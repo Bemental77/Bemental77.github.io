@@ -4,6 +4,7 @@ body {
   background-color: #010329;
   background: radial-gradient(circle at bottom, #010329, black 100%);
   min-height: 100%
+
   }
 
 h1 {
@@ -144,7 +145,7 @@ input[type="submit"] {
   background-color: #010329;
   color: #dfe4ed;
   font-family: 'Arial', sans-serif;
-  background-image: url("images/stars.jpg");
+  background-image: url("/images/stars.jpg");
   min-height: 100%;
   width: auto;
   height: auto;
@@ -153,6 +154,7 @@ input[type="submit"] {
 
 h1 {
   background-color: #010329;
+  opacity: 50;
 }
 
 nav {
