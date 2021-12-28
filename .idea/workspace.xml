@@ -1,21 +1,15 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Updated pages">
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="All is color sorted">
+      <change afterPath="$PROJECT_DIR$/images/Casey Bement Resume.pdf" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/interests.html" beforeDir="false" afterPath="$PROJECT_DIR$/interests.html" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/resume.html" beforeDir="false" afterPath="$PROJECT_DIR$/resume.html" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
-  </component>
-  <component name="FileTemplateManagerImpl">
-    <option name="RECENT_TEMPLATES">
-      <list>
-        <option value="HTML File" />
-      </list>
-    </option>
   </component>
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
@@ -38,7 +32,6 @@
   </component>
   <component name="PropertiesComponent">
     <property name="ASKED_ADD_EXTERNAL_FILES" value="true" />
-    <property name="DefaultHtmlFileTemplate" value="HTML File" />
     <property name="RunOnceActivity.OpenProjectViewOnStart" value="true" />
     <property name="RunOnceActivity.ShowReadmeOnStart" value="true" />
     <property name="WebServerToolWindowFactoryState" value="false" />
@@ -60,7 +53,7 @@
       <workItem from="1640631796046" duration="209000" />
       <workItem from="1640632023679" duration="394000" />
       <workItem from="1640634108074" duration="6011000" />
-      <workItem from="1640641418854" duration="2103000" />
+      <workItem from="1640641265352" duration="3373000" />
     </task>
     <task id="LOCAL-00001" summary="fresh">
       <created>1640629827163</created>
@@ -90,28 +83,35 @@
       <option name="project" value="LOCAL" />
       <updated>1640632058075</updated>
     </task>
-    <task id="LOCAL-00005" summary="Updated pages">
-      <created>1640641835996</created>
+    <task id="LOCAL-00005" summary="All is color sorted on webstorm">
+      <created>1640643384631</created>
       <option name="number" value="00005" />
       <option name="presentableId" value="LOCAL-00005" />
       <option name="project" value="LOCAL" />
-      <updated>1640641835996</updated>
+      <updated>1640643384631</updated>
     </task>
-    <task id="LOCAL-00006" summary="Updated pages">
-      <created>1640642505523</created>
+    <task id="LOCAL-00006" summary="All is color sorted on webstorm">
+      <created>1640643417222</created>
       <option name="number" value="00006" />
       <option name="presentableId" value="LOCAL-00006" />
       <option name="project" value="LOCAL" />
-      <updated>1640642505523</updated>
+      <updated>1640643417222</updated>
     </task>
-    <task id="LOCAL-00007" summary="Updated pages">
-      <created>1640642880621</created>
+    <task id="LOCAL-00007" summary="All is color sorted">
+      <created>1640644101116</created>
       <option name="number" value="00007" />
       <option name="presentableId" value="LOCAL-00007" />
       <option name="project" value="LOCAL" />
-      <updated>1640642880621</updated>
+      <updated>1640644101116</updated>
     </task>
-    <option name="localTasksCounter" value="8" />
+    <task id="LOCAL-00008" summary="All is color sorted">
+      <created>1640644560618</created>
+      <option name="number" value="00008" />
+      <option name="presentableId" value="LOCAL-00008" />
+      <option name="project" value="LOCAL" />
+      <updated>1640644560618</updated>
+    </task>
+    <option name="localTasksCounter" value="9" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -144,7 +144,8 @@
   <component name="VcsManagerConfiguration">
     <option name="ADD_EXTERNAL_FILES_SILENTLY" value="true" />
     <MESSAGE value="fresh" />
-    <MESSAGE value="Updated pages" />
-    <option name="LAST_COMMIT_MESSAGE" value="Updated pages" />
+    <MESSAGE value="All is color sorted on webstorm" />
+    <MESSAGE value="All is color sorted" />
+    <option name="LAST_COMMIT_MESSAGE" value="All is color sorted" />
   </component>
 </project>
