@@ -1,9 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Added resume iframe to resume.html">
-      <change afterPath="$PROJECT_DIR$/assets/js/formValidator.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Added formValidator.js, but not using it yet. Contact form should open a mailto">
       <change beforePath="$PROJECT_DIR$/contact.html" beforeDir="false" afterPath="$PROJECT_DIR$/contact.html" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -60,7 +58,7 @@
       <workItem from="1640631796046" duration="209000" />
       <workItem from="1640632023679" duration="394000" />
       <workItem from="1640634108074" duration="6011000" />
-      <workItem from="1640641265352" duration="8520000" />
+      <workItem from="1640641265352" duration="8862000" />
     </task>
     <task id="LOCAL-00001" summary="fresh">
       <created>1640629827163</created>
@@ -139,7 +137,14 @@
       <option name="project" value="LOCAL" />
       <updated>1640708982428</updated>
     </task>
-    <option name="localTasksCounter" value="12" />
+    <task id="LOCAL-00012" summary="Added formValidator.js, but not using it yet. Contact form should open a mailto">
+      <created>1640718668288</created>
+      <option name="number" value="00012" />
+      <option name="presentableId" value="LOCAL-00012" />
+      <option name="project" value="LOCAL" />
+      <updated>1640718668288</updated>
+    </task>
+    <option name="localTasksCounter" value="13" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -175,6 +180,7 @@
     <MESSAGE value="All is color sorted on webstorm" />
     <MESSAGE value="All is color sorted" />
     <MESSAGE value="Added resume iframe to resume.html" />
-    <option name="LAST_COMMIT_MESSAGE" value="Added resume iframe to resume.html" />
+    <MESSAGE value="Added formValidator.js, but not using it yet. Contact form should open a mailto" />
+    <option name="LAST_COMMIT_MESSAGE" value="Added formValidator.js, but not using it yet. Contact form should open a mailto" />
   </component>
 </project>
