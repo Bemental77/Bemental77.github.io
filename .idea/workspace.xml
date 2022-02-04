@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="added /test page for Agile Programming class. This is contains no links because it is a requirement for the class.">
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="added first elevator pitch">
       <change beforePath="$PROJECT_DIR$/test.html" beforeDir="false" afterPath="$PROJECT_DIR$/test.html" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -62,7 +62,7 @@
       <workItem from="1640634108074" duration="6011000" />
       <workItem from="1640641265352" duration="11225000" />
       <workItem from="1643687774287" duration="21000" />
-      <workItem from="1643954368909" duration="1161000" />
+      <workItem from="1643954368909" duration="1266000" />
     </task>
     <task id="LOCAL-00001" summary="fresh">
       <created>1640629827163</created>
@@ -183,7 +183,14 @@
       <option name="project" value="LOCAL" />
       <updated>1643954947515</updated>
     </task>
-    <option name="localTasksCounter" value="18" />
+    <task id="LOCAL-00018" summary="added first elevator pitch">
+      <created>1643955606670</created>
+      <option name="number" value="00018" />
+      <option name="presentableId" value="LOCAL-00018" />
+      <option name="project" value="LOCAL" />
+      <updated>1643955606670</updated>
+    </task>
+    <option name="localTasksCounter" value="19" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -222,6 +229,7 @@
     <MESSAGE value="Added formValidator.js, but not using it yet. Contact form should open a mailto" />
     <MESSAGE value="updates to pages, filling it with real info." />
     <MESSAGE value="added /test page for Agile Programming class. This is contains no links because it is a requirement for the class." />
-    <option name="LAST_COMMIT_MESSAGE" value="added /test page for Agile Programming class. This is contains no links because it is a requirement for the class." />
+    <MESSAGE value="added first elevator pitch" />
+    <option name="LAST_COMMIT_MESSAGE" value="added first elevator pitch" />
   </component>
 </project>
