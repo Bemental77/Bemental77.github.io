@@ -1,13 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Added formValidator.js, but not using it yet. Contact form should open a mailto">
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="updates to pages, filling it with real info.">
+      <change afterPath="$PROJECT_DIR$/test.html" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/about.html" beforeDir="false" afterPath="$PROJECT_DIR$/about.html" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/contact.html" beforeDir="false" afterPath="$PROJECT_DIR$/contact.html" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/index.html" beforeDir="false" afterPath="$PROJECT_DIR$/index.html" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/interests.html" beforeDir="false" afterPath="$PROJECT_DIR$/interests.html" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/resume.html" beforeDir="false" afterPath="$PROJECT_DIR$/resume.html" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -18,6 +14,7 @@
     <option name="RECENT_TEMPLATES">
       <list>
         <option value="JavaScript File" />
+        <option value="HTML File" />
       </list>
     </option>
   </component>
@@ -42,6 +39,7 @@
   </component>
   <component name="PropertiesComponent">
     <property name="ASKED_ADD_EXTERNAL_FILES" value="true" />
+    <property name="DefaultHtmlFileTemplate" value="HTML File" />
     <property name="RunOnceActivity.OpenProjectViewOnStart" value="true" />
     <property name="RunOnceActivity.ShowReadmeOnStart" value="true" />
     <property name="WebServerToolWindowFactoryState" value="false" />
@@ -63,7 +61,9 @@
       <workItem from="1640631796046" duration="209000" />
       <workItem from="1640632023679" duration="394000" />
       <workItem from="1640634108074" duration="6011000" />
-      <workItem from="1640641265352" duration="10374000" />
+      <workItem from="1640641265352" duration="11225000" />
+      <workItem from="1643687774287" duration="21000" />
+      <workItem from="1643954368909" duration="262000" />
     </task>
     <task id="LOCAL-00001" summary="fresh">
       <created>1640629827163</created>
@@ -156,7 +156,14 @@
       <option name="project" value="LOCAL" />
       <updated>1640719028350</updated>
     </task>
-    <option name="localTasksCounter" value="14" />
+    <task id="LOCAL-00014" summary="updates to pages, filling it with real info.">
+      <created>1640720540844</created>
+      <option name="number" value="00014" />
+      <option name="presentableId" value="LOCAL-00014" />
+      <option name="project" value="LOCAL" />
+      <updated>1640720540844</updated>
+    </task>
+    <option name="localTasksCounter" value="15" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -193,6 +200,7 @@
     <MESSAGE value="All is color sorted" />
     <MESSAGE value="Added resume iframe to resume.html" />
     <MESSAGE value="Added formValidator.js, but not using it yet. Contact form should open a mailto" />
-    <option name="LAST_COMMIT_MESSAGE" value="Added formValidator.js, but not using it yet. Contact form should open a mailto" />
+    <MESSAGE value="updates to pages, filling it with real info." />
+    <option name="LAST_COMMIT_MESSAGE" value="updates to pages, filling it with real info." />
   </component>
 </project>
