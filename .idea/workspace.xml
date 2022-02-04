@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="added first elevator pitch">
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="added all elevator pitches">
+      <change afterPath="$PROJECT_DIR$/test/index.html" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/test.html" beforeDir="false" afterPath="$PROJECT_DIR$/test.html" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/test.html" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -63,7 +64,7 @@
       <workItem from="1640634108074" duration="6011000" />
       <workItem from="1640641265352" duration="11225000" />
       <workItem from="1643687774287" duration="21000" />
-      <workItem from="1643954368909" duration="3718000" />
+      <workItem from="1643954368909" duration="3935000" />
     </task>
     <task id="LOCAL-00001" summary="fresh">
       <created>1640629827163</created>
@@ -198,7 +199,14 @@
       <option name="project" value="LOCAL" />
       <updated>1643955683103</updated>
     </task>
-    <option name="localTasksCounter" value="20" />
+    <task id="LOCAL-00020" summary="added all elevator pitches">
+      <created>1643990454099</created>
+      <option name="number" value="00020" />
+      <option name="presentableId" value="LOCAL-00020" />
+      <option name="project" value="LOCAL" />
+      <updated>1643990454099</updated>
+    </task>
+    <option name="localTasksCounter" value="21" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -238,6 +246,7 @@
     <MESSAGE value="updates to pages, filling it with real info." />
     <MESSAGE value="added /test page for Agile Programming class. This is contains no links because it is a requirement for the class." />
     <MESSAGE value="added first elevator pitch" />
-    <option name="LAST_COMMIT_MESSAGE" value="added first elevator pitch" />
+    <MESSAGE value="added all elevator pitches" />
+    <option name="LAST_COMMIT_MESSAGE" value="added all elevator pitches" />
   </component>
 </project>
