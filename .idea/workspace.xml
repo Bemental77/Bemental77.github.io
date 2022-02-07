@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="restructured test file to have index.html">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Added success message to README.md">
+      <change beforePath="$PROJECT_DIR$/test/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/test/README.md" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -64,6 +64,7 @@
       <workItem from="1643687774287" duration="21000" />
       <workItem from="1643954368909" duration="3935000" />
       <workItem from="1644012101926" duration="1062000" />
+      <workItem from="1644211672353" duration="332000" />
     </task>
     <task id="LOCAL-00001" summary="fresh">
       <created>1640629827163</created>
@@ -219,7 +220,28 @@
       <option name="project" value="LOCAL" />
       <updated>1644012603294</updated>
     </task>
-    <option name="localTasksCounter" value="23" />
+    <task id="LOCAL-00023" summary="Added success message to README.md">
+      <created>1644211843325</created>
+      <option name="number" value="00023" />
+      <option name="presentableId" value="LOCAL-00023" />
+      <option name="project" value="LOCAL" />
+      <updated>1644211843325</updated>
+    </task>
+    <task id="LOCAL-00024" summary="Added success message to README.md">
+      <created>1644211906031</created>
+      <option name="number" value="00024" />
+      <option name="presentableId" value="LOCAL-00024" />
+      <option name="project" value="LOCAL" />
+      <updated>1644211906031</updated>
+    </task>
+    <task id="LOCAL-00025" summary="Added success message to README.md">
+      <created>1644211945638</created>
+      <option name="number" value="00025" />
+      <option name="presentableId" value="LOCAL-00025" />
+      <option name="project" value="LOCAL" />
+      <updated>1644211945638</updated>
+    </task>
+    <option name="localTasksCounter" value="26" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -261,6 +283,7 @@
     <MESSAGE value="added first elevator pitch" />
     <MESSAGE value="added all elevator pitches" />
     <MESSAGE value="restructured test file to have index.html" />
-    <option name="LAST_COMMIT_MESSAGE" value="restructured test file to have index.html" />
+    <MESSAGE value="Added success message to README.md" />
+    <option name="LAST_COMMIT_MESSAGE" value="Added success message to README.md" />
   </component>
 </project>
