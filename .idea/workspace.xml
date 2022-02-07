@@ -1,9 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Added success message to README.md">
-      <change beforePath="$PROJECT_DIR$/test/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/test/README.md" afterDir="false" />
-    </list>
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Added success message to README.md" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -64,7 +62,7 @@
       <workItem from="1643687774287" duration="21000" />
       <workItem from="1643954368909" duration="3935000" />
       <workItem from="1644012101926" duration="1062000" />
-      <workItem from="1644211672353" duration="332000" />
+      <workItem from="1644211672353" duration="660000" />
     </task>
     <task id="LOCAL-00001" summary="fresh">
       <created>1640629827163</created>
@@ -241,7 +239,14 @@
       <option name="project" value="LOCAL" />
       <updated>1644211945638</updated>
     </task>
-    <option name="localTasksCounter" value="26" />
+    <task id="LOCAL-00026" summary="Added success message to README.md">
+      <created>1644212106845</created>
+      <option name="number" value="00026" />
+      <option name="presentableId" value="LOCAL-00026" />
+      <option name="project" value="LOCAL" />
+      <updated>1644212106845</updated>
+    </task>
+    <option name="localTasksCounter" value="27" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
