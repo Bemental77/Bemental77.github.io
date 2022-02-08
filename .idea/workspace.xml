@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Added link to caseyClicker on google play." />
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Updating README.md to see if pivitol tracker updates.">
+      <change beforePath="$PROJECT_DIR$/test/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/test/README.md" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -40,7 +42,7 @@
     <property name="RunOnceActivity.OpenProjectViewOnStart" value="true" />
     <property name="RunOnceActivity.ShowReadmeOnStart" value="true" />
     <property name="WebServerToolWindowFactoryState" value="false" />
-    <property name="last_opened_file_path" value="$PROJECT_DIR$/../../CVTC/Web 3/Module1/Journal1870_cBement" />
+    <property name="last_opened_file_path" value="$PROJECT_DIR$" />
     <property name="settings.editor.selected.configurable" value="preferences.lookFeel" />
     <property name="vue.rearranger.settings.migration" value="true" />
   </component>
@@ -65,6 +67,7 @@
       <workItem from="1644211672353" duration="660000" />
       <workItem from="1644213859911" duration="27000" />
       <workItem from="1644213923752" duration="476000" />
+      <workItem from="1644358374694" duration="606000" />
     </task>
     <task id="LOCAL-00001" summary="fresh">
       <created>1640629827163</created>
@@ -269,7 +272,14 @@
       <option name="project" value="LOCAL" />
       <updated>1644214450301</updated>
     </task>
-    <option name="localTasksCounter" value="30" />
+    <task id="LOCAL-00030" summary="Updating README.md to see if pivitol tracker updates.">
+      <created>1644358480282</created>
+      <option name="number" value="00030" />
+      <option name="presentableId" value="LOCAL-00030" />
+      <option name="project" value="LOCAL" />
+      <updated>1644358480282</updated>
+    </task>
+    <option name="localTasksCounter" value="31" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -314,6 +324,7 @@
     <MESSAGE value="Added success message to README.md" />
     <MESSAGE value="Updated Resume" />
     <MESSAGE value="Added link to caseyClicker on google play." />
-    <option name="LAST_COMMIT_MESSAGE" value="Added link to caseyClicker on google play." />
+    <MESSAGE value="Updating README.md to see if pivitol tracker updates." />
+    <option name="LAST_COMMIT_MESSAGE" value="Updating README.md to see if pivitol tracker updates." />
   </component>
 </project>
