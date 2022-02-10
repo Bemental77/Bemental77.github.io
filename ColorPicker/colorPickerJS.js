@@ -18,7 +18,8 @@ ColorCtx .fillRect(0, 0, ColorCtx .canvas.width,
     ColorCtx .canvas.height);
 
 
-//Color picking function only seems to result in black backroung
+//Color picking function only seems to result in black backround
+//Needs further testing
 /* colorCanvas.addEventListener('click',function(event){
     let x = event.clientX;  // Get X coordinate
     let y = event.clientY;  // Get Y coordinate
