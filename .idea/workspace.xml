@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Added success to README.md [(Finishes) #181195918]">
-      <change afterPath="$PROJECT_DIR$/ColorPicker/index.html" afterDir="false" />
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Creating basic color picker design. [#181211877]">
+      <change afterPath="$PROJECT_DIR$/ColorPicker/colorPickerJS.js" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/ColorPicker/css/styles.css" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ColorPicker/index.html" beforeDir="false" afterPath="$PROJECT_DIR$/ColorPicker/index.html" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -13,8 +15,9 @@
   <component name="FileTemplateManagerImpl">
     <option name="RECENT_TEMPLATES">
       <list>
-        <option value="JavaScript File" />
         <option value="HTML File" />
+        <option value="JavaScript File" />
+        <option value="CSS File" />
       </list>
     </option>
   </component>
@@ -44,8 +47,14 @@
     <property name="RunOnceActivity.ShowReadmeOnStart" value="true" />
     <property name="WebServerToolWindowFactoryState" value="false" />
     <property name="last_opened_file_path" value="$PROJECT_DIR$" />
+    <property name="list.type.of.created.stylesheet" value="CSS" />
     <property name="settings.editor.selected.configurable" value="preferences.lookFeel" />
     <property name="vue.rearranger.settings.migration" value="true" />
+  </component>
+  <component name="RecentsManager">
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/ColorPicker/css" />
+    </key>
   </component>
   <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />
   <component name="TaskManager">
@@ -69,7 +78,8 @@
       <workItem from="1644213859911" duration="27000" />
       <workItem from="1644213923752" duration="476000" />
       <workItem from="1644358374694" duration="1000000" />
-      <workItem from="1644505431865" duration="575000" />
+      <workItem from="1644505431865" duration="2013000" />
+      <workItem from="1644510471285" duration="1644000" />
     </task>
     <task id="LOCAL-00001" summary="fresh">
       <created>1640629827163</created>
@@ -302,7 +312,14 @@
       <option name="project" value="LOCAL" />
       <updated>1644359488447</updated>
     </task>
-    <option name="localTasksCounter" value="34" />
+    <task id="LOCAL-00034" summary="Created Color Picker Page">
+      <created>1644506031829</created>
+      <option name="number" value="00034" />
+      <option name="presentableId" value="LOCAL-00034" />
+      <option name="project" value="LOCAL" />
+      <updated>1644506031829</updated>
+    </task>
+    <option name="localTasksCounter" value="35" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -351,6 +368,7 @@
     <MESSAGE value="Add a success message to README.md [(Finishes) #181195656]" />
     <MESSAGE value="remove success message" />
     <MESSAGE value="Added success to README.md [(Finishes) #181195918]" />
-    <option name="LAST_COMMIT_MESSAGE" value="Added success to README.md [(Finishes) #181195918]" />
+    <MESSAGE value="Created Color Picker Page" />
+    <option name="LAST_COMMIT_MESSAGE" value="Created Color Picker Page" />
   </component>
 </project>
