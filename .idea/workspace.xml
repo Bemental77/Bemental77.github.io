@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Updating README.md to see if pivitol tracker updates.">
-      <change beforePath="$PROJECT_DIR$/test/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/test/README.md" afterDir="false" />
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Added success to README.md [(Finishes) #181195918]">
+      <change afterPath="$PROJECT_DIR$/ColorPicker/index.html" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -67,7 +68,8 @@
       <workItem from="1644211672353" duration="660000" />
       <workItem from="1644213859911" duration="27000" />
       <workItem from="1644213923752" duration="476000" />
-      <workItem from="1644358374694" duration="606000" />
+      <workItem from="1644358374694" duration="1000000" />
+      <workItem from="1644505431865" duration="575000" />
     </task>
     <task id="LOCAL-00001" summary="fresh">
       <created>1640629827163</created>
@@ -279,7 +281,28 @@
       <option name="project" value="LOCAL" />
       <updated>1644358480282</updated>
     </task>
-    <option name="localTasksCounter" value="31" />
+    <task id="LOCAL-00031" summary="Add a success message to README.md [(Finishes) #181195656]">
+      <created>1644359241644</created>
+      <option name="number" value="00031" />
+      <option name="presentableId" value="LOCAL-00031" />
+      <option name="project" value="LOCAL" />
+      <updated>1644359241644</updated>
+    </task>
+    <task id="LOCAL-00032" summary="remove success message">
+      <created>1644359345138</created>
+      <option name="number" value="00032" />
+      <option name="presentableId" value="LOCAL-00032" />
+      <option name="project" value="LOCAL" />
+      <updated>1644359345138</updated>
+    </task>
+    <task id="LOCAL-00033" summary="Added success to README.md [(Finishes) #181195918]">
+      <created>1644359488447</created>
+      <option name="number" value="00033" />
+      <option name="presentableId" value="LOCAL-00033" />
+      <option name="project" value="LOCAL" />
+      <updated>1644359488447</updated>
+    </task>
+    <option name="localTasksCounter" value="34" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -325,6 +348,9 @@
     <MESSAGE value="Updated Resume" />
     <MESSAGE value="Added link to caseyClicker on google play." />
     <MESSAGE value="Updating README.md to see if pivitol tracker updates." />
-    <option name="LAST_COMMIT_MESSAGE" value="Updating README.md to see if pivitol tracker updates." />
+    <MESSAGE value="Add a success message to README.md [(Finishes) #181195656]" />
+    <MESSAGE value="remove success message" />
+    <MESSAGE value="Added success to README.md [(Finishes) #181195918]" />
+    <option name="LAST_COMMIT_MESSAGE" value="Added success to README.md [(Finishes) #181195918]" />
   </component>
 </project>
