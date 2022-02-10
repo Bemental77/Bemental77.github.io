@@ -1,7 +1,7 @@
 var colorCanvas = document.getElementById('color_canvas');
 var ColorCtx = colorCanvas .getContext('2d');  // This create a 2D context for the canvas
 
-// Create a horizontal gradient
+// Create a horizontal gradient -
 var color = '#0000ff'
 let gradientH = ColorCtx .createLinearGradient(0, 0, ColorCtx .canvas.width, 0);
 gradientH.addColorStop(0, '#fff');
