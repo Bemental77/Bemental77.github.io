@@ -11,3 +11,8 @@ canvas {
 
     background: linear-gradient(90deg, white 0%, black 85%);
 }
+#submitButton{
+    width: 100px;
+    height: 20px;
+    padding: 3px;
+}
