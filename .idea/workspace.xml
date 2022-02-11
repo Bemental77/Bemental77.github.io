@@ -1,12 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="JS for color picker only showing black after click. 2 hours. [#181211889]">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ColorPicker/colorPickerJS.js" beforeDir="false" afterPath="$PROJECT_DIR$/ColorPicker/colorPickerJS.js" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ColorPicker/css/styles.css" beforeDir="false" afterPath="$PROJECT_DIR$/ColorPicker/css/styles.css" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/ColorPicker/index.html" beforeDir="false" afterPath="$PROJECT_DIR$/ColorPicker/index.html" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/images/Casey Bement Resume.pdf" beforeDir="false" afterPath="$PROJECT_DIR$/images/Casey Bement Resume.pdf" afterDir="false" />
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Continued Color Picker Layout. 2 hours.[#181211877]">
+      <change beforePath="$PROJECT_DIR$/index.html" beforeDir="false" afterPath="$PROJECT_DIR$/index.html" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -80,7 +76,7 @@
       <workItem from="1644213923752" duration="476000" />
       <workItem from="1644358374694" duration="1000000" />
       <workItem from="1644505431865" duration="2013000" />
-      <workItem from="1644510471285" duration="6721000" />
+      <workItem from="1644510471285" duration="7036000" />
     </task>
     <task id="LOCAL-00001" summary="fresh">
       <created>1640629827163</created>
@@ -369,7 +365,14 @@
       <option name="project" value="LOCAL" />
       <updated>1644518383760</updated>
     </task>
-    <option name="localTasksCounter" value="42" />
+    <task id="LOCAL-00042" summary="Continued Color Picker Layout. 2 hours.[#181211877]">
+      <created>1644548323072</created>
+      <option name="number" value="00042" />
+      <option name="presentableId" value="LOCAL-00042" />
+      <option name="project" value="LOCAL" />
+      <updated>1644548323072</updated>
+    </task>
+    <option name="localTasksCounter" value="43" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -425,6 +428,7 @@
     <MESSAGE value="Design the Color Picker Layout. 1 hour. [#181211877]" />
     <MESSAGE value="JS for color picker only showing black after click.  [#181211889]" />
     <MESSAGE value="JS for color picker only showing black after click. 2 hours. [#181211889]" />
-    <option name="LAST_COMMIT_MESSAGE" value="JS for color picker only showing black after click. 2 hours. [#181211889]" />
+    <MESSAGE value="Continued Color Picker Layout. 2 hours.[#181211877]" />
+    <option name="LAST_COMMIT_MESSAGE" value="Continued Color Picker Layout. 2 hours.[#181211877]" />
   </component>
 </project>
