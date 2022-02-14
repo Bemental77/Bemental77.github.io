@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Creating a triangle canvas rather than default rectangle. [#181211877]">
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="working on rgb conversion still.  [#181211906]">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/ColorPicker/colorPickerJS.js" beforeDir="false" afterPath="$PROJECT_DIR$/ColorPicker/colorPickerJS.js" afterDir="false" />
     </list>
@@ -30,6 +30,9 @@
       <filtered-out-file-type name="COMMIT_BY_MESSAGE" />
     </file-type-list>
   </component>
+  <component name="HighlightingSettingsPerFile">
+    <setting file="file://$PROJECT_DIR$/ColorPicker/colorPickerJS.js" root0="FORCE_HIGHLIGHTING" />
+  </component>
   <component name="ProjectId" id="22sAo06PGS5RjZuA9VxOmN07eI1" />
   <component name="ProjectLevelVcsManager" settingsEditedManually="true">
     <ConfirmationsSetting value="2" id="Add" />
@@ -40,14 +43,18 @@
   </component>
   <component name="PropertiesComponent">
     <property name="ASKED_ADD_EXTERNAL_FILES" value="true" />
+    <property name="ASKED_SHARE_PROJECT_CONFIGURATION_FILES" value="true" />
     <property name="DefaultHtmlFileTemplate" value="HTML File" />
     <property name="RunOnceActivity.OpenProjectViewOnStart" value="true" />
     <property name="RunOnceActivity.ShowReadmeOnStart" value="true" />
+    <property name="SHARE_PROJECT_CONFIGURATION_FILES" value="true" />
     <property name="WebServerToolWindowFactoryState" value="false" />
     <property name="last_opened_file_path" value="$PROJECT_DIR$/../../CVTC/Web 3/Module1/Journal1870_cBement" />
     <property name="list.type.of.created.stylesheet" value="CSS" />
     <property name="node.js.detected.package.eslint" value="true" />
+    <property name="node.js.detected.package.tslint" value="true" />
     <property name="node.js.selected.package.eslint" value="(autodetect)" />
+    <property name="node.js.selected.package.tslint" value="(autodetect)" />
     <property name="settings.editor.selected.configurable" value="reference.settings.ide.settings.notifications" />
     <property name="vue.rearranger.settings.migration" value="true" />
   </component>
@@ -79,7 +86,7 @@
       <workItem from="1644213923752" duration="476000" />
       <workItem from="1644358374694" duration="1000000" />
       <workItem from="1644505431865" duration="2013000" />
-      <workItem from="1644510471285" duration="14962000" />
+      <workItem from="1644510471285" duration="15585000" />
     </task>
     <task id="LOCAL-00001" summary="fresh">
       <created>1640629827163</created>
@@ -403,7 +410,14 @@
       <option name="project" value="LOCAL" />
       <updated>1644812797495</updated>
     </task>
-    <option name="localTasksCounter" value="47" />
+    <task id="LOCAL-00047" summary="working on rgb conversion still.  [#181211906]">
+      <created>1644855313258</created>
+      <option name="number" value="00047" />
+      <option name="presentableId" value="LOCAL-00047" />
+      <option name="project" value="LOCAL" />
+      <updated>1644855313258</updated>
+    </task>
+    <option name="localTasksCounter" value="48" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -435,7 +449,6 @@
   </component>
   <component name="VcsManagerConfiguration">
     <option name="ADD_EXTERNAL_FILES_SILENTLY" value="true" />
-    <MESSAGE value="Added formValidator.js, but not using it yet. Contact form should open a mailto" />
     <MESSAGE value="updates to pages, filling it with real info." />
     <MESSAGE value="added /test page for Agile Programming class. This is contains no links because it is a requirement for the class." />
     <MESSAGE value="added first elevator pitch" />
@@ -460,6 +473,7 @@
     <MESSAGE value="Making progress to implement RBG value conversion to pybl. [#181211906]" />
     <MESSAGE value="Making progress to implement RBG value conversion to pybl.&#10; JS now takes input from user. 3 hours total. [#181211906]" />
     <MESSAGE value="Creating a triangle canvas rather than default rectangle. [#181211877]" />
-    <option name="LAST_COMMIT_MESSAGE" value="Creating a triangle canvas rather than default rectangle. [#181211877]" />
+    <MESSAGE value="working on rgb conversion still.  [#181211906]" />
+    <option name="LAST_COMMIT_MESSAGE" value="working on rgb conversion still.  [#181211906]" />
   </component>
 </project>
