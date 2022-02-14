@@ -14,3 +14,17 @@ function f() {
 
 }
 
+function draw() {
+    var canvas = document.getElementById('color_canvas');
+    if (canvas.getContext) {
+        var ctx = canvas.getContext('2d');
+
+        ctx.beginPath();
+        ctx.moveTo(275, 150);
+        ctx.lineTo(100, 150);
+        ctx.lineTo(180, 5);
+        ctx.fillStyle = "dimgrey";
+        ctx.fill();
+    }
+}
+draw();
