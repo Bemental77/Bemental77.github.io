@@ -9,7 +9,7 @@ body {
 }
 
 .canvasSlider {
-    background-color: dimgrey;
+    background-image: linear-gradient(to right, black, white);
 }
 
 .colorCanvas {
