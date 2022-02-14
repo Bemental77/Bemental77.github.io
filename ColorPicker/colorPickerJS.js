@@ -31,15 +31,7 @@ function f() {
     if (rNumber, gNumber, bNumber <= 1 && rNumber >=0 && gNumber >=0 && bNumber >= 0) {
         window.alert("You entered: " + rNumber + ", " + gNumber + ", " + bNumber);
 
-        if (rNumber === 0) {
-            rho = 0.0;
-        }
-        if (gNumber === 0) {
-            gamma = 0;
-        }
-        if (bNumber === 0) {
-            beta = 0;
-        }
+
 
 
 
@@ -47,10 +39,10 @@ function f() {
     else {
         window.alert("Please enter a value that is between 0.0 - 1.0");
     }
+
     window.alert("The rho value is: " + ((1 / rNumber) * rNumber));
     window.alert("The gamma value is: " + ((1 / gNumber) * gNumber));
     window.alert("The beta value is: " + ((1 / bNumber) * bNumber));
-
 
 }
 
