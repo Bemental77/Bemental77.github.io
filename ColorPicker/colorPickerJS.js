@@ -39,9 +39,9 @@ function f() {
     beta = (1 / (rNumber + gNumber + bNumber) * bNumber);
 
 
-    window.alert("The rho value is: " + rho.toFixed(3));
-    window.alert("The gamma value is: " + gamma.toFixed(3));
-    window.alert("The beta value is: " + beta.toFixed(3));
+    window.alert("The rho value is: " + rho.toFixed(1));
+    window.alert("The gamma value is: " + gamma.toFixed(1));
+    window.alert("The beta value is: " + beta.toFixed(1));
 
 }
 

@@ -1,8 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="working on rgb conversion still. 3 hours. IMO un-functional math. [#181211906]">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="RBG to PYBL working. 4 hours total. [#181211906]">
       <change beforePath="$PROJECT_DIR$/ColorPicker/colorPickerJS.js" beforeDir="false" afterPath="$PROJECT_DIR$/ColorPicker/colorPickerJS.js" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -86,14 +85,7 @@
       <workItem from="1644213923752" duration="476000" />
       <workItem from="1644358374694" duration="1000000" />
       <workItem from="1644505431865" duration="2013000" />
-      <workItem from="1644510471285" duration="18186000" />
-    </task>
-    <task id="LOCAL-00002" summary="fresh">
-      <created>1640630208518</created>
-      <option name="number" value="00002" />
-      <option name="presentableId" value="LOCAL-00002" />
-      <option name="project" value="LOCAL" />
-      <updated>1640630208518</updated>
+      <workItem from="1644510471285" duration="18541000" />
     </task>
     <task id="LOCAL-00003" summary="fresh">
       <created>1640631806946</created>
@@ -431,7 +423,14 @@
       <option name="project" value="LOCAL" />
       <updated>1644857580438</updated>
     </task>
-    <option name="localTasksCounter" value="51" />
+    <task id="LOCAL-00051" summary="RBG to PYBL working. 4 hours total. [#181211906]">
+      <created>1644860776564</created>
+      <option name="number" value="00051" />
+      <option name="presentableId" value="LOCAL-00051" />
+      <option name="project" value="LOCAL" />
+      <updated>1644860776564</updated>
+    </task>
+    <option name="localTasksCounter" value="52" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -463,7 +462,6 @@
   </component>
   <component name="VcsManagerConfiguration">
     <option name="ADD_EXTERNAL_FILES_SILENTLY" value="true" />
-    <MESSAGE value="added /test page for Agile Programming class. This is contains no links because it is a requirement for the class." />
     <MESSAGE value="added first elevator pitch" />
     <MESSAGE value="added all elevator pitches" />
     <MESSAGE value="restructured test file to have index.html" />
@@ -488,6 +486,7 @@
     <MESSAGE value="Creating a triangle canvas rather than default rectangle. [#181211877]" />
     <MESSAGE value="working on rgb conversion still.  [#181211906]" />
     <MESSAGE value="working on rgb conversion still. 3 hours. IMO un-functional math. [#181211906]" />
-    <option name="LAST_COMMIT_MESSAGE" value="working on rgb conversion still. 3 hours. IMO un-functional math. [#181211906]" />
+    <MESSAGE value="RBG to PYBL working. 4 hours total. [#181211906]" />
+    <option name="LAST_COMMIT_MESSAGE" value="RBG to PYBL working. 4 hours total. [#181211906]" />
   </component>
 </project>
