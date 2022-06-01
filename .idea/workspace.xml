@@ -1,10 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="RBG to PYBL working. 4 hours total. Only shows the first decimal place. [#181211906]">
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Updated Resume">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/images/Casey Bement Resume.pdf" beforeDir="false" afterPath="$PROJECT_DIR$/images/Casey Bement Resume.pdf" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/resume.html" beforeDir="false" afterPath="$PROJECT_DIR$/resume.html" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -95,14 +94,7 @@
       <workItem from="1644505431865" duration="2013000" />
       <workItem from="1644510471285" duration="19135000" />
       <workItem from="1649649911067" duration="130000" />
-      <workItem from="1654105182853" duration="121000" />
-    </task>
-    <task id="LOCAL-00005" summary="All is color sorted on webstorm">
-      <created>1640643384631</created>
-      <option name="number" value="00005" />
-      <option name="presentableId" value="LOCAL-00005" />
-      <option name="project" value="LOCAL" />
-      <updated>1640643384631</updated>
+      <workItem from="1654105182853" duration="957000" />
     </task>
     <task id="LOCAL-00006" summary="All is color sorted on webstorm">
       <created>1640643417222</created>
@@ -440,7 +432,14 @@
       <option name="project" value="LOCAL" />
       <updated>1644862330350</updated>
     </task>
-    <option name="localTasksCounter" value="54" />
+    <task id="LOCAL-00054" summary="Updated Resume">
+      <created>1654105346751</created>
+      <option name="number" value="00054" />
+      <option name="presentableId" value="LOCAL-00054" />
+      <option name="project" value="LOCAL" />
+      <updated>1654105346752</updated>
+    </task>
+    <option name="localTasksCounter" value="55" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -474,7 +473,6 @@
     <MESSAGE value="added all elevator pitches" />
     <MESSAGE value="restructured test file to have index.html" />
     <MESSAGE value="Added success message to README.md" />
-    <MESSAGE value="Updated Resume" />
     <MESSAGE value="Added link to caseyClicker on google play." />
     <MESSAGE value="Updating README.md to see if pivitol tracker updates." />
     <MESSAGE value="Add a success message to README.md [(Finishes) #181195656]" />
@@ -496,6 +494,7 @@
     <MESSAGE value="working on rgb conversion still. 3 hours. IMO un-functional math. [#181211906]" />
     <MESSAGE value="RBG to PYBL working. 4 hours total. [#181211906]" />
     <MESSAGE value="RBG to PYBL working. 4 hours total. Only shows the first decimal place. [#181211906]" />
-    <option name="LAST_COMMIT_MESSAGE" value="RBG to PYBL working. 4 hours total. Only shows the first decimal place. [#181211906]" />
+    <MESSAGE value="Updated Resume" />
+    <option name="LAST_COMMIT_MESSAGE" value="Updated Resume" />
   </component>
 </project>
