@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Title</title>
+</head>
+<body>
+<pre>
+
+    install deno on windows
+install deno extension vs code
+
+create .env file for subsription, requestor, apiUrl, clientId, clientSecret
+
+create auth.entities.ts file
+	export enum Secrets {
+    ClientId = 'x',
+    ClientSecret = 'y',
+    Subscription = 'z',
+    Requestor = 'cbement',
+    baseUrl = 'https://nhs-api-dev.azure-api.net/bat-cave/test/v1'
+	}
+
+create deps.ts file
+	import {
+    decode as base64Decode,
+    encode as base64Encode,
+  } from 'https://deno.land/std@0.82.0/encoding/base64.ts';
+
+  export { base64Decode, base64Encode };
+
+create .gitignore file
+	auth.entities.ts
+	casey.env
+
+create script.ts file
+	import { base64Encode } from "./deps.ts";
+	import { Secrets } from "./auth.entities.ts"
+
+async function getAccessToken(): Promise<any> {
+    const headers = {
+      Subscription: Secrets.Subscription,
+    }
+
+    let resp = await fetch(
+      `${Secrets.baseUrl}/auth`,
+      {
+          method: "POST",
+          headers,
+          body: JSON.stringify(
+            {
+              authentication: base64Encode(`${Secrets.ClientId}:${Secrets.ClientSecret}`),
+              requestor: Secrets.Requestor
+          })
+        }
+    )
+
+   return {
+        status: resp.status,
+        body: await resp.json()
+   }
+}
+
+
+async function getAllContacts(token: string, testCase: string): Promise<any> {
+
+  const params = {
+
+  }
+
+  //Construct the URL with correct parameters
+  const URL = `${Secrets.baseUrl}/contacts?${new URLSearchParams(params)}`
+  console.log(URL)
+  const headers = {
+      authorization: `Bearer ${token}`,
+      Subscription: Secrets.Subscription,
+      requestor: Secrets.Requestor,
+      "test_case": testCase,
+      firstName: 'Bruce'
+    }
+
+    let resp = await fetch(
+      URL,
+      {
+          method: "GET",
+          headers,
+      }
+    )
+
+   return {
+        status: resp.status,
+        body: await resp.json()
+   }
+}
+
+
+const data = await getAccessToken().then(data => {
+  return data
+})
+
+function runTests() {
+  getAllContacts(data.body.access_token, "powers").then(data => {
+    console.log(JSON.stringify(data.body))
+  }).catch(err => {
+    console.log(err)
+  }).finally(() => {
+    console.log("done")
+  }
+  )
+}
+
+runTests()
+
+
+</pre>
+</body>
+</html>
