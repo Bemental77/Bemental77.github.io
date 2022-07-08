@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="ChangeListManager">
-    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="Updated Resume">
-      <change afterPath="$PROJECT_DIR$/Nettest.html" afterDir="false" />
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="adding page for test resources">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Nettest.html" beforeDir="false" afterPath="$PROJECT_DIR$/Nettest.html" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -95,14 +95,8 @@
       <workItem from="1644510471285" duration="19135000" />
       <workItem from="1649649911067" duration="130000" />
       <workItem from="1654105182853" duration="1568000" />
-      <workItem from="1657225863154" duration="317000" />
-    </task>
-    <task id="LOCAL-00007" summary="All is color sorted">
-      <created>1640644101116</created>
-      <option name="number" value="00007" />
-      <option name="presentableId" value="LOCAL-00007" />
-      <option name="project" value="LOCAL" />
-      <updated>1640644101116</updated>
+      <workItem from="1657225863154" duration="424000" />
+      <workItem from="1657239870166" duration="44000" />
     </task>
     <task id="LOCAL-00008" summary="All is color sorted">
       <created>1640644560618</created>
@@ -440,7 +434,14 @@
       <option name="project" value="LOCAL" />
       <updated>1654107815768</updated>
     </task>
-    <option name="localTasksCounter" value="56" />
+    <task id="LOCAL-00056" summary="adding page for test resources">
+      <created>1657226208139</created>
+      <option name="number" value="00056" />
+      <option name="presentableId" value="LOCAL-00056" />
+      <option name="project" value="LOCAL" />
+      <updated>1657226208139</updated>
+    </task>
+    <option name="localTasksCounter" value="57" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -471,7 +472,6 @@
   </component>
   <component name="VcsManagerConfiguration">
     <option name="ADD_EXTERNAL_FILES_SILENTLY" value="true" />
-    <MESSAGE value="added all elevator pitches" />
     <MESSAGE value="restructured test file to have index.html" />
     <MESSAGE value="Added success message to README.md" />
     <MESSAGE value="Added link to caseyClicker on google play." />
@@ -496,6 +496,7 @@
     <MESSAGE value="RBG to PYBL working. 4 hours total. [#181211906]" />
     <MESSAGE value="RBG to PYBL working. 4 hours total. Only shows the first decimal place. [#181211906]" />
     <MESSAGE value="Updated Resume" />
-    <option name="LAST_COMMIT_MESSAGE" value="Updated Resume" />
+    <MESSAGE value="adding page for test resources" />
+    <option name="LAST_COMMIT_MESSAGE" value="adding page for test resources" />
   </component>
 </project>

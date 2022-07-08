@@ -35,7 +35,7 @@ create .gitignore file
 
 create script.ts file
 	import { base64Encode } from "./deps.ts";
-	import { Secrets } from "./auth.entities.ts"
+import { Secrets } from "./auth.entities.ts"
 
 async function getAccessToken(): Promise<any> {
     const headers = {
@@ -94,13 +94,51 @@ async function getAllContacts(token: string, testCase: string): Promise<any> {
 }
 
 
-const data = await getAccessToken().then(data => {
+const accessTokenRequestResponse = await getAccessToken().then(data => {
   return data
 })
 
 function runTests() {
-  getAllContacts(data.body.access_token, "powers").then(data => {
+  getAllContacts(accessTokenRequestResponse.body.access_token, "powers").then(data => {
     console.log(JSON.stringify(data.body))
+    /** data.body holds all information that you need */
+    // Test 1: Logic
+    const aliveContacts = []
+    const deadContacts = []
+    const aliveAndGoodContacts = []
+    for (const contact of data.body.contacts) {
+      if (contact.status === 'Alive') {
+        aliveContacts.push(contact)
+      }
+      if (contact.status === 'Dead') {
+        deadContacts.push(contact)
+      }
+      if (contact.status === 'Alive' && contact.team === 'Good') {
+        contact.status = 'Dead'
+        aliveAndGoodContacts.push(contact)
+      }
+    }
+    console.log(JSON.stringify('Alive Contacts: ' + aliveContacts)) //post function to update location, then post results to contacts endpoint
+    console.log(JSON.stringify('Dead Contacts: ' + deadContacts))
+    console.log(JSON.stringify('Alive and good Contacts: ' + aliveAndGoodContacts))
+
+    // Test 2 Logic
+
+    // Find example of a contact with a bad team
+    const badTeamContacts = data.body.contacts.find(contact => contact.team === 'Bad')
+    console.log(JSON.stringify('Bad Team Contacts: ' + badTeamContacts))
+
+
+
+    // Post Test 2 Results
+
+    // Test 3 Logic
+
+    // Post Test 3 Results
+
+    // Test 4 Logic
+
+    // Post Test 4 Results
   }).catch(err => {
     console.log(err)
   }).finally(() => {
