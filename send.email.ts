@@ -1,5 +1,5 @@
-import { config } from 'dotenv';
-config();
+import webpackConfig from "./webpack.config";
+
 
 function sendEmail(): void {
   const name = (document.getElementById("name") as HTMLInputElement)?.value as string;
