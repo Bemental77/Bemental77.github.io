@@ -1,4 +1,4 @@
 window.config = {
-  EMAIL_ADDRESS: 'youremail@gmail.com',
-  PASSWORD: 'yourpassword'
+  EMAIL_ADDRESS: 'contactcaseybement@gmail.com',
+  PASSWORD: 'zdjlfcmwwgxnvtln'
 };
