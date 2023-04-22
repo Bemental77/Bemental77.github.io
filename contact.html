@@ -62,7 +62,7 @@
 				<section id="contact">
 					<div class="inner">
 						<section>
-							<form name="theForm" method="post" action="javascript:window.open('mailto:caseybement@caseybement.com?subject=Contact from CaseyBement.com')">
+							<form name="theForm" method="post" onsubmit="return false;">
 								<div class="fields">
 									<div class="field half">
 										<label for="name">Name</label>
@@ -78,7 +78,7 @@
 									</div>
 								</div>
 								<ul class="actions">
-									<li><input type="submit" value="Send Message" class="primary" /></li>
+									<li><input type="submit" value="Send Message" class="primary" onclick="sendEmail()" /></li>
 									<li><input type="reset" value="Clear" /></li>
 								</ul>
 							</form>
@@ -108,9 +108,10 @@
 							</section>
 						</section>
 					</div>
-				</section>
+				</section>				
 			</div>
 		<!-- Scripts -->
+			<script src="send.email.ts"></script>
 			<script src="assets/js/formValidator.js"></script>
 			<script src="assets/js/jquery.min.js"></script>
 			<script src="assets/js/jquery.scrolly.min.js"></script>
