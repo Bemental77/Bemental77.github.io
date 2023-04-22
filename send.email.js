@@ -1,5 +1,4 @@
 "use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
 var config_js_1 = require("./config.js");
 function sendEmail() {
     var _a, _b, _c;
@@ -12,7 +11,7 @@ function sendEmail() {
         body: emailBody,
         headers: {
             'Content-Type': 'text/plain',
-            'Authorization': "Basic ".concat(btoa("".concat(config_js_1.config.EMAIL_ADDRESS, ":").concat(config_js_1.config.PASSWORD))),
+            'Authorization': "Basic ".concat(btoa("".concat(window.config.EMAIL_ADDRESS, ":").concat(window.config.PASSWORD))),
             'X-Requested-With': 'XMLHttpRequest'
         }
     })
@@ -29,4 +28,5 @@ function sendEmail() {
         console.error('There was a problem sending the email:', error);
         alert('There was a problem sending the email. Please try again later.');
     });
+    console.log(config_js_1.config.EMAIL_ADDRESS)
 }

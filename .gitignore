@@ -1,2 +1,3 @@
 .env
+send.email.ts
 node_modules/

@@ -1,4 +1,3 @@
-import { config } from './config.js';
 
 function sendEmail(): void {
   const name = (<HTMLInputElement>document.getElementById("name"))?.value;
@@ -12,7 +11,7 @@ function sendEmail(): void {
     body: emailBody,
     headers: {
       'Content-Type': 'text/plain',
-      'Authorization': `Basic ${btoa(`${config.EMAIL_ADDRESS}:${config.PASSWORD}`)}`,
+     // 'Authorization': `Basic ${btoa(`${window.config.EMAIL_ADDRESS}:${config.PASSWORD}`)}`,
       'X-Requested-With': 'XMLHttpRequest'
     }
   })
