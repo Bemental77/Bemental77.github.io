@@ -1,3 +1,4 @@
 .env
 send.email.ts
+sendgrid.env
 node_modules/

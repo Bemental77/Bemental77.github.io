@@ -1,31 +1,27 @@
+function sendEmail() {
+  const sgMail = require('@sendgrid/mail');
+  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
-function sendEmail(): void {
-  const name = (<HTMLInputElement>document.getElementById("name"))?.value;
-  const emailaddress = (<HTMLInputElement>document.getElementById("email"))?.value;
-  const message = (<HTMLInputElement>document.getElementById("message"))?.value;
+  const name = (<HTMLInputElement>document.getElementById('name')).value;
+  const emailaddress = (<HTMLInputElement>document.getElementById('email')).value;
+  const message = (<HTMLTextAreaElement>document.getElementById('message')).value;
 
-  const emailBody = `From: ${name} <${emailaddress}>\r\nTo: caseybement@caseybement.com\r\nSubject: Message from your website\r\n\r\n${message}`;
-  
-  fetch('https://smtp.gmail.com:587', {
-    method: 'POST',
-    body: emailBody,
-    headers: {
-      'Content-Type': 'text/plain',
-     // 'Authorization': `Basic ${btoa(`${window.config.EMAIL_ADDRESS}:${config.PASSWORD}`)}`,
-      'X-Requested-With': 'XMLHttpRequest'
-    }
-  })
-  .then(response => {
-    if (!response.ok) {
-      throw new Error('Network response was not ok');
-    }
-    alert('Email sent successfully!');
-    (<HTMLInputElement>document.getElementById('name')).value = '';
-    (<HTMLInputElement>document.getElementById('email')).value = '';
-    (<HTMLInputElement>document.getElementById('message')).value = '';
-  })
-  .catch(error => {
-    console.error('There was a problem sending the email:', error);
-    alert('There was a problem sending the email. Please try again later.');
-  });
+  const msg = {
+    to: 'caseybement@caseybement.com', // Change to your recipient
+    from: 'contactcaseybement@gmail.com', // Change to your verified sender
+    subject: 'Message from your website',
+    text: message,
+    html: `<p>${message}</p><br><p>${name} <${emailaddress}></p>`,
+  };
+
+  sgMail
+    .send(msg)
+    .then(() => {
+      console.log('Email sent');
+      alert('Email sent successfully!');
+    })
+    .catch((error) => {
+      console.error(error);
+      alert('There was a problem sending the email. Please try again later.');
+    });
 }
