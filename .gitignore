@@ -1,3 +1,5 @@
 .env
+config.js
 send.email.ts
+config.js
 node_modules/
