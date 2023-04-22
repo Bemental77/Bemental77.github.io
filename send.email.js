@@ -12,7 +12,7 @@ function sendEmail() {
         body: emailBody,
         headers: {
             'Content-Type': 'text/plain',
-            'Authorization': "Basic ".concat(btoa("".concat(config_js_1.email, ":").concat(config_js_1.password))),
+            'Authorization': "Basic ".concat(btoa("".concat(config_js_1.config.EMAIL_ADDRESS, ":").concat(config_js_1.config.PASSWORD))),
             'X-Requested-With': 'XMLHttpRequest'
         }
     })
