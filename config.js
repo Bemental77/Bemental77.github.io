@@ -1,7 +1,8 @@
-const email = process.env.EMAIL_ADDRESS;
-const password = process.env.PASSWORD;
-
-module.exports = {
-  email,
-  password,
+export var config = {
+  EMAIL_ADDRESS: 'contactcaseybement@gmail.com',
+  PASSWORD: 'zdjlfcmwwgxnvtln'
 };
+
+if (typeof module !== 'undefined') {
+  module.exports = config;
+}
