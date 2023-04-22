@@ -6,12 +6,12 @@ function sendEmail() {
     var emailaddress = (_b = document.getElementById("email")) === null || _b === void 0 ? void 0 : _b.value;
     var message = (_c = document.getElementById("message")) === null || _c === void 0 ? void 0 : _c.value;
     var emailBody = "From: ".concat(name, " <").concat(emailaddress, ">\r\nTo: caseybement@caseybement.com\r\nSubject: Message from your website\r\n\r\n").concat(message);
-    fetch('https://smtp.gmail.com:587', {
+    fetch('https://smtp.sendgrid.net:587', {
         method: 'POST',
         body: emailBody,
         headers: {
             'Content-Type': 'text/plain',
-            'Authorization': "Basic ".concat(btoa("".concat(window.config.EMAIL_ADDRESS, ":").concat(window.config.PASSWORD))),
+            'Authorization': "Basic ".concat(btoa("".concat('apikey', ":").concat(window.config.PASSWORD))),
             'X-Requested-With': 'XMLHttpRequest'
         }
     })
