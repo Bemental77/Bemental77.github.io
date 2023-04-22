@@ -6,7 +6,7 @@ function sendEmail() {
     var emailaddress = (_b = document.getElementById("email")) === null || _b === void 0 ? void 0 : _b.value;
     var message = (_c = document.getElementById("message")) === null || _c === void 0 ? void 0 : _c.value;
     var emailBody = "From: ".concat(name, " <").concat(emailaddress, ">\r\nTo: caseybement@caseybement.com\r\nSubject: Message from your website\r\n\r\n").concat(message);
-    fetch('https://smtp.gmail.com:587', {
+    fetch('https://smtp.gmail.com:465', {
         method: 'POST',
         body: emailBody,
         headers: {
@@ -28,5 +28,4 @@ function sendEmail() {
         console.error('There was a problem sending the email:', error);
         alert('There was a problem sending the email. Please try again later.');
     });
-    console.log(config_js_1.config.EMAIL_ADDRESS)
 }
