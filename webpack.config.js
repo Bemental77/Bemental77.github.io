@@ -1,7 +1,7 @@
 const Dotenv = require('dotenv-webpack');
 
 module.exports = {
-  // other configuration options...
+  mode: 'production',
   plugins: [
     new Dotenv()
   ]
