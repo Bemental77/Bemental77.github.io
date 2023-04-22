@@ -1,5 +1,5 @@
 import { config } from 'dotenv';
-config()
+config();
 
 function sendEmail(): void {
   const name = (document.getElementById("name") as HTMLInputElement)?.value as string;
@@ -8,8 +8,8 @@ function sendEmail(): void {
 
   const emailBody = `From: ${name} <${email}>\r\nTo: caseybement@caseybement.com\r\nSubject: Message from your website\r\n\r\n${message}`;
 
-  const emailAddress = process.env.emailaddress;
-  const password = process.env.password;
+  const emailAddress = process.env.emailaddress as string;
+  const password = process.env.password as string;
 
   fetch('https://smtp.gmail.com:587', {
     method: 'POST',
