@@ -1,31 +1,21 @@
 
-function sendEmail(): void {
-  const name = (<HTMLInputElement>document.getElementById("name"))?.value;
-  const emailaddress = (<HTMLInputElement>document.getElementById("email"))?.value;
-  const message = (<HTMLInputElement>document.getElementById("message"))?.value;
+// using Twilio SendGrid's v3 Node.js Library
+// https://github.com/sendgrid/sendgrid-nodejs
 
-  const emailBody = `From: ${name} <${emailaddress}>\r\nTo: caseybement@caseybement.com\r\nSubject: Message from your website\r\n\r\n${message}`;
-  
-  fetch('https://smtp.gmail.com:587', {
-    method: 'POST',
-    body: emailBody,
-    headers: {
-      'Content-Type': 'text/plain',
-     // 'Authorization': `Basic ${btoa(`${window.config.EMAIL_ADDRESS}:${config.PASSWORD}`)}`,
-      'X-Requested-With': 'XMLHttpRequest'
-    }
-  })
-  .then(response => {
-    if (!response.ok) {
-      throw new Error('Network response was not ok');
-    }
-    alert('Email sent successfully!');
-    (<HTMLInputElement>document.getElementById('name')).value = '';
-    (<HTMLInputElement>document.getElementById('email')).value = '';
-    (<HTMLInputElement>document.getElementById('message')).value = '';
-  })
-  .catch(error => {
-    console.error('There was a problem sending the email:', error);
-    alert('There was a problem sending the email. Please try again later.');
-  });
+const sgMail = require('@sendgrid/mail')
+sgMail.setApiKey(process.env.SE)
+const msg = {
+  to: 'caseybement@caseybement.com', // Change to your recipient
+  from: 'contactcaseybement@gmail.com', // Change to your verified sender
+  subject: 'Sending with SendGrid is Fun',
+  text: 'and easy to do anywhere, even with Node.js',
+  html: '<strong>and easy to do anywhere, even with Node.js</strong>',
 }
+sgMail
+  .send(msg)
+  .then(() => {
+    console.log('Email sent')
+  })
+  .catch((error) => {
+    console.error(error)
+  })
