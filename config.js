@@ -1,8 +1,4 @@
-export var config = {
-  EMAIL_ADDRESS: 'contactcaseybement@gmail.com',
-  PASSWORD: 'zdjlfcmwwgxnvtln'
+window.config = {
+  EMAIL_ADDRESS: 'youremail@gmail.com',
+  PASSWORD: 'yourpassword'
 };
-
-if (typeof module !== 'undefined') {
-  module.exports = config;
-}
