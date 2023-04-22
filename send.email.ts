@@ -1,5 +1,4 @@
-import { config } from "dotenv";
-config();
+import { EMAIL_ADDRESS, PASSWORD } from './config.js';
 
 function sendEmail(): void {
   const name = (<HTMLInputElement>document.getElementById("name"))?.value;
@@ -13,7 +12,7 @@ function sendEmail(): void {
     body: emailBody,
     headers: {
       'Content-Type': 'text/plain',
-      'Authorization': `Basic ${btoa(`${process.env.EMAIL_ADDRESS}:${process.env.PASSWORD}`)}`,
+      'Authorization': `Basic ${btoa(`${EMAIL_ADDRESS}:${PASSWORD}`)}`,
       'X-Requested-With': 'XMLHttpRequest'
     }
   })

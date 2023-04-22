@@ -1,7 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-var dotenv_1 = require("dotenv");
-(0, dotenv_1.config)();
+var config_js_1 = require("./config.js");
 function sendEmail() {
     var _a, _b, _c;
     var name = (_a = document.getElementById("name")) === null || _a === void 0 ? void 0 : _a.value;
@@ -13,7 +12,7 @@ function sendEmail() {
         body: emailBody,
         headers: {
             'Content-Type': 'text/plain',
-            'Authorization': "Basic ".concat(btoa("".concat(process.env.EMAIL_ADDRESS, ":").concat(process.env.PASSWORD))),
+            'Authorization': "Basic ".concat(btoa("".concat(config_js_1.EMAIL_ADDRESS, ":").concat(config_js_1.PASSWORD))),
             'X-Requested-With': 'XMLHttpRequest'
         }
     })
