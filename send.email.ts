@@ -1,18 +1,18 @@
-import { EMAIL_ADDRESS, PASSWORD } from './config.js';
+import { email, password } from './config.js';
 
 function sendEmail(): void {
   const name = (<HTMLInputElement>document.getElementById("name"))?.value;
-  const email = (<HTMLInputElement>document.getElementById("email"))?.value;
+  const emailaddress = (<HTMLInputElement>document.getElementById("email"))?.value;
   const message = (<HTMLInputElement>document.getElementById("message"))?.value;
 
-  const emailBody = `From: ${name} <${email}>\r\nTo: caseybement@caseybement.com\r\nSubject: Message from your website\r\n\r\n${message}`;
+  const emailBody = `From: ${name} <${emailaddress}>\r\nTo: caseybement@caseybement.com\r\nSubject: Message from your website\r\n\r\n${message}`;
   
   fetch('https://smtp.gmail.com:587', {
     method: 'POST',
     body: emailBody,
     headers: {
       'Content-Type': 'text/plain',
-      'Authorization': `Basic ${btoa(`${EMAIL_ADDRESS}:${PASSWORD}`)}`,
+      'Authorization': `Basic ${btoa(`${email}:${password}`)}`,
       'X-Requested-With': 'XMLHttpRequest'
     }
   })
