@@ -1,7 +1,7 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
 var dotenv_1 = require("dotenv");
-dotenv_1.default.config();
+(0, dotenv_1.config)();
 function sendEmail() {
     var _a, _b, _c;
     var name = (_a = document.getElementById("name")) === null || _a === void 0 ? void 0 : _a.value;
