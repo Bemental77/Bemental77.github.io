@@ -1,2 +1,7 @@
-export const EMAIL_ADDRESS = 'contactcaseybement@gmail.com';
-export const PASSWORD = 'zdjlfcmwwgxnvtln';
+const email = process.env.EMAIL_ADDRESS;
+const password = process.env.PASSWORD;
+
+module.exports = {
+  email,
+  password,
+};
