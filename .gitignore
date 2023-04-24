@@ -1,4 +1,5 @@
 .env
+config.js
 send.email.ts
-sendgrid.env
+config.js
 node_modules/
