@@ -35,16 +35,13 @@ var __generator = (this && this.__generator) || function (thisArg, body) {
     }
 };
 var _this = this;
-// get the form element
-var form = document.querySelector('form');
-if (form) { // check if the form element exists
-    // add event listener to the form on submit
+var form = document.querySelector('form[name="theForm"]');
+if (form) {
     form.addEventListener('submit', function (event) { return __awaiter(_this, void 0, void 0, function () {
         var nameInput, emailInput, messageInput, name, email, message, response, data;
         return __generator(this, function (_a) {
             switch (_a.label) {
                 case 0:
-                    // prevent default form submission behavior
                     event.preventDefault();
                     nameInput = document.querySelector('#name');
                     emailInput = document.querySelector('#email');

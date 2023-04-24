@@ -1,10 +1,7 @@
-// get the form element
-const form = document.querySelector('form');
+const form = document.querySelector('form[name="theForm"]');
 
-if (form) { // check if the form element exists
-  // add event listener to the form on submit
+if (form) {
   form.addEventListener('submit', async (event) => {
-    // prevent default form submission behavior
     event.preventDefault();
 
     const nameInput = document.querySelector('#name') as HTMLInputElement;
@@ -15,8 +12,6 @@ if (form) { // check if the form element exists
     const email = emailInput.value;
     const message = messageInput.value;
 
-
-    // make the fetch request
     const response = await fetch('sendemail/pages/api/send', {
       method: 'POST',
       headers: {
@@ -29,7 +24,6 @@ if (form) { // check if the form element exists
       })
     });
 
-    // do something with the response
     const data = await response.json();
     console.log(data);
   });
