@@ -1,31 +1,36 @@
+// get the form element
+const form = document.querySelector('form');
 
-function sendEmail(): void {
-  const name = (<HTMLInputElement>document.getElementById("name"))?.value;
-  const emailaddress = (<HTMLInputElement>document.getElementById("email"))?.value;
-  const message = (<HTMLInputElement>document.getElementById("message"))?.value;
+if (form) { // check if the form element exists
+  // add event listener to the form on submit
+  form.addEventListener('submit', async (event) => {
+    // prevent default form submission behavior
+    event.preventDefault();
 
-  const emailBody = `From: ${name} <${emailaddress}>\r\nTo: caseybement@caseybement.com\r\nSubject: Message from your website\r\n\r\n${message}`;
-  
-  fetch('https://smtp.gmail.com:587', {
-    method: 'POST',
-    body: emailBody,
-    headers: {
-      'Content-Type': 'text/plain',
-     // 'Authorization': `Basic ${btoa(`${window.config.EMAIL_ADDRESS}:${config.PASSWORD}`)}`,
-      'X-Requested-With': 'XMLHttpRequest'
-    }
-  })
-  .then(response => {
-    if (!response.ok) {
-      throw new Error('Network response was not ok');
-    }
-    alert('Email sent successfully!');
-    (<HTMLInputElement>document.getElementById('name')).value = '';
-    (<HTMLInputElement>document.getElementById('email')).value = '';
-    (<HTMLInputElement>document.getElementById('message')).value = '';
-  })
-  .catch(error => {
-    console.error('There was a problem sending the email:', error);
-    alert('There was a problem sending the email. Please try again later.');
+    const nameInput = document.querySelector('#name') as HTMLInputElement;
+    const emailInput = document.querySelector('#email') as HTMLInputElement;
+    const messageInput = document.querySelector('#message') as HTMLInputElement;
+
+    const name = nameInput.value;
+    const email = emailInput.value;
+    const message = messageInput.value;
+
+
+    // make the fetch request
+    const response = await fetch('sendemail/pages/api/send', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        name,
+        email,
+        message
+      })
+    });
+
+    // do something with the response
+    const data = await response.json();
+    console.log(data);
   });
 }
