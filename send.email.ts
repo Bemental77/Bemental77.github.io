@@ -1,3 +1,4 @@
+
 // get the form element
 const form = document.querySelector('form');
 
@@ -33,4 +34,4 @@ if (form) { // check if the form element exists
     const data = await response.json();
     console.log(data);
   });
-}
+
