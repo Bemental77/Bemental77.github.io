@@ -1,4 +1,4 @@
-function sendEmail() {
+function sendEmailClientSide() {
   const form = document.querySelector('form[name="theForm"]');
 
   if (form) {
