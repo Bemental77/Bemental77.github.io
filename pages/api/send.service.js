@@ -1,3 +1,4 @@
+"use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -34,37 +35,42 @@ var __generator = (this && this.__generator) || function (thisArg, body) {
         if (op[0] & 5) throw op[1]; return { value: op[0] ? op[1] : void 0, done: true };
     }
 };
-function sendEmailClientSide() {
+Object.defineProperty(exports, "__esModule", { value: true });
+var nodemailer = require("nodemailer");
+function sendEmail(formData) {
     return __awaiter(this, void 0, void 0, function () {
-        var nameInput, emailInput, messageInput, name, email, message, response, data;
+        var transporter, error_1;
         return __generator(this, function (_a) {
             switch (_a.label) {
                 case 0:
-                    nameInput = document.querySelector('#name');
-                    emailInput = document.querySelector('#email');
-                    messageInput = document.querySelector('#message');
-                    name = nameInput.value;
-                    email = emailInput.value;
-                    message = messageInput.value;
-                    return [4 /*yield*/, fetch('/api/send', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify({
-                                name: name,
-                                email: email,
-                                message: message
-                            })
-                        })];
+                    transporter = nodemailer.createTransport({
+                        host: 'smtp.gmail.com',
+                        port: 587,
+                        secure: false,
+                        auth: {
+                            user: process.env.EMAIL_ADDRESS,
+                            pass: process.env.EMAIL_PASSWORD,
+                        },
+                    });
+                    _a.label = 1;
                 case 1:
-                    response = _a.sent();
-                    return [4 /*yield*/, response.json()];
+                    _a.trys.push([1, 3, , 4]);
+                    return [4 /*yield*/, transporter.sendMail({
+                            from: "\"".concat(formData.name, "\" <").concat(formData.email, ">"),
+                            to: 'caseybement@caseybement.com',
+                            subject: 'Message from your website',
+                            text: formData.message,
+                        })];
                 case 2:
-                    data = _a.sent();
-                    console.log(data);
-                    return [2 /*return*/];
+                    _a.sent();
+                    return [2 /*return*/, { message: 'Email sent successfully!' }];
+                case 3:
+                    error_1 = _a.sent();
+                    console.error(error_1);
+                    throw new Error('There was a problem sending the email.');
+                case 4: return [2 /*return*/];
             }
         });
     });
 }
+exports.default = sendEmail;

@@ -1,3 +1,4 @@
+"use strict";
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -34,37 +35,42 @@ var __generator = (this && this.__generator) || function (thisArg, body) {
         if (op[0] & 5) throw op[1]; return { value: op[0] ? op[1] : void 0, done: true };
     }
 };
-function sendEmailClientSide() {
+Object.defineProperty(exports, "__esModule", { value: true });
+var send_service_1 = require("./send.service");
+function handler(req, res) {
     return __awaiter(this, void 0, void 0, function () {
-        var nameInput, emailInput, messageInput, name, email, message, response, data;
+        var formDataName, formDataEmail, formDataMessage, formData, response, error_1;
         return __generator(this, function (_a) {
             switch (_a.label) {
                 case 0:
-                    nameInput = document.querySelector('#name');
-                    emailInput = document.querySelector('#email');
-                    messageInput = document.querySelector('#message');
-                    name = nameInput.value;
-                    email = emailInput.value;
-                    message = messageInput.value;
-                    return [4 /*yield*/, fetch('/api/send', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify({
-                                name: name,
-                                email: email,
-                                message: message
-                            })
-                        })];
+                    if (req.method !== 'POST') {
+                        res.status(405).json({ message: 'Method not allowed' });
+                        return [2 /*return*/];
+                    }
+                    formDataName = req.body.name;
+                    formDataEmail = req.body.email;
+                    formDataMessage = req.body.message;
+                    formData = {
+                        name: formDataName,
+                        email: formDataEmail,
+                        message: formDataMessage
+                    };
+                    _a.label = 1;
                 case 1:
-                    response = _a.sent();
-                    return [4 /*yield*/, response.json()];
+                    _a.trys.push([1, 3, , 4]);
+                    return [4 /*yield*/, (0, send_service_1.default)(formData)];
                 case 2:
-                    data = _a.sent();
-                    console.log(data);
-                    return [2 /*return*/];
+                    response = _a.sent();
+                    res.status(200).json(response);
+                    return [3 /*break*/, 4];
+                case 3:
+                    error_1 = _a.sent();
+                    console.error(error_1);
+                    res.status(500).json({ message: error_1 });
+                    return [3 /*break*/, 4];
+                case 4: return [2 /*return*/];
             }
         });
     });
 }
+exports.default = handler;
