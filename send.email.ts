@@ -8,7 +8,7 @@ async function sendEmailClientSide() {
   const email = emailInput.value;
   const message = messageInput.value;
 
-  const response = await fetch('sendemail/pages/api/send', {
+  const response = await fetch('sendemail/pages/api/send.js', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json'
