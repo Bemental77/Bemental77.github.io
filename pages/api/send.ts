@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import sendEmail from '/Users/caseybement/Bemental77.github.io/sendemail/pages/api/send.service'
+import sendEmail from './send.service'
 
 export default async function handler(
   req: NextApiRequest,
