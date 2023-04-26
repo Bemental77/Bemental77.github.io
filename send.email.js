@@ -35,41 +35,37 @@ var __generator = (this && this.__generator) || function (thisArg, body) {
     }
 };
 function sendEmailClientSide() {
-    var _this = this;
-    var form = document.querySelector('form[name="theForm"]');
-    if (form) {
-        form.addEventListener('submit', function (event) { return __awaiter(_this, void 0, void 0, function () {
-            var nameInput, emailInput, messageInput, name, email, message, response, data;
-            return __generator(this, function (_a) {
-                switch (_a.label) {
-                    case 0:
-                        event.preventDefault();
-                        nameInput = document.querySelector('#name');
-                        emailInput = document.querySelector('#email');
-                        messageInput = document.querySelector('#message');
-                        name = nameInput.value;
-                        email = emailInput.value;
-                        message = messageInput.value;
-                        return [4 /*yield*/, fetch('sendemail/pages/api/send', {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json'
-                                },
-                                body: JSON.stringify({
-                                    name: name,
-                                    email: email,
-                                    message: message
-                                })
-                            })];
-                    case 1:
-                        response = _a.sent();
-                        return [4 /*yield*/, response.json()];
-                    case 2:
-                        data = _a.sent();
-                        console.log(data);
-                        return [2 /*return*/];
-                }
-            });
-        }); });
-    }
+    return __awaiter(this, void 0, void 0, function () {
+        var form, nameInput, emailInput, messageInput, name, email, message, response, data;
+        return __generator(this, function (_a) {
+            switch (_a.label) {
+                case 0:
+                    form = document.querySelector('form[name="theForm"]');
+                    nameInput = document.querySelector('#name');
+                    emailInput = document.querySelector('#email');
+                    messageInput = document.querySelector('#message');
+                    name = nameInput.value;
+                    email = emailInput.value;
+                    message = messageInput.value;
+                    return [4 /*yield*/, fetch('sendemail/pages/api/send', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                name: name,
+                                email: email,
+                                message: message
+                            })
+                        })];
+                case 1:
+                    response = _a.sent();
+                    return [4 /*yield*/, response.json()];
+                case 2:
+                    data = _a.sent();
+                    console.log(data);
+                    return [2 /*return*/];
+            }
+        });
+    });
 }
