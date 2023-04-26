@@ -1,5 +1,4 @@
 async function sendEmailClientSide() {
-  const form = document.querySelector('form[name="theForm"]');
   const nameInput = document.querySelector('#name') as HTMLInputElement;
   const emailInput = document.querySelector('#email') as HTMLInputElement;
   const messageInput = document.querySelector('#message') as HTMLInputElement;
@@ -8,7 +7,7 @@ async function sendEmailClientSide() {
   const email = emailInput.value;
   const message = messageInput.value;
 
-  const response = await fetch('sendemail/pages/api/send.js', {
+  const response = await fetch('/api/send', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json'
