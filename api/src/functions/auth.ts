@@ -4,8 +4,8 @@ const region = 'YOUR_REGION';
 
 // Set the access key ID and secret access key
 const credentials = new AWS.Credentials({
-  accessKeyId: 'YOUR_ACCESS_KEY_ID',
-  secretAccessKey: 'YOUR_SECRET_ACCESS_KEY'
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
 });
 
 // Set up the API Gateway Management API client
