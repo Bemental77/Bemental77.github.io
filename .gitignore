@@ -1,5 +1,11 @@
+# package directories
+node_modules
+jspm_packages
+
+# Serverless directories
+.serverless
+
 .env
 config.js
 send.email.ts
 config.js
-node_modules/
