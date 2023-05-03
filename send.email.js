@@ -46,7 +46,7 @@ function sendEmailClientSide() {
                     name = nameInput.value;
                     email = emailInput.value;
                     message = messageInput.value;
-                    return [4 /*yield*/, fetch('https://4v5c4sfqnp7fi6blb2a4wys2e40zlgtk.lambda-url.us-east-1.on.aws/', {
+                    return [4 /*yield*/, fetch('https://0ltpfr0u8f.execute-api.us-east-1.amazonaws.com/Prod', {
                             method: 'POST',
                             headers: {
                                 'Content-Type': 'application/json'
