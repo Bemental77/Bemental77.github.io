@@ -48,7 +48,6 @@ function sendEmailClientSide() {
                     message = messageInput.value;
                     return [4 /*yield*/, fetch('https://4v5c4sfqnp7fi6blb2a4wys2e40zlgtk.lambda-url.us-east-1.on.aws/', {
                             method: 'POST',
-                            mode: 'no-cors',
                             headers: {
                                 'Content-Type': 'application/json'
                             },
