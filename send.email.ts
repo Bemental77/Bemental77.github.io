@@ -7,7 +7,7 @@ async function sendEmailClientSide() {
   const email = emailInput.value;
   const message = messageInput.value;
 
-  const response = await fetch('https://0ltpfr0u8f.execute-api.us-east-1.amazonaws.com/Prod', {
+  const response = await fetch('https://0ltpfr0u8f.execute-api.us-east-1.amazonaws.com/Prod/sendEmail', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json'
