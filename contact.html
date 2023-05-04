@@ -86,7 +86,7 @@
 							</div>
 						</div>
 						<ul class="actions">
-							<li><input type="submit" value="Send Message" class="primary" onclick="sendEmailClientSide()" /></li>
+							<li><input type="submit" value="Send Message" class="primary" onclick="submitForm()" /></li>
 							<li><input type="reset" value="Clear" /></li>
 						</ul>
 					</form>
@@ -119,6 +119,16 @@
 		</section>
 	</div>
 	<!-- Scripts -->
+	<script>
+		function submitForm() {
+				// Display alert
+				alert("Form submitted!");
+		
+				// Clear form
+				document.getElementById("theForm").reset();
+		}
+		sendEmailClientSide()
+		</script>
 	<script src="send.email.js"></script>
 	<script src="assets/js/formValidator.js"></script>
 	<script src="assets/js/jquery.min.js"></script>
