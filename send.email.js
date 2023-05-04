@@ -64,6 +64,10 @@ function sendEmailClientSide() {
                 case 2:
                     data = _a.sent();
                     console.log(data);
+                    nameInput.value = '';
+                    emailInput.value = '';
+                    messageInput.value = '';
+                    alert('Email sent successfully!');
                     return [2 /*return*/];
             }
         });

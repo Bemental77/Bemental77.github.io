@@ -22,5 +22,10 @@ async function sendEmailClientSide() {
 
   const data = await response.json();
   console.log(data);
-}
 
+  nameInput.value = '';
+  emailInput.value = '';
+  messageInput.value = '';
+
+  alert('Email sent successfully!');
+}
