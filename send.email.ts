@@ -1,5 +1,3 @@
-import { showToast } from "./show.toast";
-
 async function sendEmailClientSide() {
   const nameInput = document.querySelector('#name') as HTMLInputElement;
   const emailInput = document.querySelector('#email') as HTMLInputElement;
@@ -9,12 +7,12 @@ async function sendEmailClientSide() {
   const email = emailInput.value;
   const message = messageInput.value;
 
-  const response = await fetch('https://0ltpfr0u8f.execute-api.us-east-1.amazonaws.com/Prod/sendEmail', {
+  const response = await fetch('https://0ltpfr0u8f.execute-api.us-east-1.amazonaws.com/Prod', {
     method: 'POST',
+    mode: 'no-cors',
     headers: {
       'Content-Type': 'application/json'
     },
-    mode: 'no-cors',
     body: JSON.stringify({
       name,
       email,
@@ -24,6 +22,5 @@ async function sendEmailClientSide() {
 
   const data = await response.json();
   console.log(data);
-  showToast()
 }
 
