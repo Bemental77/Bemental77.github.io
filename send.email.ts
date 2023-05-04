@@ -7,7 +7,7 @@ async function sendEmailClientSide() {
   const email = emailInput.value;
   const message = messageInput.value;
 
-  const response = await fetch('hhttps://4v5c4sfqnp7fi6blb2a4wys2e40zlgtk.lambda-url.us-east-1.on.aws/ ', {
+  const response = await fetch('https://4v5c4sfqnp7fi6blb2a4wys2e40zlgtk.lambda-url.us-east-1.on.aws/ ', {
     method: 'POST',
     mode: 'no-cors',
     headers: {
