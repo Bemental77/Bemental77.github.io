@@ -1,3 +1,5 @@
+import { showToast } from "./show.toast";
+
 async function sendEmailClientSide() {
   const nameInput = document.querySelector('#name') as HTMLInputElement;
   const emailInput = document.querySelector('#email') as HTMLInputElement;
@@ -12,6 +14,7 @@ async function sendEmailClientSide() {
     headers: {
       'Content-Type': 'application/json'
     },
+    mode: 'no-cors',
     body: JSON.stringify({
       name,
       email,
@@ -21,5 +24,6 @@ async function sendEmailClientSide() {
 
   const data = await response.json();
   console.log(data);
+  showToast()
 }
 
