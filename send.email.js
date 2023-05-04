@@ -36,7 +36,7 @@ var __generator = (this && this.__generator) || function (thisArg, body) {
 };
 function sendEmailClientSide() {
     return __awaiter(this, void 0, void 0, function () {
-        var nameInput, emailInput, messageInput, name, email, message, response, data;
+        var nameInput, emailInput, messageInput, name, email, message, response;
         return __generator(this, function (_a) {
             switch (_a.label) {
                 case 0:
@@ -60,10 +60,6 @@ function sendEmailClientSide() {
                         })];
                 case 1:
                     response = _a.sent();
-                    return [4 /*yield*/, response.json()];
-                case 2:
-                    data = _a.sent();
-                    console.log(data);
                     nameInput.value = '';
                     emailInput.value = '';
                     messageInput.value = '';
