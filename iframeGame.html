@@ -31,7 +31,7 @@
     var dosbox = new Dosbox({
       id: "dosbox",
       onload: function (dosbox) {
-        dosbox.run("https://js-dos.com/games/vikings.exe.data", "./VIKINGS.EXE");
+        dosbox.run("assets/vikings.jsdos", "./VIKINGS.EXE");
       },
       onrun: function (dosbox, app) {
         console.log("App '" + app + "' is running");
