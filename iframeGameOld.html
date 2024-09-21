@@ -26,14 +26,19 @@
   
 
   <div id="dosbox"></div>
+  
   <br />
   <button onclick="dosbox.requestFullScreen();">Make fullscreen</button>
   <script type="text/javascript" src="https://js-dos.com/cdn/js-dos-api.js"></script>
   <script type="text/javascript">
+    emulators.pathPrefix = "https://v8.js-dos.com/latest/emulators/";
+    const ci = await emulators.dosWorker(new Uint8Array(await bundle.arrayBuffer()));
+
     var dosbox = new Dosbox({
       id: "dosbox",
       onload: function (dosbox) {
         dosbox.run("caseybement.com/vikings.zip", "");
+        
       },
       onrun: function (dosbox, app) {
         console.log("App '" + app + "' is running");
