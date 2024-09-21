@@ -23,6 +23,15 @@
 </head>
 
 <body>
+
+  <div id="dos"></div>
+
+<script>
+    Dos(document.getElementById("dos"), {
+        url: "https://cdn.dos.zone/original/2X/9/9ed7eb9c2c441f56656692ed4dc7ab28f58503ce.jsdos",
+    });
+</script>
+  
   <div id="dosbox"></div>
   <br />
   <button onclick="dosbox.requestFullScreen();">Make fullscreen</button>
@@ -31,7 +40,8 @@
     var dosbox = new Dosbox({
       id: "dosbox",
       onload: function (dosbox) {
-        dosbox.run("caseybement.com/vikings.zip", "./VIKINGS.EXE");
+        dosbox.run("https://cdn.dos.zone/original/2X/9/9ed7eb9c2c441f56656692ed4dc7ab28f58503ce.jsdos
+", "./dig.exe");
       },
       onrun: function (dosbox, app) {
         console.log("App '" + app + "' is running");
