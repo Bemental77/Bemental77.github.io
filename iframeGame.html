@@ -1,53 +1,85 @@
 <!doctype html>
-<html lang="en-us">
-
+<html>
 <head>
-  <meta charset="utf-8">
-  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
-  <title>js-dos</title>
-  <style type="text/css">
-    body {
-      margin: 0;
-    }
-
-    .dosbox-container {
-      width: 640px;
-      height: 400px;
-    }
-  </style>
-  <!-- js-dos style sheet -->
-  <link rel="stylesheet" href="https://v8.js-dos.com/latest/js-dos.css">
-
-  <!-- js-dos -->
-  <script src="https://v8.js-dos.com/latest/js-dos.js"></script>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Digger Example</title>
+    <script src="https://v8.js-dos.com/latest/emulators/emulators.js"></script>
+    <style>
+        html, body, #root {
+            width: 100%;
+            height: 100%;
+            padding: 0;
+            margin: 0;
+            overflow: hidden;
+        }
+    </style>
 </head>
 
 <body>
+<div id="root">
+</div>
+<script type="module">
+    import * as THREE from 'https://unpkg.com/three@latest/build/three.module.js';
+    emulators.pathPrefix = "https://v8.js-dos.com/latest/emulators/";
 
-  <div id="dos"></div>
+    const img = document.createElement("canvas");
+    img.width = 320;
+    img.height = 200;
 
-<script>
-    Dos(document.getElementById("dos"), {
-        url: "https://cdn.dos.zone/original/2X/9/9ed7eb9c2c441f56656692ed4dc7ab28f58503ce.jsdos",
+    const ctx = img.getContext('2d');
+    const texture = new THREE.CanvasTexture(img);
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color();
+
+    const camera = new THREE.PerspectiveCamera( 75, window.innerWidth/window.innerHeight, 0.1, 1000 );
+    const renderer = new THREE.WebGLRenderer();
+    renderer.setSize( window.innerWidth, window.innerHeight );
+
+    document.getElementById("root").appendChild(renderer.domElement);
+
+    const geometry = new THREE.BoxGeometry();
+    const material = new THREE.MeshBasicMaterial({
+        map: texture,
     });
+    const cube = new THREE.Mesh( geometry, material );
+    scene.add( cube );
+
+    camera.position.z = 2;
+
+    const animate = function () {
+            requestAnimationFrame( animate );
+
+            cube.rotation.x += 0.01;
+            cube.rotation.y += 0.01;
+
+            renderer.render( scene, camera );
+    };
+
+    animate();
+
+    async function runDigger() {
+        stop();
+
+        const bundle = await fetch("https://cdn.dos.zone/original/2X/9/9ed7eb9c2c441f56656692ed4dc7ab28f58503ce.jsdos");
+        const ci = await emulators.dosWorker(new Uint8Array(await bundle.arrayBuffer()));
+        const rgba = new Uint8ClampedArray(320 * 200 * 4);
+
+        ci.events().onFrame((rgb, _rgba) => {
+            for (let next = 0; next < 320 * 200; ++next) {
+                 rgba[next * 4 + 0] = rgb[next * 3 + 0];
+                 rgba[next * 4 + 1] = rgb[next * 3 + 1];
+                 rgba[next * 4 + 2] = rgb[next * 3 + 2];
+                 rgba[next * 4 + 3] = 255;
+            }
+
+            ctx?.putImageData(new ImageData(rgba, 320, 200), 0, 0);
+            texture.needsUpdate = true;
+        });
+    }
+
+    runDigger();
 </script>
-  
-  <div id="dosbox"></div>
-  <br />
-  <button onclick="dosbox.requestFullScreen();">Make fullscreen</button>
-  <script type="text/javascript" src="https://js-dos.com/cdn/js-dos-api.js"></script>
-  <script type="text/javascript">
-    var dosbox = new Dosbox({
-      id: "dosbox",
-      onload: function (dosbox) {
-        dosbox.run("https://cdn.dos.zone/original/2X/9/9ed7eb9c2c441f56656692ed4dc7ab28f58503ce.jsdos
-", "./dig.exe");
-      },
-      onrun: function (dosbox, app) {
-        console.log("App '" + app + "' is running");
-      }
-    });
-  </script>
 </body>
-
 </html>
