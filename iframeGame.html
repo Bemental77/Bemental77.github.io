@@ -28,7 +28,7 @@
     const ctx = canvas.getContext('2d');
 
     async function runGame() {
-        const bundle = await fetch("https://cdn.dos.zone/original/2X/9/9ed7eb9c2c441f56656692ed4dc7ab28f58503ce.jsdos");
+        const bundle = await fetch("https://caseybement.com/vikings.jsdos");
         const ci = await emulators.dosWorker(new Uint8Array(await bundle.arrayBuffer()));
         const rgba = new Uint8ClampedArray(320 * 200 * 4);
 
