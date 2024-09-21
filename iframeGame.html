@@ -1,3 +1,4 @@
+
 <!doctype html>
 <html>
 <head>
@@ -20,7 +21,7 @@
 <div id="root">
 </div>
 <script type="module">
-    import * as THREE from 'https://unpkg.com/three@latest/build/three.module.js';
+
     emulators.pathPrefix = "https://v8.js-dos.com/latest/emulators/";
 
     const img = document.createElement("canvas");
@@ -28,36 +29,6 @@
     img.height = 200;
 
     const ctx = img.getContext('2d');
-    const texture = new THREE.CanvasTexture(img);
-
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color();
-
-    const camera = new THREE.PerspectiveCamera( 75, window.innerWidth/window.innerHeight, 0.1, 1000 );
-    const renderer = new THREE.WebGLRenderer();
-    renderer.setSize( window.innerWidth, window.innerHeight );
-
-    document.getElementById("root").appendChild(renderer.domElement);
-
-    const geometry = new THREE.BoxGeometry();
-    const material = new THREE.MeshBasicMaterial({
-        map: texture,
-    });
-    const cube = new THREE.Mesh( geometry, material );
-    scene.add( cube );
-
-    camera.position.z = 2;
-
-    const animate = function () {
-            requestAnimationFrame( animate );
-
-            cube.rotation.x += 0.01;
-            cube.rotation.y += 0.01;
-
-            renderer.render( scene, camera );
-    };
-
-    animate();
 
     async function runDigger() {
         stop();
@@ -83,3 +54,4 @@
 </script>
 </body>
 </html>
+

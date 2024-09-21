@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en-us">
+
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+  <title>js-dos</title>
+  <style type="text/css">
+    body {
+      margin: 0;
+    }
+
+    .dosbox-container {
+      width: 640px;
+      height: 400px;
+    }
+  </style>
+  <!-- js-dos style sheet -->
+  <link rel="stylesheet" href="https://v8.js-dos.com/latest/js-dos.css">
+
+  <!-- js-dos -->
+  <script src="https://v8.js-dos.com/latest/js-dos.js"></script>
+</head>
+
+<body>
+  
+
+  <div id="dosbox"></div>
+  <br />
+  <button onclick="dosbox.requestFullScreen();">Make fullscreen</button>
+  <script type="text/javascript" src="https://js-dos.com/cdn/js-dos-api.js"></script>
+  <script type="text/javascript">
+    var dosbox = new Dosbox({
+      id: "dosbox",
+      onload: function (dosbox) {
+        dosbox.run("caseybement.com/vikings.jsdos", "./VIKINGS.EXE");
+      },
+      onrun: function (dosbox, app) {
+        console.log("App '" + app + "' is running");
+      }
+    });
+  </script>
+</body>
+
+</html>
+
+
+
