@@ -1,10 +1,9 @@
-
 <!doctype html>
-<html>
+<html lang="en-us">
 <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-    <title>Digger Example</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>2D Canvas Example</title>
     <script src="https://v8.js-dos.com/latest/emulators/emulators.js"></script>
     <style>
         html, body, #root {
@@ -19,39 +18,33 @@
 
 <body>
 <div id="root">
+    <canvas id="gameCanvas" width="640" height="400"></canvas>
 </div>
-<script type="module">
 
+<script type="module">
     emulators.pathPrefix = "https://v8.js-dos.com/latest/emulators/";
 
-    const img = document.createElement("canvas");
-    img.width = 320;
-    img.height = 200;
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
 
-    const ctx = img.getContext('2d');
-
-    async function runDigger() {
-        stop();
-
+    async function runGame() {
         const bundle = await fetch("https://cdn.dos.zone/original/2X/9/9ed7eb9c2c441f56656692ed4dc7ab28f58503ce.jsdos");
         const ci = await emulators.dosWorker(new Uint8Array(await bundle.arrayBuffer()));
         const rgba = new Uint8ClampedArray(320 * 200 * 4);
 
         ci.events().onFrame((rgb, _rgba) => {
             for (let next = 0; next < 320 * 200; ++next) {
-                 rgba[next * 4 + 0] = rgb[next * 3 + 0];
-                 rgba[next * 4 + 1] = rgb[next * 3 + 1];
-                 rgba[next * 4 + 2] = rgb[next * 3 + 2];
-                 rgba[next * 4 + 3] = 255;
+                rgba[next * 4 + 0] = rgb[next * 3 + 0];
+                rgba[next * 4 + 1] = rgb[next * 3 + 1];
+                rgba[next * 4 + 2] = rgb[next * 3 + 2];
+                rgba[next * 4 + 3] = 255;
             }
 
-            ctx?.putImageData(new ImageData(rgba, 320, 200), 0, 0);
-            texture.needsUpdate = true;
+            ctx.putImageData(new ImageData(rgba, 320, 200), 0, 0);
         });
     }
 
-    runDigger();
+    runGame();
 </script>
 </body>
 </html>
-
