@@ -11,19 +11,19 @@
     <div id="output">Loading...</div>
 
     <script>
-    async function loadWasm() {
-        const response = await fetch('/n64/N64Wasm/dist/n64wasm.js');
-        const bytes = await response.arrayBuffer();
-        const { instance } = await WebAssembly.instantiate(bytes, {}); // Add an empty object for imports
-
-        document.getElementById('output').innerText = "WebAssembly module loaded!";
-        // Call a function from the WebAssembly instance if needed
-        // instance.exports.yourFunction();
+    async function initialize() {
+        try {
+            // Assuming n64wasm.js exports a function to load the WebAssembly module
+            const wasmModule = await N64Wasm(); // Adjust this based on the actual export from n64wasm.js
+            document.getElementById('output').innerText = "WebAssembly module loaded!";
+            // Call a function from the WebAssembly instance if needed
+            // wasmModule.instance.exports.yourFunction();
+        } catch (err) {
+            document.getElementById('output').innerText = "Error loading WebAssembly: " + err;
+        }
     }
 
-    loadWasm().catch(err => {
-        document.getElementById('output').innerText = "Error loading WebAssembly: " + err;
-    });
+    initialize();
     </script>
 </body>
 </html>
