@@ -6,9 +6,15 @@ jspm_packages
 .serverless
 
 .env
+.zip
+.jsdos
 config.js
 send.email.ts
 config.js
 vikings.zip
 vikings.jsdos
 dos-games.yaml
+node_modules
+n64db.sqlite
+sample.sqlite
+roms
