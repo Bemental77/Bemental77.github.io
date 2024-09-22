@@ -332,12 +332,12 @@ class InputController {
 
   defaultKeymappings() {
       return {
-          Mapping_Left: 'b',
-          Mapping_Right: 'n',
-          Mapping_Up: 'y',
-          Mapping_Down: 'h',
-          Mapping_Action_A: 'd',
-          Mapping_Action_B: 's',
+          Mapping_Left: 'a',
+          Mapping_Right: 'd',
+          Mapping_Up: 'w',
+          Mapping_Down: 's',
+          Mapping_Action_A: 'm',
+          Mapping_Action_B: 'n',
           Mapping_Action_Start: 'Enter',
           Mapping_Action_CUP: 'i',
           Mapping_Action_CDOWN: 'k',
