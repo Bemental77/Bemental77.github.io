@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>js-dos Diablo I</title>
+
+    <style>
+        html, body {
+            height: 100%;
+        }
+
+        #dos {
+            width: 100%;
+            height: 100%;
+        }
+    </style>
+
+    <!-- js-dos style sheet -->
+    <link rel="stylesheet" href="https://v8.js-dos.com/latest/js-dos.css">
+
+    <!-- js-dos -->
+    <script src="https://v8.js-dos.com/latest/js-dos.js"></script>
+</head>
+<body>
+
+    <div id="dos" style="width: 100%; height: 100%"></div>
+
+    <script>
+        const diabloConf = `
+[sdl]
+autolock=false
+mouse_emulation=integration
+
+[dosbox]
+title=Windows 95
+memsize=128
+
+[video]
+vmemsize=8
+vesa modelist width limit=0
+vesa modelist height limit=0
+
+[dos]
+ver=7.1
+hard drive data rate limit=0
+floppy drive data rate limit=0
+
+[cpu]
+cputype=pentium_mmx
+core=auto
+integration device=true
+
+[sblaster]
+sbtype=sb16vibra
+
+[fdc, primary]
+int13fakev86io=true
+
+[ide, primary]
+int13fakeio=true
+int13fakev86io=true
+
+[ide, secondary]
+int13fakeio=true
+int13fakev86io=true
+cd-rom insertion delay=4000
+
+[render]
+scaler=none
+
+[autoexec]
+echo off
+imgmount 2 sockdrive wss://sockdrive.js-dos.com:8001 dos.zone diablo_109_c
+imgmount 3 sockdrive wss://sockdrive.js-dos.com:8001 dos.zone diablo_109_d
+boot c:
+`;
+
+        Dos(document.getElementById("dos"), {
+            dosboxConf: diabloConf,
+        });
+    </script>
+</body>
+</html>
