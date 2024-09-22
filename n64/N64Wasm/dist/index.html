@@ -15,8 +15,6 @@
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/toastr.js/latest/css/toastr.min.css">
     <script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.2/dist/FileSaver.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/nipplejs/0.10.0/nipplejs.min.js"></script>
-    <script src="n64/N64Wasm/dist/n64wasm.js"></script>
-
     <style>
         input[type="file"] {
             display: none;
@@ -222,6 +220,13 @@
         <div id="bottomPanel" rv-hide="data.beforeEmulatorStarted">
             <!-- <div>{ data.audioSkipCount}</div> -->
         </div>
+
+        <h6 class="card-title mt-4">
+            <a href="https://github.com/nbarkhina/n64wasm" target="_blank" style="color: black;">
+                View source on GitHub
+                <img src="github_logo.png" style="height: 25px; padding-bottom: 5px; padding-left: 10px;">
+            </a>
+        </h6>
         
     </div>
 
@@ -977,7 +982,7 @@
         </div>
     </div>
 
-    <script src="n64/N64Wasm/dist/n64wasm.js"></script>
+    <script src="settings.js"></script>
     <script src="romlist.js"></script>
     <script type="text/javascript">
         var rando = Math.floor(Math.random() * Math.floor(100000));
