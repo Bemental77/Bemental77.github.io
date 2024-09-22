@@ -1,5 +1,5 @@
 var ROMLIST = [
-  {url:"roms/gauntlet.64",title:"Game 1"},
+  {url:"../roms/gauntlet.z64",title:"Gauntlet"},
 
 
 ];
