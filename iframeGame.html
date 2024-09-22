@@ -26,7 +26,15 @@
     <div id="dos" style="width: 100%; height: 100%"></div> 
 
     <script>
-        Dos(document.getElementById("dos"), {
+        const config = `[autoexec] cd THELOSTV
+        SETUP.EXE
+
+
+
+
+        
+        `;
+        Dos(document.getElementById("dos"), { config,
             url: "https://caseybement.com/vikings.zip",
         });
     </script>
