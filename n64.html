@@ -12,12 +12,13 @@
 
     <script>
     async function loadWasm() {
-        const response = await fetch('/n64/N64Wasm/dist/n64wasm.wasm');
+        const response = await fetch('/n64/N64Wasm/dist/n64wasm.js');
         const bytes = await response.arrayBuffer();
-        const { instance } = await WebAssembly.instantiate(bytes);
+        const { instance } = await WebAssembly.instantiate(bytes, {}); // Add an empty object for imports
 
         document.getElementById('output').innerText = "WebAssembly module loaded!";
         // Call a function from the WebAssembly instance if needed
+        // instance.exports.yourFunction();
     }
 
     loadWasm().catch(err => {
