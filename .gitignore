@@ -14,3 +14,7 @@ config.js
 vikings.zip
 vikings.jsdos
 dos-games.yaml
+node_modules
+n64db.sqlite
+sample.sqlite
+roms
