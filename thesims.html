@@ -3,7 +3,6 @@
 <head>
     <meta charset="UTF-8">
     <title>js-dos Diablo I</title>
-
     <style>
         html, body {
             height: 100%;
@@ -14,19 +13,15 @@
             height: 100%;
         }
     </style>
-
-    <!-- js-dos style sheet -->
     <link rel="stylesheet" href="https://v8.js-dos.com/latest/js-dos.css">
-
-    <!-- js-dos -->
     <script src="https://v8.js-dos.com/latest/js-dos.js"></script>
 </head>
 <body>
 
-    <div id="dos" style="width: 100%; height: 100%"></div>
+<div id="dos"></div>
 
-    <script>
-        const diabloConf = `
+<script>
+    const simsConfig = `
 [sdl]
 autolock=false
 mouse_emulation=integration
@@ -70,14 +65,30 @@ scaler=none
 
 [autoexec]
 echo off
-imgmount 2 sockdrive wss://sockdrive.js-dos.com:8001 dos.zone diablo_109_c
-imgmount 3 sockdrive wss://sockdrive.js-dos.com:8001 dos.zone diablo_109_d
+mount c .
+imgmount 2 cdrom.iso -t cdrom
 boot c:
 `;
 
-        Dos(document.getElementById("dos"), {
-            dosboxConf: diabloConf,
-        });
-    </script>
+    async function fetchAndMountISO(url, elementId) {
+        const response = await fetch(url);
+        const blob = await response.blob();
+        const file = new File([blob], "cdrom.iso");
+
+        const mountISO = async () => {
+            await Dos(document.getElementById(elementId), {
+                dosboxConf: simsConfig,
+                onrun: (fs) => {
+                    fs.createFile("/cdrom.iso", file);
+                }
+            });
+        };
+
+        mountISO();
+    }
+
+    fetchAndMountISO('http://caseybement.com/thesims.iso', 'dos');
+</script>
+
 </body>
 </html>
