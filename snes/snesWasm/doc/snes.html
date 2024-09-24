@@ -26,6 +26,9 @@
       <div id="menuHeader">
         <div id="menuHeaderLeftMessage">Snes9x-2005-wasm Menu</div>
         <p><a href="../roms/simcity.smc" download>simcity.smc</a></p>
+        <div class="squareButton" id="aboutButton" onclick="document.getElementById('menu').style.display='none'">
+              <div class="squareButtonMsg">hide banner</div>
+            </div>
         <div class="flex1"></div>
         <div id="menuHeaderRightMessage"><a href="#" id="menuHeaderLeftMessageChild">Close</a></div>
       </div>
@@ -40,8 +43,13 @@
             <div class="squareButton" id="loadStateButton"><div class="squareButtonMsg">Load State</div></div>
             <div class="squareButton" id="saveStateButton"><div class="squareButtonMsg">Save State</div></div>
             <div class="squareButton" id="gamepadSettingsButton"><div class="squareButtonMsg">Gamepad</div></div>
-            <div class="squareButton" id="aboutButton"><div class="squareButtonMsg">About</div></div>
-          </div>
+            <div class="squareButton" id="aboutButton" onclick="document.getElementById('flex1').style.display='none'">
+              <div class="squareButtonMsg">hide menu</div>
+            </div>
+            <div class="squareButton" id="aboutButton" onclick="document.getElementById('menu').style.display='none'">
+              <div class="squareButtonMsg">hide banner</div>
+            </div>
+                      </div>
         </div>
         <div id="gamepadSettings">
           <div id="gamepadNameShowParent">
@@ -177,8 +185,10 @@
       <div id="menuOpen1Parent">
         <div class="flex1"></div>
         <div>Menu</div>
-        <div class="StartSelectCommon" id="menuOpen1"></div>
-      </div>
+        <div class="StartSelectCommon" id="menuOpen1" onclick="document.getElementById('#menuOpen3Parent').style.display='active'">
+        </div>
+    </div>
+    
     </div>
   </div>
   <script src="../snes9x_2005.js"></script>
