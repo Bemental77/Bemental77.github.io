@@ -1,26 +1,22 @@
 body, html {
-  margin: 0;
-  padding: 0;
-  overflow: hidden;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+}
+
+#map {
+    width: 100vw;
+    height: 90vh; /* Adjusted height to fit controls */
+    background-image: url('/images/map.png');
+    background-size: cover;
+    position: relative;
 }
 
 #controls {
-  width: 100vw;
-  height: 20vh;
-  background-color: lightgray;
-  position: relative;
-  display: none; /* Only show on mobile */
-}
-
-#joystick {
-  width: 100px;
-  height: 100px;
-  background-color: gray;
-  border-radius: 50%;
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
+    width: 100vw; /* Full width */
+    height: 10vh; /* Control section height */
+    background-color: lightgray;
+    position: relative;
 }
 
 #arrow {
@@ -35,12 +31,13 @@ body, html {
   border-bottom: 60px solid red; /* Main color */
 }
 
-#square {
-  width: 80vw; /* Width of the square */
-  height: 80vh; /* Height of the square */
-  background-color: tan; /* Background color of the square */
-  position: relative;
-  margin: auto; /* Center the square */
-  overflow: hidden; /* Prevent the arrow from going outside */
-  border: 2px solid black; /* Optional border for visual reference */
+#joystick {
+    width: 80px; /* Joystick size */
+    height: 80px;
+    border-radius: 50%;
+    background-color: rgba(0, 0, 0, 0.5);
+    position: absolute;
+    bottom: 10px; /* Positioning at the bottom */
+    left: calc(50% - 40px); /* Centered horizontally */
+    pointer-events: none; /* Ignore pointer events for the background */
 }
