@@ -1,0 +1,46 @@
+body, html {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+#controls {
+  width: 100vw;
+  height: 20vh;
+  background-color: lightgray;
+  position: relative;
+  display: none; /* Only show on mobile */
+}
+
+#joystick {
+  width: 100px;
+  height: 100px;
+  background-color: gray;
+  border-radius: 50%;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+}
+
+#arrow {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%) rotate(0deg); /* Default rotation */
+  width: 0;
+  height: 0;
+  border-left: 25px solid transparent;
+  border-right: 25px solid transparent;
+  border-bottom: 60px solid red; /* Main color */
+}
+
+#square {
+  width: 80vw; /* Width of the square */
+  height: 80vh; /* Height of the square */
+  background-color: tan; /* Background color of the square */
+  position: relative;
+  margin: auto; /* Center the square */
+  overflow: hidden; /* Prevent the arrow from going outside */
+  border: 2px solid black; /* Optional border for visual reference */
+}
