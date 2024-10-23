@@ -11,18 +11,26 @@
             overflow: hidden;
         }
         #map {
-            width: 100vw;
+            width: 80vw;
             height: 100vh;
             background-image: url('/images/map.png');
             background-size: cover;
             position: relative;
+            float: left;
+        }
+        #controls {
+            width: 20vw;
+            height: 100vh;
+            background-color: lightgray;
+            position: relative;
+            float: left;
         }
         #arrow {
             width: 0;
             height: 0;
             border-left: 25px solid transparent;
             border-right: 25px solid transparent;
-            border-bottom: 50px solid red; /* Arrow color */
+            border-bottom: 50px solid red;
             position: absolute;
             top: 50%;
             left: 50%;
@@ -34,21 +42,29 @@
     <div id="map">
         <div id="arrow"></div>
     </div>
+    <div id="controls">Touch here to control the arrow</div>
 
     <script>
         const arrow = document.getElementById('arrow')
-        const map = document.getElementById('map')
+        const controls = document.getElementById('controls')
+
+        let arrowX = window.innerWidth * 0.4 // Initial position in the middle of the map (80% width, so 40% of screen width)
+        let arrowY = window.innerHeight / 2
 
         function moveArrow(event) {
             event.preventDefault()
-            const x = event.clientX || event.touches[0].clientX
-            const y = event.clientY || event.touches[0].clientY
-            arrow.style.left = `${x}px`
-            arrow.style.top = `${y}px`
+            const deltaX = event.movementX || event.touches[0].clientX - event.touches[0].previousX || 0
+            const deltaY = event.movementY || event.touches[0].clientY - event.touches[0].previousY || 0
+            
+            arrowX += deltaX
+            arrowY += deltaY
+
+            arrow.style.left = `${arrowX}px`
+            arrow.style.top = `${arrowY}px`
         }
 
-        map.addEventListener('mousemove', moveArrow)
-        map.addEventListener('touchmove', moveArrow, { passive: false })
+        controls.addEventListener('mousemove', moveArrow)
+        controls.addEventListener('touchmove', moveArrow, { passive: false })
     </script>
 </body>
 </html>
