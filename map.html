@@ -13,15 +13,16 @@
         #map {
             width: 100vw;
             height: 100vh;
-            background-image: url('map.jpg'); /* Replace with your map image */
+            background-image: url('/images/map.png');
             background-size: cover;
             position: relative;
         }
         #arrow {
-            width: 50px;
-            height: 50px;
-            background-image: url('arrow.png'); /* Replace with your arrow image */
-            background-size: contain;
+            width: 0;
+            height: 0;
+            border-left: 25px solid transparent;
+            border-right: 25px solid transparent;
+            border-bottom: 50px solid red; /* Arrow color */
             position: absolute;
             top: 50%;
             left: 50%;
@@ -39,6 +40,7 @@
         const map = document.getElementById('map')
 
         function moveArrow(event) {
+            event.preventDefault()
             const x = event.clientX || event.touches[0].clientX
             const y = event.clientY || event.touches[0].clientY
             arrow.style.left = `${x}px`
@@ -46,7 +48,7 @@
         }
 
         map.addEventListener('mousemove', moveArrow)
-        map.addEventListener('touchmove', moveArrow)
+        map.addEventListener('touchmove', moveArrow, { passive: false })
     </script>
 </body>
 </html>
