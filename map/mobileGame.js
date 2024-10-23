@@ -2,13 +2,21 @@ export function initGameMobile() {
   const arrow = document.getElementById('arrow')
   const joystick = document.getElementById('joystick')
   const controls = document.getElementById('controls')
+  const explosion = document.createElement('div')
 
+  explosion.style.position = 'absolute'
+  explosion.style.borderRadius = '50%'
+  explosion.style.background = 'red'
+  explosion.style.opacity = '0'
+  explosion.style.pointerEvents = 'none'
+  document.body.appendChild(explosion)
+
+  const speed = 2
   const arrowOffset = 25
   const joystickSensitivity = 0.2
   const joystickRadius = joystick.offsetWidth / 2
-  let joystickCenterX, joystickCenterY // To store joystick's center
+  let joystickCenterX, joystickCenterY
 
-  // Set initial position of the arrow
   let arrowX = window.innerWidth / 2
   let arrowY = window.innerHeight * 0.4
   arrow.style.left = `${arrowX}px`
@@ -26,29 +34,58 @@ export function initGameMobile() {
     const angle = Math.atan2(deltaY, deltaX)
     const distance = Math.min(Math.sqrt(deltaX ** 2 + deltaY ** 2), joystickRadius) * joystickSensitivity
 
-    const clickPointX = arrow.offsetLeft + 5 * Math.cos(angle)
-    const clickPointY = arrow.offsetTop + 5 * Math.sin(angle)
+    const clickPointX = arrowX + 5 * Math.cos(angle)
+    const clickPointY = arrowY + 5 * Math.sin(angle)
 
-    const newClickPointX = Math.max(arrowOffset, Math.min(window.innerWidth - arrowOffset, clickPointX + (distance * Math.cos(angle))))
-    const newClickPointY = Math.max(arrowOffset, Math.min(window.innerHeight - arrowOffset, clickPointY + (distance * Math.sin(angle))))
+    arrowX = Math.max(arrowOffset, Math.min(window.innerWidth - arrowOffset, clickPointX + (distance * Math.cos(angle))))
+    arrowY = Math.max(arrowOffset, Math.min(window.innerHeight - arrowOffset, clickPointY + (distance * Math.sin(angle))))
 
-    // Update the arrow's position based on the new click point
-    arrow.style.left = `${newClickPointX}px`
-    arrow.style.top = `${newClickPointY}px`
+    requestAnimationFrame(() => {
+      arrow.style.left = `${arrowX}px`
+      arrow.style.top = `${arrowY}px`
 
-    // Rotate the arrow based on opposite angle
-    const rotationAngle = angle * (180 / Math.PI) + 90
-    arrow.style.transform = `translate(-50%, -50%) rotate(${rotationAngle}deg)`
+      const rotationAngle = angle * (180 / Math.PI) + 90
+      arrow.style.transform = `translate(-50%, -50%) rotate(${rotationAngle}deg)`
+    })
+  }
+
+  function triggerExplosion() {
+    const explosionSize = 100
+    const explosionDuration = 500
+
+    const explosionX = arrowX + 50 * Math.cos((Math.atan2(arrowY, arrowX) + Math.PI) % (2 * Math.PI))
+    const explosionY = arrowY + 50 * Math.sin((Math.atan2(arrowY, arrowX) + Math.PI) % (2 * Math.PI))
+
+    explosion.style.left = `${explosionX - explosionSize / 2}px`
+    explosion.style.top = `${explosionY - explosionSize / 2}px`
+    explosion.style.width = `${explosionSize}px`
+    explosion.style.height = `${explosionSize}px`
+    explosion.style.opacity = '1'
+
+    setTimeout(() => {
+      explosion.style.transition = `width ${explosionDuration}ms, height ${explosionDuration}ms, opacity ${explosionDuration}ms`
+      explosion.style.width = '0'
+      explosion.style.height = '0'
+      explosion.style.opacity = '0'
+    }, 10)
+
+    setTimeout(() => {
+      explosion.style.transition = 'none'
+    }, explosionDuration + 10)
   }
 
   joystick.addEventListener('touchstart', event => {
-    event.preventDefault()
     joystickCenterX = joystick.getBoundingClientRect().left + joystickRadius
     joystickCenterY = joystick.getBoundingClientRect().top + joystickRadius
-    joystick.addEventListener('touchmove', moveArrowJoystick)
+    joystick.addEventListener('touchmove', moveArrowJoystick, { passive: false })
+  }, { passive: true })
+
+  // Add event listener for control box with data-index="1"
+  const button1 = controls.querySelector('.control-box[data-index="1"]')
+  button1.addEventListener('click', () => {
+    triggerExplosion() // Trigger explosion when control box 1 is clicked
   })
 
-  // Set joystick position to bottom left corner
   joystick.style.left = '20px'
   joystick.style.top = 'calc(80vh - 80px)'
   joystick.style.display = 'block'
