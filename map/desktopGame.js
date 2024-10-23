@@ -2,17 +2,21 @@ export function initGameDesktop() {
   const arrow = document.getElementById('arrow')
   const controls = document.getElementById('controls')
 
+  const speed = 2 // Set your speed here
   let arrowX = window.innerWidth / 2
   let arrowY = window.innerHeight * 0.4
   let keys = { w: false, a: false, s: false, d: false }
   let angle = 0
 
   function moveArrowSmooth() {
-      let speed = 2
       if (keys.w) arrowY -= speed
       if (keys.s) arrowY += speed
       if (keys.a) arrowX -= speed
       if (keys.d) arrowX += speed
+
+      // Constrain arrow position within window bounds
+      arrowX = Math.max(0, Math.min(window.innerWidth, arrowX))
+      arrowY = Math.max(0, Math.min(window.innerHeight, arrowY))
 
       arrow.style.left = `${arrowX}px`
       arrow.style.top = `${arrowY}px`

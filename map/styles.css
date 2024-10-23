@@ -49,9 +49,10 @@ body, html {
   height: 0;
   border-left: 10px solid transparent;
   border-right: 10px solid transparent;
-  border-bottom: 20px solid #00f; /* Color of the triangle */
+  border-bottom: 30px solid #00f; /* Increased height for elongation */
   transform: translate(-50%, -50%);
 }
+
 
 #joystick {
   display: none; /* Initially hidden, will be controlled by initGameMobile */

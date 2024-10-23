@@ -3,12 +3,12 @@ export function initGameMobile() {
   const joystick = document.getElementById('joystick')
   const controls = document.getElementById('controls')
 
+  const speed = 2
   const arrowOffset = 25
   const joystickSensitivity = 0.2
   const joystickRadius = joystick.offsetWidth / 2
-  let joystickCenterX, joystickCenterY // To store joystick's center
+  let joystickCenterX, joystickCenterY
 
-  // Set initial position of the arrow
   let arrowX = window.innerWidth / 2
   let arrowY = window.innerHeight * 0.4
   arrow.style.left = `${arrowX}px`
@@ -26,29 +26,27 @@ export function initGameMobile() {
     const angle = Math.atan2(deltaY, deltaX)
     const distance = Math.min(Math.sqrt(deltaX ** 2 + deltaY ** 2), joystickRadius) * joystickSensitivity
 
-    const clickPointX = arrow.offsetLeft + 5 * Math.cos(angle)
-    const clickPointY = arrow.offsetTop + 5 * Math.sin(angle)
+    const clickPointX = arrowX + 5 * Math.cos(angle)
+    const clickPointY = arrowY + 5 * Math.sin(angle)
 
-    const newClickPointX = Math.max(arrowOffset, Math.min(window.innerWidth - arrowOffset, clickPointX + (distance * Math.cos(angle))))
-    const newClickPointY = Math.max(arrowOffset, Math.min(window.innerHeight - arrowOffset, clickPointY + (distance * Math.sin(angle))))
+    arrowX = Math.max(arrowOffset, Math.min(window.innerWidth - arrowOffset, clickPointX + (distance * Math.cos(angle))))
+    arrowY = Math.max(arrowOffset, Math.min(window.innerHeight - arrowOffset, clickPointY + (distance * Math.sin(angle))))
 
-    // Update the arrow's position based on the new click point
-    arrow.style.left = `${newClickPointX}px`
-    arrow.style.top = `${newClickPointY}px`
+    requestAnimationFrame(() => {
+      arrow.style.left = `${arrowX}px`
+      arrow.style.top = `${arrowY}px`
 
-    // Rotate the arrow based on opposite angle
-    const rotationAngle = angle * (180 / Math.PI) + 90
-    arrow.style.transform = `translate(-50%, -50%) rotate(${rotationAngle}deg)`
+      const rotationAngle = angle * (180 / Math.PI) + 90
+      arrow.style.transform = `translate(-50%, -50%) rotate(${rotationAngle}deg)`
+    })
   }
 
   joystick.addEventListener('touchstart', event => {
-    event.preventDefault()
     joystickCenterX = joystick.getBoundingClientRect().left + joystickRadius
     joystickCenterY = joystick.getBoundingClientRect().top + joystickRadius
-    joystick.addEventListener('touchmove', moveArrowJoystick)
-  })
+    joystick.addEventListener('touchmove', moveArrowJoystick, { passive: false })
+  }, { passive: true })
 
-  // Set joystick position to bottom left corner
   joystick.style.left = '20px'
   joystick.style.top = 'calc(80vh - 80px)'
   joystick.style.display = 'block'
