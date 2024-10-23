@@ -13,10 +13,32 @@ body, html {
 }
 
 #controls {
-    width: 100vw; /* Full width */
-    height: 10vh; /* Control section height */
-    background-color: lightgray;
-    position: relative;
+  width: 100vw;
+  height: 10vh;
+  background-color: lightgray;
+  position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.control-box {
+  width: 15%; /* Adjust width as needed */
+  height: 80%; /* Adjust height as needed */
+  background-color: white;
+  margin: 0 5px; /* Space between boxes */
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-size: 2em; /* Adjust font size as needed */
+  border: 1px solid darkgray; /* Optional border */
+  border-radius: 5px; /* Optional rounded corners */
+  transition: background-color 0.3s; /* Smooth transition for color change */
+  cursor: pointer; /* Show pointer cursor on hover */
+}
+
+.control-box:active {
+  background-color: gray; /* Color change when pressed */
 }
 
 #arrow {
@@ -32,12 +54,13 @@ body, html {
 }
 
 #joystick {
-    width: 80px; /* Joystick size */
-    height: 80px;
-    border-radius: 50%;
-    background-color: rgba(0, 0, 0, 0.5);
-    position: absolute;
-    bottom: 10px; /* Positioning at the bottom */
-    left: calc(50% - 40px); /* Centered horizontally */
-    pointer-events: none; /* Ignore pointer events for the background */
+  display: none; /* Hide joystick by default */
+  width: 80px; /* Joystick size */
+  height: 80px;
+  border-radius: 50%;
+  background-color: rgba(0, 0, 0, 0.5);
+  position: absolute;
+  bottom: 10px; /* Positioning at the bottom */
+  left: calc(50% - 40px); /* Centered horizontally */
+  pointer-events: auto; /* Allow pointer events for joystick */
 }

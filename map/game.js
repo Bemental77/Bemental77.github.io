@@ -1,15 +1,12 @@
-export function initGame() {
+export function initGameDesktop() {
     const arrow = document.getElementById('arrow')
     const controls = document.getElementById('controls')
-    const joystick = document.getElementById('joystick')
   
     let arrowX = window.innerWidth / 2
     let arrowY = window.innerHeight * 0.4
     let keys = { w: false, a: false, s: false, d: false }
     let angle = 0
-  
-    const isMobile = 'ontouchstart' in window || navigator.maxTouchPoints
-  
+    
     function moveArrowSmooth() {
       let speed = 2
       if (keys.w) arrowY -= speed
@@ -50,24 +47,33 @@ export function initGame() {
       if (e.key === 's') keys.s = false
       if (e.key === 'd') keys.d = false
     })
+  }
   
+  export function initGameMobile() {
     function moveArrowJoystick(event) {
-      event.preventDefault()
-      const controlRect = controls.getBoundingClientRect()
+      const arrow = document.getElementById('arrow')
+      const controls = document.getElementById('controls')
   
-      let x = event.touches[0].clientX - controlRect.left
-      let y = event.touches[0].clientY - controlRect.top
-  
-      arrowX += (x - controlRect.width / 2) * 0.01
-      arrowY += (y - controlRect.height / 2) * 0.01
+      const arrowX = event.touches[0].clientX - controls.offsetLeft
+      const arrowY = event.touches[0].clientY - controls.offsetTop
   
       arrow.style.left = `${arrowX}px`
       arrow.style.top = `${arrowY}px`
-    }
   
-    if (isMobile) {
-      controls.style.display = 'block'
-      controls.addEventListener('touchmove', moveArrowJoystick, { passive: false })
+      const angle = Math.atan2(arrowY - 100, arrowX - 100) * (180 / Math.PI)
+      arrow.style.transform = `translate(-50%, -50%) rotate(${angle}deg)`
     }
+
+    
+    const controls = document.getElementById('controls')
+  
+    controls.addEventListener('touchstart', event => {
+      event.preventDefault()
+      controls.addEventListener('touchmove', moveArrowJoystick)
+    })
+  
+    controls.addEventListener('touchend', event => {
+      event.preventDefault()
+      controls.removeEventListener('touchmove', moveArrowJoystick)
+    })
   }
-  
