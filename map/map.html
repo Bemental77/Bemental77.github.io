@@ -4,48 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Map Game</title>
-    <style>
-        body, html {
-            margin: 0;
-            padding: 0;
-            overflow: hidden;
-        }
-        #map {
-            width: 100vw;
-            height: 80vh;
-            background-image: url('/images/map.png');
-            background-size: cover;
-            position: relative;
-        }
-        #controls {
-            width: 100vw;
-            height: 20vh;
-            background-color: lightgray;
-            position: relative;
-            display: none; /* Only show on mobile */
-        }
-        #joystick {
-            width: 100px;
-            height: 100px;
-            background-color: gray;
-            border-radius: 50%;
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-        }
-        #arrow {
-            width: 0;
-            height: 0;
-            border-left: 25px solid transparent;
-            border-right: 25px solid transparent;
-            border-bottom: 50px solid red;
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-        }
-    </style>
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <div id="map">
@@ -55,66 +14,9 @@
         <div id="joystick"></div>
     </div>
 
-    <script>
-        const arrow = document.getElementById('arrow')
-        const controls = document.getElementById('controls')
-        const joystick = document.getElementById('joystick')
-
-        let arrowX = window.innerWidth / 2
-        let arrowY = window.innerHeight * 0.4
-        let keys = { w: false, a: false, s: false, d: false }
-        let angle = 0
-
-        const isMobile = 'ontouchstart' in window || navigator.maxTouchPoints
-
-        function moveArrowSmooth() {
-            let speed = 2
-            if (keys.w) arrowY -= speed
-            if (keys.s) arrowY += speed
-            if (keys.a) arrowX -= speed
-            if (keys.d) arrowX += speed
-
-            arrow.style.left = `${arrowX}px`
-            arrow.style.top = `${arrowY}px`
-
-            if (keys.w || keys.a || keys.s || keys.d) {
-                if (keys.w && keys.a) angle = -45
-                else if (keys.w && keys.d) angle = 45
-                else if (keys.s && keys.a) angle = -135
-                else if (keys.s && keys.d) angle = 135
-                else if (keys.w) angle = 0
-                else if (keys.s) angle = 180
-                else if (keys.a) angle = -90
-                else if (keys.d) angle = 90
-                arrow.style.transform = `translate(-50%, -50%) rotate(${angle}deg)`
-            }
-
-            requestAnimationFrame(moveArrowSmooth)
-        }
-
-        moveArrowSmooth()
-
-        window.addEventListener('keydown', e => keys[e.key] = true)
-        window.addEventListener('keyup', e => keys[e.key] = false)
-
-        function moveArrowJoystick(event) {
-            event.preventDefault()
-            const controlRect = controls.getBoundingClientRect()
-
-            let x = event.touches[0].clientX - controlRect.left
-            let y = event.touches[0].clientY - controlRect.top
-
-            arrowX += (x - controlRect.width / 2) * 0.01
-            arrowY += (y - controlRect.height / 2) * 0.01
-
-            arrow.style.left = `${arrowX}px`
-            arrow.style.top = `${arrowY}px`
-        }
-
-        if (isMobile) {
-            controls.style.display = 'block'
-            controls.addEventListener('touchmove', moveArrowJoystick, { passive: false })
-        }
+    <script type="module">
+        import { initGame } from './game.js'
+        window.onload = initGame
     </script>
 </body>
 </html>
