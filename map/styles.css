@@ -1,66 +1,69 @@
 body, html {
-    margin: 0;
-    padding: 0;
-    overflow: hidden;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
 }
 
 #map {
-    width: 100vw;
-    height: 90vh; /* Adjusted height to fit controls */
-    background-image: url('/images/map.png');
-    background-size: cover;
-    position: relative;
+  width: 100vw;
+  height: 90vh; /* Adjusted height to fit controls */
+  background-image: url('/images/map.png');
+  background-size: cover;
+  position: relative;
 }
 
 #controls {
   width: 100vw;
   height: 10vh;
   background-color: lightgray;
-  position: relative;
   display: flex;
   justify-content: center;
   align-items: center;
+  position: absolute;
+  bottom: 0;
+  left: 0;
 }
 
 .control-box {
-  width: 15%; /* Adjust width as needed */
-  height: 80%; /* Adjust height as needed */
+  width: 15%;
+  height: 80%;
   background-color: white;
-  margin: 0 5px; /* Space between boxes */
+  margin: 0 5px;
   display: flex;
   justify-content: center;
   align-items: center;
-  font-size: 2em; /* Adjust font size as needed */
-  border: 1px solid darkgray; /* Optional border */
-  border-radius: 5px; /* Optional rounded corners */
-  transition: background-color 0.3s; /* Smooth transition for color change */
-  cursor: pointer; /* Show pointer cursor on hover */
+  font-size: 2em;
+  border: 1px solid darkgray;
+  border-radius: 5px;
+  transition: background-color 0.3s;
+  cursor: pointer;
 }
 
 .control-box:active {
-  background-color: gray; /* Color change when pressed */
+  background-color: gray;
 }
 
 #arrow {
   position: absolute;
   top: 50%;
   left: 50%;
-  transform: translate(-50%, -50%) rotate(0deg); /* Default rotation */
+  transform: translate(-50%, -50%) rotate(0deg);
   width: 0;
   height: 0;
   border-left: 25px solid transparent;
   border-right: 25px solid transparent;
-  border-bottom: 60px solid red; /* Main color */
+  border-bottom: 60px solid red;
+  display: block;
 }
 
 #joystick {
-  display: none; /* Hide joystick by default */
-  width: 80px; /* Joystick size */
+  display: none;
+  width: 80px;
   height: 80px;
   border-radius: 50%;
   background-color: rgba(0, 0, 0, 0.5);
   position: absolute;
-  bottom: 10px; /* Positioning at the bottom */
+  bottom: 15vh; /* Positioned above controls */
   left: calc(50% - 40px); /* Centered horizontally */
-  pointer-events: auto; /* Allow pointer events for joystick */
+  pointer-events: auto;
 }
