@@ -45,25 +45,26 @@ body, html {
 
 #arrow {
   position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%) rotate(0deg);
   width: 0;
   height: 0;
-  border-left: 25px solid transparent;
-  border-right: 25px solid transparent;
-  border-bottom: 60px solid red;
-  display: block;
+  border-left: 10px solid transparent;
+  border-right: 10px solid transparent;
+  border-bottom: 20px solid #00f; /* Color of the triangle */
+  transform: translate(-50%, -50%);
 }
 
 #joystick {
-  display: none;
-  width: 80px;
-  height: 80px;
+  display: none; /* Initially hidden, will be controlled by initGameMobile */
+  width: 80px; /* Outer circle width */
+  height: 80px; /* Outer circle height */
   border-radius: 50%;
-  background-color: rgba(0, 0, 0, 0.5);
+  border: 5px solid white; /* White outline */
+  background-color: transparent; /* Transparent center */
   position: absolute;
-  bottom: 15vh; /* Positioned above controls */
-  left: calc(50% - 40px); /* Centered horizontally */
+  bottom: 350px; /* Adjust this value to raise the joystick higher on the screen */
+  left: 20px; /* Fixed position from the left */
   pointer-events: auto;
 }
+
+
+
