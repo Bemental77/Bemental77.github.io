@@ -53,27 +53,18 @@ body, html {
   transform: translate(-50%, -50%);
 }
 
-#arrow::after {
-  content: '';
-  position: absolute;
-  top: -5px; /* Adjust to position the click point above the triangle */
-  left: 0;
-  width: 10px; /* Width of the clickable point */
-  height: 10px; /* Height of the clickable point */
-  background-color: red; /* Color of the click point */
-  border-radius: 50%; /* Make it circular */
-  transform: translate(-50%, -50%);
-}
-
-
 #joystick {
-  display: none;
-  width: 80px;
-  height: 80px;
+  display: none; /* Initially hidden, will be controlled by initGameMobile */
+  width: 80px; /* Outer circle width */
+  height: 80px; /* Outer circle height */
   border-radius: 50%;
-  background-color: rgba(0, 0, 0, 0.5);
+  border: 5px solid white; /* White outline */
+  background-color: transparent; /* Transparent center */
   position: absolute;
-  bottom: 15vh; /* Positioned above controls */
-  left: calc(50% - 40px); /* Centered horizontally */
+  bottom: 350px; /* Adjust this value to raise the joystick higher on the screen */
+  left: 20px; /* Fixed position from the left */
   pointer-events: auto;
 }
+
+
+

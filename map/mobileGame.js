@@ -5,60 +5,52 @@ export function initGameMobile() {
 
   const arrowOffset = 25
   const joystickSensitivity = 0.2
-  let initialTouchX, initialTouchY // Store initial touch coordinates
+  const joystickRadius = joystick.offsetWidth / 2
+  let joystickCenterX, joystickCenterY // To store joystick's center
+
+  // Set initial position of the arrow
+  let arrowX = window.innerWidth / 2
+  let arrowY = window.innerHeight * 0.4
+  arrow.style.left = `${arrowX}px`
+  arrow.style.top = `${arrowY}px`
 
   function moveArrowJoystick(event) {
-      event.preventDefault()
+    event.preventDefault()
 
-      const touchX = event.touches[0].clientX
-      const touchY = event.touches[0].clientY
+    const touchX = event.touches[0].clientX
+    const touchY = event.touches[0].clientY
 
-      const deltaX = touchX - initialTouchX
-      const deltaY = touchY - initialTouchY
+    const deltaX = touchX - joystickCenterX
+    const deltaY = touchY - joystickCenterY
 
-      const angle = Math.atan2(deltaY, deltaX)
+    const angle = Math.atan2(deltaY, deltaX)
+    const distance = Math.min(Math.sqrt(deltaX ** 2 + deltaY ** 2), joystickRadius) * joystickSensitivity
 
-      const distance = Math.min(Math.sqrt(deltaX ** 2 + deltaY ** 2), joystick.offsetWidth / 2) * joystickSensitivity
+    const clickPointX = arrow.offsetLeft + 5 * Math.cos(angle)
+    const clickPointY = arrow.offsetTop + 5 * Math.sin(angle)
 
-      // Calculate new position for the arrow based on initial touch point
-      const arrowX = Math.max(arrowOffset, Math.min(window.innerWidth - arrowOffset, arrow.offsetLeft + (distance * Math.cos(angle))))
-      const arrowY = Math.max(arrowOffset, Math.min(window.innerHeight - arrowOffset, arrow.offsetTop + (distance * Math.sin(angle))))
+    const newClickPointX = Math.max(arrowOffset, Math.min(window.innerWidth - arrowOffset, clickPointX + (distance * Math.cos(angle))))
+    const newClickPointY = Math.max(arrowOffset, Math.min(window.innerHeight - arrowOffset, clickPointY + (distance * Math.sin(angle))))
 
-      // Update the arrow's position
-      arrow.style.left = `${arrowX}px`
-      arrow.style.top = `${arrowY}px`
+    // Update the arrow's position based on the new click point
+    arrow.style.left = `${newClickPointX}px`
+    arrow.style.top = `${newClickPointY}px`
 
-      // Rotate the arrow based on joystick movement
-      const rotationAngle = angle * (180 / Math.PI) // Convert radians to degrees
-      arrow.style.transform = `translate(-50%, -50%) rotate(${rotationAngle}deg)`
-
-      // Update joystick handle position
-      joystick.style.left = `${initialTouchX + deltaX}px`
-      joystick.style.top = `${initialTouchY + deltaY}px`
+    // Rotate the arrow based on opposite angle
+    const rotationAngle = angle * (180 / Math.PI) + 90
+    arrow.style.transform = `translate(-50%, -50%) rotate(${rotationAngle}deg)`
   }
 
   joystick.addEventListener('touchstart', event => {
-      event.preventDefault()
-      initialTouchX = event.touches[0].clientX // Capture initial touch coordinates
-      initialTouchY = event.touches[0].clientY
-      joystick.addEventListener('touchmove', moveArrowJoystick)
+    event.preventDefault()
+    joystickCenterX = joystick.getBoundingClientRect().left + joystickRadius
+    joystickCenterY = joystick.getBoundingClientRect().top + joystickRadius
+    joystick.addEventListener('touchmove', moveArrowJoystick)
   })
 
-  joystick.addEventListener('touchend', event => {
-      event.preventDefault()
-      joystick.removeEventListener('touchmove', moveArrowJoystick)
-
-      // Reset joystick position on touch end
-      joystick.style.left = 'calc(50% - 40px)'
-      joystick.style.top = '85vh'
-
-      // Reset arrow position and rotation when joystick is released
-      arrow.style.left = '50%'
-      arrow.style.top = '50%'
-      arrow.style.transform = 'translate(-50%, -50%) rotate(0deg)' // Reset rotation
-  })
-
-  // Show joystick and controls
+  // Set joystick position to bottom left corner
+  joystick.style.left = '20px'
+  joystick.style.top = 'calc(80vh - 80px)'
   joystick.style.display = 'block'
   controls.style.display = 'flex'
 }
