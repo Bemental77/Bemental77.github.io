@@ -11,19 +11,17 @@
             overflow: hidden;
         }
         #map {
-            width: 80vw;
-            height: 100vh;
+            width: 100vw;
+            height: 80vh;
             background-image: url('/images/map.png');
             background-size: cover;
             position: relative;
-            float: left;
         }
         #controls {
-            width: 20vw;
-            height: 100vh;
+            width: 100vw;
+            height: 20vh;
             background-color: lightgray;
             position: relative;
-            float: left;
         }
         #arrow {
             width: 0;
@@ -48,16 +46,24 @@
         const arrow = document.getElementById('arrow')
         const controls = document.getElementById('controls')
 
-        let arrowX = window.innerWidth * 0.4 // Initial position in the middle of the map (80% width, so 40% of screen width)
-        let arrowY = window.innerHeight / 2
+        let arrowX = window.innerWidth / 2
+        let arrowY = window.innerHeight * 0.4 // Initial position in the middle of the map
 
         function moveArrow(event) {
             event.preventDefault()
-            const deltaX = event.movementX || event.touches[0].clientX - event.touches[0].previousX || 0
-            const deltaY = event.movementY || event.touches[0].clientY - event.touches[0].previousY || 0
-            
-            arrowX += deltaX
-            arrowY += deltaY
+            const controlRect = controls.getBoundingClientRect()
+
+            let x, y
+            if (event.touches) {
+                x = event.touches[0].clientX - controlRect.left
+                y = event.touches[0].clientY - controlRect.top
+            } else {
+                x = event.clientX - controlRect.left
+                y = event.clientY - controlRect.top
+            }
+
+            arrowX += (x - controlRect.width / 2) * 0.01// Adjust sensitivity as needed
+            arrowY += (y - controlRect.height / 2) * 0.01
 
             arrow.style.left = `${arrowX}px`
             arrow.style.top = `${arrowY}px`
