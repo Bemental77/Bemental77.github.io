@@ -55,6 +55,7 @@ export function initGameMobile() {
     const controls = document.getElementById('controls') // Buttons container
 
     const arrowOffset = 25 // Adjust for the arrow's size
+    const joystickSensitivity = 0.1 // Adjust sensitivity for smoother movement
     let joystickCenterX, joystickCenterY // To store joystick's center
 
     function moveArrowJoystick(event) {
@@ -68,23 +69,29 @@ export function initGameMobile() {
         const deltaX = touchX - joystickCenterX
         const deltaY = touchY - joystickCenterY
 
-        // Update the joystick handle position (within its limits)
+        // Calculate the distance from the center of the joystick
         const distance = Math.min(Math.sqrt(deltaX ** 2 + deltaY ** 2), joystick.offsetWidth / 2)
+
+        // Apply sensitivity to the distance moved
+        const adjustedDistance = distance * joystickSensitivity;
+
         const angle = Math.atan2(deltaY, deltaX)
 
-        const arrowX = arrow.offsetLeft + (distance * Math.cos(angle))
-        const arrowY = arrow.offsetTop + (distance * Math.sin(angle))
+        // Calculate the new position for the arrow based on the adjusted distance
+        const arrowX = Math.max(arrowOffset, Math.min(window.innerWidth - arrowOffset, arrow.offsetLeft + (adjustedDistance * Math.cos(angle))))
+        const arrowY = Math.max(arrowOffset, Math.min(window.innerHeight - arrowOffset, arrow.offsetTop + (adjustedDistance * Math.sin(angle))))
 
-        // Ensure the arrow stays within the boundaries of the window
-        arrow.style.left = `${Math.max(arrowOffset, Math.min(window.innerWidth - arrowOffset, arrowX))}px`
-        arrow.style.top = `${Math.max(arrowOffset, Math.min(window.innerHeight - arrowOffset, arrowY))}px`
+        // Update the arrow's position
+        arrow.style.left = `${arrowX}px`
+        arrow.style.top = `${arrowY}px`
 
-        // Rotate the arrow based on movement direction
-        arrow.style.transform = `translate(-50%, -50%) rotate(${angle * (180 / Math.PI)}deg)`
+        // Rotate the arrow based on joystick movement
+        const rotationAngle = angle * (180 / Math.PI) // Convert radians to degrees
+        arrow.style.transform = `translate(-50%, -50%) rotate(${rotationAngle}deg)`
 
         // Update joystick handle position
-        joystick.style.left = `${joystickCenterX + deltaX - joystick.offsetWidth / 2}px`
-        joystick.style.top = `${joystickCenterY + deltaY - joystick.offsetHeight / 2}px`
+        joystick.style.left = `${joystickCenterX + deltaX}px` // Adjust joystick position
+        joystick.style.top = `${joystickCenterY + deltaY}px` // Adjust joystick position
     }
 
     joystick.addEventListener('touchstart', event => {
@@ -101,6 +108,11 @@ export function initGameMobile() {
         // Reset joystick position on touch end
         joystick.style.left = 'calc(50% - 40px)'
         joystick.style.top = '85vh' // Positioned near the bottom
+
+        // Reset arrow position and rotation when joystick is released
+        arrow.style.left = '50%';
+        arrow.style.top = '50%';
+        arrow.style.transform = 'translate(-50%, -50%) rotate(0deg)'; // Reset rotation
     })
 
     // Show joystick and controls
