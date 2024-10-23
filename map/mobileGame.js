@@ -11,10 +11,9 @@ export function initGameMobile() {
   explosion.style.pointerEvents = 'none'
   document.body.appendChild(explosion)
 
-  const speed = 2
   const arrowOffset = 25
-  const joystickSensitivity = 0.2
-  const joystickRadius = joystick.offsetWidth / 2
+  const joystickSensitivity = 0.05
+  const joystickRadius = Math.min(window.innerWidth, window.innerHeight) * 0.177 // Joystick radius based on screen size
   let joystickCenterX, joystickCenterY
 
   let arrowX = window.innerWidth / 2
@@ -34,11 +33,8 @@ export function initGameMobile() {
     const angle = Math.atan2(deltaY, deltaX)
     const distance = Math.min(Math.sqrt(deltaX ** 2 + deltaY ** 2), joystickRadius) * joystickSensitivity
 
-    const clickPointX = arrowX + 5 * Math.cos(angle)
-    const clickPointY = arrowY + 5 * Math.sin(angle)
-
-    arrowX = Math.max(arrowOffset, Math.min(window.innerWidth - arrowOffset, clickPointX + (distance * Math.cos(angle))))
-    arrowY = Math.max(arrowOffset, Math.min(window.innerHeight - arrowOffset, clickPointY + (distance * Math.sin(angle))))
+    arrowX = Math.max(arrowOffset, Math.min(window.innerWidth - arrowOffset, arrowX + (distance * Math.cos(angle))))
+    arrowY = Math.max(arrowOffset, Math.min(window.innerHeight - arrowOffset, arrowY + (distance * Math.sin(angle))))
 
     requestAnimationFrame(() => {
       arrow.style.left = `${arrowX}px`
@@ -86,8 +82,10 @@ export function initGameMobile() {
     triggerExplosion() // Trigger explosion when control box 1 is clicked
   })
 
-  joystick.style.left = '20px'
-  joystick.style.top = 'calc(80vh - 80px)'
+  joystick.style.width = `${joystickRadius * 2}px` // Set joystick width based on calculated radius
+  joystick.style.height = `${joystickRadius * 2}px` // Set joystick height based on calculated radius
+  joystick.style.left = `20px`
+  joystick.style.top = `calc(80vh - ${joystickRadius * 2}px)` // Adjust position based on joystick size
   joystick.style.display = 'block'
   controls.style.display = 'flex'
 }
