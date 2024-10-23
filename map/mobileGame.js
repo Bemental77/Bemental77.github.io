@@ -48,27 +48,36 @@ export function initGameMobile() {
   function triggerExplosion() {
     const explosionSize = 100
     const explosionDuration = 500
-
-    const explosionX = arrowX + 50 * Math.cos((Math.atan2(arrowY, arrowX) + Math.PI) % (2 * Math.PI))
-    const explosionY = arrowY + 50 * Math.sin((Math.atan2(arrowY, arrowX) + Math.PI) % (2 * Math.PI))
-
+    const distanceInPixels = 50 // Adjust this value to represent 5 meters in your scale
+  
+    // Ensure the arrow has a rotation applied; default to 0 if not set
+    const transform = arrow.style.transform || 'rotate(0deg)'
+    const match = transform.match(/rotate\((-?\d+(\.\d+)?)deg\)/)
+    const rotationAngle = match ? parseFloat(match[1]) * (Math.PI / 180) : 0 // Convert to radians
+    
+    const explosionX = arrowX + distanceInPixels * Math.cos(rotationAngle) // Position explosion 5 meters in front
+    const explosionY = arrowY + distanceInPixels * Math.sin(rotationAngle)
+  
     explosion.style.left = `${explosionX - explosionSize / 2}px`
     explosion.style.top = `${explosionY - explosionSize / 2}px`
     explosion.style.width = `${explosionSize}px`
     explosion.style.height = `${explosionSize}px`
     explosion.style.opacity = '1'
-
+    explosion.style.zIndex = '10' // Ensure explosion is in front
+  
     setTimeout(() => {
       explosion.style.transition = `width ${explosionDuration}ms, height ${explosionDuration}ms, opacity ${explosionDuration}ms`
       explosion.style.width = '0'
       explosion.style.height = '0'
       explosion.style.opacity = '0'
     }, 10)
-
+  
     setTimeout(() => {
       explosion.style.transition = 'none'
     }, explosionDuration + 10)
   }
+  
+  
 
   joystick.addEventListener('touchstart', event => {
     joystickCenterX = joystick.getBoundingClientRect().left + joystickRadius
