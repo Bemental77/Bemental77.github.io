@@ -43,15 +43,34 @@ body, html {
   background-color: gray;
 }
 
+#arrow-container {
+  position: relative;
+  width: 100px;
+  height: 100px;
+}
+
 #arrow {
   position: absolute;
   width: 0;
   height: 0;
   border-left: 10px solid transparent;
   border-right: 10px solid transparent;
-  border-bottom: 30px solid #00f; /* Increased height for elongation */
+  border-bottom: 30px solid #00f;
   transform: translate(-50%, -50%);
+  left: 50%;
+  top: 50%;
 }
+
+#perpendicular-line {
+  position: absolute;
+  width: 2px;
+  height: 50px; /* Adjust the length of the line */
+  background-color: red;
+  left: 50%;
+  top: calc(50% + 30px); /* Starts from the arrow's point */
+  transform: rotate(90deg) translateX(-50%);
+}
+
 
 
 #joystick {

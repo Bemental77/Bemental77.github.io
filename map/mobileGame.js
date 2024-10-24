@@ -3,6 +3,7 @@ export function initGameMobile() {
   const joystick = document.getElementById('joystick')
   const controls = document.getElementById('controls')
   const explosion = document.createElement('div')
+  const perpendicularLine = document.createElement('div')
 
   explosion.style.position = 'absolute'
   explosion.style.borderRadius = '50%'
@@ -11,15 +12,32 @@ export function initGameMobile() {
   explosion.style.pointerEvents = 'none'
   document.body.appendChild(explosion)
 
-  const arrowOffset = 25
+  perpendicularLine.style.position = 'absolute'
+  perpendicularLine.style.width = '50px'
+  perpendicularLine.style.height = '2px'
+  perpendicularLine.style.backgroundColor = 'red'
+  document.body.appendChild(perpendicularLine)
+
+  const arrowOffset = 0
   const joystickSensitivity = 0.05
-  const joystickRadius = Math.min(window.innerWidth, window.innerHeight) * 0.177 // Joystick radius based on screen size
+  const joystickRadius = Math.min(window.innerWidth, window.innerHeight) * 0.177
   let joystickCenterX, joystickCenterY
 
   let arrowX = window.innerWidth / 2
   let arrowY = window.innerHeight * 0.4
   arrow.style.left = `${arrowX}px`
   arrow.style.top = `${arrowY}px`
+
+  function updatePerpendicularLine(rotationAngle) {
+    const radians = rotationAngle * (Math.PI / 180)
+    const tipX = arrowX + (arrowOffset / 2) * Math.cos(radians)
+    const tipY = arrowY + (arrowOffset / 2) * Math.sin(radians)
+
+    perpendicularLine.style.left = `${tipX}px`
+    perpendicularLine.style.top = `${tipY}px`
+    perpendicularLine.style.transformOrigin = '0 50%'
+    perpendicularLine.style.transform = `rotate(${rotationAngle - 90}deg)`
+  }
 
   function moveArrowJoystick(event) {
     event.preventDefault()
@@ -42,42 +60,10 @@ export function initGameMobile() {
 
       const rotationAngle = angle * (180 / Math.PI) + 90
       arrow.style.transform = `translate(-50%, -50%) rotate(${rotationAngle}deg)`
+
+      updatePerpendicularLine(rotationAngle)
     })
   }
-
-  function triggerExplosion() {
-    const explosionSize = 100
-    const explosionDuration = 500
-    const distanceInPixels = 50 // Adjust this value to represent 5 meters in your scale
-  
-    // Ensure the arrow has a rotation applied; default to 0 if not set
-    const transform = arrow.style.transform || 'rotate(0deg)'
-    const match = transform.match(/rotate\((-?\d+(\.\d+)?)deg\)/)
-    const rotationAngle = match ? parseFloat(match[1]) * (Math.PI / 180) : 0 // Convert to radians
-    
-    const explosionX = arrowX + distanceInPixels * Math.cos(rotationAngle) // Position explosion 5 meters in front
-    const explosionY = arrowY + distanceInPixels * Math.sin(rotationAngle)
-  
-    explosion.style.left = `${explosionX - explosionSize / 2}px`
-    explosion.style.top = `${explosionY - explosionSize / 2}px`
-    explosion.style.width = `${explosionSize}px`
-    explosion.style.height = `${explosionSize}px`
-    explosion.style.opacity = '1'
-    explosion.style.zIndex = '10' // Ensure explosion is in front
-  
-    setTimeout(() => {
-      explosion.style.transition = `width ${explosionDuration}ms, height ${explosionDuration}ms, opacity ${explosionDuration}ms`
-      explosion.style.width = '0'
-      explosion.style.height = '0'
-      explosion.style.opacity = '0'
-    }, 10)
-  
-    setTimeout(() => {
-      explosion.style.transition = 'none'
-    }, explosionDuration + 10)
-  }
-  
-  
 
   joystick.addEventListener('touchstart', event => {
     joystickCenterX = joystick.getBoundingClientRect().left + joystickRadius
@@ -85,16 +71,15 @@ export function initGameMobile() {
     joystick.addEventListener('touchmove', moveArrowJoystick, { passive: false })
   }, { passive: true })
 
-  // Add event listener for control box with data-index="1"
   const button1 = controls.querySelector('.control-box[data-index="1"]')
   button1.addEventListener('click', () => {
-    triggerExplosion() // Trigger explosion when control box 1 is clicked
+    triggerExplosion()
   })
 
-  joystick.style.width = `${joystickRadius * 2}px` // Set joystick width based on calculated radius
-  joystick.style.height = `${joystickRadius * 2}px` // Set joystick height based on calculated radius
+  joystick.style.width = `${joystickRadius * 2}px`
+  joystick.style.height = `${joystickRadius * 2}px`
   joystick.style.left = `20px`
-  joystick.style.top = `calc(80vh - ${joystickRadius * 2}px)` // Adjust position based on joystick size
+  joystick.style.top = `calc(80vh - ${joystickRadius * 2}px)`
   joystick.style.display = 'block'
   controls.style.display = 'flex'
 }
