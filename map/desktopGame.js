@@ -1,3 +1,5 @@
+import { triggerExplosion } from './spells/explosion.js'
+
 export function initGameDesktop() {
   const arrow = document.getElementById('arrow')
   const controls = document.getElementById('controls')
@@ -70,5 +72,10 @@ export function initGameDesktop() {
     if (e.key === 'a') keys.a = false
     if (e.key === 's') keys.s = false
     if (e.key === 'd') keys.d = false
+  })
+
+  const button1 = controls.querySelector('.control-box[data-index="1"]')
+  button1.addEventListener('click', () => {
+    triggerExplosion(perpendicularLine)
   })
 }

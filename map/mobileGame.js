@@ -1,3 +1,5 @@
+import { triggerExplosion } from './spells/explosion.js' // Adjust the path as necessary
+
 export function initGameMobile() {
   const arrow = document.getElementById('arrow')
   const joystick = document.getElementById('joystick')
@@ -73,7 +75,7 @@ export function initGameMobile() {
 
   const button1 = controls.querySelector('.control-box[data-index="1"]')
   button1.addEventListener('click', () => {
-    triggerExplosion()
+    triggerExplosion(explosion, perpendicularLine)
   })
 
   joystick.style.width = `${joystickRadius * 2}px`
