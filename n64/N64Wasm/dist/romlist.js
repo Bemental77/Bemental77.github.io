@@ -12,5 +12,5 @@ var ROMLIST = [
   {url:"../roms/thewheel.z64",title:"The Wheel"},
   {url:"../roms/bk-jiggiesoftime.z64",title:"Banjo Kazooie Jiggies of Time"},
   {url:"../roms/starfoxsurvival.z64",title:"starfoxsurvivial"},
-  {url:"../roms/mariomartynew.z64",title:"mariopartynew"},
+  {url:"../roms/mariopartynew.z64",title:"mariopartynew"},
 ];
