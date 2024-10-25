@@ -10,5 +10,7 @@ var ROMLIST = [
   {url:"../roms/pkmnsnap.z64",title:"Pokemon Snap"},
   {url:"../roms/sm64.z64",title:"SM64"},
   {url:"../roms/thewheel.z64",title:"The Wheel"},
-  {url:"../roms/bk-jiggiesoftime.z64",title:"Banjo Kazooie Jiggies of Time"}
+  {url:"../roms/bk-jiggiesoftime.z64",title:"Banjo Kazooie Jiggies of Time"},
+  {url:"../roms/starfoxsurvival.z64",title:"starfoxsurvivial"},
+  {url:"../roms/mariomartynew.z64",title:"mariopartynew"},
 ];
