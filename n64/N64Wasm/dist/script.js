@@ -63,7 +63,7 @@ class MyClass {
             disableAudioSync: true,
             hadNipple: false,
             hadFullscreen: false,
-            forceAngry: true,
+            forceAngry: false,
             remapPlayer1: true,
             remapOptions: false,
             remapGameshark: false,
