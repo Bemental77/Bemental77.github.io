@@ -1,0 +1,53 @@
+<!doctype html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta charset="UTF-8">
+    <style>
+        html, body, #jsdos {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+           display: flex;
+           flex-wrap: wrap;
+           flex-direction: row;
+        }
+        .player {
+           width: 40vw;
+           height: 25vw;
+           background-color: black;
+           margin: 2vw 4vw;
+        }
+    </style>
+    <!-- js-dos style sheet -->
+    <link rel="stylesheet" href="https://v8.js-dos.com/latest/js-dos.css">
+
+    <!-- js-dos -->
+    <script src="https://v8.js-dos.com/latest/js-dos.js"></script>
+</head>
+<body>
+<div class="container">
+    <div class="player"><div id="jsdos-1"></div></div>
+    <div class="player"><div id="jsdos-2"></div></div>
+    <div class="player"><div id="jsdos-3"></div></div>
+    <div class="player"><div id="jsdos-4"></div></div>
+</div>
+<script>
+    Dos(document.getElementById("jsdos-1"), {
+        url: "https://cdn.dos.zone/original/2X/2/24b00b14f118580763440ecaddcc948f8cb94f14.jsdos"
+    });
+    Dos(document.getElementById("jsdos-2"), {
+        url: "https://cdn.dos.zone/original/2X/6/6a2bfa87c031c2a11ab212758a5d914f7c112eeb.jsdos"
+    });
+    Dos(document.getElementById("jsdos-3"), {
+        url: "https://cdn.dos.zone/original/2X/b/bc2f7ea2cf2738e236ce5043b6c756440e157949.jsdos"
+    });
+    Dos(document.getElementById("jsdos-4"), {
+        url: "https://cdn.dos.zone/original/2X/4/4426757ae08c0e7f21193d04a2ad0982e83c3dbf.jsdos"
+    });
+</script>
+</body>
+</html>

@@ -1,0 +1,198 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <link rel="stylesheet" type="text/css" href="style.css">
+  <title>Snes9x-2005-wasm</title>
+</head>
+<body>
+  <template id="buttonRemapSelectParentTemplate">
+    <div class="buttonRemapSelectParent">
+      <select class="buttonRemapSelect"></select>
+    </div>
+  </template>
+  <div id="root">
+    <div id="fullScreenRoot">
+      <div id="menuOpen3ParentParent">
+        <div id="menuOpen3Parent">
+          <div class="flex1"></div>
+          <div class="StartSelectCommon" id="menuOpen3"></div>
+        </div>
+      </div>
+      <canvas id="fs_output"></canvas>
+    </div>
+    <div id="menu">
+      <div id="menuHeader">
+        <div id="menuHeaderLeftMessage">Snes9x-2005-wasm Menu</div>
+        <p><a href="../roms/simcity.smc" download>simcity.smc</a></p>
+        <div class="squareButton" id="aboutButton" onclick="document.getElementById('menu').style.display='none'">
+              <div class="squareButtonMsg">hide banner</div>
+            </div>
+        <div class="flex1"></div>
+        <div id="menuHeaderRightMessage"><a href="#" id="menuHeaderLeftMessageChild">Close</a></div>
+      </div>
+      <div class="flex1">
+        <div id="squareButtonParentParent">
+          <div id="squareButtonParent">
+            <div class="squareButton" id="muteButton"><div class="squareButtonMsg" id="muteButtonMsg">Mute</div></div>
+            <div class="squareButton" id="fullScreenButton"><div class="squareButtonMsg" id="fullScreenButtonMsg">Enter<br>Fullscreen</div></div>
+            <div class="squareButton" id="loadRomButton"><div class="squareButtonMsg">Load ROM</div></div>
+            <div class="squareButton" id="loadSramButton"><div class="squareButtonMsg">Load SRAM</div></div>
+            <div class="squareButton" id="saveSramButton"><div class="squareButtonMsg">Save SRAM</div></div>
+            <div class="squareButton" id="loadStateButton"><div class="squareButtonMsg">Load State</div></div>
+            <div class="squareButton" id="saveStateButton"><div class="squareButtonMsg">Save State</div></div>
+            <div class="squareButton" id="gamepadSettingsButton"><div class="squareButtonMsg">Gamepad</div></div>
+            <div class="squareButton" id="aboutButton" onclick="document.getElementById('flex1').style.display='none'">
+              <div class="squareButtonMsg">hide menu</div>
+            </div>
+            <div class="squareButton" id="aboutButton" onclick="document.getElementById('menu').style.display='none'">
+              <div class="squareButtonMsg">hide banner</div>
+            </div>
+                      </div>
+        </div>
+        <div id="gamepadSettings">
+          <div id="gamepadNameShowParent">
+            <div id="gamepadNameShow">no controller connected</div>
+          </div>
+          <div id="gamepadButtonSettings">
+            <div class="flex1"></div>
+            <div id="gamepadButtonSettingsButtonName">
+              <div class="gamepadButtonSettingsButtonNameShowParent">
+                <div class="gamepadButtonSettingsButtonNameShow">START:</div>
+              </div>
+              <div class="gamepadButtonSettingsButtonNameShowParent">
+                <div class="gamepadButtonSettingsButtonNameShow">SELECT:</div>
+              </div>
+              <div class="gamepadButtonSettingsButtonNameShowParent">
+                <div class="gamepadButtonSettingsButtonNameShow">A:</div>
+              </div>
+              <div class="gamepadButtonSettingsButtonNameShowParent">
+                <div class="gamepadButtonSettingsButtonNameShow">B:</div>
+              </div>
+              <div class="gamepadButtonSettingsButtonNameShowParent">
+                <div class="gamepadButtonSettingsButtonNameShow">X:</div>
+              </div>
+              <div class="gamepadButtonSettingsButtonNameShowParent">
+                <div class="gamepadButtonSettingsButtonNameShow">Y:</div>
+              </div>
+              <div class="gamepadButtonSettingsButtonNameShowParent">
+                <div class="gamepadButtonSettingsButtonNameShow">L:</div>
+              </div>
+              <div class="gamepadButtonSettingsButtonNameShowParent">
+                <div class="gamepadButtonSettingsButtonNameShow">R:</div>
+              </div>
+              <div class="gamepadButtonSettingsButtonNameShowParent">
+                <div class="gamepadButtonSettingsButtonNameShow">D-Pad RIGHT:</div>
+              </div>
+              <div class="gamepadButtonSettingsButtonNameShowParent">
+                <div class="gamepadButtonSettingsButtonNameShow">D-Pad LEFT:</div>
+              </div>
+              <div class="gamepadButtonSettingsButtonNameShowParent">
+                <div class="gamepadButtonSettingsButtonNameShow">D-Pad DOWN:</div>
+              </div>
+              <div class="gamepadButtonSettingsButtonNameShowParent">
+                <div class="gamepadButtonSettingsButtonNameShow">D-Pad UP:</div>
+              </div>
+            </div>
+            <div id="buttonRemapSelectParentParent"></div>
+            <div class="flex1"></div>
+          </div>
+        </div>
+        <div id="aboutParent">
+          <div class="flex1"></div>
+          <div id="about"></div>
+          <div class="flex1"></div>
+        </div>
+      </div>
+    </div>
+    <div id="keyboardInputRight" class="flex1">
+      Keyboard Input:<br>
+      START : Enter<br>
+      SELECT : Shift<br>
+      A : A<br>
+      B : Z<br>
+      X : X<br>
+      Y : S<br>
+      L : D<br>
+      R : C<br>
+    </div>
+    <div id="middle">
+      <canvas id="output"></canvas>
+      <div class="flex1">
+        <div id="LRButtonParent">
+          <div class="LRButton" id="LButton" data-snes-button="5">
+            <div class="LRButtonChild">L</div>
+          </div>
+          <div class="flex1"></div>
+          <div class="LRButton" id="RButton" data-snes-button="4">
+            <div class="LRButtonChild">R</div>
+          </div>
+        </div>
+        <div id="StartSelectParent">
+          <div class="flex1 displayFlex">
+            <div class="flex1"></div>
+            <div class="startSelectMsg">SELECT</div>
+          </div>
+          <div class="StartSelectCommon" id="SEButton" data-snes-button="13"></div>
+          <div class="StartSelectGap"></div>
+          <div class="StartSelectCommon" id="STButton" data-snes-button="12"></div>
+          <div class="flex1 displayFlex">
+            <div class="startSelectMsg">START</div>
+            <div class="flex1 displayFlex">
+              <div class="flex1"></div>
+              <div id="menuOpen2Parent" class="displayFlex">
+                <div class="flex1">Menu</div>
+                <div class="StartSelectCommon" id="menuOpen2"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div id="ABXYDPadParent">
+          <div id="DpadParent">
+            <div class="ABXYuttonCommon" id="DUButton" data-snes-button="11">
+              <div class="ABXYuttonCommonChild">↑</div>
+            </div>
+            <div class="ABXYuttonCommon" id="DDButton" data-snes-button="10">
+              <div class="ABXYuttonCommonChild">↓</div>
+            </div>
+            <div class="ABXYuttonCommon" id="DRButton" data-snes-button="8">
+              <div class="ABXYuttonCommonChild">→</div>
+            </div>
+            <div class="ABXYuttonCommon" id="DLButton" data-snes-button="9">
+              <div class="ABXYuttonCommonChild">←</div>
+            </div>
+          </div>
+          <div class="flex1"></div>
+          <div id="ABXYParent">
+            <div class="ABXYuttonCommon" id="AButton" data-snes-button="7">
+              <div class="ABXYuttonCommonChild">A</div>
+            </div>
+            <div class="ABXYuttonCommon" id="BButton" data-snes-button="15">
+              <div class="ABXYuttonCommonChild">B</div>
+            </div>
+            <div class="ABXYuttonCommon" id="XButton" data-snes-button="6">
+              <div class="ABXYuttonCommonChild">X</div>
+            </div>
+            <div class="ABXYuttonCommon" id="YButton" data-snes-button="14">
+              <div class="ABXYuttonCommonChild">Y</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="keyboardInput" class="flex1">
+      <div id="menuOpen1Parent">
+        <div class="flex1"></div>
+        <div>Menu</div>
+        <div class="StartSelectCommon" id="menuOpen1" onclick="document.getElementById('#menuOpen3Parent').style.display='active'">
+        </div>
+    </div>
+    
+    </div>
+  </div>
+  <script src="../snes9x_2005.js"></script>
+  <script src="gamepad.js"></script>
+  <script src="script.js"></script>
+</body>
+</html>
