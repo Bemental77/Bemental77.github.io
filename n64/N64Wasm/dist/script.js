@@ -60,7 +60,7 @@ class MyClass {
             invert2P: false,
             invert3P: false,
             invert4P: false,
-            disableAudioSync: true,
+            disableAudioSync: false,
             hadNipple: false,
             hadFullscreen: false,
             forceAngry: false,
