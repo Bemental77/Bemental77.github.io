@@ -182,7 +182,7 @@ n64wasm.js: $(FILES)
     -s USE_ZLIB=1 \
 	-s USE_SDL_IMAGE=2 \
     -lGL \
-    -s TOTAL_MEMORY=536870912 \
+    -s TOTAL_MEMORY=1073741824 \
 	--use-preload-plugins \
 	-s MIN_WEBGL_VERSION=2 \
 	-s FULL_ES3=1 \
