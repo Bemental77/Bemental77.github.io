@@ -16,5 +16,9 @@ var ROMLIST = [
   {url:"../roms/dinosaurplanet.z64",title:"dinosaurplanet"},
   {url:"../roms/marioo64.z64",title:"marioo64"},
   {url:"../roms/zeldaMasterOfTime.z64",title:"zeldaMasterOfTime"},
-
+  {url:"../roms/dk64.z64",title:"donkeyKong64"},
+  {url:"../roms/diddyKongRacing.z64",title:"diddyKongRacing"},
+  {url:"../roms/banjoChristmas.z64",title:"banjoChristmas"},
+  {url:"../roms/Banjo-Dreamie.z64",title:"banjoDreamie"},
+  {url:"../roms/superMarioStarRoad.z64",title:"superMarioStarRoad"},
 ];
