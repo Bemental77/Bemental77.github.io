@@ -15,4 +15,6 @@ var ROMLIST = [
   {url:"../roms/mariopartynew.z64",title:"mariopartynew"},
   {url:"../roms/dinosaurplanet.z64",title:"dinosaurplanet"},
   {url:"../roms/marioo64.z64",title:"marioo64"},
+  {url:"../roms/zeldaMasterOfTime.z64",title:"zeldaMasterOfTime"},
+
 ];
