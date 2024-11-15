@@ -20,4 +20,5 @@ var ROMLIST = [
   {url:"../roms/diddyKongRacing.z64",title:"diddyKongRacing"},
   {url:"../roms/banjoChristmas.z64",title:"banjoChristmas"},
   {url:"../roms/Banjo-Dreamie.z64",title:"banjoDreamie"},
+  {url:"../roms/superMarioStarRoad.z64",title:"superMarioStarRoad"},
 ];
