@@ -24,4 +24,5 @@ var ROMLIST = [
   {url:"../roms/conker.z64",title:"conker"},
   {url:"../roms/flyingDragon.z64",title:"flyingDragon"},
   {url:"../roms/gauntletLegends.z64",title:"gauntletLegends"},
+  {url:"../roms/newTetris.z64",title:"newTetris"},
 ];
