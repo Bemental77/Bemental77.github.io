@@ -10,8 +10,11 @@
     "aws-sdk": "^2.1368.0",
     "buffer": "^6.0.3",
     "eslint": "8.39.0",
+    "next": "^15.2.3",
     "nodemailer": "^6.9.1",
     "postcss": "8.4.23",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
     "tailwindcss": "3.3.1",
     "toastify-js": "^1.12.0",
     "typescript": "5.0.4"
@@ -30,5 +33,10 @@
     "postcss": "8.4.23",
     "tailwindcss": "3.3.1",
     "typescript": "5.0.4"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
   }
 }
