@@ -1,0 +1,40 @@
+@keyframes zoom-animation {
+  0% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.06);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.App {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  flex-direction: column;
+  min-height: 100vh;
+  text-align: center;
+  font-family: 'Kinky', sans-serif;
+  background-image: url('images/mint-green-abstract-squares-fabric-texture.jpg');
+  background-size: cover;
+  background-repeat: no-repeat;
+  animation: zoom-animation 60s infinite alternate; /* Adjust the duration as desired */
+}
+
+html, body {
+  overflow: hidden;
+}
+
+.App.fullscreen {
+  overflow: hidden;
+}
+
+.countdown-title {
+  font-size: 69px;
+  color: white;
+  text-shadow: 4px 4px 8px black;
+}
+

@@ -1,7 +1,8 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import './index.css';
-import App from './App';
+import './App.css';
+import App from '../../mkScoreboard/src/pp';
 import reportWebVitals from './reportWebVitals';
 
 const root = ReactDOM.createRoot(
