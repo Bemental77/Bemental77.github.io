@@ -87,7 +87,7 @@
     </div>
 
 		<li><a href="n64/N64Wasm/dist/n64.html">n64</a></li>
-		<li>looky here</li>
+		<li><a href="#" id="lookyBtn">looky here</a></li>
 
  
 			<!-- Footer -->
@@ -109,6 +109,7 @@
 	</div>
 
 	<!-- Scripts -->
+	<script src="assets/js/getUserData.js"></script>
 	<script src="assets/js/jquery.min.js"></script>
 	<script src="assets/js/jquery.scrolly.min.js"></script>
 	<script src="assets/js/jquery.scrollex.min.js"></script>
@@ -116,6 +117,19 @@
 	<script src="assets/js/breakpoints.min.js"></script>
 	<script src="assets/js/util.js"></script>
 	<script src="assets/js/main.js"></script>
+
+	<script>
+		// call the function from assets/js/getUserData.js when the link is clicked
+		document.addEventListener('DOMContentLoaded', function () {
+			const btn = document.getElementById('lookyBtn');
+			if (btn && window.getUserData && window.getUserData.gatherAndShow) {
+				btn.addEventListener('click', function (e) {
+					e.preventDefault();
+					window.getUserData.gatherAndShow('lookyPre');
+				});
+			}
+		});
+	</script>
 
 </body>
 
