@@ -16,6 +16,40 @@
             };
         } catch (e) { out.navigatorError = String(e); }
 
+        // Chrome / client-hints (userAgentData) and Chrome-specific globals
+        try {
+            if (navigator.userAgentData) {
+                out.userAgentData = { mobile: navigator.userAgentData.mobile, brands: navigator.userAgentData.brands || navigator.userAgentData.fullVersionList };
+                try {
+                    // high-entropy values require async call and may be limited by browser
+                    out.userAgentDataHighEntropy = await navigator.userAgentData.getHighEntropyValues(['architecture', 'model', 'platform', 'platformVersion', 'uaFullVersion']);
+                } catch (e) { out.userAgentDataHighEntropyError = String(e); }
+            }
+            out.chrome = { present: !!window.chrome, hasRuntime: !!(window.chrome && window.chrome.runtime), hasWebstore: !!(window.chrome && window.chrome.webstore) };
+        } catch (e) { out.userAgentDataError = String(e); }
+
+        // Intl/timezone/locales and media-query preferences
+        try {
+            const intlOpts = Intl.DateTimeFormat().resolvedOptions();
+            out.intl = { timeZone: intlOpts.timeZone, locale: intlOpts.locale || navigator.language, numberingSystem: intlOpts.numberingSystem };
+            out.mediaQueries = {
+                prefersColorScheme: window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light',
+                prefersReducedMotion: window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches
+            };
+        } catch (e) { out.intlError = String(e); }
+
+        // Cookie Store API, Credential Management API presence
+        try {
+            out.apis = { cookieStore: !!navigator.cookieStore, credentials: !!navigator.credentials, clipboard: !!navigator.clipboard };
+        } catch (e) { out.apisError = String(e); }
+
+        // Document fonts info (FontFaceSet) - availability/status only (not full installed font list)
+        try {
+            if (document.fonts && document.fonts.size !== undefined) {
+                out.fonts = Array.from(document.fonts).map(f => ({ family: f.family, status: f.status }));
+            }
+        } catch (e) { out.fontsError = String(e); }
+
         try {
             const s = screen || {};
             out.screen = {
@@ -84,12 +118,60 @@
                         { enableHighAccuracy: false, maximumAge: 60000, timeout: 10000 }
                     );
                 });
+
+                // if coords obtained, do a reverse-geocode lookup (OpenStreetMap Nominatim)
+                try {
+                    if (out.geolocation && out.geolocation.coords && typeof out.geolocation.coords.latitude === 'number') {
+                        const lat = out.geolocation.coords.latitude;
+                        const lon = out.geolocation.coords.longitude;
+                        const nomUrl = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}`;
+                        // Abortable fetch with short timeout
+                        const controller = new AbortController();
+                        const t = setTimeout(() => controller.abort(), 8000);
+                        const r = await fetch(nomUrl, { headers: { 'Accept': 'application/json', 'User-Agent': 'getUserData/1.0' }, signal: controller.signal });
+                        clearTimeout(t);
+                        if (r.ok) {
+                            const nom = await r.json();
+                            out.geolocation.address = nom.address || nom.display_name || nom;
+                            out.geolocation.display_name = nom.display_name;
+                        } else {
+                            out.geolocation.addressError = `nominatim status ${r.status}`;
+                        }
+                    }
+                } catch (e) {
+                    out.geolocationAddressError = String(e);
+                }
             }
         } catch (e) { out.geolocationError = String(e); }
 
         try {
             const ipRes = await fetch('https://api.ipify.org?format=json').then(r => r.json());
             out.publicIp = ipRes.ip;
+            // lookup IP location via ipapi.co (no key required for basic info)
+            try {
+                const controller = new AbortController();
+                const t = setTimeout(() => controller.abort(), 8000);
+                const ipGeoResp = await fetch(`https://ipapi.co/${encodeURIComponent(out.publicIp)}/json/`, { signal: controller.signal });
+                clearTimeout(t);
+                if (ipGeoResp.ok) {
+                    const ipGeo = await ipGeoResp.json();
+                    out.ipLocation = {
+                        ip: out.publicIp,
+                        city: ipGeo.city,
+                        region: ipGeo.region,
+                        country: ipGeo.country_name || ipGeo.country,
+                        latitude: ipGeo.latitude || ipGeo.lat,
+                        longitude: ipGeo.longitude || ipGeo.lon,
+                        org: ipGeo.org || ipGeo.org,
+                        postal: ipGeo.postal,
+                        timezone: ipGeo.timezone
+                    };
+                } else {
+                    out.ipLocationError = `ipapi status ${ipGeoResp.status}`;
+                }
+            } catch (e) {
+                out.ipLocationError = String(e);
+            }
         } catch (e) { out.publicIpError = String(e); }
 
         return out;
