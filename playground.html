@@ -90,7 +90,11 @@
 		<li><a href="n64/N64Wasm/dist/n64.html">n64</a></li>
 		<li><a href="#" id="lookyBtn">looky here</a></li>
 
- 
+    <!-- output for getUserData -->
+    <div id="lookyOutput" class="inner" style="margin:1rem 0;">
+        <pre id="lookyPre" style="white-space:pre-wrap; word-break:break-word; background:#111; color:#eee; padding:1rem; border-radius:4px; max-height:400px; overflow:auto;">Click "looky here" to collect user info...</pre>
+    </div>
+
 			<!-- Footer -->
 			<footer id="footer">
 				<div class="inner">
@@ -126,6 +130,14 @@
 			if (btn && window.getUserData && window.getUserData.gatherAndShow) {
 				btn.addEventListener('click', function (e) {
 					e.preventDefault();
+					console.log('lookyBtn clicked — gathering user data');
+					// ensure a fallback target exists
+					if (!document.getElementById('lookyPre')) {
+						const out = document.createElement('pre');
+						out.id = 'lookyPre';
+						out.style = 'white-space:pre-wrap; word-break:break-word; background:#111; color:#eee; padding:1rem; border-radius:4px; max-height:400px; overflow:auto;';
+						btn.insertAdjacentElement('afterend', out);
+					}
 					window.getUserData.gatherAndShow('lookyPre');
 				});
 			}
