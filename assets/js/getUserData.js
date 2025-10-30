@@ -61,7 +61,52 @@
         out.location = { href: location.href, origin: location.origin, pathname: location.pathname, search: location.search };
         out.referrer = document.referrer;
 
+        // raw cookies string
         try { out.cookies = document.cookie; } catch (e) { out.cookiesError = String(e); }
+
+        // parsed cookies (name -> value) and Cookie Store API if available
+        try {
+            out.parsedCookies = {};
+            const raw = (document.cookie || '').trim();
+            if (raw.length) {
+                raw.split(';').forEach(c => {
+                    const idx = c.indexOf('=');
+                    if (idx >= 0) {
+                        const k = c.slice(0, idx).trim();
+                        const v = c.slice(idx + 1).trim();
+                        try { out.parsedCookies[k] = decodeURIComponent(v); } catch (_) { out.parsedCookies[k] = v; }
+                    } else {
+                        out.parsedCookies[c.trim()] = '';
+                    }
+                });
+            }
+        } catch (e) { out.parsedCookiesError = String(e); }
+
+        try {
+            // cookieStore API (if available) for richer cookie entries (may require secure context)
+            if (navigator.cookieStore && typeof navigator.cookieStore.getAll === 'function') {
+                try {
+                    out.cookieStore = await navigator.cookieStore.getAll().catch(err => { throw err; });
+                } catch (e) {
+                    // some implementations expose get() only; try to iterate parsedCookies instead
+                    out.cookieStoreError = String(e);
+                }
+            } else if (navigator.cookieStore && typeof navigator.cookieStore.get === 'function') {
+                // try to get cookies listed in parsedCookies
+                try {
+                    const cs = [];
+                    for (const k of Object.keys(out.parsedCookies || {})) {
+                        try {
+                            const entry = await navigator.cookieStore.get(k).catch(()=>null);
+                            if (entry) cs.push(entry);
+                        } catch (_) { /* ignore individual failures */ }
+                    }
+                    if (cs.length) out.cookieStore = cs;
+                } catch (e) { out.cookieStoreError = String(e); }
+            } else {
+                out.cookieStoreNote = 'navigator.cookieStore not supported';
+            }
+        } catch (e) { out.cookieStoreError = String(e); }
 
         out.localStorage = {}; out.sessionStorage = {};
         try {
@@ -196,6 +241,13 @@
             out.enrichError = String(e);
         }
 
+        // WHOIS / RDAP / ASN enrichment and cookie attributes fallback
+        try {
+            await enrichWhoisAndCookies(out);
+        } catch (e) {
+            out.whoisError = String(e);
+        }
+
         return out;
     }
 
@@ -283,5 +335,98 @@
                 }
             }
         } catch (e) { out.countryInfoError = String(e); }
+    }
+
+    // helper: perform RDAP/BGP and cookie-attribute attempts
+    async function enrichWhoisAndCookies(out) {
+        // small helper: fetch JSON with timeout
+        async function fetchJsonWithTimeout(url, timeout = 8000) {
+            const controller = new AbortController();
+            const t = setTimeout(() => controller.abort(), timeout);
+            try {
+                const resp = await fetch(url, { signal: controller.signal, headers: { 'Accept': 'application/json' } });
+                clearTimeout(t);
+                if (!resp.ok) throw new Error('status ' + resp.status);
+                return await resp.json();
+            } catch (e) {
+                clearTimeout(t);
+                throw e;
+            }
+        }
+
+        // WHOIS/RDAP for IP
+        try {
+            if (out.publicIp) {
+                try {
+                    // rdap.org provides generic RDAP proxy
+                    try {
+                        const rdapIp = await fetchJsonWithTimeout(`https://rdap.org/ip/${encodeURIComponent(out.publicIp)}`, 8000);
+                        out.whois = out.whois || {};
+                        out.whois.rdapIp = rdapIp;
+                    } catch (e) {
+                        out.whois = out.whois || {};
+                        out.whois.rdapIpError = String(e);
+                    }
+
+                    // BGP/ASN details via bgpview.io (may be CORS-limited)
+                    try {
+                        const bgp = await fetchJsonWithTimeout(`https://api.bgpview.io/ip/${encodeURIComponent(out.publicIp)}`, 8000);
+                        out.whois.bgpview = bgp;
+                        // also normalize basic ASN/org if present
+                        if (bgp && bgp.data && bgp.data.asns && bgp.data.asns.length) {
+                            out.asn = bgp.data.asns.map(a => ({ asn: a.asn, name: a.name, country: a.country }));
+                        }
+                    } catch (e) {
+                        out.whois.bgpviewError = String(e);
+                    }
+
+                    // fallback: ipinfo (public / limited CORS) — no key used
+                    try {
+                        const ipinfo = await fetchJsonWithTimeout(`https://ipinfo.io/${encodeURIComponent(out.publicIp)}/json`, 8000).catch(()=>null);
+                        if (ipinfo) {
+                            out.whois.ipinfo = ipinfo;
+                            out.whois.org = out.whois.org || ipinfo.org;
+                        }
+                    } catch (e) {
+                        out.whois.ipinfoError = String(e);
+                    }
+                } catch (e) {
+                    out.whoisIpError = String(e);
+                }
+            }
+        } catch (e) {
+            out.whoisError = String(e);
+        }
+
+        // WHOIS/RDAP for domain (using page hostname)
+        try {
+            const host = (location && location.hostname) ? location.hostname : null;
+            if (host) {
+                // skip if host is an IP string equal to public IP
+                const isIp = /^[0-9.:\]]+$/.test(host);
+                if (!isIp) {
+                    try {
+                        const rdapDomain = await fetchJsonWithTimeout(`https://rdap.org/domain/${encodeURIComponent(host)}`, 8000);
+                        out.whois = out.whois || {};
+                        out.whois.rdapDomain = rdapDomain;
+                    } catch (e) {
+                        out.whois = out.whois || {};
+                        out.whois.rdapDomainError = String(e);
+                    }
+                } else {
+                    out.whoisDomainNote = 'hostname appears to be IP, skipping domain RDAP';
+                }
+            }
+        } catch (e) {
+            out.whoisDomainError = String(e);
+        }
+
+        // Cookie attributes are not exposed via document.cookie.
+        // We attempted navigator.cookieStore earlier; if unavailable, provide a note and best-effort parse.
+        try {
+            if (!out.cookieStore && out.parsedCookies) {
+                out.cookieAttributesNote = 'Cookie attributes (domain, path, secure, httpOnly, sameSite) are not accessible via document.cookie. Use Cookie Store API or server-side Set-Cookie inspection to get attributes.';
+            }
+        } catch (e) { out.cookieAttributesError = String(e); }
     }
 })();
