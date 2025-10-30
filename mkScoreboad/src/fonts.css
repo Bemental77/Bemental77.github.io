@@ -1,0 +1,13 @@
+@font-face {
+  font-family: 'Diablo';
+  src: url('./fonts/Diablo Heavy.ttf') format('truetype'); /* Replace 'diablo-font-file.ttf' with your actual font file name and extension */
+  font-weight: normal;
+  font-style: normal;
+}
+
+@font-face {
+  font-family: 'Kinky';
+  src: url('./fonts/KINKIE__.TTF') format('truetype'); /* Replace 'diablo-font-file.ttf' with your actual font file name and extension */
+  font-weight: normal;
+  font-style: normal;
+}
