@@ -36,12 +36,6 @@
                 out.localStorage[k] = localStorage.getItem(k);
             }
         } catch (e) { out.localStorageError = String(e); }
-        try {
-            for (let i = 0; i < sessionStorage.length; i++) {
-                const k = sessionStorage.key(i);
-                out.sessionStorage[k] = sessionStorage.getItem(k);
-            }
-        } catch (e) { out.sessionStorageError = String(e); }
 
         try {
             out.plugins = Array.from(navigator.plugins || []).map(p => p.name);
