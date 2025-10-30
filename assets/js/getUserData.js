@@ -86,27 +86,41 @@
             out.performance = navEntries[0] || performance.timing || {};
         } catch (e) { out.performanceError = String(e); }
 
+        // GPU (WebGL) renderer info and Battery (if available)
         try {
-            if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-                const devices = await navigator.mediaDevices.enumerateDevices();
-                out.mediaDevices = devices.map(d => ({ kind: d.kind, label: d.label, deviceId: d.deviceId }));
-            }
-        } catch (e) { out.mediaDevicesError = String(e); }
-
-        try {
-            out.permissions = {};
-            const perms = ['geolocation', 'notifications', 'camera', 'microphone', 'clipboard-read'];
-            for (const p of perms) {
-                try {
-                    if (navigator.permissions && navigator.permissions.query) {
-                        const res = await navigator.permissions.query({ name: p });
-                        out.permissions[p] = res.state;
+            try {
+                const canvas = document.createElement('canvas');
+                const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                if (gl) {
+                    const dbg = gl.getExtension && gl.getExtension('WEBGL_debug_renderer_info');
+                    if (dbg) {
+                        out.gpu = {
+                            vendor: gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL),
+                            renderer: gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)
+                        };
+                    } else {
+                        out.gpu = { note: 'WEBGL_debug_renderer_info not available' };
                     }
-                } catch (inner) {
-                    out.permissions[p] = String(inner);
+                } else {
+                    out.gpu = { note: 'WebGL not available' };
+                }
+            } catch (gErr) {
+                out.gpuError = String(gErr);
+            }
+
+            if (navigator.getBattery) {
+                try {
+                    // store battery info asynchronously but include in output if available before return
+                    out._batteryPending = true;
+                    navigator.getBattery().then(b => {
+                        out.battery = { charging: b.charging, level: b.level, chargingTime: b.chargingTime, dischargingTime: b.dischargingTime };
+                        delete out._batteryPending;
+                    }).catch(e => { out.batteryError = String(e); delete out._batteryPending; });
+                } catch (bErr) {
+                    out.batteryError = String(bErr);
                 }
             }
-        } catch (e) { out.permissionsError = String(e); }
+        } catch (e) { out.gpuBatteryError = String(e); }
 
         try {
             if (navigator.geolocation) {
@@ -160,6 +174,7 @@
                         city: ipGeo.city,
                         region: ipGeo.region,
                         country: ipGeo.country_name || ipGeo.country,
+                        country_code: ipGeo.country_code || ipGeo.country,
                         latitude: ipGeo.latitude || ipGeo.lat,
                         longitude: ipGeo.longitude || ipGeo.lon,
                         org: ipGeo.org || ipGeo.org,
@@ -173,6 +188,13 @@
                 out.ipLocationError = String(e);
             }
         } catch (e) { out.publicIpError = String(e); }
+
+        // Enrich geo/ip info: timezone, weather, restcountries, fallback geo provider
+        try {
+            await enrichIpAndCoords(out);
+        } catch (e) {
+            out.enrichError = String(e);
+        }
 
         return out;
     }
@@ -197,4 +219,69 @@
         gatherUserInfo,
         gatherAndShow
     };
+
+    // helper: enrich with timezone (worldtimeapi), weather (open-meteo), restcountry info, geojs fallback
+    async function enrichIpAndCoords(out) {
+        // timezone from worldtimeapi (by IP) - no key
+        try {
+            const wt = await fetch('https://worldtimeapi.org/api/ip').then(r => r.ok ? r.json() : null).catch(() => null);
+            if (wt && wt.timezone) out.ipTimezone = { timezone: wt.timezone, datetime: wt.datetime, utc_offset: wt.utc_offset };
+        } catch (e) { out.ipTimezoneError = String(e); }
+
+        // ensure we have coordinates (try ipLocation then geolocation)
+        const lat = (out.ipLocation && parseFloat(out.ipLocation.latitude)) || (out.geolocation && out.geolocation.coords && out.geolocation.coords.latitude);
+        const lon = (out.ipLocation && parseFloat(out.ipLocation.longitude)) || (out.geolocation && out.geolocation.coords && out.geolocation.coords.longitude);
+
+        if (typeof lat === 'number' && typeof lon === 'number' && !Number.isNaN(lat) && !Number.isNaN(lon)) {
+            try {
+                const weatherUrl = `https://api.open-meteo.com/v1/forecast?latitude=${encodeURIComponent(lat)}&longitude=${encodeURIComponent(lon)}&current_weather=true`;
+                const wresp = await fetch(weatherUrl).then(r => r.ok ? r.json() : null).catch(() => null);
+                if (wresp && wresp.current_weather) out.weather = wresp.current_weather;
+            } catch (e) {
+                out.weatherError = String(e);
+            }
+        } else {
+            // fallback geo by IP using geojs if no coords from ipapi
+            try {
+                if (!out.ipLocation) {
+                    const geo = await fetch('https://get.geojs.io/v1/ip/geo.json').then(r => r.ok ? r.json() : null).catch(() => null);
+                    if (geo) {
+                        out.ipLocation = out.ipLocation || {};
+                        out.ipLocation.city = out.ipLocation.city || geo.city;
+                        out.ipLocation.region = out.ipLocation.region || geo.region;
+                        out.ipLocation.country = out.ipLocation.country || geo.country;
+                        out.ipLocation.latitude = out.ipLocation.latitude || geo.latitude;
+                        out.ipLocation.longitude = out.ipLocation.longitude || geo.longitude;
+                        out.ipLocation.org = out.ipLocation.org || geo.organization;
+                    }
+                }
+            } catch (e) { out.geojsError = String(e); }
+        }
+
+        // restcountries: enrich country metadata if we have a country code or name
+        try {
+            const code = out.ipLocation && (out.ipLocation.country_code || out.ipLocation.country);
+            if (code) {
+                // prefer alpha code lookup if it's 2 or 3 letters, otherwise try name
+                let rc = null;
+                if (typeof code === 'string' && code.length <= 3 && /^[A-Za-z]{2,3}$/.test(code)) {
+                    rc = await fetch(`https://restcountries.com/v3.1/alpha/${encodeURIComponent(code)}`).then(r => r.ok ? r.json() : null).catch(() => null);
+                } else {
+                    rc = await fetch(`https://restcountries.com/v3.1/name/${encodeURIComponent(code)}?fullText=false`).then(r => r.ok ? r.json() : null).catch(() => null);
+                }
+                if (rc && rc.length) {
+                    const c = rc[0];
+                    out.countryInfo = {
+                        name: c.name && (c.name.common || c.name.official),
+                        cca2: c.cca2, cca3: c.cca3,
+                        region: c.region, subregion: c.subregion,
+                        currencies: c.currencies ? Object.keys(c.currencies) : undefined,
+                        languages: c.languages ? Object.values(c.languages) : undefined,
+                        population: c.population,
+                        flag: c.flags && c.flags.svg
+                    };
+                }
+            }
+        } catch (e) { out.countryInfoError = String(e); }
+    }
 })();
