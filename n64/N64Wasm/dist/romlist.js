@@ -25,4 +25,5 @@ var ROMLIST = [
   {url:"../roms/flyingDragon.z64",title:"flyingDragon"},
   {url:"../roms/gauntletLegends.z64",title:"gauntletLegends"},
   {url:"../roms/newTetris.z64",title:"newTetris"},
-  {url:"../roms/PKST1_MASTERS V1.z64",title:"pkmnStadaiumMasters"}]
+  {url:"../roms/newTetris.z64",title:"newTetris"}
+];
