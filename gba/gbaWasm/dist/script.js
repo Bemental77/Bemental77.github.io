@@ -251,6 +251,15 @@ class MyClass {
         this.romSize = u8.length;
         Module._emuLoadROM(this.romSize);
 
+        // Override save type based on ROM game code (bytes 0xAC–0xAF).
+        // emuLoadROM hard-resets flashSize to 64K; re-apply the correct size now.
+        const gameCode = String.fromCharCode(u8[0xAC], u8[0xAD], u8[0xAE], u8[0xAF]);
+        const flash128kGames = ['BPRE', 'BPGE', 'BPEE', 'PUVV']; // FireRed, LeafGreen, Emerald, Ultra Violet
+        if (flash128kGames.indexOf(gameCode) !== -1) {
+            Module._emuSetSaveType(3, 0x20000); // Flash 128K
+            console.log('Save type: Flash 128K for game code', gameCode);
+        }
+
         // Restore saved SRAM, then start
         this._loadSave((found) => {
             if (found) console.log('SRAM restored for', this.rom_name);
@@ -326,34 +335,81 @@ class MyClass {
         }
     }
 
-    saveStateLocal() {
+    // ── HEAP SNAPSHOT SAVE STATES ─────────────────────────────────────────────
+    // 44vba exposes no serialize/deserialize API. Instead we snapshot the full
+    // 128 MB WASM heap (fixed size, no growth). Most pages are zero so gzip
+    // compresses it to ~3-8 MB. Because HEAPU8 is a view of a fixed ArrayBuffer,
+    // Module.HEAPU8.set() restores state in-place and all existing typed-array
+    // views (idata, saveBuf, etc.) remain valid — no re-init needed.
+
+    async _compressHeap(u8) {
+        const cs     = new CompressionStream('gzip');
+        const writer = cs.writable.getWriter();
+        writer.write(u8);
+        writer.close();
+        const chunks = [];
+        const reader = cs.readable.getReader();
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+        }
+        return new Uint8Array(await new Blob(chunks).arrayBuffer());
+    }
+
+    async _decompressHeap(u8) {
+        const ds     = new DecompressionStream('gzip');
+        const writer = ds.writable.getWriter();
+        writer.write(u8);
+        writer.close();
+        const chunks = [];
+        const reader = ds.readable.getReader();
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+        }
+        return new Uint8Array(await new Blob(chunks).arrayBuffer());
+    }
+
+    async saveStateLocal() {
         if (!this.isRunning) { toastr.error('No game running.'); return; }
         const key = this._getSaveKey();
         if (!key) { toastr.error('No ROM loaded.'); return; }
-        const snap = new Uint8Array(WASM_SAVE_LEN);
-        snap.set(this._getSaveBuf());
-        this._putDB(key, snap,
-            () => { this.rivetsData.noLocalSave = false; toastr.info('Saved.'); },
-            () => toastr.error('Save failed.')
-        );
+        toastr.info('Saving state…');
+        try {
+            // Snapshot full 128 MB heap while the game loop keeps running
+            const snap       = new Uint8Array(Module.HEAPU8.byteLength);
+            snap.set(Module.HEAPU8);
+            const compressed = await this._compressHeap(snap);
+            this._putDB(key + '.state', compressed,
+                () => {
+                    this.rivetsData.noLocalSave = false;
+                    toastr.info('State saved (' + (compressed.byteLength / 1024 / 1024).toFixed(1) + ' MB).');
+                },
+                () => toastr.error('State save failed.')
+            );
+        } catch(e) { toastr.error('State save error: ' + e.message); }
     }
 
-    loadStateLocal() {
+    async loadStateLocal() {
         const key = this._getSaveKey();
         if (!key) { toastr.error('No ROM loaded.'); return; }
-        if (!this.romSize) { toastr.error('ROM not initialised.'); return; }
-        this._getDB(key, (data) => {
-            // Re-initialise emulator from ROM still in WASM heap, then write
-            // SRAM after — emuLoadROM clears the save buffer so order matters.
-            this.isRunning = false;
-            Module._emuLoadROM(this.romSize);
-            const src = data instanceof Uint8Array ? data : new Uint8Array(data);
-            this._getSaveBuf().set(src.subarray(0, WASM_SAVE_LEN));
-            Module._emuResetCpu();
-            this._clearSaveBufState();
-            this.isRunning = true;
-            toastr.info('Save restored — select Continue from the in-game menu.');
-        }, () => toastr.error('No save found for this ROM.'));
+        this._getDB(key + '.state', async (data) => {
+            toastr.info('Restoring state…');
+            try {
+                this.isRunning = false;
+                const compressed = data instanceof Uint8Array ? data : new Uint8Array(data);
+                const heap       = await this._decompressHeap(compressed);
+                // Restore heap in-place — typed-array views stay valid
+                Module.HEAPU8.set(heap);
+                this.isRunning = true;
+                toastr.info('State restored.');
+            } catch(e) {
+                this.isRunning = true;
+                toastr.error('State restore error: ' + e.message);
+            }
+        }, () => toastr.error('No save state found for this ROM.'));
     }
 
     _loadSave(cb) {
