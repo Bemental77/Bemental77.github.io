@@ -115,8 +115,7 @@ class MyClass {
         // 44gba WASM main() calls window.wasmReady() once the module is fully initialised
         this.romBufferPtr = Module._emuGetSymbol(1);
 
-        const savPtr = Module._emuGetSymbol(2);
-        this.wasmSaveBuf = Module.HEAPU8.subarray(savPtr, savPtr + WASM_SAVE_LEN);
+        this.savPtr = Module._emuGetSymbol(2);
 
         const fbPtr = Module._emuGetSymbol(3);
         const canvas = document.getElementById('canvas');
@@ -249,7 +248,17 @@ class MyClass {
 
         // Copy ROM bytes directly into WASM memory at the ROM buffer address
         Module.HEAPU8.set(u8, this.romBufferPtr);
-        Module._emuLoadROM(u8.length);
+        this.romSize = u8.length;
+        Module._emuLoadROM(this.romSize);
+
+        // Override save type based on ROM game code (bytes 0xAC–0xAF).
+        // emuLoadROM hard-resets flashSize to 64K; re-apply the correct size now.
+        const gameCode = String.fromCharCode(u8[0xAC], u8[0xAD], u8[0xAE], u8[0xAF]);
+        const flash128kGames = ['BPRE', 'BPGE', 'BPEE', 'PUVV']; // FireRed, LeafGreen, Emerald, Ultra Violet
+        if (flash128kGames.indexOf(gameCode) !== -1) {
+            Module._emuSetSaveType(3, 0x20000); // Flash 128K
+            console.log('Save type: Flash 128K for game code', gameCode);
+        }
 
         // Restore saved SRAM, then start
         this._loadSave((found) => {
@@ -286,42 +295,129 @@ class MyClass {
 
     // ── SAVE / LOAD (SRAM-based) ───────────────────────────────────────────────
 
-    _checkAutoSave() {
-        if (!this.isRunning) return;
-        const changed = Module._emuUpdateSavChangeFlag();
-        // When SRAM changes then stabilises → auto-save
-        if (this.lastSaveFlag === 1 && changed === 0) {
-            const snap = new Uint8Array(WASM_SAVE_LEN);
-            snap.set(this.wasmSaveBuf);
-            this._putDB(this.rom_name + '.sav', snap,
-                () => { this.rivetsData.noLocalSave = false; },
-                () => {}
-            );
-        }
-        this.lastSaveFlag = changed;
+    // Always re-derive the save buffer view — guards against stale subarray if
+    // Emscripten ever reallocates HEAPU8 (fixed-size build, but still safer).
+    _getSaveBuf() {
+        return Module.HEAPU8.subarray(this.savPtr, this.savPtr + WASM_SAVE_LEN);
     }
 
-    saveStateLocal() {
-        if (!this.isRunning) { toastr.error('No game running.'); return; }
+    // Guards against empty rom_name writing to the '.sav' catch-all slot.
+    _getSaveKey() {
+        return this.rom_name ? this.rom_name + '.sav' : null;
+    }
+
+    _persistSave() {
+        const key = this._getSaveKey();
+        if (!key) return;
         const snap = new Uint8Array(WASM_SAVE_LEN);
-        snap.set(this.wasmSaveBuf);
-        this._putDB(this.rom_name + '.sav', snap,
-            () => { this.rivetsData.noLocalSave = false; toastr.info('Saved.'); },
-            () => toastr.error('Save failed.')
+        snap.set(this._getSaveBuf());
+        this._putDB(key, snap,
+            () => { this.rivetsData.noLocalSave = false; },
+            () => {}
         );
     }
 
-    loadStateLocal() {
-        this._loadSave((found) => {
-            if (found) { Module._emuResetCpu(); toastr.info('Save loaded.'); }
-            else toastr.error('No save found for this ROM.');
-        });
+    _checkAutoSave() {
+        if (!this.isRunning) return;
+        const changed = Module._emuUpdateSavChangeFlag();
+
+        // Primary trigger: SRAM stopped changing after a write (falling edge)
+        if (this.lastSaveFlag === 1 && changed === 0) {
+            this._persistSave();
+        }
+        this.lastSaveFlag = changed;
+
+        // Fallback: periodic save every ~60 s so short sessions aren't lost
+        this._periodicSaveCnt = (this._periodicSaveCnt || 0) + 1;
+        if (this._periodicSaveCnt >= 3600) {
+            this._periodicSaveCnt = 0;
+            if (changed === 0) this._persistSave();
+        }
+    }
+
+    // ── HEAP SNAPSHOT SAVE STATES ─────────────────────────────────────────────
+    // 44vba exposes no serialize/deserialize API. Instead we snapshot the full
+    // 128 MB WASM heap (fixed size, no growth). Most pages are zero so gzip
+    // compresses it to ~3-8 MB. Because HEAPU8 is a view of a fixed ArrayBuffer,
+    // Module.HEAPU8.set() restores state in-place and all existing typed-array
+    // views (idata, saveBuf, etc.) remain valid — no re-init needed.
+
+    async _compressHeap(u8) {
+        const cs     = new CompressionStream('gzip');
+        const writer = cs.writable.getWriter();
+        writer.write(u8);
+        writer.close();
+        const chunks = [];
+        const reader = cs.readable.getReader();
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+        }
+        return new Uint8Array(await new Blob(chunks).arrayBuffer());
+    }
+
+    async _decompressHeap(u8) {
+        const ds     = new DecompressionStream('gzip');
+        const writer = ds.writable.getWriter();
+        writer.write(u8);
+        writer.close();
+        const chunks = [];
+        const reader = ds.readable.getReader();
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+        }
+        return new Uint8Array(await new Blob(chunks).arrayBuffer());
+    }
+
+    async saveStateLocal() {
+        if (!this.isRunning) { toastr.error('No game running.'); return; }
+        const key = this._getSaveKey();
+        if (!key) { toastr.error('No ROM loaded.'); return; }
+        toastr.info('Saving state…');
+        try {
+            // Snapshot full 128 MB heap while the game loop keeps running
+            const snap       = new Uint8Array(Module.HEAPU8.byteLength);
+            snap.set(Module.HEAPU8);
+            const compressed = await this._compressHeap(snap);
+            this._putDB(key + '.state', compressed,
+                () => {
+                    this.rivetsData.noLocalSave = false;
+                    toastr.info('State saved (' + (compressed.byteLength / 1024 / 1024).toFixed(1) + ' MB).');
+                },
+                () => toastr.error('State save failed.')
+            );
+        } catch(e) { toastr.error('State save error: ' + e.message); }
+    }
+
+    async loadStateLocal() {
+        const key = this._getSaveKey();
+        if (!key) { toastr.error('No ROM loaded.'); return; }
+        this._getDB(key + '.state', async (data) => {
+            toastr.info('Restoring state…');
+            try {
+                this.isRunning = false;
+                const compressed = data instanceof Uint8Array ? data : new Uint8Array(data);
+                const heap       = await this._decompressHeap(compressed);
+                // Restore heap in-place — typed-array views stay valid
+                Module.HEAPU8.set(heap);
+                this.isRunning = true;
+                toastr.info('State restored.');
+            } catch(e) {
+                this.isRunning = true;
+                toastr.error('State restore error: ' + e.message);
+            }
+        }, () => toastr.error('No save state found for this ROM.'));
     }
 
     _loadSave(cb) {
-        this._getDB(this.rom_name + '.sav', (data) => {
+        const key = this._getSaveKey();
+        if (!key) { cb(false); return; }
+        this._getDB(key, (data) => {
             const src = data instanceof Uint8Array ? data : new Uint8Array(data);
-            this.wasmSaveBuf.set(src.subarray(0, WASM_SAVE_LEN));
+            this._getSaveBuf().set(src.subarray(0, WASM_SAVE_LEN));
             this._clearSaveBufState();
             cb(true);
         }, () => cb(false));
@@ -329,6 +425,7 @@ class MyClass {
 
     _clearSaveBufState() {
         this.lastSaveFlag = 0;
+        this._periodicSaveCnt = 0;
         if (this.isWasmReady) Module._emuUpdateSavChangeFlag();
     }
 
@@ -351,7 +448,9 @@ class MyClass {
     }
 
     _findInDatabase() {
-        this._getDB(this.rom_name + '.sav',
+        const key = this._getSaveKey();
+        if (!key) return;
+        this._getDB(key,
             () => { this.rivetsData.noLocalSave = false; },
             () => {}
         );
