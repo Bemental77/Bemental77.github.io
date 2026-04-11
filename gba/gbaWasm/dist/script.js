@@ -401,7 +401,7 @@ class MyClass {
             if (document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement) {
                 (document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen).call(document);
             } else {
-                const el = document.getElementById('canvas');
+                const el = document.getElementById('canvasDiv');
                 (el.requestFullscreen || el.webkitRequestFullScreen || el.mozRequestFullScreen).call(el);
             }
         } catch(e) {}

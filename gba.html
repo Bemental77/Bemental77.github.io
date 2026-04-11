@@ -82,6 +82,26 @@
         .pill-start-select { background: #666; }
         .pill-menu { background: #888; }
 
+        #canvasDiv:fullscreen,
+        #canvasDiv:-webkit-full-screen,
+        #canvasDiv:-moz-full-screen {
+            display: flex !important;
+            align-items: center;
+            justify-content: center;
+            background: black;
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #canvasDiv:fullscreen canvas,
+        #canvasDiv:-webkit-full-screen canvas,
+        #canvasDiv:-moz-full-screen canvas {
+            width: auto !important;
+            height: 100vh !important;
+            max-width: 100vw !important;
+            image-rendering: pixelated;
+        }
+
         #keyReference {
             display: none;
             margin-top: 16px;
