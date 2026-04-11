@@ -13,40 +13,40 @@
 //   window.wasmReady()        called by WASM main() once init is complete
 //   window.writeAudio(ptr,n)  called by WASM each time new audio samples are ready
 
-const AUDIO_BLOCK_SIZE  = 2048;
+const AUDIO_BLOCK_SIZE = 2048;
 const AUDIO_FIFO_MAXLEN = 4900;
-const WASM_SAVE_LEN     = 0x22000; // libretro_save_buf size (0x20000 + 0x2000)
+const WASM_SAVE_LEN = 0x22000; // libretro_save_buf size (0x20000 + 0x2000)
 
 // GBA key bitmask — order matches 44vba keyList: ["a","b","select","start","right","left","up","down","r","l"]
-const GBA_KEY = { A:1, B:2, SELECT:4, START:8, RIGHT:16, LEFT:32, UP:64, DOWN:128, R:256, L:512 };
+const GBA_KEY = { A: 1, B: 2, SELECT: 4, START: 8, RIGHT: 16, LEFT: 32, UP: 64, DOWN: 128, R: 256, L: 512 };
 
 class MyClass {
     constructor() {
-        this.rom_name   = '';
+        this.rom_name = '';
         this.mobileMode = false;
-        this.iosMode    = false;
-        this.dblist     = [];
+        this.iosMode = false;
+        this.dblist = [];
 
         // 44vba runtime state
-        this.romBufferPtr  = -1;
-        this.wasmSaveBuf   = null;
-        this.idata         = null;
-        this.drawContext   = null;
-        this.isRunning     = false;
-        this.isWasmReady   = false;
-        this.frameCnt      = 0;
-        this.lastSaveFlag  = 0;
-        this.wasmAudioBuf  = null;
+        this.romBufferPtr = -1;
+        this.wasmSaveBuf = null;
+        this.idata = null;
+        this.drawContext = null;
+        this.isRunning = false;
+        this.isWasmReady = false;
+        this.frameCnt = 0;
+        this.lastSaveFlag = 0;
+        this.wasmAudioBuf = null;
 
         // Audio FIFO (stereo interleaved, Int16)
-        this.audioContext  = null;
-        this.audioFifo0    = new Int16Array(AUDIO_FIFO_MAXLEN);
-        this.audioFifo1    = new Int16Array(AUDIO_FIFO_MAXLEN);
+        this.audioContext = null;
+        this.audioFifo0 = new Int16Array(AUDIO_FIFO_MAXLEN);
+        this.audioFifo1 = new Int16Array(AUDIO_FIFO_MAXLEN);
         this.audioFifoHead = 0;
-        this.audioFifoCnt  = 0;
+        this.audioFifoCnt = 0;
 
         // Expose the two callbacks the WASM binary calls into
-        window['wasmReady']  = this.onWasmReady.bind(this);
+        window['wasmReady'] = this.onWasmReady.bind(this);
         window['writeAudio'] = this.writeAudio.bind(this);
 
         // Tell Emscripten where to find the .wasm file
@@ -82,13 +82,13 @@ class MyClass {
             window['ROMLIST'].forEach(r => this.rivetsData.romList.push(r));
         }
 
-        rivets.formatters.ev        = (v, a) => eval(v + a);
+        rivets.formatters.ev = (v, a) => eval(v + a);
         rivets.formatters.ev_string = (v, a) => eval("'" + v + "'" + a);
 
-        rivets.bind(document.getElementById('topPanel'),          { data: this.rivetsData });
-        rivets.bind(document.getElementById('bottomPanel'),       { data: this.rivetsData });
-        rivets.bind(document.getElementById('buttonsModal'),      { data: this.rivetsData });
-        rivets.bind(document.getElementById('lblError'),          { data: this.rivetsData });
+        rivets.bind(document.getElementById('topPanel'), { data: this.rivetsData });
+        rivets.bind(document.getElementById('bottomPanel'), { data: this.rivetsData });
+        rivets.bind(document.getElementById('buttonsModal'), { data: this.rivetsData });
+        rivets.bind(document.getElementById('lblError'), { data: this.rivetsData });
 
         document.getElementById('file-upload').addEventListener('change', this.uploadRom.bind(this));
 
@@ -119,7 +119,7 @@ class MyClass {
 
         const fbPtr = Module._emuGetSymbol(3);
         const canvas = document.getElementById('canvas');
-        canvas.width  = 240;
+        canvas.width = 240;
         canvas.height = 160;
         this.drawContext = canvas.getContext('2d');
         // ImageData views WASM memory directly — safe because TOTAL_MEMORY is fixed at 128 MB
@@ -181,31 +181,44 @@ class MyClass {
             };
             sp.connect(this.audioContext.destination);
             this.audioContext.resume();
-        } catch(e) { console.log('Audio init failed:', e); }
+        } catch (e) { console.log('Audio init failed:', e); }
     }
 
     // ── GAME LOOP ─────────────────────────────────────────────────────────────
 
     _emuLoop(timestamp) {
-        window.requestAnimationFrame(this._boundLoop);
-        if (!this.isRunning) return;
+        window.requestAnimationFrame(this._boundLoop)
+        if (!this.isRunning) return
 
-        const GBA_FRAME_MS = 1000 / 59.7275; // ~16.74 ms
+        const GBA_FRAME_MS = 1000 / 59.7275
 
-        if (!this._lastFrameTime) { this._lastFrameTime = timestamp; return; }
+        if (!this._lastFrameTime) {
+            this._lastFrameTime = timestamp
+            this._accum = 0
+            return
+        }
 
-        const elapsed = timestamp - this._lastFrameTime;
+        let delta = timestamp - this._lastFrameTime
+        this._lastFrameTime = timestamp
 
-        if (elapsed >= GBA_FRAME_MS) {
-            // Carry the sub-frame remainder forward so 60 Hz timing stays accurate.
-            // Cap at 5 ms: if the display boosts from 60 Hz to 90 Hz on a touch
-            // event, a large carry-over would leave _lastFrameTime far enough behind
-            // to trigger a second frame on the very next 11 ms rAF tick (a 90 fps
-            // burst that looks like a speed-up). With carry ≤ 5 ms, the next 90 Hz
-            // tick sees elapsed = 11 + 5 = 16 ms < 16.74 ms and always skips.
-            const carry = Math.min(elapsed - GBA_FRAME_MS, 5);
-            this._lastFrameTime = timestamp - carry;
-            this._runFrame();
+        if (delta > 50) delta = 50
+
+        this._accum += delta
+
+        const MAX_FRAMES = 3
+
+        let ranFrame = false
+        let frames = 0
+
+        while (this._accum >= GBA_FRAME_MS && frames < MAX_FRAMES) {
+            this._runFrame()
+            this._accum -= GBA_FRAME_MS
+            frames++
+            ranFrame = true
+        }
+
+        if (ranFrame) {
+            this.drawContext.putImageData(this.idata, 0, 0)
         }
     }
 
@@ -221,16 +234,16 @@ class MyClass {
         const ic = this.rivetsData.inputController;
         if (!ic) return 0;
         let m = 0;
-        if (ic.Key_Action_A)      m |= GBA_KEY.A;
-        if (ic.Key_Action_B)      m |= GBA_KEY.B;
+        if (ic.Key_Action_A) m |= GBA_KEY.A;
+        if (ic.Key_Action_B) m |= GBA_KEY.B;
         if (ic.Key_Action_Select) m |= GBA_KEY.SELECT;
-        if (ic.Key_Action_Start)  m |= GBA_KEY.START;
-        if (ic.Key_Right)         m |= GBA_KEY.RIGHT;
-        if (ic.Key_Left)          m |= GBA_KEY.LEFT;
-        if (ic.Key_Up)            m |= GBA_KEY.UP;
-        if (ic.Key_Down)          m |= GBA_KEY.DOWN;
-        if (ic.Key_Action_R)      m |= GBA_KEY.R;
-        if (ic.Key_Action_L)      m |= GBA_KEY.L;
+        if (ic.Key_Action_Start) m |= GBA_KEY.START;
+        if (ic.Key_Right) m |= GBA_KEY.RIGHT;
+        if (ic.Key_Left) m |= GBA_KEY.LEFT;
+        if (ic.Key_Up) m |= GBA_KEY.UP;
+        if (ic.Key_Down) m |= GBA_KEY.DOWN;
+        if (ic.Key_Action_R) m |= GBA_KEY.R;
+        if (ic.Key_Action_L) m |= GBA_KEY.L;
         return m;
     }
 
@@ -257,7 +270,7 @@ class MyClass {
             const resp = await fetch(url);
             const ab = await resp.arrayBuffer();
             this._loadRomArrayBuffer(ab);
-        } catch(e) { toastr.error('Failed to load ROM: ' + e); }
+        } catch (e) { toastr.error('Failed to load ROM: ' + e); }
     }
 
     _loadRomArrayBuffer(arrayBuffer) {
@@ -303,11 +316,11 @@ class MyClass {
 
     setupDragDropRom() {
         const d = document.getElementById('dropArea');
-        ['dragenter','dragover','dragleave','drop'].forEach(ev =>
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(ev =>
             d.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); })
         );
-        d.addEventListener('dragenter', () => $('#dropArea').css({'background-color':'lightblue'}));
-        d.addEventListener('dragleave', () => $('#dropArea').css({'background-color':'inherit'}));
+        d.addEventListener('dragenter', () => $('#dropArea').css({ 'background-color': 'lightblue' }));
+        d.addEventListener('dragleave', () => $('#dropArea').css({ 'background-color': 'inherit' }));
         d.addEventListener('drop', (e) => {
             const file = e.dataTransfer.files[0];
             myClass.rom_name = file.name;
@@ -337,7 +350,7 @@ class MyClass {
         snap.set(this._getSaveBuf());
         this._putDB(key, snap,
             () => { this.rivetsData.noLocalSave = false; },
-            () => {}
+            () => { }
         );
     }
 
@@ -367,7 +380,7 @@ class MyClass {
     // views (idata, saveBuf, etc.) remain valid — no re-init needed.
 
     async _compressHeap(u8) {
-        const cs     = new CompressionStream('gzip');
+        const cs = new CompressionStream('gzip');
         const writer = cs.writable.getWriter();
         writer.write(u8);
         writer.close();
@@ -382,7 +395,7 @@ class MyClass {
     }
 
     async _decompressHeap(u8) {
-        const ds     = new DecompressionStream('gzip');
+        const ds = new DecompressionStream('gzip');
         const writer = ds.writable.getWriter();
         writer.write(u8);
         writer.close();
@@ -403,7 +416,7 @@ class MyClass {
         toastr.info('Saving state…');
         try {
             // Snapshot full 128 MB heap while the game loop keeps running
-            const snap       = new Uint8Array(Module.HEAPU8.byteLength);
+            const snap = new Uint8Array(Module.HEAPU8.byteLength);
             snap.set(Module.HEAPU8);
             const compressed = await this._compressHeap(snap);
             this._putDB(key + '.state', compressed,
@@ -413,7 +426,7 @@ class MyClass {
                 },
                 () => toastr.error('State save failed.')
             );
-        } catch(e) { toastr.error('State save error: ' + e.message); }
+        } catch (e) { toastr.error('State save error: ' + e.message); }
     }
 
     async loadStateLocal() {
@@ -424,12 +437,12 @@ class MyClass {
             try {
                 this.isRunning = false;
                 const compressed = data instanceof Uint8Array ? data : new Uint8Array(data);
-                const heap       = await this._decompressHeap(compressed);
+                const heap = await this._decompressHeap(compressed);
                 // Restore heap in-place — typed-array views stay valid
                 Module.HEAPU8.set(heap);
                 this.isRunning = true;
                 toastr.info('State restored.');
-            } catch(e) {
+            } catch (e) {
                 this.isRunning = true;
                 toastr.error('State restore error: ' + e.message);
             }
@@ -462,7 +475,7 @@ class MyClass {
             ev.target.result.createObjectStore('GBAWASMSTATES', { autoIncrement: true });
         req.onsuccess = (ev) => {
             const store = ev.target.result
-                .transaction('GBAWASMSTATES','readwrite')
+                .transaction('GBAWASMSTATES', 'readwrite')
                 .objectStore('GBAWASMSTATES');
             store.openCursor().onsuccess = (ev) => {
                 const c = ev.target.result;
@@ -476,7 +489,7 @@ class MyClass {
         if (!key) return;
         this._getDB(key,
             () => { this.rivetsData.noLocalSave = false; },
-            () => {}
+            () => { }
         );
     }
 
@@ -484,11 +497,11 @@ class MyClass {
         const req = indexedDB.open('GBAWASMDB');
         req.onsuccess = (ev) => {
             const r = ev.target.result
-                .transaction('GBAWASMSTATES','readwrite')
+                .transaction('GBAWASMSTATES', 'readwrite')
                 .objectStore('GBAWASMSTATES')
                 .put(data, key);
             r.onsuccess = onOk;
-            r.onerror   = onErr;
+            r.onerror = onErr;
         };
         req.onerror = onErr;
     }
@@ -497,11 +510,11 @@ class MyClass {
         const req = indexedDB.open('GBAWASMDB');
         req.onsuccess = (ev) => {
             const r = ev.target.result
-                .transaction('GBAWASMSTATES','readwrite')
+                .transaction('GBAWASMSTATES', 'readwrite')
                 .objectStore('GBAWASMSTATES')
                 .get(key);
             r.onsuccess = () => r.result ? onFound(r.result) : onMissing();
-            r.onerror   = onMissing;
+            r.onerror = onMissing;
         };
         req.onerror = onMissing;
     }
@@ -533,24 +546,24 @@ class MyClass {
                 const el = document.getElementById('canvas');
                 (el.requestFullscreen || el.webkitRequestFullScreen || el.mozRequestFullScreen).call(el);
             }
-        } catch(e) {}
+        } catch (e) { }
     }
 
     _onFullscreenChange() {
         const canvasDiv = document.getElementById('canvasDiv');
-        const canvas    = document.getElementById('canvas');
+        const canvas = document.getElementById('canvas');
         const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement);
         if (isFs) {
             const sw = window.screen.width;
             const sh = window.screen.height;
-            const w  = Math.min(sw, Math.round(sh * 3 / 2));
-            const h  = Math.min(sh, Math.round(sw * 2 / 3));
+            const w = Math.min(sw, Math.round(sh * 3 / 2));
+            const h = Math.min(sh, Math.round(sw * 2 / 3));
             canvasDiv.style.cssText = 'display:flex !important; align-items:center; justify-content:center; background:black; width:100vw; height:100vh;';
-            canvas.style.width  = w + 'px';
+            canvas.style.width = w + 'px';
             canvas.style.height = h + 'px';
         } else {
             canvasDiv.style.cssText = '';
-            canvas.style.width  = this.rivetsData.canvasSize + 'px';
+            canvas.style.width = this.rivetsData.canvasSize + 'px';
             canvas.style.height = '';
         }
     }
@@ -594,7 +607,7 @@ class MyClass {
                         this.rivetsData.inputController.KeyMappings[k] = v;
                 }
             }
-        } catch(e){}
+        } catch (e) { }
         this._pollInput();
     }
 
@@ -607,7 +620,7 @@ class MyClass {
 
     detectMobile() {
         const ua = navigator.userAgent.toLowerCase();
-        this.iosMode    = ua.includes('iphone') || ua.includes('ipad');
+        this.iosMode = ua.includes('iphone') || ua.includes('ipad');
         this.mobileMode = window.innerWidth < 600 || ua.includes('iphone');
     }
 
@@ -616,8 +629,8 @@ class MyClass {
     showRemapModal() {
         this.rivetsData.remapPlayer1 = true;
         this.rivetsData.remapOptions = false;
-        this.rivetsData.remappings   = Object.assign({}, this.rivetsData.inputController.KeyMappings);
-        this.rivetsData.remapWait    = false;
+        this.rivetsData.remappings = Object.assign({}, this.rivetsData.inputController.KeyMappings);
+        this.rivetsData.remapWait = false;
         $('#buttonsModal').modal('show');
     }
 
@@ -628,30 +641,30 @@ class MyClass {
 
     btnRemapKey(n) {
         this.rivetsData.remapMode = 'key';
-        this.rivetsData.currKey   = n;
+        this.rivetsData.currKey = n;
         this.rivetsData.remapWait = true;
-        this.rivetsData.inputController.Key_Last   = '';
+        this.rivetsData.inputController.Key_Last = '';
         this.rivetsData.inputController.Remap_Check = true;
     }
 
     btnRemapJoy(n) {
         this.rivetsData.remapMode = 'joy';
-        this.rivetsData.currJoy   = n;
+        this.rivetsData.currJoy = n;
         this.rivetsData.remapWait = true;
-        this.rivetsData.inputController.Joy_Last    = null;
+        this.rivetsData.inputController.Joy_Last = null;
         this.rivetsData.inputController.Remap_Check = true;
     }
 
     remapPressed() {
-        const isKey  = this.rivetsData.remapMode === 'key';
-        const num    = isKey ? this.rivetsData.currKey  : this.rivetsData.currJoy;
-        const val    = isKey ? this.rivetsData.inputController.Key_Last : this.rivetsData.inputController.Joy_Last;
+        const isKey = this.rivetsData.remapMode === 'key';
+        const num = isKey ? this.rivetsData.currKey : this.rivetsData.currJoy;
+        const val = isKey ? this.rivetsData.inputController.Key_Last : this.rivetsData.inputController.Joy_Last;
         const prefix = isKey ? 'Mapping_' : 'Joy_Mapping_';
         const map = {
-            1:prefix+'Up', 2:prefix+'Down', 3:prefix+'Left', 4:prefix+'Right',
-            5:prefix+'Action_A', 6:prefix+'Action_B', 7:prefix+'Action_Start',
-            8:prefix+'Action_Select', 9:prefix+'Action_L', 10:prefix+'Action_R',
-            11:prefix+'Menu'
+            1: prefix + 'Up', 2: prefix + 'Down', 3: prefix + 'Left', 4: prefix + 'Right',
+            5: prefix + 'Action_A', 6: prefix + 'Action_B', 7: prefix + 'Action_Start',
+            8: prefix + 'Action_Select', 9: prefix + 'Action_L', 10: prefix + 'Action_R',
+            11: prefix + 'Menu'
         };
         if (map[num]) {
             this.rivetsData.inputController.KeyMappings[map[num]] = val;
@@ -672,17 +685,17 @@ class MyClass {
         document.getElementById('keyReference').style.display = 'block';
         const km = this.rivetsData.inputController.KeyMappings;
         const buttons = [
-            { label: 'D-Up',    key: 'Mapping_Up',            cls: 'pill-dpad' },
-            { label: 'D-Down',  key: 'Mapping_Down',          cls: 'pill-dpad' },
-            { label: 'D-Left',  key: 'Mapping_Left',          cls: 'pill-dpad' },
-            { label: 'D-Right', key: 'Mapping_Right',         cls: 'pill-dpad' },
-            { label: 'A',       key: 'Mapping_Action_A',      cls: 'gba-a' },
-            { label: 'B',       key: 'Mapping_Action_B',      cls: 'gba-b' },
-            { label: 'L',       key: 'Mapping_Action_L',      cls: 'gba-shoulder' },
-            { label: 'R',       key: 'Mapping_Action_R',      cls: 'gba-shoulder' },
-            { label: 'Start',   key: 'Mapping_Action_Start',  cls: 'pill-start-select' },
-            { label: 'Select',  key: 'Mapping_Action_Select', cls: 'pill-start-select' },
-            { label: 'Menu',    key: 'Mapping_Menu',          cls: 'pill-menu' },
+            { label: 'D-Up', key: 'Mapping_Up', cls: 'pill-dpad' },
+            { label: 'D-Down', key: 'Mapping_Down', cls: 'pill-dpad' },
+            { label: 'D-Left', key: 'Mapping_Left', cls: 'pill-dpad' },
+            { label: 'D-Right', key: 'Mapping_Right', cls: 'pill-dpad' },
+            { label: 'A', key: 'Mapping_Action_A', cls: 'gba-a' },
+            { label: 'B', key: 'Mapping_Action_B', cls: 'gba-b' },
+            { label: 'L', key: 'Mapping_Action_L', cls: 'gba-shoulder' },
+            { label: 'R', key: 'Mapping_Action_R', cls: 'gba-shoulder' },
+            { label: 'Start', key: 'Mapping_Action_Start', cls: 'pill-start-select' },
+            { label: 'Select', key: 'Mapping_Action_Select', cls: 'pill-start-select' },
+            { label: 'Menu', key: 'Mapping_Menu', cls: 'pill-menu' },
         ];
         grid.innerHTML = buttons.map(b =>
             `<div class="key-ref-item">` +
@@ -700,7 +713,7 @@ class MyClass {
 }
 
 var myClass = new MyClass();
-var myApp   = myClass;
+var myApp = myClass;
 
 // Load input controller, which then loads the 44vba WASM binary
 var _rando = Math.floor(Math.random() * 100000);
