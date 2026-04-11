@@ -458,6 +458,11 @@
                         </div>
                     </div>
 
+                    <div id="spSpeedRow" style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 6px;">
+                        <input type="range" id="spSpeedSlider" min="0" max="2" value="0" step="1" style="width: 140px; height: 28px;">
+                        <span id="spSpeedLabel">1x</span>
+                    </div>
+
                     <div class="sp-controls">
 
                         <div class="sp-dpad-disc">
@@ -666,6 +671,17 @@
         spWireBtn('mobileL',      'Key_Action_L');
         spWireBtn('mobileR',      'Key_Action_R');
         spWireDpad();
+
+        var speedSlider = document.getElementById('spSpeedSlider');
+        var speedLabel  = document.getElementById('spSpeedLabel');
+        if (speedSlider && speedLabel) {
+            var speedMap = [1, 2, 5];
+            speedSlider.addEventListener('input', function() {
+                var speed = speedMap[parseInt(this.value)];
+                speedLabel.innerText = speed + 'x';
+                if (window.myApp) window.myApp.setGameSpeed(speed);
+            });
+        }
     }
 
     function spScaleCanvas() {
