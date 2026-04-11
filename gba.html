@@ -55,6 +55,58 @@
         .nav-tabs .nav-link.active {
             color: #007bff;
         }
+
+        .keycap {
+            display: inline-block;
+            background: #f0f0f0;
+            border: 1px solid #aaa;
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-family: monospace;
+            font-size: 0.85em;
+            box-shadow: 0 1px 0 #aaa;
+            min-width: 60px;
+            text-align: center;
+        }
+
+        .btn-pill {
+            display: inline-block;
+            border-radius: 12px;
+            padding: 2px 10px;
+            font-size: 0.85em;
+            font-weight: bold;
+            color: white;
+        }
+
+        .pill-dpad { background: #555; }
+        .pill-start-select { background: #666; }
+        .pill-menu { background: #888; }
+
+        #keyReference {
+            display: none;
+            margin-top: 16px;
+            padding: 12px 16px;
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            max-width: 520px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        #keyRefGrid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            justify-content: center;
+            margin-top: 8px;
+        }
+
+        .key-ref-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
     </style>
 </head>
 
@@ -101,7 +153,8 @@
                     rv-disabled="data.noLocalSave">Load State</button>
                 <button class="btn btn-primary mt-2 mb-2" onclick="myApp.zoomOut()">Zoom Out</button>
                 <button class="btn btn-primary mt-2 mb-2" onclick="myApp.zoomIn()">Zoom In</button>
-                <button class="btn btn-primary mt-2 mb-2" onclick="myApp.fullscreen()">Full Screen</button>
+                <button class="btn btn-primary mt-2 mb-2" onclick="myApp.showRemapModal()">Remap Buttons</button>
+                <button class="btn btn-primary mt-2 mb-2" onclick="myApp.fullscreen()">Toggle Fullscreen</button>
             </div>
 
         </div>
@@ -123,6 +176,11 @@
         </div>
 
         <div id="bottomPanel" rv-hide="data.beforeEmulatorStarted"></div>
+
+        <div id="keyReference">
+            <strong>Keyboard Reference</strong>
+            <div id="keyRefGrid"></div>
+        </div>
     </div>
 
     <!-- Mobile UX -->
@@ -214,8 +272,10 @@
                         </li>
                     </ul>
 
-                    <div rv-if="data.remapWait" class="alert alert-info mt-2">
-                        Press a key or button...
+                    <div rv-if="data.remapWait" class="alert alert-info mt-2"
+                         style="display: flex; justify-content: space-between; align-items: center;">
+                        <span>Press a key or button...</span>
+                        <button class="btn btn-sm btn-secondary" onclick="myApp.cancelRemap()">Cancel</button>
                     </div>
 
                     <div rv-if="data.remapPlayer1" rv-hide="data.remapWait">
@@ -232,9 +292,9 @@
 
                                 <!-- D-Up -->
                                 <tr>
-                                    <th>D-Up</th>
-                                    <td><input rv-value="data.remappings.Mapping_Up" type="text" class="form-control" disabled></td>
-                                    <td><input rv-value="data.remappings.Joy_Mapping_Up" type="text" class="form-control" disabled></td>
+                                    <th><span class="btn-pill pill-dpad">D-Up</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Up"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Up"></span></td>
                                     <td>
                                         <table class="regularTable"><tr>
                                             <td><button onclick="myApp.btnRemapKey(1)" class="btn btn-primary">Key</button></td>
@@ -245,9 +305,9 @@
 
                                 <!-- D-Down -->
                                 <tr>
-                                    <th>D-Down</th>
-                                    <td><input rv-value="data.remappings.Mapping_Down" type="text" class="form-control" disabled></td>
-                                    <td><input rv-value="data.remappings.Joy_Mapping_Down" type="text" class="form-control" disabled></td>
+                                    <th><span class="btn-pill pill-dpad">D-Down</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Down"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Down"></span></td>
                                     <td>
                                         <table class="regularTable"><tr>
                                             <td><button onclick="myApp.btnRemapKey(2)" class="btn btn-primary">Key</button></td>
@@ -258,9 +318,9 @@
 
                                 <!-- D-Left -->
                                 <tr>
-                                    <th>D-Left</th>
-                                    <td><input rv-value="data.remappings.Mapping_Left" type="text" class="form-control" disabled></td>
-                                    <td><input rv-value="data.remappings.Joy_Mapping_Left" type="text" class="form-control" disabled></td>
+                                    <th><span class="btn-pill pill-dpad">D-Left</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Left"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Left"></span></td>
                                     <td>
                                         <table class="regularTable"><tr>
                                             <td><button onclick="myApp.btnRemapKey(3)" class="btn btn-primary">Key</button></td>
@@ -271,9 +331,9 @@
 
                                 <!-- D-Right -->
                                 <tr>
-                                    <th>D-Right</th>
-                                    <td><input rv-value="data.remappings.Mapping_Right" type="text" class="form-control" disabled></td>
-                                    <td><input rv-value="data.remappings.Joy_Mapping_Right" type="text" class="form-control" disabled></td>
+                                    <th><span class="btn-pill pill-dpad">D-Right</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Right"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Right"></span></td>
                                     <td>
                                         <table class="regularTable"><tr>
                                             <td><button onclick="myApp.btnRemapKey(4)" class="btn btn-primary">Key</button></td>
@@ -284,9 +344,9 @@
 
                                 <!-- A -->
                                 <tr>
-                                    <th>A</th>
-                                    <td><input rv-value="data.remappings.Mapping_Action_A" type="text" class="form-control" disabled></td>
-                                    <td><input rv-value="data.remappings.Joy_Mapping_Action_A" type="text" class="form-control" disabled></td>
+                                    <th><span class="btn-pill gba-a">A</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_A"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_A"></span></td>
                                     <td>
                                         <table class="regularTable"><tr>
                                             <td><button onclick="myApp.btnRemapKey(5)" class="btn btn-primary">Key</button></td>
@@ -297,9 +357,9 @@
 
                                 <!-- B -->
                                 <tr>
-                                    <th>B</th>
-                                    <td><input rv-value="data.remappings.Mapping_Action_B" type="text" class="form-control" disabled></td>
-                                    <td><input rv-value="data.remappings.Joy_Mapping_Action_B" type="text" class="form-control" disabled></td>
+                                    <th><span class="btn-pill gba-b">B</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_B"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_B"></span></td>
                                     <td>
                                         <table class="regularTable"><tr>
                                             <td><button onclick="myApp.btnRemapKey(6)" class="btn btn-primary">Key</button></td>
@@ -310,9 +370,9 @@
 
                                 <!-- Start -->
                                 <tr>
-                                    <th>Start</th>
-                                    <td><input rv-value="data.remappings.Mapping_Action_Start" type="text" class="form-control" disabled></td>
-                                    <td><input rv-value="data.remappings.Joy_Mapping_Action_Start" type="text" class="form-control" disabled></td>
+                                    <th><span class="btn-pill pill-start-select">Start</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_Start"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_Start"></span></td>
                                     <td>
                                         <table class="regularTable"><tr>
                                             <td><button onclick="myApp.btnRemapKey(7)" class="btn btn-primary">Key</button></td>
@@ -323,9 +383,9 @@
 
                                 <!-- Select -->
                                 <tr>
-                                    <th>Select</th>
-                                    <td><input rv-value="data.remappings.Mapping_Action_Select" type="text" class="form-control" disabled></td>
-                                    <td><input rv-value="data.remappings.Joy_Mapping_Action_Select" type="text" class="form-control" disabled></td>
+                                    <th><span class="btn-pill pill-start-select">Select</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_Select"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_Select"></span></td>
                                     <td>
                                         <table class="regularTable"><tr>
                                             <td><button onclick="myApp.btnRemapKey(8)" class="btn btn-primary">Key</button></td>
@@ -336,9 +396,9 @@
 
                                 <!-- L -->
                                 <tr>
-                                    <th>L</th>
-                                    <td><input rv-value="data.remappings.Mapping_Action_L" type="text" class="form-control" disabled></td>
-                                    <td><input rv-value="data.remappings.Joy_Mapping_Action_L" type="text" class="form-control" disabled></td>
+                                    <th><span class="btn-pill gba-shoulder">L</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_L"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_L"></span></td>
                                     <td>
                                         <table class="regularTable"><tr>
                                             <td><button onclick="myApp.btnRemapKey(9)" class="btn btn-primary">Key</button></td>
@@ -349,9 +409,9 @@
 
                                 <!-- R -->
                                 <tr>
-                                    <th>R</th>
-                                    <td><input rv-value="data.remappings.Mapping_Action_R" type="text" class="form-control" disabled></td>
-                                    <td><input rv-value="data.remappings.Joy_Mapping_Action_R" type="text" class="form-control" disabled></td>
+                                    <th><span class="btn-pill gba-shoulder">R</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_R"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_R"></span></td>
                                     <td>
                                         <table class="regularTable"><tr>
                                             <td><button onclick="myApp.btnRemapKey(10)" class="btn btn-primary">Key</button></td>
@@ -362,9 +422,9 @@
 
                                 <!-- Menu -->
                                 <tr>
-                                    <th>Menu</th>
-                                    <td><input rv-value="data.remappings.Mapping_Menu" type="text" class="form-control" disabled></td>
-                                    <td><input rv-value="data.remappings.Joy_Mapping_Menu" type="text" class="form-control" disabled></td>
+                                    <th><span class="btn-pill pill-menu">Menu</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Menu"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Menu"></span></td>
                                     <td>
                                         <table class="regularTable"><tr>
                                             <td><button onclick="myApp.btnRemapKey(11)" class="btn btn-primary">Key</button></td>
@@ -378,7 +438,8 @@
                     </div>
                 </div>
                 <div class="modal-footer">
-                    <button type="button" class="btn btn-secondary" onclick="myApp.resetRemaps()">Reset Defaults</button>
+                    <button type="button" class="btn btn-secondary"
+                        onclick="if(confirm('Reset all button mappings to defaults?')) myApp.resetRemaps()">Reset Defaults</button>
                     <button type="button" class="btn btn-primary" onclick="myApp.saveRemaps()">Save</button>
                     <button type="button" class="btn btn-secondary" data-dismiss="modal">Cancel</button>
                 </div>
