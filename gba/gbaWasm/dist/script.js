@@ -89,8 +89,6 @@ class MyClass {
         rivets.bind(document.getElementById('bottomPanel'),       { data: this.rivetsData });
         rivets.bind(document.getElementById('buttonsModal'),      { data: this.rivetsData });
         rivets.bind(document.getElementById('lblError'),          { data: this.rivetsData });
-        rivets.bind(document.getElementById('mobileBottomPanel'), { data: this.rivetsData });
-        rivets.bind(document.getElementById('mobileButtons'),     { data: this.rivetsData });
 
         document.getElementById('file-upload').addEventListener('change', this.uploadRom.bind(this));
 
@@ -101,6 +99,11 @@ class MyClass {
         // rAF loop runs even before a ROM is loaded; frames only execute once isRunning=true
         this._boundLoop = this._emuLoop.bind(this);
         window.requestAnimationFrame(this._boundLoop);
+
+        const _fsChange = this._onFullscreenChange.bind(this);
+        document.addEventListener('fullscreenchange', _fsChange);
+        document.addEventListener('webkitfullscreenchange', _fsChange);
+        document.addEventListener('mozfullscreenchange', _fsChange);
 
         $('#topPanel').show();
         $('#lblErrorOuter').show();
@@ -117,6 +120,8 @@ class MyClass {
 
         const fbPtr = Module._emuGetSymbol(3);
         const canvas = document.getElementById('canvas');
+        canvas.width  = 240;
+        canvas.height = 160;
         this.drawContext = canvas.getContext('2d');
         // ImageData views WASM memory directly — safe because TOTAL_MEMORY is fixed at 128 MB
         this.idata = new ImageData(
@@ -127,6 +132,7 @@ class MyClass {
         this.isWasmReady = true;
         this.rivetsData.moduleInitializing = false;
         console.log('44vba WASM ready');
+        if (typeof spScaleCanvas === 'function') spScaleCanvas();
     }
 
     writeAudio(ptr, frames) {
@@ -398,18 +404,38 @@ class MyClass {
 
     fullscreen() {
         try {
-            if (document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement) {
-                (document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen).call(document);
+            if (document.fullscreenElement || document.webkitFullscreenElement) {
+                (document.exitFullscreen || document.webkitExitFullscreen).call(document);
             } else {
-                const el = document.getElementById('canvasDiv');
+                const el = document.getElementById('canvas');
                 (el.requestFullscreen || el.webkitRequestFullScreen || el.mozRequestFullScreen).call(el);
             }
         } catch(e) {}
     }
 
+    _onFullscreenChange() {
+        const canvasDiv = document.getElementById('canvasDiv');
+        const canvas    = document.getElementById('canvas');
+        const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement);
+        if (isFs) {
+            const sw = window.screen.width;
+            const sh = window.screen.height;
+            const w  = Math.min(sw, Math.round(sh * 3 / 2));
+            const h  = Math.min(sh, Math.round(sw * 2 / 3));
+            canvasDiv.style.cssText = 'display:flex !important; align-items:center; justify-content:center; background:black; width:100vw; height:100vh;';
+            canvas.style.width  = w + 'px';
+            canvas.style.height = h + 'px';
+        } else {
+            canvasDiv.style.cssText = '';
+            canvas.style.width  = this.rivetsData.canvasSize + 'px';
+            canvas.style.height = '';
+        }
+    }
+
     cancelRemap() {
         this.rivetsData.remapWait = false;
-        this.rivetsData.inputController.Remap_Check = false;
+        if (this.rivetsData.inputController)
+            this.rivetsData.inputController.Remap_Check = false;
     }
 
     newRom() { location.reload(); }
@@ -423,21 +449,13 @@ class MyClass {
     }
 
     _setupMobileMode() {
-        this.rivetsData.canvasSize = window.innerWidth;
-        const half = (window.innerWidth / 2) - 35;
-        document.getElementById('menuDiv').style.left = half + 'px';
-        this.rivetsData.inputController.setupMobileControls('divTouchSurface');
-        $('#mobileDiv').show();
-        $('#maindiv').hide();
-        $('#middleDiv').hide();
-        $('#canvas').appendTo('#mobileCanvas');
-        document.getElementById('maindiv').classList.remove('container');
-        document.getElementById('canvas').style.display = 'block';
-        try { document.body.scrollTop = 0; document.documentElement.scrollTop = 0; } catch(e){}
+        // Hand off to the GBA SP shell
+        document.getElementById('canvasDiv').style.display = 'block';
+        if (typeof spActivate === 'function') spActivate();
     }
 
     hideMobileMenu() {
-        if (this.mobileMode) { $('#mobileButtons').hide(); $('#menuDiv').show(); }
+        if (this.mobileMode) spCloseMenu();
     }
 
     // ── INPUT CONTROLLER ──────────────────────────────────────────────────────
