@@ -282,7 +282,7 @@ class InputController {
             }
         } catch (e) { }
     }
-    
+
     sendKeyDownEvent(key) {
         let ev = new KeyboardEvent('Gamepad Event Down', { key })
         this.keyDown(ev)
@@ -346,18 +346,18 @@ class InputController {
     }
 
     updateMobileControls() {
-        let s = ''
-        s += this.Key_Up ? '1' : '0'
-        s += this.Key_Down ? '1' : '0'
-        s += this.Key_Left ? '1' : '0'
-        s += this.Key_Right ? '1' : '0'
-        s += this.Key_Action_A ? '1' : '0'
-        s += this.Key_Action_B ? '1' : '0'
-        s += this.Key_Action_Start ? '1' : '0'
-        s += this.Key_Action_Select ? '1' : '0'
-        s += this.Key_Action_L ? '1' : '0'
-        s += this.Key_Action_R ? '1' : '0'
-        window['myApp'].sendMobileControls(s, this.VectorX.toString(), this.VectorY.toString())
+        let s = '';
+        s += this.Key_Up ? '1' : '0'; // UP
+        s += this.Key_Down ? '1' : '0'; // DOWN
+        s += this.Key_Left ? '1' : '0'; // LEFT
+        s += this.Key_Right ? '1' : '0'; // RIGHT
+        s += this.Key_Action_A ? '1' : '0'; // A
+        s += this.Key_Action_B ? '1' : '0'; // B
+        s += this.Key_Action_Start ? '1' : '0'; // START
+        s += this.Key_Action_Select ? '1' : '0'; // SELECT
+        s += this.Key_Action_L ? '1' : '0'; // L
+        s += this.Key_Action_R ? '1' : '0'; // R
+        window['myApp'].sendMobileControls(s, this.VectorX.toString(), this.VectorY.toString());
     }
 }
 
