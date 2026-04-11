@@ -34,6 +34,7 @@ class MyClass {
         this.drawContext = null;
         this.isRunning = false;
         this.isWasmReady = false;
+        this.gameSpeed = 1;
         this.frameCnt = 0;
         this.lastSaveFlag = 0;
         this.wasmAudioBuf = null;
@@ -136,6 +137,7 @@ class MyClass {
 
     writeAudio(ptr, frames) {
         // Called by WASM systemOnWriteDataToSoundBuffer with a pointer into HEAPU8
+        if (this.gameSpeed > 1) return; // mute audio during fast-forward
         if (!this.wasmAudioBuf) {
             this.wasmAudioBuf = new Int16Array(Module.HEAPU8.buffer).subarray(ptr >> 1, (ptr >> 1) + 2048);
         }
@@ -211,7 +213,9 @@ class MyClass {
         let frames = 0
 
         while (this._accum >= GBA_FRAME_MS && frames < MAX_FRAMES) {
-            this._runFrame()
+            for (let i = 0; i < this.gameSpeed; i++) {
+                this._runFrame(i === this.gameSpeed - 1)
+            }
             this._accum -= GBA_FRAME_MS
             frames++
             ranFrame = true
@@ -222,12 +226,12 @@ class MyClass {
         }
     }
 
-    _runFrame() {
+    _runFrame(draw = true) {
         if (!this.isRunning || !this.isWasmReady) return;
         this.frameCnt++;
         if (this.frameCnt % 60 === 0) this._checkAutoSave();
         Module._emuRunFrame(this._getKeyMask());
-        this.drawContext.putImageData(this.idata, 0, 0);
+        if (draw) this.drawContext.putImageData(this.idata, 0, 0);
     }
 
     _getKeyMask() {
@@ -588,6 +592,10 @@ class MyClass {
         // Hand off to the GBA SP shell
         document.getElementById('canvasDiv').style.display = 'block';
         if (typeof spActivate === 'function') spActivate();
+    }
+
+    setGameSpeed(speed) {
+        this.gameSpeed = speed;
     }
 
     hideMobileMenu() {
