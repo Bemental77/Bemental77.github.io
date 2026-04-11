@@ -398,9 +398,18 @@ class MyClass {
 
     fullscreen() {
         try {
-            const el = document.getElementById('canvas');
-            (el.requestFullscreen || el.webkitRequestFullScreen || el.mozRequestFullScreen).call(el);
+            if (document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement) {
+                (document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen).call(document);
+            } else {
+                const el = document.getElementById('canvas');
+                (el.requestFullscreen || el.webkitRequestFullScreen || el.mozRequestFullScreen).call(el);
+            }
         } catch(e) {}
+    }
+
+    cancelRemap() {
+        this.rivetsData.remapWait = false;
+        this.rivetsData.inputController.Remap_Check = false;
     }
 
     newRom() { location.reload(); }
@@ -410,6 +419,7 @@ class MyClass {
         if (size) this.rivetsData.canvasSize = parseInt(size);
         if (this.mobileMode) this._setupMobileMode();
         this.resizeCanvas();
+        this.refreshKeyRefGrid();
     }
 
     _setupMobileMode() {
@@ -512,6 +522,33 @@ class MyClass {
     saveRemaps() {
         localStorage.setItem('gbawasm_mappings_v1', JSON.stringify(this.rivetsData.inputController.KeyMappings));
         $('#buttonsModal').modal('hide');
+        this.refreshKeyRefGrid();
+    }
+
+    refreshKeyRefGrid() {
+        const grid = document.getElementById('keyRefGrid');
+        if (!grid || !this.rivetsData.inputController) return;
+        document.getElementById('keyReference').style.display = 'block';
+        const km = this.rivetsData.inputController.KeyMappings;
+        const buttons = [
+            { label: 'D-Up',    key: 'Mapping_Up',            cls: 'pill-dpad' },
+            { label: 'D-Down',  key: 'Mapping_Down',          cls: 'pill-dpad' },
+            { label: 'D-Left',  key: 'Mapping_Left',          cls: 'pill-dpad' },
+            { label: 'D-Right', key: 'Mapping_Right',         cls: 'pill-dpad' },
+            { label: 'A',       key: 'Mapping_Action_A',      cls: 'gba-a' },
+            { label: 'B',       key: 'Mapping_Action_B',      cls: 'gba-b' },
+            { label: 'L',       key: 'Mapping_Action_L',      cls: 'gba-shoulder' },
+            { label: 'R',       key: 'Mapping_Action_R',      cls: 'gba-shoulder' },
+            { label: 'Start',   key: 'Mapping_Action_Start',  cls: 'pill-start-select' },
+            { label: 'Select',  key: 'Mapping_Action_Select', cls: 'pill-start-select' },
+            { label: 'Menu',    key: 'Mapping_Menu',          cls: 'pill-menu' },
+        ];
+        grid.innerHTML = buttons.map(b =>
+            `<div class="key-ref-item">` +
+            `<span class="btn-pill ${b.cls}">${b.label}</span>` +
+            `<span class="keycap">${km[b.key] || '—'}</span>` +
+            `</div>`
+        ).join('');
     }
 
     resetRemaps() {
