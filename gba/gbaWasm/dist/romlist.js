@@ -1,3 +1,3 @@
 var ROMLIST = [
-  {url:"../roms/pokemonUltraViolet.gba",title:"PKMN Ultra Violet"}
+  {url:"gba/gbaWasm/roms/pokemonUltraViolet.gba",title:"PKMN Ultra Violet"}
 ];
