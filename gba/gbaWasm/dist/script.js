@@ -186,23 +186,25 @@ class MyClass {
 
     // ── GAME LOOP ─────────────────────────────────────────────────────────────
 
-    _emuLoop() {
+    _emuLoop(timestamp) {
         window.requestAnimationFrame(this._boundLoop);
         if (!this.isRunning) return;
 
-        const now = performance.now();
-        const GBA_FRAME_MS = 1000 / 59.7275; // exact GBA framerate
+        const GBA_FRAME_MS = 1000 / 59.7275; // ~16.74 ms
 
-        if (!this._lastFrameTime) { this._lastFrameTime = now; return; }
+        if (!this._lastFrameTime) { this._lastFrameTime = timestamp; return; }
 
-        const elapsed = now - this._lastFrameTime;
+        const elapsed = timestamp - this._lastFrameTime;
 
-        // Only run a frame if enough wall-clock time has passed.
-        // This decouples the emulator from rAF frequency so it runs at a
-        // constant 59.73fps regardless of whether the device fires rAF at
-        // 60Hz, 90Hz, or 120Hz (variable refresh rate on real mobile hardware).
         if (elapsed >= GBA_FRAME_MS) {
-            this._lastFrameTime = now - (elapsed % GBA_FRAME_MS); // carry over remainder
+            // Carry the sub-frame remainder forward so 60 Hz timing stays accurate.
+            // Cap at 5 ms: if the display boosts from 60 Hz to 90 Hz on a touch
+            // event, a large carry-over would leave _lastFrameTime far enough behind
+            // to trigger a second frame on the very next 11 ms rAF tick (a 90 fps
+            // burst that looks like a speed-up). With carry ≤ 5 ms, the next 90 Hz
+            // tick sees elapsed = 11 + 5 = 16 ms < 16.74 ms and always skips.
+            const carry = Math.min(elapsed - GBA_FRAME_MS, 5);
+            this._lastFrameTime = timestamp - carry;
             this._runFrame();
         }
     }
