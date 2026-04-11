@@ -188,7 +188,23 @@ class MyClass {
 
     _emuLoop() {
         window.requestAnimationFrame(this._boundLoop);
-        if (this.isRunning) this._runFrame();
+        if (!this.isRunning) return;
+
+        const now = performance.now();
+        const GBA_FRAME_MS = 1000 / 59.7275; // exact GBA framerate
+
+        if (!this._lastFrameTime) { this._lastFrameTime = now; return; }
+
+        const elapsed = now - this._lastFrameTime;
+
+        // Only run a frame if enough wall-clock time has passed.
+        // This decouples the emulator from rAF frequency so it runs at a
+        // constant 59.73fps regardless of whether the device fires rAF at
+        // 60Hz, 90Hz, or 120Hz (variable refresh rate on real mobile hardware).
+        if (elapsed >= GBA_FRAME_MS) {
+            this._lastFrameTime = now - (elapsed % GBA_FRAME_MS); // carry over remainder
+            this._runFrame();
+        }
     }
 
     _runFrame() {
@@ -274,6 +290,7 @@ class MyClass {
             this._configureEmulator();
             $('#canvasDiv').show();
             this.rivetsData.beforeEmulatorStarted = false;
+            this._lastFrameTime = null; // reset fixed-timestep clock for new ROM
             this.isRunning = true;
         });
     }
