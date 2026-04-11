@@ -1,45 +1,43 @@
-
 class InputController {
 
     constructor() {
 
-        this.DebugKeycodes = false;
+        this.DebugKeycodes = false
 
-        // for remapping
-        this.Key_Last = '';
-        this.Joy_Last = null;
-        this.Remap_Check = false;
+        this.Key_Last = ''
+        this.Joy_Last = null
+        this.Remap_Check = false
 
-        // GBA buttons
-        this.Key_Up = false;
-        this.Key_Down = false;
-        this.Key_Left = false;
-        this.Key_Right = false;
-        this.Key_Action_A = false;
-        this.Key_Action_B = false;
-        this.Key_Action_Start = false;
-        this.Key_Action_Select = false;
-        this.Key_Action_L = false;
-        this.Key_Action_R = false;
-        this.Key_Menu = false;
+        this.Key_Up = false
+        this.Key_Down = false
+        this.Key_Left = false
+        this.Key_Right = false
+        this.Key_Action_A = false
+        this.Key_Action_B = false
+        this.Key_Action_Start = false
+        this.Key_Action_Select = false
+        this.Key_Action_L = false
+        this.Key_Action_R = false
+        this.Key_Menu = false
 
-        // mobile touch
-        this.MobileA = false;
-        this.MobileB = false;
-        this.MobileStart = false;
-        this.MobileSelect = false;
-        this.MobileL = false;
-        this.MobileR = false;
+        this.MobileA = false
+        this.MobileB = false
+        this.MobileStart = false
+        this.MobileSelect = false
+        this.MobileL = false
+        this.MobileR = false
 
-        this.nippleDirection = 'none';
-        this.VectorX = 0;
-        this.VectorY = 0;
+        this.nippleDirection = 'none'
+        this.VectorX = 0
+        this.VectorY = 0
 
-        this.KeyMappings = this.defaultKeymappings();
-        document.onkeydown = this.keyDown.bind(this);
-        document.onkeyup = this.keyUp.bind(this);
+        this.KeyMappings = this.defaultKeymappings()
 
-        this.setGamePadButtons();
+        document.onkeydown = this.keyDown.bind(this)
+        document.onkeyup = this.keyUp.bind(this)
+
+        this.setGamePadButtons()
+        this.setupGamePad()
     }
 
     defaultKeymappings() {
@@ -66,11 +64,21 @@ class InputController {
             Joy_Mapping_Action_Start: 9,
             Joy_Mapping_Action_Select: 8,
 
-            Joy_Mapping_Action_L: 6,
-            Joy_Mapping_Action_R: 7,
+            Joy_Mapping_Action_L: 4,
+            Joy_Mapping_Action_R: 5,
 
             Joy_Mapping_Menu: 16
         }
+    }
+
+    setupGamePad() {
+        window.addEventListener('gamepadconnected', e => {
+            console.log('Gamepad connected:', e.gamepad.id)
+        })
+    }
+
+    setGamePadButtons() {
+        this.gamepadButtons = []
     }
 
     processGamepad() {
@@ -80,7 +88,7 @@ class InputController {
 
             let gp = null
             for (let i = 0; i < gamepads.length; i++) {
-                if (gamepads[i]) {
+                if (gamepads[i] && gamepads[i].buttons.length > 0) {
                     gp = gamepads[i]
                     break
                 }
@@ -88,7 +96,12 @@ class InputController {
 
             if (!gp) return
 
-            const btn = n => gp.buttons[n] && gp.buttons[n].pressed
+            for (let i = 0; i < gp.buttons.length; i++) {
+                if (this.DebugKeycodes && gp.buttons[i].pressed) console.log('joy:', i)
+                if (gp.buttons[i].pressed) this.Joy_Last = i
+            }
+
+            const btn = n => n >= 0 && gp.buttons[n] && gp.buttons[n].pressed
 
             const set = (flag, joyBtn, keyMapping) => {
                 if (btn(joyBtn)) {
@@ -113,10 +126,10 @@ class InputController {
             const ax0 = gp.axes[0] || 0
             const ax1 = gp.axes[1] || 0
 
-            if (ax0 < -0.4) left = true
-            if (ax0 > 0.4) right = true
-            if (ax1 < -0.4) up = true
-            if (ax1 > 0.4) down = true
+            if (ax0 < -0.35) left = true
+            if (ax0 > 0.35) right = true
+            if (ax1 < -0.35) up = true
+            if (ax1 > 0.35) down = true
 
             if (up) {
                 if (!this.Key_Up) this.sendKeyDownEvent(this.KeyMappings.Mapping_Up)
@@ -271,72 +284,67 @@ class InputController {
     }
 
     sendKeyDownEvent(key) {
-        let ev = new KeyboardEvent('Gamepad Event Down', { key });
-        this.keyDown(ev);
+        let ev = new KeyboardEvent('Gamepad Event Down', { key })
+        this.keyDown(ev)
     }
 
     sendKeyUpEvent(key) {
-        let ev = new KeyboardEvent('Gamepad Event Up', { key });
-        this.keyUp(ev);
+        let ev = new KeyboardEvent('Gamepad Event Up', { key })
+        this.keyUp(ev)
     }
 
     _normalizeArrow(event) {
-        let key = event.key;
-        if (key === 'Left' && this.KeyMappings.Mapping_Left === 'ArrowLeft') key = 'ArrowLeft';
-        if (key === 'Right' && this.KeyMappings.Mapping_Right === 'ArrowRight') key = 'ArrowRight';
-        if (key === 'Up' && this.KeyMappings.Mapping_Up === 'ArrowUp') key = 'ArrowUp';
-        if (key === 'Down' && this.KeyMappings.Mapping_Down === 'ArrowDown') key = 'ArrowDown';
-        return key;
+        let key = event.key
+        if (key === 'Left' && this.KeyMappings.Mapping_Left === 'ArrowLeft') key = 'ArrowLeft'
+        if (key === 'Right' && this.KeyMappings.Mapping_Right === 'ArrowRight') key = 'ArrowRight'
+        if (key === 'Up' && this.KeyMappings.Mapping_Up === 'ArrowUp') key = 'ArrowUp'
+        if (key === 'Down' && this.KeyMappings.Mapping_Down === 'ArrowDown') key = 'ArrowDown'
+        return key
     }
 
     keyDown(event) {
-        let ic = this;
-        const key = ic._normalizeArrow(event);
-        ic.Key_Last = key;
-        if (ic.DebugKeycodes) console.log('key:', key);
+        const key = this._normalizeArrow(event)
+        this.Key_Last = key
 
-        if (key === ic.KeyMappings.Mapping_Up) ic.Key_Up = true;
-        if (key === ic.KeyMappings.Mapping_Down) ic.Key_Down = true;
-        if (key === ic.KeyMappings.Mapping_Left) ic.Key_Left = true;
-        if (key === ic.KeyMappings.Mapping_Right) ic.Key_Right = true;
-        if (key === ic.KeyMappings.Mapping_Action_A) ic.Key_Action_A = true;
-        if (key === ic.KeyMappings.Mapping_Action_B) ic.Key_Action_B = true;
-        if (key === ic.KeyMappings.Mapping_Action_Start) ic.Key_Action_Start = true;
-        if (key === ic.KeyMappings.Mapping_Action_Select) ic.Key_Action_Select = true;
-        if (key === ic.KeyMappings.Mapping_Action_L) ic.Key_Action_L = true;
-        if (key === ic.KeyMappings.Mapping_Action_R) ic.Key_Action_R = true;
-        if (key === ic.KeyMappings.Mapping_Menu) ic.Key_Menu = true;
+        if (key === this.KeyMappings.Mapping_Up) this.Key_Up = true
+        if (key === this.KeyMappings.Mapping_Down) this.Key_Down = true
+        if (key === this.KeyMappings.Mapping_Left) this.Key_Left = true
+        if (key === this.KeyMappings.Mapping_Right) this.Key_Right = true
+        if (key === this.KeyMappings.Mapping_Action_A) this.Key_Action_A = true
+        if (key === this.KeyMappings.Mapping_Action_B) this.Key_Action_B = true
+        if (key === this.KeyMappings.Mapping_Action_Start) this.Key_Action_Start = true
+        if (key === this.KeyMappings.Mapping_Action_Select) this.Key_Action_Select = true
+        if (key === this.KeyMappings.Mapping_Action_L) this.Key_Action_L = true
+        if (key === this.KeyMappings.Mapping_Action_R) this.Key_Action_R = true
+        if (key === this.KeyMappings.Mapping_Menu) this.Key_Menu = true
     }
 
     keyUp(event) {
-        let ic = this;
-        const key = ic._normalizeArrow(event);
+        const key = this._normalizeArrow(event)
 
-        if (key === ic.KeyMappings.Mapping_Up) ic.Key_Up = false;
-        if (key === ic.KeyMappings.Mapping_Down) ic.Key_Down = false;
-        if (key === ic.KeyMappings.Mapping_Left) ic.Key_Left = false;
-        if (key === ic.KeyMappings.Mapping_Right) ic.Key_Right = false;
-        if (key === ic.KeyMappings.Mapping_Action_A) ic.Key_Action_A = false;
-        if (key === ic.KeyMappings.Mapping_Action_B) ic.Key_Action_B = false;
-        if (key === ic.KeyMappings.Mapping_Action_Start) ic.Key_Action_Start = false;
-        if (key === ic.KeyMappings.Mapping_Action_Select) ic.Key_Action_Select = false;
-        if (key === ic.KeyMappings.Mapping_Action_L) ic.Key_Action_L = false;
-        if (key === ic.KeyMappings.Mapping_Action_R) ic.Key_Action_R = false;
-        if (key === ic.KeyMappings.Mapping_Menu) ic.Key_Menu = false;
+        if (key === this.KeyMappings.Mapping_Up) this.Key_Up = false
+        if (key === this.KeyMappings.Mapping_Down) this.Key_Down = false
+        if (key === this.KeyMappings.Mapping_Left) this.Key_Left = false
+        if (key === this.KeyMappings.Mapping_Right) this.Key_Right = false
+        if (key === this.KeyMappings.Mapping_Action_A) this.Key_Action_A = false
+        if (key === this.KeyMappings.Mapping_Action_B) this.Key_Action_B = false
+        if (key === this.KeyMappings.Mapping_Action_Start) this.Key_Action_Start = false
+        if (key === this.KeyMappings.Mapping_Action_Select) this.Key_Action_Select = false
+        if (key === this.KeyMappings.Mapping_Action_L) this.Key_Action_L = false
+        if (key === this.KeyMappings.Mapping_Action_R) this.Key_Action_R = false
+        if (key === this.KeyMappings.Mapping_Menu) this.Key_Menu = false
     }
 
     update() {
-        this.processGamepad();
+        this.processGamepad()
         if (this.Remap_Check) {
             if (this.Key_Last !== '' || this.Joy_Last !== null) {
-                window['myApp'].remapPressed();
-                this.Remap_Check = false;
+                window['myApp'].remapPressed()
+                this.Remap_Check = false
             }
         }
     }
 
-    // Called each emulator frame — maps current state into a string for the WASM module.
-    // Bit order matches what the GBA emulator expects (adapt if needed).
     updateMobileControls() {
         let s = '';
         s += this.Key_Up ? '1' : '0'; // UP
@@ -353,10 +361,9 @@ class InputController {
     }
 }
 
-window['myApp'].setupInputController();
+window['myApp'].setupInputController()
 
-// Load the GBA WASM emulator binary (place gbawasm.js + gbawasm.wasm in gba/gbaWasm/dist/)
-var rando3 = Math.floor(Math.random() * 100000);
-var wasmScript = document.createElement('script');
-wasmScript.src = 'gba/gbaWasm/dist/44gba.js?v=' + rando3;
-document.getElementsByTagName('head')[0].appendChild(wasmScript);
+var rando3 = Math.floor(Math.random() * 100000)
+var wasmScript = document.createElement('script')
+wasmScript.src = 'gba/gbaWasm/dist/44gba.js?v=' + rando3
+document.getElementsByTagName('head')[0].appendChild(wasmScript)
