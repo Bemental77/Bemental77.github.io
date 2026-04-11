@@ -13,7 +13,7 @@
 //   window.wasmReady()        called by WASM main() once init is complete
 //   window.writeAudio(ptr,n)  called by WASM each time new audio samples are ready
 
-const AUDIO_BLOCK_SIZE  = 1024;
+const AUDIO_BLOCK_SIZE  = 2048;
 const AUDIO_FIFO_MAXLEN = 4900;
 const WASM_SAVE_LEN     = 0x22000; // libretro_save_buf size (0x20000 + 0x2000)
 
@@ -157,15 +157,18 @@ class MyClass {
             return;
         }
         try {
-            this.audioContext = new AudioContext({ latencyHint: 0.0001, sampleRate: 48000 });
+            // 'playback' tells the browser to prefer glitch-free output over low latency.
+            // This is better for games than the near-zero latencyHint which caused
+            // the ScriptProcessor to compete with touch events on mobile.
+            this.audioContext = new AudioContext({ latencyHint: 'playback', sampleRate: 48000 });
             const sp = this.audioContext.createScriptProcessor(AUDIO_BLOCK_SIZE, 0, 2);
             sp.onaudioprocess = (ev) => {
                 const o0 = ev.outputBuffer.getChannelData(0);
                 const o1 = ev.outputBuffer.getChannelData(1);
                 if (!this.isRunning) { o0.fill(0); o1.fill(0); return; }
-                // Run extra frames when audio buffer is starved (keeps A/V in sync)
-                let safety = 0;
-                while (this.audioFifoCnt < AUDIO_BLOCK_SIZE && safety++ < 10) this._runFrame();
+                // Drain the FIFO. If it runs dry, output silence — rAF is the sole
+                // frame driver; running catch-up frames here caused double-speed
+                // emulation on mobile whenever a touch event delayed rAF.
                 const n = Math.min(AUDIO_BLOCK_SIZE, this.audioFifoCnt);
                 for (let i = 0; i < n; i++) {
                     o0[i] = this.audioFifo0[this.audioFifoHead] / 32768;
@@ -173,6 +176,8 @@ class MyClass {
                     this.audioFifoHead = (this.audioFifoHead + 1) % AUDIO_FIFO_MAXLEN;
                     this.audioFifoCnt--;
                 }
+                // Fill any remainder with silence
+                for (let i = n; i < AUDIO_BLOCK_SIZE; i++) { o0[i] = 0; o1[i] = 0; }
             };
             sp.connect(this.audioContext.destination);
             this.audioContext.resume();
