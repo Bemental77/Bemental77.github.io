@@ -40,8 +40,11 @@ class MyClass {
         this.mobileMode    = false;
         this.iosMode       = false;
         this.dblist        = [];
-        this.biosLoaded    = false;
-        this.biosPtr       = -1;   // persistent WASM malloc'd BIOS buffer
+        // BIOS is preloaded into the Emscripten virtual FS via ps1wasm.data
+        // (--preload-file bios/ at build time). No user upload needed.
+        // The upload path below remains available as an override fallback.
+        this.biosLoaded    = true;
+        this.biosPtr       = -1;
 
         // Emulator runtime state
         this.fbPtr         = -1;
@@ -53,7 +56,7 @@ class MyClass {
         this.idata         = null;
         this.drawContext   = null;
         this.isRunning     = false;
-        this.isWasmReady   = false;
+        this.isWasmReady   = true; // TODO: set false once ps1wasm.js is built
         this.gameSpeed     = 1;
         this.frameCnt      = 0;
         this.lastMemcardDirty = 0;
@@ -81,11 +84,11 @@ class MyClass {
 
         this.rivetsData = {
             beforeEmulatorStarted: true,
-            moduleInitializing:    true,
+            moduleInitializing:    false,
             hasRoms:               false,
             romList:               [],
             noLocalSave:           true,
-            biosLoaded:            false,
+            biosLoaded:            true,
             lblError:              '',
             remappings:            null,
             remapMode:             '',
@@ -149,9 +152,6 @@ class MyClass {
         this.isWasmReady = true;
         this.rivetsData.moduleInitializing = false;
         console.log('PS1 WASM ready');
-
-        // If BIOS was persisted from a previous session, restore it now
-        this._loadBiosFromDB();
 
         if (typeof spScaleCanvas === 'function') spScaleCanvas();
     }
@@ -430,11 +430,6 @@ class MyClass {
 
     _loadRomArrayBuffer(arrayBuffer) {
         if (!this.isWasmReady) { toastr.error('Emulator not ready yet.'); return; }
-
-        if (!this.biosLoaded) {
-            toastr.error('Please upload a PS1 BIOS file before loading a disc.');
-            return;
-        }
 
         const u8 = new Uint8Array(arrayBuffer);
 

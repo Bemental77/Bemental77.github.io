@@ -34,16 +34,6 @@
         .nav-tabs .nav-item.show .nav-link,
         .nav-tabs .nav-link.active { color: #007bff; }
 
-        /* BIOS status indicator */
-        #biosStatus {
-            display: inline-block;
-            margin-left: 8px;
-            font-size: 1.3em;
-            vertical-align: middle;
-        }
-        #biosStatus.loaded { color: #28a745; }
-        #biosStatus.missing { color: #dc3545; }
-
         /* ── Desktop canvas ── */
         #canvasDiv {
             text-align: center;
@@ -421,20 +411,13 @@
             <!-- BEFORE LOAD -->
             <div rv-if="data.beforeEmulatorStarted">
 
-                <!-- BIOS row -->
-                <div class="mt-3 mb-2">
-                    <button id="btnUploadBios" class="btn btn-warning"
+                <!-- BIOS override — hidden unless SHOWADVANCED.
+                     The BIOS is normally preloaded via ps1wasm.data at build time. -->
+                <div class="mt-3 mb-2" rv-if="data.settings.SHOWADVANCED">
+                    <button id="btnUploadBios" class="btn btn-outline-secondary btn-sm"
                         onclick="myApp.uploadBiosBrowse()"
-                        rv-disabled="data.moduleInitializing">Upload BIOS</button>
-                    <span id="biosStatus"
-                        rv-class-loaded="data.biosLoaded"
-                        rv-class-missing="data.biosLoaded | ev '===false'">
-                        <span rv-if="data.biosLoaded">&#10003;</span>
-                        <span rv-hide="data.biosLoaded">&#9888;</span>
-                    </span>
-                    <small class="d-block text-muted mt-1" rv-hide="data.biosLoaded">
-                        A PS1 BIOS file is required before loading a disc.
-                    </small>
+                        rv-disabled="data.moduleInitializing">Override BIOS</button>
+                    <span rv-if="data.biosLoaded" style="color:#28a745; margin-left:6px;">&#10003; BIOS ready</span>
                 </div>
 
                 <input id="bios-upload" type="file" accept=".bin,.rom" />
