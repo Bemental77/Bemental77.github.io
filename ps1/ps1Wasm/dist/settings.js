@@ -1,0 +1,4 @@
+var PS1WASMETTINGS = {
+  CLOUDSAVEURL: "",
+  SHOWADVANCED: true
+}

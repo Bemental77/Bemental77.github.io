@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <title>PS1 Wasm</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="keywords" content="PS1 Emulator, PlayStation, WebAssembly, HTML5">
+    <meta charset="UTF-8">
+    <script src="https://code.jquery.com/jquery-3.3.1.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/rivets/0.9.6/rivets.bundled.min.js"></script>
+    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.12.9/umd/popper.min.js"></script>
+    <script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/js/bootstrap.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/toastr.js/latest/toastr.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/toastr.js/latest/css/toastr.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.2/dist/FileSaver.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/nipplejs/0.10.0/nipplejs.min.js"></script>
+
+    <style>
+        input[type="file"] { display: none; }
+        .table td, .table th { padding: 5px; }
+        .regularTable td, .regularTable th { padding: 0; vertical-align: top; border-top: 0; }
+        .btn-purple { background-color: #7b5ea7; color: white; }
+        .btn-purple:hover { background-color: #6a4e96; color: white; }
+        .buttonhold { background-color: lightsalmon !important; }
+
+        /* PS1 face button colors */
+        .ps1-cross    { background-color: #3366dd; color: white; }
+        .ps1-circle   { background-color: #cc2222; color: white; }
+        .ps1-square   { background-color: #bb55aa; color: white; }
+        .ps1-triangle { background-color: #228844; color: white; }
+        .ps1-shoulder { background-color: #555; color: white; }
+
+        .nav-tabs .nav-item.show .nav-link,
+        .nav-tabs .nav-link.active { color: #007bff; }
+
+        /* BIOS status indicator */
+        #biosStatus {
+            display: inline-block;
+            margin-left: 8px;
+            font-size: 1.3em;
+            vertical-align: middle;
+        }
+        #biosStatus.loaded { color: #28a745; }
+        #biosStatus.missing { color: #dc3545; }
+
+        /* ── Desktop canvas ── */
+        #canvasDiv {
+            text-align: center;
+            width: 100%;
+            overflow: hidden;
+        }
+        #canvasDiv canvas {
+            display: block;
+            margin: 0 auto;
+            max-width: 100%;
+        }
+
+        /* Load progress bar */
+        #loadProgressDiv {
+            display: none;
+            width: 320px;
+            margin: 16px auto 0;
+            text-align: center;
+        }
+        #loadProgressDiv small {
+            display: block;
+            margin-top: 4px;
+            color: #666;
+        }
+
+        /* Key reference panel */
+        .keycap {
+            display: inline-block;
+            background: #f0f0f0;
+            border: 1px solid #aaa;
+            border-radius: 4px;
+            padding: 2px 8px;
+            font-family: monospace;
+            font-size: 0.85em;
+            box-shadow: 0 1px 0 #aaa;
+            min-width: 60px;
+            text-align: center;
+        }
+        .btn-pill {
+            display: inline-block;
+            border-radius: 12px;
+            padding: 2px 10px;
+            font-size: 0.85em;
+            font-weight: bold;
+            color: white;
+        }
+        .pill-dpad         { background: #555; }
+        .pill-start-select { background: #666; }
+        .pill-menu         { background: #888; }
+
+        #keyReference {
+            display: none;
+            margin-top: 16px;
+            padding: 12px 16px;
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+            max-width: 580px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        #keyRefGrid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            justify-content: center;
+            margin-top: 8px;
+        }
+        .key-ref-item { display: inline-flex; align-items: center; gap: 4px; }
+
+        /* ── Hide decorative SP elements ── */
+        .sp-screws, .sp-brand, .sp-bottom-dots,
+        .sp-hinge-knuckle, .sp-hinge { display: none; }
+
+        /* ════════════════════════════════════════
+           PlayStation Shell — mobile only
+           ════════════════════════════════════════ */
+        html, body { margin: 0; padding: 0; height: 100%; }
+
+        #spShell {
+            display: none;
+            flex-direction: column;
+            background: #111;
+            width: 100vw;
+            height: 100vh;
+            overflow: hidden;
+            position: fixed;
+            top: 0; left: 0;
+            z-index: 1000;
+        }
+
+        .sp-device {
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            height: 100%;
+            font-family: sans-serif;
+            user-select: none;
+            -webkit-user-select: none;
+            touch-action: manipulation;
+        }
+
+        /* TOP — exactly 50vh, black background, canvas centered inside */
+        .sp-top {
+            height: 50vh;
+            flex: 0 0 50vh;
+            background: #000;
+            overflow: hidden;
+            position: relative;
+        }
+
+        #spScreen {
+            width: 100%;
+            height: 100%;
+            background: #000;
+            overflow: hidden;
+            position: relative;
+        }
+
+        #spScreen canvas {
+            display: block;
+            position: absolute;
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
+        }
+
+        /* BOTTOM — exactly 50vh, controls */
+        .sp-bottom {
+            height: 50vh;
+            flex: 0 0 50vh;
+            background: linear-gradient(150deg, #c8c8c8 0%, #a2a2a2 50%, #b8b8b8 100%);
+            border-top: 2px solid #888;
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* LED */
+        .sp-led {
+            position: absolute;
+            right: 0; top: 52px;
+            width: 5px; height: 14px;
+            border-radius: 2px 0 0 2px;
+            background: #00e676;
+            box-shadow: 0 0 6px #00e676;
+        }
+
+        /* SHOULDER ROWS — two rows: L2/R2 on top, L1/R1 below */
+        .sp-shoulders {
+            display: flex;
+            height: 22px;
+        }
+        .sp-shoulder {
+            width: 50%; height: 100%;
+            background: linear-gradient(180deg, #c2c2c2 0%, #909090 100%);
+            border-bottom: 1.5px solid #777;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 10px; font-weight: 700;
+            color: #333; letter-spacing: 1px;
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+            transition: filter 0.08s;
+        }
+        .sp-shoulder.L { border-right: 1px solid #888; }
+        .sp-shoulder:active, .sp-shoulder.held { filter: brightness(0.70); }
+        /* L2/R2 row slightly dimmer to hint at secondary status */
+        .sp-shoulders.secondary .sp-shoulder {
+            background: linear-gradient(180deg, #b8b8b8 0%, #828282 100%);
+            font-size: 9px;
+            color: #444;
+        }
+
+        /* INNER — fills remaining bottom space */
+        .sp-inner {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 4px 12px 6px;
+            overflow: hidden;
+        }
+
+        /* MENU BUTTON */
+        .sp-menu-row {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 4px;
+        }
+        .sp-menu-btn {
+            width: 26px; height: 26px;
+            border-radius: 5px;
+            background: linear-gradient(145deg, #bbb 0%, #888 100%);
+            border: 1.5px solid #666;
+            box-shadow: inset 0 1px 2px rgba(255,255,255,0.4), 0 2px 4px rgba(0,0,0,0.4);
+            cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            transition: filter 0.08s;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .sp-menu-btn:active { filter: brightness(0.72); }
+        .sp-menu-icon {
+            width: 10px; height: 10px;
+            border-radius: 2px;
+            border: 1.5px solid #555;
+            background: #999;
+        }
+
+        /* CONTROLS ROW — fills remaining space */
+        .sp-controls {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex: 1;
+        }
+
+        /* D-PAD */
+        .sp-dpad-disc {
+            width: min(36vh, 42vw);
+            height: min(36vh, 42vw);
+            max-width: 145px; max-height: 145px;
+            border-radius: 50%;
+            background: radial-gradient(circle at 40% 35%, #b2b2b2 0%, #888 60%, #777 100%);
+            border: 2px solid #666;
+            box-shadow: inset 0 2px 4px rgba(255,255,255,0.3), 0 4px 8px rgba(0,0,0,0.45);
+            position: relative;
+            flex-shrink: 0;
+        }
+        .sp-dpad-v, .sp-dpad-h {
+            position: absolute;
+            background: #686868;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.5);
+            cursor: pointer;
+            -webkit-tap-highlight-color: transparent;
+            transition: filter 0.08s;
+        }
+        .sp-dpad-v {
+            width: 30%; height: 90%;
+            top: 5%; left: 35%;
+            border-radius: 4px;
+            flex-direction: column;
+        }
+        .sp-dpad-h {
+            width: 90%; height: 30%;
+            top: 35%; left: 5%;
+            border-radius: 4px;
+        }
+        .sp-dpad-center {
+            position: absolute;
+            width: 30%; height: 30%;
+            top: 35%; left: 35%;
+            background: #5a5a5a;
+            border-radius: 3px;
+            z-index: 3;
+            box-shadow: inset 0 1px 3px rgba(0,0,0,0.5);
+            pointer-events: none;
+        }
+        .sp-dpad-v:active, .sp-dpad-h:active,
+        .sp-dpad-v.held,   .sp-dpad-h.held  { filter: brightness(0.68); }
+        .arr { pointer-events: none; }
+        .arr-up    { width:0; height:0; border-left:5px solid transparent; border-right:5px solid transparent; border-bottom:7px solid #aaa; margin:5px auto 0; }
+        .arr-down  { width:0; height:0; border-left:5px solid transparent; border-right:5px solid transparent; border-top:7px solid #aaa; margin:0 auto 5px; }
+        .arr-left  { width:0; height:0; border-top:5px solid transparent; border-bottom:5px solid transparent; border-right:7px solid #aaa; margin:auto 5px; }
+        .arr-right { width:0; height:0; border-top:5px solid transparent; border-bottom:5px solid transparent; border-left:7px solid #aaa; margin:auto 5px; }
+
+        /* START / SELECT */
+        .sp-center {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 10px;
+            flex: 1;
+            padding: 0 6px;
+        }
+        .sp-sys-btn {
+            width: 62px; height: 15px;
+            border-radius: 7px;
+            background: linear-gradient(180deg, #aaa 0%, #787878 100%);
+            border: 1px solid #555;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.3), 0 2px 4px rgba(0,0,0,0.45);
+            cursor: pointer;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 7px; color: #ccc;
+            letter-spacing: 1.5px; text-transform: uppercase; font-weight: 700;
+            transition: filter 0.08s;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .sp-sys-btn:active, .sp-sys-btn.held {
+            filter: brightness(0.68);
+            box-shadow: 0 1px 1px rgba(0,0,0,0.3);
+        }
+
+        /* ── PS1 FACE BUTTON DIAMOND ── */
+        /* Container matches the GBA .sp-ab dimensions */
+        .sp-ab {
+            width: min(36vh, 42vw);
+            height: min(36vh, 42vw);
+            max-width: 145px; max-height: 145px;
+            position: relative;
+            flex-shrink: 0;
+        }
+        .sp-btn-circle {
+            width: min(14vh, 17vw);
+            height: min(14vh, 17vw);
+            max-width: 54px; max-height: 54px;
+            border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 16px; font-weight: 700;
+            color: rgba(255,255,255,0.92);
+            cursor: pointer;
+            position: absolute;
+            border: 2px solid rgba(0,0,0,0.2);
+            box-shadow: 0 4px 0 rgba(0,0,0,0.38), inset 0 1px 3px rgba(255,255,255,0.3);
+            transition: transform 0.08s, box-shadow 0.08s;
+            -webkit-tap-highlight-color: transparent;
+        }
+        .sp-btn-circle:active, .sp-btn-circle.held {
+            transform: translateY(3px);
+            box-shadow: 0 1px 0 rgba(0,0,0,0.3), inset 0 1px 2px rgba(255,255,255,0.2);
+        }
+        /* Diamond positions: △ top-center, □ left, ○ right, ✕ bottom-center */
+        .btn-ps-triangle { background: radial-gradient(circle at 38% 32%, #44bb66, #116633); top: 2px;  left: 50%; transform: translateX(-50%); }
+        .btn-ps-square   { background: radial-gradient(circle at 38% 32%, #dd88bb, #993377); top: 50%; left: 2px;  transform: translateY(-50%); }
+        .btn-ps-circle   { background: radial-gradient(circle at 38% 32%, #ee5555, #991111); top: 50%; right: 2px; transform: translateY(-50%); }
+        .btn-ps-cross    { background: radial-gradient(circle at 38% 32%, #5588ee, #1133aa); bottom: 2px; left: 50%; transform: translateX(-50%); }
+        /* Held state must cancel the translate, not stack it */
+        .btn-ps-triangle:active, .btn-ps-triangle.held { transform: translateX(-50%) translateY(3px); }
+        .btn-ps-square:active,   .btn-ps-square.held   { transform: translateY(calc(-50% + 3px)); }
+        .btn-ps-circle:active,   .btn-ps-circle.held   { transform: translateY(calc(-50% + 3px)); }
+        .btn-ps-cross:active,    .btn-ps-cross.held    { transform: translateX(-50%) translateY(3px); }
+
+        /* MOBILE MENU OVERLAY */
+        #spMenuOverlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.75);
+            z-index: 9999;
+            align-items: center;
+            justify-content: center;
+        }
+        #spMenuOverlay.open { display: flex; }
+        .sp-overlay-box {
+            background: #fff;
+            border-radius: 12px;
+            padding: 24px 28px;
+            text-align: center;
+            min-width: 220px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+        }
+        .sp-overlay-box h6 {
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: #888;
+            margin-bottom: 16px;
+        }
+        .sp-overlay-box .btn { display: block; width: 100%; margin-bottom: 10px; }
+        .sp-overlay-box .btn:last-child { margin-bottom: 0; }
+    </style>
+</head>
+
+<body>
+
+    <!-- ══ DESKTOP UI ══════════════════════════════════════════════════ -->
+    <div id="maindiv" class="container text-center">
+        <h1>PS1 Wasm</h1>
+
+        <div id="topPanel" style="display: none;">
+
+            <!-- BEFORE LOAD -->
+            <div rv-if="data.beforeEmulatorStarted">
+
+                <!-- BIOS row -->
+                <div class="mt-3 mb-2">
+                    <button id="btnUploadBios" class="btn btn-warning"
+                        onclick="myApp.uploadBiosBrowse()"
+                        rv-disabled="data.moduleInitializing">Upload BIOS</button>
+                    <span id="biosStatus"
+                        rv-class-loaded="data.biosLoaded"
+                        rv-class-missing="data.biosLoaded | ev '===false'">
+                        <span rv-if="data.biosLoaded">&#10003;</span>
+                        <span rv-hide="data.biosLoaded">&#9888;</span>
+                    </span>
+                    <small class="d-block text-muted mt-1" rv-hide="data.biosLoaded">
+                        A PS1 BIOS file is required before loading a disc.
+                    </small>
+                </div>
+
+                <input id="bios-upload" type="file" accept=".bin,.rom" />
+
+                <button id="btnPlayGame" class="btn btn-primary mt-2"
+                    rv-if="data.hasRoms"
+                    rv-disabled="data.moduleInitializing"
+                    onclick="myClass.loadRom();">Play Game</button>
+                <button id="btnUploadRom" class="btn btn-primary mt-2"
+                    rv-disabled="data.moduleInitializing"
+                    onclick="myApp.uploadBrowse()">Browse</button>
+                <button type="button" class="btn btn-primary mt-2"
+                    onclick="myApp.showRemapModal()">Remap Buttons</button>
+
+                <input id="file-upload" type="file" accept=".bin,.iso,.cue" />
+
+                <div class="form-group mt-2 mb-2" rv-if="data.hasRoms"
+                    style="width: 320px; margin-left: auto; margin-right: auto;">
+                    <select class="form-control" id="romselect">
+                        <option rv-each-rom="data.romList" rv-value="rom.url">{rom.title}</option>
+                    </select>
+                </div>
+
+                <!-- Chunked-fetch progress bar -->
+                <div id="loadProgressDiv">
+                    <div class="progress">
+                        <div id="loadProgressBar" class="progress-bar progress-bar-striped progress-bar-animated"
+                            role="progressbar" style="width: 0%"
+                            aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+                    </div>
+                    <small id="loadProgressLabel">0 MB / ? MB</small>
+                </div>
+
+                <div style="margin-top: 40px;">
+                    <div id="dropArea" style="width: 160px; height: 160px; border: 1px dashed gray;
+                        margin-left: auto; margin-right: auto; color: darkgrey;">
+                        <br><br>Drag/Drop<br>.bin / .iso
+                    </div>
+                </div>
+            </div>
+
+            <!-- AFTER LOAD -->
+            <div rv-hide="data.beforeEmulatorStarted">
+                <button class="btn btn-primary mt-2 mb-2" onclick="myApp.newRom()">New Disc</button>
+                <button class="btn btn-primary mt-2 mb-2" onclick="myApp.saveStateLocal()">Save State</button>
+                <button class="btn btn-primary mt-2 mb-2" onclick="myApp.loadStateLocal()"
+                    rv-disabled="data.noLocalSave">Load State</button>
+                <button class="btn btn-primary mt-2 mb-2" onclick="myApp.zoomOut()">Zoom Out</button>
+                <button class="btn btn-primary mt-2 mb-2" onclick="myApp.zoomIn()">Zoom In</button>
+                <button class="btn btn-primary mt-2 mb-2" onclick="myApp.showRemapModal()">Remap Buttons</button>
+                <button class="btn btn-primary mt-2 mb-2" onclick="myApp.fullscreen()">Toggle Fullscreen</button>
+            </div>
+        </div>
+
+        <div id="lblErrorOuter" style="display: none;">
+            <div rv-if="data.lblError | ev_string '.length > 0'"
+                class="alert alert-danger mt-4" id="lblError" role="alert"
+                rv-html="data.lblError">
+            </div>
+        </div>
+        <div id="mydiv" class="mt-4"></div>
+    </div>
+
+    <!-- Desktop canvas -->
+    <div id="middleDiv" class="text-center">
+        <div id="canvasDiv" style="display: none;">
+            <canvas id="canvas" style="width: 640px;"></canvas>
+        </div>
+        <div id="bottomPanel" rv-hide="data.beforeEmulatorStarted"></div>
+        <div id="keyReference">
+            <strong>Keyboard Reference</strong>
+            <div id="keyRefGrid"></div>
+        </div>
+    </div>
+
+    <!-- ══ PlayStation Shell — mobile ══════════════════════════════════ -->
+    <div id="spShell">
+        <div class="sp-device">
+
+            <!-- TOP: screen area -->
+            <div class="sp-top">
+                <div id="spScreen"></div>
+            </div>
+
+            <!-- BOTTOM: controls -->
+            <div class="sp-bottom">
+                <div class="sp-led"></div>
+
+                <!-- L2 / R2 secondary shoulder row -->
+                <div class="sp-shoulders secondary">
+                    <div class="sp-shoulder L" id="mobileL2">L2</div>
+                    <div class="sp-shoulder R" id="mobileR2">R2</div>
+                </div>
+                <!-- L1 / R1 primary shoulder row -->
+                <div class="sp-shoulders">
+                    <div class="sp-shoulder L" id="mobileL1">L1</div>
+                    <div class="sp-shoulder R" id="mobileR1">R1</div>
+                </div>
+
+                <div class="sp-inner">
+                    <div class="sp-menu-row">
+                        <div class="sp-menu-btn" id="spMenuBtn" onclick="spToggleMenu()">
+                            <div class="sp-menu-icon"></div>
+                        </div>
+                    </div>
+
+                    <div id="spSpeedRow" style="display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 4px;">
+                        <input type="range" id="spSpeedSlider" min="0" max="2" value="0" step="1" style="width: 140px; height: 28px;">
+                        <span id="spSpeedLabel">1x</span>
+                    </div>
+
+                    <div class="sp-controls">
+
+                        <!-- D-PAD -->
+                        <div class="sp-dpad-disc">
+                            <div class="sp-dpad-v" id="spDpadV">
+                                <div class="arr arr-up"></div>
+                                <div class="arr arr-down"></div>
+                            </div>
+                            <div class="sp-dpad-h" id="spDpadH">
+                                <div class="arr arr-left"></div>
+                                <div class="arr arr-right"></div>
+                            </div>
+                            <div class="sp-dpad-center"></div>
+                        </div>
+
+                        <!-- START / SELECT -->
+                        <div class="sp-center">
+                            <div class="sp-sys-btn" id="mobileStart">Start</div>
+                            <div class="sp-sys-btn" id="mobileSelect">Select</div>
+                        </div>
+
+                        <!-- PS1 face button diamond: △ □ ○ ✕ -->
+                        <div class="sp-ab">
+                            <div class="sp-btn-circle btn-ps-triangle" id="mobileTriangle">&#9651;</div>
+                            <div class="sp-btn-circle btn-ps-square"   id="mobileSquare">&#9633;</div>
+                            <div class="sp-btn-circle btn-ps-circle"   id="mobileCircle">&#9675;</div>
+                            <div class="sp-btn-circle btn-ps-cross"    id="mobileCross">&#10005;</div>
+                        </div>
+
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- SP Menu Overlay -->
+    <div id="spMenuOverlay" onclick="spCloseMenu()">
+        <div class="sp-overlay-box" onclick="event.stopPropagation()">
+            <h6>Menu</h6>
+            <button class="btn btn-primary" onclick="myApp.saveStateLocal(); spCloseMenu();">Save State</button>
+            <button class="btn btn-primary" onclick="myApp.loadStateLocal(); spCloseMenu();"
+                id="spLoadBtn">Load State</button>
+            <button class="btn btn-secondary" onclick="myApp.newRom()">New Disc</button>
+            <hr style="margin: 12px 0;">
+            <button class="btn btn-outline-secondary btn-sm" onclick="spCloseMenu()">Close</button>
+        </div>
+    </div>
+
+    <!-- ══ KEYMAPPING MODAL ════════════════════════════════════════════ -->
+    <div class="modal fade" id="buttonsModal" tabindex="-1" role="dialog" aria-hidden="true">
+        <div class="modal-dialog" role="document">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Remap Buttons</h5>
+                    <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+                        <span aria-hidden="true">&times;</span>
+                    </button>
+                </div>
+                <div class="modal-body" id="modalMain" style="padding-bottom: 0;">
+                    <ul class="nav nav-tabs" rv-hide="data.remapWait">
+                        <li class="nav-item">
+                            <a class="nav-link" rv-class-active="data.remapPlayer1" style="cursor: pointer;"
+                                onclick="myApp.swapRemap('player1')">Player 1</a>
+                        </li>
+                    </ul>
+                    <div rv-if="data.remapWait" class="alert alert-info mt-2"
+                        style="display: flex; justify-content: space-between; align-items: center;">
+                        <span>Press a key or button...</span>
+                        <button class="btn btn-sm btn-secondary" onclick="myApp.cancelRemap()">Cancel</button>
+                    </div>
+                    <div rv-if="data.remapPlayer1" rv-hide="data.remapWait">
+                        <table class="table">
+                            <thead><tr><th>Button</th><th>Keyboard</th><th>Joypad</th><th>Remap</th></tr></thead>
+                            <tbody>
+                                <tr><th><span class="btn-pill pill-dpad">D-Up</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Up"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Up"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(1)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(1)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill pill-dpad">D-Down</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Down"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Down"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(2)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(2)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill pill-dpad">D-Left</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Left"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Left"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(3)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(3)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill pill-dpad">D-Right</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Right"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Right"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(4)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(4)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill ps1-cross">&#10005;</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_Cross"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_Cross"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(5)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(5)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill ps1-circle">&#9675;</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_Circle"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_Circle"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(6)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(6)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill ps1-square">&#9633;</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_Square"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_Square"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(7)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(7)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill ps1-triangle">&#9651;</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_Triangle"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_Triangle"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(8)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(8)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill ps1-shoulder">L1</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_L1"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_L1"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(9)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(9)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill ps1-shoulder">R1</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_R1"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_R1"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(10)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(10)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill ps1-shoulder">L2</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_L2"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_L2"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(11)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(11)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill ps1-shoulder">R2</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_R2"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_R2"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(12)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(12)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill pill-start-select">Start</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_Start"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_Start"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(13)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(13)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill pill-start-select">Select</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Action_Select"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Action_Select"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(14)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(14)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                                <tr><th><span class="btn-pill pill-menu">Menu</span></th>
+                                    <td><span class="keycap" rv-text="data.remappings.Mapping_Menu"></span></td>
+                                    <td><span class="keycap" rv-text="data.remappings.Joy_Mapping_Menu"></span></td>
+                                    <td><table class="regularTable"><tr><td><button onclick="myApp.btnRemapKey(15)" class="btn btn-primary">Key</button></td><td><button onclick="myApp.btnRemapJoy(15)" class="btn btn-primary ml-2">Joy</button></td></tr></table></td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary"
+                        onclick="if(confirm('Reset all button mappings to defaults?')) myApp.resetRemaps()">Reset Defaults</button>
+                    <button type="button" class="btn btn-primary" onclick="myApp.saveRemaps()">Save</button>
+                    <button type="button" class="btn btn-secondary" data-dismiss="modal">Cancel</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══ SP TOUCH + CANVAS SCALING ══════════════════════════════════ -->
+    <script>
+    function spToggleMenu() {
+        document.getElementById('spMenuOverlay').classList.toggle('open');
+        var noSave = window.myApp && myApp.rivetsData.noLocalSave;
+        document.getElementById('spLoadBtn').disabled = !!noSave;
+    }
+    function spCloseMenu() {
+        document.getElementById('spMenuOverlay').classList.remove('open');
+    }
+
+    function spWireBtn(id, flagName) {
+        var el = document.getElementById(id);
+        if (!el) return;
+        function press(e) {
+            e.preventDefault();
+            if (window.myApp && myApp.rivetsData.inputController)
+                myApp.rivetsData.inputController[flagName] = true;
+            el.classList.add('held');
+        }
+        function release(e) {
+            e.preventDefault();
+            if (window.myApp && myApp.rivetsData.inputController)
+                myApp.rivetsData.inputController[flagName] = false;
+            el.classList.remove('held');
+        }
+        el.addEventListener('touchstart',  press,   { passive: false });
+        el.addEventListener('touchend',    release, { passive: false });
+        el.addEventListener('touchcancel', release, { passive: false });
+    }
+
+    function spWireDpad() {
+        var vEl = document.getElementById('spDpadV');
+        var hEl = document.getElementById('spDpadH');
+        if (!vEl || !hEl) return;
+        function ic() { return window.myApp && myApp.rivetsData.inputController; }
+        function vPress(e) {
+            e.preventDefault();
+            if (!ic()) return;
+            var rect  = vEl.getBoundingClientRect();
+            var touch = e.touches[0] || e.changedTouches[0];
+            if (touch.clientY < rect.top + rect.height / 2) { ic().Key_Up = true;  ic().Key_Down  = false; }
+            else                                             { ic().Key_Down = true; ic().Key_Up   = false; }
+            vEl.classList.add('held');
+        }
+        function vRelease(e) {
+            e.preventDefault();
+            if (ic()) { ic().Key_Up = false; ic().Key_Down = false; }
+            vEl.classList.remove('held');
+        }
+        function hPress(e) {
+            e.preventDefault();
+            if (!ic()) return;
+            var rect  = hEl.getBoundingClientRect();
+            var touch = e.touches[0] || e.changedTouches[0];
+            if (touch.clientX < rect.left + rect.width / 2) { ic().Key_Left = true;  ic().Key_Right = false; }
+            else                                             { ic().Key_Right = true; ic().Key_Left  = false; }
+            hEl.classList.add('held');
+        }
+        function hRelease(e) {
+            e.preventDefault();
+            if (ic()) { ic().Key_Left = false; ic().Key_Right = false; }
+            hEl.classList.remove('held');
+        }
+        vEl.addEventListener('touchstart',  vPress,   { passive: false });
+        vEl.addEventListener('touchend',    vRelease, { passive: false });
+        vEl.addEventListener('touchcancel', vRelease, { passive: false });
+        hEl.addEventListener('touchstart',  hPress,   { passive: false });
+        hEl.addEventListener('touchend',    hRelease, { passive: false });
+        hEl.addEventListener('touchcancel', hRelease, { passive: false });
+    }
+
+    function spInitControls() {
+        spWireBtn('mobileCross',    'Key_Action_Cross');
+        spWireBtn('mobileCircle',   'Key_Action_Circle');
+        spWireBtn('mobileSquare',   'Key_Action_Square');
+        spWireBtn('mobileTriangle', 'Key_Action_Triangle');
+        spWireBtn('mobileL1',       'Key_Action_L1');
+        spWireBtn('mobileR1',       'Key_Action_R1');
+        spWireBtn('mobileL2',       'Key_Action_L2');
+        spWireBtn('mobileR2',       'Key_Action_R2');
+        spWireBtn('mobileStart',    'Key_Action_Start');
+        spWireBtn('mobileSelect',   'Key_Action_Select');
+        spWireDpad();
+
+        var speedSlider = document.getElementById('spSpeedSlider');
+        var speedLabel  = document.getElementById('spSpeedLabel');
+        if (speedSlider && speedLabel) {
+            var speedMap = [1, 2, 5];
+            speedSlider.addEventListener('input', function() {
+                var speed = speedMap[parseInt(this.value)];
+                speedLabel.innerText = speed + 'x';
+                if (window.myApp) window.myApp.setGameSpeed(speed);
+            });
+        }
+    }
+
+    function spScaleCanvas() {
+        var canvas = document.getElementById('canvas');
+        var slot   = document.getElementById('spScreen');
+        if (!canvas || !slot) return;
+
+        // Use the canvas's natural pixel dimensions as set by the emulator
+        var cw = canvas.width  || 320;
+        var ch = canvas.height || 240;
+
+        void slot.offsetWidth;
+        var sw = slot.clientWidth;
+        var sh = slot.clientHeight;
+        if (!sw || !sh) return;
+
+        var scale  = Math.min(sw / cw, sh / ch);
+        var scaledW = Math.round(cw * scale);
+        var scaledH = Math.round(ch * scale);
+        var ox = Math.round((sw - scaledW) / 2);
+        var oy = Math.round((sh - scaledH) / 2);
+
+        canvas.style.position        = 'absolute';
+        canvas.style.left            = ox + 'px';
+        canvas.style.top             = oy + 'px';
+        canvas.style.width           = cw + 'px';
+        canvas.style.height          = ch + 'px';
+        canvas.style.transformOrigin = 'top left';
+        canvas.style.transform       = 'scale(' + scale + ')';
+        canvas.style.imageRendering  = 'pixelated';
+    }
+
+    function spActivate() {
+        var canvas = document.getElementById('canvas');
+        var slot   = document.getElementById('spScreen');
+        if (canvas && slot) {
+            canvas.style.width    = '';
+            canvas.style.height   = '';
+            canvas.style.position = 'absolute';
+            slot.appendChild(canvas);
+        }
+        document.getElementById('maindiv').style.display   = 'none';
+        document.getElementById('middleDiv').style.display = 'none';
+        document.getElementById('spShell').style.display   = 'flex';
+        spInitControls();
+
+        if (canvas) {
+            var obs = new MutationObserver(function() { spScaleCanvas(); });
+            obs.observe(canvas, { attributes: true, attributeFilter: ['width', 'height'] });
+        }
+
+        spScaleCanvas();
+        setTimeout(spScaleCanvas, 100);
+        setTimeout(spScaleCanvas, 600);
+        setTimeout(spScaleCanvas, 1500);
+        window.addEventListener('resize', spScaleCanvas);
+    }
+
+    window.spScaleCanvas = spScaleCanvas;
+    </script>
+
+    <script src="ps1/ps1Wasm/dist/settings.js"></script>
+    <script src="ps1/ps1Wasm/dist/romlist.js"></script>
+    <script src="ps1/ps1Wasm/dist/script.js"></script>
+</body>
+</html>
