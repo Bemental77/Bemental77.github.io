@@ -308,6 +308,7 @@ class MyClass {
             this._findInDatabase();
             this._configureEmulator();
             $('#canvasDiv').show();
+            $('#dpSpeedRow').show();
             this.rivetsData.beforeEmulatorStarted = false;
             this._lastFrameTime = null; // reset fixed-timestep clock for new ROM
             this.isRunning = true;
