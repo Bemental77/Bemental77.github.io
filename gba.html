@@ -426,6 +426,11 @@
         <div id="canvasDiv" style="display: none;">
             <canvas id="canvas" style="width: 480px;"></canvas>
         </div>
+        <div id="dpSpeedRow" style="display: none; justify-content: center; gap: 8px; margin-top: 10px;">
+            <button class="btn btn-sm btn-secondary dp-speed-btn" data-speed="1" onclick="dpSetSpeed(1)">1x</button>
+            <button class="btn btn-sm btn-outline-secondary dp-speed-btn" data-speed="2" onclick="dpSetSpeed(2)">2x</button>
+            <button class="btn btn-sm btn-outline-secondary dp-speed-btn" data-speed="5" onclick="dpSetSpeed(5)">5x</button>
+        </div>
         <div id="bottomPanel" rv-hide="data.beforeEmulatorStarted"></div>
         <div id="keyReference">
             <strong>Keyboard Reference</strong>
@@ -747,6 +752,16 @@
     }
 
     window.spScaleCanvas = spScaleCanvas;
+
+    function dpSetSpeed(speed) {
+        if (window.myApp) window.myApp.setGameSpeed(speed);
+        document.querySelectorAll('.dp-speed-btn').forEach(function(btn) {
+            var active = parseInt(btn.dataset.speed) === speed;
+            btn.classList.toggle('btn-secondary', active);
+            btn.classList.toggle('btn-outline-secondary', !active);
+        });
+    }
+    window.dpSetSpeed = dpSetSpeed;
     </script>
 
     <script src="gba/gbaWasm/dist/settings.js"></script>
