@@ -357,17 +357,59 @@ class MyClass {
         });
     }
 
-    loadRom() {
-        const url = document.getElementById('romselect').value;
-        this.rom_name = this._extractRomName(url);
+    async loadRom() {
+        const title = document.getElementById('romselect').value;
+        const rom = this.rivetsData.romList.find(r => r.title === title);
+        if (!rom) { toastr.error('ROM not found.'); return; }
+        this.rom_name = rom.title;
         this.tryInitSound();
-        this._whenReady(() => {
-            $('#canvasDiv').css('display', 'flex');
-            this.rivetsData.beforeEmulatorStarted = false;
-            console.log('[ps1] calling loadUrl:', url);
-            document.getElementById('ps1player').loadUrl(url);
-            this.isRunning = true;
+        this._whenReady(async () => {
+            try {
+                const u8 = await this._fetchChunked(rom.chunks);
+                const file = new File([u8], rom.title + '.iso', { type: 'application/octet-stream' });
+                document.getElementById('ps1player').readFile(file);
+                this.isRunning = true;
+                $('#canvasDiv').css('display', 'flex');
+                this.rivetsData.beforeEmulatorStarted = false;
+            } catch (e) {
+                toastr.error('Failed to load ROM: ' + e.message);
+            }
         });
+    }
+
+    async _fetchChunked(chunks) {
+        const buffers = [];
+        let totalLoaded = 0;
+
+        for (let i = 0; i < chunks.length; i++) {
+            const resp = await fetch(chunks[i]);
+            if (!resp.ok) throw new Error('Failed to fetch chunk ' + (i + 1) + ': HTTP ' + resp.status);
+
+            const reader = resp.body.getReader();
+            const chunkPieces = [];
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunkPieces.push(value);
+                totalLoaded += value.length;
+                this._showLoadProgress(totalLoaded, 0);
+            }
+
+            const chunkSize = chunkPieces.reduce((s, b) => s + b.length, 0);
+            const chunkArr = new Uint8Array(chunkSize);
+            let off = 0;
+            for (const piece of chunkPieces) { chunkArr.set(piece, off); off += piece.length; }
+            buffers.push(chunkArr);
+        }
+
+        this._hideLoadProgress();
+
+        const totalSize = buffers.reduce((s, b) => s + b.length, 0);
+        const result = new Uint8Array(totalSize);
+        let off = 0;
+        for (const buf of buffers) { result.set(buf, off); off += buf.length; }
+        return result;
     }
 
     _whenReady(fn) {
