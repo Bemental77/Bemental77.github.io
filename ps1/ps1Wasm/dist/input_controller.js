@@ -99,22 +99,22 @@ class InputController {
             Mapping_Up:               'ArrowUp',
             Mapping_Down:             'ArrowDown',
 
-            // Face buttons: Cross=confirm, Circle=back (PlayStation convention)
-            Mapping_Action_Cross:     'm',
-            Mapping_Action_Circle:    'n',
-            Mapping_Action_Square:    'v',
-            Mapping_Action_Triangle:  'b',
+            // Face buttons — keys match WASMpsx default bindings
+            Mapping_Action_Cross:     'z',
+            Mapping_Action_Circle:    'x',
+            Mapping_Action_Square:    's',
+            Mapping_Action_Triangle:  'd',
 
-            Mapping_Action_L1:        'q',
-            Mapping_Action_R1:        'e',
-            Mapping_Action_L2:        '1',
-            Mapping_Action_R2:        '3',
+            Mapping_Action_L1:        'w',
+            Mapping_Action_R1:        'r',
+            Mapping_Action_L2:        'e',
+            Mapping_Action_R2:        't',
 
-            Mapping_Action_Start:     'Enter',
-            Mapping_Action_Select:    'Backspace',
+            Mapping_Action_Start:     'v',
+            Mapping_Action_Select:    'c',
 
-            Mapping_Action_L3:        'z',
-            Mapping_Action_R3:        'x',
+            Mapping_Action_L3:        'q',
+            Mapping_Action_R3:        'p',
 
             Mapping_Menu:             '`',
 
@@ -326,13 +326,11 @@ class InputController {
     mobileReleaseR2(e)       { e.preventDefault(); this.Key_Action_R2       = false; this.MobileR2       = false }
 
     sendKeyDownEvent(key) {
-        const ev = new KeyboardEvent('Gamepad Event Down', { key })
-        this.keyDown(ev)
+        document.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, composed: true }))
     }
 
     sendKeyUpEvent(key) {
-        const ev = new KeyboardEvent('Gamepad Event Up', { key })
-        this.keyUp(ev)
+        document.dispatchEvent(new KeyboardEvent('keyup', { key, bubbles: true, composed: true }))
     }
 
     _normalizeArrow(event) {
@@ -402,9 +400,3 @@ class InputController {
 }
 
 window['myApp'].setupInputController()
-
-// Dynamically load the PS1 WASM binary after the input controller is ready
-var _ps1Rando = Math.floor(Math.random() * 100000)
-var _ps1WasmScript = document.createElement('script')
-_ps1WasmScript.src = 'ps1/ps1Wasm/dist/ps1wasm.js?v=' + _ps1Rando
-document.getElementsByTagName('head')[0].appendChild(_ps1WasmScript)

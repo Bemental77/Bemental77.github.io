@@ -71,16 +71,11 @@ class MyClass {
         this.wasmAudioBuf   = null;
 
         // Expose WASM callbacks before ps1wasm.js loads
-        window['wasmReady']  = this.onWasmReady.bind(this);
+        // window['wasmReady'] intentionally omitted — WASMpsx never fires this callback
         window['writeAudio'] = this.writeAudio.bind(this);
 
-        // Tell Emscripten where to find the .wasm file (injected via <script> in head)
-        window['Module'] = {
-            locateFile: (path) => 'ps1/ps1Wasm/dist/' + path,
-            // Increase initial heap — PS1 emulation needs significant memory.
-            // This must be <= the value baked into the build via -sINITIAL_MEMORY.
-            INITIAL_MEMORY: 256 * 1024 * 1024,
-        };
+        // Note: window.Module is owned by wasmpsx.min.js — do not overwrite it here.
+        // wasmpsx.min.js hardcodes locateFile and all Module callbacks internally.
 
         this.rivetsData = {
             beforeEmulatorStarted: true,
@@ -174,27 +169,14 @@ class MyClass {
     // ── AUDIO ─────────────────────────────────────────────────────────────────
 
     tryInitSound() {
+        // Audio is handled entirely by wasmpsx's internal SDL system.
+        // We only need to unlock the AudioContext on the first user gesture.
         if (this.audioContext) {
             if (this.audioContext.state !== 'running') this.audioContext.resume();
             return;
         }
         try {
-            this.audioContext = new AudioContext({ latencyHint: 'playback', sampleRate: 44100 });
-            const sp = this.audioContext.createScriptProcessor(PS1_AUDIO_BLOCK_SIZE, 0, 2);
-            sp.onaudioprocess = (ev) => {
-                const o0 = ev.outputBuffer.getChannelData(0);
-                const o1 = ev.outputBuffer.getChannelData(1);
-                if (!this.isRunning) { o0.fill(0); o1.fill(0); return; }
-                const n = Math.min(PS1_AUDIO_BLOCK_SIZE, this.audioFifoCnt);
-                for (let i = 0; i < n; i++) {
-                    o0[i] = this.audioFifo0[this.audioFifoHead] / 32768;
-                    o1[i] = this.audioFifo1[this.audioFifoHead] / 32768;
-                    this.audioFifoHead = (this.audioFifoHead + 1) % PS1_AUDIO_FIFO_MAXLEN;
-                    this.audioFifoCnt--;
-                }
-                for (let i = n; i < PS1_AUDIO_BLOCK_SIZE; i++) { o0[i] = 0; o1[i] = 0; }
-            };
-            sp.connect(this.audioContext.destination);
+            this.audioContext = new AudioContext({ sampleRate: 44100 });
             this.audioContext.resume();
         } catch (e) { console.log('Audio init failed:', e); }
     }
@@ -237,11 +219,7 @@ class MyClass {
     }
 
     _runFrame(draw = true) {
-        if (!this.isRunning || !this.isWasmReady) return;
-        this.frameCnt++;
-        if (this.frameCnt % 60 === 0) this._checkAutoSave();
-        Module._ps1RunFrame(this._getKeyMask());
-        if (draw) this._convertAndDraw();
+        // wasmpsx runs its own game loop in the worker — no-op here
     }
 
     // ── FRAMEBUFFER — RGB555 → RGBA conversion ────────────────────────────────
@@ -250,6 +228,9 @@ class MyClass {
     // The emulator can change resolution per-frame (e.g. 320×240 ↔ 640×480).
 
     _convertAndDraw() {
+        // wasmpsx renders via its own canvas through the worker render message — no-op here
+        return;
+
         if (!this.isWasmReady || this.fbPtr < 0) return;
 
         const w = Module._ps1GetFrameWidth();
@@ -327,7 +308,6 @@ class MyClass {
     }
 
     _loadBiosArrayBuffer(arrayBuffer) {
-        if (!this.isWasmReady) { toastr.error('Emulator not ready yet.'); return; }
         const u8 = new Uint8Array(arrayBuffer);
         // PS1 BIOS images are 512 KB or 1 MB
         if (u8.length !== 524288 && u8.length !== 1048576) {
@@ -367,46 +347,35 @@ class MyClass {
 
     uploadRom(event) {
         const file = event.currentTarget.files[0];
-        myClass.rom_name = file.name;
-        const r = new FileReader();
-        r.onload = (e) => myClass._loadRomArrayBuffer(e.target.result);
-        r.readAsArrayBuffer(file);
+        this.rom_name = file.name;
+        this.tryInitSound();
+        this._whenReady(() => {
+            $('#canvasDiv').css('display', 'flex');
+            this.rivetsData.beforeEmulatorStarted = false;
+            console.log('[ps1] calling readFile:', file.name);
+            document.getElementById('ps1player').readFile(file);
+        });
     }
 
-    async loadRom() {
-        const url = document.getElementById('romselect')['value'];
+    loadRom() {
+        const url = document.getElementById('romselect').value;
         this.rom_name = this._extractRomName(url);
         this.tryInitSound();
+        this._whenReady(() => {
+            $('#canvasDiv').css('display', 'flex');
+            this.rivetsData.beforeEmulatorStarted = false;
+            console.log('[ps1] calling loadUrl:', url);
+            document.getElementById('ps1player').loadUrl(url);
+            this.isRunning = true;
+        });
+    }
 
-        // Chunked fetch so we can show a progress bar for large disc images
-        try {
-            const resp = await fetch(url);
-            const total = parseInt(resp.headers.get('Content-Length') || '0');
-            const reader = resp.body.getReader();
-            const chunks = [];
-            let received = 0;
-
-            this._showLoadProgress(0, total);
-
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                chunks.push(value);
-                received += value.length;
-                this._showLoadProgress(received, total);
-            }
-
-            this._hideLoadProgress();
-
-            const buf = new Uint8Array(received);
-            let offset = 0;
-            for (const c of chunks) { buf.set(c, offset); offset += c.length; }
-
-            this._loadRomArrayBuffer(buf.buffer);
-        } catch (e) {
-            this._hideLoadProgress();
-            toastr.error('Failed to load disc: ' + e);
-        }
+    _whenReady(fn) {
+        if (window.wasmpsxReady) { console.log('[ps1] wasm already ready'); fn(); return; }
+        console.log('[ps1] waiting for wasm...');
+        const id = setInterval(() => {
+            if (window.wasmpsxReady) { clearInterval(id); console.log('[ps1] wasm became ready'); fn(); }
+        }, 100);
     }
 
     _showLoadProgress(received, total) {
@@ -429,7 +398,6 @@ class MyClass {
     }
 
     _loadRomArrayBuffer(arrayBuffer) {
-        if (!this.isWasmReady) { toastr.error('Emulator not ready yet.'); return; }
 
         const u8 = new Uint8Array(arrayBuffer);
 
@@ -506,6 +474,8 @@ class MyClass {
     }
 
     _checkAutoSave() {
+        // Memory card API not available in wasmpsx build
+        return;
         if (!this.isRunning) return;
         const dirty = Module._ps1MemcardDirty(0);
 
@@ -545,40 +515,35 @@ class MyClass {
         if (!this.isRunning) { toastr.error('No game running.'); return; }
         const key = this._getSaveKey();
         if (!key) { toastr.error('No disc loaded.'); return; }
+        if (!window.saveStateWasm) { toastr.error('Emulator not ready.'); return; }
         toastr.info('Saving state…');
-        try {
-            const size = Module._ps1SaveState(this.statePtr, PS1_STATE_MAX_BYTES);
-            if (size <= 0) { toastr.error('Save state returned empty data.'); return; }
-            const snap = new Uint8Array(size);
-            snap.set(Module.HEAPU8.subarray(this.statePtr, this.statePtr + size));
-            const compressed = await this._compressData(snap);
-            this._putDB(key + '.ps1state', compressed,
-                () => {
-                    this.rivetsData.noLocalSave = false;
-                    toastr.info('State saved (' + (compressed.byteLength / 1024).toFixed(0) + ' KB).');
-                },
-                () => toastr.error('State save failed.')
-            );
-        } catch (e) { toastr.error('State save error: ' + e.message); }
+        window.saveStateWasm(async (heap) => {
+            try {
+                const compressed = await this._compressData(new Uint8Array(heap));
+                this._putDB(key + '.ps1state', compressed,
+                    () => {
+                        this.rivetsData.noLocalSave = false;
+                        toastr.success('State saved (' + (compressed.byteLength / 1024 / 1024).toFixed(1) + ' MB).');
+                    },
+                    () => toastr.error('State save failed.')
+                );
+            } catch (e) { toastr.error('State save error: ' + e.message); }
+        });
     }
 
     async loadStateLocal() {
         const key = this._getSaveKey();
         if (!key) { toastr.error('No disc loaded.'); return; }
+        if (!window.loadStateWasm) { toastr.error('Emulator not ready.'); return; }
         this._getDB(key + '.ps1state', async (data) => {
             toastr.info('Restoring state…');
             try {
-                this.isRunning = false;
                 const compressed = data instanceof Uint8Array ? data : new Uint8Array(data);
-                const raw = await this._decompressData(compressed);
-                Module.HEAPU8.set(raw, this.statePtr);
-                Module._ps1LoadState(this.statePtr, raw.length);
-                this.isRunning = true;
-                toastr.info('State restored.');
-            } catch (e) {
-                this.isRunning = true;
-                toastr.error('State restore error: ' + e.message);
-            }
+                const heap = await this._decompressData(compressed);
+                window.loadStateWasm(heap, () => {
+                    toastr.success('State restored.');
+                });
+            } catch (e) { toastr.error('State restore error: ' + (e && e.message ? e.message : String(e))); }
         }, () => toastr.error('No save state found for this disc.'));
     }
 

@@ -484,7 +484,8 @@
     <!-- Desktop canvas -->
     <div id="middleDiv" class="text-center">
         <div id="canvasDiv" style="display: none;">
-            <canvas id="canvas" style="width: 640px;"></canvas>
+            <wasmpsx-player id="ps1player" style="width: 640px; height: 480px; display: block; overflow: hidden;"></wasmpsx-player>
+            <script src="ps1/ps1Wasm/dist/wasmpsx.min.js"></script>
         </div>
         <div id="bottomPanel" rv-hide="data.beforeEmulatorStarted"></div>
         <div id="keyReference">
@@ -689,19 +690,21 @@
         document.getElementById('spMenuOverlay').classList.remove('open');
     }
 
-    function spWireBtn(id, flagName) {
+    function spKey(type, key) {
+        document.dispatchEvent(new KeyboardEvent(type, { key: key, bubbles: true, composed: true }));
+    }
+
+    function spWireBtn(id, key) {
         var el = document.getElementById(id);
         if (!el) return;
         function press(e) {
             e.preventDefault();
-            if (window.myApp && myApp.rivetsData.inputController)
-                myApp.rivetsData.inputController[flagName] = true;
+            spKey('keydown', key);
             el.classList.add('held');
         }
         function release(e) {
             e.preventDefault();
-            if (window.myApp && myApp.rivetsData.inputController)
-                myApp.rivetsData.inputController[flagName] = false;
+            spKey('keyup', key);
             el.classList.remove('held');
         }
         el.addEventListener('touchstart',  press,   { passive: false });
@@ -713,33 +716,43 @@
         var vEl = document.getElementById('spDpadV');
         var hEl = document.getElementById('spDpadH');
         if (!vEl || !hEl) return;
-        function ic() { return window.myApp && myApp.rivetsData.inputController; }
+        var upHeld = false, downHeld = false, leftHeld = false, rightHeld = false;
         function vPress(e) {
             e.preventDefault();
-            if (!ic()) return;
             var rect  = vEl.getBoundingClientRect();
             var touch = e.touches[0] || e.changedTouches[0];
-            if (touch.clientY < rect.top + rect.height / 2) { ic().Key_Up = true;  ic().Key_Down  = false; }
-            else                                             { ic().Key_Down = true; ic().Key_Up   = false; }
+            if (touch.clientY < rect.top + rect.height / 2) {
+                if (!upHeld)   { spKey('keydown', 'ArrowUp');   upHeld   = true;  }
+                if (downHeld)  { spKey('keyup',   'ArrowDown'); downHeld = false; }
+            } else {
+                if (!downHeld) { spKey('keydown', 'ArrowDown'); downHeld = true;  }
+                if (upHeld)    { spKey('keyup',   'ArrowUp');   upHeld   = false; }
+            }
             vEl.classList.add('held');
         }
         function vRelease(e) {
             e.preventDefault();
-            if (ic()) { ic().Key_Up = false; ic().Key_Down = false; }
+            if (upHeld)   { spKey('keyup', 'ArrowUp');   upHeld   = false; }
+            if (downHeld) { spKey('keyup', 'ArrowDown'); downHeld = false; }
             vEl.classList.remove('held');
         }
         function hPress(e) {
             e.preventDefault();
-            if (!ic()) return;
             var rect  = hEl.getBoundingClientRect();
             var touch = e.touches[0] || e.changedTouches[0];
-            if (touch.clientX < rect.left + rect.width / 2) { ic().Key_Left = true;  ic().Key_Right = false; }
-            else                                             { ic().Key_Right = true; ic().Key_Left  = false; }
+            if (touch.clientX < rect.left + rect.width / 2) {
+                if (!leftHeld)  { spKey('keydown', 'ArrowLeft');  leftHeld  = true;  }
+                if (rightHeld)  { spKey('keyup',   'ArrowRight'); rightHeld = false; }
+            } else {
+                if (!rightHeld) { spKey('keydown', 'ArrowRight'); rightHeld = true;  }
+                if (leftHeld)   { spKey('keyup',   'ArrowLeft');  leftHeld  = false; }
+            }
             hEl.classList.add('held');
         }
         function hRelease(e) {
             e.preventDefault();
-            if (ic()) { ic().Key_Left = false; ic().Key_Right = false; }
+            if (leftHeld)  { spKey('keyup', 'ArrowLeft');  leftHeld  = false; }
+            if (rightHeld) { spKey('keyup', 'ArrowRight'); rightHeld = false; }
             hEl.classList.remove('held');
         }
         vEl.addEventListener('touchstart',  vPress,   { passive: false });
@@ -751,78 +764,49 @@
     }
 
     function spInitControls() {
-        spWireBtn('mobileCross',    'Key_Action_Cross');
-        spWireBtn('mobileCircle',   'Key_Action_Circle');
-        spWireBtn('mobileSquare',   'Key_Action_Square');
-        spWireBtn('mobileTriangle', 'Key_Action_Triangle');
-        spWireBtn('mobileL1',       'Key_Action_L1');
-        spWireBtn('mobileR1',       'Key_Action_R1');
-        spWireBtn('mobileL2',       'Key_Action_L2');
-        spWireBtn('mobileR2',       'Key_Action_R2');
-        spWireBtn('mobileStart',    'Key_Action_Start');
-        spWireBtn('mobileSelect',   'Key_Action_Select');
+        var km = window.myApp && myApp.rivetsData.inputController
+                 ? myApp.rivetsData.inputController.KeyMappings : null;
+        if (!km) return;
+        spWireBtn('mobileCross',    km.Mapping_Action_Cross);
+        spWireBtn('mobileCircle',   km.Mapping_Action_Circle);
+        spWireBtn('mobileSquare',   km.Mapping_Action_Square);
+        spWireBtn('mobileTriangle', km.Mapping_Action_Triangle);
+        spWireBtn('mobileL1',       km.Mapping_Action_L1);
+        spWireBtn('mobileR1',       km.Mapping_Action_R1);
+        spWireBtn('mobileL2',       km.Mapping_Action_L2);
+        spWireBtn('mobileR2',       km.Mapping_Action_R2);
+        spWireBtn('mobileStart',    km.Mapping_Action_Start);
+        spWireBtn('mobileSelect',   km.Mapping_Action_Select);
         spWireDpad();
-
-        var speedSlider = document.getElementById('spSpeedSlider');
-        var speedLabel  = document.getElementById('spSpeedLabel');
-        if (speedSlider && speedLabel) {
-            var speedMap = [1, 2, 5];
-            speedSlider.addEventListener('input', function() {
-                var speed = speedMap[parseInt(this.value)];
-                speedLabel.innerText = speed + 'x';
-                if (window.myApp) window.myApp.setGameSpeed(speed);
-            });
-        }
     }
 
     function spScaleCanvas() {
-        var canvas = document.getElementById('canvas');
+        var player = document.getElementById('ps1player');
         var slot   = document.getElementById('spScreen');
-        if (!canvas || !slot) return;
-
-        // Use the canvas's natural pixel dimensions as set by the emulator
-        var cw = canvas.width  || 320;
-        var ch = canvas.height || 240;
+        if (!player || !slot) return;
 
         void slot.offsetWidth;
         var sw = slot.clientWidth;
         var sh = slot.clientHeight;
         if (!sw || !sh) return;
 
-        var scale  = Math.min(sw / cw, sh / ch);
-        var scaledW = Math.round(cw * scale);
-        var scaledH = Math.round(ch * scale);
-        var ox = Math.round((sw - scaledW) / 2);
-        var oy = Math.round((sh - scaledH) / 2);
-
-        canvas.style.position        = 'absolute';
-        canvas.style.left            = ox + 'px';
-        canvas.style.top             = oy + 'px';
-        canvas.style.width           = cw + 'px';
-        canvas.style.height          = ch + 'px';
-        canvas.style.transformOrigin = 'top left';
-        canvas.style.transform       = 'scale(' + scale + ')';
-        canvas.style.imageRendering  = 'pixelated';
+        player.style.width    = sw + 'px';
+        player.style.height   = sh + 'px';
+        player.style.position = 'absolute';
+        player.style.left     = '0';
+        player.style.top      = '0';
     }
 
     function spActivate() {
-        var canvas = document.getElementById('canvas');
+        var player = document.getElementById('ps1player');
         var slot   = document.getElementById('spScreen');
-        if (canvas && slot) {
-            canvas.style.width    = '';
-            canvas.style.height   = '';
-            canvas.style.position = 'absolute';
-            slot.appendChild(canvas);
+        if (player && slot) {
+            slot.appendChild(player);
         }
         document.getElementById('maindiv').style.display   = 'none';
         document.getElementById('middleDiv').style.display = 'none';
         document.getElementById('spShell').style.display   = 'flex';
         spInitControls();
-
-        if (canvas) {
-            var obs = new MutationObserver(function() { spScaleCanvas(); });
-            obs.observe(canvas, { attributes: true, attributeFilter: ['width', 'height'] });
-        }
 
         spScaleCanvas();
         setTimeout(spScaleCanvas, 100);
