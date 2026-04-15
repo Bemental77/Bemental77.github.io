@@ -146,7 +146,6 @@ class MyClass {
 
         this.isWasmReady = true;
         this.rivetsData.moduleInitializing = false;
-        console.log('PS1 WASM ready');
 
         if (typeof spScaleCanvas === 'function') spScaleCanvas();
     }
@@ -410,10 +409,9 @@ class MyClass {
     }
 
     _whenReady(fn) {
-        if (window.wasmpsxReady) { console.log('[ps1] wasm already ready'); fn(); return; }
-        console.log('[ps1] waiting for wasm...');
+        if (window.wasmpsxReady) { fn(); return; }
         const id = setInterval(() => {
-            if (window.wasmpsxReady) { clearInterval(id); console.log('[ps1] wasm became ready'); fn(); }
+            if (window.wasmpsxReady) { clearInterval(id); fn(); }
         }, 100);
     }
 
