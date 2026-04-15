@@ -169,16 +169,13 @@ class MyClass {
     // ── AUDIO ─────────────────────────────────────────────────────────────────
 
     tryInitSound() {
-        // Audio is handled entirely by wasmpsx's internal SDL system.
-        // We only need to unlock the AudioContext on the first user gesture.
-        if (this.audioContext) {
-            if (this.audioContext.state !== 'running') this.audioContext.resume();
-            return;
-        }
+        // Resume SDL's AudioContext — the one actually used for output.
+        // A separate AudioContext here would be unused; SDL creates its own.
         try {
-            this.audioContext = new AudioContext({ sampleRate: 44100 });
-            this.audioContext.resume();
-        } catch (e) { console.log('Audio init failed:', e); }
+            if (typeof SDL !== 'undefined' && SDL.audioContext && SDL.audioContext.state !== 'running') {
+                SDL.audioContext.resume();
+            }
+        } catch (e) { console.log('Audio resume failed:', e); }
     }
 
     // ── GAME LOOP ─────────────────────────────────────────────────────────────
