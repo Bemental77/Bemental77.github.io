@@ -1,0 +1,502 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="ChangeListManager">
+    <list default="true" id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="adding page for test resources">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/Nettest.html" beforeDir="false" afterPath="$PROJECT_DIR$/Nettest.html" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="FileTemplateManagerImpl">
+    <option name="RECENT_TEMPLATES">
+      <list>
+        <option value="JavaScript File" />
+        <option value="CSS File" />
+        <option value="HTML File" />
+      </list>
+    </option>
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="GitSEFilterConfiguration">
+    <file-type-list>
+      <filtered-out-file-type name="LOCAL_BRANCH" />
+      <filtered-out-file-type name="REMOTE_BRANCH" />
+      <filtered-out-file-type name="TAG" />
+      <filtered-out-file-type name="COMMIT_BY_MESSAGE" />
+    </file-type-list>
+  </component>
+  <component name="HighlightingSettingsPerFile">
+    <setting file="file://$PROJECT_DIR$/ColorPicker/colorPickerJS.js" root0="FORCE_HIGHLIGHTING" />
+  </component>
+  <component name="MarkdownSettingsMigration">
+    <option name="stateVersion" value="1" />
+  </component>
+  <component name="ProjectId" id="22sAo06PGS5RjZuA9VxOmN07eI1" />
+  <component name="ProjectLevelVcsManager" settingsEditedManually="true">
+    <ConfirmationsSetting value="2" id="Add" />
+  </component>
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent">
+    <property name="ASKED_ADD_EXTERNAL_FILES" value="true" />
+    <property name="ASKED_SHARE_PROJECT_CONFIGURATION_FILES" value="true" />
+    <property name="DefaultHtmlFileTemplate" value="HTML File" />
+    <property name="RunOnceActivity.OpenProjectViewOnStart" value="true" />
+    <property name="RunOnceActivity.ShowReadmeOnStart" value="true" />
+    <property name="SHARE_PROJECT_CONFIGURATION_FILES" value="true" />
+    <property name="WebServerToolWindowFactoryState" value="false" />
+    <property name="last_opened_file_path" value="$PROJECT_DIR$/images" />
+    <property name="list.type.of.created.stylesheet" value="CSS" />
+    <property name="node.js.detected.package.eslint" value="true" />
+    <property name="node.js.detected.package.tslint" value="true" />
+    <property name="node.js.selected.package.eslint" value="(autodetect)" />
+    <property name="node.js.selected.package.tslint" value="(autodetect)" />
+    <property name="settings.editor.selected.configurable" value="reference.settings.ide.settings.notifications" />
+    <property name="vue.rearranger.settings.migration" value="true" />
+  </component>
+  <component name="RecentsManager">
+    <key name="CopyFile.RECENT_KEYS">
+      <recent name="C:\Users\cbement\WebstormProjects\Bemental77.github.io\images" />
+    </key>
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="$PROJECT_DIR$/ColorPicker/css" />
+    </key>
+  </component>
+  <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="e49e2bdd-c6a2-4dfd-90f9-9c18d7249e8c" name="Changes" comment="" />
+      <created>1640616092034</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1640616092034</updated>
+      <workItem from="1640616093876" duration="8019000" />
+      <workItem from="1640628743134" duration="115000" />
+      <workItem from="1640629683925" duration="1638000" />
+      <workItem from="1640631796046" duration="209000" />
+      <workItem from="1640632023679" duration="394000" />
+      <workItem from="1640634108074" duration="6011000" />
+      <workItem from="1640641265352" duration="11225000" />
+      <workItem from="1643687774287" duration="21000" />
+      <workItem from="1643954368909" duration="3935000" />
+      <workItem from="1644012101926" duration="1062000" />
+      <workItem from="1644211672353" duration="660000" />
+      <workItem from="1644213859911" duration="27000" />
+      <workItem from="1644213923752" duration="476000" />
+      <workItem from="1644358374694" duration="1000000" />
+      <workItem from="1644505431865" duration="2013000" />
+      <workItem from="1644510471285" duration="19135000" />
+      <workItem from="1649649911067" duration="130000" />
+      <workItem from="1654105182853" duration="1568000" />
+      <workItem from="1657225863154" duration="424000" />
+      <workItem from="1657239870166" duration="44000" />
+    </task>
+    <task id="LOCAL-00008" summary="All is color sorted">
+      <created>1640644560618</created>
+      <option name="number" value="00008" />
+      <option name="presentableId" value="LOCAL-00008" />
+      <option name="project" value="LOCAL" />
+      <updated>1640644560618</updated>
+    </task>
+    <task id="LOCAL-00009" summary="Added resume iframe to resume.html">
+      <created>1640707338036</created>
+      <option name="number" value="00009" />
+      <option name="presentableId" value="LOCAL-00009" />
+      <option name="project" value="LOCAL" />
+      <updated>1640707338036</updated>
+    </task>
+    <task id="LOCAL-00010" summary="Added resume iframe to resume.html">
+      <created>1640708877428</created>
+      <option name="number" value="00010" />
+      <option name="presentableId" value="LOCAL-00010" />
+      <option name="project" value="LOCAL" />
+      <updated>1640708877428</updated>
+    </task>
+    <task id="LOCAL-00011" summary="Added resume iframe to resume.html">
+      <created>1640708982428</created>
+      <option name="number" value="00011" />
+      <option name="presentableId" value="LOCAL-00011" />
+      <option name="project" value="LOCAL" />
+      <updated>1640708982428</updated>
+    </task>
+    <task id="LOCAL-00012" summary="Added formValidator.js, but not using it yet. Contact form should open a mailto">
+      <created>1640718668288</created>
+      <option name="number" value="00012" />
+      <option name="presentableId" value="LOCAL-00012" />
+      <option name="project" value="LOCAL" />
+      <updated>1640718668288</updated>
+    </task>
+    <task id="LOCAL-00013" summary="Added formValidator.js, but not using it yet. Contact form should open a mailto">
+      <created>1640719028350</created>
+      <option name="number" value="00013" />
+      <option name="presentableId" value="LOCAL-00013" />
+      <option name="project" value="LOCAL" />
+      <updated>1640719028350</updated>
+    </task>
+    <task id="LOCAL-00014" summary="updates to pages, filling it with real info.">
+      <created>1640720540844</created>
+      <option name="number" value="00014" />
+      <option name="presentableId" value="LOCAL-00014" />
+      <option name="project" value="LOCAL" />
+      <updated>1640720540844</updated>
+    </task>
+    <task id="LOCAL-00015" summary="added /test page for Agile Programming class. This is contains no links because it is a requirement for the class.">
+      <created>1643954753050</created>
+      <option name="number" value="00015" />
+      <option name="presentableId" value="LOCAL-00015" />
+      <option name="project" value="LOCAL" />
+      <updated>1643954753050</updated>
+    </task>
+    <task id="LOCAL-00016" summary="added /test page for Agile Programming class. This is contains no links because it is a requirement for the class.">
+      <created>1643954852912</created>
+      <option name="number" value="00016" />
+      <option name="presentableId" value="LOCAL-00016" />
+      <option name="project" value="LOCAL" />
+      <updated>1643954852912</updated>
+    </task>
+    <task id="LOCAL-00017" summary="added /test page for Agile Programming class. This is contains no links because it is a requirement for the class.">
+      <created>1643954947515</created>
+      <option name="number" value="00017" />
+      <option name="presentableId" value="LOCAL-00017" />
+      <option name="project" value="LOCAL" />
+      <updated>1643954947515</updated>
+    </task>
+    <task id="LOCAL-00018" summary="added first elevator pitch">
+      <created>1643955606670</created>
+      <option name="number" value="00018" />
+      <option name="presentableId" value="LOCAL-00018" />
+      <option name="project" value="LOCAL" />
+      <updated>1643955606670</updated>
+    </task>
+    <task id="LOCAL-00019" summary="added first elevator pitch">
+      <created>1643955683103</created>
+      <option name="number" value="00019" />
+      <option name="presentableId" value="LOCAL-00019" />
+      <option name="project" value="LOCAL" />
+      <updated>1643955683103</updated>
+    </task>
+    <task id="LOCAL-00020" summary="added all elevator pitches">
+      <created>1643990454099</created>
+      <option name="number" value="00020" />
+      <option name="presentableId" value="LOCAL-00020" />
+      <option name="project" value="LOCAL" />
+      <updated>1643990454099</updated>
+    </task>
+    <task id="LOCAL-00021" summary="restructured test file to have index.html">
+      <created>1644012139661</created>
+      <option name="number" value="00021" />
+      <option name="presentableId" value="LOCAL-00021" />
+      <option name="project" value="LOCAL" />
+      <updated>1644012139661</updated>
+    </task>
+    <task id="LOCAL-00022" summary="restructured test file to have index.html">
+      <created>1644012603294</created>
+      <option name="number" value="00022" />
+      <option name="presentableId" value="LOCAL-00022" />
+      <option name="project" value="LOCAL" />
+      <updated>1644012603294</updated>
+    </task>
+    <task id="LOCAL-00023" summary="Added success message to README.md">
+      <created>1644211843325</created>
+      <option name="number" value="00023" />
+      <option name="presentableId" value="LOCAL-00023" />
+      <option name="project" value="LOCAL" />
+      <updated>1644211843325</updated>
+    </task>
+    <task id="LOCAL-00024" summary="Added success message to README.md">
+      <created>1644211906031</created>
+      <option name="number" value="00024" />
+      <option name="presentableId" value="LOCAL-00024" />
+      <option name="project" value="LOCAL" />
+      <updated>1644211906031</updated>
+    </task>
+    <task id="LOCAL-00025" summary="Added success message to README.md">
+      <created>1644211945638</created>
+      <option name="number" value="00025" />
+      <option name="presentableId" value="LOCAL-00025" />
+      <option name="project" value="LOCAL" />
+      <updated>1644211945638</updated>
+    </task>
+    <task id="LOCAL-00026" summary="Added success message to README.md">
+      <created>1644212106845</created>
+      <option name="number" value="00026" />
+      <option name="presentableId" value="LOCAL-00026" />
+      <option name="project" value="LOCAL" />
+      <updated>1644212106845</updated>
+    </task>
+    <task id="LOCAL-00027" summary="Updated Resume">
+      <created>1644213874703</created>
+      <option name="number" value="00027" />
+      <option name="presentableId" value="LOCAL-00027" />
+      <option name="project" value="LOCAL" />
+      <updated>1644213874703</updated>
+    </task>
+    <task id="LOCAL-00028" summary="Updated Resume">
+      <created>1644213947548</created>
+      <option name="number" value="00028" />
+      <option name="presentableId" value="LOCAL-00028" />
+      <option name="project" value="LOCAL" />
+      <updated>1644213947548</updated>
+    </task>
+    <task id="LOCAL-00029" summary="Added link to caseyClicker on google play.">
+      <created>1644214450300</created>
+      <option name="number" value="00029" />
+      <option name="presentableId" value="LOCAL-00029" />
+      <option name="project" value="LOCAL" />
+      <updated>1644214450301</updated>
+    </task>
+    <task id="LOCAL-00030" summary="Updating README.md to see if pivitol tracker updates.">
+      <created>1644358480282</created>
+      <option name="number" value="00030" />
+      <option name="presentableId" value="LOCAL-00030" />
+      <option name="project" value="LOCAL" />
+      <updated>1644358480282</updated>
+    </task>
+    <task id="LOCAL-00031" summary="Add a success message to README.md [(Finishes) #181195656]">
+      <created>1644359241644</created>
+      <option name="number" value="00031" />
+      <option name="presentableId" value="LOCAL-00031" />
+      <option name="project" value="LOCAL" />
+      <updated>1644359241644</updated>
+    </task>
+    <task id="LOCAL-00032" summary="remove success message">
+      <created>1644359345138</created>
+      <option name="number" value="00032" />
+      <option name="presentableId" value="LOCAL-00032" />
+      <option name="project" value="LOCAL" />
+      <updated>1644359345138</updated>
+    </task>
+    <task id="LOCAL-00033" summary="Added success to README.md [(Finishes) #181195918]">
+      <created>1644359488447</created>
+      <option name="number" value="00033" />
+      <option name="presentableId" value="LOCAL-00033" />
+      <option name="project" value="LOCAL" />
+      <updated>1644359488447</updated>
+    </task>
+    <task id="LOCAL-00034" summary="Created Color Picker Page">
+      <created>1644506031829</created>
+      <option name="number" value="00034" />
+      <option name="presentableId" value="LOCAL-00034" />
+      <option name="project" value="LOCAL" />
+      <updated>1644506031829</updated>
+    </task>
+    <task id="LOCAL-00035" summary="Creating basic color picker design. [#181211877]">
+      <created>1644512483098</created>
+      <option name="number" value="00035" />
+      <option name="presentableId" value="LOCAL-00035" />
+      <option name="project" value="LOCAL" />
+      <updated>1644512483098</updated>
+    </task>
+    <task id="LOCAL-00036" summary="Testing JS for color picker to read pixels and apply pixel color to background. [#181211889]">
+      <created>1644513574399</created>
+      <option name="number" value="00036" />
+      <option name="presentableId" value="LOCAL-00036" />
+      <option name="project" value="LOCAL" />
+      <updated>1644513574399</updated>
+    </task>
+    <task id="LOCAL-00037" summary="Add links to Pivotal Tracker and GitHub [#181211877]">
+      <created>1644514586559</created>
+      <option name="number" value="00037" />
+      <option name="presentableId" value="LOCAL-00037" />
+      <option name="project" value="LOCAL" />
+      <updated>1644514586559</updated>
+    </task>
+    <task id="LOCAL-00038" summary="Design the Color Picker Layout. 1 hour. [#181211877]">
+      <created>1644514971547</created>
+      <option name="number" value="00038" />
+      <option name="presentableId" value="LOCAL-00038" />
+      <option name="project" value="LOCAL" />
+      <updated>1644514971547</updated>
+    </task>
+    <task id="LOCAL-00039" summary="JS for color picker only showing black after click.  [#181211889]">
+      <created>1644517611620</created>
+      <option name="number" value="00039" />
+      <option name="presentableId" value="LOCAL-00039" />
+      <option name="project" value="LOCAL" />
+      <updated>1644517611620</updated>
+    </task>
+    <task id="LOCAL-00040" summary="JS for color picker only showing black after click. 2 hours. [#181211889]">
+      <created>1644517644867</created>
+      <option name="number" value="00040" />
+      <option name="presentableId" value="LOCAL-00040" />
+      <option name="project" value="LOCAL" />
+      <updated>1644517644867</updated>
+    </task>
+    <task id="LOCAL-00041" summary="JS for color picker only showing black after click. 2 hours. [#181211889]">
+      <created>1644518383760</created>
+      <option name="number" value="00041" />
+      <option name="presentableId" value="LOCAL-00041" />
+      <option name="project" value="LOCAL" />
+      <updated>1644518383760</updated>
+    </task>
+    <task id="LOCAL-00042" summary="Continued Color Picker Layout. 2 hours.[#181211877]">
+      <created>1644548323072</created>
+      <option name="number" value="00042" />
+      <option name="presentableId" value="LOCAL-00042" />
+      <option name="project" value="LOCAL" />
+      <updated>1644548323072</updated>
+    </task>
+    <task id="LOCAL-00043" summary="remove phone number, spam">
+      <created>1644548603582</created>
+      <option name="number" value="00043" />
+      <option name="presentableId" value="LOCAL-00043" />
+      <option name="project" value="LOCAL" />
+      <updated>1644548603582</updated>
+    </task>
+    <task id="LOCAL-00044" summary="Making progress to implement RBG value conversion to pybl. [#181211906]">
+      <created>1644594457229</created>
+      <option name="number" value="00044" />
+      <option name="presentableId" value="LOCAL-00044" />
+      <option name="project" value="LOCAL" />
+      <updated>1644594457229</updated>
+    </task>
+    <task id="LOCAL-00045" summary="Making progress to implement RBG value conversion to pybl.&#10; JS now takes input from user. 3 hours total. [#181211906]">
+      <created>1644810347439</created>
+      <option name="number" value="00045" />
+      <option name="presentableId" value="LOCAL-00045" />
+      <option name="project" value="LOCAL" />
+      <updated>1644810347439</updated>
+    </task>
+    <task id="LOCAL-00046" summary="Creating a triangle canvas rather than default rectangle. [#181211877]">
+      <created>1644812797495</created>
+      <option name="number" value="00046" />
+      <option name="presentableId" value="LOCAL-00046" />
+      <option name="project" value="LOCAL" />
+      <updated>1644812797495</updated>
+    </task>
+    <task id="LOCAL-00047" summary="working on rgb conversion still.  [#181211906]">
+      <created>1644855313258</created>
+      <option name="number" value="00047" />
+      <option name="presentableId" value="LOCAL-00047" />
+      <option name="project" value="LOCAL" />
+      <updated>1644855313258</updated>
+    </task>
+    <task id="LOCAL-00048" summary="working on rgb conversion still. 3 hours. IMO un-functional math. [#181211906]">
+      <created>1644856110246</created>
+      <option name="number" value="00048" />
+      <option name="presentableId" value="LOCAL-00048" />
+      <option name="project" value="LOCAL" />
+      <updated>1644856110246</updated>
+    </task>
+    <task id="LOCAL-00049" summary="working on rgb conversion still. 3 hours. IMO un-functional math. [#181211906]">
+      <created>1644857187609</created>
+      <option name="number" value="00049" />
+      <option name="presentableId" value="LOCAL-00049" />
+      <option name="project" value="LOCAL" />
+      <updated>1644857187609</updated>
+    </task>
+    <task id="LOCAL-00050" summary="working on rgb conversion still. 3 hours. IMO un-functional math. [#181211906]">
+      <created>1644857580438</created>
+      <option name="number" value="00050" />
+      <option name="presentableId" value="LOCAL-00050" />
+      <option name="project" value="LOCAL" />
+      <updated>1644857580438</updated>
+    </task>
+    <task id="LOCAL-00051" summary="RBG to PYBL working. 4 hours total. [#181211906]">
+      <created>1644860776564</created>
+      <option name="number" value="00051" />
+      <option name="presentableId" value="LOCAL-00051" />
+      <option name="project" value="LOCAL" />
+      <updated>1644860776564</updated>
+    </task>
+    <task id="LOCAL-00052" summary="RBG to PYBL working. 4 hours total. Only shows the first decimal place. [#181211906]">
+      <created>1644862024858</created>
+      <option name="number" value="00052" />
+      <option name="presentableId" value="LOCAL-00052" />
+      <option name="project" value="LOCAL" />
+      <updated>1644862024858</updated>
+    </task>
+    <task id="LOCAL-00053" summary="RBG to PYBL working. 4 hours total. Only shows the first decimal place. [#181211906]">
+      <created>1644862330350</created>
+      <option name="number" value="00053" />
+      <option name="presentableId" value="LOCAL-00053" />
+      <option name="project" value="LOCAL" />
+      <updated>1644862330350</updated>
+    </task>
+    <task id="LOCAL-00054" summary="Updated Resume">
+      <created>1654105346751</created>
+      <option name="number" value="00054" />
+      <option name="presentableId" value="LOCAL-00054" />
+      <option name="project" value="LOCAL" />
+      <updated>1654105346752</updated>
+    </task>
+    <task id="LOCAL-00055" summary="Updated Resume">
+      <created>1654107815768</created>
+      <option name="number" value="00055" />
+      <option name="presentableId" value="LOCAL-00055" />
+      <option name="project" value="LOCAL" />
+      <updated>1654107815768</updated>
+    </task>
+    <task id="LOCAL-00056" summary="adding page for test resources">
+      <created>1657226208139</created>
+      <option name="number" value="00056" />
+      <option name="presentableId" value="LOCAL-00056" />
+      <option name="project" value="LOCAL" />
+      <updated>1657226208139</updated>
+    </task>
+    <option name="localTasksCounter" value="57" />
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+  <component name="Vcs.Log.Tabs.Properties">
+    <option name="TAB_STATES">
+      <map>
+        <entry key="MAIN">
+          <value>
+            <State>
+              <option name="FILTERS">
+                <map>
+                  <entry key="branch">
+                    <value>
+                      <list>
+                        <option value="master" />
+                      </list>
+                    </value>
+                  </entry>
+                </map>
+              </option>
+            </State>
+          </value>
+        </entry>
+      </map>
+    </option>
+  </component>
+  <component name="VcsManagerConfiguration">
+    <option name="ADD_EXTERNAL_FILES_SILENTLY" value="true" />
+    <MESSAGE value="restructured test file to have index.html" />
+    <MESSAGE value="Added success message to README.md" />
+    <MESSAGE value="Added link to caseyClicker on google play." />
+    <MESSAGE value="Updating README.md to see if pivitol tracker updates." />
+    <MESSAGE value="Add a success message to README.md [(Finishes) #181195656]" />
+    <MESSAGE value="remove success message" />
+    <MESSAGE value="Added success to README.md [(Finishes) #181195918]" />
+    <MESSAGE value="Created Color Picker Page" />
+    <MESSAGE value="Creating basic color picker design. [#181211877]" />
+    <MESSAGE value="Testing JS for color picker to read pixels and apply pixel color to background. [#181211889]" />
+    <MESSAGE value="Add links to Pivotal Tracker and GitHub [#181211877]" />
+    <MESSAGE value="Design the Color Picker Layout. 1 hour. [#181211877]" />
+    <MESSAGE value="JS for color picker only showing black after click.  [#181211889]" />
+    <MESSAGE value="JS for color picker only showing black after click. 2 hours. [#181211889]" />
+    <MESSAGE value="Continued Color Picker Layout. 2 hours.[#181211877]" />
+    <MESSAGE value="remove phone number, spam" />
+    <MESSAGE value="Making progress to implement RBG value conversion to pybl. [#181211906]" />
+    <MESSAGE value="Making progress to implement RBG value conversion to pybl.&#10; JS now takes input from user. 3 hours total. [#181211906]" />
+    <MESSAGE value="Creating a triangle canvas rather than default rectangle. [#181211877]" />
+    <MESSAGE value="working on rgb conversion still.  [#181211906]" />
+    <MESSAGE value="working on rgb conversion still. 3 hours. IMO un-functional math. [#181211906]" />
+    <MESSAGE value="RBG to PYBL working. 4 hours total. [#181211906]" />
+    <MESSAGE value="RBG to PYBL working. 4 hours total. Only shows the first decimal place. [#181211906]" />
+    <MESSAGE value="Updated Resume" />
+    <MESSAGE value="adding page for test resources" />
+    <option name="LAST_COMMIT_MESSAGE" value="adding page for test resources" />
+  </component>
+</project>
