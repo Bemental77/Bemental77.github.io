@@ -98,8 +98,9 @@ int pcsx_init(const char *isofilename)
     strcpy(Config.Cdr, "Disabled");
     strcpy(Config.Pad1, "./libDFInput.so");
     strcpy(Config.Pad2, "./libDFInput.so");
-    strcpy(Config.Bios, "HLE");
-    Config.HLE = TRUE;
+    strcpy(Config.BiosDir, "/bios");
+    strcpy(Config.Bios, "ps-41a.bin");
+    Config.HLE = FALSE;
 
     // create & load default memcards if they don't exist
     CreateMemcard("card1.mcd", Config.Mcd1);

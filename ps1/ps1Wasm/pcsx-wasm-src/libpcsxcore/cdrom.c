@@ -150,7 +150,6 @@ static void ReadTrack() {
 #define DiskError	5
 
 void AddIrqQueue(unsigned char irq, unsigned long ecycle) {
-	{ static u32 _n=0; _n++; if (_n < 30) SysPrintf("[DIAG-CDR] AddIrqQueue #%u irq=%02x ecycle=%lu stat_was=%02x\n", _n, irq, ecycle, cdr.Stat); }
 	cdr.Irq = irq;
 	if (cdr.Stat) {
 		cdr.eCycle = ecycle;
@@ -162,7 +161,6 @@ void AddIrqQueue(unsigned char irq, unsigned long ecycle) {
 void cdrInterrupt() {
 	int i;
 	unsigned char Irq = cdr.Irq;
-	{ static u32 _n=0; _n++; if (_n < 50) SysPrintf("[DIAG-CDR] cdrInterrupt #%u irq=%02x stat=%02x cmd=%02x\n", _n, cdr.Irq, cdr.Stat, cdr.Cmd); }
 
 	if (cdr.Stat) {
 		CDR_INT(0x1000);
@@ -597,7 +595,6 @@ void cdrInterrupt() {
 
 void cdrReadInterrupt() {
 	u8 *buf;
-	{ static u32 _n=0; _n++; if (_n < 20 || (_n & 0xff)==0) SysPrintf("[DIAG-CDR] cdrReadInterrupt #%u reading=%d stat=%02x\n", _n, cdr.Reading, cdr.Stat); }
 
 	if (!cdr.Reading)
 		return;
@@ -749,7 +746,6 @@ unsigned char cdrRead1(void) {
 
 void cdrWrite1(unsigned char rt) {
 	int i;
-	SysPrintf("[DIAG-CDR] cdrWrite1 cmd=%02x ctrl=%02x paramC=%d\n", rt, cdr.Ctrl, cdr.ParamC);
 
 #ifdef CDR_LOG
 	CDR_LOG("cdrWrite1() Log: CD1 write: %x (%s)\n", rt, CmdName[rt]);

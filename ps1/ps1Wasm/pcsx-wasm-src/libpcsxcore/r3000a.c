@@ -79,7 +79,6 @@ void psxShutdown() {
 }
 
 void psxException(u32 code, u32 bd) {
-	{ static u32 _n=0; _n++; if (_n < 10 || (_n & 0x7f)==0) SysPrintf("[DIAG-EXC] #%u code=%08x epc=%08x istat=%08x imask=%08x\n", _n, code, psxRegs.pc, psxHu32(0x1070), psxHu32(0x1074)); }
 	// Set the Cause
 	psxRegs.CP0.n.Cause = code;
 
@@ -112,64 +111,6 @@ void psxException(u32 code, u32 bd) {
 }
 
 void psxBranchTest() {
-	/* DIAG: PC range sampling each call, heartbeat every ~5M cycles */
-	{
-		static u32 _diag_last_cycle = 0;
-		static u32 _diag_last_pc = 0;
-		static int _diag_stuck_count = 0;
-		static u32 _diag_pc_min = 0xffffffff;
-		static u32 _diag_pc_max = 0;
-		static u32 _diag_last_ra = 0;
-		/* sample PC range */
-		if (psxRegs.pc < _diag_pc_min) _diag_pc_min = psxRegs.pc;
-		if (psxRegs.pc > _diag_pc_max) _diag_pc_max = psxRegs.pc;
-		if (psxRegs.GPR.n.ra != _diag_last_ra) _diag_last_ra = psxRegs.GPR.n.ra;
-		u32 _diag_delta = psxRegs.cycle - _diag_last_cycle;
-		if (_diag_delta >= 5000000) {
-			if (psxRegs.pc == _diag_last_pc) _diag_stuck_count++;
-			else _diag_stuck_count = 0;
-			SysPrintf("[DIAG] pc=%08x ra=%08x cyc=%u dc=%u intr=%08x IMSK=%08x ISTT=%08x SR=%08x stuck=%d pcrng=%08x..%08x\n",
-				psxRegs.pc, psxRegs.GPR.n.ra, psxRegs.cycle, _diag_delta, psxRegs.interrupt,
-				psxHu32(0x1074), psxHu32(0x1070), psxRegs.CP0.n.Status, _diag_stuck_count,
-				_diag_pc_min, _diag_pc_max);
-			_diag_pc_min = 0xffffffff;
-			_diag_pc_max = 0;
-			/* re-fire dump every 20 stuck heartbeats so it stays in the rolling console */
-			if (_diag_stuck_count >= 2 && (_diag_stuck_count % 20) == 0 && (psxRegs.pc & 0xffe00000) == 0x80000000) {
-				u32 ra = psxRegs.GPR.n.ra;
-				u32 pc = psxRegs.pc;
-				SysPrintf("[DIAG-CODE] pc-16 @%08x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-					pc - 16, PSXMu32(pc - 16), PSXMu32(pc - 12), PSXMu32(pc - 8), PSXMu32(pc - 4),
-					PSXMu32(pc), PSXMu32(pc + 4), PSXMu32(pc + 8), PSXMu32(pc + 12));
-				if ((ra & 0xffe00000) == 0x80000000) {
-					/* Dump the full range 0x8008e500..0x8008e660 (thread entry + retry loop) */
-					u32 base = ra & ~0xff;  /* page-align back to show whole area */
-					int k;
-					for (k = 0; k < 0x180; k += 32) {
-						SysPrintf("[DIAG-CODE] @%08x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-							base + k,
-							PSXMu32(base + k), PSXMu32(base + k + 4),
-							PSXMu32(base + k + 8), PSXMu32(base + k + 12),
-							PSXMu32(base + k + 16), PSXMu32(base + k + 20),
-							PSXMu32(base + k + 24), PSXMu32(base + k + 28));
-					}
-					/* Dump the stub area at pc */
-					u32 pbase = pc & ~0x1f;
-					for (k = 0; k < 0x40; k += 32) {
-						SysPrintf("[DIAG-CODE] stub @%08x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-							pbase + k,
-							PSXMu32(pbase + k), PSXMu32(pbase + k + 4),
-							PSXMu32(pbase + k + 8), PSXMu32(pbase + k + 12),
-							PSXMu32(pbase + k + 16), PSXMu32(pbase + k + 20),
-							PSXMu32(pbase + k + 24), PSXMu32(pbase + k + 28));
-					}
-				}
-			}
-			_diag_last_cycle = psxRegs.cycle;
-			_diag_last_pc = psxRegs.pc;
-		}
-	}
-
 	if ((psxRegs.cycle - psxNextsCounter) >= psxNextCounter)
 		psxRcntUpdate();
 

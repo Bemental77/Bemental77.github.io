@@ -297,7 +297,6 @@ void psxRcntUpdate()
             DoGPUUpdate=1;
             GPU_vBlank( 0 );
             setIrq( 0x01 );
-            { static u32 _vb=0; _vb++; if (_vb < 5 || (_vb % 300)==0) SysPrintf("[DIAG-VB] vblank irq #%u\n", _vb); }
 #else
 
             GPU_vBlank( 0 );

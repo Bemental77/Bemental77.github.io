@@ -31,7 +31,6 @@ static void hleDummy() {
 
 static void hleA0() {
 	u32 call = psxRegs.GPR.n.t1 & 0xff;
-	{ static u32 _n=0; _n++; if (_n < 200) SysPrintf("[DIAG-BIOS] A0(%02x) impl=%d ra=%08x a0=%08x a1=%08x\n", call, biosA0[call]!=0, psxRegs.GPR.n.ra, psxRegs.GPR.n.a0, psxRegs.GPR.n.a1); }
 
 	if (biosA0[call]) biosA0[call]();
 
@@ -40,15 +39,6 @@ static void hleA0() {
 
 static void hleB0() {
 	u32 call = psxRegs.GPR.n.t1 & 0xff;
-	{
-		static u32 _n=0;
-		// B0(17) = ReturnFromException — fires every vblank, spam
-		if (call != 0x17) {
-			_n++;
-			if (_n < 400) SysPrintf("[DIAG-BIOS] B0(%02x) impl=%d ra=%08x a0=%08x a1=%08x a2=%08x a3=%08x\n",
-				call, biosB0[call]!=0, psxRegs.GPR.n.ra, psxRegs.GPR.n.a0, psxRegs.GPR.n.a1, psxRegs.GPR.n.a2, psxRegs.GPR.n.a3);
-		}
-	}
 
 	if (biosB0[call]) biosB0[call]();
 
@@ -57,7 +47,6 @@ static void hleB0() {
 
 static void hleC0() {
 	u32 call = psxRegs.GPR.n.t1 & 0xff;
-	{ static u32 _n=0; _n++; if (_n < 200) SysPrintf("[DIAG-BIOS] C0(%02x) impl=%d ra=%08x a0=%08x a1=%08x\n", call, biosC0[call]!=0, psxRegs.GPR.n.ra, psxRegs.GPR.n.a0, psxRegs.GPR.n.a1); }
 
 	if (biosC0[call]) biosC0[call]();
 

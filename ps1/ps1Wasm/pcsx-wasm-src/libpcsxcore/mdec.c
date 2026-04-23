@@ -504,7 +504,6 @@ void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 	int blk[DSIZE2 * 6];
 	unsigned short *image;
 	int size;
-	static u32 _diag_dma1_count = 0;
 
 #ifdef CDR_LOG
 	CDR_LOG("DMA1 %08x %08x %08x (cmd = %08x)\n", adr, bcr, chcr, mdec.reg0);
@@ -513,10 +512,6 @@ void psxDma1(u32 adr, u32 bcr, u32 chcr) {
 	if (chcr != 0x01000200) return;
 
 	size = (bcr >> 16) * (bcr & 0xffff);
-	if ((_diag_dma1_count++ & 0x3f) == 0) {
-		SysPrintf("[DIAG-MDEC] psxDma1 #%u size=%d cmd=%08x rgb24=%d\n",
-			_diag_dma1_count, size, mdec.reg0, (mdec.reg0 & MDEC0_RGB24) ? 1 : 0);
-	}
 
 	image = (u16 *)PSXM(adr);
 
