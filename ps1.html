@@ -860,6 +860,65 @@
     wireDpad();
   }
 
+  // ─── Gamepad / Bluetooth controller support ──────────────────────
+  // Standard-mapping pads (Xbox / DualShock / most BT controllers) go
+  // through the same synthetic-KeyboardEvent pipeline as the on-screen
+  // buttons, so the worker sees them identically to a key press.
+  var GP_BUTTON_KEYS = {
+    0: KEYMAP.cross,    1: KEYMAP.circle,
+    2: KEYMAP.square,   3: KEYMAP.triangle,
+    4: KEYMAP.l1,       5: KEYMAP.r1,
+    6: KEYMAP.l2,       7: KEYMAP.r2,
+    8: KEYMAP.select,   9: KEYMAP.start,
+    12: KEYMAP.up,      13: KEYMAP.down,
+    14: KEYMAP.left,    15: KEYMAP.right
+  };
+  var gpPressed = {};
+  var gpPolling = false;
+  var GP_AXIS_DEAD = 0.35;
+
+  function gpEdge(id, keyLabel, pressed) {
+    if (pressed && !gpPressed[id]) {
+      dispatchKey('keydown', keyLabel); gpPressed[id] = true;
+    } else if (!pressed && gpPressed[id]) {
+      dispatchKey('keyup', keyLabel); gpPressed[id] = false;
+    }
+  }
+
+  function pollGamepads() {
+    var pads = (navigator.getGamepads && navigator.getGamepads()) || [];
+    for (var i = 0; i < pads.length; i++) {
+      var gp = pads[i];
+      if (!gp) continue;
+      var btns = gp.buttons || [];
+      for (var b in GP_BUTTON_KEYS) {
+        var bi = +b, key = GP_BUTTON_KEYS[b];
+        gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed));
+      }
+      var ax = gp.axes || [];
+      var axX = ax[0] || 0, axY = ax[1] || 0;
+      gpEdge(i + ':axL', KEYMAP.left,  axX < -GP_AXIS_DEAD);
+      gpEdge(i + ':axR', KEYMAP.right, axX >  GP_AXIS_DEAD);
+      gpEdge(i + ':axU', KEYMAP.up,    axY < -GP_AXIS_DEAD);
+      gpEdge(i + ':axD', KEYMAP.down,  axY >  GP_AXIS_DEAD);
+    }
+    requestAnimationFrame(pollGamepads);
+  }
+
+  window.addEventListener('gamepadconnected', function (e) {
+    setStatus('Controller connected: ' + e.gamepad.id);
+    if (!gpPolling) { gpPolling = true; requestAnimationFrame(pollGamepads); }
+  });
+  window.addEventListener('gamepaddisconnected', function () {
+    setStatus('Controller disconnected');
+  });
+  // Safari + some mobile browsers won't fire gamepadconnected until a
+  // button is pressed, so we poll unconditionally once the page loads.
+  if (navigator.getGamepads) {
+    gpPolling = true;
+    requestAnimationFrame(pollGamepads);
+  }
+
   // ─── Landscape / portrait handling for mobile ─────────────────────
   function checkOrientation() {
     if (!isMobile) return;
