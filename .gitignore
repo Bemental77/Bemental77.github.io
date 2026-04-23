@@ -18,3 +18,7 @@ node_modules
 n64db.sqlite
 sample.sqlite
 .claude
+
+# Reference upstream PCSX-wasm checkout (not used by deployed site)
+ps1/ps1Wasm/wasmpsx-repo
+
