@@ -7,3 +7,12 @@
 *.n64 filter=lfs diff=lfs merge=lfs -text
 *.z64 filter=lfs diff=lfs merge=lfs -text
 *.v64 filter=lfs diff=lfs merge=lfs -text
+
+# PS1 emulator binaries are small (<1 MB each) and must be served as real
+# content by GitHub Pages (which does not resolve LFS pointers). Override
+# the *.wasm / *.bin LFS rules for these specific paths.
+ps1/ps1Wasm/dist/*.wasm              filter= diff= merge= -text
+ps1/ps1Wasm/dist/*.bin               filter= diff= merge= -text
+ps1/ps1Wasm/pcsx-wasm-src/*.wasm     filter= diff= merge= -text
+ps1/ps1Wasm/pcsx-wasm-src/*.bin      filter= diff= merge= -text
+ps1/ps1Wasm/pcsx-wasm-src/docs/*.wasm filter= diff= merge= -text
