@@ -1,7 +1,7 @@
 CC=emcc
-CFLAGS= -O3 -Wno-unused-result -s USE_ZLIB=1 -s USE_SDL=1 \
+CFLAGS= -O3 -flto -fno-exceptions -DNDEBUG -Wno-unused-result -s USE_ZLIB=1 -s USE_SDL=1 \
 -D USESDLSOUND -I./include -I./libpcsxcore
-LDFLAGS=
+LDFLAGS= -flto
 
 # WORKER
 WORKER_EXPORT=_main,_pcsx_init,_one_iter,_get_ptr,_ls
