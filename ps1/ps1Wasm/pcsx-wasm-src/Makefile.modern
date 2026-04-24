@@ -19,7 +19,9 @@ plugins/dfsound/spu.o plugins/dfsound/cfg.o  plugins/dfsound/dma.o plugins/dfsou
 plugins/sdlinput/cfg.o     plugins/sdlinput/pad_worker.o plugins/sdlinput/analog.o
 WORKER_FLAGS= --post-js js/worker_funcs.js \
   --preload-file ps-41a.bin@/bios/ps-41a.bin \
-  -s INITIAL_MEMORY=419430400 \
+  -s INITIAL_MEMORY=67108864 \
+  -s ALLOW_MEMORY_GROWTH=1 \
+  -s MAXIMUM_MEMORY=268435456 \
   -s EXPORTED_RUNTIME_METHODS=cwrap,ccall,getValue,setValue,HEAPU8,HEAP32,HEAPU32,FS \
   -s EXPORTED_FUNCTIONS=$(WORKER_EXPORT)
 
