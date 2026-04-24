@@ -280,6 +280,27 @@
       font-size: 18px; text-align: center; z-index: 3000;
       padding: 40px;
     }
+
+    /* Mobile splash — ROM picker + Start, shown before gameplay */
+    #mobileSplash {
+      display: none;
+      position: absolute; inset: 0;
+      flex-direction: column; align-items: center; justify-content: center;
+      gap: 16px; padding: 24px; z-index: 2000; color: #eee;
+      background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%);
+      text-align: center;
+    }
+    #mobileSplash h3 { margin: 0 0 4px; font-size: 22px; }
+    #mobileSplash label { font-size: 14px; opacity: 0.8; }
+    #mobileSplash select, #mobileSplash button {
+      font-size: 16px; padding: 12px 20px; min-width: 240px;
+      border-radius: 8px; border: 1px solid #444;
+      background: #222; color: #fff; -webkit-appearance: none;
+    }
+    #mobileSplash button#mobileStart {
+      background: #2a6b4a; border-color: #2a6b4a; cursor: pointer;
+    }
+    #mobileSplash .rotateTip { font-size: 12px; opacity: 0.55; margin-top: 8px; }
   </style>
 </head>
 <body>
@@ -309,6 +330,13 @@
 
 <!-- ═══ MOBILE LANDSCAPE SHELL ═════════════════════════════════════ -->
 <div id="mobileShell">
+  <div id="mobileSplash">
+    <h3>PS1 Wasm</h3>
+    <label for="mobileRomSelect">Choose a game</label>
+    <select id="mobileRomSelect"></select>
+    <button id="mobileStart" type="button">Start</button>
+    <p class="rotateTip">Rotate to landscape for the best view.</p>
+  </div>
   <div id="mobileScreen"><!-- canvas moves here on mobile --></div>
 
   <div class="mobileSide left">
@@ -408,20 +436,29 @@
   // ─── DOM refs ─────────────────────────────────────────────────────
   const $ = id => document.getElementById(id);
 
-  // Populate the ROM selector and remember last choice
+  // Populate the ROM selector(s) and remember last choice. There's a
+  // desktop #romSelect and a mobile-splash #mobileRomSelect; both mirror
+  // the same persisted index so whichever the user sees works.
   (function populateRomSelect() {
-    var sel = $('romSelect');
-    if (!sel) return;
-    ROMS.forEach(function (r, i) {
-      var opt = document.createElement('option');
-      opt.value = String(i);
-      opt.textContent = r.label;
-      sel.appendChild(opt);
+    var selects = [$('romSelect'), $('mobileRomSelect')].filter(Boolean);
+    if (!selects.length) return;
+    selects.forEach(function (sel) {
+      ROMS.forEach(function (r, i) {
+        var opt = document.createElement('option');
+        opt.value = String(i);
+        opt.textContent = r.label;
+        sel.appendChild(opt);
+      });
     });
     var saved = localStorage.getItem('ps1wasm_romIdx');
-    if (saved !== null && saved >= 0 && saved < ROMS.length) sel.value = saved;
-    sel.addEventListener('change', function () {
-      localStorage.setItem('ps1wasm_romIdx', sel.value);
+    if (saved !== null && saved >= 0 && saved < ROMS.length) {
+      selects.forEach(function (s) { s.value = saved; });
+    }
+    selects.forEach(function (sel) {
+      sel.addEventListener('change', function () {
+        localStorage.setItem('ps1wasm_romIdx', sel.value);
+        selects.forEach(function (s) { if (s !== sel) s.value = sel.value; });
+      });
     });
   })();
   const logEl = $('log'), statusEl = $('status'), fpsEl = $('fps'), toastEl = $('toast');
@@ -920,10 +957,13 @@
   }
 
   // ─── Landscape / portrait handling for mobile ─────────────────────
+  // Only nag about rotation AFTER the user has actually started the game —
+  // before then the splash is orientation-agnostic.
   function checkOrientation() {
     if (!isMobile) return;
     var landscape = window.innerWidth > window.innerHeight;
-    $('rotateHint').style.display = landscape ? 'none' : 'flex';
+    var show = started && !landscape;
+    $('rotateHint').style.display = show ? 'flex' : 'none';
   }
   window.addEventListener('resize',            checkOrientation);
   window.addEventListener('orientationchange', checkOrientation);
@@ -937,18 +977,20 @@
     c.style.height = '';
     $('mobileScreen').appendChild(c);
     $('mobileShell').style.display = 'block';
+    $('mobileSplash').style.display = 'flex';
     wireMobileControls();
     checkOrientation();
-    // Mobile needs its own Start trigger — tap the screen area to start
-    var tapped = false;
-    $('mobileScreen').addEventListener('touchstart', function () {
-      if (tapped) return;
-      tapped = true;
+    // Splash Start button commits the ROM choice to the shared select,
+    // hides the splash, and boots the runtime exactly like desktop Start.
+    $('mobileStart').addEventListener('click', function () {
+      var mSel = $('mobileRomSelect');
+      var dSel = $('romSelect');
+      if (mSel && dSel) dSel.value = mSel.value;
+      $('mobileSplash').style.display = 'none';
       startEmulator();
-    }, { once: false, passive: true });
-    // Also keep the desktop Start button accessible via menu
-    // (first tap on screen starts it)
-    setStatus('Tap the screen to start.');
+      checkOrientation();
+    });
+    setStatus('Pick a game and tap Start.');
   }
 
   // ─── Prevent iOS double-tap zoom on controls ──────────────────────
