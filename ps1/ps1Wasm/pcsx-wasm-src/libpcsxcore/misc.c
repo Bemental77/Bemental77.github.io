@@ -487,7 +487,6 @@ static const char PcsxHeader[32] = "STv4 PCSX v" PACKAGE_VERSION;
 // If you make changes to the savestate version, please increment the value below.
 static const u32 SaveVersion = 0x8b410004;
 
-#if 0 // remove 
 int SaveState(const char *file) {
 	gzFile f;
 	GPUFreeze_t *gpufP;
@@ -621,6 +620,7 @@ int CheckState(const char *file) {
 	return 0;
 }
 
+#if 0 // disabled: NET_* symbols undefined in this build
 // NET Function Helpers
 
 int SendPcsxInfo() {

@@ -195,6 +195,30 @@ var main_onmessage = function (event) {
 
 			break;
 
+		case "saveState":
+			try {
+				Module.ccall('SaveState', 'number', ['string'], ['/tmp/state']);
+				var savedBytes = Module.FS.readFile('/tmp/state');
+				postMessage({ cmd: 'stateSaved', heap: savedBytes.buffer }, [savedBytes.buffer]);
+			} catch (e) {
+				cout_print('saveState failed: ' + e);
+				postMessage({ cmd: 'stateSaved', heap: new ArrayBuffer(0) });
+			}
+			break;
+
+		case "loadState":
+			try {
+				var loadBytes = new Uint8Array(data.heap);
+				try { Module.FS.unlink('/tmp/state'); } catch (e) {}
+				Module.FS.writeFile('/tmp/state', loadBytes);
+				Module.ccall('LoadState', 'number', ['string'], ['/tmp/state']);
+				postMessage({ cmd: 'stateLoaded' });
+			} catch (e) {
+				cout_print('loadState failed: ' + e);
+				postMessage({ cmd: 'stateLoaded' });
+			}
+			break;
+
 		default:
 			postMessage({
 				cmd: "print",

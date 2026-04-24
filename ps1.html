@@ -4,1004 +4,283 @@
   <meta charset="UTF-8" />
   <title>PS1 Wasm — Monster Rancher 2</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <link rel="icon" href="data:,">
+  <link rel="icon" href=",">
   <script src="/coi-serviceworker.js"></script>
   <style>
-    html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd;
-                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { overflow: hidden; }
-
-    /* ─── DESKTOP LAYOUT ─────────────────────────────────────────────── */
-    #desktop {
-      display: flex; flex-direction: column; align-items: center;
-      padding: 12px; gap: 8px; height: 100vh; box-sizing: border-box;
-    }
+    #desktop { display: flex; flex-direction: column; align-items: center; padding: 12px; gap: 8px; height: 100vh; box-sizing: border-box; }
     #title { margin: 0; font-size: 18px; letter-spacing: 1px; color: #aaa; }
-    #controlBar {
-      display: flex; gap: 8px; flex-wrap: wrap; justify-content: center;
-    }
-    #controlBar button {
-      padding: 8px 14px; border: 1px solid #444; background: #222; color: #eee;
-      border-radius: 4px; cursor: pointer; font-size: 14px;
-      min-width: 44px; min-height: 36px;
-    }
+    #controlBar { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+    #controlBar button { padding: 8px 14px; border: 1px solid #444; background: #222; color: #eee; border-radius: 4px; cursor: pointer; font-size: 14px; min-width: 44px; min-height: 36px; }
     #controlBar button:hover:not(:disabled) { background: #333; }
     #controlBar button:disabled { opacity: 0.4; cursor: not-allowed; }
-    #controlBar select {
-      padding: 8px 10px; border: 1px solid #444; background: #222; color: #eee;
-      border-radius: 4px; font-size: 14px; min-height: 36px;
-    }
-
-    #canvasWrap {
-      background: #000; display: flex; align-items: center; justify-content: center;
-      flex: 1; width: 100%; max-width: 100vw;
-    }
-    #canvas {
-      background: #000;
-      image-rendering: pixelated;
-      /* Crop ~5% off the bottom to hide NTSC overscan garbage. */
-      clip-path: inset(0 0 5.14% 0);
-      width: 640px; height: 480px;
-      max-width: 100%; max-height: 100%;
-    }
-
-    /* Fullscreen: canvas expands to fill viewport, 4:3 letterboxed only if needed */
-    #canvasWrap:fullscreen,
-    #canvasWrap:-webkit-full-screen {
-      width: 100vw; height: 100vh;
-      max-width: none; max-height: none;
-      display: flex; align-items: center; justify-content: center;
-    }
-    #canvasWrap:fullscreen #canvas,
-    #canvasWrap:-webkit-full-screen #canvas {
-      width: auto; height: 100vh;
-      max-width: 100vw; max-height: 100vh;
-      /* 4:3 letterbox: if viewport is wider than 4:3, height drives; if narrower, width drives */
-    }
-    /* When viewport is wider than 4:3, prefer width-driven sizing */
-    @media (min-aspect-ratio: 4/3) {
-      #canvasWrap:fullscreen #canvas,
-      #canvasWrap:-webkit-full-screen #canvas {
-        width: calc(100vh * 4 / 3);
-      }
-    }
-    @media (max-aspect-ratio: 4/3) {
-      #canvasWrap:fullscreen #canvas,
-      #canvasWrap:-webkit-full-screen #canvas {
-        width: 100vw;
-        height: calc(100vw * 3 / 4);
-      }
-    }
-
-    /* Mobile shell fullscreen — screen fills, controls stay overlayed */
-    #mobileShell:fullscreen,
-    #mobileShell:-webkit-full-screen {
-      width: 100vw; height: 100vh;
-    }
-    #statusBar {
-      display: flex; gap: 16px; font-size: 12px; color: #888;
-      font-family: monospace;
-    }
-    #log {
-      display: none;
-      height: 140px; width: 100%; max-width: 820px;
-      overflow: auto; border: 1px solid #333; padding: 4px;
-      font-size: 11px; background: #0a0a0a; color: #bbb;
-      white-space: pre-wrap; user-select: text; -webkit-user-select: text;
-    }
-
-    /* ─── MOBILE LANDSCAPE SHELL ─────────────────────────────────────── */
-    #mobileShell {
-      display: none;
-      position: fixed; inset: 0;
-      background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%);
-      z-index: 1000;
-      user-select: none; -webkit-user-select: none; touch-action: none;
-      overflow: hidden;
-    }
-    /* Screen area fills center; controls overlay left/right */
-    #mobileScreen {
-      position: absolute; inset: 0;
-      display: flex; align-items: center; justify-content: center;
-      background: #000;
-    }
-    #mobileScreen canvas {
-      image-rendering: pixelated;
-      max-width: 100%; max-height: 100%;
-      width: auto; height: 100%;
-      clip-path: inset(0 0 5.14% 0);
-    }
-
-    /* Left and right control strips sit on top of the screen area */
-    .mobileSide {
-      position: absolute; top: 0; bottom: 0;
-      width: 34vw; max-width: 220px;
-      display: flex; flex-direction: column;
-      padding: 12px 10px;
-      box-sizing: border-box;
-      pointer-events: none; /* only children receive touches */
-    }
+    #controlBar select { padding: 8px 10px; border: 1px solid #444; background: #222; color: #eee; border-radius: 4px; font-size: 14px; min-height: 36px; }
+    #canvasWrap { background: #000; display: flex; align-items: center; justify-content: center; flex: 1; width: 100%; max-width: 100vw; }
+    #canvas { background: #000; image-rendering: pixelated; clip-path: inset(0 0 5.14% 0); width: 640px; height: 480px; max-width: 100%; max-height: 100%; }
+    #canvasWrap:fullscreen, #canvasWrap:-webkit-full-screen { width: 100vw; height: 100vh; max-width: none; max-height: none; display: flex; align-items: center; justify-content: center; }
+    #canvasWrap:fullscreen #canvas, #canvasWrap:-webkit-full-screen #canvas { width: auto; height: 100vh; max-width: 100vw; max-height: 100vh; }
+    @media (min-aspect-ratio: 4/3) { #canvasWrap:fullscreen #canvas, #canvasWrap:-webkit-full-screen #canvas { width: calc(100vh * 4 / 3); } }
+    @media (max-aspect-ratio: 4/3) { #canvasWrap:fullscreen #canvas, #canvasWrap:-webkit-full-screen #canvas { width: 100vw; height: calc(100vw * 3 / 4); } }
+    #mobileShell:fullscreen, #mobileShell:-webkit-full-screen { width: 100vw; height: 100vh; }
+    #statusBar { display: flex; gap: 16px; font-size: 12px; color: #888; font-family: monospace; }
+    #log { display: none; height: 140px; min-height: 80px; max-height: 50vh; width: 100%; max-width: 820px; overflow: auto; border: 1px solid #333; padding: 4px; font-size: 11px; background: #0a0a0a; color: #bbb; white-space: pre-wrap; user-select: text; -webkit-user-select: text; resize: vertical; position: relative; }
+    #log::after { content: "⋮"; position: absolute; bottom: 2px; right: 4px; color: #555; font-size: 10px; pointer-events: none; }
+    #mobileShell { display: none; position: fixed; inset: 0; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); z-index: 1000; user-select: none; -webkit-user-select: none; touch-action: none; overflow: hidden; }
+    #mobileScreen { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: #000; }
+    #mobileScreen canvas { image-rendering: pixelated; max-width: 100%; max-height: 100%; width: auto; height: 100%; clip-path: inset(0 0 5.14% 0); }
+    .mobileSide { position: absolute; top: 0; bottom: 0; width: 34vw; max-width: 220px; display: flex; flex-direction: column; padding: 12px 10px; box-sizing: border-box; pointer-events: none; }
     .mobileSide > * { pointer-events: auto; }
     .mobileSide.left  { left: 0; background: linear-gradient(90deg, rgba(0,0,0,0.55), rgba(0,0,0,0)); }
     .mobileSide.right { right: 0; background: linear-gradient(270deg, rgba(0,0,0,0.55), rgba(0,0,0,0)); }
-
-    /* Shoulder pair (stacked vertically, L2 on top of L1) */
-    .shoulderStack {
-      display: flex; flex-direction: column; gap: 8px;
-      align-items: center;
-    }
-    .shoulderBtn {
-      width: 80%; height: 38px;
-      border-radius: 8px;
-      background: linear-gradient(180deg, #4a4a4a 0%, #2a2a2a 100%);
-      border: 1px solid #555;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 13px; font-weight: 700; color: #ddd;
-      letter-spacing: 1px;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.12);
-      -webkit-tap-highlight-color: transparent;
-    }
+    .shoulderStack { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+    .shoulderBtn { width: 80%; height: 38px; border-radius: 8px; background: linear-gradient(180deg, #4a4a4a 0%, #2a2a2a 100%); border: 1px solid #555; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; color: #ddd; letter-spacing: 1px; box-shadow: 0 2px 4px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.12); -webkit-tap-highlight-color: transparent; }
     .shoulderBtn.held { filter: brightness(0.65); }
-
-    /* D-pad disc */
-    .dpadWrap {
-      flex: 1;
-      display: flex; align-items: center; justify-content: center;
-    }
-    .dpadDisc {
-      width: min(32vh, 180px);
-      height: min(32vh, 180px);
-      border-radius: 50%;
-      background: radial-gradient(circle at 40% 35%, #555 0%, #2a2a2a 60%, #1a1a1a 100%);
-      border: 2px solid #333;
-      box-shadow: inset 0 2px 4px rgba(255,255,255,0.2), 0 6px 12px rgba(0,0,0,0.6);
-      position: relative;
-    }
-    .dpadV, .dpadH {
-      position: absolute;
-      background: #333;
-      box-shadow: inset 0 1px 3px rgba(0,0,0,0.7);
-      -webkit-tap-highlight-color: transparent;
-    }
+    .dpadWrap { flex: 1; display: flex; align-items: center; justify-content: center; }
+    .dpadDisc { width: min(32vh, 180px); height: min(32vh, 180px); border-radius: 50%; background: radial-gradient(circle at 40% 35%, #555 0%, #2a2a2a 60%, #1a1a1a 100%); border: 2px solid #333; box-shadow: inset 0 2px 4px rgba(255,255,255,0.2), 0 6px 12px rgba(0,0,0,0.6); position: relative; }
+    .dpadV, .dpadH { position: absolute; background: #333; box-shadow: inset 0 1px 3px rgba(0,0,0,0.7); -webkit-tap-highlight-color: transparent; }
     .dpadV { width: 30%; height: 90%; top: 5%; left: 35%; border-radius: 6px; }
     .dpadH { width: 90%; height: 30%; top: 35%; left: 5%; border-radius: 6px; }
     .dpadV.held, .dpadH.held { filter: brightness(0.65); }
-    .dpadCenter {
-      position: absolute; width: 30%; height: 30%; top: 35%; left: 35%;
-      background: #1a1a1a; border-radius: 4px; pointer-events: none; z-index: 3;
-    }
+    .dpadCenter { position: absolute; width: 30%; height: 30%; top: 35%; left: 35%; background: #1a1a1a; border-radius: 4px; pointer-events: none; z-index: 3; }
     .arr { position: absolute; pointer-events: none; }
     .arr-up    { top: 6%;  left: 50%; transform: translateX(-50%); border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 9px solid #888; }
     .arr-down  { bottom: 6%; left: 50%; transform: translateX(-50%); border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 9px solid #888; }
     .arr-left  { left: 6%;  top: 50%; transform: translateY(-50%); border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-right: 9px solid #888; }
     .arr-right { right: 6%; top: 50%; transform: translateY(-50%); border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-left: 9px solid #888; }
-
-    /* Face-button diamond */
-    .faceWrap {
-      flex: 1;
-      display: flex; align-items: center; justify-content: center;
-    }
-    .faceDiamond {
-      width: min(32vh, 180px);
-      height: min(32vh, 180px);
-      position: relative;
-    }
-    .faceBtn {
-      position: absolute;
-      width: min(12vh, 64px); height: min(12vh, 64px);
-      border-radius: 50%;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 18px; font-weight: 700; color: rgba(255,255,255,0.9);
-      border: 2px solid rgba(0,0,0,0.3);
-      box-shadow: 0 4px 0 rgba(0,0,0,0.5), inset 0 2px 4px rgba(255,255,255,0.25);
-      -webkit-tap-highlight-color: transparent;
-    }
-    .faceBtn.held { transform: translate(var(--tx, 0), calc(var(--ty, 0) + 3px));
-                    box-shadow: 0 1px 0 rgba(0,0,0,0.4), inset 0 1px 3px rgba(0,0,0,0.3); }
-    .btn-triangle { background: radial-gradient(circle at 38% 32%, #44bb66, #116633);
-                    top: 0;   left: 50%; --tx: -50%; --ty: 0; transform: translateX(-50%); }
-    .btn-square   { background: radial-gradient(circle at 38% 32%, #dd88bb, #993377);
-                    top: 50%; left: 0;   --tx: 0; --ty: -50%; transform: translateY(-50%); }
-    .btn-circle   { background: radial-gradient(circle at 38% 32%, #ee5555, #991111);
-                    top: 50%; right: 0;  --tx: 0; --ty: -50%; transform: translateY(-50%); }
-    .btn-cross    { background: radial-gradient(circle at 38% 32%, #5588ee, #1133aa);
-                    bottom: 0; left: 50%; --tx: -50%; --ty: 0; transform: translateX(-50%); }
-
-    /* Bottom center strip: Start / Select / Menu */
-    #mobileBottom {
-      position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%);
-      display: flex; gap: 10px; align-items: center;
-      z-index: 10;
-    }
-    .sysBtn {
-      height: 26px; padding: 0 14px;
-      border-radius: 13px;
-      background: linear-gradient(180deg, #555 0%, #333 100%);
-      border: 1px solid #222;
-      color: #ccc; font-size: 11px; font-weight: 700;
-      letter-spacing: 1px; text-transform: uppercase;
-      display: flex; align-items: center; justify-content: center;
-      -webkit-tap-highlight-color: transparent;
-    }
+    .faceWrap { flex: 1; display: flex; align-items: center; justify-content: center; }
+    .faceDiamond { width: min(32vh, 180px); height: min(32vh, 180px); position: relative; }
+    .faceBtn { position: absolute; width: min(12vh, 64px); height: min(12vh, 64px); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; color: rgba(255,255,255,0.9); border: 2px solid rgba(0,0,0,0.3); box-shadow: 0 4px 0 rgba(0,0,0,0.5), inset 0 2px 4px rgba(255,255,255,0.25); -webkit-tap-highlight-color: transparent; }
+    .faceBtn.held { transform: translate(var(--tx, 0), calc(var(--ty, 0) + 3px)); box-shadow: 0 1px 0 rgba(0,0,0,0.4), inset 0 1px 3px rgba(0,0,0,0.3); }
+    .btn-triangle { background: radial-gradient(circle at 38% 32%, #44bb66, #116633); top: 0;   left: 50%; --tx: -50%; --ty: 0; transform: translateX(-50%); }
+    .btn-square   { background: radial-gradient(circle at 38% 32%, #dd88bb, #993377); top: 50%; left: 0;   --tx: 0; --ty: -50%; transform: translateY(-50%); }
+    .btn-circle   { background: radial-gradient(circle at 38% 32%, #ee5555, #991111); top: 50%; right: 0;  --tx: 0; --ty: -50%; transform: translateY(-50%); }
+    .btn-cross    { background: radial-gradient(circle at 38% 32%, #5588ee, #1133aa); bottom: 0; left: 50%; --tx: -50%; --ty: 0; transform: translateX(-50%); }
+    #mobileBottom { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); display: flex; gap: 10px; align-items: center; z-index: 10; }
+    .sysBtn { height: 26px; padding: 0 14px; border-radius: 13px; background: linear-gradient(180deg, #555 0%, #333 100%); border: 1px solid #222; color: #ccc; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
     .sysBtn.held { filter: brightness(0.6); }
-    .menuBtn {
-      width: 34px; height: 34px; border-radius: 17px;
-      background: linear-gradient(180deg, #777 0%, #444 100%);
-      border: 2px solid #222;
-      color: #fff; font-size: 18px; font-weight: 700;
-      display: flex; align-items: center; justify-content: center;
-      -webkit-tap-highlight-color: transparent;
-    }
-
-    /* Mobile menu overlay */
-    #mobileMenu {
-      display: none;
-      position: fixed; inset: 0;
-      background: rgba(0,0,0,0.8);
-      z-index: 2000;
-      align-items: center; justify-content: center;
-    }
+    .menuBtn { width: 34px; height: 34px; border-radius: 17px; background: linear-gradient(180deg, #777 0%, #444 100%); border: 2px solid #222; color: #fff; font-size: 18px; font-weight: 700; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
+    #mobileMenu { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 2000; align-items: center; justify-content: center; }
     #mobileMenu.open { display: flex; }
-    #mobileMenuBox {
-      background: #222; color: #eee;
-      border-radius: 10px; padding: 20px;
-      min-width: 240px; text-align: center;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.7);
-    }
-    #mobileMenuBox h6 {
-      margin: 0 0 14px; font-size: 12px;
-      text-transform: uppercase; letter-spacing: 2px; color: #888;
-    }
-    #mobileMenuBox button {
-      display: block; width: 100%; margin-bottom: 8px;
-      padding: 10px; border: 1px solid #444; background: #2c2c2c;
-      color: #eee; border-radius: 6px; font-size: 14px; cursor: pointer;
-    }
+    #mobileMenuBox { background: #222; color: #eee; border-radius: 10px; padding: 20px; min-width: 240px; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.7); }
+    #mobileMenuBox h6 { margin: 0 0 14px; font-size: 12px; text-transform: uppercase; letter-spacing: 2px; color: #888; }
+    #mobileMenuBox button { display: block; width: 100%; margin-bottom: 8px; padding: 10px; border: 1px solid #444; background: #2c2c2c; color: #eee; border-radius: 6px; font-size: 14px; cursor: pointer; }
     #mobileMenuBox button:last-child { margin-bottom: 0; }
     #mobileMenuBox button:disabled { opacity: 0.4; }
-
-    /* Toast notifications */
-    #toast {
-      position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
-      padding: 10px 18px; border-radius: 6px;
-      background: rgba(0,0,0,0.85); color: #fff; font-size: 13px;
-      z-index: 9999; opacity: 0; transition: opacity 0.2s;
-      pointer-events: none; max-width: 90vw;
-    }
+    #toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); padding: 10px 18px; border-radius: 6px; background: rgba(0,0,0,0.85); color: #fff; font-size: 13px; z-index: 9999; opacity: 0; transition: opacity 0.2s; pointer-events: none; max-width: 90vw; }
     #toast.show { opacity: 1; }
     #toast.err { background: rgba(170, 40, 40, 0.95); }
-
-    /* Rotate-device hint for portrait mobile */
-    #rotateHint {
-      display: none;
-      position: fixed; inset: 0;
-      background: #111; color: #eee;
-      align-items: center; justify-content: center;
-      font-size: 18px; text-align: center; z-index: 3000;
-      padding: 40px;
-    }
-
-    /* Mobile splash — ROM picker + Start, shown before gameplay */
-    #mobileSplash {
-      display: none;
-      position: absolute; inset: 0;
-      flex-direction: column; align-items: center; justify-content: center;
-      gap: 16px; padding: 24px; z-index: 2000; color: #eee;
-      background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%);
-      text-align: center;
-    }
+    #rotateHint { display: none; position: fixed; inset: 0; background: #111; color: #eee; align-items: center; justify-content: center; font-size: 18px; text-align: center; z-index: 3000; padding: 40px; }
+    #mobileSplash { display: none; position: absolute; inset: 0; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 24px; z-index: 2000; color: #eee; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); text-align: center; }
     #mobileSplash h3 { margin: 0 0 4px; font-size: 22px; }
     #mobileSplash label { font-size: 14px; opacity: 0.8; }
-    #mobileSplash select, #mobileSplash button {
-      font-size: 16px; padding: 12px 20px; min-width: 240px;
-      border-radius: 8px; border: 1px solid #444;
-      background: #222; color: #fff; -webkit-appearance: none;
-    }
-    #mobileSplash button#mobileStart {
-      background: #2a6b4a; border-color: #2a6b4a; cursor: pointer;
-    }
+    #mobileSplash select, #mobileSplash button { font-size: 16px; padding: 12px 20px; min-width: 240px; border-radius: 8px; border: 1px solid #444; background: #222; color: #fff; -webkit-appearance: none; }
+    #mobileSplash button#mobileSplashStart { background: #2a6b4a; border-color: #2a6b4a; cursor: pointer; z-index: 3000; position: relative; }
     #mobileSplash .rotateTip { font-size: 12px; opacity: 0.55; margin-top: 8px; }
+    #mobileStatus { position: absolute; top: 10px; width: 100%; text-align: center; color: #888; z-index: 3000; font-size: 12px; }
   </style>
 </head>
 <body>
-
-<!-- ═══ DESKTOP UI ═══════════════════════════════════════════════════ -->
 <div id="desktop">
   <h3 id="title">PS1 Wasm</h3>
   <div id="controlBar">
     <select id="romSelect"></select>
     <button id="btnStart">Start</button>
-    <button id="btnSave"  disabled>Save State</button>
-    <button id="btnLoad"  disabled>Load State</button>
-    <button id="btnMute"  disabled>🔊 Mute</button>
+    <button id="btnSave" disabled>Save State</button>
+    <button id="btnLoad" disabled>Load State</button>
+    <button id="btnMute" disabled>🔊 Mute</button>
     <button id="btnResetAudio" disabled>↻ Reset Audio</button>
-    <button id="btnFull"  disabled>⛶ Fullscreen</button>
-    <button id="btnLog"   type="button">Toggle Log</button>
+    <button id="btnFull" disabled>⛶ Fullscreen</button>
+    <button id="btnLog" type="button">Toggle Log</button>
   </div>
-  <div id="canvasWrap">
-    <canvas id="canvas" width="640" height="480"></canvas>
-  </div>
-  <div id="statusBar">
-    <span id="status">Idle.</span>
-    <span id="fps"></span>
-  </div>
+  <div id="canvasWrap"><canvas id="canvas" width="640" height="480"></canvas></div>
+  <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
   <pre id="log" tabindex="0"></pre>
 </div>
-
-<!-- ═══ MOBILE LANDSCAPE SHELL ═════════════════════════════════════ -->
 <div id="mobileShell">
+  <div id="mobileStatus"></div>
   <div id="mobileSplash">
     <h3>PS1 Wasm</h3>
     <label for="mobileRomSelect">Choose a game</label>
     <select id="mobileRomSelect"></select>
-    <button id="mobileStart" type="button">Start</button>
+    <button id="mobileSplashStart" type="button">Start</button>
     <p class="rotateTip">Rotate to landscape for the best view.</p>
   </div>
-  <div id="mobileScreen"><!-- canvas moves here on mobile --></div>
-
+  <div id="mobileScreen"></div>
   <div class="mobileSide left">
-    <div class="shoulderStack">
-      <div class="shoulderBtn" id="mobileL2">L2</div>
-      <div class="shoulderBtn" id="mobileL1">L1</div>
-    </div>
+    <div class="shoulderStack"><div class="shoulderBtn" id="mobileL2">L2</div><div class="shoulderBtn" id="mobileL1">L1</div></div>
     <div class="dpadWrap">
       <div class="dpadDisc">
-        <div class="dpadV" id="mobileDpadV"></div>
-        <div class="dpadH" id="mobileDpadH"></div>
-        <div class="dpadCenter"></div>
-        <div class="arr arr-up"></div>
-        <div class="arr arr-down"></div>
-        <div class="arr arr-left"></div>
-        <div class="arr arr-right"></div>
+        <div class="dpadV" id="mobileDpadV"></div><div class="dpadH" id="mobileDpadH"></div><div class="dpadCenter"></div>
+        <div class="arr arr-up"></div><div class="arr arr-down"></div><div class="arr arr-left"></div><div class="arr arr-right"></div>
       </div>
     </div>
   </div>
-
   <div class="mobileSide right">
-    <div class="shoulderStack">
-      <div class="shoulderBtn" id="mobileR2">R2</div>
-      <div class="shoulderBtn" id="mobileR1">R1</div>
-    </div>
+    <div class="shoulderStack"><div class="shoulderBtn" id="mobileR2">R2</div><div class="shoulderBtn" id="mobileR1">R1</div></div>
     <div class="faceWrap">
       <div class="faceDiamond">
-        <div class="faceBtn btn-triangle" id="mobileTriangle">&#9651;</div>
-        <div class="faceBtn btn-square"   id="mobileSquare">&#9633;</div>
-        <div class="faceBtn btn-circle"   id="mobileCircle">&#9675;</div>
-        <div class="faceBtn btn-cross"    id="mobileCross">&#10005;</div>
+        <div class="faceBtn btn-triangle" id="mobileTriangle">&#9651;</div><div class="faceBtn btn-square" id="mobileSquare">&#9633;</div>
+        <div class="faceBtn btn-circle" id="mobileCircle">&#9675;</div><div class="faceBtn btn-cross" id="mobileCross">&#10005;</div>
       </div>
     </div>
   </div>
-
   <div id="mobileBottom">
     <div class="sysBtn" id="mobileSelect">Select</div>
     <div class="menuBtn" id="mobileMenuBtn">≡</div>
     <div class="sysBtn" id="mobileStart">Start</div>
   </div>
 </div>
-
 <div id="mobileMenu">
   <div id="mobileMenuBox">
     <h6>Menu</h6>
-    <button id="mSave"  disabled>Save State</button>
-    <button id="mLoad"  disabled>Load State</button>
-    <button id="mMute"  disabled>Mute</button>
-    <button id="mResetAudio" disabled>Reset Audio</button>
-    <button id="mFull"  disabled>Fullscreen</button>
-    <button id="mClose">Close</button>
+    <button id="mSave" disabled>Save State</button><button id="mLoad" disabled>Load State</button>
+    <button id="mMute" disabled>Mute</button><button id="mResetAudio" disabled>Reset Audio</button>
+    <button id="mFull" disabled>Fullscreen</button><button id="mClose">Close</button>
   </div>
 </div>
-
 <div id="rotateHint">Rotate your device to landscape to play.</div>
 <div id="toast"></div>
-
 <script>
-/* ═══════════════════════════════════════════════════════════════════
-   PS1 WASM — boot, worker wiring, UI
-   Based on the working ps1test.html pattern (LLVM trio).
-   ═══════════════════════════════════════════════════════════════════ */
-
 (function () {
   'use strict';
-
-  // Each ROM: label shown in picker, base filename, and chunk-suffix range (inclusive).
-  // Chunk URL is `${ROM_ROOT}${base}.bin.part${suffix}` for each suffix in [from..to].
   const ROM_ROOT = '/ps1/ps1Wasm/roms/';
-  // Chunks from `split -a 2` have suffixes aa..az. `chunkRange('X', 'f')` → aa..af.
-  function chunkRange(base, lastLetter) {
-    var urls = [];
-    for (var i = 'a'.charCodeAt(0); i <= lastLetter.charCodeAt(0); i++) {
-      urls.push(ROM_ROOT + base + '.bin.parta' + String.fromCharCode(i));
-    }
-    return urls;
-  }
+  function chunkRange(base, lastLetter) { var urls = []; for (var i = 'a'.charCodeAt(0); i <= lastLetter.charCodeAt(0); i++) { urls.push(ROM_ROOT + base + '.bin.parta' + String.fromCharCode(i)); } return urls; }
   const ROMS = [
-    { label: 'Monster Rancher 2',          base: 'MonsterRancher2',     chunks: chunkRange('MonsterRancher2',     'f') },
-    { label: 'Metal Gear Solid (Disc 1)',  base: 'MetalGearSolidDisc1', chunks: chunkRange('MetalGearSolidDisc1', 'h') },
-    { label: 'Metal Gear Solid (Disc 2)',  base: 'MetalGearSolidDisc2', chunks: chunkRange('MetalGearSolidDisc2', 'i') }
+    { label: 'Monster Rancher 2', base: 'MonsterRancher2', chunks: chunkRange('MonsterRancher2', 'f') },
+    { label: 'Metal Gear Solid (Disc 1)', base: 'MetalGearSolidDisc1', chunks: chunkRange('MetalGearSolidDisc1', 'h') },
+    { label: 'Metal Gear Solid (Disc 2)', base: 'MetalGearSolidDisc2', chunks: chunkRange('MetalGearSolidDisc2', 'i') }
   ];
-  // The active ROM is chosen in the selector, set at Start time.
-  var ROM_NAME = ROMS[0].base;
-  var ROM_CHUNKS = ROMS[0].chunks;
-
-  // Default keymap — SDL1 reads these via document keyboard events.
-  // Keep in sync with pcsx-wasm-src defaults.
-  const KEYMAP = {
-    up:    'ArrowUp',    down:  'ArrowDown',
-    left:  'ArrowLeft',  right: 'ArrowRight',
-    cross: 'x',  circle: 's',  square: 'z',  triangle: 'a',
-    l1:    'q',  r1:     'w',  l2:     'e',  r2:     'r',
-    start: 'Enter',      select: 'Shift'
-  };
-
-  // ─── DOM refs ─────────────────────────────────────────────────────
+  var ROM_NAME = ROMS[0].base, ROM_CHUNKS = ROMS[0].chunks;
+  const KEYMAP = { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', cross: 'x', circle: 's', square: 'z', triangle: 'a', l1: 'q', r1: 'w', l2: 'e', r2: 'r', start: 'Enter', select: 'Shift' };
   const $ = id => document.getElementById(id);
-
-  // Populate the ROM selector(s) and remember last choice. There's a
-  // desktop #romSelect and a mobile-splash #mobileRomSelect; both mirror
-  // the same persisted index so whichever the user sees works.
   (function populateRomSelect() {
-    var selects = [$('romSelect'), $('mobileRomSelect')].filter(Boolean);
-    if (!selects.length) return;
-    selects.forEach(function (sel) {
-      ROMS.forEach(function (r, i) {
-        var opt = document.createElement('option');
-        opt.value = String(i);
-        opt.textContent = r.label;
-        sel.appendChild(opt);
-      });
-    });
-    var saved = localStorage.getItem('ps1wasm_romIdx');
-    if (saved !== null && saved >= 0 && saved < ROMS.length) {
-      selects.forEach(function (s) { s.value = saved; });
-    }
-    selects.forEach(function (sel) {
-      sel.addEventListener('change', function () {
-        localStorage.setItem('ps1wasm_romIdx', sel.value);
-        selects.forEach(function (s) { if (s !== sel) s.value = sel.value; });
-      });
-    });
+    var selects = [$('romSelect'), $('mobileRomSelect')].filter(Boolean); if (!selects.length) return;
+    selects.forEach(function (sel) { ROMS.forEach(function (r, i) { var opt = document.createElement('option'); opt.value = String(i); opt.textContent = r.label; sel.appendChild(opt); }); });
+    var saved = localStorage.getItem('ps1wasm_romIdx'); if (saved !== null && saved >= 0 && saved < ROMS.length) { selects.forEach(function (s) { s.value = saved; }); }
+    selects.forEach(function (sel) { sel.addEventListener('change', function () { localStorage.setItem('ps1wasm_romIdx', sel.value); selects.forEach(function (s) { if (s !== sel) s.value = sel.value; }); }); });
   })();
-  const logEl = $('log'), statusEl = $('status'), fpsEl = $('fps'), toastEl = $('toast');
-
-  function pageLog(s) {
-    if (logEl) { logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; }
-    console.log(s);
-  }
-  function setStatus(t) { if (statusEl) statusEl.textContent = t; }
-  function toast(msg, isErr) {
-    toastEl.textContent = msg;
-    toastEl.classList.toggle('err', !!isErr);
-    toastEl.classList.add('show');
-    clearTimeout(toast._t);
-    toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200);
-  }
-
-  // ─── Mobile detection ─────────────────────────────────────────────
-  const isMobile = (() => {
-    const ua = navigator.userAgent.toLowerCase();
-    return /iphone|ipad|ipod|android|mobile/.test(ua) || window.innerWidth < 720;
-  })();
-
-  // ─── Module setup — must be global before pcsx_ww.js loads ────────
+  const logEl = $('log'), statusEl = $('status'), mobileStatusEl = $('mobileStatus'), fpsEl = $('fps'), toastEl = $('toast');
+  function pageLog(s) { if (logEl) { logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; } console.log(s); }
+  function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
+  function toast(msg, isErr) { toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200); }
+  const isMobile = (() => { const ua = navigator.userAgent.toLowerCase(); return /iphone|ipad|ipod|android|mobile|xbox/.test(ua) || ('ontouchstart' in window) || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile'); })();
   var do_iter = true;
-  var Module = window.Module = {
-    preRun: [], postRun: [],
-    locateFile: f => '/ps1/ps1Wasm/dist/' + f,
-    print:    t => pageLog(String(t)),
-    printErr: t => pageLog('[err] ' + String(t)),
-    canvas: $('canvas'),
-    setStatus: setStatus,
-    totalDependencies: 0,
-    monitorRunDependencies: () => {}
-  };
-
-  // ─── SDL surface hooks (verbatim from ps1test.html / kxkx5150) ────
+  var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/ps1/ps1Wasm/dist/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: $('canvas'), setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {} };
   var img_data32;
-  window.my_SDL_LockSurface = function (surf) {
-    var s = Module.SDL.surfaces[surf];
-    s.locked++;
-    if (s.locked > 1) return 0;
-    if (!s.buffer) {
-      s.buffer = Module._malloc(s.width * s.height * 4);
-      Module.HEAP32[(surf + 20) >> 2] = s.buffer;
-    }
-    Module.HEAP32[(surf + 20) >> 2] = s.buffer;
-    if (!s.image) s.image = s.ctx.getImageData(0, 0, s.width, s.height);
-    return 0;
-  };
-  window.my_SDL_UnlockSurface = function (surf) {
-    var s = Module.SDL.surfaces[surf];
-    if (!s.locked || --s.locked > 0) return;
-    var src = s.buffer >> 2;
-    if (!img_data32) img_data32 = new Uint32Array(s.image.data.buffer);
-    img_data32.set(Module.HEAP32.subarray(src, src + img_data32.length));
-    s.ctx.putImageData(s.image, 0, 0);
-  };
+  window.my_SDL_LockSurface = function (surf) { var s = Module.SDL.surfaces[surf]; s.locked++; if (s.locked > 1) return 0; if (!s.buffer) { s.buffer = Module._malloc(s.width * s.height * 4); Module.HEAP32[(surf + 20) >> 2] = s.buffer; } Module.HEAP32[(surf + 20) >> 2] = s.buffer; if (!s.image) s.image = s.ctx.getImageData(0, 0, s.width, s.height); return 0; };
+  window.my_SDL_UnlockSurface = function (surf) { var s = Module.SDL.surfaces[surf]; if (!s.locked || --s.locked > 0) return; var src = s.buffer >> 2; if (!img_data32) img_data32 = new Uint32Array(s.image.data.buffer); img_data32.set(Module.HEAP32.subarray(src, src + img_data32.length)); s.ctx.putImageData(s.image, 0, 0); };
+  var padStatus1, padStatus2, vram_ptr; window.cout_print = t => pageLog(String(t)); var pcsx_worker = null; var SoundFeedStreamData; var states_arrs = []; var audioMuted = false; var audioDraining = false; var pendingSaveResolve = null; var pendingLoadResolve = null;
+  function getAudioCtx() { try { return (Module && Module.preCreatedAudioContext) || (Module && Module.SDL && Module.SDL.audioContext) || null; } catch (e) { return null; } }
+  function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } }
+  document.addEventListener('click', resumeAudio); document.addEventListener('keydown', resumeAudio); document.addEventListener('visibilitychange', resumeAudio);
+  window.var_setup = function () { pageLog('[ui] var_setup — spawning worker'); SoundFeedStreamData = Module.cwrap('SoundFeedStreamData', 'null', ['number', 'number']); vram_ptr = Module._get_ptr(0); padStatus1 = Module._get_ptr(1); padStatus2 = Module._get_ptr(2); Module.SDL.defaults.copyOnLock = false; Module.SDL.defaults.opaqueFrontBuffer = false; pcsx_worker = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?v=' + Date.now()); pcsx_worker.onmessage = onWorkerMsg; window.pcsx_worker = pcsx_worker; setStatus('Runtime ready. Fetching ROM...'); fetchRomAndBoot(); };
 
-  // ─── Worker bridge ────────────────────────────────────────────────
-  var padStatus1, padStatus2, vram_ptr;
-  window.cout_print = t => pageLog(String(t));
-  var pcsx_worker = null;
-  var SoundFeedStreamData;
-  var states_arrs = [];
-  var audioMuted = false;
-  var audioDraining = false;
+  var mobilePadState = { cross: false, circle: false, square: false, triangle: false, l1: false, r1: false, l2: false, r2: false, start: false, select: false, up: false, down: false, left: false, right: false };
 
-  // Save-state callbacks — resolved when worker replies
-  var pendingSaveResolve = null;
-  var pendingLoadResolve = null;
-
-  // ─── Audio context ────────────────────────────────────────────────
-  function getAudioCtx() {
-    try {
-      return (Module && Module.preCreatedAudioContext) ||
-             (Module && Module.SDL && Module.SDL.audioContext) || null;
-    } catch (e) { return null; }
+  function updatePadState() {
+    if (!padStatus1) return;
+    var b0 = Module.HEAPU8[padStatus1];
+    var b1 = Module.HEAPU8[padStatus1 + 1];
+    if (mobilePadState.select) b0 &= ~(1 << 0); if (mobilePadState.start) b0 &= ~(1 << 3);
+    if (mobilePadState.up) b0 &= ~(1 << 4); if (mobilePadState.right) b0 &= ~(1 << 5);
+    if (mobilePadState.down) b0 &= ~(1 << 6); if (mobilePadState.left) b0 &= ~(1 << 7);
+    if (mobilePadState.l2) b1 &= ~(1 << 0); if (mobilePadState.r2) b1 &= ~(1 << 1);
+    if (mobilePadState.l1) b1 &= ~(1 << 2); if (mobilePadState.r1) b1 &= ~(1 << 3);
+    if (mobilePadState.triangle) b1 &= ~(1 << 4); if (mobilePadState.circle) b1 &= ~(1 << 5);
+    if (mobilePadState.cross) b1 &= ~(1 << 6); if (mobilePadState.square) b1 &= ~(1 << 7);
+    Module.HEAPU8[padStatus1] = b0; Module.HEAPU8[padStatus1 + 1] = b1;
   }
-  function resumeAudio() {
-    if (audioMuted) return;
-    var ctx = getAudioCtx();
-    if (ctx && ctx.state === 'suspended') {
-      ctx.resume().catch(() => {});
-    }
+
+  function dispatchKey(type, key) {
+    var keyToPad = { 'ArrowUp': 'up', 'ArrowDown': 'down', 'ArrowLeft': 'left', 'ArrowRight': 'right', 'x': 'cross', 's': 'circle', 'z': 'square', 'a': 'triangle', 'q': 'l1', 'w': 'r1', 'e': 'l2', 'r': 'r2', 'Enter': 'start', 'Shift': 'select' };
+    var padBtn = keyToPad[key];
+    if (padBtn) { mobilePadState[padBtn] = (type === 'keydown'); updatePadState(); }
   }
-  document.addEventListener('click', resumeAudio);
-  document.addEventListener('keydown', resumeAudio);
-  document.addEventListener('visibilitychange', resumeAudio);
 
-  // ─── var_setup — called by pcsx_ww.wasm when runtime is ready ─────
-  window.var_setup = function () {
-    pageLog('[ui] var_setup — spawning worker');
-    SoundFeedStreamData = Module.cwrap('SoundFeedStreamData', 'null', ['number', 'number']);
-    vram_ptr   = Module._get_ptr(0);
-    padStatus1 = Module._get_ptr(1);
-    padStatus2 = Module._get_ptr(2);
-    Module.SDL.defaults.copyOnLock = false;
-    Module.SDL.defaults.opaqueFrontBuffer = false;
-    pcsx_worker = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?v=' + Date.now());
-    pcsx_worker.onmessage = onWorkerMsg;
-    window.pcsx_worker = pcsx_worker;
-    setStatus('Runtime ready. Fetching ROM...');
-    fetchRomAndBoot();
-  };
+  function wireButton(id, key) {
+    var el = $(id); if (!el) return;
+    function press(e) { e.preventDefault(); dispatchKey('keydown', key); el.classList.add('held'); }
+    function release(e) { e.preventDefault(); dispatchKey('keyup', key); el.classList.remove('held'); }
+    el.addEventListener('touchstart', press, { passive: false }); el.addEventListener('touchend', release, { passive: false }); el.addEventListener('touchcancel', release, { passive: false });
+    el.addEventListener('mousedown', press); el.addEventListener('mouseup', release); el.addEventListener('mouseleave', release);
+  }
 
-  // ─── Controller polling ──────────────────────────────────────────
+  function wireDpad() {
+    var v = $('mobileDpadV'), h = $('mobileDpadH'); if (!v || !h) return;
+    var upHeld = false, dnHeld = false, lHeld = false, rHeld = false;
+    function vPress(e) { e.preventDefault(); var rect = v.getBoundingClientRect(); var t = e.touches[0] || e.changedTouches[0];
+      if (t.clientY < rect.top + rect.height / 2) { if (!upHeld) { dispatchKey('keydown', KEYMAP.up); upHeld = true; } if (dnHeld) { dispatchKey('keyup', KEYMAP.down); dnHeld = false; } }
+      else { if (!dnHeld) { dispatchKey('keydown', KEYMAP.down); dnHeld = true; } if (upHeld) { dispatchKey('keyup', KEYMAP.up); upHeld = false; } } v.classList.add('held'); }
+    function vRelease(e) { e.preventDefault(); if (upHeld) { dispatchKey('keyup', KEYMAP.up); upHeld = false; } if (dnHeld) { dispatchKey('keyup', KEYMAP.down); dnHeld = false; } v.classList.remove('held'); }
+    function hPress(e) { e.preventDefault(); var rect = h.getBoundingClientRect(); var t = e.touches[0] || e.changedTouches[0];
+      if (t.clientX < rect.left + rect.width / 2) { if (!lHeld) { dispatchKey('keydown', KEYMAP.left); lHeld = true; } if (rHeld) { dispatchKey('keyup', KEYMAP.right); rHeld = false; } }
+      else { if (!rHeld) { dispatchKey('keydown', KEYMAP.right); rHeld = true; } if (lHeld) { dispatchKey('keyup', KEYMAP.left); lHeld = false; } } h.classList.add('held'); }
+    function hRelease(e) { e.preventDefault(); if (lHeld) { dispatchKey('keyup', KEYMAP.left); lHeld = false; } if (rHeld) { dispatchKey('keyup', KEYMAP.right); rHeld = false; } h.classList.remove('held'); }
+    v.addEventListener('touchstart', vPress, { passive: false }); v.addEventListener('touchend', vRelease, { passive: false }); v.addEventListener('touchcancel', vRelease, { passive: false });
+    h.addEventListener('touchstart', hPress, { passive: false }); h.addEventListener('touchend', hRelease, { passive: false }); h.addEventListener('touchcancel', hRelease, { passive: false });
+    v.addEventListener('mousedown', vPress); v.addEventListener('mouseup', vRelease); v.addEventListener('mouseleave', vRelease);
+    h.addEventListener('mousedown', hPress); h.addEventListener('mouseup', hRelease); h.addEventListener('mouseleave', hRelease);
+  }
+
+  function wireMobileControls() {
+    wireButton('mobileCross', KEYMAP.cross); wireButton('mobileCircle', KEYMAP.circle); wireButton('mobileSquare', KEYMAP.square); wireButton('mobileTriangle', KEYMAP.triangle);
+    wireButton('mobileL1', KEYMAP.l1); wireButton('mobileR1', KEYMAP.r1); wireButton('mobileL2', KEYMAP.l2); wireButton('mobileR2', KEYMAP.r2);
+    wireButton('mobileStart', KEYMAP.start); wireButton('mobileSelect', KEYMAP.select); wireDpad();
+  }
+
   function pollController() {
     if (!pcsx_worker) return;
-    Module._CheckJoy();       // Gamepad API (incl. Bluetooth controllers)
-    Module._CheckKeyboard();  // Keyboard
+    Module._CheckJoy(); Module._CheckKeyboard(); updatePadState();
     var src = Module.HEAPU8.subarray(padStatus1, padStatus1 + 48);
-    var arr;
-    while (states_arrs.length > 50) states_arrs.pop();
-    if (states_arrs.length > 0) { arr = states_arrs.pop(); arr.set(src); }
-    else arr = new Uint8Array(src);
+    var arr; while (states_arrs.length > 50) states_arrs.pop();
+    if (states_arrs.length > 0) { arr = states_arrs.pop(); arr.set(src); } else arr = new Uint8Array(src);
     pcsx_worker.postMessage({ cmd: 'padStatus', states: arr }, [arr.buffer]);
     setTimeout(pollController, 10);
   }
 
-  // ─── FPS counter ──────────────────────────────────────────────────
   var renderFrames = 0, lastFpsLog = performance.now();
-
-  // ─── Worker message dispatch ──────────────────────────────────────
   function onWorkerMsg(e) {
     var data = e.data;
     switch (data.cmd) {
-      case 'print':     pageLog('> ' + data.txt); break;
+      case 'print': pageLog('> ' + data.txt); break;
       case 'setStatus': setStatus(data.txt); break;
-      case 'setUI':     break;
-      case 'render': {
-        var v = data.vram;
-        Module.HEAPU8.set(v, vram_ptr);
-        pcsx_worker.postMessage({ cmd: 'return_vram', vram: v }, [v.buffer]);
-        Module._render(data.x, data.y, data.sx, data.sy, data.dx, data.dy, data.rgb24);
-        renderFrames++;
-        var now = performance.now();
-        if (now - lastFpsLog > 1000) {
-          fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now - lastFpsLog)).toFixed(1);
-          renderFrames = 0;
-          lastFpsLog = now;
-        }
-        break;
-      }
-      case 'return_states':
-        states_arrs.push(data.states);
-        break;
-      case 'SoundFeedStreamData': {
-        if (audioMuted || audioDraining) break;
-        var ps = data.pSound;
-        if (!window._soundScratchPtr) {
-          window._soundScratchPtr = Module._malloc(8192);
-          window._soundScratchSize = 8192;
-        }
-        if (data.lBytes > window._soundScratchSize) {
-          Module._free(window._soundScratchPtr);
-          window._soundScratchSize = data.lBytes;
-          window._soundScratchPtr = Module._malloc(window._soundScratchSize);
-        }
-        Module.HEAPU8.set(ps.subarray(0, data.lBytes), window._soundScratchPtr);
-        SoundFeedStreamData(window._soundScratchPtr, data.lBytes);
-        break;
-      }
-      case 'stateSaved':
-        if (pendingSaveResolve) { pendingSaveResolve(new Uint8Array(data.heap)); pendingSaveResolve = null; }
-        break;
-      case 'stateLoaded':
-        if (pendingLoadResolve) { pendingLoadResolve(); pendingLoadResolve = null; }
-        break;
-      default:
-        pageLog('unknown worker cmd: ' + data.cmd);
+      case 'setUI': break;
+      case 'render': { var v = data.vram; Module.HEAPU8.set(v, vram_ptr); pcsx_worker.postMessage({ cmd: 'return_vram', vram: v }, [v.buffer]); Module._render(data.x, data.y, data.sx, data.sy, data.dx, data.dy, data.rgb24); renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now - lastFpsLog)).toFixed(1); renderFrames = 0; lastFpsLog = now; } break; }
+      case 'return_states': states_arrs.push(data.states); break;
+      case 'SoundFeedStreamData': { if (audioMuted || audioDraining) break; var ps = data.pSound; if (!window._soundScratchPtr) { window._soundScratchPtr = Module._malloc(8192); window._soundScratchSize = 8192; } if (data.lBytes > window._soundScratchSize) { Module._free(window._soundScratchPtr); window._soundScratchSize = data.lBytes; window._soundScratchPtr = Module._malloc(window._soundScratchSize); } Module.HEAPU8.set(ps.subarray(0, data.lBytes), window._soundScratchPtr); SoundFeedStreamData(window._soundScratchPtr, data.lBytes); break; }
+      case 'stateSaved': if (pendingSaveResolve) { pendingSaveResolve(new Uint8Array(data.heap)); pendingSaveResolve = null; } break;
+      case 'stateLoaded': if (pendingLoadResolve) { pendingLoadResolve(); pendingLoadResolve = null; } break;
+      default: pageLog('unknown worker cmd: ' + data.cmd);
     }
   }
 
-  // ─── ROM fetch + worker boot ──────────────────────────────────────
-  async function fetchRomAndBoot() {
-    setStatus('Fetching ROM chunks...');
-    var bufs = [], total = 0;
-    for (var i = 0; i < ROM_CHUNKS.length; i++) {
-      var r = await fetch(ROM_CHUNKS[i]);
-      if (!r.ok) { setStatus('Chunk fetch failed: ' + ROM_CHUNKS[i]); return; }
-      var buf = await r.arrayBuffer();
-      bufs.push(buf); total += buf.byteLength;
-      pageLog('[rom] chunk ' + (i+1) + '/' + ROM_CHUNKS.length + '  (' + (total/1048576).toFixed(1) + ' MB)');
-    }
-    var file = new File([new Blob(bufs)], ROM_NAME + '.bin', { type: 'application/octet-stream' });
-    pageLog('[rom] posting to worker — ' + (total/1048576).toFixed(1) + ' MB');
-    setStatus('Booting emulator...');
-    pcsx_worker.postMessage({ cmd: 'loadfile', file: file });
-    setTimeout(pollController, 10);
-    // Unlock feature buttons
-    [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'),
-     $('mSave'),   $('mLoad'),   $('mMute'),   $('mResetAudio'),   $('mFull')].forEach(b => b && (b.disabled = false));
-  }
-
-  // ─── Start button — lazy-load runtime ─────────────────────────────
-  var started = false;
-  function startEmulator() {
-    if (started) return;
-    started = true;
-    // Commit ROM selection — cannot change after Start (reload to switch)
-    var sel = $('romSelect');
-    if (sel) {
-      var pick = ROMS[+sel.value] || ROMS[0];
-      ROM_NAME = pick.base;
-      ROM_CHUNKS = pick.chunks;
-      SAVE_KEY = ROM_NAME + '.ps1state';
-      sel.disabled = true;
-      pageLog('[ui] selected ROM: ' + pick.label);
-    }
-    $('btnStart').disabled = true;
-    // Create AudioContext during user gesture so it's born "running".
-    try {
-      var AC = window.AudioContext || window.webkitAudioContext;
-      if (AC) {
-        Module.preCreatedAudioContext = new AC();
-        if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume();
-      }
-    } catch (e) {}
-    pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...');
-    setStatus('Loading LLVM runtime...');
-    var s = document.createElement('script');
-    s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now();
-    document.body.appendChild(s);
-  }
+  async function fetchRomAndBoot() { setStatus('Fetching ROM chunks...'); var bufs = [], total = 0; for (var i = 0; i < ROM_CHUNKS.length; i++) { var r = await fetch(ROM_CHUNKS[i]); if (!r.ok) { setStatus('Chunk fetch failed: ' + ROM_CHUNKS[i]); return; } var buf = await r.arrayBuffer(); bufs.push(buf); total += buf.byteLength; pageLog('[rom] chunk ' + (i+1) + '/' + ROM_CHUNKS.length + '  (' + (total/1048576).toFixed(1) + ' MB)'); } var file = new File([new Blob(bufs)], ROM_NAME + '.bin', { type: 'application/octet-stream' }); pageLog('[rom] posting to worker — ' + (total/1048576).toFixed(1) + ' MB'); setStatus('Booting emulator...'); pcsx_worker.postMessage({ cmd: 'loadfile', file: file }); setTimeout(pollController, 10); [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false)); }
+  var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; SAVE_KEY = ROM_NAME + '.ps1state'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...'); setStatus('Loading LLVM runtime...'); var s = document.createElement('script'); s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now(); document.body.appendChild(s); }
   $('btnStart').addEventListener('click', startEmulator);
-
-  // ─── Save / load state via IndexedDB + gzip ───────────────────────
-  const DB_NAME  = 'PS1WASMDB';
-  const STORE    = 'PS1WASMSTATES';
-  var   SAVE_KEY = ROM_NAME + '.ps1state';
-
-  function openDB() {
-    return new Promise((resolve, reject) => {
-      var req = indexedDB.open(DB_NAME);
-      req.onupgradeneeded = e => e.target.result.createObjectStore(STORE);
-      req.onsuccess = e => resolve(e.target.result);
-      req.onerror   = () => reject(req.error);
-    });
-  }
-  async function idbPut(key, val) {
-    var db = await openDB();
-    return new Promise((resolve, reject) => {
-      var t = db.transaction(STORE, 'readwrite').objectStore(STORE).put(val, key);
-      t.onsuccess = () => resolve(); t.onerror = () => reject(t.error);
-    });
-  }
-  async function idbGet(key) {
-    var db = await openDB();
-    return new Promise((resolve, reject) => {
-      var t = db.transaction(STORE, 'readonly').objectStore(STORE).get(key);
-      t.onsuccess = () => resolve(t.result); t.onerror = () => reject(t.error);
-    });
-  }
-  async function gzip(u8) {
-    var cs = new CompressionStream('gzip');
-    var w = cs.writable.getWriter();
-    w.write(u8); w.close();
-    return new Uint8Array(await new Response(cs.readable).arrayBuffer());
-  }
-  async function gunzip(u8) {
-    var ds = new DecompressionStream('gzip');
-    var w = ds.writable.getWriter();
-    w.write(u8); w.close();
-    return new Uint8Array(await new Response(ds.readable).arrayBuffer());
-  }
-
-  async function saveState() {
-    if (!pcsx_worker) return toast('Emulator not ready', true);
-    toast('Saving state…');
-    try {
-      var heap = await new Promise(res => {
-        pendingSaveResolve = res;
-        pcsx_worker.postMessage({ cmd: 'saveState' });
-      });
-      var compressed = await gzip(heap);
-      await idbPut(SAVE_KEY, compressed);
-      toast('Saved (' + (compressed.byteLength / 1048576).toFixed(1) + ' MB)');
-    } catch (e) { toast('Save failed: ' + e.message, true); }
-  }
-  async function loadState() {
-    if (!pcsx_worker) return toast('Emulator not ready', true);
-    try {
-      var stored = await idbGet(SAVE_KEY);
-      if (!stored) return toast('No save state found', true);
-      toast('Restoring…');
-      var heap = await gunzip(stored instanceof Uint8Array ? stored : new Uint8Array(stored));
-      var buf = heap.buffer;
-      await new Promise(res => {
-        pendingLoadResolve = res;
-        pcsx_worker.postMessage({ cmd: 'loadState', heap: buf }, [buf]);
-      });
-      toast('State restored');
-    } catch (e) { toast('Load failed: ' + (e.message || e), true); }
-  }
-
-  // ─── Mute ─────────────────────────────────────────────────────────
-  function toggleMute() {
-    audioMuted = !audioMuted;
-    var ctx = getAudioCtx();
-    if (ctx) { audioMuted ? ctx.suspend() : ctx.resume(); }
-    $('btnMute').textContent = audioMuted ? '🔇 Unmute' : '🔊 Mute';
-    $('mMute').textContent   = audioMuted ? 'Unmute' : 'Mute';
-  }
-
-  // ─── Reset Audio — resync the audio graph when it breaks ──────────
-  // Suspends the AudioContext, drains the worker's sound-stream feed for a
-  // brief window so the SDL queue can empty, then resumes. Fixes the common
-  // case where the producer/consumer drift has built up a persistent gap.
-  async function resetAudio() {
-    var ctx = getAudioCtx();
-    if (!ctx) { toast('Audio not ready', true); return; }
-    if (audioDraining) return;
-    audioDraining = true;
-    toast('Resetting audio…');
-    try { await ctx.suspend(); } catch (e) {}
-    await new Promise(r => setTimeout(r, 150));
-    // Drop any scratch buffer so the next feed starts from a known pointer
-    if (window._soundScratchPtr) {
-      try { Module._free(window._soundScratchPtr); } catch (e) {}
-      window._soundScratchPtr = 0;
-      window._soundScratchSize = 0;
-    }
-    if (!audioMuted) {
-      try { await ctx.resume(); } catch (e) {}
-    }
-    audioDraining = false;
-    toast('Audio reset');
-  }
-
-  // ─── Fullscreen ───────────────────────────────────────────────────
-  function toggleFullscreen() {
-    var el = isMobile ? $('mobileShell') : $('canvasWrap');
-    if (document.fullscreenElement || document.webkitFullscreenElement) {
-      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
-    } else {
-      var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen;
-      if (fn) fn.call(el).catch(() => {});
-    }
-  }
-
-  // ─── Button wiring (desktop) ──────────────────────────────────────
-  $('btnSave').addEventListener('click', saveState);
-  $('btnLoad').addEventListener('click', loadState);
-  $('btnMute').addEventListener('click', toggleMute);
-  $('btnResetAudio').addEventListener('click', resetAudio);
-  $('btnFull').addEventListener('click', toggleFullscreen);
-  $('btnLog').addEventListener('click', () => {
-    logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block';
-  });
-
-  // ─── Mobile menu ──────────────────────────────────────────────────
-  function openMobileMenu()  { $('mobileMenu').classList.add('open'); }
-  function closeMobileMenu() { $('mobileMenu').classList.remove('open'); }
-  $('mobileMenuBtn').addEventListener('click', openMobileMenu);
-  $('mClose').addEventListener('click', closeMobileMenu);
-  $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); });
-  $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); });
-  $('mMute').addEventListener('click', () => { toggleMute(); });
-  $('mResetAudio').addEventListener('click', () => { resetAudio(); closeMobileMenu(); });
-  $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
-
-  // ─── Mobile control wiring (synthetic keyboard events) ────────────
-  function dispatchKey(type, key) {
-    document.dispatchEvent(new KeyboardEvent(type, { key: key, bubbles: true, composed: true }));
-  }
-  function wireButton(id, key) {
-    var el = $(id);
-    if (!el) return;
-    function press(e)   { e.preventDefault(); dispatchKey('keydown', key); el.classList.add('held'); }
-    function release(e) { e.preventDefault(); dispatchKey('keyup',   key); el.classList.remove('held'); }
-    el.addEventListener('touchstart',  press,   { passive: false });
-    el.addEventListener('touchend',    release, { passive: false });
-    el.addEventListener('touchcancel', release, { passive: false });
-  }
-  function wireDpad() {
-    var v = $('mobileDpadV'), h = $('mobileDpadH');
-    if (!v || !h) return;
-    var upHeld = false, dnHeld = false, lHeld = false, rHeld = false;
-    function vPress(e) {
-      e.preventDefault();
-      var rect = v.getBoundingClientRect();
-      var t = e.touches[0] || e.changedTouches[0];
-      if (t.clientY < rect.top + rect.height / 2) {
-        if (!upHeld) { dispatchKey('keydown', KEYMAP.up);   upHeld = true; }
-        if (dnHeld)  { dispatchKey('keyup',   KEYMAP.down); dnHeld = false; }
-      } else {
-        if (!dnHeld) { dispatchKey('keydown', KEYMAP.down); dnHeld = true; }
-        if (upHeld)  { dispatchKey('keyup',   KEYMAP.up);   upHeld = false; }
-      }
-      v.classList.add('held');
-    }
-    function vRelease(e) {
-      e.preventDefault();
-      if (upHeld) { dispatchKey('keyup', KEYMAP.up);   upHeld = false; }
-      if (dnHeld) { dispatchKey('keyup', KEYMAP.down); dnHeld = false; }
-      v.classList.remove('held');
-    }
-    function hPress(e) {
-      e.preventDefault();
-      var rect = h.getBoundingClientRect();
-      var t = e.touches[0] || e.changedTouches[0];
-      if (t.clientX < rect.left + rect.width / 2) {
-        if (!lHeld) { dispatchKey('keydown', KEYMAP.left);  lHeld = true; }
-        if (rHeld)  { dispatchKey('keyup',   KEYMAP.right); rHeld = false; }
-      } else {
-        if (!rHeld) { dispatchKey('keydown', KEYMAP.right); rHeld = true; }
-        if (lHeld)  { dispatchKey('keyup',   KEYMAP.left);  lHeld = false; }
-      }
-      h.classList.add('held');
-    }
-    function hRelease(e) {
-      e.preventDefault();
-      if (lHeld) { dispatchKey('keyup', KEYMAP.left);  lHeld = false; }
-      if (rHeld) { dispatchKey('keyup', KEYMAP.right); rHeld = false; }
-      h.classList.remove('held');
-    }
-    v.addEventListener('touchstart',  vPress,   { passive: false });
-    v.addEventListener('touchend',    vRelease, { passive: false });
-    v.addEventListener('touchcancel', vRelease, { passive: false });
-    h.addEventListener('touchstart',  hPress,   { passive: false });
-    h.addEventListener('touchend',    hRelease, { passive: false });
-    h.addEventListener('touchcancel', hRelease, { passive: false });
-  }
-  function wireMobileControls() {
-    wireButton('mobileCross',    KEYMAP.cross);
-    wireButton('mobileCircle',   KEYMAP.circle);
-    wireButton('mobileSquare',   KEYMAP.square);
-    wireButton('mobileTriangle', KEYMAP.triangle);
-    wireButton('mobileL1',       KEYMAP.l1);
-    wireButton('mobileR1',       KEYMAP.r1);
-    wireButton('mobileL2',       KEYMAP.l2);
-    wireButton('mobileR2',       KEYMAP.r2);
-    wireButton('mobileStart',    KEYMAP.start);
-    wireButton('mobileSelect',   KEYMAP.select);
-    wireDpad();
-  }
-
-  // ─── Gamepad / Bluetooth controller support ──────────────────────
-  // Standard-mapping pads (Xbox / DualShock / most BT controllers) go
-  // through the same synthetic-KeyboardEvent pipeline as the on-screen
-  // buttons, so the worker sees them identically to a key press.
-  var GP_BUTTON_KEYS = {
-    0: KEYMAP.cross,    1: KEYMAP.circle,
-    2: KEYMAP.square,   3: KEYMAP.triangle,
-    4: KEYMAP.l1,       5: KEYMAP.r1,
-    6: KEYMAP.l2,       7: KEYMAP.r2,
-    8: KEYMAP.select,   9: KEYMAP.start,
-    12: KEYMAP.up,      13: KEYMAP.down,
-    14: KEYMAP.left,    15: KEYMAP.right
-  };
-  var gpPressed = {};
-  var gpPolling = false;
-  var GP_AXIS_DEAD = 0.35;
-
-  function gpEdge(id, keyLabel, pressed) {
-    if (pressed && !gpPressed[id]) {
-      dispatchKey('keydown', keyLabel); gpPressed[id] = true;
-    } else if (!pressed && gpPressed[id]) {
-      dispatchKey('keyup', keyLabel); gpPressed[id] = false;
-    }
-  }
-
-  function pollGamepads() {
-    var pads = (navigator.getGamepads && navigator.getGamepads()) || [];
-    for (var i = 0; i < pads.length; i++) {
-      var gp = pads[i];
-      if (!gp) continue;
-      var btns = gp.buttons || [];
-      for (var b in GP_BUTTON_KEYS) {
-        var bi = +b, key = GP_BUTTON_KEYS[b];
-        gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed));
-      }
-      var ax = gp.axes || [];
-      var axX = ax[0] || 0, axY = ax[1] || 0;
-      gpEdge(i + ':axL', KEYMAP.left,  axX < -GP_AXIS_DEAD);
-      gpEdge(i + ':axR', KEYMAP.right, axX >  GP_AXIS_DEAD);
-      gpEdge(i + ':axU', KEYMAP.up,    axY < -GP_AXIS_DEAD);
-      gpEdge(i + ':axD', KEYMAP.down,  axY >  GP_AXIS_DEAD);
-    }
-    requestAnimationFrame(pollGamepads);
-  }
-
-  window.addEventListener('gamepadconnected', function (e) {
-    setStatus('Controller connected: ' + e.gamepad.id);
-    if (!gpPolling) { gpPolling = true; requestAnimationFrame(pollGamepads); }
-  });
-  window.addEventListener('gamepaddisconnected', function () {
-    setStatus('Controller disconnected');
-  });
-  // Safari + some mobile browsers won't fire gamepadconnected until a
-  // button is pressed, so we poll unconditionally once the page loads.
-  if (navigator.getGamepads) {
-    gpPolling = true;
-    requestAnimationFrame(pollGamepads);
-  }
-
-  // ─── Landscape / portrait handling for mobile ─────────────────────
-  // Only nag about rotation AFTER the user has actually started the game —
-  // before then the splash is orientation-agnostic.
-  function checkOrientation() {
-    if (!isMobile) return;
-    var landscape = window.innerWidth > window.innerHeight;
-    var show = started && !landscape;
-    $('rotateHint').style.display = show ? 'flex' : 'none';
-  }
-  window.addEventListener('resize',            checkOrientation);
-  window.addEventListener('orientationchange', checkOrientation);
-
-  // ─── Activate mobile shell ────────────────────────────────────────
-  if (isMobile) {
-    // Move canvas into the mobile screen slot and hide desktop chrome
-    $('desktop').style.display = 'none';
-    var c = $('canvas');
-    c.style.width  = '';
-    c.style.height = '';
-    $('mobileScreen').appendChild(c);
-    $('mobileShell').style.display = 'block';
-    $('mobileSplash').style.display = 'flex';
-    wireMobileControls();
-    checkOrientation();
-    // Splash Start button commits the ROM choice to the shared select,
-    // hides the splash, and boots the runtime exactly like desktop Start.
-    $('mobileStart').addEventListener('click', function () {
-      var mSel = $('mobileRomSelect');
-      var dSel = $('romSelect');
-      if (mSel && dSel) dSel.value = mSel.value;
-      $('mobileSplash').style.display = 'none';
-      startEmulator();
-      checkOrientation();
-    });
-    setStatus('Pick a game and tap Start.');
-  }
-
-  // ─── Prevent iOS double-tap zoom on controls ──────────────────────
-  document.addEventListener('touchstart', function (e) {
-    if (e.target.closest('.faceBtn, .shoulderBtn, .dpadV, .dpadH, .sysBtn, .menuBtn')) {
-      // prevent default handled per-element; this is a safety net
-    }
-  }, { passive: true });
-
+  const DB_NAME = 'PS1WASMDB', STORE = 'PS1WASMSTATES'; var SAVE_KEY = ROM_NAME + '.ps1state';
+  function openDB() { return new Promise((resolve, reject) => { var req = indexedDB.open(DB_NAME); req.onupgradeneeded = e => e.target.result.createObjectStore(STORE); req.onsuccess = e => resolve(e.target.result); req.onerror = () => reject(req.error); }); }
+  async function idbPut(key, val) { var db = await openDB(); return new Promise((resolve, reject) => { var t = db.transaction(STORE, 'readwrite').objectStore(STORE).put(val, key); t.onsuccess = () => resolve(); t.onerror = () => reject(t.error); }); }
+  async function idbGet(key) { var db = await openDB(); return new Promise((resolve, reject) => { var t = db.transaction(STORE, 'readonly').objectStore(STORE).get(key); t.onsuccess = () => resolve(t.result); t.onerror = () => reject(t.error); }); }
+  async function gzip(u8) { var cs = new CompressionStream('gzip'); var w = cs.writable.getWriter(); w.write(u8); w.close(); return new Uint8Array(await new Response(cs.readable).arrayBuffer()); }
+  async function gunzip(u8) { var ds = new DecompressionStream('gzip'); var w = ds.writable.getWriter(); w.write(u8); w.close(); return new Uint8Array(await new Response(ds.readable).arrayBuffer()); }
+  async function saveState() { if (!pcsx_worker) return toast('Emulator not ready', true); toast('Saving state…'); try { var heap = await new Promise(res => { pendingSaveResolve = res; pcsx_worker.postMessage({ cmd: 'saveState' }); }); var compressed = await gzip(heap); await idbPut(SAVE_KEY, compressed); toast('Saved (' + (compressed.byteLength / 1048576).toFixed(1) + ' MB)'); } catch (e) { toast('Save failed: ' + e.message, true); } }
+  async function loadState() { if (!pcsx_worker) return toast('Emulator not ready', true); try { var stored = await idbGet(SAVE_KEY); if (!stored) return toast('No save state found', true); toast('Restoring…'); var heap = await gunzip(stored instanceof Uint8Array ? stored : new Uint8Array(stored)); var buf = heap.buffer; await new Promise(res => { pendingLoadResolve = res; pcsx_worker.postMessage({ cmd: 'loadState', heap: buf }, [buf]); }); toast('State restored'); } catch (e) { toast('Load failed: ' + (e.message || e), true); } }
+  function toggleMute() { audioMuted = !audioMuted; var ctx = getAudioCtx(); if (ctx) { audioMuted ? ctx.suspend() : ctx.resume(); } $('btnMute').textContent = audioMuted ? '🔇 Unmute' : '🔊 Mute'; $('mMute').textContent = audioMuted ? 'Unmute' : 'Mute'; }
+  async function resetAudio() { var ctx = getAudioCtx(); if (!ctx) { toast('Audio not ready', true); return; } if (audioDraining) return; audioDraining = true; toast('Resetting audio…'); try { await ctx.suspend(); } catch (e) {} await new Promise(r => setTimeout(r, 150)); if (window._soundScratchPtr) { try { Module._free(window._soundScratchPtr); } catch (e) {} window._soundScratchPtr = 0; window._soundScratchSize = 0; } if (!audioMuted) { try { await ctx.resume(); } catch (e) {} } audioDraining = false; toast('Audio reset'); }
+  function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasWrap'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
+  $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
+  function openMobileMenu() { $('mobileMenu').classList.add('open'); } function closeMobileMenu() { $('mobileMenu').classList.remove('open'); }
+  $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); }); $('mResetAudio').addEventListener('click', () => { resetAudio(); closeMobileMenu(); }); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
+  var GP_BUTTON_KEYS = { 0: KEYMAP.cross, 1: KEYMAP.circle, 2: KEYMAP.square, 3: KEYMAP.triangle, 4: KEYMAP.l1, 5: KEYMAP.r1, 6: KEYMAP.l2, 7: KEYMAP.r2, 8: KEYMAP.select, 9: KEYMAP.start, 12: KEYMAP.up, 13: KEYMAP.down, 14: KEYMAP.left, 15: KEYMAP.right }; var gpPressed = {}; var gpPolling = false; var GP_AXIS_DEAD = 0.35;
+  function gpEdge(id, keyLabel, pressed) { if (pressed && !gpPressed[id]) { dispatchKey('keydown', keyLabel); gpPressed[id] = true; } else if (!pressed && gpPressed[id]) { dispatchKey('keyup', keyLabel); gpPressed[id] = false; } }
+  function pollGamepads() { var pads = (navigator.getGamepads && navigator.getGamepads()) || []; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; var btns = gp.buttons || []; for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); } requestAnimationFrame(pollGamepads); }
+  window.addEventListener('gamepadconnected', function (e) { setStatus('Controller connected: ' + e.gamepad.id); if (!gpPolling) { gpPolling = true; requestAnimationFrame(pollGamepads); } }); window.addEventListener('gamepaddisconnected', function () { setStatus('Controller disconnected'); }); if (navigator.getGamepads) { gpPolling = true; requestAnimationFrame(pollGamepads); }
+  function checkOrientation() { if (!isMobile) return; var landscape = window.innerWidth > window.innerHeight; var show = started && !landscape; $('rotateHint').style.display = show ? 'flex' : 'none'; }
+  window.addEventListener('resize', checkOrientation); window.addEventListener('orientationchange', checkOrientation);
+  if (isMobile) { $('desktop').style.display = 'none'; var c = $('canvas'); c.style.width = ''; c.style.height = ''; $('mobileScreen').appendChild(c); $('mobileShell').style.display = 'block'; $('mobileSplash').style.display = 'flex'; wireMobileControls(); checkOrientation(); $('mobileSplashStart').addEventListener('pointerdown', function (e) { e.preventDefault(); var mSel = $('mobileRomSelect'); var dSel = $('romSelect'); if (mSel && dSel) dSel.value = mSel.value; $('mobileSplash').style.display = 'none'; startEmulator(); checkOrientation(); }); setStatus('Pick a game and tap Start.'); }
+  document.addEventListener('touchstart', function (e) { if (e.target.closest('.faceBtn, .shoulderBtn, .dpadV, .dpadH, .sysBtn, .menuBtn')) {} }, { passive: true });
 })();
 </script>
-
 </body>
 </html>
