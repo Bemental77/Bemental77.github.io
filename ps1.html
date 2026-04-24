@@ -152,7 +152,7 @@
     { label: 'Metal Gear Solid (Disc 2)', base: 'MetalGearSolidDisc2', chunks: chunkRange('MetalGearSolidDisc2', 'i') }
   ];
   var ROM_NAME = ROMS[0].base, ROM_CHUNKS = ROMS[0].chunks;
-  const KEYMAP = { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', cross: 'x', circle: 's', square: 'z', triangle: 'a', l1: 'q', r1: 'w', l2: 'e', r2: 'r', start: 'Enter', select: 'Shift' };
+  const KEYMAP = { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', cross: 'z', circle: 'x', square: 's', triangle: 'd', l1: 'w', r1: 'r', l2: 'e', r2: 't', start: 'v', select: 'c' };
   const $ = id => document.getElementById(id);
   (function populateRomSelect() {
     var selects = [$('romSelect'), $('mobileRomSelect')].filter(Boolean); if (!selects.length) return;
@@ -192,10 +192,18 @@
     Module.HEAPU8[padStatus1] = b0; Module.HEAPU8[padStatus1 + 1] = b1;
   }
 
+  var KEY_CODES = { 'ArrowUp': ['ArrowUp', 38], 'ArrowDown': ['ArrowDown', 40], 'ArrowLeft': ['ArrowLeft', 37], 'ArrowRight': ['ArrowRight', 39], 'z': ['KeyZ', 90], 'x': ['KeyX', 88], 's': ['KeyS', 83], 'd': ['KeyD', 68], 'w': ['KeyW', 87], 'r': ['KeyR', 82], 'e': ['KeyE', 69], 't': ['KeyT', 84], 'v': ['KeyV', 86], 'c': ['KeyC', 67] };
   function dispatchKey(type, key) {
-    var keyToPad = { 'ArrowUp': 'up', 'ArrowDown': 'down', 'ArrowLeft': 'left', 'ArrowRight': 'right', 'x': 'cross', 's': 'circle', 'z': 'square', 'a': 'triangle', 'q': 'l1', 'w': 'r1', 'e': 'l2', 'r': 'r2', 'Enter': 'start', 'Shift': 'select' };
+    var keyToPad = { 'ArrowUp': 'up', 'ArrowDown': 'down', 'ArrowLeft': 'left', 'ArrowRight': 'right', 'z': 'cross', 'x': 'circle', 's': 'square', 'd': 'triangle', 'w': 'l1', 'r': 'r1', 'e': 'l2', 't': 'r2', 'v': 'start', 'c': 'select' };
     var padBtn = keyToPad[key];
     if (padBtn) { mobilePadState[padBtn] = (type === 'keydown'); updatePadState(); }
+    var info = KEY_CODES[key]; if (!info) return;
+    try {
+      var evt = new KeyboardEvent(type, { key: key, code: info[0], keyCode: info[1], which: info[1], bubbles: true, cancelable: true });
+      Object.defineProperty(evt, 'keyCode', { get: function () { return info[1]; } });
+      Object.defineProperty(evt, 'which', { get: function () { return info[1]; } });
+      window.dispatchEvent(evt); document.dispatchEvent(evt);
+    } catch (e) {}
   }
 
   function wireButton(id, key) {
@@ -269,23 +277,34 @@
   }
 
   async function fetchRomAndBoot() {
-    setStatus('Loading 0/' + ROM_CHUNKS.length + '…');
-    var blobs = [], total = 0;
+    setStatus('Sizing ROM…');
+    var sizes;
+    try {
+      sizes = await Promise.all(ROM_CHUNKS.map(async function (u) {
+        var r = await fetch(u, { method: 'HEAD' });
+        if (!r.ok) throw new Error('HEAD ' + u + ' -> ' + r.status);
+        return +(r.headers.get('Content-Length') || 0);
+      }));
+    } catch (e) { setStatus('Size check failed: ' + e.message); pageLog('[rom] HEAD failed: ' + e); return; }
+    var totalSize = sizes.reduce(function (a, b) { return a + b; }, 0);
+    if (!totalSize) { setStatus('Could not determine ROM size'); return; }
+    var totalMB = (totalSize/1048576).toFixed(0);
+    pageLog('[rom] total ' + totalMB + ' MB across ' + ROM_CHUNKS.length + ' chunks');
+    pcsx_worker.postMessage({ cmd: 'romBegin', name: ROM_NAME + '.bin', size: totalSize });
+    var total = 0;
     for (var i = 0; i < ROM_CHUNKS.length; i++) {
+      setStatus('Loading ' + (i+1) + '/' + ROM_CHUNKS.length + ' — ' + (total/1048576).toFixed(0) + ' / ' + totalMB + ' MB');
       var r = await fetch(ROM_CHUNKS[i]);
       if (!r.ok) { setStatus('Chunk fetch failed: ' + ROM_CHUNKS[i]); return; }
-      var b = await r.blob();
-      blobs.push(b); total += b.size;
-      var mb = (total/1048576).toFixed(0);
-      setStatus('Loading ' + (i+1) + '/' + ROM_CHUNKS.length + ' — ' + mb + ' MB');
-      pageLog('[rom] chunk ' + (i+1) + '/' + ROM_CHUNKS.length + '  (' + mb + ' MB)');
+      var buf = await r.arrayBuffer();
+      total += buf.byteLength;
+      pageLog('[rom] chunk ' + (i+1) + '/' + ROM_CHUNKS.length + '  (' + (total/1048576).toFixed(1) + ' MB)');
+      pcsx_worker.postMessage({ cmd: 'romChunk', buf: buf }, [buf]);
+      buf = null;
     }
-    var file = new File(blobs, ROM_NAME + '.bin', { type: 'application/octet-stream' });
-    blobs = null;
-    pageLog('[rom] posting to worker — ' + (total/1048576).toFixed(1) + ' MB');
+    pageLog('[rom] streamed ' + (total/1048576).toFixed(1) + ' MB — booting');
     setStatus('Booting emulator…');
-    pcsx_worker.postMessage({ cmd: 'loadfile', file: file });
-    file = null;
+    pcsx_worker.postMessage({ cmd: 'romEnd' });
     setTimeout(pollController, 10);
     [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
   }
