@@ -54,6 +54,9 @@
     #mobileShell.ghost .mobileSide { background: transparent; }
     #mobileShell.ghost .shoulderBtn, #mobileShell.ghost .faceBtn, #mobileShell.ghost .dpadDisc, #mobileShell.ghost .sysBtn, #mobileShell.ghost .menuBtn { opacity: 0.35; }
     #mobileShell.ghost .shoulderBtn.held, #mobileShell.ghost .faceBtn.held, #mobileShell.ghost .sysBtn.held { opacity: 0.7; }
+    #mobileShell.hide-controls .mobileSide, #mobileShell.hide-controls #mobileBottom { display: none; }
+    #mobileShell.hide-controls #mobileHideHint { display: flex; }
+    #mobileHideHint { display: none; position: absolute; top: 10px; right: 10px; width: 40px; height: 40px; border-radius: 20px; background: rgba(0,0,0,0.55); color: #fff; align-items: center; justify-content: center; font-size: 22px; font-weight: 700; z-index: 20; -webkit-tap-highlight-color: transparent; }
     .faceWrap { flex: 1; display: flex; align-items: center; justify-content: center; }
     .faceDiamond { width: min(32vh, 180px); height: min(32vh, 180px); position: relative; }
     .faceBtn { position: absolute; width: min(12vh, 64px); height: min(12vh, 64px); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; color: rgba(255,255,255,0.9); border: 2px solid rgba(0,0,0,0.3); box-shadow: 0 4px 0 rgba(0,0,0,0.5), inset 0 2px 4px rgba(255,255,255,0.25); -webkit-tap-highlight-color: transparent; }
@@ -62,7 +65,7 @@
     .btn-square   { background: radial-gradient(circle at 38% 32%, #dd88bb, #993377); top: 50%; left: 0;   --tx: 0; --ty: -50%; transform: translateY(-50%); }
     .btn-circle   { background: radial-gradient(circle at 38% 32%, #ee5555, #991111); top: 50%; right: 0;  --tx: 0; --ty: -50%; transform: translateY(-50%); }
     .btn-cross    { background: radial-gradient(circle at 38% 32%, #5588ee, #1133aa); bottom: 0; left: 50%; --tx: -50%; --ty: 0; transform: translateX(-50%); }
-    #mobileBottom { position: absolute; bottom: 8px; left: 50%; transform: translateX(-50%); display: flex; gap: 10px; align-items: center; z-index: 10; }
+    #mobileBottom { position: absolute; bottom: max(30px, calc(env(safe-area-inset-bottom, 0px) + 20px)); left: 50%; transform: translateX(-50%); display: flex; gap: 10px; align-items: center; z-index: 10; }
     .sysBtn { height: 26px; padding: 0 14px; border-radius: 13px; background: linear-gradient(180deg, #555 0%, #333 100%); border: 1px solid #222; color: #ccc; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
     .sysBtn.held { filter: brightness(0.6); }
     .menuBtn { width: 34px; height: 34px; border-radius: 17px; background: linear-gradient(180deg, #777 0%, #444 100%); border: 2px solid #222; color: #fff; font-size: 18px; font-weight: 700; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
@@ -136,14 +139,16 @@
     <div class="menuBtn" id="mobileMenuBtn">≡</div>
     <div class="sysBtn" id="mobileStart">Start</div>
   </div>
-</div>
-<div id="mobileMenu">
-  <div id="mobileMenuBox">
-    <h6>Menu</h6>
-    <button id="mSave" disabled>Save State</button><button id="mLoad" disabled>Load State</button>
-    <button id="mMute" disabled>Mute</button><button id="mResetAudio" disabled>Reset Audio</button>
-    <button id="mGhost">Transparent Controls: Off</button>
-    <button id="mFull" disabled>Fullscreen</button><button id="mClose">Close</button>
+  <div id="mobileHideHint" title="Show controls">≡</div>
+  <div id="mobileMenu">
+    <div id="mobileMenuBox">
+      <h6>Menu</h6>
+      <button id="mSave" disabled>Save State</button><button id="mLoad" disabled>Load State</button>
+      <button id="mMute" disabled>Mute</button><button id="mResetAudio" disabled>Reset Audio</button>
+      <button id="mGhost">Transparent Controls: Off</button>
+      <button id="mHide">Hide Controls: Off</button>
+      <button id="mFull" disabled>Fullscreen</button><button id="mClose">Close</button>
+    </div>
   </div>
 </div>
 <div id="rotateHint">Rotate your device to landscape to play.</div>
