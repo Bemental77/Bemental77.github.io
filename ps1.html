@@ -51,7 +51,7 @@
     .faceWrap { flex: 1; display: flex; align-items: center; justify-content: center; }
     .faceDiamond { width: min(32vh, 180px); height: min(32vh, 180px); position: relative; }
     .faceBtn { position: absolute; width: min(12vh, 64px); height: min(12vh, 64px); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; color: rgba(255,255,255,0.9); border: 2px solid rgba(0,0,0,0.3); box-shadow: 0 4px 0 rgba(0,0,0,0.5), inset 0 2px 4px rgba(255,255,255,0.25); -webkit-tap-highlight-color: transparent; }
-    .faceBtn.held { transform: translate(var(--tx, 0), calc(var(--ty, 0) + 3px)); box-shadow: 0 1px 0 rgba(0,0,0,0.4), inset 0 1px 3px rgba(0,0,0,0.3); }
+    .faceBtn.held { filter: brightness(0.65); box-shadow: 0 1px 0 rgba(0,0,0,0.4), inset 0 1px 3px rgba(0,0,0,0.3); }
     .btn-triangle { background: radial-gradient(circle at 38% 32%, #44bb66, #116633); top: 0;   left: 50%; --tx: -50%; --ty: 0; transform: translateX(-50%); }
     .btn-square   { background: radial-gradient(circle at 38% 32%, #dd88bb, #993377); top: 50%; left: 0;   --tx: 0; --ty: -50%; transform: translateY(-50%); }
     .btn-circle   { background: radial-gradient(circle at 38% 32%, #ee5555, #991111); top: 50%; right: 0;  --tx: 0; --ty: -50%; transform: translateY(-50%); }
@@ -200,8 +200,12 @@
 
   function wireButton(id, key) {
     var el = $(id); if (!el) return;
-    function press(e) { e.preventDefault(); dispatchKey('keydown', key); el.classList.add('held'); }
-    function release(e) { e.preventDefault(); dispatchKey('keyup', key); el.classList.remove('held'); }
+    function press(e) { if (e && e.preventDefault) e.preventDefault(); dispatchKey('keydown', key); el.classList.add('held'); }
+    function release(e) { if (e && e.preventDefault) e.preventDefault(); dispatchKey('keyup', key); el.classList.remove('held'); }
+    if (window.PointerEvent) {
+      el.addEventListener('pointerdown', function (e) { try { el.setPointerCapture(e.pointerId); } catch (_) {} press(e); });
+      el.addEventListener('pointerup', release); el.addEventListener('pointercancel', release); el.addEventListener('pointerleave', release);
+    }
     el.addEventListener('touchstart', press, { passive: false }); el.addEventListener('touchend', release, { passive: false }); el.addEventListener('touchcancel', release, { passive: false });
     el.addEventListener('mousedown', press); el.addEventListener('mouseup', release); el.addEventListener('mouseleave', release);
   }
@@ -209,14 +213,23 @@
   function wireDpad() {
     var v = $('mobileDpadV'), h = $('mobileDpadH'); if (!v || !h) return;
     var upHeld = false, dnHeld = false, lHeld = false, rHeld = false;
-    function vPress(e) { e.preventDefault(); var rect = v.getBoundingClientRect(); var t = e.touches[0] || e.changedTouches[0];
+    function getPoint(e) { if (e.touches && e.touches[0]) return e.touches[0]; if (e.changedTouches && e.changedTouches[0]) return e.changedTouches[0]; return e; }
+    function vPress(e) { if (e.preventDefault) e.preventDefault(); var rect = v.getBoundingClientRect(); var t = getPoint(e);
       if (t.clientY < rect.top + rect.height / 2) { if (!upHeld) { dispatchKey('keydown', KEYMAP.up); upHeld = true; } if (dnHeld) { dispatchKey('keyup', KEYMAP.down); dnHeld = false; } }
       else { if (!dnHeld) { dispatchKey('keydown', KEYMAP.down); dnHeld = true; } if (upHeld) { dispatchKey('keyup', KEYMAP.up); upHeld = false; } } v.classList.add('held'); }
-    function vRelease(e) { e.preventDefault(); if (upHeld) { dispatchKey('keyup', KEYMAP.up); upHeld = false; } if (dnHeld) { dispatchKey('keyup', KEYMAP.down); dnHeld = false; } v.classList.remove('held'); }
-    function hPress(e) { e.preventDefault(); var rect = h.getBoundingClientRect(); var t = e.touches[0] || e.changedTouches[0];
+    function vRelease(e) { if (e.preventDefault) e.preventDefault(); if (upHeld) { dispatchKey('keyup', KEYMAP.up); upHeld = false; } if (dnHeld) { dispatchKey('keyup', KEYMAP.down); dnHeld = false; } v.classList.remove('held'); }
+    function hPress(e) { if (e.preventDefault) e.preventDefault(); var rect = h.getBoundingClientRect(); var t = getPoint(e);
       if (t.clientX < rect.left + rect.width / 2) { if (!lHeld) { dispatchKey('keydown', KEYMAP.left); lHeld = true; } if (rHeld) { dispatchKey('keyup', KEYMAP.right); rHeld = false; } }
       else { if (!rHeld) { dispatchKey('keydown', KEYMAP.right); rHeld = true; } if (lHeld) { dispatchKey('keyup', KEYMAP.left); lHeld = false; } } h.classList.add('held'); }
-    function hRelease(e) { e.preventDefault(); if (lHeld) { dispatchKey('keyup', KEYMAP.left); lHeld = false; } if (rHeld) { dispatchKey('keyup', KEYMAP.right); rHeld = false; } h.classList.remove('held'); }
+    function hRelease(e) { if (e.preventDefault) e.preventDefault(); if (lHeld) { dispatchKey('keyup', KEYMAP.left); lHeld = false; } if (rHeld) { dispatchKey('keyup', KEYMAP.right); rHeld = false; } h.classList.remove('held'); }
+    if (window.PointerEvent) {
+      v.addEventListener('pointerdown', function (e) { try { v.setPointerCapture(e.pointerId); } catch (_) {} vPress(e); });
+      v.addEventListener('pointermove', function (e) { if (upHeld || dnHeld) vPress(e); });
+      v.addEventListener('pointerup', vRelease); v.addEventListener('pointercancel', vRelease); v.addEventListener('pointerleave', vRelease);
+      h.addEventListener('pointerdown', function (e) { try { h.setPointerCapture(e.pointerId); } catch (_) {} hPress(e); });
+      h.addEventListener('pointermove', function (e) { if (lHeld || rHeld) hPress(e); });
+      h.addEventListener('pointerup', hRelease); h.addEventListener('pointercancel', hRelease); h.addEventListener('pointerleave', hRelease);
+    }
     v.addEventListener('touchstart', vPress, { passive: false }); v.addEventListener('touchend', vRelease, { passive: false }); v.addEventListener('touchcancel', vRelease, { passive: false });
     h.addEventListener('touchstart', hPress, { passive: false }); h.addEventListener('touchend', hRelease, { passive: false }); h.addEventListener('touchcancel', hRelease, { passive: false });
     v.addEventListener('mousedown', vPress); v.addEventListener('mouseup', vRelease); v.addEventListener('mouseleave', vRelease);
@@ -255,7 +268,27 @@
     }
   }
 
-  async function fetchRomAndBoot() { setStatus('Fetching ROM chunks...'); var bufs = [], total = 0; for (var i = 0; i < ROM_CHUNKS.length; i++) { var r = await fetch(ROM_CHUNKS[i]); if (!r.ok) { setStatus('Chunk fetch failed: ' + ROM_CHUNKS[i]); return; } var buf = await r.arrayBuffer(); bufs.push(buf); total += buf.byteLength; pageLog('[rom] chunk ' + (i+1) + '/' + ROM_CHUNKS.length + '  (' + (total/1048576).toFixed(1) + ' MB)'); } var file = new File([new Blob(bufs)], ROM_NAME + '.bin', { type: 'application/octet-stream' }); pageLog('[rom] posting to worker — ' + (total/1048576).toFixed(1) + ' MB'); setStatus('Booting emulator...'); pcsx_worker.postMessage({ cmd: 'loadfile', file: file }); setTimeout(pollController, 10); [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false)); }
+  async function fetchRomAndBoot() {
+    setStatus('Loading 0/' + ROM_CHUNKS.length + '…');
+    var blobs = [], total = 0;
+    for (var i = 0; i < ROM_CHUNKS.length; i++) {
+      var r = await fetch(ROM_CHUNKS[i]);
+      if (!r.ok) { setStatus('Chunk fetch failed: ' + ROM_CHUNKS[i]); return; }
+      var b = await r.blob();
+      blobs.push(b); total += b.size;
+      var mb = (total/1048576).toFixed(0);
+      setStatus('Loading ' + (i+1) + '/' + ROM_CHUNKS.length + ' — ' + mb + ' MB');
+      pageLog('[rom] chunk ' + (i+1) + '/' + ROM_CHUNKS.length + '  (' + mb + ' MB)');
+    }
+    var file = new File(blobs, ROM_NAME + '.bin', { type: 'application/octet-stream' });
+    blobs = null;
+    pageLog('[rom] posting to worker — ' + (total/1048576).toFixed(1) + ' MB');
+    setStatus('Booting emulator…');
+    pcsx_worker.postMessage({ cmd: 'loadfile', file: file });
+    file = null;
+    setTimeout(pollController, 10);
+    [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
+  }
   var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; SAVE_KEY = ROM_NAME + '.ps1state'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...'); setStatus('Loading LLVM runtime...'); var s = document.createElement('script'); s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now(); document.body.appendChild(s); }
   $('btnStart').addEventListener('click', startEmulator);
   const DB_NAME = 'PS1WASMDB', STORE = 'PS1WASMSTATES'; var SAVE_KEY = ROM_NAME + '.ps1state';
