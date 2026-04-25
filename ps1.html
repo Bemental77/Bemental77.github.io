@@ -161,7 +161,12 @@
   const ROMS = [
     { label: 'Monster Rancher 2', base: 'MonsterRancher2', chunks: chunkRange('MonsterRancher2', 'f') },
     { label: 'Metal Gear Solid (Disc 1)', base: 'MetalGearSolidDisc1', chunks: chunkRange('MetalGearSolidDisc1', 'h') },
-    { label: 'Metal Gear Solid (Disc 2)', base: 'MetalGearSolidDisc2', chunks: chunkRange('MetalGearSolidDisc2', 'i') }
+    { label: 'Metal Gear Solid (Disc 2)', base: 'MetalGearSolidDisc2', chunks: chunkRange('MetalGearSolidDisc2', 'i') },
+    { label: "Harry Potter & the Sorcerer's Stone", base: 'HarryPotterSorcerersStone', chunks: chunkRange('HarryPotterSorcerersStone', 'd') },
+    { label: 'Legend of Dragoon (Disc 1)', base: 'LegendOfDragoonDisc1', chunks: chunkRange('LegendOfDragoonDisc1', 'f') },
+    { label: 'Legend of Dragoon (Disc 2)', base: 'LegendOfDragoonDisc2', chunks: chunkRange('LegendOfDragoonDisc2', 'g') },
+    { label: 'Legend of Dragoon (Disc 3)', base: 'LegendOfDragoonDisc3', chunks: chunkRange('LegendOfDragoonDisc3', 'g') },
+    { label: 'Legend of Dragoon (Disc 4)', base: 'LegendOfDragoonDisc4', chunks: chunkRange('LegendOfDragoonDisc4', 'i') }
   ];
   var ROM_NAME = ROMS[0].base, ROM_CHUNKS = ROMS[0].chunks;
   const KEYMAP = { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', cross: 'z', circle: 'x', square: 's', triangle: 'd', l1: 'w', r1: 'r', l2: 'e', r2: 't', start: 'v', select: 'c' };
@@ -360,7 +365,11 @@
   function applyGhost(on) { $('mobileShell').classList.toggle('ghost', on); if ($('mGhost')) $('mGhost').textContent = 'Transparent Controls: ' + (on ? 'On' : 'Off'); }
   function toggleGhost() { var on = !$('mobileShell').classList.contains('ghost'); localStorage.setItem('ps1wasm_ghost', on ? '1' : '0'); applyGhost(on); }
   applyGhost(localStorage.getItem('ps1wasm_ghost') === '1');
-  $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); }); $('mResetAudio').addEventListener('click', () => { resetAudio(); closeMobileMenu(); }); $('mGhost').addEventListener('click', toggleGhost); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
+  function applyHide(on) { $('mobileShell').classList.toggle('hide-controls', on); if ($('mHide')) $('mHide').textContent = 'Hide Controls: ' + (on ? 'On' : 'Off'); }
+  function toggleHide() { var on = !$('mobileShell').classList.contains('hide-controls'); localStorage.setItem('ps1wasm_hide', on ? '1' : '0'); applyHide(on); }
+  applyHide(localStorage.getItem('ps1wasm_hide') === '1');
+  $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); }); $('mResetAudio').addEventListener('click', () => { resetAudio(); closeMobileMenu(); }); $('mGhost').addEventListener('click', toggleGhost); $('mHide').addEventListener('click', () => { toggleHide(); closeMobileMenu(); }); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
+  $('mobileHideHint').addEventListener('click', () => { applyHide(false); localStorage.setItem('ps1wasm_hide', '0'); });
   var GP_BUTTON_KEYS = { 0: KEYMAP.cross, 1: KEYMAP.circle, 2: KEYMAP.square, 3: KEYMAP.triangle, 4: KEYMAP.l1, 5: KEYMAP.r1, 6: KEYMAP.l2, 7: KEYMAP.r2, 8: KEYMAP.select, 9: KEYMAP.start, 12: KEYMAP.up, 13: KEYMAP.down, 14: KEYMAP.left, 15: KEYMAP.right }; var gpPressed = {}; var gpPolling = false; var GP_AXIS_DEAD = 0.35;
   function gpEdge(id, keyLabel, pressed) { if (pressed && !gpPressed[id]) { dispatchKey('keydown', keyLabel); gpPressed[id] = true; } else if (!pressed && gpPressed[id]) { dispatchKey('keyup', keyLabel); gpPressed[id] = false; } }
   function pollGamepads() { var pads = (navigator.getGamepads && navigator.getGamepads()) || []; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; var btns = gp.buttons || []; for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); } requestAnimationFrame(pollGamepads); }
