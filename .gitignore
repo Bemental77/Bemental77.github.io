@@ -22,3 +22,10 @@ sample.sqlite
 # Reference upstream PCSX-wasm checkout (not used by deployed site)
 ps1/ps1Wasm/wasmpsx-repo
 
+# GameCube — dolphin source tree (2.1GB) is internal build input, not deployed.
+gamecube/dolphin-src/
+
+# bementalCompiler local build artifacts (the JIT lib is statically linked
+# into Dolphin via dolphin-src; only sources are deployed)
+bementalCompiler/build/
+

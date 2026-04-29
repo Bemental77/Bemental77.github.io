@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>GameCube Wasm — Sonic Adventure 2 Battle</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <link rel="icon" href=",">
+  <script src="/coi-serviceworker.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { overflow: hidden; }
+    #desktop { display: flex; flex-direction: column; align-items: center; padding: 12px; gap: 8px; height: 100vh; box-sizing: border-box; }
+    #title { margin: 0; font-size: 18px; letter-spacing: 1px; color: #aaa; }
+    #controlBar { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+    #controlBar button { padding: 8px 14px; border: 1px solid #444; background: #222; color: #eee; border-radius: 4px; cursor: pointer; font-size: 14px; min-width: 44px; min-height: 36px; }
+    #controlBar button:hover:not(:disabled) { background: #333; }
+    #controlBar button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #controlBar select { padding: 8px 10px; border: 1px solid #444; background: #222; color: #eee; border-radius: 4px; font-size: 14px; min-height: 36px; }
+    #canvasWrap { background: #000; display: flex; align-items: center; justify-content: center; flex: 1; width: 100%; max-width: 100vw; }
+    #canvas { background: #000; image-rendering: pixelated; width: 640px; height: 528px; max-width: 100%; max-height: 100%; }
+    #canvasWrap:fullscreen, #canvasWrap:-webkit-full-screen { width: 100vw; height: 100vh; max-width: none; max-height: none; display: flex; align-items: center; justify-content: center; }
+    #canvasWrap:fullscreen #canvas, #canvasWrap:-webkit-full-screen #canvas { width: auto; height: 100vh; max-width: 100vw; max-height: 100vh; }
+    @media (min-aspect-ratio: 4/3) { #canvasWrap:fullscreen #canvas, #canvasWrap:-webkit-full-screen #canvas { width: calc(100vh * 4 / 3); } }
+    @media (max-aspect-ratio: 4/3) { #canvasWrap:fullscreen #canvas, #canvasWrap:-webkit-full-screen #canvas { width: 100vw; height: calc(100vw * 3 / 4); } }
+    #mobileShell:fullscreen, #mobileShell:-webkit-full-screen { width: 100vw; height: 100vh; }
+    #statusBar { display: flex; gap: 16px; font-size: 12px; color: #888; font-family: monospace; }
+    #log { display: none; height: 140px; min-height: 80px; max-height: 50vh; width: 100%; max-width: 820px; overflow: auto; border: 1px solid #333; padding: 4px; font-size: 11px; background: #0a0a0a; color: #bbb; white-space: pre-wrap; user-select: text; -webkit-user-select: text; resize: vertical; position: relative; }
+    #log::after { content: "⋮"; position: absolute; bottom: 2px; right: 4px; color: #555; font-size: 10px; pointer-events: none; }
+    #mobileShell { display: none; position: fixed; inset: 0; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); z-index: 1000; user-select: none; -webkit-user-select: none; touch-action: none; overflow: hidden; }
+    #mobileScreen { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: #000; }
+    #mobileScreen canvas { image-rendering: pixelated; max-width: 100%; max-height: 100%; width: auto; height: 100%; }
+    .mobileSide { position: absolute; top: 0; bottom: 0; width: 34vw; max-width: 220px; display: flex; flex-direction: column; padding: 12px 10px; box-sizing: border-box; pointer-events: none; }
+    .mobileSide > * { pointer-events: auto; }
+    .mobileSide.left  { left: 0; background: linear-gradient(90deg, rgba(0,0,0,0.55), rgba(0,0,0,0)); }
+    .mobileSide.right { right: 0; background: linear-gradient(270deg, rgba(0,0,0,0.55), rgba(0,0,0,0)); }
+    .shoulderStack { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+    .shoulderBtn { width: 80%; height: 38px; border-radius: 8px; background: linear-gradient(180deg, #4a4a4a 0%, #2a2a2a 100%); border: 1px solid #555; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; color: #ddd; letter-spacing: 1px; box-shadow: 0 2px 4px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.12); -webkit-tap-highlight-color: transparent; }
+    .shoulderBtn.held { filter: brightness(0.65); }
+    .dpadWrap { flex: 1; display: flex; align-items: center; justify-content: center; }
+    .dpadDisc { width: min(32vh, 180px); height: min(32vh, 180px); border-radius: 50%; background: radial-gradient(circle at 40% 35%, #555 0%, #2a2a2a 60%, #1a1a1a 100%); border: 2px solid #333; box-shadow: inset 0 2px 4px rgba(255,255,255,0.2), 0 6px 12px rgba(0,0,0,0.6); position: relative; }
+    .dpadV, .dpadH { position: absolute; background: #333; box-shadow: inset 0 1px 3px rgba(0,0,0,0.7); pointer-events: none; }
+    .dpadV { width: 30%; height: 90%; top: 5%; left: 35%; border-radius: 6px; }
+    .dpadH { width: 90%; height: 30%; top: 35%; left: 5%; border-radius: 6px; }
+    .dpadCenter { position: absolute; width: 30%; height: 30%; top: 35%; left: 35%; background: #1a1a1a; border-radius: 4px; pointer-events: none; z-index: 3; }
+    .arr { position: absolute; pointer-events: none; transition: border-color 0.08s; }
+    .arr-up    { top: 6%;  left: 50%; transform: translateX(-50%); border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 9px solid #888; }
+    .arr-down  { bottom: 6%; left: 50%; transform: translateX(-50%); border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 9px solid #888; }
+    .arr-left  { left: 6%;  top: 50%; transform: translateY(-50%); border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-right: 9px solid #888; }
+    .arr-right { right: 6%; top: 50%; transform: translateY(-50%); border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-left: 9px solid #888; }
+    .dpadDisc.d-up .arr-up { border-bottom-color: #fff; }
+    .dpadDisc.d-down .arr-down { border-top-color: #fff; }
+    .dpadDisc.d-left .arr-left { border-right-color: #fff; }
+    .dpadDisc.d-right .arr-right { border-left-color: #fff; }
+    #mobileShell.ghost .mobileSide { background: transparent; }
+    #mobileShell.ghost .shoulderBtn, #mobileShell.ghost .faceBtn, #mobileShell.ghost .dpadDisc, #mobileShell.ghost .sysBtn, #mobileShell.ghost .menuBtn { opacity: 0.35; }
+    #mobileShell.ghost .shoulderBtn.held, #mobileShell.ghost .faceBtn.held, #mobileShell.ghost .sysBtn.held { opacity: 0.7; }
+    #mobileShell.hide-controls .mobileSide, #mobileShell.hide-controls #mobileBottom { display: none; }
+    #mobileShell.hide-controls #mobileHideHint { display: flex; }
+    #mobileHideHint { display: none; position: absolute; top: 10px; right: 10px; width: 40px; height: 40px; border-radius: 20px; background: rgba(0,0,0,0.55); color: #fff; align-items: center; justify-content: center; font-size: 22px; font-weight: 700; z-index: 20; -webkit-tap-highlight-color: transparent; }
+    .faceWrap { flex: 1; display: flex; align-items: center; justify-content: center; }
+    .faceDiamond { width: min(32vh, 180px); height: min(32vh, 180px); position: relative; }
+    .faceBtn { position: absolute; width: min(12vh, 64px); height: min(12vh, 64px); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; color: rgba(255,255,255,0.9); border: 2px solid rgba(0,0,0,0.3); box-shadow: 0 4px 0 rgba(0,0,0,0.5), inset 0 2px 4px rgba(255,255,255,0.25); -webkit-tap-highlight-color: transparent; }
+    .faceBtn.held { filter: brightness(0.65); box-shadow: 0 1px 0 rgba(0,0,0,0.4), inset 0 1px 3px rgba(0,0,0,0.3); }
+    .btn-a { background: radial-gradient(circle at 38% 32%, #44bb66, #116633); top: 0;   left: 50%; --tx: -50%; --ty: 0; transform: translateX(-50%); }
+    .btn-b { background: radial-gradient(circle at 38% 32%, #ee5555, #991111); top: 50%; right: 0;  --tx: 0; --ty: -50%; transform: translateY(-50%); }
+    .btn-x { background: radial-gradient(circle at 38% 32%, #5588ee, #1133aa); top: 50%; left: 0;   --tx: 0; --ty: -50%; transform: translateY(-50%); }
+    .btn-y { background: radial-gradient(circle at 38% 32%, #dd88bb, #993377); bottom: 0; left: 50%; --tx: -50%; --ty: 0; transform: translateX(-50%); }
+    #mobileBottom { position: absolute; bottom: max(30px, calc(env(safe-area-inset-bottom, 0px) + 20px)); left: 50%; transform: translateX(-50%); display: flex; gap: 10px; align-items: center; z-index: 10; }
+    .sysBtn { height: 26px; padding: 0 14px; border-radius: 13px; background: linear-gradient(180deg, #555 0%, #333 100%); border: 1px solid #222; color: #ccc; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
+    .sysBtn.held { filter: brightness(0.6); }
+    .menuBtn { width: 34px; height: 34px; border-radius: 17px; background: linear-gradient(180deg, #777 0%, #444 100%); border: 2px solid #222; color: #fff; font-size: 18px; font-weight: 700; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
+    #mobileMenu { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 2000; align-items: center; justify-content: center; }
+    #mobileMenu.open { display: flex; }
+    #mobileMenuBox { background: #222; color: #eee; border-radius: 10px; padding: 20px; min-width: 240px; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.7); }
+    #mobileMenuBox h6 { margin: 0 0 14px; font-size: 12px; text-transform: uppercase; letter-spacing: 2px; color: #888; }
+    #mobileMenuBox button { display: block; width: 100%; margin-bottom: 8px; padding: 10px; border: 1px solid #444; background: #2c2c2c; color: #eee; border-radius: 6px; font-size: 14px; cursor: pointer; }
+    #mobileMenuBox button:last-child { margin-bottom: 0; }
+    #mobileMenuBox button:disabled { opacity: 0.4; }
+    #toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); padding: 10px 18px; border-radius: 6px; background: rgba(0,0,0,0.85); color: #fff; font-size: 13px; z-index: 9999; opacity: 0; transition: opacity 0.2s; pointer-events: none; max-width: 90vw; }
+    #toast.show { opacity: 1; }
+    #toast.err { background: rgba(170, 40, 40, 0.95); }
+    #rotateHint { display: none; position: fixed; inset: 0; background: #111; color: #eee; align-items: center; justify-content: center; font-size: 18px; text-align: center; z-index: 3000; padding: 40px; }
+    #mobileSplash { display: none; position: absolute; inset: 0; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 24px; z-index: 2000; color: #eee; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); text-align: center; }
+    #mobileSplash h3 { margin: 0 0 4px; font-size: 22px; }
+    #mobileSplash label { font-size: 14px; opacity: 0.8; }
+    #mobileSplash select, #mobileSplash button { font-size: 16px; padding: 12px 20px; min-width: 240px; border-radius: 8px; border: 1px solid #444; background: #222; color: #fff; -webkit-appearance: none; }
+    #mobileSplash button#mobileSplashStart { background: #2a6b4a; border-color: #2a6b4a; cursor: pointer; z-index: 3000; position: relative; }
+    #mobileSplash .rotateTip { font-size: 12px; opacity: 0.55; margin-top: 8px; }
+    #mobileStatus { position: absolute; top: 10px; width: 100%; text-align: center; color: #888; z-index: 3000; font-size: 12px; }
+  </style>
+</head>
+<body>
+<div id="desktop">
+  <h3 id="title">GameCube Wasm</h3>
+  <div id="controlBar">
+    <select id="romSelect"></select>
+    <button id="btnStart">Start</button>
+    <button id="btnSave" disabled>Save State</button>
+    <button id="btnLoad" disabled>Load State</button>
+    <button id="btnMute" disabled>🔊 Mute</button>
+    <button id="btnResetAudio" disabled>↻ Reset Audio</button>
+    <button id="btnFull" disabled>⛶ Fullscreen</button>
+    <button id="btnLog" type="button">Toggle Log</button>
+  </div>
+  <div id="canvasWrap"><canvas id="canvas" width="640" height="528"></canvas></div>
+  <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
+  <pre id="log" tabindex="0"></pre>
+</div>
+<div id="mobileShell">
+  <div id="mobileStatus"></div>
+  <div id="mobileSplash">
+    <h3>GameCube Wasm</h3>
+    <label for="mobileRomSelect">Choose a game</label>
+    <select id="mobileRomSelect"></select>
+    <button id="mobileSplashStart" type="button">Start</button>
+    <p class="rotateTip">Rotate to landscape for the best view.</p>
+  </div>
+  <div id="mobileScreen"></div>
+  <div class="mobileSide left">
+    <div class="shoulderStack"><div class="shoulderBtn" id="mobileL">L</div><div class="shoulderBtn" id="mobileZ">Z</div></div>
+    <div class="dpadWrap">
+      <div class="dpadDisc" id="mobileDpadDisc">
+        <div class="dpadV"></div><div class="dpadH"></div><div class="dpadCenter"></div>
+        <div class="arr arr-up"></div><div class="arr arr-down"></div><div class="arr arr-left"></div><div class="arr arr-right"></div>
+      </div>
+    </div>
+  </div>
+  <div class="mobileSide right">
+    <div class="shoulderStack"><div class="shoulderBtn" id="mobileR">R</div></div>
+    <div class="faceWrap">
+      <div class="faceDiamond">
+        <div class="faceBtn btn-y" id="mobileY">Y</div><div class="faceBtn btn-x" id="mobileX">X</div>
+        <div class="faceBtn btn-b" id="mobileB">B</div><div class="faceBtn btn-a" id="mobileA">A</div>
+      </div>
+    </div>
+  </div>
+  <div id="mobileBottom">
+    <div class="sysBtn" id="mobileSelect">Select</div>
+    <div class="menuBtn" id="mobileMenuBtn">≡</div>
+    <div class="sysBtn" id="mobileStart">Start</div>
+  </div>
+  <div id="mobileHideHint" title="Show controls">≡</div>
+  <div id="mobileMenu">
+    <div id="mobileMenuBox">
+      <h6>Menu</h6>
+      <button id="mSave" disabled>Save State</button><button id="mLoad" disabled>Load State</button>
+      <button id="mMute" disabled>Mute</button><button id="mResetAudio" disabled>Reset Audio</button>
+      <button id="mGhost">Transparent Controls: Off</button>
+      <button id="mHide">Hide Controls: Off</button>
+      <button id="mFull" disabled>Fullscreen</button><button id="mClose">Close</button>
+    </div>
+  </div>
+  <div id="rotateHint">Rotate your device to landscape to play.</div>
+  <div id="toast"></div>
+</div>
+<script>
+(function () {
+  'use strict';
+  const ROM_ROOT = '/gamecube/roms/';
+  function chunkRange(base, lastLetter) { var urls = []; for (var i = 'a'.charCodeAt(0); i <= lastLetter.charCodeAt(0); i++) { urls.push(ROM_ROOT + base + '.bin.parta' + String.fromCharCode(i)); } return urls; }
+  const ROMS = [
+    { label: 'Sonic Adventure 2 Battle', base: 'SonicAdventure2Battle', chunks: chunkRange('SonicAdventure2Battle', 'q') }
+  ];
+  var ROM_NAME = ROMS[0].base, ROM_CHUNKS = ROMS[0].chunks;
+  const KEYMAP = { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', a: 'x', b: 'z', x: 's', y: 'd', l: 'w', r: 'r', z: 'e', start: 'v', select: 'c' };
+  const $ = id => document.getElementById(id);
+  (function populateRomSelect() {
+    var selects = [$('romSelect'), $('mobileRomSelect')].filter(Boolean); if (!selects.length) return;
+    selects.forEach(function (sel) { ROMS.forEach(function (r, i) { var opt = document.createElement('option'); opt.value = String(i); opt.textContent = r.label; sel.appendChild(opt); }); });
+    var saved = localStorage.getItem('gcwasm_romIdx'); if (saved !== null && saved >= 0 && saved < ROMS.length) { selects.forEach(function (s) { s.value = saved; }); }
+    selects.forEach(function (sel) { sel.addEventListener('change', function () { localStorage.setItem('gcwasm_romIdx', sel.value); selects.forEach(function (s) { if (s !== sel) s.value = sel.value; }); }); });
+  })();
+  const logEl = $('log'), statusEl = $('status'), mobileStatusEl = $('mobileStatus'), fpsEl = $('fps'), toastEl = $('toast');
+  var _logLast = '', _logRepeat = 0, _logBufLen = 0;
+  function pageLog(s) {
+    // Coalesce consecutive duplicates and cap the log buffer so a stuck JIT
+    // emitting thousands of identical PANIC lines can't OOM the tab.
+    if (s === _logLast) { _logRepeat++; if (_logRepeat % 100 !== 0) return; s = '… (x' + _logRepeat + ')'; }
+    else { if (_logRepeat > 0 && logEl) { logEl.textContent += '… (x' + _logRepeat + ' suppressed)\n'; } _logLast = s; _logRepeat = 0; }
+    if (logEl) {
+      logEl.textContent += s + '\n';
+      _logBufLen += s.length + 1;
+      if (_logBufLen > 200000) { logEl.textContent = logEl.textContent.slice(-100000); _logBufLen = 100000; }
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    console.log(s);
+  }
+  function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
+  function toast(msg, isErr) { toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200); }
+  const isMobile = (() => { const ua = navigator.userAgent.toLowerCase(); return /iphone|ipad|ipod|android|mobile|xbox/.test(ua) || ('ontouchstart' in window) || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile'); })();
+  var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/gamecube/dolphin_libretro/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: $('canvas'), setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {} };
+  var padStatus1, vram_ptr; var dolphin_worker = null; var states_arrs = []; var audioMuted = false; var pendingSaveResolve = null; var pendingLoadResolve = null;
+  function getAudioCtx() { try { return (Module && Module.preCreatedAudioContext) || (Module && Module.SDL && Module.SDL.audioContext) || null; } catch (e) { return null; } }
+  function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } }
+  document.addEventListener('click', resumeAudio); document.addEventListener('keydown', resumeAudio); document.addEventListener('visibilitychange', resumeAudio);
+  window.var_setup = function () { pageLog('[ui] var_setup — initializing Dolphin libretro'); padStatus1 = Module._get_ptr(0); Module.SDL.defaults.copyOnLock = false; Module.SDL.defaults.opaqueFrontBuffer = false; dolphin_worker = new Worker('/gamecube/dolphin_libretro/dolphin_worker.js?v=' + Date.now()); dolphin_worker.onmessage = onWorkerMsg; window.dolphin_worker = dolphin_worker; setStatus('Runtime ready. Loading ROM...'); loadRomAndBoot(); };
+  var mobilePadState = { a: false, b: false, x: false, y: false, l: false, r: false, z: false, start: false, select: false, up: false, down: false, left: false, right: false };
+  function updatePadState() {
+    if (!padStatus1) return;
+    var b0 = Module.HEAPU8[padStatus1], b1 = Module.HEAPU8[padStatus1 + 1];
+    if (mobilePadState.select) b0 &= ~(1 << 0); if (mobilePadState.start) b0 &= ~(1 << 1);
+    if (mobilePadState.up) b0 &= ~(1 << 2); if (mobilePadState.down) b0 &= ~(1 << 3);
+    if (mobilePadState.left) b0 &= ~(1 << 4); if (mobilePadState.right) b0 &= ~(1 << 5);
+    if (mobilePadState.a) b0 &= ~(1 << 6); if (mobilePadState.b) b0 &= ~(1 << 7);
+    if (mobilePadState.x) b1 &= ~(1 << 0); if (mobilePadState.y) b1 &= ~(1 << 1);
+    if (mobilePadState.z) b1 &= ~(1 << 2); if (mobilePadState.l) b1 &= ~(1 << 3);
+    if (mobilePadState.r) b1 &= ~(1 << 4);
+    Module.HEAPU8[padStatus1] = b0; Module.HEAPU8[padStatus1 + 1] = b1;
+  }
+  var KEY_CODES = { 'ArrowUp': ['ArrowUp', 38], 'ArrowDown': ['ArrowDown', 40], 'ArrowLeft': ['ArrowLeft', 37], 'ArrowRight': ['ArrowRight', 39], 'x': ['KeyX', 88], 'z': ['KeyZ', 90], 's': ['KeyS', 83], 'd': ['KeyD', 68], 'w': ['KeyW', 87], 'r': ['KeyR', 82], 'e': ['KeyE', 69], 'v': ['KeyV', 86], 'c': ['KeyC', 67] };
+  function dispatchKey(type, key) {
+    var keyToPad = { 'ArrowUp': 'up', 'ArrowDown': 'down', 'ArrowLeft': 'left', 'ArrowRight': 'right', 'x': 'a', 'z': 'b', 's': 'x', 'd': 'y', 'w': 'l', 'r': 'r', 'e': 'z', 'v': 'start', 'c': 'select' };
+    var padBtn = keyToPad[key];
+    if (padBtn) { mobilePadState[padBtn] = (type === 'keydown'); updatePadState(); }
+    var info = KEY_CODES[key]; if (!info) return;
+    try { var evt = new KeyboardEvent(type, { key: key, code: info[0], keyCode: info[1], which: info[1], bubbles: true, cancelable: true }); Object.defineProperty(evt, 'keyCode', { get: function () { return info[1]; } }); Object.defineProperty(evt, 'which', { get: function () { return info[1]; } }); window.dispatchEvent(evt); document.dispatchEvent(evt); } catch (e) {}
+  }
+  function wireButton(id, key) {
+    var el = $(id); if (!el) return;
+    function press(e) { if (e && e.preventDefault) e.preventDefault(); dispatchKey('keydown', key); el.classList.add('held'); }
+    function release(e) { if (e && e.preventDefault) e.preventDefault(); dispatchKey('keyup', key); el.classList.remove('held'); }
+    if (window.PointerEvent) { el.addEventListener('pointerdown', function (e) { try { el.setPointerCapture(e.pointerId); } catch (_) {} press(e); }); el.addEventListener('pointerup', release); el.addEventListener('pointercancel', release); el.addEventListener('pointerleave', release); }
+    el.addEventListener('touchstart', press, { passive: false }); el.addEventListener('touchend', release, { passive: false }); el.addEventListener('touchcancel', release, { passive: false });
+    el.addEventListener('mousedown', press); el.addEventListener('mouseup', release); el.addEventListener('mouseleave', release);
+  }
+  function wireDpad() {
+    var disc = $('mobileDpadDisc'); if (!disc) return;
+    var active = { up: false, down: false, left: false, right: false }; var captureId = null;
+    function compute(x, y) { var rect = disc.getBoundingClientRect(); var cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2; var r = rect.width / 2; var dx = x - cx, dy = y - cy; var dist = Math.hypot(dx, dy); var next = { up: false, down: false, left: false, right: false }; if (dist < r * 0.18) return next; var deg = Math.atan2(dy, dx) * 180 / Math.PI; if (deg > -67.5 && deg < 67.5) next.right = true; if (deg > 22.5 && deg < 157.5) next.down = true; if (deg > 112.5 || deg < -112.5) next.left = true; if (deg > -157.5 && deg < -22.5) next.up = true; return next; }
+    function apply(next) { ['up','down','left','right'].forEach(function (d) { if (next[d] !== active[d]) { dispatchKey(next[d] ? 'keydown' : 'keyup', KEYMAP[d]); active[d] = next[d]; disc.classList.toggle('d-' + d, next[d]); } }); }
+    function reset() { apply({ up: false, down: false, left: false, right: false }); captureId = null; }
+    function onDown(e) { if (e.preventDefault) e.preventDefault(); try { disc.setPointerCapture(e.pointerId); } catch (_) {} captureId = e.pointerId; apply(compute(e.clientX, e.clientY)); }
+    function onMove(e) { if (captureId != null && e.pointerId !== captureId) return; if (e.pointerType === 'mouse' && !e.buttons) return; if (e.preventDefault) e.preventDefault(); apply(compute(e.clientX, e.clientY)); }
+    function onUp() { reset(); }
+    if (window.PointerEvent) { disc.addEventListener('pointerdown', onDown); disc.addEventListener('pointermove', onMove); disc.addEventListener('pointerup', onUp); disc.addEventListener('pointercancel', onUp); disc.addEventListener('pointerleave', onUp); }
+    disc.addEventListener('touchstart', function (e) { if (e.preventDefault) e.preventDefault(); var t = e.touches[0]; if (t) apply(compute(t.clientX, t.clientY)); }, { passive: false });
+    disc.addEventListener('touchmove',  function (e) { if (e.preventDefault) e.preventDefault(); var t = e.touches[0]; if (t) apply(compute(t.clientX, t.clientY)); }, { passive: false });
+    disc.addEventListener('touchend', onUp); disc.addEventListener('touchcancel', onUp);
+  }
+  function wireMobileControls() {
+    wireButton('mobileA', KEYMAP.a); wireButton('mobileB', KEYMAP.b); wireButton('mobileX', KEYMAP.x); wireButton('mobileY', KEYMAP.y);
+    wireButton('mobileL', KEYMAP.l); wireButton('mobileR', KEYMAP.r); wireButton('mobileZ', KEYMAP.z);
+    wireButton('mobileStart', KEYMAP.start); wireButton('mobileSelect', KEYMAP.select); wireDpad();
+  }
+  function pollController() {
+    if (!dolphin_worker) return;
+    if (Module._CheckJoy) Module._CheckJoy(); if (Module._CheckKeyboard) Module._CheckKeyboard();
+    updatePadState();
+    var src = Module.HEAPU8.subarray(padStatus1, padStatus1 + 16);
+    var arr; while (states_arrs.length > 50) states_arrs.pop();
+    if (states_arrs.length > 0) { arr = states_arrs.pop(); arr.set(src); } else arr = new Uint8Array(src);
+    dolphin_worker.postMessage({ cmd: 'input', states: arr }, [arr.buffer]);
+    setTimeout(pollController, 10);
+  }
+  var renderFrames = 0, lastFpsLog = performance.now();
+  var canvasCtx = null, canvasImg = null;
+  function paintFrame(pixels, w, h, pitch) {
+    var c = $('canvas');
+    if (!canvasCtx) canvasCtx = c.getContext('2d');
+    if (c.width !== w) c.width = w;
+    if (c.height !== h) c.height = h;
+    if (!canvasImg || canvasImg.width !== w || canvasImg.height !== h) {
+      canvasImg = canvasCtx.createImageData(w, h);
+    }
+    var dst = canvasImg.data;
+    var stride = pitch || w * 4;
+    var src = pixels;
+    var di = 0;
+    for (var y = 0; y < h; y++) {
+      var so = y * stride;
+      for (var x = 0; x < w; x++) {
+        // Source is XRGB8888 little-endian = bytes [B,G,R,X]; canvas wants RGBA.
+        dst[di++] = src[so + 2];
+        dst[di++] = src[so + 1];
+        dst[di++] = src[so + 0];
+        dst[di++] = 255;
+        so += 4;
+      }
+    }
+    canvasCtx.putImageData(canvasImg, 0, 0);
+  }
+  function onWorkerMsg(e) {
+    var data = e.data;
+    switch (data.cmd) {
+      case 'print': pageLog('> ' + data.txt); break;
+      case 'setStatus': setStatus(data.txt); break;
+      case 'render': { if (data.pixels) paintFrame(data.pixels, data.w, data.h, data.pitch); if (data.h > 0 && !window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame received w:' + data.w + ' h:' + data.h); } renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now - lastFpsLog)).toFixed(1); renderFrames = 0; lastFpsLog = now; } break; }
+      case 'audio': { if (audioMuted) break; if (Module._feedAudio) Module._feedAudio(data.buf, data.len); break; }
+      case 'stateSaved': if (pendingSaveResolve) { pendingSaveResolve(data.data); pendingSaveResolve = null; } break;
+      case 'stateLoaded': if (pendingLoadResolve) { pendingLoadResolve(); pendingLoadResolve = null; } break;
+      default: pageLog('unknown worker cmd: ' + data.cmd);
+    }
+  }
+  async function loadRomAndBoot() {
+    setStatus('Sizing ROM…');
+    var totalSize = 0;
+    try {
+      var sizes = await Promise.all(ROM_CHUNKS.map(async function (u) {
+        try { var r = await fetch(u, { method: 'HEAD' }); return r.ok ? +(r.headers.get('Content-Length') || 0) : 0; }
+        catch (e) { return 0; }
+      }));
+      totalSize = sizes.reduce(function (a, b) { return a + b; }, 0);
+    } catch (e) { pageLog('[rom] sizing skipped: ' + e); }
+    var totalMB = totalSize ? (totalSize/1048576).toFixed(0) : '?';
+    pageLog('[rom] size hint ' + totalMB + ' MB across ' + ROM_CHUNKS.length + ' chunks');
+    setStatus('Loading ' + ROM_NAME + '…');
+    var total = 0;
+    for (var i = 0; i < ROM_CHUNKS.length; i++) {
+      setStatus('Loading ' + (i+1) + '/' + ROM_CHUNKS.length + ' — ' + (total/1048576).toFixed(0) + ' / ' + totalMB + ' MB');
+      var r = await fetch(ROM_CHUNKS[i]);
+      if (!r.ok) { setStatus('Chunk fetch failed: ' + ROM_CHUNKS[i]); return; }
+      var buf = await r.arrayBuffer();
+      total += buf.byteLength;
+      pageLog('[rom] chunk ' + (i+1) + '/' + ROM_CHUNKS.length + '  (' + (total/1048576).toFixed(1) + ' MB)');
+      dolphin_worker.postMessage({ cmd: 'romChunk', buf: buf }, [buf]);
+      buf = null;
+    }
+    pageLog('[rom] streamed ' + (total/1048576).toFixed(1) + ' MB — booting');
+    setStatus('Booting emulator…');
+    dolphin_worker.postMessage({ cmd: 'romEnd', name: ROM_NAME + '.iso', size: totalSize });
+    setTimeout(pollController, 10);
+    [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
+  }
+  var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; SAVE_KEY = ROM_NAME + '.gcs'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /gamecube/dolphin_libretro/dolphin_libretro.js ...'); setStatus('Loading Dolphin libretro core...'); var s = document.createElement('script'); s.src = '/gamecube/dolphin_libretro/dolphin_libretro.js?v=' + Date.now(); document.body.appendChild(s); }
+  $('btnStart').addEventListener('click', startEmulator);
+  const DB_NAME = 'GCWASMDB', STORE = 'GCWASMSTATES'; var SAVE_KEY = ROM_NAME + '.gcs';
+  function openDB() { return new Promise((resolve, reject) => { var req = indexedDB.open(DB_NAME); req.onupgradeneeded = e => e.target.result.createObjectStore(STORE); req.onsuccess = e => resolve(e.target.result); req.onerror = () => reject(req.error); }); }
+  async function idbPut(key, val) { var db = await openDB(); return new Promise((resolve, reject) => { var t = db.transaction(STORE, 'readwrite').objectStore(STORE).put(val, key); t.onsuccess = () => resolve(); t.onerror = () => reject(t.error); }); }
+  async function idbGet(key) { var db = await openDB(); return new Promise((resolve, reject) => { var t = db.transaction(STORE, 'readonly').objectStore(STORE).get(key); t.onsuccess = () => resolve(t.result); t.onerror = () => reject(t.error); }); }
+  async function gzip(u8) { var cs = new CompressionStream('gzip'); var w = cs.writable.getWriter(); w.write(u8); w.close(); return new Uint8Array(await new Response(cs.readable).arrayBuffer()); }
+  async function gunzip(u8) { var ds = new DecompressionStream('gzip'); var w = ds.writable.getWriter(); w.write(u8); w.close(); return new Uint8Array(await new Response(ds.readable).arrayBuffer()); }
+  async function saveState() { if (!dolphin_worker) return toast('Emulator not ready', true); toast('Saving state…'); try { var data = await new Promise(res => { pendingSaveResolve = res; dolphin_worker.postMessage({ cmd: 'saveState' }); }); var compressed = await gzip(data); await idbPut(SAVE_KEY, compressed); toast('Saved (' + (compressed.byteLength / 1048576).toFixed(1) + ' MB)'); } catch (e) { toast('Save failed: ' + e.message, true); } }
+  async function loadState() { if (!dolphin_worker) return toast('Emulator not ready', true); try { var stored = await idbGet(SAVE_KEY); if (!stored) return toast('No save state found', true); toast('Restoring…'); var data = await gunzip(stored instanceof Uint8Array ? stored : new Uint8Array(stored)); await new Promise(res => { pendingLoadResolve = res; dolphin_worker.postMessage({ cmd: 'loadState', data: data }, [data.buffer]); }); toast('State restored'); } catch (e) { toast('Load failed: ' + (e.message || e), true); } }
+  function toggleMute() { audioMuted = !audioMuted; var ctx = getAudioCtx(); if (ctx) { audioMuted ? ctx.suspend() : ctx.resume(); } $('btnMute').textContent = audioMuted ? '🔇 Unmute' : '🔊 Mute'; $('mMute').textContent = audioMuted ? 'Unmute' : 'Mute'; }
+  async function resetAudio() { var ctx = getAudioCtx(); if (!ctx) { toast('Audio not ready', true); return; } toast('Resetting audio…'); try { await ctx.suspend(); } catch (e) {} await new Promise(r => setTimeout(r, 150)); if (!audioMuted) { try { await ctx.resume(); } catch (e) {} } toast('Audio reset'); }
+  function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasWrap'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
+  $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
+  function openMobileMenu() { $('mobileMenu').classList.add('open'); } function closeMobileMenu() { $('mobileMenu').classList.remove('open'); }
+  function applyGhost(on) { $('mobileShell').classList.toggle('ghost', on); if ($('mGhost')) $('mGhost').textContent = 'Transparent Controls: ' + (on ? 'On' : 'Off'); }
+  function toggleGhost() { var on = !$('mobileShell').classList.contains('ghost'); localStorage.setItem('gcwasm_ghost', on ? '1' : '0'); applyGhost(on); }
+  applyGhost(localStorage.getItem('gcwasm_ghost') === '1');
+  function applyHide(on) { $('mobileShell').classList.toggle('hide-controls', on); if ($('mHide')) $('mHide').textContent = 'Hide Controls: ' + (on ? 'On' : 'Off'); }
+  function toggleHide() { var on = !$('mobileShell').classList.contains('hide-controls'); localStorage.setItem('gcwasm_hide', on ? '1' : '0'); applyHide(on); }
+  applyHide(localStorage.getItem('gcwasm_hide') === '1');
+  $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); closeMobileMenu(); }); $('mResetAudio').addEventListener('click', () => { resetAudio(); closeMobileMenu(); }); $('mGhost').addEventListener('click', toggleGhost); $('mHide').addEventListener('click', () => { toggleHide(); closeMobileMenu(); }); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
+  $('mobileHideHint').addEventListener('click', () => { applyHide(false); localStorage.setItem('gcwasm_hide', '0'); });
+  var GP_BUTTON_KEYS = { 0: KEYMAP.a, 1: KEYMAP.b, 2: KEYMAP.x, 3: KEYMAP.y, 4: KEYMAP.l, 5: KEYMAP.r, 6: KEYMAP.z, 7: KEYMAP.start, 8: KEYMAP.select, 12: KEYMAP.up, 13: KEYMAP.down, 14: KEYMAP.left, 15: KEYMAP.right }; var gpPressed = {}; var gpPolling = false; var GP_AXIS_DEAD = 0.35;
+  function gpEdge(id, keyLabel, pressed) { if (pressed && !gpPressed[id]) { dispatchKey('keydown', keyLabel); gpPressed[id] = true; } else if (!pressed && gpPressed[id]) { dispatchKey('keyup', keyLabel); gpPressed[id] = false; } }
+  function pollGamepads() { var pads = (navigator.getGamepads && navigator.getGamepads()) || []; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; var btns = gp.buttons || []; for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); } requestAnimationFrame(pollGamepads); }
+  window.addEventListener('gamepadconnected', function (e) { setStatus('Controller connected: ' + e.gamepad.id); if (!gpPolling) { gpPolling = true; requestAnimationFrame(pollGamepads); } }); window.addEventListener('gamepaddisconnected', function () { setStatus('Controller disconnected'); }); if (navigator.getGamepads) { gpPolling = true; requestAnimationFrame(pollGamepads); }
+  function checkOrientation() { if (!isMobile) return; var landscape = window.innerWidth > window.innerHeight; var show = started && !landscape; $('rotateHint').style.display = show ? 'flex' : 'none'; }
+  window.addEventListener('resize', checkOrientation); window.addEventListener('orientationchange', checkOrientation);
+  if (isMobile) { $('desktop').style.display = 'none'; var c = $('canvas'); c.style.width = ''; c.style.height = ''; $('mobileScreen').appendChild(c); $('mobileShell').style.display = 'block'; $('mobileSplash').style.display = 'flex'; wireMobileControls(); checkOrientation(); $('mobileSplashStart').addEventListener('pointerdown', function (e) { e.preventDefault(); var mSel = $('mobileRomSelect'); var dSel = $('romSelect'); if (mSel && dSel) dSel.value = mSel.value; $('mobileSplash').style.display = 'none'; startEmulator(); checkOrientation(); }); setStatus('Pick a game and tap Start.'); }
+  document.addEventListener('touchstart', function (e) { if (e.target.closest('.faceBtn, .shoulderBtn, .dpadV, .dpadH, .sysBtn, .menuBtn')) {} }, { passive: true });
+})();
+</script>
+</body>
+</html>
