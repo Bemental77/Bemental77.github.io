@@ -159,7 +159,8 @@
   const ROM_ROOT = '/gamecube/roms/';
   function chunkRange(base, lastLetter) { var urls = []; for (var i = 'a'.charCodeAt(0); i <= lastLetter.charCodeAt(0); i++) { urls.push(ROM_ROOT + base + '.bin.parta' + String.fromCharCode(i)); } return urls; }
   const ROMS = [
-    { label: 'Sonic Adventure 2 Battle', base: 'SonicAdventure2Battle', chunks: chunkRange('SonicAdventure2Battle', 'q') }
+    { label: 'Sonic Adventure 2 Battle', base: 'SonicAdventure2Battle', chunks: chunkRange('SonicAdventure2Battle', 'q') },
+    { label: 'Phantasy Star Online Episode I & II Plus', base: 'PhantasyStarOnline1And2Plus', chunks: chunkRange('PhantasyStarOnline1And2Plus', 'q') }
   ];
   var ROM_NAME = ROMS[0].base, ROM_CHUNKS = ROMS[0].chunks;
   const KEYMAP = { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', a: 'x', b: 'z', x: 's', y: 'd', l: 'w', r: 'r', z: 'e', start: 'v', select: 'c' };

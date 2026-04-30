@@ -145,9 +145,16 @@ inline constexpr s32 LI(u32 i)     {
 // ---------------------------------------------------------------------------
 struct EmitCtx {
     WasmModuleBuilder& b;
-    u32  pc;          // guest PC of this instruction
-    u32  inst;        // raw instruction word
-    bool block_end;   // emitter sets to true to terminate the basic block
+    u32  pc;                 // guest PC of this instruction
+    u32  inst;               // raw instruction word
+    bool block_end;          // emitter sets to true to terminate the basic block
+    // Multiblock chain hint: when this is `bc` (op 16, no LK) and the
+    // instruction immediately following in the build_block buffer is the
+    // bc's fall-through (pc + 4), this flag is true. The bc emitter then
+    // emits ONLY the taken-side return — fall-through continues inline
+    // into the next chained instruction, no block terminator. When false,
+    // bc emits its standard if/else with both paths returning.
+    bool chain_fallthrough;
 };
 
 // Forward-declared core emit functions live in gekko_emit.cpp.
@@ -169,8 +176,32 @@ void gekko_emit_instr(EmitCtx& ctx);
 //
 // Caller is responsible for passing a contiguous instruction buffer that
 // already lives in host memory; the JIT does not fetch from guest RAM.
+// build_block — assemble a WASM module that runs `count` PowerPC
+// instructions starting at `start_pc`.
+//   ctx_ptr_const   absolute address of PowerPCState within the host's
+//                    linear memory (so emitted blocks can read/write GPRs
+//                    via i32.load/store at compile-time-known offsets).
+//   mem_pages        memory import minimum (0 ⇒ defaults to 1 page).
+//   mem1_base        offset of MEM1 within the host's linear memory. When
+//                    non-zero, D-form load/store emit a fast path that
+//                    bypasses ppc_read*/ppc_write* trampolines for any
+//                    address that lands in MEM1 (covers cached, uncached,
+//                    and real-mode mirrors). 0 ⇒ disable the fast path.
+//   mem1_mask        mask applied to addr after a successful range check;
+//                    typically GetRamMask() == GetRamSize()-1.
+//   ram_size         size of MEM1 in bytes; used by the runtime range
+//                    check `(addr & 0x01FFFFFF) < ram_size`.
+// `instr_pcs` is an optional parallel array giving the source PC of each
+// instruction. When non-null, build_block uses it to handle multiblock
+// chained streams: a `b` (op 18, no LK) whose target equals the next
+// instruction's PC in the stream is NOT emitted as a terminator —
+// emit continues with the chained instruction. When null, build_block
+// derives PCs as start_pc + i*4 (single-block legacy path).
 std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
-                            u32 ctx_ptr_const, u32 mem_pages = 0);
+                            u32 ctx_ptr_const, u32 mem_pages = 0,
+                            u32 mem1_base = 0, u32 mem1_mask = 0,
+                            u32 ram_size = 0,
+                            const u32* instr_pcs = nullptr);
 
 // ---------------------------------------------------------------------------
 // Inline helpers used by the .cpp emitter implementations.

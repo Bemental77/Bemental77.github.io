@@ -37,6 +37,15 @@ static void emit_addi(EmitCtx& c) {
 // global set per build_block call (these are not reentrant, but that matches
 // the rest of bementalCompiler).
 static u32 g_ctx_ptr = 0;
+// Linear-memory offset of MEM1 in the shared host heap, set per-build by
+// build_block(). Zero means "fast-path direct memory access disabled, fall
+// back to ppc_read*/ppc_write* trampolines for everything." When non-zero,
+// D-form load/store emitters take a runtime branch on the address: cached-
+// MEM1 hits go via i32.load/store offset=g_mem1_base, everything else
+// (MMIO, MEM2 etc.) falls through to the trampoline.
+static u32 g_mem1_base = 0;
+static u32 g_mem1_mask = 0;
+static u32 g_ram_size  = 0;
 
 #define CTX (g_ctx_ptr)
 
@@ -271,16 +280,81 @@ static void emit_ea_d(EmitCtx& c, u32 ra, s32 simm) {
 }
 
 // lbz/lhz/lwz/lha — D-form loads. update flag toggles RA writeback (lbzu etc.)
+//
+// Fast-path: emit a runtime range check + direct WASM linear-memory load
+// when the address falls in cached/uncached/real MEM1 mirrors. The shared
+// linear memory IS the emscripten heap, so MEM1's storage at offset
+// g_mem1_base is reachable from the JIT block via an `i32.load offset=N`.
+// PPC memory is big-endian; emscripten/WASM is little-endian, so the
+// loaded value needs a 32-bit byte swap (or 16-bit for halfword ops).
+//
+// Range detection: GameCube maps MEM1 at three logical bases:
+//   0x80000000-0x817FFFFF  (cached)
+//   0xC0000000-0xC17FFFFF  (uncached)
+//   0x00000000-0x017FFFFF  (real-mode physical)
+// Common test: `(addr & 0x01FFFFFF) < ram_size`. Fast and covers all three.
+//
+// We embed the load width in `import_idx` (WIMPORT_READ8/16/32). The fast
+// path emits the matching native i32.load8_u / load16_u / load.
 static void emit_load_d(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool update) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
-    // EA in tmp_a
+    // EA in tmp_a (also drop one copy to keep stack clean for the branch).
     emit_ea_d(c, ra, simm);
     c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
-    // value = host_read(EA)
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_call(import_idx);
+
+    // Compile-time gate: per-block DFA in build_block sets g_mem1_base to
+    // the host's MEM1 base ONLY when all loads in the block are proven
+    // MEM1-targeting (base register is r1/r2/r13 or computed from one).
+    // Otherwise g_mem1_base=0 → trampoline whole block. This avoids the
+    // Liftoff perf cliff that hits if/else (result i32) per-load.
+    if (g_mem1_base == 0u) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_call(import_idx);
+    } else {
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x017FFFFF);
+        c.b.op_i32_and();
+        c.b.op_i32_const((s32)g_mem1_base);
+        c.b.op_i32_add();
+        if (import_idx == WIMPORT_READ32) {
+            c.b.op_i32_load(0);
+            c.b.op_local_tee(LOCAL_TMP_B);
+            c.b.op_i32_const(24);
+            c.b.op_i32_shr_u();
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const(8);
+            c.b.op_i32_shr_u();
+            c.b.op_i32_const(0xFF00);
+            c.b.op_i32_and();
+            c.b.op_i32_or();
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const(8);
+            c.b.op_i32_shl();
+            c.b.op_i32_const(0xFF0000);
+            c.b.op_i32_and();
+            c.b.op_i32_or();
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const(24);
+            c.b.op_i32_shl();
+            c.b.op_i32_or();
+        } else if (import_idx == WIMPORT_READ16) {
+            c.b.op_i32_load16_u(0);
+            c.b.op_local_tee(LOCAL_TMP_B);
+            c.b.op_i32_const(8);
+            c.b.op_i32_shr_u();
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const(8);
+            c.b.op_i32_shl();
+            c.b.op_i32_or();
+            c.b.op_i32_const(0xFFFF);
+            c.b.op_i32_and();
+        } else {
+            c.b.op_i32_load8_u(0);
+        }
+    }
+
     if (sign_extend_h) {
         // Sign-extend from 16-bit. WASM has no direct i32_extend16, but
         // (val << 16) >> 16 (signed) does it.
@@ -310,18 +384,67 @@ static void emit_lhau_impl (EmitCtx& c) { emit_load_d(c, WIMPORT_READ16, true,  
 static void emit_lwz_impl  (EmitCtx& c) { emit_load_d(c, WIMPORT_READ32, false, false); }
 static void emit_lwzu_impl (EmitCtx& c) { emit_load_d(c, WIMPORT_READ32, false, true);  }
 
-// stb/sth/stw — D-form stores.
+// stb/sth/stw — D-form stores. Mirror of emit_load_d's fast/slow path
+// strategy: runtime range-check on the address; if it lands in MEM1 take
+// the direct WASM linear-memory store path (with bswap to write the value
+// in PPC big-endian byte order); otherwise the trampoline.
 static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
     const u32 rs = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
     emit_ea_d(c, ra, simm);
     c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
-    // host_write(EA, gpr[rs])
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
-    c.b.op_call(import_idx);
+
+    if (g_mem1_base == 0u) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::gpr(rs));
+        c.b.op_call(import_idx);
+    } else {
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x017FFFFF);
+        c.b.op_i32_and();
+        c.b.op_i32_const((s32)g_mem1_base);
+        c.b.op_i32_add();
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::gpr(rs));
+        if (import_idx == WIMPORT_WRITE32) {
+            c.b.op_local_tee(LOCAL_TMP_B);
+            c.b.op_i32_const(24);
+            c.b.op_i32_shr_u();
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const(8);
+            c.b.op_i32_shr_u();
+            c.b.op_i32_const(0xFF00);
+            c.b.op_i32_and();
+            c.b.op_i32_or();
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const(8);
+            c.b.op_i32_shl();
+            c.b.op_i32_const(0xFF0000);
+            c.b.op_i32_and();
+            c.b.op_i32_or();
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const(24);
+            c.b.op_i32_shl();
+            c.b.op_i32_or();
+            c.b.op_i32_store(0);
+        } else if (import_idx == WIMPORT_WRITE16) {
+            c.b.op_local_tee(LOCAL_TMP_B);
+            c.b.op_i32_const(8);
+            c.b.op_i32_shr_u();
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const(8);
+            c.b.op_i32_shl();
+            c.b.op_i32_or();
+            c.b.op_i32_const(0xFFFF);
+            c.b.op_i32_and();
+            c.b.op_i32_store16(0);
+        } else {
+            c.b.op_i32_store8(0);
+        }
+    }
+
     if (update && ra != 0) {
         c.b.op_i32_const((s32)CTX);
         c.b.op_local_get(LOCAL_TMP_A);
@@ -429,11 +552,28 @@ static void emit_bcx_impl(EmitCtx& c) {
     }
     // Stack: [bit_value 0/1]. If branch_if_true and bit==1, take branch.
     if (!branch_if_true) {
-        // Invert: branch when bit is 0 (e.g., bne+ checks "not EQ").
         c.b.op_i32_eqz();
     }
 
-    // if (cond) { pc = target; return target; } else { pc = fallthrough; return fallthrough; }
+    if (c.chain_fallthrough) {
+        // Multiblock chain: fall-through PC is the next chained instruction.
+        // Emit only the taken-side early return; the else path continues
+        // inline. NO block_end — the chain keeps going.
+        //
+        // Validation: the if's then-body has imbalanced stack (unconditional
+        // return) which WASM's typing system marks polymorphic, then the
+        // (implicit, empty) else matches the no-result if signature.
+        c.b.op_if(/*no result*/ 0x40);
+            emit_set_pc(c, CTX, target);
+            c.b.op_i32_const((s32)target);
+            c.b.op_return();
+        c.b.op_end();
+        // Fall-through: chain continues. Do NOT set block_end.
+        return;
+    }
+
+    // Standalone bc (chain ended here OR not chained): full if/else with
+    // both paths returning.
     c.b.op_if(WASM_TYPE_I32);
         emit_set_pc(c, CTX, target);
         c.b.op_i32_const((s32)target);
@@ -1626,8 +1766,92 @@ void gekko_emit_instr(EmitCtx& c) {
 // ---------------------------------------------------------------------------
 
 std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
-                            u32 ctx_ptr_const, u32 mem_pages) {
+                            u32 ctx_ptr_const, u32 mem_pages,
+                            u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                            const u32* instr_pcs) {
     g_ctx_ptr = ctx_ptr_const;
+    // Per-block DFA (research_findings.md item 5 K_unknown analysis):
+    // walk the block's instructions, track which GPRs are "trusted" as
+    // MEM1 pointers. Trusted baselines: r1 (stack), r2 (TOC), r13 (SDA).
+    // Trust propagates through addi/addis/lis from a trusted source.
+    // Loads invalidate their destination register (loaded value is
+    // unknown). Any other write invalidates the destination.
+    // If ALL D-form load/store base registers are trusted at their use,
+    // the block is safe for MEM1 fastpath (g_mem1_base = mem1_base).
+    // Otherwise force trampoline path (g_mem1_base = 0). The compile-
+    // time decision keeps Liftoff straight-line for both fast and slow
+    // blocks — no per-load runtime branch.
+    {
+        u32 trust = (1u << 1) | (1u << 2) | (1u << 13);  // r1/r2/r13
+        bool block_safe = true;
+        for (u32 i = 0; i < count; ++i) {
+            const u32 inst = insts[i];
+            const u32 op = (inst >> 26) & 0x3Fu;
+            const u32 rt = (inst >> 21) & 0x1Fu;  // also rS for stores
+            const u32 ra = (inst >> 16) & 0x1Fu;
+
+            // 1) Check D-form loads/stores (op 32..47) for trusted base.
+            if (op >= 32u && op <= 45u) {
+                const bool base_trusted = (ra == 0u) || ((trust & (1u << ra)) != 0u);
+                if (!base_trusted) { block_safe = false; break; }
+            }
+
+            // 2) Update trust based on this instruction's writes.
+            //    addi (op 14): rT = rA + simm. Inherits rA's trust (or
+            //                  trusted if rA==0 since simm is small).
+            //    addis (op 15): rT = rA + (simm<<16). When rA==0 (lis),
+            //                   trust if simm in MEM1 range.
+            //    Loads (op 32-35, 40-43): rT loaded, untrusted.
+            //    Loads-update (op 33,35,41,43): rA also updated to EA;
+            //                  EA = rA + simm, so rA stays trusted iff
+            //                  it was trusted (small offset, same base).
+            //    Stores (op 36-39, 44-45): no register written (except
+            //                  -update variants which update rA same as
+            //                  load-update).
+            //    All other op-14/15 writes to rT: be conservative.
+            if (op == 14u) {  // addi
+                if (rt != 0u) {
+                    if (ra == 0u || (trust & (1u << ra))) trust |= (1u << rt);
+                    else trust &= ~(1u << rt);
+                }
+            } else if (op == 15u) {  // addis (lis when rA=0)
+                if (rt != 0u) {
+                    const u32 imm = inst & 0xFFFFu;
+                    if (ra == 0u) {
+                        // lis rT, imm — trusted only if imm puts rT in MEM1
+                        // (cached 0x80?? or low 0x00..0x017F).
+                        // 0xC0..0xCF = MMIO; 0xD0..0xDF = uncached EXRAM-ish.
+                        const bool mem1 = (imm >= 0x8000u && imm <= 0x817Fu)
+                                       || (imm < 0x0180u);
+                        if (mem1) trust |= (1u << rt);
+                        else trust &= ~(1u << rt);
+                    } else {
+                        trust &= ~(1u << rt);
+                    }
+                }
+            } else if (op == 32u || op == 34u || op == 40u || op == 42u) {
+                // Plain loads (lwz, lbz, lhz, lha) — rT untrusted.
+                if (rt != 0u) trust &= ~(1u << rt);
+            } else if (op == 33u || op == 35u || op == 41u || op == 43u) {
+                // Loads-update — rT untrusted; rA stays as-is (EA computed).
+                if (rt != 0u) trust &= ~(1u << rt);
+            } else if (op == 31u) {
+                // X-form: many sub-ops. Conservative — clear rT trust.
+                // (Update-form X-form loads/stores access via rA+rB; we
+                // already always-trampoline X-form via emit_load_x/store_x,
+                // so we don't need to track those here.)
+                if (rt != 0u) trust &= ~(1u << rt);
+            } else if (op >= 24u && op <= 29u) {
+                // ori/oris/xori/xoris/andi/andis — dest is rA (=`ra` field).
+                // Conservative: clear ra's trust unless we can prove safe.
+                if (ra != 0u) trust &= ~(1u << ra);
+            }
+            // Branches, system calls, FP ops etc. don't write GPRs we care about.
+        }
+        g_mem1_base = block_safe ? mem1_base : 0u;
+    }
+    g_mem1_mask = mem1_mask;
+    g_ram_size  = ram_size;
 
     WasmModuleBuilder b;
     b.emitHeader();
@@ -1693,7 +1917,7 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
         b.emitLocals(1, counts, types);
     }
 
-    EmitCtx ctx{ b, start_pc, 0u, false };
+    EmitCtx ctx{ b, start_pc, 0u, false, false };
 
     // HLE function-hooking check at the very start of every block. If the
     // dispatcher entered at a PC that Dolphin's HLE table replaces (OSPanic,
@@ -1716,9 +1940,32 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
 
     bool emitted_terminator = false;
     for (u32 i = 0; i < count; ++i) {
-        ctx.pc = start_pc + i * 4u;
+        ctx.pc = instr_pcs ? instr_pcs[i] : (start_pc + i * 4u);
         ctx.inst = insts[i];
         ctx.block_end = false;
+        ctx.chain_fallthrough = false;
+
+        if (instr_pcs && i + 1 < count) {
+            const u32 op = (ctx.inst >> 26) & 0x3F;
+            // Unconditional `b` whose target IS the next chained
+            // instruction — drop the branch entirely.
+            if (op == 18 && (ctx.inst & 0x1) == 0) {
+                s32 disp = static_cast<s32>(ctx.inst & 0x03FFFFFC);
+                if (disp & 0x02000000) disp |= 0xFC000000;
+                const bool aa = (ctx.inst & 0x2) != 0;
+                const u32 target = aa
+                    ? static_cast<u32>(disp)
+                    : static_cast<u32>(static_cast<s32>(ctx.pc) + disp);
+                if (target == instr_pcs[i + 1])
+                    continue;  // chained — emit nothing for this `b`
+            }
+            // Conditional `bc` whose fall-through (pc + 4) IS the next
+            // chained instruction — emit taken-only return, continue chain.
+            if (op == 16 && (ctx.inst & 0x1) == 0) {
+                if ((ctx.pc + 4u) == instr_pcs[i + 1])
+                    ctx.chain_fallthrough = true;
+            }
+        }
 
         gekko_emit_instr(ctx);
 
@@ -1728,7 +1975,12 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
         }
     }
 
-    const u32 next_pc = start_pc + count * 4u;
+    // Block exit fallthrough PC: pc of the instruction AFTER the last one we
+    // executed. With chaining the count of instructions can include
+    // instructions from multiple physical PC regions, so derive from the
+    // last entry's PC + 4 rather than (start_pc + count*4).
+    const u32 last_pc = instr_pcs && count > 0 ? instr_pcs[count - 1] : (start_pc + (count - 1) * 4u);
+    const u32 next_pc = last_pc + 4u;
     if (!emitted_terminator)
         emit_set_pc(ctx, g_ctx_ptr, next_pc);
     // Trailing return. For terminators that already emitted op_return (bx,
