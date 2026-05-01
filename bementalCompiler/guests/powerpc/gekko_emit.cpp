@@ -1744,12 +1744,32 @@ EmitFn gekko_lookup(u32 inst) {
 }
 
 void gekko_emit_instr(EmitCtx& c) {
-    EmitFn fn = gekko_lookup(c.inst);
-    if (fn) {
-        fn(c);
-    } else {
-        emit_fallback(c);
+    // Route every instruction through Dolphin's interpreter (WIMPORT_INTERP).
+    // This matches native semantics exactly — same paths, same MSR/SPR/MMU
+    // handling, same exception delivery timing. Custom emitters were skipping
+    // some side effects (e.g. MSR.RI preservation) that produced subtle
+    // divergences from native.
+    emit_fallback(c);
+
+    // Properly terminate blocks at control-flow / MSR-changing instructions
+    // so the JIT dispatcher re-fetches at the new PC. Without this, the
+    // generated WASM keeps executing baked-in fallback calls past a branch.
+    const u32 inst  = c.inst;
+    const u32 op    = (inst >> 26) & 0x3F;
+    const u32 sub10 = (inst >> 1)  & 0x3FF;
+    bool ends_block = false;
+    if (op == 16 || op == 17 || op == 18) ends_block = true;     // bc, sc, b
+    if (op == 19) {
+        if (sub10 == 16 || sub10 == 528 || sub10 == 50)
+            ends_block = true;                                    // bclr, bcctr, rfi
     }
+    if (op == 31) {
+        if (sub10 == 146 || sub10 == 178 ||                       // mtmsr, mtmsrd
+            sub10 == 210 || sub10 == 242 ||                       // mtsr, mtsrin
+            sub10 == 4)                                           // tw
+            ends_block = true;
+    }
+    if (ends_block) c.block_end = true;
 }
 
 // ---------------------------------------------------------------------------
