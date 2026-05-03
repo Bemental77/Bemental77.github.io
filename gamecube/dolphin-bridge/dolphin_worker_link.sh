@@ -95,6 +95,7 @@ emcc \
   -Wl,--allow-multiple-definition \
   -sEXPORTED_FUNCTIONS="$EXPORTED_FUNCS" \
   -sEXPORTED_RUNTIME_METHODS="$EXPORTED_RUNTIME" \
-  --embed-file $ROOT/gamecube/IPL.bin@/IPL.bin
+  --embed-file $ROOT/gamecube/IPL.bin@/IPL.bin \
+  --embed-file $ROOT/gamecube/dolphin-src/Data/Sys/totaldb.dsy@/totaldb.dsy
 
 echo "linked: $OUT/dolphin_worker.js"

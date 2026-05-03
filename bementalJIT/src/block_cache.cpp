@@ -314,6 +314,7 @@ bool BlockCache::dispatch(u64 key, s32* out) {
         m_map.erase(it);
         return false;
     }
+
     if (out) *out = r;
     return true;
 }
