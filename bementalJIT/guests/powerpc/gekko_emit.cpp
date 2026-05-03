@@ -35,7 +35,7 @@ static void emit_addi(EmitCtx& c) {
 // We avoid the thread-local hack by giving every emit fn the full context
 // through a shared "EmitState" stored on EmitCtx. Simpler: pass ctx_ptr via a
 // global set per build_block call (these are not reentrant, but that matches
-// the rest of bementalCompiler).
+// the rest of bementalJIT).
 static u32 g_ctx_ptr = 0;
 // Linear-memory offset of MEM1 in the shared host heap, set per-build by
 // build_block(). Zero means "fast-path direct memory access disabled, fall
@@ -1743,26 +1743,60 @@ EmitFn gekko_lookup(u32 inst) {
     return p;
 }
 
+// Per-op exception bail. Native emitters write GPRs/CR/XER but never touch
+// ppc_state.pc — so if a *prior* op in this block (fallback or native)
+// raised an exception that should vector PC, native ops would keep running
+// with corrupted state. Fallback ops are protected by dolphin_interp's
+// PC-divergence guard in JitWasm.cpp; native ops have no equivalent, so
+// this bail is what catches that case. Emits:
+//
+//   if (ppc_check_exc(pc)) { return ppc_state.pc; }
+//
+// The host's dolphin_check_exc reads ppc_state.Exceptions only — it does
+// NOT call CheckExceptions (the dispatcher's outer loop handles vectoring
+// before re-entering the next block). Cost: one host call per native op.
+//
+// While gekko_emit_instr is in its all-fallback override, used_fallback is
+// true on every op and this helper is dead. Becomes live once any group of
+// native emitters is re-enabled.
+static void emit_exception_bail(EmitCtx& c) {
+    c.b.op_i32_const((s32)c.pc);
+    c.b.op_call(WIMPORT_CHECK_EXC);
+    c.b.op_if(WASM_TYPE_I32);
+        c.b.op_i32_const((s32)g_ctx_ptr);
+        c.b.op_i32_load(ppc_off::PC);
+        c.b.op_return();
+    c.b.op_else();
+        c.b.op_i32_const(0);  // dummy to satisfy if-result type
+    c.b.op_end();
+    c.b.op_drop();
+}
+
 void gekko_emit_instr(EmitCtx& c) {
-    // Dispatch via gekko_lookup to native emitters first; fall back to
-    // dolphin_interp (WIMPORT_INTERP) for ops without a native emitter.
+    // Dispatch through gekko_lookup. Native emitters cover most of the
+    // integer/branch/load/store/SPR space; fall back to dolphin_interp for
+    // ops without a native impl (FP single/double, mfcr, mtcrf, system).
     //
-    // The previous all-fallback override blamed "MSR.RI preservation" for
-    // divergence — but that turned out to be the dolphin_interp PC-clobber
-    // bug (fixed in JitWasm.cpp; an exception that vectored PC was
-    // overwritten by the next baked dolphin_interp call). With the
-    // PC-divergence guard in place, native emitters are safe.
-    //
-    // Performance impact: scheduler hot-path (PCs 0x800e5700-0x800e57c0)
-    // is dominated by mfspr/mtspr/lwz/stw/stmw — all natively emitted.
-    // Running them via WASM instructions instead of host-call dolphin_interp
-    // eliminates the per-instruction JS↔WASM↔interp boundary cross.
-    // Native emitters were tried (commit history) but produce stuck-PCs
-    // (different per emitter group enabled). Revert to all-fallback —
-    // proven correct, ~1M dispatches/sec. Real perf fix needs careful
-    // per-emitter validation, not a blanket enable. See
-    // dolphin_pc_divergence_fix.md for the investigation history.
-    emit_fallback(c);
+    // Native ops don't touch ppc_state.pc themselves (branches overwrite
+    // with target before block exit; non-branches leave pc alone). Pre-set
+    // pc = c.pc before each native op — mirrors dolphin_interp's first
+    // line (`ppc_state.pc = pc`). This keeps three things working:
+    //   1. Block-exit dispatcher read of ppc_state.pc returns a current
+    //      value, not whatever stale pc was left by the prior block entry.
+    //   2. The exception bail returns the faulting instruction's pc, so
+    //      the dispatcher re-enters at the correct location after the
+    //      handler vectors PC.
+    //   3. Chained-block continuation: when a chained block continues
+    //      past a non-terminator native op, the next op's pre-set advances
+    //      pc with the chain.
+    c.used_fallback = false;
+    EmitFn fn = gekko_lookup(c.inst);
+    if (fn) {
+        emit_set_pc(c, g_ctx_ptr, c.pc);
+        fn(c);
+    } else {
+        emit_fallback(c);
+    }
 
     // Properly terminate blocks at control-flow / MSR-changing instructions
     // so the JIT dispatcher re-fetches at the new PC. Native emitters set
@@ -1784,6 +1818,14 @@ void gekko_emit_instr(EmitCtx& c) {
             ends_block = true;
     }
     if (ends_block) c.block_end = true;
+
+    // Per-op exception bail — only after a native emitter ran (fallback ops
+    // are covered by their own PC-divergence guard) and only for non-
+    // terminator ops (terminators exit the block anyway). Currently dead
+    // because all ops route through emit_fallback above.
+    if (!c.used_fallback && !c.block_end) {
+        emit_exception_bail(c);
+    }
 }
 
 // ---------------------------------------------------------------------------
