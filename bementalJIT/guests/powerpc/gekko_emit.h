@@ -213,6 +213,29 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
                             const u32* instr_pcs = nullptr);
 
 // ---------------------------------------------------------------------------
+// Multi-module region build. Wraps N concatenated function bodies into a
+// single WASM module with the standard import set (memory + WIMPORT_COUNT
+// host functions) and an INTERNAL funcref table populated with all N
+// bodies via an active element segment. Each body is exported as
+// `fn_<i>` so the dispatcher can enter at any block.
+//
+// `concatenated_bodies` is the raw byte stream of N function entries in
+// code-section form (5-byte LEB128 size prefix + locals + ops + 0x0B
+// end), exactly as produced by WasmModuleBuilder between beginFuncBody()
+// and endFuncBody(). Bodies are concatenated in local-fn-idx order;
+// fn_<i> corresponds to the i-th body in the buffer.
+//
+// V8 inlining note: the table is declared internally (table section) and
+// populated via element segment, not imported. This is the load-bearing
+// invariant — V8's speculative inliner only inlines call_indirect
+// targets when caller and target live in the same instance.
+// ---------------------------------------------------------------------------
+std::vector<u8> build_region_module(const u8* concatenated_bodies,
+                                    std::size_t concatenated_size,
+                                    u32 n_funcs,
+                                    u32 mem_pages = 1);
+
+// ---------------------------------------------------------------------------
 // Inline helpers used by the .cpp emitter implementations.
 // (Kept in the header so individual emit functions can be defined inline
 // alongside their declarations.)

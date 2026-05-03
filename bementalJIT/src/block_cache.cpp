@@ -2,12 +2,25 @@
 
 #include <climits>
 #include <cstdint>
+#include <vector>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
 
 namespace bemental {
+
+// Forward declaration for the guest emitter's merged-module builder.
+// Defined in guests/powerpc/gekko_emit.cpp; declared here (rather than
+// including gekko_emit.h) to keep block_cache.cpp guest-agnostic at the
+// type level. When a second guest emitter (SH4) needs region modules,
+// this becomes a function pointer registered at startup.
+namespace powerpc {
+    std::vector<u8> build_region_module(const u8* concatenated_bodies,
+                                        std::size_t concatenated_size,
+                                        u32 n_funcs,
+                                        u32 mem_pages);
+}
 
 int compile_raw(const u8* bytes, std::size_t size) {
 #ifdef __EMSCRIPTEN__
@@ -368,6 +381,225 @@ s32 BlockCache::chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32
     if (final_pc) *final_pc = fpc;
     if (trap_pc) *trap_pc = tpc;
     return count;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-module region API (Phase 2). See block_cache.h for the design notes
+// (internal table per module, V8 inlining invariant, partition source).
+// ---------------------------------------------------------------------------
+
+Region classify(u32 pc) {
+    if (pc < 0x80050000u)                              return REGION_MAIN_LOW;
+    if (pc >= 0x817e0000u && pc < 0x81800000u)         return REGION_HIGH_LOADER;
+    // Phase 5 will populate REL_n via lookup_rel_for_pc.
+    return REGION_JIT_RUNTIME;
+}
+
+// Monotonic millisecond clock. Uses emscripten_get_now() under emcc (returns
+// double ms with sub-ms resolution) and a fallback otherwise so the host
+// build still compiles without -DBUILD_FOR_BROWSER.
+static double now_ms() {
+#ifdef __EMSCRIPTEN__
+    return emscripten_get_now();
+#else
+    return 0.0;
+#endif
+}
+
+void BlockCache::region_accumulate(Region r, u32 pc,
+                                   const u8* body_bytes, std::size_t body_size) {
+    if (r >= REGION_COUNT) return;
+    if (body_bytes == nullptr || body_size == 0) return;
+    RegionState& rs = m_regions[r];
+
+    // Append the body verbatim. body_bytes is in code-section function-entry
+    // format (5-byte LEB128 size prefix + locals + ops + 0x0B end), as
+    // produced by WasmModuleBuilder. The merged-module emitter concats
+    // these directly into its code section.
+    rs.fn_bodies_concat.insert(rs.fn_bodies_concat.end(),
+                               body_bytes, body_bytes + body_size);
+    rs.pc_keys.push_back(pc);
+    rs.n_funcs           += 1u;
+    rs.blocks_since_link += 1u;
+    rs.last_accum_ms      = now_ms();
+}
+
+bool BlockCache::region_should_relink(Region r) const {
+    if (r >= REGION_COUNT) return false;
+    const RegionState& rs = m_regions[r];
+
+    // Trigger 1: enough new blocks accumulated to make a re-link worthwhile.
+    if (rs.blocks_since_link >= 64u) return true;
+
+    // Trigger 2: steady-state catch — the region has at least one block
+    // pending and hasn't accumulated a new one in >2 s. Without this, a
+    // region that JITs a handful of blocks then quiesces would never get
+    // its merged module built.
+    if (rs.blocks_since_link >= 1u) {
+        const double age = now_ms() - rs.last_accum_ms;
+        if (age > 2000.0) return true;
+    }
+
+    return false;
+}
+
+void BlockCache::region_relink(Region r, u32 mem_pages) {
+    if (r >= REGION_COUNT) return;
+    RegionState& rs = m_regions[r];
+    if (rs.n_funcs == 0u) return;
+
+    // Build the merged-module bytes via the guest emitter.
+    std::vector<u8> bytes = powerpc::build_region_module(
+        rs.fn_bodies_concat.data(),
+        rs.fn_bodies_concat.size(),
+        rs.n_funcs,
+        mem_pages);
+    if (bytes.empty()) {
+#ifdef __EMSCRIPTEN__
+        EM_ASM({
+            console.error('[bemental] region', $0,
+                ' relink: build_region_module returned empty bytes');
+        }, (int)r);
+#endif
+        return;
+    }
+
+#ifdef __EMSCRIPTEN__
+    // Instantiate, populate JS-side per-region pc->local_fn_idx Map, and
+    // swap module_handle. Keep the previous instance alive in
+    // Module.bemental_regions_old until we've successfully bound the new
+    // one — guards against an instantiate failure leaving the region with
+    // no live module.
+    const int new_handle = EM_ASM_INT({
+        const r          = $0 | 0;
+        const bytesPtr   = $1;
+        const bytesLen   = $2 >>> 0;
+        const pcKeysPtr  = $3;
+        const nFuncs     = $4 >>> 0;
+        const generation = $5 | 0;
+        try {
+            const view = new Uint8Array(Module.HEAPU8.buffer, bytesPtr, bytesLen);
+            const copy = new Uint8Array(view);
+            const mod  = new WebAssembly.Module(copy);
+
+            const memObj = (typeof wasmMemory !== 'undefined') ? wasmMemory : null;
+            const env = {};
+            if (memObj) env.memory = memObj;
+            if (Module.bemental_imports && Module.bemental_imports.env) {
+                Object.assign(env, Module.bemental_imports.env);
+            }
+            const inst = new WebAssembly.Instance(mod, { env: env });
+
+            // Build pc -> local_fn_idx Map from the parallel pc_keys array.
+            const pcMap = new Map();
+            for (let i = 0; i < nFuncs; i++) {
+                const pc = HEAPU32[(pcKeysPtr >>> 2) + i] >>> 0;
+                pcMap.set(pc, i);
+            }
+
+            // Pre-resolve each fn_<i> export into a JS array indexed by
+            // local fn idx — avoids a string lookup per dispatch.
+            const fns = new Array(nFuncs);
+            for (let i = 0; i < nFuncs; i++) {
+                fns[i] = inst.exports['fn_' + i];
+            }
+
+            if (!Module.bemental_regions) Module.bemental_regions = {};
+            const prev = Module.bemental_regions[r];
+            Module.bemental_regions[r] = {
+                instance: inst, fns: fns, pcMap: pcMap,
+                nFuncs: nFuncs, generation: generation,
+            };
+            // Drop previous instance reference (V8 GCs the module + code).
+            if (prev) prev.instance = null;
+            console.log('[bemental] region', r, 'relinked gen=', generation,
+                'n_funcs=', nFuncs, 'bytes=', bytesLen);
+            return r;
+        } catch (e) {
+            console.error('[bemental] region', r, 'relink failed:',
+                e && e.message, e && e.stack);
+            return -1;
+        }
+    },
+    (int)r,
+    bytes.data(), (int)bytes.size(),
+    rs.pc_keys.data(), (int)rs.n_funcs,
+    rs.generation + 1);
+
+    if (new_handle < 0) return;
+    rs.module_handle      = new_handle;
+    rs.generation        += 1;
+    rs.blocks_since_link  = 0u;
+#else
+    (void)mem_pages;
+#endif
+}
+
+bool BlockCache::region_dispatch(u32 pc, s32* out) {
+    const Region r = classify(pc);
+    if (r >= REGION_COUNT) return false;
+    if (m_regions[r].module_handle < 0) return false;
+#ifdef __EMSCRIPTEN__
+    return EM_ASM_INT({
+        const r        = $0 | 0;
+        const pc       = $1 >>> 0;
+        const outPtr   = $2;
+        const region   = Module.bemental_regions && Module.bemental_regions[r];
+        if (!region) return 0;
+        const idx = region.pcMap.get(pc);
+        if (idx === undefined) return 0;
+        try {
+            const next = region.fns[idx]() >>> 0;
+            HEAP32[outPtr >>> 2] = next | 0;
+            return 1;
+        } catch (e) {
+            if (Module.bemental_region_traps === undefined) Module.bemental_region_traps = 0;
+            Module.bemental_region_traps++;
+            if (Module.bemental_region_traps <= 16) {
+                console.error('[bemental] region', r, 'dispatch trap pc=0x'
+                    + pc.toString(16) + ' idx=' + idx
+                    + ' msg=' + (e && e.message ? e.message : String(e)));
+            }
+            return 0;
+        }
+    }, (int)r, (int)pc, out) != 0;
+#else
+    (void)pc; (void)out;
+    return false;
+#endif
+}
+
+void BlockCache::region_drop(Region r) {
+    if (r >= REGION_COUNT) return;
+    RegionState& rs = m_regions[r];
+#ifdef __EMSCRIPTEN__
+    if (rs.module_handle >= 0) {
+        EM_ASM({
+            const r = $0 | 0;
+            if (Module.bemental_regions && Module.bemental_regions[r]) {
+                Module.bemental_regions[r] = null;
+                delete Module.bemental_regions[r];
+            }
+        }, (int)r);
+    }
+#endif
+    rs.fn_bodies_concat.clear();
+    rs.pc_keys.clear();
+    rs.n_funcs           = 0u;
+    rs.blocks_since_link = 0u;
+    rs.last_accum_ms     = 0.0;
+    rs.module_handle     = -1;
+    rs.generation        = 0;
+}
+
+std::size_t BlockCache::region_n_funcs(Region r) const {
+    if (r >= REGION_COUNT) return 0u;
+    return m_regions[r].n_funcs;
+}
+
+int BlockCache::region_generation(Region r) const {
+    if (r >= REGION_COUNT) return 0;
+    return m_regions[r].generation;
 }
 
 } // namespace bemental

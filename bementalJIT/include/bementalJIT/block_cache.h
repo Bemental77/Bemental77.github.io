@@ -1,9 +1,61 @@
 #pragma once
 #include "types.h"
+#include <array>
 #include <cstddef>
 #include <unordered_map>
+#include <vector>
 
 namespace bemental {
+
+// ---------------------------------------------------------------------------
+// Multi-module region partitioning (Phase 2 of the multi-module refactor).
+//
+// The runtime carries one merged WASM module per region. Each module
+// declares an INTERNAL funcref table populated with the region's block
+// functions and exports each one as `fn_<idx>`. Branches inside a body
+// that target same-region PCs are emitted as `call_indirect (table 0,
+// type 0)` — V8's speculative inlining requires the call_indirect target
+// to live in the same instance's table, so the table MUST NOT be imported.
+//
+// Region boundaries derive from observed PSO/SAB DOL load addresses
+// captured 2026-05-03 (memory: multi_module_partition_2026_05_03.md):
+//   MAIN_LOW       PCs <  0x80050000
+//   HIGH_LOADER    PCs in 0x817e0000..0x81800000 (apploader-resident)
+//   REL_0..REL_5   per-REL slots populated by the OSLink hook (Phase 5)
+//   JIT_RUNTIME    catch-all (SMC, surprise PCs)
+// ---------------------------------------------------------------------------
+enum Region : u8 {
+    REGION_MAIN_LOW    = 0,
+    REGION_HIGH_LOADER = 1,
+    REGION_REL_0       = 2,
+    REGION_REL_1       = 3,
+    REGION_REL_2       = 4,
+    REGION_REL_3       = 5,
+    REGION_REL_4       = 6,
+    REGION_REL_5       = 7,
+    REGION_JIT_RUNTIME = 8,
+    REGION_COUNT       = 9,
+};
+
+// Classify a guest PC into a region. Phase 5 wires lookup_rel_for_pc to
+// route per-REL PCs into REGION_REL_n; until then those land in
+// REGION_JIT_RUNTIME.
+Region classify(u32 pc);
+
+// Per-region accumulator. Owns the concatenated body bytes for the next
+// re-link. `fn_bodies_concat` stores each body in code-section
+// function-entry format (5-byte LEB128 size prefix + locals + ops +
+// 0x0B end) — exactly what WasmModuleBuilder produces between
+// beginFuncBody() and endFuncBody().
+struct RegionState {
+    std::vector<u8>  fn_bodies_concat;
+    u32              n_funcs           = 0;
+    std::vector<u32> pc_keys;            // pc[i] -> local fn idx i
+    u32              blocks_since_link  = 0;
+    double           last_accum_ms      = 0.0;
+    int              module_handle      = -1;   // Module.bemental_regions[r].handle
+    int              generation         = 0;
+};
 
 // Runtime dispatcher for many compiled WASM modules.
 // Keyed on guest-PC (or any hashable u64). Each module exports a single
@@ -58,8 +110,43 @@ public:
     // Returns the count of blocks dispatched (use for downcount accounting).
     s32 chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_pc);
 
+    // ---- Phase 2 multi-module region API (additive — not yet wired into
+    // the dispatcher path; Phase 4 routes dolphin_interp through it). ----
+
+    // Append a freshly emitted body to its region's accumulator. body_bytes
+    // is a single function-entry as produced by WasmModuleBuilder
+    // (beginFuncBody → ... → endFuncBody): 5-byte LEB128 size prefix +
+    // locals decl + ops + 0x0B end.
+    void region_accumulate(Region r, u32 pc,
+                           const u8* body_bytes, std::size_t body_size);
+
+    // Threshold check. True when:
+    //   ≥64 blocks accumulated since last re-link, OR
+    //   ≥1 block accumulated AND >2000 ms since the last accumulate
+    //   (steady-state catch — otherwise a region that JITs a handful of
+    //    blocks then quiesces would sit in interp forever).
+    bool region_should_relink(Region r) const;
+
+    // Build the merged module via the guest emitter, instantiate it, and
+    // populate the JS-side per-region pc → local_fn_idx Map. Drops the
+    // previous region module (if any) after the new one is live.
+    void region_relink(Region r, u32 mem_pages);
+
+    // Look up `pc`'s region module + local fn idx, call the export, and
+    // capture its i32 return (next-pc) into *out. Returns true on hit;
+    // false → caller falls through to the legacy per-block / interp path.
+    bool region_dispatch(u32 pc, s32* out);
+
+    // For REL unload (Phase 5). Drops the module and clears accumulator.
+    void region_drop(Region r);
+
+    // Diagnostics.
+    std::size_t region_n_funcs(Region r) const;
+    int         region_generation(Region r) const;
+
 private:
-    std::unordered_map<u64, int> m_map;
+    std::unordered_map<u64, int>          m_map;
+    std::array<RegionState, REGION_COUNT> m_regions{};
 };
 
 // ---- Lower-level free helpers ----

@@ -11,6 +11,7 @@
 
 #include "gekko_emit.h"
 #include <array>
+#include <cstdio>
 #include <cstring>
 
 namespace bemental::powerpc {
@@ -2076,6 +2077,108 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     b.op_return();
 
     b.endFuncBody();
+    b.endSection();
+
+    return b.getBytes();
+}
+
+// ---------------------------------------------------------------------------
+// build_region_module — wrap N pre-emitted function bodies into a single
+// merged WASM module with an INTERNAL funcref table populated via active
+// element segment. Each body is exported as `fn_<i>` for JS-side dispatch.
+//
+// V8 inlining invariant: the table is internally declared (table section),
+// not imported. Bodies that emit `call_indirect (table 0, type 0)` for
+// intra-region branch targets land on the same instance's table — V8's
+// speculative inliner only inlines call_indirect when caller and callee
+// share an instance. Importing the table would defeat the entire refactor.
+//
+// Section order (per WASM spec): type, import, function, table, export,
+// element, code.
+// ---------------------------------------------------------------------------
+std::vector<u8> build_region_module(const u8* concatenated_bodies,
+                                    std::size_t concatenated_size,
+                                    u32 n_funcs,
+                                    u32 mem_pages) {
+    if (n_funcs == 0u || concatenated_bodies == nullptr || concatenated_size == 0u)
+        return {};
+
+    WasmModuleBuilder b;
+    b.emitHeader();
+
+    // ---- Type section: same 4 types as build_block ----
+    //  type 0: () -> i32
+    //  type 1: (i32) -> i32
+    //  type 2: (i32, i32) -> ()
+    //  type 3: (i32, i32) -> i32  (reserved)
+    b.emitTypeSection(4);
+    {
+        const u8 i32t[]  = { WASM_TYPE_I32 };
+        const u8 i32x2[] = { WASM_TYPE_I32, WASM_TYPE_I32 };
+        b.emitFuncType(nullptr, 0, i32t, 1);
+        b.emitFuncType(i32t, 1, i32t, 1);
+        b.emitFuncType(i32x2, 2, nullptr, 0);
+        b.emitFuncType(i32x2, 2, i32t, 1);
+    }
+    b.endSection();
+
+    // ---- Import section: memory + WIMPORT_COUNT host functions ----
+    b.emitImportSection(1u + (u32)WIMPORT_COUNT);
+    b.emitImportMemory("env", "memory", mem_pages > 0u ? mem_pages : 1u);
+    b.emitImportFunc("env", "ppc_read8",       /*type*/1);
+    b.emitImportFunc("env", "ppc_read16",      /*type*/1);
+    b.emitImportFunc("env", "ppc_read32",      /*type*/1);
+    b.emitImportFunc("env", "ppc_write8",      /*type*/2);
+    b.emitImportFunc("env", "ppc_write16",     /*type*/2);
+    b.emitImportFunc("env", "ppc_write32",     /*type*/2);
+    b.emitImportFunc("env", "ppc_interp",      /*type*/2);
+    b.emitImportFunc("env", "ppc_check_exc",   /*type*/1);
+    b.emitImportFunc("env", "ppc_break_block", /*type*/2);
+    b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);
+    b.endSection();
+
+    // ---- Function section: N entries, all type 0 ((), i32) ----
+    {
+        std::vector<u32> typeIndices(n_funcs, 0u);
+        b.emitFunctionSection(n_funcs, typeIndices.data());
+    }
+
+    // ---- Table section: one INTERNAL funcref table of size n_funcs.
+    // Both initial and max set to n_funcs — the merged module is sealed
+    // at instantiate time; growth is impossible (next re-link replaces
+    // the whole module). ----
+    b.beginTableSection(1);
+    b.emitTable(n_funcs, /*hasMax=*/true, n_funcs, WASM_REF_FUNCREF);
+    b.endSection();
+
+    // ---- Export section: each body as fn_<i>. WASM function indices
+    // for declared functions start at WIMPORT_COUNT (since 10 imports
+    // claim indices 0..9). ----
+    b.beginExportSection(n_funcs);
+    {
+        char name[24];
+        for (u32 i = 0; i < n_funcs; ++i) {
+            std::snprintf(name, sizeof(name), "fn_%u", (unsigned)i);
+            b.emitExport(name, WASM_EXPORT_FUNC, (u32)WIMPORT_COUNT + i);
+        }
+    }
+    b.endSection();
+
+    // ---- Element section: 1 active segment populating table 0 from
+    // offset 0 with [WIMPORT_COUNT, WIMPORT_COUNT+1, ..., WIMPORT_COUNT+N-1]. ----
+    b.beginElementSection(1);
+    {
+        std::vector<u32> indices(n_funcs);
+        for (u32 i = 0; i < n_funcs; ++i) indices[i] = (u32)WIMPORT_COUNT + i;
+        b.emitActiveElementSegment(/*offset=*/0u, indices.data(), n_funcs);
+    }
+    b.endSection();
+
+    // ---- Code section: N body entries, copied verbatim from the
+    // accumulator. Each entry is already in code-section format
+    // (5-byte LEB128 size prefix + locals + ops + 0x0B end). ----
+    b.beginCodeSection(n_funcs);
+    b.emitBytes(concatenated_bodies, concatenated_size);
     b.endSection();
 
     return b.getBytes();
