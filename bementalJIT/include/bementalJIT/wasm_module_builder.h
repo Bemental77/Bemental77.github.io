@@ -23,9 +23,13 @@ constexpr u8 WASM_SEC_EXPORT = 7;
 constexpr u8 WASM_SEC_CODE = 10;
 
 // WASM import/export kinds
-constexpr u8 WASM_IMPORT_FUNC = 0x00;
+constexpr u8 WASM_IMPORT_FUNC   = 0x00;
+constexpr u8 WASM_IMPORT_TABLE  = 0x01;
 constexpr u8 WASM_IMPORT_MEMORY = 0x02;
-constexpr u8 WASM_EXPORT_FUNC = 0x00;
+constexpr u8 WASM_EXPORT_FUNC   = 0x00;
+
+// WASM reference types (used by tables)
+constexpr u8 WASM_REF_FUNCREF   = 0x70;
 
 // WASM opcodes
 namespace wop {
@@ -268,6 +272,21 @@ public:
 		emitLEB128(typeIdx);
 	}
 
+	// Import a function table (typically Emscripten's
+	// `__indirect_function_table`) so emitted call_indirect ops can target
+	// the host's shared table. Must be called between emitImportSection's
+	// count and endSection. limits flags 0x00 = no max, 0x01 = has max.
+	void emitImportTable(const char* module, const char* name,
+	                     u32 initialSize, bool hasMax = false, u32 maxSize = 0) {
+		emitName(module);
+		emitName(name);
+		emitByte(WASM_IMPORT_TABLE);
+		emitByte(WASM_REF_FUNCREF);
+		emitByte(hasMax ? 0x01 : 0x00);
+		emitLEB128(initialSize);
+		if (hasMax) emitLEB128(maxSize);
+	}
+
 	// --- Function section ---
 
 	void emitFunctionSection(u32 count, const u32* typeIndices) {
@@ -486,6 +505,26 @@ public:
 
 	// Control flow
 	void op_call(u32 funcIdx) { emitByte(wop::call); emitLEB128(funcIdx); }
+	// Indirect call through a table. typeIdx is the function-type index in
+	// the type section; tableIdx is the table import index (0 if there's
+	// only one imported/declared table). The runtime asserts the called
+	// function's signature matches `typeIdx`; mismatch traps.
+	void op_call_indirect(u32 typeIdx, u32 tableIdx = 0) {
+		emitByte(0x11);            // call_indirect
+		emitLEB128(typeIdx);
+		emitLEB128(tableIdx);
+	}
+	// Tail-call counterparts (WASM tail-call proposal — V8 ships this since
+	// 11.2). Stack doesn't grow; caller's frame is replaced.
+	void op_return_call(u32 funcIdx) {
+		emitByte(0x12);            // return_call
+		emitLEB128(funcIdx);
+	}
+	void op_return_call_indirect(u32 typeIdx, u32 tableIdx = 0) {
+		emitByte(0x13);            // return_call_indirect
+		emitLEB128(typeIdx);
+		emitLEB128(tableIdx);
+	}
 	void op_return()     { emitByte(wop::return_); }
 	void op_drop()       { emitByte(wop::drop); }
 	void op_select()     { emitByte(wop::select); }
