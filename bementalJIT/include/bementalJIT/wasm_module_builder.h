@@ -15,18 +15,25 @@ constexpr u8 WASM_TYPE_F32 = 0x7D;
 constexpr u8 WASM_TYPE_F64 = 0x7C;
 constexpr u8 WASM_TYPE_FUNC = 0x60;
 
-// WASM section IDs
-constexpr u8 WASM_SEC_TYPE = 1;
-constexpr u8 WASM_SEC_IMPORT = 2;
+// WASM section IDs (full set in spec order: type=1, import=2, function=3,
+// table=4, memory=5, global=6, export=7, start=8, element=9, code=10,
+// data=11). We emit only the subset listed below.
+constexpr u8 WASM_SEC_TYPE     = 1;
+constexpr u8 WASM_SEC_IMPORT   = 2;
 constexpr u8 WASM_SEC_FUNCTION = 3;
-constexpr u8 WASM_SEC_EXPORT = 7;
-constexpr u8 WASM_SEC_CODE = 10;
+constexpr u8 WASM_SEC_TABLE    = 4;
+constexpr u8 WASM_SEC_EXPORT   = 7;
+constexpr u8 WASM_SEC_ELEMENT  = 9;
+constexpr u8 WASM_SEC_CODE     = 10;
 
 // WASM import/export kinds
 constexpr u8 WASM_IMPORT_FUNC   = 0x00;
 constexpr u8 WASM_IMPORT_TABLE  = 0x01;
 constexpr u8 WASM_IMPORT_MEMORY = 0x02;
 constexpr u8 WASM_EXPORT_FUNC   = 0x00;
+constexpr u8 WASM_EXPORT_TABLE  = 0x01;
+constexpr u8 WASM_EXPORT_MEMORY = 0x02;
+constexpr u8 WASM_EXPORT_GLOBAL = 0x03;
 
 // WASM reference types (used by tables)
 constexpr u8 WASM_REF_FUNCREF   = 0x70;
@@ -296,7 +303,8 @@ public:
 		endSection();
 	}
 
-	// --- Export section ---
+	// --- Export section (single-export, kept for the original
+	// single-function build_block path) ---
 
 	void emitExportSection(const char* name, u32 funcIdx) {
 		beginSection(WASM_SEC_EXPORT);
@@ -305,6 +313,66 @@ public:
 		emitByte(WASM_EXPORT_FUNC);
 		emitLEB128(funcIdx);
 		endSection();
+	}
+
+	// --- Multi-export section (multi-function modules) ---
+	//
+	// Use:
+	//   beginExportSection(N);
+	//   emitExport("name1", WASM_EXPORT_FUNC,  funcIdx1);
+	//   emitExport("name2", WASM_EXPORT_TABLE, tableIdx);
+	//   ...
+	//   endSection();   // existing endSection() works
+	void beginExportSection(u32 count) {
+		beginSection(WASM_SEC_EXPORT);
+		emitLEB128(count);
+	}
+
+	void emitExport(const char* name, u8 kind, u32 idx) {
+		emitName(name);
+		emitByte(kind);
+		emitLEB128(idx);
+	}
+
+	// --- Table section (declares tables defined IN this module — the
+	// foundation for V8 speculative inlining, since call_indirect through
+	// an internally-declared table doesn't trip the cross-instance check.
+	// See kcGCresearch_gaps Gap 1 for the rationale.) ---
+	void beginTableSection(u32 count) {
+		beginSection(WASM_SEC_TABLE);
+		emitLEB128(count);
+	}
+
+	// Encodes one table entry: elem_type then limits.
+	// limits flags: 0x00 = no max, 0x01 = has max.
+	void emitTable(u32 initialSize, bool hasMax = true,
+	               u32 maxSize = 0, u8 elemType = WASM_REF_FUNCREF) {
+		emitByte(elemType);
+		emitByte(hasMax ? 0x01 : 0x00);
+		emitLEB128(initialSize);
+		if (hasMax) emitLEB128(maxSize);
+	}
+
+	// --- Element section (populates a table at instantiation time).
+	// We use the simplest form: an "active" segment with a constant
+	// i32.const offset and a sequence of function indices.
+	void beginElementSection(u32 count) {
+		beginSection(WASM_SEC_ELEMENT);
+		emitLEB128(count);
+	}
+
+	// Active segment for table 0 (default), populating slots
+	// [offset, offset+funcIndices.size()) with the given functions.
+	// Encoding (per WASM 2.0 element-segment forms):
+	//   flags = 0x00 (active, table 0, expr-offset, vec(funcidx))
+	//   offset_expr = i32.const N end
+	//   vec(funcidx) = LEB(N) then N LEB-encoded indices
+	void emitActiveElementSegment(u32 offset, const u32* funcIndices, u32 n) {
+		emitByte(0x00);                         // flags: active, table 0
+		emitByte(wop::i32_const); emitSignedLEB128((s32)offset);
+		emitByte(wop::end);
+		emitLEB128(n);
+		for (u32 i = 0; i < n; ++i) emitLEB128(funcIndices[i]);
 	}
 
 	// --- Code section ---
