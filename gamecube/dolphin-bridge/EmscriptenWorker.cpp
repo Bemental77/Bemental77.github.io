@@ -50,6 +50,7 @@ static bool environment_cb(unsigned cmd, void* data) {
 
 static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
     static int frame_log = 0;
+    static bool first_frame_signaled = false;
     if (frame_log < 3) {
         frame_log++;
         MAIN_THREAD_EM_ASM({
@@ -57,6 +58,14 @@ static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
         }, (uintptr_t)data, w, h, (uint32_t)pitch);
     }
     if (!data || !w || !h) return;
+    // First real frame — flip the boot-loop pacing flag so worker_funcs.js
+    // switches from flat-out boot mode to 60 Hz steady state.
+    if (!first_frame_signaled) {
+        first_frame_signaled = true;
+        MAIN_THREAD_EM_ASM({
+            if (typeof markFirstFrame === 'function') markFirstFrame();
+        });
+    }
     MAIN_THREAD_EM_ASM({
         var bytes = $2 * $3;
         var src = $0;
@@ -125,6 +134,19 @@ int load_iso(const char* path) {
 EMSCRIPTEN_KEEPALIVE
 void run_iter(void) {
     if (g_loaded) retro_run();
+}
+
+// Drain N retro_run slices in one call. Amortizes the JS↔WASM (and
+// PROXY_TO_PTHREAD) round-trip cost across the whole batch instead of
+// per-slice. Caller picks N to balance throughput against responsiveness
+// (large N = better dispatch rate but worse input latency).
+EMSCRIPTEN_KEEPALIVE
+void run_iter_batch(int n) {
+    if (!g_loaded) return;
+    for (int i = 0; i < n; i++) {
+        retro_run();
+        if (!g_loaded) break;
+    }
 }
 
 EMSCRIPTEN_KEEPALIVE

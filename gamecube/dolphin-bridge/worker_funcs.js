@@ -8,14 +8,46 @@ var romChunks = [];
 var totalSize = 0;
 var bootStarted = false;
 var tickInterval = null;
+var firstFrameSeen = false;
+var bootLoopRunning = false;
+
+// During boot (before any frame is produced), run flat-out: drain a large
+// batch via _run_iter_batch then yield to the event loop via setTimeout(0)
+// so messages still get processed. The 60 Hz setInterval pace is correct
+// for a running game (matches GC VBlank) but throttles us 10–16× during
+// early OS init when there's no rendering budget to fill. After the first
+// frame arrives we switch to the steady-state 60 Hz loop.
+async function bootLoop() {
+  if (bootLoopRunning) return;
+  bootLoopRunning = true;
+  while (!firstFrameSeen) {
+    if (Module && Module._run_iter_batch) {
+      Module._run_iter_batch(100000);
+    } else if (Module && Module._run_iter) {
+      for (var i = 0; i < 10000; i++) Module._run_iter();
+    }
+    await new Promise(function (r) { setTimeout(r, 0); });
+  }
+  bootLoopRunning = false;
+}
 
 function startTickLoop() {
   if (tickInterval) return;
   tickInterval = setInterval(function () {
-    if (Module && Module._run_iter) {
+    if (Module && Module._run_iter_batch) {
+      Module._run_iter_batch(10000);
+    } else if (Module && Module._run_iter) {
       for (var i = 0; i < 10000; i++) Module._run_iter();
     }
   }, 16); // ~60 fps
+}
+
+// Called once we know rendering has begun (set by video_cb in
+// EmscriptenWorker.cpp). Lets bootLoop fall through to the 60 Hz tick.
+function markFirstFrame() {
+  if (firstFrameSeen) return;
+  firstFrameSeen = true;
+  startTickLoop();
 }
 
 async function bootIso(name, size) {
@@ -107,7 +139,8 @@ async function bootIso(name, size) {
     return;
   }
   postMessage({ cmd: 'setStatus', txt: 'Running' });
-  startTickLoop();
+  // Run flat-out during boot. Switch to 60 Hz once first frame fires.
+  bootLoop();
 }
 
 self.onmessage = function (e) {
