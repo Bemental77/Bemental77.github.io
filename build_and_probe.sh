@@ -16,7 +16,11 @@ echo "=== build ==="
 emmake make dolphin_libretro -j4 2>&1 | grep -E "error:|Built target dolphin" | tail -3
 
 echo "=== link ==="
-bash /tmp/dolphin_worker_link.sh 2>&1 | tail -1
+# Prefer /tmp copy (faster iteration when active); fall back to repo copy
+# at gamecube/dolphin-bridge/ which survives /tmp wipes.
+LINK_SCRIPT=/tmp/dolphin_worker_link.sh
+[ -f "$LINK_SCRIPT" ] || LINK_SCRIPT=/Users/caseybement/Bemental77.github.io/gamecube/dolphin-bridge/dolphin_worker_link.sh
+bash "$LINK_SCRIPT" 2>&1 | tail -1
 
 echo "=== probe (log: $PROBE_LOG) ==="
 node /Users/caseybement/dolphin_render_probe.js > "$PROBE_LOG" 2>&1
