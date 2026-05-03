@@ -1820,26 +1820,33 @@ void gekko_emit_instr(EmitCtx& c) {
         emit_fallback(c);
     }
 
-    // Properly terminate blocks at control-flow / MSR-changing instructions
-    // so the JIT dispatcher re-fetches at the new PC. Native emitters set
-    // block_end themselves where appropriate; this is the safety net for
-    // fallback path which doesn't.
-    const u32 inst  = c.inst;
-    const u32 op    = (inst >> 26) & 0x3F;
-    const u32 sub10 = (inst >> 1)  & 0x3FF;
-    bool ends_block = false;
-    if (op == 16 || op == 17 || op == 18) ends_block = true;     // bc, sc, b
-    if (op == 19) {
-        if (sub10 == 16 || sub10 == 528 || sub10 == 50)
-            ends_block = true;                                    // bclr, bcctr, rfi
+    // Safety net for FALLBACK paths only. Native emitters set block_end
+    // themselves where appropriate (and deliberately leave it false for
+    // chain_fallthrough cases — bne+ in a chain extends into its
+    // fallthrough's emitter without terminating the block). If we apply
+    // ends_block to the native path here, we break that chain extension:
+    // the next instruction's emitter never runs, and whatever the native
+    // emit's pre-op set_pc(c.pc) wrote to ppc_state.pc is what the
+    // trailing read-PC-and-return picks up — pinning the dispatcher to
+    // the same pc forever.
+    if (c.used_fallback) {
+        const u32 inst  = c.inst;
+        const u32 op    = (inst >> 26) & 0x3F;
+        const u32 sub10 = (inst >> 1)  & 0x3FF;
+        bool ends_block = false;
+        if (op == 16 || op == 17 || op == 18) ends_block = true;     // bc, sc, b
+        if (op == 19) {
+            if (sub10 == 16 || sub10 == 528 || sub10 == 50)
+                ends_block = true;                                    // bclr, bcctr, rfi
+        }
+        if (op == 31) {
+            if (sub10 == 146 || sub10 == 178 ||                       // mtmsr, mtmsrd
+                sub10 == 210 || sub10 == 242 ||                       // mtsr, mtsrin
+                sub10 == 4)                                           // tw
+                ends_block = true;
+        }
+        if (ends_block) c.block_end = true;
     }
-    if (op == 31) {
-        if (sub10 == 146 || sub10 == 178 ||                       // mtmsr, mtmsrd
-            sub10 == 210 || sub10 == 242 ||                       // mtsr, mtsrin
-            sub10 == 4)                                           // tw
-            ends_block = true;
-    }
-    if (ends_block) c.block_end = true;
 
     // Per-op exception bail — only after a native emitter ran (fallback ops
     // are covered by their own PC-divergence guard) and only for non-
