@@ -472,7 +472,11 @@ bool BlockCache::region_should_relink(Region r) const {
     const RegionState& rs = m_regions[r];
 
     // Trigger 1: enough new blocks accumulated to make a re-link worthwhile.
-    if (rs.blocks_since_link >= 64u) return true;
+    // Bumped from 64 → 256 after measuring 9 re-links per 60 s probe at 64
+    // — each re-link is a fresh V8 compile of a 100-400 KB merged module.
+    // The compile cost dominated dispatch time during warmup. 256 cuts
+    // re-link frequency 4× without leaving large gaps between merges.
+    if (rs.blocks_since_link >= 256u) return true;
 
     // Trigger 2: steady-state catch — the region has at least one block
     // pending and hasn't accumulated a new one in >2 s. Without this, a
