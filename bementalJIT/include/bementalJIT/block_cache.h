@@ -48,13 +48,14 @@ Region classify(u32 pc);
 // 0x0B end) — exactly what WasmModuleBuilder produces between
 // beginFuncBody() and endFuncBody().
 struct RegionState {
-    std::vector<u8>  fn_bodies_concat;
-    u32              n_funcs           = 0;
-    std::vector<u32> pc_keys;            // pc[i] -> local fn idx i
-    u32              blocks_since_link  = 0;
-    double           last_accum_ms      = 0.0;
-    int              module_handle      = -1;   // Module.bemental_regions[r].handle
-    int              generation         = 0;
+    std::vector<u8>                 fn_bodies_concat;
+    u32                             n_funcs           = 0;
+    std::vector<u32>                pc_keys;            // pc[i] -> local fn idx i
+    std::unordered_map<u32, u32>    pc_to_idx;          // O(1) reverse lookup
+    u32                             blocks_since_link = 0;
+    double                          last_accum_ms     = 0.0;
+    int                             module_handle     = -1;
+    int                             generation        = 0;
 };
 
 // Runtime dispatcher for many compiled WASM modules.
@@ -139,6 +140,16 @@ public:
 
     // For REL unload (Phase 5). Drops the module and clears accumulator.
     void region_drop(Region r);
+
+    // True if `pc` is already accumulated for its region (caller can skip
+    // re-emission). Cheap O(1) hash lookup.
+    bool region_has_pc(Region r, u32 pc) const;
+
+    // Resolve `target_pc` to a same-region local fn idx. Used as the
+    // backing for emit_block_body's LocalIdxLookupFn. Returns true on
+    // hit; *out_idx receives the local fn idx (index into the region's
+    // internal table, equivalently into pc_keys).
+    bool region_lookup_local_idx(Region r, u32 target_pc, u32* out_idx) const;
 
     // Diagnostics.
     std::size_t region_n_funcs(Region r) const;

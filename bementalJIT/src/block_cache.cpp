@@ -389,7 +389,10 @@ s32 BlockCache::chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32
 // ---------------------------------------------------------------------------
 
 Region classify(u32 pc) {
-    if (pc < 0x80050000u)                              return REGION_MAIN_LOW;
+    // MAIN_LOW upper bound covers both PSO (main DOL ends ~0x80046800)
+    // and SAB (main DOL ends ~0x801de1e0). Single 0x80200000 bound serves
+    // both games — see multi_module_partition_2026_05_03.md.
+    if (pc >= 0x80000000u && pc < 0x80200000u)         return REGION_MAIN_LOW;
     if (pc >= 0x817e0000u && pc < 0x81800000u)         return REGION_HIGH_LOADER;
     // Phase 5 will populate REL_n via lookup_rel_for_pc.
     return REGION_JIT_RUNTIME;
@@ -412,16 +415,56 @@ void BlockCache::region_accumulate(Region r, u32 pc,
     if (body_bytes == nullptr || body_size == 0) return;
     RegionState& rs = m_regions[r];
 
+    // Dedup: if this pc is already accumulated, skip. The first emission
+    // is canonical for the region's current generation. (Phase 7 might
+    // re-emit dirty bodies at re-link time to upgrade unresolved branches
+    // — that path would clear the region first.)
+    if (rs.pc_to_idx.find(pc) != rs.pc_to_idx.end()) return;
+
     // Append the body verbatim. body_bytes is in code-section function-entry
     // format (5-byte LEB128 size prefix + locals + ops + 0x0B end), as
     // produced by WasmModuleBuilder. The merged-module emitter concats
     // these directly into its code section.
+    const u32 local_idx = rs.n_funcs;
     rs.fn_bodies_concat.insert(rs.fn_bodies_concat.end(),
                                body_bytes, body_bytes + body_size);
     rs.pc_keys.push_back(pc);
+    rs.pc_to_idx.emplace(pc, local_idx);
     rs.n_funcs           += 1u;
     rs.blocks_since_link += 1u;
     rs.last_accum_ms      = now_ms();
+
+#ifdef __EMSCRIPTEN__
+    // Diagnostic uses [worker] prefix so the probe puts it in the
+    // worker bucket (displayed in full); generic [bemental] strings land
+    // in the "other" bucket which is truncated to last 15 lines.
+    if (local_idx == 0u) {
+        EM_ASM({
+            console.error('[worker] [bemental] region ' + $0 + ' first accumulate pc=0x'
+                + ($1>>>0).toString(16) + ' body_size=' + $2);
+        }, (int)r, pc, (int)body_size);
+    }
+    if ((rs.n_funcs & 63u) == 0u) {
+        EM_ASM({
+            console.error('[worker] [bemental] region ' + $0 + ' n_funcs=' + $1
+                + ' blocks_since_link=' + $2);
+        }, (int)r, (int)rs.n_funcs, (int)rs.blocks_since_link);
+    }
+#endif
+}
+
+bool BlockCache::region_has_pc(Region r, u32 pc) const {
+    if (r >= REGION_COUNT) return false;
+    return m_regions[r].pc_to_idx.find(pc) != m_regions[r].pc_to_idx.end();
+}
+
+bool BlockCache::region_lookup_local_idx(Region r, u32 target_pc, u32* out_idx) const {
+    if (r >= REGION_COUNT) return false;
+    const auto& m = m_regions[r].pc_to_idx;
+    auto it = m.find(target_pc);
+    if (it == m.end()) return false;
+    if (out_idx) *out_idx = it->second;
+    return true;
 }
 
 bool BlockCache::region_should_relink(Region r) const {
@@ -506,18 +549,20 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
 
             if (!Module.bemental_regions) Module.bemental_regions = {};
             const prev = Module.bemental_regions[r];
-            Module.bemental_regions[r] = {
-                instance: inst, fns: fns, pcMap: pcMap,
-                nFuncs: nFuncs, generation: generation,
-            };
-            // Drop previous instance reference (V8 GCs the module + code).
+            const region = {};
+            region.instance   = inst;
+            region.fns        = fns;
+            region.pcMap      = pcMap;
+            region.nFuncs     = nFuncs;
+            region.generation = generation;
+            Module.bemental_regions[r] = region;
             if (prev) prev.instance = null;
-            console.log('[bemental] region', r, 'relinked gen=', generation,
-                'n_funcs=', nFuncs, 'bytes=', bytesLen);
+            console.log('[worker] [bemental] region ' + r + ' relinked gen=' + generation
+                + ' n_funcs=' + nFuncs + ' bytes=' + bytesLen);
             return r;
         } catch (e) {
-            console.error('[bemental] region', r, 'relink failed:',
-                e && e.message, e && e.stack);
+            console.error('[bemental] region ' + r + ' relink failed: '
+                + (e && e.message ? e.message : String(e)));
             return -1;
         }
     },
