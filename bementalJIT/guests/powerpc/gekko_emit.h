@@ -141,6 +141,19 @@ inline constexpr s32 LI(u32 i)     {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-module region target resolver. When a branch emitter has a static
+// target PC and this callback resolves it to a same-region local fn idx,
+// the emitter emits `return_call_indirect (table 0, type 0)` instead of
+// `set_pc + return`. The call_indirect target lives in the merged
+// region module's INTERNAL table, which is what V8's speculative inliner
+// requires for cross-block inlining (see Gap 1 in the multi-module
+// research). Returns true if `target_pc` is in the same region and writes
+// the local fn idx to `*out_local_idx`; returns false otherwise (caller
+// falls back to set_pc + return, host re-enters the dispatcher).
+// ---------------------------------------------------------------------------
+using LocalIdxLookupFn = bool(*)(const void* user, u32 target_pc, u32* out_local_idx);
+
+// ---------------------------------------------------------------------------
 // Per-instruction emit context.
 // ---------------------------------------------------------------------------
 struct EmitCtx {
@@ -164,6 +177,11 @@ struct EmitCtx {
     // gekko_emit_instr; default-initialized so existing aggregate
     // initializers (build_block) don't need to be updated.
     bool used_fallback = false;
+    // Multi-module region resolver — see LocalIdxLookupFn comment above.
+    // Default null = legacy host-bounce behavior (every branch returns
+    // its target PC for the dispatcher to re-look-up).
+    LocalIdxLookupFn lookup_local_idx = nullptr;
+    const void*      lookup_user      = nullptr;
 };
 
 // Forward-declared core emit functions live in gekko_emit.cpp.
@@ -211,6 +229,27 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
                             u32 mem1_base = 0, u32 mem1_mask = 0,
                             u32 ram_size = 0,
                             const u32* instr_pcs = nullptr);
+
+// ---------------------------------------------------------------------------
+// Body-only counterpart to build_block. Emits a single function entry
+// (5-byte LEB128 size prefix + locals + ops + 0x0B end) into a fresh
+// WasmModuleBuilder and returns its bytes — exactly the format expected
+// by BlockCache::region_accumulate. No module wrapper.
+//
+// Branches with static targets consult `lookup_fn` (if non-null) to
+// resolve same-region targets to a local fn idx; resolved targets emit
+// `return_call_indirect` (intra-module tail-call, V8-inline-able);
+// unresolved targets emit set_pc + return (host re-enters dispatcher).
+//
+// Same per-block DFA + ctx_ptr/mem1 conventions as build_block.
+// ---------------------------------------------------------------------------
+std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
+                                u32 ctx_ptr_const,
+                                u32 mem1_base = 0, u32 mem1_mask = 0,
+                                u32 ram_size = 0,
+                                const u32* instr_pcs = nullptr,
+                                LocalIdxLookupFn lookup_fn = nullptr,
+                                const void* lookup_user = nullptr);
 
 // ---------------------------------------------------------------------------
 // Multi-module region build. Wraps N concatenated function bodies into a

@@ -464,27 +464,47 @@ static void emit_stwu_impl (EmitCtx& c) { emit_store_d(c, WIMPORT_WRITE32, true)
 // Native emitters — branches (block-terminating)
 // ===========================================================================
 
+// Emit either a tail-call into a same-region body (when local_idx is
+// non-null) or a legacy set_pc + return that hands the target PC to the
+// dispatcher. Centralized so b/bc share the same resolution logic.
+//
+// Tail-call form: `i32.const local_idx; return_call_indirect (type 0,
+// table 0)`. The merged region module's INTERNAL table maps slot
+// `local_idx` to the target body — V8 sees both caller and callee in
+// the same instance and inlines through the call_indirect.
+static void emit_branch_resolution(EmitCtx& c, u32 target_pc, const u32* local_idx) {
+    if (local_idx) {
+        c.b.op_i32_const((s32)*local_idx);
+        c.b.op_return_call_indirect(/*type=*/0u, /*table=*/0u);
+        return;
+    }
+    emit_set_pc(c, CTX, target_pc);
+    c.b.op_i32_const((s32)target_pc);
+    c.b.op_return();
+}
+
+// Try to resolve `target_pc` to a same-region local fn idx via the
+// emitter's lookup callback. Returns true and writes `*out` on hit.
+static inline bool try_resolve_target(EmitCtx& c, u32 target_pc, u32* out) {
+    if (!c.lookup_local_idx) return false;
+    return c.lookup_local_idx(c.lookup_user, target_pc, out);
+}
+
 // bx/bl — primary 18, unconditional branch (with optional link).
 static void emit_bx_impl(EmitCtx& c) {
     const s32 li = LI(c.inst);
     const u32 target = AA(c.inst) ? (u32)li : (u32)((s32)c.pc + li);
     if (LK(c.inst)) {
-        // bl: LR := pc + 4, PC := target, return target. Native emit
-        // replaces an interp fallback that was the #3 hot path (op18 was
-        // 16% of all interp calls per profiling tally).
+        // bl: LR := pc + 4, then branch to target. Native emit replaces
+        // an interp fallback that was the #3 hot path (op18 was 16% of
+        // all interp calls per profiling tally).
         c.b.op_i32_const((s32)CTX);
         c.b.op_i32_const((s32)(c.pc + 4));
         c.b.op_i32_store(ppc_off::spr(8));  // LR = pc + 4
-        emit_set_pc(c, CTX, target);
-        c.b.op_i32_const((s32)target);
-        c.b.op_return();
-        c.block_end = true;
-        return;
     }
-    // PC := target, then return target.
-    emit_set_pc(c, CTX, target);
-    c.b.op_i32_const((s32)target);
-    c.b.op_return();
+    u32 lidx = 0u;
+    const bool resolved = try_resolve_target(c, target, &lidx);
+    emit_branch_resolution(c, target, resolved ? &lidx : nullptr);
     c.block_end = true;
 }
 
@@ -556,33 +576,34 @@ static void emit_bcx_impl(EmitCtx& c) {
         c.b.op_i32_eqz();
     }
 
+    u32 t_lidx = 0u, f_lidx = 0u;
+    const bool t_resolved = try_resolve_target(c, target, &t_lidx);
+    const bool f_resolved = try_resolve_target(c, fallthrough, &f_lidx);
+
     if (c.chain_fallthrough) {
         // Multiblock chain: fall-through PC is the next chained instruction.
-        // Emit only the taken-side early return; the else path continues
+        // Emit only the taken-side terminator; the else path continues
         // inline. NO block_end — the chain keeps going.
         //
-        // Validation: the if's then-body has imbalanced stack (unconditional
-        // return) which WASM's typing system marks polymorphic, then the
-        // (implicit, empty) else matches the no-result if signature.
+        // Validation: the if's then-body unconditionally returns (or tail-
+        // calls), making the then-branch polymorphic; the implicit empty
+        // else matches the no-result if signature.
         c.b.op_if(/*no result*/ 0x40);
-            emit_set_pc(c, CTX, target);
-            c.b.op_i32_const((s32)target);
-            c.b.op_return();
+            emit_branch_resolution(c, target, t_resolved ? &t_lidx : nullptr);
         c.b.op_end();
-        // Fall-through: chain continues. Do NOT set block_end.
         return;
     }
 
-    // Standalone bc (chain ended here OR not chained): full if/else with
-    // both paths returning.
-    c.b.op_if(WASM_TYPE_I32);
-        emit_set_pc(c, CTX, target);
-        c.b.op_i32_const((s32)target);
+    // Standalone bc (chain ended here OR not chained). Both arms
+    // unconditionally return / return_call_indirect, so they're polymorphic
+    // — use a no-result if/else and follow with `unreachable` to satisfy
+    // the function-level i32 result requirement.
+    c.b.op_if(/*no result*/ 0x40);
+        emit_branch_resolution(c, target, t_resolved ? &t_lidx : nullptr);
     c.b.op_else();
-        emit_set_pc(c, CTX, fallthrough);
-        c.b.op_i32_const((s32)fallthrough);
+        emit_branch_resolution(c, fallthrough, f_resolved ? &f_lidx : nullptr);
     c.b.op_end();
-    c.b.op_return();
+    c.b.op_unreachable();
     c.block_end = true;
 }
 
@@ -1842,62 +1863,53 @@ void gekko_emit_instr(EmitCtx& c) {
 //      pc + count*4 (i.e. the address right after the block).
 // ---------------------------------------------------------------------------
 
-std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
-                            u32 ctx_ptr_const, u32 mem_pages,
-                            u32 mem1_base, u32 mem1_mask, u32 ram_size,
-                            const u32* instr_pcs) {
+// Internal body emitter shared by build_block (legacy single-function
+// module) and emit_block_body (multi-module accumulator path). Emits the
+// per-block DFA + locals + HLE prologue + instruction stream + trailing
+// PC-read + return, all between the supplied builder's beginFuncBody()
+// and endFuncBody() (which the CALLER is responsible for invoking).
+//
+// All branch emitters consult `lookup_fn`/`lookup_user` (when non-null)
+// to resolve same-region branch targets to local fn indices. When null,
+// every branch host-bounces (legacy behavior).
+static void emit_body_into(WasmModuleBuilder& b,
+                           u32 start_pc, const u32* insts, u32 count,
+                           u32 ctx_ptr_const,
+                           u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                           const u32* instr_pcs,
+                           LocalIdxLookupFn lookup_fn,
+                           const void* lookup_user) {
     g_ctx_ptr = ctx_ptr_const;
-    // Per-block DFA (research_findings.md item 5 K_unknown analysis):
-    // walk the block's instructions, track which GPRs are "trusted" as
-    // MEM1 pointers. Trusted baselines: r1 (stack), r2 (TOC), r13 (SDA).
-    // Trust propagates through addi/addis/lis from a trusted source.
-    // Loads invalidate their destination register (loaded value is
-    // unknown). Any other write invalidates the destination.
-    // If ALL D-form load/store base registers are trusted at their use,
-    // the block is safe for MEM1 fastpath (g_mem1_base = mem1_base).
-    // Otherwise force trampoline path (g_mem1_base = 0). The compile-
-    // time decision keeps Liftoff straight-line for both fast and slow
-    // blocks — no per-load runtime branch.
+    // Per-block DFA: walk the block's instructions, track which GPRs are
+    // "trusted" as MEM1 pointers. Trusted baselines: r1 (stack), r2 (TOC),
+    // r13 (SDA). Trust propagates through addi/addis/lis from a trusted
+    // source. Loads invalidate their dest; any other write to dest
+    // invalidates. If ALL D-form load/store base registers are trusted at
+    // their use, the block is safe for MEM1 fastpath
+    // (g_mem1_base = mem1_base). Otherwise force trampoline path
+    // (g_mem1_base = 0). Compile-time decision keeps Liftoff straight-line
+    // for both fast and slow blocks — no per-load runtime branch.
     {
-        u32 trust = (1u << 1) | (1u << 2) | (1u << 13);  // r1/r2/r13
+        u32 trust = (1u << 1) | (1u << 2) | (1u << 13);
         bool block_safe = true;
         for (u32 i = 0; i < count; ++i) {
             const u32 inst = insts[i];
             const u32 op = (inst >> 26) & 0x3Fu;
-            const u32 rt = (inst >> 21) & 0x1Fu;  // also rS for stores
+            const u32 rt = (inst >> 21) & 0x1Fu;
             const u32 ra = (inst >> 16) & 0x1Fu;
-
-            // 1) Check D-form loads/stores (op 32..47) for trusted base.
             if (op >= 32u && op <= 45u) {
                 const bool base_trusted = (ra == 0u) || ((trust & (1u << ra)) != 0u);
                 if (!base_trusted) { block_safe = false; break; }
             }
-
-            // 2) Update trust based on this instruction's writes.
-            //    addi (op 14): rT = rA + simm. Inherits rA's trust (or
-            //                  trusted if rA==0 since simm is small).
-            //    addis (op 15): rT = rA + (simm<<16). When rA==0 (lis),
-            //                   trust if simm in MEM1 range.
-            //    Loads (op 32-35, 40-43): rT loaded, untrusted.
-            //    Loads-update (op 33,35,41,43): rA also updated to EA;
-            //                  EA = rA + simm, so rA stays trusted iff
-            //                  it was trusted (small offset, same base).
-            //    Stores (op 36-39, 44-45): no register written (except
-            //                  -update variants which update rA same as
-            //                  load-update).
-            //    All other op-14/15 writes to rT: be conservative.
-            if (op == 14u) {  // addi
+            if (op == 14u) {
                 if (rt != 0u) {
                     if (ra == 0u || (trust & (1u << ra))) trust |= (1u << rt);
                     else trust &= ~(1u << rt);
                 }
-            } else if (op == 15u) {  // addis (lis when rA=0)
+            } else if (op == 15u) {
                 if (rt != 0u) {
                     const u32 imm = inst & 0xFFFFu;
                     if (ra == 0u) {
-                        // lis rT, imm — trusted only if imm puts rT in MEM1
-                        // (cached 0x80?? or low 0x00..0x017F).
-                        // 0xC0..0xCF = MMIO; 0xD0..0xDF = uncached EXRAM-ish.
                         const bool mem1 = (imm >= 0x8000u && imm <= 0x817Fu)
                                        || (imm < 0x0180u);
                         if (mem1) trust |= (1u << rt);
@@ -1907,29 +1919,105 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
                     }
                 }
             } else if (op == 32u || op == 34u || op == 40u || op == 42u) {
-                // Plain loads (lwz, lbz, lhz, lha) — rT untrusted.
                 if (rt != 0u) trust &= ~(1u << rt);
             } else if (op == 33u || op == 35u || op == 41u || op == 43u) {
-                // Loads-update — rT untrusted; rA stays as-is (EA computed).
                 if (rt != 0u) trust &= ~(1u << rt);
             } else if (op == 31u) {
-                // X-form: many sub-ops. Conservative — clear rT trust.
-                // (Update-form X-form loads/stores access via rA+rB; we
-                // already always-trampoline X-form via emit_load_x/store_x,
-                // so we don't need to track those here.)
                 if (rt != 0u) trust &= ~(1u << rt);
             } else if (op >= 24u && op <= 29u) {
-                // ori/oris/xori/xoris/andi/andis — dest is rA (=`ra` field).
-                // Conservative: clear ra's trust unless we can prove safe.
                 if (ra != 0u) trust &= ~(1u << ra);
             }
-            // Branches, system calls, FP ops etc. don't write GPRs we care about.
         }
         g_mem1_base = block_safe ? mem1_base : 0u;
     }
     g_mem1_mask = mem1_mask;
     g_ram_size  = ram_size;
 
+    // Locals: 2 i32 scratch.
+    {
+        const u32 counts[] = { LOCAL_TMP_COUNT };
+        const u8  types[]  = { WASM_TYPE_I32 };
+        b.emitLocals(1, counts, types);
+    }
+
+    EmitCtx ctx{ b, start_pc, 0u, false, false };
+    ctx.lookup_local_idx = lookup_fn;
+    ctx.lookup_user      = lookup_user;
+
+    // HLE function-hooking check at the very start of every block.
+    {
+        b.op_i32_const((s32)start_pc);
+        b.op_call(WIMPORT_HLE_CHECK);
+        b.op_if(WASM_TYPE_I32);
+            b.op_i32_const((s32)ctx_ptr_const);
+            b.op_i32_load(ppc_off::PC);
+            b.op_return();
+        b.op_else();
+            b.op_i32_const(0);
+        b.op_end();
+        b.op_drop();
+    }
+
+    bool emitted_terminator = false;
+    for (u32 i = 0; i < count; ++i) {
+        ctx.pc = instr_pcs ? instr_pcs[i] : (start_pc + i * 4u);
+        ctx.inst = insts[i];
+        ctx.block_end = false;
+        ctx.chain_fallthrough = false;
+
+        if (instr_pcs && i + 1 < count) {
+            const u32 op = (ctx.inst >> 26) & 0x3F;
+            // Unconditional `b` whose target IS the next chained
+            // instruction — drop the branch entirely.
+            if (op == 18 && (ctx.inst & 0x1) == 0) {
+                s32 disp = static_cast<s32>(ctx.inst & 0x03FFFFFC);
+                if (disp & 0x02000000) disp |= 0xFC000000;
+                const bool aa = (ctx.inst & 0x2) != 0;
+                const u32 target = aa
+                    ? static_cast<u32>(disp)
+                    : static_cast<u32>(static_cast<s32>(ctx.pc) + disp);
+                if (target == instr_pcs[i + 1])
+                    continue;
+            }
+            // Conditional `bc` whose fall-through (pc + 4) IS the next
+            // chained instruction — emit taken-only return, continue chain.
+            if (op == 16 && (ctx.inst & 0x1) == 0) {
+                if ((ctx.pc + 4u) == instr_pcs[i + 1])
+                    ctx.chain_fallthrough = true;
+            }
+        }
+
+        gekko_emit_instr(ctx);
+
+        if (ctx.block_end) {
+            emitted_terminator = true;
+            break;
+        }
+    }
+
+    // Block exit fallthrough PC.
+    const u32 last_pc = instr_pcs && count > 0
+                        ? instr_pcs[count - 1]
+                        : (start_pc + (count - 1) * 4u);
+    const u32 next_pc = last_pc + 4u;
+    if (!emitted_terminator)
+        emit_set_pc(ctx, g_ctx_ptr, next_pc);
+    // Trailing return: read PC back from context. For terminators that
+    // already op_return'd, this trails as unreachable code — but WASM
+    // validation still requires an i32 on the (polymorphic) stack at the
+    // function's `end`. For fallback-only terminators (bclr/bcctr/rfi/sc,
+    // bcx-fallback), emit_fallback hands control to the interpreter which
+    // writes the real branch target into ppc_state.pc. Reading PC back
+    // here is what carries that target out to the dispatcher.
+    b.op_i32_const((s32)g_ctx_ptr);
+    b.op_i32_load(ppc_off::PC);
+    b.op_return();
+}
+
+std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
+                            u32 ctx_ptr_const, u32 mem_pages,
+                            u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                            const u32* instr_pcs) {
     WasmModuleBuilder b;
     b.emitHeader();
 
@@ -1987,98 +2075,33 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     // ---- Code section ----
     b.beginCodeSection(1);
     b.beginFuncBody();
-    // Locals: 2 i32 scratch
-    {
-        const u32 counts[] = { LOCAL_TMP_COUNT };
-        const u8  types[]  = { WASM_TYPE_I32 };
-        b.emitLocals(1, counts, types);
-    }
-
-    EmitCtx ctx{ b, start_pc, 0u, false, false };
-
-    // HLE function-hooking check at the very start of every block. If the
-    // dispatcher entered at a PC that Dolphin's HLE table replaces (OSPanic,
-    // OSReport, OSEnableInterrupts, etc.), the host trampoline runs the
-    // replacement, sets ppc_state.pc = LR, and returns 1. We then bail out
-    // of this block immediately by returning ppc_state.pc so the dispatcher
-    // picks up the new PC. If 0, fall through to the normal compiled body.
-    {
-        b.op_i32_const((s32)start_pc);
-        b.op_call(WIMPORT_HLE_CHECK);
-        b.op_if(WASM_TYPE_I32);          // i32 result — match emit_bcx_impl style
-            b.op_i32_const((s32)ctx_ptr_const);
-            b.op_i32_load(ppc_off::PC);
-            b.op_return();
-        b.op_else();
-            b.op_i32_const(0);            // dummy value to satisfy if-result type
-        b.op_end();
-        b.op_drop();
-    }
-
-    bool emitted_terminator = false;
-    for (u32 i = 0; i < count; ++i) {
-        ctx.pc = instr_pcs ? instr_pcs[i] : (start_pc + i * 4u);
-        ctx.inst = insts[i];
-        ctx.block_end = false;
-        ctx.chain_fallthrough = false;
-
-        if (instr_pcs && i + 1 < count) {
-            const u32 op = (ctx.inst >> 26) & 0x3F;
-            // Unconditional `b` whose target IS the next chained
-            // instruction — drop the branch entirely.
-            if (op == 18 && (ctx.inst & 0x1) == 0) {
-                s32 disp = static_cast<s32>(ctx.inst & 0x03FFFFFC);
-                if (disp & 0x02000000) disp |= 0xFC000000;
-                const bool aa = (ctx.inst & 0x2) != 0;
-                const u32 target = aa
-                    ? static_cast<u32>(disp)
-                    : static_cast<u32>(static_cast<s32>(ctx.pc) + disp);
-                if (target == instr_pcs[i + 1])
-                    continue;  // chained — emit nothing for this `b`
-            }
-            // Conditional `bc` whose fall-through (pc + 4) IS the next
-            // chained instruction — emit taken-only return, continue chain.
-            if (op == 16 && (ctx.inst & 0x1) == 0) {
-                if ((ctx.pc + 4u) == instr_pcs[i + 1])
-                    ctx.chain_fallthrough = true;
-            }
-        }
-
-        gekko_emit_instr(ctx);
-
-        if (ctx.block_end) {
-            emitted_terminator = true;
-            break;
-        }
-    }
-
-    // Block exit fallthrough PC: pc of the instruction AFTER the last one we
-    // executed. With chaining the count of instructions can include
-    // instructions from multiple physical PC regions, so derive from the
-    // last entry's PC + 4 rather than (start_pc + count*4).
-    const u32 last_pc = instr_pcs && count > 0 ? instr_pcs[count - 1] : (start_pc + (count - 1) * 4u);
-    const u32 next_pc = last_pc + 4u;
-    if (!emitted_terminator)
-        emit_set_pc(ctx, g_ctx_ptr, next_pc);
-    // Trailing return. For terminators that already emitted op_return (bx,
-    // bcx with cond resolved), this trails as unreachable code — but WASM
-    // validation still requires an i32 on the (polymorphic) stack at the
-    // function's `end` opcode regardless of which body path was taken.
-    //
-    // For fallback-only terminators (bclr/bcctr/rfi/sc, bl, bcx-fallback),
-    // emit_fallback hands control to the interpreter which writes the real
-    // branch target into ppc_state.pc. Reading PC back from the context here
-    // — instead of returning the precomputed `start_pc + count*4` constant —
-    // is what carries that branch target out to the dispatcher. Without
-    // this, every fallback-terminated block returns the wrong next-PC,
-    // sending the dispatcher to garbage addresses.
-    b.op_i32_const((s32)g_ctx_ptr);
-    b.op_i32_load(ppc_off::PC);
-    b.op_return();
-
+    emit_body_into(b, start_pc, insts, count, ctx_ptr_const,
+                   mem1_base, mem1_mask, ram_size, instr_pcs,
+                   /*lookup_fn=*/nullptr, /*lookup_user=*/nullptr);
     b.endFuncBody();
     b.endSection();
 
+    return b.getBytes();
+}
+
+// ---------------------------------------------------------------------------
+// emit_block_body — body-only counterpart to build_block. Same DFA + emit
+// logic, but produces a single function-entry (5-byte LEB size + locals +
+// ops + 0x0B) rather than a complete module. Output bytes feed directly
+// into BlockCache::region_accumulate.
+// ---------------------------------------------------------------------------
+std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
+                                u32 ctx_ptr_const,
+                                u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                                const u32* instr_pcs,
+                                LocalIdxLookupFn lookup_fn,
+                                const void* lookup_user) {
+    WasmModuleBuilder b;
+    b.beginFuncBody();
+    emit_body_into(b, start_pc, insts, count, ctx_ptr_const,
+                   mem1_base, mem1_mask, ram_size, instr_pcs,
+                   lookup_fn, lookup_user);
+    b.endFuncBody();
     return b.getBytes();
 }
 
