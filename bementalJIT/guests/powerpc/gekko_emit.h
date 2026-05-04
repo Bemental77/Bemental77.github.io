@@ -330,27 +330,53 @@ inline void emit_store_gpr(EmitCtx& c, u32 i) {
 //   bit1: EQ
 //   bit0: SO (copy of XER.SO — we approximate as 0 for now)
 inline void emit_set_cr0(EmitCtx& c, u32 ctx_ptr) {
-    // Dolphin's ConditionRegister uses an internal encoding where each CR
-    // field is a u64 with: SO at bit 59, EQ ⇔ low 32 bits == 0, GT ⇔
-    // (s64)cr_val > 0, LT at bit 62. The header (ConditionRegister.h) notes:
-    // "sign-extending the result of an operation from 32 to 64 bits results
-    //  in a 64 bit value that works as a CR value."
+    // Dolphin's ConditionRegister encoding (per ConditionRegister.h):
+    //   - bit 32 of u64 (= high u32 bit 0) ALWAYS set (PPCToInternal marker)
+    //   - LT ⇔ bit 62 of u64 (= high u32 bit 30)
+    //   - SO ⇔ bit 59 of u64 (= high u32 bit 27)
+    //   - EQ ⇔ low 32 bits == 0
+    //   - GT ⇔ (s64)cr_val > 0  (i.e., bit 63 is 0 AND value is non-zero)
     //
-    // So for arithmetic results (addic., or., etc.), we just write the i32
-    // result as the low 32 bits and its arithmetic sign-extension as the
-    // high 32 bits. Without this, every Rc=1 operation produced a wrong CR
-    // value and any subsequent bne+/beq misbranched.
-    c.b.op_local_tee(LOCAL_TMP_A);   // tee, save to A, leave on stack
+    // The previous implementation used `result >> 31 signed` for the high
+    // u32, which fills high with 0xFFFFFFFF for negative results — that
+    // sets bit 27 (SO) as a side effect, which differential testing
+    // (DolphinPPCTests oracle) caught: ADD. with negative result reported
+    // SO=1 in CR0, contradicting real-Wii reference. emit_set_cr0 must
+    // set ONLY bit 30 (LT) for negative results, not bit 27 (SO).
+    //
+    // Correct encoding for the high u32 of cr.fields[0]:
+    //   bit 0   = 1  (always-set marker matching PPCToInternal)
+    //   bit 30  = (result < 0)        — LT
+    //   bit 31  = (result <= 0)        — encodes "NOT GT" so (s64)cr_val
+    //                                    is non-positive when result <= 0,
+    //                                    making Dolphin's GT check return 0.
+    //   bit 27  = 0  (SO; intentionally unset — XER.SO is not tracked here.
+    //                Real PPC sets CR0.SO from XER.SO; we leave it 0
+    //                because non-overflow Rc=1 ops do not set XER.SO.)
+    c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
-    // Store low 32 bits at cr.fields[0]
+    // Store low 32 = result.
     c.b.op_i32_const((s32)ctx_ptr);
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_store(ppc_off::cr_field(0));
-    // Store high 32 bits at cr.fields[0] + 4 = sign-extension of value
+    // Compute and store high 32.
     c.b.op_i32_const((s32)ctx_ptr);
+    // bit 30 = sign-bit << 30 (LT)
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const(31);
-    c.b.op_i32_shr_s();
+    c.b.op_i32_shr_u();
+    c.b.op_i32_const(30);
+    c.b.op_i32_shl();
+    // OR with bit 31 = (result <= 0 signed)
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const(0);
+    c.b.op_i32_le_s();
+    c.b.op_i32_const(31);
+    c.b.op_i32_shl();
+    c.b.op_i32_or();
+    // OR with bit 0 marker (always set per Dolphin's PPCToInternal).
+    c.b.op_i32_const(1);
+    c.b.op_i32_or();
     c.b.op_i32_store(ppc_off::cr_field(0) + 4);
 }
 

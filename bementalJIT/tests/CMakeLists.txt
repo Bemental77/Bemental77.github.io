@@ -41,4 +41,25 @@ if(BEMENTAL_GUEST_POWERPC)
         "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
     )
     target_compile_options(test_gekko PRIVATE "-pthread")
+
+    # Differential test: replays DolphinPPCTests' pre-recorded oracle
+    # (1823 X-form integer cases) through bementalJIT and diffs results.
+    add_executable(test_diff test_diff.cpp)
+    target_link_libraries(test_diff PRIVATE bementalJIT bementalJITPowerPC)
+    target_include_directories(test_diff PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(test_diff PROPERTIES SUFFIX ".html")
+    target_link_options(test_diff PRIVATE
+        "SHELL:-s EXIT_RUNTIME=1"
+        "SHELL:-pthread"
+        "SHELL:-s PTHREAD_POOL_SIZE=0"
+        "SHELL:-s INITIAL_MEMORY=33554432"
+        "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+        "SHELL:-s MAXIMUM_MEMORY=67108864"
+        "SHELL:-s ALLOW_TABLE_GROWTH=1"
+        "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+    )
+    target_compile_options(test_diff PRIVATE "-pthread")
 endif()

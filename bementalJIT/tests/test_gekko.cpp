@@ -529,67 +529,15 @@ static bool test_divwu() {
     return next_pc == (s32)(PC + 12u) && env.gpr(3) == 14u;
 }
 
-// or. r3, r4, r5 (Rc=1) — bit OR with CR0 update. Result negative ⇒ CR0.LT
-// (encoded in cr.fields[0] high u32 bit 30, per Dolphin's CR encoding).
-// emit_set_cr0 stores low 32 = result, high 32 = sign-ext(result).
-// Test: r4=0xFFFF0000, r5=0x0000FFFF → r3 = 0xFFFFFFFF. Negative as s32, so
-// the high u32 should be 0xFFFFFFFF (sign-extended -1).
-static bool test_or_with_rc_negative() {
-    TestEnv env;
-    if (!env.init()) return false;
-    const u32 PC = 0x80003000;
-    u32 insts[] = {
-        enc_addis(4, 0, 0xFFFF),         // r4 = 0xFFFF0000 (sign-ext: 0xFFFFFFFF<<16... let's be explicit)
-        // 0xFFFF as s16 = -1, lis r4, -1 = -1 << 16 = 0xFFFF0000
-        enc_ori(5, 0, 0xFFFF),            // r5 = 0 | 0xFFFF = 0x0000FFFF
-        enc_or_rc(3, 4, 5),               // r3 = r4 | r5 = 0xFFFFFFFF, CR0 set
-    };
-    s32 next_pc = -1;
-    if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
-    // Result correct, AND CR0 fields should reflect negativity.
-    if (env.gpr(3) != 0xFFFFFFFFu) return false;
-    if (next_pc != (s32)(PC + 12u)) return false;
-    // emit_set_cr0 writes low 32 = result, high 32 = arith-shift-right by 31 of result
-    // = 0xFFFFFFFF (since bit 31 of 0xFFFFFFFF = 1, sign-ext is all 1s).
-    return env.cr_field0_low() == 0xFFFFFFFFu
-        && env.cr_field0_high() == 0xFFFFFFFFu;
-}
-
-// or. r3, r4, r5 with positive non-zero result → CR0 high u32 = 0
-// (sign-ext of positive value).
-static bool test_or_with_rc_positive() {
-    TestEnv env;
-    if (!env.init()) return false;
-    const u32 PC = 0x80003000;
-    u32 insts[] = {
-        enc_addi(4, 0, 0x55),
-        enc_addi(5, 0, 0xAA),
-        enc_or_rc(3, 4, 5),               // r3 = 0xFF, CR0 set
-    };
-    s32 next_pc = -1;
-    if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
-    if (env.gpr(3) != 0xFFu) return false;
-    if (next_pc != (s32)(PC + 12u)) return false;
-    return env.cr_field0_low() == 0xFFu && env.cr_field0_high() == 0u;
-}
-
-// or. r3, r4, r5 with zero result → CR0.EQ (low 32 == 0 in Dolphin's
-// encoding).
-static bool test_or_with_rc_zero() {
-    TestEnv env;
-    if (!env.init()) return false;
-    const u32 PC = 0x80003000;
-    u32 insts[] = {
-        enc_addi(4, 0, 0),
-        enc_addi(5, 0, 0),
-        enc_or_rc(3, 4, 5),               // r3 = 0, CR0 set: low==0 ⇒ EQ
-    };
-    s32 next_pc = -1;
-    if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
-    if (env.gpr(3) != 0u) return false;
-    return next_pc == (s32)(PC + 12u)
-        && env.cr_field0_low() == 0u && env.cr_field0_high() == 0u;
-}
+// (Removed: test_or_with_rc_{negative,positive,zero} — those asserted on
+// raw cr.fields[0] bytes, which encoded the OLD broken `shr_s 31` form
+// where high u32 was 0xFFFFFFFF for any negative result. After the
+// emit_set_cr0 fix surfaced by test_diff against DolphinPPCTests' oracle,
+// the bit pattern is now 0xC0000001 / 0x00000001 / 0x80000001 (LT only,
+// GT only, EQ only) — matching Dolphin's PPCToInternal exactly. test_diff
+// validates Rc=1 CR semantics across hundreds of cases against the
+// real-Wii reference; those bespoke tests were redundant and asserting
+// the wrong invariant.)
 
 // lwz via trampoline. Base address is 0x40000000 — outside MEM1 trusted
 // ranges, so per-block DFA forces trampoline path (ppc_read32 stub fires).
@@ -936,9 +884,7 @@ static const TestCase k_tests[] = {
     {"mtlr_then_blr",                    &test_mtlr_then_blr},
     {"mullw",                            &test_mullw},
     {"divwu",                            &test_divwu},
-    {"or_with_rc_negative",              &test_or_with_rc_negative},
-    {"or_with_rc_positive",              &test_or_with_rc_positive},
-    {"or_with_rc_zero",                  &test_or_with_rc_zero},
+    // or_with_rc_* removed — see comment above; superseded by test_diff.
     {"lwz_trampoline",                   &test_lwz_trampoline},
     {"stw_trampoline",                   &test_stw_trampoline},
     {"stwu_stack_frame",                 &test_stwu_stack_frame},

@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+# parse_oracle.py — translate DolphinPPCTests' instruction_tests_console.txt
+# into a C++ header with structured test cases for differential testing.
+#
+# Input  format (one per line, OPTEST_3_COMPONENTS shape):
+#   INSTR    :: rD 0xRRRRRRRR | rA 0xAAAAAAAA | rB 0xBBBBBBBB | XER: 0xXXXXXXXX | CR: 0xCCCCCCCC
+#
+# Output format: a C++ array of {mnemonic, instr_word, in_a, in_b, exp_rd,
+# exp_xer, exp_cr} structs, ready to #include from test_diff.cpp.
+#
+# We fix register assignments: dest=r3, srcA=r4, srcB=r5. Initial XER and
+# CR are zero (OPTEST macro clears them). Only X-form 3-component integer
+# instructions are emitted in this first pass; other shapes (CMP, 5-component
+# RLWINM, IMM-suffix, FP, 2-component) are deferred to follow-up passes.
+
+import re
+import sys
+from pathlib import Path
+
+# rT = bits 6-10, rA = bits 11-15, rB = bits 16-20, sub_op = bits 22-30, Rc = bit 31.
+# For "arith" shape: dest goes to rT (bits 6-10).
+# For "logic" shape: dest goes to rA (bits 11-15), src goes to rS (bits 6-10).
+# For "shift" shape: same as logic (rA=dest, rS=src, rB=shift count).
+ARITH_OPS = {
+    'ADD':    266,
+    'ADDC':    10,
+    'ADDE':   138,
+    'DIVW':   491,
+    'DIVWU':  459,
+    'MULHW':   75,
+    'MULHWU':  11,
+    'MULLW':  235,
+    'NEG':    104,  # 2-component (rT, rA) — handled separately
+    'SUBF':    40,
+    'SUBFC':    8,
+    'SUBFE':  136,
+}
+LOGIC_OPS = {
+    'AND':    28,
+    'ANDC':   60,
+    'EQV':   284,
+    'NAND':  476,
+    'NOR':   124,
+    'OR':    444,
+    'ORC':   412,
+    'XOR':   316,
+}
+SHIFT_OPS = {
+    'SLW':     24,
+    'SRW':    536,
+    'SRAW':   792,
+}
+
+OPCODE_31 = 31
+
+def encode_xform_arith(sub_op, rt, ra, rb, rc, oe=False):
+    inst = (OPCODE_31 << 26) | ((rt & 0x1F) << 21) | ((ra & 0x1F) << 16) | ((rb & 0x1F) << 11)
+    if oe:
+        inst |= (1 << 10)  # OE bit (bit 21 in MSB ordering = bit 10 from LSB after the operand fields)
+    inst |= (sub_op << 1) | (1 if rc else 0)
+    return inst & 0xFFFFFFFF
+
+def encode_xform_logical(sub_op, ra, rs, rb, rc):
+    # rA is dest (bits 11-15), rS is src (bits 6-10) — convention swap from arith.
+    inst = (OPCODE_31 << 26) | ((rs & 0x1F) << 21) | ((ra & 0x1F) << 16) | ((rb & 0x1F) << 11)
+    inst |= (sub_op << 1) | (1 if rc else 0)
+    return inst & 0xFFFFFFFF
+
+# Register convention for the differential test harness:
+#   r3 = destination (rD or rA-output depending on shape)
+#   r4 = input rA (or rS for logicals)
+#   r5 = input rB
+DEST_REG = 3
+SRCA_REG = 4
+SRCB_REG = 5
+
+LINE_RE = re.compile(
+    r'^([A-Z_.][A-Z_.0-9]*)\s+::\s+'
+    r'rD\s+0x([0-9A-Fa-f]+)\s+\|\s+'
+    r'rA\s+0x([0-9A-Fa-f]+)\s+\|\s+'
+    r'rB\s+0x([0-9A-Fa-f]+)\s+\|\s+'
+    r'XER:\s+0x([0-9A-Fa-f]+)\s+\|\s+'
+    r'CR:\s+0x([0-9A-Fa-f]+)\s*$'
+)
+
+def encode_for_mnemonic(mnemonic):
+    """Returns (instr_word, kind) or None if mnemonic is unsupported."""
+    rc = mnemonic.endswith('.')
+    base = mnemonic.rstrip('.')
+    # OE-suffix variants — defer for now (need OE bit handling in encoder).
+    if base.endswith('O'):
+        return None
+    if base in ARITH_OPS:
+        sub_op = ARITH_OPS[base]
+        return (encode_xform_arith(sub_op, DEST_REG, SRCA_REG, SRCB_REG, rc), 'arith')
+    if base in LOGIC_OPS:
+        sub_op = LOGIC_OPS[base]
+        return (encode_xform_logical(sub_op, DEST_REG, SRCA_REG, SRCB_REG, rc), 'logic')
+    if base in SHIFT_OPS:
+        sub_op = SHIFT_OPS[base]
+        # Shifts use logical-form encoding (rA=dest, rS=src, rB=count).
+        return (encode_xform_logical(sub_op, DEST_REG, SRCA_REG, SRCB_REG, rc), 'shift')
+    return None
+
+def main():
+    src = Path(__file__).resolve().parent.parent.parent / 'gc_refs' / 'DolphinPPCTests' / 'binary' / 'instruction_tests_console.txt'
+    if not src.exists():
+        # Fallback to absolute path
+        src = Path('/Users/caseybement/gc_refs/DolphinPPCTests/binary/instruction_tests_console.txt')
+    if not src.exists():
+        print(f'oracle file not found: {src}', file=sys.stderr)
+        sys.exit(1)
+
+    cases = []
+    skipped_mnemonics = set()
+    skipped_format = 0
+    with src.open() as f:
+        for line in f:
+            m = LINE_RE.match(line.rstrip('\n'))
+            if not m:
+                continue
+            mnemonic = m.group(1)
+            rd  = int(m.group(2), 16)
+            ra  = int(m.group(3), 16)
+            rb  = int(m.group(4), 16)
+            xer = int(m.group(5), 16)
+            cr  = int(m.group(6), 16)
+            enc = encode_for_mnemonic(mnemonic)
+            if enc is None:
+                skipped_mnemonics.add(mnemonic)
+                skipped_format += 1
+                continue
+            instr_word, kind = enc
+            cases.append((mnemonic, instr_word, kind, ra, rb, rd, xer, cr))
+
+    # Emit C++ header.
+    out = Path(__file__).resolve().parent.parent / 'tests' / 'oracle_data.h'
+    with out.open('w') as f:
+        f.write('// Auto-generated by tools/parse_oracle.py from\n')
+        f.write('// gc_refs/DolphinPPCTests/binary/instruction_tests_console.txt.\n')
+        f.write('// Do not edit by hand — re-run the parser instead.\n')
+        f.write('//\n')
+        f.write(f'// Cases: {len(cases)} parsed, {skipped_format} lines skipped\n')
+        f.write(f'// Skipped mnemonics ({len(skipped_mnemonics)}): {", ".join(sorted(skipped_mnemonics))}\n')
+        f.write('//\n')
+        f.write('// Each test: set ppc_state.gpr[4] = in_a, gpr[5] = in_b, XER = 0, CR = 0;\n')
+        f.write('// dispatch a single-instruction block; assert gpr[3] == exp_rd,\n')
+        f.write('// XER == exp_xer, mfcr-equivalent(CR fields) == exp_cr.\n')
+        f.write('\n')
+        f.write('#pragma once\n')
+        f.write('#include "bementalJIT/types.h"\n')
+        f.write('\n')
+        f.write('struct OracleCase {\n')
+        f.write('    const char* name;\n')
+        f.write('    u32 instr_word;\n')
+        f.write('    u32 in_a;\n')
+        f.write('    u32 in_b;\n')
+        f.write('    u32 exp_rd;\n')
+        f.write('    u32 exp_xer;\n')
+        f.write('    u32 exp_cr;\n')
+        f.write('};\n')
+        f.write('\n')
+        f.write(f'static constexpr OracleCase k_oracle_cases[] = {{\n')
+        for (mnemonic, instr_word, kind, ra, rb, rd, xer, cr) in cases:
+            f.write(f'    {{"{mnemonic}", 0x{instr_word:08x}u, 0x{ra:08x}u, 0x{rb:08x}u, 0x{rd:08x}u, 0x{xer:08x}u, 0x{cr:08x}u}},\n')
+        f.write('};\n')
+        f.write('\n')
+        f.write(f'static constexpr unsigned k_oracle_case_count = {len(cases)};\n')
+
+    print(f'Wrote {len(cases)} cases to {out}')
+    print(f'Skipped mnemonics: {", ".join(sorted(skipped_mnemonics))}')
+
+if __name__ == '__main__':
+    main()
