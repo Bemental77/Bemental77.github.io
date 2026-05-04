@@ -1,19 +1,11 @@
 // test_diff.cpp — differential testing of bementalJIT vs Dolphin's interpreter
-// using DolphinPPCTests' pre-recorded oracle.
-//
-// For each of ~1800 oracle test cases:
-//   1. Initialize a fresh PowerPCState in linear memory
-//   2. Set gpr[4] = in_a, gpr[5] = in_b, XER=0, CR=0 (matches OPTEST harness)
-//   3. build_block + compile + dispatch a single-instruction block
-//   4. Extract gpr[3], reconstruct mfxer/mfcr equivalents from PPCState
-//   5. Compare to expected exp_rd / exp_xer / exp_cr from the oracle
-//
-// Mismatch = bementalJIT diverges from Dolphin's interpreter (which itself
-// is validated against real Wii hardware via DolphinPPCTests). Either an
-// emit bug, or a missing native emitter (the test interp stub is no-op,
-// so any fallback path will fail the result check).
-//
-// Reports: per-mnemonic pass/fail breakdown + first-N divergent cases.
+// using DolphinPPCTests' pre-recorded oracle. Now covers all six OPTEST shapes:
+//   3-operand        (ADD, OR, MULLW, ...)
+//   2-operand        (NEG, EXTSB, CNTLZW, ...)
+//   3-op + immediate (ADDI, ANDI., MULLI, ...)
+//   compare          (CMP, CMPL — no rD output)
+//   compare + imm    (CMPI, CMPLI)
+//   5-operand        (RLWINM, RLWIMI)
 
 #include "bementalJIT/bemental.h"
 #include "guests/powerpc/gekko_emit.h"
@@ -34,13 +26,7 @@ using namespace bemental;
 using namespace bemental::powerpc;
 
 // Reconstruct mfcr-equivalent u32 from Dolphin's per-field cr storage.
-// Mirrors ConditionRegister::GetField exactly:
-//   LT ⇔ bit 62 of u64 (= bit 30 of high u32)
-//   SO ⇔ bit 59 of u64 (= bit 27 of high u32)
-//   EQ ⇔ low 32 == 0
-//   GT ⇔ (s64)cr_val > 0   ← can't be derived from LT/EQ alone — Dolphin
-//                            relies on bit 63 being set whenever GT is
-//                            false. PPCToInternal sets bit 63 = !GT.
+// Mirrors ConditionRegister::GetField exactly.
 static u32 dolphin_to_mfcr(const void* ctx_raw) {
     const u8* base = (const u8*)ctx_raw;
     u32 mfcr = 0;
@@ -58,9 +44,6 @@ static u32 dolphin_to_mfcr(const void* ctx_raw) {
     return mfcr;
 }
 
-// Reconstruct mfxer-equivalent from Dolphin's split storage:
-//   xer_ca       at offset XER_CA      (u8)  — value at bit 29
-//   xer_so_ov    at offset XER_SO_OV   (u8)  — format (SO<<1)|OV at bits 30-31
 static u32 dolphin_to_mfxer(const void* ctx_raw) {
     const u8* base = (const u8*)ctx_raw;
     const u8 ca    = *(base + ppc_off::XER_CA);
@@ -114,41 +97,37 @@ int main() {
     if (!ctx_raw) { std::printf("[FAIL] calloc\n"); return 1; }
     const u32 ctx_ptr = (u32)(uintptr_t)ctx_raw;
 
-    std::map<std::string, std::pair<unsigned, unsigned>> per_mnemonic;  // pass / fail
+    std::map<std::string, std::pair<unsigned, unsigned>> per_mnemonic;
     unsigned total_pass = 0, total_fail = 0;
     std::vector<std::string> first_failures;
 
     for (unsigned i = 0; i < k_oracle_case_count; ++i) {
         const OracleCase& tc = k_oracle_cases[i];
 
-        // Reset state. Each test starts with the macro's SetCR(0)/SetXER(0).
+        // Reset state. Each OPTEST clears CR/XER before running, so the
+        // initial state mirrors that.
         std::memset(ctx_raw, 0, CTX_BYTES);
         u8* base = (u8*)ctx_raw;
-        *(u32*)(base + ppc_off::gpr(4)) = tc.in_a;
-        *(u32*)(base + ppc_off::gpr(5)) = tc.in_b;
+
         // Initialize CR fields to PPCToInternal(0) — Dolphin's "all-flags-
-        // clear" canonical form. A memset-zero state would read as "EQ
-        // set" via GetField (low 32 == 0), which is NOT what real PPC
-        // means by an unwritten CR field.
+        // clear" canonical form. Memset-zero would read as "EQ set."
         for (int f = 0; f < 8; ++f) {
             *(u64*)(base + ppc_off::cr_field(f)) = 0x8000000100000001ULL;
         }
 
-        // Build a 1-instruction block. instr_pcs sequential.
-        u32 instr_pcs[1] = {START_PC};
-        std::vector<u8> bytes = build_block(START_PC, &tc.instr_word, 1, ctx_ptr,
-                                            /*mem_pages=*/0, /*mem1_base=*/0,
-                                            /*mem1_mask=*/0, /*ram_size=*/0,
-                                            instr_pcs);
+        // Wire input registers per shape:
+        //   r4 = in_a (rA value, always)
+        //   r5 = in_b (rB value, only for 3OP/CMP shapes; immediate-form
+        //              cases have imm baked into the instruction word)
+        *(u32*)(base + ppc_off::gpr(4)) = tc.in_a;
+        *(u32*)(base + ppc_off::gpr(5)) = tc.in_b;
 
-        // Each iteration uses a fresh start_pc-keyed entry. Cache.compile()
-        // releases the prior entry if the key collides — but to be safe we
-        // give each test its own pc by offsetting.
+        // Each test gets its own start_pc to avoid cache key collisions
+        // across the 3000+ test cases.
         const u32 pc_for_this = START_PC + (i & 0xFFFu) * 0x100u;
-        // Re-emit with the correct pc baked in (set_pc constants depend on pc).
-        instr_pcs[0] = pc_for_this;
-        bytes = build_block(pc_for_this, &tc.instr_word, 1, ctx_ptr,
-                            0, 0, 0, 0, instr_pcs);
+        u32 instr_pcs[1] = {pc_for_this};
+        std::vector<u8> bytes = build_block(pc_for_this, &tc.instr_word, 1, ctx_ptr,
+                                            0, 0, 0, 0, instr_pcs);
 
         int handle = cache.compile(pc_for_this, bytes.data(), bytes.size());
         if (handle < 0) { ++total_fail; per_mnemonic[tc.name].second++; continue; }
@@ -162,7 +141,9 @@ int main() {
         const u32 got_xer = dolphin_to_mfxer(ctx_raw);
         const u32 got_cr  = dolphin_to_mfcr(ctx_raw);
 
-        const bool ok = (got_rd  == tc.exp_rd)
+        // Compare. CMP shapes don't produce an rD; skip the rD check.
+        const bool check_rd = (tc.shape != OS_CMP) && (tc.shape != OS_CMP_IMM);
+        const bool ok = (!check_rd || got_rd == tc.exp_rd)
                      && (got_xer == tc.exp_xer)
                      && (got_cr  == tc.exp_cr);
         if (ok) {
@@ -174,8 +155,8 @@ int main() {
             if (first_failures.size() < 20) {
                 char buf[256];
                 std::snprintf(buf, sizeof(buf),
-                    "%-8s  in_a=0x%08x in_b=0x%08x  rd %s%08x exp%08x  xer %s%08x exp%08x  cr %s%08x exp%08x",
-                    tc.name, tc.in_a, tc.in_b,
+                    "%-8s shape=%u  in_a=0x%08x in_b=0x%08x  rd %s%08x exp%08x  xer %s%08x exp%08x  cr %s%08x exp%08x",
+                    tc.name, tc.shape, tc.in_a, tc.in_b,
                     (got_rd == tc.exp_rd ? "==" : "!="),  got_rd,  tc.exp_rd,
                     (got_xer == tc.exp_xer ? "==" : "!="), got_xer, tc.exp_xer,
                     (got_cr == tc.exp_cr ? "==" : "!="),  got_cr,  tc.exp_cr);
@@ -186,7 +167,6 @@ int main() {
 
     std::free(ctx_raw);
 
-    // Per-mnemonic summary.
     char buf[256];
     std::printf("\n=== per-mnemonic ===\n");
     for (const auto& kv : per_mnemonic) {
