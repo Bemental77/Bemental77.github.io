@@ -726,6 +726,287 @@ static void emit_orcx_impl(EmitCtx& c) {
     }
 }
 
+// Helper: store the carry-out byte to ppc_state.xer_ca. Stack must have
+// [carry_value 0/1] on top; consumes it. The byte at XER_CA holds the
+// CA bit directly (0 or 1) per Dolphin's split XER storage.
+static inline void emit_store_xer_ca(EmitCtx& c, u32 ctx_ptr) {
+    // Stack: [carry]. We need [ctx, carry] for store8.
+    c.b.op_local_set(LOCAL_TMP_B);
+    c.b.op_i32_const((s32)ctx_ptr);
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_store8(ppc_off::XER_CA);
+}
+
+// addc rT, rA, rB: rT = rA + rB; XER.CA = unsigned carry-out.
+static void emit_addcx_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
+    // result = rA + rB → TMP_A
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i32_add();
+    c.b.op_local_set(LOCAL_TMP_A);
+    // gpr[rt] = result
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_store(ppc_off::gpr(rt));
+    // XER.CA = (result < rA) unsigned
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_lt_u();
+    emit_store_xer_ca(c, CTX);
+    if (RC(c.inst)) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_set_cr0(c, CTX);
+    }
+}
+
+// subfc rT, rA, rB: rT = rB - rA; XER.CA = (rA <= rB) unsigned (= no
+// underflow, equivalently the carry out from ~rA + rB + 1).
+static void emit_subfcx_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
+    // result = rB - rA → TMP_A
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_sub();
+    c.b.op_local_set(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_store(ppc_off::gpr(rt));
+    // XER.CA = (rA <= rB) unsigned
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i32_le_u();
+    emit_store_xer_ca(c, CTX);
+    if (RC(c.inst)) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_set_cr0(c, CTX);
+    }
+}
+
+// adde rT, rA, rB: rT = rA + rB + XER.CA; XER.CA = compound carry-out.
+static void emit_addex_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
+    // temp = rA + rB → TMP_A
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i32_add();
+    c.b.op_local_set(LOCAL_TMP_A);
+    // result = temp + xer.CA → TMP_B (XER_CA byte holds 0 or 1 directly)
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load8_u(ppc_off::XER_CA);
+    c.b.op_i32_add();
+    c.b.op_local_set(LOCAL_TMP_B);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_store(ppc_off::gpr(rt));
+    // new XER.CA = (temp < rA) || (result < temp)
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_lt_u();
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_lt_u();
+    c.b.op_i32_or();
+    emit_store_xer_ca(c, CTX);
+    if (RC(c.inst)) {
+        c.b.op_local_get(LOCAL_TMP_B);
+        emit_set_cr0(c, CTX);
+    }
+}
+
+// subfe rT, rA, rB: rT = ~rA + rB + XER.CA = (rB - rA - 1) + XER.CA.
+// Compound carry-out detection.
+static void emit_subfex_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
+    // a_inv = ~rA  →  pushed onto stack
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_const(-1);
+    c.b.op_i32_xor();
+    c.b.op_local_set(LOCAL_TMP_A);   // TMP_A = ~rA
+    // temp = ~rA + rB
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i32_add();
+    c.b.op_local_set(LOCAL_TMP_B);   // TMP_B = ~rA + rB
+    // result = temp + xer.CA
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load8_u(ppc_off::XER_CA);
+    c.b.op_i32_add();
+    c.b.op_local_set(LOCAL_TMP_A);   // TMP_A = result (overwrite)
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_store(ppc_off::gpr(rt));
+    // new XER.CA = (temp < ~rA) || (result < temp)
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_const(-1);
+    c.b.op_i32_xor();
+    c.b.op_i32_lt_u();
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_lt_u();
+    c.b.op_i32_or();
+    emit_store_xer_ca(c, CTX);
+    if (RC(c.inst)) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_set_cr0(c, CTX);
+    }
+}
+
+// addme rT, rA: rT = rA + XER.CA + (-1) = rA + XER.CA - 1
+// Compound: like ADDE with rB = -1 (immediate). Carry-out semantics
+// match ADDE with rB = -1.
+static void emit_addmex_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst), ra = RA(c.inst);
+    // temp = rA + (-1)
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_const(-1);
+    c.b.op_i32_add();
+    c.b.op_local_set(LOCAL_TMP_A);
+    // result = temp + xer.CA
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load8_u(ppc_off::XER_CA);
+    c.b.op_i32_add();
+    c.b.op_local_set(LOCAL_TMP_B);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_store(ppc_off::gpr(rt));
+    // CA = (temp < rA, since rB=-1) || (result < temp)
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_lt_u();
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_lt_u();
+    c.b.op_i32_or();
+    emit_store_xer_ca(c, CTX);
+    if (RC(c.inst)) {
+        c.b.op_local_get(LOCAL_TMP_B);
+        emit_set_cr0(c, CTX);
+    }
+}
+
+// addze rT, rA: rT = rA + XER.CA + 0 — like ADDE with rB = 0.
+static void emit_addzex_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst), ra = RA(c.inst);
+    // result = rA + xer.CA
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load8_u(ppc_off::XER_CA);
+    c.b.op_i32_add();
+    c.b.op_local_set(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_store(ppc_off::gpr(rt));
+    // CA = (result < rA)
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_lt_u();
+    emit_store_xer_ca(c, CTX);
+    if (RC(c.inst)) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_set_cr0(c, CTX);
+    }
+}
+
+// subfme rT, rA: rT = ~rA + XER.CA + (-1)
+static void emit_subfmex_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst), ra = RA(c.inst);
+    // a_inv = ~rA
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_const(-1);
+    c.b.op_i32_xor();
+    c.b.op_local_set(LOCAL_TMP_A);   // TMP_A = ~rA
+    // temp = ~rA + (-1)
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const(-1);
+    c.b.op_i32_add();
+    c.b.op_local_set(LOCAL_TMP_B);
+    // result = temp + xer.CA
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load8_u(ppc_off::XER_CA);
+    c.b.op_i32_add();
+    c.b.op_local_set(LOCAL_TMP_A);   // overwrite TMP_A with result
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_const(-1);
+    c.b.op_i32_xor();
+    c.b.op_local_set(LOCAL_TMP_B);   // restore ~rA into TMP_B for CA check
+    // ... actually rewrite for clarity: load result for store
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_store(ppc_off::gpr(rt));
+    // CA = (temp < ~rA, with rB=-1) || (result < temp). We've overwritten
+    // TMP_A and TMP_B — recompute. Acceptable since this is cold-path arith.
+    // Recompute temp = ~rA - 1.
+    c.b.op_local_get(LOCAL_TMP_B);   // ~rA
+    c.b.op_i32_const(-1);
+    c.b.op_i32_add();                 // temp = ~rA + -1
+    c.b.op_local_get(LOCAL_TMP_B);   // ~rA
+    c.b.op_i32_lt_u();                // (temp < ~rA)
+    c.b.op_local_get(LOCAL_TMP_A);   // result
+    c.b.op_local_get(LOCAL_TMP_B);   // ~rA
+    c.b.op_i32_const(-1);
+    c.b.op_i32_add();                 // recompute temp
+    c.b.op_i32_lt_u();                // (result < temp)
+    c.b.op_i32_or();
+    emit_store_xer_ca(c, CTX);
+    if (RC(c.inst)) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_set_cr0(c, CTX);
+    }
+}
+
+// subfze rT, rA: rT = ~rA + XER.CA + 0
+static void emit_subfzex_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst), ra = RA(c.inst);
+    // result = ~rA + xer.CA
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_const(-1);
+    c.b.op_i32_xor();
+    c.b.op_local_set(LOCAL_TMP_A);   // TMP_A = ~rA
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load8_u(ppc_off::XER_CA);
+    c.b.op_i32_add();
+    c.b.op_local_set(LOCAL_TMP_B);   // TMP_B = result
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_store(ppc_off::gpr(rt));
+    // CA = (result < ~rA)
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_lt_u();
+    emit_store_xer_ca(c, CTX);
+    if (RC(c.inst)) {
+        c.b.op_local_get(LOCAL_TMP_B);
+        emit_set_cr0(c, CTX);
+    }
+}
+
 // neg rT, rA: rT = -rA = (~rA) + 1. X-form 2-op arith.
 static void emit_negx_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
@@ -1883,6 +2164,19 @@ constexpr OpEntry table31_entries[] = {
     { 75, &emit_mulhwx_impl},
     { 11, &emit_mulhwux_impl},
     {792, &emit_srawx_impl},
+    // Carry-arithmetic: ADDC*/SUBFC*/ADDE*/SUBFE* (compound carry-out).
+    // OE-suffix variants reuse the non-OE emitter — XER.OV/SO is not
+    // tracked here; tests with overflow-detection asserts will fail
+    // those bits but rD + XER.CA match.
+    { 10, &emit_addcx_impl},  {522, &emit_addcx_impl},
+    {  8, &emit_subfcx_impl}, {520, &emit_subfcx_impl},
+    {138, &emit_addex_impl},  {650, &emit_addex_impl},
+    {136, &emit_subfex_impl}, {648, &emit_subfex_impl},
+    // Implicit-operand carry-arithmetic: ADDME/ADDZE/SUBFME/SUBFZE.
+    {234, &emit_addmex_impl},  {746, &emit_addmex_impl},
+    {202, &emit_addzex_impl},  {714, &emit_addzex_impl},
+    {232, &emit_subfmex_impl}, {744, &emit_subfmex_impl},
+    {200, &emit_subfzex_impl}, {712, &emit_subfzex_impl},
     {235, &emit_mullwx_impl}, {747, &emit_mullwx_impl},
     {491, &emit_divwx_impl},  {1003, &emit_divwx_impl},
     {459, &emit_divwux_impl}, {971, &emit_divwux_impl},
