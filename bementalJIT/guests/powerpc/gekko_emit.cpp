@@ -835,42 +835,39 @@ static void emit_addex_impl(EmitCtx& c) {
 }
 
 // subfe rT, rA, rB: rT = ~rA + rB + XER.CA = (rB - rA - 1) + XER.CA.
-// Compound carry-out detection.
+// Compute new XER.CA BEFORE storing rT (avoids the rT==rA reload bug —
+// see emit_addex_impl).
 static void emit_subfex_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    // a_inv = ~rA  →  pushed onto stack
+    // TMP_A = ~rA
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(ra));
     c.b.op_i32_const(-1);
     c.b.op_i32_xor();
-    c.b.op_local_set(LOCAL_TMP_A);   // TMP_A = ~rA
-    // temp = ~rA + rB
+    c.b.op_local_set(LOCAL_TMP_A);
+    // TMP_B = temp = ~rA + rB
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(rb));
     c.b.op_i32_add();
-    c.b.op_local_set(LOCAL_TMP_B);   // TMP_B = ~rA + rB
-    // result = temp + xer.CA
-    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_local_tee(LOCAL_TMP_B);            // [temp]
+    // first carry term: (temp < ~rA)
+    c.b.op_local_get(LOCAL_TMP_A);            // [temp, ~rA]
+    c.b.op_i32_lt_u();                        // [(temp<~rA)]
+    // result = temp + CA → overwrite TMP_A
+    c.b.op_local_get(LOCAL_TMP_B);            // [(temp<~rA), temp]
     c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load8_u(ppc_off::XER_CA);
-    c.b.op_i32_add();
-    c.b.op_local_set(LOCAL_TMP_A);   // TMP_A = result (overwrite)
+    c.b.op_i32_load8_u(ppc_off::XER_CA);      // [(temp<~rA), temp, ca]
+    c.b.op_i32_add();                         // [(temp<~rA), result]
+    c.b.op_local_tee(LOCAL_TMP_A);            // TMP_A = result; stack [(temp<~rA), result]
+    c.b.op_local_get(LOCAL_TMP_B);            // [(temp<~rA), result, temp]
+    c.b.op_i32_lt_u();                        // [(temp<~rA), (result<temp)]
+    c.b.op_i32_or();                          // [carry]
+    emit_store_xer_ca(c, CTX);                // [], TMP_B clobbered
+    // gpr[rT] = result (still in TMP_A)
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_store(ppc_off::gpr(rt));
-    // new XER.CA = (temp < ~rA) || (result < temp)
-    c.b.op_local_get(LOCAL_TMP_B);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
-    c.b.op_i32_const(-1);
-    c.b.op_i32_xor();
-    c.b.op_i32_lt_u();
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_local_get(LOCAL_TMP_B);
-    c.b.op_i32_lt_u();
-    c.b.op_i32_or();
-    emit_store_xer_ca(c, CTX);
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
@@ -878,110 +875,101 @@ static void emit_subfex_impl(EmitCtx& c) {
 }
 
 // addme rT, rA: rT = rA + XER.CA + (-1) = rA + XER.CA - 1
-// Compound: like ADDE with rB = -1 (immediate). Carry-out semantics
-// match ADDE with rB = -1.
+// Compound: like ADDE with rB = -1. Compute CA before storing rT.
 static void emit_addmex_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
-    // temp = rA + (-1)
+    // TMP_A = rA
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_local_set(LOCAL_TMP_A);
+    // TMP_B = temp = rA + (-1)
+    c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const(-1);
     c.b.op_i32_add();
-    c.b.op_local_set(LOCAL_TMP_A);
-    // result = temp + xer.CA
-    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_local_tee(LOCAL_TMP_B);            // [temp]
+    // (temp < rA)
+    c.b.op_local_get(LOCAL_TMP_A);            // [temp, rA]
+    c.b.op_i32_lt_u();                        // [(temp<rA)]
+    // result = temp + CA → overwrite TMP_A
+    c.b.op_local_get(LOCAL_TMP_B);
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load8_u(ppc_off::XER_CA);
     c.b.op_i32_add();
-    c.b.op_local_set(LOCAL_TMP_B);
-    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_tee(LOCAL_TMP_A);            // TMP_A = result
     c.b.op_local_get(LOCAL_TMP_B);
-    c.b.op_i32_store(ppc_off::gpr(rt));
-    // CA = (temp < rA, since rB=-1) || (result < temp)
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
-    c.b.op_i32_lt_u();
-    c.b.op_local_get(LOCAL_TMP_B);
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_lt_u();
+    c.b.op_i32_lt_u();                        // (result<temp)
     c.b.op_i32_or();
     emit_store_xer_ca(c, CTX);
-    if (RC(c.inst)) {
-        c.b.op_local_get(LOCAL_TMP_B);
-        emit_set_cr0(c, CTX);
-    }
-}
-
-// addze rT, rA: rT = rA + XER.CA + 0 — like ADDE with rB = 0.
-static void emit_addzex_impl(EmitCtx& c) {
-    const u32 rt = RT(c.inst), ra = RA(c.inst);
-    // result = rA + xer.CA
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load8_u(ppc_off::XER_CA);
-    c.b.op_i32_add();
-    c.b.op_local_set(LOCAL_TMP_A);
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_store(ppc_off::gpr(rt));
-    // CA = (result < rA)
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
-    c.b.op_i32_lt_u();
-    emit_store_xer_ca(c, CTX);
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     }
 }
 
-// subfme rT, rA: rT = ~rA + XER.CA + (-1)
+// addze rT, rA: rT = rA + XER.CA + 0 — like ADDE with rB = 0.
+// Note: emit_store_xer_ca clobbers TMP_B as a scratch local. So we must
+// either store gpr[rt] BEFORE emit_store_xer_ca or keep result in TMP_A.
+static void emit_addzex_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst), ra = RA(c.inst);
+    // TMP_A = rA
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_local_set(LOCAL_TMP_A);
+    // Push CTX, compute result, tee into TMP_B, store gpr[rt].
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load8_u(ppc_off::XER_CA);
+    c.b.op_i32_add();                          // [CTX, result]
+    c.b.op_local_tee(LOCAL_TMP_B);             // TMP_B = result
+    c.b.op_i32_store(ppc_off::gpr(rt));        // []
+    // CA = (result < rA). TMP_B and TMP_A both live here.
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_lt_u();
+    emit_store_xer_ca(c, CTX);                 // clobbers TMP_B; OK, gpr[rt] already stored.
+    if (RC(c.inst)) {
+        // Re-load result from memory (gpr[rt] has it).
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::gpr(rt));
+        emit_set_cr0(c, CTX);
+    }
+}
+
+// subfme rT, rA: rT = ~rA + XER.CA + (-1).
+// Compute CA before storing rT.
 static void emit_subfmex_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
-    // a_inv = ~rA
+    // TMP_A = ~rA
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(ra));
     c.b.op_i32_const(-1);
     c.b.op_i32_xor();
-    c.b.op_local_set(LOCAL_TMP_A);   // TMP_A = ~rA
-    // temp = ~rA + (-1)
+    c.b.op_local_set(LOCAL_TMP_A);
+    // TMP_B = temp = ~rA + (-1)
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const(-1);
     c.b.op_i32_add();
-    c.b.op_local_set(LOCAL_TMP_B);
-    // result = temp + xer.CA
+    c.b.op_local_tee(LOCAL_TMP_B);            // [temp]
+    // (temp < ~rA)
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_lt_u();                        // [(temp<~rA)]
+    // result = temp + CA → overwrite TMP_A
     c.b.op_local_get(LOCAL_TMP_B);
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load8_u(ppc_off::XER_CA);
     c.b.op_i32_add();
-    c.b.op_local_set(LOCAL_TMP_A);   // overwrite TMP_A with result
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
-    c.b.op_i32_const(-1);
-    c.b.op_i32_xor();
-    c.b.op_local_set(LOCAL_TMP_B);   // restore ~rA into TMP_B for CA check
-    // ... actually rewrite for clarity: load result for store
+    c.b.op_local_tee(LOCAL_TMP_A);            // TMP_A = result
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_lt_u();                        // (result<temp)
+    c.b.op_i32_or();
+    emit_store_xer_ca(c, CTX);
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_store(ppc_off::gpr(rt));
-    // CA = (temp < ~rA, with rB=-1) || (result < temp). We've overwritten
-    // TMP_A and TMP_B — recompute. Acceptable since this is cold-path arith.
-    // Recompute temp = ~rA - 1.
-    c.b.op_local_get(LOCAL_TMP_B);   // ~rA
-    c.b.op_i32_const(-1);
-    c.b.op_i32_add();                 // temp = ~rA + -1
-    c.b.op_local_get(LOCAL_TMP_B);   // ~rA
-    c.b.op_i32_lt_u();                // (temp < ~rA)
-    c.b.op_local_get(LOCAL_TMP_A);   // result
-    c.b.op_local_get(LOCAL_TMP_B);   // ~rA
-    c.b.op_i32_const(-1);
-    c.b.op_i32_add();                 // recompute temp
-    c.b.op_i32_lt_u();                // (result < temp)
-    c.b.op_i32_or();
-    emit_store_xer_ca(c, CTX);
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
@@ -991,27 +979,28 @@ static void emit_subfmex_impl(EmitCtx& c) {
 // subfze rT, rA: rT = ~rA + XER.CA + 0
 static void emit_subfzex_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
-    // result = ~rA + xer.CA
+    // TMP_A = ~rA
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(ra));
     c.b.op_i32_const(-1);
     c.b.op_i32_xor();
-    c.b.op_local_set(LOCAL_TMP_A);   // TMP_A = ~rA
+    c.b.op_local_set(LOCAL_TMP_A);
+    // result = ~rA + CA → tee into TMP_B, store to gpr[rt].
+    c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load8_u(ppc_off::XER_CA);
     c.b.op_i32_add();
-    c.b.op_local_set(LOCAL_TMP_B);   // TMP_B = result
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_local_get(LOCAL_TMP_B);
-    c.b.op_i32_store(ppc_off::gpr(rt));
+    c.b.op_local_tee(LOCAL_TMP_B);             // TMP_B = result
+    c.b.op_i32_store(ppc_off::gpr(rt));        // gpr[rt] = result
     // CA = (result < ~rA)
     c.b.op_local_get(LOCAL_TMP_B);
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_lt_u();
-    emit_store_xer_ca(c, CTX);
+    emit_store_xer_ca(c, CTX);                 // clobbers TMP_B
     if (RC(c.inst)) {
-        c.b.op_local_get(LOCAL_TMP_B);
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::gpr(rt));
         emit_set_cr0(c, CTX);
     }
 }
@@ -1087,40 +1076,72 @@ static void emit_mulhwux_impl(EmitCtx& c) {
 }
 
 // sraw rA, rS, rB: arithmetic right shift by (rB & 0x3F).
-// PPC: shift by ≥32 → result = sign-extended (all 0s or all 1s); also sets
-// XER.CA per PPC spec but we're not tracking that here for variable shifts
-// (the few SAB call sites aren't carry-sensitive). For shift in 0..31 we
-// use i32.shr_s; for shift ≥32 the result is (s32)rS >> 31 (= 0 or -1).
+// sraw rA, rS, rB: rA = ((s32)rS) >> (rB & 0x3F) saturated.
+//   For shift n in 0..31: rA = rS >> n (signed); CA = (rS<0) && ((rS & ((1<<n)-1)) != 0)
+//   For shift n >= 32:    rA = (s32)rS >> 31 (= 0 or -1); CA = (rS < 0)
+// Store rA BEFORE emit_store_xer_ca (which clobbers TMP_B).
 static void emit_srawx_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    // Compute "result if shift<32": rS >> (rB & 0x1F) signed
+    // TMP_A = rS
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(rs));
+    c.b.op_local_set(LOCAL_TMP_A);
+    // Compute result and store to gpr[ra] FIRST.
+    c.b.op_i32_const((s32)CTX);
+    // (rS >> (rB & 0x1F)) signed
+    c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(rb));
     c.b.op_i32_const(0x1F);
     c.b.op_i32_and();
     c.b.op_i32_shr_s();
-    // Compute "result if shift>=32": rS >> 31 signed (= 0 or -1)
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
+    // (rS >> 31) signed = 0 or -1
+    c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const(31);
     c.b.op_i32_shr_s();
-    // Condition: (rB & 0x20) == 0  → use the "shift<32" result
+    // select: use low result if (rB & 0x20) == 0
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(rb));
     c.b.op_i32_const(0x20);
     c.b.op_i32_and();
     c.b.op_i32_eqz();
     c.b.op_select();
+    c.b.op_local_tee(LOCAL_TMP_B);             // TMP_B = result
+    c.b.op_i32_store(ppc_off::gpr(ra));        // gpr[ra] = result
+    // --- Compute XER.CA = (rS<0) && ((rS & low_mask) != 0) ---
+    // low_mask if shift < 32:  (1 << (rB & 0x1F)) - 1
+    c.b.op_i32_const(1);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i32_const(0x1F);
+    c.b.op_i32_and();
+    c.b.op_i32_shl();
+    c.b.op_i32_const(1);
+    c.b.op_i32_sub();
+    // low_mask if shift >= 32:  -1 (all bits)
+    c.b.op_i32_const(-1);
+    // select: use the <32 mask if (rB & 0x20) == 0
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i32_const(0x20);
+    c.b.op_i32_and();
+    c.b.op_i32_eqz();
+    c.b.op_select();
+    // (rS & low_mask) != 0
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_and();
+    c.b.op_i32_const(0);
+    c.b.op_i32_ne();
+    // (rS < 0)
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const(0);
+    c.b.op_i32_lt_s();
+    c.b.op_i32_and();
+    emit_store_xer_ca(c, CTX);                 // clobbers TMP_B; OK, already stored.
     if (RC(c.inst)) {
-        c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
-        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::gpr(ra));
         emit_set_cr0(c, CTX);
-    } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
     }
 }
 
@@ -1283,21 +1304,47 @@ static void emit_srwx_impl(EmitCtx& c)  {
 }
 // srawix — shift right algebraic word immediate (signed shift by SH; sets CA).
 // We emit shr_s but skip the CA update (fallback handles edge cases).
+// srawi rA, rS, SH: rA = ((s32)rS) >> SH (arithmetic). XER.CA set when
+// rS<0 AND any low SH bits of rS were 1. SH is 5-bit immediate (0..31).
+// Store rA BEFORE emit_store_xer_ca because emit_store_xer_ca clobbers TMP_B.
 static void emit_srawix_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst);
     const u32 sh = SH(c.inst);
-    c.b.op_i32_const((s32)CTX);
+    // TMP_A = rS
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(rs));
+    c.b.op_local_set(LOCAL_TMP_A);
+    // Store rA = (s32)rS >> SH. (Store first so TMP_B-clobber by emit_store_xer_ca is safe.)
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const((s32)sh);
     c.b.op_i32_shr_s();
-    if (RC(c.inst)) {
-        c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
-        c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+    c.b.op_local_tee(LOCAL_TMP_B);            // TMP_B = result
+    c.b.op_i32_store(ppc_off::gpr(ra));
+    // XER.CA = (rS < 0) && ((rS & low_sh_mask) != 0).
+    if (sh == 0u) {
+        // No bits shifted out: CA = 0.
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_const(0);
+        c.b.op_i32_store8(ppc_off::XER_CA);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        const u32 low_mask = (1u << sh) - 1u;  // sh in 1..31
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0);
+        c.b.op_i32_lt_s();                     // (rS < 0)
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const((s32)low_mask);
+        c.b.op_i32_and();
+        c.b.op_i32_const(0);
+        c.b.op_i32_ne();                       // ((rS & mask) != 0)
+        c.b.op_i32_and();
+        emit_store_xer_ca(c, CTX);             // clobbers TMP_B; OK, gpr[ra] stored.
+    }
+    if (RC(c.inst)) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const((s32)sh);
+        c.b.op_i32_shr_s();                    // recompute result for CR0
+        emit_set_cr0(c, CTX);
     }
 }
 

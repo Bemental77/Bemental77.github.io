@@ -29,13 +29,13 @@ OPCODE_31 = 31
 def x_arith(sub_op, rt, ra, rb, rc=0, oe=0):
     """X-form: opcode=31, RT=dest, RA=src1, RB=src2."""
     return ((OPCODE_31 << 26) | ((rt & 0x1F) << 21) | ((ra & 0x1F) << 16)
-            | ((rb & 0x1F) << 11) | ((oe & 1) << 10) | ((sub_op & 0x1FF) << 1)
+            | ((rb & 0x1F) << 11) | ((oe & 1) << 10) | ((sub_op & 0x3FF) << 1)
             | (rc & 1)) & 0xFFFFFFFF
 
 def x_logic(sub_op, ra, rs, rb, rc=0):
     """X-form logical: opcode=31, RA=dest, RS=src1, RB=src2 (rA/rS swap from arith)."""
     return ((OPCODE_31 << 26) | ((rs & 0x1F) << 21) | ((ra & 0x1F) << 16)
-            | ((rb & 0x1F) << 11) | ((sub_op & 0x1FF) << 1) | (rc & 1)) & 0xFFFFFFFF
+            | ((rb & 0x1F) << 11) | ((sub_op & 0x3FF) << 1) | (rc & 1)) & 0xFFFFFFFF
 
 def x_2op_arith(sub_op, rt, ra, rc=0, oe=0):
     """X-form 2-operand arith (NEG, ADDME, ADDZE, SUBFME, SUBFZE): RT=dest, RA=src."""
@@ -189,7 +189,7 @@ def encode_for_3op(mnemonic, ra, rb):
         sub_op = 824
         sh = rb & 0x1F
         return ((OPCODE_31 << 26) | ((SRCA_REG & 0x1F) << 21) | ((DEST_REG & 0x1F) << 16)
-                | ((sh & 0x1F) << 11) | ((sub_op & 0x1FF) << 1) | (rc & 1)) & 0xFFFFFFFF
+                | ((sh & 0x1F) << 11) | ((sub_op & 0x3FF) << 1) | (rc & 1)) & 0xFFFFFFFF
     return None
 
 def encode_for_2op(mnemonic, ra):

@@ -121,6 +121,15 @@ int main() {
         //              cases have imm baked into the instruction word)
         *(u32*)(base + ppc_off::gpr(4)) = tc.in_a;
         *(u32*)(base + ppc_off::gpr(5)) = tc.in_b;
+        // RLWIMI is unique among arithmetic ops: it reads rA before writing it
+        // (mask-insert into the prior value of rA). DolphinPPCTests initializes
+        // rA to the expected post-instruction value before running. We mirror
+        // that by pre-loading gpr[3] with exp_rd for any 5op test where the
+        // mnemonic family is RLWIMI. RLWINM zeroes bits outside the mask, so
+        // its initial rA is irrelevant.
+        if (tc.shape == OS_5OP && std::strncmp(tc.name, "RLWIMI", 6) == 0) {
+            *(u32*)(base + ppc_off::gpr(3)) = tc.exp_rd;
+        }
 
         // Each test gets its own start_pc to avoid cache key collisions
         // across the 3000+ test cases.
@@ -152,7 +161,7 @@ int main() {
         } else {
             ++total_fail;
             per_mnemonic[tc.name].second++;
-            if (first_failures.size() < 20) {
+            if (first_failures.size() < 600) {
                 char buf[256];
                 std::snprintf(buf, sizeof(buf),
                     "%-8s shape=%u  in_a=0x%08x in_b=0x%08x  rd %s%08x exp%08x  xer %s%08x exp%08x  cr %s%08x exp%08x",
