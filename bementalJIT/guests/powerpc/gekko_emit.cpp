@@ -679,6 +679,162 @@ static void emit_subfx_impl(EmitCtx& c) {
 static void emit_andx_impl(EmitCtx& c)  { emit_xform_logical(c, wop::i32_and); }
 static void emit_orx_impl (EmitCtx& c)  { emit_xform_logical(c, wop::i32_or);  }
 static void emit_xorx_impl(EmitCtx& c)  { emit_xform_logical(c, wop::i32_xor); }
+
+// Helper for "X-form 3-op logical with bitwise complement of result."
+// Used by NAND, NOR, EQV: rA = ~(rS OP rB).
+static void emit_xform_logical_complement(EmitCtx& c, u8 op_byte) {
+    const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rs));
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.emitByte(op_byte);
+    c.b.op_i32_const(-1);
+    c.b.op_i32_xor();
+    if (RC(c.inst)) {
+        c.b.op_local_tee(LOCAL_TMP_A);
+        c.b.op_i32_store(ppc_off::gpr(ra));
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_set_cr0(c, CTX);
+    } else {
+        c.b.op_i32_store(ppc_off::gpr(ra));
+    }
+}
+static void emit_nandx_impl(EmitCtx& c) { emit_xform_logical_complement(c, wop::i32_and); }
+static void emit_eqvx_impl(EmitCtx& c)  { emit_xform_logical_complement(c, wop::i32_xor); }
+
+// orc rA, rS, rB: rA = rS | ~rB. Different shape from NAND/NOR/EQV — the
+// complement is on rB, not the whole expression.
+static void emit_orcx_impl(EmitCtx& c) {
+    const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rs));
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i32_const(-1);
+    c.b.op_i32_xor();
+    c.b.op_i32_or();
+    if (RC(c.inst)) {
+        c.b.op_local_tee(LOCAL_TMP_A);
+        c.b.op_i32_store(ppc_off::gpr(ra));
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_set_cr0(c, CTX);
+    } else {
+        c.b.op_i32_store(ppc_off::gpr(ra));
+    }
+}
+
+// neg rT, rA: rT = -rA = (~rA) + 1. X-form 2-op arith.
+static void emit_negx_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst), ra = RA(c.inst);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_const(0);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i32_sub();
+    if (RC(c.inst)) {
+        c.b.op_local_tee(LOCAL_TMP_A);
+        c.b.op_i32_store(ppc_off::gpr(rt));
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_set_cr0(c, CTX);
+    } else {
+        c.b.op_i32_store(ppc_off::gpr(rt));
+    }
+}
+
+// mulhw rT, rA, rB: rT = high 32 bits of (s32 rA) * (s32 rB).
+// WASM has no 32x32→64 mul; use i64 sign-extend then i64 mul, then take high.
+static void emit_mulhwx_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
+    c.b.op_i32_const((s32)CTX);
+    // (s64)rA
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i64_extend_i32_s();
+    // (s64)rB
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i64_extend_i32_s();
+    // i64 multiply
+    c.b.op_i64_mul();
+    // shift right 32 (logical) to get high 32 bits
+    c.b.op_i64_const(32);
+    c.b.op_i64_shr_u();
+    c.b.op_i32_wrap_i64();
+    if (RC(c.inst)) {
+        c.b.op_local_tee(LOCAL_TMP_A);
+        c.b.op_i32_store(ppc_off::gpr(rt));
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_set_cr0(c, CTX);
+    } else {
+        c.b.op_i32_store(ppc_off::gpr(rt));
+    }
+}
+// mulhwu — same but unsigned.
+static void emit_mulhwux_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_i64_extend_i32_u();
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i64_extend_i32_u();
+    c.b.op_i64_mul();
+    c.b.op_i64_const(32);
+    c.b.op_i64_shr_u();
+    c.b.op_i32_wrap_i64();
+    if (RC(c.inst)) {
+        c.b.op_local_tee(LOCAL_TMP_A);
+        c.b.op_i32_store(ppc_off::gpr(rt));
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_set_cr0(c, CTX);
+    } else {
+        c.b.op_i32_store(ppc_off::gpr(rt));
+    }
+}
+
+// sraw rA, rS, rB: arithmetic right shift by (rB & 0x3F).
+// PPC: shift by ≥32 → result = sign-extended (all 0s or all 1s); also sets
+// XER.CA per PPC spec but we're not tracking that here for variable shifts
+// (the few SAB call sites aren't carry-sensitive). For shift in 0..31 we
+// use i32.shr_s; for shift ≥32 the result is (s32)rS >> 31 (= 0 or -1).
+static void emit_srawx_impl(EmitCtx& c) {
+    const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
+    c.b.op_i32_const((s32)CTX);
+    // Compute "result if shift<32": rS >> (rB & 0x1F) signed
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rs));
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i32_const(0x1F);
+    c.b.op_i32_and();
+    c.b.op_i32_shr_s();
+    // Compute "result if shift>=32": rS >> 31 signed (= 0 or -1)
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rs));
+    c.b.op_i32_const(31);
+    c.b.op_i32_shr_s();
+    // Condition: (rB & 0x20) == 0  → use the "shift<32" result
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i32_const(0x20);
+    c.b.op_i32_and();
+    c.b.op_i32_eqz();
+    c.b.op_select();
+    if (RC(c.inst)) {
+        c.b.op_local_tee(LOCAL_TMP_A);
+        c.b.op_i32_store(ppc_off::gpr(ra));
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_set_cr0(c, CTX);
+    } else {
+        c.b.op_i32_store(ppc_off::gpr(ra));
+    }
+}
+
+// (deprecated trailing comment fragment retained below from emit_norx)
 static void emit_norx_impl(EmitCtx& c)  {
     // PPC `nor rA, rS, rB`: rA = ~(rS | rB). RA is destination, RT-slot is RS.
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
@@ -776,12 +932,13 @@ static void emit_div_guarded(EmitCtx& c, bool is_signed) {
 static void emit_divwx_impl(EmitCtx& c) { emit_div_guarded(c, true); }
 static void emit_divwux_impl(EmitCtx& c){ emit_div_guarded(c, false); }
 static void emit_slwx_impl(EmitCtx& c)  {
-    // rt = rs << (rb & 0x3F)   (PPC clamps shift to 6 bits; WASM uses low 5
-    // bits of shifter for i32). For values 32..63, PPC defines the result
-    // as 0; WASM would alias to (n & 31) which is wrong. To be safe, mask
-    // and emit a conditional zero. Cheap approximation: assume 0..31.
+    // PPC slw: rA = rS << (rB & 0x3F). For shift counts ≥32 (bit 5 of rB
+    // set), PPC defines result = 0. WASM i32.shl uses (count & 0x1F),
+    // which would alias 32 to 0 (no shift) — wrong. Use select: if
+    // (rB & 0x20) is zero, return shifted value; else return 0.
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
     c.b.op_i32_const((s32)CTX);
+    // shifted_value
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(rs));
     c.b.op_i32_const((s32)CTX);
@@ -789,6 +946,15 @@ static void emit_slwx_impl(EmitCtx& c)  {
     c.b.op_i32_const(0x1F);
     c.b.op_i32_and();
     c.b.op_i32_shl();
+    // zero_value (returned when shift ≥32)
+    c.b.op_i32_const(0);
+    // condition: (rB & 0x20) == 0  → use shifted_value
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i32_const(0x20);
+    c.b.op_i32_and();
+    c.b.op_i32_eqz();
+    c.b.op_select();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
         c.b.op_i32_store(ppc_off::gpr(ra));
@@ -799,6 +965,7 @@ static void emit_slwx_impl(EmitCtx& c)  {
     }
 }
 static void emit_srwx_impl(EmitCtx& c)  {
+    // Same shift-≥32 issue as emit_slwx_impl. Result = 0 for rB & 0x20 set.
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_const((s32)CTX);
@@ -808,6 +975,13 @@ static void emit_srwx_impl(EmitCtx& c)  {
     c.b.op_i32_const(0x1F);
     c.b.op_i32_and();
     c.b.op_i32_shr_u();
+    c.b.op_i32_const(0);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rb));
+    c.b.op_i32_const(0x20);
+    c.b.op_i32_and();
+    c.b.op_i32_eqz();
+    c.b.op_select();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
         c.b.op_i32_store(ppc_off::gpr(ra));
@@ -840,23 +1014,42 @@ static void emit_srawix_impl(EmitCtx& c) {
 // cmp — X-form signed compare (a vs b). Use sign-extend trick: store
 // (a-b) as low 32 and its arithmetic sign-extension as high 32 of cr field.
 static void emit_cmp_impl(EmitCtx& c) {
+    // PPC cmp: signed compare ra vs rb, set CRFD field accordingly.
+    // Previous implementation computed (ra - rb) and used the difference's
+    // sign as the CR encoding — that broke for overflow cases like
+    // ra=0x80000000, rb=1 where the subtract wraps and reports the wrong
+    // sign. Differential testing against DolphinPPCTests caught this.
+    // Mirrors emit_cmpl_impl's structure but uses signed lt_s instead of
+    // unsigned lt_u, and skips the SO bit (XER.SO not tracked here).
     const u32 crfd = CRFD(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    // result = ra - rb, kept in TMP_A
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_local_set(LOCAL_TMP_A);
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(rb));
-    c.b.op_i32_sub();
-    c.b.op_local_set(LOCAL_TMP_A);
-    // Store low 32 = result
+    c.b.op_local_set(LOCAL_TMP_B);
+    // Low 32 = (ra != rb). Encodes EQ when low == 0 in Dolphin's GetField.
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_ne();
     c.b.op_i32_store(ppc_off::cr_field(crfd));
-    // Store high 32 = sign extension
+    // High 32 = (ra<rb signed) << 30  |  (ra<rb signed) << 31. The bit-31
+    // sets cr_val high bit, making (s64)cr_val < 0 when LT (kills GT
+    // check); for the GT case both bits are 0 and low=1 makes (s64)cr_val
+    // positive non-zero (GT check passes).
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_lt_s();
+    c.b.op_i32_const(30);
+    c.b.op_i32_shl();
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_lt_s();
     c.b.op_i32_const(31);
-    c.b.op_i32_shr_s();
+    c.b.op_i32_shl();
+    c.b.op_i32_or();
     c.b.op_i32_store(ppc_off::cr_field(crfd) + 4);
 }
 
@@ -1683,6 +1876,13 @@ constexpr OpEntry table31_entries[] = {
     {444, &emit_orx_impl},
     {316, &emit_xorx_impl},
     {124, &emit_norx_impl},
+    {476, &emit_nandx_impl},
+    {412, &emit_orcx_impl},
+    {284, &emit_eqvx_impl},
+    {104, &emit_negx_impl}, {616, &emit_negx_impl},
+    { 75, &emit_mulhwx_impl},
+    { 11, &emit_mulhwux_impl},
+    {792, &emit_srawx_impl},
     {235, &emit_mullwx_impl}, {747, &emit_mullwx_impl},
     {491, &emit_divwx_impl},  {1003, &emit_divwx_impl},
     {459, &emit_divwux_impl}, {971, &emit_divwux_impl},
