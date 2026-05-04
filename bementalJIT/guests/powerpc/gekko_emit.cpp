@@ -793,34 +793,43 @@ static void emit_subfcx_impl(EmitCtx& c) {
 // adde rT, rA, rB: rT = rA + rB + XER.CA; XER.CA = compound carry-out.
 static void emit_addex_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    // temp = rA + rB → TMP_A
+    // CRITICAL: compute the new XER.CA BEFORE storing rT. Otherwise the
+    // (temp < rA) compare re-loads gpr[rA] from memory, and if rT==rA the
+    // post-store value is the result (not the original rA) and CA is wrong.
+    // This bites every `adde rN,rN,rN` in libgcc's __udivdi3 shift-add chain.
+    //
+    // Plan with 2 locals:
+    //   TMP_A = rA (original); TMP_B = temp (rA+rB).
+    //   Use them to compute first carry term (temp<rA).
+    //   Then overwrite TMP_A with result (temp+CA).
+    //   Compute second carry term (result<temp); OR; store CA.
+    //   Finally store rT = result and (if Rc) emit_set_cr0.
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(ra));
+    c.b.op_local_set(LOCAL_TMP_A);            // TMP_A = rA
+    c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::gpr(rb));
     c.b.op_i32_add();
-    c.b.op_local_set(LOCAL_TMP_A);
-    // result = temp + xer.CA → TMP_B (XER_CA byte holds 0 or 1 directly)
+    c.b.op_local_tee(LOCAL_TMP_B);            // TMP_B = temp; stack [temp]
+    c.b.op_local_get(LOCAL_TMP_A);            // [temp, rA]
+    c.b.op_i32_lt_u();                        // [(temp<rA)]
+    // result = temp + CA → overwrite TMP_A
+    c.b.op_local_get(LOCAL_TMP_B);            // [(temp<rA), temp]
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load8_u(ppc_off::XER_CA);      // [(temp<rA), temp, ca]
+    c.b.op_i32_add();                         // [(temp<rA), result]
+    c.b.op_local_tee(LOCAL_TMP_A);            // TMP_A = result; stack [(temp<rA), result]
+    c.b.op_local_get(LOCAL_TMP_B);            // [(temp<rA), result, temp]
+    c.b.op_i32_lt_u();                        // [(temp<rA), (result<temp)]
+    c.b.op_i32_or();                          // [carry]
+    emit_store_xer_ca(c, CTX);                // [], CA stored. TMP_B clobbered.
+    // gpr[rT] = result (still in TMP_A).
+    c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load8_u(ppc_off::XER_CA);
-    c.b.op_i32_add();
-    c.b.op_local_set(LOCAL_TMP_B);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_local_get(LOCAL_TMP_B);
     c.b.op_i32_store(ppc_off::gpr(rt));
-    // new XER.CA = (temp < rA) || (result < temp)
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
-    c.b.op_i32_lt_u();
-    c.b.op_local_get(LOCAL_TMP_B);
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_lt_u();
-    c.b.op_i32_or();
-    emit_store_xer_ca(c, CTX);
     if (RC(c.inst)) {
-        c.b.op_local_get(LOCAL_TMP_B);
+        c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     }
 }

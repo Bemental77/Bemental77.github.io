@@ -132,12 +132,28 @@ typedef u32 (*BemBlockFn)(void);
 s32 dispatch_raw(int handle) {
 #ifdef __EMSCRIPTEN__
     if (handle <= 0) return 0;
-    // Cast the table index to a function pointer. Emscripten compiles
-    // the indirect call below to `call_indirect`, which reads the
-    // wasmTable entry — the raw WASM function we placed there in
-    // compile_raw — and calls it directly. No JS round-trip.
-    BemBlockFn fn = reinterpret_cast<BemBlockFn>(static_cast<std::uintptr_t>(handle));
-    return static_cast<s32>(fn());
+    // We must call into JIT'd WASM with a JS-side try/catch because WASM
+    // traps (e.g. unguarded i32.div_s/0, table OOB on a stale call_indirect
+    // index) propagate as JS RuntimeError. A direct `fn()` from C++ would
+    // unwind the entire pthread without recovery — caller's "trap recovery"
+    // protocol expecting INT32_MIN never fires because nothing returns it.
+    // The JS shim catches the trap, logs it once, and returns the sentinel.
+    return EM_ASM_INT({
+        try {
+            const f = wasmTable.get($0);
+            if (!f) return -2147483648;  // freed slot
+            return f() | 0;
+        } catch (e) {
+            if (Module.bemental_block_traps === undefined) Module.bemental_block_traps = 0;
+            Module.bemental_block_traps++;
+            if (Module.bemental_block_traps <= 16) {
+                console.error('[bemental] dispatch trap handle=' + $0
+                    + ' #' + Module.bemental_block_traps
+                    + ' err=' + (e && e.message ? e.message : String(e)));
+            }
+            return -2147483648;  // INT32_MIN sentinel
+        }
+    }, handle);
 #else
     (void)handle;
     return 0;

@@ -145,12 +145,45 @@ typedef u32 (*BemBlockFn)(void);
 s32 dispatch_raw(int handle) {
 #ifdef __EMSCRIPTEN__
     if (handle <= 0) return 0;
-    // Cast the table index to a function pointer. Emscripten compiles
-    // the indirect call below to `call_indirect`, which reads the
-    // wasmTable entry — the raw WASM function we placed there in
-    // compile_raw — and calls it directly. No JS round-trip.
-    BemBlockFn fn = reinterpret_cast<BemBlockFn>(static_cast<std::uintptr_t>(handle));
-    return static_cast<s32>(fn());
+    // We must call into JIT'd WASM with a JS-side try/catch because WASM
+    // traps (e.g. unguarded i32.div_s/0, table OOB on a stale call_indirect
+    // index) propagate as JS RuntimeError. A direct `fn()` from C++ would
+    // unwind the entire pthread without recovery — caller's "trap recovery"
+    // protocol expecting INT32_MIN never fires because nothing returns it.
+    // The JS shim catches the trap, logs it once, and returns the sentinel.
+    return EM_ASM_INT({
+        // Pre-dispatch trace: every 100K calls log the handle ABOUT to be
+        // dispatched. If a wasm block infinite-loops (no trap, no return),
+        // the LAST log line identifies the hung handle. Pair with m_map to
+        // recover the hung pc.
+        if (Module.bemental_dispatch_n === undefined) Module.bemental_dispatch_n = 0;
+        Module.bemental_dispatch_n++;
+        if ((Module.bemental_dispatch_n % 10000) === 0) {
+            // Reverse-lookup pc from handle for diagnostic clarity.
+            let foundPc = 0;
+            if (Module.bemental_pc_to_handle) {
+                for (const [pc, h] of Module.bemental_pc_to_handle) {
+                    if (h === $0) { foundPc = pc; break; }
+                }
+            }
+            console.error('[bemental] pre-dispatch n=' + Module.bemental_dispatch_n
+                + ' handle=' + $0 + ' pc=0x' + foundPc.toString(16));
+        }
+        try {
+            const f = wasmTable.get($0);
+            if (!f) return -2147483648;  // freed slot
+            return f() | 0;
+        } catch (e) {
+            if (Module.bemental_block_traps === undefined) Module.bemental_block_traps = 0;
+            Module.bemental_block_traps++;
+            if (Module.bemental_block_traps <= 16) {
+                console.error('[bemental] dispatch trap handle=' + $0
+                    + ' #' + Module.bemental_block_traps
+                    + ' err=' + (e && e.message ? e.message : String(e)));
+            }
+            return -2147483648;  // INT32_MIN sentinel
+        }
+    }, handle);
 #else
     (void)handle;
     return 0;
@@ -597,6 +630,15 @@ bool BlockCache::region_dispatch(u32 pc, s32* out) {
         if (!region) return 0;
         const idx = region.pcMap.get(pc);
         if (idx === undefined) return 0;
+        // Pre-dispatch trace: every 100K calls log the pc ABOUT to be
+        // dispatched. If a wasm region function infinite-loops, the LAST
+        // log line identifies the hung pc.
+        if (Module.bemental_region_dispatch_n === undefined) Module.bemental_region_dispatch_n = 0;
+        Module.bemental_region_dispatch_n++;
+        if ((Module.bemental_region_dispatch_n % 10000) === 0) {
+            console.error('[bemental] pre-region-dispatch n=' + Module.bemental_region_dispatch_n
+                + ' r=' + r + ' pc=0x' + pc.toString(16) + ' idx=' + idx);
+        }
         try {
             const next = region.fns[idx]() >>> 0;
             HEAP32[outPtr >>> 2] = next | 0;
