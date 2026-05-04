@@ -1870,6 +1870,45 @@ void gekko_emit_instr(EmitCtx& c) {
 //      pc + count*4 (i.e. the address right after the block).
 // ---------------------------------------------------------------------------
 
+// Compile-time block-emission invariant. Scans the just-emitted bytes to
+// confirm the body contains at least one PC-update mechanism — either an
+// `i32.store offset=0` (set_pc, opcode 0x36 align=2 offset=0) OR a
+// `return_call_indirect` (tail-call, opcode 0x13). A body lacking BOTH
+// can never advance ppc_state.pc beyond what the dispatcher passed in,
+// which guarantees a dispatch-loop self-loop. Catches the entire bug class
+// where an emitter forgets to terminate a block properly (the bne+
+// chain_fallthrough safety-net override regression that pinned pc=
+// 0x800e52fc would have shown up here if the body had been truly empty).
+//
+// This check is dynamic-cost only at compile time, not at dispatch time —
+// each block compiles once. ~30-byte scan per compile, no measurable
+// impact even during region re-link.
+static void verify_block_can_advance_pc(const std::vector<u8>& body, u32 start_pc) {
+    bool has_pc_store = false;
+    bool has_tail_call = false;
+    for (size_t i = 0; i + 2 < body.size(); ++i) {
+        // i32.store align=2 offset=0  →  0x36 0x02 0x00
+        if (body[i] == 0x36 && body[i+1] == 0x02 && body[i+2] == 0x00) {
+            has_pc_store = true;
+        }
+        // return_call_indirect  →  0x13 (followed by typeidx + tableidx LEBs)
+        if (body[i] == 0x13) {
+            has_tail_call = true;
+        }
+        if (has_pc_store && has_tail_call) break;
+    }
+    if (!has_pc_store && !has_tail_call) {
+#ifdef __EMSCRIPTEN__
+        EM_ASM({
+            console.error('[bemental] block-invariant FAIL: pc=0x'
+                + ($0>>>0).toString(16) + ' body has no PC write and no '
+                + 'tail call (body_size=' + $1 + ') — this block will '
+                + 'self-loop on dispatch');
+        }, start_pc, (int)body.size());
+#endif
+    }
+}
+
 // Internal body emitter shared by build_block (legacy single-function
 // module) and emit_block_body (multi-module accumulator path). Emits the
 // per-block DFA + locals + HLE prologue + instruction stream + trailing
@@ -2088,7 +2127,9 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     b.endFuncBody();
     b.endSection();
 
-    return b.getBytes();
+    auto bytes = b.getBytes();
+    verify_block_can_advance_pc(bytes, start_pc);
+    return bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -2109,7 +2150,9 @@ std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
                    mem1_base, mem1_mask, ram_size, instr_pcs,
                    lookup_fn, lookup_user);
     b.endFuncBody();
-    return b.getBytes();
+    auto bytes = b.getBytes();
+    verify_block_can_advance_pc(bytes, start_pc);
+    return bytes;
 }
 
 // ---------------------------------------------------------------------------
