@@ -125,6 +125,24 @@ static u32 enc_mtspr(u32 spr, u32 rs) {
     return (31u << 26) | ((rs & 0x1F) << 21) | (spr_lo << 16) | (spr_hi << 11) | (467u << 1);
 }
 
+// mullw rt, ra, rb  (op 31, sub-op 235)
+static u32 enc_mullw(u32 rt, u32 ra, u32 rb) {
+    return (31u << 26) | ((rt & 0x1F) << 21) | ((ra & 0x1F) << 16)
+         | ((rb & 0x1F) << 11) | (235u << 1);
+}
+
+// divwu rt, ra, rb  (op 31, sub-op 459) — unsigned divide
+static u32 enc_divwu(u32 rt, u32 ra, u32 rb) {
+    return (31u << 26) | ((rt & 0x1F) << 21) | ((ra & 0x1F) << 16)
+         | ((rb & 0x1F) << 11) | (459u << 1);
+}
+
+// or. ra, rs, rb  (op 31, sub-op 444, Rc=1) — bit OR with CR0 update
+static u32 enc_or_rc(u32 ra, u32 rs, u32 rb) {
+    return (31u << 26) | ((rs & 0x1F) << 21) | ((ra & 0x1F) << 16)
+         | ((rb & 0x1F) << 11) | (444u << 1) | 1u;
+}
+
 // lwz rt, offset(ra)   (op 32)
 static u32 enc_lwz(u32 rt, u32 ra, s32 offset) {
     return (32u << 26) | ((rt & 0x1F) << 21) | ((ra & 0x1F) << 16)
@@ -423,6 +441,164 @@ static bool test_mtlr_then_blr() {
     return next_pc == (s32)0x900 && env.spr(8) == 0x900u;
 }
 
+// mullw r3, r4, r5 — 32-bit signed/unsigned multiply (low 32 bits of product).
+static bool test_mullw() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    u32 insts[] = {
+        enc_addi(4, 0, 7),
+        enc_addi(5, 0, 11),
+        enc_mullw(3, 4, 5),       // r3 = 7 * 11 = 77
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
+    return next_pc == (s32)(PC + 12u) && env.gpr(3) == 77u;
+}
+
+// divwu r3, r4, r5 — unsigned divide.
+static bool test_divwu() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    u32 insts[] = {
+        enc_addi(4, 0, 100),
+        enc_addi(5, 0, 7),
+        enc_divwu(3, 4, 5),       // r3 = 100 / 7 = 14
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
+    return next_pc == (s32)(PC + 12u) && env.gpr(3) == 14u;
+}
+
+// or. r3, r4, r5 (Rc=1) — bit OR with CR0 update. Result negative ⇒ CR0.LT
+// (encoded in cr.fields[0] high u32 bit 30, per Dolphin's CR encoding).
+// emit_set_cr0 stores low 32 = result, high 32 = sign-ext(result).
+// Test: r4=0xFFFF0000, r5=0x0000FFFF → r3 = 0xFFFFFFFF. Negative as s32, so
+// the high u32 should be 0xFFFFFFFF (sign-extended -1).
+static bool test_or_with_rc_negative() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    u32 insts[] = {
+        enc_addis(4, 0, 0xFFFF),         // r4 = 0xFFFF0000 (sign-ext: 0xFFFFFFFF<<16... let's be explicit)
+        // 0xFFFF as s16 = -1, lis r4, -1 = -1 << 16 = 0xFFFF0000
+        enc_ori(5, 0, 0xFFFF),            // r5 = 0 | 0xFFFF = 0x0000FFFF
+        enc_or_rc(3, 4, 5),               // r3 = r4 | r5 = 0xFFFFFFFF, CR0 set
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
+    // Result correct, AND CR0 fields should reflect negativity.
+    if (env.gpr(3) != 0xFFFFFFFFu) return false;
+    if (next_pc != (s32)(PC + 12u)) return false;
+    // emit_set_cr0 writes low 32 = result, high 32 = arith-shift-right by 31 of result
+    // = 0xFFFFFFFF (since bit 31 of 0xFFFFFFFF = 1, sign-ext is all 1s).
+    return env.cr_field0_low() == 0xFFFFFFFFu
+        && env.cr_field0_high() == 0xFFFFFFFFu;
+}
+
+// or. r3, r4, r5 with positive non-zero result → CR0 high u32 = 0
+// (sign-ext of positive value).
+static bool test_or_with_rc_positive() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    u32 insts[] = {
+        enc_addi(4, 0, 0x55),
+        enc_addi(5, 0, 0xAA),
+        enc_or_rc(3, 4, 5),               // r3 = 0xFF, CR0 set
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
+    if (env.gpr(3) != 0xFFu) return false;
+    if (next_pc != (s32)(PC + 12u)) return false;
+    return env.cr_field0_low() == 0xFFu && env.cr_field0_high() == 0u;
+}
+
+// or. r3, r4, r5 with zero result → CR0.EQ (low 32 == 0 in Dolphin's
+// encoding).
+static bool test_or_with_rc_zero() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    u32 insts[] = {
+        enc_addi(4, 0, 0),
+        enc_addi(5, 0, 0),
+        enc_or_rc(3, 4, 5),               // r3 = 0, CR0 set: low==0 ⇒ EQ
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
+    if (env.gpr(3) != 0u) return false;
+    return next_pc == (s32)(PC + 12u)
+        && env.cr_field0_low() == 0u && env.cr_field0_high() == 0u;
+}
+
+// lwz via trampoline. Base address is 0x40000000 — outside MEM1 trusted
+// ranges, so per-block DFA forces trampoline path (ppc_read32 stub fires).
+// JS stub records the addr it was called with and returns 0xDEADBEEF.
+static bool test_lwz_trampoline() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_last_read_addr = 0;
+        Module.bemental_imports.env.ppc_read32 = function(addr) {
+            Module.test_last_read_addr = addr >>> 0;
+            return 0xDEADBEEF | 0;
+        };
+    });
+#endif
+    u32 insts[] = {
+        enc_addis(4, 0, 0x4000),          // r4 = 0x40000000
+        enc_lwz(3, 4, 0x10),              // r3 = mem[r4 + 0x10] (via trampoline)
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 2, &next_pc)) return false;
+#ifdef __EMSCRIPTEN__
+    const u32 read_addr = (u32)EM_ASM_INT({ return Module.test_last_read_addr | 0; });
+#else
+    const u32 read_addr = 0;
+#endif
+    return next_pc == (s32)(PC + 8u)
+        && env.gpr(3) == 0xDEADBEEFu
+        && read_addr == 0x40000010u;
+}
+
+// stw via trampoline. Same trusted-range logic forces trampoline. JS stub
+// records (addr, val) of the call.
+static bool test_stw_trampoline() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_last_write_addr = 0;
+        Module.test_last_write_val  = 0;
+        Module.bemental_imports.env.ppc_write32 = function(addr, val) {
+            Module.test_last_write_addr = addr >>> 0;
+            Module.test_last_write_val  = val  >>> 0;
+        };
+    });
+#endif
+    u32 insts[] = {
+        enc_addi(3, 0, 0x1234),           // r3 = 0x1234
+        enc_addis(4, 0, 0x4000),           // r4 = 0x40000000
+        enc_stw(3, 4, 0x20),              // mem[r4 + 0x20] = r3
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
+#ifdef __EMSCRIPTEN__
+    const u32 wa = (u32)EM_ASM_INT({ return Module.test_last_write_addr | 0; });
+    const u32 wv = (u32)EM_ASM_INT({ return Module.test_last_write_val  | 0; });
+#else
+    const u32 wa = 0, wv = 0;
+#endif
+    return next_pc == (s32)(PC + 12u)
+        && wa == 0x40000020u
+        && wv == 0x1234u;
+}
+
 // Block with no terminator (count cap reached without hitting a branch).
 // Trailing fallback emits set_pc(next_pc) + return. next_pc must be
 // start_pc + count*4.
@@ -469,6 +645,13 @@ static const TestCase k_tests[] = {
     {"addi_negative",                    &test_addi_negative},
     {"rlwinm_extract",                   &test_rlwinm_extract},
     {"mtlr_then_blr",                    &test_mtlr_then_blr},
+    {"mullw",                            &test_mullw},
+    {"divwu",                            &test_divwu},
+    {"or_with_rc_negative",              &test_or_with_rc_negative},
+    {"or_with_rc_positive",              &test_or_with_rc_positive},
+    {"or_with_rc_zero",                  &test_or_with_rc_zero},
+    {"lwz_trampoline",                   &test_lwz_trampoline},
+    {"stw_trampoline",                   &test_stw_trampoline},
 };
 
 int main() {
