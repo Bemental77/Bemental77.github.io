@@ -24,10 +24,21 @@ if(BEMENTAL_GUEST_POWERPC)
     )
     set_target_properties(test_gekko PROPERTIES SUFFIX ".html")
     target_link_options(test_gekko PRIVATE
+        "SHELL:-s EXIT_RUNTIME=1"
+        # Block-emitter's env.memory import declares shared+max to match
+        # the dolphin_libretro -pthread target. The test runtime must
+        # also export a shared memory; otherwise WebAssembly.Instance
+        # fails with "mismatch in shared state of memory".
+        "SHELL:-pthread"
+        "SHELL:-s PTHREAD_POOL_SIZE=0"
+        "SHELL:-s INITIAL_MEMORY=33554432"
         "SHELL:-s ALLOW_MEMORY_GROWTH=1"
-        "SHELL:-s EXIT_RUNTIME=0"
-        # Stub all 9 PowerPC host imports — test only triggers addi which
-        # doesn't call any of them, but the WASM module declares them all.
+        "SHELL:-s MAXIMUM_MEMORY=67108864"
+        # block_cache.cpp::compile_raw pre-grows wasmTable by 8192 slots.
+        "SHELL:-s ALLOW_TABLE_GROWTH=1"
+        # Stub all PowerPC host imports — most corpus tests don't call
+        # them, but the WASM module declares them all.
         "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
     )
+    target_compile_options(test_gekko PRIVATE "-pthread")
 endif()
