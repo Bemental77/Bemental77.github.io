@@ -94,6 +94,37 @@ static u32 enc_blr() {
     return (19u << 26) | (20u << 21) | (0u << 16) | (0u << 11) | (16u << 1) | 0u;
 }
 
+// bctr  (op 19, sub-op 528, BO=20 = "branch always", BI=0, LK=lk)
+static u32 enc_bctr() {
+    return (19u << 26) | (20u << 21) | (0u << 16) | (0u << 11) | (528u << 1) | 0u;
+}
+
+// addis rt, ra, simm  (op 15)
+static u32 enc_addis(u32 rt, u32 ra, s32 simm) {
+    return (15u << 26) | ((rt & 0x1F) << 21) | ((ra & 0x1F) << 16)
+         | ((u32)(s32)(s16)simm & 0xFFFFu);
+}
+
+// ori ra, rs, uimm  (op 24; note: rA is dest, rS is source)
+static u32 enc_ori(u32 ra, u32 rs, u32 uimm) {
+    return (24u << 26) | ((rs & 0x1F) << 21) | ((ra & 0x1F) << 16)
+         | (uimm & 0xFFFFu);
+}
+
+// rlwinm ra, rs, sh, mb, me  (op 21)
+static u32 enc_rlwinm(u32 ra, u32 rs, u32 sh, u32 mb, u32 me) {
+    return (21u << 26) | ((rs & 0x1F) << 21) | ((ra & 0x1F) << 16)
+         | ((sh & 0x1F) << 11) | ((mb & 0x1F) << 6) | ((me & 0x1F) << 1);
+}
+
+// mtspr rs, spr  (op 31, sub-op 467; SPR field uses split-nibble encoding:
+// bits 11-15 hold SPR[5..9], bits 16-20 hold SPR[0..4] — opposite of mfspr)
+static u32 enc_mtspr(u32 spr, u32 rs) {
+    const u32 spr_lo = spr & 0x1F;
+    const u32 spr_hi = (spr >> 5) & 0x1F;
+    return (31u << 26) | ((rs & 0x1F) << 21) | (spr_lo << 16) | (spr_hi << 11) | (467u << 1);
+}
+
 // lwz rt, offset(ra)   (op 32)
 static u32 enc_lwz(u32 rt, u32 ra, s32 offset) {
     return (32u << 26) | ((rt & 0x1F) << 21) | ((ra & 0x1F) << 16)
@@ -291,6 +322,107 @@ static bool test_addi_then_b() {
     return next_pc == (s32)TARGET && env.gpr(3) == 99;
 }
 
+// bctr indirect: pre-set CTR, dispatch `bctr`, verify next_pc == CTR.
+// Parallels blr_indirect but uses SPR 9 (CTR) instead of SPR 8 (LR).
+static bool test_bctr_indirect() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    const u32 CTR_TARGET = 0x80006000;
+    env.spr(9) = CTR_TARGET;  // pre-set CTR
+    u32 insts[] = { enc_bctr() };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    return next_pc == (s32)CTR_TARGET;
+}
+
+// lis r3, 0x8000 = addis r3, 0, 0x8000. Verifies addis with ra=0 sets
+// r3 = simm << 16 (the conventional way to materialize a 32-bit constant).
+static bool test_lis_immediate() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    u32 insts[] = {
+        enc_addis(3, 0, 0x8000),  // r3 = 0x80000000 (sign-extended? simm is signed)
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    // Note: 0x8000 as simm sign-extends to 0xFFFF8000. 0xFFFF8000 << 16 = 0x80000000.
+    return next_pc == (s32)(PC + 4u) && env.gpr(3) == 0x80000000u;
+}
+
+// ori r3, r4, 0x1234 — sets r3 to r4 | 0x1234. CodeWarrior idiom for
+// completing a 32-bit constant after lis.
+static bool test_ori_low_half() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    u32 insts[] = {
+        enc_addis(4, 0, 0x1234),  // r4 = 0x12340000
+        enc_ori(3, 4, 0x5678),    // r3 = r4 | 0x5678 = 0x12345678
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 2, &next_pc)) return false;
+    return next_pc == (s32)(PC + 8u) && env.gpr(3) == 0x12345678u;
+}
+
+// addi with negative simm — verifies the s16 sign-extension path. With
+// ra=0, addi sets rt = sign_ext(simm). The encoder packs simm as a u16,
+// the emitter must sign-extend on use.
+static bool test_addi_negative() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    u32 insts[] = {
+        enc_addi(3, 0, -1),       // r3 = -1 = 0xFFFFFFFF
+        enc_addi(4, 0, -32768),   // r4 = -32768 = 0xFFFF8000 (smallest s16)
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 2, &next_pc)) return false;
+    return next_pc == (s32)(PC + 8u)
+        && env.gpr(3) == 0xFFFFFFFFu
+        && env.gpr(4) == 0xFFFF8000u;
+}
+
+// rlwinm rA, rS, SH, MB, ME — rotate-left-word-immediate-then-mask. Bit
+// extraction idiom: r3 := (r4 << 4) & 0x000FF000 to extract bits [12:5]
+// of an unrelated layout. Tests the rotate+mask emission.
+// Pattern used: rlwinm r3, r4, 4, 12, 19 — rotate r4 left 4, keep bits
+// 12..19 (in MSB ordering = mask 0x000FF000), zero everything else.
+static bool test_rlwinm_extract() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    u32 insts[] = {
+        enc_addis(4, 0, 0x1234),                  // r4 = 0x12340000
+        enc_ori(4, 4, 0x5678),                    // r4 = 0x12345678
+        enc_rlwinm(3, 4, /*sh=*/4, /*mb=*/12, /*me=*/19),
+        // r3 = rotate_left(0x12345678, 4) & mask(12,19)
+        //    = 0x23456781 & 0x000FF000
+        //    = 0x00056000 (bits 12..19 of 0x23456781 are 0x56)
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
+    return next_pc == (s32)(PC + 12u) && env.gpr(3) == 0x00056000u;
+}
+
+// mtspr LR + blr round-trip: verifies that mtspr can write LR and a
+// subsequent blr reads it back as the indirect branch target.
+// Pattern: addi r3, 0, 0x900; mtspr LR, r3; blr
+static bool test_mtlr_then_blr() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    u32 insts[] = {
+        enc_addi(3, 0, 0x900),    // r3 = 0x900 (s16 sign-extended → 0x900 unchanged)
+        enc_mtspr(/*SPR_LR=8*/8, 3),
+        enc_blr(),
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
+    return next_pc == (s32)0x900 && env.spr(8) == 0x900u;
+}
+
 // Block with no terminator (count cap reached without hitting a branch).
 // Trailing fallback emits set_pc(next_pc) + return. next_pc must be
 // start_pc + count*4.
@@ -331,6 +463,12 @@ static const TestCase k_tests[] = {
     {"blr_indirect",                     &test_blr_indirect},
     {"addi_then_b",                      &test_addi_then_b},
     {"no_terminator_block",              &test_no_terminator_block},
+    {"bctr_indirect",                    &test_bctr_indirect},
+    {"lis_immediate",                    &test_lis_immediate},
+    {"ori_low_half",                     &test_ori_low_half},
+    {"addi_negative",                    &test_addi_negative},
+    {"rlwinm_extract",                   &test_rlwinm_extract},
+    {"mtlr_then_blr",                    &test_mtlr_then_blr},
 };
 
 int main() {
