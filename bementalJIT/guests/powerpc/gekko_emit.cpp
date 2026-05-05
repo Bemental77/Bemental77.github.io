@@ -1633,15 +1633,70 @@ static void emit_bcctrx_impl(EmitCtx& c) {
 static void emit_rfi_impl(EmitCtx& c)    { emit_fallback(c); c.block_end = true; }
 static void emit_sc_impl (EmitCtx& c)    { emit_fallback(c); c.block_end = true; }
 
-// MSR / SR access — privileged. Interpreter::mtmsr writes msr.Hex, calls
-// MSRUpdated(), CheckExceptions() and sets m_end_block=true. The JIT block
-// must also end so the dispatcher re-reads pc — Interpreter::mtmsr can
-// redirect pc via exception delivery and any subsequent pre-compiled
-// instruction in this WASM block would otherwise execute against the wrong
-// state. mfmsr / mtsr / mfsr / mtsrin / mfsrin / tlbie all change privileged
-// state and follow the same rule.
-static void emit_mfmsr_impl (EmitCtx& c) { emit_fallback(c); c.block_end = true; }
-static void emit_mtmsr_impl (EmitCtx& c) { emit_fallback(c); c.block_end = true; }
+// MSR / SR access — privileged. mfmsr is a simple register read; native emit.
+// mtmsr has a fast path when the new MSR has EE=0 (no exception delivery
+// needed; bementalJIT's MSRUpdated equivalent is effectively a no-op since
+// the JIT goes through Memory::Read_U32 for MMU translation rather than
+// caching MSR.IR/DR derived state). When EE=1 in the new MSR, we still need
+// the full interpreter path to handle pending external exceptions.
+//
+// Reference: ~/gc_refs/dolphin/Source/Core/Core/PowerPC/Interpreter/
+//            Interpreter_SystemRegisters.cpp:177  (canonical semantics)
+//          + ~/gc_refs/dolphin/Source/Core/Core/PowerPC/Jit64/
+//            Jit_SystemRegisters.cpp:432         (Dolphin's inline emit)
+//
+// mtsr / mfsr / mtsrin / mfsrin / tlbie remain fallback (rare, complex).
+
+// mfmsr rD: rD = msr.Hex
+// In-block emit (does NOT end the block). The next instruction's
+// pre-emit set_pc advances pc to pc+4 naturally. Native MSR read is
+// safe in any privilege mode bementalJIT runs (MSR.PR=0 in OS code).
+static void emit_mfmsr_impl(EmitCtx& c) {
+    const u32 rd = RT(c.inst);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::MSR);
+    c.b.op_i32_store(ppc_off::gpr(rd));
+}
+
+// mtmsr rS: msr.Hex = gpr[rS]
+//   If new MSR.EE = 0: store inline, end block. No exception delivery.
+//   If new MSR.EE = 1: fall back to Interpreter::mtmsr for full semantics
+//     (MSRUpdated, CheckFPExceptions, CheckExceptions). Exception delivery
+//     after EE-on must check Exceptions and may vector PC.
+static void emit_mtmsr_impl(EmitCtx& c) {
+    const u32 rs = RT(c.inst);
+    // Stash new MSR in TMP_A.
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::gpr(rs));
+    c.b.op_local_set(LOCAL_TMP_A);
+    // if (new_msr & 0x8000) ... else fast-path-store
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const(0x8000);
+    c.b.op_i32_and();
+    c.b.op_if(/*no result*/ 0x40);
+        // EE=1 → call interpreter (via emit_fallback). Interpreter advances
+        // pc to pc+4 internally, so we don't need to do it here.
+        emit_fallback(c);
+    c.b.op_else();
+        // EE=0 → fast path: store new MSR + advance pc to pc+4 (mtmsr is a
+        // non-branch terminator; without advancing, the dispatcher would
+        // re-enter the same block forever). Skip exception delivery and
+        // MSRUpdated (no MSR-derived state cached in bementalJIT).
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_store(ppc_off::MSR);
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_const((s32)(c.pc + 4u));
+        c.b.op_i32_store(ppc_off::PC);
+    c.b.op_end();
+    c.block_end = true;
+    // If EE=0 path was taken, c.used_fallback stays false from the
+    // pre-emit reset in gekko_emit_instr — that's correct, we're not
+    // falling back. If EE=1 path was taken at runtime, emit_fallback set
+    // used_fallback=true, but at compile time we don't know which path
+    // wins; either way the block_end above ensures the dispatcher exits.
+}
 static void emit_mtsr_impl  (EmitCtx& c) { emit_fallback(c); c.block_end = true; }
 static void emit_mfsr_impl  (EmitCtx& c) { emit_fallback(c); c.block_end = true; }
 static void emit_mtsrin_impl(EmitCtx& c) { emit_fallback(c); c.block_end = true; }
