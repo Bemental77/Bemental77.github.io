@@ -2242,6 +2242,31 @@ static void emit_fmrx_impl(EmitCtx& c) {
     emit_fp_load_ps0(c, fb);
     emit_fp_store_double(c, fd);
 }
+// fnabsx (op63 sub136): rD = -|rB|. WASM: f64.abs then f64.neg.
+static void emit_fnabsx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_abs();
+    c.b.op_f64_neg();
+    emit_fp_store_double(c, fd);
+}
+// frspx (op63 sub12): rD = single(rB), with PS0 AND PS1 filled.
+// The "DragonballZ" comment in Dolphin's interpreter notes that PS1 must
+// be set to PS0 even though the spec says PS1 is undefined. Many games
+// rely on this. Treat exactly like a single-precision arith result.
+static void emit_frspx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fb);
+    emit_fp_round_to_single(c);
+    emit_fp_store_single_fill(c, fd);
+}
+// fctiwzx (op63 sub15) and fctiwx (op63 sub14): NOT yet emitted. They need
+// either non-trapping i32.trunc_sat_f64_s (not exposed in our WASM builder
+// yet) or a runtime NaN/overflow guard, because the trapping i32.trunc_f64_s
+// would crash on NaN inputs that games legitimately pass when initializing
+// uninitialized memory or via paired-single intrinsics. Deferred until the
+// builder gets the saturating variant. Falls through to interpreter via
+// gekko_lookup miss.
 
 // ===========================================================================
 // lmw / stmw — load/store multiple words (D-form).
@@ -2615,9 +2640,11 @@ constexpr OpEntry table63_arith_entries[] = {
 // SUBOP5 keys above because their SUBOP5 values (0, 8, etc.) are unused
 // in the arith table.
 constexpr OpEntry table63_other_entries[] = {
-    { 40, &emit_fnegx_impl},
-    { 72, &emit_fmrx_impl},
-    {264, &emit_fabsx_impl},
+    { 12, &emit_frspx_impl},   // round to single (PS0 + PS1 fill)
+    { 40, &emit_fnegx_impl},   // -rB
+    { 72, &emit_fmrx_impl},    // rD = rB (move)
+    {136, &emit_fnabsx_impl},  // -|rB|
+    {264, &emit_fabsx_impl},   // |rB|
 };
 
 constexpr EmitFn table_lookup(const OpEntry* tbl, std::size_t n, u32 key) {
