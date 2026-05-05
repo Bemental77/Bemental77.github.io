@@ -2314,6 +2314,81 @@ static void emit_frspx_impl(EmitCtx& c) {
     emit_fp_round_to_single(c);
     emit_fp_store_single_fill(c, fd);
 }
+// fcmpu (op63 sub 0) / fcmpo (op63 sub 32): FP compare. Sets crfD field with
+// LT/GT/EQ/SO based on (fA vs fB). NaN on either side ⇒ SO ("unordered").
+//
+// Internal CR encoding (matches Dolphin's ConditionRegister.h, also used by
+// emit_cmp_impl/emit_cmpl_impl):
+//   low32 == 0   ⇒ EQ      ; non-zero means NOT EQ
+//   high bit 30  ⇒ LT
+//   high bit 31  ⇒ kills GT (forces (s64)cr_val ≤ 0; needed for LT and SO)
+//   high bit 27  ⇒ SO
+// So:
+//   LT case : low=1, high=0xC0000000 (bits 30+31)
+//   GT case : low=1, high=0x00000000
+//   EQ case : low=0, high=0x00000000
+//   SO/NaN  : low=1, high=0x88000000 (bits 27+31)
+//
+// We compute (is_nan, is_lt) into TMP_A/TMP_B, low32 := !(fa == fb), and
+// compose high32 from those bits. WASM f64 compare ops return false on NaN,
+// so is_lt and the f64.eq used for low32 both correctly cleared on NaN.
+//
+// Skipped vs canonical interpreter:
+//   * FPSCR.FX / FPSCR.VXSNAN / FPSCR.FPCC bits — most games don't read FPSCR.
+//   * fcmpo's signaling-NaN exception path (would set FPSCR.VXSNAN and
+//     potentially raise an FP exception) — exception masking is the norm.
+//   * Ordered vs unordered behavior is identical here; the only spec
+//     difference is which FPSCR bits get raised on SNaN, and we skip FPSCR.
+static void emit_fcmpu_impl(EmitCtx& c) {
+    const u32 crfd = CRFD(c.inst);
+    const u32 fa = RA(c.inst), fb = RB(c.inst);
+
+    // is_nan = (fa != fa) | (fb != fb).  Stash in TMP_A.
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fa);
+    c.b.op_f64_ne();
+    emit_fp_load_ps0(c, fb);
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_ne();
+    c.b.op_i32_or();
+    c.b.op_local_set(LOCAL_TMP_A);
+
+    // is_lt = fa < fb. WASM f64.lt returns 0 on NaN, so this naturally
+    // excludes the SO case. Stash in TMP_B.
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_lt();
+    c.b.op_local_set(LOCAL_TMP_B);
+
+    // Store low32 = !(fa == fb). f64.ne returns 1 on NaN, so this is non-zero
+    // for LT/GT/SO and zero only for true EQ.
+    c.b.op_i32_const((s32)CTX);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_ne();
+    c.b.op_i32_store(ppc_off::cr_field(crfd));
+
+    // Store high32 = (is_lt<<30) | ((is_lt|is_nan)<<31) | (is_nan<<27).
+    c.b.op_i32_const((s32)CTX);
+    // bit 30 = is_lt  (LT marker)
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_const(30);
+    c.b.op_i32_shl();
+    // bit 31 = is_lt | is_nan  (kills GT for both LT and SO)
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_or();
+    c.b.op_i32_const(31);
+    c.b.op_i32_shl();
+    c.b.op_i32_or();
+    // bit 27 = is_nan  (SO marker)
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const(27);
+    c.b.op_i32_shl();
+    c.b.op_i32_or();
+    c.b.op_i32_store(ppc_off::cr_field(crfd) + 4);
+}
+
 // fctiwzx (op63 sub15) and fctiwx (op63 sub14): NOT yet emitted. They need
 // either non-trapping i32.trunc_sat_f64_s (not exposed in our WASM builder
 // yet) or a runtime NaN/overflow guard, because the trapping i32.trunc_f64_s
@@ -2694,7 +2769,9 @@ constexpr OpEntry table63_arith_entries[] = {
 // SUBOP5 keys above because their SUBOP5 values (0, 8, etc.) are unused
 // in the arith table.
 constexpr OpEntry table63_other_entries[] = {
+    {  0, &emit_fcmpu_impl},   // FP compare unordered
     { 12, &emit_frspx_impl},   // round to single (PS0 + PS1 fill)
+    { 32, &emit_fcmpu_impl},   // FP compare ordered (same impl — FPSCR diffs skipped)
     { 40, &emit_fnegx_impl},   // -rB
     { 72, &emit_fmrx_impl},    // rD = rB (move)
     {136, &emit_fnabsx_impl},  // -|rB|
