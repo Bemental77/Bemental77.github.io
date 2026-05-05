@@ -112,10 +112,32 @@ int compile_raw(const u8* bytes, std::size_t size) {
             return idx;
         } catch (e) {
             if (typeof console !== 'undefined') {
-                console.error('[bemental] compile_raw failed:', e, e && e.message, e && e.stack);
-                const head = copy.subarray(0, Math.min(32, copy.length));
-                const hex = Array.from(head).map(function(b) { return b.toString(16).padStart(2, '0'); }).join(' ');
-                console.error('[bemental] size=' + copy.length + ' first 32 bytes:', hex);
+                // Discriminate: WebAssembly.CompileError = validation failure
+                // (stack/type bug in our emit). LinkError = import-binding bug
+                // (signature mismatch). RuntimeError = WebAssembly trap (bad
+                // dispatch path). Cap each category at 16 entries to avoid
+                // log flood.
+                const ename = (e && e.constructor && e.constructor.name) || 'Error';
+                const isCompile = (typeof WebAssembly !== 'undefined'
+                                   && WebAssembly.CompileError
+                                   && e instanceof WebAssembly.CompileError);
+                const isLink = (typeof WebAssembly !== 'undefined'
+                                && WebAssembly.LinkError
+                                && e instanceof WebAssembly.LinkError);
+                const tag = isCompile ? '[wild-compile-error]'
+                          : isLink ? '[wild-link-error]'
+                          : '[wild-other-error]';
+                if (Module._bemental_err_count === undefined) Module._bemental_err_count = 0;
+                if (Module._bemental_err_count < 16) {
+                    Module._bemental_err_count++;
+                    const head = copy.subarray(0, Math.min(32, copy.length));
+                    const hex = Array.from(head).map(function(b) { return b.toString(16).padStart(2, '0'); }).join(' ');
+                    console.error(tag + ' #' + Module._bemental_err_count
+                        + ' kind=' + ename
+                        + ' msg=' + (e && e.message ? e.message : String(e))
+                        + ' size=' + copy.length
+                        + ' head=' + hex);
+                }
             }
             return -1;
         }
