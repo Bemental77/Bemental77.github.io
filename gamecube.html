@@ -189,7 +189,17 @@
   function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
   function toast(msg, isErr) { toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200); }
   const isMobile = (() => { const ua = navigator.userAgent.toLowerCase(); return /iphone|ipad|ipod|android|mobile|xbox/.test(ua) || ('ontouchstart' in window) || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile'); })();
-  var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/gamecube/dolphin_libretro/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: $('canvas'), setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {} };
+  // Module uses a hidden dummy canvas. The real display canvas (#canvas)
+  // is transferred to the GPU worker via transferControlToOffscreen and
+  // is no longer accessible to main-thread getContext calls. SDL's
+  // automatic canvas-context init would otherwise throw on the transferred
+  // canvas. Module is mainly used for audio output; the dummy canvas
+  // satisfies SDL's "canvas required" assumption.
+  var _moduleDummyCanvas = document.createElement('canvas');
+  _moduleDummyCanvas.style.display = 'none';
+  _moduleDummyCanvas.width = 1;
+  _moduleDummyCanvas.height = 1;
+  var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/gamecube/dolphin_libretro/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: _moduleDummyCanvas, setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {} };
   var padStatus1, vram_ptr; var dolphin_worker = null; var states_arrs = []; var audioMuted = false; var pendingSaveResolve = null; var pendingLoadResolve = null;
   function getAudioCtx() { try { return (Module && Module.preCreatedAudioContext) || (Module && Module.SDL && Module.SDL.audioContext) || null; } catch (e) { return null; } }
   function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } }
@@ -254,11 +264,20 @@
     setTimeout(pollController, 10);
   }
   var renderFrames = 0, lastFpsLog = performance.now();
-  // Render backend: try WebGPU first, fall back to 2D canvas. WebGPU path
-  // accepts BGRA8Unorm directly so no per-pixel JS swizzle is needed; the
-  // GPU does the format conversion in hardware. Adopts the SHaR-WASM
-  // state-cache pattern: pipeline/sampler/bind-group are created once and
-  // reused per frame; only the texture is recreated on resolution change.
+  // Render backend selection (in order of preference):
+  //   1. GPU worker via OffscreenCanvas (paint runs on its own thread,
+  //      tries WebGPU then internally falls back to 2D inside the worker)
+  //   2. Main-thread WebGPU (older browsers w/ WebGPU but no OffscreenCanvas)
+  //   3. Main-thread 2D canvas (per-pixel JS swizzle)
+  // Once we transferControlToOffscreen, the canvas is owned by the worker
+  // and main-thread fallback is no longer possible. We try the worker
+  // first because in modern browsers it's the strictly better path.
+  var gpuWorker = null;
+  var gpuWorkerMode = null;   // 'webgpu' | '2d' | null (not initialized)
+  var gpuWorkerReady = false;
+  var gpuWorkerFailed = false;
+  // Main-thread WebGPU state (used only if gpu worker can't be created
+  // OR if OffscreenCanvas is unavailable).
   var GPU = {
     available: false,
     initing: false,
@@ -404,19 +423,97 @@
   }
   function paintFrame(pixels, w, h, pitch) {
     var c = $('canvas');
+    // GPU worker path: ship the pixels to the worker. The OffscreenCanvas
+    // worker decides whether to paint via WebGPU or 2D internally.
+    if (gpuWorker && gpuWorkerReady) {
+      // Pixels arrive as Uint8Array views into a postMessage-transferred
+      // buffer; pass the buffer directly to the worker as transferable.
+      var buf = pixels.buffer || pixels;
+      var byteOffset = pixels.byteOffset || 0;
+      var byteLength = pixels.byteLength || buf.byteLength;
+      // If pixels view is over a SharedArrayBuffer, we can't transfer; copy.
+      if (buf instanceof SharedArrayBuffer) {
+        var copy = new Uint8Array(byteLength);
+        copy.set(new Uint8Array(buf, byteOffset, byteLength));
+        gpuWorker.postMessage({ cmd: 'frame', pixels: copy.buffer, w: w, h: h, pitch: pitch }, [copy.buffer]);
+      } else {
+        // Slice to avoid sending the whole underlying buffer if it's larger.
+        var slice = byteOffset === 0 && byteLength === buf.byteLength
+          ? buf
+          : pixels.slice().buffer;
+        gpuWorker.postMessage({ cmd: 'frame', pixels: slice, w: w, h: h, pitch: pitch }, [slice]);
+      }
+      return;
+    }
+    // Fallbacks (only used if GPU worker couldn't be created).
     if (c.width !== w) c.width = w;
     if (c.height !== h) c.height = h;
     if (GPU.available) { paintFrameGPU(pixels, w, h, pitch); return; }
     paintFrame2D(pixels, w, h, pitch);
   }
-  // Eager WebGPU init — kick off at page load so the path is ready by the
-  // time the first XFB arrives. Logs result either way for diagnosability.
+  // Eager GPU-worker init — kick off at page load. If OffscreenCanvas is
+  // available we transferControlToOffscreen and let the worker handle
+  // paint on its own thread (WebGPU preferred, 2D fallback inside worker).
+  // If transferControlToOffscreen is unavailable (very old browsers), or
+  // if Worker spawn fails, fall back to main-thread WebGPU then 2D.
   (function () {
     function tryInit() {
       var c = $('canvas');
       if (!c) { setTimeout(tryInit, 50); return; }
-      pageLog('[render] navigator.gpu=' + (typeof navigator !== 'undefined' && 'gpu' in navigator ? 'present' : 'missing'));
-      initWebGPU(c);
+      var hasOffscreen = typeof c.transferControlToOffscreen === 'function';
+      var hasGpu = typeof navigator !== 'undefined' && 'gpu' in navigator;
+      pageLog('[render] OffscreenCanvas=' + hasOffscreen + ' navigator.gpu=' + hasGpu);
+      if (!hasOffscreen) {
+        // Old browser: fall back to main-thread WebGPU (or 2D inside it).
+        initWebGPU(c);
+        return;
+      }
+      try {
+        gpuWorker = new Worker('/gamecube/gpu-worker.js?v=' + Date.now());
+        gpuWorker.onmessage = function (e) {
+          var d = e.data;
+          if (d.cmd === 'ready') {
+            gpuWorkerReady = true;
+            gpuWorkerMode = d.mode;
+            pageLog('[render] GPU worker ready (mode=' + d.mode + ')');
+          } else if (d.cmd === 'init-failed') {
+            gpuWorkerFailed = true;
+            pageLog('[render] GPU worker init failed: ' + d.reason);
+            // Canvas is gone (transferred); accept the failure.
+          } else if (d.cmd === 'stats') {
+            // Optional: log stats to FPS counter.
+            if (d.framesPainted > 0 && fpsEl) {
+              fpsEl.textContent = 'FPS: ' + d.framesPainted + ' (paint ' + d.lastPaintMs.toFixed(1) + 'ms)';
+            }
+          }
+        };
+        gpuWorker.onerror = function (e) {
+          gpuWorkerFailed = true;
+          pageLog('[render] GPU worker error: ' + e.message);
+        };
+        var off = c.transferControlToOffscreen();
+        gpuWorker.postMessage({ cmd: 'init', canvas: off }, [off]);
+        // Runtime control surface for post-processing. Examples:
+        //   _gcSetRender({aspect: '4:3', scale: 'integer', filter: 'nearest'});
+        //   _gcSetRender({gamma: 1.2, brightness: 0.05, saturation: 1.1});
+        // Settings persist on the GPU worker until changed.
+        window._gcSetRender = function (opts) {
+          if (gpuWorker) gpuWorker.postMessage(Object.assign({ cmd: 'pp' }, opts || {}));
+        };
+        // Resize hook — when the page changes the canvas backing dimensions
+        // (CSS sizing, rotate, fullscreen), forward to the worker so it
+        // updates the OffscreenCanvas.
+        window._gcCanvasResize = function (w, h) {
+          if (gpuWorker) gpuWorker.postMessage({ cmd: 'resize', w: w, h: h });
+        };
+      } catch (e) {
+        pageLog('[render] GPU worker spawn failed: ' + e + ' — falling back to main-thread paint');
+        gpuWorker = null;
+        gpuWorkerFailed = true;
+        // Try main-thread WebGPU as last resort. Canvas hasn't been
+        // transferred if transferControlToOffscreen threw.
+        initWebGPU(c);
+      }
     }
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', tryInit);
