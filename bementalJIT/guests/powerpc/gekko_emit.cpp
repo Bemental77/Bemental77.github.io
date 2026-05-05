@@ -2389,13 +2389,81 @@ static void emit_fcmpu_impl(EmitCtx& c) {
     c.b.op_i32_store(ppc_off::cr_field(crfd) + 4);
 }
 
-// fctiwzx (op63 sub15) and fctiwx (op63 sub14): NOT yet emitted. They need
-// either non-trapping i32.trunc_sat_f64_s (not exposed in our WASM builder
-// yet) or a runtime NaN/overflow guard, because the trapping i32.trunc_f64_s
-// would crash on NaN inputs that games legitimately pass when initializing
-// uninitialized memory or via paired-single intrinsics. Deferred until the
-// builder gets the saturating variant. Falls through to interpreter via
-// gekko_lookup miss.
+// fctiwx (op63 sub14) / fctiwzx (op63 sub15): convert FP double to s32.
+//
+// Mirrors Dolphin's ConvertToInteger (Interpreter_FloatingPoint.cpp):
+//   double b   = ps0(rB)
+//   if (NaN)            value = 0x80000000
+//   else if (b ≥ 2^31)  value = 0x7FFFFFFF   (saturate +)
+//   else if (b < -2^31) value = 0x80000000   (saturate -)
+//   else                value = (s32) round(b)
+//   ps0(rD) low32  = value
+//   ps0(rD) high32 = 0xFFF80000 | (value == 0 && signbit(b) ? 1 : 0)
+//
+// fctiwx uses the FPSCR.RN rounding mode; fctiwzx is hard-wired to
+// round-toward-zero. We assume RN=0 (round-to-nearest-even) for fctiwx — the
+// dominant case (most games never alter RN). Non-default RN would need a
+// runtime fpscr.RN switch; deferred.
+//
+// WASM mapping:
+//   round_or_trunc → i32.trunc_sat_f64_s. The saturating variant gives
+//   exactly the +∞/−∞/oob saturation PowerPC requires; the only mismatch
+//   is NaN (WASM → 0, PPC → 0x80000000), handled by an explicit pre-NaN
+//   guard.
+//
+// The "negative-zero" indicator (high32 bit 0 set when result==0 and input
+// signbit set) is computed directly from the f64 bit pattern and ANDed with
+// (result==0).
+//
+// Skipped vs canonical interpreter (per B2 precedent):
+//   * FPSCR.FX/VXSNAN/VXCVI/XX/FI/FR bits.
+//   * Rc bit → CR1 update.
+//   * FPSCR.VE-gated suppression of result write (always writes result).
+static void emit_fctiwx_common(EmitCtx& c, bool round_to_zero) {
+    const u32 fd = RT(c.inst), fb = RB(c.inst);
+
+    // Stash rB in TMP_F.
+    emit_fp_load_ps0(c, fb);
+    c.b.op_local_set(LOCAL_TMP_F);
+
+    // Compute integer result with NaN guard:
+    //   is_nan ? 0x80000000 : trunc_sat(round(b))
+    c.b.op_local_get(LOCAL_TMP_F);
+    c.b.op_local_get(LOCAL_TMP_F);
+    c.b.op_f64_ne();              // is_nan
+    c.b.op_if(WASM_TYPE_I32);
+        c.b.op_i32_const((s32)0x80000000);
+    c.b.op_else();
+        c.b.op_local_get(LOCAL_TMP_F);
+        if (round_to_zero) c.b.op_f64_trunc();
+        else               c.b.op_f64_nearest();
+        c.b.op_i32_trunc_sat_f64_s();
+    c.b.op_end();
+    c.b.op_local_set(LOCAL_TMP_A);
+
+    // Store low32 = result.
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_store(ppc_off::ps0(fd));
+
+    // Store high32 = 0xFFF80000 | (result==0 && signbit(b) ? 1 : 0).
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_const((s32)0xFFF80000);
+    // signbit(b) = bit 63 of i64.reinterpret(b).
+    c.b.op_local_get(LOCAL_TMP_F);
+    c.b.op_i64_reinterpret_f64();
+    c.b.op_i64_const(63);
+    c.b.op_i64_shr_u();
+    c.b.op_i32_wrap_i64();          // 0 or 1
+    // AND with (result == 0).
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_eqz();
+    c.b.op_i32_and();               // neg-zero indicator: 0 or 1
+    c.b.op_i32_or();                // 0xFFF80000 | indicator
+    c.b.op_i32_store(ppc_off::ps0(fd) + 4u);
+}
+static void emit_fctiwx_impl(EmitCtx& c)  { emit_fctiwx_common(c, false); }
+static void emit_fctiwzx_impl(EmitCtx& c) { emit_fctiwx_common(c, true);  }
 
 // ===========================================================================
 // lmw / stmw — load/store multiple words (D-form).
@@ -2771,6 +2839,8 @@ constexpr OpEntry table63_arith_entries[] = {
 constexpr OpEntry table63_other_entries[] = {
     {  0, &emit_fcmpu_impl},   // FP compare unordered
     { 12, &emit_frspx_impl},   // round to single (PS0 + PS1 fill)
+    { 14, &emit_fctiwx_impl},  // FP → i32 (round-to-nearest, FPSCR.RN=0 assumed)
+    { 15, &emit_fctiwzx_impl}, // FP → i32 (round-toward-zero)
     { 32, &emit_fcmpu_impl},   // FP compare ordered (same impl — FPSCR diffs skipped)
     { 40, &emit_fnegx_impl},   // -rB
     { 72, &emit_fmrx_impl},    // rD = rB (move)

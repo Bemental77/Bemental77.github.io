@@ -152,6 +152,20 @@ namespace wop {
 	constexpr u8 f32_demote_f64    = 0xB6;
 	constexpr u8 f32_reinterpret_i32 = 0xBE;
 	constexpr u8 f64_reinterpret_i64 = 0xBF;
+
+	// Saturating truncation prefix + sub-opcodes (Wasm 2.0 / non-trapping
+	// float-to-int proposal, in core spec since 2019). Encoded as
+	// 0xFC <leb128 subop>. Saturating semantics: NaN → 0, ±INF →
+	// INT_MIN/INT_MAX, oob finite → INT_MIN/INT_MAX.
+	constexpr u8 prefix_FC                  = 0xFC;
+	constexpr u8 sub_i32_trunc_sat_f32_s    = 0x00;
+	constexpr u8 sub_i32_trunc_sat_f32_u    = 0x01;
+	constexpr u8 sub_i32_trunc_sat_f64_s    = 0x02;
+	constexpr u8 sub_i32_trunc_sat_f64_u    = 0x03;
+	constexpr u8 sub_i64_trunc_sat_f32_s    = 0x04;
+	constexpr u8 sub_i64_trunc_sat_f32_u    = 0x05;
+	constexpr u8 sub_i64_trunc_sat_f64_s    = 0x06;
+	constexpr u8 sub_i64_trunc_sat_f64_u    = 0x07;
 }
 
 class WasmModuleBuilder {
@@ -461,6 +475,10 @@ public:
 	void op_f64_abs()            { emitByte(wop::f64_abs); }
 	void op_f64_neg()            { emitByte(wop::f64_neg); }
 	void op_f64_sqrt()           { emitByte(wop::f64_sqrt); }
+	void op_f64_trunc()          { emitByte(wop::f64_trunc); }
+	void op_f64_nearest()        { emitByte(wop::f64_nearest); }
+	void op_f64_floor()          { emitByte(wop::f64_floor); }
+	void op_f64_ceil()           { emitByte(wop::f64_ceil); }
 	void op_f64_eq()             { emitByte(wop::f64_eq); }
 	void op_f64_ne()             { emitByte(wop::f64_ne); }
 	void op_f64_lt()             { emitByte(wop::f64_lt); }
@@ -475,6 +493,12 @@ public:
 	void op_i32_trunc_f32_u()    { emitByte(wop::i32_trunc_f32_u); }
 	void op_i32_trunc_f64_s()    { emitByte(wop::i32_trunc_f64_s); }
 	void op_i32_trunc_f64_u()    { emitByte(wop::i32_trunc_f64_u); }
+
+	// Saturating (non-trapping) variants. NaN → 0, oob → INT_MIN/MAX.
+	void op_i32_trunc_sat_f32_s() { emitByte(wop::prefix_FC); emitLEB128(wop::sub_i32_trunc_sat_f32_s); }
+	void op_i32_trunc_sat_f32_u() { emitByte(wop::prefix_FC); emitLEB128(wop::sub_i32_trunc_sat_f32_u); }
+	void op_i32_trunc_sat_f64_s() { emitByte(wop::prefix_FC); emitLEB128(wop::sub_i32_trunc_sat_f64_s); }
+	void op_i32_trunc_sat_f64_u() { emitByte(wop::prefix_FC); emitLEB128(wop::sub_i32_trunc_sat_f64_u); }
 	void op_f32_convert_i32_s()  { emitByte(wop::f32_convert_i32_s); }
 	void op_f32_convert_i32_u()  { emitByte(wop::f32_convert_i32_u); }
 	void op_f64_convert_i32_s()  { emitByte(wop::f64_convert_i32_s); }
