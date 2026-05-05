@@ -1949,6 +1949,246 @@ static void emit_stfdu_impl(EmitCtx& c) {
 }
 
 // ===========================================================================
+// FP arithmetic — primary 59 (single-precision) and primary 63 (double).
+//
+// Both primaries share the same sub-opcode space (bits 26-30):
+//   18  fdivx / fdivsx        rD = rA / rB
+//   20  fsubx / fsubsx        rD = rA - rB
+//   21  faddx / faddsx        rD = rA + rB
+//   22  fsqrtx (op63 only)    rD = sqrt(rB)
+//   24  fresx  (op59 only)    rD = 1/rB         (estimate; we emit f64.div 1)
+//   25  fmulx / fmulsx        rD = rA * rC      (uses C field, not B!)
+//   28  fmsubx / fmsubsx      rD = rA*rC - rB
+//   29  fmaddx / fmaddsx      rD = rA*rC + rB
+//   30  fnmsubx / fnmsubsx    rD = -(rA*rC - rB)
+//   31  fnmaddx / fnmaddsx    rD = -(rA*rC + rB)
+//
+// FPR layout: ppc_state.ps[N] is two 8-byte f64 slots (PS0 + PS1). For
+// scalar FP, the value lives in PS0; PS1 is don't-care for double-precision
+// but must mirror PS0 for single-precision (the "Fill" semantic — paired-
+// singles convention so subsequent paired-single ops see consistent data).
+//
+// Single-precision rounding: `f32.demote_f64; f64.promote_f32` round-trips
+// through f32 precision. WASM's demote uses round-to-nearest-even, matching
+// PowerPC's default rounding mode (FPSCR.RN = 0).
+//
+// Skipped vs canonical interpreter:
+//   * FPSCR.VE/ZE/OE/UE/XE exception checks — most games run with all FP
+//     exceptions masked. If a game depends on FP exceptions firing, the
+//     fast emit produces wrong-but-not-crashing behavior.
+//   * UpdateFPRF (result-class bits in FPSCR) — most games don't read FPRF.
+//   * Rc bit (record) — when Rc=1, CR1 should be updated from FPSCR FPCC
+//     bits. Skipped; very rare in practice.
+//
+// Reference: ~/gc_refs/dolphin/Source/Core/Core/PowerPC/Interpreter/
+//            Interpreter_FloatingPoint.cpp (faddx/faddsx, fsubx/fsubsx, etc).
+// ===========================================================================
+
+// FC field — bits 21-25 from MSB = (i >> 6) & 0x1F.
+inline constexpr u32 FC(u32 i) { return (i >> 6) & 0x1F; }
+
+// Helper: emit "PS0(N) ← top-of-stack f64; also PS1(N) ← same" for single-
+// precision Fill. Caller has already pushed the f64 value onto the WASM stack.
+static void emit_fp_store_single_fill(EmitCtx& c, u32 fd) {
+    // Stash value in TMP_F (a local f64). Then store to ps0 and ps1.
+    c.b.op_local_tee(LOCAL_TMP_F);
+    c.b.op_drop();
+    // ps0(fd) = TMP_F
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_F);
+    c.b.op_f64_store(ppc_off::ps0(fd));
+    // ps1(fd) = TMP_F
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_F);
+    c.b.op_f64_store(ppc_off::ps1(fd));
+}
+
+// Helper: emit "PS0(N) ← top-of-stack f64" for double-precision (no PS1 update).
+static void emit_fp_store_double(EmitCtx& c, u32 fd) {
+    // Stash + write only to ps0(fd).
+    c.b.op_local_tee(LOCAL_TMP_F);
+    c.b.op_drop();
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_local_get(LOCAL_TMP_F);
+    c.b.op_f64_store(ppc_off::ps0(fd));
+}
+
+// Helper: load PS0(N) onto the WASM stack as f64. Caller does the rest.
+static void emit_fp_load_ps0(EmitCtx& c, u32 fr) {
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_f64_load(ppc_off::ps0(fr));
+}
+
+// Single-precision wrapper: round f64 result to single via demote+promote.
+static void emit_fp_round_to_single(EmitCtx& c) {
+    c.b.op_f32_demote_f64();
+    c.b.op_f64_promote_f32();
+}
+
+// faddsx (op59 sub21): rD = single(rA + rB)
+static void emit_faddsx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_add();
+    emit_fp_round_to_single(c);
+    emit_fp_store_single_fill(c, fd);
+}
+// fsubsx (op59 sub20): rD = single(rA - rB)
+static void emit_fsubsx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_sub();
+    emit_fp_round_to_single(c);
+    emit_fp_store_single_fill(c, fd);
+}
+// fmulsx (op59 sub25): rD = single(rA * rC)  — uses C field
+static void emit_fmulsx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fc);
+    c.b.op_f64_mul();
+    emit_fp_round_to_single(c);
+    emit_fp_store_single_fill(c, fd);
+}
+// fdivsx (op59 sub18): rD = single(rA / rB)
+static void emit_fdivsx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_div();
+    emit_fp_round_to_single(c);
+    emit_fp_store_single_fill(c, fd);
+}
+// fmaddsx (op59 sub29): rD = single((rA * rC) + rB)
+static void emit_fmaddsx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst),
+              fb = RB(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fc);
+    c.b.op_f64_mul();
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_add();
+    emit_fp_round_to_single(c);
+    emit_fp_store_single_fill(c, fd);
+}
+// fmsubsx (op59 sub28): rD = single((rA * rC) - rB)
+static void emit_fmsubsx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst),
+              fb = RB(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fc);
+    c.b.op_f64_mul();
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_sub();
+    emit_fp_round_to_single(c);
+    emit_fp_store_single_fill(c, fd);
+}
+// fnmaddsx (op59 sub31): rD = -single((rA * rC) + rB)
+static void emit_fnmaddsx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst),
+              fb = RB(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fc);
+    c.b.op_f64_mul();
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_add();
+    c.b.op_f64_neg();
+    emit_fp_round_to_single(c);
+    emit_fp_store_single_fill(c, fd);
+}
+// fnmsubsx (op59 sub30): rD = -single((rA * rC) - rB)
+static void emit_fnmsubsx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst),
+              fb = RB(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fc);
+    c.b.op_f64_mul();
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_sub();
+    c.b.op_f64_neg();
+    emit_fp_round_to_single(c);
+    emit_fp_store_single_fill(c, fd);
+}
+
+// faddx (op63 sub21): rD = double(rA + rB)
+static void emit_faddx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_add();
+    emit_fp_store_double(c, fd);
+}
+// fsubx (op63 sub20): rD = double(rA - rB)
+static void emit_fsubx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_sub();
+    emit_fp_store_double(c, fd);
+}
+// fmulx (op63 sub25): rD = double(rA * rC)
+static void emit_fmulx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fc);
+    c.b.op_f64_mul();
+    emit_fp_store_double(c, fd);
+}
+// fdivx (op63 sub18): rD = double(rA / rB)
+static void emit_fdivx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_div();
+    emit_fp_store_double(c, fd);
+}
+// fmaddx (op63 sub29): rD = double((rA * rC) + rB)
+static void emit_fmaddx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst),
+              fb = RB(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fc);
+    c.b.op_f64_mul();
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_add();
+    emit_fp_store_double(c, fd);
+}
+// fmsubx (op63 sub28): rD = double((rA * rC) - rB)
+static void emit_fmsubx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fa = RA(c.inst),
+              fb = RB(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fa);
+    emit_fp_load_ps0(c, fc);
+    c.b.op_f64_mul();
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_sub();
+    emit_fp_store_double(c, fd);
+}
+
+// fnegx (op63 sub40): rD = -rB (preserves PS1)
+static void emit_fnegx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_neg();
+    emit_fp_store_double(c, fd);
+}
+// fabsx (op63 sub264): rD = |rB|
+static void emit_fabsx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fb);
+    c.b.op_f64_abs();
+    emit_fp_store_double(c, fd);
+}
+// fmrx (op63 sub72): rD = rB (move FP)
+static void emit_fmrx_impl(EmitCtx& c) {
+    const u32 fd = RT(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fb);
+    emit_fp_store_double(c, fd);
+}
+
+// ===========================================================================
 // lmw / stmw — load/store multiple words (D-form).
 //   lmw rT, d(rA): for i in [rT..31]: gpr[i] = read32(EA + (i-rT)*4)
 //   stmw rS, d(rA): for i in [rS..31]: write32(EA + (i-rS)*4, gpr[i])
@@ -2292,6 +2532,39 @@ constexpr OpEntry table31_entries[] = {
     {659, &emit_mfsrin_impl},
 };
 
+// op59 sub-ops (single-precision FP arith). Dispatch via SUBOP5 (bits 26-30).
+constexpr OpEntry table59_entries[] = {
+    {18, &emit_fdivsx_impl},
+    {20, &emit_fsubsx_impl},
+    {21, &emit_faddsx_impl},
+    {25, &emit_fmulsx_impl},
+    {28, &emit_fmsubsx_impl},
+    {29, &emit_fmaddsx_impl},
+    {30, &emit_fnmsubsx_impl},
+    {31, &emit_fnmaddsx_impl},
+};
+
+// op63 arith sub-ops (5-bit dispatch). 4-operand ops (fmadd-class) carry an
+// rC field in bits 21-25, so we MUST mask via SUBOP5 — SUBOP10 would vary
+// with rC and miss the lookup.
+constexpr OpEntry table63_arith_entries[] = {
+    {18, &emit_fdivx_impl},
+    {20, &emit_fsubx_impl},
+    {21, &emit_faddx_impl},
+    {25, &emit_fmulx_impl},
+    {28, &emit_fmsubx_impl},
+    {29, &emit_fmaddx_impl},
+};
+
+// op63 single-purpose 10-bit sub-ops. These don't collide with the arith
+// SUBOP5 keys above because their SUBOP5 values (0, 8, etc.) are unused
+// in the arith table.
+constexpr OpEntry table63_other_entries[] = {
+    { 40, &emit_fnegx_impl},
+    { 72, &emit_fmrx_impl},
+    {264, &emit_fabsx_impl},
+};
+
 constexpr EmitFn table_lookup(const OpEntry* tbl, std::size_t n, u32 key) {
     for (std::size_t i = 0; i < n; ++i)
         if (tbl[i].op == key) return tbl[i].fn;
@@ -2314,8 +2587,19 @@ EmitFn gekko_lookup(u32 inst) {
     if (p == S_T31) return table_lookup(table31_entries,
                                         sizeof(table31_entries)/sizeof(table31_entries[0]),
                                         SUBOP10(inst));
-    if (p == S_T59) return nullptr;  // FP single — fallback
-    if (p == S_T63) return nullptr;  // FP double — fallback
+    if (p == S_T59) return table_lookup(table59_entries,
+                                        sizeof(table59_entries)/sizeof(table59_entries[0]),
+                                        SUBOP5(inst));
+    if (p == S_T63) {
+        // op63: try arith table (SUBOP5) first, then 10-bit table.
+        EmitFn f = table_lookup(table63_arith_entries,
+                                sizeof(table63_arith_entries)/sizeof(table63_arith_entries[0]),
+                                SUBOP5(inst));
+        if (f) return f;
+        return table_lookup(table63_other_entries,
+                            sizeof(table63_other_entries)/sizeof(table63_other_entries[0]),
+                            SUBOP10(inst));
+    }
     return p;
 }
 
@@ -2533,11 +2817,11 @@ static void emit_body_into(WasmModuleBuilder& b,
     g_mem1_mask = mem1_mask;
     g_ram_size  = ram_size;
 
-    // Locals: 2 i32 scratch.
+    // Locals: 2 i32 scratch + 1 f64 scratch (for FP arith store-fill).
     {
-        const u32 counts[] = { LOCAL_TMP_COUNT };
-        const u8  types[]  = { WASM_TYPE_I32 };
-        b.emitLocals(1, counts, types);
+        const u32 counts[] = { LOCAL_TMP_COUNT, 1 };
+        const u8  types[]  = { WASM_TYPE_I32,    WASM_TYPE_F64 };
+        b.emitLocals(2, counts, types);
     }
 
     EmitCtx ctx{ b, start_pc, 0u, false, false };

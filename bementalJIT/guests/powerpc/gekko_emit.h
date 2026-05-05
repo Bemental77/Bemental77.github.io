@@ -46,6 +46,10 @@ enum WasmImportFunc : u32 {
 constexpr u32 LOCAL_TMP_A = 0;
 constexpr u32 LOCAL_TMP_B = 1;
 constexpr u32 LOCAL_TMP_COUNT = 2;
+// Single f64 scratch local for FP arith store-fill (used by op59/op63
+// emitters). Index = LOCAL_TMP_COUNT since locals are appended after the
+// i32 group declared in emit_body_into's emitLocals call.
+constexpr u32 LOCAL_TMP_F = 2;
 
 // ---------------------------------------------------------------------------
 // PowerPCState field offsets, in bytes from the start of the struct.
