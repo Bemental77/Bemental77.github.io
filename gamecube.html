@@ -254,16 +254,138 @@
     setTimeout(pollController, 10);
   }
   var renderFrames = 0, lastFpsLog = performance.now();
-  var canvasCtx = null, canvasImg = null;
-  function paintFrame(pixels, w, h, pitch) {
-    var c = $('canvas');
-    if (!canvasCtx) canvasCtx = c.getContext('2d');
-    if (c.width !== w) c.width = w;
-    if (c.height !== h) c.height = h;
-    if (!canvasImg || canvasImg.width !== w || canvasImg.height !== h) {
-      canvasImg = canvasCtx.createImageData(w, h);
+  // Render backend: try WebGPU first, fall back to 2D canvas. WebGPU path
+  // accepts BGRA8Unorm directly so no per-pixel JS swizzle is needed; the
+  // GPU does the format conversion in hardware. Adopts the SHaR-WASM
+  // state-cache pattern: pipeline/sampler/bind-group are created once and
+  // reused per frame; only the texture is recreated on resolution change.
+  var GPU = {
+    available: false,
+    initing: false,
+    inited: false,
+    failed: false,
+    device: null,
+    ctx: null,
+    format: null,
+    pipeline: null,
+    sampler: null,
+    texture: null,
+    texW: 0, texH: 0,
+    bindGroup: null,
+    layout: null,
+  };
+  function initWebGPU(canvas) {
+    if (GPU.inited || GPU.failed || GPU.initing) return GPU.inited;
+    GPU.initing = true;
+    if (!('gpu' in navigator)) {
+      GPU.failed = true; GPU.initing = false;
+      pageLog('[render] WebGPU not available — falling back to 2D canvas');
+      return false;
     }
-    var dst = canvasImg.data;
+    navigator.gpu.requestAdapter().then(function (adapter) {
+      if (!adapter) throw new Error('no adapter');
+      return adapter.requestDevice();
+    }).then(function (device) {
+      GPU.device = device;
+      GPU.ctx = canvas.getContext('webgpu');
+      if (!GPU.ctx) throw new Error('webgpu context unavailable');
+      GPU.format = navigator.gpu.getPreferredCanvasFormat();
+      GPU.ctx.configure({ device: device, format: GPU.format, alphaMode: 'opaque' });
+      // Uber-shader: fullscreen quad via vertex_index, sample BGRA texture, output as canvas format.
+      var shader = device.createShaderModule({ code: ''
+        + 'struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, };\n'
+        + '@vertex fn vs(@builtin(vertex_index) i: u32) -> VSOut {\n'
+        + '  var p = array<vec2<f32>, 6>(\n'
+        + '    vec2(-1.0, -1.0), vec2( 1.0, -1.0), vec2(-1.0,  1.0),\n'
+        + '    vec2(-1.0,  1.0), vec2( 1.0, -1.0), vec2( 1.0,  1.0));\n'
+        + '  var uv = array<vec2<f32>, 6>(\n'
+        + '    vec2(0.0, 1.0), vec2(1.0, 1.0), vec2(0.0, 0.0),\n'
+        + '    vec2(0.0, 0.0), vec2(1.0, 1.0), vec2(1.0, 0.0));\n'
+        + '  var o: VSOut;\n'
+        + '  o.pos = vec4(p[i], 0.0, 1.0);\n'
+        + '  o.uv = uv[i];\n'
+        + '  return o;\n'
+        + '}\n'
+        + '@group(0) @binding(0) var samp: sampler;\n'
+        + '@group(0) @binding(1) var tex: texture_2d<f32>;\n'
+        + '@fragment fn fs(in: VSOut) -> @location(0) vec4<f32> {\n'
+        + '  return textureSample(tex, samp, in.uv);\n'
+        + '}\n'
+      });
+      GPU.layout = device.createBindGroupLayout({ entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+      ]});
+      var pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [GPU.layout] });
+      GPU.pipeline = device.createRenderPipeline({
+        layout: pipelineLayout,
+        vertex: { module: shader, entryPoint: 'vs' },
+        fragment: { module: shader, entryPoint: 'fs', targets: [{ format: GPU.format }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      GPU.sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+      GPU.available = true;
+      GPU.inited = true;
+      GPU.initing = false;
+      pageLog('[render] WebGPU ready (format=' + GPU.format + ')');
+    }).catch(function (e) {
+      GPU.failed = true;
+      GPU.initing = false;
+      pageLog('[render] WebGPU init failed: ' + e + ' — falling back to 2D');
+    });
+    return false;
+  }
+  function ensureGpuTexture(w, h) {
+    if (GPU.texture && GPU.texW === w && GPU.texH === h) return;
+    if (GPU.texture) GPU.texture.destroy();
+    GPU.texture = GPU.device.createTexture({
+      size: { width: w, height: h, depthOrArrayLayers: 1 },
+      format: 'bgra8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    GPU.texW = w; GPU.texH = h;
+    GPU.bindGroup = GPU.device.createBindGroup({
+      layout: GPU.layout,
+      entries: [
+        { binding: 0, resource: GPU.sampler },
+        { binding: 1, resource: GPU.texture.createView() },
+      ],
+    });
+  }
+  function paintFrameGPU(pixels, w, h, pitch) {
+    ensureGpuTexture(w, h);
+    var bytesPerRow = pitch || w * 4;
+    // writeTexture: GPU does the BGRA -> canvas-format swizzle for free.
+    // pixels is a Uint8Array view into the worker's memory transferred via
+    // postMessage. WebGPU copies it into the texture in one host-side memcpy.
+    GPU.device.queue.writeTexture(
+      { texture: GPU.texture },
+      pixels,
+      { offset: 0, bytesPerRow: bytesPerRow, rowsPerImage: h },
+      { width: w, height: h, depthOrArrayLayers: 1 }
+    );
+    var enc = GPU.device.createCommandEncoder();
+    var pass = enc.beginRenderPass({
+      colorAttachments: [{
+        view: GPU.ctx.getCurrentTexture().createView(),
+        loadOp: 'clear', storeOp: 'store',
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    pass.setPipeline(GPU.pipeline);
+    pass.setBindGroup(0, GPU.bindGroup);
+    pass.draw(6);
+    pass.end();
+    GPU.device.queue.submit([enc.finish()]);
+  }
+  var canvasCtx2D = null, canvasImg2D = null;
+  function paintFrame2D(pixels, w, h, pitch) {
+    var c = $('canvas');
+    if (!canvasCtx2D) canvasCtx2D = c.getContext('2d');
+    if (!canvasImg2D || canvasImg2D.width !== w || canvasImg2D.height !== h) {
+      canvasImg2D = canvasCtx2D.createImageData(w, h);
+    }
+    var dst = canvasImg2D.data;
     var stride = pitch || w * 4;
     var src = pixels;
     var di = 0;
@@ -278,8 +400,30 @@
         so += 4;
       }
     }
-    canvasCtx.putImageData(canvasImg, 0, 0);
+    canvasCtx2D.putImageData(canvasImg2D, 0, 0);
   }
+  function paintFrame(pixels, w, h, pitch) {
+    var c = $('canvas');
+    if (c.width !== w) c.width = w;
+    if (c.height !== h) c.height = h;
+    if (GPU.available) { paintFrameGPU(pixels, w, h, pitch); return; }
+    paintFrame2D(pixels, w, h, pitch);
+  }
+  // Eager WebGPU init — kick off at page load so the path is ready by the
+  // time the first XFB arrives. Logs result either way for diagnosability.
+  (function () {
+    function tryInit() {
+      var c = $('canvas');
+      if (!c) { setTimeout(tryInit, 50); return; }
+      pageLog('[render] navigator.gpu=' + (typeof navigator !== 'undefined' && 'gpu' in navigator ? 'present' : 'missing'));
+      initWebGPU(c);
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', tryInit);
+    } else {
+      tryInit();
+    }
+  })();
   function onWorkerMsg(e) {
     var data = e.data;
     switch (data.cmd) {
