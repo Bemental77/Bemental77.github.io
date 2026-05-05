@@ -519,6 +519,61 @@ static void emit_bx_impl(EmitCtx& c) {
 static void emit_bcx_impl(EmitCtx& c) {
     const u32 bo = BO(c.inst), bi = BI(c.inst);
     const s32 bd = BD(c.inst);
+    // BO encoding (5 bits, MSB-first):
+    //   bit 0: don't decrement CTR if set
+    //   bit 1: branch on CR=true if set, =false if clear
+    //   bit 2: ignore CR if set
+    //   bit 3: don't check CTR == 0 if set (only relevant when CTR is decremented)
+    //   bit 4: branch prediction hint (ignored)
+    //
+    // Native fast paths (no LK):
+    //   BO = 0b00100 (4)  bne+   no-CTR, branch on CR-false  ← original
+    //   BO = 0b01100 (12) beq+   no-CTR, branch on CR-true   ← original
+    //   BO = 0b10000 (16) bdnz   decrement-CTR, branch on CTR != 0
+    //   BO = 0b10010 (18) bdz    decrement-CTR, branch on CTR == 0
+    // Anything else falls back.
+    const u32 target = AA(c.inst) ? (u32)bd : (u32)((s32)c.pc + bd);
+    const u32 fallthrough = c.pc + 4;
+    const bool is_bdnz = (bo == 0b10000u);
+    const bool is_bdz  = (bo == 0b10010u);
+    if (!LK(c.inst) && (is_bdnz || is_bdz)) {
+        // CTR-decrement-and-branch path. Decrement CTR, push the result on the
+        // stack so we can both store it and test it against 0.
+        c.b.op_i32_const((s32)CTX);          // store addr for CTR write
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::spr(9));    // load CTR
+        c.b.op_i32_const(1);
+        c.b.op_i32_sub();                     // CTR - 1
+        c.b.op_local_tee(LOCAL_TMP_A);        // stash for the test
+        c.b.op_i32_store(ppc_off::spr(9));    // CTR := CTR - 1
+
+        // Predicate: bdnz fires if new CTR != 0; bdz fires if == 0.
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0);
+        if (is_bdnz)
+            c.b.op_i32_ne();
+        else
+            c.b.op_i32_eq();
+
+        u32 t_lidx = 0u, f_lidx = 0u;
+        const bool t_resolved = try_resolve_target(c, target, &t_lidx);
+        const bool f_resolved = try_resolve_target(c, fallthrough, &f_lidx);
+
+        if (c.chain_fallthrough) {
+            c.b.op_if(/*no result*/ 0x40);
+                emit_branch_resolution(c, target, t_resolved ? &t_lidx : nullptr);
+            c.b.op_end();
+            return;
+        }
+        c.b.op_if(/*no result*/ 0x40);
+            emit_branch_resolution(c, target, t_resolved ? &t_lidx : nullptr);
+        c.b.op_else();
+            emit_branch_resolution(c, fallthrough, f_resolved ? &f_lidx : nullptr);
+        c.b.op_end();
+        c.b.op_unreachable();
+        c.block_end = true;
+        return;
+    }
     // Handle only "branch if cr_bit{eq,ne}" — BO = 0b00100 (branch false)
     // or BO = 0b01100 (branch true). No CTR decrement, no link.
     if (LK(c.inst) || (bo & 0b10100) != 0b00100) {
@@ -529,8 +584,7 @@ static void emit_bcx_impl(EmitCtx& c) {
         return;
     }
     const bool branch_if_true = (bo & 0b01000) != 0;
-    const u32 target = AA(c.inst) ? (u32)bd : (u32)((s32)c.pc + bd);
-    const u32 fallthrough = c.pc + 4;
+    // (target / fallthrough already declared above for the bdnz/bdz path)
 
     // Test CR bit `bi` using Dolphin's CR encoding (cr.fields[i] is a u64
     // where: LT ⇔ bit 62 set, EQ ⇔ low 32 == 0, GT ⇔ NOT LT AND NOT EQ,
