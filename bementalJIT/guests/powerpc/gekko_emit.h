@@ -164,6 +164,10 @@ struct EmitCtx {
     WasmModuleBuilder& b;
     u32  pc;                 // guest PC of this instruction
     u32  inst;               // raw instruction word
+    u32  start_pc = 0u;      // guest PC of the first instruction of this block.
+                             // Used to suppress self-block tail-calls so the
+                             // host-side idle-skip detector can observe
+                             // self-loops at the host-loop boundary.
     bool block_end;          // emitter sets to true to terminate the basic block
     // Multiblock chain hint: when this is `bc` (op 16, no LK) and the
     // instruction immediately following in the build_block buffer is the

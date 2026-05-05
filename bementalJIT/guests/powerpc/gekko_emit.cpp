@@ -489,8 +489,18 @@ static void emit_branch_resolution(EmitCtx& c, u32 target_pc, const u32* local_i
 
 // Try to resolve `target_pc` to a same-region local fn idx via the
 // emitter's lookup callback. Returns true and writes `*out` on hit.
+//
+// Self-block back-branches are deliberately NOT resolved: a tail-call to
+// our own start_pc would loop entirely in WASM, never returning to the
+// host-loop boundary. The host-side B1 idle-skip detector ONLY fires at
+// that boundary (it observes the next_pc value the block returns), so
+// busy-wait loops like SelectThread idle (`beq self`) would spin in WASM
+// forever without idle-skip ever firing. Forcing a return for self-target
+// branches restores the host-loop visit and lets idle-skip fast-forward
+// sim_time to the next CoreTiming event.
 static inline bool try_resolve_target(EmitCtx& c, u32 target_pc, u32* out) {
     if (!c.lookup_local_idx) return false;
+    if (target_pc == c.start_pc) return false;
     return c.lookup_local_idx(c.lookup_user, target_pc, out);
 }
 
@@ -3107,7 +3117,7 @@ static void emit_body_into(WasmModuleBuilder& b,
         b.emitLocals(2, counts, types);
     }
 
-    EmitCtx ctx{ b, start_pc, 0u, false, false };
+    EmitCtx ctx{ b, start_pc, 0u, start_pc, false, false };
     ctx.lookup_local_idx = lookup_fn;
     ctx.lookup_user      = lookup_user;
 
