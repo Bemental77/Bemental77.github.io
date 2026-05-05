@@ -424,13 +424,102 @@
       tryInit();
     }
   })();
+  // AudioWorklet init via SAB ring buffer. AudioContext requires user
+  // gesture (autoplay policy) so init runs on the first user interaction
+  // event. Until then, the cmd:'audio' handler falls back to the legacy
+  // Module._feedAudio path. RING_FRAMES sizes the buffer for ~93 ms of
+  // stereo audio at 44.1 kHz (4096 frames * 2 ch = 8192 i16 samples).
+  var GcAudio = { ctx: null, node: null, ring: null, ringHdr: null,
+                  ringData: null, ringCap: 0, inited: false };
+  function pushAudioSamples(int16Buf, frameCount) {
+    if (!GcAudio.inited) return;
+    var hdr = GcAudio.ringHdr;
+    var data = GcAudio.ringData;
+    var cap = GcAudio.ringCap;
+    var head = Atomics.load(hdr, 0);
+    var tail = Atomics.load(hdr, 1);
+    var free = cap - ((head - tail) | 0);
+    var samplesIn = (frameCount | 0) * 2;
+    var n = samplesIn > free ? free : samplesIn;
+    if (n === 0) return;
+    var src = new Int16Array(int16Buf);
+    var start = (head >>> 0) % cap;
+    var first = Math.min(n, cap - start);
+    for (var i = 0; i < first; ++i) data[start + i] = src[i];
+    var second = n - first;
+    for (var j = 0; j < second; ++j) data[j] = src[first + j];
+    Atomics.store(hdr, 0, ((head + n) | 0));
+  }
+  async function initGcAudio() {
+    if (GcAudio.inited || GcAudio.initing) return;
+    GcAudio.initing = true;
+    try {
+      var ctx = new (window.AudioContext || window.webkitAudioContext)();
+      // Ring buffer SAB: 4 i32 header + 4096 i16 samples.
+      var RING_SAMPLES = 4096 * 2;  // 4096 frames * 2 channels
+      var sab = new SharedArrayBuffer(16 + RING_SAMPLES * 2);
+      var hdr = new Int32Array(sab, 0, 4);
+      hdr[2] = RING_SAMPLES;  // capacity in elements
+      hdr[3] = 2;              // elemSize bytes (int16)
+      var data = new Int16Array(sab, 16, RING_SAMPLES);
+      await ctx.audioWorklet.addModule('/gamecube/audio-worklet.js');
+      var node = new AudioWorkletNode(ctx, 'gc-audio-processor', {
+        outputChannelCount: [2],
+        processorOptions: { sab: sab, byteOffset: 0 },
+      });
+      node.port.onmessage = function (e) {
+        if (e.data && e.data.cmd === 'stats') {
+          if (e.data.underrunFrames > 0) {
+            pageLog('[audio] underrun ' + e.data.underrunFrames + 'f / consumed ' + e.data.consumedFrames + 'f');
+          }
+        }
+      };
+      node.connect(ctx.destination);
+      GcAudio.ctx = ctx;
+      GcAudio.node = node;
+      GcAudio.ring = sab;
+      GcAudio.ringHdr = hdr;
+      GcAudio.ringData = data;
+      GcAudio.ringCap = RING_SAMPLES;
+      GcAudio.inited = true;
+      window._gcAudioPushSamples = pushAudioSamples;
+      pageLog('[audio] AudioWorklet ready (sampleRate=' + ctx.sampleRate + ')');
+    } catch (e) {
+      pageLog('[audio] AudioWorklet init failed: ' + e + ' — using legacy Module._feedAudio');
+    } finally {
+      GcAudio.initing = false;
+    }
+  }
+  // Wire user-gesture init.
+  (function () {
+    function once() {
+      window.removeEventListener('pointerdown', once, true);
+      window.removeEventListener('keydown', once, true);
+      window.removeEventListener('touchstart', once, true);
+      initGcAudio();
+    }
+    window.addEventListener('pointerdown', once, true);
+    window.addEventListener('keydown', once, true);
+    window.addEventListener('touchstart', once, true);
+  })();
   function onWorkerMsg(e) {
     var data = e.data;
     switch (data.cmd) {
       case 'print': pageLog('> ' + data.txt); break;
       case 'setStatus': setStatus(data.txt); break;
       case 'render': { if (data.pixels) paintFrame(data.pixels, data.w, data.h, data.pitch); if (data.h > 0 && !window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame received w:' + data.w + ' h:' + data.h); } renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now - lastFpsLog)).toFixed(1); renderFrames = 0; lastFpsLog = now; } break; }
-      case 'audio': { if (audioMuted) break; if (Module._feedAudio) Module._feedAudio(data.buf, data.len); break; }
+      case 'audio': {
+        if (audioMuted) break;
+        // Prefer AudioWorklet path (lock-free SAB ring buffer); fall back
+        // to legacy Module._feedAudio if the worklet hasn't been initialized
+        // yet (e.g., user hasn't gestured to start AudioContext).
+        if (window._gcAudioPushSamples) {
+          window._gcAudioPushSamples(data.buf, data.len);
+        } else if (Module._feedAudio) {
+          Module._feedAudio(data.buf, data.len);
+        }
+        break;
+      }
       case 'stateSaved': if (pendingSaveResolve) { pendingSaveResolve(data.data); pendingSaveResolve = null; } break;
       case 'stateLoaded': if (pendingLoadResolve) { pendingLoadResolve(); pendingLoadResolve = null; } break;
       default: pageLog('unknown worker cmd: ' + data.cmd);
