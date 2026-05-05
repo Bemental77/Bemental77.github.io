@@ -138,35 +138,34 @@ void emit_invalidate_gpr_locals(EmitCtx& c) {
 #define CTX (g_ctx_ptr)
 
 // Re-implement addi cleanly now that CTX is defined.
+// B11 Phase 2 Task 1 — migrated to emit_gpr_get_impl / emit_gpr_set_impl.
+// Cat A: load + compute + store, no TMP_A reuse.
 static void emit_addi_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
-    c.b.op_i32_const((s32)CTX);
     if (ra == 0) {
         c.b.op_i32_const(simm);
     } else {
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(ra));
+        emit_gpr_get_impl(c, ra, g_ctx_ptr);
         c.b.op_i32_const(simm);
         c.b.op_i32_add();
     }
-    c.b.op_i32_store(ppc_off::gpr(rt));
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);
 }
 
 // addis rt, ra, simm   ; rt = (RA==0 ? 0 : ra) + (simm << 16)
+// B11 Phase 2 Task 2 — cat A.
 static void emit_addis_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
     const s32 simm = (s32)((u32)(s32)(s16)c.inst << 16);
-    c.b.op_i32_const((s32)CTX);
     if (ra == 0) {
         c.b.op_i32_const(simm);
     } else {
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(ra));
+        emit_gpr_get_impl(c, ra, g_ctx_ptr);
         c.b.op_i32_const(simm);
         c.b.op_i32_add();
     }
-    c.b.op_i32_store(ppc_off::gpr(rt));
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);
 }
 
 // addic rt, ra, simm   ; rt = ra + simm; XER.CA = unsigned-carry
@@ -205,34 +204,33 @@ static void emit_addic_rc_impl(EmitCtx& c) {
 }
 
 // subfic rt, ra, simm  ; rt = simm - ra; CA = unsigned ~ra + simm + 1 carry
+// B11 Phase 2 Task 4 — cat A. The CA store at XER_CA is non-GPR memory
+// so it keeps the legacy `[ctx, val] → i32.store8` shape with explicit
+// pre-pushed CTX.
 static void emit_subfic_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
-    c.b.op_i32_const((s32)CTX);
     c.b.op_i32_const(simm);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_sub();
-    c.b.op_i32_store(ppc_off::gpr(rt));
-    // CA: simm >= ra (unsigned)
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    // CA: simm >= ra (unsigned). Pre-push CTX for the i32.store8 below.
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_const(simm);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_ge_u();
     c.b.op_i32_store8(ppc_off::XER_CA);
 }
 
 // mulli rt, ra, simm   ; rt = ra * simm (signed, low 32 bits)
+// B11 Phase 2 Task 3 — cat A.
 static void emit_mulli_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_const(simm);
     c.b.op_i32_mul();
-    c.b.op_i32_store(ppc_off::gpr(rt));
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);
 }
 
 // cmpi crfd, L, ra, simm  ; signed compare ra <-> simm into CR field crfd
