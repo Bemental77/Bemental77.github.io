@@ -50,6 +50,12 @@ constexpr u32 LOCAL_TMP_COUNT = 2;
 // emitters). Index = LOCAL_TMP_COUNT since locals are appended after the
 // i32 group declared in emit_body_into's emitLocals call.
 constexpr u32 LOCAL_TMP_F = 2;
+// B11 — per-block GPR cache. 32 i32 locals, one per PowerPC GPR, declared
+// AFTER the f64 local so LOCAL_TMP_F's index is unaffected. Indices
+// GPR_LOCAL_BASE..GPR_LOCAL_BASE+31. Allocated whether or not
+// EmitCtx::use_gpr_locals is set; V8 elides unused locals.
+constexpr u32 GPR_LOCAL_BASE = 3u;
+inline constexpr u32 gpr_local_idx(u32 i) { return GPR_LOCAL_BASE + i; }
 
 // ---------------------------------------------------------------------------
 // PowerPCState field offsets, in bytes from the start of the struct.
@@ -190,6 +196,24 @@ struct EmitCtx {
     // its target PC for the dispatcher to re-look-up).
     LocalIdxLookupFn lookup_local_idx = nullptr;
     const void*      lookup_user      = nullptr;
+
+    // B11 — per-block GPR-local cache state. When `use_gpr_locals` is true,
+    // emit_gpr_get/set route through WASM locals (gpr_local_idx(i)) instead
+    // of memory:
+    //   - gpr_loaded[i]: this block has loaded gpr[i] from memory into the
+    //     local at least once. Subsequent reads use the local directly.
+    //   - gpr_dirty[i]: the local holds a value not yet written back to
+    //     memory. Must be flushed before any path that hands control to
+    //     code that reads ppc_state.gpr[i] (fallback, exception bail,
+    //     branch return / tail-call, end of block).
+    //
+    // The fallback path also INVALIDATES the cache (sets gpr_loaded[i] =
+    // gpr_dirty[i] = false for all i) because the interpreter may have
+    // mutated ppc_state.gpr[i] via direct memory writes; locals would be
+    // stale.
+    bool use_gpr_locals = false;
+    bool gpr_loaded[32] = {};
+    bool gpr_dirty[32]  = {};
 };
 
 // Forward-declared core emit functions live in gekko_emit.cpp.
@@ -327,6 +351,17 @@ inline void emit_store_gpr(EmitCtx& c, u32 i) {
     c.b.op_i32_store(ppc_off::gpr(i));
 }
 
+// ---------------------------------------------------------------------------
+// B11 GPR-local cache helpers (gekko_emit.cpp uses g_ctx_ptr as the address
+// constant; these helpers reach for it lazily via the unified pattern).
+// ---------------------------------------------------------------------------
+
+// Forward declare; defined in gekko_emit.cpp where g_ctx_ptr lives.
+void emit_gpr_get_impl(EmitCtx& c, u32 i, u32 ctx_ptr);
+void emit_gpr_set_impl(EmitCtx& c, u32 i, u32 ctx_ptr);
+void emit_flush_dirty_gprs_impl(EmitCtx& c, u32 ctx_ptr);
+void emit_invalidate_gpr_locals(EmitCtx& c);
+
 // CR0 quick-set: given an i32 value already on the stack, compute and write
 // CR0 = SLT|SGT|EQ|SO  (4-bit field stored in low byte of cr.fields[0]).
 // Implements the typical "Rc=1" behavior: signed compare against 0.
@@ -404,10 +439,18 @@ inline void emit_set_pc_dyn(EmitCtx& c, u32 ctx_ptr) {
 }
 
 // Emit fallback: inst_word + pc are i32 consts; calls WIMPORT_INTERP.
+//
+// B11: when GPR-local cache is active, dirty GPRs MUST be flushed to memory
+// before the interpreter call (the interpreter reads ppc_state.gpr directly).
+// AFTER the call, all GPR locals are invalidated because the interpreter
+// may have written ppc_state.gpr — cached locals would be stale.
 inline void emit_fallback(EmitCtx& c) {
+    extern u32 g_ctx_ptr;
+    emit_flush_dirty_gprs_impl(c, g_ctx_ptr);
     c.b.op_i32_const((s32)c.inst);
     c.b.op_i32_const((s32)c.pc);
     c.b.op_call(WIMPORT_INTERP);
+    emit_invalidate_gpr_locals(c);
     c.used_fallback = true;
 }
 

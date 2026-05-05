@@ -41,7 +41,7 @@ static void emit_addi(EmitCtx& c) {
 // through a shared "EmitState" stored on EmitCtx. Simpler: pass ctx_ptr via a
 // global set per build_block call (these are not reentrant, but that matches
 // the rest of bementalJIT).
-static u32 g_ctx_ptr = 0;
+u32 g_ctx_ptr = 0;
 // Linear-memory offset of MEM1 in the shared host heap, set per-build by
 // build_block(). Zero means "fast-path direct memory access disabled, fall
 // back to ppc_read*/ppc_write* trampolines for everything." When non-zero,
@@ -51,6 +51,89 @@ static u32 g_ctx_ptr = 0;
 static u32 g_mem1_base = 0;
 static u32 g_mem1_mask = 0;
 static u32 g_ram_size  = 0;
+
+// ---------------------------------------------------------------------------
+// B11 GPR-local cache helper bodies. Forward-declared in gekko_emit.h.
+//
+// emit_gpr_get_impl: pushes gpr[i] onto the WASM stack. Lazy: if not yet
+//   loaded, emit `i32.const ctx; i32.load gpr_off; local.tee idx`. If
+//   loaded, emit `local.get idx`.
+// emit_gpr_set_impl: pops top, writes to local idx (if cache enabled) or
+//   directly to memory at gpr_off (legacy). Caller must NOT pre-push ctx
+//   in either mode.
+// emit_flush_dirty_gprs_impl: writes back every gpr_dirty[i]==true to
+//   memory and clears the dirty bit. Loaded state remains true (cached
+//   value is now also in memory).
+// emit_invalidate_gpr_locals: clears loaded[] and dirty[]; caller is
+//   responsible for ensuring memory has the canonical state. Used after
+//   fallback (interpreter may have mutated ppc_state.gpr).
+// ---------------------------------------------------------------------------
+void emit_gpr_get_impl(EmitCtx& c, u32 i, u32 ctx_ptr) {
+    if (!c.use_gpr_locals) {
+        c.b.op_i32_const((s32)ctx_ptr);
+        c.b.op_i32_load(ppc_off::gpr(i));
+        return;
+    }
+    if (!c.gpr_loaded[i]) {
+        c.b.op_i32_const((s32)ctx_ptr);
+        c.b.op_i32_load(ppc_off::gpr(i));
+        c.b.op_local_tee(gpr_local_idx(i));   // keep on stack + write local
+        c.gpr_loaded[i] = true;
+    } else {
+        c.b.op_local_get(gpr_local_idx(i));
+    }
+}
+
+void emit_gpr_set_impl(EmitCtx& c, u32 i, u32 ctx_ptr) {
+    if (!c.use_gpr_locals) {
+        // Legacy memory path: incoming stack is [value]; we need [ctx, value]
+        // before i32.store. Use TMP_A as a scratch swap.
+        c.b.op_local_set(LOCAL_TMP_A);
+        c.b.op_i32_const((s32)ctx_ptr);
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_store(ppc_off::gpr(i));
+        return;
+    }
+    c.b.op_local_set(gpr_local_idx(i));
+    c.gpr_loaded[i] = true;
+    c.gpr_dirty[i]  = true;
+}
+
+void emit_flush_dirty_gprs_impl(EmitCtx& c, u32 ctx_ptr) {
+    if (!c.use_gpr_locals) return;
+    for (u32 i = 0; i < 32u; ++i) {
+        if (!c.gpr_dirty[i]) continue;
+        c.b.op_i32_const((s32)ctx_ptr);
+        c.b.op_local_get(gpr_local_idx(i));
+        c.b.op_i32_store(ppc_off::gpr(i));
+        c.gpr_dirty[i] = false;
+        // Loaded stays true: memory and local now agree.
+    }
+}
+
+// Flush dirty GPRs WITHOUT updating the compile-time dirty[]/loaded[]
+// state. Used inside conditional-return branches (e.g. exception bail) so
+// the post-branch code (which executes when the branch isn't taken at
+// runtime) still treats GPR locals as if the flush hadn't happened.
+void emit_flush_dirty_gprs_inside_branch(EmitCtx& c, u32 ctx_ptr) {
+    if (!c.use_gpr_locals) return;
+    for (u32 i = 0; i < 32u; ++i) {
+        if (!c.gpr_dirty[i]) continue;
+        c.b.op_i32_const((s32)ctx_ptr);
+        c.b.op_local_get(gpr_local_idx(i));
+        c.b.op_i32_store(ppc_off::gpr(i));
+        // Intentionally leave c.gpr_dirty[i] alone.
+    }
+}
+
+void emit_invalidate_gpr_locals(EmitCtx& c) {
+    if (!c.use_gpr_locals) return;
+    for (u32 i = 0; i < 32u; ++i) {
+        c.gpr_loaded[i] = false;
+        c.gpr_dirty[i]  = false;
+    }
+}
+
 
 #define CTX (g_ctx_ptr)
 
@@ -277,8 +360,7 @@ static void emit_ea_d(EmitCtx& c, u32 ra, s32 simm) {
     if (ra == 0) {
         c.b.op_i32_const(simm);
     } else {
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(ra));
+        emit_gpr_get_impl(c, ra, g_ctx_ptr);
         c.b.op_i32_const(simm);
         c.b.op_i32_add();
     }
@@ -369,15 +451,17 @@ static void emit_load_d(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
         c.b.op_i32_shr_s();
     }
     c.b.op_local_set(LOCAL_TMP_B);
-    // store rt
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_local_get(LOCAL_TMP_B);
-    c.b.op_i32_store(ppc_off::gpr(rt));
+    // Update RA first — emit_gpr_set_impl in legacy mode uses TMP_A as a
+    // swap (`local.set TMP_A; ctx; local.get TMP_A; i32.store`) which
+    // clobbers TMP_A. EA is currently in TMP_A from emit_ea_d, so the
+    // update-ra store MUST happen before the rt store.
     if (update && ra != 0) {
-        c.b.op_i32_const((s32)CTX);
         c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
+    // Now TMP_A may be clobbered; safe.
+    c.b.op_local_get(LOCAL_TMP_B);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);
 }
 
 static void emit_lbz_impl  (EmitCtx& c) { emit_load_d(c, WIMPORT_READ8,  false, false); }
@@ -402,8 +486,7 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
 
     if (g_mem1_base == 0u) {
         c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(rs));
+        emit_gpr_get_impl(c, rs, g_ctx_ptr);
         c.b.op_call(import_idx);
     } else {
         c.b.op_local_get(LOCAL_TMP_A);
@@ -411,8 +494,7 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
         c.b.op_i32_and();
         c.b.op_i32_const((s32)g_mem1_base);
         c.b.op_i32_add();
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(rs));
+        emit_gpr_get_impl(c, rs, g_ctx_ptr);
         if (import_idx == WIMPORT_WRITE32) {
             c.b.op_local_tee(LOCAL_TMP_B);
             c.b.op_i32_const(24);
@@ -451,9 +533,8 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
     }
 
     if (update && ra != 0) {
-        c.b.op_i32_const((s32)CTX);
         c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
 
@@ -476,7 +557,15 @@ static void emit_stwu_impl (EmitCtx& c) { emit_store_d(c, WIMPORT_WRITE32, true)
 // table 0)`. The merged region module's INTERNAL table maps slot
 // `local_idx` to the target body — V8 sees both caller and callee in
 // the same instance and inlines through the call_indirect.
+// Forward declaration — body is defined alongside try_resolve_target below.
+static inline void emit_block_exit_flush(EmitCtx& c);
+
 static void emit_branch_resolution(EmitCtx& c, u32 target_pc, const u32* local_idx) {
+    // B11: flush before either exit path. The tail-call path lands in
+    // another block in the same region, which expects ppc_state.gpr to
+    // hold the canonical values. The return path hands control to the
+    // host loop which may dispatch any block; same requirement.
+    emit_block_exit_flush(c);
     if (local_idx) {
         c.b.op_i32_const((s32)*local_idx);
         c.b.op_return_call_indirect(/*type=*/0u, /*table=*/0u);
@@ -502,6 +591,18 @@ static inline bool try_resolve_target(EmitCtx& c, u32 target_pc, u32* out) {
     if (!c.lookup_local_idx) return false;
     if (target_pc == c.start_pc) return false;
     return c.lookup_local_idx(c.lookup_user, target_pc, out);
+}
+
+// B11: flush dirty GPR locals before any block exit. Centralized so each
+// terminator path (branch_resolution return, branch_resolution tail-call,
+// emit_indirect_branch_native, end-of-block) doesn't repeat the loop.
+//
+// After flush, dirty[] is clear but loaded[] is unchanged: the locals still
+// hold the same values, just also coherent with memory. Callers that hand
+// off control to code which may MUTATE memory (interpreter fallback) must
+// also invalidate via emit_invalidate_gpr_locals.
+static inline void emit_block_exit_flush(EmitCtx& c) {
+    emit_flush_dirty_gprs_impl(c, g_ctx_ptr);
 }
 
 // bx/bl — primary 18, unconditional branch (with optional link).
@@ -682,19 +783,16 @@ static void emit_bcx_impl(EmitCtx& c) {
 // Helper for X-form i32 binary ops with optional Rc=1 CR0 update.
 static void emit_xform_binop(EmitCtx& c, u32 wasm_op_byte) {
     const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.emitByte(wasm_op_byte);
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(rt));
+        emit_gpr_set_impl(c, rt, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(rt));
+        emit_gpr_set_impl(c, rt, g_ctx_ptr);
     }
 }
 
@@ -705,19 +803,16 @@ static void emit_xform_binop(EmitCtx& c, u32 wasm_op_byte) {
 // silently swaps source and destination, leaving rD unchanged.
 static void emit_xform_logical(EmitCtx& c, u32 wasm_op_byte) {
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.emitByte(wasm_op_byte);
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
 
@@ -748,21 +843,18 @@ static void emit_xorx_impl(EmitCtx& c)  { emit_xform_logical(c, wop::i32_xor); }
 // Used by NAND, NOR, EQV: rA = ~(rS OP rB).
 static void emit_xform_logical_complement(EmitCtx& c, u8 op_byte) {
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.emitByte(op_byte);
     c.b.op_i32_const(-1);
     c.b.op_i32_xor();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
 static void emit_nandx_impl(EmitCtx& c) { emit_xform_logical_complement(c, wop::i32_and); }
@@ -1666,6 +1758,9 @@ static void emit_indirect_branch_native(EmitCtx& c, u32 target_spr_idx) {
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_store(ppc_off::PC);
+
+    // B11: flush before returning to host loop / dispatcher.
+    emit_block_exit_flush(c);
 
     // Return target.
     c.b.op_local_get(LOCAL_TMP_A);
@@ -2916,6 +3011,11 @@ static void emit_exception_bail(EmitCtx& c) {
     c.b.op_i32_const((s32)c.pc);
     c.b.op_call(WIMPORT_CHECK_EXC);
     c.b.op_if(WASM_TYPE_I32);
+        // B11: flush WITHOUT clearing compile-time dirty[]: we're inside
+        // an if-branch that returns. If the runtime takes this branch,
+        // the flush ops execute. If the runtime doesn't take it, the post-
+        // if code path still believes its locals are dirty (correctly).
+        emit_flush_dirty_gprs_inside_branch(c, g_ctx_ptr);
         c.b.op_i32_const((s32)g_ctx_ptr);
         c.b.op_i32_load(ppc_off::PC);
         c.b.op_return();
@@ -3110,11 +3210,14 @@ static void emit_body_into(WasmModuleBuilder& b,
     g_mem1_mask = mem1_mask;
     g_ram_size  = ram_size;
 
-    // Locals: 2 i32 scratch + 1 f64 scratch (for FP arith store-fill).
+    // Locals: 2 i32 scratch + 1 f64 scratch + 32 i32 GPR cache (B11).
+    // GPR locals start at index GPR_LOCAL_BASE = 3 (after the f64). They
+    // are always declared so emit_body_into's local layout is stable;
+    // V8 elides the unused ones when use_gpr_locals is false.
     {
-        const u32 counts[] = { LOCAL_TMP_COUNT, 1 };
-        const u8  types[]  = { WASM_TYPE_I32,    WASM_TYPE_F64 };
-        b.emitLocals(2, counts, types);
+        const u32 counts[] = { LOCAL_TMP_COUNT, 1, 32u };
+        const u8  types[]  = { WASM_TYPE_I32,    WASM_TYPE_F64, WASM_TYPE_I32 };
+        b.emitLocals(3, counts, types);
     }
 
     EmitCtx ctx{ b, start_pc, 0u, start_pc, false, false };
@@ -3179,6 +3282,12 @@ static void emit_body_into(WasmModuleBuilder& b,
     const u32 next_pc = last_pc + 4u;
     if (!emitted_terminator)
         emit_set_pc(ctx, g_ctx_ptr, next_pc);
+    // B11: flush dirty GPR locals before exiting the block. The trailing
+    // return is reachable only when no terminator (branch/blr/etc.) was
+    // emitted; those paths already flushed via emit_block_exit_flush.
+    // For terminator-emitting paths, this code is unreachable and the
+    // flush here is dead — but harmless (V8 elides unreachable ops).
+    emit_flush_dirty_gprs_impl(ctx, g_ctx_ptr);
     // Trailing return: read PC back from context. For terminators that
     // already op_return'd, this trails as unreachable code — but WASM
     // validation still requires an i32 on the (polymorphic) stack at the
