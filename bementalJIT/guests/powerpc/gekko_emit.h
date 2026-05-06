@@ -357,8 +357,14 @@ inline void emit_store_gpr(EmitCtx& c, u32 i) {
 // ---------------------------------------------------------------------------
 
 // Forward declare; defined in gekko_emit.cpp where g_ctx_ptr lives.
+//
+// `scratch` (passed to emit_gpr_set_impl) is a WASM local idx used as a
+// stack-shape swap (`local.set scratch; ctx; local.get scratch; store`)
+// in legacy mode. Caller MUST choose a local it does not need to
+// preserve across this call. See jit_scratch_clobber_pattern_2026_05_05.md
+// for the underlying bug class this contract eliminates.
 void emit_gpr_get_impl(EmitCtx& c, u32 i, u32 ctx_ptr);
-void emit_gpr_set_impl(EmitCtx& c, u32 i, u32 ctx_ptr);
+void emit_gpr_set_impl(EmitCtx& c, u32 i, u32 ctx_ptr, u32 scratch);
 void emit_flush_dirty_gprs_impl(EmitCtx& c, u32 ctx_ptr);
 void emit_invalidate_gpr_locals(EmitCtx& c);
 
@@ -372,7 +378,11 @@ void emit_invalidate_gpr_locals(EmitCtx& c);
 //   bit2: GT (signed greater than 0)
 //   bit1: EQ
 //   bit0: SO (copy of XER.SO — we approximate as 0 for now)
-inline void emit_set_cr0(EmitCtx& c, u32 ctx_ptr) {
+// `scratch` (typically LOCAL_TMP_A or LOCAL_TMP_B) is used internally by
+// emit_set_cr0 to hold the input value across the high-word compute.
+// Caller MUST choose a local it does not need to preserve across this
+// call. See jit_scratch_clobber_pattern_2026_05_05.md.
+inline void emit_set_cr0(EmitCtx& c, u32 ctx_ptr, u32 scratch) {
     // Dolphin's ConditionRegister encoding (per ConditionRegister.h):
     //   - bit 32 of u64 (= high u32 bit 0) ALWAYS set (PPCToInternal marker)
     //   - LT ⇔ bit 62 of u64 (= high u32 bit 30)
@@ -396,22 +406,22 @@ inline void emit_set_cr0(EmitCtx& c, u32 ctx_ptr) {
     //   bit 27  = 0  (SO; intentionally unset — XER.SO is not tracked here.
     //                Real PPC sets CR0.SO from XER.SO; we leave it 0
     //                because non-overflow Rc=1 ops do not set XER.SO.)
-    c.b.op_local_tee(LOCAL_TMP_A);
+    c.b.op_local_tee(scratch);
     c.b.op_drop();
     // Store low 32 = result.
     c.b.op_i32_const((s32)ctx_ptr);
-    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_local_get(scratch);
     c.b.op_i32_store(ppc_off::cr_field(0));
     // Compute and store high 32.
     c.b.op_i32_const((s32)ctx_ptr);
     // bit 30 = sign-bit << 30 (LT)
-    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_local_get(scratch);
     c.b.op_i32_const(31);
     c.b.op_i32_shr_u();
     c.b.op_i32_const(30);
     c.b.op_i32_shl();
     // OR with bit 31 = (result <= 0 signed)
-    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_local_get(scratch);
     c.b.op_i32_const(0);
     c.b.op_i32_le_s();
     c.b.op_i32_const(31);

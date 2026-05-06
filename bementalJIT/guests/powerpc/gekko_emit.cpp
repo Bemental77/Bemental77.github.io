@@ -84,13 +84,17 @@ void emit_gpr_get_impl(EmitCtx& c, u32 i, u32 ctx_ptr) {
     }
 }
 
-void emit_gpr_set_impl(EmitCtx& c, u32 i, u32 ctx_ptr) {
+void emit_gpr_set_impl(EmitCtx& c, u32 i, u32 ctx_ptr, u32 scratch) {
     if (!c.use_gpr_locals) {
         // Legacy memory path: incoming stack is [value]; we need [ctx, value]
-        // before i32.store. Use TMP_A as a scratch swap.
-        c.b.op_local_set(LOCAL_TMP_A);
+        // before i32.store. Use the caller-provided `scratch` local for the
+        // swap. Caller is responsible for choosing a local it does NOT need
+        // to preserve across this call (typically LOCAL_TMP_B if the caller
+        // is using LOCAL_TMP_A, or vice versa). See
+        // jit_scratch_clobber_pattern_2026_05_05.md for why this is a param.
+        c.b.op_local_set(scratch);
         c.b.op_i32_const((s32)ctx_ptr);
-        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_local_get(scratch);
         c.b.op_i32_store(ppc_off::gpr(i));
         return;
     }
@@ -150,7 +154,7 @@ static void emit_addi_impl(EmitCtx& c) {
         c.b.op_i32_const(simm);
         c.b.op_i32_add();
     }
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
 }
 
 // addis rt, ra, simm   ; rt = (RA==0 ? 0 : ra) + (simm << 16)
@@ -165,7 +169,7 @@ static void emit_addis_impl(EmitCtx& c) {
         c.b.op_i32_const(simm);
         c.b.op_i32_add();
     }
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
 }
 
 // addic rt, ra, simm   ; rt = ra + simm; XER.CA = unsigned-carry
@@ -194,7 +198,7 @@ static void emit_addic_impl(EmitCtx& c) {
     c.b.op_i32_const(simm);
     c.b.op_i32_add();
     c.b.op_local_tee(LOCAL_TMP_A);
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);  // legacy clobbers TMP_A := sum (idempotent)
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);  // legacy clobbers TMP_A := sum (idempotent)
     // CA = (sum < ra) unsigned. Pre-push CTX for the i32.store8 below.
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
@@ -210,7 +214,7 @@ static void emit_addic_impl(EmitCtx& c) {
 static void emit_addic_rc_impl(EmitCtx& c) {
     emit_addic_impl(c);
     c.b.op_local_get(LOCAL_TMP_A);
-    emit_set_cr0(c, CTX);
+    emit_set_cr0(c, CTX, LOCAL_TMP_A);
 }
 
 // subfic rt, ra, simm  ; rt = simm - ra; CA = unsigned ~ra + simm + 1 carry
@@ -223,7 +227,7 @@ static void emit_subfic_impl(EmitCtx& c) {
     c.b.op_i32_const(simm);
     emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_sub();
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
     // CA: simm >= ra (unsigned). Pre-push CTX for the i32.store8 below.
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_const(simm);
@@ -240,7 +244,7 @@ static void emit_mulli_impl(EmitCtx& c) {
     emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_const(simm);
     c.b.op_i32_mul();
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
 }
 
 // cmpi crfd, L, ra, simm  ; signed compare ra <-> simm into CR field crfd
@@ -316,7 +320,7 @@ static void emit_logical_imm(EmitCtx& c, u32 wasm_op_byte, bool high) {
     emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_const((s32)(high ? (imm << 16) : imm));
     c.b.emitByte(wasm_op_byte); // i32_or / i32_and / i32_xor
-    emit_gpr_set_impl(c, ra, g_ctx_ptr);
+    emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
 }
 
 static void emit_ori_impl  (EmitCtx& c) { emit_logical_imm(c, wop::i32_or,  false); }
@@ -334,10 +338,10 @@ static void emit_andi_rc_impl(EmitCtx& c) {
     c.b.op_i32_const((s32)imm);
     c.b.op_i32_and();
     c.b.op_local_tee(LOCAL_TMP_A);
-    emit_gpr_set_impl(c, ra, g_ctx_ptr);
+    emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     // CR0 from result (TMP_A still holds it).
     c.b.op_local_get(LOCAL_TMP_A);
-    emit_set_cr0(c, CTX);
+    emit_set_cr0(c, CTX, LOCAL_TMP_A);
 }
 
 static void emit_andis_rc_impl(EmitCtx& c) {
@@ -347,9 +351,9 @@ static void emit_andis_rc_impl(EmitCtx& c) {
     c.b.op_i32_const((s32)imm);
     c.b.op_i32_and();
     c.b.op_local_tee(LOCAL_TMP_A);
-    emit_gpr_set_impl(c, ra, g_ctx_ptr);
+    emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     c.b.op_local_get(LOCAL_TMP_A);
-    emit_set_cr0(c, CTX);
+    emit_set_cr0(c, CTX, LOCAL_TMP_A);
 }
 
 // ===========================================================================
@@ -458,11 +462,11 @@ static void emit_load_d(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
     // update-ra store MUST happen before the rt store.
     if (update && ra != 0) {
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
     // Now TMP_A may be clobbered; safe.
     c.b.op_local_get(LOCAL_TMP_B);
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
 }
 
 static void emit_lbz_impl  (EmitCtx& c) { emit_load_d(c, WIMPORT_READ8,  false, false); }
@@ -535,7 +539,7 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
 
     if (update && ra != 0) {
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 
@@ -789,11 +793,11 @@ static void emit_xform_binop(EmitCtx& c, u32 wasm_op_byte) {
     c.b.emitByte(wasm_op_byte);
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, rt, g_ctx_ptr);
+        emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, rt, g_ctx_ptr);
+        emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 
@@ -809,11 +813,11 @@ static void emit_xform_logical(EmitCtx& c, u32 wasm_op_byte) {
     c.b.emitByte(wasm_op_byte);
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 
@@ -827,11 +831,11 @@ static void emit_subfx_impl(EmitCtx& c) {
     c.b.op_i32_sub();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, rt, g_ctx_ptr);
+        emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, rt, g_ctx_ptr);
+        emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 static void emit_andx_impl(EmitCtx& c)  { emit_xform_logical(c, wop::i32_and); }
@@ -849,11 +853,11 @@ static void emit_xform_logical_complement(EmitCtx& c, u8 op_byte) {
     c.b.op_i32_xor();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 static void emit_nandx_impl(EmitCtx& c) { emit_xform_logical_complement(c, wop::i32_and); }
@@ -871,22 +875,26 @@ static void emit_orcx_impl(EmitCtx& c) {
     c.b.op_i32_or();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 
 // Helper: store the carry-out byte to ppc_state.xer_ca. Stack must have
 // [carry_value 0/1] on top; consumes it. The byte at XER_CA holds the
 // CA bit directly (0 or 1) per Dolphin's split XER storage.
-static inline void emit_store_xer_ca(EmitCtx& c, u32 ctx_ptr) {
+//
+// `scratch` is used internally for the [val] → [ctx, val] swap. Caller
+// MUST choose a local it does not need to preserve across this call.
+// See jit_scratch_clobber_pattern_2026_05_05.md.
+static inline void emit_store_xer_ca(EmitCtx& c, u32 ctx_ptr, u32 scratch) {
     // Stack: [carry]. We need [ctx, carry] for store8.
-    c.b.op_local_set(LOCAL_TMP_B);
+    c.b.op_local_set(scratch);
     c.b.op_i32_const((s32)ctx_ptr);
-    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_local_get(scratch);
     c.b.op_i32_store8(ppc_off::XER_CA);
 }
 
@@ -901,15 +909,15 @@ static void emit_addcx_impl(EmitCtx& c) {
     c.b.op_local_set(LOCAL_TMP_A);
     // gpr[rt] = result
     c.b.op_local_get(LOCAL_TMP_A);
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);  // legacy clobbers TMP_A := result (idempotent)
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);  // legacy clobbers TMP_A := result (idempotent)
     // XER.CA = (result < rA) unsigned
     c.b.op_local_get(LOCAL_TMP_A);
     emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_lt_u();
-    emit_store_xer_ca(c, CTX);
+    emit_store_xer_ca(c, CTX, LOCAL_TMP_B);
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     }
 }
 
@@ -924,15 +932,15 @@ static void emit_subfcx_impl(EmitCtx& c) {
     c.b.op_i32_sub();
     c.b.op_local_set(LOCAL_TMP_A);
     c.b.op_local_get(LOCAL_TMP_A);
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
     // XER.CA = (rA <= rB) unsigned
     emit_gpr_get_impl(c, ra, g_ctx_ptr);
     emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_le_u();
-    emit_store_xer_ca(c, CTX);
+    emit_store_xer_ca(c, CTX, LOCAL_TMP_B);
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     }
 }
 
@@ -968,14 +976,14 @@ static void emit_addex_impl(EmitCtx& c) {
     c.b.op_local_get(LOCAL_TMP_B);            // [(temp<rA), result, temp]
     c.b.op_i32_lt_u();                        // [(temp<rA), (result<temp)]
     c.b.op_i32_or();                          // [carry]
-    emit_store_xer_ca(c, CTX);                // [], CA stored. TMP_B clobbered.
+    emit_store_xer_ca(c, CTX, LOCAL_TMP_B);                // [], CA stored. TMP_B clobbered.
     // gpr[rT] = result (still in TMP_A). emit_gpr_set_impl in legacy
     // clobbers TMP_A := result (idempotent — same value already there).
     c.b.op_local_get(LOCAL_TMP_A);
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     }
 }
 
@@ -1007,13 +1015,13 @@ static void emit_subfex_impl(EmitCtx& c) {
     c.b.op_local_get(LOCAL_TMP_B);            // [(temp<~rA), result, temp]
     c.b.op_i32_lt_u();                        // [(temp<~rA), (result<temp)]
     c.b.op_i32_or();                          // [carry]
-    emit_store_xer_ca(c, CTX);                // [], TMP_B clobbered
+    emit_store_xer_ca(c, CTX, LOCAL_TMP_B);                // [], TMP_B clobbered
     // gpr[rT] = result (still in TMP_A)
     c.b.op_local_get(LOCAL_TMP_A);
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     }
 }
 
@@ -1042,12 +1050,12 @@ static void emit_addmex_impl(EmitCtx& c) {
     c.b.op_local_get(LOCAL_TMP_B);
     c.b.op_i32_lt_u();                        // (result<temp)
     c.b.op_i32_or();
-    emit_store_xer_ca(c, CTX);
+    emit_store_xer_ca(c, CTX, LOCAL_TMP_B);
     c.b.op_local_get(LOCAL_TMP_A);
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     }
 }
 
@@ -1067,15 +1075,15 @@ static void emit_addzex_impl(EmitCtx& c) {
     c.b.op_i32_load8_u(ppc_off::XER_CA);
     c.b.op_i32_add();                          // [result]
     c.b.op_local_tee(LOCAL_TMP_B);             // [result], TMP_B = result
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);       // legacy may clobber TMP_A.
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);       // legacy may clobber TMP_A.
     // CA = (result < rA) — TMP_B has result; re-fetch rA via cache helper.
     c.b.op_local_get(LOCAL_TMP_B);
     emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_lt_u();
-    emit_store_xer_ca(c, CTX);                 // clobbers TMP_B.
+    emit_store_xer_ca(c, CTX, LOCAL_TMP_B);                 // clobbers TMP_B.
     if (RC(c.inst)) {
         emit_gpr_get_impl(c, rt, g_ctx_ptr);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     }
 }
 
@@ -1106,12 +1114,12 @@ static void emit_subfmex_impl(EmitCtx& c) {
     c.b.op_local_get(LOCAL_TMP_B);
     c.b.op_i32_lt_u();                        // (result<temp)
     c.b.op_i32_or();
-    emit_store_xer_ca(c, CTX);
+    emit_store_xer_ca(c, CTX, LOCAL_TMP_B);
     c.b.op_local_get(LOCAL_TMP_A);
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     }
 }
 
@@ -1127,17 +1135,17 @@ static void emit_subfzex_impl(EmitCtx& c) {
     c.b.op_i32_load8_u(ppc_off::XER_CA);
     c.b.op_i32_add();                          // [result]
     c.b.op_local_tee(LOCAL_TMP_B);             // [result], TMP_B = result
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
     // CA = (result < ~rA). Re-fetch ~rA from gpr[ra].
     c.b.op_local_get(LOCAL_TMP_B);
     emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_const(-1);
     c.b.op_i32_xor();
     c.b.op_i32_lt_u();
-    emit_store_xer_ca(c, CTX);
+    emit_store_xer_ca(c, CTX, LOCAL_TMP_B);
     if (RC(c.inst)) {
         emit_gpr_get_impl(c, rt, g_ctx_ptr);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     }
 }
 
@@ -1150,11 +1158,11 @@ static void emit_negx_impl(EmitCtx& c) {
     c.b.op_i32_sub();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, rt, g_ctx_ptr);
+        emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, rt, g_ctx_ptr);
+        emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 
@@ -1173,11 +1181,11 @@ static void emit_mulhwx_impl(EmitCtx& c) {
     c.b.op_i32_wrap_i64();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, rt, g_ctx_ptr);
+        emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, rt, g_ctx_ptr);
+        emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 // mulhwu — same but unsigned.
@@ -1193,11 +1201,11 @@ static void emit_mulhwux_impl(EmitCtx& c) {
     c.b.op_i32_wrap_i64();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, rt, g_ctx_ptr);
+        emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, rt, g_ctx_ptr);
+        emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 
@@ -1232,7 +1240,7 @@ static void emit_srawx_impl(EmitCtx& c) {
     c.b.op_i32_eqz();
     c.b.op_select();
     c.b.op_local_tee(LOCAL_TMP_B);             // TMP_B = result; stack [result]
-    emit_gpr_set_impl(c, ra, g_ctx_ptr);       // legacy clobbers TMP_A := result
+    emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);       // legacy clobbers TMP_A := result
     // CRITICAL: TMP_A may now hold result, not rS. Re-fetch rS for CA.
     emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_local_set(LOCAL_TMP_A);
@@ -1263,10 +1271,10 @@ static void emit_srawx_impl(EmitCtx& c) {
     c.b.op_i32_const(0);
     c.b.op_i32_lt_s();
     c.b.op_i32_and();
-    emit_store_xer_ca(c, CTX);                 // clobbers TMP_B; OK, already stored.
+    emit_store_xer_ca(c, CTX, LOCAL_TMP_B);                 // clobbers TMP_B; OK, already stored.
     if (RC(c.inst)) {
         emit_gpr_get_impl(c, ra, g_ctx_ptr);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     }
 }
 
@@ -1281,11 +1289,11 @@ static void emit_norx_impl(EmitCtx& c)  {
     c.b.op_i32_xor();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 static void emit_mullwx_impl(EmitCtx& c){ emit_xform_binop(c, wop::i32_mul); }
@@ -1364,11 +1372,11 @@ static void emit_div_guarded(EmitCtx& c, bool is_signed) {
     // Stack: [result]. Store + optional CR0 update.
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, rt, g_ctx_ptr);
+        emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, rt, g_ctx_ptr);
+        emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 static void emit_divwx_impl(EmitCtx& c) { emit_div_guarded(c, true); }
@@ -1396,11 +1404,11 @@ static void emit_slwx_impl(EmitCtx& c)  {
     c.b.op_select();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 // B11 Phase 2 Task 24 — cat B.
@@ -1420,11 +1428,11 @@ static void emit_srwx_impl(EmitCtx& c)  {
     c.b.op_select();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 // srawix — shift right algebraic word immediate (signed shift by SH; sets CA).
@@ -1444,7 +1452,7 @@ static void emit_srawix_impl(EmitCtx& c) {
     c.b.op_i32_const((s32)sh);
     c.b.op_i32_shr_s();
     c.b.op_local_tee(LOCAL_TMP_B);            // TMP_B = result; stack [result]
-    emit_gpr_set_impl(c, ra, g_ctx_ptr);       // legacy clobbers TMP_A := result
+    emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);       // legacy clobbers TMP_A := result
     // Re-fetch rS into TMP_A for the CA compute.
     emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_local_set(LOCAL_TMP_A);
@@ -1465,13 +1473,13 @@ static void emit_srawix_impl(EmitCtx& c) {
         c.b.op_i32_const(0);
         c.b.op_i32_ne();                       // ((rS & mask) != 0)
         c.b.op_i32_and();
-        emit_store_xer_ca(c, CTX);             // clobbers TMP_B; OK.
+        emit_store_xer_ca(c, CTX, LOCAL_TMP_B);             // clobbers TMP_B; OK.
     }
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
         c.b.op_i32_const((s32)sh);
         c.b.op_i32_shr_s();                    // recompute result for CR0
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     }
 }
 
@@ -1559,11 +1567,11 @@ static void emit_extsbx_impl(EmitCtx& c) {
     c.b.op_i32_shr_s();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 static void emit_extshx_impl(EmitCtx& c) {
@@ -1575,11 +1583,11 @@ static void emit_extshx_impl(EmitCtx& c) {
     c.b.op_i32_shr_s();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 static void emit_cntlzwx_impl(EmitCtx& c) {
@@ -1588,11 +1596,11 @@ static void emit_cntlzwx_impl(EmitCtx& c) {
     c.b.op_i32_clz();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 
@@ -1630,11 +1638,11 @@ static void emit_rlwinmx_impl(EmitCtx& c) {
     c.b.op_i32_and();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 
@@ -1659,11 +1667,11 @@ static void emit_rlwimix_impl(EmitCtx& c) {
     c.b.op_i32_or();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 
@@ -1682,11 +1690,11 @@ static void emit_rlwnmx_impl(EmitCtx& c) {
     c.b.op_i32_and();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_set_cr0(c, CTX);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
     } else {
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 
@@ -1874,7 +1882,7 @@ static void emit_mfspr_impl(EmitCtx& c) {
     if (!spr_is_direct(spr_num)) { emit_fallback(c); return; }
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::spr(spr_num));   // [spr_val]
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
 }
 
 static void emit_mtspr_impl(EmitCtx& c) {
@@ -2540,17 +2548,10 @@ static void emit_fctiwzx_impl(EmitCtx& c) { emit_fctiwx_common(c, true);  }
 // 0x18(r1); stmw r24, 0x18(r1) etc.
 // ===========================================================================
 static void emit_lmw_impl(EmitCtx& c) {
-    // B11 Phase 2 Tasks 33-34 — DEFERRED. lmw/stmw hold the base EA in
-    // LOCAL_TMP_A across the per-iter loop body. emit_gpr_set_impl in
-    // legacy mode clobbers TMP_A as part of its [val] → [ctx, val] swap,
-    // breaking the loop. Reverting this emitter to the original direct-
-    // memory pattern; B11 cache benefit here is minimal because lmw/stmw
-    // touch many GPRs at once with little post-emit reuse.
-    //
-    // To migrate later: either (a) allocate a third scratch local for
-    // EA and pass it to emit_gpr_set_impl, or (b) emit per-iter direct
-    // i32.store but invalidate gpr_loaded[i] in B11 mode so subsequent
-    // reads pick up the new memory value.
+    // B11 Phase 2.5 — re-migrated after the per-helper-scratch-param fix.
+    // The base EA stays in LOCAL_TMP_A across the loop; per-iter
+    // emit_gpr_set_impl uses LOCAL_TMP_B as its swap scratch (passed
+    // explicitly), so TMP_A is preserved.
     const u32 rt = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
     if (ra == 0) {
@@ -2563,20 +2564,19 @@ static void emit_lmw_impl(EmitCtx& c) {
     c.b.op_local_set(LOCAL_TMP_A);
     for (u32 i = rt; i < 32; ++i) {
         const s32 offset = (s32)((i - rt) * 4u);
-        c.b.op_i32_const((s32)CTX);
         c.b.op_local_get(LOCAL_TMP_A);
         if (offset != 0) {
             c.b.op_i32_const(offset);
             c.b.op_i32_add();
         }
         c.b.op_call(WIMPORT_READ32);
-        c.b.op_i32_store(ppc_off::gpr(i));
+        emit_gpr_set_impl(c, i, g_ctx_ptr, LOCAL_TMP_B);
     }
 }
 
 static void emit_stmw_impl(EmitCtx& c) {
-    // B11 Phase 2 Tasks 33-34 — DEFERRED for the same TMP_A-hold-across-
-    // loop reason as emit_lmw_impl above.
+    // B11 Phase 2.5 — symmetric with emit_lmw_impl. No emit_gpr_set_impl
+    // here (we do GPR reads only), so technically TMP_B is also free.
     const u32 rs = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
     if (ra == 0) {
@@ -2594,8 +2594,7 @@ static void emit_stmw_impl(EmitCtx& c) {
             c.b.op_i32_const(offset);
             c.b.op_i32_add();
         }
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(i));
+        emit_gpr_get_impl(c, i, g_ctx_ptr);
         c.b.op_call(WIMPORT_WRITE32);
     }
 }
@@ -2644,10 +2643,10 @@ static void emit_load_x(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
     // emit_load_d in Phase 1.
     if (update && ra != 0) {
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
     c.b.op_local_get(LOCAL_TMP_B);
-    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
 }
 
 static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
@@ -2660,7 +2659,7 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
     c.b.op_call(import_idx);
     if (update && ra != 0) {
         c.b.op_local_get(LOCAL_TMP_A);
-        emit_gpr_set_impl(c, ra, g_ctx_ptr);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
     }
 }
 
