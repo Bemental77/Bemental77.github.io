@@ -3276,6 +3276,126 @@ static void verify_block_can_advance_pc(const std::vector<u8>& body, u32 start_p
     }
 }
 
+// Self-loop detection. Returns true if the LAST instruction of the block
+// is a conditional branch (op 16, no-AA, no-LK) whose target == start_pc,
+// AND the BO encodes one of the four patterns we can express as a WASM
+// `loop` + `br_if 0`:
+//   bdnz (BO=16): decrement-CTR, branch if CTR != 0
+//   bdz  (BO=18): decrement-CTR, branch if CTR == 0
+//   bne+ (BO=4):  branch on cr_bit false (BI selects CR bit)
+//   beq+ (BO=12): branch on cr_bit true
+// On success, *out_fallthrough_pc receives the post-branch PC. Per
+// memory/lever_2_blocklink_blocked_2026_05_05.md, this is the
+// multi-block-per-WASM-fn lever's smallest practical slice — converts
+// tight self-recurrent loops (T1a/b/c/e) from N-dispatches-per-iter to
+// 1-dispatch-per-kernel-call.
+static bool detect_self_loop(const u32* insts, u32 count,
+                             const u32* instr_pcs, u32 start_pc,
+                             u32* out_fallthrough_pc) {
+    if (count < 2) return false;
+    const u32 last = insts[count - 1];
+    const u32 op = (last >> 26) & 0x3F;
+    if (op != 16) return false;             // not bcx
+    if ((last & 0x3) != 0) return false;     // AA or LK set — skip
+    s32 bd = static_cast<s32>(last & 0xFFFC);
+    if (bd & 0x8000) bd |= 0xFFFF0000;       // sign-extend 16-bit
+    const u32 last_pc = instr_pcs ? instr_pcs[count - 1]
+                                  : (start_pc + (count - 1) * 4u);
+    const u32 target = static_cast<u32>(static_cast<s32>(last_pc) + bd);
+    if (target != start_pc) return false;    // not back-to-entry
+    const u32 bo = (last >> 21) & 0x1Fu;
+    const bool is_bdnz = (bo == 0b10000u);
+    const bool is_bdz  = (bo == 0b10010u);
+    const bool is_cr_branch = ((bo & 0b10100u) == 0b00100u);
+    if (!is_bdnz && !is_bdz && !is_cr_branch) return false;
+    if (out_fallthrough_pc) *out_fallthrough_pc = last_pc + 4u;
+    return true;
+}
+
+// Emit the WASM control-flow predicate for the self-loop's terminating
+// branch: `br_if 0` continues the loop, fall-through exits. The CR-test
+// path mirrors emit_bcx_impl's CR-bit decode but emits br_if 0 instead of
+// emit_branch_resolution. The BO encodes which of (bdnz/bdz/cr_branch).
+static void emit_self_loop_terminator(EmitCtx& c, u32 inst) {
+    const u32 bo = BO(inst), bi = BI(inst);
+    const bool is_bdnz = (bo == 0b10000u);
+    const bool is_bdz  = (bo == 0b10010u);
+
+    if (is_bdnz || is_bdz) {
+        // Decrement CTR; test against 0; br_if 0 if predicate true.
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::spr(9));
+        c.b.op_i32_const(1);
+        c.b.op_i32_sub();
+        c.b.op_local_tee(LOCAL_TMP_A);
+        c.b.op_i32_store(ppc_off::spr(9));
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0);
+        if (is_bdnz) c.b.op_i32_ne(); else c.b.op_i32_eq();
+        c.b.op_br_if(0);
+        return;
+    }
+    // CR-test branch (BO = 0bX01XX). bit 3 of BO == 1 => branch on true.
+    const bool branch_if_true = (bo & 0b01000u) != 0u;
+    const u32 field_idx = bi / 4u;
+    const u32 bit_in_field = bi % 4u;       // 0=LT, 1=GT, 2=EQ, 3=SO
+    switch (bit_in_field) {
+      case 0:   // LT — bit 30 of cr_field high u32
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::cr_field(field_idx) + 4);
+        c.b.op_i32_const(1u << 30);
+        c.b.op_i32_and();
+        c.b.op_i32_const(0);
+        c.b.op_i32_ne();
+        break;
+      case 1:   // GT — NOT LT AND NOT EQ
+      {
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::cr_field(field_idx));         // low (EQ)
+        c.b.op_i32_eqz();                                       // EQ flag
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::cr_field(field_idx) + 4);     // high
+        c.b.op_i32_const(1u << 30);
+        c.b.op_i32_and();
+        c.b.op_i32_eqz();                                       // NOT LT
+        c.b.op_i32_and();                                       // (NOT LT) AND EQ-zero
+        // Wait: GT iff NOT(LT) AND NOT(EQ).  EQ flag = (low==0). NOT(EQ) = (low!=0).
+        // Recompute properly below.
+        c.b.op_drop();                                          // toss the wrong stack
+        c.b.op_drop();
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::cr_field(field_idx) + 4);
+        c.b.op_i32_const(1u << 30);
+        c.b.op_i32_and();
+        c.b.op_i32_eqz();                                       // NOT LT
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::cr_field(field_idx));
+        c.b.op_i32_const(0);
+        c.b.op_i32_ne();                                        // NOT EQ
+        c.b.op_i32_and();
+        break;
+      }
+      case 2:   // EQ — low u32 == 0
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::cr_field(field_idx));
+        c.b.op_i32_eqz();
+        break;
+      case 3:   // SO — bit 27 of high u32
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::cr_field(field_idx) + 4);
+        c.b.op_i32_const(1u << 27);
+        c.b.op_i32_and();
+        c.b.op_i32_const(0);
+        c.b.op_i32_ne();
+        break;
+    }
+    if (!branch_if_true) {
+        c.b.op_i32_eqz();
+    }
+    c.b.op_br_if(0);
+}
+
 // Internal body emitter shared by build_block (legacy single-function
 // module) and emit_block_body (multi-module accumulator path). Emits the
 // per-block DFA + locals + HLE prologue + instruction stream + trailing
@@ -3387,7 +3507,48 @@ static void emit_body_into(WasmModuleBuilder& b,
         b.op_drop();
     }
 
+    // Self-loop fast path: detect "block ends with bdnz/bdz/bne/beq back
+    // to start_pc" and wrap the body in WASM `loop` + `br_if 0` so the
+    // entire iter chain runs inside ONE function call. Eliminates the
+    // per-iter dispatch round-trip that caps T1b/T1c/T1e at 0.7-4% native.
+    // B11 GPR cache is disabled inside the self-loop because the cache's
+    // "first emit = memory load + tee local" pattern would corrupt the
+    // local on iter 2's re-entry. With B11 off, every gpr access is
+    // memory; correct, slightly slower. Future refinement: emit a flush
+    // at the back-edge, then re-load on entry.
     bool emitted_terminator = false;
+    u32 self_loop_fallthrough_pc = 0;
+    if (count >= 2 && detect_self_loop(insts, count, instr_pcs, start_pc,
+                                       &self_loop_fallthrough_pc)) {
+        const bool saved_use_gpr_locals = ctx.use_gpr_locals;
+        ctx.use_gpr_locals = false;
+        b.op_loop(0x40);
+            for (u32 i = 0; i + 1 < count; ++i) {
+                ctx.pc = instr_pcs ? instr_pcs[i] : (start_pc + i * 4u);
+                ctx.inst = insts[i];
+                ctx.block_end = false;
+                ctx.chain_fallthrough = false;
+                gekko_emit_instr(ctx);
+                if (ctx.block_end) {
+                    // Body had an early terminator — bail out; treat as if
+                    // no self-loop optimization (rare; only fires for
+                    // unexpected emit-side behaviour).
+                    break;
+                }
+            }
+            // Set ctx.pc to the terminator's PC so emit_self_loop_terminator
+            // sees the right context.
+            ctx.pc = instr_pcs ? instr_pcs[count - 1]
+                               : (start_pc + (count - 1) * 4u);
+            ctx.inst = insts[count - 1];
+            emit_self_loop_terminator(ctx, ctx.inst);
+        b.op_end();  // close loop
+        // Loop exited (predicate false). Set PC to fallthrough and fall
+        // through to the trailing flush + return below.
+        emit_set_pc(ctx, g_ctx_ptr, self_loop_fallthrough_pc);
+        emitted_terminator = true;       // we wrote PC explicitly
+        ctx.use_gpr_locals = saved_use_gpr_locals;
+    } else {
     for (u32 i = 0; i < count; ++i) {
         ctx.pc = instr_pcs ? instr_pcs[i] : (start_pc + i * 4u);
         ctx.inst = insts[i];
@@ -3423,6 +3584,7 @@ static void emit_body_into(WasmModuleBuilder& b,
             break;
         }
     }
+    }  // !self_loop
 
     // Block exit fallthrough PC.
     const u32 last_pc = instr_pcs && count > 0
