@@ -1298,30 +1298,44 @@ static void emit_mullwx_impl(EmitCtx& c){ emit_xform_binop(c, wop::i32_mul); }
 // Without this guard every PPC divw/divwu with rb=0 takes down the entire
 // WASM block via a trap, leaving PC pinned. SAB hits this during clock-rate
 // init.
+// B11 Phase 2 Task 30 — cat D. Suspected primary culprit of the prior
+// monolithic Phase 2 attempt. Original kept `[CTX]` on the WASM stack
+// across the outer if/else AND inside the inner overflow-path nested
+// if/else. After my migration drops the pre-push, every arm of every
+// if/else must produce exactly `[i32 result]` on the stack.
+//
+// Stack-shape audit (all paths produce [result]):
+//   signed:
+//     overflow=true  → if-then-else returns (-1 or 0)             [result]
+//     overflow=false → load a, load b, div_s                       [result]
+//   unsigned:
+//     b==0  → 0                                                    [result]
+//     b!=0  → load a, load b, div_u                                [result]
+//
+// NOTE on B11 mode (when use_gpr_locals=true in Phase 3): the FIRST
+// emit_gpr_get_impl call inside an if-branch sets gpr_loaded[i]=true
+// at compile time. If the runtime takes the OTHER branch, the local
+// is zero-initialized — wrong value. This needs a conditional-branch
+// state-management story before flipping the flag. For Phase 2 with
+// flag OFF, every emit_gpr_get_impl emits a fresh i32.load — no
+// stateful concern.
 static void emit_div_guarded(EmitCtx& c, bool is_signed) {
     const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    // Pre-place CTX so the final store has [CTX, result] on the stack.
-    c.b.op_i32_const((s32)CTX);
     if (is_signed) {
         // overflow = (b == 0) || (a == INT_MIN && b == -1)
-        // Compute a one-bit "overflow" flag.
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(rb));
+        emit_gpr_get_impl(c, rb, g_ctx_ptr);
         c.b.op_i32_eqz();                       // (b == 0)
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(rb));
+        emit_gpr_get_impl(c, rb, g_ctx_ptr);
         c.b.op_i32_const(-1);
         c.b.op_i32_eq();                        // (b == -1)
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(ra));
+        emit_gpr_get_impl(c, ra, g_ctx_ptr);
         c.b.op_i32_const((s32)0x80000000);
         c.b.op_i32_eq();                        // (a == INT_MIN)
         c.b.op_i32_and();                       // (b==-1 && a==INT_MIN)
         c.b.op_i32_or();                        // overall overflow flag
         c.b.op_if(WASM_TYPE_I32);
             // overflow: result = (a < 0) ? -1 : 0   (matches Dolphin)
-            c.b.op_i32_const((s32)CTX);
-            c.b.op_i32_load(ppc_off::gpr(ra));
+            emit_gpr_get_impl(c, ra, g_ctx_ptr);
             c.b.op_i32_const(0);
             c.b.op_i32_lt_s();                  // (a < 0)
             c.b.op_if(WASM_TYPE_I32);
@@ -1331,35 +1345,30 @@ static void emit_div_guarded(EmitCtx& c, bool is_signed) {
             c.b.op_end();
         c.b.op_else();
             // safe divide
-            c.b.op_i32_const((s32)CTX);
-            c.b.op_i32_load(ppc_off::gpr(ra));
-            c.b.op_i32_const((s32)CTX);
-            c.b.op_i32_load(ppc_off::gpr(rb));
+            emit_gpr_get_impl(c, ra, g_ctx_ptr);
+            emit_gpr_get_impl(c, rb, g_ctx_ptr);
             c.b.op_i32_div_s();
         c.b.op_end();
     } else {
         // unsigned: only /0 is the issue, returns 0
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(rb));
+        emit_gpr_get_impl(c, rb, g_ctx_ptr);
         c.b.op_i32_eqz();
         c.b.op_if(WASM_TYPE_I32);
             c.b.op_i32_const(0);
         c.b.op_else();
-            c.b.op_i32_const((s32)CTX);
-            c.b.op_i32_load(ppc_off::gpr(ra));
-            c.b.op_i32_const((s32)CTX);
-            c.b.op_i32_load(ppc_off::gpr(rb));
+            emit_gpr_get_impl(c, ra, g_ctx_ptr);
+            emit_gpr_get_impl(c, rb, g_ctx_ptr);
             c.b.op_i32_div_u();
         c.b.op_end();
     }
-    // Stack: [CTX, result]. Store + optional CR0 update.
+    // Stack: [result]. Store + optional CR0 update.
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(rt));
+        emit_gpr_set_impl(c, rt, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(rt));
+        emit_gpr_set_impl(c, rt, g_ctx_ptr);
     }
 }
 static void emit_divwx_impl(EmitCtx& c) { emit_div_guarded(c, true); }
