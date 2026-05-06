@@ -3276,58 +3276,51 @@ static void verify_block_can_advance_pc(const std::vector<u8>& body, u32 start_p
     }
 }
 
-// Self-loop detection. Returns true if the LAST instruction of the block
-// is a conditional branch (op 16, no-AA, no-LK) whose target lies WITHIN
-// this block (between start_pc and start_pc+count*4 exclusive), AND the
-// BO encodes one of the four patterns we can express as a WASM
-// `loop` + `br_if 0`:
+// Self-loop detection. Scans the stream for ANY conditional branch (op 16,
+// no-AA, no-LK) whose target lies WITHIN this block AND whose BO encodes
+// a pattern expressible as `loop` + `br_if 0`. Returns the FIRST match
+// found (closest to start) so post-loop instructions can be inlined.
+//
+// On success, sets:
+//   *out_bdnz_idx        index of the self-loop bcx in insts[]
+//   *out_loop_entry_idx  index of the back-branch target in insts[]
+//
+// Supported BO encodings:
 //   bdnz (BO=16): decrement-CTR, branch if CTR != 0
 //   bdz  (BO=18): decrement-CTR, branch if CTR == 0
 //   bne+ (BO=4):  branch on cr_bit false (BI selects CR bit)
 //   beq+ (BO=12): branch on cr_bit true
-// On success, *out_loop_entry_idx receives the instruction index of the
-// loop entry (target's position in insts[]); *out_fallthrough_pc receives
-// the post-branch PC. Generalizes the earlier "target == start_pc" case
-// to also handle entry-block patterns like T1b: setup instructions
-// followed by a tight loop whose bdnz targets the loop's first
-// instruction within the SAME decoded block.
 static bool detect_self_loop(const u32* insts, u32 count,
                              const u32* instr_pcs, u32 start_pc,
-                             u32* out_loop_entry_idx,
-                             u32* out_fallthrough_pc) {
+                             u32* out_bdnz_idx,
+                             u32* out_loop_entry_idx) {
     if (count < 2) return false;
-    const u32 last = insts[count - 1];
-    const u32 op = (last >> 26) & 0x3F;
-    if (op != 16) return false;             // not bcx
-    if ((last & 0x3) != 0) return false;     // AA or LK set — skip
-    s32 bd = static_cast<s32>(last & 0xFFFC);
-    if (bd & 0x8000) bd |= 0xFFFF0000;       // sign-extend 16-bit
-    const u32 last_pc = instr_pcs ? instr_pcs[count - 1]
-                                  : (start_pc + (count - 1) * 4u);
-    const u32 target = static_cast<u32>(static_cast<s32>(last_pc) + bd);
-    // Map target to an instruction index inside this block.
-    if (target < start_pc) return false;
-    const u32 byte_off = target - start_pc;
-    if ((byte_off & 0x3u) != 0u) return false;
-    const u32 entry_idx = byte_off / 4u;
-    if (entry_idx >= count) return false;    // target past end — out of block
-    if (entry_idx > count - 1) return false; // can't target past terminator
-    // Per-instr_pcs path: confirm the chained instr_pcs[i] sequence has
-    // an entry equal to the resolved target. (When instr_pcs is dense and
-    // sequential — the standalone-test case — entry_idx already points at
-    // the matching instruction. When instr_pcs has gaps from the chain
-    // optimization we'd need a search; for now require dense chains.)
-    if (instr_pcs) {
-        if (instr_pcs[entry_idx] != target) return false;
+    for (u32 i = 0; i < count; ++i) {
+        const u32 inst = insts[i];
+        const u32 op = (inst >> 26) & 0x3F;
+        if (op != 16) continue;             // not bcx
+        if ((inst & 0x3) != 0) continue;     // AA or LK set — skip
+        s32 bd = static_cast<s32>(inst & 0xFFFC);
+        if (bd & 0x8000) bd |= 0xFFFF0000;   // sign-extend 16-bit
+        const u32 cur_pc = instr_pcs ? instr_pcs[i]
+                                     : (start_pc + i * 4u);
+        const u32 target = static_cast<u32>(static_cast<s32>(cur_pc) + bd);
+        if (target < start_pc) continue;
+        const u32 byte_off = target - start_pc;
+        if ((byte_off & 0x3u) != 0u) continue;
+        const u32 entry_idx = byte_off / 4u;
+        if (entry_idx > i) continue;         // target ahead → forward branch (not a loop)
+        if (instr_pcs && instr_pcs[entry_idx] != target) continue;
+        const u32 bo = (inst >> 21) & 0x1Fu;
+        const bool is_bdnz = (bo == 0b10000u);
+        const bool is_bdz  = (bo == 0b10010u);
+        const bool is_cr_branch = ((bo & 0b10100u) == 0b00100u);
+        if (!is_bdnz && !is_bdz && !is_cr_branch) continue;
+        if (out_bdnz_idx)        *out_bdnz_idx        = i;
+        if (out_loop_entry_idx)  *out_loop_entry_idx  = entry_idx;
+        return true;
     }
-    const u32 bo = (last >> 21) & 0x1Fu;
-    const bool is_bdnz = (bo == 0b10000u);
-    const bool is_bdz  = (bo == 0b10010u);
-    const bool is_cr_branch = ((bo & 0b10100u) == 0b00100u);
-    if (!is_bdnz && !is_bdz && !is_cr_branch) return false;
-    if (out_loop_entry_idx)  *out_loop_entry_idx  = entry_idx;
-    if (out_fallthrough_pc) *out_fallthrough_pc = last_pc + 4u;
-    return true;
+    return false;
 }
 
 // Emit the WASM control-flow predicate for the self-loop's terminating
@@ -3540,17 +3533,12 @@ static void emit_body_into(WasmModuleBuilder& b,
     // preserves B11's intra-iter savings (multiple reads of same gpr →
     // one memory load) while staying correct across the back-edge.
     bool emitted_terminator = false;
-    u32 self_loop_fallthrough_pc = 0;
+    u32 self_loop_bdnz_idx  = 0;
     u32 self_loop_entry_idx = 0;
     if (count >= 2 && detect_self_loop(insts, count, instr_pcs, start_pc,
-                                       &self_loop_entry_idx,
-                                       &self_loop_fallthrough_pc)) {
-        // Emit setup instructions [0, entry_idx) as straight-line, then
-        // wrap [entry_idx, count-1) in `loop` + `br_if 0` terminator.
-        // For T1's loop-only blocks, entry_idx == 0 and there's no setup.
-        // For T1b/T1c/T1e entry blocks (setup + first iter + bdnz targeting
-        // the first-iter's start), entry_idx > 0 absorbs the setup into
-        // the same WASM function as the loop body.
+                                       &self_loop_bdnz_idx,
+                                       &self_loop_entry_idx)) {
+        // Emit setup instructions [0, entry_idx) as straight-line.
         for (u32 i = 0; i < self_loop_entry_idx; ++i) {
             ctx.pc = instr_pcs ? instr_pcs[i] : (start_pc + i * 4u);
             ctx.inst = insts[i];
@@ -3558,39 +3546,59 @@ static void emit_body_into(WasmModuleBuilder& b,
             ctx.chain_fallthrough = false;
             gekko_emit_instr(ctx);
             if (ctx.block_end) {
-                // Setup hit a terminator — bail to the per-block path.
                 emitted_terminator = true;
                 break;
             }
         }
         if (!emitted_terminator) {
             // Flush before entering the loop so the loop body's first
-            // memory loads see consistent state. (Setup may have written
-            // GPRs into dirty locals; loop body's emit will read them
-            // back as memory loads + tee, so memory must agree.)
+            // memory loads see consistent state.
             emit_flush_dirty_gprs_impl(ctx, g_ctx_ptr);
+            // Loop body: instructions [entry_idx, bdnz_idx) wrapped in
+            // `loop` + `br_if 0`.
             b.op_loop(0x40);
-                for (u32 i = self_loop_entry_idx; i + 1 < count; ++i) {
+                for (u32 i = self_loop_entry_idx; i < self_loop_bdnz_idx; ++i) {
                     ctx.pc = instr_pcs ? instr_pcs[i] : (start_pc + i * 4u);
                     ctx.inst = insts[i];
                     ctx.block_end = false;
                     ctx.chain_fallthrough = false;
                     gekko_emit_instr(ctx);
-                    if (ctx.block_end) {
-                        break;
-                    }
+                    if (ctx.block_end) break;
                 }
                 // Flush dirty GPR locals BEFORE the back-edge so memory is
                 // current when the next iter's first emit-time-memory-read
                 // executes.
                 emit_flush_dirty_gprs_impl(ctx, g_ctx_ptr);
-                ctx.pc = instr_pcs ? instr_pcs[count - 1]
-                                   : (start_pc + (count - 1) * 4u);
-                ctx.inst = insts[count - 1];
+                ctx.pc = instr_pcs ? instr_pcs[self_loop_bdnz_idx]
+                                   : (start_pc + self_loop_bdnz_idx * 4u);
+                ctx.inst = insts[self_loop_bdnz_idx];
                 emit_self_loop_terminator(ctx, ctx.inst);
             b.op_end();  // close loop
-            emit_set_pc(ctx, g_ctx_ptr, self_loop_fallthrough_pc);
-            emitted_terminator = true;
+            // Emit post-loop instructions [bdnz_idx+1, count). These run
+            // when the bdnz fall-through path exits the loop. Each may be
+            // a hard terminator (blr, b, sc) which sets ctx.block_end and
+            // emits its own set_pc + return.
+            for (u32 i = self_loop_bdnz_idx + 1; i < count; ++i) {
+                ctx.pc = instr_pcs ? instr_pcs[i] : (start_pc + i * 4u);
+                ctx.inst = insts[i];
+                ctx.block_end = false;
+                ctx.chain_fallthrough = false;
+                gekko_emit_instr(ctx);
+                if (ctx.block_end) {
+                    emitted_terminator = true;
+                    break;
+                }
+            }
+            // If post-loop ran out without a terminator, set_pc to the
+            // PC after the last instruction so the dispatcher continues
+            // correctly.
+            if (!emitted_terminator) {
+                const u32 last_pc = instr_pcs
+                    ? instr_pcs[count - 1]
+                    : (start_pc + (count - 1) * 4u);
+                emit_set_pc(ctx, g_ctx_ptr, last_pc + 4u);
+                emitted_terminator = true;
+            }
         }
     } else {
     for (u32 i = 0; i < count; ++i) {
