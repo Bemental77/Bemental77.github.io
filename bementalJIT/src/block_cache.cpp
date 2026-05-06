@@ -588,10 +588,14 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
     // up-to-date pc_to_idx map: branches whose targets are in the map
     // become return_call_indirect (intra-instance, V8-inline-able).
     //
-    // Only fires when block_records are available (caller passed inputs to
-    // region_accumulate). When records are missing or empty, fall through
-    // to the legacy concat path.
-    bool have_records = (rs.block_records.size() == rs.n_funcs);
+    // Only fires when block_records are available AND the env-var
+    // JITWASM_REEMIT_AT_RELINK is set. Default OFF: measured 2026-05-06,
+    // re-emitting all N bodies on each relink is O(N^2) over a region's
+    // lifetime — at 1500+ blocks, slice timing collapses to ~0.03% native.
+    // Re-enabling requires per-block "needs re-emit" tracking (only
+    // re-emit blocks whose branches resolve to newly-accumulated PCs).
+    static const bool s_reemit_enabled = (std::getenv("JITWASM_REEMIT_AT_RELINK") != nullptr);
+    bool have_records = s_reemit_enabled && (rs.block_records.size() == rs.n_funcs);
     for (const auto& rec : rs.block_records) {
         if (rec.insts.empty()) { have_records = false; break; }
     }
