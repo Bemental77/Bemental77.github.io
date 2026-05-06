@@ -214,6 +214,14 @@ struct EmitCtx {
     bool use_gpr_locals = false;
     bool gpr_loaded[32] = {};
     bool gpr_dirty[32]  = {};
+
+    // Phase 3 prereq — depth of currently-open WASM `if`/`else`/`end`
+    // blocks. Inside any if/else (depth > 0), emit_gpr_get_impl and
+    // emit_gpr_set_impl fall back to direct memory access regardless
+    // of `use_gpr_locals` because runtime may not take the path that
+    // initialised the local. Tracked via the emit_b11_op_if/else/end
+    // wrappers that replace c.b.op_if/op_else/op_end calls in emitters.
+    u32 if_depth = 0;
 };
 
 // Forward-declared core emit functions live in gekko_emit.cpp.
@@ -367,6 +375,13 @@ void emit_gpr_get_impl(EmitCtx& c, u32 i, u32 ctx_ptr);
 void emit_gpr_set_impl(EmitCtx& c, u32 i, u32 ctx_ptr, u32 scratch);
 void emit_flush_dirty_gprs_impl(EmitCtx& c, u32 ctx_ptr);
 void emit_invalidate_gpr_locals(EmitCtx& c);
+
+// Wrappers around c.b.op_if/op_else/op_end that maintain
+// EmitCtx::if_depth so the GPR cache falls back to direct memory inside
+// any if/else and invalidates after the merge point.
+void emit_b11_op_if(EmitCtx& c, u8 result_type);
+void emit_b11_op_else(EmitCtx& c);
+void emit_b11_op_end(EmitCtx& c);
 
 // CR0 quick-set: given an i32 value already on the stack, compute and write
 // CR0 = SLT|SGT|EQ|SO  (4-bit field stored in low byte of cr.fields[0]).

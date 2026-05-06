@@ -69,7 +69,10 @@ static u32 g_ram_size  = 0;
 //   fallback (interpreter may have mutated ppc_state.gpr).
 // ---------------------------------------------------------------------------
 void emit_gpr_get_impl(EmitCtx& c, u32 i, u32 ctx_ptr) {
-    if (!c.use_gpr_locals) {
+    // Inside an if/else block (if_depth > 0), runtime may not take the
+    // path that initialises the local — fall back to direct memory.
+    // See EmitCtx::if_depth comment in gekko_emit.h.
+    if (!c.use_gpr_locals || c.if_depth > 0) {
         c.b.op_i32_const((s32)ctx_ptr);
         c.b.op_i32_load(ppc_off::gpr(i));
         return;
@@ -85,7 +88,7 @@ void emit_gpr_get_impl(EmitCtx& c, u32 i, u32 ctx_ptr) {
 }
 
 void emit_gpr_set_impl(EmitCtx& c, u32 i, u32 ctx_ptr, u32 scratch) {
-    if (!c.use_gpr_locals) {
+    if (!c.use_gpr_locals || c.if_depth > 0) {
         // Legacy memory path: incoming stack is [value]; we need [ctx, value]
         // before i32.store. Use the caller-provided `scratch` local for the
         // swap. Caller is responsible for choosing a local it does NOT need
@@ -101,6 +104,41 @@ void emit_gpr_set_impl(EmitCtx& c, u32 i, u32 ctx_ptr, u32 scratch) {
     c.b.op_local_set(gpr_local_idx(i));
     c.gpr_loaded[i] = true;
     c.gpr_dirty[i]  = true;
+}
+
+// Phase 3 prereq — wrappers around c.b.op_if/op_else/op_end. Manage
+// EmitCtx::if_depth so emit_gpr_get_impl/emit_gpr_set_impl fall back to
+// direct memory inside the if/else, and invalidate the cache after the
+// merge point so post-if code can't rely on partially-loaded state.
+//
+// Mirrors V8 Liftoff's "spill before branch + invalidate after merge"
+// pattern (see jit_b11_phase1_2026_05_05.md research synthesis), with
+// the simplification that we use one universal flush+invalidate instead
+// of per-branch CacheState snapshot/merge.
+void emit_b11_op_if(EmitCtx& c, u8 result_type) {
+    if (c.use_gpr_locals && c.if_depth == 0u) {
+        // Flush dirty so memory is current before the legacy-path emits
+        // inside the if/else read fresh values.
+        emit_flush_dirty_gprs_impl(c, g_ctx_ptr);
+    }
+    c.if_depth++;
+    c.b.op_if(result_type);
+}
+
+void emit_b11_op_else(EmitCtx& c) {
+    c.b.op_else();
+}
+
+void emit_b11_op_end(EmitCtx& c) {
+    c.b.op_end();
+    if (c.if_depth > 0u) c.if_depth--;
+    if (c.use_gpr_locals && c.if_depth == 0u) {
+        // Conservative: invalidate all loaded[] flags. Runtime took ONE
+        // arm; we don't know which gprs that arm loaded. Locals may be
+        // stale relative to memory (which is current — every if/else
+        // arm uses the legacy memory path).
+        emit_invalidate_gpr_locals(c);
+    }
 }
 
 void emit_flush_dirty_gprs_impl(EmitCtx& c, u32 ctx_ptr) {
@@ -676,16 +714,16 @@ static void emit_bcx_impl(EmitCtx& c) {
         const bool f_resolved = try_resolve_target(c, fallthrough, &f_lidx);
 
         if (c.chain_fallthrough) {
-            c.b.op_if(/*no result*/ 0x40);
+            emit_b11_op_if(c, /*no result*/ 0x40);
                 emit_branch_resolution(c, target, t_resolved ? &t_lidx : nullptr);
-            c.b.op_end();
+            emit_b11_op_end(c);
             return;
         }
-        c.b.op_if(/*no result*/ 0x40);
+        emit_b11_op_if(c, /*no result*/ 0x40);
             emit_branch_resolution(c, target, t_resolved ? &t_lidx : nullptr);
-        c.b.op_else();
+        emit_b11_op_else(c);
             emit_branch_resolution(c, fallthrough, f_resolved ? &f_lidx : nullptr);
-        c.b.op_end();
+        emit_b11_op_end(c);
         c.b.op_unreachable();
         c.block_end = true;
         return;
@@ -762,9 +800,9 @@ static void emit_bcx_impl(EmitCtx& c) {
         // Validation: the if's then-body unconditionally returns (or tail-
         // calls), making the then-branch polymorphic; the implicit empty
         // else matches the no-result if signature.
-        c.b.op_if(/*no result*/ 0x40);
+        emit_b11_op_if(c, /*no result*/ 0x40);
             emit_branch_resolution(c, target, t_resolved ? &t_lidx : nullptr);
-        c.b.op_end();
+        emit_b11_op_end(c);
         return;
     }
 
@@ -772,11 +810,11 @@ static void emit_bcx_impl(EmitCtx& c) {
     // unconditionally return / return_call_indirect, so they're polymorphic
     // — use a no-result if/else and follow with `unreachable` to satisfy
     // the function-level i32 result requirement.
-    c.b.op_if(/*no result*/ 0x40);
+    emit_b11_op_if(c, /*no result*/ 0x40);
         emit_branch_resolution(c, target, t_resolved ? &t_lidx : nullptr);
-    c.b.op_else();
+    emit_b11_op_else(c);
         emit_branch_resolution(c, fallthrough, f_resolved ? &f_lidx : nullptr);
-    c.b.op_end();
+    emit_b11_op_end(c);
     c.b.op_unreachable();
     c.block_end = true;
 }
@@ -1341,33 +1379,33 @@ static void emit_div_guarded(EmitCtx& c, bool is_signed) {
         c.b.op_i32_eq();                        // (a == INT_MIN)
         c.b.op_i32_and();                       // (b==-1 && a==INT_MIN)
         c.b.op_i32_or();                        // overall overflow flag
-        c.b.op_if(WASM_TYPE_I32);
+        emit_b11_op_if(c, WASM_TYPE_I32);
             // overflow: result = (a < 0) ? -1 : 0   (matches Dolphin)
             emit_gpr_get_impl(c, ra, g_ctx_ptr);
             c.b.op_i32_const(0);
             c.b.op_i32_lt_s();                  // (a < 0)
-            c.b.op_if(WASM_TYPE_I32);
+            emit_b11_op_if(c, WASM_TYPE_I32);
                 c.b.op_i32_const(-1);
-            c.b.op_else();
+            emit_b11_op_else(c);
                 c.b.op_i32_const(0);
-            c.b.op_end();
-        c.b.op_else();
+            emit_b11_op_end(c);
+        emit_b11_op_else(c);
             // safe divide
             emit_gpr_get_impl(c, ra, g_ctx_ptr);
             emit_gpr_get_impl(c, rb, g_ctx_ptr);
             c.b.op_i32_div_s();
-        c.b.op_end();
+        emit_b11_op_end(c);
     } else {
         // unsigned: only /0 is the issue, returns 0
         emit_gpr_get_impl(c, rb, g_ctx_ptr);
         c.b.op_i32_eqz();
-        c.b.op_if(WASM_TYPE_I32);
+        emit_b11_op_if(c, WASM_TYPE_I32);
             c.b.op_i32_const(0);
-        c.b.op_else();
+        emit_b11_op_else(c);
             emit_gpr_get_impl(c, ra, g_ctx_ptr);
             emit_gpr_get_impl(c, rb, g_ctx_ptr);
             c.b.op_i32_div_u();
-        c.b.op_end();
+        emit_b11_op_end(c);
     }
     // Stack: [result]. Store + optional CR0 update.
     if (RC(c.inst)) {
@@ -1801,11 +1839,11 @@ static void emit_mtmsr_impl(EmitCtx& c) {
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const(0x8000);
     c.b.op_i32_and();
-    c.b.op_if(/*no result*/ 0x40);
+    emit_b11_op_if(c, /*no result*/ 0x40);
         // EE=1 → call interpreter (via emit_fallback). Interpreter advances
         // pc to pc+4 internally, so we don't need to do it here.
         emit_fallback(c);
-    c.b.op_else();
+    emit_b11_op_else(c);
         // EE=0 → fast path: store new MSR + advance pc to pc+4 (mtmsr is a
         // non-branch terminator; without advancing, the dispatcher would
         // re-enter the same block forever). Skip exception delivery and
@@ -1816,7 +1854,7 @@ static void emit_mtmsr_impl(EmitCtx& c) {
         c.b.op_i32_const((s32)CTX);
         c.b.op_i32_const((s32)(c.pc + 4u));
         c.b.op_i32_store(ppc_off::PC);
-    c.b.op_end();
+    emit_b11_op_end(c);
     c.block_end = true;
     // If EE=0 path was taken, c.used_fallback stays false from the
     // pre-emit reset in gekko_emit_instr — that's correct, we're not
@@ -2503,14 +2541,14 @@ static void emit_fctiwx_common(EmitCtx& c, bool round_to_zero) {
     c.b.op_local_get(LOCAL_TMP_F);
     c.b.op_local_get(LOCAL_TMP_F);
     c.b.op_f64_ne();              // is_nan
-    c.b.op_if(WASM_TYPE_I32);
+    emit_b11_op_if(c, WASM_TYPE_I32);
         c.b.op_i32_const((s32)0x80000000);
-    c.b.op_else();
+    emit_b11_op_else(c);
         c.b.op_local_get(LOCAL_TMP_F);
         if (round_to_zero) c.b.op_f64_trunc();
         else               c.b.op_f64_nearest();
         c.b.op_i32_trunc_sat_f64_s();
-    c.b.op_end();
+    emit_b11_op_end(c);
     c.b.op_local_set(LOCAL_TMP_A);
 
     // Store low32 = result.
@@ -2976,7 +3014,7 @@ EmitFn gekko_lookup(u32 inst) {
 static void emit_exception_bail(EmitCtx& c) {
     c.b.op_i32_const((s32)c.pc);
     c.b.op_call(WIMPORT_CHECK_EXC);
-    c.b.op_if(WASM_TYPE_I32);
+    emit_b11_op_if(c, WASM_TYPE_I32);
         // B11: flush WITHOUT clearing compile-time dirty[]: we're inside
         // an if-branch that returns. If the runtime takes this branch,
         // the flush ops execute. If the runtime doesn't take it, the post-
@@ -2985,9 +3023,9 @@ static void emit_exception_bail(EmitCtx& c) {
         c.b.op_i32_const((s32)g_ctx_ptr);
         c.b.op_i32_load(ppc_off::PC);
         c.b.op_return();
-    c.b.op_else();
+    emit_b11_op_else(c);
         c.b.op_i32_const(0);  // dummy to satisfy if-result type
-    c.b.op_end();
+    emit_b11_op_end(c);
     c.b.op_drop();
 }
 
@@ -3189,6 +3227,19 @@ static void emit_body_into(WasmModuleBuilder& b,
     EmitCtx ctx{ b, start_pc, 0u, start_pc, false, false };
     ctx.lookup_local_idx = lookup_fn;
     ctx.lookup_user      = lookup_user;
+    // Phase 3 — flip the B11 GPR-local cache on. Inside if/else (when
+    // ctx.if_depth>0) the helpers fall back to direct memory access, so
+    // partially-loaded locals can't escape the merge point. After every
+    // op_end (via emit_b11_op_end) the cache is invalidated.
+    //
+    // Direct A/B-compared at 240s wall (probe_phase3_b vs probe_phase3_off):
+    // both reached iter=9M sim_time=140M with frames=5. B11 ON is
+    // correctness-neutral at the current measurement scale — no regression,
+    // no measurable speedup. The flag is left ON so the infrastructure is
+    // active for future optimizations (cross-block GPR passing via
+    // tail-call params, register-allocator over locals, etc.) where the
+    // cache becomes essential.
+    ctx.use_gpr_locals = true;
 
     // HLE function-hooking check at the very start of every block.
     {
