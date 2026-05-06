@@ -3360,33 +3360,18 @@ static void emit_self_loop_terminator(EmitCtx& c, u32 inst) {
         c.b.op_i32_const(0);
         c.b.op_i32_ne();
         break;
-      case 1:   // GT — NOT LT AND NOT EQ
-      {
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::cr_field(field_idx));         // low (EQ)
-        c.b.op_i32_eqz();                                       // EQ flag
+      case 1:   // GT — NOT(LT) AND NOT(EQ)
         c.b.op_i32_const((s32)CTX);
         c.b.op_i32_load(ppc_off::cr_field(field_idx) + 4);     // high
         c.b.op_i32_const(1u << 30);
         c.b.op_i32_and();
         c.b.op_i32_eqz();                                       // NOT LT
-        c.b.op_i32_and();                                       // (NOT LT) AND EQ-zero
-        // Wait: GT iff NOT(LT) AND NOT(EQ).  EQ flag = (low==0). NOT(EQ) = (low!=0).
-        // Recompute properly below.
-        c.b.op_drop();                                          // toss the wrong stack
-        c.b.op_drop();
         c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::cr_field(field_idx) + 4);
-        c.b.op_i32_const(1u << 30);
-        c.b.op_i32_and();
-        c.b.op_i32_eqz();                                       // NOT LT
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::cr_field(field_idx));
+        c.b.op_i32_load(ppc_off::cr_field(field_idx));         // low
         c.b.op_i32_const(0);
         c.b.op_i32_ne();                                        // NOT EQ
-        c.b.op_i32_and();
+        c.b.op_i32_and();                                       // (NOT LT) AND (NOT EQ)
         break;
-      }
       case 2:   // EQ — low u32 == 0
         c.b.op_i32_const((s32)CTX);
         c.b.op_i32_load(ppc_off::cr_field(field_idx));
