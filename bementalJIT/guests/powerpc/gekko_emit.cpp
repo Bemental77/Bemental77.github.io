@@ -248,12 +248,12 @@ static void emit_mulli_impl(EmitCtx& c) {
 //   comment): write (ra - simm) as low 32 and its sign extension as high 32.
 //   Signed compare result is correctly captured because the sign of (ra-simm)
 //   matches the GT/LT/EQ relation.
+// B11 Phase 2 Task 15 — cat A.
 static void emit_cmpi_impl(EmitCtx& c) {
     const u32 crfd = CRFD(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
     // result = ra - simm  (kept in TMP_A)
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_const(simm);
     c.b.op_i32_sub();
     c.b.op_local_set(LOCAL_TMP_A);
@@ -275,11 +275,11 @@ static void emit_cmpi_impl(EmitCtx& c) {
 //     LT: low=1, high=0xC0000000  (bit 62 set ⇒ LT, bit 63 set ⇒ negative
 //                                   so (s64)>0 fails ⇒ GT=0)
 //     GT: low=1, high=0           (positive non-zero ⇒ GT, low!=0 ⇒ EQ=0)
+// B11 Phase 2 Task 17 — cat A.
 static void emit_cmpli_impl(EmitCtx& c) {
     const u32 crfd = CRFD(c.inst), ra = RA(c.inst);
     const u32 uimm = UIMM_16(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_local_set(LOCAL_TMP_A);
     // low_word = (ra != uimm) ? 1 : 0
     c.b.op_local_get(LOCAL_TMP_A);
@@ -1382,64 +1382,58 @@ static void emit_div_guarded(EmitCtx& c, bool is_signed) {
 }
 static void emit_divwx_impl(EmitCtx& c) { emit_div_guarded(c, true); }
 static void emit_divwux_impl(EmitCtx& c){ emit_div_guarded(c, false); }
+// B11 Phase 2 Task 24 — cat B.
 static void emit_slwx_impl(EmitCtx& c)  {
     // PPC slw: rA = rS << (rB & 0x3F). For shift counts ≥32 (bit 5 of rB
     // set), PPC defines result = 0. WASM i32.shl uses (count & 0x1F),
     // which would alias 32 to 0 (no shift) — wrong. Use select: if
     // (rB & 0x20) is zero, return shifted value; else return 0.
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    c.b.op_i32_const((s32)CTX);
     // shifted_value
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_const(0x1F);
     c.b.op_i32_and();
     c.b.op_i32_shl();
     // zero_value (returned when shift ≥32)
     c.b.op_i32_const(0);
     // condition: (rB & 0x20) == 0  → use shifted_value
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_const(0x20);
     c.b.op_i32_and();
     c.b.op_i32_eqz();
     c.b.op_select();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
+// B11 Phase 2 Task 24 — cat B.
 static void emit_srwx_impl(EmitCtx& c)  {
     // Same shift-≥32 issue as emit_slwx_impl. Result = 0 for rB & 0x20 set.
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_const(0x1F);
     c.b.op_i32_and();
     c.b.op_i32_shr_u();
     c.b.op_i32_const(0);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_const(0x20);
     c.b.op_i32_and();
     c.b.op_i32_eqz();
     c.b.op_select();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
 // srawix — shift right algebraic word immediate (signed shift by SH; sets CA).
@@ -1490,6 +1484,7 @@ static void emit_srawix_impl(EmitCtx& c) {
 
 // cmp — X-form signed compare (a vs b). Use sign-extend trick: store
 // (a-b) as low 32 and its arithmetic sign-extension as high 32 of cr field.
+// B11 Phase 2 Task 14 — cat A.
 static void emit_cmp_impl(EmitCtx& c) {
     // PPC cmp: signed compare ra vs rb, set CRFD field accordingly.
     // Previous implementation computed (ra - rb) and used the difference's
@@ -1499,11 +1494,9 @@ static void emit_cmp_impl(EmitCtx& c) {
     // Mirrors emit_cmpl_impl's structure but uses signed lt_s instead of
     // unsigned lt_u, and skips the SO bit (XER.SO not tracked here).
     const u32 crfd = CRFD(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_local_set(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_local_set(LOCAL_TMP_B);
     // Low 32 = (ra != rb). Encodes EQ when low == 0 in Dolphin's GetField.
     c.b.op_i32_const((s32)CTX);
@@ -1532,14 +1525,13 @@ static void emit_cmp_impl(EmitCtx& c) {
 
 // cmpl — X-form unsigned compare. Construct Dolphin's CR encoding manually
 // (see emit_cmpli_impl comment for the encoding rules).
+// B11 Phase 2 Task 16 — cat A.
 static void emit_cmpl_impl(EmitCtx& c) {
     const u32 crfd = CRFD(c.inst), ra = RA(c.inst), rb = RB(c.inst);
     // Save ra, rb to locals.
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_local_set(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_local_set(LOCAL_TMP_B);
     // Store low 32 = (ra != rb) ? 1 : 0
     c.b.op_i32_const((s32)CTX);
@@ -1564,55 +1556,50 @@ static void emit_cmpl_impl(EmitCtx& c) {
 }
 
 // extsbx / extshx / cntlzwx — sign extend / count leading zeros
+// B11 Phase 2 Tasks 18-20 — cat B.
 static void emit_extsbx_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_const(24);
     c.b.op_i32_shl();
     c.b.op_i32_const(24);
     c.b.op_i32_shr_s();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
 static void emit_extshx_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_const(16);
     c.b.op_i32_shl();
     c.b.op_i32_const(16);
     c.b.op_i32_shr_s();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
 static void emit_cntlzwx_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_clz();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
 
@@ -1637,43 +1624,41 @@ static u32 ppc_mask(u32 mb, u32 me) {
     return mask;
 }
 
+// B11 Phase 2 Task 21 — cat B.
 static void emit_rlwinmx_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst);
     const u32 sh = SH(c.inst), mb = MB(c.inst), me = ME(c.inst);
     const u32 mask = ppc_mask(mb, me);
-    c.b.op_i32_const((s32)CTX);
     // (rs <<< sh) & mask
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_const((s32)sh);
     c.b.op_i32_rotl();
     c.b.op_i32_const((s32)mask);
     c.b.op_i32_and();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
 
 // rlwimix — rotate-left-word immediate then mask insert
 //   ra = (ra & ~mask) | ((rs <<< sh) & mask)
+// B11 Phase 2 Task 23 — cat B (reads + writes ra; in B11 mode this is a
+// no-op on the local cache since both go to gpr_local[ra]).
 static void emit_rlwimix_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst);
     const u32 sh = SH(c.inst), mb = MB(c.inst), me = ME(c.inst);
     const u32 mask = ppc_mask(mb, me);
-    c.b.op_i32_const((s32)CTX);
     // ra & ~mask
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_const((s32)~mask);
     c.b.op_i32_and();
     // | ((rs <<< sh) & mask)
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_const((s32)sh);
     c.b.op_i32_rotl();
     c.b.op_i32_const((s32)mask);
@@ -1681,24 +1666,22 @@ static void emit_rlwimix_impl(EmitCtx& c) {
     c.b.op_i32_or();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
 
 // rlwnmx — like rlwinmx but shift count from rb (low 5 bits).
+// B11 Phase 2 Task 22 — cat B.
 static void emit_rlwnmx_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
     const u32 mb = MB(c.inst), me = ME(c.inst);
     const u32 mask = ppc_mask(mb, me);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_const(0x1F);
     c.b.op_i32_and();
     c.b.op_i32_rotl();
@@ -1706,11 +1689,11 @@ static void emit_rlwnmx_impl(EmitCtx& c) {
     c.b.op_i32_and();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
 
