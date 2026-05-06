@@ -504,12 +504,25 @@ bool BlockCache::region_should_relink(Region r) const {
     if (r >= REGION_COUNT) return false;
     const RegionState& rs = m_regions[r];
 
-    // Trigger 1: enough new blocks accumulated to make a re-link worthwhile.
-    // Bumped from 64 → 256 after measuring 9 re-links per 60 s probe at 64
-    // — each re-link is a fresh V8 compile of a 100-400 KB merged module.
-    // The compile cost dominated dispatch time during warmup. 256 cuts
-    // re-link frequency 4× without leaving large gaps between merges.
-    if (rs.blocks_since_link >= 256u) return true;
+    // Trigger 1: blocks accumulated. Threshold scales with how many blocks
+    // are already in the region — small regions relink quickly so early
+    // boot exploration moves PCs into the live module fast; large stable
+    // regions relink less often to amortize V8 compile cost.
+    //
+    //   < 256 blocks total:    relink every 32 new   (boot warmup phase)
+    //   < 1024 blocks total:   relink every 128 new  (active exploration)
+    //   >= 1024 blocks total:  relink every 256 new  (steady state)
+    //
+    // Diagnose probe (2026-05-06) showed boot exploration adds new PCs
+    // faster than the prior fixed 256 threshold relinks them — region
+    // module perpetually 24% behind, dispatch falls to slow per-block
+    // (cross-instance call_indirect deopt) path. Tiered threshold lets
+    // boot stabilize the region quickly, then settles for steady state.
+    u32 threshold;
+    if (rs.n_funcs < 256u)        threshold = 32u;
+    else if (rs.n_funcs < 1024u)  threshold = 128u;
+    else                          threshold = 256u;
+    if (rs.blocks_since_link >= threshold) return true;
 
     // Trigger 2: steady-state catch — the region has at least one block
     // pending and hasn't accumulated a new one in >2 s. Without this, a
