@@ -881,6 +881,28 @@ static void emit_andx_impl(EmitCtx& c)  { emit_xform_logical(c, wop::i32_and); }
 static void emit_orx_impl (EmitCtx& c)  { emit_xform_logical(c, wop::i32_or);  }
 static void emit_xorx_impl(EmitCtx& c)  { emit_xform_logical(c, wop::i32_xor); }
 
+// andc rA, rS, rB  (X-form, sub-op 60)  →  rA = rS AND (NOT rB)
+// Real-game profiling 2026-05-06: andc was the #2 op31 fallback on SAB
+// (~427 hits per 10K dispatches). Native emit eliminates one JS round-
+// trip per execution. WASM has no native ANDC; emit as
+// rS AND (rB XOR -1).
+static void emit_andcx_impl(EmitCtx& c) {
+    const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);    // push rs
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);    // push rb
+    c.b.op_i32_const(-1);                    // push -1
+    c.b.op_i32_xor();                         // top = ~rB
+    c.b.op_i32_and();                         // top = rS & ~rB
+    if (RC(c.inst)) {
+        c.b.op_local_tee(LOCAL_TMP_A);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_set_cr0(c, CTX, LOCAL_TMP_A);
+    } else {
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
+    }
+}
+
 // Helper for "X-form 3-op logical with bitwise complement of result."
 // Used by NAND, NOR, EQV: rA = ~(rS OP rB).
 static void emit_xform_logical_complement(EmitCtx& c, u8 op_byte) {
@@ -2981,6 +3003,7 @@ constexpr OpEntry table31_entries[] = {
     {266, &emit_addx_impl}, {778, &emit_addx_impl},
     { 40, &emit_subfx_impl}, {552, &emit_subfx_impl},
     { 28, &emit_andx_impl},
+    { 60, &emit_andcx_impl},
     {444, &emit_orx_impl},
     {316, &emit_xorx_impl},
     {124, &emit_norx_impl},
