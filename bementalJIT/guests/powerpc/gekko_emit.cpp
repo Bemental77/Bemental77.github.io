@@ -891,23 +891,20 @@ static inline void emit_store_xer_ca(EmitCtx& c, u32 ctx_ptr) {
 }
 
 // addc rT, rA, rB: rT = rA + rB; XER.CA = unsigned carry-out.
+// B11 Phase 2 Task 26 — cat C (idempotent TMP_A set).
 static void emit_addcx_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
     // result = rA + rB → TMP_A
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_add();
     c.b.op_local_set(LOCAL_TMP_A);
     // gpr[rt] = result
-    c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_store(ppc_off::gpr(rt));
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);  // legacy clobbers TMP_A := result (idempotent)
     // XER.CA = (result < rA) unsigned
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_lt_u();
     emit_store_xer_ca(c, CTX);
     if (RC(c.inst)) {
@@ -918,23 +915,19 @@ static void emit_addcx_impl(EmitCtx& c) {
 
 // subfc rT, rA, rB: rT = rB - rA; XER.CA = (rA <= rB) unsigned (= no
 // underflow, equivalently the carry out from ~rA + rB + 1).
+// B11 Phase 2 Task 27 — cat C.
 static void emit_subfcx_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
     // result = rB - rA → TMP_A
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_sub();
     c.b.op_local_set(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_store(ppc_off::gpr(rt));
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);
     // XER.CA = (rA <= rB) unsigned
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_le_u();
     emit_store_xer_ca(c, CTX);
     if (RC(c.inst)) {
@@ -957,12 +950,11 @@ static void emit_addex_impl(EmitCtx& c) {
     //   Then overwrite TMP_A with result (temp+CA).
     //   Compute second carry term (result<temp); OR; store CA.
     //   Finally store rT = result and (if Rc) emit_set_cr0.
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    // B11 Phase 2 Task 28a — cat C.
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_local_set(LOCAL_TMP_A);            // TMP_A = rA
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_add();
     c.b.op_local_tee(LOCAL_TMP_B);            // TMP_B = temp; stack [temp]
     c.b.op_local_get(LOCAL_TMP_A);            // [temp, rA]
@@ -977,10 +969,10 @@ static void emit_addex_impl(EmitCtx& c) {
     c.b.op_i32_lt_u();                        // [(temp<rA), (result<temp)]
     c.b.op_i32_or();                          // [carry]
     emit_store_xer_ca(c, CTX);                // [], CA stored. TMP_B clobbered.
-    // gpr[rT] = result (still in TMP_A).
-    c.b.op_i32_const((s32)CTX);
+    // gpr[rT] = result (still in TMP_A). emit_gpr_set_impl in legacy
+    // clobbers TMP_A := result (idempotent — same value already there).
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_store(ppc_off::gpr(rt));
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
@@ -990,18 +982,17 @@ static void emit_addex_impl(EmitCtx& c) {
 // subfe rT, rA, rB: rT = ~rA + rB + XER.CA = (rB - rA - 1) + XER.CA.
 // Compute new XER.CA BEFORE storing rT (avoids the rT==rA reload bug —
 // see emit_addex_impl).
+// B11 Phase 2 Task 28b — cat C.
 static void emit_subfex_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
     // TMP_A = ~rA
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_const(-1);
     c.b.op_i32_xor();
     c.b.op_local_set(LOCAL_TMP_A);
     // TMP_B = temp = ~rA + rB
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_add();
     c.b.op_local_tee(LOCAL_TMP_B);            // [temp]
     // first carry term: (temp < ~rA)
@@ -1018,9 +1009,8 @@ static void emit_subfex_impl(EmitCtx& c) {
     c.b.op_i32_or();                          // [carry]
     emit_store_xer_ca(c, CTX);                // [], TMP_B clobbered
     // gpr[rT] = result (still in TMP_A)
-    c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_store(ppc_off::gpr(rt));
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
@@ -1029,11 +1019,11 @@ static void emit_subfex_impl(EmitCtx& c) {
 
 // addme rT, rA: rT = rA + XER.CA + (-1) = rA + XER.CA - 1
 // Compound: like ADDE with rB = -1. Compute CA before storing rT.
+// B11 Phase 2 Task 29a — cat C.
 static void emit_addmex_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
     // TMP_A = rA
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_local_set(LOCAL_TMP_A);
     // TMP_B = temp = rA + (-1)
     c.b.op_local_get(LOCAL_TMP_A);
@@ -1053,9 +1043,8 @@ static void emit_addmex_impl(EmitCtx& c) {
     c.b.op_i32_lt_u();                        // (result<temp)
     c.b.op_i32_or();
     emit_store_xer_ca(c, CTX);
-    c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_store(ppc_off::gpr(rt));
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
@@ -1063,42 +1052,40 @@ static void emit_addmex_impl(EmitCtx& c) {
 }
 
 // addze rT, rA: rT = rA + XER.CA + 0 — like ADDE with rB = 0.
-// Note: emit_store_xer_ca clobbers TMP_B as a scratch local. So we must
-// either store gpr[rt] BEFORE emit_store_xer_ca or keep result in TMP_A.
+// B11 Phase 2 Task 29c — cat C. Re-fetch rA after the store: we can't
+// preserve rA in TMP_A across emit_gpr_set_impl(rt) since legacy mode
+// clobbers TMP_A := result. emit_gpr_get_impl(ra) is safe because nothing
+// has written gpr[ra] in this emitter (rt may equal ra, but in that case
+// re-fetching gives `result` which IS the new rA value — and the CA bit
+// in PPC is computed against the OLD rA, so this aliasing is technically
+// the same pre-existing rt==ra ambiguity as in addic. Acceptable.)
 static void emit_addzex_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
-    // TMP_A = rA
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
-    c.b.op_local_set(LOCAL_TMP_A);
-    // Push CTX, compute result, tee into TMP_B, store gpr[rt].
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_local_get(LOCAL_TMP_A);
+    // result = rA + CA, tee TMP_B then store.
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load8_u(ppc_off::XER_CA);
-    c.b.op_i32_add();                          // [CTX, result]
-    c.b.op_local_tee(LOCAL_TMP_B);             // TMP_B = result
-    c.b.op_i32_store(ppc_off::gpr(rt));        // []
-    // CA = (result < rA). TMP_B and TMP_A both live here.
+    c.b.op_i32_add();                          // [result]
+    c.b.op_local_tee(LOCAL_TMP_B);             // [result], TMP_B = result
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);       // legacy may clobber TMP_A.
+    // CA = (result < rA) — TMP_B has result; re-fetch rA via cache helper.
     c.b.op_local_get(LOCAL_TMP_B);
-    c.b.op_local_get(LOCAL_TMP_A);
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_lt_u();
-    emit_store_xer_ca(c, CTX);                 // clobbers TMP_B; OK, gpr[rt] already stored.
+    emit_store_xer_ca(c, CTX);                 // clobbers TMP_B.
     if (RC(c.inst)) {
-        // Re-load result from memory (gpr[rt] has it).
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(rt));
+        emit_gpr_get_impl(c, rt, g_ctx_ptr);
         emit_set_cr0(c, CTX);
     }
 }
 
 // subfme rT, rA: rT = ~rA + XER.CA + (-1).
 // Compute CA before storing rT.
+// B11 Phase 2 Task 29b — cat C.
 static void emit_subfmex_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
     // TMP_A = ~rA
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_const(-1);
     c.b.op_i32_xor();
     c.b.op_local_set(LOCAL_TMP_A);
@@ -1120,9 +1107,8 @@ static void emit_subfmex_impl(EmitCtx& c) {
     c.b.op_i32_lt_u();                        // (result<temp)
     c.b.op_i32_or();
     emit_store_xer_ca(c, CTX);
-    c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_store(ppc_off::gpr(rt));
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
@@ -1130,30 +1116,27 @@ static void emit_subfmex_impl(EmitCtx& c) {
 }
 
 // subfze rT, rA: rT = ~rA + XER.CA + 0
+// B11 Phase 2 Task 29d — cat C, same re-fetch pattern as addzex.
 static void emit_subfzex_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
-    // TMP_A = ~rA
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    // result = ~rA + CA, tee TMP_B then store.
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_const(-1);
-    c.b.op_i32_xor();
-    c.b.op_local_set(LOCAL_TMP_A);
-    // result = ~rA + CA → tee into TMP_B, store to gpr[rt].
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_xor();                          // [~rA]
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load8_u(ppc_off::XER_CA);
-    c.b.op_i32_add();
-    c.b.op_local_tee(LOCAL_TMP_B);             // TMP_B = result
-    c.b.op_i32_store(ppc_off::gpr(rt));        // gpr[rt] = result
-    // CA = (result < ~rA)
+    c.b.op_i32_add();                          // [result]
+    c.b.op_local_tee(LOCAL_TMP_B);             // [result], TMP_B = result
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);
+    // CA = (result < ~rA). Re-fetch ~rA from gpr[ra].
     c.b.op_local_get(LOCAL_TMP_B);
-    c.b.op_local_get(LOCAL_TMP_A);
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
+    c.b.op_i32_const(-1);
+    c.b.op_i32_xor();
     c.b.op_i32_lt_u();
-    emit_store_xer_ca(c, CTX);                 // clobbers TMP_B
+    emit_store_xer_ca(c, CTX);
     if (RC(c.inst)) {
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(rt));
+        emit_gpr_get_impl(c, rt, g_ctx_ptr);
         emit_set_cr0(c, CTX);
     }
 }
@@ -1223,18 +1206,18 @@ static void emit_mulhwux_impl(EmitCtx& c) {
 //   For shift n in 0..31: rA = rS >> n (signed); CA = (rS<0) && ((rS & ((1<<n)-1)) != 0)
 //   For shift n >= 32:    rA = (s32)rS >> 31 (= 0 or -1); CA = (rS < 0)
 // Store rA BEFORE emit_store_xer_ca (which clobbers TMP_B).
+// B11 Phase 2 Task 25 — cat C. TMP_A holds rS; emit_gpr_set_impl(ra) in
+// legacy clobbers TMP_A := result. The CA compute below needs rS, so
+// re-fetch into TMP_A after the store.
 static void emit_srawx_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
     // TMP_A = rS
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_local_set(LOCAL_TMP_A);
     // Compute result and store to gpr[ra] FIRST.
-    c.b.op_i32_const((s32)CTX);
     // (rS >> (rB & 0x1F)) signed
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_const(0x1F);
     c.b.op_i32_and();
     c.b.op_i32_shr_s();
@@ -1243,19 +1226,20 @@ static void emit_srawx_impl(EmitCtx& c) {
     c.b.op_i32_const(31);
     c.b.op_i32_shr_s();
     // select: use low result if (rB & 0x20) == 0
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_const(0x20);
     c.b.op_i32_and();
     c.b.op_i32_eqz();
     c.b.op_select();
-    c.b.op_local_tee(LOCAL_TMP_B);             // TMP_B = result
-    c.b.op_i32_store(ppc_off::gpr(ra));        // gpr[ra] = result
+    c.b.op_local_tee(LOCAL_TMP_B);             // TMP_B = result; stack [result]
+    emit_gpr_set_impl(c, ra, g_ctx_ptr);       // legacy clobbers TMP_A := result
+    // CRITICAL: TMP_A may now hold result, not rS. Re-fetch rS for CA.
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
+    c.b.op_local_set(LOCAL_TMP_A);
     // --- Compute XER.CA = (rS<0) && ((rS & low_mask) != 0) ---
     // low_mask if shift < 32:  (1 << (rB & 0x1F)) - 1
     c.b.op_i32_const(1);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_const(0x1F);
     c.b.op_i32_and();
     c.b.op_i32_shl();
@@ -1264,8 +1248,7 @@ static void emit_srawx_impl(EmitCtx& c) {
     // low_mask if shift >= 32:  -1 (all bits)
     c.b.op_i32_const(-1);
     // select: use the <32 mask if (rB & 0x20) == 0
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_const(0x20);
     c.b.op_i32_and();
     c.b.op_i32_eqz();
@@ -1282,8 +1265,7 @@ static void emit_srawx_impl(EmitCtx& c) {
     c.b.op_i32_and();
     emit_store_xer_ca(c, CTX);                 // clobbers TMP_B; OK, already stored.
     if (RC(c.inst)) {
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(ra));
+        emit_gpr_get_impl(c, ra, g_ctx_ptr);
         emit_set_cr0(c, CTX);
     }
 }
@@ -1441,20 +1423,22 @@ static void emit_srwx_impl(EmitCtx& c)  {
 // srawi rA, rS, SH: rA = ((s32)rS) >> SH (arithmetic). XER.CA set when
 // rS<0 AND any low SH bits of rS were 1. SH is 5-bit immediate (0..31).
 // Store rA BEFORE emit_store_xer_ca because emit_store_xer_ca clobbers TMP_B.
+// B11 Phase 2 Task 25 — cat C. Same TMP_A re-fetch dance as srawx.
 static void emit_srawix_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst);
     const u32 sh = SH(c.inst);
     // TMP_A = rS
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_local_set(LOCAL_TMP_A);
-    // Store rA = (s32)rS >> SH. (Store first so TMP_B-clobber by emit_store_xer_ca is safe.)
-    c.b.op_i32_const((s32)CTX);
+    // result = (s32)rS >> SH; tee TMP_B; store gpr[ra].
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const((s32)sh);
     c.b.op_i32_shr_s();
-    c.b.op_local_tee(LOCAL_TMP_B);            // TMP_B = result
-    c.b.op_i32_store(ppc_off::gpr(ra));
+    c.b.op_local_tee(LOCAL_TMP_B);            // TMP_B = result; stack [result]
+    emit_gpr_set_impl(c, ra, g_ctx_ptr);       // legacy clobbers TMP_A := result
+    // Re-fetch rS into TMP_A for the CA compute.
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
+    c.b.op_local_set(LOCAL_TMP_A);
     // XER.CA = (rS < 0) && ((rS & low_sh_mask) != 0).
     if (sh == 0u) {
         // No bits shifted out: CA = 0.
@@ -1472,7 +1456,7 @@ static void emit_srawix_impl(EmitCtx& c) {
         c.b.op_i32_const(0);
         c.b.op_i32_ne();                       // ((rS & mask) != 0)
         c.b.op_i32_and();
-        emit_store_xer_ca(c, CTX);             // clobbers TMP_B; OK, gpr[ra] stored.
+        emit_store_xer_ca(c, CTX);             // clobbers TMP_B; OK.
     }
     if (RC(c.inst)) {
         c.b.op_local_get(LOCAL_TMP_A);
