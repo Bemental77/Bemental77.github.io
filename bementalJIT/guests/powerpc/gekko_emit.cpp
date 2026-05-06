@@ -818,22 +818,20 @@ static void emit_xform_logical(EmitCtx& c, u32 wasm_op_byte) {
 }
 
 static void emit_addx_impl(EmitCtx& c)  { emit_xform_binop(c, wop::i32_add); }
+// B11 Phase 2 Task 9 — cat B.
 static void emit_subfx_impl(EmitCtx& c) {
     // PPC subfx: rt = rb - ra (note operand order!)
     const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_sub();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(rt));
+        emit_gpr_set_impl(c, rt, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(rt));
+        emit_gpr_set_impl(c, rt, g_ctx_ptr);
     }
 }
 static void emit_andx_impl(EmitCtx& c)  { emit_xform_logical(c, wop::i32_and); }
@@ -863,23 +861,21 @@ static void emit_eqvx_impl(EmitCtx& c)  { emit_xform_logical_complement(c, wop::
 
 // orc rA, rS, rB: rA = rS | ~rB. Different shape from NAND/NOR/EQV — the
 // complement is on rB, not the whole expression.
+// B11 Phase 2 Task 13 — cat B.
 static void emit_orcx_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_const(-1);
     c.b.op_i32_xor();
     c.b.op_i32_or();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
 
@@ -1163,60 +1159,50 @@ static void emit_subfzex_impl(EmitCtx& c) {
 }
 
 // neg rT, rA: rT = -rA = (~rA) + 1. X-form 2-op arith.
+// B11 Phase 2 Task 10 — cat B.
 static void emit_negx_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
-    c.b.op_i32_const((s32)CTX);
     c.b.op_i32_const(0);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_sub();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(rt));
+        emit_gpr_set_impl(c, rt, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(rt));
+        emit_gpr_set_impl(c, rt, g_ctx_ptr);
     }
 }
 
 // mulhw rT, rA, rB: rT = high 32 bits of (s32 rA) * (s32 rB).
 // WASM has no 32x32→64 mul; use i64 sign-extend then i64 mul, then take high.
+// B11 Phase 2 Task 11 — cat B.
 static void emit_mulhwx_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    // (s64)rA
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i64_extend_i32_s();
-    // (s64)rB
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i64_extend_i32_s();
-    // i64 multiply
     c.b.op_i64_mul();
-    // shift right 32 (logical) to get high 32 bits
     c.b.op_i64_const(32);
     c.b.op_i64_shr_u();
     c.b.op_i32_wrap_i64();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(rt));
+        emit_gpr_set_impl(c, rt, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(rt));
+        emit_gpr_set_impl(c, rt, g_ctx_ptr);
     }
 }
 // mulhwu — same but unsigned.
 static void emit_mulhwux_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i64_extend_i32_u();
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i64_extend_i32_u();
     c.b.op_i64_mul();
     c.b.op_i64_const(32);
@@ -1224,11 +1210,11 @@ static void emit_mulhwux_impl(EmitCtx& c) {
     c.b.op_i32_wrap_i64();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(rt));
+        emit_gpr_set_impl(c, rt, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(rt));
+        emit_gpr_set_impl(c, rt, g_ctx_ptr);
     }
 }
 
@@ -1302,25 +1288,22 @@ static void emit_srawx_impl(EmitCtx& c) {
     }
 }
 
-// (deprecated trailing comment fragment retained below from emit_norx)
+// B11 Phase 2 Task 12 — cat B.
 static void emit_norx_impl(EmitCtx& c)  {
     // PPC `nor rA, rS, rB`: rA = ~(rS | rB). RA is destination, RT-slot is RS.
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rb));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
+    emit_gpr_get_impl(c, rb, g_ctx_ptr);
     c.b.op_i32_or();
     c.b.op_i32_const(-1);
     c.b.op_i32_xor();
     if (RC(c.inst)) {
         c.b.op_local_tee(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
         c.b.op_local_get(LOCAL_TMP_A);
         emit_set_cr0(c, CTX);
     } else {
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
 static void emit_mullwx_impl(EmitCtx& c){ emit_xform_binop(c, wop::i32_mul); }
