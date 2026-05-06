@@ -17,6 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(bementalJIT STATIC
     src/block_cache.cpp
+    src/perf_runtime.cpp
 )
 
 target_include_directories(bementalJIT PUBLIC
@@ -24,6 +25,15 @@ target_include_directories(bementalJIT PUBLIC
 )
 
 target_compile_features(bementalJIT PUBLIC cxx_std_17)
+
+# perf_runtime.cpp uses <atomic>, which under Emscripten requires the
+# 'atomics' wasm feature. The link target uses -pthread (shared memory);
+# the static library must compile with -pthread too so wasm-ld doesn't
+# reject objects that lack the atomics feature flag.
+if(EMSCRIPTEN)
+    target_compile_options(bementalJIT PUBLIC "-pthread")
+    target_link_options(bementalJIT PUBLIC "-pthread")
+endif()
 
 # ---- Per-guest emitters (gated; each provides its own subdirectory) --------
 

@@ -10,6 +10,7 @@
 // existing Interpreter::RunInterpreterOp.
 
 #include "gekko_emit.h"
+#include "bementalCompiler/perf_runtime.h"
 #include <array>
 #include <cstring>
 
@@ -1803,6 +1804,7 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
                             u32 ctx_ptr_const, u32 mem_pages,
                             u32 mem1_base, u32 mem1_mask, u32 ram_size,
                             const u32* instr_pcs) {
+    bemental::perf_runtime::inc(bemental::PERF_SLOT_BLOCK_EMIT);
     g_ctx_ptr = ctx_ptr_const;
     // Per-block DFA (research_findings.md item 5 K_unknown analysis):
     // walk the block's instructions, track which GPRs are "trusted" as

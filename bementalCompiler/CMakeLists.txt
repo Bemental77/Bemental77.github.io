@@ -17,6 +17,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(bementalCompiler STATIC
     src/block_cache.cpp
+    src/perf_runtime.cpp
 )
 
 target_include_directories(bementalCompiler PUBLIC
