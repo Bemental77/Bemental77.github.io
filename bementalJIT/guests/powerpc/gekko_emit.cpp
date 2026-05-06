@@ -1866,15 +1866,15 @@ static void emit_mfpvr_native(EmitCtx& c, u32 rt) {
     c.b.op_i32_store(ppc_off::gpr(rt));
 }
 
+// B11 Phase 2 Tasks 35-36 — cat E (SPR access).
 static void emit_mfspr_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst);
     const u32 spr_num = SPR_DECODE(c.inst);
     if (spr_num == 287) { emit_mfpvr_native(c, rt); return; }  // PVR constant
     if (!spr_is_direct(spr_num)) { emit_fallback(c); return; }
     c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::spr(spr_num));
-    c.b.op_i32_store(ppc_off::gpr(rt));
+    c.b.op_i32_load(ppc_off::spr(spr_num));   // [spr_val]
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);
 }
 
 static void emit_mtspr_impl(EmitCtx& c) {
@@ -1882,8 +1882,7 @@ static void emit_mtspr_impl(EmitCtx& c) {
     const u32 spr_num = SPR_DECODE(c.inst);
     if (!spr_is_direct(spr_num)) { emit_fallback(c); return; }
     c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_store(ppc_off::spr(spr_num));
 }
 
@@ -2541,13 +2540,23 @@ static void emit_fctiwzx_impl(EmitCtx& c) { emit_fctiwx_common(c, true);  }
 // 0x18(r1); stmw r24, 0x18(r1) etc.
 // ===========================================================================
 static void emit_lmw_impl(EmitCtx& c) {
+    // B11 Phase 2 Tasks 33-34 — DEFERRED. lmw/stmw hold the base EA in
+    // LOCAL_TMP_A across the per-iter loop body. emit_gpr_set_impl in
+    // legacy mode clobbers TMP_A as part of its [val] → [ctx, val] swap,
+    // breaking the loop. Reverting this emitter to the original direct-
+    // memory pattern; B11 cache benefit here is minimal because lmw/stmw
+    // touch many GPRs at once with little post-emit reuse.
+    //
+    // To migrate later: either (a) allocate a third scratch local for
+    // EA and pass it to emit_gpr_set_impl, or (b) emit per-iter direct
+    // i32.store but invalidate gpr_loaded[i] in B11 mode so subsequent
+    // reads pick up the new memory value.
     const u32 rt = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
     if (ra == 0) {
         c.b.op_i32_const(simm);
     } else {
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(ra));
+        emit_gpr_get_impl(c, ra, g_ctx_ptr);
         c.b.op_i32_const(simm);
         c.b.op_i32_add();
     }
@@ -2566,13 +2575,14 @@ static void emit_lmw_impl(EmitCtx& c) {
 }
 
 static void emit_stmw_impl(EmitCtx& c) {
+    // B11 Phase 2 Tasks 33-34 — DEFERRED for the same TMP_A-hold-across-
+    // loop reason as emit_lmw_impl above.
     const u32 rs = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
     if (ra == 0) {
         c.b.op_i32_const(simm);
     } else {
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(ra));
+        emit_gpr_get_impl(c, ra, g_ctx_ptr);
         c.b.op_i32_const(simm);
         c.b.op_i32_add();
     }
@@ -2604,15 +2614,13 @@ static void emit_stmw_impl(EmitCtx& c) {
 // MSR.DR — matching real GameCube hardware where the memory controller
 // only decodes the low bits.
 // ===========================================================================
+// B11 Phase 2 Tasks 31-32 — cat D (mirrors emit_load_d/store_d).
 static void emit_ea_x(EmitCtx& c, u32 ra, u32 rb) {
     if (ra == 0) {
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(rb));
+        emit_gpr_get_impl(c, rb, g_ctx_ptr);
     } else {
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(ra));
-        c.b.op_i32_const((s32)CTX);
-        c.b.op_i32_load(ppc_off::gpr(rb));
+        emit_gpr_get_impl(c, ra, g_ctx_ptr);
+        emit_gpr_get_impl(c, rb, g_ctx_ptr);
         c.b.op_i32_add();
     }
 }
@@ -2631,14 +2639,15 @@ static void emit_load_x(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
         c.b.op_i32_shr_s();
     }
     c.b.op_local_set(LOCAL_TMP_B);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_local_get(LOCAL_TMP_B);
-    c.b.op_i32_store(ppc_off::gpr(rt));
+    // Update RA first (TMP_A still holds EA), then store rt (legacy
+    // emit_gpr_set_impl clobbers TMP_A := rt's value). Same fix as
+    // emit_load_d in Phase 1.
     if (update && ra != 0) {
-        c.b.op_i32_const((s32)CTX);
         c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
+    c.b.op_local_get(LOCAL_TMP_B);
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);
 }
 
 static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
@@ -2647,13 +2656,11 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
     c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_call(import_idx);
     if (update && ra != 0) {
-        c.b.op_i32_const((s32)CTX);
         c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_i32_store(ppc_off::gpr(ra));
+        emit_gpr_set_impl(c, ra, g_ctx_ptr);
     }
 }
 
