@@ -122,8 +122,18 @@ struct Harness {
     }
 
     // Compile (lazily) and dispatch starting at start_pc. Continues following
-    // next_pc until the kernel returns to SENTINEL_LR. Returns true on
-    // successful kernel completion.
+    // next_pc until the kernel returns to SENTINEL_LR.
+    //
+    // Lever #2 (block-link patching) note: the region/multi-module path
+    // exists (region_accumulate + emit_block_body w/ LocalIdxLookupFn +
+    // region_relink + region_dispatch) but applied here it REGRESSES T1
+    // because (a) emit_block_body's branch resolver runs at FIRST emit,
+    // when sibling blocks aren't accumulated yet, so loop bodies'
+    // self-targeting bdnz never resolves to return_call_indirect, and
+    // (b) the per-block region_dispatch overhead exceeds the per-block
+    // BlockCache::dispatch direct-handle path on tiny microkernels.
+    // Real lever #2 needs CFG pre-discovery + per-relink re-emit so the
+    // bdnz can target the now-accumulated loop entry. Deferred.
     bool run_until_sentinel(u32 start_pc) {
         u32 pc = start_pc;
         // Cap at >2M because T1e has inner_count=1,048,576 and each bdnz
@@ -158,9 +168,6 @@ struct Harness {
                 std::fprintf(stderr, "[t1-fail] dispatch returned false at pc=0x%08x\n", pc);
                 return false;
             }
-            // next_pc is a u32 guest address packed into an s32 return slot;
-            // PCs >= 0x80000000 appear "negative" — that's normal, not a fault.
-            // BlockCache::dispatch has already filtered the INT32_MIN trap.
             pc = static_cast<u32>(next_pc);
         }
         std::fprintf(stderr, "[t1-fail] safety cap hit, last pc=0x%08x\n", pc);

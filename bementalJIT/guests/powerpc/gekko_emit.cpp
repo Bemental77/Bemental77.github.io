@@ -2663,13 +2663,84 @@ static void emit_ea_x(EmitCtx& c, u32 ra, u32 rb) {
     }
 }
 
+// X-form load fastmem. Unlike emit_load_d's compile-time gate (per-block
+// trust DFA proves all loads target MEM1), X-form ops can't be statically
+// trusted because the index reg `rb` isn't part of the DFA. So we use a
+// runtime range check `(ea & 0x01FFFFFF) < ram_size` to pick between
+// the direct linear-memory load and the JS-import trampoline. The Liftoff
+// cliff on `if (result i32)` is real (~2-3x vs straight-line) but the
+// JS round-trip it replaces is ~10-20x worse, so net win for in-MEM1
+// hot loops (memcpy, hash, etc.).
 static void emit_load_x(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool update) {
     const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
     emit_ea_x(c, ra, rb);
     c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_call(import_idx);
+
+    if (g_mem1_base == 0u) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_call(import_idx);
+        bemental::perf_runtime::inc(bemental::PERF_SLOT_FASTMEM_SLOW);
+    } else {
+        // Runtime range check — emits one compare + one branch per load.
+        // The fastmem-hits/fastmem-slow counters live on the runtime side;
+        // here we only count the compile-time decision for "fastmem path
+        // emitted". Per-iter dynamic counts could be added later by
+        // incrementing inside the fast/slow arms via SAB atomics.
+        bemental::perf_runtime::inc(bemental::PERF_SLOT_FASTMEM_HITS);
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x01FFFFFF);
+        c.b.op_i32_and();
+        c.b.op_local_tee(LOCAL_TMP_B);            // phys offset
+        c.b.op_i32_const((s32)g_ram_size);
+        c.b.op_i32_lt_u();
+        c.b.op_if(WASM_TYPE_I32);                 // (result i32)
+            // Fast path: direct linear-memory load + bswap.
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const((s32)g_mem1_base);
+            c.b.op_i32_add();
+            if (import_idx == WIMPORT_READ32) {
+                c.b.op_i32_load(0);
+                c.b.op_local_tee(LOCAL_TMP_B);
+                c.b.op_i32_const(24);
+                c.b.op_i32_shr_u();
+                c.b.op_local_get(LOCAL_TMP_B);
+                c.b.op_i32_const(8);
+                c.b.op_i32_shr_u();
+                c.b.op_i32_const(0xFF00);
+                c.b.op_i32_and();
+                c.b.op_i32_or();
+                c.b.op_local_get(LOCAL_TMP_B);
+                c.b.op_i32_const(8);
+                c.b.op_i32_shl();
+                c.b.op_i32_const(0xFF0000);
+                c.b.op_i32_and();
+                c.b.op_i32_or();
+                c.b.op_local_get(LOCAL_TMP_B);
+                c.b.op_i32_const(24);
+                c.b.op_i32_shl();
+                c.b.op_i32_or();
+            } else if (import_idx == WIMPORT_READ16) {
+                c.b.op_i32_load16_u(0);
+                c.b.op_local_tee(LOCAL_TMP_B);
+                c.b.op_i32_const(8);
+                c.b.op_i32_shr_u();
+                c.b.op_local_get(LOCAL_TMP_B);
+                c.b.op_i32_const(8);
+                c.b.op_i32_shl();
+                c.b.op_i32_or();
+                c.b.op_i32_const(0xFFFF);
+                c.b.op_i32_and();
+            } else {
+                c.b.op_i32_load8_u(0);
+            }
+        c.b.op_else();
+            // Slow path: ppc_read*(ea).
+            c.b.op_local_get(LOCAL_TMP_A);
+            c.b.op_call(import_idx);
+        c.b.op_end();
+    }
+
     if (sign_extend_h) {
         c.b.op_i32_const(16);
         c.b.op_i32_shl();
@@ -2677,9 +2748,6 @@ static void emit_load_x(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
         c.b.op_i32_shr_s();
     }
     c.b.op_local_set(LOCAL_TMP_B);
-    // Update RA first (TMP_A still holds EA), then store rt (legacy
-    // emit_gpr_set_impl clobbers TMP_A := rt's value). Same fix as
-    // emit_load_d in Phase 1.
     if (update && ra != 0) {
         c.b.op_local_get(LOCAL_TMP_A);
         emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
@@ -2688,14 +2756,77 @@ static void emit_load_x(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
     emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
 }
 
+// X-form store fastmem. Same structure as load, but the if is void-typed
+// because both arms produce no value (store consumes addr+val, import
+// returns void).
 static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
     emit_ea_x(c, ra, rb);
     c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
-    c.b.op_local_get(LOCAL_TMP_A);
-    emit_gpr_get_impl(c, rs, g_ctx_ptr);
-    c.b.op_call(import_idx);
+
+    if (g_mem1_base == 0u) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_gpr_get_impl(c, rs, g_ctx_ptr);
+        c.b.op_call(import_idx);
+        bemental::perf_runtime::inc(bemental::PERF_SLOT_FASTMEM_SLOW);
+    } else {
+        bemental::perf_runtime::inc(bemental::PERF_SLOT_FASTMEM_HITS);
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x01FFFFFF);
+        c.b.op_i32_and();
+        c.b.op_local_tee(LOCAL_TMP_B);
+        c.b.op_i32_const((s32)g_ram_size);
+        c.b.op_i32_lt_u();
+        c.b.op_if();                              // (result void)
+            // Fast: addr-host = mem1_base + phys; load val; bswap; store.
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const((s32)g_mem1_base);
+            c.b.op_i32_add();
+            emit_gpr_get_impl(c, rs, g_ctx_ptr);
+            if (import_idx == WIMPORT_WRITE32) {
+                c.b.op_local_tee(LOCAL_TMP_B);
+                c.b.op_i32_const(24);
+                c.b.op_i32_shr_u();
+                c.b.op_local_get(LOCAL_TMP_B);
+                c.b.op_i32_const(8);
+                c.b.op_i32_shr_u();
+                c.b.op_i32_const(0xFF00);
+                c.b.op_i32_and();
+                c.b.op_i32_or();
+                c.b.op_local_get(LOCAL_TMP_B);
+                c.b.op_i32_const(8);
+                c.b.op_i32_shl();
+                c.b.op_i32_const(0xFF0000);
+                c.b.op_i32_and();
+                c.b.op_i32_or();
+                c.b.op_local_get(LOCAL_TMP_B);
+                c.b.op_i32_const(24);
+                c.b.op_i32_shl();
+                c.b.op_i32_or();
+                c.b.op_i32_store(0);
+            } else if (import_idx == WIMPORT_WRITE16) {
+                c.b.op_local_tee(LOCAL_TMP_B);
+                c.b.op_i32_const(8);
+                c.b.op_i32_shr_u();
+                c.b.op_local_get(LOCAL_TMP_B);
+                c.b.op_i32_const(8);
+                c.b.op_i32_shl();
+                c.b.op_i32_or();
+                c.b.op_i32_const(0xFFFF);
+                c.b.op_i32_and();
+                c.b.op_i32_store16(0);
+            } else {
+                c.b.op_i32_store8(0);
+            }
+        c.b.op_else();
+            // Slow: ppc_write*(ea, val).
+            c.b.op_local_get(LOCAL_TMP_A);
+            emit_gpr_get_impl(c, rs, g_ctx_ptr);
+            c.b.op_call(import_idx);
+        c.b.op_end();
+    }
+
     if (update && ra != 0) {
         c.b.op_local_get(LOCAL_TMP_A);
         emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_A);
