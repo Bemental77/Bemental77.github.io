@@ -67,19 +67,17 @@ static void emit_perf_line(const char* test_id, u32 calls, u64 inner_total,
 }
 
 // ---------- Block walker ---------------------------------------------------
-// Decode forward from pc through guest memory, stopping at the first HARD
-// block terminator. Returns instruction count; *out_inst is filled with up
-// to 64 instructions.
+// Decode forward from pc through guest memory, stopping at the first block
+// terminator. Returns instruction count; *out_inst is filled with up to 64
+// instructions. Mirrors the JitWasm IsBlockTerminator predicate: opcodes
+// 16 (bc), 17 (sc), 18 (b), 19 (bclr/bcctr).
 //
-// Hard terminators end the trace:
-//   op 17  (sc)
-//   op 18  (b/bx)              — except no-op b whose target == pc+4
-//   op 19  (bclr/bcctr)
-// Conditional branch op 16 (bcx) is NOT a hard terminator — its fall-through
-// is always pc+4, so we can keep decoding past it; emit_body_into's
-// self-loop pass handles the self-loop case, and any post-bcx instructions
-// (e.g. trailing blr after a loop's natural exit) get inlined into the
-// same WASM function instead of becoming a separate dispatched block.
+// Note: the previous "extend through bcx" experiment (commit bcb3636) was
+// reverted because the post-loop emit path didn't handle b/bcx that the
+// existing build_block chain optimization drops, causing pc-divergence
+// against the live runtime PC tracker (visible in PSO probe logs as
+// `[jit] pc-divergence #N baked=X actual=X-4`). Self-loop detection now
+// requires the bcx to be the LAST instruction in the decoded block.
 static u32 decode_block(const u32* guest_mem, u32 pc, u32* out_inst, u32 max_inst) {
     const u32 base_word_idx = (pc - GUEST_MEM_BASE) / 4u;
     u32 i = 0;
@@ -87,24 +85,9 @@ static u32 decode_block(const u32* guest_mem, u32 pc, u32* out_inst, u32 max_ins
         const u32 inst = guest_mem[base_word_idx + i];
         out_inst[i] = inst;
         const u32 op = (inst >> 26) & 0x3Fu;
-        if (op == 17 || op == 19) {
+        if (op == 16 || op == 17 || op == 18 || op == 19) {
             ++i;
             break;
-        }
-        if (op == 18) {
-            // Stop at b unless it's a no-op (target == pc+4) — same
-            // chain-fallthrough collapse rule build_block uses.
-            const u32 cur_pc = pc + i * 4u;
-            const bool aa = (inst & 0x2) != 0;
-            s32 disp = static_cast<s32>(inst & 0x03FFFFFC);
-            if (disp & 0x02000000) disp |= 0xFC000000;
-            const u32 target = aa
-                ? static_cast<u32>(disp)
-                : static_cast<u32>(static_cast<s32>(cur_pc) + disp);
-            if (target != cur_pc + 4u) {
-                ++i;
-                break;
-            }
         }
     }
     return i;
