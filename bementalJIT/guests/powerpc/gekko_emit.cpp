@@ -170,36 +170,46 @@ static void emit_addis_impl(EmitCtx& c) {
 
 // addic rt, ra, simm   ; rt = ra + simm; XER.CA = unsigned-carry
 //   We compute rt and (sum < ra) for carry.
+//
+// B11 Phase 2 Task 5 — cat C (TMP_A reuse).
+// Invariant: after emit_gpr_set_impl(rt) in legacy mode, TMP_A is
+// rewritten to the same `sum` value that was in it before (the helper
+// pops the value and writes it back into TMP_A as part of its swap).
+// So TMP_A still holds sum for the CA compute below. In B11 mode,
+// emit_gpr_set_impl writes a different local (gpr_local[rt]) and leaves
+// TMP_A alone — same end state.
+//
+// Pre-existing semantic note (NOT introduced by this migration): when
+// rt == ra, the rt store overwrites memory, and the subsequent CA
+// compute reads the just-written memory. The CA bit is computed against
+// `sum` instead of original `ra` — wrong by spec (CA must use OLD rA).
+// The original emit had this bug; we preserve behavior. Real games rarely
+// alias rt==ra in addic.
 static void emit_addic_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
-    // tmp_a = ra + simm
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    // sum = ra + simm; tee into TMP_A so the CA compute below has it
+    // even after the rt store potentially clobbers TMP_A in legacy mode.
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_const(simm);
     c.b.op_i32_add();
     c.b.op_local_tee(LOCAL_TMP_A);
-    // store rt
-    c.b.op_local_set(LOCAL_TMP_B);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_local_get(LOCAL_TMP_B);
-    c.b.op_i32_store(ppc_off::gpr(rt));
-    // CA = (tmp < (u32)ra) — unsigned overflow
+    emit_gpr_set_impl(c, rt, g_ctx_ptr);  // legacy clobbers TMP_A := sum (idempotent)
+    // CA = (sum < ra) unsigned. Pre-push CTX for the i32.store8 below.
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(ra));
+    emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_lt_u();
     c.b.op_i32_store8(ppc_off::XER_CA);
 }
 
 // addic. — addic with Rc=1 (set CR0 from result)
+// B11 Phase 2 Task 5 — cat C. After emit_addic_impl, TMP_A holds sum
+// (in both modes), so we just reuse it directly instead of re-reading
+// gpr[rt] from memory.
 static void emit_addic_rc_impl(EmitCtx& c) {
     emit_addic_impl(c);
-    // After the store the result is in tmp_a (still set above). Use it for CR0.
-    const u32 rt = RT(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rt));
+    c.b.op_local_get(LOCAL_TMP_A);
     emit_set_cr0(c, CTX);
 }
 
@@ -299,15 +309,14 @@ static void emit_cmpli_impl(EmitCtx& c) {
 
 // ori rs, ra, uimm     ; ra = rs | uimm
 // Note: PPC encoding has RS in the RT slot; "ra" here is the destination.
+// B11 Phase 2 Task 6 — cat A. Covers ori/oris/xori/xoris.
 static void emit_logical_imm(EmitCtx& c, u32 wasm_op_byte, bool high) {
     const u32 rs = RT(c.inst), ra = RA(c.inst);
     const u32 imm = UIMM_16(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_const((s32)(high ? (imm << 16) : imm));
     c.b.emitByte(wasm_op_byte); // i32_or / i32_and / i32_xor
-    c.b.op_i32_store(ppc_off::gpr(ra));
+    emit_gpr_set_impl(c, ra, g_ctx_ptr);
 }
 
 static void emit_ori_impl  (EmitCtx& c) { emit_logical_imm(c, wop::i32_or,  false); }
@@ -316,19 +325,17 @@ static void emit_xori_impl (EmitCtx& c) { emit_logical_imm(c, wop::i32_xor, fals
 static void emit_xoris_impl(EmitCtx& c) { emit_logical_imm(c, wop::i32_xor, true);  }
 
 // andi. / andis. — same as ori/oris but AND, and CR0 is set from result.
+// B11 Phase 2 Tasks 7-8 — cat B (TMP_A holds result; emit_gpr_set_impl
+// in legacy clobbers TMP_A := same result, idempotent).
 static void emit_andi_rc_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst);
     const u32 imm = UIMM_16(c.inst);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_const((s32)imm);
     c.b.op_i32_and();
     c.b.op_local_tee(LOCAL_TMP_A);
-    c.b.op_drop();
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_store(ppc_off::gpr(ra));
-    // CR0 from result
+    emit_gpr_set_impl(c, ra, g_ctx_ptr);
+    // CR0 from result (TMP_A still holds it).
     c.b.op_local_get(LOCAL_TMP_A);
     emit_set_cr0(c, CTX);
 }
@@ -336,15 +343,11 @@ static void emit_andi_rc_impl(EmitCtx& c) {
 static void emit_andis_rc_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst);
     const u32 imm = (u32)UIMM_16(c.inst) << 16;
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::gpr(rs));
+    emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_const((s32)imm);
     c.b.op_i32_and();
     c.b.op_local_tee(LOCAL_TMP_A);
-    c.b.op_drop();
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_store(ppc_off::gpr(ra));
+    emit_gpr_set_impl(c, ra, g_ctx_ptr);
     c.b.op_local_get(LOCAL_TMP_A);
     emit_set_cr0(c, CTX);
 }
