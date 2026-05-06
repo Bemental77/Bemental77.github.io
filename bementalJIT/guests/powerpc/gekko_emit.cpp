@@ -3511,17 +3511,20 @@ static void emit_body_into(WasmModuleBuilder& b,
     // to start_pc" and wrap the body in WASM `loop` + `br_if 0` so the
     // entire iter chain runs inside ONE function call. Eliminates the
     // per-iter dispatch round-trip that caps T1b/T1c/T1e at 0.7-4% native.
-    // B11 GPR cache is disabled inside the self-loop because the cache's
-    // "first emit = memory load + tee local" pattern would corrupt the
-    // local on iter 2's re-entry. With B11 off, every gpr access is
-    // memory; correct, slightly slower. Future refinement: emit a flush
-    // at the back-edge, then re-load on entry.
+    //
+    // B11 GPR cache CAN be active inside the loop provided we flush dirty
+    // locals BEFORE the back-edge `br_if 0`. The compiler emits the first
+    // read of each gpr_i in the body as "memory load + tee local" because
+    // `gpr_loaded[i]==false` at start of body. Subsequent reads in the
+    // same iter use `local.get`. At end of iter we flush dirty locals to
+    // memory; on the next iter's re-entry, memory is current, so the
+    // first re-emitted "memory load + tee" sees the right value. This
+    // preserves B11's intra-iter savings (multiple reads of same gpr →
+    // one memory load) while staying correct across the back-edge.
     bool emitted_terminator = false;
     u32 self_loop_fallthrough_pc = 0;
     if (count >= 2 && detect_self_loop(insts, count, instr_pcs, start_pc,
                                        &self_loop_fallthrough_pc)) {
-        const bool saved_use_gpr_locals = ctx.use_gpr_locals;
-        ctx.use_gpr_locals = false;
         b.op_loop(0x40);
             for (u32 i = 0; i + 1 < count; ++i) {
                 ctx.pc = instr_pcs ? instr_pcs[i] : (start_pc + i * 4u);
@@ -3536,6 +3539,10 @@ static void emit_body_into(WasmModuleBuilder& b,
                     break;
                 }
             }
+            // Flush dirty GPR locals BEFORE the back-edge so memory is
+            // current when the next iter's first emit-time-memory-read
+            // executes.
+            emit_flush_dirty_gprs_impl(ctx, g_ctx_ptr);
             // Set ctx.pc to the terminator's PC so emit_self_loop_terminator
             // sees the right context.
             ctx.pc = instr_pcs ? instr_pcs[count - 1]
@@ -3547,7 +3554,6 @@ static void emit_body_into(WasmModuleBuilder& b,
         // through to the trailing flush + return below.
         emit_set_pc(ctx, g_ctx_ptr, self_loop_fallthrough_pc);
         emitted_terminator = true;       // we wrote PC explicitly
-        ctx.use_gpr_locals = saved_use_gpr_locals;
     } else {
     for (u32 i = 0; i < count; ++i) {
         ctx.pc = instr_pcs ? instr_pcs[i] : (start_pc + i * 4u);
