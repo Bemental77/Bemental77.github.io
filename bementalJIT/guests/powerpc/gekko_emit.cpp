@@ -52,6 +52,14 @@ u32 g_ctx_ptr = 0;
 static u32 g_mem1_base = 0;
 static u32 g_mem1_mask = 0;
 static u32 g_ram_size  = 0;
+// True when the per-block trust DFA proved every D-form load/store base
+// register is r1/r2/r13-derived. When true, emit_load_d/emit_store_d
+// skip the runtime range check and emit the direct linear-memory access
+// directly. When false but mem1_base != 0, they emit the runtime range
+// check + fastmem-on-hit pattern (analogous to emit_load_x). Pre-
+// no-liftoff this was Liftoff-perf-cliff-bound; with TurboFan-only the
+// if-result-i32 cliff is gone.
+static bool g_mem1_safe = false;
 
 // ---------------------------------------------------------------------------
 // B11 GPR-local cache helper bodies. Forward-declared in gekko_emit.h.
@@ -435,20 +443,17 @@ static void emit_load_d(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
     c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
 
-    // Compile-time gate: per-block DFA in build_block sets g_mem1_base to
-    // the host's MEM1 base ONLY when all loads in the block are proven
-    // MEM1-targeting (base register is r1/r2/r13 or computed from one).
-    // Otherwise g_mem1_base=0 → trampoline whole block. This avoids the
-    // Liftoff perf cliff that hits if/else (result i32) per-load.
-    if (g_mem1_base == 0u) {
-        c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_call(import_idx);
-    } else {
-        c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_i32_const(0x017FFFFF);
-        c.b.op_i32_and();
-        c.b.op_i32_const((s32)g_mem1_base);
-        c.b.op_i32_add();
+    // Three-way fastmem dispatch:
+    //   (a) g_mem1_base == 0          → caller provided no fastmem base; import
+    //   (b) g_mem1_base != 0 && g_mem1_safe → trust DFA proved MEM1; direct load
+    //   (c) g_mem1_base != 0 && !g_mem1_safe → runtime range check then direct
+    //                                          or import (analogous to emit_load_x)
+    //
+    // Path (c) was previously path (a) — every D-form in an "untrusted" block
+    // hit the JS import. With --no-liftoff the if-result-i32 cliff is gone,
+    // so the runtime check is cheap. Untrusted-block r32 calls drop
+    // dramatically when most of the addresses ARE in MEM1.
+    auto emit_direct_load_post = [&]() {
         if (import_idx == WIMPORT_READ32) {
             c.b.op_i32_load(0);
             c.b.op_local_tee(LOCAL_TMP_B);
@@ -484,6 +489,41 @@ static void emit_load_d(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
         } else {
             c.b.op_i32_load8_u(0);
         }
+    };
+    if (g_mem1_base == 0u) {
+        // (a) No fastmem base provided; full import.
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_call(import_idx);
+    } else if (g_mem1_safe) {
+        // (b) Trust DFA passed; direct load with mask + add (no runtime branch).
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x017FFFFF);
+        c.b.op_i32_and();
+        c.b.op_i32_const((s32)g_mem1_base);
+        c.b.op_i32_add();
+        emit_direct_load_post();
+    } else {
+        // (c) Untrusted block; runtime range check (matches emit_load_x).
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x1F000000);
+        c.b.op_i32_and();
+        c.b.op_i32_eqz();                          // high mirror byte OK
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x01FFFFFF);
+        c.b.op_i32_and();
+        c.b.op_local_tee(LOCAL_TMP_B);             // phys offset
+        c.b.op_i32_const((s32)g_ram_size);
+        c.b.op_i32_lt_u();
+        c.b.op_i32_and();
+        c.b.op_if(WASM_TYPE_I32);
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const((s32)g_mem1_base);
+            c.b.op_i32_add();
+            emit_direct_load_post();
+        c.b.op_else();
+            c.b.op_local_get(LOCAL_TMP_A);
+            c.b.op_call(import_idx);
+        c.b.op_end();
     }
 
     if (sign_extend_h) {
@@ -528,16 +568,8 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
     c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
 
-    if (g_mem1_base == 0u) {
-        c.b.op_local_get(LOCAL_TMP_A);
-        emit_gpr_get_impl(c, rs, g_ctx_ptr);
-        c.b.op_call(import_idx);
-    } else {
-        c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_i32_const(0x017FFFFF);
-        c.b.op_i32_and();
-        c.b.op_i32_const((s32)g_mem1_base);
-        c.b.op_i32_add();
+    auto emit_direct_store_post_with_addr_on_stack = [&]() {
+        // Stack on entry: [host_addr]. Push value, bswap if needed, store.
         emit_gpr_get_impl(c, rs, g_ctx_ptr);
         if (import_idx == WIMPORT_WRITE32) {
             c.b.op_local_tee(LOCAL_TMP_B);
@@ -574,6 +606,43 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
         } else {
             c.b.op_i32_store8(0);
         }
+    };
+    if (g_mem1_base == 0u) {
+        // (a) No fastmem base; full import.
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_gpr_get_impl(c, rs, g_ctx_ptr);
+        c.b.op_call(import_idx);
+    } else if (g_mem1_safe) {
+        // (b) Trust DFA passed; direct store with mask + add.
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x017FFFFF);
+        c.b.op_i32_and();
+        c.b.op_i32_const((s32)g_mem1_base);
+        c.b.op_i32_add();
+        emit_direct_store_post_with_addr_on_stack();
+    } else {
+        // (c) Untrusted block; runtime range check.
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x1F000000);
+        c.b.op_i32_and();
+        c.b.op_i32_eqz();
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x01FFFFFF);
+        c.b.op_i32_and();
+        c.b.op_local_tee(LOCAL_TMP_B);
+        c.b.op_i32_const((s32)g_ram_size);
+        c.b.op_i32_lt_u();
+        c.b.op_i32_and();
+        c.b.op_if();                              // (result void)
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const((s32)g_mem1_base);
+            c.b.op_i32_add();
+            emit_direct_store_post_with_addr_on_stack();
+        c.b.op_else();
+            c.b.op_local_get(LOCAL_TMP_A);
+            emit_gpr_get_impl(c, rs, g_ctx_ptr);
+            c.b.op_call(import_idx);
+        c.b.op_end();
     }
 
     if (update && ra != 0) {
@@ -3495,7 +3564,12 @@ static void emit_body_into(WasmModuleBuilder& b,
                 if (ra != 0u) trust &= ~(1u << ra);
             }
         }
-        g_mem1_base = block_safe ? mem1_base : 0u;
+        // Keep g_mem1_base populated regardless of trust DFA result —
+        // emit_load_d / emit_store_d use g_mem1_safe to choose between
+        // compile-time-direct and runtime-check fastmem paths. Setting
+        // g_mem1_base to 0 only when the caller didn't provide one.
+        g_mem1_base = mem1_base;
+        g_mem1_safe = block_safe;
     }
     g_mem1_mask = mem1_mask;
     g_ram_size  = ram_size;
