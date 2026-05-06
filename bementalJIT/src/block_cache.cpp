@@ -32,7 +32,8 @@ namespace powerpc {
                                     u32 ram_size,
                                     const u32* instr_pcs,
                                     LocalIdxLookupFn lookup_fn,
-                                    const void* lookup_user);
+                                    const void* lookup_user,
+                                    bool emit_hle_check = true);
 }
 
 int compile_raw(const u8* bytes, std::size_t size) {

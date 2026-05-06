@@ -3444,7 +3444,8 @@ static void emit_body_into(WasmModuleBuilder& b,
                            u32 mem1_base, u32 mem1_mask, u32 ram_size,
                            const u32* instr_pcs,
                            LocalIdxLookupFn lookup_fn,
-                           const void* lookup_user) {
+                           const void* lookup_user,
+                           bool emit_hle_check_prologue) {
     g_ctx_ptr = ctx_ptr_const;
     // Per-block DFA: walk the block's instructions, track which GPRs are
     // "trusted" as MEM1 pointers. Trusted baselines: r1 (stack), r2 (TOC),
@@ -3527,7 +3528,10 @@ static void emit_body_into(WasmModuleBuilder& b,
     ctx.use_gpr_locals = true;
 
     // HLE function-hooking check at the very start of every block.
-    {
+    // Skipped when caller has pre-verified that no HLE hook matches
+    // start_pc — saves one JS round-trip per block dispatch on the
+    // ~95% of PCs that aren't HLE-patched.
+    if (emit_hle_check_prologue) {
         b.op_i32_const((s32)start_pc);
         b.op_call(WIMPORT_HLE_CHECK);
         b.op_if(WASM_TYPE_I32);
@@ -3749,7 +3753,8 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     b.beginFuncBody();
     emit_body_into(b, start_pc, insts, count, ctx_ptr_const,
                    mem1_base, mem1_mask, ram_size, instr_pcs,
-                   /*lookup_fn=*/nullptr, /*lookup_user=*/nullptr);
+                   /*lookup_fn=*/nullptr, /*lookup_user=*/nullptr,
+                   /*emit_hle_check=*/true);
     b.endFuncBody();
     b.endSection();
 
@@ -3769,12 +3774,13 @@ std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
                                 u32 mem1_base, u32 mem1_mask, u32 ram_size,
                                 const u32* instr_pcs,
                                 LocalIdxLookupFn lookup_fn,
-                                const void* lookup_user) {
+                                const void* lookup_user,
+                                bool emit_hle_check) {
     WasmModuleBuilder b;
     b.beginFuncBody();
     emit_body_into(b, start_pc, insts, count, ctx_ptr_const,
                    mem1_base, mem1_mask, ram_size, instr_pcs,
-                   lookup_fn, lookup_user);
+                   lookup_fn, lookup_user, emit_hle_check);
     b.endFuncBody();
     auto bytes = b.getBytes();
     verify_block_can_advance_pc(bytes, start_pc);

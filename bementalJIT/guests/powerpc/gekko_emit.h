@@ -283,13 +283,23 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
 //
 // Same per-block DFA + ctx_ptr/mem1 conventions as build_block.
 // ---------------------------------------------------------------------------
+// `emit_hle_check` controls whether the body opens with a call to
+// WIMPORT_HLE_CHECK. The check runs HLE::TryReplaceFunction +
+// HLE::GetHookByAddress on every block entry — for PCs known
+// (compile-time) to NOT be HLE-patched, the check is a wasted JS
+// round-trip. Caller passes false when it has already verified that
+// no HLE hook matches `start_pc`. Default true preserves legacy
+// behavior. SAB measurement (2026-05-06): hle_check fires ~7.5x per
+// dispatch on real-game; gating eliminates JS round-trips on the
+// ~95% of unpatched PCs.
 std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
                                 u32 ctx_ptr_const,
                                 u32 mem1_base = 0, u32 mem1_mask = 0,
                                 u32 ram_size = 0,
                                 const u32* instr_pcs = nullptr,
                                 LocalIdxLookupFn lookup_fn = nullptr,
-                                const void* lookup_user = nullptr);
+                                const void* lookup_user = nullptr,
+                                bool emit_hle_check = true);
 
 // ---------------------------------------------------------------------------
 // Multi-module region build. Wraps N concatenated function bodies into a
