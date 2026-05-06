@@ -2682,19 +2682,26 @@ static void emit_load_x(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
         c.b.op_call(import_idx);
         bemental::perf_runtime::inc(bemental::PERF_SLOT_FASTMEM_SLOW);
     } else {
-        // Runtime range check — emits one compare + one branch per load.
-        // The fastmem-hits/fastmem-slow counters live on the runtime side;
-        // here we only count the compile-time decision for "fastmem path
-        // emitted". Per-iter dynamic counts could be added later by
-        // incrementing inside the fast/slow arms via SAB atomics.
+        // Runtime range check — TWO conditions, both must be true:
+        //   1. (addr & 0x1F000000) == 0  ⇔ high byte ∈ {0x00, 0x80, 0xC0}
+        //      (the three MEM1 mirrors). Excludes MMIO at 0xCC000000+.
+        //   2. (addr & 0x01FFFFFF) < ram_size — within MEM1 size.
+        // Without check (1), MMIO addresses like 0xCC003004 (PI) collapse
+        // onto MEM1 + 0x3004 and skip the MMIO handler — the regression
+        // that broke SAB's RunQueueBits / interrupt path.
         bemental::perf_runtime::inc(bemental::PERF_SLOT_FASTMEM_HITS);
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x1F000000);
+        c.b.op_i32_and();
+        c.b.op_i32_eqz();                          // high mirror byte OK
         c.b.op_local_get(LOCAL_TMP_A);
         c.b.op_i32_const(0x01FFFFFF);
         c.b.op_i32_and();
-        c.b.op_local_tee(LOCAL_TMP_B);            // phys offset
+        c.b.op_local_tee(LOCAL_TMP_B);             // phys offset
         c.b.op_i32_const((s32)g_ram_size);
         c.b.op_i32_lt_u();
-        c.b.op_if(WASM_TYPE_I32);                 // (result i32)
+        c.b.op_i32_and();                          // both must be true
+        c.b.op_if(WASM_TYPE_I32);                  // (result i32)
             // Fast path: direct linear-memory load + bswap.
             c.b.op_local_get(LOCAL_TMP_B);
             c.b.op_i32_const((s32)g_mem1_base);
@@ -2771,14 +2778,20 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
         c.b.op_call(import_idx);
         bemental::perf_runtime::inc(bemental::PERF_SLOT_FASTMEM_SLOW);
     } else {
+        // See emit_load_x — two-condition range check excludes MMIO.
         bemental::perf_runtime::inc(bemental::PERF_SLOT_FASTMEM_HITS);
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x1F000000);
+        c.b.op_i32_and();
+        c.b.op_i32_eqz();
         c.b.op_local_get(LOCAL_TMP_A);
         c.b.op_i32_const(0x01FFFFFF);
         c.b.op_i32_and();
         c.b.op_local_tee(LOCAL_TMP_B);
         c.b.op_i32_const((s32)g_ram_size);
         c.b.op_i32_lt_u();
-        c.b.op_if();                              // (result void)
+        c.b.op_i32_and();
+        c.b.op_if();                               // (result void)
             // Fast: addr-host = mem1_base + phys; load val; bswap; store.
             c.b.op_local_get(LOCAL_TMP_B);
             c.b.op_i32_const((s32)g_mem1_base);
