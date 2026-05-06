@@ -34,21 +34,27 @@ function summarize(events) {
         runStart = runStart === null ? e.ts : Math.min(runStart, e.ts);
         runEnd   = runEnd   === null ? e.ts : Math.max(runEnd,   e.ts);
         const name = e.name || '';
-        // V8 names these depending on version: wasm.CompileBaseline,
-        // wasm.CompileTopTier, wasm.CompileCode, wasm.OptimizeCode,
-        // wasm.Instantiate, wasm.Decode. Match generously.
-        if (/^wasm\.Compile(Baseline|Code)$/.test(name)) {
+        // Actual V8 wasm event names (verified against M138 trace dumps):
+        //   wasm.CompileLazy / wasm.CompileBaseline  → Liftoff baseline
+        //   wasm.TopTierCompilation                  → TurboFan tier-up
+        //   wasm.SyncInstantiate / SyncCompile       → instance-level
+        //   wasm.DecodeWasmModule                    → decode
+        if (name === 'wasm.CompileBaseline' || name === 'wasm.CompileLazy') {
             result.wasm_compile++;
             if (result.first_compile_us === null) result.first_compile_us = e.ts;
             if (typeof e.dur === 'number') result.total_compile_dur_us += e.dur;
-        } else if (/^wasm\.(Optimize|CompileTopTier)/.test(name)) {
+        } else if (name === 'wasm.TopTierCompilation' ||
+                   name === 'V8.OptimizeCode' ||
+                   /^wasm\.OptimizeCode/.test(name)) {
             result.wasm_optimize++;
             if (result.first_optimize_us === null) result.first_optimize_us = e.ts;
             result.last_optimize_us = e.ts;
             if (typeof e.dur === 'number') result.total_optimize_dur_us += e.dur;
-        } else if (/^wasm\.Instantiate/.test(name)) {
+        } else if (name === 'wasm.SyncInstantiate' ||
+                   /^wasm\.Instantiate/.test(name)) {
             result.wasm_instantiate++;
-        } else if (/^wasm\.Decode/.test(name)) {
+        } else if (name === 'wasm.DecodeWasmModule' ||
+                   /^wasm\.Decode/.test(name)) {
             result.wasm_decode++;
         }
     }

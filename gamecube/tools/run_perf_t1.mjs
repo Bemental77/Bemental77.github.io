@@ -44,10 +44,27 @@ function startServer() {
 (async () => {
     const srv = await startServer();
     console.log('[t1-probe] server up on :' + PORT);
+    // V8 WASM flags. Default = unset (Liftoff dynamic-tiering, V8 default).
+    // Override via T1_JS_FLAGS — useful values:
+    //   --no-wasm-dynamic-tiering   eager TurboFan tier-up on bg thread
+    //   --no-liftoff                TurboFan-only synchronous compile
+    //   --wasm-tier-up=false        disable tier-up entirely (Liftoff stays)
+    //
+    // Note (per measurement 2026-05-05): eager tier-up REGRESSES 15-20% on
+    // T1 because per-block modules pay TurboFan compile-thread contention
+    // without the long-lived single-module-per-region prerequisite that
+    // amortizes the cost. Lever #3 (tier-up) needs lever #2 (block-link
+    // patching → multi-block-per-WASM-fn) to land first.
+    const jsFlags = process.env.T1_JS_FLAGS || '';
     const browser = await puppeteer.launch({
         executablePath: CHROME,
         headless: 'new',
-        args: ['--no-sandbox', '--enable-features=SharedArrayBuffer', '--disable-dev-shm-usage'],
+        args: [
+            '--no-sandbox',
+            '--enable-features=SharedArrayBuffer',
+            '--disable-dev-shm-usage',
+            ...(jsFlags ? ['--js-flags=' + jsFlags] : []),
+        ],
         protocolTimeout: TIMEOUT_MS + 30000,
     });
     const page = await browser.newPage();
@@ -64,6 +81,30 @@ function startServer() {
     });
     page.on('pageerror', (err) => console.error('[t1-probe] pageerror: ' + err.message));
 
+    // Capture chrome://tracing JSON so wasm-trace-summary.mjs can confirm
+    // TurboFan tier-up events. Start BEFORE page.goto so the page-load
+    // compile events (where most WASM compilation happens) are captured.
+    // Default ON; disable via T1_NO_TRACE=1.
+    const tracePath = process.env.T1_TRACE_PATH || '/tmp/t1-trace.json';
+    const captureTrace = !process.env.T1_NO_TRACE;
+    if (captureTrace) {
+        try {
+            await page.tracing.start({
+                path: tracePath,
+                categories: [
+                    'v8',
+                    'v8.execute',
+                    'v8.wasm',
+                    'disabled-by-default-v8.compile',
+                    'disabled-by-default-v8.wasm',
+                    'disabled-by-default-v8.wasm.detailed',
+                ],
+            });
+        } catch (e) {
+            console.error('[t1-probe] tracing.start failed: ' + e.message);
+        }
+    }
+
     await page.goto(`http://127.0.0.1:${PORT}/test_perf_t1.html`, { waitUntil: 'load', timeout: 60000 });
 
     // Test exits naturally with EXIT_RUNTIME=1 once main() returns; wait for
@@ -72,6 +113,11 @@ function startServer() {
     while (Date.now() - t0 < TIMEOUT_MS) {
         if (lines.some(l => l.includes('[wild-perf summary]'))) break;
         await new Promise(r => setTimeout(r, 250));
+    }
+
+    if (captureTrace) {
+        try { await page.tracing.stop(); console.log('[t1-probe] trace → ' + tracePath); }
+        catch (e) { console.error('[t1-probe] tracing.stop failed: ' + e.message); }
     }
 
     await browser.close();
