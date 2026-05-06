@@ -47,11 +47,29 @@ Region classify(u32 pc);
 // function-entry format (5-byte LEB128 size prefix + locals + ops +
 // 0x0B end) — exactly what WasmModuleBuilder produces between
 // beginFuncBody() and endFuncBody().
+// Source inputs needed to re-emit a single block at region_relink time
+// with a different (typically more complete) lookup_fn. region_accumulate
+// stores these alongside the body bytes; region_relink optionally re-emits
+// every block before building the merged module so back-edge / forward
+// cross-block branches can resolve to local fn indices and emit
+// return_call_indirect (V8-inline-able intra-instance tail call) instead
+// of the slow set_pc + return path.
+struct BlockEmitInputs {
+    u32                             start_pc      = 0;
+    u32                             ctx_ptr_const = 0;
+    u32                             mem1_base     = 0;
+    u32                             mem1_mask     = 0;
+    u32                             ram_size      = 0;
+    std::vector<u32>                insts;          // raw guest opcodes
+    std::vector<u32>                instr_pcs;      // parallel PC array
+};
+
 struct RegionState {
     std::vector<u8>                 fn_bodies_concat;
     u32                             n_funcs           = 0;
     std::vector<u32>                pc_keys;            // pc[i] -> local fn idx i
     std::unordered_map<u32, u32>    pc_to_idx;          // O(1) reverse lookup
+    std::vector<BlockEmitInputs>    block_records;      // for re-emit at relink
     u32                             blocks_since_link = 0;
     double                          last_accum_ms     = 0.0;
     int                             module_handle     = -1;
@@ -118,8 +136,16 @@ public:
     // is a single function-entry as produced by WasmModuleBuilder
     // (beginFuncBody → ... → endFuncBody): 5-byte LEB128 size prefix +
     // locals decl + ops + 0x0B end.
+    //
+    // When `inputs` is non-null, the BlockCache stores a copy of the
+    // emit inputs so region_relink can re-emit this block with the now-
+    // complete pc_to_idx map (delivers lever #2 — branches that targeted
+    // unknown PCs at first emit get rewritten to local-fn-idx
+    // return_call_indirect on relink). When `inputs` is null, the body is
+    // baked permanently and relink can only rebuild from concat bytes.
     void region_accumulate(Region r, u32 pc,
-                           const u8* body_bytes, std::size_t body_size);
+                           const u8* body_bytes, std::size_t body_size,
+                           const BlockEmitInputs* inputs = nullptr);
 
     // Threshold check. True when:
     //   ≥64 blocks accumulated since last re-link, OR

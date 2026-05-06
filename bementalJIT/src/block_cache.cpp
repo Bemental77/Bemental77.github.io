@@ -20,6 +20,19 @@ namespace powerpc {
                                         std::size_t concatenated_size,
                                         u32 n_funcs,
                                         u32 mem_pages);
+
+    // Forward-declared LocalIdxLookupFn must match the typedef in
+    // guests/powerpc/gekko_emit.h. Kept here as a bare typedef so we don't
+    // pull the whole guest header into block_cache.cpp.
+    using LocalIdxLookupFn = bool(*)(const void* user, u32 target_pc, u32* out_local_idx);
+
+    std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
+                                    u32 ctx_ptr_const,
+                                    u32 mem1_base, u32 mem1_mask,
+                                    u32 ram_size,
+                                    const u32* instr_pcs,
+                                    LocalIdxLookupFn lookup_fn,
+                                    const void* lookup_user);
 }
 
 int compile_raw(const u8* bytes, std::size_t size) {
@@ -443,15 +456,17 @@ static double now_ms() {
 }
 
 void BlockCache::region_accumulate(Region r, u32 pc,
-                                   const u8* body_bytes, std::size_t body_size) {
+                                   const u8* body_bytes, std::size_t body_size,
+                                   const BlockEmitInputs* inputs) {
     if (r >= REGION_COUNT) return;
     if (body_bytes == nullptr || body_size == 0) return;
     RegionState& rs = m_regions[r];
 
     // Dedup: if this pc is already accumulated, skip. The first emission
-    // is canonical for the region's current generation. (Phase 7 might
-    // re-emit dirty bodies at re-link time to upgrade unresolved branches
-    // — that path would clear the region first.)
+    // is canonical for the region's current generation. region_relink
+    // re-emits each block with the up-to-date pc_to_idx map so first-emit
+    // unresolved branches get rewritten on relink without us having to
+    // re-accumulate.
     if (rs.pc_to_idx.find(pc) != rs.pc_to_idx.end()) return;
 
     // Append the body verbatim. body_bytes is in code-section function-entry
@@ -463,6 +478,13 @@ void BlockCache::region_accumulate(Region r, u32 pc,
                                body_bytes, body_bytes + body_size);
     rs.pc_keys.push_back(pc);
     rs.pc_to_idx.emplace(pc, local_idx);
+    // Save emit inputs for re-emit at relink. Only if the caller provided
+    // them — legacy callers without re-emit support pass null.
+    if (inputs != nullptr) {
+        rs.block_records.push_back(*inputs);
+    } else {
+        rs.block_records.emplace_back();  // placeholder; relink falls back to concat
+    }
     rs.n_funcs           += 1u;
     rs.blocks_since_link += 1u;
     rs.last_accum_ms      = now_ms();
@@ -536,10 +558,66 @@ bool BlockCache::region_should_relink(Region r) const {
     return false;
 }
 
+// LocalIdxLookupFn closure that reads from a region's pc_to_idx map.
+// Used during region_relink's re-emit pass so emit_block_body can resolve
+// any pc that has been accumulated to its local fn idx, and emit
+// return_call_indirect to the merged module's internal table.
+namespace {
+    struct RegionLookupCtx {
+        const RegionState* rs;
+    };
+    bool region_lookup_for_emit(const void* user, u32 target_pc, u32* out_idx) {
+        const auto* ctx = static_cast<const RegionLookupCtx*>(user);
+        if (!ctx || !ctx->rs) return false;
+        auto it = ctx->rs->pc_to_idx.find(target_pc);
+        if (it == ctx->rs->pc_to_idx.end()) return false;
+        if (out_idx) *out_idx = it->second;
+        return true;
+    }
+}
+
 void BlockCache::region_relink(Region r, u32 mem_pages) {
     if (r >= REGION_COUNT) return;
     RegionState& rs = m_regions[r];
     if (rs.n_funcs == 0u) return;
+
+    // ---- Re-emit pass (lever #2 — block-link patching) ----
+    // The bodies in fn_bodies_concat were emitted at first-accumulate time
+    // when sibling blocks weren't yet known, so any cross-block branch
+    // baked the slow set-pc + return path. Re-emit each body now with the
+    // up-to-date pc_to_idx map: branches whose targets are in the map
+    // become return_call_indirect (intra-instance, V8-inline-able).
+    //
+    // Only fires when block_records are available (caller passed inputs to
+    // region_accumulate). When records are missing or empty, fall through
+    // to the legacy concat path.
+    bool have_records = (rs.block_records.size() == rs.n_funcs);
+    for (const auto& rec : rs.block_records) {
+        if (rec.insts.empty()) { have_records = false; break; }
+    }
+    if (have_records) {
+        rs.fn_bodies_concat.clear();
+        RegionLookupCtx ctx{ &rs };
+        for (u32 i = 0; i < rs.n_funcs; ++i) {
+            const BlockEmitInputs& rec = rs.block_records[i];
+            std::vector<u8> body = powerpc::emit_block_body(
+                rec.start_pc,
+                rec.insts.data(),
+                static_cast<u32>(rec.insts.size()),
+                rec.ctx_ptr_const,
+                rec.mem1_base, rec.mem1_mask, rec.ram_size,
+                rec.instr_pcs.data(),
+                &region_lookup_for_emit, &ctx);
+            rs.fn_bodies_concat.insert(rs.fn_bodies_concat.end(),
+                                       body.begin(), body.end());
+        }
+#ifdef __EMSCRIPTEN__
+        EM_ASM({
+            console.error('[worker] [bemental] region ' + $0
+                + ' re-emitted ' + $1 + ' bodies for relink (lever #2)');
+        }, (int)r, (int)rs.n_funcs);
+#endif
+    }
 
     // Build the merged-module bytes via the guest emitter.
     std::vector<u8> bytes = powerpc::build_region_module(
