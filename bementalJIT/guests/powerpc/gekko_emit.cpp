@@ -3276,20 +3276,20 @@ static void verify_block_can_advance_pc(const std::vector<u8>& body, u32 start_p
     }
 }
 
-// Self-loop detection. Scans the stream for ANY conditional branch (op 16,
-// no-AA, no-LK) whose target lies WITHIN this block AND whose BO encodes
-// a pattern expressible as `loop` + `br_if 0`. Returns the FIRST match
-// found (closest to start) so post-loop instructions can be inlined.
+// Self-loop detection. Scans the stream for a CTR-bounded conditional
+// branch (op 16 with BO=bdnz/bdz, no-AA, no-LK) whose target lies WITHIN
+// this block. Returns the FIRST match found (closest to start) so
+// post-loop instructions can be inlined.
 //
 // On success, sets:
 //   *out_bdnz_idx        index of the self-loop bcx in insts[]
 //   *out_loop_entry_idx  index of the back-branch target in insts[]
 //
-// Supported BO encodings:
-//   bdnz (BO=16): decrement-CTR, branch if CTR != 0
-//   bdz  (BO=18): decrement-CTR, branch if CTR == 0
-//   bne+ (BO=4):  branch on cr_bit false (BI selects CR bit)
-//   beq+ (BO=12): branch on cr_bit true
+// **Only bdnz/bdz are accepted.** CR-branches (bne+/beq+/bgt+/etc.)
+// are rejected because they may be MMIO-polling loops that deadlock if
+// wrapped in WASM `loop` — the dispatcher never gets control to fire
+// CoreTiming events the loop is waiting on. CTR-bounded loops can't
+// deadlock (CTR self-terminates after N iters regardless of side state).
 static bool detect_self_loop(const u32* insts, u32 count,
                              const u32* instr_pcs, u32 start_pc,
                              u32* out_bdnz_idx,
@@ -3314,8 +3314,9 @@ static bool detect_self_loop(const u32* insts, u32 count,
         const u32 bo = (inst >> 21) & 0x1Fu;
         const bool is_bdnz = (bo == 0b10000u);
         const bool is_bdz  = (bo == 0b10010u);
-        const bool is_cr_branch = ((bo & 0b10100u) == 0b00100u);
-        if (!is_bdnz && !is_bdz && !is_cr_branch) continue;
+        // CR-branches deliberately rejected: see header comment about
+        // MMIO-poll deadlock.
+        if (!is_bdnz && !is_bdz) continue;
         if (out_bdnz_idx)        *out_bdnz_idx        = i;
         if (out_loop_entry_idx)  *out_loop_entry_idx  = entry_idx;
         return true;
