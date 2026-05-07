@@ -1833,8 +1833,11 @@ static void emit_rlwnmx_impl(EmitCtx& c) {
 // bclr / bcctr — return / vtable-call. Native emit for the unconditional
 // (BO=20 = "branch always") form, which is overwhelmingly the common case
 // (every `blr` for function return; every `bctr` for vtable). Conditional
-// variants fall back. Profiling showed op19 was 60% of all interp calls
-// before this — native emit eliminates that hot path.
+// variants now also emit native (CR-bit forms only; CTR-decrement and LK
+// variants still fall back). Profiling showed op19 was 60% of all interp
+// calls before this — unconditional native emit took the bulk; the
+// conditional CR-bit form (bnelr/beqlr/...) handles the OS early-return
+// idiom (`bl OSDisable; cmplwi r3,0; bnelr`).
 //
 // blr (op=19, xo=16, BO=20):  target = LR. If LK then LR = pc+4.
 // bctr (op=19, xo=528, BO=20): target = CTR. If LK then LR = pc+4.
@@ -1865,26 +1868,101 @@ static void emit_indirect_branch_native(EmitCtx& c, u32 target_spr_idx) {
     c.b.op_return();
 }
 
+// Emit BO/BI decode for the CR-bit conditional form. Pushes 0/1 onto
+// the WASM stack (1 = condition true / take branch). Returns false if
+// the BO is not the supported "branch on CR-bit" form (BO matches
+// 0b001x0, where bit-0=1 inhibits CTR decrement, bit-2=1 inhibits CR
+// test). LK variants and CTR-decrementing forms are caller-fallback.
+//
+// Mirrors the CR-bit decode in emit_bcx_impl line ~813. Kept as a
+// shared helper so emit_bclrx_impl / emit_bcctrx_impl don't drift from
+// emit_bcx_impl's CR encoding.
+static bool emit_bc_cond_cr_to_stack(EmitCtx& c) {
+    const u32 bo = BO(c.inst);
+    const u32 bi = BI(c.inst);
+    // Same gate as emit_bcx_impl: BO must be 0b00x0x (no CTR decrement,
+    // no CTR test, branch-on-CR). LK falls back.
+    if (LK(c.inst) || (bo & 0b10100u) != 0b00100u) return false;
+
+    const bool branch_if_true = (bo & 0b01000u) != 0u;
+    const u32 field_idx = bi / 4u;
+    const u32 bit_in_field = bi % 4u;  // 0=LT, 1=GT, 2=EQ, 3=SO
+    switch (bit_in_field) {
+      case 0:  // LT: bit 62 of u64 = bit 30 of high u32
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::cr_field(field_idx) + 4);
+        c.b.op_i32_const(1 << 30);
+        c.b.op_i32_and();
+        c.b.op_i32_const(0);
+        c.b.op_i32_ne();
+        break;
+      case 1:  // GT: NOT LT AND NOT EQ
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::cr_field(field_idx) + 4);
+        c.b.op_i32_const(0x40000000);
+        c.b.op_i32_and();
+        c.b.op_i32_eqz();
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::cr_field(field_idx));
+        c.b.op_i32_const(0);
+        c.b.op_i32_ne();
+        c.b.op_i32_and();
+        break;
+      case 2:  // EQ: low 32 == 0
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::cr_field(field_idx));
+        c.b.op_i32_eqz();
+        break;
+      case 3:  // SO: bit 59 of u64 = bit 27 of high u32
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::cr_field(field_idx) + 4);
+        c.b.op_i32_const(1 << 27);
+        c.b.op_i32_and();
+        c.b.op_i32_const(0);
+        c.b.op_i32_ne();
+        break;
+    }
+    if (!branch_if_true) c.b.op_i32_eqz();
+    return true;
+}
+
 static void emit_bclrx_impl(EmitCtx& c) {
-    if (BO(c.inst) != 20u) {
-        // Conditional bclr (e.g., beqlr) — fallback.
+    if (BO(c.inst) == 20u) {
+        emit_indirect_branch_native(c, /*spr=*/8);  // LR
+        c.block_end = true;
+        return;
+    }
+    // Conditional bclr (bnelr/beqlr/bgtlr/bltlr/bnslr/...).
+    // Native emit: `if (cond) { pc=LR; flush; return; }` — block continues
+    // on the not-taken arm (bclr is normally followed by more code only
+    // in OS error-check idioms; for a function epilogue, the not-taken
+    // path leads into another return path further on).
+    if (!emit_bc_cond_cr_to_stack(c)) {
         emit_fallback(c);
         c.block_end = true;
         return;
     }
-    emit_indirect_branch_native(c, /*spr=*/8);  // LR
-    c.block_end = true;
+    emit_b11_op_if(c, /*no result*/ 0x40);
+        emit_indirect_branch_native(c, /*spr=*/8);  // LR
+    emit_b11_op_end(c);
+    // block_end stays false: not-taken path falls through to next instr.
 }
 
 static void emit_bcctrx_impl(EmitCtx& c) {
-    if (BO(c.inst) != 20u) {
-        // Conditional bcctr — fallback.
+    if (BO(c.inst) == 20u) {
+        emit_indirect_branch_native(c, /*spr=*/9);  // CTR
+        c.block_end = true;
+        return;
+    }
+    // Conditional bcctr — same shape as conditional bclr, target=CTR.
+    if (!emit_bc_cond_cr_to_stack(c)) {
         emit_fallback(c);
         c.block_end = true;
         return;
     }
-    emit_indirect_branch_native(c, /*spr=*/9);  // CTR
-    c.block_end = true;
+    emit_b11_op_if(c, /*no result*/ 0x40);
+        emit_indirect_branch_native(c, /*spr=*/9);  // CTR
+    emit_b11_op_end(c);
 }
 // rfi / sc — privileged; fallback + end block.
 static void emit_rfi_impl(EmitCtx& c)    { emit_fallback(c); c.block_end = true; }
