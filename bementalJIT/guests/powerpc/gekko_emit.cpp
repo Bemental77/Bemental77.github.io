@@ -3869,7 +3869,8 @@ static void emit_body_into(WasmModuleBuilder& b,
 std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
                             u32 ctx_ptr_const, u32 mem_pages,
                             u32 mem1_base, u32 mem1_mask, u32 ram_size,
-                            const u32* instr_pcs) {
+                            const u32* instr_pcs,
+                            bool emit_hle_check) {
     bemental::perf_runtime::inc(bemental::PERF_SLOT_BLOCK_EMIT);
     WasmModuleBuilder b;
     b.emitHeader();
@@ -3932,7 +3933,7 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     emit_body_into(b, start_pc, insts, count, ctx_ptr_const,
                    mem1_base, mem1_mask, ram_size, instr_pcs,
                    /*lookup_fn=*/nullptr, /*lookup_user=*/nullptr,
-                   /*emit_hle_check=*/true);
+                   emit_hle_check);
     b.endFuncBody();
     b.endSection();
 

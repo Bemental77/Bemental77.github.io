@@ -269,7 +269,8 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
                             u32 ctx_ptr_const, u32 mem_pages = 0,
                             u32 mem1_base = 0, u32 mem1_mask = 0,
                             u32 ram_size = 0,
-                            const u32* instr_pcs = nullptr);
+                            const u32* instr_pcs = nullptr,
+                            bool emit_hle_check = true);
 
 // ---------------------------------------------------------------------------
 // Body-only counterpart to build_block. Emits a single function entry
