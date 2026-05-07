@@ -84,4 +84,26 @@ if(BEMENTAL_GUEST_POWERPC)
         "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
     )
     target_compile_options(test_diff PRIVATE "-pthread")
+
+    # Repro for SAB PI-mask write miscompilation (sab_pi_mask_clobbered).
+    # Replays the exact 46-instruction byte sequence at 0x800e7bbc..0x800e7c70
+    # and asserts r5 == 0x77FF at the stw to PI_INTERRUPT_MASK.
+    add_executable(test_pi_mask_path test_pi_mask_path.cpp)
+    target_link_libraries(test_pi_mask_path PRIVATE bementalJIT bementalJITPowerPC)
+    target_include_directories(test_pi_mask_path PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(test_pi_mask_path PROPERTIES SUFFIX ".html")
+    target_link_options(test_pi_mask_path PRIVATE
+        "SHELL:-s EXIT_RUNTIME=1"
+        "SHELL:-pthread"
+        "SHELL:-s PTHREAD_POOL_SIZE=0"
+        "SHELL:-s INITIAL_MEMORY=33554432"
+        "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+        "SHELL:-s MAXIMUM_MEMORY=67108864"
+        "SHELL:-s ALLOW_TABLE_GROWTH=1"
+        "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+    )
+    target_compile_options(test_pi_mask_path PRIVATE "-pthread")
 endif()
