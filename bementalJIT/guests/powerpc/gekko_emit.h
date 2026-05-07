@@ -225,8 +225,37 @@ struct EmitCtx {
     // emit_gpr_set_impl fall back to direct memory access regardless
     // of `use_gpr_locals` because runtime may not take the path that
     // initialised the local. Tracked via the emit_b11_op_if/else/end
-    // wrappers that replace c.b.op_if/op_else/op_end calls in emitters.
+    // wrappers that replace c.b.op_if/op_end calls in emitters.
     u32 if_depth = 0;
+
+    // ---- Lever #2 — merged-region single-function mode ----
+    // When `merged_mode` is true, the body being emitted lives INSIDE
+    // a labeled WASM `block $b_K`, itself nested inside an outer
+    // `loop $L` whose body dispatches via `br_table` on the WASM global
+    // `entry_sel`. Intra-region branches resolved via `lookup_local_idx`
+    // emit `(i32.const K) (global.set entry_sel) (br br_to_loop_depth)`
+    // instead of `(i32.const K) (return_call_indirect)`. Out-of-region
+    // branches still emit `set_pc + return`.
+    //
+    // `br_to_loop_depth` is the WASM label depth from inside this block
+    // to the outer `loop $L`. Must be set by the caller before invoking
+    // emit_body_into in merged mode (typically N-1-K for block K of N).
+    //
+    // `entry_sel_global_idx` is the WASM global index for $entry_sel
+    // inside the merged module. Always 0 in the current build_region_function
+    // shape (single global).
+    bool merged_mode          = false;
+    u32  br_to_loop_depth     = 0;
+    u32  entry_sel_global_idx = 0;
+
+    // Tracks the depth of currently-open WASM block/loop/if constructs
+    // emitted INSIDE this body since emit_body_into started. Bumped by
+    // wrappers around raw op_block/op_loop/op_if; decremented by op_end.
+    // Used by emit_branch_resolution's merged path to compute the actual
+    // br depth to the outer loop ($L). Without this, a `br br_to_loop_depth`
+    // emitted from inside e.g. an op_if arm would br to the WRONG label
+    // (one of the if's nested blocks rather than $L).
+    u32 local_block_depth = 0;
 };
 
 // Forward-declared core emit functions live in gekko_emit.cpp.
@@ -329,6 +358,43 @@ std::vector<u8> build_region_module(const u8* concatenated_bodies,
                                     std::size_t concatenated_size,
                                     u32 n_funcs,
                                     u32 mem_pages = 1);
+
+// ---------------------------------------------------------------------------
+// Lever #2 — single-function merged-region build.
+// build_region_function emits ONE WASM function containing all N PowerPC
+// blocks woven together with nested `block` labels and an outer `loop`.
+// Entry dispatch is via a `br_table` keyed on the exported mutable WASM
+// global `entry_sel`. Intra-region branches become `global.set entry_sel +
+// br $L` (cheaper than call_indirect; keeps V8 inside one function for full
+// register allocation and TurboFan tier-up).
+//
+// `block_inputs` is the per-block array describing every PPC block in the
+// region in local-fn-idx order: starting PC, instruction stream, ctx_ptr,
+// MEM1 fastmem params, etc. Caller is responsible for ensuring blocks are
+// listed in the same order they appear in the dispatch indices used by
+// the dispatcher's pc->idx map.
+//
+// The returned module exports:
+//   "region"     (func)   () -> i32 — invoke to execute, returns next_pc
+//   "entry_sel"  (global) i32 (mut) — write to select the entry block
+//   "memory"     (re-imported from "env")
+// ---------------------------------------------------------------------------
+struct BlockInputs {
+    u32 start_pc;
+    const u32* insts;
+    u32 count;
+    u32 ctx_ptr_const;
+    u32 mem1_base;
+    u32 mem1_mask;
+    u32 ram_size;
+    const u32* instr_pcs;
+    bool emit_hle_check;
+};
+std::vector<u8> build_region_function(const BlockInputs* blocks,
+                                      u32 n_blocks,
+                                      LocalIdxLookupFn lookup_fn,
+                                      const void* lookup_user,
+                                      u32 mem_pages = 1);
 
 // ---------------------------------------------------------------------------
 // Inline helpers used by the .cpp emitter implementations.

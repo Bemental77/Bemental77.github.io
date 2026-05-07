@@ -22,6 +22,7 @@ constexpr u8 WASM_SEC_TYPE     = 1;
 constexpr u8 WASM_SEC_IMPORT   = 2;
 constexpr u8 WASM_SEC_FUNCTION = 3;
 constexpr u8 WASM_SEC_TABLE    = 4;
+constexpr u8 WASM_SEC_GLOBAL   = 6;
 constexpr u8 WASM_SEC_EXPORT   = 7;
 constexpr u8 WASM_SEC_ELEMENT  = 9;
 constexpr u8 WASM_SEC_CODE     = 10;
@@ -49,6 +50,7 @@ namespace wop {
 	constexpr u8 end           = 0x0B;
 	constexpr u8 br            = 0x0C;
 	constexpr u8 br_if         = 0x0D;
+	constexpr u8 br_table      = 0x0E;
 	constexpr u8 return_       = 0x0F;
 	constexpr u8 call          = 0x10;
 	constexpr u8 drop          = 0x1A;
@@ -56,6 +58,8 @@ namespace wop {
 	constexpr u8 local_get     = 0x20;
 	constexpr u8 local_set     = 0x21;
 	constexpr u8 local_tee     = 0x22;
+	constexpr u8 global_get    = 0x23;
+	constexpr u8 global_set    = 0x24;
 	constexpr u8 i32_load      = 0x28;
 	constexpr u8 i64_load      = 0x29;
 	constexpr u8 f32_load      = 0x2A;
@@ -367,6 +371,24 @@ public:
 		if (hasMax) emitLEB128(maxSize);
 	}
 
+	// --- Global section ---
+	//   beginGlobalSection(N);
+	//   emitGlobalI32Mut(initialValue);   // repeat N times
+	//   endSection();
+	// Section order: type, import, function, table, memory, global, export.
+	// emitGlobalI32Mut emits one global descriptor: mut i32 = init_value.
+	void beginGlobalSection(u32 count) {
+		beginSection(WASM_SEC_GLOBAL);
+		emitLEB128(count);
+	}
+	void emitGlobalI32Mut(s32 init_value) {
+		emitByte(WASM_TYPE_I32);
+		emitByte(0x01);                         // mutable
+		emitByte(wop::i32_const);
+		emitSignedLEB128(init_value);
+		emitByte(wop::end);
+	}
+
 	// --- Element section (populates a table at instantiation time).
 	// We use the simplest form: an "active" segment with a constant
 	// i32.const offset and a sequence of function indices.
@@ -422,6 +444,8 @@ public:
 
 	void op_local_get(u32 idx) { emitByte(wop::local_get); emitLEB128(idx); }
 	void op_local_set(u32 idx) { emitByte(wop::local_set); emitLEB128(idx); }
+	void op_global_get(u32 idx) { emitByte(wop::global_get); emitLEB128(idx); }
+	void op_global_set(u32 idx) { emitByte(wop::global_set); emitLEB128(idx); }
 	void op_local_tee(u32 idx) { emitByte(wop::local_tee); emitLEB128(idx); }
 
 	void op_i32_const(s32 val) { emitByte(wop::i32_const); emitSignedLEB128(val); }
@@ -629,6 +653,16 @@ public:
 	void op_loop(u8 blockType = 0x40) { emitByte(wop::loop_); emitByte(blockType); }
 	void op_br(u32 depth) { emitByte(wop::br); emitLEB128(depth); }
 	void op_br_if(u32 depth) { emitByte(wop::br_if); emitLEB128(depth); }
+	// br_table: branch to one of the labels indexed by the i32 on stack.
+	// Encoding: 0x0E + LEB128(N) + N×LEB128(label) + LEB128(default).
+	// `labels` is the per-arm label depth list of length n_labels;
+	// `default_label` is taken when the i32 index is >= n_labels.
+	void op_br_table(const u32* labels, u32 n_labels, u32 default_label) {
+		emitByte(wop::br_table);
+		emitLEB128(n_labels);
+		for (u32 i = 0; i < n_labels; ++i) emitLEB128(labels[i]);
+		emitLEB128(default_label);
+	}
 
 	// --- Output ---
 

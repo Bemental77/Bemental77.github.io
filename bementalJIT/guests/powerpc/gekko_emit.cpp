@@ -136,16 +136,20 @@ void emit_b11_op_if(EmitCtx& c, u8 result_type) {
         emit_flush_dirty_gprs_impl(c, g_ctx_ptr);
     }
     c.if_depth++;
+    c.local_block_depth++;
     c.b.op_if(result_type);
 }
 
 void emit_b11_op_else(EmitCtx& c) {
+    // op_else doesn't change block-stack depth — it's the alternative
+    // arm of the same if's block.
     c.b.op_else();
 }
 
 void emit_b11_op_end(EmitCtx& c) {
     c.b.op_end();
     if (c.if_depth > 0u) c.if_depth--;
+    if (c.local_block_depth > 0u) c.local_block_depth--;
     if (c.use_gpr_locals && c.if_depth == 0u) {
         // Conservative: invalidate all loaded[] flags. Runtime took ONE
         // arm; we don't know which gprs that arm loaded. Locals may be
@@ -153,6 +157,26 @@ void emit_b11_op_end(EmitCtx& c) {
         // arm uses the legacy memory path).
         emit_invalidate_gpr_locals(c);
     }
+}
+
+// Wrappers for raw op_block/op_loop/op_if/op_end sites that don't go
+// through emit_b11_op_*. Track local_block_depth so the merged-mode
+// br-to-loop branch can compute correct depths.
+static inline void emit_local_op_block(EmitCtx& c, u8 result_type = 0x40) {
+    c.b.op_block(result_type);
+    c.local_block_depth++;
+}
+static inline void emit_local_op_loop(EmitCtx& c, u8 result_type = 0x40) {
+    c.b.op_loop(result_type);
+    c.local_block_depth++;
+}
+static inline void emit_local_op_if(EmitCtx& c, u8 result_type = 0x40) {
+    c.b.op_if(result_type);
+    c.local_block_depth++;
+}
+static inline void emit_local_op_end(EmitCtx& c) {
+    c.b.op_end();
+    if (c.local_block_depth > 0u) c.local_block_depth--;
 }
 
 void emit_flush_dirty_gprs_impl(EmitCtx& c, u32 ctx_ptr) {
@@ -520,7 +544,7 @@ static void emit_load_d(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
         c.b.op_i32_const((s32)g_ram_size);
         c.b.op_i32_lt_u();
         c.b.op_i32_and();
-        c.b.op_if(WASM_TYPE_I32);
+        emit_local_op_if(c, WASM_TYPE_I32);
             c.b.op_local_get(LOCAL_TMP_B);
             c.b.op_i32_const((s32)g_mem1_base);
             c.b.op_i32_add();
@@ -528,7 +552,7 @@ static void emit_load_d(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
         c.b.op_else();
             c.b.op_local_get(LOCAL_TMP_A);
             c.b.op_call(import_idx);
-        c.b.op_end();
+        emit_local_op_end(c);
     }
 
     if (sign_extend_h) {
@@ -692,6 +716,24 @@ static void emit_branch_resolution(EmitCtx& c, u32 target_pc, const u32* local_i
     // host loop which may dispatch any block; same requirement.
     emit_block_exit_flush(c);
     if (local_idx) {
+        if (c.merged_mode) {
+            // Lever #2 merged path: same-region target lives in a sibling
+            // labeled block. Set $entry_sel and `br $L` — the loop body
+            // re-runs the br_table with the new sel and jumps to that
+            // block's labeled landing point. No call_indirect, no return.
+            //
+            // br depth = static body-relative depth (br_to_loop_depth) PLUS
+            // however many block/loop/if constructs the body itself opened
+            // since its start (local_block_depth). Tracked via wrappers
+            // emit_local_op_*/emit_b11_op_*. Without local_block_depth, a
+            // br emitted from inside e.g. an op_if arm would jump to the
+            // wrong label (one of the if's nested blocks rather than $L).
+            const u32 actual_depth = c.br_to_loop_depth + c.local_block_depth;
+            c.b.op_i32_const((s32)*local_idx);
+            c.b.op_global_set(c.entry_sel_global_idx);
+            c.b.op_br(actual_depth);
+            return;
+        }
         c.b.op_i32_const((s32)*local_idx);
         c.b.op_return_call_indirect(/*type=*/0u, /*table=*/0u);
         return;
@@ -2905,7 +2947,7 @@ static void emit_load_x(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
         c.b.op_i32_const((s32)g_ram_size);
         c.b.op_i32_lt_u();
         c.b.op_i32_and();                          // both must be true
-        c.b.op_if(WASM_TYPE_I32);                  // (result i32)
+        emit_local_op_if(c, WASM_TYPE_I32);        // (result i32)
             // Fast path: direct linear-memory load + bswap.
             c.b.op_local_get(LOCAL_TMP_B);
             c.b.op_i32_const((s32)g_mem1_base);
@@ -2949,7 +2991,7 @@ static void emit_load_x(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
             // Slow path: ppc_read*(ea).
             c.b.op_local_get(LOCAL_TMP_A);
             c.b.op_call(import_idx);
-        c.b.op_end();
+        emit_local_op_end(c);
     }
 
     if (sign_extend_h) {
@@ -3624,6 +3666,18 @@ static void emit_self_loop_terminator(EmitCtx& c, u32 inst) {
 // All branch emitters consult `lookup_fn`/`lookup_user` (when non-null)
 // to resolve same-region branch targets to local fn indices. When null,
 // every branch host-bounces (legacy behavior).
+// Merged-mode parameters bundle (avoids growing the signature for legacy
+// callers). When `merged` is true, emit_body_into:
+//   - SKIPS the per-body emitLocals call (caller declared 35 locals at the
+//     enclosing function level, shared across all PPC blocks in the region)
+//   - propagates `br_to_loop_depth` and `entry_sel_global_idx` into the
+//     EmitCtx so emit_branch_resolution emits the merged-fast-path branch.
+struct MergedModeArgs {
+    bool merged              = false;
+    u32  br_to_loop_depth    = 0;
+    u32  entry_sel_global_idx = 0;
+};
+
 static void emit_body_into(WasmModuleBuilder& b,
                            u32 start_pc, const u32* insts, u32 count,
                            u32 ctx_ptr_const,
@@ -3631,7 +3685,8 @@ static void emit_body_into(WasmModuleBuilder& b,
                            const u32* instr_pcs,
                            LocalIdxLookupFn lookup_fn,
                            const void* lookup_user,
-                           bool emit_hle_check_prologue) {
+                           bool emit_hle_check_prologue,
+                           const MergedModeArgs& merged = {}) {
     g_ctx_ptr = ctx_ptr_const;
     // Per-block DFA: walk the block's instructions, track which GPRs are
     // "trusted" as MEM1 pointers. Trusted baselines: r1 (stack), r2 (TOC),
@@ -3695,15 +3750,23 @@ static void emit_body_into(WasmModuleBuilder& b,
     // GPR locals start at index GPR_LOCAL_BASE = 3 (after the f64). They
     // are always declared so emit_body_into's local layout is stable;
     // V8 elides the unused ones when use_gpr_locals is false.
-    {
+    //
+    // Merged-mode skip: in build_region_function the same 35 locals are
+    // declared once at the function level (shared across all per-block
+    // regions of the body). Re-emitting them per body would double the
+    // local count and shift indices.
+    if (!merged.merged) {
         const u32 counts[] = { LOCAL_TMP_COUNT, 1, 32u };
         const u8  types[]  = { WASM_TYPE_I32,    WASM_TYPE_F64, WASM_TYPE_I32 };
         b.emitLocals(3, counts, types);
     }
 
     EmitCtx ctx{ b, start_pc, 0u, start_pc, false, false };
-    ctx.lookup_local_idx = lookup_fn;
-    ctx.lookup_user      = lookup_user;
+    ctx.lookup_local_idx       = lookup_fn;
+    ctx.lookup_user            = lookup_user;
+    ctx.merged_mode            = merged.merged;
+    ctx.br_to_loop_depth       = merged.br_to_loop_depth;
+    ctx.entry_sel_global_idx   = merged.entry_sel_global_idx;
     // Phase 3 — flip the B11 GPR-local cache on. Inside if/else (when
     // ctx.if_depth>0) the helpers fall back to direct memory access, so
     // partially-loaded locals can't escape the merge point. After every
@@ -3726,13 +3789,13 @@ static void emit_body_into(WasmModuleBuilder& b,
     if (emit_hle_check_prologue) {
         b.op_i32_const((s32)start_pc);
         b.op_call(WIMPORT_HLE_CHECK);
-        b.op_if(WASM_TYPE_I32);
+        emit_local_op_if(ctx, WASM_TYPE_I32);
             b.op_i32_const((s32)ctx_ptr_const);
             b.op_i32_load(ppc_off::PC);
             b.op_return();
         b.op_else();
             b.op_i32_const(0);
-        b.op_end();
+        emit_local_op_end(ctx);
         b.op_drop();
     }
 
@@ -3774,7 +3837,7 @@ static void emit_body_into(WasmModuleBuilder& b,
             emit_flush_dirty_gprs_impl(ctx, g_ctx_ptr);
             // Loop body: instructions [entry_idx, bdnz_idx) wrapped in
             // `loop` + `br_if 0`.
-            b.op_loop(0x40);
+            emit_local_op_loop(ctx, 0x40);
                 for (u32 i = self_loop_entry_idx; i < self_loop_bdnz_idx; ++i) {
                     ctx.pc = instr_pcs ? instr_pcs[i] : (start_pc + i * 4u);
                     ctx.inst = insts[i];
@@ -3791,7 +3854,7 @@ static void emit_body_into(WasmModuleBuilder& b,
                                    : (start_pc + self_loop_bdnz_idx * 4u);
                 ctx.inst = insts[self_loop_bdnz_idx];
                 emit_self_loop_terminator(ctx, ctx.inst);
-            b.op_end();  // close loop
+            emit_local_op_end(ctx);  // close loop
             // Emit post-loop instructions [bdnz_idx+1, count). These run
             // when the bdnz fall-through path exits the loop. Each may be
             // a hard terminator (blr, b, sc) which sets ctx.block_end and
@@ -4079,6 +4142,167 @@ std::vector<u8> build_region_module(const u8* concatenated_bodies,
     // (5-byte LEB128 size prefix + locals + ops + 0x0B end). ----
     b.beginCodeSection(n_funcs);
     b.emitBytes(concatenated_bodies, concatenated_size);
+    b.endSection();
+
+    return b.getBytes();
+}
+
+// ---------------------------------------------------------------------------
+// Lever #2 — single-function merged-region build. Emits ONE WASM module
+// whose code section contains a single function `region` taking no params
+// and returning i32 (next_pc). Inside it: 35 shared locals (2 i32 scratch +
+// 1 f64 scratch + 32 i32 GPR cache), then a `loop $L` containing N nested
+// `block`s and a `br_table` keyed on the mutable WASM global `entry_sel`.
+//
+// Block K's emitted body lives between `end $b_K` and `end $b_{K+1}`
+// (block N-1's body lives between `end $b_N-1` and `end loop $L`). Every
+// block must terminate explicitly — fall-through into the next block would
+// execute a wrong-PC body since adjacent blocks may have non-contiguous
+// PCs in PowerPC space.
+// ---------------------------------------------------------------------------
+namespace {
+// Local lookup wrapper: build_region_function's caller passes a generic
+// LocalIdxLookupFn (receiving target_pc → out_local_idx). Internally we
+// pre-compute a pc → local-idx map for this region, then expose the same
+// callback shape to emit_body_into so emit_branch_resolution emits the
+// merged-fast-path branch (`global.set entry_sel; br $L`).
+struct RegionFnCtx {
+    LocalIdxLookupFn user_fn;
+    const void*      user_user;
+};
+static bool region_fn_lookup(const void* user, u32 target_pc, u32* out) {
+    auto* c = (const RegionFnCtx*)user;
+    if (!c->user_fn) return false;
+    return c->user_fn(c->user_user, target_pc, out);
+}
+}  // namespace
+
+std::vector<u8> build_region_function(const BlockInputs* blocks,
+                                      u32 n_blocks,
+                                      LocalIdxLookupFn lookup_fn,
+                                      const void* lookup_user,
+                                      u32 mem_pages) {
+    if (blocks == nullptr || n_blocks == 0u) return {};
+
+    WasmModuleBuilder b;
+    b.emitHeader();
+
+    // ---- Type section: same 4 types as build_block ----
+    //   type 0: () -> i32                — region function signature
+    //   type 1: (i32) -> i32             — read*, check_exc, hle_check, read_tb
+    //   type 2: (i32, i32) -> ()         — write*, interp, break_block
+    //   type 3: (i32, i32) -> i32        — reserved
+    b.emitTypeSection(4);
+    {
+        const u8 i32t[]  = { WASM_TYPE_I32 };
+        const u8 i32x2[] = { WASM_TYPE_I32, WASM_TYPE_I32 };
+        b.emitFuncType(nullptr, 0, i32t, 1);
+        b.emitFuncType(i32t, 1, i32t, 1);
+        b.emitFuncType(i32x2, 2, nullptr, 0);
+        b.emitFuncType(i32x2, 2, i32t, 1);
+    }
+    b.endSection();
+
+    // ---- Import section: env.memory + WIMPORT_COUNT host functions ----
+    b.emitImportSection(1u + (u32)WIMPORT_COUNT);
+    b.emitImportMemory("env", "memory", mem_pages > 0u ? mem_pages : 1u);
+    b.emitImportFunc("env", "ppc_read8",       /*type*/1);
+    b.emitImportFunc("env", "ppc_read16",      /*type*/1);
+    b.emitImportFunc("env", "ppc_read32",      /*type*/1);
+    b.emitImportFunc("env", "ppc_write8",      /*type*/2);
+    b.emitImportFunc("env", "ppc_write16",     /*type*/2);
+    b.emitImportFunc("env", "ppc_write32",     /*type*/2);
+    b.emitImportFunc("env", "ppc_interp",      /*type*/2);
+    b.emitImportFunc("env", "ppc_check_exc",   /*type*/1);
+    b.emitImportFunc("env", "ppc_break_block", /*type*/2);
+    b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);
+    b.emitImportFunc("env", "ppc_read_tb",     /*type*/1);
+    b.endSection();
+
+    // ---- Function section: 1 region function of type 0 ----
+    {
+        const u32 idx[] = {0u};
+        b.emitFunctionSection(1u, idx);
+    }
+
+    // ---- Global section: 1 mutable i32 = entry_sel, init 0 ----
+    b.beginGlobalSection(1u);
+    b.emitGlobalI32Mut(0);
+    b.endSection();
+
+    // ---- Export section: "region" (func) + "entry_sel" (global) ----
+    b.beginExportSection(2u);
+    b.emitExport("region",    WASM_EXPORT_FUNC,   (u32)WIMPORT_COUNT);
+    b.emitExport("entry_sel", WASM_EXPORT_GLOBAL, 0u);
+    b.endSection();
+
+    // ---- Code section: 1 function body ----
+    b.beginCodeSection(1u);
+    b.beginFuncBody();
+
+    // Locals: 2 i32 scratch + 1 f64 scratch + 32 i32 GPR cache (B11).
+    // Declared ONCE at function level — all per-block emits share them.
+    {
+        const u32 counts[] = { LOCAL_TMP_COUNT, 1u, 32u };
+        const u8  types[]  = { WASM_TYPE_I32,    WASM_TYPE_F64, WASM_TYPE_I32 };
+        b.emitLocals(3u, counts, types);
+    }
+
+    // Open the outer loop $L.
+    b.op_loop(0x40);
+
+    // Open N nested blocks $b_{N-1} (outermost) ... $b_0 (innermost).
+    for (u32 i = 0; i < n_blocks; ++i) {
+        b.op_block(0x40);
+    }
+
+    // br_table dispatch — innermost, depth 0 = $b_0, ..., depth N-1 = $b_{N-1},
+    // depth N = $L. Default = 0 (silent fall to block 0 if sel out of range;
+    // dispatcher is responsible for passing sel ∈ [0, N)).
+    b.op_global_get(/*entry_sel*/0u);
+    {
+        std::vector<u32> arms(n_blocks);
+        for (u32 i = 0; i < n_blocks; ++i) arms[i] = i;
+        b.op_br_table(arms.data(), n_blocks, /*default=*/0u);
+    }
+
+    // Close $b_0 (innermost), then emit block 0's body.
+    // Then close $b_1, emit block 1's body. Repeat through block N-1.
+    RegionFnCtx ctx{ lookup_fn, lookup_user };
+    for (u32 i = 0; i < n_blocks; ++i) {
+        // Close the (N-i)-th nested block — landing point for sel == i.
+        b.op_end();
+        // Emit block i's body. br_to_loop_depth = N - 1 - i.
+        const BlockInputs& bi = blocks[i];
+        MergedModeArgs m;
+        m.merged              = true;
+        m.br_to_loop_depth    = (n_blocks - 1u) - i;
+        m.entry_sel_global_idx = 0u;
+        emit_body_into(b,
+                       bi.start_pc, bi.insts, bi.count,
+                       bi.ctx_ptr_const,
+                       bi.mem1_base, bi.mem1_mask, bi.ram_size,
+                       bi.instr_pcs,
+                       &region_fn_lookup, &ctx,
+                       bi.emit_hle_check,
+                       m);
+        // emit_body_into ends with: `i32.load PC` `return`. That `return`
+        // exits the whole region function, leaving the loop semantics
+        // intact for sibling blocks. After the trailing return, control
+        // can never reach the next `op_end` from this body — so the next
+        // body's prologue is dead-code from the WASM validator's view,
+        // but the validator handles polymorphic stack after `return`.
+    }
+
+    // Close the outer loop $L.
+    b.op_end();
+
+    // Trailing unreachable so the function has a valid type at end (the
+    // loop never falls through normally — every body terminates with
+    // `return` or `br $L`).
+    b.emitByte(wop::unreachable);
+
+    b.endFuncBody();
     b.endSection();
 
     return b.getBytes();

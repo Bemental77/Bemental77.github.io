@@ -34,6 +34,24 @@ namespace powerpc {
                                     LocalIdxLookupFn lookup_fn,
                                     const void* lookup_user,
                                     bool emit_hle_check = true);
+
+    // Lever #2 — single-function merged-region build. See gekko_emit.h.
+    struct BlockInputs {
+        u32 start_pc;
+        const u32* insts;
+        u32 count;
+        u32 ctx_ptr_const;
+        u32 mem1_base;
+        u32 mem1_mask;
+        u32 ram_size;
+        const u32* instr_pcs;
+        bool emit_hle_check;
+    };
+    std::vector<u8> build_region_function(const BlockInputs* blocks,
+                                          u32 n_blocks,
+                                          LocalIdxLookupFn lookup_fn,
+                                          const void* lookup_user,
+                                          u32 mem_pages = 1);
 }
 
 int compile_raw(const u8* bytes, std::size_t size) {
@@ -624,17 +642,69 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
 #endif
     }
 
-    // Build the merged-module bytes via the guest emitter.
-    std::vector<u8> bytes = powerpc::build_region_module(
-        rs.fn_bodies_concat.data(),
-        rs.fn_bodies_concat.size(),
-        rs.n_funcs,
-        mem_pages);
+    // Lever #2 alt path — single-function merged region. Toggled by
+    // BJIT_LEVER2_MERGED=1 (process env) OR Module.lever2_merged=1 (JS-side
+    // flag, useful for puppeteer probe before pthread spawns). Requires
+    // per-block records (same condition as re-emit at relink). Output is a
+    // module exporting ONE function `region` and ONE mutable global
+    // `entry_sel`; dispatcher writes entry_sel = local_idx then calls
+    // region() to execute.
+    // Lever #2 single-function merged region. Toggled by BJIT_LEVER2_MERGED=1
+    // (process env) OR Module.lever2_merged=1 (JS-side flag, useful for
+    // puppeteer probe before pthread spawns). Default OFF — boot-parity
+    // confirmed on SAB+PSO with merged ON, including the depth-tracked
+    // br-to-loop optimization. Pending: A/B perf measurement vs legacy
+    // before flipping default ON.
+#ifdef __EMSCRIPTEN__
+    static const bool s_merged_enabled = []{
+        if (std::getenv("BJIT_LEVER2_MERGED") != nullptr) return true;
+        return EM_ASM_INT({
+            return (typeof Module === 'object' && Module.lever2_merged) ? 1 : 0;
+        }) != 0;
+    }();
+#else
+    static const bool s_merged_enabled = (std::getenv("BJIT_LEVER2_MERGED") != nullptr);
+#endif
+    bool use_merged_fn = s_merged_enabled
+                      && (rs.block_records.size() == rs.n_funcs);
+    if (use_merged_fn) {
+        for (const auto& rec : rs.block_records) {
+            if (rec.insts.empty()) { use_merged_fn = false; break; }
+        }
+    }
+
+    std::vector<u8> bytes;
+    if (use_merged_fn) {
+        std::vector<powerpc::BlockInputs> bins(rs.n_funcs);
+        for (u32 i = 0; i < rs.n_funcs; ++i) {
+            const BlockEmitInputs& rec = rs.block_records[i];
+            bins[i].start_pc       = rec.start_pc;
+            bins[i].insts          = rec.insts.data();
+            bins[i].count          = (u32)rec.insts.size();
+            bins[i].ctx_ptr_const  = rec.ctx_ptr_const;
+            bins[i].mem1_base      = rec.mem1_base;
+            bins[i].mem1_mask      = rec.mem1_mask;
+            bins[i].ram_size       = rec.ram_size;
+            bins[i].instr_pcs      = rec.instr_pcs.data();
+            bins[i].emit_hle_check = true;
+        }
+        RegionLookupCtx ctx{ &rs };
+        bytes = powerpc::build_region_function(
+            bins.data(), rs.n_funcs,
+            &region_lookup_for_emit, &ctx,
+            mem_pages);
+    } else {
+        bytes = powerpc::build_region_module(
+            rs.fn_bodies_concat.data(),
+            rs.fn_bodies_concat.size(),
+            rs.n_funcs,
+            mem_pages);
+    }
     if (bytes.empty()) {
 #ifdef __EMSCRIPTEN__
         EM_ASM({
             console.error('[bemental] region', $0,
-                ' relink: build_region_module returned empty bytes');
+                ' relink: build_region returned empty bytes');
         }, (int)r);
 #endif
         return;
@@ -653,6 +723,7 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
         const pcKeysPtr  = $3;
         const nFuncs     = $4 >>> 0;
         const generation = $5 | 0;
+        const mergedFn   = $6 | 0;     // 1 = single-fn merged region, 0 = N fn_<i> path
         try {
             const view = new Uint8Array(Module.HEAPU8.buffer, bytesPtr, bytesLen);
             const copy = new Uint8Array(view);
@@ -673,25 +744,40 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
                 pcMap.set(pc, i);
             }
 
-            // Pre-resolve each fn_<i> export into a JS array indexed by
+            // Lever #2 merged shape exports `region` + `entry_sel`. Otherwise
+            // pre-resolve each fn_<i> export into a JS array indexed by
             // local fn idx — avoids a string lookup per dispatch.
-            const fns = new Array(nFuncs);
-            for (let i = 0; i < nFuncs; i++) {
-                fns[i] = inst.exports['fn_' + i];
+            const region = {};
+            region.merged = !!mergedFn;
+            if (region.merged) {
+                region.regionFn  = inst.exports['region'];
+                region.entrySel  = inst.exports['entry_sel'];
+                if (!region.regionFn || !region.entrySel) {
+                    console.error('[bemental] region ' + r
+                        + ' merged shape missing exports — region:'
+                        + (typeof region.regionFn) + ' entry_sel:'
+                        + (typeof region.entrySel));
+                    return -1;
+                }
+            } else {
+                const fns = new Array(nFuncs);
+                for (let i = 0; i < nFuncs; i++) {
+                    fns[i] = inst.exports['fn_' + i];
+                }
+                region.fns = fns;
             }
 
             if (!Module.bemental_regions) Module.bemental_regions = {};
             const prev = Module.bemental_regions[r];
-            const region = {};
             region.instance   = inst;
-            region.fns        = fns;
             region.pcMap      = pcMap;
             region.nFuncs     = nFuncs;
             region.generation = generation;
             Module.bemental_regions[r] = region;
             if (prev) prev.instance = null;
             console.log('[worker] [bemental] region ' + r + ' relinked gen=' + generation
-                + ' n_funcs=' + nFuncs + ' bytes=' + bytesLen);
+                + ' n_funcs=' + nFuncs + ' bytes=' + bytesLen
+                + (region.merged ? ' shape=merged' : ' shape=Nfn'));
             return r;
         } catch (e) {
             console.error('[bemental] region ' + r + ' relink failed: '
@@ -702,7 +788,8 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
     (int)r,
     bytes.data(), (int)bytes.size(),
     rs.pc_keys.data(), (int)rs.n_funcs,
-    rs.generation + 1);
+    rs.generation + 1,
+    use_merged_fn ? 1 : 0);
 
     if (new_handle < 0) return;
     rs.module_handle      = new_handle;
@@ -736,7 +823,13 @@ bool BlockCache::region_dispatch(u32 pc, s32* out) {
                 + ' r=' + r + ' pc=0x' + pc.toString(16) + ' idx=' + idx);
         }
         try {
-            const next = region.fns[idx]() >>> 0;
+            let next;
+            if (region.merged) {
+                region.entrySel.value = idx | 0;
+                next = region.regionFn() >>> 0;
+            } else {
+                next = region.fns[idx]() >>> 0;
+            }
             HEAP32[outPtr >>> 2] = next | 0;
             return 1;
         } catch (e) {
