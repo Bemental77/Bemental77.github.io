@@ -20,6 +20,10 @@
 
 namespace bemental::powerpc {
 
+// Debug toggle: when true, emit_body_into emits without B11 GPR-local cache.
+// Used in tests to isolate JIT bugs from cache-flush-ordering issues.
+extern bool g_disable_b11;
+
 // ---------------------------------------------------------------------------
 // Imports the JIT host MUST provide when instantiating a compiled block.
 // Order is fixed; consumer is responsible for matching it during module setup.

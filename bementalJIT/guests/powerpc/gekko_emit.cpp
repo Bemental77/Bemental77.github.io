@@ -43,6 +43,16 @@ static void emit_addi(EmitCtx& c) {
 // global set per build_block call (these are not reentrant, but that matches
 // the rest of bementalJIT).
 u32 g_ctx_ptr = 0;
+// Debug toggle: when true, emit_body_into sets ctx.use_gpr_locals = false,
+// reverting to legacy memory-direct GPR access. Used to isolate JIT
+// miscompilations from B11 cache logic.
+//
+// 2026-05-07: temporarily defaulted ON because B11 has a memory-coherence
+// bug exposed by SAB's __OSSetInterruptMask cntlzw=17 path — observed via
+// test_pi_mask_path: with B11 ON, stw at 0x800e7c68 writes 0 even though
+// memory[gpr(5)] holds 0xf0 throughout. Disabling B11 fixes the write.
+// Re-enable once root cause found and fixed.
+bool g_disable_b11 = true;
 // Linear-memory offset of MEM1 in the shared host heap, set per-build by
 // build_block(). Zero means "fast-path direct memory access disabled, fall
 // back to ppc_read*/ppc_write* trampolines for everything." When non-zero,
@@ -3702,7 +3712,8 @@ static void emit_body_into(WasmModuleBuilder& b,
     // active for future optimizations (cross-block GPR passing via
     // tail-call params, register-allocator over locals, etc.) where the
     // cache becomes essential.
-    ctx.use_gpr_locals = true;
+    extern bool g_disable_b11;
+    ctx.use_gpr_locals = !g_disable_b11;
 
     // HLE function-hooking check at the very start of every block.
     // Skipped when caller has pre-verified that no HLE hook matches
