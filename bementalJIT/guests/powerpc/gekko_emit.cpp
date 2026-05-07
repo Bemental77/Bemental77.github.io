@@ -44,15 +44,9 @@ static void emit_addi(EmitCtx& c) {
 // the rest of bementalJIT).
 u32 g_ctx_ptr = 0;
 // Debug toggle: when true, emit_body_into sets ctx.use_gpr_locals = false,
-// reverting to legacy memory-direct GPR access. Used to isolate JIT
-// miscompilations from B11 cache logic.
-//
-// 2026-05-07: temporarily defaulted ON because B11 has a memory-coherence
-// bug exposed by SAB's __OSSetInterruptMask cntlzw=17 path — observed via
-// test_pi_mask_path: with B11 ON, stw at 0x800e7c68 writes 0 even though
-// memory[gpr(5)] holds 0xf0 throughout. Disabling B11 fixes the write.
-// Re-enable once root cause found and fixed.
-bool g_disable_b11 = true;
+// reverting to legacy memory-direct GPR access. Used in tests to isolate
+// JIT bugs from B11 cache logic.
+bool g_disable_b11 = false;
 // Linear-memory offset of MEM1 in the shared host heap, set per-build by
 // build_block(). Zero means "fast-path direct memory access disabled, fall
 // back to ppc_read*/ppc_write* trampolines for everything." When non-zero,
@@ -120,6 +114,7 @@ void emit_gpr_set_impl(EmitCtx& c, u32 i, u32 ctx_ptr, u32 scratch) {
         c.b.op_i32_store(ppc_off::gpr(i));
         return;
     }
+    (void)scratch;
     c.b.op_local_set(gpr_local_idx(i));
     c.gpr_loaded[i] = true;
     c.gpr_dirty[i]  = true;
@@ -643,16 +638,23 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
         c.b.op_i32_const((s32)g_ram_size);
         c.b.op_i32_lt_u();
         c.b.op_i32_and();
-        c.b.op_if();                              // (result void)
+        // B11-aware if/else/end: bumps if_depth so emit_gpr_get_impl in
+        // either arm takes the memory-direct path. Raw op_if would let
+        // compile-time gpr_loaded[] propagate across arms, so the else-
+        // arm's gpr_get could emit `local.get` of a value the if-arm
+        // tee'd at runtime — but only ONE arm runs, leaving the local
+        // uninitialized in the other arm. (Bug exposed by SAB
+        // 0x800e7c68 PI mask write — see b11_coherence_bug_2026_05_07.)
+        emit_b11_op_if(c, /*no result*/ 0x40);
             c.b.op_local_get(LOCAL_TMP_B);
             c.b.op_i32_const((s32)g_mem1_base);
             c.b.op_i32_add();
             emit_direct_store_post_with_addr_on_stack();
-        c.b.op_else();
+        emit_b11_op_else(c);
             c.b.op_local_get(LOCAL_TMP_A);
             emit_gpr_get_impl(c, rs, g_ctx_ptr);
             c.b.op_call(import_idx);
-        c.b.op_end();
+        emit_b11_op_end(c);
     }
 
     if (update && ra != 0) {
@@ -2993,7 +2995,9 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
         c.b.op_i32_const((s32)g_ram_size);
         c.b.op_i32_lt_u();
         c.b.op_i32_and();
-        c.b.op_if();                               // (result void)
+        // B11-aware: bumps if_depth so emit_gpr_get_impl in either arm
+        // takes the memory-direct path. See b11_coherence_bug_2026_05_07.
+        emit_b11_op_if(c, /*no result*/ 0x40);
             // Fast: addr-host = mem1_base + phys; load val; bswap; store.
             c.b.op_local_get(LOCAL_TMP_B);
             c.b.op_i32_const((s32)g_mem1_base);
@@ -3034,12 +3038,12 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
             } else {
                 c.b.op_i32_store8(0);
             }
-        c.b.op_else();
+        emit_b11_op_else(c);
             // Slow: ppc_write*(ea, val).
             c.b.op_local_get(LOCAL_TMP_A);
             emit_gpr_get_impl(c, rs, g_ctx_ptr);
             c.b.op_call(import_idx);
-        c.b.op_end();
+        emit_b11_op_end(c);
     }
 
     if (update && ra != 0) {

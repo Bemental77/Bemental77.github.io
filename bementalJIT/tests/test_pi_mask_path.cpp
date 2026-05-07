@@ -162,7 +162,7 @@ int main() {
     gpr(5) = 0xDEADBEEFu;    // poison so we can see if it's overwritten
     spr(8) = SENTINEL_LR;    // lr = sentinel; blr lands here, dispatcher exits
 
-    bemental::powerpc::g_disable_b11 = false;  // B11 ON — reproduce the bug
+    bemental::powerpc::g_disable_b11 = false;  // B11 ON — verifies fix
 
     BlockCache cache;
 
