@@ -2102,6 +2102,29 @@ static void emit_mtspr_impl(EmitCtx& c) {
     c.b.op_i32_store(ppc_off::spr(spr_num));
 }
 
+// mftb rD, TBR  (op31 sub-op 371).
+// Real-game profiling 2026-05-07: mftb was 76% of remaining op31 fallbacks
+// on SAB (1289/1701 at disp=5000). Polling-loop deadline checks read TBL
+// every iter; routing through dolphin_interp pays full SingleStepInner
+// overhead per fire.
+//
+// SPR_DECODE returns the same split-half decode mftb's TBR uses (Dolphin
+// dispatches mftb → mfspr internally). Valid TBR indices are 268 (TBL)
+// and 269 (TBU); anything else falls back. We pass which=0 for TBL,
+// which=1 for TBU to a thin import that calls GetFakeTimeBase() directly,
+// bypassing Interpreter::SingleStepInner.
+static void emit_mftb_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst);
+    const u32 tbr = SPR_DECODE(c.inst);
+    u32 which;
+    if      (tbr == 268u) which = 0u;       // SPR_TL
+    else if (tbr == 269u) which = 1u;       // SPR_TU
+    else { emit_fallback(c); return; }
+    c.b.op_i32_const((s32)which);
+    c.b.op_call(WIMPORT_READ_TB);            // -> i32 (TBL or TBU half)
+    emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
+}
+
 // ===========================================================================
 // mfcr — read CR register into rT.
 // CR is stored as 8 u64 fields (Dolphin's encoding). To produce a 32-bit CR
@@ -3197,6 +3220,8 @@ constexpr OpEntry table31_entries[] = {
     // SPR access — direct slots only; CoreTiming/MMCR/BAT/HID0 fall back.
     {339, &emit_mfspr_impl},
     {467, &emit_mtspr_impl},
+    // Time base read (TBL/TBU) — thin native import bypasses SingleStepInner.
+    {371, &emit_mftb_impl},
     // CR field access (mfcr/mtcrf — currently fallback; encoding extraction
     // is non-trivial because Dolphin packs CR into 8 u64 fields, not the
     // packed 32-bit format mfcr returns. Listed explicitly so they're not
@@ -3870,7 +3895,7 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     }
     b.endSection();
 
-    // ---- Import section: memory + 9 host functions ----
+    // ---- Import section: memory + WIMPORT_COUNT host functions ----
     b.emitImportSection(1 + WIMPORT_COUNT);
     if (mem_pages > 0) {
         b.emitImportMemory("env", "memory", mem_pages);
@@ -3889,6 +3914,7 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     b.emitImportFunc("env", "ppc_check_exc",   /*type*/1);
     b.emitImportFunc("env", "ppc_break_block", /*type*/2);
     b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);  // (pc) -> i32
+    b.emitImportFunc("env", "ppc_read_tb",     /*type*/1);  // (which:0=TBL,1=TBU)->i32
     b.endSection();
 
     // ---- Function section: 1 function of type 0 ----
@@ -3992,6 +4018,7 @@ std::vector<u8> build_region_module(const u8* concatenated_bodies,
     b.emitImportFunc("env", "ppc_check_exc",   /*type*/1);
     b.emitImportFunc("env", "ppc_break_block", /*type*/2);
     b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);
+    b.emitImportFunc("env", "ppc_read_tb",     /*type*/1);  // (which:0=TBL,1=TBU)->i32
     b.endSection();
 
     // ---- Function section: N entries, all type 0 ((), i32) ----

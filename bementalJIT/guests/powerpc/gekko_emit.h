@@ -35,7 +35,8 @@ enum WasmImportFunc : u32 {
     WIMPORT_CHECK_EXC   = 7,   // (pc) -> i32               — non-zero = early-exit
     WIMPORT_BREAK_BLOCK = 8,   // (pc) -> void              — block exit hook
     WIMPORT_HLE_CHECK   = 9,   // (pc) -> i32               — non-zero = HLE replaced, bail
-    WIMPORT_COUNT       = 10
+    WIMPORT_READ_TB     = 10,  // (which: 0=TBL,1=TBU) -> i32 — thin time-base read
+    WIMPORT_COUNT       = 11
 };
 
 // ---------------------------------------------------------------------------
