@@ -420,14 +420,58 @@
           });
         } else if (m.cmd === 'region-instantiate-ack') {
           console.log('[ppc-worker-handshake] region-instantiate region=' + m.regionIdx + ' exports=' + JSON.stringify(m.exportNames));
-          ppc_worker.postMessage({ cmd: 'region-call-export', regionIdx: m.regionIdx, exportName: 'test' });
+          if (m.regionIdx === 7) {
+            ppc_worker.postMessage({ cmd: 'region-call-export', regionIdx: m.regionIdx, exportName: 'test' });
+          } else if (m.regionIdx === 6) {
+            // Phase 2c.4f-4: kick off the dispatch loop. Start at
+            // 0x80003100 (block0). Loop should chain block0 → 0x80003200
+            // → block1 → 0xDEADBEEF → unmapped (exit). Iter cap of 10
+            // is plenty; dispatch chain is exactly 2 hops.
+            ppc_worker.postMessage({ cmd: 'run', startPc: 0x80003100, maxIters: 10 });
+          }
         } else if (m.cmd === 'region-instantiate-nack') {
           console.error('[ppc-worker-handshake] region-instantiate FAIL: ' + m.reason);
         } else if (m.cmd === 'region-call-export-ack') {
           var ok = (m.value >>> 0) === 42;
           console.log('[ppc-worker-handshake] region call test() → ' + (m.value >>> 0) + ' ' + (ok ? 'PASS' : 'FAIL'));
+          // Phase 2c.4f-4: instantiate a 2-block region (slot 6) so
+          // the ppc-worker dispatch loop has a chain to walk.
+          // Hand-built wasm exporting:
+          //   block0: () -> i32  returns 0x80003200
+          //   block1: () -> i32  returns 0xDEADBEEF
+          // Region 6 pcMap: { 0x80003100 → 0, 0x80003200 → 1 }.
+          var twoBlockWasm = new Uint8Array([
+            0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,           // \0asm v1
+            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,           // type sec: ()->i32
+            0x03, 0x03, 0x02, 0x00, 0x00,                        // func sec: 2 funcs type 0
+            0x07, 0x13, 0x02,                                    // export sec: 19 bytes, 2 entries
+              0x06, 0x62,0x6c,0x6f,0x63,0x6b,0x30, 0x00, 0x00,  //   "block0" func idx 0
+              0x06, 0x62,0x6c,0x6f,0x63,0x6b,0x31, 0x00, 0x01,  //   "block1" func idx 1
+            0x0a, 0x13, 0x02,                                    // code sec: 2 bodies
+              0x08, 0x00, 0x41, 0x80,0xe4,0x80,0x80,0x78, 0x0b, //   block0: i32.const 0x80003200, end
+              0x08, 0x00, 0x41, 0xef,0xfd,0xb6,0xf5,0x7d, 0x0b  //   block1: i32.const 0xDEADBEEF, end
+          ]);
+          var pcKeys = new Uint32Array([0x80003100, 0x80003200]);
+          ppc_worker.postMessage({
+            cmd: 'region-instantiate',
+            regionIdx: 6,
+            bytes: twoBlockWasm.buffer,
+            imports: 'none',
+            pcKeys: pcKeys.buffer,
+          });
         } else if (m.cmd === 'region-call-export-nack') {
           console.error('[ppc-worker-handshake] region call FAIL: ' + m.reason);
+        } else if (m.cmd === 'run-ack') {
+          var okIters  = m.iters === 2;
+          var okLast   = (m.lastPc >>> 0) === 0xDEADBEEF;
+          var okReason = m.exitReason === 'unmapped';
+          var ok = okIters && okLast && okReason;
+          console.log('[ppc-worker-handshake] run iters=' + m.iters
+            + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+            + ' exit=' + m.exitReason
+            + ' ' + (ok ? 'PASS' : 'FAIL'));
+        } else if (m.cmd === 'run-nack') {
+          console.error('[ppc-worker-handshake] run FAIL: ' + m.reason);
         } else if (m.cmd === 'error') {
           console.error('[ppc-worker-handshake] error: ' + m.error);
         }

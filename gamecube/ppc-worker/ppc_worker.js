@@ -221,6 +221,47 @@
           mask32, byte0, half0, mask32b });
         break;
       }
+      case 'run': {
+        // Phase 2c.4f-4: replicate JitWasm::Run()'s inner-iter loop.
+        // For each iteration: look pc up in some region's pcMap, call
+        // the corresponding block export (named "block<idx>"), use
+        // its return value as the next pc, repeat. Region lookup
+        // iterates the small (≤8) region table — bementalJIT's real
+        // bemental::classify() is constant-time on pc bits; deferred
+        // until the multi-region storage carries a classify cache.
+        //
+        // Exit reasons (string):
+        //   'unmapped'         — pc not in any region's pcMap (next
+        //                         step in 4f-5 will mailbox a
+        //                         CompileBlock to dolphin).
+        //   'no-block-export'  — region.exports['block<idx>'] missing.
+        //   'block-trap: ...'  — wasm trap inside dispatched block.
+        //   'max-iters'        — iter budget exhausted (no exit cond).
+        if (!mod || !mod.bemental_regions) { postMessage({ cmd: 'run-nack', reason: 'no regions' }); return; }
+        let pc = (data.startPc | 0) >>> 0;
+        const maxIters = ((data.maxIters | 0) >>> 0) || 100;
+        const regions = mod.bemental_regions;
+        let iters = 0;
+        let exitReason = 'max-iters';
+        for (; iters < maxIters; ++iters) {
+          let region = null, idx = -1;
+          for (const k in regions) {
+            const r = regions[k];
+            if (r && r.pcMap && r.pcMap.has(pc)) { region = r; idx = r.pcMap.get(pc); break; }
+          }
+          if (!region) { exitReason = 'unmapped'; break; }
+          const fn = region.exports['block' + idx];
+          if (typeof fn !== 'function') { exitReason = 'no-block-export'; break; }
+          try {
+            pc = fn() >>> 0;
+          } catch (e) {
+            exitReason = 'block-trap: ' + (e && e.message ? e.message : String(e));
+            break;
+          }
+        }
+        postMessage({ cmd: 'run-ack', iters, lastPc: pc, exitReason });
+        break;
+      }
       case 'mailbox-call': {
         // Phase 2c.4c: synchronous request-reply. ppc-worker C++
         // publishes (mboxCmd, arg0) into the mailbox slot, Atomics.waits
