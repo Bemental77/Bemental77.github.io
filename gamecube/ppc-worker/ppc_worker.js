@@ -95,6 +95,67 @@
         postMessage({ cmd: 'mmio-read-test-ack', addr: data.addr, value });
         break;
       }
+      case 'init-bemental-regions': {
+        // Phase 2c.4f-3: stand up the JS-side region storage in
+        // ppc-worker. After this, region-instantiate accepts wasm
+        // bytes and stores the resulting Instance in mod.bemental_regions[r],
+        // analogous to dolphin's block_cache.cpp::region_relink path.
+        if (!mod) { postMessage({ cmd: 'init-bemental-regions-nack', reason: 'wasm not yet ready' }); return; }
+        if (!mod.bemental_regions) mod.bemental_regions = {};
+        const had_env = (mod.bemental_imports && mod.bemental_imports.env);
+        postMessage({ cmd: 'init-bemental-regions-ack', had_env: !!had_env });
+        break;
+      }
+      case 'region-instantiate': {
+        // Receives:
+        //   regionIdx: 0..7
+        //   bytes: ArrayBuffer of the wasm module
+        //   imports: 'env' (use mod.bemental_imports.env) or 'none' (no imports)
+        //   pcKeys: optional Uint32Array of PCs for pcMap
+        // Stores in mod.bemental_regions[regionIdx].
+        if (!mod) { postMessage({ cmd: 'region-instantiate-nack', reason: 'wasm not yet ready' }); return; }
+        if (!mod.bemental_regions) mod.bemental_regions = {};
+        try {
+          const bytes = new Uint8Array(data.bytes);
+          const wmod = new WebAssembly.Module(bytes);
+          const importObj = (data.imports === 'env' && mod.bemental_imports)
+            ? { env: mod.bemental_imports.env }
+            : {};
+          const inst = new WebAssembly.Instance(wmod, importObj);
+          const region = { instance: inst, exports: inst.exports };
+          if (data.pcKeys) {
+            const pcMap = new Map();
+            const arr = new Uint32Array(data.pcKeys);
+            for (let i = 0; i < arr.length; ++i) pcMap.set(arr[i] >>> 0, i);
+            region.pcMap = pcMap;
+            region.nFuncs = arr.length;
+          }
+          mod.bemental_regions[data.regionIdx | 0] = region;
+          const exportNames = Object.keys(inst.exports);
+          postMessage({ cmd: 'region-instantiate-ack', regionIdx: data.regionIdx, exportNames });
+        } catch (e) {
+          postMessage({ cmd: 'region-instantiate-nack', reason: 'instantiate failed: ' + (e && e.message ? e.message : String(e)) });
+        }
+        break;
+      }
+      case 'region-call-export': {
+        // Calls a named export from a stored region. For test-mode
+        // bytes the export takes no args and returns i32; we just
+        // return the value.
+        if (!mod || !mod.bemental_regions) { postMessage({ cmd: 'region-call-export-nack', reason: 'no regions' }); return; }
+        const region = mod.bemental_regions[data.regionIdx | 0];
+        if (!region || !region.exports[data.exportName]) {
+          postMessage({ cmd: 'region-call-export-nack', reason: 'no such export: ' + data.exportName });
+          return;
+        }
+        try {
+          const value = region.exports[data.exportName]() >>> 0;
+          postMessage({ cmd: 'region-call-export-ack', regionIdx: data.regionIdx, exportName: data.exportName, value });
+        } catch (e) {
+          postMessage({ cmd: 'region-call-export-nack', reason: 'call failed: ' + (e && e.message ? e.message : String(e)) });
+        }
+        break;
+      }
       case 'env-call-test': {
         // Phase 2c.4f-2 verify: invoke a binding from mod.bemental_imports.env
         // by NAME. If cmd 8/10/12 etc. handlers in dolphin are wired, they

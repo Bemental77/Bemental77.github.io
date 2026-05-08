@@ -373,6 +373,38 @@
           // env.ppc_read_tb(0) → some TB-low value. Just verify the
           // round-trip completed and we got a value back.
           console.log('[ppc-worker-handshake] env.' + m.name + '(' + m.arg0 + ') → 0x' + (m.reply >>> 0).toString(16) + ' (cmd 12 = ppc_read_tb)');
+          // Phase 2c.4f-3: stand up mod.bemental_regions in ppc-worker,
+          // then verify region-instantiate works by sending a 37-byte
+          // hand-built wasm module that exports `test() -> i32 = 42`.
+          ppc_worker.postMessage({ cmd: 'init-bemental-regions' });
+        } else if (m.cmd === 'init-bemental-regions-ack') {
+          console.log('[ppc-worker-handshake] mod.bemental_regions ready, env present=' + m.had_env);
+          // Hand-built minimal wasm: (module
+          //   (type (func (result i32)))
+          //   (func (export "test") (result i32) i32.const 42))
+          var testWasm = new Uint8Array([
+            0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,           // \0asm v1
+            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,           // type sec: ()->i32
+            0x03, 0x02, 0x01, 0x00,                              // func sec: 1 func type 0
+            0x07, 0x08, 0x01, 0x04, 0x74,0x65,0x73,0x74, 0x00, 0x00, // export "test" func 0
+            0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b      // code: 1 body, locals=0, i32.const 42, end
+          ]);
+          ppc_worker.postMessage({
+            cmd: 'region-instantiate',
+            regionIdx: 7,                  // use slot 7 (highest, won't collide with real regions)
+            bytes: testWasm.buffer,
+            imports: 'none',
+          });
+        } else if (m.cmd === 'region-instantiate-ack') {
+          console.log('[ppc-worker-handshake] region-instantiate region=' + m.regionIdx + ' exports=' + JSON.stringify(m.exportNames));
+          ppc_worker.postMessage({ cmd: 'region-call-export', regionIdx: m.regionIdx, exportName: 'test' });
+        } else if (m.cmd === 'region-instantiate-nack') {
+          console.error('[ppc-worker-handshake] region-instantiate FAIL: ' + m.reason);
+        } else if (m.cmd === 'region-call-export-ack') {
+          var ok = (m.value >>> 0) === 42;
+          console.log('[ppc-worker-handshake] region call test() → ' + (m.value >>> 0) + ' ' + (ok ? 'PASS' : 'FAIL'));
+        } else if (m.cmd === 'region-call-export-nack') {
+          console.error('[ppc-worker-handshake] region call FAIL: ' + m.reason);
         } else if (m.cmd === 'error') {
           console.error('[ppc-worker-handshake] error: ' + m.error);
         }
