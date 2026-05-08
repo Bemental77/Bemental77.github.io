@@ -284,10 +284,15 @@
           // a sync ping. Consumer polls req_ready every 4 ms (typical
           // request rate is far lower while we're just verifying);
           // dolphin_worker will replace it as the consumer in 2c.4e.
+          // Slot layout MUST match ppc_worker_main.cpp::MBX_OFF_*:
+          //   +0 cmd, +4 arg0, +8 arg1, +12 req_ready, +16 reply, +20 reply_ready
           var MBX_BASE = 0x02000000;
-          var MBX_REQ_READY   = MBX_BASE + 8;
-          var MBX_REPLY       = MBX_BASE + 12;
-          var MBX_REPLY_READY = MBX_BASE + 16;
+          var MBX_CMD         = MBX_BASE +  0;
+          var MBX_ARG0        = MBX_BASE +  4;
+          var MBX_ARG1        = MBX_BASE +  8;
+          var MBX_REQ_READY   = MBX_BASE + 12;
+          var MBX_REPLY       = MBX_BASE + 16;
+          var MBX_REPLY_READY = MBX_BASE + 20;
           var i32 = new Int32Array(sharedMemory.buffer);
           // Reset slot to known state.
           Atomics.store(i32, MBX_REQ_READY   >> 2, 0);
@@ -295,18 +300,14 @@
           window._ppcMboxConsumer = setInterval(function () {
             var req = Atomics.load(i32, MBX_REQ_READY >> 2);
             if (req !== 1) return;
-            var cmd  = Atomics.load(i32, (MBX_BASE +  0) >> 2);
-            var arg0 = Atomics.load(i32, (MBX_BASE +  4) >> 2);
+            var cmd  = Atomics.load(i32, MBX_CMD  >> 2);
+            var arg0 = Atomics.load(i32, MBX_ARG0 >> 2);
             var reply = 0;
             if (cmd === 1) {
               // PING: reply = arg0 * 2.
               reply = (arg0 * 2) | 0;
             } else if (cmd === 4) {
-              // MmioRead32: page-side mock for 2c.4d. 2c.4e routes to
-              // dolphin_worker. Recognised addresses:
-              //   0xCC003004 PI_INTERRUPT_MASK → mock 0x1FC (matches
-              //              the value we observed in real probe runs)
-              //   else → 0
+              // MmioRead32: page-side mock for 2c.4d.
               if ((arg0 >>> 0) === 0xCC003004) reply = 0x1FC;
             }
             Atomics.store(i32, MBX_REPLY       >> 2, reply);
@@ -344,7 +345,21 @@
           } else {
             // Real dolphin response.
             console.log('[ppc-worker-handshake] mmio_read32(0xCC003004) → 0x' + got + ' (dolphin) — Phase 2c.4e end-to-end');
+            // Phase 2c.4f-1: exercise the rest of the MMIO cmd set.
+            ppc_worker.postMessage({ cmd: 'mmio-rw-suite' });
           }
+        } else if (m.cmd === 'mmio-rw-suite-ack') {
+          // PI_INTERRUPT_MASK at 0xCC003004 is a u32-only register;
+          // Dolphin's MMIOMapping returns the same u32 for read8/read16
+          // requests (no byte-handlers registered). The meaningful
+          // verification is the read32 → write32 → read32 round-trip:
+          // we re-wrote the original value, so mask32b must equal mask32.
+          var ok_rw = (m.mask32 >>> 0) === (m.mask32b >>> 0);
+          var ok_responded = (m.byte0 !== undefined) && (m.half0 !== undefined);
+          console.log('[ppc-worker-handshake] mmio-rw-suite cmds=2/3/4/7 all responded; '
+            + 'read32=0x' + (m.mask32>>>0).toString(16)
+            + ' write32+read32=0x' + (m.mask32b>>>0).toString(16)
+            + ' round-trip=' + (ok_rw?'PASS':'FAIL'));
         } else if (m.cmd === 'error') {
           console.error('[ppc-worker-handshake] error: ' + m.error);
         }

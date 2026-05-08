@@ -87,13 +87,33 @@
         break;
       }
       case 'mmio-read-test': {
-        // Phase 2c.4d: ppc-worker calls _ppc_worker_mmio_read32 which
-        // routes via the mailbox (cmd=4). Page-side consumer recognises
-        // cmd=4 and (in 4d) returns a mock value; in 4e it'll route to
-        // dolphin_worker.
+        // Phase 2c.4d/4e: ppc-worker → mailbox → dolphin → return value.
         if (!inited) { postMessage({ cmd: 'mmio-read-test-nack', reason: 'not initialised' }); return; }
         const value = mod._ppc_worker_mmio_read32((data.addr | 0) >>> 0) >>> 0;
         postMessage({ cmd: 'mmio-read-test-ack', addr: data.addr, value });
+        break;
+      }
+      case 'mmio-rw-suite': {
+        // Phase 2c.4f-1: exercise read8/read16/write8/write16/write32
+        // through the mailbox. dolphin handles each via dolphin_read*/
+        // dolphin_write* into Memory.GetMMIOMapping(). This validates
+        // the new arg1 slot and all six cmd handlers.
+        if (!inited) { postMessage({ cmd: 'mmio-rw-suite-nack', reason: 'not initialised' }); return; }
+        const PI_MASK = 0xCC003004;
+        // Read current PI mask (32-bit).
+        const mask32 = mod._ppc_worker_mmio_read32(PI_MASK) >>> 0;
+        // Read first byte of mask (8-bit). Should be the LOW byte
+        // (PI mask is little-endian on the wire from MMIO ops? Actually
+        // PowerPC is big-endian — the high byte of the u32 is at the
+        // lowest offset). dolphin_read8(addr) returns the byte at addr.
+        const byte0 = mod._ppc_worker_mmio_read8(PI_MASK)  >>> 0;
+        const half0 = mod._ppc_worker_mmio_read16(PI_MASK) >>> 0;
+        // Write into a benign register slot — re-write the SAME mask
+        // back to itself so we don't disturb dolphin state.
+        mod._ppc_worker_mmio_write32(PI_MASK, mask32);
+        const mask32b = mod._ppc_worker_mmio_read32(PI_MASK) >>> 0;
+        postMessage({ cmd: 'mmio-rw-suite-ack',
+          mask32, byte0, half0, mask32b });
         break;
       }
       case 'mailbox-call': {

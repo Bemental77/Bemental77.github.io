@@ -105,45 +105,50 @@ void ppc_worker_mailbox_post_demo(u32 sentinel) {
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(g_mailbox_base)) = sentinel;
 }
 
-// ---- Mailbox request-reply (Phase 2c.4c) ----
+// ---- Mailbox request-reply (Phase 2c.4c, extended in 2c.4f-1) ----
 // Single-slot synchronous request-reply. Slot layout at g_mailbox_base:
 //   +0  cmd          u32  ppc writes
-//   +4  arg0         u32  ppc writes
-//   +8  req_ready    u32  ppc sets 1 (publish), consumer resets to 0
-//   +12 reply        u32  consumer writes
-//   +16 reply_ready  u32  consumer sets 1, ppc Atomics.waits on it
+//   +4  arg0         u32  ppc writes (typically address)
+//   +8  arg1         u32  ppc writes (typically value, for writes)
+//   +12 req_ready    u32  ppc sets 1 (publish), consumer resets to 0
+//   +16 reply        u32  consumer writes
+//   +20 reply_ready  u32  consumer sets 1, ppc Atomics.waits on it
 //
-// Consumer (currently the page; in 2c.4e dolphin_worker takes over)
-// polls req_ready, processes, writes reply, sets reply_ready,
-// Atomics.notify. ppc-worker resets reply_ready and req_ready to 0 on
-// return so the slot is reusable.
-//
-// Single-slot is fine for the verification path; full ring-buffer
-// (sab_layout.h::MailboxRecord × 1024) lands when MMIO traffic is real.
+// Consumer (dolphin_worker per Phase 2c.4e) polls req_ready in its
+// inner-iter heartbeat, processes, writes reply, sets reply_ready,
+// Atomics.notify.
 
 constexpr u32 MBX_OFF_CMD         = 0;
 constexpr u32 MBX_OFF_ARG0        = 4;
-constexpr u32 MBX_OFF_REQ_READY   = 8;
-constexpr u32 MBX_OFF_REPLY       = 12;
-constexpr u32 MBX_OFF_REPLY_READY = 16;
+constexpr u32 MBX_OFF_ARG1        = 8;
+constexpr u32 MBX_OFF_REQ_READY   = 12;
+constexpr u32 MBX_OFF_REPLY       = 16;
+constexpr u32 MBX_OFF_REPLY_READY = 20;
 
 EMSCRIPTEN_KEEPALIVE
-u32 ppc_worker_mailbox_call_sync(u32 cmd, u32 arg0);
-
-// Convenience wrapper: cmd=4 (MmioRead32 per sab_layout.h::MailboxCmd).
-// Phase 2c.4d: when ppc-worker eventually owns dispatch, every PPC
-// load that hits MMIO (~1% of memory accesses) routes through here.
-EMSCRIPTEN_KEEPALIVE
-u32 ppc_worker_mmio_read32(u32 addr) {
-    return ppc_worker_mailbox_call_sync(/*cmd=*/4u, addr);
-}
+u32 ppc_worker_mailbox_call_sync2(u32 cmd, u32 arg0, u32 arg1);
 
 EMSCRIPTEN_KEEPALIVE
 u32 ppc_worker_mailbox_call_sync(u32 cmd, u32 arg0) {
+    return ppc_worker_mailbox_call_sync2(cmd, arg0, 0u);
+}
+
+// MMIO wrappers. Cmd codes match sab_layout.h::MailboxCmd:
+//   2 = Read8, 3 = Read16, 4 = Read32, 5 = Write8, 6 = Write16, 7 = Write32
+EMSCRIPTEN_KEEPALIVE u32 ppc_worker_mmio_read8(u32 addr)  { return ppc_worker_mailbox_call_sync(2u, addr); }
+EMSCRIPTEN_KEEPALIVE u32 ppc_worker_mmio_read16(u32 addr) { return ppc_worker_mailbox_call_sync(3u, addr); }
+EMSCRIPTEN_KEEPALIVE u32 ppc_worker_mmio_read32(u32 addr) { return ppc_worker_mailbox_call_sync(4u, addr); }
+EMSCRIPTEN_KEEPALIVE void ppc_worker_mmio_write8(u32 addr, u32 val)  { (void)ppc_worker_mailbox_call_sync2(5u, addr, val); }
+EMSCRIPTEN_KEEPALIVE void ppc_worker_mmio_write16(u32 addr, u32 val) { (void)ppc_worker_mailbox_call_sync2(6u, addr, val); }
+EMSCRIPTEN_KEEPALIVE void ppc_worker_mmio_write32(u32 addr, u32 val) { (void)ppc_worker_mailbox_call_sync2(7u, addr, val); }
+
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_mailbox_call_sync2(u32 cmd, u32 arg0, u32 arg1) {
     if (g_mailbox_base == 0u) return 0u;
     u32* base = reinterpret_cast<u32*>(static_cast<uintptr_t>(g_mailbox_base));
     u32* p_cmd        = base + (MBX_OFF_CMD         / 4);
     u32* p_arg0       = base + (MBX_OFF_ARG0        / 4);
+    u32* p_arg1       = base + (MBX_OFF_ARG1        / 4);
     u32* p_req_ready  = base + (MBX_OFF_REQ_READY   / 4);
     u32* p_reply      = base + (MBX_OFF_REPLY       / 4);
     u32* p_reply_ready = base + (MBX_OFF_REPLY_READY / 4);
@@ -153,6 +158,7 @@ u32 ppc_worker_mailbox_call_sync(u32 cmd, u32 arg0) {
     // Write request fields.
     __atomic_store_n(p_cmd,  cmd,  __ATOMIC_RELAXED);
     __atomic_store_n(p_arg0, arg0, __ATOMIC_RELAXED);
+    __atomic_store_n(p_arg1, arg1, __ATOMIC_RELAXED);
     // Publish: set req_ready=1; this is what the consumer polls/waits on.
     __atomic_store_n(p_req_ready, 1u, __ATOMIC_RELEASE);
     emscripten_atomic_notify(p_req_ready, 1);
