@@ -216,6 +216,14 @@
   function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } }
   document.addEventListener('click', resumeAudio); document.addEventListener('keydown', resumeAudio); document.addEventListener('visibilitychange', resumeAudio);
   window.var_setup = function () {
+    // Guard against re-entry — Emscripten may call var_setup more than
+    // once during Module init under PROXY_TO_PTHREAD; without the guard
+    // we'd spawn two ppc_workers racing on the same mailbox slot.
+    if (window._varSetupRan) {
+      console.log('[ppc-worker-handshake] var_setup re-entry skipped');
+      return;
+    }
+    window._varSetupRan = true;
     console.log('[ppc-worker-handshake] var_setup entered');
     pageLog('[ui] var_setup — initializing Dolphin libretro');
     padStatus1 = Module._get_ptr(0);
@@ -244,6 +252,10 @@
       window.ppcSharedMemory = ppcSharedMemory;
       ppc_worker.onmessage = function (e) {
         var m = e.data || {};
+        if (m.cmd === 'rw-suite-debug') {
+          console.log('[ppc-worker-handshake] rw-suite-debug stage=' + m.stage + (m.value !== undefined ? ' value=0x' + (m.value>>>0).toString(16) : ''));
+          return;
+        }
         console.log('[ppc-worker-handshake] ' + JSON.stringify(m));
         if (m.cmd === 'ready') {
           // Phase 2c.4b: assign a mailbox address in shared SAB.

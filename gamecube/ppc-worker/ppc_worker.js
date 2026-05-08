@@ -202,9 +202,11 @@
         // dolphin_write* into Memory.GetMMIOMapping(). This validates
         // the new arg1 slot and all six cmd handlers.
         if (!inited) { postMessage({ cmd: 'mmio-rw-suite-nack', reason: 'not initialised' }); return; }
+        postMessage({ cmd: 'rw-suite-debug', stage: 'entered' });
         const PI_MASK = 0xCC003004;
         // Read current PI mask (32-bit).
         const mask32 = mod._ppc_worker_mmio_read32(PI_MASK) >>> 0;
+        postMessage({ cmd: 'rw-suite-debug', stage: 'after-read32', value: mask32 });
         // Read first byte of mask (8-bit). Should be the LOW byte
         // (PI mask is little-endian on the wire from MMIO ops? Actually
         // PowerPC is big-endian — the high byte of the u32 is at the
