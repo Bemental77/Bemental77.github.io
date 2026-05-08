@@ -214,6 +214,13 @@ self.onmessage = function (e) {
         postMessage({ cmd: 'stateLoaded' });
       }
       break;
+    case 'setup-ppc-mailbox':
+      // Phase 2c.4e: page hands us the SAB offset of the ppc-worker
+      // mailbox slot. We forward to the C++ side which then polls the
+      // slot in JitWasm Run()'s inner-iter heartbeat window.
+      Module._dolphin_ppc_mailbox_init(data.addr >>> 0);
+      postMessage({ cmd: 'print', txt: '[worker] ppc-mailbox init at 0x' + (data.addr >>> 0).toString(16) });
+      break;
     default:
       postMessage({ cmd: 'print', txt: '[worker] unknown cmd: ' + data.cmd });
   }

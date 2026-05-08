@@ -323,8 +323,28 @@
           ppc_worker.postMessage({ cmd: 'mmio-read-test', addr: 0xCC003004 });
         } else if (m.cmd === 'mmio-read-test-ack') {
           var got = (m.value >>> 0).toString(16);
-          var ok = (m.value >>> 0) === 0x1FC;
-          console.log('[ppc-worker-handshake] mmio_read32(0xCC003004) → 0x' + got + ' ' + (ok ? 'PASS' : 'FAIL'));
+          if (!window._ppcMboxRealMmio) {
+            // Page-mock response (Phase 2c.4d).
+            var ok = (m.value >>> 0) === 0x1FC;
+            console.log('[ppc-worker-handshake] mmio_read32(0xCC003004) → 0x' + got + ' (page-mock) ' + (ok ? 'PASS' : 'FAIL'));
+            // Phase 2c.4e cutover: hand mailbox to dolphin_worker.
+            setTimeout(function () {
+              try {
+                dolphin_worker.postMessage({ cmd: 'setup-ppc-mailbox', addr: 0x02000000 });
+                if (window._ppcMboxConsumer) { clearInterval(window._ppcMboxConsumer); window._ppcMboxConsumer = null; }
+                console.log('[ppc-worker-handshake] cutover: dolphin_worker now owns ppc-mailbox');
+                setTimeout(function () {
+                  window._ppcMboxRealMmio = true;
+                  ppc_worker.postMessage({ cmd: 'mmio-read-test', addr: 0xCC003004 });
+                }, 500);
+              } catch (e) {
+                console.error('[ppc-worker-handshake] cutover failed: ' + (e && e.message ? e.message : String(e)));
+              }
+            }, 3000);
+          } else {
+            // Real dolphin response.
+            console.log('[ppc-worker-handshake] mmio_read32(0xCC003004) → 0x' + got + ' (dolphin) — Phase 2c.4e end-to-end');
+          }
         } else if (m.cmd === 'error') {
           console.error('[ppc-worker-handshake] error: ' + m.error);
         }
