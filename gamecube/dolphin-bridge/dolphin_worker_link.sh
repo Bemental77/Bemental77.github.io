@@ -66,7 +66,7 @@ emcc \
   $BUILD/Externals/glslang/glslang/glslang/libglslang.a \
   $BUILD/Externals/glslang/glslang/SPIRV/libSPIRV.a \
   --post-js $BRIDGE/worker_funcs.js \
-  -o $OUT/dolphin_worker.js \
+  -o $OUT/dolphin_worker_emcc.js \
   -O3 \
   -std=c++23 \
   -fno-strict-aliasing \
@@ -100,4 +100,4 @@ emcc \
   --embed-file $ROOT/gamecube/IPL.bin@/IPL.bin \
   --embed-file $ROOT/gamecube/dolphin-src/Data/Sys/totaldb.dsy@/totaldb.dsy
 
-echo "linked: $OUT/dolphin_worker.js"
+echo "linked: $OUT/dolphin_worker_emcc.js"

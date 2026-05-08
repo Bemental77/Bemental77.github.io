@@ -239,6 +239,14 @@
     dolphin_worker = new Worker('/gamecube/dolphin_libretro/dolphin_worker.js?v=' + Date.now());
     dolphin_worker.onmessage = onWorkerMsg;
     window.dolphin_worker = dolphin_worker;
+    // 2e.3b: dolphin_worker.js is now a shim. First message must carry
+    // the page's shared SAB-backed WebAssembly.Memory so dolphin's wasm
+    // imports the same memory ppc-worker has. With dolphin's link
+    // configured -sGLOBAL_BASE=0x10000000 (2e.3a), its data section
+    // starts at 256 MB; ppc-worker's stays at low addresses; the
+    // PowerPCState region at SAB[0x02400000] sits between them
+    // (safe from both modules' instantiation-time data init).
+    dolphin_worker.postMessage({ cmd: 'mem-init', memory: sharedMemory });
 
     // Phase 2c: spawn the dedicated PowerPC JIT worker, sharing the
     // same memory object.
