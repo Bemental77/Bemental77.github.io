@@ -250,18 +250,29 @@
       };
       var ppcSharedMemory = sharedMemory;  // same memory as dolphin_worker
       window.ppcSharedMemory = ppcSharedMemory;
+      // Verification cascade is opt-in via ?ppctest=1 — costs ~25s of
+      // mailbox round-trips at heartbeat-polling rate, only useful for
+      // regression-checking the Phase 2c.4* infra. Default-off keeps
+      // probe time honest. Once Phase 2c.4f-4 lands and ppc-worker
+      // actually drives dispatch, the cascade can be deleted entirely.
+      var ppcTestEnabled = new URLSearchParams(location.search).has('ppctest');
       ppc_worker.onmessage = function (e) {
         var m = e.data || {};
         if (m.cmd === 'rw-suite-debug') {
-          console.log('[ppc-worker-handshake] rw-suite-debug stage=' + m.stage + (m.value !== undefined ? ' value=0x' + (m.value>>>0).toString(16) : ''));
+          if (ppcTestEnabled) console.log('[ppc-worker-handshake] rw-suite-debug stage=' + m.stage + (m.value !== undefined ? ' value=0x' + (m.value>>>0).toString(16) : ''));
           return;
         }
-        console.log('[ppc-worker-handshake] ' + JSON.stringify(m));
+        if (ppcTestEnabled || m.cmd === 'ready') {
+          console.log('[ppc-worker-handshake] ' + JSON.stringify(m));
+        }
         if (m.cmd === 'ready') {
-          // Phase 2c.4b: assign a mailbox address in shared SAB.
-          // 0x02000000 = 32 MB into shared memory; well above the
-          // SAB-probe at 0x01000000 and below MEM1's typical placement.
+          // ALWAYS: initialise the worker (mailbox base etc.) so
+          // Phase 2c.4f machinery is reachable. Test cascade only
+          // chains further when ?ppctest=1.
           ppc_worker.postMessage({ cmd: 'init', ppcStateAddr: 0, mem1Addr: 0, mem1Size: 0, mailboxAddr: 0x02000000 });
+        } else if (!ppcTestEnabled) {
+          // Skip the rest of the cascade in normal probe runs.
+          return;
         } else if (m.cmd === 'init-ack') {
           // Test dispatch round-trip with a known PC. Stub returns input
           // PC unchanged, so we expect next === 0x80003140.
