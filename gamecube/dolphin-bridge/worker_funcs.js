@@ -15,6 +15,22 @@ if (typeof Module !== 'undefined') {
     if (typeof _ppc_origORI === 'function') {
       try { _ppc_origORI(); } catch (e) {}
     }
+    // 2e.4: redirect PowerPCState to shared SAB at offset 0x02400000.
+    // Must happen BEFORE Core::System is constructed (which happens
+    // later during retro_load_game). When PowerPCManager's constructor
+    // sees g_ppc_state_external_storage != nullptr, it placement-new's
+    // PowerPCState into shared memory — both dolphin and ppc-worker
+    // see the same bytes via direct env.memory access. This is the
+    // foundation for native-speed dispatch (no per-state-access
+    // mailbox round-trips).
+    try {
+      if (typeof Module._dolphin_set_ppc_state_external_storage === 'function') {
+        Module._dolphin_set_ppc_state_external_storage(0x02400000);
+        postMessage({ cmd: 'print', txt: '[worker] PowerPCState redirected to SAB[0x02400000]' });
+      }
+    } catch (err) {
+      postMessage({ cmd: 'print', txt: '[worker] state redirect FAILED: ' + (err && err.message ? err.message : String(err)) });
+    }
     postMessage({ cmd: 'runtime-ready' });
     postMessage({ cmd: 'print', txt: '[worker] runtime-ready posted' });
   };
