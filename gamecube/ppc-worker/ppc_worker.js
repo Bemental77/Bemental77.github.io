@@ -21,6 +21,8 @@
   let inited = false;
   let pendingDispatch = null;  // queued if 'dispatch' arrives before 'ready'
   let sharedMemoryRef = null;  // the WebAssembly.Memory we received via mem-init
+  let mailboxBase = 0;         // remembered from 'init' so the run loop can
+                               // peek reply_extra1/2 after a CompileBlock
 
   importScripts('./ppc_worker_emcc.js?v=' + Date.now());
 
@@ -63,6 +65,7 @@
         const mem1Size     = (data.mem1Size     | 0) >>> 0;
         const mailboxAddr  = (data.mailboxAddr  | 0) >>> 0;
         mod._ppc_worker_init(ppcStateAddr, mem1Addr, mem1Size, mailboxAddr);
+        mailboxBase = mailboxAddr;
         inited = true;
         postMessage({ cmd: 'init-ack' });
         break;

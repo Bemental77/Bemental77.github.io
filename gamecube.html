@@ -352,6 +352,13 @@
             var ok = (m.value >>> 0) === 0x1FC;
             console.log('[ppc-worker-handshake] mmio_read32(0xCC003004) → 0x' + got + ' (page-mock) ' + (ok ? 'PASS' : 'FAIL'));
             // Phase 2c.4e cutover: hand mailbox to dolphin_worker.
+            // 4f-5 NOTE: this cutover does NOT actually hand the mailbox
+            // to dolphin — dolphin's wasm linear memory is independent
+            // of page+ppc-worker's SAB, so dolphin's poll never observes
+            // page-side req_ready writes. The cascade post-cutover
+            // continues to "PASS" by coincidence (stale reply field
+            // values matching expected). 4f-5 needs page-mediated
+            // routing instead. See memory: 4f5_sab_collision.md.
             setTimeout(function () {
               try {
                 dolphin_worker.postMessage({ cmd: 'setup-ppc-mailbox', addr: 0x02000000 });
@@ -470,6 +477,9 @@
             + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
             + ' exit=' + m.exitReason
             + ' ' + (ok ? 'PASS' : 'FAIL'));
+          // 4f-5 verification removed: requires dolphin↔ppc-worker SAB
+          // sharing, which collides on data sections at instantiation.
+          // See memory: 4f5_sab_collision.md.
         } else if (m.cmd === 'run-nack') {
           console.error('[ppc-worker-handshake] run FAIL: ' + m.reason);
         } else if (m.cmd === 'error') {
