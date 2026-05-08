@@ -23,7 +23,7 @@ if [ ! -f "$BJIT_BUILD/libbementalJIT.a" ] || [ ! -f "$BJIT_BUILD/guests/powerpc
   emmake make -j4 bementalJIT bementalJITPowerPC > /tmp/bjit_build.log 2>&1
 fi
 
-EXPORTED_FUNCS='["_main","_malloc","_free","_ppc_worker_init","_ppc_worker_dispatch","_ppc_worker_shutdown","_ppc_worker_version"]'
+EXPORTED_FUNCS='["_main","_malloc","_free","_ppc_worker_init","_ppc_worker_dispatch","_ppc_worker_shutdown","_ppc_worker_version","_ppc_worker_peek_u32","_ppc_worker_poke_u32"]'
 
 EXPORTED_RUNTIME='["ccall","cwrap","getValue","setValue","HEAP8","HEAPU8","HEAP32","HEAPU32"]'
 

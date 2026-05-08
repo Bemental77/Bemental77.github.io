@@ -79,6 +79,21 @@ u32 ppc_worker_dispatch(u32 pc) {
     return pc;
 }
 
+// Shared-memory verification probe. Reads a u32 at the given linear
+// memory address and returns it. If the page wrote a sentinel into the
+// SAB at this address, ppc-worker should read back the same value —
+// proving the WebAssembly.Memory really is shared, not just two copies.
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_peek_u32(u32 addr) {
+    return *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(addr));
+}
+
+// Companion poke for symmetric test from the ppc-worker side.
+EMSCRIPTEN_KEEPALIVE
+void ppc_worker_poke_u32(u32 addr, u32 value) {
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(addr)) = value;
+}
+
 // shutdown: stub.
 EMSCRIPTEN_KEEPALIVE
 void ppc_worker_shutdown() {

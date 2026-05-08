@@ -255,6 +255,22 @@
           ppc_worker.postMessage({ cmd: 'dispatch', pc: 0x80003140 });
         } else if (m.cmd === 'dispatch-ack') {
           console.log('[ppc-worker-handshake] dispatch round-trip OK, next=0x' + (m.next >>> 0).toString(16));
+          // Phase 2c.4a SAB-share verification: write a sentinel into
+          // shared memory from the page, ask ppc-worker to read it back.
+          // Address chosen: 16 MB into the SAB (well above any heap or
+          // stack collision; well below MEM1's typical placement). This
+          // proves the WebAssembly.Memory really is shared, not two
+          // independent copies.
+          var SAB_PROBE_ADDR = 0x01000000;
+          var SAB_PROBE_VALUE = 0xDEC0DE42;
+          var view = new DataView(sharedMemory.buffer);
+          view.setUint32(SAB_PROBE_ADDR, SAB_PROBE_VALUE, true);  // little-endian
+          console.log('[ppc-worker-handshake] SAB probe wrote 0x' + SAB_PROBE_VALUE.toString(16) + ' at 0x' + SAB_PROBE_ADDR.toString(16));
+          ppc_worker.postMessage({ cmd: 'sab-peek', addr: SAB_PROBE_ADDR });
+        } else if (m.cmd === 'sab-peek-ack') {
+          var got = (m.value >>> 0).toString(16);
+          var ok = (m.value >>> 0) === 0xDEC0DE42;
+          console.log('[ppc-worker-handshake] SAB peek-ack addr=0x' + (m.addr >>> 0).toString(16) + ' got=0x' + got + ' ' + (ok ? 'PASS' : 'FAIL'));
         } else if (m.cmd === 'error') {
           console.error('[ppc-worker-handshake] error: ' + m.error);
         }

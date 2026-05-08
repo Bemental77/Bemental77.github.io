@@ -71,6 +71,12 @@
         postMessage({ cmd: 'dispatch-ack', next });
         break;
       }
+      case 'sab-peek': {
+        if (!mod) { postMessage({ cmd: 'sab-peek-nack', reason: 'wasm not yet ready' }); return; }
+        const value = mod._ppc_worker_peek_u32((data.addr | 0) >>> 0) >>> 0;
+        postMessage({ cmd: 'sab-peek-ack', addr: data.addr, value });
+        break;
+      }
       case 'shutdown': {
         if (mod) mod._ppc_worker_shutdown();
         postMessage({ cmd: 'shutdown-ack' });
