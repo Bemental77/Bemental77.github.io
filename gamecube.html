@@ -269,7 +269,13 @@
           // ALWAYS: initialise the worker (mailbox base etc.) so
           // Phase 2c.4f machinery is reachable. Test cascade only
           // chains further when ?ppctest=1.
-          ppc_worker.postMessage({ cmd: 'init', ppcStateAddr: 0, mem1Addr: 0, mem1Size: 0, mailboxAddr: 0x02000000 });
+          // 2d.1: PPC_STATE_SAB_OFFSET reserves a SAB region for the
+          // emulated PowerPCState. ppc-worker's init stores this as
+          // ppc_state_addr; future bementalJIT-emitted blocks will
+          // emit reads/writes against this offset (ctx_ptr_const in
+          // build_block). The verification step below confirms a
+          // dispatched wasm block can mutate state at this offset.
+          ppc_worker.postMessage({ cmd: 'init', ppcStateAddr: 0x02400000, mem1Addr: 0, mem1Size: 0, mailboxAddr: 0x02000000 });
         } else if (!ppcTestEnabled) {
           // Skip the rest of the cascade in normal probe runs.
           return;
@@ -532,6 +538,13 @@
             // → block1 → 0xDEADBEEF → unmapped (exit). Iter cap of 10
             // is plenty; dispatch chain is exactly 2 hops.
             ppc_worker.postMessage({ cmd: 'run', startPc: 0x80003100, maxIters: 10 });
+          } else if (m.regionIdx === 4) {
+            // Phase 2d.1: dispatch the ppc-state mutate block. pc=0xABCD
+            // resolves to the only block in region 4. The block writes
+            // 0xCAFED00D to SAB[ppc_state+0] and returns 0; iter 1
+            // looks up pc=0 → unmapped → exit. (maxIters=1 would exit
+            // on the iter-count guard before checking pc=0.)
+            ppc_worker.postMessage({ cmd: 'run', startPc: 0xABCD, maxIters: 2 });
           }
         } else if (m.cmd === 'region-instantiate-nack') {
           console.error('[ppc-worker-handshake] region-instantiate FAIL: ' + m.reason);
@@ -566,7 +579,20 @@
         } else if (m.cmd === 'region-call-export-nack') {
           console.error('[ppc-worker-handshake] region call FAIL: ' + m.reason);
         } else if (m.cmd === 'run-ack') {
-          if (window._ppcRunCompileTest) {
+          if (window._ppcStateMutateTest) {
+            // Phase 2d.1 verification: a dispatched wasm block writes
+            // 0xCAFED00D via env.memory to SAB[ppc_state_addr+0]. The
+            // run loop should iter once and exit unmapped (next_pc=0).
+            var okIters_d1  = m.iters === 1;
+            var okReason_d1 = m.exitReason === 'unmapped';
+            var sabValue = new Uint32Array(sharedMemory.buffer)[0x02400000 >> 2] >>> 0;
+            var okSab    = sabValue === 0xCAFED00D;
+            var ok_d1 = okIters_d1 && okReason_d1 && okSab;
+            console.log('[ppc-worker-handshake] ppc-state-mutate iters=' + m.iters
+              + ' exit=' + m.exitReason
+              + ' SAB[0x02400000]=0x' + sabValue.toString(16)
+              + ' ' + (ok_d1 ? 'PASS' : 'FAIL'));
+          } else if (window._ppcRunCompileTest) {
             // Phase 2c.4f-5 verification: dispatch loop posted CompileBlock
             // (cmd 13) for each unmapped pc; page-mock synthesized a
             // stub wasm whose block0() returns pc+4. With maxIters=3
@@ -584,6 +610,53 @@
               + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
               + ' exit=' + m.exitReason
               + ' ' + (ok5 ? 'PASS' : 'FAIL'));
+            // Kick off Phase 2d.1 ppc-state mutate test. Page writes a
+            // sentinel into SAB[ppc_state+0]; a dispatched hand-built
+            // wasm block writes 0xCAFED00D over it via env.memory.
+            window._ppcStateMutateTest = true;
+            var u32state = new Uint32Array(sharedMemory.buffer);
+            u32state[0x02400000 >> 2] = 0xDEADBEEF;
+            // Hand-built wasm: imports env.memory, exports block0()
+            // that does
+            //   *(u32*)(env.memory + 0x02400000) = 0xCAFED00D
+            //   return 0
+            // The 5-byte padded sLEB128 of 0x02400000 is 80,80,80,92,00;
+            // 0xCAFED00D is 8d,a0,fb,d7,7c.
+            // Memory import limits MUST match the page's SAB:
+            // shared=true with max. limits_flags = 0x03 (has-max + shared);
+            // min=8192 (LEB128 = 0x80 0x40 = 512 MB / 64 KB pages);
+            // max=65536 (LEB128 = 0x80 0x80 0x04 = 4 GB / 64 KB pages).
+            // Otherwise WebAssembly.Instance throws
+            //   "mismatch in shared state of memory, declared = 0,
+            //    imported = 1".
+            var mutateWasm = new Uint8Array([
+              0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,           // \0asm v1
+              0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,           // type sec: ()->i32
+              0x02, 0x13, 0x01,                                    // import sec, content size 19
+                0x03, 0x65,0x6e,0x76,                             //   "env"
+                0x06, 0x6d,0x65,0x6d,0x6f,0x72,0x79,              //   "memory"
+                0x02,                                              //   kind=memory
+                0x03, 0x80,0x40, 0x80,0x80,0x04,                  //   shared+max, min=8192, max=65536
+              0x03, 0x02, 0x01, 0x00,                              // func sec: 1 func type 0
+              0x07, 0x0a, 0x01,                                    // export sec
+                0x06, 0x62,0x6c,0x6f,0x63,0x6b,0x30,              //   "block0"
+                0x00, 0x00,                                        //   kind=func, idx=0
+              0x0a, 0x15, 0x01,                                    // code sec: 1 body, content 21
+                0x13, 0x00,                                        //   body_size=19, locals=0
+                0x41, 0x80,0x80,0x80,0x92,0x00,                   //   i32.const 0x02400000
+                0x41, 0x8d,0xa0,0xfb,0xd7,0x7c,                   //   i32.const 0xCAFED00D
+                0x36, 0x02, 0x00,                                  //   i32.store align=2 offset=0
+                0x41, 0x00,                                        //   i32.const 0
+                0x0b                                               //   end
+            ]);
+            var pcKeysD1 = new Uint32Array([0xABCD]);
+            ppc_worker.postMessage({
+              cmd: 'region-instantiate',
+              regionIdx: 4,
+              bytes: mutateWasm.buffer,
+              imports: 'env',
+              pcKeys: pcKeysD1.buffer,
+            });
           } else {
             var okIters  = m.iters === 2;
             var okLast   = (m.lastPc >>> 0) === 0xDEADBEEF;
