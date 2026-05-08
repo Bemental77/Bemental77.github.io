@@ -106,4 +106,27 @@ if(BEMENTAL_GUEST_POWERPC)
         "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
     )
     target_compile_options(test_pi_mask_path PRIVATE "-pthread")
+
+    # Validates that bementalJIT correctly emits the SAB strcat byte
+    # sequence at 0x8010df88..0x8010dfb0 (lbzu/cmpli/bne loops). If this
+    # fails, the HLEStrcat patch is masking a JIT-level bug — without HLE
+    # replacement the game would corrupt memory on every strcat call.
+    add_executable(test_str_hle_pattern test_str_hle_pattern.cpp)
+    target_link_libraries(test_str_hle_pattern PRIVATE bementalJIT bementalJITPowerPC)
+    target_include_directories(test_str_hle_pattern PRIVATE
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set_target_properties(test_str_hle_pattern PROPERTIES SUFFIX ".html")
+    target_link_options(test_str_hle_pattern PRIVATE
+        "SHELL:-s EXIT_RUNTIME=1"
+        "SHELL:-pthread"
+        "SHELL:-s PTHREAD_POOL_SIZE=0"
+        "SHELL:-s INITIAL_MEMORY=33554432"
+        "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+        "SHELL:-s MAXIMUM_MEMORY=67108864"
+        "SHELL:-s ALLOW_TABLE_GROWTH=1"
+        "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+    )
+    target_compile_options(test_str_hle_pattern PRIVATE "-pthread")
 endif()

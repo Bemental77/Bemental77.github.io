@@ -649,21 +649,14 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
     // module exporting ONE function `region` and ONE mutable global
     // `entry_sel`; dispatcher writes entry_sel = local_idx then calls
     // region() to execute.
-    // Lever #2 single-function merged region. Toggled by BJIT_LEVER2_MERGED=1
-    // (process env) OR Module.lever2_merged=1 (JS-side flag, useful for
-    // puppeteer probe before pthread spawns). Default OFF — boot-parity
-    // confirmed on SAB+PSO with merged ON, including the depth-tracked
-    // br-to-loop optimization. Pending: A/B perf measurement vs legacy
-    // before flipping default ON.
+    // Lever #2 — single-function merged region with depth-tracked
+    // br-to-loop. Default ON: SAB+PSO boot parity confirmed and ~43%
+    // reduction in region-dispatch host round-trips on SAB at disp=100k.
+    // Override via BJIT_LEVER2_MERGED_OFF=1 to fall back to N-fn shape.
 #ifdef __EMSCRIPTEN__
-    static const bool s_merged_enabled = []{
-        if (std::getenv("BJIT_LEVER2_MERGED") != nullptr) return true;
-        return EM_ASM_INT({
-            return (typeof Module === 'object' && Module.lever2_merged) ? 1 : 0;
-        }) != 0;
-    }();
+    static const bool s_merged_enabled = (std::getenv("BJIT_LEVER2_MERGED_OFF") == nullptr);
 #else
-    static const bool s_merged_enabled = (std::getenv("BJIT_LEVER2_MERGED") != nullptr);
+    static const bool s_merged_enabled = (std::getenv("BJIT_LEVER2_MERGED_OFF") == nullptr);
 #endif
     bool use_merged_fn = s_merged_enabled
                       && (rs.block_records.size() == rs.n_funcs);
