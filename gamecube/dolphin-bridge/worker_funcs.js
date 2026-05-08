@@ -269,6 +269,12 @@ self.onmessage = function (e) {
           case 10: r = Module._dolphin_check_exc(a0) >>> 0; break;
           case 11: Module._dolphin_break_block(a0); break;
           case 12: r = Module._dolphin_read_tb(a0) >>> 0; break;
+          case 100:
+            // 4f-6 routing-live probe. Pure function (no emulator
+            // state), so it works pre-boot. The cascade verifies the
+            // round-trip: cmd 100 with arg0=0 must reply 0xCAFEBABE.
+            r = Module._dolphin_routing_probe(a0) >>> 0;
+            break;
           default: r = 0;
         }
       } catch (err) {

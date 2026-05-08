@@ -427,11 +427,20 @@
           // 2c.4c PING test.
           ppc_worker.postMessage({ cmd: 'mailbox-call', mboxCmd: 1, arg0: 42 });
         } else if (m.cmd === 'mailbox-call-ack') {
-          var ok = ((m.reply >>> 0) === 84);
-          console.log('[ppc-worker-handshake] mailbox sync-call PING(42) → ' + (m.reply >>> 0) + ' ' + (ok ? 'PASS' : 'FAIL'));
-          // Phase 2c.4d: now that ping works, exercise the MmioRead32
-          // wrapper. ppc-worker should get the page-mock 0x1FC.
-          ppc_worker.postMessage({ cmd: 'mmio-read-test', addr: 0xCC003004 });
+          if (window._routingProbeInFlight) {
+            window._routingProbeInFlight = false;
+            var probeOk = (m.reply >>> 0) === 0xCAFEBABE;
+            console.log('[ppc-worker-handshake] routing-probe(0) → 0x'
+              + (m.reply >>> 0).toString(16) + ' ' + (probeOk ? 'PASS' : 'FAIL'));
+            // Continue to the rest of the MMIO cmd suite.
+            ppc_worker.postMessage({ cmd: 'mmio-rw-suite' });
+          } else {
+            var ok = ((m.reply >>> 0) === 84);
+            console.log('[ppc-worker-handshake] mailbox sync-call PING(42) → ' + (m.reply >>> 0) + ' ' + (ok ? 'PASS' : 'FAIL'));
+            // Phase 2c.4d: now that ping works, exercise the MmioRead32
+            // wrapper. ppc-worker should get the page-mock 0x1FC.
+            ppc_worker.postMessage({ cmd: 'mmio-read-test', addr: 0xCC003004 });
+          }
         } else if (m.cmd === 'mmio-read-test-ack') {
           var got = (m.value >>> 0).toString(16);
           if (!window._ppcMboxRealMmio) {
@@ -457,8 +466,14 @@
           } else {
             // Real dolphin response.
             console.log('[ppc-worker-handshake] mmio_read32(0xCC003004) → 0x' + got + ' (dolphin) — Phase 2c.4e end-to-end');
-            // Phase 2c.4f-1: exercise the rest of the MMIO cmd set.
-            ppc_worker.postMessage({ cmd: 'mmio-rw-suite' });
+            // 4f-6 routing-live verification: cmd 100 routes via the
+            // page-mediated path to dolphin_routing_probe, which is a
+            // pure function returning magic ^ 0xCAFEBABE. With arg0=0
+            // the reply must be 0xCAFEBABE — only possible if dolphin's
+            // wasm code actually executed. If the page fallback had
+            // answered, reply would be 0.
+            window._routingProbeInFlight = true;
+            ppc_worker.postMessage({ cmd: 'mailbox-call', mboxCmd: 100, arg0: 0 });
           }
         } else if (m.cmd === 'mmio-rw-suite-ack') {
           var ok_rw = (m.mask32 >>> 0) === (m.mask32b >>> 0);
