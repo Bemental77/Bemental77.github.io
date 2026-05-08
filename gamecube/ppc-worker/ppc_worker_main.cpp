@@ -21,6 +21,7 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#include <emscripten/atomic.h>
 #endif
 
 using namespace bemental;
@@ -95,17 +96,68 @@ void ppc_worker_poke_u32(u32 addr, u32 value) {
 }
 
 // ---- Mailbox primitive (Phase 2c.4b — async one-way demo) ----
-// Phase 2c.4b ships only the simplest possible cross-worker write:
-// ppc-worker pokes a sentinel into shared SAB at the mailbox address;
-// page polls and verifies. No reply, no Atomics yet — that's 2c.4c.
-//
-// This proves ppc-worker → shared-SAB → page works end-to-end with a
-// real export the dispatch loop can call. Once verified, the same
-// mechanism extends to writing MailboxRecord slots + reply waits.
+// 2c.4b ships only the simplest possible cross-worker write: ppc-worker
+// pokes a sentinel into shared SAB at the mailbox address; page polls
+// and verifies. No reply, no Atomics. Foundation for 2c.4c below.
 EMSCRIPTEN_KEEPALIVE
 void ppc_worker_mailbox_post_demo(u32 sentinel) {
     if (g_mailbox_base == 0u) return;
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(g_mailbox_base)) = sentinel;
+}
+
+// ---- Mailbox request-reply (Phase 2c.4c) ----
+// Single-slot synchronous request-reply. Slot layout at g_mailbox_base:
+//   +0  cmd          u32  ppc writes
+//   +4  arg0         u32  ppc writes
+//   +8  req_ready    u32  ppc sets 1 (publish), consumer resets to 0
+//   +12 reply        u32  consumer writes
+//   +16 reply_ready  u32  consumer sets 1, ppc Atomics.waits on it
+//
+// Consumer (currently the page; in 2c.4e dolphin_worker takes over)
+// polls req_ready, processes, writes reply, sets reply_ready,
+// Atomics.notify. ppc-worker resets reply_ready and req_ready to 0 on
+// return so the slot is reusable.
+//
+// Single-slot is fine for the verification path; full ring-buffer
+// (sab_layout.h::MailboxRecord × 1024) lands when MMIO traffic is real.
+
+constexpr u32 MBX_OFF_CMD         = 0;
+constexpr u32 MBX_OFF_ARG0        = 4;
+constexpr u32 MBX_OFF_REQ_READY   = 8;
+constexpr u32 MBX_OFF_REPLY       = 12;
+constexpr u32 MBX_OFF_REPLY_READY = 16;
+
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_mailbox_call_sync(u32 cmd, u32 arg0) {
+    if (g_mailbox_base == 0u) return 0u;
+    u32* base = reinterpret_cast<u32*>(static_cast<uintptr_t>(g_mailbox_base));
+    u32* p_cmd        = base + (MBX_OFF_CMD         / 4);
+    u32* p_arg0       = base + (MBX_OFF_ARG0        / 4);
+    u32* p_req_ready  = base + (MBX_OFF_REQ_READY   / 4);
+    u32* p_reply      = base + (MBX_OFF_REPLY       / 4);
+    u32* p_reply_ready = base + (MBX_OFF_REPLY_READY / 4);
+
+    // Reset reply_ready so we can wait on transition 0→1.
+    __atomic_store_n(p_reply_ready, 0u, __ATOMIC_RELEASE);
+    // Write request fields.
+    __atomic_store_n(p_cmd,  cmd,  __ATOMIC_RELAXED);
+    __atomic_store_n(p_arg0, arg0, __ATOMIC_RELAXED);
+    // Publish: set req_ready=1; this is what the consumer polls/waits on.
+    __atomic_store_n(p_req_ready, 1u, __ATOMIC_RELEASE);
+    emscripten_atomic_notify(p_req_ready, 1);
+
+    // Wait until reply_ready becomes non-zero. Bound the wait so a
+    // consumer crash doesn't hang the worker forever.
+    for (int i = 0; i < 100; ++i) {
+        const u32 ready = __atomic_load_n(p_reply_ready, __ATOMIC_ACQUIRE);
+        if (ready != 0u) break;
+        emscripten_atomic_wait_u32(p_reply_ready, 0u, 100000000ll /* 100 ms */);
+    }
+    const u32 reply = __atomic_load_n(p_reply, __ATOMIC_ACQUIRE);
+    // Consumer-acknowledged. Reset slot so consumer's next poll sees 0.
+    __atomic_store_n(p_req_ready,  0u, __ATOMIC_RELEASE);
+    __atomic_store_n(p_reply_ready, 0u, __ATOMIC_RELEASE);
+    return reply;
 }
 
 // shutdown: stub.

@@ -280,6 +280,34 @@
           var got = view.getUint32(0x02000000, true) >>> 0;
           var ok = (got === 0xCAFEBABE);
           console.log('[ppc-worker-handshake] mailbox-demo addr=0x02000000 got=0x' + got.toString(16) + ' ' + (ok ? 'PASS' : 'FAIL'));
+          // Phase 2c.4c: start the page-side mailbox consumer + issue
+          // a sync ping. Consumer polls req_ready every 4 ms (typical
+          // request rate is far lower while we're just verifying);
+          // dolphin_worker will replace it as the consumer in 2c.4e.
+          var MBX_BASE = 0x02000000;
+          var MBX_REQ_READY   = MBX_BASE + 8;
+          var MBX_REPLY       = MBX_BASE + 12;
+          var MBX_REPLY_READY = MBX_BASE + 16;
+          var i32 = new Int32Array(sharedMemory.buffer);
+          // Reset slot to known state.
+          Atomics.store(i32, MBX_REQ_READY   >> 2, 0);
+          Atomics.store(i32, MBX_REPLY_READY >> 2, 0);
+          window._ppcMboxConsumer = setInterval(function () {
+            var req = Atomics.load(i32, MBX_REQ_READY >> 2);
+            if (req !== 1) return;
+            var cmd  = Atomics.load(i32, (MBX_BASE +  0) >> 2);
+            var arg0 = Atomics.load(i32, (MBX_BASE +  4) >> 2);
+            // Test reply: cmd 1 (PING) returns arg0 * 2.
+            var reply = (cmd === 1) ? ((arg0 * 2) | 0) : 0;
+            Atomics.store(i32, MBX_REPLY       >> 2, reply);
+            Atomics.store(i32, MBX_REPLY_READY >> 2, 1);
+            Atomics.notify(i32, MBX_REPLY_READY >> 2, 1);
+          }, 4);
+          // Issue a sync ping: ppc-worker should get back 84.
+          ppc_worker.postMessage({ cmd: 'mailbox-call', mboxCmd: 1, arg0: 42 });
+        } else if (m.cmd === 'mailbox-call-ack') {
+          var ok = ((m.reply >>> 0) === 84);
+          console.log('[ppc-worker-handshake] mailbox sync-call PING(42) → ' + (m.reply >>> 0) + ' ' + (ok ? 'PASS' : 'FAIL'));
         } else if (m.cmd === 'error') {
           console.error('[ppc-worker-handshake] error: ' + m.error);
         }

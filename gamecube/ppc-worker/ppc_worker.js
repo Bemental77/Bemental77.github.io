@@ -86,6 +86,17 @@
         postMessage({ cmd: 'mailbox-demo-ack', sentinel: data.sentinel });
         break;
       }
+      case 'mailbox-call': {
+        // Phase 2c.4c: synchronous request-reply. ppc-worker C++
+        // publishes (mboxCmd, arg0) into the mailbox slot, Atomics.waits
+        // for the consumer (page) to write reply + reply_ready.
+        // BLOCKS this worker until the page responds.
+        if (!inited) { postMessage({ cmd: 'mailbox-call-nack', reason: 'not initialised' }); return; }
+        const reply = mod._ppc_worker_mailbox_call_sync(
+          (data.mboxCmd | 0) >>> 0, (data.arg0 | 0) >>> 0) >>> 0;
+        postMessage({ cmd: 'mailbox-call-ack', reply });
+        break;
+      }
       case 'shutdown': {
         if (mod) mod._ppc_worker_shutdown();
         postMessage({ cmd: 'shutdown-ack' });
