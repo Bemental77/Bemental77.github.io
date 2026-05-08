@@ -1193,6 +1193,36 @@
         // 4f-6: dolphin's mbx-cmd handler reply. Ignore here — the
         // listener inside mailbox-demo-ack writes to the SAB.
         break;
+      case 'state-export-test-result': {
+        // 2d.7: dolphin stamped its test buffer with sentinel + pattern.
+        // Bytes arrive here Transferable; we copy into SAB[0x02400000]
+        // and verify the layout matches what dolphin wrote. PC sentinel
+        // at +0, pattern (0xCAFE0000 | offset/4) at every other u32.
+        if (data.error) {
+          console.error('[ppc-worker-handshake] state-export-test FAIL: ' + data.error);
+          break;
+        }
+        var u8s = new Uint8Array(data.bytes);
+        var u8sab = new Uint8Array(sharedMemory.buffer);
+        u8sab.set(u8s, 0x02400000);
+        var u32sab = new Uint32Array(sharedMemory.buffer);
+        var pcVal  = u32sab[(0x02400000 + 0)  >> 2] >>> 0;
+        var pat4   = u32sab[(0x02400000 + 4)  >> 2] >>> 0;  // 0xCAFE0001 expected
+        var pat32  = u32sab[(0x02400000 + 32) >> 2] >>> 0;  // 0xCAFE0008 expected
+        var pat252 = u32sab[(0x02400000 + 252)>> 2] >>> 0;  // 0xCAFE003F expected
+        var okPc    = pcVal === (data.pcSentinel >>> 0);
+        var okPat4  = pat4 === 0xCAFE0001;
+        var okPat32 = pat32 === 0xCAFE0008;
+        var okPat252 = pat252 === 0xCAFE003F;
+        var ok_d7 = okPc && okPat4 && okPat32 && okPat252;
+        console.log('[ppc-worker-handshake] state-sync size=' + data.size
+          + ' SAB[+0]=0x' + pcVal.toString(16) + ' (expect 0x' + (data.pcSentinel >>> 0).toString(16) + ')'
+          + ' SAB[+4]=0x' + pat4.toString(16)
+          + ' SAB[+32]=0x' + pat32.toString(16)
+          + ' SAB[+252]=0x' + pat252.toString(16)
+          + ' ' + (ok_d7 ? 'PASS' : 'FAIL'));
+        break;
+      }
       case 'compile-test-result': {
         // 2d.2: dolphin emitted a real bementalJIT wasm via build_block
         // and shipped the bytes via Transferable. Verify the magic
@@ -1262,6 +1292,11 @@
             + ' Module=' + (instROk ? 'OK' : ('FAIL:' + instRErr))
             + ' shape=' + (preBootShape ? 'pre-boot-fallback' : (postBootShape ? 'post-boot-real' : 'unexpected'))
             + ' ' + (ok_d6 ? 'PASS' : 'FAIL'));
+          // Phase 2d.7 kick-off: dolphin stamps a test PowerPCState
+          // buffer with a sentinel + recognizable pattern, ships the
+          // bytes to the page; page copies into SAB[0x02400000] and
+          // verifies the layout.
+          dolphin_worker.postMessage({ cmd: 'state-export-test', pcSentinel: 0xDEADC0DE });
           break;
         }
         if (data.tag && data.tag !== 'verify') break;

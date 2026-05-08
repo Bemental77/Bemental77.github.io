@@ -240,6 +240,26 @@ self.onmessage = function (e) {
       // signal: we just print so the cascade log lines up.
       postMessage({ cmd: 'print', txt: '[worker] setup-ppc-mailbox legacy ack (4f-6: routing is page-mediated)' });
       break;
+    case 'state-export-test': {
+      // 2d.7: stamp the dolphin-side test PowerPCState buffer with a
+      // known sentinel + pattern, then ship the buffer bytes to the
+      // page via Transferable. Page copies into SAB[0x02400000] and
+      // verifies the layout (PC at +0, pattern at +4..). Production
+      // PowerPCState mirror will work the same way but read from
+      // m_system.GetPPCState() instead of the test buffer.
+      try {
+        var pcSentinel = (data.pcSentinel | 0) >>> 0;
+        Module._dolphin_test_state_set_pc(pcSentinel);
+        var addr = Module._dolphin_test_state_buf_addr() >>> 0;
+        var size = Module._dolphin_test_state_buf_size() >>> 0;
+        var bytes = new Uint8Array(size);
+        bytes.set(Module.HEAPU8.subarray(addr, addr + size));
+        postMessage({ cmd: 'state-export-test-result', size: size, pcSentinel: pcSentinel, bytes: bytes.buffer }, [bytes.buffer]);
+      } catch (err) {
+        postMessage({ cmd: 'state-export-test-result', error: 'state-export-test threw: ' + (err && err.message ? err.message : String(err)) });
+      }
+      break;
+    }
     case 'compile-test': {
       // 2d.2: page asks dolphin to emit a real bementalJIT wasm module
       // for `pc` and ship the bytes back. dolphin_test_compile_block
