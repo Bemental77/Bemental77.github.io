@@ -627,6 +627,11 @@
               + ' (expected 0x' + expectedNext.toString(16) + ')'
               + ' exit=' + m.exitReason
               + ' ' + (ok_d3 ? 'PASS' : 'FAIL'));
+            // Phase 2d.5: multi-instruction compile test. dolphin's
+            // dolphin_test_compile_block(pc, n_insts) emits an
+            // n_insts-nop block via build_block; the wasm bytes scale
+            // up. 10 nops should produce >500 bytes vs 386 baseline.
+            dolphin_worker.postMessage({ cmd: 'compile-test', pc: 0x80003200, nInsts: 10, tag: 'multi-insts' });
           } else if (window._ppcStateMutateTest) {
             window._ppcStateMutateTest = false;
             // Phase 2d.1 verification: a dispatched wasm block writes
@@ -1195,10 +1200,35 @@
         // is structurally valid. Imports are bound to env.memory (SAB)
         // and the same mailbox-routed env bindings ppc-worker uses,
         // so any import dependencies (ppc_read32 etc.) resolve.
-        // 2d.4: tag-gated — only the cascade verification path uses
-        // tag='verify'. cmd-13 mbx routing uses tag='mbx-13' and is
-        // handled in _ppcMboxReplyListener (which writes bytes into
-        // SAB scratch instead of running the verification logic).
+        // 2d.4: tag-gated — cmd-13 mbx routing uses tag='mbx-13' and
+        // is handled in _ppcMboxReplyListener.
+        // 2d.5: tag='multi-insts' verifies multi-instruction emission
+        // produces larger wasm than the 1-nop baseline.
+        if (data.tag === 'multi-insts') {
+          if (data.error) {
+            console.error('[ppc-worker-handshake] multi-insts FAIL: ' + data.error);
+            break;
+          }
+          var u8m = new Uint8Array(data.bytes);
+          var hdrM = u8m.length >= 8 && u8m[0] === 0x00 && u8m[1] === 0x61 && u8m[2] === 0x73 && u8m[3] === 0x6d;
+          var instMOk = false, instMErr = null;
+          if (hdrM) {
+            try { new WebAssembly.Module(u8m); instMOk = true; }
+            catch (err) { instMErr = err && err.message ? err.message : String(err); }
+          }
+          // 1-nop baseline was 386. 10-nop should be appreciably
+          // larger; threshold of 500 is comfortable.
+          var biggerThanBaseline = data.size > 500;
+          var ok_d5 = hdrM && instMOk && biggerThanBaseline;
+          console.log('[ppc-worker-handshake] multi-insts pc=0x' + (data.pc >>> 0).toString(16)
+            + ' nInsts=10 bytes=' + data.size
+            + ' (baseline 386)'
+            + ' magic=' + (hdrM ? 'OK' : 'BAD')
+            + ' Module=' + (instMOk ? 'OK' : ('FAIL:' + instMErr))
+            + ' bigger=' + (biggerThanBaseline ? 'YES' : 'NO')
+            + ' ' + (ok_d5 ? 'PASS' : 'FAIL'));
+          break;
+        }
         if (data.tag && data.tag !== 'verify') break;
         if (data.error) {
           console.error('[ppc-worker-handshake] real-compile FAIL: ' + data.error);

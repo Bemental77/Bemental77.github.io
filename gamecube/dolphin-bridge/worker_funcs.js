@@ -249,7 +249,8 @@ self.onmessage = function (e) {
       try {
         var pc = (data.pc | 0) >>> 0;
         var tag = data.tag || 'verify';
-        var size = Module._dolphin_test_compile_block(pc) >>> 0;
+        var nInsts = (data.nInsts | 0) >>> 0;  // 0 = default 1
+        var size = Module._dolphin_test_compile_block(pc, nInsts) >>> 0;
         if (size === 0) {
           postMessage({ cmd: 'compile-test-result', tag: tag, error: 'build_block returned 0 bytes' });
           break;
