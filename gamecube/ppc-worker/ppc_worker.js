@@ -95,6 +95,18 @@
         postMessage({ cmd: 'mmio-read-test-ack', addr: data.addr, value });
         break;
       }
+      case 'env-call-test': {
+        // Phase 2c.4f-2 verify: invoke a binding from mod.bemental_imports.env
+        // by NAME. If cmd 8/10/12 etc. handlers in dolphin are wired, they
+        // return real values; if not, we get 0 and a spinning Atomics.wait.
+        if (!inited || !mod.bemental_imports) { postMessage({ cmd: 'env-call-test-nack', reason: 'env not ready' }); return; }
+        const env = mod.bemental_imports.env;
+        const fn = env[data.name];
+        if (typeof fn !== 'function') { postMessage({ cmd: 'env-call-test-nack', reason: 'no such fn: ' + data.name }); return; }
+        const reply = fn((data.arg0 | 0) >>> 0) >>> 0;
+        postMessage({ cmd: 'env-call-test-ack', name: data.name, arg0: data.arg0, reply });
+        break;
+      }
       case 'setup-bemental-env': {
         // Phase 2c.4f-2: build the env import object that JIT-emitted
         // blocks will resolve against when instantiated in ppc-worker

@@ -364,6 +364,15 @@
           var ok = JSON.stringify(got) === JSON.stringify(expected);
           console.log('[ppc-worker-handshake] bemental-env keys count=' + m.count + ' ' + (ok?'PASS':'FAIL'));
           if (!ok) console.log('[ppc-worker-handshake]   expected: ' + expected.join(',') + '\n  got: ' + got.join(','));
+          // Phase 2c.4f-2 verify: actually invoke env.ppc_read_tb(0) which
+          // routes to mailbox cmd 12 → dolphin_read_tb in dolphin's poll.
+          // dolphin_read_tb returns the lower TB half (always nonzero
+          // when emulation is running).
+          ppc_worker.postMessage({ cmd: 'env-call-test', name: 'ppc_read_tb', arg0: 0 });
+        } else if (m.cmd === 'env-call-test-ack') {
+          // env.ppc_read_tb(0) → some TB-low value. Just verify the
+          // round-trip completed and we got a value back.
+          console.log('[ppc-worker-handshake] env.' + m.name + '(' + m.arg0 + ') → 0x' + (m.reply >>> 0).toString(16) + ' (cmd 12 = ppc_read_tb)');
         } else if (m.cmd === 'error') {
           console.error('[ppc-worker-handshake] error: ' + m.error);
         }
