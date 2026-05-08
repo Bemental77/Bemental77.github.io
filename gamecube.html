@@ -247,6 +247,13 @@
     // PowerPCState region at SAB[0x02400000] sits between them
     // (safe from both modules' instantiation-time data init).
     dolphin_worker.postMessage({ cmd: 'mem-init', memory: sharedMemory });
+    // 2e.3c: pre-write a cross-boundary sentinel at SAB[0x02400000].
+    // dolphin's heartbeat (every 4096 JIT iters) reads this address
+    // and logs '[dolphin-sab-read] SAB[0x02400000]=0xCAFE1234'. If
+    // dolphin sees the value the page wrote, dolphin and ppc-worker
+    // truly share memory at this offset — the architectural
+    // prerequisite for the native-speed cutover.
+    new Uint32Array(sharedMemory.buffer)[0x02400000 >> 2] = 0xCAFE1234;
 
     // Phase 2c: spawn the dedicated PowerPC JIT worker, sharing the
     // same memory object.
