@@ -244,15 +244,55 @@
         let pc = (data.startPc | 0) >>> 0;
         const maxIters = ((data.maxIters | 0) >>> 0) || 100;
         const regions = mod.bemental_regions;
+        const compileOnMiss = !!data.compileOnMiss;
         let iters = 0;
         let exitReason = 'max-iters';
+        let compileCalls = 0;
         for (; iters < maxIters; ++iters) {
           let region = null, idx = -1;
           for (const k in regions) {
             const r = regions[k];
             if (r && r.pcMap && r.pcMap.has(pc)) { region = r; idx = r.pcMap.get(pc); break; }
           }
-          if (!region) { exitReason = 'unmapped'; break; }
+          if (!region) {
+            if (!compileOnMiss) { exitReason = 'unmapped'; break; }
+            // 4f-5 page-mediated CompileBlock (cmd 13). Page polls the
+            // mailbox slot, synthesizes wasm bytes, writes them into
+            // SAB scratch, and replies with (offset, size, region<<16|fn)
+            // via reply + reply_extra1 + reply_extra2 fields. ppc-worker
+            // copies bytes out of SAB and instantiates locally. Real
+            // bementalJIT-driven delivery comes once the dolphin compile
+            // path is wired (still pending — page synthesizes the test
+            // stub for now).
+            const bytesOffset = mod._ppc_worker_mailbox_call_sync(13, pc) >>> 0;
+            const bytesSize   = mod._ppc_worker_peek_u32(mailboxBase + 24) >>> 0;
+            const packed      = mod._ppc_worker_peek_u32(mailboxBase + 28) >>> 0;
+            ++compileCalls;
+            if (bytesSize === 0) { exitReason = 'compile-empty'; break; }
+            const regionIdx = (packed >>> 16) & 0xFFFF;
+            const fnIdx     = packed & 0xFFFF;
+            try {
+              const bytes = new Uint8Array(sharedMemoryRef.buffer, bytesOffset, bytesSize).slice();
+              const wmod = new WebAssembly.Module(bytes);
+              const importObj = mod.bemental_imports
+                ? { env: mod.bemental_imports.env } : {};
+              const inst = new WebAssembly.Instance(wmod, importObj);
+              if (!regions[regionIdx]) {
+                regions[regionIdx] = { instance: inst, exports: inst.exports, pcMap: new Map(), nFuncs: 0 };
+              } else {
+                regions[regionIdx].instance = inst;
+                regions[regionIdx].exports = inst.exports;
+                if (!regions[regionIdx].pcMap) regions[regionIdx].pcMap = new Map();
+              }
+              regions[regionIdx].pcMap.set(pc >>> 0, fnIdx);
+              regions[regionIdx].nFuncs = Math.max(regions[regionIdx].nFuncs || 0, fnIdx + 1);
+              region = regions[regionIdx];
+              idx = fnIdx;
+            } catch (e) {
+              exitReason = 'compile-instantiate: ' + (e && e.message ? e.message : String(e));
+              break;
+            }
+          }
           const fn = region.exports['block' + idx];
           if (typeof fn !== 'function') { exitReason = 'no-block-export'; break; }
           try {
@@ -262,7 +302,7 @@
             break;
           }
         }
-        postMessage({ cmd: 'run-ack', iters, lastPc: pc, exitReason });
+        postMessage({ cmd: 'run-ack', iters, lastPc: pc, exitReason, compileCalls });
         break;
       }
       case 'mailbox-call': {

@@ -312,29 +312,77 @@
           var MBX_BASE = 0x02000000;
           var MBX_CMD         = MBX_BASE +  0;
           var MBX_ARG0        = MBX_BASE +  4;
-          var MBX_ARG1        = MBX_BASE +  8;
-          var MBX_REQ_READY   = MBX_BASE + 12;
-          var MBX_REPLY       = MBX_BASE + 16;
-          var MBX_REPLY_READY = MBX_BASE + 20;
+          var MBX_ARG1         = MBX_BASE +  8;
+          var MBX_REQ_READY    = MBX_BASE + 12;
+          var MBX_REPLY        = MBX_BASE + 16;
+          var MBX_REPLY_READY  = MBX_BASE + 20;
+          var MBX_REPLY_EXTRA1 = MBX_BASE + 24;
+          var MBX_REPLY_EXTRA2 = MBX_BASE + 28;
+          var WASM_SCRATCH_OFFSET = 0x02100000;  // mailbox base + 1 MB
           var i32 = new Int32Array(sharedMemory.buffer);
+          var u8  = new Uint8Array(sharedMemory.buffer);
           // Reset slot to known state.
           Atomics.store(i32, MBX_REQ_READY   >> 2, 0);
           Atomics.store(i32, MBX_REPLY_READY >> 2, 0);
+          // 4f-5 helper: build a 43-byte wasm exporting block0() returning
+          // a constant nextPc. 5-byte padded sLEB128 keeps wasm size
+          // constant across pc values.
+          function buildCompileBlockWasm(nextPc) {
+            var w = new Uint8Array([
+              0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+              0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+              0x03, 0x02, 0x01, 0x00,
+              0x07, 0x0a, 0x01,
+                0x06, 0x62,0x6c,0x6f,0x63,0x6b,0x30, 0x00, 0x00,
+              0x0a, 0x0a, 0x01,
+                0x08, 0x00, 0x41,
+                0x00, 0x00, 0x00, 0x00, 0x00,
+                0x0b
+            ]);
+            // 5-byte padded sLEB128 of nextPc into bytes [37..41]
+            w[37] = (nextPc & 0x7F) | 0x80;
+            w[38] = ((nextPc >>> 7)  & 0x7F) | 0x80;
+            w[39] = ((nextPc >>> 14) & 0x7F) | 0x80;
+            w[40] = ((nextPc >>> 21) & 0x7F) | 0x80;
+            var b4 = (nextPc >>> 28) & 0x0F;
+            if (nextPc & 0x80000000) b4 |= 0x70;
+            w[41] = b4;
+            return w;
+          }
           window._ppcMboxConsumer = setInterval(function () {
             var req = Atomics.load(i32, MBX_REQ_READY >> 2);
             if (req !== 1) return;
             var cmd  = Atomics.load(i32, MBX_CMD  >> 2);
             var arg0 = Atomics.load(i32, MBX_ARG0 >> 2);
-            var reply = 0;
+            var reply = 0, extra1 = 0, extra2 = 0;
             if (cmd === 1) {
               // PING: reply = arg0 * 2.
               reply = (arg0 * 2) | 0;
             } else if (cmd === 4) {
               // MmioRead32: page-side mock for 2c.4d.
               if ((arg0 >>> 0) === 0xCC003004) reply = 0x1FC;
+            } else if (cmd === 13) {
+              // 4f-5 CompileBlock: synthesize a 1-block wasm whose
+              // block0() returns arg0+4, write to SAB scratch, reply
+              // with (offset, size, region<<16|fn). Region 5 fn 0 is
+              // a fixed test-mode assignment; real bementalJIT-driven
+              // delivery comes after the dolphin compile path is
+              // wired. The page-mediated routing here means dolphin's
+              // wasm memory stays independent of page+ppc-worker's SAB
+              // (the SAB-collision fix per 4f5_sab_collision.md).
+              var nextPc = (arg0 + 4) >>> 0;
+              var w = buildCompileBlockWasm(nextPc);
+              u8.set(w, WASM_SCRATCH_OFFSET);
+              reply  = WASM_SCRATCH_OFFSET;
+              extra1 = w.length;
+              extra2 = (5 << 16) | 0;
             }
-            Atomics.store(i32, MBX_REPLY       >> 2, reply);
-            Atomics.store(i32, MBX_REPLY_READY >> 2, 1);
+            // Extras must be visible BEFORE reply_ready transitions;
+            // Atomics.store on reply_ready provides the release fence.
+            Atomics.store(i32, MBX_REPLY_EXTRA1 >> 2, extra1 >>> 0);
+            Atomics.store(i32, MBX_REPLY_EXTRA2 >> 2, extra2 >>> 0);
+            Atomics.store(i32, MBX_REPLY        >> 2, reply  >>> 0);
+            Atomics.store(i32, MBX_REPLY_READY  >> 2, 1);
             Atomics.notify(i32, MBX_REPLY_READY >> 2, 1);
           }, 4);
           // 2c.4c PING test.
@@ -351,19 +399,17 @@
             // Page-mock response (Phase 2c.4d).
             var ok = (m.value >>> 0) === 0x1FC;
             console.log('[ppc-worker-handshake] mmio_read32(0xCC003004) → 0x' + got + ' (page-mock) ' + (ok ? 'PASS' : 'FAIL'));
-            // Phase 2c.4e cutover: hand mailbox to dolphin_worker.
-            // 4f-5 NOTE: this cutover does NOT actually hand the mailbox
-            // to dolphin — dolphin's wasm linear memory is independent
-            // of page+ppc-worker's SAB, so dolphin's poll never observes
-            // page-side req_ready writes. The cascade post-cutover
-            // continues to "PASS" by coincidence (stale reply field
-            // values matching expected). 4f-5 needs page-mediated
-            // routing instead. See memory: 4f5_sab_collision.md.
+            // Phase 2c.4e was a "cutover" that handed the mailbox to
+            // dolphin. 4f-5 keeps the page-mock setInterval as the
+            // PERMANENT mailbox consumer instead — dolphin's wasm
+            // memory cannot be naively shared with ppc-worker (SAB
+            // data-section collision; see memory:4f5_sab_collision.md).
+            // The 'cutover' postMessage still goes to dolphin so its
+            // setup-ppc-mailbox handler logs the init address; harmless.
             setTimeout(function () {
               try {
                 dolphin_worker.postMessage({ cmd: 'setup-ppc-mailbox', addr: 0x02000000 });
-                if (window._ppcMboxConsumer) { clearInterval(window._ppcMboxConsumer); window._ppcMboxConsumer = null; }
-                console.log('[ppc-worker-handshake] cutover: dolphin_worker now owns ppc-mailbox');
+                console.log('[ppc-worker-handshake] cutover: page-mock remains consumer (4f-5 page-mediated)');
                 setTimeout(function () {
                   window._ppcMboxRealMmio = true;
                   ppc_worker.postMessage({ cmd: 'mmio-read-test', addr: 0xCC003004 });
@@ -469,17 +515,40 @@
         } else if (m.cmd === 'region-call-export-nack') {
           console.error('[ppc-worker-handshake] region call FAIL: ' + m.reason);
         } else if (m.cmd === 'run-ack') {
-          var okIters  = m.iters === 2;
-          var okLast   = (m.lastPc >>> 0) === 0xDEADBEEF;
-          var okReason = m.exitReason === 'unmapped';
-          var ok = okIters && okLast && okReason;
-          console.log('[ppc-worker-handshake] run iters=' + m.iters
-            + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
-            + ' exit=' + m.exitReason
-            + ' ' + (ok ? 'PASS' : 'FAIL'));
-          // 4f-5 verification removed: requires dolphin↔ppc-worker SAB
-          // sharing, which collides on data sections at instantiation.
-          // See memory: 4f5_sab_collision.md.
+          if (window._ppcRunCompileTest) {
+            // Phase 2c.4f-5 verification: dispatch loop posted CompileBlock
+            // (cmd 13) for each unmapped pc; page-mock synthesized a
+            // stub wasm whose block0() returns pc+4. With maxIters=3
+            // and startPc=0x10000000 the chain walks
+            //   0x10000000 → 0x10000004 → 0x10000008 → 0x1000000C,
+            // exit=max-iters after exactly 3 dispatches and 3 compile
+            // round-trips.
+            var okIters5  = m.iters === 3;
+            var okLast5   = (m.lastPc >>> 0) === 0x1000000C;
+            var okReason5 = m.exitReason === 'max-iters';
+            var okCalls5  = m.compileCalls === 3;
+            var ok5 = okIters5 && okLast5 && okReason5 && okCalls5;
+            console.log('[ppc-worker-handshake] run-with-compile iters=' + m.iters
+              + ' compileCalls=' + m.compileCalls
+              + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+              + ' exit=' + m.exitReason
+              + ' ' + (ok5 ? 'PASS' : 'FAIL'));
+          } else {
+            var okIters  = m.iters === 2;
+            var okLast   = (m.lastPc >>> 0) === 0xDEADBEEF;
+            var okReason = m.exitReason === 'unmapped';
+            var ok = okIters && okLast && okReason;
+            console.log('[ppc-worker-handshake] run iters=' + m.iters
+              + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+              + ' exit=' + m.exitReason
+              + ' ' + (ok ? 'PASS' : 'FAIL'));
+            // Kick off 4f-5 verification: empty region 5, run with
+            // compileOnMiss=true. Each miss mailbox-calls cmd 13
+            // (CompileBlock); page synthesizes wasm bytes and writes
+            // them into SAB scratch, ppc-worker copies + instantiates.
+            window._ppcRunCompileTest = true;
+            ppc_worker.postMessage({ cmd: 'run', startPc: 0x10000000, maxIters: 3, compileOnMiss: true });
+          }
         } else if (m.cmd === 'run-nack') {
           console.error('[ppc-worker-handshake] run FAIL: ' + m.reason);
         } else if (m.cmd === 'error') {
