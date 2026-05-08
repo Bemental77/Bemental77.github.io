@@ -20,6 +20,7 @@
   let mod = null;
   let inited = false;
   let pendingDispatch = null;  // queued if 'dispatch' arrives before 'ready'
+  let sharedMemoryRef = null;  // the WebAssembly.Memory we received via mem-init
 
   importScripts('./ppc_worker_emcc.js?v=' + Date.now());
 
@@ -45,12 +46,13 @@
     switch (data.cmd) {
       case 'mem-init': {
         // The page hands us a SharedArrayBuffer-backed WebAssembly.Memory.
-        // Phase 2c Step 2: this is currently created by the page just for
-        // ppc-worker. Step 3 will share it with dolphin_worker too.
+        // Phase 2c Step 3: same memory is shared with dolphin_worker via
+        // Module.wasmMemory page-side injection.
         if (!data.memory || !(data.memory instanceof WebAssembly.Memory)) {
           postMessage({ cmd: 'error', error: 'mem-init requires memory: WebAssembly.Memory' });
           return;
         }
+        sharedMemoryRef = data.memory;
         instantiateWith(data.memory);
         break;
       }
@@ -91,6 +93,34 @@
         if (!inited) { postMessage({ cmd: 'mmio-read-test-nack', reason: 'not initialised' }); return; }
         const value = mod._ppc_worker_mmio_read32((data.addr | 0) >>> 0) >>> 0;
         postMessage({ cmd: 'mmio-read-test-ack', addr: data.addr, value });
+        break;
+      }
+      case 'setup-bemental-env': {
+        // Phase 2c.4f-2: build the env import object that JIT-emitted
+        // blocks will resolve against when instantiated in ppc-worker
+        // (Phase 2c.4f-3). Each binding mailboxes its request via
+        // ppc_worker_mailbox_call_sync — dolphin executes the
+        // corresponding dolphin_* function in its inner-iter poll.
+        // Cmd codes match gamecube/ppc-worker/sab_layout.h::MailboxCmd.
+        if (!inited) { postMessage({ cmd: 'setup-bemental-env-nack', reason: 'not initialised' }); return; }
+        if (!mod.bemental_imports) mod.bemental_imports = { env: {} };
+        const env = mod.bemental_imports.env;
+        const call1 = (cmd, a) => mod._ppc_worker_mailbox_call_sync(cmd, a >>> 0) >>> 0;
+        const call2 = (cmd, a, b) => { mod._ppc_worker_mailbox_call_sync2(cmd, a >>> 0, b >>> 0); };
+        env.memory          = sharedMemoryRef;
+        env.ppc_read8       = (addr) => call1(2, addr);
+        env.ppc_read16      = (addr) => call1(3, addr);
+        env.ppc_read32      = (addr) => call1(4, addr);
+        env.ppc_write8      = (addr, val) => call2(5, addr, val);
+        env.ppc_write16     = (addr, val) => call2(6, addr, val);
+        env.ppc_write32     = (addr, val) => call2(7, addr, val);
+        env.ppc_hle_check   = (pc) => call1(8, pc);
+        env.ppc_interp      = (inst, pc) => call2(9, inst, pc);
+        env.ppc_check_exc   = (pc) => call1(10, pc);
+        env.ppc_break_block = (pc, x) => call2(11, pc, x);
+        env.ppc_read_tb     = (which) => call1(12, which);
+        const keys = Object.keys(env).sort();
+        postMessage({ cmd: 'setup-bemental-env-ack', keys, count: keys.length });
         break;
       }
       case 'mmio-rw-suite': {

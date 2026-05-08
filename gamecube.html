@@ -349,17 +349,21 @@
             ppc_worker.postMessage({ cmd: 'mmio-rw-suite' });
           }
         } else if (m.cmd === 'mmio-rw-suite-ack') {
-          // PI_INTERRUPT_MASK at 0xCC003004 is a u32-only register;
-          // Dolphin's MMIOMapping returns the same u32 for read8/read16
-          // requests (no byte-handlers registered). The meaningful
-          // verification is the read32 → write32 → read32 round-trip:
-          // we re-wrote the original value, so mask32b must equal mask32.
           var ok_rw = (m.mask32 >>> 0) === (m.mask32b >>> 0);
-          var ok_responded = (m.byte0 !== undefined) && (m.half0 !== undefined);
           console.log('[ppc-worker-handshake] mmio-rw-suite cmds=2/3/4/7 all responded; '
             + 'read32=0x' + (m.mask32>>>0).toString(16)
             + ' write32+read32=0x' + (m.mask32b>>>0).toString(16)
             + ' round-trip=' + (ok_rw?'PASS':'FAIL'));
+          // Phase 2c.4f-2: replicate Module.bemental_imports.env in
+          // ppc-worker so JIT-emitted blocks (instantiated in ppc-worker
+          // in 4f-3) can resolve their env imports.
+          ppc_worker.postMessage({ cmd: 'setup-bemental-env' });
+        } else if (m.cmd === 'setup-bemental-env-ack') {
+          var expected = ['memory','ppc_break_block','ppc_check_exc','ppc_hle_check','ppc_interp','ppc_read16','ppc_read32','ppc_read8','ppc_read_tb','ppc_write16','ppc_write32','ppc_write8'].sort();
+          var got = (m.keys || []).slice().sort();
+          var ok = JSON.stringify(got) === JSON.stringify(expected);
+          console.log('[ppc-worker-handshake] bemental-env keys count=' + m.count + ' ' + (ok?'PASS':'FAIL'));
+          if (!ok) console.log('[ppc-worker-handshake]   expected: ' + expected.join(',') + '\n  got: ' + got.join(','));
         } else if (m.cmd === 'error') {
           console.error('[ppc-worker-handshake] error: ' + m.error);
         }
