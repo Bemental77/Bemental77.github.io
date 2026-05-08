@@ -643,6 +643,11 @@
               + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
               + ' exit=' + m.exitReason
               + ' ' + (ok_d8 ? 'PASS' : 'FAIL'));
+            // 2d.9 (real-cutover) attempt was REVERTED — see
+            // memory:2d9_real_cutover_blocked.md. The mirror-and-pause
+            // approach is fundamentally blocked by emscripten's
+            // PROXY_TO_PTHREAD memory isolation between the JS main
+            // thread and dolphin's pthread.
           } else if (window._ppcRealDispatchTest) {
             window._ppcRealDispatchTest = false;
             // Phase 2d.3: bementalJIT-emitted nop block dispatched
@@ -1227,6 +1232,10 @@
       case 'mbx-reply':
         // 4f-6: dolphin's mbx-cmd handler reply. Ignore here — the
         // listener inside mailbox-demo-ack writes to the SAB.
+        break;
+      case 'paused-for-cutover':
+      case 'cutover-resumed':
+        // 2d.9 reverted; messages no longer expected. Ignore silently.
         break;
       case 'state-export-test-result': {
         // 2d.7: dolphin stamped its test buffer with sentinel + pattern.

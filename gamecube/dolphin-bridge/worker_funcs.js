@@ -240,6 +240,13 @@ self.onmessage = function (e) {
       // signal: we just print so the cascade log lines up.
       postMessage({ cmd: 'print', txt: '[worker] setup-ppc-mailbox legacy ack (4f-6: routing is page-mediated)' });
       break;
+    case 'pause-for-cutover':
+    case 'resume-from-cutover':
+      // 2d.9 reverted — see memory:2d9_real_cutover_blocked.md.
+      // Acknowledge to keep the page's cascade unstuck if it sent
+      // the message anyway.
+      postMessage({ cmd: 'cutover-resumed', error: '2d.9 cutover blocked by PROXY_TO_PTHREAD memory isolation' });
+      break;
     case 'state-export-test': {
       // 2d.7: stamp the dolphin-side test PowerPCState buffer with a
       // known sentinel + pattern, then ship the buffer bytes to the
