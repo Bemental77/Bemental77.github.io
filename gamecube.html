@@ -1227,6 +1227,41 @@
             + ' Module=' + (instMOk ? 'OK' : ('FAIL:' + instMErr))
             + ' bigger=' + (biggerThanBaseline ? 'YES' : 'NO')
             + ' ' + (ok_d5 ? 'PASS' : 'FAIL'));
+          // Phase 2d.6: kick off real-decode test. Pre-boot
+          // dolphin_compile_block_real returns 0 (g_jit_wasm null);
+          // worker_funcs.js falls through to the synth path. Cascade
+          // verifies the API plumbing works AND the decode flag
+          // correctly reports false pre-boot.
+          dolphin_worker.postMessage({ cmd: 'compile-test', pc: 0x80003100, realDecode: true, tag: 'real-decode' });
+          break;
+        }
+        if (data.tag === 'real-decode') {
+          if (data.error) {
+            console.error('[ppc-worker-handshake] real-decode FAIL: ' + data.error);
+            break;
+          }
+          var u8r = new Uint8Array(data.bytes);
+          var hdrR = u8r.length >= 8 && u8r[0] === 0x00 && u8r[1] === 0x61 && u8r[2] === 0x73 && u8r[3] === 0x6d;
+          var instROk = false, instRErr = null;
+          if (hdrR) {
+            try { new WebAssembly.Module(u8r); instROk = true; }
+            catch (err) { instRErr = err && err.message ? err.message : String(err); }
+          }
+          // Pre-boot expectation: decoded=false (g_jit_wasm null →
+          // dolphin_compile_block_real returns 0 → fallback to synth →
+          // bytes match the 1-nop baseline of 386).
+          // Post-boot expectation (future): decoded=true, bytes scale
+          // with the real instruction count at pc.
+          var preBootShape = !data.decoded && data.size === 386;
+          var postBootShape = data.decoded && data.size > 100;
+          var ok_d6 = hdrR && instROk && (preBootShape || postBootShape);
+          console.log('[ppc-worker-handshake] real-decode pc=0x' + (data.pc >>> 0).toString(16)
+            + ' decoded=' + data.decoded
+            + ' bytes=' + data.size
+            + ' magic=' + (hdrR ? 'OK' : 'BAD')
+            + ' Module=' + (instROk ? 'OK' : ('FAIL:' + instRErr))
+            + ' shape=' + (preBootShape ? 'pre-boot-fallback' : (postBootShape ? 'post-boot-real' : 'unexpected'))
+            + ' ' + (ok_d6 ? 'PASS' : 'FAIL'));
           break;
         }
         if (data.tag && data.tag !== 'verify') break;

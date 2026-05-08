@@ -250,7 +250,20 @@ self.onmessage = function (e) {
         var pc = (data.pc | 0) >>> 0;
         var tag = data.tag || 'verify';
         var nInsts = (data.nInsts | 0) >>> 0;  // 0 = default 1
-        var size = Module._dolphin_test_compile_block(pc, nInsts) >>> 0;
+        // 2d.6: when realDecode is set, try the post-boot real-decode
+        // path first (uses dolphin's MMU to read instructions from
+        // emulated RAM at pc). Returns 0 pre-boot or on decode failure;
+        // fall through to the synth path so verification still gets
+        // valid bytes back.
+        var size = 0;
+        var decoded = false;
+        if (data.realDecode) {
+          size = Module._dolphin_compile_block_real(pc) >>> 0;
+          decoded = (size !== 0);
+        }
+        if (size === 0) {
+          size = Module._dolphin_test_compile_block(pc, nInsts) >>> 0;
+        }
         if (size === 0) {
           postMessage({ cmd: 'compile-test-result', tag: tag, error: 'build_block returned 0 bytes' });
           break;
@@ -260,7 +273,7 @@ self.onmessage = function (e) {
         // Transferable transfer doesn't take the heap-backed view.
         var bytes = new Uint8Array(size);
         bytes.set(Module.HEAPU8.subarray(addr, addr + size));
-        postMessage({ cmd: 'compile-test-result', tag: tag, pc: pc, size: size, bytes: bytes.buffer }, [bytes.buffer]);
+        postMessage({ cmd: 'compile-test-result', tag: tag, pc: pc, size: size, decoded: decoded, bytes: bytes.buffer }, [bytes.buffer]);
       } catch (err) {
         postMessage({ cmd: 'compile-test-result', tag: data.tag || 'verify', error: 'compile-test threw: ' + (err && err.message ? err.message : String(err)) });
       }
