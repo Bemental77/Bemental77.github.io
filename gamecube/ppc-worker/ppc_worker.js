@@ -271,8 +271,15 @@
             ++compileCalls;
             totalCompileBytes += bytesSize;
             if (bytesSize === 0) { exitReason = 'compile-empty'; break; }
-            const regionIdx = (packed >>> 16) & 0xFFFF;
-            const fnIdx     = packed & 0xFFFF;
+            // 2f.0: reply_extra2 packs cycles + region + fn:
+            //   bits 0-15:  fn idx (16-bit)
+            //   bits 16-23: region idx (8-bit)
+            //   bits 24-31: cycle count (8-bit, 0..255)
+            // cycles = 0 means stub or pre-boot fallback (treat as 1 to
+            // keep downcount progressing).
+            const regionIdx   = (packed >>> 16) & 0xFF;
+            const fnIdx       = packed & 0xFFFF;
+            const blockCycles = ((packed >>> 24) & 0xFF) || 1;
             try {
               const bytes = new Uint8Array(sharedMemoryRef.buffer, bytesOffset, bytesSize).slice();
               const wmod = new WebAssembly.Module(bytes);
@@ -280,13 +287,15 @@
                 ? { env: mod.bemental_imports.env } : {};
               const inst = new WebAssembly.Instance(wmod, importObj);
               if (!regions[regionIdx]) {
-                regions[regionIdx] = { instance: inst, exports: inst.exports, pcMap: new Map(), nFuncs: 0 };
+                regions[regionIdx] = { instance: inst, exports: inst.exports, pcMap: new Map(), cycleMap: new Map(), nFuncs: 0 };
               } else {
                 regions[regionIdx].instance = inst;
                 regions[regionIdx].exports = inst.exports;
                 if (!regions[regionIdx].pcMap) regions[regionIdx].pcMap = new Map();
+                if (!regions[regionIdx].cycleMap) regions[regionIdx].cycleMap = new Map();
               }
               regions[regionIdx].pcMap.set(pc >>> 0, fnIdx);
+              regions[regionIdx].cycleMap.set(pc >>> 0, blockCycles);  // 2f.0
               regions[regionIdx].nFuncs = Math.max(regions[regionIdx].nFuncs || 0, fnIdx + 1);
               region = regions[regionIdx];
               idx = fnIdx;

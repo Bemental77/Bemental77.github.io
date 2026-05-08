@@ -312,11 +312,16 @@ self.onmessage = function (e) {
           break;
         }
         var addr = Module._dolphin_test_compile_block_addr() >>> 0;
+        // 2f.0: cycle count of this block (raw instruction count).
+        // ppc-worker uses this to decrement ppc_state.downcount per
+        // dispatch in the continuous run loop (2f.1).
+        var cycles = (typeof Module._dolphin_get_last_compile_cycles === 'function')
+          ? (Module._dolphin_get_last_compile_cycles() >>> 0) : 0;
         // Copy out of dolphin's heap into a fresh ArrayBuffer so the
         // Transferable transfer doesn't take the heap-backed view.
         var bytes = new Uint8Array(size);
         bytes.set(Module.HEAPU8.subarray(addr, addr + size));
-        postMessage({ cmd: 'compile-test-result', tag: tag, pc: pc, size: size, decoded: decoded, bytes: bytes.buffer }, [bytes.buffer]);
+        postMessage({ cmd: 'compile-test-result', tag: tag, pc: pc, size: size, decoded: decoded, cycles: cycles, bytes: bytes.buffer }, [bytes.buffer]);
       } catch (err) {
         postMessage({ cmd: 'compile-test-result', tag: data.tag || 'verify', error: 'compile-test threw: ' + (err && err.message ? err.message : String(err)) });
       }

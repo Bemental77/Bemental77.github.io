@@ -414,7 +414,15 @@
               }
               var srcU8 = new Uint8Array(msg.bytes);
               u8.set(srcU8, WASM_SCRATCH_OFFSET);
-              deliverReply(WASM_SCRATCH_OFFSET, msg.size >>> 0, (5 << 16) | 0);
+              // 2f.0: pack cycles into reply_extra2 alongside region/fn:
+              //   bits 0-15:  fn   (16-bit)
+              //   bits 16-23: region (8-bit, 0..255 — current count is 8)
+              //   bits 24-31: cycles (8-bit, 0..255 — kMaxInstrsPerBlock=64)
+              // ppc-worker unpacks and decrements ppc_state.downcount per
+              // dispatch in the continuous run loop (2f.1).
+              var cycles_d4 = (msg.cycles | 0) & 0xFF;
+              var packed_d4 = (cycles_d4 << 24) | (5 << 16) | 0;  // region=5, fn=0
+              deliverReply(WASM_SCRATCH_OFFSET, msg.size >>> 0, packed_d4);
               return;
             }
             if (msg.cmd !== 'mbx-reply') return;
