@@ -199,7 +199,18 @@
   _moduleDummyCanvas.style.display = 'none';
   _moduleDummyCanvas.width = 1;
   _moduleDummyCanvas.height = 1;
-  var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/gamecube/dolphin_libretro/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: _moduleDummyCanvas, setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {} };
+  // Phase 2c Step 3: PAGE allocates ONE shared WebAssembly.Memory
+  // (sized to dolphin_worker's INITIAL_MEMORY = 512 MB, MAX = 4 GB).
+  // Set on Module.wasmMemory BEFORE dolphin_libretro.js runs so the
+  // emcc bootstrap uses it for the main pthread (which becomes
+  // dolphin_worker). ppc-worker is given the SAME memory in var_setup.
+  var sharedMemory = new WebAssembly.Memory({
+    initial: 536870912 / 65536,    // 512 MB / 64 KB pages = 8192
+    maximum: 4294967296 / 65536,   // 4 GB / 64 KB pages = 65536
+    shared: true,
+  });
+  var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/gamecube/dolphin_libretro/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: _moduleDummyCanvas, setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {}, wasmMemory: sharedMemory };
+  console.log('[ppc-worker-handshake] sharedMemory allocated at page-load (initial=' + (sharedMemory.buffer.byteLength >>> 20) + ' MB)');
   var padStatus1, vram_ptr; var dolphin_worker = null; var ppc_worker = null; var states_arrs = []; var audioMuted = false; var pendingSaveResolve = null; var pendingLoadResolve = null;
   function getAudioCtx() { try { return (Module && Module.preCreatedAudioContext) || (Module && Module.SDL && Module.SDL.audioContext) || null; } catch (e) { return null; } }
   function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } }
@@ -210,31 +221,26 @@
     padStatus1 = Module._get_ptr(0);
     Module.SDL.defaults.copyOnLock = false;
     Module.SDL.defaults.opaqueFrontBuffer = false;
+    // sharedMemory was allocated at page-load (above) and assigned to
+    // Module.wasmMemory so dolphin_libretro.js's pthread spawn picks it up.
+    // We re-fetch it here for ppc-worker.
+    window.sharedMemory = sharedMemory;
+
+    // Spawn dolphin (its main pthread inherits sharedMemory via
+    // Module.wasmMemory which was set in the page Module above).
     dolphin_worker = new Worker('/gamecube/dolphin_libretro/dolphin_worker.js?v=' + Date.now());
     dolphin_worker.onmessage = onWorkerMsg;
     window.dolphin_worker = dolphin_worker;
 
-    // Phase 2b: spawn the dedicated PowerPC JIT worker in parallel.
-    // Currently runs alongside dolphin_worker (idle, stub dispatch).
-    // Phase 2c will gate dolphin_worker's dispatch on this worker
-    // being live and route compile/dispatch through SAB mailbox.
+    // Phase 2c: spawn the dedicated PowerPC JIT worker, sharing the
+    // same memory object.
     try {
       console.log('[ppc-worker-handshake] spawning /gamecube/ppc-worker/ppc_worker.js');
       ppc_worker = new Worker('/gamecube/ppc-worker/ppc_worker.js?v=' + Date.now());
       ppc_worker.onerror = function (e) {
         console.error('[ppc-worker-handshake] worker error: ' + (e.message || e.filename + ':' + e.lineno + ' ' + e.error));
       };
-      // Phase 2c Step 2: the PAGE allocates a shared WebAssembly.Memory
-      // and hands it to ppc-worker. Step 3 will reuse the same memory
-      // for dolphin_worker (after dolphin_worker is rebuilt with
-      // -sIMPORTED_MEMORY=1). At that point the two workers see the
-      // same bytes — PowerPCState writes from the JIT are immediately
-      // visible to dolphin_worker without a copy.
-      var ppcSharedMemory = new WebAssembly.Memory({
-        initial: 32 * 1024 * 1024 / 65536,   // 32 MB → 512 pages
-        maximum: 64 * 1024 * 1024 / 65536,   // 64 MB → 1024 pages
-        shared: true,
-      });
+      var ppcSharedMemory = sharedMemory;  // same memory as dolphin_worker
       window.ppcSharedMemory = ppcSharedMemory;
       ppc_worker.onmessage = function (e) {
         var m = e.data || {};
