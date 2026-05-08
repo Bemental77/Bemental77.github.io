@@ -248,9 +248,10 @@ self.onmessage = function (e) {
       // We read via Module.HEAPU8 and Transferable-postMessage to page.
       try {
         var pc = (data.pc | 0) >>> 0;
+        var tag = data.tag || 'verify';
         var size = Module._dolphin_test_compile_block(pc) >>> 0;
         if (size === 0) {
-          postMessage({ cmd: 'compile-test-result', error: 'build_block returned 0 bytes' });
+          postMessage({ cmd: 'compile-test-result', tag: tag, error: 'build_block returned 0 bytes' });
           break;
         }
         var addr = Module._dolphin_test_compile_block_addr() >>> 0;
@@ -258,9 +259,9 @@ self.onmessage = function (e) {
         // Transferable transfer doesn't take the heap-backed view.
         var bytes = new Uint8Array(size);
         bytes.set(Module.HEAPU8.subarray(addr, addr + size));
-        postMessage({ cmd: 'compile-test-result', pc: pc, size: size, bytes: bytes.buffer }, [bytes.buffer]);
+        postMessage({ cmd: 'compile-test-result', tag: tag, pc: pc, size: size, bytes: bytes.buffer }, [bytes.buffer]);
       } catch (err) {
-        postMessage({ cmd: 'compile-test-result', error: 'compile-test threw: ' + (err && err.message ? err.message : String(err)) });
+        postMessage({ cmd: 'compile-test-result', tag: data.tag || 'verify', error: 'compile-test threw: ' + (err && err.message ? err.message : String(err)) });
       }
       break;
     }

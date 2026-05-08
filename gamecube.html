@@ -380,6 +380,20 @@
               console.log('[ppc-worker-handshake] dolphin runtime-ready — MMIO routing live');
               return;
             }
+            // 2d.4: tagged compile-test-result for in-flight cmd 13.
+            // Untagged ('verify') results go to the cascade verification
+            // handler in onWorkerMsg — left untouched here.
+            if (msg.cmd === 'compile-test-result' && msg.tag === 'mbx-13') {
+              if (msg.error) {
+                console.error('[ppc-worker-handshake] cmd-13 compile-test failed: ' + msg.error);
+                deliverReply(0, 0, 0);
+                return;
+              }
+              var srcU8 = new Uint8Array(msg.bytes);
+              u8.set(srcU8, WASM_SCRATCH_OFFSET);
+              deliverReply(WASM_SCRATCH_OFFSET, msg.size >>> 0, (5 << 16) | 0);
+              return;
+            }
             if (msg.cmd !== 'mbx-reply') return;
             deliverReply(msg.reply, msg.reply_extra1, msg.reply_extra2);
           };
@@ -412,12 +426,19 @@
               // Routing is up — fall through to dolphin.
             }
             if (cmd === 13) {
-              // 4f-5 CompileBlock: synthesize 1-block wasm into SAB
-              // scratch, reply with (offset, size, region<<16|fn).
-              var nextPc = (arg0 + 4) >>> 0;
-              var w = buildCompileBlockWasm(nextPc);
-              u8.set(w, WASM_SCRATCH_OFFSET);
-              deliverReply(WASM_SCRATCH_OFFSET, w.length, (5 << 16) | 0);
+              // 2d.4: CompileBlock now routes to dolphin's real
+              // bemental::powerpc::build_block. Page postMessages
+              // 'compile-test' with tag='mbx-13'; dolphin emits and
+              // ships bytes back via 'compile-test-result' tagged
+              // 'mbx-13'. The mbox reply listener (registered below)
+              // matches by tag, copies bytes into SAB[0x02100000],
+              // and calls deliverReply with (offset, size, packed).
+              // inFlight gates the polling loop until the async
+              // round-trip completes. The previous page-stub path
+              // (buildCompileBlockWasm) is kept defined as a fallback
+              // but is no longer the primary CompileBlock source.
+              inFlight = true;
+              dolphin_worker.postMessage({ cmd: 'compile-test', pc: arg0 >>> 0, tag: 'mbx-13' });
               return;
             }
             if (!window._ppcDolphinRoutingReady) {
@@ -628,7 +649,10 @@
             // 'compile-test-result' branch verifies the magic header
             // and instantiates the resulting module.
             window._ppcRealCompileTest = true;
-            dolphin_worker.postMessage({ cmd: 'compile-test', pc: 0x80003100 });
+            // tag='verify' so the response goes to the cascade
+            // verification handler in onWorkerMsg, not the cmd-13
+            // mbx delivery path in _ppcMboxReplyListener.
+            dolphin_worker.postMessage({ cmd: 'compile-test', pc: 0x80003100, tag: 'verify' });
           } else if (window._ppcRunCompileTest) {
             // Phase 2c.4f-5 verification: dispatch loop posted CompileBlock
             // (cmd 13) for each unmapped pc; page-mock synthesized a
@@ -637,13 +661,22 @@
             //   0x10000000 → 0x10000004 → 0x10000008 → 0x1000000C,
             // exit=max-iters after exactly 3 dispatches and 3 compile
             // round-trips.
-            var okIters5  = m.iters === 3;
-            var okLast5   = (m.lastPc >>> 0) === 0x1000000C;
-            var okReason5 = m.exitReason === 'max-iters';
-            var okCalls5  = m.compileCalls === 3;
-            var ok5 = okIters5 && okLast5 && okReason5 && okCalls5;
+            var okIters5   = m.iters === 3;
+            var okLast5    = (m.lastPc >>> 0) === 0x1000000C;
+            var okReason5  = m.exitReason === 'max-iters';
+            var okCalls5   = m.compileCalls === 3;
+            // 2d.4: each cmd-13 reply now sources real bementalJIT
+            // bytes from dolphin's build_block (~386 bytes per 1-nop
+            // block, so 3 calls give ~1158 bytes total). The previous
+            // page-stub was 43 bytes per call (3 calls = 129 bytes),
+            // so a threshold of 500 distinguishes the two paths.
+            var avgBytes5 = m.totalCompileBytes / Math.max(m.compileCalls, 1);
+            var okBytes5 = m.totalCompileBytes > 500 && avgBytes5 > 100;
+            var ok5 = okIters5 && okLast5 && okReason5 && okCalls5 && okBytes5;
             console.log('[ppc-worker-handshake] run-with-compile iters=' + m.iters
               + ' compileCalls=' + m.compileCalls
+              + ' totalBytes=' + m.totalCompileBytes
+              + ' (avg=' + avgBytes5.toFixed(0) + ')'
               + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
               + ' exit=' + m.exitReason
               + ' ' + (ok5 ? 'PASS' : 'FAIL'));
@@ -1162,6 +1195,11 @@
         // is structurally valid. Imports are bound to env.memory (SAB)
         // and the same mailbox-routed env bindings ppc-worker uses,
         // so any import dependencies (ppc_read32 etc.) resolve.
+        // 2d.4: tag-gated — only the cascade verification path uses
+        // tag='verify'. cmd-13 mbx routing uses tag='mbx-13' and is
+        // handled in _ppcMboxReplyListener (which writes bytes into
+        // SAB scratch instead of running the verification logic).
+        if (data.tag && data.tag !== 'verify') break;
         if (data.error) {
           console.error('[ppc-worker-handshake] real-compile FAIL: ' + data.error);
           break;

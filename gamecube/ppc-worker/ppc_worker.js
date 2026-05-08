@@ -248,6 +248,7 @@
         let iters = 0;
         let exitReason = 'max-iters';
         let compileCalls = 0;
+        let totalCompileBytes = 0;
         for (; iters < maxIters; ++iters) {
           let region = null, idx = -1;
           for (const k in regions) {
@@ -268,6 +269,7 @@
             const bytesSize   = mod._ppc_worker_peek_u32(mailboxBase + 24) >>> 0;
             const packed      = mod._ppc_worker_peek_u32(mailboxBase + 28) >>> 0;
             ++compileCalls;
+            totalCompileBytes += bytesSize;
             if (bytesSize === 0) { exitReason = 'compile-empty'; break; }
             const regionIdx = (packed >>> 16) & 0xFFFF;
             const fnIdx     = packed & 0xFFFF;
@@ -306,7 +308,7 @@
             break;
           }
         }
-        postMessage({ cmd: 'run-ack', iters, lastPc: pc, exitReason, compileCalls });
+        postMessage({ cmd: 'run-ack', iters, lastPc: pc, exitReason, compileCalls, totalCompileBytes });
         break;
       }
       case 'mailbox-call': {
