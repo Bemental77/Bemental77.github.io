@@ -38,6 +38,7 @@ emcc \
   -pthread \
   -s ENVIRONMENT=worker \
   -s EXIT_RUNTIME=0 \
+  -s IMPORTED_MEMORY=1 \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=33554432 \
   -s MAXIMUM_MEMORY=67108864 \

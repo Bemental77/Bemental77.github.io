@@ -224,12 +224,24 @@
       ppc_worker.onerror = function (e) {
         console.error('[ppc-worker-handshake] worker error: ' + (e.message || e.filename + ':' + e.lineno + ' ' + e.error));
       };
+      // Phase 2c Step 2: the PAGE allocates a shared WebAssembly.Memory
+      // and hands it to ppc-worker. Step 3 will reuse the same memory
+      // for dolphin_worker (after dolphin_worker is rebuilt with
+      // -sIMPORTED_MEMORY=1). At that point the two workers see the
+      // same bytes — PowerPCState writes from the JIT are immediately
+      // visible to dolphin_worker without a copy.
+      var ppcSharedMemory = new WebAssembly.Memory({
+        initial: 32 * 1024 * 1024 / 65536,   // 32 MB → 512 pages
+        maximum: 64 * 1024 * 1024 / 65536,   // 64 MB → 1024 pages
+        shared: true,
+      });
+      window.ppcSharedMemory = ppcSharedMemory;
       ppc_worker.onmessage = function (e) {
         var m = e.data || {};
         console.log('[ppc-worker-handshake] ' + JSON.stringify(m));
         if (m.cmd === 'ready') {
-          // Phase 2b smoke: pass placeholder zeros for the SAB pointers
-          // (real sharing lands in Phase 2c). Verifies init→ack round-trip.
+          // Phase 2c: pass placeholder zeros for the SAB-relative pointers
+          // (Step 3 will populate them from dolphin_worker's metadata).
           ppc_worker.postMessage({ cmd: 'init', ppcStateAddr: 0, mem1Addr: 0, mem1Size: 0, mailboxAddr: 0 });
         } else if (m.cmd === 'init-ack') {
           // Test dispatch round-trip with a known PC. Stub returns input
@@ -241,6 +253,9 @@
           console.error('[ppc-worker-handshake] error: ' + m.error);
         }
       };
+      // Send the shared memory to the worker; it instantiates the wasm
+      // with this memory and posts 'ready' once done.
+      ppc_worker.postMessage({ cmd: 'mem-init', memory: ppcSharedMemory });
       window.ppc_worker = ppc_worker;
     } catch (e) {
       console.error('[ppc-worker-handshake] spawn failed: ' + (e && e.message ? e.message : String(e)));
