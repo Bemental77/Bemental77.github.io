@@ -320,6 +320,160 @@
         postMessage({ cmd: 'run-ack', iters, lastPc: pc, exitReason, compileCalls, totalCompileBytes });
         break;
       }
+      case 'run-continuous': {
+        // 2f.1: continuous dispatch loop. Drives ppc-worker as the
+        // PowerPC dispatch source — reads live PC from SAB ppc_state
+        // (post-2e.4), dispatches block, decrements downcount, repeats
+        // until a natural exit (downcount<=0, exception, idle-skip,
+        // stop-flag). Replaces the maxIters-bounded 'run' handler for
+        // production use; the bounded 'run' stays for verification.
+        //
+        // Exit reasons:
+        //   'downcount-exhausted' — dolphin needs to advance scheduler
+        //   'exception-pending'   — Exceptions != 0; dolphin handles vector
+        //   'idle-skip'           — same pc > 100 dispatches; dolphin's
+        //                            CoreTiming::Idle() should fast-forward
+        //   'unmapped'            — block lookup miss + compileOnMiss=false
+        //   'stop-flag'           — external (page or dolphin) set the
+        //                            yield flag at SAB[0x02500000]
+        //   'safety-cap'          — hit the hard cap (sanity bound)
+        //   'block-trap: ...'     — wasm trap inside dispatched block
+        if (!mod || !mod.bemental_regions) { postMessage({ cmd: 'run-continuous-nack', reason: 'no regions' }); return; }
+        if (!sharedMemoryRef) { postMessage({ cmd: 'run-continuous-nack', reason: 'no shared memory' }); return; }
+        const regions = mod.bemental_regions;
+        const compileOnMiss = !!data.compileOnMiss;
+        const safetyCap = ((data.safetyCap | 0) >>> 0) || 100000;
+        // PowerPCState SAB offsets per ppc_worker_main.cpp layout comment.
+        const PPC_STATE_BASE   = 0x02400000;
+        const OFFSET_PC        = 0x000;
+        const OFFSET_MSR       = 0x2E0;
+        const OFFSET_EXC       = 0x2EC;
+        const OFFSET_DOWNCOUNT = 0x2F0;
+        const STOP_FLAG_ADDR   = 0x02500000;
+        const u32 = new Uint32Array(sharedMemoryRef.buffer);
+        const i32 = new Int32Array(sharedMemoryRef.buffer);  // downcount is signed
+        // Initial PC: caller-supplied wins, else read from SAB ppc_state.
+        let pc;
+        if (typeof data.startPc === 'number') {
+          pc = (data.startPc | 0) >>> 0;
+          u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] = pc;
+        } else {
+          pc = u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] >>> 0;
+        }
+        let iters = 0;
+        let compileCalls = 0;
+        let totalCompileBytes = 0;
+        let exitReason = 'safety-cap';
+        let lastPc = 0xFFFFFFFF;
+        let samePcCount = 0;
+        for (; iters < safetyCap; ++iters) {
+          // External stop flag (page or dolphin requesting yield).
+          if (Atomics.load(i32, STOP_FLAG_ADDR >> 2) !== 0) {
+            exitReason = 'stop-flag'; break;
+          }
+          // Exception pending? Let dolphin vector the handler.
+          const exc = u32[(PPC_STATE_BASE + OFFSET_EXC) >> 2] >>> 0;
+          if (exc !== 0) {
+            const msr = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
+            // Always exit on synchronous exceptions; for EXTERNAL_INT
+            // only if MSR.EE=1 (else they're masked and can wait).
+            const EXC_EXTERNAL_INT = 0x00000004;
+            const MSR_EE = 0x8000;
+            const externalOnly = (exc & ~EXC_EXTERNAL_INT) === 0;
+            if (!externalOnly || (msr & MSR_EE) !== 0) {
+              exitReason = 'exception-pending'; break;
+            }
+          }
+          // Downcount budget. <=0 means CoreTiming needs to advance.
+          const downcount = i32[(PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2];
+          if (downcount <= 0) { exitReason = 'downcount-exhausted'; break; }
+          // Lookup or compile.
+          let region = null, idx = -1, blockCycles = 1;
+          for (const k in regions) {
+            const r = regions[k];
+            if (r && r.pcMap && r.pcMap.has(pc)) {
+              region = r; idx = r.pcMap.get(pc);
+              if (r.cycleMap && r.cycleMap.has(pc)) blockCycles = r.cycleMap.get(pc) || 1;
+              break;
+            }
+          }
+          if (!region) {
+            if (!compileOnMiss) { exitReason = 'unmapped'; break; }
+            const bytesOffset = mod._ppc_worker_mailbox_call_sync(13, pc) >>> 0;
+            const bytesSize   = mod._ppc_worker_peek_u32(mailboxBase + 24) >>> 0;
+            const packed      = mod._ppc_worker_peek_u32(mailboxBase + 28) >>> 0;
+            ++compileCalls;
+            totalCompileBytes += bytesSize;
+            if (bytesSize === 0) { exitReason = 'compile-empty'; break; }
+            const regionIdx   = (packed >>> 16) & 0xFF;
+            const fnIdx       = packed & 0xFFFF;
+            const cycles      = ((packed >>> 24) & 0xFF) || 1;
+            try {
+              const bytes = new Uint8Array(sharedMemoryRef.buffer, bytesOffset, bytesSize).slice();
+              const wmod = new WebAssembly.Module(bytes);
+              const importObj = mod.bemental_imports
+                ? { env: mod.bemental_imports.env } : {};
+              const inst = new WebAssembly.Instance(wmod, importObj);
+              if (!regions[regionIdx]) {
+                regions[regionIdx] = { instance: inst, exports: inst.exports, pcMap: new Map(), cycleMap: new Map(), nFuncs: 0 };
+              } else {
+                regions[regionIdx].instance = inst;
+                regions[regionIdx].exports = inst.exports;
+                if (!regions[regionIdx].pcMap) regions[regionIdx].pcMap = new Map();
+                if (!regions[regionIdx].cycleMap) regions[regionIdx].cycleMap = new Map();
+              }
+              regions[regionIdx].pcMap.set(pc >>> 0, fnIdx);
+              regions[regionIdx].cycleMap.set(pc >>> 0, cycles);
+              regions[regionIdx].nFuncs = Math.max(regions[regionIdx].nFuncs || 0, fnIdx + 1);
+              region = regions[regionIdx];
+              idx = fnIdx;
+              blockCycles = cycles;
+            } catch (e) {
+              exitReason = 'compile-instantiate: ' + (e && e.message ? e.message : String(e));
+              break;
+            }
+          }
+          // Same-PC idle-skip detector (port of JitWasm.cpp:3686+).
+          // Increments when the same pc is dispatched repeatedly, which
+          // happens for busy-wait loops (e.g., bne -8 polling SAB poll
+          // patterns from sab_polling_loop_skip). After 100 same-pc
+          // dispatches, exit so dolphin's CoreTiming::Idle() can
+          // fast-forward to the next event.
+          if (pc === lastPc) {
+            ++samePcCount;
+            if (samePcCount > 100) {
+              exitReason = 'idle-skip'; break;
+            }
+          } else {
+            samePcCount = 0;
+            lastPc = pc;
+          }
+          // Dispatch.
+          const fn = region.exports['block' + idx] || region.exports.run;
+          if (typeof fn !== 'function') { exitReason = 'no-block-export'; break; }
+          let nextPc;
+          try {
+            nextPc = fn() >>> 0;
+          } catch (e) {
+            exitReason = 'block-trap: ' + (e && e.message ? e.message : String(e));
+            break;
+          }
+          // Decrement downcount per dispatch (post-2f.0 cycles plumbing).
+          // Use Atomics.sub to keep this race-free with dolphin's parallel
+          // Run() until 2f.2 wires the yield handshake.
+          Atomics.sub(i32, (PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2, blockCycles);
+          // Update SAB pc to the new value (block return is canonical
+          // per Q2 finding).
+          u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] = nextPc;
+          pc = nextPc;
+        }
+        postMessage({
+          cmd: 'run-continuous-ack',
+          iters, lastPc: pc, exitReason, compileCalls, totalCompileBytes,
+          samePcCount,
+        });
+        break;
+      }
       case 'mailbox-call': {
         // Phase 2c.4c: synchronous request-reply. ppc-worker C++
         // publishes (mboxCmd, arg0) into the mailbox slot, Atomics.waits
