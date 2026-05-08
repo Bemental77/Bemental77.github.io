@@ -256,6 +256,14 @@
       // probe time honest. Once Phase 2c.4f-4 lands and ppc-worker
       // actually drives dispatch, the cascade can be deleted entirely.
       var ppcTestEnabled = new URLSearchParams(location.search).has('ppctest');
+      // 2d.8 cutover gate: when set (alongside ?ppctest=1), after the
+      // verification cascade completes, kick off a sustained ppc-worker
+      // run that drives many iterations of the production dispatch
+      // path. Each iter: cmd 13 → dolphin build_block → real bytes →
+      // ppc-worker instantiates + dispatches → next_pc → loop.
+      // Demonstrates ppc-worker can sustain real PowerPC dispatch.
+      var ppcDispatchEnabled = new URLSearchParams(location.search).has('ppcdispatch');
+      window._ppcDispatchEnabled = ppcDispatchEnabled;  // surfaced for onWorkerMsg (outer scope)
       ppc_worker.onmessage = function (e) {
         var m = e.data || {};
         if (m.cmd === 'rw-suite-debug') {
@@ -608,7 +616,34 @@
         } else if (m.cmd === 'region-call-export-nack') {
           console.error('[ppc-worker-handshake] region call FAIL: ' + m.reason);
         } else if (m.cmd === 'run-ack') {
-          if (window._ppcRealDispatchTest) {
+          if (window._ppcCutoverDispatchTest) {
+            window._ppcCutoverDispatchTest = false;
+            // Phase 2d.8 cutover-gate verification. The dispatch
+            // chain ran for the full maxIters with sustained
+            // compileOnMiss activity (real bytes from dolphin's
+            // build_block via the page-mediated cmd-13 route).
+            //
+            // What we DON'T check: the exact lastPc. bementalJIT-
+            // emitted blocks make runtime decisions beyond compile-
+            // time constants (state reads, branch targets, exception
+            // checks), so the chain trajectory depends on real
+            // bementalJIT semantics that aren't 1-nop-pc-plus-4
+            // even when ppc_state is reset. The interesting
+            // verification is "ppc-worker sustained the dispatch
+            // loop with real bementalJIT bytes" — which the iter
+            // count + byte total + compile count attest to.
+            var okIters_d8   = m.iters === 10;
+            var okReason_d8  = m.exitReason === 'max-iters';
+            var okSustained  = m.compileCalls >= 5;
+            var okBytes_d8   = m.totalCompileBytes > 3000;
+            var ok_d8 = okIters_d8 && okReason_d8 && okSustained && okBytes_d8;
+            console.log('[ppc-worker-handshake] cutover-gate iters=' + m.iters
+              + ' compileCalls=' + m.compileCalls
+              + ' totalBytes=' + m.totalCompileBytes
+              + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+              + ' exit=' + m.exitReason
+              + ' ' + (ok_d8 ? 'PASS' : 'FAIL'));
+          } else if (window._ppcRealDispatchTest) {
             window._ppcRealDispatchTest = false;
             // Phase 2d.3: bementalJIT-emitted nop block dispatched
             // exactly once, advanced pc by 4, returned next_pc.
@@ -1221,6 +1256,29 @@
           + ' SAB[+32]=0x' + pat32.toString(16)
           + ' SAB[+252]=0x' + pat252.toString(16)
           + ' ' + (ok_d7 ? 'PASS' : 'FAIL'));
+        // Phase 2d.8: cutover gate. With ?ppcdispatch=1, kick off the
+        // sustained dispatch run. Each iter: lookup unmapped → cmd 13
+        // → dolphin build_block emits real bytes → ppc-worker
+        // instantiates + dispatches → next_pc → loop. 20 iters keeps
+        // wall-time bounded (~100 ms at ~5 ms/compile).
+        if (window._ppcDispatchEnabled) {
+          window._ppcCutoverDispatchTest = true;
+          // 2d.7 left SAB[0x02400000..255] stamped with the test
+          // sentinel pattern. Real bementalJIT-emitted blocks read
+          // various ppc_state fields (pc, npc, msr, etc.) and the
+          // pattern's non-zero values would skew the dispatch chain.
+          // Reset the region to zeros (matching the SAB state when
+          // 4f-5's run-with-compile chain validated cleanly), then
+          // seed pc to the run's start_pc so the first block sees
+          // its expected entry state.
+          var u32rst = new Uint32Array(sharedMemory.buffer);
+          for (var off_d8 = 0; off_d8 < 256; off_d8 += 4) {
+            u32rst[(0x02400000 + off_d8) >> 2] = 0;
+          }
+          u32rst[0x02400000 >> 2] = 0x80003200;  // ppc_state.pc
+          console.log('[ppc-worker-handshake] cutover-gate: ppc-worker driving sustained dispatch (10 iters)');
+          window.ppc_worker.postMessage({ cmd: 'run', startPc: 0x80003200, maxIters: 10, compileOnMiss: true });
+        }
         break;
       }
       case 'compile-test-result': {
