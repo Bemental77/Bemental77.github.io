@@ -592,6 +592,15 @@
               + ' exit=' + m.exitReason
               + ' SAB[0x02400000]=0x' + sabValue.toString(16)
               + ' ' + (ok_d1 ? 'PASS' : 'FAIL'));
+            // Phase 2d.2: ask dolphin to emit a real bementalJIT wasm
+            // for pc=0x80003100. The compile-test handler in
+            // worker_funcs.js calls dolphin_test_compile_block (which
+            // wraps bemental::powerpc::build_block) and Transferable-
+            // postMessages the bytes back. onWorkerMsg's
+            // 'compile-test-result' branch verifies the magic header
+            // and instantiates the resulting module.
+            window._ppcRealCompileTest = true;
+            dolphin_worker.postMessage({ cmd: 'compile-test', pc: 0x80003100 });
           } else if (window._ppcRunCompileTest) {
             // Phase 2c.4f-5 verification: dispatch loop posted CompileBlock
             // (cmd 13) for each unmapped pc; page-mock synthesized a
@@ -1118,6 +1127,40 @@
         // 4f-6: dolphin's mbx-cmd handler reply. Ignore here — the
         // listener inside mailbox-demo-ack writes to the SAB.
         break;
+      case 'compile-test-result': {
+        // 2d.2: dolphin emitted a real bementalJIT wasm via build_block
+        // and shipped the bytes via Transferable. Verify the magic
+        // header (\0asm) and try instantiating to confirm the module
+        // is structurally valid. Imports are bound to env.memory (SAB)
+        // and the same mailbox-routed env bindings ppc-worker uses,
+        // so any import dependencies (ppc_read32 etc.) resolve.
+        if (data.error) {
+          console.error('[ppc-worker-handshake] real-compile FAIL: ' + data.error);
+          break;
+        }
+        var u8 = new Uint8Array(data.bytes);
+        var hdrOk = u8.length >= 8
+          && u8[0] === 0x00 && u8[1] === 0x61 && u8[2] === 0x73 && u8[3] === 0x6d
+          && u8[4] === 0x01 && u8[5] === 0x00 && u8[6] === 0x00 && u8[7] === 0x00;
+        var instOk = false, instErr = null;
+        if (hdrOk) {
+          try {
+            var wmod = new WebAssembly.Module(u8);
+            instOk = true;
+            // Just construct the Module — full Instance would need all
+            // imports bound. Module construction validates the structure.
+          } catch (err) {
+            instErr = err && err.message ? err.message : String(err);
+          }
+        }
+        var ok_d2 = hdrOk && instOk;
+        console.log('[ppc-worker-handshake] real-compile pc=0x' + (data.pc >>> 0).toString(16)
+          + ' bytes=' + (data.size >>> 0)
+          + ' magic=' + (hdrOk ? 'OK' : 'BAD')
+          + ' WebAssembly.Module=' + (instOk ? 'OK' : ('FAIL:' + instErr))
+          + ' ' + (ok_d2 ? 'PASS' : 'FAIL'));
+        break;
+      }
       default: pageLog('unknown worker cmd: ' + data.cmd);
     }
   }

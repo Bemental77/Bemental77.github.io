@@ -240,6 +240,30 @@ self.onmessage = function (e) {
       // signal: we just print so the cascade log lines up.
       postMessage({ cmd: 'print', txt: '[worker] setup-ppc-mailbox legacy ack (4f-6: routing is page-mediated)' });
       break;
+    case 'compile-test': {
+      // 2d.2: page asks dolphin to emit a real bementalJIT wasm module
+      // for `pc` and ship the bytes back. dolphin_test_compile_block
+      // calls bemental::powerpc::build_block for a synthetic 1-nop
+      // sequence; bytes live in g_test_compile_buf (in dolphin's heap).
+      // We read via Module.HEAPU8 and Transferable-postMessage to page.
+      try {
+        var pc = (data.pc | 0) >>> 0;
+        var size = Module._dolphin_test_compile_block(pc) >>> 0;
+        if (size === 0) {
+          postMessage({ cmd: 'compile-test-result', error: 'build_block returned 0 bytes' });
+          break;
+        }
+        var addr = Module._dolphin_test_compile_block_addr() >>> 0;
+        // Copy out of dolphin's heap into a fresh ArrayBuffer so the
+        // Transferable transfer doesn't take the heap-backed view.
+        var bytes = new Uint8Array(size);
+        bytes.set(Module.HEAPU8.subarray(addr, addr + size));
+        postMessage({ cmd: 'compile-test-result', pc: pc, size: size, bytes: bytes.buffer }, [bytes.buffer]);
+      } catch (err) {
+        postMessage({ cmd: 'compile-test-result', error: 'compile-test threw: ' + (err && err.message ? err.message : String(err)) });
+      }
+      break;
+    }
     case 'mbx-cmd': {
       // 4f-6: page polls the SAB mailbox; on real MMIO cmds (2..12)
       // it postMessages here. We call the proxied wasm export and

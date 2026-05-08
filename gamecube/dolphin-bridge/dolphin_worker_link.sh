@@ -12,7 +12,7 @@ OUT=$ROOT/gamecube/dolphin_libretro
 
 source $ROOT/emsdk/emsdk_env.sh > /dev/null 2>&1
 
-EXPORTED_FUNCS='["_main","_malloc","_free","_dolphin_check_exc","_dolphin_break_block","_dolphin_hle_check","_dolphin_interp","_dolphin_read8","_dolphin_read16","_dolphin_read32","_dolphin_read_tb","_dolphin_write8","_dolphin_write16","_dolphin_write32","_load_iso","_load_state","_save_state","_state_size","_run_iter","_run_iter_batch","_get_pad_ptr","_dolphin_ppc_mailbox_init","_dolphin_ppc_mailbox_poll","_dolphin_routing_probe"]'
+EXPORTED_FUNCS='["_main","_malloc","_free","_dolphin_check_exc","_dolphin_break_block","_dolphin_hle_check","_dolphin_interp","_dolphin_read8","_dolphin_read16","_dolphin_read32","_dolphin_read_tb","_dolphin_write8","_dolphin_write16","_dolphin_write32","_load_iso","_load_state","_save_state","_state_size","_run_iter","_run_iter_batch","_get_pad_ptr","_dolphin_ppc_mailbox_init","_dolphin_ppc_mailbox_poll","_dolphin_routing_probe","_dolphin_test_compile_block","_dolphin_test_compile_block_addr"]'
 
 EXPORTED_RUNTIME='["ccall","cwrap","getValue","setValue","addFunction","removeFunction","addRunDependency","removeRunDependency","FS","FS_createDataFile","FS_createPath","FS_createDevice","FS_createLazyFile","FS_createPreloadedFile","FS_unlink","callMain","ENV","stringToNewUTF8","HEAP8","HEAPU8","HEAP16","HEAPU16","HEAP32","HEAPU32","HEAPF32","HEAPF64"]'
 
