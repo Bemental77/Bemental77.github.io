@@ -86,6 +86,16 @@
         postMessage({ cmd: 'mailbox-demo-ack', sentinel: data.sentinel });
         break;
       }
+      case 'mmio-read-test': {
+        // Phase 2c.4d: ppc-worker calls _ppc_worker_mmio_read32 which
+        // routes via the mailbox (cmd=4). Page-side consumer recognises
+        // cmd=4 and (in 4d) returns a mock value; in 4e it'll route to
+        // dolphin_worker.
+        if (!inited) { postMessage({ cmd: 'mmio-read-test-nack', reason: 'not initialised' }); return; }
+        const value = mod._ppc_worker_mmio_read32((data.addr | 0) >>> 0) >>> 0;
+        postMessage({ cmd: 'mmio-read-test-ack', addr: data.addr, value });
+        break;
+      }
       case 'mailbox-call': {
         // Phase 2c.4c: synchronous request-reply. ppc-worker C++
         // publishes (mboxCmd, arg0) into the mailbox slot, Atomics.waits

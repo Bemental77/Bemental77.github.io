@@ -128,6 +128,17 @@ constexpr u32 MBX_OFF_REPLY       = 12;
 constexpr u32 MBX_OFF_REPLY_READY = 16;
 
 EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_mailbox_call_sync(u32 cmd, u32 arg0);
+
+// Convenience wrapper: cmd=4 (MmioRead32 per sab_layout.h::MailboxCmd).
+// Phase 2c.4d: when ppc-worker eventually owns dispatch, every PPC
+// load that hits MMIO (~1% of memory accesses) routes through here.
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_mmio_read32(u32 addr) {
+    return ppc_worker_mailbox_call_sync(/*cmd=*/4u, addr);
+}
+
+EMSCRIPTEN_KEEPALIVE
 u32 ppc_worker_mailbox_call_sync(u32 cmd, u32 arg0) {
     if (g_mailbox_base == 0u) return 0u;
     u32* base = reinterpret_cast<u32*>(static_cast<uintptr_t>(g_mailbox_base));
