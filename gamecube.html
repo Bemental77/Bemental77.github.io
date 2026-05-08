@@ -349,41 +349,80 @@
             w[41] = b4;
             return w;
           }
+          // 4f-6: page-mediated routing. Page-handles cmds 1/4/13
+          // directly (deterministic stubs that don't need dolphin).
+          // Real MMIO cmds 2/3/5/6/7/8/9/10/11/12 are postMessage'd
+          // to dolphin once it signals runtime-ready. Before that,
+          // they're answered with reply=0 to avoid wedging ppc-worker
+          // on Atomics.wait — the cascade is structured so those
+          // cmds only fire after the cutover point (which now waits
+          // on 'runtime-ready').
+          var inFlight = false;
+          window._ppcDolphinRoutingReady = false;
+          function deliverReply(reply, extra1, extra2) {
+            Atomics.store(i32, MBX_REPLY_EXTRA1 >> 2, (extra1 || 0) >>> 0);
+            Atomics.store(i32, MBX_REPLY_EXTRA2 >> 2, (extra2 || 0) >>> 0);
+            Atomics.store(i32, MBX_REPLY        >> 2, (reply  || 0) >>> 0);
+            Atomics.store(i32, MBX_REPLY_READY  >> 2, 1);
+            Atomics.notify(i32, MBX_REPLY_READY >> 2, 1);
+            inFlight = false;
+          }
+          window._ppcMboxReplyListener = function (e) {
+            var msg = e.data || {};
+            if (msg.cmd === 'runtime-ready') {
+              window._ppcDolphinRoutingReady = true;
+              console.log('[ppc-worker-handshake] dolphin runtime-ready — MMIO routing live');
+              return;
+            }
+            if (msg.cmd !== 'mbx-reply') return;
+            deliverReply(msg.reply, msg.reply_extra1, msg.reply_extra2);
+          };
+          dolphin_worker.addEventListener('message', window._ppcMboxReplyListener);
           window._ppcMboxConsumer = setInterval(function () {
+            if (inFlight) return;
             var req = Atomics.load(i32, MBX_REQ_READY >> 2);
             if (req !== 1) return;
             var cmd  = Atomics.load(i32, MBX_CMD  >> 2);
             var arg0 = Atomics.load(i32, MBX_ARG0 >> 2);
-            var reply = 0, extra1 = 0, extra2 = 0;
+            var arg1 = Atomics.load(i32, MBX_ARG1 >> 2);
+            // Direct page-handled cmds first.
             if (cmd === 1) {
-              // PING: reply = arg0 * 2.
-              reply = (arg0 * 2) | 0;
-            } else if (cmd === 4) {
-              // MmioRead32: page-side mock for 2c.4d.
-              if ((arg0 >>> 0) === 0xCC003004) reply = 0x1FC;
-            } else if (cmd === 13) {
-              // 4f-5 CompileBlock: synthesize a 1-block wasm whose
-              // block0() returns arg0+4, write to SAB scratch, reply
-              // with (offset, size, region<<16|fn). Region 5 fn 0 is
-              // a fixed test-mode assignment; real bementalJIT-driven
-              // delivery comes after the dolphin compile path is
-              // wired. The page-mediated routing here means dolphin's
-              // wasm memory stays independent of page+ppc-worker's SAB
-              // (the SAB-collision fix per 4f5_sab_collision.md).
+              deliverReply((arg0 * 2) | 0, 0, 0);  // PING
+              return;
+            }
+            if (cmd === 4) {
+              // PI mask read mock for the early-cascade page-mock test.
+              // After routingReady, this would normally route to dolphin
+              // for the real value — but dolphin happens to also return
+              // 0x1FC here, so deferring to the page-stub keeps the
+              // pre-runtime test deterministic. Once routing is live,
+              // the second mmio-read-test (after cutover-ack) will go
+              // through dolphin via cmd 4 too — see post-cutover branch.
+              if (!window._ppcDolphinRoutingReady) {
+                if ((arg0 >>> 0) === 0xCC003004) deliverReply(0x1FC, 0, 0);
+                else deliverReply(0, 0, 0);
+                return;
+              }
+              // Routing is up — fall through to dolphin.
+            }
+            if (cmd === 13) {
+              // 4f-5 CompileBlock: synthesize 1-block wasm into SAB
+              // scratch, reply with (offset, size, region<<16|fn).
               var nextPc = (arg0 + 4) >>> 0;
               var w = buildCompileBlockWasm(nextPc);
               u8.set(w, WASM_SCRATCH_OFFSET);
-              reply  = WASM_SCRATCH_OFFSET;
-              extra1 = w.length;
-              extra2 = (5 << 16) | 0;
+              deliverReply(WASM_SCRATCH_OFFSET, w.length, (5 << 16) | 0);
+              return;
             }
-            // Extras must be visible BEFORE reply_ready transitions;
-            // Atomics.store on reply_ready provides the release fence.
-            Atomics.store(i32, MBX_REPLY_EXTRA1 >> 2, extra1 >>> 0);
-            Atomics.store(i32, MBX_REPLY_EXTRA2 >> 2, extra2 >>> 0);
-            Atomics.store(i32, MBX_REPLY        >> 2, reply  >>> 0);
-            Atomics.store(i32, MBX_REPLY_READY  >> 2, 1);
-            Atomics.notify(i32, MBX_REPLY_READY >> 2, 1);
+            if (!window._ppcDolphinRoutingReady) {
+              // Pre-runtime: cmds 2/3/5/6/7/8/9/10/11/12 reply 0.
+              // The cascade should not be sending these before
+              // routingReady; if it is, the test will visibly fail.
+              deliverReply(0, 0, 0);
+              return;
+            }
+            inFlight = true;
+            dolphin_worker.postMessage({ cmd: 'mbx-cmd', mboxCmd: cmd, arg0: arg0, arg1: arg1 });
           }, 4);
           // 2c.4c PING test.
           ppc_worker.postMessage({ cmd: 'mailbox-call', mboxCmd: 1, arg0: 42 });
@@ -399,25 +438,22 @@
             // Page-mock response (Phase 2c.4d).
             var ok = (m.value >>> 0) === 0x1FC;
             console.log('[ppc-worker-handshake] mmio_read32(0xCC003004) → 0x' + got + ' (page-mock) ' + (ok ? 'PASS' : 'FAIL'));
-            // Phase 2c.4e was a "cutover" that handed the mailbox to
-            // dolphin. 4f-5 keeps the page-mock setInterval as the
-            // PERMANENT mailbox consumer instead — dolphin's wasm
-            // memory cannot be naively shared with ppc-worker (SAB
-            // data-section collision; see memory:4f5_sab_collision.md).
-            // The 'cutover' postMessage still goes to dolphin so its
-            // setup-ppc-mailbox handler logs the init address; harmless.
-            setTimeout(function () {
-              try {
-                dolphin_worker.postMessage({ cmd: 'setup-ppc-mailbox', addr: 0x02000000 });
-                console.log('[ppc-worker-handshake] cutover: page-mock remains consumer (4f-5 page-mediated)');
-                setTimeout(function () {
-                  window._ppcMboxRealMmio = true;
-                  ppc_worker.postMessage({ cmd: 'mmio-read-test', addr: 0xCC003004 });
-                }, 500);
-              } catch (e) {
-                console.error('[ppc-worker-handshake] cutover failed: ' + (e && e.message ? e.message : String(e)));
+            // 4f-6 cutover: page is the permanent mailbox consumer.
+            // Wait for dolphin's 'runtime-ready' postMessage before
+            // proceeding to the real-MMIO test step — only after
+            // that does the page consumer route cmds 2..12 to dolphin.
+            // If the signal hasn't arrived yet, the listener installed
+            // above sets the flag whenever it does; here we just poll
+            // (cheap setInterval) until live.
+            (function awaitRuntimeReady() {
+              if (window._ppcDolphinRoutingReady) {
+                console.log('[ppc-worker-handshake] cutover: routing live, sending real MMIO test');
+                window._ppcMboxRealMmio = true;
+                ppc_worker.postMessage({ cmd: 'mmio-read-test', addr: 0xCC003004 });
+                return;
               }
-            }, 3000);
+              setTimeout(awaitRuntimeReady, 50);
+            })();
           } else {
             // Real dolphin response.
             console.log('[ppc-worker-handshake] mmio_read32(0xCC003004) → 0x' + got + ' (dolphin) — Phase 2c.4e end-to-end');
@@ -980,6 +1016,20 @@
       }
       case 'stateSaved': if (pendingSaveResolve) { pendingSaveResolve(data.data); pendingSaveResolve = null; } break;
       case 'stateLoaded': if (pendingLoadResolve) { pendingLoadResolve(); pendingLoadResolve = null; } break;
+      case 'runtime-ready':
+        // 4f-6: dolphin's wasm runtime is up. Set the flag so the
+        // page-mediated mailbox consumer starts routing real MMIO cmds
+        // (2..12) to dolphin. Listener inside the mailbox-demo-ack
+        // handler also sets this — duplicate set is harmless.
+        if (!window._ppcDolphinRoutingReady) {
+          window._ppcDolphinRoutingReady = true;
+          console.log('[ppc-worker-handshake] dolphin runtime-ready (via onWorkerMsg)');
+        }
+        break;
+      case 'mbx-reply':
+        // 4f-6: dolphin's mbx-cmd handler reply. Ignore here — the
+        // listener inside mailbox-demo-ack writes to the SAB.
+        break;
       default: pageLog('unknown worker cmd: ' + data.cmd);
     }
   }

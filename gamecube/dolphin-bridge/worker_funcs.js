@@ -4,6 +4,22 @@
 // handler installed by emscripten's pthread runtime.
 if (typeof ENVIRONMENT_IS_PTHREAD === 'undefined' || !ENVIRONMENT_IS_PTHREAD) {
 
+// 4f-6: surface a 'runtime-ready' postMessage when emscripten has
+// finished bringing up wasm + memory + exports. Page waits on this
+// before routing real MMIO cmds (2..12) — earlier calls hit
+// throwing stubs because Module.calledRun isn't reliable under
+// PROXY_TO_PTHREAD on the main thread.
+if (typeof Module !== 'undefined') {
+  var _ppc_origORI = Module.onRuntimeInitialized;
+  Module.onRuntimeInitialized = function () {
+    if (typeof _ppc_origORI === 'function') {
+      try { _ppc_origORI(); } catch (e) {}
+    }
+    postMessage({ cmd: 'runtime-ready' });
+    postMessage({ cmd: 'print', txt: '[worker] runtime-ready posted' });
+  };
+}
+
 var romChunks = [];
 var totalSize = 0;
 var bootStarted = false;
@@ -215,12 +231,53 @@ self.onmessage = function (e) {
       }
       break;
     case 'setup-ppc-mailbox':
-      // Phase 2c.4e: page hands us the SAB offset of the ppc-worker
-      // mailbox slot. We forward to the C++ side which then polls the
-      // slot in JitWasm Run()'s inner-iter heartbeat window.
-      Module._dolphin_ppc_mailbox_init(data.addr >>> 0);
-      postMessage({ cmd: 'print', txt: '[worker] ppc-mailbox init at 0x' + (data.addr >>> 0).toString(16) });
+      // 4f-6 reframe: dolphin no longer polls the SAB mailbox itself
+      // (its private wasm memory can't observe page-side req_ready
+      // writes). The 4f-6 page-mediated routing replaces that role —
+      // page polls the SAB and forwards real MMIO cmds via 'mbx-cmd'
+      // postMessage. The C-side dolphin_ppc_mailbox_init/poll remain
+      // defined for binary-compat, but the init call is now a no-op
+      // signal: we just print so the cascade log lines up.
+      postMessage({ cmd: 'print', txt: '[worker] setup-ppc-mailbox legacy ack (4f-6: routing is page-mediated)' });
       break;
+    case 'mbx-cmd': {
+      // 4f-6: page polls the SAB mailbox; on real MMIO cmds (2..12)
+      // it postMessages here. We call the proxied wasm export and
+      // post the reply back. Page writes the reply into the SAB
+      // mailbox slot. Round-trip cost ~1-2ms wall — acceptable for
+      // verification cascades; a perf concern for hot MMIO paths
+      // that's solved later by moving PowerPCState into shared SAB.
+      //
+      // Module.calledRun isn't reliable under PROXY_TO_PTHREAD (main
+      // thread's flag may never set). Try/catch the proxied call so a
+      // not-yet-initialised export becomes a 0 reply instead of an
+      // unhandled exception that wedges the cascade.
+      var c = data.mboxCmd >>> 0;
+      var a0 = data.arg0 >>> 0;
+      var a1 = data.arg1 >>> 0;
+      var r = 0;
+      try {
+        switch (c) {
+          case 2:  r = Module._dolphin_read8 (a0) >>> 0; break;
+          case 3:  r = Module._dolphin_read16(a0) >>> 0; break;
+          case 4:  r = Module._dolphin_read32(a0) >>> 0; break;
+          case 5:  Module._dolphin_write8 (a0, a1); break;
+          case 6:  Module._dolphin_write16(a0, a1); break;
+          case 7:  Module._dolphin_write32(a0, a1); break;
+          case 8:  r = Module._dolphin_hle_check(a0) >>> 0; break;
+          case 9:  Module._dolphin_interp(a0, a1); break;
+          case 10: r = Module._dolphin_check_exc(a0) >>> 0; break;
+          case 11: Module._dolphin_break_block(a0); break;
+          case 12: r = Module._dolphin_read_tb(a0) >>> 0; break;
+          default: r = 0;
+        }
+      } catch (err) {
+        postMessage({ cmd: 'print', txt: '[worker] mbx-cmd ' + c + ' threw: ' + (err && err.message ? err.message : String(err)) });
+        r = 0;
+      }
+      postMessage({ cmd: 'mbx-reply', mboxCmd: c, reply: r });
+      break;
+    }
     default:
       postMessage({ cmd: 'print', txt: '[worker] unknown cmd: ' + data.cmd });
   }
