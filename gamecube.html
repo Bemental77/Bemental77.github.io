@@ -200,11 +200,55 @@
   _moduleDummyCanvas.width = 1;
   _moduleDummyCanvas.height = 1;
   var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/gamecube/dolphin_libretro/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: _moduleDummyCanvas, setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {} };
-  var padStatus1, vram_ptr; var dolphin_worker = null; var states_arrs = []; var audioMuted = false; var pendingSaveResolve = null; var pendingLoadResolve = null;
+  var padStatus1, vram_ptr; var dolphin_worker = null; var ppc_worker = null; var states_arrs = []; var audioMuted = false; var pendingSaveResolve = null; var pendingLoadResolve = null;
   function getAudioCtx() { try { return (Module && Module.preCreatedAudioContext) || (Module && Module.SDL && Module.SDL.audioContext) || null; } catch (e) { return null; } }
   function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } }
   document.addEventListener('click', resumeAudio); document.addEventListener('keydown', resumeAudio); document.addEventListener('visibilitychange', resumeAudio);
-  window.var_setup = function () { pageLog('[ui] var_setup — initializing Dolphin libretro'); padStatus1 = Module._get_ptr(0); Module.SDL.defaults.copyOnLock = false; Module.SDL.defaults.opaqueFrontBuffer = false; dolphin_worker = new Worker('/gamecube/dolphin_libretro/dolphin_worker.js?v=' + Date.now()); dolphin_worker.onmessage = onWorkerMsg; window.dolphin_worker = dolphin_worker; setStatus('Runtime ready. Loading ROM...'); loadRomAndBoot(); };
+  window.var_setup = function () {
+    console.log('[ppc-worker-handshake] var_setup entered');
+    pageLog('[ui] var_setup — initializing Dolphin libretro');
+    padStatus1 = Module._get_ptr(0);
+    Module.SDL.defaults.copyOnLock = false;
+    Module.SDL.defaults.opaqueFrontBuffer = false;
+    dolphin_worker = new Worker('/gamecube/dolphin_libretro/dolphin_worker.js?v=' + Date.now());
+    dolphin_worker.onmessage = onWorkerMsg;
+    window.dolphin_worker = dolphin_worker;
+
+    // Phase 2b: spawn the dedicated PowerPC JIT worker in parallel.
+    // Currently runs alongside dolphin_worker (idle, stub dispatch).
+    // Phase 2c will gate dolphin_worker's dispatch on this worker
+    // being live and route compile/dispatch through SAB mailbox.
+    try {
+      console.log('[ppc-worker-handshake] spawning /gamecube/ppc-worker/ppc_worker.js');
+      ppc_worker = new Worker('/gamecube/ppc-worker/ppc_worker.js?v=' + Date.now());
+      ppc_worker.onerror = function (e) {
+        console.error('[ppc-worker-handshake] worker error: ' + (e.message || e.filename + ':' + e.lineno + ' ' + e.error));
+      };
+      ppc_worker.onmessage = function (e) {
+        var m = e.data || {};
+        console.log('[ppc-worker-handshake] ' + JSON.stringify(m));
+        if (m.cmd === 'ready') {
+          // Phase 2b smoke: pass placeholder zeros for the SAB pointers
+          // (real sharing lands in Phase 2c). Verifies init→ack round-trip.
+          ppc_worker.postMessage({ cmd: 'init', ppcStateAddr: 0, mem1Addr: 0, mem1Size: 0, mailboxAddr: 0 });
+        } else if (m.cmd === 'init-ack') {
+          // Test dispatch round-trip with a known PC. Stub returns input
+          // PC unchanged, so we expect next === 0x80003140.
+          ppc_worker.postMessage({ cmd: 'dispatch', pc: 0x80003140 });
+        } else if (m.cmd === 'dispatch-ack') {
+          console.log('[ppc-worker-handshake] dispatch round-trip OK, next=0x' + (m.next >>> 0).toString(16));
+        } else if (m.cmd === 'error') {
+          console.error('[ppc-worker-handshake] error: ' + m.error);
+        }
+      };
+      window.ppc_worker = ppc_worker;
+    } catch (e) {
+      console.error('[ppc-worker-handshake] spawn failed: ' + (e && e.message ? e.message : String(e)));
+    }
+
+    setStatus('Runtime ready. Loading ROM...');
+    loadRomAndBoot();
+  };
   var mobilePadState = { a: false, b: false, x: false, y: false, l: false, r: false, z: false, start: false, select: false, up: false, down: false, left: false, right: false };
   function updatePadState() {
     if (!padStatus1) return;
