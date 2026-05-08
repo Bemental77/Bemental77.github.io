@@ -293,7 +293,11 @@
               break;
             }
           }
-          const fn = region.exports['block' + idx];
+          // bementalJIT-emitted modules export the entrypoint as `run`
+          // (see gekko_emit.cpp::4006). Test wasms (4f-4 hand-built,
+          // 4f-5 page-stub) export per-block names like `block0`. Fall
+          // back from one to the other so both shapes dispatch.
+          const fn = region.exports['block' + idx] || region.exports.run;
           if (typeof fn !== 'function') { exitReason = 'no-block-export'; break; }
           try {
             pc = fn() >>> 0;

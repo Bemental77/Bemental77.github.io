@@ -545,6 +545,14 @@
             // looks up pc=0 → unmapped → exit. (maxIters=1 would exit
             // on the iter-count guard before checking pc=0.)
             ppc_worker.postMessage({ cmd: 'run', startPc: 0xABCD, maxIters: 2 });
+          } else if (m.regionIdx === 3) {
+            // Phase 2d.3: real bementalJIT bytes loaded into region 3.
+            // Exports include `run` (no `block0`); ppc-worker's
+            // dispatch loop falls back to `run`. Iter 0 dispatches at
+            // start_pc=0x80003100; the bementalJIT-emitted run()
+            // executes the baked-in nop semantics and returns the next
+            // pc. Iter 1 looks that up → unmapped → exit.
+            ppc_worker.postMessage({ cmd: 'run', startPc: window._ppcRealDispatchPc, maxIters: 2 });
           }
         } else if (m.cmd === 'region-instantiate-nack') {
           console.error('[ppc-worker-handshake] region-instantiate FAIL: ' + m.reason);
@@ -579,7 +587,27 @@
         } else if (m.cmd === 'region-call-export-nack') {
           console.error('[ppc-worker-handshake] region call FAIL: ' + m.reason);
         } else if (m.cmd === 'run-ack') {
-          if (window._ppcStateMutateTest) {
+          if (window._ppcRealDispatchTest) {
+            window._ppcRealDispatchTest = false;
+            // Phase 2d.3: bementalJIT-emitted nop block dispatched
+            // exactly once, advanced pc by 4, returned next_pc.
+            // Iter 1 looks up next_pc → unmapped → exit. The block's
+            // return value (next_pc) is observable via lastPc; for a
+            // 1-instr nop at 0x80003100 the expected next_pc is 0x80003104.
+            var startPc_d3 = window._ppcRealDispatchPc >>> 0;
+            var expectedNext = (startPc_d3 + 4) >>> 0;
+            var okIters_d3   = m.iters === 1;
+            var okReason_d3  = m.exitReason === 'unmapped';
+            var okLast_d3    = (m.lastPc >>> 0) === expectedNext;
+            var ok_d3 = okIters_d3 && okReason_d3 && okLast_d3;
+            console.log('[ppc-worker-handshake] real-dispatch start=0x' + startPc_d3.toString(16)
+              + ' iters=' + m.iters
+              + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+              + ' (expected 0x' + expectedNext.toString(16) + ')'
+              + ' exit=' + m.exitReason
+              + ' ' + (ok_d3 ? 'PASS' : 'FAIL'));
+          } else if (window._ppcStateMutateTest) {
+            window._ppcStateMutateTest = false;
             // Phase 2d.1 verification: a dispatched wasm block writes
             // 0xCAFED00D via env.memory to SAB[ppc_state_addr+0]. The
             // run loop should iter once and exit unmapped (next_pc=0).
@@ -1159,6 +1187,24 @@
           + ' magic=' + (hdrOk ? 'OK' : 'BAD')
           + ' WebAssembly.Module=' + (instOk ? 'OK' : ('FAIL:' + instErr))
           + ' ' + (ok_d2 ? 'PASS' : 'FAIL'));
+        // Phase 2d.3: hand the real bytes to ppc-worker for instantiate
+        // + dispatch. bementalJIT exports the entrypoint as `run`;
+        // ppc-worker's dispatch loop falls back to it when there's no
+        // `block<idx>` export. region-instantiate with imports='env'
+        // resolves all host function imports against ppc-worker's
+        // mod.bemental_imports.env (set up in 4f-2).
+        if (ok_d2) {
+          window._ppcRealDispatchTest = true;
+          window._ppcRealDispatchPc = (data.pc >>> 0);
+          var pcKeysReal = new Uint32Array([data.pc >>> 0]);
+          ppc_worker.postMessage({
+            cmd: 'region-instantiate',
+            regionIdx: 3,
+            bytes: data.bytes,
+            imports: 'env',
+            pcKeys: pcKeysReal.buffer,
+          });
+        }
         break;
       }
       default: pageLog('unknown worker cmd: ' + data.cmd);
