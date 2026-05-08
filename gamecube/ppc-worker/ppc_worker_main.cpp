@@ -94,6 +94,20 @@ void ppc_worker_poke_u32(u32 addr, u32 value) {
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(addr)) = value;
 }
 
+// ---- Mailbox primitive (Phase 2c.4b — async one-way demo) ----
+// Phase 2c.4b ships only the simplest possible cross-worker write:
+// ppc-worker pokes a sentinel into shared SAB at the mailbox address;
+// page polls and verifies. No reply, no Atomics yet — that's 2c.4c.
+//
+// This proves ppc-worker → shared-SAB → page works end-to-end with a
+// real export the dispatch loop can call. Once verified, the same
+// mechanism extends to writing MailboxRecord slots + reply waits.
+EMSCRIPTEN_KEEPALIVE
+void ppc_worker_mailbox_post_demo(u32 sentinel) {
+    if (g_mailbox_base == 0u) return;
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(g_mailbox_base)) = sentinel;
+}
+
 // shutdown: stub.
 EMSCRIPTEN_KEEPALIVE
 void ppc_worker_shutdown() {

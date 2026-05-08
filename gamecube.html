@@ -246,9 +246,10 @@
         var m = e.data || {};
         console.log('[ppc-worker-handshake] ' + JSON.stringify(m));
         if (m.cmd === 'ready') {
-          // Phase 2c: pass placeholder zeros for the SAB-relative pointers
-          // (Step 3 will populate them from dolphin_worker's metadata).
-          ppc_worker.postMessage({ cmd: 'init', ppcStateAddr: 0, mem1Addr: 0, mem1Size: 0, mailboxAddr: 0 });
+          // Phase 2c.4b: assign a mailbox address in shared SAB.
+          // 0x02000000 = 32 MB into shared memory; well above the
+          // SAB-probe at 0x01000000 and below MEM1's typical placement.
+          ppc_worker.postMessage({ cmd: 'init', ppcStateAddr: 0, mem1Addr: 0, mem1Size: 0, mailboxAddr: 0x02000000 });
         } else if (m.cmd === 'init-ack') {
           // Test dispatch round-trip with a known PC. Stub returns input
           // PC unchanged, so we expect next === 0x80003140.
@@ -271,6 +272,14 @@
           var got = (m.value >>> 0).toString(16);
           var ok = (m.value >>> 0) === 0xDEC0DE42;
           console.log('[ppc-worker-handshake] SAB peek-ack addr=0x' + (m.addr >>> 0).toString(16) + ' got=0x' + got + ' ' + (ok ? 'PASS' : 'FAIL'));
+          // Phase 2c.4b: ask ppc-worker to poke a sentinel at the
+          // mailbox base. Page then DataView-reads it back.
+          ppc_worker.postMessage({ cmd: 'mailbox-demo', sentinel: 0xCAFEBABE });
+        } else if (m.cmd === 'mailbox-demo-ack') {
+          var view = new DataView(sharedMemory.buffer);
+          var got = view.getUint32(0x02000000, true) >>> 0;
+          var ok = (got === 0xCAFEBABE);
+          console.log('[ppc-worker-handshake] mailbox-demo addr=0x02000000 got=0x' + got.toString(16) + ' ' + (ok ? 'PASS' : 'FAIL'));
         } else if (m.cmd === 'error') {
           console.error('[ppc-worker-handshake] error: ' + m.error);
         }

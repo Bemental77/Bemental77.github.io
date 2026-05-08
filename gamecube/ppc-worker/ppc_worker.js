@@ -77,6 +77,15 @@
         postMessage({ cmd: 'sab-peek-ack', addr: data.addr, value });
         break;
       }
+      case 'mailbox-demo': {
+        if (!inited) { postMessage({ cmd: 'mailbox-demo-nack', reason: 'not initialised' }); return; }
+        // ppc-worker pokes its mailbox slot with a sentinel. The page
+        // then DataView-reads the same SAB offset to confirm the write
+        // is visible cross-worker.
+        mod._ppc_worker_mailbox_post_demo((data.sentinel | 0) >>> 0);
+        postMessage({ cmd: 'mailbox-demo-ack', sentinel: data.sentinel });
+        break;
+      }
       case 'shutdown': {
         if (mod) mod._ppc_worker_shutdown();
         postMessage({ cmd: 'shutdown-ack' });
