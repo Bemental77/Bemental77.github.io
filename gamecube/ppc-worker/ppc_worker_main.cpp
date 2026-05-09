@@ -18,6 +18,19 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <vector>
+
+// gekko_emit.h is in the per-guest tree (not part of the public include/
+// surface); declare the one entry we use here. Default arguments are
+// supplied at the call site.
+namespace bemental::powerpc {
+std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
+                            u32 ctx_ptr_const, u32 mem_pages,
+                            u32 mem1_base, u32 mem1_mask,
+                            u32 ram_size,
+                            const u32* instr_pcs,
+                            bool emit_hle_check);
+}
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -175,6 +188,75 @@ u32 ppc_worker_mailbox_call_sync2(u32 cmd, u32 arg0, u32 arg1) {
     __atomic_store_n(p_req_ready,  0u, __ATOMIC_RELEASE);
     __atomic_store_n(p_reply_ready, 0u, __ATOMIC_RELEASE);
     return reply;
+}
+
+// ---- Self-compile (Phase 2g) -----------------------------------------------
+// ppc-worker reads instructions directly from SAB-mapped guest RAM (placed
+// at g_mem1_base by ppc_worker_init) and calls bemental::powerpc::build_block
+// without any round-trip to dolphin. Eliminates the proxy-call hang that
+// blocked sustained dispatch under PROXY_TO_PTHREAD.
+//
+// PowerPC instructions live big-endian in guest RAM; host (wasm) is
+// little-endian — byte-swap on read.
+//
+// Block-end heuristic: stop after ANY branch-class opcode (16 bc, 17 sc,
+// 18 b/bl, 19 bclr/bcctr/rfi). This matches Dolphin's DecodeBlock for
+// the common case; the chained-fall-through optimization (instr_pcs)
+// is left for a later pass.
+
+static constexpr u32 PPC_MAX_BLOCK_INSTRS = 64u;
+static std::vector<u8> g_compile_buf;
+static u32 g_compile_cycles = 0;
+
+static inline u32 byteswap32(u32 v) {
+    return (v >> 24) | ((v >> 8) & 0x0000FF00u) | ((v << 8) & 0x00FF0000u) | (v << 24);
+}
+
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_compile_block(u32 start_pc) {
+    if (g_mem1_base == 0u || g_mem1_size == 0u) return 0u;
+    // Translate guest virtual PC to SAB linear-memory address. MEM1 is
+    // mirrored at 0x80000000 (cached) and 0x00000000 (real-mode); both
+    // map to the same physical bytes via mask.
+    const u32 ram_mask = g_mem1_size - 1u;  // assumes size is power-of-two
+    const u32 phys     = start_pc & ram_mask;
+    const uintptr_t ram_addr = g_mem1_base + phys;
+    const u32* ram_ptr = reinterpret_cast<const u32*>(ram_addr);
+
+    u32 insts[PPC_MAX_BLOCK_INSTRS];
+    u32 count = 0;
+    while (count < PPC_MAX_BLOCK_INSTRS) {
+        const u32 raw_be = ram_ptr[count];
+        const u32 inst   = byteswap32(raw_be);
+        insts[count]     = inst;
+        const u32 op     = (inst >> 26) & 0x3Fu;
+        ++count;
+        if (op == 16u || op == 17u || op == 18u || op == 19u) break;
+    }
+    if (count == 0u) return 0u;
+
+    auto bytes = bemental::powerpc::build_block(
+        start_pc, insts, count,
+        /* ctx_ptr_const   = */ static_cast<u32>(g_ppc_state_base),
+        /* mem_pages       = */ 0u,
+        /* mem1_base       = */ static_cast<u32>(g_mem1_base),
+        /* mem1_mask       = */ ram_mask,
+        /* ram_size        = */ g_mem1_size,
+        /* instr_pcs       = */ nullptr,
+        /* emit_hle_check  = */ false);
+    g_compile_buf  = std::move(bytes);
+    g_compile_cycles = count;
+    return static_cast<u32>(g_compile_buf.size());
+}
+
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_compile_buf_addr() {
+    return static_cast<u32>(reinterpret_cast<uintptr_t>(g_compile_buf.data()));
+}
+
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_compile_cycles() {
+    return g_compile_cycles;
 }
 
 // shutdown: stub.

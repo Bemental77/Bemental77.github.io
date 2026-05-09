@@ -322,6 +322,11 @@
           Atomics.store(new Int32Array(sharedMemory.buffer), 0x02500000 >> 2, 0);
           return;
         }
+        if (m.cmd === 'update-mem-ack') {
+          console.log('[ppc-worker-handshake] ppc-worker MEM1 wired: addr=0x'
+            + (m.mem1Addr>>>0).toString(16) + ' size=0x' + (m.mem1Size>>>0).toString(16));
+          return;
+        }
         if (ppcTestEnabled || m.cmd === 'ready') {
           console.log('[ppc-worker-handshake] ' + JSON.stringify(m));
         }
@@ -441,6 +446,35 @@
             if (msg.cmd === 'runtime-ready') {
               window._ppcDolphinRoutingReady = true;
               console.log('[ppc-worker-handshake] dolphin runtime-ready — MMIO routing live');
+              // 2g: poll dolphin for MEM1 address — JIT g_jit_wasm
+              // singleton may not be constructed yet at runtime-ready.
+              // First non-zero response cancels the poll.
+              if (!window._ppcRamInfoPoll) {
+                window._ppcRamInfoPoll = setInterval(function () {
+                  try { dolphin_worker.postMessage({ cmd: 'get-ram-info' }); }
+                  catch (e) {}
+                }, 500);
+              }
+              return;
+            }
+            if (msg.cmd === 'ram-info') {
+              if ((msg.addr >>> 0) !== 0 && (msg.size >>> 0) !== 0
+                  && !window._ppcMem1Wired) {
+                console.log('[ppc-worker-handshake] dolphin ram addr=0x' + (msg.addr>>>0).toString(16)
+                  + ' size=0x' + (msg.size>>>0).toString(16));
+                window._ppcMem1Wired = true;
+                if (window._ppcRamInfoPoll) {
+                  clearInterval(window._ppcRamInfoPoll);
+                  window._ppcRamInfoPoll = null;
+                }
+                try {
+                  window.ppc_worker.postMessage({
+                    cmd: 'update-mem',
+                    mem1Addr: msg.addr >>> 0,
+                    mem1Size: msg.size >>> 0,
+                  });
+                } catch (e) {}
+              }
               return;
             }
             // 2d.4: tagged compile-test-result for in-flight cmd 13.
@@ -888,7 +922,9 @@
       var _perfPoll = setInterval(function () {
         var u32sab = new Uint32Array(sharedMemory.buffer);
         var pc = u32sab[0x02400000 >> 2] >>> 0;
-        var ready = (pc >= 0x80000000 && pc < 0x81800000);
+        // 2g: also gate on MEM1 being wired into ppc-worker — without
+        // it the self-compile path can't read instructions from RAM.
+        var ready = (pc >= 0x80000000 && pc < 0x81800000) && !!window._ppcMem1Wired;
         var elapsed = performance.now() - _perfWaitStart;
         if (ready) {
           clearInterval(_perfPoll);
@@ -1351,6 +1387,10 @@
       case 'mbx-reply':
         // 4f-6: dolphin's mbx-cmd handler reply. Ignore here — the
         // listener inside mailbox-demo-ack writes to the SAB.
+        break;
+      case 'ram-info':
+        // 2g: handled by _ppcMboxReplyListener (added in mailbox-demo-ack);
+        // swallow here so onWorkerMsg's default doesn't log "unknown".
         break;
       case 'paused-for-cutover':
       case 'cutover-resumed':

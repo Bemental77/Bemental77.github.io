@@ -283,6 +283,21 @@ self.onmessage = function (e) {
       }
       break;
     }
+    case 'get-ram-info': {
+      // 2g: page polls this until non-zero, then forwards to ppc-worker
+      // so its self-compile path can read instructions directly from
+      // SAB-mapped guest RAM. Returns 0/0 until JitWasm::Init() runs.
+      try {
+        var addr = (typeof Module._dolphin_get_ram_addr === 'function')
+          ? (Module._dolphin_get_ram_addr() >>> 0) : 0;
+        var size = (typeof Module._dolphin_get_ram_size === 'function')
+          ? (Module._dolphin_get_ram_size() >>> 0) : 0;
+        postMessage({ cmd: 'ram-info', addr: addr, size: size });
+      } catch (err) {
+        postMessage({ cmd: 'ram-info', addr: 0, size: 0, error: String(err && err.message || err) });
+      }
+      break;
+    }
     case 'compile-test': {
       // 2d.2: page asks dolphin to emit a real bementalJIT wasm module
       // for `pc` and ship the bytes back. dolphin_test_compile_block

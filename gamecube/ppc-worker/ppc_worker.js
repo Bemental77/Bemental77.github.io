@@ -92,6 +92,22 @@
         postMessage({ cmd: 'init-ack' });
         break;
       }
+      case 'update-mem': {
+        // 2g: deferred MEM1 wiring. Page calls Module._dolphin_get_ram_addr
+        // once dolphin's runtime is ready, posts here. ppc-worker's
+        // self-compile path needs g_mem1_base/g_mem1_size set so it can
+        // read guest instructions directly from SAB-mapped RAM.
+        if (!mod) { postMessage({ cmd: 'update-mem-nack', reason: 'wasm not yet ready' }); return; }
+        const newMem1Addr = (data.mem1Addr | 0) >>> 0;
+        const newMem1Size = (data.mem1Size | 0) >>> 0;
+        // Re-init keeps ppcStateAddr/mailboxAddr the same (we don't have a
+        // separate setter for just mem1).
+        const ppcStateAddr = 0x02400000;
+        const mailboxAddr  = mailboxBase || 0x02000000;
+        mod._ppc_worker_init(ppcStateAddr, newMem1Addr, newMem1Size, mailboxAddr);
+        postMessage({ cmd: 'update-mem-ack', mem1Addr: newMem1Addr, mem1Size: newMem1Size });
+        break;
+      }
       case 'dispatch': {
         if (!inited) { postMessage({ cmd: 'dispatch-nack', reason: 'not initialised' }); return; }
         const next = mod._ppc_worker_dispatch((data.pc | 0) >>> 0) >>> 0;
@@ -446,32 +462,33 @@
           }
           if (!region) {
             if (!compileOnMiss) { exitReason = 'unmapped'; break; }
-            const bytesOffset = mod._ppc_worker_mailbox_call_sync(13, pc) >>> 0;
-            const bytesSize   = mod._ppc_worker_peek_u32(mailboxBase + 24) >>> 0;
-            const packed      = mod._ppc_worker_peek_u32(mailboxBase + 28) >>> 0;
+            // 2g: ppc-worker self-compile. Reads guest instructions from
+            // SAB-mapped MEM1 directly, calls bemental::powerpc::build_block
+            // in-process, returns module bytes via static buffer. Replaces
+            // the cmd-13 mailbox round-trip to dolphin (which hangs once
+            // dolphin's pthread is in steady-state retro_run loop).
+            const bytesSize = mod._ppc_worker_compile_block(pc) >>> 0;
+            const bytesOffset = mod._ppc_worker_compile_buf_addr() >>> 0;
+            const cycles = mod._ppc_worker_compile_cycles() >>> 0 || 1;
             ++compileCalls;
             totalCompileBytes += bytesSize;
             if (bytesSize === 0) { exitReason = 'compile-empty'; break; }
-            const regionIdx   = (packed >>> 16) & 0xFF;
-            const fnIdx       = packed & 0xFFFF;
-            const cycles      = ((packed >>> 24) & 0xFF) || 1;
+            // Self-compile uses a single growing region; assign sequential
+            // function indices into region 0.
+            const regionIdx = 0;
             try {
+              if (!regions[regionIdx]) {
+                regions[regionIdx] = { pcMap: new Map(), cycleMap: new Map(), instances: [] };
+              }
+              const fnIdx = regions[regionIdx].instances.length;
               const bytes = new Uint8Array(sharedMemoryRef.buffer, bytesOffset, bytesSize).slice();
               const wmod = new WebAssembly.Module(bytes);
               const importObj = mod.bemental_imports
                 ? { env: mod.bemental_imports.env } : {};
               const inst = new WebAssembly.Instance(wmod, importObj);
-              if (!regions[regionIdx]) {
-                regions[regionIdx] = { instance: inst, exports: inst.exports, pcMap: new Map(), cycleMap: new Map(), nFuncs: 0 };
-              } else {
-                regions[regionIdx].instance = inst;
-                regions[regionIdx].exports = inst.exports;
-                if (!regions[regionIdx].pcMap) regions[regionIdx].pcMap = new Map();
-                if (!regions[regionIdx].cycleMap) regions[regionIdx].cycleMap = new Map();
-              }
+              regions[regionIdx].instances.push(inst);
               regions[regionIdx].pcMap.set(pc >>> 0, fnIdx);
               regions[regionIdx].cycleMap.set(pc >>> 0, cycles);
-              regions[regionIdx].nFuncs = Math.max(regions[regionIdx].nFuncs || 0, fnIdx + 1);
               region = regions[regionIdx];
               idx = fnIdx;
               blockCycles = cycles;
@@ -495,8 +512,16 @@
             samePcCount = 0;
             lastPc = pc;
           }
-          // Dispatch.
-          const fn = region.exports['block' + idx] || region.exports.run;
+          // Dispatch. 2g self-compile uses one Instance per block in
+          // region.instances[]; legacy mailbox path stores a single
+          // multi-block instance in region.exports.
+          let fn;
+          if (region.instances) {
+            const inst = region.instances[idx];
+            fn = inst && (inst.exports['block' + idx] || inst.exports.block0 || inst.exports.run);
+          } else {
+            fn = region.exports['block' + idx] || region.exports.run;
+          }
           if (typeof fn !== 'function') { exitReason = 'no-block-export'; break; }
           let nextPc;
           try {
