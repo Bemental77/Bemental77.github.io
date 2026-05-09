@@ -67,6 +67,28 @@
         mod._ppc_worker_init(ppcStateAddr, mem1Addr, mem1Size, mailboxAddr);
         mailboxBase = mailboxAddr;
         inited = true;
+        // 2f.6: auto-bootstrap mod.bemental_imports.env (host imports
+        // for JIT-emitted blocks) and mod.bemental_regions (region
+        // table). These were previously cascade-test-only steps; now
+        // production paths (run-continuous via ?ppcperf=1) need them
+        // too. Idempotent — overwrites any prior values.
+        if (!mod.bemental_imports) mod.bemental_imports = { env: {} };
+        const env = mod.bemental_imports.env;
+        const call1 = (cmd, a) => mod._ppc_worker_mailbox_call_sync(cmd, a >>> 0) >>> 0;
+        const call2 = (cmd, a, b) => { mod._ppc_worker_mailbox_call_sync2(cmd, a >>> 0, b >>> 0); };
+        env.memory          = sharedMemoryRef;
+        env.ppc_read8       = (addr) => call1(2, addr);
+        env.ppc_read16      = (addr) => call1(3, addr);
+        env.ppc_read32      = (addr) => call1(4, addr);
+        env.ppc_write8      = (addr, val) => call2(5, addr, val);
+        env.ppc_write16     = (addr, val) => call2(6, addr, val);
+        env.ppc_write32     = (addr, val) => call2(7, addr, val);
+        env.ppc_hle_check   = (pc) => call1(8, pc);
+        env.ppc_interp      = (inst, pc) => call2(9, inst, pc);
+        env.ppc_check_exc   = (pc) => call1(10, pc);
+        env.ppc_break_block = (pc, x) => call2(11, pc, x);
+        env.ppc_read_tb     = (which) => call1(12, which);
+        if (!mod.bemental_regions) mod.bemental_regions = {};
         postMessage({ cmd: 'init-ack' });
         break;
       }
@@ -343,13 +365,22 @@
         const regions = mod.bemental_regions;
         const compileOnMiss = !!data.compileOnMiss;
         const safetyCap = ((data.safetyCap | 0) >>> 0) || 100000;
+        // 2f.6: perf-measurement mode bypasses downcount/exception/idle
+        // termination so we can clock raw dispatch throughput. Still
+        // honors stop-flag and safetyCap.
+        const ignoreDowncount = !!data.ignoreDowncount;
+        const wallTimeMs = (data.wallTimeMs | 0) || 0;
+        const wallStart = (typeof performance !== 'undefined') ? performance.now() : Date.now();
         // PowerPCState SAB offsets per ppc_worker_main.cpp layout comment.
         const PPC_STATE_BASE   = 0x02400000;
         const OFFSET_PC        = 0x000;
         const OFFSET_MSR       = 0x2E0;
         const OFFSET_EXC       = 0x2EC;
         const OFFSET_DOWNCOUNT = 0x2F0;
-        const STOP_FLAG_ADDR   = 0x02500000;
+        // 2f.2 reserves SAB[0x02500000] for the dolphin yield flag
+        // (page sets → dolphin returns from Run()). ppc-worker uses
+        // a separate stop flag at +4 so the two signals don't conflict.
+        const STOP_FLAG_ADDR   = 0x02500004;
         const u32 = new Uint32Array(sharedMemoryRef.buffer);
         const i32 = new Int32Array(sharedMemoryRef.buffer);  // downcount is signed
         // Initial PC: caller-supplied wins, else read from SAB ppc_state.
@@ -360,6 +391,18 @@
         } else {
           pc = u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] >>> 0;
         }
+        // 2f.6 diag: log what ppc-worker sees at the ppc_state offsets.
+        // If page sees 0xcafe1234 here but dolphin writes real PCs in
+        // the same address, the views are inconsistent.
+        const _diag_pc  = u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] >>> 0;
+        const _diag_msr = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
+        const _diag_dc  = i32[(PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2];
+        const _diag_buf = sharedMemoryRef ? sharedMemoryRef.buffer.byteLength : 0;
+        postMessage({ cmd: 'print',
+          txt: '[ppc-worker-diag] SAB[0x02400000+0]=0x' + _diag_pc.toString(16)
+             + ' MSR=0x' + _diag_msr.toString(16)
+             + ' downcount=' + _diag_dc
+             + ' bufBytes=' + _diag_buf });
         let iters = 0;
         let compileCalls = 0;
         let totalCompileBytes = 0;
@@ -372,21 +415,25 @@
             exitReason = 'stop-flag'; break;
           }
           // Exception pending? Let dolphin vector the handler.
-          const exc = u32[(PPC_STATE_BASE + OFFSET_EXC) >> 2] >>> 0;
-          if (exc !== 0) {
-            const msr = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
-            // Always exit on synchronous exceptions; for EXTERNAL_INT
-            // only if MSR.EE=1 (else they're masked and can wait).
-            const EXC_EXTERNAL_INT = 0x00000004;
-            const MSR_EE = 0x8000;
-            const externalOnly = (exc & ~EXC_EXTERNAL_INT) === 0;
-            if (!externalOnly || (msr & MSR_EE) !== 0) {
-              exitReason = 'exception-pending'; break;
+          if (!ignoreDowncount) {
+            const exc = u32[(PPC_STATE_BASE + OFFSET_EXC) >> 2] >>> 0;
+            if (exc !== 0) {
+              const msr = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
+              const EXC_EXTERNAL_INT = 0x00000004;
+              const MSR_EE = 0x8000;
+              const externalOnly = (exc & ~EXC_EXTERNAL_INT) === 0;
+              if (!externalOnly || (msr & MSR_EE) !== 0) {
+                exitReason = 'exception-pending'; break;
+              }
             }
+            const downcount = i32[(PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2];
+            if (downcount <= 0) { exitReason = 'downcount-exhausted'; break; }
           }
-          // Downcount budget. <=0 means CoreTiming needs to advance.
-          const downcount = i32[(PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2];
-          if (downcount <= 0) { exitReason = 'downcount-exhausted'; break; }
+          // Wall-time cap (perf-measurement mode).
+          if (wallTimeMs > 0 && (iters & 0xfff) === 0) {
+            const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+            if ((now - wallStart) >= wallTimeMs) { exitReason = 'wall-time-cap'; break; }
+          }
           // Lookup or compile.
           let region = null, idx = -1, blockCycles = 1;
           for (const k in regions) {
@@ -460,8 +507,11 @@
           }
           // Decrement downcount per dispatch (post-2f.0 cycles plumbing).
           // Use Atomics.sub to keep this race-free with dolphin's parallel
-          // Run() until 2f.2 wires the yield handshake.
-          Atomics.sub(i32, (PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2, blockCycles);
+          // Run() until 2f.2 wires the yield handshake. In perf mode we
+          // skip this (downcount accounting is dolphin's job there).
+          if (!ignoreDowncount) {
+            Atomics.sub(i32, (PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2, blockCycles);
+          }
           // Update SAB pc to the new value (block return is canonical
           // per Q2 finding).
           u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] = nextPc;

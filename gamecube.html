@@ -278,11 +278,48 @@
       // ppc-worker instantiates + dispatches → next_pc → loop.
       // Demonstrates ppc-worker can sustain real PowerPC dispatch.
       var ppcDispatchEnabled = new URLSearchParams(location.search).has('ppcdispatch');
+      // 2f.6: opt-in production cutover perf measurement. Gated separately
+      // so it doesn't fire during normal `?ppctest=1` runs (it engages the
+      // dolphin yield gate, hands dispatch to ppc-worker for ~1 second,
+      // then resumes — disruptive enough to want explicit consent).
+      var ppcPerfEnabled = new URLSearchParams(location.search).has('ppcperf');
       window._ppcDispatchEnabled = ppcDispatchEnabled;  // surfaced for onWorkerMsg (outer scope)
+      window._ppcPerfEnabled = ppcPerfEnabled;
       ppc_worker.onmessage = function (e) {
         var m = e.data || {};
         if (m.cmd === 'rw-suite-debug') {
           if (ppcTestEnabled) console.log('[ppc-worker-handshake] rw-suite-debug stage=' + m.stage + (m.value !== undefined ? ' value=0x' + (m.value>>>0).toString(16) : ''));
+          return;
+        }
+        // 2f.6: perf-measurement uses ?ppcperf=1 (independent of ?ppctest=1).
+        // Handle run-continuous responses + generic 'print' diagnostics
+        // here so they surface even when the test cascade is disabled.
+        if (m.cmd === 'print') {
+          console.log('[ppc-worker-print] ' + (m.txt || ''));
+          return;
+        }
+        if (m.cmd === 'run-continuous-ack') {
+          var elapsedMs_pf = performance.now() - (window._perfStartTime || performance.now());
+          var iters_pf     = m.iters >>> 0;
+          var rate_pf      = elapsedMs_pf > 0 ? (iters_pf * 1000 / elapsedMs_pf) : 0;
+          var nativeBlocksPerSec = 48.6e6;  // 486 MHz / 10 insts per block
+          var nativePctEst = (rate_pf / nativeBlocksPerSec) * 100;
+          console.log('[ppc-worker-handshake] perf-result iters=' + iters_pf
+            + ' compileCalls=' + (m.compileCalls >>> 0)
+            + ' totalBytes=' + (m.totalCompileBytes >>> 0)
+            + ' elapsed=' + elapsedMs_pf.toFixed(1) + 'ms'
+            + ' rate=' + rate_pf.toFixed(0) + ' iters/sec'
+            + ' (~' + nativePctEst.toFixed(2) + '% native @ 10 inst/block)'
+            + ' exit=' + m.exitReason
+            + ' lastPc=0x' + (m.lastPc >>> 0).toString(16));
+          // Clear dolphin yield flag — dolphin's next heartbeat resumes.
+          Atomics.store(new Int32Array(sharedMemory.buffer), 0x02500000 >> 2, 0);
+          console.log('[ppc-worker-handshake] perf-measurement: yield flag cleared, dolphin resuming');
+          return;
+        }
+        if (m.cmd === 'run-continuous-nack') {
+          console.error('[ppc-worker-handshake] run-continuous FAIL: ' + m.reason);
+          Atomics.store(new Int32Array(sharedMemory.buffer), 0x02500000 >> 2, 0);
           return;
         }
         if (ppcTestEnabled || m.cmd === 'ready') {
@@ -299,8 +336,11 @@
           // build_block). The verification step below confirms a
           // dispatched wasm block can mutate state at this offset.
           ppc_worker.postMessage({ cmd: 'init', ppcStateAddr: 0x02400000, mem1Addr: 0, mem1Size: 0, mailboxAddr: 0x02000000 });
-        } else if (!ppcTestEnabled) {
+        } else if (!ppcTestEnabled && !ppcPerfEnabled) {
           // Skip the rest of the cascade in normal probe runs.
+          // ?ppcperf=1 needs the cascade because the mailbox consumer
+          // (set up in 'mailbox-demo-ack' branch) is what services
+          // ppc-worker's cmd-13 CompileBlock requests.
           return;
         } else if (m.cmd === 'init-ack') {
           // Test dispatch round-trip with a known PC. Stub returns input
@@ -408,10 +448,11 @@
             // handler in onWorkerMsg — left untouched here.
             if (msg.cmd === 'compile-test-result' && msg.tag === 'mbx-13') {
               if (msg.error) {
-                console.error('[ppc-worker-handshake] cmd-13 compile-test failed: ' + msg.error);
+                console.log('[mbx-13-fail] pc=0x' + ((window._lastMbx13Pc||0)>>>0).toString(16) + ' err=' + msg.error);
                 deliverReply(0, 0, 0);
                 return;
               }
+              console.log('[mbx-13-ok] pc=0x' + ((msg.pc||0)>>>0).toString(16) + ' size=' + (msg.size>>>0) + ' decoded=' + !!msg.decoded + ' cycles=' + (msg.cycles>>>0));
               var srcU8 = new Uint8Array(msg.bytes);
               u8.set(srcU8, WASM_SCRATCH_OFFSET);
               // 2f.0: pack cycles into reply_extra2 alongside region/fn:
@@ -469,7 +510,8 @@
               // (buildCompileBlockWasm) is kept defined as a fallback
               // but is no longer the primary CompileBlock source.
               inFlight = true;
-              dolphin_worker.postMessage({ cmd: 'compile-test', pc: arg0 >>> 0, tag: 'mbx-13' });
+              window._lastMbx13Pc = arg0 >>> 0;
+              dolphin_worker.postMessage({ cmd: 'compile-test', pc: arg0 >>> 0, tag: 'mbx-13', realDecode: true });
               return;
             }
             if (!window._ppcDolphinRoutingReady) {
@@ -671,6 +713,14 @@
             // approach is fundamentally blocked by emscripten's
             // PROXY_TO_PTHREAD memory isolation between the JS main
             // thread and dolphin's pthread.
+            //
+            // 2f.6 perf measurement is now triggered independently —
+            // see the standalone perf-trigger setTimeout in var_setup
+            // below. Running it here corrupts PowerPCState because the
+            // cascade tests (2d.1, 2d.7, 2d.8) wrote sentinel values to
+            // SAB[0x02400000] before PowerPCManager construction; the
+            // live PC reads as 0xdeadbf13 (cutover-gate test residue)
+            // instead of the actual boot PC.
           } else if (window._ppcRealDispatchTest) {
             window._ppcRealDispatchTest = false;
             // Phase 2d.3: bementalJIT-emitted nop block dispatched
@@ -827,6 +877,52 @@
 
     setStatus('Runtime ready. Loading ROM...');
     loadRomAndBoot();
+    // 2f.6: standalone perf-measurement trigger. Engage cutover only
+    // once dolphin has booted far enough that PC is in valid PowerPC
+    // virtual range [0x80000000, 0x81800000) — i.e., PowerPCManager
+    // has been constructed (placement-new at SAB[0x02400000] zeros
+    // the page sentinel) AND the boot has reached real game code.
+    // Polling at 250ms cadence; gives up after 60s.
+    if (ppcPerfEnabled) {
+      var _perfWaitStart = performance.now();
+      var _perfPoll = setInterval(function () {
+        var u32sab = new Uint32Array(sharedMemory.buffer);
+        var pc = u32sab[0x02400000 >> 2] >>> 0;
+        var ready = (pc >= 0x80000000 && pc < 0x81800000);
+        var elapsed = performance.now() - _perfWaitStart;
+        if (ready) {
+          clearInterval(_perfPoll);
+          var i32sab = new Int32Array(sharedMemory.buffer);
+          var preDowncount = i32sab[(0x02400000 + 0x2F0) >> 2];
+          var preMsr       = u32sab[(0x02400000 + 0x2E0) >> 2] >>> 0;
+          var preExc       = u32sab[(0x02400000 + 0x2EC) >> 2] >>> 0;
+          console.log('[ppc-worker-handshake] perf-measurement: pre-cutover'
+            + ' (waited=' + elapsed.toFixed(0) + 'ms)'
+            + ' PC=0x' + pc.toString(16)
+            + ' downcount=' + preDowncount
+            + ' MSR=0x' + preMsr.toString(16)
+            + ' Exceptions=0x' + preExc.toString(16));
+          // NOTE: yield flag intentionally NOT set — see
+          // perf_cmd13_proxy_blocked_2026_05_08.md. With yield flag set,
+          // dolphin's pthread doesn't drain the proxy queue, so cmd-13
+          // (CompileBlock) postMessage from page hangs indefinitely.
+          // Run alongside dolphin instead; measurement loses some accuracy
+          // but at least exercises the actual dispatch path.
+          console.log('[ppc-worker-handshake] perf-measurement: sending run-continuous (no-yield)');
+          window._perfStartTime = performance.now();
+          window.ppc_worker.postMessage({
+            cmd: 'run-continuous',
+            compileOnMiss: true,
+            safetyCap: 5000000,
+            ignoreDowncount: true,
+            wallTimeMs: 5000,
+          });
+        } else if (elapsed > 60000) {
+          clearInterval(_perfPoll);
+          console.log('[ppc-worker-handshake] perf-measurement: timed out waiting for valid PC, last=0x' + pc.toString(16));
+        }
+      }, 250);
+    }
   };
   var mobilePadState = { a: false, b: false, x: false, y: false, l: false, r: false, z: false, start: false, select: false, up: false, down: false, left: false, right: false };
   function updatePadState() {
