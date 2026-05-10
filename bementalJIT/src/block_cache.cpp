@@ -607,13 +607,22 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
     // up-to-date pc_to_idx map: branches whose targets are in the map
     // become return_call_indirect (intra-instance, V8-inline-able).
     //
-    // Only fires when block_records are available AND the env-var
-    // JITWASM_REEMIT_AT_RELINK is set. Default OFF: measured 2026-05-06,
-    // re-emitting all N bodies on each relink is O(N^2) over a region's
-    // lifetime — at 1500+ blocks, slice timing collapses to ~0.03% native.
-    // Re-enabling requires per-block "needs re-emit" tracking (only
-    // re-emit blocks whose branches resolve to newly-accumulated PCs).
-    static const bool s_reemit_enabled = (std::getenv("JITWASM_REEMIT_AT_RELINK") != nullptr);
+    // Phase B4: default-ON (was default-OFF gated by JITWASM_REEMIT_AT_RELINK).
+    // The 2026-05-06 measurement that motivated the gate observed 1500+
+    // blocks per region; in current SAB boot we plateau at ~480/region per
+    // probe (gen=9), well under the O(N^2) collapse threshold. Disable
+    // explicitly via JITWASM_REEMIT_AT_RELINK_OFF=1 if a regression turns up
+    // (e.g. game with much wider regions).
+    //
+    // Re-emit lets cross-block branches whose targets are NEWLY accumulated
+    // since first emit become return_call_indirect (intra-instance, V8-
+    // inline-able) instead of staying baked as set_pc + return.
+    //
+    // TODO: per-block "needs re-emit" tracking — only re-emit blocks with
+    // unresolved branches whose targets are now in pc_to_idx. Reduces O(N^2)
+    // to O(touched edges).
+    static const bool s_reemit_enabled =
+        (std::getenv("JITWASM_REEMIT_AT_RELINK_OFF") == nullptr);
     bool have_records = s_reemit_enabled && (rs.block_records.size() == rs.n_funcs);
     for (const auto& rec : rs.block_records) {
         if (rec.insts.empty()) { have_records = false; break; }
