@@ -98,6 +98,8 @@ emcc \
   -sEXPORTED_FUNCTIONS="$EXPORTED_FUNCS" \
   -sEXPORTED_RUNTIME_METHODS="$EXPORTED_RUNTIME" \
   --embed-file $ROOT/gamecube/IPL.bin@/IPL.bin \
-  --embed-file $ROOT/gamecube/dolphin-src/Data/Sys/totaldb.dsy@/totaldb.dsy
+  --embed-file $ROOT/gamecube/dolphin-src/Data/Sys/totaldb.dsy@/totaldb.dsy \
+  --embed-file $ROOT/tools/gsne8p.map@/User/Maps/GSNE8P.map \
+  --embed-file $ROOT/tools/gpoe8p.map@/User/Maps/GPOE8P.map
 
 echo "linked: $OUT/dolphin_worker_emcc.js"

@@ -43,6 +43,13 @@ static bool environment_cb(unsigned cmd, void* data) {
         case RETRO_ENVIRONMENT_GET_CAN_DUPE:
             *(bool*)data = true;
             return true;
+        case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
+            // Boot.cpp does user_dir = save_dir + "/User". Use empty so
+            // user_dir = "/User" (single slash) → D_MAPS_IDX="/User/Maps/".
+            // The .map files are --embed-file'd to that MEMFS path by the
+            // link script.
+            *(const char**)data = "";
+            return true;
         default:
             return false;
     }
