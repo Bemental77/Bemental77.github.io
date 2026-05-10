@@ -29,3 +29,6 @@ gamecube/dolphin-src/
 # into Dolphin via dolphin-src; only sources are deployed)
 bementalCompiler/build/
 
+# bementalJIT local build artifacts (host/test/emcc CMake out-of-tree builds)
+bementalJIT/build-*/
+

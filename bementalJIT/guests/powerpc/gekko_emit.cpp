@@ -447,6 +447,95 @@ static void emit_ea_d(EmitCtx& c, u32 ra, s32 simm) {
     }
 }
 
+// Phase A1: SAB MMIO mirror constants. Mirrored from
+// gamecube/ppc-worker/sab_layout.h. Both sides MUST agree.
+//
+// When EA is in [0xCC000000, 0xCC040000) AND the per-cell classification
+// table marks it DIRECT_RW, the read can come from a SAB-resident mirror
+// page that dolphin keeps current. Skips the synchronous mailbox round-
+// trip that previously dominated per-instruction cost.
+//
+// Mirror values are stored host-native (semantic value, NOT BE-encoded
+// like guest MEM1). NO byte-swap on read — dolphin writes via memcpy
+// from its u16/u32 register-file fields, so the bytes already represent
+// the value the guest expects from a PPC LWZ/LHZ.
+constexpr u32 MMIO_GUEST_BASE       = 0xCC000000u;
+constexpr u32 MMIO_GUEST_LIMIT      = 0xCC040000u;
+constexpr u32 MMIO_GUEST_RANGE_BYTES = MMIO_GUEST_LIMIT - MMIO_GUEST_BASE;
+constexpr u32 MMIO_MIRROR_ADDR      = 0x02600000u;
+constexpr u32 MMIO_CLS16_ADDR       = 0x02640000u;
+constexpr u32 MMIO_CLS32_ADDR       = 0x02660000u;
+constexpr u8  MMIO_CLASS_DIRECT_RW  = 1u;
+
+// Helper: emit the slow-path branch with an MMIO-mirror fast-path inserted
+// in front. EA must be in LOCAL_TMP_A from the caller. Result of the
+// expression (one i32 — the loaded value) is left on the stack.
+//
+// Layout:
+//   rel = ea - 0xCC000000
+//   if (rel < 0x40000) AND (cls[rel >> shift] == DIRECT_RW)
+//       i32.load[16_u]  offset = MMIO_MIRROR_ADDR
+//   else
+//       call import_idx        ; ppc_read*(ea)
+//
+// 8-bit reads skip the mirror entirely (no cls8 table in stage 1) and
+// fall straight to the import — matches today's behavior. Rare in MMIO.
+static void emit_mmio_mirror_else_or_import(EmitCtx& c, u32 import_idx) {
+    if (import_idx == WIMPORT_READ8) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_call(import_idx);
+        return;
+    }
+    const u32 cls_addr  = (import_idx == WIMPORT_READ32) ? MMIO_CLS32_ADDR
+                                                         : MMIO_CLS16_ADDR;
+    const u32 cls_shift = (import_idx == WIMPORT_READ32) ? 2u : 1u;
+
+    // rel = ea - MMIO_GUEST_BASE — kept ONLY in LOCAL_TMP_B (set, not
+    // tee — leaving rel on the stack here would imbalance the if-block
+    // below: each arm would fall through with [rel, value] but the
+    // block result is one i32, tripping wasm validation
+    // ("expected 1 elements on the stack for fallthru, found 2").
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)MMIO_GUEST_BASE);
+    c.b.op_i32_sub();
+    c.b.op_local_set(LOCAL_TMP_B);
+
+    // cls[(rel & range_mask) >> shift] == DIRECT_RW
+    // The mask is critical: rel can be > range_bytes when EA is in
+    // MEM1 / cached / uncached space (e.g. 0x80003140). Without the
+    // mask, rel >> shift would index past the cls table and trap
+    // ("memory access out of bounds"). Masking keeps the cls read
+    // safe; the in_range check below makes the result irrelevant.
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_const((s32)(MMIO_GUEST_RANGE_BYTES - 1u));
+    c.b.op_i32_and();
+    c.b.op_i32_const((s32)cls_shift);
+    c.b.op_i32_shr_u();
+    c.b.op_i32_load8_u(cls_addr);          // offset = cls table base
+    c.b.op_i32_const((s32)MMIO_CLASS_DIRECT_RW);
+    c.b.op_i32_eq();
+
+    // rel < MMIO_GUEST_RANGE_BYTES — bounds-guards the cls read above.
+    // (Out-of-range cls reads land harmlessly in adjacent SAB anyway,
+    // but the AND below ensures we never act on a junk cls byte.)
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_const((s32)MMIO_GUEST_RANGE_BYTES);
+    c.b.op_i32_lt_u();
+
+    c.b.op_i32_and();
+    emit_local_op_if(c, WASM_TYPE_I32);
+        c.b.op_local_get(LOCAL_TMP_B);
+        if (import_idx == WIMPORT_READ32) {
+            c.b.op_i32_load(MMIO_MIRROR_ADDR);
+        } else {
+            c.b.op_i32_load16_u(MMIO_MIRROR_ADDR);
+        }
+    c.b.op_else();
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_call(import_idx);
+    emit_local_op_end(c);
+}
+
 // lbz/lhz/lwz/lha — D-form loads. update flag toggles RA writeback (lbzu etc.)
 //
 // Fast-path: emit a runtime range check + direct WASM linear-memory load
@@ -520,9 +609,8 @@ static void emit_load_d(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
         }
     };
     if (g_mem1_base == 0u) {
-        // (a) No fastmem base provided; full import.
-        c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_call(import_idx);
+        // (a) No fastmem base provided; try MMIO mirror first, then import.
+        emit_mmio_mirror_else_or_import(c, import_idx);
     } else if (g_mem1_safe) {
         // (b) Trust DFA passed; direct load with mask + add (no runtime branch).
         c.b.op_local_get(LOCAL_TMP_A);
@@ -550,8 +638,8 @@ static void emit_load_d(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
             c.b.op_i32_add();
             emit_direct_load_post();
         c.b.op_else();
-            c.b.op_local_get(LOCAL_TMP_A);
-            c.b.op_call(import_idx);
+            // MEM1 missed; try MMIO mirror before falling to import.
+            emit_mmio_mirror_else_or_import(c, import_idx);
         emit_local_op_end(c);
     }
 
@@ -2111,7 +2199,23 @@ static void emit_nop_impl(EmitCtx& /*c*/) { /* emit nothing */ }
 // ResetRegisters / RoundingModeUpdated), or XER (split fields) goes through
 // fallback so Dolphin's mfspr/mtspr handlers run.
 // ===========================================================================
-static bool spr_is_direct(u32 spr_num) {
+// Phase A4: split read vs. write SPR direct-ness.
+//
+// READ side: nearly all SPRs are storage-only — Interpreter::mfspr just
+// returns ppc_state.spr[N] for the bulk. Dynamic SPRs (TB/DEC) are
+// snapshotted at the JitWasm yield boundary, so reading state.spr[N]
+// returns a recently-current value. PVR (287) is the only SPR with a
+// special non-state.spr[] read path (constant 0x00083214) and is
+// handled inline by emit_mfpvr_native before this check.
+static bool spr_read_is_direct(u32 spr_num) {
+    return spr_num != 287u;
+}
+
+// WRITE side: stays restrictive. Writes to most non-listed SPRs trigger
+// dolphin-side handler logic — DEC reschedule, MSR-derived cache
+// invalidation, BAT-table refresh, IBAT/DBAT translation updates, perf-
+// counter resets, etc. Only confirmed storage-only SPRs are direct here.
+static bool spr_write_is_direct(u32 spr_num) {
     switch (spr_num) {
       case 8:    // LR
       case 9:    // CTR
@@ -2141,7 +2245,7 @@ static void emit_mfspr_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst);
     const u32 spr_num = SPR_DECODE(c.inst);
     if (spr_num == 287) { emit_mfpvr_native(c, rt); return; }  // PVR constant
-    if (!spr_is_direct(spr_num)) { emit_fallback(c); return; }
+    if (!spr_read_is_direct(spr_num)) { emit_fallback(c); return; }
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::spr(spr_num));   // [spr_val]
     emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
@@ -2150,7 +2254,7 @@ static void emit_mfspr_impl(EmitCtx& c) {
 static void emit_mtspr_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst);
     const u32 spr_num = SPR_DECODE(c.inst);
-    if (!spr_is_direct(spr_num)) { emit_fallback(c); return; }
+    if (!spr_write_is_direct(spr_num)) { emit_fallback(c); return; }
     c.b.op_i32_const((s32)CTX);
     emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_store(ppc_off::spr(spr_num));
@@ -2170,12 +2274,18 @@ static void emit_mtspr_impl(EmitCtx& c) {
 static void emit_mftb_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst);
     const u32 tbr = SPR_DECODE(c.inst);
-    u32 which;
-    if      (tbr == 268u) which = 0u;       // SPR_TL
-    else if (tbr == 269u) which = 1u;       // SPR_TU
+    u32 spr_idx;
+    if      (tbr == 268u) spr_idx = 268u;   // SPR_TL
+    else if (tbr == 269u) spr_idx = 269u;   // SPR_TU
     else { emit_fallback(c); return; }
-    c.b.op_i32_const((s32)which);
-    c.b.op_call(WIMPORT_READ_TB);            // -> i32 (TBL or TBU half)
+    // Phase A2: TB lives in ppc_state.spr[SPR_TL/TU] which is in shared
+    // SAB (PowerPCState placement-new'd at g_ctx_ptr). dolphin snapshots
+    // TB into those fields at the yield boundary (see JitWasm Run()),
+    // so we can read directly with no mailbox round-trip. Granularity
+    // is one dispatch slice ≈ 1ms — fine for SAB's deadline-poll loops
+    // which only need monotonic increase, not microsecond precision.
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_load(ppc_off::spr(spr_idx));  // offset = SPR_BASE + idx*4
     emit_gpr_set_impl(c, rt, g_ctx_ptr, LOCAL_TMP_A);
 }
 
@@ -2924,8 +3034,8 @@ static void emit_load_x(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
     c.b.op_drop();
 
     if (g_mem1_base == 0u) {
-        c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_call(import_idx);
+        // No fastmem base; try MMIO mirror, then fall to import.
+        emit_mmio_mirror_else_or_import(c, import_idx);
         bemental::perf_runtime::inc(bemental::PERF_SLOT_FASTMEM_SLOW);
     } else {
         // Runtime range check — TWO conditions, both must be true:
@@ -2988,9 +3098,8 @@ static void emit_load_x(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
                 c.b.op_i32_load8_u(0);
             }
         c.b.op_else();
-            // Slow path: ppc_read*(ea).
-            c.b.op_local_get(LOCAL_TMP_A);
-            c.b.op_call(import_idx);
+            // MEM1 missed; try MMIO mirror, then fall to import.
+            emit_mmio_mirror_else_or_import(c, import_idx);
         emit_local_op_end(c);
     }
 
@@ -3993,7 +4102,7 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     b.emitImportFunc("env", "ppc_check_exc",   /*type*/1);
     b.emitImportFunc("env", "ppc_break_block", /*type*/2);
     b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);  // (pc) -> i32
-    b.emitImportFunc("env", "ppc_read_tb",     /*type*/1);  // (which:0=TBL,1=TBU)->i32
+    // A5: ppc_read_tb dropped — mftb is direct from spr[].
     b.endSection();
 
     // ---- Function section: 1 function of type 0 ----
@@ -4097,7 +4206,7 @@ std::vector<u8> build_region_module(const u8* concatenated_bodies,
     b.emitImportFunc("env", "ppc_check_exc",   /*type*/1);
     b.emitImportFunc("env", "ppc_break_block", /*type*/2);
     b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);
-    b.emitImportFunc("env", "ppc_read_tb",     /*type*/1);  // (which:0=TBL,1=TBU)->i32
+    // A5: ppc_read_tb dropped — mftb is direct from spr[].
     b.endSection();
 
     // ---- Function section: N entries, all type 0 ((), i32) ----
@@ -4216,7 +4325,7 @@ std::vector<u8> build_region_function(const BlockInputs* blocks,
     b.emitImportFunc("env", "ppc_check_exc",   /*type*/1);
     b.emitImportFunc("env", "ppc_break_block", /*type*/2);
     b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);
-    b.emitImportFunc("env", "ppc_read_tb",     /*type*/1);
+    // A5: ppc_read_tb dropped — mftb is direct from spr[].
     b.endSection();
 
     // ---- Function section: 1 region function of type 0 ----

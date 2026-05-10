@@ -39,8 +39,13 @@ enum WasmImportFunc : u32 {
     WIMPORT_CHECK_EXC   = 7,   // (pc) -> i32               — non-zero = early-exit
     WIMPORT_BREAK_BLOCK = 8,   // (pc) -> void              — block exit hook
     WIMPORT_HLE_CHECK   = 9,   // (pc) -> i32               — non-zero = HLE replaced, bail
-    WIMPORT_READ_TB     = 10,  // (which: 0=TBL,1=TBU) -> i32 — thin time-base read
-    WIMPORT_COUNT       = 11
+    // Phase A5: WIMPORT_READ_TB removed. mftb is now a direct
+    // i32.load offset=spr(SPR_TL/TU) against the SAB-resident
+    // PowerPCState (snapshotted at the dolphin yield boundary).
+    // env.ppc_read_tb stays in the JS shim as harmless dead code
+    // until the next ppc_worker.js cleanup.
+    WIMPORT_COUNT       = 10
+
 };
 
 // ---------------------------------------------------------------------------

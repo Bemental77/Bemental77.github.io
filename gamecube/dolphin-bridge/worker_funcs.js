@@ -170,6 +170,11 @@ async function bootIso(name, size) {
     postMessage({ cmd: 'setStatus', txt: 'load_iso failed (' + ret + ')' });
     return;
   }
+  // Phase A1: cls-table init runs on the dolphin pthread inside
+  // HW::Init (HW.cpp routes through dolphin_mmio_mirror_init C-extern
+  // to defeat LTO DCE). Don't call it from JS — under PROXY_TO_PTHREAD
+  // the JS-thread call would land in main-thread memory while
+  // Core::System lives in the pthread's memory.
   postMessage({ cmd: 'setStatus', txt: 'Running' });
   // Run flat-out during boot. Switch to 60 Hz once first frame fires.
   bootLoop();
