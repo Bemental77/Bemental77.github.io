@@ -21,7 +21,7 @@
 #include <vector>
 
 // gekko_emit.h is in the per-guest tree (not part of the public include/
-// surface); declare the one entry we use here. Default arguments are
+// surface); declare the entries we use here. Default arguments are
 // supplied at the call site.
 namespace bemental::powerpc {
 std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
@@ -30,6 +30,21 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
                             u32 ram_size,
                             const u32* instr_pcs,
                             bool emit_hle_check);
+// Phase 3a.2 — emit just the function body (no module wrapper). Used by
+// region_accumulate; the wrapper is built later at region_relink time.
+// LocalIdxLookupFn = nullptr means branches that would target other
+// region-local fns get baked as `set_pc + return` (slow path) on first
+// emit; region_relink re-emits with the correct lookup_fn so they become
+// `return_call_indirect` (lever #2). Signature matches gekko_emit.h:174.
+using LocalIdxLookupFn = bool(*)(const void* user, u32 target_pc, u32* out_local_idx);
+std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
+                                u32 ctx_ptr_const,
+                                u32 mem1_base, u32 mem1_mask,
+                                u32 ram_size,
+                                const u32* instr_pcs,
+                                LocalIdxLookupFn lookup_fn,
+                                const void* lookup_user,
+                                bool emit_hle_check);
 }
 
 #ifdef __EMSCRIPTEN__
@@ -63,6 +78,14 @@ static uintptr_t g_ppc_state_base = 0;
 static uintptr_t g_mem1_base      = 0;
 static u32       g_mem1_size      = 0;
 static uintptr_t g_mailbox_base   = 0;
+
+// Phase 3a.1 — link BlockCache into ppc-worker. Instance is private to
+// this worker; dolphin's BlockCache lives in dolphin_worker. They do not
+// share state at the C++ level (only the underlying SAB-mapped emulator
+// state). Region-emit work in 3a.2-3a.7 calls methods on this instance.
+// Declared at file scope (not inside extern "C") so it's visible to all
+// translation units below it.
+static BlockCache g_bcache;
 
 extern "C" {
 
@@ -249,6 +272,89 @@ u32 ppc_worker_compile_block(u32 start_pc) {
     return static_cast<u32>(g_compile_buf.size());
 }
 
+// Phase 3a.2 — compile block AND accumulate into its region. Replaces
+// the per-block standalone-module path (build_block + JS instantiate)
+// with the multi-block region path (emit_block_body + region_accumulate;
+// instantiate happens later at region_relink time).
+//
+// Caller (ppc_worker.js) treats this exactly like ppc_worker_compile_block
+// for now — calls it on miss, gets back a body-byte size. The difference
+// is that the body is parked in g_bcache; no module is yet runnable.
+// Once 3a.3 wires region_relink_if_due() and 3a.4 wires region_dispatch
+// fast-path, the second call to a same-PC block hits the relinked region
+// module (one module per region, many blocks).
+//
+// Returns: number of bytes accumulated (= body size). 0 on failure or
+// already-accumulated (idempotent — re-accumulating a known PC is a no-op
+// per region_has_pc check).
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_compile_and_accumulate(u32 start_pc) {
+    if (g_mem1_base == 0u || g_mem1_size == 0u) return 0u;
+
+    const Region region = classify(start_pc);
+    if (g_bcache.region_has_pc(region, start_pc)) {
+        // Already accumulated; nothing to do.
+        return 0u;
+    }
+
+    // Same decode loop as ppc_worker_compile_block — read guest RAM,
+    // byte-swap PPC big-endian to native, terminate after first
+    // branch-class opcode (16/17/18/19) or PPC_MAX_BLOCK_INSTRS.
+    const u32 ram_mask = g_mem1_size - 1u;
+    const u32 phys     = start_pc & ram_mask;
+    const uintptr_t ram_addr = g_mem1_base + phys;
+    const u32* ram_ptr = reinterpret_cast<const u32*>(ram_addr);
+
+    u32 insts[PPC_MAX_BLOCK_INSTRS];
+    u32 instr_pcs[PPC_MAX_BLOCK_INSTRS];
+    u32 count = 0;
+    while (count < PPC_MAX_BLOCK_INSTRS) {
+        const u32 raw_be = ram_ptr[count];
+        const u32 inst   = byteswap32(raw_be);
+        insts[count]     = inst;
+        instr_pcs[count] = start_pc + count * 4u;
+        const u32 op     = (inst >> 26) & 0x3Fu;
+        ++count;
+        if (op == 16u || op == 17u || op == 18u || op == 19u) break;
+    }
+    if (count == 0u) return 0u;
+
+    // Emit body (no module wrapper). lookup_fn=nullptr → branches to
+    // region-local PCs that aren't yet in the region's pcMap fall back
+    // to slow set_pc+return; region_relink (Phase 3a.3) re-emits these
+    // with the now-complete lookup, converting them to the fast
+    // return_call_indirect path (lever #2).
+    auto body = bemental::powerpc::emit_block_body(
+        start_pc, insts, count,
+        /* ctx_ptr_const   = */ static_cast<u32>(g_ppc_state_base),
+        /* mem1_base       = */ static_cast<u32>(g_mem1_base),
+        /* mem1_mask       = */ ram_mask,
+        /* ram_size        = */ g_mem1_size,
+        /* instr_pcs       = */ instr_pcs,
+        /* lookup_fn       = */ nullptr,
+        /* lookup_user     = */ nullptr,
+        /* emit_hle_check  = */ false);
+    if (body.empty()) return 0u;
+
+    // Stash the emit inputs so region_relink can re-emit with a complete
+    // lookup_fn. The accumulator copies the data internally.
+    BlockEmitInputs inputs;
+    inputs.start_pc      = start_pc;
+    inputs.ctx_ptr_const = static_cast<u32>(g_ppc_state_base);
+    inputs.mem1_base     = static_cast<u32>(g_mem1_base);
+    inputs.mem1_mask     = ram_mask;
+    inputs.ram_size      = g_mem1_size;
+    inputs.insts.assign(insts, insts + count);
+    inputs.instr_pcs.assign(instr_pcs, instr_pcs + count);
+
+    const std::size_t body_size = body.size();
+    g_bcache.region_accumulate(region, start_pc,
+                               body.data(), body.size(), &inputs);
+
+    g_compile_cycles = count;
+    return static_cast<u32>(body_size);
+}
+
 EMSCRIPTEN_KEEPALIVE
 u32 ppc_worker_compile_buf_addr() {
     return static_cast<u32>(reinterpret_cast<uintptr_t>(g_compile_buf.data()));
@@ -274,12 +380,6 @@ EMSCRIPTEN_KEEPALIVE
 u32 ppc_worker_version() {
     return 2u;
 }
-
-// Phase 3a.1 — link BlockCache into ppc-worker. Instance is private to
-// this worker; dolphin's BlockCache lives in dolphin_worker. They do not
-// share state at the C++ level (only the underlying SAB-mapped emulator
-// state). Region-emit work in 3a.2-3a.7 calls methods on this instance.
-static BlockCache g_bcache;
 
 // Diagnostic export: number of accumulated bodies in a region. Returns 0
 // until 3a.2 wires region_accumulate calls. JS verifies non-zero growth
