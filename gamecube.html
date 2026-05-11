@@ -450,14 +450,46 @@
             if (msg.cmd === 'runtime-ready') {
               window._ppcDolphinRoutingReady = true;
               console.log('[ppc-worker-handshake] dolphin runtime-ready — MMIO routing live');
-              // 2g: poll dolphin for MEM1 address — JIT g_jit_wasm
-              // singleton may not be constructed yet at runtime-ready.
-              // First non-zero response cancels the poll.
+              // Phase 3a-fix: poll SAB DIRECTLY for MEM1 address.
+              // The previous postMessage path (get-ram-info → ram-info)
+              // was throttled to ~5 replies per 60s by worker_funcs.js
+              // bootLoop blocking the worker main thread inside
+              // _run_iter_batch(100K). Worse: `_dolphin_get_ram_addr`
+              // returned 0 because g_jit_wasm (a static global) is
+              // pthread-isolated under PROXY_TO_PTHREAD=1 — set on
+              // dolphin's pthread, but the worker MAIN thread (where
+              // get-ram-info runs) sees nullptr forever.
+              //
+              // Direct SAB read sidesteps both. JitWasm::Run() entry
+              // (running on the pthread that has valid g_jit_wasm AND
+              // m_ram allocated) writes ram_addr/size + sentinel-last
+              // to SAB[0x02500020/24/28]. This setInterval polls the
+              // sentinel via Atomics.load every 100ms — no postMessage,
+              // no throttle, no thread-isolation. Cancels itself on
+              // first non-zero sentinel.
               if (!window._ppcRamInfoPoll) {
                 window._ppcRamInfoPoll = setInterval(function () {
-                  try { dolphin_worker.postMessage({ cmd: 'get-ram-info' }); }
-                  catch (e) {}
-                }, 500);
+                  var u32 = new Uint32Array(sharedMemory.buffer);
+                  var sentinel = Atomics.load(u32, 0x02500028 >> 2) >>> 0;
+                  if (sentinel !== 0xCAFEBABE) return;
+                  var addr = u32[0x02500020 >> 2] >>> 0;
+                  var size = u32[0x02500024 >> 2] >>> 0;
+                  if (addr === 0 || size === 0) return;
+                  if (window._ppcMem1Wired) return;
+                  window._ppcMem1Wired = true;
+                  console.log('[ppc-worker-handshake] dolphin ram (SAB-direct)'
+                    + ' addr=0x' + addr.toString(16)
+                    + ' size=0x' + size.toString(16));
+                  clearInterval(window._ppcRamInfoPoll);
+                  window._ppcRamInfoPoll = null;
+                  try {
+                    window.ppc_worker.postMessage({
+                      cmd: 'update-mem',
+                      mem1Addr: addr,
+                      mem1Size: size,
+                    });
+                  } catch (e) {}
+                }, 100);
               }
               return;
             }
