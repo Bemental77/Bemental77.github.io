@@ -414,6 +414,29 @@ u32 ppc_worker_relink_region_if_due(u32 mem_pages) {
     return n_relinked;
 }
 
+// Phase 3a.5 — force-relink any region whose accumulator has ≥1 body
+// regardless of region_should_relink's natural threshold (which requires
+// ≥64 blocks OR ≥2s quiesce). Solves the warmup chicken-and-egg: the
+// first miss-storm needs a module materialized BEFORE 64 PCs have
+// accumulated, otherwise dispatch keeps missing.
+//
+// JS calls this once at iter==0 of the merged-mode loop, and again on
+// any iter where compile_and_accumulate succeeded but the next dispatch
+// would still miss (caller tracks misses-since-relink and decides).
+//
+// Returns the number of regions force-relinked.
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_force_relink_all(u32 mem_pages) {
+    u32 n_relinked = 0u;
+    for (u32 r = 0u; r < REGION_COUNT; ++r) {
+        const Region region = static_cast<Region>(r);
+        if (g_bcache.region_n_funcs(region) == 0u) continue;
+        g_bcache.region_relink(region, mem_pages);
+        ++n_relinked;
+    }
+    return n_relinked;
+}
+
 // Diagnostic: current generation counter for a region. Bumped each
 // relink. JS reads this to detect when a fresh module is available
 // (compare with previously-observed generation).

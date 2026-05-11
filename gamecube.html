@@ -283,6 +283,10 @@
       // dolphin yield gate, hands dispatch to ppc-worker for ~1 second,
       // then resumes — disruptive enough to want explicit consent).
       var ppcPerfEnabled = new URLSearchParams(location.search).has('ppcperf');
+      // Phase 3a.7 — page flag for ppc-worker merged-region dispatch.
+      // ?ppcmerged=1 → use merged-region path (single WASM module per
+      // region with V8 cross-block inlining). Default off until verified.
+      var ppcMergedEnabled = new URLSearchParams(location.search).has('ppcmerged');
       window._ppcDispatchEnabled = ppcDispatchEnabled;  // surfaced for onWorkerMsg (outer scope)
       window._ppcPerfEnabled = ppcPerfEnabled;
       ppc_worker.onmessage = function (e) {
@@ -952,6 +956,7 @@
             safetyCap: 5000000,
             ignoreDowncount: true,
             wallTimeMs: 5000,
+            mergedRegion: ppcMergedEnabled,
           });
         } else if (elapsed > 60000) {
           clearInterval(_perfPoll);

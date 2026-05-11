@@ -389,10 +389,14 @@
         // to compile_and_accumulate + relink_region_if_due on miss.
         // When false: legacy 2g per-block-instance path (unchanged).
         const mergedRegion = !!data.mergedRegion;
-        // Tunable: relink check cadence in iters. region_should_relink is
-        // cheap (≤9 hashmap-size + time-deltas) but not free; checking
-        // every iter would waste time on the steady-state path.
-        const relinkCheckMask = 0xff;  // every 256 iters
+        // Phase 3a.5 — relink cadence. Tighter than research's 256-iter
+        // suggestion: at 110 blocks/sec baseline, 256 iters could be
+        // multiple seconds, leaving the merged path stuck waiting for
+        // first module. Every 32 iters means the first 64 misses (ie the
+        // first compile-storm) trigger relink within ~2 ms even at the
+        // legacy throughput rate. Cost: 32× more region_should_relink
+        // calls — each is ≤9 hashmap-size + time-delta checks (cheap).
+        const relinkCheckMask = 0x1f;  // every 32 iters
         // 2f.6: perf-measurement mode bypasses downcount/exception/idle
         // termination so we can clock raw dispatch throughput. Still
         // honors stop-flag and safetyCap.
@@ -463,6 +467,11 @@
             if ((now - wallStart) >= wallTimeMs) { exitReason = 'wall-time-cap'; break; }
           }
           // Phase 3a.4 fast-path: merged-region dispatch via C side.
+          // Phase 3a.5: also a startup force-relink. On the very first
+          // miss-storm (no module yet for the entry region) the natural
+          // 64-block threshold means dispatch keeps missing until 64
+          // accumulates. Forcing relink on iter==0 + after ANY accumulate
+          // shrinks the warm-up window from seconds to milliseconds.
           // ppc_worker_region_dispatch_pc returns next-pc on hit, or
           // 0xFFFFFFFF on miss. C-side BlockCache::region_dispatch
           // does the pcMap lookup + regionFn() call inside one
@@ -489,9 +498,14 @@
               ++compileCalls;
               totalCompileBytes += bytesSize;
             }
-            // Relink any region that's hit its threshold. Cheap when
-            // nothing's due; ~one EM_ASM_INT per region that is.
-            if ((iters & relinkCheckMask) === 0) {
+            // Phase 3a.5 force-relink-on-warmup: the natural threshold
+            // (≥64 blocks) means the very first miss-storm sits compiling
+            // for 64 iters before the first module materializes. Force
+            // relink for the first 16 iterations to shrink that to ~16
+            // misses; afterwards rely on the natural threshold.
+            if (iters < 16 && bytesSize > 0) {
+              mod._ppc_worker_force_relink_all(0);
+            } else if ((iters & relinkCheckMask) === 0) {
               mod._ppc_worker_relink_region_if_due(0);
             }
             // pc unchanged; next iter retries dispatch (on the same pc
