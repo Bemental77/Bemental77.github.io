@@ -467,6 +467,54 @@ constexpr u32 MMIO_CLS16_ADDR       = 0x02640000u;
 constexpr u32 MMIO_CLS32_ADDR       = 0x02660000u;
 constexpr u8  MMIO_CLASS_DIRECT_RW  = 1u;
 
+// Option D — emit either the import call OR an inline stub equivalent.
+// In stub mode, returning imports become `drop args + i32.const 0`; void
+// imports become `drop args`. Used by ppc-worker perf-measurement path
+// so dispatched blocks have ZERO env.ppc_* dependencies, avoiding the
+// _ppc_worker_mailbox_call_sync hang AND enabling V8 cross-block inlining
+// (the Phase 3a throughput-win actually requires this — Option A's
+// JS-side stubs still cross WASM→JS, killing V8's inliner).
+//
+// Caller has already placed the import's args on the wasm stack (per
+// the import's signature, see gekko_emit.h:32-47 WIMPORT_* enum).
+static void emit_import_or_stub(EmitCtx& c, u32 import_idx) {
+    if (!c.emit_perf_stub) {
+        emit_import_or_stub(c, import_idx);
+        return;
+    }
+    // WIMPORT_* signatures (gekko_emit.h:32-47):
+    //   READ8/16/32       (addr)      → i32        — 1 arg, returns i32
+    //   WRITE8/16/32      (addr, val) → void       — 2 args, void
+    //   INTERP            (inst, pc)  → void       — 2 args, void
+    //   CHECK_EXC         (pc)        → i32        — 1 arg, returns i32
+    //   BREAK_BLOCK       (pc)        → void       — 1 arg, void
+    //   HLE_CHECK         (pc)        → i32        — 1 arg, returns i32
+    switch (import_idx) {
+        case WIMPORT_READ8:
+        case WIMPORT_READ16:
+        case WIMPORT_READ32:        // 1 arg → i32
+        case WIMPORT_CHECK_EXC:
+        case WIMPORT_HLE_CHECK:
+            c.b.op_drop();          // drop addr/pc
+            c.b.op_i32_const(0);    // stub return 0
+            break;
+        case WIMPORT_WRITE8:
+        case WIMPORT_WRITE16:
+        case WIMPORT_WRITE32:       // 2 args, void
+        case WIMPORT_INTERP:
+            c.b.op_drop();          // drop val/pc
+            c.b.op_drop();          // drop addr/inst
+            break;
+        case WIMPORT_BREAK_BLOCK:   // 1 arg, void
+            c.b.op_drop();
+            break;
+        default:
+            // Unknown import — emit the call anyway (shouldn't reach).
+            emit_import_or_stub(c, import_idx);
+            break;
+    }
+}
+
 // Helper: emit the slow-path branch with an MMIO-mirror fast-path inserted
 // in front. EA must be in LOCAL_TMP_A from the caller. Result of the
 // expression (one i32 — the loaded value) is left on the stack.
@@ -483,7 +531,7 @@ constexpr u8  MMIO_CLASS_DIRECT_RW  = 1u;
 static void emit_mmio_mirror_else_or_import(EmitCtx& c, u32 import_idx) {
     if (import_idx == WIMPORT_READ8) {
         c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_call(import_idx);
+        emit_import_or_stub(c, import_idx);
         return;
     }
     const u32 cls_addr  = (import_idx == WIMPORT_READ32) ? MMIO_CLS32_ADDR
@@ -532,7 +580,7 @@ static void emit_mmio_mirror_else_or_import(EmitCtx& c, u32 import_idx) {
         }
     c.b.op_else();
         c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_call(import_idx);
+        emit_import_or_stub(c, import_idx);
     emit_local_op_end(c);
 }
 
@@ -728,7 +776,7 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
         // (a) No fastmem base; full import.
         c.b.op_local_get(LOCAL_TMP_A);
         emit_gpr_get_impl(c, rs, g_ctx_ptr);
-        c.b.op_call(import_idx);
+        emit_import_or_stub(c, import_idx);
     } else if (g_mem1_safe) {
         // (b) Trust DFA passed; direct store with mask + add.
         c.b.op_local_get(LOCAL_TMP_A);
@@ -765,7 +813,7 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
         emit_b11_op_else(c);
             c.b.op_local_get(LOCAL_TMP_A);
             emit_gpr_get_impl(c, rs, g_ctx_ptr);
-            c.b.op_call(import_idx);
+            emit_import_or_stub(c, import_idx);
         emit_b11_op_end(c);
     }
 
@@ -2338,7 +2386,7 @@ static void emit_lfs_impl(EmitCtx& c) {
     // promote to f64 -> store to FPR.
     c.b.op_i32_const((s32)CTX);     // dest ctx for store
     emit_ea_d(c, ra, simm);
-    c.b.op_call(WIMPORT_READ32);
+    emit_import_or_stub(c, WIMPORT_READ32);
     c.b.op_f32_reinterpret_i32();
     c.b.op_f64_promote_f32();
     c.b.op_f64_store(ppc_off::ps0(rt));
@@ -2359,7 +2407,7 @@ static void emit_lfsu_impl(EmitCtx& c) {
     // Load f32, promote, store to FPR.
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_call(WIMPORT_READ32);
+    emit_import_or_stub(c, WIMPORT_READ32);
     c.b.op_f32_reinterpret_i32();
     c.b.op_f64_promote_f32();
     c.b.op_f64_store(ppc_off::ps0(rt));
@@ -2397,12 +2445,12 @@ static void emit_lfd_impl(EmitCtx& c) {
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const(4);
     c.b.op_i32_add();
-    c.b.op_call(WIMPORT_READ32);
+    emit_import_or_stub(c, WIMPORT_READ32);
     c.b.op_i32_store(ppc_off::ps0(rt));
     // FPR high half: read32(EA) — stores at ps0(rt) + 4.
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_call(WIMPORT_READ32);
+    emit_import_or_stub(c, WIMPORT_READ32);
     c.b.op_i32_store(ppc_off::ps0(rt) + 4u);
 }
 
@@ -2420,11 +2468,11 @@ static void emit_lfdu_impl(EmitCtx& c) {
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const(4);
     c.b.op_i32_add();
-    c.b.op_call(WIMPORT_READ32);
+    emit_import_or_stub(c, WIMPORT_READ32);
     c.b.op_i32_store(ppc_off::ps0(rt));
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_call(WIMPORT_READ32);
+    emit_import_or_stub(c, WIMPORT_READ32);
     c.b.op_i32_store(ppc_off::ps0(rt) + 4u);
     // ra = EA
     c.b.op_i32_const((s32)CTX);
@@ -2443,7 +2491,7 @@ static void emit_stfs_impl(EmitCtx& c) {
     c.b.op_f64_load(ppc_off::ps0(rs));
     c.b.op_f32_demote_f64();
     c.b.op_i32_reinterpret_f32();
-    c.b.op_call(WIMPORT_WRITE32);
+    emit_import_or_stub(c, WIMPORT_WRITE32);
 }
 
 static void emit_stfsu_impl(EmitCtx& c) {
@@ -2460,7 +2508,7 @@ static void emit_stfsu_impl(EmitCtx& c) {
     c.b.op_f64_load(ppc_off::ps0(rs));
     c.b.op_f32_demote_f64();
     c.b.op_i32_reinterpret_f32();
-    c.b.op_call(WIMPORT_WRITE32);
+    emit_import_or_stub(c, WIMPORT_WRITE32);
     // ra = EA
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
@@ -2488,14 +2536,14 @@ static void emit_stfd_impl(EmitCtx& c) {
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::ps0(rs) + 4u);
-    c.b.op_call(WIMPORT_WRITE32);
+    emit_import_or_stub(c, WIMPORT_WRITE32);
     // write32(EA + 4, low32 of FPR) — low32 lives at ps0(rs) + 0.
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const(4);
     c.b.op_i32_add();
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::ps0(rs));
-    c.b.op_call(WIMPORT_WRITE32);
+    emit_import_or_stub(c, WIMPORT_WRITE32);
 }
 
 static void emit_stfdu_impl(EmitCtx& c) {
@@ -2511,13 +2559,13 @@ static void emit_stfdu_impl(EmitCtx& c) {
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::ps0(rs) + 4u);
-    c.b.op_call(WIMPORT_WRITE32);
+    emit_import_or_stub(c, WIMPORT_WRITE32);
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const(4);
     c.b.op_i32_add();
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::ps0(rs));
-    c.b.op_call(WIMPORT_WRITE32);
+    emit_import_or_stub(c, WIMPORT_WRITE32);
     // ra = EA
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
@@ -2964,7 +3012,7 @@ static void emit_lmw_impl(EmitCtx& c) {
             c.b.op_i32_const(offset);
             c.b.op_i32_add();
         }
-        c.b.op_call(WIMPORT_READ32);
+        emit_import_or_stub(c, WIMPORT_READ32);
         emit_gpr_set_impl(c, i, g_ctx_ptr, LOCAL_TMP_B);
     }
 }
@@ -2990,7 +3038,7 @@ static void emit_stmw_impl(EmitCtx& c) {
             c.b.op_i32_add();
         }
         emit_gpr_get_impl(c, i, g_ctx_ptr);
-        c.b.op_call(WIMPORT_WRITE32);
+        emit_import_or_stub(c, WIMPORT_WRITE32);
     }
 }
 
@@ -3130,7 +3178,7 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
     if (g_mem1_base == 0u) {
         c.b.op_local_get(LOCAL_TMP_A);
         emit_gpr_get_impl(c, rs, g_ctx_ptr);
-        c.b.op_call(import_idx);
+        emit_import_or_stub(c, import_idx);
         bemental::perf_runtime::inc(bemental::PERF_SLOT_FASTMEM_SLOW);
     } else {
         // See emit_load_x — two-condition range check excludes MMIO.
@@ -3193,7 +3241,7 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
             // Slow: ppc_write*(ea, val).
             c.b.op_local_get(LOCAL_TMP_A);
             emit_gpr_get_impl(c, rs, g_ctx_ptr);
-            c.b.op_call(import_idx);
+            emit_import_or_stub(c, import_idx);
         emit_b11_op_end(c);
     }
 
@@ -3248,7 +3296,7 @@ static void emit_dcbz_impl(EmitCtx& c) {
             c.b.op_i32_add();
         }
         c.b.op_i32_const(0);
-        c.b.op_call(WIMPORT_WRITE32);
+        emit_import_or_stub(c, WIMPORT_WRITE32);
     }
 }
 
@@ -3518,7 +3566,7 @@ EmitFn gekko_lookup(u32 inst) {
 // native emitters is re-enabled.
 static void emit_exception_bail(EmitCtx& c) {
     c.b.op_i32_const((s32)c.pc);
-    c.b.op_call(WIMPORT_CHECK_EXC);
+    emit_import_or_stub(c, WIMPORT_CHECK_EXC);
     emit_b11_op_if(c, WASM_TYPE_I32);
         // B11: flush WITHOUT clearing compile-time dirty[]: we're inside
         // an if-branch that returns. If the runtime takes this branch,
@@ -3795,6 +3843,7 @@ static void emit_body_into(WasmModuleBuilder& b,
                            LocalIdxLookupFn lookup_fn,
                            const void* lookup_user,
                            bool emit_hle_check_prologue,
+                           bool emit_perf_stub = false,
                            const MergedModeArgs& merged = {}) {
     g_ctx_ptr = ctx_ptr_const;
     // Per-block DFA: walk the block's instructions, track which GPRs are
@@ -3873,6 +3922,7 @@ static void emit_body_into(WasmModuleBuilder& b,
     EmitCtx ctx{ b, start_pc, 0u, start_pc, false, false };
     ctx.lookup_local_idx       = lookup_fn;
     ctx.lookup_user            = lookup_user;
+    ctx.emit_perf_stub         = emit_perf_stub;
     ctx.merged_mode            = merged.merged;
     ctx.br_to_loop_depth       = merged.br_to_loop_depth;
     ctx.entry_sel_global_idx   = merged.entry_sel_global_idx;
@@ -4057,7 +4107,8 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
                             u32 ctx_ptr_const, u32 mem_pages,
                             u32 mem1_base, u32 mem1_mask, u32 ram_size,
                             const u32* instr_pcs,
-                            bool emit_hle_check) {
+                            bool emit_hle_check,
+                            bool emit_perf_stub) {
     bemental::perf_runtime::inc(bemental::PERF_SLOT_BLOCK_EMIT);
     WasmModuleBuilder b;
     b.emitHeader();
@@ -4120,7 +4171,7 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     emit_body_into(b, start_pc, insts, count, ctx_ptr_const,
                    mem1_base, mem1_mask, ram_size, instr_pcs,
                    /*lookup_fn=*/nullptr, /*lookup_user=*/nullptr,
-                   emit_hle_check);
+                   emit_hle_check, emit_perf_stub);
     b.endFuncBody();
     b.endSection();
 
@@ -4141,12 +4192,14 @@ std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
                                 const u32* instr_pcs,
                                 LocalIdxLookupFn lookup_fn,
                                 const void* lookup_user,
-                                bool emit_hle_check) {
+                                bool emit_hle_check,
+                                bool emit_perf_stub) {
     WasmModuleBuilder b;
     b.beginFuncBody();
     emit_body_into(b, start_pc, insts, count, ctx_ptr_const,
                    mem1_base, mem1_mask, ram_size, instr_pcs,
-                   lookup_fn, lookup_user, emit_hle_check);
+                   lookup_fn, lookup_user, emit_hle_check,
+                   emit_perf_stub);
     b.endFuncBody();
     auto bytes = b.getBytes();
     verify_block_can_advance_pc(bytes, start_pc);
@@ -4394,6 +4447,7 @@ std::vector<u8> build_region_function(const BlockInputs* blocks,
                        bi.instr_pcs,
                        &region_fn_lookup, &ctx,
                        bi.emit_hle_check,
+                       bi.emit_perf_stub,
                        m);
         // emit_body_into ends with: `i32.load PC` `return`. That `return`
         // exits the whole region function, leaving the loop semantics

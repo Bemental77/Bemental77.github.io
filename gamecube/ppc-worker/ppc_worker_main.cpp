@@ -29,7 +29,8 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
                             u32 mem1_base, u32 mem1_mask,
                             u32 ram_size,
                             const u32* instr_pcs,
-                            bool emit_hle_check);
+                            bool emit_hle_check,
+                            bool emit_perf_stub = false);
 // Phase 3a.2 — emit just the function body (no module wrapper). Used by
 // region_accumulate; the wrapper is built later at region_relink time.
 // LocalIdxLookupFn = nullptr means branches that would target other
@@ -44,7 +45,8 @@ std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
                                 const u32* instr_pcs,
                                 LocalIdxLookupFn lookup_fn,
                                 const void* lookup_user,
-                                bool emit_hle_check);
+                                bool emit_hle_check,
+                                bool emit_perf_stub = false);
 }
 
 #ifdef __EMSCRIPTEN__
@@ -266,7 +268,8 @@ u32 ppc_worker_compile_block(u32 start_pc) {
         /* mem1_mask       = */ ram_mask,
         /* ram_size        = */ g_mem1_size,
         /* instr_pcs       = */ nullptr,
-        /* emit_hle_check  = */ false);
+        /* emit_hle_check  = */ false,
+        /* emit_perf_stub  = */ true);
     g_compile_buf  = std::move(bytes);
     g_compile_cycles = count;
     return static_cast<u32>(g_compile_buf.size());
@@ -333,7 +336,8 @@ u32 ppc_worker_compile_and_accumulate(u32 start_pc) {
         /* instr_pcs       = */ instr_pcs,
         /* lookup_fn       = */ nullptr,
         /* lookup_user     = */ nullptr,
-        /* emit_hle_check  = */ false);
+        /* emit_hle_check  = */ false,
+        /* emit_perf_stub  = */ true);
     if (body.empty()) return 0u;
 
     // Stash the emit inputs so region_relink can re-emit with a complete
@@ -344,6 +348,7 @@ u32 ppc_worker_compile_and_accumulate(u32 start_pc) {
     inputs.mem1_base     = static_cast<u32>(g_mem1_base);
     inputs.mem1_mask     = ram_mask;
     inputs.ram_size      = g_mem1_size;
+    inputs.emit_perf_stub = true;  // Phase D — re-emit at relink also stubs
     inputs.insts.assign(insts, insts + count);
     inputs.instr_pcs.assign(instr_pcs, instr_pcs + count);
 

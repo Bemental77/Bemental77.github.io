@@ -60,6 +60,12 @@ struct BlockEmitInputs {
     u32                             mem1_base     = 0;
     u32                             mem1_mask     = 0;
     u32                             ram_size      = 0;
+    // Option D: when true, emit path replaces every WIMPORT_* op_call
+    // with an inline stub (drop args + i32.const 0 for returning imports,
+    // drop args only for void). Used by ppc-worker perf-measurement so
+    // dispatched blocks have ZERO env.ppc_* dependencies. Stored here
+    // so region_relink's re-emit path preserves the choice.
+    bool                            emit_perf_stub = false;
     std::vector<u32>                insts;          // raw guest opcodes
     std::vector<u32>                instr_pcs;      // parallel PC array
 };

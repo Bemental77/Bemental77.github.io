@@ -33,7 +33,8 @@ namespace powerpc {
                                     const u32* instr_pcs,
                                     LocalIdxLookupFn lookup_fn,
                                     const void* lookup_user,
-                                    bool emit_hle_check = true);
+                                    bool emit_hle_check = true,
+                                    bool emit_perf_stub = false);
 
     // Lever #2 — single-function merged-region build. See gekko_emit.h.
     struct BlockInputs {
@@ -46,6 +47,7 @@ namespace powerpc {
         u32 ram_size;
         const u32* instr_pcs;
         bool emit_hle_check;
+        bool emit_perf_stub = false;
     };
     std::vector<u8> build_region_function(const BlockInputs* blocks,
                                           u32 n_blocks,
@@ -639,7 +641,9 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
                 rec.ctx_ptr_const,
                 rec.mem1_base, rec.mem1_mask, rec.ram_size,
                 rec.instr_pcs.data(),
-                &region_lookup_for_emit, &ctx);
+                &region_lookup_for_emit, &ctx,
+                /*emit_hle_check=*/true,
+                /*emit_perf_stub=*/rec.emit_perf_stub);
             rs.fn_bodies_concat.insert(rs.fn_bodies_concat.end(),
                                        body.begin(), body.end());
         }
@@ -689,6 +693,7 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
             bins[i].ram_size       = rec.ram_size;
             bins[i].instr_pcs      = rec.instr_pcs.data();
             bins[i].emit_hle_check = true;
+            bins[i].emit_perf_stub = rec.emit_perf_stub;
         }
         RegionLookupCtx ctx{ &rs };
         bytes = powerpc::build_region_function(

@@ -261,6 +261,21 @@ struct EmitCtx {
     // emitted from inside e.g. an op_if arm would br to the WRONG label
     // (one of the if's nested blocks rather than $L).
     u32 local_block_depth = 0;
+
+    // Option D (Phase 3a verification): when true, every op_call(WIMPORT_*)
+    // site emits an INLINE stub (drop args + i32.const 0 for returning
+    // imports, drop args only for void imports) instead of the import
+    // call. Used by ppc-worker compile path so dispatched blocks have
+    // ZERO env.ppc_* dependencies — eliminates _ppc_worker_mailbox_call_sync
+    // hang (dolphin pthread doesn't drain) AND allows V8 to inline across
+    // blocks (the actual Phase 3a throughput win, killed by Option A's
+    // JS-side stubs which still cross WASM→JS).
+    //
+    // Correctness sacrificed for throughput. Dispatched code reads return 0
+    // and writes are no-ops. Acceptable for the throughput-only measurement
+    // path under ?ppcperf=1 where ppc-worker runs concurrent with dolphin
+    // (which owns canonical state via ignoreDowncount: true).
+    bool emit_perf_stub = false;
 };
 
 // Forward-declared core emit functions live in gekko_emit.cpp.
@@ -308,7 +323,8 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
                             u32 mem1_base = 0, u32 mem1_mask = 0,
                             u32 ram_size = 0,
                             const u32* instr_pcs = nullptr,
-                            bool emit_hle_check = true);
+                            bool emit_hle_check = true,
+                            bool emit_perf_stub = false);
 
 // ---------------------------------------------------------------------------
 // Body-only counterpart to build_block. Emits a single function entry
@@ -339,7 +355,8 @@ std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
                                 const u32* instr_pcs = nullptr,
                                 LocalIdxLookupFn lookup_fn = nullptr,
                                 const void* lookup_user = nullptr,
-                                bool emit_hle_check = true);
+                                bool emit_hle_check = true,
+                                bool emit_perf_stub = false);
 
 // ---------------------------------------------------------------------------
 // Multi-module region build. Wraps N concatenated function bodies into a
@@ -394,6 +411,7 @@ struct BlockInputs {
     u32 ram_size;
     const u32* instr_pcs;
     bool emit_hle_check;
+    bool emit_perf_stub = false;
 };
 std::vector<u8> build_region_function(const BlockInputs* blocks,
                                       u32 n_blocks,
