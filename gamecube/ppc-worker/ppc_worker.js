@@ -402,6 +402,46 @@
         // honors stop-flag and safetyCap.
         const ignoreDowncount = !!data.ignoreDowncount;
         const wallTimeMs = (data.wallTimeMs | 0) || 0;
+
+        // Phase 3a-fix (Option A): swap env.ppc_* imports to no-op stubs
+        // when in perf-measurement mode. Background: every env.ppc_*
+        // import calls _ppc_worker_mailbox_call_sync which Atomics.waits
+        // for dolphin to drain the mailbox. dolphin's pthread is busy
+        // in _run_iter_batch(100K) during boot and NEVER drains, so any
+        // dispatched block that hits an env.ppc_* import hangs forever
+        // (verified: iter=1 block at 0x80003254 hung in the 2g test).
+        // Stubs return 0 (or void) immediately — loop progresses. The
+        // dispatched code's side effects are wrong (memory reads return
+        // 0) but that was already true under ignoreDowncount: ppc-worker
+        // runs concurrent with dolphin which owns canonical state.
+        // Throughput measurement IS the only goal here.
+        //
+        // Must mutate env BEFORE any new WebAssembly.Instance is created
+        // in the loop — instances capture import refs at instantiation.
+        // We swap on the SAME object (mod.bemental_imports.env) so any
+        // future instances pick up the stubs.
+        //
+        // No restore: perf mode is one-shot per session. After the loop
+        // exits the stubs stay, but no other dispatch path runs.
+        if (ignoreDowncount && mod.bemental_imports && mod.bemental_imports.env
+            && !mod.bemental_imports.env._stubbed_for_perf) {
+          const env = mod.bemental_imports.env;
+          env.ppc_read8       = () => 0;
+          env.ppc_read16      = () => 0;
+          env.ppc_read32      = () => 0;
+          env.ppc_write8      = () => {};
+          env.ppc_write16     = () => {};
+          env.ppc_write32     = () => {};
+          env.ppc_hle_check   = () => 0;
+          env.ppc_interp      = () => {};
+          env.ppc_check_exc   = () => 0;
+          env.ppc_break_block = () => {};
+          env.ppc_read_tb     = () => 0;
+          env._stubbed_for_perf = true;
+          postMessage({ cmd: 'print',
+            txt: '[ppc-worker] env.ppc_* stubbed for perf-measurement mode '
+               + '(returns 0; correctness sacrificed for throughput)' });
+        }
         const wallStart = (typeof performance !== 'undefined') ? performance.now() : Date.now();
         // PowerPCState SAB offsets per ppc_worker_main.cpp layout comment.
         const PPC_STATE_BASE   = 0x02400000;
