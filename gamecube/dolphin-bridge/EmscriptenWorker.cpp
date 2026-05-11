@@ -52,6 +52,13 @@ static bool environment_cb(unsigned cmd, void* data) {
             // double slash transparently.
             *(const char**)data = "/";
             return true;
+        case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
+            // Accept XRGB8888. Required so the SW renderer's RGBA output
+            // can be pushed via video_cb. Without this, default RETRO_PIXEL_
+            // FORMAT_RGB565 mismatches the 4-byte SW frame buffer and the
+            // page receives garbage even when video_cb fires.
+            return *(const enum retro_pixel_format*)data ==
+                   RETRO_PIXEL_FORMAT_XRGB8888;
         default:
             return false;
     }
