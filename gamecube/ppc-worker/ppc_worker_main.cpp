@@ -269,9 +269,25 @@ void ppc_worker_shutdown() {
 
 // version: lets JS verify the loaded wasm matches the protocol it
 // expects. Bumped whenever the SAB layout or function signatures change.
+// Bumps: 1 (Phase 2a foundation) → 2 (Phase 3a.1 BlockCache instance live).
 EMSCRIPTEN_KEEPALIVE
 u32 ppc_worker_version() {
-    return 1u;
+    return 2u;
+}
+
+// Phase 3a.1 — link BlockCache into ppc-worker. Instance is private to
+// this worker; dolphin's BlockCache lives in dolphin_worker. They do not
+// share state at the C++ level (only the underlying SAB-mapped emulator
+// state). Region-emit work in 3a.2-3a.7 calls methods on this instance.
+static BlockCache g_bcache;
+
+// Diagnostic export: number of accumulated bodies in a region. Returns 0
+// until 3a.2 wires region_accumulate calls. JS verifies non-zero growth
+// post-relink to confirm Phase 3a.2+ is working.
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_region_n_funcs(u32 region) {
+    if (region >= REGION_COUNT) return 0u;
+    return static_cast<u32>(g_bcache.region_n_funcs(static_cast<Region>(region)));
 }
 
 }  // extern "C"
