@@ -423,6 +423,28 @@ u32 ppc_worker_region_generation(u32 region) {
     return static_cast<u32>(g_bcache.region_generation(static_cast<Region>(region)));
 }
 
+// Phase 3a.4 — wrapper around BlockCache::region_dispatch that hides the
+// out-param convention behind a single-u32 return. The C side already
+// does the merged-region pcMap lookup + regionFn() call inside an
+// EM_ASM_INT, so the JS dispatch loop just calls this and checks
+// against MISS_SENTINEL.
+//
+// Returns: next-pc on hit; 0xFFFFFFFF on miss (caller should fall
+// through to compile + accumulate + maybe relink).
+//
+// Real guest PCs are always < 0x82000000, so 0xFFFFFFFF is a safe
+// sentinel; no risk of conflating with a real next-pc.
+static constexpr u32 PPC_WORKER_DISPATCH_MISS = 0xFFFFFFFFu;
+
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_region_dispatch_pc(u32 pc) {
+    s32 next = 0;
+    if (g_bcache.region_dispatch(pc, &next)) {
+        return static_cast<u32>(next);
+    }
+    return PPC_WORKER_DISPATCH_MISS;
+}
+
 }  // extern "C"
 
 // main: not used in worker mode (we're loaded as a library), but

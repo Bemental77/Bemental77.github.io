@@ -23,7 +23,7 @@ if [ ! -f "$BJIT_BUILD/libbementalJIT.a" ] || [ ! -f "$BJIT_BUILD/guests/powerpc
   emmake make -j4 bementalJIT bementalJITPowerPC > /tmp/bjit_build.log 2>&1
 fi
 
-EXPORTED_FUNCS='["_main","_malloc","_free","_ppc_worker_init","_ppc_worker_dispatch","_ppc_worker_shutdown","_ppc_worker_version","_ppc_worker_peek_u32","_ppc_worker_poke_u32","_ppc_worker_mailbox_post_demo","_ppc_worker_mailbox_call_sync","_ppc_worker_mailbox_call_sync2","_ppc_worker_mmio_read8","_ppc_worker_mmio_read16","_ppc_worker_mmio_read32","_ppc_worker_mmio_write8","_ppc_worker_mmio_write16","_ppc_worker_mmio_write32","_ppc_worker_compile_block","_ppc_worker_compile_buf_addr","_ppc_worker_compile_cycles","_ppc_worker_region_n_funcs","_ppc_worker_compile_and_accumulate","_ppc_worker_relink_region_if_due","_ppc_worker_region_generation"]'
+EXPORTED_FUNCS='["_main","_malloc","_free","_ppc_worker_init","_ppc_worker_dispatch","_ppc_worker_shutdown","_ppc_worker_version","_ppc_worker_peek_u32","_ppc_worker_poke_u32","_ppc_worker_mailbox_post_demo","_ppc_worker_mailbox_call_sync","_ppc_worker_mailbox_call_sync2","_ppc_worker_mmio_read8","_ppc_worker_mmio_read16","_ppc_worker_mmio_read32","_ppc_worker_mmio_write8","_ppc_worker_mmio_write16","_ppc_worker_mmio_write32","_ppc_worker_compile_block","_ppc_worker_compile_buf_addr","_ppc_worker_compile_cycles","_ppc_worker_region_n_funcs","_ppc_worker_compile_and_accumulate","_ppc_worker_relink_region_if_due","_ppc_worker_region_generation","_ppc_worker_region_dispatch_pc"]'
 
 EXPORTED_RUNTIME='["ccall","cwrap","getValue","setValue","HEAP8","HEAPU8","HEAP32","HEAPU32"]'
 

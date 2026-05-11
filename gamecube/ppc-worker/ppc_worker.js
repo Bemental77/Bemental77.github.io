@@ -381,6 +381,18 @@
         const regions = mod.bemental_regions;
         const compileOnMiss = !!data.compileOnMiss;
         const safetyCap = ((data.safetyCap | 0) >>> 0) || 100000;
+        // Phase 3a.4 — feature flag for the merged-region dispatch path.
+        // When `mergedRegion: true`, dispatch goes through the C-side
+        // ppc_worker_region_dispatch_pc which uses BlockCache::region_dispatch
+        // (single merged WASM module per region; V8 cross-block inlining
+        // possible since blocks are in the same instance). Falls through
+        // to compile_and_accumulate + relink_region_if_due on miss.
+        // When false: legacy 2g per-block-instance path (unchanged).
+        const mergedRegion = !!data.mergedRegion;
+        // Tunable: relink check cadence in iters. region_should_relink is
+        // cheap (≤9 hashmap-size + time-deltas) but not free; checking
+        // every iter would waste time on the steady-state path.
+        const relinkCheckMask = 0xff;  // every 256 iters
         // 2f.6: perf-measurement mode bypasses downcount/exception/idle
         // termination so we can clock raw dispatch throughput. Still
         // honors stop-flag and safetyCap.
@@ -450,7 +462,43 @@
             const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
             if ((now - wallStart) >= wallTimeMs) { exitReason = 'wall-time-cap'; break; }
           }
-          // Lookup or compile.
+          // Phase 3a.4 fast-path: merged-region dispatch via C side.
+          // ppc_worker_region_dispatch_pc returns next-pc on hit, or
+          // 0xFFFFFFFF on miss. C-side BlockCache::region_dispatch
+          // does the pcMap lookup + regionFn() call inside one
+          // EM_ASM_INT — far less per-iter overhead than the legacy
+          // JS-side scan + per-block instance.exports lookup.
+          if (mergedRegion) {
+            const next = mod._ppc_worker_region_dispatch_pc(pc) >>> 0;
+            if (next !== 0xFFFFFFFF) {
+              // Hit. Update SAB pc + fall through to downcount/loop.
+              if (!ignoreDowncount) {
+                Atomics.sub(i32, (PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2, 1);
+              }
+              u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] = next;
+              // Same-PC idle-skip detector applies to merged path too.
+              if (next === lastPc) {
+                if (++samePcCount > 100) { exitReason = 'idle-skip'; break; }
+              } else { samePcCount = 0; lastPc = next; }
+              pc = next;
+              continue;
+            }
+            // Miss → fall through to compile_and_accumulate.
+            const bytesSize = mod._ppc_worker_compile_and_accumulate(pc) >>> 0;
+            if (bytesSize > 0) {
+              ++compileCalls;
+              totalCompileBytes += bytesSize;
+            }
+            // Relink any region that's hit its threshold. Cheap when
+            // nothing's due; ~one EM_ASM_INT per region that is.
+            if ((iters & relinkCheckMask) === 0) {
+              mod._ppc_worker_relink_region_if_due(0);
+            }
+            // pc unchanged; next iter retries dispatch (on the same pc
+            // if relink happened it'll hit, else continues compiling).
+            continue;
+          }
+          // Legacy 2g per-block-instance path (unchanged).
           let region = null, idx = -1, blockCycles = 1;
           for (const k in regions) {
             const r = regions[k];
