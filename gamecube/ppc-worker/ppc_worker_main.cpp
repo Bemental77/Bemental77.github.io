@@ -390,6 +390,39 @@ u32 ppc_worker_region_n_funcs(u32 region) {
     return static_cast<u32>(g_bcache.region_n_funcs(static_cast<Region>(region)));
 }
 
+// Phase 3a.3 — iterate REGION_COUNT regions; for each that meets
+// region_should_relink (≥64 blocks since last relink OR ≥1 block + 2s
+// quiesce per block_cache.cpp:544-578), call region_relink which
+// builds the merged module via the guest emitter, instantiates it via
+// EM_ASM_INT into Module.bemental_regions[r], and drops the previous
+// module. Returns the number of regions that relinked this call (0 if
+// none were due, ≥1 if compile-pool is keeping up).
+//
+// Should be called from the JS dispatch loop on a slow cadence (e.g.
+// every N misses or once per outer iter) so the threshold work does
+// not pile up. Cheap when nothing is due (just N hashmap-size + N
+// time-deltas).
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_relink_region_if_due(u32 mem_pages) {
+    u32 n_relinked = 0u;
+    for (u32 r = 0u; r < REGION_COUNT; ++r) {
+        const Region region = static_cast<Region>(r);
+        if (!g_bcache.region_should_relink(region)) continue;
+        g_bcache.region_relink(region, mem_pages);
+        ++n_relinked;
+    }
+    return n_relinked;
+}
+
+// Diagnostic: current generation counter for a region. Bumped each
+// relink. JS reads this to detect when a fresh module is available
+// (compare with previously-observed generation).
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_region_generation(u32 region) {
+    if (region >= REGION_COUNT) return 0u;
+    return static_cast<u32>(g_bcache.region_generation(static_cast<Region>(region)));
+}
+
 }  // extern "C"
 
 // main: not used in worker mode (we're loaded as a library), but
