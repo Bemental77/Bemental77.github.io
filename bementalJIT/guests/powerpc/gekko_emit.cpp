@@ -2515,6 +2515,51 @@ static void emit_stfsu_impl(EmitCtx& c) {
     c.b.op_i32_store(ppc_off::gpr(ra));
 }
 
+// Forward decl — emit_ea_x lives later in this file (X-form support
+// section). The FP X-form impls below need it.
+static void emit_ea_x(EmitCtx& c, u32 ra, u32 rb);
+
+// X-form FP-memory ops (Phase A continuation). Per perf-op31 trace:
+// these three were top-3 of remaining op31 interp fallbacks (lfsx + stfsx
+// = 34,590 of 40,822 = 85% of op31 fallbacks). Same shape as the D-form
+// lfs/stfs/stfiwx but EA computed from (ra ? gpr[ra] : 0) + gpr[rb]
+// instead of gpr[ra] + simm.
+
+// lfsx rT, rA, rB — load 32-bit float (indexed), promote to f64.
+// EA = (ra ? gpr[ra] : 0) + gpr[rb]
+static void emit_lfsx_impl(EmitCtx& c) {
+    const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
+    c.b.op_i32_const((s32)CTX);
+    emit_ea_x(c, ra, rb);
+    emit_import_or_stub(c, WIMPORT_READ32);
+    c.b.op_f32_reinterpret_i32();
+    c.b.op_f64_promote_f32();
+    c.b.op_f64_store(ppc_off::ps0(rt));
+}
+
+// stfsx rS, rA, rB — store 32-bit float (indexed) (demote f64 from FPR).
+static void emit_stfsx_impl(EmitCtx& c) {
+    const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
+    emit_ea_x(c, ra, rb);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_f64_load(ppc_off::ps0(rs));
+    c.b.op_f32_demote_f64();
+    c.b.op_i32_reinterpret_f32();
+    emit_import_or_stub(c, WIMPORT_WRITE32);
+}
+
+// stfiwx rS, rA, rB — store FPR as integer word (indexed). Writes the
+// low 32 bits of the FPR's ps0 slot directly (no demote/reinterpret).
+// In our little-endian f64 storage, low 32 bits live at ppc_off::ps0(rs)
+// (see lfd comment ~line 2424 for the layout rationale).
+static void emit_stfiwx_impl(EmitCtx& c) {
+    const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
+    emit_ea_x(c, ra, rb);
+    c.b.op_i32_const((s32)CTX);
+    c.b.op_i32_load(ppc_off::ps0(rs));  // low 32 bits of f64 slot
+    emit_import_or_stub(c, WIMPORT_WRITE32);
+}
+
 // stfd rS, d(rA) — store 64-bit double directly. PPC big-endian byte order:
 // [EA+0..3] = high 32 bits (BE), [EA+4..7] = low 32 bits (BE). Our host
 // write_u32 import handles endianness. We split the FPR's f64 into two i32
@@ -3461,6 +3506,12 @@ constexpr OpEntry table31_entries[] = {
     {439, &emit_sthux_impl},
     {215, &emit_stbx_impl},
     {247, &emit_stbux_impl},
+    // X-form FP memory ops — addresses 85%+ of remaining op31 interp
+    // fallbacks per perf-op31 measurement (lfsx + stfsx = 34,590 of
+    // 40,822 op31 fallbacks in a 500K-dispatch window).
+    {535, &emit_lfsx_impl},
+    {663, &emit_stfsx_impl},
+    {983, &emit_stfiwx_impl},
     // MSR / SR access — fallback + block_end (privileged state change).
     { 83, &emit_mfmsr_impl},
     {146, &emit_mtmsr_impl},
