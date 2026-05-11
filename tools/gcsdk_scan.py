@@ -135,7 +135,27 @@ def scan_section(section_bytes, section_addr, sigs_by_size, sig_table,
     return hits
 
 
-def write_map(out_path, hits, game_id="UNKNOWN"):
+def load_hle_blocklist(hle_cpp_path):
+    """Read Dolphin's HLE/HLE.cpp os_patches[] table and return the set of
+    function names that get HLE handlers attached on Reload.
+
+    These names are also covered by Dolphin's bundled totaldb.dsy at the
+    correct addresses. If our scanner emits the SAME name at a DIFFERENT
+    address (hash collision — distinct fn happens to mask-hash to the
+    same value), Dolphin's LoadMap REPLACES totaldb's correct address
+    with our wrong one, then HLE patches the wrong code → catastrophic.
+    Filter these names out unconditionally."""
+    import re
+    p = Path(hle_cpp_path)
+    if not p.exists():
+        return set()
+    names = set()
+    for m in re.finditer(r'\{"([A-Za-z_][A-Za-z0-9_]+)"', p.read_text()):
+        names.add(m.group(1))
+    return names
+
+
+def write_map(out_path, hits, game_id="UNKNOWN", hle_blocklist=None):
     """Emit a CodeWarrior-style .map file Dolphin parses.
 
     Format: 4-column with optional alignment + entry/object suffix.
@@ -151,7 +171,11 @@ def write_map(out_path, hits, game_id="UNKNOWN"):
     lines.append("  ---------------------------------")
     # Sort + dedupe by addr.
     by_addr = {}
+    n_hle_drop = 0
     for addr, name, size, source in hits:
+        if hle_blocklist and name in hle_blocklist:
+            n_hle_drop += 1
+            continue
         if addr in by_addr:
             existing = by_addr[addr]
             # Prefer larger sig (more specific).
@@ -162,6 +186,9 @@ def write_map(out_path, hits, game_id="UNKNOWN"):
         name, size, source = by_addr[addr]
         lines.append(f"  {addr:08x} {size:08x} {addr:08x} 00000000  {name}\t{source}")
     Path(out_path).write_text("\n".join(lines) + "\n")
+    if n_hle_drop:
+        print(f"  dropped {n_hle_drop} HLE-conflicting hits (avoid LoadMap "
+              f"override of totaldb's correct addresses)", file=sys.stderr)
     return len(by_addr)
 
 
@@ -173,6 +200,12 @@ def main():
     ap.add_argument("--out", required=True, help="output .map path")
     ap.add_argument("--game-id", default="UNKNOWN",
                     help="6-char game ID (informational)")
+    ap.add_argument("--hle-cpp",
+                    default="gamecube/dolphin-src/Source/Core/Core/HLE/HLE.cpp",
+                    help="Path to Dolphin's HLE.cpp — names listed in its "
+                         "os_patches[] table are auto-filtered from the "
+                         "output map to avoid override of totaldb's "
+                         "correct addresses (set empty to disable filter).")
     args = ap.parse_args()
 
     sig_data = json.loads(Path(args.sigs).read_text())
@@ -217,7 +250,11 @@ def main():
         print(f"    {len(hits)} raw hits", file=sys.stderr)
         all_hits.extend(hits)
 
-    n = write_map(args.out, all_hits, args.game_id)
+    hle_blocklist = load_hle_blocklist(args.hle_cpp) if args.hle_cpp else set()
+    if hle_blocklist:
+        print(f"loaded {len(hle_blocklist)} HLE-blocklist names from {args.hle_cpp}",
+              file=sys.stderr)
+    n = write_map(args.out, all_hits, args.game_id, hle_blocklist)
     print(f"wrote {n} unique-addr entries → {args.out}", file=sys.stderr)
     return 0
 

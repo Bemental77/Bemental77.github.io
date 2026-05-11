@@ -44,11 +44,13 @@ static bool environment_cb(unsigned cmd, void* data) {
             *(bool*)data = true;
             return true;
         case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
-            // Boot.cpp does user_dir = save_dir + "/User". Use empty so
-            // user_dir = "/User" (single slash) → D_MAPS_IDX="/User/Maps/".
-            // The .map files are --embed-file'd to that MEMFS path by the
-            // link script.
-            *(const char**)data = "";
+            // Boot.cpp checks `if (save_dir && *save_dir)` then does
+            // user_dir = save_dir + "/User". "/" gives user_dir="//User"
+            // (double slash, but emscripten MEMFS tolerates it) →
+            // D_MAPS_IDX="//User/Maps/". The .map files are --embed-file'd
+            // to /User/Maps/ by the link script — MEMFS resolves the
+            // double slash transparently.
+            *(const char**)data = "/";
             return true;
         default:
             return false;

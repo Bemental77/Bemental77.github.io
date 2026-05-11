@@ -13,13 +13,10 @@
   800e5388 00000124 800e5388 00000000  __OSLoadFPUContext	os.a/OSContext.o
   800e54ac 00000128 800e54ac 00000000  __OSSaveFPUContext	os.a/OSContext.o
   800e55d4 0000005c 800e55d4 00000000  OSSetCurrentContext	os.a/OSContext.o
-  800e563c 00000080 800e563c 00000000  OSSaveContext	os.a/OSContext.o
-  800e56bc 000000d8 800e56bc 00000000  OSLoadContext	os.a/OSContext.o
   800e57c0 000000bc 800e57c0 00000000  OSInitContext	os.a/OSContext.o
   800e587c 000002a8 800e587c 00000000  OSDumpContext	os.a/OSContext.o
   800e5b24 00000084 800e5b24 00000000  OSSwitchFPUContext	os.a/OSContext.o
   800e5ba8 00000048 800e5ba8 00000000  __OSContextInit	os.a/OSContext.o
-  800e5bf0 00000080 800e5bf0 00000000  OSReport	os.a/OSError.o
   800e669c 00000048 800e669c 00000000  EXIClearInterrupts	exi.a/EXIBios.o
   800e799c 000002d8 800e799c 00000000  SetInterruptMask	os.a/OSInterrupt.o
   800e88e0 0000006c 800e88e0 00000000  MEMIntrruptHandler	os.a/OSMemory.o
