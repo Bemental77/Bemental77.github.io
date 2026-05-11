@@ -462,6 +462,18 @@
               return;
             }
             if (msg.cmd === 'ram-info') {
+              // Diag: log every Nth reply (even zero) so we can see what
+              // _dolphin_get_ram_addr actually returns over the boot.
+              if (window._ppcRamInfoReplyN === undefined) window._ppcRamInfoReplyN = 0;
+              window._ppcRamInfoReplyN++;
+              if (window._ppcRamInfoReplyN <= 5
+                  || (window._ppcRamInfoReplyN % 60) === 0) {
+                console.log('[ppc-worker-handshake] ram-info reply #'
+                  + window._ppcRamInfoReplyN
+                  + ' addr=0x' + (msg.addr>>>0).toString(16)
+                  + ' size=0x' + (msg.size>>>0).toString(16)
+                  + (msg.error ? ' err=' + msg.error : ''));
+              }
               if ((msg.addr >>> 0) !== 0 && (msg.size >>> 0) !== 0
                   && !window._ppcMem1Wired) {
                 console.log('[ppc-worker-handshake] dolphin ram addr=0x' + (msg.addr>>>0).toString(16)
