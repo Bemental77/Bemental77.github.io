@@ -66,6 +66,11 @@ struct BlockEmitInputs {
     // dispatched blocks have ZERO env.ppc_* dependencies. Stored here
     // so region_relink's re-emit path preserves the choice.
     bool                            emit_perf_stub = false;
+    // Item 5: when true, the block's prologue HLE check uses the
+    // wasm-native SAB-resident hash-table lookup instead of the
+    // env.ppc_hle_check import (or perf-stub drop+const-0). Stored so
+    // re-emit at region_relink preserves the choice.
+    bool                            emit_hle_check_native = false;
     std::vector<u32>                insts;          // raw guest opcodes
     std::vector<u32>                instr_pcs;      // parallel PC array
 };
@@ -80,6 +85,16 @@ struct RegionState {
     double                          last_accum_ms     = 0.0;
     int                             module_handle     = -1;
     int                             generation        = 0;
+    // Module-discard timing (V8 tier-up grace). Set in region_relink;
+    // region_should_relink uses it to defer relink while the fresh module
+    // is still inside V8's TurboFan tier-up window. Per V8 docs, tier-up
+    // for tiny single-fn modules is ~300µs background work; for merged
+    // modules with N≈hundreds of fns the bg compile-thread can take
+    // multiple hundred ms. Without this gate every threshold-trigger
+    // discards the fresh module before V8 ever upgrades it, capping
+    // throughput at Liftoff-baseline.
+    double                          last_relink_ms    = 0.0;
+    u32                             dispatches_since_relink = 0;
 };
 
 // Runtime dispatcher for many compiled WASM modules.

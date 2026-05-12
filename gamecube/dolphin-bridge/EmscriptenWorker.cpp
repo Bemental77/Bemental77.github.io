@@ -11,6 +11,28 @@
 #include "Common/Config/Config.h"
 #include "Core/Config/MainSettings.h"
 
+// Item 7 Phase IV: dolphin_service_iter routes here when CT_PHASE4_ENABLE
+// is set. Instead of running the full retro_run() → JitWasm::Run() chain
+// (which is the PPC dispatch path now owned by ppc-worker), we drain the
+// MMIO mirror + SPSC ring, sync TB/DEC, fire any ppc-worker-pre-fired
+// hybrid events (VI/DSP/AudioDMA/GPUSleeper/PatchEngine) into dolphin's
+// CoreTiming queue, then call retro_run() once. That outer call's
+// JitWasm::Run() will exit immediately because downcount is owned by
+// ppc-worker (already <= 0 mid-yield), so the libretro frontend
+// callbacks (video_cb, audio_*_cb) still fire normally — at the cost of
+// one Advance + outer-while iter overhead per service tick. Minimal-risk
+// shape: no rewiring of libretro pipeline, only a service detour.
+#include "Core/System.h"
+#include "Core/HW/MMIOMirror.h"
+#include "Core/HW/SystemTimers.h"
+#include "Core/CoreTiming.h"
+
+// CT phase flag accessor + queue mask drain live in JitWasm.cpp.
+extern "C" {
+unsigned dolphin_ct_get_phase_flags(void);
+unsigned dolphin_ct_drain_pending_mask(void);
+}
+
 extern "C" {
 void retro_init(void);
 void retro_deinit(void);
@@ -127,10 +149,26 @@ extern "C" {
 EMSCRIPTEN_KEEPALIVE
 void* get_pad_ptr(void) { return g_pad; }
 
+// PowerPCState placement-new redirect. Forward-declared instead of #include
+// to avoid pulling Core/PowerPC/PowerPC.h into the libretro shim TU.
+extern "C" void dolphin_set_ppc_state_external_storage(uint32_t addr);
+
 EMSCRIPTEN_KEEPALIVE
 int load_iso(const char* path) {
+    // Item 2e.x — set PowerPCState placement-new target BEFORE
+    // retro_load_game → BootCore → Core::System::GetInstance() triggers
+    // PowerPCManager construction. Under PROXY_TO_PTHREAD the worker-main
+    // and proxy-pthread wasm instances have SEPARATE copies of file-static
+    // globals (same bug class as g_jit_wasm — see JitWasm.cpp:1525-1535).
+    // Setting it from worker_funcs.js's onRuntimeInitialized only affects
+    // worker-main's copy; the pthread that actually constructs
+    // PowerPCManager reads its own nullptr and falls back to internal
+    // storage. By calling here in load_iso (which runs on the pthread,
+    // same instance that immediately triggers the singleton), the static
+    // IS visible at construction time.
+    dolphin_set_ppc_state_external_storage(0x02400000u);
     MAIN_THREAD_EM_ASM({
-        postMessage({cmd: 'print', txt: '[worker] load_iso: entry, path=' + UTF8ToString($0)});
+        postMessage({cmd: 'print', txt: '[worker] load_iso: PowerPCState redirect set on pthread (0x02400000) — entry, path=' + UTF8ToString($0)});
     }, path);
     if (g_loaded) retro_unload_game();
     retro_game_info info{};
@@ -152,15 +190,97 @@ void run_iter(void) {
     if (g_loaded) retro_run();
 }
 
+// Phase IV gate bit (mirrors gamecube/ppc-worker/sab_layout.h:386).
+static constexpr unsigned EW_CT_PHASE4_ENABLE = 1u << 1;
+
+// Item 7 Phase IV: service-only iter. Run when ppc-worker owns PPC
+// dispatch. Drains MMIO mirror + pending-writes ring, fires any
+// ppc-worker-pre-fired hybrid event cadence into dolphin's CoreTiming
+// queue, and lets retro_run() drive the libretro frontend (video_cb /
+// audio_*_cb fire when the SW renderer produces a frame). JitWasm::Run
+// inside that retro_run will exit on the first downcount<=0 because
+// ppc-worker owns downcount under Phase IV — so this call is cheap.
+EMSCRIPTEN_KEEPALIVE
+void dolphin_service_iter(void) {
+    if (!g_loaded) return;
+    // 1. Pull ppc-worker DIRECT_W mirror writes back into dolphin's
+    //    struct, then drain the pending-writes ring (replays
+    //    ComplexWrite handlers, which may schedule CoreTiming events).
+    bemental_sab::mmio_mirror_sync_from_sab();
+    (void)bemental_sab::mmio_mirror_drain_pending_writes();
+    // 2. Fire hybrid events whose cadence ppc-worker already advanced.
+    //    Dolphin's local m_event_queue still holds these entries — the
+    //    pending mask is a latency short-cut, not a replacement, so the
+    //    eventual local fire stays idempotent.
+    {
+        auto& system = Core::System::GetInstance();
+        const unsigned mask = dolphin_ct_drain_pending_mask();
+        if (mask != 0u) {
+            auto& core_timing = system.GetCoreTiming();
+            auto& timers = system.GetSystemTimers();
+            auto sched_now = [&](CoreTiming::EventType* et) {
+                if (et) core_timing.ScheduleEvent(0, et);
+            };
+            // Pending-mask bit layout matches bemental_ct::CT_PEND_* in JitWasm.cpp.
+            if (mask & (1u << 0)) sched_now(timers.GetVIEvent());
+            if (mask & (1u << 1)) sched_now(timers.GetDSPEvent());
+            if (mask & (1u << 2)) sched_now(timers.GetAudioDMAEvent());
+            if (mask & (1u << 4)) sched_now(timers.GetGPUSleeperEvent());
+            if (mask & (1u << 5)) sched_now(timers.GetPatchEngineEvent());
+            // CT_PEND_AI (1<<3): AudioInterface holds its own event type
+            // pointer; cross-module access deferred (idempotent w.r.t.
+            // dolphin's own AI event).
+        }
+    }
+    // 3. NO retro_run() — under Phase IV ppc-worker owns dispatch entirely.
+    //    retro_run calls into Core::ExecuteCPULoop → JitWasm::Run, which
+    //    will still execute the inner dispatch even though downcount may
+    //    have been burned, because Run reads downcount AFTER advancing the
+    //    next slice. That defeats the cadence handoff. Frame/audio
+    //    presentation needs to be wired separately (libretro video_cb /
+    //    audio_sample_batch_cb invoked from here when SW FIFO has output).
+    //    For now: 0 frames in Phase IV mode (boot-progress diagnosis first).
+}
+
 // Drain N retro_run slices in one call. Amortizes the JS↔WASM (and
 // PROXY_TO_PTHREAD) round-trip cost across the whole batch instead of
 // per-slice. Caller picks N to balance throughput against responsiveness
 // (large N = better dispatch rate but worse input latency).
+//
+// Phase IV: when CT_PHASE4_ENABLE is set, route to dolphin_service_iter
+// instead of retro_run. Gate is a single u32 atomic-load + AND so the
+// non-Phase-IV hot path pays only ~ns overhead. Per-iter check lets the
+// page flip Phase IV on/off without restarting the loop.
 EMSCRIPTEN_KEEPALIVE
 void run_iter_batch(int n) {
     if (!g_loaded) return;
+    // Diag counters in SAB so we can read them from the page without
+    // depending on MAIN_THREAD_EM_ASM blocking the pthread.
+    // 0x025010C0 = total iters
+    // 0x025010C4 = iters with flags=0
+    // 0x025010C8 = iters with flags=0x6
+    // 0x025010CC = iters that took the Phase IV branch
+    // 0x025010D0 = iters that called service_iter
+    // 0x025010D4 = iters that called retro_run
+    static volatile unsigned* const c_total   = (volatile unsigned*)0x025010C0u;
+    static volatile unsigned* const c_flag0   = (volatile unsigned*)0x025010C4u;
+    static volatile unsigned* const c_flag6   = (volatile unsigned*)0x025010C8u;
+    static volatile unsigned* const c_p4br    = (volatile unsigned*)0x025010CCu;
+    static volatile unsigned* const c_svci    = (volatile unsigned*)0x025010D0u;
+    static volatile unsigned* const c_retror  = (volatile unsigned*)0x025010D4u;
     for (int i = 0; i < n; i++) {
-        retro_run();
+        (*c_total)++;
+        const unsigned flags = dolphin_ct_get_phase_flags();
+        if (flags == 0u) (*c_flag0)++;
+        else if (flags == 0x6u) (*c_flag6)++;
+        if (flags & EW_CT_PHASE4_ENABLE) {
+            (*c_p4br)++;
+            (*c_svci)++;
+            dolphin_service_iter();
+        } else {
+            (*c_retror)++;
+            retro_run();
+        }
         if (!g_loaded) break;
     }
 }

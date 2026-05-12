@@ -40,3 +40,6 @@ echo "--- VI/Frame ---"
 grep -E "VI write|XFB|first frame|OutputField #" "$PROBE_LOG" | head -5
 echo "--- patches installed ---"
 grep -E "HLE patches|HLEMemset patched" "$PROBE_LOG" | head -3
+echo "--- DSP HLE chain sentinels (first / last) ---"
+grep "dsp-sentinel" "$PROBE_LOG" | head -1
+grep "dsp-sentinel" "$PROBE_LOG" | tail -1

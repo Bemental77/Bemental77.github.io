@@ -2,6 +2,7 @@
 
 #include <climits>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #ifdef __EMSCRIPTEN__
@@ -34,7 +35,8 @@ namespace powerpc {
                                     LocalIdxLookupFn lookup_fn,
                                     const void* lookup_user,
                                     bool emit_hle_check = true,
-                                    bool emit_perf_stub = false);
+                                    bool emit_perf_stub = false,
+                                    bool emit_hle_check_native = false);
 
     // Lever #2 — single-function merged-region build. See gekko_emit.h.
     struct BlockInputs {
@@ -48,6 +50,10 @@ namespace powerpc {
         const u32* instr_pcs;
         bool emit_hle_check;
         bool emit_perf_stub = false;
+        // Item 5 — match the BlockInputs in gekko_emit.h so the layout
+        // is identical when this translation unit hands a BlockInputs
+        // array to build_region_function.
+        bool emit_hle_check_native = false;
     };
     std::vector<u8> build_region_function(const BlockInputs* blocks,
                                           u32 n_blocks,
@@ -77,6 +83,19 @@ int compile_raw(const u8* bytes, std::size_t size) {
             // Module._fn) gives the WASM block a WASM→WASM cross-module
             // call instead of WASM→JS→WASM. By compile time, runtime is
             // fully initialised and the dummy calls are safe.
+            // Bootstrap: if bemental_imports isn't set up yet, do it now.
+            // Under PROXY_TO_PTHREAD, JitWasm::Init's EM_ASM runs on
+            // the worker-main wasm instance — pthread's Module never sees
+            // those bindings. compile_raw runs on the pthread, so we
+            // populate pthread's Module.bemental_imports here. Idempotent.
+            if (!Module.bemental_imports_need_upgrade
+                && (!Module.bemental_imports || !Module.bemental_imports.env
+                    || !Module.bemental_imports.env.ppc_write16)) {
+                if (typeof Module._dolphin_write16 === 'function') {
+                    Module.bemental_imports_need_upgrade = true;
+                    console.error('[bemental] bootstrap: pthread-side bemental_imports init');
+                }
+            }
             if (Module.bemental_imports_need_upgrade) {
                 try {
                     Module._dolphin_read8(0);
@@ -90,6 +109,9 @@ int compile_raw(const u8* bytes, std::size_t size) {
                     Module._dolphin_hle_check(0);
                     // Skip dolphin_interp(0,0) — it calls SingleStepInner
                     // which is not safe to invoke at random.
+                    // Skip dolphin_hle_fire(0, 0) — it would actually
+                    // execute an HLE handler at hook_index=0 which is the
+                    // sentinel "unimplemented" PanicAlert.
                     if (Module.bemental_imports && Module.bemental_imports.env) {
                         const e = Module.bemental_imports.env;
                         e.ppc_read8       = Module._dolphin_read8;
@@ -101,6 +123,11 @@ int compile_raw(const u8* bytes, std::size_t size) {
                         e.ppc_check_exc   = Module._dolphin_check_exc;
                         e.ppc_break_block = Module._dolphin_break_block;
                         e.ppc_hle_check   = Module._dolphin_hle_check;
+                        // Item 5: direct-bind hle_fire for dolphin's own
+                        // path (called when emit_hle_check_native is
+                        // unused — module still declares the import).
+                        if (Module._dolphin_hle_fire)
+                            e.ppc_hle_fire = Module._dolphin_hle_fire;
                         // Keep ppc_interp as the JS wrapper (don't bypass).
                     }
                     const isWasm = (typeof WebAssembly.Function !== 'undefined')
@@ -565,18 +592,64 @@ bool BlockCache::region_should_relink(Region r) const {
     if (rs.n_funcs < 256u)        threshold = 32u;
     else if (rs.n_funcs < 1024u)  threshold = 128u;
     else                          threshold = 256u;
-    if (rs.blocks_since_link >= threshold) return true;
+    const bool block_trigger = (rs.blocks_since_link >= threshold);
 
     // Trigger 2: steady-state catch — the region has at least one block
     // pending and hasn't accumulated a new one in >2 s. Without this, a
     // region that JITs a handful of blocks then quiesces would never get
     // its merged module built.
+    bool quiesce_trigger = false;
     if (rs.blocks_since_link >= 1u) {
         const double age = now_ms() - rs.last_accum_ms;
-        if (age > 2000.0) return true;
+        if (age > 2000.0) quiesce_trigger = true;
     }
 
-    return false;
+    if (!block_trigger && !quiesce_trigger) return false;
+
+    // ---- Module-discard timing (V8 tier-up grace) ----
+    // Once a region is past initial warmup (≥256 blocks → module is large
+    // enough that TurboFan tier-up actually has inlining work to do), defer
+    // relink while the just-installed module is still in V8's background
+    // tier-up window. Without this, every threshold-trigger discards the
+    // freshly-instantiated module before V8 ever upgrades it from Liftoff
+    // → TurboFan, capping sustained throughput at baseline.
+    //
+    // We can't read V8 internals to know "tier-up done", so use two
+    // proxies that bound the bg window from below:
+    //   - elapsed-since-relink (>= grace ms)
+    //   - dispatches-into-this-module (>= min dispatches; ensures V8
+    //     actually collected feedback for the new instance — type
+    //     feedback is per-instance and starts empty).
+    //
+    // Defaults derived from V8 research + lever_3_tierup_blocked_2026_05_05
+    // (~300µs/fn bg compile; merged modules with ~480 fns → ~145 ms).
+    // Defaults are conservative so steady-state behavior favors keeping a
+    // tier-up'd module alive. Overridable via env for measurement.
+    //
+    // Disabled while still in warmup (n_funcs < 256) — boot needs fast
+    // catch-up to surface PCs into the module before they pile up on the
+    // slow per-block dispatch path.
+    if (rs.n_funcs >= 256u && rs.last_relink_ms > 0.0) {
+        static const double s_grace_ms =
+            (std::getenv("BJIT_TIERUP_GRACE_MS") != nullptr)
+                ? std::atof(std::getenv("BJIT_TIERUP_GRACE_MS"))
+                : 250.0;
+        static const u32 s_min_dispatches =
+            (std::getenv("BJIT_TIERUP_MIN_DISPATCHES") != nullptr)
+                ? static_cast<u32>(std::atoi(std::getenv("BJIT_TIERUP_MIN_DISPATCHES")))
+                : 5000u;
+        const double since_relink = now_ms() - rs.last_relink_ms;
+        // Quiesce trigger ignores the grace gate: if the region has been
+        // idle >2 s, V8 has definitely had its bg window — let the relink
+        // proceed so pending blocks aren't stranded.
+        if (!quiesce_trigger
+            && since_relink < s_grace_ms
+            && rs.dispatches_since_relink < s_min_dispatches) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 // LocalIdxLookupFn closure that reads from a region's pc_to_idx map.
@@ -643,7 +716,8 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
                 rec.instr_pcs.data(),
                 &region_lookup_for_emit, &ctx,
                 /*emit_hle_check=*/true,
-                /*emit_perf_stub=*/rec.emit_perf_stub);
+                /*emit_perf_stub=*/rec.emit_perf_stub,
+                /*emit_hle_check_native=*/rec.emit_hle_check_native);
             rs.fn_bodies_concat.insert(rs.fn_bodies_concat.end(),
                                        body.begin(), body.end());
         }
@@ -694,6 +768,7 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
             bins[i].instr_pcs      = rec.instr_pcs.data();
             bins[i].emit_hle_check = true;
             bins[i].emit_perf_stub = rec.emit_perf_stub;
+            bins[i].emit_hle_check_native = rec.emit_hle_check_native;
         }
         RegionLookupCtx ctx{ &rs };
         bytes = powerpc::build_region_function(
@@ -799,9 +874,11 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
     use_merged_fn ? 1 : 0);
 
     if (new_handle < 0) return;
-    rs.module_handle      = new_handle;
-    rs.generation        += 1;
-    rs.blocks_since_link  = 0u;
+    rs.module_handle             = new_handle;
+    rs.generation               += 1;
+    rs.blocks_since_link         = 0u;
+    rs.last_relink_ms            = now_ms();
+    rs.dispatches_since_relink   = 0u;
 #else
     (void)mem_pages;
 #endif
@@ -811,6 +888,13 @@ bool BlockCache::region_dispatch(u32 pc, s32* out) {
     const Region r = classify(pc);
     if (r >= REGION_COUNT) return false;
     if (m_regions[r].module_handle < 0) return false;
+    // Tier-up grace counter — V8 type feedback is per-instance and starts
+    // empty. region_should_relink consults this to know whether the
+    // current module has had enough traffic for TurboFan to have material
+    // worth preserving. Bump on every call into region_dispatch regardless
+    // of hit/miss; on miss the caller falls through to compile path, the
+    // feedback investment in the current module is unchanged.
+    m_regions[r].dispatches_since_relink += 1u;
 #ifdef __EMSCRIPTEN__
     return EM_ASM_INT({
         const r        = $0 | 0;
@@ -872,11 +956,13 @@ void BlockCache::region_drop(Region r) {
 #endif
     rs.fn_bodies_concat.clear();
     rs.pc_keys.clear();
-    rs.n_funcs           = 0u;
-    rs.blocks_since_link = 0u;
-    rs.last_accum_ms     = 0.0;
-    rs.module_handle     = -1;
-    rs.generation        = 0;
+    rs.n_funcs                 = 0u;
+    rs.blocks_since_link       = 0u;
+    rs.last_accum_ms           = 0.0;
+    rs.module_handle           = -1;
+    rs.generation              = 0;
+    rs.last_relink_ms          = 0.0;
+    rs.dispatches_since_relink = 0u;
 }
 
 std::size_t BlockCache::region_n_funcs(Region r) const {

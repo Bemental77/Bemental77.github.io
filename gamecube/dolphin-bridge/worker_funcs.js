@@ -15,22 +15,14 @@ if (typeof Module !== 'undefined') {
     if (typeof _ppc_origORI === 'function') {
       try { _ppc_origORI(); } catch (e) {}
     }
-    // 2e.4: redirect PowerPCState to shared SAB at offset 0x02400000.
-    // Must happen BEFORE Core::System is constructed (which happens
-    // later during retro_load_game). When PowerPCManager's constructor
-    // sees g_ppc_state_external_storage != nullptr, it placement-new's
-    // PowerPCState into shared memory — both dolphin and ppc-worker
-    // see the same bytes via direct env.memory access. This is the
-    // foundation for native-speed dispatch (no per-state-access
-    // mailbox round-trips).
-    try {
-      if (typeof Module._dolphin_set_ppc_state_external_storage === 'function') {
-        Module._dolphin_set_ppc_state_external_storage(0x02400000);
-        postMessage({ cmd: 'print', txt: '[worker] PowerPCState redirected to SAB[0x02400000]' });
-      }
-    } catch (err) {
-      postMessage({ cmd: 'print', txt: '[worker] state redirect FAILED: ' + (err && err.message ? err.message : String(err)) });
-    }
+    // 2e.4 (UPDATED 2026-05-11): PowerPCState redirect moved to
+    // load_iso() in EmscriptenWorker.cpp. Under PROXY_TO_PTHREAD the
+    // onRuntimeInitialized callback runs on the worker-main wasm
+    // instance, but PowerPCManager is constructed on the proxy-pthread
+    // wasm instance — file-static `g_ppc_state_external_storage` is
+    // per-instance, so setting it from here never reaches the pthread
+    // that needs it. Same bug class as g_jit_wasm (JitWasm.cpp:1525).
+    postMessage({ cmd: 'print', txt: '[worker] PowerPCState redirect deferred to load_iso (pthread instance)' });
     postMessage({ cmd: 'runtime-ready' });
     postMessage({ cmd: 'print', txt: '[worker] runtime-ready posted' });
   };
@@ -261,6 +253,20 @@ self.onmessage = function (e) {
       // signal: we just print so the cascade log lines up.
       postMessage({ cmd: 'print', txt: '[worker] setup-ppc-mailbox legacy ack (4f-6: routing is page-mediated)' });
       break;
+    case 'ct-phase-set':
+      // Item 7 Phase IV: page-driven gate. Called by gamecube.html when
+      // ppc-worker is taking over PPC dispatch (?ppcbootdispatch=1). Bits
+      // match gamecube/ppc-worker/sab_layout.h:386 (PHASE4=0x2, PHASE5=0x4).
+      if (Module && Module._dolphin_ct_set_phase_flags) {
+        var flags = (data.flags | 0) >>> 0;
+        Module._dolphin_ct_set_phase_flags(flags);
+        postMessage({ cmd: 'print',
+          txt: '[worker] ct-phase-set flags=0x' + flags.toString(16) });
+      } else {
+        postMessage({ cmd: 'print',
+          txt: '[worker] ct-phase-set: Module._dolphin_ct_set_phase_flags missing' });
+      }
+      break;
     case 'pause-for-cutover':
     case 'resume-from-cutover':
       // 2d.9 reverted — see memory:2d9_real_cutover_blocked.md.
@@ -376,6 +382,8 @@ self.onmessage = function (e) {
           case 10: r = Module._dolphin_check_exc(a0) >>> 0; break;
           case 11: Module._dolphin_break_block(a0); break;
           case 12: r = Module._dolphin_read_tb(a0) >>> 0; break;
+          case 14: // Item 5 — HleFire (pc, idx|type<<16) -> next_pc
+            r = Module._dolphin_hle_fire(a0, a1) >>> 0; break;
           case 100:
             // 4f-6 routing-live probe. Pure function (no emulator
             // state), so it works pre-boot. The cascade verifies the

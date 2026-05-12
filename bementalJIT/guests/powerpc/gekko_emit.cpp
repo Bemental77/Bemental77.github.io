@@ -466,6 +466,19 @@ constexpr u32 MMIO_MIRROR_ADDR      = 0x02600000u;
 constexpr u32 MMIO_CLS16_ADDR       = 0x02640000u;
 constexpr u32 MMIO_CLS32_ADDR       = 0x02660000u;
 constexpr u8  MMIO_CLASS_DIRECT_RW  = 1u;
+constexpr u8  MMIO_CLASS_READ_SE    = 2u;
+// Item 6 Stage 2: pending-writes SPSC ring lives at 0x02670000 (64 KB).
+// Header layout mirrors gamecube/ppc-worker/sab_layout.h PendingWriteRecord:
+//   +0x00 u32 magic   ('PWR0')
+//   +0x04 u32 version
+//   +0x08 u32 head    (producer-owned; this emitter doesn't enqueue —
+//                      ppc-worker.js does, when the W2 flag is on)
+//   +0x0C u32 tail    (consumer-owned, dolphin)
+//   +0x10 u32 capacity
+//   ...
+constexpr u32 PWR_BASE_ADDR         = 0x02670000u;
+constexpr u32 PWR_CAPACITY          = 4096u;
+constexpr u32 PWR_RECORDS_OFF       = 0x100u;
 
 // Option D — emit either the import call OR an inline stub equivalent.
 // In stub mode, returning imports become `drop args + i32.const 0`; void
@@ -479,7 +492,7 @@ constexpr u8  MMIO_CLASS_DIRECT_RW  = 1u;
 // the import's signature, see gekko_emit.h:32-47 WIMPORT_* enum).
 static void emit_import_or_stub(EmitCtx& c, u32 import_idx) {
     if (!c.emit_perf_stub) {
-        emit_import_or_stub(c, import_idx);
+        c.b.op_call(import_idx);  // emit real wasm call — fix for f35466e sed regression
         return;
     }
     // WIMPORT_* signatures (gekko_emit.h:32-47):
@@ -510,7 +523,7 @@ static void emit_import_or_stub(EmitCtx& c, u32 import_idx) {
             break;
         default:
             // Unknown import — emit the call anyway (shouldn't reach).
-            emit_import_or_stub(c, import_idx);
+            c.b.op_call(import_idx);
             break;
     }
 }
@@ -582,6 +595,109 @@ static void emit_mmio_mirror_else_or_import(EmitCtx& c, u32 import_idx) {
         c.b.op_local_get(LOCAL_TMP_A);
         emit_import_or_stub(c, import_idx);
     emit_local_op_end(c);
+}
+
+// Item 6 Stage 2 — STORE-side counterpart of emit_mmio_mirror_else_or_import.
+//
+// Preconditions:
+//   - EA already stashed in LOCAL_TMP_A by caller (matches read helper).
+//   - Value already stashed in LOCAL_TMP_C by caller (read helper uses
+//     LOCAL_TMP_B for `rel`, so we need a separate value local).
+//   - import_idx is WIMPORT_WRITE16 or WIMPORT_WRITE32. WRITE8 skips
+//     this helper because stage 2 omits a cls8 table (rare in MMIO).
+//
+// Emission shape (per design doc §3a):
+//   rel = ea - 0xCC000000
+//   if (rel < 0x40000) AND (cls[rel >> shift] in {DIRECT_RW, READ_SE})
+//       i32.store[16] offset=MMIO_MIRROR_ADDR        ; mirror canonical, no bswap
+//   else
+//       call write_import(ea, val)                    ; existing mailbox path
+//
+// READ_SE is in the acceptance set because "READ_SE" means READ has
+// side effects but WRITE is pure-storage — the mirror is the canonical
+// write target. {WRITE_SE, READ_WRITE_SE, UNMAPPED, CONSTANT} all fall
+// through to the import (the mailbox handler reacts; in W2 mode
+// ppc_worker.js diverts the import to enqueue into the pending-writes
+// ring instead of postMessage round-trip).
+//
+// Stack discipline (mirrors the read helper carefully):
+//   - if-block result is empty (0x40 / void) since both arms produce
+//     no values (store consumes addr+val; import is void).
+//   - The void-typed if/else means rel does NOT remain on the stack.
+//     We MUST `local.set LOCAL_TMP_B` (not tee) for the rel value;
+//     otherwise the cls byte ends up imbalancing fall-through.
+//   - B11-aware op_if/else/end so the cross-arm GPR cache stays sound.
+static void emit_mmio_mirror_store_else_or_import(EmitCtx& c, u32 import_idx) {
+    if (import_idx == WIMPORT_WRITE8) {
+        // No cls8 table; fall straight to the import. Caller has
+        // already arranged TMP_A=ea, TMP_C=val on the wasm locals.
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_local_get(LOCAL_TMP_C);
+        emit_import_or_stub(c, import_idx);
+        return;
+    }
+    const u32 cls_addr  = (import_idx == WIMPORT_WRITE32) ? MMIO_CLS32_ADDR
+                                                          : MMIO_CLS16_ADDR;
+    const u32 cls_shift = (import_idx == WIMPORT_WRITE32) ? 2u : 1u;
+
+    // rel = ea - MMIO_GUEST_BASE — kept in LOCAL_TMP_B only (NOT teed;
+    // see the read helper's comment for the validation rationale —
+    // void-typed if-block means fall-through must be zero values, not
+    // one rel-on-stack value).
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)MMIO_GUEST_BASE);
+    c.b.op_i32_sub();
+    c.b.op_local_set(LOCAL_TMP_B);
+
+    // cls[(rel & range_mask) >> shift] tested for {DIRECT_RW=1, READ_SE=2}.
+    // Encoding the dual-class accept as a single unsigned subtract +
+    // compare (cls - 1 <= 1) avoids needing a second local to share the
+    // cls byte across two equality tests, which is important because
+    // TMP_A here still holds EA (the caller's update-form sthu/stwu
+    // expects EA in TMP_A AFTER the helper returns).
+    //
+    // Masking is critical for the same reason as the read helper: rel
+    // can be huge for non-MMIO addresses and would index past the cls
+    // table → wasm bounds trap. The `rel < range_bytes` check below
+    // gates the result before we act on it; the mask just keeps the
+    // cls read itself safe.
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_const((s32)(MMIO_GUEST_RANGE_BYTES - 1u));
+    c.b.op_i32_and();
+    c.b.op_i32_const((s32)cls_shift);
+    c.b.op_i32_shr_u();
+    c.b.op_i32_load8_u(cls_addr);
+    // accept = (cls - 1) <= 1, i.e. cls is 1 (DIRECT_RW) or 2 (READ_SE).
+    c.b.op_i32_const(1);
+    c.b.op_i32_sub();
+    c.b.op_i32_const(1);
+    c.b.op_i32_le_u();
+
+    // rel < MMIO_GUEST_RANGE_BYTES — bounds-guards the cls read.
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_const((s32)MMIO_GUEST_RANGE_BYTES);
+    c.b.op_i32_lt_u();
+
+    c.b.op_i32_and();
+    emit_b11_op_if(c, /*void*/ 0x40);
+        // Fast path: store value into the mirror at offset MMIO_MIRROR_ADDR + rel.
+        // Host-native (no bswap) because dolphin writes the mirror via
+        // memcpy from the host-native register field, and the matching
+        // mirror-read fast path consumes host-native bytes the same way.
+        c.b.op_local_get(LOCAL_TMP_B);
+        c.b.op_local_get(LOCAL_TMP_C);
+        if (import_idx == WIMPORT_WRITE32) {
+            c.b.op_i32_store(MMIO_MIRROR_ADDR);
+        } else {
+            c.b.op_i32_store16(MMIO_MIRROR_ADDR);
+        }
+    emit_b11_op_else(c);
+        // Slow path: write via the mailbox import. EA still lives in
+        // TMP_A — the helper never clobbered it.
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_local_get(LOCAL_TMP_C);
+        emit_import_or_stub(c, import_idx);
+    emit_b11_op_end(c);
 }
 
 // lbz/lhz/lwz/lha — D-form loads. update flag toggles RA writeback (lbzu etc.)
@@ -659,16 +775,9 @@ static void emit_load_d(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
     if (g_mem1_base == 0u) {
         // (a) No fastmem base provided; try MMIO mirror first, then import.
         emit_mmio_mirror_else_or_import(c, import_idx);
-    } else if (g_mem1_safe) {
-        // (b) Trust DFA passed; direct load with mask + add (no runtime branch).
-        c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_i32_const(0x017FFFFF);
-        c.b.op_i32_and();
-        c.b.op_i32_const((s32)g_mem1_base);
-        c.b.op_i32_add();
-        emit_direct_load_post();
     } else {
-        // (c) Untrusted block; runtime range check (matches emit_load_x).
+        // (c) ALWAYS runtime range check. Path (b) "trust DFA" was a
+        // correctness bug — see emit_store_d comment.
         c.b.op_local_get(LOCAL_TMP_A);
         c.b.op_i32_const(0x1F000000);
         c.b.op_i32_and();
@@ -774,19 +883,22 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
     };
     if (g_mem1_base == 0u) {
         // (a) No fastmem base; full import.
-        c.b.op_local_get(LOCAL_TMP_A);
+        // Item 6 Stage 2: route through the MMIO mirror helper. For
+        // non-MMIO EAs it falls through to the same import — no
+        // behavior change. For DIRECT_RW / READ_SE cells (VI, MI, the
+        // direct-write parts of CP) it stores directly into the SAB
+        // mirror without a synchronous mailbox round-trip.
+        // Helper preconditions: TMP_A = EA, TMP_C = val.
         emit_gpr_get_impl(c, rs, g_ctx_ptr);
-        emit_import_or_stub(c, import_idx);
-    } else if (g_mem1_safe) {
-        // (b) Trust DFA passed; direct store with mask + add.
-        c.b.op_local_get(LOCAL_TMP_A);
-        c.b.op_i32_const(0x017FFFFF);
-        c.b.op_i32_and();
-        c.b.op_i32_const((s32)g_mem1_base);
-        c.b.op_i32_add();
-        emit_direct_store_post_with_addr_on_stack();
+        c.b.op_local_set(LOCAL_TMP_C);
+        emit_mmio_mirror_store_else_or_import(c, import_idx);
     } else {
-        // (c) Untrusted block; runtime range check.
+        // (c) ALWAYS runtime range check. Path (b) "trust DFA" was a
+        // correctness bug: blocks where r13/SDA-relative offsets reach
+        // MMIO addresses (0xCC00xxxx) silently wrote to MEM1[masked].
+        // DSPCR + AI registers were lost → DSP HLE never progressed
+        // past ROM ucode → boot stuck in audio init polls. (Native
+        // Dolphin oracle 2026-05-11 — see /tmp/native_oracle_report.md.)
         c.b.op_local_get(LOCAL_TMP_A);
         c.b.op_i32_const(0x1F000000);
         c.b.op_i32_and();
@@ -811,9 +923,12 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
             c.b.op_i32_add();
             emit_direct_store_post_with_addr_on_stack();
         emit_b11_op_else(c);
-            c.b.op_local_get(LOCAL_TMP_A);
+            // Item 6 Stage 2: same MMIO mirror routing as path (a).
+            // The else-arm runs when EA is NOT in MEM1 — exactly the
+            // case where MMIO might apply.
             emit_gpr_get_impl(c, rs, g_ctx_ptr);
-            emit_import_or_stub(c, import_idx);
+            c.b.op_local_set(LOCAL_TMP_C);
+            emit_mmio_mirror_store_else_or_import(c, import_idx);
         emit_b11_op_end(c);
     }
 
@@ -3221,9 +3336,10 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
     c.b.op_drop();
 
     if (g_mem1_base == 0u) {
-        c.b.op_local_get(LOCAL_TMP_A);
+        // Item 6 Stage 2: same MMIO mirror routing as emit_store_d path (a).
         emit_gpr_get_impl(c, rs, g_ctx_ptr);
-        emit_import_or_stub(c, import_idx);
+        c.b.op_local_set(LOCAL_TMP_C);
+        emit_mmio_mirror_store_else_or_import(c, import_idx);
         bemental::perf_runtime::inc(bemental::PERF_SLOT_FASTMEM_SLOW);
     } else {
         // See emit_load_x — two-condition range check excludes MMIO.
@@ -3283,10 +3399,12 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
                 c.b.op_i32_store8(0);
             }
         emit_b11_op_else(c);
-            // Slow: ppc_write*(ea, val).
-            c.b.op_local_get(LOCAL_TMP_A);
+            // Slow: not in MEM1. Item 6 Stage 2: route through MMIO mirror
+            // helper. DIRECT_RW / READ_SE cells store to the SAB mirror;
+            // others fall through to ppc_write*(ea, val).
             emit_gpr_get_impl(c, rs, g_ctx_ptr);
-            emit_import_or_stub(c, import_idx);
+            c.b.op_local_set(LOCAL_TMP_C);
+            emit_mmio_mirror_store_else_or_import(c, import_idx);
         emit_b11_op_end(c);
     }
 
@@ -3895,7 +4013,8 @@ static void emit_body_into(WasmModuleBuilder& b,
                            const void* lookup_user,
                            bool emit_hle_check_prologue,
                            bool emit_perf_stub = false,
-                           const MergedModeArgs& merged = {}) {
+                           const MergedModeArgs& merged = {},
+                           bool emit_hle_check_native = false) {
     g_ctx_ptr = ctx_ptr_const;
     // Per-block DFA: walk the block's instructions, track which GPRs are
     // "trusted" as MEM1 pointers. Trusted baselines: r1 (stack), r2 (TOC),
@@ -3974,6 +4093,7 @@ static void emit_body_into(WasmModuleBuilder& b,
     ctx.lookup_local_idx       = lookup_fn;
     ctx.lookup_user            = lookup_user;
     ctx.emit_perf_stub         = emit_perf_stub;
+    ctx.emit_hle_check_native  = emit_hle_check_native;
     ctx.merged_mode            = merged.merged;
     ctx.br_to_loop_depth       = merged.br_to_loop_depth;
     ctx.entry_sel_global_idx   = merged.entry_sel_global_idx;
@@ -3996,7 +4116,81 @@ static void emit_body_into(WasmModuleBuilder& b,
     // Skipped when caller has pre-verified that no HLE hook matches
     // start_pc — saves one JS round-trip per block dispatch on the
     // ~95% of PCs that aren't HLE-patched.
-    if (emit_hle_check_prologue) {
+    //
+    // Three modes:
+    //   (a) emit_hle_check_native=true  — wasm-native SAB hash-table
+    //       lookup; on hit, call WIMPORT_HLE_FIRE (mailbox cmd 14 ->
+    //       HLE::ExecuteFromJIT) and return its next-pc. On miss,
+    //       fall through. ZERO JS round-trips on the ~95% miss path.
+    //       Item 5 (this file).
+    //   (b) emit_perf_stub=true (and !native) — drop+const-0 stub.
+    //       Used for perf measurement runs where HLE bypass is OK.
+    //   (c) default — env.ppc_hle_check import call. Dolphin's path.
+    if (emit_hle_check_prologue && emit_hle_check_native) {
+        // ---- Item 5 wasm-native HLE check, const-PC prologue ----
+        // SAB layout mirrors gamecube/ppc-worker/sab_layout.h. Probe
+        // HLE_TABLE_PROBE (=4) consecutive buckets inline; on any hit,
+        // call WIMPORT_HLE_FIRE(pc, packed) and return its next_pc.
+        // On total miss (no slot.pc == start_pc), fall through into
+        // the block body normally.
+        //
+        // Constants must stay in lockstep with sab_layout.h and
+        // HLE::ExportSnapshot. Documented in item5_hle_static_link_design.md.
+        constexpr u32 HLE_TABLE_ADDR   = 0x02690000u;
+        constexpr u32 HLE_TABLE_SLOTS  = 1024u;
+        constexpr u32 HLE_TABLE_PROBE  = 4u;
+        constexpr u32 HLE_HASH_MUL     = 0x9E3779B1u;
+        const u32 mask = HLE_TABLE_SLOTS - 1u;
+        const u32 bucket0 = ((start_pc >> 2) * HLE_HASH_MUL) & mask;
+        // For each probe, emit:
+        //   i32.const (HLE_TABLE_ADDR + bucket_i * 8)
+        //   i32.load offset=0                  ;; slot[bucket_i].pc
+        //   i32.const start_pc
+        //   i32.eq
+        //   if (i32 result):
+        //       i32.const start_pc
+        //       i32.load offset=(HLE_TABLE_ADDR + bucket_i * 8 + 4)  ;; idx_and_type
+        //         ; absolute offset already encodes the slot — emitter uses
+        //         ;   i32.const 0  + i32.load offset=slot_idx_byte
+        //       call WIMPORT_HLE_FIRE
+        //       return
+        //   end
+        // After all probes fall through, normal block body emits.
+        for (u32 p = 0; p < HLE_TABLE_PROBE; ++p) {
+            const u32 b_idx = (bucket0 + p) & mask;
+            const u32 slot_pc_addr  = HLE_TABLE_ADDR + b_idx * 8u;
+            const u32 slot_idx_addr = slot_pc_addr + 4u;
+            // Load slot.pc (i32.const 0 base + offset encoding the address).
+            b.op_i32_const(0);
+            b.op_i32_load(slot_pc_addr);
+            b.op_i32_const((s32)start_pc);
+            b.op_i32_eq();
+            // if (slot.pc == start_pc): fire + return; else: fall through.
+            // op_if result type = i32 so the result of the if expression
+            // can drive a branch; we use the bare control-flow form
+            // because the hit path takes op_return immediately and the
+            // else arm has no value.
+            emit_b11_op_if(ctx, 0x40 /* void block type */);
+                // pc
+                b.op_i32_const((s32)start_pc);
+                // idx_and_type — i32.load offset=slot_idx_addr against base 0
+                b.op_i32_const(0);
+                b.op_i32_load(slot_idx_addr);
+                // call ppc_hle_fire(pc, idx_and_type) -> i32 (next_pc)
+                b.op_call(WIMPORT_HLE_FIRE);
+                // Write next_pc into ppc_state.pc so the dispatcher resumes
+                // from the right place. Stack: [next_pc].
+                b.op_local_set(LOCAL_TMP_A);
+                b.op_i32_const((s32)ctx_ptr_const);
+                b.op_local_get(LOCAL_TMP_A);
+                b.op_i32_store(ppc_off::PC);
+                // Return next_pc to the dispatcher.
+                b.op_local_get(LOCAL_TMP_A);
+                b.op_return();
+            emit_b11_op_end(ctx);
+        }
+        // All probes missed: fall through to block body.
+    } else if (emit_hle_check_prologue) {
         b.op_i32_const((s32)start_pc);
         b.op_call(WIMPORT_HLE_CHECK);
         emit_local_op_if(ctx, WASM_TYPE_I32);
@@ -4159,7 +4353,8 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
                             u32 mem1_base, u32 mem1_mask, u32 ram_size,
                             const u32* instr_pcs,
                             bool emit_hle_check,
-                            bool emit_perf_stub) {
+                            bool emit_perf_stub,
+                            bool emit_hle_check_native) {
     bemental::perf_runtime::inc(bemental::PERF_SLOT_BLOCK_EMIT);
     WasmModuleBuilder b;
     b.emitHeader();
@@ -4205,6 +4400,8 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     b.emitImportFunc("env", "ppc_break_block", /*type*/2);
     b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);  // (pc) -> i32
     // A5: ppc_read_tb dropped — mftb is direct from spr[].
+    // Item 5: ppc_hle_fire — (pc, idx_and_type) -> i32 — type 3.
+    b.emitImportFunc("env", "ppc_hle_fire",    /*type*/3);
     b.endSection();
 
     // ---- Function section: 1 function of type 0 ----
@@ -4222,7 +4419,8 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     emit_body_into(b, start_pc, insts, count, ctx_ptr_const,
                    mem1_base, mem1_mask, ram_size, instr_pcs,
                    /*lookup_fn=*/nullptr, /*lookup_user=*/nullptr,
-                   emit_hle_check, emit_perf_stub);
+                   emit_hle_check, emit_perf_stub,
+                   /*merged=*/{}, emit_hle_check_native);
     b.endFuncBody();
     b.endSection();
 
@@ -4244,13 +4442,14 @@ std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
                                 LocalIdxLookupFn lookup_fn,
                                 const void* lookup_user,
                                 bool emit_hle_check,
-                                bool emit_perf_stub) {
+                                bool emit_perf_stub,
+                                bool emit_hle_check_native) {
     WasmModuleBuilder b;
     b.beginFuncBody();
     emit_body_into(b, start_pc, insts, count, ctx_ptr_const,
                    mem1_base, mem1_mask, ram_size, instr_pcs,
                    lookup_fn, lookup_user, emit_hle_check,
-                   emit_perf_stub);
+                   emit_perf_stub, /*merged=*/{}, emit_hle_check_native);
     b.endFuncBody();
     auto bytes = b.getBytes();
     verify_block_can_advance_pc(bytes, start_pc);
@@ -4311,6 +4510,8 @@ std::vector<u8> build_region_module(const u8* concatenated_bodies,
     b.emitImportFunc("env", "ppc_break_block", /*type*/2);
     b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);
     // A5: ppc_read_tb dropped — mftb is direct from spr[].
+    // Item 5: ppc_hle_fire — (pc, idx_and_type) -> i32 — type 3.
+    b.emitImportFunc("env", "ppc_hle_fire",    /*type*/3);
     b.endSection();
 
     // ---- Function section: N entries, all type 0 ((), i32) ----
@@ -4430,6 +4631,8 @@ std::vector<u8> build_region_function(const BlockInputs* blocks,
     b.emitImportFunc("env", "ppc_break_block", /*type*/2);
     b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);
     // A5: ppc_read_tb dropped — mftb is direct from spr[].
+    // Item 5: ppc_hle_fire — (pc, idx_and_type) -> i32 — type 3.
+    b.emitImportFunc("env", "ppc_hle_fire",    /*type*/3);
     b.endSection();
 
     // ---- Function section: 1 region function of type 0 ----
@@ -4499,7 +4702,8 @@ std::vector<u8> build_region_function(const BlockInputs* blocks,
                        &region_fn_lookup, &ctx,
                        bi.emit_hle_check,
                        bi.emit_perf_stub,
-                       m);
+                       m,
+                       bi.emit_hle_check_native);
         // emit_body_into ends with: `i32.load PC` `return`. That `return`
         // exits the whole region function, leaving the loop semantics
         // intact for sibling blocks. After the trailing return, control

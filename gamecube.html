@@ -255,6 +255,50 @@
     // prerequisite for the native-speed cutover.
     new Uint32Array(sharedMemory.buffer)[0x02400000 >> 2] = 0xCAFE1234;
 
+    // [dsp-sentinel] periodic dump of DSP HLE chain sentinels (A/B/C/D +
+    // last DSPCR write + last temp.DSPReset). Throwaway diagnostic.
+    try {
+      var _dspSentBuf = new Uint32Array(sharedMemory.buffer);
+      window._dspSentPoll = setInterval(function () {
+        var A = _dspSentBuf[0x026B0000 >> 2] >>> 0;
+        var B = _dspSentBuf[0x026B0010 >> 2] >>> 0;
+        var C = _dspSentBuf[0x026B0020 >> 2] >>> 0;
+        var D = _dspSentBuf[0x026B0030 >> 2] >>> 0;
+        var lastVal = _dspSentBuf[0x026B0040 >> 2] >>> 0;
+        var lastReset = _dspSentBuf[0x026B0050 >> 2] >>> 0;
+        var W = _dspSentBuf[0x026B0060 >> 2] >>> 0;
+        var Waddr = _dspSentBuf[0x026B0064 >> 2] >>> 0;
+        var Wval  = _dspSentBuf[0x026B0068 >> 2] >>> 0;
+        var Wmmio = _dspSentBuf[0x026B006C >> 2] >>> 0;
+        console.log('[dsp-sentinel] A=' + A + ' B=' + B + ' C=' + C + ' D=' + D
+          + ' lastDSPCR=0x' + lastVal.toString(16)
+          + ' lastTempDSPReset=' + lastReset
+          + ' W=' + W + ' Wmmio=' + Wmmio
+          + ' Wlast=0x' + Waddr.toString(16) + '=0x' + Wval.toString(16));
+        // Phase IV gate diagnostic counters (written by run_iter_batch in
+        // EmscriptenWorker.cpp; read here via SAB at fixed offsets).
+        var rb_total   = _dspSentBuf[0x025010C0 >> 2] >>> 0;
+        var rb_flag0   = _dspSentBuf[0x025010C4 >> 2] >>> 0;
+        var rb_flag6   = _dspSentBuf[0x025010C8 >> 2] >>> 0;
+        var rb_p4br    = _dspSentBuf[0x025010CC >> 2] >>> 0;
+        var rb_svci    = _dspSentBuf[0x025010D0 >> 2] >>> 0;
+        var rb_retror  = _dspSentBuf[0x025010D4 >> 2] >>> 0;
+        console.log('[phase4-counters] total=' + rb_total
+          + ' flag0=' + rb_flag0 + ' flag6=' + rb_flag6
+          + ' p4br=' + rb_p4br + ' svci=' + rb_svci + ' retror=' + rb_retror);
+        // ppc-worker inner-slice diag (written by ppc_worker.js every 256 iters)
+        var ph4_iters = _dspSentBuf[0x025010E0 >> 2] >>> 0;
+        var ph4_pc    = _dspSentBuf[0x025010E4 >> 2] >>> 0;
+        var ph4_dc    = (new Int32Array(sharedMemory.buffer))[0x025010E8 >> 2];
+        var ph4_exc   = _dspSentBuf[0x025010EC >> 2] >>> 0;
+        var ph4_exit  = _dspSentBuf[0x025010F0 >> 2] >>> 0;
+        console.log('[phase4-slice] iters=' + ph4_iters
+          + ' pc=0x' + ph4_pc.toString(16)
+          + ' dc=' + ph4_dc + ' exc=0x' + ph4_exc.toString(16)
+          + ' exited=' + ph4_exit);
+      }, 2000);
+    } catch (e) { console.error('[dsp-sentinel] init failed: ' + e.message); }
+
     // Phase 2c: spawn the dedicated PowerPC JIT worker, sharing the
     // same memory object.
     try {
@@ -287,8 +331,28 @@
       // ?ppcmerged=1 → use merged-region path (single WASM module per
       // region with V8 cross-block inlining). Default off until verified.
       var ppcMergedEnabled = new URLSearchParams(location.search).has('ppcmerged');
+      // Item-3 perf-methodology: ?ppcperfsynth=1 builds a wide-PC ring of
+      // synthetic PowerPC blocks in dolphin MEM1, then drives ppc-worker
+      // through them with disableIdleSkip=true and a long wall-time cap.
+      // Wide PC fanout + sustained dispatch is the configuration V8's
+      // TurboFan needs to fire speculative call_indirect inlining; the
+      // earlier ?ppcperf=1 path always converged on <=5 unique PCs and
+      // terminated via idle-skip before any tier-up could occur.
+      // Combine with ?ppcmerged=1 to exercise the call_indirect dispatch
+      // (the path where V8 inlining can actually win) instead of the
+      // legacy per-block-instance path.
+      var ppcPerfSynthEnabled = new URLSearchParams(location.search).has('ppcperfsynth');
+      // Real-boot dispatcher: ppc-worker drives PowerPC dispatch from
+      // the moment PC + MEM1 + dolphin runtime are all live. Yield flag
+      // is set sustained; dolphin's Run() returns at every 4096-iter
+      // heartbeat so its pthread can drain the proxied MMIO/HLE call
+      // queue from page-mediated mailbox traffic. Default OFF until
+      // boot-dispatch is validated.
+      var ppcBootDispatchEnabled = new URLSearchParams(location.search).has('ppcbootdispatch');
       window._ppcDispatchEnabled = ppcDispatchEnabled;  // surfaced for onWorkerMsg (outer scope)
       window._ppcPerfEnabled = ppcPerfEnabled;
+      window._ppcPerfSynthEnabled = ppcPerfSynthEnabled;
+      window._ppcBootDispatchEnabled = ppcBootDispatchEnabled;
       ppc_worker.onmessage = function (e) {
         var m = e.data || {};
         if (m.cmd === 'rw-suite-debug') {
@@ -296,6 +360,8 @@
           return;
         }
         // 2f.6: perf-measurement uses ?ppcperf=1 (independent of ?ppctest=1).
+        // ?ppcperfsynth=1 (Item-3) uses the same SAB/MEM1 wiring + dispatch
+        // handlers, just kicks off a synthetic ring instead of the boot.
         // Handle run-continuous responses + generic 'print' diagnostics
         // here so they surface even when the test cascade is disabled.
         if (m.cmd === 'print') {
@@ -303,22 +369,78 @@
           return;
         }
         if (m.cmd === 'run-continuous-ack') {
+          // Boot-dispatcher: re-engage immediately (clear yield → brief
+          // dolphin window → set yield → next slice). The perf-result
+          // branch below is only meaningful for ?ppcperf=1 paths; for
+          // boot-dispatch we want the per-slice trace from _bdReengageOnAck.
+          if (typeof window._bdReengageOnAck === 'function' && window._bdLoopRunning) {
+            window._bdReengageOnAck(m);
+            return;
+          }
           var elapsedMs_pf = performance.now() - (window._perfStartTime || performance.now());
           var iters_pf     = m.iters >>> 0;
           var rate_pf      = elapsedMs_pf > 0 ? (iters_pf * 1000 / elapsedMs_pf) : 0;
+          // Native baseline: 486 MHz / 10 insts per typical real block.
+          // For Item-3 synth-perf the ring's 2-insn-per-block makes the
+          // "% native" headline less meaningful (real blocks are larger),
+          // but it's still a useful trend indicator across measurements.
           var nativeBlocksPerSec = 48.6e6;  // 486 MHz / 10 insts per block
           var nativePctEst = (rate_pf / nativeBlocksPerSec) * 100;
+          var compileCalls_pf = m.compileCalls >>> 0;
+          var pureDispatchIters = (iters_pf > compileCalls_pf) ? (iters_pf - compileCalls_pf) : 0;
+          // Item-3 TurboFan tier-up window detector. V8's speculative
+          // call_indirect inliner needs sustained call-count per target
+          // (on the order of 1K-10K per fn) before TurboFan reoptimizes.
+          // Per-block iter count = pureDispatchIters / nSlots. ≥10K means
+          // every ring block crossed the inliner's per-target threshold;
+          // a sudden rate jump partway through the window is V8 tier-up.
+          var itersPerBlockEst = (window._perfSynthSlots > 0)
+            ? (pureDispatchIters / window._perfSynthSlots) : 0;
+          var tierupHint = itersPerBlockEst >= 10000
+            ? ' [>=10K-iter/block - TurboFan tier-up window REACHED]'
+            : (itersPerBlockEst > 0
+                ? ' [' + itersPerBlockEst.toFixed(0) + ' iters/block - below 10K tier-up window]'
+                : '');
           console.log('[ppc-worker-handshake] perf-result iters=' + iters_pf
-            + ' compileCalls=' + (m.compileCalls >>> 0)
+            + ' compileCalls=' + compileCalls_pf
             + ' totalBytes=' + (m.totalCompileBytes >>> 0)
             + ' elapsed=' + elapsedMs_pf.toFixed(1) + 'ms'
             + ' rate=' + rate_pf.toFixed(0) + ' iters/sec'
             + ' (~' + nativePctEst.toFixed(2) + '% native @ 10 inst/block)'
             + ' exit=' + m.exitReason
-            + ' lastPc=0x' + (m.lastPc >>> 0).toString(16));
+            + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+            + tierupHint);
           // Clear dolphin yield flag — dolphin's next heartbeat resumes.
           Atomics.store(new Int32Array(sharedMemory.buffer), 0x02500000 >> 2, 0);
           console.log('[ppc-worker-handshake] perf-measurement: yield flag cleared, dolphin resuming');
+          return;
+        }
+        if (m.cmd === 'synth-perf-ack') {
+          console.log('[ppc-worker-handshake] synth-perf ring built'
+            + ' nSlots=' + (m.nSlots >>> 0)
+            + ' baseVA=0x' + (m.baseVA >>> 0).toString(16)
+            + ' totalBytes=' + (m.totalBytes >>> 0)
+            + ' sabAddr=0x' + (m.sabAddr >>> 0).toString(16));
+          // Now start the sustained dispatch run with idle-skip disabled.
+          // wallTimeMs of 30000 + safetyCap of 10M is generous enough that
+          // V8's tier-up budget (per-fn call count threshold) fires for
+          // every block in the ring.
+          window._perfStartTime = performance.now();
+          window._perfSynthSlots = (m.nSlots >>> 0);
+          window.ppc_worker.postMessage({
+            cmd: 'run-continuous',
+            startPc: m.baseVA >>> 0,
+            compileOnMiss: true,
+            safetyCap: 10000000,
+            ignoreDowncount: true,
+            disableIdleSkip: true,
+            wallTimeMs: 30000,
+            mergedRegion: ppcMergedEnabled,
+          });
+          return;
+        }
+        if (m.cmd === 'synth-perf-nack') {
+          console.error('[ppc-worker-handshake] synth-perf FAIL: ' + m.reason);
           return;
         }
         if (m.cmd === 'run-continuous-nack') {
@@ -344,12 +466,21 @@
           // emit reads/writes against this offset (ctx_ptr_const in
           // build_block). The verification step below confirms a
           // dispatched wasm block can mutate state at this offset.
-          ppc_worker.postMessage({ cmd: 'init', ppcStateAddr: 0x02400000, mem1Addr: 0, mem1Size: 0, mailboxAddr: 0x02000000 });
-        } else if (!ppcTestEnabled && !ppcPerfEnabled) {
+          // perfStub default OFF for real boot; flipped ON only by the
+          // perf-measurement paths (?ppcperf=1 / ?ppcperfsynth=1).
+          // hleNative stays OFF at init — flipped ON later once dolphin
+          // confirms the HLE snapshot has populated the SAB hash table.
+          var _initPerfStub  = ppcPerfEnabled || ppcPerfSynthEnabled;
+          var _initHleNative = false;
+          ppc_worker.postMessage({ cmd: 'init',
+            ppcStateAddr: 0x02400000, mem1Addr: 0, mem1Size: 0, mailboxAddr: 0x02000000,
+            perfStub: _initPerfStub, hleNative: _initHleNative });
+        } else if (!ppcTestEnabled && !ppcPerfEnabled && !ppcPerfSynthEnabled && !ppcBootDispatchEnabled) {
           // Skip the rest of the cascade in normal probe runs.
-          // ?ppcperf=1 needs the cascade because the mailbox consumer
-          // (set up in 'mailbox-demo-ack' branch) is what services
-          // ppc-worker's cmd-13 CompileBlock requests.
+          // ?ppcperf=1 and ?ppcperfsynth=1 need the cascade because the
+          // mailbox consumer (set up in 'mailbox-demo-ack' branch) is
+          // what services ppc-worker's cmd-13 CompileBlock requests AND
+          // bemental_imports.env bindings.
           return;
         } else if (m.cmd === 'init-ack') {
           // Test dispatch round-trip with a known PC. Stub returns input
@@ -668,7 +799,7 @@
           // in 4f-3) can resolve their env imports.
           ppc_worker.postMessage({ cmd: 'setup-bemental-env' });
         } else if (m.cmd === 'setup-bemental-env-ack') {
-          var expected = ['memory','ppc_break_block','ppc_check_exc','ppc_hle_check','ppc_interp','ppc_read16','ppc_read32','ppc_read8','ppc_read_tb','ppc_write16','ppc_write32','ppc_write8'].sort();
+          var expected = ['memory','ppc_break_block','ppc_check_exc','ppc_hle_check','ppc_hle_fire','ppc_interp','ppc_read16','ppc_read32','ppc_read8','ppc_read_tb','ppc_write16','ppc_write32','ppc_write8'].sort();
           var got = (m.keys || []).slice().sort();
           var ok = JSON.stringify(got) === JSON.stringify(expected);
           console.log('[ppc-worker-handshake] bemental-env keys count=' + m.count + ' ' + (ok?'PASS':'FAIL'));
@@ -965,6 +1096,32 @@
     // has been constructed (placement-new at SAB[0x02400000] zeros
     // the page sentinel) AND the boot has reached real game code.
     // Polling at 250ms cadence; gives up after 60s.
+    if (ppcPerfSynthEnabled) {
+      // Item-3: synthetic-ring perf-measurement. Gate only on MEM1 being
+      // wired (don't need a valid game PC — we make our own). Once wired,
+      // ask ppc-worker to splat a 256-slot ring at guest VA 0x80700000
+      // (well above OS structures and below libogc heap top). The ring's
+      // PC fanout + disabled idle-skip + 30s wall cap gives V8 sustained
+      // dispatch volume to fire TurboFan tier-up on every block in the
+      // ring.
+      var _perfSynthWait = performance.now();
+      var _perfSynthPoll = setInterval(function () {
+        var elapsed = performance.now() - _perfSynthWait;
+        if (window._ppcMem1Wired) {
+          clearInterval(_perfSynthPoll);
+          console.log('[ppc-worker-handshake] perf-synth: MEM1 wired (waited='
+            + elapsed.toFixed(0) + 'ms), building synthetic ring');
+          window.ppc_worker.postMessage({
+            cmd: 'synth-perf',
+            baseVA: 0x80700000,
+            nSlots: 256,
+          });
+        } else if (elapsed > 60000) {
+          clearInterval(_perfSynthPoll);
+          console.log('[ppc-worker-handshake] perf-synth: timed out waiting for MEM1 wire');
+        }
+      }, 250);
+    }
     if (ppcPerfEnabled) {
       var _perfWaitStart = performance.now();
       var _perfPoll = setInterval(function () {
@@ -1005,6 +1162,116 @@
         } else if (elapsed > 60000) {
           clearInterval(_perfPoll);
           console.log('[ppc-worker-handshake] perf-measurement: timed out waiting for valid PC, last=0x' + pc.toString(16));
+        }
+      }, 250);
+    }
+    // Real-boot dispatcher (?ppcbootdispatch=1). Once dolphin has booted
+    // far enough that PC is valid, MEM1 is wired, AND the page-mediated
+    // MMIO routing is live, set the yield flag and start ppc-worker's
+    // run-continuous loop. Dolphin's Run() returns at every 4096-iter
+    // heartbeat boundary so its pthread can drain the proxied MMIO/HLE
+    // calls that ppc-worker dispatches via the mailbox (cmd 6 → page
+    // setInterval → dolphin_worker postMessage → _dolphin_write16).
+    //
+    // When run-continuous returns for any reason (exception, downcount,
+    // idle-skip, unmapped), the page briefly clears the yield flag so
+    // dolphin can vector exceptions / advance scheduler / fast-forward
+    // idle, then re-engages.
+    if (ppcBootDispatchEnabled) {
+      var _bdWaitStart = performance.now();
+      var _bdPoll = setInterval(function () {
+        var u32bd = new Uint32Array(sharedMemory.buffer);
+        var pcBd  = u32bd[0x02400000 >> 2] >>> 0;
+        var pcOk  = (pcBd >= 0x80000000 && pcBd < 0x81800000);
+        var ready = pcOk && !!window._ppcMem1Wired && !!window._ppcDolphinRoutingReady;
+        var elapsed = performance.now() - _bdWaitStart;
+        if (ready) {
+          clearInterval(_bdPoll);
+          console.log('[ppc-worker-handshake] boot-dispatch: gate open'
+            + ' (waited=' + elapsed.toFixed(0) + 'ms)'
+            + ' PC=0x' + pcBd.toString(16));
+          // Item 7 Phase IV: enable cadence-handoff so dolphin reads
+          // canonical global_timer from SAB and run_iter_batch routes
+          // through dolphin_service_iter (no PPC dispatch — ppc-worker
+          // owns it). Keep Phase V (DEC dedupe) on too. Bits match
+          // gamecube/ppc-worker/sab_layout.h:386. Set BEFORE the first
+          // run-continuous slice so dolphin's bootLoop adopts the new
+          // route immediately. Routed through dolphin_worker postMessage
+          // because Module-side _dolphin_ct_set_phase_flags lives in the
+          // worker thread.
+          if (dolphin_worker) {
+            // Write CT_PHASE_FLAGS directly into SAB — same memory both
+            // workers see. CT_QUEUE_ADDR=0x02680000, CT_OFF_PHASE_FLAGS=0x2C,
+            // PHASE4=0x2, PHASE5=0x4. Use Atomics.store for release-order
+            // semantics so dolphin's __atomic_load_n(ACQUIRE) sees the write.
+            Atomics.store(new Int32Array(sharedMemory.buffer), (0x02680000 + 0x2C) >> 2, 0x6);
+            // Also send postMessage as a backup in case dolphin caches a
+            // copy of the flags somewhere (it shouldn't — flag is read
+            // directly via dolphin_ct_get_phase_flags from SAB).
+            dolphin_worker.postMessage({ cmd: 'ct-phase-set', flags: 0x6 });
+            console.log('[ppc-worker-handshake] CT_PHASE4|PHASE5 set in SAB + postMessage sent');
+          }
+          // Confirm boot-mode flags on ppc-worker. perfStub=false ensures
+          // dispatched blocks call real env.ppc_* imports through the
+          // mailbox path. hleNative stays false; the SAB hash table is
+          // populated by dolphin but we don't have a "snapshot-published"
+          // signal yet — the JS-side env.ppc_hle_check mailbox path is
+          // already live so HLE works either way.
+          window.ppc_worker.postMessage({ cmd: 'set-mode',
+            perfStub: false, hleNative: false });
+          window._bdDispatching = false;
+          window._bdLoopRunning = true;
+          window._bdLoopStart   = performance.now();
+          var i32bd = new Int32Array(sharedMemory.buffer);
+          var startBootDispatchSlice = function () {
+            if (!window._bdLoopRunning) return;
+            // Set yield flag so dolphin's Run() returns at next heartbeat.
+            Atomics.store(i32bd, 0x02500000 >> 2, 1);
+            window._bdDispatching = true;
+            window._bdSliceStart  = performance.now();
+            // safetyCap large; wallTimeMs caps each slice so we yield
+            // back to dolphin every ~250ms even on smooth runs. Boot
+            // mode: real imports, real downcount, real idle-skip.
+            window.ppc_worker.postMessage({
+              cmd: 'run-continuous',
+              compileOnMiss: true,
+              safetyCap: 500000,
+              ignoreDowncount: false,
+              disableIdleSkip: false,
+              wallTimeMs: 250,
+              mergedRegion: ppcMergedEnabled,
+            });
+          };
+          // Hook run-continuous-ack so we re-engage. The existing
+          // onmessage handler logs the perf-result line; we add a
+          // second listener via window-scoped flag so we can extend
+          // its behaviour without rewriting that branch.
+          window._bdReengageOnAck = function (m) {
+            if (!window._bdLoopRunning) return;
+            var sliceMs = performance.now() - (window._bdSliceStart || performance.now());
+            console.log('[ppc-worker-handshake] boot-dispatch slice'
+              + ' iters=' + (m.iters >>> 0)
+              + ' compileCalls=' + (m.compileCalls >>> 0)
+              + ' exit=' + m.exitReason
+              + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+              + ' sliceMs=' + sliceMs.toFixed(1));
+            // Clear yield flag and give dolphin a brief window to vector
+            // exceptions / advance scheduler. setTimeout 0 yields the
+            // event loop; the page's mbx consumer (4 ms interval) keeps
+            // running. 30 ms is enough for dolphin's bootLoop to step
+            // through 1-2 batches.
+            Atomics.store(i32bd, 0x02500000 >> 2, 0);
+            window._bdDispatching = false;
+            setTimeout(startBootDispatchSlice, 30);
+          };
+          // Initial kick.
+          startBootDispatchSlice();
+        } else if (elapsed > 60000) {
+          clearInterval(_bdPoll);
+          console.log('[ppc-worker-handshake] boot-dispatch: timed out'
+            + ' PC=0x' + pcBd.toString(16)
+            + ' mem1Wired=' + !!window._ppcMem1Wired
+            + ' routingReady=' + !!window._ppcDolphinRoutingReady);
         }
       }, 250);
     }

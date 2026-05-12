@@ -44,7 +44,8 @@ enum WasmImportFunc : u32 {
     // PowerPCState (snapshotted at the dolphin yield boundary).
     // env.ppc_read_tb stays in the JS shim as harmless dead code
     // until the next ppc_worker.js cleanup.
-    WIMPORT_COUNT       = 10
+    WIMPORT_HLE_FIRE    = 10,  // (pc, idx_and_type) -> i32 — Item 5: ppc-worker wasm-native HLE hit path
+    WIMPORT_COUNT       = 11
 
 };
 
@@ -55,16 +56,22 @@ enum WasmImportFunc : u32 {
 // ---------------------------------------------------------------------------
 constexpr u32 LOCAL_TMP_A = 0;
 constexpr u32 LOCAL_TMP_B = 1;
-constexpr u32 LOCAL_TMP_COUNT = 2;
+// Item 6 Stage 2 — third i32 scratch reserved for the
+// emit_mmio_mirror_store_else_or_import helper: TMP_A is EA, TMP_B is
+// rel, TMP_C is the value passing through the if/else block (the
+// helper's two arms BOTH need the value, so it can't ride the stack).
+// Unused by any other emitter so V8 elides it.
+constexpr u32 LOCAL_TMP_C = 2;
+constexpr u32 LOCAL_TMP_COUNT = 3;
 // Single f64 scratch local for FP arith store-fill (used by op59/op63
 // emitters). Index = LOCAL_TMP_COUNT since locals are appended after the
 // i32 group declared in emit_body_into's emitLocals call.
-constexpr u32 LOCAL_TMP_F = 2;
+constexpr u32 LOCAL_TMP_F = 3;
 // B11 — per-block GPR cache. 32 i32 locals, one per PowerPC GPR, declared
 // AFTER the f64 local so LOCAL_TMP_F's index is unaffected. Indices
 // GPR_LOCAL_BASE..GPR_LOCAL_BASE+31. Allocated whether or not
 // EmitCtx::use_gpr_locals is set; V8 elides unused locals.
-constexpr u32 GPR_LOCAL_BASE = 3u;
+constexpr u32 GPR_LOCAL_BASE = 4u;
 inline constexpr u32 gpr_local_idx(u32 i) { return GPR_LOCAL_BASE + i; }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +283,17 @@ struct EmitCtx {
     // path under ?ppcperf=1 where ppc-worker runs concurrent with dolphin
     // (which owns canonical state via ignoreDowncount: true).
     bool emit_perf_stub = false;
+
+    // Item 5: wasm-native HLE check. When true, prologue (and any
+    // block-body) HLE checks emit a SAB-resident hash-table lookup
+    // (i32.const + i32.load + i32.eq + branch) instead of the
+    // env.ppc_hle_check import call OR perf-stub drop+const-0. The hit
+    // path fires WIMPORT_HLE_FIRE which routes to dolphin's
+    // HLE::ExecuteFromJIT via mailbox cmd 14. Correctness-preserving:
+    // matches HLE::GetHookByAddress semantics modulo the assumption
+    // that dolphin's HLE table snapshot is in-sync (HLE::ExportSnapshot
+    // is called after PatchFunctions).
+    bool emit_hle_check_native = false;
 };
 
 // Forward-declared core emit functions live in gekko_emit.cpp.
@@ -324,7 +342,8 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
                             u32 ram_size = 0,
                             const u32* instr_pcs = nullptr,
                             bool emit_hle_check = true,
-                            bool emit_perf_stub = false);
+                            bool emit_perf_stub = false,
+                            bool emit_hle_check_native = false);
 
 // ---------------------------------------------------------------------------
 // Body-only counterpart to build_block. Emits a single function entry
@@ -356,7 +375,8 @@ std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
                                 LocalIdxLookupFn lookup_fn = nullptr,
                                 const void* lookup_user = nullptr,
                                 bool emit_hle_check = true,
-                                bool emit_perf_stub = false);
+                                bool emit_perf_stub = false,
+                                bool emit_hle_check_native = false);
 
 // ---------------------------------------------------------------------------
 // Multi-module region build. Wraps N concatenated function bodies into a
@@ -412,6 +432,13 @@ struct BlockInputs {
     const u32* instr_pcs;
     bool emit_hle_check;
     bool emit_perf_stub = false;
+    // Item 5: when true, the block's prologue HLE check is emitted as
+    // wasm-native (SAB-resident hash-table lookup + conditional bail to
+    // ppc_hle_fire) instead of either an env.ppc_hle_check import call
+    // OR the perf-stub drop+const-0. The native path costs ~6 wasm ops
+    // on the miss path and one i32-const + load + eq + br_if on the
+    // hit path. Only meaningful when emit_hle_check is also true.
+    bool emit_hle_check_native = false;
 };
 std::vector<u8> build_region_function(const BlockInputs* blocks,
                                       u32 n_blocks,

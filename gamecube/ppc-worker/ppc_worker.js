@@ -23,6 +23,70 @@
   let sharedMemoryRef = null;  // the WebAssembly.Memory we received via mem-init
   let mailboxBase = 0;         // remembered from 'init' so the run loop can
                                // peek reply_extra1/2 after a CompileBlock
+  let mem1Base    = 0;         // SAB linear-memory addr of dolphin MEM1 (set
+                               // by 'update-mem'). Required by 'synth-perf'
+                               // to splat a ring of pre-emitted PowerPC
+                               // instructions into the guest RAM mirror.
+  let mem1Size    = 0;
+
+  // Item 6 Stage 2 — feature flag. When true, env.ppc_write{8,16,32}
+  // enqueue into the pending-writes SPSC ring at SAB[0x02670000] for
+  // ComplexWrite (WRITE_SE / READ_WRITE_SE) cells instead of doing a
+  // synchronous postMessage round-trip. dolphin drains the ring at its
+  // JitWasm yield boundary (CoreTiming-equivalent cadence). Default
+  // OFF so the initial Stage 2 ship keeps mailbox semantics for
+  // Complex writes — design doc §4 W1 fallback. Flip ON after
+  // measurement confirms no boot regression.
+  const PWR_BASE_ADDR     = 0x02670000;
+  const PWR_CAPACITY      = 4096;
+  const PWR_RECORDS_OFF   = 0x100;
+  const PWR_OFF_HEAD      = 0x08;
+  const PWR_OFF_ENQ_COUNT = 0x14;
+  const PWR_OFF_DROP_COUNT= 0x18;
+  let useWriteRing = true;  // Item 6 W2 default-on under Phase IV
+
+  function installWriteEnv(env, call2) {
+    if (!useWriteRing) {
+      env.ppc_write8  = (addr, val) => call2(5, addr, val);
+      env.ppc_write16 = (addr, val) => call2(6, addr, val);
+      env.ppc_write32 = (addr, val) => call2(7, addr, val);
+      return;
+    }
+    // W2 mode: enqueue into the pending-writes ring. SPSC discipline —
+    // ppc-worker is the sole producer (head++); dolphin drains (tail++).
+    // No Atomics.wait; this is fire-and-forget. Slot is reused once
+    // dolphin's tail advances, so overflow drops the write and bumps
+    // the diag drop counter (caller falls back to mailbox).
+    const sab = sharedMemoryRef && sharedMemoryRef.buffer;
+    if (!sab) {
+      // Cannot install ring path without SAB; fall back to mailbox.
+      env.ppc_write8  = (addr, val) => call2(5, addr, val);
+      env.ppc_write16 = (addr, val) => call2(6, addr, val);
+      env.ppc_write32 = (addr, val) => call2(7, addr, val);
+      return;
+    }
+    const hdr32  = new Int32Array(sab, PWR_BASE_ADDR, PWR_RECORDS_OFF >> 2);
+    const recU32 = new Uint32Array(sab, PWR_BASE_ADDR + PWR_RECORDS_OFF,
+                                   PWR_CAPACITY * 4);
+    const recU8  = new Uint8Array(sab, PWR_BASE_ADDR + PWR_RECORDS_OFF,
+                                  PWR_CAPACITY * 16);
+    const enqueue = (cmd, sizeBits, addr, val) => {
+      // head atomically bumped; SPSC so no CAS needed.
+      const head = Atomics.add(hdr32, PWR_OFF_HEAD >> 2, 1) >>> 0;
+      const slot = (head % PWR_CAPACITY) >>> 0;
+      const recBase = slot * 16;
+      recU8[recBase + 0] = cmd & 0xFF;
+      recU8[recBase + 1] = sizeBits & 0xFF;
+      // _pad u16 at recBase+2 stays 0.
+      recU32[(recBase >> 2) + 1] = addr >>> 0;
+      recU32[(recBase >> 2) + 2] = val >>> 0;
+      recU32[(recBase >> 2) + 3] = head >>> 0;
+      Atomics.add(hdr32, PWR_OFF_ENQ_COUNT >> 2, 1);
+    };
+    env.ppc_write8  = (addr, val) => enqueue(5,  8,  addr, val);
+    env.ppc_write16 = (addr, val) => enqueue(6, 16,  addr, val);
+    env.ppc_write32 = (addr, val) => enqueue(7, 32,  addr, val);
+  }
 
   importScripts('./ppc_worker_emcc.js?v=' + Date.now());
 
@@ -66,6 +130,26 @@
         const mailboxAddr  = (data.mailboxAddr  | 0) >>> 0;
         mod._ppc_worker_init(ppcStateAddr, mem1Addr, mem1Size, mailboxAddr);
         mailboxBase = mailboxAddr;
+        // Boot-dispatcher mode wiring. By default ppc-worker is the
+        // real-boot dispatcher: dispatched blocks call real env.ppc_*
+        // (no Option D stubs), and HLE checks go through the JS-side
+        // mailbox path until the page flips native-HLE on via
+        // `set-mode` (after dolphin's snapshot publishes the table).
+        // Perf-measurement paths (?ppcperf=1 / ?ppcperfsynth=1) flip
+        // perfStub=true via the same set-mode message before starting
+        // run-continuous.
+        if (typeof mod._ppc_worker_set_perf_stub === 'function') {
+          const perfStub = !!data.perfStub;
+          const hleNative = !!data.hleNative;
+          mod._ppc_worker_set_perf_stub(perfStub ? 1 : 0);
+          mod._ppc_worker_set_hle_check_native(hleNative ? 1 : 0);
+        }
+        // Item 7 Phase II — initialize the SAB CT queue once on init.
+        // Safe to call twice (dolphin also calls dolphin_ct_queue_init
+        // from SystemTimers::Init); idempotent zero + magic publish.
+        if (typeof mod._ppc_worker_ct_queue_init === 'function') {
+          mod._ppc_worker_ct_queue_init();
+        }
         inited = true;
         // 2f.6: auto-bootstrap mod.bemental_imports.env (host imports
         // for JIT-emitted blocks) and mod.bemental_regions (region
@@ -80,16 +164,44 @@
         env.ppc_read8       = (addr) => call1(2, addr);
         env.ppc_read16      = (addr) => call1(3, addr);
         env.ppc_read32      = (addr) => call1(4, addr);
-        env.ppc_write8      = (addr, val) => call2(5, addr, val);
-        env.ppc_write16     = (addr, val) => call2(6, addr, val);
-        env.ppc_write32     = (addr, val) => call2(7, addr, val);
+        // Item 6 Stage 2 — writes go either via mailbox (W1, default) or
+        // SAB pending-writes ring (W2, gated by `useWriteRing`).
+        installWriteEnv(env, call2);
         env.ppc_hle_check   = (pc) => call1(8, pc);
         env.ppc_interp      = (inst, pc) => call2(9, inst, pc);
         env.ppc_check_exc   = (pc) => call1(10, pc);
         env.ppc_break_block = (pc, x) => call2(11, pc, x);
         env.ppc_read_tb     = (which) => call1(12, which);
+        // Item 5 — env.ppc_hle_fire wired via mailbox cmd 14 (HleFire).
+        // Routes to dolphin_hle_fire(pc, idx_and_type) -> next_pc. Counted
+        // via mod._ppc_hle_fire_hits for the Phase 5 perf assertion.
+        if (!mod._ppc_hle_fire_hits) mod._ppc_hle_fire_hits = 0;
+        env.ppc_hle_fire    = (pc, it) => {
+            mod._ppc_hle_fire_hits = (mod._ppc_hle_fire_hits | 0) + 1;
+            return mod._ppc_worker_mailbox_call_sync2(14, pc >>> 0, it >>> 0) >>> 0;
+        };
         if (!mod.bemental_regions) mod.bemental_regions = {};
         postMessage({ cmd: 'init-ack' });
+        break;
+      }
+      case 'set-mode': {
+        // Page flips perf-stub / native-HLE flags post-init. Used by the
+        // boot-dispatcher cascade (set perfStub=false / hleNative=true
+        // once dolphin signals "snapshot published") and perf-measurement
+        // entry (set perfStub=true).
+        if (!mod || typeof mod._ppc_worker_set_perf_stub !== 'function') {
+          postMessage({ cmd: 'set-mode-nack', reason: 'setters not available' });
+          return;
+        }
+        if (typeof data.perfStub === 'boolean') {
+          mod._ppc_worker_set_perf_stub(data.perfStub ? 1 : 0);
+        }
+        if (typeof data.hleNative === 'boolean') {
+          mod._ppc_worker_set_hle_check_native(data.hleNative ? 1 : 0);
+        }
+        postMessage({ cmd: 'set-mode-ack',
+          perfStub: mod._ppc_worker_get_perf_stub() >>> 0,
+          hleNative: mod._ppc_worker_get_hle_check_native() >>> 0 });
         break;
       }
       case 'update-mem': {
@@ -105,7 +217,63 @@
         const ppcStateAddr = 0x02400000;
         const mailboxAddr  = mailboxBase || 0x02000000;
         mod._ppc_worker_init(ppcStateAddr, newMem1Addr, newMem1Size, mailboxAddr);
+        mem1Base = newMem1Addr;
+        mem1Size = newMem1Size;
         postMessage({ cmd: 'update-mem-ack', mem1Addr: newMem1Addr, mem1Size: newMem1Size });
+        break;
+      }
+      case 'synth-perf': {
+        // Item-3 perf-methodology: hand-build a ring of N synthetic
+        // PowerPC blocks in MEM1, then start a wide-fanout dispatch
+        // run that survives idle-skip and gives V8 enough sustained
+        // per-block dispatch volume to fire TurboFan tier-up.
+        //
+        // Each ring slot is 2 instructions, 8 bytes apart:
+        //   slot k @ guest VA (baseVA + k*8):
+        //       +0:  ori r0,r0,0                    (PPC nop, 0x60000000)
+        //       +4:  b   (baseVA + ((k+1) % N) * 8) (op18, link-not)
+        // The branch encodes a relative offset = next_slot_va - cur_va.
+        // Block decode in ppc_worker_compile_block terminates after
+        // the op-18 branch (count=2). gekko_emit's emit_bx_impl
+        // resolves the target and returns it as next-pc.
+        //
+        // Caller chooses baseVA in guest virtual space; the page reads
+        // the dolphin MEM1 size and picks a high-end address well above
+        // anything the OS is using during early boot.
+        if (!inited) { postMessage({ cmd: 'synth-perf-nack', reason: 'not initialised' }); return; }
+        if (!sharedMemoryRef) { postMessage({ cmd: 'synth-perf-nack', reason: 'no shared memory' }); return; }
+        if (mem1Base === 0 || mem1Size === 0) { postMessage({ cmd: 'synth-perf-nack', reason: 'mem1 not wired' }); return; }
+        const nSlots = ((data.nSlots | 0) >>> 0) || 256;
+        const baseVA = (data.baseVA | 0) >>> 0;
+        if ((baseVA & 0x3) !== 0) { postMessage({ cmd: 'synth-perf-nack', reason: 'baseVA not 4-aligned' }); return; }
+        const ramMask = (mem1Size - 1) >>> 0;
+        const basePhys = baseVA & ramMask;
+        const sabAddr  = (mem1Base + basePhys) >>> 0;
+        // Pack 2 BE u32s per slot, total nSlots*8 bytes. Need to write
+        // them BE because gekko's compile path byte-swaps on read.
+        const totalBytes = nSlots * 8;
+        const u8 = new Uint8Array(sharedMemoryRef.buffer, sabAddr, totalBytes);
+        const NOP = 0x60000000 >>> 0;  // ori r0,r0,0
+        for (let k = 0; k < nSlots; ++k) {
+          const slotVA   = (baseVA + k * 8) >>> 0;
+          const nextVA   = (baseVA + ((k + 1) % nSlots) * 8) >>> 0;
+          const offset   = (nextVA - (slotVA + 4)) | 0;  // PC-relative from branch instr
+          // op-18 b: 0x48 LI[24] AA LK. LI = offset>>2, masked to 24 bits
+          // sign-extended at execute time. AA=0, LK=0.
+          const liMask   = (offset & 0x03FFFFFC) >>> 0;
+          const branch   = (0x48000000 | liMask) >>> 0;
+          // Write BE: byte 0 = bits [31:24].
+          const o = k * 8;
+          u8[o + 0] = (NOP >>> 24) & 0xff;
+          u8[o + 1] = (NOP >>> 16) & 0xff;
+          u8[o + 2] = (NOP >>>  8) & 0xff;
+          u8[o + 3] = (NOP       ) & 0xff;
+          u8[o + 4] = (branch >>> 24) & 0xff;
+          u8[o + 5] = (branch >>> 16) & 0xff;
+          u8[o + 6] = (branch >>>  8) & 0xff;
+          u8[o + 7] = (branch       ) & 0xff;
+        }
+        postMessage({ cmd: 'synth-perf-ack', baseVA, nSlots, totalBytes, sabAddr });
         break;
       }
       case 'dispatch': {
@@ -225,14 +393,20 @@
         env.ppc_read8       = (addr) => call1(2, addr);
         env.ppc_read16      = (addr) => call1(3, addr);
         env.ppc_read32      = (addr) => call1(4, addr);
-        env.ppc_write8      = (addr, val) => call2(5, addr, val);
-        env.ppc_write16     = (addr, val) => call2(6, addr, val);
-        env.ppc_write32     = (addr, val) => call2(7, addr, val);
+        // Item 6 Stage 2 — writes go either via mailbox (W1, default) or
+        // SAB pending-writes ring (W2, gated by `useWriteRing`).
+        installWriteEnv(env, call2);
         env.ppc_hle_check   = (pc) => call1(8, pc);
         env.ppc_interp      = (inst, pc) => call2(9, inst, pc);
         env.ppc_check_exc   = (pc) => call1(10, pc);
         env.ppc_break_block = (pc, x) => call2(11, pc, x);
         env.ppc_read_tb     = (which) => call1(12, which);
+        // Item 5 — env.ppc_hle_fire wired via mailbox cmd 14 (HleFire).
+        if (!mod._ppc_hle_fire_hits) mod._ppc_hle_fire_hits = 0;
+        env.ppc_hle_fire    = (pc, it) => {
+            mod._ppc_hle_fire_hits = (mod._ppc_hle_fire_hits | 0) + 1;
+            return mod._ppc_worker_mailbox_call_sync2(14, pc >>> 0, it >>> 0) >>> 0;
+        };
         const keys = Object.keys(env).sort();
         postMessage({ cmd: 'setup-bemental-env-ack', keys, count: keys.length });
         break;
@@ -402,6 +576,14 @@
         // honors stop-flag and safetyCap.
         const ignoreDowncount = !!data.ignoreDowncount;
         const wallTimeMs = (data.wallTimeMs | 0) || 0;
+        // Item-3 perf-methodology fix: disable the samePcCount idle-skip
+        // exit so we can keep dispatching past the synthetic boot's
+        // degenerate-loop convergence. Required to let V8 see sustained
+        // per-block dispatch counts (>10K iters/block) and tier up via
+        // TurboFan. ?ppcperfsynth=1 path always sets this; synthetic
+        // ring's wide PC fanout independently keeps lastPc moving so
+        // the flag is belt-and-suspenders for that path.
+        const disableIdleSkip = !!data.disableIdleSkip;
 
         // Phase 3a-fix (Option A): swap env.ppc_* imports to no-op stubs
         // when in perf-measurement mode. Background: every env.ppc_*
@@ -437,6 +619,11 @@
           env.ppc_check_exc   = () => 0;
           env.ppc_break_block = () => {};
           env.ppc_read_tb     = () => 0;
+          // Item 5: in ignoreDowncount perf mode, dolphin owns canonical
+          // state and HLE bypass is acceptable. Stub returns pc unchanged
+          // so the block falls through. Real boot wires this through the
+          // mailbox at the init-ack / setup-bemental-env paths above.
+          env.ppc_hle_fire    = (pc /*, it*/) => pc | 0;
           env._stubbed_for_perf = true;
           postMessage({ cmd: 'print',
             txt: '[ppc-worker] env.ppc_* stubbed for perf-measurement mode '
@@ -481,12 +668,106 @@
         let exitReason = 'safety-cap';
         let lastPc = 0xFFFFFFFF;
         let samePcCount = 0;
+        // Item 7 Phase II — periodically drain DEC (and Phase III hybrid)
+        // events from the SAB shared CT queue. The fire is a no-op if
+        // the queue is empty, so calling every N iters is cheap. N=256
+        // keeps the latency well under one VI half-line on any clock.
+        // Read global timer from SAB header (dolphin publishes via
+        // CoreTiming::Advance hooks). Init guarded by ppc_worker_ct_queue_init
+        // — JS-side caller is responsible for invoking it once before
+        // run-continuous; we tolerate "not ready" by reading 0 timer
+        // and dolphin's publish lighting it up over time.
+        const CT_BASE = 0x02680000;
+        const CT_OFF_GTL = 0x08;
+        const CT_OFF_GTH = 0x0C;
+        const CT_QUEUE_RECORDS_OFF = 0x80;
+        const CT_QUEUE_CAPACITY = 256;
+        const CT_REC_BYTES = 24;
+        const CT_FLAG_VALID = 0x1;
+        const CT_FLAG_REMOVED = 0x8;
+        const CT_FIRE_EVERY = 256;
+        // Item 7 sleep-tick policy. Mirror of dolphin's JitWasm path:
+        // when same-PC ≥ 1024 AND next event distance > 1024 cycles,
+        // advance SAB global_timer directly to next_event-1. PC-agnostic
+        // — works for any unrecognized polling loop. ppc-worker walks
+        // the shared queue itself to find the minimum non-tombstoned
+        // event time. dolphin polls the SAB timer in Advance() under
+        // Phase IV and adopts it.
+        const SLEEP_TICK_THRESHOLD = 1024;
+        let sleepTickCount = 0;
+        const findNextEventCycles = () => {
+          let minLo = 0xFFFFFFFF, minHi = 0xFFFFFFFF, anyValid = false;
+          for (let i = 0; i < CT_QUEUE_CAPACITY; ++i) {
+            const recBase = CT_BASE + CT_QUEUE_RECORDS_OFF + i * CT_REC_BYTES;
+            const flags = u32[(recBase + 16) >> 2] >>> 0;
+            if ((flags & CT_FLAG_VALID) === 0) continue;
+            if ((flags & CT_FLAG_REMOVED) !== 0) continue;
+            const tLo = u32[(recBase + 0) >> 2] >>> 0;
+            const tHi = u32[(recBase + 4) >> 2] >>> 0;
+            if (!anyValid || tHi < minHi || (tHi === minHi && tLo < minLo)) {
+              minLo = tLo; minHi = tHi; anyValid = true;
+            }
+          }
+          return anyValid ? { lo: minLo, hi: minHi } : null;
+        };
+        // Item 7 Phase IV: slice-bound cycles cap. Before entering
+        // dispatch, ask the C side for min(downcount, next_event - now,
+        // PHASE4_MAX_SLICE) in cycles. Track cycles burned across blocks;
+        // exit when sliceCyclesBurned >= cap. commit_slice (well, the
+        // inline advance_global_timer + fire_due_pure equivalent at end
+        // of case) runs at slice exit to atomically advance global_timer
+        // + fire due events. When the C export is missing (older worker
+        // build), cap=0 disables Phase IV slicing and the loop falls back
+        // to pre-Phase-IV exit conditions (downcount/idle-skip/etc.).
+        // Phase IV — under cadence handoff dolphin's CoreTiming::Advance no
+        // longer runs (we routed run_iter_batch to service_iter), so nobody
+        // replenishes downcount. ppc-worker is sole owner — prime it before
+        // the slice so the per-block Atomics.sub has something to burn.
+        // 20000 = MAX_SLICE_LENGTH per CoreTiming.cpp:55.
+        if (typeof mod._ppc_worker_set_downcount === 'function') {
+          mod._ppc_worker_set_downcount(20000);
+        }
+        const sliceCyclesCap = (typeof mod._ppc_worker_slice_budget === 'function')
+            ? (mod._ppc_worker_slice_budget() >>> 0) : 0;
+        let sliceCyclesBurned = 0;
+        // Phase IV diag: SAB counters so page can see slice progress
+        // without waiting for ack messages. 0x025010E0..025010FF reserved.
+        const PH4_DIAG_ITERS  = 0x025010E0;
+        const PH4_DIAG_PC     = 0x025010E4;
+        const PH4_DIAG_DC     = 0x025010E8;
+        const PH4_DIAG_EXC    = 0x025010EC;
+        const PH4_DIAG_EXIT   = 0x025010F0;  // 0=running, 1=exited
+        Atomics.store(i32, PH4_DIAG_EXIT >> 2, 0);
         for (; iters < safetyCap; ++iters) {
+          // Update SAB diag every 256 iters so we can see progress
+          // from the page even if no ack ever fires.
+          if ((iters & 0xFF) === 0) {
+            Atomics.store(i32, PH4_DIAG_ITERS >> 2, iters | 0);
+            Atomics.store(i32, PH4_DIAG_PC >> 2, pc | 0);
+            Atomics.store(i32, PH4_DIAG_DC >> 2,
+              i32[(PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2] | 0);
+            Atomics.store(i32, PH4_DIAG_EXC >> 2,
+              u32[(PPC_STATE_BASE + OFFSET_EXC) >> 2] | 0);
+          }
           // External stop flag (page or dolphin requesting yield).
           if (Atomics.load(i32, STOP_FLAG_ADDR >> 2) !== 0) {
             exitReason = 'stop-flag'; break;
           }
-          // Exception pending? Let dolphin vector the handler.
+          // Phase IV slice cycles budget exhausted — yield to dolphin
+          // service_iter so MMIO mirror drains and hybrid-event cadence
+          // gets applied to CoreTiming.
+          if (sliceCyclesCap > 0 && sliceCyclesBurned >= sliceCyclesCap) {
+            exitReason = 'slice-budget'; break;
+          }
+          if ((iters & (CT_FIRE_EVERY - 1)) === 0) {
+            const gtl = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
+            const gth = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
+            mod._ppc_worker_ct_fire_due_pure(gtl, gth);
+          }
+          // Exception pending? Deliver via dolphin_check_exc (mailbox cmd 10),
+          // then re-read PC from SAB and continue dispatching from the vector.
+          // Under Phase IV, exiting the slice would deadlock — dolphin's
+          // service_iter can't dispatch PPC, so nobody else delivers.
           if (!ignoreDowncount) {
             const exc = u32[(PPC_STATE_BASE + OFFSET_EXC) >> 2] >>> 0;
             if (exc !== 0) {
@@ -495,7 +776,9 @@
               const MSR_EE = 0x8000;
               const externalOnly = (exc & ~EXC_EXTERNAL_INT) === 0;
               if (!externalOnly || (msr & MSR_EE) !== 0) {
-                exitReason = 'exception-pending'; break;
+                call1(10, pc >>> 0);
+                pc = u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] >>> 0;
+                continue;
               }
             }
             const downcount = i32[(PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2];
@@ -524,10 +807,45 @@
               if (!ignoreDowncount) {
                 Atomics.sub(i32, (PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2, 1);
               }
+              sliceCyclesBurned += 1;
               u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] = next;
               // Same-PC idle-skip detector applies to merged path too.
               if (next === lastPc) {
-                if (++samePcCount > 100) { exitReason = 'idle-skip'; break; }
+                ++samePcCount;
+                // Item 7 sleep-tick: aggressively bump SAB global_timer
+                // when same-PC is sustained and next event is far. Runs
+                // BEFORE the 100-iter idle-skip exit so we don't bounce
+                // out into dolphin to drain a slice we could fast-skip.
+                if (samePcCount >= SLEEP_TICK_THRESHOLD) {
+                  const nxt = findNextEventCycles();
+                  if (nxt) {
+                    const gtl0 = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
+                    const gth0 = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
+                    // 64-bit subtract: nxt - cur. Treat as cycles diff;
+                    // only ff if hi-words differ or lo distance > 1024.
+                    const farHi = (nxt.hi >>> 0) > (gth0 >>> 0);
+                    const farLo = (nxt.hi === gth0) && ((nxt.lo - gtl0) >>> 0) > 1024;
+                    if (farHi || farLo) {
+                      // Set SAB global_timer to (next - 1). Phase IV makes
+                      // dolphin's Advance() adopt this value on next call.
+                      let newLo = (nxt.lo - 1) >>> 0;
+                      let newHi = nxt.hi >>> 0;
+                      if (newLo === 0xFFFFFFFF && nxt.lo === 0) newHi = (newHi - 1) >>> 0;
+                      u32[(CT_BASE + CT_OFF_GTL) >> 2] = newLo;
+                      u32[(CT_BASE + CT_OFF_GTH) >> 2] = newHi;
+                      // Fire any due pure-PPC events now.
+                      mod._ppc_worker_ct_fire_due_pure(newLo, newHi);
+                      if (++sleepTickCount <= 4) {
+                        postMessage({ cmd: 'print',
+                          txt: '[ppc-worker] sleep-tick #' + sleepTickCount
+                             + ' pc=0x' + pc.toString(16)
+                             + ' jumpTo=0x' + newHi.toString(16) + newLo.toString(16).padStart(8,'0') });
+                      }
+                      samePcCount = 0;
+                    }
+                  }
+                }
+                if (samePcCount > 100 && !disableIdleSkip) { exitReason = 'idle-skip'; break; }
               } else { samePcCount = 0; lastPc = next; }
               pc = next;
               continue;
@@ -607,7 +925,32 @@
           // fast-forward to the next event.
           if (pc === lastPc) {
             ++samePcCount;
-            if (samePcCount > 100) {
+            // Item 7 sleep-tick (legacy path mirror).
+            if (samePcCount >= SLEEP_TICK_THRESHOLD) {
+              const nxt = findNextEventCycles();
+              if (nxt) {
+                const gtl0 = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
+                const gth0 = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
+                const farHi = (nxt.hi >>> 0) > (gth0 >>> 0);
+                const farLo = (nxt.hi === gth0) && ((nxt.lo - gtl0) >>> 0) > 1024;
+                if (farHi || farLo) {
+                  let newLo = (nxt.lo - 1) >>> 0;
+                  let newHi = nxt.hi >>> 0;
+                  if (newLo === 0xFFFFFFFF && nxt.lo === 0) newHi = (newHi - 1) >>> 0;
+                  u32[(CT_BASE + CT_OFF_GTL) >> 2] = newLo;
+                  u32[(CT_BASE + CT_OFF_GTH) >> 2] = newHi;
+                  mod._ppc_worker_ct_fire_due_pure(newLo, newHi);
+                  if (++sleepTickCount <= 4) {
+                    postMessage({ cmd: 'print',
+                      txt: '[ppc-worker] sleep-tick #' + sleepTickCount
+                         + ' pc=0x' + pc.toString(16)
+                         + ' jumpTo=0x' + newHi.toString(16) + newLo.toString(16).padStart(8,'0') });
+                  }
+                  samePcCount = 0;
+                }
+              }
+            }
+            if (samePcCount > 100 && !disableIdleSkip) {
               exitReason = 'idle-skip'; break;
             }
           } else {
@@ -639,15 +982,35 @@
           if (!ignoreDowncount) {
             Atomics.sub(i32, (PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2, blockCycles);
           }
+          sliceCyclesBurned += blockCycles;
           // Update SAB pc to the new value (block return is canonical
           // per Q2 finding).
           u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] = nextPc;
           pc = nextPc;
         }
+        // Phase IV commit: advance SAB global_timer atomically and fire
+        // any due pure-PPC events. The downcount math above already
+        // subtracted the per-block cycles; commit_slice's own
+        // __atomic_sub_fetch is a second decrement of the EXACT same
+        // total, which is wrong. So instead of having commit_slice
+        // subtract, we pass 0 here and only let it advance the timer
+        // + fire events — keeping the existing per-block Atomics.sub
+        // as canonical. Equivalent to ppc_worker_advance_global_timer +
+        // ppc_worker_ct_fire_due_pure but in one C call.
+        if (sliceCyclesBurned > 0 && typeof mod._ppc_worker_advance_global_timer === 'function') {
+          const gtl0 = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
+          const gth0 = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
+          // 64-bit add gtl0:gth0 + sliceCyclesBurned (sliceCyclesBurned is u32).
+          const sumLo = (gtl0 + (sliceCyclesBurned >>> 0)) >>> 0;
+          const carry = (sumLo < gtl0) ? 1 : 0;
+          const sumHi = (gth0 + carry) >>> 0;
+          mod._ppc_worker_advance_global_timer(sumLo, sumHi);
+          mod._ppc_worker_ct_fire_due_pure(sumLo, sumHi);
+        }
         postMessage({
           cmd: 'run-continuous-ack',
           iters, lastPc: pc, exitReason, compileCalls, totalCompileBytes,
-          samePcCount,
+          samePcCount, sliceCyclesBurned,
         });
         break;
       }

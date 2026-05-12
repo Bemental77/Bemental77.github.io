@@ -15,9 +15,11 @@
 
 #include "bementalJIT/bemental.h"
 #include "bementalJIT/block_cache.h"
+#include "sab_layout.h"
 
 #include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 // gekko_emit.h is in the per-guest tree (not part of the public include/
@@ -30,7 +32,8 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
                             u32 ram_size,
                             const u32* instr_pcs,
                             bool emit_hle_check,
-                            bool emit_perf_stub = false);
+                            bool emit_perf_stub = false,
+                            bool emit_hle_check_native = false);
 // Phase 3a.2 — emit just the function body (no module wrapper). Used by
 // region_accumulate; the wrapper is built later at region_relink time.
 // LocalIdxLookupFn = nullptr means branches that would target other
@@ -46,7 +49,8 @@ std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
                                 LocalIdxLookupFn lookup_fn,
                                 const void* lookup_user,
                                 bool emit_hle_check,
-                                bool emit_perf_stub = false);
+                                bool emit_perf_stub = false,
+                                bool emit_hle_check_native = false);
 }
 
 #ifdef __EMSCRIPTEN__
@@ -81,6 +85,21 @@ static uintptr_t g_mem1_base      = 0;
 static u32       g_mem1_size      = 0;
 static uintptr_t g_mailbox_base   = 0;
 
+// Boot-dispatcher mode controls. Default to "real boot" semantics
+// (perf_stub off, native HLE off until table snapshot signals ready).
+// Page flips these via ppc_worker_set_mode mailbox-equivalent C exports
+// once the relevant infrastructure is live.
+//   g_emit_perf_stub        — true under ?ppcperf=1/?ppcperfsynth=1 (V8
+//                              tier-up measurement path); false for real
+//                              boot so dispatched blocks call real
+//                              env.ppc_* imports through the mailbox.
+//   g_emit_hle_check_native — true once dolphin's HLE snapshot has been
+//                              published to the SAB hash table at
+//                              HLE_TABLE_ADDR. Until then, fall back to
+//                              the JS-side env.ppc_hle_check mailbox.
+static bool g_emit_perf_stub        = false;
+static bool g_emit_hle_check_native = false;
+
 // Phase 3a.1 — link BlockCache into ppc-worker. Instance is private to
 // this worker; dolphin's BlockCache lives in dolphin_worker. They do not
 // share state at the C++ level (only the underlying SAB-mapped emulator
@@ -109,6 +128,26 @@ void ppc_worker_init(u32 ppc_state_addr,
     }, (u32)ppc_state_addr, (u32)mem1_addr, mem1_size, (u32)mailbox_addr);
 #endif
 }
+
+// Boot-dispatcher mode setters. The page calls these post-init to flip
+// ppc-worker between "real boot" (default — real imports, no native HLE)
+// and "perf measurement" (Option D stubs, native HLE inline). Idempotent;
+// safe to call repeatedly. set_hle_check_native is meant for the page to
+// flip ON once dolphin signals "HLE snapshot published" via a postMessage.
+EMSCRIPTEN_KEEPALIVE
+void ppc_worker_set_perf_stub(u32 enable) {
+    g_emit_perf_stub = (enable != 0u);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void ppc_worker_set_hle_check_native(u32 enable) {
+    g_emit_hle_check_native = (enable != 0u);
+}
+
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_get_perf_stub() { return g_emit_perf_stub ? 1u : 0u; }
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_get_hle_check_native() { return g_emit_hle_check_native ? 1u : 0u; }
 
 // dispatch: stub. Phase 2c will wire actual block cache + dispatch.
 // Returns input PC unchanged so any caller treating return-value as
@@ -268,8 +307,13 @@ u32 ppc_worker_compile_block(u32 start_pc) {
         /* mem1_mask       = */ ram_mask,
         /* ram_size        = */ g_mem1_size,
         /* instr_pcs       = */ nullptr,
-        /* emit_hle_check  = */ false,
-        /* emit_perf_stub  = */ true);
+        // Boot-mode default: real imports (perf_stub=false), JS-side HLE
+        // check until dolphin signals the SAB hash table is ready.
+        // ?ppcperf=1/?ppcperfsynth=1 flip g_emit_perf_stub via
+        // ppc_worker_set_perf_stub.
+        /* emit_hle_check         = */ true,
+        /* emit_perf_stub         = */ g_emit_perf_stub,
+        /* emit_hle_check_native  = */ g_emit_hle_check_native);
     g_compile_buf  = std::move(bytes);
     g_compile_cycles = count;
     return static_cast<u32>(g_compile_buf.size());
@@ -336,8 +380,11 @@ u32 ppc_worker_compile_and_accumulate(u32 start_pc) {
         /* instr_pcs       = */ instr_pcs,
         /* lookup_fn       = */ nullptr,
         /* lookup_user     = */ nullptr,
-        /* emit_hle_check  = */ false,
-        /* emit_perf_stub  = */ true);
+        // Boot-mode default — runtime-controlled via the same g_emit_*
+        // flags as ppc_worker_compile_block above.
+        /* emit_hle_check         = */ true,
+        /* emit_perf_stub         = */ g_emit_perf_stub,
+        /* emit_hle_check_native  = */ g_emit_hle_check_native);
     if (body.empty()) return 0u;
 
     // Stash the emit inputs so region_relink can re-emit with a complete
@@ -348,7 +395,8 @@ u32 ppc_worker_compile_and_accumulate(u32 start_pc) {
     inputs.mem1_base     = static_cast<u32>(g_mem1_base);
     inputs.mem1_mask     = ram_mask;
     inputs.ram_size      = g_mem1_size;
-    inputs.emit_perf_stub = true;  // Phase D — re-emit at relink also stubs
+    inputs.emit_perf_stub = g_emit_perf_stub;
+    inputs.emit_hle_check_native = g_emit_hle_check_native;
     inputs.insts.assign(insts, insts + count);
     inputs.instr_pcs.assign(instr_pcs, instr_pcs + count);
 
@@ -380,10 +428,11 @@ void ppc_worker_shutdown() {
 
 // version: lets JS verify the loaded wasm matches the protocol it
 // expects. Bumped whenever the SAB layout or function signatures change.
-// Bumps: 1 (Phase 2a foundation) → 2 (Phase 3a.1 BlockCache instance live).
+// Bumps: 1 (Phase 2a foundation) → 2 (Phase 3a.1 BlockCache instance live)
+//      → 3 (boot-dispatcher mode setters; g_emit_* defaults flipped to false).
 EMSCRIPTEN_KEEPALIVE
 u32 ppc_worker_version() {
-    return 2u;
+    return 3u;
 }
 
 // Diagnostic export: number of accumulated bodies in a region. Returns 0
@@ -471,6 +520,435 @@ u32 ppc_worker_region_dispatch_pc(u32 pc) {
         return static_cast<u32>(next);
     }
     return PPC_WORKER_DISPATCH_MISS;
+}
+
+// ---- CoreTiming shared event queue (Item 7 Phase I) ----
+// Infrastructure stub. The queue starts empty; nothing pushes into it
+// yet — that's Phase II (DEC mirror) and Phase III (hybrid events).
+// See gamecube/notes/item7_coretiming_design.md.
+//
+// Layout addresses come from sab_layout.h. All u32 reads/writes go
+// through __atomic_* to be safe under the seqlock protocol; the
+// initializer below uses RELAXED for one-time fill and a single
+// RELEASE for the magic publish.
+
+// Apply the pure-PPC DecCallback effect locally. Mirrors
+// SystemTimers::DecrementerCallback in dolphin-src:
+//   ppc_state.spr[SPR_DEC] = 0xFFFFFFFF;
+//   ppc_state.Exceptions |= EXCEPTION_DECREMENTER;
+// Both writes target the SAB-backed PowerPCState at g_ppc_state_base
+// + ppc_off::SPR_BASE + 22*4 (SPR_DEC=22) and + ppc_off::EXCEPTIONS.
+static void fire_pure_decrementer() {
+    if (g_ppc_state_base == 0u) return;
+    constexpr u32 SPR_BASE_OFF  = 0x340u;  // matches PowerPCState layout (per ppc_worker_main.cpp header comment)
+    constexpr u32 SPR_DEC_INDEX = 22u;
+    constexpr u32 EXCEPTIONS_OFF = 0x2ECu;
+    constexpr u32 EXCEPTION_DECREMENTER = 0x00000800u;
+
+    volatile u32* dec_slot = reinterpret_cast<volatile u32*>(
+        static_cast<uintptr_t>(g_ppc_state_base + SPR_BASE_OFF + SPR_DEC_INDEX * 4u));
+    *dec_slot = 0xFFFFFFFFu;
+
+    u32* exc_slot = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(g_ppc_state_base + EXCEPTIONS_OFF));
+    __atomic_or_fetch(exc_slot, EXCEPTION_DECREMENTER, __ATOMIC_RELEASE);
+}
+
+// Zero header + records, then publish magic. Idempotent — calling this
+// twice is fine (re-zeroes any in-flight entries; Phase I doesn't have
+// any).
+EMSCRIPTEN_KEEPALIVE
+void ppc_worker_ct_queue_init() {
+    using namespace bemental_sab;
+    volatile u8* base = reinterpret_cast<volatile u8*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR));
+    // Zero the entire region (header + records).
+    for (u32 i = 0; i < CT_QUEUE_BYTES; ++i) base[i] = 0u;
+    // Publish magic with RELEASE so a reader observing the magic sees
+    // a zero count.
+    volatile u32* magic = reinterpret_cast<volatile u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_MAGIC));
+    __atomic_store_n(reinterpret_cast<u32*>(const_cast<u32*>(magic)),
+                     CT_QUEUE_MAGIC, __ATOMIC_RELEASE);
+}
+
+// Return the current entry count (number of records with CT_FLAG_VALID).
+// Phase I returns 0; Phase II onward returns the seqlock-stable count.
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_ct_queue_count() {
+    using namespace bemental_sab;
+    return __atomic_load_n(reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_EVENT_COUNT)),
+        __ATOMIC_ACQUIRE);
+}
+
+// Verify magic. Returns 1 iff CT_QUEUE_MAGIC has been published.
+// JS-side diag uses this to confirm init succeeded.
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_ct_queue_ready() {
+    using namespace bemental_sab;
+    const u32 m = __atomic_load_n(reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_MAGIC)),
+        __ATOMIC_ACQUIRE);
+    return (m == CT_QUEUE_MAGIC) ? 1u : 0u;
+}
+
+// Walk the queue, fire any pure-PPC events whose time <= now. Returns
+// the number of events fired. Caller passes the current sim time as
+// (lo, hi) split 64-bit.
+//
+// Phase II: queue populated by dolphin_ct_publish_dec (mirrors DEC
+// schedule). DEC entries fire fire_pure_decrementer() locally and set
+// CT_PEND_DEC_PREFIRED as a diagnostic hint. The state mutation is
+// idempotent so dolphin's local DEC firing remains safe.
+//
+// Phase III (when CT_PHASE3_ENABLE bit is set in PHASE_FLAGS): hybrid
+// entries (VI/DSP/AI/AudioDMA/GPUSleeper/PatchEngine) have their cadence
+// "consumed" — record is tombstoned — and the corresponding pending-mask
+// bit is set so dolphin will run the C++ callback at its next heartbeat.
+// Without the phase flag, hybrids are ignored (left for dolphin's local
+// Advance to fire normally).
+//
+// Seqlock-stable: loops up to 2 times under writer contention; if
+// the writer holds the lock longer than that, returns 0 and the
+// caller retries next iter. That is safe because sim-time only
+// monotonically advances.
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_ct_fire_due_pure(u32 now_lo, u32 now_hi) {
+    using namespace bemental_sab;
+    const u64 now = (static_cast<u64>(now_hi) << 32) | static_cast<u64>(now_lo);
+    u32* hdr_seq = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_EVENT_SEQ));
+    u32* hdr_cnt = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_EVENT_COUNT));
+    u32* hdr_pending = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_DOLPHIN_PENDING_MASK));
+    u32* hdr_phase = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_PHASE_FLAGS));
+    const u32 phase = __atomic_load_n(hdr_phase, __ATOMIC_RELAXED);
+    const bool phase3_on = (phase & CT_PHASE3_ENABLE) != 0u;
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const u32 s0 = __atomic_load_n(hdr_seq, __ATOMIC_ACQUIRE);
+        if (s0 & 1u) continue;  // writer in progress
+        const u32 cnt = __atomic_load_n(hdr_cnt, __ATOMIC_RELAXED);
+        if (cnt == 0u) {
+            // Empty queue. Seqlock didn't need to be re-checked because
+            // we read no records.
+            return 0u;
+        }
+        u32 fired = 0u;
+        u32 hybrid_bits = 0u;
+        for (u32 i = 0; i < CT_QUEUE_CAPACITY; ++i) {
+            CtEventRecord* rec = reinterpret_cast<CtEventRecord*>(
+                static_cast<uintptr_t>(ct_record_addr(i)));
+            const u32 flags = __atomic_load_n(&rec->flags, __ATOMIC_RELAXED);
+            if ((flags & CT_FLAG_VALID) == 0u) continue;
+            if ((flags & CT_FLAG_REMOVED) != 0u) continue;
+            const u64 t = (static_cast<u64>(static_cast<u32>(rec->time_hi)) << 32)
+                          | static_cast<u64>(static_cast<u32>(rec->time_lo));
+            if (t > now) continue;
+            const u32 type_id = rec->event_type_id;
+            bool consumed = false;
+            if ((flags & CT_FLAG_PURE_PPC) != 0u) {
+                if (type_id == CT_EV_DECREMENTER) {
+                    fire_pure_decrementer();
+                    hybrid_bits |= CT_PEND_DEC_PREFIRED;  // diagnostic hint
+                    ++fired;
+                    consumed = true;
+                }
+            } else if ((flags & CT_FLAG_HYBRID) != 0u) {
+                if (phase3_on) {
+                    const u32 bit = ct_event_pending_bit(type_id);
+                    if (bit != 0u) {
+                        hybrid_bits |= bit;
+                        ++fired;
+                        consumed = true;
+                    }
+                }
+                // If phase3 is off, leave the entry — dolphin's local
+                // Advance() still processes the equivalent local event.
+            }
+            if (consumed) {
+                __atomic_store_n(&rec->flags,
+                                 (flags | CT_FLAG_REMOVED) & ~CT_FLAG_VALID,
+                                 __ATOMIC_RELEASE);
+            }
+        }
+        // Seqlock re-check.
+        const u32 s1 = __atomic_load_n(hdr_seq, __ATOMIC_ACQUIRE);
+        if (s1 == s0) {
+            if (hybrid_bits != 0u) {
+                __atomic_or_fetch(hdr_pending, hybrid_bits, __ATOMIC_RELEASE);
+            }
+            return fired;
+        }
+        // Writer raced us; retry the whole walk.
+    }
+    return 0u;
+}
+
+// Diagnostic export: read the current dolphin-pending-mask without
+// clearing it. Dolphin's outer Run() loop polls this in Phase III; the
+// helper exists now so the JS side can verify the field is reachable.
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_ct_dolphin_pending_mask() {
+    using namespace bemental_sab;
+    return __atomic_load_n(reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_DOLPHIN_PENDING_MASK)),
+        __ATOMIC_ACQUIRE);
+}
+
+// Phase II — ppc-worker-side seqlocked publish of a single event. Used
+// by §2d (ppc-worker-initiated scheduling) once guest mtspr DEC paths
+// run inside ppc-worker. Phase II ships this for completeness; dolphin's
+// SystemTimers::DecrementerSet currently does the publish from C++ via
+// dolphin_ct_publish_dec (JitWasm.cpp), so this entry-point is exercised
+// only by future work.
+//
+// (event_type_id, time_lo, time_hi, flags) — flags should be CT_FLAG_VALID
+// plus CT_FLAG_PURE_PPC or CT_FLAG_HYBRID. Returns the slot index used,
+// or 0xFFFFFFFF if the queue is full.
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_ct_publish_event(u32 event_type_id, u32 time_lo, u32 time_hi, u32 flags) {
+    using namespace bemental_sab;
+    u32* hdr_seq = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_EVENT_SEQ));
+    u32* hdr_cnt = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_EVENT_COUNT));
+    u32* hdr_owner = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_WRITER_OWNER));
+
+    // Acquire writer ownership (id 1 = ppc).
+    for (int spin = 0; spin < 256; ++spin) {
+        u32 expected = 0u;
+        if (__atomic_compare_exchange_n(hdr_owner, &expected, 1u, false,
+                                         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+            break;
+        }
+        if (spin == 255) return 0xFFFFFFFFu;
+    }
+    // Begin seqlock write (seq -> odd).
+    __atomic_add_fetch(hdr_seq, 1u, __ATOMIC_RELEASE);
+    u32 chosen = 0xFFFFFFFFu;
+    // Scan for a free slot (CT_FLAG_VALID==0). Re-use REMOVED tombstones.
+    for (u32 i = 0; i < CT_QUEUE_CAPACITY; ++i) {
+        CtEventRecord* rec = reinterpret_cast<CtEventRecord*>(
+            static_cast<uintptr_t>(ct_record_addr(i)));
+        const u32 cur = __atomic_load_n(&rec->flags, __ATOMIC_RELAXED);
+        if ((cur & CT_FLAG_VALID) == 0u) {
+            rec->time_lo       = static_cast<int32_t>(time_lo);
+            rec->time_hi       = static_cast<int32_t>(time_hi);
+            rec->event_type_id = event_type_id;
+            rec->userdata_lo   = 0u;
+            rec->userdata_hi   = 0u;
+            __atomic_store_n(&rec->flags, flags | CT_FLAG_VALID,
+                             __ATOMIC_RELEASE);
+            chosen = i;
+            break;
+        }
+    }
+    // Recompute count (cheap; capacity is 256).
+    u32 new_count = 0u;
+    for (u32 i = 0; i < CT_QUEUE_CAPACITY; ++i) {
+        CtEventRecord* rec = reinterpret_cast<CtEventRecord*>(
+            static_cast<uintptr_t>(ct_record_addr(i)));
+        const u32 cur = __atomic_load_n(&rec->flags, __ATOMIC_RELAXED);
+        if ((cur & CT_FLAG_VALID) != 0u) ++new_count;
+    }
+    __atomic_store_n(hdr_cnt, new_count, __ATOMIC_RELEASE);
+    // End seqlock write (seq -> even).
+    __atomic_add_fetch(hdr_seq, 1u, __ATOMIC_RELEASE);
+    __atomic_store_n(hdr_owner, 0u, __ATOMIC_RELEASE);
+    return chosen;
+}
+
+// Phase II/III runtime control. Page-mediated flip via URL flag or post
+// from dolphin's retro_load_game. Idempotent.
+EMSCRIPTEN_KEEPALIVE
+void ppc_worker_ct_set_phase_flags(u32 flags) {
+    using namespace bemental_sab;
+    __atomic_store_n(reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_PHASE_FLAGS)),
+        flags, __ATOMIC_RELEASE);
+}
+
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_ct_get_phase_flags() {
+    using namespace bemental_sab;
+    return __atomic_load_n(reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_PHASE_FLAGS)),
+        __ATOMIC_ACQUIRE);
+}
+
+// Read the canonical global sim time (lo word). Phase II uses this so
+// ppc-worker can compare entry times against the timer dolphin publishes
+// from CoreTiming::Advance(). Phase IV/V will move ownership to
+// ppc-worker; the accessor stays.
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_ct_global_timer_lo() {
+    using namespace bemental_sab;
+    return __atomic_load_n(reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_GLOBAL_TIMER_LO)),
+        __ATOMIC_ACQUIRE);
+}
+
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_ct_global_timer_hi() {
+    using namespace bemental_sab;
+    return __atomic_load_n(reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_GLOBAL_TIMER_HI)),
+        __ATOMIC_ACQUIRE);
+}
+
+// ---- Item 7 Phase IV: ppc-worker owns CoreTiming cadence ----------------
+//
+// Under Phase IV ppc-worker is the canonical writer for two fields that
+// dolphin's CoreTiming used to own outright:
+//   - global_timer (CT queue header u64 split lo/hi)
+//   - downcount (PowerPCState s32 at +0x2F0)
+//
+// The four entry points below wrap the math + atomics required by the
+// run-continuous slice loop.
+
+namespace {
+// PowerPCState downcount offset (matches the layout comment near
+// g_ppc_state_base — downcount is s32 at +0x2F0).
+constexpr u32 PPC_DC_OFF = 0x2F0u;
+
+// Phase IV slice cap — keeps the slice short enough that dolphin's
+// service_iter heartbeat (which drains MMIO + hybrid-pending-mask) gets
+// a chance to run at human-perceivable cadence. 200K cycles ~= 0.4 ms
+// at 486 MHz emulated — well under one VI half-line.
+constexpr u32 PHASE4_MAX_SLICE = 200000u;
+}  // namespace
+
+// Write split-64 sim time to CT queue header. Seqlock pattern: bump
+// seq odd, store lo, store hi, bump seq even. Single-writer (ppc-worker
+// under Phase IV); readers (dolphin Advance) tolerate transient
+// inconsistency via the same seqlock retry pattern.
+EMSCRIPTEN_KEEPALIVE
+void ppc_worker_advance_global_timer(u32 lo, u32 hi) {
+    using namespace bemental_sab;
+    u32* p_seq = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_EVENT_SEQ));
+    u32* p_lo  = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_GLOBAL_TIMER_LO));
+    u32* p_hi  = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_GLOBAL_TIMER_HI));
+    __atomic_add_fetch(p_seq, 1u, __ATOMIC_RELEASE);  // odd
+    __atomic_store_n(p_lo, lo, __ATOMIC_RELAXED);
+    __atomic_store_n(p_hi, hi, __ATOMIC_RELAXED);
+    __atomic_add_fetch(p_seq, 1u, __ATOMIC_RELEASE);  // even
+}
+
+// Atomic write to PowerPCState.downcount. Signed s32. Used by
+// ppc_worker_commit_slice and any external test path that wants to
+// seed/clear downcount without a JIT-emitted store.
+EMSCRIPTEN_KEEPALIVE
+void ppc_worker_set_downcount(int32_t v) {
+    if (g_ppc_state_base == 0u) return;
+    int32_t* p_dc = reinterpret_cast<int32_t*>(
+        static_cast<uintptr_t>(g_ppc_state_base + PPC_DC_OFF));
+    __atomic_store_n(p_dc, v, __ATOMIC_RELEASE);
+}
+
+// Compute the next slice budget in cycles. Returned as u32 (always >=0).
+// Formula: min(downcount, next_event_time - global_timer, PHASE4_MAX_SLICE).
+// downcount<=0 -> 0 (caller should commit_slice(0) then yield).
+// No pending event -> infinite, so the slice is capped by PHASE4_MAX_SLICE.
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_slice_budget(void) {
+    using namespace bemental_sab;
+    if (g_ppc_state_base == 0u) return 0u;
+    const int32_t dc = __atomic_load_n(reinterpret_cast<int32_t*>(
+        static_cast<uintptr_t>(g_ppc_state_base + PPC_DC_OFF)),
+        __ATOMIC_ACQUIRE);
+    if (dc <= 0) return 0u;
+
+    // Read global_timer (seqlock).
+    u32* p_seq = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_EVENT_SEQ));
+    u32* p_lo  = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_GLOBAL_TIMER_LO));
+    u32* p_hi  = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_GLOBAL_TIMER_HI));
+    u32 gt_lo = 0u, gt_hi = 0u;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const u32 s0 = __atomic_load_n(p_seq, __ATOMIC_ACQUIRE);
+        if (s0 & 1u) continue;
+        gt_lo = __atomic_load_n(p_lo, __ATOMIC_RELAXED);
+        gt_hi = __atomic_load_n(p_hi, __ATOMIC_RELAXED);
+        const u32 s1 = __atomic_load_n(p_seq, __ATOMIC_ACQUIRE);
+        if (s1 == s0) break;
+    }
+    const uint64_t now = (static_cast<uint64_t>(gt_hi) << 32) | gt_lo;
+
+    // Walk queue for nearest non-tombstoned event time.
+    uint64_t nearest = static_cast<uint64_t>(-1);
+    bool found = false;
+    for (u32 i = 0; i < CT_QUEUE_CAPACITY; ++i) {
+        CtEventRecord* rec = reinterpret_cast<CtEventRecord*>(
+            static_cast<uintptr_t>(ct_record_addr(i)));
+        const u32 flags = __atomic_load_n(&rec->flags, __ATOMIC_RELAXED);
+        if ((flags & CT_FLAG_VALID) == 0u) continue;
+        if ((flags & CT_FLAG_REMOVED) != 0u) continue;
+        const uint64_t t = (static_cast<uint64_t>(static_cast<u32>(rec->time_hi)) << 32)
+                          | static_cast<uint64_t>(static_cast<u32>(rec->time_lo));
+        if (!found || t < nearest) { nearest = t; found = true; }
+    }
+
+    uint64_t cycles_to_evt = static_cast<uint64_t>(PHASE4_MAX_SLICE);
+    if (found) {
+        cycles_to_evt = (nearest > now) ? (nearest - now) : 0u;
+    }
+    uint64_t budget = static_cast<uint64_t>(static_cast<u32>(dc));
+    if (cycles_to_evt < budget) budget = cycles_to_evt;
+    if (budget > PHASE4_MAX_SLICE) budget = PHASE4_MAX_SLICE;
+    return static_cast<u32>(budget);
+}
+
+// Commit a slice: subtract cycles from downcount, advance global_timer,
+// fire any due pure-PPC events. Called once per JS-side slice after the
+// dispatch inner loop returns.
+EMSCRIPTEN_KEEPALIVE
+void ppc_worker_commit_slice(u32 cycles_consumed) {
+    using namespace bemental_sab;
+    if (g_ppc_state_base == 0u) return;
+    if (cycles_consumed == 0u) {
+        // Still fire due events with the current timer — caller may have
+        // burned wall time but no cycles (e.g. all-idle slice).
+        const u32 gtl0 = ppc_worker_ct_global_timer_lo();
+        const u32 gth0 = ppc_worker_ct_global_timer_hi();
+        ppc_worker_ct_fire_due_pure(gtl0, gth0);
+        return;
+    }
+    // Atomic downcount subtract.
+    int32_t* p_dc = reinterpret_cast<int32_t*>(
+        static_cast<uintptr_t>(g_ppc_state_base + PPC_DC_OFF));
+    __atomic_sub_fetch(p_dc, static_cast<int32_t>(cycles_consumed),
+                       __ATOMIC_ACQ_REL);
+
+    // 64-bit add to global_timer (seqlock).
+    u32* p_seq = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_EVENT_SEQ));
+    u32* p_lo  = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_GLOBAL_TIMER_LO));
+    u32* p_hi  = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(CT_QUEUE_ADDR + CT_OFF_GLOBAL_TIMER_HI));
+    const u32 old_lo = __atomic_load_n(p_lo, __ATOMIC_ACQUIRE);
+    const u32 old_hi = __atomic_load_n(p_hi, __ATOMIC_ACQUIRE);
+    const uint64_t old_t = (static_cast<uint64_t>(old_hi) << 32) | old_lo;
+    const uint64_t new_t = old_t + static_cast<uint64_t>(cycles_consumed);
+    const u32 new_lo = static_cast<u32>(new_t & 0xFFFFFFFFull);
+    const u32 new_hi = static_cast<u32>((new_t >> 32) & 0xFFFFFFFFull);
+    __atomic_add_fetch(p_seq, 1u, __ATOMIC_RELEASE);  // odd
+    __atomic_store_n(p_lo, new_lo, __ATOMIC_RELAXED);
+    __atomic_store_n(p_hi, new_hi, __ATOMIC_RELAXED);
+    __atomic_add_fetch(p_seq, 1u, __ATOMIC_RELEASE);  // even
+
+    // Fire due pure-PPC events at the new time.
+    ppc_worker_ct_fire_due_pure(new_lo, new_hi);
 }
 
 }  // extern "C"
