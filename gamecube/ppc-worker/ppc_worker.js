@@ -737,6 +737,14 @@
         const sliceCyclesCap = (typeof mod._ppc_worker_slice_budget === 'function')
             ? (mod._ppc_worker_slice_budget() >>> 0) : 0;
         let sliceCyclesBurned = 0;
+        // Track cycles already pushed into SAB global_timer mid-slice so
+        // per-iter CT advance + slice-end advance don't double-count.
+        // Phase 2e fix: under cutover, dolphin's libretro frame loop is
+        // the only outer CoreTiming::Advance — but it ticks every ~16ms
+        // wall, during which ppc-worker burns ~750K dispatches. Events
+        // scheduled mid-slice never fire mid-slice unless we advance
+        // global_timer + run fire_due_pure incrementally.
+        let cyclesAdvancedSoFar = 0;
         // Phase IV diag: SAB counters so page can see slice progress
         // without waiting for ack messages. 0x025010E0..025010FF reserved.
         const PH4_DIAG_ITERS  = 0x025010E0;
@@ -928,9 +936,28 @@
             exitReason = 'slice-budget'; break;
           }
           if ((iters & (CT_FIRE_EVERY - 1)) === 0) {
-            const gtl = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
-            const gth = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
-            mod._ppc_worker_ct_fire_due_pure(gtl, gth);
+            // Phase 2e fix: advance global_timer by the cycles burned
+            // since the last CT-fire, THEN fire_due_pure with the new
+            // time. Without this advance, events scheduled mid-slice
+            // never become due during the slice — fire_due_pure reads
+            // a stale global_timer that only updates at slice end.
+            const deltaCycles = (sliceCyclesBurned - cyclesAdvancedSoFar) >>> 0;
+            if (deltaCycles > 0 && typeof mod._ppc_worker_advance_global_timer === 'function') {
+              const gtl0 = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
+              const gth0 = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
+              const sumLo = (gtl0 + deltaCycles) >>> 0;
+              const carry = (sumLo < gtl0) ? 1 : 0;
+              const sumHi = (gth0 + carry) >>> 0;
+              mod._ppc_worker_advance_global_timer(sumLo, sumHi);
+              cyclesAdvancedSoFar = sliceCyclesBurned;
+              mod._ppc_worker_ct_fire_due_pure(sumLo, sumHi);
+            } else {
+              // No new cycles burned (mostly waste). Still poll for
+              // already-due events (cheap).
+              const gtl = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
+              const gth = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
+              mod._ppc_worker_ct_fire_due_pure(gtl, gth);
+            }
           }
           // Exception pending? Deliver via dolphin_check_exc (mailbox cmd 10),
           // then re-read PC from SAB and continue dispatching from the vector.
@@ -1165,15 +1192,21 @@
         // + fire events — keeping the existing per-block Atomics.sub
         // as canonical. Equivalent to ppc_worker_advance_global_timer +
         // ppc_worker_ct_fire_due_pure but in one C call.
-        if (sliceCyclesBurned > 0 && typeof mod._ppc_worker_advance_global_timer === 'function') {
-          const gtl0 = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
-          const gth0 = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
-          // 64-bit add gtl0:gth0 + sliceCyclesBurned (sliceCyclesBurned is u32).
-          const sumLo = (gtl0 + (sliceCyclesBurned >>> 0)) >>> 0;
-          const carry = (sumLo < gtl0) ? 1 : 0;
-          const sumHi = (gth0 + carry) >>> 0;
-          mod._ppc_worker_advance_global_timer(sumLo, sumHi);
-          mod._ppc_worker_ct_fire_due_pure(sumLo, sumHi);
+        // Phase 2e fix: advance only the residual cycles not already
+        // pushed by the per-iter CT-fire path. Without this guard, mid-
+        // slice advances would double-count and global_timer would race
+        // ahead of emulated execution.
+        {
+          const residual = (sliceCyclesBurned - cyclesAdvancedSoFar) >>> 0;
+          if (residual > 0 && typeof mod._ppc_worker_advance_global_timer === 'function') {
+            const gtl0 = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
+            const gth0 = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
+            const sumLo = (gtl0 + residual) >>> 0;
+            const carry = (sumLo < gtl0) ? 1 : 0;
+            const sumHi = (gth0 + carry) >>> 0;
+            mod._ppc_worker_advance_global_timer(sumLo, sumHi);
+            mod._ppc_worker_ct_fire_due_pure(sumLo, sumHi);
+          }
         }
         postMessage({
           cmd: 'run-continuous-ack',

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is Casey Bement's personal site deployed to GitHub Pages (CNAME, `.nojekyll`). It is not a single app — it is a collection of static HTML pages plus several self-contained sub-projects, each with its own build system (or none). There is no top-level build for the site itself; HTML/JS files are served as-is.
 
-- **Deploy branch is `prod`** (not `main`/`master`). Feature branches merge into `prod` via PR. `master` exists but is not the deploy target.
+- **Deploy branch is `prod`** (not `main`/`master`). Feature branches merge into `prod` via PR. `master` exists but is not the deploy target — ignore git's default-main heuristic if it reports `master`.
 - Top-level `package.json` / `tsconfig.json` exist but are only used by `handler.js` + `serverless.yml` (an AWS Lambda `sendEmail` endpoint via Serverless Framework). Most of the repo is plain static HTML.
 - The top-level `README.md` is an unmodified `create-next-app` boilerplate left over from an old experiment — ignore it; this is not a Next.js project.
 
@@ -35,13 +35,36 @@ When editing the PS1 emulator specifically, the current JS-side patches (perform
 
 ## GameCube / Dolphin WASM build
 
-This is an active R&D effort — not yet shipping. Three pieces interact:
+This is an active R&D effort — not yet shipping. Four pieces interact:
 
 - `gamecube/dolphin-src/` — Dolphin source tree, configured under `build-wasm/` for an Emscripten static-lib build (`dolphin_libretro` libretro target).
 - `bementalJIT/` — repo-root C++17 static library that Dolphin links against in place of its native JIT. Per-guest emitters live under `guests/<arch>/` (currently `powerpc` for Gekko, plus an SH4 stub) and are gated by CMake options. Block cache lives in `src/block_cache.cpp`.
 - `gamecube/dolphin_libretro/` — final Emscripten link output (`dolphin_worker.js`, `dolphin_worker.wasm`, etc.) loaded by `gamecube.html`.
+- `gamecube/ppc-worker/` — standalone PowerPC JIT worker (Phase 2 architecture: separate worker thread from `dolphin_worker`). Built via `gamecube/ppc-worker/build_ppc_worker.sh`, which also drives `bementalJIT/build-emcc/` on first run. Outputs `ppc_worker.{js,wasm}`. SAB layout shared with dolphin defined in `sab_layout.h`.
+- `gamecube/dolphin-bridge/worker_funcs.js` — page-mediated mailbox routing between `dolphin_worker` and `ppc-worker` (CompileBlock cmds, MMIO routing, PowerPCState mirror). Loaded by `gamecube.html`.
 
-The canonical inner-loop is `build_and_probe.sh` at the repo root — it sources `emsdk_env.sh`, runs `emmake make dolphin_libretro` in `build-wasm/`, runs the link script at `/tmp/dolphin_worker_link.sh`, then runs a Node-based render probe and prints a fixed summary (canvas non-black check, jit-inner traces, HLE replace counts, frame counts, VI/XFB events, installed patches). Use this single script for build/link/probe iterations rather than running emcc/make ad hoc — permissions are configured for it.
+The canonical inner-loop is `build_and_probe.sh` at the repo root — it sources `emsdk_env.sh`, runs `emmake make dolphin_libretro` in `build-wasm/`, runs the link script at `/tmp/dolphin_worker_link.sh` (falls back to `gamecube/dolphin-bridge/dolphin_worker_link.sh`), then runs a Node-based render probe and prints a fixed summary (canvas non-black check, jit-inner traces, HLE replace counts, frame counts, VI/XFB events, installed patches). Use this single script for build/link/probe iterations rather than running emcc/make ad hoc — permissions are configured for it.
+
+### bementalJIT tests
+
+Host-side tests live in `bementalJIT/tests/` (`test_dispatch.cpp`, `test_gekko.cpp`, `test_perf_t1.cpp`, `test_pi_mask_path.cpp`, `test_str_hle_pattern.cpp`, `test_analyst.cpp`, `test_diff.cpp`). Built via CMake into `bementalJIT/build-host-test/` or `bementalJIT/build-test/`.
+
+### SAB primitives
+
+`gamecube/seqlock.js` and `gamecube/ringbuffer.js` are SharedArrayBuffer primitives used across the worker boundary. Each ships a Node smoke test:
+
+```bash
+node gamecube/seqlock.test.mjs
+node gamecube/ringbuffer.test.mjs
+```
+
+### GameCube-specific tools
+
+Separate from the repo-root `tools/jsearch.js`. `gamecube/tools/` contains symbol/disassembly utilities for game-binary investigation:
+
+- `gcsdk_scan.py` / `gcsdk_siggen.py` — SDK symbol signature scan against game binaries.
+- `gsne8p.map`, `gpoe8p.map` — SAB (Sonic Adventure 2 Battle) and PSO symbol maps.
+- `find_polls.py`, `disasm_fn.py`, `dtk_extract_map.py`, `mw_listener.py`.
 
 ## Searching minified JS
 
