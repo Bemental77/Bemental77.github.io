@@ -2002,9 +2002,28 @@
         // swallow here so onWorkerMsg's default doesn't log "unknown".
         break;
       case 'jit-pcs':
-        // Phase 2e cache-warmup: dolphin replied with per-region PC lists
-        // for ppc-worker pre-compile. Orchestrator installs _pendingJitPcs.
+        // Phase 2e cache-warmup (Option 1): dolphin replied with per-
+        // region PC lists for ppc-worker pre-compile. Orchestrator
+        // installs _pendingJitPcs.
         if (typeof window._pendingJitPcs === 'function') window._pendingJitPcs(data);
+        break;
+      case 'relinked-region':
+        // Phase 2e cache-warmup (Option 2b): dolphin's bementalJIT
+        // relinked a region. Forward merged-module bytes + pc_keys to
+        // ppc-worker as Transferable; V8 structured-clone shares the
+        // compiled WebAssembly bytecode within the same agent cluster
+        // (coi-serviceworker keeps everything COI), so ppc-worker re-
+        // instantiates without paying a compile.
+        if (typeof window.ppc_worker !== 'undefined' && window.ppc_worker) {
+          window.ppc_worker.postMessage({
+            cmd: 'install-relinked-region',
+            r: data.r | 0,
+            bytes: data.bytes,
+            pcKeys: data.pcKeys,
+            generation: data.generation | 0,
+            merged: !!data.merged,
+          }, [data.bytes.buffer, data.pcKeys.buffer]);
+        }
         break;
       case 'paused-for-cutover':
       case 'cutover-resumed':

@@ -322,6 +322,66 @@
         postMessage({ cmd: 'init-bemental-regions-ack', had_env: !!had_env });
         break;
       }
+      case 'install-relinked-region': {
+        // Phase 2e cache-warmup (Option 2b): dolphin's bementalJIT
+        // relinked a region. The page forwarded the merged-module bytes
+        // and pc_keys. V8 structured-clone of WebAssembly.Module in the
+        // same agent cluster shares compiled code, so re-instantiation
+        // here doesn't pay a compile. The instance shape mirrors
+        // block_cache.cpp's EM_ASM_INT path: merged → {regionFn, entrySel},
+        // Nfn → {fns[]}. Both populate {instance, pcMap, nFuncs, generation}.
+        if (!mod) { postMessage({ cmd: 'install-relinked-region-nack', reason: 'wasm not yet ready' }); return; }
+        if (!mod.bemental_regions) mod.bemental_regions = {};
+        try {
+          const r = data.r | 0;
+          const incomingGen = data.generation | 0;
+          const prev = mod.bemental_regions[r];
+          if (prev && (prev.generation | 0) >= incomingGen) {
+            // Already at or beyond this generation; skip.
+            postMessage({ cmd: 'install-relinked-region-ack', r, generation: incomingGen, skipped: true });
+            break;
+          }
+          const bytes = new Uint8Array(data.bytes);
+          const wmod = new WebAssembly.Module(bytes);
+          const env = {};
+          if (mod.bemental_imports && mod.bemental_imports.env) {
+            Object.assign(env, mod.bemental_imports.env);
+          }
+          // env.memory must be the shared WebAssembly.Memory both workers
+          // use; setup-bemental-env / init-bemental-regions paths already
+          // populated mod.bemental_imports.env with this. Fall through to
+          // wasmMemory if it's not there yet.
+          if (!env.memory && typeof wasmMemory !== 'undefined') env.memory = wasmMemory;
+          const inst = new WebAssembly.Instance(wmod, { env });
+          const pcMap = new Map();
+          const pcKeys = new Uint32Array(data.pcKeys);
+          for (let i = 0; i < pcKeys.length; ++i) pcMap.set(pcKeys[i] >>> 0, i);
+          const region = {
+            instance: inst,
+            pcMap,
+            nFuncs: pcKeys.length,
+            generation: incomingGen,
+            merged: !!data.merged,
+          };
+          if (region.merged) {
+            region.regionFn = inst.exports['region'];
+            region.entrySel = inst.exports['entry_sel'];
+            if (!region.regionFn || !region.entrySel) {
+              postMessage({ cmd: 'install-relinked-region-nack', r, reason: 'merged shape missing exports' });
+              break;
+            }
+          } else {
+            const fns = new Array(pcKeys.length);
+            for (let i = 0; i < pcKeys.length; ++i) fns[i] = inst.exports['fn_' + i];
+            region.fns = fns;
+          }
+          mod.bemental_regions[r] = region;
+          postMessage({ cmd: 'install-relinked-region-ack', r, generation: incomingGen, nFuncs: pcKeys.length });
+        } catch (e) {
+          postMessage({ cmd: 'install-relinked-region-nack', r: data.r | 0, reason: 'install failed: ' + (e && e.message ? e.message : String(e)) });
+        }
+        break;
+      }
       case 'region-instantiate': {
         // Receives:
         //   regionIdx: 0..7

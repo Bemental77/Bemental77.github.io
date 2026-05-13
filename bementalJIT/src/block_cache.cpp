@@ -793,6 +793,27 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
     }
 
 #ifdef __EMSCRIPTEN__
+    // Phase 2e cache-warmup (Option 2b: share via postMessage of relinked
+    // Module bytes). If the host installed `bementalPublishRelinkedRegion`
+    // (worker_funcs.js does on dolphin worker init), pass the merged-region
+    // bytes + pc_keys to it. The handler postMessages dolphin → page →
+    // ppc-worker, which builds its own WebAssembly.Module from the same
+    // bytes. V8 structured-clones the Module in the same agent cluster
+    // (coi-serviceworker provides COI), so ppc-worker pays instantiation
+    // cost only — no recompile. Fires for every relink so ppc-worker's
+    // cache tracks dolphin's.
+    EM_ASM({
+        if (typeof self !== 'undefined' &&
+            typeof self.bementalPublishRelinkedRegion === 'function') {
+            self.bementalPublishRelinkedRegion($0, $1, $2, $3, $4, $5, $6);
+        }
+    },
+    (int)r,
+    (int)bytes.data(), (int)bytes.size(),
+    (int)rs.pc_keys.data(), (int)rs.n_funcs,
+    rs.generation + 1,
+    use_merged_fn ? 1 : 0);
+
     // Instantiate, populate JS-side per-region pc->local_fn_idx Map, and
     // swap module_handle. Keep the previous instance alive in
     // Module.bemental_regions_old until we've successfully bound the new

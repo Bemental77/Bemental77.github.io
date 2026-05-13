@@ -4,6 +4,34 @@
 // handler installed by emscripten's pthread runtime.
 if (typeof ENVIRONMENT_IS_PTHREAD === 'undefined' || !ENVIRONMENT_IS_PTHREAD) {
 
+// Phase 2e cache-warmup (Option 2b): bementalJIT region_relink in
+// block_cache.cpp fires this callback every time dolphin builds a merged-
+// region WASM module. We slice the bytes + pc_keys out of dolphin's heap
+// and postMessage them to the page, which forwards to ppc-worker. V8
+// structured-clones the resulting WebAssembly.Module in the same agent
+// cluster (coi-serviceworker keeps everything COI), so ppc-worker re-
+// instantiates without paying a compile.
+self.bementalPublishRelinkedRegion = function (r, bytesAddr, bytesSize, pcAddr, pcCount, generation, merged) {
+  try {
+    if (!bytesSize || !Module || !Module.HEAPU8) return;
+    var bytes = new Uint8Array(bytesSize);
+    bytes.set(Module.HEAPU8.subarray(bytesAddr, bytesAddr + bytesSize));
+    var pcKeys = new Uint32Array(pcCount);
+    var srcU32 = new Uint32Array(Module.HEAPU8.buffer, pcAddr, pcCount);
+    pcKeys.set(srcU32);
+    postMessage({
+      cmd: 'relinked-region',
+      r: r | 0,
+      bytes: bytes,
+      pcKeys: pcKeys,
+      generation: generation | 0,
+      merged: !!merged,
+    }, [bytes.buffer, pcKeys.buffer]);
+  } catch (err) {
+    postMessage({ cmd: 'print', txt: '[worker] bementalPublishRelinkedRegion threw: ' + (err && err.message || err) });
+  }
+};
+
 // 4f-6: surface a 'runtime-ready' postMessage when emscripten has
 // finished bringing up wasm + memory + exports. Page waits on this
 // before routing real MMIO cmds (2..12) — earlier calls hit
