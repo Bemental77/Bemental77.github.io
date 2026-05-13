@@ -79,7 +79,6 @@ void SoundFeedStreamData(unsigned char *pSound, long lBytes) {
 	//printf("soundfeedstream %ld\n", lBytes);
 	//ccc+=100;
 	if(lBytes>4800){
-		printf("lBytes>4800 %ld\n", lBytes);
 		lBytes=4800;
 	}
 	SoundGetBytesBuffered_value+=lBytes;
