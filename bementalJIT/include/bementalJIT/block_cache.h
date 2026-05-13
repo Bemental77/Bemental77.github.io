@@ -71,6 +71,13 @@ struct BlockEmitInputs {
     // env.ppc_hle_check import (or perf-stub drop+const-0). Stored so
     // re-emit at region_relink preserves the choice.
     bool                            emit_hle_check_native = false;
+    // HLE pre-gate result: when false, the block has no registered
+    // HLE hook matching start_pc (TryReplaceFunction + GetHookByAddress
+    // both miss). Skipping the prologue check saves one JS round-trip
+    // per dispatch on the ~95% unpatched PCs. Stored so region_relink's
+    // re-emit path preserves the pre-gate decision (default true keeps
+    // legacy callers conservative — they pay the round-trip).
+    bool                            emit_hle_check = true;
     std::vector<u32>                insts;          // raw guest opcodes
     std::vector<u32>                instr_pcs;      // parallel PC array
 };

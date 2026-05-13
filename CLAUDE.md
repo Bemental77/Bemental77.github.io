@@ -19,7 +19,7 @@ Each has its own toolchain — run commands inside the subdirectory.
 | `ps1/ps1Wasm/` | PS1 WebAssembly emulator (derived from `kxkx5150/PCSX-wasm`) | Static — served from `ps1.html`. Source in `pcsx-wasm-src/` (Emscripten Makefile, fastcomp v1.37.40) |
 | `n64/N64Wasm`, `snes/snesWasm`, `gba/gbaWasm` | WebAssembly emulators with bundled `emsdk` | Static — served from corresponding `*.html` |
 | `gamecube/` | Dolphin libretro WASM build + custom JIT (in active development) | See **GameCube / Dolphin** below |
-| `bementalCompiler/` | Guest-agnostic WASM JIT-builder library (PowerPC/SH4 emitters) | CMake — consumed by `gamecube/` via `add_subdirectory` |
+| `bementalJIT/` | Guest-agnostic WASM JIT-builder library (PowerPC/SH4 emitters) | CMake — consumed by `gamecube/` via `add_subdirectory` |
 | root `*.html` | Portfolio pages (`index`, `about`, `resume`, `contact`, `playground`, `gamecube`, etc.) | Static |
 
 ## WASM emulator architecture (ps1/n64/snes/gba/gamecube)
@@ -38,7 +38,7 @@ When editing the PS1 emulator specifically, the current JS-side patches (perform
 This is an active R&D effort — not yet shipping. Three pieces interact:
 
 - `gamecube/dolphin-src/` — Dolphin source tree, configured under `build-wasm/` for an Emscripten static-lib build (`dolphin_libretro` libretro target).
-- `bementalCompiler/` — repo-root C++17 static library that Dolphin links against in place of its native JIT. Per-guest emitters live under `guests/<arch>/` (currently `powerpc` for Gekko, plus an SH4 stub) and are gated by CMake options. Block cache lives in `src/block_cache.cpp`.
+- `bementalJIT/` — repo-root C++17 static library that Dolphin links against in place of its native JIT. Per-guest emitters live under `guests/<arch>/` (currently `powerpc` for Gekko, plus an SH4 stub) and are gated by CMake options. Block cache lives in `src/block_cache.cpp`.
 - `gamecube/dolphin_libretro/` — final Emscripten link output (`dolphin_worker.js`, `dolphin_worker.wasm`, etc.) loaded by `gamecube.html`.
 
 The canonical inner-loop is `build_and_probe.sh` at the repo root — it sources `emsdk_env.sh`, runs `emmake make dolphin_libretro` in `build-wasm/`, runs the link script at `/tmp/dolphin_worker_link.sh`, then runs a Node-based render probe and prints a fixed summary (canvas non-black check, jit-inner traces, HLE replace counts, frame counts, VI/XFB events, installed patches). Use this single script for build/link/probe iterations rather than running emcc/make ad hoc — permissions are configured for it.

@@ -951,6 +951,150 @@ void ppc_worker_commit_slice(u32 cycles_consumed) {
     ppc_worker_ct_fire_due_pure(new_lo, new_hi);
 }
 
+// ---- Phase 2e Step 1: C-side run-continuous core ---------------------------
+//
+// Ports the body of `case 'run-continuous'` in ppc_worker.js (~lines
+// 741..990) into C. Owns the inner dispatch loop so the per-block JS
+// round-trip disappears: read PC from SAB, region_dispatch, decrement
+// downcount, write PC back, check exit conditions — all inside compiled
+// wasm. The only JS crossing per iter is the EM_ASM_INT inside
+// region_dispatch (which Phase 2 step 2 will replace with a direct
+// wasm function-table call).
+//
+// Step 1 ONLY: this entry point is scaffolding. The JS-side run-continuous
+// dispatcher above continues to drive boot; nothing calls this yet. Step 2
+// flips the JS to invoke ppc_worker_run_slice and observes throughput.
+//
+// SAB addresses are absolute (PPC_STATE_BASE = 0x02400000, STOP_FLAG at
+// 0x02500004) matching the constants used by ppc_worker.js. We do NOT
+// derive them from g_ppc_state_base because the stop flag lives outside
+// the PowerPCState block.
+//
+// ExitInfo packing (u64 return):
+//   low  32 bits = iters executed in this slice
+//   high 32 bits = exit reason enum:
+//     0 = downcount exhausted (downcount <= 0)
+//     1 = stop_flag set (page or dolphin requested yield)
+//     2 = exception pending (Exceptions != 0; JS handles delivery)
+//     3 = safety_cap (max_iters hit; hard 1M ceiling)
+//     4 = region_miss (region_dispatch returned false; JS handles compile)
+//
+// `flags` param: reserved for step 2 (e.g. ignore_downcount for perf
+// mode). Currently unused — all exits are evaluated normally.
+//
+// `wall_deadline_ms` param: also reserved; wall-time exits will be
+// added in step 2 once we have a low-overhead clock. Currently ignored.
+
+enum PpcSliceExitReason : u32 {
+    PPC_SLICE_EXIT_DOWNCOUNT  = 0u,
+    PPC_SLICE_EXIT_STOP_FLAG  = 1u,
+    PPC_SLICE_EXIT_EXCEPTION  = 2u,
+    PPC_SLICE_EXIT_SAFETY_CAP = 3u,
+    PPC_SLICE_EXIT_REGION_MISS = 4u,
+};
+
+// Hard safety ceiling — refuses to loop more than 1M iters per slice
+// regardless of caller-supplied max_iters. Prevents a runaway from
+// pegging the worker thread for an unbounded period.
+static constexpr u32 PPC_SLICE_SAFETY_CAP = 1000000u;
+
+// SAB absolute addresses (mirror the JS constants).
+static constexpr u32 PPC_SLICE_STATE_BASE       = 0x02400000u;
+static constexpr u32 PPC_SLICE_OFF_PC           = 0x000u;
+static constexpr u32 PPC_SLICE_OFF_EXC          = 0x2ECu;
+static constexpr u32 PPC_SLICE_OFF_DOWNCOUNT    = 0x2F0u;
+static constexpr u32 PPC_SLICE_STOP_FLAG_ADDR   = 0x02500004u;
+
+// Phase 2e Step 2: ExitInfo is written into SAB instead of returned packed
+// in a u64. Avoids BigInt complexity (BIGINT not enabled in build flags) and
+// keeps the C ABI simple (void return).  JS reads these two slots back after
+// the call.
+static constexpr u32 PPC_SLICE_EXIT_ITERS_ADDR  = 0x025000A0u;
+static constexpr u32 PPC_SLICE_EXIT_REASON_ADDR = 0x025000A4u;
+
+EMSCRIPTEN_KEEPALIVE
+void ppc_worker_run_slice(u32 max_iters, u32 wall_deadline_ms, u32 flags) {
+    (void)wall_deadline_ms;  // reserved for step 2
+    (void)flags;             // reserved for step 2
+
+    // Clamp caller cap to safety ceiling.
+    u32 cap = max_iters;
+    if (cap == 0u || cap > PPC_SLICE_SAFETY_CAP) cap = PPC_SLICE_SAFETY_CAP;
+
+    volatile u32* p_pc  = reinterpret_cast<volatile u32*>(
+        static_cast<uintptr_t>(PPC_SLICE_STATE_BASE + PPC_SLICE_OFF_PC));
+    u32* p_exc          = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(PPC_SLICE_STATE_BASE + PPC_SLICE_OFF_EXC));
+    int32_t* p_dc       = reinterpret_cast<int32_t*>(
+        static_cast<uintptr_t>(PPC_SLICE_STATE_BASE + PPC_SLICE_OFF_DOWNCOUNT));
+    int32_t* p_stop     = reinterpret_cast<int32_t*>(
+        static_cast<uintptr_t>(PPC_SLICE_STOP_FLAG_ADDR));
+    u32* p_exit_iters   = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(PPC_SLICE_EXIT_ITERS_ADDR));
+    u32* p_exit_reason  = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(PPC_SLICE_EXIT_REASON_ADDR));
+
+    u32 pc = *p_pc;
+    u32 iters = 0u;
+    PpcSliceExitReason reason = PPC_SLICE_EXIT_SAFETY_CAP;
+
+    for (; iters < cap; ++iters) {
+        // External stop flag (page or dolphin requesting yield).
+        if (__atomic_load_n(p_stop, __ATOMIC_ACQUIRE) != 0) {
+            reason = PPC_SLICE_EXIT_STOP_FLAG;
+            break;
+        }
+
+        // Exception pending? Exit; JS handles delivery (mailbox cmd 10).
+        // TODO(step 2+): inline EE-gated EXTERNAL_INT delivery here to
+        // avoid the JS round-trip on the common "external-only, EE=0"
+        // path. For now keep all exception handling in JS so step 2 is
+        // a pure refactor.
+        const u32 exc = __atomic_load_n(p_exc, __ATOMIC_ACQUIRE);
+        if (exc != 0u) {
+            reason = PPC_SLICE_EXIT_EXCEPTION;
+            break;
+        }
+
+        // Downcount exhausted?
+        const int32_t dc = __atomic_load_n(p_dc, __ATOMIC_ACQUIRE);
+        if (dc <= 0) {
+            reason = PPC_SLICE_EXIT_DOWNCOUNT;
+            break;
+        }
+
+        // Dispatch via merged-region path. region_dispatch crosses into
+        // JS via EM_ASM_INT to invoke the WASM region function — keeping
+        // each region's function table inside its own instance per the
+        // Q1 architectural decision (no shared WebAssembly.Table install).
+        s32 next = 0;
+        if (!g_bcache.region_dispatch(pc, &next)) {
+            reason = PPC_SLICE_EXIT_REGION_MISS;
+            break;
+        }
+
+        // Hit: decrement downcount by one cycle (block-cycles plumbing
+        // is step 2 / Q3). Use __atomic_sub_fetch to stay race-free with
+        // dolphin's parallel writes to downcount, matching the JS
+        // Atomics.sub(i32, dc, 1) call this replaces.
+        __atomic_sub_fetch(p_dc, 1, __ATOMIC_ACQ_REL);
+
+        // Publish next PC back to SAB and update local cursor.
+        pc = static_cast<u32>(next);
+        *p_pc = pc;
+    }
+
+    // safety-cap if we fell out of the loop normally.
+    if (iters >= cap && reason == PPC_SLICE_EXIT_SAFETY_CAP) {
+        reason = PPC_SLICE_EXIT_SAFETY_CAP;
+    }
+
+    // Phase 2e Step 2: publish ExitInfo into SAB instead of returning it.
+    // JS reads these two slots immediately after the call returns.
+    __atomic_store_n(p_exit_iters, iters, __ATOMIC_RELEASE);
+    __atomic_store_n(p_exit_reason, static_cast<u32>(reason), __ATOMIC_RELEASE);
+}
+
 }  // extern "C"
 
 // main: not used in worker mode (we're loaded as a library), but

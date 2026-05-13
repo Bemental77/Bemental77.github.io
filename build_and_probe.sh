@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stable build + link + probe pipeline for Dolphin/bementalCompiler iteration.
+# Stable build + link + probe pipeline for Dolphin/bementalJIT iteration.
 # Single command path so Claude Code permissions are granted once.
 #
 # Usage: build_and_probe.sh [probe_log_path]
@@ -26,6 +26,10 @@ echo "=== probe (log: $PROBE_LOG) ==="
 node /Users/caseybement/dolphin_render_probe.js > "$PROBE_LOG" 2>&1
 
 echo "=== summary ==="
+if grep -q '^\[probe\] EXIT-STUCK:' "$PROBE_LOG"; then
+  echo "*** PROBE TERMINATED EARLY — stuck pattern detected ***"
+  grep '^\[probe\] EXIT-STUCK:' "$PROBE_LOG"
+fi
 echo "--- canvas ---"
 grep "nonBlack" "$PROBE_LOG" | head -1
 echo "--- latest jit-inner ---"

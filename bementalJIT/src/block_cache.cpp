@@ -715,7 +715,7 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
                 rec.mem1_base, rec.mem1_mask, rec.ram_size,
                 rec.instr_pcs.data(),
                 &region_lookup_for_emit, &ctx,
-                /*emit_hle_check=*/true,
+                /*emit_hle_check=*/rec.emit_hle_check,
                 /*emit_perf_stub=*/rec.emit_perf_stub,
                 /*emit_hle_check_native=*/rec.emit_hle_check_native);
             rs.fn_bodies_concat.insert(rs.fn_bodies_concat.end(),
@@ -766,7 +766,7 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
             bins[i].mem1_mask      = rec.mem1_mask;
             bins[i].ram_size       = rec.ram_size;
             bins[i].instr_pcs      = rec.instr_pcs.data();
-            bins[i].emit_hle_check = true;
+            bins[i].emit_hle_check = rec.emit_hle_check;
             bins[i].emit_perf_stub = rec.emit_perf_stub;
             bins[i].emit_hle_check_native = rec.emit_hle_check_native;
         }

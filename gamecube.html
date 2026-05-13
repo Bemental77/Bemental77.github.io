@@ -270,11 +270,215 @@
         var Waddr = _dspSentBuf[0x026B0064 >> 2] >>> 0;
         var Wval  = _dspSentBuf[0x026B0068 >> 2] >>> 0;
         var Wmmio = _dspSentBuf[0x026B006C >> 2] >>> 0;
+        var E   = _dspSentBuf[0x026B0080 >> 2] >>> 0;
+        var Eud = _dspSentBuf[0x026B0084 >> 2] >>> 0;
+        var P       = _dspSentBuf[0x026B0090 >> 2] >>> 0;
+        var Picause = _dspSentBuf[0x026B0094 >> 2] >>> 0;
+        var Pimask  = _dspSentBuf[0x026B0098 >> 2] >>> 0;
+        var G       = _dspSentBuf[0x026B00A0 >> 2] >>> 0;
+        var Gsrr0   = _dspSentBuf[0x026B00A4 >> 2] >>> 0;
+        var H       = _dspSentBuf[0x026B00B0 >> 2] >>> 0;
+        // [dsp-sentinel L0..L5] per-PC read trace at six wild-idle polling
+        // PCs. Slot layout: 12 bytes per slot starting at SAB[0x026B0110].
+        //   L0 = 0x800f6470, L1 = 0x800f64ec, L2 = 0x800f6564,
+        //   L3 = 0x800f65dc, L4 = 0x800f6654, L5 = 0x800f6700.
+        var L0  = _dspSentBuf[0x026B0110 >> 2] >>> 0;
+        var L0a = _dspSentBuf[0x026B0114 >> 2] >>> 0;
+        var L0v = _dspSentBuf[0x026B0118 >> 2] >>> 0;
+        var L1  = _dspSentBuf[0x026B011C >> 2] >>> 0;
+        var L1a = _dspSentBuf[0x026B0120 >> 2] >>> 0;
+        var L1v = _dspSentBuf[0x026B0124 >> 2] >>> 0;
+        var L2  = _dspSentBuf[0x026B0128 >> 2] >>> 0;
+        var L2a = _dspSentBuf[0x026B012C >> 2] >>> 0;
+        var L2v = _dspSentBuf[0x026B0130 >> 2] >>> 0;
+        var L3  = _dspSentBuf[0x026B0134 >> 2] >>> 0;
+        var L3a = _dspSentBuf[0x026B0138 >> 2] >>> 0;
+        var L3v = _dspSentBuf[0x026B013C >> 2] >>> 0;
+        var L4  = _dspSentBuf[0x026B0140 >> 2] >>> 0;
+        var L4a = _dspSentBuf[0x026B0144 >> 2] >>> 0;
+        var L4v = _dspSentBuf[0x026B0148 >> 2] >>> 0;
+        var L5  = _dspSentBuf[0x026B014C >> 2] >>> 0;
+        var L5a = _dspSentBuf[0x026B0150 >> 2] >>> 0;
+        var L5v = _dspSentBuf[0x026B0154 >> 2] >>> 0;
+        var F       = _dspSentBuf[0x026B00D0 >> 2] >>> 0;
+        var Fsrc    = _dspSentBuf[0x026B00D4 >> 2] >>> 0;
+        var I       = _dspSentBuf[0x026B00E0 >> 2] >>> 0;
+        var Imail   = _dspSentBuf[0x026B00E4 >> 2] >>> 0;
+        // [dsp-sentinel J] dolphin-side writer trace for guest 0x803c136c
+        var J       = _dspSentBuf[0x026B00F0 >> 2] >>> 0;
+        var Jpc     = _dspSentBuf[0x026B00F4 >> 2] >>> 0;
+        var Jval    = _dspSentBuf[0x026B00F8 >> 2] >>> 0;
+        var Jw      = _dspSentBuf[0x026B00FC >> 2] >>> 0;
+        // [dsp-sentinel K] JIT-side MEM1-direct writer trace for guest 0x803c136c
+        var K       = _dspSentBuf[0x026B0100 >> 2] >>> 0;
+        var Kpc     = _dspSentBuf[0x026B0104 >> 2] >>> 0;
+        var Kval    = _dspSentBuf[0x026B0108 >> 2] >>> 0;
+        // [dsp-sentinel M + IRQchain first-8] external_int chain dispatch trace.
+        // M counts chain starts (PC == 0x80000500 / 0x500).
+        // 0x026B0170..0x026B018C = FIRST 8 PCs of the in-progress chain (live).
+        // 0x026B0190..0x026B01AF = FIRST 8 PCs of the previously-started chain
+        //                          (snapshot, frozen at the NEXT chain's start).
+        var M     = _dspSentBuf[0x026B0160 >> 2] >>> 0;
+        var IRQP0 = _dspSentBuf[0x026B0190 >> 2] >>> 0;
+        var IRQP1 = _dspSentBuf[0x026B0194 >> 2] >>> 0;
+        var IRQP2 = _dspSentBuf[0x026B0198 >> 2] >>> 0;
+        var IRQP3 = _dspSentBuf[0x026B019C >> 2] >>> 0;
+        var IRQP4 = _dspSentBuf[0x026B01A0 >> 2] >>> 0;
+        var IRQP5 = _dspSentBuf[0x026B01A4 >> 2] >>> 0;
+        var IRQP6 = _dspSentBuf[0x026B01A8 >> 2] >>> 0;
+        var IRQP7 = _dspSentBuf[0x026B01AC >> 2] >>> 0;
+        var IRQL0 = _dspSentBuf[0x026B0170 >> 2] >>> 0;
+        var IRQL1 = _dspSentBuf[0x026B0174 >> 2] >>> 0;
+        var IRQL2 = _dspSentBuf[0x026B0178 >> 2] >>> 0;
+        var IRQL3 = _dspSentBuf[0x026B017C >> 2] >>> 0;
+        var IRQL4 = _dspSentBuf[0x026B0180 >> 2] >>> 0;
+        var IRQL5 = _dspSentBuf[0x026B0184 >> 2] >>> 0;
+        var IRQL6 = _dspSentBuf[0x026B0188 >> 2] >>> 0;
+        var IRQL7 = _dspSentBuf[0x026B018C >> 2] >>> 0;
+        // [insn8040-dump] 8 PowerPC instruction words read from MEM1 at
+        // virtual 0x800e8040 (the OS interrupt prologue spin point). Dumped
+        // one-shot by JitWasm on first dispatch of that PC.
+        var I8_0 = _dspSentBuf[0x026B01B0 >> 2] >>> 0;
+        var I8_1 = _dspSentBuf[0x026B01B4 >> 2] >>> 0;
+        var I8_2 = _dspSentBuf[0x026B01B8 >> 2] >>> 0;
+        var I8_3 = _dspSentBuf[0x026B01BC >> 2] >>> 0;
+        var I8_4 = _dspSentBuf[0x026B01C0 >> 2] >>> 0;
+        var I8_5 = _dspSentBuf[0x026B01C4 >> 2] >>> 0;
+        var I8_6 = _dspSentBuf[0x026B01C8 >> 2] >>> 0;
+        var I8_7 = _dspSentBuf[0x026B01CC >> 2] >>> 0;
         console.log('[dsp-sentinel] A=' + A + ' B=' + B + ' C=' + C + ' D=' + D
           + ' lastDSPCR=0x' + lastVal.toString(16)
           + ' lastTempDSPReset=' + lastReset
           + ' W=' + W + ' Wmmio=' + Wmmio
-          + ' Wlast=0x' + Waddr.toString(16) + '=0x' + Wval.toString(16));
+          + ' Wlast=0x' + Waddr.toString(16) + '=0x' + Wval.toString(16)
+          + ' E=' + E + ' Eud=0x' + Eud.toString(16)
+          + ' P=' + P + ' PIcause=0x' + Picause.toString(16) + ' PImask=0x' + Pimask.toString(16)
+          + ' G=' + G + ' Gsrr0=0x' + Gsrr0.toString(16)
+          + ' H=' + H
+          + ' L0=' + L0 + ' L0=0x' + L0a.toString(16) + ':0x' + L0v.toString(16)
+          + ' L1=' + L1 + ' L1=0x' + L1a.toString(16) + ':0x' + L1v.toString(16)
+          + ' L2=' + L2 + ' L2=0x' + L2a.toString(16) + ':0x' + L2v.toString(16)
+          + ' L3=' + L3 + ' L3=0x' + L3a.toString(16) + ':0x' + L3v.toString(16)
+          + ' L4=' + L4 + ' L4=0x' + L4a.toString(16) + ':0x' + L4v.toString(16)
+          + ' L5=' + L5 + ' L5=0x' + L5a.toString(16) + ':0x' + L5v.toString(16)
+          + ' F=' + F + ' Fsrc=0x' + Fsrc.toString(16)
+          + ' I=' + I + ' Imail=0x' + Imail.toString(16)
+          + ' J=' + J + ' Jpc=0x' + Jpc.toString(16)
+          + ' Jval=0x' + Jval.toString(16) + ' Jw=' + Jw
+          + ' K=' + K + ' Kpc=0x' + Kpc.toString(16)
+          + ' Kval=0x' + Kval.toString(16)
+          + ' M=' + M
+          + ' IRQ_prev=[0x' + IRQP0.toString(16)
+          + ',0x' + IRQP1.toString(16)
+          + ',0x' + IRQP2.toString(16)
+          + ',0x' + IRQP3.toString(16)
+          + ',0x' + IRQP4.toString(16)
+          + ',0x' + IRQP5.toString(16)
+          + ',0x' + IRQP6.toString(16)
+          + ',0x' + IRQP7.toString(16) + ']'
+          + ' IRQ_live=[0x' + IRQL0.toString(16)
+          + ',0x' + IRQL1.toString(16)
+          + ',0x' + IRQL2.toString(16)
+          + ',0x' + IRQL3.toString(16)
+          + ',0x' + IRQL4.toString(16)
+          + ',0x' + IRQL5.toString(16)
+          + ',0x' + IRQL6.toString(16)
+          + ',0x' + IRQL7.toString(16) + ']'
+          + ' INSN8040=[0x' + ('00000000'+I8_0.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_1.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_2.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_3.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_4.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_5.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_6.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_7.toString(16)).slice(-8) + ']'
+          + ' Ntail=' + (_dspSentBuf[0x026B01D0 >> 2] >>> 0)
+          + ' r3_tail=0x' + (_dspSentBuf[0x026B01D4 >> 2] >>> 0).toString(16)
+          + ' Nhead=' + (_dspSentBuf[0x026B01E0 >> 2] >>> 0)
+          + ' r3_head=0x' + (_dspSentBuf[0x026B01E4 >> 2] >>> 0).toString(16)
+          + ' mem[r3_head]=0x' + (_dspSentBuf[0x026B01EC >> 2] >>> 0).toString(16)
+          + ' r4=0x' + (_dspSentBuf[0x026B01D8 >> 2] >>> 0).toString(16)
+          + ' T=' + (_dspSentBuf[0x026B0200 >> 2] >>> 0)
+          + ' Tmail=0x' + (_dspSentBuf[0x026B0204 >> 2] >>> 0).toString(16)
+          + ' R=' + (_dspSentBuf[0x026B0208 >> 2] >>> 0)
+          + ' Rmail=0x' + (_dspSentBuf[0x026B020C >> 2] >>> 0).toString(16)
+          // [dsp-sentinel MailFromDSP] CPU MMIO reads of DSP->CPU mailbox at
+          // 0xCC005004/06. MfHIr/MfLOr = read counts; MfHIlast/MfLOlast = last
+          // 16-bit values. feed = number of times the assembled 32-bit mail
+          // equalled 0x8071FEED (the ROM-ucode invitation mail).
+          + ' MfHIr=' + (_dspSentBuf[0x026B0280 >> 2] >>> 0)
+          + ' MfHIlast=0x' + (_dspSentBuf[0x026B0284 >> 2] >>> 0).toString(16)
+          + ' MfLOr=' + (_dspSentBuf[0x026B0288 >> 2] >>> 0)
+          + ' MfLOlast=0x' + (_dspSentBuf[0x026B028C >> 2] >>> 0).toString(16)
+          + ' feed=' + (_dspSentBuf[0x026B0290 >> 2] >>> 0)
+          + ' UE=' + (_dspSentBuf[0x026B02C8 >> 2] >>> 0)
+          + ' en=' + (_dspSentBuf[0x026B02CC >> 2] >>> 0)
+          + ' rb=' + (_dspSentBuf[0x026B02D0 >> 2] >>> 0)
+          + ' nb=' + (_dspSentBuf[0x026B02D4 >> 2] >>> 0)
+          // [dsp-sentinel RR] RemoveEvent(m_event_type_audio_dma) tripwire.
+          // Source scan found ZERO call sites in dolphin-src that RemoveEvent
+          // the audio_dma event — RR=0 is the expected value. A non-zero RR
+          // would indicate a code path we missed canceling the periodic
+          // AudioDMACallback (would leave F=1 instead of continuously firing).
+          + ' RR=' + (_dspSentBuf[0x026B02D8 >> 2] >>> 0)
+          + ' wj_cnt=' + (_dspSentBuf[0x026B0428 >> 2] >>> 0)
+          + ' wj_lr=0x' + (_dspSentBuf[0x026B0420 >> 2] >>> 0).toString(16)
+          + ' wj_ctr=0x' + (_dspSentBuf[0x026B0424 >> 2] >>> 0).toString(16)
+          + ' wj_r3=0x' + (_dspSentBuf[0x026B042C >> 2] >>> 0).toString(16)
+          + ' INSN5760=[0x' + ('00000000'+(_dspSentBuf[0x026B0400>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B0404>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B0408>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B040C>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B0410>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B0414>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B0418>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B041C>>2]>>>0).toString(16)).slice(-8) + ']'
+          + ' oslc=' + (_dspSentBuf[0x026B0430 >> 2] >>> 0)
+          + ' oslc_lr1=0x' + (_dspSentBuf[0x026B0434 >> 2] >>> 0).toString(16)
+          + ' oslc_lrN=0x' + (_dspSentBuf[0x026B0438 >> 2] >>> 0).toString(16)
+          + ' oslc_r3z=' + (_dspSentBuf[0x026B043C >> 2] >>> 0)
+          + ' oslc_lr0_1=0x' + (_dspSentBuf[0x026B0440 >> 2] >>> 0).toString(16)
+          + ' oslc_lr0_N=0x' + (_dspSentBuf[0x026B0444 >> 2] >>> 0).toString(16));
+        // [op0-hist] per-PC histogram of op0 interpreter fallbacks (set by
+        // dolphin_interp in JitWasm.cpp). 16-slot ring at SAB[0x026B0300..],
+        // counts at SAB[0x026B0340..], unique-PC count at SAB[0x026B02E0],
+        // total op0 fallbacks at SAB[0x026B02E4]. Distinguishes (a) few hot
+        // PCs hitting op0 (bug to fix) vs (b) spread across address space
+        // (legitimate traps) vs (c) all-zero from cache leftovers.
+        {
+          var op0Unique = _dspSentBuf[0x026B02E0 >> 2] >>> 0;
+          var op0Total  = _dspSentBuf[0x026B02E4 >> 2] >>> 0;
+          if (op0Unique > 16) op0Unique = 16;
+          var op0Parts = [];
+          for (var k = 0; k < op0Unique; k++) {
+            var pc = _dspSentBuf[(0x026B0300 + k * 4) >> 2] >>> 0;
+            var cnt = _dspSentBuf[(0x026B0340 + k * 4) >> 2] >>> 0;
+            op0Parts.push('0x' + pc.toString(16) + '=' + cnt);
+          }
+          console.log('[op0-hist] total=' + op0Total + ' unique=' + op0Unique
+            + ' pcs=[' + op0Parts.join(',') + ']');
+        }
+        // [dsp-sentinel MailsCPU/MailsDSP] first-8 chronological mail rings.
+        // CPU->DSP ring at 0x026B0220..3F, head at 0x026B0260.
+        // DSP->CPU ring at 0x026B0240..5F, head at 0x026B0264.
+        {
+          var headCPU = _dspSentBuf[0x026B0260 >> 2] >>> 0;
+          var headDSP = _dspSentBuf[0x026B0264 >> 2] >>> 0;
+          if (headCPU > 8) headCPU = 8;
+          if (headDSP > 8) headDSP = 8;
+          var partsCPU = [];
+          for (var i = 0; i < headCPU; i++) {
+            partsCPU.push('0x' + (_dspSentBuf[(0x026B0220 + i * 4) >> 2] >>> 0).toString(16));
+          }
+          var partsDSP = [];
+          for (var j = 0; j < headDSP; j++) {
+            partsDSP.push('0x' + (_dspSentBuf[(0x026B0240 + j * 4) >> 2] >>> 0).toString(16));
+          }
+          var AC = _dspSentBuf[0x026B02C0 >> 2] >>> 0;
+          console.log('[dsp-sentinel] MailsCPU=[' + partsCPU.join(',') + ']'
+            + ' MailsDSP=[' + partsDSP.join(',') + ']'
+            + ' AC=' + AC);
+        }
         // Phase IV gate diagnostic counters (written by run_iter_batch in
         // EmscriptenWorker.cpp; read here via SAB at fixed offsets).
         var rb_total   = _dspSentBuf[0x025010C0 >> 2] >>> 0;

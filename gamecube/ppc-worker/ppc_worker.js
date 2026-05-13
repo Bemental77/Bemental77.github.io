@@ -99,6 +99,9 @@
     ppcWorkerModule({ wasmMemory: memory })
       .then((m) => {
         mod = m;
+        // Default Phase 2e C-slice path ON. Override with =0 to use legacy
+        // JS dispatch loop. See ppc_worker_run_slice in ppc_worker_main.cpp.
+        if (mod.PPC_WORKER_USE_C_SLICE === undefined) mod.PPC_WORKER_USE_C_SLICE = 1;
         const v = mod._ppc_worker_version();
         postMessage({ cmd: 'ready', version: v });
       })
@@ -738,7 +741,168 @@
         const PH4_DIAG_EXC    = 0x025010EC;
         const PH4_DIAG_EXIT   = 0x025010F0;  // 0=running, 1=exited
         Atomics.store(i32, PH4_DIAG_EXIT >> 2, 0);
-        for (; iters < safetyCap; ++iters) {
+
+        // Phase 2e Step 2: feature-flagged C-side dispatch loop. When
+        // Module.PPC_WORKER_USE_C_SLICE === 1, the inner per-block
+        // while-loop is replaced by repeated calls to the C function
+        // _ppc_worker_run_slice which owns the iteration. ExitInfo is
+        // returned via SAB (no BigInt needed): SAB[0x025000A0]=iters,
+        // SAB[0x025000A4]=reason. All JS-side housekeeping (relink-due
+        // checks, ack postMessage, slice-budget commit) stays here,
+        // wrapped OUTSIDE the C call. Default OFF — flag must be
+        // explicitly enabled (Module.PPC_WORKER_USE_C_SLICE = 1) before
+        // posting 'run-continuous' to opt in.
+        //
+        // Exit reasons (mirror C enum PpcSliceExitReason):
+        //   0 = downcount-exhausted (downcount <= 0)   → exit slice
+        //   1 = stop-flag (SAB stop set)               → exit slice
+        //   2 = exception-pending (Exceptions != 0)    → cmd 10 + re-enter
+        //   3 = safety-cap (1M iters)                  → re-enter (just sliced)
+        //   4 = region-miss (compile path needed)      → compile + re-enter
+        if (mod && mod.PPC_WORKER_USE_C_SLICE === 1
+            && typeof mod._ppc_worker_run_slice === 'function') {
+          const EXIT_ITERS_ADDR  = 0x025000A0;
+          const EXIT_REASON_ADDR = 0x025000A4;
+          const REASON_DOWNCOUNT  = 0;
+          const REASON_STOP_FLAG  = 1;
+          const REASON_EXCEPTION  = 2;
+          const REASON_SAFETY_CAP = 3;
+          const REASON_REGION_MISS = 4;
+          // Per-C-call cap. Smaller than safetyCap so JS housekeeping
+          // (relink-due check + diag publish) runs often enough to keep
+          // the merged-region path fresh and the page observable.
+          const C_SLICE_CAP = 4096;
+          // mailbox cmd 10 helper (mirrors the call1 helper defined in
+          // 'setup-bemental-env'; not in scope here, so call mailbox
+          // sync directly).
+          const _mboxCall10 = (pcArg) =>
+            mod._ppc_worker_mailbox_call_sync(10, pcArg >>> 0) >>> 0;
+          let exitedSlice = false;
+          while (!exitedSlice && iters < safetyCap) {
+            // Outer-loop housekeeping — same checks JS used to do per
+            // iter, now done per C-slice. Cheap enough to run every
+            // entry (the merged-region force-relink kicks once iters<16
+            // and not at all after; relink_region_if_due is a few
+            // hashmap checks).
+            if (mergedRegion) {
+              if (iters < 16) {
+                mod._ppc_worker_force_relink_all(0);
+              } else {
+                mod._ppc_worker_relink_region_if_due(0);
+              }
+            }
+            // Publish SAB diag so page can observe progress.
+            Atomics.store(i32, PH4_DIAG_ITERS >> 2, iters | 0);
+            Atomics.store(i32, PH4_DIAG_PC >> 2, pc | 0);
+            Atomics.store(i32, PH4_DIAG_DC >> 2,
+              i32[(PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2] | 0);
+            Atomics.store(i32, PH4_DIAG_EXC >> 2,
+              u32[(PPC_STATE_BASE + OFFSET_EXC) >> 2] | 0);
+            // Call into C — owns the inner dispatch loop. Writes
+            // ExitInfo into SAB at EXIT_ITERS_ADDR / EXIT_REASON_ADDR.
+            // wall_deadline_ms / flags reserved (0).
+            mod._ppc_worker_run_slice(C_SLICE_CAP, 0, 0);
+            const sliceIters  = u32[EXIT_ITERS_ADDR  >> 2] >>> 0;
+            const sliceReason = u32[EXIT_REASON_ADDR >> 2] >>> 0;
+            iters += sliceIters;
+            sliceCyclesBurned += sliceIters;
+            // Refresh local pc cursor from SAB (C wrote it back).
+            pc = u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] >>> 0;
+            // Drive periodic CT pure-events drain — same cadence as
+            // the legacy loop (every CT_FIRE_EVERY iters).
+            if (sliceIters > 0) {
+              const gtl = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
+              const gth = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
+              mod._ppc_worker_ct_fire_due_pure(gtl, gth);
+            }
+            // Dispatch on exit reason.
+            switch (sliceReason) {
+              case REASON_DOWNCOUNT:
+                exitReason = 'downcount-exhausted';
+                exitedSlice = true;
+                break;
+              case REASON_STOP_FLAG:
+                exitReason = 'stop-flag';
+                exitedSlice = true;
+                break;
+              case REASON_EXCEPTION: {
+                // Mirror the legacy gating: deliver only when EE is on
+                // for external-only interrupts (otherwise we'd thrash).
+                const exc = u32[(PPC_STATE_BASE + OFFSET_EXC) >> 2] >>> 0;
+                const msr = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
+                const EXC_EXTERNAL_INT = 0x00000004;
+                const MSR_EE = 0x8000;
+                const externalOnly = (exc & ~EXC_EXTERNAL_INT) === 0;
+                if (!externalOnly || (msr & MSR_EE) !== 0) {
+                  _mboxCall10(pc >>> 0);
+                  pc = u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] >>> 0;
+                  // Continue: re-enter slice from the (possibly
+                  // vector-redirected) new pc.
+                } else {
+                  // EE off + external-only: dolphin will hold the
+                  // interrupt until EE comes on. Exit the slice so
+                  // dolphin's service_iter can update state.
+                  exitReason = 'exception-pending';
+                  exitedSlice = true;
+                }
+                break;
+              }
+              case REASON_REGION_MISS: {
+                if (!compileOnMiss) {
+                  exitReason = 'unmapped';
+                  exitedSlice = true;
+                  break;
+                }
+                const bytesSize = mod._ppc_worker_compile_and_accumulate(pc) >>> 0;
+                if (bytesSize > 0) {
+                  ++compileCalls;
+                  totalCompileBytes += bytesSize;
+                }
+                // Force-relink in early warmup so the first miss-storm
+                // doesn't sit compiling for 64 iters before a module
+                // materializes. Matches the legacy path's policy.
+                if (iters < 16 && bytesSize > 0) {
+                  mod._ppc_worker_force_relink_all(0);
+                } else {
+                  mod._ppc_worker_relink_region_if_due(0);
+                }
+                // pc unchanged; re-enter slice — next dispatch retries.
+                break;
+              }
+              case REASON_SAFETY_CAP:
+                // Hit the C-side 1M ceiling — just re-enter. iters
+                // bookkeeping above already accumulated.
+                break;
+              default:
+                exitReason = 'unknown-c-exit-reason: ' + sliceReason;
+                exitedSlice = true;
+                break;
+            }
+            // Wall-time cap (perf-measurement mode).
+            if (wallTimeMs > 0) {
+              const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+              if ((now - wallStart) >= wallTimeMs) {
+                exitReason = 'wall-time-cap';
+                exitedSlice = true;
+              }
+            }
+            // Phase IV slice cycles budget.
+            if (sliceCyclesCap > 0 && sliceCyclesBurned >= sliceCyclesCap) {
+              exitReason = 'slice-budget';
+              exitedSlice = true;
+            }
+          }
+          // Skip the legacy for-loop below; jump straight to the
+          // post-loop commit + ack via a sentinel that mimics natural
+          // loop exit. The if/for split makes that awkward, so we use
+          // a labelled break would be cleaner — but for surgical
+          // minimality we just guard the for-loop with a flag.
+        }
+        // Legacy JS inner loop (default path). Skipped when the C-slice
+        // path above ran to completion.
+        for (; (!(mod && mod.PPC_WORKER_USE_C_SLICE === 1
+                  && typeof mod._ppc_worker_run_slice === 'function'))
+               && iters < safetyCap; ++iters) {
           // Update SAB diag every 256 iters so we can see progress
           // from the page even if no ack ever fires.
           if ((iters & 0xFF) === 0) {

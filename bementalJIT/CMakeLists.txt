@@ -42,6 +42,14 @@ if(BEMENTAL_GUEST_POWERPC)
     add_subdirectory(guests/powerpc)
 endif()
 
+# Phase 1 parallel rebuild target — IR substrate (CodeOp/CodeBlock/PPCAnalyzer)
+# that the existing emitter will progressively consume. Additive; safe to
+# build alongside guests/powerpc/ until cut-over per scope-doc §7.
+option(BEMENTAL_GUEST_POWERPC_NEXT "Build the Jit64-modeled PowerPC rebuild (parallel to powerpc/)" ON)
+if(BEMENTAL_GUEST_POWERPC_NEXT)
+    add_subdirectory(guests/powerpc-next)
+endif()
+
 # ---- Tests -----------------------------------------------------------------
 
 option(BEMENTAL_BUILD_TESTS "Build bementalJIT test harnesses" OFF)

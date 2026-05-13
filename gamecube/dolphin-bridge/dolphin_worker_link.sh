@@ -39,6 +39,7 @@ emcc \
   $BUILD/Source/Core/Common/libcommon.a \
   $BUILD/bementalJIT/libbementalJIT.a \
   $BUILD/bementalJIT/guests/powerpc/libbementalJITPowerPC.a \
+  $BUILD/bementalJIT/guests/powerpc-next/libbementalJITPowerPCNext.a \
   $BUILD/Externals/imgui/libimgui.a \
   $BUILD/Externals/implot/libimplot.a \
   $BUILD/Externals/fmt/fmt/libfmt.a \
