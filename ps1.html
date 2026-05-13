@@ -159,16 +159,16 @@
   const ROM_ROOT = '/ps1/ps1Wasm/roms/';
   function chunkRange(base, lastLetter) { var urls = []; for (var i = 'a'.charCodeAt(0); i <= lastLetter.charCodeAt(0); i++) { urls.push(ROM_ROOT + base + '.bin.parta' + String.fromCharCode(i)); } return urls; }
   const ROMS = [
-    { label: 'Monster Rancher 2', base: 'MonsterRancher2', chunks: chunkRange('MonsterRancher2', 'f') },
-    { label: 'Metal Gear Solid (Disc 1)', base: 'MetalGearSolidDisc1', chunks: chunkRange('MetalGearSolidDisc1', 'h') },
-    { label: 'Metal Gear Solid (Disc 2)', base: 'MetalGearSolidDisc2', chunks: chunkRange('MetalGearSolidDisc2', 'i') },
-    { label: "Harry Potter & the Sorcerer's Stone", base: 'HarryPotterSorcerersStone', chunks: chunkRange('HarryPotterSorcerersStone', 'd') },
-    { label: 'Legend of Dragoon (Disc 1)', base: 'LegendOfDragoonDisc1', chunks: chunkRange('LegendOfDragoonDisc1', 'f') },
-    { label: 'Legend of Dragoon (Disc 2)', base: 'LegendOfDragoonDisc2', chunks: chunkRange('LegendOfDragoonDisc2', 'g') },
-    { label: 'Legend of Dragoon (Disc 3)', base: 'LegendOfDragoonDisc3', chunks: chunkRange('LegendOfDragoonDisc3', 'g') },
-    { label: 'Legend of Dragoon (Disc 4)', base: 'LegendOfDragoonDisc4', chunks: chunkRange('LegendOfDragoonDisc4', 'i') }
+    { label: 'Monster Rancher 2', base: 'MonsterRancher2', size: 451280592, chunks: chunkRange('MonsterRancher2', 'f') },
+    { label: 'Metal Gear Solid (Disc 1)', base: 'MetalGearSolidDisc1', size: 705614112, chunks: chunkRange('MetalGearSolidDisc1', 'h') },
+    { label: 'Metal Gear Solid (Disc 2)', base: 'MetalGearSolidDisc2', size: 731911824, chunks: chunkRange('MetalGearSolidDisc2', 'i') },
+    { label: "Harry Potter & the Sorcerer's Stone", base: 'HarryPotterSorcerersStone', size: 346032644, chunks: chunkRange('HarryPotterSorcerersStone', 'd') },
+    { label: 'Legend of Dragoon (Disc 1)', base: 'LegendOfDragoonDisc1', size: 484951824, chunks: chunkRange('LegendOfDragoonDisc1', 'f') },
+    { label: 'Legend of Dragoon (Disc 2)', base: 'LegendOfDragoonDisc2', size: 576009504, chunks: chunkRange('LegendOfDragoonDisc2', 'g') },
+    { label: 'Legend of Dragoon (Disc 3)', base: 'LegendOfDragoonDisc3', size: 559173888, chunks: chunkRange('LegendOfDragoonDisc3', 'g') },
+    { label: 'Legend of Dragoon (Disc 4)', base: 'LegendOfDragoonDisc4', size: 748204128, chunks: chunkRange('LegendOfDragoonDisc4', 'i') }
   ];
-  var ROM_NAME = ROMS[0].base, ROM_CHUNKS = ROMS[0].chunks;
+  var ROM_NAME = ROMS[0].base, ROM_CHUNKS = ROMS[0].chunks, ROM_SIZE = ROMS[0].size || 0;
   const KEYMAP = { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', cross: 'z', circle: 'x', square: 's', triangle: 'd', l1: 'w', r1: 'r', l2: 'e', r2: 't', start: 'v', select: 'c' };
   const $ = id => document.getElementById(id);
   (function populateRomSelect() {
@@ -191,7 +191,19 @@
   function getAudioCtx() { try { return (Module && Module.preCreatedAudioContext) || (Module && Module.SDL && Module.SDL.audioContext) || null; } catch (e) { return null; } }
   function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } }
   document.addEventListener('click', resumeAudio); document.addEventListener('keydown', resumeAudio); document.addEventListener('visibilitychange', resumeAudio);
-  window.var_setup = function () { pageLog('[ui] var_setup — spawning worker'); SoundFeedStreamData = Module.cwrap('SoundFeedStreamData', 'null', ['number', 'number']); vram_ptr = Module._get_ptr(0); padStatus1 = Module._get_ptr(1); padStatus2 = Module._get_ptr(2); Module.SDL.defaults.copyOnLock = false; Module.SDL.defaults.opaqueFrontBuffer = false; pcsx_worker = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?v=' + Date.now()); pcsx_worker.onmessage = onWorkerMsg; window.pcsx_worker = pcsx_worker; setStatus('Runtime ready. Fetching ROM...'); fetchRomAndBoot(); };
+  var VRAM_SAB_HDR_BYTES = 64, VRAM_SAB_PAYLOAD_BYTES = 1024 * 2048;
+  var vramSAB = null, vramSabI32 = null, vramSabBytes = null;
+  function tryAllocVramSab() {
+    try {
+      if (typeof SharedArrayBuffer !== 'function') return false;
+      if (typeof crossOriginIsolated !== 'undefined' && !crossOriginIsolated) return false;
+      vramSAB = new SharedArrayBuffer(VRAM_SAB_HDR_BYTES + VRAM_SAB_PAYLOAD_BYTES);
+      vramSabI32 = new Int32Array(vramSAB, 0, 16);
+      vramSabBytes = new Uint8Array(vramSAB, VRAM_SAB_HDR_BYTES, VRAM_SAB_PAYLOAD_BYTES);
+      return true;
+    } catch (e) { pageLog('[vram-sab] alloc failed: ' + e); vramSAB = vramSabI32 = vramSabBytes = null; return false; }
+  }
+  window.var_setup = function () { pageLog('[ui] var_setup — spawning worker'); SoundFeedStreamData = Module.cwrap('SoundFeedStreamData', 'null', ['number', 'number']); vram_ptr = Module._get_ptr(0); padStatus1 = Module._get_ptr(1); padStatus2 = Module._get_ptr(2); Module.SDL.defaults.copyOnLock = false; Module.SDL.defaults.opaqueFrontBuffer = false; pcsx_worker = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?v=' + Date.now()); pcsx_worker.onmessage = onWorkerMsg; window.pcsx_worker = pcsx_worker; if (tryAllocVramSab()) { pcsx_worker.postMessage({ cmd: 'vramSab', sab: vramSAB }); pageLog('[vram-sab] installed (' + (VRAM_SAB_PAYLOAD_BYTES/1048576) + ' MiB)'); } setStatus('Runtime ready. Fetching ROM...'); fetchRomAndBoot(); };
 
   var mobilePadState = { cross: false, circle: false, square: false, triangle: false, l1: false, r1: false, l2: false, r2: false, start: false, select: false, up: false, down: false, left: false, right: false };
 
@@ -298,17 +310,20 @@
     var arr; while (states_arrs.length > 50) states_arrs.pop();
     if (states_arrs.length > 0) { arr = states_arrs.pop(); arr.set(src); } else arr = new Uint8Array(src);
     pcsx_worker.postMessage({ cmd: 'padStatus', states: arr }, [arr.buffer]);
-    setTimeout(pollController, 10);
+    setTimeout(pollController, 33);
   }
 
   var renderFrames = 0, lastFpsLog = performance.now();
+  var _perfLastRenderMs = 0, _perfGapSum = 0, _perfGapMax = 0, _perfGapCount = 0;
+  var _perfProcSum = 0, _perfProcMax = 0;
   function onWorkerMsg(e) {
     var data = e.data;
     switch (data.cmd) {
       case 'print': pageLog('> ' + data.txt); break;
       case 'setStatus': setStatus(data.txt); break;
       case 'setUI': break;
-      case 'render': { var v = data.vram; Module.HEAPU8.set(v, vram_ptr); pcsx_worker.postMessage({ cmd: 'return_vram', vram: v }, [v.buffer]); Module._render(data.x, data.y, data.sx, data.sy, data.dx, data.dy, data.rgb24); renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now - lastFpsLog)).toFixed(1); renderFrames = 0; lastFpsLog = now; } break; }
+      case 'render': { var _t0 = performance.now(); if (_perfLastRenderMs) { var _gap = _t0 - _perfLastRenderMs; _perfGapSum += _gap; if (_gap > _perfGapMax) _perfGapMax = _gap; _perfGapCount++; } _perfLastRenderMs = _t0; var v = data.vram; Module.HEAPU8.set(v, vram_ptr); pcsx_worker.postMessage({ cmd: 'return_vram', vram: v }, [v.buffer]); Module._render(data.x, data.y, data.sx, data.sy, data.dx, data.dy, data.rgb24); renderFrames++; var _t1 = performance.now(); var _proc = _t1 - _t0; _perfProcSum += _proc; if (_proc > _perfProcMax) _perfProcMax = _proc; var now = _t1; if (now - lastFpsLog > 1000) { var _gapAvg = _perfGapCount ? (_perfGapSum / _perfGapCount).toFixed(1) : '?'; var _procAvg = renderFrames ? (_perfProcSum / renderFrames).toFixed(2) : '?'; fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now - lastFpsLog)).toFixed(1) + ' | gap avg=' + _gapAvg + 'ms max=' + _perfGapMax.toFixed(0) + 'ms | proc avg=' + _procAvg + 'ms max=' + _perfProcMax.toFixed(1) + 'ms'; renderFrames = 0; lastFpsLog = now; _perfGapSum = 0; _perfGapMax = 0; _perfGapCount = 0; _perfProcSum = 0; _perfProcMax = 0; } break; }
+      case 'renderTick': { var _t0 = performance.now(); if (_perfLastRenderMs) { var _gap = _t0 - _perfLastRenderMs; _perfGapSum += _gap; if (_gap > _perfGapMax) _perfGapMax = _gap; _perfGapCount++; } _perfLastRenderMs = _t0; if (!vramSabI32 || !vramSabBytes) break; var rx,ry,rsx,rsy,rdx,rdy,rrgb,ok=false; for (var attempt=0; attempt<8; attempt++) { var s0 = Atomics.load(vramSabI32, 0); if (s0 & 1) continue; rx=Atomics.load(vramSabI32,1); ry=Atomics.load(vramSabI32,2); rsx=Atomics.load(vramSabI32,3); rsy=Atomics.load(vramSabI32,4); rdx=Atomics.load(vramSabI32,5); rdy=Atomics.load(vramSabI32,6); rrgb=Atomics.load(vramSabI32,7); Module.HEAPU8.set(vramSabBytes, vram_ptr); var s1 = Atomics.load(vramSabI32, 0); if (s1 === s0) { ok = true; break; } } if (!ok) break; Module._render(rx,ry,rsx,rsy,rdx,rdy,rrgb); renderFrames++; var _t1 = performance.now(); var _proc = _t1 - _t0; _perfProcSum += _proc; if (_proc > _perfProcMax) _perfProcMax = _proc; var now2 = _t1; if (now2 - lastFpsLog > 1000) { var _gapAvg2 = _perfGapCount ? (_perfGapSum / _perfGapCount).toFixed(1) : '?'; var _procAvg2 = renderFrames ? (_perfProcSum / renderFrames).toFixed(2) : '?'; fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now2 - lastFpsLog)).toFixed(1) + ' | gap avg=' + _gapAvg2 + 'ms max=' + _perfGapMax.toFixed(0) + 'ms | proc avg=' + _procAvg2 + 'ms max=' + _perfProcMax.toFixed(1) + 'ms [SAB]'; renderFrames = 0; lastFpsLog = now2; _perfGapSum = 0; _perfGapMax = 0; _perfGapCount = 0; _perfProcSum = 0; _perfProcMax = 0; } break; }
       case 'return_states': states_arrs.push(data.states); break;
       case 'SoundFeedStreamData': { if (audioMuted || audioDraining) break; var ps = data.pSound; if (!window._soundScratchPtr) { window._soundScratchPtr = Module._malloc(8192); window._soundScratchSize = 8192; } if (data.lBytes > window._soundScratchSize) { Module._free(window._soundScratchPtr); window._soundScratchSize = data.lBytes; window._soundScratchPtr = Module._malloc(window._soundScratchSize); } Module.HEAPU8.set(ps.subarray(0, data.lBytes), window._soundScratchPtr); SoundFeedStreamData(window._soundScratchPtr, data.lBytes); break; }
       case 'stateSaved': if (pendingSaveResolve) { pendingSaveResolve(new Uint8Array(data.heap)); pendingSaveResolve = null; } break;
@@ -317,18 +332,32 @@
     }
   }
 
+  async function probeChunkSize(u) {
+    try {
+      var r = await fetch(u, { method: 'HEAD' });
+      if (r.ok) { var cl = +(r.headers.get('Content-Length') || 0); if (cl > 0) return cl; }
+    } catch (e) {}
+    try {
+      var r = await fetch(u, { headers: { 'Range': 'bytes=0-0' } });
+      if (r.ok || r.status === 206) {
+        var cr = r.headers.get('Content-Range') || '';
+        var m = cr.match(/\/(\d+)/);
+        if (m) { try { await r.arrayBuffer(); } catch (e) {} return +m[1]; }
+      }
+    } catch (e) {}
+    return 0;
+  }
   async function fetchRomAndBoot() {
     setStatus('Sizing ROM…');
-    var totalSize = 0;
-    try {
-      var sizes = await Promise.all(ROM_CHUNKS.map(async function (u) {
-        try { var r = await fetch(u, { method: 'HEAD' }); return r.ok ? +(r.headers.get('Content-Length') || 0) : 0; }
-        catch (e) { return 0; }
-      }));
-      totalSize = sizes.reduce(function (a, b) { return a + b; }, 0);
-    } catch (e) { pageLog('[rom] sizing skipped: ' + e); }
+    var totalSize = ROM_SIZE || 0;
+    if (!totalSize) {
+      try {
+        var sizes = await Promise.all(ROM_CHUNKS.map(probeChunkSize));
+        totalSize = sizes.reduce(function (a, b) { return a + b; }, 0);
+      } catch (e) { pageLog('[rom] sizing skipped: ' + e); }
+    }
     var totalMB = totalSize ? (totalSize/1048576).toFixed(0) : '?';
-    pageLog('[rom] size hint ' + totalMB + ' MB across ' + ROM_CHUNKS.length + ' chunks');
+    pageLog('[rom] size ' + totalMB + ' MB (' + (ROM_SIZE ? 'hardcoded' : 'probed') + ') across ' + ROM_CHUNKS.length + ' chunks');
     pcsx_worker.postMessage({ cmd: 'romBegin', name: ROM_NAME + '.bin', size: totalSize });
     var total = 0;
     var BATCH_BYTES = 1 << 20;
@@ -371,7 +400,7 @@
     setTimeout(pollController, 10);
     [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
   }
-  var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; SAVE_KEY = ROM_NAME + '.ps1state'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...'); setStatus('Loading LLVM runtime...'); var s = document.createElement('script'); s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now(); document.body.appendChild(s); }
+  var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; ROM_SIZE = pick.size || 0; SAVE_KEY = ROM_NAME + '.ps1state'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...'); setStatus('Loading LLVM runtime...'); var s = document.createElement('script'); s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now(); document.body.appendChild(s); }
   $('btnStart').addEventListener('click', startEmulator);
   const DB_NAME = 'PS1WASMDB', STORE = 'PS1WASMSTATES'; var SAVE_KEY = ROM_NAME + '.ps1state';
   function openDB() { return new Promise((resolve, reject) => { var req = indexedDB.open(DB_NAME); req.onupgradeneeded = e => e.target.result.createObjectStore(STORE); req.onsuccess = e => resolve(e.target.result); req.onerror = () => reject(req.error); }); }

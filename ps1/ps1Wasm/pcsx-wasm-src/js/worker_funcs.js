@@ -147,10 +147,21 @@ var clear_event_history = function () {
 	};
 	setTimeout("Module.setStatus('Open an iso file using the above button(worker ready!).')", 1);
 }
+var _romName, _romBuffer = null, _romOffset = 0, _romSize = 0;
 var pre_onmessage = function (event) {
-	if (event.data.cmd != 'soundBytes') {
+	var c = event.data.cmd;
+	if (c == "romBegin" || c == "romChunk" || c == "romEnd") {
+		if (c == "romEnd") {
+			clear_event_history();
+			setTimeout(function () { main_onmessage(event) }, 0);
+		} else {
+			main_onmessage(event);
+		}
+		return;
+	}
+	if (c != 'soundBytes') {
 		event_history.push(event);
-		cout_print("push event" + event.data.cmd);
+		cout_print("push event" + c);
 	}
 }
 self.onmessage = pre_onmessage;
@@ -216,6 +227,61 @@ var main_onmessage = function (event) {
 			} catch (e) {
 				cout_print('loadState failed: ' + e);
 				postMessage({ cmd: 'stateLoaded' });
+			}
+			break;
+
+		case "romBegin":
+			try {
+				_romName = data.name;
+				_romSize = data.size | 0;
+				var _init = _romSize ? Math.ceil(_romSize * 1.03) : 33554432;
+				_romBuffer = new Uint8Array(_init);
+				_romOffset = 0;
+				cout_print("romBegin " + _romName + " hint=" + _romSize + " alloc=" + _init + "\n");
+			} catch (e) {
+				cout_print("romBegin failed: " + e);
+				_romBuffer = null;
+			}
+			break;
+
+		case "romChunk":
+			try {
+				if (!_romBuffer) { cout_print("romChunk without romBegin\n"); break; }
+				var _c = new Uint8Array(data.buf);
+				var _need = _romOffset + _c.length;
+				if (_need > _romBuffer.length) {
+					var _ns = Math.max(_need + 16777216, Math.ceil(_romBuffer.length * 1.25));
+					var _nb = new Uint8Array(_ns);
+					_nb.set(_romBuffer.subarray(0, _romOffset), 0);
+					_romBuffer = _nb;
+					_nb = null;
+					cout_print("romBuffer grew to " + _ns + "\n");
+				}
+				_romBuffer.set(_c, _romOffset);
+				_romOffset += _c.length;
+			} catch (e) {
+				cout_print("romChunk failed at offset " + _romOffset + ": " + e);
+				_romBuffer = null;
+			}
+			break;
+
+		case "romEnd":
+			try {
+				if (!_romBuffer) { cout_print("romEnd without buffer\n"); break; }
+				var _final = (_romOffset < _romBuffer.length) ? _romBuffer.subarray(0, _romOffset) : _romBuffer;
+				try { FS.unlink("/" + _romName); } catch (e) {}
+				FS.createDataFile("/", _romName, _final, true, true);
+				_romBuffer = null;
+				Module.setStatus("Running!");
+				pcsx_init("/" + _romName);
+				padStatus1 = _get_ptr(-2);
+				vram_ptr = _get_ptr(-1);
+				soundbuffer_ptr = _get_ptr(7);
+				isMute_ptr = _get_ptr(8);
+				cout_print("romEnd booted, " + _romOffset + " bytes\n");
+				pcsx_mainloop();
+			} catch (e) {
+				cout_print("romEnd failed: " + e);
 			}
 			break;
 
