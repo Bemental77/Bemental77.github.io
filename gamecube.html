@@ -189,12 +189,1297 @@
   function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
   function toast(msg, isErr) { toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200); }
   const isMobile = (() => { const ua = navigator.userAgent.toLowerCase(); return /iphone|ipad|ipod|android|mobile|xbox/.test(ua) || ('ontouchstart' in window) || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile'); })();
-  var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/gamecube/dolphin_libretro/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: $('canvas'), setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {} };
-  var padStatus1, vram_ptr; var dolphin_worker = null; var states_arrs = []; var audioMuted = false; var pendingSaveResolve = null; var pendingLoadResolve = null;
+  // Module uses a hidden dummy canvas. The real display canvas (#canvas)
+  // is transferred to the GPU worker via transferControlToOffscreen and
+  // is no longer accessible to main-thread getContext calls. SDL's
+  // automatic canvas-context init would otherwise throw on the transferred
+  // canvas. Module is mainly used for audio output; the dummy canvas
+  // satisfies SDL's "canvas required" assumption.
+  var _moduleDummyCanvas = document.createElement('canvas');
+  _moduleDummyCanvas.style.display = 'none';
+  _moduleDummyCanvas.width = 1;
+  _moduleDummyCanvas.height = 1;
+  // Phase 2c Step 3: PAGE allocates ONE shared WebAssembly.Memory
+  // (sized to dolphin_worker's INITIAL_MEMORY = 512 MB, MAX = 4 GB).
+  // Set on Module.wasmMemory BEFORE dolphin_libretro.js runs so the
+  // emcc bootstrap uses it for the main pthread (which becomes
+  // dolphin_worker). ppc-worker is given the SAME memory in var_setup.
+  var sharedMemory = new WebAssembly.Memory({
+    initial: 536870912 / 65536,    // 512 MB / 64 KB pages = 8192
+    maximum: 4294967296 / 65536,   // 4 GB / 64 KB pages = 65536
+    shared: true,
+  });
+  var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/gamecube/dolphin_libretro/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: _moduleDummyCanvas, setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {}, wasmMemory: sharedMemory };
+  console.log('[ppc-worker-handshake] sharedMemory allocated at page-load (initial=' + (sharedMemory.buffer.byteLength >>> 20) + ' MB)');
+  var padStatus1, vram_ptr; var dolphin_worker = null; var ppc_worker = null; var states_arrs = []; var audioMuted = false; var pendingSaveResolve = null; var pendingLoadResolve = null;
   function getAudioCtx() { try { return (Module && Module.preCreatedAudioContext) || (Module && Module.SDL && Module.SDL.audioContext) || null; } catch (e) { return null; } }
   function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } }
   document.addEventListener('click', resumeAudio); document.addEventListener('keydown', resumeAudio); document.addEventListener('visibilitychange', resumeAudio);
-  window.var_setup = function () { pageLog('[ui] var_setup — initializing Dolphin libretro'); padStatus1 = Module._get_ptr(0); Module.SDL.defaults.copyOnLock = false; Module.SDL.defaults.opaqueFrontBuffer = false; dolphin_worker = new Worker('/gamecube/dolphin_libretro/dolphin_worker.js?v=' + Date.now()); dolphin_worker.onmessage = onWorkerMsg; window.dolphin_worker = dolphin_worker; setStatus('Runtime ready. Loading ROM...'); loadRomAndBoot(); };
+  window.var_setup = function () {
+    // Guard against re-entry — Emscripten may call var_setup more than
+    // once during Module init under PROXY_TO_PTHREAD; without the guard
+    // we'd spawn two ppc_workers racing on the same mailbox slot.
+    if (window._varSetupRan) {
+      console.log('[ppc-worker-handshake] var_setup re-entry skipped');
+      return;
+    }
+    window._varSetupRan = true;
+    console.log('[ppc-worker-handshake] var_setup entered');
+    pageLog('[ui] var_setup — initializing Dolphin libretro');
+    padStatus1 = Module._get_ptr(0);
+    Module.SDL.defaults.copyOnLock = false;
+    Module.SDL.defaults.opaqueFrontBuffer = false;
+    // sharedMemory was allocated at page-load (above) and assigned to
+    // Module.wasmMemory so dolphin_libretro.js's pthread spawn picks it up.
+    // We re-fetch it here for ppc-worker.
+    window.sharedMemory = sharedMemory;
+
+    // Spawn dolphin (its main pthread inherits sharedMemory via
+    // Module.wasmMemory which was set in the page Module above).
+    dolphin_worker = new Worker('/gamecube/dolphin_libretro/dolphin_worker.js?v=' + Date.now());
+    dolphin_worker.onmessage = onWorkerMsg;
+    window.dolphin_worker = dolphin_worker;
+    // 2e.3b: dolphin_worker.js is now a shim. First message must carry
+    // the page's shared SAB-backed WebAssembly.Memory so dolphin's wasm
+    // imports the same memory ppc-worker has. With dolphin's link
+    // configured -sGLOBAL_BASE=0x10000000 (2e.3a), its data section
+    // starts at 256 MB; ppc-worker's stays at low addresses; the
+    // PowerPCState region at SAB[0x02400000] sits between them
+    // (safe from both modules' instantiation-time data init).
+    dolphin_worker.postMessage({ cmd: 'mem-init', memory: sharedMemory });
+    // 2e.3c: pre-write a cross-boundary sentinel at SAB[0x02400000].
+    // dolphin's heartbeat (every 4096 JIT iters) reads this address
+    // and logs '[dolphin-sab-read] SAB[0x02400000]=0xCAFE1234'. If
+    // dolphin sees the value the page wrote, dolphin and ppc-worker
+    // truly share memory at this offset — the architectural
+    // prerequisite for the native-speed cutover.
+    new Uint32Array(sharedMemory.buffer)[0x02400000 >> 2] = 0xCAFE1234;
+
+    // [dsp-sentinel] periodic dump of DSP HLE chain sentinels (A/B/C/D +
+    // last DSPCR write + last temp.DSPReset). Throwaway diagnostic.
+    try {
+      var _dspSentBuf = new Uint32Array(sharedMemory.buffer);
+      window._dspSentPoll = setInterval(function () {
+        var A = _dspSentBuf[0x026B0000 >> 2] >>> 0;
+        var B = _dspSentBuf[0x026B0010 >> 2] >>> 0;
+        var C = _dspSentBuf[0x026B0020 >> 2] >>> 0;
+        var D = _dspSentBuf[0x026B0030 >> 2] >>> 0;
+        var lastVal = _dspSentBuf[0x026B0040 >> 2] >>> 0;
+        var lastReset = _dspSentBuf[0x026B0050 >> 2] >>> 0;
+        var W = _dspSentBuf[0x026B0060 >> 2] >>> 0;
+        var Waddr = _dspSentBuf[0x026B0064 >> 2] >>> 0;
+        var Wval  = _dspSentBuf[0x026B0068 >> 2] >>> 0;
+        var Wmmio = _dspSentBuf[0x026B006C >> 2] >>> 0;
+        var E   = _dspSentBuf[0x026B0080 >> 2] >>> 0;
+        var Eud = _dspSentBuf[0x026B0084 >> 2] >>> 0;
+        var P       = _dspSentBuf[0x026B0090 >> 2] >>> 0;
+        var Picause = _dspSentBuf[0x026B0094 >> 2] >>> 0;
+        var Pimask  = _dspSentBuf[0x026B0098 >> 2] >>> 0;
+        var G       = _dspSentBuf[0x026B00A0 >> 2] >>> 0;
+        var Gsrr0   = _dspSentBuf[0x026B00A4 >> 2] >>> 0;
+        var H       = _dspSentBuf[0x026B00B0 >> 2] >>> 0;
+        // [dsp-sentinel L0..L5] per-PC read trace at six wild-idle polling
+        // PCs. Slot layout: 12 bytes per slot starting at SAB[0x026B0110].
+        //   L0 = 0x800f6470, L1 = 0x800f64ec, L2 = 0x800f6564,
+        //   L3 = 0x800f65dc, L4 = 0x800f6654, L5 = 0x800f6700.
+        var L0  = _dspSentBuf[0x026B0110 >> 2] >>> 0;
+        var L0a = _dspSentBuf[0x026B0114 >> 2] >>> 0;
+        var L0v = _dspSentBuf[0x026B0118 >> 2] >>> 0;
+        var L1  = _dspSentBuf[0x026B011C >> 2] >>> 0;
+        var L1a = _dspSentBuf[0x026B0120 >> 2] >>> 0;
+        var L1v = _dspSentBuf[0x026B0124 >> 2] >>> 0;
+        var L2  = _dspSentBuf[0x026B0128 >> 2] >>> 0;
+        var L2a = _dspSentBuf[0x026B012C >> 2] >>> 0;
+        var L2v = _dspSentBuf[0x026B0130 >> 2] >>> 0;
+        var L3  = _dspSentBuf[0x026B0134 >> 2] >>> 0;
+        var L3a = _dspSentBuf[0x026B0138 >> 2] >>> 0;
+        var L3v = _dspSentBuf[0x026B013C >> 2] >>> 0;
+        var L4  = _dspSentBuf[0x026B0140 >> 2] >>> 0;
+        var L4a = _dspSentBuf[0x026B0144 >> 2] >>> 0;
+        var L4v = _dspSentBuf[0x026B0148 >> 2] >>> 0;
+        var L5  = _dspSentBuf[0x026B014C >> 2] >>> 0;
+        var L5a = _dspSentBuf[0x026B0150 >> 2] >>> 0;
+        var L5v = _dspSentBuf[0x026B0154 >> 2] >>> 0;
+        var F       = _dspSentBuf[0x026B00D0 >> 2] >>> 0;
+        var Fsrc    = _dspSentBuf[0x026B00D4 >> 2] >>> 0;
+        var I       = _dspSentBuf[0x026B00E0 >> 2] >>> 0;
+        var Imail   = _dspSentBuf[0x026B00E4 >> 2] >>> 0;
+        // [dsp-sentinel J] dolphin-side writer trace for guest 0x803c136c
+        var J       = _dspSentBuf[0x026B00F0 >> 2] >>> 0;
+        var Jpc     = _dspSentBuf[0x026B00F4 >> 2] >>> 0;
+        var Jval    = _dspSentBuf[0x026B00F8 >> 2] >>> 0;
+        var Jw      = _dspSentBuf[0x026B00FC >> 2] >>> 0;
+        // [dsp-sentinel K] JIT-side MEM1-direct writer trace for guest 0x803c136c
+        var K       = _dspSentBuf[0x026B0100 >> 2] >>> 0;
+        var Kpc     = _dspSentBuf[0x026B0104 >> 2] >>> 0;
+        var Kval    = _dspSentBuf[0x026B0108 >> 2] >>> 0;
+        // [dsp-sentinel M + IRQchain first-8] external_int chain dispatch trace.
+        // M counts chain starts (PC == 0x80000500 / 0x500).
+        // 0x026B0170..0x026B018C = FIRST 8 PCs of the in-progress chain (live).
+        // 0x026B0190..0x026B01AF = FIRST 8 PCs of the previously-started chain
+        //                          (snapshot, frozen at the NEXT chain's start).
+        var M     = _dspSentBuf[0x026B0160 >> 2] >>> 0;
+        var IRQP0 = _dspSentBuf[0x026B0190 >> 2] >>> 0;
+        var IRQP1 = _dspSentBuf[0x026B0194 >> 2] >>> 0;
+        var IRQP2 = _dspSentBuf[0x026B0198 >> 2] >>> 0;
+        var IRQP3 = _dspSentBuf[0x026B019C >> 2] >>> 0;
+        var IRQP4 = _dspSentBuf[0x026B01A0 >> 2] >>> 0;
+        var IRQP5 = _dspSentBuf[0x026B01A4 >> 2] >>> 0;
+        var IRQP6 = _dspSentBuf[0x026B01A8 >> 2] >>> 0;
+        var IRQP7 = _dspSentBuf[0x026B01AC >> 2] >>> 0;
+        var IRQL0 = _dspSentBuf[0x026B0170 >> 2] >>> 0;
+        var IRQL1 = _dspSentBuf[0x026B0174 >> 2] >>> 0;
+        var IRQL2 = _dspSentBuf[0x026B0178 >> 2] >>> 0;
+        var IRQL3 = _dspSentBuf[0x026B017C >> 2] >>> 0;
+        var IRQL4 = _dspSentBuf[0x026B0180 >> 2] >>> 0;
+        var IRQL5 = _dspSentBuf[0x026B0184 >> 2] >>> 0;
+        var IRQL6 = _dspSentBuf[0x026B0188 >> 2] >>> 0;
+        var IRQL7 = _dspSentBuf[0x026B018C >> 2] >>> 0;
+        // [insn8040-dump] 8 PowerPC instruction words read from MEM1 at
+        // virtual 0x800e8040 (the OS interrupt prologue spin point). Dumped
+        // one-shot by JitWasm on first dispatch of that PC.
+        var I8_0 = _dspSentBuf[0x026B01B0 >> 2] >>> 0;
+        var I8_1 = _dspSentBuf[0x026B01B4 >> 2] >>> 0;
+        var I8_2 = _dspSentBuf[0x026B01B8 >> 2] >>> 0;
+        var I8_3 = _dspSentBuf[0x026B01BC >> 2] >>> 0;
+        var I8_4 = _dspSentBuf[0x026B01C0 >> 2] >>> 0;
+        var I8_5 = _dspSentBuf[0x026B01C4 >> 2] >>> 0;
+        var I8_6 = _dspSentBuf[0x026B01C8 >> 2] >>> 0;
+        var I8_7 = _dspSentBuf[0x026B01CC >> 2] >>> 0;
+        console.log('[dsp-sentinel] A=' + A + ' B=' + B + ' C=' + C + ' D=' + D
+          + ' lastDSPCR=0x' + lastVal.toString(16)
+          + ' lastTempDSPReset=' + lastReset
+          + ' W=' + W + ' Wmmio=' + Wmmio
+          + ' Wlast=0x' + Waddr.toString(16) + '=0x' + Wval.toString(16)
+          + ' E=' + E + ' Eud=0x' + Eud.toString(16)
+          + ' P=' + P + ' PIcause=0x' + Picause.toString(16) + ' PImask=0x' + Pimask.toString(16)
+          + ' G=' + G + ' Gsrr0=0x' + Gsrr0.toString(16)
+          + ' H=' + H
+          + ' L0=' + L0 + ' L0=0x' + L0a.toString(16) + ':0x' + L0v.toString(16)
+          + ' L1=' + L1 + ' L1=0x' + L1a.toString(16) + ':0x' + L1v.toString(16)
+          + ' L2=' + L2 + ' L2=0x' + L2a.toString(16) + ':0x' + L2v.toString(16)
+          + ' L3=' + L3 + ' L3=0x' + L3a.toString(16) + ':0x' + L3v.toString(16)
+          + ' L4=' + L4 + ' L4=0x' + L4a.toString(16) + ':0x' + L4v.toString(16)
+          + ' L5=' + L5 + ' L5=0x' + L5a.toString(16) + ':0x' + L5v.toString(16)
+          + ' F=' + F + ' Fsrc=0x' + Fsrc.toString(16)
+          + ' I=' + I + ' Imail=0x' + Imail.toString(16)
+          + ' J=' + J + ' Jpc=0x' + Jpc.toString(16)
+          + ' Jval=0x' + Jval.toString(16) + ' Jw=' + Jw
+          + ' K=' + K + ' Kpc=0x' + Kpc.toString(16)
+          + ' Kval=0x' + Kval.toString(16)
+          + ' M=' + M
+          + ' IRQ_prev=[0x' + IRQP0.toString(16)
+          + ',0x' + IRQP1.toString(16)
+          + ',0x' + IRQP2.toString(16)
+          + ',0x' + IRQP3.toString(16)
+          + ',0x' + IRQP4.toString(16)
+          + ',0x' + IRQP5.toString(16)
+          + ',0x' + IRQP6.toString(16)
+          + ',0x' + IRQP7.toString(16) + ']'
+          + ' IRQ_live=[0x' + IRQL0.toString(16)
+          + ',0x' + IRQL1.toString(16)
+          + ',0x' + IRQL2.toString(16)
+          + ',0x' + IRQL3.toString(16)
+          + ',0x' + IRQL4.toString(16)
+          + ',0x' + IRQL5.toString(16)
+          + ',0x' + IRQL6.toString(16)
+          + ',0x' + IRQL7.toString(16) + ']'
+          + ' INSN8040=[0x' + ('00000000'+I8_0.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_1.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_2.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_3.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_4.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_5.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_6.toString(16)).slice(-8)
+          + ',0x' + ('00000000'+I8_7.toString(16)).slice(-8) + ']'
+          + ' Ntail=' + (_dspSentBuf[0x026B01D0 >> 2] >>> 0)
+          + ' r3_tail=0x' + (_dspSentBuf[0x026B01D4 >> 2] >>> 0).toString(16)
+          + ' Nhead=' + (_dspSentBuf[0x026B01E0 >> 2] >>> 0)
+          + ' r3_head=0x' + (_dspSentBuf[0x026B01E4 >> 2] >>> 0).toString(16)
+          + ' mem[r3_head]=0x' + (_dspSentBuf[0x026B01EC >> 2] >>> 0).toString(16)
+          + ' r4=0x' + (_dspSentBuf[0x026B01D8 >> 2] >>> 0).toString(16)
+          + ' T=' + (_dspSentBuf[0x026B0200 >> 2] >>> 0)
+          + ' Tmail=0x' + (_dspSentBuf[0x026B0204 >> 2] >>> 0).toString(16)
+          + ' R=' + (_dspSentBuf[0x026B0208 >> 2] >>> 0)
+          + ' Rmail=0x' + (_dspSentBuf[0x026B020C >> 2] >>> 0).toString(16)
+          // [dsp-sentinel MailFromDSP] CPU MMIO reads of DSP->CPU mailbox at
+          // 0xCC005004/06. MfHIr/MfLOr = read counts; MfHIlast/MfLOlast = last
+          // 16-bit values. feed = number of times the assembled 32-bit mail
+          // equalled 0x8071FEED (the ROM-ucode invitation mail).
+          + ' MfHIr=' + (_dspSentBuf[0x026B0280 >> 2] >>> 0)
+          + ' MfHIlast=0x' + (_dspSentBuf[0x026B0284 >> 2] >>> 0).toString(16)
+          + ' MfLOr=' + (_dspSentBuf[0x026B0288 >> 2] >>> 0)
+          + ' MfLOlast=0x' + (_dspSentBuf[0x026B028C >> 2] >>> 0).toString(16)
+          + ' feed=' + (_dspSentBuf[0x026B0290 >> 2] >>> 0)
+          + ' UE=' + (_dspSentBuf[0x026B02C8 >> 2] >>> 0)
+          + ' en=' + (_dspSentBuf[0x026B02CC >> 2] >>> 0)
+          + ' rb=' + (_dspSentBuf[0x026B02D0 >> 2] >>> 0)
+          + ' nb=' + (_dspSentBuf[0x026B02D4 >> 2] >>> 0)
+          // [dsp-sentinel RR] RemoveEvent(m_event_type_audio_dma) tripwire.
+          // Source scan found ZERO call sites in dolphin-src that RemoveEvent
+          // the audio_dma event — RR=0 is the expected value. A non-zero RR
+          // would indicate a code path we missed canceling the periodic
+          // AudioDMACallback (would leave F=1 instead of continuously firing).
+          + ' RR=' + (_dspSentBuf[0x026B02D8 >> 2] >>> 0)
+          + ' wj_cnt=' + (_dspSentBuf[0x026B0428 >> 2] >>> 0)
+          + ' wj_lr=0x' + (_dspSentBuf[0x026B0420 >> 2] >>> 0).toString(16)
+          + ' wj_ctr=0x' + (_dspSentBuf[0x026B0424 >> 2] >>> 0).toString(16)
+          + ' wj_r3=0x' + (_dspSentBuf[0x026B042C >> 2] >>> 0).toString(16)
+          + ' INSN5760=[0x' + ('00000000'+(_dspSentBuf[0x026B0400>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B0404>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B0408>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B040C>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B0410>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B0414>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B0418>>2]>>>0).toString(16)).slice(-8)
+          + ',0x' + ('00000000'+(_dspSentBuf[0x026B041C>>2]>>>0).toString(16)).slice(-8) + ']'
+          + ' oslc=' + (_dspSentBuf[0x026B0430 >> 2] >>> 0)
+          + ' oslc_lr1=0x' + (_dspSentBuf[0x026B0434 >> 2] >>> 0).toString(16)
+          + ' oslc_lrN=0x' + (_dspSentBuf[0x026B0438 >> 2] >>> 0).toString(16)
+          + ' oslc_r3z=' + (_dspSentBuf[0x026B043C >> 2] >>> 0)
+          + ' oslc_lr0_1=0x' + (_dspSentBuf[0x026B0440 >> 2] >>> 0).toString(16)
+          + ' oslc_lr0_N=0x' + (_dspSentBuf[0x026B0444 >> 2] >>> 0).toString(16));
+        // [op0-hist] per-PC histogram of op0 interpreter fallbacks (set by
+        // dolphin_interp in JitWasm.cpp). 16-slot ring at SAB[0x026B0300..],
+        // counts at SAB[0x026B0340..], unique-PC count at SAB[0x026B02E0],
+        // total op0 fallbacks at SAB[0x026B02E4]. Distinguishes (a) few hot
+        // PCs hitting op0 (bug to fix) vs (b) spread across address space
+        // (legitimate traps) vs (c) all-zero from cache leftovers.
+        {
+          var op0Unique = _dspSentBuf[0x026B02E0 >> 2] >>> 0;
+          var op0Total  = _dspSentBuf[0x026B02E4 >> 2] >>> 0;
+          if (op0Unique > 16) op0Unique = 16;
+          var op0Parts = [];
+          for (var k = 0; k < op0Unique; k++) {
+            var pc = _dspSentBuf[(0x026B0300 + k * 4) >> 2] >>> 0;
+            var cnt = _dspSentBuf[(0x026B0340 + k * 4) >> 2] >>> 0;
+            op0Parts.push('0x' + pc.toString(16) + '=' + cnt);
+          }
+          console.log('[op0-hist] total=' + op0Total + ' unique=' + op0Unique
+            + ' pcs=[' + op0Parts.join(',') + ']');
+        }
+        // [dsp-sentinel MailsCPU/MailsDSP] first-8 chronological mail rings.
+        // CPU->DSP ring at 0x026B0220..3F, head at 0x026B0260.
+        // DSP->CPU ring at 0x026B0240..5F, head at 0x026B0264.
+        {
+          var headCPU = _dspSentBuf[0x026B0260 >> 2] >>> 0;
+          var headDSP = _dspSentBuf[0x026B0264 >> 2] >>> 0;
+          if (headCPU > 8) headCPU = 8;
+          if (headDSP > 8) headDSP = 8;
+          var partsCPU = [];
+          for (var i = 0; i < headCPU; i++) {
+            partsCPU.push('0x' + (_dspSentBuf[(0x026B0220 + i * 4) >> 2] >>> 0).toString(16));
+          }
+          var partsDSP = [];
+          for (var j = 0; j < headDSP; j++) {
+            partsDSP.push('0x' + (_dspSentBuf[(0x026B0240 + j * 4) >> 2] >>> 0).toString(16));
+          }
+          var AC = _dspSentBuf[0x026B02C0 >> 2] >>> 0;
+          console.log('[dsp-sentinel] MailsCPU=[' + partsCPU.join(',') + ']'
+            + ' MailsDSP=[' + partsDSP.join(',') + ']'
+            + ' AC=' + AC);
+        }
+        // Phase IV gate diagnostic counters (written by run_iter_batch in
+        // EmscriptenWorker.cpp; read here via SAB at fixed offsets).
+        var rb_total   = _dspSentBuf[0x025010C0 >> 2] >>> 0;
+        var rb_flag0   = _dspSentBuf[0x025010C4 >> 2] >>> 0;
+        var rb_flag6   = _dspSentBuf[0x025010C8 >> 2] >>> 0;
+        var rb_p4br    = _dspSentBuf[0x025010CC >> 2] >>> 0;
+        var rb_svci    = _dspSentBuf[0x025010D0 >> 2] >>> 0;
+        var rb_retror  = _dspSentBuf[0x025010D4 >> 2] >>> 0;
+        console.log('[phase4-counters] total=' + rb_total
+          + ' flag0=' + rb_flag0 + ' flag6=' + rb_flag6
+          + ' p4br=' + rb_p4br + ' svci=' + rb_svci + ' retror=' + rb_retror);
+        // ppc-worker inner-slice diag (written by ppc_worker.js every 256 iters)
+        var ph4_iters = _dspSentBuf[0x025010E0 >> 2] >>> 0;
+        var ph4_pc    = _dspSentBuf[0x025010E4 >> 2] >>> 0;
+        var ph4_dc    = (new Int32Array(sharedMemory.buffer))[0x025010E8 >> 2];
+        var ph4_exc   = _dspSentBuf[0x025010EC >> 2] >>> 0;
+        var ph4_exit  = _dspSentBuf[0x025010F0 >> 2] >>> 0;
+        console.log('[phase4-slice] iters=' + ph4_iters
+          + ' pc=0x' + ph4_pc.toString(16)
+          + ' dc=' + ph4_dc + ' exc=0x' + ph4_exc.toString(16)
+          + ' exited=' + ph4_exit);
+      }, 2000);
+    } catch (e) { console.error('[dsp-sentinel] init failed: ' + e.message); }
+
+    // Phase 2c: spawn the dedicated PowerPC JIT worker, sharing the
+    // same memory object.
+    try {
+      console.log('[ppc-worker-handshake] spawning /gamecube/ppc-worker/ppc_worker.js');
+      ppc_worker = new Worker('/gamecube/ppc-worker/ppc_worker.js?v=' + Date.now());
+      ppc_worker.onerror = function (e) {
+        console.error('[ppc-worker-handshake] worker error: ' + (e.message || e.filename + ':' + e.lineno + ' ' + e.error));
+      };
+      var ppcSharedMemory = sharedMemory;  // same memory as dolphin_worker
+      window.ppcSharedMemory = ppcSharedMemory;
+      // Verification cascade is opt-in via ?ppctest=1 — costs ~25s of
+      // mailbox round-trips at heartbeat-polling rate, only useful for
+      // regression-checking the Phase 2c.4* infra. Default-off keeps
+      // probe time honest. Once Phase 2c.4f-4 lands and ppc-worker
+      // actually drives dispatch, the cascade can be deleted entirely.
+      var ppcTestEnabled = new URLSearchParams(location.search).has('ppctest');
+      // 2d.8 cutover gate: when set (alongside ?ppctest=1), after the
+      // verification cascade completes, kick off a sustained ppc-worker
+      // run that drives many iterations of the production dispatch
+      // path. Each iter: cmd 13 → dolphin build_block → real bytes →
+      // ppc-worker instantiates + dispatches → next_pc → loop.
+      // Demonstrates ppc-worker can sustain real PowerPC dispatch.
+      var ppcDispatchEnabled = new URLSearchParams(location.search).has('ppcdispatch');
+      // 2f.6: opt-in production cutover perf measurement. Gated separately
+      // so it doesn't fire during normal `?ppctest=1` runs (it engages the
+      // dolphin yield gate, hands dispatch to ppc-worker for ~1 second,
+      // then resumes — disruptive enough to want explicit consent).
+      var ppcPerfEnabled = new URLSearchParams(location.search).has('ppcperf');
+      // Phase 3a.7 — page flag for ppc-worker merged-region dispatch.
+      // ?ppcmerged=1 → use merged-region path (single WASM module per
+      // region with V8 cross-block inlining). Default off until verified.
+      var ppcMergedEnabled = new URLSearchParams(location.search).has('ppcmerged');
+      // Item-3 perf-methodology: ?ppcperfsynth=1 builds a wide-PC ring of
+      // synthetic PowerPC blocks in dolphin MEM1, then drives ppc-worker
+      // through them with disableIdleSkip=true and a long wall-time cap.
+      // Wide PC fanout + sustained dispatch is the configuration V8's
+      // TurboFan needs to fire speculative call_indirect inlining; the
+      // earlier ?ppcperf=1 path always converged on <=5 unique PCs and
+      // terminated via idle-skip before any tier-up could occur.
+      // Combine with ?ppcmerged=1 to exercise the call_indirect dispatch
+      // (the path where V8 inlining can actually win) instead of the
+      // legacy per-block-instance path.
+      var ppcPerfSynthEnabled = new URLSearchParams(location.search).has('ppcperfsynth');
+      // Real-boot dispatcher: ppc-worker drives PowerPC dispatch from
+      // the moment PC + MEM1 + dolphin runtime are all live. Yield flag
+      // is set sustained; dolphin's Run() returns at every 4096-iter
+      // heartbeat so its pthread can drain the proxied MMIO/HLE call
+      // queue from page-mediated mailbox traffic. Default OFF until
+      // boot-dispatch is validated.
+      var ppcBootDispatchEnabled = new URLSearchParams(location.search).has('ppcbootdispatch');
+      window._ppcDispatchEnabled = ppcDispatchEnabled;  // surfaced for onWorkerMsg (outer scope)
+      window._ppcPerfEnabled = ppcPerfEnabled;
+      window._ppcPerfSynthEnabled = ppcPerfSynthEnabled;
+      window._ppcBootDispatchEnabled = ppcBootDispatchEnabled;
+      ppc_worker.onmessage = function (e) {
+        var m = e.data || {};
+        if (m.cmd === 'rw-suite-debug') {
+          if (ppcTestEnabled) console.log('[ppc-worker-handshake] rw-suite-debug stage=' + m.stage + (m.value !== undefined ? ' value=0x' + (m.value>>>0).toString(16) : ''));
+          return;
+        }
+        // 2f.6: perf-measurement uses ?ppcperf=1 (independent of ?ppctest=1).
+        // ?ppcperfsynth=1 (Item-3) uses the same SAB/MEM1 wiring + dispatch
+        // handlers, just kicks off a synthetic ring instead of the boot.
+        // Handle run-continuous responses + generic 'print' diagnostics
+        // here so they surface even when the test cascade is disabled.
+        if (m.cmd === 'print') {
+          console.log('[ppc-worker-print] ' + (m.txt || ''));
+          return;
+        }
+        if (m.cmd === 'run-continuous-ack') {
+          // Boot-dispatcher: re-engage immediately (clear yield → brief
+          // dolphin window → set yield → next slice). The perf-result
+          // branch below is only meaningful for ?ppcperf=1 paths; for
+          // boot-dispatch we want the per-slice trace from _bdReengageOnAck.
+          if (typeof window._bdReengageOnAck === 'function' && window._bdLoopRunning) {
+            window._bdReengageOnAck(m);
+            return;
+          }
+          var elapsedMs_pf = performance.now() - (window._perfStartTime || performance.now());
+          var iters_pf     = m.iters >>> 0;
+          var rate_pf      = elapsedMs_pf > 0 ? (iters_pf * 1000 / elapsedMs_pf) : 0;
+          // Native baseline: 486 MHz / 10 insts per typical real block.
+          // For Item-3 synth-perf the ring's 2-insn-per-block makes the
+          // "% native" headline less meaningful (real blocks are larger),
+          // but it's still a useful trend indicator across measurements.
+          var nativeBlocksPerSec = 48.6e6;  // 486 MHz / 10 insts per block
+          var nativePctEst = (rate_pf / nativeBlocksPerSec) * 100;
+          var compileCalls_pf = m.compileCalls >>> 0;
+          var pureDispatchIters = (iters_pf > compileCalls_pf) ? (iters_pf - compileCalls_pf) : 0;
+          // Item-3 TurboFan tier-up window detector. V8's speculative
+          // call_indirect inliner needs sustained call-count per target
+          // (on the order of 1K-10K per fn) before TurboFan reoptimizes.
+          // Per-block iter count = pureDispatchIters / nSlots. ≥10K means
+          // every ring block crossed the inliner's per-target threshold;
+          // a sudden rate jump partway through the window is V8 tier-up.
+          var itersPerBlockEst = (window._perfSynthSlots > 0)
+            ? (pureDispatchIters / window._perfSynthSlots) : 0;
+          var tierupHint = itersPerBlockEst >= 10000
+            ? ' [>=10K-iter/block - TurboFan tier-up window REACHED]'
+            : (itersPerBlockEst > 0
+                ? ' [' + itersPerBlockEst.toFixed(0) + ' iters/block - below 10K tier-up window]'
+                : '');
+          console.log('[ppc-worker-handshake] perf-result iters=' + iters_pf
+            + ' compileCalls=' + compileCalls_pf
+            + ' totalBytes=' + (m.totalCompileBytes >>> 0)
+            + ' elapsed=' + elapsedMs_pf.toFixed(1) + 'ms'
+            + ' rate=' + rate_pf.toFixed(0) + ' iters/sec'
+            + ' (~' + nativePctEst.toFixed(2) + '% native @ 10 inst/block)'
+            + ' exit=' + m.exitReason
+            + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+            + tierupHint);
+          // Clear dolphin yield flag — dolphin's next heartbeat resumes.
+          Atomics.store(new Int32Array(sharedMemory.buffer), 0x02500000 >> 2, 0);
+          console.log('[ppc-worker-handshake] perf-measurement: yield flag cleared, dolphin resuming');
+          return;
+        }
+        if (m.cmd === 'synth-perf-ack') {
+          console.log('[ppc-worker-handshake] synth-perf ring built'
+            + ' nSlots=' + (m.nSlots >>> 0)
+            + ' baseVA=0x' + (m.baseVA >>> 0).toString(16)
+            + ' totalBytes=' + (m.totalBytes >>> 0)
+            + ' sabAddr=0x' + (m.sabAddr >>> 0).toString(16));
+          // Now start the sustained dispatch run with idle-skip disabled.
+          // wallTimeMs of 30000 + safetyCap of 10M is generous enough that
+          // V8's tier-up budget (per-fn call count threshold) fires for
+          // every block in the ring.
+          window._perfStartTime = performance.now();
+          window._perfSynthSlots = (m.nSlots >>> 0);
+          window.ppc_worker.postMessage({
+            cmd: 'run-continuous',
+            startPc: m.baseVA >>> 0,
+            compileOnMiss: true,
+            safetyCap: 10000000,
+            ignoreDowncount: true,
+            disableIdleSkip: true,
+            wallTimeMs: 30000,
+            mergedRegion: ppcMergedEnabled,
+          });
+          return;
+        }
+        if (m.cmd === 'synth-perf-nack') {
+          console.error('[ppc-worker-handshake] synth-perf FAIL: ' + m.reason);
+          return;
+        }
+        if (m.cmd === 'run-continuous-nack') {
+          console.error('[ppc-worker-handshake] run-continuous FAIL: ' + m.reason);
+          Atomics.store(new Int32Array(sharedMemory.buffer), 0x02500000 >> 2, 0);
+          return;
+        }
+        if (m.cmd === 'update-mem-ack') {
+          console.log('[ppc-worker-handshake] ppc-worker MEM1 wired: addr=0x'
+            + (m.mem1Addr>>>0).toString(16) + ' size=0x' + (m.mem1Size>>>0).toString(16));
+          return;
+        }
+        if (ppcTestEnabled || m.cmd === 'ready') {
+          console.log('[ppc-worker-handshake] ' + JSON.stringify(m));
+        }
+        if (m.cmd === 'ready') {
+          // ALWAYS: initialise the worker (mailbox base etc.) so
+          // Phase 2c.4f machinery is reachable. Test cascade only
+          // chains further when ?ppctest=1.
+          // 2d.1: PPC_STATE_SAB_OFFSET reserves a SAB region for the
+          // emulated PowerPCState. ppc-worker's init stores this as
+          // ppc_state_addr; future bementalJIT-emitted blocks will
+          // emit reads/writes against this offset (ctx_ptr_const in
+          // build_block). The verification step below confirms a
+          // dispatched wasm block can mutate state at this offset.
+          // perfStub default OFF for real boot; flipped ON only by the
+          // perf-measurement paths (?ppcperf=1 / ?ppcperfsynth=1).
+          // hleNative stays OFF at init — flipped ON later once dolphin
+          // confirms the HLE snapshot has populated the SAB hash table.
+          var _initPerfStub  = ppcPerfEnabled || ppcPerfSynthEnabled;
+          var _initHleNative = false;
+          ppc_worker.postMessage({ cmd: 'init',
+            ppcStateAddr: 0x02400000, mem1Addr: 0, mem1Size: 0, mailboxAddr: 0x02000000,
+            perfStub: _initPerfStub, hleNative: _initHleNative });
+        } else if (!ppcTestEnabled && !ppcPerfEnabled && !ppcPerfSynthEnabled && !ppcBootDispatchEnabled) {
+          // Skip the rest of the cascade in normal probe runs.
+          // ?ppcperf=1 and ?ppcperfsynth=1 need the cascade because the
+          // mailbox consumer (set up in 'mailbox-demo-ack' branch) is
+          // what services ppc-worker's cmd-13 CompileBlock requests AND
+          // bemental_imports.env bindings.
+          return;
+        } else if (m.cmd === 'init-ack') {
+          // Test dispatch round-trip with a known PC. Stub returns input
+          // PC unchanged, so we expect next === 0x80003140.
+          ppc_worker.postMessage({ cmd: 'dispatch', pc: 0x80003140 });
+        } else if (m.cmd === 'dispatch-ack') {
+          console.log('[ppc-worker-handshake] dispatch round-trip OK, next=0x' + (m.next >>> 0).toString(16));
+          // Phase 2c.4a SAB-share verification: write a sentinel into
+          // shared memory from the page, ask ppc-worker to read it back.
+          // Address chosen: 16 MB into the SAB (well above any heap or
+          // stack collision; well below MEM1's typical placement). This
+          // proves the WebAssembly.Memory really is shared, not two
+          // independent copies.
+          var SAB_PROBE_ADDR = 0x01000000;
+          var SAB_PROBE_VALUE = 0xDEC0DE42;
+          var view = new DataView(sharedMemory.buffer);
+          view.setUint32(SAB_PROBE_ADDR, SAB_PROBE_VALUE, true);  // little-endian
+          console.log('[ppc-worker-handshake] SAB probe wrote 0x' + SAB_PROBE_VALUE.toString(16) + ' at 0x' + SAB_PROBE_ADDR.toString(16));
+          ppc_worker.postMessage({ cmd: 'sab-peek', addr: SAB_PROBE_ADDR });
+        } else if (m.cmd === 'sab-peek-ack') {
+          var got = (m.value >>> 0).toString(16);
+          var ok = (m.value >>> 0) === 0xDEC0DE42;
+          console.log('[ppc-worker-handshake] SAB peek-ack addr=0x' + (m.addr >>> 0).toString(16) + ' got=0x' + got + ' ' + (ok ? 'PASS' : 'FAIL'));
+          // Phase 2c.4b: ask ppc-worker to poke a sentinel at the
+          // mailbox base. Page then DataView-reads it back.
+          ppc_worker.postMessage({ cmd: 'mailbox-demo', sentinel: 0xCAFEBABE });
+        } else if (m.cmd === 'mailbox-demo-ack') {
+          var view = new DataView(sharedMemory.buffer);
+          var got = view.getUint32(0x02000000, true) >>> 0;
+          var ok = (got === 0xCAFEBABE);
+          console.log('[ppc-worker-handshake] mailbox-demo addr=0x02000000 got=0x' + got.toString(16) + ' ' + (ok ? 'PASS' : 'FAIL'));
+          // Phase 2c.4c: start the page-side mailbox consumer + issue
+          // a sync ping. Consumer polls req_ready every 4 ms (typical
+          // request rate is far lower while we're just verifying);
+          // dolphin_worker will replace it as the consumer in 2c.4e.
+          // Slot layout MUST match ppc_worker_main.cpp::MBX_OFF_*:
+          //   +0 cmd, +4 arg0, +8 arg1, +12 req_ready, +16 reply, +20 reply_ready
+          var MBX_BASE = 0x02000000;
+          var MBX_CMD         = MBX_BASE +  0;
+          var MBX_ARG0        = MBX_BASE +  4;
+          var MBX_ARG1         = MBX_BASE +  8;
+          var MBX_REQ_READY    = MBX_BASE + 12;
+          var MBX_REPLY        = MBX_BASE + 16;
+          var MBX_REPLY_READY  = MBX_BASE + 20;
+          var MBX_REPLY_EXTRA1 = MBX_BASE + 24;
+          var MBX_REPLY_EXTRA2 = MBX_BASE + 28;
+          var WASM_SCRATCH_OFFSET = 0x02100000;  // mailbox base + 1 MB
+          var i32 = new Int32Array(sharedMemory.buffer);
+          var u8  = new Uint8Array(sharedMemory.buffer);
+          // Reset slot to known state.
+          Atomics.store(i32, MBX_REQ_READY   >> 2, 0);
+          Atomics.store(i32, MBX_REPLY_READY >> 2, 0);
+          // 4f-5 helper: build a 43-byte wasm exporting block0() returning
+          // a constant nextPc. 5-byte padded sLEB128 keeps wasm size
+          // constant across pc values.
+          function buildCompileBlockWasm(nextPc) {
+            var w = new Uint8Array([
+              0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,
+              0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+              0x03, 0x02, 0x01, 0x00,
+              0x07, 0x0a, 0x01,
+                0x06, 0x62,0x6c,0x6f,0x63,0x6b,0x30, 0x00, 0x00,
+              0x0a, 0x0a, 0x01,
+                0x08, 0x00, 0x41,
+                0x00, 0x00, 0x00, 0x00, 0x00,
+                0x0b
+            ]);
+            // 5-byte padded sLEB128 of nextPc into bytes [37..41]
+            w[37] = (nextPc & 0x7F) | 0x80;
+            w[38] = ((nextPc >>> 7)  & 0x7F) | 0x80;
+            w[39] = ((nextPc >>> 14) & 0x7F) | 0x80;
+            w[40] = ((nextPc >>> 21) & 0x7F) | 0x80;
+            var b4 = (nextPc >>> 28) & 0x0F;
+            if (nextPc & 0x80000000) b4 |= 0x70;
+            w[41] = b4;
+            return w;
+          }
+          // 4f-6: page-mediated routing. Page-handles cmds 1/4/13
+          // directly (deterministic stubs that don't need dolphin).
+          // Real MMIO cmds 2/3/5/6/7/8/9/10/11/12 are postMessage'd
+          // to dolphin once it signals runtime-ready. Before that,
+          // they're answered with reply=0 to avoid wedging ppc-worker
+          // on Atomics.wait — the cascade is structured so those
+          // cmds only fire after the cutover point (which now waits
+          // on 'runtime-ready').
+          var inFlight = false;
+          window._ppcDolphinRoutingReady = false;
+          function deliverReply(reply, extra1, extra2) {
+            Atomics.store(i32, MBX_REPLY_EXTRA1 >> 2, (extra1 || 0) >>> 0);
+            Atomics.store(i32, MBX_REPLY_EXTRA2 >> 2, (extra2 || 0) >>> 0);
+            Atomics.store(i32, MBX_REPLY        >> 2, (reply  || 0) >>> 0);
+            Atomics.store(i32, MBX_REPLY_READY  >> 2, 1);
+            Atomics.notify(i32, MBX_REPLY_READY >> 2, 1);
+            inFlight = false;
+          }
+          window._ppcMboxReplyListener = function (e) {
+            var msg = e.data || {};
+            if (msg.cmd === 'runtime-ready') {
+              window._ppcDolphinRoutingReady = true;
+              console.log('[ppc-worker-handshake] dolphin runtime-ready — MMIO routing live');
+              // Phase 3a-fix: poll SAB DIRECTLY for MEM1 address.
+              // The previous postMessage path (get-ram-info → ram-info)
+              // was throttled to ~5 replies per 60s by worker_funcs.js
+              // bootLoop blocking the worker main thread inside
+              // _run_iter_batch(100K). Worse: `_dolphin_get_ram_addr`
+              // returned 0 because g_jit_wasm (a static global) is
+              // pthread-isolated under PROXY_TO_PTHREAD=1 — set on
+              // dolphin's pthread, but the worker MAIN thread (where
+              // get-ram-info runs) sees nullptr forever.
+              //
+              // Direct SAB read sidesteps both. JitWasm::Run() entry
+              // (running on the pthread that has valid g_jit_wasm AND
+              // m_ram allocated) writes ram_addr/size + sentinel-last
+              // to SAB[0x02500020/24/28]. This setInterval polls the
+              // sentinel via Atomics.load every 100ms — no postMessage,
+              // no throttle, no thread-isolation. Cancels itself on
+              // first non-zero sentinel.
+              if (!window._ppcRamInfoPoll) {
+                window._ppcRamInfoPoll = setInterval(function () {
+                  var u32 = new Uint32Array(sharedMemory.buffer);
+                  var sentinel = Atomics.load(u32, 0x02500028 >> 2) >>> 0;
+                  if (sentinel !== 0xCAFEBABE) return;
+                  var addr = u32[0x02500020 >> 2] >>> 0;
+                  var size = u32[0x02500024 >> 2] >>> 0;
+                  if (addr === 0 || size === 0) return;
+                  if (window._ppcMem1Wired) return;
+                  window._ppcMem1Wired = true;
+                  console.log('[ppc-worker-handshake] dolphin ram (SAB-direct)'
+                    + ' addr=0x' + addr.toString(16)
+                    + ' size=0x' + size.toString(16));
+                  clearInterval(window._ppcRamInfoPoll);
+                  window._ppcRamInfoPoll = null;
+                  try {
+                    window.ppc_worker.postMessage({
+                      cmd: 'update-mem',
+                      mem1Addr: addr,
+                      mem1Size: size,
+                    });
+                  } catch (e) {}
+                }, 100);
+              }
+              return;
+            }
+            if (msg.cmd === 'ram-info') {
+              // Diag: log every Nth reply (even zero) so we can see what
+              // _dolphin_get_ram_addr actually returns over the boot.
+              if (window._ppcRamInfoReplyN === undefined) window._ppcRamInfoReplyN = 0;
+              window._ppcRamInfoReplyN++;
+              if (window._ppcRamInfoReplyN <= 5
+                  || (window._ppcRamInfoReplyN % 60) === 0) {
+                console.log('[ppc-worker-handshake] ram-info reply #'
+                  + window._ppcRamInfoReplyN
+                  + ' addr=0x' + (msg.addr>>>0).toString(16)
+                  + ' size=0x' + (msg.size>>>0).toString(16)
+                  + (msg.error ? ' err=' + msg.error : ''));
+              }
+              if ((msg.addr >>> 0) !== 0 && (msg.size >>> 0) !== 0
+                  && !window._ppcMem1Wired) {
+                console.log('[ppc-worker-handshake] dolphin ram addr=0x' + (msg.addr>>>0).toString(16)
+                  + ' size=0x' + (msg.size>>>0).toString(16));
+                window._ppcMem1Wired = true;
+                if (window._ppcRamInfoPoll) {
+                  clearInterval(window._ppcRamInfoPoll);
+                  window._ppcRamInfoPoll = null;
+                }
+                try {
+                  window.ppc_worker.postMessage({
+                    cmd: 'update-mem',
+                    mem1Addr: msg.addr >>> 0,
+                    mem1Size: msg.size >>> 0,
+                  });
+                } catch (e) {}
+              }
+              return;
+            }
+            // 2d.4: tagged compile-test-result for in-flight cmd 13.
+            // Untagged ('verify') results go to the cascade verification
+            // handler in onWorkerMsg — left untouched here.
+            if (msg.cmd === 'compile-test-result' && msg.tag === 'mbx-13') {
+              if (msg.error) {
+                console.log('[mbx-13-fail] pc=0x' + ((window._lastMbx13Pc||0)>>>0).toString(16) + ' err=' + msg.error);
+                deliverReply(0, 0, 0);
+                return;
+              }
+              console.log('[mbx-13-ok] pc=0x' + ((msg.pc||0)>>>0).toString(16) + ' size=' + (msg.size>>>0) + ' decoded=' + !!msg.decoded + ' cycles=' + (msg.cycles>>>0));
+              var srcU8 = new Uint8Array(msg.bytes);
+              u8.set(srcU8, WASM_SCRATCH_OFFSET);
+              // 2f.0: pack cycles into reply_extra2 alongside region/fn:
+              //   bits 0-15:  fn   (16-bit)
+              //   bits 16-23: region (8-bit, 0..255 — current count is 8)
+              //   bits 24-31: cycles (8-bit, 0..255 — kMaxInstrsPerBlock=64)
+              // ppc-worker unpacks and decrements ppc_state.downcount per
+              // dispatch in the continuous run loop (2f.1).
+              var cycles_d4 = (msg.cycles | 0) & 0xFF;
+              var packed_d4 = (cycles_d4 << 24) | (5 << 16) | 0;  // region=5, fn=0
+              deliverReply(WASM_SCRATCH_OFFSET, msg.size >>> 0, packed_d4);
+              return;
+            }
+            if (msg.cmd !== 'mbx-reply') return;
+            deliverReply(msg.reply, msg.reply_extra1, msg.reply_extra2);
+          };
+          dolphin_worker.addEventListener('message', window._ppcMboxReplyListener);
+          window._ppcMboxConsumer = setInterval(function () {
+            if (inFlight) return;
+            var req = Atomics.load(i32, MBX_REQ_READY >> 2);
+            if (req !== 1) return;
+            var cmd  = Atomics.load(i32, MBX_CMD  >> 2);
+            var arg0 = Atomics.load(i32, MBX_ARG0 >> 2);
+            var arg1 = Atomics.load(i32, MBX_ARG1 >> 2);
+            // Direct page-handled cmds first.
+            if (cmd === 1) {
+              deliverReply((arg0 * 2) | 0, 0, 0);  // PING
+              return;
+            }
+            if (cmd === 4) {
+              // PI mask read mock for the early-cascade page-mock test.
+              // After routingReady, this would normally route to dolphin
+              // for the real value — but dolphin happens to also return
+              // 0x1FC here, so deferring to the page-stub keeps the
+              // pre-runtime test deterministic. Once routing is live,
+              // the second mmio-read-test (after cutover-ack) will go
+              // through dolphin via cmd 4 too — see post-cutover branch.
+              if (!window._ppcDolphinRoutingReady) {
+                if ((arg0 >>> 0) === 0xCC003004) deliverReply(0x1FC, 0, 0);
+                else deliverReply(0, 0, 0);
+                return;
+              }
+              // Routing is up — fall through to dolphin.
+            }
+            if (cmd === 13) {
+              // 2d.4: CompileBlock now routes to dolphin's real
+              // bemental::powerpc::build_block. Page postMessages
+              // 'compile-test' with tag='mbx-13'; dolphin emits and
+              // ships bytes back via 'compile-test-result' tagged
+              // 'mbx-13'. The mbox reply listener (registered below)
+              // matches by tag, copies bytes into SAB[0x02100000],
+              // and calls deliverReply with (offset, size, packed).
+              // inFlight gates the polling loop until the async
+              // round-trip completes. The previous page-stub path
+              // (buildCompileBlockWasm) is kept defined as a fallback
+              // but is no longer the primary CompileBlock source.
+              inFlight = true;
+              window._lastMbx13Pc = arg0 >>> 0;
+              dolphin_worker.postMessage({ cmd: 'compile-test', pc: arg0 >>> 0, tag: 'mbx-13', realDecode: true });
+              return;
+            }
+            if (!window._ppcDolphinRoutingReady) {
+              // Pre-runtime: cmds 2/3/5/6/7/8/9/10/11/12 reply 0.
+              // The cascade should not be sending these before
+              // routingReady; if it is, the test will visibly fail.
+              deliverReply(0, 0, 0);
+              return;
+            }
+            inFlight = true;
+            dolphin_worker.postMessage({ cmd: 'mbx-cmd', mboxCmd: cmd, arg0: arg0, arg1: arg1 });
+          }, 4);
+          // 2c.4c PING test.
+          ppc_worker.postMessage({ cmd: 'mailbox-call', mboxCmd: 1, arg0: 42 });
+        } else if (m.cmd === 'mailbox-call-ack') {
+          if (window._routingProbeInFlight) {
+            window._routingProbeInFlight = false;
+            var probeOk = (m.reply >>> 0) === 0xCAFEBABE;
+            console.log('[ppc-worker-handshake] routing-probe(0) → 0x'
+              + (m.reply >>> 0).toString(16) + ' ' + (probeOk ? 'PASS' : 'FAIL'));
+            // Continue to the rest of the MMIO cmd suite.
+            ppc_worker.postMessage({ cmd: 'mmio-rw-suite' });
+          } else {
+            var ok = ((m.reply >>> 0) === 84);
+            console.log('[ppc-worker-handshake] mailbox sync-call PING(42) → ' + (m.reply >>> 0) + ' ' + (ok ? 'PASS' : 'FAIL'));
+            // Phase 2c.4d: now that ping works, exercise the MmioRead32
+            // wrapper. ppc-worker should get the page-mock 0x1FC.
+            ppc_worker.postMessage({ cmd: 'mmio-read-test', addr: 0xCC003004 });
+          }
+        } else if (m.cmd === 'mmio-read-test-ack') {
+          var got = (m.value >>> 0).toString(16);
+          if (!window._ppcMboxRealMmio) {
+            // Page-mock response (Phase 2c.4d).
+            var ok = (m.value >>> 0) === 0x1FC;
+            console.log('[ppc-worker-handshake] mmio_read32(0xCC003004) → 0x' + got + ' (page-mock) ' + (ok ? 'PASS' : 'FAIL'));
+            // 4f-6 cutover: page is the permanent mailbox consumer.
+            // Wait for dolphin's 'runtime-ready' postMessage before
+            // proceeding to the real-MMIO test step — only after
+            // that does the page consumer route cmds 2..12 to dolphin.
+            // If the signal hasn't arrived yet, the listener installed
+            // above sets the flag whenever it does; here we just poll
+            // (cheap setInterval) until live.
+            (function awaitRuntimeReady() {
+              if (window._ppcDolphinRoutingReady) {
+                console.log('[ppc-worker-handshake] cutover: routing live, sending real MMIO test');
+                window._ppcMboxRealMmio = true;
+                ppc_worker.postMessage({ cmd: 'mmio-read-test', addr: 0xCC003004 });
+                return;
+              }
+              setTimeout(awaitRuntimeReady, 50);
+            })();
+          } else {
+            // Real dolphin response.
+            console.log('[ppc-worker-handshake] mmio_read32(0xCC003004) → 0x' + got + ' (dolphin) — Phase 2c.4e end-to-end');
+            // 4f-6 routing-live verification: cmd 100 routes via the
+            // page-mediated path to dolphin_routing_probe, which is a
+            // pure function returning magic ^ 0xCAFEBABE. With arg0=0
+            // the reply must be 0xCAFEBABE — only possible if dolphin's
+            // wasm code actually executed. If the page fallback had
+            // answered, reply would be 0.
+            window._routingProbeInFlight = true;
+            ppc_worker.postMessage({ cmd: 'mailbox-call', mboxCmd: 100, arg0: 0 });
+          }
+        } else if (m.cmd === 'mmio-rw-suite-ack') {
+          var ok_rw = (m.mask32 >>> 0) === (m.mask32b >>> 0);
+          console.log('[ppc-worker-handshake] mmio-rw-suite cmds=2/3/4/7 all responded; '
+            + 'read32=0x' + (m.mask32>>>0).toString(16)
+            + ' write32+read32=0x' + (m.mask32b>>>0).toString(16)
+            + ' round-trip=' + (ok_rw?'PASS':'FAIL'));
+          // Phase 2c.4f-2: replicate Module.bemental_imports.env in
+          // ppc-worker so JIT-emitted blocks (instantiated in ppc-worker
+          // in 4f-3) can resolve their env imports.
+          ppc_worker.postMessage({ cmd: 'setup-bemental-env' });
+        } else if (m.cmd === 'setup-bemental-env-ack') {
+          var expected = ['memory','ppc_break_block','ppc_check_exc','ppc_hle_check','ppc_hle_fire','ppc_interp','ppc_read16','ppc_read32','ppc_read8','ppc_read_tb','ppc_write16','ppc_write32','ppc_write8'].sort();
+          var got = (m.keys || []).slice().sort();
+          var ok = JSON.stringify(got) === JSON.stringify(expected);
+          console.log('[ppc-worker-handshake] bemental-env keys count=' + m.count + ' ' + (ok?'PASS':'FAIL'));
+          if (!ok) console.log('[ppc-worker-handshake]   expected: ' + expected.join(',') + '\n  got: ' + got.join(','));
+          // Phase 2c.4f-2 verify: actually invoke env.ppc_read_tb(0) which
+          // routes to mailbox cmd 12 → dolphin_read_tb in dolphin's poll.
+          // dolphin_read_tb returns the lower TB half (always nonzero
+          // when emulation is running).
+          ppc_worker.postMessage({ cmd: 'env-call-test', name: 'ppc_read_tb', arg0: 0 });
+        } else if (m.cmd === 'env-call-test-ack') {
+          // env.ppc_read_tb(0) → some TB-low value. Just verify the
+          // round-trip completed and we got a value back.
+          console.log('[ppc-worker-handshake] env.' + m.name + '(' + m.arg0 + ') → 0x' + (m.reply >>> 0).toString(16) + ' (cmd 12 = ppc_read_tb)');
+          // Phase 2c.4f-3: stand up mod.bemental_regions in ppc-worker,
+          // then verify region-instantiate works by sending a 37-byte
+          // hand-built wasm module that exports `test() -> i32 = 42`.
+          ppc_worker.postMessage({ cmd: 'init-bemental-regions' });
+        } else if (m.cmd === 'init-bemental-regions-ack') {
+          console.log('[ppc-worker-handshake] mod.bemental_regions ready, env present=' + m.had_env);
+          // Hand-built minimal wasm: (module
+          //   (type (func (result i32)))
+          //   (func (export "test") (result i32) i32.const 42))
+          var testWasm = new Uint8Array([
+            0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,           // \0asm v1
+            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,           // type sec: ()->i32
+            0x03, 0x02, 0x01, 0x00,                              // func sec: 1 func type 0
+            0x07, 0x08, 0x01, 0x04, 0x74,0x65,0x73,0x74, 0x00, 0x00, // export "test" func 0
+            0x0a, 0x06, 0x01, 0x04, 0x00, 0x41, 0x2a, 0x0b      // code: 1 body, locals=0, i32.const 42, end
+          ]);
+          ppc_worker.postMessage({
+            cmd: 'region-instantiate',
+            regionIdx: 7,                  // use slot 7 (highest, won't collide with real regions)
+            bytes: testWasm.buffer,
+            imports: 'none',
+          });
+        } else if (m.cmd === 'region-instantiate-ack') {
+          console.log('[ppc-worker-handshake] region-instantiate region=' + m.regionIdx + ' exports=' + JSON.stringify(m.exportNames));
+          if (m.regionIdx === 7) {
+            ppc_worker.postMessage({ cmd: 'region-call-export', regionIdx: m.regionIdx, exportName: 'test' });
+          } else if (m.regionIdx === 6) {
+            // Phase 2c.4f-4: kick off the dispatch loop. Start at
+            // 0x80003100 (block0). Loop should chain block0 → 0x80003200
+            // → block1 → 0xDEADBEEF → unmapped (exit). Iter cap of 10
+            // is plenty; dispatch chain is exactly 2 hops.
+            ppc_worker.postMessage({ cmd: 'run', startPc: 0x80003100, maxIters: 10 });
+          } else if (m.regionIdx === 4) {
+            // Phase 2d.1: dispatch the ppc-state mutate block. pc=0xABCD
+            // resolves to the only block in region 4. The block writes
+            // 0xCAFED00D to SAB[ppc_state+0] and returns 0; iter 1
+            // looks up pc=0 → unmapped → exit. (maxIters=1 would exit
+            // on the iter-count guard before checking pc=0.)
+            ppc_worker.postMessage({ cmd: 'run', startPc: 0xABCD, maxIters: 2 });
+          } else if (m.regionIdx === 3) {
+            // Phase 2d.3: real bementalJIT bytes loaded into region 3.
+            // Exports include `run` (no `block0`); ppc-worker's
+            // dispatch loop falls back to `run`. Iter 0 dispatches at
+            // start_pc=0x80003100; the bementalJIT-emitted run()
+            // executes the baked-in nop semantics and returns the next
+            // pc. Iter 1 looks that up → unmapped → exit.
+            ppc_worker.postMessage({ cmd: 'run', startPc: window._ppcRealDispatchPc, maxIters: 2 });
+          }
+        } else if (m.cmd === 'region-instantiate-nack') {
+          console.error('[ppc-worker-handshake] region-instantiate FAIL: ' + m.reason);
+        } else if (m.cmd === 'region-call-export-ack') {
+          var ok = (m.value >>> 0) === 42;
+          console.log('[ppc-worker-handshake] region call test() → ' + (m.value >>> 0) + ' ' + (ok ? 'PASS' : 'FAIL'));
+          // Phase 2c.4f-4: instantiate a 2-block region (slot 6) so
+          // the ppc-worker dispatch loop has a chain to walk.
+          // Hand-built wasm exporting:
+          //   block0: () -> i32  returns 0x80003200
+          //   block1: () -> i32  returns 0xDEADBEEF
+          // Region 6 pcMap: { 0x80003100 → 0, 0x80003200 → 1 }.
+          var twoBlockWasm = new Uint8Array([
+            0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,           // \0asm v1
+            0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,           // type sec: ()->i32
+            0x03, 0x03, 0x02, 0x00, 0x00,                        // func sec: 2 funcs type 0
+            0x07, 0x13, 0x02,                                    // export sec: 19 bytes, 2 entries
+              0x06, 0x62,0x6c,0x6f,0x63,0x6b,0x30, 0x00, 0x00,  //   "block0" func idx 0
+              0x06, 0x62,0x6c,0x6f,0x63,0x6b,0x31, 0x00, 0x01,  //   "block1" func idx 1
+            0x0a, 0x13, 0x02,                                    // code sec: 2 bodies
+              0x08, 0x00, 0x41, 0x80,0xe4,0x80,0x80,0x78, 0x0b, //   block0: i32.const 0x80003200, end
+              0x08, 0x00, 0x41, 0xef,0xfd,0xb6,0xf5,0x7d, 0x0b  //   block1: i32.const 0xDEADBEEF, end
+          ]);
+          var pcKeys = new Uint32Array([0x80003100, 0x80003200]);
+          ppc_worker.postMessage({
+            cmd: 'region-instantiate',
+            regionIdx: 6,
+            bytes: twoBlockWasm.buffer,
+            imports: 'none',
+            pcKeys: pcKeys.buffer,
+          });
+        } else if (m.cmd === 'region-call-export-nack') {
+          console.error('[ppc-worker-handshake] region call FAIL: ' + m.reason);
+        } else if (m.cmd === 'run-ack') {
+          if (window._ppcCutoverDispatchTest) {
+            window._ppcCutoverDispatchTest = false;
+            // Phase 2d.8 cutover-gate verification. The dispatch
+            // chain ran for the full maxIters with sustained
+            // compileOnMiss activity (real bytes from dolphin's
+            // build_block via the page-mediated cmd-13 route).
+            //
+            // What we DON'T check: the exact lastPc. bementalJIT-
+            // emitted blocks make runtime decisions beyond compile-
+            // time constants (state reads, branch targets, exception
+            // checks), so the chain trajectory depends on real
+            // bementalJIT semantics that aren't 1-nop-pc-plus-4
+            // even when ppc_state is reset. The interesting
+            // verification is "ppc-worker sustained the dispatch
+            // loop with real bementalJIT bytes" — which the iter
+            // count + byte total + compile count attest to.
+            var okIters_d8   = m.iters === 10;
+            var okReason_d8  = m.exitReason === 'max-iters';
+            var okSustained  = m.compileCalls >= 5;
+            var okBytes_d8   = m.totalCompileBytes > 3000;
+            var ok_d8 = okIters_d8 && okReason_d8 && okSustained && okBytes_d8;
+            console.log('[ppc-worker-handshake] cutover-gate iters=' + m.iters
+              + ' compileCalls=' + m.compileCalls
+              + ' totalBytes=' + m.totalCompileBytes
+              + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+              + ' exit=' + m.exitReason
+              + ' ' + (ok_d8 ? 'PASS' : 'FAIL'));
+            // 2d.9 (real-cutover) attempt was REVERTED — see
+            // memory:2d9_real_cutover_blocked.md. The mirror-and-pause
+            // approach is fundamentally blocked by emscripten's
+            // PROXY_TO_PTHREAD memory isolation between the JS main
+            // thread and dolphin's pthread.
+            //
+            // 2f.6 perf measurement is now triggered independently —
+            // see the standalone perf-trigger setTimeout in var_setup
+            // below. Running it here corrupts PowerPCState because the
+            // cascade tests (2d.1, 2d.7, 2d.8) wrote sentinel values to
+            // SAB[0x02400000] before PowerPCManager construction; the
+            // live PC reads as 0xdeadbf13 (cutover-gate test residue)
+            // instead of the actual boot PC.
+          } else if (window._ppcRealDispatchTest) {
+            window._ppcRealDispatchTest = false;
+            // Phase 2d.3: bementalJIT-emitted nop block dispatched
+            // exactly once, advanced pc by 4, returned next_pc.
+            // Iter 1 looks up next_pc → unmapped → exit. The block's
+            // return value (next_pc) is observable via lastPc; for a
+            // 1-instr nop at 0x80003100 the expected next_pc is 0x80003104.
+            var startPc_d3 = window._ppcRealDispatchPc >>> 0;
+            var expectedNext = (startPc_d3 + 4) >>> 0;
+            var okIters_d3   = m.iters === 1;
+            var okReason_d3  = m.exitReason === 'unmapped';
+            var okLast_d3    = (m.lastPc >>> 0) === expectedNext;
+            var ok_d3 = okIters_d3 && okReason_d3 && okLast_d3;
+            console.log('[ppc-worker-handshake] real-dispatch start=0x' + startPc_d3.toString(16)
+              + ' iters=' + m.iters
+              + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+              + ' (expected 0x' + expectedNext.toString(16) + ')'
+              + ' exit=' + m.exitReason
+              + ' ' + (ok_d3 ? 'PASS' : 'FAIL'));
+            // Phase 2d.5: multi-instruction compile test. dolphin's
+            // dolphin_test_compile_block(pc, n_insts) emits an
+            // n_insts-nop block via build_block; the wasm bytes scale
+            // up. 10 nops should produce >500 bytes vs 386 baseline.
+            dolphin_worker.postMessage({ cmd: 'compile-test', pc: 0x80003200, nInsts: 10, tag: 'multi-insts' });
+          } else if (window._ppcStateMutateTest) {
+            window._ppcStateMutateTest = false;
+            // Phase 2d.1 verification: a dispatched wasm block writes
+            // 0xCAFED00D via env.memory to SAB[ppc_state_addr+0]. The
+            // run loop should iter once and exit unmapped (next_pc=0).
+            var okIters_d1  = m.iters === 1;
+            var okReason_d1 = m.exitReason === 'unmapped';
+            var sabValue = new Uint32Array(sharedMemory.buffer)[0x02400000 >> 2] >>> 0;
+            var okSab    = sabValue === 0xCAFED00D;
+            var ok_d1 = okIters_d1 && okReason_d1 && okSab;
+            console.log('[ppc-worker-handshake] ppc-state-mutate iters=' + m.iters
+              + ' exit=' + m.exitReason
+              + ' SAB[0x02400000]=0x' + sabValue.toString(16)
+              + ' ' + (ok_d1 ? 'PASS' : 'FAIL'));
+            // Phase 2d.2: ask dolphin to emit a real bementalJIT wasm
+            // for pc=0x80003100. The compile-test handler in
+            // worker_funcs.js calls dolphin_test_compile_block (which
+            // wraps bemental::powerpc::build_block) and Transferable-
+            // postMessages the bytes back. onWorkerMsg's
+            // 'compile-test-result' branch verifies the magic header
+            // and instantiates the resulting module.
+            window._ppcRealCompileTest = true;
+            // tag='verify' so the response goes to the cascade
+            // verification handler in onWorkerMsg, not the cmd-13
+            // mbx delivery path in _ppcMboxReplyListener.
+            dolphin_worker.postMessage({ cmd: 'compile-test', pc: 0x80003100, tag: 'verify' });
+          } else if (window._ppcRunCompileTest) {
+            // Phase 2c.4f-5 verification: dispatch loop posted CompileBlock
+            // (cmd 13) for each unmapped pc; page-mock synthesized a
+            // stub wasm whose block0() returns pc+4. With maxIters=3
+            // and startPc=0x10000000 the chain walks
+            //   0x10000000 → 0x10000004 → 0x10000008 → 0x1000000C,
+            // exit=max-iters after exactly 3 dispatches and 3 compile
+            // round-trips.
+            var okIters5   = m.iters === 3;
+            var okLast5    = (m.lastPc >>> 0) === 0x1000000C;
+            var okReason5  = m.exitReason === 'max-iters';
+            var okCalls5   = m.compileCalls === 3;
+            // 2d.4: each cmd-13 reply now sources real bementalJIT
+            // bytes from dolphin's build_block (~386 bytes per 1-nop
+            // block, so 3 calls give ~1158 bytes total). The previous
+            // page-stub was 43 bytes per call (3 calls = 129 bytes),
+            // so a threshold of 500 distinguishes the two paths.
+            var avgBytes5 = m.totalCompileBytes / Math.max(m.compileCalls, 1);
+            var okBytes5 = m.totalCompileBytes > 500 && avgBytes5 > 100;
+            var ok5 = okIters5 && okLast5 && okReason5 && okCalls5 && okBytes5;
+            console.log('[ppc-worker-handshake] run-with-compile iters=' + m.iters
+              + ' compileCalls=' + m.compileCalls
+              + ' totalBytes=' + m.totalCompileBytes
+              + ' (avg=' + avgBytes5.toFixed(0) + ')'
+              + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+              + ' exit=' + m.exitReason
+              + ' ' + (ok5 ? 'PASS' : 'FAIL'));
+            // Kick off Phase 2d.1 ppc-state mutate test. Page writes a
+            // sentinel into SAB[ppc_state+0]; a dispatched hand-built
+            // wasm block writes 0xCAFED00D over it via env.memory.
+            window._ppcStateMutateTest = true;
+            var u32state = new Uint32Array(sharedMemory.buffer);
+            u32state[0x02400000 >> 2] = 0xDEADBEEF;
+            // Hand-built wasm: imports env.memory, exports block0()
+            // that does
+            //   *(u32*)(env.memory + 0x02400000) = 0xCAFED00D
+            //   return 0
+            // The 5-byte padded sLEB128 of 0x02400000 is 80,80,80,92,00;
+            // 0xCAFED00D is 8d,a0,fb,d7,7c.
+            // Memory import limits MUST match the page's SAB:
+            // shared=true with max. limits_flags = 0x03 (has-max + shared);
+            // min=8192 (LEB128 = 0x80 0x40 = 512 MB / 64 KB pages);
+            // max=65536 (LEB128 = 0x80 0x80 0x04 = 4 GB / 64 KB pages).
+            // Otherwise WebAssembly.Instance throws
+            //   "mismatch in shared state of memory, declared = 0,
+            //    imported = 1".
+            var mutateWasm = new Uint8Array([
+              0x00,0x61,0x73,0x6d, 0x01,0x00,0x00,0x00,           // \0asm v1
+              0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,           // type sec: ()->i32
+              0x02, 0x13, 0x01,                                    // import sec, content size 19
+                0x03, 0x65,0x6e,0x76,                             //   "env"
+                0x06, 0x6d,0x65,0x6d,0x6f,0x72,0x79,              //   "memory"
+                0x02,                                              //   kind=memory
+                0x03, 0x80,0x40, 0x80,0x80,0x04,                  //   shared+max, min=8192, max=65536
+              0x03, 0x02, 0x01, 0x00,                              // func sec: 1 func type 0
+              0x07, 0x0a, 0x01,                                    // export sec
+                0x06, 0x62,0x6c,0x6f,0x63,0x6b,0x30,              //   "block0"
+                0x00, 0x00,                                        //   kind=func, idx=0
+              0x0a, 0x15, 0x01,                                    // code sec: 1 body, content 21
+                0x13, 0x00,                                        //   body_size=19, locals=0
+                0x41, 0x80,0x80,0x80,0x92,0x00,                   //   i32.const 0x02400000
+                0x41, 0x8d,0xa0,0xfb,0xd7,0x7c,                   //   i32.const 0xCAFED00D
+                0x36, 0x02, 0x00,                                  //   i32.store align=2 offset=0
+                0x41, 0x00,                                        //   i32.const 0
+                0x0b                                               //   end
+            ]);
+            var pcKeysD1 = new Uint32Array([0xABCD]);
+            ppc_worker.postMessage({
+              cmd: 'region-instantiate',
+              regionIdx: 4,
+              bytes: mutateWasm.buffer,
+              imports: 'env',
+              pcKeys: pcKeysD1.buffer,
+            });
+          } else {
+            var okIters  = m.iters === 2;
+            var okLast   = (m.lastPc >>> 0) === 0xDEADBEEF;
+            var okReason = m.exitReason === 'unmapped';
+            var ok = okIters && okLast && okReason;
+            console.log('[ppc-worker-handshake] run iters=' + m.iters
+              + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+              + ' exit=' + m.exitReason
+              + ' ' + (ok ? 'PASS' : 'FAIL'));
+            // Kick off 4f-5 verification: empty region 5, run with
+            // compileOnMiss=true. Each miss mailbox-calls cmd 13
+            // (CompileBlock); page synthesizes wasm bytes and writes
+            // them into SAB scratch, ppc-worker copies + instantiates.
+            window._ppcRunCompileTest = true;
+            ppc_worker.postMessage({ cmd: 'run', startPc: 0x10000000, maxIters: 3, compileOnMiss: true });
+          }
+        } else if (m.cmd === 'run-nack') {
+          console.error('[ppc-worker-handshake] run FAIL: ' + m.reason);
+        } else if (m.cmd === 'error') {
+          console.error('[ppc-worker-handshake] error: ' + m.error);
+        }
+      };
+      // Send the shared memory to the worker; it instantiates the wasm
+      // with this memory and posts 'ready' once done.
+      ppc_worker.postMessage({ cmd: 'mem-init', memory: ppcSharedMemory });
+      window.ppc_worker = ppc_worker;
+    } catch (e) {
+      console.error('[ppc-worker-handshake] spawn failed: ' + (e && e.message ? e.message : String(e)));
+    }
+
+    setStatus('Runtime ready. Loading ROM...');
+    loadRomAndBoot();
+    // 2f.6: standalone perf-measurement trigger. Engage cutover only
+    // once dolphin has booted far enough that PC is in valid PowerPC
+    // virtual range [0x80000000, 0x81800000) — i.e., PowerPCManager
+    // has been constructed (placement-new at SAB[0x02400000] zeros
+    // the page sentinel) AND the boot has reached real game code.
+    // Polling at 250ms cadence; gives up after 60s.
+    if (ppcPerfSynthEnabled) {
+      // Item-3: synthetic-ring perf-measurement. Gate only on MEM1 being
+      // wired (don't need a valid game PC — we make our own). Once wired,
+      // ask ppc-worker to splat a 256-slot ring at guest VA 0x80700000
+      // (well above OS structures and below libogc heap top). The ring's
+      // PC fanout + disabled idle-skip + 30s wall cap gives V8 sustained
+      // dispatch volume to fire TurboFan tier-up on every block in the
+      // ring.
+      var _perfSynthWait = performance.now();
+      var _perfSynthPoll = setInterval(function () {
+        var elapsed = performance.now() - _perfSynthWait;
+        if (window._ppcMem1Wired) {
+          clearInterval(_perfSynthPoll);
+          console.log('[ppc-worker-handshake] perf-synth: MEM1 wired (waited='
+            + elapsed.toFixed(0) + 'ms), building synthetic ring');
+          window.ppc_worker.postMessage({
+            cmd: 'synth-perf',
+            baseVA: 0x80700000,
+            nSlots: 256,
+          });
+        } else if (elapsed > 60000) {
+          clearInterval(_perfSynthPoll);
+          console.log('[ppc-worker-handshake] perf-synth: timed out waiting for MEM1 wire');
+        }
+      }, 250);
+    }
+    if (ppcPerfEnabled) {
+      var _perfWaitStart = performance.now();
+      var _perfPoll = setInterval(function () {
+        var u32sab = new Uint32Array(sharedMemory.buffer);
+        var pc = u32sab[0x02400000 >> 2] >>> 0;
+        // 2g: also gate on MEM1 being wired into ppc-worker — without
+        // it the self-compile path can't read instructions from RAM.
+        var ready = (pc >= 0x80000000 && pc < 0x81800000) && !!window._ppcMem1Wired;
+        var elapsed = performance.now() - _perfWaitStart;
+        if (ready) {
+          clearInterval(_perfPoll);
+          var i32sab = new Int32Array(sharedMemory.buffer);
+          var preDowncount = i32sab[(0x02400000 + 0x2F0) >> 2];
+          var preMsr       = u32sab[(0x02400000 + 0x2E0) >> 2] >>> 0;
+          var preExc       = u32sab[(0x02400000 + 0x2EC) >> 2] >>> 0;
+          console.log('[ppc-worker-handshake] perf-measurement: pre-cutover'
+            + ' (waited=' + elapsed.toFixed(0) + 'ms)'
+            + ' PC=0x' + pc.toString(16)
+            + ' downcount=' + preDowncount
+            + ' MSR=0x' + preMsr.toString(16)
+            + ' Exceptions=0x' + preExc.toString(16));
+          // NOTE: yield flag intentionally NOT set — see
+          // perf_cmd13_proxy_blocked_2026_05_08.md. With yield flag set,
+          // dolphin's pthread doesn't drain the proxy queue, so cmd-13
+          // (CompileBlock) postMessage from page hangs indefinitely.
+          // Run alongside dolphin instead; measurement loses some accuracy
+          // but at least exercises the actual dispatch path.
+          console.log('[ppc-worker-handshake] perf-measurement: sending run-continuous (no-yield)');
+          window._perfStartTime = performance.now();
+          window.ppc_worker.postMessage({
+            cmd: 'run-continuous',
+            compileOnMiss: true,
+            safetyCap: 5000000,
+            ignoreDowncount: true,
+            wallTimeMs: 5000,
+            mergedRegion: ppcMergedEnabled,
+          });
+        } else if (elapsed > 60000) {
+          clearInterval(_perfPoll);
+          console.log('[ppc-worker-handshake] perf-measurement: timed out waiting for valid PC, last=0x' + pc.toString(16));
+        }
+      }, 250);
+    }
+    // Real-boot dispatcher (?ppcbootdispatch=1). Once dolphin has booted
+    // far enough that PC is valid, MEM1 is wired, AND the page-mediated
+    // MMIO routing is live, set the yield flag and start ppc-worker's
+    // run-continuous loop. Dolphin's Run() returns at every 4096-iter
+    // heartbeat boundary so its pthread can drain the proxied MMIO/HLE
+    // calls that ppc-worker dispatches via the mailbox (cmd 6 → page
+    // setInterval → dolphin_worker postMessage → _dolphin_write16).
+    //
+    // When run-continuous returns for any reason (exception, downcount,
+    // idle-skip, unmapped), the page briefly clears the yield flag so
+    // dolphin can vector exceptions / advance scheduler / fast-forward
+    // idle, then re-engages.
+    if (ppcBootDispatchEnabled) {
+      var _bdWaitStart = performance.now();
+      var _bdPoll = setInterval(function () {
+        var u32bd = new Uint32Array(sharedMemory.buffer);
+        var pcBd  = u32bd[0x02400000 >> 2] >>> 0;
+        var pcOk  = (pcBd >= 0x80000000 && pcBd < 0x81800000);
+        var ready = pcOk && !!window._ppcMem1Wired && !!window._ppcDolphinRoutingReady;
+        var elapsed = performance.now() - _bdWaitStart;
+        if (ready) {
+          clearInterval(_bdPoll);
+          console.log('[ppc-worker-handshake] boot-dispatch: gate open'
+            + ' (waited=' + elapsed.toFixed(0) + 'ms)'
+            + ' PC=0x' + pcBd.toString(16));
+          // Item 7 Phase IV: enable cadence-handoff so dolphin reads
+          // canonical global_timer from SAB and run_iter_batch routes
+          // through dolphin_service_iter (no PPC dispatch — ppc-worker
+          // owns it). Keep Phase V (DEC dedupe) on too. Bits match
+          // gamecube/ppc-worker/sab_layout.h:386. Set BEFORE the first
+          // run-continuous slice so dolphin's bootLoop adopts the new
+          // route immediately. Routed through dolphin_worker postMessage
+          // because Module-side _dolphin_ct_set_phase_flags lives in the
+          // worker thread.
+          if (dolphin_worker) {
+            // Write CT_PHASE_FLAGS directly into SAB — same memory both
+            // workers see. CT_QUEUE_ADDR=0x02680000, CT_OFF_PHASE_FLAGS=0x2C,
+            // PHASE4=0x2, PHASE5=0x4. Use Atomics.store for release-order
+            // semantics so dolphin's __atomic_load_n(ACQUIRE) sees the write.
+            Atomics.store(new Int32Array(sharedMemory.buffer), (0x02680000 + 0x2C) >> 2, 0x6);
+            // Also send postMessage as a backup in case dolphin caches a
+            // copy of the flags somewhere (it shouldn't — flag is read
+            // directly via dolphin_ct_get_phase_flags from SAB).
+            dolphin_worker.postMessage({ cmd: 'ct-phase-set', flags: 0x6 });
+            console.log('[ppc-worker-handshake] CT_PHASE4|PHASE5 set in SAB + postMessage sent');
+          }
+          // Confirm boot-mode flags on ppc-worker. perfStub=false ensures
+          // dispatched blocks call real env.ppc_* imports through the
+          // mailbox path. hleNative stays false; the SAB hash table is
+          // populated by dolphin but we don't have a "snapshot-published"
+          // signal yet — the JS-side env.ppc_hle_check mailbox path is
+          // already live so HLE works either way.
+          window.ppc_worker.postMessage({ cmd: 'set-mode',
+            perfStub: false, hleNative: false });
+          window._bdDispatching = false;
+          window._bdLoopRunning = true;
+          window._bdLoopStart   = performance.now();
+          var i32bd = new Int32Array(sharedMemory.buffer);
+          var startBootDispatchSlice = function () {
+            if (!window._bdLoopRunning) return;
+            // Set yield flag so dolphin's Run() returns at next heartbeat.
+            Atomics.store(i32bd, 0x02500000 >> 2, 1);
+            window._bdDispatching = true;
+            window._bdSliceStart  = performance.now();
+            // safetyCap large; wallTimeMs caps each slice so we yield
+            // back to dolphin every ~250ms even on smooth runs. Boot
+            // mode: real imports, real downcount, real idle-skip.
+            window.ppc_worker.postMessage({
+              cmd: 'run-continuous',
+              compileOnMiss: true,
+              safetyCap: 500000,
+              ignoreDowncount: false,
+              disableIdleSkip: false,
+              wallTimeMs: 250,
+              mergedRegion: ppcMergedEnabled,
+            });
+          };
+          // Hook run-continuous-ack so we re-engage. The existing
+          // onmessage handler logs the perf-result line; we add a
+          // second listener via window-scoped flag so we can extend
+          // its behaviour without rewriting that branch.
+          window._bdReengageOnAck = function (m) {
+            if (!window._bdLoopRunning) return;
+            var sliceMs = performance.now() - (window._bdSliceStart || performance.now());
+            console.log('[ppc-worker-handshake] boot-dispatch slice'
+              + ' iters=' + (m.iters >>> 0)
+              + ' compileCalls=' + (m.compileCalls >>> 0)
+              + ' exit=' + m.exitReason
+              + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+              + ' sliceMs=' + sliceMs.toFixed(1));
+            // Clear yield flag and give dolphin a brief window to vector
+            // exceptions / advance scheduler. setTimeout 0 yields the
+            // event loop; the page's mbx consumer (4 ms interval) keeps
+            // running. 30 ms is enough for dolphin's bootLoop to step
+            // through 1-2 batches.
+            Atomics.store(i32bd, 0x02500000 >> 2, 0);
+            window._bdDispatching = false;
+            setTimeout(startBootDispatchSlice, 30);
+          };
+          // Initial kick.
+          startBootDispatchSlice();
+        } else if (elapsed > 60000) {
+          clearInterval(_bdPoll);
+          console.log('[ppc-worker-handshake] boot-dispatch: timed out'
+            + ' PC=0x' + pcBd.toString(16)
+            + ' mem1Wired=' + !!window._ppcMem1Wired
+            + ' routingReady=' + !!window._ppcDolphinRoutingReady);
+        }
+      }, 250);
+    }
+  };
   var mobilePadState = { a: false, b: false, x: false, y: false, l: false, r: false, z: false, start: false, select: false, up: false, down: false, left: false, right: false };
   function updatePadState() {
     if (!padStatus1) return;
@@ -254,16 +1539,147 @@
     setTimeout(pollController, 10);
   }
   var renderFrames = 0, lastFpsLog = performance.now();
-  var canvasCtx = null, canvasImg = null;
-  function paintFrame(pixels, w, h, pitch) {
-    var c = $('canvas');
-    if (!canvasCtx) canvasCtx = c.getContext('2d');
-    if (c.width !== w) c.width = w;
-    if (c.height !== h) c.height = h;
-    if (!canvasImg || canvasImg.width !== w || canvasImg.height !== h) {
-      canvasImg = canvasCtx.createImageData(w, h);
+  // Render backend selection (in order of preference):
+  //   1. GPU worker via OffscreenCanvas (paint runs on its own thread,
+  //      tries WebGPU then internally falls back to 2D inside the worker)
+  //   2. Main-thread WebGPU (older browsers w/ WebGPU but no OffscreenCanvas)
+  //   3. Main-thread 2D canvas (per-pixel JS swizzle)
+  // Once we transferControlToOffscreen, the canvas is owned by the worker
+  // and main-thread fallback is no longer possible. We try the worker
+  // first because in modern browsers it's the strictly better path.
+  var gpuWorker = null;
+  var gpuWorkerMode = null;   // 'webgpu' | '2d' | null (not initialized)
+  var gpuWorkerReady = false;
+  var gpuWorkerFailed = false;
+  // Main-thread WebGPU state (used only if gpu worker can't be created
+  // OR if OffscreenCanvas is unavailable).
+  var GPU = {
+    available: false,
+    initing: false,
+    inited: false,
+    failed: false,
+    device: null,
+    ctx: null,
+    format: null,
+    pipeline: null,
+    sampler: null,
+    texture: null,
+    texW: 0, texH: 0,
+    bindGroup: null,
+    layout: null,
+  };
+  function initWebGPU(canvas) {
+    if (GPU.inited || GPU.failed || GPU.initing) return GPU.inited;
+    GPU.initing = true;
+    if (!('gpu' in navigator)) {
+      GPU.failed = true; GPU.initing = false;
+      pageLog('[render] WebGPU not available — falling back to 2D canvas');
+      return false;
     }
-    var dst = canvasImg.data;
+    navigator.gpu.requestAdapter().then(function (adapter) {
+      if (!adapter) throw new Error('no adapter');
+      return adapter.requestDevice();
+    }).then(function (device) {
+      GPU.device = device;
+      GPU.ctx = canvas.getContext('webgpu');
+      if (!GPU.ctx) throw new Error('webgpu context unavailable');
+      GPU.format = navigator.gpu.getPreferredCanvasFormat();
+      GPU.ctx.configure({ device: device, format: GPU.format, alphaMode: 'opaque' });
+      // Uber-shader: fullscreen quad via vertex_index, sample BGRA texture, output as canvas format.
+      var shader = device.createShaderModule({ code: ''
+        + 'struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, };\n'
+        + '@vertex fn vs(@builtin(vertex_index) i: u32) -> VSOut {\n'
+        + '  var p = array<vec2<f32>, 6>(\n'
+        + '    vec2(-1.0, -1.0), vec2( 1.0, -1.0), vec2(-1.0,  1.0),\n'
+        + '    vec2(-1.0,  1.0), vec2( 1.0, -1.0), vec2( 1.0,  1.0));\n'
+        + '  var uv = array<vec2<f32>, 6>(\n'
+        + '    vec2(0.0, 1.0), vec2(1.0, 1.0), vec2(0.0, 0.0),\n'
+        + '    vec2(0.0, 0.0), vec2(1.0, 1.0), vec2(1.0, 0.0));\n'
+        + '  var o: VSOut;\n'
+        + '  o.pos = vec4(p[i], 0.0, 1.0);\n'
+        + '  o.uv = uv[i];\n'
+        + '  return o;\n'
+        + '}\n'
+        + '@group(0) @binding(0) var samp: sampler;\n'
+        + '@group(0) @binding(1) var tex: texture_2d<f32>;\n'
+        + '@fragment fn fs(in: VSOut) -> @location(0) vec4<f32> {\n'
+        + '  return textureSample(tex, samp, in.uv);\n'
+        + '}\n'
+      });
+      GPU.layout = device.createBindGroupLayout({ entries: [
+        { binding: 0, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+        { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+      ]});
+      var pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [GPU.layout] });
+      GPU.pipeline = device.createRenderPipeline({
+        layout: pipelineLayout,
+        vertex: { module: shader, entryPoint: 'vs' },
+        fragment: { module: shader, entryPoint: 'fs', targets: [{ format: GPU.format }] },
+        primitive: { topology: 'triangle-list' },
+      });
+      GPU.sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+      GPU.available = true;
+      GPU.inited = true;
+      GPU.initing = false;
+      pageLog('[render] WebGPU ready (format=' + GPU.format + ')');
+    }).catch(function (e) {
+      GPU.failed = true;
+      GPU.initing = false;
+      pageLog('[render] WebGPU init failed: ' + e + ' — falling back to 2D');
+    });
+    return false;
+  }
+  function ensureGpuTexture(w, h) {
+    if (GPU.texture && GPU.texW === w && GPU.texH === h) return;
+    if (GPU.texture) GPU.texture.destroy();
+    GPU.texture = GPU.device.createTexture({
+      size: { width: w, height: h, depthOrArrayLayers: 1 },
+      format: 'bgra8unorm',
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    GPU.texW = w; GPU.texH = h;
+    GPU.bindGroup = GPU.device.createBindGroup({
+      layout: GPU.layout,
+      entries: [
+        { binding: 0, resource: GPU.sampler },
+        { binding: 1, resource: GPU.texture.createView() },
+      ],
+    });
+  }
+  function paintFrameGPU(pixels, w, h, pitch) {
+    ensureGpuTexture(w, h);
+    var bytesPerRow = pitch || w * 4;
+    // writeTexture: GPU does the BGRA -> canvas-format swizzle for free.
+    // pixels is a Uint8Array view into the worker's memory transferred via
+    // postMessage. WebGPU copies it into the texture in one host-side memcpy.
+    GPU.device.queue.writeTexture(
+      { texture: GPU.texture },
+      pixels,
+      { offset: 0, bytesPerRow: bytesPerRow, rowsPerImage: h },
+      { width: w, height: h, depthOrArrayLayers: 1 }
+    );
+    var enc = GPU.device.createCommandEncoder();
+    var pass = enc.beginRenderPass({
+      colorAttachments: [{
+        view: GPU.ctx.getCurrentTexture().createView(),
+        loadOp: 'clear', storeOp: 'store',
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+      }],
+    });
+    pass.setPipeline(GPU.pipeline);
+    pass.setBindGroup(0, GPU.bindGroup);
+    pass.draw(6);
+    pass.end();
+    GPU.device.queue.submit([enc.finish()]);
+  }
+  var canvasCtx2D = null, canvasImg2D = null;
+  function paintFrame2D(pixels, w, h, pitch) {
+    var c = $('canvas');
+    if (!canvasCtx2D) canvasCtx2D = c.getContext('2d');
+    if (!canvasImg2D || canvasImg2D.width !== w || canvasImg2D.height !== h) {
+      canvasImg2D = canvasCtx2D.createImageData(w, h);
+    }
+    var dst = canvasImg2D.data;
     var stride = pitch || w * 4;
     var src = pixels;
     var di = 0;
@@ -278,17 +1694,403 @@
         so += 4;
       }
     }
-    canvasCtx.putImageData(canvasImg, 0, 0);
+    canvasCtx2D.putImageData(canvasImg2D, 0, 0);
   }
+  function paintFrame(pixels, w, h, pitch) {
+    var c = $('canvas');
+    // GPU worker path: ship the pixels to the worker. The OffscreenCanvas
+    // worker decides whether to paint via WebGPU or 2D internally.
+    if (gpuWorker && gpuWorkerReady) {
+      // Pixels arrive as Uint8Array views into a postMessage-transferred
+      // buffer; pass the buffer directly to the worker as transferable.
+      var buf = pixels.buffer || pixels;
+      var byteOffset = pixels.byteOffset || 0;
+      var byteLength = pixels.byteLength || buf.byteLength;
+      // If pixels view is over a SharedArrayBuffer, we can't transfer; copy.
+      if (buf instanceof SharedArrayBuffer) {
+        var copy = new Uint8Array(byteLength);
+        copy.set(new Uint8Array(buf, byteOffset, byteLength));
+        gpuWorker.postMessage({ cmd: 'frame', pixels: copy.buffer, w: w, h: h, pitch: pitch }, [copy.buffer]);
+      } else {
+        // Slice to avoid sending the whole underlying buffer if it's larger.
+        var slice = byteOffset === 0 && byteLength === buf.byteLength
+          ? buf
+          : pixels.slice().buffer;
+        gpuWorker.postMessage({ cmd: 'frame', pixels: slice, w: w, h: h, pitch: pitch }, [slice]);
+      }
+      return;
+    }
+    // Fallbacks (only used if GPU worker couldn't be created).
+    if (c.width !== w) c.width = w;
+    if (c.height !== h) c.height = h;
+    if (GPU.available) { paintFrameGPU(pixels, w, h, pitch); return; }
+    paintFrame2D(pixels, w, h, pitch);
+  }
+  // Eager GPU-worker init — kick off at page load. If OffscreenCanvas is
+  // available we transferControlToOffscreen and let the worker handle
+  // paint on its own thread (WebGPU preferred, 2D fallback inside worker).
+  // If transferControlToOffscreen is unavailable (very old browsers), or
+  // if Worker spawn fails, fall back to main-thread WebGPU then 2D.
+  (function () {
+    function tryInit() {
+      var c = $('canvas');
+      if (!c) { setTimeout(tryInit, 50); return; }
+      var hasOffscreen = typeof c.transferControlToOffscreen === 'function';
+      var hasGpu = typeof navigator !== 'undefined' && 'gpu' in navigator;
+      pageLog('[render] OffscreenCanvas=' + hasOffscreen + ' navigator.gpu=' + hasGpu);
+      if (!hasOffscreen) {
+        // Old browser: fall back to main-thread WebGPU (or 2D inside it).
+        initWebGPU(c);
+        return;
+      }
+      try {
+        gpuWorker = new Worker('/gamecube/gpu-worker.js?v=' + Date.now());
+        gpuWorker.onmessage = function (e) {
+          var d = e.data;
+          if (d.cmd === 'ready') {
+            gpuWorkerReady = true;
+            gpuWorkerMode = d.mode;
+            pageLog('[render] GPU worker ready (mode=' + d.mode + ')');
+          } else if (d.cmd === 'init-failed') {
+            gpuWorkerFailed = true;
+            pageLog('[render] GPU worker init failed: ' + d.reason);
+            // Canvas is gone (transferred); accept the failure.
+          } else if (d.cmd === 'stats') {
+            // Optional: log stats to FPS counter.
+            if (d.framesPainted > 0 && fpsEl) {
+              fpsEl.textContent = 'FPS: ' + d.framesPainted + ' (paint ' + d.lastPaintMs.toFixed(1) + 'ms)';
+            }
+          }
+        };
+        gpuWorker.onerror = function (e) {
+          gpuWorkerFailed = true;
+          pageLog('[render] GPU worker error: ' + e.message);
+        };
+        var off = c.transferControlToOffscreen();
+        gpuWorker.postMessage({ cmd: 'init', canvas: off }, [off]);
+        // Runtime control surface for post-processing. Examples:
+        //   _gcSetRender({aspect: '4:3', scale: 'integer', filter: 'nearest'});
+        //   _gcSetRender({gamma: 1.2, brightness: 0.05, saturation: 1.1});
+        // Settings persist on the GPU worker until changed.
+        window._gcSetRender = function (opts) {
+          if (gpuWorker) gpuWorker.postMessage(Object.assign({ cmd: 'pp' }, opts || {}));
+        };
+        // Resize hook — when the page changes the canvas backing dimensions
+        // (CSS sizing, rotate, fullscreen), forward to the worker so it
+        // updates the OffscreenCanvas.
+        window._gcCanvasResize = function (w, h) {
+          if (gpuWorker) gpuWorker.postMessage({ cmd: 'resize', w: w, h: h });
+        };
+      } catch (e) {
+        pageLog('[render] GPU worker spawn failed: ' + e + ' — falling back to main-thread paint');
+        gpuWorker = null;
+        gpuWorkerFailed = true;
+        // Try main-thread WebGPU as last resort. Canvas hasn't been
+        // transferred if transferControlToOffscreen threw.
+        initWebGPU(c);
+      }
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', tryInit);
+    } else {
+      tryInit();
+    }
+  })();
+  // AudioWorklet init via SAB ring buffer. AudioContext requires user
+  // gesture (autoplay policy) so init runs on the first user interaction
+  // event. Until then, the cmd:'audio' handler falls back to the legacy
+  // Module._feedAudio path. RING_FRAMES sizes the buffer for ~93 ms of
+  // stereo audio at 44.1 kHz (4096 frames * 2 ch = 8192 i16 samples).
+  var GcAudio = { ctx: null, node: null, ring: null, ringHdr: null,
+                  ringData: null, ringCap: 0, inited: false };
+  function pushAudioSamples(int16Buf, frameCount) {
+    if (!GcAudio.inited) return;
+    var hdr = GcAudio.ringHdr;
+    var data = GcAudio.ringData;
+    var cap = GcAudio.ringCap;
+    var head = Atomics.load(hdr, 0);
+    var tail = Atomics.load(hdr, 1);
+    var free = cap - ((head - tail) | 0);
+    var samplesIn = (frameCount | 0) * 2;
+    var n = samplesIn > free ? free : samplesIn;
+    if (n === 0) return;
+    var src = new Int16Array(int16Buf);
+    var start = (head >>> 0) % cap;
+    var first = Math.min(n, cap - start);
+    for (var i = 0; i < first; ++i) data[start + i] = src[i];
+    var second = n - first;
+    for (var j = 0; j < second; ++j) data[j] = src[first + j];
+    Atomics.store(hdr, 0, ((head + n) | 0));
+  }
+  async function initGcAudio() {
+    if (GcAudio.inited || GcAudio.initing) return;
+    GcAudio.initing = true;
+    try {
+      var ctx = new (window.AudioContext || window.webkitAudioContext)();
+      // Ring buffer SAB: 4 i32 header + 4096 i16 samples.
+      var RING_SAMPLES = 4096 * 2;  // 4096 frames * 2 channels
+      var sab = new SharedArrayBuffer(16 + RING_SAMPLES * 2);
+      var hdr = new Int32Array(sab, 0, 4);
+      hdr[2] = RING_SAMPLES;  // capacity in elements
+      hdr[3] = 2;              // elemSize bytes (int16)
+      var data = new Int16Array(sab, 16, RING_SAMPLES);
+      await ctx.audioWorklet.addModule('/gamecube/audio-worklet.js');
+      var node = new AudioWorkletNode(ctx, 'gc-audio-processor', {
+        outputChannelCount: [2],
+        processorOptions: { sab: sab, byteOffset: 0 },
+      });
+      node.port.onmessage = function (e) {
+        if (e.data && e.data.cmd === 'stats') {
+          if (e.data.underrunFrames > 0) {
+            pageLog('[audio] underrun ' + e.data.underrunFrames + 'f / consumed ' + e.data.consumedFrames + 'f');
+          }
+        }
+      };
+      node.connect(ctx.destination);
+      GcAudio.ctx = ctx;
+      GcAudio.node = node;
+      GcAudio.ring = sab;
+      GcAudio.ringHdr = hdr;
+      GcAudio.ringData = data;
+      GcAudio.ringCap = RING_SAMPLES;
+      GcAudio.inited = true;
+      window._gcAudioPushSamples = pushAudioSamples;
+      pageLog('[audio] AudioWorklet ready (sampleRate=' + ctx.sampleRate + ')');
+    } catch (e) {
+      pageLog('[audio] AudioWorklet init failed: ' + e + ' — using legacy Module._feedAudio');
+    } finally {
+      GcAudio.initing = false;
+    }
+  }
+  // Wire user-gesture init.
+  (function () {
+    function once() {
+      window.removeEventListener('pointerdown', once, true);
+      window.removeEventListener('keydown', once, true);
+      window.removeEventListener('touchstart', once, true);
+      initGcAudio();
+    }
+    window.addEventListener('pointerdown', once, true);
+    window.addEventListener('keydown', once, true);
+    window.addEventListener('touchstart', once, true);
+  })();
   function onWorkerMsg(e) {
     var data = e.data;
     switch (data.cmd) {
       case 'print': pageLog('> ' + data.txt); break;
       case 'setStatus': setStatus(data.txt); break;
       case 'render': { if (data.pixels) paintFrame(data.pixels, data.w, data.h, data.pitch); if (data.h > 0 && !window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame received w:' + data.w + ' h:' + data.h); } renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now - lastFpsLog)).toFixed(1); renderFrames = 0; lastFpsLog = now; } break; }
-      case 'audio': { if (audioMuted) break; if (Module._feedAudio) Module._feedAudio(data.buf, data.len); break; }
+      case 'audio': {
+        if (audioMuted) break;
+        // Prefer AudioWorklet path (lock-free SAB ring buffer); fall back
+        // to legacy Module._feedAudio if the worklet hasn't been initialized
+        // yet (e.g., user hasn't gestured to start AudioContext).
+        if (window._gcAudioPushSamples) {
+          window._gcAudioPushSamples(data.buf, data.len);
+        } else if (Module._feedAudio) {
+          Module._feedAudio(data.buf, data.len);
+        }
+        break;
+      }
       case 'stateSaved': if (pendingSaveResolve) { pendingSaveResolve(data.data); pendingSaveResolve = null; } break;
       case 'stateLoaded': if (pendingLoadResolve) { pendingLoadResolve(); pendingLoadResolve = null; } break;
+      case 'runtime-ready':
+        // 4f-6: dolphin's wasm runtime is up. Set the flag so the
+        // page-mediated mailbox consumer starts routing real MMIO cmds
+        // (2..12) to dolphin. Listener inside the mailbox-demo-ack
+        // handler also sets this — duplicate set is harmless.
+        if (!window._ppcDolphinRoutingReady) {
+          window._ppcDolphinRoutingReady = true;
+          console.log('[ppc-worker-handshake] dolphin runtime-ready (via onWorkerMsg)');
+        }
+        break;
+      case 'mbx-reply':
+        // 4f-6: dolphin's mbx-cmd handler reply. Ignore here — the
+        // listener inside mailbox-demo-ack writes to the SAB.
+        break;
+      case 'ram-info':
+        // 2g: handled by _ppcMboxReplyListener (added in mailbox-demo-ack);
+        // swallow here so onWorkerMsg's default doesn't log "unknown".
+        break;
+      case 'paused-for-cutover':
+      case 'cutover-resumed':
+        // 2d.9 reverted; messages no longer expected. Ignore silently.
+        break;
+      case 'state-export-test-result': {
+        // 2d.7: dolphin stamped its test buffer with sentinel + pattern.
+        // Bytes arrive here Transferable; we copy into SAB[0x02400000]
+        // and verify the layout matches what dolphin wrote. PC sentinel
+        // at +0, pattern (0xCAFE0000 | offset/4) at every other u32.
+        if (data.error) {
+          console.error('[ppc-worker-handshake] state-export-test FAIL: ' + data.error);
+          break;
+        }
+        var u8s = new Uint8Array(data.bytes);
+        var u8sab = new Uint8Array(sharedMemory.buffer);
+        u8sab.set(u8s, 0x02400000);
+        var u32sab = new Uint32Array(sharedMemory.buffer);
+        var pcVal  = u32sab[(0x02400000 + 0)  >> 2] >>> 0;
+        var pat4   = u32sab[(0x02400000 + 4)  >> 2] >>> 0;  // 0xCAFE0001 expected
+        var pat32  = u32sab[(0x02400000 + 32) >> 2] >>> 0;  // 0xCAFE0008 expected
+        var pat252 = u32sab[(0x02400000 + 252)>> 2] >>> 0;  // 0xCAFE003F expected
+        var okPc    = pcVal === (data.pcSentinel >>> 0);
+        var okPat4  = pat4 === 0xCAFE0001;
+        var okPat32 = pat32 === 0xCAFE0008;
+        var okPat252 = pat252 === 0xCAFE003F;
+        var ok_d7 = okPc && okPat4 && okPat32 && okPat252;
+        console.log('[ppc-worker-handshake] state-sync size=' + data.size
+          + ' SAB[+0]=0x' + pcVal.toString(16) + ' (expect 0x' + (data.pcSentinel >>> 0).toString(16) + ')'
+          + ' SAB[+4]=0x' + pat4.toString(16)
+          + ' SAB[+32]=0x' + pat32.toString(16)
+          + ' SAB[+252]=0x' + pat252.toString(16)
+          + ' ' + (ok_d7 ? 'PASS' : 'FAIL'));
+        // Phase 2d.8: cutover gate. With ?ppcdispatch=1, kick off the
+        // sustained dispatch run. Each iter: lookup unmapped → cmd 13
+        // → dolphin build_block emits real bytes → ppc-worker
+        // instantiates + dispatches → next_pc → loop. 20 iters keeps
+        // wall-time bounded (~100 ms at ~5 ms/compile).
+        if (window._ppcDispatchEnabled) {
+          window._ppcCutoverDispatchTest = true;
+          // 2d.7 left SAB[0x02400000..255] stamped with the test
+          // sentinel pattern. Real bementalJIT-emitted blocks read
+          // various ppc_state fields (pc, npc, msr, etc.) and the
+          // pattern's non-zero values would skew the dispatch chain.
+          // Reset the region to zeros (matching the SAB state when
+          // 4f-5's run-with-compile chain validated cleanly), then
+          // seed pc to the run's start_pc so the first block sees
+          // its expected entry state.
+          var u32rst = new Uint32Array(sharedMemory.buffer);
+          for (var off_d8 = 0; off_d8 < 256; off_d8 += 4) {
+            u32rst[(0x02400000 + off_d8) >> 2] = 0;
+          }
+          u32rst[0x02400000 >> 2] = 0x80003200;  // ppc_state.pc
+          console.log('[ppc-worker-handshake] cutover-gate: ppc-worker driving sustained dispatch (10 iters)');
+          window.ppc_worker.postMessage({ cmd: 'run', startPc: 0x80003200, maxIters: 10, compileOnMiss: true });
+        }
+        break;
+      }
+      case 'compile-test-result': {
+        // 2d.2: dolphin emitted a real bementalJIT wasm via build_block
+        // and shipped the bytes via Transferable. Verify the magic
+        // header (\0asm) and try instantiating to confirm the module
+        // is structurally valid. Imports are bound to env.memory (SAB)
+        // and the same mailbox-routed env bindings ppc-worker uses,
+        // so any import dependencies (ppc_read32 etc.) resolve.
+        // 2d.4: tag-gated — cmd-13 mbx routing uses tag='mbx-13' and
+        // is handled in _ppcMboxReplyListener.
+        // 2d.5: tag='multi-insts' verifies multi-instruction emission
+        // produces larger wasm than the 1-nop baseline.
+        if (data.tag === 'multi-insts') {
+          if (data.error) {
+            console.error('[ppc-worker-handshake] multi-insts FAIL: ' + data.error);
+            break;
+          }
+          var u8m = new Uint8Array(data.bytes);
+          var hdrM = u8m.length >= 8 && u8m[0] === 0x00 && u8m[1] === 0x61 && u8m[2] === 0x73 && u8m[3] === 0x6d;
+          var instMOk = false, instMErr = null;
+          if (hdrM) {
+            try { new WebAssembly.Module(u8m); instMOk = true; }
+            catch (err) { instMErr = err && err.message ? err.message : String(err); }
+          }
+          // 1-nop baseline was 386. 10-nop should be appreciably
+          // larger; threshold of 500 is comfortable.
+          var biggerThanBaseline = data.size > 500;
+          var ok_d5 = hdrM && instMOk && biggerThanBaseline;
+          console.log('[ppc-worker-handshake] multi-insts pc=0x' + (data.pc >>> 0).toString(16)
+            + ' nInsts=10 bytes=' + data.size
+            + ' (baseline 386)'
+            + ' magic=' + (hdrM ? 'OK' : 'BAD')
+            + ' Module=' + (instMOk ? 'OK' : ('FAIL:' + instMErr))
+            + ' bigger=' + (biggerThanBaseline ? 'YES' : 'NO')
+            + ' ' + (ok_d5 ? 'PASS' : 'FAIL'));
+          // Phase 2d.6: kick off real-decode test. Pre-boot
+          // dolphin_compile_block_real returns 0 (g_jit_wasm null);
+          // worker_funcs.js falls through to the synth path. Cascade
+          // verifies the API plumbing works AND the decode flag
+          // correctly reports false pre-boot.
+          dolphin_worker.postMessage({ cmd: 'compile-test', pc: 0x80003100, realDecode: true, tag: 'real-decode' });
+          break;
+        }
+        if (data.tag === 'real-decode') {
+          if (data.error) {
+            console.error('[ppc-worker-handshake] real-decode FAIL: ' + data.error);
+            break;
+          }
+          var u8r = new Uint8Array(data.bytes);
+          var hdrR = u8r.length >= 8 && u8r[0] === 0x00 && u8r[1] === 0x61 && u8r[2] === 0x73 && u8r[3] === 0x6d;
+          var instROk = false, instRErr = null;
+          if (hdrR) {
+            try { new WebAssembly.Module(u8r); instROk = true; }
+            catch (err) { instRErr = err && err.message ? err.message : String(err); }
+          }
+          // Pre-boot expectation: decoded=false (g_jit_wasm null →
+          // dolphin_compile_block_real returns 0 → fallback to synth →
+          // bytes match the 1-nop baseline of 386).
+          // Post-boot expectation (future): decoded=true, bytes scale
+          // with the real instruction count at pc.
+          var preBootShape = !data.decoded && data.size === 386;
+          var postBootShape = data.decoded && data.size > 100;
+          var ok_d6 = hdrR && instROk && (preBootShape || postBootShape);
+          console.log('[ppc-worker-handshake] real-decode pc=0x' + (data.pc >>> 0).toString(16)
+            + ' decoded=' + data.decoded
+            + ' bytes=' + data.size
+            + ' magic=' + (hdrR ? 'OK' : 'BAD')
+            + ' Module=' + (instROk ? 'OK' : ('FAIL:' + instRErr))
+            + ' shape=' + (preBootShape ? 'pre-boot-fallback' : (postBootShape ? 'post-boot-real' : 'unexpected'))
+            + ' ' + (ok_d6 ? 'PASS' : 'FAIL'));
+          // Phase 2d.7 kick-off: dolphin stamps a test PowerPCState
+          // buffer with a sentinel + recognizable pattern, ships the
+          // bytes to the page; page copies into SAB[0x02400000] and
+          // verifies the layout.
+          dolphin_worker.postMessage({ cmd: 'state-export-test', pcSentinel: 0xDEADC0DE });
+          break;
+        }
+        if (data.tag && data.tag !== 'verify') break;
+        if (data.error) {
+          console.error('[ppc-worker-handshake] real-compile FAIL: ' + data.error);
+          break;
+        }
+        var u8 = new Uint8Array(data.bytes);
+        var hdrOk = u8.length >= 8
+          && u8[0] === 0x00 && u8[1] === 0x61 && u8[2] === 0x73 && u8[3] === 0x6d
+          && u8[4] === 0x01 && u8[5] === 0x00 && u8[6] === 0x00 && u8[7] === 0x00;
+        var instOk = false, instErr = null;
+        if (hdrOk) {
+          try {
+            var wmod = new WebAssembly.Module(u8);
+            instOk = true;
+            // Just construct the Module — full Instance would need all
+            // imports bound. Module construction validates the structure.
+          } catch (err) {
+            instErr = err && err.message ? err.message : String(err);
+          }
+        }
+        var ok_d2 = hdrOk && instOk;
+        console.log('[ppc-worker-handshake] real-compile pc=0x' + (data.pc >>> 0).toString(16)
+          + ' bytes=' + (data.size >>> 0)
+          + ' magic=' + (hdrOk ? 'OK' : 'BAD')
+          + ' WebAssembly.Module=' + (instOk ? 'OK' : ('FAIL:' + instErr))
+          + ' ' + (ok_d2 ? 'PASS' : 'FAIL'));
+        // Phase 2d.3: hand the real bytes to ppc-worker for instantiate
+        // + dispatch. bementalJIT exports the entrypoint as `run`;
+        // ppc-worker's dispatch loop falls back to it when there's no
+        // `block<idx>` export. region-instantiate with imports='env'
+        // resolves all host function imports against ppc-worker's
+        // mod.bemental_imports.env (set up in 4f-2).
+        if (ok_d2) {
+          window._ppcRealDispatchTest = true;
+          window._ppcRealDispatchPc = (data.pc >>> 0);
+          var pcKeysReal = new Uint32Array([data.pc >>> 0]);
+          ppc_worker.postMessage({
+            cmd: 'region-instantiate',
+            regionIdx: 3,
+            bytes: data.bytes,
+            imports: 'env',
+            pcKeys: pcKeysReal.buffer,
+          });
+        }
+        break;
+      }
       default: pageLog('unknown worker cmd: ' + data.cmd);
     }
   }
