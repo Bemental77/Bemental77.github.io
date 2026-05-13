@@ -331,15 +331,39 @@
     pageLog('[rom] size hint ' + totalMB + ' MB across ' + ROM_CHUNKS.length + ' chunks');
     pcsx_worker.postMessage({ cmd: 'romBegin', name: ROM_NAME + '.bin', size: totalSize });
     var total = 0;
+    var BATCH_BYTES = 1 << 20;
+    var batch = new Uint8Array(BATCH_BYTES);
+    var batchPos = 0;
     for (var i = 0; i < ROM_CHUNKS.length; i++) {
       setStatus('Loading ' + (i+1) + '/' + ROM_CHUNKS.length + ' — ' + (total/1048576).toFixed(0) + ' / ' + totalMB + ' MB');
       var r = await fetch(ROM_CHUNKS[i]);
       if (!r.ok) { setStatus('Chunk fetch failed: ' + ROM_CHUNKS[i]); return; }
-      var buf = await r.arrayBuffer();
-      total += buf.byteLength;
-      pageLog('[rom] chunk ' + (i+1) + '/' + ROM_CHUNKS.length + '  (' + (total/1048576).toFixed(1) + ' MB)');
-      pcsx_worker.postMessage({ cmd: 'romChunk', buf: buf }, [buf]);
-      buf = null;
+      var reader = r.body.getReader();
+      while (true) {
+        var step = await reader.read();
+        if (step.done) break;
+        var v = step.value, vPos = 0;
+        while (vPos < v.length) {
+          var copy = Math.min(BATCH_BYTES - batchPos, v.length - vPos);
+          batch.set(v.subarray(vPos, vPos + copy), batchPos);
+          batchPos += copy; vPos += copy;
+          if (batchPos === BATCH_BYTES) {
+            var buf = batch.buffer;
+            pcsx_worker.postMessage({ cmd: 'romChunk', buf: buf }, [buf]);
+            batch = new Uint8Array(BATCH_BYTES);
+            batchPos = 0;
+            total += BATCH_BYTES;
+            if ((total % (16 << 20)) === 0) setStatus('Loading ' + (total/1048576).toFixed(0) + ' / ' + totalMB + ' MB');
+          }
+        }
+      }
+      pageLog('[rom] part ' + (i+1) + '/' + ROM_CHUNKS.length);
+    }
+    if (batchPos > 0) {
+      var trailing = batch.buffer.slice(0, batchPos);
+      pcsx_worker.postMessage({ cmd: 'romChunk', buf: trailing }, [trailing]);
+      total += batchPos;
+      batch = null;
     }
     pageLog('[rom] streamed ' + (total/1048576).toFixed(1) + ' MB — booting');
     setStatus('Booting emulator…');
