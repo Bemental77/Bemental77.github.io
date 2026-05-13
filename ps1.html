@@ -377,18 +377,15 @@
         remaining -= urls[k].byteLength;
       }
     }
-    // Preload the first ~32 MB so pcsx_init runs without sync-XHR thrash
-    var PRELOAD_BYTES = 32 << 20;
-    setStatus('Warming ROM cache (32 MB)…');
+    // Async-prefetch the full first chunk so pcsx_init has data ready and we know the actual decompressed size
+    setStatus('Fetching chunk 0…');
     var preload = null;
     try {
-      var firstUrl = urls[0];
-      var preloadLen = Math.min(PRELOAD_BYTES, firstUrl.byteLength);
-      var pr = await fetch(firstUrl.url, { headers: { 'Range': 'bytes=0-' + (preloadLen - 1) } });
-      if (pr.ok || pr.status === 206) { preload = new Uint8Array(await pr.arrayBuffer()); }
+      var pr = await fetch(urls[0].url);
+      if (pr.ok) { preload = new Uint8Array(await pr.arrayBuffer()); urls[0].byteLength = preload.length; }
     } catch (e) { pageLog('[rom] preload failed: ' + e); }
     var totalMB = totalSize ? (totalSize/1048576).toFixed(0) : '?';
-    pageLog('[rom] lazy mode, total=' + totalMB + ' MB, preload=' + (preload ? (preload.byteLength/1048576).toFixed(0) + ' MB' : 'none') + ', ' + urls.length + ' chunks');
+    pageLog('[rom] lazy mode (full-chunk), total=' + totalMB + ' MB, preload chunk 0 = ' + (preload ? (preload.byteLength/1048576).toFixed(1) + ' MB' : 'none') + ', ' + urls.length + ' chunks');
     var preloadBuf = preload ? preload.buffer : null;
     pcsx_worker.postMessage({ cmd: 'romBegin', name: ROM_NAME + '.bin', size: totalSize, urls: urls, preload: preloadBuf }, preloadBuf ? [preloadBuf] : []);
     setStatus('Booting emulator (lazy)…');
