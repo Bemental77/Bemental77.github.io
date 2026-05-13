@@ -26,9 +26,6 @@
 #include "Core/HW/MMIOMirror.h"
 #include "Core/HW/SystemTimers.h"
 #include "Core/CoreTiming.h"
-#include "Core/PowerPC/JitInterface.h"
-#include "Core/PowerPC/JitWasm/JitWasm.h"
-#include "bementalJIT/block_cache.h"
 
 // CT phase flag accessor + queue mask drain live in JitWasm.cpp.
 extern "C" {
@@ -304,60 +301,6 @@ int load_state(const uint8_t* in_buf, int bytes) {
 EMSCRIPTEN_KEEPALIVE
 int state_size(void) {
     return (int)retro_serialize_size();
-}
-
-// Phase 2e cache-warmup (Option 1: pre-compile from dolphin cache).
-// The page enumerates dolphin's already-populated bementalJIT BlockCache
-// then posts the PC list to ppc-worker. Ppc-worker re-decodes from shared
-// MEM1 and warms its own cache so the post-cutover dispatch path doesn't
-// pay ~85 ms per first-touch compile. dolphin_jit_region_pcs_addr fills a
-// static buffer with up to REGION_MAX_PCS PCs and returns its base; the
-// caller reads `n_funcs` PCs from there. Single static buffer (reused per
-// region, single-threaded caller) keeps the export ABI simple.
-static constexpr uint32_t REGION_MAX_PCS = 4096u;
-static uint32_t g_jit_export_pcs_buf[REGION_MAX_PCS];
-
-static JitWasm* dolphin_get_jit_wasm() {
-    auto& system = Core::System::GetInstance();
-    auto* base = system.GetJitInterface().GetCore();
-    return dynamic_cast<JitWasm*>(base);
-}
-
-EMSCRIPTEN_KEEPALIVE
-uint32_t dolphin_jit_region_n_funcs(uint32_t r) {
-    JitWasm* jw = dolphin_get_jit_wasm();
-    if (!jw) return 0u;
-    if (r >= bemental::REGION_COUNT) return 0u;
-    return (uint32_t)jw->m_wasm_cache.region_n_funcs(static_cast<bemental::Region>(r));
-}
-
-EMSCRIPTEN_KEEPALIVE
-uint32_t dolphin_jit_region_pcs_addr(uint32_t r) {
-    JitWasm* jw = dolphin_get_jit_wasm();
-    if (!jw) return 0u;
-    if (r >= bemental::REGION_COUNT) return 0u;
-    const std::size_t n = jw->m_wasm_cache.region_export_pcs(
-        static_cast<bemental::Region>(r),
-        g_jit_export_pcs_buf, REGION_MAX_PCS);
-    // Buffer is at most REGION_MAX_PCS; caller pairs this with
-    // dolphin_jit_region_n_funcs to know the count.
-    (void)n;
-    return (uint32_t)reinterpret_cast<uintptr_t>(g_jit_export_pcs_buf);
-}
-
-// Phase 2e cache-warmup (Option 3 hybrid). Page calls this once at boot
-// after both workers' runtime is ready; bementalJIT's BlockCache will
-// publish a shadow record to the ring at `ring_addr` for every new block
-// (per-block and per-region paths). ppc-worker drains the ring on a
-// 50 ms cadence and calls compile_and_accumulate(pc) on each record,
-// warming its own cache during dolphin-owned dispatch.
-EMSCRIPTEN_KEEPALIVE
-void dolphin_jit_enable_shadow_publish(uint32_t ring_addr, uint32_t capacity) {
-    auto& system = Core::System::GetInstance();
-    auto* base = system.GetJitInterface().GetCore();
-    auto* jw = dynamic_cast<JitWasm*>(base);
-    if (!jw) return;
-    jw->m_wasm_cache.enable_shadow_publish(ring_addr, capacity);
 }
 
 }

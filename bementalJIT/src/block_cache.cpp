@@ -382,12 +382,6 @@ int BlockCache::compile(u64 key, const u8* bytes, std::size_t size) {
         m_map.emplace(key, handle);
     }
     register_pc_handle(key, handle);
-    // Phase 2e Option 3: publish to shadow ring so ppc-worker can warm
-    // its own cache during dolphin-owned dispatch. REGION_COUNT means
-    // "per-block path" — ppc-worker treats these the same as region
-    // entries on the consumer side.
-    shadow_publish_pc(static_cast<u32>(key), static_cast<u32>(REGION_COUNT),
-                      static_cast<u32>(size));
     return handle;
 }
 
@@ -542,10 +536,6 @@ void BlockCache::region_accumulate(Region r, u32 pc,
     rs.n_funcs           += 1u;
     rs.blocks_since_link += 1u;
     rs.last_accum_ms      = now_ms();
-
-    // Phase 2e Option 3: publish to shadow ring after the local record
-    // is committed. Drops on overflow — never blocks the producer.
-    shadow_publish_pc(pc, static_cast<u32>(r), static_cast<u32>(body_size));
 
 #ifdef __EMSCRIPTEN__
     // Diagnostic uses [worker] prefix so the probe puts it in the
@@ -803,27 +793,6 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
     }
 
 #ifdef __EMSCRIPTEN__
-    // Phase 2e cache-warmup (Option 2b: share via postMessage of relinked
-    // Module bytes). If the host installed `bementalPublishRelinkedRegion`
-    // (worker_funcs.js does on dolphin worker init), pass the merged-region
-    // bytes + pc_keys to it. The handler postMessages dolphin → page →
-    // ppc-worker, which builds its own WebAssembly.Module from the same
-    // bytes. V8 structured-clones the Module in the same agent cluster
-    // (coi-serviceworker provides COI), so ppc-worker pays instantiation
-    // cost only — no recompile. Fires for every relink so ppc-worker's
-    // cache tracks dolphin's.
-    EM_ASM({
-        if (typeof self !== 'undefined' &&
-            typeof self.bementalPublishRelinkedRegion === 'function') {
-            self.bementalPublishRelinkedRegion($0, $1, $2, $3, $4, $5, $6);
-        }
-    },
-    (int)r,
-    (int)bytes.data(), (int)bytes.size(),
-    (int)rs.pc_keys.data(), (int)rs.n_funcs,
-    rs.generation + 1,
-    use_merged_fn ? 1 : 0);
-
     // Instantiate, populate JS-side per-region pc->local_fn_idx Map, and
     // swap module_handle. Keep the previous instance alive in
     // Module.bemental_regions_old until we've successfully bound the new
@@ -1004,67 +973,6 @@ std::size_t BlockCache::region_n_funcs(Region r) const {
 int BlockCache::region_generation(Region r) const {
     if (r >= REGION_COUNT) return 0;
     return m_regions[r].generation;
-}
-
-std::size_t BlockCache::region_export_pcs(Region r, u32* out, std::size_t cap) const {
-    if (r >= REGION_COUNT || out == nullptr || cap == 0) return 0;
-    const auto& keys = m_regions[r].pc_keys;
-    const std::size_t n = (keys.size() < cap) ? keys.size() : cap;
-    for (std::size_t i = 0; i < n; ++i) out[i] = keys[i];
-    return n;
-}
-
-void BlockCache::enable_shadow_publish(u32 ring_addr, u32 capacity) {
-    m_shadow_ring_addr     = ring_addr;
-    m_shadow_ring_capacity = capacity;
-}
-
-// Layout (kept in lock-step with sab_layout.h SHADOW_RING_* constants;
-// duplicated here so bementalJIT compiles standalone without the ppc-worker
-// header). Header offsets are bytes; data offset starts at 0x40 for
-// cacheline padding.
-namespace {
-    constexpr u32 SHADOW_HEAD_OFF = 0x00u;
-    constexpr u32 SHADOW_TAIL_OFF = 0x04u;
-    constexpr u32 SHADOW_ENQ_OFF  = 0x08u;
-    constexpr u32 SHADOW_DROP_OFF = 0x0Cu;
-    constexpr u32 SHADOW_DATA_OFF = 0x40u;
-    constexpr u32 SHADOW_RECORD_BYTES = 16u;
-}
-
-void BlockCache::shadow_publish_pc(u32 pc, u32 region, u32 body_size) {
-    if (m_shadow_ring_addr == 0u || m_shadow_ring_capacity == 0u) return;
-    // SAB shadow ring is reachable as plain memory inside the wasm module —
-    // both workers import the same WebAssembly.Memory and the ring address
-    // is a fixed offset within it. Use atomic primitives so the consumer
-    // sees a consistent {pc, region, size, reserved} record.
-    auto* base    = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(m_shadow_ring_addr));
-    auto* head_p  = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(m_shadow_ring_addr + SHADOW_HEAD_OFF));
-    auto* tail_p  = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(m_shadow_ring_addr + SHADOW_TAIL_OFF));
-    auto* enq_p   = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(m_shadow_ring_addr + SHADOW_ENQ_OFF));
-    auto* drop_p  = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(m_shadow_ring_addr + SHADOW_DROP_OFF));
-    (void)base;
-
-    const u32 head = __atomic_load_n(head_p, __ATOMIC_RELAXED);
-    const u32 tail = __atomic_load_n(tail_p, __ATOMIC_ACQUIRE);
-    if (head - tail >= m_shadow_ring_capacity) {
-        __atomic_fetch_add(drop_p, 1u, __ATOMIC_RELAXED);
-        return;
-    }
-    const u32 slot = head & (m_shadow_ring_capacity - 1u);  // capacity must be pow2
-    const u32 rec_addr = m_shadow_ring_addr + SHADOW_DATA_OFF + slot * SHADOW_RECORD_BYTES;
-    auto* rec_pc      = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(rec_addr + 0u));
-    auto* rec_region  = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(rec_addr + 4u));
-    auto* rec_size    = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(rec_addr + 8u));
-    auto* rec_resv    = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(rec_addr + 12u));
-    *rec_pc     = pc;
-    *rec_region = region;
-    *rec_size   = body_size;
-    *rec_resv   = 0u;
-    // Publish: RELEASE-store head+1 makes the record visible to the
-    // consumer's ACQUIRE-load.
-    __atomic_store_n(head_p, head + 1u, __ATOMIC_RELEASE);
-    __atomic_fetch_add(enq_p, 1u, __ATOMIC_RELAXED);
 }
 
 } // namespace bemental

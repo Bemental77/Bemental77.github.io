@@ -209,28 +209,7 @@ public:
     std::size_t region_n_funcs(Region r) const;
     int         region_generation(Region r) const;
 
-    // Phase 2e cache-warmup (Option 1). Snapshot of accumulated PCs for
-    // `r` into `out` (up to `cap` entries). Returns the count copied.
-    // Used by the page to read dolphin's already-populated cache and
-    // post the PC list to ppc-worker.
-    std::size_t region_export_pcs(Region r, u32* out, std::size_t cap) const;
-
-    // Phase 2e cache-warmup (Option 3 hybrid). Enable shadow-publish: every
-    // newly compiled block writes a {pc, region, size} record into the
-    // SPSC ring at `ring_addr` (SAB-resident, both workers share linear
-    // memory). ppc-worker drains on a 50 ms cadence and warms its own
-    // cache so post-cutover dispatch starts hot. Zero addr → disabled
-    // (default). Idempotent. Capacity must match the consumer's view.
-    void enable_shadow_publish(u32 ring_addr, u32 capacity);
-
 private:
-    // Shadow ring (Phase 2e Option 3). Atomically published by compile()
-    // and region_accumulate() when enabled. Single-producer (dolphin
-    // pthread inside bementalJIT) / single-consumer (ppc-worker via
-    // its own export). Drops on overflow — never blocks the producer.
-    void shadow_publish_pc(u32 pc, u32 region, u32 body_size);
-    u32  m_shadow_ring_addr     = 0u;
-    u32  m_shadow_ring_capacity = 0u;
     std::unordered_map<u64, int>          m_map;
     std::array<RegionState, REGION_COUNT> m_regions{};
 };

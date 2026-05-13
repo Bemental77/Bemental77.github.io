@@ -4,34 +4,6 @@
 // handler installed by emscripten's pthread runtime.
 if (typeof ENVIRONMENT_IS_PTHREAD === 'undefined' || !ENVIRONMENT_IS_PTHREAD) {
 
-// Phase 2e cache-warmup (Option 2b): bementalJIT region_relink in
-// block_cache.cpp fires this callback every time dolphin builds a merged-
-// region WASM module. We slice the bytes + pc_keys out of dolphin's heap
-// and postMessage them to the page, which forwards to ppc-worker. V8
-// structured-clones the resulting WebAssembly.Module in the same agent
-// cluster (coi-serviceworker keeps everything COI), so ppc-worker re-
-// instantiates without paying a compile.
-self.bementalPublishRelinkedRegion = function (r, bytesAddr, bytesSize, pcAddr, pcCount, generation, merged) {
-  try {
-    if (!bytesSize || !Module || !Module.HEAPU8) return;
-    var bytes = new Uint8Array(bytesSize);
-    bytes.set(Module.HEAPU8.subarray(bytesAddr, bytesAddr + bytesSize));
-    var pcKeys = new Uint32Array(pcCount);
-    var srcU32 = new Uint32Array(Module.HEAPU8.buffer, pcAddr, pcCount);
-    pcKeys.set(srcU32);
-    postMessage({
-      cmd: 'relinked-region',
-      r: r | 0,
-      bytes: bytes,
-      pcKeys: pcKeys,
-      generation: generation | 0,
-      merged: !!merged,
-    }, [bytes.buffer, pcKeys.buffer]);
-  } catch (err) {
-    postMessage({ cmd: 'print', txt: '[worker] bementalPublishRelinkedRegion threw: ' + (err && err.message || err) });
-  }
-};
-
 // 4f-6: surface a 'runtime-ready' postMessage when emscripten has
 // finished bringing up wasm + memory + exports. Page waits on this
 // before routing real MMIO cmds (2..12) — earlier calls hit
@@ -378,50 +350,6 @@ self.onmessage = function (e) {
         postMessage({ cmd: 'compile-test-result', tag: tag, pc: pc, size: size, decoded: decoded, cycles: cycles, bytes: bytes.buffer }, [bytes.buffer]);
       } catch (err) {
         postMessage({ cmd: 'compile-test-result', tag: data.tag || 'verify', error: 'compile-test threw: ' + (err && err.message ? err.message : String(err)) });
-      }
-      break;
-    }
-    case 'export-jit-pcs': {
-      // Phase 2e cache-warmup (Option 1): page asks dolphin to enumerate
-      // its bementalJIT BlockCache. We loop over the 9 regions, ask
-      // dolphin_jit_region_pcs_addr for each region's PC list base + count,
-      // copy the bytes out of dolphin's heap into fresh Uint32Arrays, and
-      // postMessage the parallel array back. Page then batches PCs and
-      // posts precompile-batch to ppc-worker (which decodes from shared
-      // MEM1 and warms its own cache).
-      try {
-        var perRegion = [];
-        for (var r = 0; r < 9; r++) {
-          var n = (typeof Module._dolphin_jit_region_n_funcs === 'function')
-            ? (Module._dolphin_jit_region_n_funcs(r) >>> 0) : 0;
-          if (n === 0) { perRegion.push(new Uint32Array(0)); continue; }
-          var addr = (Module._dolphin_jit_region_pcs_addr(r) >>> 0);
-          var view = new Uint32Array(Module.HEAPU8.buffer, addr, n);
-          perRegion.push(new Uint32Array(view));  // detached copy
-        }
-        var transferList = [];
-        for (var i = 0; i < perRegion.length; i++) transferList.push(perRegion[i].buffer);
-        postMessage({ cmd: 'jit-pcs', perRegion: perRegion }, transferList);
-      } catch (err) {
-        postMessage({ cmd: 'jit-pcs', perRegion: [], error: String(err && err.message || err) });
-      }
-      break;
-    }
-    case 'enable-shadow-publish-producer': {
-      // Phase 2e cache-warmup (Option 3 hybrid): page asks dolphin to
-      // start publishing newly-compiled-block records into the SAB
-      // shadow ring. Receiver (ppc-worker) drains continuously.
-      try {
-        if (typeof Module._dolphin_jit_enable_shadow_publish === 'function') {
-          Module._dolphin_jit_enable_shadow_publish(
-            (data.ringAddr | 0) >>> 0,
-            (data.capacity | 0) >>> 0);
-          postMessage({ cmd: 'print', txt: '[worker] shadow-publish producer enabled (addr=0x' + ((data.ringAddr | 0) >>> 0).toString(16) + ', cap=' + ((data.capacity | 0) >>> 0) + ')' });
-        } else {
-          postMessage({ cmd: 'print', txt: '[worker] shadow-publish export not available' });
-        }
-      } catch (err) {
-        postMessage({ cmd: 'print', txt: '[worker] enable-shadow-publish-producer threw: ' + (err && err.message || err) });
       }
       break;
     }
