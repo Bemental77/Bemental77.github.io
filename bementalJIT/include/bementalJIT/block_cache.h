@@ -209,6 +209,11 @@ public:
     std::size_t region_n_funcs(Region r) const;
     int         region_generation(Region r) const;
 
+    // Snapshot of accumulated PCs for `r` into `out` (up to `cap` entries).
+    // Returns the count copied. Used by Phase 2e cache-warmup: page reads
+    // dolphin's already-populated cache and posts the PC list to ppc-worker.
+    std::size_t region_export_pcs(Region r, u32* out, std::size_t cap) const;
+
 private:
     std::unordered_map<u64, int>          m_map;
     std::array<RegionState, REGION_COUNT> m_regions{};

@@ -572,6 +572,14 @@
           console.log('[ppc-worker-print] ' + (m.txt || ''));
           return;
         }
+        if (m.cmd === 'precompile-ack') {
+          if (typeof window._pendingPrecompileAck === 'function') window._pendingPrecompileAck(m);
+          return;
+        }
+        if (m.cmd === 'precompile-relink-ack') {
+          if (typeof window._pendingPrecompileRelinkAck === 'function') window._pendingPrecompileRelinkAck(m);
+          return;
+        }
         if (m.cmd === 'run-continuous-ack') {
           // Boot-dispatcher: re-engage immediately (clear yield → brief
           // dolphin window → set yield → next slice). The perf-result
@@ -1394,6 +1402,86 @@
           console.log('[ppc-worker-handshake] boot-dispatch: gate open'
             + ' (waited=' + elapsed.toFixed(0) + 'ms)'
             + ' PC=0x' + pcBd.toString(16));
+          // Phase 2e cache-warmup (Option 1: pre-compile from dolphin
+          // cache). Before flipping CT_PHASE_FLAGS / yield flag, ask
+          // dolphin to enumerate its bementalJIT BlockCache, then batch
+          // the PCs over to ppc-worker. Ppc-worker re-decodes from shared
+          // MEM1 and warms its own cache so the post-cutover dispatch
+          // path doesn't pay ~85 ms per first-touch compile.
+          //
+          // Skip REGION_HIGH_LOADER (r=1, apploader 0x817e0000..0x81800000):
+          // the apploader gets unloaded post-load, those PCs evict.
+          //
+          // After all batches ack, post precompile-relink-all so the
+          // freshly accumulated bodies become live merged modules before
+          // dispatch hits them.
+          var _pcwResumeAfterWarmup = function () {
+            // Item 7 Phase IV: enable cadence-handoff (continues below).
+            _pcwAfterWarmup();
+          };
+          var _pcwAfterWarmup = function () {
+            // (Placeholder; rebound below to invoke the remainder of the
+            // gate-open path. Kept as a function so the warmup cascade
+            // can fall through OR be skipped.)
+          };
+          // One-shot listeners for jit-pcs + precompile acks. Routed from
+          // onWorkerMsg / ppc_worker.onmessage via window-scoped slots.
+          var _warmupBatchSize = 128;
+          var _warmupBatchId   = 0;
+          var _warmupAllPcs    = [];
+          var _warmupTotal     = 0;
+          window._pendingJitPcs = function (msg) {
+            window._pendingJitPcs = null;
+            var per = msg.perRegion || [];
+            var skipRegion = 1;  // REGION_HIGH_LOADER
+            for (var r = 0; r < per.length; r++) {
+              if (r === skipRegion) continue;
+              var arr = per[r];
+              for (var i = 0; i < arr.length; i++) _warmupAllPcs.push(arr[i] >>> 0);
+            }
+            _warmupTotal = _warmupAllPcs.length;
+            console.log('[ppc-worker-handshake] cache-warmup: enumerated '
+              + _warmupTotal + ' PCs from dolphin cache (skipped HIGH_LOADER)');
+            if (_warmupTotal === 0) {
+              _pcwResumeAfterWarmup();
+              return;
+            }
+            _pcwSendNextBatch();
+          };
+          var _pcwSendNextBatch = function () {
+            if (_warmupAllPcs.length === 0) {
+              console.log('[ppc-worker-handshake] cache-warmup: all batches sent, requesting relink-all');
+              window._pendingPrecompileRelinkAck = function () {
+                window._pendingPrecompileRelinkAck = null;
+                console.log('[ppc-worker-handshake] cache-warmup: relink-all complete');
+                _pcwResumeAfterWarmup();
+              };
+              window.ppc_worker.postMessage({ cmd: 'precompile-relink-all' });
+              return;
+            }
+            var batch = _warmupAllPcs.splice(0, _warmupBatchSize);
+            var thisBatchId = ++_warmupBatchId;
+            window._pendingPrecompileAck = function (m) {
+              window._pendingPrecompileAck = null;
+              if ((m.batchId | 0) !== thisBatchId) {
+                console.warn('[ppc-worker-handshake] cache-warmup: batchId mismatch '
+                  + (m.batchId|0) + ' vs ' + thisBatchId);
+              }
+              _pcwSendNextBatch();
+            };
+            window.ppc_worker.postMessage({
+              cmd: 'precompile-batch',
+              batchId: thisBatchId,
+              pcs: batch,
+            });
+          };
+          // Kick off the cache-warmup cascade.
+          dolphin_worker.postMessage({ cmd: 'export-jit-pcs' });
+
+          // Rebind _pcwAfterWarmup to the rest of the gate-open work
+          // (CT_PHASE_FLAGS, set-mode, run-continuous). Defined as a
+          // function so the warmup cascade controls when it runs.
+          _pcwAfterWarmup = function () {
           // Item 7 Phase IV: enable cadence-handoff so dolphin reads
           // canonical global_timer from SAB and run_iter_batch routes
           // through dolphin_service_iter (no PPC dispatch — ppc-worker
@@ -1470,6 +1558,7 @@
           };
           // Initial kick.
           startBootDispatchSlice();
+          };  // end of _pcwAfterWarmup
         } else if (elapsed > 60000) {
           clearInterval(_bdPoll);
           console.log('[ppc-worker-handshake] boot-dispatch: timed out'
@@ -1911,6 +2000,11 @@
       case 'ram-info':
         // 2g: handled by _ppcMboxReplyListener (added in mailbox-demo-ack);
         // swallow here so onWorkerMsg's default doesn't log "unknown".
+        break;
+      case 'jit-pcs':
+        // Phase 2e cache-warmup: dolphin replied with per-region PC lists
+        // for ppc-worker pre-compile. Orchestrator installs _pendingJitPcs.
+        if (typeof window._pendingJitPcs === 'function') window._pendingJitPcs(data);
         break;
       case 'paused-for-cutover':
       case 'cutover-resumed':

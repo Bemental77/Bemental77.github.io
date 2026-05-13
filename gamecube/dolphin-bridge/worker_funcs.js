@@ -353,6 +353,32 @@ self.onmessage = function (e) {
       }
       break;
     }
+    case 'export-jit-pcs': {
+      // Phase 2e cache-warmup (Option 1): page asks dolphin to enumerate
+      // its bementalJIT BlockCache. We loop over the 9 regions, ask
+      // dolphin_jit_region_pcs_addr for each region's PC list base + count,
+      // copy the bytes out of dolphin's heap into fresh Uint32Arrays, and
+      // postMessage the parallel array back. Page then batches PCs and
+      // posts precompile-batch to ppc-worker (which decodes from shared
+      // MEM1 and warms its own cache).
+      try {
+        var perRegion = [];
+        for (var r = 0; r < 9; r++) {
+          var n = (typeof Module._dolphin_jit_region_n_funcs === 'function')
+            ? (Module._dolphin_jit_region_n_funcs(r) >>> 0) : 0;
+          if (n === 0) { perRegion.push(new Uint32Array(0)); continue; }
+          var addr = (Module._dolphin_jit_region_pcs_addr(r) >>> 0);
+          var view = new Uint32Array(Module.HEAPU8.buffer, addr, n);
+          perRegion.push(new Uint32Array(view));  // detached copy
+        }
+        var transferList = [];
+        for (var i = 0; i < perRegion.length; i++) transferList.push(perRegion[i].buffer);
+        postMessage({ cmd: 'jit-pcs', perRegion: perRegion }, transferList);
+      } catch (err) {
+        postMessage({ cmd: 'jit-pcs', perRegion: [], error: String(err && err.message || err) });
+      }
+      break;
+    }
     case 'mbx-cmd': {
       // 4f-6: page polls the SAB mailbox; on real MMIO cmds (2..12)
       // it postMessages here. We call the proxied wasm export and

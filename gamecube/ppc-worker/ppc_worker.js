@@ -1193,6 +1193,45 @@
         postMessage({ cmd: 'mailbox-call-ack', reply });
         break;
       }
+      case 'precompile-batch': {
+        // Phase 2e cache-warmup (Option 1): page sends a batch of PCs
+        // enumerated from dolphin's BlockCache. We call
+        // ppc_worker_compile_and_accumulate(pc) for each — that path
+        // decodes from shared MEM1 and emits into our region accumulator.
+        // No relink is forced here; the orchestrator posts
+        // 'precompile-relink-all' once all batches have been processed.
+        if (!inited) { postMessage({ cmd: 'precompile-ack', batchId: data.batchId | 0, compiled: 0, error: 'not initialised' }); break; }
+        var pcs = data.pcs || [];
+        var compiled = 0;
+        for (var i = 0; i < pcs.length; i++) {
+          var pc = pcs[i] >>> 0;
+          if (pc === 0) continue;
+          try {
+            var sz = mod._ppc_worker_compile_and_accumulate(pc) >>> 0;
+            if (sz > 0) compiled++;
+          } catch (err) {
+            // Continue with the rest of the batch; one bad PC shouldn't
+            // halt warmup. We don't surface individual errors — the
+            // dispatch path will hit them again later if they matter.
+          }
+        }
+        postMessage({ cmd: 'precompile-ack', batchId: data.batchId | 0, compiled: compiled });
+        break;
+      }
+      case 'precompile-relink-all': {
+        // Phase 2e cache-warmup (Option 1): force a relink on every
+        // region so the freshly-accumulated bodies become a live merged
+        // module before dispatch hits them. Without this, the first
+        // dispatch into each region pays the relink cost (~30 ms × 9).
+        if (!inited) { postMessage({ cmd: 'precompile-relink-ack', error: 'not initialised' }); break; }
+        try {
+          mod._ppc_worker_force_relink_all(0);
+          postMessage({ cmd: 'precompile-relink-ack' });
+        } catch (err) {
+          postMessage({ cmd: 'precompile-relink-ack', error: String(err && err.message || err) });
+        }
+        break;
+      }
       case 'shutdown': {
         if (mod) mod._ppc_worker_shutdown();
         postMessage({ cmd: 'shutdown-ack' });

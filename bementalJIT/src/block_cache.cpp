@@ -975,4 +975,12 @@ int BlockCache::region_generation(Region r) const {
     return m_regions[r].generation;
 }
 
+std::size_t BlockCache::region_export_pcs(Region r, u32* out, std::size_t cap) const {
+    if (r >= REGION_COUNT || out == nullptr || cap == 0) return 0;
+    const auto& keys = m_regions[r].pc_keys;
+    const std::size_t n = (keys.size() < cap) ? keys.size() : cap;
+    for (std::size_t i = 0; i < n; ++i) out[i] = keys[i];
+    return n;
+}
+
 } // namespace bemental
