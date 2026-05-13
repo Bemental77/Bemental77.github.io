@@ -6,8 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <link rel="icon" href=",">
   <script src="/coi-serviceworker.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/eruda"></script>
-  <script>if (typeof eruda !== 'undefined' && !new URLSearchParams(location.search).has('noeruda')) { eruda.init(); }</script>
+  <script>if (new URLSearchParams(location.search).has('eruda')) { var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/eruda'; s.onload=function(){eruda.init();}; document.head.appendChild(s); }</script>
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { overflow: hidden; }
@@ -349,7 +348,55 @@
     } catch (e) {}
     return 0;
   }
-  async function fetchRomAndBoot() {
+  async function fetchRomLazyAndBoot() {
+    setStatus('Preparing lazy ROM…');
+    var urls = [];
+    for (var i = 0; i < ROM_CHUNKS.length; i++) {
+      var len = 0;
+      try { var rh = await fetch(ROM_CHUNKS[i], { method: 'HEAD' }); if (rh.ok) len = +(rh.headers.get('Content-Length') || 0); } catch (e) {}
+      if (!len) {
+        try {
+          var rr = await fetch(ROM_CHUNKS[i], { headers: { 'Range': 'bytes=0-0' } });
+          if (rr.ok || rr.status === 206) {
+            var cr = rr.headers.get('Content-Range') || '';
+            var m = cr.match(/\/(\d+)/);
+            if (m) len = +m[1];
+            try { await rr.arrayBuffer(); } catch (e) {}
+          }
+        } catch (e) {}
+      }
+      urls.push({ url: ROM_CHUNKS[i], byteLength: len });
+    }
+    var totalSize = ROM_SIZE || urls.reduce(function (s, u) { return s + (u.byteLength | 0); }, 0);
+    if (ROM_SIZE && urls.some(function (u) { return !u.byteLength; })) {
+      var chunkCount = urls.length;
+      var perChunk = Math.ceil(totalSize / chunkCount);
+      var remaining = totalSize;
+      for (var k = 0; k < chunkCount; k++) {
+        if (!urls[k].byteLength) { urls[k].byteLength = (k === chunkCount - 1) ? remaining : Math.min(perChunk, remaining); }
+        remaining -= urls[k].byteLength;
+      }
+    }
+    // Preload the first ~32 MB so pcsx_init runs without sync-XHR thrash
+    var PRELOAD_BYTES = 32 << 20;
+    setStatus('Warming ROM cache (32 MB)…');
+    var preload = null;
+    try {
+      var firstUrl = urls[0];
+      var preloadLen = Math.min(PRELOAD_BYTES, firstUrl.byteLength);
+      var pr = await fetch(firstUrl.url, { headers: { 'Range': 'bytes=0-' + (preloadLen - 1) } });
+      if (pr.ok || pr.status === 206) { preload = new Uint8Array(await pr.arrayBuffer()); }
+    } catch (e) { pageLog('[rom] preload failed: ' + e); }
+    var totalMB = totalSize ? (totalSize/1048576).toFixed(0) : '?';
+    pageLog('[rom] lazy mode, total=' + totalMB + ' MB, preload=' + (preload ? (preload.byteLength/1048576).toFixed(0) + ' MB' : 'none') + ', ' + urls.length + ' chunks');
+    var preloadBuf = preload ? preload.buffer : null;
+    pcsx_worker.postMessage({ cmd: 'romBegin', name: ROM_NAME + '.bin', size: totalSize, urls: urls, preload: preloadBuf }, preloadBuf ? [preloadBuf] : []);
+    setStatus('Booting emulator (lazy)…');
+    pcsx_worker.postMessage({ cmd: 'romEnd' });
+    setTimeout(pollController, 33);
+    [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
+  }
+  async function fetchRomStreamAndBoot() {
     setStatus('Sizing ROM…');
     var totalSize = ROM_SIZE || 0;
     if (!totalSize) {
@@ -399,8 +446,14 @@
     pageLog('[rom] streamed ' + (total/1048576).toFixed(1) + ' MB — booting');
     setStatus('Booting emulator…');
     pcsx_worker.postMessage({ cmd: 'romEnd' });
-    setTimeout(pollController, 10);
+    setTimeout(pollController, 33);
     [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
+  }
+  async function fetchRomAndBoot() {
+    if (new URLSearchParams(location.search).has('lazy')) {
+      return fetchRomLazyAndBoot();
+    }
+    return fetchRomStreamAndBoot();
   }
   var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; ROM_SIZE = pick.size || 0; SAVE_KEY = ROM_NAME + '.ps1state'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...'); setStatus('Loading LLVM runtime...'); var s = document.createElement('script'); s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now(); document.body.appendChild(s); }
   $('btnStart').addEventListener('click', startEmulator);
