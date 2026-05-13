@@ -407,6 +407,24 @@ self.onmessage = function (e) {
       }
       break;
     }
+    case 'enable-shadow-publish-producer': {
+      // Phase 2e cache-warmup (Option 3 hybrid): page asks dolphin to
+      // start publishing newly-compiled-block records into the SAB
+      // shadow ring. Receiver (ppc-worker) drains continuously.
+      try {
+        if (typeof Module._dolphin_jit_enable_shadow_publish === 'function') {
+          Module._dolphin_jit_enable_shadow_publish(
+            (data.ringAddr | 0) >>> 0,
+            (data.capacity | 0) >>> 0);
+          postMessage({ cmd: 'print', txt: '[worker] shadow-publish producer enabled (addr=0x' + ((data.ringAddr | 0) >>> 0).toString(16) + ', cap=' + ((data.capacity | 0) >>> 0) + ')' });
+        } else {
+          postMessage({ cmd: 'print', txt: '[worker] shadow-publish export not available' });
+        }
+      } catch (err) {
+        postMessage({ cmd: 'print', txt: '[worker] enable-shadow-publish-producer threw: ' + (err && err.message || err) });
+      }
+      break;
+    }
     case 'mbx-cmd': {
       // 4f-6: page polls the SAB mailbox; on real MMIO cmds (2..12)
       // it postMessages here. We call the proxied wasm export and

@@ -1992,6 +1992,22 @@
           window._ppcDolphinRoutingReady = true;
           console.log('[ppc-worker-handshake] dolphin runtime-ready (via onWorkerMsg)');
         }
+        // Phase 2e cache-warmup (Option 3 hybrid). Unconditionally enable
+        // shadow-publish on dolphin and shadow-warmup on ppc-worker so
+        // ppc-worker's cache fills continuously during dolphin-owned
+        // dispatch. Constants mirror sab_layout.h SHADOW_RING_*.
+        if (!window._shadowWarmupArmed) {
+          window._shadowWarmupArmed = true;
+          var SHADOW_ADDR = 0x026A0000;
+          var SHADOW_CAP  = 4096;
+          if (typeof dolphin_worker !== 'undefined' && dolphin_worker) {
+            dolphin_worker.postMessage({ cmd: 'enable-shadow-publish-producer', ringAddr: SHADOW_ADDR, capacity: SHADOW_CAP });
+          }
+          if (typeof window.ppc_worker !== 'undefined' && window.ppc_worker) {
+            window.ppc_worker.postMessage({ cmd: 'enable-shadow-warmup', maxPerTick: 64 });
+          }
+          console.log('[ppc-worker-handshake] shadow-warmup armed (ring=0x' + SHADOW_ADDR.toString(16) + ', cap=' + SHADOW_CAP + ')');
+        }
         break;
       case 'mbx-reply':
         // 4f-6: dolphin's mbx-cmd handler reply. Ignore here — the

@@ -491,6 +491,39 @@ u32 ppc_worker_force_relink_all(u32 mem_pages) {
     return n_relinked;
 }
 
+// Phase 2e cache-warmup (Option 3 hybrid). Drain up to `max_records`
+// entries from the SAB shadow ring at SHADOW_RING_ADDR. For each record,
+// call ppc_worker_compile_and_accumulate(pc), which is a no-op if the PC
+// is already accumulated. Skips REGION_HIGH_LOADER (apploader unloads —
+// caching apploader PCs would just be evicted later). Returns the number
+// of records actually compiled (not necessarily == drained, since dups
+// no-op).
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_shadow_drain(u32 max_records) {
+    using namespace bemental_sab;
+    auto* head_p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(SHADOW_RING_ADDR + SHADOW_RING_HEAD_OFF));
+    auto* tail_p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(SHADOW_RING_ADDR + SHADOW_RING_TAIL_OFF));
+    const u32 head = __atomic_load_n(head_p, __ATOMIC_ACQUIRE);
+    u32 tail = __atomic_load_n(tail_p, __ATOMIC_RELAXED);
+    u32 compiled = 0u;
+    u32 popped = 0u;
+    while (tail != head && popped < max_records) {
+        const u32 slot = tail & (SHADOW_RING_CAPACITY - 1u);
+        const u32 rec_addr = SHADOW_RING_ADDR + SHADOW_RING_DATA_OFF + slot * 16u;
+        const u32 pc       = *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(rec_addr + 0u));
+        const u32 region   = *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(rec_addr + 4u));
+        ++tail;
+        ++popped;
+        if (pc == 0u) continue;
+        if (region == static_cast<u32>(REGION_HIGH_LOADER)) continue;
+        // Compile-and-accumulate decodes from shared MEM1, dedup'd against
+        // ppc-worker's own pc_to_idx — duplicates no-op.
+        if (ppc_worker_compile_and_accumulate(pc) > 0u) ++compiled;
+    }
+    if (popped > 0u) __atomic_store_n(tail_p, tail, __ATOMIC_RELEASE);
+    return compiled;
+}
+
 // Diagnostic: current generation counter for a region. Bumped each
 // relink. JS reads this to detect when a fresh module is available
 // (compare with previously-observed generation).

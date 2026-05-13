@@ -345,6 +345,21 @@ uint32_t dolphin_jit_region_pcs_addr(uint32_t r) {
     return (uint32_t)reinterpret_cast<uintptr_t>(g_jit_export_pcs_buf);
 }
 
+// Phase 2e cache-warmup (Option 3 hybrid). Page calls this once at boot
+// after both workers' runtime is ready; bementalJIT's BlockCache will
+// publish a shadow record to the ring at `ring_addr` for every new block
+// (per-block and per-region paths). ppc-worker drains the ring on a
+// 50 ms cadence and calls compile_and_accumulate(pc) on each record,
+// warming its own cache during dolphin-owned dispatch.
+EMSCRIPTEN_KEEPALIVE
+void dolphin_jit_enable_shadow_publish(uint32_t ring_addr, uint32_t capacity) {
+    auto& system = Core::System::GetInstance();
+    auto* base = system.GetJitInterface().GetCore();
+    auto* jw = dynamic_cast<JitWasm*>(base);
+    if (!jw) return;
+    jw->m_wasm_cache.enable_shadow_publish(ring_addr, capacity);
+}
+
 }
 
 int main(void) {

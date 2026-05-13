@@ -471,4 +471,39 @@ constexpr inline uint32_t hle_slot_idx_offset(uint32_t slot_idx) {
     return HLE_TABLE_ADDR + slot_idx * HLE_SLOT_BYTES + 4u;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2e cache-warmup (Option 3 hybrid) — shadow-publish SPSC ring.
+//
+// dolphin's bementalJIT publishes a {pc, region, body_size} record into this
+// ring every time a block is added to its cache. ppc-worker's drain loop
+// pops records and calls compile_and_accumulate(pc), warming its own cache
+// continuously during dolphin-owned dispatch — so when the user later arms
+// ?ppcbootdispatch=1, the post-cutover dispatch path doesn't pay ~85 ms per
+// first-touch compile.
+//
+// Layout (relative to SHADOW_RING_ADDR):
+//   +0x00  u32 head   (producer cursor, monotonic; atomic RELAXED load /
+//                      RELEASE store from dolphin pthread)
+//   +0x04  u32 tail   (consumer cursor, monotonic; atomic ACQUIRE load /
+//                      RELEASE store from ppc-worker)
+//   +0x08  u32 enq_count   (cumulative enqueued, diag-only)
+//   +0x0C  u32 drop_count  (cumulative dropped on overflow, diag-only)
+//   +0x40  ShadowRecord[CAPACITY], 16 bytes each
+//
+// Reserve 0x026A0000..0x026B0000 (64 KB). 16384 records * 16 B = 256 KB
+// would overrun; cap capacity at 4096 to fit in the 64 KB slot.
+constexpr uint32_t SHADOW_RING_ADDR      = 0x026A0000u;
+constexpr uint32_t SHADOW_RING_CAPACITY  = 4096u;
+constexpr uint32_t SHADOW_RING_HEAD_OFF  = 0x00u;
+constexpr uint32_t SHADOW_RING_TAIL_OFF  = 0x04u;
+constexpr uint32_t SHADOW_RING_ENQ_OFF   = 0x08u;
+constexpr uint32_t SHADOW_RING_DROP_OFF  = 0x0Cu;
+constexpr uint32_t SHADOW_RING_DATA_OFF  = 0x40u;
+struct ShadowRecord {
+    uint32_t pc;
+    uint32_t region;     // 0..8; REGION_COUNT for per-block (non-region) compile
+    uint32_t size;       // body byte size (informational)
+    uint32_t reserved;   // 0
+};
+
 }  // namespace bemental_sab

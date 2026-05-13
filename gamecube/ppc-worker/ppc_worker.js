@@ -1292,6 +1292,42 @@
         }
         break;
       }
+      case 'enable-shadow-warmup': {
+        // Phase 2e cache-warmup (Option 3 hybrid). Start a 50 ms drain
+        // interval. Each tick pops up to 64 records from the SAB shadow
+        // ring and warms our cache via compile_and_accumulate. Idempotent
+        // — second 'enable-shadow-warmup' is a no-op.
+        if (!inited) { postMessage({ cmd: 'shadow-warmup-nack', reason: 'not initialised' }); break; }
+        if (self._shadow_drain_iv) {
+          postMessage({ cmd: 'shadow-warmup-ack', already: true });
+          break;
+        }
+        var drainBatch = (data.maxPerTick | 0) || 64;
+        var totalCompiled = 0;
+        var ticks = 0;
+        self._shadow_drain_iv = setInterval(function () {
+          try {
+            var n = mod._ppc_worker_shadow_drain(drainBatch >>> 0) >>> 0;
+            totalCompiled += n;
+            ticks++;
+            if ((ticks % 200) === 0) {  // ~10 sec at 50 ms cadence
+              postMessage({ cmd: 'print', txt: '[ppc-worker] shadow-warmup ticks=' + ticks + ' totalCompiled=' + totalCompiled });
+            }
+          } catch (err) {
+            // Continue ticking; one bad PC shouldn't kill warmup.
+          }
+        }, 50);
+        postMessage({ cmd: 'shadow-warmup-ack' });
+        break;
+      }
+      case 'disable-shadow-warmup': {
+        if (self._shadow_drain_iv) {
+          clearInterval(self._shadow_drain_iv);
+          self._shadow_drain_iv = null;
+        }
+        postMessage({ cmd: 'shadow-warmup-disabled' });
+        break;
+      }
       case 'shutdown': {
         if (mod) mod._ppc_worker_shutdown();
         postMessage({ cmd: 'shutdown-ack' });
