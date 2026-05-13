@@ -1001,6 +1001,7 @@ static constexpr u32 PPC_SLICE_SAFETY_CAP = 1000000u;
 // SAB absolute addresses (mirror the JS constants).
 static constexpr u32 PPC_SLICE_STATE_BASE       = 0x02400000u;
 static constexpr u32 PPC_SLICE_OFF_PC           = 0x000u;
+static constexpr u32 PPC_SLICE_OFF_MSR          = 0x2E0u;
 static constexpr u32 PPC_SLICE_OFF_EXC          = 0x2ECu;
 static constexpr u32 PPC_SLICE_OFF_DOWNCOUNT    = 0x2F0u;
 static constexpr u32 PPC_SLICE_STOP_FLAG_ADDR   = 0x02500004u;
@@ -1023,6 +1024,8 @@ void ppc_worker_run_slice(u32 max_iters, u32 wall_deadline_ms, u32 flags) {
 
     volatile u32* p_pc  = reinterpret_cast<volatile u32*>(
         static_cast<uintptr_t>(PPC_SLICE_STATE_BASE + PPC_SLICE_OFF_PC));
+    u32* p_msr          = reinterpret_cast<u32*>(
+        static_cast<uintptr_t>(PPC_SLICE_STATE_BASE + PPC_SLICE_OFF_MSR));
     u32* p_exc          = reinterpret_cast<u32*>(
         static_cast<uintptr_t>(PPC_SLICE_STATE_BASE + PPC_SLICE_OFF_EXC));
     int32_t* p_dc       = reinterpret_cast<int32_t*>(
@@ -1045,15 +1048,24 @@ void ppc_worker_run_slice(u32 max_iters, u32 wall_deadline_ms, u32 flags) {
             break;
         }
 
-        // Exception pending? Exit; JS handles delivery (mailbox cmd 10).
-        // TODO(step 2+): inline EE-gated EXTERNAL_INT delivery here to
-        // avoid the JS round-trip on the common "external-only, EE=0"
-        // path. For now keep all exception handling in JS so step 2 is
-        // a pure refactor.
+        // Exception pending? Apply Q2 gate: external-only + EE=0 is
+        // ignored (PPC code will eventually mtmsr EE=1 and deliver on its
+        // own); anything else exits the slice for JS to deliver via
+        // mailbox cmd 10. Without this gate the slice exits 0-iters
+        // forever during early boot — the game's BS2 init holds EE=0 with
+        // an external_int pending and never gets a chance to advance.
         const u32 exc = __atomic_load_n(p_exc, __ATOMIC_ACQUIRE);
         if (exc != 0u) {
-            reason = PPC_SLICE_EXIT_EXCEPTION;
-            break;
+            constexpr u32 EXC_EXTERNAL_INT = 0x00000004u;
+            constexpr u32 MSR_EE           = 0x00008000u;
+            const u32 msr = __atomic_load_n(p_msr, __ATOMIC_ACQUIRE);
+            const bool external_only = (exc & ~EXC_EXTERNAL_INT) == 0u;
+            const bool ee_set        = (msr & MSR_EE) != 0u;
+            if (!external_only || ee_set) {
+                reason = PPC_SLICE_EXIT_EXCEPTION;
+                break;
+            }
+            // EE-gated external_int — fall through and keep dispatching.
         }
 
         // Downcount exhausted?

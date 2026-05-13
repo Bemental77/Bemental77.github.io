@@ -99,9 +99,13 @@
     ppcWorkerModule({ wasmMemory: memory })
       .then((m) => {
         mod = m;
-        // Default Phase 2e C-slice path ON. Override with =0 to use legacy
-        // JS dispatch loop. See ppc_worker_run_slice in ppc_worker_main.cpp.
-        if (mod.PPC_WORKER_USE_C_SLICE === undefined) mod.PPC_WORKER_USE_C_SLICE = 1;
+        // Phase 2e C-slice path: default OFF pending cache-warmup work.
+        // EE-gate fix (ppc_worker_main.cpp) makes the path correct, but
+        // ppc-worker's BlockCache starts empty under ?ppcbootdispatch=1
+        // and each block compiles fresh (~85ms each), so throughput
+        // regresses vs dolphin-owned dispatch until the cache warms up.
+        // Enable explicitly with =1 to test the architectural cutover.
+        if (mod.PPC_WORKER_USE_C_SLICE === undefined) mod.PPC_WORKER_USE_C_SLICE = 0;
         const v = mod._ppc_worker_version();
         postMessage({ cmd: 'ready', version: v });
       })
