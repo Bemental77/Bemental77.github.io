@@ -160,16 +160,16 @@
   const ROM_ROOT = '/ps1/ps1Wasm/roms/';
   function chunkRange(base, lastLetter) { var urls = []; for (var i = 'a'.charCodeAt(0); i <= lastLetter.charCodeAt(0); i++) { urls.push(ROM_ROOT + base + '.bin.parta' + String.fromCharCode(i)); } return urls; }
   const ROMS = [
-    { label: 'Monster Rancher 2', base: 'MonsterRancher2', size: 451280592, chunks: chunkRange('MonsterRancher2', 'f') },
-    { label: 'Metal Gear Solid (Disc 1)', base: 'MetalGearSolidDisc1', size: 705614112, chunks: chunkRange('MetalGearSolidDisc1', 'h') },
-    { label: 'Metal Gear Solid (Disc 2)', base: 'MetalGearSolidDisc2', size: 731911824, chunks: chunkRange('MetalGearSolidDisc2', 'i') },
-    { label: "Harry Potter & the Sorcerer's Stone", base: 'HarryPotterSorcerersStone', size: 346032644, chunks: chunkRange('HarryPotterSorcerersStone', 'd') },
-    { label: 'Legend of Dragoon (Disc 1)', base: 'LegendOfDragoonDisc1', size: 484951824, chunks: chunkRange('LegendOfDragoonDisc1', 'f') },
-    { label: 'Legend of Dragoon (Disc 2)', base: 'LegendOfDragoonDisc2', size: 576009504, chunks: chunkRange('LegendOfDragoonDisc2', 'g') },
-    { label: 'Legend of Dragoon (Disc 3)', base: 'LegendOfDragoonDisc3', size: 559173888, chunks: chunkRange('LegendOfDragoonDisc3', 'g') },
-    { label: 'Legend of Dragoon (Disc 4)', base: 'LegendOfDragoonDisc4', size: 748204128, chunks: chunkRange('LegendOfDragoonDisc4', 'i') }
+    { label: 'Monster Rancher 2', base: 'MonsterRancher2', size: 451280592, chunks: chunkRange('MonsterRancher2', 'f'), chunkSizes: [89128960,89128960,89128960,89128960,89128960,5635792] },
+    { label: 'Metal Gear Solid (Disc 1)', base: 'MetalGearSolidDisc1', size: 705614112, chunks: chunkRange('MetalGearSolidDisc1', 'h'), chunkSizes: [89128960,89128960,89128960,89128960,89128960,89128960,89128960,81711392] },
+    { label: 'Metal Gear Solid (Disc 2)', base: 'MetalGearSolidDisc2', size: 731911824, chunks: chunkRange('MetalGearSolidDisc2', 'i'), chunkSizes: [89128960,89128960,89128960,89128960,89128960,89128960,89128960,89128960,18880144] },
+    { label: "Harry Potter & the Sorcerer's Stone", base: 'HarryPotterSorcerersStone', size: 346032644, chunks: chunkRange('HarryPotterSorcerersStone', 'd'), chunkSizes: [89128960,89128960,89128960,78645764] },
+    { label: 'Legend of Dragoon (Disc 1)', base: 'LegendOfDragoonDisc1', size: 484951824, chunks: chunkRange('LegendOfDragoonDisc1', 'f'), chunkSizes: [89128960,89128960,89128960,89128960,89128960,39307024] },
+    { label: 'Legend of Dragoon (Disc 2)', base: 'LegendOfDragoonDisc2', size: 576009504, chunks: chunkRange('LegendOfDragoonDisc2', 'g'), chunkSizes: [89128960,89128960,89128960,89128960,89128960,89128960,41235744] },
+    { label: 'Legend of Dragoon (Disc 3)', base: 'LegendOfDragoonDisc3', size: 559173888, chunks: chunkRange('LegendOfDragoonDisc3', 'g'), chunkSizes: [89128960,89128960,89128960,89128960,89128960,89128960,24400128] },
+    { label: 'Legend of Dragoon (Disc 4)', base: 'LegendOfDragoonDisc4', size: 748204128, chunks: chunkRange('LegendOfDragoonDisc4', 'i'), chunkSizes: [89128960,89128960,89128960,89128960,89128960,89128960,89128960,89128960,35172448] }
   ];
-  var ROM_NAME = ROMS[0].base, ROM_CHUNKS = ROMS[0].chunks, ROM_SIZE = ROMS[0].size || 0;
+  var ROM_NAME = ROMS[0].base, ROM_CHUNKS = ROMS[0].chunks, ROM_SIZE = ROMS[0].size || 0, ROM_CHUNK_SIZES = ROMS[0].chunkSizes || null;
   const KEYMAP = { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', cross: 'z', circle: 'x', square: 's', triangle: 'd', l1: 'w', r1: 'r', l2: 'e', r2: 't', start: 'v', select: 'c' };
   const $ = id => document.getElementById(id);
   (function populateRomSelect() {
@@ -204,6 +204,9 @@
       return true;
     } catch (e) { pageLog('[vram-sab] alloc failed: ' + e); vramSAB = vramSabI32 = vramSabBytes = null; return false; }
   }
+  var workerReady = false; var workerReadyResolve = null;
+  var workerReadyPromise = new Promise(function (res) { workerReadyResolve = res; });
+  function _onWorkerReady() { if (workerReady) return; workerReady = true; pageLog('[ui] worker runtime ready'); if (workerReadyResolve) workerReadyResolve(); }
   window.var_setup = function () { pageLog('[ui] var_setup — spawning worker'); SoundFeedStreamData = Module.cwrap('SoundFeedStreamData', 'null', ['number', 'number']); vram_ptr = Module._get_ptr(0); padStatus1 = Module._get_ptr(1); padStatus2 = Module._get_ptr(2); Module.SDL.defaults.copyOnLock = false; Module.SDL.defaults.opaqueFrontBuffer = false; pcsx_worker = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?v=' + Date.now()); pcsx_worker.onmessage = onWorkerMsg; window.pcsx_worker = pcsx_worker; if (tryAllocVramSab()) { pcsx_worker.postMessage({ cmd: 'vramSab', sab: vramSAB }); pageLog('[vram-sab] installed (' + (VRAM_SAB_PAYLOAD_BYTES/1048576) + ' MiB)'); } setStatus('Runtime ready. Fetching ROM...'); fetchRomAndBoot(); };
 
   var mobilePadState = { cross: false, circle: false, square: false, triangle: false, l1: false, r1: false, l2: false, r2: false, start: false, select: false, up: false, down: false, left: false, right: false };
@@ -323,6 +326,7 @@
       case 'print': pageLog('> ' + data.txt); break;
       case 'setStatus': setStatus(data.txt); break;
       case 'setUI': break;
+      case 'workerReady': _onWorkerReady(); break;
       case 'render': { var _t0 = performance.now(); if (_perfLastRenderMs) { var _gap = _t0 - _perfLastRenderMs; _perfGapSum += _gap; if (_gap > _perfGapMax) _perfGapMax = _gap; _perfGapCount++; } _perfLastRenderMs = _t0; var v = data.vram; Module.HEAPU8.set(v, vram_ptr); pcsx_worker.postMessage({ cmd: 'return_vram', vram: v }, [v.buffer]); Module._render(data.x, data.y, data.sx, data.sy, data.dx, data.dy, data.rgb24); renderFrames++; var _t1 = performance.now(); var _proc = _t1 - _t0; _perfProcSum += _proc; if (_proc > _perfProcMax) _perfProcMax = _proc; var now = _t1; if (now - lastFpsLog > 1000) { var _gapAvg = _perfGapCount ? (_perfGapSum / _perfGapCount).toFixed(1) : '?'; var _procAvg = renderFrames ? (_perfProcSum / renderFrames).toFixed(2) : '?'; fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now - lastFpsLog)).toFixed(1) + ' | gap avg=' + _gapAvg + 'ms max=' + _perfGapMax.toFixed(0) + 'ms | proc avg=' + _procAvg + 'ms max=' + _perfProcMax.toFixed(1) + 'ms'; renderFrames = 0; lastFpsLog = now; _perfGapSum = 0; _perfGapMax = 0; _perfGapCount = 0; _perfProcSum = 0; _perfProcMax = 0; } break; }
       case 'renderTick': { var _t0 = performance.now(); if (_perfLastRenderMs) { var _gap = _t0 - _perfLastRenderMs; _perfGapSum += _gap; if (_gap > _perfGapMax) _perfGapMax = _gap; _perfGapCount++; } _perfLastRenderMs = _t0; if (!vramSabI32 || !vramSabBytes) break; var rx,ry,rsx,rsy,rdx,rdy,rrgb,ok=false; for (var attempt=0; attempt<8; attempt++) { var s0 = Atomics.load(vramSabI32, 0); if (s0 & 1) continue; rx=Atomics.load(vramSabI32,1); ry=Atomics.load(vramSabI32,2); rsx=Atomics.load(vramSabI32,3); rsy=Atomics.load(vramSabI32,4); rdx=Atomics.load(vramSabI32,5); rdy=Atomics.load(vramSabI32,6); rrgb=Atomics.load(vramSabI32,7); Module.HEAPU8.set(vramSabBytes, vram_ptr); var s1 = Atomics.load(vramSabI32, 0); if (s1 === s0) { ok = true; break; } } if (!ok) break; Module._render(rx,ry,rsx,rsy,rdx,rdy,rrgb); renderFrames++; var _t1 = performance.now(); var _proc = _t1 - _t0; _perfProcSum += _proc; if (_proc > _perfProcMax) _perfProcMax = _proc; var now2 = _t1; if (now2 - lastFpsLog > 1000) { var _gapAvg2 = _perfGapCount ? (_perfGapSum / _perfGapCount).toFixed(1) : '?'; var _procAvg2 = renderFrames ? (_perfProcSum / renderFrames).toFixed(2) : '?'; fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now2 - lastFpsLog)).toFixed(1) + ' | gap avg=' + _gapAvg2 + 'ms max=' + _perfGapMax.toFixed(0) + 'ms | proc avg=' + _procAvg2 + 'ms max=' + _perfProcMax.toFixed(1) + 'ms [SAB]'; renderFrames = 0; lastFpsLog = now2; _perfGapSum = 0; _perfGapMax = 0; _perfGapCount = 0; _perfProcSum = 0; _perfProcMax = 0; } break; }
       case 'return_states': states_arrs.push(data.states); break;
@@ -351,21 +355,29 @@
   async function fetchRomLazyAndBoot() {
     setStatus('Preparing lazy ROM…');
     var urls = [];
-    for (var i = 0; i < ROM_CHUNKS.length; i++) {
-      var len = 0;
-      try { var rh = await fetch(ROM_CHUNKS[i], { method: 'HEAD' }); if (rh.ok) len = +(rh.headers.get('Content-Length') || 0); } catch (e) {}
-      if (!len) {
-        try {
-          var rr = await fetch(ROM_CHUNKS[i], { headers: { 'Range': 'bytes=0-0' } });
-          if (rr.ok || rr.status === 206) {
-            var cr = rr.headers.get('Content-Range') || '';
-            var m = cr.match(/\/(\d+)/);
-            if (m) len = +m[1];
-            try { await rr.arrayBuffer(); } catch (e) {}
-          }
-        } catch (e) {}
+    // Use hardcoded per-chunk sizes if present (bypasses gzip-compressed Content-Length on the deployed CDN).
+    // Fall back to HEAD/Range probes for ROMs without hardcoded sizes — those may misbehave deployed.
+    if (ROM_CHUNK_SIZES && ROM_CHUNK_SIZES.length === ROM_CHUNKS.length) {
+      for (var i = 0; i < ROM_CHUNKS.length; i++) {
+        urls.push({ url: ROM_CHUNKS[i], byteLength: ROM_CHUNK_SIZES[i] });
       }
-      urls.push({ url: ROM_CHUNKS[i], byteLength: len });
+    } else {
+      for (var i = 0; i < ROM_CHUNKS.length; i++) {
+        var len = 0;
+        try { var rh = await fetch(ROM_CHUNKS[i], { method: 'HEAD' }); if (rh.ok) len = +(rh.headers.get('Content-Length') || 0); } catch (e) {}
+        if (!len) {
+          try {
+            var rr = await fetch(ROM_CHUNKS[i], { headers: { 'Range': 'bytes=0-0' } });
+            if (rr.ok || rr.status === 206) {
+              var cr = rr.headers.get('Content-Range') || '';
+              var m = cr.match(/\/(\d+)/);
+              if (m) len = +m[1];
+              try { await rr.arrayBuffer(); } catch (e) {}
+            }
+          } catch (e) {}
+        }
+        urls.push({ url: ROM_CHUNKS[i], byteLength: len });
+      }
     }
     var totalSize = ROM_SIZE || urls.reduce(function (s, u) { return s + (u.byteLength | 0); }, 0);
     if (ROM_SIZE && urls.some(function (u) { return !u.byteLength; })) {
@@ -377,15 +389,39 @@
         remaining -= urls[k].byteLength;
       }
     }
-    // Async-prefetch the full first chunk so pcsx_init has data ready and we know the actual decompressed size
-    setStatus('Fetching chunk 0…');
+    // Async-prefetch the full first chunk via streaming reader (so we can show progress on slow connections like Xbox Wi-Fi).
+    // ?nopreload skips this and lets the worker sync-XHR the first chunk on demand at boot.
+    var SKIP_PRELOAD = new URLSearchParams(location.search).has('nopreload');
     var preload = null;
-    try {
-      var pr = await fetch(urls[0].url);
-      if (pr.ok) { preload = new Uint8Array(await pr.arrayBuffer()); urls[0].byteLength = preload.length; }
-    } catch (e) { pageLog('[rom] preload failed: ' + e); }
+    if (!SKIP_PRELOAD) {
+      setStatus('Fetching chunk 0…');
+      try {
+        var pr = await fetch(urls[0].url);
+        if (pr.ok && pr.body) {
+          var contentLen = +(pr.headers.get('Content-Length') || urls[0].byteLength || 0);
+          var reader = pr.body.getReader();
+          var chunks = [];
+          var got = 0;
+          while (true) {
+            var step = await reader.read();
+            if (step.done) break;
+            chunks.push(step.value);
+            got += step.value.length;
+            setStatus('Fetching chunk 0… ' + (got/1048576).toFixed(1) + (contentLen ? ' / ' + (contentLen/1048576).toFixed(1) : '') + ' MB');
+          }
+          // Concatenate. Browser already decompressed gzip in stream.
+          var total = chunks.reduce(function (s, c) { return s + c.length; }, 0);
+          preload = new Uint8Array(total);
+          var off = 0;
+          for (var i = 0; i < chunks.length; i++) { preload.set(chunks[i], off); off += chunks[i].length; }
+          chunks = null;
+          urls[0].byteLength = preload.length;
+        }
+      } catch (e) { pageLog('[rom] preload failed: ' + e); preload = null; }
+    } else { pageLog('[rom] preload skipped (?nopreload)'); }
     var totalMB = totalSize ? (totalSize/1048576).toFixed(0) : '?';
     pageLog('[rom] lazy mode (full-chunk), total=' + totalMB + ' MB, preload chunk 0 = ' + (preload ? (preload.byteLength/1048576).toFixed(1) + ' MB' : 'none') + ', ' + urls.length + ' chunks');
+    if (!workerReady) { setStatus('Waiting for worker runtime…'); await workerReadyPromise; }
     var preloadBuf = preload ? preload.buffer : null;
     pcsx_worker.postMessage({ cmd: 'romBegin', name: ROM_NAME + '.bin', size: totalSize, urls: urls, preload: preloadBuf }, preloadBuf ? [preloadBuf] : []);
     setStatus('Booting emulator (lazy)…');
@@ -404,6 +440,7 @@
     }
     var totalMB = totalSize ? (totalSize/1048576).toFixed(0) : '?';
     pageLog('[rom] size ' + totalMB + ' MB (' + (ROM_SIZE ? 'hardcoded' : 'probed') + ') across ' + ROM_CHUNKS.length + ' chunks');
+    if (!workerReady) { setStatus('Waiting for worker runtime…'); await workerReadyPromise; }
     pcsx_worker.postMessage({ cmd: 'romBegin', name: ROM_NAME + '.bin', size: totalSize });
     var total = 0;
     var BATCH_BYTES = 1 << 20;
@@ -452,7 +489,7 @@
     }
     return fetchRomStreamAndBoot();
   }
-  var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; ROM_SIZE = pick.size || 0; SAVE_KEY = ROM_NAME + '.ps1state'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...'); setStatus('Loading LLVM runtime...'); var s = document.createElement('script'); s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now(); document.body.appendChild(s); }
+  var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; ROM_SIZE = pick.size || 0; ROM_CHUNK_SIZES = pick.chunkSizes || null; SAVE_KEY = ROM_NAME + '.ps1state'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...'); setStatus('Loading LLVM runtime...'); var s = document.createElement('script'); s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now(); document.body.appendChild(s); }
   $('btnStart').addEventListener('click', startEmulator);
   const DB_NAME = 'PS1WASMDB', STORE = 'PS1WASMSTATES'; var SAVE_KEY = ROM_NAME + '.ps1state';
   function openDB() { return new Promise((resolve, reject) => { var req = indexedDB.open(DB_NAME); req.onupgradeneeded = e => e.target.result.createObjectStore(STORE); req.onsuccess = e => resolve(e.target.result); req.onerror = () => reject(req.error); }); }
@@ -475,9 +512,17 @@
   applyHide(localStorage.getItem('ps1wasm_hide') === '1');
   $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); closeMobileMenu(); }); $('mResetAudio').addEventListener('click', () => { resetAudio(); closeMobileMenu(); }); $('mGhost').addEventListener('click', toggleGhost); $('mHide').addEventListener('click', () => { toggleHide(); closeMobileMenu(); }); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
   $('mobileHideHint').addEventListener('click', () => { applyHide(false); localStorage.setItem('ps1wasm_hide', '0'); });
-  var GP_BUTTON_KEYS = { 0: KEYMAP.cross, 1: KEYMAP.circle, 2: KEYMAP.square, 3: KEYMAP.triangle, 4: KEYMAP.l1, 5: KEYMAP.r1, 6: KEYMAP.l2, 7: KEYMAP.r2, 8: KEYMAP.select, 9: KEYMAP.start, 12: KEYMAP.up, 13: KEYMAP.down, 14: KEYMAP.left, 15: KEYMAP.right }; var gpPressed = {}; var gpPolling = false; var GP_AXIS_DEAD = 0.35;
+  // URL knobs for gamepad mapping (set via query string, e.g. ?startbtn=7 or ?gpdebug)
+  var _gpQs = new URLSearchParams(location.search);
+  var GP_START_BTN = +(_gpQs.get('startbtn') || 9);
+  var GP_SELECT_BTN = +(_gpQs.get('selectbtn') || 8);
+  var GP_DEBUG = _gpQs.has('gpdebug') || _gpQs.has('gp');
+  var GP_BUTTON_KEYS = { 0: KEYMAP.cross, 1: KEYMAP.circle, 2: KEYMAP.square, 3: KEYMAP.triangle, 4: KEYMAP.l1, 5: KEYMAP.r1, 6: KEYMAP.l2, 7: KEYMAP.r2, 12: KEYMAP.up, 13: KEYMAP.down, 14: KEYMAP.left, 15: KEYMAP.right };
+  GP_BUTTON_KEYS[GP_START_BTN] = KEYMAP.start;
+  GP_BUTTON_KEYS[GP_SELECT_BTN] = KEYMAP.select;
+  var gpPressed = {}; var gpPolling = false; var GP_AXIS_DEAD = 0.35;
   function gpEdge(id, keyLabel, pressed) { if (pressed && !gpPressed[id]) { dispatchKey('keydown', keyLabel); gpPressed[id] = true; } else if (!pressed && gpPressed[id]) { dispatchKey('keyup', keyLabel); gpPressed[id] = false; } }
-  // Long-press the PSX Start button (controller hamburger / button 9) for 1.2s → exit fullscreen or open menu.
+  // Long-press the PSX Start button (configurable via ?startbtn=N) for 1.2s → exit fullscreen or open menu.
   var GP_LONG_PRESS_MS = 1200;
   var gpStartHold = {};
   function gpLongPressStart(padIdx, pressed) {
@@ -486,7 +531,7 @@
       if (gpStartHold[padIdx] === undefined) { gpStartHold[padIdx] = now; }
       else if (gpStartHold[padIdx] !== -1 && (now - gpStartHold[padIdx]) > GP_LONG_PRESS_MS) {
         gpStartHold[padIdx] = -1;
-        gpEdge(padIdx + ':b9', KEYMAP.start, false);
+        gpEdge(padIdx + ':b' + GP_START_BTN, KEYMAP.start, false);
         var inFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
         if (inFs) {
           try { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch (e) {}
@@ -497,18 +542,21 @@
       }
     } else { delete gpStartHold[padIdx]; }
   }
-  // Diagnostic: ?gpdebug shows which gamepad button index was pressed (passive, no behavior change)
-  var GP_DEBUG = new URLSearchParams(location.search).has('gpdebug');
+  // Diagnostic: ?gp or ?gpdebug shows every pressed button index in the status bar and log.
   var gpLastSnapshot = {};
-  function gpDebugLog(i, btns) {
+  var gpLoggedInfo = {};
+  function gpDebugLog(i, gp) {
     if (!GP_DEBUG) return;
+    if (!gpLoggedInfo[i]) { gpLoggedInfo[i] = true; pageLog('[gp' + i + '] id=' + gp.id + ' mapping=' + (gp.mapping || '(empty)') + ' btns=' + (gp.buttons || []).length); }
+    var btns = gp.buttons || [];
     var snap = btns.map(function (b, idx) { return b && b.pressed ? idx : -1; }).filter(function (x) { return x >= 0; }).join(',');
     if (snap !== gpLastSnapshot[i]) {
       gpLastSnapshot[i] = snap;
-      if (snap) pageLog('[gp' + i + '] pressed: ' + snap);
+      if (snap) { pageLog('[gp' + i + '] pressed: ' + snap); }
+      var el = $('status'); if (el) el.textContent = 'gp' + i + ' btns=[' + snap + ']';
     }
   }
-  function pollGamepads() { var pads = (navigator.getGamepads && navigator.getGamepads()) || []; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; var btns = gp.buttons || []; gpDebugLog(i, btns); for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } gpLongPressStart(i, !!(btns[9] && btns[9].pressed)); var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); } requestAnimationFrame(pollGamepads); }
+  function pollGamepads() { var pads = (navigator.getGamepads && navigator.getGamepads()) || []; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; var btns = gp.buttons || []; gpDebugLog(i, gp); for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } gpLongPressStart(i, !!(btns[GP_START_BTN] && btns[GP_START_BTN].pressed)); var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); } requestAnimationFrame(pollGamepads); }
   window.addEventListener('gamepadconnected', function (e) { setStatus('Controller connected: ' + e.gamepad.id); if (!gpPolling) { gpPolling = true; requestAnimationFrame(pollGamepads); } }); window.addEventListener('gamepaddisconnected', function () { setStatus('Controller disconnected'); }); if (navigator.getGamepads) { gpPolling = true; requestAnimationFrame(pollGamepads); }
   function checkOrientation() { if (!isMobile) return; var landscape = window.innerWidth > window.innerHeight; var show = started && !landscape; $('rotateHint').style.display = show ? 'flex' : 'none'; }
   window.addEventListener('resize', checkOrientation); window.addEventListener('orientationchange', checkOrientation);

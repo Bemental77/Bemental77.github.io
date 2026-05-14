@@ -1,0 +1,52 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index e116444..0148e64 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -101,6 +101,31 @@ option(ENABLE_FC_PROFILER "Build with support for host app (Flycast) profiler" O
+ option(USE_DISCORD "Use Discord Presence API" OFF)
+ option(USE_LIBCDIO "Use libcdio for CDROM access" OFF)
+ 
++if(EMSCRIPTEN)
++	# Host backends not available in browser/WASM. AICA still mixes samples;
++	# libretro-side audio sink is wired separately by the page.
++	set(USE_VULKAN OFF CACHE BOOL "Force vulkan off" FORCE)
++	set(USE_DX9 OFF CACHE BOOL "Force dx9 off" FORCE)
++	set(USE_DX11 OFF CACHE BOOL "Force dx11 off" FORCE)
++	set(USE_OPENMP OFF CACHE BOOL "Force openmp off" FORCE)
++	set(USE_LUA OFF CACHE BOOL "Force lua off" FORCE)
++	set(USE_BREAKPAD OFF CACHE BOOL "Force breakpad off" FORCE)
++	set(USE_HOST_SDL OFF CACHE BOOL "Force host SDL off" FORCE)
++	set(USE_HOST_LIBCHDR OFF CACHE BOOL "Force host libchdr off" FORCE)
++	set(USE_HOST_LIBZIP OFF CACHE BOOL "Force host libzip off" FORCE)
++	set(ENABLE_GDB_SERVER OFF CACHE BOOL "Force gdb server off" FORCE)
++	set(USE_PULSEAUDIO OFF CACHE BOOL "Force pulseaudio off" FORCE)
++	set(USE_ALSA OFF CACHE BOOL "Force alsa off" FORCE)
++	set(USE_OSS OFF CACHE BOOL "Force oss off" FORCE)
++	set(USE_LIBAO OFF CACHE BOOL "Force libao off" FORCE)
++	# Renderer: GLES3 via WebGL2 (libGL.js). USE_OPENGL stays ON because the
++	# libretro branch picks the GLES3 path when (ANDROID OR USE_GLES); we set
++	# USE_GLES so that path fires under Emscripten too.
++	set(USE_OPENGL ON CACHE BOOL "Force opengl on (mapped to GLES3 via USE_GLES)" FORCE)
++	set(USE_GLES ON CACHE BOOL "Force GLES[3] API on" FORCE)
++	set(USE_GLES2 OFF CACHE BOOL "Force GLES2 off" FORCE)
++endif()
++
+ if(IOS AND NOT LIBRETRO)
+ 	set(USE_VULKAN OFF CACHE BOOL "Force vulkan off" FORCE)
+ endif()
+@@ -1685,3 +1710,15 @@ if(${CMAKE_GENERATOR} MATCHES "^Xcode.*|^Visual Studio.*")
+ 	file(GLOB_RECURSE SRC_FILES *.h *.cpp *.c *.cc *.mm)
+ 	source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${SRC_FILES})
+ endif()
++
++# Emscripten libretro link/compile flags. WebGL2 + Full ES3 are required so
++# the GLES3 renderer path resolves at link time. Static lib: these flags
++# propagate to consumers via INTERFACE if a downstream emcc link uses them.
++if(EMSCRIPTEN AND LIBRETRO)
++	target_compile_options(${PROJECT_NAME} PRIVATE
++		-sUSE_WEBGL2=1
++		-sFULL_ES3=1)
++	target_link_options(${PROJECT_NAME} PRIVATE
++		-sUSE_WEBGL2=1
++		-sFULL_ES3=1)
++endif()
