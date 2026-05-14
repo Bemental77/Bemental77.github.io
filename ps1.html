@@ -513,6 +513,13 @@
   applyHide(localStorage.getItem('ps1wasm_hide') === '1');
   $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); closeMobileMenu(); }); $('mResetAudio').addEventListener('click', () => { resetAudio(); closeMobileMenu(); }); $('mGhost').addEventListener('click', toggleGhost); $('mHide').addEventListener('click', () => { toggleHide(); closeMobileMenu(); }); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
   $('mobileHideHint').addEventListener('click', () => { applyHide(false); localStorage.setItem('ps1wasm_hide', '0'); });
+  // Xbox Edge translates View (btn 8) and L3 (btn 10) into browser-back navigation
+  // before page-side gamepad polling can read them — push a sentinel history entry
+  // and re-push on popstate so the page stays loaded. That lets View map to PSX
+  // Select and keeps L3 a no-op. The hold-Menu OS gesture still exits as intended.
+  try { history.pushState({ ps1: 1 }, ''); } catch (e) {}
+  window.addEventListener('popstate', function () { try { history.pushState({ ps1: 1 }, ''); } catch (_) {} });
+  window.addEventListener('keydown', function (e) { if (e.key === 'BrowserBack' || e.key === 'BrowserForward' || e.key === 'GoBack') { e.preventDefault(); e.stopPropagation(); } }, true);
   // Standard PSX↔Xbox controller mapping. Hamburger (Menu, button 9) → PSX Start, View (button 8) → Select.
   // The "hold Menu to return to browser controls" gesture on Xbox Edge is a shell-level OS gesture and
   // should fire regardless of page-side gamepad polling (Gamepad API is poll-only and doesn't consume events).

@@ -105,23 +105,25 @@ EXPORTED_RUNTIME='[
 # ---------------------------------------------------------------------------
 ARCHIVES=(
   "$BUILD/libflycast_libretro.a"
+  "$BUILD/libflycast-resources.a"
 
   # bementalJIT — subbuild placed at ${CMAKE_BINARY_DIR}/bementalJIT
   "$BUILD/bementalJIT/libbementalJIT.a"
   "$BUILD/bementalJIT/guests/sh4/libbementalJITSh4.a"
 
-  # External deps — paths follow add_subdirectory source dirs under build-wasm.
-  # TODO: confirm exact path after build (e.g. xxhash CMakeLists is in cmake_unofficial/).
+  # External deps — confirmed against actual build-wasm output (build #8).
   "$BUILD/core/deps/xxHash/cmake_unofficial/libxxhash.a"
-  "$BUILD/core/deps/nowide/libnowide.a"                    # TODO: confirm name (could be libnowide_lib.a)
+  "$BUILD/core/deps/nowide/libnowide.a"
   "$BUILD/core/deps/libelf/libelf.a"
-  "$BUILD/core/deps/libzip/lib/libzip.a"                   # TODO: confirm subpath (libzip CMake puts archive under lib/)
+  "$BUILD/core/deps/libzip/lib/libzip.a"
   "$BUILD/core/deps/tinygettext/libtinygettext.a"
+  "$BUILD/core/deps/miniupnpc/libminiupnpc.a"
 
-  # libchdr + its bundled deps (zlib/zstd) — all under deps/libchdr/...
-  "$BUILD/core/deps/libchdr/libchdr-static.a"              # TODO: confirm filename for chdr-static target
-  "$BUILD/core/deps/libchdr/deps/zlib-1.3.1/libzlibstatic.a"
+  # libchdr + its bundled deps (zlib/zstd/lzma).
+  "$BUILD/core/deps/libchdr/libchdr-static.a"
+  "$BUILD/core/deps/libchdr/deps/zlib-1.3.1/libz.a"
   "$BUILD/core/deps/libchdr/deps/zstd-1.5.6/build/cmake/lib/libzstd.a"
+  "$BUILD/core/deps/libchdr/deps/lzma-24.05/liblzma.a"
 )
 
 # ---------------------------------------------------------------------------
@@ -132,13 +134,27 @@ emcc \
   $BRIDGE/flycast_stubs.cpp \
   -I $SRC/core \
   -I $SRC/core/deps \
+  -I $SRC/core/deps/nowide/include \
+  -I $SRC/core/deps/xxHash \
+  -I $SRC/core/deps/glm \
+  -I $SRC/core/deps/stb \
+  -I $SRC/core/deps/json \
+  -I $SRC/core/deps/asio/asio/include \
+  -I $SRC/core/deps/libchdr/include \
+  -I $SRC/core/deps/libchdr/deps/zlib-1.3.1 \
+  -I $SRC/core/deps/libchdr/deps/zstd-1.5.6/lib \
   -I $SRC/core/deps/libretro-common/include \
+  -I $SRC/core/deps/picotcp/include \
+  -I $SRC/core/deps/picotcp/modules \
+  -I $SRC/core/deps/tinygettext/include \
+  -I $SRC/core/deps/miniupnpc/include \
+  -I $SRC/core/deps/libzip/lib \
+  -I $SRC/core/deps/libelf/include \
   -I $SRC/shell/libretro \
   "${ARCHIVES[@]}" \
   -O3 \
   -std=c++23 \
   -fno-strict-aliasing \
-  -fno-exceptions \
   -fomit-frame-pointer \
   -DNDEBUG \
   -D__LIBRETRO__ \
