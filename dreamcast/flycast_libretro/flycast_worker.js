@@ -21,15 +21,11 @@
 // waiting for mem-init (mirrors the dolphin_worker.js shim pattern).
 
 (function () {
-  // Pthread children: skip the mem-init wait, just load the factory.
+  // Pthread children: emcc spawned us as `new Worker(_scriptName, { name: 'em-pthread' })`
+  // where `_scriptName` resolves to THIS shim's URL — not the factory's. Load
+  // the factory directly so its top-level pthread-bootstrap fires.
   if (typeof self !== 'undefined' && self.name === 'em-pthread') {
-    importScripts('flycast_worker.js?factory=1');  // emcc factory output
-    // TODO: the factory file path may need an explicit non-self override
-    // (e.g. flycast_worker_emcc.js) once link-script outputs are renamed to
-    // disambiguate this shim from the factory. Today they share a name; the
-    // emcc runtime's pthread bootstrapper handles this case via importScripts
-    // re-entry, but if you see "factory ran twice" warnings rename the
-    // emcc -o output to flycast_worker_emcc.js and update both branches here.
+    importScripts('flycast_worker_emcc.js');
     return;
   }
 
@@ -61,37 +57,42 @@
         fbCfg    = { offset: data.fbOffset, w: data.fbW, h: data.fbH };
         audioCfg = { offset: data.audioOffset, frames: data.audioFrames };
 
-        self.Module = self.Module || {};
-        self.Module.wasmMemory = sharedMemory;
-        if (!self.Module.locateFile) {
-          self.Module.locateFile = function (f) {
-            return new URL(f, self.location.href).href;
-          };
-        }
-        // The emcc factory writes its own onmessage during bootstrap; our
-        // post-js (flycast_worker_funcs.js) installs the user-facing one
-        // *after* runtime-ready. Both will see queued messages via the
-        // replay below.
-        self.Module.onRuntimeInitialized = onRuntimeInitialized;
-
         bootstrapped = true;
         postMessage({ cmd: 'print', txt: '[flycast-shim] mem-init received, importScripts factory' });
         try {
-          // The link script -o flag emits flycast_worker.js + flycast_worker.wasm
-          // — the emcc-generated factory shares this script's name. To avoid
-          // re-importing ourselves we expect the link script to be updated
-          // (TODO below) to emit the factory under flycast_worker_emcc.js and
-          // load it explicitly here.
-          // TODO: rename emcc output to flycast_worker_emcc.{js,wasm} in
-          //       flycast_worker_link.sh so this importScripts has a stable
-          //       distinct target. Until then the link will overwrite this
-          //       shim — the dev workflow is to keep this shim under source
-          //       control and the emcc output under .gitignore'd path.
           importScripts('flycast_worker_emcc.js?v=' + Date.now());
         } catch (err) {
           postMessage({ cmd: 'print', txt: '[flycast-shim] importScripts failed: ' + (err && err.message ? err.message : String(err)) });
           return;
         }
+        // MODULARIZE=1 EXPORT_NAME=flycastWorkerModule — the file just defines
+        // a global factory function; we must invoke it with the module config
+        // for the runtime to actually start. Returns a promise that resolves
+        // when (or rejects if) the runtime is up.
+        if (typeof flycastWorkerModule !== 'function') {
+          postMessage({ cmd: 'print', txt: '[flycast-shim] flycastWorkerModule global missing after importScripts' });
+          return;
+        }
+        const moduleArg = {
+          wasmMemory: sharedMemory,
+          locateFile: function (f) { return new URL(f, self.location.href).href; },
+          // Pthread spawn uses _scriptName by default → our shim. Force the
+          // factory URL instead so pthread workers load the emcc bootstrap.
+          mainScriptUrlOrBlob: new URL('flycast_worker_emcc.js', self.location.href).href,
+          print:       function (s) { postMessage({ cmd: 'print', txt: '[wasm.out] ' + s }); },
+          printErr:    function (s) { postMessage({ cmd: 'print', txt: '[wasm.err] ' + s }); },
+          onAbort: function (why) { postMessage({ cmd: 'print', txt: '[flycast-shim] ABORT: ' + why }); },
+        };
+        flycastWorkerModule(moduleArg).then(
+          function (mod) {
+            // mod IS moduleArg post-mutation, with all _emscripten_* exports.
+            self.Module = mod;
+            onRuntimeInitialized();
+          },
+          function (err) {
+            postMessage({ cmd: 'print', txt: '[flycast-shim] factory rejected: ' + (err && err.message ? err.message : String(err)) });
+          }
+        );
         // Replay anything we queued so the page's earlier messages aren't lost.
         if (typeof self.onmessage === 'function' && self.onmessage !== shimOnMessage) {
           for (const ev of earlyQueue) {
@@ -110,26 +111,33 @@
   self.onmessage = shimOnMessage;
 
   // ---------------------------------------------------------------------------
-  // onRuntimeInitialized — called once the emcc runtime is up and exports
-  // are wired. Wire video target + audio ring, init the libretro core,
-  // tell the page we're ready.
+  // onRuntimeInitialized — emcc runtime up. We can safely call trivial exports
+  // (pure global stores) from this worker thread now, but anything that hits
+  // Asyncify-instrumented code (malloc, sigaction, FS, locale, dynarec setup)
+  // must run on the pthread that owns the per-thread Asyncify frame — i.e.
+  // the pthread that runs main(). So we only wire the SAB-pointer exports
+  // here; retro_init() happens inside main() (see EmscriptenWorker.cpp:main).
+  // The page-facing 'ready' message is posted once we receive 'core-ready'
+  // from main via postMessage.
   // ---------------------------------------------------------------------------
+  let coreReady = false;
+  let videoAudioWired = false;
+
+  function maybePostReady() {
+    if (coreReady && videoAudioWired) {
+      postMessage({ cmd: 'print', txt: '[flycast-shim] runtime + core ready' });
+      postMessage({ cmd: 'ready' });
+    }
+  }
+
   function onRuntimeInitialized() {
     const Module = self.Module;
     try {
-      // Hand the worker its slice of the SAB for direct video memcpy.
-      // emscripten_set_video_target signature: (uint8_t* target, int w, int h).
-      // The "pointer" is just an offset into wasmMemory — both the page's
-      // FB_OFFSET view and Module.HEAPU8 share the same SAB, so passing
-      // the offset directly is equivalent to passing a heap pointer.
+      // SAB-pointer wiring — trivial global stores, safe from this thread.
       Module._emscripten_set_video_target(fbCfg.offset >>> 0, fbCfg.w | 0, fbCfg.h | 0);
-
-      // Audio ring at AUDIO_OFFSET. Capacity = frames (stereo i16).
       Module._emscripten_set_audio_ring(audioCfg.offset >>> 0, audioCfg.frames | 0);
-
-      Module._emscripten_worker_init();
-      postMessage({ cmd: 'print', txt: '[flycast-shim] runtime ready, core inited' });
-      postMessage({ cmd: 'ready' });
+      videoAudioWired = true;
+      maybePostReady();
     } catch (err) {
       postMessage({ cmd: 'print', txt: '[flycast-shim] runtime-init threw: ' + (err && err.message ? err.message : String(err)) });
     }
@@ -142,6 +150,21 @@
     for (const ev of earlyQueue) { try { onCmd(ev); } catch (_) {} }
     earlyQueue = [];
   }
+
+  // Intercept the worker's outgoing postMessage stream to observe 'core-ready'
+  // sent from main()'s MAIN_THREAD_EM_ASM body. MAIN_THREAD_EM_ASM runs JS on
+  // the main browser thread = this worker's own scope, so the postMessage
+  // calls inside main() go through self.postMessage here before reaching the
+  // page. We pass everything else through unchanged.
+  const _origPostMessage = self.postMessage.bind(self);
+  self.postMessage = function (msg, transfer) {
+    if (msg && msg.cmd === 'core-ready') {
+      coreReady = true;
+      maybePostReady();
+    }
+    if (transfer) _origPostMessage(msg, transfer);
+    else _origPostMessage(msg);
+  };
 
   // ---------------------------------------------------------------------------
   // Worker message dispatcher. Handles all 7 page-side commands:
