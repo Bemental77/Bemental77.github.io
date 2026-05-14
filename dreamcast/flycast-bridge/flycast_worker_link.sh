@@ -179,6 +179,8 @@ emcc \
   -Wl,--allow-multiple-definition \
   -sEXPORTED_FUNCTIONS="$EXPORTED_FUNCS" \
   -sEXPORTED_RUNTIME_METHODS="$EXPORTED_RUNTIME" \
+  --emit-symbol-map \
+  -g2 \
   --embed-file "$ROOT/dreamcast/bios/Dreamcast/DC - BIOS.bin@/bios/dc_bios.bin" \
   --embed-file "$ROOT/dreamcast/bios/Dreamcast/DC - Flash.bin@/bios/dc_flash.bin" \
   --post-js $BRIDGE/flycast_worker_funcs.js \

@@ -213,16 +213,16 @@ extern "C" {
 
 EMSCRIPTEN_KEEPALIVE
 void emscripten_worker_init(void) {
-    retro_set_environment(environment_cb);
-    retro_set_video_refresh(video_cb);
-    retro_set_audio_sample(audio_sample_cb);
-    retro_set_audio_sample_batch(audio_sample_batch_cb);
-    retro_set_input_poll(input_poll_cb);
-    retro_set_input_state(input_state_cb);
-    retro_init();
+    // No-op. The libretro callback wiring + retro_init() must run on the
+    // pthread that owns Emscripten's per-thread Asyncify / TLS state — i.e.
+    // the pthread that runs main(). With -sPROXY_TO_PTHREAD=1 our shim's
+    // worker thread is the "browser main" thread; calling retro_init from
+    // there hits Asyncify-instrumented paths (malloc that may sbrk-grow,
+    // sigaction, locale catalog opens) with no Asyncify frame allocated,
+    // which traps "memory access out of bounds". main() below performs
+    // those calls and signals 'core-ready' via postMessage when finished.
     MAIN_THREAD_EM_ASM({
-        postMessage({cmd: 'print', txt: '[flycast-worker] core inited'});
-        postMessage({cmd: 'setStatus', txt: 'Flycast core ready, waiting for disc'});
+        postMessage({cmd: 'print', txt: '[flycast-worker] worker_init no-op (init now happens in main())'});
     });
 }
 
@@ -390,7 +390,18 @@ void sh4_interp_shil_fb(uint32_t block_vaddr, uint32_t op_idx) {
 // ---------------------------------------------------------------------------
 int main(void) {
     MAIN_THREAD_EM_ASM({
-        postMessage({cmd: 'print', txt: '[flycast-worker] main entered, awaiting init'});
+        postMessage({cmd: 'print', txt: '[flycast-worker] main entered, running retro_init on pthread'});
+    });
+    retro_set_environment(environment_cb);
+    retro_set_video_refresh(video_cb);
+    retro_set_audio_sample(audio_sample_cb);
+    retro_set_audio_sample_batch(audio_sample_batch_cb);
+    retro_set_input_poll(input_poll_cb);
+    retro_set_input_state(input_state_cb);
+    retro_init();
+    MAIN_THREAD_EM_ASM({
+        postMessage({cmd: 'print', txt: '[flycast-worker] core inited (from main pthread)'});
+        postMessage({cmd: 'core-ready'});
     });
     emscripten_exit_with_live_runtime();
     return 0;

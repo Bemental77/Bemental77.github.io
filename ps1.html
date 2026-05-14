@@ -234,10 +234,33 @@
   // so we deliberately do NOT also dispatch synthetic KeyboardEvents. Dispatching them caused
   // SDL/listener preventDefault chains that interfered with Xbox Edge's hamburger-hold gesture.
   // n64.html handles this the same way (no synthetic events from gamepad).
+  // Hold D-pad Up for 1.5s → fire a single Select pulse. Xbox Edge consumes the
+  // View button (PSX Select on standard mappings) for chrome fullscreen, so this
+  // gesture is the alt path for Edge. Up itself is unaffected and continues to
+  // register normally; Select pulses once at the threshold, then releases.
+  var _upHoldTimer = null, _upHoldPulseTimer = null;
+  var UP_HOLD_SELECT_MS = 1500, SELECT_PULSE_MS = 100;
+  function _cancelUpHold() {
+    if (_upHoldTimer) { clearTimeout(_upHoldTimer); _upHoldTimer = null; }
+  }
+  function _armUpHold() {
+    if (_upHoldTimer) return;
+    _upHoldTimer = setTimeout(function () {
+      _upHoldTimer = null;
+      if (!mobilePadState.up) return;
+      mobilePadState.select = true; updatePadState();
+      if (_upHoldPulseTimer) clearTimeout(_upHoldPulseTimer);
+      _upHoldPulseTimer = setTimeout(function () {
+        _upHoldPulseTimer = null;
+        mobilePadState.select = false; updatePadState();
+      }, SELECT_PULSE_MS);
+    }, UP_HOLD_SELECT_MS);
+  }
   function dispatchKey(type, key) {
     var keyToPad = { 'ArrowUp': 'up', 'ArrowDown': 'down', 'ArrowLeft': 'left', 'ArrowRight': 'right', 'z': 'cross', 'x': 'circle', 's': 'square', 'd': 'triangle', 'w': 'l1', 'r': 'r1', 'e': 'l2', 't': 'r2', 'v': 'start', 'c': 'select' };
     var padBtn = keyToPad[key];
     if (padBtn) { mobilePadState[padBtn] = (type === 'keydown'); updatePadState(); }
+    if (key === KEYMAP.up) { if (type === 'keydown') _armUpHold(); else _cancelUpHold(); }
   }
 
   function wireButton(id, key) {
@@ -513,10 +536,14 @@
   applyHide(localStorage.getItem('ps1wasm_hide') === '1');
   $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); closeMobileMenu(); }); $('mResetAudio').addEventListener('click', () => { resetAudio(); closeMobileMenu(); }); $('mGhost').addEventListener('click', toggleGhost); $('mHide').addEventListener('click', () => { toggleHide(); closeMobileMenu(); }); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
   $('mobileHideHint').addEventListener('click', () => { applyHide(false); localStorage.setItem('ps1wasm_hide', '0'); });
-  // Xbox Edge translates View (btn 8) and L3 (btn 10) into browser-back navigation
-  // before page-side gamepad polling can read them — push a sentinel history entry
-  // and re-push on popstate so the page stays loaded. That lets View map to PSX
-  // Select and keeps L3 a no-op. The hold-Menu OS gesture still exits as intended.
+  // Xbox Edge: L3 (btn 10) triggers browser-back (popstate + BrowserBack key).
+  // View (btn 8) triggers Edge's chrome fullscreen at the shell level — not
+  // observable from the page (no fullscreenchange, no key event). Therefore:
+  //   - Re-push the sentinel on popstate and preventDefault BrowserBack so L3
+  //     can't unload the page (kept as a no-op, not mapped to Select).
+  //   - View → PSX Select cannot be implemented through any web API on Edge;
+  //     Select needs a different binding (chord or alternate button).
+  // Hold-Menu OS exit gesture is shell-level and still works.
   try { history.pushState({ ps1: 1 }, ''); } catch (e) {}
   window.addEventListener('popstate', function () { try { history.pushState({ ps1: 1 }, ''); } catch (_) {} });
   window.addEventListener('keydown', function (e) { if (e.key === 'BrowserBack' || e.key === 'BrowserForward' || e.key === 'GoBack') { e.preventDefault(); e.stopPropagation(); } }, true);
@@ -528,6 +555,11 @@
   var GP_START_BTN = _gpQs.has('startbtn') ? +_gpQs.get('startbtn') : 9;
   var GP_SELECT_BTN = _gpQs.has('selectbtn') ? +_gpQs.get('selectbtn') : 8;
   var GP_DEBUG = _gpQs.has('gpdebug') || _gpQs.has('gp');
+  // ?xboxsim=1 — simulate Xbox Edge button consumption when developing on
+  // a desktop with a paired Xbox controller. View (btn 8) is suppressed
+  // entirely; L3 (btn 10) and R3 (btn 11) dispatch BrowserBack/Forward
+  // KeyboardEvents and invoke history.back/forward so the existing
+  // popstate+keydown handlers above run as they would on real Edge.
   var GP_BUTTON_KEYS = { 0: KEYMAP.cross, 1: KEYMAP.circle, 2: KEYMAP.square, 3: KEYMAP.triangle, 4: KEYMAP.l1, 5: KEYMAP.r1, 6: KEYMAP.l2, 7: KEYMAP.r2, 12: KEYMAP.up, 13: KEYMAP.down, 14: KEYMAP.left, 15: KEYMAP.right };
   if (GP_START_BTN >= 0) GP_BUTTON_KEYS[GP_START_BTN] = KEYMAP.start;
   if (GP_SELECT_BTN >= 0) GP_BUTTON_KEYS[GP_SELECT_BTN] = KEYMAP.select;

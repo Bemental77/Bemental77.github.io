@@ -5,72 +5,53 @@
   <title>Dreamcast (Bemental77)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="icon" href=",">
-  <!-- Cross-origin isolation for SharedArrayBuffer.
-       Without this, sharedMemory creation throws and the worker silently fails. -->
   <script src="/coi-serviceworker.js"></script>
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd;
                  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     #wrap { display: flex; flex-direction: column; align-items: center; padding: 12px; gap: 8px;
             height: 100vh; box-sizing: border-box; }
-    h3   { margin: 0; font-size: 18px; letter-spacing: 1px; color: #aaa; }
-    #bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: center; }
-    #bar button, #bar label.fileLabel {
+    h3 { margin: 0; font-size: 18px; letter-spacing: 1px; color: #aaa; }
+    #controlBar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: center; }
+    #controlBar button, #controlBar select {
       padding: 8px 14px; border: 1px solid #444; background: #222; color: #eee;
-      border-radius: 4px; cursor: pointer; font-size: 14px; min-height: 36px;
+      border-radius: 4px; font-size: 14px; min-height: 36px; cursor: pointer;
     }
-    #bar button:disabled { opacity: 0.4; cursor: not-allowed; }
-    #bar input[type=file] { display: none; }
+    #controlBar button:hover:not(:disabled), #controlBar select:hover { background: #333; }
+    #controlBar button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #status { font-size: 13px; color: #888; min-height: 16px; text-align: center; }
     #canvasWrap { background: #000; display: flex; align-items: center; justify-content: center;
                   flex: 1; width: 100%; max-width: 100vw; }
     #dc-canvas { background: #000; image-rendering: pixelated; width: 640px; height: 480px;
                  max-width: 100%; max-height: 100%; }
-    pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
-          margin: 0; color: #aaa; white-space: pre-wrap; }
-    #status { min-width: 220px; text-align: center; }
-    #pad    { min-width: 220px; text-align: center; }
-    #log    { width: 100%; max-width: 820px; height: 120px; overflow: auto;
-              background: #0a0a0a; border: 1px solid #333; padding: 4px; color: #bbb; }
+    #log { display: none; width: 100%; max-width: 820px; height: 140px; overflow: auto;
+           background: #0a0a0a; border: 1px solid #333; padding: 4px; font-size: 11px;
+           color: #bbb; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; }
+    #log.visible { display: block; }
   </style>
 </head>
 <body>
 <div id="wrap">
-  <h3>Dreamcast Wasm — Phase 1 single-worker bringup</h3>
-  <div id="bar">
-    <label class="fileLabel" for="discFile">Choose disc (.cue + .bin tracks)</label>
-    <input id="discFile" type="file" multiple accept=".cue,.bin,.gdi,.chd,.cdi,.iso" />
-    <button id="btnBoot" disabled>Boot</button>
+  <h3>Dreamcast Wasm</h3>
+  <div id="controlBar">
+    <select id="romSelect">
+      <option value="pso2">Phantasy Star Online Ver. 2 (USA)</option>
+    </select>
+    <button id="btnStart">Start</button>
     <button id="btnReset" disabled>Reset</button>
     <button id="btnSave"  disabled>Save State</button>
     <button id="btnLoad"  disabled>Load State</button>
+    <button id="btnLog"   type="button">Log</button>
   </div>
-  <pre id="status">Idle.</pre>
-  <pre id="pad">pad: -</pre>
+  <div id="status"></div>
   <div id="canvasWrap"><canvas id="dc-canvas" width="640" height="480"></canvas></div>
   <pre id="log"></pre>
 </div>
 <script>
-// =============================================================================
-// Phase 1 single-worker bringup for the Flycast Dreamcast WASM core.
-//
-//   page (this file)
-//     |  postMessage  +  shared WebAssembly.Memory
-//     v
-//   /dreamcast/flycast_libretro/flycast_worker.js  (outer worker JS)
-//     |  importScripts
-//     v
-//   flycast_worker.{js,wasm}  (emcc-generated factory + SH4 JIT inside)
-//
-// The SH4 JIT (bementalJITSh4) currently runs *inside* flycast_worker via the
-// rec_wasm seam — there is no separate sh4-worker yet. Phase 2 (two-worker
-// split mirroring gamecube/ppc-worker) will land once Phase 1 sustains
-// >=100% native PowerPC-equivalent. Until then this page stays simple:
-// one worker, one shared SAB, one rAF loop driving frame paint + pad input.
-// =============================================================================
 (function () {
   'use strict';
   const $ = (id) => document.getElementById(id);
-  const statusEl = $('status'), padEl = $('pad'), logEl = $('log');
+  const statusEl = $('status'), logEl = $('log');
 
   function pageLog(s) {
     if (logEl) {
@@ -81,172 +62,199 @@
   }
   function setStatus(t) { if (statusEl) statusEl.textContent = t; }
 
-  // ---------------------------------------------------------------------------
-  // SAB layout (matches flycast_worker.js):
-  //   [0x1F000000 .. 0x1F12C000)  framebuffer (640*480*4 = 1228800 B = 1.17 MB)
-  //   [0x1F200000 .. )            audio ring (header 8B + 16384 stereo frames)
-  // INITIAL_MEMORY in flycast_worker_link.sh is 512 MB; pick offsets near the
-  // top of that range so they don't collide with .data/.bss/heap.
-  // ---------------------------------------------------------------------------
-  const FB_OFFSET   = 0x1F000000;
-  const FB_W = 640, FB_H = 480;
-  const FB_BYTES    = FB_W * FB_H * 4;
-  const AUDIO_OFFSET = 0x1F200000;
-  const AUDIO_FRAMES = 16384;          // power-of-two stereo frames
-  const AUDIO_BYTES  = 8 + AUDIO_FRAMES * 2 * 2;  // 8B header + i16 stereo
+  $('btnLog').addEventListener('click', () => logEl.classList.toggle('visible'));
 
-  // 512 MB shared, 4 GB max — mirrors gamecube allocation.
+  // ---------------------------------------------------------------------------
+  // Cross-origin isolation gate. SharedArrayBuffer requires this; the COI
+  // service worker installs on first hit but doesn't take effect until reload.
+  // ---------------------------------------------------------------------------
+  if (!self.crossOriginIsolated) {
+    setStatus('Initializing... (page will reload once)');
+    setTimeout(() => location.reload(), 800);
+    return;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Game catalog. Each entry has { name, base, files: [{name, url|parts}], cue }.
+  // Mirrors the chunked-rom pattern at ps1/ps1Wasm/roms/*.partXX.
+  // ---------------------------------------------------------------------------
+  const GAMES = {
+    pso2: {
+      name: 'Phantasy Star Online Ver. 2 (USA)',
+      base: '/dreamcast/discs/pso2/',
+      cue:  'PSO.cue',
+      files: [
+        { name: 'Track1.bin' },
+        { name: 'Track2.bin' },
+        { name: 'Track3.bin', parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
+                                       .map(s => 'Track3.bin.part' + s) },
+        { name: 'PSO.cue' },
+      ],
+    },
+  };
+
+  // ---------------------------------------------------------------------------
+  // SAB layout (matches flycast_worker.js).
+  // ---------------------------------------------------------------------------
+  const FB_OFFSET    = 0x1F000000;
+  const FB_W = 640, FB_H = 480;
+  const FB_BYTES     = FB_W * FB_H * 4;
+  const AUDIO_OFFSET = 0x1F200000;
+  const AUDIO_FRAMES = 16384;
+
   const sharedMemory = new WebAssembly.Memory({
     initial: 536870912 / 65536,
     maximum: 4294967296 / 65536,
     shared: true,
   });
-  pageLog('[page] sharedMemory allocated (initial=' + (sharedMemory.buffer.byteLength >>> 20) + ' MB)');
+  pageLog('[page] sharedMemory allocated (' + (sharedMemory.buffer.byteLength >>> 20) + ' MB)');
 
   // ---------------------------------------------------------------------------
-  // Worker
+  // Worker bootstrap. Runs silently in the background while the user picks a game.
   // ---------------------------------------------------------------------------
   const worker = new Worker('/dreamcast/flycast_libretro/flycast_worker.js?v=' + Date.now());
   let workerReady = false;
-  let discReady   = false;
-  let booted      = false;
+  let workerReadyResolve;
+  const workerReadyPromise = new Promise((r) => { workerReadyResolve = r; });
+
+  let booted = false;
+  let pendingDiscLoad = null;  // resolver for discReady -> discLoaded
 
   worker.onmessage = (e) => {
     const d = e.data || {};
     switch (d.cmd) {
       case 'print':       pageLog(d.txt); break;
-      case 'setStatus':   setStatus(d.txt); break;
       case 'ready':
         workerReady = true;
         pageLog('[page] worker ready');
-        setStatus('Worker ready. Pick a disc.');
+        workerReadyResolve();
+        break;
+      case 'runtime-ready':
+        // post-js heartbeat — already covered by 'ready' from the shim.
         break;
       case 'discLoaded':
-        if (d.success) {
-          pageLog('[page] disc loaded ok: ' + d.cuePath);
-          setStatus('Disc loaded. Press Boot.');
-          $('btnBoot').disabled = false;
-        } else {
-          pageLog('[page] disc load FAILED: ' + d.cuePath);
-          setStatus('Disc load failed.');
-        }
+        if (pendingDiscLoad) { pendingDiscLoad(d.success); pendingDiscLoad = null; }
         break;
       case 'frame':
-        // SAB framebuffer was updated in-place by video_cb. Blit it.
         paintFrame();
         break;
       case 'render':
-        // Path B fallback (worker postMessage'd pixels because video target
-        // wasn't set). Useful sanity net during early bringup.
         paintTransferable(d);
         break;
       case 'stateSaved':  pageLog('[page] save state ' + (d.data ? d.data.byteLength : 0) + ' B'); break;
       case 'stateLoaded': pageLog('[page] state loaded'); break;
       default:
-        // TODO: route flycast bridge cmds (post-js mbx-* etc) once Phase 2 lands.
         pageLog('[page] unknown worker cmd: ' + d.cmd);
     }
   };
 
-  // Hand the worker the SAB first; it forwards to the emcc factory as wasmMemory.
   worker.postMessage({ cmd: 'mem-init', memory: sharedMemory,
                        fbOffset: FB_OFFSET, fbW: FB_W, fbH: FB_H,
                        audioOffset: AUDIO_OFFSET, audioFrames: AUDIO_FRAMES });
 
   // ---------------------------------------------------------------------------
-  // Audio worklet — consumes the SAB ring at AUDIO_OFFSET that the flycast
-  // bridge writes from audio_sample_batch_cb. Dreamcast AICA native rate is
-  // 44.1 kHz. Browser autoplay policy requires resume() on a user gesture, so
-  // the actual ctx.resume() lives in the Boot button handler below.
+  // Audio worklet. Created on first user gesture (browser autoplay policy).
   // ---------------------------------------------------------------------------
   let audioContext = null;
-  let audioNode    = null;
-  let audioReady   = false;
   async function initAudio() {
     if (audioContext) return;
     try {
       audioContext = new (self.AudioContext || self.webkitAudioContext)({ sampleRate: 44100 });
       await audioContext.audioWorklet.addModule('/dreamcast/audio-worklet.js');
-      audioNode = new AudioWorkletNode(audioContext, 'dc-audio-processor', {
-        numberOfInputs: 0,
-        numberOfOutputs: 1,
-        outputChannelCount: [2],
-        processorOptions: {
-          sab: sharedMemory.buffer,
-          ringOffset: AUDIO_OFFSET,
-          ringCapacity: AUDIO_FRAMES,
-        },
+      const node = new AudioWorkletNode(audioContext, 'dc-audio-processor', {
+        numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
+        processorOptions: { sab: sharedMemory.buffer, ringOffset: AUDIO_OFFSET, ringCapacity: AUDIO_FRAMES },
       });
-      audioNode.port.onmessage = (e) => {
-        const m = e.data || {};
-        if (m.cmd === 'stats' && m.underrunFrames > 0) {
-          pageLog('[audio] underrun ' + m.underrunFrames + ' / consumed ' + m.consumedFrames);
-        }
-      };
-      audioNode.connect(audioContext.destination);
-      audioReady = true;
-      pageLog('[page] audio worklet wired (sr=' + audioContext.sampleRate + ')');
+      node.connect(audioContext.destination);
+      if (audioContext.state === 'suspended') { try { await audioContext.resume(); } catch (_) {} }
     } catch (err) {
       pageLog('[page] audio init failed: ' + (err && err.message ? err.message : String(err)));
     }
   }
 
   // ---------------------------------------------------------------------------
-  // Disc picker — accept .cue + .bin tracks together. Stream each File as a
-  // discChunk, then send discReady with the cue's chosen virtual path.
+  // Disc fetcher. Streams files (and chunked .partXX sets) from the project,
+  // postMessages them to the worker. No file picker; no waiting.
   // ---------------------------------------------------------------------------
-  $('discFile').addEventListener('change', async (ev) => {
-    const files = Array.from(ev.target.files || []);
-    if (!files.length) return;
-    setStatus('Loading disc (' + files.length + ' files)...');
-    let cueName = null;
-    for (const f of files) {
-      const buf = await f.arrayBuffer();
-      pageLog('[page] disc chunk: ' + f.name + ' (' + (buf.byteLength/1048576).toFixed(2) + ' MB)');
-      worker.postMessage({ cmd: 'discChunk', name: f.name, bytes: buf }, [buf]);
-      if (/\.cue$/i.test(f.name) || /\.gdi$/i.test(f.name) || /\.chd$/i.test(f.name) || /\.cdi$/i.test(f.name)) {
-        cueName = f.name;
+  async function fetchAndPostFile(file, base, cuePath) {
+    let buf;
+    if (file.parts) {
+      const parts = file.parts.map(p => base + p);
+      const bufs = [];
+      let total = 0;
+      for (let i = 0; i < parts.length; i++) {
+        setStatus(file.name + ' part ' + (i + 1) + '/' + parts.length);
+        const r = await fetch(parts[i]);
+        if (!r.ok) throw new Error('fetch ' + parts[i] + ' -> ' + r.status);
+        const ab = await r.arrayBuffer();
+        bufs.push(new Uint8Array(ab));
+        total += ab.byteLength;
       }
-      // ISO single-file path: treat the .iso itself as the boot path.
-      if (!cueName && /\.iso$/i.test(f.name)) cueName = f.name;
+      const out = new Uint8Array(total);
+      let off = 0;
+      for (const b of bufs) { out.set(b, off); off += b.byteLength; }
+      buf = out.buffer;
+    } else {
+      setStatus('Fetching ' + file.name);
+      const r = await fetch(base + file.name);
+      if (!r.ok) throw new Error('fetch ' + base + file.name + ' -> ' + r.status);
+      buf = await r.arrayBuffer();
     }
-    if (!cueName) {
-      setStatus('No .cue/.gdi/.chd/.cdi/.iso among picked files.');
-      return;
-    }
-    discReady = true;
-    worker.postMessage({ cmd: 'discReady', cuePath: '/discs/' + cueName });
-  });
+    worker.postMessage({ cmd: 'discChunk', name: file.name, bytes: buf }, [buf]);
+  }
 
   // ---------------------------------------------------------------------------
-  // Buttons
+  // Start button: one-click flow.
+  //   1. fetch & post all disc files (in parallel with worker init)
+  //   2. await worker ready
+  //   3. tell worker to load the disc
+  //   4. await disc-loaded ack
+  //   5. initAudio (this is on a user gesture so audioContext.resume is allowed)
+  //   6. start frame loop
   // ---------------------------------------------------------------------------
-  $('btnBoot').addEventListener('click', async () => {
-    if (!workerReady || !discReady || booted) return;
-    booted = true;
-    // First user gesture — safe to create + resume the AudioContext now.
-    await initAudio();
-    if (audioContext && audioContext.state === 'suspended') {
-      try { await audioContext.resume(); } catch (_) {}
+  $('btnStart').addEventListener('click', async () => {
+    if (booted) return;
+    const key = $('romSelect').value;
+    const game = GAMES[key];
+    if (!game) { setStatus('Unknown game: ' + key); return; }
+
+    $('btnStart').disabled = true;
+    setStatus('Loading ' + game.name + '...');
+    try {
+      // 1. Stream every file. The worker queues writes until runtime-ready
+      //    (the post-js drains queued messages on init).
+      for (const f of game.files) {
+        await fetchAndPostFile(f, game.base, game.cue);
+      }
+      // 2. Wait for worker if it isn't ready yet (usually instant on warm load).
+      setStatus('Waiting for emulator runtime...');
+      await workerReadyPromise;
+      // 3. Tell the worker to load the disc and wait for ack.
+      setStatus('Loading disc image...');
+      const ok = await new Promise((resolve) => {
+        pendingDiscLoad = resolve;
+        worker.postMessage({ cmd: 'discReady', cuePath: '/discs/' + game.cue });
+      });
+      if (!ok) throw new Error('disc load returned 0');
+      // 4. Audio + frame loop.
+      await initAudio();
+      booted = true;
+      [$('btnReset'), $('btnSave'), $('btnLoad')].forEach((b) => b.disabled = false);
+      setStatus('Running.');
+      requestAnimationFrame(frameLoop);
+    } catch (err) {
+      pageLog('[page] start failed: ' + (err && err.message ? err.message : String(err)));
+      setStatus('Failed: ' + (err && err.message ? err.message : String(err)));
+      $('btnStart').disabled = false;
     }
-    setStatus('Booting...');
-    [$('btnReset'), $('btnSave'), $('btnLoad')].forEach((b) => b.disabled = false);
-    requestAnimationFrame(frameLoop);
   });
-  $('btnReset').addEventListener('click', () => {
-    worker.postMessage({ cmd: 'reset' });
-    setStatus('Reset.');
-  });
+
+  $('btnReset').addEventListener('click', () => worker.postMessage({ cmd: 'reset' }));
   $('btnSave').addEventListener('click', () => worker.postMessage({ cmd: 'saveState' }));
-  $('btnLoad').addEventListener('click', () => {
-    // TODO: wire IndexedDB-backed save slots once Phase 1 reaches stable boot.
-    pageLog('[page] loadState UI is a stub — wire IDB after first stable boot');
-  });
+  $('btnLoad').addEventListener('click', () => pageLog('[page] loadState UI is a stub'));
 
   // ---------------------------------------------------------------------------
-  // rAF loop — packs gamepad → SAB MAPLE buffer, pings worker for one iter.
-  // The worker drives its own setInterval-paced run loop too (see
-  // flycast_worker.js); this rAF tick is for input + canvas paint pacing.
+  // Canvas + GL paint.
   // ---------------------------------------------------------------------------
   const canvas = $('dc-canvas');
   const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
@@ -263,7 +271,6 @@
     }
   }
   function paintTransferable(d) {
-    // Path B render fallback. d.pixels is a Uint8Array (XRGB8888).
     if (!d || !d.pixels || !d.w || !d.h) return;
     if (gl) blitGL(d.pixels, d.w, d.h);
     else if (ctx2d) {
@@ -272,18 +279,18 @@
     }
   }
   function initGL() {
-    glTex  = gl.createTexture();
+    glTex = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, glTex);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    const vsSrc = 'attribute vec2 p; varying vec2 t; void main(){ t=vec2(p.x*0.5+0.5,1.0-(p.y*0.5+0.5)); gl_Position=vec4(p,0,1); }';
-    const fsSrc = 'precision mediump float; varying vec2 t; uniform sampler2D s; void main(){ vec4 c=texture2D(s,t); gl_FragColor=vec4(c.b,c.g,c.r,1.0); }';
+    const vs = 'attribute vec2 p; varying vec2 t; void main(){ t=vec2(p.x*0.5+0.5,1.0-(p.y*0.5+0.5)); gl_Position=vec4(p,0,1); }';
+    const fs = 'precision mediump float; varying vec2 t; uniform sampler2D s; void main(){ vec4 c=texture2D(s,t); gl_FragColor=vec4(c.b,c.g,c.r,1.0); }';
     function sh(type, src) { const o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o); return o; }
     glProg = gl.createProgram();
-    gl.attachShader(glProg, sh(gl.VERTEX_SHADER, vsSrc));
-    gl.attachShader(glProg, sh(gl.FRAGMENT_SHADER, fsSrc));
+    gl.attachShader(glProg, sh(gl.VERTEX_SHADER, vs));
+    gl.attachShader(glProg, sh(gl.FRAGMENT_SHADER, fs));
     gl.linkProgram(glProg);
     glVbo = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, glVbo);
@@ -302,37 +309,20 @@
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
 
-  // MAPLE-pad layout: 256 bytes — 64 B per port * 4 ports. JS writes button
-  // bits (bytes 0..7) and analog axes (bytes 8..63) per port. flycast bridge
-  // input_state_cb reads g_maple_pad_state[port*64 + (id/8)] & bit(id%8).
-  // We mirror DreamShellInput button IDs (libretro RETRO_DEVICE_ID_JOYPAD_*).
-  const RETRO_BUTTONS = {
-    B: 0, Y: 1, SELECT: 2, START: 3, UP: 4, DOWN: 5, LEFT: 6, RIGHT: 7,
-    A: 8, X: 9, L: 10, R: 11, L2: 12, R2: 13, L3: 14, R3: 15,
-  };
+  // ---------------------------------------------------------------------------
+  // Input. Keyboard maps to RETRO_DEVICE_ID_JOYPAD_*; gamepads passthrough.
+  // ---------------------------------------------------------------------------
+  const RB = { B:0, Y:1, SELECT:2, START:3, UP:4, DOWN:5, LEFT:6, RIGHT:7,
+               A:8, X:9, L:10, R:11 };
   const KEYMAP = {
-    [RETRO_BUTTONS.UP]:    'ArrowUp',
-    [RETRO_BUTTONS.DOWN]:  'ArrowDown',
-    [RETRO_BUTTONS.LEFT]:  'ArrowLeft',
-    [RETRO_BUTTONS.RIGHT]: 'ArrowRight',
-    [RETRO_BUTTONS.A]:     'x',
-    [RETRO_BUTTONS.B]:     'z',
-    [RETRO_BUTTONS.X]:     's',
-    [RETRO_BUTTONS.Y]:     'd',
-    [RETRO_BUTTONS.START]: 'Enter',
-    [RETRO_BUTTONS.L]:     'q',
-    [RETRO_BUTTONS.R]:     'e',
+    [RB.UP]: 'ArrowUp', [RB.DOWN]: 'ArrowDown', [RB.LEFT]: 'ArrowLeft', [RB.RIGHT]: 'ArrowRight',
+    [RB.A]: 'x', [RB.B]: 'z', [RB.X]: 's', [RB.Y]: 'd',
+    [RB.START]: 'Enter', [RB.L]: 'q', [RB.R]: 'e',
   };
   const heldKeys = new Set();
   window.addEventListener('keydown', (e) => { heldKeys.add(e.key); });
   window.addEventListener('keyup',   (e) => { heldKeys.delete(e.key); });
 
-  // The maple buffer ptr is allocated in the worker's wasm heap (g_maple_pad_state).
-  // The page can't write there directly because the heap pointer lives in the
-  // worker's view of the SAB-backed memory. Phase 1: we send pad bytes via
-  // postMessage; the worker copies them in. (Phase 2 will move the maple
-  // buffer to a known SAB offset for direct Atomics writes from the page.)
-  // TODO: cache last padBytes and only postMessage on change to avoid 60 Hz spam.
   function packPad() {
     const bytes = new Uint8Array(256);
     for (const [idStr, key] of Object.entries(KEYMAP)) {
@@ -352,16 +342,11 @@
     return bytes;
   }
 
-  let lastPadHex = '';
   function frameLoop() {
     if (booted) {
       const pad = packPad();
       worker.postMessage({ cmd: 'input', states: pad }, [pad.buffer]);
       worker.postMessage({ cmd: 'runFrame' });
-      // Echo first 16 bytes of port-0 pad state for debugging.
-      let hex = '';
-      for (let i = 0; i < 8; i++) hex += (pad[i] || 0).toString(16).padStart(2, '0');
-      if (hex !== lastPadHex) { padEl.textContent = 'pad p0: ' + hex; lastPadHex = hex; }
     }
     requestAnimationFrame(frameLoop);
   }
