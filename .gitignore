@@ -33,3 +33,15 @@ bementalCompiler/build/
 bementalJIT/build-*/
 
 tools/bin/
+
+# Dreamcast — local-only artifacts (mirror gamecube pattern)
+# BIOS / Flash dumps (DC - BIOS.bin, DC - Flash.bin, etc.) — not redistributable
+dreamcast/bios/
+# Native oracle (redream binary + saves) — host-only, not deployed
+dreamcast/oracle/
+# Game images (.gdi/.cdi/.chd/.iso/.bin/.cue/.nrg)
+dreamcast/roms/
+# Flycast source tree (large internal build input — not deployed)
+dreamcast/flycast-src/
+# Flycast / sh4-worker local CMake build dirs (build-wasm/, build-host-test/, etc.)
+dreamcast/**/build-*/
