@@ -15,16 +15,20 @@ index ec28ab1..e116444 100644
  	if(APPLE)
  		if(NOT IOS)
  			set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-undefined,error")
-@@ -1351,6 +1355,19 @@ if("x86" IN_LIST ARCHITECTURE OR "x86_64" IN_LIST ARCHITECTURE)
+@@ -1351,6 +1355,23 @@ if("x86" IN_LIST ARCHITECTURE OR "x86_64" IN_LIST ARCHITECTURE)
  	endif()
  endif()
- 
+
 +# WASM recompiler — uses bementalJIT (repo root, ../../bementalJIT relative
 +# to flycast-src) as the codegen backend with the SH4 guest enabled.
 +# rec_wasm.cpp lives in flycast-bridge/ and implements the Sh4Dynarec
 +# interface declared in core/hw/sh4/dyna/ngen.h.
 +if("wasm32" IN_LIST ARCHITECTURE)
 +	set(BEMENTAL_GUEST_SH4 ON CACHE BOOL "" FORCE)
++	# Override default in bementalJIT/guests/sh4/CMakeLists.txt — when invoked
++	# as a subdir of flycast-src, CMAKE_SOURCE_DIR resolves to flycast-src,
++	# making its default ${CMAKE_SOURCE_DIR}/../dreamcast/flycast-src wrong.
++	set(BEMENTAL_SH4_FLYCAST_SRC "${CMAKE_CURRENT_SOURCE_DIR}" CACHE PATH "" FORCE)
 +	add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../bementalJIT
 +	                 ${CMAKE_BINARY_DIR}/bementalJIT)
 +	target_sources(${PROJECT_NAME} PRIVATE

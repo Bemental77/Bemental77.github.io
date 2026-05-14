@@ -184,7 +184,11 @@
   function toast(msg, isErr) { toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200); }
   const isMobile = (() => { const ua = navigator.userAgent.toLowerCase(); return /iphone|ipad|ipod|android|mobile|xbox/.test(ua) || ('ontouchstart' in window) || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile'); })();
   var do_iter = true;
-  var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/ps1/ps1Wasm/dist/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: $('canvas'), setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {} };
+  // keyboardListeningElement scopes SDL's keydown/keyup capture to the canvas only,
+  // so document-level events (including any system gestures Xbox Edge dispatches) aren't
+  // intercepted by SDL's preventDefault chain. n64.html doesn't register any document
+  // listeners and works fine on Xbox; this brings PS1 closer to that.
+  var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/ps1/ps1Wasm/dist/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: $('canvas'), keyboardListeningElement: $('canvas'), setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {} };
   var img_data32;
   window.my_SDL_LockSurface = function (surf) { var s = Module.SDL.surfaces[surf]; s.locked++; if (s.locked > 1) return 0; if (!s.buffer) { s.buffer = Module._malloc(s.width * s.height * 4); Module.HEAP32[(surf + 20) >> 2] = s.buffer; } Module.HEAP32[(surf + 20) >> 2] = s.buffer; if (!s.image) s.image = s.ctx.getImageData(0, 0, s.width, s.height); return 0; };
   window.my_SDL_UnlockSurface = function (surf) { var s = Module.SDL.surfaces[surf]; if (!s.locked || --s.locked > 0) return; var src = s.buffer >> 2; if (!img_data32) img_data32 = new Uint32Array(s.image.data.buffer); img_data32.set(Module.HEAP32.subarray(src, src + img_data32.length)); s.ctx.putImageData(s.image, 0, 0); };
@@ -226,17 +230,14 @@
   }
 
   var KEY_CODES = { 'ArrowUp': ['ArrowUp', 38], 'ArrowDown': ['ArrowDown', 40], 'ArrowLeft': ['ArrowLeft', 37], 'ArrowRight': ['ArrowRight', 39], 'z': ['KeyZ', 90], 'x': ['KeyX', 88], 's': ['KeyS', 83], 'd': ['KeyD', 68], 'w': ['KeyW', 87], 'r': ['KeyR', 82], 'e': ['KeyE', 69], 't': ['KeyT', 84], 'v': ['KeyV', 86], 'c': ['KeyC', 67] };
+  // Gamepad input is mirrored straight into PSX pad state (mobilePadState → updatePadState),
+  // so we deliberately do NOT also dispatch synthetic KeyboardEvents. Dispatching them caused
+  // SDL/listener preventDefault chains that interfered with Xbox Edge's hamburger-hold gesture.
+  // n64.html handles this the same way (no synthetic events from gamepad).
   function dispatchKey(type, key) {
     var keyToPad = { 'ArrowUp': 'up', 'ArrowDown': 'down', 'ArrowLeft': 'left', 'ArrowRight': 'right', 'z': 'cross', 'x': 'circle', 's': 'square', 'd': 'triangle', 'w': 'l1', 'r': 'r1', 'e': 'l2', 't': 'r2', 'v': 'start', 'c': 'select' };
     var padBtn = keyToPad[key];
     if (padBtn) { mobilePadState[padBtn] = (type === 'keydown'); updatePadState(); }
-    var info = KEY_CODES[key]; if (!info) return;
-    try {
-      var evt = new KeyboardEvent(type, { key: key, code: info[0], keyCode: info[1], which: info[1], bubbles: true, cancelable: true });
-      Object.defineProperty(evt, 'keyCode', { get: function () { return info[1]; } });
-      Object.defineProperty(evt, 'which', { get: function () { return info[1]; } });
-      window.dispatchEvent(evt); document.dispatchEvent(evt);
-    } catch (e) {}
   }
 
   function wireButton(id, key) {
@@ -525,25 +526,6 @@
   if (GP_SELECT_BTN >= 0) GP_BUTTON_KEYS[GP_SELECT_BTN] = KEYMAP.select;
   var gpPressed = {}; var gpPolling = false; var GP_AXIS_DEAD = 0.35;
   function gpEdge(id, keyLabel, pressed) { if (pressed && !gpPressed[id]) { dispatchKey('keydown', keyLabel); gpPressed[id] = true; } else if (!pressed && gpPressed[id]) { dispatchKey('keyup', keyLabel); gpPressed[id] = false; } }
-  // Hold View (button 8) for 1.2s to release the gamepad — stops polling so Xbox Edge can revert
-  // to browser controls. PSX Select on View is released first so it doesn't get stuck.
-  var GP_RELEASE_MS = 1200;
-  var gpViewHold = {};
-  function gpHoldViewToRelease(padIdx, pressed) {
-    var now = performance.now();
-    if (pressed) {
-      if (gpViewHold[padIdx] === undefined) { gpViewHold[padIdx] = now; }
-      else if (gpViewHold[padIdx] !== -1 && (now - gpViewHold[padIdx]) > GP_RELEASE_MS) {
-        gpViewHold[padIdx] = -1;
-        if (GP_SELECT_BTN >= 0) gpEdge(padIdx + ':b' + GP_SELECT_BTN, KEYMAP.select, false);
-        gpReleased = true;  // halts pollGamepads from re-arming
-        try { var ife = (document.fullscreenElement || document.webkitFullscreenElement); if (ife) (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch (e) {}
-        toast('Gamepad released — browser controls active');
-        pageLog('[gp] released by hold-View; reload page to re-enable game controls');
-      }
-    } else { delete gpViewHold[padIdx]; }
-  }
-  var gpReleased = false;
   // Diagnostic: ?gp or ?gpdebug shows every pressed button index in the status bar and log.
   var gpLastSnapshot = {};
   var gpLoggedInfo = {};
@@ -558,7 +540,7 @@
       var el = $('status'); if (el) el.textContent = 'gp' + i + ' btns=[' + snap + ']';
     }
   }
-  function pollGamepads() { if (gpReleased) { gpPolling = false; return; } var pads = (navigator.getGamepads && navigator.getGamepads()) || []; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; var btns = gp.buttons || []; gpDebugLog(i, gp); for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } gpHoldViewToRelease(i, !!(btns[8] && btns[8].pressed)); var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); } requestAnimationFrame(pollGamepads); }
+  function pollGamepads() { var pads = (navigator.getGamepads && navigator.getGamepads()) || []; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; var btns = gp.buttons || []; gpDebugLog(i, gp); for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); } requestAnimationFrame(pollGamepads); }
   window.addEventListener('gamepadconnected', function (e) { setStatus('Controller connected: ' + e.gamepad.id); if (!gpPolling) { gpPolling = true; requestAnimationFrame(pollGamepads); } }); window.addEventListener('gamepaddisconnected', function () { setStatus('Controller disconnected'); }); if (navigator.getGamepads) { gpPolling = true; requestAnimationFrame(pollGamepads); }
   function checkOrientation() { if (!isMobile) return; var landscape = window.innerWidth > window.innerHeight; var show = started && !landscape; $('rotateHint').style.display = show ? 'flex' : 'none'; }
   window.addEventListener('resize', checkOrientation); window.addEventListener('orientationchange', checkOrientation);

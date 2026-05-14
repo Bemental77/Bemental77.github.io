@@ -28,7 +28,26 @@ add_library(bementalJITSh4 STATIC
 
 target_include_directories(bementalJITSh4 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    # Flycast's SH4 dyna headers transitively pull in much of core/deps.
+    # Keep this list aligned with Flycast's libretro target includes_CXX.rsp.
     ${BEMENTAL_SH4_FLYCAST_SRC}/core
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/nowide/include
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/xxHash
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/glm
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/stb
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/json
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/asio/asio/include
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/libchdr/include
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/libchdr/deps/zlib-1.3.1
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/libchdr/deps/zstd-1.5.6/lib
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/libretro-common/include
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/picotcp/include
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/picotcp/modules
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/tinygettext/include
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/miniupnpc/include
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/libzip/lib
+    ${BEMENTAL_SH4_FLYCAST_SRC}/core/deps/libelf/include
 )
 
 target_link_libraries(bementalJITSh4 PUBLIC bementalJIT)
