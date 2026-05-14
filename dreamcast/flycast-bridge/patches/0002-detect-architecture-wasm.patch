@@ -1,0 +1,20 @@
+diff --git a/shell/cmake/DetectArchitecture.cmake b/shell/cmake/DetectArchitecture.cmake
+index 9a4b855..0000000 100644
+--- a/shell/cmake/DetectArchitecture.cmake
++++ b/shell/cmake/DetectArchitecture.cmake
+@@ -2,6 +2,15 @@
+
+ include(CheckSymbolExists)
+
++# Emscripten path. emcmake on macOS sets CMAKE_OSX_ARCHITECTURES to the host
++# arch (x86_64 / arm64), which trips the early-return below and leaves
++# ARCHITECTURE pointing at the host instead of wasm32. Detect the wasm target
++# explicitly first so the rec_wasm branch in CMakeLists.txt fires.
++if (EMSCRIPTEN)
++    set(ARCHITECTURE "wasm32")
++    return()
++endif()
++
+ if (CMAKE_OSX_ARCHITECTURES)
+     set(ARCHITECTURE "${CMAKE_OSX_ARCHITECTURES}")
+     return()

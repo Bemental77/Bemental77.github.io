@@ -87,7 +87,6 @@ void psxException(u32 code, u32 bd) {
 #ifdef PSXCPU_LOG
 		PSXCPU_LOG("bd set!!!\n");
 #endif
-		SysPrintf("bd set!!!\n");
 		psxRegs.CP0.n.Cause |= 0x80000000;
 		psxRegs.CP0.n.EPC = (psxRegs.pc - 4);
 	} else

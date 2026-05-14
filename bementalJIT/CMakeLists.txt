@@ -42,6 +42,11 @@ if(BEMENTAL_GUEST_POWERPC)
     add_subdirectory(guests/powerpc)
 endif()
 
+option(BEMENTAL_GUEST_SH4 "Build the SH4 emitter for Dreamcast" OFF)
+if(BEMENTAL_GUEST_SH4)
+    add_subdirectory(guests/sh4)
+endif()
+
 # Phase 1 parallel rebuild target — IR substrate (CodeOp/CodeBlock/PPCAnalyzer)
 # that the existing emitter will progressively consume. Additive; safe to
 # build alongside guests/powerpc/ until cut-over per scope-doc §7.

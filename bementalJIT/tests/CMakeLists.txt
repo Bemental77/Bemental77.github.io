@@ -154,3 +154,21 @@ if(BEMENTAL_GUEST_POWERPC)
     )
     target_compile_options(test_str_hle_pattern PRIVATE "-pthread")
 endif()
+
+# SH4 emitter smoke test — only built when the Dreamcast guest is enabled.
+if(BEMENTAL_GUEST_SH4)
+    add_executable(test_sh4_dispatch test_sh4_dispatch.cpp)
+    target_link_libraries(test_sh4_dispatch PRIVATE bementalJIT bementalJITSh4)
+    set_target_properties(test_sh4_dispatch PROPERTIES SUFFIX ".html")
+    target_link_options(test_sh4_dispatch PRIVATE
+        "SHELL:-s EXIT_RUNTIME=1"
+        "SHELL:-pthread"
+        "SHELL:-s PTHREAD_POOL_SIZE=0"
+        "SHELL:-s INITIAL_MEMORY=33554432"
+        "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+        "SHELL:-s MAXIMUM_MEMORY=67108864"
+        "SHELL:-s ALLOW_TABLE_GROWTH=1"
+        "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+    )
+    target_compile_options(test_sh4_dispatch PRIVATE "-pthread")
+endif()

@@ -156,7 +156,6 @@ void playcdda()
 		t = GetTickCount() + CDDA_FRAMETIME;
 
 		if (subChanMixed) {
-			printf("subChanMixed\n");
 			s = 0;
 
 			for (i = 0; i < sizeof(sndbuffer) / CD_FRAMESIZE_RAW; i++) {
@@ -174,7 +173,6 @@ void playcdda()
 		}
 		else {
 			s = fread(sndbuffer, 1, sizeof(sndbuffer), cddaHandle);
-			printf("read s %ld\n",s);
 		}
 
 		if (s == 0) {
@@ -182,7 +180,6 @@ void playcdda()
 			fclose(cddaHandle);
 			cddaHandle = NULL;
 			initial_offset = 0;
-			printf("end playcdda\n");
 			return;
 		}
 
@@ -210,7 +207,6 @@ void playcdda()
 		}
 
 		if(playing){
-			printf("playcdda %ld\n", d);
 			EM_ASM_( {setTimeout("_playcdda()", $0);}, d);
 		}
 
@@ -218,7 +214,6 @@ void playcdda()
 
 // stop the CDDA playback
 static void stopCDDA() {
-	printf("stopCDDA\n");
 	if (!playing) {
 		return;
 	}
@@ -236,7 +231,6 @@ static void stopCDDA() {
 
 // start the CDDA playback
 static void startCDDA(unsigned int offset) {
-	printf("startCDDA\n");
 	if (playing) {
 		if (initial_offset == offset) {
 			return;
