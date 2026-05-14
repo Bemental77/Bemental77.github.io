@@ -512,36 +512,38 @@
   applyHide(localStorage.getItem('ps1wasm_hide') === '1');
   $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); closeMobileMenu(); }); $('mResetAudio').addEventListener('click', () => { resetAudio(); closeMobileMenu(); }); $('mGhost').addEventListener('click', toggleGhost); $('mHide').addEventListener('click', () => { toggleHide(); closeMobileMenu(); }); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
   $('mobileHideHint').addEventListener('click', () => { applyHide(false); localStorage.setItem('ps1wasm_hide', '0'); });
-  // URL knobs for gamepad mapping (set via query string, e.g. ?startbtn=7 or ?gpdebug)
+  // Standard PSX↔Xbox controller mapping. Hamburger (Menu, button 9) → PSX Start, View (button 8) → Select.
+  // The "hold Menu to return to browser controls" gesture on Xbox Edge is a shell-level OS gesture and
+  // should fire regardless of page-side gamepad polling (Gamepad API is poll-only and doesn't consume events).
+  // Override per-button via URL: ?startbtn=N, ?selectbtn=N.
   var _gpQs = new URLSearchParams(location.search);
-  var GP_START_BTN = +(_gpQs.get('startbtn') || 9);
-  var GP_SELECT_BTN = +(_gpQs.get('selectbtn') || 8);
+  var GP_START_BTN = _gpQs.has('startbtn') ? +_gpQs.get('startbtn') : 9;
+  var GP_SELECT_BTN = _gpQs.has('selectbtn') ? +_gpQs.get('selectbtn') : 8;
   var GP_DEBUG = _gpQs.has('gpdebug') || _gpQs.has('gp');
   var GP_BUTTON_KEYS = { 0: KEYMAP.cross, 1: KEYMAP.circle, 2: KEYMAP.square, 3: KEYMAP.triangle, 4: KEYMAP.l1, 5: KEYMAP.r1, 6: KEYMAP.l2, 7: KEYMAP.r2, 12: KEYMAP.up, 13: KEYMAP.down, 14: KEYMAP.left, 15: KEYMAP.right };
-  GP_BUTTON_KEYS[GP_START_BTN] = KEYMAP.start;
-  GP_BUTTON_KEYS[GP_SELECT_BTN] = KEYMAP.select;
+  if (GP_START_BTN >= 0) GP_BUTTON_KEYS[GP_START_BTN] = KEYMAP.start;
+  if (GP_SELECT_BTN >= 0) GP_BUTTON_KEYS[GP_SELECT_BTN] = KEYMAP.select;
   var gpPressed = {}; var gpPolling = false; var GP_AXIS_DEAD = 0.35;
   function gpEdge(id, keyLabel, pressed) { if (pressed && !gpPressed[id]) { dispatchKey('keydown', keyLabel); gpPressed[id] = true; } else if (!pressed && gpPressed[id]) { dispatchKey('keyup', keyLabel); gpPressed[id] = false; } }
-  // Long-press the PSX Start button (configurable via ?startbtn=N) for 1.2s → exit fullscreen or open menu.
-  var GP_LONG_PRESS_MS = 1200;
-  var gpStartHold = {};
-  function gpLongPressStart(padIdx, pressed) {
+  // Hold View (button 8) for 1.2s to release the gamepad — stops polling so Xbox Edge can revert
+  // to browser controls. PSX Select on View is released first so it doesn't get stuck.
+  var GP_RELEASE_MS = 1200;
+  var gpViewHold = {};
+  function gpHoldViewToRelease(padIdx, pressed) {
     var now = performance.now();
     if (pressed) {
-      if (gpStartHold[padIdx] === undefined) { gpStartHold[padIdx] = now; }
-      else if (gpStartHold[padIdx] !== -1 && (now - gpStartHold[padIdx]) > GP_LONG_PRESS_MS) {
-        gpStartHold[padIdx] = -1;
-        gpEdge(padIdx + ':b' + GP_START_BTN, KEYMAP.start, false);
-        var inFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
-        if (inFs) {
-          try { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch (e) {}
-          toast('Exited fullscreen');
-        } else {
-          openMobileMenu();
-        }
+      if (gpViewHold[padIdx] === undefined) { gpViewHold[padIdx] = now; }
+      else if (gpViewHold[padIdx] !== -1 && (now - gpViewHold[padIdx]) > GP_RELEASE_MS) {
+        gpViewHold[padIdx] = -1;
+        if (GP_SELECT_BTN >= 0) gpEdge(padIdx + ':b' + GP_SELECT_BTN, KEYMAP.select, false);
+        gpReleased = true;  // halts pollGamepads from re-arming
+        try { var ife = (document.fullscreenElement || document.webkitFullscreenElement); if (ife) (document.exitFullscreen || document.webkitExitFullscreen).call(document); } catch (e) {}
+        toast('Gamepad released — browser controls active');
+        pageLog('[gp] released by hold-View; reload page to re-enable game controls');
       }
-    } else { delete gpStartHold[padIdx]; }
+    } else { delete gpViewHold[padIdx]; }
   }
+  var gpReleased = false;
   // Diagnostic: ?gp or ?gpdebug shows every pressed button index in the status bar and log.
   var gpLastSnapshot = {};
   var gpLoggedInfo = {};
@@ -556,7 +558,7 @@
       var el = $('status'); if (el) el.textContent = 'gp' + i + ' btns=[' + snap + ']';
     }
   }
-  function pollGamepads() { var pads = (navigator.getGamepads && navigator.getGamepads()) || []; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; var btns = gp.buttons || []; gpDebugLog(i, gp); for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } gpLongPressStart(i, !!(btns[GP_START_BTN] && btns[GP_START_BTN].pressed)); var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); } requestAnimationFrame(pollGamepads); }
+  function pollGamepads() { if (gpReleased) { gpPolling = false; return; } var pads = (navigator.getGamepads && navigator.getGamepads()) || []; for (var i = 0; i < pads.length; i++) { var gp = pads[i]; if (!gp) continue; var btns = gp.buttons || []; gpDebugLog(i, gp); for (var b in GP_BUTTON_KEYS) { var bi = +b, key = GP_BUTTON_KEYS[b]; gpEdge(i + ':b' + bi, key, !!(btns[bi] && btns[bi].pressed)); } gpHoldViewToRelease(i, !!(btns[8] && btns[8].pressed)); var ax = gp.axes || []; var axX = ax[0] || 0, axY = ax[1] || 0; gpEdge(i + ':axL', KEYMAP.left, axX < -GP_AXIS_DEAD); gpEdge(i + ':axR', KEYMAP.right, axX > GP_AXIS_DEAD); gpEdge(i + ':axU', KEYMAP.up, axY < -GP_AXIS_DEAD); gpEdge(i + ':axD', KEYMAP.down, axY > GP_AXIS_DEAD); } requestAnimationFrame(pollGamepads); }
   window.addEventListener('gamepadconnected', function (e) { setStatus('Controller connected: ' + e.gamepad.id); if (!gpPolling) { gpPolling = true; requestAnimationFrame(pollGamepads); } }); window.addEventListener('gamepaddisconnected', function () { setStatus('Controller disconnected'); }); if (navigator.getGamepads) { gpPolling = true; requestAnimationFrame(pollGamepads); }
   function checkOrientation() { if (!isMobile) return; var landscape = window.innerWidth > window.innerHeight; var show = started && !landscape; $('rotateHint').style.display = show ? 'flex' : 'none'; }
   window.addEventListener('resize', checkOrientation); window.addEventListener('orientationchange', checkOrientation);

@@ -29,7 +29,7 @@ index ec28ab1..e116444 100644
 +	                 ${CMAKE_BINARY_DIR}/bementalJIT)
 +	target_sources(${PROJECT_NAME} PRIVATE
 +		${CMAKE_CURRENT_SOURCE_DIR}/../flycast-bridge/rec_wasm.cpp)
-+	target_link_libraries(${PROJECT_NAME} PRIVATE bementalJIT)
++	target_link_libraries(${PROJECT_NAME} PRIVATE bementalJIT bementalJITSh4)
 +endif()
 +
  if((USE_OPENGL OR USE_GLES2 OR USE_GLES) AND NOT LIBRETRO)
