@@ -184,7 +184,11 @@
   function toast(msg, isErr) { toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200); }
   const isMobile = (() => { const ua = navigator.userAgent.toLowerCase(); return /iphone|ipad|ipod|android|mobile|xbox/.test(ua) || ('ontouchstart' in window) || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile'); })();
   var do_iter = true;
-  var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/ps1/ps1Wasm/dist/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: $('canvas'), setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {} };
+  // keyboardListeningElement scopes SDL's keydown/keyup capture to the canvas only,
+  // so document-level events (including any system gestures Xbox Edge dispatches) aren't
+  // intercepted by SDL's preventDefault chain. n64.html doesn't register any document
+  // listeners and works fine on Xbox; this brings PS1 closer to that.
+  var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/ps1/ps1Wasm/dist/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: $('canvas'), keyboardListeningElement: $('canvas'), setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {} };
   var img_data32;
   window.my_SDL_LockSurface = function (surf) { var s = Module.SDL.surfaces[surf]; s.locked++; if (s.locked > 1) return 0; if (!s.buffer) { s.buffer = Module._malloc(s.width * s.height * 4); Module.HEAP32[(surf + 20) >> 2] = s.buffer; } Module.HEAP32[(surf + 20) >> 2] = s.buffer; if (!s.image) s.image = s.ctx.getImageData(0, 0, s.width, s.height); return 0; };
   window.my_SDL_UnlockSurface = function (surf) { var s = Module.SDL.surfaces[surf]; if (!s.locked || --s.locked > 0) return; var src = s.buffer >> 2; if (!img_data32) img_data32 = new Uint32Array(s.image.data.buffer); img_data32.set(Module.HEAP32.subarray(src, src + img_data32.length)); s.ctx.putImageData(s.image, 0, 0); };
