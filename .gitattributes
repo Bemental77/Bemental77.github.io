@@ -17,3 +17,8 @@ ps1/ps1Wasm/pcsx-wasm-src/*.wasm     filter= diff= merge= -text
 ps1/ps1Wasm/pcsx-wasm-src/*.bin      filter= diff= merge= -text
 ps1/ps1Wasm/pcsx-wasm-src/docs/*.wasm filter= diff= merge= -text
 *.bin.parta* filter=lfs diff=lfs merge=lfs -text
+
+# Same reason as above: the PS1 lazy-loader (ps1.html ?lazy) fetches these
+# chunks directly. GitHub Pages does not resolve LFS pointers, so they must
+# ship as real blobs even though they're large.
+ps1/ps1Wasm/roms/*.bin.parta* filter= diff= merge= -text
