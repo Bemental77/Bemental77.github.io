@@ -36,6 +36,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -128,6 +129,26 @@ public:
 	{
 		// Build a WASM module for this block via bementalJIT.
 		std::vector<u8> bytes = bemental::sh4::build_block(block);
+		// One-shot block-bytes hexdump for the 0x8c0133f4 memset-loop
+		// throughput investigation. Logged once via postMessage; the probe
+		// harness greps `[blockdump]` and decodes hex -> .wasm for wasm2wat.
+		static bool s_dumped_target = false;
+		if (!s_dumped_target && block->vaddr == 0x8c0133f4u) {
+			s_dumped_target = true;
+			std::string hex;
+			hex.reserve(bytes.size() * 2);
+			static const char* kHex = "0123456789abcdef";
+			for (u8 by : bytes) {
+				hex.push_back(kHex[by >> 4]);
+				hex.push_back(kHex[by & 0xF]);
+			}
+			MAIN_THREAD_EM_ASM({
+				var s = '[blockdump] vaddr=0x' + ($0>>>0).toString(16) +
+				        ' size=' + ($1|0) +
+				        ' hex=' + UTF8ToString($2);
+				postMessage({cmd:'print', txt: s});
+			}, (int)block->vaddr, (int)bytes.size(), hex.c_str());
+		}
 		const u32 vaddr = block->vaddr;
 		const u32 len   = (u32)bytes.size();
 
