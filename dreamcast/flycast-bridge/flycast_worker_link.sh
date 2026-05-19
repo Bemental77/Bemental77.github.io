@@ -60,7 +60,10 @@ EXPORTED_FUNCS='[
   "_sh4_interp_ifb",
   "_sh4_interp_shil_fb",
   "_flycast_diag_set",
-  "_flycast_diag_ifb"
+  "_flycast_diag_ifb",
+  "_flycast_set_interp_only",
+  "_flycast_interp_step_count",
+  "_flycast_set_pc_trace_until"
 ]'
 
 EXPORTED_RUNTIME='[

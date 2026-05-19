@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace bemental::sh4 {
@@ -1974,6 +1975,457 @@ static void emitMemsetFastPath(WasmModuleBuilder& b, RuntimeBlockInfo* block,
 }
 
 // ---------------------------------------------------------------------------
+// Outer-loop word-memcpy pattern detector + fast-path emitter (option D).
+//
+// Targets the PSO IPL VRAM-fill loop at 0x8c02ab54 (the "counter block"),
+// which is the BACK half of a two-block outer loop:
+//
+//   Block A at vaddr_A (e.g. 0x8c02ab4c):  (BET_DynamicCall)
+//     mov.l Rsrc_arg,Rsrc_callee     ; shop_mov32 rd=R5, rs1=Rsp(R15)
+//     mov   #N,Rcount                ; shop_mov32 rd=R6, rs1=imm N
+//     jsr   @Rcallee                 ; shop_jdyn rs1=Rcallee(R11)
+//     mov   Rdst_outer,Rdst_arg      ; shop_mov32 rd=R4, rs1=R14 (delay slot)
+//
+//   Block B at vaddr_B (e.g. 0x8c02ab54):  (BET_Cond_0)
+//     add   #1,Rcounter              ; shop_add rs2.imm=1
+//     cmp/ge Rlimit,Rcounter         ; shop_setge rs1=Rcounter, rs2=Rlimit
+//     bf/s  <vaddr_A>                ; BET_Cond_0, BranchBlock == vaddr_A
+//     add   #stride,Rdst_outer       ; shop_add rs2.imm=stride (delay slot)
+//
+//   Callee at @Rcallee: word-memcpy. First 4 bytes are fingerprinted as
+//   0x60564509 (shlr2 R6 ; mov.l @R5+,R0) at runtime. PSO IPL's word-memcpy
+//   at 0x8c02c15e matches; other memcpys with the same prologue also match.
+//
+// When all of the above hold AND the runtime fingerprint check passes, we
+// collapse `iters = Rlimit - Rcounter` outer iterations into a single tight
+// wasm loop that stores a 4-byte source word at `Rdst_outer, Rdst_outer+stride,
+// ..., Rdst_outer+(iters-1)*stride`. Updates Rcounter=Rlimit, Rdst_outer+=
+// iters*stride, T=1, PC=NextBlock, debits the cycle counter, and returns.
+//
+// Cited: STATUS_2026_05_18.md option D — would collapse the 8 MiB VRAM fill
+// from ~75 s wall to one wasm-loop execution. Detected at block B because
+// that's where ~95% of dispatches land during the wedge.
+// ---------------------------------------------------------------------------
+struct OuterMemcpyPattern {
+    bool detected      = false;
+    u32  counter_off   = 0;    // ctx offset of counter register (e.g. R13)
+    u32  limit_off     = 0;    // ctx offset of limit register   (e.g. R12)
+    u32  dst_off       = 0;    // ctx offset of outer dst pointer (e.g. R14)
+    u32  stride        = 0;    // stride per outer iter (from block B's delay-slot add imm)
+    u32  src_off       = 0;    // ctx offset of src pointer register set up in block A (e.g. R15)
+    u32  callee_off    = 0;    // ctx offset of callee address register (jdyn rs1, e.g. R11)
+    u32  vaddr_A       = 0;    // for sanity / next-PC computation
+};
+
+// bementalJIT installs blocks via its own jit_register table — flycast's
+// `bm_GetBlock(u32)` (which uses FPCA() in blockmanager.cpp) never gets
+// populated, so we can't use it for sibling-block lookup. Maintain a
+// parallel cache of "block A shape" data keyed by vaddr. Populated on every
+// compile call from inside detectOuterMemcpyLoop; consulted on the same call
+// when the current block looks like a block-B counter-and-bf candidate.
+struct BlockACache {
+    u32 callee_off;
+    u32 mov32_a_rs1_off;   // rs1.reg_offset() of one register-source mov32 in block A
+    u32 mov32_b_rs1_off;   // rs1.reg_offset() of the OTHER register-source mov32
+    // At block-B lookup, the mov32 whose rs1 == block_B->stride_add->rd is
+    // the dst-arg setup (`mov Rdst_outer, Rdst_arg`); the other is the src
+    // setup (`mov Rsrc_outer, Rsrc_arg`). p.src_off comes from the OTHER one.
+};
+static std::unordered_map<u32, BlockACache>& blockACache() {
+    static std::unordered_map<u32, BlockACache> m;
+    return m;
+}
+
+// Set of block-B vaddrs whose first-compile missed the block-A cache. Keyed
+// by the BLOCK A vaddr each one branches back to. When that block A finally
+// appears in the cache, we invalidate its pending block-Bs so they recompile
+// with the fast path on next dispatch.
+static std::unordered_map<u32, std::vector<u32>>& pendingBlockB() {
+    static std::unordered_map<u32, std::vector<u32>> m;
+    return m;
+}
+
+// Defined in dreamcast/flycast-bridge/rec_wasm.cpp.
+extern "C" void bemental_jit_invalidate(u32 vaddr);
+
+static OuterMemcpyPattern detectOuterMemcpyLoop(RuntimeBlockInfo* block) {
+    OuterMemcpyPattern p;
+    if (block == nullptr) return p;
+
+    // Diagnostic: log every compile call in the wedge region.
+    if (block->vaddr >= 0x8c02ab00u && block->vaddr <= 0x8c02ab80u) {
+        std::fprintf(stderr, "[optD-compile] vaddr=0x%08x ops=%zu BlockType=0x%x Branch=0x%08x Next=0x%08x\n",
+                     (unsigned)block->vaddr, block->oplist.size(),
+                     (unsigned)block->BlockType,
+                     (unsigned)block->BranchBlock, (unsigned)block->NextBlock);
+        for (size_t i = 0; i < block->oplist.size(); ++i) {
+            const auto& op = block->oplist[i];
+            std::fprintf(stderr, "[optD-compile]   op[%zu] shop=%d rd_imm=%d rs1_imm=%d rs2_imm=%d rs2._imm=%d\n",
+                         i, (int)op.op,
+                         op.rd.is_imm(), op.rs1.is_imm(), op.rs2.is_imm(),
+                         op.rs2.is_imm() ? (int)op.rs2._imm : 0);
+        }
+    }
+
+    // FIRST: opportunistically cache "block A shape" data for any block that
+    // ends in BET_DynamicCall and has the setup-mov32 + jdyn shape — so that
+    // when block B compiles later, its cache lookup succeeds.
+    if (block->BlockType == BET_DynamicCall
+        && block->oplist.size() >= 3 && block->oplist.size() <= 8) {
+        const shil_opcode* jdyn = nullptr;
+        const shil_opcode* mov32_a = nullptr;
+        const shil_opcode* mov32_b = nullptr;
+        for (const auto& op : block->oplist) {
+            if (op.op == shop_jdyn && op.rs1.is_r32i()) {
+                jdyn = &op;
+            } else if (op.op == shop_mov32 && op.rd.is_r32i() && op.rs1.is_r32i()) {
+                if (mov32_a == nullptr)      mov32_a = &op;
+                else if (mov32_b == nullptr) mov32_b = &op;
+            }
+        }
+        if (jdyn && mov32_a && mov32_b) {
+            BlockACache c;
+            c.callee_off      = jdyn->rs1.reg_offset();
+            c.mov32_a_rs1_off = mov32_a->rs1.reg_offset();
+            c.mov32_b_rs1_off = mov32_b->rs1.reg_offset();
+            blockACache()[block->vaddr] = c;
+
+            // Invalidate any block Bs that previously compiled with cache
+            // miss waiting on this block A. Their next dispatch will recompile
+            // with the fast path.
+            auto pit = pendingBlockB().find(block->vaddr);
+            if (pit != pendingBlockB().end()) {
+                for (u32 bb_vaddr : pit->second) {
+                    std::fprintf(stderr, "[optD-detect] block A cached at 0x%08x — invalidating pending block B at 0x%08x\n",
+                                 (unsigned)block->vaddr, (unsigned)bb_vaddr);
+                    bemental_jit_invalidate(bb_vaddr);
+                }
+                pendingBlockB().erase(pit);
+            }
+        }
+    }
+
+    // SECOND: try to detect block B (the counter-and-bf-back-to-A pattern).
+    if (BET_GET_CLS(block->BlockType) != BET_CLS_COND) return p;
+    if (block->BlockType != BET_Cond_0) return p;
+    if (block->BranchBlock == block->vaddr) return p;          // NOT a self-loop
+    if (block->BranchBlock == NullAddress) return p;
+    if (block->oplist.size() < 3 || block->oplist.size() > 8) return p;
+
+    // Temporary diagnostic — log every candidate block-B reaching this point
+    // so we can see which ones match vs miss. Keep narrow to avoid spam.
+    if (block->vaddr >= 0x8c02ab00u && block->vaddr <= 0x8c02ab80u) {
+        std::fprintf(stderr, "[optD-detect] block B candidate vaddr=0x%08x ops=%zu BlockType=0x%x Branch=0x%08x\n",
+                     (unsigned)block->vaddr, block->oplist.size(),
+                     (unsigned)block->BlockType, (unsigned)block->BranchBlock);
+        for (size_t i = 0; i < block->oplist.size(); ++i) {
+            const auto& op = block->oplist[i];
+            std::fprintf(stderr, "[optD-detect]   op[%zu] shop=%d rd_imm=%d rs1_imm=%d rs2_imm=%d rs2._imm=%d\n",
+                         i, (int)op.op,
+                         op.rd.is_imm(), op.rs1.is_imm(), op.rs2.is_imm(),
+                         op.rs2.is_imm() ? (int)op.rs2._imm : 0);
+        }
+    }
+
+    // Scan block B for: counter-add (rs2.imm==1, rd==rs1), stride-add (rs2.imm>=2, rd==rs1),
+    // and setge/setgt with rs1==counter's rd.
+    const shil_opcode* counter_add = nullptr;
+    const shil_opcode* stride_add  = nullptr;
+    const shil_opcode* cmp_op      = nullptr;
+    for (const auto& op : block->oplist) {
+        if (op.op == shop_add && op.rd.is_r32i() && op.rs1.is_r32i() && op.rs2.is_imm()
+            && op.rd.reg_offset() == op.rs1.reg_offset()) {
+            if (op.rs2._imm == 1 && counter_add == nullptr) {
+                counter_add = &op;
+            } else if (op.rs2._imm >= 2 && stride_add == nullptr) {
+                stride_add = &op;
+            }
+        }
+        if ((op.op == shop_setge || op.op == shop_setgt)
+            && op.rs1.is_r32i() && op.rs2.is_r32i()) {
+            cmp_op = &op;
+        }
+    }
+    if (!counter_add || !stride_add || !cmp_op) {
+        if (block->vaddr >= 0x8c02ab00u && block->vaddr <= 0x8c02ab80u) {
+            std::fprintf(stderr, "[optD-detect] vaddr=0x%08x SHIL-pattern miss: counter_add=%p stride_add=%p cmp_op=%p\n",
+                         (unsigned)block->vaddr, counter_add, stride_add, cmp_op);
+        }
+        return p;
+    }
+    if (cmp_op->rs1.reg_offset() != counter_add->rd.reg_offset()) {
+        if (block->vaddr >= 0x8c02ab00u && block->vaddr <= 0x8c02ab80u) {
+            std::fprintf(stderr, "[optD-detect] vaddr=0x%08x cmp.rs1!=counter.rd\n", (unsigned)block->vaddr);
+        }
+        return p;
+    }
+
+    // Lookup block A's cached shape data (populated above on prior compile).
+    // If block A hasn't been compiled yet, bail — block B will be re-compiled
+    // when it's re-emitted later (each cache miss recompile re-enters this
+    // detector). For PSO, block A IS compiled before block B in the boot
+    // flow, so the cache should be warm by block B's first emit.
+    auto cacheIt = blockACache().find(block->BranchBlock);
+    if (cacheIt == blockACache().end()) {
+        // Cache miss — record this block B as pending and bail. When block A
+        // is eventually compiled and cached, the populator above will
+        // invalidate this block B so its next dispatch recompiles with the
+        // fast path.
+        auto& vec = pendingBlockB()[block->BranchBlock];
+        bool already = false;
+        for (u32 v : vec) if (v == block->vaddr) { already = true; break; }
+        if (!already) vec.push_back(block->vaddr);
+        if (block->vaddr >= 0x8c02ab00u && block->vaddr <= 0x8c02ab80u) {
+            std::fprintf(stderr, "[optD-detect] vaddr=0x%08x cache miss for block A at 0x%08x — queued pending (cache size %zu)\n",
+                         (unsigned)block->vaddr, (unsigned)block->BranchBlock,
+                         blockACache().size());
+        }
+        return p;
+    }
+    const BlockACache& cA = cacheIt->second;
+
+    // Pick which of the two cached mov32 rs1 offsets is the src setup. The
+    // dst-arg setup's rs1 equals block B's stride register's rd. The OTHER
+    // mov32 is the src setup.
+    const u32 stride_reg_off = stride_add->rd.reg_offset();
+    u32 src_off_picked = 0;
+    if (cA.mov32_a_rs1_off == stride_reg_off) {
+        src_off_picked = cA.mov32_b_rs1_off;
+    } else if (cA.mov32_b_rs1_off == stride_reg_off) {
+        src_off_picked = cA.mov32_a_rs1_off;
+    } else {
+        if (block->vaddr >= 0x8c02ab00u && block->vaddr <= 0x8c02ab80u) {
+            std::fprintf(stderr, "[optD-detect] vaddr=0x%08x cached block A mov32s (a_rs1=%u b_rs1=%u) don't match stride reg %u\n",
+                         (unsigned)block->vaddr,
+                         (unsigned)cA.mov32_a_rs1_off,
+                         (unsigned)cA.mov32_b_rs1_off,
+                         (unsigned)stride_reg_off);
+        }
+        return p;
+    }
+
+    if (block->vaddr >= 0x8c02ab00u && block->vaddr <= 0x8c02ab80u) {
+        std::fprintf(stderr, "[optD-detect] vaddr=0x%08x MATCH! counter_off=%u limit_off=%u dst_off=%u stride=%u src_off=%u callee_off=%u\n",
+                     (unsigned)block->vaddr,
+                     (unsigned)counter_add->rd.reg_offset(),
+                     (unsigned)cmp_op->rs2.reg_offset(),
+                     (unsigned)stride_add->rd.reg_offset(),
+                     (unsigned)stride_add->rs2._imm,
+                     (unsigned)src_off_picked,
+                     (unsigned)cA.callee_off);
+    }
+
+    p.detected    = true;
+    p.counter_off = counter_add->rd.reg_offset();
+    p.limit_off   = cmp_op->rs2.reg_offset();
+    p.dst_off     = stride_add->rd.reg_offset();
+    p.stride      = (u32)stride_add->rs2._imm;
+    p.src_off     = src_off_picked;
+    p.callee_off  = cA.callee_off;
+    p.vaddr_A     = block->BranchBlock;
+    return p;
+}
+
+// Emits the outer-memcpy fast-path probe. Stack must be empty on entry.
+//
+// Runtime check tree (top-down):
+//   1. R_callee value masked to area-3? (RAM)
+//   2. First 4 bytes at @R_callee == 0x60564509 fingerprint?
+//   3. R_dst_outer masked to area-3 OR area-5 (system RAM or VRAM linear)?
+//   4. iters = R_limit - R_counter, > 0?
+//   5. R_src in area-3?  (PSO: R5=R15=sp, in area-3)
+// If all pass: load src_word once, tight wasm loop writing `iters` words to
+// `dst, dst+stride, ..., dst+(iters-1)*stride`. Updates counter/dst/T/PC/
+// CYCLE_COUNTER, returns ctx.pc.
+//
+// Otherwise control falls through with an empty stack to the regular block
+// emit. Same scheme as emitMemsetFastPath.
+static void emitOuterMemcpyFastPath(WasmModuleBuilder& b, RuntimeBlockInfo* block,
+                                    const OuterMemcpyPattern& p)
+{
+    constexpr u32 SH4_AREA_MASK = 0x1FFFFFFF;
+    constexpr u32 SH4_LO24_MASK = 0x00FFFFFF;
+    constexpr u32 SH4_VRAM_MASK = 0x007FFFFF;  // VRAM linear is 8 MiB
+    constexpr u32 MEMCPY_FP     = 0x60564509;  // shlr2 R6 ; mov.l @R5+,R0  (LE)
+
+    // ---- 1. Load R_callee and check area-3 ----
+    b.op_local_get(LOCAL_CTX);
+    b.op_i32_load(p.callee_off);
+    b.op_i32_const((s32)SH4_AREA_MASK);
+    b.op_i32_and();
+    b.op_local_tee(LOCAL_TMP);                 // TMP = callee_phys
+    b.op_i32_const(26);
+    b.op_i32_shr_u();
+    b.op_i32_const(3);
+    b.op_i32_eq();
+    b.op_if();
+
+    // ---- 2. Fingerprint check ----
+    b.op_local_get(LOCAL_RAM);
+    b.op_local_get(LOCAL_TMP);
+    b.op_i32_const((s32)SH4_LO24_MASK);
+    b.op_i32_and();
+    b.op_i32_add();
+    b.op_i32_load(0);
+    b.op_i32_const((s32)MEMCPY_FP);
+    b.op_i32_eq();
+    b.op_if();
+
+    // ---- 3. Load R_dst_outer; check area-3 or area-5 ----
+    b.op_local_get(LOCAL_CTX);
+    b.op_i32_load(p.dst_off);
+    b.op_local_tee(LOCAL_TMP);                 // TMP = dst (original)
+    b.op_i32_const((s32)SH4_AREA_MASK);
+    b.op_i32_and();
+    b.op_local_tee(LOCAL_TMP2);                // TMP2 = dst_phys (masked)
+    b.op_i32_const(26);
+    b.op_i32_shr_u();
+    b.op_local_tee(LOCAL_TMP3);                // TMP3 = dst_area
+    b.op_i32_const(3);
+    b.op_i32_eq();
+    b.op_local_get(LOCAL_TMP3);
+    b.op_i32_const(5);
+    b.op_i32_eq();
+    b.op_i32_or();
+    b.op_if();
+
+    // ---- 4. iters = limit - counter; iters > 0 ? ----
+    b.op_local_get(LOCAL_CTX);
+    b.op_i32_load(p.limit_off);
+    b.op_local_get(LOCAL_CTX);
+    b.op_i32_load(p.counter_off);
+    b.op_i32_sub();
+    b.op_local_tee(LOCAL_TMP4);                // TMP4 = iters
+    b.op_i32_const(0);
+    b.op_i32_gt_s();
+    b.op_if();
+
+    // ---- 5. R_src in area-3? Load src_word ----
+    b.op_local_get(LOCAL_CTX);
+    b.op_i32_load(p.src_off);
+    b.op_i32_const((s32)SH4_AREA_MASK);
+    b.op_i32_and();
+    b.op_local_tee(LOCAL_TMP);                 // TMP = src_phys (reused)
+    b.op_i32_const(26);
+    b.op_i32_shr_u();
+    b.op_i32_const(3);
+    b.op_i32_eq();
+    b.op_if();
+
+    // Read src word (LOCAL_RAM + (src_phys & LO24_MASK)) -> LOCAL_TMP5
+    b.op_local_get(LOCAL_RAM);
+    b.op_local_get(LOCAL_TMP);
+    b.op_i32_const((s32)SH4_LO24_MASK);
+    b.op_i32_and();
+    b.op_i32_add();
+    b.op_i32_load(0);
+    b.op_local_set(LOCAL_TMP5);                // TMP5 = src_word
+
+    // Compute dst_base in WASM linear memory.
+    //   area-3 (RAM):  base = LOCAL_RAM + (dst_phys & LO24_MASK)
+    //   area-5 (VRAM): base = g_vram_lin_base + (dst_phys & VRAM_MASK)
+    // After this block, LOCAL_TMP holds dst_base (the wasm address of the
+    // first store), and LOCAL_TMP3 still holds dst_area (3 or 5).
+    b.op_local_get(LOCAL_TMP3);
+    b.op_i32_const(3);
+    b.op_i32_eq();
+    b.op_if(WASM_TYPE_I32);
+        b.op_local_get(LOCAL_RAM);
+        b.op_local_get(LOCAL_TMP2);
+        b.op_i32_const((s32)SH4_LO24_MASK);
+        b.op_i32_and();
+        b.op_i32_add();
+    b.op_else();
+        // area-5: VRAM linear. g_vram_lin_base is captured at compile-time.
+        // If it's still 0 (bridge hasn't set it yet), the fast-path runtime
+        // arithmetic still produces a deterministic (wrong) address; the
+        // (g_vram_lin_base != 0) guard upstream in shop_writem suggests
+        // gating this branch the same way for safety.
+        b.op_i32_const((s32)g_vram_lin_base);
+        b.op_local_get(LOCAL_TMP2);
+        b.op_i32_const((s32)SH4_VRAM_MASK);
+        b.op_i32_and();
+        b.op_i32_add();
+    b.op_end();
+    b.op_local_set(LOCAL_TMP);                 // TMP = dst_base (wasm-mem)
+
+    // ---- Hot inner loop: for (i = 0; i < iters; i++) *(dst_base + i*stride) = src_word ----
+    // i kept in LOCAL_TMP3; iters in LOCAL_TMP4; dst_base in LOCAL_TMP; src_word in LOCAL_TMP5.
+    b.op_i32_const(0);
+    b.op_local_set(LOCAL_TMP3);                // i = 0
+    b.op_loop();
+        // *(dst_base + i*stride) = src_word
+        b.op_local_get(LOCAL_TMP);
+        b.op_local_get(LOCAL_TMP3);
+        b.op_i32_const((s32)p.stride);
+        b.op_i32_mul();
+        b.op_i32_add();
+        b.op_local_get(LOCAL_TMP5);
+        b.op_i32_store(0);
+        // i++
+        b.op_local_get(LOCAL_TMP3);
+        b.op_i32_const(1);
+        b.op_i32_add();
+        b.op_local_tee(LOCAL_TMP3);
+        // i < iters ? loop
+        b.op_local_get(LOCAL_TMP4);
+        b.op_i32_lt_s();
+        b.op_br_if(0);
+    b.op_end();
+
+    // ---- Update guest state to "loop exited" ----
+    // counter = limit
+    b.op_local_get(LOCAL_CTX);
+    b.op_local_get(LOCAL_CTX);
+    b.op_i32_load(p.limit_off);
+    b.op_i32_store(p.counter_off);
+
+    // dst_outer += iters * stride
+    b.op_local_get(LOCAL_CTX);
+    b.op_local_get(LOCAL_CTX);
+    b.op_i32_load(p.dst_off);
+    b.op_local_get(LOCAL_TMP4);
+    b.op_i32_const((s32)p.stride);
+    b.op_i32_mul();
+    b.op_i32_add();
+    b.op_i32_store(p.dst_off);
+
+    // SR.T = 1 (cmp/ge of equal endpoints sets T)
+    b.op_local_get(LOCAL_CTX);
+    b.op_i32_const(1);
+    b.op_i32_store(ctx_off::SR_T);
+
+    // PC = NextBlock (bf-not-taken arm — exit the loop)
+    b.op_local_get(LOCAL_CTX);
+    b.op_i32_const((s32)block->NextBlock);
+    b.op_i32_store(ctx_off::PC);
+
+    // Cycle drain: ~16 cycles per skipped outer iter. Conservative — the real
+    // outer iter is block A (~3 cycles) + callee (~5 cycles) + block B (~3),
+    // call it 16 to allow timer-event slack without over-draining.
+    b.op_local_get(LOCAL_CTX);
+    b.op_local_get(LOCAL_CTX);
+    b.op_i32_load(ctx_off::CYCLE_COUNTER);
+    b.op_local_get(LOCAL_TMP4);
+    b.op_i32_const(16);
+    b.op_i32_mul();
+    b.op_i32_sub();
+    b.op_i32_store(ctx_off::CYCLE_COUNTER);
+
+    // return ctx.pc
+    b.op_local_get(LOCAL_CTX);
+    b.op_i32_load(ctx_off::PC);
+    b.op_return();
+
+    b.op_end();   // R_src area-3
+    b.op_end();   // iters > 0
+    b.op_end();   // dst area 3 or 5
+    b.op_end();   // fingerprint match
+    b.op_end();   // R_callee area-3
+    // Fall-through: stack empty, normal block emit continues.
+}
+
+// ---------------------------------------------------------------------------
 // Internal: emit one block's function body INTO an existing builder.
 //
 // Called by build_block between b.beginCodeSection(1) and the matching
@@ -2047,6 +2499,15 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         const MemsetPattern mp = detectMemsetByteLoop(block);
         if (mp.detected) {
             emitMemsetFastPath(b, block, mp);
+        }
+
+        // Outer-loop word-memcpy fast path (option D). Mutually exclusive
+        // with the memset detector above — memset requires self-loop
+        // (BranchBlock == vaddr) and this requires cross-block
+        // (BranchBlock != vaddr), so at most one will fire.
+        const OuterMemcpyPattern omp = detectOuterMemcpyLoop(block);
+        if (omp.detected) {
+            emitOuterMemcpyFastPath(b, block, omp);
         }
 
         // Lazy mode: prologue is a no-op; first use lazy-loads from memory.

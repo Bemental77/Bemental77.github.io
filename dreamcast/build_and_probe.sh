@@ -24,6 +24,8 @@ SKIP_LINK=0
 DURATION=""
 IDLE=""
 KEEP_NOISE=""
+INTERP=""
+PCTRACE=""
 NAME=""
 PROBE_LOG=""
 JS_FLAGS=""
@@ -33,6 +35,8 @@ while [ $# -gt 0 ]; do
     --duration)               DURATION="$2"; shift 2 ;;
     --idle)                   IDLE="$2"; shift 2 ;;
     --keep-noise)             KEEP_NOISE="--keep-noise"; shift ;;
+    --interp)                 INTERP="--interp"; shift ;;
+    --pctrace)                PCTRACE="--pctrace $2"; shift 2 ;;
     --name)                   NAME="$2"; shift 2 ;;
     --log)                    PROBE_LOG="$2"; shift 2 ;;
     --js-flags)               JS_FLAGS="$2"; shift 2 ;;
@@ -75,7 +79,7 @@ fi
 # ---- probe ----
 echo "=== probe (log → $PROBE_LOG${DURATION:+, duration=$DURATION ms}${IDLE:+, idle=$IDLE ms}) ==="
 
-CMD="node $PROBE_JS --log $PROBE_LOG $KEEP_NOISE"
+CMD="node $PROBE_JS --log $PROBE_LOG $KEEP_NOISE $INTERP $PCTRACE"
 [ -n "$DURATION" ] && CMD="$CMD --duration $DURATION"
 [ -n "$IDLE" ]     && CMD="$CMD --idle $IDLE"
 

@@ -46,6 +46,8 @@ let AUTO_START = true;
 let IDLE_MS = parseInt(process.env.PROBE_IDLE_MS || '20000', 10);
 let KEEP_NOISE = false;
 let LOG_PATH = process.env.PROBE_LOG || '';
+let INTERP_ONLY = false;
+let PC_TRACE_UNTIL = 0;
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
   if (a === '--duration')   DURATION_MS = parseInt(process.argv[++i], 10);
@@ -53,8 +55,10 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === '--no-start') AUTO_START = false;
   else if (a === '--keep-noise') KEEP_NOISE = true;
   else if (a === '--log')   LOG_PATH = process.argv[++i];
+  else if (a === '--interp') INTERP_ONLY = true;
+  else if (a === '--pctrace') PC_TRACE_UNTIL = parseInt(process.argv[++i], 10) >>> 0;
   else if (a === '-h' || a === '--help') {
-    console.log('flycast_probe [--duration MS] [--idle MS] [--no-start] [--keep-noise] [--log PATH]');
+    console.log('flycast_probe [--duration MS] [--idle MS] [--no-start] [--keep-noise] [--log PATH] [--interp] [--pctrace N]');
     process.exit(0);
   }
 }
@@ -172,7 +176,10 @@ function classify(text) {
   });
 
   const start = Date.now();
-  await page.goto(`http://127.0.0.1:${PORT}/dreamcast.html?diag=1`, { waitUntil: 'domcontentloaded' });
+  const probeUrl = `http://127.0.0.1:${PORT}/dreamcast.html?diag=1`
+    + (INTERP_ONLY ? '&interp=1' : '')
+    + (PC_TRACE_UNTIL ? `&pctrace=${PC_TRACE_UNTIL}` : '');
+  await page.goto(probeUrl, { waitUntil: 'domcontentloaded' });
 
   // Poll loop: auto-click Start when worker-ready, exit on idle/fatal/duration.
   let clicked = !AUTO_START;

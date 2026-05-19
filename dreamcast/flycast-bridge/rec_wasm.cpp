@@ -183,6 +183,43 @@ static void jit_clear() {
     s_block_count = 0;
 }
 
+// Removes a single vaddr's block from BOTH bementalJIT's jit_register table
+// AND flycast's blkmap/FPCA, so the next dispatch re-enters compile() cleanly.
+// Used by bementalJIT's outer-memcpy detector (option D) to invalidate block B
+// once block A has been seen and cached: block B was originally compiled
+// before block A in PSO's boot flow, so its first emit didn't have block A's
+// shape data in cache. Forcing a full recompile lets the fast-path fire on
+// the next dispatch.
+//
+// Both tables must be cleared together — clearing only ours leaves flycast's
+// bm_AddBlock-time verify (`bm_GetCode == ngen_FailedToFindBlock`) tripping
+// on the next compile attempt for the same vaddr.
+extern "C" void bemental_jit_invalidate(u32 vaddr) {
+    if (vaddr == 0) return;
+
+    // 1. Clear bementalJIT's shadow table entry.
+    u32 h = jit_hash(vaddr);
+    for (u32 i = 0; i < JIT_PROBE_LIMIT; i++) {
+        u32 slot = (h + i) & JIT_TABLE_MASK;
+        if (s_block_pc[slot] == vaddr) {
+            s_block_pc[slot] = 0;
+            s_block_fn[slot] = nullptr;
+            if (s_block_count > 0) --s_block_count;
+            break;
+        }
+        if (s_block_pc[slot] == 0) break;   // empty slot — not in table
+    }
+
+    // 2. Discard from flycast's blkmap + FPCA so bm_AddBlock can re-register.
+    DynarecCodeEntryPtr cde = bm_GetCodeByVAddr(vaddr);
+    if (cde != ngen_FailedToFindBlock) {
+        RuntimeBlockInfoPtr blkPtr = bm_GetBlock((void*)cde);
+        if (blkPtr) {
+            bm_DiscardBlock(blkPtr.get());
+        }
+    }
+}
+
 // Forward decls — `seal_pending_shard` below references these; actual
 // definitions are further down in this file (g_diag_enabled at ~297,
 // g_cb_disp_count at ~312). Forward-declaring here keeps W7's shard manager
@@ -221,25 +258,21 @@ static constexpr u64 SHARD_DISPATCH_SEAL = 1000000;  // bumped from 100K — was
 static std::vector<RuntimeBlockInfo*> s_pending_shard;
 static u64 s_dispatches_at_last_seal = 0;
 
-// [direct-dispatch test] gate + body. Defined non-static so the trampoline's
-// extern declaration sees them and so emcc doesn't inline the body.
-bool s_direct_dispatch = []{
-    const char* e = std::getenv("FLYCAST_DIRECT_DISPATCH");
-    return e && e[0] != '0';
-}();
-__attribute__((noinline))
-u32 noop_direct_block(u32 ctx, u32 /*ram*/) {
-    // Return current PC unchanged; same effect as the no-op wasm block, but
-    // reached via a direct `call` opcode (no call_indirect machinery).
-    return *(u32*)(uintptr_t)(ctx + 0x148);  // ctx->pc offset
-}
-
+// [2026-05-19] Forcing shard ON validated the path engages (124 seals fired in 60s)
+// but reproduces the compile-churn problem the comment warned about — pre bucket
+// exploded to 23793 ns/disp, total dispatches dropped 13× vs baseline. Reverting
+// to original env-gated default OFF until the persistent vaddr→shard-fn registry
+// (or another seal-churn fix) lands. Note: env var FLYCAST_SHARD does NOT
+// propagate through emcc's getenv() to wasm runtime — fix that mechanism if
+// you want to use the env-gate path.
+// [2026-05-19] Forcing shard ON validated the path engages (124 seals fired in 60s)
+// but reproduces the compile-churn problem the comment warned about — pre bucket
+// exploded to 23793 ns/disp, total dispatches dropped 13× vs baseline. The
+// "persistent vaddr→shard-fn registry" fix attempted (kept the funcref in a map
+// across flycast cache flushes, short-circuited compile() on re-issue) DID NOT
+// HELP — 261K unique jit_register calls in 60s still happened, same regression.
+// Reverting to env-gated default OFF.
 static bool s_shard_enabled = []{
-    // Default OFF — current sharding causes 3× dispatch-cost regression due
-    // to compile-churn (every dispatch creates new RuntimeBlockInfo; jit_lookup
-    // dedup catches some but ~750 seals/30s still happen). Needs deeper fix:
-    // probably persistent vaddr→shard registry that survives flycast block-
-    // cache evictions, OR a hard-cap on total seals.
     const char* e = std::getenv("FLYCAST_SHARD");
     return e && e[0] != '0';
 }();
@@ -335,6 +368,23 @@ std::atomic<uint64_t> g_exc_count{0};
 EMSCRIPTEN_KEEPALIVE void flycast_diag_set(int on) { g_diag_enabled = !!on; }
 EMSCRIPTEN_KEEPALIVE uint64_t flycast_diag_ifb(void) { return g_ifb_count.load(); }
 
+// Interpreter-only mode. When set, wasm_block_trampoline bypasses the JIT path
+// entirely and routes every dispatch through Sh4Interpreter::Step() (one SH4
+// op per call). Empirical anchor: nasomers/flycast-wasm (NO_REC=1) ships at
+// 20–40 FPS on PSO with this exact path. Toggleable from JS via
+// _flycast_set_interp_only(0|1). Default OFF.
+volatile bool g_interp_only = false;
+std::atomic<uint64_t> g_interp_step_count{0};
+EMSCRIPTEN_KEEPALIVE void flycast_set_interp_only(int on) { g_interp_only = !!on; }
+EMSCRIPTEN_KEEPALIVE uint64_t flycast_interp_step_count(void) { return g_interp_step_count.load(); }
+
+// Dense PC-trace prefix. When non-zero, the PC sampler dumps every dispatch
+// (instead of the default every-1000 stride) for the first N dispatches. Used
+// to find the first JIT-vs-interp divergence point. Cost is ~100-400 µs/dump
+// (proxied postMessage); a value of 5000 adds ~1s probe overhead.
+volatile uint32_t g_pc_trace_until = 0;
+EMSCRIPTEN_KEEPALIVE void flycast_set_pc_trace_until(uint32_t n) { g_pc_trace_until = n; }
+
 // ---------------------------------------------------------------------------
 // Per-phase cost-breakdown counters. Populated by the mainloop + trampoline
 // when DEBUG_DISPATCH is on, dumped every 100K dispatches. Goal: split the
@@ -392,6 +442,21 @@ static void wasm_block_trampoline()
 #endif
     Sh4Context* ctx = &Sh4cntx;
     const u32 pc = ctx->pc;
+
+    // Interp-only short-circuit. Bypasses jit_lookup / compile / call_indirect
+    // entirely; advances PC by exactly one SH4 op via Sh4Interpreter::Step().
+    // Sh4Interpreter::Instance is wired in mainloop() at startup
+    // (Sh4Interpreter::Instance = Sh4Recompiler::Instance), so it is non-null
+    // by the time the trampoline is reachable.
+    if (g_interp_only) {
+        if (Sh4Interpreter::Instance) {
+            Sh4Interpreter::Instance->Step();
+            g_interp_step_count.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            ctx->pc = pc + 2;
+        }
+        return;
+    }
     // Area-3 RAM fast-path in bementalJIT/guests/sh4/wasm_emit.cpp uses
     // `LOCAL_RAM + (addr & 0x00FFFFFF)` as the linear-memory offset for guest
     // RAM reads/writes. LOCAL_RAM is param #1 of the compiled "run" export.
@@ -710,64 +775,6 @@ public:
 		// into a `call_indirect` against the SAME shared wasmTable — no
 		// JS hop at dispatch time.
 		std::vector<u8> bytes = bemental::sh4::build_block(block);
-		// [no-op-substitute test 2026-05-19] For vaddr=0x8c02ab4c, replace the
-		// generated function body with a minimal "return ctx.PC" body. The block
-		// then dispatches the same way (via call_indirect against the funcref)
-		// but with near-zero body cost. By comparing the tramp_total ns/disp
-		// between this build and the baseline, we split the `call` bucket into:
-		//   - V8 call_indirect dispatch overhead (~baseline_call - noop_call)
-		//   - SHIL block-body execution time (baseline_call - noop_call)
-		// PSO won't boot correctly with this patch — that's intended. The
-		// dispatcher will spin on the wedge forever, giving stable per-dispatch
-		// timing for the measurement.
-		if (vaddr == 0x8c02ab4cu) {
-			// Parse forward through sections to find the code section (id=0x0a).
-			size_t pos = 8;  // skip 4-byte magic + 4-byte version
-			while (pos < bytes.size()) {
-				u8 sec_id = bytes[pos];
-				if (sec_id == 0x0a) break;
-				pos++;  // past id
-				size_t sec_size = 0; int shift = 0;
-				while (pos < bytes.size()) {
-					u8 b = bytes[pos++];
-					sec_size |= (size_t)(b & 0x7f) << shift;
-					if (!(b & 0x80)) break;
-					shift += 7;
-				}
-				pos += sec_size;
-			}
-			if (pos < bytes.size()) {
-				bytes.resize(pos);
-				// Replace with minimal code section. Body = `local.get 0;
-				// i32.load offset=0x148; end` (returns ctx->PC unchanged).
-				// 0x148 is the PC offset in Sh4Context (confirmed via existing
-				// blockdump showing `28 02 c8 02` for PC load/store).
-				// WASM function body format:
-				//   body_size: varuint32
-				//   locals_vec: count:varuint32 + entries(count:varuint32, type:valtype)
-				//   expr: instructions ending with 0x0b
-				// Previous version emitted `02 00` for locals, which is "2 groups,
-				// first count=0 type=0x?" — invalid valtype, V8 silently rejected
-				// the module and the dispatcher fell through the miss path.
-				// Correct encoding for 0 locals: single byte `00`.
-				static const u8 noop_code_section[] = {
-					0x0a,                    // section ID: code
-					0x0a,                    // section payload size = 10
-					0x01,                    // 1 function body
-					0x08,                    // body size = 8 (locals + expr)
-					0x00,                    // locals_vec: 0 entries
-					0x20, 0x00,              // local.get 0 (ctx)
-					0x28, 0x02, 0xc8, 0x02,  // i32.load align=2 offset=0x148 (PC)
-					0x0b                     // end
-				};
-				bytes.insert(bytes.end(), noop_code_section,
-				             noop_code_section + sizeof(noop_code_section));
-				MAIN_THREAD_EM_ASM({
-					postMessage({cmd:'print', txt:
-						'[noop-substitute] vaddr=0x8c02ab4c replaced with no-op body, total_bytes=' + ($0|0)});
-				}, (int)bytes.size());
-			}
-		}
 		// One-shot block-bytes hexdump for the 0x8c0133f4 memset-loop
 		// throughput investigation. Logged once via postMessage; the
 		// probe harness greps `[blockdump]` and decodes hex -> .wasm.
@@ -862,7 +869,7 @@ public:
 		// real SH4 code or is zero-filled (i.e. 1ST_READ.BIN never landed).
 		static unsigned s_ram_blocks_dumped = 0;
 		if ((vaddr >> 28) == 0x8 && (vaddr & 0x0FF00000) >= 0x0C000000 &&
-		    s_ram_blocks_dumped < 8) {
+		    s_ram_blocks_dumped < 400) {
 			++s_ram_blocks_dumped;
 			u16 w0 = ReadMem16(vaddr + 0);
 			u16 w1 = ReadMem16(vaddr + 2);
@@ -1005,7 +1012,9 @@ public:
 				// of the dispatch budget. The 5s [stats] flush below is the
 				// production-friendly throughput indicator.
 				if (g_diag_enabled &&
-				    (s_dispatch_count < 20 || s_dispatch_count % 1000 == 0)) {
+				    (s_dispatch_count < 20 ||
+				     s_dispatch_count < g_pc_trace_until ||
+				     s_dispatch_count % 1000 == 0)) {
 					u32 pc_now = ctx->pc;
 					u32 r0 = ctx->r[0];
 					u32 r6 = ctx->r[6];

@@ -302,6 +302,30 @@
         break;
       }
 
+      case 'interp': {
+        try {
+          if (typeof Module._flycast_set_interp_only === 'function') {
+            Module._flycast_set_interp_only(data.on ? 1 : 0);
+            postMessage({ cmd: 'print', txt: '[flycast-shim] interp ' + (data.on ? 'ON' : 'OFF') });
+          }
+        } catch (err) {
+          postMessage({ cmd: 'print', txt: '[flycast-shim] interp threw: ' + (err && err.message ? err.message : String(err)) });
+        }
+        break;
+      }
+
+      case 'pctrace': {
+        try {
+          if (typeof Module._flycast_set_pc_trace_until === 'function') {
+            Module._flycast_set_pc_trace_until(data.n >>> 0);
+            postMessage({ cmd: 'print', txt: '[flycast-shim] pctrace until=' + (data.n >>> 0) });
+          }
+        } catch (err) {
+          postMessage({ cmd: 'print', txt: '[flycast-shim] pctrace threw: ' + (err && err.message ? err.message : String(err)) });
+        }
+        break;
+      }
+
       case 'saveState': {
         try {
           const ppOut  = Module._malloc(4);

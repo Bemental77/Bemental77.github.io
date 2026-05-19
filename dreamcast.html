@@ -132,6 +132,15 @@
         if (new URLSearchParams(location.search).has('diag')) {
           worker.postMessage({ cmd: 'diag', on: 1 });
         }
+        if (new URLSearchParams(location.search).has('interp')) {
+          worker.postMessage({ cmd: 'interp', on: 1 });
+        }
+        {
+          const pct = new URLSearchParams(location.search).get('pctrace');
+          if (pct !== null) {
+            worker.postMessage({ cmd: 'pctrace', n: parseInt(pct, 10) >>> 0 });
+          }
+        }
         workerReadyResolve();
         break;
       case 'runtime-ready':
