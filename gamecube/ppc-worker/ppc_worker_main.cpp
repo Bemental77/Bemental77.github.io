@@ -110,6 +110,43 @@ static BlockCache g_bcache;
 
 extern "C" {
 
+// Researcher B stack-corrupt sentinel — ppc-worker side stub.
+// JIT-emitted blocks call env.ppc_stack_corrupt which JS-shims to
+// Module._dolphin_stack_corrupt. In ppc-worker context (where the JIT runs),
+// "dolphin" doesn't actually exist — so this stub writes the (pc, ea, val,
+// width, r1) tuple to a SAB ring at 0x02700000 (γ-safe range, above all
+// documented sentinels, below dolphin's GLOBAL_BASE=256MB). Dolphin reads
+// the ring on its [jit-inner] heartbeat.
+//
+// Ring layout at SAB[0x02700000]:
+//   +0x00 = head (monotonic counter)
+//   +0x04 = stack_writes_seen (total stack-range stores observed)
+//   +0x08..+0xFFC = 255 entries × 16 bytes: (pc, ea, val, r1)
+//                   (width omitted to save space; w=1/2/4 inferrable
+//                   from caller analysis if needed)
+EMSCRIPTEN_KEEPALIVE
+void dolphin_stack_corrupt(u32 pc, u32 ea, u32 val, u32 width) {
+    (void)width;  // not stored; saves 4 bytes per slot
+    // Stack-range gate: 0x80300000..0x80400000 (per observed r1 in 0x803cxxxx).
+    if (ea < 0x80300000u || ea >= 0x80400000u) return;
+    // Read current r1 from ppc_state (g_ppc_state_base is the host pointer
+    // to PowerPCState; gpr[1] is at offset GPR_BASE+4 = 0x14 + 4 = 0x18).
+    const u32 r1 = g_ppc_state_base
+        ? *reinterpret_cast<volatile u32*>(g_ppc_state_base + 0x18u)
+        : 0u;
+    volatile u32* sHead  = reinterpret_cast<volatile u32*>(0x02700000u);
+    volatile u32* sTotal = reinterpret_cast<volatile u32*>(0x02700004u);
+    const u32 head = *sHead;
+    *sHead  = head + 1u;
+    *sTotal = *sTotal + 1u;
+    const u32 slot_addr = 0x02700008u + (head & 0xFFu) * 16u;
+    volatile u32* slot = reinterpret_cast<volatile u32*>(slot_addr);
+    slot[0] = pc;
+    slot[1] = ea;
+    slot[2] = val;
+    slot[3] = r1;
+}
+
 // init: wire up SAB pointers. Called once by the JS-side worker after
 // it receives the SAB references via postMessage.
 EMSCRIPTEN_KEEPALIVE

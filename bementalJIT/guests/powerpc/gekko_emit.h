@@ -45,7 +45,8 @@ enum WasmImportFunc : u32 {
     // env.ppc_read_tb stays in the JS shim as harmless dead code
     // until the next ppc_worker.js cleanup.
     WIMPORT_HLE_FIRE    = 10,  // (pc, idx_and_type) -> i32 — Item 5: ppc-worker wasm-native HLE hit path
-    WIMPORT_COUNT       = 11
+    WIMPORT_STACK_CORRUPT = 11, // (pc, ea, val, width) -> void — Researcher B: stack-store sentinel
+    WIMPORT_COUNT       = 12
 
 };
 

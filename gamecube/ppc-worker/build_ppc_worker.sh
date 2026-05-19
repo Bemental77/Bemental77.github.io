@@ -32,7 +32,7 @@ if [ ! -f "$BJIT_BUILD/libbementalJIT.a" ] || [ ! -f "$BJIT_BUILD/guests/powerpc
   emmake make -j4 bementalJIT bementalJITPowerPC > /tmp/bjit_build.log 2>&1
 fi
 
-EXPORTED_FUNCS='["_main","_malloc","_free","_ppc_worker_init","_ppc_worker_dispatch","_ppc_worker_shutdown","_ppc_worker_version","_ppc_worker_peek_u32","_ppc_worker_poke_u32","_ppc_worker_mailbox_post_demo","_ppc_worker_mailbox_call_sync","_ppc_worker_mailbox_call_sync2","_ppc_worker_mmio_read8","_ppc_worker_mmio_read16","_ppc_worker_mmio_read32","_ppc_worker_mmio_write8","_ppc_worker_mmio_write16","_ppc_worker_mmio_write32","_ppc_worker_compile_block","_ppc_worker_compile_buf_addr","_ppc_worker_compile_cycles","_ppc_worker_region_n_funcs","_ppc_worker_compile_and_accumulate","_ppc_worker_relink_region_if_due","_ppc_worker_region_generation","_ppc_worker_region_dispatch_pc","_ppc_worker_force_relink_all","_ppc_worker_ct_queue_init","_ppc_worker_ct_queue_count","_ppc_worker_ct_queue_ready","_ppc_worker_ct_fire_due_pure","_ppc_worker_ct_dolphin_pending_mask","_ppc_worker_ct_publish_event","_ppc_worker_ct_set_phase_flags","_ppc_worker_ct_get_phase_flags","_ppc_worker_ct_global_timer_lo","_ppc_worker_ct_global_timer_hi","_ppc_worker_advance_global_timer","_ppc_worker_set_downcount","_ppc_worker_slice_budget","_ppc_worker_commit_slice","_ppc_worker_set_perf_stub","_ppc_worker_set_hle_check_native","_ppc_worker_get_perf_stub","_ppc_worker_get_hle_check_native","_ppc_worker_run_slice"'
+EXPORTED_FUNCS='["_main","_malloc","_free","_dolphin_stack_corrupt","_ppc_worker_init","_ppc_worker_dispatch","_ppc_worker_shutdown","_ppc_worker_version","_ppc_worker_peek_u32","_ppc_worker_poke_u32","_ppc_worker_mailbox_post_demo","_ppc_worker_mailbox_call_sync","_ppc_worker_mailbox_call_sync2","_ppc_worker_mmio_read8","_ppc_worker_mmio_read16","_ppc_worker_mmio_read32","_ppc_worker_mmio_write8","_ppc_worker_mmio_write16","_ppc_worker_mmio_write32","_ppc_worker_compile_block","_ppc_worker_compile_buf_addr","_ppc_worker_compile_cycles","_ppc_worker_region_n_funcs","_ppc_worker_compile_and_accumulate","_ppc_worker_relink_region_if_due","_ppc_worker_region_generation","_ppc_worker_region_dispatch_pc","_ppc_worker_force_relink_all","_ppc_worker_ct_queue_init","_ppc_worker_ct_queue_count","_ppc_worker_ct_queue_ready","_ppc_worker_ct_fire_due_pure","_ppc_worker_ct_dolphin_pending_mask","_ppc_worker_ct_publish_event","_ppc_worker_ct_set_phase_flags","_ppc_worker_ct_get_phase_flags","_ppc_worker_ct_global_timer_lo","_ppc_worker_ct_global_timer_hi","_ppc_worker_advance_global_timer","_ppc_worker_set_downcount","_ppc_worker_slice_budget","_ppc_worker_commit_slice","_ppc_worker_set_perf_stub","_ppc_worker_set_hle_check_native","_ppc_worker_get_perf_stub","_ppc_worker_get_hle_check_native","_ppc_worker_run_slice"'
 if [ "$MICROBENCH" = 1 ]; then
   EXPORTED_FUNCS="${EXPORTED_FUNCS},\"_ppc_mb_init_fixture\",\"_ppc_mb_get_handle\",\"_ppc_mb_now_ms\",\"_ppc_mb_run_l0_empty_emasm\",\"_ppc_mb_run_l1_dispatch_raw\",\"_ppc_mb_run_l2_direct\""
 fi
@@ -64,6 +64,14 @@ emcc \
   -s ALLOW_MEMORY_GROWTH=1 \
   -s INITIAL_MEMORY=536870912 \
   -s MAXIMUM_MEMORY=4294967296 \
+  -s GLOBAL_BASE=134217728 \
+  `# γ-fix (2026-05-19): push ppc-worker's static-data + dlmalloc heap above` \
+  `# 128 MB so the diagnostic SAB region 0x026Bxxxx (~40 MB) isn't clobbered.` \
+  `# Without this asymmetry vs dolphin (which already has GLOBAL_BASE=256MB),` \
+  `# ppc-worker's heap squats on diagnostic addresses → JIT-emitted sentinel` \
+  `# writes to e.g. 0x026B0700 land in a live malloc allocation and get` \
+  `# overwritten by BlockCache inserts. SAB layout per sab_layout.h reserves` \
+  `# up to 0x026A0000; 128 MB starts well above all documented allocations.` \
   -s ALLOW_TABLE_GROWTH=1 \
   -s PTHREAD_POOL_SIZE=0 \
   -s "EXPORTED_FUNCTIONS=$EXPORTED_FUNCS" \

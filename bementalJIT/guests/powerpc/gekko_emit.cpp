@@ -531,6 +531,12 @@ static void emit_import_or_stub(EmitCtx& c, u32 import_idx) {
         case WIMPORT_BREAK_BLOCK:   // 1 arg, void
             c.b.op_drop();
             break;
+        case WIMPORT_STACK_CORRUPT: // 4 args, void
+            c.b.op_drop();
+            c.b.op_drop();
+            c.b.op_drop();
+            c.b.op_drop();
+            break;
         default:
             // Unknown import — emit the call anyway (shouldn't reach).
             c.b.op_call(import_idx);
@@ -903,6 +909,18 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
     emit_ea_d(c, ra, simm);
     c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
+
+    // [stack-corrupt] Researcher B sentinel: (pc, ea, val, width) -> void.
+    // Fires on EVERY store; dolphin gates on stack-range EA + val==0.
+    {
+        const u32 width = (import_idx == WIMPORT_WRITE32) ? 4u
+                        : (import_idx == WIMPORT_WRITE16) ? 2u : 1u;
+        c.b.op_i32_const((s32)c.pc);
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_gpr_get_impl(c, rs, g_ctx_ptr);
+        c.b.op_i32_const((s32)width);
+        emit_import_or_stub(c, WIMPORT_STACK_CORRUPT);
+    }
 
     auto emit_direct_store_post_with_addr_on_stack = [&]() {
         // Stack on entry: [host_addr]. Push value, bswap if needed, store.
@@ -3474,6 +3492,17 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
     c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
 
+    // [stack-corrupt] Researcher B sentinel (X-form variant).
+    {
+        const u32 width = (import_idx == WIMPORT_WRITE32) ? 4u
+                        : (import_idx == WIMPORT_WRITE16) ? 2u : 1u;
+        c.b.op_i32_const((s32)c.pc);
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_gpr_get_impl(c, rs, g_ctx_ptr);
+        c.b.op_i32_const((s32)width);
+        emit_import_or_stub(c, WIMPORT_STACK_CORRUPT);
+    }
+
     // PLANTER TRIPWIRE 1 (X-form EA-match).
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const((s32)0x802bafccu);
@@ -4540,7 +4569,7 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     //  type 2: (i32, i32) -> ()             — write8/write16/write32
     //  type 3: (i32, i32) -> ()             — interp(inst, pc), break_block(pc)
     //  (check_exc reuses type 1)
-    b.emitTypeSection(4);
+    b.emitTypeSection(5);
     {
         const u8 i32t[] = { WASM_TYPE_I32 };
         // type 0: () -> i32
@@ -4552,6 +4581,9 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
         b.emitFuncType(i32x2, 2, nullptr, 0);
         // type 3: (i32, i32) -> i32   (currently unused; reserved for future)
         b.emitFuncType(i32x2, 2, i32t, 1);
+        // type 4: (i32, i32, i32, i32) -> ()  — ppc_stack_corrupt
+        const u8 i32x4[] = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I32 };
+        b.emitFuncType(i32x4, 4, nullptr, 0);
     }
     b.endSection();
 
@@ -4577,6 +4609,8 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     // A5: ppc_read_tb dropped — mftb is direct from spr[].
     // Item 5: ppc_hle_fire — (pc, idx_and_type) -> i32 — type 3.
     b.emitImportFunc("env", "ppc_hle_fire",    /*type*/3);
+    // Researcher B stack-store sentinel — (pc, ea, val, width) -> void
+    b.emitImportFunc("env", "ppc_stack_corrupt", /*type*/4);
     b.endSection();
 
     // ---- Function section: 1 function of type 0 ----
@@ -4660,14 +4694,16 @@ std::vector<u8> build_region_module(const u8* concatenated_bodies,
     //  type 1: (i32) -> i32
     //  type 2: (i32, i32) -> ()
     //  type 3: (i32, i32) -> i32  (reserved)
-    b.emitTypeSection(4);
+    b.emitTypeSection(5);
     {
         const u8 i32t[]  = { WASM_TYPE_I32 };
         const u8 i32x2[] = { WASM_TYPE_I32, WASM_TYPE_I32 };
+        const u8 i32x4[] = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I32 };
         b.emitFuncType(nullptr, 0, i32t, 1);
         b.emitFuncType(i32t, 1, i32t, 1);
         b.emitFuncType(i32x2, 2, nullptr, 0);
         b.emitFuncType(i32x2, 2, i32t, 1);
+        b.emitFuncType(i32x4, 4, nullptr, 0);  // type 4: (i32x4) -> () — ppc_stack_corrupt
     }
     b.endSection();
 
@@ -4687,6 +4723,8 @@ std::vector<u8> build_region_module(const u8* concatenated_bodies,
     // A5: ppc_read_tb dropped — mftb is direct from spr[].
     // Item 5: ppc_hle_fire — (pc, idx_and_type) -> i32 — type 3.
     b.emitImportFunc("env", "ppc_hle_fire",    /*type*/3);
+    // Researcher B stack-store sentinel — (pc, ea, val, width) -> void
+    b.emitImportFunc("env", "ppc_stack_corrupt", /*type*/4);
     b.endSection();
 
     // ---- Function section: N entries, all type 0 ((), i32) ----
@@ -4781,14 +4819,16 @@ std::vector<u8> build_region_function(const BlockInputs* blocks,
     //   type 1: (i32) -> i32             — read*, check_exc, hle_check, read_tb
     //   type 2: (i32, i32) -> ()         — write*, interp, break_block
     //   type 3: (i32, i32) -> i32        — reserved
-    b.emitTypeSection(4);
+    b.emitTypeSection(5);
     {
         const u8 i32t[]  = { WASM_TYPE_I32 };
         const u8 i32x2[] = { WASM_TYPE_I32, WASM_TYPE_I32 };
+        const u8 i32x4[] = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I32 };
         b.emitFuncType(nullptr, 0, i32t, 1);
         b.emitFuncType(i32t, 1, i32t, 1);
         b.emitFuncType(i32x2, 2, nullptr, 0);
         b.emitFuncType(i32x2, 2, i32t, 1);
+        b.emitFuncType(i32x4, 4, nullptr, 0);  // type 4: (i32x4) -> () — ppc_stack_corrupt
     }
     b.endSection();
 
@@ -4808,6 +4848,8 @@ std::vector<u8> build_region_function(const BlockInputs* blocks,
     // A5: ppc_read_tb dropped — mftb is direct from spr[].
     // Item 5: ppc_hle_fire — (pc, idx_and_type) -> i32 — type 3.
     b.emitImportFunc("env", "ppc_hle_fire",    /*type*/3);
+    // Researcher B stack-store sentinel — (pc, ea, val, width) -> void
+    b.emitImportFunc("env", "ppc_stack_corrupt", /*type*/4);
     b.endSection();
 
     // ---- Function section: 1 region function of type 0 ----

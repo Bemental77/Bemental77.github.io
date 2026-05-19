@@ -160,6 +160,15 @@ int compile_raw(const u8* bytes, std::size_t size) {
                         // unused — module still declares the import).
                         if (Module._dolphin_hle_fire)
                             e.ppc_hle_fire = Module._dolphin_hle_fire;
+                        // Researcher B's stack-corrupt diagnostic. Direct-bind
+                        // if the export exists; without this, the env object
+                        // built on the pthread-side bootstrap drops the import
+                        // and wasm instantiation throws silently (caught at
+                        // try/catch below) → ALL JIT BLOCKS fall back to interp.
+                        // This is the root-cause class for any "I added a new
+                        // WIMPORT and nothing fires" failure.
+                        if (Module._dolphin_stack_corrupt)
+                            e.ppc_stack_corrupt = Module._dolphin_stack_corrupt;
                         // Keep ppc_interp as the JS wrapper (don't bypass).
                     }
                     const isWasm = (typeof WebAssembly.Function !== 'undefined')
@@ -867,6 +876,13 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
             if (memObj) env.memory = memObj;
             if (Module.bemental_imports && Module.bemental_imports.env) {
                 Object.assign(env, Module.bemental_imports.env);
+            }
+            // DIAG: print env keys to see if ppc_stack_corrupt is wired
+            {
+                const keys = Object.keys(env).join(',');
+                const has_sc = ('ppc_stack_corrupt' in env) ? 1 : 0;
+                const has_dsc = (typeof Module._dolphin_stack_corrupt === 'function') ? 1 : 0;
+                console.error('[region-env-diag] keys=[' + keys + '] has_sc=' + has_sc + ' has_dsc=' + has_dsc);
             }
             const inst = new WebAssembly.Instance(mod, { env: env });
 
