@@ -260,6 +260,13 @@ struct EmitCtx {
     bool merged_mode          = false;
     u32  br_to_loop_depth     = 0;
     u32  entry_sel_global_idx = 0;
+    // This body's own slot inside the merged region (the loop index `i` in
+    // build_region_function). Authoritative — baked into the br_table arm
+    // at module-build time. Used by emit_branch_resolution's merged path
+    // to bail out at runtime when entry_sel == self_local_idx, preventing
+    // the stale-pcMap self-loop documented in
+    // dolphin_merged_mode_selfslot_bug_2026_05_19.
+    u32  self_local_idx       = 0;
 
     // Tracks the depth of currently-open WASM block/loop/if constructs
     // emitted INSIDE this body since emit_body_into started. Bumped by

@@ -1107,6 +1107,24 @@ static void emit_branch_resolution(EmitCtx& c, u32 target_pc, const u32* local_i
             const u32 actual_depth = c.br_to_loop_depth + c.local_block_depth;
             c.b.op_i32_const((s32)*local_idx);
             c.b.op_global_set(c.entry_sel_global_idx);
+            // Runtime self-slot guard (2026-05-19). The compile-time
+            // try_resolve_target was passed a target_pc != start_pc, but the
+            // runtime pcMap may have aliased target_pc → start_pc's body
+            // slot. Without this check, br $L re-runs the loop body and
+            // re-selects the SAME body — infinite self-loop, invisible to
+            // host. self_local_idx is the loop-index `i` baked into the
+            // br_table arm at build time (authoritative — does NOT consult
+            // pcMap). See dolphin_merged_mode_selfslot_bug_2026_05_19.
+            c.b.op_global_get(c.entry_sel_global_idx);
+            c.b.op_i32_const((s32)c.self_local_idx);
+            c.b.op_i32_eq();
+            c.b.op_if(0x40);
+                // entry_sel == self → bail to host with target_pc.
+                // GPRs already flushed at line 1093; nothing to re-flush.
+                emit_set_pc(c, CTX, target_pc);
+                c.b.op_i32_const((s32)target_pc);
+                c.b.op_return();
+            c.b.op_end();
             c.b.op_br(actual_depth);
             return;
         }
@@ -4206,6 +4224,7 @@ struct MergedModeArgs {
     bool merged              = false;
     u32  br_to_loop_depth    = 0;
     u32  entry_sel_global_idx = 0;
+    u32  self_local_idx      = 0;  // this body's own slot; baked into the br_table arm at build time
 };
 
 static void emit_body_into(WasmModuleBuilder& b,
@@ -4301,6 +4320,7 @@ static void emit_body_into(WasmModuleBuilder& b,
     ctx.merged_mode            = merged.merged;
     ctx.br_to_loop_depth       = merged.br_to_loop_depth;
     ctx.entry_sel_global_idx   = merged.entry_sel_global_idx;
+    ctx.self_local_idx         = merged.self_local_idx;
     // Phase 3 — flip the B11 GPR-local cache on. Inside if/else (when
     // ctx.if_depth>0) the helpers fall back to direct memory access, so
     // partially-loaded locals can't escape the merge point. After every
@@ -4911,6 +4931,7 @@ std::vector<u8> build_region_function(const BlockInputs* blocks,
         m.merged              = true;
         m.br_to_loop_depth    = (n_blocks - 1u) - i;
         m.entry_sel_global_idx = 0u;
+        m.self_local_idx      = i;  // this body's own slot — authoritative
         emit_body_into(b,
                        bi.start_pc, bi.insts, bi.count,
                        bi.ctx_ptr_const,

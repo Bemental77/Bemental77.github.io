@@ -127,6 +127,12 @@ extern "C" {
 EMSCRIPTEN_KEEPALIVE
 void dolphin_stack_corrupt(u32 pc, u32 ea, u32 val, u32 width) {
     (void)width;  // not stored; saves 4 bytes per slot
+    // Unconditional call counter at 0x02700100. Incremented BEFORE the EA
+    // filter so dolphin-side [stack-canary] can discriminate "import never
+    // bound / never called" (callcnt=0) from "called many times but EA
+    // filter rejected all of them" (callcnt>>0, head=0).
+    volatile u32* sCallCnt = reinterpret_cast<volatile u32*>(0x02700100u);
+    *sCallCnt = *sCallCnt + 1u;
     // Stack-range gate: 0x80300000..0x80400000 (per observed r1 in 0x803cxxxx).
     if (ea < 0x80300000u || ea >= 0x80400000u) return;
     // Read current r1 from ppc_state (g_ppc_state_base is the host pointer
