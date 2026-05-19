@@ -42,6 +42,7 @@ EXPORTED_FUNCS='[
   "_malloc",
   "_free",
   "_emscripten_worker_init",
+  "_emscripten_create_gl_context",
   "_emscripten_load_disc",
   "_emscripten_run_iter",
   "_emscripten_reset",
@@ -57,7 +58,9 @@ EXPORTED_FUNCS='[
   "_sh4_mem_write16",
   "_sh4_mem_write32",
   "_sh4_interp_ifb",
-  "_sh4_interp_shil_fb"
+  "_sh4_interp_shil_fb",
+  "_flycast_diag_set",
+  "_flycast_diag_ifb"
 ]'
 
 EXPORTED_RUNTIME='[
@@ -73,7 +76,9 @@ EXPORTED_RUNTIME='[
   "FS_createDataFile",
   "FS_createPath",
   "callMain",
-  "stringToNewUTF8"
+  "stringToNewUTF8",
+  "GL",
+  "wasmTable"
 ]'
 
 # ---------------------------------------------------------------------------
@@ -127,11 +132,49 @@ ARCHIVES=(
 )
 
 # ---------------------------------------------------------------------------
+# Diagnostic gate. Two flags share the same env-var toggle:
+#   -DFLYCAST_BRIDGE_DIAG compiles in the per-memory-access [gdrom]/[lsb-trip]
+#     tracing in EmscriptenWorker.cpp. Drop the flag for release-style builds
+#     to collapse sh4_mem_read*/write* into zero-cost ReadMem*/WriteMem*
+#     wrappers (kills the runtime g_diag_enabled branch on every guest memory
+#     access).
+#   -DDEBUG_DISPATCH compiles in the per-dispatch instrumentation in
+#     rec_wasm.cpp::mainloop() (per-1000 PC sampler, PC ring buffer, region
+#     trap, one-shot instruction dumps, SPG diag counters, 5s [stats] flush,
+#     exception ring dump). Strips ~6 [stats]+sampler hot-path branches per
+#     dispatch when undefined.
+#
+#   FLYCAST_RELEASE=1 bash flycast_worker_link.sh   # no DIAG/DEBUG_DISPATCH, faster
+#   bash flycast_worker_link.sh                     # both ON (probe-friendly)
+# ---------------------------------------------------------------------------
+DIAG_FLAGS="-DFLYCAST_BRIDGE_DIAG -DDEBUG_DISPATCH"
+if [ -n "${FLYCAST_RELEASE:-}" ]; then
+  DIAG_FLAGS=""
+  echo "link: FLYCAST_RELEASE=1 — diagnostic trace OFF (no -DFLYCAST_BRIDGE_DIAG / -DDEBUG_DISPATCH)"
+else
+  echo "link: diagnostic trace ON (-DFLYCAST_BRIDGE_DIAG -DDEBUG_DISPATCH)"
+fi
+
+# ---------------------------------------------------------------------------
 # emcc link
+#
+# Real DC BIOS embed (DC - BIOS.bin) is intentionally NOT in the embed list
+# below. With it embedded, flycast loads it at boot and runs the real BIOS
+# bytes through our SH4 JIT; the JIT misexecutes during BIOS init, leaving
+# 0x8c000000-0x8c00DFFF largely zero (no SEGA license data, no syscall
+# jumptables). Without the embed, flycast falls back to its Reios HLE BIOS
+# which populates the same regions directly via host code and skips the
+# misexecuted BIOS path. Confirmed 2026-05-17 by comparing live RAM in
+# RedDream (working) vs our build (zeros) at PC wedges 0x8c0000e8,
+# 0x8c00cb34, 0x8c00ba8a. To re-enable real BIOS for diagnosis, add:
+#   --embed-file "$ROOT/dreamcast/bios/Dreamcast/DC - BIOS.bin@/bios/dc/dc_boot.bin" \
+# above the dc_flash.bin embed line.
 # ---------------------------------------------------------------------------
 emcc \
   $BRIDGE/EmscriptenWorker.cpp \
   $BRIDGE/flycast_stubs.cpp \
+  $BRIDGE/rec_wasm.cpp \
+  $DIAG_FLAGS \
   -I $SRC/core \
   -I $SRC/core/deps \
   -I $SRC/core/deps/nowide/include \
@@ -151,39 +194,61 @@ emcc \
   -I $SRC/core/deps/libzip/lib \
   -I $SRC/core/deps/libelf/include \
   -I $SRC/shell/libretro \
+  -I $ROOT/bementalJIT/guests/sh4 \
+  -I $ROOT/bementalJIT/include \
   "${ARCHIVES[@]}" \
   -O3 \
   -std=c++23 \
   -fno-strict-aliasing \
   -fomit-frame-pointer \
+  -fexceptions \
   -DNDEBUG \
   -D__LIBRETRO__ \
   -pthread \
-  -matomics -mbulk-memory \
+  -matomics -mbulk-memory -mtail-call \
   -sIMPORTED_MEMORY=1 \
   -sINITIAL_MEMORY=536870912 \
   -sMAXIMUM_MEMORY=4294967296 \
   -sALLOW_MEMORY_GROWTH=1 \
   -sALLOW_TABLE_GROWTH=1 \
-  -sPROXY_TO_PTHREAD=1 \
-  -sPTHREAD_POOL_SIZE=4 \
+  -sPTHREAD_POOL_SIZE=8 \
   -sASYNCIFY=1 \
+  -sASYNCIFY_REMOVE='["sh4_mem_read8","sh4_mem_read16","sh4_mem_read32","sh4_mem_write8","sh4_mem_write16","sh4_mem_write32","sh4_interp_ifb","sh4_interp_shil_fb"]' \
   -sUSE_WEBGL2=1 \
   -sFULL_ES3=1 \
+  -sMIN_WEBGL_VERSION=2 \
+  -sMAX_WEBGL_VERSION=2 \
+  -sOFFSCREENCANVAS_SUPPORT=1 \
   -sENVIRONMENT=worker \
   -sMODULARIZE=1 \
   -sEXPORT_NAME=flycastWorkerModule \
   -sEXIT_RUNTIME=0 \
-  -sASSERTIONS=1 \
   -sSTACK_SIZE=8388608 \
   -Wl,--allow-multiple-definition \
+  -Wl,-u,_emscripten_thread_crashed \
+  -Wl,-u,_emscripten_thread_free_data \
   -sEXPORTED_FUNCTIONS="$EXPORTED_FUNCS" \
   -sEXPORTED_RUNTIME_METHODS="$EXPORTED_RUNTIME" \
   --emit-symbol-map \
   -g2 \
-  --embed-file "$ROOT/dreamcast/bios/Dreamcast/DC - BIOS.bin@/bios/dc_bios.bin" \
-  --embed-file "$ROOT/dreamcast/bios/Dreamcast/DC - Flash.bin@/bios/dc_flash.bin" \
+  --embed-file "$ROOT/dreamcast/bios/Dreamcast/DC - Flash.bin@/bios/dc/dc_flash.bin" \
+  --embed-file "$ROOT/dreamcast/bios/Dreamcast/textures/MK-51193/.placeholder@/bios/dc/textures/MK-51193/.placeholder" \
+  --pre-js $BRIDGE/webgl2-compat.js \
+  --js-library $BRIDGE/gl_override.js \
   --post-js $BRIDGE/flycast_worker_funcs.js \
   -o $OUT/flycast_worker_emcc.js
 
 echo "linked: $OUT/flycast_worker_emcc.{js,wasm}"
+
+# ---------------------------------------------------------------------------
+# Post-build patch: Emscripten 3.1.67 has a bug in pthread_create's
+# transferredCanvasNames handling. The comment at the for-of loop site says
+# "transferredCanvasNames might be null (so we cannot do a for-of loop)" but
+# then immediately does the for-of loop anyway, throwing
+# "transferredCanvasNames is not iterable" on first run_iter. Insert the
+# missing null guard. If the upstream Emscripten ever fixes this, the sed
+# becomes a no-op (won't match) — safe.
+# ---------------------------------------------------------------------------
+sed -i '' 's|// Note that transferredCanvasNames might be null (so we cannot do a for-of loop)\.$|// Note that transferredCanvasNames might be null (so we cannot do a for-of loop).\
+  if (!transferredCanvasNames) transferredCanvasNames = [];  // PATCH: Emscripten 3.1.67 missing null guard|' "$OUT/flycast_worker_emcc.js"
+echo "patched: transferredCanvasNames null-guard"

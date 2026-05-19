@@ -127,6 +127,11 @@
       case 'ready':
         workerReady = true;
         pageLog('[page] worker ready');
+        // Send diag toggle AFTER worker is up — the early-queue path may
+        // drop pre-runtime messages depending on shim version.
+        if (new URLSearchParams(location.search).has('diag')) {
+          worker.postMessage({ cmd: 'diag', on: 1 });
+        }
         workerReadyResolve();
         break;
       case 'runtime-ready':
@@ -148,9 +153,23 @@
     }
   };
 
+  // Transfer canvas control to the worker. The pthread that runs Flycast's
+  // main() creates its own WebGL2 context on this OffscreenCanvas and paints
+  // directly into it. transferControlToOffscreen() can only be called once
+  // per canvas, and the page-side can no longer call getContext after — so
+  // the legacy SAB-blit paintFrame paths below become no-ops.
+  const offscreen = $('dc-canvas').transferControlToOffscreen();
   worker.postMessage({ cmd: 'mem-init', memory: sharedMemory,
                        fbOffset: FB_OFFSET, fbW: FB_W, fbH: FB_H,
-                       audioOffset: AUDIO_OFFSET, audioFrames: AUDIO_FRAMES });
+                       audioOffset: AUDIO_OFFSET, audioFrames: AUDIO_FRAMES,
+                       offscreen: offscreen },
+                     [offscreen]);
+
+  // Optional ?diag=1 URL param enables the SH4 per-1000-dispatch sampler +
+  // SPG/MMIO/exception trace. Toggle is sent in the 'ready' handler below
+  // (worker_init must finish first). Default off to keep the page console
+  // clean — at 380K disp/s the sampler overflows V8's console buffer and
+  // crashes the tab with "Aw, Snap! Error code 5".
 
   // ---------------------------------------------------------------------------
   // Audio worklet. Created on first user gesture (browser autoplay policy).
@@ -254,60 +273,14 @@
   $('btnLoad').addEventListener('click', () => pageLog('[page] loadState UI is a stub'));
 
   // ---------------------------------------------------------------------------
-  // Canvas + GL paint.
+  // Canvas paint — the OffscreenCanvas is now owned by the worker (transferred
+  // above). The page cannot call getContext on it anymore; the worker's GL
+  // context renders directly to the visible canvas. paintFrame /
+  // paintTransferable are kept as no-ops so the message dispatcher doesn't
+  // throw on legacy 'frame' / 'render' messages.
   // ---------------------------------------------------------------------------
-  const canvas = $('dc-canvas');
-  const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
-  let glTex = null, glProg = null, glVbo = null;
-  if (gl) initGL();
-  const ctx2d = gl ? null : canvas.getContext('2d');
-  const fbView = new Uint8Array(sharedMemory.buffer, FB_OFFSET, FB_BYTES);
-
-  function paintFrame() {
-    if (gl) blitGL(fbView);
-    else if (ctx2d) {
-      const img = new ImageData(new Uint8ClampedArray(fbView.slice().buffer), FB_W, FB_H);
-      ctx2d.putImageData(img, 0, 0);
-    }
-  }
-  function paintTransferable(d) {
-    if (!d || !d.pixels || !d.w || !d.h) return;
-    if (gl) blitGL(d.pixels, d.w, d.h);
-    else if (ctx2d) {
-      const img = new ImageData(new Uint8ClampedArray(d.pixels.buffer || d.pixels), d.w, d.h);
-      ctx2d.putImageData(img, 0, 0);
-    }
-  }
-  function initGL() {
-    glTex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, glTex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    const vs = 'attribute vec2 p; varying vec2 t; void main(){ t=vec2(p.x*0.5+0.5,1.0-(p.y*0.5+0.5)); gl_Position=vec4(p,0,1); }';
-    const fs = 'precision mediump float; varying vec2 t; uniform sampler2D s; void main(){ vec4 c=texture2D(s,t); gl_FragColor=vec4(c.b,c.g,c.r,1.0); }';
-    function sh(type, src) { const o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o); return o; }
-    glProg = gl.createProgram();
-    gl.attachShader(glProg, sh(gl.VERTEX_SHADER, vs));
-    gl.attachShader(glProg, sh(gl.FRAGMENT_SHADER, fs));
-    gl.linkProgram(glProg);
-    glVbo = gl.createBuffer();
-    gl.bindBuffer(gl.ARRAY_BUFFER, glVbo);
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-  }
-  function blitGL(bytes, w, h) {
-    w = w || FB_W; h = h || FB_H;
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.useProgram(glProg);
-    gl.bindTexture(gl.TEXTURE_2D, glTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, bytes);
-    gl.bindBuffer(gl.ARRAY_BUFFER, glVbo);
-    const loc = gl.getAttribLocation(glProg, 'p');
-    gl.enableVertexAttribArray(loc);
-    gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-  }
+  function paintFrame() {}
+  function paintTransferable(_d) {}
 
   // ---------------------------------------------------------------------------
   // Input. Keyboard maps to RETRO_DEVICE_ID_JOYPAD_*; gamepads passthrough.
@@ -342,8 +315,13 @@
     return bytes;
   }
 
+  let _frameTick = 0;
   function frameLoop() {
     if (booted) {
+      _frameTick++;
+      if (_frameTick < 5 || _frameTick % 600 === 0) {
+        pageLog('[page] frameLoop tick=' + _frameTick);
+      }
       const pad = packPad();
       worker.postMessage({ cmd: 'input', states: pad }, [pad.buffer]);
       worker.postMessage({ cmd: 'runFrame' });

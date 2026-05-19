@@ -73,6 +73,9 @@
           postMessage({ cmd: 'print', txt: '[flycast-shim] flycastWorkerModule global missing after importScripts' });
           return;
         }
+        // OffscreenCanvas was transferred from the page via mem-init.
+        // Stash it for the preRun hook to register with Emscripten's GL.
+        const transferredOffscreen = data.offscreen;
         const moduleArg = {
           wasmMemory: sharedMemory,
           locateFile: function (f) { return new URL(f, self.location.href).href; },
@@ -82,11 +85,29 @@
           print:       function (s) { postMessage({ cmd: 'print', txt: '[wasm.out] ' + s }); },
           printErr:    function (s) { postMessage({ cmd: 'print', txt: '[wasm.err] ' + s }); },
           onAbort: function (why) { postMessage({ cmd: 'print', txt: '[flycast-shim] ABORT: ' + why }); },
+          canvas: transferredOffscreen,
+          // Emscripten's pthread runtime iterates Module.transferredCanvasNames
+          // when spawning a pthread that needs the OffscreenCanvas transferred
+          // to it. With OFFSCREENCANVAS_SUPPORT=1 link flag, this MUST be an
+          // iterable (array) — undefined throws "transferredCanvasNames is not
+          // iterable" on every retro_run that touches pthread-side GL.
+          transferredCanvasNames: ['#canvas'],
         };
         flycastWorkerModule(moduleArg).then(
           function (mod) {
             // mod IS moduleArg post-mutation, with all _emscripten_* exports.
             self.Module = mod;
+            // Ensure transferredCanvasNames survives factory mutation.
+            if (!Array.isArray(mod.transferredCanvasNames)) {
+              mod.transferredCanvasNames = ['#canvas'];
+              postMessage({ cmd: 'print', txt: '[flycast-shim] re-attached transferredCanvasNames to Module' });
+            }
+            // Also stash on self.PThread if Emscripten set that up.
+            if (typeof self.PThread === 'object' && self.PThread) {
+              if (!Array.isArray(self.PThread.transferredCanvasNames)) {
+                self.PThread.transferredCanvasNames = ['#canvas'];
+              }
+            }
             onRuntimeInitialized();
           },
           function (err) {
@@ -137,6 +158,39 @@
       Module._emscripten_set_video_target(fbCfg.offset >>> 0, fbCfg.w | 0, fbCfg.h | 0);
       Module._emscripten_set_audio_ring(audioCfg.offset >>> 0, audioCfg.frames | 0);
       videoAudioWired = true;
+      // Register offscreen canvas into Module.GL — now safe (runtime up).
+      try {
+        if (Module.GL && Module.canvas) {
+          const entry = { offscreenCanvas: Module.canvas };
+          Module.GL.offscreenCanvases = Module.GL.offscreenCanvases || {};
+          Module.GL.offscreenCanvases['#canvas']     = entry;
+          Module.GL.offscreenCanvases['canvas']      = entry;
+          Module.GL.offscreenCanvases['#dc-canvas']  = entry;
+          postMessage({ cmd: 'print', txt: '[flycast-shim] registered offscreen in GL.offscreenCanvases' });
+        } else {
+          postMessage({ cmd: 'print', txt: '[flycast-shim] cannot register offscreen (GL=' + !!Module.GL + ' canvas=' + !!Module.canvas + ')' });
+        }
+      } catch (e) {
+        postMessage({ cmd: 'print', txt: '[flycast-shim] offscreen register threw: ' + (e && e.message ? e.message : String(e)) });
+      }
+      // Session build's main() just idles; explicit init required.
+      try {
+        if (typeof Module._emscripten_create_gl_context === 'function') {
+          const handle = Module._emscripten_create_gl_context();
+          postMessage({ cmd: 'print', txt: '[flycast-shim] create_gl_context returned ' + handle });
+        }
+      } catch (e) {
+        postMessage({ cmd: 'print', txt: '[flycast-shim] create_gl_context threw: ' + (e && e.message ? e.message : String(e)) });
+      }
+      try {
+        if (typeof Module._emscripten_worker_init === 'function') {
+          Module._emscripten_worker_init();
+          postMessage({ cmd: 'print', txt: '[flycast-shim] worker_init returned' });
+        }
+      } catch (e) {
+        postMessage({ cmd: 'print', txt: '[flycast-shim] worker_init threw: ' + (e && e.message ? e.message : String(e)) });
+      }
+      coreReady = true;
       maybePostReady();
     } catch (err) {
       postMessage({ cmd: 'print', txt: '[flycast-shim] runtime-init threw: ' + (err && err.message ? err.message : String(err)) });
@@ -232,6 +286,18 @@
           postMessage({ cmd: 'print', txt: '[flycast-shim] reset done' });
         } catch (err) {
           postMessage({ cmd: 'print', txt: '[flycast-shim] reset threw: ' + (err && err.message ? err.message : String(err)) });
+        }
+        break;
+      }
+
+      case 'diag': {
+        try {
+          if (typeof Module._flycast_diag_set === 'function') {
+            Module._flycast_diag_set(data.on ? 1 : 0);
+            postMessage({ cmd: 'print', txt: '[flycast-shim] diag ' + (data.on ? 'ON' : 'OFF') });
+          }
+        } catch (err) {
+          postMessage({ cmd: 'print', txt: '[flycast-shim] diag threw: ' + (err && err.message ? err.message : String(err)) });
         }
         break;
       }
