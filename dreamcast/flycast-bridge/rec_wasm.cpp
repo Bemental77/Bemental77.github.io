@@ -183,43 +183,6 @@ static void jit_clear() {
     s_block_count = 0;
 }
 
-// Removes a single vaddr's block from BOTH bementalJIT's jit_register table
-// AND flycast's blkmap/FPCA, so the next dispatch re-enters compile() cleanly.
-// Used by bementalJIT's outer-memcpy detector (option D) to invalidate block B
-// once block A has been seen and cached: block B was originally compiled
-// before block A in PSO's boot flow, so its first emit didn't have block A's
-// shape data in cache. Forcing a full recompile lets the fast-path fire on
-// the next dispatch.
-//
-// Both tables must be cleared together — clearing only ours leaves flycast's
-// bm_AddBlock-time verify (`bm_GetCode == ngen_FailedToFindBlock`) tripping
-// on the next compile attempt for the same vaddr.
-extern "C" void bemental_jit_invalidate(u32 vaddr) {
-    if (vaddr == 0) return;
-
-    // 1. Clear bementalJIT's shadow table entry.
-    u32 h = jit_hash(vaddr);
-    for (u32 i = 0; i < JIT_PROBE_LIMIT; i++) {
-        u32 slot = (h + i) & JIT_TABLE_MASK;
-        if (s_block_pc[slot] == vaddr) {
-            s_block_pc[slot] = 0;
-            s_block_fn[slot] = nullptr;
-            if (s_block_count > 0) --s_block_count;
-            break;
-        }
-        if (s_block_pc[slot] == 0) break;   // empty slot — not in table
-    }
-
-    // 2. Discard from flycast's blkmap + FPCA so bm_AddBlock can re-register.
-    DynarecCodeEntryPtr cde = bm_GetCodeByVAddr(vaddr);
-    if (cde != ngen_FailedToFindBlock) {
-        RuntimeBlockInfoPtr blkPtr = bm_GetBlock((void*)cde);
-        if (blkPtr) {
-            bm_DiscardBlock(blkPtr.get());
-        }
-    }
-}
-
 // Forward decls — `seal_pending_shard` below references these; actual
 // definitions are further down in this file (g_diag_enabled at ~297,
 // g_cb_disp_count at ~312). Forward-declaring here keeps W7's shard manager
