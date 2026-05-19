@@ -221,6 +221,19 @@ static constexpr u64 SHARD_DISPATCH_SEAL = 1000000;  // bumped from 100K — was
 static std::vector<RuntimeBlockInfo*> s_pending_shard;
 static u64 s_dispatches_at_last_seal = 0;
 
+// [direct-dispatch test] gate + body. Defined non-static so the trampoline's
+// extern declaration sees them and so emcc doesn't inline the body.
+bool s_direct_dispatch = []{
+    const char* e = std::getenv("FLYCAST_DIRECT_DISPATCH");
+    return e && e[0] != '0';
+}();
+__attribute__((noinline))
+u32 noop_direct_block(u32 ctx, u32 /*ram*/) {
+    // Return current PC unchanged; same effect as the no-op wasm block, but
+    // reached via a direct `call` opcode (no call_indirect machinery).
+    return *(u32*)(uintptr_t)(ctx + 0x148);  // ctx->pc offset
+}
+
 static bool s_shard_enabled = []{
     // Default OFF — current sharding causes 3× dispatch-cost regression due
     // to compile-churn (every dispatch creates new RuntimeBlockInfo; jit_lookup
@@ -341,6 +354,7 @@ std::atomic<uint64_t> g_cb_tramp_post_ns{0};     // PC writeback after EM_JS ret
 std::atomic<uint64_t> g_cb_drain_ns{0};          // wrapper-gap: diag samplers + ring writes between ++dispatch and trampoline
 std::atomic<uint64_t> g_cb_spg_ns{0};            // wrapper-gap: cycle_counter <= 0 branch (cycle refill + SPG raise + INTC pump)
 std::atomic<uint64_t> g_cb_stats_ns{0};          // wrapper-gap: wall-time-gated [stats] flush block
+std::atomic<uint64_t> g_cb_outer_ns{0};          // FULL inner-while iteration top-to-bottom — diagnoses the unaccounted ~51% wall gap
 std::atomic<uint64_t> g_cb_mem_read_calls{0};    // sh4_mem_read* import hits
 std::atomic<uint64_t> g_cb_mem_write_calls{0};   // sh4_mem_write* import hits
 }
@@ -623,28 +637,12 @@ public:
 
 	void compile(RuntimeBlockInfo* block, bool /*smc_checks*/, bool /*optimise*/) override
 	{
-		// Build a WASM module for this block via bementalJIT.
-		std::vector<u8> bytes = bemental::sh4::build_block(block);
-		// One-shot block-bytes hexdump for the 0x8c0133f4 memset-loop
-		// throughput investigation. Logged once via postMessage; the probe
-		// harness greps `[blockdump]` and decodes hex -> .wasm for wasm2wat.
-		static bool s_dumped_target = false;
-		if (!s_dumped_target && block->vaddr == 0x8c0133f4u) {
-			s_dumped_target = true;
-			std::string hex;
-			hex.reserve(bytes.size() * 2);
-			static const char* kHex = "0123456789abcdef";
-			for (u8 by : bytes) {
-				hex.push_back(kHex[by >> 4]);
-				hex.push_back(kHex[by & 0xF]);
-			}
-			MAIN_THREAD_EM_ASM({
-				var s = '[blockdump] vaddr=0x' + ($0>>>0).toString(16) +
-				        ' size=' + ($1|0) +
-				        ' hex=' + UTF8ToString($2);
-				postMessage({cmd:'print', txt: s});
-			}, (int)block->vaddr, (int)bytes.size(), hex.c_str());
-		}
+		// Earlier-style 0x8c0133f4 diag dump that lived here was DUPLICATING the
+		// build_block() call done below at the per-block install site (line ~715),
+		// and the duplicate decl of `bytes` triggered a -Wshadow / redefinition
+		// merge collision. The line 715 install path already has a unified diag
+		// dump covering 0x8c0133f4, 0x8c02ab4c, 0x8c02c160, 0x8c01a494. Kept here
+		// as a placeholder so block-numbers in commit-history grep stay aligned.
 		const u32 vaddr = block->vaddr;
 
 		// F1 — Sharded install path. When FLYCAST_SHARD=1, push this
@@ -712,6 +710,64 @@ public:
 		// into a `call_indirect` against the SAME shared wasmTable — no
 		// JS hop at dispatch time.
 		std::vector<u8> bytes = bemental::sh4::build_block(block);
+		// [no-op-substitute test 2026-05-19] For vaddr=0x8c02ab4c, replace the
+		// generated function body with a minimal "return ctx.PC" body. The block
+		// then dispatches the same way (via call_indirect against the funcref)
+		// but with near-zero body cost. By comparing the tramp_total ns/disp
+		// between this build and the baseline, we split the `call` bucket into:
+		//   - V8 call_indirect dispatch overhead (~baseline_call - noop_call)
+		//   - SHIL block-body execution time (baseline_call - noop_call)
+		// PSO won't boot correctly with this patch — that's intended. The
+		// dispatcher will spin on the wedge forever, giving stable per-dispatch
+		// timing for the measurement.
+		if (vaddr == 0x8c02ab4cu) {
+			// Parse forward through sections to find the code section (id=0x0a).
+			size_t pos = 8;  // skip 4-byte magic + 4-byte version
+			while (pos < bytes.size()) {
+				u8 sec_id = bytes[pos];
+				if (sec_id == 0x0a) break;
+				pos++;  // past id
+				size_t sec_size = 0; int shift = 0;
+				while (pos < bytes.size()) {
+					u8 b = bytes[pos++];
+					sec_size |= (size_t)(b & 0x7f) << shift;
+					if (!(b & 0x80)) break;
+					shift += 7;
+				}
+				pos += sec_size;
+			}
+			if (pos < bytes.size()) {
+				bytes.resize(pos);
+				// Replace with minimal code section. Body = `local.get 0;
+				// i32.load offset=0x148; end` (returns ctx->PC unchanged).
+				// 0x148 is the PC offset in Sh4Context (confirmed via existing
+				// blockdump showing `28 02 c8 02` for PC load/store).
+				// WASM function body format:
+				//   body_size: varuint32
+				//   locals_vec: count:varuint32 + entries(count:varuint32, type:valtype)
+				//   expr: instructions ending with 0x0b
+				// Previous version emitted `02 00` for locals, which is "2 groups,
+				// first count=0 type=0x?" — invalid valtype, V8 silently rejected
+				// the module and the dispatcher fell through the miss path.
+				// Correct encoding for 0 locals: single byte `00`.
+				static const u8 noop_code_section[] = {
+					0x0a,                    // section ID: code
+					0x0a,                    // section payload size = 10
+					0x01,                    // 1 function body
+					0x08,                    // body size = 8 (locals + expr)
+					0x00,                    // locals_vec: 0 entries
+					0x20, 0x00,              // local.get 0 (ctx)
+					0x28, 0x02, 0xc8, 0x02,  // i32.load align=2 offset=0x148 (PC)
+					0x0b                     // end
+				};
+				bytes.insert(bytes.end(), noop_code_section,
+				             noop_code_section + sizeof(noop_code_section));
+				MAIN_THREAD_EM_ASM({
+					postMessage({cmd:'print', txt:
+						'[noop-substitute] vaddr=0x8c02ab4c replaced with no-op body, total_bytes=' + ($0|0)});
+				}, (int)bytes.size());
+			}
+		}
 		// One-shot block-bytes hexdump for the 0x8c0133f4 memset-loop
 		// throughput investigation. Logged once via postMessage; the
 		// probe harness greps `[blockdump]` and decodes hex -> .wasm.
@@ -934,6 +990,10 @@ public:
 				while (ctx->CpuRunning) {
 				++s_dispatch_count;
 #ifdef DEBUG_DISPATCH
+				// Outer-loop timer — captures the FULL inner-while iteration body so we
+				// can compute (outer - drain - tramp - spg - stats) = the unaccounted gap.
+				// Measurement-grounded research 2026-05-18 found ~51% of wall in the gap.
+				const double tOuterStart = emscripten_get_now();
 				const double tA = emscripten_get_now();
 				// Sample PC at startup + every 1k dispatches. When stuck at
 				// the known BIOS polling PC, also dump R3 and the polled
@@ -1209,12 +1269,19 @@ public:
 						const int drain_avg = (int)(g_cb_drain_ns.load(std::memory_order_relaxed) / n);
 						const int spg_avg   = (int)(g_cb_spg_ns.load  (std::memory_order_relaxed) / n);
 						const int stats_avg = (int)(g_cb_stats_ns.load(std::memory_order_relaxed) / n);
+						const int outer_avg = (int)(g_cb_outer_ns.load(std::memory_order_relaxed) / n);
+						// gap = outer - all-instrumented. If positive, time
+						// is being spent OUTSIDE the named buckets (cost
+						// research 2026-05-18: ~51% unaccounted).
+						const int gap_avg   = outer_avg - tot_avg - drain_avg - spg_avg - stats_avg;
 						MAIN_THREAD_EM_ASM({
 							postMessage({cmd:'print', txt:
 								'[cost-breakdown]   drain=' + ($0|0) +
 								' spg=' + ($1|0) +
-								' stats=' + ($2|0)});
-						}, drain_avg, spg_avg, stats_avg);
+								' stats=' + ($2|0) +
+								' outer=' + ($3|0) +
+								' gap=' + ($4|0)});
+						}, drain_avg, spg_avg, stats_avg, outer_avg, gap_avg);
 						MAIN_THREAD_EM_ASM({
 							postMessage({cmd:'print', txt:
 								'[cost-breakdown]   mem_reads=' + ($0|0) +
@@ -1510,9 +1577,11 @@ public:
 				}
 			}
 				const double tE = emscripten_get_now();
+				const double tOuterEnd = emscripten_get_now();
 				g_cb_drain_ns.fetch_add((uint64_t)((tB       - tA      ) * 1e6), std::memory_order_relaxed);
 				g_cb_spg_ns.fetch_add  ((uint64_t)((tD_inner - tC      ) * 1e6), std::memory_order_relaxed);
 				g_cb_stats_ns.fetch_add((uint64_t)((tE       - tD_inner) * 1e6), std::memory_order_relaxed);
+				g_cb_outer_ns.fetch_add((uint64_t)((tOuterEnd - tOuterStart) * 1e6), std::memory_order_relaxed);
 #endif // DEBUG_DISPATCH
 				}    // end inner while (hoisted try-frame, lever #1)
 			} catch (const SH4ThrownException& ex) {

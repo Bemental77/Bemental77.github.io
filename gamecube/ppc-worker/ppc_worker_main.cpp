@@ -1109,6 +1109,117 @@ void ppc_worker_run_slice(u32 max_iters, u32 wall_deadline_ms, u32 flags) {
 
 }  // extern "C"
 
+// ---------------------------------------------------------------------------
+// Microbench harness — gated by PPC_WORKER_MICROBENCH so production builds
+// are bit-identical without the flag. Implements native-speed-gap-test
+// from gamecube/docs/native-speed-gap-test/TASKS.md.
+//
+// Three layers measured against one fixture block (15× addi r3,r3,1 ; blr):
+//   L0  empty EM_ASM_INT loop — floor of any C→JS crossing.
+//   L1  dispatch_raw(handle) — production single-block path (EM_ASM-wrapped
+//       wasmTable.get($0)() — see bementalJIT/src/block_cache.cpp:206-252).
+//   L2  C-direct call via fn-ptr cast on the same wasmTable index. The wasm
+//       toolchain lowers a call through a fn-ptr to `call_indirect
+//       __indirect_function_table` (verify post-build with wasm-objdump).
+//       No JS hop, no try/catch sentinel. Any trap unwinds the pthread.
+//
+// L1 vs L0 = EM_ASM transition cost (independent of body).
+// L2 vs L1 = cost of the JS trap-catch wrap at line 215.
+// L2 = achievable in-C dispatch ceiling on the EXISTING wasmTable path.
+// ---------------------------------------------------------------------------
+#ifdef PPC_WORKER_MICROBENCH
+
+#include <emscripten.h>
+#include <atomic>
+
+extern "C" {
+
+static std::atomic<int> s_mb_handle{-1};
+static constexpr u32 MB_FIXTURE_PC = 0x10000000u;
+static constexpr u32 MB_FIXTURE_INSTR_COUNT = 16u;
+
+// Pure-register Gekko block: 15× `addi r3, r3, 1` (0x38630001) + `blr` (0x4E800020).
+// emit_perf_stub=true stubs every WIMPORT_* call site (drop+const-0); emit_hle_check
+// =false skips the prologue check. Block body touches ctx[r3] via i32.load/store
+// and ctx[LR] via final blr. No env.ppc_* round-trips.
+EMSCRIPTEN_KEEPALIVE
+int ppc_mb_init_fixture(void) {
+    if (s_mb_handle.load(std::memory_order_acquire) >= 0)
+        return s_mb_handle.load(std::memory_order_acquire);
+    static const u32 insts[MB_FIXTURE_INSTR_COUNT] = {
+        0x38630001u, 0x38630001u, 0x38630001u, 0x38630001u,
+        0x38630001u, 0x38630001u, 0x38630001u, 0x38630001u,
+        0x38630001u, 0x38630001u, 0x38630001u, 0x38630001u,
+        0x38630001u, 0x38630001u, 0x38630001u,
+        0x4E800020u,
+    };
+    auto bytes = bemental::powerpc::build_block(
+        MB_FIXTURE_PC, insts, MB_FIXTURE_INSTR_COUNT,
+        /*ctx_ptr_const*/ (u32)g_ppc_state_base,
+        /*mem_pages*/ 0,
+        /*mem1_base*/ 0, /*mem1_mask*/ 0, /*ram_size*/ 0,
+        /*instr_pcs*/ nullptr,
+        /*emit_hle_check*/ false,
+        /*emit_perf_stub*/ true,
+        /*emit_hle_check_native*/ false);
+    if (bytes.empty()) return -1;
+    int h = bemental::compile_raw(bytes.data(), bytes.size());
+    s_mb_handle.store(h, std::memory_order_release);
+    return h;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int ppc_mb_get_handle(void) { return s_mb_handle.load(std::memory_order_acquire); }
+
+EMSCRIPTEN_KEEPALIVE
+double ppc_mb_now_ms(void) { return emscripten_get_now(); }
+
+// L0 — empty EM_ASM_INT loop. Returns sum of returned values so V8 can't
+// dead-code-eliminate.
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_mb_run_l0_empty_emasm(u32 count) {
+    u32 acc = 0;
+    for (u32 i = 0; i < count; ++i) {
+        acc += (u32)EM_ASM_INT({ return $0; }, (int)i);
+    }
+    return acc;
+}
+
+// L1 — production dispatch path. Same body as ppc_worker_run_slice's hot
+// step minus the exit checks.
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_mb_run_l1_dispatch_raw(u32 count) {
+    int h = s_mb_handle.load(std::memory_order_acquire);
+    if (h < 0) return 0;
+    u32 acc = 0;
+    for (u32 i = 0; i < count; ++i) {
+        acc += (u32)bemental::dispatch_raw(h);
+    }
+    return acc;
+}
+
+// L2 — C-direct call via fn-ptr cast on the wasmTable index returned by
+// compile_raw. wasm32 fn-ptrs ARE __indirect_function_table indices; the
+// toolchain lowers `fn()` to `call_indirect`. No JS hop. Any trap unwinds
+// the pthread (the fixture block is trap-free by construction — pure
+// register math + blr).
+typedef u32 (*MbBlockFn)(void);
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_mb_run_l2_direct(u32 count) {
+    int h = s_mb_handle.load(std::memory_order_acquire);
+    if (h < 0) return 0;
+    MbBlockFn fn = (MbBlockFn)(uintptr_t)h;
+    u32 acc = 0;
+    for (u32 i = 0; i < count; ++i) {
+        acc += fn();
+    }
+    return acc;
+}
+
+}  // extern "C"
+
+#endif  // PPC_WORKER_MICROBENCH
+
 // main: not used in worker mode (we're loaded as a library), but
 // emscripten requires SOMETHING. Return 0 immediately; runtime stays
 // alive (-s EXIT_RUNTIME=0) so the exported functions remain callable.

@@ -2,12 +2,34 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Pre-action gates (mandatory)
+
+These are forced rules — not guidance. Violations have happened repeatedly across sessions; the user has explicitly called out the pattern as "abhorrent." If you catch yourself about to skip a gate, STOP and run the gate.
+
+1. **Before any test / probe / measurement action** for an emulator: read `dreamcast/docs/*/TASKS.md` (or `gamecube/docs/*/TASKS.md`) — the documented command lives there. Use `dreamcast/build_and_probe.sh` for Dreamcast iterations and the root `build_and_probe.sh` for GameCube. Do not improvise (no manual `emcc`, no browser-only test when a Node probe exists). Probe output: Dreamcast = `/tmp/probe-dc.log` (or `/tmp/dc-probes/<name>.log` with `--name`); GameCube = `/tmp/probe.log` (or `/tmp/probes/<name>.{log,summary.json,trace.json,metrics.json}` with `--name`). Each emulator's `docs/README.md` lists the full oracle/tool/test inventory — consult it before declaring "throughput" or "cache cold-start" as the next blocker; both have been wrong on the first try repeatedly. See `gamecube/docs/README.md` "failure mode this folder exists to prevent" and `dreamcast/docs/option2-direct-dispatch/README.md` for the rigor target.
+
+2. **Before serving any HTML page locally**: use `npm run web` (= `python3 -m http.server 8080`) → `http://localhost:8080/<page>.html`. Do not improvise the port, do not invent a script, do not `npx serve` unless the existing one is dead. Check `package.json` "scripts" first.
+
+3. **Before asserting "X does/doesn't exist in the repo"**: run one Read or one targeted grep against the live working tree. CLAUDE.md/memory/training are snapshots — they describe committed state at write-time and can be stale or wrong about local changes. "I haven't checked" is a correct answer; a confident wrong assertion is not.
+
+4. **Before running a build, link, or rebuild manually**: check if a script wraps it (`dreamcast/flycast-bridge/flycast_worker_link.sh`, `dreamcast/build_and_probe.sh`, `gamecube/ppc-worker/build_ppc_worker.sh`). Use the script.
+
+5. **When the user asks a direct factual question** ("what's the port?", "where's X defined?", "what does Y do?"): the answer is in one specific file. Read that file before answering — do not answer from context memory.
+
+6. **Claim discipline — every factual assertion about repo or runtime state must be either cited or hedged.** Two acceptable forms:
+   - **Cited**: `Per <file>:<line>, X = Y.` or `In the probe log /tmp/...:<grep>, observed X.` The citation must be from THIS conversation, not from memory or training.
+   - **Hedged**: `I haven't verified, but I think X.` or `I don't know — would need to check Z.`
+   Bare assertions ("the wedge is a slow memset", "the issue is throughput", "X doesn't exist in the repo") without one of these forms are FORBIDDEN. If you catch yourself typing one, stop and rewrite. This includes diagnostic conclusions: declaring "this is/isn't a bug" requires multiple verification data points, not just one consistent observation. The user has called out this pattern as "abhorrent behavior" multiple times. Defaulting to fluent-confident over hedged-accurate produces wrong answers that erode trust.
+
+7. **Challenge word: `VERIFY?`** — when the user sends this single word as a reply, treat it as an audit demand on your last claim. You MUST respond with EITHER (a) the exact tool call output / file:line that grounds the claim, copied verbatim from this conversation; OR (b) the literal sentence "I don't know — I asserted without verifying." There is no third option. Do not defend the prior, do not explain why you thought it, do not equivocate. Cite or retract.
+
 ## Repository shape
 
 This is Casey Bement's personal site deployed to GitHub Pages (CNAME, `.nojekyll`). It is not a single app — it is a collection of static HTML pages plus several self-contained sub-projects, each with its own build system (or none). There is no top-level build for the site itself; HTML/JS files are served as-is.
 
 - **Deploy branch is `prod`** (not `main`/`master`). Feature branches merge into `prod` via PR. `master` exists but is not the deploy target — ignore git's default-main heuristic if it reports `master`.
-- Top-level `package.json` / `tsconfig.json` exist but are only used by `handler.js` + `serverless.yml` (an AWS Lambda `sendEmail` endpoint via Serverless Framework). Most of the repo is plain static HTML.
+- Top-level `package.json` / `tsconfig.json` are used by `handler.js` + `serverless.yml` (an AWS Lambda `sendEmail` endpoint via Serverless Framework). Most of the repo is plain static HTML.
+- **Local dev server**: `npm run web` (= `python3 -m http.server 8080`) → http://localhost:8080/<page>.html. The site's `coi-serviceworker.js` installs COOP/COEP on first reload for SharedArrayBuffer.
 - The top-level `README.md` is an unmodified `create-next-app` boilerplate left over from an old experiment — ignore it; this is not a Next.js project.
 
 ## Sub-projects
@@ -19,7 +41,8 @@ Each has its own toolchain — run commands inside the subdirectory.
 | `ps1/ps1Wasm/` | PS1 WebAssembly emulator (derived from `kxkx5150/PCSX-wasm`) | Static — served from `ps1.html`. Source in `pcsx-wasm-src/` (Emscripten Makefile, fastcomp v1.37.40) |
 | `n64/N64Wasm`, `snes/snesWasm`, `gba/gbaWasm` | WebAssembly emulators with bundled `emsdk` | Static — served from corresponding `*.html` |
 | `gamecube/` | Dolphin libretro WASM build + custom JIT (in active development) | See **GameCube / Dolphin** below |
-| `bementalJIT/` | Guest-agnostic WASM JIT-builder library (PowerPC/SH4 emitters) | CMake — consumed by `gamecube/` via `add_subdirectory` |
+| `dreamcast/` | Flycast libretro WASM build + SH4 JIT (in active development) | See **Dreamcast / Flycast** below |
+| `bementalJIT/` | Guest-agnostic WASM JIT-builder library (PowerPC/SH4 emitters) | CMake — consumed by `gamecube/` and `dreamcast/` via `add_subdirectory` |
 | root `*.html` | Portfolio pages (`index`, `about`, `resume`, `contact`, `playground`, `gamecube`, etc.) | Static |
 
 ## WASM emulator architecture (ps1/n64/snes/gba/gamecube)
@@ -47,7 +70,22 @@ The canonical inner-loop is `build_and_probe.sh` at the repo root — it sources
 
 ### bementalJIT tests
 
-Host-side tests live in `bementalJIT/tests/` (`test_dispatch.cpp`, `test_gekko.cpp`, `test_perf_t1.cpp`, `test_pi_mask_path.cpp`, `test_str_hle_pattern.cpp`, `test_analyst.cpp`, `test_diff.cpp`). Built via CMake into `bementalJIT/build-host-test/` or `bementalJIT/build-test/`.
+Host-side tests live in `bementalJIT/tests/` (`test_dispatch.cpp`, `test_gekko.cpp`, `test_perf_t1.cpp`, `test_pi_mask_path.cpp`, `test_str_hle_pattern.cpp`, `test_analyst.cpp`, `test_diff.cpp`, `test_sh4_dispatch.cpp`). Built via CMake into `bementalJIT/build-host-test/` or `bementalJIT/build-test/`.
+
+## Dreamcast / Flycast WASM build
+
+Active R&D, parallel structure to GameCube. Pieces:
+
+- `dreamcast/flycast-src/` — Flycast source tree, the SH4 dynarec is replaced by a `bementalJIT`-backed emitter (`bementalJIT/guests/sh4/`).
+- `dreamcast/flycast-bridge/` — Emscripten link script (`flycast_worker_link.sh`), worker glue (`EmscriptenWorker.cpp`, `flycast_worker_funcs.js`), WebGL2/GL override shims (`gl_override.js`, `webgl2-compat.js`), and `rec_wasm.cpp` (the SH4 dynarec hook into Flycast).
+- `dreamcast/flycast_libretro/` — final link output (`flycast_worker.{js,wasm,symbols}`) loaded by `dreamcast.html`.
+- `dreamcast/sh4-worker/` — standalone SH4 JIT worker (parallel to GameCube's `ppc-worker`).
+- `dreamcast/oracle/` — RedDream native reference for trajectory diffing; see `dreamcast/tools/trace_diff_native_vs_wasm.sh`.
+- `dreamcast/build_and_probe.sh` — canonical Dreamcast inner-loop (build → link → Node probe). Probe output: `/tmp/dc-probes/<name>.log`.
+- `dreamcast/run_native_flycast.sh` — runs native Flycast as an oracle.
+- `dreamcast/docs/<topic>/TASKS.md` — per-topic task lists; pre-action gate #1 requires reading these before improvising any probe/test command.
+
+`dreamcast/STATUS.md`, `dreamcast/STATUS_*.md`, and `dreamcast/CLAUDE_VIOLATIONS.md` are session-state scratch files — read for context, don't treat as authoritative spec.
 
 ### SAB primitives
 

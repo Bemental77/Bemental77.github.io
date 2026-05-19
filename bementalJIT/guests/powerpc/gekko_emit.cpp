@@ -1141,6 +1141,15 @@ static void emit_bx_impl(EmitCtx& c) {
         c.b.op_i32_const((s32)CTX);
         c.b.op_i32_const((s32)(c.pc + 4));
         c.b.op_i32_store(ppc_off::spr(8));  // LR = pc + 4
+        // Call boundary: the callee may be HLE'd or fall back to interp,
+        // either of which can MUTATE ppc_state.gpr[] (e.g.
+        // HLE_PPCMfhid2 forces gpr[3]=0). The post-call block must
+        // reload from memory, not read stale wasm locals. Flush dirties
+        // first (so any in-flight writes hit memory), then invalidate
+        // loaded[] (so subsequent emit_gpr_get re-reads from ppc_state).
+        // Matches JIT64's "flush all caller-saved on call" contract.
+        emit_flush_dirty_gprs_impl(c, g_ctx_ptr);
+        emit_invalidate_gpr_locals(c);
     }
     u32 lidx = 0u;
     const bool resolved = try_resolve_target(c, target, &lidx);
@@ -2273,7 +2282,12 @@ static void emit_indirect_branch_native(EmitCtx& c, u32 target_spr_idx) {
     c.b.op_i32_store(ppc_off::PC);
 
     // B11: flush before returning to host loop / dispatcher.
+    // Invalidate too — blr/bctr can return into HLE'd functions or
+    // exception handlers that mutate ppc_state.gpr[]. The post-call block
+    // (within same region) must reload from memory rather than read stale
+    // wasm-local cache. Same contract as emit_bx_impl's LK branch.
     emit_block_exit_flush(c);
+    emit_invalidate_gpr_locals(c);
 
     // Return target.
     c.b.op_local_get(LOCAL_TMP_A);
@@ -2525,6 +2539,30 @@ static void emit_mtspr_impl(EmitCtx& c) {
     c.b.op_i32_const((s32)CTX);
     emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_store(ppc_off::spr(spr_num));
+
+    // [srr0-side-channel] When emitting mtspr SRR0 (SPR 26), ALSO write a
+    // (pc, value, counter) tuple to fixed SAB slots so dolphin-side can
+    // identify which JIT-emitted mtspr instruction wrote each SRR0 value.
+    // SAB[0x026B0600] = pc of emitting instruction
+    // SAB[0x026B0604] = value written to SRR0
+    // SAB[0x026B0608] = monotonic counter (incremented every fire)
+    if (spr_num == 26u) {
+        // sab[0x600] = pc
+        c.b.op_i32_const((s32)0x026B0600);
+        c.b.op_i32_const((s32)c.pc);
+        c.b.op_i32_store(0);
+        // sab[0x604] = value (re-read gpr[rs] since prior get consumed the stack value)
+        c.b.op_i32_const((s32)0x026B0604);
+        emit_gpr_get_impl(c, rs, g_ctx_ptr);
+        c.b.op_i32_store(0);
+        // sab[0x608] = counter (load, +1, store)
+        c.b.op_i32_const((s32)0x026B0608);
+        c.b.op_i32_const((s32)0x026B0608);
+        c.b.op_i32_load(0);
+        c.b.op_i32_const(1);
+        c.b.op_i32_add();
+        c.b.op_i32_store(0);
+    }
 }
 
 // mftb rD, TBR  (op31 sub-op 371).

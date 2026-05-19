@@ -30,6 +30,15 @@
 #include "ppc_offsets.h"
 #include "reg_cache.h"
 
+// NOTE: Cannot include "../powerpc/gekko_emit.h" — both libs share the
+// `bemental::powerpc` namespace and have parallel definitions for spr/gpr/
+// WIMPORT_* enum / BlockInputs, causing ODR redefinition collisions.
+// Until a follow-up extracts shared types to a third-party header, the
+// region implementations below stay as passthroughs to the live functions
+// (forward-declared inside #ifdef BEMENTALJIT_USE_REBUILD blocks below).
+// Agent 4's real region impls (which deref BlockInputs members and would
+// route the SAB wedge path through powerpc-next ports) are reverted.
+
 namespace bemental::powerpc {
 
 static constexpr u32 WIMPORT_INTERP = 6;
@@ -268,10 +277,6 @@ std::vector<u8> build_block_next(u32 start_pc,
         b.emitLocals(2u, counts, types);
     }
 
-    // HLE-check prologue: if the host replaces this block, read PC and
-    // early-exit.
-    emit_hle_prologue(b, ctx_ptr, start_pc);
-
     // RegCache: assign per-PPC-GPR WASM locals + emit prologue loads
     // for live-in registers.
     RegCache rc(b);
@@ -284,12 +289,35 @@ std::vector<u8> build_block_next(u32 start_pc,
     params.mem1_mask = mem1_mask;
     params.ram_size  = ram_size;
 
-    // Per-CodeOp dispatch. Idle-skip override fires only for the
-    // terminator (last op) when the analyzer flagged branchIsIdleLoop.
+    // Per-CodeOp dispatch. 2026-05-18 port of JIT64's HandleFunctionHooking
+    // (Jit.cpp:1065-1066): JIT64 calls HLE::TryReplaceFunction on EVERY op's
+    // address, not just block start. If any mid-block op is HLE-hooked, the
+    // hook fires and the block exits there. This catches wild-branch-into-
+    // mid-function cases (the SAB wedge at 0x800e5778 where ppc-worker landed
+    // mid-OSLoadContext with r3=0 and the registered HLE patch at the function
+    // entry never had a chance to fire). Previous port only emitted the HLE
+    // prologue at start_pc once — equivalent to JIT64 calling HandleFunctionHooking
+    // only at op[0], which doesn't catch downstream hooked PCs.
+    //
+    // RegCache must be flushed before the HLE call so the host sees current
+    // GPR state if the hook reads ppc_state.
+    //
+    // Idle-skip override fires only for the terminator (last op) when the
+    // analyzer flagged branchIsIdleLoop.
     const std::size_t n_ops = buffer.size();
     for (std::size_t i = 0; i < n_ops; ++i) {
         const CodeOp& op = buffer[i];
         const bool is_terminator = (i + 1 == n_ops);
+
+        // Per-op HLE check (was: emit_hle_prologue at block-start only).
+        // emit_hle_prologue emits the if/return early-exit shape; if the
+        // host's hle_check returns 0 (not hooked), the wasm falls through
+        // to the dispatch_op below. Cost = one i32_const + one host call
+        // per op when not hooked; the trade-off is correctness for wild
+        // mid-function branches.
+        rc.Flush(ctx_ptr);
+        emit_hle_prologue(b, ctx_ptr, op.address);
+
         if (is_terminator && op.branchIsIdleLoop) {
             emit_idle_skip(b, rc, op, ctx_ptr);
         } else {
@@ -309,5 +337,76 @@ std::vector<u8> build_block_next(u32 start_pc,
 
     return b.getBytes();
 }
+
+
+#ifdef BEMENTALJIT_USE_REBUILD
+
+// Region-path _next implementations: PASSTHROUGHS to the live bemental::
+// powerpc:: functions in guests/powerpc/gekko_emit.cpp. Real implementations
+// were attempted but require including ../powerpc/gekko_emit.h, which ODR-
+// collides with powerpc-next's own ppc_offsets.h (both define ppc_off::spr/
+// gpr/etc in the same namespace) and with the local WIMPORT_INTERP constant.
+//
+// Follow-up: extract BlockInputs + LocalIdxLookupFn + WIMPORT_* + ppc_off::*
+// into a third shared header (e.g. bementalJIT/include/bementalJIT/ppc_shared.h)
+// that both gekko_emit.h and powerpc-next headers can include without
+// collision. Then re-introduce the real region impls so the SAB wedge path
+// exercises the per-op HLE check (task 25), const-MMIO routing (task 26),
+// and LR-stack push/pop (task 27).
+
+// Forward decls for the live functions we forward to.
+std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
+                                u32 ctx_ptr_const,
+                                u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                                const u32* instr_pcs,
+                                LocalIdxLookupFn lookup_fn,
+                                const void* lookup_user,
+                                bool emit_hle_check,
+                                bool emit_perf_stub,
+                                bool emit_hle_check_native);
+std::vector<u8> build_region_module(const u8* concatenated_bodies,
+                                    std::size_t concatenated_size,
+                                    u32 n_funcs,
+                                    u32 mem_pages);
+std::vector<u8> build_region_function(const BlockInputs* blocks,
+                                      u32 n_blocks,
+                                      LocalIdxLookupFn lookup_fn,
+                                      const void* lookup_user,
+                                      u32 mem_pages);
+
+std::vector<u8> emit_block_body_next(u32 start_pc, const u32* insts, u32 count,
+                                     u32 ctx_ptr_const,
+                                     u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                                     const u32* instr_pcs,
+                                     LocalIdxLookupFn lookup_fn,
+                                     const void* lookup_user,
+                                     bool emit_hle_check,
+                                     bool emit_perf_stub,
+                                     bool emit_hle_check_native) {
+    return emit_block_body(start_pc, insts, count, ctx_ptr_const,
+                           mem1_base, mem1_mask, ram_size, instr_pcs,
+                           lookup_fn, lookup_user, emit_hle_check,
+                           emit_perf_stub, emit_hle_check_native);
+}
+
+std::vector<u8> build_region_module_next(const u8* concatenated_bodies,
+                                         std::size_t concatenated_size,
+                                         u32 n_funcs,
+                                         u32 mem_pages) {
+    return build_region_module(concatenated_bodies, concatenated_size,
+                               n_funcs, mem_pages);
+}
+
+std::vector<u8> build_region_function_next(const BlockInputs* blocks,
+                                           u32 n_blocks,
+                                           LocalIdxLookupFn lookup_fn,
+                                           const void* lookup_user,
+                                           u32 mem_pages) {
+    return build_region_function(blocks, n_blocks, lookup_fn, lookup_user,
+                                 mem_pages);
+}
+
+#endif  // BEMENTALJIT_USE_REBUILD
+
 
 }  // namespace bemental::powerpc

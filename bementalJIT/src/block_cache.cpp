@@ -60,6 +60,38 @@ namespace powerpc {
                                           LocalIdxLookupFn lookup_fn,
                                           const void* lookup_user,
                                           u32 mem_pages = 1);
+
+#ifdef BEMENTALJIT_USE_REBUILD
+    // Interim _next entry points provided by guests/powerpc-next/ppc_emit.cpp.
+    // Currently wrappers around the unsuffixed versions above; will become
+    // distinct JIT64-modeled implementations as the rebuild lands. Declared
+    // here so block_cache.cpp stays guest-agnostic at the include level (no
+    // ppc_emit.h include — same pattern as the live forward decls above).
+    // LocalIdxLookupFn and BlockInputs are reused unchanged: both libraries
+    // share the bemental::powerpc namespace, so the types are identical
+    // entities on either side of the link.
+    std::vector<u8> emit_block_body_next(u32 start_pc, const u32* insts, u32 count,
+                                         u32 ctx_ptr_const,
+                                         u32 mem1_base, u32 mem1_mask,
+                                         u32 ram_size,
+                                         const u32* instr_pcs,
+                                         LocalIdxLookupFn lookup_fn,
+                                         const void* lookup_user,
+                                         bool emit_hle_check = true,
+                                         bool emit_perf_stub = false,
+                                         bool emit_hle_check_native = false);
+
+    std::vector<u8> build_region_module_next(const u8* concatenated_bodies,
+                                             std::size_t concatenated_size,
+                                             u32 n_funcs,
+                                             u32 mem_pages);
+
+    std::vector<u8> build_region_function_next(const BlockInputs* blocks,
+                                               u32 n_blocks,
+                                               LocalIdxLookupFn lookup_fn,
+                                               const void* lookup_user,
+                                               u32 mem_pages = 1);
+#endif
 }
 
 int compile_raw(const u8* bytes, std::size_t size) {
@@ -707,7 +739,11 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
         RegionLookupCtx ctx{ &rs };
         for (u32 i = 0; i < rs.n_funcs; ++i) {
             const BlockEmitInputs& rec = rs.block_records[i];
+#ifdef BEMENTALJIT_USE_REBUILD
+            std::vector<u8> body = powerpc::emit_block_body_next(
+#else
             std::vector<u8> body = powerpc::emit_block_body(
+#endif
                 rec.start_pc,
                 rec.insts.data(),
                 static_cast<u32>(rec.insts.size()),
@@ -771,16 +807,31 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
             bins[i].emit_hle_check_native = rec.emit_hle_check_native;
         }
         RegionLookupCtx ctx{ &rs };
+#ifdef BEMENTALJIT_USE_REBUILD
+        bytes = powerpc::build_region_function_next(
+            bins.data(), rs.n_funcs,
+            &region_lookup_for_emit, &ctx,
+            mem_pages);
+#else
         bytes = powerpc::build_region_function(
             bins.data(), rs.n_funcs,
             &region_lookup_for_emit, &ctx,
             mem_pages);
+#endif
     } else {
+#ifdef BEMENTALJIT_USE_REBUILD
+        bytes = powerpc::build_region_module_next(
+            rs.fn_bodies_concat.data(),
+            rs.fn_bodies_concat.size(),
+            rs.n_funcs,
+            mem_pages);
+#else
         bytes = powerpc::build_region_module(
             rs.fn_bodies_concat.data(),
             rs.fn_bodies_concat.size(),
             rs.n_funcs,
             mem_pages);
+#endif
     }
     if (bytes.empty()) {
 #ifdef __EMSCRIPTEN__

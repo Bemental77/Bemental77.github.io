@@ -141,6 +141,7 @@ function classify(text) {
     executablePath: CHROME,
     headless: 'new',
     args: chromeArgs,
+    dumpio: !!process.env.FLYCAST_DUMPIO,  // tee Chrome stderr (V8 --print-wasm-code) into our stdout
   });
   const page = await browser.newPage();
 

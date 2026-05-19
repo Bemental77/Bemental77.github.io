@@ -17,6 +17,10 @@ namespace bemental::powerpc {
 
 // Unconditional. LK=1 sets LR = next_pc; LK=0 doesn't touch LR.
 // AA=1 absolute target; AA=0 PC-relative.
+//
+// BLR-stack: LK=1 PUSHes the after-PC onto the SAB-resident return-PC ring
+// (see jit_branch.cpp header comment for the SAB layout) so the matching
+// `blr` can detect stack corruption. Mirrors Jit64 Jit.cpp:641-645.
 void emit_bx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
              u32 ctx_ptr);
 
@@ -24,11 +28,25 @@ void emit_bx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // Phase 4 part 2 ships the static-target variant; complex multi-condition
 // dispatch (BO bit 4=0 needs CR check, BO bit 2=0 needs CTR decrement)
 // delegates to the runtime helper when too rich for inline emit.
+//
+// BLR-stack: the inline BO=20 LK=1 path pushes. The interp-fallback path
+// does NOT push (interp owns LR mutation for the LK arm); this is a known
+// gap in the mispredict diagnostic, tolerated because bclXX,LK is rare.
 void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
               u32 ctx_ptr);
 
 // Indirect: bclr (op19:16) takes target from LR; bcctr (op19:528) takes
 // target from CTR. Both support LK to set LR=next_pc.
+//
+// BLR-stack: emit_bclrx POPs the ring and compares against the runtime
+// SPR_LR; a mismatch bumps SAB[0x026B0504] (count) + records the site PC,
+// actual LR, and expected popped value at SAB[0x026B0508..0x026B0510].
+// PC is still written from SPR_LR (option (a) — preserves current
+// semantics, just makes the wild-branch observable). Mirrors
+// Jit64::WriteBLRExit (Jit.cpp:660-682) minus the dispatcher reroute.
+//
+// emit_bcctrx does NOT pop — CTR holds a forward-call target, not a
+// return PC. LK=1 still PUSHes (bcctrl is a linked call).
 void emit_bclrx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                 u32 ctx_ptr);
 void emit_bcctrx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,

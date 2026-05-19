@@ -64,6 +64,22 @@ struct CodeOp {
     BitSet32 fprIsStoreSafeBeforeInst;
     BitSet32 fprIsStoreSafeAfterInst;
 
+    // Compile-time-known effective address (for D-form loads/stores whose
+    // RA is either zero or a register the analyzer proved holds a known
+    // constant). Mirrors the gpr.IsImm()-driven `WriteToConstAddress` /
+    // `ReadFromConstAddress` paths in Dolphin Jit64 (Jit_LoadStore.cpp:531).
+    //
+    // Populated by PPCAnalyzer's forward const-propagation pass. The
+    // const-address store path in jit_load_store.cpp routes MMIO addresses
+    // (>=0xCC000000 && <0xCC040000) directly through the WIMPORT_WRITE*
+    // host import — bypassing the MMIO-mirror fast path entirely so the
+    // host MMIO handler observes the write before any subsequent JIT op
+    // runs. This is the structural fix for the DICR.TSTART-before-DICMDBUF
+    // ordering bug that triggers DVDInterface.cpp:1286 "Unknown DVD
+    // command 00000000".
+    bool has_const_ea = false;
+    u32  const_ea     = 0;
+
     BitSet32 GetFregsOut() const {
         BitSet32 result;
         if (fregOut >= 0) result[fregOut] = true;

@@ -675,6 +675,16 @@
         let exitReason = 'safety-cap';
         let lastPc = 0xFFFFFFFF;
         let samePcCount = 0;
+        // CT-fire wall-time clock. Previously gated on `iters & (CT_FIRE_EVERY-1)`
+        // which assumed ~16K disp/sec → 60 Hz fire. At observed ~9.5K disp/sec
+        // (phase_2e_cutover_works_cache_bottleneck.md) that gave ~37 Hz; lower
+        // dispatch rates degrade proportionally. Same bug class as dreamcast
+        // rec_wasm.cpp:1296 SPG raise gate (s_spg_tick & 0x3F → 7.5 Hz). Fixed
+        // there 2026-05-17 by switching to emscripten_get_now() ≥16ms wall gate
+        // → 7.6× throughput, see dreamcast_spg_walltime_gate_2026_05_17.md.
+        // Mirror that pattern here.
+        let lastCtFireMs = wallStart;
+        const CT_FIRE_INTERVAL_MS = 16.0;  // ~60 Hz, matches native VI cadence.
         // Item 7 Phase II — periodically drain DEC (and Phase III hybrid)
         // events from the SAB shared CT queue. The fire is a no-op if
         // the queue is empty, so calling every N iters is cheap. N=256
@@ -935,7 +945,16 @@
           if (sliceCyclesCap > 0 && sliceCyclesBurned >= sliceCyclesCap) {
             exitReason = 'slice-budget'; break;
           }
-          if ((iters & (CT_FIRE_EVERY - 1)) === 0) {
+          // Wall-time gated CT fire (was dispatch-count gated on
+          // `iters & (CT_FIRE_EVERY - 1)`). See declaration of
+          // lastCtFireMs above for why. Cheap check on every iter via
+          // performance.now() — V8 inlines it. The 16ms interval
+          // matches native VI cadence (60 Hz) regardless of dispatch
+          // throughput, so events scheduled to fire at wall-60Hz
+          // actually fire at wall-60Hz rather than at JIT-disp-rate/256.
+          const _nowMs_ct = (typeof performance !== 'undefined') ? performance.now() : Date.now();
+          if ((_nowMs_ct - lastCtFireMs) >= CT_FIRE_INTERVAL_MS) {
+            lastCtFireMs = _nowMs_ct;
             // Phase 2e fix: advance global_timer by the cycles burned
             // since the last CT-fire, THEN fire_due_pure with the new
             // time. Without this advance, events scheduled mid-slice

@@ -300,6 +300,69 @@ static void emit_store_common(WasmModuleBuilder& wb, RegCache& rc,
 }
 
 // ---------------------------------------------------------------------------
+// Const-address MMIO routing.
+//
+// Ported from Dolphin Jit64's EmuCodeBlock::WriteToConstAddress
+// (Source/Core/Core/PowerPC/Jit64Common/EmuCodeBlock.cpp:631-686). When
+// the analyzer proved the effective address at compile time, MMIO writes
+// (0xCC000000..0xCC03FFFF — GameCube hardware-register window) must
+// route DIRECTLY through the host ppc_write* import. The runtime
+// MMIO-mirror fast path (live emitter, gekko_emit.cpp:640) is a
+// performance hack that lets the host coalesce writes into a SAB mirror;
+// for MMIO addresses with side effects (DVDInterface DICR/DICMDBUF,
+// AudioInterface, ProcessorInterface…) that coalescing reorders the
+// store with respect to subsequent JIT-emitted ops and the host MMIO
+// handler — which is exactly the DICR.TSTART-before-DICMDBUF[0] ordering
+// failure that triggers DVDInterface.cpp:1286 "Unknown DVD command
+// 00000000 - fatal error" on PSO boot.
+//
+// Const-EA store ordering guarantee: rc.Flush(ctx_ptr) is emitted BEFORE
+// the import call (so any dirty GPRs the handler may inspect through
+// PowerPCState are coherent), and the import call is a wasm `call` to
+// an imported host function — the V8 wasm engine treats imports as
+// opaque external calls and is forbidden by the wasm-spec from
+// reordering wasm side effects across them. The subsequent JIT-emitted
+// op observes the host write's full side effect.
+// ---------------------------------------------------------------------------
+static constexpr u32 MMIO_BASE = 0xCC000000u;
+static constexpr u32 MMIO_END  = 0xCC040000u;
+
+static bool is_mmio_const_addr(u32 addr) {
+    return addr >= MMIO_BASE && addr < MMIO_END;
+}
+
+// Emit a store to a compile-time-known MMIO address. Stack-neutral.
+static void emit_const_mmio_store(WasmModuleBuilder& wb, RegCache& rc,
+                                  LoadStoreParams params, u32 addr,
+                                  StoreWidth width, u32 src_local) {
+    // Flush dirty GPRs to PowerPCState — host MMIO handler may read them
+    // (e.g. ExpansionInterface inspects gpr[3..5] for some commands).
+    rc.Flush(params.ctx_ptr);
+    // Push address + value, call import. The wasm `call` to a host import
+    // is a strict happens-before barrier per wasm semantics — no
+    // subsequent op can be hoisted across it.
+    wb.op_i32_const((s32)addr);
+    wb.op_local_get(src_local);
+    wb.op_call(write_import_for_width(width));
+}
+
+// Emit a load from a compile-time-known MMIO address. Leaves the loaded
+// value (sign-extended for S16) on the stack.
+static void emit_const_mmio_load(WasmModuleBuilder& wb, RegCache& rc,
+                                 LoadStoreParams params, u32 addr,
+                                 LoadWidth width) {
+    rc.Flush(params.ctx_ptr);
+    wb.op_i32_const((s32)addr);
+    wb.op_call(read_import_for_width(width));
+    if (width == LoadWidth::S16) {
+        wb.op_i32_const(16);
+        wb.op_i32_shl();
+        wb.op_i32_const(16);
+        wb.op_i32_shr_s();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
 void emit_load_d(WasmModuleBuilder& wb, RegCache& rc,
@@ -309,6 +372,23 @@ void emit_load_d(WasmModuleBuilder& wb, RegCache& rc,
     const u32 rt   = GekkoOperands::RD(inst);
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 simm = GekkoOperands::SIMM_16(inst);
+
+    // Compile-time-known address: route MMIO directly through the import,
+    // keep non-MMIO on the fastmem path. RAM loads still go through the
+    // guarded if/else (BAT/TLB races on MMU enable would otherwise
+    // require yet another const-address gate).
+    if (op.has_const_ea && is_mmio_const_addr(op.const_ea)) {
+        auto rc_rt = rc.Bind(rt, RCMode::Write);
+        emit_const_mmio_load(wb, rc, params, op.const_ea, width);
+        wb.op_local_set(rc_rt.local_idx());
+        if (update && ra != 0) {
+            auto rc_ra = rc.Bind(ra, RCMode::Write);
+            wb.op_i32_const((s32)op.const_ea);
+            wb.op_local_set(rc_ra.local_idx());
+        }
+        return;
+    }
+
     emit_ea_d_form(wb, rc, ra, simm);
     emit_load_common(wb, rc, params, rt, ra, width, update);
 }
@@ -320,6 +400,23 @@ void emit_store_d(WasmModuleBuilder& wb, RegCache& rc,
     const u32 rs   = GekkoOperands::RS(inst);
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 simm = GekkoOperands::SIMM_16(inst);
+
+    // Const-address MMIO store: bypass the fastmem-guarded if/else and
+    // route directly to the host import. Preserves the host-observable
+    // store ordering required by DVDInterface DICR.TSTART/DICMDBUF[0],
+    // AudioInterface, etc.
+    if (op.has_const_ea && is_mmio_const_addr(op.const_ea)) {
+        auto rc_rs = rc.Bind(rs, RCMode::Read);
+        emit_const_mmio_store(wb, rc, params, op.const_ea, width,
+                              rc_rs.local_idx());
+        if (update && ra != 0) {
+            auto rc_ra = rc.Bind(ra, RCMode::Write);
+            wb.op_i32_const((s32)op.const_ea);
+            wb.op_local_set(rc_ra.local_idx());
+        }
+        return;
+    }
+
     emit_ea_d_form(wb, rc, ra, simm);
     emit_store_common(wb, rc, params, rs, ra, width, update);
 }

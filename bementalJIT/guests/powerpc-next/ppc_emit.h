@@ -22,6 +22,19 @@ class WasmModuleBuilder;
 
 namespace bemental::powerpc {
 
+// ---------------------------------------------------------------------------
+// Region-build / block-body callback types (shared with live powerpc/).
+// The canonical definitions live in guests/powerpc/gekko_emit.h. Both libs
+// share the `bemental::powerpc` namespace so the names refer to the same
+// entity — but the C++ ODR forbids two FULL DEFINITIONS in different TUs
+// even when layouts match. Forward-declare here; the only consumers of
+// the layout (the `_next` wrapper implementations in ppc_emit.cpp) include
+// gekko_emit.h to see the full definition. block_cache.cpp does the same.
+// ---------------------------------------------------------------------------
+using LocalIdxLookupFn = bool(*)(const void* user, u32 target_pc, u32* out_local_idx);
+
+struct BlockInputs;  // full definition in guests/powerpc/gekko_emit.h
+
 
 // Dispatch one CodeOp: route to the right Phase 4 emit fn.  Falls back
 // to WIMPORT_INTERP for ops without a native emitter (paired-singles,
@@ -40,5 +53,62 @@ std::vector<u8> build_block_next(u32 start_pc,
                                  const u32* insts, u32 count,
                                  u32 ctx_ptr,
                                  u32 mem1_base, u32 mem1_mask, u32 ram_size);
+
+// ---------------------------------------------------------------------------
+// _next region/block-body entry points.
+//
+// block_cache.cpp's region_relink and JitWasm.cpp's per-block-body emit
+// path call emit_block_body / build_region_module / build_region_function
+// on every JIT step. When BEMENTALJIT_USE_REBUILD=ON, those callsites are
+// gated to the _next variants below.
+//
+// Real implementations (ppc_emit.cpp):
+//   emit_block_body_next       — emits one function body via the powerpc-
+//                                next path (dispatch_op + RegCache + per-
+//                                op HLE check + jit_load_store const-MMIO
+//                                routing + jit_branch LR-stack). Mirrors
+//                                build_block_next's body shape minus the
+//                                module-shell wrap.
+//   build_region_function_next — emits the merged-fn region (br_table over
+//                                N nested blocks, shared 36 locals). Per-
+//                                block bodies use emit_block_body_next's
+//                                inner helper.
+//   build_region_module_next   — structural module-shell wrapper only;
+//                                forwards to the live build_region_module
+//                                because no per-op semantics live here.
+//                                The bytes inside the code section come
+//                                from emit_block_body_next, so the rebuild
+//                                per-op semantics are preserved.
+//
+// Known gap: merged-region intra-region branch resolution (global.set
+// entry_sel + br $L) is not yet implemented in powerpc-next's jit_branch
+// emitters. Intra-region branches in build_region_function_next emit
+// set-pc + return (host-bounce), correctness-preserving. Future patch
+// must add MergedModeArgs plumbing into emit_bx/emit_bcx.
+//
+// Both libraries are linked together when BEMENTALJIT_USE_REBUILD=ON, so
+// build_region_module_next can resolve the unsuffixed live symbol.
+// ---------------------------------------------------------------------------
+std::vector<u8> emit_block_body_next(u32 start_pc, const u32* insts, u32 count,
+                                     u32 ctx_ptr_const,
+                                     u32 mem1_base, u32 mem1_mask,
+                                     u32 ram_size,
+                                     const u32* instr_pcs,
+                                     LocalIdxLookupFn lookup_fn,
+                                     const void* lookup_user,
+                                     bool emit_hle_check = true,
+                                     bool emit_perf_stub = false,
+                                     bool emit_hle_check_native = false);
+
+std::vector<u8> build_region_module_next(const u8* concatenated_bodies,
+                                         std::size_t concatenated_size,
+                                         u32 n_funcs,
+                                         u32 mem_pages = 1);
+
+std::vector<u8> build_region_function_next(const BlockInputs* blocks,
+                                           u32 n_blocks,
+                                           LocalIdxLookupFn lookup_fn,
+                                           const void* lookup_user,
+                                           u32 mem_pages = 1);
 
 }  // namespace bemental::powerpc
