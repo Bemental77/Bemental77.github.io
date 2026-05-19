@@ -1128,6 +1128,23 @@ static void emit_branch_resolution(EmitCtx& c, u32 target_pc, const u32* local_i
             c.b.op_br(actual_depth);
             return;
         }
+        // Non-merged path runtime self-slot guard (mirror of merged guard at
+        // L1110-1128). The compile-time check at try_resolve_target only
+        // rejects target_pc==start_pc, not runtime pcMap aliasing where
+        // target_pc resolves to start_pc's table slot. Without this, the
+        // return_call_indirect tail-calls back into this body — infinite
+        // self-loop, invisible to host dispatch. SAB fn 0x800e362c probe data:
+        // 2520× pc==npc==0x800e362c vs 1× pc==0x800e3958 (normal exit).
+        c.b.op_i32_const((s32)*local_idx);
+        c.b.op_i32_const((s32)c.self_local_idx);
+        c.b.op_i32_eq();
+        c.b.op_if(0x40);
+            // self-slot aliasing: bail to host with target_pc.
+            // GPRs already flushed at line 1093.
+            emit_set_pc(c, CTX, target_pc);
+            c.b.op_i32_const((s32)target_pc);
+            c.b.op_return();
+        c.b.op_end();
         c.b.op_i32_const((s32)*local_idx);
         c.b.op_return_call_indirect(/*type=*/0u, /*table=*/0u);
         return;
