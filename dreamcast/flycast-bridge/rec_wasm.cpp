@@ -452,6 +452,39 @@ static void wasm_block_trampoline()
         }, (int)s_ram_base, (int)pMem, (int)pVram, (int)pAica);
     }
 
+    // ---- One-shot snapshot at IPL entry (parity test 2026-05-19, U3+U2). ----
+    static bool s_ipl_entry_dumped = false;
+    if (!s_ipl_entry_dumped && pc == 0xac008300u) {
+        s_ipl_entry_dumped = true;
+        const u8* r1 = (const u8*)s_ram_base + 0x8300;
+        const u8* r2 = (const u8*)s_ram_base + 0x83d8;
+        const u8* r3 = (const u8*)s_ram_base + 0x2ab4c;
+        char h1[80] = {0}, h2[80] = {0}, h3[80] = {0};
+        for (int i = 0; i < 32; ++i) {
+            snprintf(h1 + i*2, 4, "%02x", r1[i]);
+            snprintf(h2 + i*2, 4, "%02x", r2[i]);
+            snprintf(h3 + i*2, 4, "%02x", r3[i]);
+        }
+        char buf[1024];
+        snprintf(buf, sizeof(buf),
+            "[ipl-entry-snap] pc=%08x "
+            "r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x r5=%08x r6=%08x r7=%08x "
+            "r8=%08x r9=%08x r10=%08x r11=%08x r12=%08x r13=%08x r14=%08x r15=%08x "
+            "sr=%08x pr=%08x gbr=%08x vbr=%08x mach=%08x macl=%08x fpscr=%08x "
+            "ram_8300=%s ram_83d8=%s ram_2ab4c=%s",
+            pc,
+            ctx->r[0], ctx->r[1], ctx->r[2], ctx->r[3],
+            ctx->r[4], ctx->r[5], ctx->r[6], ctx->r[7],
+            ctx->r[8], ctx->r[9], ctx->r[10], ctx->r[11],
+            ctx->r[12], ctx->r[13], ctx->r[14], ctx->r[15],
+            ctx->sr.getFull(), ctx->pr, ctx->gbr, ctx->vbr,
+            ctx->mac.h, ctx->mac.l, ctx->fpscr.full,
+            h1, h2, h3);
+        MAIN_THREAD_EM_ASM({
+            postMessage({cmd:'print', txt: UTF8ToString($0)});
+        }, buf);
+    }
+
     // ---- One-shot snapshot for the 0x8c02ab4c wedge investigation. ----
     // Captures all 16 GPRs + PR + 64B of OUR-RAM at the wedge PC window
     // (0x8c02ab30..0x8c02ab6f) + 64B at the PR target (0x8c020000..0x8c02003f)
@@ -1007,7 +1040,102 @@ public:
 							' vbr=0x' + ($2 >>> 0).toString(16) +
 							' pend=0x' + ($3 >>> 0).toString(16)});
 					}, (int)r12, (int)r14, (int)vbr, (int)pend);
+					// Holly interrupt-state at wedge — distinguishes
+					// "raise never fired" (ISTNRM=0) from "raise fired but
+					// SR.IMASK blocked" (ISTNRM&IML4NRM nonzero, ctx pend=0).
+					const u32 hi_istnrm = SB_ISTNRM;
+					const u32 hi_istext = SB_ISTEXT;
+					const u32 hi_iml4n  = SB_IML4NRM;
+					const u32 hi_iml4e  = SB_IML4EXT;
+					MAIN_THREAD_EM_ASM({
+						postMessage({cmd: 'print', txt:
+							'[flycast-worker]   ... istnrm=0x' + ($0 >>> 0).toString(16) +
+							' istext=0x' + ($1 >>> 0).toString(16) +
+							' iml4nrm=0x' + ($2 >>> 0).toString(16) +
+							' iml4ext=0x' + ($3 >>> 0).toString(16)});
+					}, (int)hi_istnrm, (int)hi_istext, (int)hi_iml4n, (int)hi_iml4e);
+					// PR (link register), r4/r5 (memcpy src/dst args), r13 (outer
+					// loop counter), r12 (outer loop limit). The wedge PC is rts;
+					// PR points at the caller's next insn.
+					MAIN_THREAD_EM_ASM({
+						postMessage({cmd: 'print', txt:
+							'[flycast-worker]   ... pr=0x' + ($0 >>> 0).toString(16) +
+							' r4=0x' + ($1 >>> 0).toString(16) +
+							' r5=0x' + ($2 >>> 0).toString(16) +
+							' r13=0x' + ($3 >>> 0).toString(16) +
+							' r12=0x' + ($4 >>> 0).toString(16)});
+					}, (int)ctx->pr, (int)ctx->r[4], (int)ctx->r[5],
+					   (int)ctx->r[13], (int)ctx->r[12]);
 					s_last_logged_pc = pc_now;
+				}
+				// One-shot dump of the caller at 0x8c0215e0-0x8c021600.
+				static bool s_caller_dump_fired = false;
+				if (g_diag_enabled && !s_caller_dump_fired &&
+				    s_dispatch_count > 100000 &&
+				    ctx->pc == 0x8c02c16au) {
+					s_caller_dump_fired = true;
+					MAIN_THREAD_EM_ASM({
+						postMessage({cmd: 'print', txt:
+							'[caller-asm] fired at dispatch #' + ($0 >>> 0) +
+							' pr=0x' + ($1 >>> 0).toString(16)});
+					}, (int)s_dispatch_count, (int)ctx->pr);
+					const u32 cbase = ctx->pr - 0x10;
+					u16 cw[16];
+					for (int i = 0; i < 16; i++) cw[i] = ReadMem16(cbase + i*2);
+					MAIN_THREAD_EM_ASM({
+						var hex = function(x){return ('0000'+(x>>>0).toString(16)).slice(-4);};
+						postMessage({cmd: 'print', txt:
+							'[caller-asm] +0x00: ' +
+							hex($0)+' '+hex($1)+' '+hex($2)+' '+hex($3)+' '+
+							hex($4)+' '+hex($5)+' '+hex($6)+' '+hex($7)});
+					}, (int)cw[0],(int)cw[1],(int)cw[2],(int)cw[3],(int)cw[4],(int)cw[5],(int)cw[6],(int)cw[7]);
+					MAIN_THREAD_EM_ASM({
+						var hex = function(x){return ('0000'+(x>>>0).toString(16)).slice(-4);};
+						postMessage({cmd: 'print', txt:
+							'[caller-asm] +0x10: ' +
+							hex($0)+' '+hex($1)+' '+hex($2)+' '+hex($3)+' '+
+							hex($4)+' '+hex($5)+' '+hex($6)+' '+hex($7)});
+					}, (int)cw[8],(int)cw[9],(int)cw[10],(int)cw[11],(int)cw[12],(int)cw[13],(int)cw[14],(int)cw[15]);
+				}
+				// One-shot disassembly dump of the 0x8c02c16a wedge block.
+				// Loop reads 1 byte/dispatch from r14 (VRAM 0x05XXxxxx); we
+				// need to know what termination/exit condition it expects.
+				static bool s_wedge_dump_fired = false;
+				if (g_diag_enabled && !s_wedge_dump_fired &&
+				    ctx->pc >= 0x8c02c160u && ctx->pc < 0x8c02c180u) {
+					s_wedge_dump_fired = true;
+					const u32 base = 0x8c02c160u;
+					u16 w[16];
+					for (int i = 0; i < 16; i++) w[i] = ReadMem16(base + i*2);
+					MAIN_THREAD_EM_ASM({
+						var hex = function(x){return ('0000'+(x>>>0).toString(16)).slice(-4);};
+						postMessage({cmd: 'print', txt:
+							'[wedge-asm] 0x8c02c160: ' +
+							hex($0)+' '+hex($1)+' '+hex($2)+' '+hex($3)+' '+
+							hex($4)+' '+hex($5)+' '+hex($6)+' '+hex($7)});
+						postMessage({cmd: 'print', txt:
+							'[wedge-asm] 0x8c02c170: ' +
+							hex($8)+' '+hex($9)+' '+hex($10)+' '+hex($11)+' '+
+							hex($12)+' '+hex($13)+' '+hex($14)+' '+hex($15)});
+					}, (int)w[0],(int)w[1],(int)w[2],(int)w[3],(int)w[4],(int)w[5],(int)w[6],(int)w[7],
+					   (int)w[8],(int)w[9],(int)w[10],(int)w[11],(int)w[12],(int)w[13],(int)w[14],(int)w[15]);
+					// Dump current VRAM bytes the poll is scanning, so we can
+					// see whether the DMA target buffer is actually zero or
+					// nonzero where r14 is pointing.
+					const u32 vaddr = ctx->r[14] & 0x1FFFFFFFu;
+					u8 vb[16];
+					for (int i = 0; i < 16; i++) vb[i] = ReadMem8(vaddr + i);
+					MAIN_THREAD_EM_ASM({
+						var hex2 = function(x){return ('00'+(x>>>0).toString(16)).slice(-2);};
+						postMessage({cmd: 'print', txt:
+							'[wedge-vram] 0x' + ($0 >>> 0).toString(16) + ': ' +
+							hex2($1)+' '+hex2($2)+' '+hex2($3)+' '+hex2($4)+' '+
+							hex2($5)+' '+hex2($6)+' '+hex2($7)+' '+hex2($8)+' '+
+							hex2($9)+' '+hex2($10)+' '+hex2($11)+' '+hex2($12)+' '+
+							hex2($13)+' '+hex2($14)+' '+hex2($15)+' '+hex2($16)});
+					}, (int)vaddr,
+					   (int)vb[0],(int)vb[1],(int)vb[2],(int)vb[3],(int)vb[4],(int)vb[5],(int)vb[6],(int)vb[7],
+					   (int)vb[8],(int)vb[9],(int)vb[10],(int)vb[11],(int)vb[12],(int)vb[13],(int)vb[14],(int)vb[15]);
 				}
 				// One-shot dump of SH4 instructions at PCs that wrote zero
 				// to SB_IML*NRM (interrupt mask registers). If real BIOS

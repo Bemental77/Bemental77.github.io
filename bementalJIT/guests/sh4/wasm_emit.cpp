@@ -77,6 +77,19 @@ static bool s_lazy_regcache_enabled = []{
     return e && e[0] != '0';
 }();
 
+// Per-block interrupt-pend prologue check. Mirrors redream's x64 backend
+// (x64_backend.cc:651-653): test ctx->interrupt_pend, on non-zero dispatch
+// UpdateINTC via the SHIL_FB sentinel and exit the block. Without this we
+// only catch pending interrupts at timeslice boundaries (every 448 cycles
+// in rec_wasm.cpp:1407-1414), which under our reduced JIT throughput lets
+// PSO IRL4-wait loops poll forever. Default ON; env-var doesn't reach the
+// pthread worker so flipping requires rebuild.
+static bool s_intc_pend_check = []{
+    const char* e = std::getenv("FLYCAST_INTC_PROLOGUE");
+    if (e) return e[0] != '0';
+    return true;
+}();
+
 // ---------------------------------------------------------------------------
 // Param helpers
 // ---------------------------------------------------------------------------
@@ -2055,6 +2068,25 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         // Both flavors run BEFORE the loop header so cached locals persist
         // across iterations rather than being re-fetched every time.
         reloadOrInvalidate(b, cache);
+
+        // Per-block interrupt-pend check (Fix A — redream-style). If a peripheral
+        // raise (asic_RaiseInterrupt) has set ctx->interrupt_pend AND the SR.IMASK
+        // mask allows it, dispatch UpdateINTC via the SHIL_FB sentinel route
+        // (block_vaddr=0xFFFFFFFF triggers UpdateINTC at EmscriptenWorker.cpp:1095)
+        // and return ctx->pc — the dispatcher re-enters at the new PC after Flycast's
+        // Do_Interrupt has rewritten it for the exception vector.
+        if (s_intc_pend_check && block != nullptr) {
+            b.op_local_get(LOCAL_CTX);
+            b.op_i32_load(ctx_off::INTERRUPT_PEND);
+            b.op_if();
+                b.op_i32_const((s32)0xFFFFFFFFu);
+                b.op_i32_const(0);
+                b.op_call(WIMPORT_SHIL_FB);
+                b.op_local_get(LOCAL_CTX);
+                b.op_i32_load(ctx_off::PC);
+                b.op_return();
+            b.op_end();
+        }
 
         if (self_loop) {
             b.op_loop();   // 0x40 / void blocktype — loop body produces no value

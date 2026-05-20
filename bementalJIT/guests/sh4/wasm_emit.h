@@ -60,11 +60,12 @@ enum WasmImportFunc : u32 {
 //   + cycle_counter                                               @ 0x174
 // ---------------------------------------------------------------------------
 namespace ctx_off {
-    constexpr u32 PC            = 0x148;
-    constexpr u32 JDYN          = 0x14C;
-    constexpr u32 SR_STATUS     = 0x150;
-    constexpr u32 SR_T          = 0x154;
-    constexpr u32 CYCLE_COUNTER = 0x174;
+    constexpr u32 PC             = 0x148;
+    constexpr u32 JDYN           = 0x14C;
+    constexpr u32 SR_STATUS      = 0x150;
+    constexpr u32 SR_T           = 0x154;
+    constexpr u32 INTERRUPT_PEND = 0x16C;
+    constexpr u32 CYCLE_COUNTER  = 0x174;
 }
 
 // ---------------------------------------------------------------------------
