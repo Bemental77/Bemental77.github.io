@@ -330,6 +330,12 @@ std::atomic<uint64_t> g_ifb_count{0};
 std::atomic<uint64_t> g_exc_count{0};
 EMSCRIPTEN_KEEPALIVE void flycast_diag_set(int on) { g_diag_enabled = !!on; }
 EMSCRIPTEN_KEEPALIVE uint64_t flycast_diag_ifb(void) { return g_ifb_count.load(); }
+// OOB-location probe (2026-05-21): read the live SH4 pc from JS. On a wasm
+// memory-OOB trap the shim catch reads this to learn the trapping block's
+// entry pc — ctx->pc holds the current block's entry until the trampoline
+// writes next_pc after fn() returns, so a mid-block trap leaves it pointing
+// at the faulting block.
+EMSCRIPTEN_KEEPALIVE uint32_t flycast_get_sh4_pc(void) { return Sh4cntx.pc; }
 
 // Interpreter-only mode. When set, wasm_block_trampoline bypasses the JIT path
 // entirely and routes every dispatch through Sh4Interpreter::Step() (one SH4
@@ -919,13 +925,17 @@ public:
 		INFO_LOG(DYNAREC, "[rec_wasm] reset — clearing %zu compiled blocks",
 		         g_compiled_blocks.size());
 		g_compiled_blocks.clear();
-		// Drop the vaddr -> fn table. The wasmTable slots on the JS side
-		// stay allocated (V8 owns the table and we can't usefully shrink
-		// it); the next install just keeps growing. The Instance refs in
-		// flycast_table_slots[] remain GC roots so previously-installed
-		// blocks won't be collected, but since jit_lookup() no longer
-		// finds them by vaddr they're unreachable from the dispatcher.
-		jit_clear();
+		// DO NOT jit_clear() here. Sh4Dynarec::reset() is invoked from
+		// flycast bm_ResetCache() (blockmanager.cpp:398), which immediately
+		// AFTER us resets FPCA and then RELINKS every surviving block in
+		// blkmap back into FPCA (blockmanager.cpp:399-409). flycast's reset
+		// only compacts ITS code buffer; our compiled blocks live in the
+		// shared wasmTable and survive it — their vaddr->index mapping is
+		// still valid. Wiping the jit shadow here desynced us from the
+		// relinked FPCA: jit_lookup missed -> recompile -> bm_AddBlock's
+		// verify(FPCA==ngen_FailedToFindBlock) failed -> os_DebugBreak (a
+		// [[noreturn]] worker kill) ~1692 blocks into boot. Keeping the
+		// shadow keeps jit and FPCA in sync across the code-buffer reset.
 		// F1 — Discard any pending un-sealed shard. The RuntimeBlockInfo*
 		// pointers in s_pending_shard are owned by the block manager which
 		// is also resetting; holding them past this point would be UAF.
