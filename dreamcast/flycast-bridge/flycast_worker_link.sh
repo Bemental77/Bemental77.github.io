@@ -63,7 +63,8 @@ EXPORTED_FUNCS='[
   "_flycast_diag_ifb",
   "_flycast_set_interp_only",
   "_flycast_interp_step_count",
-  "_flycast_set_pc_trace_until"
+  "_flycast_set_pc_trace_until",
+  "_flycast_get_sh4_pc"
 ]'
 
 EXPORTED_RUNTIME='[

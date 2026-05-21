@@ -261,7 +261,10 @@
           Module._emscripten_run_iter();
           postMessage({ cmd: 'frame' });
         } catch (err) {
-          postMessage({ cmd: 'print', txt: '[flycast-shim] run_iter threw: ' + (err && err.message ? err.message : String(err)) });
+          var pcTxt = '';
+          try { if (Module._flycast_get_sh4_pc) pcTxt = ' sh4_pc=0x' + (Module._flycast_get_sh4_pc() >>> 0).toString(16); } catch (_) {}
+          var stk = (err && err.stack) ? (' stack=' + String(err.stack).split('\n').slice(0,4).join(' | ')) : '';
+          postMessage({ cmd: 'print', txt: '[flycast-shim] run_iter threw: ' + (err && err.message ? err.message : String(err)) + pcTxt + stk });
         }
         break;
       }

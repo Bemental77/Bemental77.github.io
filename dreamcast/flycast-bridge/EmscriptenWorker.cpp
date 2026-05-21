@@ -191,8 +191,29 @@ static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
     static unsigned long frame_count = 0;
     static unsigned long real_frame_count = 0;
     ++frame_count;
-    const bool is_real_frame = (data != nullptr);
+    // RETRO_HW_FRAME_BUFFER_VALID == (void*)-1 is libretro's HARDWARE-rendered
+    // frame sentinel: the frame lives in the WebGL2 FBO, NOT at `data`. Flycast
+    // is configured for HW rendering (SET_HW_RENDER), so once it produces a
+    // frame it passes (void*)-1 here. The old `is_real_frame = data != nullptr`
+    // + `if (!data) return` guards let the sentinel through → Path A/B then
+    // memcpy'd from 0xFFFFFFFF → wasm "memory access out of bounds" (the OOB
+    // the clean/fast build hit at the first rendered frame; the slow diag build
+    // never rendered, so it never tripped this). Treat it as a non-software
+    // frame: do not dereference `data`. (HW-frame *presentation* via the WebGL
+    // canvas / glReadPixels is a separate follow-on.)
+    const bool is_hw_frame = (data == (const void*)(intptr_t)-1);
+    const bool is_real_frame = (data != nullptr) && !is_hw_frame;
     if (is_real_frame) ++real_frame_count;
+    if (is_hw_frame) {
+        static unsigned long hw_frame_count = 0;
+        ++hw_frame_count;
+        if (hw_frame_count < 5 || hw_frame_count % 1000 == 0) {
+            MAIN_THREAD_EM_ASM({
+                postMessage({cmd: 'print', txt: '[flycast-worker] video_cb #' + $0 + ' HW_FRAME_VALID #' + $1 + ' (WebGL FBO, not dereferenced) w=' + $2 + ' h=' + $3});
+            }, (int)frame_count, (int)hw_frame_count, w, h);
+        }
+        return;
+    }
     // Log only the first few + the first real frame + every 1000th call.
     // The dupe-frame (data=NULL) stream is the libretro "is_dupe" sentinel
     // — at our boot speed it fires every iter for many seconds; the noise
@@ -863,6 +884,7 @@ static inline void gdrom_log_w(uint32_t addr, uint32_t val, int width,
        (int)pend_before, (int)pend_after);
 }
 #endif // FLYCAST_BRIDGE_DIAG
+
 
 EMSCRIPTEN_KEEPALIVE
 uint32_t sh4_mem_read8(uint32_t addr) {
