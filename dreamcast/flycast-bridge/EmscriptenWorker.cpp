@@ -207,10 +207,15 @@ static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
     if (is_hw_frame) {
         static unsigned long hw_frame_count = 0;
         ++hw_frame_count;
-        if (hw_frame_count < 5 || hw_frame_count % 1000 == 0) {
+        // Present the frame flycast just rendered into the OffscreenCanvas
+        // backbuffer. We run on the GL-owning thread with explicitSwapControl,
+        // so commit_frame is the swap. Without it the backbuffer is never
+        // composited to the visible canvas (black screen).
+        EMSCRIPTEN_RESULT swap = emscripten_webgl_commit_frame();
+        if (hw_frame_count < 5 || hw_frame_count % 600 == 0) {
             MAIN_THREAD_EM_ASM({
-                postMessage({cmd: 'print', txt: '[flycast-worker] video_cb #' + $0 + ' HW_FRAME_VALID #' + $1 + ' (WebGL FBO, not dereferenced) w=' + $2 + ' h=' + $3});
-            }, (int)frame_count, (int)hw_frame_count, w, h);
+                postMessage({cmd: 'print', txt: '[flycast-worker] video_cb #' + $0 + ' HW_FRAME_VALID #' + $1 + ' commit_frame=' + $2 + ' w=' + $3 + ' h=' + $4});
+            }, (int)frame_count, (int)hw_frame_count, (int)swap, w, h);
         }
         return;
     }
@@ -350,7 +355,13 @@ int emscripten_create_gl_context(void) {
     attrs.preserveDrawingBuffer     = false;
     attrs.failIfMajorPerformanceCaveat = false;
     attrs.enableExtensionsByDefault = true;
-    attrs.explicitSwapControl       = false;
+    // explicitSwapControl=true: the worker drives the SH4 loop from a
+    // postMessage handler, NOT emscripten's RAF main loop, so the implicit
+    // swap (which is RAF-driven) never fires → frames rendered to the
+    // OffscreenCanvas backbuffer were never presented (black canvas). With
+    // explicit control we present via emscripten_webgl_commit_frame() when a
+    // HW frame is ready (video_cb RETRO_HW_FRAME_BUFFER_VALID).
+    attrs.explicitSwapControl       = true;
     attrs.renderViaOffscreenBackBuffer = false;
     attrs.proxyContextToMainThread  = EMSCRIPTEN_WEBGL_CONTEXT_PROXY_DISALLOW;
 

@@ -48,6 +48,7 @@ let KEEP_NOISE = false;
 let LOG_PATH = process.env.PROBE_LOG || '';
 let INTERP_ONLY = false;
 let PC_TRACE_UNTIL = 0;
+let SCREENSHOT_PATH = '';
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
   if (a === '--duration')   DURATION_MS = parseInt(process.argv[++i], 10);
@@ -57,6 +58,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === '--log')   LOG_PATH = process.argv[++i];
   else if (a === '--interp') INTERP_ONLY = true;
   else if (a === '--pctrace') PC_TRACE_UNTIL = parseInt(process.argv[++i], 10) >>> 0;
+  else if (a === '--screenshot') SCREENSHOT_PATH = process.argv[++i];
   else if (a === '-h' || a === '--help') {
     console.log('flycast_probe [--duration MS] [--idle MS] [--no-start] [--keep-noise] [--log PATH] [--interp] [--pctrace N]');
     process.exit(0);
@@ -202,6 +204,19 @@ function classify(text) {
     }
   }
   if (!stopReason) stopReason = 'duration-elapsed';
+
+  // Capture the visible canvas (browser composites the worker's OffscreenCanvas
+  // into it). Black PNG = HW frame not presented; non-black = presentation works.
+  if (SCREENSHOT_PATH) {
+    try {
+      const el = await page.$('#dc-canvas');
+      if (el) { await el.screenshot({ path: SCREENSHOT_PATH }); }
+      else    { await page.screenshot({ path: SCREENSHOT_PATH }); }
+      process.stdout.write('[probe] screenshot -> ' + SCREENSHOT_PATH + '\n');
+    } catch (e) {
+      process.stdout.write('[probe] screenshot failed: ' + e.message + '\n');
+    }
+  }
 
   await browser.close();
   srv.close();
