@@ -157,6 +157,17 @@ if [ -n "${FLYCAST_RELEASE:-}" ]; then
 else
   echo "link: diagnostic trace ON (-DFLYCAST_BRIDGE_DIAG -DDEBUG_DISPATCH)"
 fi
+# FLYCAST_MICROBENCH=1 — clean per-dispatch cost measurement (phase6 §2).
+# Forces the release/clean dispatch path (NO DEBUG_DISPATCH per-dispatch
+# timing, NO diag samplers) and compiles in exactly ONE batch timer per 10k
+# dispatches. Mutually exclusive with DEBUG_DISPATCH on purpose: the entire
+# point is to measure dispatch cost WITHOUT the ~11 emscripten_get_now()/
+# dispatch + ring-write samplers the diag path adds (which dominate the diag
+# build's own "[cost-breakdown]"). Emits "[mbench] per_dispatch_us=...".
+if [ -n "${FLYCAST_MICROBENCH:-}" ]; then
+  DIAG_FLAGS="-DDISPATCH_MICROBENCH"
+  echo "link: FLYCAST_MICROBENCH=1 — clean per-dispatch microbench ON (DEBUG_DISPATCH OFF)"
+fi
 
 # ---------------------------------------------------------------------------
 # emcc link
@@ -208,7 +219,13 @@ emcc \
   -DNDEBUG \
   -D__LIBRETRO__ \
   -pthread \
-  -matomics -mbulk-memory -mtail-call \
+  `# -mtail-call REMOVED 2026-05-21: clang/LTO converted calls in flycast-src` \
+  `# (hw_get_proc_address_cb + GL dispatch) into return_call, which wasm-opt's` \
+  `# --asyncify pass fatals on ("tail calls not yet supported in asyncify").` \
+  `# Only the diag build (DEBUG_DISPATCH on) happened to dodge it; FLYCAST_RELEASE` \
+  `# never linked. The static module does not need tail calls — runtime JIT` \
+  `# blocks emit their own return_call bytes via WasmModuleBuilder.` \
+  -matomics -mbulk-memory \
   -sIMPORTED_MEMORY=1 \
   -sINITIAL_MEMORY=536870912 \
   -sMAXIMUM_MEMORY=4294967296 \

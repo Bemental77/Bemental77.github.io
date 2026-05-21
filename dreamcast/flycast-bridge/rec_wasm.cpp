@@ -1125,17 +1125,27 @@ public:
 					const u32 vaddr = ctx->r[14] & 0x1FFFFFFFu;
 					u8 vb[16];
 					for (int i = 0; i < 16; i++) vb[i] = ReadMem8(vaddr + i);
+					// NOTE: MAIN_THREAD_EM_ASM's proxied arg marshaling caps at
+					// 16 substituted args ($0..$15). Passing 17 ($0..$16) made
+					// $16 a bare undefined identifier → "$16 is not defined"
+					// thrown out of run_iter every time dispatch reached this
+					// PC. Split across two postMessages, each <=9 args.
 					MAIN_THREAD_EM_ASM({
 						var hex2 = function(x){return ('00'+(x>>>0).toString(16)).slice(-2);};
 						postMessage({cmd: 'print', txt:
 							'[wedge-vram] 0x' + ($0 >>> 0).toString(16) + ': ' +
 							hex2($1)+' '+hex2($2)+' '+hex2($3)+' '+hex2($4)+' '+
-							hex2($5)+' '+hex2($6)+' '+hex2($7)+' '+hex2($8)+' '+
-							hex2($9)+' '+hex2($10)+' '+hex2($11)+' '+hex2($12)+' '+
-							hex2($13)+' '+hex2($14)+' '+hex2($15)+' '+hex2($16)});
+							hex2($5)+' '+hex2($6)+' '+hex2($7)+' '+hex2($8)});
 					}, (int)vaddr,
-					   (int)vb[0],(int)vb[1],(int)vb[2],(int)vb[3],(int)vb[4],(int)vb[5],(int)vb[6],(int)vb[7],
-					   (int)vb[8],(int)vb[9],(int)vb[10],(int)vb[11],(int)vb[12],(int)vb[13],(int)vb[14],(int)vb[15]);
+					   (int)vb[0],(int)vb[1],(int)vb[2],(int)vb[3],(int)vb[4],(int)vb[5],(int)vb[6],(int)vb[7]);
+					MAIN_THREAD_EM_ASM({
+						var hex2 = function(x){return ('00'+(x>>>0).toString(16)).slice(-2);};
+						postMessage({cmd: 'print', txt:
+							'[wedge-vram] +8: ' +
+							hex2($0)+' '+hex2($1)+' '+hex2($2)+' '+hex2($3)+' '+
+							hex2($4)+' '+hex2($5)+' '+hex2($6)+' '+hex2($7)});
+					}, (int)vb[8],(int)vb[9],(int)vb[10],(int)vb[11],
+					   (int)vb[12],(int)vb[13],(int)vb[14],(int)vb[15]);
 				}
 				// One-shot dump of SH4 instructions at PCs that wrote zero
 				// to SB_IML*NRM (interrupt mask registers). If real BIOS
@@ -1520,6 +1530,32 @@ public:
 							   (int)s_pc_ring_before[slot], (int)s_pc_ring_after[slot]);
 						}
 						ctx->CpuRunning = false;
+					}
+				}
+#elif defined(DISPATCH_MICROBENCH)
+				// Clean per-dispatch cost (phase6 §2). ONE emscripten_get_now()
+				// pair per 10k dispatches → measurement granularity ~0.5ns/disp,
+				// versus the diag path's ~11 get_now()+samplers per dispatch.
+				{
+					static constexpr unsigned MBENCH_BATCH = 10000;
+					static unsigned          mbench_n      = 0;
+					static double            mbench_t0     = 0.0;
+					static unsigned long     mbench_total  = 0;
+					if (mbench_n == 0) mbench_t0 = emscripten_get_now();
+					wasm_block_trampoline();
+					if (++mbench_n == MBENCH_BATCH) {
+						double dt_ms           = emscripten_get_now() - mbench_t0;
+						double per_dispatch_us = (dt_ms * 1000.0) / (double)MBENCH_BATCH;
+						mbench_total += MBENCH_BATCH;
+						if ((mbench_total % 100000) == 0) {
+							MAIN_THREAD_EM_ASM({
+								postMessage({cmd: 'print', txt:
+									'[mbench] per_dispatch_us=' + ($0).toFixed(3) +
+									' blocks=' + ($1|0) +
+									' cumulative=' + ($2|0)});
+							}, per_dispatch_us, (int)s_block_count, (int)mbench_total);
+						}
+						mbench_n = 0;
 					}
 				}
 #else
