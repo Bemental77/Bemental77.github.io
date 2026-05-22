@@ -524,6 +524,46 @@ static void wasm_block_trampoline()
         }, buf);
     }
 
+    // ---- Snap PR/JDYN at the rts-spin block (next_pc=ctx[0x140]=PR). ----
+    static int s_pr_snap = 0;
+    static uint64_t s_c16a_hits = 0;
+    if (pc == 0x8c02c16au && s_pr_snap < 24 &&
+        (s_c16a_hits++ % 50000ull) == 0) {
+        s_pr_snap++;
+        const u32 pr   = ((const u32*)ctx)[0x140/4];
+        const u32 jdyn = ((const u32*)ctx)[0x14C/4];
+        const u32 ipend = ((const u32*)ctx)[0x16C/4];   // interrupt_pend (prologue reads this)
+        const u32 srf  = ctx->sr.getFull();
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "[pr-snap] #%d pc=0x8c02c16a PR=0x%08x JDYN=0x%08x "
+            "r4=0x%08x r5=0x%08x r6=0x%08x r12=0x%08x r13=0x%08x r14=0x%08x r15=0x%08x "
+            "interrupt_pend=0x%08x sr=0x%08x",
+            s_pr_snap, pr, jdyn,
+            ctx->r[4], ctx->r[5], ctx->r[6], ctx->r[12], ctx->r[13], ctx->r[14], ctx->r[15],
+            ipend, srf);
+        MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, buf);
+    }
+
+    // ---- One-shot snap of the 0x8c02139e POLL loop's target. ----
+    // The block reads @(ctx field 208), ANDs with (ctx field 212), and spins
+    // while the masked value is unchanged. Capture the polled guest address,
+    // the mask, and ReadMem32 of the address so we can name what the JIT is
+    // waiting on (RAM flag set by SH4 code vs MMIO/peripheral state).
+    static int s_poll_snap = 0;
+    if (s_poll_snap < 4 && pc == 0x8c02139eu) {
+        s_poll_snap++;
+        const u32 poll_addr = ((const u32*)ctx)[208/4];
+        const u32 poll_mask = ((const u32*)ctx)[212/4];
+        const u32 poll_val  = ReadMem32(poll_addr);
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+            "[poll-139e] #%d addr=0x%08x mask=0x%08x val=0x%08x (val&mask)=0x%08x sr=%08x",
+            s_poll_snap, poll_addr, poll_mask, poll_val, (poll_val & poll_mask),
+            ctx->sr.getFull());
+        MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt: UTF8ToString($0)}); }, buf);
+    }
+
     BlockFn fn = jit_lookup(pc);
     if (!fn) {
         // Cold block — ask the block manager to compile via the standard
@@ -784,16 +824,37 @@ public:
 		static bool s_dumped_target2 = false;
 		static bool s_dumped_target3 = false;
 		static bool s_dumped_target4 = false;
+		// Spin blocks (the JIT-non-termination wedge): the interpreter completes
+		// this init loop nest and proceeds to game code; the JIT cycles here
+		// forever. Dump their emitted wasm to find the loop-exit codegen bug.
+		static bool s_dumped_target5 = false;  // 0x8c02c16a inner spin block
+		static bool s_dumped_target6 = false;  // 0x8c02139e outer-loop spin block
+		static bool s_dumped_target7 = false;  // 0x8c02116c
+		static bool s_dumped_target8 = false;  // 0x8c00851e
+		static bool s_dumped_target9 = false;  // 0xac008300 (P2) state-diff first-divergent block
+		static bool s_dumped_target10 = false; // 0x8c02ab54 counter block (add #1,r13; cmp/ge; bf/s)
 		const bool dump_now =
 			(!s_dumped_target1 && vaddr == 0x8c0133f4u) ||
 			(!s_dumped_target2 && vaddr == 0x8c02ab4cu) ||
 			(!s_dumped_target3 && vaddr == 0x8c02c160u) ||
-			(!s_dumped_target4 && vaddr == 0x8c01a494u);
+			(!s_dumped_target4 && vaddr == 0x8c01a494u) ||
+			(!s_dumped_target5 && vaddr == 0x8c02c16au) ||
+			(!s_dumped_target6 && vaddr == 0x8c02139eu) ||
+			(!s_dumped_target7 && vaddr == 0x8c02116cu) ||
+			(!s_dumped_target8 && vaddr == 0x8c00851eu) ||
+			(!s_dumped_target9 && vaddr == 0xac008300u) ||
+			(!s_dumped_target10 && vaddr == 0x8c02ab54u);
 		if (dump_now) {
 			if (vaddr == 0x8c0133f4u) s_dumped_target1 = true;
 			if (vaddr == 0x8c02ab4cu) s_dumped_target2 = true;
 			if (vaddr == 0x8c02c160u) s_dumped_target3 = true;
 			if (vaddr == 0x8c01a494u) s_dumped_target4 = true;
+			if (vaddr == 0x8c02c16au) s_dumped_target5 = true;
+			if (vaddr == 0x8c02139eu) s_dumped_target6 = true;
+			if (vaddr == 0x8c02116cu) s_dumped_target7 = true;
+			if (vaddr == 0x8c00851eu) s_dumped_target8 = true;
+			if (vaddr == 0xac008300u) s_dumped_target9 = true;
+			if (vaddr == 0x8c02ab54u) s_dumped_target10 = true;
 			std::string hex;
 			hex.reserve(bytes.size() * 2);
 			static const char* kHex = "0123456789abcdef";
@@ -870,7 +931,7 @@ public:
 		// first 8 raw guest instruction words. Tells us whether RAM has
 		// real SH4 code or is zero-filled (i.e. 1ST_READ.BIN never landed).
 		static unsigned s_ram_blocks_dumped = 0;
-		if ((vaddr >> 28) == 0x8 && (vaddr & 0x0FF00000) >= 0x0C000000 &&
+		if (((vaddr >> 28) == 0x8 || (vaddr >> 28) == 0xa) && (vaddr & 0x0FF00000) >= 0x0C000000 &&
 		    s_ram_blocks_dumped < 400) {
 			++s_ram_blocks_dumped;
 			u16 w0 = ReadMem16(vaddr + 0);
@@ -1476,6 +1537,54 @@ public:
 					s_pc_ring_r15   [s_pc_ring_idx] = ctx->r[15];
 					s_pc_ring_pr    [s_pc_ring_idx] = ctx->pr;
 					s_pc_ring_idx = (s_pc_ring_idx + 1) % PC_RING_LEN;
+
+					// [traj] First-seen block-entry trajectory: record each
+					// DISTINCT block entry PC in execution order (no loop
+					// repetition), so the full boot control-flow path fits in a
+					// bounded buffer. Cheap (set lookup + push), no per-dispatch
+					// proxy. Dumped once on the first transition into the spin
+					// (0x8c02c16a). Diff vs the interpreter's trajectory => the
+					// FIRST block where the JIT takes a different successor (the
+					// divergent branch). The 256-ring was too short (divergence
+					// is upstream of it), the dense trace too slow, sampler too
+					// coarse.
+					// State-diff: key by block-ENTRY pc (pc_after = the block
+					// about to run), record an FNV hash of the architectural
+					// state entering it. JIT & interp execute the same pcs in
+					// the same order until they diverge, so the FIRST pc where
+					// both ran it but the hashes differ = the first state
+					// divergence (the prior block mis-computed something). Same
+					// pc missing from one = a control-flow divergence.
+					static std::unordered_set<u32> s_traj_seen;
+					static std::vector<u32> s_traj_pc;
+					static std::vector<u32> s_traj_hash;
+					if (s_traj_pc.size() < 200000u && s_traj_seen.insert(pc_after).second) {
+						u32 h = 2166136261u;
+						for (int ri = 0; ri < 16; ri++) h = (h ^ ctx->r[ri]) * 16777619u;
+						h = (h ^ ctx->sr.getFull()) * 16777619u;
+						h = (h ^ ctx->pr)  * 16777619u;
+						h = (h ^ ctx->gbr) * 16777619u;
+						h = (h ^ ctx->vbr) * 16777619u;
+						h = (h ^ ctx->mac.h) * 16777619u;
+						h = (h ^ ctx->mac.l) * 16777619u;
+						s_traj_pc.push_back(pc_after);
+						s_traj_hash.push_back(h);
+					}
+					static bool s_traj_dumped = false;
+					if (!s_traj_dumped && (pc_after == 0x8c02c16au || s_traj_pc.size() >= 4000u)) {
+						s_traj_dumped = true;
+						// Emit pc:hash pairs, 8 per line.
+						std::string line; char tmp[24]; unsigned col = 0;
+						for (size_t i = 0; i < s_traj_pc.size(); i++) {
+							snprintf(tmp, sizeof(tmp), "%08x:%08x ", s_traj_pc[i], s_traj_hash[i]);
+							line += tmp;
+							if (++col == 8 || i + 1 == s_traj_pc.size()) {
+								MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[traj] '+UTF8ToString($0)}); }, line.c_str());
+								line.clear(); col = 0;
+							}
+						}
+						MAIN_THREAD_EM_ASM({ postMessage({cmd:'print', txt:'[traj] count='+($0|0)}); }, (int)s_traj_pc.size());
+					}
 
 					// PR-corruption tripwire: PR must always be 16-bit aligned
 					// (LSB=0) on real SH4. Any block exit with PR having bit 0

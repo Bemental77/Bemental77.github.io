@@ -395,6 +395,29 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
 }
 
 int BlockCache::compile(u64 key, const u8* bytes, std::size_t size) {
+#ifdef __EMSCRIPTEN__
+    // [compile-key] log every distinct compile() key+size so the block map is
+    // visible — the OSInit wedge block (B) is keyed by something other than
+    // 0x800e362c (compile(0x800e362c) is never called yet dispatch leaves
+    // ppc_state.pc=0x800e362c). Capped. Full hex for any key in the OSInit
+    // region [0x800e3500,0x800e3700) so it can be disassembled (wasm2wat).
+    {
+        static u32 s_ck_n = 0;
+        if (s_ck_n < 80u) {
+            ++s_ck_n;
+            EM_ASM({ console.error('[compile-key] key=0x' + ($0>>>0).toString(16) + ' size=' + ($1>>>0)); },
+                   (u32)key, (u32)size);
+        }
+        const u32 kk = (u32)key;
+        if (kk >= 0x800e3500u && kk < 0x800e4000u) {
+            EM_ASM({
+                var p = $0>>>0; var n = $1>>>0; var s = '';
+                for (var i = 0; i < n; i++) { var b = HEAPU8[p+i]; s += (b<16?'0':'') + b.toString(16); }
+                console.error('[block-dump] key=0x' + ($2>>>0).toString(16) + ' size=' + n + ' hex=' + s);
+            }, (u32)(uintptr_t)bytes, (u32)size, kk);
+        }
+    }
+#endif
     // Bound the cache to prevent OOM when the guest emits a flood of unique
     // blocks (e.g. JIT'ing garbage virtual addresses with MMU off — each one
     // compiles a fresh module). Wipe everything past the cap; hot blocks
@@ -635,12 +658,21 @@ bool BlockCache::region_should_relink(Region r) const {
     else                          threshold = 256u;
     const bool block_trigger = (rs.blocks_since_link >= threshold);
 
+    // [determinism] JITWASM_DETERMINISTIC=1 makes relink timing reproducible:
+    // relink fires purely on block/dispatch COUNTS, never on wall-clock. This
+    // removes the run-to-run variance in WHEN relink fires (and thus which
+    // region module layout is live), which is the structural source of the
+    // shifting wedge PC. Acceptance: two runs of one build → identical traces.
+    static const bool s_deterministic = (std::getenv("JITWASM_DETERMINISTIC") != nullptr);
+
     // Trigger 2: steady-state catch — the region has at least one block
     // pending and hasn't accumulated a new one in >2 s. Without this, a
     // region that JITs a handful of blocks then quiesces would never get
-    // its merged module built.
+    // its merged module built. TIME-based → suppressed in deterministic mode
+    // (block_trigger alone governs; a deterministic dispatch-budget probe
+    // doesn't strand blocks the way an open-ended run would).
     bool quiesce_trigger = false;
-    if (rs.blocks_since_link >= 1u) {
+    if (!s_deterministic && rs.blocks_since_link >= 1u) {
         const double age = now_ms() - rs.last_accum_ms;
         if (age > 2000.0) quiesce_trigger = true;
     }
@@ -683,9 +715,13 @@ bool BlockCache::region_should_relink(Region r) const {
         // Quiesce trigger ignores the grace gate: if the region has been
         // idle >2 s, V8 has definitely had its bg window — let the relink
         // proceed so pending blocks aren't stranded.
-        if (!quiesce_trigger
-            && since_relink < s_grace_ms
-            && rs.dispatches_since_relink < s_min_dispatches) {
+        // [determinism] in deterministic mode the wall-clock `since_relink`
+        // term is dropped — the grace gate becomes purely dispatch-count
+        // based, so relink timing no longer depends on real time.
+        const bool grace_blocks = s_deterministic
+            ? (rs.dispatches_since_relink < s_min_dispatches)
+            : (since_relink < s_grace_ms && rs.dispatches_since_relink < s_min_dispatches);
+        if (!quiesce_trigger && grace_blocks) {
             return false;
         }
     }
@@ -816,6 +852,33 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
             bins[i].emit_hle_check_native = rec.emit_hle_check_native;
         }
         RegionLookupCtx ctx{ &rs };
+#ifdef __EMSCRIPTEN__
+        // [slotmap] builder-agnostic dump of the authoritative slot→start_pc
+        // map (br_table arm i lands on bins[i]) plus what the emit-time lookup
+        // maps the wedge fn's key successors to. If lookup says 0x800e3958=slot
+        // K but bins[K].start_pc != 0x800e3958, that mismatch is the self-loop.
+        {
+            bool has_wedge = false;
+            for (u32 i = 0; i < rs.n_funcs; ++i)
+                if (bins[i].start_pc == 0x800e362cu) { has_wedge = true; break; }
+            static int s_slotmap_logged = 0;
+            if (has_wedge && s_slotmap_logged < 2) {
+                s_slotmap_logged++;
+                EM_ASM({ console.error('[slotmap] n_funcs=' + ($0|0)); }, rs.n_funcs);
+                for (u32 i = 0; i < rs.n_funcs; ++i)
+                    EM_ASM({ console.error('[slotmap] slot=' + ($0|0)
+                        + ' pc=0x' + ($1>>>0).toString(16)); }, i, bins[i].start_pc);
+                u32 i3958 = 0xffffffffu, i362c = 0xffffffffu, i3654 = 0xffffffffu;
+                const bool r3958 = region_lookup_for_emit(&ctx, 0x800e3958u, &i3958);
+                const bool r362c = region_lookup_for_emit(&ctx, 0x800e362cu, &i362c);
+                const bool r3654 = region_lookup_for_emit(&ctx, 0x800e3654u, &i3654);
+                EM_ASM({ console.error('[slotmap] lookup 3958 res=' + ($0|0) + ' idx=' + ($1|0)
+                    + ' | 362c res=' + ($2|0) + ' idx=' + ($3|0)
+                    + ' | 3654 res=' + ($4|0) + ' idx=' + ($5|0)); },
+                    r3958, (int)i3958, r362c, (int)i362c, r3654, (int)i3654);
+            }
+        }
+#endif
 #ifdef BEMENTALJIT_USE_REBUILD
         bytes = powerpc::build_region_function_next(
             bins.data(), rs.n_funcs,

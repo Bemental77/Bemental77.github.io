@@ -740,10 +740,10 @@ function createWasm() {
     wasmExports = instance.exports;
     wasmExports = Asyncify.instrumentWasmExports(wasmExports);
     wasmExports = applySignatureConversions(wasmExports);
-    registerTLSInit(wasmExports["Lg"]);
-    wasmTable = wasmExports["jg"];
+    registerTLSInit(wasmExports["Ng"]);
+    wasmTable = wasmExports["kg"];
     Module["wasmTable"] = wasmTable;
-    addOnInit(wasmExports["dg"]);
+    addOnInit(wasmExports["eg"]);
     // We now have the Wasm module loaded up, keep a reference to the compiled module so we can post it to the workers.
     wasmModule = module;
     removeRunDependency("wasm-instantiate");
@@ -787,97 +787,97 @@ var tempI64;
 // end include: runtime_debug.js
 // === Body ===
 var ASM_CONSTS = {
-  6641896: $0 => {
+  6641560: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] gl ctx already created, handle=" + $0
     });
   },
-  6641991: $0 => {
+  6641655: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] FATAL: emscripten_webgl_create_context failed (handle=" + $0 + ")"
     });
   },
-  6642115: ($0, $1) => {
+  6641779: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] WebGL2 ctx created on main-runtime thread, handle=" + $0 + ", make_current=" + $1
     });
   },
-  6642254: () => {
+  6641918: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] worker_init: retro_init done"
     });
   },
-  6642341: $0 => {
+  6642005: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] run_iter enter #" + $0
     });
   },
-  6642421: $0 => {
+  6642085: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] run_iter exit  #" + $0
     });
   },
-  6642501: ($0, $1, $2) => {
+  6642165: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] video target set buf=" + $0 + " w=" + $1 + " h=" + $2
     });
   },
-  6642612: ($0, $1) => {
+  6642276: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] audio ring addr=" + $0 + " capacity=" + $1 + " frames"
     });
   },
-  6642724: ($0, $1, $2, $3, $4, $5) => {
-    postMessage({
-      cmd: "print",
-      txt: "[lsb-trip] #" + ($0 | 0) + " write32 addr=0x" + ($1 >>> 0).toString(16) + " val=0x" + ($2 >>> 0).toString(16) + " guest_pc=0x" + ($3 >>> 0).toString(16) + " r15=0x" + ($4 >>> 0).toString(16) + " pr=0x" + ($5 >>> 0).toString(16)
-    });
-  },
-  6642990: ($0, $1, $2) => {
+  6642388: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[ifb-pc] #" + ($0 | 0) + " pc=0x" + ($1 >>> 0).toString(16) + " op=0x" + (($2 | 0) & 65535).toString(16) + " major=" + ((($2 | 0) >> 12) & 15)
     });
   },
-  6643169: ($0, $1, $2, $3) => {
+  6642567: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[sh4-throw] #" + $0 + " pc=" + ($1 >>> 0).toString(16) + " op=" + ($2 & 65535).toString(16) + " sr=" + ($3 >>> 0).toString(16) + " BL=" + (($3 >>> 28) & 1) + " MD=" + (($3 >>> 30) & 1)
     });
   },
-  6643395: () => {
+  6642793: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] main pthread entered (idle)"
     });
   },
-  6643481: ($0, $1, $2) => {
+  6642879: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] SET_HW_RENDER captured (ctx_type=" + $0 + ", ver=" + $1 + "." + $2 + ")"
     });
   },
-  6643611: $0 => {
+  6643009: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast.log] " + UTF8ToString($0)
     });
   },
-  6643686: ($0, $1, $2, $3, $4, $5) => {
+  6643084: ($0, $1, $2, $3, $4) => {
+    postMessage({
+      cmd: "print",
+      txt: "[flycast-worker] video_cb #" + $0 + " HW_FRAME_VALID #" + $1 + " commit_frame=" + $2 + " w=" + $3 + " h=" + $4
+    });
+  },
+  6643235: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] video_cb #" + $0 + " data=" + $1 + " w=" + $2 + " h=" + $3 + " pitch=" + $4 + " real_frames=" + $5
     });
   },
-  6643842: ($0, $1, $2, $3) => {
+  6643391: ($0, $1, $2, $3) => {
     var bytes = $2 * $3;
     var src = $0;
     var view = GROWABLE_HEAP_U8().subarray(src >>> 0, src + bytes >>> 0);
@@ -892,129 +892,80 @@ var ASM_CONSTS = {
       pitch: $3
     }, [ copy.buffer ]);
   },
-  6644061: $0 => {
+  6643610: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: " + UTF8ToString($0)
     });
   },
-  6644150: () => {
+  6643699: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: unknown exception during retro_load_game"
     });
   },
-  6644260: $0 => {
+  6643809: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: C-string exception during retro_load_game: " + UTF8ToString($0)
     });
   },
-  6644392: $0 => {
+  6643941: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: std::exception during retro_load_game: " + UTF8ToString($0)
     });
   },
-  6644520: $0 => {
+  6644069: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: retro_load_game returned " + ($0 ? "true" : "false")
     });
   },
-  6644641: $0 => {
-    postMessage({
-      cmd: "print",
-      txt: UTF8ToString($0)
-    });
-  },
-  6644696: $0 => {
-    postMessage({
-      cmd: "print",
-      txt: UTF8ToString($0)
-    });
-  },
-  6644751: $0 => {
+  6644190: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] disc_type=" + ($0 >>> 0) + " (0=CdRom 1=CdRom_XA 4=GdRom 16=NoDisk)"
     });
   },
-  6644877: ($0, $1, $2, $3, $4) => {
+  6644316: ($0, $1, $2, $3, $4) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] av_info base=" + $0 + "x" + $1 + " max=" + $2 + "x" + $3 + " fps=" + $4
     });
   },
-  6645006: () => {
+  6644445: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] invoking hw_render.context_reset"
     });
   },
-  6645097: () => {
+  6644536: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] hw_render.context_reset returned"
     });
   },
-  6645188: () => {
+  6644627: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] WARNING: hw_render.context_reset not registered"
     });
   },
-  6645294: () => {
-    postMessage({
-      cmd: "print",
-      txt: "[cost-breakdown] sch_list.size=SKIP (file-static in sh4_sched.cpp; " + "no accessor in sh4_sched.h; bridge does not patch flycast-src)"
-    });
-  },
-  6645470: ($0, $1, $2, $3, $4, $5, $6) => {
-    var spi0 = $4 & 255;
-    postMessage({
-      cmd: "print",
-      txt: "[gdrom] R" + ($3 | 0) + " reg=0x" + ($0 >>> 0).toString(16) + " val=0x" + ($1 >>> 0).toString(16) + " pc=0x" + ($2 >>> 0).toString(16) + " [ata=0x" + (($5 | 0).toString(16)) + " spi=0x" + spi0.toString(16) + " rds=" + ($6 | 0) + "]"
-    });
-  },
-  6645759: ($0, $1, $2, $3) => {
-    postMessage({
-      cmd: "print",
-      txt: "[gdrom] R" + ($3 | 0) + " reg=0x" + ($0 >>> 0).toString(16) + " val=0x" + ($1 >>> 0).toString(16) + " pc=0x" + ($2 >>> 0).toString(16)
-    });
-  },
-  6645932: $0 => {
-    var b = $0;
-    var hex = "";
-    for (var i = 0; i < 12; i++) {
-      hex += ("0" + ((GROWABLE_HEAP_U8()[b + i >>> 0]) >>> 0).toString(16)).slice(-2);
-      if (i < 11) hex += " ";
-    }
-    postMessage({
-      cmd: "print",
-      txt: "[gdrom-spi] cmd=0x" + (GROWABLE_HEAP_U8()[b >>> 0] >>> 0).toString(16) + " packet=" + hex
-    });
-  },
-  6646184: ($0, $1, $2, $3, $4, $5) => {
-    postMessage({
-      cmd: "print",
-      txt: "[gdrom] W" + ($3 | 0) + " reg=0x" + ($0 >>> 0).toString(16) + " val=0x" + ($1 >>> 0).toString(16) + " pc=0x" + ($2 >>> 0).toString(16) + " pend=" + ($4 >>> 0).toString(16) + "->" + ($5 >>> 0).toString(16)
-    });
-  },
-  6646427: ($0, $1, $2) => {
+  6644733: ($0, $1, $2) => {
     var s = "[blockdump] vaddr=0x" + ($0 >>> 0).toString(16) + " size=" + ($1 | 0) + " hex=" + UTF8ToString($2);
     postMessage({
       cmd: "print",
       txt: s
     });
   },
-  6646572: ($0, $1) => {
+  6644878: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm] jit_register probe-limit at vaddr=0x" + ($0 >>> 0).toString(16) + " (probe #" + ($1 | 0) + ")"
     });
   },
-  6646715: ($0, $1, $2, $3, $4, $5) => {
+  6645021: ($0, $1, $2, $3, $4, $5) => {
     var addr = $0;
     var n = $1;
     var hex = "";
@@ -1034,31 +985,31 @@ var ASM_CONSTS = {
       txt: "[rec_wasm] install_block FAILED #" + ($3 | 0) + " vaddr=0x" + ($4 >>> 0).toString(16) + " bytes=" + ($5 | 0) + ' err="' + errStr + '"' + " first" + n + "=" + hex
     });
   },
-  6647212: ($0, $1, $2, $3, $4, $5) => {
+  6645518: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] compile RAM-block #" + ($0 | 0) + " vaddr=0x" + ($1 >>> 0).toString(16) + " ops=" + ($2 | 0) + " BlockType=0x" + ($3 >>> 0).toString(16) + " Branch=0x" + ($4 >>> 0).toString(16) + " Next=0x" + ($5 >>> 0).toString(16)
     });
   },
-  6647482: ($0, $1, $2, $3, $4, $5, $6, $7) => {
+  6645788: ($0, $1, $2, $3, $4, $5, $6, $7) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker]   words: " + ($0 >>> 0).toString(16).padStart(4, "0") + " " + ($1 >>> 0).toString(16).padStart(4, "0") + " " + ($2 >>> 0).toString(16).padStart(4, "0") + " " + ($3 >>> 0).toString(16).padStart(4, "0") + " " + ($4 >>> 0).toString(16).padStart(4, "0") + " " + ($5 >>> 0).toString(16).padStart(4, "0") + " " + ($6 >>> 0).toString(16).padStart(4, "0") + " " + ($7 >>> 0).toString(16).padStart(4, "0")
     });
   },
-  6647928: $0 => {
+  6646234: $0 => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm-shard] jit_register probe-limit vaddr=0x" + ($0 >>> 0).toString(16)
     });
   },
-  6648045: ($0, $1, $2) => {
+  6646351: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm-shard] sealed count=" + ($0 | 0) + " base_idx=" + ($1 | 0) + " bytes=" + ($2 | 0)
     });
   },
-  6648170: ($0, $1, $2, $3) => {
+  6646476: ($0, $1, $2, $3) => {
     var errPtr = $0;
     var errStr = "";
     var i = 0;
@@ -1071,262 +1022,34 @@ var ASM_CONSTS = {
       txt: "[rec_wasm-shard] install_shard FAILED #" + ($1 | 0) + " count=" + ($2 | 0) + " bytes=" + ($3 | 0) + ' err="' + errStr + '"'
     });
   },
-  6648472: ($0, $1, $2, $3) => {
+  6646778: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[mem-map] ram=0x" + ($0 >>> 0).toString(16) + " &mem_b[0]=0x" + ($1 >>> 0).toString(16) + " &vram[0]=0x" + ($2 >>> 0).toString(16) + " &aica_ram[0]=0x" + ($3 >>> 0).toString(16)
     });
   },
-  6648681: $0 => {
+  6646987: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6648736: $0 => {
+  6647042: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6648791: $0 => {
-    var s = UTF8ToString($0);
+  6647097: $0 => {
     postMessage({
       cmd: "print",
-      txt: s
+      txt: UTF8ToString($0)
     });
   },
-  6648857: $0 => {
-    var s = UTF8ToString($0);
+  6647152: $0 => {
     postMessage({
       cmd: "print",
-      txt: s
-    });
-  },
-  6648923: ($0, $1, $2) => {
-    postMessage({
-      cmd: "print",
-      txt: "[flycast-worker] mainloop entry #" + ($0 >>> 0) + " CpuRunning=" + $1 + " pc=0x" + ($2 >>> 0).toString(16)
-    });
-  },
-  6649070: ($0, $1, $2, $3, $4) => {
-    postMessage({
-      cmd: "print",
-      txt: "[flycast-worker] sh4 dispatch #" + ($0 >>> 0) + " pc=0x" + ($1 >>> 0).toString(16) + " r0=0x" + ($2 >>> 0).toString(16) + " r6=0x" + ($3 >>> 0).toString(16) + " sr=0x" + ($4 >>> 0).toString(16)
-    });
-  },
-  6649304: ($0, $1, $2, $3) => {
-    postMessage({
-      cmd: "print",
-      txt: "[flycast-worker]   ... r12=0x" + ($0 >>> 0).toString(16) + " r14=0x" + ($1 >>> 0).toString(16) + " vbr=0x" + ($2 >>> 0).toString(16) + " pend=0x" + ($3 >>> 0).toString(16)
-    });
-  },
-  6649516: ($0, $1, $2, $3) => {
-    postMessage({
-      cmd: "print",
-      txt: "[flycast-worker]   ... istnrm=0x" + ($0 >>> 0).toString(16) + " istext=0x" + ($1 >>> 0).toString(16) + " iml4nrm=0x" + ($2 >>> 0).toString(16) + " iml4ext=0x" + ($3 >>> 0).toString(16)
-    });
-  },
-  6649741: ($0, $1, $2, $3, $4) => {
-    postMessage({
-      cmd: "print",
-      txt: "[flycast-worker]   ... pr=0x" + ($0 >>> 0).toString(16) + " r4=0x" + ($1 >>> 0).toString(16) + " r5=0x" + ($2 >>> 0).toString(16) + " r13=0x" + ($3 >>> 0).toString(16) + " r12=0x" + ($4 >>> 0).toString(16)
-    });
-  },
-  6649987: ($0, $1) => {
-    postMessage({
-      cmd: "print",
-      txt: "[caller-asm] fired at dispatch #" + ($0 >>> 0) + " pr=0x" + ($1 >>> 0).toString(16)
-    });
-  },
-  6650111: ($0, $1, $2, $3, $4, $5, $6, $7) => {
-    var hex = function(x) {
-      return ("0000" + (x >>> 0).toString(16)).slice(-4);
-    };
-    postMessage({
-      cmd: "print",
-      txt: "[caller-asm] +0x00: " + hex($0) + " " + hex($1) + " " + hex($2) + " " + hex($3) + " " + hex($4) + " " + hex($5) + " " + hex($6) + " " + hex($7)
-    });
-  },
-  6650340: ($0, $1, $2, $3, $4, $5, $6, $7) => {
-    var hex = function(x) {
-      return ("0000" + (x >>> 0).toString(16)).slice(-4);
-    };
-    postMessage({
-      cmd: "print",
-      txt: "[caller-asm] +0x10: " + hex($0) + " " + hex($1) + " " + hex($2) + " " + hex($3) + " " + hex($4) + " " + hex($5) + " " + hex($6) + " " + hex($7)
-    });
-  },
-  6650569: ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) => {
-    var hex = function(x) {
-      return ("0000" + (x >>> 0).toString(16)).slice(-4);
-    };
-    postMessage({
-      cmd: "print",
-      txt: "[wedge-asm] 0x8c02c160: " + hex($0) + " " + hex($1) + " " + hex($2) + " " + hex($3) + " " + hex($4) + " " + hex($5) + " " + hex($6) + " " + hex($7)
-    });
-    postMessage({
-      cmd: "print",
-      txt: "[wedge-asm] 0x8c02c170: " + hex($8) + " " + hex($9) + " " + hex($10) + " " + hex($11) + " " + hex($12) + " " + hex($13) + " " + hex($14) + " " + hex($15)
-    });
-  },
-  6650965: ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) => {
-    var hex2 = function(x) {
-      return ("00" + (x >>> 0).toString(16)).slice(-2);
-    };
-    postMessage({
-      cmd: "print",
-      txt: "[wedge-vram] 0x" + ($0 >>> 0).toString(16) + ": " + hex2($1) + " " + hex2($2) + " " + hex2($3) + " " + hex2($4) + " " + hex2($5) + " " + hex2($6) + " " + hex2($7) + " " + hex2($8) + " " + hex2($9) + " " + hex2($10) + " " + hex2($11) + " " + hex2($12) + " " + hex2($13) + " " + hex2($14) + " " + hex2($15) + " " + hex2($16)
-    });
-  },
-  6651342: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
-    var hex = function(x) {
-      return ("0000" + (x >>> 0).toString(16)).slice(-4);
-    };
-    postMessage({
-      cmd: "print",
-      txt: "[mask-asm] 0x" + ($0 >>> 0).toString(16) + ": " + hex($1) + " " + hex($2) + " " + hex($3) + " " + hex($4) + " " + hex($5) + " " + hex($6) + " " + hex($7) + " " + hex($8)
-    });
-  },
-  6651597: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
-    var hex = function(x) {
-      return ("0000" + (x >>> 0).toString(16)).slice(-4);
-    };
-    postMessage({
-      cmd: "print",
-      txt: "[loop-asm] 0x" + ($0 >>> 0).toString(16) + ": " + hex($1) + " " + hex($2) + " " + hex($3) + " " + hex($4) + " " + hex($5) + " " + hex($6) + " " + hex($7) + " " + hex($8)
-    });
-  },
-  6651852: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
-    var hex = function(x) {
-      return ("0000" + (x >>> 0).toString(16)).slice(-4);
-    };
-    postMessage({
-      cmd: "print",
-      txt: "[d9fbc-asm] 0x" + ($0 >>> 0).toString(16) + ": " + hex($1) + " " + hex($2) + " " + hex($3) + " " + hex($4) + " " + hex($5) + " " + hex($6) + " " + hex($7) + " " + hex($8)
-    });
-  },
-  6652108: ($0, $1, $2, $3, $4, $5, $6, $7) => {
-    postMessage({
-      cmd: "print",
-      txt: "[d9fbc-gpr] r0=0x" + ($0 >>> 0).toString(16) + " r1=0x" + ($1 >>> 0).toString(16) + " r2=0x" + ($2 >>> 0).toString(16) + " r3=0x" + ($3 >>> 0).toString(16) + " r4=0x" + ($4 >>> 0).toString(16) + " r5=0x" + ($5 >>> 0).toString(16) + " r6=0x" + ($6 >>> 0).toString(16) + " r7=0x" + ($7 >>> 0).toString(16)
-    });
-  },
-  6652451: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
-    postMessage({
-      cmd: "print",
-      txt: "[d9fbc-gpr] r8=0x" + ($0 >>> 0).toString(16) + " r9=0x" + ($1 >>> 0).toString(16) + " r10=0x" + ($2 >>> 0).toString(16) + " r11=0x" + ($3 >>> 0).toString(16) + " r12=0x" + ($4 >>> 0).toString(16) + " r13=0x" + ($5 >>> 0).toString(16) + " r14=0x" + ($6 >>> 0).toString(16) + " r15=0x" + ($7 >>> 0).toString(16) + " pr=0x" + ($8 >>> 0).toString(16)
-    });
-  },
-  6652837: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
-    var hex = function(x) {
-      return ("0000" + (x >>> 0).toString(16)).slice(-4);
-    };
-    postMessage({
-      cmd: "print",
-      txt: "[b6b8-asm] 0x" + ($0 >>> 0).toString(16) + ": " + hex($1) + " " + hex($2) + " " + hex($3) + " " + hex($4) + " " + hex($5) + " " + hex($6) + " " + hex($7) + " " + hex($8)
-    });
-  },
-  6653092: ($0, $1, $2, $3, $4, $5, $6, $7) => {
-    postMessage({
-      cmd: "print",
-      txt: "[b6b8-gpr] r0=0x" + ($0 >>> 0).toString(16) + " r1=0x" + ($1 >>> 0).toString(16) + " r2=0x" + ($2 >>> 0).toString(16) + " r3=0x" + ($3 >>> 0).toString(16) + " r4=0x" + ($4 >>> 0).toString(16) + " r5=0x" + ($5 >>> 0).toString(16) + " r6=0x" + ($6 >>> 0).toString(16) + " r7=0x" + ($7 >>> 0).toString(16)
-    });
-  },
-  6653434: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
-    postMessage({
-      cmd: "print",
-      txt: "[b6b8-gpr] r8=0x" + ($0 >>> 0).toString(16) + " r9=0x" + ($1 >>> 0).toString(16) + " r10=0x" + ($2 >>> 0).toString(16) + " r11=0x" + ($3 >>> 0).toString(16) + " r12=0x" + ($4 >>> 0).toString(16) + " r13=0x" + ($5 >>> 0).toString(16) + " r14=0x" + ($6 >>> 0).toString(16) + " r15=0x" + ($7 >>> 0).toString(16) + " pr=0x" + ($8 >>> 0).toString(16)
-    });
-  },
-  6653819: ($0, $1, $2, $3, $4, $5, $6, $7) => {
-    postMessage({
-      cmd: "print",
-      txt: "[b6b8-sys] pc=0x" + ($0 >>> 0).toString(16) + " sr=0x" + ($1 >>> 0).toString(16) + " vbr=0x" + ($2 >>> 0).toString(16) + " gbr=0x" + ($3 >>> 0).toString(16) + " ssr=0x" + ($4 >>> 0).toString(16) + " spc=0x" + ($5 >>> 0).toString(16) + " fpscr=0x" + ($6 >>> 0).toString(16) + " pend=0x" + ($7 >>> 0).toString(16)
-    });
-  },
-  6654170: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
-    postMessage({
-      cmd: "print",
-      txt: "[cost-breakdown] disp=" + ($0 | 0) + " blocks=" + ($1 | 0) + " total_ns=" + ($2 | 0) + " bm=" + ($3 | 0) + " tramp_total=" + ($4 | 0) + " pre=" + ($5 | 0) + " emjs=" + ($6 | 0) + " call=" + ($7 | 0) + " post=" + ($8 | 0)
-    });
-  },
-  6654412: ($0, $1, $2, $3, $4) => {
-    postMessage({
-      cmd: "print",
-      txt: "[cost-breakdown]   drain=" + ($0 | 0) + " spg=" + ($1 | 0) + " stats=" + ($2 | 0) + " outer=" + ($3 | 0) + " gap=" + ($4 | 0)
-    });
-  },
-  6654567: ($0, $1, $2, $3) => {
-    postMessage({
-      cmd: "print",
-      txt: "[cost-breakdown]   mem_reads=" + ($0 | 0) + " mem_writes=" + ($1 | 0) + " reads/disp=" + ($2 | 0) + " writes/disp=" + ($3 | 0)
-    });
-  },
-  6654725: ($0, $1, $2, $3, $4) => {
-    postMessage({
-      cmd: "print",
-      txt: "[cost-breakdown]   mem_by_area reads:" + " a0=" + ($0 | 0) + " a3=" + ($1 | 0) + " a4=" + ($2 | 0) + " a5=" + ($3 | 0) + " other=" + ($4 | 0)
-    });
-  },
-  6654896: ($0, $1, $2, $3, $4) => {
-    postMessage({
-      cmd: "print",
-      txt: "[cost-breakdown]   mem_by_area writes:" + " a0=" + ($0 | 0) + " a3=" + ($1 | 0) + " a4=" + ($2 | 0) + " a5=" + ($3 | 0) + " other=" + ($4 | 0)
-    });
-  },
-  6655068: ($0, $1, $2, $3, $4, $5) => {
-    postMessage({
-      cmd: "print",
-      txt: "[pr-trip] block pc=0x" + ($0 >>> 0).toString(16) + "->0x" + ($1 >>> 0).toString(16) + " pr=0x" + ($2 >>> 0).toString(16) + " r15=0x" + ($3 >>> 0).toString(16) + " r0=0x" + ($4 >>> 0).toString(16) + " dispatch=#" + ($5 | 0)
-    });
-  },
-  6655329: ($0, $1, $2) => {
-    postMessage({
-      cmd: "print",
-      txt: "[flycast-worker] !! REGION TRAP at dispatch #" + ($0 >>> 0) + " pc_after=0x" + ($1 >>> 0).toString(16) + " pc_before=0x" + ($2 >>> 0).toString(16)
-    });
-  },
-  6655516: ($0, $1, $2, $3, $4) => {
-    postMessage({
-      cmd: "print",
-      txt: "[flycast-worker]   r" + ($0 | 0) + "=0x" + ($1 >>> 0).toString(16) + " r" + (($0 | 0) + 1) + "=0x" + ($2 >>> 0).toString(16) + " r" + (($0 | 0) + 2) + "=0x" + ($3 >>> 0).toString(16) + " r" + (($0 | 0) + 3) + "=0x" + ($4 >>> 0).toString(16)
-    });
-  },
-  6655783: ($0, $1, $2, $3, $4) => {
-    postMessage({
-      cmd: "print",
-      txt: "[flycast-worker]   pr=0x" + ($0 >>> 0).toString(16) + " gbr=0x" + ($1 >>> 0).toString(16) + " vbr=0x" + ($2 >>> 0).toString(16) + " mach=0x" + ($3 >>> 0).toString(16) + " macl=0x" + ($4 >>> 0).toString(16)
-    });
-  },
-  6656029: ($0, $1, $2, $3) => {
-    postMessage({
-      cmd: "print",
-      txt: "[flycast-worker]   ring[-" + ((($1 | 0)) - ($0 | 0)) + "]" + " before=0x" + ($2 >>> 0).toString(16) + " -> after=0x" + ($3 >>> 0).toString(16)
-    });
-  },
-  6656208: ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9) => {
-    postMessage({
-      cmd: "print",
-      txt: "[spg] tick=" + ($0 | 0) + " scanline=" + (($1 >>> 0) & 1023) + " istnrm=0x" + ($2 >>> 0).toString(16) + " SCANINT1=" + ($3 | 0) + " SCANINT2=" + ($4 | 0) + " HBLANK=" + ($5 | 0) + " SPG_VBLANK_INT=0x" + ($6 >>> 0).toString(16) + " SPG_HBLANK_INT=0x" + ($7 >>> 0).toString(16) + " sched_next=" + ($8 | 0) + " sched_now32=" + ($9 >>> 0)
-    });
-  },
-  6656563: ($0, $1, $2, $3, $4) => {
-    postMessage({
-      cmd: "print",
-      txt: "[stats] disp=" + ($0 | 0) + "/s ifb=" + ($1 | 0) + "/s blocks=" + ($2 | 0) + " cache_miss=" + ($3 | 0) + "/s exc=" + ($4 | 0) + "/s"
-    });
-  },
-  6656726: ($0, $1, $2, $3, $4, $5, $6) => {
-    postMessage({
-      cmd: "print",
-      txt: "[exception] #" + ($0 | 0) + " epc=0x" + ($1 >>> 0).toString(16) + " expEvn=0x" + ($2 >>> 0).toString(16) + " sr=0x" + ($3 >>> 0).toString(16) + " vbr=0x" + ($4 >>> 0).toString(16) + " ssr=0x" + ($5 >>> 0).toString(16) + " spc=0x" + ($6 >>> 0).toString(16)
-    });
-  },
-  6657020: ($0, $1, $2, $3, $4, $5) => {
-    postMessage({
-      cmd: "print",
-      txt: "[exception]  ring[-" + (($1 | 0) - ($0 | 0)) + "]" + " pc=0x" + ($2 >>> 0).toString(16) + "->0x" + ($3 >>> 0).toString(16) + " r15=0x" + ($4 >>> 0).toString(16) + " pr=0x" + ($5 >>> 0).toString(16)
+      txt: UTF8ToString($0)
     });
   }
 };
@@ -10493,6 +10216,21 @@ function _emscripten_resize_heap(requestedSize) {
   return false;
 }
 
+/** @suppress {duplicate } */ var _emscripten_webgl_do_commit_frame = () => {
+  if (!GL.currentContext || !GL.currentContext.GLctx) {
+    return -3;
+  }
+  if (!GL.currentContext.attributes.explicitSwapControl) {
+    return -3;
+  }
+  // We would do GL.currentContext.GLctx.commit(); here, but the current implementation
+  // in browsers has removed it - swap is implicit, so this function is a no-op for now
+  // (until/unless the spec changes).
+  return 0;
+};
+
+var _emscripten_webgl_commit_frame = _emscripten_webgl_do_commit_frame;
+
 var _emscripten_supports_offscreencanvas = () => // TODO: Add a new build mode, e.g. OFFSCREENCANVAS_SUPPORT=2, which
 // necessitates OffscreenCanvas support at build time, and "return 1;" here in that build mode.
 typeof OffscreenCanvas != "undefined";
@@ -11445,548 +11183,551 @@ var wasmImports;
 
 function assignWasmImports() {
   wasmImports = {
-    /** @export */ cg: ___call_sighandler,
+    /** @export */ dg: ___call_sighandler,
     /** @export */ o: ___cxa_begin_catch,
-    /** @export */ r: ___cxa_end_catch,
-    /** @export */ c: ___cxa_find_matching_catch_2,
-    /** @export */ i: ___cxa_find_matching_catch_3,
-    /** @export */ bg: ___cxa_find_matching_catch_5,
-    /** @export */ S: ___cxa_rethrow,
-    /** @export */ ag: ___cxa_rethrow_primary_exception,
-    /** @export */ d: ___cxa_throw,
-    /** @export */ $f: ___cxa_uncaught_exceptions,
-    /** @export */ _f: ___pthread_create_js,
+    /** @export */ q: ___cxa_end_catch,
+    /** @export */ b: ___cxa_find_matching_catch_2,
+    /** @export */ h: ___cxa_find_matching_catch_3,
+    /** @export */ cg: ___cxa_find_matching_catch_5,
+    /** @export */ R: ___cxa_rethrow,
+    /** @export */ bg: ___cxa_rethrow_primary_exception,
+    /** @export */ c: ___cxa_throw,
+    /** @export */ ag: ___cxa_uncaught_exceptions,
+    /** @export */ $f: ___pthread_create_js,
     /** @export */ e: ___resumeException,
-    /** @export */ Zf: ___syscall__newselect,
-    /** @export */ Yf: ___syscall_accept4,
-    /** @export */ Xf: ___syscall_bind,
-    /** @export */ Wf: ___syscall_connect,
-    /** @export */ Vf: ___syscall_faccessat,
-    /** @export */ t: ___syscall_fcntl64,
-    /** @export */ Uf: ___syscall_getdents64,
-    /** @export */ Tf: ___syscall_getpeername,
-    /** @export */ Sf: ___syscall_getsockname,
-    /** @export */ Rf: ___syscall_getsockopt,
-    /** @export */ C: ___syscall_ioctl,
-    /** @export */ Qf: ___syscall_listen,
-    /** @export */ Pf: ___syscall_mkdirat,
-    /** @export */ R: ___syscall_openat,
-    /** @export */ Of: ___syscall_pipe,
-    /** @export */ Nf: ___syscall_poll,
-    /** @export */ Mf: ___syscall_recvfrom,
-    /** @export */ Lf: ___syscall_recvmsg,
-    /** @export */ Kf: ___syscall_rmdir,
-    /** @export */ Jf: ___syscall_sendmsg,
-    /** @export */ If: ___syscall_sendto,
-    /** @export */ Q: ___syscall_socket,
-    /** @export */ Hf: ___syscall_stat64,
-    /** @export */ Gf: ___syscall_unlinkat,
-    /** @export */ Cf: __abort_js,
-    /** @export */ Bf: __emscripten_fs_load_embedded_files,
-    /** @export */ Af: __emscripten_get_now_is_monotonic,
-    /** @export */ zf: __emscripten_init_main_thread_js,
-    /** @export */ yf: __emscripten_lookup_name,
-    /** @export */ xf: __emscripten_notify_mailbox_postmessage,
-    /** @export */ wf: __emscripten_receive_on_main_thread_js,
-    /** @export */ vf: __emscripten_runtime_keepalive_clear,
-    /** @export */ O: __emscripten_thread_cleanup,
-    /** @export */ uf: __emscripten_thread_mailbox_await,
-    /** @export */ tf: __emscripten_thread_set_strongref,
-    /** @export */ ca: __gmtime_js,
-    /** @export */ ba: __localtime_js,
-    /** @export */ aa: __mktime_js,
-    /** @export */ $: __mmap_js,
-    /** @export */ _: __munmap_js,
-    /** @export */ sf: __tzset_js,
-    /** @export */ N: _emscripten_asm_const_int,
-    /** @export */ h: _emscripten_asm_const_int_sync_on_main_thread,
-    /** @export */ M: _emscripten_check_blocking_allowed,
-    /** @export */ E: _emscripten_date_now,
-    /** @export */ L: _emscripten_exit_with_live_runtime,
-    /** @export */ v: _emscripten_get_now,
-    /** @export */ rf: _emscripten_glActiveTexture,
-    /** @export */ qf: _emscripten_glAttachShader,
-    /** @export */ pf: _emscripten_glBeginQuery,
-    /** @export */ of: _emscripten_glBeginQueryEXT,
-    /** @export */ nf: _emscripten_glBeginTransformFeedback,
-    /** @export */ mf: _emscripten_glBindAttribLocation,
-    /** @export */ lf: _emscripten_glBindBuffer,
-    /** @export */ kf: _emscripten_glBindBufferBase,
-    /** @export */ jf: _emscripten_glBindBufferRange,
-    /** @export */ hf: _emscripten_glBindFramebuffer,
-    /** @export */ gf: _emscripten_glBindRenderbuffer,
-    /** @export */ ff: _emscripten_glBindSampler,
-    /** @export */ ef: _emscripten_glBindTexture,
-    /** @export */ df: _emscripten_glBindTransformFeedback,
-    /** @export */ cf: _emscripten_glBindVertexArray,
-    /** @export */ bf: _emscripten_glBindVertexArrayOES,
-    /** @export */ af: _emscripten_glBlendColor,
-    /** @export */ $e: _emscripten_glBlendEquation,
-    /** @export */ _e: _emscripten_glBlendEquationSeparate,
-    /** @export */ Ze: _emscripten_glBlendFunc,
-    /** @export */ Ye: _emscripten_glBlendFuncSeparate,
-    /** @export */ Xe: _emscripten_glBlitFramebuffer,
-    /** @export */ We: _emscripten_glBufferData,
-    /** @export */ Ve: _emscripten_glBufferSubData,
-    /** @export */ Ue: _emscripten_glCheckFramebufferStatus,
-    /** @export */ Te: _emscripten_glClear,
-    /** @export */ Se: _emscripten_glClearBufferfi,
-    /** @export */ Re: _emscripten_glClearBufferfv,
-    /** @export */ Qe: _emscripten_glClearBufferiv,
-    /** @export */ Pe: _emscripten_glClearBufferuiv,
-    /** @export */ Oe: _emscripten_glClearColor,
-    /** @export */ Ne: _emscripten_glClearDepthf,
-    /** @export */ Me: _emscripten_glClearStencil,
-    /** @export */ Le: _emscripten_glClientWaitSync,
-    /** @export */ Ke: _emscripten_glClipControlEXT,
-    /** @export */ Je: _emscripten_glColorMask,
-    /** @export */ Ie: _emscripten_glCompileShader,
-    /** @export */ He: _emscripten_glCompressedTexImage2D,
-    /** @export */ Ge: _emscripten_glCompressedTexImage3D,
-    /** @export */ Fe: _emscripten_glCompressedTexSubImage2D,
-    /** @export */ Ee: _emscripten_glCompressedTexSubImage3D,
-    /** @export */ De: _emscripten_glCopyBufferSubData,
-    /** @export */ Ce: _emscripten_glCopyTexImage2D,
-    /** @export */ Be: _emscripten_glCopyTexSubImage2D,
-    /** @export */ Ae: _emscripten_glCopyTexSubImage3D,
-    /** @export */ ze: _emscripten_glCreateProgram,
-    /** @export */ ye: _emscripten_glCreateShader,
-    /** @export */ xe: _emscripten_glCullFace,
-    /** @export */ we: _emscripten_glDeleteBuffers,
-    /** @export */ ve: _emscripten_glDeleteFramebuffers,
-    /** @export */ ue: _emscripten_glDeleteProgram,
-    /** @export */ te: _emscripten_glDeleteQueries,
-    /** @export */ se: _emscripten_glDeleteQueriesEXT,
-    /** @export */ re: _emscripten_glDeleteRenderbuffers,
-    /** @export */ qe: _emscripten_glDeleteSamplers,
-    /** @export */ pe: _emscripten_glDeleteShader,
-    /** @export */ oe: _emscripten_glDeleteSync,
-    /** @export */ ne: _emscripten_glDeleteTextures,
-    /** @export */ me: _emscripten_glDeleteTransformFeedbacks,
-    /** @export */ le: _emscripten_glDeleteVertexArrays,
-    /** @export */ ke: _emscripten_glDeleteVertexArraysOES,
-    /** @export */ je: _emscripten_glDepthFunc,
-    /** @export */ ie: _emscripten_glDepthMask,
-    /** @export */ he: _emscripten_glDepthRangef,
-    /** @export */ ge: _emscripten_glDetachShader,
-    /** @export */ fe: _emscripten_glDisable,
-    /** @export */ ee: _emscripten_glDisableVertexAttribArray,
-    /** @export */ de: _emscripten_glDrawArrays,
-    /** @export */ ce: _emscripten_glDrawArraysInstanced,
-    /** @export */ be: _emscripten_glDrawArraysInstancedANGLE,
-    /** @export */ ae: _emscripten_glDrawArraysInstancedARB,
-    /** @export */ $d: _emscripten_glDrawArraysInstancedEXT,
-    /** @export */ _d: _emscripten_glDrawArraysInstancedNV,
-    /** @export */ Zd: _emscripten_glDrawBuffers,
-    /** @export */ Yd: _emscripten_glDrawBuffersEXT,
-    /** @export */ Xd: _emscripten_glDrawBuffersWEBGL,
-    /** @export */ Wd: _emscripten_glDrawElements,
-    /** @export */ Vd: _emscripten_glDrawElementsInstanced,
-    /** @export */ Ud: _emscripten_glDrawElementsInstancedANGLE,
-    /** @export */ Td: _emscripten_glDrawElementsInstancedARB,
-    /** @export */ Sd: _emscripten_glDrawElementsInstancedEXT,
-    /** @export */ Rd: _emscripten_glDrawElementsInstancedNV,
-    /** @export */ Qd: _emscripten_glDrawRangeElements,
-    /** @export */ Pd: _emscripten_glEnable,
-    /** @export */ Od: _emscripten_glEnableVertexAttribArray,
-    /** @export */ Nd: _emscripten_glEndQuery,
-    /** @export */ Md: _emscripten_glEndQueryEXT,
-    /** @export */ Ld: _emscripten_glEndTransformFeedback,
-    /** @export */ Kd: _emscripten_glFenceSync,
-    /** @export */ Jd: _emscripten_glFinish,
-    /** @export */ Id: _emscripten_glFlush,
-    /** @export */ Hd: _emscripten_glFlushMappedBufferRange,
-    /** @export */ Gd: _emscripten_glFramebufferRenderbuffer,
-    /** @export */ Fd: _emscripten_glFramebufferTexture2D,
-    /** @export */ Ed: _emscripten_glFramebufferTextureLayer,
-    /** @export */ Dd: _emscripten_glFrontFace,
-    /** @export */ Cd: _emscripten_glGenBuffers,
-    /** @export */ Bd: _emscripten_glGenFramebuffers,
-    /** @export */ Ad: _emscripten_glGenQueries,
-    /** @export */ zd: _emscripten_glGenQueriesEXT,
-    /** @export */ yd: _emscripten_glGenRenderbuffers,
-    /** @export */ xd: _emscripten_glGenSamplers,
-    /** @export */ wd: _emscripten_glGenTextures,
-    /** @export */ vd: _emscripten_glGenTransformFeedbacks,
-    /** @export */ ud: _emscripten_glGenVertexArrays,
-    /** @export */ td: _emscripten_glGenVertexArraysOES,
-    /** @export */ sd: _emscripten_glGenerateMipmap,
-    /** @export */ rd: _emscripten_glGetActiveAttrib,
-    /** @export */ qd: _emscripten_glGetActiveUniform,
-    /** @export */ pd: _emscripten_glGetActiveUniformBlockName,
-    /** @export */ od: _emscripten_glGetActiveUniformBlockiv,
-    /** @export */ nd: _emscripten_glGetActiveUniformsiv,
-    /** @export */ md: _emscripten_glGetAttachedShaders,
-    /** @export */ ld: _emscripten_glGetAttribLocation,
-    /** @export */ kd: _emscripten_glGetBooleanv,
-    /** @export */ jd: _emscripten_glGetBufferParameteri64v,
-    /** @export */ id: _emscripten_glGetBufferParameteriv,
-    /** @export */ hd: _emscripten_glGetBufferPointerv,
-    /** @export */ gd: _emscripten_glGetError,
-    /** @export */ fd: _emscripten_glGetFloatv,
-    /** @export */ ed: _emscripten_glGetFragDataLocation,
-    /** @export */ dd: _emscripten_glGetFramebufferAttachmentParameteriv,
-    /** @export */ cd: _emscripten_glGetInteger64i_v,
-    /** @export */ bd: _emscripten_glGetInteger64v,
-    /** @export */ ad: _emscripten_glGetIntegeri_v,
-    /** @export */ $c: _emscripten_glGetIntegerv,
-    /** @export */ _c: _emscripten_glGetInternalformativ,
-    /** @export */ Zc: _emscripten_glGetProgramBinary,
-    /** @export */ Yc: _emscripten_glGetProgramInfoLog,
-    /** @export */ Xc: _emscripten_glGetProgramiv,
-    /** @export */ Wc: _emscripten_glGetQueryObjecti64vEXT,
-    /** @export */ Vc: _emscripten_glGetQueryObjectivEXT,
-    /** @export */ Uc: _emscripten_glGetQueryObjectui64vEXT,
-    /** @export */ Tc: _emscripten_glGetQueryObjectuiv,
-    /** @export */ Sc: _emscripten_glGetQueryObjectuivEXT,
-    /** @export */ Rc: _emscripten_glGetQueryiv,
-    /** @export */ Qc: _emscripten_glGetQueryivEXT,
-    /** @export */ Pc: _emscripten_glGetRenderbufferParameteriv,
-    /** @export */ Oc: _emscripten_glGetSamplerParameterfv,
-    /** @export */ Nc: _emscripten_glGetSamplerParameteriv,
-    /** @export */ Mc: _emscripten_glGetShaderInfoLog,
-    /** @export */ Lc: _emscripten_glGetShaderPrecisionFormat,
-    /** @export */ Kc: _emscripten_glGetShaderSource,
-    /** @export */ Jc: _emscripten_glGetShaderiv,
-    /** @export */ Ic: _emscripten_glGetString,
-    /** @export */ Hc: _emscripten_glGetStringi,
-    /** @export */ Gc: _emscripten_glGetSynciv,
-    /** @export */ Fc: _emscripten_glGetTexParameterfv,
-    /** @export */ Ec: _emscripten_glGetTexParameteriv,
-    /** @export */ Dc: _emscripten_glGetTransformFeedbackVarying,
-    /** @export */ Cc: _emscripten_glGetUniformBlockIndex,
-    /** @export */ Bc: _emscripten_glGetUniformIndices,
-    /** @export */ Ac: _emscripten_glGetUniformLocation,
-    /** @export */ zc: _emscripten_glGetUniformfv,
-    /** @export */ yc: _emscripten_glGetUniformiv,
-    /** @export */ xc: _emscripten_glGetUniformuiv,
-    /** @export */ wc: _emscripten_glGetVertexAttribIiv,
-    /** @export */ vc: _emscripten_glGetVertexAttribIuiv,
-    /** @export */ uc: _emscripten_glGetVertexAttribPointerv,
-    /** @export */ tc: _emscripten_glGetVertexAttribfv,
-    /** @export */ sc: _emscripten_glGetVertexAttribiv,
-    /** @export */ rc: _emscripten_glHint,
-    /** @export */ qc: _emscripten_glInvalidateFramebuffer,
-    /** @export */ pc: _emscripten_glInvalidateSubFramebuffer,
-    /** @export */ oc: _emscripten_glIsBuffer,
-    /** @export */ nc: _emscripten_glIsEnabled,
-    /** @export */ mc: _emscripten_glIsFramebuffer,
-    /** @export */ lc: _emscripten_glIsProgram,
-    /** @export */ kc: _emscripten_glIsQuery,
-    /** @export */ jc: _emscripten_glIsQueryEXT,
-    /** @export */ ic: _emscripten_glIsRenderbuffer,
-    /** @export */ hc: _emscripten_glIsSampler,
-    /** @export */ gc: _emscripten_glIsShader,
-    /** @export */ fc: _emscripten_glIsSync,
-    /** @export */ ec: _emscripten_glIsTexture,
-    /** @export */ dc: _emscripten_glIsTransformFeedback,
-    /** @export */ cc: _emscripten_glIsVertexArray,
-    /** @export */ bc: _emscripten_glIsVertexArrayOES,
-    /** @export */ ac: _emscripten_glLineWidth,
-    /** @export */ $b: _emscripten_glLinkProgram,
-    /** @export */ _b: _emscripten_glMapBufferRange,
-    /** @export */ Zb: _emscripten_glPauseTransformFeedback,
-    /** @export */ Yb: _emscripten_glPixelStorei,
-    /** @export */ Xb: _emscripten_glPolygonModeWEBGL,
-    /** @export */ Wb: _emscripten_glPolygonOffset,
-    /** @export */ Vb: _emscripten_glPolygonOffsetClampEXT,
-    /** @export */ Ub: _emscripten_glProgramBinary,
-    /** @export */ Tb: _emscripten_glProgramParameteri,
-    /** @export */ Sb: _emscripten_glQueryCounterEXT,
-    /** @export */ Rb: _emscripten_glReadBuffer,
-    /** @export */ Qb: _emscripten_glReadPixels,
-    /** @export */ Pb: _emscripten_glReleaseShaderCompiler,
-    /** @export */ Ob: _emscripten_glRenderbufferStorage,
-    /** @export */ Nb: _emscripten_glRenderbufferStorageMultisample,
-    /** @export */ Mb: _emscripten_glResumeTransformFeedback,
-    /** @export */ Lb: _emscripten_glSampleCoverage,
-    /** @export */ Kb: _emscripten_glSamplerParameterf,
-    /** @export */ Jb: _emscripten_glSamplerParameterfv,
-    /** @export */ Ib: _emscripten_glSamplerParameteri,
-    /** @export */ Hb: _emscripten_glSamplerParameteriv,
-    /** @export */ Gb: _emscripten_glScissor,
-    /** @export */ Fb: _emscripten_glShaderBinary,
-    /** @export */ Eb: _emscripten_glShaderSource,
-    /** @export */ Db: _emscripten_glStencilFunc,
-    /** @export */ Cb: _emscripten_glStencilFuncSeparate,
-    /** @export */ Bb: _emscripten_glStencilMask,
-    /** @export */ Ab: _emscripten_glStencilMaskSeparate,
-    /** @export */ zb: _emscripten_glStencilOp,
-    /** @export */ yb: _emscripten_glStencilOpSeparate,
-    /** @export */ xb: _emscripten_glTexImage2D,
-    /** @export */ wb: _emscripten_glTexImage3D,
-    /** @export */ vb: _emscripten_glTexParameterf,
-    /** @export */ ub: _emscripten_glTexParameterfv,
-    /** @export */ tb: _emscripten_glTexParameteri,
-    /** @export */ sb: _emscripten_glTexParameteriv,
-    /** @export */ rb: _emscripten_glTexStorage2D,
-    /** @export */ qb: _emscripten_glTexStorage3D,
-    /** @export */ pb: _emscripten_glTexSubImage2D,
-    /** @export */ ob: _emscripten_glTexSubImage3D,
-    /** @export */ nb: _emscripten_glTransformFeedbackVaryings,
-    /** @export */ mb: _emscripten_glUniform1f,
-    /** @export */ lb: _emscripten_glUniform1fv,
-    /** @export */ kb: _emscripten_glUniform1i,
-    /** @export */ jb: _emscripten_glUniform1iv,
-    /** @export */ ib: _emscripten_glUniform1ui,
-    /** @export */ hb: _emscripten_glUniform1uiv,
-    /** @export */ gb: _emscripten_glUniform2f,
-    /** @export */ fb: _emscripten_glUniform2fv,
-    /** @export */ eb: _emscripten_glUniform2i,
-    /** @export */ db: _emscripten_glUniform2iv,
-    /** @export */ cb: _emscripten_glUniform2ui,
-    /** @export */ bb: _emscripten_glUniform2uiv,
-    /** @export */ ab: _emscripten_glUniform3f,
-    /** @export */ $a: _emscripten_glUniform3fv,
-    /** @export */ _a: _emscripten_glUniform3i,
-    /** @export */ Za: _emscripten_glUniform3iv,
-    /** @export */ Ya: _emscripten_glUniform3ui,
-    /** @export */ Xa: _emscripten_glUniform3uiv,
-    /** @export */ Wa: _emscripten_glUniform4f,
-    /** @export */ Va: _emscripten_glUniform4fv,
-    /** @export */ Ua: _emscripten_glUniform4i,
-    /** @export */ Ta: _emscripten_glUniform4iv,
-    /** @export */ Sa: _emscripten_glUniform4ui,
-    /** @export */ Ra: _emscripten_glUniform4uiv,
-    /** @export */ Qa: _emscripten_glUniformBlockBinding,
-    /** @export */ Pa: _emscripten_glUniformMatrix2fv,
-    /** @export */ Oa: _emscripten_glUniformMatrix2x3fv,
-    /** @export */ Na: _emscripten_glUniformMatrix2x4fv,
-    /** @export */ Ma: _emscripten_glUniformMatrix3fv,
-    /** @export */ La: _emscripten_glUniformMatrix3x2fv,
-    /** @export */ Ka: _emscripten_glUniformMatrix3x4fv,
-    /** @export */ Ja: _emscripten_glUniformMatrix4fv,
-    /** @export */ Ia: _emscripten_glUniformMatrix4x2fv,
-    /** @export */ Ha: _emscripten_glUniformMatrix4x3fv,
-    /** @export */ Ga: _emscripten_glUnmapBuffer,
-    /** @export */ Fa: _emscripten_glUseProgram,
-    /** @export */ Ea: _emscripten_glValidateProgram,
-    /** @export */ Da: _emscripten_glVertexAttrib1f,
-    /** @export */ Ca: _emscripten_glVertexAttrib1fv,
-    /** @export */ Ba: _emscripten_glVertexAttrib2f,
-    /** @export */ Aa: _emscripten_glVertexAttrib2fv,
-    /** @export */ za: _emscripten_glVertexAttrib3f,
-    /** @export */ ya: _emscripten_glVertexAttrib3fv,
-    /** @export */ xa: _emscripten_glVertexAttrib4f,
-    /** @export */ wa: _emscripten_glVertexAttrib4fv,
-    /** @export */ va: _emscripten_glVertexAttribDivisor,
-    /** @export */ ua: _emscripten_glVertexAttribDivisorANGLE,
-    /** @export */ ta: _emscripten_glVertexAttribDivisorARB,
-    /** @export */ sa: _emscripten_glVertexAttribDivisorEXT,
-    /** @export */ ra: _emscripten_glVertexAttribDivisorNV,
-    /** @export */ qa: _emscripten_glVertexAttribI4i,
-    /** @export */ pa: _emscripten_glVertexAttribI4iv,
-    /** @export */ oa: _emscripten_glVertexAttribI4ui,
-    /** @export */ na: _emscripten_glVertexAttribI4uiv,
-    /** @export */ ma: _emscripten_glVertexAttribIPointer,
-    /** @export */ la: _emscripten_glVertexAttribPointer,
-    /** @export */ ka: _emscripten_glViewport,
-    /** @export */ ja: _emscripten_glWaitSync,
-    /** @export */ ia: _emscripten_resize_heap,
+    /** @export */ _f: ___syscall__newselect,
+    /** @export */ Zf: ___syscall_accept4,
+    /** @export */ Yf: ___syscall_bind,
+    /** @export */ Xf: ___syscall_connect,
+    /** @export */ Wf: ___syscall_faccessat,
+    /** @export */ s: ___syscall_fcntl64,
+    /** @export */ Vf: ___syscall_getdents64,
+    /** @export */ Uf: ___syscall_getpeername,
+    /** @export */ Tf: ___syscall_getsockname,
+    /** @export */ Sf: ___syscall_getsockopt,
+    /** @export */ B: ___syscall_ioctl,
+    /** @export */ Rf: ___syscall_listen,
+    /** @export */ Qf: ___syscall_mkdirat,
+    /** @export */ Q: ___syscall_openat,
+    /** @export */ Pf: ___syscall_pipe,
+    /** @export */ Of: ___syscall_poll,
+    /** @export */ Nf: ___syscall_recvfrom,
+    /** @export */ Mf: ___syscall_recvmsg,
+    /** @export */ Lf: ___syscall_rmdir,
+    /** @export */ Kf: ___syscall_sendmsg,
+    /** @export */ Jf: ___syscall_sendto,
+    /** @export */ P: ___syscall_socket,
+    /** @export */ If: ___syscall_stat64,
+    /** @export */ Hf: ___syscall_unlinkat,
+    /** @export */ Df: __abort_js,
+    /** @export */ Cf: __emscripten_fs_load_embedded_files,
+    /** @export */ Bf: __emscripten_get_now_is_monotonic,
+    /** @export */ Af: __emscripten_init_main_thread_js,
+    /** @export */ zf: __emscripten_lookup_name,
+    /** @export */ yf: __emscripten_notify_mailbox_postmessage,
+    /** @export */ xf: __emscripten_receive_on_main_thread_js,
+    /** @export */ wf: __emscripten_runtime_keepalive_clear,
+    /** @export */ N: __emscripten_thread_cleanup,
+    /** @export */ vf: __emscripten_thread_mailbox_await,
+    /** @export */ uf: __emscripten_thread_set_strongref,
+    /** @export */ ba: __gmtime_js,
+    /** @export */ aa: __localtime_js,
+    /** @export */ $: __mktime_js,
+    /** @export */ _: __mmap_js,
+    /** @export */ Z: __munmap_js,
+    /** @export */ tf: __tzset_js,
+    /** @export */ M: _emscripten_asm_const_int,
+    /** @export */ k: _emscripten_asm_const_int_sync_on_main_thread,
+    /** @export */ L: _emscripten_check_blocking_allowed,
+    /** @export */ D: _emscripten_date_now,
+    /** @export */ K: _emscripten_exit_with_live_runtime,
+    /** @export */ u: _emscripten_get_now,
+    /** @export */ sf: _emscripten_glActiveTexture,
+    /** @export */ rf: _emscripten_glAttachShader,
+    /** @export */ qf: _emscripten_glBeginQuery,
+    /** @export */ pf: _emscripten_glBeginQueryEXT,
+    /** @export */ of: _emscripten_glBeginTransformFeedback,
+    /** @export */ nf: _emscripten_glBindAttribLocation,
+    /** @export */ mf: _emscripten_glBindBuffer,
+    /** @export */ lf: _emscripten_glBindBufferBase,
+    /** @export */ kf: _emscripten_glBindBufferRange,
+    /** @export */ jf: _emscripten_glBindFramebuffer,
+    /** @export */ hf: _emscripten_glBindRenderbuffer,
+    /** @export */ gf: _emscripten_glBindSampler,
+    /** @export */ ff: _emscripten_glBindTexture,
+    /** @export */ ef: _emscripten_glBindTransformFeedback,
+    /** @export */ df: _emscripten_glBindVertexArray,
+    /** @export */ cf: _emscripten_glBindVertexArrayOES,
+    /** @export */ bf: _emscripten_glBlendColor,
+    /** @export */ af: _emscripten_glBlendEquation,
+    /** @export */ $e: _emscripten_glBlendEquationSeparate,
+    /** @export */ _e: _emscripten_glBlendFunc,
+    /** @export */ Ze: _emscripten_glBlendFuncSeparate,
+    /** @export */ Ye: _emscripten_glBlitFramebuffer,
+    /** @export */ Xe: _emscripten_glBufferData,
+    /** @export */ We: _emscripten_glBufferSubData,
+    /** @export */ Ve: _emscripten_glCheckFramebufferStatus,
+    /** @export */ Ue: _emscripten_glClear,
+    /** @export */ Te: _emscripten_glClearBufferfi,
+    /** @export */ Se: _emscripten_glClearBufferfv,
+    /** @export */ Re: _emscripten_glClearBufferiv,
+    /** @export */ Qe: _emscripten_glClearBufferuiv,
+    /** @export */ Pe: _emscripten_glClearColor,
+    /** @export */ Oe: _emscripten_glClearDepthf,
+    /** @export */ Ne: _emscripten_glClearStencil,
+    /** @export */ Me: _emscripten_glClientWaitSync,
+    /** @export */ Le: _emscripten_glClipControlEXT,
+    /** @export */ Ke: _emscripten_glColorMask,
+    /** @export */ Je: _emscripten_glCompileShader,
+    /** @export */ Ie: _emscripten_glCompressedTexImage2D,
+    /** @export */ He: _emscripten_glCompressedTexImage3D,
+    /** @export */ Ge: _emscripten_glCompressedTexSubImage2D,
+    /** @export */ Fe: _emscripten_glCompressedTexSubImage3D,
+    /** @export */ Ee: _emscripten_glCopyBufferSubData,
+    /** @export */ De: _emscripten_glCopyTexImage2D,
+    /** @export */ Ce: _emscripten_glCopyTexSubImage2D,
+    /** @export */ Be: _emscripten_glCopyTexSubImage3D,
+    /** @export */ Ae: _emscripten_glCreateProgram,
+    /** @export */ ze: _emscripten_glCreateShader,
+    /** @export */ ye: _emscripten_glCullFace,
+    /** @export */ xe: _emscripten_glDeleteBuffers,
+    /** @export */ we: _emscripten_glDeleteFramebuffers,
+    /** @export */ ve: _emscripten_glDeleteProgram,
+    /** @export */ ue: _emscripten_glDeleteQueries,
+    /** @export */ te: _emscripten_glDeleteQueriesEXT,
+    /** @export */ se: _emscripten_glDeleteRenderbuffers,
+    /** @export */ re: _emscripten_glDeleteSamplers,
+    /** @export */ qe: _emscripten_glDeleteShader,
+    /** @export */ pe: _emscripten_glDeleteSync,
+    /** @export */ oe: _emscripten_glDeleteTextures,
+    /** @export */ ne: _emscripten_glDeleteTransformFeedbacks,
+    /** @export */ me: _emscripten_glDeleteVertexArrays,
+    /** @export */ le: _emscripten_glDeleteVertexArraysOES,
+    /** @export */ ke: _emscripten_glDepthFunc,
+    /** @export */ je: _emscripten_glDepthMask,
+    /** @export */ ie: _emscripten_glDepthRangef,
+    /** @export */ he: _emscripten_glDetachShader,
+    /** @export */ ge: _emscripten_glDisable,
+    /** @export */ fe: _emscripten_glDisableVertexAttribArray,
+    /** @export */ ee: _emscripten_glDrawArrays,
+    /** @export */ de: _emscripten_glDrawArraysInstanced,
+    /** @export */ ce: _emscripten_glDrawArraysInstancedANGLE,
+    /** @export */ be: _emscripten_glDrawArraysInstancedARB,
+    /** @export */ ae: _emscripten_glDrawArraysInstancedEXT,
+    /** @export */ $d: _emscripten_glDrawArraysInstancedNV,
+    /** @export */ _d: _emscripten_glDrawBuffers,
+    /** @export */ Zd: _emscripten_glDrawBuffersEXT,
+    /** @export */ Yd: _emscripten_glDrawBuffersWEBGL,
+    /** @export */ Xd: _emscripten_glDrawElements,
+    /** @export */ Wd: _emscripten_glDrawElementsInstanced,
+    /** @export */ Vd: _emscripten_glDrawElementsInstancedANGLE,
+    /** @export */ Ud: _emscripten_glDrawElementsInstancedARB,
+    /** @export */ Td: _emscripten_glDrawElementsInstancedEXT,
+    /** @export */ Sd: _emscripten_glDrawElementsInstancedNV,
+    /** @export */ Rd: _emscripten_glDrawRangeElements,
+    /** @export */ Qd: _emscripten_glEnable,
+    /** @export */ Pd: _emscripten_glEnableVertexAttribArray,
+    /** @export */ Od: _emscripten_glEndQuery,
+    /** @export */ Nd: _emscripten_glEndQueryEXT,
+    /** @export */ Md: _emscripten_glEndTransformFeedback,
+    /** @export */ Ld: _emscripten_glFenceSync,
+    /** @export */ Kd: _emscripten_glFinish,
+    /** @export */ Jd: _emscripten_glFlush,
+    /** @export */ Id: _emscripten_glFlushMappedBufferRange,
+    /** @export */ Hd: _emscripten_glFramebufferRenderbuffer,
+    /** @export */ Gd: _emscripten_glFramebufferTexture2D,
+    /** @export */ Fd: _emscripten_glFramebufferTextureLayer,
+    /** @export */ Ed: _emscripten_glFrontFace,
+    /** @export */ Dd: _emscripten_glGenBuffers,
+    /** @export */ Cd: _emscripten_glGenFramebuffers,
+    /** @export */ Bd: _emscripten_glGenQueries,
+    /** @export */ Ad: _emscripten_glGenQueriesEXT,
+    /** @export */ zd: _emscripten_glGenRenderbuffers,
+    /** @export */ yd: _emscripten_glGenSamplers,
+    /** @export */ xd: _emscripten_glGenTextures,
+    /** @export */ wd: _emscripten_glGenTransformFeedbacks,
+    /** @export */ vd: _emscripten_glGenVertexArrays,
+    /** @export */ ud: _emscripten_glGenVertexArraysOES,
+    /** @export */ td: _emscripten_glGenerateMipmap,
+    /** @export */ sd: _emscripten_glGetActiveAttrib,
+    /** @export */ rd: _emscripten_glGetActiveUniform,
+    /** @export */ qd: _emscripten_glGetActiveUniformBlockName,
+    /** @export */ pd: _emscripten_glGetActiveUniformBlockiv,
+    /** @export */ od: _emscripten_glGetActiveUniformsiv,
+    /** @export */ nd: _emscripten_glGetAttachedShaders,
+    /** @export */ md: _emscripten_glGetAttribLocation,
+    /** @export */ ld: _emscripten_glGetBooleanv,
+    /** @export */ kd: _emscripten_glGetBufferParameteri64v,
+    /** @export */ jd: _emscripten_glGetBufferParameteriv,
+    /** @export */ id: _emscripten_glGetBufferPointerv,
+    /** @export */ hd: _emscripten_glGetError,
+    /** @export */ gd: _emscripten_glGetFloatv,
+    /** @export */ fd: _emscripten_glGetFragDataLocation,
+    /** @export */ ed: _emscripten_glGetFramebufferAttachmentParameteriv,
+    /** @export */ dd: _emscripten_glGetInteger64i_v,
+    /** @export */ cd: _emscripten_glGetInteger64v,
+    /** @export */ bd: _emscripten_glGetIntegeri_v,
+    /** @export */ ad: _emscripten_glGetIntegerv,
+    /** @export */ $c: _emscripten_glGetInternalformativ,
+    /** @export */ _c: _emscripten_glGetProgramBinary,
+    /** @export */ Zc: _emscripten_glGetProgramInfoLog,
+    /** @export */ Yc: _emscripten_glGetProgramiv,
+    /** @export */ Xc: _emscripten_glGetQueryObjecti64vEXT,
+    /** @export */ Wc: _emscripten_glGetQueryObjectivEXT,
+    /** @export */ Vc: _emscripten_glGetQueryObjectui64vEXT,
+    /** @export */ Uc: _emscripten_glGetQueryObjectuiv,
+    /** @export */ Tc: _emscripten_glGetQueryObjectuivEXT,
+    /** @export */ Sc: _emscripten_glGetQueryiv,
+    /** @export */ Rc: _emscripten_glGetQueryivEXT,
+    /** @export */ Qc: _emscripten_glGetRenderbufferParameteriv,
+    /** @export */ Pc: _emscripten_glGetSamplerParameterfv,
+    /** @export */ Oc: _emscripten_glGetSamplerParameteriv,
+    /** @export */ Nc: _emscripten_glGetShaderInfoLog,
+    /** @export */ Mc: _emscripten_glGetShaderPrecisionFormat,
+    /** @export */ Lc: _emscripten_glGetShaderSource,
+    /** @export */ Kc: _emscripten_glGetShaderiv,
+    /** @export */ Jc: _emscripten_glGetString,
+    /** @export */ Ic: _emscripten_glGetStringi,
+    /** @export */ Hc: _emscripten_glGetSynciv,
+    /** @export */ Gc: _emscripten_glGetTexParameterfv,
+    /** @export */ Fc: _emscripten_glGetTexParameteriv,
+    /** @export */ Ec: _emscripten_glGetTransformFeedbackVarying,
+    /** @export */ Dc: _emscripten_glGetUniformBlockIndex,
+    /** @export */ Cc: _emscripten_glGetUniformIndices,
+    /** @export */ Bc: _emscripten_glGetUniformLocation,
+    /** @export */ Ac: _emscripten_glGetUniformfv,
+    /** @export */ zc: _emscripten_glGetUniformiv,
+    /** @export */ yc: _emscripten_glGetUniformuiv,
+    /** @export */ xc: _emscripten_glGetVertexAttribIiv,
+    /** @export */ wc: _emscripten_glGetVertexAttribIuiv,
+    /** @export */ vc: _emscripten_glGetVertexAttribPointerv,
+    /** @export */ uc: _emscripten_glGetVertexAttribfv,
+    /** @export */ tc: _emscripten_glGetVertexAttribiv,
+    /** @export */ sc: _emscripten_glHint,
+    /** @export */ rc: _emscripten_glInvalidateFramebuffer,
+    /** @export */ qc: _emscripten_glInvalidateSubFramebuffer,
+    /** @export */ pc: _emscripten_glIsBuffer,
+    /** @export */ oc: _emscripten_glIsEnabled,
+    /** @export */ nc: _emscripten_glIsFramebuffer,
+    /** @export */ mc: _emscripten_glIsProgram,
+    /** @export */ lc: _emscripten_glIsQuery,
+    /** @export */ kc: _emscripten_glIsQueryEXT,
+    /** @export */ jc: _emscripten_glIsRenderbuffer,
+    /** @export */ ic: _emscripten_glIsSampler,
+    /** @export */ hc: _emscripten_glIsShader,
+    /** @export */ gc: _emscripten_glIsSync,
+    /** @export */ fc: _emscripten_glIsTexture,
+    /** @export */ ec: _emscripten_glIsTransformFeedback,
+    /** @export */ dc: _emscripten_glIsVertexArray,
+    /** @export */ cc: _emscripten_glIsVertexArrayOES,
+    /** @export */ bc: _emscripten_glLineWidth,
+    /** @export */ ac: _emscripten_glLinkProgram,
+    /** @export */ $b: _emscripten_glMapBufferRange,
+    /** @export */ _b: _emscripten_glPauseTransformFeedback,
+    /** @export */ Zb: _emscripten_glPixelStorei,
+    /** @export */ Yb: _emscripten_glPolygonModeWEBGL,
+    /** @export */ Xb: _emscripten_glPolygonOffset,
+    /** @export */ Wb: _emscripten_glPolygonOffsetClampEXT,
+    /** @export */ Vb: _emscripten_glProgramBinary,
+    /** @export */ Ub: _emscripten_glProgramParameteri,
+    /** @export */ Tb: _emscripten_glQueryCounterEXT,
+    /** @export */ Sb: _emscripten_glReadBuffer,
+    /** @export */ Rb: _emscripten_glReadPixels,
+    /** @export */ Qb: _emscripten_glReleaseShaderCompiler,
+    /** @export */ Pb: _emscripten_glRenderbufferStorage,
+    /** @export */ Ob: _emscripten_glRenderbufferStorageMultisample,
+    /** @export */ Nb: _emscripten_glResumeTransformFeedback,
+    /** @export */ Mb: _emscripten_glSampleCoverage,
+    /** @export */ Lb: _emscripten_glSamplerParameterf,
+    /** @export */ Kb: _emscripten_glSamplerParameterfv,
+    /** @export */ Jb: _emscripten_glSamplerParameteri,
+    /** @export */ Ib: _emscripten_glSamplerParameteriv,
+    /** @export */ Hb: _emscripten_glScissor,
+    /** @export */ Gb: _emscripten_glShaderBinary,
+    /** @export */ Fb: _emscripten_glShaderSource,
+    /** @export */ Eb: _emscripten_glStencilFunc,
+    /** @export */ Db: _emscripten_glStencilFuncSeparate,
+    /** @export */ Cb: _emscripten_glStencilMask,
+    /** @export */ Bb: _emscripten_glStencilMaskSeparate,
+    /** @export */ Ab: _emscripten_glStencilOp,
+    /** @export */ zb: _emscripten_glStencilOpSeparate,
+    /** @export */ yb: _emscripten_glTexImage2D,
+    /** @export */ xb: _emscripten_glTexImage3D,
+    /** @export */ wb: _emscripten_glTexParameterf,
+    /** @export */ vb: _emscripten_glTexParameterfv,
+    /** @export */ ub: _emscripten_glTexParameteri,
+    /** @export */ tb: _emscripten_glTexParameteriv,
+    /** @export */ sb: _emscripten_glTexStorage2D,
+    /** @export */ rb: _emscripten_glTexStorage3D,
+    /** @export */ qb: _emscripten_glTexSubImage2D,
+    /** @export */ pb: _emscripten_glTexSubImage3D,
+    /** @export */ ob: _emscripten_glTransformFeedbackVaryings,
+    /** @export */ nb: _emscripten_glUniform1f,
+    /** @export */ mb: _emscripten_glUniform1fv,
+    /** @export */ lb: _emscripten_glUniform1i,
+    /** @export */ kb: _emscripten_glUniform1iv,
+    /** @export */ jb: _emscripten_glUniform1ui,
+    /** @export */ ib: _emscripten_glUniform1uiv,
+    /** @export */ hb: _emscripten_glUniform2f,
+    /** @export */ gb: _emscripten_glUniform2fv,
+    /** @export */ fb: _emscripten_glUniform2i,
+    /** @export */ eb: _emscripten_glUniform2iv,
+    /** @export */ db: _emscripten_glUniform2ui,
+    /** @export */ cb: _emscripten_glUniform2uiv,
+    /** @export */ bb: _emscripten_glUniform3f,
+    /** @export */ ab: _emscripten_glUniform3fv,
+    /** @export */ $a: _emscripten_glUniform3i,
+    /** @export */ _a: _emscripten_glUniform3iv,
+    /** @export */ Za: _emscripten_glUniform3ui,
+    /** @export */ Ya: _emscripten_glUniform3uiv,
+    /** @export */ Xa: _emscripten_glUniform4f,
+    /** @export */ Wa: _emscripten_glUniform4fv,
+    /** @export */ Va: _emscripten_glUniform4i,
+    /** @export */ Ua: _emscripten_glUniform4iv,
+    /** @export */ Ta: _emscripten_glUniform4ui,
+    /** @export */ Sa: _emscripten_glUniform4uiv,
+    /** @export */ Ra: _emscripten_glUniformBlockBinding,
+    /** @export */ Qa: _emscripten_glUniformMatrix2fv,
+    /** @export */ Pa: _emscripten_glUniformMatrix2x3fv,
+    /** @export */ Oa: _emscripten_glUniformMatrix2x4fv,
+    /** @export */ Na: _emscripten_glUniformMatrix3fv,
+    /** @export */ Ma: _emscripten_glUniformMatrix3x2fv,
+    /** @export */ La: _emscripten_glUniformMatrix3x4fv,
+    /** @export */ Ka: _emscripten_glUniformMatrix4fv,
+    /** @export */ Ja: _emscripten_glUniformMatrix4x2fv,
+    /** @export */ Ia: _emscripten_glUniformMatrix4x3fv,
+    /** @export */ Ha: _emscripten_glUnmapBuffer,
+    /** @export */ Ga: _emscripten_glUseProgram,
+    /** @export */ Fa: _emscripten_glValidateProgram,
+    /** @export */ Ea: _emscripten_glVertexAttrib1f,
+    /** @export */ Da: _emscripten_glVertexAttrib1fv,
+    /** @export */ Ca: _emscripten_glVertexAttrib2f,
+    /** @export */ Ba: _emscripten_glVertexAttrib2fv,
+    /** @export */ Aa: _emscripten_glVertexAttrib3f,
+    /** @export */ za: _emscripten_glVertexAttrib3fv,
+    /** @export */ ya: _emscripten_glVertexAttrib4f,
+    /** @export */ xa: _emscripten_glVertexAttrib4fv,
+    /** @export */ wa: _emscripten_glVertexAttribDivisor,
+    /** @export */ va: _emscripten_glVertexAttribDivisorANGLE,
+    /** @export */ ua: _emscripten_glVertexAttribDivisorARB,
+    /** @export */ ta: _emscripten_glVertexAttribDivisorEXT,
+    /** @export */ sa: _emscripten_glVertexAttribDivisorNV,
+    /** @export */ ra: _emscripten_glVertexAttribI4i,
+    /** @export */ qa: _emscripten_glVertexAttribI4iv,
+    /** @export */ pa: _emscripten_glVertexAttribI4ui,
+    /** @export */ oa: _emscripten_glVertexAttribI4uiv,
+    /** @export */ na: _emscripten_glVertexAttribIPointer,
+    /** @export */ ma: _emscripten_glVertexAttribPointer,
+    /** @export */ la: _emscripten_glViewport,
+    /** @export */ ka: _emscripten_glWaitSync,
+    /** @export */ ja: _emscripten_resize_heap,
+    /** @export */ ia: _emscripten_webgl_commit_frame,
     /** @export */ ha: _emscripten_webgl_create_context,
     /** @export */ ga: _emscripten_webgl_make_context_current,
-    /** @export */ Ff: _environ_get,
-    /** @export */ Ef: _environ_sizes_get,
+    /** @export */ Gf: _environ_get,
+    /** @export */ Ff: _environ_sizes_get,
     /** @export */ fa: _exit,
-    /** @export */ w: _fd_close,
-    /** @export */ P: _fd_read,
-    /** @export */ da: _fd_seek,
-    /** @export */ F: _fd_write,
-    /** @export */ y: _getaddrinfo,
+    /** @export */ v: _fd_close,
+    /** @export */ O: _fd_read,
+    /** @export */ ca: _fd_seek,
+    /** @export */ E: _fd_write,
+    /** @export */ x: _getaddrinfo,
     /** @export */ ea: _getnameinfo,
-    /** @export */ q: invoke_d,
-    /** @export */ K: invoke_diii,
-    /** @export */ D: invoke_fiii,
+    /** @export */ da: invoke_d,
+    /** @export */ J: invoke_diii,
+    /** @export */ C: invoke_fiii,
     /** @export */ m: invoke_i,
-    /** @export */ b: invoke_ii,
+    /** @export */ d: invoke_ii,
     /** @export */ g: invoke_iii,
     /** @export */ p: invoke_iiii,
-    /** @export */ k: invoke_iiiii,
-    /** @export */ J: invoke_iiiiii,
-    /** @export */ u: invoke_iiiiiii,
-    /** @export */ I: invoke_iiiiiiii,
-    /** @export */ B: invoke_iiiiiiiiiiii,
-    /** @export */ Z: invoke_j,
-    /** @export */ Y: invoke_ji,
-    /** @export */ X: invoke_jii,
-    /** @export */ W: invoke_jiiii,
-    /** @export */ j: invoke_v,
+    /** @export */ j: invoke_iiiii,
+    /** @export */ I: invoke_iiiiii,
+    /** @export */ t: invoke_iiiiiii,
+    /** @export */ H: invoke_iiiiiiii,
+    /** @export */ A: invoke_iiiiiiiiiiii,
+    /** @export */ Y: invoke_j,
+    /** @export */ X: invoke_ji,
+    /** @export */ W: invoke_jii,
+    /** @export */ V: invoke_jiiii,
+    /** @export */ i: invoke_v,
     /** @export */ l: invoke_vi,
     /** @export */ f: invoke_vii,
     /** @export */ n: invoke_viii,
-    /** @export */ H: invoke_viiii,
-    /** @export */ G: invoke_viiiiii,
-    /** @export */ s: invoke_viiiiiii,
-    /** @export */ x: invoke_viiiiiiiiii,
-    /** @export */ A: invoke_viiiiiiiiiiiiiii,
-    /** @export */ z: _llvm_eh_typeid_for,
+    /** @export */ G: invoke_viiii,
+    /** @export */ F: invoke_viiiiii,
+    /** @export */ r: invoke_viiiiiii,
+    /** @export */ w: invoke_viiiiiiiiii,
+    /** @export */ z: invoke_viiiiiiiiiiiiiii,
+    /** @export */ y: _llvm_eh_typeid_for,
     /** @export */ a: wasmMemory,
-    /** @export */ Df: _proc_exit,
-    /** @export */ V: wasm_dispatcher_get_last_error,
-    /** @export */ U: wasm_install_block,
-    /** @export */ T: wasm_install_shard
+    /** @export */ Ef: _proc_exit,
+    /** @export */ U: wasm_dispatcher_get_last_error,
+    /** @export */ T: wasm_install_block,
+    /** @export */ S: wasm_install_shard
   };
 }
 
 var wasmExports = createWasm();
 
-var ___wasm_call_ctors = () => (___wasm_call_ctors = wasmExports["dg"])();
+var ___wasm_call_ctors = () => (___wasm_call_ctors = wasmExports["eg"])();
 
-var _flycast_keep_pthread_runtime = Module["_flycast_keep_pthread_runtime"] = () => (_flycast_keep_pthread_runtime = Module["_flycast_keep_pthread_runtime"] = wasmExports["eg"])();
+var _flycast_keep_pthread_runtime = Module["_flycast_keep_pthread_runtime"] = () => (_flycast_keep_pthread_runtime = Module["_flycast_keep_pthread_runtime"] = wasmExports["fg"])();
 
-var __emscripten_thread_free_data = a0 => (__emscripten_thread_free_data = wasmExports["fg"])(a0);
+var __emscripten_thread_free_data = a0 => (__emscripten_thread_free_data = wasmExports["gg"])(a0);
 
-var _emscripten_create_gl_context = Module["_emscripten_create_gl_context"] = () => (_emscripten_create_gl_context = Module["_emscripten_create_gl_context"] = wasmExports["gg"])();
+var _emscripten_create_gl_context = Module["_emscripten_create_gl_context"] = () => (_emscripten_create_gl_context = Module["_emscripten_create_gl_context"] = wasmExports["hg"])();
 
-var _emscripten_worker_init = Module["_emscripten_worker_init"] = () => (_emscripten_worker_init = Module["_emscripten_worker_init"] = wasmExports["hg"])();
+var _emscripten_worker_init = Module["_emscripten_worker_init"] = () => (_emscripten_worker_init = Module["_emscripten_worker_init"] = wasmExports["ig"])();
 
-var _emscripten_load_disc = Module["_emscripten_load_disc"] = a0 => (_emscripten_load_disc = Module["_emscripten_load_disc"] = wasmExports["ig"])(a0);
+var _emscripten_load_disc = Module["_emscripten_load_disc"] = a0 => (_emscripten_load_disc = Module["_emscripten_load_disc"] = wasmExports["jg"])(a0);
 
-var _emscripten_run_iter = Module["_emscripten_run_iter"] = () => (_emscripten_run_iter = Module["_emscripten_run_iter"] = wasmExports["kg"])();
+var _emscripten_run_iter = Module["_emscripten_run_iter"] = () => (_emscripten_run_iter = Module["_emscripten_run_iter"] = wasmExports["lg"])();
 
-var _emscripten_reset = Module["_emscripten_reset"] = () => (_emscripten_reset = Module["_emscripten_reset"] = wasmExports["lg"])();
+var _emscripten_reset = Module["_emscripten_reset"] = () => (_emscripten_reset = Module["_emscripten_reset"] = wasmExports["mg"])();
 
-var _emscripten_get_maple_ptr = Module["_emscripten_get_maple_ptr"] = () => (_emscripten_get_maple_ptr = Module["_emscripten_get_maple_ptr"] = wasmExports["mg"])();
+var _emscripten_get_maple_ptr = Module["_emscripten_get_maple_ptr"] = () => (_emscripten_get_maple_ptr = Module["_emscripten_get_maple_ptr"] = wasmExports["ng"])();
 
-var _emscripten_save_state = Module["_emscripten_save_state"] = (a0, a1) => (_emscripten_save_state = Module["_emscripten_save_state"] = wasmExports["ng"])(a0, a1);
+var _emscripten_save_state = Module["_emscripten_save_state"] = (a0, a1) => (_emscripten_save_state = Module["_emscripten_save_state"] = wasmExports["og"])(a0, a1);
 
-var _malloc = Module["_malloc"] = a0 => (_malloc = Module["_malloc"] = wasmExports["og"])(a0);
+var _malloc = Module["_malloc"] = a0 => (_malloc = Module["_malloc"] = wasmExports["pg"])(a0);
 
-var _free = Module["_free"] = a0 => (_free = Module["_free"] = wasmExports["pg"])(a0);
+var _free = Module["_free"] = a0 => (_free = Module["_free"] = wasmExports["qg"])(a0);
 
-var _emscripten_load_state = Module["_emscripten_load_state"] = (a0, a1) => (_emscripten_load_state = Module["_emscripten_load_state"] = wasmExports["qg"])(a0, a1);
+var _emscripten_load_state = Module["_emscripten_load_state"] = (a0, a1) => (_emscripten_load_state = Module["_emscripten_load_state"] = wasmExports["rg"])(a0, a1);
 
-var _emscripten_set_video_target = Module["_emscripten_set_video_target"] = (a0, a1, a2) => (_emscripten_set_video_target = Module["_emscripten_set_video_target"] = wasmExports["rg"])(a0, a1, a2);
+var _emscripten_set_video_target = Module["_emscripten_set_video_target"] = (a0, a1, a2) => (_emscripten_set_video_target = Module["_emscripten_set_video_target"] = wasmExports["sg"])(a0, a1, a2);
 
-var _emscripten_set_audio_ring = Module["_emscripten_set_audio_ring"] = (a0, a1) => (_emscripten_set_audio_ring = Module["_emscripten_set_audio_ring"] = wasmExports["sg"])(a0, a1);
+var _emscripten_set_audio_ring = Module["_emscripten_set_audio_ring"] = (a0, a1) => (_emscripten_set_audio_ring = Module["_emscripten_set_audio_ring"] = wasmExports["tg"])(a0, a1);
 
-var _sh4_mem_read8 = Module["_sh4_mem_read8"] = a0 => (_sh4_mem_read8 = Module["_sh4_mem_read8"] = wasmExports["tg"])(a0);
+var _sh4_mem_read8 = Module["_sh4_mem_read8"] = a0 => (_sh4_mem_read8 = Module["_sh4_mem_read8"] = wasmExports["ug"])(a0);
 
-var _sh4_mem_read16 = Module["_sh4_mem_read16"] = a0 => (_sh4_mem_read16 = Module["_sh4_mem_read16"] = wasmExports["ug"])(a0);
+var _sh4_mem_read16 = Module["_sh4_mem_read16"] = a0 => (_sh4_mem_read16 = Module["_sh4_mem_read16"] = wasmExports["vg"])(a0);
 
-var _sh4_mem_read32 = Module["_sh4_mem_read32"] = a0 => (_sh4_mem_read32 = Module["_sh4_mem_read32"] = wasmExports["vg"])(a0);
+var _sh4_mem_read32 = Module["_sh4_mem_read32"] = a0 => (_sh4_mem_read32 = Module["_sh4_mem_read32"] = wasmExports["wg"])(a0);
 
-var _sh4_mem_write8 = Module["_sh4_mem_write8"] = (a0, a1) => (_sh4_mem_write8 = Module["_sh4_mem_write8"] = wasmExports["wg"])(a0, a1);
+var _sh4_mem_write8 = Module["_sh4_mem_write8"] = (a0, a1) => (_sh4_mem_write8 = Module["_sh4_mem_write8"] = wasmExports["xg"])(a0, a1);
 
-var _sh4_mem_write16 = Module["_sh4_mem_write16"] = (a0, a1) => (_sh4_mem_write16 = Module["_sh4_mem_write16"] = wasmExports["xg"])(a0, a1);
+var _sh4_mem_write16 = Module["_sh4_mem_write16"] = (a0, a1) => (_sh4_mem_write16 = Module["_sh4_mem_write16"] = wasmExports["yg"])(a0, a1);
 
-var _sh4_mem_write32 = Module["_sh4_mem_write32"] = (a0, a1) => (_sh4_mem_write32 = Module["_sh4_mem_write32"] = wasmExports["yg"])(a0, a1);
+var _sh4_mem_write32 = Module["_sh4_mem_write32"] = (a0, a1) => (_sh4_mem_write32 = Module["_sh4_mem_write32"] = wasmExports["zg"])(a0, a1);
 
-var _sh4_interp_ifb = Module["_sh4_interp_ifb"] = (a0, a1) => (_sh4_interp_ifb = Module["_sh4_interp_ifb"] = wasmExports["zg"])(a0, a1);
+var _sh4_interp_ifb = Module["_sh4_interp_ifb"] = (a0, a1) => (_sh4_interp_ifb = Module["_sh4_interp_ifb"] = wasmExports["Ag"])(a0, a1);
 
-var _sh4_interp_shil_fb = Module["_sh4_interp_shil_fb"] = (a0, a1) => (_sh4_interp_shil_fb = Module["_sh4_interp_shil_fb"] = wasmExports["Ag"])(a0, a1);
+var _sh4_interp_shil_fb = Module["_sh4_interp_shil_fb"] = (a0, a1) => (_sh4_interp_shil_fb = Module["_sh4_interp_shil_fb"] = wasmExports["Bg"])(a0, a1);
 
-var _main = Module["_main"] = (a0, a1) => (_main = Module["_main"] = wasmExports["Bg"])(a0, a1);
+var _main = Module["_main"] = (a0, a1) => (_main = Module["_main"] = wasmExports["Cg"])(a0, a1);
 
-var _flycast_diag_set = Module["_flycast_diag_set"] = a0 => (_flycast_diag_set = Module["_flycast_diag_set"] = wasmExports["Cg"])(a0);
+var _flycast_diag_set = Module["_flycast_diag_set"] = a0 => (_flycast_diag_set = Module["_flycast_diag_set"] = wasmExports["Dg"])(a0);
 
-var _flycast_diag_ifb = Module["_flycast_diag_ifb"] = () => (_flycast_diag_ifb = Module["_flycast_diag_ifb"] = wasmExports["Dg"])();
+var _flycast_diag_ifb = Module["_flycast_diag_ifb"] = () => (_flycast_diag_ifb = Module["_flycast_diag_ifb"] = wasmExports["Eg"])();
 
-var _flycast_set_interp_only = Module["_flycast_set_interp_only"] = a0 => (_flycast_set_interp_only = Module["_flycast_set_interp_only"] = wasmExports["Eg"])(a0);
+var _flycast_get_sh4_pc = Module["_flycast_get_sh4_pc"] = () => (_flycast_get_sh4_pc = Module["_flycast_get_sh4_pc"] = wasmExports["Fg"])();
 
-var _flycast_interp_step_count = Module["_flycast_interp_step_count"] = () => (_flycast_interp_step_count = Module["_flycast_interp_step_count"] = wasmExports["Fg"])();
+var _flycast_set_interp_only = Module["_flycast_set_interp_only"] = a0 => (_flycast_set_interp_only = Module["_flycast_set_interp_only"] = wasmExports["Gg"])(a0);
 
-var _flycast_set_pc_trace_until = Module["_flycast_set_pc_trace_until"] = a0 => (_flycast_set_pc_trace_until = Module["_flycast_set_pc_trace_until"] = wasmExports["Gg"])(a0);
+var _flycast_interp_step_count = Module["_flycast_interp_step_count"] = () => (_flycast_interp_step_count = Module["_flycast_interp_step_count"] = wasmExports["Hg"])();
 
-var _pthread_self = () => (_pthread_self = wasmExports["Hg"])();
+var _flycast_set_pc_trace_until = Module["_flycast_set_pc_trace_until"] = a0 => (_flycast_set_pc_trace_until = Module["_flycast_set_pc_trace_until"] = wasmExports["Ig"])(a0);
 
-var _htons = a0 => (_htons = wasmExports["Ig"])(a0);
+var _pthread_self = () => (_pthread_self = wasmExports["Jg"])();
 
-var _htonl = a0 => (_htonl = wasmExports["Jg"])(a0);
+var _htons = a0 => (_htons = wasmExports["Kg"])(a0);
 
-var _ntohs = a0 => (_ntohs = wasmExports["Kg"])(a0);
+var _htonl = a0 => (_htonl = wasmExports["Lg"])(a0);
 
-var __emscripten_tls_init = () => (__emscripten_tls_init = wasmExports["Lg"])();
+var _ntohs = a0 => (_ntohs = wasmExports["Mg"])(a0);
 
-var _emscripten_builtin_memalign = (a0, a1) => (_emscripten_builtin_memalign = wasmExports["Mg"])(a0, a1);
+var __emscripten_tls_init = () => (__emscripten_tls_init = wasmExports["Ng"])();
 
-var __emscripten_thread_init = (a0, a1, a2, a3, a4, a5) => (__emscripten_thread_init = wasmExports["Ng"])(a0, a1, a2, a3, a4, a5);
+var _emscripten_builtin_memalign = (a0, a1) => (_emscripten_builtin_memalign = wasmExports["Og"])(a0, a1);
 
-var __emscripten_run_on_main_thread_js = (a0, a1, a2, a3, a4) => (__emscripten_run_on_main_thread_js = wasmExports["Og"])(a0, a1, a2, a3, a4);
+var __emscripten_thread_init = (a0, a1, a2, a3, a4, a5) => (__emscripten_thread_init = wasmExports["Pg"])(a0, a1, a2, a3, a4, a5);
 
-var __emscripten_thread_exit = a0 => (__emscripten_thread_exit = wasmExports["Pg"])(a0);
+var __emscripten_run_on_main_thread_js = (a0, a1, a2, a3, a4) => (__emscripten_run_on_main_thread_js = wasmExports["Qg"])(a0, a1, a2, a3, a4);
 
-var __emscripten_check_mailbox = () => (__emscripten_check_mailbox = wasmExports["Qg"])();
+var __emscripten_thread_exit = a0 => (__emscripten_thread_exit = wasmExports["Rg"])(a0);
 
-var _setThrew = (a0, a1) => (_setThrew = wasmExports["Rg"])(a0, a1);
+var __emscripten_check_mailbox = () => (__emscripten_check_mailbox = wasmExports["Sg"])();
 
-var __emscripten_tempret_set = a0 => (__emscripten_tempret_set = wasmExports["Sg"])(a0);
+var _setThrew = (a0, a1) => (_setThrew = wasmExports["Tg"])(a0, a1);
 
-var _emscripten_stack_set_limits = (a0, a1) => (_emscripten_stack_set_limits = wasmExports["Tg"])(a0, a1);
+var __emscripten_tempret_set = a0 => (__emscripten_tempret_set = wasmExports["Ug"])(a0);
 
-var __emscripten_stack_restore = a0 => (__emscripten_stack_restore = wasmExports["Ug"])(a0);
+var _emscripten_stack_set_limits = (a0, a1) => (_emscripten_stack_set_limits = wasmExports["Vg"])(a0, a1);
 
-var __emscripten_stack_alloc = a0 => (__emscripten_stack_alloc = wasmExports["Vg"])(a0);
+var __emscripten_stack_restore = a0 => (__emscripten_stack_restore = wasmExports["Wg"])(a0);
 
-var _emscripten_stack_get_current = () => (_emscripten_stack_get_current = wasmExports["Wg"])();
+var __emscripten_stack_alloc = a0 => (__emscripten_stack_alloc = wasmExports["Xg"])(a0);
 
-var ___cxa_decrement_exception_refcount = a0 => (___cxa_decrement_exception_refcount = wasmExports["Xg"])(a0);
+var _emscripten_stack_get_current = () => (_emscripten_stack_get_current = wasmExports["Yg"])();
 
-var ___cxa_increment_exception_refcount = a0 => (___cxa_increment_exception_refcount = wasmExports["Yg"])(a0);
+var ___cxa_decrement_exception_refcount = a0 => (___cxa_decrement_exception_refcount = wasmExports["Zg"])(a0);
 
-var ___cxa_can_catch = (a0, a1, a2) => (___cxa_can_catch = wasmExports["Zg"])(a0, a1, a2);
+var ___cxa_increment_exception_refcount = a0 => (___cxa_increment_exception_refcount = wasmExports["_g"])(a0);
 
-var ___cxa_get_exception_ptr = a0 => (___cxa_get_exception_ptr = wasmExports["_g"])(a0);
+var ___cxa_can_catch = (a0, a1, a2) => (___cxa_can_catch = wasmExports["$g"])(a0, a1, a2);
 
-var dynCall_vi = Module["dynCall_vi"] = (a0, a1) => (dynCall_vi = Module["dynCall_vi"] = wasmExports["$g"])(a0, a1);
+var ___cxa_get_exception_ptr = a0 => (___cxa_get_exception_ptr = wasmExports["ah"])(a0);
 
-var dynCall_v = Module["dynCall_v"] = a0 => (dynCall_v = Module["dynCall_v"] = wasmExports["ah"])(a0);
+var dynCall_vi = Module["dynCall_vi"] = (a0, a1) => (dynCall_vi = Module["dynCall_vi"] = wasmExports["bh"])(a0, a1);
 
-var dynCall_iii = Module["dynCall_iii"] = (a0, a1, a2) => (dynCall_iii = Module["dynCall_iii"] = wasmExports["bh"])(a0, a1, a2);
+var dynCall_v = Module["dynCall_v"] = a0 => (dynCall_v = Module["dynCall_v"] = wasmExports["ch"])(a0);
 
-var dynCall_viiii = Module["dynCall_viiii"] = (a0, a1, a2, a3, a4) => (dynCall_viiii = Module["dynCall_viiii"] = wasmExports["ch"])(a0, a1, a2, a3, a4);
+var dynCall_iii = Module["dynCall_iii"] = (a0, a1, a2) => (dynCall_iii = Module["dynCall_iii"] = wasmExports["dh"])(a0, a1, a2);
 
-var dynCall_vii = Module["dynCall_vii"] = (a0, a1, a2) => (dynCall_vii = Module["dynCall_vii"] = wasmExports["dh"])(a0, a1, a2);
+var dynCall_viiii = Module["dynCall_viiii"] = (a0, a1, a2, a3, a4) => (dynCall_viiii = Module["dynCall_viiii"] = wasmExports["eh"])(a0, a1, a2, a3, a4);
 
-var dynCall_iiiii = Module["dynCall_iiiii"] = (a0, a1, a2, a3, a4) => (dynCall_iiiii = Module["dynCall_iiiii"] = wasmExports["eh"])(a0, a1, a2, a3, a4);
+var dynCall_vii = Module["dynCall_vii"] = (a0, a1, a2) => (dynCall_vii = Module["dynCall_vii"] = wasmExports["fh"])(a0, a1, a2);
 
-var dynCall_viii = Module["dynCall_viii"] = (a0, a1, a2, a3) => (dynCall_viii = Module["dynCall_viii"] = wasmExports["fh"])(a0, a1, a2, a3);
+var dynCall_iiiii = Module["dynCall_iiiii"] = (a0, a1, a2, a3, a4) => (dynCall_iiiii = Module["dynCall_iiiii"] = wasmExports["gh"])(a0, a1, a2, a3, a4);
 
-var dynCall_ii = Module["dynCall_ii"] = (a0, a1) => (dynCall_ii = Module["dynCall_ii"] = wasmExports["gh"])(a0, a1);
+var dynCall_viii = Module["dynCall_viii"] = (a0, a1, a2, a3) => (dynCall_viii = Module["dynCall_viii"] = wasmExports["hh"])(a0, a1, a2, a3);
 
-var dynCall_i = Module["dynCall_i"] = a0 => (dynCall_i = Module["dynCall_i"] = wasmExports["hh"])(a0);
+var dynCall_ii = Module["dynCall_ii"] = (a0, a1) => (dynCall_ii = Module["dynCall_ii"] = wasmExports["ih"])(a0, a1);
 
-var dynCall_iiii = Module["dynCall_iiii"] = (a0, a1, a2, a3) => (dynCall_iiii = Module["dynCall_iiii"] = wasmExports["ih"])(a0, a1, a2, a3);
+var dynCall_i = Module["dynCall_i"] = a0 => (dynCall_i = Module["dynCall_i"] = wasmExports["jh"])(a0);
 
-var dynCall_viiiiii = Module["dynCall_viiiiii"] = (a0, a1, a2, a3, a4, a5, a6) => (dynCall_viiiiii = Module["dynCall_viiiiii"] = wasmExports["jh"])(a0, a1, a2, a3, a4, a5, a6);
+var dynCall_iiii = Module["dynCall_iiii"] = (a0, a1, a2, a3) => (dynCall_iiii = Module["dynCall_iiii"] = wasmExports["kh"])(a0, a1, a2, a3);
 
-var dynCall_d = Module["dynCall_d"] = a0 => (dynCall_d = Module["dynCall_d"] = wasmExports["kh"])(a0);
+var dynCall_viiiiii = Module["dynCall_viiiiii"] = (a0, a1, a2, a3, a4, a5, a6) => (dynCall_viiiiii = Module["dynCall_viiiiii"] = wasmExports["lh"])(a0, a1, a2, a3, a4, a5, a6);
 
-var dynCall_j = Module["dynCall_j"] = a0 => (dynCall_j = Module["dynCall_j"] = wasmExports["lh"])(a0);
+var dynCall_d = Module["dynCall_d"] = a0 => (dynCall_d = Module["dynCall_d"] = wasmExports["mh"])(a0);
 
-var dynCall_iiiiiii = Module["dynCall_iiiiiii"] = (a0, a1, a2, a3, a4, a5, a6) => (dynCall_iiiiiii = Module["dynCall_iiiiiii"] = wasmExports["mh"])(a0, a1, a2, a3, a4, a5, a6);
+var dynCall_iiiiiii = Module["dynCall_iiiiiii"] = (a0, a1, a2, a3, a4, a5, a6) => (dynCall_iiiiiii = Module["dynCall_iiiiiii"] = wasmExports["nh"])(a0, a1, a2, a3, a4, a5, a6);
 
-var dynCall_ji = Module["dynCall_ji"] = (a0, a1) => (dynCall_ji = Module["dynCall_ji"] = wasmExports["nh"])(a0, a1);
+var dynCall_ji = Module["dynCall_ji"] = (a0, a1) => (dynCall_ji = Module["dynCall_ji"] = wasmExports["oh"])(a0, a1);
 
-var dynCall_jii = Module["dynCall_jii"] = (a0, a1, a2) => (dynCall_jii = Module["dynCall_jii"] = wasmExports["oh"])(a0, a1, a2);
+var dynCall_jii = Module["dynCall_jii"] = (a0, a1, a2) => (dynCall_jii = Module["dynCall_jii"] = wasmExports["ph"])(a0, a1, a2);
 
-var dynCall_jiiii = Module["dynCall_jiiii"] = (a0, a1, a2, a3, a4) => (dynCall_jiiii = Module["dynCall_jiiii"] = wasmExports["ph"])(a0, a1, a2, a3, a4);
+var dynCall_jiiii = Module["dynCall_jiiii"] = (a0, a1, a2, a3, a4) => (dynCall_jiiii = Module["dynCall_jiiii"] = wasmExports["qh"])(a0, a1, a2, a3, a4);
 
-var dynCall_iiiiii = Module["dynCall_iiiiii"] = (a0, a1, a2, a3, a4, a5) => (dynCall_iiiiii = Module["dynCall_iiiiii"] = wasmExports["qh"])(a0, a1, a2, a3, a4, a5);
+var dynCall_iiiiii = Module["dynCall_iiiiii"] = (a0, a1, a2, a3, a4, a5) => (dynCall_iiiiii = Module["dynCall_iiiiii"] = wasmExports["rh"])(a0, a1, a2, a3, a4, a5);
 
-var dynCall_iiiiiiiiiiii = Module["dynCall_iiiiiiiiiiii"] = (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11) => (dynCall_iiiiiiiiiiii = Module["dynCall_iiiiiiiiiiii"] = wasmExports["rh"])(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
+var dynCall_iiiiiiiiiiii = Module["dynCall_iiiiiiiiiiii"] = (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11) => (dynCall_iiiiiiiiiiii = Module["dynCall_iiiiiiiiiiii"] = wasmExports["sh"])(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11);
 
-var dynCall_viiiiiii = Module["dynCall_viiiiiii"] = (a0, a1, a2, a3, a4, a5, a6, a7) => (dynCall_viiiiiii = Module["dynCall_viiiiiii"] = wasmExports["sh"])(a0, a1, a2, a3, a4, a5, a6, a7);
+var dynCall_viiiiiii = Module["dynCall_viiiiiii"] = (a0, a1, a2, a3, a4, a5, a6, a7) => (dynCall_viiiiiii = Module["dynCall_viiiiiii"] = wasmExports["th"])(a0, a1, a2, a3, a4, a5, a6, a7);
 
-var dynCall_viiiiiiiiii = Module["dynCall_viiiiiiiiii"] = (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10) => (dynCall_viiiiiiiiii = Module["dynCall_viiiiiiiiii"] = wasmExports["th"])(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
+var dynCall_viiiiiiiiii = Module["dynCall_viiiiiiiiii"] = (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10) => (dynCall_viiiiiiiiii = Module["dynCall_viiiiiiiiii"] = wasmExports["uh"])(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10);
 
-var dynCall_iiiiiiii = Module["dynCall_iiiiiiii"] = (a0, a1, a2, a3, a4, a5, a6, a7) => (dynCall_iiiiiiii = Module["dynCall_iiiiiiii"] = wasmExports["uh"])(a0, a1, a2, a3, a4, a5, a6, a7);
+var dynCall_j = Module["dynCall_j"] = a0 => (dynCall_j = Module["dynCall_j"] = wasmExports["vh"])(a0);
 
-var dynCall_fiii = Module["dynCall_fiii"] = (a0, a1, a2, a3) => (dynCall_fiii = Module["dynCall_fiii"] = wasmExports["vh"])(a0, a1, a2, a3);
+var dynCall_iiiiiiii = Module["dynCall_iiiiiiii"] = (a0, a1, a2, a3, a4, a5, a6, a7) => (dynCall_iiiiiiii = Module["dynCall_iiiiiiii"] = wasmExports["wh"])(a0, a1, a2, a3, a4, a5, a6, a7);
 
-var dynCall_diii = Module["dynCall_diii"] = (a0, a1, a2, a3) => (dynCall_diii = Module["dynCall_diii"] = wasmExports["wh"])(a0, a1, a2, a3);
+var dynCall_fiii = Module["dynCall_fiii"] = (a0, a1, a2, a3) => (dynCall_fiii = Module["dynCall_fiii"] = wasmExports["xh"])(a0, a1, a2, a3);
 
-var dynCall_viiiiiiiiiiiiiii = Module["dynCall_viiiiiiiiiiiiiii"] = (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15) => (dynCall_viiiiiiiiiiiiiii = Module["dynCall_viiiiiiiiiiiiiii"] = wasmExports["xh"])(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15);
+var dynCall_diii = Module["dynCall_diii"] = (a0, a1, a2, a3) => (dynCall_diii = Module["dynCall_diii"] = wasmExports["yh"])(a0, a1, a2, a3);
 
-var _asyncify_start_unwind = a0 => (_asyncify_start_unwind = wasmExports["yh"])(a0);
+var dynCall_viiiiiiiiiiiiiii = Module["dynCall_viiiiiiiiiiiiiii"] = (a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15) => (dynCall_viiiiiiiiiiiiiii = Module["dynCall_viiiiiiiiiiiiiii"] = wasmExports["zh"])(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15);
 
-var _asyncify_stop_unwind = () => (_asyncify_stop_unwind = wasmExports["zh"])();
+var _asyncify_start_unwind = a0 => (_asyncify_start_unwind = wasmExports["Ah"])(a0);
 
-var _asyncify_start_rewind = a0 => (_asyncify_start_rewind = wasmExports["Ah"])(a0);
+var _asyncify_stop_unwind = () => (_asyncify_stop_unwind = wasmExports["Bh"])();
 
-var _asyncify_stop_rewind = () => (_asyncify_stop_rewind = wasmExports["Bh"])();
+var _asyncify_start_rewind = a0 => (_asyncify_start_rewind = wasmExports["Ch"])(a0);
 
-var ___emscripten_embedded_file_data = Module["___emscripten_embedded_file_data"] = 3400180;
+var _asyncify_stop_rewind = () => (_asyncify_stop_rewind = wasmExports["Dh"])();
+
+var ___emscripten_embedded_file_data = Module["___emscripten_embedded_file_data"] = 3399844;
 
 function invoke_vi(index, a1) {
   var sp = stackSave();
@@ -12272,13 +12013,13 @@ function applySignatureConversions(wasmExports) {
   var makeWrapper_pp = f => a0 => f(a0) >>> 0;
   var makeWrapper_p = f => () => f() >>> 0;
   var makeWrapper_ppp = f => (a0, a1) => f(a0, a1) >>> 0;
-  wasmExports["og"] = makeWrapper_pp(wasmExports["og"]);
-  wasmExports["Hg"] = makeWrapper_p(wasmExports["Hg"]);
-  wasmExports["Mg"] = makeWrapper_ppp(wasmExports["Mg"]);
+  wasmExports["pg"] = makeWrapper_pp(wasmExports["pg"]);
+  wasmExports["Jg"] = makeWrapper_p(wasmExports["Jg"]);
+  wasmExports["Og"] = makeWrapper_ppp(wasmExports["Og"]);
   wasmExports["emscripten_main_runtime_thread_id"] = makeWrapper_p(wasmExports["emscripten_main_runtime_thread_id"]);
-  wasmExports["Vg"] = makeWrapper_pp(wasmExports["Vg"]);
-  wasmExports["Wg"] = makeWrapper_p(wasmExports["Wg"]);
-  wasmExports["_g"] = makeWrapper_pp(wasmExports["_g"]);
+  wasmExports["Xg"] = makeWrapper_pp(wasmExports["Xg"]);
+  wasmExports["Yg"] = makeWrapper_p(wasmExports["Yg"]);
+  wasmExports["ah"] = makeWrapper_pp(wasmExports["ah"]);
   return wasmExports;
 }
 

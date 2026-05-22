@@ -981,6 +981,20 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
         c.b.op_i32_const((s32)c.pc);
         emit_import_or_stub(c, WIMPORT_INTERP);
     c.b.op_end();
+    // [test4-writer-trace] EA-match for 0x800e3a30..0x800e3a34
+    // ((EA & 0xFFFFFFFC) == 0x800e3a30). Logs via WIMPORT_INTERP marker
+    // 0xFFFFFFFDu — handler in JitWasm.cpp dolphin_interp logs storing PC
+    // + pre-mem value + gpr[1/3/13/31].
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)0xFFFFFFFCu);
+    c.b.op_i32_and();
+    c.b.op_i32_const((s32)0x800e3a30u);
+    c.b.op_i32_eq();
+    c.b.op_if(0x40);
+        c.b.op_i32_const((s32)0xFFFFFFFDu);
+        c.b.op_i32_const((s32)c.pc);
+        emit_import_or_stub(c, WIMPORT_INTERP);
+    c.b.op_end();
 
     if (g_mem1_base == 0u) {
         // (a) No fastmem base; full import.
@@ -3556,6 +3570,17 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
         c.b.op_i32_const((s32)c.pc);
         emit_import_or_stub(c, WIMPORT_INTERP);
     c.b.op_end();
+    // [test4-writer-trace] X-form EA-match for 0x800e3a30..0x800e3a34.
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)0xFFFFFFFCu);
+    c.b.op_i32_and();
+    c.b.op_i32_const((s32)0x800e3a30u);
+    c.b.op_i32_eq();
+    c.b.op_if(0x40);
+        c.b.op_i32_const((s32)0xFFFFFFFDu);
+        c.b.op_i32_const((s32)c.pc);
+        emit_import_or_stub(c, WIMPORT_INTERP);
+    c.b.op_end();
 
     if (g_mem1_base == 0u) {
         // Item 6 Stage 2: same MMIO mirror routing as emit_store_d path (a).
@@ -4692,10 +4717,24 @@ std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
                                 bool emit_hle_check_native) {
     WasmModuleBuilder b;
     b.beginFuncBody();
+    // 2026-05-21 fix: set self_local_idx so the non-merged (N-fn tail-call)
+    // self-slot guard in emit_branch_resolution (this file, ~L1152) can detect
+    // a return_call_indirect whose target slot aliases THIS body's own slot and
+    // bail to host with the real target_pc instead of tail-calling back into
+    // its own prologue. Previously merged={} left self_local_idx=0, so the
+    // guard only protected slot 0 — a block at slot N>0 self-looped (OSInit
+    // 0x800e362c: prologue re-ran, r1 leaked, guard store at 0x800e3658 never
+    // reached). Our own slot is lookup(start_pc) — the same pc_to_idx authority
+    // the branch targets resolve through. See dolphin_sab_362c_selfloop_chain.
+    MergedModeArgs mm{};  // mm.merged stays false → tail-call path unchanged
+    if (lookup_fn) {
+        u32 self_idx = 0;
+        if (lookup_fn(lookup_user, start_pc, &self_idx)) mm.self_local_idx = self_idx;
+    }
     emit_body_into(b, start_pc, insts, count, ctx_ptr_const,
                    mem1_base, mem1_mask, ram_size, instr_pcs,
                    lookup_fn, lookup_user, emit_hle_check,
-                   emit_perf_stub, /*merged=*/{}, emit_hle_check_native);
+                   emit_perf_stub, /*merged=*/mm, emit_hle_check_native);
     b.endFuncBody();
     auto bytes = b.getBytes();
     verify_block_can_advance_pc(bytes, start_pc);

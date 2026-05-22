@@ -69,9 +69,15 @@ if [ "$SKIP_LINK" = 0 ]; then
   # shellcheck disable=SC1091
   source /Users/caseybement/Bemental77.github.io/emsdk/emsdk_env.sh > /dev/null 2>&1
   emmake make bementalJIT bementalJITSh4 -j4 2>&1 | grep -E "error:|Built target" | tail -5
+  # The `| grep | tail` above means `set -e` sees grep/tail's exit, NOT make's.
+  # Without this PIPESTATUS guard a FAILED build would silently fall through to
+  # the probe, which then runs against a STALE wasm — a false "it still works"
+  # result. The basis of testing is a fresh build every run; abort if it broke.
+  if [ "${PIPESTATUS[0]}" -ne 0 ]; then echo "FATAL: bementalJIT build failed"; exit 1; fi
 
   echo "=== link ==="
   bash "$LINK_SCRIPT" 2>&1 | tail -3
+  if [ "${PIPESTATUS[0]}" -ne 0 ]; then echo "FATAL: link failed — refusing to probe a stale wasm"; exit 1; fi
 else
   echo "=== link skipped (--skip-link) ==="
 fi

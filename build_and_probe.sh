@@ -67,11 +67,32 @@ else
   echo "=== build / link skipped (--skip-build) ==="
 fi
 
+# ---- provenance / contamination stamp (CLAUDE.md gate #8) ----
+# Makes every probe log self-identifying: which commit, whether the tree is
+# dirty, the built-worker hash, and how many TEMPORARY diagnostic markers are
+# baked into the binary. A clean perf/boot answer REQUIRES diag_markers=0 —
+# this is what catches "probed a stale/instrumented binary as if it were clean."
+REPO=/Users/caseybement/Bemental77.github.io
+WASM_JS="$REPO/gamecube/dolphin_libretro/dolphin_worker_emcc.js"
+WASM_BIN="$REPO/gamecube/dolphin_libretro/dolphin_worker_emcc.wasm"
+DIAG_RE='mem1-dump|blk3a44|term-rsv2|region-slot|smap2|chain362c|wasmdump|ret-trace|flag-w|text-corrupt|c4c-poll'
+PROV_COMMIT=$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo nogit)
+PROV_DIRTY=$(git -C "$REPO" status --porcelain 2>/dev/null | grep -c . || true)
+PROV_SHA=$(shasum -a 1 "$WASM_BIN" 2>/dev/null | cut -c1-12)
+PROV_DIAG_LIST=$(grep -oE "$DIAG_RE" "$WASM_JS" 2>/dev/null | sort -u | paste -sd, - || true)
+PROV_DIAG_N=$(grep -oE "$DIAG_RE" "$WASM_JS" 2>/dev/null | sort -u | grep -c . || true)
+PROVENANCE="[provenance] commit=$PROV_COMMIT dirty_files=$PROV_DIRTY wasm_sha=$PROV_SHA diag_markers=$PROV_DIAG_N${PROV_DIAG_LIST:+ ($PROV_DIAG_LIST)}"
+echo "$PROVENANCE"
+[ "$PROV_DIAG_N" -gt 0 ] && echo "[provenance] WARNING: build is NOT clean — $PROV_DIAG_N diagnostic marker(s) baked in; perf/boot numbers are untrustworthy."
+
 # ---- probe ----
 echo "=== probe ($PROBE_LOG${PROBE_QUERY:+ q=$PROBE_QUERY}${ROM_IDX:+ rom=$ROM_IDX}${PROBE_DURATION_MS:+ d=${PROBE_DURATION_MS}ms}) ==="
 SECONDS=0
 node /Users/caseybement/dolphin_render_probe.js > "$PROBE_LOG" 2>&1
 WALL_MS=$((SECONDS * 1000))
+# Stamp provenance into the probe log itself so it can never be read as clean
+# without proof.
+printf '%s\n' "$PROVENANCE" >> "$PROBE_LOG"
 
 # ---- structured summary extraction ----
 # Disable -e for parsing: grep returns 1 on no match and we'd rather emit
