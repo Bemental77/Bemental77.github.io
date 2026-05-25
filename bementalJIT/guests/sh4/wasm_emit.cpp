@@ -895,6 +895,42 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         // write to a single i32.store. Emitter falls back to slow path if
         // vram base is uninitialized OR address is outside areas 3/4/5.
         if (g_vram_lin_base != 0) {
+            // Area-1 32-bit VRAM window (phys 0x05xxxxxx). Flycast routes these
+            // through pvr_write32p -> pvr_map32 (bank-interleaved 64-bit bus,
+            // pvr_mem.cpp:289), NOT a linear offset. PSO's 8 MB VRAM-clear at
+            // 0x8c02ab4c writes here every iteration; without this fastpath it
+            // falls to the slow sh4_write import and the clear never completes,
+            // stalling boot. Swizzle: off = (m&3)|((m&0x3FFFFC)<<1)|((m&0x400000)>>20)
+            b.op_local_get(LOCAL_TMP);
+            b.op_i32_const(24);
+            b.op_i32_shr_u();
+            b.op_i32_const(5);
+            b.op_i32_eq();
+            b.op_if();
+            b.op_i32_const((s32)g_vram_lin_base);
+            b.op_local_get(LOCAL_TMP);
+            b.op_i32_const(3);
+            b.op_i32_and();
+            b.op_local_get(LOCAL_TMP);
+            b.op_i32_const(0x3FFFFC);
+            b.op_i32_and();
+            b.op_i32_const(1);
+            b.op_i32_shl();
+            b.op_i32_or();
+            b.op_local_get(LOCAL_TMP);
+            b.op_i32_const(0x400000);
+            b.op_i32_and();
+            b.op_i32_const(20);
+            b.op_i32_shr_u();
+            b.op_i32_or();
+            b.op_i32_add();
+            emitLoadParamCached(b, op.rs2, cache);
+            switch (op.size) {
+            case 1: b.op_i32_store8(0); break;
+            case 2: b.op_i32_store16(0); break;
+            default: b.op_i32_store(0); break;
+            }
+            b.op_else();
             // (masked >> 26) == 4  OR  (masked >> 26) == 5
             b.op_local_get(LOCAL_TMP);
             b.op_i32_const(26);
@@ -934,7 +970,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         case 2: b.op_call(WIMPORT_WRITE16); break;
         default: b.op_call(WIMPORT_WRITE32); break;
         }
-        if (g_vram_lin_base != 0) b.op_end();   // close inner area-4/5 if
+        if (g_vram_lin_base != 0) { b.op_end(); b.op_end(); }   // close area-4/5 if + area-1 if
         b.op_end();                              // close outer area-3 if
         return true;
     }
