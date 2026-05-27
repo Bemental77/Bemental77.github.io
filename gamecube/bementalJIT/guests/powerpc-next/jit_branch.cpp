@@ -285,15 +285,103 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
         return;
     }
 
-    // Conditional path — fallback to WIMPORT_INTERP. The interpreter
-    // handles BO/BI/CTR/CR combinations and writes ppc_state.pc on its
-    // own. After the call the dispatcher's outer loop picks up at
-    // whatever PC the interp ended on.
+    // Conditional path. Natively resolve the common forms (mirrors the
+    // proven gekko_emit.cpp::emit_bcx_impl): store PC=target/fallthrough so
+    // the block epilogue returns the correct next_pc. Previously ALL
+    // conditional forms fell back to WIMPORT_INTERP, whose ppc_state.pc
+    // write was NOT reflected in the block's returned next_pc — the OSInit
+    // guard `bne` (fn 0x800e362c) then returned its own entry PC, self-
+    // looping and wedging SAB boot. Proof: native trajectory diverges at
+    // 0x800e3650→0x800e3654 (/tmp/native-osexc-362c.log).
+    const u32  bi  = GekkoOperands::BI(inst);
+    const s32  bd  = GekkoOperands::BD(inst);
+    const bool aa  = GekkoOperands::AA(inst);
+    const bool lk  = GekkoOperands::LK(inst);
+    const u32  target      = aa ? (u32)bd : (u32)((s32)op.address + bd);
+    const u32  fallthrough = op.address + 4u;
+    constexpr u32 LOCAL_TMP_A = 0u;  // build_block_next declares 2 i32 scratch
+
+    // bdnz (BO=0b10000) / bdz (BO=0b10010): decrement CTR, branch on != / == 0.
+    if (!lk && (bo == 0b10000u || bo == 0b10010u)) {
+        const bool is_bdnz = (bo == 0b10000u);
+        wb.op_i32_const((s32)ctx_ptr);              // store addr for CTR write
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i32_load(ppc_off::ctr_off());
+        wb.op_i32_const(1);
+        wb.op_i32_sub();
+        wb.op_local_tee(LOCAL_TMP_A);               // stash CTR-1 for the test
+        wb.op_i32_store(ppc_off::ctr_off());        // CTR := CTR - 1
+        wb.op_local_get(LOCAL_TMP_A);
+        wb.op_i32_const(0);
+        if (is_bdnz) wb.op_i32_ne(); else wb.op_i32_eq();
+        wb.op_if();
+            emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, target);
+        wb.op_else();
+            emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, fallthrough);
+        wb.op_end();
+        return;
+    }
+
+    // CR-bit conditional, no CTR decrement, no LK: BO=0b00100 (branch on CR
+    // false, e.g. bne) or BO=0b01100 (branch on CR true, e.g. beq).
+    if (!lk && (bo & 0b10100u) == 0b00100u) {
+        const bool branch_if_true = (bo & 0b01000u) != 0u;
+        const u32  field_idx    = bi / 4u;
+        const u32  bit_in_field = bi % 4u;          // 0=LT,1=GT,2=EQ,3=SO
+        // CR field is a u64 (Dolphin encoding): LT⇔hi&(1<<30), EQ⇔lo==0,
+        // GT⇔!LT&&!EQ, SO⇔hi&(1<<27). Pushes 1 iff the tested bit is set.
+        switch (bit_in_field) {
+          case 0:  // LT
+            wb.op_i32_const((s32)ctx_ptr);
+            wb.op_i32_load(ppc_off::cr(field_idx) + 4u);
+            wb.op_i32_const(1 << 30);
+            wb.op_i32_and();
+            wb.op_i32_const(0);
+            wb.op_i32_ne();
+            break;
+          case 1:  // GT = NOT LT AND NOT EQ
+            wb.op_i32_const((s32)ctx_ptr);
+            wb.op_i32_load(ppc_off::cr(field_idx) + 4u);
+            wb.op_i32_const(0x40000000);
+            wb.op_i32_and();
+            wb.op_i32_eqz();
+            wb.op_i32_const((s32)ctx_ptr);
+            wb.op_i32_load(ppc_off::cr(field_idx));
+            wb.op_i32_const(0);
+            wb.op_i32_ne();
+            wb.op_i32_and();
+            break;
+          case 2:  // EQ
+            wb.op_i32_const((s32)ctx_ptr);
+            wb.op_i32_load(ppc_off::cr(field_idx));
+            wb.op_i32_eqz();
+            break;
+          case 3:  // SO
+            wb.op_i32_const((s32)ctx_ptr);
+            wb.op_i32_load(ppc_off::cr(field_idx) + 4u);
+            wb.op_i32_const(1 << 27);
+            wb.op_i32_and();
+            wb.op_i32_const(0);
+            wb.op_i32_ne();
+            break;
+        }
+        if (!branch_if_true) wb.op_i32_eqz();        // invert: stack=1 iff taken
+        wb.op_if();
+            emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, target);
+        wb.op_else();
+            emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, fallthrough);
+        wb.op_end();
+        return;
+    }
+
+    // Genuinely rare forms (LK conditional calls; exotic CTR+CR combos):
+    // fall back to the interpreter (unchanged behavior). ppc_state.pc is
+    // written by interp; these terminals still rely on that path.
     //
     // Note: bcx with LK=1 in the fallback path won't get a BLR-stack push.
     // That's a tolerated gap — the conditional-call idiom (`bclXX ...,LK`)
     // is rare; missing pushes only mean the ring stays in sync only when
-    // the caller didn't take the LK arm. Live emitter behavior is the same.
+    // the caller didn't take the LK arm.
     wb.op_i32_const((s32)inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
