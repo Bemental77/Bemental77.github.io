@@ -58,14 +58,14 @@ Use this as the starting point when populating a topic's resource table.
 | `gamecube/dolphin-src/Source/Core/Core/HW/*.cpp` (especially `ProcessorInterface.cpp`, `DSPHLE.cpp`, MMIO handlers under `gamecube/dolphin-src/Source/Core/Core/HW/MMIO*`) | What dolphin's native MMIO handlers expect on read/write. Use to validate any "the mirror is canonical" claim (`item6_mmio_stage2_design.md` walks the wrinkles). |
 | `gamecube/dolphin-bridge/` (`EmscriptenWorker.cpp`, `dolphin_stubs.cpp`, `worker_funcs.js`, `dolphin_worker_link.sh`, `patches/`) | Page-mediated mailbox + dolphin worker glue. Don't patch dolphin-src — patch here. |
 | `gamecube/ppc-worker/` (`ppc_worker_main.cpp`, `ppc_worker.js`, `sab_layout.h`, `compile_pool_worker.js`) | Standalone PowerPC JIT worker (Phase 2 architecture). SAB layout in `sab_layout.h`. |
-| `bementalJIT/include/bementalJIT/` + `bementalJIT/src/` + `bementalJIT/guests/powerpc/` | PowerPC emitter + block cache. Where any emit-side fix lands. |
+| `gamecube/bementalJIT/include/bementalJIT/` + `gamecube/bementalJIT/src/` + `gamecube/bementalJIT/guests/powerpc/` (+ `guests/powerpc-next/`) | PowerPC emitter + block cache. Where any emit-side fix lands. GameCube uses `gamecube/bementalJIT/` — not the repo-root `bementalJIT/` (which is Dreamcast-only). |
 
 ### Build + probe pipeline
 
 | Resource | What it answers |
 |---|---|
 | **`build_and_probe.sh`** (repo root — note this is the GameCube script, the Dreamcast equivalent lives at `dreamcast/build_and_probe.sh`) | Canonical inner-loop: emcc rebuild → link → headless Node probe → fixed summary. Use this. Do not improvise `emcc` invocations. |
-| `gamecube/ppc-worker/build_ppc_worker.sh` | Builds ppc-worker. Also drives `bementalJIT/build-emcc/` on first run. |
+| `gamecube/ppc-worker/build_ppc_worker.sh` | Builds ppc-worker. Also drives `gamecube/bementalJIT/build-emcc/` on first run. |
 | `gamecube/dolphin-bridge/dolphin_worker_link.sh` | Durable copy of `/tmp/dolphin_worker_link.sh` (the canonical link script). `build_and_probe.sh` prefers `/tmp` and falls back here. |
 | `/tmp/probes/<name>.log` + `.summary.json` + `.trace.json` + `.metrics.json` | Per-`--name` archive: console + extracted summary JSON + chrome://tracing artifact + page.metrics() snapshots. Default no-name run goes to `/tmp/probe.log` + `/tmp/probe.summary.json`. |
 | `probe_diff.sh` (per `tools_2026_05_14.md`) | Diff two summary JSONs from `/tmp/probes/`. |
@@ -104,7 +104,7 @@ Environment passthrough: `PROBE_QUERY`, `ROM_IDX`, `PROBE_DURATION_MS`, `PROBE_T
 
 | Resource | What it answers |
 |---|---|
-| `bementalJIT/build-host-test/tests/test_*` (build via `cmake -S bementalJIT -B bementalJIT/build-host-test && cmake --build bementalJIT/build-host-test -j`) | Host-side correctness for emit / dispatch / Gekko / SH4 dispatch / perf-T1 / PI-mask / `str` HLE / analyst / diff. Run a specific binary to isolate a regression: `./bementalJIT/build-host-test/tests/test_gekko`. |
+| `gamecube/bementalJIT/tests/` — Emscripten targets (build via `emcmake cmake -S gamecube/bementalJIT -B gamecube/bementalJIT/build-emcc-test -DBEMENTAL_BUILD_TESTS=ON -DBEMENTAL_GUEST_POWERPC=ON && emmake make -C gamecube/bementalJIT/build-emcc-test`); test list: `test_dispatch`, `test_gekko`, `test_perf_t1`, `test_pi_mask_path`, `test_str_hle_pattern`, `test_analyst`, `test_diff`. **Note**: `tests/CMakeLists.txt` early-returns under a native cmake ("requires Emscripten") — all outputs are `.html`, not native binaries. Run by serving the build dir over HTTP and opening the `.html` in a browser. | Emscripten-only correctness harness for emit / dispatch / Gekko / perf-T1 / PI-mask / `str` HLE / analyst / diff (no SH4 — GameCube copy has no SH4 guest). |
 | `node gamecube/seqlock.test.mjs` | SAB seqlock primitive smoke test (19/19 per memory). |
 | `node gamecube/ringbuffer.test.mjs` | SAB ringbuffer primitive smoke test. |
 

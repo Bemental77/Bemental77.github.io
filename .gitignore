@@ -31,6 +31,8 @@ bementalCompiler/build/
 
 # bementalJIT local build artifacts (host/test/emcc CMake out-of-tree builds)
 bementalJIT/build-*/
+# GameCube-owned bementalJIT copy (de-shared from root) — same build-dir pattern
+gamecube/bementalJIT/build-*/
 
 tools/bin/
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // run_perf_t1.mjs — Puppeteer probe for bementalJIT T1 microkernels.
-// Serves bementalJIT/build-emcc/tests/test_perf_t1.html with COI headers,
+// Serves gamecube/bementalJIT/build-emcc/tests/test_perf_t1.html with COI headers,
 // loads it in headless Chrome, and captures the [wild-perf t1*] lines.
 
 import http from 'node:http';
@@ -9,7 +9,7 @@ import path from 'node:path';
 import puppeteer from 'puppeteer';
 
 const ROOT = '/Users/caseybement/Bemental77.github.io';
-const TEST_DIR = path.join(ROOT, 'bementalJIT/build-emcc/tests');
+const TEST_DIR = path.join(ROOT, 'gamecube/bementalJIT/build-emcc/tests');
 const PORT = 8789;
 const TIMEOUT_MS = parseInt(process.env.T1_TIMEOUT_MS || '120000', 10);
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';

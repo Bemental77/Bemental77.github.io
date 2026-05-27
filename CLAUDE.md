@@ -49,7 +49,8 @@ Each has its own toolchain — run commands inside the subdirectory.
 | `n64/N64Wasm`, `snes/snesWasm`, `gba/gbaWasm` | WebAssembly emulators with bundled `emsdk` | Static — served from corresponding `*.html` |
 | `gamecube/` | Dolphin libretro WASM build + custom JIT (in active development) | See **GameCube / Dolphin** below |
 | `dreamcast/` | Flycast libretro WASM build + SH4 JIT (in active development) | See **Dreamcast / Flycast** below |
-| `bementalJIT/` | Guest-agnostic WASM JIT-builder library (PowerPC/SH4 emitters) | CMake — consumed by `gamecube/` and `dreamcast/` via `add_subdirectory` |
+| `gamecube/bementalJIT/` | GameCube-only JIT library (PowerPC + powerpc-next emitters; no SH4) | CMake — consumed by `gamecube/dolphin-src/` and `gamecube/ppc-worker/` via `add_subdirectory` |
+| `bementalJIT/` | Dreamcast-only JIT library (PowerPC + powerpc-next + SH4 emitters) | CMake — consumed by `dreamcast/flycast-src/` via `add_subdirectory` |
 | root `*.html` | Portfolio pages (`index`, `about`, `resume`, `contact`, `playground`, `gamecube`, etc.) | Static |
 
 ## WASM emulator architecture (ps1/n64/snes/gba/gamecube)
@@ -68,16 +69,18 @@ When editing the PS1 emulator specifically, the current JS-side patches (perform
 This is an active R&D effort — not yet shipping. Four pieces interact:
 
 - `gamecube/dolphin-src/` — Dolphin source tree, configured under `build-wasm/` for an Emscripten static-lib build (`dolphin_libretro` libretro target).
-- `bementalJIT/` — repo-root C++17 static library that Dolphin links against in place of its native JIT. Per-guest emitters live under `guests/<arch>/` (currently `powerpc` for Gekko, plus an SH4 stub) and are gated by CMake options. Block cache lives in `src/block_cache.cpp`.
+- `gamecube/bementalJIT/` — GameCube-local C++17 static library that Dolphin links against in place of its native JIT. Per-guest emitters live under `guests/<arch>/` (currently `powerpc` for Gekko and `powerpc-next` for the Phase 1 IR rebuild; no SH4). Block cache lives in `src/block_cache.cpp`.
 - `gamecube/dolphin_libretro/` — final Emscripten link output (`dolphin_worker.js`, `dolphin_worker.wasm`, etc.) loaded by `gamecube.html`.
-- `gamecube/ppc-worker/` — standalone PowerPC JIT worker (Phase 2 architecture: separate worker thread from `dolphin_worker`). Built via `gamecube/ppc-worker/build_ppc_worker.sh`, which also drives `bementalJIT/build-emcc/` on first run. Outputs `ppc_worker.{js,wasm}`. SAB layout shared with dolphin defined in `sab_layout.h`.
+- `gamecube/ppc-worker/` — standalone PowerPC JIT worker (Phase 2 architecture: separate worker thread from `dolphin_worker`). Built via `gamecube/ppc-worker/build_ppc_worker.sh`, which also drives `gamecube/bementalJIT/build-emcc/` on first run. Outputs `ppc_worker.{js,wasm}`. SAB layout shared with dolphin defined in `sab_layout.h`.
 - `gamecube/dolphin-bridge/worker_funcs.js` — page-mediated mailbox routing between `dolphin_worker` and `ppc-worker` (CompileBlock cmds, MMIO routing, PowerPCState mirror). Loaded by `gamecube.html`.
 
 The canonical inner-loop is `build_and_probe.sh` at the repo root — it sources `emsdk_env.sh`, runs `emmake make dolphin_libretro` in `build-wasm/`, runs the link script at `/tmp/dolphin_worker_link.sh` (falls back to `gamecube/dolphin-bridge/dolphin_worker_link.sh`), then runs a Node-based render probe and prints a fixed summary (canvas non-black check, jit-inner traces, HLE replace counts, frame counts, VI/XFB events, installed patches). Use this single script for build/link/probe iterations rather than running emcc/make ad hoc — permissions are configured for it.
 
 ### bementalJIT tests
 
-Host-side tests live in `bementalJIT/tests/` (`test_dispatch.cpp`, `test_gekko.cpp`, `test_perf_t1.cpp`, `test_pi_mask_path.cpp`, `test_str_hle_pattern.cpp`, `test_analyst.cpp`, `test_diff.cpp`, `test_sh4_dispatch.cpp`). Built via CMake into `bementalJIT/build-host-test/` or `bementalJIT/build-test/`.
+**GameCube tests** live in `gamecube/bementalJIT/tests/` (`test_dispatch.cpp`, `test_gekko.cpp`, `test_perf_t1.cpp`, `test_pi_mask_path.cpp`, `test_str_hle_pattern.cpp`, `test_analyst.cpp`, `test_diff.cpp`). These are **Emscripten-only** targets — `tests/CMakeLists.txt` early-returns with "bementalJIT tests skipped (requires Emscripten)" under a native cmake. All test targets produce `.html` output (e.g. `test_gekko.html`), not native binaries. To build: `emcmake cmake -S gamecube/bementalJIT -B gamecube/bementalJIT/build-emcc-test -DBEMENTAL_BUILD_TESTS=ON -DBEMENTAL_GUEST_POWERPC=ON && emmake make -C gamecube/bementalJIT/build-emcc-test`. Run by serving the build directory over HTTP and opening the `.html` in a browser. Build artifacts land in `gamecube/bementalJIT/build-emcc-test/` (or `gamecube/bementalJIT/build-host-test/` if that directory was bootstrapped with an emcc toolchain).
+
+**Dreamcast tests** live in `bementalJIT/tests/` (repo root), which additionally includes `test_sh4_dispatch.cpp`. Same Emscripten-only constraint applies.
 
 ## Dreamcast / Flycast WASM build
 
@@ -105,11 +108,14 @@ node gamecube/ringbuffer.test.mjs
 
 ### GameCube-specific tools
 
-Separate from the repo-root `tools/jsearch.js`. `gamecube/tools/` contains symbol/disassembly utilities for game-binary investigation:
+Two separate tool locations — do not confuse them:
 
-- `gcsdk_scan.py` / `gcsdk_siggen.py` — SDK symbol signature scan against game binaries.
-- `gsne8p.map`, `gpoe8p.map` — SAB (Sonic Adventure 2 Battle) and PSO symbol maps.
-- `find_polls.py`, `disasm_fn.py`, `dtk_extract_map.py`, `mw_listener.py`.
+**`tools/` (repo root)** — symbol/disassembly utilities for game-binary investigation:
+- `tools/gcsdk_scan.py` / `tools/gcsdk_siggen.py` — SDK symbol signature scan against game binaries.
+- `tools/gsne8p.map`, `tools/gpoe8p.map` — SAB (Sonic Adventure 2 Battle) and PSO symbol maps.
+- `tools/find_polls.py`, `tools/disasm_fn.py`, `tools/dtk_extract_map.py`, `tools/mw_listener.py`.
+
+**`gamecube/tools/`** — runtime diagnostic `.mjs` and `.py` scripts for the live probe (e.g. `dump_sab_pc.mjs`, `diagnose_gc.mjs`, `sab_disasm.py`, `gdb_memdump.py`, `memdiff.py`, and the `find_*.mjs` / `perf_*.mjs` family). See `gamecube/docs/README.md` "Runtime-state tools" table for the full inventory.
 
 ## Searching minified JS
 
@@ -128,6 +134,6 @@ node tools/jsearch.js <file> --extract <name>  # extract a named function/var bl
 ## Git conventions
 
 - PR target is `prod`, not `main`/`master`.
-- GameCube changes commit to the `gamecube` branch first, then merge to `prod`.
+- GameCube changes commit to the `dev` branch (current active branch). The standalone `gamecube` branch is stale (pre-emulator era) — do not use it.
 - Do not commit `node_modules`, `.env`, `config.js`, `send.email.ts`, `*.jsdos`, `*.zip`, ROM `.iso` files, or `emsdk` artifacts beyond what is already tracked (see `.gitignore`).
 - Large generated files (vendored emulator binaries, split ROM parts) are tracked intentionally — don't "clean them up."

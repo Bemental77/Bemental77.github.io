@@ -18,7 +18,7 @@ done
 
 ROOT=/Users/caseybement/Bemental77.github.io
 SRC=$ROOT/gamecube/ppc-worker
-BJIT_BUILD=$ROOT/bementalJIT/build-emcc
+BJIT_BUILD=$ROOT/gamecube/bementalJIT/build-emcc
 OUT=$ROOT/gamecube/ppc-worker
 
 source $ROOT/emsdk/emsdk_env.sh > /dev/null 2>&1
@@ -28,7 +28,7 @@ if [ ! -f "$BJIT_BUILD/libbementalJIT.a" ] || [ ! -f "$BJIT_BUILD/guests/powerpc
   echo "=== bementalJIT emcc lib build ==="
   mkdir -p "$BJIT_BUILD"
   cd "$BJIT_BUILD"
-  emcmake cmake -DCMAKE_BUILD_TYPE=Release "$ROOT/bementalJIT" > /tmp/bjit_cmake.log 2>&1
+  emcmake cmake -DCMAKE_BUILD_TYPE=Release "$ROOT/gamecube/bementalJIT" > /tmp/bjit_cmake.log 2>&1
   emmake make -j4 bementalJIT bementalJITPowerPC > /tmp/bjit_build.log 2>&1
 fi
 
@@ -52,7 +52,7 @@ cd "$SRC"
 emcc \
   ppc_worker_main.cpp \
   $EXTRA_CPPFLAGS \
-  -I "$ROOT/bementalJIT/include" \
+  -I "$ROOT/gamecube/bementalJIT/include" \
   "$BJIT_BUILD/libbementalJIT.a" \
   "$BJIT_BUILD/guests/powerpc/libbementalJITPowerPC.a" \
   -O2 \

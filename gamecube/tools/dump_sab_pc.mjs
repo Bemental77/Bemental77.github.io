@@ -97,7 +97,8 @@ function looksLikePrologue(inst) {
     if (op === 37 && ((inst >>> 21) & 0x1F) === 1 && ((inst >>> 16) & 0x1F) === 1) {
         return true;
     }
-    // mflr r0 + stw r0, +4(r1)
+    // mflr r0 (0x7c0802a6) — functions that save LR at the start before stwu
+    if (inst === 0x7c0802a6) return true;
     return false;
 }
 
@@ -143,21 +144,26 @@ for (const pc of PCS_TO_DUMP) {
     }
     console.log(`  in section [${r.section.idx} ${r.section.type}] file=0x${r.fileOff.toString(16)}`);
     // Walk backwards to find function prologue (up to 64 instructions back).
+    // i=0 checks the PC itself (pc IS the entry), i=1 checks pc-4, etc.
     let prologue = -1;
-    for (let i = 0; i < 64; ++i) {
-        const off = r.fileOff - (i + 1) * 4;
+    for (let i = 0; i <= 64; ++i) {
+        const off = r.fileOff - i * 4;
         if (off < r.section.fileOff) break;
         const inst = readBE32(iso, off);
         if (looksLikePrologue(inst)) {
-            prologue = pc - (i + 1) * 4;
+            prologue = pc - i * 4;
             break;
         }
     }
     if (prologue >= 0) {
-        console.log(`  function entry (prologue) appears to be: 0x${prologue.toString(16)}`);
-        console.log(`  → distance from PC: ${(pc - prologue) / 4} instructions`);
+        if (prologue === pc) {
+            console.log(`  function entry: PC is the prologue (mflr/stwu at PC itself)`);
+        } else {
+            console.log(`  function entry (prologue) appears to be: 0x${prologue.toString(16)}`);
+            console.log(`  → distance from PC: ${(pc - prologue) / 4} instructions`);
+        }
     } else {
-        console.log('  no stwu prologue found within 64 prior instructions — could be a leaf function or middle of a multi-block function');
+        console.log('  no stwu/mflr prologue found within 64 prior instructions — could be a leaf function or middle of a multi-block function');
     }
     // Dump 8 instructions before, target, 16 after.
     const startOff = Math.max(r.section.fileOff, r.fileOff - 8 * 4);
