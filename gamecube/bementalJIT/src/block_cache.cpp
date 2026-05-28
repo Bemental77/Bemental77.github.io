@@ -259,6 +259,25 @@ s32 dispatch_raw(int handle) {
         // recover the hung pc.
         if (Module.bemental_dispatch_n === undefined) Module.bemental_dispatch_n = 0;
         Module.bemental_dispatch_n++;
+        // [wtraj] per-block trajectory ring (LIVE path — this is the hot
+        // dispatcher, 11.5M hits). Records the executing block PC; flushes
+        // chunked [wtraj] lines every 100k; bounded to 3M. Diffed vs native
+        // Jit64 [traj] by gamecube/tools/trace_diff_gc.py.
+        if (Module.bemental_wtraj === undefined) { Module.bemental_wtraj = []; Module.bemental_wtraj_total = 0; }
+        if (Module.bemental_wtraj_total < 3000000) {
+            const __pc = Module.bemental_handle_to_pc ? (Module.bemental_handle_to_pc[$0] >>> 0) : 0;
+            Module.bemental_wtraj.push(__pc);
+            Module.bemental_wtraj_total++;
+            if (Module.bemental_wtraj.length >= 100000) {
+                let __l = '[wtraj]';
+                for (let __i = 0; __i < Module.bemental_wtraj.length; __i++) {
+                    __l += ' ' + (Module.bemental_wtraj[__i] >>> 0).toString(16);
+                    if ((__i % 20000) === 19999) { console.error(__l); __l = '[wtraj]'; }
+                }
+                if (__l.length > 7) console.error(__l);
+                Module.bemental_wtraj = [];
+            }
+        }
         if ((Module.bemental_dispatch_n % 10000) === 0) {
             // Reverse-lookup pc from handle for diagnostic clarity.
             let foundPc = 0;
@@ -321,6 +340,10 @@ void register_pc_handle(u64 pc, int handle) {
     EM_ASM({
         if (!Module.bemental_pc_to_handle) Module.bemental_pc_to_handle = new Map();
         Module.bemental_pc_to_handle.set($0 >>> 0, $1 | 0);
+        // [wtraj] trajectory: inverse handle->pc so dispatch_raw can record the
+        // executing block PC (native-granularity diff vs Jit64 [traj]).
+        if (!Module.bemental_handle_to_pc) Module.bemental_handle_to_pc = {};
+        Module.bemental_handle_to_pc[$1 | 0] = $0 >>> 0;
     }, static_cast<u32>(pc), handle);
 #else
     (void)pc; (void)handle;
@@ -359,6 +382,22 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
         }
         let count = 0;
         while (count < max) {
+            // [wtraj] per-block trajectory ring (chained-dispatch path). pc here
+            // is the executing block PC. Shares the ring with dispatch_raw.
+            if (Module.bemental_wtraj === undefined) { Module.bemental_wtraj = []; Module.bemental_wtraj_total = 0; }
+            if (Module.bemental_wtraj_total < 3000000) {
+                Module.bemental_wtraj.push(pc >>> 0);
+                Module.bemental_wtraj_total++;
+                if (Module.bemental_wtraj.length >= 100000) {
+                    let __l = '[wtraj]';
+                    for (let __i = 0; __i < Module.bemental_wtraj.length; __i++) {
+                        __l += ' ' + (Module.bemental_wtraj[__i] >>> 0).toString(16);
+                        if ((__i % 20000) === 19999) { console.error(__l); __l = '[wtraj]'; }
+                    }
+                    if (__l.length > 7) console.error(__l);
+                    Module.bemental_wtraj = [];
+                }
+            }
             const handle = map.get(pc);
             if (handle === undefined) break;
             const inst = cache[handle];
