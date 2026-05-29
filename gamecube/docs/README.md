@@ -57,7 +57,7 @@ Use this as the starting point when populating a topic's resource table.
 |---|---|
 | `gamecube/dolphin-src/Source/Core/Core/HW/*.cpp` (especially `ProcessorInterface.cpp`, `DSPHLE.cpp`, MMIO handlers under `gamecube/dolphin-src/Source/Core/Core/HW/MMIO*`) | What dolphin's native MMIO handlers expect on read/write. Use to validate any "the mirror is canonical" claim (`item6_mmio_stage2_design.md` walks the wrinkles). |
 | `gamecube/dolphin-bridge/` (`EmscriptenWorker.cpp`, `dolphin_stubs.cpp`, `worker_funcs.js`, `dolphin_worker_link.sh`, `patches/`) | Page-mediated mailbox + dolphin worker glue. Don't patch dolphin-src — patch here. |
-| `gamecube/ppc-worker/` (`ppc_worker_main.cpp`, `ppc_worker.js`, `sab_layout.h`, `compile_pool_worker.js`) | Standalone PowerPC JIT worker (Phase 2 architecture). SAB layout in `sab_layout.h`. |
+| `gamecube/ppc-worker/` (`ppc_worker_main.cpp`, `ppc_worker.js`, `sab_layout.h`) | Standalone PowerPC JIT worker (Phase 2 architecture). SAB layout in `sab_layout.h`. |
 | `gamecube/bementalJIT/include/bementalJIT/` + `gamecube/bementalJIT/src/` + `gamecube/bementalJIT/guests/powerpc/` (+ `guests/powerpc-next/`) | PowerPC emitter + block cache. Where any emit-side fix lands. GameCube uses `gamecube/bementalJIT/` — not the repo-root `bementalJIT/` (which is Dreamcast-only). |
 
 ### Build + probe pipeline
@@ -152,7 +152,6 @@ Topic name = short kebab-case description of the question being resolved (e.g. `
 |---|---|---|
 | `identify-the-actual-blocker/` | open | "Cache cold-start" was named the bottleneck in `phase_2e_cutover_works_cache_bottleneck.md`, but never confirmed against the oracle inventory. Is it really cache cold-start, or is there a discrete unresolved wedge upstream? |
 | `native-speed-gap-test/` | open | Across the four boundaries the dispatch path crosses (in-WASM → C → EM_ASM_INT → JS-side ppc_worker.js → gamecube.html orchestration), which single layer's cost is dominant? Microbench design that pins per-layer cost so the gap is measurable, not assumed. |
-| `wild-pc-0x58-crash/` | open | After `HLE_DSPMailUnblock` was patched 2026-05-17 (mail drain + PI INT_CAUSE_DSP clear, `HLE_OS.cpp:584-625`), boot advanced from AC=33 stuck-at-0x80139a6c to AC=235/F=11/slice_n=83 in 90s with the OS scheduler running threads. New crash: wild jump to PC=0x58 with LR=0, r1=0xfffffca8, empty backtrace. Topic identifies the corrupting block. **2026-05-18 narrowed**: wild-branch into OSLoadContext body (PC=0x800e5778) with r3=0; region-path redirect to `__OSReschedule` landed; next wedge is upstream LR=0 caller (`gamecube/docs/jit-correctness-rulebook/`). |
 | `jit-correctness-rulebook/` | **refuted 2026-05-18** | Diff'd bementalJIT vs JIT64 for stwu/lwz/emit_ea_d directly. Semantics match. The JIT is correctly executing broken guest code: `lwz r4, 408(r3)` with r3=0 → MEM1[408]=0 → SRR0=0 → rfi to PC=0 (already documented at JitWasm.cpp:3060-3068). The wedge is upstream: OS-state / context-save corruption (something writes instruction bytes into a thread Context's save area, or invokes OSLoadContext with r3=0). New topic needed for that. |
 
 Add a row here when starting a new topic.

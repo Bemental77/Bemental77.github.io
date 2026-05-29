@@ -97,7 +97,7 @@ echo "$PROVENANCE"
 # ---- probe ----
 echo "=== probe ($PROBE_LOG${PROBE_QUERY:+ q=$PROBE_QUERY}${ROM_IDX:+ rom=$ROM_IDX}${PROBE_DURATION_MS:+ d=${PROBE_DURATION_MS}ms}) ==="
 SECONDS=0
-node /Users/caseybement/dolphin_render_probe.js > "$PROBE_LOG" 2>&1
+node /Users/caseybement/Bemental77.github.io/gamecube/tools/dolphin_render_probe.js > "$PROBE_LOG" 2>&1
 WALL_MS=$((SECONDS * 1000))
 # Stamp provenance into the probe log itself so it can never be read as clean
 # without proof.

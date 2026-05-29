@@ -47,3 +47,9 @@ dreamcast/roms/
 dreamcast/flycast-src/
 # Flycast / sh4-worker local CMake build dirs (build-wasm/, build-host-test/, etc.)
 dreamcast/**/build-*/
+
+# Python bytecode
+**/__pycache__/
+
+# Old fork tree — preserved for MemArena port reference; remove after build Stage 0 passes (CC-1)
+gamecube/dolphin-src.bak/

@@ -16,7 +16,7 @@
 
 ## Goal
 
-After the DSPHLE mail-handshake fix + the OSLoadContext wild-branch redirect (see `gamecube/docs/wild-pc-0x58-crash/TASKS.md`), boot reaches OS scheduler running threads but still wedges via a deeper layer: **functions are invoked with LR=0 and registers containing instruction-encoded bytes**.
+After the DSPHLE mail-handshake fix + the OSLoadContext wild-branch redirect (the wild-pc-0x58-crash/ topic, hard-superseded 2026-05-29 and removed from the tree; see git history if needed), boot reaches OS scheduler running threads but still wedges via a deeper layer: **functions are invoked with LR=0 and registers containing instruction-encoded bytes**.
 
 User observation (load-bearing): "**seems odd that we do not already have the JIT rulebook from running dolphin JIT64 emulation locally**." Native Dolphin runs the same SAB ROM cleanly with its JIT64 PowerPC JIT (verified 2026-05-18: boots to SEGA logo / staffRoll.prs intro in ~10s wall). **JIT64 IS the rulebook.** This topic uses JIT64 as the canonical oracle for diagnosing bementalJIT's correctness divergence.
 
@@ -191,7 +191,6 @@ Task D (SAB disasm at lr=0x800ec0b8)──┘
 ## References
 
 - `gamecube/docs/README.md` — pattern + oracle inventory.
-- `gamecube/docs/wild-pc-0x58-crash/TASKS.md` — sibling topic; the HLE-side fixes that unblocked enough boot to expose this JIT bug.
 - `gamecube/dolphin-src/Source/Core/Core/PowerPC/Jit64/` — **the rulebook**. JIT64 is verified correct on this ROM via native Dolphin runs.
 - `bementalJIT/guests/powerpc/gekko_emit.{cpp,h}` — our PowerPC emit; where the fix lands.
 - `bementalJIT/src/block_cache.cpp` — region/per-block dispatch (H6 region).

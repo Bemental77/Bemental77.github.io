@@ -568,7 +568,7 @@ u32 ppc_worker_region_dispatch_pc(u32 pc) {
 // ---- CoreTiming shared event queue (Item 7 Phase I) ----
 // Infrastructure stub. The queue starts empty; nothing pushes into it
 // yet — that's Phase II (DEC mirror) and Phase III (hybrid events).
-// See gamecube/notes/item7_coretiming_design.md.
+// See gamecube/docs/designs/item7_coretiming_design.md.
 //
 // Layout addresses come from sab_layout.h. All u32 reads/writes go
 // through __atomic_* to be safe under the seqlock protocol; the

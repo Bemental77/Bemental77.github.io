@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Comprehensive native-Dolphin MMIO trajectory capture via GDB Z2/Z3 watchpoints.
 
-Same protocol as gdb_si_watch.py — Dolphin's GDB-RSP routes Z2/Z3 to
-MemChecks (see GDBStub.cpp:872-901 → MemChecks.Add()) which fire from
-MMU::Memcheck() on every guest read/write (MMU.cpp:633-666). MMIO addresses
-trigger because Memcheck() runs on the guest EA *before* hardware dispatch.
+Dolphin's GDB-RSP routes Z2/Z3 to MemChecks (see GDBStub.cpp:872-901 →
+MemChecks.Add()) which fire from MMU::Memcheck() on every guest read/write
+(MMU.cpp:633-666). MMIO addresses trigger because Memcheck() runs on the
+guest EA *before* hardware dispatch.
 
 The count is NOT hardware-limited — only performance-bound (linear lookup in
 MemChecks vector). We register both r-watch (Z3) and w-watch (Z2) covering

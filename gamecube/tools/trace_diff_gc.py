@@ -13,7 +13,8 @@ NATIVE input formats (--native FILE):
             Full log line: "01:23:45:678 Jit.cpp:461 N[POWERPC]: [traj] 80003140"
             The extractor looks for the literal token "[traj] " followed by a
             hex string anywhere on a line.
-  Format C: GDB single-step output from gdb_osexc_step.py / gdb_si_step.py.
+  Format C: GDB single-step output (line format reusable; the original
+            session-specific step scripts were retired 2026-05-29).
             Lines like: "  [  0] pc=0x80003140 r0=0x..."
             Extracts the first "pc=0x<hex>" token per line.
   (Formats are auto-detected; unknown lines are silently skipped.)
