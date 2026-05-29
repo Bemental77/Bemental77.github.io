@@ -63,4 +63,21 @@ void emit_store_x(WasmModuleBuilder& wb, RegCache& rc,
                   LoadStoreParams params, const CodeOp& op,
                   StoreWidth width, bool update);
 
+// ----- FP X-form (indexed) — single-precision load / store + stfiwx.
+// All three route through the host WIMPORT slow path (no fastmem). The
+// FPR is stored as f64 at PowerPCState +ps0(rs) per Dolphin's paired-single
+// layout. lfsx promotes the f32 in memory to f64; stfsx demotes the f64 in
+// the FPR back to f32. stfiwx writes the low 32 bits of the f64 slot
+// (matches Dolphin's little-endian host storage of the f64).
+//
+// Op31 xo: 535 lfsx, 663 stfsx, 983 stfiwx. Per gekko_emit.cpp:2847-2878
+// these were the top-3 of remaining op31 interp fallbacks (= 85% of total
+// op31 fallbacks in a 500K-dispatch window).
+void emit_lfsx  (WasmModuleBuilder& wb, RegCache& rc,
+                 LoadStoreParams params, const CodeOp& op);
+void emit_stfsx (WasmModuleBuilder& wb, RegCache& rc,
+                 LoadStoreParams params, const CodeOp& op);
+void emit_stfiwx(WasmModuleBuilder& wb, RegCache& rc,
+                 LoadStoreParams params, const CodeOp& op);
+
 }  // namespace bemental::powerpc

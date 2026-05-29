@@ -1,5 +1,16 @@
 # Wild PC=0x58 crash after the DSP handshake unblock
 
+> **STATUS: SUPERSEDED — 2026-05-29.** The PC=0x58 symptom was a downstream
+> effect of the 0x800e362c bcx self-loop wedge documented in
+> `dolphin_sab_362c_selfloop_chain_2026_05_21`. That self-loop is fixed
+> (commit 95b9d1b: powerpc-next emit_bcx natively resolves bne/beq/bdnz/bdz).
+> Current authoritative wedge root: memory
+> `gamecube_first_mmio_divergence_2026_05_28` (MMIO routing, zz_800e6760_
+> skipped at write-index 12). This topic kept as historical record;
+> follow-up work happens against the new root, not these tasks.
+
+
+
 ## Goal
 
 After `HLE_DSPMailUnblock` was patched 2026-05-17 to drain DSPHLE's pending mail + clear PI `INT_CAUSE_DSP` (gamecube/dolphin-src/Source/Core/Core/HLE/HLE_OS.cpp:584-625), boot advanced from a stuck wedge at `0x80139a6c` (AC=33 in 30s) to running the OS scheduler with 10+ polling loops cycled in 90s wall (AC=235, F=11, slice_n=83 per `refs/dspmail-pi-clear-90s.summary.json`). Boot now eventually crashes with a wild jump to **PC=0x58** in a corrupted state.

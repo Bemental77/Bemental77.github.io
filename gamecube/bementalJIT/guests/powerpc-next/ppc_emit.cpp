@@ -36,8 +36,9 @@
 // Until a follow-up extracts shared types to a third-party header, the
 // region implementations below stay as passthroughs to the live functions
 // (forward-declared inside #ifdef BEMENTALJIT_USE_REBUILD blocks below).
-// Agent 4's real region impls (which deref BlockInputs members and would
-// route the SAB wedge path through powerpc-next ports) are reverted.
+// Real region impls (which deref BlockInputs members and would route the
+// region path entirely through powerpc-next ports) are reverted pending
+// the shared-header extraction.
 
 namespace bemental::powerpc {
 
@@ -65,13 +66,16 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     case 8:  emit_subfic (wb, rc, op, params.ctx_ptr);       return true;
     case 10: emit_cmpli  (wb, rc, op, params.ctx_ptr);       return true;
     case 11: emit_cmpi   (wb, rc, op, params.ctx_ptr);       return true;
-    case 12: emit_addic  (wb, rc, op, params.ctx_ptr);       return true;
-    case 14: emit_addi   (wb, rc, op);                       return true;
+    case 12: emit_addic    (wb, rc, op, params.ctx_ptr);     return true;
+    case 13: emit_addic_rc (wb, rc, op, params.ctx_ptr);     return true;
+    case 14: emit_addi     (wb, rc, op);                     return true;
     case 15: emit_addis  (wb, rc, op);                       return true;
     case 24: emit_ori    (wb, rc, op);                       return true;
     case 25: emit_oris   (wb, rc, op);                       return true;
     case 26: emit_xori   (wb, rc, op);                       return true;
     case 27: emit_xoris  (wb, rc, op);                       return true;
+    case 28: emit_andix  (wb, rc, op, params.ctx_ptr);       return true;
+    case 29: emit_andisx (wb, rc, op, params.ctx_ptr);       return true;
 
     // ---- D-form loads ----
     case 32: emit_load_d (wb, rc, params, op, LoadWidth::U32, false); return true;
@@ -92,9 +96,9 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     case 45: emit_store_d(wb, rc, params, op, StoreWidth::U16, true);  return true;
 
     // ---- Rotate / mask ----
-    case 20: emit_rlwimix(wb, rc, op);                       return true;
-    case 21: emit_rlwinmx(wb, rc, op);                       return true;
-    case 23: emit_rlwnmx (wb, rc, op);                       return true;
+    case 20: emit_rlwimix(wb, rc, op, params.ctx_ptr);       return true;
+    case 21: emit_rlwinmx(wb, rc, op, params.ctx_ptr);       return true;
+    case 23: emit_rlwnmx (wb, rc, op, params.ctx_ptr);       return true;
 
     // ---- Branch (D-form) ----
     case 16: emit_bcx    (wb, rc, op, params.ctx_ptr);       return true;
@@ -112,22 +116,35 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 
     case 31:
         switch (sub10) {
-        // X-form integer
-        case 266: case 778: emit_addx  (wb, rc, op);                       return true;
-        case 40:  case 552: emit_subfx (wb, rc, op);                       return true;
-        case 235: case 747: emit_mullwx(wb, rc, op);                       return true;
-        case 28:            emit_andx  (wb, rc, op);                       return true;
-        case 444:           emit_orx   (wb, rc, op);                       return true;
-        case 316:           emit_xorx  (wb, rc, op);                       return true;
-        case 124:           emit_norx  (wb, rc, op);                       return true;
-        case 24:            emit_slwx  (wb, rc, op);                       return true;
-        case 536:           emit_srwx  (wb, rc, op);                       return true;
+        // X-form integer — all FL_RC_BIT, ctx_ptr threaded for CR0 update.
+        case 266: case 778: emit_addx  (wb, rc, op, params.ctx_ptr);       return true;
+        case 40:  case 552: emit_subfx (wb, rc, op, params.ctx_ptr);       return true;
+        case 235: case 747: emit_mullwx(wb, rc, op, params.ctx_ptr);       return true;
+        // X-form carry arithmetic (OE-suffix variants share emit; OV/SO untracked).
+        case 10:  case 522: emit_addcx (wb, rc, op, params.ctx_ptr);       return true;
+        case 8:   case 520: emit_subfcx(wb, rc, op, params.ctx_ptr);       return true;
+        // X-form wide multiply (high half).
+        case 75:            emit_mulhwx (wb, rc, op, params.ctx_ptr);      return true;
+        case 11:            emit_mulhwux(wb, rc, op, params.ctx_ptr);      return true;
+        // X-form integer divide (guarded).
+        case 491: case 1003: emit_divwx (wb, rc, op, params.ctx_ptr);      return true;
+        case 459: case 971:  emit_divwux(wb, rc, op, params.ctx_ptr);      return true;
+        case 28:            emit_andx  (wb, rc, op, params.ctx_ptr);       return true;
+        case 60:            emit_andcx (wb, rc, op, params.ctx_ptr);       return true;
+        case 444:           emit_orx   (wb, rc, op, params.ctx_ptr);       return true;
+        case 316:           emit_xorx  (wb, rc, op, params.ctx_ptr);       return true;
+        case 124:           emit_norx  (wb, rc, op, params.ctx_ptr);       return true;
+        case 476:           emit_nandx (wb, rc, op, params.ctx_ptr);       return true;
+        case 284:           emit_eqvx  (wb, rc, op, params.ctx_ptr);       return true;
+        case 412:           emit_orcx  (wb, rc, op, params.ctx_ptr);       return true;
+        case 24:            emit_slwx  (wb, rc, op, params.ctx_ptr);       return true;
+        case 536:           emit_srwx  (wb, rc, op, params.ctx_ptr);       return true;
         case 792:           emit_srawx (wb, rc, op, params.ctx_ptr);       return true;
         case 824:           emit_srawix(wb, rc, op, params.ctx_ptr);       return true;
-        case 954:           emit_extsbx(wb, rc, op);                       return true;
-        case 922:           emit_extshx(wb, rc, op);                       return true;
-        case 26:            emit_cntlzwx(wb, rc, op);                      return true;
-        case 104:           emit_negx  (wb, rc, op);                       return true;
+        case 954:           emit_extsbx(wb, rc, op, params.ctx_ptr);       return true;
+        case 922:           emit_extshx(wb, rc, op, params.ctx_ptr);       return true;
+        case 26:            emit_cntlzwx(wb, rc, op, params.ctx_ptr);      return true;
+        case 104:           emit_negx  (wb, rc, op, params.ctx_ptr);       return true;
         case 138: case 650: emit_addex (wb, rc, op, params.ctx_ptr);       return true;
         case 136: case 648: emit_subfex(wb, rc, op, params.ctx_ptr);       return true;
         case 234: case 746: emit_addmex(wb, rc, op, params.ctx_ptr);       return true;
@@ -155,18 +172,73 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
         case 407: emit_store_x(wb, rc, params, op, StoreWidth::U16, false); return true;
         case 439: emit_store_x(wb, rc, params, op, StoreWidth::U16, true);  return true;
 
+        // FP X-form indexed load/store (lfsx 535, stfsx 663, stfiwx 983).
+        case 535: emit_lfsx  (wb, rc, params, op);                          return true;
+        case 663: emit_stfsx (wb, rc, params, op);                          return true;
+        case 983: emit_stfiwx(wb, rc, params, op);                          return true;
+
         // System registers
         case 339: emit_mfspr(wb, rc, op, params.ctx_ptr);                  return true;
         case 467: emit_mtspr(wb, rc, op, params.ctx_ptr);                  return true;
         case 83:  emit_mfmsr(wb, rc, op, params.ctx_ptr);                  return true;
         case 146: emit_mtmsr(wb, rc, op, params.ctx_ptr);                  return true;
+        // Time-base read (direct SPR slot — no CoreTiming).
+        case 371: emit_mftb  (wb, rc, op, params.ctx_ptr);                 return true;
+        // CR pack/unpack — interp fallback (CR-encoding non-trivial).
+        case 19:  emit_mfcr  (wb, rc, op, params.ctx_ptr);                 return true;
+        case 144: emit_mtcrf (wb, rc, op, params.ctx_ptr);                 return true;
+        // Segment register access / TLB invalidate — interp fallback
+        // (privileged MMU ops; rare and block-ending).
+        case 210: emit_mtsr  (wb, rc, op, params.ctx_ptr);                 return true;
+        case 242: emit_mtsrin(wb, rc, op, params.ctx_ptr);                 return true;
+        case 306: emit_tlbie (wb, rc, op, params.ctx_ptr);                 return true;
+        case 595: emit_mfsr  (wb, rc, op, params.ctx_ptr);                 return true;
+        case 659: emit_mfsrin(wb, rc, op, params.ctx_ptr);                 return true;
 
-        // Sync / cache barriers — emit nothing.
-        case 598: case 854: case 982:                                       return true;
+        // dcbz — 32-byte zero block. Memset/__fill_mem hot path.
+        case 1014: emit_dcbz(wb, rc, op, params.ctx_ptr);                  return true;
+
+        // Sync / cache barriers / cache hints — emit nothing. The emulator's
+        // linear memory model has no real cache to flush/invalidate/prefetch.
+        //   598 sync/lwsync, 854 eieio, 982 icbi (i-cache invalidate),
+        //    86 dcbf, 54 dcbst, 470 dcbi, 278 dcbt, 246 dcbtst.
+        case 598: case 854: case 982:
+        case 86:  case 54:  case 470:
+        case 278: case 246:
+            return true;
 
         default: break;
         }
         break;
+
+    // ---- FP D-form load/store + PS D-form indexed memory + FP arith ----
+    // Phase 4 routes all FP / PS ops to WIMPORT_INTERP. ppc_tables.cpp now
+    // classifies these with FL_USE_FPU / FL_LOADSTORE / FL_IN_FLOAT_* so
+    // the analyzer keeps the block intact across long stfd/lfd chains in
+    // OSContext save/restore (per gsne8p.map: __OSLoadFPUContext 0x800e5388
+    // — 0x800e54ab, __OSSaveFPUContext 0x800e54ac — 0x800e55d3, and the
+    // ~70 stfd/psq_st pair in OSFillFPUContext referenced by OSContext.c
+    // :566-643). Without this classification the analyzer broke at the
+    // first FP op, yielding 1-op blocks of pure FPU loadstores with no
+    // dispatch amortization. Once Phase 5 ports the per-op FP emitters
+    // from guests/powerpc/gekko_emit.cpp (emit_lfs_impl..emit_fmaddx_impl
+    // at ~line 2706..3150), the dispatch cases here can call them
+    // directly. Until then, fallthrough.
+    //   48-55 = lfs/lfsu/lfd/lfdu/stfs/stfsu/stfd/stfdu (FP D-form)
+    //   56-57 = psq_l/psq_lu                            (PS D-form load)
+    //   60-61 = psq_st/psq_stu                          (PS D-form store)
+    //   4     = paired-singles subtable (handled by analyzer/table4)
+    //   59    = single-precision FP arith subtable
+    //   63    = double-precision FP + system-FP subtable
+    case 4:
+    case 48: case 49: case 50: case 51:
+    case 52: case 53: case 54: case 55:
+    case 56: case 57:
+    case 59:
+    case 60: case 61:
+    case 63:
+        emit_fallback(wb, rc, op, params.ctx_ptr);
+        return false;
 
     default: break;
     }
@@ -293,11 +365,13 @@ std::vector<u8> build_block_next(u32 start_pc,
     // (Jit.cpp:1065-1066): JIT64 calls HLE::TryReplaceFunction on EVERY op's
     // address, not just block start. If any mid-block op is HLE-hooked, the
     // hook fires and the block exits there. This catches wild-branch-into-
-    // mid-function cases (the SAB wedge at 0x800e5778 where ppc-worker landed
-    // mid-OSLoadContext with r3=0 and the registered HLE patch at the function
-    // entry never had a chance to fire). Previous port only emitted the HLE
-    // prologue at start_pc once — equivalent to JIT64 calling HandleFunctionHooking
-    // only at op[0], which doesn't catch downstream hooked PCs.
+    // mid-function cases. Historical: the SAB 0x800e5778 OSLoadContext-with-
+    // r3=0 symptom motivated the port; that specific PC has since been
+    // superseded as the wedge (current root in memory
+    // gamecube_first_mmio_divergence_2026_05_28), but the per-op hook check
+    // is still correctness-required vs the original "start-of-block only"
+    // shape, which equivalent to JIT64 calling HandleFunctionHooking on
+    // op[0] only — missing downstream hooked PCs.
     //
     // RegCache must be flushed before the HLE call so the host sees current
     // GPR state if the hook reads ppc_state.
@@ -317,6 +391,20 @@ std::vector<u8> build_block_next(u32 start_pc,
         // mid-function branches.
         rc.Flush(ctx_ptr);
         emit_hle_prologue(b, ctx_ptr, op.address);
+
+        // Pre-op set_pc — mirrors live gekko_emit.cpp:4023+. Native
+        // emitters don't write ppc_state.pc; without this pre-set, a later
+        // op in the same block that falls back to dolphin_interp sees a
+        // stale pc and the dolphin_interp guard (`if (ppc_state.pc != pc)
+        // return`, search JitWasm.cpp for that conditional) bails before
+        // SingleStepInner runs. Historically observed on the SAB 0x500
+        // EXT_INT path: addis/addi/mtspr ran natively without updating pc,
+        // then rfi fell back; the interp guard saw stale pc and skipped
+        // the rfi, leaving the block in a self-loop until idle-skip
+        // heuristics tripped.
+        b.op_i32_const((s32)ctx_ptr);
+        b.op_i32_const((s32)op.address);
+        b.op_i32_store(ppc_off::PC);
 
         if (is_terminator && op.branchIsIdleLoop) {
             emit_idle_skip(b, rc, op, ctx_ptr);
@@ -350,9 +438,9 @@ std::vector<u8> build_block_next(u32 start_pc,
 // Follow-up: extract BlockInputs + LocalIdxLookupFn + WIMPORT_* + ppc_off::*
 // into a third shared header (e.g. bementalJIT/include/bementalJIT/ppc_shared.h)
 // that both gekko_emit.h and powerpc-next headers can include without
-// collision. Then re-introduce the real region impls so the SAB wedge path
-// exercises the per-op HLE check (task 25), const-MMIO routing (task 26),
-// and LR-stack push/pop (task 27).
+// collision. Then re-introduce the real region impls so the region path
+// exercises the per-op HLE check, const-MMIO routing, and LR-stack push/pop
+// natively rather than via the live-gekko forward.
 
 // Forward decls for the live functions we forward to.
 std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,

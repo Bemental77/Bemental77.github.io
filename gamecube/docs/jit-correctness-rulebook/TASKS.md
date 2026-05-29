@@ -1,5 +1,19 @@
 # JIT correctness — bementalJIT vs JIT64 rulebook
 
+> **STATUS UPDATE — 2026-05-29.** The wedge that prompted this doc
+> (`r31=0x7c600124 lr=0x0` at PC=0x800e5778) was a downstream symptom of
+> the 0x800e362c bcx self-loop (fixed commit 95b9d1b — powerpc-next
+> emit_bcx natively resolves bne/beq/bdnz/bdz; previously all conditional
+> forms fell back to interp without writing ppc_state.pc, self-looping
+> the OSInit guard). H1/H2/H3 (stwu/lwz/blr emitter divergence) were
+> NOT confirmed; the actual class was "block self-returns its own entry
+> PC because pre-op set_pc was missing for native+interp mixed blocks."
+> Current authoritative wedge root: memory
+> `gamecube_first_mmio_divergence_2026_05_28`. Keep this doc for
+> reference; new correctness hunts open as separate topics.
+
+
+
 ## Goal
 
 After the DSPHLE mail-handshake fix + the OSLoadContext wild-branch redirect (see `gamecube/docs/wild-pc-0x58-crash/TASKS.md`), boot reaches OS scheduler running threads but still wedges via a deeper layer: **functions are invoked with LR=0 and registers containing instruction-encoded bytes**.

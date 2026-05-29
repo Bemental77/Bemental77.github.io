@@ -19,13 +19,17 @@ constexpr u32 PS_BASE     = 0x0A0;
 constexpr u32 CR_BASE     = 0x2A0;  // CR[0..7], each u64
 constexpr u32 MSR         = 0x2E0;
 constexpr u32 FPSCR       = 0x2E4;
-constexpr u32 XER_CA      = 0x2F4;  // u8
-constexpr u32 XER_SO_OV   = 0x2F5;  // u8
-constexpr u32 SPR_BASE    = 0x340;
+constexpr u32 XER_CA          = 0x2F4;  // u8
+constexpr u32 XER_SO_OV       = 0x2F5;  // u8 — format: (SO << 1) | OV
+constexpr u32 XER_STRINGCTRL  = 0x2F6;  // u16 — BYTE_COUNT | (BYTE_CMP << 8)
+constexpr u32 SPR_BASE        = 0x340;
 
 constexpr u32 gpr(u32 n)  { return GPR_BASE + (n * 4u); }
 constexpr u32 cr(u32 n)   { return CR_BASE + (n * 8u); }
 constexpr u32 spr(u32 n)  { return SPR_BASE + (n * 4u); }
+// PairedSingle = 16 bytes (ps0 + ps1, each f64). Per gekko_emit.h:117-120.
+constexpr u32 ps0(u32 n)  { return PS_BASE + (n * 16u) + 0u; }
+constexpr u32 ps1(u32 n)  { return PS_BASE + (n * 16u) + 8u; }
 
 // Common SPR indices (PowerPC architecture).
 constexpr u32 SPR_XER     = 1;

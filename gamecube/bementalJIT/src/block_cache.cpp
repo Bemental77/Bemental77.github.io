@@ -261,10 +261,11 @@ s32 dispatch_raw(int handle) {
         Module.bemental_dispatch_n++;
         // [wtraj] per-block trajectory ring (LIVE path — this is the hot
         // dispatcher, 11.5M hits). Records the executing block PC; flushes
-        // chunked [wtraj] lines every 100k; bounded to 3M. Diffed vs native
-        // Jit64 [traj] by gamecube/tools/trace_diff_gc.py.
+        // chunked [wtraj] lines every 100k; bounded to 8M (covers native's
+        // 5.99M plus margin). Diffed vs native Jit64 [traj] by
+        // gamecube/tools/trace_diff_gc.py.
         if (Module.bemental_wtraj === undefined) { Module.bemental_wtraj = []; Module.bemental_wtraj_total = 0; }
-        if (Module.bemental_wtraj_total < 3000000) {
+        if (Module.bemental_wtraj_total < 8000000) {
             const __pc = Module.bemental_handle_to_pc ? (Module.bemental_handle_to_pc[$0] >>> 0) : 0;
             Module.bemental_wtraj.push(__pc);
             Module.bemental_wtraj_total++;
@@ -384,8 +385,9 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
         while (count < max) {
             // [wtraj] per-block trajectory ring (chained-dispatch path). pc here
             // is the executing block PC. Shares the ring with dispatch_raw.
+            // Bounded to 8M (covers native's 5.99M plus margin).
             if (Module.bemental_wtraj === undefined) { Module.bemental_wtraj = []; Module.bemental_wtraj_total = 0; }
-            if (Module.bemental_wtraj_total < 3000000) {
+            if (Module.bemental_wtraj_total < 8000000) {
                 Module.bemental_wtraj.push(pc >>> 0);
                 Module.bemental_wtraj_total++;
                 if (Module.bemental_wtraj.length >= 100000) {

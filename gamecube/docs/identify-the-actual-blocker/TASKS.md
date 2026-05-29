@@ -1,5 +1,24 @@
 # Identify the actual blocker (not "throughput", not "cache cold-start")
 
+> **STATUS UPDATE — 2026-05-29.** Kill criterion #3 (correctness bug in an
+> emitted op / PPC state diverged from native) has fired multiple times
+> since this doc was written. Documented findings:
+>
+> - 0x800e362c bcx self-loop — emitter bug, fixed in commit 95b9d1b
+>   (memory `gamecube_362c_block_decode_2026_05_27`).
+> - SetInterruptMask PI MASK widening — andi./andis./andc emitter gaps,
+>   added (see gamecube/bementalJIT/guests/powerpc-next/jit_integer.cpp).
+> - First MMIO divergence at write-index 12 — wasm skipping zz_800e6760_
+>   (EXI/DI status-clear). Current authoritative root: memory
+>   `gamecube_first_mmio_divergence_2026_05_28`.
+>
+> Throughput hypothesis (H0) remains UNFALSIFIED only because the wedge
+> sequence has not yet been fully cleared. Keep this topic open as the
+> meta-tracker; the per-bug fix work lives in commits + memory entries,
+> not as new sub-tasks here.
+
+
+
 ## Goal
 
 `phase_2e_cutover_works_cache_bottleneck.md` claims the current limiter past the Phase 2e cutover is "ppc-worker cache cold-start (~85ms/compile)". `baseline_probe_2026_05_14.md` separately documents `video_cb=0` (zero game-frames ever) and AC=33 / F=1 IDENTICAL to a baseline two days older — i.e. moving CT advance per iter did NOT move hybrid-event cadence (AID/VI/DSP). Two memories, two different "the bottleneck is throughput" framings, neither one falsified against the oracle inventory.

@@ -20,9 +20,10 @@
 // `bl`/`bcl`/`bclrl`/`bcctrl` (any LK=1) PUSHes the after-PC; every `blr`
 // CMPs the popped value against the actual LR and routes a mismatch to
 // `dispatcher_mispredicted_blr` (Jit.cpp:660-682). That mismatch path is
-// what catches stack corruption that would otherwise wild-branch — the
-// upstream symptom of SAB's PC=0x800e5778 wedge per the prior researcher
-// note.
+// what catches stack corruption that would otherwise wild-branch.
+// Historical: the 0x800e5778 SAB symptom motivated this port; that PC has
+// since been superseded as "the wedge" (see memory
+// gamecube_first_mmio_divergence_2026_05_28).
 //
 // bementalJIT has no host stack to PUSH on (we're running inside a WASM
 // module function with no architectural caller frame between blocks). We
@@ -256,10 +257,10 @@ void emit_bx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // emit_bcx — conditional branch.
 //   target = SignExt16(BD << 2); if (!AA) target += pc;
 //   BO[0..4] decode: bit 4=1 → ignore CR; bit 2=1 → ignore CTR (no decrement)
-// Phase 4 part 2 ships static-target branch with BO=20 (branch always)
-// inline; richer conditions fallback to WIMPORT_INTERP. The interpreter
-// handles the CTR/CR combination logic exactly; emit_bcx invokes it via
-// the per-op fallback.
+// Native paths: BO=20 (branch always), bdnz/bdz (BO=0b10000 / 0b10010), and
+// the CR-bit conditional forms BO=0b00100 / 0b01100 (bne / beq). Genuinely
+// rare combos (LK conditional calls; exotic CTR+CR mixes) fall back to
+// WIMPORT_INTERP via the trailing path.
 // ---------------------------------------------------------------------------
 void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
               u32 ctx_ptr) {

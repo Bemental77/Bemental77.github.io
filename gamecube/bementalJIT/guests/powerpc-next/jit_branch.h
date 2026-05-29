@@ -25,9 +25,9 @@ void emit_bx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
              u32 ctx_ptr);
 
 // Conditional branch — bcx (op16). Decodes BO/BI for CR + CTR conditions.
-// Phase 4 part 2 ships the static-target variant; complex multi-condition
-// dispatch (BO bit 4=0 needs CR check, BO bit 2=0 needs CTR decrement)
-// delegates to the runtime helper when too rich for inline emit.
+// Native paths: BO=20 (branch always), bdnz/bdz, and the CR-bit conditional
+// forms bne/beq. Rare BO combinations (LK conditional calls, exotic CTR+CR
+// mixes) delegate to WIMPORT_INTERP.
 //
 // BLR-stack: the inline BO=20 LK=1 path pushes. The interp-fallback path
 // does NOT push (interp owns LR mutation for the LK arm); this is a known

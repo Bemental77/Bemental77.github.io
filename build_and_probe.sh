@@ -34,14 +34,23 @@ while [ $# -gt 0 ]; do
 done
 
 # ---- archive paths ----
+# Every rebuild+probe overwrites — we don't keep prior findings around. The
+# only artifact preserved is THIS run's set. Any prior runs (named or
+# unnamed) get cleared before we write the new one.
 if [ -n "$NAME" ]; then
   ARCHIVE_DIR="/tmp/probes"
   mkdir -p "$ARCHIVE_DIR"
+  # Clear all prior probe artifacts — this run is the only valid one.
+  rm -f "$ARCHIVE_DIR"/*.log "$ARCHIVE_DIR"/*.summary.json "$ARCHIVE_DIR"/*.trace.json "$ARCHIVE_DIR"/*.metrics.json 2>/dev/null
+  rm -f /tmp/probe.log /tmp/probe.summary.json 2>/dev/null
   PROBE_LOG="${PROBE_LOG:-$ARCHIVE_DIR/${NAME}.log}"
   SUMMARY_JSON="$ARCHIVE_DIR/${NAME}.summary.json"
   export PROBE_TRACE_PATH="$ARCHIVE_DIR/${NAME}.trace.json"
   export PROBE_METRICS_PATH="$ARCHIVE_DIR/${NAME}.metrics.json"
 else
+  # Unnamed run — clear all prior probe artifacts including any named runs.
+  rm -f /tmp/probe.log /tmp/probe.summary.json 2>/dev/null
+  rm -rf /tmp/probes 2>/dev/null
   PROBE_LOG="${PROBE_LOG:-/tmp/probe.log}"
   SUMMARY_JSON="/tmp/probe.summary.json"
 fi

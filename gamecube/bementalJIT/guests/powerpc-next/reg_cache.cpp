@@ -1,13 +1,10 @@
 //
-// RegCache — implementation. Phase 2 deliverable. Pure host C++ logic;
-// the actual WASM emit (i32.load / i32.store / local.get / local.set /
-// op_if / op_else / op_end) goes through bementalJIT's WasmModuleBuilder.
+// RegCache — implementation. Pure host C++ logic; the actual WASM emit
+// (i32.load / i32.store / local.get / local.set / op_if / op_else /
+// op_end) goes through bementalJIT's WasmModuleBuilder.
 //
-// Phase 2 stub status: full state-machine logic is in place but the WASM
-// emit-helper calls reference WasmModuleBuilder methods that may not exist
-// under those exact names in the live header. Each emit site is marked
-// with a TODO referencing the live builder's actual op_* helper; the
-// linkage is settled in Phase 3 when this RegCache wires into jit_load_store.
+// Status: wired through jit_load_store / jit_integer / jit_branch /
+// jit_compare / jit_system_registers / ppc_emit (build_block_next).
 
 #include "reg_cache.h"
 

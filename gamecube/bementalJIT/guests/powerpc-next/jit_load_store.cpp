@@ -29,6 +29,7 @@
 #include "code_op.h"
 #include "common/op_info.h"
 #include "ppc_analyst.h"
+#include "ppc_offsets.h"
 #include "reg_cache.h"
 
 namespace bemental::powerpc {
@@ -441,6 +442,100 @@ void emit_store_x(WasmModuleBuilder& wb, RegCache& rc,
     const u32 rb   = GekkoOperands::RB(inst);
     emit_ea_x_form(wb, rc, ra, rb);
     emit_store_common(wb, rc, params, rs, ra, width, update);
+}
+
+// ---------------------------------------------------------------------------
+// FP X-form: lfsx / stfsx / stfiwx. All route through WIMPORT_READ32/WRITE32
+// without fastmem (FPRs touched in MMIO range is exceedingly rare and the
+// f32 reinterpret prelude/postlude is awkward to share with the integer
+// fastmem shape). Flush regcache before the call so host MMIO handlers see
+// coherent PowerPCState.
+// Ported from gekko_emit.cpp:2847-2878.
+// ---------------------------------------------------------------------------
+
+// Compute EA = (ra ? gpr[ra] : 0) + gpr[rb] and leave it on the wasm stack.
+static void emit_ea_x_stack(WasmModuleBuilder& wb, RegCache& rc,
+                            u32 ra, u32 rb) {
+    auto rc_rb = rc.Bind(rb, RCMode::Read);
+    if (ra == 0) {
+        wb.op_local_get(rc_rb.local_idx());
+    } else {
+        auto rc_ra = rc.Bind(ra, RCMode::Read);
+        wb.op_local_get(rc_ra.local_idx());
+        wb.op_local_get(rc_rb.local_idx());
+        wb.op_i32_add();
+    }
+}
+
+// lfsx fT, rA, rB — load f32 at EA, promote to f64, store at ps0(rt).
+// gekko_emit.cpp:2847 emit_lfsx_impl.
+void emit_lfsx(WasmModuleBuilder& wb, RegCache& rc,
+               LoadStoreParams params, const CodeOp& op) {
+    const u32 inst = op.inst;
+    const u32 rt   = GekkoOperands::RD(inst);
+    const u32 ra   = GekkoOperands::RA(inst);
+    const u32 rb   = GekkoOperands::RB(inst);
+
+    // Compute EA to stack, save into LOCAL_TMP_EA.
+    emit_ea_x_stack(wb, rc, ra, rb);
+    wb.op_local_set(LOCAL_TMP_EA);
+
+    // Flush regcache before WIMPORT call (host may dereference PowerPCState).
+    rc.Flush(params.ctx_ptr);
+
+    // Push ctx pointer for the eventual f64.store at the end.
+    wb.op_i32_const((s32)params.ctx_ptr);
+    // read32(EA) returns u32 big-endian-converted bits.
+    wb.op_local_get(LOCAL_TMP_EA);
+    wb.op_call(WIMPORT_READ32);
+    // reinterpret as f32 -> promote to f64 -> store
+    wb.op_f32_reinterpret_i32();
+    wb.op_f64_promote_f32();
+    wb.op_f64_store(ppc_off::ps0(rt));
+}
+
+// stfsx fS, rA, rB — demote ps0(rs) f64 to f32, store via WIMPORT_WRITE32.
+// gekko_emit.cpp:2858 emit_stfsx_impl.
+void emit_stfsx(WasmModuleBuilder& wb, RegCache& rc,
+                LoadStoreParams params, const CodeOp& op) {
+    const u32 inst = op.inst;
+    const u32 rs   = GekkoOperands::RS(inst);
+    const u32 ra   = GekkoOperands::RA(inst);
+    const u32 rb   = GekkoOperands::RB(inst);
+
+    emit_ea_x_stack(wb, rc, ra, rb);
+    wb.op_local_set(LOCAL_TMP_EA);
+
+    rc.Flush(params.ctx_ptr);
+
+    // write32(EA, demote(f64) as u32) — push EA, push value, call.
+    wb.op_local_get(LOCAL_TMP_EA);
+    wb.op_i32_const((s32)params.ctx_ptr);
+    wb.op_f64_load(ppc_off::ps0(rs));
+    wb.op_f32_demote_f64();
+    wb.op_i32_reinterpret_f32();
+    wb.op_call(WIMPORT_WRITE32);
+}
+
+// stfiwx fS, rA, rB — write low 32 bits of ps0(rs) f64 as a word.
+// Little-endian f64 host storage puts the low 32 bits at offset +0.
+// gekko_emit.cpp:2872 emit_stfiwx_impl.
+void emit_stfiwx(WasmModuleBuilder& wb, RegCache& rc,
+                 LoadStoreParams params, const CodeOp& op) {
+    const u32 inst = op.inst;
+    const u32 rs   = GekkoOperands::RS(inst);
+    const u32 ra   = GekkoOperands::RA(inst);
+    const u32 rb   = GekkoOperands::RB(inst);
+
+    emit_ea_x_stack(wb, rc, ra, rb);
+    wb.op_local_set(LOCAL_TMP_EA);
+
+    rc.Flush(params.ctx_ptr);
+
+    wb.op_local_get(LOCAL_TMP_EA);
+    wb.op_i32_const((s32)params.ctx_ptr);
+    wb.op_i32_load(ppc_off::ps0(rs));  // low 32 bits of f64 slot (little-endian host)
+    wb.op_call(WIMPORT_WRITE32);
 }
 
 }  // namespace bemental::powerpc

@@ -62,23 +62,14 @@ std::vector<u8> build_block_next(u32 start_pc,
 // on every JIT step. When BEMENTALJIT_USE_REBUILD=ON, those callsites are
 // gated to the _next variants below.
 //
-// Real implementations (ppc_emit.cpp):
-//   emit_block_body_next       — emits one function body via the powerpc-
-//                                next path (dispatch_op + RegCache + per-
-//                                op HLE check + jit_load_store const-MMIO
-//                                routing + jit_branch LR-stack). Mirrors
-//                                build_block_next's body shape minus the
-//                                module-shell wrap.
-//   build_region_function_next — emits the merged-fn region (br_table over
-//                                N nested blocks, shared 36 locals). Per-
-//                                block bodies use emit_block_body_next's
-//                                inner helper.
-//   build_region_module_next   — structural module-shell wrapper only;
-//                                forwards to the live build_region_module
-//                                because no per-op semantics live here.
-//                                The bytes inside the code section come
-//                                from emit_block_body_next, so the rebuild
-//                                per-op semantics are preserved.
+// Implementations (ppc_emit.cpp):
+//   All three _next entry points are currently PASSTHROUGHS to the live
+//   guests/powerpc/ gekko_emit.cpp symbols, gated by BEMENTALJIT_USE_REBUILD.
+//   The ODR collision blocking real impls is documented in ppc_emit.cpp's
+//   region-section header comment; resolving it (extract BlockInputs +
+//   LocalIdxLookupFn + WIMPORT_* + ppc_off::* into a shared third header)
+//   unblocks routing the region path through the powerpc-next dispatch /
+//   RegCache / HLE-prologue chain rather than the live forward.
 //
 // Known gap: merged-region intra-region branch resolution (global.set
 // entry_sel + br $L) is not yet implemented in powerpc-next's jit_branch
