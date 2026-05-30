@@ -755,6 +755,7 @@ if(EMSCRIPTEN)
   PUBLIC
     bementalJIT
     bementalJITPowerPC
+    bementalJITPowerPCNext
   )
 endif()
 
