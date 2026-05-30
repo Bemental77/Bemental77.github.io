@@ -250,8 +250,23 @@ bool retro_load_game(const struct retro_game_info* game)
                      Libretro::GetOption<bool>(audio::DSP_HLE, /*def=*/true));
 
   // dual core (true) or single core (false)
+  // Under __EMSCRIPTEN__ we force single core. PROXY_TO_PTHREAD + a
+  // PTHREAD_POOL_SIZE-bounded worker pool cannot reliably service the
+  // GetInitializedVideoGuard gpu_thread spawn + get_future().get() wait
+  // pair driven by the libretro dual-core path (PROVER 2.1, 2026-05-30:
+  // EmuThread enters Core.cpp:647 GetInitializedVideoGuard and never
+  // returns under dual-core, with no [p21] post-video printf firing in
+  // 60 s). Single-core matches the upstream non-Android default at
+  // MainSettings.cpp:63 (DEFAULT_CPU_THREAD = false) and avoids the
+  // worker-handoff hang entirely — EmuThread becomes a synchronous call
+  // from Main.cpp:227 and the CPU pipeline runs on the retro_run caller.
+#ifdef __EMSCRIPTEN__
+  Config::SetBase(Config::MAIN_CPU_THREAD,
+    Libretro::GetOption<bool>(core::MAIN_CPU_THREAD, /*def=*/false));
+#else
   Config::SetBase(Config::MAIN_CPU_THREAD,
     Libretro::GetOption<bool>(core::MAIN_CPU_THREAD, /*def=*/true));
+#endif
 
   Config::SetBase(Config::MAIN_ENABLE_CHEATS,
                      Libretro::GetOption<bool>(core::CHEATS_ENABLED, /*def=*/false));
