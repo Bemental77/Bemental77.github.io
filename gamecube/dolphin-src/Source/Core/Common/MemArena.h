@@ -148,6 +148,18 @@ private:
 
   vm_address_t m_region_address = 0;
   vm_size_t m_region_size = 0;
+#elif defined(__EMSCRIPTEN__)
+  // Wasm linear memory cannot reproduce native Dolphin's shm_open + mmap(MAP_FIXED|MAP_SHARED)
+  // aliasing model (emscripten upstream #5928 wontfix, #17801/#21706 open, WebAssembly threads
+  // proposal #103). We back the SHM segment with a plain malloc'd buffer and produce views by
+  // pointer arithmetic; the fastmem-arena half of the interface is a no-op (returns nullptr /
+  // false), and Memmap::InitFastmemArena short-circuits to false under __EMSCRIPTEN__ so the
+  // 4 GiB ppc_view_size constant (which truncates to 0 on wasm32) is never reached. JitWasm /
+  // CachedInterpreter / bementalJIT all index the freestanding view pointers directly with
+  // (em_address & GetRamMask()), so the host-VA aliasing the fastmem arena would have provided
+  // is not load-bearing for the wasm build.
+  void* m_shm_buf = nullptr;
+  std::size_t m_shm_size = 0;
 #else
   int m_shm_fd = 0;
   void* m_reserved_region = nullptr;

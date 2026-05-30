@@ -234,7 +234,16 @@ elseif(HAIKU)
   target_link_libraries(common PRIVATE be GL)
 endif()
 
-if(ANDROID)
+if(EMSCRIPTEN)
+  # Wasm linear-memory backed MemArena: no kernel mmap, no MAP_FIXED aliasing.
+  # Implementation is malloc + pointer arithmetic; the fastmem-arena half of the
+  # MemArena public interface returns nullptr/false and is short-circuited in
+  # Memmap::InitFastmemArena under __EMSCRIPTEN__.
+  target_sources(common PRIVATE
+    Logging/ConsoleListenerNix.cpp
+    MemArenaEmscripten.cpp
+  )
+elseif(ANDROID)
   target_sources(common PRIVATE
     Logging/ConsoleListenerDroid.cpp
     MemArenaAndroid.cpp

@@ -178,6 +178,18 @@ bool MemoryManager::IsAddressInFastmemArea(const u8* address) const
 
 bool MemoryManager::InitFastmemArena()
 {
+#ifdef __EMSCRIPTEN__
+  // No fastmem arena under wasm — see Source/Core/Common/MemArenaEmscripten.cpp for the
+  // architectural rationale. JitWasm / CachedInterpreter / bementalJIT consume the freestanding
+  // view pointers (m_ram, m_l1_cache, m_fake_vmem) directly via (em_address & GetRamMask())
+  // and software TranslateAddress, so the fastmem arena (with its MAP_FIXED-aliased views) is
+  // not load-bearing. Short-circuit here BEFORE the 4 GiB ppc_view_size constant on line ~212
+  // is evaluated — that constant truncates to 0 on wasm32 because size_t is 32-bit, and any
+  // arithmetic against it produces garbage. m_is_fastmem_arena_initialized stays false and the
+  // downstream checks at :298, :326, :571 (and elsewhere) skip every arena-dependent code path.
+  return false;
+#endif
+
   // Here we set up memory mappings for fastmem. The basic idea of fastmem is that we reserve 4 GiB
   // of virtual memory and lay out the addresses within that 4 GiB range just like the memory map of
   // the emulated system. This lets the JIT emulate PPC load/store instructions by translating a PPC
