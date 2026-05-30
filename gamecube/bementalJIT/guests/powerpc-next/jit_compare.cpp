@@ -1,14 +1,18 @@
 //
 // jit_compare.cpp — Phase 4.5 compare ops with native CR-field setting.
 //
-// Signed compares (cmp/cmpi): compute (ra - simm_or_rb) as i32, write to
-// a scratch local, then call emit_cr_from_signed_local — which sign-extends
-// to i64 and stores the Dolphin u64 CR encoding.
+// REWRITTEN 2026-05-30: the prior signed-compare path computed
+// (ra - rb_or_simm) as i32 then passed the difference to
+// emit_cr_from_signed_local. That subtraction OVERFLOWS for operands
+// straddling the s32 boundary (e.g. cmpi ra=0x80000000, simm=1 →
+// diff=0x7FFFFFFF reports GT when correct PPC semantics give LT). Now
+// uses emit_cr_from_signed_pair which compares operands directly.
 //
-// Unsigned compares (cmpl/cmpli): call emit_cr_from_unsigned_pair directly
-// — it builds the trichotomy {-1, 0, +1} from u32 lt/gt compares and
-// sign-extends. For cmpli, we need the immediate in a local; use
-// LOCAL_TMP_VAL (scratch slot 1).
+// Signed compares (cmp/cmpi): stash the second operand in a scratch
+// local if needed (cmpi's SIMM_16 → LOCAL_TMP_IMM), then call
+// emit_cr_from_signed_pair(ra_local, b_local).
+//
+// Unsigned compares (cmpl/cmpli): same shape but emit_cr_from_unsigned_pair.
 
 #include "jit_compare.h"
 
@@ -32,13 +36,13 @@ void emit_cmpi(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     const u32 simm = GekkoOperands::SIMM_16(inst);
 
     auto rc_ra = rc.Bind(ra, RCMode::Read);
-    // diff = ra - simm  (signed-compare i32)
-    wb.op_local_get(rc_ra.local_idx());
+    // Stash SIMM (sign-extended to i32 by GekkoOperands::SIMM_16) in a
+    // scratch local so the signed-pair helper can read it as a local.
     wb.op_i32_const((s32)simm);
-    wb.op_i32_sub();
-    wb.op_local_set(LOCAL_TMP_DIFF);
+    wb.op_local_set(LOCAL_TMP_IMM);
 
-    emit_cr_from_signed_local(wb, ctx_ptr, crfd, LOCAL_TMP_DIFF);
+    emit_cr_from_signed_pair(wb, ctx_ptr, crfd, rc_ra.local_idx(),
+                             LOCAL_TMP_IMM);
 }
 
 void emit_cmpli(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
@@ -67,13 +71,8 @@ void emit_cmp(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     auto rc_ra = rc.Bind(ra, RCMode::Read);
     auto rc_rb = rc.Bind(rb, RCMode::Read);
 
-    // diff = ra - rb (signed-compare)
-    wb.op_local_get(rc_ra.local_idx());
-    wb.op_local_get(rc_rb.local_idx());
-    wb.op_i32_sub();
-    wb.op_local_set(LOCAL_TMP_DIFF);
-
-    emit_cr_from_signed_local(wb, ctx_ptr, crfd, LOCAL_TMP_DIFF);
+    emit_cr_from_signed_pair(wb, ctx_ptr, crfd, rc_ra.local_idx(),
+                             rc_rb.local_idx());
 }
 
 void emit_cmpl(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,

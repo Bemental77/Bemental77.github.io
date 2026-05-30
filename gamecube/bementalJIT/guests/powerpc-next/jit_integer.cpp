@@ -327,31 +327,14 @@ void emit_orx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr
     // Common shape: `or rA, rS, rS` = `mr rA, rS`. WASM doesn't have a
     // dedicated MOV; the redundant i32_or with two equal operands is fine
     // (Liftoff folds it; TurboFan does even better).
-    // SAB EXT_INT context handler at 0x800e8138 uses `or. r26,r3,r3` (mr.)
-    // and branches on CR0.EQ at 0x800e8140 — without Rc handling the beq
-    // reads stale CR0, takes the degenerate r31=0 path, and the dispatch
-    // cascade ends at bcctr ctr=0 → pc=0 → ISI 0x400.
     //
-    // DIAGNOSTIC: hardcode `or r0, r25, r20` at PC=0x800e3a7c (the
-    // OSExceptionInit template-patch OR) to write the expected native
-    // value 0x38600000 | (r26 & 0xff). If boot advances with this, the
-    // bug is in our `or` emit/regcache; if it doesn't, bug is upstream.
-    if (op.address == 0x800e3a7cu) {
-        const u32 inst = op.inst;
-        const u32 ra = GekkoOperands::RA(inst);
-        const u32 rs = GekkoOperands::RS(inst);
-        const u32 rb = GekkoOperands::RB(inst);
-        if (ra == 0 && rs == 25 && rb == 20) {
-            auto rc_ra = rc.Bind(ra, RCMode::Write);
-            auto rc_rb = rc.Bind(rb, RCMode::Read);
-            // r0 = 0x38600000 | r20  (hardcoded template OR exc-num)
-            wb.op_i32_const(0x38600000);
-            wb.op_local_get(rc_rb.local_idx());
-            wb.op_i32_or();
-            wb.op_local_set(rc_ra.local_idx());
-            return;
-        }
-    }
+    // Removed 2026-05-30: a PC-hardcoded substitution at op.address ==
+    // 0x800e3a7c that wrote `r0 = 0x38600000 | r20` instead of the canonical
+    // `or` result. It was added to bisect the SetInterruptMask widening
+    // wedge (now resolved upstream via the andi./andis. emit landed in
+    // commit 4167634 + the cmp/CR0 sign-extension fix in commit c7dc522).
+    // Per CLAUDE.md gate #8 ("diagnostics are temporary and must not
+    // accumulate") the substitution is now scrubbed.
     emit_boolx(wb, rc, op, &WasmModuleBuilder::op_i32_or, ctx_ptr);
 }
 void emit_xorx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
@@ -838,10 +821,18 @@ void emit_subfmex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     // only have one (LOCAL_TMP_SCRATCH). Fold: ~ra + (-1) = ~ra - 1.
     //   Compute (~ra - 1) directly, then add CA, set CA from carry.
     // For Phase 4.5, simplest: fallback. The op is rare in modern code.
+    //
+    // CRITICAL: must rc.Flush(ctx_ptr) BEFORE the WIMPORT_INTERP call.
+    // The interpreter writes the destination GPR directly to
+    // PowerPCState.gpr[rt], but the RegCache still holds a stale rt-local
+    // from prior emit context. Without the flush, the next regcache flush
+    // would clobber what the interpreter just wrote with the stale local
+    // value. Matches the pattern used by other interp-fallback sites in
+    // this file (e.g. the invalid-TBR path in emit_mftb).
+    rc.Flush(ctx_ptr);
     wb.op_i32_const((s32)op.inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(/*WIMPORT_INTERP=*/6);
-    (void)wb; (void)rc; (void)ctx_ptr;
 }
 
 void emit_addzex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
