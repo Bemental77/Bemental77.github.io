@@ -1,12 +1,141 @@
-// Stubs for symbols Dolphin references but Emscripten/SFMLCompat don't provide.
+// Stubs for symbols Dolphin references but emcc's sysroot doesn't provide.
+// Prior fork carried sf::IpAddress::{Any,LocalHost} definitions here as ODR
+// partners to a Common/SFMLCompat.h shim; both removed in the sanitization
+// (df03d80). All SFML-touching sources are now CMake-gated, so the sf::
+// symbols have no remaining references in the link.
+#include <array>
 #include <cstdio>
 #include <cstring>
-#include "Common/SFMLCompat.h"
+#include <functional>
+#include <span>
+#include <string>
+#include "Common/CommonTypes.h"
 
-namespace sf {
-const IpAddress IpAddress::Any{};
-const IpAddress IpAddress::LocalHost{"127.0.0.1"};
+// ---------------------------------------------------------------------------
+// Link-time stubs for upstream symbols whose .cpp sources are CMake-gated off
+// under emcc (SFML / host networking unavailable). These are not behavior;
+// they are link satisfiers — every consumer's call returns the no-op default
+// it would have gotten in a non-netplay / non-triforce / non-DSU configuration.
+// Author them as upstream-PR-shaped patches if upstream ever supports emcc.
+// ---------------------------------------------------------------------------
+
+// Forward decls to avoid pulling the full headers (which transitively SFML).
+class PointerWrap;
+namespace DiscIO { class Volume; }
+namespace NetPlay { struct NetSettings; }
+
+namespace NetPlay {
+bool IsNetPlayRunning() { return false; }
 }
+
+namespace ConfigLoaders {
+struct ConfigLayerLoader;
+std::unique_ptr<ConfigLayerLoader> GenerateNetPlayConfigLoader(const NetPlay::NetSettings&) {
+  return nullptr;
+}
+}  // namespace ConfigLoaders
+
+namespace AMMediaboard {
+void Init() {}
+void Shutdown() {}
+void DoState(PointerWrap&) {}
+unsigned int GetGameType() { return 0; }
+bool GetTestMenu() { return false; }
+void InitDIMM(const DiscIO::Volume&) {}
+void InitKeys(unsigned int, unsigned int, unsigned int) {}
+void FirmwareMap(bool) {}
+unsigned int ExecuteCommand(std::array<unsigned int, 3>&, unsigned int*, unsigned int, unsigned int) {
+  return 0;
+}
+}  // namespace AMMediaboard
+
+struct GCPadStatus;
+
+namespace NetPlay {
+void SetSIPollBatching(bool) {}
+}  // namespace NetPlay
+
+namespace SerialInterface {
+class CSIDevice_GCController {
+public:
+  static bool NetPlay_GetInput(int, GCPadStatus*);
+  static int NetPlay_InGamePadToLocalPad(int);
+};
+bool CSIDevice_GCController::NetPlay_GetInput(int, GCPadStatus*) { return false; }
+int CSIDevice_GCController::NetPlay_InGamePadToLocalPad(int pad) { return pad; }
+
+class CSIDevice_AMBaseboard {
+public:
+  static int NetPlay_InGamePadToLocalPad(int);
+};
+int CSIDevice_AMBaseboard::NetPlay_InGamePadToLocalPad(int pad) { return pad; }
+}  // namespace SerialInterface
+
+namespace ExpansionInterface {
+class CEXIIPL { public: static u64 NetPlay_GetEmulatedTime(); };
+u64 CEXIIPL::NetPlay_GetEmulatedTime() { return 0; }
+// TAPServerConnection ctor referenced by Modem/TAPServerModem.cpp (gated off,
+// but the constructor symbol is referenced from its TU's tables).
+class TAPServerConnection {
+public:
+  TAPServerConnection(const std::string&, std::function<void(std::string&&)>, unsigned long);
+};
+TAPServerConnection::TAPServerConnection(const std::string&, std::function<void(std::string&&)>,
+                                         unsigned long) {}
+
+// TAPServerNetworkInterface ctor referenced by EXI_DeviceModem.cpp (Modem
+// build is gated off, but the device-list table references the constructor).
+class CEXIModem;
+class CEXIModem_TAPServerNetworkInterface_Stub {
+public:
+  CEXIModem_TAPServerNetworkInterface_Stub(CEXIModem*, const std::string&) {}
+};
+}  // namespace ExpansionInterface
+
+// Direct-name mangling stub for ExpansionInterface::CEXIModem::TAPServerNetworkInterface::ctor.
+// Linker wants the exact mangled name; defining the nested class inline here.
+namespace ExpansionInterface {
+class CEXIModem {
+public:
+  class TAPServerNetworkInterface {
+  public:
+    TAPServerNetworkInterface(CEXIModem*, const std::string&);
+  };
+};
+CEXIModem::TAPServerNetworkInterface::TAPServerNetworkInterface(CEXIModem*, const std::string&) {}
+}  // namespace ExpansionInterface
+
+namespace NetPlay { class NetPlayClient; }
+class NetPlayChatUI {
+public:
+  explicit NetPlayChatUI(std::function<void(const std::string&)>);
+  ~NetPlayChatUI();
+  void Display();
+};
+NetPlayChatUI::NetPlayChatUI(std::function<void(const std::string&)>) {}
+NetPlayChatUI::~NetPlayChatUI() {}
+void NetPlayChatUI::Display() {}
+std::unique_ptr<NetPlayChatUI> g_netplay_chat_ui;
+
+class NetPlayGolfUI {
+public:
+  explicit NetPlayGolfUI(std::shared_ptr<NetPlay::NetPlayClient>);
+  ~NetPlayGolfUI();
+  void Display();
+};
+NetPlayGolfUI::NetPlayGolfUI(std::shared_ptr<NetPlay::NetPlayClient>) {}
+NetPlayGolfUI::~NetPlayGolfUI() {}
+void NetPlayGolfUI::Display() {}
+std::unique_ptr<NetPlayGolfUI> g_netplay_golf_ui;
+
+// Bridge-side Phase-IV publishers that EmscriptenWorker.cpp calls. Prior fork
+// defined these in JitWasm.cpp; sanitized away. No-op until canonical
+// CoreTiming-publish wiring lands as its own commit.
+extern "C" {
+unsigned dolphin_ct_drain_pending_mask() { return 0; }
+unsigned dolphin_ct_get_phase_flags() { return 0; }
+void dolphin_set_ppc_state_external_storage(unsigned) {}
+}  // extern "C"
 
 extern "C" {
 

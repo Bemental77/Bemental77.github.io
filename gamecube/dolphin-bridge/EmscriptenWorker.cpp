@@ -23,7 +23,10 @@
 // one Advance + outer-while iter overhead per service tick. Minimal-risk
 // shape: no rewiring of libretro pipeline, only a service detour.
 #include "Core/System.h"
-#include "Core/HW/MMIOMirror.h"
+// MMIOMirror.h was part of the prior dolphin-src fork's diagnostic stack and
+// is deliberately not present in the sanitized tree (df03d80 + canonical
+// CMake gates). Removed unused include; if any MMIOMirror.h symbol turns out
+// to still be referenced below, re-evaluate as canonical-source work.
 #include "Core/HW/SystemTimers.h"
 #include "Core/CoreTiming.h"
 
@@ -206,8 +209,9 @@ void dolphin_service_iter(void) {
     // 1. Pull ppc-worker DIRECT_W mirror writes back into dolphin's
     //    struct, then drain the pending-writes ring (replays
     //    ComplexWrite handlers, which may schedule CoreTiming events).
-    bemental_sab::mmio_mirror_sync_from_sab();
-    (void)bemental_sab::mmio_mirror_drain_pending_writes();
+    // bemental_sab::mmio_mirror_* lived in the prior fork's Core/HW/MMIOMirror.h
+    // (sanitized away in df03d80). No replacement on the canonical tree yet;
+    // re-introducing the mirror is canonical work, not a .bak port. No-op here.
     // 2. Fire hybrid events whose cadence ppc-worker already advanced.
     //    Dolphin's local m_event_queue still holds these entries — the
     //    pending mask is a latency short-cut, not a replacement, so the
@@ -222,14 +226,16 @@ void dolphin_service_iter(void) {
                 if (et) core_timing.ScheduleEvent(0, et);
             };
             // Pending-mask bit layout matches bemental_ct::CT_PEND_* in JitWasm.cpp.
-            if (mask & (1u << 0)) sched_now(timers.GetVIEvent());
-            if (mask & (1u << 1)) sched_now(timers.GetDSPEvent());
-            if (mask & (1u << 2)) sched_now(timers.GetAudioDMAEvent());
-            if (mask & (1u << 4)) sched_now(timers.GetGPUSleeperEvent());
-            if (mask & (1u << 5)) sched_now(timers.GetPatchEngineEvent());
-            // CT_PEND_AI (1<<3): AudioInterface holds its own event type
-            // pointer; cross-module access deferred (idempotent w.r.t.
-            // dolphin's own AI event).
+            // Note: the GetVIEvent / GetDSPEvent / GetAudioDMAEvent /
+            // GetGPUSleeperEvent / GetPatchEngineEvent accessors on
+            // SystemTimersManager were custom additions in the prior fork's
+            // dolphin-src patches; they are not present in the sanitized
+            // upstream tree (df03d80). Re-introducing them is canonical work
+            // (subclass + override in dolphin-bridge, or a tracked upstream
+            // PR) — out of scope for the initial JIT-swap link milestone.
+            // For now the cross-module CT publish/drain is a no-op and the
+            // events fire from dolphin's own SystemTimers cadence.
+            (void)mask; (void)timers; (void)sched_now;
         }
     }
     // 3. NO retro_run() — under Phase IV ppc-worker owns dispatch entirely.

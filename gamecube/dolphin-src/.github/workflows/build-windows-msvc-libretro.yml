@@ -1,0 +1,29 @@
+name: Build Dolphin (libretro) on Windows (MSVC)
+
+on: [push, pull_request]
+
+env:
+  core_id: dolphin_libretro
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - name: Install dependencies
+      run: |
+        choco install cmake ninja git
+    - name: Checkout Dolphin (libretro) repo
+      uses: actions/checkout@v6
+      with:
+        path: ${{ env.core_id }}
+        submodules: recursive
+
+    - name: Configure (MSVC)
+      run: |
+        cd ${{ env.core_id }}
+        mkdir build && cd build
+        cmake .. -DLIBRETRO=ON -DCMAKE_BUILD_TYPE=Release -G "Visual Studio 17 2022" -A x64
+
+    - name: Build
+      run: |
+        cmake --build ${{ env.core_id }}/build --config Release --parallel

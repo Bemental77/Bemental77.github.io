@@ -22,8 +22,21 @@ sample.sqlite
 # Reference upstream PCSX-wasm checkout (not used by deployed site)
 ps1/ps1Wasm/wasmpsx-repo
 
-# GameCube — dolphin source tree (2.1GB) is internal build input, not deployed.
-gamecube/dolphin-src/
+# GameCube — dolphin source tree. Source/, CMake/, Tools/, Installer/ are tracked
+# (~30 MB of canonical libretro/dolphin@0cd3bb8 + our minimum-JIT-swap edits).
+# Externals/ submodules + Data/Languages/ assets + build dirs are NOT tracked —
+# regenerate via `git submodule update --init --recursive` inside gamecube/dolphin-src
+# (after re-cloning the inner git history if needed for Externals).
+gamecube/dolphin-src/Externals/
+gamecube/dolphin-src/Data/
+gamecube/dolphin-src/Languages/
+gamecube/dolphin-src/docs/
+gamecube/dolphin-src/build-wasm/
+gamecube/dolphin-src/build-native-dbg/
+gamecube/dolphin-src/build/
+gamecube/dolphin-src/cmake-build-debug/
+gamecube/dolphin-src/cmake-build-release/
+gamecube/dolphin-src/Source/Core/Common/scmrev.h
 
 # bementalCompiler local build artifacts (the JIT lib is statically linked
 # into Dolphin via dolphin-src; only sources are deployed)
