@@ -26,7 +26,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 23> os_patches{{
+constexpr std::array<Hook, 25> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -58,7 +58,17 @@ constexpr std::array<Hook, 23> os_patches{{
 
     {"GeckoCodehandler",             HLE_Misc::GeckoCodeHandlerICacheFlush, HookType::Start,   HookFlag::Fixed},
     {"GeckoHandlerReturnTrampoline", HLE_Misc::GeckoReturnTrampoline,       HookType::Replace, HookFlag::Fixed},
-    {"AppLoaderReport",              HLE_OS::HLE_GeneralDebugPrint,         HookType::Start,   HookFlag::Fixed} // apploader needs OSReport-like function
+    {"AppLoaderReport",              HLE_OS::HLE_GeneralDebugPrint,         HookType::Start,   HookFlag::Fixed}, // apploader needs OSReport-like function
+    // SAB / SDK helpers that native dolphin.log shows being installed
+    // for SAB but missing from libretro/dolphin@0cd3bb8's os_patches:
+    //   Patching PPCMfhid2 800e34a4
+    //   Patching PPCMfhid2 800e34ac
+    //   Patching PPCMfhid2 800e34e0
+    //   Patching strncpy 8010dfb4
+    // Replace-mode + Fixed so they install at known addresses (no symbol
+    // DB match required) and survive HLE::Reload's PatchFunctions sweep.
+    {"PPCMfhid2",                    HLE_Misc::HLE_PPCMfhid2,               HookType::Replace, HookFlag::Fixed},
+    {"strncpy",                      HLE_Misc::HLE_Strncpy,                 HookType::Replace, HookFlag::Fixed}
 }};
 // clang-format on
 

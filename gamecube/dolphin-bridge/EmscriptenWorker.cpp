@@ -280,18 +280,25 @@ void run_iter_batch(int n) {
     static volatile unsigned* const c_p4br    = (volatile unsigned*)0x025010CCu;
     static volatile unsigned* const c_svci    = (volatile unsigned*)0x025010D0u;
     static volatile unsigned* const c_retror  = (volatile unsigned*)0x025010D4u;
-    // SAB-specific HLE patches mirroring native dolphin.log:
+    // ENTIRE SAB HLE patch set per native dolphin.log:
+    //   [HLE]: Patching PPCMfhid2 0x800e34a4
+    //   [HLE]: Patching PPCMfhid2 0x800e34ac
+    //   [HLE]: Patching PPCMfhid2 0x800e34e0
+    //   [HLE]: Patching strncpy   0x8010dfb4
     //   [HLE]: Patching OSReport  0x800e5bf0
     //   [HLE]: Patching ___blank  0x800ecfa4
     //   [HLE]: Patching ___blank  0x800fe3c0
-    // Native installs these via PPCSymbolDB name lookup (LoadMapOnBoot
-    // + HLE::Reload→PatchFunctions). Our tools/gsne8p.map carries the
-    // CodeWarrior names "DBPrintf"/"OSReport" but not Dolphin's
-    // "___blank" alias for compiler-stripped debug stubs, so the name-
-    // based lookup misses two of the three. Install at the empirically-
-    // verified addresses instead. Both "OSReport" and "___blank" are
-    // already in upstream HLE.cpp's os_patches table (line 42 and 56)
-    // bound to HLE_OS::HLE_GeneralDebugPrint — same handler native uses.
+    // OSReport and ___blank are already in upstream HLE.cpp's os_patches
+    // (lines 42, 56) bound to HLE_OS::HLE_GeneralDebugPrint. PPCMfhid2
+    // and strncpy are NOT in libretro/dolphin@0cd3bb8's table — we added
+    // them in HLE.cpp + HLE_Misc.cpp (authored canonically, replacement
+    // semantics matching upstream Dolphin master).
+    //
+    // Native installs via PPCSymbolDB name lookup (LoadMapOnBoot +
+    // HLE::Reload→PatchFunctions). Our tools/gsne8p.map carries the
+    // CodeWarrior names (DBPrintf instead of ___blank, PPCMfhid0/
+    // PPCMfl2cr at the first two PPCMfhid2 addresses), so the name-
+    // based lookup misses. Install at the empirically-verified addresses.
     //
     // Timing: install AFTER the first retro_run completes. By then
     // libretro Main.cpp's EmuThread→BootUp→OnTitleDirectlyBooted→
@@ -315,19 +322,24 @@ void run_iter_batch(int n) {
         if (!s_sab_patches_installed) {
             s_sab_patches_installed = true;
             auto& system = Core::System::GetInstance();
+            // Full 7-patch set per native dolphin.log.preserved:
+            HLE::Patch(system, 0x800e34a4u, "PPCMfhid2");
+            HLE::Patch(system, 0x800e34acu, "PPCMfhid2");
+            HLE::Patch(system, 0x800e34e0u, "PPCMfhid2");
+            HLE::Patch(system, 0x8010dfb4u, "strncpy");
             HLE::Patch(system, 0x800e5bf0u, "OSReport");
             HLE::Patch(system, 0x800ecfa4u, "___blank");
             HLE::Patch(system, 0x800fe3c0u, "___blank");
-            // Evict any pre-existing m_wasm_cache entries at those PCs so
-            // the next dispatch recompiles with the HLE hook check live.
-            // HLE::Patch's iCache.Invalidate only reaches the inherited
-            // JitBaseBlockCache, not bementalJIT's m_wasm_cache.
-            // dolphin_evict_block forward-declared at top of file.
+            // Evict any pre-existing m_wasm_cache entries at all 7 PCs.
+            dolphin_evict_block(0x800e34a4u);
+            dolphin_evict_block(0x800e34acu);
+            dolphin_evict_block(0x800e34e0u);
+            dolphin_evict_block(0x8010dfb4u);
             dolphin_evict_block(0x800e5bf0u);
             dolphin_evict_block(0x800ecfa4u);
             dolphin_evict_block(0x800fe3c0u);
             MAIN_THREAD_EM_ASM({
-                postMessage({cmd: 'print', txt: '[worker] installed SAB HLE patches (OSReport@800e5bf0, ___blank@800ecfa4, ___blank@800fe3c0) + evicted m_wasm_cache entries'});
+                postMessage({cmd: 'print', txt: '[worker] installed all 7 SAB HLE patches per native dolphin.log + evicted m_wasm_cache'});
             });
         }
         if (!g_loaded) break;

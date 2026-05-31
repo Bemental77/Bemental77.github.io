@@ -14,4 +14,14 @@ void UnimplementedFunction(const Core::CPUThreadGuard& guard);
 void HBReload(const Core::CPUThreadGuard& guard);
 void GeckoCodeHandlerICacheFlush(const Core::CPUThreadGuard& guard);
 void GeckoReturnTrampoline(const Core::CPUThreadGuard& guard);
+
+// SDK-helper HLE replacements native Dolphin installs for SAB:
+//   - PPCMfhid2 inlined 2-instr helper (mfspr r3, HID2; blr). The
+//     compiler inlines it at multiple PCs; SAB's symbol DB matches the
+//     name at 0x800e34a4 / 0x800e34ac / 0x800e34e0 even though the
+//     CodeWarrior names there are PPCMfhid0 / PPCMfl2cr / PPCMfhid2
+//     (all 3 share the same instruction pattern → same handler).
+//   - strncpy: dst, src, n → host strncpy; replaces the SDK's loop.
+void HLE_PPCMfhid2(const Core::CPUThreadGuard& guard);
+void HLE_Strncpy(const Core::CPUThreadGuard& guard);
 }  // namespace HLE_Misc
