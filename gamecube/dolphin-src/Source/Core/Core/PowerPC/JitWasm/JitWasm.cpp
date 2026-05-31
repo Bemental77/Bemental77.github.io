@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "Common/CommonTypes.h"
+#include "Core/CoreTiming.h"
 #include "Core/HW/CPU.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/PowerPC.h"
@@ -83,6 +84,7 @@ void JitWasm::Run()
 {
   auto& mem = m_system.GetMemory();
   auto& ppc_state = m_ppc_state;
+  auto& core_timing = m_system.GetCoreTiming();
   const CPU::State* state_ptr = m_system.GetCPU().GetStatePtr();
 
   // bementalJIT compile inputs. ctx_ptr / mem1_base are wasm linear-memory
@@ -93,67 +95,80 @@ void JitWasm::Run()
   const u32 mem1_mask = mem.GetRamMask();
   const u32 ram_size  = mem.GetRamSize();
 
-  // Outer slice loop. Yields back to PowerPCManager when downcount expires
-  // or CPU state leaves Running — at which point CoreTiming::Advance runs
-  // and we're re-entered.
-  while (ppc_state.downcount > 0 && *state_ptr == CPU::State::Running)
+  // Mirror canonical CachedInterpreter::Run: outer loop on CPU::State,
+  // CoreTiming::Advance starts each slice (refills downcount + advances
+  // scheduled events), inner loop dispatches blocks until downcount expires.
+  // The single-loop variant was wrong — under libretro single-core,
+  // RunSingleFrame calls power_pc.RunLoop() once per retro_run, and nothing
+  // outside our loop advances CoreTiming. With downcount == 0 on entry the
+  // body was skipped and retro_run returned ~147k times/sec with zero PPC
+  // dispatches (probe_fix.js, 2026-05-30).
+  while (*state_ptr == CPU::State::Running)
   {
-    // Pending exceptions: let upstream CheckExceptions transition PC to the
-    // handler vector; the next iteration dispatches the handler block.
-    if (ppc_state.Exceptions != 0)
-    {
-      m_system.GetPowerPC().CheckExceptions();
-      if (*state_ptr != CPU::State::Running)
-        return;
-      // Fall through; pc may now be at a vector (0x400/0x500/etc).
-    }
+    // Start new timing slice. Refills downcount; scheduled events fire
+    // here (VI, AI, DSP, etc.). NOTE: Advance may set Exceptions / change PC.
+    core_timing.Advance();
 
-    const u32 pc = ppc_state.pc;
-    s32 next_pc = 0;
-
-    if (m_wasm_cache.dispatch(pc, &next_pc))
+    do
     {
-      // Hit. INT32_MIN sentinel = the dispatched block trapped at runtime
-      // (block_cache.cpp's dispatch_raw try/catch returns it on any wasm
-      // exception). Evict so the next iteration re-compiles, then bail to
-      // the interpreter for one slice — the interpreter is responsible for
-      // surfacing whatever underlying fault caused the trap.
-      if (next_pc == std::numeric_limits<s32>::min())
+      // Pending exceptions: let upstream CheckExceptions transition PC to
+      // the handler vector; the next iteration dispatches the handler.
+      if (ppc_state.Exceptions != 0)
       {
-        m_wasm_cache.evict(pc);
-        m_block_inst_counts.erase(pc);
-        CachedInterpreter::Run();
-        return;
+        m_system.GetPowerPC().CheckExceptions();
+        if (*state_ptr != CPU::State::Running)
+          return;
+        // Fall through; pc may now be at a vector (0x400/0x500/etc).
       }
 
-      // Decrement downcount by the block's compile-time instruction count
-      // (1 cycle/instr — matches Interpreter::SingleStep accounting). If
-      // somehow the count is missing (race / explicit cache clear elsewhere),
-      // use 1 as a conservative floor so we always make progress.
-      auto it = m_block_inst_counts.find(pc);
-      const u32 cycles = (it != m_block_inst_counts.end()) ? it->second : 1u;
-      ppc_state.downcount -= static_cast<int>(cycles);
+      const u32 pc = ppc_state.pc;
+      s32 next_pc = 0;
 
-      ppc_state.pc  = static_cast<u32>(next_pc);
-      ppc_state.npc = ppc_state.pc;
-      continue;
-    }
+      if (m_wasm_cache.dispatch(pc, &next_pc))
+      {
+        // Hit. INT32_MIN sentinel = the dispatched block trapped at
+        // runtime (block_cache.cpp dispatch_raw try/catch returns it on
+        // any wasm exception). Evict so the next iteration re-compiles,
+        // then bail to the interpreter for the rest of this slice — the
+        // interpreter is responsible for surfacing whatever underlying
+        // fault caused the trap.
+        if (next_pc == std::numeric_limits<s32>::min())
+        {
+          m_wasm_cache.evict(pc);
+          m_block_inst_counts.erase(pc);
+          CachedInterpreter::Run();
+          return;
+        }
 
-    // Cache miss. Try to compile a block at this PC.
-    if (TryCompileBlock(pc, ctx_ptr, mem1_base, mem1_mask, ram_size))
-    {
-      // Compile produced a cached entry. Loop and retry dispatch.
-      continue;
-    }
+        // Decrement downcount by the block's compile-time instruction
+        // count (1 cycle/instr — matches Interpreter::SingleStep
+        // accounting). If somehow the count is missing (race / explicit
+        // cache clear elsewhere), use 1 as a conservative floor.
+        auto it = m_block_inst_counts.find(pc);
+        const u32 cycles = (it != m_block_inst_counts.end()) ? it->second : 1u;
+        ppc_state.downcount -= static_cast<int>(cycles);
 
-    // Compile failed (decode hit unsupported stream, build_block_next
-    // returned empty, or m_wasm_cache.compile rejected the bytes). Fall
-    // back to upstream CachedInterpreter::Run for the rest of this slice.
-    // CachedInterpreter has its own downcount loop and yields to CoreTiming
-    // when budget exhausts; we don't re-enter our loop until the next
-    // outer scheduler tick.
-    CachedInterpreter::Run();
-    return;
+        ppc_state.pc  = static_cast<u32>(next_pc);
+        ppc_state.npc = ppc_state.pc;
+        continue;
+      }
+
+      // Cache miss. Try to compile a block at this PC.
+      if (TryCompileBlock(pc, ctx_ptr, mem1_base, mem1_mask, ram_size))
+      {
+        // Compile produced a cached entry. Loop and retry dispatch.
+        continue;
+      }
+
+      // Compile failed (decode hit unsupported stream, build_block_next
+      // returned empty, or m_wasm_cache.compile rejected the bytes). Fall
+      // back to upstream CachedInterpreter::Run for the rest of this slice.
+      // CachedInterpreter has its own outer Advance loop and yields to
+      // CoreTiming when budget exhausts; returning out of our Run lets
+      // RunSingleFrame complete the frame.
+      CachedInterpreter::Run();
+      return;
+    } while (ppc_state.downcount > 0 && *state_ptr == CPU::State::Running);
   }
 }
 

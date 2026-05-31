@@ -136,13 +136,26 @@ int compile_raw(const u8* bytes, std::size_t size) {
                     Module._dolphin_write16(0, 0);
                     Module._dolphin_write32(0, 0);
                     Module._dolphin_check_exc(0);
-                    Module._dolphin_break_block(0);
+                    Module._dolphin_break_block(0, 0);
                     Module._dolphin_hle_check(0);
                     // Skip dolphin_interp(0,0) — it calls SingleStepInner
                     // which is not safe to invoke at random.
                     // Skip dolphin_hle_fire(0, 0) — it would actually
                     // execute an HLE handler at hook_index=0 which is the
                     // sentinel "unimplemented" PanicAlert.
+
+                    // Lazy-init the imports container on the pthread side.
+                    // The dolphin-bridge worker never publishes
+                    // Module.bemental_imports up-front, so without this
+                    // init the binding block below silently skips and
+                    // every Instance() throws "ppc_read8 requires a
+                    // callable" (2026-05-30 probe_fix.js with
+                    // dolphin_jit_wimports.cpp present: upgrade fired,
+                    // bindings never written, 100% compile-fail).
+                    if (!Module.bemental_imports)
+                        Module.bemental_imports = { env: {} };
+                    if (!Module.bemental_imports.env)
+                        Module.bemental_imports.env = {};
                     if (Module.bemental_imports && Module.bemental_imports.env) {
                         const e = Module.bemental_imports.env;
                         e.ppc_read8       = Module._dolphin_read8;
@@ -168,7 +181,15 @@ int compile_raw(const u8* bytes, std::size_t size) {
                         // WIMPORT and nothing fires" failure.
                         if (Module._dolphin_stack_corrupt)
                             e.ppc_stack_corrupt = Module._dolphin_stack_corrupt;
-                        // Keep ppc_interp as the JS wrapper (don't bypass).
+                        // Direct-bind ppc_interp now that dolphin_interp is
+                        // exported by dolphin-bridge/dolphin_jit_wimports.cpp
+                        // (2026-05-30). The previous "JS wrapper" comment
+                        // referred to an older bridge where interp went
+                        // through a thunk; the native C function takes
+                        // (u32 unused, u32 pc) → void which matches the
+                        // emitter's type-2 import signature.
+                        if (Module._dolphin_interp)
+                            e.ppc_interp = Module._dolphin_interp;
                     }
                     const isWasm = (typeof WebAssembly.Function !== 'undefined')
                         ? Module._dolphin_read32 instanceof WebAssembly.Function
