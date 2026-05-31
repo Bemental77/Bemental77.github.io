@@ -132,6 +132,22 @@ void RegCache::Flush(u32 ctx_ptr, BitSet32 mask) {
     }
 }
 
+// Reload every assigned GPR cache local from PowerPCState. Used after host
+// mutations of gpr[] (interp fallbacks, HLE handlers). Cost = 3 wasm ops
+// per assigned local; cap is 32 regs. Clears dirty + is_imm to keep the
+// cache state consistent with what we just wrote into the locals.
+void RegCache::ReloadAll(u32 ctx_ptr) {
+    for (u32 i = 0; i < 32; ++i) {
+        if (!m_state[i].assigned) continue;
+        m_wb.op_i32_const((s32)ctx_ptr);
+        m_wb.op_i32_load(ppc_gpr_off(i));
+        m_wb.op_local_set(m_state[i].local_idx);
+        m_state[i].dirty  = false;
+        m_state[i].is_imm = false;
+        m_state[i].loaded = true;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EmitIf / EmitElse / EmitEndIf — wrap WASM control-flow ops with flush-
 // before, invalidate-on-arm-merge. Replaces every raw op_if / op_else /

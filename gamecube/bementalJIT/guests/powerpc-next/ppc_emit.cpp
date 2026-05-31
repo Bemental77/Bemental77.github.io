@@ -45,13 +45,21 @@ namespace bemental::powerpc {
 static constexpr u32 WIMPORT_INTERP = 6;
 
 // Emit a fallback call to WIMPORT_INTERP for an op without a native
-// emitter. Caller flushes regcache state first.
+// emitter. Flushes regcache (dirty wasm locals → PowerPCState memory) so
+// the interp sees current GPR state, calls into single-step, then
+// RELOADS all assigned cache locals from memory so subsequent ops in the
+// same block see the post-interp GPR values. Without the reload, a later
+// op's Flush at block exit overwrites the interp's writes with stale
+// local values — observed 2026-05-31 as r28-r31 corruption in
+// __OSCacheInit's lmw-restore sequence, which zeroed r31 in
+// __init_hardware's saved-LR slot and made blr return to PC=0.
 static void emit_fallback(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                           u32 ctx_ptr) {
     rc.Flush(ctx_ptr);
     wb.op_i32_const((s32)op.inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
+    rc.ReloadAll(ctx_ptr);
 }
 
 bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,

@@ -242,13 +242,24 @@ static void emit_slowmem_store(WasmModuleBuilder& wb, StoreWidth width,
 static void emit_load_common(WasmModuleBuilder& wb, RegCache& rc,
                              LoadStoreParams params, u32 rt, u32 ra,
                              LoadWidth width, bool update) {
-    // Bind RT in Write mode — invalidates any prior immediate / read state.
+    // Push fastmem-guard onto stack, then flush dirty bindings, THEN bind
+    // rt for Write. Binding rt before the flush was a memory-corruption
+    // bug — Bind(Write) marks rt dirty, and the subsequent Flush then
+    // writes rt's stale wasm-local-default (0) to memory[gpr(rt)] before
+    // the load result is produced. The block's end-of-flow flush only
+    // covers locals that were re-marked dirty AFTER the load, so the
+    // zero-write was the final memory state. 2026-05-31 SAB boot:
+    // L2GlobalInvalidate's epilogue `lwz r31, 12(r1)` zeroed memory's
+    // gpr(31) slot mid-load, surfacing as __init_hardware's mtlr r31; blr
+    // returning to PC=0 (caller-saved r31 = 0 after function return).
+    emit_fastmem_guard(wb, params);
+    rc.Flush(params.ctx_ptr);  // stack-neutral — guard stays on top
+
+    // Bind RT now (post-flush). Marks rt dirty so its end-of-block flush
+    // writes the loaded value back to memory.
     auto rc_rt = rc.Bind(rt, RCMode::Write);
     const u32 rt_local = rc_rt.local_idx();
 
-    // Push fastmem-guard onto stack, then flush dirty bindings, then op_if.
-    emit_fastmem_guard(wb, params);
-    rc.Flush(params.ctx_ptr);  // stack-neutral — guard stays on top
     wb.op_if(BLOCK_TYPE_VOID);
 
     // ---- fast path ----

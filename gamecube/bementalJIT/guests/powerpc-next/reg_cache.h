@@ -76,6 +76,17 @@ public:
     //   - At control-flow join points (when arms have diverging state).
     void Flush(u32 ctx_ptr, BitSet32 mask = BitSet32(0xFFFFFFFFu));
 
+    // ReloadAll — emit `i32.load + local.set` for every previously-assigned
+    // GPR cache local, re-pulling its value from PowerPCState. Required
+    // after any host-side mutation of gpr[] (interp fallback, HLE handler
+    // that touches gpr[]) so subsequent emit_* calls in the same block see
+    // the post-mutation state instead of stale cached locals. Without this,
+    // the AFTER-fallback Flush at block exit would overwrite the host's
+    // writes with stale local values (2026-05-31: lmw fallback corrupted
+    // r28-r31 in OSCacheInit, see jitwasm_run_wired follow-on bug
+    // jit_emit_fallback_regcache_invalidate).
+    void ReloadAll(u32 ctx_ptr);
+
     // Control-flow wrappers — guarantee flush/invalidate ordering across
     // branch arms. Emitters MUST use these instead of raw
     // WasmModuleBuilder::op_if/op_else/op_end (structural fix for the
