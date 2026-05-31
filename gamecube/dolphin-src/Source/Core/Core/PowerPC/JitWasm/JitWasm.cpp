@@ -54,17 +54,37 @@ inline u32 PrimaryOp(u32 inst)
   return (inst >> 26) & 0x3Fu;
 }
 
-// True iff the primary opcode is a branch that terminates a basic block.
-//   18  = b   (op_b)
-//   16  = bc  (op_bcx — conditional)
-//   19  = bclr / bcctr / rfi / isync / sub-ops (op_branch_19)
-// rfi (op 19 xo=50) and sc (op 17) also end blocks. sc is rare enough to
-// catch via the conservative break. The bementalJIT analyzer applies the
-// same cut.
+// True iff the instruction terminates a basic block.
+//   18 = b     (unconditional branch, op_bx)
+//   16 = bc    (conditional branch, op_bcx)
+//   17 = sc    (syscall — raises EXCEPTION_SYSCALL, transfers control)
+//   19 = sub-coded. The extended opcode in bits 21-30 distinguishes:
+//        16  = bclr  (branch-to-LR)        → terminate
+//        50  = rfi   (return-from-interrupt) → terminate
+//        528 = bcctr (branch-to-CTR)       → terminate
+//        150 = isync (pipeline sync)       → NOT a branch, do NOT terminate
+//        129/193/225/257/289/417/449 = crand/crandc/cror/.../crxor
+//                                          → CR ops, do NOT terminate
+//        0   = mcrf  (move CR field)       → NOT a branch, do NOT terminate
+//
+// Pre-2026-05-30 this returned true for ALL primary == 19, which mis-cut
+// blocks at isync — most painfully ICEnable at 0x800e4f5c, whose 5-op
+// body starts with isync and whose mfspr/ori/mtspr/blr never got decoded,
+// so the emitted block returned op.address unchanged and JitWasm self-
+// looped on it indefinitely (wasm2wat capture 2026-05-30 confirmed the
+// block body was just prologue + set_pc + epilogue).
 inline bool IsBlockTerminator(u32 inst)
 {
   const u32 primary = PrimaryOp(inst);
-  return primary == 16u || primary == 17u || primary == 18u || primary == 19u;
+  if (primary == 16u || primary == 17u || primary == 18u)
+    return true;
+  if (primary != 19u)
+    return false;
+  // Op 19: only the control-flow extended opcodes terminate a block.
+  const u32 xo = (inst >> 1) & 0x3FFu;
+  return xo == 16u   // bclrx  (branch-to-LR)
+      || xo == 50u   // rfi    (return-from-interrupt)
+      || xo == 528u; // bcctrx (branch-to-CTR)
 }
 }  // namespace
 
