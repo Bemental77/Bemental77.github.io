@@ -10,6 +10,7 @@
 
 #include "Common/Config/Config.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/HLE/HLE.h"
 
 // Item 7 Phase IV: dolphin_service_iter routes here when CT_PHASE4_ENABLE
 // is set. Instead of running the full retro_run() → JitWasm::Run() chain
@@ -34,6 +35,11 @@
 extern "C" {
 unsigned dolphin_ct_get_phase_flags(void);
 unsigned dolphin_ct_drain_pending_mask(void);
+// Defined in dolphin_jit_wimports.cpp — evicts a single PC from
+// JitWasm::m_wasm_cache (the bementalJIT block cache). Used after
+// out-of-band HLE::Patch calls so the next dispatch recompiles the
+// block with the new HLE hook check live.
+void dolphin_evict_block(uint32_t pc);
 }
 
 extern "C" {
@@ -274,6 +280,25 @@ void run_iter_batch(int n) {
     static volatile unsigned* const c_p4br    = (volatile unsigned*)0x025010CCu;
     static volatile unsigned* const c_svci    = (volatile unsigned*)0x025010D0u;
     static volatile unsigned* const c_retror  = (volatile unsigned*)0x025010D4u;
+    // SAB-specific HLE patches mirroring native dolphin.log:
+    //   [HLE]: Patching OSReport  0x800e5bf0
+    //   [HLE]: Patching ___blank  0x800ecfa4
+    //   [HLE]: Patching ___blank  0x800fe3c0
+    // Native installs these via PPCSymbolDB name lookup (LoadMapOnBoot
+    // + HLE::Reload→PatchFunctions). Our tools/gsne8p.map carries the
+    // CodeWarrior names "DBPrintf"/"OSReport" but not Dolphin's
+    // "___blank" alias for compiler-stripped debug stubs, so the name-
+    // based lookup misses two of the three. Install at the empirically-
+    // verified addresses instead. Both "OSReport" and "___blank" are
+    // already in upstream HLE.cpp's os_patches table (line 42 and 56)
+    // bound to HLE_OS::HLE_GeneralDebugPrint — same handler native uses.
+    //
+    // Timing: install AFTER the first retro_run completes. By then
+    // libretro Main.cpp's EmuThread→BootUp→OnTitleDirectlyBooted→
+    // HLE::Reload has fired (and cleared all non-Fixed hooks). Once
+    // installed here, no further Reload fires during normal boot, so
+    // the patches persist.
+    static bool s_sab_patches_installed = false;
     for (int i = 0; i < n; i++) {
         (*c_total)++;
         const unsigned flags = dolphin_ct_get_phase_flags();
@@ -286,6 +311,24 @@ void run_iter_batch(int n) {
         } else {
             (*c_retror)++;
             retro_run();
+        }
+        if (!s_sab_patches_installed) {
+            s_sab_patches_installed = true;
+            auto& system = Core::System::GetInstance();
+            HLE::Patch(system, 0x800e5bf0u, "OSReport");
+            HLE::Patch(system, 0x800ecfa4u, "___blank");
+            HLE::Patch(system, 0x800fe3c0u, "___blank");
+            // Evict any pre-existing m_wasm_cache entries at those PCs so
+            // the next dispatch recompiles with the HLE hook check live.
+            // HLE::Patch's iCache.Invalidate only reaches the inherited
+            // JitBaseBlockCache, not bementalJIT's m_wasm_cache.
+            // dolphin_evict_block forward-declared at top of file.
+            dolphin_evict_block(0x800e5bf0u);
+            dolphin_evict_block(0x800ecfa4u);
+            dolphin_evict_block(0x800fe3c0u);
+            MAIN_THREAD_EM_ASM({
+                postMessage({cmd: 'print', txt: '[worker] installed SAB HLE patches (OSReport@800e5bf0, ___blank@800ecfa4, ___blank@800fe3c0) + evicted m_wasm_cache entries'});
+            });
         }
         if (!g_loaded) break;
     }

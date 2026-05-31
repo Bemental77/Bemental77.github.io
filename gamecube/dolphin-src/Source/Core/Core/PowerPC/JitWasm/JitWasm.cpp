@@ -30,10 +30,13 @@
 #include <cstdint>
 #include <vector>
 
+#include <emscripten.h>
+
 #include "Common/CommonTypes.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/CPU.h"
 #include "Core/HW/Memmap.h"
+#include "Core/PowerPC/JitInterface.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
@@ -98,6 +101,36 @@ void JitWasm::Shutdown()
   m_wasm_cache.clear();
   m_block_inst_counts.clear();
   CachedInterpreter::Shutdown();
+}
+
+void JitWasm::ClearCache()
+{
+  // Drop both caches together so a subsequent dispatch re-compiles with
+  // current state (HLE patches installed, regcache assumptions reset,
+  // etc.). Called from JitInterface::ClearCache via the inherited virtual.
+  m_wasm_cache.clear();
+  m_block_inst_counts.clear();
+  CachedInterpreter::ClearCache();
+}
+
+void JitWasm::EvictBlock(u32 pc)
+{
+  m_wasm_cache.evict(pc);
+  m_block_inst_counts.erase(pc);
+}
+
+// C-linkage helper for the bridge (dolphin-bridge can't include JitWasm.h
+// because that pulls bementalJIT/block_cache.h via the m_wasm_cache
+// member, and the bridge's link-step compile doesn't have the bementalJIT
+// include path). Defined here in JitWasm.cpp where the full type is in
+// scope. Callable from dolphin-bridge as `extern "C" void
+// dolphin_evict_block(uint32_t)`.
+extern "C" EMSCRIPTEN_KEEPALIVE void dolphin_evict_block(u32 pc)
+{
+  auto& system = Core::System::GetInstance();
+  auto* core = system.GetJitInterface().GetCore();
+  if (auto* jw = dynamic_cast<JitWasm*>(core))
+    jw->EvictBlock(pc);
 }
 
 void JitWasm::Run()

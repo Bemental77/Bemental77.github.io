@@ -113,6 +113,9 @@ void dolphin_interp(uint32_t /*unused*/, uint32_t pc) {
     system.GetInterpreter().SingleStep();
 }
 
+// dolphin_evict_block lives in JitWasm.cpp (which has the bementalJIT
+// include path for m_wasm_cache).
+
 }  // extern "C"
 
 #endif  // __EMSCRIPTEN__

@@ -43,7 +43,16 @@ public:
   void Init() override;
   void Shutdown() override;
   void Run() override;
+  void ClearCache() override;
   const char* GetName() const override { return "WASM JIT (bementalCompiler)"; }
+
+  // Bridge-callable single-PC evict. HLE::Patch's iCache.Invalidate path
+  // only touches the inherited JitBaseBlockCache, not our bemental::
+  // BlockCache — so a block at the patched PC compiled BEFORE the patch
+  // installed keeps dispatching without the HLE check. Call this after
+  // any out-of-band HLE::Patch from the bridge so the next dispatch at
+  // that PC re-compiles with the hook check live.
+  void EvictBlock(u32 pc);
 
 private:
   // Decode a basic block starting at start_pc (terminator is the first

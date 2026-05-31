@@ -155,6 +155,33 @@ async function bootIso(name, size) {
     postMessage({ cmd: 'print', txt: '[ipl] write threw: ' + e });
   }
 
+  // Stage the GSNE8P (SAB) symbol map into User/Maps so PPCSymbolDB's
+  // LoadMapOnBoot finds it and HLE::PatchFunctions can install the
+  // ___blank / OSReport hooks for DBPrintf, etc. Without this, native's
+  // DBPrintf-no-op patch isn't installed and the real body's
+  // OSThread-scheduler polls wedge boot at pc=0x800ecb48. Source file
+  // tools/gsne8p.map is lowercase on disk; Dolphin's FindMapFile uses
+  // m_debugger_game_id which is uppercase "GSNE8P".
+  try {
+    var mapResp = await fetch('/tools/gsne8p.map');
+    if (!mapResp.ok) {
+      postMessage({ cmd: 'print', txt: '[map] fetch failed: HTTP ' + mapResp.status });
+    } else {
+      var mapBuf = await mapResp.arrayBuffer();
+      var mapBytes = new Uint8Array(mapBuf);
+      var mapsDir = '/home/web_user/retroarch/userdata/system/dolphin-emu/User/Maps';
+      try {
+        Module.FS.mkdirTree(mapsDir);
+        Module.FS.writeFile(mapsDir + '/GSNE8P.map', mapBytes);
+        postMessage({ cmd: 'print', txt: '[map] wrote GSNE8P.map ' + mapBuf.byteLength + ' bytes to ' + mapsDir });
+      } catch (we) {
+        postMessage({ cmd: 'print', txt: '[map] writeFile failed: ' + we });
+      }
+    }
+  } catch (e) {
+    postMessage({ cmd: 'print', txt: '[map] write threw: ' + e });
+  }
+
   postMessage({ cmd: 'print', txt: '[worker] ISO written to /' + name + ' (' + size + ' bytes), calling load_iso' });
   var ret = Module._load_iso ? Module.ccall('load_iso', 'number', ['string'], ['/' + name]) : -99;
   if (ret !== 0) {
