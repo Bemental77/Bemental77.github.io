@@ -201,6 +201,20 @@ void JitWasm::Run()
         const u32 cycles = (it != m_block_inst_counts.end()) ? it->second : 1u;
         ppc_state.downcount -= static_cast<int>(cycles);
 
+        // Self-dispatch idle-skip — when emit_idle_skip marked the block's
+        // terminator as branchIsIdleLoop, the analyzer collapsed the bcx
+        // (e.g. SAB 0x800ecb48 mftbu/mftbl/mftbu/cmpw/bne-$-16 TBU-retry)
+        // to next_pc == op.address with no fallthrough check. Without the
+        // floor below, the inner loop burns ~600 dispatches before
+        // downcount goes negative and the outer loop's CoreTiming::Advance
+        // updates TBU — that's the wedge symptom (pc=0x800ecb48
+        // dispatched 46M times in 60s, 2026-05-31). Force downcount <= 0
+        // so the inner do-while exits THIS iteration; outer Advance runs,
+        // ticks TBU, next dispatch reads a fresh upper, cmpw can mismatch
+        // and the loop exits. Matches Jit64's idle-skip behavior.
+        if (static_cast<u32>(next_pc) == pc)
+          ppc_state.downcount = 0;
+
         ppc_state.pc  = static_cast<u32>(next_pc);
         ppc_state.npc = ppc_state.pc;
         continue;

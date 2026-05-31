@@ -414,11 +414,19 @@ std::vector<u8> build_block_next(u32 start_pc,
         b.op_i32_const((s32)op.address);
         b.op_i32_store(ppc_off::PC);
 
-        if (is_terminator && op.branchIsIdleLoop) {
-            emit_idle_skip(b, rc, op, ctx_ptr);
-        } else {
-            dispatch_op(b, rc, op, params);
-        }
+        // Always route through dispatch_op for the terminator. The
+        // emit_idle_skip override was wrong for benign polling loops
+        // (e.g. SAB 0x800ecb48 mftbu/mftbl/mftbu/cmpw/bne TBU-retry):
+        // it dropped the bne's CR0[EQ] check and unconditionally set
+        // PC=target, so the loop self-spun forever even when r3==r5
+        // (which is the case every iteration since both reads happen in
+        // the same JIT dispatch and TBU only advances between
+        // dispatches). emit_bcx handles the conditional correctly; if
+        // the cond falls through, next_pc=fallthrough and the block
+        // exits naturally. PowerPC ISA's standard 64-bit timebase read
+        // pattern depends on this behavior to terminate.
+        dispatch_op(b, rc, op, params);
+        (void)is_terminator;
     }
 
     // Epilogue: flush dirty GPR locals, then read PC back and return.
