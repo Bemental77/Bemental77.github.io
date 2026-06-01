@@ -160,6 +160,11 @@ static const GekkoOPInfo* table31(u32 sub10) {
     static constexpr GekkoOPInfo srawx  = {"srawx",  OpType::Integer, 1, FL_OUT_A | FL_IN_SB | FL_SET_CA | FL_RC_BIT};
     static constexpr GekkoOPInfo srawix = {"srawix", OpType::Integer, 1, FL_OUT_A | FL_IN_S | FL_SET_CA | FL_RC_BIT};
     static constexpr GekkoOPInfo cmp    = {"cmp",    OpType::Integer, 1, FL_IN_AB | FL_SET_CRn};
+    // negx (xo=104) — rT = -rA. Encoded with RB=0 unused. Missing from
+    // this table caused PPCAnalyzer::Analyze to early-end the block at
+    // any neg.; SAB 0x800eb534 (`neg. r5, r5`) self-looped because the
+    // following bne+ terminator never made it into the buffer.
+    static constexpr GekkoOPInfo negx   = {"negx",   OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_RC_BIT};
     static constexpr GekkoOPInfo cmpl   = {"cmpl",   OpType::Integer, 1, FL_IN_AB | FL_SET_CRn};
     static constexpr GekkoOPInfo cntlzwx= {"cntlzwx",OpType::Integer, 1, FL_OUT_A | FL_IN_S | FL_RC_BIT};
     static constexpr GekkoOPInfo extsbx = {"extsbx", OpType::Integer, 1, FL_OUT_A | FL_IN_S | FL_RC_BIT};
@@ -220,6 +225,8 @@ static const GekkoOPInfo* table31(u32 sub10) {
     case 235: case 747: return &mullwx;
     case 491: case 1003: return &divwx;
     case 459: case 971: return &divwux;
+    // negx (xo=104, with OE variant 360). emit_negx exists in ppc_emit.
+    case 104: case 360: return &negx;
     // Carry-out arith + wide multiply (port).
     case 10:  case 522: return &addcx;
     case 8:   case 520: return &subfcx;
