@@ -172,6 +172,21 @@ static const GekkoOPInfo* table31(u32 sub10) {
     // Carry-out arithmetic — write XER.CA but don't read it.
     static constexpr GekkoOPInfo addcx  = {"addcx",  OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_SET_CA | FL_RC_BIT};
     static constexpr GekkoOPInfo subfcx = {"subfcx", OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_SET_CA | FL_RC_BIT};
+    // Carry-IN+OUT, single-source arithmetic (RB unused):
+    //   addzex (xo=202/714) — rT = rA + CA
+    //   addmex (xo=234/746) — rT = rA + CA + (-1)
+    //   subfzex (xo=200/712) — rT = ~rA + CA
+    //   subfmex (xo=232/744) — rT = ~rA + CA + (-1)
+    // Emit handlers existed in ppc_emit.cpp:160-163; opinfo entries below
+    // were missing — caused PPCAnalyzer to early-end the block at any such
+    // op. SAB SITransferNext-class spin at 0x800ea454 (addze r0, r0) wedged
+    // because the block compiled to 1 instruction, then JIT epilogue read
+    // ppc_state.pc which never advanced past block start → self-loop.
+    // Same class of bug as the negx fix in commit f8c941d.
+    static constexpr GekkoOPInfo addzex  = {"addzex",  OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
+    static constexpr GekkoOPInfo addmex  = {"addmex",  OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
+    static constexpr GekkoOPInfo subfzex = {"subfzex", OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
+    static constexpr GekkoOPInfo subfmex = {"subfmex", OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
     // High-half multiply — same operand shape as mullwx; multi-cycle latency.
     static constexpr GekkoOPInfo mulhwx = {"mulhwx", OpType::Integer, 3, FL_OUT_D | FL_IN_AB | FL_RC_BIT};
     static constexpr GekkoOPInfo mulhwux= {"mulhwux",OpType::Integer, 3, FL_OUT_D | FL_IN_AB | FL_RC_BIT};
@@ -230,6 +245,11 @@ static const GekkoOPInfo* table31(u32 sub10) {
     // Carry-out arith + wide multiply (port).
     case 10:  case 522: return &addcx;
     case 8:   case 520: return &subfcx;
+    // Carry-in/out single-source (matching emit_addzex/addmex/subfzex/subfmex).
+    case 202: case 714: return &addzex;
+    case 234: case 746: return &addmex;
+    case 200: case 712: return &subfzex;
+    case 232: case 744: return &subfmex;
     case 75:  return &mulhwx;
     case 11:  return &mulhwux;
     case 28:  return &andx;
