@@ -1207,22 +1207,25 @@ void emit_mftb(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     const u32 spr_field = (inst >> 11) & 0x3FFu;
     const u32 tbr = ((spr_field >> 5) & 0x1Fu) | ((spr_field & 0x1Fu) << 5);
 
-    u32 spr_idx;
-    if      (tbr == 268u) spr_idx = 268u;  // SPR_TL
-    else if (tbr == 269u) spr_idx = 269u;  // SPR_TU
-    else {
-        // Invalid TBR — fall back to interp.
-        rc.Flush(ctx_ptr);
-        wb.op_i32_const((s32)inst);
-        wb.op_i32_const((s32)op.address);
-        wb.op_call(/*WIMPORT_INTERP=*/6);
-        return;
-    }
-
-    auto rc_rt = rc.Bind(rt, RCMode::Write);
-    wb.op_i32_const((s32)ctx_ptr);
-    wb.op_i32_load(ppc_off::spr(spr_idx));
-    wb.op_local_set(rc_rt.local_idx());
+    // CRITICAL: ppc_state.spr[TL/TU] is STALE until something refreshes it.
+    // Native Interpreter::mfspr for SPR_TL/SPR_TU calls
+    // PowerPC().WriteFullTimeBaseValue(SystemTimers::GetFakeTimeBase())
+    // BEFORE reading the SPR (see Interpreter_SystemRegisters.cpp:254-258).
+    // A direct ppc_state.spr[TL] load returns whatever was last snapshotted —
+    // when the loop calling mftb is itself a short-cycle idle-spin (SAB's
+    // __OSInitAudioSystem 0x800e4c5c..0x800ecb60 OSGetTick poll, 2026-05-31),
+    // TBL never advances inside the spin → infinite loop.
+    //
+    // Route through WIMPORT_INTERP: marginally slower per insn but
+    // semantically correct, and the only mftb call sites in steady-state
+    // are idle-spins anyway — the cost is bounded by how fast TBL actually
+    // ticks (Advance fires, spin exits).
+    (void)tbr;
+    (void)rt;
+    rc.Flush(ctx_ptr);
+    wb.op_i32_const((s32)inst);
+    wb.op_i32_const((s32)op.address);
+    wb.op_call(/*WIMPORT_INTERP=*/6);
 }
 
 // ---------------------------------------------------------------------------

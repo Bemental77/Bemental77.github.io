@@ -34,9 +34,12 @@
 
 #include "Common/CommonTypes.h"
 #include "Core/CoreTiming.h"
+#include "Core/DSPEmulator.h"
 #include "Core/HW/CPU.h"
+#include "Core/HW/DSP.h"
 #include "Core/HW/Memmap.h"
 #include "Core/PowerPC/JitInterface.h"
+#include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
@@ -212,8 +215,25 @@ void JitWasm::Run()
         // so the inner do-while exits THIS iteration; outer Advance runs,
         // ticks TBU, next dispatch reads a fresh upper, cmpw can mismatch
         // and the loop exits. Matches Jit64's idle-skip behavior.
-        if (static_cast<u32>(next_pc) == pc)
-          ppc_state.downcount = 0;
+        //
+        // Also extend to short-cycle loops (k=2..4): SAB 0x800e4c5c → bl
+        // OSGetTick(0x800ecb60: mftb r3; blr) → 0x800e4c60 (subf/cmpw/blt
+        // 0x800e4c5c) is a 3-PC cycle with no self-dispatch but is
+        // semantically an idle-spin on mftb. Same problem class — without
+        // forcing Advance, TBL never ticks. Track last 4 next_pc values;
+        // if `next_pc` matches any → we just closed a ≤4-PC cycle → idle.
+        {
+          static u32 last_next[4] = {0, 0, 0, 0};
+          static u32 last_idx = 0;
+          const u32 np = static_cast<u32>(next_pc);
+          if (np == pc || np == last_next[0] || np == last_next[1] ||
+              np == last_next[2] || np == last_next[3])
+          {
+            ppc_state.downcount = 0;
+          }
+          last_next[last_idx & 3] = np;
+          ++last_idx;
+        }
 
         ppc_state.pc  = static_cast<u32>(next_pc);
         ppc_state.npc = ppc_state.pc;
