@@ -304,6 +304,15 @@ static void emit_store_common(WasmModuleBuilder& wb, RegCache& rc,
 
     wb.op_end();
 
+    // TODO(audit 2026-06-01): update-form stores (opcd 37/39/41/43/45 — Rc/L
+    // low-bit set) should suppress the RA writeback if the slow path raised
+    // EXCEPTION_DSI. PowerPC architecture spec: update-form ops must NOT
+    // commit RA on a DSI/Alignment/data-page-fault. Currently the writeback
+    // is unconditional, which can desynchronize RA from the architectural
+    // state on a faulting store. Cleanly emitting the guard requires a
+    // ppc_off::Exceptions and EXCEPTION_DSI constant; neither is in
+    // ppc_offsets.h today (only PC/NPC/GPR/CR/MSR/FPSCR/XER/SPR are
+    // defined). Skipped per the audit instructions' PARTIAL fallback path.
     if (update && ra != 0) {
         auto rc_ra = rc.Bind(ra, RCMode::Write);
         wb.op_local_get(LOCAL_TMP_EA);
@@ -360,7 +369,10 @@ static void emit_const_mmio_store(WasmModuleBuilder& wb, RegCache& rc,
 
 // Emit a load from a compile-time-known MMIO address. Leaves the loaded
 // value (sign-extended for S16) on the stack.
-static void emit_const_mmio_load(WasmModuleBuilder& wb, RegCache& rc,
+// 2026-06-01: callers now inline the body to avoid the Flush-after-Bind
+// stale-zero ordering bug; this helper is preserved for future reuse and
+// marked maybe_unused.
+[[maybe_unused]] static void emit_const_mmio_load(WasmModuleBuilder& wb, RegCache& rc,
                                  LoadStoreParams params, u32 addr,
                                  LoadWidth width) {
     rc.Flush(params.ctx_ptr);
@@ -390,8 +402,27 @@ void emit_load_d(WasmModuleBuilder& wb, RegCache& rc,
     // guarded if/else (BAT/TLB races on MMU enable would otherwise
     // require yet another const-address gate).
     if (op.has_const_ea && is_mmio_const_addr(op.const_ea)) {
+        // CRITICAL: Flush dirty regcache BEFORE Bind(rt, Write). Binding rt
+        // first marks its wasm-local as the canonical source; the subsequent
+        // Flush inside emit_const_mmio_load would then write rt's stale local
+        // (default 0) to memory[gpr(rt)] BEFORE the import call produces the
+        // loaded value. This is the same stale-zero memory-corruption bug
+        // fixed for emit_load_common at 2026-05-31 (commit 4247f98 — see
+        // ordering comment at lines 245-260 above). Mirror that ordering
+        // here: Flush, then Bind(Write), then perform the load.
+        rc.Flush(params.ctx_ptr);
         auto rc_rt = rc.Bind(rt, RCMode::Write);
-        emit_const_mmio_load(wb, rc, params, op.const_ea, width);
+        // emit_const_mmio_load also calls rc.Flush internally — a second
+        // Flush after Bind(Write) would re-trigger the stale-write bug.
+        // Inline its body here (sans the redundant Flush) instead.
+        wb.op_i32_const((s32)op.const_ea);
+        wb.op_call(read_import_for_width(width));
+        if (width == LoadWidth::S16) {
+            wb.op_i32_const(16);
+            wb.op_i32_shl();
+            wb.op_i32_const(16);
+            wb.op_i32_shr_s();
+        }
         wb.op_local_set(rc_rt.local_idx());
         if (update && ra != 0) {
             auto rc_ra = rc.Bind(ra, RCMode::Write);
@@ -503,29 +534,44 @@ void emit_lfsx(WasmModuleBuilder& wb, RegCache& rc,
     wb.op_f32_reinterpret_i32();
     wb.op_f64_promote_f32();
     wb.op_f64_store(ppc_off::ps0(rt));
+
+    // PEM paired-single splat: lfsx duplicates the loaded f64 into ps1(rt)
+    // as well. Without this, paired-single ops that read ps1 see a stale
+    // value. Re-load ps0 (just-stored) and write into ps1 — avoids needing
+    // a scratch f64 local. The IEEE→PEM conversion difference (subnormals,
+    // NaN payload) is secondary and not addressed here.
+    //
+    // Stack shape: push base_ptr (i32) for the store-address, then base_ptr
+    // for the load-address, then f64_load pops the load-address and leaves
+    // the f64, then f64_store pops [store_addr, f64] and writes ps1.
+    wb.op_i32_const((s32)params.ctx_ptr);
+    wb.op_i32_const((s32)params.ctx_ptr);
+    wb.op_f64_load(ppc_off::ps0(rt));
+    wb.op_f64_store(ppc_off::ps1(rt));
 }
 
-// stfsx fS, rA, rB — demote ps0(rs) f64 to f32, store via WIMPORT_WRITE32.
-// gekko_emit.cpp:2858 emit_stfsx_impl.
+// stfsx fS, rA, rB — store f32 from ps0(rs) at EA.
+// TODO(audit 2026-06-01): the previous inline emit used wasm
+// f32.demote_f64 (IEEE-754 round-to-nearest-even on the full 64-bit value),
+// but the architectural correct conversion is PEM (Paired-Element-Mode)
+// ConvertToSingle — Dolphin's Source/Core/Core/PowerPC/Interpreter/
+// Interpreter_FPUtils.h ConvertToSingleFTZ / ConvertToSingle path: bit-
+// manipulate the 64-bit double's exponent/mantissa to produce the PowerPC
+// f32 bit pattern (handles subnormals, infinities, and NaN payload
+// differently than IEEE round-then-reinterpret). The fix is non-trivial
+// (≈20 lines of bit-twiddling, plus the EA-form path), so for now route
+// stfsx to the interp fallback. Mirror emit_fallback (ppc_emit.cpp:56-63):
+// Flush dirty wasm-locals to memory so the interp sees current GPR/FPR
+// state, then ReloadAll after the call so subsequent ops in the same block
+// observe any interp-side mutations.
 void emit_stfsx(WasmModuleBuilder& wb, RegCache& rc,
                 LoadStoreParams params, const CodeOp& op) {
-    const u32 inst = op.inst;
-    const u32 rs   = GekkoOperands::RS(inst);
-    const u32 ra   = GekkoOperands::RA(inst);
-    const u32 rb   = GekkoOperands::RB(inst);
-
-    emit_ea_x_stack(wb, rc, ra, rb);
-    wb.op_local_set(LOCAL_TMP_EA);
-
+    static constexpr u32 WIMPORT_INTERP = 6;
     rc.Flush(params.ctx_ptr);
-
-    // write32(EA, demote(f64) as u32) — push EA, push value, call.
-    wb.op_local_get(LOCAL_TMP_EA);
-    wb.op_i32_const((s32)params.ctx_ptr);
-    wb.op_f64_load(ppc_off::ps0(rs));
-    wb.op_f32_demote_f64();
-    wb.op_i32_reinterpret_f32();
-    wb.op_call(WIMPORT_WRITE32);
+    wb.op_i32_const((s32)op.inst);
+    wb.op_i32_const((s32)op.address);
+    wb.op_call(WIMPORT_INTERP);
+    rc.ReloadAll(params.ctx_ptr);
 }
 
 // stfiwx fS, rA, rB — write low 32 bits of ps0(rs) f64 as a word.

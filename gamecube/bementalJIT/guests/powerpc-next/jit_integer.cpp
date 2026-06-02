@@ -19,6 +19,29 @@
 namespace bemental::powerpc {
 
 // ---------------------------------------------------------------------------
+// OE-form fallback. addx/subfx/addcx/subfcx/addex/subfex/addmex/subfmex/
+// addzex/subfzex/mullwx/divwx/divwux/negx all have OE-suffix variants
+// (bit 0x400 of the instruction word) that set XER.OV/SO on signed-overflow
+// detection. The native emitters here do NOT track OV/SO; OE-form ops are
+// rare in compiler output (typically only emerge from Watcom/CW range
+// checks). Conservative fix: when OE bit is set, route the whole op to
+// WIMPORT_INTERP — the interpreter handles OV/SO correctly. Mirrors the
+// emit_fallback shape at ppc_emit.cpp:56-63 (Flush before, ReloadAll after,
+// so subsequent ops in the block see post-interp register state).
+// Returns true when the op was handled (interp call emitted); caller must
+// early-return in that case.
+static bool emit_oe_fallback_if_set(WasmModuleBuilder& wb, RegCache& rc,
+                                    const CodeOp& op, u32 ctx_ptr) {
+    if (!GekkoOperands::OE(op.inst)) return false;
+    rc.Flush(ctx_ptr);
+    wb.op_i32_const((s32)op.inst);
+    wb.op_i32_const((s32)op.address);
+    wb.op_call(/*WIMPORT_INTERP=*/6);
+    rc.ReloadAll(ctx_ptr);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Helper: emit "value of preg ra" — handles the RA==0-means-zero case for
 // D-form ops that use FL_IN_A0 semantics (addi/addis: when RA==0, the
 // literal value 0 is used, not gpr[r0]).
@@ -65,6 +88,16 @@ void emit_addic(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                 u32 ctx_ptr) {
     // RT = RA + SIMM; set XER.CA = (result < RA).  RA is always read (no
     // a-or-zero variant — FL_IN_A, not FL_IN_A0).
+    //
+    // When RD==RA, rc_rt and rc_ra share the same wasm local. Writing rt
+    // first and then reading "ra" reads the post-write (new) value, giving
+    // CA = (rt < rt) = 0, which is wrong (e.g. wrap RA=0xFFFFFFFF, SIMM=1
+    // ⇒ rt=0, CA should be 1, but observed 0). Fix: stash the original RA
+    // in scratch local 1 before overwriting rt, and use that for CA.
+    // Scratch local index matches the file-wide LOCAL_TMP_SCRATCH at line ~754
+    // (= LOCAL_TMP_B / LOCAL_TMP_VAL); declared locally here since this fn
+    // sits earlier in the TU than the file-scope constexpr.
+    constexpr u32 LOCAL_TMP_SCRATCH = 1;
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
     const u32 ra   = GekkoOperands::RA(inst);
@@ -73,18 +106,23 @@ void emit_addic(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     auto rc_rt = rc.Bind(rt, RCMode::Write);
     auto rc_ra = rc.Bind(ra, RCMode::Read);
 
-    // result = ra + simm; written to rt local
+    // Stash original RA in LOCAL_TMP_SCRATCH so CA uses pre-write value
+    // even when rt==ra.
     wb.op_local_get(rc_ra.local_idx());
+    wb.op_local_set(LOCAL_TMP_SCRATCH);
+
+    // result = ra + simm; written to rt local
+    wb.op_local_get(LOCAL_TMP_SCRATCH);
     wb.op_i32_const((s32)simm);
     wb.op_i32_add();
     wb.op_local_set(rc_rt.local_idx());
 
-    // CA = (rt < ra) unsigned compare — i.e. wrap-around detected.
+    // CA = (rt < ra_original) unsigned compare — wrap-around detected.
     // Store as u8 at PowerPCState +0x2F4 (XER_CA, per the live-tree offset
     // table in gekko_emit.h ppc_off::XER_CA).
     wb.op_i32_const((s32)ctx_ptr);
     wb.op_local_get(rc_rt.local_idx());
-    wb.op_local_get(rc_ra.local_idx());
+    wb.op_local_get(LOCAL_TMP_SCRATCH);
     wb.op_i32_lt_u();
     wb.op_i32_store8(0x2F4);
 }
@@ -247,9 +285,11 @@ static void emit_binop_x(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 }
 
 void emit_addx (WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
     emit_binop_x(wb, rc, op, &WasmModuleBuilder::op_i32_add, ctx_ptr);
 }
 void emit_subfx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
     // subf: RT = RB - RA  (note operand order is reversed vs Wasm sub-form).
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
@@ -267,6 +307,7 @@ void emit_subfx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_p
     }
 }
 void emit_mullwx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
     emit_binop_x(wb, rc, op, &WasmModuleBuilder::op_i32_mul, ctx_ptr);
 }
 
@@ -687,6 +728,7 @@ void emit_srawx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // Negate (op31:104). rt = -ra. WASM: 0 - ra.
 // ---------------------------------------------------------------------------
 void emit_negx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
     const u32 ra   = GekkoOperands::RA(inst);
@@ -749,6 +791,7 @@ static void emit_ca_chain(WasmModuleBuilder& wb, u32 ctx_ptr,
 
 void emit_addex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                 u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
     const u32 inst = op.inst;
     auto rc_rt = rc.Bind(GekkoOperands::RD(inst), RCMode::Write);
     auto rc_ra = rc.Bind(GekkoOperands::RA(inst), RCMode::Read);
@@ -762,6 +805,7 @@ void emit_addex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 
 void emit_subfex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                  u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
     // subfe: rt = ~ra + rb + CA. Inlined (can't reuse emit_ca_chain
     // because it stashes sum1 in LOCAL_TMP_SCRATCH; we'd alias if we
     // pre-stashed ~ra there). Recompute ~ra at the carry-out check.
@@ -801,6 +845,7 @@ void emit_subfex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 
 void emit_addmex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                  u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
     // addme: rt = ra + (-1) + CA. operand_b = -1.
     const u32 inst = op.inst;
     auto rc_rt = rc.Bind(GekkoOperands::RD(inst), RCMode::Write);
@@ -816,6 +861,8 @@ void emit_addmex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 
 void emit_subfmex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                   u32 ctx_ptr) {
+    // OE-form is handled by the same interp fallback below (the body
+    // already routes to WIMPORT_INTERP), so no separate OE guard needed.
     // subfme: rt = ~ra + (-1) + CA. Compute ~ra → ra_inv, then
     // ca_chain(ra_inv, -1). Need a different scratch for both, but we
     // only have one (LOCAL_TMP_SCRATCH). Fold: ~ra + (-1) = ~ra - 1.
@@ -833,10 +880,15 @@ void emit_subfmex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_const((s32)op.inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(/*WIMPORT_INTERP=*/6);
+    // ReloadAll mirrors canonical emit_fallback (ppc_emit.cpp:56-63): without
+    // this, the next block-flush writes a stale local back over the rt the
+    // interpreter just stored to PowerPCState.gpr[rt].
+    rc.ReloadAll(ctx_ptr);
 }
 
 void emit_addzex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                  u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
     // addze: rt = ra + 0 + CA = ra + CA. Specialized form:
     //   result = ra + CA_in
     //   CA_out = (result < ra)
@@ -862,6 +914,7 @@ void emit_addzex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 
 void emit_subfzex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                   u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
     // subfze: rt = ~ra + 0 + CA = ~ra + CA.
     //   result = ~ra + CA
     //   CA_out = (result < ~ra)
@@ -935,6 +988,7 @@ void emit_rlwnmx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // gekko_emit.cpp:1521 emit_addcx_impl.
 void emit_addcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                 u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
     const u32 ra   = GekkoOperands::RA(inst);
@@ -966,6 +1020,7 @@ void emit_addcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // gekko_emit.cpp:1545 emit_subfcx_impl.
 void emit_subfcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                  u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
     const u32 ra   = GekkoOperands::RA(inst);
@@ -1182,10 +1237,12 @@ static void emit_div_guarded_next(WasmModuleBuilder& wb, RegCache& rc,
 
 void emit_divwx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                 u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
     emit_div_guarded_next(wb, rc, op, /*is_signed=*/true, ctx_ptr);
 }
 void emit_divwux(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                  u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
     emit_div_guarded_next(wb, rc, op, /*is_signed=*/false, ctx_ptr);
 }
 
@@ -1222,58 +1279,41 @@ void emit_mftb(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     // ticks (Advance fires, spin exits).
     (void)tbr;
     (void)rt;
+    // Mirror canonical emit_fallback (ppc_emit.cpp:56-63): Flush BEFORE the
+    // interp call so the host sees current GPRs, then ReloadAll AFTER so
+    // subsequent ops in the block see the post-interp rt value (otherwise
+    // the regcache flush at block end overwrites it with a stale local).
     rc.Flush(ctx_ptr);
     wb.op_i32_const((s32)inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(/*WIMPORT_INTERP=*/6);
+    rc.ReloadAll(ctx_ptr);
 }
 
 // ---------------------------------------------------------------------------
 // dcbz — zero a 32-byte cache line at EA = (ra?gpr[ra]:0) + gpr[rb], aligned
 // down to 32-byte boundary. The Gekko's memset/__fill_mem zero-init paths
-// rely on this; interp fallback was an order of magnitude slower.
-// Emit as 8x i32 store via WIMPORT_WRITE32 (matches gekko_emit.cpp:3707
-// emit_dcbz_impl).
-//
-// Uses LOCAL_TMP_SCRATCH (= 1, LOCAL_TMP_VAL) as base-EA scratch. Flushes
-// regcache before the import calls so the WIMPORT slow path sees
-// fully-coherent PowerPCState (MMIO handlers may dereference it).
+// rely on this. Conservative correctness fix 2026-06-01: route to
+// WIMPORT_INTERP so MMU::ClearDCacheLine (and the JIT block-cache
+// invalidation hook) fire correctly. The prior 8x WIMPORT_WRITE32 inline
+// bypassed those — fast but wrong. Until a dedicated WIMPORT for
+// ClearDCacheLine lands, the interp delegate is the safe shape.
 // ---------------------------------------------------------------------------
 void emit_dcbz(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                u32 ctx_ptr) {
-    const u32 inst = op.inst;
-    const u32 ra   = GekkoOperands::RA(inst);
-    const u32 rb   = GekkoOperands::RB(inst);
-
-    // Compute EA into LOCAL_TMP_SCRATCH (already aligned to 32B).
-    if (ra == 0) {
-        auto rc_rb = rc.Bind(rb, RCMode::Read);
-        wb.op_local_get(rc_rb.local_idx());
-    } else {
-        auto rc_ra = rc.Bind(ra, RCMode::Read);
-        auto rc_rb = rc.Bind(rb, RCMode::Read);
-        wb.op_local_get(rc_ra.local_idx());
-        wb.op_local_get(rc_rb.local_idx());
-        wb.op_i32_add();
-    }
-    wb.op_i32_const((s32)~31);
-    wb.op_i32_and();
-    wb.op_local_set(LOCAL_TMP_SCRATCH);
-
-    // Flush regcache before issuing WIMPORT calls — host MMIO handlers may
-    // read PowerPCState. Calls are stack-neutral (write32 is (i32,i32)->()).
+    // CONSERVATIVE FIX (2026-06-01): the prior 8x per-word WIMPORT_WRITE32
+    // inline was semantically WRONG — it bypassed MMU::ClearDCacheLine, did
+    // not honor cache-disabled regions, did not signal the JIT block-cache
+    // invalidation hook, and missed exception delivery on bad EA. The
+    // proper fix is to route to MMU::ClearDCacheLine via a new WIMPORT.
+    // Interim: WIMPORT_INTERP delegates the whole op to Dolphin's
+    // Interpreter::dcbz, which calls ClearDCacheLine correctly. Cost is one
+    // host call per dcbz instead of eight, plus correctness.
     rc.Flush(ctx_ptr);
-
-    // 8 x write32(EA + i*4, 0).
-    for (u32 i = 0; i < 8; ++i) {
-        wb.op_local_get(LOCAL_TMP_SCRATCH);
-        if (i != 0) {
-            wb.op_i32_const((s32)(i * 4u));
-            wb.op_i32_add();
-        }
-        wb.op_i32_const(0);
-        wb.op_call(/*WIMPORT_WRITE32=*/5);
-    }
+    wb.op_i32_const((s32)op.inst);
+    wb.op_i32_const((s32)op.address);
+    wb.op_call(/*WIMPORT_INTERP=*/6);
+    rc.ReloadAll(ctx_ptr);
 }
 
 }  // namespace bemental::powerpc

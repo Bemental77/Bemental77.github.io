@@ -16,7 +16,6 @@ add_library(bementalJITPowerPCNext STATIC
     jit_system_registers.cpp
     cr_encode.cpp
     jit_compare.cpp
-    idle_skip.cpp
     hle_prologue.cpp
     ppc_emit.cpp
 )

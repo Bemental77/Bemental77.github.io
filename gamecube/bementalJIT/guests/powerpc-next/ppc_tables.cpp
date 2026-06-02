@@ -142,14 +142,27 @@ static const GekkoOPInfo* table19(u32 sub10) {
 // (analyzer treats as Unknown / no flow info) until Phase 4 fills the
 // per-op file split.
 static const GekkoOPInfo* table31(u32 sub10) {
-    // ADD family (Rc and OE variants share the same metadata for analysis).
-    static constexpr GekkoOPInfo addx   = {"addx",   OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_RC_BIT};
-    static constexpr GekkoOPInfo subfx  = {"subfx",  OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_RC_BIT};
-    static constexpr GekkoOPInfo addex  = {"addex",  OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
-    static constexpr GekkoOPInfo subfex = {"subfex", OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
-    static constexpr GekkoOPInfo mullwx = {"mullwx", OpType::Integer, 3, FL_OUT_D | FL_IN_AB | FL_RC_BIT};
-    static constexpr GekkoOPInfo divwx  = {"divwx",  OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_FLOAT_DIV};
-    static constexpr GekkoOPInfo divwux = {"divwux", OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_FLOAT_DIV};
+    // ADD family. OE-suffix variants carry FL_SET_OE so analyzer correctly
+    // classifies them as XER.OV-writers (per dolphin-upstream PPCTables.cpp
+    // s_table31). Emit functions in jit_integer.cpp branch on
+    // GekkoOperands::OE(inst) internally and route the OE form to
+    // WIMPORT_INTERP — see emit_oe_fallback_if_set. The split-entry shape
+    // here matches Dolphin's source-of-truth flag bits even though
+    // powerpc-next does not inline OV/SO tracking.
+    static constexpr GekkoOPInfo addx    = {"addx",    OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_RC_BIT};
+    static constexpr GekkoOPInfo addox   = {"addox",   OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_SET_OE};
+    static constexpr GekkoOPInfo subfx   = {"subfx",   OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_RC_BIT};
+    static constexpr GekkoOPInfo subfox  = {"subfox",  OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_SET_OE};
+    static constexpr GekkoOPInfo addex   = {"addex",   OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
+    static constexpr GekkoOPInfo addeox  = {"addeox",  OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_READ_CA | FL_SET_CA | FL_RC_BIT | FL_SET_OE};
+    static constexpr GekkoOPInfo subfex  = {"subfex",  OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
+    static constexpr GekkoOPInfo subfeox = {"subfeox", OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_READ_CA | FL_SET_CA | FL_RC_BIT | FL_SET_OE};
+    static constexpr GekkoOPInfo mullwx  = {"mullwx",  OpType::Integer, 3, FL_OUT_D | FL_IN_AB | FL_RC_BIT};
+    static constexpr GekkoOPInfo mullwox = {"mullwox", OpType::Integer, 3, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_SET_OE};
+    static constexpr GekkoOPInfo divwx   = {"divwx",   OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_FLOAT_DIV};
+    static constexpr GekkoOPInfo divwox  = {"divwox",  OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_FLOAT_DIV | FL_SET_OE};
+    static constexpr GekkoOPInfo divwux  = {"divwux",  OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_FLOAT_DIV};
+    static constexpr GekkoOPInfo divwuox = {"divwuox", OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_FLOAT_DIV | FL_SET_OE};
     static constexpr GekkoOPInfo andx   = {"andx",   OpType::Integer, 1, FL_OUT_A | FL_IN_SB | FL_RC_BIT};
     static constexpr GekkoOPInfo andcx  = {"andcx",  OpType::Integer, 1, FL_OUT_A | FL_IN_SB | FL_RC_BIT};
     static constexpr GekkoOPInfo orx    = {"orx",    OpType::Integer, 1, FL_OUT_A | FL_IN_SB | FL_RC_BIT};
@@ -165,13 +178,17 @@ static const GekkoOPInfo* table31(u32 sub10) {
     // any neg.; SAB 0x800eb534 (`neg. r5, r5`) self-looped because the
     // following bne+ terminator never made it into the buffer.
     static constexpr GekkoOPInfo negx   = {"negx",   OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_RC_BIT};
+    static constexpr GekkoOPInfo negox  = {"negox",  OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_RC_BIT | FL_SET_OE};
     static constexpr GekkoOPInfo cmpl   = {"cmpl",   OpType::Integer, 1, FL_IN_AB | FL_SET_CRn};
     static constexpr GekkoOPInfo cntlzwx= {"cntlzwx",OpType::Integer, 1, FL_OUT_A | FL_IN_S | FL_RC_BIT};
     static constexpr GekkoOPInfo extsbx = {"extsbx", OpType::Integer, 1, FL_OUT_A | FL_IN_S | FL_RC_BIT};
     static constexpr GekkoOPInfo extshx = {"extshx", OpType::Integer, 1, FL_OUT_A | FL_IN_S | FL_RC_BIT};
-    // Carry-out arithmetic — write XER.CA but don't read it.
-    static constexpr GekkoOPInfo addcx  = {"addcx",  OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_SET_CA | FL_RC_BIT};
-    static constexpr GekkoOPInfo subfcx = {"subfcx", OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_SET_CA | FL_RC_BIT};
+    // Carry-out arithmetic — write XER.CA but don't read it. OE-suffix
+    // variants (addcox=522, subfcox=520) additionally set XER.OV/SO.
+    static constexpr GekkoOPInfo addcx   = {"addcx",   OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_SET_CA | FL_RC_BIT};
+    static constexpr GekkoOPInfo addcox  = {"addcox",  OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_SET_CA | FL_RC_BIT | FL_SET_OE};
+    static constexpr GekkoOPInfo subfcx  = {"subfcx",  OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_SET_CA | FL_RC_BIT};
+    static constexpr GekkoOPInfo subfcox = {"subfcox", OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_SET_CA | FL_RC_BIT | FL_SET_OE};
     // Carry-IN+OUT, single-source arithmetic (RB unused):
     //   addzex (xo=202/714) — rT = rA + CA
     //   addmex (xo=234/746) — rT = rA + CA + (-1)
@@ -183,10 +200,14 @@ static const GekkoOPInfo* table31(u32 sub10) {
     // because the block compiled to 1 instruction, then JIT epilogue read
     // ppc_state.pc which never advanced past block start → self-loop.
     // Same class of bug as the negx fix in commit f8c941d.
-    static constexpr GekkoOPInfo addzex  = {"addzex",  OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
-    static constexpr GekkoOPInfo addmex  = {"addmex",  OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
-    static constexpr GekkoOPInfo subfzex = {"subfzex", OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
-    static constexpr GekkoOPInfo subfmex = {"subfmex", OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
+    static constexpr GekkoOPInfo addzex   = {"addzex",   OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
+    static constexpr GekkoOPInfo addzeox  = {"addzeox",  OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT | FL_SET_OE};
+    static constexpr GekkoOPInfo addmex   = {"addmex",   OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
+    static constexpr GekkoOPInfo addmeox  = {"addmeox",  OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT | FL_SET_OE};
+    static constexpr GekkoOPInfo subfzex  = {"subfzex",  OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
+    static constexpr GekkoOPInfo subfzeox = {"subfzeox", OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT | FL_SET_OE};
+    static constexpr GekkoOPInfo subfmex  = {"subfmex",  OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT};
+    static constexpr GekkoOPInfo subfmeox = {"subfmeox", OpType::Integer, 1, FL_OUT_D | FL_IN_A | FL_READ_CA | FL_SET_CA | FL_RC_BIT | FL_SET_OE};
     // High-half multiply — same operand shape as mullwx; multi-cycle latency.
     static constexpr GekkoOPInfo mulhwx = {"mulhwx", OpType::Integer, 3, FL_OUT_D | FL_IN_AB | FL_RC_BIT};
     static constexpr GekkoOPInfo mulhwux= {"mulhwux",OpType::Integer, 3, FL_OUT_D | FL_IN_AB | FL_RC_BIT};
@@ -233,23 +254,37 @@ static const GekkoOPInfo* table31(u32 sub10) {
     static constexpr GekkoOPInfo stbux  = {"stbux",  OpType::Store, 1, FL_OUT_A | FL_IN_S | FL_IN_AB | FL_LOADSTORE};
 
     switch (sub10) {
-    case 266: case 778: return &addx;
-    case 40:  case 552: return &subfx;
-    case 138: case 650: return &addex;
-    case 136: case 648: return &subfex;
-    case 235: case 747: return &mullwx;
-    case 491: case 1003: return &divwx;
-    case 459: case 971: return &divwux;
-    // negx (xo=104, with OE variant 360). emit_negx exists in ppc_emit.
-    case 104: case 360: return &negx;
-    // Carry-out arith + wide multiply (port).
-    case 10:  case 522: return &addcx;
-    case 8:   case 520: return &subfcx;
+    case 266: return &addx;
+    case 778: return &addox;
+    case 40:  return &subfx;
+    case 552: return &subfox;
+    case 138: return &addex;
+    case 650: return &addeox;
+    case 136: return &subfex;
+    case 648: return &subfeox;
+    case 235: return &mullwx;
+    case 747: return &mullwox;
+    case 491: return &divwx;
+    case 1003: return &divwox;
+    case 459: return &divwux;
+    case 971: return &divwuox;
+    // negx (xo=104) / negox (xo=360). emit_negx handles OE internally.
+    case 104: return &negx;
+    case 360: return &negox;
+    // Carry-out arith — OE variants set XER.OV/SO too.
+    case 10:  return &addcx;
+    case 522: return &addcox;
+    case 8:   return &subfcx;
+    case 520: return &subfcox;
     // Carry-in/out single-source (matching emit_addzex/addmex/subfzex/subfmex).
-    case 202: case 714: return &addzex;
-    case 234: case 746: return &addmex;
-    case 200: case 712: return &subfzex;
-    case 232: case 744: return &subfmex;
+    case 202: return &addzex;
+    case 714: return &addzeox;
+    case 234: return &addmex;
+    case 746: return &addmeox;
+    case 200: return &subfzex;
+    case 712: return &subfzeox;
+    case 232: return &subfmex;
+    case 744: return &subfmeox;
     case 75:  return &mulhwx;
     case 11:  return &mulhwux;
     case 28:  return &andx;

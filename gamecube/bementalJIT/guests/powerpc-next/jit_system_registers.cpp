@@ -102,10 +102,13 @@ static void emit_load_arch_xer(WasmModuleBuilder& wb, u32 ctx_ptr) {
 // Reads the XER value from local `xer_local`. Stack-neutral.
 static void emit_store_arch_xer(WasmModuleBuilder& wb, u32 ctx_ptr,
                                 u32 xer_local) {
-    // xer_stringctrl = xer & 0xFFFF
+    // xer_stringctrl = xer & 0xFF7F
+    // Mask preserves the reserved bit 7 as zero. Matches Jit64
+    // Jit_SystemRegisters.cpp:264 and Interpreter SetXER behavior; the
+    // earlier 0xFFFF allowed bit 7 to leak into stored XER.
     wb.op_i32_const((s32)ctx_ptr);
     wb.op_local_get(xer_local);
-    wb.op_i32_const((s32)0xFFFF);
+    wb.op_i32_const((s32)0xFF7F);
     wb.op_i32_and();
     wb.op_i32_store16(ppc_off::XER_STRINGCTRL);
     // xer_ca = (xer >> 29) & 1
@@ -142,9 +145,15 @@ void emit_mfspr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 
     if (!spr_is_direct(spr_num)) {
         // Fallback — TBL/TBU/DEC need CoreTiming live values.
+        // Mirror emit_fallback (ppc_emit.cpp:56-63): Flush dirty locals so
+        // the interp sees current GPR state, then ReloadAll after so later
+        // ops' Flush doesn't overwrite the interp's writes with stale
+        // locals.
+        rc.Flush(ctx_ptr);
         wb.op_i32_const((s32)inst);
         wb.op_i32_const((s32)op.address);
         wb.op_call(WIMPORT_INTERP);
+        rc.ReloadAll(ctx_ptr);
         return;
     }
 
@@ -167,10 +176,23 @@ void emit_mtspr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
         return;
     }
 
+    // SPR_PVR (287) is read-only on real hardware; writes are silently
+    // ignored by the interpreter. Emit nothing rather than corrupting the
+    // PVR slot in PowerPCState.spr[].
+    if (spr_num == ppc_off::SPR_PVR) {
+        return;
+    }
+
     if (!spr_is_direct(spr_num)) {
+        // Mirror emit_fallback (ppc_emit.cpp:56-63): Flush dirty locals so
+        // the interp sees current GPR state, then ReloadAll after so later
+        // ops' Flush doesn't overwrite the interp's writes with stale
+        // locals.
+        rc.Flush(ctx_ptr);
         wb.op_i32_const((s32)inst);
         wb.op_i32_const((s32)op.address);
         wb.op_call(WIMPORT_INTERP);
+        rc.ReloadAll(ctx_ptr);
         return;
     }
 
@@ -243,10 +265,14 @@ void emit_mtmsr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // ---------------------------------------------------------------------------
 static void emit_simple_fallback(WasmModuleBuilder& wb, RegCache& rc,
                                  const CodeOp& op, u32 ctx_ptr) {
+    // Mirror emit_fallback (ppc_emit.cpp:56-63): Flush dirty locals so the
+    // interp sees current GPR state, then ReloadAll after so later ops'
+    // Flush doesn't overwrite the interp's writes with stale locals.
     rc.Flush(ctx_ptr);
     wb.op_i32_const((s32)op.inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
+    rc.ReloadAll(ctx_ptr);
 }
 
 void emit_mfcr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,

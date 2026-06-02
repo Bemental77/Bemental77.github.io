@@ -20,7 +20,6 @@
 #include "code_op.h"
 #include "common/op_info.h"
 #include "hle_prologue.h"
-#include "idle_skip.h"
 #include "jit_branch.h"
 #include "jit_compare.h"
 #include "jit_integer.h"

@@ -34,10 +34,12 @@ static void emit_cr_high32_into_stack(WasmModuleBuilder& wb, u32 ctx_ptr,
     wb.op_i32_const(1);
 
     // OR in (XER.SO & 1) << 27.
+    // XER_SO_OV byte layout: bit 1 = SO, bit 0 = OV. Right-shift by 1 to
+    // isolate SO into bit 0 before the << 27 positions it at CR.SO.
     wb.op_i32_const((s32)ctx_ptr);
     wb.op_i32_load8_u(ppc_off::XER_SO_OV);
     wb.op_i32_const(1);
-    wb.op_i32_and();
+    wb.op_i32_shr_u();
     wb.op_i32_const(27);
     wb.op_i32_shl();
     wb.op_i32_or();
