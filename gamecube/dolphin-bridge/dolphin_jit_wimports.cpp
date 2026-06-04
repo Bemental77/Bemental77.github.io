@@ -30,12 +30,30 @@
 
 #include "Common/CommonTypes.h"
 #include "Core/HLE/HLE.h"
+#include "Core/HW/Memmap.h"
+#include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
 extern "C" {
+
+// EA translation seam: the JIT slow path (jit_load_store.cpp::emit_slowmem_*
+// + const-MMIO routing at :348-465) hands MMU the RAW guest virtual EA
+// (e.g. 0xCC003004 for PI MASK, 0x817ede28 for MEM1 Arena+8). MMU::Write/Read
+// route through WriteToHardware/ReadFromHardware which call MMU::TranslateAddress
+// when MSR.DR=1 — TranslateAddress consults the DBAT cache which BS2Emu
+// installs at Boot_BS2Emu.cpp:121-137 (DBAT0 80000000→00000000 cached MEM1,
+// DBAT1 C0000000→00000000 uncached/MMIO mirror). Empirical probe 2026-06-04:
+// at PC=0x800e4bd0 (DSP_CONTROL write inside __OSInitAudioSystem), MSR.DR=1,
+// SPR_DBAT0/1 hold the correct SetupBAT values, and m_dbat_table[0x6600] =
+// 0x0C000005 (PA=0x0C000000 | BAT_MAPPED_BIT | BAT_WI_BIT). Passing the raw
+// 0xCC00500A therefore translates to 0x0C00500A and reaches GetMMIOMapping
+// → DSP::Write<u16>. The prior unconditional `addr & 0x3FFFFFFF` mask was a
+// bug: it stripped the high bits, then MMU saw a physical address with no
+// BAT mapping → DSI exception → 26K "Invalid write to 0x0c00xxxx" warnings
+// that fully wedged __OSInitAudioSystem on the DSP_CR bit-0x20 poll.
 
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_read8(uint32_t addr) {
@@ -142,6 +160,20 @@ void dolphin_interp(uint32_t /*unused*/, uint32_t pc) {
     auto& ppc_state = system.GetPPCState();
     if (ppc_state.pc != pc) return;
     system.GetInterpreter().SingleStep();
+}
+
+// Recompute feature_flags / membase from the current MSR. Called from
+// emit_mtmsr immediately after the new MSR is stored to ppc_state. Without
+// this, after mtmsr flips MSR.IR/DR the host-side translation context
+// (feature_flags, membase) stays stale → MMIO/RAM router rejects subsequent
+// addresses as "Unable to resolve" → exception vector dispatch reads wrong
+// → DBExceptionDestination → PPCHalt wedge. Mirrors Jit64::EmitUpdateMembase
+// (Jit.cpp:714) which is called from every MSR-changing op. Type-2 import
+// signature (i32, i32) -> () — both args unused; the handler reads the
+// global m_ppc_state via Core::System.
+EMSCRIPTEN_KEEPALIVE
+void dolphin_msr_updated(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
+    Core::System::GetInstance().GetPowerPC().MSRUpdated();
 }
 
 // dolphin_evict_block lives in JitWasm.cpp (which has the bementalJIT

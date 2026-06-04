@@ -190,6 +190,12 @@ int compile_raw(const u8* bytes, std::size_t size) {
                         // emitter's type-2 import signature.
                         if (Module._dolphin_interp)
                             e.ppc_interp = Module._dolphin_interp;
+                        // ppc_msr_updated (WIMPORT idx 11) — added to fix the
+                        // SAB DBException wedge. emit_mtmsr calls this after
+                        // the MSR store so feature_flags/membase get
+                        // recomputed (Jit64 parity via EmitUpdateMembase).
+                        if (Module._dolphin_msr_updated)
+                            e.ppc_msr_updated = Module._dolphin_msr_updated;
                     }
                     const isWasm = (typeof WebAssembly.Function !== 'undefined')
                         ? Module._dolphin_read32 instanceof WebAssembly.Function
@@ -456,29 +462,6 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
 }
 
 int BlockCache::compile(u64 key, const u8* bytes, std::size_t size) {
-#ifdef __EMSCRIPTEN__
-    // [compile-key] log every distinct compile() key+size so the block map is
-    // visible — the OSInit wedge block (B) is keyed by something other than
-    // 0x800e362c (compile(0x800e362c) is never called yet dispatch leaves
-    // ppc_state.pc=0x800e362c). Capped. Full hex for any key in the OSInit
-    // region [0x800e3500,0x800e3700) so it can be disassembled (wasm2wat).
-    {
-        static u32 s_ck_n = 0;
-        if (s_ck_n < 80u) {
-            ++s_ck_n;
-            EM_ASM({ console.error('[compile-key] key=0x' + ($0>>>0).toString(16) + ' size=' + ($1>>>0)); },
-                   (u32)key, (u32)size);
-        }
-        const u32 kk = (u32)key;
-        if (kk >= 0x800e3500u && kk < 0x800e4000u) {
-            EM_ASM({
-                var p = $0>>>0; var n = $1>>>0; var s = '';
-                for (var i = 0; i < n; i++) { var b = HEAPU8[p+i]; s += (b<16?'0':'') + b.toString(16); }
-                console.error('[block-dump] key=0x' + ($2>>>0).toString(16) + ' size=' + n + ' hex=' + s);
-            }, (u32)(uintptr_t)bytes, (u32)size, kk);
-        }
-    }
-#endif
     // Bound the cache to prevent OOM when the guest emits a flood of unique
     // blocks (e.g. JIT'ing garbage virtual addresses with MMU off — each one
     // compiles a fresh module). Wipe everything past the cap; hot blocks

@@ -67,6 +67,15 @@ public:
     // calls return RCOpArg::Imm32(imm). Subsequent Bind(Write) invalidates.
     void SetImmediate32(u32 preg, u32 imm);
 
+    // Mark a preg's wasm-local as dirty (needs flush back to PowerPCState).
+    // Used when an emit writes to a Bind(Write)-bound local AFTER a Flush
+    // that cleared the dirty bit. Without this, the local has the new value
+    // but Flush thinks it's clean → block exit drops the write → silent
+    // corruption. Diagnosed in emit_shiftx/emit_srawx where Flush precedes
+    // op_if/op_else/op_end whose body's op_local_set is the actual write
+    // (2026-06-04 multi-agent JIT correctness hunt).
+    void MarkDirty(u32 preg);
+
     // Flush dirty bindings back to PowerPCState. `mask` selects which PPC
     // GPRs to flush; default is all-32. Called at:
     //   - Block exit (always — before the final read-PC-and-return).

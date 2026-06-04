@@ -40,6 +40,22 @@ void Init()
     Common::Log::LogManager::GetInstance()->EnableListener(Common::Log::LogListener::CUSTOM_LISTENER, true);
     Common::Log::LogManager::GetInstance()->EnableListener(Common::Log::LogListener::LISTENER::CONSOLE_LISTENER, false);
   }
+  // Even when no retro_log_callback is registered (the wasm/emscripten case
+  // where env_cb doesn't provide GET_LOG_INTERFACE), enable the log types we
+  // want CONSOLE_LISTENER to print. Without this, LogManager::IsEnabled
+  // returns false for every type (LogManager.cpp:167-171 defaults each
+  // m_log[type].m_enable to false) → ALL log messages are dropped before
+  // listener dispatch → ConsoleListener::Log is never called → no Patching /
+  // OSREPORT / symbols-loaded messages reach the page console.
+  auto* mgr = Common::Log::LogManager::GetInstance();
+  mgr->SetEnable(Common::Log::LogType::BOOT,         true);
+  mgr->SetEnable(Common::Log::LogType::CORE,         true);
+  mgr->SetEnable(Common::Log::LogType::OSHLE,        true);  // short name "HLE"
+  mgr->SetEnable(Common::Log::LogType::OSREPORT,     true);
+  mgr->SetEnable(Common::Log::LogType::OSREPORT_HLE, true);
+  mgr->SetEnable(Common::Log::LogType::SYMBOLS,      true);
+  mgr->SetEnable(Common::Log::LogType::MEMMAP,       true);
+  mgr->SetEnable(Common::Log::LogType::COMMON,       true);
 }
 
 void Shutdown()

@@ -487,6 +487,13 @@ static void emit_shiftx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_const(0);
     wb.op_end();
     wb.op_local_set(rc_ra.local_idx());
+    // The Flush above cleared dirty for rc_ra; the op_local_set above wrote
+    // the actual result into rc_ra's local. Re-mark dirty so block-exit Flush
+    // writes the new value back to ppc_state.gpr[ra] — otherwise the write
+    // is silently dropped, corrupting downstream readers of ra (e.g. the OS
+    // interrupt-priority decode chain cntlzw(unmasked & *prio) ⇒ wrong index
+    // ⇒ no registered handler ⇒ DBExceptionDestination → PPCHalt wedge).
+    rc.MarkDirty(GekkoOperands::RA(op.inst));
     if (GekkoOperands::Rc(op.inst)) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
@@ -719,6 +726,15 @@ void emit_srawx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
         wb.op_call(/*WIMPORT_INTERP=*/6);
     wb.op_end();
 
+    // The Flush before the if cleared dirty for rc_ra; the IF arm above
+    // op_local_set's the shifted value into rc_ra's local. Re-mark dirty so
+    // block-exit Flush writes it back to ppc_state.gpr[ra]. The ELSE arm
+    // (interp fallback) writes ppc_state.gpr[ra] directly via the host, so
+    // ReloadAll would be the canonical follow-up there — but the if/else
+    // collapses to a single dirty bit, and srawx is dominated by the inline
+    // IF path on the OS interrupt-priority decode (srawi r0,..,4 / addze
+    // family at SITransferNext, OSDispatchInterrupt cntlzw chain).
+    rc.MarkDirty(GekkoOperands::RA(inst));
     if (GekkoOperands::Rc(inst)) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }

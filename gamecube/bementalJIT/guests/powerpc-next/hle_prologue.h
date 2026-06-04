@@ -26,9 +26,11 @@ namespace bemental::powerpc {
 //   8  ppc_break_block   (i32, i32) -> ()
 //   9  ppc_hle_check     (i32) -> i32
 //  10  ppc_hle_fire      (i32, i32) -> i32
-constexpr u32 WIMPORT_HLE_CHECK = 9;
-constexpr u32 WIMPORT_HLE_FIRE  = 10;
-constexpr u32 WIMPORT_COUNT     = 11;
+//  11  ppc_msr_updated   (i32, i32) -> ()  ; recompute feature_flags/membase
+constexpr u32 WIMPORT_HLE_CHECK   = 9;
+constexpr u32 WIMPORT_HLE_FIRE    = 10;
+constexpr u32 WIMPORT_MSR_UPDATED = 11;
+constexpr u32 WIMPORT_COUNT       = 12;
 
 void emit_hle_prologue(WasmModuleBuilder& wb, u32 ctx_ptr, u32 start_pc);
 

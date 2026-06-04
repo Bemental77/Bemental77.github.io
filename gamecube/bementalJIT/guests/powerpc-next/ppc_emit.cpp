@@ -333,6 +333,7 @@ std::vector<u8> build_block_next(u32 start_pc,
     b.emitImportFunc("env", "ppc_break_block", /*type*/2);   // idx 8
     b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);   // idx 9
     b.emitImportFunc("env", "ppc_hle_fire",    /*type*/3);   // idx 10
+    b.emitImportFunc("env", "ppc_msr_updated", /*type*/2);   // idx 11
     b.endSection();
 
     // ---- Function section: 1 function of type 0 ----

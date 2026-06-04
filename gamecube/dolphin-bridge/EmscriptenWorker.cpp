@@ -75,13 +75,15 @@ static bool environment_cb(unsigned cmd, void* data) {
             *(bool*)data = true;
             return true;
         case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
-            // Boot.cpp checks `if (save_dir && *save_dir)` then does
-            // user_dir = save_dir + "/User". "/" gives user_dir="//User"
-            // (double slash, but emscripten MEMFS tolerates it) →
-            // D_MAPS_IDX="//User/Maps/". The .map files are --embed-file'd
-            // to /User/Maps/ by the link script — MEMFS resolves the
-            // double slash transparently.
-            *(const char**)data = "/";
+            // Boot.cpp:182 does user_dir = save_dir + "/User" → for HLE patches
+            // (Patching OSReport / ___blank / OSPanic) to install, the resulting
+            // D_MAPS_IDX must match where worker_funcs.js preloads GSNE8P.map.
+            // Returning "/dolphin-emu" gives user_dir="/dolphin-emu/User" and
+            // D_MAPS_IDX="/dolphin-emu/User/Maps/" — that's one of the paths
+            // worker_funcs.js writes the map to. Previously "/" produced the
+            // fragile "//User/Maps/" with double slash; switching to a clean
+            // single-slash path eliminates MEMFS normalization as a variable.
+            *(const char**)data = "/dolphin-emu";
             return true;
         case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
             // Accept XRGB8888. Required so the SW renderer's RGBA output

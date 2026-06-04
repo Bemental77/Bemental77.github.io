@@ -25,7 +25,8 @@
 
 namespace bemental::powerpc {
 
-static constexpr u32 WIMPORT_INTERP    = 6;
+static constexpr u32 WIMPORT_INTERP      = 6;
+static constexpr u32 WIMPORT_MSR_UPDATED = 11;
 static constexpr u32 WIMPORT_CHECK_EXC = 7;
 
 // PowerPC SPR encoding: the 10-bit SPR field is split (5+5) and swapped.
@@ -242,6 +243,18 @@ void emit_mtmsr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_local_get(rc_rs.local_idx());
     wb.op_i32_store(ppc_off::MSR);
 
+    // Recompute feature_flags / membase from the new MSR (MSR.IR/DR drive
+    // address translation; without this they go stale and the host MMIO/RAM
+    // router rejects subsequent translated accesses as "Unable to resolve"
+    // — which is exactly the cascade seen on SAB boot leading to a
+    // misrouted EXT_INT vector trampoline → DBExceptionDestination →
+    // PPCHalt). Mirrors Jit64::mtmsr which calls EmitUpdateMembase at
+    // Jit_SystemRegisters.cpp:446. type-2 import takes (i32,i32) — args
+    // unused (handler reads global m_ppc_state).
+    wb.op_i32_const(0);
+    wb.op_i32_const(0);
+    wb.op_call(WIMPORT_MSR_UPDATED);
+
     // Advance PC to op.address+4. The op-level FL_ENDBLOCK ends the block
     // here; epilogue reads PC back. Without this advance the dispatcher
     // would re-enter the same mtmsr → self-loop until the idle heuristic
@@ -249,6 +262,18 @@ void emit_mtmsr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_const((s32)ctx_ptr);
     wb.op_i32_const((s32)(op.address + 4));
     wb.op_i32_store(ppc_off::PC);
+
+    // Sync NPC = PC before the exception-drain. PowerPC.cpp:600's
+    // CheckExternalExceptions captures SRR0 = m_ppc_state.npc; without this
+    // store NPC stays at block-entry PC and SRR0 = wrong PC. Mirrors Jit64's
+    // WriteExternalExceptionExit (Jit.cpp:719-723) which does
+    // `MOV PPCSTATE(npc), pc` immediately before CheckExternalExceptionsFromJIT.
+    // Diagnosed via multi-agent JIT correctness hunt 2026-06-04: SAB wedge at
+    // SRR0=0x800e78c0 (= OSEnableInterrupts mfmsr = block-entry PC of the
+    // mtmsr block) → DBExceptionDestination → PPCHalt.
+    wb.op_i32_const((s32)ctx_ptr);
+    wb.op_i32_const((s32)(op.address + 4));
+    wb.op_i32_store(ppc_off::NPC);
 
     // Probe pending exceptions (dispatcher signals readiness). Drop result.
     wb.op_i32_const((s32)(op.address + 4));

@@ -115,6 +115,10 @@ void RegCache::SetImmediate32(u32 preg, u32 imm) {
     s.dirty  = true;  // PowerPCState doesn't reflect the new value until flushed
 }
 
+void RegCache::MarkDirty(u32 preg) {
+    m_state[preg].dirty = true;
+}
+
 // ---------------------------------------------------------------------------
 // Flush — write dirty locals back to PowerPCState.
 // ---------------------------------------------------------------------------
