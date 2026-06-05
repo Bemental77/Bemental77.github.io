@@ -88,9 +88,61 @@ void dolphin_write32(uint32_t addr, uint32_t val) {
 // Pending-exception drain after a block exit. Mirrors what every native
 // Dolphin JIT epilogue invokes. The cookie arg is unused (kept for the
 // JIT's generic type-1 import signature: (i32) -> i32).
+//
+// Gates external-interrupt (EI) delivery on MEM[0xC0] (OSCurrentContext
+// pointer) being non-zero. The GameCube OS sets MEM[0xC0] to
+// &__OSDefaultContext during OSInit BEFORE enabling any interrupts.
+// However, the apploader / bootrom may issue mtmsr EE=1 before the OS
+// has reached that point. The EI vector at 0x500 saves register state
+// via `lwz r4, 0xC0(r0); ...; stw rN, OSContext.N(r4)`. If r4=0, the
+// save lands at MEM[0..0x1ac] — corrupting low memory and the
+// caller-frame's stack-saved callee-save regs (r28..r31). Observed
+// 2026-06-05 as: EI fires at OSEnableInterrupts+0xc → vector handler
+// chain runs through trampoline at 0x800eb71c → blrl reads r31=0
+// (corrupted by EI vector's save into low memory) → PC=0 → walks
+// garbage → Program-TRAP at PHYS 0x20 → __DBExceptionDestinationAux
+// → PPCHalt at 0x800e34d0.
+//
+// Fix: defer EI delivery until MEM[0xC0] != 0. Other exception types
+// (DSI, Program, Decrementer, FP-unavailable, etc.) are delivered
+// unconditionally because their handlers don't depend on the
+// OSCurrentContext pointer being installed (they go through fixed
+// low-memory scratch slots).
+//
+// Documented as "the PROPER fix" in jit_system_registers.cpp:219-231.
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_check_exc(uint32_t /*unused*/) {
-    PowerPC::CheckExceptionsFromJIT(Core::System::GetInstance().GetPowerPC());
+    auto& sys = Core::System::GetInstance();
+    auto& ps = sys.GetPPCState();
+    auto& ppc = sys.GetPowerPC();
+
+    if (ps.Exceptions & EXCEPTION_EXTERNAL_INT) {
+        // Read MEM[0xC0] directly from host RAM (avoids MMU translation
+        // path's MSR.DR-state dependency). Memory::MemoryManager::GetRAM()
+        // returns the MEM1 base; OSCurrentContext lives at physical 0xC0.
+        const u8* ram = sys.GetMemory().GetRAM();
+        u32 os_current_context_ptr = 0;
+        if (ram) {
+            // Big-endian 4-byte read from MEM[0xC0..0xC3].
+            os_current_context_ptr = (u32(ram[0xC0]) << 24) |
+                                     (u32(ram[0xC1]) << 16) |
+                                     (u32(ram[0xC2]) <<  8) |
+                                      u32(ram[0xC3]);
+        }
+        if (os_current_context_ptr == 0) {
+            // OSCurrentContext not yet installed. Suppress EI delivery for
+            // THIS call by temporarily clearing the EXT_INT pending bit
+            // (other exceptions, if pending, still process), then restore
+            // it so subsequent dolphin_check_exc calls re-evaluate.
+            const u32 saved = ps.Exceptions & EXCEPTION_EXTERNAL_INT;
+            ps.Exceptions &= ~EXCEPTION_EXTERNAL_INT;
+            PowerPC::CheckExceptionsFromJIT(ppc);
+            ps.Exceptions |= saved;
+            return 0;
+        }
+    }
+
+    PowerPC::CheckExceptionsFromJIT(ppc);
     return 0;
 }
 
