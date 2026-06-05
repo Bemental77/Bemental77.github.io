@@ -48,14 +48,29 @@ void Init()
   // listener dispatch → ConsoleListener::Log is never called → no Patching /
   // OSREPORT / symbols-loaded messages reach the page console.
   auto* mgr = Common::Log::LogManager::GetInstance();
-  mgr->SetEnable(Common::Log::LogType::BOOT,         true);
-  mgr->SetEnable(Common::Log::LogType::CORE,         true);
-  mgr->SetEnable(Common::Log::LogType::OSHLE,        true);  // short name "HLE"
-  mgr->SetEnable(Common::Log::LogType::OSREPORT,     true);
-  mgr->SetEnable(Common::Log::LogType::OSREPORT_HLE, true);
-  mgr->SetEnable(Common::Log::LogType::SYMBOLS,      true);
-  mgr->SetEnable(Common::Log::LogType::MEMMAP,       true);
-  mgr->SetEnable(Common::Log::LogType::COMMON,       true);
+  mgr->SetEnable(Common::Log::LogType::BOOT,               true);
+  mgr->SetEnable(Common::Log::LogType::CORE,               true);
+  mgr->SetEnable(Common::Log::LogType::OSHLE,              true);  // short name "HLE"
+  mgr->SetEnable(Common::Log::LogType::OSREPORT,           true);
+  mgr->SetEnable(Common::Log::LogType::OSREPORT_HLE,       true);
+  mgr->SetEnable(Common::Log::LogType::SYMBOLS,            true);
+  mgr->SetEnable(Common::Log::LogType::MEMMAP,             true);
+  mgr->SetEnable(Common::Log::LogType::COMMON,             true);
+  // Channels needed for native-vs-wasm divergence diagnosis around audio/IRQ
+  // boot phase (Logger.ini parity — fresh native log shows DSP_CONTROL halt
+  // bit toggles, AX ucode chosen, Audio DMA configured, DBAT updated 542/543,
+  // PAD - Get Origin between Arena and game-code entry; none of those
+  // surfaced in wasm before because the LogType was disabled at the source).
+  mgr->SetEnable(Common::Log::LogType::DSPHLE,             true);
+  mgr->SetEnable(Common::Log::LogType::DSP_MAIL,           true);
+  mgr->SetEnable(Common::Log::LogType::DSPINTERFACE,       true);
+  mgr->SetEnable(Common::Log::LogType::AUDIO,              true);
+  mgr->SetEnable(Common::Log::LogType::AUDIO_INTERFACE,    true);  // [AI]
+  mgr->SetEnable(Common::Log::LogType::SERIALINTERFACE,    true);  // [SI]
+  mgr->SetEnable(Common::Log::LogType::PROCESSORINTERFACE, true);  // [PI]
+  mgr->SetEnable(Common::Log::LogType::EXPANSIONINTERFACE, true);  // [EXI]
+  mgr->SetEnable(Common::Log::LogType::POWERPC,            true);  // DBAT updated, MMU events
+  mgr->SetEnable(Common::Log::LogType::VIDEOINTERFACE,     true);  // [VI]
 }
 
 void Shutdown()
