@@ -84,6 +84,26 @@ void PPCAnalyzer::SetInstructionStats(CodeBlock* block, CodeOp* code,
         code->regsOut[GekkoOperands::RA(inst)] = true;
     }
 
+    // lmw rT,d(rA): writes r{rT..31}. stmw rS,d(rA): reads r{rS..31}.
+    // The opinfo flag set cannot express the range, so we special-case
+    // here so block-level live-in propagation, RegCache::OnBlockEntry, and
+    // EmitPrologueLoads see these registers as touched. Without this, the
+    // SAB SIGetType (0x800eb45c) epilogue's `lmw r27,20(r1)` restores
+    // r27..r31 in PowerPCState via the interp fallback, but successor
+    // blocks see m_gpr_inputs[27..31]=false → RegCache::Bind() fabricates
+    // a u32{0} value → block-exit Flush corrupts the restored memory →
+    // SIGetTypeAsync's trampoline at 0x800eb71c loads r31=0 → blrl→PC=0.
+    {
+        const u32 opcd_lmw = GekkoOperands::OPCD(inst);
+        if (opcd_lmw == 46u) {                       // lmw
+            const u32 rT = GekkoOperands::RD(inst);
+            for (u32 r = rT; r < 32u; ++r) code->regsOut[r] = true;
+        } else if (opcd_lmw == 47u) {                // stmw
+            const u32 rS = GekkoOperands::RS(inst);
+            for (u32 r = rS; r < 32u; ++r) code->regsIn[r] = true;
+        }
+    }
+
     // FPR inputs / outputs.
     code->fregsIn.m_val = 0;
     if (opinfo->flags & FL_IN_FLOAT_A) {

@@ -42,8 +42,12 @@ public:
     // Layout the per-block WASM-local assignment from the analyzer's output.
     // `wasm_local_base` is the index of the first WASM local reserved for
     // GPR caching (the emitter allocates LOCAL_TMP_*, then the GPR locals
-    // start at wasm_local_base).
-    void OnBlockEntry(const CodeBlock& block, u32 wasm_local_base);
+    // start at wasm_local_base). `ctx_ptr` is the PowerPCState base address,
+    // stamped into m_lazy_ctx_ptr for use by Bind()'s lazy-load fallback
+    // (when the analyzer's live-in set is incomplete — e.g. for opcodes
+    // whose opinfo flags can't express full register usage like lmw/stmw).
+    void OnBlockEntry(const CodeBlock& block, u32 wasm_local_base,
+                      u32 ctx_ptr);
 
     // Prologue: emit `local.set` from PowerPCState loads for every preg in
     // block.m_gpr_inputs (live-in set). After this, the WASM locals hold
@@ -125,6 +129,12 @@ private:
     PregState m_state[32]{};
     u32 m_local_base = 0;
     u32 m_if_depth   = 0;
+    // Stamped once per block by OnBlockEntry. Used by Bind()'s lazy-load
+    // fallback when the analyzer's live-in set is incomplete for a preg
+    // (e.g. analyzer-blind opcodes like lmw/stmw whose opinfo flags can't
+    // express full register usage). 0 is a sentinel — emitting a load
+    // against ctx_ptr=0 would produce a wasm OOB trap.
+    u32 m_lazy_ctx_ptr = 0;
 };
 
 }  // namespace bemental::powerpc

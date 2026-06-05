@@ -44,9 +44,11 @@ RegCache::RegCache(WasmModuleBuilder& wb)
 // from CodeBlock::m_gpr_inputs (computed by PPCAnalyzer). Writes-only GPRs
 // also get a local (defined+used within the block).
 // ---------------------------------------------------------------------------
-void RegCache::OnBlockEntry(const CodeBlock& block, u32 wasm_local_base) {
-    m_local_base = wasm_local_base;
-    m_if_depth   = 0;
+void RegCache::OnBlockEntry(const CodeBlock& block, u32 wasm_local_base,
+                            u32 ctx_ptr) {
+    m_local_base   = wasm_local_base;
+    m_if_depth     = 0;
+    m_lazy_ctx_ptr = ctx_ptr;
     for (u32 i = 0; i < 32; ++i) {
         m_state[i] = PregState{};
         m_state[i].local_idx = wasm_local_base + i;
@@ -78,13 +80,24 @@ void RegCache::EmitPrologueLoads(u32 ctx_ptr) {
 RCWasmLocal RegCache::Bind(u32 preg, RCMode mode) {
     PregState& s = m_state[preg];
     if (!s.assigned) {
+        // Analyzer didn't mark preg as live-in. Previously: silently
+        // fabricated u32{0} as the value (s.loaded=true with no load).
+        // That was the SIGetType lmw r28-r31 corruption root: epilogue
+        // restored regs via interp fallback; successor block Bind(r31, *)
+        // here marked dirty without loading, block-exit Flush wrote 0
+        // over the restored memory. Now: lazy-load from PowerPCState for
+        // any mode that reads. Pure Write skips the load (the local will
+        // be defined by the emit before any read).
         s.local_idx = m_local_base + preg;
         s.assigned  = true;
-        s.loaded    = true;  // Read-mode use of a non-live-in preg is an
-                              // analyzer fail-safe — we mark loaded but
-                              // emit no prologue load (the caller has to
-                              // store before reading; the local's u32{0}
-                              // default value is fine).
+        if (mode != RCMode::Write) {
+            // m_lazy_ctx_ptr stamped by OnBlockEntry; 0 = mis-wiring,
+            // would emit OOB load (wasm trap) which surfaces the bug.
+            m_wb.op_i32_const((s32)m_lazy_ctx_ptr);
+            m_wb.op_i32_load(ppc_gpr_off(preg));
+            m_wb.op_local_set(s.local_idx);
+        }
+        s.loaded = true;
     }
     if (mode == RCMode::Write || mode == RCMode::ReadWrite) {
         s.dirty  = true;

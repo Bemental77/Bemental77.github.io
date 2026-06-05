@@ -360,7 +360,7 @@ std::vector<u8> build_block_next(u32 start_pc,
     // RegCache: assign per-PPC-GPR WASM locals + emit prologue loads
     // for live-in registers.
     RegCache rc(b);
-    rc.OnBlockEntry(block, /*wasm_local_base=*/2u);
+    rc.OnBlockEntry(block, /*wasm_local_base=*/2u, ctx_ptr);
     rc.EmitPrologueLoads(ctx_ptr);
 
     LoadStoreParams params;
