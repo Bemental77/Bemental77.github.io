@@ -159,6 +159,7 @@
   const ROM_ROOT = '/gamecube/roms/';
   function chunkRange(base, lastLetter) { var urls = []; for (var i = 'a'.charCodeAt(0); i <= lastLetter.charCodeAt(0); i++) { urls.push(ROM_ROOT + base + '.bin.parta' + String.fromCharCode(i)); } return urls; }
   const ROMS = [
+    { label: 'Mario Party 4', base: 'MarioParty4', chunks: chunkRange('MarioParty4', 'f') },
     { label: 'Sonic Adventure 2 Battle', base: 'SonicAdventure2Battle', chunks: chunkRange('SonicAdventure2Battle', 'q') },
     { label: 'Phantasy Star Online Episode I & II Plus', base: 'PhantasyStarOnline1And2Plus', chunks: chunkRange('PhantasyStarOnline1And2Plus', 'q') },
     { label: '240pSuite (homebrew)', base: '240pSuite-1.10b', chunks: [ROM_ROOT + '240pSuite-1.10b.dol'], ext: '.dol' }

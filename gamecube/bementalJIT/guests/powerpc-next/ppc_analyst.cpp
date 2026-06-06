@@ -11,6 +11,7 @@
 
 #include "ppc_analyst.h"
 
+#include <bitset>
 #include <cstddef>
 
 #include "bementalJIT/types.h"
@@ -156,21 +157,50 @@ void PPCAnalyzer::SetInstructionStats(CodeBlock* block, CodeOp* code,
 
 bool PPCAnalyzer::IsBusyWaitLoop(CodeBlock* block, CodeOp* code,
                                  std::size_t instructions) const {
-    // Phase 1 minimal heuristic: a tight loop is one whose terminating
-    // branch jumps back to the block start AND every intervening op is
-    // side-effect-free (no FL_LOADSTORE / FL_SET_MSR / FL_SET_FPRF / etc.).
-    // Phase 4 will port Dolphin's full IsBusyWaitLoop with mtspr/lwz
-    // tolerance for ARAM polling.
+    // Canonical Dolphin Jit64 port (Source/Core/Core/PowerPC/PPCAnalyst.cpp:737):
+    //   * Loops to itself, no other branches.
+    //   * No stores (memory writes break idle-spin assumption).
+    //   * Reads only from registers either written earlier in the loop, or
+    //     never written in the loop. If a register is read BEFORE being
+    //     written in the loop, it's "externally driven" — and later writes
+    //     to it would break the externally-driven assumption.
+    //
+    // The previous heuristic (Phase 1 minimal) rejected ALL FL_LOADSTORE ops.
+    // That excluded the canonical OS idle pattern `lwz; cmp; beq self` —
+    // which is exactly what MP4/SAB SelectThread+0x138 (poll RunQueueBits)
+    // and __OSReschedule loops look like. Without idle-skip, SelectThread
+    // dispatched 358 wasm blocks per CoreTiming slice instead of 1 — losing
+    // ~358× throughput. Fix: port the upstream Load-aware dataflow check.
     if (instructions == 0) return false;
-    CodeOp* last = &code[instructions - 1];
-    if (last->branchTo != block->m_address) return false;
-    for (std::size_t i = 0; i + 1 < instructions; ++i) {
+    std::bitset<32> write_disallowed_regs;
+    std::bitset<32> written_regs;
+    // bementalJIT's caller passes m_num_instructions (count), not the branch
+    // index (upstream's convention). The branch is at index instructions-1.
+    for (std::size_t i = 0; i < instructions; ++i) {
         if (!code[i].opinfo) return false;
-        const u64 flags = code[i].opinfo->flags;
-        if (flags & (FL_LOADSTORE | FL_SET_MSR | FL_SET_FPRF | FL_USE_FPU))
+        const OpType type = code[i].opinfo->type;
+        if (type == OpType::Branch) {
+            if (code[i].branchUsesCtr) return false;
+            if (code[i].branchTo == block->m_address && i + 1 == instructions)
+                return true;
+        } else if (type != OpType::Integer && type != OpType::Load) {
+            // Reject Store, SystemFP, DataCache, etc. Only Integer + Load
+            // (and the terminating Branch) are allowed in a busy-wait.
             return false;
+        } else {
+            for (int reg : code[i].regsIn) {
+                if (reg < 0) continue;
+                if (written_regs[reg]) continue;
+                write_disallowed_regs[reg] = true;
+            }
+            for (int reg : code[i].regsOut) {
+                if (reg < 0) continue;
+                if (write_disallowed_regs[reg]) return false;
+                written_regs[reg] = true;
+            }
+        }
     }
-    return true;
+    return false;
 }
 
 u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
