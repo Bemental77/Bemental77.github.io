@@ -214,7 +214,16 @@ void DVDThread::StartReadInternal(bool copy_to_ram, u32 output_address, u64 dvd_
   request.time_started_ticks = core_timing.GetTicks();
   request.realtime_started_us = Common::Timer::NowUs();
 
+#ifdef __EMSCRIPTEN__
+  // Under emscripten/pthreads the DVD worker thread does not consistently
+  // service pushed requests (WorkQueueThreadSP relies on std::thread + Event
+  // wait semantics that PROXY_TO_PTHREAD doesn't drive here), so FinishRead's
+  // WaitForData would deadlock the CPU thread. Process the request inline so
+  // the result queue already has data by the time m_finish_read fires.
+  ProcessReadRequest(std::move(request));
+#else
   m_dvd_thread.Push(std::move(request));
+#endif
   core_timing.ScheduleEvent(ticks_until_completion, m_finish_read, id);
 }
 
