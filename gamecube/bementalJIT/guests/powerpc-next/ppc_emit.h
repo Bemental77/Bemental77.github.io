@@ -69,6 +69,21 @@ std::vector<u8> build_block_next(u32 start_pc,
                                  u32* out_cycles = nullptr,
                                  bool* out_is_idle_loop = nullptr);
 
+// Compile-time HLE-hook query. Set by the host integrator (JitWasm) to
+// HLE::GetHookByAddress != 0. When set, build_block_next skips the per-op
+// rc.Flush + emit_hle_prologue + rc.ReloadAll wrapper for PCs that have NO
+// registered hook — the overwhelming majority. This is the bementalJIT
+// equivalent of Jit64's compile-time HandleFunctionHooking (Jit.cpp:1065)
+// and closes the per-op host-call overhead the structural audit identified
+// as the dominant ~18x per-PPC-op bookkeeping blowup. Default null = current
+// conservative behavior (every op gets the prologue).
+//
+// Caller MUST evict any cached blocks containing newly-hooked PCs after
+// installing patches (existing pattern at EmscriptenWorker.cpp:357 evicts
+// per HLE::Patch call).
+using HleHookQueryFn = bool(*)(u32 pc);
+extern HleHookQueryFn g_hle_hook_query;
+
 // ---------------------------------------------------------------------------
 // _next region/block-body entry points.
 //

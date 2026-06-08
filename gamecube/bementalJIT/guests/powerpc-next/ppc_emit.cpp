@@ -392,6 +392,10 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // The JS-side import-binding code keys on the import names, not indices,
 // so the rebuild can safely use the same shim runtime.
 // ---------------------------------------------------------------------------
+// Default null — current conservative behavior (every op gets HLE prologue).
+// Set by host integrator (JitWasm) to HLE::GetHookByAddress wrapper.
+HleHookQueryFn g_hle_hook_query = nullptr;
+
 std::vector<u8> build_block_next(u32 start_pc,
                                  const u32* insts, u32 count,
                                  u32 ctx_ptr,
@@ -518,21 +522,28 @@ std::vector<u8> build_block_next(u32 start_pc,
         const CodeOp& op = buffer[i];
         const bool is_terminator = (i + 1 == n_ops);
 
-        // Per-op HLE check (was: emit_hle_prologue at block-start only).
-        // emit_hle_prologue emits the if/return early-exit shape; if the
-        // host's hle_check returns 0 (not hooked), the wasm falls through
-        // to the dispatch_op below. Cost = one i32_const + one host call
-        // per op when not hooked; the trade-off is correctness for wild
-        // mid-function branches.
-        rc.Flush(ctx_ptr);
-        emit_hle_prologue(b, ctx_ptr, op.address);
-        // Pass-2 audit (w6oeq0l6e RANK 3): HLE Start hooks (OSReport,
-        // DBPrintf, generic-skip) read & mutate ppc_state.gpr[3..5]
-        // (HLE_OS.cpp). On the fall-through path (Start hook ran, returned
-        // 0), the block continues with stale regcache locals — same class
-        // as the emit_mfspr/mtspr/mftb fix at commit 87e55db. Reload all
-        // GPRs from PowerPCState so post-hook gpr writes are visible.
-        rc.ReloadAll(ctx_ptr);
+        // Per-op HLE check, GATED on compile-time host query (structural
+        // audit 2026-06-08, wp7gh3uoi — finding #1, ~18x per-op blowup).
+        // If no hook is registered at op.address, emit ZERO wasm ops here —
+        // mirrors Jit64's HandleFunctionHooking shape (Jit.cpp:1065). When
+        // g_hle_hook_query is null (default), preserve the old conservative
+        // every-op-prologue behavior. Caller must evict cached blocks when
+        // installing hooks at PCs already compiled (existing pattern at
+        // EmscriptenWorker.cpp:357).
+        const bool may_have_hook =
+            (g_hle_hook_query == nullptr) || g_hle_hook_query(op.address);
+        if (may_have_hook) {
+            rc.Flush(ctx_ptr);
+            emit_hle_prologue(b, ctx_ptr, op.address);
+            // Pass-2 audit (w6oeq0l6e RANK 3): HLE Start hooks (OSReport,
+            // DBPrintf, generic-skip) read & mutate ppc_state.gpr[3..5]
+            // (HLE_OS.cpp). On the fall-through path (Start hook ran,
+            // returned 0), the block continues with stale regcache locals
+            // — same class as the emit_mfspr/mtspr/mftb fix at commit
+            // 87e55db. Reload all GPRs from PowerPCState so post-hook gpr
+            // writes are visible.
+            rc.ReloadAll(ctx_ptr);
+        }
 
         // Pre-op set_pc — mirrors live gekko_emit.cpp:4023+. Native
         // emitters don't write ppc_state.pc; without this pre-set, a later

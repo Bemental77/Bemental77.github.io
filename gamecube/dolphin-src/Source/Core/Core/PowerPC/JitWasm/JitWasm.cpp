@@ -35,6 +35,7 @@
 #include "Common/CommonTypes.h"
 #include "Core/CoreTiming.h"
 #include "Core/DSPEmulator.h"
+#include "Core/HLE/HLE.h"
 #include "Core/HW/CPU.h"
 #include "Core/HW/DSP.h"
 #include "Core/HW/Memmap.h"
@@ -77,6 +78,14 @@ inline bool IsBlockTerminator(u32 inst)
 void JitWasm::Init()
 {
   CachedInterpreter::Init();
+  // Wire compile-time HLE-hook query into bementalJIT so build_block_next
+  // skips per-op rc.Flush + emit_hle_prologue + rc.ReloadAll for un-hooked
+  // PCs (overwhelming majority). Per structural audit wp7gh3uoi finding #1:
+  // ~18x per-op bookkeeping blowup eliminated. Mirrors Jit64's compile-time
+  // HandleFunctionHooking at Jit.cpp:1065.
+  bemental::powerpc::g_hle_hook_query = [](u32 pc) -> bool {
+    return HLE::GetHookByAddress(pc) != 0;
+  };
 }
 
 void JitWasm::Shutdown()
