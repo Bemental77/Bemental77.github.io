@@ -383,6 +383,17 @@ void DSPManager::UpdateInterrupts()
 
 void DSPManager::GlobalGenerateDSPInterrupt(Core::System& system, u64 DSPIntType, s64 cyclesLate)
 {
+  {
+    // Rate-limited: every 16th call. AID events fire continuously while
+    // audio DMA is enabled — we want to see if they're firing at all.
+    static u32 s_ei_trace_aid_count = 0;
+    if ((s_ei_trace_aid_count++ & 0xF) == 0)
+    {
+      NOTICE_LOG_FMT(AUDIO_INTERFACE,
+                     "[ei-trace] AID event fired n={} DSPIntType={:#x}",
+                     s_ei_trace_aid_count, DSPIntType);
+    }
+  }
   system.GetDSP().GenerateDSPInterrupt(DSPIntType, cyclesLate);
 }
 
@@ -426,9 +437,6 @@ void DSPManager::UpdateAudioDMA()
   static short zero_samples[8 * 2] = {0};
   if (m_audio_dma.AudioDMAControl.Enable)
   {
-    // Read audio at g_audioDMA.current_source_address in RAM and push onto an
-    // external audio fifo in the emulator, to be mixed with the disc
-    // streaming output.
     auto& memory = m_system.GetMemory();
     void* address = memory.GetPointerForRange(m_audio_dma.current_source_address, 32);
     AudioCommon::SendAIBuffer(m_system, static_cast<short*>(address), 8);

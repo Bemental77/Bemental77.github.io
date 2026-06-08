@@ -105,4 +105,18 @@ struct GekkoOperands {
 
 constexpr u32 BRANCH_FOLLOWING_THRESHOLD = 2;
 
+// IsBlockTerminator — single source of truth for "does this Gekko instruction
+// end a basic block?". Used by both PPCAnalyzer::Analyze (per-op canEndBlock
+// derivation lives in SetInstructionStats via opinfo->flags & FL_ENDBLOCK,
+// this helper is the equivalent for callers that only have a u32 inst word
+// and don't materialize a CodeOp) and JitWasm::TryCompileBlock (decode-loop
+// terminator check). Routes through lookup_op_info()'s flag table so that
+// adding/removing FL_ENDBLOCK on an op in ppc_tables.cpp automatically
+// updates BOTH the analyst and the JIT block decoder — no drift.
+//
+// Matches Dolphin Jit64's InstructionCanEndBlock (PPCAnalyst.cpp:218-223),
+// minus the mtspr/MMCR0/MMCR1 special-case (bementalJIT's table entry for
+// mtspr does not carry FL_ENDBLOCK, so the special-case is moot here).
+bool IsBlockTerminator(u32 inst);
+
 }  // namespace bemental::powerpc

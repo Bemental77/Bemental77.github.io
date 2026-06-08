@@ -51,12 +51,17 @@ page.on('requestfailed', req => log(`[reqfailed] ${req.url()} - ${req.failure()?
 log(`[driver] goto`);
 await page.goto(URL, { waitUntil: 'networkidle2', timeout: 30000 }).catch(e => log(`[goto-fail] ${e.message}`));
 
-// COI service worker requires a reload to take effect.
-log(`[driver] reload to activate coi-serviceworker`);
-await page.reload({ waitUntil: 'networkidle2', timeout: 30000 }).catch(e => log(`[reload-fail] ${e.message}`));
-
-const coi = await page.evaluate(() => typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated).catch(() => false);
-log(`[driver] crossOriginIsolated=${coi}`);
+// COI service worker installs on first load and triggers its own reload to
+// activate. Poll for crossOriginIsolated=true with extra reloads to defeat
+// the race between the SW's auto-reload and our manual reload.
+let coi = false;
+for (let attempt = 0; attempt < 6 && !coi; attempt++) {
+  log(`[driver] reload attempt ${attempt + 1} to activate coi-serviceworker`);
+  await page.reload({ waitUntil: 'networkidle2', timeout: 30000 }).catch(e => log(`[reload-fail] ${e.message}`));
+  await new Promise(r => setTimeout(r, 1500));
+  coi = await page.evaluate(() => typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated).catch(() => false);
+  log(`[driver] post-reload-${attempt + 1} crossOriginIsolated=${coi}`);
+}
 
 // Select the ROM by index (defaults to 0; override via ROM_IDX env var).
 const ROM_IDX = process.env.ROM_IDX || '0';

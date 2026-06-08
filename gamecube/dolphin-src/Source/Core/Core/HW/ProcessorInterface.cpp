@@ -149,6 +149,17 @@ void ProcessorInterfaceManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
 void ProcessorInterfaceManager::UpdateException()
 {
   auto& ppc_state = m_system.GetPPCState();
+  {
+    // Rate-limited: log every 64th call so mask updates are visible.
+    static u32 s_ei_trace_update_count = 0;
+    if ((s_ei_trace_update_count++ & 0x3F) == 0)
+    {
+      NOTICE_LOG_FMT(AUDIO_INTERFACE,
+                     "[ei-trace] PI::UpdateException n={} cause={:#x} mask={:#x} EI={}",
+                     s_ei_trace_update_count, m_interrupt_cause, m_interrupt_mask,
+                     ((m_interrupt_cause & m_interrupt_mask) != 0));
+    }
+  }
   if ((m_interrupt_cause & m_interrupt_mask) != 0)
     ppc_state.Exceptions |= EXCEPTION_EXTERNAL_INT;
   else
@@ -199,6 +210,34 @@ static const char* Debug_GetInterruptName(u32 cause_mask)
 void ProcessorInterfaceManager::SetInterrupt(u32 cause_mask, bool set)
 {
   DEBUG_ASSERT_MSG(POWERPC, Core::IsCPUThread(), "SetInterrupt from wrong thread");
+
+  if ((cause_mask & INT_CAUSE_DSP) != 0)
+  {
+    // Always log set=true (rare and decisive); rate-limit set=false to
+    // every 64th call to avoid flooding.
+    static u32 s_ei_trace_setint_dsp_true_count = 0;
+    static u32 s_ei_trace_setint_dsp_false_count = 0;
+    if (set)
+    {
+      ++s_ei_trace_setint_dsp_true_count;
+      NOTICE_LOG_FMT(AUDIO_INTERFACE,
+                     "[ei-trace] PI::SetInterrupt SET cause={:#x} n_true={} n_false={} new_cause={:#x}",
+                     cause_mask, s_ei_trace_setint_dsp_true_count,
+                     s_ei_trace_setint_dsp_false_count,
+                     (m_interrupt_cause | cause_mask));
+    }
+    else
+    {
+      ++s_ei_trace_setint_dsp_false_count;
+      if ((s_ei_trace_setint_dsp_false_count & 0x3F) == 1)
+      {
+        NOTICE_LOG_FMT(AUDIO_INTERFACE,
+                       "[ei-trace] PI::SetInterrupt CLR cause={:#x} n_false={} new_cause={:#x}",
+                       cause_mask, s_ei_trace_setint_dsp_false_count,
+                       (m_interrupt_cause & ~cause_mask));
+      }
+    }
+  }
 
   if (set && !(m_interrupt_cause & cause_mask))
   {

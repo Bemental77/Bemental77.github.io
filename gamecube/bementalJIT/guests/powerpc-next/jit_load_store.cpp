@@ -79,21 +79,53 @@ static void emit_ea_x_form(WasmModuleBuilder& wb, RegCache& rc, u32 ra, u32 rb) 
 
 // ---------------------------------------------------------------------------
 // emit_fastmem_guard — push i32 (1 = fastmem hit, 0 = miss) onto stack.
+//
+// `access_bytes` is the size of the upcoming load/store (1/2/4) so the
+// bound check accounts for accesses that straddle the MEM1 tail. Without
+// this, a 4-byte access at EA = ram_size - 1 passes the guard but reads
+// bytes through ram_size + 2 → wasm linear-memory OOB trap when the host
+// heap hasn't grown past mem1_base + ram_size + (width-1). Pass-6 audit
+// 2026-06-06 (workflow a8a87199a5f5ac928): root cause of the OOB trap
+// observed shortly after `Audio DMA configured` — a JIT block hit the
+// MEM1 tail during the audio ISR's context save path with width>1.
 // ---------------------------------------------------------------------------
-static void emit_fastmem_guard(WasmModuleBuilder& wb, LoadStoreParams params) {
+static void emit_fastmem_guard(WasmModuleBuilder& wb, LoadStoreParams params,
+                               u32 access_bytes) {
     // (EA & 0x1F000000) == 0  — top bits zero (filters out MMIO @ 0xCC* etc.)
     wb.op_local_get(LOCAL_TMP_EA);
     wb.op_i32_const(0x1F000000);
     wb.op_i32_and();
     wb.op_i32_eqz();
-    // (EA & mem1_mask) < ram_size
+    // (EA & mem1_mask) <= ram_size - access_bytes — the masked EA plus the
+    // access width must fit within ram_size. Use lt_u with bound = ram_size
+    // - (access_bytes - 1) which is the smallest EA that would write past
+    // the end. For 4-byte access, bound = ram_size - 3.
     wb.op_local_get(LOCAL_TMP_EA);
     wb.op_i32_const((s32)params.mem1_mask);
     wb.op_i32_and();
-    wb.op_i32_const((s32)params.ram_size);
+    wb.op_i32_const((s32)(params.ram_size - (access_bytes - 1)));
     wb.op_i32_lt_u();
     // AND
     wb.op_i32_and();
+}
+
+static u32 load_width_bytes(LoadWidth w) {
+    switch (w) {
+    case LoadWidth::U8:  return 1;
+    case LoadWidth::U16: return 2;
+    case LoadWidth::S16: return 2;
+    case LoadWidth::U32: return 4;
+    }
+    return 4;
+}
+
+static u32 store_width_bytes(StoreWidth w) {
+    switch (w) {
+    case StoreWidth::U8:  return 1;
+    case StoreWidth::U16: return 2;
+    case StoreWidth::U32: return 4;
+    }
+    return 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +284,7 @@ static void emit_load_common(WasmModuleBuilder& wb, RegCache& rc,
     // L2GlobalInvalidate's epilogue `lwz r31, 12(r1)` zeroed memory's
     // gpr(31) slot mid-load, surfacing as __init_hardware's mtlr r31; blr
     // returning to PC=0 (caller-saved r31 = 0 after function return).
-    emit_fastmem_guard(wb, params);
+    emit_fastmem_guard(wb, params, load_width_bytes(width));
     rc.Flush(params.ctx_ptr);  // stack-neutral — guard stays on top
 
     // Bind RT now (post-flush). Marks rt dirty so its end-of-block flush
@@ -292,7 +324,7 @@ static void emit_store_common(WasmModuleBuilder& wb, RegCache& rc,
     auto rc_rs = rc.Bind(rs, RCMode::Read);
     const u32 rs_local = rc_rs.local_idx();
 
-    emit_fastmem_guard(wb, params);
+    emit_fastmem_guard(wb, params, store_width_bytes(width));
     rc.Flush(params.ctx_ptr);
     wb.op_if(BLOCK_TYPE_VOID);
 
@@ -572,6 +604,204 @@ void emit_stfsx(WasmModuleBuilder& wb, RegCache& rc,
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
     rc.ReloadAll(params.ctx_ptr);
+}
+
+// lfd  FRD, d(rA)  — load f64 (8 bytes BE) from EA, store at ps0(FRD).
+// lfdu FRD, d(rA)  — same + rA <- EA (update form, opc 51).
+// Slowmem-only path (no fastmem): two WIMPORT_READ32 calls (each host
+// byte-swaps its u32), combined into i64 with high u32 in upper bits and
+// low u32 in lower bits, then f64_reinterpret_i64 + f64_store directly to
+// the PowerPCState mirror. No FPR cache.
+//
+// Per mp4_wedge_is_throughput_2026_06_07: every gcsetjmp/gclongjmp pays
+// 18 of these via interp fallback (~18×WIMPORT_INTERP roundtrips). Native
+// emit is the documented throughput fix path. Per FP audit researcher
+// 2026-06-08: structurally mirrors emit_lfsx but for 8 bytes.
+void emit_lfd(WasmModuleBuilder& wb, RegCache& rc,
+              LoadStoreParams params, const CodeOp& op, bool update) {
+    const u32 inst = op.inst;
+    const u32 rt   = GekkoOperands::RD(inst);
+    const u32 ra   = GekkoOperands::RA(inst);
+    const u32 simm = GekkoOperands::SIMM_16(inst);
+
+    emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
+
+    rc.Flush(params.ctx_ptr);
+
+    // Push ctx_ptr now for the eventual f64.store at ps0(rt).
+    wb.op_i32_const((s32)params.ctx_ptr);
+
+    // high u32 = read32(EA) <<i64 32
+    wb.op_local_get(LOCAL_TMP_EA);
+    wb.op_call(WIMPORT_READ32);
+    wb.op_i64_extend_i32_u();
+    wb.op_i64_const(32);
+    wb.op_i64_shl();
+
+    // low u32 = read32(EA + 4)
+    wb.op_local_get(LOCAL_TMP_EA);
+    wb.op_i32_const(4);
+    wb.op_i32_add();
+    wb.op_call(WIMPORT_READ32);
+    wb.op_i64_extend_i32_u();
+
+    wb.op_i64_or();
+    wb.op_f64_reinterpret_i64();
+    wb.op_f64_store(ppc_off::ps0(rt));
+
+    if (update && ra != 0) {
+        auto rc_ra = rc.Bind(ra, RCMode::Write);
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_local_set(rc_ra.local_idx());
+    }
+}
+
+// stfd  FRS, d(rA) — store f64 from ps0(FRS) at EA (8 bytes BE).
+// stfdu FRS, d(rA) — same + rA <- EA (update form, opc 55).
+//
+// Avoids i64 scratch by reading the two u32 halves directly from the host
+// f64 storage. Host stores f64 little-endian at ps0(rs): u32 at offset +0
+// holds the f64 value's low 32 bits (which numerically equals the
+// big-endian guest's BYTES 4..7 read as a u32); u32 at offset +4 holds
+// the high 32 bits (= guest BYTES 0..3 as a u32). WIMPORT_WRITE32 byte-
+// swaps host LE u32 → guest BE bytes, so:
+//   write32(EA,     host_u32(ps0+4)) → EA..EA+3 = guest BYTES 0..3
+//   write32(EA + 4, host_u32(ps0+0)) → EA+4..EA+7 = guest BYTES 4..7
+void emit_stfd(WasmModuleBuilder& wb, RegCache& rc,
+               LoadStoreParams params, const CodeOp& op, bool update) {
+    const u32 inst = op.inst;
+    const u32 rs   = GekkoOperands::RS(inst);
+    const u32 ra   = GekkoOperands::RA(inst);
+    const u32 simm = GekkoOperands::SIMM_16(inst);
+
+    emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
+
+    rc.Flush(params.ctx_ptr);
+
+    // write32(EA, host_u32(ctx + ps0(rs) + 4))  — guest BYTES 0..3.
+    wb.op_local_get(LOCAL_TMP_EA);
+    wb.op_i32_const((s32)params.ctx_ptr);
+    wb.op_i32_load(ppc_off::ps0(rs) + 4);
+    wb.op_call(WIMPORT_WRITE32);
+
+    // write32(EA + 4, host_u32(ctx + ps0(rs) + 0))  — guest BYTES 4..7.
+    wb.op_local_get(LOCAL_TMP_EA);
+    wb.op_i32_const(4);
+    wb.op_i32_add();
+    wb.op_i32_const((s32)params.ctx_ptr);
+    wb.op_i32_load(ppc_off::ps0(rs) + 0);
+    wb.op_call(WIMPORT_WRITE32);
+
+    if (update && ra != 0) {
+        auto rc_ra = rc.Bind(ra, RCMode::Write);
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_local_set(rc_ra.local_idx());
+    }
+}
+
+// lfs  FRD, d(rA) — load f32 at EA, naive f32->f64 promote, store at
+// ps0(FRD) + splat to ps1(FRD). Mirrors emit_lfsx (jit_load_store.cpp:546).
+// Naive promote vs PEM ConvertToDouble — same approximation as existing
+// emit_lfsx; tightening is a separate pass across lfs/lfsu/lfsx/lfsux.
+void emit_lfs(WasmModuleBuilder& wb, RegCache& rc,
+              LoadStoreParams params, const CodeOp& op, bool update) {
+    const u32 inst = op.inst;
+    const u32 rt   = GekkoOperands::RD(inst);
+    const u32 ra   = GekkoOperands::RA(inst);
+    const u32 simm = GekkoOperands::SIMM_16(inst);
+
+    emit_ea_d_form(wb, rc, ra, simm);
+    rc.Flush(params.ctx_ptr);
+
+    wb.op_i32_const((s32)params.ctx_ptr);
+    wb.op_local_get(LOCAL_TMP_EA);
+    wb.op_call(WIMPORT_READ32);
+    wb.op_f32_reinterpret_i32();
+    wb.op_f64_promote_f32();
+    wb.op_f64_store(ppc_off::ps0(rt));
+
+    // Splat to ps1(rt) — paired-singles ops that read ps1 see fresh value.
+    wb.op_i32_const((s32)params.ctx_ptr);
+    wb.op_i32_const((s32)params.ctx_ptr);
+    wb.op_f64_load(ppc_off::ps0(rt));
+    wb.op_f64_store(ppc_off::ps1(rt));
+
+    if (update && ra != 0) {
+        auto rc_ra = rc.Bind(ra, RCMode::Write);
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_local_set(rc_ra.local_idx());
+    }
+}
+
+// lmw rD, d(rA) — load (32 - rD) words sequentially. Per Jit64
+// Jit_LoadStore.cpp:644-667. Direct PowerPCState writes + ReloadAll to
+// keep the regcache coherent with the loaded slots (avoids the 2026-05-31
+// OSCacheInit r28-r31 class regression — see ppc_emit.cpp:54-58).
+void emit_lmw(WasmModuleBuilder& wb, RegCache& rc,
+              LoadStoreParams params, const CodeOp& op) {
+    const u32 inst = op.inst;
+    const u32 rd   = GekkoOperands::RD(inst);
+    const u32 ra   = GekkoOperands::RA(inst);
+    const u32 simm = GekkoOperands::SIMM_16(inst);
+
+    rc.Flush(params.ctx_ptr);
+
+    if (ra == 0) {
+        wb.op_i32_const((s32)simm);
+    } else {
+        wb.op_i32_const((s32)params.ctx_ptr);
+        wb.op_i32_load(ppc_off::gpr(ra));
+        wb.op_i32_const((s32)simm);
+        wb.op_i32_add();
+    }
+    wb.op_local_set(LOCAL_TMP_EA);
+
+    for (u32 i = rd; i <= 31; ++i) {
+        wb.op_i32_const((s32)params.ctx_ptr);
+        wb.op_local_get(LOCAL_TMP_EA);
+        if (i != rd) {
+            wb.op_i32_const((s32)((i - rd) * 4u));
+            wb.op_i32_add();
+        }
+        wb.op_call(WIMPORT_READ32);
+        wb.op_i32_store(ppc_off::gpr(i));
+    }
+
+    rc.ReloadAll(params.ctx_ptr);
+}
+
+// stmw rS, d(rA) — store (32 - rS) words sequentially. Per Jit64
+// Jit_LoadStore.cpp:669-697. No ReloadAll needed since stmw doesn't write
+// gpr[]; cache stays coherent.
+void emit_stmw(WasmModuleBuilder& wb, RegCache& rc,
+               LoadStoreParams params, const CodeOp& op) {
+    const u32 inst = op.inst;
+    const u32 rs   = GekkoOperands::RS(inst);
+    const u32 ra   = GekkoOperands::RA(inst);
+    const u32 simm = GekkoOperands::SIMM_16(inst);
+
+    rc.Flush(params.ctx_ptr);
+
+    if (ra == 0) {
+        wb.op_i32_const((s32)simm);
+    } else {
+        wb.op_i32_const((s32)params.ctx_ptr);
+        wb.op_i32_load(ppc_off::gpr(ra));
+        wb.op_i32_const((s32)simm);
+        wb.op_i32_add();
+    }
+    wb.op_local_set(LOCAL_TMP_EA);
+
+    for (u32 i = rs; i <= 31; ++i) {
+        wb.op_local_get(LOCAL_TMP_EA);
+        if (i != rs) {
+            wb.op_i32_const((s32)((i - rs) * 4u));
+            wb.op_i32_add();
+        }
+        wb.op_i32_const((s32)params.ctx_ptr);
+        wb.op_i32_load(ppc_off::gpr(i));
+        wb.op_call(WIMPORT_WRITE32);
+    }
 }
 
 // stfiwx fS, rA, rB — write low 32 bits of ps0(rs) f64 as a word.

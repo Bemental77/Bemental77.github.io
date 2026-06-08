@@ -80,4 +80,22 @@ void emit_stfsx (WasmModuleBuilder& wb, RegCache& rc,
 void emit_stfiwx(WasmModuleBuilder& wb, RegCache& rc,
                  LoadStoreParams params, const CodeOp& op);
 
+// ----- FP D-form (immediate offset) double load / store.
+// lfd (opc 50), lfdu (opc 51), stfd (opc 54), stfdu (opc 55). Slowmem-only.
+void emit_lfd (WasmModuleBuilder& wb, RegCache& rc,
+               LoadStoreParams params, const CodeOp& op, bool update);
+void emit_stfd(WasmModuleBuilder& wb, RegCache& rc,
+               LoadStoreParams params, const CodeOp& op, bool update);
+
+// ----- D-form load/store-multiple (opc 46/47). Per Jit64 Jit_LoadStore.cpp.
+void emit_lmw (WasmModuleBuilder& wb, RegCache& rc,
+               LoadStoreParams params, const CodeOp& op);
+void emit_stmw(WasmModuleBuilder& wb, RegCache& rc,
+               LoadStoreParams params, const CodeOp& op);
+
+// ----- FP D-form (immediate offset) single load (opc 48 lfs, 49 lfsu).
+// stfs/stfsu (52/53) deferred — need PEM ConvertToSingle inline bit-twiddle.
+void emit_lfs (WasmModuleBuilder& wb, RegCache& rc,
+               LoadStoreParams params, const CodeOp& op, bool update);
+
 }  // namespace bemental::powerpc

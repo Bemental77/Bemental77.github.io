@@ -49,10 +49,25 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 //
 // Arguments mirror live build_block enough that integration is mostly
 // a re-bind on the caller side.
+// out_cycles (optional): receives the analyzer's summed opinfo->num_cycles
+// for the decoded block. Used by JitWasm::Run to drain downcount accurately
+// per Jit64's js.downcountAmount semantics (Jit.cpp:1003,587,715). Without
+// this, blocks dominated by div/mul/lmw/dcb* drain downcount too slowly
+// and CoreTiming events fire late (pass-2 audit w6oeq0l6e RANK 12).
+//
+// out_is_idle_loop (optional): true iff the analyst classified the block's
+// terminator as a busy-wait loop (branchIsIdleLoop, e.g. mftb-poll). The
+// JitWasm dispatcher uses this to force downcount=0 only on idle blocks —
+// without this gate, CTR-counted cache-flush loops (DCFlushRange et al)
+// get force-zeroed every iteration → 6.65M Advance-bound iterations
+// observed in pass-7 (workflow a449a929c58f3908c). branchIsIdleLoop is
+// set by IsBusyWaitLoop at ppc_analyst.cpp:414-415.
 std::vector<u8> build_block_next(u32 start_pc,
                                  const u32* insts, u32 count,
                                  u32 ctx_ptr,
-                                 u32 mem1_base, u32 mem1_mask, u32 ram_size);
+                                 u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                                 u32* out_cycles = nullptr,
+                                 bool* out_is_idle_loop = nullptr);
 
 // ---------------------------------------------------------------------------
 // _next region/block-body entry points.

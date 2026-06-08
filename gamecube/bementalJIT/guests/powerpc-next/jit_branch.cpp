@@ -340,17 +340,19 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
             wb.op_i32_const(0);
             wb.op_i32_ne();
             break;
-          case 1:  // GT = NOT LT AND NOT EQ
+          case 1:  // GT: (s64)cr_val > 0 ⇔ bit 63 clear. Per
+                   // ConditionRegister.h:27-39 the u64 always has bit 32 set
+                   // (PPCToInternal:50 `cr_val = 0x100000000`), so (s64)>0 is
+                   // equivalent to (hi32 & 0x80000000) == 0. Matches Jit64
+                   // Jit_SystemRegisters.cpp:177-179 (CMP 64 + CC_G).
+                   // Pass-2 audit (w6oeq0l6e RANK 10): prior !LT&&!EQ
+                   // diverged when SO is set alone (post-mtcrf PPC value 0x1,
+                   // post-mcrxr).
             wb.op_i32_const((s32)ctx_ptr);
             wb.op_i32_load(ppc_off::cr(field_idx) + 4u);
-            wb.op_i32_const(0x40000000);
+            wb.op_i32_const((s32)0x80000000u);
             wb.op_i32_and();
             wb.op_i32_eqz();
-            wb.op_i32_const((s32)ctx_ptr);
-            wb.op_i32_load(ppc_off::cr(field_idx));
-            wb.op_i32_const(0);
-            wb.op_i32_ne();
-            wb.op_i32_and();
             break;
           case 2:  // EQ
             wb.op_i32_const((s32)ctx_ptr);

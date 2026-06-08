@@ -17,8 +17,46 @@
 #include "bementalJIT/types.h"
 #include "code_op.h"
 #include "common/op_info.h"
+#include "ppc_offsets.h"  // SPR_MMCR0 / SPR_MMCR1 for mtspr terminator filter
 
 namespace bemental::powerpc {
+
+// IsMtspr / GetSPRIndex — mirror Dolphin's PPCAnalyst.cpp:207-216 helpers.
+// SPR field bit layout: SPRU = inst[16:20], SPRL = inst[11:15], real_spr =
+// (SPRU<<5) | SPRL. Bit-identical to jit_system_registers.cpp:34's
+// decode_spr_num; kept local so ppc_analyst.cpp stays free of system-
+// register internals.
+static inline bool IsMtspr(u32 inst) {
+    return GekkoOperands::OPCD(inst) == 31 && GekkoOperands::SUBOP10(inst) == 467;
+}
+static inline u32 GetSPRIndex(u32 inst) {
+    const u32 sprl = (inst >> 11) & 0x1F;
+    const u32 spru = (inst >> 16) & 0x1F;
+    return (spru << 5) | sprl;
+}
+
+// IsBlockTerminator — table-driven block-terminator predicate. The lookup
+// is keyed on the raw u32 instruction; pc is unused by lookup_op_info for
+// classification (it's only consulted for HLE patch resolution, which the
+// flag table is not part of), so we pass 0. An unknown encoding (lookup
+// returns nullptr) is treated as a terminator — matches the analyst's
+// conservative "Unknown / invalid encoding. End block conservatively."
+// path in PPCAnalyzer::Analyze.
+//
+// mtspr-specific filter (per dolphin-src PPCAnalyst.cpp:218-223): mtspr is
+// FL_ENDBLOCK in the table to drive cr_in/cr_out flags identically with
+// Jit64, but only ACTUALLY terminates a block when target SPR is MMCR0 or
+// MMCR1 — those reconfigure the perf-monitor and can change downcount
+// accounting. Writes to other SPRs (LR, CTR, SPRG*, GQR*, etc.) are pure
+// register updates and must NOT terminate.
+bool IsBlockTerminator(u32 inst) {
+    const GekkoOPInfo* opinfo = lookup_op_info(inst, /*pc=*/0u);
+    if (!opinfo) return true;  // unknown encoding — end block conservatively.
+    if ((opinfo->flags & FL_ENDBLOCK) == 0) return false;
+    if (!IsMtspr(inst)) return true;
+    const u32 spr = GetSPRIndex(inst);
+    return spr == ppc_off::SPR_MMCR0 || spr == ppc_off::SPR_MMCR1;
+}
 
 // EvaluateBranchTarget — return the absolute target PC for any branch
 // instruction at `pc`, or INVALID_BRANCH_TARGET if not a branch. The host

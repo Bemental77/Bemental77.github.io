@@ -71,6 +71,7 @@ void Init()
   mgr->SetEnable(Common::Log::LogType::EXPANSIONINTERFACE, true);  // [EXI]
   mgr->SetEnable(Common::Log::LogType::POWERPC,            true);  // DBAT updated, MMU events
   mgr->SetEnable(Common::Log::LogType::VIDEOINTERFACE,     true);  // [VI]
+  mgr->SetEnable(Common::Log::LogType::PIXELENGINE,        true);  // [PE] — ax-pe trace
   mgr->SetEnable(Common::Log::LogType::DVDINTERFACE,       true);  // [DVD]
   mgr->SetEnable(Common::Log::LogType::FILEMON,            true);  // file access
   mgr->SetEnable(Common::Log::LogType::DISCIO,             true);  // disc IO

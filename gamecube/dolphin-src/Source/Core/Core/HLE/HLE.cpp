@@ -26,7 +26,7 @@ namespace HLE
 static std::map<u32, u32> s_hooked_addresses;
 
 // clang-format off
-constexpr std::array<Hook, 25> os_patches{{
+constexpr std::array<Hook, 26> os_patches{{
     // Placeholder, os_patches[0] is the "non-existent function" index
     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
 
@@ -68,7 +68,11 @@ constexpr std::array<Hook, 25> os_patches{{
     // Replace-mode + Fixed so they install at known addresses (no symbol
     // DB match required) and survive HLE::Reload's PatchFunctions sweep.
     {"PPCMfhid2",                    HLE_Misc::HLE_PPCMfhid2,               HookType::Replace, HookFlag::Fixed},
-    {"strncpy",                      HLE_Misc::HLE_Strncpy,                 HookType::Replace, HookFlag::Fixed}
+    {"strncpy",                      HLE_Misc::HLE_Strncpy,                 HookType::Replace, HookFlag::Fixed},
+    // pass-5 SAB instrumentation — Start-hook on the interrupt-mask-decoder
+    // at 0x800e7e9c. Throttled trace prints r3/r4/LR each call to pin
+    // which cntlzw value is hanging the polling loop at 0x800e81c4.
+    {"TraceDispatcher",              HLE_Misc::HLE_TraceDispatcher,         HookType::Start,   HookFlag::Fixed}
 }};
 // clang-format on
 

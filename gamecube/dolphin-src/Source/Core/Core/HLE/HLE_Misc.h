@@ -24,4 +24,9 @@ void GeckoReturnTrampoline(const Core::CPUThreadGuard& guard);
 //   - strncpy: dst, src, n → host strncpy; replaces the SDK's loop.
 void HLE_PPCMfhid2(const Core::CPUThreadGuard& guard);
 void HLE_Strncpy(const Core::CPUThreadGuard& guard);
+// HLE_TraceDispatcher — Start-hook for the interrupt-mask-decoder at
+// 0x800e7e9c (cntlzw r3 switch). Logs r3 (caller's pending-interrupt
+// bitmap) + r4 (sub-status) on entry. Used to identify which cntlzw
+// value triggers the SAB-on-WASM dispatcher spin (pass-5 diagnosis).
+void HLE_TraceDispatcher(const Core::CPUThreadGuard& guard);
 }  // namespace HLE_Misc

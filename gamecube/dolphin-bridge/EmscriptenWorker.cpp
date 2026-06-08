@@ -332,7 +332,20 @@ void run_iter_batch(int n) {
             HLE::Patch(system, 0x800e5bf0u, "OSReport");
             HLE::Patch(system, 0x800ecfa4u, "___blank");
             HLE::Patch(system, 0x800fe3c0u, "___blank");
-            // Evict any pre-existing m_wasm_cache entries at all 7 PCs.
+            // pass-5 instrumentation — Start-hook on interrupt-mask-decoder
+            // at 0x800e7e9c. Hook logs r3/r4/LR; spin diagnostic.
+            HLE::Patch(system, 0x800e7e9cu, "TraceDispatcher");
+            // MP4 (GMPE01_01) GXWaitDrawDone unblock: libretro init never
+            // calls VideoBackend::Initialize (Core.cpp:488-489 libretro
+            // init_video lambda returns true without it), so CommandProcessor
+            // / Fifo / PixelEngine never Init, CPReadWriteDistance stays 0,
+            // RunGpuOnCpu's gate never passes, BPWritten never reached, no
+            // BPMEM_SETDRAWDONE -> PixelEngine::SetFinish, PE_FINISH never
+            // fires, GXWaitDrawDone (GXMisc.c:116-127) sleeps on FinishQueue
+            // forever. HLE-skip lets main thread proceed; renders nothing
+            // but unblocks boot past Start New OVL 1.
+            HLE::Patch(system, 0x800CA840u, "FAKE_TO_SKIP_0");
+            // Evict any pre-existing m_wasm_cache entries at all PCs.
             dolphin_evict_block(0x800e34a4u);
             dolphin_evict_block(0x800e34acu);
             dolphin_evict_block(0x800e34e0u);
@@ -340,8 +353,10 @@ void run_iter_batch(int n) {
             dolphin_evict_block(0x800e5bf0u);
             dolphin_evict_block(0x800ecfa4u);
             dolphin_evict_block(0x800fe3c0u);
+            dolphin_evict_block(0x800e7e9cu);
+            dolphin_evict_block(0x800CA840u);
             MAIN_THREAD_EM_ASM({
-                postMessage({cmd: 'print', txt: '[worker] installed all 7 SAB HLE patches per native dolphin.log + evicted m_wasm_cache'});
+                postMessage({cmd: 'print', txt: '[worker] installed all 7 SAB HLE patches + dispatcher trace + evicted m_wasm_cache'});
             });
         }
         if (!g_loaded) break;

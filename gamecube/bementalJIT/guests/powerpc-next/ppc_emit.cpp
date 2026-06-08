@@ -23,7 +23,9 @@
 #include "jit_branch.h"
 #include "jit_compare.h"
 #include "jit_integer.h"
+#include "jit_floating_point.h"
 #include "jit_load_store.h"
+#include "jit_paired.h"
 #include "jit_system_registers.h"
 #include "ppc_analyst.h"
 #include "ppc_offsets.h"
@@ -41,7 +43,9 @@
 
 namespace bemental::powerpc {
 
-static constexpr u32 WIMPORT_INTERP = 6;
+static constexpr u32 WIMPORT_INTERP    = 6;
+static constexpr u32 WIMPORT_CHECK_EXC = 7;
+static constexpr u8  BLOCK_TYPE_VOID   = 0x40;
 
 // Emit a fallback call to WIMPORT_INTERP for an op without a native
 // emitter. Flushes regcache (dirty wasm locals → PowerPCState memory) so
@@ -52,12 +56,45 @@ static constexpr u32 WIMPORT_INTERP = 6;
 // local values — observed 2026-05-31 as r28-r31 corruption in
 // __OSCacheInit's lmw-restore sequence, which zeroed r31 in
 // __init_hardware's saved-LR slot and made blr return to PC=0.
+//
+// Pass-2 audit (w6oeq0l6e RANK 6): for ops that can raise a precise
+// exception (canCauseException — FP-unavailable / FP exceptions / div),
+// invoke CHECK_EXC after the interp call. CheckExceptionsFromJIT
+// transitions PC to the vector if an exception was delivered. We detect
+// this by comparing PC to op.address+4 (the normal fallthrough); if it
+// differs, exit the block so the dispatcher routes through the new PC.
+// Without this, a falling-back op that raised an exception left PC at
+// the vector but subsequent ops in the same block kept running with
+// stale ppc_state.
 static void emit_fallback(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                           u32 ctx_ptr) {
     rc.Flush(ctx_ptr);
     wb.op_i32_const((s32)op.inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
+
+    if (op.canCauseException) {
+        wb.op_i32_const((s32)op.address);
+        wb.op_call(WIMPORT_CHECK_EXC);
+        wb.op_drop();  // CHECK_EXC reserved i32 return
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i32_load(ppc_off::PC);
+        wb.op_i32_const((s32)(op.address + 4u));
+        wb.op_i32_ne();
+        wb.op_if(BLOCK_TYPE_VOID);
+            // Pass-3 audit: must drain GPU gather-pipe before early-exit
+            // (FIX 9's normal-epilogue drain is bypassed by op_return). A
+            // fallback stw to 0xCC008000 (FL_LOADSTORE → canCauseException)
+            // followed by DSI would otherwise leave the FIFO undrained.
+            wb.op_i32_const(0);
+            wb.op_i32_const(0);
+            wb.op_call(WIMPORT_GATHER_DRAIN);
+            wb.op_i32_const((s32)ctx_ptr);
+            wb.op_i32_load(ppc_off::PC);
+            wb.op_return();
+        wb.op_end();
+    }
+
     rc.ReloadAll(ctx_ptr);
 }
 
@@ -93,6 +130,13 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     case 41: emit_load_d (wb, rc, params, op, LoadWidth::U16, true);  return true;
     case 42: emit_load_d (wb, rc, params, op, LoadWidth::S16, false); return true;
     case 43: emit_load_d (wb, rc, params, op, LoadWidth::S16, true);  return true;
+
+    // ---- D-form load-multiple / store-multiple (opc 46/47) ----
+    // Native emit per mp4_wedge_is_throughput_2026_06_07: every
+    // gcsetjmp/gclongjmp pays one lmw + one stmw (RD=13, 19 words each)
+    // via interp fallback on every protothread context switch.
+    case 46: emit_lmw    (wb, rc, params, op);                          return true;
+    case 47: emit_stmw   (wb, rc, params, op);                          return true;
 
     // ---- D-form stores ----
     case 36: emit_store_d(wb, rc, params, op, StoreWidth::U32, false); return true;
@@ -151,7 +195,7 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
         case 954:           emit_extsbx(wb, rc, op, params.ctx_ptr);       return true;
         case 922:           emit_extshx(wb, rc, op, params.ctx_ptr);       return true;
         case 26:            emit_cntlzwx(wb, rc, op, params.ctx_ptr);      return true;
-        case 104:           emit_negx  (wb, rc, op, params.ctx_ptr);       return true;
+        case 104: case 616: emit_negx  (wb, rc, op, params.ctx_ptr);       return true;
         case 138: case 650: emit_addex (wb, rc, op, params.ctx_ptr);       return true;
         case 136: case 648: emit_subfex(wb, rc, op, params.ctx_ptr);       return true;
         case 234: case 746: emit_addmex(wb, rc, op, params.ctx_ptr);       return true;
@@ -237,15 +281,83 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     //   4     = paired-singles subtable (handled by analyzer/table4)
     //   59    = single-precision FP arith subtable
     //   63    = double-precision FP + system-FP subtable
-    case 4:
-    case 48: case 49: case 50: case 51:
-    case 52: case 53: case 54: case 55:
+    case 4: {
+        // Opcode-4 trivial paired-singles ops — native emit. Per FP audit
+        // researcher 2026-06-08 + mp4_wedge_is_throughput_2026_06_07:
+        // dominates MP4 mtx/transform path in steady state.
+        const u32 sub5 = GekkoOperands::SUBOP5(inst);
+        switch (sub10) {
+        case  72: emit_ps_mr      (wb, rc, op, params.ctx_ptr); return true;
+        case  40: emit_ps_neg     (wb, rc, op, params.ctx_ptr); return true;
+        case 264: emit_ps_abs     (wb, rc, op, params.ctx_ptr); return true;
+        case 136: emit_ps_nabs    (wb, rc, op, params.ctx_ptr); return true;
+        case 528: emit_ps_merge00 (wb, rc, op, params.ctx_ptr); return true;
+        case 560: emit_ps_merge01 (wb, rc, op, params.ctx_ptr); return true;
+        case 592: emit_ps_merge10 (wb, rc, op, params.ctx_ptr); return true;
+        case 624: emit_ps_merge11 (wb, rc, op, params.ctx_ptr); return true;
+        default: break;
+        }
+        // ps_sel is the 4-op-form encoded by SUBOP5=23.
+        if (sub5 == 23) { emit_ps_sel(wb, rc, op, params.ctx_ptr); return true; }
+        // Arithmetic paired-singles by SUBOP5. Per FP audit researcher:
+        // 441 ps_* arith lines in MP4 mtx/psmtx code — dominates steady-
+        // state render once boot pushes past the OSContext-heavy window.
+        switch (sub5) {
+        case 10: case 11:                    emit_ps_sum   (wb, rc, op, params.ctx_ptr); return true;
+        case 12: case 13:                    emit_ps_muls  (wb, rc, op, params.ctx_ptr); return true;
+        case 14: case 15:                    emit_ps_madds (wb, rc, op, params.ctx_ptr); return true;
+        case 18: case 20: case 21: case 25:  emit_ps_binary(wb, rc, op, params.ctx_ptr); return true;
+        case 28: case 29: case 30: case 31:  emit_ps_fma   (wb, rc, op, params.ctx_ptr); return true;
+        default: break;
+        }
+        // ps_cmp*/ps_res/ps_rsqrte/psq_*x/dcbz_l — still interp fallback.
+        emit_fallback(wb, rc, op, params.ctx_ptr);
+        return false;
+    }
+    case 52: case 53:   // stfs/stfsu — deferred, needs PEM ConvertToSingle
     case 56: case 57:
     case 59:
     case 60: case 61:
-    case 63:
         emit_fallback(wb, rc, op, params.ctx_ptr);
         return false;
+
+    // Opcode 63 — scalar f64 trivial sign/copy ops (fmr/fneg/fabs/fnabs).
+    // All others (fadd/fsub/fmul/fdiv/fmadd family/fcmpu/o/frsp/fctiw*/
+    // mffs/mtfsf*) still routed to interp pending full op63 port.
+    case 63: {
+        switch (sub10) {
+        case  72: emit_fmrx  (wb, rc, op, params.ctx_ptr); return true;
+        case  40: emit_fnegx (wb, rc, op, params.ctx_ptr); return true;
+        case 264: emit_fabsx (wb, rc, op, params.ctx_ptr); return true;
+        case 136: emit_fnabsx(wb, rc, op, params.ctx_ptr); return true;
+        default: break;
+        }
+        // SUBOP5-keyed arith — 4-operand form (table63 in ppc_tables.cpp
+        // dispatches the arith ops via sub5). Per FP audit: heavy mtx use.
+        const u32 sub5_63 = GekkoOperands::SUBOP5(inst);
+        switch (sub5_63) {
+        case 18: case 20: case 21: case 25:  emit_fp_arith_double(wb, rc, op, params.ctx_ptr); return true;
+        case 28: case 29: case 30: case 31:  emit_fp_fma_double  (wb, rc, op, params.ctx_ptr); return true;
+        default: break;
+        }
+        // fcmpu/fcmpo/frsp/fctiw*/mffs/mtfsf* still routed to interp.
+        emit_fallback(wb, rc, op, params.ctx_ptr);
+        return false;
+    }
+
+    // FP D-form double load/store — native emit (slowmem-only path).
+    // Per mp4_wedge_is_throughput_2026_06_07 + FP audit researcher 2026-06-08:
+    // every gcsetjmp/gclongjmp pays 18 of these via interp fallback.
+    case 50: emit_lfd (wb, rc, params, op, /*update=*/false); return true;
+    case 51: emit_lfd (wb, rc, params, op, /*update=*/true ); return true;
+    case 54: emit_stfd(wb, rc, params, op, /*update=*/false); return true;
+    case 55: emit_stfd(wb, rc, params, op, /*update=*/true ); return true;
+
+    // FP D-form single load (lfs/lfsu) — naive f32->f64 promote (same
+    // approximation as existing emit_lfsx). stfs/stfsu still in fallback
+    // pending PEM ConvertToSingle implementation.
+    case 48: emit_lfs (wb, rc, params, op, /*update=*/false); return true;
+    case 49: emit_lfs (wb, rc, params, op, /*update=*/true ); return true;
 
     default: break;
     }
@@ -259,7 +371,7 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 //
 //   1. PPCAnalyzer::Analyze on the supplied instruction stream
 //   2. Emit complete WASM module:
-//        header + type(4) + import(1 memory + 11 funcs) + function(1) +
+//        header + type(4) + import(1 memory + 13 funcs) + function(1) +
 //        export("run") + code section with one function body
 //   3. Function body:
 //        a. Declare 2 i32 scratch locals (LOCAL_TMP_A, LOCAL_TMP_B) +
@@ -273,8 +385,9 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 //           function return.
 //
 // Module shape mirrors live gekko_emit.cpp:4375-4454 byte-for-byte so
-// Phase 7 cut-over is binary-compatible: same 11-import set, same export
-// name and index (= WIMPORT_COUNT), same function type 0 = () -> i32.
+// Phase 7 cut-over is binary-compatible: same 13-import set (11 originals +
+// ppc_msr_updated + ppc_gather_drain), same export name and index
+// (= WIMPORT_COUNT), same function type 0 = () -> i32.
 //
 // The JS-side import-binding code keys on the import names, not indices,
 // so the rebuild can safely use the same shim runtime.
@@ -282,7 +395,9 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 std::vector<u8> build_block_next(u32 start_pc,
                                  const u32* insts, u32 count,
                                  u32 ctx_ptr,
-                                 u32 mem1_base, u32 mem1_mask, u32 ram_size) {
+                                 u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                                 u32* out_cycles,
+                                 bool* out_is_idle_loop) {
     // Wrap raw insts[] in a fetch callback for PPCAnalyzer.
     struct FetchCtx { const u32* insts; u32 base_pc; u32 count; };
     FetchCtx fc{insts, start_pc, count};
@@ -299,6 +414,17 @@ std::vector<u8> build_block_next(u32 start_pc,
     block.m_stats = &stats;
     CodeBuffer buffer;
     pa.Analyze(start_pc, &block, &buffer, count, fetch, &fc);
+
+    if (out_cycles) *out_cycles = stats.numCycles;
+    if (out_is_idle_loop) {
+        // True iff the analyst's IsBusyWaitLoop classified the terminator
+        // as an mftb-style busy-wait. CTR-counted loops (bdnz) and other
+        // non-timing-poll self-loops set this false so the JitWasm
+        // dispatcher's idle-skip ring won't force downcount=0 on them.
+        const bool n_ops_positive = block.m_num_instructions > 0;
+        *out_is_idle_loop = n_ops_positive &&
+            buffer.data()[block.m_num_instructions - 1].branchIsIdleLoop;
+    }
 
     WasmModuleBuilder b;
     b.emitHeader();
@@ -319,7 +445,7 @@ std::vector<u8> build_block_next(u32 start_pc,
     }
     b.endSection();
 
-    // ---- Import section: 1 memory + 11 host functions ----
+    // ---- Import section: 1 memory + WIMPORT_COUNT (= 13) host functions ----
     b.emitImportSection(1u + WIMPORT_COUNT);
     b.emitImportMemory("env", "memory", /*initialPages=*/1u);
     b.emitImportFunc("env", "ppc_read8",       /*type*/1);   // idx 0
@@ -334,6 +460,7 @@ std::vector<u8> build_block_next(u32 start_pc,
     b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);   // idx 9
     b.emitImportFunc("env", "ppc_hle_fire",    /*type*/3);   // idx 10
     b.emitImportFunc("env", "ppc_msr_updated", /*type*/2);   // idx 11
+    b.emitImportFunc("env", "ppc_gather_drain", /*type*/2);  // idx 12
     b.endSection();
 
     // ---- Function section: 1 function of type 0 ----
@@ -399,6 +526,13 @@ std::vector<u8> build_block_next(u32 start_pc,
         // mid-function branches.
         rc.Flush(ctx_ptr);
         emit_hle_prologue(b, ctx_ptr, op.address);
+        // Pass-2 audit (w6oeq0l6e RANK 3): HLE Start hooks (OSReport,
+        // DBPrintf, generic-skip) read & mutate ppc_state.gpr[3..5]
+        // (HLE_OS.cpp). On the fall-through path (Start hook ran, returned
+        // 0), the block continues with stale regcache locals — same class
+        // as the emit_mfspr/mtspr/mftb fix at commit 87e55db. Reload all
+        // GPRs from PowerPCState so post-hook gpr writes are visible.
+        rc.ReloadAll(ctx_ptr);
 
         // Pre-op set_pc — mirrors live gekko_emit.cpp:4023+. Native
         // emitters don't write ppc_state.pc; without this pre-set, a later
@@ -429,8 +563,18 @@ std::vector<u8> build_block_next(u32 start_pc,
         (void)is_terminator;
     }
 
-    // Epilogue: flush dirty GPR locals, then read PC back and return.
-    // The trailing i32 satisfies type 0's i32 result.
+    // Epilogue: drain gather-pipe (so GPU FIFO sees CP_INT/PE_TOKEN/PE_FINISH
+    // after stw-to-0xCC008000 family stores), flush dirty GPR locals, then
+    // read PC back and return. The trailing i32 satisfies type 0's i32 result.
+    //
+    // Pass-2 audit (w6oeq0l6e RANK 9): without this drain, post-boot GPU
+    // FIFO writes accumulate past GATHER_PIPE_SIZE and CP-interrupt-triggered
+    // fences never fire → games wait forever on GP-triggered events. Mirrors
+    // Jit64 Cleanup() (Jit.cpp:454-490).
+    b.op_i32_const(0);
+    b.op_i32_const(0);
+    b.op_call(WIMPORT_GATHER_DRAIN);
+
     rc.Flush(ctx_ptr);
     b.op_i32_const((s32)ctx_ptr);
     b.op_i32_load(ppc_off::PC);

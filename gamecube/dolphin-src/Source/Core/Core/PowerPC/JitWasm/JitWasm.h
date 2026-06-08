@@ -23,6 +23,7 @@
 #ifdef __EMSCRIPTEN__
 
 #include <unordered_map>
+#include <unordered_set>
 
 #include "Common/CommonTypes.h"
 #include "Core/PowerPC/CachedInterpreter/CachedInterpreter.h"
@@ -73,6 +74,12 @@ private:
   // instruction matches Interpreter::SingleStep accounting). Sparse — only
   // populated for PCs we've compiled.
   std::unordered_map<u32, u32> m_block_inst_counts;
+
+  // Per-block "is_idle_loop" flag, captured at compile time from the
+  // analyst's branchIsIdleLoop classification. Used to gate the idle-skip
+  // ring in Run() — without this, CTR-counted loops (DCFlushRange et al)
+  // get force-zeroed every iteration → Advance-bound spin. Pass-7 fix.
+  std::unordered_set<u32> m_block_is_idle;
 };
 
 #endif  // __EMSCRIPTEN__

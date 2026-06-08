@@ -44,7 +44,8 @@
 #include "Core/System.h"
 
 #include "bementalJIT/types.h"
-#include "ppc_emit.h"  // bementalJIT/guests/powerpc-next/ppc_emit.h (PUBLIC include dir)
+#include "ppc_analyst.h"  // bemental::powerpc::IsBlockTerminator — single source of truth.
+#include "ppc_emit.h"     // bementalJIT/guests/powerpc-next/ppc_emit.h (PUBLIC include dir)
 
 namespace
 {
@@ -53,44 +54,23 @@ namespace
 // fall-through fetch.
 constexpr u32 kMaxBlockInsts = 64;
 
-// Primary-opcode helper — extract bits 0-5 (PowerPC ISA notation: the
-// "primary op" field is in the top 6 bits of a 32-bit instruction).
-inline u32 PrimaryOp(u32 inst)
-{
-  return (inst >> 26) & 0x3Fu;
-}
-
-// True iff the instruction terminates a basic block.
-//   18 = b     (unconditional branch, op_bx)
-//   16 = bc    (conditional branch, op_bcx)
-//   17 = sc    (syscall — raises EXCEPTION_SYSCALL, transfers control)
-//   19 = sub-coded. The extended opcode in bits 21-30 distinguishes:
-//        16  = bclr  (branch-to-LR)        → terminate
-//        50  = rfi   (return-from-interrupt) → terminate
-//        528 = bcctr (branch-to-CTR)       → terminate
-//        150 = isync (pipeline sync)       → NOT a branch, do NOT terminate
-//        129/193/225/257/289/417/449 = crand/crandc/cror/.../crxor
-//                                          → CR ops, do NOT terminate
-//        0   = mcrf  (move CR field)       → NOT a branch, do NOT terminate
+// IsBlockTerminator — forwards to bemental::powerpc::IsBlockTerminator
+// (ppc_analyst.h / ppc_analyst.cpp). One source of truth keyed off the
+// FL_ENDBLOCK flag in ppc_tables.cpp, shared with PPCAnalyzer::Analyze's
+// per-op canEndBlock derivation. Adding/removing FL_ENDBLOCK on a table
+// entry updates BOTH decoder paths in one move — no drift.
 //
-// Pre-2026-05-30 this returned true for ALL primary == 19, which mis-cut
-// blocks at isync — most painfully ICEnable at 0x800e4f5c, whose 5-op
-// body starts with isync and whose mfspr/ori/mtspr/blr never got decoded,
-// so the emitted block returned op.address unchanged and JitWasm self-
-// looped on it indefinitely (wasm2wat capture 2026-05-30 confirmed the
-// block body was just prologue + set_pc + epilogue).
+// Prior to consolidation (2026-06-07) this was a JitWasm.cpp-local
+// hardcoded list (primary 16/17/18 + 19 sub-opcodes 16/50/528), which was
+// a strict subset of the canonical FL_ENDBLOCK set and silently missed any
+// new FL_ENDBLOCK-flagged op (twi, tw, mtsr, mtsrin, mtmsr, tlbie, icbi,
+// etc.). The table-driven path matches Dolphin Jit64's
+// InstructionCanEndBlock (PPCAnalyst.cpp:218-223 upstream), minus the
+// mtspr/MMCR0/MMCR1 special-case (bementalJIT's mtspr table entry lacks
+// FL_ENDBLOCK, so the filter is moot here).
 inline bool IsBlockTerminator(u32 inst)
 {
-  const u32 primary = PrimaryOp(inst);
-  if (primary == 16u || primary == 17u || primary == 18u)
-    return true;
-  if (primary != 19u)
-    return false;
-  // Op 19: only the control-flow extended opcodes terminate a block.
-  const u32 xo = (inst >> 1) & 0x3FFu;
-  return xo == 16u   // bclrx  (branch-to-LR)
-      || xo == 50u   // rfi    (return-from-interrupt)
-      || xo == 528u; // bcctrx (branch-to-CTR)
+  return bemental::powerpc::IsBlockTerminator(inst);
 }
 }  // namespace
 
@@ -165,6 +145,16 @@ void JitWasm::Run()
     // here (VI, AI, DSP, etc.). NOTE: Advance may set Exceptions / change PC.
     core_timing.Advance();
 
+    // Per-slice idle-skip ring. Must be SLICE-LOCAL (not static), or PCs
+    // from a real idle loop in one slice will throttle unrelated blocks
+    // in subsequent slices: any block whose next_pc happens to match a
+    // stale ring entry incorrectly triggers downcount=0, forcing a one-
+    // block-per-slice cadence on unrelated code. Bug found by branch-
+    // emit audit 2026-06-07; was previously declared `static` causing
+    // process-lifetime contamination of the heuristic.
+    u32 last_next[4] = {0, 0, 0, 0};
+    u32 last_idx = 0;
+
     do
     {
       // Pending exceptions: let upstream CheckExceptions transition PC to
@@ -223,8 +213,6 @@ void JitWasm::Run()
         // forcing Advance, TBL never ticks. Track last 4 next_pc values;
         // if `next_pc` matches any → we just closed a ≤4-PC cycle → idle.
         {
-          static u32 last_next[4] = {0, 0, 0, 0};
-          static u32 last_idx = 0;
           const u32 np = static_cast<u32>(next_pc);
           if (np == pc || np == last_next[0] || np == last_next[1] ||
               np == last_next[2] || np == last_next[3])

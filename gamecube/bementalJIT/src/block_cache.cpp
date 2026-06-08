@@ -196,6 +196,14 @@ int compile_raw(const u8* bytes, std::size_t size) {
                         // recomputed (Jit64 parity via EmitUpdateMembase).
                         if (Module._dolphin_msr_updated)
                             e.ppc_msr_updated = Module._dolphin_msr_updated;
+                        // ppc_gather_drain (WIMPORT idx 12) — block epilogue
+                        // calls this to drain the GPU gather-pipe so CP-IRQ
+                        // / PE_TOKEN / PE_FINISH fences fire (Jit64 parity
+                        // via Cleanup + GPFifo::UpdateGatherPipe). Without
+                        // this binding the emitted import resolves to
+                        // undefined and EVERY block compile throws LinkError.
+                        if (Module._dolphin_gather_drain)
+                            e.ppc_gather_drain = Module._dolphin_gather_drain;
                     }
                     const isWasm = (typeof WebAssembly.Function !== 'undefined')
                         ? Module._dolphin_read32 instanceof WebAssembly.Function
@@ -325,9 +333,17 @@ s32 dispatch_raw(int handle) {
             if (Module.bemental_block_traps === undefined) Module.bemental_block_traps = 0;
             Module.bemental_block_traps++;
             if (Module.bemental_block_traps <= 16) {
-                console.error('[bemental] dispatch trap handle=' + $0
+                // Resolve guest PC from handle for fault localization. The
+                // handle_to_pc map is populated by register_pc_handle at
+                // compile time, so the PC here is the block START PC the
+                // wasm "run" was dispatched for — same PC JitWasm.cpp:191
+                // evicts on the INT32_MIN sentinel.
+                const __pc = Module.bemental_handle_to_pc ? (Module.bemental_handle_to_pc[$0] >>> 0) : 0;
+                const __msg = (e && e.message ? e.message : String(e));
+                console.error('[bemental] BLOCK TRAP pc=0x' + __pc.toString(16)
+                    + ' handle=' + $0
                     + ' #' + Module.bemental_block_traps
-                    + ' err=' + (e && e.message ? e.message : String(e)));
+                    + ' msg="' + __msg + '"');
             }
             return -2147483648;  // INT32_MIN sentinel
         }

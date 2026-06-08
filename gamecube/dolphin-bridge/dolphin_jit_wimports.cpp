@@ -1,9 +1,10 @@
 // dolphin_jit_wimports.cpp — bementalJIT WIMPORT callback bridge.
 //
 // JIT-compiled blocks (per gamecube/bementalJIT/guests/powerpc-next/
-// ppc_emit.cpp:316-328) import 11 host functions from the wasm "env":
+// ppc_emit.cpp:354-368) import 13 host functions from the wasm "env":
 //   ppc_read8/16/32, ppc_write8/16/32, ppc_interp, ppc_check_exc,
-//   ppc_break_block, ppc_hle_check, ppc_hle_fire.
+//   ppc_break_block, ppc_hle_check, ppc_hle_fire, ppc_msr_updated,
+//   ppc_gather_drain.
 //
 // The JS-side import bootstrap in gamecube/bementalJIT/src/block_cache.cpp
 // resolves Module._dolphin_<name> to env.<name> at instantiate-time
@@ -29,8 +30,11 @@
 #include <cstdint>
 
 #include "Common/CommonTypes.h"
+#include "Common/Logging/Log.h"
 #include "Core/HLE/HLE.h"
+#include "Core/HW/GPFifo.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HW/ProcessorInterface.h"
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/MMU.h"
@@ -77,6 +81,22 @@ void dolphin_write8(uint32_t addr, uint32_t val) {
 
 EMSCRIPTEN_KEEPALIVE
 void dolphin_write16(uint32_t addr, uint32_t val) {
+    // [ax-vi-w] Trace VI MMIO 16-bit writes (0xCC002000..0xCC0020FF). VI
+    // registers are 16-bit per Source/Core/Core/HW/VideoInterface.cpp.
+    // Diagnostic for "VI vblank IRQ never fires" — check whether MP4 ever
+    // programs the VI Interrupt Registers (0xCC002030..0xCC002037).
+    {
+        const uint32_t phys = addr & 0x0FFFFFFF;
+        if (phys >= 0x0C002000 && phys <= 0x0C0020FF) {
+            static uint32_t s_viw_n = 0;
+            if (s_viw_n < 80) {
+                ++s_viw_n;
+                NOTICE_LOG_FMT(VIDEOINTERFACE,
+                               "[ax-vi-w] VI MMIO write16 n={} addr={:#x} val={:#x}",
+                               s_viw_n, addr, val & 0xFFFF);
+            }
+        }
+    }
     Core::System::GetInstance().GetMMU().Write<u16>(static_cast<u16>(val), addr);
 }
 
@@ -103,18 +123,61 @@ void dolphin_write32(uint32_t addr, uint32_t val) {
 // garbage → Program-TRAP at PHYS 0x20 → __DBExceptionDestinationAux
 // → PPCHalt at 0x800e34d0.
 //
-// Fix: defer EI delivery until MEM[0xC0] != 0. Other exception types
-// (DSI, Program, Decrementer, FP-unavailable, etc.) are delivered
-// unconditionally because their handlers don't depend on the
-// OSCurrentContext pointer being installed (they go through fixed
-// low-memory scratch slots).
-//
-// Documented as "the PROPER fix" in jit_system_registers.cpp:219-231.
+// Pass-7 (2026-06-06): attempted full removal regressed boot (didn't
+// reach DSP halt 0954→0950). Gate is load-bearing for our path even if
+// not present in upstream. Restored.
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_check_exc(uint32_t /*unused*/) {
     auto& sys = Core::System::GetInstance();
     auto& ps = sys.GetPPCState();
     auto& ppc = sys.GetPowerPC();
+
+    // [ax-queue] Snapshot RunQueueBits (0x1D4350) + retraceQueue (0x1D4430) +
+    // retraceCount (0x1D4428 — the value VIWaitForRetrace's do-while watches).
+    // Per ~/gc_refs/dolsdk2001/src/vi/vi.c:432-443, main thread re-sleeps if
+    // retraceCount doesn't advance between OSSleepThread wakes. Log on CHANGE.
+    {
+        static u32 s_prev_run_bits = 0xFFFFFFFFu;
+        static u32 s_prev_q_head = 0xFFFFFFFFu;
+        static u32 s_prev_q_tail = 0xFFFFFFFFu;
+        static u32 s_prev_rcount = 0xFFFFFFFFu;
+        static u32 s_run_log_count = 0;
+        static u32 s_q_log_count = 0;
+        static u32 s_rc_log_count = 0;
+        const u8* ram = sys.GetMemory().GetRAM();
+        if (ram) {
+            u32 run_bits = (u32(ram[0x1D4350]) << 24) | (u32(ram[0x1D4351]) << 16) |
+                           (u32(ram[0x1D4352]) << 8) | u32(ram[0x1D4353]);
+            u32 q_head  = (u32(ram[0x1D4430]) << 24) | (u32(ram[0x1D4431]) << 16) |
+                          (u32(ram[0x1D4432]) << 8) | u32(ram[0x1D4433]);
+            u32 q_tail  = (u32(ram[0x1D4434]) << 24) | (u32(ram[0x1D4435]) << 16) |
+                          (u32(ram[0x1D4436]) << 8) | u32(ram[0x1D4437]);
+            u32 rcount  = (u32(ram[0x1D4428]) << 24) | (u32(ram[0x1D4429]) << 16) |
+                          (u32(ram[0x1D442A]) << 8) | u32(ram[0x1D442B]);
+            if (run_bits != s_prev_run_bits && s_run_log_count < 200) {
+                s_run_log_count++;
+                NOTICE_LOG_FMT(POWERPC,
+                               "[ax-queue] RunQueueBits {:#x} -> {:#x} (n={})",
+                               s_prev_run_bits, run_bits, s_run_log_count);
+                s_prev_run_bits = run_bits;
+            }
+            if ((q_head != s_prev_q_head || q_tail != s_prev_q_tail) && s_q_log_count < 200) {
+                s_q_log_count++;
+                NOTICE_LOG_FMT(POWERPC,
+                               "[ax-queue] retraceQueue head:{:#x}->{:#x} tail:{:#x}->{:#x} (n={})",
+                               s_prev_q_head, q_head, s_prev_q_tail, q_tail, s_q_log_count);
+                s_prev_q_head = q_head;
+                s_prev_q_tail = q_tail;
+            }
+            if (rcount != s_prev_rcount && s_rc_log_count < 400) {
+                s_rc_log_count++;
+                NOTICE_LOG_FMT(POWERPC,
+                               "[ax-rcount] retraceCount {} -> {} (n={})",
+                               s_prev_rcount, rcount, s_rc_log_count);
+                s_prev_rcount = rcount;
+            }
+        }
+    }
 
     if (ps.Exceptions & EXCEPTION_EXTERNAL_INT) {
         // Read MEM[0xC0] directly from host RAM (avoids MMU translation
@@ -138,6 +201,15 @@ uint32_t dolphin_check_exc(uint32_t /*unused*/) {
             ps.Exceptions &= ~EXCEPTION_EXTERNAL_INT;
             PowerPC::CheckExceptionsFromJIT(ppc);
             ps.Exceptions |= saved;
+            return 0;
+        }
+
+        // Jit64 mtmsr "issue 4336": when the EI is caused by the Command
+        // Processor (GPU FIFO), defer delivery so the next block runs and
+        // feeds the FIFO rather than dispatching the EI vector. Matches
+        // Jit_SystemRegisters.cpp:462-465.
+        const u32 int_cause = sys.GetProcessorInterface().GetCause();
+        if (int_cause & ProcessorInterface::INT_CAUSE_CP) {
             return 0;
         }
     }
@@ -170,6 +242,15 @@ void dolphin_break_block(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
 // or advancing.
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_hle_check(uint32_t pc) {
+    // Pass-3 audit reverted the FIX 4 entry-only + IsEnabled gates: the
+    // bridge installs HLE patches via HLE::Patch(addr, name) at
+    // EmscriptenWorker.cpp:332-334 without populating PPCSymbolDB, so
+    // GetHookByFunctionAddress returns 0 for everything. The HookFlag::Debug
+    // gate also silences the manually-installed OSReport/DBPrintf hooks
+    // since IsEnabled is off in JIT mode. Keeping GetHookByAddress until
+    // either (a) the install path is rewritten to use PatchFunctions after
+    // populating the symbol DB from tools/gsne8p.map, or (b) the bridge
+    // marks these patches HookFlag::Fixed at install time.
     const uint32_t hook_index = HLE::GetHookByAddress(pc);
     if (hook_index == 0) return 0;
 
@@ -208,10 +289,15 @@ uint32_t dolphin_hle_fire(uint32_t pc, uint32_t hook_index) {
 // already updated pc — re-stepping the original op would corrupt state.
 EMSCRIPTEN_KEEPALIVE
 void dolphin_interp(uint32_t /*unused*/, uint32_t pc) {
+    // Pass-2 audit (w6oeq0l6e RANK 5): SingleStep() calls CoreTiming.Advance,
+    // sets slice_length=1, forces downcount=0, and calls CheckExceptions —
+    // all of which mutate state mid-block. SingleStepInner is the per-op-only
+    // path that just executes one instruction. Mirrors Interpreter.cpp:263,278
+    // FastRun pattern.
     auto& system = Core::System::GetInstance();
     auto& ppc_state = system.GetPPCState();
     if (ppc_state.pc != pc) return;
-    system.GetInterpreter().SingleStep();
+    system.GetInterpreter().SingleStepInner();
 }
 
 // Recompute feature_flags / membase from the current MSR. Called from
@@ -226,6 +312,24 @@ void dolphin_interp(uint32_t /*unused*/, uint32_t pc) {
 EMSCRIPTEN_KEEPALIVE
 void dolphin_msr_updated(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
     Core::System::GetInstance().GetPowerPC().MSRUpdated();
+}
+
+// Drain GPU gather-pipe at block exit. Mirrors Jit64 Cleanup()
+// (Jit.cpp:454-490) gather-pipe overflow check + GPFifo::UpdateGatherPipe.
+// Type-2 import signature (i32, i32) -> () — both args unused.
+//
+// Pass-2 audit (w6oeq0l6e RANK 9): without this, post-boot GPU FIFO writes
+// (stw to 0xCC008000) accumulate past GATHER_PIPE_SIZE without ever
+// flushing → CP_INT / PE_TOKEN / PE_FINISH never fire → games wait
+// forever on GP-triggered fences.
+EMSCRIPTEN_KEEPALIVE
+void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
+    static u64 s_drain_n = 0;
+    if ((++s_drain_n & 0xFFu) == 1) {
+        NOTICE_LOG_FMT(POWERPC, "[ax-pe] dolphin_gather_drain n={}", s_drain_n);
+    }
+    auto& system = Core::System::GetInstance();
+    GPFifo::UpdateGatherPipe(system.GetGPFifo());
 }
 
 // dolphin_evict_block lives in JitWasm.cpp (which has the bementalJIT

@@ -38,7 +38,7 @@ constexpr GekkoOPInfo PRIMARY[64] = {
     /* 00 */ {"<invalid>", OpType::Invalid,   0, 0},
     /* 01 */ {"<invalid>", OpType::Invalid,   0, 0},
     /* 02 */ {"tdi",       OpType::System,    1, FL_IN_A | FL_PROGRAMEXCEPTION},
-    /* 03 */ {"twi",       OpType::System,    1, FL_IN_A | FL_PROGRAMEXCEPTION},
+    /* 03 */ {"twi",       OpType::System,    1, FL_IN_A | FL_PROGRAMEXCEPTION | FL_ENDBLOCK},
     /* 04 */ {"<table4>",  OpType::Subtable,  0, 0},
     /* 05 */ {"<invalid>", OpType::Invalid,   0, 0},
     /* 06 */ {"<invalid>", OpType::Invalid,   0, 0},
@@ -216,9 +216,9 @@ static const GekkoOPInfo* table31(u32 sub10) {
     static constexpr GekkoOPInfo eqvx   = {"eqvx",   OpType::Integer, 1, FL_OUT_A | FL_IN_SB | FL_RC_BIT};
     static constexpr GekkoOPInfo orcx   = {"orcx",   OpType::Integer, 1, FL_OUT_A | FL_IN_SB | FL_RC_BIT};
     // Segment-register access / TLB ops — privileged, end-block (MMU recompute).
-    static constexpr GekkoOPInfo mtsr   = {"mtsr",   OpType::System,  2, FL_IN_S | FL_ENDBLOCK};
+    static constexpr GekkoOPInfo mtsr   = {"mtsr",   OpType::System,  2, FL_IN_S | FL_PROGRAMEXCEPTION};
     static constexpr GekkoOPInfo mfsr   = {"mfsr",   OpType::System,  1, FL_OUT_D};
-    static constexpr GekkoOPInfo mtsrin = {"mtsrin", OpType::System,  2, FL_IN_SB | FL_ENDBLOCK};
+    static constexpr GekkoOPInfo mtsrin = {"mtsrin", OpType::System,  2, FL_IN_SB | FL_PROGRAMEXCEPTION};
     static constexpr GekkoOPInfo mfsrin = {"mfsrin", OpType::System,  1, FL_OUT_D | FL_IN_B};
     // FP X-form load/store (lfsx 535, stfsx 663, stfiwx 983). ps0
     // dest/source. FL_OUT_FLOAT_D / FL_IN_FLOAT_S.
@@ -227,7 +227,7 @@ static const GekkoOPInfo* table31(u32 sub10) {
     static constexpr GekkoOPInfo stfiwx = {"stfiwx", OpType::StoreFP, 1, FL_IN_FLOAT_S  | FL_IN_A0B | FL_LOADSTORE | FL_USE_FPU};
     // SPR / MSR.
     static constexpr GekkoOPInfo mfspr  = {"mfspr",  OpType::SPR,     1, FL_OUT_D};
-    static constexpr GekkoOPInfo mtspr  = {"mtspr",  OpType::SPR,     2, FL_IN_S};
+    static constexpr GekkoOPInfo mtspr  = {"mtspr",  OpType::SPR,     2, FL_IN_S | FL_PROGRAMEXCEPTION};
     static constexpr GekkoOPInfo mfmsr  = {"mfmsr",  OpType::System,  1, FL_OUT_D};
     static constexpr GekkoOPInfo mtmsr  = {"mtmsr",  OpType::System,  2, FL_IN_S | FL_SET_MSR | FL_ENDBLOCK | FL_CHECKEXCEPTIONS};
     static constexpr GekkoOPInfo mfcr   = {"mfcr",   OpType::System,  1, FL_OUT_D | FL_READ_ALL_CR};
@@ -236,7 +236,7 @@ static const GekkoOPInfo* table31(u32 sub10) {
     // Sync / cache.
     static constexpr GekkoOPInfo nop    = {"nop",    OpType::DataCache, 1, 0};
     static constexpr GekkoOPInfo dcbz   = {"dcbz",   OpType::DataCache, 1, FL_IN_A0B | FL_LOADSTORE};
-    static constexpr GekkoOPInfo tlbie  = {"tlbie",  OpType::System,    1, FL_IN_B | FL_ENDBLOCK};
+    static constexpr GekkoOPInfo tlbie  = {"tlbie",  OpType::System,    1, FL_IN_B | FL_PROGRAMEXCEPTION};
     // X-form loads/stores (integer).
     static constexpr GekkoOPInfo lwzx   = {"lwzx",   OpType::Load,  1, FL_OUT_D | FL_IN_A0B | FL_LOADSTORE};
     static constexpr GekkoOPInfo lwzux  = {"lwzux",  OpType::Load,  1, FL_OUT_AD | FL_IN_AB | FL_LOADSTORE};
@@ -252,6 +252,16 @@ static const GekkoOPInfo* table31(u32 sub10) {
     static constexpr GekkoOPInfo sthux  = {"sthux",  OpType::Store, 1, FL_OUT_A | FL_IN_S | FL_IN_AB | FL_LOADSTORE};
     static constexpr GekkoOPInfo stbx   = {"stbx",   OpType::Store, 1, FL_IN_S | FL_IN_A0B | FL_LOADSTORE};
     static constexpr GekkoOPInfo stbux  = {"stbux",  OpType::Store, 1, FL_OUT_A | FL_IN_S | FL_IN_AB | FL_LOADSTORE};
+    // Byte-reversed X-form load/store. Pass-2 audit (w6oeq0l6e RANK 8): these
+    // were missing entirely → table31() returned nullptr for any byterev op,
+    // marking the block broken at the first lwbrx/lhbrx/stwbrx/sthbrx. Used
+    // by VI/DSP/AI MMIO + any little-endian read path. Dispatch falls back to
+    // emit_fallback (no native byterev emitter); analyzer just needs the
+    // opinfo to keep blocks intact.
+    static constexpr GekkoOPInfo lwbrx  = {"lwbrx",  OpType::Load,  1, FL_OUT_D | FL_IN_A0B | FL_LOADSTORE};
+    static constexpr GekkoOPInfo lhbrx  = {"lhbrx",  OpType::Load,  1, FL_OUT_D | FL_IN_A0B | FL_LOADSTORE};
+    static constexpr GekkoOPInfo stwbrx = {"stwbrx", OpType::Store, 1, FL_IN_S | FL_IN_A0B | FL_LOADSTORE};
+    static constexpr GekkoOPInfo sthbrx = {"sthbrx", OpType::Store, 1, FL_IN_S | FL_IN_A0B | FL_LOADSTORE};
 
     switch (sub10) {
     case 266: return &addx;
@@ -268,9 +278,14 @@ static const GekkoOPInfo* table31(u32 sub10) {
     case 1003: return &divwox;
     case 459: return &divwux;
     case 971: return &divwuox;
-    // negx (xo=104) / negox (xo=360). emit_negx handles OE internally.
+    // negx (xo=104) / negox (xo=616 = 104 | OE_BIT). emit_negx handles OE
+    // internally. Pass-2 audit (w6oeq0l6e RANK 7): previously mapped to 360
+    // — that's an unused encoding; xo=616 falls through to nullptr → analyzer
+    // breaks block + sets m_broken. Confirmed against
+    // ~/gc_refs/dolphin-upstream/Source/Core/Core/PowerPC/PPCTables.cpp:262
+    // and Interpreter_Tables.cpp:174.
     case 104: return &negx;
-    case 360: return &negox;
+    case 616: return &negox;
     // Carry-out arith — OE variants set XER.OV/SO too.
     case 10:  return &addcx;
     case 522: return &addcox;
@@ -339,6 +354,11 @@ static const GekkoOPInfo* table31(u32 sub10) {
     case 439: return &sthux;
     case 215: return &stbx;
     case 247: return &stbux;
+    // Byte-reversed integer X-form load/store.
+    case 534: return &lwbrx;
+    case 662: return &stwbrx;
+    case 790: return &lhbrx;
+    case 918: return &sthbrx;
     // FP X-form load/store.
     case 535: return &lfsx;
     case 663: return &stfsx;

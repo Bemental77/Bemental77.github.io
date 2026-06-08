@@ -243,6 +243,12 @@ void PixelEngineManager::SetToken(const u16 token, const bool interrupt, int cyc
 void PixelEngineManager::SetFinish(int cycles_into_future)
 {
   DEBUG_LOG_FMT(PIXELENGINE, "VIDEO Set Finish");
+  {
+    static u64 s_pe_finish_n = 0;
+    s_pe_finish_n++;
+    NOTICE_LOG_FMT(PIXELENGINE, "[ax-pe] PixelEngine::SetFinish n={} cycles_into_future={}",
+                   s_pe_finish_n, cycles_into_future);
+  }
 
   std::lock_guard lk(m_token_finish_mutex);
 

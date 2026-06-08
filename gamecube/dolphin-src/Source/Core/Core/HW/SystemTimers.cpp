@@ -46,6 +46,7 @@ IPC_HLE_PERIOD: For the Wii Remote this is the call schedule:
 
 #include "AudioCommon/Mixer.h"
 #include "Common/CommonTypes.h"
+#include "Common/Logging/Log.h"
 #include "Common/Timer.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
@@ -120,6 +121,15 @@ void SystemTimersManager::VICallback(Core::System& system, u64 userdata, s64 cyc
 {
   auto& core_timing = system.GetCoreTiming();
   auto& vi = system.GetVideoInterface();
+  {
+    static u64 s_vicb_n = 0;
+    const u64 n = ++s_vicb_n;
+    if (n == 1 || (n % 60) == 0)
+    {
+      NOTICE_LOG_FMT(VIDEOINTERFACE, "[ax-vi-cb] VICallback n={} ticks={} cycles_late={}",
+                     n, core_timing.GetTicks(), cycles_late);
+    }
+  }
   vi.Update(core_timing.GetTicks() - cycles_late);
   core_timing.ScheduleEvent(vi.GetTicksPerHalfLine() - cycles_late,
                             system.GetSystemTimers().m_event_type_vi);

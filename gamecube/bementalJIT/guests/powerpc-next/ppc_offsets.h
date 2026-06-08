@@ -52,6 +52,8 @@ constexpr u32 SPR_TBU_W   = 285;
 constexpr u32 SPR_PVR     = 287;
 constexpr u32 SPR_HID0    = 1008;
 constexpr u32 SPR_HID2    = 920;
+constexpr u32 SPR_MMCR0   = 952;   // perf-monitor control 0
+constexpr u32 SPR_MMCR1   = 956;   // perf-monitor control 1
 
 constexpr u32 lr_off()    { return spr(SPR_LR); }
 constexpr u32 ctr_off()   { return spr(SPR_CTR); }

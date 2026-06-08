@@ -4,6 +4,7 @@
 #include "Core/HLE/HLE_Misc.h"
 
 #include "Common/CommonTypes.h"
+#include "Common/Logging/Log.h"
 #include "Core/Core.h"
 #include "Core/GeckoCode.h"
 #include "Core/HW/CPU.h"
@@ -98,6 +99,23 @@ void HLE_Strncpy(const Core::CPUThreadGuard& guard)
 
   // r3 (return) stays as dst. PC ← LR to skip the SDK loop.
   ppc_state.npc = LR(ppc_state);
+}
+
+// HLE_TraceDispatcher — Start-hook for the interrupt-decoder at 0x800e7e9c.
+// Logs r3 (pending-interrupt mask) + r4 (sub-status) + LR (caller PC).
+// Throttled to one log line every 64 calls to keep the log volume sane;
+// pass-5 audit traced the SAB-on-WASM spin to a polling loop at 0x800e81c4
+// that calls 0x800e7e9c repeatedly until r3 returns 0 — capturing r3 here
+// pins which cntlzw value the switch is failing to handle.
+void HLE_TraceDispatcher(const Core::CPUThreadGuard& guard)
+{
+  static u32 s_count = 0;
+  auto& ppc_state = guard.GetSystem().GetPPCState();
+  if ((s_count++ & 0x3F) == 0)
+  {
+    NOTICE_LOG_FMT(OSREPORT, "[dispatch-trace] n={} r3={:08x} r4={:08x} LR={:08x}",
+                   s_count, ppc_state.gpr[3], ppc_state.gpr[4], LR(ppc_state));
+  }
 }
 
 // Because Dolphin messes around with the CPU state instead of patching the game binary, we
