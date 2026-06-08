@@ -117,14 +117,16 @@ void emit_addic(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_add();
     wb.op_local_set(rc_rt.local_idx());
 
-    // CA = (rt < ra_original) unsigned compare — wrap-around detected.
-    // Store as u8 at PowerPCState +0x2F4 (XER_CA, per the live-tree offset
-    // table in gekko_emit.h ppc_off::XER_CA).
-    wb.op_i32_const((s32)ctx_ptr);
-    wb.op_local_get(rc_rt.local_idx());
-    wb.op_local_get(LOCAL_TMP_SCRATCH);
-    wb.op_i32_lt_u();
-    wb.op_i32_store8(0x2F4);
+    if (!op.ca_discardable) {
+        // CA = (rt < ra_original) unsigned compare — wrap-around detected.
+        // Store as u8 at PowerPCState +0x2F4 (XER_CA, per the live-tree
+        // offset table in gekko_emit.h ppc_off::XER_CA).
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_local_get(rc_rt.local_idx());
+        wb.op_local_get(LOCAL_TMP_SCRATCH);
+        wb.op_i32_lt_u();
+        wb.op_i32_store8(0x2F4);
+    }
 }
 
 // addic.  (OPCD=13) — Add Immediate Carrying and Record.
@@ -628,9 +630,11 @@ void emit_srawix(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
         // rt = rs; CA = 0
         wb.op_local_get(rc_rs.local_idx());
         wb.op_local_set(rc_ra.local_idx());
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_i32_const(0);
-        wb.op_i32_store8(ppc_off::XER_CA);
+        if (!op.ca_discardable) {
+            wb.op_i32_const((s32)ctx_ptr);
+            wb.op_i32_const(0);
+            wb.op_i32_store8(ppc_off::XER_CA);
+        }
         if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
             emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
         }
@@ -643,23 +647,25 @@ void emit_srawix(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_shr_s();
     wb.op_local_set(rc_ra.local_idx());
 
-    // CA = (rs < 0) AND ((rs & ((1<<sh)-1)) != 0)
-    //    = (rs >>_u 31) AND ((rs & mask) != 0)
-    const u32 low_mask = (1u << sh) - 1u;
-    wb.op_i32_const((s32)ctx_ptr);
-    // (rs >>_u 31)
-    wb.op_local_get(rc_rs.local_idx());
-    wb.op_i32_const(31);
-    wb.op_i32_shr_u();
-    // (rs & low_mask) != 0   →  (rs & low_mask) ne 0
-    wb.op_local_get(rc_rs.local_idx());
-    wb.op_i32_const((s32)low_mask);
-    wb.op_i32_and();
-    wb.op_i32_const(0);
-    wb.op_i32_ne();
-    // combine
-    wb.op_i32_and();
-    wb.op_i32_store8(ppc_off::XER_CA);
+    if (!op.ca_discardable) {
+        // CA = (rs < 0) AND ((rs & ((1<<sh)-1)) != 0)
+        //    = (rs >>_u 31) AND ((rs & mask) != 0)
+        const u32 low_mask = (1u << sh) - 1u;
+        wb.op_i32_const((s32)ctx_ptr);
+        // (rs >>_u 31)
+        wb.op_local_get(rc_rs.local_idx());
+        wb.op_i32_const(31);
+        wb.op_i32_shr_u();
+        // (rs & low_mask) != 0
+        wb.op_local_get(rc_rs.local_idx());
+        wb.op_i32_const((s32)low_mask);
+        wb.op_i32_and();
+        wb.op_i32_const(0);
+        wb.op_i32_ne();
+        // combine
+        wb.op_i32_and();
+        wb.op_i32_store8(ppc_off::XER_CA);
+    }
 
     if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
@@ -780,7 +786,8 @@ static constexpr u32 LOCAL_TMP_SCRATCH = 1;  // LOCAL_TMP_B / LOCAL_TMP_VAL
 // chain because they need ~ra which doesn't live in a regcache local.
 static void emit_ca_chain(WasmModuleBuilder& wb, u32 ctx_ptr,
                           u32 operand_a_local, u32 operand_b_local,
-                          u32 dest_local) {
+                          u32 dest_local,
+                          bool ca_discardable = false) {
     // sum1 = a + b → tee TMP_SCRATCH
     wb.op_local_get(operand_a_local);
     wb.op_local_get(operand_b_local);
@@ -793,16 +800,18 @@ static void emit_ca_chain(WasmModuleBuilder& wb, u32 ctx_ptr,
     wb.op_i32_add();
     wb.op_local_set(dest_local);
 
-    // carry1 = (sum1 < a); carry2 = (dest < sum1); new_ca = carry1 | carry2
-    wb.op_i32_const((s32)ctx_ptr);
-    wb.op_local_get(LOCAL_TMP_SCRATCH);
-    wb.op_local_get(operand_a_local);
-    wb.op_i32_lt_u();
-    wb.op_local_get(dest_local);
-    wb.op_local_get(LOCAL_TMP_SCRATCH);
-    wb.op_i32_lt_u();
-    wb.op_i32_or();
-    wb.op_i32_store8(ppc_off::XER_CA);
+    if (!ca_discardable) {
+        // carry1 = (sum1 < a); carry2 = (dest < sum1); new_ca = carry1 | carry2
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_local_get(LOCAL_TMP_SCRATCH);
+        wb.op_local_get(operand_a_local);
+        wb.op_i32_lt_u();
+        wb.op_local_get(dest_local);
+        wb.op_local_get(LOCAL_TMP_SCRATCH);
+        wb.op_i32_lt_u();
+        wb.op_i32_or();
+        wb.op_i32_store8(ppc_off::XER_CA);
+    }
 }
 
 void emit_addex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
@@ -813,7 +822,7 @@ void emit_addex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     auto rc_ra = rc.Bind(GekkoOperands::RA(inst), RCMode::Read);
     auto rc_rb = rc.Bind(GekkoOperands::RB(inst), RCMode::Read);
     emit_ca_chain(wb, ctx_ptr, rc_ra.local_idx(), rc_rb.local_idx(),
-                  rc_rt.local_idx());
+                  rc_rt.local_idx(), op.ca_discardable);
     if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
@@ -842,18 +851,20 @@ void emit_subfex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_load8_u(ppc_off::XER_CA);
     wb.op_i32_add();
     wb.op_local_set(rc_rt.local_idx());
-    // CA_out = (sum1 < ~ra) | (dest < sum1)
-    wb.op_i32_const((s32)ctx_ptr);
-    wb.op_local_get(LOCAL_TMP_SCRATCH);
-    wb.op_local_get(rc_ra.local_idx());
-    wb.op_i32_const(-1);
-    wb.op_i32_xor();
-    wb.op_i32_lt_u();
-    wb.op_local_get(rc_rt.local_idx());
-    wb.op_local_get(LOCAL_TMP_SCRATCH);
-    wb.op_i32_lt_u();
-    wb.op_i32_or();
-    wb.op_i32_store8(ppc_off::XER_CA);
+    if (!op.ca_discardable) {
+        // CA_out = (sum1 < ~ra) | (dest < sum1)
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_local_get(LOCAL_TMP_SCRATCH);
+        wb.op_local_get(rc_ra.local_idx());
+        wb.op_i32_const(-1);
+        wb.op_i32_xor();
+        wb.op_i32_lt_u();
+        wb.op_local_get(rc_rt.local_idx());
+        wb.op_local_get(LOCAL_TMP_SCRATCH);
+        wb.op_i32_lt_u();
+        wb.op_i32_or();
+        wb.op_i32_store8(ppc_off::XER_CA);
+    }
     if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
@@ -869,7 +880,7 @@ void emit_addmex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_const(-1);
     wb.op_local_set(LOCAL_TMP_SCRATCH);
     emit_ca_chain(wb, ctx_ptr, rc_ra.local_idx(), LOCAL_TMP_SCRATCH,
-                  rc_rt.local_idx());
+                  rc_rt.local_idx(), op.ca_discardable);
     if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
