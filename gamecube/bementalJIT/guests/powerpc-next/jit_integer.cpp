@@ -279,7 +279,7 @@ static void emit_binop_x(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_local_get(rc_rb.local_idx());
     (wb.*opfn)();
     wb.op_local_set(rc_rt.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }
@@ -302,7 +302,7 @@ void emit_subfx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_p
     wb.op_local_get(rc_ra.local_idx());
     wb.op_i32_sub();
     wb.op_local_set(rc_rt.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }
@@ -328,7 +328,7 @@ static void emit_boolx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_local_get(rc_rb.local_idx());
     (wb.*opfn)();
     wb.op_local_set(rc_ra.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -360,7 +360,7 @@ void emit_andcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_p
     wb.op_i32_xor();                            // ~RB
     wb.op_i32_and();                            // RS & ~RB
     wb.op_local_set(rc_ra.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -396,7 +396,7 @@ void emit_norx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_pt
     wb.op_i32_const(-1);
     wb.op_i32_xor();
     wb.op_local_set(rc_ra.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -419,7 +419,7 @@ static void emit_sign_ext(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_const((s32)(32 - bit_count));
     wb.op_i32_shr_s();
     wb.op_local_set(rc_ra.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -444,7 +444,7 @@ void emit_cntlzwx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx
     wb.op_local_get(rc_rs.local_idx());
     wb.op_i32_clz();
     wb.op_local_set(rc_ra.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -494,7 +494,7 @@ static void emit_shiftx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     // interrupt-priority decode chain cntlzw(unmasked & *prio) ⇒ wrong index
     // ⇒ no registered handler ⇒ DBExceptionDestination → PPCHalt wedge).
     rc.MarkDirty(GekkoOperands::RA(op.inst));
-    if (GekkoOperands::Rc(op.inst)) {
+    if (GekkoOperands::Rc(op.inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -569,7 +569,7 @@ void emit_rlwinmx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
     wb.op_local_set(rc_ra.local_idx());
 
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -603,7 +603,7 @@ void emit_rlwimix(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_or();
     wb.op_local_set(rc_ra.local_idx());
 
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -631,7 +631,7 @@ void emit_srawix(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
         wb.op_i32_const((s32)ctx_ptr);
         wb.op_i32_const(0);
         wb.op_i32_store8(ppc_off::XER_CA);
-        if (GekkoOperands::Rc(inst)) {
+        if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
             emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
         }
         return;
@@ -661,7 +661,7 @@ void emit_srawix(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_and();
     wb.op_i32_store8(ppc_off::XER_CA);
 
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -735,7 +735,7 @@ void emit_srawx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     // IF path on the OS interrupt-priority decode (srawi r0,..,4 / addze
     // family at SITransferNext, OSDispatchInterrupt cntlzw chain).
     rc.MarkDirty(GekkoOperands::RA(inst));
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -754,7 +754,7 @@ void emit_negx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_pt
     wb.op_local_get(rc_ra.local_idx());
     wb.op_i32_sub();
     wb.op_local_set(rc_rt.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }
@@ -814,7 +814,7 @@ void emit_addex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     auto rc_rb = rc.Bind(GekkoOperands::RB(inst), RCMode::Read);
     emit_ca_chain(wb, ctx_ptr, rc_ra.local_idx(), rc_rb.local_idx(),
                   rc_rt.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }
@@ -854,7 +854,7 @@ void emit_subfex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_lt_u();
     wb.op_i32_or();
     wb.op_i32_store8(ppc_off::XER_CA);
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }
@@ -870,7 +870,7 @@ void emit_addmex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_local_set(LOCAL_TMP_SCRATCH);
     emit_ca_chain(wb, ctx_ptr, rc_ra.local_idx(), LOCAL_TMP_SCRATCH,
                   rc_rt.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }
@@ -923,7 +923,7 @@ void emit_addzex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_local_get(rc_ra.local_idx());
     wb.op_i32_lt_u();
     wb.op_i32_store8(ppc_off::XER_CA);
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }
@@ -955,7 +955,7 @@ void emit_subfzex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_xor();
     wb.op_i32_lt_u();
     wb.op_i32_store8(ppc_off::XER_CA);
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }
@@ -987,7 +987,7 @@ void emit_rlwnmx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
     wb.op_local_set(rc_ra.local_idx());
 
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -1026,7 +1026,7 @@ void emit_addcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_lt_u();
     wb.op_i32_store8(ppc_off::XER_CA);
 
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }
@@ -1058,7 +1058,7 @@ void emit_subfcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_le_u();
     wb.op_i32_store8(ppc_off::XER_CA);
 
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }
@@ -1084,7 +1084,7 @@ void emit_nandx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_const(-1);
     wb.op_i32_xor();
     wb.op_local_set(rc_ra.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -1105,7 +1105,7 @@ void emit_eqvx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_const(-1);
     wb.op_i32_xor();
     wb.op_local_set(rc_ra.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -1126,7 +1126,7 @@ void emit_orcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_xor();    // ~RB
     wb.op_i32_or();     // RS | ~RB
     wb.op_local_set(rc_ra.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
@@ -1156,7 +1156,7 @@ void emit_mulhwx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i64_shr_u();
     wb.op_i32_wrap_i64();
     wb.op_local_set(rc_rt.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }
@@ -1180,7 +1180,7 @@ void emit_mulhwux(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i64_shr_u();
     wb.op_i32_wrap_i64();
     wb.op_local_set(rc_rt.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }
@@ -1246,7 +1246,7 @@ static void emit_div_guarded_next(WasmModuleBuilder& wb, RegCache& rc,
     }
     // Stack: [result]
     wb.op_local_set(rc_rt.local_idx());
-    if (GekkoOperands::Rc(inst)) {
+    if (GekkoOperands::Rc(inst) && !op.crDiscardable[0]) {
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }

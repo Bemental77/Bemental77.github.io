@@ -52,6 +52,7 @@ struct CodeOp {
     // Reachability / discardability (reverse-scan output).
     BitSet8  crInUse;
     BitSet8  crDiscardable;
+    bool     ca_discardable    = false;  // outputCA && CA dead before next reader
     BitSet32 fprInUse;
     BitSet32 gprInUse;
     BitSet32 gprDiscardable;

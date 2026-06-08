@@ -32,12 +32,11 @@ void emit_cmpi(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 crfd = GekkoOperands::CRFD(inst);
+    if (op.crDiscardable[crfd]) return;  // CR field dead — skip the compare
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 simm = GekkoOperands::SIMM_16(inst);
 
     auto rc_ra = rc.Bind(ra, RCMode::Read);
-    // Stash SIMM (sign-extended to i32 by GekkoOperands::SIMM_16) in a
-    // scratch local so the signed-pair helper can read it as a local.
     wb.op_i32_const((s32)simm);
     wb.op_local_set(LOCAL_TMP_IMM);
 
@@ -49,11 +48,11 @@ void emit_cmpli(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                 u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 crfd = GekkoOperands::CRFD(inst);
+    if (op.crDiscardable[crfd]) return;
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 uimm = GekkoOperands::UIMM_16(inst);
 
     auto rc_ra = rc.Bind(ra, RCMode::Read);
-    // Stash UIMM in a scratch local so the unsigned-pair helper can read it.
     wb.op_i32_const((s32)uimm);
     wb.op_local_set(LOCAL_TMP_IMM);
 
@@ -65,6 +64,7 @@ void emit_cmp(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
               u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 crfd = GekkoOperands::CRFD(inst);
+    if (op.crDiscardable[crfd]) return;
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 rb   = GekkoOperands::RB(inst);
 
@@ -79,6 +79,7 @@ void emit_cmpl(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 crfd = GekkoOperands::CRFD(inst);
+    if (op.crDiscardable[crfd]) return;
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 rb   = GekkoOperands::RB(inst);
 

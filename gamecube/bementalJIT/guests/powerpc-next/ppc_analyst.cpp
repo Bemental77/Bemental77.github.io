@@ -461,19 +461,30 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
         }
     }
 
-    // Reverse scan — populate gprInUse / gprDiscardable.
+    // Reverse scan — populate gprInUse / gprDiscardable + crInUse /
+    // crDiscardable + ca_discardable. Per structural audit wp7gh3uoi
+    // cr-xer-fpscr finding #2: dead-CR elision saves ~24 wasm ops per Rc=1
+    // op whose CR0 is overwritten or never branched on before block end.
     BitSet32 live_after;
     BitSet32 fpr_live_after;
+    // CR / CA conservatively live at block end (next block may read them).
+    BitSet8  cr_live_after(0xFF);
+    bool     ca_live_after = true;
     for (std::size_t i = block->m_num_instructions; i-- > 0; ) {
         CodeOp& op = (*buffer)[i];
         op.gprInUse       = live_after;
         op.fprInUse       = fpr_live_after;
         op.gprDiscardable = BitSet32(op.regsOut.m_val & ~live_after.m_val);
         op.fprDiscardable = BitSet32(op.GetFregsOut().m_val & ~fpr_live_after.m_val);
+        op.crInUse        = cr_live_after;
+        op.crDiscardable  = BitSet8(op.crOut.m_val & ~cr_live_after.m_val);
+        op.ca_discardable = op.outputCA && !ca_live_after;
         // Live-after for predecessor = (live_after | reads) & ~writes.
         live_after = BitSet32((live_after.m_val | op.regsIn.m_val) & ~op.regsOut.m_val);
         BitSet32 fregs_out = op.GetFregsOut();
         fpr_live_after = BitSet32((fpr_live_after.m_val | op.fregsIn.m_val) & ~fregs_out.m_val);
+        cr_live_after = BitSet8((cr_live_after.m_val | op.crIn.m_val) & ~op.crOut.m_val);
+        ca_live_after = (ca_live_after && !op.outputCA) || op.wantsCA;
     }
 
     // Idle-loop classification — only valid for a fully-decoded short block
