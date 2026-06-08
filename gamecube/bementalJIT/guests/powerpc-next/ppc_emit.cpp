@@ -518,9 +518,20 @@ std::vector<u8> build_block_next(u32 start_pc,
     // Idle-skip override fires only for the terminator (last op) when the
     // analyzer flagged branchIsIdleLoop.
     const std::size_t n_ops = buffer.size();
+    // Track whether the block contains any store — gates the gather-pipe
+    // drain at block exit (structural audit wp7gh3uoi msr-ee finding #1).
+    // Pure ALU/branch blocks (the overwhelming majority pre-VI_FIELD_BELOW)
+    // skip the unconditional wasm→JS crossing.
+    bool block_has_store = false;
     for (std::size_t i = 0; i < n_ops; ++i) {
         const CodeOp& op = buffer[i];
         const bool is_terminator = (i + 1 == n_ops);
+        if (op.opinfo) {
+            const OpType t = op.opinfo->type;
+            if (t == OpType::Store || t == OpType::StoreFP || t == OpType::StorePS) {
+                block_has_store = true;
+            }
+        }
 
         // Per-op HLE check, GATED on compile-time host query (structural
         // audit 2026-06-08, wp7gh3uoi — finding #1, ~18x per-op blowup).
@@ -582,9 +593,17 @@ std::vector<u8> build_block_next(u32 start_pc,
     // FIFO writes accumulate past GATHER_PIPE_SIZE and CP-interrupt-triggered
     // fences never fire → games wait forever on GP-triggered events. Mirrors
     // Jit64 Cleanup() (Jit.cpp:454-490).
-    b.op_i32_const(0);
-    b.op_i32_const(0);
-    b.op_call(WIMPORT_GATHER_DRAIN);
+    //
+    // Structural audit wp7gh3uoi msr-ee finding #1: gate on whether this
+    // block actually emitted a store. Pure ALU/branch blocks (the bulk of
+    // pre-VI_FIELD_BELOW boot) skip the wasm→JS crossing. Conservative —
+    // any store could route to MMIO (including the gather-pipe range), so
+    // we always drain when stores exist; only fully store-free blocks skip.
+    if (block_has_store) {
+        b.op_i32_const(0);
+        b.op_i32_const(0);
+        b.op_call(WIMPORT_GATHER_DRAIN);
+    }
 
     rc.Flush(ctx_ptr);
     b.op_i32_const((s32)ctx_ptr);
