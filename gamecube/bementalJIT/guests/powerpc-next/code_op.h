@@ -79,6 +79,13 @@ struct CodeOp {
     // ordering bug that triggers DVDInterface.cpp:1286 "Unknown DVD
     // command 00000000".
     bool has_const_ea = false;
+    // Forward const-prop: this op's destination GPR is a compile-time
+    // constant after execution. emit_addi/addis/ori/oris/xori/xoris use
+    // this to skip the runtime add/or/xor and just emit op_i32_const +
+    // op_local_set. Populated by PPCAnalyzer for the 6 const-producing
+    // OPCDs.
+    bool has_const_result = false;
+    u32  const_result     = 0;
     u32  const_ea     = 0;
 
     BitSet32 GetFregsOut() const {

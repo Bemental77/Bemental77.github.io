@@ -433,6 +433,8 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
             if (produced) {
                 gpr_known[produced_reg] = true;
                 gpr_const[produced_reg] = produced_val;
+                op.has_const_result = true;
+                op.const_result     = produced_val;
             }
         }
 

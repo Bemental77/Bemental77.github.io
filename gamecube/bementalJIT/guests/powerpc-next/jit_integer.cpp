@@ -61,9 +61,16 @@ static void emit_ra_or_zero(WasmModuleBuilder& wb, RegCache& rc, u32 ra) {
 void emit_addi(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
+    auto rc_rt = rc.Bind(rt, RCMode::Write);
+    if (op.has_const_result) {
+        // Forward const-prop hit (ra==0 li-form, or ra known-const). Skip
+        // the runtime add — just materialize the known result directly.
+        wb.op_i32_const((s32)op.const_result);
+        wb.op_local_set(rc_rt.local_idx());
+        return;
+    }
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 simm = GekkoOperands::SIMM_16(inst);
-    auto rc_rt = rc.Bind(rt, RCMode::Write);
     emit_ra_or_zero(wb, rc, ra);
     wb.op_i32_const((s32)simm);
     wb.op_i32_add();
@@ -73,11 +80,14 @@ void emit_addi(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
 void emit_addis(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
-    const u32 ra   = GekkoOperands::RA(inst);
-    // SIMM is the upper 16 bits — UIMM_16 shifted left by 16; sign is from
-    // the shifted-up value, not the 16-bit half.
-    const s32 simm = (s32)(GekkoOperands::UIMM_16(inst) << 16);
     auto rc_rt = rc.Bind(rt, RCMode::Write);
+    if (op.has_const_result) {
+        wb.op_i32_const((s32)op.const_result);
+        wb.op_local_set(rc_rt.local_idx());
+        return;
+    }
+    const u32 ra   = GekkoOperands::RA(inst);
+    const s32 simm = (s32)(GekkoOperands::UIMM_16(inst) << 16);
     emit_ra_or_zero(wb, rc, ra);
     wb.op_i32_const(simm);
     wb.op_i32_add();
@@ -192,8 +202,14 @@ static void emit_logical_imm_simple(WasmModuleBuilder& wb, RegCache& rc,
                                     void (WasmModuleBuilder::*opfn)()) {
     const u32 inst = op.inst;
     const u32 ra   = GekkoOperands::RA(inst);   // dest (RA in D-form for these)
-    const u32 rs   = GekkoOperands::RS(inst);   // src
     auto rc_ra = rc.Bind(ra, RCMode::Write);
+    if (op.has_const_result) {
+        // Forward const-prop hit (rs known-const). Materialize directly.
+        wb.op_i32_const((s32)op.const_result);
+        wb.op_local_set(rc_ra.local_idx());
+        return;
+    }
+    const u32 rs   = GekkoOperands::RS(inst);   // src
     auto rc_rs = rc.Bind(rs, RCMode::Read);
     wb.op_local_get(rc_rs.local_idx());
     wb.op_i32_const((s32)imm_value);
