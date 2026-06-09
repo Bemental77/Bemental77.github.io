@@ -12,6 +12,7 @@
 #include "jit_paired.h"
 #include "bementalJIT/wasm_module_builder.h"
 #include "code_op.h"
+#include "fpr_reg_cache.h"
 #include "ppc_analyst.h"
 #include "ppc_offsets.h"
 #include "reg_cache.h"
@@ -22,12 +23,17 @@ namespace powerpc {
 static constexpr u32 WIMPORT_INTERP = 6;
 
 static void emit_rc_fallback(WasmModuleBuilder& wb, RegCache& rc,
-                             const CodeOp& op, u32 ctx_ptr) {
+                             FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
+    // PS Rc=1 falls back to interp (CR1 update from FPSCR not modeled);
+    // interp may mutate ps[] so the FPR cache flushes pre-call and reloads
+    // post-call to stay coherent with PowerPCState.
     rc.Flush(ctx_ptr);
+    frc.Flush(ctx_ptr);
     wb.op_i32_const((s32)op.inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
     rc.ReloadAll(ctx_ptr);
+    frc.ReloadAll(ctx_ptr);
 }
 
 // Shared body for ps_neg/ps_abs/ps_nabs (XOR/AND/OR with SIGN bit).
@@ -67,80 +73,101 @@ static void emit_ps_copy_halves(WasmModuleBuilder& wb, u32 ctx_ptr, u32 d,
 }
 
 // ps_mr fD, fB — fD <- fB (both halves).
-void emit_ps_mr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+// Step-4 plumbing: every trivial PS op reads ps0/ps1 from memory + writes
+// to memory. Frame each emit with frc.Flush before and frc.ReloadAll after
+// so the FPR cache stays coherent with the memory writes. Step 6 converts
+// these to pure local-to-local copies on the cache and drops both calls.
+void emit_ps_mr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
-    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, op, ctx_ptr); return; }
+    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 d = GekkoOperands::FD(inst);
     const u32 b = GekkoOperands::FB(inst);
     if (d == b) return;
+    frc.Flush(ctx_ptr);
     emit_ps_copy_halves(wb, ctx_ptr, d, ppc_off::ps0(b), ppc_off::ps1(b));
+    frc.ReloadAll(ctx_ptr);
 }
 
-void emit_ps_neg(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_ps_neg(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
-    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, op, ctx_ptr); return; }
+    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
+    frc.Flush(ctx_ptr);
     emit_ps_bit_op(wb, ctx_ptr, GekkoOperands::FD(inst), GekkoOperands::FB(inst), PSBitOp::NEG);
+    frc.ReloadAll(ctx_ptr);
 }
 
-void emit_ps_abs(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_ps_abs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
-    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, op, ctx_ptr); return; }
+    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
+    frc.Flush(ctx_ptr);
     emit_ps_bit_op(wb, ctx_ptr, GekkoOperands::FD(inst), GekkoOperands::FB(inst), PSBitOp::ABS);
+    frc.ReloadAll(ctx_ptr);
 }
 
-void emit_ps_nabs(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_ps_nabs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
-    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, op, ctx_ptr); return; }
+    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
+    frc.Flush(ctx_ptr);
     emit_ps_bit_op(wb, ctx_ptr, GekkoOperands::FD(inst), GekkoOperands::FB(inst), PSBitOp::NABS);
+    frc.ReloadAll(ctx_ptr);
 }
 
-void emit_ps_merge00(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_ps_merge00(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
-    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, op, ctx_ptr); return; }
+    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 d = GekkoOperands::FD(inst);
     const u32 a = GekkoOperands::FA(inst);
     const u32 b = GekkoOperands::FB(inst);
+    frc.Flush(ctx_ptr);
     emit_ps_copy_halves(wb, ctx_ptr, d, ppc_off::ps0(a), ppc_off::ps0(b));
+    frc.ReloadAll(ctx_ptr);
 }
 
-void emit_ps_merge01(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_ps_merge01(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
-    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, op, ctx_ptr); return; }
+    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 d = GekkoOperands::FD(inst);
     const u32 a = GekkoOperands::FA(inst);
     const u32 b = GekkoOperands::FB(inst);
+    frc.Flush(ctx_ptr);
     emit_ps_copy_halves(wb, ctx_ptr, d, ppc_off::ps0(a), ppc_off::ps1(b));
+    frc.ReloadAll(ctx_ptr);
 }
 
-void emit_ps_merge10(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_ps_merge10(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
-    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, op, ctx_ptr); return; }
+    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 d = GekkoOperands::FD(inst);
     const u32 a = GekkoOperands::FA(inst);
     const u32 b = GekkoOperands::FB(inst);
+    frc.Flush(ctx_ptr);
     emit_ps_copy_halves(wb, ctx_ptr, d, ppc_off::ps1(a), ppc_off::ps0(b));
+    frc.ReloadAll(ctx_ptr);
 }
 
-void emit_ps_merge11(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_ps_merge11(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
-    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, op, ctx_ptr); return; }
+    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 d = GekkoOperands::FD(inst);
     const u32 a = GekkoOperands::FA(inst);
     const u32 b = GekkoOperands::FB(inst);
+    frc.Flush(ctx_ptr);
     emit_ps_copy_halves(wb, ctx_ptr, d, ppc_off::ps1(a), ppc_off::ps1(b));
+    frc.ReloadAll(ctx_ptr);
 }
 
 // ps_sel fD, fA, fB, fC — fD.psN = (a.psN >= -0.0) ? c.psN : b.psN.
 // IEEE: +0.0 >= -0.0 and -0.0 >= -0.0 are both true; NaN >= -0.0 is false.
-void emit_ps_sel(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_ps_sel(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     static constexpr u32 BLOCK_TYPE_VOID = 0x40;
     const u32 inst = op.inst;
-    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, op, ctx_ptr); return; }
+    if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 d = GekkoOperands::FD(inst);
     const u32 a = GekkoOperands::FA(inst);
     const u32 b = GekkoOperands::FB(inst);
     const u32 c = GekkoOperands::FC(inst);
 
+    frc.Flush(ctx_ptr);
     auto half = [&](u32 a_off, u32 b_off, u32 c_off, u32 d_off) {
         wb.op_i32_const((s32)ctx_ptr);
         wb.op_f64_load(a_off);
@@ -160,6 +187,7 @@ void emit_ps_sel(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_
     };
     half(ppc_off::ps0(a), ppc_off::ps0(b), ppc_off::ps0(c), ppc_off::ps0(d));
     half(ppc_off::ps1(a), ppc_off::ps1(b), ppc_off::ps1(c), ppc_off::ps1(d));
+    frc.ReloadAll(ctx_ptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +200,7 @@ void emit_ps_sel(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_
 // NOT modeled — same omission as scalar emit_lfd/lfs etc.).
 // ---------------------------------------------------------------------------
 
-void emit_ps_binary(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_ps_binary(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 fd   = GekkoOperands::FD(inst);
     const u32 fa   = GekkoOperands::FA(inst);
@@ -184,6 +212,12 @@ void emit_ps_binary(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 c
     const u32 arg2 = (sub5 == 25) ? fc : fb;
 
     rc.Flush(ctx_ptr);
+    // Step-4 plumbing: emit body writes ps0/ps1 to PowerPCState memory
+    // directly (cache not used yet). Flush dirty FPR-cache lanes before
+    // the memory read so the lane lambda sees current values; reload
+    // after so subsequent ops see post-write state. Steps 6-7 convert
+    // these emits to cache locals and drop both calls.
+    frc.Flush(ctx_ptr);
 
     auto lane = [&](u32 a_off, u32 b_off, u32 d_off) {
         wb.op_i32_const((s32)ctx_ptr);          // store-addr
@@ -204,9 +238,13 @@ void emit_ps_binary(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 c
     };
     lane(ppc_off::ps0(fa), ppc_off::ps0(arg2), ppc_off::ps0(fd));
     lane(ppc_off::ps1(fa), ppc_off::ps1(arg2), ppc_off::ps1(fd));
+    // Step-4: emit wrote ps0(fd)/ps1(fd) to memory; reload the cache so
+    // subsequent ops see the new values (mirror of the rc.ReloadAll
+    // pattern after a memory-direct write of GPR memory).
+    frc.ReloadAll(ctx_ptr);
 }
 
-void emit_ps_fma(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_ps_fma(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 fd   = GekkoOperands::FD(inst);
     const u32 fa   = GekkoOperands::FA(inst);
@@ -218,6 +256,12 @@ void emit_ps_fma(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_
     const bool negate   = (sub5 == 30) || (sub5 == 31);  // nmsub / nmadd
 
     rc.Flush(ctx_ptr);
+    // Step-4 plumbing: emit body writes ps0/ps1 to PowerPCState memory
+    // directly (cache not used yet). Flush dirty FPR-cache lanes before
+    // the memory read so the lane lambda sees current values; reload
+    // after so subsequent ops see post-write state. Steps 6-7 convert
+    // these emits to cache locals and drop both calls.
+    frc.Flush(ctx_ptr);
 
     auto lane = [&](u32 a_off, u32 b_off, u32 c_off, u32 d_off) {
         wb.op_i32_const((s32)ctx_ptr);          // store-addr for d
@@ -237,9 +281,10 @@ void emit_ps_fma(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_
     };
     lane(ppc_off::ps0(fa), ppc_off::ps0(fb), ppc_off::ps0(fc), ppc_off::ps0(fd));
     lane(ppc_off::ps1(fa), ppc_off::ps1(fb), ppc_off::ps1(fc), ppc_off::ps1(fd));
+    frc.ReloadAll(ctx_ptr);
 }
 
-void emit_ps_sum(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_ps_sum(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 fd   = GekkoOperands::FD(inst);
     const u32 fa   = GekkoOperands::FA(inst);
@@ -277,9 +322,10 @@ void emit_ps_sum(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_
         emit_copy_c(ppc_off::ps0(fc), ppc_off::ps0(fd));
         emit_sum(ppc_off::ps1(fd));
     }
+    frc.ReloadAll(ctx_ptr);
 }
 
-void emit_ps_muls(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_ps_muls(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 fd   = GekkoOperands::FD(inst);
     const u32 fa   = GekkoOperands::FA(inst);
@@ -288,6 +334,12 @@ void emit_ps_muls(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx
     const u32 c_off = (sub5 == 12) ? ppc_off::ps0(fc) : ppc_off::ps1(fc);
 
     rc.Flush(ctx_ptr);
+    // Step-4 plumbing: emit body writes ps0/ps1 to PowerPCState memory
+    // directly (cache not used yet). Flush dirty FPR-cache lanes before
+    // the memory read so the lane lambda sees current values; reload
+    // after so subsequent ops see post-write state. Steps 6-7 convert
+    // these emits to cache locals and drop both calls.
+    frc.Flush(ctx_ptr);
 
     auto lane = [&](u32 a_off, u32 d_off) {
         wb.op_i32_const((s32)ctx_ptr);
@@ -302,9 +354,10 @@ void emit_ps_muls(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx
     };
     lane(ppc_off::ps0(fa), ppc_off::ps0(fd));
     lane(ppc_off::ps1(fa), ppc_off::ps1(fd));
+    frc.ReloadAll(ctx_ptr);
 }
 
-void emit_ps_madds(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_ps_madds(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 fd   = GekkoOperands::FD(inst);
     const u32 fa   = GekkoOperands::FA(inst);
@@ -314,6 +367,12 @@ void emit_ps_madds(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ct
     const u32 c_off = (sub5 == 14) ? ppc_off::ps0(fc) : ppc_off::ps1(fc);
 
     rc.Flush(ctx_ptr);
+    // Step-4 plumbing: emit body writes ps0/ps1 to PowerPCState memory
+    // directly (cache not used yet). Flush dirty FPR-cache lanes before
+    // the memory read so the lane lambda sees current values; reload
+    // after so subsequent ops see post-write state. Steps 6-7 convert
+    // these emits to cache locals and drop both calls.
+    frc.Flush(ctx_ptr);
 
     auto lane = [&](u32 a_off, u32 b_off, u32 d_off) {
         wb.op_i32_const((s32)ctx_ptr);
@@ -331,6 +390,7 @@ void emit_ps_madds(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ct
     };
     lane(ppc_off::ps0(fa), ppc_off::ps0(fb), ppc_off::ps0(fd));
     lane(ppc_off::ps1(fa), ppc_off::ps1(fb), ppc_off::ps1(fd));
+    frc.ReloadAll(ctx_ptr);
 }
 
 }  // namespace powerpc

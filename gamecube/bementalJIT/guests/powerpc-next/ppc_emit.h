@@ -15,6 +15,7 @@
 
 #include "bementalJIT/types.h"
 #include "code_op.h"
+#include "fpr_reg_cache.h"
 #include "jit_load_store.h"
 #include "reg_cache.h"
 
@@ -41,8 +42,8 @@ struct BlockInputs;  // full definition in guests/powerpc/gekko_emit.h
 // FP arith, complex SPRs, segment registers, etc.).
 //
 // Returns true if a native emitter was invoked; false on fallback.
-bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
-                 LoadStoreParams params);
+bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+                 const CodeOp& op, LoadStoreParams params);
 
 // Phase 4 build_block — eventual cut-over target. Phase 1 deliverable
 // onward; not yet called by live runtime.

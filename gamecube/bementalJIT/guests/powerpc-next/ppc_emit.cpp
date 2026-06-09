@@ -67,9 +67,14 @@ static constexpr u8  BLOCK_TYPE_VOID   = 0x40;
 // Without this, a falling-back op that raised an exception left PC at
 // the vector but subsequent ops in the same block kept running with
 // stale ppc_state.
-static void emit_fallback(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
-                          u32 ctx_ptr) {
+static void emit_fallback(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+                          const CodeOp& op, u32 ctx_ptr) {
+    // FPR cache must flush BEFORE the interp call (interp reads ps[] from
+    // PowerPCState directly), and reload AFTER (interp may have mutated
+    // ps[] — any FP op fallback, OSContext save/restore via interp). Same
+    // class as the GPR fallback fix at commit 65be5fd.
     rc.Flush(ctx_ptr);
+    frc.Flush(ctx_ptr);
     wb.op_i32_const((s32)op.inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
@@ -97,70 +102,71 @@ static void emit_fallback(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
 
     rc.ReloadAll(ctx_ptr);
+    frc.ReloadAll(ctx_ptr);
 }
 
-bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
-                 LoadStoreParams params) {
+bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+                 const CodeOp& op, LoadStoreParams params) {
     const u32 inst  = op.inst;
     const u32 opcd  = GekkoOperands::OPCD(inst);
     const u32 sub10 = GekkoOperands::SUBOP10(inst);
 
     switch (opcd) {
     // ---- D-form integer / logical ----
-    case 7:  emit_mulli  (wb, rc, op);                       return true;
-    case 8:  emit_subfic (wb, rc, op, params.ctx_ptr);       return true;
-    case 10: emit_cmpli  (wb, rc, op, params.ctx_ptr);       return true;
-    case 11: emit_cmpi   (wb, rc, op, params.ctx_ptr);       return true;
-    case 12: emit_addic    (wb, rc, op, params.ctx_ptr);     return true;
-    case 13: emit_addic_rc (wb, rc, op, params.ctx_ptr);     return true;
-    case 14: emit_addi     (wb, rc, op);                     return true;
-    case 15: emit_addis  (wb, rc, op);                       return true;
-    case 24: emit_ori    (wb, rc, op);                       return true;
-    case 25: emit_oris   (wb, rc, op);                       return true;
-    case 26: emit_xori   (wb, rc, op);                       return true;
-    case 27: emit_xoris  (wb, rc, op);                       return true;
-    case 28: emit_andix  (wb, rc, op, params.ctx_ptr);       return true;
-    case 29: emit_andisx (wb, rc, op, params.ctx_ptr);       return true;
+    case 7:  emit_mulli  (wb, rc, frc, op);                       return true;
+    case 8:  emit_subfic (wb, rc, frc, op, params.ctx_ptr);       return true;
+    case 10: emit_cmpli  (wb, rc, frc, op, params.ctx_ptr);       return true;
+    case 11: emit_cmpi   (wb, rc, frc, op, params.ctx_ptr);       return true;
+    case 12: emit_addic    (wb, rc, frc, op, params.ctx_ptr);     return true;
+    case 13: emit_addic_rc (wb, rc, frc, op, params.ctx_ptr);     return true;
+    case 14: emit_addi     (wb, rc, frc, op);                     return true;
+    case 15: emit_addis  (wb, rc, frc, op);                       return true;
+    case 24: emit_ori    (wb, rc, frc, op);                       return true;
+    case 25: emit_oris   (wb, rc, frc, op);                       return true;
+    case 26: emit_xori   (wb, rc, frc, op);                       return true;
+    case 27: emit_xoris  (wb, rc, frc, op);                       return true;
+    case 28: emit_andix  (wb, rc, frc, op, params.ctx_ptr);       return true;
+    case 29: emit_andisx (wb, rc, frc, op, params.ctx_ptr);       return true;
 
     // ---- D-form loads ----
-    case 32: emit_load_d (wb, rc, params, op, LoadWidth::U32, false); return true;
-    case 33: emit_load_d (wb, rc, params, op, LoadWidth::U32, true);  return true;
-    case 34: emit_load_d (wb, rc, params, op, LoadWidth::U8,  false); return true;
-    case 35: emit_load_d (wb, rc, params, op, LoadWidth::U8,  true);  return true;
-    case 40: emit_load_d (wb, rc, params, op, LoadWidth::U16, false); return true;
-    case 41: emit_load_d (wb, rc, params, op, LoadWidth::U16, true);  return true;
-    case 42: emit_load_d (wb, rc, params, op, LoadWidth::S16, false); return true;
-    case 43: emit_load_d (wb, rc, params, op, LoadWidth::S16, true);  return true;
+    case 32: emit_load_d (wb, rc, frc, params, op, LoadWidth::U32, false); return true;
+    case 33: emit_load_d (wb, rc, frc, params, op, LoadWidth::U32, true);  return true;
+    case 34: emit_load_d (wb, rc, frc, params, op, LoadWidth::U8,  false); return true;
+    case 35: emit_load_d (wb, rc, frc, params, op, LoadWidth::U8,  true);  return true;
+    case 40: emit_load_d (wb, rc, frc, params, op, LoadWidth::U16, false); return true;
+    case 41: emit_load_d (wb, rc, frc, params, op, LoadWidth::U16, true);  return true;
+    case 42: emit_load_d (wb, rc, frc, params, op, LoadWidth::S16, false); return true;
+    case 43: emit_load_d (wb, rc, frc, params, op, LoadWidth::S16, true);  return true;
 
     // ---- D-form load-multiple / store-multiple (opc 46/47) ----
     // Native emit per mp4_wedge_is_throughput_2026_06_07: every
     // gcsetjmp/gclongjmp pays one lmw + one stmw (RD=13, 19 words each)
     // via interp fallback on every protothread context switch.
-    case 46: emit_lmw    (wb, rc, params, op);                          return true;
-    case 47: emit_stmw   (wb, rc, params, op);                          return true;
+    case 46: emit_lmw    (wb, rc, frc, params, op);                          return true;
+    case 47: emit_stmw   (wb, rc, frc, params, op);                          return true;
 
     // ---- D-form stores ----
-    case 36: emit_store_d(wb, rc, params, op, StoreWidth::U32, false); return true;
-    case 37: emit_store_d(wb, rc, params, op, StoreWidth::U32, true);  return true;
-    case 38: emit_store_d(wb, rc, params, op, StoreWidth::U8,  false); return true;
-    case 39: emit_store_d(wb, rc, params, op, StoreWidth::U8,  true);  return true;
-    case 44: emit_store_d(wb, rc, params, op, StoreWidth::U16, false); return true;
-    case 45: emit_store_d(wb, rc, params, op, StoreWidth::U16, true);  return true;
+    case 36: emit_store_d(wb, rc, frc, params, op, StoreWidth::U32, false); return true;
+    case 37: emit_store_d(wb, rc, frc, params, op, StoreWidth::U32, true);  return true;
+    case 38: emit_store_d(wb, rc, frc, params, op, StoreWidth::U8,  false); return true;
+    case 39: emit_store_d(wb, rc, frc, params, op, StoreWidth::U8,  true);  return true;
+    case 44: emit_store_d(wb, rc, frc, params, op, StoreWidth::U16, false); return true;
+    case 45: emit_store_d(wb, rc, frc, params, op, StoreWidth::U16, true);  return true;
 
     // ---- Rotate / mask ----
-    case 20: emit_rlwimix(wb, rc, op, params.ctx_ptr);       return true;
-    case 21: emit_rlwinmx(wb, rc, op, params.ctx_ptr);       return true;
-    case 23: emit_rlwnmx (wb, rc, op, params.ctx_ptr);       return true;
+    case 20: emit_rlwimix(wb, rc, frc, op, params.ctx_ptr);       return true;
+    case 21: emit_rlwinmx(wb, rc, frc, op, params.ctx_ptr);       return true;
+    case 23: emit_rlwnmx (wb, rc, frc, op, params.ctx_ptr);       return true;
 
     // ---- Branch (D-form) ----
-    case 16: emit_bcx    (wb, rc, op, params.ctx_ptr);       return true;
-    case 18: emit_bx     (wb, rc, op, params.ctx_ptr);       return true;
+    case 16: emit_bcx    (wb, rc, frc, op, params.ctx_ptr);       return true;
+    case 18: emit_bx     (wb, rc, frc, op, params.ctx_ptr);       return true;
 
     case 19:
         switch (sub10) {
-        case 16:  emit_bclrx (wb, rc, op, params.ctx_ptr);   return true;
-        case 528: emit_bcctrx(wb, rc, op, params.ctx_ptr);   return true;
-        case 50:  emit_rfi   (wb, rc, op, params.ctx_ptr);   return true;
+        case 16:  emit_bclrx (wb, rc, frc, op, params.ctx_ptr);   return true;
+        case 528: emit_bcctrx(wb, rc, frc, op, params.ctx_ptr);   return true;
+        case 50:  emit_rfi   (wb, rc, frc, op, params.ctx_ptr);   return true;
         case 150: /* isync */                                return true;
         default:  break;
         }
@@ -169,86 +175,86 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     case 31:
         switch (sub10) {
         // X-form integer — all FL_RC_BIT, ctx_ptr threaded for CR0 update.
-        case 266: case 778: emit_addx  (wb, rc, op, params.ctx_ptr);       return true;
-        case 40:  case 552: emit_subfx (wb, rc, op, params.ctx_ptr);       return true;
-        case 235: case 747: emit_mullwx(wb, rc, op, params.ctx_ptr);       return true;
+        case 266: case 778: emit_addx  (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 40:  case 552: emit_subfx (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 235: case 747: emit_mullwx(wb, rc, frc, op, params.ctx_ptr);       return true;
         // X-form carry arithmetic (OE-suffix variants share emit; OV/SO untracked).
-        case 10:  case 522: emit_addcx (wb, rc, op, params.ctx_ptr);       return true;
-        case 8:   case 520: emit_subfcx(wb, rc, op, params.ctx_ptr);       return true;
+        case 10:  case 522: emit_addcx (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 8:   case 520: emit_subfcx(wb, rc, frc, op, params.ctx_ptr);       return true;
         // X-form wide multiply (high half).
-        case 75:            emit_mulhwx (wb, rc, op, params.ctx_ptr);      return true;
-        case 11:            emit_mulhwux(wb, rc, op, params.ctx_ptr);      return true;
+        case 75:            emit_mulhwx (wb, rc, frc, op, params.ctx_ptr);      return true;
+        case 11:            emit_mulhwux(wb, rc, frc, op, params.ctx_ptr);      return true;
         // X-form integer divide (guarded).
-        case 491: case 1003: emit_divwx (wb, rc, op, params.ctx_ptr);      return true;
-        case 459: case 971:  emit_divwux(wb, rc, op, params.ctx_ptr);      return true;
-        case 28:            emit_andx  (wb, rc, op, params.ctx_ptr);       return true;
-        case 60:            emit_andcx (wb, rc, op, params.ctx_ptr);       return true;
-        case 444:           emit_orx   (wb, rc, op, params.ctx_ptr);       return true;
-        case 316:           emit_xorx  (wb, rc, op, params.ctx_ptr);       return true;
-        case 124:           emit_norx  (wb, rc, op, params.ctx_ptr);       return true;
-        case 476:           emit_nandx (wb, rc, op, params.ctx_ptr);       return true;
-        case 284:           emit_eqvx  (wb, rc, op, params.ctx_ptr);       return true;
-        case 412:           emit_orcx  (wb, rc, op, params.ctx_ptr);       return true;
-        case 24:            emit_slwx  (wb, rc, op, params.ctx_ptr);       return true;
-        case 536:           emit_srwx  (wb, rc, op, params.ctx_ptr);       return true;
-        case 792:           emit_srawx (wb, rc, op, params.ctx_ptr);       return true;
-        case 824:           emit_srawix(wb, rc, op, params.ctx_ptr);       return true;
-        case 954:           emit_extsbx(wb, rc, op, params.ctx_ptr);       return true;
-        case 922:           emit_extshx(wb, rc, op, params.ctx_ptr);       return true;
-        case 26:            emit_cntlzwx(wb, rc, op, params.ctx_ptr);      return true;
-        case 104: case 616: emit_negx  (wb, rc, op, params.ctx_ptr);       return true;
-        case 138: case 650: emit_addex (wb, rc, op, params.ctx_ptr);       return true;
-        case 136: case 648: emit_subfex(wb, rc, op, params.ctx_ptr);       return true;
-        case 234: case 746: emit_addmex(wb, rc, op, params.ctx_ptr);       return true;
-        case 232: case 744: emit_subfmex(wb, rc, op, params.ctx_ptr);      return true;
-        case 202: case 714: emit_addzex(wb, rc, op, params.ctx_ptr);       return true;
-        case 200: case 712: emit_subfzex(wb, rc, op, params.ctx_ptr);      return true;
-        case 0:             emit_cmp   (wb, rc, op, params.ctx_ptr);       return true;
-        case 32:            emit_cmpl  (wb, rc, op, params.ctx_ptr);       return true;
+        case 491: case 1003: emit_divwx (wb, rc, frc, op, params.ctx_ptr);      return true;
+        case 459: case 971:  emit_divwux(wb, rc, frc, op, params.ctx_ptr);      return true;
+        case 28:            emit_andx  (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 60:            emit_andcx (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 444:           emit_orx   (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 316:           emit_xorx  (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 124:           emit_norx  (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 476:           emit_nandx (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 284:           emit_eqvx  (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 412:           emit_orcx  (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 24:            emit_slwx  (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 536:           emit_srwx  (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 792:           emit_srawx (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 824:           emit_srawix(wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 954:           emit_extsbx(wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 922:           emit_extshx(wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 26:            emit_cntlzwx(wb, rc, frc, op, params.ctx_ptr);      return true;
+        case 104: case 616: emit_negx  (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 138: case 650: emit_addex (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 136: case 648: emit_subfex(wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 234: case 746: emit_addmex(wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 232: case 744: emit_subfmex(wb, rc, frc, op, params.ctx_ptr);      return true;
+        case 202: case 714: emit_addzex(wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 200: case 712: emit_subfzex(wb, rc, frc, op, params.ctx_ptr);      return true;
+        case 0:             emit_cmp   (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 32:            emit_cmpl  (wb, rc, frc, op, params.ctx_ptr);       return true;
 
         // X-form loads
-        case 23:  emit_load_x (wb, rc, params, op, LoadWidth::U32, false); return true;
-        case 55:  emit_load_x (wb, rc, params, op, LoadWidth::U32, true);  return true;
-        case 87:  emit_load_x (wb, rc, params, op, LoadWidth::U8,  false); return true;
-        case 119: emit_load_x (wb, rc, params, op, LoadWidth::U8,  true);  return true;
-        case 279: emit_load_x (wb, rc, params, op, LoadWidth::U16, false); return true;
-        case 311: emit_load_x (wb, rc, params, op, LoadWidth::U16, true);  return true;
-        case 343: emit_load_x (wb, rc, params, op, LoadWidth::S16, false); return true;
-        case 375: emit_load_x (wb, rc, params, op, LoadWidth::S16, true);  return true;
+        case 23:  emit_load_x (wb, rc, frc, params, op, LoadWidth::U32, false); return true;
+        case 55:  emit_load_x (wb, rc, frc, params, op, LoadWidth::U32, true);  return true;
+        case 87:  emit_load_x (wb, rc, frc, params, op, LoadWidth::U8,  false); return true;
+        case 119: emit_load_x (wb, rc, frc, params, op, LoadWidth::U8,  true);  return true;
+        case 279: emit_load_x (wb, rc, frc, params, op, LoadWidth::U16, false); return true;
+        case 311: emit_load_x (wb, rc, frc, params, op, LoadWidth::U16, true);  return true;
+        case 343: emit_load_x (wb, rc, frc, params, op, LoadWidth::S16, false); return true;
+        case 375: emit_load_x (wb, rc, frc, params, op, LoadWidth::S16, true);  return true;
 
         // X-form stores
-        case 151: emit_store_x(wb, rc, params, op, StoreWidth::U32, false); return true;
-        case 183: emit_store_x(wb, rc, params, op, StoreWidth::U32, true);  return true;
-        case 215: emit_store_x(wb, rc, params, op, StoreWidth::U8,  false); return true;
-        case 247: emit_store_x(wb, rc, params, op, StoreWidth::U8,  true);  return true;
-        case 407: emit_store_x(wb, rc, params, op, StoreWidth::U16, false); return true;
-        case 439: emit_store_x(wb, rc, params, op, StoreWidth::U16, true);  return true;
+        case 151: emit_store_x(wb, rc, frc, params, op, StoreWidth::U32, false); return true;
+        case 183: emit_store_x(wb, rc, frc, params, op, StoreWidth::U32, true);  return true;
+        case 215: emit_store_x(wb, rc, frc, params, op, StoreWidth::U8,  false); return true;
+        case 247: emit_store_x(wb, rc, frc, params, op, StoreWidth::U8,  true);  return true;
+        case 407: emit_store_x(wb, rc, frc, params, op, StoreWidth::U16, false); return true;
+        case 439: emit_store_x(wb, rc, frc, params, op, StoreWidth::U16, true);  return true;
 
         // FP X-form indexed load/store (lfsx 535, stfsx 663, stfiwx 983).
-        case 535: emit_lfsx  (wb, rc, params, op);                          return true;
-        case 663: emit_stfsx (wb, rc, params, op);                          return true;
-        case 983: emit_stfiwx(wb, rc, params, op);                          return true;
+        case 535: emit_lfsx  (wb, rc, frc, params, op);                          return true;
+        case 663: emit_stfsx (wb, rc, frc, params, op);                          return true;
+        case 983: emit_stfiwx(wb, rc, frc, params, op);                          return true;
 
         // System registers
-        case 339: emit_mfspr(wb, rc, op, params.ctx_ptr);                  return true;
-        case 467: emit_mtspr(wb, rc, op, params.ctx_ptr);                  return true;
-        case 83:  emit_mfmsr(wb, rc, op, params.ctx_ptr);                  return true;
-        case 146: emit_mtmsr(wb, rc, op, params.ctx_ptr);                  return true;
+        case 339: emit_mfspr(wb, rc, frc, op, params.ctx_ptr);                  return true;
+        case 467: emit_mtspr(wb, rc, frc, op, params.ctx_ptr);                  return true;
+        case 83:  emit_mfmsr(wb, rc, frc, op, params.ctx_ptr);                  return true;
+        case 146: emit_mtmsr(wb, rc, frc, op, params.ctx_ptr);                  return true;
         // Time-base read (direct SPR slot — no CoreTiming).
-        case 371: emit_mftb  (wb, rc, op, params.ctx_ptr);                 return true;
+        case 371: emit_mftb  (wb, rc, frc, op, params.ctx_ptr);                 return true;
         // CR pack/unpack — interp fallback (CR-encoding non-trivial).
-        case 19:  emit_mfcr  (wb, rc, op, params.ctx_ptr);                 return true;
-        case 144: emit_mtcrf (wb, rc, op, params.ctx_ptr);                 return true;
+        case 19:  emit_mfcr  (wb, rc, frc, op, params.ctx_ptr);                 return true;
+        case 144: emit_mtcrf (wb, rc, frc, op, params.ctx_ptr);                 return true;
         // Segment register access / TLB invalidate — interp fallback
         // (privileged MMU ops; rare and block-ending).
-        case 210: emit_mtsr  (wb, rc, op, params.ctx_ptr);                 return true;
-        case 242: emit_mtsrin(wb, rc, op, params.ctx_ptr);                 return true;
-        case 306: emit_tlbie (wb, rc, op, params.ctx_ptr);                 return true;
-        case 595: emit_mfsr  (wb, rc, op, params.ctx_ptr);                 return true;
-        case 659: emit_mfsrin(wb, rc, op, params.ctx_ptr);                 return true;
+        case 210: emit_mtsr  (wb, rc, frc, op, params.ctx_ptr);                 return true;
+        case 242: emit_mtsrin(wb, rc, frc, op, params.ctx_ptr);                 return true;
+        case 306: emit_tlbie (wb, rc, frc, op, params.ctx_ptr);                 return true;
+        case 595: emit_mfsr  (wb, rc, frc, op, params.ctx_ptr);                 return true;
+        case 659: emit_mfsrin(wb, rc, frc, op, params.ctx_ptr);                 return true;
 
         // dcbz — 32-byte zero block. Memset/__fill_mem hot path.
-        case 1014: emit_dcbz(wb, rc, op, params.ctx_ptr);                  return true;
+        case 1014: emit_dcbz(wb, rc, frc, op, params.ctx_ptr);                  return true;
 
         // Sync / cache barriers / cache hints — emit nothing. The emulator's
         // linear memory model has no real cache to flush/invalidate/prefetch.
@@ -288,38 +294,38 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
         // dominates MP4 mtx/transform path in steady state.
         const u32 sub5 = GekkoOperands::SUBOP5(inst);
         switch (sub10) {
-        case  72: emit_ps_mr      (wb, rc, op, params.ctx_ptr); return true;
-        case  40: emit_ps_neg     (wb, rc, op, params.ctx_ptr); return true;
-        case 264: emit_ps_abs     (wb, rc, op, params.ctx_ptr); return true;
-        case 136: emit_ps_nabs    (wb, rc, op, params.ctx_ptr); return true;
-        case 528: emit_ps_merge00 (wb, rc, op, params.ctx_ptr); return true;
-        case 560: emit_ps_merge01 (wb, rc, op, params.ctx_ptr); return true;
-        case 592: emit_ps_merge10 (wb, rc, op, params.ctx_ptr); return true;
-        case 624: emit_ps_merge11 (wb, rc, op, params.ctx_ptr); return true;
+        case  72: emit_ps_mr      (wb, rc, frc, op, params.ctx_ptr); return true;
+        case  40: emit_ps_neg     (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 264: emit_ps_abs     (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 136: emit_ps_nabs    (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 528: emit_ps_merge00 (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 560: emit_ps_merge01 (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 592: emit_ps_merge10 (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 624: emit_ps_merge11 (wb, rc, frc, op, params.ctx_ptr); return true;
         default: break;
         }
         // ps_sel is the 4-op-form encoded by SUBOP5=23.
-        if (sub5 == 23) { emit_ps_sel(wb, rc, op, params.ctx_ptr); return true; }
+        if (sub5 == 23) { emit_ps_sel(wb, rc, frc, op, params.ctx_ptr); return true; }
         // Arithmetic paired-singles by SUBOP5. Per FP audit researcher:
         // 441 ps_* arith lines in MP4 mtx/psmtx code — dominates steady-
         // state render once boot pushes past the OSContext-heavy window.
         switch (sub5) {
-        case 10: case 11:                    emit_ps_sum   (wb, rc, op, params.ctx_ptr); return true;
-        case 12: case 13:                    emit_ps_muls  (wb, rc, op, params.ctx_ptr); return true;
-        case 14: case 15:                    emit_ps_madds (wb, rc, op, params.ctx_ptr); return true;
-        case 18: case 20: case 21: case 25:  emit_ps_binary(wb, rc, op, params.ctx_ptr); return true;
-        case 28: case 29: case 30: case 31:  emit_ps_fma   (wb, rc, op, params.ctx_ptr); return true;
+        case 10: case 11:                    emit_ps_sum   (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 12: case 13:                    emit_ps_muls  (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 14: case 15:                    emit_ps_madds (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 18: case 20: case 21: case 25:  emit_ps_binary(wb, rc, frc, op, params.ctx_ptr); return true;
+        case 28: case 29: case 30: case 31:  emit_ps_fma   (wb, rc, frc, op, params.ctx_ptr); return true;
         default: break;
         }
         // ps_cmp*/ps_res/ps_rsqrte/psq_*x/dcbz_l — still interp fallback.
-        emit_fallback(wb, rc, op, params.ctx_ptr);
+        emit_fallback(wb, rc, frc, op, params.ctx_ptr);
         return false;
     }
     case 52: case 53:   // stfs/stfsu — deferred, needs PEM ConvertToSingle
     case 56: case 57:
     case 59:
     case 60: case 61:
-        emit_fallback(wb, rc, op, params.ctx_ptr);
+        emit_fallback(wb, rc, frc, op, params.ctx_ptr);
         return false;
 
     // Opcode 63 — scalar f64 trivial sign/copy ops (fmr/fneg/fabs/fnabs).
@@ -327,43 +333,43 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     // mffs/mtfsf*) still routed to interp pending full op63 port.
     case 63: {
         switch (sub10) {
-        case  72: emit_fmrx  (wb, rc, op, params.ctx_ptr); return true;
-        case  40: emit_fnegx (wb, rc, op, params.ctx_ptr); return true;
-        case 264: emit_fabsx (wb, rc, op, params.ctx_ptr); return true;
-        case 136: emit_fnabsx(wb, rc, op, params.ctx_ptr); return true;
+        case  72: emit_fmrx  (wb, rc, frc, op, params.ctx_ptr); return true;
+        case  40: emit_fnegx (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 264: emit_fabsx (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 136: emit_fnabsx(wb, rc, frc, op, params.ctx_ptr); return true;
         default: break;
         }
         // SUBOP5-keyed arith — 4-operand form (table63 in ppc_tables.cpp
         // dispatches the arith ops via sub5). Per FP audit: heavy mtx use.
         const u32 sub5_63 = GekkoOperands::SUBOP5(inst);
         switch (sub5_63) {
-        case 18: case 20: case 21: case 25:  emit_fp_arith_double(wb, rc, op, params.ctx_ptr); return true;
-        case 28: case 29: case 30: case 31:  emit_fp_fma_double  (wb, rc, op, params.ctx_ptr); return true;
+        case 18: case 20: case 21: case 25:  emit_fp_arith_double(wb, rc, frc, op, params.ctx_ptr); return true;
+        case 28: case 29: case 30: case 31:  emit_fp_fma_double  (wb, rc, frc, op, params.ctx_ptr); return true;
         default: break;
         }
         // fcmpu/fcmpo/frsp/fctiw*/mffs/mtfsf* still routed to interp.
-        emit_fallback(wb, rc, op, params.ctx_ptr);
+        emit_fallback(wb, rc, frc, op, params.ctx_ptr);
         return false;
     }
 
     // FP D-form double load/store — native emit (slowmem-only path).
     // Per mp4_wedge_is_throughput_2026_06_07 + FP audit researcher 2026-06-08:
     // every gcsetjmp/gclongjmp pays 18 of these via interp fallback.
-    case 50: emit_lfd (wb, rc, params, op, /*update=*/false); return true;
-    case 51: emit_lfd (wb, rc, params, op, /*update=*/true ); return true;
-    case 54: emit_stfd(wb, rc, params, op, /*update=*/false); return true;
-    case 55: emit_stfd(wb, rc, params, op, /*update=*/true ); return true;
+    case 50: emit_lfd (wb, rc, frc, params, op, /*update=*/false); return true;
+    case 51: emit_lfd (wb, rc, frc, params, op, /*update=*/true ); return true;
+    case 54: emit_stfd(wb, rc, frc, params, op, /*update=*/false); return true;
+    case 55: emit_stfd(wb, rc, frc, params, op, /*update=*/true ); return true;
 
     // FP D-form single load (lfs/lfsu) — naive f32->f64 promote (same
     // approximation as existing emit_lfsx). stfs/stfsu still in fallback
     // pending PEM ConvertToSingle implementation.
-    case 48: emit_lfs (wb, rc, params, op, /*update=*/false); return true;
-    case 49: emit_lfs (wb, rc, params, op, /*update=*/true ); return true;
+    case 48: emit_lfs (wb, rc, frc, params, op, /*update=*/false); return true;
+    case 49: emit_lfs (wb, rc, frc, params, op, /*update=*/true ); return true;
 
     default: break;
     }
     // No native emitter for this op — fallback to interp.
-    emit_fallback(wb, rc, op, params.ctx_ptr);
+    emit_fallback(wb, rc, frc, op, params.ctx_ptr);
     return false;
 }
 
@@ -558,6 +564,11 @@ std::vector<u8> build_block_next(u32 start_pc,
             (g_hle_hook_query == nullptr) || g_hle_hook_query(op.address);
         if (may_have_hook) {
             rc.Flush(ctx_ptr);
+            // Step-4 plumbing: HLE handlers don't touch FPRs today
+            // (OSReport/DBPrintf only mutate gpr[3..5]) but future FP-aware
+            // HLE could. Conservative match to rc.Flush/rc.ReloadAll keeps
+            // the FPR cache coherent across the HLE-may-fire boundary.
+            frc.Flush(ctx_ptr);
             emit_hle_prologue(b, ctx_ptr, op.address);
             // Pass-2 audit (w6oeq0l6e RANK 3): HLE Start hooks (OSReport,
             // DBPrintf, generic-skip) read & mutate ppc_state.gpr[3..5]
@@ -567,6 +578,7 @@ std::vector<u8> build_block_next(u32 start_pc,
             // 87e55db. Reload all GPRs from PowerPCState so post-hook gpr
             // writes are visible.
             rc.ReloadAll(ctx_ptr);
+            frc.ReloadAll(ctx_ptr);
         }
 
         // Pre-op set_pc — mirrors live gekko_emit.cpp:4023+. Native
@@ -594,7 +606,7 @@ std::vector<u8> build_block_next(u32 start_pc,
         // the cond falls through, next_pc=fallthrough and the block
         // exits naturally. PowerPC ISA's standard 64-bit timebase read
         // pattern depends on this behavior to terminate.
-        dispatch_op(b, rc, op, params);
+        dispatch_op(b, rc, frc, op, params);
         (void)is_terminator;
     }
 

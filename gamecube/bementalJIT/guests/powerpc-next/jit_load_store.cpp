@@ -28,6 +28,7 @@
 #include "bementalJIT/wasm_module_builder.h"
 #include "code_op.h"
 #include "common/op_info.h"
+#include "fpr_reg_cache.h"
 #include "ppc_analyst.h"
 #include "ppc_offsets.h"
 #include "reg_cache.h"
@@ -272,6 +273,7 @@ static void emit_slowmem_store(WasmModuleBuilder& wb, StoreWidth width,
 // already emitted EA into LOCAL_TMP_EA.
 // ---------------------------------------------------------------------------
 static void emit_load_common(WasmModuleBuilder& wb, RegCache& rc,
+                             FPRRegCache& frc,
                              LoadStoreParams params, u32 rt, u32 ra,
                              LoadWidth width, bool update) {
     // Push fastmem-guard onto stack, then flush dirty bindings, THEN bind
@@ -286,6 +288,7 @@ static void emit_load_common(WasmModuleBuilder& wb, RegCache& rc,
     // returning to PC=0 (caller-saved r31 = 0 after function return).
     emit_fastmem_guard(wb, params, load_width_bytes(width));
     rc.Flush(params.ctx_ptr);  // stack-neutral — guard stays on top
+    frc.Flush(params.ctx_ptr);
 
     // Bind RT now (post-flush). Marks rt dirty so its end-of-block flush
     // writes the loaded value back to memory.
@@ -318,6 +321,7 @@ static void emit_load_common(WasmModuleBuilder& wb, RegCache& rc,
 }
 
 static void emit_store_common(WasmModuleBuilder& wb, RegCache& rc,
+                              FPRRegCache& frc,
                               LoadStoreParams params, u32 rs, u32 ra,
                               StoreWidth width, bool update) {
     // Read RS — bind for the value-to-be-stored.
@@ -326,6 +330,7 @@ static void emit_store_common(WasmModuleBuilder& wb, RegCache& rc,
 
     emit_fastmem_guard(wb, params, store_width_bytes(width));
     rc.Flush(params.ctx_ptr);
+    frc.Flush(params.ctx_ptr);
     wb.op_if(BLOCK_TYPE_VOID);
 
     emit_fastmem_store(wb, params, width, rs_local);
@@ -386,11 +391,13 @@ static bool is_mmio_const_addr(u32 addr) {
 
 // Emit a store to a compile-time-known MMIO address. Stack-neutral.
 static void emit_const_mmio_store(WasmModuleBuilder& wb, RegCache& rc,
+                                  FPRRegCache& frc,
                                   LoadStoreParams params, u32 addr,
                                   StoreWidth width, u32 src_local) {
     // Flush dirty GPRs to PowerPCState — host MMIO handler may read them
     // (e.g. ExpansionInterface inspects gpr[3..5] for some commands).
     rc.Flush(params.ctx_ptr);
+    frc.Flush(params.ctx_ptr);
     // Push address + value, call import. The wasm `call` to a host import
     // is a strict happens-before barrier per wasm semantics — no
     // subsequent op can be hoisted across it.
@@ -405,9 +412,11 @@ static void emit_const_mmio_store(WasmModuleBuilder& wb, RegCache& rc,
 // stale-zero ordering bug; this helper is preserved for future reuse and
 // marked maybe_unused.
 [[maybe_unused]] static void emit_const_mmio_load(WasmModuleBuilder& wb, RegCache& rc,
+                                 FPRRegCache& frc,
                                  LoadStoreParams params, u32 addr,
                                  LoadWidth width) {
     rc.Flush(params.ctx_ptr);
+    frc.Flush(params.ctx_ptr);
     wb.op_i32_const((s32)addr);
     wb.op_call(read_import_for_width(width));
     if (width == LoadWidth::S16) {
@@ -421,7 +430,7 @@ static void emit_const_mmio_store(WasmModuleBuilder& wb, RegCache& rc,
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
-void emit_load_d(WasmModuleBuilder& wb, RegCache& rc,
+void emit_load_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                  LoadStoreParams params, const CodeOp& op,
                  LoadWidth width, bool update) {
     const u32 inst = op.inst;
@@ -443,6 +452,7 @@ void emit_load_d(WasmModuleBuilder& wb, RegCache& rc,
         // ordering comment at lines 245-260 above). Mirror that ordering
         // here: Flush, then Bind(Write), then perform the load.
         rc.Flush(params.ctx_ptr);
+        frc.Flush(params.ctx_ptr);
         auto rc_rt = rc.Bind(rt, RCMode::Write);
         // emit_const_mmio_load also calls rc.Flush internally — a second
         // Flush after Bind(Write) would re-trigger the stale-write bug.
@@ -465,10 +475,10 @@ void emit_load_d(WasmModuleBuilder& wb, RegCache& rc,
     }
 
     emit_ea_d_form(wb, rc, ra, simm);
-    emit_load_common(wb, rc, params, rt, ra, width, update);
+    emit_load_common(wb, rc, frc, params, rt, ra, width, update);
 }
 
-void emit_store_d(WasmModuleBuilder& wb, RegCache& rc,
+void emit_store_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                   LoadStoreParams params, const CodeOp& op,
                   StoreWidth width, bool update) {
     const u32 inst = op.inst;
@@ -482,7 +492,7 @@ void emit_store_d(WasmModuleBuilder& wb, RegCache& rc,
     // AudioInterface, etc.
     if (op.has_const_ea && is_mmio_const_addr(op.const_ea)) {
         auto rc_rs = rc.Bind(rs, RCMode::Read);
-        emit_const_mmio_store(wb, rc, params, op.const_ea, width,
+        emit_const_mmio_store(wb, rc, frc, params, op.const_ea, width,
                               rc_rs.local_idx());
         if (update && ra != 0) {
             auto rc_ra = rc.Bind(ra, RCMode::Write);
@@ -493,10 +503,10 @@ void emit_store_d(WasmModuleBuilder& wb, RegCache& rc,
     }
 
     emit_ea_d_form(wb, rc, ra, simm);
-    emit_store_common(wb, rc, params, rs, ra, width, update);
+    emit_store_common(wb, rc, frc, params, rs, ra, width, update);
 }
 
-void emit_load_x(WasmModuleBuilder& wb, RegCache& rc,
+void emit_load_x(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                  LoadStoreParams params, const CodeOp& op,
                  LoadWidth width, bool update) {
     const u32 inst = op.inst;
@@ -504,10 +514,10 @@ void emit_load_x(WasmModuleBuilder& wb, RegCache& rc,
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 rb   = GekkoOperands::RB(inst);
     emit_ea_x_form(wb, rc, ra, rb);
-    emit_load_common(wb, rc, params, rt, ra, width, update);
+    emit_load_common(wb, rc, frc, params, rt, ra, width, update);
 }
 
-void emit_store_x(WasmModuleBuilder& wb, RegCache& rc,
+void emit_store_x(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                   LoadStoreParams params, const CodeOp& op,
                   StoreWidth width, bool update) {
     const u32 inst = op.inst;
@@ -515,7 +525,7 @@ void emit_store_x(WasmModuleBuilder& wb, RegCache& rc,
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 rb   = GekkoOperands::RB(inst);
     emit_ea_x_form(wb, rc, ra, rb);
-    emit_store_common(wb, rc, params, rs, ra, width, update);
+    emit_store_common(wb, rc, frc, params, rs, ra, width, update);
 }
 
 // ---------------------------------------------------------------------------
@@ -543,7 +553,7 @@ static void emit_ea_x_stack(WasmModuleBuilder& wb, RegCache& rc,
 
 // lfsx fT, rA, rB — load f32 at EA, promote to f64, store at ps0(rt).
 // gekko_emit.cpp:2847 emit_lfsx_impl.
-void emit_lfsx(WasmModuleBuilder& wb, RegCache& rc,
+void emit_lfsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op) {
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
@@ -556,6 +566,7 @@ void emit_lfsx(WasmModuleBuilder& wb, RegCache& rc,
 
     // Flush regcache before WIMPORT call (host may dereference PowerPCState).
     rc.Flush(params.ctx_ptr);
+    frc.Flush(params.ctx_ptr);
 
     // Push ctx pointer for the eventual f64.store at the end.
     wb.op_i32_const((s32)params.ctx_ptr);
@@ -596,14 +607,16 @@ void emit_lfsx(WasmModuleBuilder& wb, RegCache& rc,
 // Flush dirty wasm-locals to memory so the interp sees current GPR/FPR
 // state, then ReloadAll after the call so subsequent ops in the same block
 // observe any interp-side mutations.
-void emit_stfsx(WasmModuleBuilder& wb, RegCache& rc,
+void emit_stfsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                 LoadStoreParams params, const CodeOp& op) {
     static constexpr u32 WIMPORT_INTERP = 6;
     rc.Flush(params.ctx_ptr);
+    frc.Flush(params.ctx_ptr);
     wb.op_i32_const((s32)op.inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
     rc.ReloadAll(params.ctx_ptr);
+    frc.ReloadAll(params.ctx_ptr);
 }
 
 // lfd  FRD, d(rA)  — load f64 (8 bytes BE) from EA, store at ps0(FRD).
@@ -617,7 +630,7 @@ void emit_stfsx(WasmModuleBuilder& wb, RegCache& rc,
 // 18 of these via interp fallback (~18×WIMPORT_INTERP roundtrips). Native
 // emit is the documented throughput fix path. Per FP audit researcher
 // 2026-06-08: structurally mirrors emit_lfsx but for 8 bytes.
-void emit_lfd(WasmModuleBuilder& wb, RegCache& rc,
+void emit_lfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
               LoadStoreParams params, const CodeOp& op, bool update) {
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
@@ -627,6 +640,7 @@ void emit_lfd(WasmModuleBuilder& wb, RegCache& rc,
     emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
 
     rc.Flush(params.ctx_ptr);
+    frc.Flush(params.ctx_ptr);
 
     // Push ctx_ptr now for the eventual f64.store at ps0(rt).
     wb.op_i32_const((s32)params.ctx_ptr);
@@ -667,7 +681,7 @@ void emit_lfd(WasmModuleBuilder& wb, RegCache& rc,
 // swaps host LE u32 → guest BE bytes, so:
 //   write32(EA,     host_u32(ps0+4)) → EA..EA+3 = guest BYTES 0..3
 //   write32(EA + 4, host_u32(ps0+0)) → EA+4..EA+7 = guest BYTES 4..7
-void emit_stfd(WasmModuleBuilder& wb, RegCache& rc,
+void emit_stfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op, bool update) {
     const u32 inst = op.inst;
     const u32 rs   = GekkoOperands::RS(inst);
@@ -677,6 +691,7 @@ void emit_stfd(WasmModuleBuilder& wb, RegCache& rc,
     emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
 
     rc.Flush(params.ctx_ptr);
+    frc.Flush(params.ctx_ptr);
 
     // write32(EA, host_u32(ctx + ps0(rs) + 4))  — guest BYTES 0..3.
     wb.op_local_get(LOCAL_TMP_EA);
@@ -703,7 +718,7 @@ void emit_stfd(WasmModuleBuilder& wb, RegCache& rc,
 // ps0(FRD) + splat to ps1(FRD). Mirrors emit_lfsx (jit_load_store.cpp:546).
 // Naive promote vs PEM ConvertToDouble — same approximation as existing
 // emit_lfsx; tightening is a separate pass across lfs/lfsu/lfsx/lfsux.
-void emit_lfs(WasmModuleBuilder& wb, RegCache& rc,
+void emit_lfs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
               LoadStoreParams params, const CodeOp& op, bool update) {
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
@@ -712,6 +727,7 @@ void emit_lfs(WasmModuleBuilder& wb, RegCache& rc,
 
     emit_ea_d_form(wb, rc, ra, simm);
     rc.Flush(params.ctx_ptr);
+    frc.Flush(params.ctx_ptr);
 
     wb.op_i32_const((s32)params.ctx_ptr);
     wb.op_local_get(LOCAL_TMP_EA);
@@ -737,7 +753,7 @@ void emit_lfs(WasmModuleBuilder& wb, RegCache& rc,
 // Jit_LoadStore.cpp:644-667. Direct PowerPCState writes + ReloadAll to
 // keep the regcache coherent with the loaded slots (avoids the 2026-05-31
 // OSCacheInit r28-r31 class regression — see ppc_emit.cpp:54-58).
-void emit_lmw(WasmModuleBuilder& wb, RegCache& rc,
+void emit_lmw(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
               LoadStoreParams params, const CodeOp& op) {
     const u32 inst = op.inst;
     const u32 rd   = GekkoOperands::RD(inst);
@@ -745,6 +761,7 @@ void emit_lmw(WasmModuleBuilder& wb, RegCache& rc,
     const u32 simm = GekkoOperands::SIMM_16(inst);
 
     rc.Flush(params.ctx_ptr);
+    frc.Flush(params.ctx_ptr);
 
     if (ra == 0) {
         wb.op_i32_const((s32)simm);
@@ -768,12 +785,13 @@ void emit_lmw(WasmModuleBuilder& wb, RegCache& rc,
     }
 
     rc.ReloadAll(params.ctx_ptr);
+    frc.ReloadAll(params.ctx_ptr);
 }
 
 // stmw rS, d(rA) — store (32 - rS) words sequentially. Per Jit64
 // Jit_LoadStore.cpp:669-697. No ReloadAll needed since stmw doesn't write
 // gpr[]; cache stays coherent.
-void emit_stmw(WasmModuleBuilder& wb, RegCache& rc,
+void emit_stmw(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op) {
     const u32 inst = op.inst;
     const u32 rs   = GekkoOperands::RS(inst);
@@ -781,6 +799,7 @@ void emit_stmw(WasmModuleBuilder& wb, RegCache& rc,
     const u32 simm = GekkoOperands::SIMM_16(inst);
 
     rc.Flush(params.ctx_ptr);
+    frc.Flush(params.ctx_ptr);
 
     if (ra == 0) {
         wb.op_i32_const((s32)simm);
@@ -807,7 +826,7 @@ void emit_stmw(WasmModuleBuilder& wb, RegCache& rc,
 // stfiwx fS, rA, rB — write low 32 bits of ps0(rs) f64 as a word.
 // Little-endian f64 host storage puts the low 32 bits at offset +0.
 // gekko_emit.cpp:2872 emit_stfiwx_impl.
-void emit_stfiwx(WasmModuleBuilder& wb, RegCache& rc,
+void emit_stfiwx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                  LoadStoreParams params, const CodeOp& op) {
     const u32 inst = op.inst;
     const u32 rs   = GekkoOperands::RS(inst);
@@ -818,6 +837,7 @@ void emit_stfiwx(WasmModuleBuilder& wb, RegCache& rc,
     wb.op_local_set(LOCAL_TMP_EA);
 
     rc.Flush(params.ctx_ptr);
+    frc.Flush(params.ctx_ptr);
 
     wb.op_local_get(LOCAL_TMP_EA);
     wb.op_i32_const((s32)params.ctx_ptr);

@@ -19,6 +19,7 @@
 #include "bementalJIT/wasm_module_builder.h"
 #include "code_op.h"
 #include "common/op_info.h"
+#include "fpr_reg_cache.h"
 #include "ppc_analyst.h"
 #include "ppc_offsets.h"
 #include "reg_cache.h"
@@ -130,7 +131,7 @@ static void emit_store_arch_xer(WasmModuleBuilder& wb, u32 ctx_ptr,
     wb.op_i32_store8(ppc_off::XER_SO_OV);
 }
 
-void emit_mfspr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_mfspr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
     const u32 inst    = op.inst;
     const u32 rt      = GekkoOperands::RD(inst);
@@ -151,10 +152,12 @@ void emit_mfspr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
         // ops' Flush doesn't overwrite the interp's writes with stale
         // locals.
         rc.Flush(ctx_ptr);
+        frc.Flush(ctx_ptr);
         wb.op_i32_const((s32)inst);
         wb.op_i32_const((s32)op.address);
         wb.op_call(WIMPORT_INTERP);
         rc.ReloadAll(ctx_ptr);
+        frc.ReloadAll(ctx_ptr);
         return;
     }
 
@@ -164,7 +167,7 @@ void emit_mfspr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_local_set(rc_rt.local_idx());
 }
 
-void emit_mtspr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_mtspr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
     const u32 inst    = op.inst;
     const u32 rs      = GekkoOperands::RS(inst);
@@ -190,10 +193,12 @@ void emit_mtspr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
         // ops' Flush doesn't overwrite the interp's writes with stale
         // locals.
         rc.Flush(ctx_ptr);
+        frc.Flush(ctx_ptr);
         wb.op_i32_const((s32)inst);
         wb.op_i32_const((s32)op.address);
         wb.op_call(WIMPORT_INTERP);
         rc.ReloadAll(ctx_ptr);
+        frc.ReloadAll(ctx_ptr);
         return;
     }
 
@@ -203,7 +208,7 @@ void emit_mtspr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_store(ppc_off::spr(spr_num));
 }
 
-void emit_mfmsr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_mfmsr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
     const u32 rt = GekkoOperands::RD(op.inst);
     auto rc_rt = rc.Bind(rt, RCMode::Write);
@@ -212,7 +217,7 @@ void emit_mfmsr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_local_set(rc_rt.local_idx());
 }
 
-void emit_mtmsr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_mtmsr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
     // ASYNC delivery (revert of synchronous-delivery fix). Per
     // feedback_session_2026_05_28_dolphin_run_avoidance and the SAB
@@ -237,6 +242,7 @@ void emit_mtmsr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     auto rc_rs = rc.Bind(rs, RCMode::Read);
 
     rc.Flush(ctx_ptr);
+    frc.Flush(ctx_ptr);
 
     // Store new MSR.
     wb.op_i32_const((s32)ctx_ptr);
@@ -289,24 +295,27 @@ void emit_mtmsr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // Matches gekko_emit.cpp:2677/2681 (emit_fallback only).
 // ---------------------------------------------------------------------------
 static void emit_simple_fallback(WasmModuleBuilder& wb, RegCache& rc,
-                                 const CodeOp& op, u32 ctx_ptr) {
+                                 FPRRegCache& frc, const CodeOp& op,
+                                 u32 ctx_ptr) {
     // Mirror emit_fallback (ppc_emit.cpp:56-63): Flush dirty locals so the
     // interp sees current GPR state, then ReloadAll after so later ops'
     // Flush doesn't overwrite the interp's writes with stale locals.
     rc.Flush(ctx_ptr);
+    frc.Flush(ctx_ptr);
     wb.op_i32_const((s32)op.inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
     rc.ReloadAll(ctx_ptr);
+    frc.ReloadAll(ctx_ptr);
 }
 
-void emit_mfcr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_mfcr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                u32 ctx_ptr) {
-    emit_simple_fallback(wb, rc, op, ctx_ptr);
+    emit_simple_fallback(wb, rc, frc, op, ctx_ptr);
 }
-void emit_mtcrf(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_mtcrf(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
-    emit_simple_fallback(wb, rc, op, ctx_ptr);
+    emit_simple_fallback(wb, rc, frc, op, ctx_ptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -321,25 +330,25 @@ void emit_mtcrf(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // runs once at boot; tlbie is not used in normal boot. Cheap fallback is
 // fine.
 // ---------------------------------------------------------------------------
-void emit_mtsr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_mtsr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                u32 ctx_ptr) {
-    emit_simple_fallback(wb, rc, op, ctx_ptr);
+    emit_simple_fallback(wb, rc, frc, op, ctx_ptr);
 }
-void emit_mfsr(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_mfsr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                u32 ctx_ptr) {
-    emit_simple_fallback(wb, rc, op, ctx_ptr);
+    emit_simple_fallback(wb, rc, frc, op, ctx_ptr);
 }
-void emit_mtsrin(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_mtsrin(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr) {
-    emit_simple_fallback(wb, rc, op, ctx_ptr);
+    emit_simple_fallback(wb, rc, frc, op, ctx_ptr);
 }
-void emit_mfsrin(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_mfsrin(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr) {
-    emit_simple_fallback(wb, rc, op, ctx_ptr);
+    emit_simple_fallback(wb, rc, frc, op, ctx_ptr);
 }
-void emit_tlbie(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_tlbie(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
-    emit_simple_fallback(wb, rc, op, ctx_ptr);
+    emit_simple_fallback(wb, rc, frc, op, ctx_ptr);
 }
 
 }  // namespace bemental::powerpc

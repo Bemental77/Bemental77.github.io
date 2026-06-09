@@ -20,6 +20,7 @@
 #include "bementalJIT/wasm_module_builder.h"
 #include "code_op.h"
 #include "cr_encode.h"
+#include "fpr_reg_cache.h"
 #include "ppc_analyst.h"
 #include "reg_cache.h"
 
@@ -28,7 +29,7 @@ namespace bemental::powerpc {
 static constexpr u32 LOCAL_TMP_DIFF = 0;  // shared with LOCAL_TMP_EA
 static constexpr u32 LOCAL_TMP_IMM  = 1;  // shared with LOCAL_TMP_VAL
 
-void emit_cmpi(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_cmpi(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 crfd = GekkoOperands::CRFD(inst);
@@ -44,7 +45,7 @@ void emit_cmpi(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                              LOCAL_TMP_IMM);
 }
 
-void emit_cmpli(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_cmpli(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 crfd = GekkoOperands::CRFD(inst);
@@ -60,7 +61,7 @@ void emit_cmpli(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                                LOCAL_TMP_IMM);
 }
 
-void emit_cmp(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_cmp(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
               u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 crfd = GekkoOperands::CRFD(inst);
@@ -75,7 +76,7 @@ void emit_cmp(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
                              rc_rb.local_idx());
 }
 
-void emit_cmpl(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_cmpl(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 crfd = GekkoOperands::CRFD(inst);

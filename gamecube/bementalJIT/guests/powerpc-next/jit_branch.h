@@ -8,6 +8,7 @@
 
 #include "bementalJIT/types.h"
 #include "code_op.h"
+#include "fpr_reg_cache.h"
 #include "reg_cache.h"
 
 class WasmModuleBuilder;
@@ -21,7 +22,7 @@ namespace bemental::powerpc {
 // BLR-stack: LK=1 PUSHes the after-PC onto the SAB-resident return-PC ring
 // (see jit_branch.cpp header comment for the SAB layout) so the matching
 // `blr` can detect stack corruption. Mirrors Jit64 Jit.cpp:641-645.
-void emit_bx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_bx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
              u32 ctx_ptr);
 
 // Conditional branch — bcx (op16). Decodes BO/BI for CR + CTR conditions.
@@ -32,7 +33,7 @@ void emit_bx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // BLR-stack: the inline BO=20 LK=1 path pushes. The interp-fallback path
 // does NOT push (interp owns LR mutation for the LK arm); this is a known
 // gap in the mispredict diagnostic, tolerated because bclXX,LK is rare.
-void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
               u32 ctx_ptr);
 
 // Indirect: bclr (op19:16) takes target from LR; bcctr (op19:528) takes
@@ -47,16 +48,16 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 //
 // emit_bcctrx does NOT pop — CTR holds a forward-call target, not a
 // return PC. LK=1 still PUSHes (bcctrl is a linked call).
-void emit_bclrx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_bclrx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr);
-void emit_bcctrx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_bcctrx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr);
 
 // rfi (op19:50). Always block-end; restores PC from SRR0, MSR from SRR1.
 // Phase 4 part 2 fallbacks this to WIMPORT_INTERP — the SRR1->MSR
 // transition path needs the exception-state save/restore from
 // Jit_SystemRegisters.cpp which lands in Phase 4 part 3.
-void emit_rfi(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_rfi(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
               u32 ctx_ptr);
 
 }  // namespace bemental::powerpc

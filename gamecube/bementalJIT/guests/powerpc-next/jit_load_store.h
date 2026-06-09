@@ -21,6 +21,7 @@
 
 #include "bementalJIT/types.h"
 #include "code_op.h"
+#include "fpr_reg_cache.h"
 #include "reg_cache.h"
 
 class WasmModuleBuilder;
@@ -43,23 +44,23 @@ enum class StoreWidth : u8 { U8, U16, U32 };
 
 // D-form load: EA = (RA==0 ? 0 : gpr[RA]) + SIMM. RT receives the loaded
 // value. Update mode writes EA back to RA when update=true.
-void emit_load_d(WasmModuleBuilder& wb, RegCache& rc,
+void emit_load_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                  LoadStoreParams params, const CodeOp& op,
                  LoadWidth width, bool update);
 
 // D-form store: EA = (RA==0 ? 0 : gpr[RA]) + SIMM. RS provides the stored
 // value. Update mode writes EA back to RA when update=true.
-void emit_store_d(WasmModuleBuilder& wb, RegCache& rc,
+void emit_store_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                   LoadStoreParams params, const CodeOp& op,
                   StoreWidth width, bool update);
 
 // X-form load: EA = (RA==0 ? 0 : gpr[RA]) + gpr[RB].
-void emit_load_x(WasmModuleBuilder& wb, RegCache& rc,
+void emit_load_x(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                  LoadStoreParams params, const CodeOp& op,
                  LoadWidth width, bool update);
 
 // X-form store: EA = (RA==0 ? 0 : gpr[RA]) + gpr[RB].
-void emit_store_x(WasmModuleBuilder& wb, RegCache& rc,
+void emit_store_x(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                   LoadStoreParams params, const CodeOp& op,
                   StoreWidth width, bool update);
 
@@ -73,29 +74,29 @@ void emit_store_x(WasmModuleBuilder& wb, RegCache& rc,
 // Op31 xo: 535 lfsx, 663 stfsx, 983 stfiwx. Per gekko_emit.cpp:2847-2878
 // these were the top-3 of remaining op31 interp fallbacks (= 85% of total
 // op31 fallbacks in a 500K-dispatch window).
-void emit_lfsx  (WasmModuleBuilder& wb, RegCache& rc,
+void emit_lfsx  (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                  LoadStoreParams params, const CodeOp& op);
-void emit_stfsx (WasmModuleBuilder& wb, RegCache& rc,
+void emit_stfsx (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                  LoadStoreParams params, const CodeOp& op);
-void emit_stfiwx(WasmModuleBuilder& wb, RegCache& rc,
+void emit_stfiwx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                  LoadStoreParams params, const CodeOp& op);
 
 // ----- FP D-form (immediate offset) double load / store.
 // lfd (opc 50), lfdu (opc 51), stfd (opc 54), stfdu (opc 55). Slowmem-only.
-void emit_lfd (WasmModuleBuilder& wb, RegCache& rc,
+void emit_lfd (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op, bool update);
-void emit_stfd(WasmModuleBuilder& wb, RegCache& rc,
+void emit_stfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op, bool update);
 
 // ----- D-form load/store-multiple (opc 46/47). Per Jit64 Jit_LoadStore.cpp.
-void emit_lmw (WasmModuleBuilder& wb, RegCache& rc,
+void emit_lmw (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op);
-void emit_stmw(WasmModuleBuilder& wb, RegCache& rc,
+void emit_stmw(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op);
 
 // ----- FP D-form (immediate offset) single load (opc 48 lfs, 49 lfsu).
 // stfs/stfsu (52/53) deferred — need PEM ConvertToSingle inline bit-twiddle.
-void emit_lfs (WasmModuleBuilder& wb, RegCache& rc,
+void emit_lfs (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op, bool update);
 
 }  // namespace bemental::powerpc

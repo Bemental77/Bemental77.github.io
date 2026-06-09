@@ -12,6 +12,7 @@
 #include "bementalJIT/wasm_module_builder.h"
 #include "code_op.h"
 #include "cr_encode.h"
+#include "fpr_reg_cache.h"
 #include "ppc_analyst.h"
 #include "ppc_offsets.h"
 #include "reg_cache.h"
@@ -31,13 +32,16 @@ namespace bemental::powerpc {
 // Returns true when the op was handled (interp call emitted); caller must
 // early-return in that case.
 static bool emit_oe_fallback_if_set(WasmModuleBuilder& wb, RegCache& rc,
-                                    const CodeOp& op, u32 ctx_ptr) {
+                                    FPRRegCache& frc, const CodeOp& op,
+                                    u32 ctx_ptr) {
     if (!GekkoOperands::OE(op.inst)) return false;
     rc.Flush(ctx_ptr);
+    frc.Flush(ctx_ptr);
     wb.op_i32_const((s32)op.inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(/*WIMPORT_INTERP=*/6);
     rc.ReloadAll(ctx_ptr);
+    frc.ReloadAll(ctx_ptr);
     return true;
 }
 
@@ -58,7 +62,7 @@ static void emit_ra_or_zero(WasmModuleBuilder& wb, RegCache& rc, u32 ra) {
 // ---------------------------------------------------------------------------
 // D-form arithmetic immediate
 // ---------------------------------------------------------------------------
-void emit_addi(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
+void emit_addi(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op) {
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
     auto rc_rt = rc.Bind(rt, RCMode::Write);
@@ -77,7 +81,7 @@ void emit_addi(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
     wb.op_local_set(rc_rt.local_idx());
 }
 
-void emit_addis(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
+void emit_addis(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op) {
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
     auto rc_rt = rc.Bind(rt, RCMode::Write);
@@ -94,7 +98,7 @@ void emit_addis(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
     wb.op_local_set(rc_rt.local_idx());
 }
 
-void emit_addic(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_addic(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
     // RT = RA + SIMM; set XER.CA = (result < RA).  RA is always read (no
     // a-or-zero variant — FL_IN_A, not FL_IN_A0).
@@ -143,9 +147,9 @@ void emit_addic(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // Same semantics as addic (XER.CA from unsigned wrap of RA+SIMM) PLUS a
 // CR0 update from the signed result-vs-0. Per gekko_emit.cpp:300
 // emit_addic_rc_impl.
-void emit_addic_rc(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_addic_rc(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                    u32 ctx_ptr) {
-    emit_addic(wb, rc, op, ctx_ptr);
+    emit_addic(wb, rc, frc, op, ctx_ptr);
     // After emit_addic, rt's local holds the result. Re-bind RT in Read
     // mode (still cached) and update CR0 from its signed value-vs-0.
     const u32 rt = GekkoOperands::RD(op.inst);
@@ -153,7 +157,7 @@ void emit_addic_rc(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
 }
 
-void emit_subfic(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_subfic(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr) {
     // RT = ~RA + SIMM + 1 = SIMM - RA  (with CA on overflow detect of the
     // two-operand carry chain: CA = (carry out of (~RA + SIMM + 1))).
@@ -180,7 +184,7 @@ void emit_subfic(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     wb.op_i32_store8(0x2F4);
 }
 
-void emit_mulli(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
+void emit_mulli(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op) {
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
     const u32 ra   = GekkoOperands::RA(inst);
@@ -198,6 +202,7 @@ void emit_mulli(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
 // D-form logical immediate
 // ---------------------------------------------------------------------------
 static void emit_logical_imm_simple(WasmModuleBuilder& wb, RegCache& rc,
+                                    FPRRegCache& /*frc*/,
                                     const CodeOp& op, u32 imm_value,
                                     void (WasmModuleBuilder::*opfn)()) {
     const u32 inst = op.inst;
@@ -217,9 +222,9 @@ static void emit_logical_imm_simple(WasmModuleBuilder& wb, RegCache& rc,
     wb.op_local_set(rc_ra.local_idx());
 }
 
-void emit_ori(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
+void emit_ori(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op) {
     const u32 uimm = GekkoOperands::UIMM_16(op.inst);
-    emit_logical_imm_simple(wb, rc, op, uimm, &WasmModuleBuilder::op_i32_or);
+    emit_logical_imm_simple(wb, rc, frc, op, uimm, &WasmModuleBuilder::op_i32_or);
 }
 
 // andi. (op 28) / andis. (op 29) — Logical AND Immediate (with optional shift)
@@ -238,7 +243,7 @@ void emit_ori(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
 // CR0 spec: SO copied from XER.SO; LT/GT/EQ computed by signed comparison of
 // result with 0. We use emit_cr0_from_local which mirrors the canonical
 // gekko_emit.cpp:421-441 implementation.
-static void emit_andi_imm(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+static void emit_andi_imm(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                           u32 imm_value, u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 ra   = GekkoOperands::RA(inst);   // dest
@@ -256,34 +261,34 @@ static void emit_andi_imm(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
 }
 
-void emit_andix(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_andix(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
     const u32 uimm = GekkoOperands::UIMM_16(op.inst);
-    emit_andi_imm(wb, rc, op, uimm, ctx_ptr);
+    emit_andi_imm(wb, rc, frc, op, uimm, ctx_ptr);
 }
 
-void emit_andisx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_andisx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr) {
     const u32 uimm = GekkoOperands::UIMM_16(op.inst) << 16;
-    emit_andi_imm(wb, rc, op, uimm, ctx_ptr);
+    emit_andi_imm(wb, rc, frc, op, uimm, ctx_ptr);
 }
-void emit_oris(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
+void emit_oris(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op) {
     const u32 uimm = GekkoOperands::UIMM_16(op.inst) << 16;
-    emit_logical_imm_simple(wb, rc, op, uimm, &WasmModuleBuilder::op_i32_or);
+    emit_logical_imm_simple(wb, rc, frc, op, uimm, &WasmModuleBuilder::op_i32_or);
 }
-void emit_xori(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
+void emit_xori(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op) {
     const u32 uimm = GekkoOperands::UIMM_16(op.inst);
-    emit_logical_imm_simple(wb, rc, op, uimm, &WasmModuleBuilder::op_i32_xor);
+    emit_logical_imm_simple(wb, rc, frc, op, uimm, &WasmModuleBuilder::op_i32_xor);
 }
-void emit_xoris(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op) {
+void emit_xoris(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op) {
     const u32 uimm = GekkoOperands::UIMM_16(op.inst) << 16;
-    emit_logical_imm_simple(wb, rc, op, uimm, &WasmModuleBuilder::op_i32_xor);
+    emit_logical_imm_simple(wb, rc, frc, op, uimm, &WasmModuleBuilder::op_i32_xor);
 }
 
 // ---------------------------------------------------------------------------
 // X-form arithmetic (op31 sub)
 // ---------------------------------------------------------------------------
-static void emit_binop_x(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+static void emit_binop_x(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                          void (WasmModuleBuilder::*opfn)(),
                          u32 ctx_ptr) {
     const u32 inst = op.inst;
@@ -302,12 +307,12 @@ static void emit_binop_x(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
 }
 
-void emit_addx (WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
-    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
-    emit_binop_x(wb, rc, op, &WasmModuleBuilder::op_i32_add, ctx_ptr);
+void emit_addx (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, frc, op, ctx_ptr)) return;
+    emit_binop_x(wb, rc, frc, op, &WasmModuleBuilder::op_i32_add, ctx_ptr);
 }
-void emit_subfx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
-    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
+void emit_subfx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, frc, op, ctx_ptr)) return;
     // subf: RT = RB - RA  (note operand order is reversed vs Wasm sub-form).
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
@@ -324,15 +329,15 @@ void emit_subfx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_p
         emit_cr0_from_local(wb, ctx_ptr, rc_rt.local_idx());
     }
 }
-void emit_mullwx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
-    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
-    emit_binop_x(wb, rc, op, &WasmModuleBuilder::op_i32_mul, ctx_ptr);
+void emit_mullwx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, frc, op, ctx_ptr)) return;
+    emit_binop_x(wb, rc, frc, op, &WasmModuleBuilder::op_i32_mul, ctx_ptr);
 }
 
 // ---------------------------------------------------------------------------
 // X-form logical (op31 sub) — bool family. RA-form dest, RS-RB source.
 // ---------------------------------------------------------------------------
-static void emit_boolx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+static void emit_boolx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                        void (WasmModuleBuilder::*opfn)(),
                        u32 ctx_ptr) {
     const u32 inst = op.inst;
@@ -351,8 +356,8 @@ static void emit_boolx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
 }
 
-void emit_andx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
-    emit_boolx(wb, rc, op, &WasmModuleBuilder::op_i32_and, ctx_ptr);
+void emit_andx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
+    emit_boolx(wb, rc, frc, op, &WasmModuleBuilder::op_i32_and, ctx_ptr);
 }
 // andc rA, rS, rB  (op31 xo=60): RA = RS AND (NOT RB).
 // Used by the SAB OS-interrupt path (canonical:
@@ -364,7 +369,7 @@ void emit_andx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_pt
 // originally attributed here has since been re-rooted to MMIO routing —
 // see memory gamecube_first_mmio_divergence_2026_05_28 for the current
 // authoritative wedge root.
-void emit_andcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_andcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 ra   = GekkoOperands::RA(inst);   // dest
     const u32 rs   = GekkoOperands::RS(inst);
@@ -382,7 +387,7 @@ void emit_andcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_p
         emit_cr0_from_local(wb, ctx_ptr, rc_ra.local_idx());
     }
 }
-void emit_orx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_orx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     // Common shape: `or rA, rS, rS` = `mr rA, rS`. WASM doesn't have a
     // dedicated MOV; the redundant i32_or with two equal operands is fine
     // (Liftoff folds it; TurboFan does even better).
@@ -394,12 +399,12 @@ void emit_orx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr
     // commit 4167634 + the cmp/CR0 sign-extension fix in commit c7dc522).
     // Per CLAUDE.md gate #8 ("diagnostics are temporary and must not
     // accumulate") the substitution is now scrubbed.
-    emit_boolx(wb, rc, op, &WasmModuleBuilder::op_i32_or, ctx_ptr);
+    emit_boolx(wb, rc, frc, op, &WasmModuleBuilder::op_i32_or, ctx_ptr);
 }
-void emit_xorx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
-    emit_boolx(wb, rc, op, &WasmModuleBuilder::op_i32_xor, ctx_ptr);
+void emit_xorx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
+    emit_boolx(wb, rc, frc, op, &WasmModuleBuilder::op_i32_xor, ctx_ptr);
 }
-void emit_norx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_norx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     // nor: RA = ~(RS | RB)
     const u32 inst = op.inst;
     const u32 ra   = GekkoOperands::RA(inst);
@@ -424,7 +429,7 @@ void emit_norx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_pt
 // WASM has no signed-byte sign-extend opcode pre-bulk-memory; do it via
 // shl 24 / shr_s 24 (16/16 for half).
 // ---------------------------------------------------------------------------
-static void emit_sign_ext(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+static void emit_sign_ext(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                           u32 bit_count, u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 ra   = GekkoOperands::RA(inst);
@@ -442,18 +447,18 @@ static void emit_sign_ext(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
 }
 
-void emit_extsbx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
-    emit_sign_ext(wb, rc, op, 8, ctx_ptr);
+void emit_extsbx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
+    emit_sign_ext(wb, rc, frc, op, 8, ctx_ptr);
 }
-void emit_extshx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
-    emit_sign_ext(wb, rc, op, 16, ctx_ptr);
+void emit_extshx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
+    emit_sign_ext(wb, rc, frc, op, 16, ctx_ptr);
 }
 
 // ---------------------------------------------------------------------------
 // Count leading zeros — direct WASM i32.clz mapping. PowerPC semantics
 // match WASM's: cntlzw(0) == 32.
 // ---------------------------------------------------------------------------
-void emit_cntlzwx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
+void emit_cntlzwx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 ra   = GekkoOperands::RA(inst);
     const u32 rs   = GekkoOperands::RS(inst);
@@ -472,7 +477,7 @@ void emit_cntlzwx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx
 // (only the low 6 bits of RB are inspected, and bit 5 forces the result
 // to 0). Implement via guard: if (rb & 0x20) result = 0; else shift.
 // ---------------------------------------------------------------------------
-static void emit_shiftx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+static void emit_shiftx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                         void (WasmModuleBuilder::*opfn)(),
                         u32 ctx_ptr) {
     const u32 inst = op.inst;
@@ -517,11 +522,11 @@ static void emit_shiftx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
 }
 
-void emit_slwx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
-    emit_shiftx(wb, rc, op, &WasmModuleBuilder::op_i32_shl, ctx_ptr);
+void emit_slwx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
+    emit_shiftx(wb, rc, frc, op, &WasmModuleBuilder::op_i32_shl, ctx_ptr);
 }
-void emit_srwx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
-    emit_shiftx(wb, rc, op, &WasmModuleBuilder::op_i32_shr_u, ctx_ptr);
+void emit_srwx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
+    emit_shiftx(wb, rc, frc, op, &WasmModuleBuilder::op_i32_shr_u, ctx_ptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -552,7 +557,7 @@ static constexpr u32 make_ppc_mask(u32 mb, u32 me) {
     return ~gap;
 }
 
-void emit_rlwinmx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_rlwinmx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                   u32 ctx_ptr) {
     // rlwinm: RA = ROL32(RS, SH) & mask(MB, ME)
     // rlwinm. (Rc=1): also write CR0 from the signed result-vs-zero.
@@ -592,7 +597,7 @@ void emit_rlwinmx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
 }
 
-void emit_rlwimix(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_rlwimix(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                   u32 ctx_ptr) {
     // rlwimi: RA = (ROL32(RS, SH) & mask) | (RA & ~mask)
     // rlwimi. (Rc=1): also write CR0 from the signed result-vs-zero.
@@ -632,7 +637,7 @@ void emit_rlwimix(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // i.e. CA captures "did we shift out a 1 from a negative value (which
 // means the rounding direction was wrong vs floor-div-by-2^SH)".
 // ---------------------------------------------------------------------------
-void emit_srawix(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_srawix(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 ra   = GekkoOperands::RA(inst);
@@ -688,7 +693,7 @@ void emit_srawix(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
 }
 
-void emit_srawx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_srawx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
     // srawx: shift count from rb low 6 bits. If bit 5 set, result is
     // 0xFFFFFFFF if rs<0 else 0; CA = sign of rs. Otherwise behaves like
@@ -765,8 +770,8 @@ void emit_srawx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // ---------------------------------------------------------------------------
 // Negate (op31:104). rt = -ra. WASM: 0 - ra.
 // ---------------------------------------------------------------------------
-void emit_negx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op, u32 ctx_ptr) {
-    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
+void emit_negx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
+    if (emit_oe_fallback_if_set(wb, rc, frc, op, ctx_ptr)) return;
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
     const u32 ra   = GekkoOperands::RA(inst);
@@ -830,9 +835,9 @@ static void emit_ca_chain(WasmModuleBuilder& wb, u32 ctx_ptr,
     }
 }
 
-void emit_addex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_addex(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
-    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
+    if (emit_oe_fallback_if_set(wb, rc, frc, op, ctx_ptr)) return;
     const u32 inst = op.inst;
     auto rc_rt = rc.Bind(GekkoOperands::RD(inst), RCMode::Write);
     auto rc_ra = rc.Bind(GekkoOperands::RA(inst), RCMode::Read);
@@ -844,9 +849,9 @@ void emit_addex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
 }
 
-void emit_subfex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_subfex(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr) {
-    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
+    if (emit_oe_fallback_if_set(wb, rc, frc, op, ctx_ptr)) return;
     // subfe: rt = ~ra + rb + CA. Inlined (can't reuse emit_ca_chain
     // because it stashes sum1 in LOCAL_TMP_SCRATCH; we'd alias if we
     // pre-stashed ~ra there). Recompute ~ra at the carry-out check.
@@ -886,9 +891,9 @@ void emit_subfex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
 }
 
-void emit_addmex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_addmex(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr) {
-    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
+    if (emit_oe_fallback_if_set(wb, rc, frc, op, ctx_ptr)) return;
     // addme: rt = ra + (-1) + CA. operand_b = -1.
     const u32 inst = op.inst;
     auto rc_rt = rc.Bind(GekkoOperands::RD(inst), RCMode::Write);
@@ -902,7 +907,7 @@ void emit_addmex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
 }
 
-void emit_subfmex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_subfmex(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                   u32 ctx_ptr) {
     // OE-form is handled by the same interp fallback below (the body
     // already routes to WIMPORT_INTERP), so no separate OE guard needed.
@@ -929,9 +934,9 @@ void emit_subfmex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     rc.ReloadAll(ctx_ptr);
 }
 
-void emit_addzex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_addzex(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr) {
-    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
+    if (emit_oe_fallback_if_set(wb, rc, frc, op, ctx_ptr)) return;
     // addze: rt = ra + 0 + CA = ra + CA. Specialized form:
     //   result = ra + CA_in
     //   CA_out = (result < ra)
@@ -955,9 +960,9 @@ void emit_addzex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
 }
 
-void emit_subfzex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_subfzex(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                   u32 ctx_ptr) {
-    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
+    if (emit_oe_fallback_if_set(wb, rc, frc, op, ctx_ptr)) return;
     // subfze: rt = ~ra + 0 + CA = ~ra + CA.
     //   result = ~ra + CA
     //   CA_out = (result < ~ra)
@@ -987,7 +992,7 @@ void emit_subfzex(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     }
 }
 
-void emit_rlwnmx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_rlwnmx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr) {
     // rlwnm: RA = ROL32(RS, RB & 0x1F) & mask(MB, ME)
     // rlwnm. (Rc=1): also write CR0 from the signed result-vs-zero.
@@ -1029,9 +1034,9 @@ void emit_rlwnmx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // addc rT, rA, rB: rT = rA + rB; XER.CA = unsigned carry-out.
 // Per PowerPC arch manual: CA = (result < rA) unsigned.
 // gekko_emit.cpp:1521 emit_addcx_impl.
-void emit_addcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_addcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
-    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
+    if (emit_oe_fallback_if_set(wb, rc, frc, op, ctx_ptr)) return;
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
     const u32 ra   = GekkoOperands::RA(inst);
@@ -1061,9 +1066,9 @@ void emit_addcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // subfc rT, rA, rB: rT = rB - rA; XER.CA = (rA <= rB) unsigned (carry-out
 // of ~rA + rB + 1 = no-borrow).
 // gekko_emit.cpp:1545 emit_subfcx_impl.
-void emit_subfcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_subfcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr) {
-    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
+    if (emit_oe_fallback_if_set(wb, rc, frc, op, ctx_ptr)) return;
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
     const u32 ra   = GekkoOperands::RA(inst);
@@ -1096,7 +1101,7 @@ void emit_subfcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // ---------------------------------------------------------------------------
 
 // nand rA, rS, rB: RA = ~(RS & RB). gekko_emit.cpp:1481 emit_nandx_impl.
-void emit_nandx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_nandx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 ra   = GekkoOperands::RA(inst);
@@ -1117,7 +1122,7 @@ void emit_nandx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 }
 
 // eqv rA, rS, rB: RA = ~(RS ^ RB). gekko_emit.cpp:1482 emit_eqvx_impl.
-void emit_eqvx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_eqvx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 ra   = GekkoOperands::RA(inst);
@@ -1138,7 +1143,7 @@ void emit_eqvx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 }
 
 // orc rA, rS, rB: RA = RS | ~RB. gekko_emit.cpp:1487 emit_orcx_impl.
-void emit_orcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_orcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 ra   = GekkoOperands::RA(inst);
@@ -1165,7 +1170,7 @@ void emit_orcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // ---------------------------------------------------------------------------
 
 // mulhw rT, rA, rB: rT = high 32 bits of (s32)rA * (s32)rB.
-void emit_mulhwx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_mulhwx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
@@ -1189,7 +1194,7 @@ void emit_mulhwx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 }
 
 // mulhwu rT, rA, rB: rT = high 32 bits of (u32)rA * (u32)rB.
-void emit_mulhwux(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_mulhwux(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                   u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
@@ -1220,6 +1225,7 @@ void emit_mulhwux(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // Ported from gekko_emit.cpp:1948-2001 emit_div_guarded.
 // ---------------------------------------------------------------------------
 static void emit_div_guarded_next(WasmModuleBuilder& wb, RegCache& rc,
+                                  FPRRegCache& /*frc*/,
                                   const CodeOp& op, bool is_signed,
                                   u32 ctx_ptr) {
     const u32 inst = op.inst;
@@ -1278,15 +1284,15 @@ static void emit_div_guarded_next(WasmModuleBuilder& wb, RegCache& rc,
     }
 }
 
-void emit_divwx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_divwx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
-    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
-    emit_div_guarded_next(wb, rc, op, /*is_signed=*/true, ctx_ptr);
+    if (emit_oe_fallback_if_set(wb, rc, frc, op, ctx_ptr)) return;
+    emit_div_guarded_next(wb, rc, frc, op, /*is_signed=*/true, ctx_ptr);
 }
-void emit_divwux(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_divwux(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr) {
-    if (emit_oe_fallback_if_set(wb, rc, op, ctx_ptr)) return;
-    emit_div_guarded_next(wb, rc, op, /*is_signed=*/false, ctx_ptr);
+    if (emit_oe_fallback_if_set(wb, rc, frc, op, ctx_ptr)) return;
+    emit_div_guarded_next(wb, rc, frc, op, /*is_signed=*/false, ctx_ptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1298,7 +1304,7 @@ void emit_divwux(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // agent audit; falling back to interp here was a major fallback hot-spot.
 // Ported from gekko_emit.cpp:2646 emit_mftb_impl.
 // ---------------------------------------------------------------------------
-void emit_mftb(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_mftb(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 rt   = GekkoOperands::RD(inst);
@@ -1342,7 +1348,7 @@ void emit_mftb(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // bypassed those — fast but wrong. Until a dedicated WIMPORT for
 // ClearDCacheLine lands, the interp delegate is the safe shape.
 // ---------------------------------------------------------------------------
-void emit_dcbz(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_dcbz(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                u32 ctx_ptr) {
     // CONSERVATIVE FIX (2026-06-01): the prior 8x per-word WIMPORT_WRITE32
     // inline was semantically WRONG — it bypassed MMU::ClearDCacheLine, did

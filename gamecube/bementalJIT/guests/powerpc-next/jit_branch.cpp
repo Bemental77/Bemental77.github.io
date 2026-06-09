@@ -232,7 +232,7 @@ static void emit_blr_pop_and_check(WasmModuleBuilder& wb, u32 ctx_ptr,
 //   if (LK) gpr[LR] = pc + 4;
 //   pc = target;
 // ---------------------------------------------------------------------------
-void emit_bx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_bx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
              u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 li   = GekkoOperands::LI(inst);
@@ -242,6 +242,7 @@ void emit_bx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 
     // Flush dirty GPRs before block-exiting branch.
     rc.Flush(ctx_ptr);
+    frc.Flush(ctx_ptr);
 
     if (lk) {
         emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::lr_off(), op.address + 4);
@@ -262,13 +263,14 @@ void emit_bx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // rare combos (LK conditional calls; exotic CTR+CR mixes) fall back to
 // WIMPORT_INTERP via the trailing path.
 // ---------------------------------------------------------------------------
-void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
               u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 bo   = GekkoOperands::BO(inst);
 
     // Flush before bail-or-take.
     rc.Flush(ctx_ptr);
+    frc.Flush(ctx_ptr);
 
     if (bo == 20) {
         // "branch always" — equivalent to bx without LK side-effect choice.
@@ -401,13 +403,14 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // rerouting the PC (option (a) from the task brief — preserves current
 // "trust LR" semantics, just makes the mismatch observable).
 // ---------------------------------------------------------------------------
-void emit_bclrx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_bclrx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                 u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 bo   = GekkoOperands::BO(inst);
     const bool lk  = GekkoOperands::LK(inst);
 
     rc.Flush(ctx_ptr);
+    frc.Flush(ctx_ptr);
 
     if (bo == 20) {
         // Pop + check FIRST, before mutating LR for the LK case.
@@ -443,7 +446,7 @@ void emit_bclrx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // a return. Jit64 likewise only checks the BLR stack in WriteBLRExit
 // (LR path), not in bcctr.
 // ---------------------------------------------------------------------------
-void emit_bcctrx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_bcctrx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
                  u32 ctx_ptr) {
     const u32 inst = op.inst;
     const u32 bo   = GekkoOperands::BO(inst);
@@ -455,6 +458,7 @@ void emit_bcctrx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
     const bool no_cr_test  = (bo & 0x10) != 0;
 
     rc.Flush(ctx_ptr);
+    frc.Flush(ctx_ptr);
 
     if (no_ctr_test && no_cr_test) {
         wb.op_i32_const((s32)ctx_ptr);
@@ -483,9 +487,10 @@ void emit_bcctrx(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
 // block. Inlining this safely needs the WIMPORT_CHECK_EXC integration that
 // Phase 4 part 3 wires in.
 // ---------------------------------------------------------------------------
-void emit_rfi(WasmModuleBuilder& wb, RegCache& rc, const CodeOp& op,
+void emit_rfi(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
               u32 ctx_ptr) {
     rc.Flush(ctx_ptr);
+    frc.Flush(ctx_ptr);
     wb.op_i32_const((s32)op.inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
