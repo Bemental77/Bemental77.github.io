@@ -101,6 +101,12 @@ void emit_ps_nabs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const C
 }
 
 // ps_merge00 fD, fA, fB — fD.ps0 <- fA.ps0; fD.ps1 <- fB.ps0.
+// Write order: d.ps1 from b.ps0 FIRST, then d.ps0 from a.ps0. When d==b,
+// writing d.ps0 = a.ps0 corrupts the shared local that also holds b.ps0;
+// reading b.ps0 after that point sees a.ps0 instead of the original.
+// Jit64 Jit_Paired.cpp:117 uses VUNPCKLPD which is atomic; we emit two
+// sequential local copies so order matters. d==a aliasing is safe either
+// way (different lane).
 void emit_ps_merge00(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
@@ -110,10 +116,12 @@ void emit_ps_merge00(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, cons
     auto a_pair = frc.Bind(a, FPRMode::Read,  FPR_LANE_PS0);
     auto b_pair = frc.Bind(b, FPRMode::Read,  FPR_LANE_PS0);
     auto d_pair = frc.Bind(d, FPRMode::Write, FPR_LANE_BOTH);
-    wb.op_local_get(a_pair.ps0_idx);
-    wb.op_local_set(d_pair.ps0_idx);
+    // d.ps1 = b.ps0  (consume b before d.ps0 write that aliases when d==b)
     wb.op_local_get(b_pair.ps0_idx);
     wb.op_local_set(d_pair.ps1_idx);
+    // d.ps0 = a.ps0
+    wb.op_local_get(a_pair.ps0_idx);
+    wb.op_local_set(d_pair.ps0_idx);
 }
 
 // ps_merge01 fD, fA, fB — fD.ps0 <- fA.ps0; fD.ps1 <- fB.ps1.
@@ -133,6 +141,10 @@ void emit_ps_merge01(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, cons
 }
 
 // ps_merge10 fD, fA, fB — fD.ps0 <- fA.ps1; fD.ps1 <- fB.ps0.
+// Same d==b aliasing class as ps_merge00: writing d.ps0 = a.ps1 corrupts
+// the shared local that also holds b.ps0 (since d.ps0 and b.ps0 are both
+// "lane 0 of preg d/b" which is one local when d==b). Reorder: write
+// d.ps1 = b.ps0 first.
 void emit_ps_merge10(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
@@ -142,10 +154,12 @@ void emit_ps_merge10(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, cons
     auto a_pair = frc.Bind(a, FPRMode::Read,  FPR_LANE_PS1);
     auto b_pair = frc.Bind(b, FPRMode::Read,  FPR_LANE_PS0);
     auto d_pair = frc.Bind(d, FPRMode::Write, FPR_LANE_BOTH);
-    wb.op_local_get(a_pair.ps1_idx);
-    wb.op_local_set(d_pair.ps0_idx);
+    // d.ps1 = b.ps0  (consume b before d.ps0 write that aliases when d==b)
     wb.op_local_get(b_pair.ps0_idx);
     wb.op_local_set(d_pair.ps1_idx);
+    // d.ps0 = a.ps1
+    wb.op_local_get(a_pair.ps1_idx);
+    wb.op_local_set(d_pair.ps0_idx);
 }
 
 // ps_merge11 fD, fA, fB — fD.ps0 <- fA.ps1; fD.ps1 <- fB.ps1.
