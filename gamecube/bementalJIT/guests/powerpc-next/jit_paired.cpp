@@ -36,128 +36,147 @@ static void emit_rc_fallback(WasmModuleBuilder& wb, RegCache& rc,
     frc.ReloadAll(ctx_ptr);
 }
 
-// Shared body for ps_neg/ps_abs/ps_nabs (XOR/AND/OR with SIGN bit).
+// Cache-local bit-op helper for ps_neg/ps_abs/ps_nabs.
+// Reads src lane local, applies the SIGN_BIT mask, writes dst lane local.
 enum class PSBitOp { NEG, ABS, NABS };
-static void emit_ps_bit_op(WasmModuleBuilder& wb, u32 ctx_ptr, u32 d, u32 b,
-                           PSBitOp kind) {
+static void emit_lane_bit_op(WasmModuleBuilder& wb, u32 src_local,
+                             u32 dst_local, PSBitOp kind) {
     static constexpr s64 SIGN_BIT = (s64)0x8000000000000000ull;
     static constexpr s64 NOT_SIGN = (s64)0x7FFFFFFFFFFFFFFFull;
-
-    auto apply = [&](u32 src_off, u32 dst_off) {
-        wb.op_i32_const((s32)ctx_ptr);          // store-addr base
-        wb.op_i32_const((s32)ctx_ptr);          // load-addr base
-        wb.op_i64_load(src_off);
-        switch (kind) {
-        case PSBitOp::NEG:  wb.op_i64_const(SIGN_BIT); wb.op_i64_xor(); break;
-        case PSBitOp::ABS:  wb.op_i64_const(NOT_SIGN); wb.op_i64_and(); break;
-        case PSBitOp::NABS: wb.op_i64_const(SIGN_BIT); wb.op_i64_or();  break;
-        }
-        wb.op_i64_store(dst_off);
-    };
-    apply(ppc_off::ps0(b), ppc_off::ps0(d));
-    apply(ppc_off::ps1(b), ppc_off::ps1(d));
+    wb.op_local_get(src_local);
+    switch (kind) {
+    case PSBitOp::NEG:  wb.op_i64_const(SIGN_BIT); wb.op_i64_xor(); break;
+    case PSBitOp::ABS:  wb.op_i64_const(NOT_SIGN); wb.op_i64_and(); break;
+    case PSBitOp::NABS: wb.op_i64_const(SIGN_BIT); wb.op_i64_or();  break;
+    }
+    wb.op_local_set(dst_local);
 }
 
-// Shared body for ps_mr / ps_merge00/01/10/11: copy two f64-bit halves.
-static void emit_ps_copy_halves(WasmModuleBuilder& wb, u32 ctx_ptr, u32 d,
-                                u32 src_a_off, u32 src_b_off) {
-    wb.op_i32_const((s32)ctx_ptr);
-    wb.op_i32_const((s32)ctx_ptr);
-    wb.op_i64_load(src_a_off);
-    wb.op_i64_store(ppc_off::ps0(d));
-
-    wb.op_i32_const((s32)ctx_ptr);
-    wb.op_i32_const((s32)ctx_ptr);
-    wb.op_i64_load(src_b_off);
-    wb.op_i64_store(ppc_off::ps1(d));
-}
-
-// ps_mr fD, fB — fD <- fB (both halves).
-// Step-4 plumbing: every trivial PS op reads ps0/ps1 from memory + writes
-// to memory. Frame each emit with frc.Flush before and frc.ReloadAll after
-// so the FPR cache stays coherent with the memory writes. Step 6 converts
-// these to pure local-to-local copies on the cache and drops both calls.
+// ps_mr fD, fB — fD <- fB (both halves). Pure i64 cache-local copy.
 void emit_ps_mr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 d = GekkoOperands::FD(inst);
     const u32 b = GekkoOperands::FB(inst);
     if (d == b) return;
-    frc.Flush(ctx_ptr);
-    emit_ps_copy_halves(wb, ctx_ptr, d, ppc_off::ps0(b), ppc_off::ps1(b));
-    frc.ReloadAll(ctx_ptr);
+    auto b_pair = frc.Bind(b, FPRMode::Read,  FPR_LANE_BOTH);
+    auto d_pair = frc.Bind(d, FPRMode::Write, FPR_LANE_BOTH);
+    wb.op_local_get(b_pair.ps0_idx);
+    wb.op_local_set(d_pair.ps0_idx);
+    wb.op_local_get(b_pair.ps1_idx);
+    wb.op_local_set(d_pair.ps1_idx);
 }
 
 void emit_ps_neg(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
-    frc.Flush(ctx_ptr);
-    emit_ps_bit_op(wb, ctx_ptr, GekkoOperands::FD(inst), GekkoOperands::FB(inst), PSBitOp::NEG);
-    frc.ReloadAll(ctx_ptr);
+    const u32 d = GekkoOperands::FD(inst);
+    const u32 b = GekkoOperands::FB(inst);
+    auto b_pair = frc.Bind(b, FPRMode::Read,  FPR_LANE_BOTH);
+    auto d_pair = frc.Bind(d, FPRMode::Write, FPR_LANE_BOTH);
+    emit_lane_bit_op(wb, b_pair.ps0_idx, d_pair.ps0_idx, PSBitOp::NEG);
+    emit_lane_bit_op(wb, b_pair.ps1_idx, d_pair.ps1_idx, PSBitOp::NEG);
 }
 
 void emit_ps_abs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
-    frc.Flush(ctx_ptr);
-    emit_ps_bit_op(wb, ctx_ptr, GekkoOperands::FD(inst), GekkoOperands::FB(inst), PSBitOp::ABS);
-    frc.ReloadAll(ctx_ptr);
+    const u32 d = GekkoOperands::FD(inst);
+    const u32 b = GekkoOperands::FB(inst);
+    auto b_pair = frc.Bind(b, FPRMode::Read,  FPR_LANE_BOTH);
+    auto d_pair = frc.Bind(d, FPRMode::Write, FPR_LANE_BOTH);
+    emit_lane_bit_op(wb, b_pair.ps0_idx, d_pair.ps0_idx, PSBitOp::ABS);
+    emit_lane_bit_op(wb, b_pair.ps1_idx, d_pair.ps1_idx, PSBitOp::ABS);
 }
 
 void emit_ps_nabs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
-    frc.Flush(ctx_ptr);
-    emit_ps_bit_op(wb, ctx_ptr, GekkoOperands::FD(inst), GekkoOperands::FB(inst), PSBitOp::NABS);
-    frc.ReloadAll(ctx_ptr);
+    const u32 d = GekkoOperands::FD(inst);
+    const u32 b = GekkoOperands::FB(inst);
+    auto b_pair = frc.Bind(b, FPRMode::Read,  FPR_LANE_BOTH);
+    auto d_pair = frc.Bind(d, FPRMode::Write, FPR_LANE_BOTH);
+    emit_lane_bit_op(wb, b_pair.ps0_idx, d_pair.ps0_idx, PSBitOp::NABS);
+    emit_lane_bit_op(wb, b_pair.ps1_idx, d_pair.ps1_idx, PSBitOp::NABS);
 }
 
+// ps_merge00 fD, fA, fB — fD.ps0 <- fA.ps0; fD.ps1 <- fB.ps0.
 void emit_ps_merge00(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 d = GekkoOperands::FD(inst);
     const u32 a = GekkoOperands::FA(inst);
     const u32 b = GekkoOperands::FB(inst);
-    frc.Flush(ctx_ptr);
-    emit_ps_copy_halves(wb, ctx_ptr, d, ppc_off::ps0(a), ppc_off::ps0(b));
-    frc.ReloadAll(ctx_ptr);
+    auto a_pair = frc.Bind(a, FPRMode::Read,  FPR_LANE_PS0);
+    auto b_pair = frc.Bind(b, FPRMode::Read,  FPR_LANE_PS0);
+    auto d_pair = frc.Bind(d, FPRMode::Write, FPR_LANE_BOTH);
+    wb.op_local_get(a_pair.ps0_idx);
+    wb.op_local_set(d_pair.ps0_idx);
+    wb.op_local_get(b_pair.ps0_idx);
+    wb.op_local_set(d_pair.ps1_idx);
 }
 
+// ps_merge01 fD, fA, fB — fD.ps0 <- fA.ps0; fD.ps1 <- fB.ps1.
 void emit_ps_merge01(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 d = GekkoOperands::FD(inst);
     const u32 a = GekkoOperands::FA(inst);
     const u32 b = GekkoOperands::FB(inst);
-    frc.Flush(ctx_ptr);
-    emit_ps_copy_halves(wb, ctx_ptr, d, ppc_off::ps0(a), ppc_off::ps1(b));
-    frc.ReloadAll(ctx_ptr);
+    auto a_pair = frc.Bind(a, FPRMode::Read,  FPR_LANE_PS0);
+    auto b_pair = frc.Bind(b, FPRMode::Read,  FPR_LANE_PS1);
+    auto d_pair = frc.Bind(d, FPRMode::Write, FPR_LANE_BOTH);
+    wb.op_local_get(a_pair.ps0_idx);
+    wb.op_local_set(d_pair.ps0_idx);
+    wb.op_local_get(b_pair.ps1_idx);
+    wb.op_local_set(d_pair.ps1_idx);
 }
 
+// ps_merge10 fD, fA, fB — fD.ps0 <- fA.ps1; fD.ps1 <- fB.ps0.
 void emit_ps_merge10(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 d = GekkoOperands::FD(inst);
     const u32 a = GekkoOperands::FA(inst);
     const u32 b = GekkoOperands::FB(inst);
-    frc.Flush(ctx_ptr);
-    emit_ps_copy_halves(wb, ctx_ptr, d, ppc_off::ps1(a), ppc_off::ps0(b));
-    frc.ReloadAll(ctx_ptr);
+    auto a_pair = frc.Bind(a, FPRMode::Read,  FPR_LANE_PS1);
+    auto b_pair = frc.Bind(b, FPRMode::Read,  FPR_LANE_PS0);
+    auto d_pair = frc.Bind(d, FPRMode::Write, FPR_LANE_BOTH);
+    wb.op_local_get(a_pair.ps1_idx);
+    wb.op_local_set(d_pair.ps0_idx);
+    wb.op_local_get(b_pair.ps0_idx);
+    wb.op_local_set(d_pair.ps1_idx);
 }
 
+// ps_merge11 fD, fA, fB — fD.ps0 <- fA.ps1; fD.ps1 <- fB.ps1.
 void emit_ps_merge11(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     const u32 inst = op.inst;
     if (GekkoOperands::Rc(inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 d = GekkoOperands::FD(inst);
     const u32 a = GekkoOperands::FA(inst);
     const u32 b = GekkoOperands::FB(inst);
-    frc.Flush(ctx_ptr);
-    emit_ps_copy_halves(wb, ctx_ptr, d, ppc_off::ps1(a), ppc_off::ps1(b));
-    frc.ReloadAll(ctx_ptr);
+    auto a_pair = frc.Bind(a, FPRMode::Read,  FPR_LANE_PS1);
+    auto b_pair = frc.Bind(b, FPRMode::Read,  FPR_LANE_PS1);
+    auto d_pair = frc.Bind(d, FPRMode::Write, FPR_LANE_BOTH);
+    wb.op_local_get(a_pair.ps1_idx);
+    wb.op_local_set(d_pair.ps0_idx);
+    wb.op_local_get(b_pair.ps1_idx);
+    wb.op_local_set(d_pair.ps1_idx);
 }
 
 // ps_sel fD, fA, fB, fC — fD.psN = (a.psN >= -0.0) ? c.psN : b.psN.
 // IEEE: +0.0 >= -0.0 and -0.0 >= -0.0 are both true; NaN >= -0.0 is false.
+//
+// Cache-local form: bind a/b/c (Read, both lanes); the d-local indices
+// come from a separate index lookup so we can defer the Bind(Write) until
+// AFTER the if/else chain — that way the Bind's dirty mark happens at the
+// point Flush at block exit / boundary correctly snapshots the final
+// chosen value. Both arms write the SAME d local, so the post-merge local
+// is the final value regardless of which arm ran.
+//
+// Raw op_if/op_else/op_end is correct here because there's no cross-arm
+// cache divergence to worry about: a/b/c bindings are Read-only (no
+// dirty state to flush), and the d-local writes converge on one local.
 void emit_ps_sel(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     static constexpr u32 BLOCK_TYPE_VOID = 0x40;
     const u32 inst = op.inst;
@@ -167,27 +186,29 @@ void emit_ps_sel(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
     const u32 b = GekkoOperands::FB(inst);
     const u32 c = GekkoOperands::FC(inst);
 
-    frc.Flush(ctx_ptr);
-    auto half = [&](u32 a_off, u32 b_off, u32 c_off, u32 d_off) {
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_f64_load(a_off);
+    auto a_pair = frc.Bind(a, FPRMode::Read, FPR_LANE_BOTH);
+    auto b_pair = frc.Bind(b, FPRMode::Read, FPR_LANE_BOTH);
+    auto c_pair = frc.Bind(c, FPRMode::Read, FPR_LANE_BOTH);
+    // Bind d for Write — sets the local indices we'll write to. Pure Write
+    // doesn't load (no lazy-load), and the dirty mark is what we want so
+    // block-exit Flush emits the i64.store of the final local value.
+    auto d_pair = frc.Bind(d, FPRMode::Write, FPR_LANE_BOTH);
+
+    auto half = [&](u32 a_local, u32 b_local, u32 c_local, u32 d_local) {
+        wb.op_local_get(a_local);
+        wb.op_f64_reinterpret_i64();
         wb.op_f64_const(-0.0);
         wb.op_f64_ge();
         wb.op_if(BLOCK_TYPE_VOID);
-            wb.op_i32_const((s32)ctx_ptr);
-            wb.op_i32_const((s32)ctx_ptr);
-            wb.op_i64_load(c_off);
-            wb.op_i64_store(d_off);
+            wb.op_local_get(c_local);
+            wb.op_local_set(d_local);
         wb.op_else();
-            wb.op_i32_const((s32)ctx_ptr);
-            wb.op_i32_const((s32)ctx_ptr);
-            wb.op_i64_load(b_off);
-            wb.op_i64_store(d_off);
+            wb.op_local_get(b_local);
+            wb.op_local_set(d_local);
         wb.op_end();
     };
-    half(ppc_off::ps0(a), ppc_off::ps0(b), ppc_off::ps0(c), ppc_off::ps0(d));
-    half(ppc_off::ps1(a), ppc_off::ps1(b), ppc_off::ps1(c), ppc_off::ps1(d));
-    frc.ReloadAll(ctx_ptr);
+    half(a_pair.ps0_idx, b_pair.ps0_idx, c_pair.ps0_idx, d_pair.ps0_idx);
+    half(a_pair.ps1_idx, b_pair.ps1_idx, c_pair.ps1_idx, d_pair.ps1_idx);
 }
 
 // ---------------------------------------------------------------------------
