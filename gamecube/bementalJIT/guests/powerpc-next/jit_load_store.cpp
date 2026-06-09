@@ -551,8 +551,10 @@ static void emit_ea_x_stack(WasmModuleBuilder& wb, RegCache& rc,
     }
 }
 
-// lfsx fT, rA, rB — load f32 at EA, promote to f64, store at ps0(rt).
-// gekko_emit.cpp:2847 emit_lfsx_impl.
+// lfsx fT, rA, rB — load f32 at EA, promote to f64, store at ps0(rt) +
+// splat to ps1(rt). Cache-local form: write the promoted f64 (as i64 bits)
+// to both ps0 and ps1 cache locals. No memory traffic for the FPR side;
+// memory becomes canonical at block-exit frc.Flush.
 void emit_lfsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op) {
     const u32 inst = op.inst;
@@ -564,33 +566,25 @@ void emit_lfsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     emit_ea_x_stack(wb, rc, ra, rb);
     wb.op_local_set(LOCAL_TMP_EA);
 
-    // Flush regcache before WIMPORT call (host may dereference PowerPCState).
+    // Flush GPRs (host MMIO handler may inspect them); flush FPRs so the
+    // host READ32 doesn't see a stale ps0 slot (defensive — READ32 is a
+    // memory read of the EA, not of ps0, but the FPR cache flush is cheap
+    // and keeps memory ordering observable).
     rc.Flush(params.ctx_ptr);
     frc.Flush(params.ctx_ptr);
 
-    // Push ctx pointer for the eventual f64.store at the end.
-    wb.op_i32_const((s32)params.ctx_ptr);
-    // read32(EA) returns u32 big-endian-converted bits.
+    // Read the f32 into an i64 (zero-extended after the f64 promote
+    // round-trip). Land it in BOTH ps0 + ps1 cache locals.
+    auto rt_pair = frc.Bind(rt, FPRMode::Write, FPR_LANE_BOTH);
+
     wb.op_local_get(LOCAL_TMP_EA);
     wb.op_call(WIMPORT_READ32);
-    // reinterpret as f32 -> promote to f64 -> store
     wb.op_f32_reinterpret_i32();
     wb.op_f64_promote_f32();
-    wb.op_f64_store(ppc_off::ps0(rt));
-
-    // PEM paired-single splat: lfsx duplicates the loaded f64 into ps1(rt)
-    // as well. Without this, paired-single ops that read ps1 see a stale
-    // value. Re-load ps0 (just-stored) and write into ps1 — avoids needing
-    // a scratch f64 local. The IEEE→PEM conversion difference (subnormals,
-    // NaN payload) is secondary and not addressed here.
-    //
-    // Stack shape: push base_ptr (i32) for the store-address, then base_ptr
-    // for the load-address, then f64_load pops the load-address and leaves
-    // the f64, then f64_store pops [store_addr, f64] and writes ps1.
-    wb.op_i32_const((s32)params.ctx_ptr);
-    wb.op_i32_const((s32)params.ctx_ptr);
-    wb.op_f64_load(ppc_off::ps0(rt));
-    wb.op_f64_store(ppc_off::ps1(rt));
+    wb.op_i64_reinterpret_f64();
+    // Use local_tee so the i64 stays on the stack for the second local_set.
+    wb.op_local_tee(rt_pair.ps0_idx);
+    wb.op_local_set(rt_pair.ps1_idx);
 }
 
 // stfsx fS, rA, rB — store f32 from ps0(rs) at EA.
@@ -642,8 +636,9 @@ void emit_lfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     rc.Flush(params.ctx_ptr);
     frc.Flush(params.ctx_ptr);
 
-    // Push ctx_ptr now for the eventual f64.store at ps0(rt).
-    wb.op_i32_const((s32)params.ctx_ptr);
+    // Bind rt for Write — only ps0 lane (lfd does NOT splat to ps1; ps1 is
+    // preserved per scalar-FP semantics, unlike lfsx/lfs which DO splat).
+    auto rt_pair = frc.Bind(rt, FPRMode::Write, FPR_LANE_PS0);
 
     // high u32 = read32(EA) <<i64 32
     wb.op_local_get(LOCAL_TMP_EA);
@@ -659,9 +654,9 @@ void emit_lfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     wb.op_call(WIMPORT_READ32);
     wb.op_i64_extend_i32_u();
 
+    // Combine + store into ps0 cache local (i64 — preserves bit pattern).
     wb.op_i64_or();
-    wb.op_f64_reinterpret_i64();
-    wb.op_f64_store(ppc_off::ps0(rt));
+    wb.op_local_set(rt_pair.ps0_idx);
 
     if (update && ra != 0) {
         auto rc_ra = rc.Bind(ra, RCMode::Write);
@@ -673,14 +668,19 @@ void emit_lfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 // stfd  FRS, d(rA) — store f64 from ps0(FRS) at EA (8 bytes BE).
 // stfdu FRS, d(rA) — same + rA <- EA (update form, opc 55).
 //
-// Avoids i64 scratch by reading the two u32 halves directly from the host
-// f64 storage. Host stores f64 little-endian at ps0(rs): u32 at offset +0
-// holds the f64 value's low 32 bits (which numerically equals the
-// big-endian guest's BYTES 4..7 read as a u32); u32 at offset +4 holds
-// the high 32 bits (= guest BYTES 0..3 as a u32). WIMPORT_WRITE32 byte-
-// swaps host LE u32 → guest BE bytes, so:
-//   write32(EA,     host_u32(ps0+4)) → EA..EA+3 = guest BYTES 0..3
-//   write32(EA + 4, host_u32(ps0+0)) → EA+4..EA+7 = guest BYTES 4..7
+// Cache-local form: read the i64 from rs's ps0 cache local (the i64
+// equals the big-endian guest's 8-byte value reinterpreted to host LE
+// bits — same as the f64 stored in memory before). Extract halves via
+// i64.shr / i64.wrap. The high i64 bits = guest BYTES 0..3; the low
+// i64 bits = guest BYTES 4..7. WIMPORT_WRITE32 byte-swaps host LE u32 →
+// guest BE bytes, so:
+//   write32(EA,     wrap(local >> 32)) → EA..EA+3 = guest BYTES 0..3
+//   write32(EA + 4, wrap(local))       → EA+4..EA+7 = guest BYTES 4..7
+//
+// Eliminates the latent stale-memory bug: when rs's ps0 lane is dirty in
+// the cache, the prior code read memory ps0(rs)+0/+4 — which held the
+// pre-write value. The fix is structural: read the local, which always
+// holds the current value.
 void emit_stfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op, bool update) {
     const u32 inst = op.inst;
@@ -690,21 +690,27 @@ void emit_stfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 
     emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
 
-    rc.Flush(params.ctx_ptr);
-    frc.Flush(params.ctx_ptr);
+    // Read rs's ps0 lane from cache. No frc.Flush needed for the source
+    // (we're reading from the local, not memory).
+    auto rs_pair = frc.Bind(rs, FPRMode::Read, FPR_LANE_PS0);
 
-    // write32(EA, host_u32(ctx + ps0(rs) + 4))  — guest BYTES 0..3.
+    // GPR flush — host WRITE32 may dispatch into MMIO that reads gpr[].
+    rc.Flush(params.ctx_ptr);
+
+    // write32(EA, wrap(rs_local >> 32))  — guest BYTES 0..3 (high i64 bits).
     wb.op_local_get(LOCAL_TMP_EA);
-    wb.op_i32_const((s32)params.ctx_ptr);
-    wb.op_i32_load(ppc_off::ps0(rs) + 4);
+    wb.op_local_get(rs_pair.ps0_idx);
+    wb.op_i64_const(32);
+    wb.op_i64_shr_u();
+    wb.op_i32_wrap_i64();
     wb.op_call(WIMPORT_WRITE32);
 
-    // write32(EA + 4, host_u32(ctx + ps0(rs) + 0))  — guest BYTES 4..7.
+    // write32(EA + 4, wrap(rs_local))    — guest BYTES 4..7 (low i64 bits).
     wb.op_local_get(LOCAL_TMP_EA);
     wb.op_i32_const(4);
     wb.op_i32_add();
-    wb.op_i32_const((s32)params.ctx_ptr);
-    wb.op_i32_load(ppc_off::ps0(rs) + 0);
+    wb.op_local_get(rs_pair.ps0_idx);
+    wb.op_i32_wrap_i64();
     wb.op_call(WIMPORT_WRITE32);
 
     if (update && ra != 0) {
@@ -729,18 +735,17 @@ void emit_lfs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     rc.Flush(params.ctx_ptr);
     frc.Flush(params.ctx_ptr);
 
-    wb.op_i32_const((s32)params.ctx_ptr);
+    auto rt_pair = frc.Bind(rt, FPRMode::Write, FPR_LANE_BOTH);
+
     wb.op_local_get(LOCAL_TMP_EA);
     wb.op_call(WIMPORT_READ32);
     wb.op_f32_reinterpret_i32();
     wb.op_f64_promote_f32();
-    wb.op_f64_store(ppc_off::ps0(rt));
-
-    // Splat to ps1(rt) — paired-singles ops that read ps1 see fresh value.
-    wb.op_i32_const((s32)params.ctx_ptr);
-    wb.op_i32_const((s32)params.ctx_ptr);
-    wb.op_f64_load(ppc_off::ps0(rt));
-    wb.op_f64_store(ppc_off::ps1(rt));
+    wb.op_i64_reinterpret_f64();
+    // Splat to both ps0 + ps1 cache locals — paired-singles ops that read
+    // ps1 see fresh value. Use local_tee to keep the i64 on the stack.
+    wb.op_local_tee(rt_pair.ps0_idx);
+    wb.op_local_set(rt_pair.ps1_idx);
 
     if (update && ra != 0) {
         auto rc_ra = rc.Bind(ra, RCMode::Write);
@@ -824,8 +829,10 @@ void emit_stmw(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 }
 
 // stfiwx fS, rA, rB — write low 32 bits of ps0(rs) f64 as a word.
-// Little-endian f64 host storage puts the low 32 bits at offset +0.
-// gekko_emit.cpp:2872 emit_stfiwx_impl.
+// Cache-local form: read the i64 from rs's ps0 lane, wrap to i32 low bits,
+// write via WIMPORT_WRITE32. Eliminates the latent stale-memory read bug
+// (when rs's ps0 lane is cached dirty, the prior i32_load of ps0(rs)
+// returned the pre-write value).
 void emit_stfiwx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                  LoadStoreParams params, const CodeOp& op) {
     const u32 inst = op.inst;
@@ -836,12 +843,12 @@ void emit_stfiwx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     emit_ea_x_stack(wb, rc, ra, rb);
     wb.op_local_set(LOCAL_TMP_EA);
 
+    auto rs_pair = frc.Bind(rs, FPRMode::Read, FPR_LANE_PS0);
     rc.Flush(params.ctx_ptr);
-    frc.Flush(params.ctx_ptr);
 
     wb.op_local_get(LOCAL_TMP_EA);
-    wb.op_i32_const((s32)params.ctx_ptr);
-    wb.op_i32_load(ppc_off::ps0(rs));  // low 32 bits of f64 slot (little-endian host)
+    wb.op_local_get(rs_pair.ps0_idx);
+    wb.op_i32_wrap_i64();
     wb.op_call(WIMPORT_WRITE32);
 }
 
