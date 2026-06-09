@@ -122,6 +122,14 @@ struct CodeBlock {
     // GPRs read before defined — block's live-in set.
     BitSet32 m_gpr_inputs;
 
+    // FPRs read before defined — block's live-in set, mirrors m_gpr_inputs
+    // for the FPRRegCache. Populated by ppc_analyst.cpp's forward decode
+    // loop alongside m_gpr_inputs. Consumers: FPRRegCache::OnBlockEntry
+    // marks each preg in this set as needing a prologue load (both ps0
+    // and ps1 lanes per Jit64's FPURegCache.cpp:46-64 — paired-singles
+    // are bound as a unit).
+    BitSet32 m_fpr_inputs;
+
     // Physical-address range tracking is deferred to a later phase
     // (Common::RangeSet<u32> port). Phase 1 leaves the field absent.
 };

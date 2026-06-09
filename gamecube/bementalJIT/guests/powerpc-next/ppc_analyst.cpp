@@ -251,6 +251,7 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
     block->m_gqr_used.m_val   = 0;
     block->m_gqr_modified.m_val = 0;
     block->m_gpr_inputs.m_val = 0;
+    block->m_fpr_inputs.m_val = 0;
 
     if (block->m_stats) block->m_stats->numCycles = 0;
     if (block->m_gpa)   block->m_gpa->any = false;
@@ -260,6 +261,7 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
     buffer->reserve(block_size);
 
     BitSet32 defined_so_far;  // GPRs written by the in-progress block.
+    BitSet32 fpr_defined_so_far;  // FPRs written by the in-progress block.
 
     // Forward const-propagation tracker. `gpr_known[i]` is true when
     // analyzer has proved gpr[i] holds the value `gpr_const[i]` at this
@@ -302,6 +304,19 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
         const BitSet32 reads_live_in = BitSet32(read_now.m_val & ~defined_so_far.m_val);
         block->m_gpr_inputs |= reads_live_in;
         defined_so_far |= op.regsOut;
+
+        // Same shape for FPRs — block's live-in FPR set drives
+        // FPRRegCache::EmitPrologueLoads. Mirrors the GPR forward-scan
+        // pattern exactly so analyzer-blind opcodes behave identically.
+        // Both lanes (ps0+ps1) are always loaded for any preg in this set;
+        // lazy-load fallback at Bind() time handles opcodes whose opinfo
+        // flags don't reflect their actual FPR reads (mirror of the
+        // lmw/stmw analyzer-blind class for FPRs).
+        const BitSet32 fpr_reads_now = op.fregsIn;
+        const BitSet32 fpr_reads_live_in =
+            BitSet32(fpr_reads_now.m_val & ~fpr_defined_so_far.m_val);
+        block->m_fpr_inputs |= fpr_reads_live_in;
+        fpr_defined_so_far |= op.GetFregsOut();
 
         // ------------------------------------------------------------------
         // Const-EA derivation for D-form loads/stores (op.has_const_ea).
