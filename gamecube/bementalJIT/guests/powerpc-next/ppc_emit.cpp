@@ -29,6 +29,7 @@
 #include "jit_system_registers.h"
 #include "ppc_analyst.h"
 #include "ppc_offsets.h"
+#include "fpr_reg_cache.h"
 #include "reg_cache.h"
 
 // NOTE: Cannot include "../powerpc/gekko_emit.h" — both libs share the
@@ -481,11 +482,14 @@ std::vector<u8> build_block_next(u32 start_pc,
     b.beginFuncBody();
 
     // Locals: 2 i32 scratch (LOCAL_TMP_A=0, LOCAL_TMP_B=1) + 32 i32 GPR
-    // cache locals (indices 2..33). RegCache uses wasm_local_base=2.
+    // cache locals (indices 2..33) + 64 i64 FPR-lane locals (indices
+    // 34..97 — 32 ps0 lanes then 32 ps1 lanes). RegCache uses
+    // wasm_local_base=2; FPRRegCache uses wasm_local_base=34. Total 98
+    // locals, well within wasm engine limits.
     {
-        const u32 counts[] = { 2u, 32u };
-        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32 };
-        b.emitLocals(2u, counts, types);
+        const u32 counts[] = { 2u, 32u, 64u };
+        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64 };
+        b.emitLocals(3u, counts, types);
     }
 
     // RegCache: assign per-PPC-GPR WASM locals + emit prologue loads
@@ -493,6 +497,15 @@ std::vector<u8> build_block_next(u32 start_pc,
     RegCache rc(b);
     rc.OnBlockEntry(block, /*wasm_local_base=*/2u, ctx_ptr);
     rc.EmitPrologueLoads(ctx_ptr);
+
+    // FPRRegCache: assign per-PPC-FPR WASM locals (both ps0/ps1 lanes) +
+    // emit i64 prologue loads for live-in FPRs (block.m_fpr_inputs).
+    // Step-3 wiring: prologue+epilogue only — no emit_* site references
+    // frc yet. Bit-exact round-trip safe because i64 load+store preserves
+    // any 64-bit pattern (NaN payload + signed-zero preserved).
+    FPRRegCache frc(b);
+    frc.OnBlockEntry(block, /*wasm_local_base=*/34u, ctx_ptr);
+    frc.EmitPrologueLoads(ctx_ptr);
 
     LoadStoreParams params;
     params.ctx_ptr   = ctx_ptr;
@@ -605,6 +618,12 @@ std::vector<u8> build_block_next(u32 start_pc,
         b.op_call(WIMPORT_GATHER_DRAIN);
     }
 
+    // Flush dirty FPR lanes back to PowerPCState before the GPR flush.
+    // In step 3 wiring no emit_* writes the cache so this is a no-op (no
+    // dirty bits set), but the call sits structurally where future emit-
+    // site conversions will need it. Per step-3 plan: prologue load +
+    // epilogue flush form a bit-exact round-trip on FPR memory.
+    frc.Flush(ctx_ptr);
     rc.Flush(ctx_ptr);
     b.op_i32_const((s32)ctx_ptr);
     b.op_i32_load(ppc_off::PC);
