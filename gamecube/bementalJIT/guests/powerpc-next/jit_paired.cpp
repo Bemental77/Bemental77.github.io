@@ -232,20 +232,21 @@ void emit_ps_binary(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const
     // ps_mul (sub5=25) uses FC as second operand; others use FB.
     const u32 arg2 = (sub5 == 25) ? fc : fb;
 
-    rc.Flush(ctx_ptr);
-    // Step-4 plumbing: emit body writes ps0/ps1 to PowerPCState memory
-    // directly (cache not used yet). Flush dirty FPR-cache lanes before
-    // the memory read so the lane lambda sees current values; reload
-    // after so subsequent ops see post-write state. Steps 6-7 convert
-    // these emits to cache locals and drop both calls.
-    frc.Flush(ctx_ptr);
+    // Cache-local form: bind fa + arg2 (Read, both lanes), fd (Write, both
+    // lanes). Per-lane lambda: load operand i64 locals, reinterpret to
+    // f64 at use, run arith, single-precision demote/promote round
+    // (matches Jit64 non-accurate-NaN fast path), reinterpret back to
+    // i64, store into d local. Memory becomes canonical at block-exit
+    // frc.Flush — no per-op memory traffic.
+    auto fa_pair   = frc.Bind(fa,   FPRMode::Read,  FPR_LANE_BOTH);
+    auto arg2_pair = frc.Bind(arg2, FPRMode::Read,  FPR_LANE_BOTH);
+    auto fd_pair   = frc.Bind(fd,   FPRMode::Write, FPR_LANE_BOTH);
 
-    auto lane = [&](u32 a_off, u32 b_off, u32 d_off) {
-        wb.op_i32_const((s32)ctx_ptr);          // store-addr
-        wb.op_i32_const((s32)ctx_ptr);          // load-addr base for a
-        wb.op_f64_load(a_off);
-        wb.op_i32_const((s32)ctx_ptr);          // load-addr base for arg2
-        wb.op_f64_load(b_off);
+    auto lane = [&](u32 a_local, u32 b_local, u32 d_local) {
+        wb.op_local_get(a_local);
+        wb.op_f64_reinterpret_i64();
+        wb.op_local_get(b_local);
+        wb.op_f64_reinterpret_i64();
         switch (sub5) {
         case 18: wb.op_f64_div(); break;  // ps_div
         case 20: wb.op_f64_sub(); break;  // ps_sub
@@ -255,14 +256,11 @@ void emit_ps_binary(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const
         }
         wb.op_f32_demote_f64();
         wb.op_f64_promote_f32();
-        wb.op_f64_store(d_off);
+        wb.op_i64_reinterpret_f64();
+        wb.op_local_set(d_local);
     };
-    lane(ppc_off::ps0(fa), ppc_off::ps0(arg2), ppc_off::ps0(fd));
-    lane(ppc_off::ps1(fa), ppc_off::ps1(arg2), ppc_off::ps1(fd));
-    // Step-4: emit wrote ps0(fd)/ps1(fd) to memory; reload the cache so
-    // subsequent ops see the new values (mirror of the rc.ReloadAll
-    // pattern after a memory-direct write of GPR memory).
-    frc.ReloadAll(ctx_ptr);
+    lane(fa_pair.ps0_idx, arg2_pair.ps0_idx, fd_pair.ps0_idx);
+    lane(fa_pair.ps1_idx, arg2_pair.ps1_idx, fd_pair.ps1_idx);
 }
 
 void emit_ps_fma(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
@@ -276,33 +274,29 @@ void emit_ps_fma(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
     const bool subtract = (sub5 == 28) || (sub5 == 30);  // msub / nmsub
     const bool negate   = (sub5 == 30) || (sub5 == 31);  // nmsub / nmadd
 
-    rc.Flush(ctx_ptr);
-    // Step-4 plumbing: emit body writes ps0/ps1 to PowerPCState memory
-    // directly (cache not used yet). Flush dirty FPR-cache lanes before
-    // the memory read so the lane lambda sees current values; reload
-    // after so subsequent ops see post-write state. Steps 6-7 convert
-    // these emits to cache locals and drop both calls.
-    frc.Flush(ctx_ptr);
+    auto fa_pair = frc.Bind(fa, FPRMode::Read,  FPR_LANE_BOTH);
+    auto fb_pair = frc.Bind(fb, FPRMode::Read,  FPR_LANE_BOTH);
+    auto fc_pair = frc.Bind(fc, FPRMode::Read,  FPR_LANE_BOTH);
+    auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_BOTH);
 
-    auto lane = [&](u32 a_off, u32 b_off, u32 c_off, u32 d_off) {
-        wb.op_i32_const((s32)ctx_ptr);          // store-addr for d
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_f64_load(a_off);
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_f64_load(c_off);
+    auto lane = [&](u32 a_local, u32 b_local, u32 c_local, u32 d_local) {
+        wb.op_local_get(a_local);
+        wb.op_f64_reinterpret_i64();
+        wb.op_local_get(c_local);
+        wb.op_f64_reinterpret_i64();
         wb.op_f64_mul();
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_f64_load(b_off);
+        wb.op_local_get(b_local);
+        wb.op_f64_reinterpret_i64();
         if (subtract) wb.op_f64_sub();
         else          wb.op_f64_add();
         if (negate)   wb.op_f64_neg();
         wb.op_f32_demote_f64();
         wb.op_f64_promote_f32();
-        wb.op_f64_store(d_off);
+        wb.op_i64_reinterpret_f64();
+        wb.op_local_set(d_local);
     };
-    lane(ppc_off::ps0(fa), ppc_off::ps0(fb), ppc_off::ps0(fc), ppc_off::ps0(fd));
-    lane(ppc_off::ps1(fa), ppc_off::ps1(fb), ppc_off::ps1(fc), ppc_off::ps1(fd));
-    frc.ReloadAll(ctx_ptr);
+    lane(fa_pair.ps0_idx, fb_pair.ps0_idx, fc_pair.ps0_idx, fd_pair.ps0_idx);
+    lane(fa_pair.ps1_idx, fb_pair.ps1_idx, fc_pair.ps1_idx, fd_pair.ps1_idx);
 }
 
 void emit_ps_sum(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
@@ -313,37 +307,38 @@ void emit_ps_sum(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
     const u32 fc   = GekkoOperands::FC(inst);
     const u32 sub5 = GekkoOperands::SUBOP5(inst);
 
-    rc.Flush(ctx_ptr);
+    // ps_sum0/1 reads only fa.ps0 + fb.ps1, and copies one fc lane.
+    auto fa_pair = frc.Bind(fa, FPRMode::Read,  FPR_LANE_PS0);
+    auto fb_pair = frc.Bind(fb, FPRMode::Read,  FPR_LANE_PS1);
+    auto fc_pair = frc.Bind(fc, FPRMode::Read,  FPR_LANE_BOTH);
+    auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_BOTH);
 
-    // Shared sum: single(a.ps0 + b.ps1). Lands in ps0 for sum0, ps1 for sum1.
-    // Other lane: single(c.<matching half>).
-    auto emit_sum = [&](u32 d_off) {
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_f64_load(ppc_off::ps0(fa));
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_f64_load(ppc_off::ps1(fb));
+    auto emit_sum = [&](u32 d_local) {
+        wb.op_local_get(fa_pair.ps0_idx);
+        wb.op_f64_reinterpret_i64();
+        wb.op_local_get(fb_pair.ps1_idx);
+        wb.op_f64_reinterpret_i64();
         wb.op_f64_add();
         wb.op_f32_demote_f64();
         wb.op_f64_promote_f32();
-        wb.op_f64_store(d_off);
+        wb.op_i64_reinterpret_f64();
+        wb.op_local_set(d_local);
     };
-    auto emit_copy_c = [&](u32 c_off, u32 d_off) {
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_f64_load(c_off);
+    auto emit_copy_c = [&](u32 c_local, u32 d_local) {
+        wb.op_local_get(c_local);
+        wb.op_f64_reinterpret_i64();
         wb.op_f32_demote_f64();
         wb.op_f64_promote_f32();
-        wb.op_f64_store(d_off);
+        wb.op_i64_reinterpret_f64();
+        wb.op_local_set(d_local);
     };
     if (sub5 == 10) {  // ps_sum0
-        emit_sum(ppc_off::ps0(fd));
-        emit_copy_c(ppc_off::ps1(fc), ppc_off::ps1(fd));
+        emit_sum(fd_pair.ps0_idx);
+        emit_copy_c(fc_pair.ps1_idx, fd_pair.ps1_idx);
     } else {  // ps_sum1 (sub5 == 11)
-        emit_copy_c(ppc_off::ps0(fc), ppc_off::ps0(fd));
-        emit_sum(ppc_off::ps1(fd));
+        emit_copy_c(fc_pair.ps0_idx, fd_pair.ps0_idx);
+        emit_sum(fd_pair.ps1_idx);
     }
-    frc.ReloadAll(ctx_ptr);
 }
 
 void emit_ps_muls(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
@@ -352,30 +347,26 @@ void emit_ps_muls(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const C
     const u32 fa   = GekkoOperands::FA(inst);
     const u32 fc   = GekkoOperands::FC(inst);
     const u32 sub5 = GekkoOperands::SUBOP5(inst);
-    const u32 c_off = (sub5 == 12) ? ppc_off::ps0(fc) : ppc_off::ps1(fc);
+    const u8  c_lane = (sub5 == 12) ? FPR_LANE_PS0 : FPR_LANE_PS1;
 
-    rc.Flush(ctx_ptr);
-    // Step-4 plumbing: emit body writes ps0/ps1 to PowerPCState memory
-    // directly (cache not used yet). Flush dirty FPR-cache lanes before
-    // the memory read so the lane lambda sees current values; reload
-    // after so subsequent ops see post-write state. Steps 6-7 convert
-    // these emits to cache locals and drop both calls.
-    frc.Flush(ctx_ptr);
+    auto fa_pair = frc.Bind(fa, FPRMode::Read,  FPR_LANE_BOTH);
+    auto fc_pair = frc.Bind(fc, FPRMode::Read,  c_lane);
+    auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_BOTH);
+    const u32 c_local = (c_lane == FPR_LANE_PS0) ? fc_pair.ps0_idx : fc_pair.ps1_idx;
 
-    auto lane = [&](u32 a_off, u32 d_off) {
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_f64_load(a_off);
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_f64_load(c_off);
+    auto lane = [&](u32 a_local, u32 d_local) {
+        wb.op_local_get(a_local);
+        wb.op_f64_reinterpret_i64();
+        wb.op_local_get(c_local);
+        wb.op_f64_reinterpret_i64();
         wb.op_f64_mul();
         wb.op_f32_demote_f64();
         wb.op_f64_promote_f32();
-        wb.op_f64_store(d_off);
+        wb.op_i64_reinterpret_f64();
+        wb.op_local_set(d_local);
     };
-    lane(ppc_off::ps0(fa), ppc_off::ps0(fd));
-    lane(ppc_off::ps1(fa), ppc_off::ps1(fd));
-    frc.ReloadAll(ctx_ptr);
+    lane(fa_pair.ps0_idx, fd_pair.ps0_idx);
+    lane(fa_pair.ps1_idx, fd_pair.ps1_idx);
 }
 
 void emit_ps_madds(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
@@ -385,33 +376,30 @@ void emit_ps_madds(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const 
     const u32 fb   = GekkoOperands::FB(inst);
     const u32 fc   = GekkoOperands::FC(inst);
     const u32 sub5 = GekkoOperands::SUBOP5(inst);
-    const u32 c_off = (sub5 == 14) ? ppc_off::ps0(fc) : ppc_off::ps1(fc);
+    const u8  c_lane = (sub5 == 14) ? FPR_LANE_PS0 : FPR_LANE_PS1;
 
-    rc.Flush(ctx_ptr);
-    // Step-4 plumbing: emit body writes ps0/ps1 to PowerPCState memory
-    // directly (cache not used yet). Flush dirty FPR-cache lanes before
-    // the memory read so the lane lambda sees current values; reload
-    // after so subsequent ops see post-write state. Steps 6-7 convert
-    // these emits to cache locals and drop both calls.
-    frc.Flush(ctx_ptr);
+    auto fa_pair = frc.Bind(fa, FPRMode::Read,  FPR_LANE_BOTH);
+    auto fb_pair = frc.Bind(fb, FPRMode::Read,  FPR_LANE_BOTH);
+    auto fc_pair = frc.Bind(fc, FPRMode::Read,  c_lane);
+    auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_BOTH);
+    const u32 c_local = (c_lane == FPR_LANE_PS0) ? fc_pair.ps0_idx : fc_pair.ps1_idx;
 
-    auto lane = [&](u32 a_off, u32 b_off, u32 d_off) {
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_f64_load(a_off);
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_f64_load(c_off);
+    auto lane = [&](u32 a_local, u32 b_local, u32 d_local) {
+        wb.op_local_get(a_local);
+        wb.op_f64_reinterpret_i64();
+        wb.op_local_get(c_local);
+        wb.op_f64_reinterpret_i64();
         wb.op_f64_mul();
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_f64_load(b_off);
+        wb.op_local_get(b_local);
+        wb.op_f64_reinterpret_i64();
         wb.op_f64_add();
         wb.op_f32_demote_f64();
         wb.op_f64_promote_f32();
-        wb.op_f64_store(d_off);
+        wb.op_i64_reinterpret_f64();
+        wb.op_local_set(d_local);
     };
-    lane(ppc_off::ps0(fa), ppc_off::ps0(fb), ppc_off::ps0(fd));
-    lane(ppc_off::ps1(fa), ppc_off::ps1(fb), ppc_off::ps1(fd));
-    frc.ReloadAll(ctx_ptr);
+    lane(fa_pair.ps0_idx, fb_pair.ps0_idx, fd_pair.ps0_idx);
+    lane(fa_pair.ps1_idx, fb_pair.ps1_idx, fd_pair.ps1_idx);
 }
 
 }  // namespace powerpc
