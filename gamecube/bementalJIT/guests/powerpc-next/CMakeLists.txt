@@ -10,6 +10,7 @@ add_library(bementalJITPowerPCNext STATIC
     ppc_analyst.cpp
     ppc_tables.cpp
     reg_cache.cpp
+    fpr_reg_cache.cpp
     jit_load_store.cpp
     jit_paired.cpp
     jit_floating_point.cpp
