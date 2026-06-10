@@ -325,6 +325,31 @@ s32 dispatch_raw(int handle) {
             console.error('[bemental] pre-dispatch n=' + Module.bemental_dispatch_n
                 + ' handle=' + $0 + ' pc=0x' + foundPc.toString(16));
         }
+        // [mp4-wedge-diag] 2026-06-10: count dispatches by PC range. Quoted
+        // keys avoid the C preprocessor treating bare 'name:' as a statement
+        // label inside the EM_ASM_INT body.
+        {
+            const __dpc = Module.bemental_handle_to_pc ? (Module.bemental_handle_to_pc[$0] >>> 0) : 0;
+            if (!Module.bemental_diag_disp) {
+                Module.bemental_diag_disp = {};
+                Module.bemental_diag_disp['mn'] = 0;
+                Module.bemental_diag_disp['hp'] = 0;
+                Module.bemental_diag_disp['ow'] = 0;
+                Module.bemental_diag_disp['or'] = 0;
+            }
+            if (__dpc >= 0x800057C0 && __dpc < 0x800059EC) Module.bemental_diag_disp['mn']++;
+            else if (__dpc >= 0x8000D01C && __dpc < 0x8000D1A0) Module.bemental_diag_disp['hp']++;
+            else if (__dpc >= 0x8002EC68 && __dpc < 0x8002EDD8) Module.bemental_diag_disp['ow']++;
+            else if (__dpc === 0x800E5BF0) Module.bemental_diag_disp['or']++;
+            if ((Module.bemental_dispatch_n % 100000) === 0) {
+                console.error('[mp4-wedge-diag] disp-counts'
+                    + ' main=' + Module.bemental_diag_disp['mn']
+                    + ' huprc=' + Module.bemental_diag_disp['hp']
+                    + ' omwatch=' + Module.bemental_diag_disp['ow']
+                    + ' osreport=' + Module.bemental_diag_disp['or']
+                    + ' total=' + Module.bemental_dispatch_n);
+            }
+        }
         try {
             const f = wasmTable.get($0);
             if (!f) return -2147483648;  // freed slot
@@ -388,6 +413,46 @@ void register_pc_handle(u64 pc, int handle) {
         // executing block PC (native-granularity diff vs Jit64 [traj]).
         if (!Module.bemental_handle_to_pc) Module.bemental_handle_to_pc = {};
         Module.bemental_handle_to_pc[$1 | 0] = $0 >>> 0;
+
+        // [mp4-wedge-diag] 2026-06-10: log block-compile + register events for
+        // PCs we are investigating in the omWatchOverlayProc wedge diagnosis.
+        // - 0x8002EC68..0x8002EDD8: omWatchOverlayProc body (objmain.c:67-107)
+        //   — first dispatch = protothread entered; later PCs = protothread
+        //   made forward progress through its body (post-HuPrcSleep resume).
+        // - 0x8000D01C..0x8000D1A0: HuPrcCall body (process.c:228) — proves
+        //   main loop actually reaches the protothread dispatcher.
+        // - 0x800057C0..0x800059EC: main body — proves main loop is iterating.
+        // - 0x800E5BF0: OSReport entry — counts how many OSReports compile.
+        // - 0x8000DCxx..0x8000DDxx area not currently tagged but we already
+        //   see HuSpr* PCs in samples so that range is exercised.
+        var __pc = $0 >>> 0;
+        var inRange = function(lo, hi) { return __pc >= lo && __pc < hi; };
+        // [mp4-wedge-diag] 2026-06-10 extension: track exception-vector
+        // dispatch to test the IRQ-unserviced wedge hypothesis. After
+        // CheckExternalExceptions (PowerPC.cpp:589), PC is set to 0x500
+        // and MSR.IR is cleared, so the dispatcher should compile a block
+        // at PC=0x500. The cached alias at 0x80000500 is the IR=1 path.
+        // Vector range 0x100..0x1700 per dolsdk OSExceptionLocations
+        // (OS.c:196). The OS handler chain (ExternalInterruptHandler /
+        // __OSDispatchInterrupt) per gc_refs/dolsdk2001/src/os/OSInterrupt.c
+        // typically resolves to addresses in 0x80003000..0x80004000 once
+        // OSInit installs them.
+        if (inRange(0x8002EC68, 0x8002EDD8) ||
+            inRange(0x8000D01C, 0x8000D1A0) ||
+            inRange(0x800057C0, 0x800059EC) ||
+            (__pc === 0x800E5BF0) ||
+            inRange(0x100, 0x1800) ||
+            inRange(0x80000100, 0x80001800) ||
+            inRange(0x80003000, 0x80004000)) {
+            if (!Module.bemental_diag_compile_seen) Module.bemental_diag_compile_seen = {};
+            if (!Module.bemental_diag_compile_seen[__pc]) {
+                Module.bemental_diag_compile_seen[__pc] = 1;
+                console.log("[mp4-wedge-diag] block-compiled pc=0x" + __pc.toString(16) +
+                            " handle=" + ($1 | 0));
+            } else {
+                Module.bemental_diag_compile_seen[__pc]++;
+            }
+        }
     }, static_cast<u32>(pc), handle);
 #else
     (void)pc; (void)handle;

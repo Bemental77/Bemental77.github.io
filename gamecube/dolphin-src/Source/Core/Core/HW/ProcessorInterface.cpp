@@ -211,6 +211,33 @@ void ProcessorInterfaceManager::SetInterrupt(u32 cause_mask, bool set)
 {
   DEBUG_ASSERT_MSG(POWERPC, Core::IsCPUThread(), "SetInterrupt from wrong thread");
 
+  // [mp4-wedge-diag] 2026-06-10: per-IRQ-source raise counters.
+  // Diagnoses audio-thread-monopolization: if AI fires far more often than
+  // native ~187Hz, the bug is upstream-host (CoreTiming cadence) rather than
+  // guest semantics. Logs cumulative counts every 1000 raise events.
+  if (set)
+  {
+    static u32 s_diag_ai = 0, s_diag_dsp = 0, s_diag_vi = 0, s_diag_di = 0;
+    static u32 s_diag_si = 0, s_diag_exi = 0, s_diag_pi = 0, s_diag_other = 0;
+    static u32 s_diag_total = 0;
+    if (cause_mask & INT_CAUSE_AI)       ++s_diag_ai;
+    else if (cause_mask & INT_CAUSE_DSP) ++s_diag_dsp;
+    else if (cause_mask & INT_CAUSE_VI)  ++s_diag_vi;
+    else if (cause_mask & INT_CAUSE_DI)  ++s_diag_di;
+    else if (cause_mask & INT_CAUSE_SI)  ++s_diag_si;
+    else if (cause_mask & INT_CAUSE_EXI) ++s_diag_exi;
+    else if (cause_mask & INT_CAUSE_PI)  ++s_diag_pi;
+    else                                  ++s_diag_other;
+    ++s_diag_total;
+    if ((s_diag_total % 1000u) == 0u)
+    {
+      NOTICE_LOG_FMT(AUDIO_INTERFACE,
+                     "[mp4-wedge-diag] IRQ-raise total={} AI={} DSP={} VI={} DI={} SI={} EXI={} PI={} OTHER={}",
+                     s_diag_total, s_diag_ai, s_diag_dsp, s_diag_vi, s_diag_di,
+                     s_diag_si, s_diag_exi, s_diag_pi, s_diag_other);
+    }
+  }
+
   if ((cause_mask & INT_CAUSE_DSP) != 0)
   {
     // Always log set=true (rare and decisive); rate-limit set=false to
