@@ -335,6 +335,33 @@ void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
 // dolphin_evict_block lives in JitWasm.cpp (which has the bementalJIT
 // include path for m_wasm_cache).
 
+// MEM1 address/size accessors. The worker_funcs.js `get-ram-info` cmd
+// calls Module._dolphin_get_ram_addr() / _dolphin_get_ram_size() and
+// replies to the page with the values. The page polls this until non-
+// zero, then forwards to the ppc-worker so its self-compile path can
+// read instructions directly from SAB-mapped guest RAM. Tools that need
+// to walk guest data (OS thread state, etc.) use the same path.
+//
+// The old dolphin-src.bak/JitWasm.cpp also wrote (ram_addr, ram_size,
+// sentinel=0xCAFEBABE) to SAB[0x02500020/24/28] from inside JitWasm::Run,
+// which let the page poll the SAB sentinel directly without sending a
+// message. The re-extracted dolphin-src (2026-05-29) doesn't carry that
+// publication; the ram-info request/reply mailbox is the only path.
+EMSCRIPTEN_KEEPALIVE
+uint32_t dolphin_get_ram_addr() {
+    auto& memory = Core::System::GetInstance().GetMemory();
+    // GetRAM() returns u8*& — cast to wasm-side u32 (a pointer in the
+    // shared linear memory). Returns 0 before Memory::Init() runs.
+    u8* ram = memory.GetRAM();
+    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ram));
+}
+
+EMSCRIPTEN_KEEPALIVE
+uint32_t dolphin_get_ram_size() {
+    auto& memory = Core::System::GetInstance().GetMemory();
+    return static_cast<uint32_t>(memory.GetRamSize());
+}
+
 }  // extern "C"
 
 #endif  // __EMSCRIPTEN__

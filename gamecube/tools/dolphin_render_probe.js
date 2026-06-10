@@ -347,6 +347,10 @@ function startServer() {
   (buckets.mem_diag||[]).forEach(l => console.log('  ' + l));
   console.log('\n--- perf_flow (count=' + ((buckets.perf_flow||[]).length) + ') ---');
   (buckets.perf_flow||[]).forEach(l => console.log('  ' + l));
+  console.log('\n--- mp4-wedge-diag disp-counts (full) ---');
+  buckets.other.filter(l => /\[mp4-wedge-diag\] disp-counts/.test(l)).forEach(l => console.log('  ' + l));
+  console.log('\n--- mp4-wedge-diag block-compiled (full) ---');
+  buckets.other.filter(l => /\[mp4-wedge-diag\] block-compiled/.test(l)).forEach(l => console.log('  ' + l));
   console.log('\n--- other (last 15 of ' + buckets.other.length + ') ---');
   buckets.other.slice(-15).forEach(l => console.log('  ' + l));
   console.log('\n--- wtraj (full, count=' + ((buckets.wtraj||[]).length) + ') ---');

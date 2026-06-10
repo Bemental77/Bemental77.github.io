@@ -336,17 +336,110 @@ s32 dispatch_raw(int handle) {
                 Module.bemental_diag_disp['hp'] = 0;
                 Module.bemental_diag_disp['ow'] = 0;
                 Module.bemental_diag_disp['or'] = 0;
+                // [mp4-wedge-diag] 2026-06-10 IRQ-chain extension. Symbols
+                // resolved from gc_refs/marioparty4/config/GMPE01_01/symbols.txt:
+                //   evec  = OSExceptionVector        0x800B4BB8 size 0x9C
+                //                                    (template only — runtime
+                //                                    executes COPY at 0x500;
+                //                                    expect evec=0)
+                //   dispi = __OSDispatchInterrupt    0x800B7714 size 0x344
+                //   exti  = ExternalInterruptHandler 0x800B7A58 size 0x50
+                //   sel   = SelectThread             0x800BA1B8 size 0x200 (wedge fn)
+                //   dsph  = __DSPHandler             0x800C7558 size 0x424
+                //                                    (registered for id 7 =
+                //                                    __OS_INTERRUPT_DSP_DSP
+                //                                    by dsp.c:46/dolsdk dsp.c:69)
+                //   aish  = __AISHandler             0x800C5F70 size 0x7C
+                //                                    (AI streaming sub-handler)
+                //   aidh  = __AIDHandler             0x800C5FEC size 0x90
+                //                                    (AI DMA sub-handler)
+                //   musy  = MusyX data-plane         0x80113000..0x80114000
+                //                                    (reverb/mixing — NOT IRQ;
+                //                                    formerly mislabeled dspc)
+                // Disambiguation:
+                //   dsph=0  → __DSPHandler never reached; dispatcher table
+                //             lookup misses (id 7 entry stale/null).
+                //   dsph>0 but DSP cause CLR≈0 → handler runs but MMIO ACK
+                //             write doesn't drain — Dolphin PI MMIO emul or
+                //             our store-side bug.
+                Module.bemental_diag_disp['evec']  = 0;
+                Module.bemental_diag_disp['dispi'] = 0;
+                Module.bemental_diag_disp['exti']  = 0;
+                Module.bemental_diag_disp['sel']   = 0;
+                Module.bemental_diag_disp['dsph']  = 0;
+                Module.bemental_diag_disp['aish']  = 0;
+                Module.bemental_diag_disp['aidh']  = 0;
+                Module.bemental_diag_disp['musy']  = 0;
+                // Inside __OSDispatchInterrupt (asm from
+                // gc_refs/marioparty4/build/GMPE01_01/asm/dolphin/os/OSInterrupt.s):
+                //   0x800B7758 .L_800B7758 spurious-IRQ branch (calls
+                //              OSLoadContext when intsr==0 or (intsr&intmr)==0)
+                //   0x800B7760 .L_800B7760 normal cause-decode entry
+                // If spur >> norm → __PIRegs[0] read returns stale 0 → MMIO
+                // read coherence bug. If norm >> spur but dsph still rare →
+                // failure is in cause-mask/handler-table walk.
+                Module.bemental_diag_disp['spur']  = 0;
+                Module.bemental_diag_disp['norm']  = 0;
+                // Per OSInterrupt.s analysis of __OSDispatchInterrupt:
+                //   0x800B79A0 .L_800B79A0 mask gate passed — entering
+                //              InterruptPrioTable walk
+                //   0x800B7A0C .L_800B7A0C handler call site (blrl to
+                //              registered handler via mtlr r12)
+                // Derived: mask-rejected = norm - prio; handler-NULL =
+                // prio - hcall; hcall should ≈ DSP CLR count if __DSPHandler
+                // is the only one being called.
+                Module.bemental_diag_disp['prio']  = 0;
+                Module.bemental_diag_disp['pthit'] = 0;
+                Module.bemental_diag_disp['hcall'] = 0;
+                // Other registered IRQ handlers (resolved from MP4 syms):
+                //   vih = __VIRetraceHandler   0x800C0B6C size 0x228 (60Hz native)
+                //   sih = SIInterruptHandler   0x800D9040 size 0x344 (controller poll)
+                // If vih >> dsph, VI handler is starving DSP via prio walk —
+                // and VI is over-firing in the wasm vs the native 60Hz rate
+                // (693K raises in ~104s emulated = 6672/sec vs native 60/sec).
+                Module.bemental_diag_disp['vih']   = 0;
+                Module.bemental_diag_disp['sih']   = 0;
             }
             if (__dpc >= 0x800057C0 && __dpc < 0x800059EC) Module.bemental_diag_disp['mn']++;
             else if (__dpc >= 0x8000D01C && __dpc < 0x8000D1A0) Module.bemental_diag_disp['hp']++;
             else if (__dpc >= 0x8002EC68 && __dpc < 0x8002EDD8) Module.bemental_diag_disp['ow']++;
             else if (__dpc === 0x800E5BF0) Module.bemental_diag_disp['or']++;
+            else if (__dpc >= 0x800B4BB8 && __dpc < 0x800B4C54) Module.bemental_diag_disp['evec']++;
+            else if (__dpc >= 0x800B7714 && __dpc < 0x800B7A58) Module.bemental_diag_disp['dispi']++;
+            else if (__dpc >= 0x800B7A58 && __dpc < 0x800B7AA8) Module.bemental_diag_disp['exti']++;
+            else if (__dpc >= 0x800BA1B8 && __dpc < 0x800BA3B8) Module.bemental_diag_disp['sel']++;
+            else if (__dpc >= 0x800C7558 && __dpc < 0x800C797C) Module.bemental_diag_disp['dsph']++;
+            else if (__dpc >= 0x800C5F70 && __dpc < 0x800C5FEC) Module.bemental_diag_disp['aish']++;
+            else if (__dpc >= 0x800C5FEC && __dpc < 0x800C607C) Module.bemental_diag_disp['aidh']++;
+            else if (__dpc >= 0x80113000 && __dpc < 0x80114000) Module.bemental_diag_disp['musy']++;
+            else if (__dpc >= 0x800C0B6C && __dpc < 0x800C0D94) Module.bemental_diag_disp['vih']++;
+            else if (__dpc >= 0x800D9040 && __dpc < 0x800D9384) Module.bemental_diag_disp['sih']++;
+            if (__dpc === 0x800B7758) Module.bemental_diag_disp['spur']++;
+            if (__dpc === 0x800B7760) Module.bemental_diag_disp['norm']++;
+            if (__dpc === 0x800B79A0) Module.bemental_diag_disp['prio']++;
+            if (__dpc === 0x800B79D8) Module.bemental_diag_disp['pthit']++;
+            if (__dpc === 0x800B7A10) Module.bemental_diag_disp['hcall']++;
             if ((Module.bemental_dispatch_n % 100000) === 0) {
                 console.error('[mp4-wedge-diag] disp-counts'
                     + ' main=' + Module.bemental_diag_disp['mn']
                     + ' huprc=' + Module.bemental_diag_disp['hp']
                     + ' omwatch=' + Module.bemental_diag_disp['ow']
                     + ' osreport=' + Module.bemental_diag_disp['or']
+                    + ' evec=' + Module.bemental_diag_disp['evec']
+                    + ' dispi=' + Module.bemental_diag_disp['dispi']
+                    + ' exti=' + Module.bemental_diag_disp['exti']
+                    + ' sel=' + Module.bemental_diag_disp['sel']
+                    + ' dsph=' + Module.bemental_diag_disp['dsph']
+                    + ' aish=' + Module.bemental_diag_disp['aish']
+                    + ' aidh=' + Module.bemental_diag_disp['aidh']
+                    + ' musy=' + Module.bemental_diag_disp['musy']
+                    + ' spur=' + Module.bemental_diag_disp['spur']
+                    + ' norm=' + Module.bemental_diag_disp['norm']
+                    + ' prio=' + Module.bemental_diag_disp['prio']
+                    + ' pthit=' + Module.bemental_diag_disp['pthit']
+                    + ' hcall=' + Module.bemental_diag_disp['hcall']
+                    + ' vih=' + Module.bemental_diag_disp['vih']
+                    + ' sih=' + Module.bemental_diag_disp['sih']
                     + ' total=' + Module.bemental_dispatch_n);
             }
         }
@@ -433,17 +526,31 @@ void register_pc_handle(u64 pc, int handle) {
         // and MSR.IR is cleared, so the dispatcher should compile a block
         // at PC=0x500. The cached alias at 0x80000500 is the IR=1 path.
         // Vector range 0x100..0x1700 per dolsdk OSExceptionLocations
-        // (OS.c:196). The OS handler chain (ExternalInterruptHandler /
-        // __OSDispatchInterrupt) per gc_refs/dolsdk2001/src/os/OSInterrupt.c
-        // typically resolves to addresses in 0x80003000..0x80004000 once
-        // OSInit installs them.
+        // (OS.c:196). The MP4-specific handler chain (per
+        // gc_refs/marioparty4/config/GMPE01_01/symbols.txt — NOT the
+        // generic 0x80003000 area, that earlier guess was wrong for MP4):
+        //   0x800B4BB8 OSExceptionVector       (size 0x9C)
+        //   0x800B7714 __OSDispatchInterrupt   (size 0x344)
+        //   0x800B7A58 ExternalInterruptHandler (size 0x50)
+        //   0x800BA1B8 SelectThread            (size 0x200, wedge fn)
+        //   0x800C7558 __DSPHandler            (size 0x424, DSP IRQ id 7)
+        //   0x800C5F70 __AISHandler            (size 0x7C,  AI streaming)
+        //   0x800C5FEC __AIDHandler            (size 0x90,  AI DMA)
+        //   0x80113000..0x80114000 MusyX data-plane (mixing/reverb, NOT IRQ).
         if (inRange(0x8002EC68, 0x8002EDD8) ||
             inRange(0x8000D01C, 0x8000D1A0) ||
             inRange(0x800057C0, 0x800059EC) ||
             (__pc === 0x800E5BF0) ||
             inRange(0x100, 0x1800) ||
             inRange(0x80000100, 0x80001800) ||
-            inRange(0x80003000, 0x80004000)) {
+            inRange(0x800B4BB8, 0x800B4C54) ||
+            inRange(0x800B7714, 0x800B7A58) ||
+            inRange(0x800B7A58, 0x800B7AA8) ||
+            inRange(0x800BA1B8, 0x800BA3B8) ||
+            inRange(0x800C7558, 0x800C797C) ||
+            inRange(0x800C5F70, 0x800C5FEC) ||
+            inRange(0x800C5FEC, 0x800C607C) ||
+            inRange(0x80113000, 0x80114000)) {
             if (!Module.bemental_diag_compile_seen) Module.bemental_diag_compile_seen = {};
             if (!Module.bemental_diag_compile_seen[__pc]) {
                 Module.bemental_diag_compile_seen[__pc] = 1;
