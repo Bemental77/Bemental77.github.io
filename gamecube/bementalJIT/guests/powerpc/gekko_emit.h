@@ -45,8 +45,14 @@ enum WasmImportFunc : u32 {
     // env.ppc_read_tb stays in the JS shim as harmless dead code
     // until the next ppc_worker.js cleanup.
     WIMPORT_HLE_FIRE    = 10,  // (pc, idx_and_type) -> i32 — Item 5: ppc-worker wasm-native HLE hit path
-    WIMPORT_STACK_CORRUPT = 11, // (pc, ea, val, width) -> void — Researcher B: stack-store sentinel
-    WIMPORT_COUNT       = 12
+    // WIMPORT_STACK_CORRUPT removed 2026-06-09 — Researcher B diagnostic
+    // sentinel that fired per-store with a wasm→JS roundtrip cost. The
+    // ppc-worker side implemented the SAB-ring log; dolphin-bridge never
+    // bound the import. Powerpc-next emitter retired it. Removing here
+    // unblocks the merged-region path (build_region_function) which
+    // failed instantiation with "Import #12 ppc_stack_corrupt: function
+    // import requires a callable" and reduces per-store wasm op count.
+    WIMPORT_COUNT       = 11
 
 };
 
