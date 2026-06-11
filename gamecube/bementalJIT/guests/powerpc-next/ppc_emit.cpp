@@ -321,7 +321,11 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         emit_fallback(wb, rc, frc, op, params.ctx_ptr);
         return false;
     }
-    case 52: case 53:   // stfs/stfsu — deferred, needs PEM ConvertToSingle
+    // stfs/stfsu — native PEM ConvertToSingle (2026-06-11; PSO/MP4 highest-
+    // frequency FP-store fallback eliminated).
+    case 52: emit_stfs(wb, rc, frc, params, op, /*update=*/false); return true;
+    case 53: emit_stfs(wb, rc, frc, params, op, /*update=*/true ); return true;
+
     case 56: case 57:
     case 59:
     case 60: case 61:

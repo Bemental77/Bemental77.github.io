@@ -472,6 +472,68 @@ static bool test_mfspr_interp_writeback_visible() {
     return wv == 0xB00F0000u;
 }
 
+// stfs native PEM ConvertToSingle (2026-06-11): the retail lfs+stfs pair,
+// end-to-end through recording read/write imports. Two value classes:
+//   1.0f (0x3F800000) — normal: fast path must reproduce the bits.
+//   min denormal f32 (0x00000001) — lfs promotes to a double with
+//   exp=874; ConvertToSingle's denormal path must round-trip the exact
+//   bit pattern (an IEEE f32.demote would also produce it, but the PEM
+//   path is what hardware does; this exercises the select's denorm arm).
+// RED before the native emit (stfs was interp fallback; harness interp is
+// a no-op, so no write ever fired).
+static bool test_stfs_native_converttosingle() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80009BD4;
+    const u32 R2  = 0x801D8000u;
+    const u32 R13 = 0x801DB420u;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_writes = [];
+        Module.bemental_imports.env.ppc_read32 = function(addr) {
+            addr = addr >>> 0;
+            if (addr === 0x801D0008) return 0x3F800000 | 0;  // 1.0f
+            if (addr === 0x801D000C) return 0x00000001 | 0;  // min denormal
+            return 0;
+        };
+        Module.bemental_imports.env.ppc_write32 = function(addr, val) {
+            Module.test_writes.push([addr >>> 0, val >>> 0]);
+        };
+    });
+#endif
+    env.gpr(2)  = R2;
+    env.gpr(13) = R13;
+    *(u32*)((u8*)env.ctx_raw + ppc_off::MSR) = 0x2000u;  // MSR.FP=1
+    const u32 insts[] = {
+        0xC0228008u,  // lfs  f1, -0x7FF8(r2)  -> 1.0f
+        0xD02D86E0u,  // stfs f1, -0x7920(r13) -> expect (0x801D3B00, 0x3F800000)
+        0xC022800Cu,  // lfs  f1, -0x7FF4(r2)  -> denormal 0x00000001
+        0xD02D86E4u,  // stfs f1, -0x791C(r13) -> expect (0x801D3B04, 0x00000001)
+    };
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, 4, &next_pc);
+#ifdef __EMSCRIPTEN__
+    const u32 n_writes = (u32)EM_ASM_INT({ return Module.test_writes.length | 0; });
+    const u32 w0a = (u32)EM_ASM_INT({ return (Module.test_writes[0] || [0,0])[0] | 0; });
+    const u32 w0v = (u32)EM_ASM_INT({ return (Module.test_writes[0] || [0,0])[1] | 0; });
+    const u32 w1a = (u32)EM_ASM_INT({ return (Module.test_writes[1] || [0,0])[0] | 0; });
+    const u32 w1v = (u32)EM_ASM_INT({ return (Module.test_writes[1] || [0,0])[1] | 0; });
+    EM_ASM({
+        Module.bemental_imports.env.ppc_read32  = function(addr) { return 0; };
+        Module.bemental_imports.env.ppc_write32 = function(addr, val) {};
+    });
+#else
+    const u32 n_writes = 0, w0a = 0, w0v = 0, w1a = 0, w1v = 0;
+#endif
+    if (!dispatched) return false;
+    std::printf("[diag stfs-cts] n=%u w0=(0x%08x,0x%08x exp 0x801d3b00,0x3f800000) "
+                "w1=(0x%08x,0x%08x exp 0x801d3b04,0x00000001)\n",
+                n_writes, w0a, w0v, w1a, w1v);
+    return n_writes == 2u
+        && w0a == 0x801D3B00u && w0v == 0x3F800000u
+        && w1a == 0x801D3B04u && w1v == 0x00000001u;
+}
+
 static bool test_addi_sequential() {
     TestEnv env;
     if (!env.init()) return false;
@@ -1093,6 +1155,7 @@ static const TestCase k_tests[] = {
     {"lfs_sda2_negative_offset",         &test_lfs_sda2_negative_offset},
     {"lfs_msr_fp_disabled",              &test_lfs_msr_fp_disabled},
     {"mfspr_interp_writeback_visible",   &test_mfspr_interp_writeback_visible},
+    {"stfs_native_converttosingle",      &test_stfs_native_converttosingle},
     {"add_register",                     &test_add_register},
     {"bx_unconditional",                 &test_bx_unconditional},
     {"bx_with_link",                     &test_bx_with_link},

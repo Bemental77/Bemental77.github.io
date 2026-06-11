@@ -94,9 +94,12 @@ void emit_lmw (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 void emit_stmw(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op);
 
-// ----- FP D-form (immediate offset) single load (opc 48 lfs, 49 lfsu).
-// stfs/stfsu (52/53) deferred — need PEM ConvertToSingle inline bit-twiddle.
+// ----- FP D-form (immediate offset) single load/store (opc 48 lfs,
+// 49 lfsu, 52 stfs, 53 stfsu). Store uses PEM ConvertToSingle (bit-exact
+// port of Interpreter_FPUtils.h:541-562, native as of 2026-06-11).
 void emit_lfs (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+               LoadStoreParams params, const CodeOp& op, bool update);
+void emit_stfs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op, bool update);
 
 }  // namespace bemental::powerpc

@@ -600,30 +600,143 @@ void emit_lfsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     wb.op_local_set(rt_pair.ps1_idx);
 }
 
-// stfsx fS, rA, rB — store f32 from ps0(rs) at EA.
-// TODO(audit 2026-06-01): the previous inline emit used wasm
-// f32.demote_f64 (IEEE-754 round-to-nearest-even on the full 64-bit value),
-// but the architectural correct conversion is PEM (Paired-Element-Mode)
-// ConvertToSingle — Dolphin's Source/Core/Core/PowerPC/Interpreter/
-// Interpreter_FPUtils.h ConvertToSingleFTZ / ConvertToSingle path: bit-
-// manipulate the 64-bit double's exponent/mantissa to produce the PowerPC
-// f32 bit pattern (handles subnormals, infinities, and NaN payload
-// differently than IEEE round-then-reinterpret). The fix is non-trivial
-// (≈20 lines of bit-twiddling, plus the EA-form path), so for now route
-// stfsx to the interp fallback. Mirror emit_fallback (ppc_emit.cpp:56-63):
-// Flush dirty wasm-locals to memory so the interp sees current GPR/FPR
-// state, then ReloadAll after the call so subsequent ops in the same block
-// observe any interp-side mutations.
+// emit_convert_to_single — push ConvertToSingle(ps0_bits) as i32.
+// Bit-exact port of Dolphin Interpreter_FPUtils.h:541-562 (the stfs/stfsu/
+// stfsx store conversion; NOT the FTZ variant used by psq_st):
+//   exp = (x >> 52) & 0x7ff
+//   fast   (exp > 896 || mag == 0, and the "undefined" exp < 874 case —
+//           both branches are the same formula):
+//          ((x>>32) & 0xC0000000) | ((x>>29) & 0x3FFFFFFF)
+//   denorm (874 <= exp <= 896 && mag != 0):
+//          ((0x80000000 | ((x & DOUBLE_FRAC) >> 21)) >> (905 - exp))
+//          | ((x>>32) & 0x80000000)
+// Branchless via wasm `select` — both values computed, condition picks.
+// In the discarded fast case the denorm shift amount may exceed 31; wasm
+// i32.shr_u masks the count (&31), so it cannot trap. Clobbers
+// LOCAL_TMP_VAL (exp scratch); ps0_local is an i64 FPR cache local.
+static void emit_convert_to_single(WasmModuleBuilder& wb, u32 ps0_local) {
+    // exp -> LOCAL_TMP_VAL
+    wb.op_local_get(ps0_local);
+    wb.op_i64_const(52);
+    wb.op_i64_shr_u();
+    wb.op_i32_wrap_i64();
+    wb.op_i32_const(0x7FF);
+    wb.op_i32_and();
+    wb.op_local_set(LOCAL_TMP_VAL);
+
+    // denorm value
+    wb.op_local_get(ps0_local);
+    wb.op_i64_const(0x000FFFFFFFFFFFFFll);  // Common::DOUBLE_FRAC
+    wb.op_i64_and();
+    wb.op_i64_const(21);
+    wb.op_i64_shr_u();
+    wb.op_i32_wrap_i64();
+    wb.op_i32_const((s32)0x80000000u);
+    wb.op_i32_or();
+    wb.op_i32_const(905);
+    wb.op_local_get(LOCAL_TMP_VAL);
+    wb.op_i32_sub();
+    wb.op_i32_shr_u();
+    wb.op_local_get(ps0_local);
+    wb.op_i64_const(32);
+    wb.op_i64_shr_u();
+    wb.op_i32_wrap_i64();
+    wb.op_i32_const((s32)0x80000000u);
+    wb.op_i32_and();
+    wb.op_i32_or();
+
+    // fast value
+    wb.op_local_get(ps0_local);
+    wb.op_i64_const(32);
+    wb.op_i64_shr_u();
+    wb.op_i32_wrap_i64();
+    wb.op_i32_const((s32)0xC0000000u);
+    wb.op_i32_and();
+    wb.op_local_get(ps0_local);
+    wb.op_i64_const(29);
+    wb.op_i64_shr_u();
+    wb.op_i32_wrap_i64();
+    wb.op_i32_const(0x3FFFFFFF);
+    wb.op_i32_and();
+    wb.op_i32_or();
+
+    // cond: (exp >= 874) & (exp <= 896) & (magnitude != 0)
+    wb.op_local_get(LOCAL_TMP_VAL);
+    wb.op_i32_const(874);
+    wb.op_i32_ge_u();
+    wb.op_local_get(LOCAL_TMP_VAL);
+    wb.op_i32_const(896);
+    wb.op_i32_le_u();
+    wb.op_i32_and();
+    // mag != 0: ((wrap(x>>32) & 0x7FFFFFFF) | wrap(x)) != 0 — no i64.eqz
+    // in the builder, so do it in i32 halves.
+    wb.op_local_get(ps0_local);
+    wb.op_i64_const(32);
+    wb.op_i64_shr_u();
+    wb.op_i32_wrap_i64();
+    wb.op_i32_const(0x7FFFFFFF);
+    wb.op_i32_and();
+    wb.op_local_get(ps0_local);
+    wb.op_i32_wrap_i64();
+    wb.op_i32_or();
+    wb.op_i32_eqz();
+    wb.op_i32_eqz();
+    wb.op_i32_and();
+
+    wb.op_select();  // cond ? denorm : fast
+}
+
+// stfsx fS, rA, rB — store f32 from ps0(rs) at EA, PEM ConvertToSingle
+// semantics (2026-06-11: native emit replaces the interp-fallback stub;
+// the conversion lives in emit_convert_to_single above).
 void emit_stfsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                 LoadStoreParams params, const CodeOp& op) {
-    static constexpr u32 WIMPORT_INTERP = 6;
+    const u32 inst = op.inst;
+    const u32 rs   = GekkoOperands::RS(inst);
+    const u32 ra   = GekkoOperands::RA(inst);
+    const u32 rb   = GekkoOperands::RB(inst);
+
+    emit_ea_x_stack(wb, rc, ra, rb);
+    wb.op_local_set(LOCAL_TMP_EA);
+
+    auto rs_pair = frc.Bind(rs, FPRMode::Read, FPR_LANE_PS0);
+
+    // GPR flush — host WRITE32 may dispatch into MMIO that reads gpr[].
     rc.Flush(params.ctx_ptr);
-    frc.Flush(params.ctx_ptr);
-    wb.op_i32_const((s32)op.inst);
-    wb.op_i32_const((s32)op.address);
-    wb.op_call(WIMPORT_INTERP);
-    rc.ReloadAll(params.ctx_ptr);
-    frc.ReloadAll(params.ctx_ptr);
+
+    wb.op_local_get(LOCAL_TMP_EA);
+    emit_convert_to_single(wb, rs_pair.ps0_idx);
+    wb.op_call(WIMPORT_WRITE32);
+}
+
+// stfs  fS, d(rA) — D-form single store, PEM ConvertToSingle semantics.
+// stfsu fS, d(rA) — update form: rA <- EA after the store.
+// 2026-06-11: native emit (was interp fallback "deferred, needs PEM
+// ConvertToSingle"). stfs is every single-precision float store the guest
+// makes — the highest-frequency FP fallback in gameplay code paths.
+void emit_stfs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+               LoadStoreParams params, const CodeOp& op, bool update) {
+    const u32 inst = op.inst;
+    const u32 rs   = GekkoOperands::RS(inst);
+    const u32 ra   = GekkoOperands::RA(inst);
+    const u32 simm = GekkoOperands::SIMM_16(inst);
+
+    emit_ea_d_form(wb, rc, ra, simm);  // EA -> LOCAL_TMP_EA
+
+    auto rs_pair = frc.Bind(rs, FPRMode::Read, FPR_LANE_PS0);
+
+    // GPR flush — host WRITE32 may dispatch into MMIO that reads gpr[].
+    rc.Flush(params.ctx_ptr);
+
+    wb.op_local_get(LOCAL_TMP_EA);
+    emit_convert_to_single(wb, rs_pair.ps0_idx);
+    wb.op_call(WIMPORT_WRITE32);
+
+    if (update && ra != 0) {
+        auto rc_ra = rc.Bind(ra, RCMode::Write);
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_local_set(rc_ra.local_idx());
+    }
 }
 
 // lfd  FRD, d(rA)  — load f64 (8 bytes BE) from EA, store at ps0(FRD).
