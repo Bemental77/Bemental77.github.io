@@ -89,6 +89,14 @@ void SystemTimersManager::AudioDMACallback(Core::System& system, u64 userdata, s
   auto& system_timers = system.GetSystemTimers();
   const int callback_period = GetAudioDMACallbackPeriod(
       system_timers.m_cpu_core_clock, system.GetAudioInterface().GetAIDSampleRateDivisor());
+  {
+    static u64 axad_n = 0;
+    const u64 n = ++axad_n;
+    if (n <= 4 || (n & 0x3FF) == 0)
+      NOTICE_LOG_FMT(POWERPC, "[ax-aid] AudioDMACallback n={} period={} divisor={} late={}", n,
+                     callback_period, system.GetAudioInterface().GetAIDSampleRateDivisor(),
+                     cycles_late);
+  }
   system.GetCoreTiming().ScheduleEvent(callback_period - cycles_late,
                                        system_timers.m_event_type_audio_dma);
 }
