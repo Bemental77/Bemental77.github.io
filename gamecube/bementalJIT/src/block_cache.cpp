@@ -280,10 +280,22 @@ typedef u32 (*BemBlockFn)(void);
 
 // Armed by the dolphin-bridge wake watcher; consumed here per dispatch.
 int g_ax_wake_arm = 0;
+// Re-check block watch (VIWaitForRetrace wake compare, 0x800C1544): the
+// bridge logs the compare inputs whenever this block dispatches.
+int g_recheck_handle = -1;
+int g_vwaitset_handle = -1;
 int g_ax_wake_ring[256];
 int g_ax_wake_ring_n = 0;
 
+// Diag hook installed by the dolphin bridge (null in standalone test
+// links — tests have no bridge TU, so a hard extern breaks wasm-ld).
+void (*g_block_watch_hook)(int phase) = nullptr;
+
 s32 dispatch_raw(int handle) {
+    if (g_block_watch_hook) {
+        if (handle == g_recheck_handle && g_recheck_handle >= 0) g_block_watch_hook(0);
+        if (handle == g_vwaitset_handle && g_vwaitset_handle >= 0) g_block_watch_hook(1);
+    }
     int ax_arm_now = 0;
     if (g_ax_wake_arm > 0) {
         ax_arm_now = g_ax_wake_arm--;
@@ -518,6 +530,8 @@ void release_raw(int handle) {
 }
 
 void register_pc_handle(u64 pc, int handle) {
+    if ((u32)pc == 0x800C1544u) g_recheck_handle = handle;
+    if ((u32)pc == 0x800059ECu) g_vwaitset_handle = handle;
 #ifdef __EMSCRIPTEN__
     EM_ASM({
         if (!Module.bemental_pc_to_handle) Module.bemental_pc_to_handle = new Map();

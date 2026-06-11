@@ -194,6 +194,20 @@ uint32_t dolphin_check_exc(uint32_t /*unused*/) {
                            (u32(ram[0x1D3CE4]) << 8) | u32(ram[0x1D3CE7]);
                 u32 misc = (u32(ram[0x1D3D18]) << 24) | (u32(ram[0x1D3A07]) << 16) |
                            u32(ram[0x1D3A04]);
+                // Wild-store watch: minimumVcount/minimumVcountf
+                // (0x1D3B04/0x1D3B00, zero-initialized .sbss) read -1 /
+                // 0x59800000 every run with HuSysVWaitSet NEVER dispatched.
+                {
+                    static u32 s_prev_mv = 0xEEEEEEEEu;
+                    u32 mv = (u32(ram[0x1D3B04]) << 24) | (u32(ram[0x1D3B05]) << 16) |
+                             (u32(ram[0x1D3B06]) << 8) | u32(ram[0x1D3B07]);
+                    if (mv != s_prev_mv) {
+                        NOTICE_LOG_FMT(POWERPC,
+                                       "[ax-minvc] minimumVcount {:#x} -> {:#x} (detect pc={:#x} lr={:#x})",
+                                       s_prev_mv, mv, ps.pc, LR(ps));
+                        s_prev_mv = mv;
+                    }
+                }
                 // PAD driver state (authoritative host-side read; the SAB
                 // dump tool showed all-zero here, contradicting its own
                 // ResettingChan=32 initializer — suspected stale-MEM1-copy
@@ -271,10 +285,14 @@ uint32_t dolphin_check_exc(uint32_t /*unused*/) {
                             u32 r30 = rd32(thr + 0x78);
                             u32 r31 = rd32(thr + 0x7C);
                             u32 live_rcount = rd32(0x1D4428);
+                            const u32 pi_cause =
+                                sys.GetProcessorInterface().m_interrupt_cause;
+                            const u32 pi_mask =
+                                sys.GetProcessorInterface().m_interrupt_mask;
                             NOTICE_LOG_FMT(POWERPC,
-                                           "[ax-park] srr0={:#x} state={:#x} queue={:#x} r30={} rcount={} arm={} (n={})",
-                                           srr0, state, queue, r30, live_rcount,
-                                           bemental::g_ax_wake_arm, s_park_n);
+                                           "[ax-park] srr0={:#x} state={:#x} queue={:#x} r30={} rcount={} cause={:#x} mask={:#x} (n={})",
+                                           srr0, state, queue, r30, live_rcount, pi_cause,
+                                           pi_mask, s_park_n);
                         }
                         s_prev_srr0 = srr0;
                         s_prev_queue = queue;
@@ -437,6 +455,45 @@ void dolphin_interp(uint32_t /*unused*/, uint32_t pc) {
 // (Jit.cpp:714) which is called from every MSR-changing op. Type-2 import
 // signature (i32, i32) -> () — both args unused; the handler reads the
 // global m_ppc_state via Core::System.
+extern "C" EMSCRIPTEN_KEEPALIVE void dolphin_log_recheck(int phase) {
+    // Compare inputs of the VIWaitForRetrace wake re-check block at the
+    // moment of its dispatch: r30 = startCount (live register), the SDA
+    // load source = ram[0x1D4428] (retraceCount), r13 (SDA base sanity).
+    static u64 n = 0;
+    auto& sys = Core::System::GetInstance();
+    if (phase == 1) {
+        auto& ps1 = sys.GetPPCState();
+        NOTICE_LOG_FMT(POWERPC, "[ax-vwaitset] r3={:#x} r2={:#x} r13={:#x} lr={:#x}", ps1.gpr[3],
+                       ps1.gpr[2], ps1.gpr[13], LR(ps1));
+        return;
+    }
+    ++n;
+    if (n > 64 && (n & 0x3FF) != 0) return;
+    auto& ps = sys.GetPPCState();
+    const u8* ram = sys.GetMemory().GetRAM();
+    const u32 rcount = ram ? ((u32(ram[0x1D4428]) << 24) | (u32(ram[0x1D4429]) << 16) |
+                              (u32(ram[0x1D442A]) << 8) | u32(ram[0x1D442B])) : 0;
+    // Caller of VIWaitForRetrace: its prologue stores the caller LR at
+    // [r1+0x14] (mflr r0; stw r0,4(r1); stwu r1,-0x10(r1) -> slot at +0x14).
+    u32 caller = 0;
+    if (ram) {
+        const u32 sp = ps.gpr[1] & 0x01FFFFFFu;
+        caller = (u32(ram[sp + 0x14]) << 24) | (u32(ram[sp + 0x15]) << 16) |
+                 (u32(ram[sp + 0x16]) << 8) | u32(ram[sp + 0x17]);
+    }
+    u32 min_vc = 0, min_vcf = 0;
+    if (ram) {
+        min_vc  = (u32(ram[0x1D3B04]) << 24) | (u32(ram[0x1D3B05]) << 16) |
+                  (u32(ram[0x1D3B06]) << 8) | u32(ram[0x1D3B07]);
+        min_vcf = (u32(ram[0x1D3B00]) << 24) | (u32(ram[0x1D3B01]) << 16) |
+                  (u32(ram[0x1D3B02]) << 8) | u32(ram[0x1D3B03]);
+    }
+    NOTICE_LOG_FMT(POWERPC,
+                   "[ax-recheck] n={} r30={} mem_rcount={} caller={:#x} minVcount={} minVcountF={:#x}",
+                   n, ps.gpr[30], rcount, caller, (s32)min_vc, min_vcf);
+    (void)phase;
+}
+
 EMSCRIPTEN_KEEPALIVE
 void dolphin_msr_updated(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
     Core::System::GetInstance().GetPowerPC().MSRUpdated();
@@ -452,6 +509,24 @@ void dolphin_msr_updated(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
 // forever on GP-triggered fences.
 EMSCRIPTEN_KEEPALIVE
 void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
+    // [ax-minvc2] per-store-block wild-store bracket for minimumVcount
+    // (0x1D3B04): detection lands within ONE block of the writer.
+    {
+        auto& sys_m = Core::System::GetInstance();
+        const u8* ram_m = sys_m.GetMemory().GetRAM();
+        if (ram_m) {
+            static u32 s_prev_mv2 = 0xEEEEEEEEu;
+            u32 mv = (u32(ram_m[0x1D3B04]) << 24) | (u32(ram_m[0x1D3B05]) << 16) |
+                     (u32(ram_m[0x1D3B06]) << 8) | u32(ram_m[0x1D3B07]);
+            if (mv != s_prev_mv2) {
+                auto& ps_m = sys_m.GetPPCState();
+                NOTICE_LOG_FMT(POWERPC,
+                               "[ax-minvc2] {:#x} -> {:#x} (block pc={:#x} lr={:#x})",
+                               s_prev_mv2, mv, ps_m.pc, LR(ps_m));
+                s_prev_mv2 = mv;
+            }
+        }
+    }
     // [ax-fill] __fill_mem (0x800033D8..0x80003490) dominates wedged-phase
     // dispatch; check_exc never fires from its stw/bdnz loop, but this drain
     // runs at every store-block exit. Capture caller LR + args (r3=dst,

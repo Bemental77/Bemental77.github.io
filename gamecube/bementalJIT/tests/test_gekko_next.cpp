@@ -264,6 +264,43 @@ struct TestEnv {
 // (0x800C1544: lwz r0,-0x6FF8(r13); cmplw r30,r0; beq -0x10). The conformance
 // corpus never used r0 as an input operand — this is the live boot-wedge
 // block (main re-sleeps forever despite retraceCount advancing).
+// Exact retail bytes of MP4 HuSysInit's minimumVcountf store (init.s:65-66):
+// lfs f1,-0x7FF8(r2); stfs f1,-0x7920(r13). Live bug: the lfs EA computed
+// 8 bytes LOW, loading the int-to-double magic (2^52) at -0x8000 instead of
+// the 1.0f at -0x7FF8 -> minimumVcountf=0x59800000, fp2unsigned saturates
+// minimumVcount=-1 -> HuSysDoneRender's unsigned pacing loop never exits ->
+// boot wedge (GlobalCounter pinned at 0).
+static bool test_lfs_sda2_negative_offset() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80009BD4;
+    static u8 mem1[0x20000];
+    std::memset(mem1, 0, sizeof(mem1));
+    const u32 R2 = 0x801D8000u;       // arbitrary sdata2 base for the test
+    const u32 R13 = 0x801DB420u;      // real r13
+    const u32 ea_one  = (R2 - 0x7FF8u) & 0x1FFFFu;  // 1.0f here
+    const u32 ea_magic = (R2 - 0x8000u) & 0x1FFFFu; // 2^52 double here
+    const u32 ea_dst  = (R13 - 0x7920u) & 0x1FFFFu; // minimumVcountf slot
+    // big-endian 1.0f at ea_one
+    mem1[ea_one] = 0x3F; mem1[ea_one+1] = 0x80; mem1[ea_one+2] = 0; mem1[ea_one+3] = 0;
+    // big-endian double 2^52 at ea_magic (0x4330000000000000)
+    mem1[ea_magic] = 0x43; mem1[ea_magic+1] = 0x30;
+    env.gpr(2)  = R2;
+    env.gpr(13) = R13;
+    const u32 insts[] = {
+        0xC0228008u,  // lfs f1, -0x7FF8(r2)
+        0xD02D86E0u,  // stfs f1, -0x7920(r13)
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 2, &next_pc,
+                            (u32)(uintptr_t)mem1, 0x1FFFFu, sizeof(mem1)))
+        return false;
+    const u32 stored = (u32(mem1[ea_dst]) << 24) | (u32(mem1[ea_dst+1]) << 16) |
+                       (u32(mem1[ea_dst+2]) << 8) | u32(mem1[ea_dst+3]);
+    std::printf("[diag lfs-sda2] stored=0x%08x (exp 0x3f800000)\n", stored);
+    return stored == 0x3F800000u;
+}
+
 static bool test_viwait_recheck_block() {
     TestEnv env;
     if (!env.init()) return false;
@@ -906,6 +943,7 @@ struct TestCase {
 static const TestCase k_tests[] = {
     {"addi_sequential",                  &test_addi_sequential},
     {"viwait_recheck_block",             &test_viwait_recheck_block},
+    {"lfs_sda2_negative_offset",         &test_lfs_sda2_negative_offset},
     {"add_register",                     &test_add_register},
     {"bx_unconditional",                 &test_bx_unconditional},
     {"bx_with_link",                     &test_bx_with_link},
