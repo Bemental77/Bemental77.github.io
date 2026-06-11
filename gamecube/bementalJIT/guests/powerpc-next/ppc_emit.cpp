@@ -542,6 +542,16 @@ std::vector<u8> build_block_next(u32 start_pc,
     // Pure ALU/branch blocks (the overwhelming majority pre-VI_FIELD_BELOW)
     // skip the unconditional wasm→JS crossing.
     bool block_has_store = false;
+    // Jit64 parity (Jit.cpp:1104-1128): the FIRST FL_USE_FPU op in a block
+    // gets an MSR.FP bailout check; once it passes, later FP ops in the
+    // same block skip it (FP can't be disabled mid-block — mtmsr ends the
+    // block). Root cause of the MP4 minimumVcount boot wedge (2026-06-11):
+    // native lfs ran with MSR.FP=0 (no trap), the interp-fallback stfs then
+    // raised FPU-unavailable, __OSLoadFPUContext clobbered the lfs result
+    // with the stale saved context, and SRR0-based re-execution resumed at
+    // the stfs — storing stale f1 (f64 2^52 → 0x59800000) and saturating
+    // minimumVcount to 0xFFFFFFFF (red test: lfs_msr_fp_disabled).
+    bool first_fp_found = false;
     for (std::size_t i = 0; i < n_ops; ++i) {
         const CodeOp& op = buffer[i];
         const bool is_terminator = (i + 1 == n_ops);
@@ -606,6 +616,43 @@ std::vector<u8> build_block_next(u32 start_pc,
         // the cond falls through, next_pc=fallthrough and the block
         // exits naturally. PowerPC ISA's standard 64-bit timebase read
         // pattern depends on this behavior to terminate.
+        // FP-unavailable bailout before the first FP op (see first_fp_found
+        // above). ctx.PC already holds op.address (pre-op set_pc), matching
+        // Jit64's MOV(pc, op.address) — SRR0 lands on THIS op so the whole
+        // FP sequence re-executes after __OSLoadFPUContext.
+        if (op.opinfo && (op.opinfo->flags & FL_USE_FPU) && !first_fp_found) {
+            rc.Flush(ctx_ptr);
+            frc.Flush(ctx_ptr);
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_load(ppc_off::MSR);
+            b.op_i32_const(0x2000);          // MSR.FP (Jit64 Jit.cpp:1107)
+            b.op_i32_and();
+            b.op_i32_eqz();
+            b.op_if(BLOCK_TYPE_VOID);
+                // Exceptions |= EXCEPTION_FPU_UNAVAILABLE (0x40, Gekko.h:930)
+                b.op_i32_const((s32)ctx_ptr);
+                b.op_i32_const((s32)ctx_ptr);
+                b.op_i32_load(ppc_off::EXCEPTIONS);
+                b.op_i32_const(0x40);
+                b.op_i32_or();
+                b.op_i32_store(ppc_off::EXCEPTIONS);
+                // Deliver: CheckExceptionsFromJIT sets PC to vector 0x800,
+                // SRR0 = op.address (PowerPC.cpp:538-548).
+                b.op_i32_const((s32)op.address);
+                b.op_call(WIMPORT_CHECK_EXC);
+                b.op_drop();
+                // Early-exit parity with emit_fallback's exception path:
+                // drain the gather pipe (the normal epilogue is bypassed).
+                b.op_i32_const(0);
+                b.op_i32_const(0);
+                b.op_call(WIMPORT_GATHER_DRAIN);
+                b.op_i32_const((s32)ctx_ptr);
+                b.op_i32_load(ppc_off::PC);
+                b.op_return();
+            b.op_end();
+            first_fp_found = true;
+        }
+
         const bool emitted_native = dispatch_op(b, rc, frc, op, params);
 
         // Block-exit PC correctness for non-branch-terminated blocks (decode-

@@ -270,35 +270,120 @@ struct TestEnv {
 // the 1.0f at -0x7FF8 -> minimumVcountf=0x59800000, fp2unsigned saturates
 // minimumVcount=-1 -> HuSysDoneRender's unsigned pacing loop never exits ->
 // boot wedge (GlobalCounter pinned at 0).
+// 2026-06-11 REWRITE — the previous version of this test was a HARNESS
+// ARTIFACT, not an EA-bug repro: it asserted on the stfs's store, but stfs
+// is interp-fallback (ppc_emit.cpp case 52) and this harness's ppc_interp
+// stub is a NO-OP — and emit_lfs is slowmem-only, so the default
+// ppc_read32 stub (return 0) fed the lfs zeros regardless of EA. Red by
+// construction; it indicted the lfs EA without testing it.
+// This version tests the lfs claim directly: a recording ppc_read32
+// captures the EA the emitted code actually issues (the STATUS.md claim
+// "EA computed 8 bytes LOW" would show read_addr=0x801D0000 instead of
+// 0x801D0008), and f1's ps0/ps1 (flushed to PowerPCState by the stfs
+// fallback's frc.Flush + block epilogue) capture the loaded+promoted value.
 static bool test_lfs_sda2_negative_offset() {
     TestEnv env;
     if (!env.init()) return false;
     const u32 PC = 0x80009BD4;
-    static u8 mem1[0x20000];
-    std::memset(mem1, 0, sizeof(mem1));
-    const u32 R2 = 0x801D8000u;       // arbitrary sdata2 base for the test
-    const u32 R13 = 0x801DB420u;      // real r13
-    const u32 ea_one  = (R2 - 0x7FF8u) & 0x1FFFFu;  // 1.0f here
-    const u32 ea_magic = (R2 - 0x8000u) & 0x1FFFFu; // 2^52 double here
-    const u32 ea_dst  = (R13 - 0x7920u) & 0x1FFFFu; // minimumVcountf slot
-    // big-endian 1.0f at ea_one
-    mem1[ea_one] = 0x3F; mem1[ea_one+1] = 0x80; mem1[ea_one+2] = 0; mem1[ea_one+3] = 0;
-    // big-endian double 2^52 at ea_magic (0x4330000000000000)
-    mem1[ea_magic] = 0x43; mem1[ea_magic+1] = 0x30;
+    const u32 R2       = 0x801D8000u;   // arbitrary sdata2 base for the test
+    const u32 EA_ONE   = R2 - 0x7FF8u;  // 0x801D0008 — 1.0f lives here
+    const u32 EA_MAGIC = R2 - 0x8000u;  // 0x801D0000 — 2^52 magic high word
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_last_read_addr = 0;
+        Module.bemental_imports.env.ppc_read32 = function(addr) {
+            addr = addr >>> 0;
+            Module.test_last_read_addr = addr;
+            if (addr === ($0 >>> 0)) return 0x3F800000 | 0;  // 1.0f
+            if (addr === ($1 >>> 0)) return 0x43300000 | 0;  // magic hi word
+            return 0;
+        };
+    }, EA_ONE, EA_MAGIC);
+#endif
     env.gpr(2)  = R2;
-    env.gpr(13) = R13;
+    env.gpr(13) = 0x801DB420u;  // real r13
+    // MSR.FP=1 — this test covers the FPU-ENABLED path. The disabled path
+    // (first-FP-op exception bailout, Jit64 Jit.cpp:1104-1128 parity) is
+    // covered by lfs_msr_fp_disabled below.
+    *(u32*)((u8*)env.ctx_raw + ppc_off::MSR) = 0x2000u;
     const u32 insts[] = {
-        0xC0228008u,  // lfs f1, -0x7FF8(r2)
-        0xD02D86E0u,  // stfs f1, -0x7920(r13)
+        0xC0228008u,  // lfs f1, -0x7FF8(r2)   — exact retail bytes
+        0xD02D86E0u,  // stfs f1, -0x7920(r13) — kept for retail block shape;
+                      //   interp-fallback no-op in this harness, NOT asserted
     };
     s32 next_pc = -1;
-    if (!env.dispatch_block(PC, insts, 2, &next_pc,
-                            (u32)(uintptr_t)mem1, 0x1FFFFu, sizeof(mem1)))
-        return false;
-    const u32 stored = (u32(mem1[ea_dst]) << 24) | (u32(mem1[ea_dst+1]) << 16) |
-                       (u32(mem1[ea_dst+2]) << 8) | u32(mem1[ea_dst+3]);
-    std::printf("[diag lfs-sda2] stored=0x%08x (exp 0x3f800000)\n", stored);
-    return stored == 0x3F800000u;
+    bool dispatched = env.dispatch_block(PC, insts, 2, &next_pc);
+#ifdef __EMSCRIPTEN__
+    const u32 read_addr = (u32)EM_ASM_INT({ return Module.test_last_read_addr | 0; });
+    // Restore the suite's default return-0 stub for subsequent tests.
+    EM_ASM({
+        Module.bemental_imports.env.ppc_read32 = function(addr) { return 0; };
+    });
+#else
+    const u32 read_addr = 0;
+#endif
+    if (!dispatched) return false;
+    const u64 f1ps0 = *(const u64*)((const u8*)env.ctx_raw + ppc_off::ps0(1));
+    const u64 f1ps1 = *(const u64*)((const u8*)env.ctx_raw + ppc_off::ps1(1));
+    std::printf("[diag lfs-sda2] read_addr=0x%08x (exp 0x%08x) "
+                "f1.ps0=0x%016llx f1.ps1=0x%016llx (exp 0x3ff0000000000000)\n",
+                read_addr, EA_ONE,
+                (unsigned long long)f1ps0, (unsigned long long)f1ps1);
+    return read_addr == EA_ONE
+        && f1ps0 == 0x3FF0000000000000ull
+        && f1ps1 == 0x3FF0000000000000ull;
+}
+
+// MSR.FP=0 + FP op: the block must RAISE EXCEPTION_FPU_UNAVAILABLE (0x40,
+// Gekko.h:930) BEFORE executing the FP op, and exit — Jit64 parity
+// (Jit.cpp:1104-1128: TEST msr,1<<13 → pc=op.address, Exceptions|=0x40,
+// WriteExceptionExit). This is the MP4 boot-wedge mechanism pinned
+// 2026-06-11 from the live trajectory (probe.log wtraj: 80009bd4 → vector
+// 800 → resume at 80009bd8): the native lfs ran WITHOUT the MSR.FP check,
+// the interp-fallback stfs then raised FPU-unavailable, __OSLoadFPUContext
+// clobbered f1 with the stale saved context (f64 2^52), and re-execution
+// resumed at the stfs — storing minimumVcountf=0x59800000 and saturating
+// minimumVcount=0xFFFFFFFF, wedging HuSysDoneRender's pacing loop forever.
+// Asserts: (a) the load import never fires, (b) Exceptions has 0x40,
+// (c) next_pc = the faulting op's address (re-execution restarts AT the
+// lfs, not after it).
+static bool test_lfs_msr_fp_disabled() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80009BD4;
+    const u32 R2 = 0x801D8000u;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_last_read_addr = 0;
+        Module.bemental_imports.env.ppc_read32 = function(addr) {
+            Module.test_last_read_addr = addr >>> 0;
+            return 0x3F800000 | 0;
+        };
+    });
+#endif
+    env.gpr(2) = R2;
+    // MSR stays 0 (calloc) — FP disabled.
+    const u32 insts[] = {
+        0xC0228008u,  // lfs f1, -0x7FF8(r2) — exact retail bytes
+    };
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, 1, &next_pc);
+#ifdef __EMSCRIPTEN__
+    const u32 read_addr = (u32)EM_ASM_INT({ return Module.test_last_read_addr | 0; });
+    EM_ASM({
+        Module.bemental_imports.env.ppc_read32 = function(addr) { return 0; };
+    });
+#else
+    const u32 read_addr = 0;
+#endif
+    if (!dispatched) return false;
+    const u32 exceptions = *(const u32*)((const u8*)env.ctx_raw + ppc_off::EXCEPTIONS);
+    std::printf("[diag lfs-msrfp] read_addr=0x%08x (exp 0 = load suppressed) "
+                "exceptions=0x%08x (exp 0x40) next_pc=0x%08x (exp 0x%08x)\n",
+                read_addr, exceptions, (u32)next_pc, PC);
+    return read_addr == 0u
+        && (exceptions & 0x40u) != 0u
+        && next_pc == (s32)PC;
 }
 
 static bool test_viwait_recheck_block() {
@@ -944,6 +1029,7 @@ static const TestCase k_tests[] = {
     {"addi_sequential",                  &test_addi_sequential},
     {"viwait_recheck_block",             &test_viwait_recheck_block},
     {"lfs_sda2_negative_offset",         &test_lfs_sda2_negative_offset},
+    {"lfs_msr_fp_disabled",              &test_lfs_msr_fp_disabled},
     {"add_register",                     &test_add_register},
     {"bx_unconditional",                 &test_bx_unconditional},
     {"bx_with_link",                     &test_bx_with_link},

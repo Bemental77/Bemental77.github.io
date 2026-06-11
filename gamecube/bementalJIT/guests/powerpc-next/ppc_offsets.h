@@ -19,6 +19,8 @@ constexpr u32 PS_BASE     = 0x0A0;
 constexpr u32 CR_BASE     = 0x2A0;  // CR[0..7], each u64
 constexpr u32 MSR         = 0x2E0;
 constexpr u32 FPSCR       = 0x2E4;
+// feature_flags (CPUEmuFeatureFlags : u32, Gekko.h:937) sits at 0x2E8.
+constexpr u32 EXCEPTIONS  = 0x2EC;      // PowerPCState.Exceptions (PowerPC.h:150)
 constexpr u32 XER_CA          = 0x2F4;  // u8
 constexpr u32 XER_SO_OV       = 0x2F5;  // u8 — format: (SO << 1) | OV
 constexpr u32 XER_STRINGCTRL  = 0x2F6;  // u16 — BYTE_COUNT | (BYTE_CMP << 8)
