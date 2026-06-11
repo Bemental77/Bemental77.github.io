@@ -410,6 +410,68 @@ static bool test_viwait_recheck_block() {
     return next_pc == (s32)(PC + 12u) && env.gpr(0) == 5u;
 }
 
+// PSO __LCEnable HID2 read-modify-write (exact retail shape, 2026-06-11):
+//   mfspr r4, HID2   <- interp fallback (HID2 not spr_is_direct)
+//   oris  r4, r4, 0x100F   <- native
+//   stw   r4, 0(r5)   <- native, captures the oris result via write import
+// Live bug: interp mfspr wrote gpr[4]=0xA0000000 to PowerPCState ([ax-lce]
+// proof), but the oris computed on r4=0 -> stored HID2=0x100F0000, wiping
+// PSE/LSQE -> IsInvalidPairedSingleExecution(dcbz_l) -> Program exception 6
+// (Unhandled Exception 6 crash in __LCEnable's lock loop). The interp's
+// gpr[] write must be visible to the next native op's register read.
+static bool test_mfspr_interp_writeback_visible() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80011228;  // real PSO mfspr HID2 address
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_ctx_ptr = $0 >>> 0;
+        Module.test_last_write_addr = 0;
+        Module.test_last_write_val  = 0;
+        // Simulate Dolphin's interp mfspr HID2: write gpr[4] in PowerPCState
+        // memory (GPR_BASE 0x14 + 4*4 = 0x24), little-endian host u32.
+        Module.test_interp_calls = 0;
+        Module.bemental_imports.env.ppc_interp = function(inst, pc) {
+            Module.test_interp_calls++;
+            if ((pc >>> 0) === 0x80011228) {
+                HEAPU32[(Module.test_ctx_ptr + 0x24) >>> 2] = 0xA0000000;
+            }
+        };
+        Module.bemental_imports.env.ppc_write32 = function(addr, val) {
+            Module.test_last_write_addr = addr >>> 0;
+            Module.test_last_write_val  = val  >>> 0;
+        };
+    }, env.ctx_ptr);
+#endif
+    env.gpr(5) = 0x40000000u;  // outside trusted ranges -> write import fires
+    const u32 insts[] = {
+        0x7C98E2A6u,  // mfspr r4, HID2  (exact retail bytes, __LCEnable+0x28)
+        0x6484100Fu,  // oris  r4, r4, 0x100F
+        0x90850000u,  // stw   r4, 0(r5) — capture the oris result
+    };
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, 3, &next_pc);
+#ifdef __EMSCRIPTEN__
+    const u32 wv = (u32)EM_ASM_INT({ return Module.test_last_write_val | 0; });
+    // Restore suite default stubs.
+    EM_ASM({
+        Module.bemental_imports.env.ppc_interp  = function(inst, pc) {};
+        Module.bemental_imports.env.ppc_write32 = function(addr, val) {};
+    });
+#else
+    const u32 wv = 0;
+#endif
+    if (!dispatched) return false;
+#ifdef __EMSCRIPTEN__
+    const u32 interp_calls = (u32)EM_ASM_INT({ return Module.test_interp_calls | 0; });
+#else
+    const u32 interp_calls = 0;
+#endif
+    std::printf("[diag mfspr-wb] stored=0x%08x (exp 0xb00f0000) r4=0x%08x interp_calls=%u\n",
+                wv, env.gpr(4), interp_calls);
+    return wv == 0xB00F0000u;
+}
+
 static bool test_addi_sequential() {
     TestEnv env;
     if (!env.init()) return false;
@@ -1030,6 +1092,7 @@ static const TestCase k_tests[] = {
     {"viwait_recheck_block",             &test_viwait_recheck_block},
     {"lfs_sda2_negative_offset",         &test_lfs_sda2_negative_offset},
     {"lfs_msr_fp_disabled",              &test_lfs_msr_fp_disabled},
+    {"mfspr_interp_writeback_visible",   &test_mfspr_interp_writeback_visible},
     {"add_register",                     &test_add_register},
     {"bx_unconditional",                 &test_bx_unconditional},
     {"bx_with_link",                     &test_bx_with_link},

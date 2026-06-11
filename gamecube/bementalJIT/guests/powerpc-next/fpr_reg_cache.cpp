@@ -92,19 +92,16 @@ RCFprPair FPRRegCache::Bind(u32 preg, FPRMode mode, u8 lane_mask) {
         s.ps1_local_idx = m_local_base + 32u + preg;
         s.assigned = true;
     }
-    const bool wants_read = (mode != FPRMode::Write);
-    if (wants_read) {
-        if ((lane_mask & FPR_LANE_PS0) && !s.ps0_loaded) {
-            EmitLaneLoad(m_lazy_ctx_ptr, preg, FPR_LANE_PS0);
-        }
-        if ((lane_mask & FPR_LANE_PS1) && !s.ps1_loaded) {
-            EmitLaneLoad(m_lazy_ctx_ptr, preg, FPR_LANE_PS1);
-        }
-    } else {
-        // Pure Write — mark lanes loaded so a future Read sees the local
-        // (the emit guarantees it sets the local before any read).
-        if (lane_mask & FPR_LANE_PS0) s.ps0_loaded = true;
-        if (lane_mask & FPR_LANE_PS1) s.ps1_loaded = true;
+    // 2026-06-11: lazy-load fires for PURE-WRITE binds too — same class as
+    // RegCache::Bind (see reg_cache.cpp): an RMW emitter that binds the
+    // dest lane first and then reads the same lane would consume the
+    // zero-initialized wasm local instead of PowerPCState. One redundant
+    // i64.load per first-touch lane is the price.
+    if ((lane_mask & FPR_LANE_PS0) && !s.ps0_loaded) {
+        EmitLaneLoad(m_lazy_ctx_ptr, preg, FPR_LANE_PS0);
+    }
+    if ((lane_mask & FPR_LANE_PS1) && !s.ps1_loaded) {
+        EmitLaneLoad(m_lazy_ctx_ptr, preg, FPR_LANE_PS1);
     }
     if (mode == FPRMode::Write || mode == FPRMode::ReadWrite) {
         if (lane_mask & FPR_LANE_PS0) s.ps0_dirty = true;

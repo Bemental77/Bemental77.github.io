@@ -85,18 +85,28 @@ RCWasmLocal RegCache::Bind(u32 preg, RCMode mode) {
         // That was the SIGetType lmw r28-r31 corruption root: epilogue
         // restored regs via interp fallback; successor block Bind(r31, *)
         // here marked dirty without loading, block-exit Flush wrote 0
-        // over the restored memory. Now: lazy-load from PowerPCState for
-        // any mode that reads. Pure Write skips the load (the local will
-        // be defined by the emit before any read).
+        // over the restored memory.
+        //
+        // 2026-06-11 (PSO __LCEnable crash, test
+        // mfspr_interp_writeback_visible): the lazy-load must run for
+        // PURE-WRITE binds too. RMW emitters bind the DEST first
+        // (Bind(ra, Write) then Bind(rs, Read) — emit_logical_imm_simple,
+        // emit_andi_imm, emit_binop_x ...); when dest==src and the reg is
+        // unassigned, the Write bind marked it loaded WITHOUT a load, and
+        // the same op's Read bind then consumed the zero-initialized wasm
+        // local instead of PowerPCState. Live impact: `mfspr r4, HID2;
+        // oris r4, r4, 0x100F` — interp fallback wrote gpr[4]=0xA0000000
+        // to memory, oris computed on 0, HID2 lost PSE/LSQE → dcbz_l →
+        // Program exception 6 → PSO boot crash. One redundant i32.load on
+        // a genuinely-overwritten first-touch reg is the price; coherence
+        // bugs of this class are gone.
         s.local_idx = m_local_base + preg;
         s.assigned  = true;
-        if (mode != RCMode::Write) {
-            // m_lazy_ctx_ptr stamped by OnBlockEntry; 0 = mis-wiring,
-            // would emit OOB load (wasm trap) which surfaces the bug.
-            m_wb.op_i32_const((s32)m_lazy_ctx_ptr);
-            m_wb.op_i32_load(ppc_gpr_off(preg));
-            m_wb.op_local_set(s.local_idx);
-        }
+        // m_lazy_ctx_ptr stamped by OnBlockEntry; 0 = mis-wiring,
+        // would emit OOB load (wasm trap) which surfaces the bug.
+        m_wb.op_i32_const((s32)m_lazy_ctx_ptr);
+        m_wb.op_i32_load(ppc_gpr_off(preg));
+        m_wb.op_local_set(s.local_idx);
         s.loaded = true;
     }
     if (mode == RCMode::Write || mode == RCMode::ReadWrite) {
