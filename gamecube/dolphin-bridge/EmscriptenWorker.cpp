@@ -81,10 +81,15 @@ bool retro_serialize(void* data, size_t size);
 bool retro_unserialize(const void* data, size_t size);
 }
 
-static uint8_t g_pad[32] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+// All-released is the ONLY sane default. This was 0xFF-filled (every button
+// on every port pressed from boot) — 2026-06-11 PSO root cause: the
+// AppSwitcher's pad check saw its return-to-menu combo held (Pad::GetStatus
+// button=0x1f7f, triggers 255/255 on every poll) and deliberately called
+// OSResetSystem(HOTRESET) mid-load of psov3.dol, parking the console in
+// __OSDoHotReset's spin (PI_RESET_CODE write, drive -> DiscIdNotRead, no
+// further frames). The headless probe never sends pad input, so the init
+// value IS the steady-state.
+static uint8_t g_pad[32] = {};
 
 static bool g_loaded = false;
 

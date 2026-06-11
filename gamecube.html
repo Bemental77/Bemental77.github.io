@@ -229,6 +229,14 @@
     console.log('[ppc-worker-handshake] var_setup entered');
     pageLog('[ui] var_setup — initializing Dolphin libretro');
     padStatus1 = Module._get_ptr(0);
+    // All-released default. The vendored page module's main() memsets this
+    // buffer to 0xFF (EmscriptenMain.cpp:45 — every button pressed) and
+    // CheckJoy/CheckKeyboard are stubs, so without this fill the page ships
+    // all-buttons-held to the worker every 10ms. 2026-06-11 PSO root cause:
+    // the AppSwitcher saw its return-to-menu combo held and hot-reset the
+    // console mid psov3.dol load (fixed in C too; this covers the vendored
+    // dolphin_libretro.wasm until it is rebuilt).
+    Module.HEAPU8.fill(0, padStatus1, padStatus1 + 16);
     Module.SDL.defaults.copyOnLock = false;
     Module.SDL.defaults.opaqueFrontBuffer = false;
     // sharedMemory was allocated at page-load (above) and assigned to
