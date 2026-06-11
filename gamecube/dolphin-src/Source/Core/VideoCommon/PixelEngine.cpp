@@ -139,7 +139,9 @@ void PixelEngineManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
                    pe.m_control.pe_token = false;   // this flag is write only
                    pe.m_control.pe_finish = false;  // this flag is write only
 
-                   DEBUG_LOG_FMT(PIXELENGINE, "(w16) CTRL_REGISTER: {:#06x}", val);
+                   NOTICE_LOG_FMT(POWERPC, "[ax-pe2] CTRL write val={:#x} finish_en={} token_en={}",
+                                  val, static_cast<u32>(pe.m_control.pe_finish_enable),
+                                  static_cast<u32>(pe.m_control.pe_token_enable));
                    pe.UpdateInterrupts();
                  }));
 
@@ -180,6 +182,9 @@ void PixelEngineManager::SetTokenFinish_OnMainThread_Static(Core::System& system
 void PixelEngineManager::SetTokenFinish_OnMainThread(u64 userdata, s64 cycles_late)
 {
   std::unique_lock lk(m_token_finish_mutex);
+  NOTICE_LOG_FMT(POWERPC, "[ax-pe2] SetTokenFinish_OnMainThread tok_pend={} fin_pend={} fin_en={}",
+                 m_token_interrupt_pending ? 1 : 0, m_finish_interrupt_pending ? 1 : 0,
+                 static_cast<u32>(m_control.pe_finish_enable));
   m_event_raised = false;
 
   m_token = m_token_pending;

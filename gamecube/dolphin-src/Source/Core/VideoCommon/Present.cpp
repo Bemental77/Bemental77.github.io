@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "VideoCommon/Present.h"
+#include "Common/Logging/Log.h"
 
 #include "Common/ChunkFile.h"
 #include "Core/Config/GraphicsSettings.h"
@@ -175,6 +176,12 @@ bool Presenter::FetchXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_heigh
 void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height, u64 ticks,
                        TimePoint presentation_time)
 {
+  {
+    static u64 axp_n = 0;
+    const u64 n = ++axp_n;
+    if (n <= 4 || (n & 0xFF) == 0)
+      NOTICE_LOG_FMT(POWERPC, "[ax-present] ViSwap n={} addr={:#x}", n, xfb_addr);
+  }
   bool is_duplicate = FetchXFB(xfb_addr, fb_width, fb_stride, fb_height, ticks);
 
   PresentInfo present_info{
@@ -874,7 +881,13 @@ void Presenter::RenderXFBToScreen(const MathUtil::Rectangle<int>& target_rc,
 void Presenter::Present(PresentInfo* present_info)
 {
   m_present_count++;
-
+  {
+    static u64 axp_n = 0;
+    const u64 n = ++axp_n;
+    if (n <= 4 || (n & 0xFF) == 0)
+      NOTICE_LOG_FMT(POWERPC, "[ax-present] Present n={} headless={} xfb_entry={} ui={}", n,
+                     g_gfx->IsHeadless() ? 1 : 0, m_xfb_entry ? 1 : 0, m_onscreen_ui ? 1 : 0);
+  }
   if (g_gfx->IsHeadless() || (!m_onscreen_ui && !m_xfb_entry))
     return;
 

@@ -260,6 +260,34 @@ struct TestEnv {
 // ---------------------------------------------------------------------------
 
 // Smoke test: 3 sequential addi instructions.
+// Exact retail bytes of MP4 VIWaitForRetrace's wake re-check block
+// (0x800C1544: lwz r0,-0x6FF8(r13); cmplw r30,r0; beq -0x10). The conformance
+// corpus never used r0 as an input operand — this is the live boot-wedge
+// block (main re-sleeps forever despite retraceCount advancing).
+static bool test_viwait_recheck_block() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x800C1544;
+    static u8 mem1[0x10000];
+    std::memset(mem1, 0, sizeof(mem1));
+    const u32 ea_off = 0x801D4428u & 0xFFFFu;
+    mem1[ea_off] = 0; mem1[ea_off+1] = 0; mem1[ea_off+2] = 0; mem1[ea_off+3] = 5;
+    env.gpr(13) = 0x801DB420;  // r13 - 0x6FF8 = 0x801D4428
+    env.gpr(30) = 0;           // startCount = 0 (!= 5 -> loop must EXIT)
+    const u32 insts[] = {
+        0x800D9008u,  // lwz r0, -0x6FF8(r13)
+        0x7C1E0040u,  // cmplw cr0, r30, r0
+        0x4182FFF0u,  // beq -0x10
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 3, &next_pc,
+                            (u32)(uintptr_t)mem1, 0xFFFFu, sizeof(mem1)))
+        return false;
+    std::printf("[diag viwait] next_pc=0x%08x r0=%u (exp 5) r30=%u\n",
+                (u32)next_pc, env.gpr(0), env.gpr(30));
+    return next_pc == (s32)(PC + 12u) && env.gpr(0) == 5u;
+}
+
 static bool test_addi_sequential() {
     TestEnv env;
     if (!env.init()) return false;
@@ -877,6 +905,7 @@ struct TestCase {
 
 static const TestCase k_tests[] = {
     {"addi_sequential",                  &test_addi_sequential},
+    {"viwait_recheck_block",             &test_viwait_recheck_block},
     {"add_register",                     &test_add_register},
     {"bx_unconditional",                 &test_bx_unconditional},
     {"bx_with_link",                     &test_bx_with_link},

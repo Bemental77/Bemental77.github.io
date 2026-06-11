@@ -278,7 +278,21 @@ int compile_raw(const u8* bytes, std::size_t size) {
 // Block run() signature: () -> i32. As a C function pointer:
 typedef u32 (*BemBlockFn)(void);
 
+// Armed by the dolphin-bridge wake watcher; consumed here per dispatch.
+int g_ax_wake_arm = 0;
+int g_ax_wake_ring[256];
+int g_ax_wake_ring_n = 0;
+
 s32 dispatch_raw(int handle) {
+    int ax_arm_now = 0;
+    if (g_ax_wake_arm > 0) {
+        ax_arm_now = g_ax_wake_arm--;
+        // Push into the shared ring; the dolphin-bridge watcher drains it
+        // via NOTICE_LOG (this TU has no fmt/Log.h include path, and
+        // CPU-pthread console.error does not reach the probe's printed
+        // buckets).
+        if (g_ax_wake_ring_n < 256) g_ax_wake_ring[g_ax_wake_ring_n++] = handle;
+    }
 #ifdef __EMSCRIPTEN__
     if (handle <= 0) return 0;
     // We must call into JIT'd WASM with a JS-side try/catch because WASM
@@ -294,6 +308,12 @@ s32 dispatch_raw(int handle) {
         // recover the hung pc.
         if (Module.bemental_dispatch_n === undefined) Module.bemental_dispatch_n = 0;
         Module.bemental_dispatch_n++;
+        // [ax-wake-traj] armed by the bridge (g_ax_wake_arm C++ global) on
+        // DefaultThread wake: log the next N dispatched block PCs.
+        if ($1 > 0) {
+            const __wpc = Module.bemental_handle_to_pc ? (Module.bemental_handle_to_pc[$0] >>> 0) : 0;
+            console.error('[ax-wake-traj] pc=0x' + __wpc.toString(16) + ' (left=' + $1 + ')');
+        }
         // [wtraj] per-block trajectory ring (LIVE path — this is the hot
         // dispatcher, 11.5M hits). Records the executing block PC; flushes
         // chunked [wtraj] lines every 100k; bounded to 8M (covers native's
@@ -465,7 +485,7 @@ s32 dispatch_raw(int handle) {
             }
             return -2147483648;  // INT32_MIN sentinel
         }
-    }, handle);
+    }, handle, ax_arm_now);
 #else
     (void)handle;
     return 0;

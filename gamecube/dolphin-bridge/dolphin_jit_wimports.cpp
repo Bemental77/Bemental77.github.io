@@ -42,6 +42,16 @@
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
+// Cross-TU arm channel for the [ax-wake-traj] dispatch trace (consumed in
+// bementalJIT block_cache.cpp dispatch_raw).
+namespace bemental {
+extern int g_ax_wake_arm;
+extern int g_ax_wake_ring[256];
+extern int g_ax_wake_ring_n;
+}
+static void ax_wake_arm_set() { bemental::g_ax_wake_arm = 192; }
+
+
 extern "C" {
 
 // EA translation seam: the JIT slow path (jit_load_store.cpp::emit_slowmem_*
@@ -170,11 +180,128 @@ uint32_t dolphin_check_exc(uint32_t /*unused*/) {
                 s_prev_q_head = q_head;
                 s_prev_q_tail = q_tail;
             }
-            if (rcount != s_prev_rcount && s_rc_log_count < 400) {
+            // [ax-gates] boot-gate timeline (2026-06-10): GlobalCounter
+            // 0x1D3A54 (main-loop completions), omcurovl/omnextovl
+            // 0x1D3CE0/E4, fadeStat 0x1D3D18, HuDvdErrWait 0x1D3A04,
+            // GXWaitDrawDone flag region — log on ANY change, sampled.
+            {
+                static u32 s_prev_gc = 0xFFFFFFFFu, s_prev_ovl = 0xFFFFFFFFu,
+                           s_prev_misc = 0xFFFFFFFFu;
+                static u32 s_gate_log_n = 0;
+                u32 gc   = (u32(ram[0x1D3A54]) << 24) | (u32(ram[0x1D3A55]) << 16) |
+                           (u32(ram[0x1D3A56]) << 8) | u32(ram[0x1D3A57]);
+                u32 ovl  = (u32(ram[0x1D3CE0]) << 24) | (u32(ram[0x1D3CE3]) << 16) |
+                           (u32(ram[0x1D3CE4]) << 8) | u32(ram[0x1D3CE7]);
+                u32 misc = (u32(ram[0x1D3D18]) << 24) | (u32(ram[0x1D3A07]) << 16) |
+                           u32(ram[0x1D3A04]);
+                // PAD driver state (authoritative host-side read; the SAB
+                // dump tool showed all-zero here, contradicting its own
+                // ResettingChan=32 initializer — suspected stale-MEM1-copy
+                // scan hit).
+                static u32 s_prev_pad = 0xFFFFFFFFu;
+                u32 pad_bits = (u32(ram[0x1D44EF]) << 24) | (u32(ram[0x1D44F3]) << 16) |
+                               (u32(ram[0x1D44FB]) << 8) | u32(ram[0x1D391B]);
+                if (pad_bits != s_prev_pad) {
+                    NOTICE_LOG_FMT(POWERPC,
+                                   "[ax-pad] EnabledBits={:#x} ResettingBits={:#x} WaitingBits={:#x} CheckingBits={:#x} PendingBits={:#x} ResettingChan={}",
+                                   (u32(ram[0x1D44EC]) << 24) | (u32(ram[0x1D44ED]) << 16) | (u32(ram[0x1D44EE]) << 8) | u32(ram[0x1D44EF]),
+                                   (u32(ram[0x1D44F0]) << 24) | (u32(ram[0x1D44F1]) << 16) | (u32(ram[0x1D44F2]) << 8) | u32(ram[0x1D44F3]),
+                                   (u32(ram[0x1D44F8]) << 24) | (u32(ram[0x1D44F9]) << 16) | (u32(ram[0x1D44FA]) << 8) | u32(ram[0x1D44FB]),
+                                   (u32(ram[0x1D44FC]) << 24) | (u32(ram[0x1D44FD]) << 16) | (u32(ram[0x1D44FE]) << 8) | u32(ram[0x1D44FF]),
+                                   (u32(ram[0x1D4500]) << 24) | (u32(ram[0x1D4501]) << 16) | (u32(ram[0x1D4502]) << 8) | u32(ram[0x1D4503]),
+                                   (u32(ram[0x1D3918]) << 24) | (u32(ram[0x1D3919]) << 16) | (u32(ram[0x1D391A]) << 8) | u32(ram[0x1D391B]));
+                    s_prev_pad = pad_bits;
+                }
+                // DrawDone byte 0x1D45F0 + FinishQueue head 0x1D45F4 (GX
+                // draw-done handshake; __GXFinishHandler must pulse DrawDone
+                // 0->1 for GXWaitDrawDone to exit).
+                u32 gxdd = (u32(ram[0x1D45F0]) << 8) | u32(ram[0x1D45F5]);
+                static u32 s_prev_gxdd = 0xFFFFFFFFu;
+                if (gxdd != s_prev_gxdd) {
+                    NOTICE_LOG_FMT(POWERPC, "[ax-gxdd] DrawDone={:#x} FinishQ.head=..{:02x}{:02x}",
+                                   u32(ram[0x1D45F0]), u32(ram[0x1D45F6]), u32(ram[0x1D45F7]));
+                    s_prev_gxdd = gxdd;
+                }
+                // [ax-park] DefaultThread (0x1A5828) saved context: srr0
+                // (ctx+0x198), lr (ctx+0x84), state (thread+0x2C8 u16),
+                // queue ptr (thread+0x2DC) — host-side authoritative read of
+                // WHERE main parks. Log on change of srr0/queue.
+                {
+                    auto rd32 = [&](u32 off) {
+                        return (u32(ram[off]) << 24) | (u32(ram[off + 1]) << 16) |
+                               (u32(ram[off + 2]) << 8) | u32(ram[off + 3]);
+                    };
+                    const u32 thr = 0x1A5828;
+                    u32 srr0 = rd32(thr + 0x198);
+                    u32 lr = rd32(thr + 0x84);
+                    u32 queue = rd32(thr + 0x2DC);
+                    u32 state = (u32(ram[thr + 0x2C8]) << 8) | u32(ram[thr + 0x2C9]);
+                    static u32 s_prev_srr0 = 0xFFFFFFFFu, s_prev_queue = 0xFFFFFFFFu;
+                    static u32 s_park_n = 0;
+                    if (srr0 != s_prev_srr0 || queue != s_prev_queue) {
+                        s_park_n++;
+                        // Arm a 48-block dispatch trace on selected wakes
+                        // (READY transitions) — consumed by block_cache.cpp's
+                        // pre-dispatch EM_ASM via Module.ax_wake_arm.
+                        // Drain the wake-trace ring (filled by dispatch_raw).
+                        if (bemental::g_ax_wake_arm == 0 && bemental::g_ax_wake_ring_n > 0) {
+                            for (int ri = 0; ri < bemental::g_ax_wake_ring_n; ++ri) {
+                                NOTICE_LOG_FMT(POWERPC, "[ax-wake-traj] i={} handle={}", ri,
+                                               bemental::g_ax_wake_ring[ri]);
+                            }
+                            bemental::g_ax_wake_ring_n = 0;
+                        }
+                        static u32 s_wake_n = 0;
+                        if (state == 1) s_wake_n++;
+                        if (state == 1 && (s_wake_n & 0xFF) == 2) {
+                            // Same-thread EM_ASM: check_exc runs on the CPU
+                            // pthread — the same JS realm as dispatch_raw's
+                            // EM_ASM (MAIN_THREAD_EM_ASM lands in the wrong
+                            // realm under PROXY_TO_PTHREAD).
+                            ax_wake_arm_set();
+                            NOTICE_LOG_FMT(POWERPC, "[ax-arm] armed, readback={}",
+                                           bemental::g_ax_wake_arm);
+                        }
+                        if (s_park_n <= 16 || (s_park_n & 0x3F) == 0) {
+                            // r31 = VIWaitForRetrace's startCount (callee-
+                            // saved); live rcount = ram retraceCount. If the
+                            // saved r31 TRACKS rcount across cycles, the JIT
+                            // corrupts r31 (audit r28-r31 class) and the
+                            // do-while equality never breaks.
+                            u32 r30 = rd32(thr + 0x78);
+                            u32 r31 = rd32(thr + 0x7C);
+                            u32 live_rcount = rd32(0x1D4428);
+                            NOTICE_LOG_FMT(POWERPC,
+                                           "[ax-park] srr0={:#x} state={:#x} queue={:#x} r30={} rcount={} arm={} (n={})",
+                                           srr0, state, queue, r30, live_rcount,
+                                           bemental::g_ax_wake_arm, s_park_n);
+                        }
+                        s_prev_srr0 = srr0;
+                        s_prev_queue = queue;
+                    }
+                }
+                if (gc != s_prev_gc || ovl != s_prev_ovl || misc != s_prev_misc) {
+                    s_gate_log_n++;
+                    if (s_gate_log_n <= 16 || (s_gate_log_n & 0x3F) == 0) {
+                        NOTICE_LOG_FMT(POWERPC,
+                                       "[ax-gates] GlobalCounter={} curovl={:#x}{:02x} nextovl={:#x}{:02x} fade={:#x} dvderr={:#x} (n={})",
+                                       gc, u32(ram[0x1D3CE0]), u32(ram[0x1D3CE3]),
+                                       u32(ram[0x1D3CE4]), u32(ram[0x1D3CE7]),
+                                       u32(ram[0x1D3D18]), u32(ram[0x1D3A04]),
+                                       s_gate_log_n);
+                    }
+                    s_prev_gc = gc; s_prev_ovl = ovl; s_prev_misc = misc;
+                }
+            }
+            if (rcount != s_prev_rcount) {
                 s_rc_log_count++;
-                NOTICE_LOG_FMT(POWERPC,
-                               "[ax-rcount] retraceCount {} -> {} (n={})",
-                               s_prev_rcount, rcount, s_rc_log_count);
+                // Uncapped (was <400 — the cap produced a phantom "frozen at
+                // 399" wedge, 2026-06-10); sample every 64th change + first 8.
+                if (s_rc_log_count <= 8 || (s_rc_log_count & 0x3F) == 0) {
+                    NOTICE_LOG_FMT(POWERPC,
+                                   "[ax-rcount] retraceCount {} -> {} (n={})",
+                                   s_prev_rcount, rcount, s_rc_log_count);
+                }
                 s_prev_rcount = rcount;
             }
         }
@@ -325,6 +452,21 @@ void dolphin_msr_updated(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
 // forever on GP-triggered fences.
 EMSCRIPTEN_KEEPALIVE
 void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
+    // [ax-fill] __fill_mem (0x800033D8..0x80003490) dominates wedged-phase
+    // dispatch; check_exc never fires from its stw/bdnz loop, but this drain
+    // runs at every store-block exit. Capture caller LR + args (r3=dst,
+    // r4=fill, r5=size at entry) + CTR (remaining words).
+    {
+        auto& ps_f = Core::System::GetInstance().GetPPCState();
+        if (ps_f.pc >= 0x800033D8 && ps_f.pc < 0x80003490) {
+            static u64 s_fill_n = 0;
+            const u64 fn = ++s_fill_n;
+            if (fn <= 8 || (fn & 0x3FFF) == 0) {
+                NOTICE_LOG_FMT(POWERPC, "[ax-fill] n={} pc={:#x} lr={:#x} r3={:#x} r4={:#x} r5={:#x} ctr={:#x}",
+                               fn, ps_f.pc, LR(ps_f), ps_f.gpr[3], ps_f.gpr[4], ps_f.gpr[5], CTR(ps_f));
+            }
+        }
+    }
     static u64 s_drain_n = 0;
     if ((++s_drain_n & 0xFFu) == 1) {
         NOTICE_LOG_FMT(POWERPC, "[ax-pe] dolphin_gather_drain n={}", s_drain_n);

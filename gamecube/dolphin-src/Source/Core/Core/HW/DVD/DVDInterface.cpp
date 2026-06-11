@@ -615,6 +615,11 @@ void DVDInterface::RegisterMMIO(MMIO::Mapping* mmio, u32 base, bool is_wii)
   mmio->Register(base | DI_DMA_CONTROL_REGISTER, MMIO::DirectRead<u32>(&m_DICR.Hex),
                  MMIO::ComplexWrite<u32>([](Core::System& system, u32, u32 val) {
                    auto& di = system.GetDVDInterface();
+                   static u64 axdi_n = 0;
+                   const u64 n = ++axdi_n;
+                   if (n <= 64 || (n & 0x3F) == 0)
+                     NOTICE_LOG_FMT(POWERPC, "[ax-di] DICR write n={} val={:#x} cmd0={:#x}", n, val,
+                                    di.m_DICMDBUF[0]);
                    di.m_DICR.Hex = val & 7;
                    if (di.m_DICR.TSTART)
                    {
@@ -1296,6 +1301,12 @@ void DVDInterface::FinishExecutingCommandCallback(Core::System& system, u64 user
 
 void DVDInterface::SetDriveState(DriveState state)
 {
+  static u64 axds_n = 0;
+  ++axds_n;
+  if (state != m_drive_state || axds_n <= 8)
+    NOTICE_LOG_FMT(POWERPC, "[ax-dvdstate] n={} {} -> {} (err={:#x})", axds_n,
+                   static_cast<u32>(m_drive_state), static_cast<u32>(state),
+                   static_cast<u32>(m_error_code));
   m_drive_state = state;
 }
 

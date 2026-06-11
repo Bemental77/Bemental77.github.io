@@ -98,6 +98,13 @@ std::string VideoBackendBase::BadShaderFilename(const char* shader_stage, int co
 void VideoBackendBase::Video_OutputXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
                                        u64 ticks)
 {
+  {
+    static u64 axp_n = 0;
+    const u64 n = ++axp_n;
+    if (n <= 4 || (n & 0xFF) == 0)
+      NOTICE_LOG_FMT(POWERPC, "[ax-present] OutputXFB n={} init={} presenter={} addr={:#x} {}x{}",
+                     n, m_initialized ? 1 : 0, g_presenter ? 1 : 0, xfb_addr, fb_width, fb_height);
+  }
   if (!m_initialized || !g_presenter)
     return;
 

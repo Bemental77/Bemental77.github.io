@@ -44,6 +44,31 @@ const REGIONS = [
     out: '/tmp/wasm-mem1-os.bin' },
   { name: 'stack',   guestStart: 0x803a0000, guestEnd: 0x803c0000, expectedSize: 131072,
     out: '/tmp/wasm-mem1-stack.bin' },
+  // SDK DVD-driver state block (GMPE01_01 symbols.txt: LastState 0x801D4338,
+  // executing 0x801D43D0, FatalErrorFlag 0x801D43E8, CurrCommand 0x801D43EC,
+  // NumInternalRetry 0x801D4404...) — added 2026-06-10 for the DVD-error-screen
+  // wedge diagnosis.
+  { name: 'dvdstate', guestStart: 0x801d4300, guestEnd: 0x801d4480, expectedSize: 384,
+    out: '/tmp/wasm-mem1-dvdstate.bin' },
+  // Game boot-gate variables (SystemInitF 0x801D3A00, HuDvdErrWait 0x801D3A04,
+  // GlobalCounter 0x801D3A54, omcurovl/omnextovl 0x801D3CE0/E4, fadeStat
+  // 0x801D3D18, SR_ExecReset 0x801D3EC0).
+  { name: 'bootgates', guestStart: 0x801d3a00, guestEnd: 0x801d3f00, expectedSize: 1280,
+    out: '/tmp/wasm-mem1-bootgates.bin' },
+  // GX state incl. DrawDone flag + FinishQueue (0x801D45F4) region.
+  { name: 'gxstate', guestStart: 0x801d4580, guestEnd: 0x801d4680, expectedSize: 256,
+    out: '/tmp/wasm-mem1-gxstate.bin' },
+  // DefaultThread OSThread struct (0x801a5828 + 0x310) — context SRR0/LR
+  // name the exact parked PC.
+  { name: 'defthread', guestStart: 0x801a5800, guestEnd: 0x801a5c00, expectedSize: 1024,
+    out: '/tmp/wasm-mem1-defthread.bin' },
+  // PAD driver state: ResettingChan/AnalogMode/Spec @0x801D3918-24,
+  // EnabledBits/ResettingBits/WaitingBits/CheckingBits/PendingBits
+  // @0x801D44EC-0x801D4500.
+  { name: 'padstate1', guestStart: 0x801d3900, guestEnd: 0x801d3940, expectedSize: 64,
+    out: '/tmp/wasm-mem1-padstate1.bin' },
+  { name: 'padstate2', guestStart: 0x801d44e0, guestEnd: 0x801d4520, expectedSize: 64,
+    out: '/tmp/wasm-mem1-padstate2.bin' },
 ];
 
 const MIME = {

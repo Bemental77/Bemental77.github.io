@@ -466,6 +466,13 @@ void DSPManager::Do_ARAM_DMA()
   auto& core_timing = m_system.GetCoreTiming();
   auto& memory = m_system.GetMemory();
 
+  static u64 axar_n = 0;
+  const u64 n = ++axar_n;
+  if (n <= 8 || (n & 0x3F) == 0)
+    NOTICE_LOG_FMT(POWERPC, "[ax-aram] DMA n={} dir={} count={:#x} ARAddr={:#x} MMAddr={:#x}", n,
+                   static_cast<u32>(m_aram_dma.Cnt.dir), static_cast<u32>(m_aram_dma.Cnt.count),
+                   m_aram_dma.ARAddr, m_aram_dma.MMAddr);
+
   m_dsp_control.DMAState = 1;
 
   // ARAM DMA transfer rate has been measured on real hw

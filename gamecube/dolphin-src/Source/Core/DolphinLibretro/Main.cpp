@@ -1,5 +1,6 @@
 
 #include <cstdint>
+#include "Common/Logging/Log.h"
 #include <libretro.h>
 #include <string>
 #include <thread>
@@ -232,6 +233,7 @@ void retro_run(void)
     {
       g_gfx.reset();
       g_gfx = std::make_unique<Libretro::Video::SWGfx>();
+      NOTICE_LOG_FMT(POWERPC, "[ax-present] g_gfx swapped to Libretro SWGfx");
     }
     else if (Config::Get(Config::MAIN_GFX_BACKEND) == "Null")
     {

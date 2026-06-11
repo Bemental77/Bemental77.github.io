@@ -56,6 +56,15 @@ void retro_set_input_poll(retro_input_poll_t cb);
 void retro_set_input_state(retro_input_state_t cb);
 void retro_run(void);
 bool retro_load_game(const struct retro_game_info* info);
+// Libretro frontend contract: the frontend declares attached controllers via
+// retro_set_controller_port_device after retro_load_game. This minimal worker
+// never did, so input_types[] stayed RETRO_DEVICE_NONE and ALL FOUR SI ports
+// were configured SIDEVICE_NONE (Input.cpp:1017) — unlike native Dolphin.
+// MP4's HuPadRead then spins forever in PAD origin polling (observed
+// 2026-06-11: 1.29M [ax-fill] memsets of the PAD Origin array + a stack
+// PADStatus buffer at ~7k/sec, GlobalCounter frozen at 0).
+void retro_set_controller_port_device(unsigned port, unsigned device);
+#define EMW_RETRO_DEVICE_JOYPAD 1
 // Forward-declared (DolphinLibretro/Video.h drags Vulkan headers): the
 // video-backend init entry normally fired by a libretro frontend's
 // hw_render.context_reset callback — which this minimal worker frontend
@@ -202,6 +211,10 @@ int load_iso(const char* path) {
         postMessage({cmd: 'print', txt: '[worker] load_iso: retro_load_game returned ' + ($0 ? 'true' : 'false')});
     }, ok ? 1 : 0);
     if (!ok) return -1;
+    retro_set_controller_port_device(0, EMW_RETRO_DEVICE_JOYPAD);
+    MAIN_THREAD_EM_ASM({
+        postMessage({cmd: 'print', txt: '[worker] SI port 0 = GC controller (joypad)'});
+    });
     Libretro::Video::ContextReset();
     MAIN_THREAD_EM_ASM({
         postMessage({cmd: 'print', txt: '[worker] video backend ContextReset done'});
