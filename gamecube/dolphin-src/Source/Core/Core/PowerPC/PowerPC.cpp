@@ -590,17 +590,8 @@ void PowerPCManager::CheckExternalExceptions()
 {
   u32 exceptions = m_ppc_state.Exceptions;
 
-  // [ax-ee] Trace MSR.EE-gated EXT_INT dispatch. Rate-limit 1/256.
-  {
-    static u32 s_ax_ee_n = 0;
-    if ((++s_ax_ee_n & 0xFF) == 1)
-    {
-      NOTICE_LOG_FMT(POWERPC,
-                     "[ax-ee] CheckExternalExceptions n={} excp={:#x} msr.EE={} msr.Hex={:#x} pc={:#x}",
-                     s_ax_ee_n, exceptions, (u32)m_ppc_state.msr.EE,
-                     m_ppc_state.msr.Hex, m_ppc_state.pc);
-    }
-  }
+  // [ax-ee] sampling stripped 2026-06-11 per gate #8 — 284K lines per 60s
+  // probe (the single largest console-traffic source).
 
   // EXTERNAL INTERRUPT
   // Handling is delayed until MSR.EE=1.

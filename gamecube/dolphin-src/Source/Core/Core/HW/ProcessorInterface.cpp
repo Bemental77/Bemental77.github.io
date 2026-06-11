@@ -149,17 +149,8 @@ void ProcessorInterfaceManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
 void ProcessorInterfaceManager::UpdateException()
 {
   auto& ppc_state = m_system.GetPPCState();
-  {
-    // Rate-limited: log every 64th call so mask updates are visible.
-    static u32 s_ei_trace_update_count = 0;
-    if ((s_ei_trace_update_count++ & 0x3F) == 0)
-    {
-      NOTICE_LOG_FMT(AUDIO_INTERFACE,
-                     "[ei-trace] PI::UpdateException n={} cause={:#x} mask={:#x} EI={}",
-                     s_ei_trace_update_count, m_interrupt_cause, m_interrupt_mask,
-                     ((m_interrupt_cause & m_interrupt_mask) != 0));
-    }
-  }
+  // [ei-trace] UpdateException sampling stripped 2026-06-11 per gate #8 —
+  // 469K+ calls per 60s probe produced 7K+ console lines.
   if ((m_interrupt_cause & m_interrupt_mask) != 0)
     ppc_state.Exceptions |= EXCEPTION_EXTERNAL_INT;
   else
@@ -211,60 +202,9 @@ void ProcessorInterfaceManager::SetInterrupt(u32 cause_mask, bool set)
 {
   DEBUG_ASSERT_MSG(POWERPC, Core::IsCPUThread(), "SetInterrupt from wrong thread");
 
-  // [mp4-wedge-diag] 2026-06-10: per-IRQ-source raise counters.
-  // Diagnoses audio-thread-monopolization: if AI fires far more often than
-  // native ~187Hz, the bug is upstream-host (CoreTiming cadence) rather than
-  // guest semantics. Logs cumulative counts every 1000 raise events.
-  if (set)
-  {
-    static u32 s_diag_ai = 0, s_diag_dsp = 0, s_diag_vi = 0, s_diag_di = 0;
-    static u32 s_diag_si = 0, s_diag_exi = 0, s_diag_pi = 0, s_diag_other = 0;
-    static u32 s_diag_total = 0;
-    if (cause_mask & INT_CAUSE_AI)       ++s_diag_ai;
-    else if (cause_mask & INT_CAUSE_DSP) ++s_diag_dsp;
-    else if (cause_mask & INT_CAUSE_VI)  ++s_diag_vi;
-    else if (cause_mask & INT_CAUSE_DI)  ++s_diag_di;
-    else if (cause_mask & INT_CAUSE_SI)  ++s_diag_si;
-    else if (cause_mask & INT_CAUSE_EXI) ++s_diag_exi;
-    else if (cause_mask & INT_CAUSE_PI)  ++s_diag_pi;
-    else                                  ++s_diag_other;
-    ++s_diag_total;
-    if ((s_diag_total % 1000u) == 0u)
-    {
-      NOTICE_LOG_FMT(AUDIO_INTERFACE,
-                     "[mp4-wedge-diag] IRQ-raise total={} AI={} DSP={} VI={} DI={} SI={} EXI={} PI={} OTHER={}",
-                     s_diag_total, s_diag_ai, s_diag_dsp, s_diag_vi, s_diag_di,
-                     s_diag_si, s_diag_exi, s_diag_pi, s_diag_other);
-    }
-  }
-
-  if ((cause_mask & INT_CAUSE_DSP) != 0)
-  {
-    // Always log set=true (rare and decisive); rate-limit set=false to
-    // every 64th call to avoid flooding.
-    static u32 s_ei_trace_setint_dsp_true_count = 0;
-    static u32 s_ei_trace_setint_dsp_false_count = 0;
-    if (set)
-    {
-      ++s_ei_trace_setint_dsp_true_count;
-      NOTICE_LOG_FMT(AUDIO_INTERFACE,
-                     "[ei-trace] PI::SetInterrupt SET cause={:#x} n_true={} n_false={} new_cause={:#x}",
-                     cause_mask, s_ei_trace_setint_dsp_true_count,
-                     s_ei_trace_setint_dsp_false_count,
-                     (m_interrupt_cause | cause_mask));
-    }
-    else
-    {
-      ++s_ei_trace_setint_dsp_false_count;
-      if ((s_ei_trace_setint_dsp_false_count & 0x3F) == 1)
-      {
-        NOTICE_LOG_FMT(AUDIO_INTERFACE,
-                       "[ei-trace] PI::SetInterrupt CLR cause={:#x} n_false={} new_cause={:#x}",
-                       cause_mask, s_ei_trace_setint_dsp_false_count,
-                       (m_interrupt_cause & ~cause_mask));
-      }
-    }
-  }
+  // [mp4-wedge-diag] IRQ counters + [ei-trace] DSP set/clear logging
+  // stripped 2026-06-11 per gate #8 — SetInterrupt is hot (260K raises per
+  // 60s probe) and the [ei-trace] SET branch logged every DSP raise.
 
   if (set && !(m_interrupt_cause & cause_mask))
   {

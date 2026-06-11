@@ -296,9 +296,8 @@ s32 dispatch_raw(int handle) {
         if (handle == g_recheck_handle && g_recheck_handle >= 0) g_block_watch_hook(0);
         if (handle == g_vwaitset_handle && g_vwaitset_handle >= 0) g_block_watch_hook(1);
     }
-    int ax_arm_now = 0;
     if (g_ax_wake_arm > 0) {
-        ax_arm_now = g_ax_wake_arm--;
+        --g_ax_wake_arm;
         // Push into the shared ring; the dolphin-bridge watcher drains it
         // via NOTICE_LOG (this TU has no fmt/Log.h include path, and
         // CPU-pthread console.error does not reach the probe's printed
@@ -313,168 +312,14 @@ s32 dispatch_raw(int handle) {
     // unwind the entire pthread without recovery — caller's "trap recovery"
     // protocol expecting INT32_MIN never fires because nothing returns it.
     // The JS shim catches the trap, logs it once, and returns the sentinel.
+    // Diagnostics stripped 2026-06-11 per gate #8 (pre-dispatch trace,
+    // [ax-wake-traj], [wtraj] ring, [mp4-wedge-diag] per-dispatch PC
+    // classification): the classification chain + map lookups ran on EVERY
+    // dispatch and the console.error traffic flooded DevTools (2.5K+
+    // "errors" in a browser session were instrumentation, not failures).
+    // The bounded BLOCK TRAP log below is load-bearing (trap recovery) and
+    // stays. History: see this file before commit <this one> / STATUS.md.
     return EM_ASM_INT({
-        // Pre-dispatch trace: every 100K calls log the handle ABOUT to be
-        // dispatched. If a wasm block infinite-loops (no trap, no return),
-        // the LAST log line identifies the hung handle. Pair with m_map to
-        // recover the hung pc.
-        if (Module.bemental_dispatch_n === undefined) Module.bemental_dispatch_n = 0;
-        Module.bemental_dispatch_n++;
-        // [ax-wake-traj] armed by the bridge (g_ax_wake_arm C++ global) on
-        // DefaultThread wake: log the next N dispatched block PCs.
-        if ($1 > 0) {
-            const __wpc = Module.bemental_handle_to_pc ? (Module.bemental_handle_to_pc[$0] >>> 0) : 0;
-            console.error('[ax-wake-traj] pc=0x' + __wpc.toString(16) + ' (left=' + $1 + ')');
-        }
-        // [wtraj] per-block trajectory ring (LIVE path — this is the hot
-        // dispatcher, 11.5M hits). Records the executing block PC; flushes
-        // chunked [wtraj] lines every 100k; bounded to 8M (covers native's
-        // 5.99M plus margin). Diffed vs native Jit64 [traj] by
-        // gamecube/tools/trace_diff_gc.py.
-        if (Module.bemental_wtraj === undefined) { Module.bemental_wtraj = []; Module.bemental_wtraj_total = 0; }
-        if (Module.bemental_wtraj_total < 8000000) {
-            const __pc = Module.bemental_handle_to_pc ? (Module.bemental_handle_to_pc[$0] >>> 0) : 0;
-            Module.bemental_wtraj.push(__pc);
-            Module.bemental_wtraj_total++;
-            if (Module.bemental_wtraj.length >= 100000) {
-                let __l = '[wtraj]';
-                for (let __i = 0; __i < Module.bemental_wtraj.length; __i++) {
-                    __l += ' ' + (Module.bemental_wtraj[__i] >>> 0).toString(16);
-                    if ((__i % 20000) === 19999) { console.error(__l); __l = '[wtraj]'; }
-                }
-                if (__l.length > 7) console.error(__l);
-                Module.bemental_wtraj = [];
-            }
-        }
-        if ((Module.bemental_dispatch_n % 10000) === 0) {
-            // Reverse-lookup pc from handle for diagnostic clarity.
-            let foundPc = 0;
-            if (Module.bemental_pc_to_handle) {
-                for (const [pc, h] of Module.bemental_pc_to_handle) {
-                    if (h === $0) { foundPc = pc; break; }
-                }
-            }
-            console.error('[bemental] pre-dispatch n=' + Module.bemental_dispatch_n
-                + ' handle=' + $0 + ' pc=0x' + foundPc.toString(16));
-        }
-        // [mp4-wedge-diag] 2026-06-10: count dispatches by PC range. Quoted
-        // keys avoid the C preprocessor treating bare 'name:' as a statement
-        // label inside the EM_ASM_INT body.
-        {
-            const __dpc = Module.bemental_handle_to_pc ? (Module.bemental_handle_to_pc[$0] >>> 0) : 0;
-            if (!Module.bemental_diag_disp) {
-                Module.bemental_diag_disp = {};
-                Module.bemental_diag_disp['mn'] = 0;
-                Module.bemental_diag_disp['hp'] = 0;
-                Module.bemental_diag_disp['ow'] = 0;
-                Module.bemental_diag_disp['or'] = 0;
-                // [mp4-wedge-diag] 2026-06-10 IRQ-chain extension. Symbols
-                // resolved from gc_refs/marioparty4/config/GMPE01_01/symbols.txt:
-                //   evec  = OSExceptionVector        0x800B4BB8 size 0x9C
-                //                                    (template only — runtime
-                //                                    executes COPY at 0x500;
-                //                                    expect evec=0)
-                //   dispi = __OSDispatchInterrupt    0x800B7714 size 0x344
-                //   exti  = ExternalInterruptHandler 0x800B7A58 size 0x50
-                //   sel   = SelectThread             0x800BA1B8 size 0x200 (wedge fn)
-                //   dsph  = __DSPHandler             0x800C7558 size 0x424
-                //                                    (registered for id 7 =
-                //                                    __OS_INTERRUPT_DSP_DSP
-                //                                    by dsp.c:46/dolsdk dsp.c:69)
-                //   aish  = __AISHandler             0x800C5F70 size 0x7C
-                //                                    (AI streaming sub-handler)
-                //   aidh  = __AIDHandler             0x800C5FEC size 0x90
-                //                                    (AI DMA sub-handler)
-                //   musy  = MusyX data-plane         0x80113000..0x80114000
-                //                                    (reverb/mixing — NOT IRQ;
-                //                                    formerly mislabeled dspc)
-                // Disambiguation:
-                //   dsph=0  → __DSPHandler never reached; dispatcher table
-                //             lookup misses (id 7 entry stale/null).
-                //   dsph>0 but DSP cause CLR≈0 → handler runs but MMIO ACK
-                //             write doesn't drain — Dolphin PI MMIO emul or
-                //             our store-side bug.
-                Module.bemental_diag_disp['evec']  = 0;
-                Module.bemental_diag_disp['dispi'] = 0;
-                Module.bemental_diag_disp['exti']  = 0;
-                Module.bemental_diag_disp['sel']   = 0;
-                Module.bemental_diag_disp['dsph']  = 0;
-                Module.bemental_diag_disp['aish']  = 0;
-                Module.bemental_diag_disp['aidh']  = 0;
-                Module.bemental_diag_disp['musy']  = 0;
-                // Inside __OSDispatchInterrupt (asm from
-                // gc_refs/marioparty4/build/GMPE01_01/asm/dolphin/os/OSInterrupt.s):
-                //   0x800B7758 .L_800B7758 spurious-IRQ branch (calls
-                //              OSLoadContext when intsr==0 or (intsr&intmr)==0)
-                //   0x800B7760 .L_800B7760 normal cause-decode entry
-                // If spur >> norm → __PIRegs[0] read returns stale 0 → MMIO
-                // read coherence bug. If norm >> spur but dsph still rare →
-                // failure is in cause-mask/handler-table walk.
-                Module.bemental_diag_disp['spur']  = 0;
-                Module.bemental_diag_disp['norm']  = 0;
-                // Per OSInterrupt.s analysis of __OSDispatchInterrupt:
-                //   0x800B79A0 .L_800B79A0 mask gate passed — entering
-                //              InterruptPrioTable walk
-                //   0x800B7A0C .L_800B7A0C handler call site (blrl to
-                //              registered handler via mtlr r12)
-                // Derived: mask-rejected = norm - prio; handler-NULL =
-                // prio - hcall; hcall should ≈ DSP CLR count if __DSPHandler
-                // is the only one being called.
-                Module.bemental_diag_disp['prio']  = 0;
-                Module.bemental_diag_disp['pthit'] = 0;
-                Module.bemental_diag_disp['hcall'] = 0;
-                // Other registered IRQ handlers (resolved from MP4 syms):
-                //   vih = __VIRetraceHandler   0x800C0B6C size 0x228 (60Hz native)
-                //   sih = SIInterruptHandler   0x800D9040 size 0x344 (controller poll)
-                // If vih >> dsph, VI handler is starving DSP via prio walk —
-                // and VI is over-firing in the wasm vs the native 60Hz rate
-                // (693K raises in ~104s emulated = 6672/sec vs native 60/sec).
-                Module.bemental_diag_disp['vih']   = 0;
-                Module.bemental_diag_disp['sih']   = 0;
-            }
-            if (__dpc >= 0x800057C0 && __dpc < 0x800059EC) Module.bemental_diag_disp['mn']++;
-            else if (__dpc >= 0x8000D01C && __dpc < 0x8000D1A0) Module.bemental_diag_disp['hp']++;
-            else if (__dpc >= 0x8002EC68 && __dpc < 0x8002EDD8) Module.bemental_diag_disp['ow']++;
-            else if (__dpc === 0x800E5BF0) Module.bemental_diag_disp['or']++;
-            else if (__dpc >= 0x800B4BB8 && __dpc < 0x800B4C54) Module.bemental_diag_disp['evec']++;
-            else if (__dpc >= 0x800B7714 && __dpc < 0x800B7A58) Module.bemental_diag_disp['dispi']++;
-            else if (__dpc >= 0x800B7A58 && __dpc < 0x800B7AA8) Module.bemental_diag_disp['exti']++;
-            else if (__dpc >= 0x800BA1B8 && __dpc < 0x800BA3B8) Module.bemental_diag_disp['sel']++;
-            else if (__dpc >= 0x800C7558 && __dpc < 0x800C797C) Module.bemental_diag_disp['dsph']++;
-            else if (__dpc >= 0x800C5F70 && __dpc < 0x800C5FEC) Module.bemental_diag_disp['aish']++;
-            else if (__dpc >= 0x800C5FEC && __dpc < 0x800C607C) Module.bemental_diag_disp['aidh']++;
-            else if (__dpc >= 0x80113000 && __dpc < 0x80114000) Module.bemental_diag_disp['musy']++;
-            else if (__dpc >= 0x800C0B6C && __dpc < 0x800C0D94) Module.bemental_diag_disp['vih']++;
-            else if (__dpc >= 0x800D9040 && __dpc < 0x800D9384) Module.bemental_diag_disp['sih']++;
-            if (__dpc === 0x800B7758) Module.bemental_diag_disp['spur']++;
-            if (__dpc === 0x800B7760) Module.bemental_diag_disp['norm']++;
-            if (__dpc === 0x800B79A0) Module.bemental_diag_disp['prio']++;
-            if (__dpc === 0x800B79D8) Module.bemental_diag_disp['pthit']++;
-            if (__dpc === 0x800B7A10) Module.bemental_diag_disp['hcall']++;
-            if ((Module.bemental_dispatch_n % 100000) === 0) {
-                console.error('[mp4-wedge-diag] disp-counts'
-                    + ' main=' + Module.bemental_diag_disp['mn']
-                    + ' huprc=' + Module.bemental_diag_disp['hp']
-                    + ' omwatch=' + Module.bemental_diag_disp['ow']
-                    + ' osreport=' + Module.bemental_diag_disp['or']
-                    + ' evec=' + Module.bemental_diag_disp['evec']
-                    + ' dispi=' + Module.bemental_diag_disp['dispi']
-                    + ' exti=' + Module.bemental_diag_disp['exti']
-                    + ' sel=' + Module.bemental_diag_disp['sel']
-                    + ' dsph=' + Module.bemental_diag_disp['dsph']
-                    + ' aish=' + Module.bemental_diag_disp['aish']
-                    + ' aidh=' + Module.bemental_diag_disp['aidh']
-                    + ' musy=' + Module.bemental_diag_disp['musy']
-                    + ' spur=' + Module.bemental_diag_disp['spur']
-                    + ' norm=' + Module.bemental_diag_disp['norm']
-                    + ' prio=' + Module.bemental_diag_disp['prio']
-                    + ' pthit=' + Module.bemental_diag_disp['pthit']
-                    + ' hcall=' + Module.bemental_diag_disp['hcall']
-                    + ' vih=' + Module.bemental_diag_disp['vih']
-                    + ' sih=' + Module.bemental_diag_disp['sih']
-                    + ' total=' + Module.bemental_dispatch_n);
-            }
-        }
         try {
             const f = wasmTable.get($0);
             if (!f) return -2147483648;  // freed slot
@@ -497,7 +342,7 @@ s32 dispatch_raw(int handle) {
             }
             return -2147483648;  // INT32_MIN sentinel
         }
-    }, handle, ax_arm_now);
+    }, handle);
 #else
     (void)handle;
     return 0;
@@ -541,59 +386,6 @@ void register_pc_handle(u64 pc, int handle) {
         if (!Module.bemental_handle_to_pc) Module.bemental_handle_to_pc = {};
         Module.bemental_handle_to_pc[$1 | 0] = $0 >>> 0;
 
-        // [mp4-wedge-diag] 2026-06-10: log block-compile + register events for
-        // PCs we are investigating in the omWatchOverlayProc wedge diagnosis.
-        // - 0x8002EC68..0x8002EDD8: omWatchOverlayProc body (objmain.c:67-107)
-        //   — first dispatch = protothread entered; later PCs = protothread
-        //   made forward progress through its body (post-HuPrcSleep resume).
-        // - 0x8000D01C..0x8000D1A0: HuPrcCall body (process.c:228) — proves
-        //   main loop actually reaches the protothread dispatcher.
-        // - 0x800057C0..0x800059EC: main body — proves main loop is iterating.
-        // - 0x800E5BF0: OSReport entry — counts how many OSReports compile.
-        // - 0x8000DCxx..0x8000DDxx area not currently tagged but we already
-        //   see HuSpr* PCs in samples so that range is exercised.
-        var __pc = $0 >>> 0;
-        var inRange = function(lo, hi) { return __pc >= lo && __pc < hi; };
-        // [mp4-wedge-diag] 2026-06-10 extension: track exception-vector
-        // dispatch to test the IRQ-unserviced wedge hypothesis. After
-        // CheckExternalExceptions (PowerPC.cpp:589), PC is set to 0x500
-        // and MSR.IR is cleared, so the dispatcher should compile a block
-        // at PC=0x500. The cached alias at 0x80000500 is the IR=1 path.
-        // Vector range 0x100..0x1700 per dolsdk OSExceptionLocations
-        // (OS.c:196). The MP4-specific handler chain (per
-        // gc_refs/marioparty4/config/GMPE01_01/symbols.txt — NOT the
-        // generic 0x80003000 area, that earlier guess was wrong for MP4):
-        //   0x800B4BB8 OSExceptionVector       (size 0x9C)
-        //   0x800B7714 __OSDispatchInterrupt   (size 0x344)
-        //   0x800B7A58 ExternalInterruptHandler (size 0x50)
-        //   0x800BA1B8 SelectThread            (size 0x200, wedge fn)
-        //   0x800C7558 __DSPHandler            (size 0x424, DSP IRQ id 7)
-        //   0x800C5F70 __AISHandler            (size 0x7C,  AI streaming)
-        //   0x800C5FEC __AIDHandler            (size 0x90,  AI DMA)
-        //   0x80113000..0x80114000 MusyX data-plane (mixing/reverb, NOT IRQ).
-        if (inRange(0x8002EC68, 0x8002EDD8) ||
-            inRange(0x8000D01C, 0x8000D1A0) ||
-            inRange(0x800057C0, 0x800059EC) ||
-            (__pc === 0x800E5BF0) ||
-            inRange(0x100, 0x1800) ||
-            inRange(0x80000100, 0x80001800) ||
-            inRange(0x800B4BB8, 0x800B4C54) ||
-            inRange(0x800B7714, 0x800B7A58) ||
-            inRange(0x800B7A58, 0x800B7AA8) ||
-            inRange(0x800BA1B8, 0x800BA3B8) ||
-            inRange(0x800C7558, 0x800C797C) ||
-            inRange(0x800C5F70, 0x800C5FEC) ||
-            inRange(0x800C5FEC, 0x800C607C) ||
-            inRange(0x80113000, 0x80114000)) {
-            if (!Module.bemental_diag_compile_seen) Module.bemental_diag_compile_seen = {};
-            if (!Module.bemental_diag_compile_seen[__pc]) {
-                Module.bemental_diag_compile_seen[__pc] = 1;
-                console.log("[mp4-wedge-diag] block-compiled pc=0x" + __pc.toString(16) +
-                            " handle=" + ($1 | 0));
-            } else {
-                Module.bemental_diag_compile_seen[__pc]++;
-            }
-        }
     }, static_cast<u32>(pc), handle);
 #else
     (void)pc; (void)handle;
@@ -632,23 +424,6 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
         }
         let count = 0;
         while (count < max) {
-            // [wtraj] per-block trajectory ring (chained-dispatch path). pc here
-            // is the executing block PC. Shares the ring with dispatch_raw.
-            // Bounded to 8M (covers native's 5.99M plus margin).
-            if (Module.bemental_wtraj === undefined) { Module.bemental_wtraj = []; Module.bemental_wtraj_total = 0; }
-            if (Module.bemental_wtraj_total < 8000000) {
-                Module.bemental_wtraj.push(pc >>> 0);
-                Module.bemental_wtraj_total++;
-                if (Module.bemental_wtraj.length >= 100000) {
-                    let __l = '[wtraj]';
-                    for (let __i = 0; __i < Module.bemental_wtraj.length; __i++) {
-                        __l += ' ' + (Module.bemental_wtraj[__i] >>> 0).toString(16);
-                        if ((__i % 20000) === 19999) { console.error(__l); __l = '[wtraj]'; }
-                    }
-                    if (__l.length > 7) console.error(__l);
-                    Module.bemental_wtraj = [];
-                }
-            }
             const handle = map.get(pc);
             if (handle === undefined) break;
             const inst = cache[handle];

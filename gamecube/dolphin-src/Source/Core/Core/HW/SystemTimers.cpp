@@ -129,15 +129,7 @@ void SystemTimersManager::VICallback(Core::System& system, u64 userdata, s64 cyc
 {
   auto& core_timing = system.GetCoreTiming();
   auto& vi = system.GetVideoInterface();
-  {
-    static u64 s_vicb_n = 0;
-    const u64 n = ++s_vicb_n;
-    if (n == 1 || (n % 60) == 0)
-    {
-      NOTICE_LOG_FMT(VIDEOINTERFACE, "[ax-vi-cb] VICallback n={} ticks={} cycles_late={}",
-                     n, core_timing.GetTicks(), cycles_late);
-    }
-  }
+  // [ax-vi-cb] sampling stripped 2026-06-11 per gate #8 (7.4K lines/60s).
   vi.Update(core_timing.GetTicks() - cycles_late);
   core_timing.ScheduleEvent(vi.GetTicksPerHalfLine() - cycles_late,
                             system.GetSystemTimers().m_event_type_vi);

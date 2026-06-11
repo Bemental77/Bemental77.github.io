@@ -1025,20 +1025,7 @@ void VideoInterfaceManager::Update(u64 ticks)
 
   UpdateInterrupts();
 
-  {
-    static u64 s_viupd_n = 0;
-    const u64 n = ++s_viupd_n;
-    if (n == 1 || (n % 60) == 0)
-    {
-      NOTICE_LOG_FMT(VIDEOINTERFACE,
-                     "[ax-vi-upd] Update n={} half_line={} ir_int=[{},{},{},{}]",
-                     n, m_half_line_count,
-                     static_cast<u32>(m_interrupt_register[0].IR_INT),
-                     static_cast<u32>(m_interrupt_register[1].IR_INT),
-                     static_cast<u32>(m_interrupt_register[2].IR_INT),
-                     static_cast<u32>(m_interrupt_register[3].IR_INT));
-    }
-  }
+  // [ax-vi-upd] sampling stripped 2026-06-11 per gate #8 (7.4K lines/60s).
 }
 
 // Create a fake VI mode for a fifolog
