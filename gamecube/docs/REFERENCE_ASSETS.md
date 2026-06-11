@@ -31,7 +31,8 @@ Naming inversion: `~/gc_refs/dolphin` is the PRISTINE newer clone (e22551e, clea
 
 | Asset | Identity | Notes |
 |---|---|---|
-| `gamecube/roms/MarioParty4.bin.parta{a..f}` | GMPE01 rev 01 | **TRIMMED image: 598,382,592 B** vs full 1,459,978,240 B disc — DVD reads past the trim boundary diverge from a full dump (unverified how Dolphin pads EOF) |
+| `gamecube/roms/MarioParty4.bin.parta{a..f}` | GMPE01 rev 01 | **NKit-TRIMMED image** (598,382,592 B; `NKIT v01` stamp at offset 0x200) vs full 1,459,978,240 B disc. Stays the web-deployable form. |
+| `~/Downloads/Mario Party 4 (USA).iso` | GMPE01 rev 01 | **FULL CLEAN DUMP, acquired 2026-06-10** (1,459,978,240 B, zeros at 0x200, junk data past trim boundary). DOL region md5 `8bf9b315…` identical to trimmed image AND retail main.dol; 100MB spot-check differs from trimmed (consistent with NKit junk regeneration — per-file comparison not done). **Use THIS for native-oracle runs needing faithful DVD reads**; closes the untrimmed-dump conditional. |
 | `gamecube/roms/SonicAdventure2Battle.bin.parta{a..q}` | GSNE8P | 17 parts, full-size |
 | `gamecube/roms/PhantasyStarOnline1And2Plus.bin.parta{a..q}` | GPOE8P **rev 02** | 17 parts; confirm gpoe8p.map matches Rev 2 before trusting it |
 | `gamecube/roms/240pSuite-1.10b.dol` | homebrew | |
