@@ -306,9 +306,12 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
   const u32 count = static_cast<u32>(insts.size());
 
   // Hand to bementalJIT's canonical Phase-4 emit. Signature per
-  // guests/powerpc-next/ppc_emit.h:52-55.
+  // guests/powerpc-next/ppc_emit.h:52-55. block_cycles receives the
+  // analyzer's opinfo num_cycles sum (PPCAnalyzer stats.numCycles).
+  u32 block_cycles = 0;
   std::vector<u8> bytes = bemental::powerpc::build_block_next(
-      start_pc, insts.data(), count, ctx_ptr, mem1_base, mem1_mask, ram_size);
+      start_pc, insts.data(), count, ctx_ptr, mem1_base, mem1_mask, ram_size,
+      &block_cycles);
 
   if (bytes.empty())
     return false;
@@ -318,7 +321,12 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
   if (handle < 0)
     return false;
 
-  m_block_inst_counts[start_pc] = count;
+  // Jit64 parity (Jit.cpp js.downcountAmount = sum of opinfo->num_cycles):
+  // charge the block's REAL cycle cost, not 1/instruction. The 1/instr
+  // accounting skewed every CoreTiming-relative cadence (VI/DSP/audio
+  // events vs guest instruction progress) — found by the 2026-06-11
+  // exhaustive Jit64 parity audit (docs/jit-correctness-rulebook/).
+  m_block_inst_counts[start_pc] = block_cycles ? block_cycles : count;
   return true;
 }
 
