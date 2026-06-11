@@ -64,23 +64,14 @@ Use this as the starting point when populating a topic's resource table.
 
 | Resource | What it answers |
 |---|---|
-| **`build_and_probe.sh`** (repo root — note this is the GameCube script, the Dreamcast equivalent lives at `dreamcast/build_and_probe.sh`) | Canonical inner-loop: emcc rebuild → link → headless Node probe → fixed summary. Use this. Do not improvise `emcc` invocations. |
+| **The 3-step foreground flow** (no wrapper — the root `build_and_probe.sh` was deleted by user directive 2026-05-30, commit `270e38c`, and must not be re-introduced; the Dreamcast equivalent wrapper still lives at `dreamcast/build_and_probe.sh`) | Canonical inner-loop, run discretely and in the foreground: (1) `source emsdk/emsdk_env.sh && cd gamecube/dolphin-src/build-wasm && emmake make dolphin_libretro -j4`; (2) `bash gamecube/dolphin-bridge/dolphin_worker_link.sh`; (3) `node gamecube/tools/dolphin_render_probe.js > /tmp/probe.log 2>&1`. Do not improvise `emcc` invocations, do not re-bundle the steps into a script. |
 | `gamecube/ppc-worker/build_ppc_worker.sh` | Builds ppc-worker. Also drives `gamecube/bementalJIT/build-emcc/` on first run. |
-| `gamecube/dolphin-bridge/dolphin_worker_link.sh` | Durable copy of `/tmp/dolphin_worker_link.sh` (the canonical link script). `build_and_probe.sh` prefers `/tmp` and falls back here. |
-| `/tmp/probes/<name>.log` + `.summary.json` + `.trace.json` + `.metrics.json` | Per-`--name` archive: console + extracted summary JSON + chrome://tracing artifact + page.metrics() snapshots. Default no-name run goes to `/tmp/probe.log` + `/tmp/probe.summary.json`. |
-| `probe_diff.sh` (per `tools_2026_05_14.md`) | Diff two summary JSONs from `/tmp/probes/`. |
+| `gamecube/dolphin-bridge/dolphin_worker_link.sh` | The canonical link script (step 2). Produces `gamecube/dolphin_libretro/dolphin_worker_emcc.{js,wasm}`; includes `worker_funcs.js` via `--post-js`. |
+| `/tmp/probe.log` + `/tmp/probe-trace.json` + `/tmp/probe-metrics.json` | Probe console output (stdout redirect) + chrome://tracing artifact + page.metrics() snapshots. `/tmp/probes/<name>.*` archives are historical (written by the deleted wrapper's `--name` flag — nothing writes them now). |
 
-#### `build_and_probe.sh` flags
+#### `dolphin_render_probe.js` configuration
 
-```text
---name NAME          archive to /tmp/probes/NAME.{log,summary.json,trace.json,metrics.json}
---query Q            URL query string passed to dolphin.html (e.g. ppcbootdispatch=1)
---rom 0|1            ROM index (SAB vs PSO per the page selector)
---duration MS        probe wall budget
---skip-build         JS-only iteration (no emmake / emcc)
-```
-
-Environment passthrough: `PROBE_QUERY`, `ROM_IDX`, `PROBE_DURATION_MS`, `PROBE_TRACE_PATH`, `PROBE_METRICS_PATH`.
+No CLI flags — env vars only: `PROBE_DURATION_MS` (default 60000), `PROBE_QUERY` (URL query string, e.g. `ppcbootdispatch=1`), `ROM_IDX` (0=SAB, 1=PSO), `PROBE_TRACE_PATH`, `PROBE_METRICS_PATH`, `PROBE_NO_TRACE`, `PROBE_JS_FLAGS`, plus stuck-pattern early-exit knobs (`PROBE_STUCK_*`) — see the constants at the top of the script.
 
 ### Runtime-state tools (gamecube/tools/)
 
