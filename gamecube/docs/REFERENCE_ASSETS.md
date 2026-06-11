@@ -5,15 +5,16 @@
 ## The one fragile thing (read first)
 
 **`~/gc_refs/dolphin-upstream` (eb44b64) carries the native-oracle `[axei-trace]` instrumentation as an UNCOMMITTED working-tree diff** (+80/−1 across `Source/Core/Core/HW/DSP.cpp`, `ProcessorInterface.cpp`, `SystemTimers.cpp`, `PowerPC/Interpreter/Interpreter.cpp`, `PowerPC/PowerPC.cpp`). It produced `dolphin.log.pre_native_mp4_boot`. A checkout/clean there silently destroys it. **Preserved copy: `gamecube/docs/native-oracle-complete-dump/axei-trace-instrumentation.patch` (156 lines).**
-Naming inversion: `~/gc_refs/dolphin` is the PRISTINE newer clone (e22551e, clean); `dolphin-upstream` is the PATCHED oracle. Neither contains a build dir — the binary that produced the oracle logs was built elsewhere (not located).
+Naming inversion: `~/gc_refs/dolphin` is the PRISTINE newer clone (e22551e, clean); `dolphin-upstream` is the PATCHED oracle.
+**Instrumented binary REBUILT 2026-06-10**: `~/gc_refs/dolphin-upstream/build-oracle/Binaries/dolphin-emu-nogui` (18.3MB). Smoke-verified: 10s headless MP4 boot wrote 7,985 `[axei-trace]` lines (`PI::SetInterrupt n=... mask=... set=... new_cause=... mask_reg=...`). The stock `/Applications/Dolphin.app` (Mar-17 binary) emits ZERO axei-trace lines — use build-oracle for instrumented captures, the app for stock-behavior runs. Build recipe (AppleClang 12 is too old): `CC=/usr/local/opt/llvm/bin/clang CXX=.../clang++ cmake -B build-oracle -DCMAKE_BUILD_TYPE=Release -DENABLE_NOGUI=ON -DENABLE_QT=OFF` **plus ar/ranlib pinned to `/usr/bin/{ar,ranlib}` for ALL of C/CXX/OBJC/OBJCXX as :FILEPATH at first configure** — brew's `llvm-ranlib` rejects `-no_warning_for_no_symbols`, and the OBJCXX entries silently keep llvm paths if overridden after the initial configure. Target name is `dolphin-nogui`; binary lands as `dolphin-emu-nogui`.
 
 ## MP4 decomp — ~/gc_refs/marioparty4 (932M, clean @ 814c28a)
 
 - 6 region configs: GMPE01_00/01 (USA), GMPJ01_00 (JP), GMPP01_00/01/02 (PAL). **Only GMPE01_01 is fully actionable** (orig ROM + build dir + split asm); GMPE01_00 has config/symbols but no ROM, no splits.
 - `config/GMPE01_01/symbols.txt`: **7721 lines** (7644 unique names, 3469 functions), format `Name = .section:0xADDR;`. (STATUS.md previously said 7607 — wrong for this checkout.)
 - **Retail-binary oracle already extracted**: `orig/GMPE01_01/sys/main.dol` (1,319,008 B, md5 8bf9b315…) + **99 retail .rel DLLs** under `orig/GMPE01_01/files/dll/`. Combined with `build/binutils/powerpc-eabi-objdump` (vendored, with dtk + objdiff-cli + MetroWerks compilers under `build/`) this is a complete offline disassembler for any symbols.txt PC — no emulator needed.
-- **Build is mid-flight**: 618 .o compiled (Jun 10) but NO main.elf/main.dol/.map exists under build/ — ninja reports 812 edges pending (link never ran). Finish the build before planning any rebuilt-DOL diff. No linker .map exists anywhere in the tree.
-- `extern/musyx/` is an **EMPTY uninitialized submodule** (0 files; AxioDL/musyx @ a170f2ef). MusyX references that DO exist: 31 revision-exact split `.s` files under `build/GMPE01_01/asm/musyx/` (better oracle for GMPE01_01 PCs) and `~/gc_refs/ttyd/libs/musyx/` full source (proxy).
+- **Build COMPLETE (2026-06-10)**: `ninja` finished after installing wine — `Modules: 100.00% matched, 100.00% linked (327/327 files); Code: 4780604/4780604 bytes (7515/7515 functions)`. `build/GMPE01_01/main.dol` is **byte-identical to retail** (cmp-verified vs `orig/GMPE01_01/sys/main.dol`) and `build/GMPE01_01/main.elf` (2.18MB) is an unstripped PowerPC ELF — full-symbol oracle for any MP4 PC via objdump/addr2line. No separate linker .map was emitted (the ELF serves that role). Wine for the MWCC toolchain: `~/Applications/Wine Devel.app/Contents/Resources/wine/bin` (Gcenx wine-devel 11.10 osx64 tarball, user-extracted — brew casks need sudo/were removed upstream; dequarantined via user xattr).
+- `extern/musyx/` — **INITIALIZED 2026-06-10** (`git submodule update --init` → AxioDL/musyx @ a170f2ef; CMakeLists/include/src/test present). MP4's revision-matched MusyX source is now local — the hottest wedge path (musy≈25M dispatches/60s) has real source. Also: 31 revision-exact split `.s` under `build/GMPE01_01/asm/musyx/` and the ttyd proxy.
 - `src/dolphin/` is MP4's **own vendored SDK source** (os, dsp, exi, si, thp, …) — matches the guest binary's actual SDK build; outranks generic dolsdk2001 for byte-level questions.
 - orig ISO: `orig/GMPE01_01/MarioParty4.iso`, 598,382,592 B, header GMPE01 rev 01, first-1MB md5 19543615… (same image class as the repo split parts).
 
@@ -52,7 +53,7 @@ Naming inversion: `~/gc_refs/dolphin` is the PRISTINE newer clone (e22551e, clea
 | `tools/master_sigs.json` | SDK sigs | 1475 entries | top-level `{"signatures": [...]}` wrapper — not a bare array |
 | `~/gc_refs/decomp-toolkit/assets/signatures` | SDK sigs | 140 .yml | |
 
-- **No Dolphin auto-map exists for GMPE01** — MP4 PC resolution is decomp-symbols.txt only. `dolphin_profile.py` maps only GPOE8P/GSNE8P; using it on MP4 needs a map-path addition (format differs).
+- **GMPE01.map GENERATED 2026-06-10** at `~/Library/Application Support/Dolphin/Maps/GMPE01.map` (3558 text + 4136 data symbols) via `gamecube/tools/symbols_to_dolphin_map.py` from the decomp symbols.txt — native Dolphin logs/GDB now symbolize MP4, and `dolphin_profile.py` works with gameid GMPE01 unmodified (it reads `Maps/{gameid}.map`; verified spot-check: `__OSDispatchInterrupt=800b7714`, `SelectThread=800ba1b8`, `__DSPHandler=800c7558` match STATUS.md's IRQ chain).
 - ttyd has 32 per-area symbols.txt under `config/G8MJ01/<area>/` — may resolve MusyX PCs the main map doesn't.
 
 ## Native Dolphin oracle
