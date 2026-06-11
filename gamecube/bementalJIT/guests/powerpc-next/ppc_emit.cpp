@@ -606,8 +606,30 @@ std::vector<u8> build_block_next(u32 start_pc,
         // the cond falls through, next_pc=fallthrough and the block
         // exits naturally. PowerPC ISA's standard 64-bit timebase read
         // pattern depends on this behavior to terminate.
-        dispatch_op(b, rc, frc, op, params);
-        (void)is_terminator;
+        const bool emitted_native = dispatch_op(b, rc, frc, op, params);
+
+        // Block-exit PC correctness for non-branch-terminated blocks (decode-
+        // cap cuts, FL_ENDBLOCK non-branch terminators like mtspr MMCR0).
+        // The pre-op set_pc above wrote op.address; native non-branch
+        // emitters never advance PC, and the epilogue RETURNS ctx PC as
+        // next_pc (consumed at JitWasm.cpp:235 as the next dispatch
+        // address). Without this, the boundary op re-executes in the next
+        // block — non-idempotent boundary ops (stwu/lwzu rA update, MMIO
+        // stores) corrupt state. Interp-fallback ops are excluded: the
+        // interpreter advances ppc_state.pc itself (and rfi/sc must keep
+        // their vector PC). Branches are excluded: emit_bx/bcx/blr/bctr
+        // write the taken/fallthrough PC. Legacy build_block returns the
+        // +4 fallthrough for these blocks (test_gekko no_terminator_block
+        // asserts it); this restores parity.
+        // BISECT 2026-06-10: disabled pending investigation — first probe
+        // with this enabled wedged boot at 27 PCs with a +4 block-compile
+        // walk through low memory (0x17ec...). See STATUS.md.
+        if (false && is_terminator && emitted_native &&
+            !(op.opinfo && op.opinfo->type == OpType::Branch)) {
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_const((s32)(op.address + 4u));
+            b.op_i32_store(ppc_off::PC);
+        }
     }
 
     // Epilogue: drain gather-pipe (so GPU FIFO sees CP_INT/PE_TOKEN/PE_FINISH

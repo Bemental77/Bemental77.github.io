@@ -88,6 +88,60 @@ if(BEMENTAL_GUEST_POWERPC)
     )
     target_compile_options(test_diff PRIVATE "-pthread")
 
+    # Differential test against the LIVE powerpc-next emitter
+    # (build_block_next — the production path per JitWasm.cpp). Same
+    # oracle corpus as test_diff; fallback-routed ops are counted
+    # separately instead of failing. Links BOTH guest libs: ppc_emit.cpp's
+    # region passthroughs reference live guests/powerpc symbols.
+    if(BEMENTAL_GUEST_POWERPC_NEXT)
+        add_executable(test_diff_next test_diff_next.cpp)
+        target_link_libraries(test_diff_next PRIVATE
+            bementalJIT bementalJITPowerPCNext bementalJITPowerPC)
+        target_include_directories(test_diff_next PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        set_target_properties(test_diff_next PROPERTIES SUFFIX ".html")
+        target_link_options(test_diff_next PRIVATE
+            "SHELL:-s EXIT_RUNTIME=1"
+            "SHELL:-pthread"
+            "SHELL:-s PTHREAD_POOL_SIZE=0"
+            "SHELL:-s INITIAL_MEMORY=33554432"
+            "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+            "SHELL:-s MAXIMUM_MEMORY=67108864"
+            "SHELL:-s ALLOW_TABLE_GROWTH=1"
+            "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+        )
+        target_compile_options(test_diff_next PRIVATE "-pthread")
+    endif()
+
+    # Branch/load-store/ALU corpus against the LIVE powerpc-next emitter
+    # (port of test_gekko to build_block_next).
+    if(BEMENTAL_GUEST_POWERPC_NEXT)
+        add_executable(test_gekko_next test_gekko_next.cpp)
+        target_link_libraries(test_gekko_next PRIVATE
+            bementalJIT bementalJITPowerPCNext bementalJITPowerPC)
+        target_include_directories(test_gekko_next PRIVATE
+            ${CMAKE_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+        set_target_properties(test_gekko_next PROPERTIES SUFFIX ".html")
+        target_link_options(test_gekko_next PRIVATE
+            "SHELL:-s EXIT_RUNTIME=1"
+            "SHELL:-pthread"
+            "SHELL:-s PTHREAD_POOL_SIZE=0"
+            # 64MB (not 32): powerpc-next's bl/blr emit LR-shadow-ring diag
+            # writes at absolute SAB addresses 0x026B05xx (jit_branch.cpp:63-68,
+            # ~40.5MB) — must be in-bounds or every LK-branch block traps.
+            "SHELL:-s INITIAL_MEMORY=67108864"
+            "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+            "SHELL:-s MAXIMUM_MEMORY=67108864"
+            "SHELL:-s ALLOW_TABLE_GROWTH=1"
+            "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+        )
+        target_compile_options(test_gekko_next PRIVATE "-pthread")
+    endif()
+
     # Repro for SAB PI-mask write miscompilation (sab_pi_mask_clobbered).
     # Replays the exact 46-instruction byte sequence at 0x800e7bbc..0x800e7c70
     # and asserts r5 == 0x77FF at the stw to PI_INTERRUPT_MASK.

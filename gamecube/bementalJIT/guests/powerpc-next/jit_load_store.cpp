@@ -92,6 +92,19 @@ static void emit_ea_x_form(WasmModuleBuilder& wb, RegCache& rc, u32 ra, u32 rb) 
 // ---------------------------------------------------------------------------
 static void emit_fastmem_guard(WasmModuleBuilder& wb, LoadStoreParams params,
                                u32 access_bytes) {
+    // Degenerate MEM1 window (ram_size smaller than the access width — e.g.
+    // an unconfigured mem1 in a test harness): the `ram_size -
+    // (access_bytes - 1)` bound below wraps unsigned and ADMITS every
+    // address into the fast path, whose host address (EA & mask) + base
+    // then aliases low linear memory (observed as address-zero heap
+    // corruption in test_gekko_next). Emit constant-false so the select
+    // always takes the trampoline — matches legacy build_block's behavior
+    // when mem1 is unconfigured. Compile-time constant; zero cost on a
+    // real config.
+    if (params.ram_size < access_bytes) {
+        wb.op_i32_const(0);
+        return;
+    }
     // (EA & 0x1F000000) == 0  — top bits zero (filters out MMIO @ 0xCC* etc.)
     wb.op_local_get(LOCAL_TMP_EA);
     wb.op_i32_const(0x1F000000);
