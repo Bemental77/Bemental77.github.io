@@ -13,7 +13,7 @@ probably works."
 |---|---|---|
 | 0 — STATUS.md | **DONE** | `gamecube/STATUS.md` exists with wedge PCs 0x800E4C5C/0x800ECB60/0x800E4C60, verified facts, dead ends, probe commands, reference assets |
 | 1 — Opinfo audit | **DONE** | All 18 entries verified live at `ppc_tables.cpp:273-308` (grep, 2026-06-10); opinfo_gap.md updated to `MISSING (reachable) | 0` with closure note; PC delta 706→698 resolved as NOISE by 2-run variance check (699/701, STATUS.md "Task-1 variance check"); 0 new `block broken` markers |
-| 2 — Conformance harness | **IN PROGRESS — integer + branch/load-store corpora built; 2 emitter bugs found (1 fixed, 1 pinned red)** | `test_diff_next`: 3457/0/452 (oracle `"r"`-constraint artifact neutralized via PEM reference). `test_gekko_next`: found fastmem-guard ram_size wrap (FIXED, shipping, probe in band 697 PCs) + non-branch block-end next_pc bug → boundary-op double-exec (REAL; candidate +4 fix regressed boot per bisect — conditional epilogue design recorded; 23 red tests pin it). See STATUS.md "Task 2" sections. Remaining: BUG-2 conditional-epilogue fix, FP/PS coverage, RLWNM |
+| 2 — Conformance harness | **IN PROGRESS — both emitter bugs FIXED; corpora green** | `test_diff_next` 3457/0/452; `test_gekko_next` 31/31. Fastmem-guard wrap FIXED + boundary-PC double-exec FIXED via conditional epilogue (v2: `if PC==last.addr then +4`, gated native-non-branch — v1 unconditional regressed boot, see STATUS.md BUG 2). Probes post-fix reach the same SelectThread/EE-spin wedge with healthy profile. Remaining: FP/PS coverage, RLWNM vectors |
 | 3 — Trace differ | NOT STARTED | — |
 | 4 — CoreTiming pump check | NOT STARTED | — |
 | 5 — DSPHLE mailbox | NOT STARTED (blocked on 4) | — |

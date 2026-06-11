@@ -621,14 +621,29 @@ std::vector<u8> build_block_next(u32 start_pc,
         // write the taken/fallthrough PC. Legacy build_block returns the
         // +4 fallthrough for these blocks (test_gekko no_terminator_block
         // asserts it); this restores parity.
-        // BISECT 2026-06-10: disabled pending investigation — first probe
-        // with this enabled wedged boot at 27 PCs with a +4 block-compile
-        // walk through low memory (0x17ec...). See STATUS.md.
-        if (false && is_terminator && emitted_native &&
+        // CONDITIONAL form (2026-06-10, v2): only advance when PC still
+        // holds the pre-op value — i.e. nothing inside the op's emitted
+        // code redirected it. The v1 UNCONDITIONAL store regressed boot to
+        // a 27-PC low-memory +4 walk (bisected; see STATUS.md "BUG 2"):
+        // it clobbered PC values written by host imports during the op
+        // (check_exc exception vectors, interp side effects, MMIO-write
+        // consequences), which the load-PC epilogue had respected.
+        // Compile-time gates: last op only, natively emitted only (interp
+        // fallback advances/redirects ppc_state.pc itself), non-branch
+        // only (branch emitters write taken/fallthrough PC; a self-loop
+        // branch legitimately leaves PC == op.address and must not be
+        // bumped).
+        if (is_terminator && emitted_native &&
             !(op.opinfo && op.opinfo->type == OpType::Branch)) {
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_load(ppc_off::PC);
+            b.op_i32_const((s32)op.address);
+            b.op_i32_eq();
+            b.op_if(BLOCK_TYPE_VOID);
             b.op_i32_const((s32)ctx_ptr);
             b.op_i32_const((s32)(op.address + 4u));
             b.op_i32_store(ppc_off::PC);
+            b.op_end();
         }
     }
 
