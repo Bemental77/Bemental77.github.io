@@ -162,6 +162,7 @@ void JitWasm::Run()
     // emit audit 2026-06-07; was previously declared `static` causing
     // process-lifetime contamination of the heuristic.
     u32 last_next[4] = {0, 0, 0, 0};
+    u32 ring_streak = 0;
     u32 last_idx = 0;
 
     do
@@ -223,10 +224,28 @@ void JitWasm::Run()
         // if `next_pc` matches any → we just closed a ≤4-PC cycle → idle.
         {
           const u32 np = static_cast<u32>(next_pc);
-          if (np == pc || np == last_next[0] || np == last_next[1] ||
-              np == last_next[2] || np == last_next[3])
+          const bool ring_match = (np == pc || np == last_next[0] || np == last_next[1] ||
+                                   np == last_next[2] || np == last_next[3]);
+          // STREAK GATE (2026-06-11, v2 of the wake-starvation fix): a real
+          // idle spin (mftb TBU-retry, 0x800e4c5c 3-PC poll) matches the
+          // ring thousands of consecutive iterations; a woken thread's
+          // scheduler-unwind matches it incidentally (~once per wake,
+          // interleaved with fresh PCs). Firing downcount=0 on EVERY match
+          // time-warped CoreTiming straight to the next pending DSP-mail
+          // event during the unwind, preempting main at a deterministic
+          // depth (index 33, 31/31 [ax-wake-traj] windows) so it NEVER
+          // reached VIWaitForRetrace's re-check (GlobalCounter pinned 0;
+          // native completes the phase in 65ms with the same mail cadence).
+          // Require 8 consecutive matches before forcing Advance: idle
+          // spins hit that within microseconds, wake paths never do.
+          if (ring_match)
           {
-            ppc_state.downcount = 0;
+            if (++ring_streak >= 8)
+              ppc_state.downcount = 0;
+          }
+          else
+          {
+            ring_streak = 0;
           }
           last_next[last_idx & 3] = np;
           ++last_idx;
