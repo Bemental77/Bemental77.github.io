@@ -38,6 +38,7 @@
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
 #include "Core/PowerPC/MMU.h"
+#include "VideoCommon/CommandProcessor.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
@@ -330,6 +331,27 @@ void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
     }
     auto& system = Core::System::GetInstance();
     GPFifo::UpdateGatherPipe(system.GetGPFifo());
+    // [ax-cp] every 4096th drain (after UpdateGatherPipe → GatherPipeBursted
+    // → RunGpu has run), snapshot CP/FIFO state so we can see whether the
+    // game's CP enables/disables vs CPReadWriteDistance evolution. The
+    // wedge investigation question is: is the FIFO actually being parsed,
+    // or is CPReadWriteDistance stuck at 0 because GPLinkEnable is false
+    // (so GatherPipeBursted skips the CPWritePointer/distance update)?
+    if ((s_drain_n & 0xFFFu) == 1) {
+        auto& fifo = system.GetCommandProcessor().GetFifo();
+        const u32 gp_link  = fifo.bFF_GPLinkEnable.load(std::memory_order_relaxed) ? 1u : 0u;
+        const u32 gp_read  = fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) ? 1u : 0u;
+        const u32 bp_en    = fifo.bFF_BPEnable.load(std::memory_order_relaxed) ? 1u : 0u;
+        const u32 dist     = fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
+        const u32 wptr     = fifo.CPWritePointer.load(std::memory_order_relaxed);
+        const u32 rptr     = fifo.CPReadPointer.load(std::memory_order_relaxed);
+        // POWERPC channel — the probe captures only N[PowerPC]: lines per
+        // gamecube/tools/dolphin_render_probe.js, not COMMANDPROCESSOR.
+        NOTICE_LOG_FMT(POWERPC,
+                       "[ax-cp] state @drain={} gp_link={} gp_read={} bp_en={} "
+                       "dist=0x{:x} wptr=0x{:x} rptr=0x{:x}",
+                       s_drain_n, gp_link, gp_read, bp_en, dist, wptr, rptr);
+    }
 }
 
 // dolphin_evict_block lives in JitWasm.cpp (which has the bementalJIT
@@ -360,6 +382,33 @@ EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_get_ram_size() {
     auto& memory = Core::System::GetInstance().GetMemory();
     return static_cast<uint32_t>(memory.GetRamSize());
+}
+
+// CP/FIFO state snapshot for the wedge investigation. Returns a packed u32:
+//   bit 0  : SCPFifoStruct::bFF_GPLinkEnable     (CP linked to gather pipe)
+//   bit 1  : SCPFifoStruct::bFF_GPReadEnable     (CP read enabled)
+//   bit 2  : SCPFifoStruct::bFF_BPEnable
+//   bit 3  : 1 if CPReadWriteDistance != 0
+//   bits 4..7   : reserved
+//   bits 8..31  : CPReadWriteDistance >> 5 (truncated; full value via NOTICE)
+// Also emits a NOTICE_LOG line so the full state is captured in the probe.
+EMSCRIPTEN_KEEPALIVE
+uint32_t dolphin_get_cp_state() {
+    auto& system = Core::System::GetInstance();
+    auto& fifo = system.GetCommandProcessor().GetFifo();
+    const u32 gp_link  = fifo.bFF_GPLinkEnable.load(std::memory_order_relaxed) ? 1u : 0u;
+    const u32 gp_read  = fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) ? 1u : 0u;
+    const u32 bp_en    = fifo.bFF_BPEnable.load(std::memory_order_relaxed) ? 1u : 0u;
+    const u32 dist     = fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
+    const u32 wptr     = fifo.CPWritePointer.load(std::memory_order_relaxed);
+    const u32 rptr     = fifo.CPReadPointer.load(std::memory_order_relaxed);
+    NOTICE_LOG_FMT(POWERPC,
+                   "[ax-cp] state gp_link={} gp_read={} bp_en={} dist=0x{:x} "
+                   "wptr=0x{:x} rptr=0x{:x}",
+                   gp_link, gp_read, bp_en, dist, wptr, rptr);
+    return (gp_link << 0) | (gp_read << 1) | (bp_en << 2) |
+           ((dist != 0 ? 1u : 0u) << 3) |
+           ((dist >> 5) << 8);
 }
 
 }  // extern "C"

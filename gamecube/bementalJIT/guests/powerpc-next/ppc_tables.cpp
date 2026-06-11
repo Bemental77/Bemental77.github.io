@@ -159,10 +159,16 @@ static const GekkoOPInfo* table31(u32 sub10) {
     static constexpr GekkoOPInfo subfeox = {"subfeox", OpType::Integer, 1, FL_OUT_D | FL_IN_AB | FL_READ_CA | FL_SET_CA | FL_RC_BIT | FL_SET_OE};
     static constexpr GekkoOPInfo mullwx  = {"mullwx",  OpType::Integer, 3, FL_OUT_D | FL_IN_AB | FL_RC_BIT};
     static constexpr GekkoOPInfo mullwox = {"mullwox", OpType::Integer, 3, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_SET_OE};
-    static constexpr GekkoOPInfo divwx   = {"divwx",   OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_FLOAT_DIV};
-    static constexpr GekkoOPInfo divwox  = {"divwox",  OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_FLOAT_DIV | FL_SET_OE};
-    static constexpr GekkoOPInfo divwux  = {"divwux",  OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_FLOAT_DIV};
-    static constexpr GekkoOPInfo divwuox = {"divwuox", OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_FLOAT_DIV | FL_SET_OE};
+    // FL_FLOAT_DIV is reserved for true FP divides (fdiv/fdivs); integer
+    // divides don't raise a precise FP exception. Matches Dolphin
+    // PPCTables.cpp:253-256. Removal is behavior-inert today (native
+    // emitter at ppc_emit.cpp:188-189 bypasses canCauseException) but
+    // prevents a future scheduler from over-conservatively serializing
+    // around integer divides.
+    static constexpr GekkoOPInfo divwx   = {"divwx",   OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT};
+    static constexpr GekkoOPInfo divwox  = {"divwox",  OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_SET_OE};
+    static constexpr GekkoOPInfo divwux  = {"divwux",  OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT};
+    static constexpr GekkoOPInfo divwuox = {"divwuox", OpType::Integer, 19, FL_OUT_D | FL_IN_AB | FL_RC_BIT | FL_SET_OE};
     static constexpr GekkoOPInfo andx   = {"andx",   OpType::Integer, 1, FL_OUT_A | FL_IN_SB | FL_RC_BIT};
     static constexpr GekkoOPInfo andcx  = {"andcx",  OpType::Integer, 1, FL_OUT_A | FL_IN_SB | FL_RC_BIT};
     static constexpr GekkoOPInfo orx    = {"orx",    OpType::Integer, 1, FL_OUT_A | FL_IN_SB | FL_RC_BIT};
@@ -262,6 +268,44 @@ static const GekkoOPInfo* table31(u32 sub10) {
     static constexpr GekkoOPInfo lhbrx  = {"lhbrx",  OpType::Load,  1, FL_OUT_D | FL_IN_A0B | FL_LOADSTORE};
     static constexpr GekkoOPInfo stwbrx = {"stwbrx", OpType::Store, 1, FL_IN_S | FL_IN_A0B | FL_LOADSTORE};
     static constexpr GekkoOPInfo sthbrx = {"sthbrx", OpType::Store, 1, FL_IN_S | FL_IN_A0B | FL_LOADSTORE};
+    // tw (xo=4) per dolphin-src PPCTables.cpp:380 — trap-word, ENDBLOCK so analyzer
+    // terminates the block; matches Dolphin flag set verbatim.
+    static constexpr GekkoOPInfo tw = {"tw", OpType::System, 2, FL_IN_A | FL_IN_B | FL_ENDBLOCK};
+    // Reservation pair lwarx/stwcxd — single-CPU emu so the reservation is
+    // trivially honored. Analyzer needs the flag set to bind A0/B/S/D and
+    // SET_CR0 (stwcx. writes CR0). dolphin-src PPCTables.cpp:325/324.
+    static constexpr GekkoOPInfo lwarx = {"lwarx", OpType::Load, 1, FL_OUT_D | FL_IN_A0 | FL_IN_B | FL_SET_CR0 | FL_LOADSTORE};
+    static constexpr GekkoOPInfo stwcxd = {"stwcxd", OpType::Store, 1, FL_IN_S | FL_IN_A0 | FL_IN_B | FL_SET_CR0 | FL_LOADSTORE};
+    // External-control I/O — eciwx/ecowx (xo=310/438) per dolphin-src
+    // PPCTables.cpp:385/386. SystemType — modeled as Load/Store-shaped but
+    // tagged System; analyzer just needs reg-flow for A0/B and D/S.
+    static constexpr GekkoOPInfo eciwx = {"eciwx", OpType::System, 1, FL_IN_A0 | FL_IN_B | FL_OUT_D | FL_LOADSTORE};
+    static constexpr GekkoOPInfo ecowx = {"ecowx", OpType::System, 1, FL_IN_A0 | FL_IN_B | FL_IN_S | FL_LOADSTORE};
+    // mcrxr (xo=512) per dolphin-src PPCTables.cpp:376 — moves XER[0..3] to
+    // CRn then clears XER[0..3]. Reads + writes CA, sets CRn.
+    static constexpr GekkoOPInfo mcrxr = {"mcrxr", OpType::System, 1, FL_SET_CRn | FL_READ_CA | FL_SET_CA};
+    // String load/store family — lswx/lswi/stswx/stswi per dolphin-src
+    // PPCTables.cpp:328/329/347/348. NB register count comes from XER[25..31]
+    // for the X-form (lswx/stswx) and from inst.NB for the I-form.
+    static constexpr GekkoOPInfo lswx = {"lswx", OpType::Load, 1, FL_IN_A0 | FL_IN_B | FL_OUT_D | FL_LOADSTORE};
+    static constexpr GekkoOPInfo lswi = {"lswi", OpType::Load, 1, FL_IN_A0 | FL_OUT_D | FL_LOADSTORE};
+    static constexpr GekkoOPInfo stswx = {"stswx", OpType::Store, 1, FL_IN_A0 | FL_IN_B | FL_LOADSTORE};
+    static constexpr GekkoOPInfo stswi = {"stswi", OpType::Store, 1, FL_IN_A0 | FL_LOADSTORE};
+    // tlbsync (xo=566) per dolphin-src PPCTables.cpp:389 — privileged, TLB
+    // sync; analyzer marks PROGRAMEXCEPTION to inhibit speculation across.
+    static constexpr GekkoOPInfo tlbsync = {"tlbsync", OpType::System, 1, FL_PROGRAMEXCEPTION};
+    // FP X-form load/store update family — lfsux/lfdx/lfdux/stfsux/stfdx/stfdux
+    // per dolphin-src PPCTables.cpp:352/354/355/359/361/362. Match the
+    // existing lfsx/stfsx/stfiwx flag shape; update forms add FL_OUT_A.
+    static constexpr GekkoOPInfo lfsux = {"lfsux", OpType::LoadFP, 1, FL_OUT_FLOAT_D | FL_IN_A | FL_IN_B | FL_OUT_A | FL_USE_FPU | FL_LOADSTORE};
+    static constexpr GekkoOPInfo lfdx = {"lfdx", OpType::LoadFP, 1, FL_IN_FLOAT_D | FL_OUT_FLOAT_D | FL_IN_A0 | FL_IN_B | FL_USE_FPU | FL_LOADSTORE};
+    static constexpr GekkoOPInfo lfdux = {"lfdux", OpType::LoadFP, 1, FL_IN_FLOAT_D | FL_OUT_FLOAT_D | FL_IN_A | FL_IN_B | FL_OUT_A | FL_USE_FPU | FL_LOADSTORE};
+    static constexpr GekkoOPInfo stfsux = {"stfsux", OpType::StoreFP, 1, FL_IN_FLOAT_S | FL_IN_A | FL_IN_B | FL_OUT_A | FL_USE_FPU | FL_LOADSTORE};
+    static constexpr GekkoOPInfo stfdx = {"stfdx", OpType::StoreFP, 1, FL_IN_FLOAT_S | FL_IN_A0 | FL_IN_B | FL_USE_FPU | FL_LOADSTORE};
+    static constexpr GekkoOPInfo stfdux = {"stfdux", OpType::StoreFP, 1, FL_IN_FLOAT_S | FL_IN_A | FL_IN_B | FL_OUT_A | FL_USE_FPU | FL_LOADSTORE};
+    // dcba (xo=758) per dolphin-src PPCTables.cpp:300 — data cache block
+    // allocate; classified DataCache with 5-cycle cost, no reg-flow flags.
+    static constexpr GekkoOPInfo dcba = {"dcba", OpType::DataCache, 5, 0};
 
     switch (sub10) {
     case 266: return &addx;
@@ -363,6 +407,33 @@ static const GekkoOPInfo* table31(u32 sub10) {
     case 535: return &lfsx;
     case 663: return &stfsx;
     case 983: return &stfiwx;
+    // tw (xo=4) per dolphin-src PPCTables.cpp:380.
+    case 4: return &tw;
+    // Reservation pair lwarx/stwcxd per dolphin-src PPCTables.cpp:325/324.
+    case 20: return &lwarx;
+    case 150: return &stwcxd;
+    // External-control I/O — eciwx/ecowx per dolphin-src PPCTables.cpp:385/386.
+    case 310: return &eciwx;
+    case 438: return &ecowx;
+    // mcrxr per dolphin-src PPCTables.cpp:376.
+    case 512: return &mcrxr;
+    // String load/store family per dolphin-src PPCTables.cpp:328/329/347/348.
+    case 533: return &lswx;
+    case 597: return &lswi;
+    case 661: return &stswx;
+    case 725: return &stswi;
+    // tlbsync per dolphin-src PPCTables.cpp:389.
+    case 566: return &tlbsync;
+    // FP X-form load/store update family per dolphin-src
+    // PPCTables.cpp:352/354/355/359/361/362.
+    case 567: return &lfsux;
+    case 599: return &lfdx;
+    case 631: return &lfdux;
+    case 695: return &stfsux;
+    case 727: return &stfdx;
+    case 759: return &stfdux;
+    // dcba per dolphin-src PPCTables.cpp:300.
+    case 758: return &dcba;
     default:  return nullptr;
     }
 }
