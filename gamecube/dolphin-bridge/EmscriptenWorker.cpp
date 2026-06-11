@@ -56,6 +56,16 @@ void retro_set_input_poll(retro_input_poll_t cb);
 void retro_set_input_state(retro_input_state_t cb);
 void retro_run(void);
 bool retro_load_game(const struct retro_game_info* info);
+// Forward-declared (DolphinLibretro/Video.h drags Vulkan headers): the
+// video-backend init entry normally fired by a libretro frontend's
+// hw_render.context_reset callback — which this minimal worker frontend
+// never invokes (environment_cb rejects SET_HW_RENDER). Without it,
+// VideoBackendBase::InitializeShared never runs: g_texture_cache et al.
+// stay null (OOB crash at the guest's first EFB copy once the CP FIFO
+// decodes) and FifoManager::RefreshConfig never loads sync-gpu config.
+// The SW renderer needs no host GL context, so calling it right after
+// retro_load_game is safe here.
+extern "C++" { namespace Libretro { namespace Video { void ContextReset(void); } } }
 void retro_unload_game(void);
 size_t retro_serialize_size(void);
 bool retro_serialize(void* data, size_t size);
@@ -192,6 +202,10 @@ int load_iso(const char* path) {
         postMessage({cmd: 'print', txt: '[worker] load_iso: retro_load_game returned ' + ($0 ? 'true' : 'false')});
     }, ok ? 1 : 0);
     if (!ok) return -1;
+    Libretro::Video::ContextReset();
+    MAIN_THREAD_EM_ASM({
+        postMessage({cmd: 'print', txt: '[worker] video backend ContextReset done'});
+    });
     g_loaded = true;
     return 0;
 }

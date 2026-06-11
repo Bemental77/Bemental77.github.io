@@ -332,6 +332,7 @@ bool VideoBackendBase::InitializeShared(std::unique_ptr<AbstractGfx> gfx,
   g_texture_cache = std::move(texture_cache);
   g_efb_interface = std::move(efb_interface);
 
+  NOTICE_LOG_FMT(POWERPC, "[ax-vbi] InitializeShared: objects moved, creating presenter");
   g_presenter = std::make_unique<VideoCommon::Presenter>();
   g_frame_dumper = std::make_unique<FrameDumper>();
   g_framebuffer_manager = std::make_unique<FramebufferManager>();
@@ -339,12 +340,28 @@ bool VideoBackendBase::InitializeShared(std::unique_ptr<AbstractGfx> gfx,
   g_graphics_mod_manager = std::make_unique<GraphicsModManager>();
   g_widescreen = std::make_unique<WidescreenManager>();
 
-  if (!g_vertex_manager->Initialize() || !g_shader_cache->Initialize() ||
-      !g_perf_query->Initialize() || !g_presenter->Initialize() ||
-      !g_framebuffer_manager->Initialize(g_ActiveConfig.iEFBScale) ||
-      !g_texture_cache->Initialize() ||
-      (g_backend_info.bSupportsBBox && !g_bounding_box->Initialize()) ||
-      !g_graphics_mod_manager->Initialize())
+  NOTICE_LOG_FMT(POWERPC, "[ax-vbi] InitializeShared: running stage inits");
+  bool stage_fail = false;
+  {
+    NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: vertex_manager");
+    if (!g_vertex_manager->Initialize()) stage_fail = true;
+    if (!stage_fail) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: shader_cache");
+      if (!g_shader_cache->Initialize()) stage_fail = true; }
+    if (!stage_fail) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: perf_query");
+      if (!g_perf_query->Initialize()) stage_fail = true; }
+    if (!stage_fail) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: presenter");
+      if (!g_presenter->Initialize()) stage_fail = true; }
+    if (!stage_fail) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: framebuffer_manager");
+      if (!g_framebuffer_manager->Initialize(g_ActiveConfig.iEFBScale)) stage_fail = true; }
+    if (!stage_fail) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: texture_cache");
+      if (!g_texture_cache->Initialize()) stage_fail = true; }
+    if (!stage_fail && g_backend_info.bSupportsBBox) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: bounding_box");
+      if (!g_bounding_box->Initialize()) stage_fail = true; }
+    if (!stage_fail) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: graphics_mod");
+      if (!g_graphics_mod_manager->Initialize()) stage_fail = true; }
+    NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage inits done fail={}", stage_fail ? 1 : 0);
+  }
+  if (stage_fail)
   {
     PanicAlertFmtT("Failed to initialize renderer classes");
     Shutdown();
@@ -355,6 +372,7 @@ bool VideoBackendBase::InitializeShared(std::unique_ptr<AbstractGfx> gfx,
   if(is_initialized)
     return true;
 #endif
+  NOTICE_LOG_FMT(POWERPC, "[ax-vbi] InitializeShared: stage inits OK, HW init block");
   auto& system = Core::System::GetInstance();
   auto& command_processor = system.GetCommandProcessor();
   command_processor.Init();

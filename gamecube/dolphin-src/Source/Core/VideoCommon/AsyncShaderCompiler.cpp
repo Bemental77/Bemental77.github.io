@@ -129,6 +129,19 @@ bool AsyncShaderCompiler::StartWorkerThreads(u32 num_worker_threads)
   if (num_worker_threads == 0)
     return true;
 
+#ifdef __EMSCRIPTEN__
+  // PROXY_TO_PTHREAD + fixed PTHREAD_POOL_SIZE: the std::thread spawn below
+  // blocks forever in m_init_event.Wait() when no pre-spawned web worker is
+  // available to back the new pthread (observed 2026-06-10: CustomShaderCache
+  // ctor -> StartWorkerThreads hang inside VertexManagerBase::Initialize
+  // during Libretro::Video::ContextReset; [ax-vbi] stage trace stopped at
+  // "stage: vertex_manager"). Run in zero-worker mode instead — QueueWorkItem
+  // already compiles synchronously when !HasWorkerThreads(). Same
+  // environment-class as the DVDThread sync fallback (91299bd) and the
+  // forced single-core gpu_thread fix (b82d67b).
+  return true;
+#endif
+
   for (u32 i = 0; i < num_worker_threads; i++)
   {
     void* thread_param = nullptr;

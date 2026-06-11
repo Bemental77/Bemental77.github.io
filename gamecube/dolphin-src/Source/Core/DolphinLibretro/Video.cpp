@@ -439,6 +439,7 @@ void ContextReset(void)
 
 bool Video_InitializeBackend()
 {
+  NOTICE_LOG_FMT(POWERPC, "[ax-vbi] Video_InitializeBackend entry");
   WindowSystemInfo wsi = {};
   wsi.type = WindowSystemType::Libretro;
   wsi.render_surface_scale = 1.0f;
@@ -514,6 +515,7 @@ bool Video_InitializeBackend()
   }
 
   // this calls InitializeGLExtensions, FillBackendInfo and InitializeShared internally
+  NOTICE_LOG_FMT(POWERPC, "[ax-vbi] calling g_video_backend->Initialize");
   return g_video_backend->Initialize(wsi);
 }
 

@@ -101,6 +101,7 @@ emcc \
   -sENVIRONMENT=worker \
   -sNO_EXIT_RUNTIME=1 \
   -sASSERTIONS=1 \
+  --profiling-funcs \
   -sALLOW_TABLE_GROWTH=1 \
   -Wl,--allow-multiple-definition \
   -sEXPORTED_FUNCTIONS="$EXPORTED_FUNCS" \

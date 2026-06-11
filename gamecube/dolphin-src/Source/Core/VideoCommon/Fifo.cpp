@@ -13,6 +13,7 @@
 #include "Common/FPURoundMode.h"
 #include "Common/MemoryUtil.h"
 #include "Common/MsgHandler.h"
+#include "Common/Logging/Log.h"
 
 #include "Core/Config/MainSettings.h"
 #include "Core/ConfigManager.h"
@@ -28,6 +29,7 @@
 #include "VideoCommon/DataReader.h"
 #include "VideoCommon/FramebufferManager.h"
 #include "VideoCommon/OpcodeDecoding.h"
+#include "VideoCommon/PixelEngine.h"
 #include "VideoCommon/VertexLoaderManager.h"
 #include "VideoCommon/VertexManagerBase.h"
 #include "VideoCommon/VideoBackendBase.h"
@@ -420,6 +422,16 @@ bool AtBreakpoint(Core::System& system)
 void FifoManager::RunGpu()
 {
   const bool is_dual_core = m_system.IsDualCoreMode();
+  // [ax-fifo] diag (temporary): discriminate lost-event vs suspended-desync
+  // vs tick-starvation for the frozen-rptr wedge. POWERPC channel — the
+  // probe captures only N[PowerPC].
+  static u64 axf_rungpu_n = 0;
+  axf_rungpu_n++;
+  if (axf_rungpu_n <= 4 || (axf_rungpu_n & 0xFFF) == 0)
+  {
+    NOTICE_LOG_FMT(POWERPC, "[ax-fifo] rungpu n={} suspended={}", axf_rungpu_n,
+                   m_syncing_suspended ? 1 : 0);
+  }
 
   // wake up GPU thread
   if (is_dual_core && !m_use_deterministic_gpu_thread)
@@ -445,6 +457,29 @@ int FifoManager::RunGpuOnCpu(int ticks)
   auto& fifo = command_processor.GetFifo();
   bool reset_simd_state = false;
   int available_ticks = int(ticks * m_config_sync_gpu_overclock) + m_sync_ticks.load();
+  // [ax-fifo] diag (temporary): loop-entry snapshot to catch tick starvation
+  // (avail<0 with data pending) — the loop below would then run 0 iterations.
+  {
+    static u64 axf_run_n = 0;
+    axf_run_n++;
+    const u32 axf_dist = fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
+    if (available_ticks < 0 && axf_dist != 0)
+    {
+      static u64 axf_starv_n = 0;
+      axf_starv_n++;
+      if (axf_starv_n <= 4 || (axf_starv_n & 0x3FF) == 0)
+      {
+        NOTICE_LOG_FMT(POWERPC, "[ax-fifo] starv n={} run_n={} avail={} dist={:#x}", axf_starv_n,
+                       axf_run_n, available_ticks, axf_dist);
+      }
+    }
+    else if (axf_run_n <= 4 || (axf_run_n & 0xFFF) == 0)
+    {
+      NOTICE_LOG_FMT(POWERPC, "[ax-fifo] run n={} avail={} dist={:#x} rd_en={}", axf_run_n,
+                     available_ticks, axf_dist,
+                     fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) ? 1 : 0);
+    }
+  }
   while (fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) &&
          fifo.CPReadWriteDistance.load(std::memory_order_relaxed) && !AtBreakpoint(m_system) &&
          available_ticks >= 0)
@@ -578,6 +613,16 @@ void FifoManager::SyncGPUCallback(Core::System& system, u64 ticks, s64 cyclesLat
     next = fifo.WaitForGpuThread(int(ticks));
   }
 
+  // [ax-fifo] diag (temporary)
+  static u64 axf_cb_n = 0;
+  axf_cb_n++;
+  if (axf_cb_n <= 4 || (axf_cb_n & 0x3FF) == 0)
+  {
+    NOTICE_LOG_FMT(POWERPC, "[ax-fifo] cb n={} ticks={} next={} dist={:#x}", axf_cb_n, ticks,
+                   next,
+                   fifo.m_system.GetCommandProcessor().GetFifo().CPReadWriteDistance.load(
+                       std::memory_order_relaxed));
+  }
   fifo.m_syncing_suspended = next < 0;
   if (!fifo.m_syncing_suspended)
     system.GetCoreTiming().ScheduleEvent(next, fifo.m_event_sync_gpu, next);

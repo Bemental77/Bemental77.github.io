@@ -8,6 +8,8 @@
 
 ## Current wedge
 
+> **2026-06-10 (late): THE FIFO/PE WEDGE CLASS IS FIXED — see "Verified facts / Video-pipeline chain" below.** Root-cause chain: the worker frontend never fired libretro's `context_reset` → `VideoBackendBase::InitializeShared` never ran → (a) `FifoManager::RefreshConfig` never loaded → `m_config_sync_gpu_overclock` stayed at its 0.0f member default (Fifo.h:133) → `RunGpuOnCpu` tick budget `int(ticks*0)+debt < 0` forever → CP FIFO frozen at dist=0xbe0 → `BPMEM_SETDRAWDONE` never decoded → PE_FINISH never raised → DefaultThread parked on FinishQueue (the SelectThread spin at 0x800ba2f0); (b) `g_texture_cache` null → OOB crash at first EFB copy once the FIFO was unfrozen; (c) `CustomShaderCache` ctor hung spawning compiler threads under PROXY_TO_PTHREAD. Three fixes landed (worker ContextReset call; AsyncShaderCompiler zero-worker mode; the diagnostic chain). Post-fix probe: `PixelEngine::SetFinish n=1` fires, FIFO drains (dist=0x0, pointers advancing), DSP cause SETs 24K+/120s. Boot now grinds MusyX `HandleReverb` (top PCs 0x80113xxx) — the KNOWN FP-interp-fallback throughput limit (`mp4_wedge_is_throughput_2026_06_07`) is the next frontier, plus first-frame presentation (video_cb still 0). The sections below describe the pre-fix state.
+
 **`__OSInitAudioSystem` DSP-ready mailbox poll** — multi-block cycle at PCs:
 
 | PC | Symbol (per `~/gc_refs/marioparty4/config/GMPE01_01/symbols.txt`) |

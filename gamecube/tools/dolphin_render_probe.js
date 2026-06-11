@@ -193,7 +193,7 @@ function startServer() {
       }
     }
   });
-  page.on('pageerror', (err) => buckets.page_err.push(err && err.message ? err.message : String(err)));
+  page.on('pageerror', (err) => buckets.page_err.push(err && err.stack ? err.stack : (err && err.message ? err.message : String(err))));
 
   await page.setCacheEnabled(false);
   const _extra = process.env.PROBE_QUERY ? ('&' + process.env.PROBE_QUERY) : '';
