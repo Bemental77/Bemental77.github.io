@@ -116,10 +116,21 @@ void Init()
 #endif
   }
   hw_render.context_type = RETRO_HW_CONTEXT_NONE;
+#ifdef __EMSCRIPTEN__
+  // wasm worker: no hw context is ever serviceable (nothing answers
+  // SET_HW_RENDER), and the "Software" option value is _DEBUG-gated out of
+  // Options.cpp — so the desktop fallback below always picked "Null",
+  // clobbering EmscriptenWorker main()'s SetBase("Software Renderer") and
+  // leaving a backend that rasterizes nothing and presents headless
+  // (2026-06-11: "[ax-vbi] ActivateBackend name='Null'", video_cb=0).
+  // The SW renderer presents via libretro's video_cb — it IS the wasm path.
+  Config::SetBase(Config::MAIN_GFX_BACKEND, "Software Renderer");
+#else
   if (renderer == "Software")
     Config::SetBase(Config::MAIN_GFX_BACKEND, "Software Renderer");
   else
     Config::SetBase(Config::MAIN_GFX_BACKEND, "Null");
+#endif
 }
 
 bool SetHWRender(retro_hw_context_type type, const int version_major, const int version_minor)
@@ -440,6 +451,14 @@ void ContextReset(void)
 bool Video_InitializeBackend()
 {
   NOTICE_LOG_FMT(POWERPC, "[ax-vbi] Video_InitializeBackend entry");
+  // Install the SW gfx factory (SWmain.cpp) so VideoSoftware::Initialize
+  // constructs Libretro::Video::SWGfx — whose ShowImage pumps video_cb —
+  // instead of the plain SWGfx, which reports headless under wasm and
+  // makes Presenter::Present bail before ShowImage (video_cb=0 wedge).
+  SW::g_libretro_swgfx_factory =
+      [](std::unique_ptr<SWOGLWindow> window) -> std::unique_ptr<SW::SWGfx> {
+    return std::make_unique<Libretro::Video::SWGfx>(std::move(window));
+  };
   WindowSystemInfo wsi = {};
   wsi.type = WindowSystemType::Libretro;
   wsi.render_surface_scale = 1.0f;
@@ -515,7 +534,8 @@ bool Video_InitializeBackend()
   }
 
   // this calls InitializeGLExtensions, FillBackendInfo and InitializeShared internally
-  NOTICE_LOG_FMT(POWERPC, "[ax-vbi] calling g_video_backend->Initialize");
+  NOTICE_LOG_FMT(POWERPC, "[ax-vbi] calling g_video_backend->Initialize (backend={})",
+                 g_video_backend->GetConfigName());
   return g_video_backend->Initialize(wsi);
 }
 

@@ -29,11 +29,25 @@ std::unique_ptr<SWOGLWindow> SWOGLWindow::Create(const WindowSystemInfo& wsi)
 
 bool SWOGLWindow::IsHeadless() const
 {
+  // No GL context (wasm/libretro path) — headless as far as the GL preview
+  // window is concerned. Presentation happens via Libretro::Video::SWGfx's
+  // video_cb, which overrides IsHeadless() at the gfx level.
+  if (!m_gl_context)
+    return true;
   return m_gl_context->IsHeadless();
 }
 
 bool SWOGLWindow::Initialize(const WindowSystemInfo& wsi)
 {
+#ifdef __EMSCRIPTEN__
+  // wasm worker: GLContextLR::Initialize → GLExtensions::Init dereferences
+  // the retro hw_render get_proc_address, which is never set (no hw
+  // context is serviceable) → RuntimeError: null function (2026-06-11
+  // probe pageerror). The SW rasterizer needs no GL here — frames leave
+  // through libretro's video_cb — so skip the GL window entirely.
+  (void)wsi;
+  return true;
+#else
   m_gl_context = GLContext::Create(wsi);
   if (!m_gl_context)
     return false;
@@ -82,11 +96,14 @@ bool SWOGLWindow::Initialize(const WindowSystemInfo& wsi)
 
   glGenVertexArrays(1, &m_image_vao);
   return true;
+#endif
 }
 
 void SWOGLWindow::ShowImage(const AbstractTexture* image,
                             const MathUtil::Rectangle<int>& xfb_region)
 {
+  if (!m_gl_context)
+    return;  // wasm/libretro: no GL preview window; video_cb presents.
   const SW::SWTexture* sw_image = static_cast<const SW::SWTexture*>(image);
   m_gl_context->Update();  // just updates the render window position and the backbuffer size
 

@@ -33,6 +33,12 @@
 #include "VideoBackends/Null/VideoBackend.h"
 #ifdef HAS_OPENGL
 #include "VideoBackends/OGL/VideoBackend.h"
+#endif
+// SW backend: needed without HAS_OPENGL too — under wasm/libretro it
+// presents via libretro's video_cb (DolphinLibretro SWGfx), not a GL
+// window. libvideosoftware.a is linked unconditionally (dolphin-bridge/
+// dolphin_worker_link.sh:44).
+#if defined(HAS_OPENGL) || defined(__LIBRETRO__)
 #include "VideoBackends/Software/VideoBackend.h"
 #endif
 #ifdef HAS_VULKAN
@@ -233,7 +239,11 @@ const std::vector<std::unique_ptr<VideoBackendBase>>& VideoBackendBase::GetAvail
 #if defined(__APPLE__) && !defined(__LIBRETRO__)
     backends.emplace(backends.begin(), std::make_unique<Metal::VideoBackend>());
 #endif
-#ifdef HAS_OPENGL
+// Register SW without HAS_OPENGL under libretro/wasm — otherwise the list
+// is Null-only and ActivateBackend("Software Renderer") silently keeps the
+// Null default (2026-06-11 probe: "backend=Null", video_cb=0; this was the
+// third and structural root of the no-frames wedge).
+#if defined(HAS_OPENGL) || defined(__LIBRETRO__)
     backends.push_back(std::make_unique<SW::VideoSoftware>());
 #endif
     backends.push_back(std::make_unique<Null::VideoBackend>());
@@ -254,6 +264,20 @@ void VideoBackendBase::ActivateBackend(const std::string& name)
 
   const auto& backends = GetAvailableBackends();
   const auto iter = std::ranges::find(backends, name, &VideoBackendBase::GetConfigName);
+
+  // [ax-vbi] temporary diag (2026-06-11 video_cb bring-up, strip per gate
+  // #8): every activation with the requested name, the registered list,
+  // and the outcome — pins why the SW backend isn't selected.
+  {
+    std::string avail;
+    for (const auto& b : backends)
+    {
+      avail += b->GetConfigName();
+      avail += ',';
+    }
+    NOTICE_LOG_FMT(POWERPC, "[ax-vbi] ActivateBackend name='{}' avail=[{}] found={}", name,
+                   avail, iter != backends.end() ? 1 : 0);
+  }
 
   if (iter == backends.end())
     return;

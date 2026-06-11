@@ -229,11 +229,17 @@ void retro_run(void)
 
     Libretro::g_emuthread_launched = true;
 
+    // 2026-06-11: the SW g_gfx swap moved to construction time —
+    // Video_InitializeBackend installs SW::g_libretro_swgfx_factory so
+    // VideoSoftware::Initialize builds Libretro::Video::SWGfx from the
+    // start. This post-hoc reset (a) replaced a fully-wired gfx after
+    // InitializeShared and (b) never executed under wasm anyway (probe:
+    // zero "g_gfx swapped" lines — this branch sits after the synchronous
+    // EmuThread call, which the worker flow never returns through).
     if(Config::Get(Config::MAIN_GFX_BACKEND) == "Software Renderer")
     {
-      g_gfx.reset();
-      g_gfx = std::make_unique<Libretro::Video::SWGfx>();
-      NOTICE_LOG_FMT(POWERPC, "[ax-present] g_gfx swapped to Libretro SWGfx");
+      NOTICE_LOG_FMT(POWERPC,
+                     "[ax-present] SW backend: libretro SWGfx installed at init (factory)");
     }
     else if (Config::Get(Config::MAIN_GFX_BACKEND) == "Null")
     {

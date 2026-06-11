@@ -9,6 +9,7 @@
 
 #include "Common/Common.h"
 #include "Common/CommonTypes.h"
+#include "Common/Logging/Log.h"
 
 #include "VideoBackends/Software/Clipper.h"
 #include "VideoBackends/Software/Rasterizer.h"
@@ -89,8 +90,21 @@ void VideoSoftware::InitBackendInfo(const WindowSystemInfo& wsi)
   g_backend_info.AAModes = {1};
 }
 
+// Installed by DolphinLibretro/Video.cpp (Video_InitializeBackend) before
+// backend init: constructs the libretro SWGfx subclass — whose ShowImage
+// pumps the framebuffer into libretro's video_cb — in place of the plain
+// SWGfx. Restores the dolphin-libretro fork's g_gfx swap seam lost in the
+// 2026-05-29 upstream re-extract (df03d80); without it the wasm worker's
+// presents bail headless and video_cb never fires.
+std::unique_ptr<SWGfx> (*g_libretro_swgfx_factory)(std::unique_ptr<SWOGLWindow>) = nullptr;
+
 bool VideoSoftware::Initialize(const WindowSystemInfo& wsi)
 {
+  // [ax-swgfx] temporary diag (2026-06-11, video_cb bring-up): prove this
+  // path runs, with which wsi.type, and whether the libretro factory is
+  // installed at this moment. Strip per gate #8 once video_cb fires.
+  NOTICE_LOG_FMT(POWERPC, "[ax-swgfx] VideoSoftware::Initialize wsi.type={} factory={}",
+                 (int)wsi.type, g_libretro_swgfx_factory ? 1 : 0);
   std::unique_ptr<SWOGLWindow> window = SWOGLWindow::Create(wsi);
   if (!window)
     return false;
@@ -98,7 +112,12 @@ bool VideoSoftware::Initialize(const WindowSystemInfo& wsi)
   Clipper::Init();
   Rasterizer::Init();
 
-  return InitializeShared(std::make_unique<SWGfx>(std::move(window)),
+  std::unique_ptr<SWGfx> gfx =
+      (g_libretro_swgfx_factory && wsi.type == WindowSystemType::Libretro) ?
+          g_libretro_swgfx_factory(std::move(window)) :
+          std::make_unique<SWGfx>(std::move(window));
+
+  return InitializeShared(std::move(gfx),
                           std::make_unique<SWVertexLoader>(), std::make_unique<PerfQuery>(),
                           std::make_unique<SWBoundingBox>(), std::make_unique<SWEFBInterface>(),
                           std::make_unique<TextureCache>());

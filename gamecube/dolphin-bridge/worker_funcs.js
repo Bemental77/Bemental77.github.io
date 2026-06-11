@@ -102,9 +102,15 @@ async function bootIso(name, size) {
   try {
     var iniDir = '/home/web_user/retroarch/userdata/system/dolphin-emu/User/Config';
     Module.FS.mkdirTree(iniDir);
-    var iniBody = '[Core]\nMMU = True\nSkipIPL = False\n';
+    // GFXBackend must be in the ini: EmscriptenWorker main() does
+    // Config::SetBase(MAIN_GFX_BACKEND, "Software Renderer"), but the boot-
+    // time load of this file resets the base layer — without the key here
+    // the backend falls back to Null (2026-06-11 probe: "[ax-vbi] calling
+    // g_video_backend->Initialize (backend=Null)"), which rasterizes
+    // nothing and presents headless, so video_cb never fires.
+    var iniBody = '[Core]\nMMU = True\nSkipIPL = False\nGFXBackend = Software Renderer\n';
     Module.FS.writeFile(iniDir + '/Dolphin.ini', iniBody);
-    postMessage({ cmd: 'print', txt: '[worker] wrote Dolphin.ini (MMU=True, SkipIPL=False) at ' + iniDir });
+    postMessage({ cmd: 'print', txt: '[worker] wrote Dolphin.ini (MMU=True, SkipIPL=False, GFXBackend=Software Renderer) at ' + iniDir });
     try {
       var cfg = Module.FS.readFile(iniDir + '/Dolphin.ini', { encoding: 'utf8' });
       postMessage({ cmd: 'print', txt: '[config] Dolphin.ini: ' + cfg.replace(/\n/g, ' \\n ') });

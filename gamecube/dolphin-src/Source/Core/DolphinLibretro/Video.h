@@ -32,6 +32,14 @@
 #include <libretro_vulkan.h>
 #endif
 
+namespace SW
+{
+// Defined in VideoBackends/Software/SWmain.cpp. Installed by
+// Video_InitializeBackend so VideoSoftware::Initialize constructs the
+// libretro SWGfx (below) in place of the plain headless one.
+extern std::unique_ptr<SWGfx> (*g_libretro_swgfx_factory)(std::unique_ptr<SWOGLWindow>);
+}
+
 namespace Libretro
 {
 namespace Video
@@ -45,15 +53,24 @@ void ContextDestroy(void);
 class SWGfx : public SW::SWGfx
 {
 public:
-  SWGfx()
-    : SW::SWGfx(SWOGLWindow::Create(
-            WindowSystemInfo(WindowSystemType::Libretro, nullptr, nullptr, nullptr)))
-  {
-  }
+  explicit SWGfx(std::unique_ptr<SWOGLWindow> window) : SW::SWGfx(std::move(window)) {}
+  // video_cb IS the presentation surface for the libretro SW path. Without
+  // this override the wasm worker has no GL window, SW::SWGfx::IsHeadless()
+  // is true, and Presenter::Present (Present.cpp:891) returns before
+  // ShowImage — video_cb never fires (2026-06-11 probe: video_cb count=0,
+  // [ax-present] Present headless=1 while OutputXFB/ViSwap ran 256+).
+  bool IsHeadless() const override { return false; }
   void ShowImage(const AbstractTexture* source_texture,
                  const MathUtil::Rectangle<int>& source_rc) override
   {
+#ifndef __EMSCRIPTEN__
+    // Desktop: keep the SWOGLWindow GL preview blit. Under wasm there is
+    // no GL context behind SWOGLWindow — and with IsHeadless() forced
+    // false the base call no longer self-guards — so skip it entirely;
+    // the worker's video_cb (EmscriptenWorker.cpp:119) copies the
+    // framebuffer out of the heap and posts {cmd:'render'} to the page.
     SW::SWGfx::ShowImage(source_texture, source_rc);
+#endif
     video_cb(
       static_cast<const SW::SWTexture*>(source_texture)->GetData(0, 0),
       source_rc.GetWidth(),
