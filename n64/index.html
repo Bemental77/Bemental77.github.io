@@ -235,7 +235,7 @@
     { label: 'Banjo-Dreamie', file: 'Banjo-Dreamie.z64' },
     { label: 'Banjo-Kazooie: Christmas Edition', file: 'banjoChristmas.z64' },
     { label: 'Star Fox: Survival', file: 'starfoxsurvival.z64' },
-    { label: 'Mario (hack)', file: 'marioo.z64' }
+    { label: 'Super Mario Odyssey 64 (hack)', file: 'marioo.z64' }
   ];
   const $ = id => document.getElementById(id);
   (function populateRomSelect() {
@@ -340,6 +340,7 @@
 
   var started = false, running = false;
   var pendingRom = null;
+  var preCreatedCtx = null; // created inside the Start gesture so it's never autoplay-suspended
 
   // script.js calls window.postLoad() right after constructing myApp and BEFORE
   // it defines window.Module / chain-loads input_controller.js + n64wasm.js —
@@ -364,6 +365,82 @@
         running = true;
         setStatus('Running.');
       }
+    };
+
+    // ---- AudioWorklet output path ----
+    // The vendored audio pump is a ScriptProcessorNode on the MAIN thread —
+    // the same thread running the emulator core and page paint. Every heavy
+    // emulation frame delayed the audio callback, starving the device:
+    // that was the in-game crackle (worst during level/asset loads). This
+    // override plays through an AudioWorklet on the audio thread instead,
+    // with ~90 ms of queued slack, and keeps the core's production throttle
+    // fed by reporting (worklet backlog − slack) through the same
+    // neil_set_buffer_remaining feedback the original pump used (core skips
+    // retro_run when the report is ≥5000 — mymain.cpp:1163).
+    // Free-run mode only: the pump never drives frames, so force
+    // disableAudioSync regardless of any stale localStorage option.
+    app.rivetsData.disableAudioSync = true;
+    var origInitAudio = app.initAudio.bind(app);
+    app.initAudio = function () {
+      if (this.audioInited) return;
+      var self = this;
+      var ctx = preCreatedCtx;
+      try { if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive', sampleRate: 44100 }); } catch (e) { ctx = null; }
+      if (!ctx || !ctx.audioWorklet) {
+        // Old path. If we have a gesture-created context, make the vendored
+        // body adopt it: its `new AudioContext(...)` returns our instance
+        // when the constructor is swapped for the duration of the call.
+        if (ctx) {
+          var RealAC = window.AudioContext;
+          window.AudioContext = function () { return ctx; };
+          try { origInitAudio(); } finally { window.AudioContext = RealAC; }
+        } else { origInitAudio(); }
+        return;
+      }
+      this.audioInited = true;
+      this.audioContext = ctx;
+      if (ctx.state === 'suspended') ctx.resume().catch(function () {});
+      this.gainNode = ctx.createGain();
+      this.gainNode.gain.value = 0.5;
+      this.gainNode.connect(ctx.destination);
+      this.audioBufferResampled = new Int16Array(Module.HEAP16.buffer, Module._neilGetSoundBufferResampledAddress(), 64000);
+      this.audioReadPosition = 0;
+      var SLACK = 8000; // Int16 entries (~91 ms stereo); equilibrium latency ≈ SLACK+5000
+      var workletBacklog = 0, lastUnderruns = 0;
+      ctx.audioWorklet.addModule('/n64/audio-worklet.js?v=' + Date.now()).then(function () {
+        var node = new AudioWorkletNode(ctx, 'n64-audio', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2], processorOptions: { start: SLACK } });
+        node.connect(self.gainNode);
+        node.port.onmessage = function (e) {
+          workletBacklog = e.data.b;
+          if (e.data.u > lastUnderruns) { app.rivetsData.audioSkipCount += (e.data.u - lastUnderruns); lastUnderruns = e.data.u; }
+          window.__audioDbg = e.data; // diagnostics (b=backlog, u=dry calls, m=missing entries)
+        };
+        setInterval(function () {
+          if (app.rivetsData.beforeEmulatorStarted) return;
+          var write = Module._neilGetAudioWritePosition();
+          var read = self.audioReadPosition;
+          if (write !== read) {
+            var count = (write - read + 64000) % 64000;
+            var out = new Int16Array(count);
+            if (read + count <= 64000) {
+              out.set(self.audioBufferResampled.subarray(read, read + count));
+            } else {
+              var first = 64000 - read;
+              out.set(self.audioBufferResampled.subarray(read, 64000));
+              out.set(self.audioBufferResampled.subarray(0, count - first), first);
+            }
+            self.audioReadPosition = write;
+            node.port.postMessage({ s: out }, [out.buffer]);
+            workletBacklog += count; // optimistic until the next worklet report
+          }
+          if (self.setRemainingAudio) self.setRemainingAudio(Math.max(0, workletBacklog - SLACK));
+        }, 8);
+        pageLog('[audio] AudioWorklet pump active');
+      }).catch(function (err) {
+        pageLog('[audio] worklet failed (' + err + '); falling back to ScriptProcessor');
+        self.audioInited = false;
+        origInitAudio();
+      });
     };
   };
 
@@ -412,6 +489,13 @@
     var pick = ROMS[+sel.value] || ROMS[0];
     sel.disabled = true; $('btnStart').disabled = true;
     pageLog('[ui] selected ROM: ' + pick.label);
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (AC && !preCreatedCtx) {
+        preCreatedCtx = new AC({ latencyHint: 'interactive', sampleRate: 44100 });
+        if (preCreatedCtx.resume) preCreatedCtx.resume().catch(function () {});
+      }
+    } catch (e) {}
     pendingRom = pick;
     setStatus('Loading core…');
     // script.js chain-loads input_controller.js -> n64wasm.js (both resolve via <base>).
@@ -428,6 +512,11 @@
       if (!printErrWired && window.Module && typeof window.Module === 'object') {
         printErrWired = true;
         window.Module.printErr = function (t) { pageLog('[core-err] ' + t); };
+        window.Module.onAbort = function (what) {
+          setStatus('Emulator crashed (' + what + ') — reload to retry. Add ?eruda to the URL to see details.');
+          toast('Emulator crashed', true);
+          pageLog('[abort] ' + what);
+        };
       }
       if (window.myApp && window.myApp.rivetsData && window.myApp.rivetsData.moduleInitializing === false) {
         clearInterval(poll);
