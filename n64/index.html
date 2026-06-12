@@ -419,10 +419,25 @@
     s.src = '/n64/N64Wasm/dist/script.js?v=' + Date.now();
     s.onerror = function () { setStatus('Failed to load emulator core.'); };
     document.body.appendChild(s);
+    // Surface boot failures instead of sitting at "Loading core…" forever
+    // (that silence hid the prod LFS-pointer wasm, 2026-06-12).
+    window.addEventListener('error', function (e) { pageLog('[err] ' + (e.message || e.type) + (e.filename ? ' @ ' + e.filename.split('/').pop() + ':' + e.lineno : '')); });
+    var bootDeadline = Date.now() + 90000;
+    var printErrWired = false;
     var poll = setInterval(function () {
+      if (!printErrWired && window.Module && typeof window.Module === 'object') {
+        printErrWired = true;
+        window.Module.printErr = function (t) { pageLog('[core-err] ' + t); };
+      }
       if (window.myApp && window.myApp.rivetsData && window.myApp.rivetsData.moduleInitializing === false) {
         clearInterval(poll);
         onModuleReady();
+        return;
+      }
+      if (Date.now() > bootDeadline) {
+        clearInterval(poll);
+        setStatus('Core failed to start — reload to retry (see log).');
+        toast('Core failed to start', true);
       }
     }, 50);
   }

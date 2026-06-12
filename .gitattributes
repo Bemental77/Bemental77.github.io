@@ -17,3 +17,11 @@ ps1/ps1Wasm/pcsx-wasm-src/*.wasm     filter= diff= merge= -text
 ps1/ps1Wasm/pcsx-wasm-src/*.bin      filter= diff= merge= -text
 ps1/ps1Wasm/pcsx-wasm-src/docs/*.wasm filter= diff= merge= -text
 *.bin.parta* filter=lfs diff=lfs merge=lfs -text
+
+# N64 emulator assets must be served as real content by GitHub Pages (which
+# does not resolve LFS pointers) — same fix as the PS1 overrides above.
+# /n64/ stuck at "Loading core..." on prod = n64wasm.wasm was a 132-byte
+# LFS pointer (2026-06-12).
+n64/N64Wasm/dist/*.wasm              filter= diff= merge= -text
+n64/N64Wasm/dist/*.zip               filter= diff= merge= -text
+n64/N64Wasm/roms/*.z64               filter= diff= merge= -text
