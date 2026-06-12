@@ -449,6 +449,13 @@
     // pull to our pad state.
     window.myApp.rivetsData.inputController.updateMobileControls = pushControlsToCore;
     setupJitBridge();
+    // ?difftrace: start the per-VI state-checksum trace HERE — a point that
+    // is deterministically before the ROM download/callMain in every run,
+    // so capture always begins at VI frame 0 (harness alignment).
+    if (new URLSearchParams(location.search).has('difftrace') && window.Module && Module._neil_diff_enable) {
+      Module._neil_diff_enable(1);
+      pageLog('[jit] diff trace enabled');
+    }
     if (pendingRom) { var r = pendingRom; pendingRom = null; loadRom(r); }
   }
 
@@ -456,29 +463,87 @@
   // ?jit enables the C-side up-call in recompile_block: every freshly
   // compiled block span is offered to myApp.jitCompile, and a returned
   // wasm-table index is installed as the entry instruction's PC->ops.
-  // v0 proves the plumbing only: the returned funcref is a JS wrapper that
-  // counts the call and runs the ORIGINAL interpreter op — identical
-  // semantics by construction, so boot parity + a nonzero call count is a
-  // complete pass. Real per-block wasm emission replaces the wrapper in M2.
+  //
+  // v0.5 (?jit): each offered span gets a REAL per-block WebAssembly.Module
+  // built here byte-by-byte — imports the main module's table + memory and
+  // does a native call_indirect to the original interpreter op. No JS in
+  // the dispatch path; this is the exact instantiation/install pipeline the
+  // M2 native emitters will use, just with a trivial body. The first block
+  // carries a one-time JS canary import as positive proof the module
+  // actually executes.
+  // v0 (?jit=wrap): the original addFunction call-through wrapper.
+  function leb(n) { var o = []; n >>>= 0; do { var b = n & 0x7f; n >>>= 7; o.push(n ? b | 0x80 : b); } while (n); return o; }
+  function sleb(n) { var o = [], more = true; while (more) { var b = n & 0x7f; n >>= 7; if ((n === 0 && !(b & 0x40)) || (n === -1 && (b & 0x40))) more = false; else b |= 0x80; o.push(b); } return o; }
+  function wasmSection(id, content) { return [id].concat(leb(content.length), content); }
+  function buildBlockModule(origIdx, withPing) {
+    var typeSec = wasmSection(1, [].concat(leb(1), [0x60, 0x00, 0x00]));            // 1 type: () -> ()
+    var entries = [].concat(
+      [1, 0x65, 1, 0x74, 0x01, 0x70, 0x00, 0x00],                                    // "e"."t" table funcref min 0
+      [1, 0x65, 1, 0x6D, 0x02, 0x00, 0x00],                                          // "e"."m" memory min 0
+      withPing ? [1, 0x65, 1, 0x70, 0x00, 0x00] : []                                 // "e"."p" func type 0
+    );
+    var importSec = wasmSection(2, [].concat(leb(withPing ? 3 : 2), entries));
+    var funcSec = wasmSection(3, [].concat(leb(1), leb(0)));                          // 1 defined func, type 0
+    var definedIdx = withPing ? 1 : 0;                                                // imported funcs first
+    var exportSec = wasmSection(7, [].concat(leb(1), [1, 0x66, 0x00], leb(definedIdx))); // export "f"
+    var body = [].concat([0x00],                                                      // no locals
+      withPing ? [0x10, 0x00] : [],                                                   // call $ping
+      [0x41], sleb(origIdx), [0x11, 0x00, 0x00],                                      // i32.const idx; call_indirect type0 table0
+      [0x0B]);
+    var codeSec = wasmSection(10, [].concat(leb(1), leb(body.length), body));
+    return new Uint8Array([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]
+      .concat(typeSec, importSec, funcSec, exportSec, codeSec));
+  }
   function setupJitBridge() {
-    if (!new URLSearchParams(location.search).has('jit')) return;
-    if (!window.Module || !Module.addFunction || !Module._neil_set_jit_bridge) {
+    var qs = new URLSearchParams(location.search);
+    if (!qs.has('jit')) return;
+    if (!window.Module || !Module.addFunction || !Module._neil_set_jit_bridge || !Module.wasmTable) {
       pageLog('[jit] bridge unavailable in this core build');
       return;
     }
-    var wrapped = 0, calls = 0, reused = 0;
+    var mode = qs.get('jit') === 'wrap' ? 'wrap' : 'module';
+    var wrapped = 0, calls = 0, reused = 0, canaryFired = 0, instantiateFail = 0;
     var map = Object.create(null);
+    function ping() { canaryFired++; if (canaryFired === 1) pageLog('[jit] canary: native block module EXECUTED'); }
     window.myApp.jitCompile = function (vaddr, entryPtr, origOpsIdx, spanLen) {
       var key = vaddr + ':' + origOpsIdx;
       if (map[key]) { reused++; return map[key]; }
-      var orig = Module.wasmTable.get(origOpsIdx);
-      var idx = Module.addFunction(function () { calls++; orig(); }, 'v');
+      var idx = 0;
+      if (mode === 'wrap') {
+        var orig = Module.wasmTable.get(origOpsIdx);
+        idx = Module.addFunction(function () { calls++; orig(); }, 'v');
+      } else {
+        try {
+          var withPing = (wrapped === 0);
+          var mod = new WebAssembly.Module(buildBlockModule(origOpsIdx, withPing));
+          var inst = new WebAssembly.Instance(mod, { e: { t: Module.wasmTable, m: Module.wasmMemory, p: ping } });
+          idx = Module.wasmTable.length;
+          Module.wasmTable.grow(1);
+          Module.wasmTable.set(idx, inst.exports.f);
+        } catch (e) {
+          instantiateFail++;
+          if (instantiateFail === 1) pageLog('[jit] module instantiate FAILED: ' + e);
+          return 0; // interpreter keeps the block
+        }
+      }
       map[key] = idx; wrapped++;
       return idx;
     };
-    window.__jitStats = function () { return { wrapped: wrapped, calls: calls, reused: reused }; };
+    window.__jitStats = function () { return { mode: mode, wrapped: wrapped, calls: calls, reused: reused, canaryFired: canaryFired, instantiateFail: instantiateFail }; };
+    // sync-compile size-limit probe (M1 open question): padded empty modules
+    window.__jitProbeSyncLimit = function () {
+      var results = {};
+      [4096, 65536, 1 << 20, 4 << 20, 16 << 20].forEach(function (sz) {
+        var custom = wasmSection(0, [].concat([4, 0x70, 0x61, 0x64, 0x64], new Array(sz).fill(0)));
+        var bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00].concat(custom));
+        var t0 = performance.now();
+        try { new WebAssembly.Module(bytes); results[sz] = Math.round((performance.now() - t0) * 10) / 10 + 'ms'; }
+        catch (e) { results[sz] = 'FAIL: ' + String(e).slice(0, 60); }
+      });
+      return results;
+    };
     Module._neil_set_jit_bridge(1);
-    pageLog('[jit] bridge enabled (v0 call-through)');
+    pageLog('[jit] bridge enabled (' + (mode === 'wrap' ? 'v0 call-through' : 'v0.5 native modules') + ')');
   }
 
   async function loadRom(rom) {

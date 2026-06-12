@@ -190,11 +190,12 @@ n64wasm.js: $(FILES)
 	-O3 \
 	-s EXIT_RUNTIME=0 \
 	-s ALLOW_TABLE_GROWTH=1 \
-	-s EXTRA_EXPORTED_RUNTIME_METHODS="['callMain','cwrap','addFunction','removeFunction','wasmTable']" \
+	-s EXTRA_EXPORTED_RUNTIME_METHODS="['callMain','cwrap','addFunction','removeFunction','wasmTable','wasmMemory']" \
     -s EXPORTED_FUNCTIONS="['_main','_runMainLoop','_neilGetSoundBufferResampledAddress', \
     '_neilGetAudioWritePosition','_neil_serialize','_neil_unserialize','_neil_toast_message', \
     '_neil_export_eep','_neil_export_sra','_neil_export_fla','_neil_reset','_toggleFPS', '_neil_send_mobile_controls', \
-    '_neil_set_buffer_remaining','_neil_set_endframe_callback','_neil_set_double_speed','_neil_set_jit_bridge']" \
+    '_neil_set_buffer_remaining','_neil_set_endframe_callback','_neil_set_double_speed','_neil_set_jit_bridge', \
+    '_neil_diff_enable','_neil_diff_count','_neil_diff_get','_neil_vi_total']" \
 	-s INVOKE_RUN=0 \
     && mv n64wasm.js ../dist/ \
     && mv n64wasm.wasm ../dist/

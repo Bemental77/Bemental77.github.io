@@ -1,0 +1,54 @@
+// N64 JIT differential harness (n64/docs/jit/TASKS.md M1).
+//
+//   node tools/n64_jit_diff_test.mjs [rom.z64] [frames]
+//
+// Runs the same ROM with no input three times — interpreter (twice: the
+// determinism control) and ?jit — collecting the core's per-VI architectural
+// checksum stream (_neil_diff_* exports, FNV-1a over reg/hi/lo/cp0/PC at
+// every VI boundary). Two interpreter runs must match exactly or the method
+// is invalid; interpreter-vs-jit must match exactly or the JIT diverged.
+// Reports the first divergent frame index on failure.
+import puppeteer from 'puppeteer';
+
+const rom = process.argv[2] || 'mariokart.z64';
+const FRAMES = +(process.argv[3] || 600);
+const browser = await puppeteer.launch({ headless: 'new', executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox'] });
+
+async function run(label, jit) {
+  // fresh storage per run: the game writes its SRAM/EEPROM into IndexedDB
+  // ('<rom>.sram'), and a later run booting with the previous run's save
+  // data diverges the moment the game reads it (mariokart: ~frame 80)
+  const ctx = await browser.createIncognitoBrowserContext();
+  const page = await ctx.newPage();
+  const logs = [];
+  page.on('pageerror', e => logs.push(String(e).slice(0, 150)));
+  // &difftrace makes the PAGE enable capture at module-ready — always before
+  // the ROM download/callMain, so every run starts capture at VI frame 0
+  // (harness-side enabling raced the boot and misaligned streams by ~2 VIs)
+  await page.goto(`http://localhost:8080/n64/?game=${rom}&autostart&difftrace${jit ? '&jit' : ''}`, { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction('window.myApp && myApp.rivetsData.beforeEmulatorStarted === false', { timeout: 120000 });
+  await page.waitForFunction(`Module._neil_diff_count() >= ${FRAMES}`, { timeout: 180000, polling: 500 });
+  const sums = await page.evaluate((n) => { const a = []; for (let i = 0; i < n; i++) a.push(Module._neil_diff_get(i) >>> 0); return a; }, FRAMES);
+  const stats = jit ? await page.evaluate(() => window.__jitStats ? window.__jitStats() : null) : null;
+  await ctx.close();
+  return { label, sums, stats, logs };
+}
+
+function firstDiff(a, b) { for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return i; return -1; }
+
+const interpA = await run('interp-A', false);
+const interpB = await run('interp-B', false);
+const jit = await run('jit', true);
+await browser.close();
+
+const detDiff = firstDiff(interpA.sums, interpB.sums);
+const jitDiff = firstDiff(interpA.sums, jit.sums);
+const out = {
+  rom, frames: FRAMES,
+  determinismControl: detDiff === -1 ? 'PASS' : `INVALID METHOD: interp runs diverge at frame ${detDiff}`,
+  jitVsInterp: detDiff !== -1 ? 'SKIPPED (method invalid)' : (jitDiff === -1 ? 'PASS' : `DIVERGED at frame ${jitDiff}`),
+  jitStats: jit.stats,
+  errors: { a: interpA.logs.slice(0, 3), b: interpB.logs.slice(0, 3), jit: jit.logs.slice(0, 3) },
+};
+console.log(JSON.stringify(out, null, 1));
+process.exit(detDiff === -1 && jitDiff === -1 ? 0 : 1);

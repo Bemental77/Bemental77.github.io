@@ -437,10 +437,46 @@ void retro_reset_new()
     CoreDoCommand(M64CMD_RESET, 1, (void*)0);
 }
 
+/* --- N64 JIT differential trace (n64/docs/jit/TASKS.md M1) ---
+ * Captures an FNV-1a checksum of the architectural state (reg/hi/lo/cp0/PC)
+ * at every VI boundary into a ring the page reads back. Two runs of the same
+ * ROM with no input are state-deterministic per frame (VI is Count-driven,
+ * not wall-clock), so comparing the per-frame checksum streams of a ?jit run
+ * against an interpreter run is a complete divergence detector. */
+static int g_diff_enabled = 0;
+#define NEIL_DIFF_MAX 8192
+static uint32_t g_diff_buf[NEIL_DIFF_MAX];
+static int g_diff_n = 0;
+static unsigned int g_vi_total = 0; /* VIs since boot, counted regardless of enable — capture-alignment sanity */
+void neil_diff_enable(int v) { g_diff_enabled = v; g_diff_n = 0; }
+int neil_diff_count(void) { return g_diff_n; }
+unsigned int neil_vi_total(void) { return g_vi_total; }
+unsigned int neil_diff_get(int i) { return (i >= 0 && i < g_diff_n) ? g_diff_buf[i] : 0; }
+static void neil_diff_capture(void)
+{
+    extern uint32_t g_cp0_regs[32];
+    uint32_t h = 2166136261u;
+    int k;
+#define NEIL_MIX(x) h = (h ^ (uint32_t)(x)) * 16777619u
+    for (k = 0; k < 32; k++) { NEIL_MIX(reg[k]); NEIL_MIX(reg[k] >> 32); }
+    NEIL_MIX(hi); NEIL_MIX(hi >> 32); NEIL_MIX(lo); NEIL_MIX(lo >> 32);
+    for (k = 0; k < 32; k++) NEIL_MIX(g_cp0_regs[k]);
+    NEIL_MIX(PC->addr);
+#undef NEIL_MIX
+    if (g_diff_n < NEIL_DIFF_MAX) g_diff_buf[g_diff_n++] = h;
+}
+
 int retro_return(bool just_flipping)
 {
     if (stop)
         return 0;
+
+    if (!just_flipping)
+    {
+        g_vi_total++;
+        if (g_diff_enabled)
+            neil_diff_capture();
+    }
 
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
     vbo_disable();
