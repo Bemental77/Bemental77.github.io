@@ -2489,7 +2489,7 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
       void gen_interrupt(void); /* interrupt.h not included in this TU */
       uint32_t jit_entry_i = (func & UINT32_C(0xFFF)) / 4;
       struct precomp_instr* jit_entry = block->block + jit_entry_i;
-      static uint32_t jit_params[18];
+      static uint32_t jit_params[25];
       int jit_idx;
       jit_params[0] = func;                                        /* entry vaddr */
       jit_params[1] = (uint32_t)(uintptr_t)jit_entry;              /* entry precomp_instr* */
@@ -2510,6 +2510,17 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
       jit_params[15] = count_per_op;                               /* fixed per-ROM before any compile */
       jit_params[16] = (uint32_t)(uintptr_t)&skip_jump;
       jit_params[17] = (uint32_t)(uintptr_t)&gen_interrupt;        /* funcptr == table index */
+      /* wave 3 (native loads) — live dispatch-table fast path: the emitter
+       * compares readmem*[a>>16] against read_rdram* at RUNTIME, so the
+       * framebuffer-protection remapping (m64p_memory.c saved_readmem swap)
+       * is honored exactly; any non-dram mapping falls back to the interp op */
+      jit_params[18] = (uint32_t)(uintptr_t)&readmem[0];
+      jit_params[19] = (uint32_t)(uintptr_t)&readmemb[0];
+      jit_params[20] = (uint32_t)(uintptr_t)&readmemh[0];
+      jit_params[21] = (uint32_t)(uintptr_t)&read_rdram;
+      jit_params[22] = (uint32_t)(uintptr_t)&read_rdramb;
+      jit_params[23] = (uint32_t)(uintptr_t)&read_rdramh;
+      jit_params[24] = (uint32_t)(uintptr_t)&g_dev.ri.rdram.dram[0];
       jit_idx = EM_ASM_INT({
          return (typeof window !== 'undefined' && window.myApp && window.myApp.jitCompile)
             ? (window.myApp.jitCompile($0) | 0) : 0;

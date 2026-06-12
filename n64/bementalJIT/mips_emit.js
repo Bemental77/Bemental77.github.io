@@ -42,9 +42,10 @@
     local_get: 0x20, local_set: 0x21,
     i32_load: 0x28, i64_load: 0x29, i32_store: 0x36, i64_store: 0x37,
     i32_const: 0x41, i64_const: 0x42,
-    i32_eqz: 0x45, i32_ne: 0x47, i32_le_u: 0x4D,
+    i32_eqz: 0x45, i32_eq: 0x46, i32_ne: 0x47, i32_le_u: 0x4D,
     i64_eq: 0x51, i64_ne: 0x52, i64_lt_s: 0x53, i64_lt_u: 0x54, i64_gt_s: 0x55, i64_le_s: 0x57, i64_ge_s: 0x59,
-    i32_add: 0x6A, i32_sub: 0x6B, i32_mul: 0x6C, i32_shl: 0x74, i32_shr_s: 0x75, i32_shr_u: 0x76,
+    i32_add: 0x6A, i32_sub: 0x6B, i32_mul: 0x6C, i32_and: 0x71, i32_or: 0x72, i32_xor: 0x73, i32_shl: 0x74, i32_shr_s: 0x75, i32_shr_u: 0x76,
+    i32_extend8_s: 0xC0, i32_extend16_s: 0xC1,
     i64_add: 0x7C, i64_and: 0x83, i64_or: 0x84, i64_xor: 0x85,
     i32_wrap_i64: 0xA7, i64_extend_i32_s: 0xAC, i64_extend_i32_u: 0xAD,
     void_: 0x40,
@@ -104,8 +105,12 @@
   function emitNativeStore(word, ctx, p) {
     var nat = emitNative(word, ctx);
     if (!nat) return null;
-    if (nat.dest > 0) return storeI64(p.reg + nat.dest * 8, nat.bytes);
-    return []; // r0 / NOP
+    // dest -1 = NOP (word 0). For every other op MIRROR the interpreter,
+    // which writes through &reg[dest] even when dest is r0 — subsequent
+    // reads of r0 then see that value, and the differential gate compares
+    // reg[0] too. (MIPS spec discards r0 writes; this core does not.)
+    if (nat.dest >= 0) return storeI64(p.reg + nat.dest * 8, nat.bytes);
+    return []; // NOP
   }
 
   // ---- native branch decoding (wave 2) ----
@@ -171,8 +176,61 @@
     );
   }
 
+  // ---- native loads (wave 3) ----
+  // Fast path mirrors the interpreter's LIVE dispatch: load
+  // readmem*[a>>16] from linear memory and compare against read_rdram* —
+  // framebuffer-protection remapping (saved_readmem swap) therefore takes
+  // the fallback automatically. dram is a host-endian u32 array indexed by
+  // (a & 0xffffff)>>2; byte/half extraction uses the BE shifts
+  // (BSHIFT=((a&3)^3)<<3, HSHIFT=((a&2)^2)<<3) and LB/LH sign-extend
+  // (SE8/SE16) exactly like readb/readh + the op bodies.
+  // locals: 0 = address (i32), 1 = fetched word (i32)
+  function emitLoad(word, instrPtr, nextPtr, p, ctx) {
+    var op = (word >>> 26) & 0x3F;
+    if (op !== 0x20 && op !== 0x21 && op !== 0x23 && op !== 0x24 && op !== 0x25 && op !== 0x27) return null;
+    var rs = (word >>> 21) & 0x1F, rt = (word >>> 16) & 0x1F;
+    var imm = sext16(word & 0xFFFF);
+    var R = function (r) { return ctx.reg + r * 8; };
+    var tableBase, cmpVal;
+    if (op === 0x23 || op === 0x27) { tableBase = p.readmemW; cmpVal = p.rdRdram; }
+    else if (op === 0x20 || op === 0x24) { tableBase = p.readmemB; cmpVal = p.rdRdramB; }
+    else { tableBase = p.readmemH; cmpVal = p.rdRdramH; }
+    var shiftB = [OP.local_get, 0x00, OP.i32_const, 0x03, OP.i32_and, OP.i32_const, 0x03, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
+    var shiftH = [OP.local_get, 0x00, OP.i32_const, 0x02, OP.i32_and, OP.i32_const, 0x02, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
+    var val;
+    switch (op) {
+      case 0x23: val = [OP.local_get, 0x01, OP.i64_extend_i32_s]; break;                    // LW: SE32
+      case 0x27: val = [OP.local_get, 0x01, OP.i64_extend_i32_u]; break;                    // LWU
+      case 0x24: val = [OP.local_get, 0x01].concat(shiftB, [OP.i32_shr_u, OP.i32_const], sleb(0xFF), [OP.i32_and, OP.i64_extend_i32_u]); break; // LBU
+      case 0x20: val = [OP.local_get, 0x01].concat(shiftB, [OP.i32_shr_u, OP.i32_const], sleb(0xFF), [OP.i32_and, OP.i32_extend8_s, OP.i64_extend_i32_s]); break; // LB: SE8
+      case 0x25: val = [OP.local_get, 0x01].concat(shiftH, [OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i64_extend_i32_u]); break; // LHU
+      case 0x21: val = [OP.local_get, 0x01].concat(shiftH, [OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i32_extend16_s, OP.i64_extend_i32_s]); break; // LH: SE16
+    }
+    var opsIdx = null; // filled by caller-provided fallback bytes
+    return [].concat(
+      // a = (i32)reg[rs] + imm  -> local 0
+      loadI64(R(rs)), [OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, 0x00],
+      // readmem*[a>>16] == read_rdram* ?
+      [OP.local_get, 0x00, OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
+      [OP.i32_load, 0x02], leb(tableBase),
+      [OP.i32_const], sleb(cmpVal), [OP.i32_eq],
+      [OP.if_, OP.void_],
+        // w = dram[(a & 0xfffffc)]  -> local 1
+        [OP.local_get, 0x00, OP.i32_const], sleb(0xFFFFFC), [OP.i32_and],
+        [OP.i32_load, 0x02], leb(p.dramBase), [OP.local_set, 0x01],
+        storeI64(R(rt), val), // mirrors interp: writes reg[0] too when rt==0
+      [OP.else_],
+        storeI32Const(p.pcGlobal, instrPtr),
+        [OP.i32_const], sleb(Module_opsIdx(instrPtr)), [OP.call_indirect, 0x00, 0x00],
+        loadI32(p.pcGlobal), [OP.i32_const], sleb(nextPtr), [OP.i32_ne],
+        [OP.br_if, 0x02], // $exit from inside if/else
+      [OP.end]
+    );
+  }
+  var Module_opsIdx = null; // bound per-compile (reads precomp_instr.ops)
+
   // ---- block compiler ----
-  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, fallbackOps: 0, fails: 0 };
+  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeLoads: 0, fallbackOps: 0, fails: 0 };
 
   function compileSpan(p0, Module) {
     var HEAPU32 = Module.HEAPU32;
@@ -180,6 +238,7 @@
                 //   reg, hi, lo, blockStart, blockEnd, lastAddr, nextInt,
                 //   count, cpo, skipJump, genInt }
     var ctx = { reg: p.reg };
+    Module_opsIdx = function (instrPtr) { return HEAPU32[instrPtr >> 2]; };
     var body = [];
     // depths inside the main body: br $top = 0 (loop), br $exit = 1 (block)
     var EXIT = 1, TOP = 0;
@@ -273,6 +332,15 @@
         continue;
       }
 
+      // (a2) native load?
+      var ld = emitLoad(word, instrPtr, nextPtr, p, ctx);
+      if (ld) {
+        body = body.concat(ld);
+        stats.nativeLoads++;
+        i++;
+        continue;
+      }
+
       // (a) native ALU?
       var natStore = emitNativeStore(word, ctx, p);
       if (natStore !== null) {
@@ -296,7 +364,7 @@
     // natural fall-through past the span
     body = body.concat(storeI32Const(p.pcGlobal, p.entryPtr + p.span * p.stride));
 
-    var full = [0x00,                       // no locals
+    var full = [0x01, 0x02, 0x7F,           // locals: 2 x i32 (addr, word)
       OP.block, OP.void_,                   // $exit
       OP.loop, OP.void_]                    // $top
       .concat(body,
