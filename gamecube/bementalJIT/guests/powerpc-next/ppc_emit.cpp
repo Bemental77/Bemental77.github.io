@@ -256,14 +256,23 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         // dcbz — 32-byte zero block. Memset/__fill_mem hot path.
         case 1014: emit_dcbz(wb, rc, frc, op, params.ctx_ptr);                  return true;
 
-        // Sync / cache barriers / cache hints — emit nothing. The emulator's
-        // linear memory model has no real cache to flush/invalidate/prefetch.
-        //   598 sync/lwsync, 854 eieio, 982 icbi (i-cache invalidate),
-        //    86 dcbf, 54 dcbst, 470 dcbi, 278 dcbt, 246 dcbtst.
-        case 598: case 854: case 982:
+        // Sync / DATA-cache barriers / hints — emit nothing. The linear
+        // memory model has no real data cache to flush/invalidate/prefetch.
+        //   598 sync/lwsync, 854 eieio, 86 dcbf, 54 dcbst, 470 dcbi,
+        //   278 dcbt, 246 dcbtst.
+        case 598: case 854:
         case 86:  case 54:  case 470:
         case 278: case 246:
             return true;
+
+        // icbi — interp fallback so the full invalidation plumbing runs
+        // (Interpreter::icbi -> iCache.Invalidate -> JitInterface ->
+        // JitWasm wasm-block range evict). FL_ENDBLOCK in the opinfo ends
+        // the block after it. NOT a nop: the wasm block cache IS the
+        // instruction cache (2026-06-11 PSO switcher->PsoV3 handoff bug).
+        case 982:
+            emit_fallback(wb, rc, frc, op, params.ctx_ptr);
+            return false;
 
         default: break;
         }

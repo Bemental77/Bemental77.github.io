@@ -241,6 +241,14 @@ static const GekkoOPInfo* table31(u32 sub10) {
     static constexpr GekkoOPInfo mftb   = {"mftb",   OpType::System,  1, FL_OUT_D | FL_TIMER};
     // Sync / cache.
     static constexpr GekkoOPInfo nop    = {"nop",    OpType::DataCache, 1, 0};
+    // icbi is NOT a nop here: our wasm block cache IS the instruction
+    // cache. Interp-routed (iCache.Invalidate -> JitInterface -> JitWasm
+    // range-evict) and ends the block (Jit64 parity: FallBackToInterpreter
+    // + WriteExit — ops after an icbi in the same block could be stale).
+    // 2026-06-11 PSO root: the switcher loaded PsoV3.dol over already-
+    // compiled first-stage addresses (text0 0x8000c000 overlap), icbi was
+    // silent, stale blocks ran at the handoff, switcher fell into PPCHalt.
+    static constexpr GekkoOPInfo icbi   = {"icbi",   OpType::DataCache, 1, FL_IN_A0B | FL_ENDBLOCK};
     static constexpr GekkoOPInfo dcbz   = {"dcbz",   OpType::DataCache, 1, FL_IN_A0B | FL_LOADSTORE};
     static constexpr GekkoOPInfo tlbie  = {"tlbie",  OpType::System,    1, FL_IN_B | FL_PROGRAMEXCEPTION};
     // X-form loads/stores (integer).
@@ -370,13 +378,14 @@ static const GekkoOPInfo* table31(u32 sub10) {
     case 19:  return &mfcr;
     case 144: return &mtcrf;
     case 371: return &mftb;
-    // Sync + cache-control / cache-hint — all classify as nop here:
-    //   598 sync, 854 eieio, 982 icbi, 86 dcbf, 54 dcbst, 470 dcbi,
-    //   278 dcbt, 246 dcbtst. No real cache in the linear-memory model.
-    case 598: case 854: case 982:
+    // Sync + DATA-cache control / hints — classify as nop here:
+    //   598 sync, 854 eieio, 86 dcbf, 54 dcbst, 470 dcbi, 278 dcbt,
+    //   246 dcbtst. No real data cache in the linear-memory model.
+    case 598: case 854:
     case 86:  case 54:  case 470:
     case 278: case 246:
         return &nop;
+    case 982: return &icbi;  // NOT a nop — see opinfo comment above.
     case 1014: return &dcbz;
     case 306: return &tlbie;
     // Segment-register access — privileged, end-block.

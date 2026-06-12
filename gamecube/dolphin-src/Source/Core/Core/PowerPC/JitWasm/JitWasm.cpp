@@ -92,6 +92,7 @@ void JitWasm::Shutdown()
 {
   m_wasm_cache.clear();
   m_block_inst_counts.clear();
+  m_block_guest_end.clear();
   CachedInterpreter::Shutdown();
 }
 
@@ -102,6 +103,7 @@ void JitWasm::ClearCache()
   // etc.). Called from JitInterface::ClearCache via the inherited virtual.
   m_wasm_cache.clear();
   m_block_inst_counts.clear();
+  m_block_guest_end.clear();
   CachedInterpreter::ClearCache();
 }
 
@@ -109,6 +111,29 @@ void JitWasm::EvictBlock(u32 pc)
 {
   m_wasm_cache.evict(pc);
   m_block_inst_counts.erase(pc);
+  m_block_guest_end.erase(pc);
+}
+
+void JitWasm::InvalidateICacheRange(u32 lo, u32 hi)
+{
+  // Blocks decode at most 64 instructions (256 guest bytes — see
+  // TryCompileBlock), so any block overlapping [lo, hi) starts at or
+  // after lo - 256.
+  auto it = m_block_guest_end.lower_bound(lo >= 256u ? lo - 256u : 0u);
+  while (it != m_block_guest_end.end() && it->first < hi)
+  {
+    if (it->second > lo)
+    {
+      m_wasm_cache.evict(it->first);
+      m_block_inst_counts.erase(it->first);
+      m_block_is_idle.erase(it->first);
+      it = m_block_guest_end.erase(it);
+    }
+    else
+    {
+      ++it;
+    }
+  }
 }
 
 // C-linkage helper for the bridge (dolphin-bridge can't include JitWasm.h
@@ -117,6 +142,18 @@ void JitWasm::EvictBlock(u32 pc)
 // include path). Defined here in JitWasm.cpp where the full type is in
 // scope. Callable from dolphin-bridge as `extern "C" void
 // dolphin_evict_block(uint32_t)`.
+// Called from JitInterface::InvalidateICache/InvalidateICacheLine so guest
+// icbi (and host icache invalidations) evict our wasm blocks too — the
+// inherited JitBaseBlockCache path doesn't know about m_wasm_cache. Same
+// access pattern as dolphin_evict_block below.
+extern "C" void jitwasm_invalidate_icache_range(u32 address, u32 size)
+{
+  auto& system = Core::System::GetInstance();
+  auto* core = system.GetJitInterface().GetCore();
+  if (auto* jw = dynamic_cast<JitWasm*>(core))
+    jw->InvalidateICacheRange(address, address + size);
+}
+
 extern "C" EMSCRIPTEN_KEEPALIVE void dolphin_evict_block(u32 pc)
 {
   auto& system = Core::System::GetInstance();
@@ -327,6 +364,8 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
   // events vs guest instruction progress) — found by the 2026-06-11
   // exhaustive Jit64 parity audit (docs/jit-correctness-rulebook/).
   m_block_inst_counts[start_pc] = block_cycles ? block_cycles : count;
+  // Guest span for icbi range-eviction (InvalidateICacheRange).
+  m_block_guest_end[start_pc] = start_pc + count * 4u;
   return true;
 }
 

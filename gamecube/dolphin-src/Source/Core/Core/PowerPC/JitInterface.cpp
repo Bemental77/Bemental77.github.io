@@ -278,16 +278,31 @@ std::size_t JitInterface::DisassembleFarCode(const JitBlock& block, std::ostream
   return 0;
 }
 
+#ifdef __EMSCRIPTEN__
+// Defined in JitWasm/JitWasm.cpp. The JitBaseBlockCache invalidation below
+// doesn't know about JitWasm's bemental::BlockCache (the wasm block cache
+// IS the guest's instruction cache) — without this, guest icbi over
+// freshly-copied code leaves stale wasm blocks live. 2026-06-11 PSO
+// switcher->PsoV3 handoff bug; see JitWasm.h InvalidateICacheRange.
+extern "C" void jitwasm_invalidate_icache_range(u32 address, u32 size);
+#endif
+
 void JitInterface::InvalidateICache(u32 address, u32 size, bool forced)
 {
   if (m_jit)
     m_jit->GetBlockCache()->InvalidateICache(address, size, forced);
+#ifdef __EMSCRIPTEN__
+  jitwasm_invalidate_icache_range(address, size);
+#endif
 }
 
 void JitInterface::InvalidateICacheLine(u32 address)
 {
   if (m_jit)
     m_jit->GetBlockCache()->InvalidateICacheLine(address);
+#ifdef __EMSCRIPTEN__
+  jitwasm_invalidate_icache_range(address & ~31u, 32u);
+#endif
 }
 
 void JitInterface::InvalidateICacheLines(u32 address, u32 count)

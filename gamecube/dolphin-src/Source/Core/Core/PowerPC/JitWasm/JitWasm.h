@@ -22,6 +22,7 @@
 
 #ifdef __EMSCRIPTEN__
 
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -55,6 +56,16 @@ public:
   // that PC re-compiles with the hook check live.
   void EvictBlock(u32 pc);
 
+  // Range evict for guest icbi / icache invalidation (called from
+  // JitInterface::InvalidateICache* via the jitwasm_invalidate_icache_range
+  // C helper). Our wasm block cache IS the guest's instruction cache:
+  // without this, code copied over already-compiled addresses keeps
+  // executing the STALE blocks. 2026-06-11 PSO root cause: the AppSwitcher
+  // loads PsoV3.dol over the first-stage program's addresses (both have
+  // text0 at 0x8000c000), runs icbi over the range, then jumps — and the
+  // stale first-stage blocks ran instead, returning into PPCHalt.
+  void InvalidateICacheRange(u32 lo, u32 hi);
+
 private:
   // Decode a basic block starting at start_pc (terminator is the first
   // branch opcode encountered, or 64 instructions, whichever comes first).
@@ -80,6 +91,12 @@ private:
   // ring in Run() — without this, CTR-counted loops (DCFlushRange et al)
   // get force-zeroed every iteration → Advance-bound spin. Pass-7 fix.
   std::unordered_set<u32> m_block_is_idle;
+
+  // Guest-address span per compiled block (start -> start + n_insts*4),
+  // ordered so InvalidateICacheRange can find overlapping blocks. Note
+  // m_block_inst_counts holds CYCLES (downcount), not lengths — this map
+  // is the only source of block extents.
+  std::map<u32, u32> m_block_guest_end;
 };
 
 #endif  // __EMSCRIPTEN__
