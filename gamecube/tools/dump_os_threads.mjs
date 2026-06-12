@@ -93,13 +93,20 @@ function loadSymbols(symPath) {
   // Lines look like:
   //   SelectThread = .text:0x800BA1B8; // type:function size:0x200 scope:local
   const re = /^\s*([A-Za-z_][\w@.]*)\s*=\s*\.[A-Za-z0-9_.]+:0x([0-9A-Fa-f]+);/;
+  // dolphin .map format: "803beefc 00050c 803beefc 0 HandleReverb"
+  const reMap = /^([0-9A-Fa-f]{8})\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]{8}\s+\d+\s+(\S+)/;
   for (const line of text.split('\n')) {
-    const m = re.exec(line);
-    if (!m) continue;
-    const name = m[1];
-    const addr = parseInt(m[2], 16) >>> 0;
-    byAddr.set(addr, name);
-    byName.set(name, addr);
+    let m = re.exec(line);
+    if (m) {
+      byAddr.set(parseInt(m[2], 16) >>> 0, m[1]);
+      byName.set(m[1], parseInt(m[2], 16) >>> 0);
+      continue;
+    }
+    m = reMap.exec(line);
+    if (m) {
+      byAddr.set(parseInt(m[1], 16) >>> 0, m[2]);
+      byName.set(m[2], parseInt(m[1], 16) >>> 0);
+    }
   }
   return { byAddr, byName };
 }
@@ -187,6 +194,7 @@ function startServer() {
 
   page.on('console', (msg) => {
     const t = msg.text();
+    if (t.includes('mailbox-diag')) console.log('[osdump-echo] ' + t);
     if (t.includes('MEM1 wired') || t.includes('ppc-worker MEM1 wired') || t.includes('dolphin ram')) {
       if (!mem1Wired) console.log('[osdump] ' + t);
       mem1Wired = true;
@@ -318,6 +326,13 @@ function startServer() {
   //     link_next, link_prev, queueJoin_head, queueJoin_tail, mutex,
   //     queueMutex_head, queueMutex_tail, linkActive_next, linkActive_prev,
   //     stackBase, stackEnd }
+  if (process.env.OS_DUMP_SCAN_GAMEID) {
+    await page.evaluate((g) => { window._osdumpScanGid = g; }, process.env.OS_DUMP_SCAN_GAMEID);
+  }
+  if (process.env.OS_DUMP_MEM1_OFF) {
+    await page.evaluate((off) => { window._osdumpMem1Off = off >>> 0; },
+                        parseInt(process.env.OS_DUMP_MEM1_OFF, 16) >>> 0);
+  }
   const walkResult = await page.evaluate(() => {
     if (!window.sharedMemory || !window.sharedMemory.buffer) {
       return { ok: false, err: 'no window.sharedMemory.buffer' };
@@ -334,6 +349,70 @@ function startServer() {
     //      land — VI_FIELD_BELOW is well past that point.
     let mem1Addr = (window._osdumpRamAddr >>> 0) || (u32[0x02500020 >> 2] >>> 0);
     let mem1Source = mem1Addr !== 0 ? 'get-ram-info' : '';
+    // OS_DUMP_MEM1_OFF override (page receives it via window._osdumpMem1Off):
+    // the allocator places MEM1 at a stable SAB offset per build, so an
+    // offset discovered on one game (e.g. MP4) can be reused on another.
+    // The gameID at +0 is printed for verification, never trusted blindly.
+    // Game-independent lowmem-layout scan: MEM1+0x28 and +0xF0 hold the
+    // physical/simulated memory size 0x01800000 (dolsdk lowmem contract),
+    // and +0xD4/+0xD8/+0xDC/+0xE0/+0xE4 (__OSCurrentContext..__gCurrentThread)
+    // are BE 0x80xxxxxx pointers once the OS is up. PSO's switcher flow
+    // rewrites the disc-ID/boot-magic words, so this is the robust anchor.
+    if (mem1Addr === 0) {
+      const limit = sab.byteLength - 0x100;
+      for (let off = 0; off < limit; off += 4) {
+        if (u8[off+0x28] !== 0x01 || u8[off+0x29] !== 0x80 || u8[off+0x2A] !== 0x00 || u8[off+0x2B] !== 0x00) continue;
+        if (u8[off+0xF0] !== 0x01 || u8[off+0xF1] !== 0x80) continue;
+        if (u8[off+0xD4] !== 0x80 || u8[off+0xD8] !== 0x80 || u8[off+0xDC] !== 0x80 ||
+            u8[off+0xE0] !== 0x80 || u8[off+0xE4] !== 0x80) continue;
+        mem1Addr = off >>> 0;
+        mem1Source = `lowmem-layout-scan @ 0x${off.toString(16)}`;
+        break;
+      }
+      // diagnostic: if nothing matched the full signature, log the
+      // physical-memsize hits with their +0xD0..0xF4 bytes so the layout
+      // assumption itself can be checked
+      if (mem1Addr === 0) {
+        const cand = [];
+        for (let off = 0; off < limit && cand.length < 8; off += 4) {
+          if (u8[off+0x28] !== 0x01 || u8[off+0x29] !== 0x80 || u8[off+0x2A] !== 0x00 || u8[off+0x2B] !== 0x00) continue;
+          let hex = '';
+          for (let k = 0xD0; k < 0xF8; k += 4) {
+            hex += ((u8[off+k]<<24|u8[off+k+1]<<16|u8[off+k+2]<<8|u8[off+k+3])>>>0).toString(16).padStart(8,'0') + ' ';
+          }
+          cand.push(`0x${off.toString(16)}: ${hex}`);
+        }
+        window._osdumpLowmemCand = cand;
+      }
+    }
+    // OS_DUMP_SCAN_GAMEID diagnostic: report every occurrence of the given
+    // 6-byte gameID with its +0x1C word, then use the first hit whose
+    // +0x1C is the boot magic — or the first aligned hit if none have it.
+    if (mem1Addr === 0 && window._osdumpScanGid) {
+      const gid = window._osdumpScanGid;
+      const hits = [];
+      const limit = sab.byteLength - 0x20;
+      for (let off = 0; off < limit && hits.length < 12; off += 4) {
+        let ok = true;
+        for (let k = 0; k < 6; k++) if (u8[off+k] !== gid.charCodeAt(k)) { ok = false; break; }
+        if (!ok) continue;
+        const m = ((u8[off+0x1C]<<24)|(u8[off+0x1D]<<16)|(u8[off+0x1E]<<8)|u8[off+0x1F]) >>> 0;
+        hits.push({ off, magic: m });
+      }
+      window._osdumpGidHits = hits.map(h => `0x${h.off.toString(16)} magic=0x${h.magic.toString(16)}`);
+      const withMagic = hits.find(h => h.magic === 0xC2339F3D);
+      const pick = withMagic || hits[0];
+      if (pick) {
+        mem1Addr = pick.off >>> 0;
+        mem1Source = `gameid-scan @ 0x${pick.off.toString(16)} (magic=0x${pick.magic.toString(16)})`;
+      }
+    }
+    if (mem1Addr === 0 && window._osdumpMem1Off) {
+      const off = window._osdumpMem1Off >>> 0;
+      const gid = String.fromCharCode(u8[off], u8[off+1], u8[off+2], u8[off+3], u8[off+4], u8[off+5]);
+      mem1Addr = off;
+      mem1Source = `env-override @ 0x${off.toString(16)} (gameID reads '${gid}')`;
+    }
     if (mem1Addr === 0) {
       // Two-part signature:
       //   GMPE01 = 47 4D 50 45 30 31 at offset 0x00 (disc gameID).
@@ -341,17 +420,20 @@ function startServer() {
       // Both must match. The combined signature is collision-unique vs
       // random Dolphin string literals (which produce GMPE01 hits inside
       // overrides tables but lack the magic word at offset +0x1C).
-      const sig = [0x47, 0x4D, 0x50, 0x45, 0x30, 0x31];
+      // Generalized 2026-06-12: anchor on the disc boot magic 0xC2339F3D at
+      // +0x1C and require a printable 6-char gameID at +0x00 (works for any
+      // title: GMPE01=MP4, GPOE8P=PSO, GSNE8P=SAB...). The magic is the
+      // collision filter; the printable check rejects string-literal hits.
       const limit = sab.byteLength - 0x20;
+      const printable = (b) => b >= 0x30 && b <= 0x5A; // 0-9 A-Z
       for (let off = 0; off < limit; off += 4) {
-        if (u8[off]   !== sig[0] || u8[off+1] !== sig[1] ||
-            u8[off+2] !== sig[2] || u8[off+3] !== sig[3] ||
-            u8[off+4] !== sig[4] || u8[off+5] !== sig[5]) continue;
-        // Magic at +0x1C should be 0xC2 0x33 0x9F 0x3D (big-endian).
         if (u8[off+0x1C] !== 0xC2 || u8[off+0x1D] !== 0x33 ||
             u8[off+0x1E] !== 0x9F || u8[off+0x1F] !== 0x3D) continue;
+        if (!printable(u8[off]) || !printable(u8[off+1]) || !printable(u8[off+2]) ||
+            !printable(u8[off+3]) || !printable(u8[off+4]) || !printable(u8[off+5])) continue;
         mem1Addr = off >>> 0;
-        mem1Source = `signature-scan @ 0x${off.toString(16)} (GMPE01+magic)`;
+        const gid = String.fromCharCode(u8[off], u8[off+1], u8[off+2], u8[off+3], u8[off+4], u8[off+5]);
+        mem1Source = `signature-scan @ 0x${off.toString(16)} (${gid}+magic)`;
         break;
       }
     }
@@ -457,6 +539,10 @@ function startServer() {
     };
   });
 
+  const lowCand = await page.evaluate(() => window._osdumpLowmemCand || []);
+  if (lowCand.length) console.log('[osdump] lowmem candidates (+0xD0..0xF4):'), lowCand.forEach(c => console.log('   ', c));
+  const gidHits = await page.evaluate(() => window._osdumpGidHits || []);
+  if (gidHits.length) console.log('[osdump] gameID scan hits:', gidHits.join(', '));
   if (!walkResult.ok) {
     console.error(`[osdump] FAIL: ${walkResult.err}`);
     await browser.close(); srv.close(); process.exit(2);

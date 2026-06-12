@@ -234,6 +234,16 @@ async function bootIso(name, size) {
 
 self.onmessage = function (e) {
   var data = e.data || {};
+  // [mailbox-diag 2026-06-12] temporary: pin why page->worker requests
+  // (get-ram-info) never reach this switch in live runs (ramInfoSeen=0 on
+  // BOTH MP4 and PSO dumps while print/audio replies flow). Logs every
+  // non-romChunk command arrival. Strip with the other diags per gate #8.
+  if (data.cmd && data.cmd !== 'romChunk') {
+    self.__mbCount = (self.__mbCount || 0) + 1;
+    if (data.cmd !== 'input' || (self.__mbCount % 200) === 1) {
+      try { postMessage({ cmd: 'print', txt: '[mailbox-diag] n=' + self.__mbCount + ' cmd=' + data.cmd }); } catch (_) {}
+    }
+  }
   switch (data.cmd) {
     case 'romChunk':
       if (data.buf && data.buf.byteLength) {
