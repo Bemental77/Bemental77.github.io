@@ -81,7 +81,7 @@ void init_pif(struct pif *pif,
 
    for (i = 0; i < GAME_CONTROLLERS_COUNT; ++i)
    {
-      static  channels[] = { 0, 1, 2, 3 };
+      static int channels[] = { 0, 1, 2, 3 }; /* implicit int is an error in modern clang */
       init_game_controller(
             &pif->controllers[i], 
             (void*)&channels[i],

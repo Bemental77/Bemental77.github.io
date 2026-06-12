@@ -310,7 +310,7 @@ EXPORT void CALL inputControllerCommand(int Control, unsigned char *Command)
 int timeout = 0;
 
 extern void inputInitiateCallback(const char *headername);
-extern mouseRange;
+extern int mouseRange; /* defined in mymain.cpp; implicit int is an error in modern clang */
 
 static void inputGetKeys_reuse(int16_t analogX, int16_t analogY, int Control, BUTTONS* Keys)
 {
