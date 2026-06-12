@@ -405,7 +405,7 @@
       this.gainNode.connect(ctx.destination);
       this.audioBufferResampled = new Int16Array(Module.HEAP16.buffer, Module._neilGetSoundBufferResampledAddress(), 64000);
       this.audioReadPosition = 0;
-      var SLACK = 8000; // Int16 entries (~91 ms stereo); equilibrium latency ≈ SLACK+5000
+      var SLACK = 16000; // Int16 entries (~181 ms stereo) — must exceed the deepest main-thread stall the cushion should absorb
       var workletBacklog = 0, lastUnderruns = 0;
       ctx.audioWorklet.addModule('/n64/audio-worklet.js?v=' + Date.now()).then(function () {
         var node = new AudioWorkletNode(ctx, 'n64-audio', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2], processorOptions: { start: SLACK } });
