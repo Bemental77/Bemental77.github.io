@@ -74,20 +74,28 @@ for (const m of matches) {
 }
 
 // For each match, find the enclosing function (walk back to nearest stwu r1
-// prologue or just-after-blr boundary).
+// or mflr r0 prologue prefix).
 function findFunctionEntry(pc) {
     const sec = textSections.find(s => pc >= s.loadAddr && pc < s.loadAddr + s.size);
     if (!sec) return null;
     const off = sec.fileOff + (pc - sec.loadAddr);
-    for (let back = 4; back < 4096; back += 4) {
+    for (let back = 0; back < 4096; back += 4) {
         const off2 = off - back;
         if (off2 < sec.fileOff) break;
         const inst = readBE32(iso, off2);
         const op = (inst >>> 26) & 0x3F;
-        // stwu r1, neg(r1) — function prologue
+        // stwu r1, neg(r1) — function prologue body
         if (op === 37 && ((inst >>> 21) & 0x1F) === 1 && ((inst >>> 16) & 0x1F) === 1) {
+            // Walk back up to 2 more for mflr r0 / stw r0,4(r1) prefix.
+            for (let pre = 4; pre <= 8; pre += 4) {
+                const off3 = off2 - pre;
+                if (off3 < sec.fileOff) break;
+                if (readBE32(iso, off3) === 0x7c0802a6) return pc - back - pre;
+            }
             return pc - back;
         }
+        // mflr r0 alone (leaf or LR-saving entry without local frame)
+        if (inst === 0x7c0802a6) return pc - back;
     }
     return null;
 }

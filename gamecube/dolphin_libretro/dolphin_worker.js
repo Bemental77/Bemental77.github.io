@@ -29,6 +29,15 @@
   // expect to receive a 'load' postMessage with pthread setup data.
   // Skip the mem-init wait in that case.
   if (typeof self !== 'undefined' && self.name === 'em-pthread') {
+    // Bridge pthread-side stdout/stderr to the parent worker (which forwards
+    // to page console). Dolphin's main thread runs in a pthread spawned here;
+    // its LogManager fprintf(stderr, ...) writes go to this child's Module
+    // printErr, NOT to the parent shim's printErr. Without this override,
+    // every "Patching OSReport" / "symbols loaded" / OSREPORT print from
+    // Dolphin's LogManager is silently dropped under PROXY_TO_PTHREAD.
+    self.Module = self.Module || {};
+    self.Module.print    = function (t) { postMessage({ cmd: 'print', txt: '[dolphin:stdout] ' + t }); };
+    self.Module.printErr = function (t) { postMessage({ cmd: 'print', txt: '[dolphin:stderr] ' + t }); };
     importScripts('dolphin_worker_emcc.js');
     return;
   }
@@ -47,6 +56,14 @@
             return new URL(f, self.location.href).href;
           };
         }
+        // Bridge emscripten stdout/stderr to the page console. Without this,
+        // Dolphin's LogManager fprintf(stderr, ...) writes from
+        // ConsoleListenerNix don't reach the JS console under PROXY_TO_PTHREAD
+        // → no "Patching OSReport" / "5097 symbols loaded" / OSREPORT prints
+        // visible. With this, the same NOTICE-level lines that appear in
+        // native dolphin.log will appear in the page console too.
+        self.Module.print    = function (t) { postMessage({ cmd: 'print', txt: '[stdout] ' + t }); };
+        self.Module.printErr = function (t) { postMessage({ cmd: 'print', txt: '[stderr] ' + t }); };
         bootstrapped = true;
         postMessage({ cmd: 'print', txt: '[shim] mem-init received, importScripts dolphin_worker_emcc.js' });
         try {

@@ -26,6 +26,7 @@ constexpr u8 WASM_SEC_GLOBAL   = 6;
 constexpr u8 WASM_SEC_EXPORT   = 7;
 constexpr u8 WASM_SEC_ELEMENT  = 9;
 constexpr u8 WASM_SEC_CODE     = 10;
+constexpr u8 WASM_SEC_DATA_COUNT = 12;
 
 // WASM import/export kinds
 constexpr u8 WASM_IMPORT_FUNC   = 0x00;
@@ -181,6 +182,9 @@ namespace wop {
 	constexpr u8 sub_i64_trunc_sat_f32_u    = 0x05;
 	constexpr u8 sub_i64_trunc_sat_f64_s    = 0x06;
 	constexpr u8 sub_i64_trunc_sat_f64_u    = 0x07;
+	// Bulk-memory ops (also 0xFC prefix). memory.fill takes a memory index
+	// immediate (LEB128, 0 for the single imported memory).
+	constexpr u8 sub_memory_fill            = 0x0B;
 }
 
 class WasmModuleBuilder {
@@ -411,6 +415,19 @@ public:
 		for (u32 i = 0; i < n; ++i) emitLEB128(funcIndices[i]);
 	}
 
+	// --- Data count section (id 12) ---
+	//
+	// Required by the bulk-memory proposal whenever a code section uses
+	// memory.fill / memory.copy / data.drop. Declares the number of data
+	// segments the module contains; emitted between exports/start and code
+	// per the section-ordering rules. Pass 0 when the module has no
+	// data segments (the common case for JIT'd guest blocks).
+	void emitDataCountSection(u32 dataSegmentCount) {
+		beginSection(WASM_SEC_DATA_COUNT);
+		emitLEB128(dataSegmentCount);
+		endSection();
+	}
+
 	// --- Code section ---
 
 	void beginCodeSection(u32 funcCount) {
@@ -610,6 +627,16 @@ public:
 	void op_i32_trunc_sat_f32_u() { emitByte(wop::prefix_FC); emitLEB128(wop::sub_i32_trunc_sat_f32_u); }
 	void op_i32_trunc_sat_f64_s() { emitByte(wop::prefix_FC); emitLEB128(wop::sub_i32_trunc_sat_f64_s); }
 	void op_i32_trunc_sat_f64_u() { emitByte(wop::prefix_FC); emitLEB128(wop::sub_i32_trunc_sat_f64_u); }
+
+	// memory.fill: stack (dest:i32, byte:i32, len:i32) -> (). Fills `len`
+	// bytes at `dest` with the low 8 bits of `byte`. Traps if (dest+len)
+	// exceeds the memory size. Requires a data-count section (see
+	// emitDataCountSection below) per the bulk-memory spec.
+	void op_memory_fill() {
+		emitByte(wop::prefix_FC);
+		emitLEB128(wop::sub_memory_fill);
+		emitByte(0x00);              // memory index (single imported memory)
+	}
 	void op_f32_convert_i32_s()  { emitByte(wop::f32_convert_i32_s); }
 	void op_f32_convert_i32_u()  { emitByte(wop::f32_convert_i32_u); }
 	void op_f64_convert_i32_s()  { emitByte(wop::f64_convert_i32_s); }

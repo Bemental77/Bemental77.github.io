@@ -1,0 +1,308 @@
+# GameCube WASM — STATUS
+
+> Read FIRST every session. Update LAST. Every claim cites a command + output OR is hedged. No "should work" entries.
+
+> **Active task queue: `gamecube/docs/mp4-dsp-bringup/TASKS.md`** — tasks run IN ORDER; update its QUEUE STATUS block when a task's state changes. Next up: Task 1 acceptance closure (opinfo_gap.md still shows 18 MISSING-reachable in its summary; PC delta 706→698 unexplained), then Task 2 (conformance harness).
+
+---
+
+## Current wedge
+
+> **2026-06-12 (PSO HANDOFF FIXED — icbi was a silent nop; the game binary now RUNS and the frontier is measured throughput in the audio mixer.)** The switcher's park was `PPCHalt` (0x806c81ac, hand-disassembled): `__OSReboot` jumped into freshly-copied PsoV3.dol code at 0x8000c000 — the SAME addresses as the already-compiled first-stage program — and our icbi-as-nop left the STALE wasm blocks live; they ran, returned, halt. Fix (3 layers, Jit64 parity): icbi opinfo + FL_ENDBLOCK + interp route; `JitInterface::InvalidateICache*` → `jitwasm_invalidate_icache_range`; `JitWasm::InvalidateICacheRange` span-map range evict. **Post-fix: the park moved INTO PsoV3.dol — `HandleReverb` (0x803beefc+0x50c, pso.map) + do_src1/do_src2 = the audio-mixer data plane, with audio DMA alive and draining (AudioDMACallback n=192K, AID n=7K climbing).** PSO now spends its CPU budget servicing audio in real-emulated-time at interp-fallback speeds; video frame loop starves (video_cb=3/window). THE THROUGHPUT TARGET IS NAMED AND MEASURED: the psq_l/psq_st + op59/op63 FP fallback classes inside HandleReverb (same hot function as MP4's memo). MP4 regression clean (video_cb=3, GlobalCounter=12, 0 exc). Next: native psq family emit (GQR quantized load/store — Jit64 Jit_LoadStorePaired reference + the audit's GQR-speculation note), then op59/63 arith, measuring frames-per-probe after each landing.
+
+> **2026-06-11 (FINAL — EXHAUSTIVE JIT64 PARITY AUDIT LANDED + cycle accounting fixed.)** `docs/jit-correctness-rulebook/jit64_parity_audit_2026-06-11.json`: all 281 Jit64 per-op emitters + block mechanisms checked against powerpc-next with file:line evidence (154 ported / 74 interp-fallback / 33 absent / 8 diverges / 14 n-a-wasm). Real divergences: (1) FIXED — downcount was 1 cycle/instruction (JitWasm never requested `build_block_next`'s `out_cycles`; now charges the analyzer's `num_cycles` sum, Jit64 `js.downcountAmount` parity — MP4 regression-checked clean); (2) QUEUED — update-form stores commit RA even when the store faults (`jit_load_store.cpp:366-370` vs Jit64 `MemoryExceptionCheck`). The audit is the standing parity checklist — extend it, don't re-sample. **PSO current park (scaling-test-proven discrete, NOT speed): psov3 runs (DSP ROM-ucode re-init observed twice), presents plateau at 3 — next pin is inside psov3 early init, post-DSP-re-init.**
+
+> **2026-06-11 (LATE NIGHT — PAD STATE WAS HARDWIRED ALL-BUTTONS-PRESSED; one root fixed three symptoms across two games — commit 6d9fe28.)** PSO's deliberate `OSResetSystem(HOTRESET)` (AppSwitcher return-to-menu branch, pinned by [ax-reset] backchain + hand-disassembly of switcher.dol from the ISO FST), MP4's eternal GlobalCounter=1 park, AND MP4's alignment exception at 0x8041F368 were all downstream of `Pad::GetStatus` delivering `button=0x1f7f trig=(255,255)` on every poll. THREE stacked all-pressed defaults: page module `EmscriptenMain.cpp` `memset(g_pad_state, 0xff)` (CheckJoy/CheckKeyboard are stubs; `gamecube.html pollController` ships the buffer to the worker every 10ms, clobbering worker defaults), worker `EmscriptenWorker.cpp g_pad` 0xff init. Fixed at all three layers (page `HEAPU8.fill(0)` after `_get_ptr` covers the vendored `dolphin_libretro.wasm`, whose build recipe predates the repo's scripts — rebuilding that stub is open debt). **Post-fix clean build: PSO streams all 11 PsoV3.dol chunks (died at 4 before), zero PI_RESET writes, video_cb=3; MP4 GlobalCounter 1→12 and climbing, video_cb=3, alignment exception gone.** Eliminated en route (do not re-chase): guest cause-ACK clears of RST_BUTTON (diag count 0), Dolphin COMBO_RESET (exact-match never hit), dcbz_l/unknown-instruction raisers (no logs at crash time). The earlier "PSO is throughput-bound" claim was KILLED by its own scaling test (frames did not scale 3x with a 3x window) — the discrete-wedge-first rule holds again. Next: longer runs to find where each game settles (PSO post-psov3 handoff — the second "AppSwitcher executed" print hasn't appeared in-window yet; MP4 overlay progression), SAB input-stack recheck under released buttons, THEN frame-cadence measurement toward the ≥native bar.
+
+> **2026-06-11 (NIGHT — PSO UNWEDGED AND PRESENTING: video_cb count=3, double-buffered 640x480, boot reaches `SubApp filename: psov3.dol`.)** PSO's "Unhandled Exception 6" at __LCEnable+0x8C was a GENERIC regcache RMW coherence bug, pinned by the harness test `mfspr_interp_writeback_visible` (red→green) + native oracle (PSO boots clean in native Dolphin, 12s run): RMW emitters bind the DEST first (`Bind(ra, Write)` then `Bind(rs, Read)` — emit_logical_imm_simple/emit_andi_imm/emit_binop_x); on an UNASSIGNED reg the pure-Write Bind marked the wasm local `loaded` without emitting the lazy-load, so when dest==src (`mfspr r4,HID2; oris r4,r4,0x100F`) the same op's Read consumed the zero-initialized local instead of PowerPCState — the interp-fallback's gpr write was invisible, HID2 lost PSE/LSQE (stored 0x100F0000 instead of 0xB00F0000), and `IsInvalidPairedSingleExecution(dcbz_l)` (Interpreter.cpp:152) raised Program-6. Fix: lazy-load fires on first assignment for ALL bind modes, both RegCache and FPRRegCache (one redundant first-touch load is the price). Suite 35/35. MP4 regression-checked: video_cb=1, GlobalCounter=1 intact — and MP4 now progresses FURTHER, hitting the NEXT discrete wedge: **Unhandled Exception 5 (Alignment) SRR0=0x8041F368 DAR=0x80426C7E** ~50s in, post-first-frame. PSO research assets (workflow wf_b7a9b061-fe3): **`dolphin_captures/pso.map` = 27,714-symbol FULL game map** (use it, not tools/gpoe8p.map's 72 SDK syms) + `dolphin_captures/pso_dolphin.log` + `pso_profile.txt`; LCEnable is called from LCAlloc (game audio/DMA path, dolsdk2001 OSCache.c:464). Next queue: (1) MP4 alignment wedge at 0x8041F368, (2) SAB controller-input null-function (libretro input wiring dead-path), (3) throughput → frame streams.
+
+> **2026-06-11 (EVENING — FIRST FRAME PRESENTED: video_cb count=1, 640x480, pitch=2560, Present headless=0, pageerror=0.)** The video_cb=0 blocker was FOUR stacked roots, fixed in order (each pinned by its own probe evidence):
+> 1. **Backend selection**: `Libretro::Video::Init()` fallback set `MAIN_GFX_BACKEND="Null"` when the (Hardware-default, "Software"-option-_DEBUG-gated) renderer option found no hw context — clobbering EmscriptenWorker main()'s SetBase. Probe: `[ax-vbi] ActivateBackend name='Null'`. Fix: `__EMSCRIPTEN__` fallback = "Software Renderer" (Video.cpp).
+> 2. **Backend registration**: `VideoBackendBase.cpp` registered `SW::VideoSoftware` only `#ifdef HAS_OPENGL` (off under wasm) — the available list was effectively Null-only, so even the right name found nothing. Fix: register under `HAS_OPENGL || __LIBRETRO__` (libvideosoftware.a was already linked, dolphin_worker_link.sh:44).
+> 3. **GL-context crash**: with SW selected, `SWOGLWindow::Initialize → GLContextLR → GLExtensions::Init` hit `RuntimeError: null function` (retro get_proc_address never set). Fix: `__EMSCRIPTEN__` skip of the GL preview window (SWOGLWindow.cpp; IsHeadless/ShowImage null-guards).
+> 4. **Headless present + dead swap**: plain `SW::SWGfx` reports headless → `Presenter::Present` (Present.cpp:891) returned before ShowImage; the libretro SWGfx with the video_cb bridge existed (Video.h) but its only instantiation site (Main.cpp:235 post-EmuThread swap) NEVER executed under wasm (0 "g_gfx swapped" lines ever) — the dolphin-libretro fork's seam was lost in the 2026-05-29 re-extract. Fix: `SW::g_libretro_swgfx_factory` installed by Video_InitializeBackend, consumed inside `VideoSoftware::Initialize`; `Libretro::Video::SWGfx` now takes the real window, overrides `IsHeadless()=false`, skips the GL blit under `__EMSCRIPTEN__`, and pumps `video_cb` (worker side already complete: EmscriptenWorker.cpp:119 copies the framebuffer and posts {cmd:'render'}; XRGB8888 handshake pre-existing). Also: `[Core] GFXBackend` added to the worker-side Dolphin.ini (worker_funcs.js) as belt-and-braces.
+> **Present cadence is game-frame-bound**: Present n=1 fired at 45:42:205 immediately after `[ax-gates] GlobalCounter 0→1` at 45:42:073 — one completed game frame == one video_cb. The presentation pipeline is DONE; the remaining gap to a frame STREAM (and to the acceptance bar: in-game ≥100% native sustained) is game-frame completion rate = the known JIT throughput frontier (stfs/psq/FP-arith interp fallbacks per `mp4_wedge_is_throughput_2026_06_07` + the round-2 audit task list). NEXT: measure frames-per-probe on a longer run, then attack the largest interp-fallback class with the conformance harness guarding each emitter.
+> **Diag debt (gate #8)**: [ax-swgfx] (SWmain.cpp), ActivateBackend list diag (VideoBackendBase.cpp), backend= in Video.cpp:538, plus the long-standing [ax-*] inventory — strip before any perf verdict.
+
+> **2026-06-11 (LATER — minimumVcount wedge FIXED; lfs-EA theory REFUTED; root cause was the missing MSR.FP first-FP-op check.)**
+> The block below was wrong in its mechanism. The "red conformance test" `lfs_sda2_negative_offset` was red **by construction** (harness artifact): it asserted on the stfs's store, but stfs is interp-fallback (ppc_emit.cpp case 52) and the harness's `ppc_interp` stub is a NO-OP — and `emit_lfs` is slowmem-only, so the default `ppc_read32` stub (return 0) fed the lfs zeros regardless of EA. Rewritten as a valid repro (recording `ppc_read32` + f1 ps0/ps1 assertions): the lfs EA path is **CORRECT** (`read_addr=0x801d0008` exactly; f1=0x3FF0000000000000). Also disconfirming the EA theory: a 4-byte wrong-EA read of the magic's high word would store 0x43300000 (176.0f) — the observed 0x59800000 is f32 of the FULL double 2^52, only producible from stale f1.
+> **Real root cause, pinned from the live trajectory** (`/tmp/probe.log` wtraj tokens: `80009bd4` → vector `800` → handler chain → resume `80009bd8`): native FP emitters executed FP ops **without the MSR.FP check** (Jit64 parity gap — Jit.cpp:1104-1128). The native lfs ran before the thread's lazy FPU-context load; the interp-fallback stfs (Dolphin interp checks MSR.FP) then raised FPU-unavailable → vector 0x800 → `__OSLoadFPUContext` clobbered f1 with the stale saved context (f64 2^52) → SRR0-based re-execution resumed at the **stfs** (skipping the lfs) → stored 0x59800000; `__cvt_fp2unsigned(2^52)` saturated minimumVcount=0xFFFFFFFF.
+> **Fix landed:** first-FP-op-per-block MSR.FP guard in `build_block_next`'s per-op loop (ppc_emit.cpp; `Exceptions |= 0x40` Gekko.h:930, CHECK_EXC delivery, gather-drain early-exit; `ppc_off::EXCEPTIONS=0x2EC` added with layout citation). Tests: `lfs_msr_fp_disabled` (guard: load suppressed, Exceptions=0x40, next_pc=faulting op) red→green; `lfs_sda2_negative_offset` (enabled path, MSR.FP=1) green; suite 34/34.
+> **Post-fix probe (same diag build):** `[ax-minvc2] 0x0 -> 0x1` (was `0x0 -> 0xffffffff` every prior run); `[ax-gates] GlobalCounter=1` (first advance ever) with overlay transitions `curovl 0x000→0xffff→0x001, nextovl 0x001→0xffff` — boot overlay sequence loading. video_cb still 0 (count=0) — next blocker is the present chain (the still-pending g_gfx libretro-SWGfx swap fix named below), with GlobalCounter parked at 1 after overlay load (one [ax-gates] entry n=5 at 58:56:899, run ended 59:56 — whether =1 is "overlay frame loop running its own wait" or a new wedge is the next question). VI IRQ-raise still dominant (VI=258443/260000 at run end).
+
+> **2026-06-11 (SUPERSEDED — mechanism wrong, kept for the diagnostic-process record): the boot wedge is an `lfs` D-form FP-load EA bug.**
+> Causal chain, every link instrumented: HuSysInit's `minimumVcount = minimumVcountf = 1.0f` (init.c:76; retail asm init.s:65-68: `lfs f1,-0x7FF8(r2)` → `stfs` → `bl __cvt_fp2unsigned` → `stw`) executes with the **lfs reading the WRONG ADDRESS** — live evidence: minimumVcountf = 0x59800000 = float(2^52) = exactly the int-to-double magic constant residing 8 bytes BELOW the 1.0f in sdata2 (lbl_801D4960 vs lbl_801D4968), and minimumVcount = 0xFFFFFFFF = `__cvt_fp2unsigned` saturating the garbage. HuSysDoneRender's pacing loop (init.c:211, **unsigned** compare per asm) then waits for `delta < 0xFFFFFFFE` — forever. Main executes `VIWaitForRetrace` per retrace **correctly** (66+ verified completions via `[ax-recheck]`: r30 always rcount−1, caller always HuSysDoneRender+0x94) — the loop body works; the corrupted bound never lets it finish. GlobalCounter pinned at 0, no un-blank, no overlay, no frame.
+> **Repro:** `test_gekko_next` → `lfs_sda2_negative_offset` — **RED** (`stored=0x00000000` vs expected `0x3F800000`; exact retail bytes `0xC0228008, 0xD02D86E0`). Fix target: the lfs/D-form-FP-load EA path (jit_load_store/FP-load emit or its interp-fallback EA handling). Fix the emitter until this test is green, then full probe — expected cascade: pacing exits → SwapBuffers → `VISetBlack(FALSE)` → ACV lands → presents → (with the still-pending g_gfx-swap fix) video_cb.
+> **Exonerated en route (do not re-investigate):** VIWaitForRetrace loop ✓; wake re-check block ✓ (conformance-verified); scheduler wake/OSWakeupThread ✓; PE finish chain ✓; DSP-mail cadence ≈ native ✓; AID pacing ✓ (the "AID never fires" claim was a wrong-site census — see correction below); SI-pending-at-wake = hardware-coincident poll timing, benign; idle-skip ring (one-shot + streak-gate hardening kept); HuPadInit/PAD origin ✓ post controller fix.
+
+> **2026-06-11 (CORRECTION): the "AID never fires" claim below is a WRONG-SITE CENSUS.** The `[ei-trace] AID event fired DSPIntType=` diag instruments `GlobalGenerateDSPInterrupt` (DSP.cpp:384 — the CoreTiming "DSPint" EVENT entry, which only mail raises traverse); `UpdateAudioDMA`'s AID raise calls the member `GenerateDSPInterrupt(INT_AID, 0)` DIRECTLY (DSP.cpp:455), bypassing the diag. New `[ax-aid]` instrumentation proves the audio-DMA callback chain is healthy: `AudioDMACallback n=… period=121392 divisor=3372` firing continuously, guest's `Audio DMA configured: 20 blocks` enable landed → AID expected at ~200/s ≈ native (hedge: not yet measured at the true raise site), consistent with `aidh` (guest __AIDHandler PC hits) at 166K–304K per probe. **The starvation mechanism (main preempted at deterministic wake-depth ~33, never reaching the re-check, GlobalCounter=0) remains the verified wedge; the WHY is still open.** Next dig (one instrument): (1) move/duplicate the type census into the member `GenerateDSPInterrupt` (DSP.cpp:400) with type+`m_dsp_control.Hex`+PC, and (2) log the PI cause register in `[ax-park]` at READY transitions — naming the exact cause bits pending at main's rfi each wake. Then diff per-type cadence vs the native oracle log (`dolphin.log.first_frame_oracle`, which logs the same member… verify the native patch's site before comparing — the [axei] native diff instruments `GenerateDSPInterrupt` proper per axei-trace-instrumentation.patch).
+
+> **2026-06-11 (superseded in part): wedge refined — UNPACED MAIL LOOP because AID (audio-DMA) interrupts never fire.** Disproven en route (both fixes left in tree, no regression: probe profile unchanged): (a) one-shot idle-ring clear, (b) ring streak-gate (≥8 consecutive matches before downcount=0 — deterministic index-33 preemption persisted in 31/31 wake windows after each). The decisive native differential (`dolphin.log.first_frame_oracle`, instrumented build, full clean dump): native runs the SAME mail conversation (6,123 type-0x80 raises, starting at AX-init, some from inside HandleReverb) AND completes the wedge phase in 65ms — because native ALSO gets **5,774 type-0x8 AID raises (~192/s = 5ms audio-frame pacing)** while wasm has **ZERO AID raises ever**. Without AID pacing, MusyX's mail handshake with the AX ucode never goes quiet → external-int cause permanently pending → main starved at the rfi boundary. NEXT: instrument `AUDIO_DMA_CONTROL_LEN` writes (DSP.cpp:325-328 — does the guest's Enable land?), `AudioDMACallback` entries (SystemTimers.cpp:86 — is the self-rescheduling event ever kicked?), and the `m_audio_dma.AudioDMAControl.Enable` state at UpdateAudioDMA (DSP.cpp:435-455). Suspect class: yet another skipped-init (who first schedules m_event_type_audio_dma) or a lost MMIO enable write.
+
+> **2026-06-11: WEDGE = DSP-mail interrupt storm starving main at the rfi boundary.** Full causal chain, instrumented end-to-end (`[ax-park]` thread-context watch + `[ax-wake-traj]` 192-block post-wake dispatch traces, 26 windows): main parks in `VIWaitForRetrace` (re-check block 0x800C1544, verified correct in isolation — test_gekko_next `viwait_recheck_block` PASSES); every retrace wakes it; SelectThread dispatches it; after ~3 scheduler-unwind blocks the still-pending external interrupt preempts at the rfi boundary — **in 26/26 captured windows main NEVER reaches the re-check**. The pending cause: DSP-mail (`GenerateDSPInterrupt` type 0x80 only) re-asserts ~2× per service — wasm SET:CLR = 85,637:38,280 (≈2.2:1) vs native ≈1:1 (13,562:13,531) — so EXCEPTION_EXTERNAL_INT is effectively always pending and main makes zero net progress per wake (`GlobalCounter=0` forever, boot overlay never starts, `VISetBlack(FALSE)` never reached, video_cb=0). NOT wall-clock throughput — an interrupt-cadence/dispatch-priority starvation. Next dig: DSPHLE AX mail raise-site differential vs native (queue Task 5). Also fixed en route 2026-06-11: worker now declares SI port 0 as GC controller (all four ports were SIDEVICE_NONE — frontend contract gap; PAD origin acquisition verified working after fix via [ax-pad]). Known diag traps recorded below (capped watches; the SAB dump tool's MEM1 signature scan can land on the staged ISO — bridge `ram[]` watches are the only authoritative guest-memory reads).
+
+> **2026-06-10 (late): THE FIFO/PE WEDGE CLASS IS FIXED — see "Verified facts / Video-pipeline chain" below.** Root-cause chain: the worker frontend never fired libretro's `context_reset` → `VideoBackendBase::InitializeShared` never ran → (a) `FifoManager::RefreshConfig` never loaded → `m_config_sync_gpu_overclock` stayed at its 0.0f member default (Fifo.h:133) → `RunGpuOnCpu` tick budget `int(ticks*0)+debt < 0` forever → CP FIFO frozen at dist=0xbe0 → `BPMEM_SETDRAWDONE` never decoded → PE_FINISH never raised → DefaultThread parked on FinishQueue (the SelectThread spin at 0x800ba2f0); (b) `g_texture_cache` null → OOB crash at first EFB copy once the FIFO was unfrozen; (c) `CustomShaderCache` ctor hung spawning compiler threads under PROXY_TO_PTHREAD. Three fixes landed (worker ContextReset call; AsyncShaderCompiler zero-worker mode; the diagnostic chain). Post-fix probe: `PixelEngine::SetFinish n=1` fires, FIFO drains (dist=0x0, pointers advancing), DSP cause SETs 24K+/120s. Boot now grinds MusyX `HandleReverb` (top PCs 0x80113xxx) — the KNOWN FP-interp-fallback throughput limit (`mp4_wedge_is_throughput_2026_06_07`) is the next frontier, plus first-frame presentation (video_cb still 0). The sections below describe the pre-fix state.
+
+**`__OSInitAudioSystem` DSP-ready mailbox poll** — multi-block cycle at PCs:
+
+| PC | Symbol (per `~/gc_refs/marioparty4/config/GMPE01_01/symbols.txt`) |
+|---|---|
+| `0x800E4C5C` | poll-loop body (DSP mailbox status read at MMIO `0x0C00500A`) |
+| `0x800ECB60` | poll-loop branch target |
+| `0x800E4C60` | poll-loop epilogue |
+
+**Symptom:** WASM trajectory advances to the same point native does (per native MMIO sequence at `dolphin.log.preserved` line 62784, `48:59:988`), then the three PCs cycle indefinitely. Guest is reading mailbox status repeatedly, waiting for DSP-ready bit that never sets.
+
+**Evidence (per commit `f8c941d`, `probe_fix.js 60s` post-fix):**
+- 146 unique PCs touched (vs 142 pre-fix).
+- `retror` dropped from 65K → 113 — boot does real DSP-poll work per frame instead of idle spin.
+- Native MMIO sequence at native line 62784:
+  ```
+  48:59:947  [mmio-w] 0c003004 = 0xf0    pc=800e7970  PI_MASK
+  48:59:961  [mmio-w] 0c006430 = 0       pc=800ea9bc  SI
+  48:59:988  [mmio-r] 0c00500a (poll loop at 0x800e4c5c)
+  ```
+
+**Hedge:** A separate observation from this session (2026-06-10, commit `7d3edce`) found `SelectThread` spinning at `0x800BA2F0` with `DefaultThread` `WAITING` on `FinishQueue` (PE_FINISH IRQ never raised; `PE::SetFinish` n=0 vs `dolphin_gather_drain` n=23,333). This may be a LATER wedge state reached on different boot configs, OR the same wedge expressed at a different layer of the OS scheduler. Not yet resolved against the DSP-mailbox-poll framing. Reconcile before treating either as the canonical "current wedge."
+
+---
+
+## Verified facts
+
+Empirical observations, each with the command + commit that produced them. "Verified" = re-runnable from the cited command, not "I remember."
+
+### From commit `f8c941d` (2026-05-31, negx opinfo fix)
+- **negx (xo=104) + negxo (xo=360) added to `gamecube/bementalJIT/guests/powerpc-next/ppc_tables.cpp`.** Before: `SAB 0x800EB534 = neg. r5, r5` self-looped because `ppc_analyst.cpp:200-208` cuts the block on any `lookup_op_info()` miss; only `fnegx` was in the op-31 sub10 dispatch.
+- **Command:** `probe_fix.js 60s`. Pre: 142 PCs / stuck at `0x800EB534` / 16M dispatches. Post: 146 PCs / wedge cleared / new cycle at the DSP-mailbox-poll PCs above.
+- **Recurring-class lesson:** opinfo table and emit must stay in lockstep (`emit_negx` at `ppc_emit.cpp:155` existed and emitted correctly; the gap was opinfo recognition only). Same class as later opinfo gaps for addzex/addmex/subfzex/subfmex in commit `0a157cd` (per memory `opinfo_emit_must_match_table31`).
+
+### From commit `7d3edce` (2026-06-10, this session — "okdo")
+- **`gamecube/tools/dump_os_threads.mjs`** added (547 lines). Drives puppeteer against `gamecube.html`, scans SAB for MEM1 base via dual-signature (`GMPE01` ASCII at +0x00 + boot magic `0xC2339F3D` at +0x1C), walks `__OSActiveThreadQueue` per dolsdk `OSThread.h` offsets, resolves addresses against MP4 `symbols.txt`. Verified working end-to-end this session; produced empirically correct thread state at the wedge.
+- **OSThread struct layout cited from `~/gc_refs/dolsdk2001/include/dolphin/os/OSThread.h`:** `0x000 OSContext` (size 0x2C8), `0x2C8 state` (u16; 1=READY 2=RUNNING 4=WAITING 8=MORIBUND), `0x2D0 priority`, `0x2DC queue`, `0x2FC linkActive.next`, total 0x30C (padded to 0x310 in `.bss`).
+- **MP4 GMPE01_01 OS lowmem slots** (cited from MP4 `__OSThreadInit` asm at `~/gc_refs/marioparty4/build/GMPE01_01/asm/dolphin/os/OSThread.s:15-86`):
+  - `0x800000D4` `__OSCurrentContext`
+  - `0x800000DC` `__OSActiveThreadQueue.head`
+  - `0x800000E0` `__OSActiveThreadQueue.tail`
+  - `0x800000E4` `__gCurrentThread`
+- **MP4 GMPE01_01 thread storage** (per `symbols.txt`): `RunQueue` at `0x801A5418` (32×8 bytes), `IdleThread` at `0x801A5518` (size 0x310), `DefaultThread` at `0x801A5828` (size 0x310).
+- **IRQ-handler chain symbols** (per `symbols.txt`): `__DSPHandler = 0x800C7558` size 0x424 (registered for `__OS_INTERRUPT_DSP_DSP = 7` per `~/gc_refs/marioparty4/src/dolphin/dsp/dsp.c:46` and dolsdk `dsp.c:69`), `__AISHandler = 0x800C5F70`, `__AIDHandler = 0x800C5FEC`, `__VIRetraceHandler = 0x800C0B6C`, `SIInterruptHandler = 0x800D9040`, `__OSExceptionVector = 0x800B4BB8`, `__OSDispatchInterrupt = 0x800B7714`, `ExternalInterruptHandler = 0x800B7A58`, `SelectThread = 0x800BA1B8`.
+- **`_dolphin_get_ram_addr` / `_dolphin_get_ram_size` exports** added to `gamecube/dolphin-bridge/dolphin_jit_wimports.cpp` + `EXPORTED_FUNCS` in `dolphin_worker_link.sh`. Required because the re-extracted dolphin-src (per memory `dolphin_src_re_extracted_2026_05_29`) no longer publishes MEM1 base to `SAB[0x02500020/24/28]` from `JitWasm::Run` like the `.bak` build did.
+- **`get-ram-info` postMessage path remains broken** even after adding exports. Confirmed via diag: 184K worker→page messages received, 0 `cmd: 'ram-info'` among them. Workaround: `dump_os_threads.mjs` falls back to SAB signature-scan (`GMPE01`+magic).
+- **Block-cache diag counters added** to `gamecube/bementalJIT/src/block_cache.cpp` `dispatch_raw` for OS handler chain: `evec/dispi/exti/sel/dsph/aish/aidh/musy/spur/norm/prio/pthit/hcall/vih/sih`. PCs cited inline in the file from `~/gc_refs/marioparty4/build/GMPE01_01/asm/dolphin/os/OSInterrupt.s`.
+- **Task 1 (opinfo audit, 2026-06-10): 18 MISSING reachable opinfo entries closed.** See `gamecube/docs/opinfo_gap.md`. Probe 60s post-patch: 698 distinct PCs (vs 706 baseline, Δ=-8). wasm mtime `Jun 10 18:24:49 2026 17147102 /Users/caseybement/Bemental77.github.io/gamecube/dolphin_libretro/dolphin_worker_emcc.wasm`. New `block broken` markers: 0. Command: `ROM_IDX=0 PROBE_DURATION_MS=60000 node gamecube/tools/dolphin_render_probe.js`.
+
+### Task-1 variance check (2026-06-10, this session)
+- **Verdict: NOISE.** Re-ran the 60s probe twice on the Task-1 wasm: run1=699 distinct PCs (`/tmp/probes/var_run1.log`), run2=701 (`/tmp/probes/var_run2.log`); STATUS.md baseline 698; pre-Task-1 baseline 706. All within ±10 of 698. Total-dispatch spread 39.1M–40.5M (±3.5%). No regression from the 18 added opinfo entries.
+- **Metric definition.** "Distinct PCs" = unique `pc=0x[0-9a-f]{8}` values across ALL probe log lines (covers `[ax-ee]`, `[mp4-wedge-diag] block-compiled`, `[oslc-bypass]`, etc.). Not the probe's `jit_first count` headline — that has been 0 for several builds, the `[jit] FIRST` marker isn't currently emitted; `gamecube/tools/dolphin_render_probe.js:120` still looks for it. Compute: `grep -oE 'pc=0x[0-9a-f]{8}' <log> | sort -u | wc -l`.
+- **Disp-counts headlines.** run1: `musy=25681346 sel=7276927 dispi=502794 dsph=66192 vih=19266 sih=46917 aish=0 evec=0 total=39100000`. run2: `musy=26632247 sel=7538717 dispi=521339 dsph=68624 vih=19968 sih=48672 aish=0 evec=0 total=40500000`. The wall-clock jitter is the dominant variance driver.
+
+### [ax-cp] log channel fix (2026-06-10, this session)
+- **Bug:** the `[ax-cp]` CP/FIFO state diag I added in `dolphin_jit_wimports.cpp` (`dolphin_gather_drain` per-4096-drain + `dolphin_get_cp_state` accessor) used `NOTICE_LOG_FMT(COMMANDPROCESSOR, ...)`. The probe captures only `N[PowerPC]:` channel — confirmed empirically: 0 `[ax-cp]` lines in `/tmp/probe.log` despite `[ax-pe] n=15394817` total drains in 60s.
+- **Fix:** changed both NOTICE_LOG calls to `POWERPC` channel. Edit applied to `gamecube/dolphin-bridge/dolphin_jit_wimports.cpp:348, 403`. **Rebuilt + confirmed 2026-06-10** (wasm mtime Jun 10 19:18, link_exit=0): 3301 `[ax-cp]` lines in 60s probe. Late-probe sample: `@drain=13516801 gp_link=1 gp_read=1 bp_en=0 dist=0xbe0 wptr=0x313840 rptr=0x312c60` — CP FIFO linked+reading with a stable 0xbe0-byte backlog (wptr/rptr frozen across consecutive drains). Early-probe (`@drain=1`): all-zero CP state. Not yet interpreted; raw observation only.
+- **Same rebuild sanity:** 693 distinct PCs (within ±10-of-698 noise band per variance check below), `block broken`=0, disp-counts `total=37.1M sel=6.9M musy=24.3M dispi=476K dsph=62696 vih=18276 sih=44442 aidh=26405 aish=0 evec=0` — profile consistent with var_run1/2. FL_FLOAT_DIV-drop patch (ppc_tables.cpp:162-165) included in this build; no regression observed. Command: `ROM_IDX=0 PROBE_DURATION_MS=60000 node gamecube/tools/dolphin_render_probe.js > /tmp/probe.log 2>&1`.
+
+### Wedge profile observation (2026-06-10, this session)
+- `[ax-ee] CheckExternalExceptions excp=0x4 msr.EE=0` cycles **72M times** in 60s, with PCs concentrated in `0x80113868–0x801139BC`. EE-disabled spin with external IRQ pending = the classic IRQ-unserviced class (per memory `feedback_isr_not_delivered_pattern` and `mp4_irq_unserviced_wedge_2026_06_10`).
+- This means the **"Current wedge: OSInitAudioSystem DSP-mailbox poll at 0x800E4C5C" framing above is stale.** The wedge has moved past the f8c941d state into a region in `0x8011XXXX`. Symbol resolution against MP4 `~/gc_refs/marioparty4/config/GMPE01_01/symbols.txt` not yet done. Reconcile with the `SelectThread`-at-`0x800BA2F0` hedge before declaring the new canonical wedge.
+
+### Carryover 2: opinfo flag-mismatch triage (2026-06-10, this session)
+
+Triaged 5 classes of bementalJIT-vs-Dolphin opinfo divergences from `gamecube/docs/opinfo_gap.md` PRESENT_FLAG_MISMATCH section against the live emit/analyze pipeline. Workflow run-id `wf_4afa0972-15c`, 6 agents, 375K tokens.
+
+**FP load flag deltas (lfs/lfd/lfdu/psq_*) — COSMETIC, defer.**
+- lfs/lfd `FL_IN_A` (Dolphin) vs `FL_IN_A0` (bementalJIT): bementalJIT is **semantically correct** — Dolphin's own `Helper_Get_EA` at `gamecube/dolphin-src/Source/Core/Core/PowerPC/Interpreter/Interpreter_LoadStore.cpp:21-24` implements rA-or-zero, which is what `FL_IN_A0` documents (`gamecube/bementalJIT/guests/powerpc-next/common/op_info.h:22`). emit_ea_d_form (`jit_load_store.cpp:56-66`) and the analyzer FL_IN_A0 branch (`ppc_analyst.cpp:100-106`) both handle rA==0 correctly. No change.
+- lfd/lfdu missing `FL_IN_FLOAT_D`: correctness preserved by FPRRegCache::Bind lazy-load of ps1 (`fpr_reg_cache.cpp:86-127`); minor prologue-preload perf miss possible. Defer until FPR prologue-preload is measured as the bottleneck.
+- psq_l/lu/st/stu missing `FL_PROGRAMEXCEPTION`: inert — interp-fallback (`ppc_emit.cpp:325-329`) and FL_LOADSTORE|FL_USE_FPU already drive canCauseException (`ppc_analyst.cpp:92-94`).
+
+**dcb*/icbi flags=0 — ANALYZER-ONLY, defer (latent).**
+- All six of `dcbst/dcbf/dcbi/icbi/dcbt/dcbtst` map to a single shared `nop` opinfo with flags=0 (`ppc_tables.cpp:237`, dispatch at `:370-373`) and emit nothing (`ppc_emit.cpp:259-266`). Zero divergence today because Phase 1 powerpc-next has no reorder/swap pass (`ppc_analyst.cpp:3-6`).
+- Becomes a real bug the moment a Dolphin-style reorder pass is ported — Dolphin gates swap-safety on `canCauseException` (`PPCAnalyst.cpp:243-244`), so a load/store could be swapped across these.
+- icbi missing `FL_ENDBLOCK` is moot until SMC handling lands (no `InvalidateICacheLine` in bementalJIT — separate gap).
+- dcbi missing `FL_PROGRAMEXCEPTION` (privileged-instruction trap) is moot — bementalJIT has no MSR.PR check anywhere.
+- **Tracking action**: document in `gamecube/docs/opinfo_gap.md` so the Phase 4 reorder-pass author flips these flags before enabling swap.
+
+**System-register flag deltas (mfmsr/mfspr/mftb/mfsr/mfsrin/rfi + mtspr/mtmsr) — ANALYZER-ONLY, defer.**
+- All `FL_PROGRAMEXCEPTION` gaps are inert because bementalJIT implements no MSR.PR privilege checking; the fallback-routed ops (mfsr/mfsrin/mftb/rfi) hit Dolphin's interpreter which does check privilege.
+- **Only real-risk item**: `mtspr` missing `FL_ENDBLOCK` (`ppc_tables.cpp:230`). bementalJIT's `IsBlockTerminator` already implements the Dolphin MMCR0/MMCR1 filter (`ppc_analyst.cpp:52-58`) but short-circuits at `FL_ENDBLOCK==0` — making the filter unreachable. mtspr to MMCR0/MMCR1/HID0/IBAT/DBAT never cuts the block via analyzer. Already noted in `bementaljit_v_jit64_audit_round2_2026_06_07.md`. Revisit if a downstream wedge after MP4 DSP-poll points at a mid-block HID0/BAT write.
+
+**Integer divide FL_FLOAT_DIV — COSMETIC, FIX APPLIED.**
+- divwx/divwux/divwox/divwuox carried `FL_FLOAT_DIV` (`ppc_tables.cpp:162-165`); Dolphin omits it (`PPCTables.cpp:253-256`). The flag has exactly one consumer (`canCauseException` at `ppc_analyst.cpp:92-94`), and integer div dispatches to native emitters (`ppc_emit.cpp:188-189`) so `emit_fallback` (the sole canCauseException reader at `ppc_emit.cpp:82`) is never invoked.
+- **Patch applied this session**: dropped `| FL_FLOAT_DIV` from all 4 entries at `gamecube/bementalJIT/guests/powerpc-next/ppc_tables.cpp:162-165`. Zero behavior change in this build, but eliminates a latent foot-gun if a future scheduler reads canCauseException to gate reordering. Aligns with `opinfo_emit_must_match_table31` rule.
+- Needs rebuild + a sanity probe to confirm no regression (combined with the `[ax-cp]` channel rebuild).
+
+**hwtests/cputest reuse — SURVEY, adapt-not-build.**
+- Devkit-PPC/libogc Wii-homebrew suite (`~/gc_refs/hwtests/toolchain-powerpc.cmake:8-10`); .elf binaries that boot on a Wii reporting results over TCP port 16784 (`~/gc_refs/hwtests/Readme.md:20-25`). NOT runnable host-side; not a runtime oracle.
+- **Reusable in source form**: C reference models (`rlw.cpp:10-23` `GetHelperMask`, `fctiw.cpp:12-66` `fctiw_expected`, `srawix.cpp:7-12` `GetCarry`); curated input vector tables (`pairedmove.cpp:386-447` ~50 f64 boundary cases: denormals, NaN edges, min-single-denormal, round-to-even); `Common/FloatUtils.h`'s `RoundingMode`/`RoundMantissaBits`/`TruncateMantissaBits`; enumeration patterns (`srawix.cpp:17-29` 0x1000 rand × 32 shifts, `rlw.cpp:33-50` (sh,mb,me) triples, `pairedmove.cpp:449-469` NI×Rounding×sign cross-iter).
+- Conformance harness in `gamecube/tools/conformance/` will **lift these as seed material + enumeration templates**, replace the Broadway-asm runtime with bementalJIT-emit-vs-Dolphin-interpreter in-process diff.
+
+### Task 2 conformance harness — integer corpus DONE, 0 failures (2026-06-10)
+- **New:** `gamecube/bementalJIT/tests/test_diff_next.cpp` (+ CMake target) — the DolphinPPCTests 3909-vector corpus replayed through the LIVE `powerpc-next` emitter via `build_block_next` (the production entry, `JitWasm.cpp:291`), with interp-fallback cases counted separately instead of false-failing. Runner: `node gamecube/tools/conformance/run.mjs test_diff_next` (waits for the TOTAL marker; `tests/run_browser_test.mjs`'s DONE_RE truncates at the first per-mnemonic `[PASS]` line — don't use it for the diff tests).
+- **Result:** `TOTAL: 3457 passed, 0 failed, 452 interp-fallback (of 3909; 0 compile-fail; 1672 PEM-referenced)` — log `/tmp/conformance/test_diff_next.log`. Wasm-side build: `emcmake cmake -S gamecube/bementalJIT -B gamecube/bementalJIT/build-emcc-test && emmake make -C gamecube/bementalJIT/build-emcc-test test_diff_next`.
+- **ORACLE ARTIFACT (major):** DolphinPPCTests passes SH/MB/ME into inline asm with `"r"` register constraints (`~/gc_refs/DolphinPPCTests/source/Integer.cpp:73-81`), but those are IMMEDIATE encoding fields — the console executed instructions whose immediates were gcc's register NUMBERS, not the printed values `parse_oracle.py` encodes from. Proof: `instruction_tests_console.txt:1144` records rD=0xE0000001 for printed (rS=0x1E, SH=0, MB=0, ME=10) whose architectural result is 0 — but exactly rotl(0x1E,28)&wrap-mask; SRAWI block records rD=1 for 0x7FFFFFFF at printed shifts 4/5/6 — only correct for shift 30, constant across rows. ALL 1010 prior failures (RLWIMI 249×2, RLWINM 180×2, SRAWI 76×2) were this artifact — confirmed by identical counts from the legacy emitter control run. Fix: those families' expectations now computed in-harness from the decoded instr_word via PEM reference models lifted from `~/gc_refs/hwtests/cputest/rlw.cpp` (GetHelperMask) and `srawix.cpp` (GetCarry).
+- **Control run (legacy test_diff):** 2862 passed / 1047 failed — same RLW/SRAWI artifact counts, PLUS legacy-only real divergences: OE-forms fail 1–3 cases each (known XER.OV class per `bementaljit_audit_2026_06_01`) where powerpc-next falls back honestly; CMPI fail=1. Legacy is not the live path — logged, not chased.
+- **Fallback census (452):** every OE-form (ADDO/ADDCO/ADDEO/ADDMEO/ADDZEO/SUBFO/SUBFCO/SUBFEO/SUBFMEO/SUBFZEO/MULLWO/DIVWO/DIVWUO/NEGO ± Rc) + SRAW/SRAW. (128×2) + SUBFME/SUBFME. — conformant-by-construction (production routes them to Dolphin's interpreter) and a ranked native-emit candidate list for throughput work.
+- **Remaining for Task 2 acceptance:** FP/PS coverage + RLWNM (absent from corpus). Maps to priority items 1, 4, 5 below. Branch + load/store covered by test_gekko_next (next entry).
+
+### Task 2 branch/load-store corpus (test_gekko_next) — FOUND 2 EMITTER BUGS, 1 fixed, 1 pinned-red (2026-06-10)
+- **New:** `gamecube/bementalJIT/tests/test_gekko_next.cpp` — port of test_gekko's 31-test branch/load-store/ALU corpus to `build_block_next`. Run: `node gamecube/tools/conformance/run.mjs test_gekko_next`. INITIAL_MEMORY=64MB required (see LR-ring note below).
+- **BUG 1 (FIXED, shipping): fastmem-guard unsigned wrap on degenerate ram_size.** `emit_fastmem_guard`'s bound `ram_size - (access_bytes-1)` wraps when ram_size < access width → every EA admitted to the fast path → host address `(EA & mask) + base` aliases low linear memory (observed as address-zero heap corruption). Fix at `jit_load_store.cpp` emit_fastmem_guard head: compile-time constant-false guard → trampoline-only. Inert on real configs (ram_size=24MB); probe post-fix: 697 distinct PCs (in 693–706 band), `block broken`=0, disp profile in band (`sel=7.35M musy=25.9M dispi=508K total=39.5M`).
+- **BUG 2 — FIXED 2026-06-10 (conditional epilogue, v2).** After the last op (compile-time gated: natively-emitted, non-branch), emit `if (ctx.PC == op.address) ctx.PC = op.address + 4` — advances only when nothing inside the op's emitted code redirected PC, which is what v1's unconditional store broke. Evidence: test_gekko_next `31 passed, 0 failed`; test_diff_next `3457/0/452` unchanged; two 60s probes reach the SAME wedge (top PC 0x800ba2f0 SelectThread + 0x80113xxx EE-spin region, healthy disp profile `main=52 huprc=17 omwatch=4`, sel=6.6-7.1M musy=23.1-24.9M, block_broken=0). Distinct PCs 688/676 vs pre-fix 693-706 — consistent with boundary re-dispatch PCs no longer existing (hedge: not isolated from wall-clock variance). Original record kept below.
+- **BUG 2 original record (historical): non-branch-terminated blocks return the LAST op's address as next_pc.** Pre-op set_pc writes op.address; native non-branch emitters never advance PC; epilogue returns ctx PC → `JitWasm.cpp:235` (`ppc_state.pc = next_pc`) re-dispatches AT the already-executed boundary op → **boundary-op double-execution at every decode-cap cut** (non-idempotent cases: stwu/lwzu double rA-update, MMIO store double-fire). Legacy build_block returns the +4 fallthrough (test_gekko asserts it; suite green on legacy).
+  - **Candidate fix REGRESSED boot** (bisected, one change at a time): unconditional `set_pc(op.address+4)` after a native non-branch last op → probe collapsed to 27 PCs, all handler counters 0, and a +4 block-compile WALK through low memory (blocks at 0x17ec/0x17f0/... ~10K handles). Mechanism (unverified, best hypothesis): the store clobbers PC values written INSIDE the last op's emitted code by host imports (check_exc exception vectors, interp side effects) which the load-PC epilogue previously respected. Reverted via `if (false && ...)` at the `BISECT 2026-06-10` comment in ppc_emit.cpp's emit loop.
+  - **Next design:** conditional epilogue — load PC; if PC == last.address then PC = last.address+4; return PC. Compile-time gated to native-non-branch last op (so self-loop branches, which legitimately set PC == own address, are untouched). Then re-run: test_gekko_next must go 31/31 AND probe must stay in the 693–706 band.
+  - **Pinned by tests:** with the revert, test_gekko_next = `8 passed, 23 failed` — the 23 fails are this bug's signature (every test whose block ends in a non-branch op asserts next_pc=+4). Do NOT "fix" the tests; fix the emitter.
+- **LR-shadow-ring diag is baked into production blocks:** every LK=1 branch / blr emits absolute-address stores at SAB `0x026B0500/0x026B0540` (`jit_branch.cpp:63-68`, emit_blr_push/emit_blr verify). In a non-SAB env (<40.5MB memory) every bl/blr block traps. Gate-#8 concern: this is permanent per-block instrumentation in shipping code — candidate for a compile-time flag when the LR-mismatch investigation closes.
+- **Final shipping-config numbers (2026-06-10):** test_diff_next `3457 passed, 0 failed, 452 interp-fallback`; test_gekko_next `8 passed, 23 failed` (all 23 = BUG 2 signature); probe 697 PCs / block_broken=0 / profile in band. wasm `Jun 10 20:1x`, link_exit=0.
+
+**Task 2 priority order** (from synthesis — opinfo_gap real exposure, hwtest seed material, and historical regression class together):
+1. lfd / lfdu — FPR lazy-load lane semantics correctness-critical; load-bearing for the MP4 wedge per `mp4_wedge_is_throughput_2026_06_07`.
+2. srawi / srawix — XER.CA generation; SAB SITransferNext used the addzex/subfzex regression class.
+3. rlwimi / rlwinm / rlwnm — bit-field workhorse with full hwtest model lift.
+4. ps_merge00/10/01/11, ps_mr, ps_neg, ps_abs — paired-singles aliasing regression class (commit `6f7554a`).
+5. fctiw / fctiwz / frsp — FP round/convert with FPSCR-driven rounding; hwtest reference model.
+6. divwx / divwux / divwox / divwuox — lock in the FL_FLOAT_DIV-drop patch.
+7. mtspr / mfspr direct-SPR pairs — hot in OS context-switch; verifies the FL_ENDBLOCK-gap doesn't break round-trip.
+8. cmpwi / cmpw / cmplwi / cmplw — CR0 lt/gt/eq/so; `bementaljit_audit_2026_06_01` cr_encode SO/OV swap class.
+
+---
+
+## Dead ends — do NOT retry
+
+Each entry: what was tried, why it was wrong, command that disproved it.
+
+### "1.6% DSP drain rate → MMIO ACK not draining PI cause"
+- **Asserted (2026-06-10 mid-session):** wedge is `__DSPHandler` ACK write not reaching PI cause clear.
+- **Actually false:** `grep -c 'PI::SetInterrupt CLR cause=0x40'` returned 125 ONLY because `ProcessorInterface.cpp:259` rate-limits CLR logs to every 64th call (`& 0x3F == 1`). The actual counter value in the log line is `n_false`: WASM probe showed `n_true=7834 n_false=7850` → real drain ~100%, matching native's 99.77% (`13531 CLR / 13562 SET` in `dolphin.log.pre_native_mp4_boot`).
+- **Lesson:** any time a count comes from `grep -c`, verify against a non-rate-limited counter in the log lines themselves before building a theory on the ratio.
+
+### "VI is over-firing 64–111× native" → VI emulation bug
+- **Asserted:** `VI=693899` in `[mp4-wedge-diag] IRQ-raise` summary vs native `mask=0x100 set=true` = 98 over 30s.
+- **Actually false:** the wasm `VI=` counter at `ProcessorInterface.cpp:218` increments **every `SetInterrupt(VI, true)` call**, including idempotent re-asserts when cause is already set. `VideoInterface.cpp:1001` calls `UpdateInterrupts()` every half-line tick. So 693K is half-line ticks, not IRQ edges. Recomputed rate: 693899/150s ≈ 4624/sec, vs NTSC native 31,500 half-lines/sec → emulated time runs **~26% of native rate**, not over.
+- **Lesson:** Native and WASM counters use different instrumentation points (`PI::SetInterrupt n=...` vs `[mp4-wedge-diag] IRQ-raise total=...`). Confirm both counters semantically equivalent before comparing.
+
+### "mtdec missing DecrementerSet → DSP scheduling broken"
+- **Source of claim:** `bementaljit_v_jit64_audit_round2_2026_06_07` memory line 22 (Agent 6).
+- **Actually false:** `gamecube/bementalJIT/guests/powerpc-next/jit_system_registers.cpp:53-68` shows `spr_is_direct(22)` returns `false` → mtspr DEC falls through to `WIMPORT_INTERP` (line 190-202) with full `rc.Flush(ctx_ptr) + frc.Flush(ctx_ptr) + WIMPORT_INTERP + ReloadAll` bracketing. `WIMPORT_INTERP=6` → `dolphin_interp` at `gamecube/dolphin-bridge/dolphin_jit_wimports.cpp:291` → `Interpreter::SingleStepInner` → `Interpreter::mtspr` case `SPR_DEC` at `Interpreter_SystemRegisters.cpp:433-441` calls `interpreter.m_system.GetSystemTimers().DecrementerSet()`. Agent 6 was wrong; the same audit memory's "What the audit confirmed CORRECTLY" section (line 42) already says so.
+- **Lesson:** audit memory entries can have contradictory findings. Always verify against current code before treating audit claims as fact.
+
+### `build_and_probe.sh` wrapper
+- Deleted by user directive 2026-05-30 (per memory `feedback_no_build_and_probe_wrapper_2026_05_30`). Do NOT re-introduce. Three discrete foreground steps for GameCube:
+  1. `source emsdk/emsdk_env.sh`
+  2. `cd gamecube/dolphin-src/build-wasm && emmake make dolphin_libretro -j4`
+  3. `bash gamecube/dolphin-bridge/dolphin_worker_link.sh`
+- Preflight hook still suggests it on every Bash call. IGNORE the hook.
+
+### `dolphin_get_ram_addr` → `Module._dolphin_get_ram_addr` → `'get-ram-info'` postMessage handshake
+- **Path:** added `_dolphin_get_ram_addr` C export + EXPORTED_FUNCS, but `case 'get-ram-info'` in `worker_funcs.js` either never fires or its `postMessage({cmd:'ram-info'})` never reaches the page listener.
+- **Diag:** 184K worker→page messages received in `dump_os_threads.mjs` test run, **0** with `cmd === 'ram-info'`. Last 20 cmds all `"print"`.
+- **Workaround:** dual-signature SAB scan (`GMPE01` + magic `0xC2339F3D`). Reliable; produces correct MEM1 base.
+- **Not yet root-caused.** Don't restart the post-message investigation unless someone needs the path for a non-walker use case.
+
+---
+
+## Probe commands — exact invocations
+
+### Boot probe (Node + puppeteer)
+**Current canonical name:** `gamecube/tools/dolphin_render_probe.js` (the `probe_fix.js` referenced in the f8c941d commit message no longer exists; same role).
+```bash
+# Standard 60s probe against MP4 (ROM_IDX=0):
+ROM_IDX=0 PROBE_DURATION_MS=60000 node gamecube/tools/dolphin_render_probe.js > /tmp/probe.log 2>&1
+
+# Extract disp-counts breakdown:
+grep "mp4-wedge-diag.*disp-counts" /tmp/probe.log | tail -1
+
+# DSP IRQ SET/CLR (NOTE: CLR is rate-limited; read n_false in log line):
+grep -E "PI::SetInterrupt (SET|CLR) cause=0x40" /tmp/probe.log | tail -2
+```
+
+### OS thread walker
+```bash
+# Capture OS thread state at the wedge (~60s after btnStart):
+ROM_IDX=0 OS_DUMP_AT_MS=60000 OS_DUMP_TIMEOUT_MS=120000 \
+  node gamecube/tools/dump_os_threads.mjs
+
+# Override symbol map:
+node gamecube/tools/dump_os_threads.mjs --symbols /path/to/some.symbols.txt
+```
+
+### MEM1 region dumps
+```bash
+# Dumps 4 region files into /tmp/wasm-mem1-*.bin
+ROM_IDX=0 node gamecube/tools/dump_wasm_mem1.mjs
+```
+
+### Build (three foreground steps; NO wrapper)
+```bash
+cd /Users/caseybement/Bemental77.github.io
+source emsdk/emsdk_env.sh
+cd gamecube/dolphin-src/build-wasm && \
+  /Users/caseybement/Bemental77.github.io/emsdk/upstream/emscripten/emmake make dolphin_libretro -j4
+cd /Users/caseybement/Bemental77.github.io && \
+  bash gamecube/dolphin-bridge/dolphin_worker_link.sh
+```
+
+### Native Dolphin oracle
+- Native build runs locally. Per `feedback_native_dolphin_short_runs`: ≤10s runs, init completes in 1-2s.
+- Native log: `~/Library/Application Support/Dolphin/Logs/dolphin.log.preserved` (18MB, 2026-05-28; the older comprehensive log).
+- More recent native run: `~/Library/Application Support/Dolphin/Logs/dolphin.log.pre_native_mp4_boot` (6.5MB, 2026-06-07; MP4 boot with `[axei-trace]` instrumentation; covers 30s emulated).
+
+---
+
+## Reference assets
+
+### Decomp + SDK source
+- **`~/gc_refs/marioparty4/`** — MP4 USA Rev 0 + Rev 1 (GMPE01_00, GMPE01_01) WIP decomp (upstream `github.com/mariopartyrd/marioparty4` at `814c28a PAL: 100% Match (#638)`).
+  - `src/` — partial decomp C source.
+  - `build/GMPE01_01/asm/dolphin/os/*.s` — split asm with absolute PCs (e.g., `OSInterrupt.s`, `OSThread.s`).
+  - `config/GMPE01_01/symbols.txt` — **7721 lines (Name = .section:0xADDR; 7644 unique, 3469 functions — recounted 2026-06-10; the prior "7607" was wrong)**. Authoritative for PC-to-symbol resolution.
+  - `extern/musyx/` — **EMPTY uninitialized submodule (0 files)**. Real MusyX oracles: 31 revision-exact split `.s` under `build/GMPE01_01/asm/musyx/`, plus `~/gc_refs/ttyd/libs/musyx/` full source as proxy.
+  - `orig/GMPE01_01/sys/main.dol` + 99 retail `.rel` under `orig/GMPE01_01/files/dll/` — retail-binary oracle; with vendored `build/binutils/powerpc-eabi-objdump` = complete offline disassembler for any symbols.txt PC.
+  - `src/dolphin/` — MP4's own vendored SDK source (os/dsp/exi/si/thp) — outranks dolsdk2001 for byte-level questions; **dolsdk2001 has NO src/exi and NO src/si** (use ttyd/libs/dolsdk2004 for those).
+- **Full verified asset inventory (2026-06-10 6-agent sweep): `gamecube/docs/REFERENCE_ASSETS.md`** — SDK shelves, all ROMs+IPL, every symbol map, oracle GDB toolchain + port map, hwtests/DolphinPPCTests, demos.
+- **`~/gc_refs/dolsdk2001/`** — Canonical OS-source for any GameCube guest-OS question. Per memory `feedback_gc_refs_dolsdk_is_canonical_os_source_2026_05_28`: always grep here FIRST for OS symbols.
+  - `include/dolphin/os/OSThread.h` — OSThread/OSThreadQueue struct definitions.
+  - `include/dolphin/os/OSInterrupt.h` — `__OS_INTERRUPT_*` enum.
+  - `src/os/OSInterrupt.c:359 __OSDispatchInterrupt`, `:496 ExternalInterruptHandler`, `:6 ExternalInterruptHandler` (asm thunk).
+  - `src/os/OSThread.c` — RunQueue + scheduler.
+  - `src/os/OSContext.c:8` — `__OSCurrentContext` at lowmem `0x800000D4`.
+  - `src/dsp/dsp.c:69` — `__OSSetInterruptHandler(7, __DSPHandler)`.
+  - `src/dsp/dsp_task.c:18 __DSPHandler`.
+- **`~/gc_refs/ttyd/libs/musyx/`** — Full MusyX source (proxy for MP4's missing copy).
+
+### Test ROM
+- **`gamecube/roms/MarioParty4.bin.parta{a..f}`** — split chunks (deployable to GitHub Pages, vs LFS `.iso` pointer per memory `feedback_split_rom_parts_load_bearing_2026_05_29`). Reassemble: `cat parta{a..f} > /tmp/MarioParty4.iso`. GameID via `xxd -l 8 /tmp/MarioParty4.iso` → `GMPE01\x01` (USA Rev 1).
+- Also lives at `~/gc_refs/marioparty4/orig/GMPE01_01/MarioParty4.iso` after `cp` for decomp builds.
+- **MP4 image is TRIMMED** (598,382,592 B vs full 1,459,978,240 B disc) — DVD reads past the trim boundary diverge from a full dump. SA2B/PSO split sets (parts a..**q**) are full-size; PSO is **Rev 2**.
+- **ROM_IDX mapping** (gamecube.html:162-165): 0=MP4, 1=SA2B, 2=PSO, 3=240pSuite.
+- **`gamecube/IPL.bin`** (2MB, LFS): embedded into wasm FS at link (`dolphin_worker_link.sh:108`) AND runtime-fetched (`worker_funcs.js:125-152`); embed re-bakes only on relink. **Native Dolphin has NO IPL.bin** (user-dir region folders empty) → native HLE-boots while WASM real-IPL-boots; boot diffs can legitimately diverge at IPL/BS2 stage.
+
+### Native Dolphin logs
+- `~/Library/Application Support/Dolphin/Logs/dolphin.log.preserved` (18MB, 2026-05-28) — comprehensive boot log referenced by f8c941d (line 62784 = the DSP-poll `[mmio-r] 0c00500a` at `48:59:988`).
+- `~/Library/Application Support/Dolphin/Logs/dolphin.log.pre_native_mp4_boot` (6.5MB, 2026-06-07) — MP4 boot with `[axei-trace]` PI instrumentation. NATIVE DSP drain rate 99.77% (13531 CLR / 13562 SET, mask=0x40 set=true|false).
+- Logger.ini at `~/Library/Application Support/Dolphin/Config/Logger.ini` has **31 channels enabled** (incl. the 11 previously listed plus OSHLE/DVDInterface/Memmap/BOOT/FILEMON/CP/DSPINTERFACE/DSPMails/PE/SI/VI/MI/EXI...). Logs dir holds 26 snapshots total — see `gamecube/docs/REFERENCE_ASSETS.md`.
+- **Oracle instrumentation is an UNCOMMITTED diff in `~/gc_refs/dolphin-upstream`** (eb44b64 + [axei-trace] across 5 files — produced pre_native_mp4_boot). Do NOT checkout/clean that tree. Preserved: `gamecube/docs/native-oracle-complete-dump/axei-trace-instrumentation.patch`. (`~/gc_refs/dolphin` is the pristine NEWER clone — naming is inverted.)
+- Oracle live-verified 2026-06-10: Dolphin 2603a `-b -e /tmp/MarioParty4.iso` boots in ~9s (apploader OSREPORT_HLE + "Dolphin OS $Revision: 54"). GDB drivers/launchers + their inconsistent port defaults (24689/9090/9091): see REFERENCE_ASSETS.md.
+
+### Build artifacts
+- `gamecube/dolphin_libretro/dolphin_worker_emcc.{js,wasm,worker.js}` — final wasm output.
+- `gamecube/dolphin_libretro/dolphin_worker.js` — outer shim (handles `mem-init` postMessage from page, then `importScripts(dolphin_worker_emcc.js)`).
+- `gamecube/dolphin-bridge/worker_funcs.js` — `--post-js` bundled into worker; outer `self.onmessage` dispatcher.
+- `gamecube/dolphin-bridge/dolphin_jit_wimports.cpp` — WIMPORT callback bridge (read/write/interp/check_exc/break_block/hle/msr_updated/gather_drain/get_ram_addr/get_ram_size).
+
+### Memory (`~/.claude/projects/-Users-caseybement-Bemental77-github-io/memory/`)
+Per CLAUDE.md gates: behavioral rules + recent project notes. Most relevant for this work:
+- `feedback_no_dolphin_patching` — observation-only patches to dolphin-src (`[ax-*]` prefix) are established precedent; FIX patches go in bridge/JIT.
+- `feedback_no_build_and_probe_wrapper_2026_05_30` — three discrete foreground build steps.
+- `feedback_throughput_assertion_pattern` — never claim "throughput" or "slow loop" without disasm + reg-delta + emitted-wasm cite.
+- `mp4_irq_unserviced_wedge_2026_06_10` — earlier session's IRQ analysis (now partially superseded by 1.6%-drain retraction; see Dead ends).
+- `feedback_use_all_oracles_first` — inventory native/decomp/symbols BEFORE adding wasm instrumentation.
+
+---
+
+## Standing rules
+
+- **Read this file first every session. Update LAST.**
+- Every claim cites a command + output, or is hedged ("haven't verified, but...").
+- One wedge class per session. Do not chase side quests.
+- Commit messages: symptom → root cause → fix → empirical before/after (see f8c941d for the template).
+- "Current wedge" entry is single-PC-class. When the wedge moves, move it AND record the prior class under Verified facts (with the command that proved it moved).

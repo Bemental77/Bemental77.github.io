@@ -159,8 +159,10 @@
   const ROM_ROOT = '/gamecube/roms/';
   function chunkRange(base, lastLetter) { var urls = []; for (var i = 'a'.charCodeAt(0); i <= lastLetter.charCodeAt(0); i++) { urls.push(ROM_ROOT + base + '.bin.parta' + String.fromCharCode(i)); } return urls; }
   const ROMS = [
+    { label: 'Mario Party 4', base: 'MarioParty4', chunks: chunkRange('MarioParty4', 'f') },
     { label: 'Sonic Adventure 2 Battle', base: 'SonicAdventure2Battle', chunks: chunkRange('SonicAdventure2Battle', 'q') },
-    { label: 'Phantasy Star Online Episode I & II Plus', base: 'PhantasyStarOnline1And2Plus', chunks: chunkRange('PhantasyStarOnline1And2Plus', 'q') }
+    { label: 'Phantasy Star Online Episode I & II Plus', base: 'PhantasyStarOnline1And2Plus', chunks: chunkRange('PhantasyStarOnline1And2Plus', 'q') },
+    { label: '240pSuite (homebrew)', base: '240pSuite-1.10b', chunks: [ROM_ROOT + '240pSuite-1.10b.dol'], ext: '.dol' }
   ];
   var ROM_NAME = ROMS[0].base, ROM_CHUNKS = ROMS[0].chunks;
   const KEYMAP = { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', a: 'x', b: 'z', x: 's', y: 'd', l: 'w', r: 'r', z: 'e', start: 'v', select: 'c' };
@@ -227,6 +229,14 @@
     console.log('[ppc-worker-handshake] var_setup entered');
     pageLog('[ui] var_setup — initializing Dolphin libretro');
     padStatus1 = Module._get_ptr(0);
+    // All-released default. The vendored page module's main() memsets this
+    // buffer to 0xFF (EmscriptenMain.cpp:45 — every button pressed) and
+    // CheckJoy/CheckKeyboard are stubs, so without this fill the page ships
+    // all-buttons-held to the worker every 10ms. 2026-06-11 PSO root cause:
+    // the AppSwitcher saw its return-to-menu combo held and hot-reset the
+    // console mid psov3.dol load (fixed in C too; this covers the vendored
+    // dolphin_libretro.wasm until it is rebuilt).
+    Module.HEAPU8.fill(0, padStatus1, padStatus1 + 16);
     Module.SDL.defaults.copyOnLock = false;
     Module.SDL.defaults.opaqueFrontBuffer = false;
     // sharedMemory was allocated at page-load (above) and assigned to
@@ -2120,11 +2130,11 @@
     }
     pageLog('[rom] streamed ' + (total/1048576).toFixed(1) + ' MB — booting');
     setStatus('Booting emulator…');
-    dolphin_worker.postMessage({ cmd: 'romEnd', name: ROM_NAME + '.iso', size: totalSize });
+    dolphin_worker.postMessage({ cmd: 'romEnd', name: ROM_NAME + (window.__romExt || '.iso'), size: totalSize });
     setTimeout(pollController, 10);
     [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
   }
-  var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; SAVE_KEY = ROM_NAME + '.gcs'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /gamecube/dolphin_libretro/dolphin_libretro.js ...'); setStatus('Loading Dolphin libretro core...'); var s = document.createElement('script'); s.src = '/gamecube/dolphin_libretro/dolphin_libretro.js?v=' + Date.now(); document.body.appendChild(s); }
+  var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; window.__romExt = pick.ext || '.iso'; SAVE_KEY = ROM_NAME + '.gcs'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /gamecube/dolphin_libretro/dolphin_libretro.js ...'); setStatus('Loading Dolphin libretro core...'); var s = document.createElement('script'); s.src = '/gamecube/dolphin_libretro/dolphin_libretro.js?v=' + Date.now(); document.body.appendChild(s); }
   $('btnStart').addEventListener('click', startEmulator);
   const DB_NAME = 'GCWASMDB', STORE = 'GCWASMSTATES'; var SAVE_KEY = ROM_NAME + '.gcs';
   function openDB() { return new Promise((resolve, reject) => { var req = indexedDB.open(DB_NAME); req.onupgradeneeded = e => e.target.result.createObjectStore(STORE); req.onsuccess = e => resolve(e.target.result); req.onerror = () => reject(req.error); }); }

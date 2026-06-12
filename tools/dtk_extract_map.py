@@ -112,6 +112,17 @@ def main():
                     default='gamecube/dolphin-src/Source/Core/Core/HLE/HLE.cpp')
     args = ap.parse_args()
 
+    asm_path = Path(args.asm_dir)
+    if not asm_path.is_dir():
+        print(f'ERROR: --asm-dir {args.asm_dir} is not a directory. '
+              f'Run `dtk dol split` on the game DOL first to produce asm/*.s files.',
+              file=sys.stderr)
+        return 1
+    if not any(asm_path.glob('*.s')):
+        print(f'WARN: --asm-dir {args.asm_dir} contains no .s files. '
+              f'Expected output of `dtk dol split --asm <dir>`.',
+              file=sys.stderr)
+
     dtk_entries = parse_dtk_asm(args.asm_dir)
     print(f'dtk: {len(dtk_entries)} named entries from {args.asm_dir}',
           file=sys.stderr)

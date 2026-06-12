@@ -12,13 +12,20 @@ OUT=$ROOT/gamecube/dolphin_libretro
 
 source $ROOT/emsdk/emsdk_env.sh > /dev/null 2>&1
 
-EXPORTED_FUNCS='["_main","_malloc","_free","_dolphin_check_exc","_dolphin_break_block","_dolphin_hle_check","_dolphin_interp","_dolphin_read8","_dolphin_read16","_dolphin_read32","_dolphin_read_tb","_dolphin_write8","_dolphin_write16","_dolphin_write32","_load_iso","_load_state","_save_state","_state_size","_run_iter","_run_iter_batch","_get_pad_ptr","_dolphin_ppc_mailbox_init","_dolphin_ppc_mailbox_poll","_dolphin_routing_probe","_dolphin_test_compile_block","_dolphin_test_compile_block_addr","_dolphin_compile_block_real","_dolphin_test_state_set_pc","_dolphin_test_state_buf_addr","_dolphin_test_state_buf_size","_dolphin_state_export_production","_dolphin_state_export_production_addr","_dolphin_state_export_production_size","_dolphin_state_import_production","_dolphin_set_ppc_state_external_storage","_dolphin_get_ram_addr","_dolphin_get_ram_size","_dolphin_get_ram_mask","_dolphin_get_last_compile_cycles","_dolphin_mmio_mirror_init","_dolphin_mmio_mirror_sync","_dolphin_mmio_mirror_addr","_dolphin_mmio_cls16_addr","_dolphin_mmio_cls32_addr","_dolphin_mmio_mirror_sync_from_sab","_dolphin_mmio_drain_pending_writes","_dolphin_mmio_pending_writes_addr","_dolphin_mmio_pending_writes_capacity","_dolphin_ct_queue_init","_dolphin_ct_publish_dec","_dolphin_ct_remove_dec","_dolphin_ct_set_global_timer","_dolphin_ct_read_global_timer_lo","_dolphin_ct_read_global_timer_hi","_dolphin_ct_drain_pending_mask","_dolphin_ct_set_phase_flags","_dolphin_ct_get_phase_flags","_dolphin_service_iter","_dolphin_hle_fire","_dolphin_hle_table_addr","_dolphin_hle_table_slots"]'
+# Canonical minimum export set for the sanitized JIT-swap link. The prior fork
+# carried ~50 additional exports for Phase-IV ppc-worker mailbox, MMIO mirror,
+# CoreTiming publish/drain, HLE table, test-state harness, and routing probe;
+# all sanitized away in df03d80 / canonical bridge cleanup. Page-side calls to
+# any of those will fail with a clear "missing export" at runtime — that
+# becomes the trigger for canonical re-introduction work, file by file.
+EXPORTED_FUNCS='["_main","_malloc","_free","_load_iso","_load_state","_save_state","_state_size","_run_iter","_run_iter_batch","_get_pad_ptr","_dolphin_read8","_dolphin_read16","_dolphin_read32","_dolphin_write8","_dolphin_write16","_dolphin_write32","_dolphin_check_exc","_dolphin_break_block","_dolphin_hle_check","_dolphin_hle_fire","_dolphin_interp","_dolphin_msr_updated","_dolphin_gather_drain","_dolphin_get_ram_addr","_dolphin_get_ram_size","_dolphin_get_cp_state"]'
 
 EXPORTED_RUNTIME='["ccall","cwrap","getValue","setValue","addFunction","removeFunction","addRunDependency","removeRunDependency","FS","FS_createDataFile","FS_createPath","FS_createDevice","FS_createLazyFile","FS_createPreloadedFile","FS_unlink","callMain","ENV","stringToNewUTF8","HEAP8","HEAPU8","HEAP16","HEAPU16","HEAP32","HEAPU32","HEAPF32","HEAPF64"]'
 
 emcc \
   $BRIDGE/EmscriptenWorker.cpp \
   $BRIDGE/dolphin_stubs.cpp \
+  $BRIDGE/dolphin_jit_wimports.cpp \
   -I $BUILD/Source/Core \
   -I $SRC \
   -I $ROOT/gamecube/dolphin-src/Externals/Libretro/Include \
@@ -94,6 +101,7 @@ emcc \
   -sENVIRONMENT=worker \
   -sNO_EXIT_RUNTIME=1 \
   -sASSERTIONS=1 \
+  --profiling-funcs \
   -sALLOW_TABLE_GROWTH=1 \
   -Wl,--allow-multiple-definition \
   -sEXPORTED_FUNCTIONS="$EXPORTED_FUNCS" \

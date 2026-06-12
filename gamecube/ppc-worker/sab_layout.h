@@ -298,7 +298,7 @@ struct MmioCellDesc {
 };
 
 // ---- CoreTiming shared event queue (Item 7 Phase I) ------------------------
-// See gamecube/notes/item7_coretiming_design.md for the full design.
+// See gamecube/docs/designs/item7_coretiming_design.md for the full design.
 //
 // Region at 0x02680000. Holds events that ppc-worker may fire directly
 // (CT_EV_DECREMENTER) and events whose cadence ppc-worker may advance

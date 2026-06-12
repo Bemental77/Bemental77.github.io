@@ -10,10 +10,11 @@
 // there's nothing to mailbox-route in Phase 1.
 //
 // What this file lands:
-//   - JS-side rec_wasm dispatcher: per-block WebAssembly.Module / Instance
-//     caches and the two functions (flycast_register_block /
-//     flycast_run_block) that EM_JS bodies in rec_wasm.cpp call into.
-//     Defined OUTSIDE the pthread guard so they're reachable on whichever
+//   - JS-side rec_wasm dispatcher: flycast_install_block, which compiles +
+//     instantiates a per-block WebAssembly.Module and installs its `run`
+//     export into the shared wasmTable. Returns the table index so the C
+//     dispatcher in rec_wasm.cpp can call_indirect with no JS hop.
+//     Defined OUTSIDE the pthread guard so it's reachable on whichever
 //     pthread ends up running the SH4 dispatch loop (PROXY_TO_PTHREAD=1).
 //   - postMessage 'runtime-ready' (the shim in flycast_worker.js waits on
 //     Module.onRuntimeInitialized rather than this signal, but emit it for
@@ -23,28 +24,23 @@
 //   - 'shutdown' handler that tries to flush state cleanly.
 
 // ===========================================================================
-// rec_wasm JS dispatcher.
+// rec_wasm JS dispatcher — nasomers-table-dispatch shape.
 //
 // Lives outside the pthread guard so the EM_JS bodies — which the wasm CPU
 // loop calls on whatever thread it runs on — can reach this state.
 //
 // State:
-//   flycast_block_modules   Map<vaddr_u32, WebAssembly.Module>
-//   flycast_block_instances Map<vaddr_u32, WebAssembly.Instance>
-//   flycast_wasm_imports    { env: { memory, sh4_read*, sh4_write*, ... } }
+//   flycast_wasm_imports  { env: { memory, sh4_read*, sh4_write*, ... } }
+//   flycast_table_slots   Array<WebAssembly.Instance> — keep instance refs
+//                         alive (indexed by wasmTable slot) so V8 doesn't GC
+//                         compiled code while the table entry is in use.
 //
-// Imports object is built lazily on the first register/run call so we can
-// pull Module.wasmMemory after the runtime is up. We re-use the same object
-// for every Instance — the spec lets you do that, and it avoids per-block
-// allocation.
-//
-// We keep instance creation lazy (run_block side, not register_block) so the
-// register call stays cheap on the compile hot path.
+// Imports object is built lazily on the first install call so we can pull
+// Module.wasmMemory after the runtime is up. We re-use the same object for
+// every Instance — the spec allows it and avoids per-block allocation.
 // ===========================================================================
 
-var flycast_block_modules   = new Map();
-var flycast_block_instances = new Map();
-var flycast_wasm_imports    = null;
+var flycast_wasm_imports = null;
 
 function flycast_build_imports() {
   // The compiled SH4 block imports `env.memory`. We MUST pass the same
@@ -80,79 +76,95 @@ function flycast_build_imports() {
   };
 }
 
-function flycast_register_block(vaddr, bytesPtr, len) {
-  vaddr    = vaddr    >>> 0;
+// Last register_block error message, retrievable from C side via
+// flycast_register_get_last_error(). postMessage from a pthread doesn't
+// reach the page (goes to pthread's own message channel) — so we stash
+// the error and let the C side log it via MAIN_THREAD_EM_ASM.
+var flycast_last_register_error = '';
+
+// nasomers-pattern install: compile block, instantiate, grow shared wasmTable,
+// return new table index. C dispatcher in rec_wasm.cpp calls via fn pointer →
+// WASM toolchain lowers to call_indirect against this same table, no JS hop.
+// Keep instance refs alive so V8 doesn't GC the wasm code while the slot is in
+// use. Returns 0 on failure (sentinel — slot 0 is unused/null fn).
+var flycast_table_slots = [];   // index → Instance (GC root)
+
+function flycast_install_block(bytesPtr, len, vaddr) {
   bytesPtr = bytesPtr >>> 0;
   len      = len      >>> 0;
+  vaddr    = vaddr    >>> 0;
   try {
-    // Snapshot bytes out of the wasm heap into a fresh Uint8Array — the
-    // backing memory may move on a future heap-grow, and the WebAssembly
-    // spec requires the source buffer to stay alive through compile.
-    var src = HEAPU8.subarray(bytesPtr, bytesPtr + len);
-    var copy = new Uint8Array(src);
-    var mod  = new WebAssembly.Module(copy);
-    flycast_block_modules.set(vaddr, mod);
-    // Drop any cached Instance for this vaddr — a recompile means new code.
-    flycast_block_instances.delete(vaddr);
-    return 1;
-  } catch (e) {
-    if (typeof postMessage === 'function') {
-      postMessage({
-        cmd: 'print',
-        txt: '[flycast-funcs] register_block FAILED vaddr=0x' +
-             vaddr.toString(16) + ' len=' + len + ': ' +
-             (e && e.message ? e.message : String(e)),
-      });
+    var src   = HEAPU8.subarray(bytesPtr, bytesPtr + len);
+    var bytes = new Uint8Array(src);
+    var mod   = new WebAssembly.Module(bytes);
+    if (!flycast_wasm_imports) {
+      flycast_wasm_imports = flycast_build_imports();
     }
+    var inst  = new WebAssembly.Instance(mod, flycast_wasm_imports);
+    var fn    = inst.exports.run;
+    if (typeof fn !== 'function') {
+      flycast_last_register_error = 'install_block: missing "run" export';
+      return 0;
+    }
+    var idx = wasmTable.length;
+    wasmTable.grow(1);
+    wasmTable.set(idx, fn);
+    flycast_table_slots[idx] = inst;
+    return idx;
+  } catch (e) {
+    flycast_last_register_error = (e && e.message) ? e.message : String(e);
     return 0;
   }
 }
 
-function flycast_run_block(vaddr, ctxPtr, ramBase) {
-  vaddr   = vaddr   >>> 0;
-  ctxPtr  = ctxPtr  >>> 0;
-  ramBase = ramBase >>> 0;
-
-  var inst = flycast_block_instances.get(vaddr);
-  if (!inst) {
-    var mod = flycast_block_modules.get(vaddr);
-    if (!mod) {
-      // No block compiled for this PC — return PC+2 to advance one SH4
-      // instruction so the dispatcher re-enters compilePC on the next
-      // iteration. Spinning here would be a dispatcher-bug indicator,
-      // not something to silently absorb.
-      return (vaddr + 2) >>> 0;
-    }
+// F1 (shard install) — compile + instantiate a multi-block WASM module
+// containing N exported run_0..run_<N-1> functions. Grows wasmTable by N
+// contiguous slots and populates them from the exports map; returns the
+// BASE table index (run_i lives at base+i). The C side casts (base+i) to
+// a BlockFn pointer and registers each per its vaddr.
+//
+// vaddrsPtr is a u32[count] in the C heap (s_pending_shard's vaddrs). We
+// don't strictly need it here — the wasmTable lookup is purely positional —
+// but logging it on failure helps correlate JS-side errors with the C side.
+// One Instance ref serves as GC root for ALL slots in the shard: every
+// export comes from the same instance, so a single ref pins the whole
+// compiled module's code.
+function flycast_install_shard(bytesPtr, len, vaddrsPtr, count) {
+  bytesPtr  = bytesPtr  >>> 0;
+  len       = len       >>> 0;
+  vaddrsPtr = vaddrsPtr >>> 0;
+  count     = count     >>> 0;
+  if (count === 0) {
+    flycast_last_register_error = 'install_shard: count=0';
+    return 0;
+  }
+  try {
+    var src   = HEAPU8.subarray(bytesPtr, bytesPtr + len);
+    var bytes = new Uint8Array(src);
+    var mod   = new WebAssembly.Module(bytes);
     if (!flycast_wasm_imports) {
       flycast_wasm_imports = flycast_build_imports();
     }
-    try {
-      inst = new WebAssembly.Instance(mod, flycast_wasm_imports);
-    } catch (e) {
-      if (typeof postMessage === 'function') {
-        postMessage({
-          cmd: 'print',
-          txt: '[flycast-funcs] instantiate FAILED vaddr=0x' +
-               vaddr.toString(16) + ': ' + (e && e.message ? e.message : String(e)),
-        });
+    var inst     = new WebAssembly.Instance(mod, flycast_wasm_imports);
+    var base_idx = wasmTable.length;
+    wasmTable.grow(count);
+    for (var i = 0; i < count; i++) {
+      var fn = inst.exports['run_' + i];
+      if (typeof fn !== 'function') {
+        flycast_last_register_error =
+          'install_shard: missing run_' + i + ' (count=' + count + ')';
+        return 0;
       }
-      return (vaddr + 2) >>> 0;
+      wasmTable.set(base_idx + i, fn);
+      // One Instance ref pins the whole module's code; mirror it across
+      // every slot so a future selective-evict of one slot doesn't
+      // accidentally let V8 GC the entire shard.
+      flycast_table_slots[base_idx + i] = inst;
     }
-    flycast_block_instances.set(vaddr, inst);
-  }
-
-  // The compiled block exports `run(ctx_ptr, ram_base) -> next_pc`.
-  // emitBlockExit also writes ctx->pc directly, so the trampoline could
-  // technically ignore the return value — we return it anyway so the
-  // C side can mirror it back as a defensive PC sync.
-  try {
-    return inst.exports.run(ctxPtr, ramBase) >>> 0;
+    return base_idx;
   } catch (e) {
-    // SH4ThrownException propagating from inside an IFB import is one
-    // legitimate way for run() to unwind. The C++ driver catches it on
-    // the outer mainloop. Re-throw so the Emscripten exception path can
-    // surface it.
-    throw e;
+    flycast_last_register_error = (e && e.message) ? e.message : String(e);
+    return 0;
   }
 }
 

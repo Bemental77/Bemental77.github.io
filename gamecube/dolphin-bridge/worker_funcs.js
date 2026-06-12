@@ -102,9 +102,15 @@ async function bootIso(name, size) {
   try {
     var iniDir = '/home/web_user/retroarch/userdata/system/dolphin-emu/User/Config';
     Module.FS.mkdirTree(iniDir);
-    var iniBody = '[Core]\nMMU = True\nSkipIPL = False\n';
+    // GFXBackend must be in the ini: EmscriptenWorker main() does
+    // Config::SetBase(MAIN_GFX_BACKEND, "Software Renderer"), but the boot-
+    // time load of this file resets the base layer — without the key here
+    // the backend falls back to Null (2026-06-11 probe: "[ax-vbi] calling
+    // g_video_backend->Initialize (backend=Null)"), which rasterizes
+    // nothing and presents headless, so video_cb never fires.
+    var iniBody = '[Core]\nMMU = True\nSkipIPL = False\nGFXBackend = Software Renderer\n';
     Module.FS.writeFile(iniDir + '/Dolphin.ini', iniBody);
-    postMessage({ cmd: 'print', txt: '[worker] wrote Dolphin.ini (MMU=True, SkipIPL=False) at ' + iniDir });
+    postMessage({ cmd: 'print', txt: '[worker] wrote Dolphin.ini (MMU=True, SkipIPL=False, GFXBackend=Software Renderer) at ' + iniDir });
     try {
       var cfg = Module.FS.readFile(iniDir + '/Dolphin.ini', { encoding: 'utf8' });
       postMessage({ cmd: 'print', txt: '[config] Dolphin.ini: ' + cfg.replace(/\n/g, ' \\n ') });
@@ -153,6 +159,60 @@ async function bootIso(name, size) {
     }
   } catch (e) {
     postMessage({ cmd: 'print', txt: '[ipl] write threw: ' + e });
+  }
+
+  // Stage the GSNE8P (SAB) symbol map into User/Maps so PPCSymbolDB's
+  // LoadMapOnBoot finds it and HLE::PatchFunctions can install the
+  // ___blank / OSReport hooks for DBPrintf, etc. Without this, native's
+  // DBPrintf-no-op patch isn't installed and the real body's
+  // OSThread-scheduler polls wedge boot at pc=0x800ecb48. Source file
+  // tools/gsne8p.map is lowercase on disk; Dolphin's FindMapFile uses
+  // m_debugger_game_id which is uppercase "GSNE8P".
+  try {
+    // tools/gsne8p.map is a 16690-byte partial map with 258 symbols and a
+    // different header format ("Starting / Virtual / File / address") that
+    // Dolphin's PPCSymbolDB doesn't parse. The full 226627-byte map at
+    // dolphin_captures/sab.map (5097 symbols) is byte-identical to native's
+    // ~/Library/Application Support/Dolphin/Maps/GSNE8P.map (verified by
+    // MD5). Without the full map, only ~258 symbols load → HLE patches for
+    // OSReport/___blank/OSPanic that depend on symbol-DB lookup don't all
+    // install → wasm runs real OSPanic body on faults → reaches PPCHalt.
+    var mapResp = await fetch('/dolphin_captures/sab.map');
+    if (!mapResp.ok) {
+      postMessage({ cmd: 'print', txt: '[map] fetch failed: HTTP ' + mapResp.status });
+    } else {
+      var mapBuf = await mapResp.arrayBuffer();
+      var mapBytes = new Uint8Array(mapBuf);
+      // Dolphin's UserPath resolves to "//User/Maps/" — environment_cb in
+      // EmscriptenWorker.cpp returns "/" for SAVE_DIRECTORY, and Boot.cpp
+      // computes user_dir = save_dir + "/User" = "//User", then SetUserPath
+      // appends "/" → "//User/" → D_MAPS_IDX = "//User/Maps/". MEMFS should
+      // normalize the double slash but verify by writing to every plausible
+      // path. The old RetroArch path (.../retroarch/...) was never checked.
+      // Without this HLE patches for OSReport/___blank/OSPanic don't
+      // install → wasm runs real OSPanic body → PPCHalt wedge.
+      var mapDirs = [
+        '/User/Maps',
+        '/home/web_user/.dolphin-emu/Maps',
+        '/home/web_user/dolphin-emu/User/Maps',
+        '/dolphin-emu/User/Maps',
+        '/dolphin-emu/Maps',
+        '/Maps',
+      ];
+      var mapWritten = 0;
+      for (var mi = 0; mi < mapDirs.length; mi++) {
+        try {
+          Module.FS.mkdirTree(mapDirs[mi]);
+          Module.FS.writeFile(mapDirs[mi] + '/GSNE8P.map', mapBytes);
+          mapWritten++;
+        } catch (we) {
+          postMessage({ cmd: 'print', txt: '[map] write to ' + mapDirs[mi] + ' failed: ' + we });
+        }
+      }
+      postMessage({ cmd: 'print', txt: '[map] wrote GSNE8P.map ' + mapBuf.byteLength + ' bytes to ' + mapWritten + '/' + mapDirs.length + ' candidate paths' });
+    }
+  } catch (e) {
+    postMessage({ cmd: 'print', txt: '[map] write threw: ' + e });
   }
 
   postMessage({ cmd: 'print', txt: '[worker] ISO written to /' + name + ' (' + size + ' bytes), calling load_iso' });

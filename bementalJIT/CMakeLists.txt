@@ -55,6 +55,21 @@ if(BEMENTAL_GUEST_POWERPC_NEXT)
     add_subdirectory(guests/powerpc-next)
 endif()
 
+# Phase 7 cut-over flag. When ON, block_cache.cpp and JitWasm.cpp route the
+# region-build / per-block-body entry points through the powerpc-next
+# wrappers (currently forward to the live implementations until proper
+# JIT64-modeled ports land). Defined PUBLIC on bementalJIT so every
+# consumer translation unit (block_cache.cpp inside bementalJIT,
+# ppc_emit.cpp inside bementalJITPowerPCNext, and JitWasm.cpp inside
+# dolphin's core) sees the same value.
+option(BEMENTALJIT_USE_REBUILD "Route region/block builders through guests/powerpc-next/ wrappers" OFF)
+if(BEMENTALJIT_USE_REBUILD)
+    target_compile_definitions(bementalJIT PUBLIC BEMENTALJIT_USE_REBUILD=1)
+    if(BEMENTAL_GUEST_POWERPC_NEXT)
+        target_compile_definitions(bementalJITPowerPCNext PUBLIC BEMENTALJIT_USE_REBUILD=1)
+    endif()
+endif()
+
 # ---- Tests -----------------------------------------------------------------
 
 option(BEMENTAL_BUILD_TESTS "Build bementalJIT test harnesses" OFF)

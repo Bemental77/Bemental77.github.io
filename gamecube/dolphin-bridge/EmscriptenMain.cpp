@@ -42,7 +42,14 @@ int main(void) {
         g_display = SDL_SetVideoMode(640, 480, 32, SDL_HWSURFACE);
         printf("dolphin_libretro stub: SDL inited\n");
     }
-    memset(g_pad_state, 0xff, sizeof(g_pad_state));
+    // All-released default. This was memset 0xFF — every button on every
+    // port pressed forever (CheckJoy/CheckKeyboard are stubs; nothing ever
+    // rewrites the buffer, and gamecube.html ships it to the worker every
+    // 10ms, clobbering the worker-side default too). 2026-06-11 PSO root
+    // cause: the AppSwitcher saw its return-to-menu pad combo held and
+    // hot-reset the console mid psov3.dol load. The page's key handler
+    // (gamecube.html:1487-1496) sets/clears bits on top of this base.
+    memset(g_pad_state, 0x00, sizeof(g_pad_state));
     EM_ASM({ if (typeof var_setup === 'function') var_setup(); });
     emscripten_exit_with_live_runtime();
     return 0;

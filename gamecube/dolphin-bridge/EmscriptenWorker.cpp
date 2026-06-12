@@ -10,6 +10,7 @@
 
 #include "Common/Config/Config.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/HLE/HLE.h"
 
 // Item 7 Phase IV: dolphin_service_iter routes here when CT_PHASE4_ENABLE
 // is set. Instead of running the full retro_run() → JitWasm::Run() chain
@@ -23,7 +24,10 @@
 // one Advance + outer-while iter overhead per service tick. Minimal-risk
 // shape: no rewiring of libretro pipeline, only a service detour.
 #include "Core/System.h"
-#include "Core/HW/MMIOMirror.h"
+// MMIOMirror.h was part of the prior dolphin-src fork's diagnostic stack and
+// is deliberately not present in the sanitized tree (df03d80 + canonical
+// CMake gates). Removed unused include; if any MMIOMirror.h symbol turns out
+// to still be referenced below, re-evaluate as canonical-source work.
 #include "Core/HW/SystemTimers.h"
 #include "Core/CoreTiming.h"
 
@@ -31,6 +35,11 @@
 extern "C" {
 unsigned dolphin_ct_get_phase_flags(void);
 unsigned dolphin_ct_drain_pending_mask(void);
+// Defined in dolphin_jit_wimports.cpp — evicts a single PC from
+// JitWasm::m_wasm_cache (the bementalJIT block cache). Used after
+// out-of-band HLE::Patch calls so the next dispatch recompiles the
+// block with the new HLE hook check live.
+void dolphin_evict_block(uint32_t pc);
 }
 
 extern "C" {
@@ -47,16 +56,40 @@ void retro_set_input_poll(retro_input_poll_t cb);
 void retro_set_input_state(retro_input_state_t cb);
 void retro_run(void);
 bool retro_load_game(const struct retro_game_info* info);
+// Libretro frontend contract: the frontend declares attached controllers via
+// retro_set_controller_port_device after retro_load_game. This minimal worker
+// never did, so input_types[] stayed RETRO_DEVICE_NONE and ALL FOUR SI ports
+// were configured SIDEVICE_NONE (Input.cpp:1017) — unlike native Dolphin.
+// MP4's HuPadRead then spins forever in PAD origin polling (observed
+// 2026-06-11: 1.29M [ax-fill] memsets of the PAD Origin array + a stack
+// PADStatus buffer at ~7k/sec, GlobalCounter frozen at 0).
+void retro_set_controller_port_device(unsigned port, unsigned device);
+#define EMW_RETRO_DEVICE_JOYPAD 1
+// Forward-declared (DolphinLibretro/Video.h drags Vulkan headers): the
+// video-backend init entry normally fired by a libretro frontend's
+// hw_render.context_reset callback — which this minimal worker frontend
+// never invokes (environment_cb rejects SET_HW_RENDER). Without it,
+// VideoBackendBase::InitializeShared never runs: g_texture_cache et al.
+// stay null (OOB crash at the guest's first EFB copy once the CP FIFO
+// decodes) and FifoManager::RefreshConfig never loads sync-gpu config.
+// The SW renderer needs no host GL context, so calling it right after
+// retro_load_game is safe here.
+extern "C++" { namespace Libretro { namespace Video { void ContextReset(void); } } }
 void retro_unload_game(void);
 size_t retro_serialize_size(void);
 bool retro_serialize(void* data, size_t size);
 bool retro_unserialize(const void* data, size_t size);
 }
 
-static uint8_t g_pad[32] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+// All-released is the ONLY sane default. This was 0xFF-filled (every button
+// on every port pressed from boot) — 2026-06-11 PSO root cause: the
+// AppSwitcher's pad check saw its return-to-menu combo held (Pad::GetStatus
+// button=0x1f7f, triggers 255/255 on every poll) and deliberately called
+// OSResetSystem(HOTRESET) mid-load of psov3.dol, parking the console in
+// __OSDoHotReset's spin (PI_RESET_CODE write, drive -> DiscIdNotRead, no
+// further frames). The headless probe never sends pad input, so the init
+// value IS the steady-state.
+static uint8_t g_pad[32] = {};
 
 static bool g_loaded = false;
 
@@ -66,13 +99,15 @@ static bool environment_cb(unsigned cmd, void* data) {
             *(bool*)data = true;
             return true;
         case RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY:
-            // Boot.cpp checks `if (save_dir && *save_dir)` then does
-            // user_dir = save_dir + "/User". "/" gives user_dir="//User"
-            // (double slash, but emscripten MEMFS tolerates it) →
-            // D_MAPS_IDX="//User/Maps/". The .map files are --embed-file'd
-            // to /User/Maps/ by the link script — MEMFS resolves the
-            // double slash transparently.
-            *(const char**)data = "/";
+            // Boot.cpp:182 does user_dir = save_dir + "/User" → for HLE patches
+            // (Patching OSReport / ___blank / OSPanic) to install, the resulting
+            // D_MAPS_IDX must match where worker_funcs.js preloads GSNE8P.map.
+            // Returning "/dolphin-emu" gives user_dir="/dolphin-emu/User" and
+            // D_MAPS_IDX="/dolphin-emu/User/Maps/" — that's one of the paths
+            // worker_funcs.js writes the map to. Previously "/" produced the
+            // fragile "//User/Maps/" with double slash; switching to a clean
+            // single-slash path eliminates MEMFS normalization as a variable.
+            *(const char**)data = "/dolphin-emu";
             return true;
         case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT:
             // Accept XRGB8888. Required so the SW renderer's RGBA output
@@ -181,6 +216,14 @@ int load_iso(const char* path) {
         postMessage({cmd: 'print', txt: '[worker] load_iso: retro_load_game returned ' + ($0 ? 'true' : 'false')});
     }, ok ? 1 : 0);
     if (!ok) return -1;
+    retro_set_controller_port_device(0, EMW_RETRO_DEVICE_JOYPAD);
+    MAIN_THREAD_EM_ASM({
+        postMessage({cmd: 'print', txt: '[worker] SI port 0 = GC controller (joypad)'});
+    });
+    Libretro::Video::ContextReset();
+    MAIN_THREAD_EM_ASM({
+        postMessage({cmd: 'print', txt: '[worker] video backend ContextReset done'});
+    });
     g_loaded = true;
     return 0;
 }
@@ -206,8 +249,9 @@ void dolphin_service_iter(void) {
     // 1. Pull ppc-worker DIRECT_W mirror writes back into dolphin's
     //    struct, then drain the pending-writes ring (replays
     //    ComplexWrite handlers, which may schedule CoreTiming events).
-    bemental_sab::mmio_mirror_sync_from_sab();
-    (void)bemental_sab::mmio_mirror_drain_pending_writes();
+    // bemental_sab::mmio_mirror_* lived in the prior fork's Core/HW/MMIOMirror.h
+    // (sanitized away in df03d80). No replacement on the canonical tree yet;
+    // re-introducing the mirror is canonical work, not a .bak port. No-op here.
     // 2. Fire hybrid events whose cadence ppc-worker already advanced.
     //    Dolphin's local m_event_queue still holds these entries — the
     //    pending mask is a latency short-cut, not a replacement, so the
@@ -222,14 +266,16 @@ void dolphin_service_iter(void) {
                 if (et) core_timing.ScheduleEvent(0, et);
             };
             // Pending-mask bit layout matches bemental_ct::CT_PEND_* in JitWasm.cpp.
-            if (mask & (1u << 0)) sched_now(timers.GetVIEvent());
-            if (mask & (1u << 1)) sched_now(timers.GetDSPEvent());
-            if (mask & (1u << 2)) sched_now(timers.GetAudioDMAEvent());
-            if (mask & (1u << 4)) sched_now(timers.GetGPUSleeperEvent());
-            if (mask & (1u << 5)) sched_now(timers.GetPatchEngineEvent());
-            // CT_PEND_AI (1<<3): AudioInterface holds its own event type
-            // pointer; cross-module access deferred (idempotent w.r.t.
-            // dolphin's own AI event).
+            // Note: the GetVIEvent / GetDSPEvent / GetAudioDMAEvent /
+            // GetGPUSleeperEvent / GetPatchEngineEvent accessors on
+            // SystemTimersManager were custom additions in the prior fork's
+            // dolphin-src patches; they are not present in the sanitized
+            // upstream tree (df03d80). Re-introducing them is canonical work
+            // (subclass + override in dolphin-bridge, or a tracked upstream
+            // PR) — out of scope for the initial JIT-swap link milestone.
+            // For now the cross-module CT publish/drain is a no-op and the
+            // events fire from dolphin's own SystemTimers cadence.
+            (void)mask; (void)timers; (void)sched_now;
         }
     }
     // 3. NO retro_run() — under Phase IV ppc-worker owns dispatch entirely.
@@ -268,6 +314,32 @@ void run_iter_batch(int n) {
     static volatile unsigned* const c_p4br    = (volatile unsigned*)0x025010CCu;
     static volatile unsigned* const c_svci    = (volatile unsigned*)0x025010D0u;
     static volatile unsigned* const c_retror  = (volatile unsigned*)0x025010D4u;
+    // ENTIRE SAB HLE patch set per native dolphin.log:
+    //   [HLE]: Patching PPCMfhid2 0x800e34a4
+    //   [HLE]: Patching PPCMfhid2 0x800e34ac
+    //   [HLE]: Patching PPCMfhid2 0x800e34e0
+    //   [HLE]: Patching strncpy   0x8010dfb4
+    //   [HLE]: Patching OSReport  0x800e5bf0
+    //   [HLE]: Patching ___blank  0x800ecfa4
+    //   [HLE]: Patching ___blank  0x800fe3c0
+    // OSReport and ___blank are already in upstream HLE.cpp's os_patches
+    // (lines 42, 56) bound to HLE_OS::HLE_GeneralDebugPrint. PPCMfhid2
+    // and strncpy are NOT in libretro/dolphin@0cd3bb8's table — we added
+    // them in HLE.cpp + HLE_Misc.cpp (authored canonically, replacement
+    // semantics matching upstream Dolphin master).
+    //
+    // Native installs via PPCSymbolDB name lookup (LoadMapOnBoot +
+    // HLE::Reload→PatchFunctions). Our tools/gsne8p.map carries the
+    // CodeWarrior names (DBPrintf instead of ___blank, PPCMfhid0/
+    // PPCMfl2cr at the first two PPCMfhid2 addresses), so the name-
+    // based lookup misses. Install at the empirically-verified addresses.
+    //
+    // Timing: install AFTER the first retro_run completes. By then
+    // libretro Main.cpp's EmuThread→BootUp→OnTitleDirectlyBooted→
+    // HLE::Reload has fired (and cleared all non-Fixed hooks). Once
+    // installed here, no further Reload fires during normal boot, so
+    // the patches persist.
+    static bool s_sab_patches_installed = false;
     for (int i = 0; i < n; i++) {
         (*c_total)++;
         const unsigned flags = dolphin_ct_get_phase_flags();
@@ -280,6 +352,44 @@ void run_iter_batch(int n) {
         } else {
             (*c_retror)++;
             retro_run();
+        }
+        if (!s_sab_patches_installed) {
+            s_sab_patches_installed = true;
+            auto& system = Core::System::GetInstance();
+            // Full 7-patch set per native dolphin.log.preserved:
+            HLE::Patch(system, 0x800e34a4u, "PPCMfhid2");
+            HLE::Patch(system, 0x800e34acu, "PPCMfhid2");
+            HLE::Patch(system, 0x800e34e0u, "PPCMfhid2");
+            HLE::Patch(system, 0x8010dfb4u, "strncpy");
+            HLE::Patch(system, 0x800e5bf0u, "OSReport");
+            HLE::Patch(system, 0x800ecfa4u, "___blank");
+            HLE::Patch(system, 0x800fe3c0u, "___blank");
+            // pass-5 instrumentation — Start-hook on interrupt-mask-decoder
+            // at 0x800e7e9c. Hook logs r3/r4/LR; spin diagnostic.
+            HLE::Patch(system, 0x800e7e9cu, "TraceDispatcher");
+            // MP4 (GMPE01_01) GXWaitDrawDone unblock: libretro init never
+            // calls VideoBackend::Initialize (Core.cpp:488-489 libretro
+            // init_video lambda returns true without it), so CommandProcessor
+            // / Fifo / PixelEngine never Init, CPReadWriteDistance stays 0,
+            // RunGpuOnCpu's gate never passes, BPWritten never reached, no
+            // BPMEM_SETDRAWDONE -> PixelEngine::SetFinish, PE_FINISH never
+            // fires, GXWaitDrawDone (GXMisc.c:116-127) sleeps on FinishQueue
+            // forever. HLE-skip lets main thread proceed; renders nothing
+            // but unblocks boot past Start New OVL 1.
+            HLE::Patch(system, 0x800CA840u, "FAKE_TO_SKIP_0");
+            // Evict any pre-existing m_wasm_cache entries at all PCs.
+            dolphin_evict_block(0x800e34a4u);
+            dolphin_evict_block(0x800e34acu);
+            dolphin_evict_block(0x800e34e0u);
+            dolphin_evict_block(0x8010dfb4u);
+            dolphin_evict_block(0x800e5bf0u);
+            dolphin_evict_block(0x800ecfa4u);
+            dolphin_evict_block(0x800fe3c0u);
+            dolphin_evict_block(0x800e7e9cu);
+            dolphin_evict_block(0x800CA840u);
+            MAIN_THREAD_EM_ASM({
+                postMessage({cmd: 'print', txt: '[worker] installed all 7 SAB HLE patches + dispatcher trace + evicted m_wasm_cache'});
+            });
         }
         if (!g_loaded) break;
     }

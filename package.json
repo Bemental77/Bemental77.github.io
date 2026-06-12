@@ -2,6 +2,9 @@
   "name": "bemental77.github.io",
   "version": "0.1.0",
   "private": true,
+  "scripts": {
+    "web": "python3 -m http.server 8080"
+  },
   "dependencies": {
     "@types/react": "18.0.38",
     "@types/react-dom": "18.0.11",

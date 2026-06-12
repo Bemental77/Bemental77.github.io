@@ -1,0 +1,156 @@
+diff --git a/Source/Core/Core/HW/DSP.cpp b/Source/Core/Core/HW/DSP.cpp
+index ae46113..511cd2d 100644
+--- a/Source/Core/Core/HW/DSP.cpp
++++ b/Source/Core/Core/HW/DSP.cpp
+@@ -392,6 +392,10 @@ void DSPManager::GenerateDSPInterrupt(u64 DSPIntType, s64 cyclesLate)
+   // DSP_CONTROL - we mask by (INT_DSP | INT_ARAM | INT_AID) just to ensure people
+   // don't call this with bogus values.
+   m_dsp_control.Hex |= (DSPIntType & (INT_DSP | INT_ARAM | INT_AID));
++  static u64 axei_gen_n = 0;
++  axei_gen_n++;
++  NOTICE_LOG_FMT(DSPHLE, "[axei-trace] DSP::GenerateDSPInterrupt n={} type={:#x} cyclesLate={} dsp_control={:#x} PC={:#x}",
++                 axei_gen_n, DSPIntType, cyclesLate, m_dsp_control.Hex, m_system.GetPPCState().pc);
+   UpdateInterrupts();
+ }
+ 
+@@ -443,7 +447,11 @@ void DSPManager::UpdateAudioDMA()
+     {
+       m_audio_dma.current_source_address = m_audio_dma.SourceAddress;
+       m_audio_dma.remaining_blocks_count = m_audio_dma.AudioDMAControl.NumBlocks;
+-
++      static u64 axei_aid_n = 0;
++      axei_aid_n++;
++      NOTICE_LOG_FMT(AUDIO_INTERFACE, "[axei-trace] AID-fire n={} src={:#x} blocks={} PC={:#x}",
++                     axei_aid_n, m_audio_dma.SourceAddress, m_audio_dma.AudioDMAControl.NumBlocks,
++                     m_system.GetPPCState().pc);
+       GenerateDSPInterrupt(DSP::INT_AID, 0);
+     }
+   }
+diff --git a/Source/Core/Core/HW/ProcessorInterface.cpp b/Source/Core/Core/HW/ProcessorInterface.cpp
+index 7b999ac..dab99a2 100644
+--- a/Source/Core/Core/HW/ProcessorInterface.cpp
++++ b/Source/Core/Core/HW/ProcessorInterface.cpp
+@@ -218,6 +218,14 @@ void ProcessorInterfaceManager::SetInterrupt(u32 cause_mask, bool set)
+     m_interrupt_cause &= ~cause_mask;  // is there any reason to have this possibility?
+   // F|RES: i think the hw devices reset the interrupt in the PI to 0
+   // if the interrupt cause is eliminated. that isn't done by software (afaik)
++  static u64 axei_set_n = 0;
++  axei_set_n++;
++  if (cause_mask == INT_CAUSE_DSP || cause_mask == INT_CAUSE_AI || axei_set_n <= 200)
++  {
++    NOTICE_LOG_FMT(PROCESSORINTERFACE,
++                   "[axei-trace] PI::SetInterrupt n={} mask={:#x} set={} new_cause={:#x} mask_reg={:#x}",
++                   axei_set_n, cause_mask, set, m_interrupt_cause, m_interrupt_mask);
++  }
+   UpdateException();
+ }
+ 
+diff --git a/Source/Core/Core/HW/SystemTimers.cpp b/Source/Core/Core/HW/SystemTimers.cpp
+index 1790a97..6d8ed50 100644
+--- a/Source/Core/Core/HW/SystemTimers.cpp
++++ b/Source/Core/Core/HW/SystemTimers.cpp
+@@ -130,6 +130,13 @@ void SystemTimersManager::DecrementerCallback(Core::System& system, u64 userdata
+   auto& ppc_state = system.GetPPCState();
+   ppc_state.spr[SPR_DEC] = 0xFFFFFFFF;
+   ppc_state.Exceptions |= EXCEPTION_DECREMENTER;
++  static u64 axei_deccb_n = 0;
++  axei_deccb_n++;
++  if (axei_deccb_n <= 20 || (axei_deccb_n & 0xFF) == 1)
++  {
++    NOTICE_LOG_FMT(POWERPC, "[axei-trace] DecrementerCallback FIRED n={} pc={:#x}",
++                   axei_deccb_n, ppc_state.pc);
++  }
+ }
+ 
+ void SystemTimersManager::PatchEngineCallback(Core::System& system, u64 userdata, s64 cycles_late)
+@@ -175,6 +182,13 @@ void SystemTimersManager::DecrementerSet()
+   auto& ppc_state = m_system.GetPPCState();
+ 
+   u32 decValue = ppc_state.spr[SPR_DEC];
++  static u64 axei_decset_n = 0;
++  axei_decset_n++;
++  if (axei_decset_n <= 30 || (axei_decset_n & 0xFF) == 1)
++  {
++    NOTICE_LOG_FMT(POWERPC, "[axei-trace] DecrementerSet n={} decValue={:#x} pc={:#x} npc={:#x} LR={:#x}",
++                   axei_decset_n, decValue, ppc_state.pc, ppc_state.npc, LR(ppc_state));
++  }
+ 
+   core_timing.RemoveEvent(m_event_type_decrementer);
+   if ((decValue & 0x80000000) == 0)
+diff --git a/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp b/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp
+index 5ff6fa0..8cbfbc8 100644
+--- a/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp
++++ b/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp
+@@ -117,6 +117,21 @@ bool Interpreter::HandleFunctionHooking(u32 address)
+ 
+ int Interpreter::SingleStepInner()
+ {
++  // [ax-wp-native] Mirror WASM-side PC watchpoint at AX-init function entries.
++  if (m_ppc_state.pc == 0x800f8344u || m_ppc_state.pc == 0x800f5728u ||
++      m_ppc_state.pc == 0x800f8370u || m_ppc_state.pc == 0x800f8324u)
++  {
++    static u32 wp_hits = 0;
++    wp_hits++;
++    if (wp_hits <= 16 || (wp_hits & 0x3F) == 1)
++    {
++      NOTICE_LOG_FMT(POWERPC,
++                     "[ax-wp-native] pc={:#x} hit={} r3={:#x} r13={:#x} r31={:#x} r1={:#x} r0={:#x}",
++                     m_ppc_state.pc, wp_hits, m_ppc_state.gpr[3], m_ppc_state.gpr[13],
++                     m_ppc_state.gpr[31], m_ppc_state.gpr[1], m_ppc_state.gpr[0]);
++    }
++  }
++
+   if (HandleFunctionHooking(m_ppc_state.pc))
+   {
+     UpdatePC();
+diff --git a/Source/Core/Core/PowerPC/PowerPC.cpp b/Source/Core/Core/PowerPC/PowerPC.cpp
+index 564d74d..3abad20 100644
+--- a/Source/Core/Core/PowerPC/PowerPC.cpp
++++ b/Source/Core/Core/PowerPC/PowerPC.cpp
+@@ -583,12 +583,46 @@ void PowerPCManager::CheckExceptions()
+ 
+ void PowerPCManager::CheckExternalExceptions()
+ {
++  // [ax-wp-native] Mirror WASM-side PC watchpoint at AX-init function entries.
++  // Logs canonical register state native passes through these PCs so the WASM
++  // build can be compared against it.
++  if (m_ppc_state.pc == 0x800f8344u || m_ppc_state.pc == 0x800f5728u ||
++      m_ppc_state.pc == 0x800f8370u)
++  {
++    static u32 wp_hits = 0;
++    wp_hits++;
++    if (wp_hits <= 16 || (wp_hits & 0x3F) == 1)
++    {
++      NOTICE_LOG_FMT(POWERPC,
++                     "[ax-wp-native] pc={:#x} hit={} r3={:#x} r13={:#x} r31={:#x} r1={:#x} r0={:#x}",
++                     m_ppc_state.pc, wp_hits, m_ppc_state.gpr[3], m_ppc_state.gpr[13],
++                     m_ppc_state.gpr[31], m_ppc_state.gpr[1], m_ppc_state.gpr[0]);
++    }
++  }
++
+   const u32 exceptions = m_ppc_state.Exceptions;
+ 
+   // EXTERNAL INTERRUPT
+   // Handling is delayed until MSR.EE=1.
++  static u64 axei_cee_logged = 0;
++  if (exceptions != 0 && axei_cee_logged < 100)
++  {
++    axei_cee_logged++;
++    NOTICE_LOG_FMT(POWERPC,
++                   "[axei-trace] CheckExtExc n={} Exceptions={:#x} msr.EE={} pc={:#x} npc={:#x}",
++                   axei_cee_logged, exceptions, m_ppc_state.msr.EE ? 1 : 0,
++                   m_ppc_state.pc, m_ppc_state.npc);
++  }
+   if (exceptions == 0 || !m_ppc_state.msr.EE)
+     return;
++  static u64 axei_deliver_logged = 0;
++  if (axei_deliver_logged < 100)
++  {
++    axei_deliver_logged++;
++    NOTICE_LOG_FMT(POWERPC,
++                   "[axei-trace] CheckExtExc DELIVER n={} Exceptions={:#x} pc={:#x}",
++                   axei_deliver_logged, exceptions, m_ppc_state.pc);
++  }
+ 
+   u32 exception_vector = 0;
+ 

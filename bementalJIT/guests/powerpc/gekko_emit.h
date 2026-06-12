@@ -45,7 +45,8 @@ enum WasmImportFunc : u32 {
     // env.ppc_read_tb stays in the JS shim as harmless dead code
     // until the next ppc_worker.js cleanup.
     WIMPORT_HLE_FIRE    = 10,  // (pc, idx_and_type) -> i32 — Item 5: ppc-worker wasm-native HLE hit path
-    WIMPORT_COUNT       = 11
+    WIMPORT_STACK_CORRUPT = 11, // (pc, ea, val, width) -> void — Researcher B: stack-store sentinel
+    WIMPORT_COUNT       = 12
 
 };
 
@@ -259,6 +260,13 @@ struct EmitCtx {
     bool merged_mode          = false;
     u32  br_to_loop_depth     = 0;
     u32  entry_sel_global_idx = 0;
+    // This body's own slot inside the merged region (the loop index `i` in
+    // build_region_function). Authoritative — baked into the br_table arm
+    // at module-build time. Used by emit_branch_resolution's merged path
+    // to bail out at runtime when entry_sel == self_local_idx, preventing
+    // the stale-pcMap self-loop documented in
+    // dolphin_merged_mode_selfslot_bug_2026_05_19.
+    u32  self_local_idx       = 0;
 
     // Tracks the depth of currently-open WASM block/loop/if constructs
     // emitted INSIDE this body since emit_body_into started. Bumped by

@@ -531,6 +531,12 @@ static void emit_import_or_stub(EmitCtx& c, u32 import_idx) {
         case WIMPORT_BREAK_BLOCK:   // 1 arg, void
             c.b.op_drop();
             break;
+        case WIMPORT_STACK_CORRUPT: // 4 args, void
+            c.b.op_drop();
+            c.b.op_drop();
+            c.b.op_drop();
+            c.b.op_drop();
+            break;
         default:
             // Unknown import — emit the call anyway (shouldn't reach).
             c.b.op_call(import_idx);
@@ -904,6 +910,18 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
     c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
 
+    // [stack-corrupt] Researcher B sentinel: (pc, ea, val, width) -> void.
+    // Fires on EVERY store; dolphin gates on stack-range EA + val==0.
+    {
+        const u32 width = (import_idx == WIMPORT_WRITE32) ? 4u
+                        : (import_idx == WIMPORT_WRITE16) ? 2u : 1u;
+        c.b.op_i32_const((s32)c.pc);
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_gpr_get_impl(c, rs, g_ctx_ptr);
+        c.b.op_i32_const((s32)width);
+        emit_import_or_stub(c, WIMPORT_STACK_CORRUPT);
+    }
+
     auto emit_direct_store_post_with_addr_on_stack = [&]() {
         // Stack on entry: [host_addr]. Push value, bswap if needed, store.
         emit_gpr_get_impl(c, rs, g_ctx_ptr);
@@ -960,6 +978,20 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
     c.b.op_i32_eq();
     c.b.op_if(0x40);
         c.b.op_i32_const((s32)0xFFFFFFFEu);
+        c.b.op_i32_const((s32)c.pc);
+        emit_import_or_stub(c, WIMPORT_INTERP);
+    c.b.op_end();
+    // [test4-writer-trace] EA-match for 0x800e3a30..0x800e3a34
+    // ((EA & 0xFFFFFFFC) == 0x800e3a30). Logs via WIMPORT_INTERP marker
+    // 0xFFFFFFFDu — handler in JitWasm.cpp dolphin_interp logs storing PC
+    // + pre-mem value + gpr[1/3/13/31].
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)0xFFFFFFFCu);
+    c.b.op_i32_and();
+    c.b.op_i32_const((s32)0x800e3a30u);
+    c.b.op_i32_eq();
+    c.b.op_if(0x40);
+        c.b.op_i32_const((s32)0xFFFFFFFDu);
         c.b.op_i32_const((s32)c.pc);
         emit_import_or_stub(c, WIMPORT_INTERP);
     c.b.op_end();
@@ -1089,9 +1121,44 @@ static void emit_branch_resolution(EmitCtx& c, u32 target_pc, const u32* local_i
             const u32 actual_depth = c.br_to_loop_depth + c.local_block_depth;
             c.b.op_i32_const((s32)*local_idx);
             c.b.op_global_set(c.entry_sel_global_idx);
+            // Runtime self-slot guard (2026-05-19). The compile-time
+            // try_resolve_target was passed a target_pc != start_pc, but the
+            // runtime pcMap may have aliased target_pc → start_pc's body
+            // slot. Without this check, br $L re-runs the loop body and
+            // re-selects the SAME body — infinite self-loop, invisible to
+            // host. self_local_idx is the loop-index `i` baked into the
+            // br_table arm at build time (authoritative — does NOT consult
+            // pcMap). See dolphin_merged_mode_selfslot_bug_2026_05_19.
+            c.b.op_global_get(c.entry_sel_global_idx);
+            c.b.op_i32_const((s32)c.self_local_idx);
+            c.b.op_i32_eq();
+            c.b.op_if(0x40);
+                // entry_sel == self → bail to host with target_pc.
+                // GPRs already flushed at line 1093; nothing to re-flush.
+                emit_set_pc(c, CTX, target_pc);
+                c.b.op_i32_const((s32)target_pc);
+                c.b.op_return();
+            c.b.op_end();
             c.b.op_br(actual_depth);
             return;
         }
+        // Non-merged path runtime self-slot guard (mirror of merged guard at
+        // L1110-1128). The compile-time check at try_resolve_target only
+        // rejects target_pc==start_pc, not runtime pcMap aliasing where
+        // target_pc resolves to start_pc's table slot. Without this, the
+        // return_call_indirect tail-calls back into this body — infinite
+        // self-loop, invisible to host dispatch. SAB fn 0x800e362c probe data:
+        // 2520× pc==npc==0x800e362c vs 1× pc==0x800e3958 (normal exit).
+        c.b.op_i32_const((s32)*local_idx);
+        c.b.op_i32_const((s32)c.self_local_idx);
+        c.b.op_i32_eq();
+        c.b.op_if(0x40);
+            // self-slot aliasing: bail to host with target_pc.
+            // GPRs already flushed at line 1093.
+            emit_set_pc(c, CTX, target_pc);
+            c.b.op_i32_const((s32)target_pc);
+            c.b.op_return();
+        c.b.op_end();
         c.b.op_i32_const((s32)*local_idx);
         c.b.op_return_call_indirect(/*type=*/0u, /*table=*/0u);
         return;
@@ -1141,6 +1208,15 @@ static void emit_bx_impl(EmitCtx& c) {
         c.b.op_i32_const((s32)CTX);
         c.b.op_i32_const((s32)(c.pc + 4));
         c.b.op_i32_store(ppc_off::spr(8));  // LR = pc + 4
+        // Call boundary: the callee may be HLE'd or fall back to interp,
+        // either of which can MUTATE ppc_state.gpr[] (e.g.
+        // HLE_PPCMfhid2 forces gpr[3]=0). The post-call block must
+        // reload from memory, not read stale wasm locals. Flush dirties
+        // first (so any in-flight writes hit memory), then invalidate
+        // loaded[] (so subsequent emit_gpr_get re-reads from ppc_state).
+        // Matches JIT64's "flush all caller-saved on call" contract.
+        emit_flush_dirty_gprs_impl(c, g_ctx_ptr);
+        emit_invalidate_gpr_locals(c);
     }
     u32 lidx = 0u;
     const bool resolved = try_resolve_target(c, target, &lidx);
@@ -2273,7 +2349,12 @@ static void emit_indirect_branch_native(EmitCtx& c, u32 target_spr_idx) {
     c.b.op_i32_store(ppc_off::PC);
 
     // B11: flush before returning to host loop / dispatcher.
+    // Invalidate too — blr/bctr can return into HLE'd functions or
+    // exception handlers that mutate ppc_state.gpr[]. The post-call block
+    // (within same region) must reload from memory rather than read stale
+    // wasm-local cache. Same contract as emit_bx_impl's LK branch.
     emit_block_exit_flush(c);
+    emit_invalidate_gpr_locals(c);
 
     // Return target.
     c.b.op_local_get(LOCAL_TMP_A);
@@ -2525,6 +2606,30 @@ static void emit_mtspr_impl(EmitCtx& c) {
     c.b.op_i32_const((s32)CTX);
     emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_store(ppc_off::spr(spr_num));
+
+    // [srr0-side-channel] When emitting mtspr SRR0 (SPR 26), ALSO write a
+    // (pc, value, counter) tuple to fixed SAB slots so dolphin-side can
+    // identify which JIT-emitted mtspr instruction wrote each SRR0 value.
+    // SAB[0x026B0600] = pc of emitting instruction
+    // SAB[0x026B0604] = value written to SRR0
+    // SAB[0x026B0608] = monotonic counter (incremented every fire)
+    if (spr_num == 26u) {
+        // sab[0x600] = pc
+        c.b.op_i32_const((s32)0x026B0600);
+        c.b.op_i32_const((s32)c.pc);
+        c.b.op_i32_store(0);
+        // sab[0x604] = value (re-read gpr[rs] since prior get consumed the stack value)
+        c.b.op_i32_const((s32)0x026B0604);
+        emit_gpr_get_impl(c, rs, g_ctx_ptr);
+        c.b.op_i32_store(0);
+        // sab[0x608] = counter (load, +1, store)
+        c.b.op_i32_const((s32)0x026B0608);
+        c.b.op_i32_const((s32)0x026B0608);
+        c.b.op_i32_load(0);
+        c.b.op_i32_const(1);
+        c.b.op_i32_add();
+        c.b.op_i32_store(0);
+    }
 }
 
 // mftb rD, TBR  (op31 sub-op 371).
@@ -3436,6 +3541,17 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
     c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
 
+    // [stack-corrupt] Researcher B sentinel (X-form variant).
+    {
+        const u32 width = (import_idx == WIMPORT_WRITE32) ? 4u
+                        : (import_idx == WIMPORT_WRITE16) ? 2u : 1u;
+        c.b.op_i32_const((s32)c.pc);
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_gpr_get_impl(c, rs, g_ctx_ptr);
+        c.b.op_i32_const((s32)width);
+        emit_import_or_stub(c, WIMPORT_STACK_CORRUPT);
+    }
+
     // PLANTER TRIPWIRE 1 (X-form EA-match).
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const((s32)0x802bafccu);
@@ -3451,6 +3567,17 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
     c.b.op_i32_eq();
     c.b.op_if(0x40);
         c.b.op_i32_const((s32)0xFFFFFFFEu);
+        c.b.op_i32_const((s32)c.pc);
+        emit_import_or_stub(c, WIMPORT_INTERP);
+    c.b.op_end();
+    // [test4-writer-trace] X-form EA-match for 0x800e3a30..0x800e3a34.
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)0xFFFFFFFCu);
+    c.b.op_i32_and();
+    c.b.op_i32_const((s32)0x800e3a30u);
+    c.b.op_i32_eq();
+    c.b.op_if(0x40);
+        c.b.op_i32_const((s32)0xFFFFFFFDu);
         c.b.op_i32_const((s32)c.pc);
         emit_import_or_stub(c, WIMPORT_INTERP);
     c.b.op_end();
@@ -4139,6 +4266,7 @@ struct MergedModeArgs {
     bool merged              = false;
     u32  br_to_loop_depth    = 0;
     u32  entry_sel_global_idx = 0;
+    u32  self_local_idx      = 0;  // this body's own slot; baked into the br_table arm at build time
 };
 
 static void emit_body_into(WasmModuleBuilder& b,
@@ -4234,6 +4362,7 @@ static void emit_body_into(WasmModuleBuilder& b,
     ctx.merged_mode            = merged.merged;
     ctx.br_to_loop_depth       = merged.br_to_loop_depth;
     ctx.entry_sel_global_idx   = merged.entry_sel_global_idx;
+    ctx.self_local_idx         = merged.self_local_idx;
     // Phase 3 — flip the B11 GPR-local cache on. Inside if/else (when
     // ctx.if_depth>0) the helpers fall back to direct memory access, so
     // partially-loaded locals can't escape the merge point. After every
@@ -4502,7 +4631,7 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     //  type 2: (i32, i32) -> ()             — write8/write16/write32
     //  type 3: (i32, i32) -> ()             — interp(inst, pc), break_block(pc)
     //  (check_exc reuses type 1)
-    b.emitTypeSection(4);
+    b.emitTypeSection(5);
     {
         const u8 i32t[] = { WASM_TYPE_I32 };
         // type 0: () -> i32
@@ -4514,6 +4643,9 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
         b.emitFuncType(i32x2, 2, nullptr, 0);
         // type 3: (i32, i32) -> i32   (currently unused; reserved for future)
         b.emitFuncType(i32x2, 2, i32t, 1);
+        // type 4: (i32, i32, i32, i32) -> ()  — ppc_stack_corrupt
+        const u8 i32x4[] = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I32 };
+        b.emitFuncType(i32x4, 4, nullptr, 0);
     }
     b.endSection();
 
@@ -4539,6 +4671,8 @@ std::vector<u8> build_block(u32 start_pc, const u32* insts, u32 count,
     // A5: ppc_read_tb dropped — mftb is direct from spr[].
     // Item 5: ppc_hle_fire — (pc, idx_and_type) -> i32 — type 3.
     b.emitImportFunc("env", "ppc_hle_fire",    /*type*/3);
+    // Researcher B stack-store sentinel — (pc, ea, val, width) -> void
+    b.emitImportFunc("env", "ppc_stack_corrupt", /*type*/4);
     b.endSection();
 
     // ---- Function section: 1 function of type 0 ----
@@ -4583,10 +4717,24 @@ std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
                                 bool emit_hle_check_native) {
     WasmModuleBuilder b;
     b.beginFuncBody();
+    // 2026-05-21 fix: set self_local_idx so the non-merged (N-fn tail-call)
+    // self-slot guard in emit_branch_resolution (this file, ~L1152) can detect
+    // a return_call_indirect whose target slot aliases THIS body's own slot and
+    // bail to host with the real target_pc instead of tail-calling back into
+    // its own prologue. Previously merged={} left self_local_idx=0, so the
+    // guard only protected slot 0 — a block at slot N>0 self-looped (OSInit
+    // 0x800e362c: prologue re-ran, r1 leaked, guard store at 0x800e3658 never
+    // reached). Our own slot is lookup(start_pc) — the same pc_to_idx authority
+    // the branch targets resolve through. See dolphin_sab_362c_selfloop_chain.
+    MergedModeArgs mm{};  // mm.merged stays false → tail-call path unchanged
+    if (lookup_fn) {
+        u32 self_idx = 0;
+        if (lookup_fn(lookup_user, start_pc, &self_idx)) mm.self_local_idx = self_idx;
+    }
     emit_body_into(b, start_pc, insts, count, ctx_ptr_const,
                    mem1_base, mem1_mask, ram_size, instr_pcs,
                    lookup_fn, lookup_user, emit_hle_check,
-                   emit_perf_stub, /*merged=*/{}, emit_hle_check_native);
+                   emit_perf_stub, /*merged=*/mm, emit_hle_check_native);
     b.endFuncBody();
     auto bytes = b.getBytes();
     verify_block_can_advance_pc(bytes, start_pc);
@@ -4622,14 +4770,16 @@ std::vector<u8> build_region_module(const u8* concatenated_bodies,
     //  type 1: (i32) -> i32
     //  type 2: (i32, i32) -> ()
     //  type 3: (i32, i32) -> i32  (reserved)
-    b.emitTypeSection(4);
+    b.emitTypeSection(5);
     {
         const u8 i32t[]  = { WASM_TYPE_I32 };
         const u8 i32x2[] = { WASM_TYPE_I32, WASM_TYPE_I32 };
+        const u8 i32x4[] = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I32 };
         b.emitFuncType(nullptr, 0, i32t, 1);
         b.emitFuncType(i32t, 1, i32t, 1);
         b.emitFuncType(i32x2, 2, nullptr, 0);
         b.emitFuncType(i32x2, 2, i32t, 1);
+        b.emitFuncType(i32x4, 4, nullptr, 0);  // type 4: (i32x4) -> () — ppc_stack_corrupt
     }
     b.endSection();
 
@@ -4649,6 +4799,8 @@ std::vector<u8> build_region_module(const u8* concatenated_bodies,
     // A5: ppc_read_tb dropped — mftb is direct from spr[].
     // Item 5: ppc_hle_fire — (pc, idx_and_type) -> i32 — type 3.
     b.emitImportFunc("env", "ppc_hle_fire",    /*type*/3);
+    // Researcher B stack-store sentinel — (pc, ea, val, width) -> void
+    b.emitImportFunc("env", "ppc_stack_corrupt", /*type*/4);
     b.endSection();
 
     // ---- Function section: N entries, all type 0 ((), i32) ----
@@ -4743,14 +4895,16 @@ std::vector<u8> build_region_function(const BlockInputs* blocks,
     //   type 1: (i32) -> i32             — read*, check_exc, hle_check, read_tb
     //   type 2: (i32, i32) -> ()         — write*, interp, break_block
     //   type 3: (i32, i32) -> i32        — reserved
-    b.emitTypeSection(4);
+    b.emitTypeSection(5);
     {
         const u8 i32t[]  = { WASM_TYPE_I32 };
         const u8 i32x2[] = { WASM_TYPE_I32, WASM_TYPE_I32 };
+        const u8 i32x4[] = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I32 };
         b.emitFuncType(nullptr, 0, i32t, 1);
         b.emitFuncType(i32t, 1, i32t, 1);
         b.emitFuncType(i32x2, 2, nullptr, 0);
         b.emitFuncType(i32x2, 2, i32t, 1);
+        b.emitFuncType(i32x4, 4, nullptr, 0);  // type 4: (i32x4) -> () — ppc_stack_corrupt
     }
     b.endSection();
 
@@ -4770,6 +4924,8 @@ std::vector<u8> build_region_function(const BlockInputs* blocks,
     // A5: ppc_read_tb dropped — mftb is direct from spr[].
     // Item 5: ppc_hle_fire — (pc, idx_and_type) -> i32 — type 3.
     b.emitImportFunc("env", "ppc_hle_fire",    /*type*/3);
+    // Researcher B stack-store sentinel — (pc, ea, val, width) -> void
+    b.emitImportFunc("env", "ppc_stack_corrupt", /*type*/4);
     b.endSection();
 
     // ---- Function section: 1 region function of type 0 ----
@@ -4831,6 +4987,7 @@ std::vector<u8> build_region_function(const BlockInputs* blocks,
         m.merged              = true;
         m.br_to_loop_depth    = (n_blocks - 1u) - i;
         m.entry_sel_global_idx = 0u;
+        m.self_local_idx      = i;  // this body's own slot — authoritative
         emit_body_into(b,
                        bi.start_pc, bi.insts, bi.count,
                        bi.ctx_ptr_const,

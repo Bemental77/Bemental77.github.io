@@ -173,6 +173,16 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
 
     BitSet32 defined_so_far;  // GPRs written by the in-progress block.
 
+    // Forward const-propagation tracker. `gpr_known[i]` is true when
+    // analyzer has proved gpr[i] holds the value `gpr_const[i]` at this
+    // point in the linear decode. Mirrors gpr.IsImm()/Imm32() in Dolphin
+    // Jit64 (RegCache::SetImmediate32 / IsImm). Used to populate
+    // CodeOp::has_const_ea on D-form loads/stores so jit_load_store.cpp
+    // can route compile-time-known MMIO stores directly to the host
+    // import (preserving DICR.TSTART/DICMDBUF write ordering).
+    bool gpr_known[32] = {};
+    u32  gpr_const[32] = {};
+
     u32 pc = address;
     bool reached_endblock = false;
 
@@ -204,6 +214,139 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
         const BitSet32 reads_live_in = BitSet32(read_now.m_val & ~defined_so_far.m_val);
         block->m_gpr_inputs |= reads_live_in;
         defined_so_far |= op.regsOut;
+
+        // ------------------------------------------------------------------
+        // Const-EA derivation for D-form loads/stores (op.has_const_ea).
+        // Must run BEFORE we update gpr_known with this op's own output —
+        // EA uses the RA value as it stood prior to this instruction.
+        // OPCDs 32..47 = lwz/lwzu/lbz/lbzu/stw/stwu/stb/stbu/lhz/lhzu/lha/
+        //               lhau/sth/sthu/lmw/stmw. OPCDs 48..55 = lfs/lfsu/lfd/
+        // lfdu/stfs/stfsu/stfd/stfdu. All D-form, EA = (RA==0?0:rA) + SIMM.
+        {
+            const u32 opcd_ea = GekkoOperands::OPCD(inst);
+            const bool is_dform_mem =
+                (opcd_ea >= 32 && opcd_ea <= 47) ||
+                (opcd_ea >= 48 && opcd_ea <= 55);
+            if (is_dform_mem) {
+                const u32 ra_ea = GekkoOperands::RA(inst);
+                const u32 simm_ea = GekkoOperands::SIMM_16(inst);
+                if (ra_ea == 0) {
+                    op.has_const_ea = true;
+                    op.const_ea = simm_ea;
+                } else if (gpr_known[ra_ea]) {
+                    op.has_const_ea = true;
+                    op.const_ea = gpr_const[ra_ea] + simm_ea;
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Forward const-propagation. Update gpr_known[] for THIS op's
+        // output. Tracked productions:
+        //   OPCD 14 addi  : rt = (ra==0 ? 0 : rA) + simm
+        //   OPCD 15 addis : rt = (ra==0 ? 0 : rA) + (uimm<<16)
+        //   OPCD 24 ori   : rA = rS | uimm
+        //   OPCD 25 oris  : rA = rS | (uimm<<16)
+        //   OPCD 26 xori  : rA = rS ^ uimm
+        //   OPCD 27 xoris : rA = rS ^ (uimm<<16)
+        // Everything else that writes a GPR INVALIDATES the known-const
+        // entry. We must consult RA *before* updating to avoid self-aliasing.
+        {
+            const u32 opcd_p = GekkoOperands::OPCD(inst);
+            bool produced = false;
+            u32  produced_reg = 0;
+            u32  produced_val = 0;
+            switch (opcd_p) {
+            case 14: {  // addi
+                const u32 rt = GekkoOperands::RD(inst);
+                const u32 ra = GekkoOperands::RA(inst);
+                const u32 simm = GekkoOperands::SIMM_16(inst);
+                if (ra == 0) {
+                    produced = true;
+                    produced_reg = rt;
+                    produced_val = simm;
+                } else if (gpr_known[ra]) {
+                    produced = true;
+                    produced_reg = rt;
+                    produced_val = gpr_const[ra] + simm;
+                }
+                break;
+            }
+            case 15: {  // addis
+                const u32 rt = GekkoOperands::RD(inst);
+                const u32 ra = GekkoOperands::RA(inst);
+                const u32 uimm_hi = GekkoOperands::UIMM_16(inst) << 16;
+                if (ra == 0) {
+                    produced = true;
+                    produced_reg = rt;
+                    produced_val = uimm_hi;
+                } else if (gpr_known[ra]) {
+                    produced = true;
+                    produced_reg = rt;
+                    produced_val = gpr_const[ra] + uimm_hi;
+                }
+                break;
+            }
+            case 24: {  // ori
+                const u32 ra_dst = GekkoOperands::RA(inst);
+                const u32 rs = GekkoOperands::RS(inst);
+                const u32 uimm = GekkoOperands::UIMM_16(inst);
+                if (gpr_known[rs]) {
+                    produced = true;
+                    produced_reg = ra_dst;
+                    produced_val = gpr_const[rs] | uimm;
+                }
+                break;
+            }
+            case 25: {  // oris
+                const u32 ra_dst = GekkoOperands::RA(inst);
+                const u32 rs = GekkoOperands::RS(inst);
+                const u32 uimm_hi = GekkoOperands::UIMM_16(inst) << 16;
+                if (gpr_known[rs]) {
+                    produced = true;
+                    produced_reg = ra_dst;
+                    produced_val = gpr_const[rs] | uimm_hi;
+                }
+                break;
+            }
+            case 26: {  // xori
+                const u32 ra_dst = GekkoOperands::RA(inst);
+                const u32 rs = GekkoOperands::RS(inst);
+                const u32 uimm = GekkoOperands::UIMM_16(inst);
+                if (gpr_known[rs]) {
+                    produced = true;
+                    produced_reg = ra_dst;
+                    produced_val = gpr_const[rs] ^ uimm;
+                }
+                break;
+            }
+            case 27: {  // xoris
+                const u32 ra_dst = GekkoOperands::RA(inst);
+                const u32 rs = GekkoOperands::RS(inst);
+                const u32 uimm_hi = GekkoOperands::UIMM_16(inst) << 16;
+                if (gpr_known[rs]) {
+                    produced = true;
+                    produced_reg = ra_dst;
+                    produced_val = gpr_const[rs] ^ uimm_hi;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+
+            // Invalidate every GPR this op writes that we DIDN'T just
+            // record a fresh constant for.
+            for (u32 r = 0; r < 32; ++r) {
+                if (!op.regsOut[r]) continue;
+                if (produced && r == produced_reg) continue;
+                gpr_known[r] = false;
+            }
+            if (produced) {
+                gpr_known[produced_reg] = true;
+                gpr_const[produced_reg] = produced_val;
+            }
+        }
 
         // Branch target classification.
         op.branchTo = EvaluateBranchTarget(inst, pc);
