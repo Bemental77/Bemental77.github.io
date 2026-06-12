@@ -2486,9 +2486,10 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
     * architectural state addresses. */
    if (g_jit_bridge)
    {
+      void gen_interrupt(void); /* interrupt.h not included in this TU */
       uint32_t jit_entry_i = (func & UINT32_C(0xFFF)) / 4;
       struct precomp_instr* jit_entry = block->block + jit_entry_i;
-      static uint32_t jit_params[10];
+      static uint32_t jit_params[18];
       int jit_idx;
       jit_params[0] = func;                                        /* entry vaddr */
       jit_params[1] = (uint32_t)(uintptr_t)jit_entry;              /* entry precomp_instr* */
@@ -2500,6 +2501,15 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
       jit_params[7] = (uint32_t)(uintptr_t)&reg[0];                /* int64_t reg[32] */
       jit_params[8] = (uint32_t)(uintptr_t)&hi;
       jit_params[9] = (uint32_t)(uintptr_t)&lo;
+      /* wave 2 (native branches) — the DECLARE_JUMP contract surface */
+      jit_params[10] = block->start;
+      jit_params[11] = block->end;
+      jit_params[12] = (uint32_t)(uintptr_t)&last_addr;
+      jit_params[13] = (uint32_t)(uintptr_t)&next_interrupt;
+      jit_params[14] = (uint32_t)(uintptr_t)&g_cp0_regs[CP0_COUNT_REG];
+      jit_params[15] = count_per_op;                               /* fixed per-ROM before any compile */
+      jit_params[16] = (uint32_t)(uintptr_t)&skip_jump;
+      jit_params[17] = (uint32_t)(uintptr_t)&gen_interrupt;        /* funcptr == table index */
       jit_idx = EM_ASM_INT({
          return (typeof window !== 'undefined' && window.myApp && window.myApp.jitCompile)
             ? (window.myApp.jitCompile($0) | 0) : 0;
