@@ -543,7 +543,12 @@
   }
 
   // ---- block compiler ----
-  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeLoads: 0, nativeStores: 0, nativeFP: 0, fallbackOps: 0, fails: 0 };
+  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeLoads: 0, nativeStores: 0, nativeFP: 0, fallbackOps: 0, fails: 0, slotReuses: 0, distinctSlots: 0 };
+  // table slot per guest entry address: a recompile REUSES its slot via
+  // wasmTable.set, unrooting the previous instance for GC — the table is
+  // bounded by distinct block entries, not by recompile churn (vaddr keys
+  // are stable across precomp_block realloc; host entryPtr is not)
+  var slotByVaddr = Object.create(null);
 
   function compileSpan(p, Module) {
     var HEAPU32 = Module.HEAPU32;
@@ -735,9 +740,18 @@
     try {
       var mod = new WebAssembly.Module(bytes);
       var inst = new WebAssembly.Instance(mod, { e: { t: Module.wasmTable, m: Module.wasmMemory } });
-      var idx = Module.wasmTable.length;
-      Module.wasmTable.grow(1);
-      Module.wasmTable.set(idx, inst.exports.f);
+      var key = p.vaddr >>> 0;
+      var idx = slotByVaddr[key];
+      if (idx !== undefined) {
+        Module.wasmTable.set(idx, inst.exports.f);
+        stats.slotReuses++;
+      } else {
+        idx = Module.wasmTable.length;
+        Module.wasmTable.grow(1);
+        Module.wasmTable.set(idx, inst.exports.f);
+        slotByVaddr[key] = idx;
+        stats.distinctSlots++;
+      }
       stats.blocks++;
       return idx;
     } catch (e) {

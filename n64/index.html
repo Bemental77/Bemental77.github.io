@@ -561,7 +561,7 @@
     };
     window.__jitStats = function () {
       var s = { mode: mode, wrapped: wrapped, calls: calls, canaryFired: canaryFired, instantiateFail: instantiateFail };
-      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; }
+      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; s.distinctSlots = e.distinctSlots; s.slotReuses = e.slotReuses; }
       return s;
     };
     // sync-compile size-limit probe (M1 open question): padded empty modules
@@ -579,6 +579,22 @@
     function enable() {
       Module._neil_set_jit_bridge(1);
       pageLog('[jit] bridge enabled (' + mode + ')');
+      // crash forensics: a heartbeat breadcrumb every few ticks; if the tab
+      // dies (OOM/wasm fault kills the renderer with no JS notice), the next
+      // visit surfaces the last-known state in the log
+      var prev = localStorage.getItem('n64jit_breadcrumb');
+      if (prev) pageLog('[jit] previous session last state: ' + prev);
+      setInterval(function () {
+        try {
+          var st = window.__jitStats ? window.__jitStats() : {};
+          localStorage.setItem('n64jit_breadcrumb', JSON.stringify({
+            t: Date.now(), blocks: st.blocks, slots: st.distinctSlots, reuses: st.slotReuses,
+            table: Module.wasmTable.length,
+            heapMB: performance.memory ? Math.round(performance.memory.usedJSHeapSize / 1048576) : null,
+            pc: (Module._neil_vi_total ? Module._neil_vi_total() : null),
+          }));
+        } catch (e) {}
+      }, 2000);
     }
     if (mode === 'emit') {
       var s = document.createElement('script');
