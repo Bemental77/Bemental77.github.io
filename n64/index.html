@@ -1,0 +1,610 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>N64 Wasm</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <link rel="icon" href="data:,">
+  <!-- All relative URLs (script.js -> input_controller.js -> n64wasm.js/.wasm chain,
+       assets.zip XHR, ../roms/ ROM fetches) must resolve into the N64Wasm dist tree,
+       so the document base points there. Every page-local reference below is absolute. -->
+  <base href="/n64/N64Wasm/dist/">
+  <script>if (new URLSearchParams(location.search).has('eruda')) { var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/eruda'; s.onload=function(){eruda.init();}; document.head.appendChild(s); }</script>
+  <!-- script.js hard-requires jQuery, rivets, toastr, FileSaver (see dist/n64.html head).
+       Self-hosted in /n64/vendor/ so the page keeps working if a coi service worker from
+       a sibling emulator page makes this origin cross-origin-isolated (CDN scripts without
+       CORP headers would then be blocked) — and so it works offline. -->
+  <script src="/n64/vendor/jquery-3.3.1.min.js"></script>
+  <script src="/n64/vendor/rivets.bundled.min.js"></script>
+  <script src="/n64/vendor/toastr.min.js"></script>
+  <script src="/n64/vendor/FileSaver.min.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { overflow: hidden; }
+    #desktop { display: flex; flex-direction: column; align-items: center; padding: 12px; gap: 8px; height: 100vh; box-sizing: border-box; }
+    #title { margin: 0; font-size: 18px; letter-spacing: 1px; color: #aaa; }
+    #controlBar { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+    #controlBar button { padding: 8px 14px; border: 1px solid #444; background: #222; color: #eee; border-radius: 4px; cursor: pointer; font-size: 14px; min-width: 44px; min-height: 36px; }
+    #controlBar button:hover:not(:disabled) { background: #333; }
+    #controlBar button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #controlBar select { padding: 8px 10px; border: 1px solid #444; background: #222; color: #eee; border-radius: 4px; font-size: 14px; min-height: 36px; }
+    #canvasDiv { background: #000; display: flex; align-items: center; justify-content: center; flex: 1; width: 100%; max-width: 100vw; }
+    #canvas { background: #000; image-rendering: pixelated; width: 640px; height: 480px; max-width: 100%; max-height: 100%; }
+    #canvasDiv:fullscreen, #canvasDiv:-webkit-full-screen { width: 100vw; height: 100vh; max-width: none; max-height: none; display: flex; align-items: center; justify-content: center; }
+    #canvasDiv:fullscreen #canvas, #canvasDiv:-webkit-full-screen #canvas { width: auto; height: 100vh; max-width: 100vw; max-height: 100vh; }
+    @media (min-aspect-ratio: 4/3) { #canvasDiv:fullscreen #canvas, #canvasDiv:-webkit-full-screen #canvas { width: calc(100vh * 4 / 3); } }
+    @media (max-aspect-ratio: 4/3) { #canvasDiv:fullscreen #canvas, #canvasDiv:-webkit-full-screen #canvas { width: 100vw; height: calc(100vw * 3 / 4); } }
+    #mobileShell:fullscreen, #mobileShell:-webkit-full-screen { width: 100vw; height: 100vh; }
+    #statusBar { display: flex; gap: 16px; font-size: 12px; color: #888; font-family: monospace; }
+    #keyLegend { font-size: 11px; color: #666; font-family: monospace; text-align: center; max-width: 820px; }
+    #log { display: none; height: 140px; min-height: 80px; max-height: 50vh; width: 100%; max-width: 820px; overflow: auto; border: 1px solid #333; padding: 4px; font-size: 11px; background: #0a0a0a; color: #bbb; white-space: pre-wrap; user-select: text; -webkit-user-select: text; resize: vertical; position: relative; }
+    #log::after { content: "⋮"; position: absolute; bottom: 2px; right: 4px; color: #555; font-size: 10px; pointer-events: none; }
+    #mobileShell { display: none; position: fixed; inset: 0; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); z-index: 1000; user-select: none; -webkit-user-select: none; touch-action: none; overflow: hidden; }
+    #mobileScreen { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: #000; }
+    #mobileScreen canvas { image-rendering: pixelated; max-width: 100%; max-height: 100%; width: auto; height: 100%; }
+    .mobileSide { position: absolute; top: 0; bottom: 0; width: 34vw; max-width: 220px; display: flex; flex-direction: column; padding: 12px 10px; box-sizing: border-box; pointer-events: none; }
+    .mobileSide > * { pointer-events: auto; }
+    .mobileSide.left  { left: 0; background: linear-gradient(90deg, rgba(0,0,0,0.55), rgba(0,0,0,0)); }
+    .mobileSide.right { right: 0; background: linear-gradient(270deg, rgba(0,0,0,0.55), rgba(0,0,0,0)); }
+    .shoulderStack { display: flex; flex-direction: column; gap: 8px; align-items: center; }
+    .shoulderBtn { width: 80%; height: 38px; border-radius: 8px; background: linear-gradient(180deg, #4a4a4a 0%, #2a2a2a 100%); border: 1px solid #555; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; color: #ddd; letter-spacing: 1px; box-shadow: 0 2px 4px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.12); -webkit-tap-highlight-color: transparent; }
+    .shoulderBtn.held { filter: brightness(0.65); }
+    .shoulderBtn.cBtn { background: linear-gradient(180deg, #c9a900 0%, #8a7400 100%); border-color: #6b5a00; color: #fff; }
+    .dpadWrap { flex: 1; display: flex; align-items: center; justify-content: center; }
+    /* The disc is a true analog stick for N64 (vector fed to the core), not an 8-way pad. */
+    .dpadDisc { width: min(32vh, 180px); height: min(32vh, 180px); border-radius: 50%; background: radial-gradient(circle at 40% 35%, #555 0%, #2a2a2a 60%, #1a1a1a 100%); border: 2px solid #333; box-shadow: inset 0 2px 4px rgba(255,255,255,0.2), 0 6px 12px rgba(0,0,0,0.6); position: relative; }
+    #stickNub { position: absolute; width: 38%; height: 38%; top: 31%; left: 31%; border-radius: 50%; background: radial-gradient(circle at 40% 35%, #777 0%, #3a3a3a 70%, #222 100%); border: 2px solid #222; box-shadow: 0 3px 6px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.2); pointer-events: none; box-sizing: border-box; }
+    .arr { position: absolute; pointer-events: none; }
+    .arr-up    { top: 5%;  left: 50%; transform: translateX(-50%); border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 9px solid #666; }
+    .arr-down  { bottom: 5%; left: 50%; transform: translateX(-50%); border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 9px solid #666; }
+    .arr-left  { left: 5%;  top: 50%; transform: translateY(-50%); border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-right: 9px solid #666; }
+    .arr-right { right: 5%; top: 50%; transform: translateY(-50%); border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-left: 9px solid #666; }
+    #mobileShell.ghost .mobileSide { background: transparent; }
+    #mobileShell.ghost .shoulderBtn, #mobileShell.ghost .faceBtn, #mobileShell.ghost .dpadDisc, #mobileShell.ghost .sysBtn, #mobileShell.ghost .menuBtn { opacity: 0.35; }
+    #mobileShell.ghost .shoulderBtn.held, #mobileShell.ghost .faceBtn.held, #mobileShell.ghost .sysBtn.held { opacity: 0.7; }
+    #mobileShell.hide-controls .mobileSide, #mobileShell.hide-controls #mobileBottom { display: none; }
+    #mobileShell.hide-controls #mobileHideHint { display: flex; }
+    #mobileHideHint { display: none; position: absolute; top: 10px; right: 10px; width: 40px; height: 40px; border-radius: 20px; background: rgba(0,0,0,0.55); color: #fff; align-items: center; justify-content: center; font-size: 22px; font-weight: 700; z-index: 20; -webkit-tap-highlight-color: transparent; }
+    .faceWrap { flex: 1; display: flex; align-items: center; justify-content: center; }
+    .faceDiamond { width: min(32vh, 180px); height: min(32vh, 180px); position: relative; }
+    .faceBtn { position: absolute; width: min(12vh, 64px); height: min(12vh, 64px); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 16px; font-weight: 700; color: rgba(255,255,255,0.92); border: 2px solid rgba(0,0,0,0.3); box-shadow: 0 4px 0 rgba(0,0,0,0.5), inset 0 2px 4px rgba(255,255,255,0.25); -webkit-tap-highlight-color: transparent; }
+    .faceBtn.held { filter: brightness(0.65); box-shadow: 0 1px 0 rgba(0,0,0,0.4), inset 0 1px 3px rgba(0,0,0,0.3); }
+    /* N64 colors: A blue, B green, C buttons yellow. */
+    .btn-cup    { background: radial-gradient(circle at 38% 32%, #e6c200, #8a7400); top: 0;   left: 50%; transform: translateX(-50%); }
+    .btn-b      { background: radial-gradient(circle at 38% 32%, #44bb66, #116633); top: 50%; left: 0;   transform: translateY(-50%); }
+    .btn-cdown  { background: radial-gradient(circle at 38% 32%, #e6c200, #8a7400); top: 50%; right: 0;  transform: translateY(-50%); }
+    .btn-a      { background: radial-gradient(circle at 38% 32%, #5588ee, #1133aa); bottom: 0; left: 50%; transform: translateX(-50%); }
+    #mobileBottom { position: absolute; bottom: max(30px, calc(env(safe-area-inset-bottom, 0px) + 20px)); left: 50%; transform: translateX(-50%); display: flex; gap: 10px; align-items: center; z-index: 10; }
+    .sysBtn { height: 26px; padding: 0 14px; border-radius: 13px; background: linear-gradient(180deg, #555 0%, #333 100%); border: 1px solid #222; color: #ccc; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
+    .sysBtn.held { filter: brightness(0.6); }
+    .sysBtn.cBtn { background: linear-gradient(180deg, #c9a900 0%, #8a7400 100%); border-color: #6b5a00; color: #fff; text-transform: none; }
+    .menuBtn { width: 34px; height: 34px; border-radius: 17px; background: linear-gradient(180deg, #777 0%, #444 100%); border: 2px solid #222; color: #fff; font-size: 18px; font-weight: 700; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
+    #mobileMenu { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 2000; align-items: center; justify-content: center; }
+    #mobileMenu.open { display: flex; }
+    #mobileMenuBox { background: #222; color: #eee; border-radius: 10px; padding: 20px; min-width: 240px; text-align: center; box-shadow: 0 8px 32px rgba(0,0,0,0.7); }
+    #mobileMenuBox h6 { margin: 0 0 14px; font-size: 12px; text-transform: uppercase; letter-spacing: 2px; color: #888; }
+    #mobileMenuBox button { display: block; width: 100%; margin-bottom: 8px; padding: 10px; border: 1px solid #444; background: #2c2c2c; color: #eee; border-radius: 6px; font-size: 14px; cursor: pointer; }
+    #mobileMenuBox button:last-child { margin-bottom: 0; }
+    #mobileMenuBox button:disabled { opacity: 0.4; }
+    #remapPanel { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 2500; align-items: center; justify-content: center; }
+    #remapPanel.open { display: flex; }
+    #remapBox { background: #1d1d1d; color: #eee; border-radius: 10px; padding: 18px; width: min(560px, 94vw); max-height: 86vh; overflow: auto; box-shadow: 0 8px 32px rgba(0,0,0,0.7); }
+    #remapBox h6 { margin: 0 0 4px; font-size: 12px; text-transform: uppercase; letter-spacing: 2px; color: #888; text-align: center; }
+    #remapHint { font-size: 11px; color: #777; text-align: center; margin-bottom: 10px; min-height: 14px; }
+    .remapRow { display: flex; align-items: center; gap: 8px; padding: 3px 0; border-bottom: 1px solid #2a2a2a; }
+    .remapRow span.lbl { flex: 1; font-size: 13px; }
+    .remapRow button { min-width: 92px; padding: 5px 8px; border: 1px solid #444; background: #2c2c2c; color: #ddd; border-radius: 5px; font-size: 12px; font-family: monospace; cursor: pointer; }
+    .remapRow button.capturing { background: #2a6b4a; border-color: #3a8b5a; color: #fff; }
+    #remapActions { display: flex; gap: 8px; margin-top: 12px; }
+    #remapActions button { flex: 1; padding: 9px; border: 1px solid #444; background: #2c2c2c; color: #eee; border-radius: 6px; font-size: 13px; cursor: pointer; }
+    #remapActions #remapSave { background: #2a6b4a; border-color: #2a6b4a; }
+    #toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); padding: 10px 18px; border-radius: 6px; background: rgba(0,0,0,0.85); color: #fff; font-size: 13px; z-index: 9999; opacity: 0; transition: opacity 0.2s; pointer-events: none; max-width: 90vw; }
+    #toast.show { opacity: 1; }
+    #toast.err { background: rgba(170, 40, 40, 0.95); }
+    #rotateHint { display: none; position: fixed; inset: 0; background: #111; color: #eee; align-items: center; justify-content: center; font-size: 18px; text-align: center; z-index: 3000; padding: 40px; }
+    #mobileSplash { display: none; position: absolute; inset: 0; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 24px; z-index: 2000; color: #eee; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); text-align: center; }
+    #mobileSplash h3 { margin: 0 0 4px; font-size: 22px; }
+    #mobileSplash label { font-size: 14px; opacity: 0.8; }
+    #mobileSplash select, #mobileSplash button { font-size: 16px; padding: 12px 20px; min-width: 240px; border-radius: 8px; border: 1px solid #444; background: #222; color: #fff; -webkit-appearance: none; }
+    #mobileSplash button#mobileSplashStart { background: #2a6b4a; border-color: #2a6b4a; cursor: pointer; z-index: 3000; position: relative; }
+    #mobileSplash .rotateTip { font-size: 12px; opacity: 0.55; margin-top: 8px; }
+    #mobileStatus { position: absolute; top: 10px; width: 100%; text-align: center; color: #888; z-index: 3000; font-size: 12px; }
+    #n64Stubs { display: none !important; }
+  </style>
+</head>
+<body>
+<div id="desktop">
+  <h3 id="title">N64 Wasm</h3>
+  <div id="controlBar">
+    <select id="romSelect"></select>
+    <button id="btnStart">Start</button>
+    <button id="btnSave" disabled>Save State</button>
+    <button id="btnLoad" disabled>Load State</button>
+    <button id="btnMute" disabled>🔊 Mute</button>
+    <button id="btnReset" disabled>↻ Reset</button>
+    <button id="btnFull" disabled>⛶ Fullscreen</button>
+    <button id="btnRemap" type="button">⌨ Remap</button>
+    <button id="btnLog" type="button">Toggle Log</button>
+  </div>
+  <div id="canvasDiv"><canvas id="canvas" width="640" height="480"></canvas></div>
+  <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
+  <div id="keyLegend">Keys — Stick: W/A/S/D · D-pad: Arrows · A: M · B: N · Start: Enter · C: I/J/K/L · Z: Z · L: Q · R: E</div>
+  <pre id="log" tabindex="0"></pre>
+</div>
+<!-- DOM contract stubs required by N64Wasm's script.js ctor (rivets.bind targets,
+     file inputs, drop area). Never displayed; they only need to be non-null. -->
+<div id="n64Stubs">
+  <div id="topPanel"></div><div id="bottomPanel"></div><div id="loginModal"></div>
+  <div id="buttonsModal"></div><div id="lblError"></div><div id="mobileBottomPanel"></div>
+  <div id="mobileButtons"></div><div id="dropArea"></div>
+  <input type="file" id="file-upload"><input type="file" id="file-upload-eep">
+  <input type="file" id="file-upload-sra"><input type="file" id="file-upload-fla">
+</div>
+<div id="mobileShell">
+  <div id="mobileStatus"></div>
+  <div id="mobileSplash">
+    <h3>N64 Wasm</h3>
+    <label for="mobileRomSelect">Choose a game</label>
+    <select id="mobileRomSelect"></select>
+    <button id="mobileSplashStart" type="button">Start</button>
+    <p class="rotateTip">Rotate to landscape for the best view.</p>
+  </div>
+  <div id="mobileScreen"></div>
+  <div class="mobileSide left">
+    <div class="shoulderStack"><div class="shoulderBtn" id="mobileL">L</div><div class="shoulderBtn" id="mobileZ">Z</div></div>
+    <div class="dpadWrap">
+      <div class="dpadDisc" id="mobileStickDisc">
+        <div class="arr arr-up"></div><div class="arr arr-down"></div><div class="arr arr-left"></div><div class="arr arr-right"></div>
+        <div id="stickNub"></div>
+      </div>
+    </div>
+  </div>
+  <div class="mobileSide right">
+    <div class="shoulderStack"><div class="shoulderBtn" id="mobileR">R</div><div class="shoulderBtn cBtn" id="mobileCRight">C▶</div></div>
+    <div class="faceWrap">
+      <div class="faceDiamond">
+        <div class="faceBtn btn-cup" id="mobileCUp">C▲</div><div class="faceBtn btn-b" id="mobileB">B</div>
+        <div class="faceBtn btn-cdown" id="mobileCDown">C▼</div><div class="faceBtn btn-a" id="mobileA">A</div>
+      </div>
+    </div>
+  </div>
+  <div id="mobileBottom">
+    <div class="sysBtn cBtn" id="mobileCLeft">C◀</div>
+    <div class="menuBtn" id="mobileMenuBtn">≡</div>
+    <div class="sysBtn" id="mobileStart">Start</div>
+  </div>
+  <div id="mobileHideHint" title="Show controls">≡</div>
+  <div id="mobileMenu">
+    <div id="mobileMenuBox">
+      <h6>Menu</h6>
+      <button id="mSave" disabled>Save State</button><button id="mLoad" disabled>Load State</button>
+      <button id="mMute" disabled>Mute</button><button id="mReset" disabled>Reset</button>
+      <button id="mGhost">Transparent Controls: Off</button>
+      <button id="mHide">Hide Controls: Off</button>
+      <button id="mRemap">Remap Controls</button>
+      <button id="mFull" disabled>Fullscreen</button><button id="mClose">Close</button>
+    </div>
+  </div>
+  <div id="rotateHint">Rotate to landscape for the best view.<br><span style="font-size:13px;opacity:0.6">Tap to keep playing vertically.</span></div>
+  <div id="toast"></div>
+</div>
+<div id="remapPanel">
+  <div id="remapBox">
+    <h6>Remap Controls</h6>
+    <div id="remapHint">Click a binding, then press the new key or controller button.</div>
+    <div id="remapRows"></div>
+    <div id="remapActions">
+      <button id="remapSave">Save</button>
+      <button id="remapDefaults">Defaults</button>
+      <button id="remapClose">Close</button>
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+  'use strict';
+  // script.js's ctor dereferences both of these at construction (S:84-98);
+  // ROMLIST stays empty because this page owns its own ROM list/select.
+  window.N64WASMSETTINGS = { CLOUDSAVEURL: '', SHOWADVANCED: false, SHOWOPTIONS: false };
+  window.ROMLIST = [];
+  // url is resolved against <base> (the dist dir), so '../roms/...' lands in N64Wasm/roms/.
+  const ROMS = [
+    { label: 'Super Mario 64', file: 'sm64.z64' },
+    { label: 'Mario Kart 64', file: 'mariokart.z64' },
+    { label: 'Zelda: Ocarina of Time', file: 'oot.z64' },
+    { label: 'Paper Mario', file: 'papermario.z64' },
+    { label: 'Star Fox 64', file: 'starfox.z64' },
+    { label: 'Pokémon Snap', file: 'pkmnsnap.z64' },
+    { label: 'Donkey Kong 64', file: 'dk64.z64' },
+    { label: 'Banjo-Tooie', file: 'banjo-tooie.z64' },
+    { label: "Conker's Bad Fur Day", file: 'conker.z64' },
+    { label: 'Diddy Kong Racing', file: 'diddyKongRacing.z64' },
+    { label: 'Star Wars Episode I: Racer', file: 'podracer.z64' },
+    { label: "Cruis'n USA", file: 'crusin.z64' },
+    { label: 'NFL Blitz 2001', file: 'blitz2001.z64' },
+    { label: 'The New Tetris', file: 'newTetris.z64' },
+    { label: 'Gauntlet Legends', file: 'gauntletLegends.z64' },
+    { label: 'ClayFighter 63⅓', file: 'clayFighter.z64' },
+    { label: 'Flying Dragon', file: 'flyingDragon.z64' },
+    { label: 'Wheel of Fortune', file: 'thewheel.z64' },
+    { label: 'Mario Party', file: 'mariopartynew.z64' },
+    { label: 'Dinosaur Planet', file: 'dinosaurplanet.z64' },
+    { label: 'Super Mario 64: Star Road', file: 'superMarioStarRoad.z64' },
+    { label: 'Zelda: The Missing Link', file: 'zeldaMasterOfTime.z64' },
+    { label: 'Banjo-Kazooie: Jiggies of Time', file: 'bk-jiggiesoftime.z64' },
+    { label: 'Banjo-Dreamie', file: 'Banjo-Dreamie.z64' },
+    { label: 'Banjo-Kazooie: Christmas Edition', file: 'banjoChristmas.z64' },
+    { label: 'Star Fox: Survival', file: 'starfoxsurvival.z64' },
+    { label: 'Mario (hack)', file: 'marioo.z64' }
+  ];
+  const $ = id => document.getElementById(id);
+  (function populateRomSelect() {
+    var selects = [$('romSelect'), $('mobileRomSelect')].filter(Boolean); if (!selects.length) return;
+    selects.forEach(function (sel) { ROMS.forEach(function (r, i) { var opt = document.createElement('option'); opt.value = String(i); opt.textContent = r.label; sel.appendChild(opt); }); });
+    var saved = localStorage.getItem('n64wasm_romIdx'); if (saved !== null && saved >= 0 && saved < ROMS.length) { selects.forEach(function (s) { s.value = saved; }); }
+    selects.forEach(function (sel) { sel.addEventListener('change', function () { localStorage.setItem('n64wasm_romIdx', sel.value); selects.forEach(function (s) { if (s !== sel) s.value = sel.value; }); }); });
+  })();
+  const logEl = $('log'), statusEl = $('status'), mobileStatusEl = $('mobileStatus'), fpsEl = $('fps'), toastEl = $('toast');
+  function pageLog(s) { if (logEl) { logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; } console.log(s); }
+  function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
+  function toast(msg, isErr) { toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200); }
+  const isMobile = (() => { const ua = navigator.userAgent.toLowerCase(); return /iphone|ipad|ipod|android|mobile|xbox/.test(ua) || ('ontouchstart' in window) || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile'); })();
+
+  // Host-loop FPS: the core runs one mainLoop per requestAnimationFrame tick
+  // (emscripten_set_main_loop in mymain.cpp), so wrapped-RAF callback rate ==
+  // effective emulator speed. Installed before any emulator script loads.
+  var rafTicks = 0;
+  (function wrapRaf() { var o = window.requestAnimationFrame.bind(window); window.requestAnimationFrame = function (cb) { return o(function (t) { rafTicks++; cb(t); }); }; })();
+  setInterval(function () { if (running) { fpsEl.textContent = 'FPS: ' + rafTicks; } rafTicks = 0; }, 1000);
+
+  // N64 pad state owned by the page (touch overlay + anything routed through dispatchKey).
+  // Delivery is core-pulled: in mobile mode the wasm calls
+  // myApp.rivetsData.inputController.updateMobileControls() once per frame (mymain.cpp
+  // processMobileControls EM_ASM); our override below feeds it this state. Desktop
+  // keyboard/gamepad never touch this — the core reads those natively from config.txt
+  // mappings via emscripten HTML5 callbacks.
+  var mobilePadState = { a: false, b: false, z: false, l: false, r: false, start: false, cup: false, cdown: false, cleft: false, cright: false, up: false, down: false, left: false, right: false };
+  var stickVec = { x: 0, y: 0 }; // -1..1, y positive = up (nipplejs convention; core negates for axis1)
+
+  function dispatchKey(type, btn) { if (btn in mobilePadState) mobilePadState[btn] = (type === 'keydown'); }
+
+  function wireButton(id, btn) {
+    var el = $(id); if (!el) return;
+    function press(e) { if (e && e.preventDefault) e.preventDefault(); dispatchKey('keydown', btn); el.classList.add('held'); }
+    function release(e) { if (e && e.preventDefault) e.preventDefault(); dispatchKey('keyup', btn); el.classList.remove('held'); }
+    if (window.PointerEvent) {
+      el.addEventListener('pointerdown', function (e) { try { el.setPointerCapture(e.pointerId); } catch (_) {} press(e); });
+      el.addEventListener('pointerup', release); el.addEventListener('pointercancel', release); el.addEventListener('pointerleave', release);
+    }
+    el.addEventListener('touchstart', press, { passive: false }); el.addEventListener('touchend', release, { passive: false }); el.addEventListener('touchcancel', release, { passive: false });
+    el.addEventListener('mousedown', press); el.addEventListener('mouseup', release); el.addEventListener('mouseleave', release);
+  }
+
+  // Analog stick on the disc: pointer offset from center -> stickVec, with the
+  // nub tracking the touch for feedback. Deadzone 12%, saturates at 80% radius.
+  function wireStick() {
+    var disc = $('mobileStickDisc'); if (!disc) return;
+    var nub = $('stickNub');
+    var captureId = null;
+    function setVec(x, y) {
+      var rect = disc.getBoundingClientRect();
+      var cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+      var r = rect.width / 2 * 0.8;
+      var dx = (x - cx) / r, dy = (y - cy) / r;
+      var len = Math.hypot(dx, dy);
+      if (len > 1) { dx /= len; dy /= len; len = 1; }
+      if (len < 0.12) { dx = 0; dy = 0; }
+      stickVec.x = dx; stickVec.y = -dy;
+      if (nub) nub.style.transform = 'translate(' + (dx * 31) + '%, ' + (dy * 31) + '%)'.replace(/NaN/g, '0');
+    }
+    function reset() { stickVec.x = 0; stickVec.y = 0; if (nub) nub.style.transform = ''; captureId = null; }
+    function onDown(e) { if (e.preventDefault) e.preventDefault(); try { disc.setPointerCapture(e.pointerId); } catch (_) {} captureId = e.pointerId; setVec(e.clientX, e.clientY); }
+    function onMove(e) {
+      if (captureId != null && e.pointerId !== captureId) return;
+      if (e.pointerType === 'mouse' && !e.buttons) return;
+      if (e.preventDefault) e.preventDefault();
+      setVec(e.clientX, e.clientY);
+    }
+    if (window.PointerEvent) {
+      disc.addEventListener('pointerdown', onDown);
+      disc.addEventListener('pointermove', onMove);
+      disc.addEventListener('pointerup', reset);
+      disc.addEventListener('pointercancel', reset);
+      disc.addEventListener('pointerleave', function (e) { if (captureId == null || e.pointerId === captureId) reset(); });
+    }
+    disc.addEventListener('touchstart', function (e) { if (e.preventDefault) e.preventDefault(); var t = e.touches[0]; if (t) setVec(t.clientX, t.clientY); }, { passive: false });
+    disc.addEventListener('touchmove',  function (e) { if (e.preventDefault) e.preventDefault(); var t = e.touches[0]; if (t) setVec(t.clientX, t.clientY); }, { passive: false });
+    disc.addEventListener('touchend', reset);
+    disc.addEventListener('touchcancel', reset);
+  }
+
+  function wireMobileControls() {
+    wireButton('mobileA', 'a'); wireButton('mobileB', 'b');
+    wireButton('mobileCUp', 'cup'); wireButton('mobileCDown', 'cdown');
+    wireButton('mobileCLeft', 'cleft'); wireButton('mobileCRight', 'cright');
+    wireButton('mobileZ', 'z'); wireButton('mobileL', 'l'); wireButton('mobileR', 'r');
+    wireButton('mobileStart', 'start');
+    wireStick();
+  }
+
+  // Builds the 14-char button string neil_send_mobile_controls expects
+  // (mymain.cpp:1851: UP DOWN LEFT RIGHT A B START Z L R CUP CDOWN CLEFT CRIGHT).
+  function pushControlsToCore() {
+    var p = mobilePadState;
+    var s = (p.up ? '1' : '0') + (p.down ? '1' : '0') + (p.left ? '1' : '0') + (p.right ? '1' : '0') +
+            (p.a ? '1' : '0') + (p.b ? '1' : '0') + (p.start ? '1' : '0') + (p.z ? '1' : '0') +
+            (p.l ? '1' : '0') + (p.r ? '1' : '0') +
+            (p.cup ? '1' : '0') + (p.cdown ? '1' : '0') + (p.cleft ? '1' : '0') + (p.cright ? '1' : '0');
+    window.myApp.sendMobileControls(s, String(stickVec.x), String(stickVec.y));
+  }
+
+  var started = false, running = false;
+  var pendingRom = null;
+
+  // script.js calls window.postLoad() right after constructing myApp and BEFORE
+  // it defines window.Module / chain-loads input_controller.js + n64wasm.js —
+  // the one hook where myApp exists but nothing has booted. All page-side
+  // patches to the vendored UI controller go here.
+  window.postLoad = function () {
+    var app = window.myApp;
+    // Old-UI mobile layout must never run (it expects dist/n64.html's DOM and
+    // would reparent our canvas); the core-side mobile input pull is kept via
+    // the ForceMobile config flag instead.
+    app.setupMobileMode = function () {};
+    app.resizeCanvas = function () {};
+    app.rivetsData.settingMobile = isMobile ? 'ForceMobile' : 'ForceDesktop';
+    // Our status bar owns FPS display; don't burn the core's counter into the frame.
+    app.rivetsData.showFPS = false;
+    // Surface core prints in our log pane and flip status when the game starts.
+    var origPrint = app.processPrintStatement.bind(app);
+    app.processPrintStatement = function (text) {
+      origPrint(text);
+      pageLog('> ' + text);
+      if (String(text).indexOf('Starting R4300 emulator') !== -1) {
+        running = true;
+        setStatus('Running.');
+      }
+    };
+  };
+
+  function onModuleReady() {
+    // input_controller.js has run by now; route the core's per-frame mobile
+    // pull to our pad state.
+    window.myApp.rivetsData.inputController.updateMobileControls = pushControlsToCore;
+    if (pendingRom) { var r = pendingRom; pendingRom = null; loadRom(r); }
+  }
+
+  async function loadRom(rom) {
+    setStatus('Downloading ' + rom.label + '…');
+    try {
+      var resp = await fetch('../roms/' + rom.file);
+      if (!resp.ok) { setStatus('ROM fetch failed: HTTP ' + resp.status); toast('ROM fetch failed', true); return; }
+      var contentLen = +(resp.headers.get('Content-Length') || 0);
+      var reader = resp.body.getReader();
+      var chunks = [], got = 0;
+      while (true) {
+        var step = await reader.read();
+        if (step.done) break;
+        chunks.push(step.value); got += step.value.length;
+        setStatus('Downloading ' + rom.label + '… ' + (got / 1048576).toFixed(1) + (contentLen ? ' / ' + (contentLen / 1048576).toFixed(1) : '') + ' MB');
+      }
+      var bytes = new Uint8Array(got), off = 0;
+      for (var i = 0; i < chunks.length; i++) { bytes.set(chunks[i], off); off += chunks[i].length; }
+      chunks = null;
+      setStatus('Starting ' + rom.label + '…');
+      // rom_name keys all saves in script.js's IndexedDB (only loadRom() sets it
+      // normally, and we bypass loadRom's #romselect read). The old page's
+      // extractRomName keeps the extension ('mariokart.z64'), so match it
+      // exactly or saves made on the old page would orphan.
+      window.myApp.rom_name = rom.file;
+      await window.myApp.LoadEmulator(bytes);
+      [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnReset'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mReset'), $('mFull')].forEach(b => b && (b.disabled = false));
+    } catch (e) {
+      pageLog('[rom] load failed: ' + e);
+      setStatus('Load failed: ' + (e.message || e));
+      toast('Load failed', true);
+    }
+  }
+
+  function startEmulator() {
+    if (started) return; started = true;
+    var sel = $('romSelect');
+    var pick = ROMS[+sel.value] || ROMS[0];
+    sel.disabled = true; $('btnStart').disabled = true;
+    pageLog('[ui] selected ROM: ' + pick.label);
+    pendingRom = pick;
+    setStatus('Loading core…');
+    // script.js chain-loads input_controller.js -> n64wasm.js (both resolve via <base>).
+    var s = document.createElement('script');
+    s.src = '/n64/N64Wasm/dist/script.js?v=' + Date.now();
+    s.onerror = function () { setStatus('Failed to load emulator core.'); };
+    document.body.appendChild(s);
+    var poll = setInterval(function () {
+      if (window.myApp && window.myApp.rivetsData && window.myApp.rivetsData.moduleInitializing === false) {
+        clearInterval(poll);
+        onModuleReady();
+      }
+    }, 50);
+  }
+  $('btnStart').addEventListener('click', startEmulator);
+
+  // iOS/mobile: LoadEmulator's AudioContext is created long after the splash tap
+  // gesture (post ROM download), so it can start suspended — resume on any
+  // later interaction.
+  function resumeAudio() { var ctx = window.myApp && window.myApp.audioContext; if (ctx && ctx.state === 'suspended' && !audioMuted) ctx.resume().catch(function () {}); }
+  document.addEventListener('click', resumeAudio); document.addEventListener('keydown', resumeAudio);
+  document.addEventListener('touchend', resumeAudio); document.addEventListener('visibilitychange', resumeAudio);
+
+  var audioMuted = false;
+  function toggleMute() {
+    var app = window.myApp; if (!app || !app.gainNode) { toast('Audio not ready', true); return; }
+    audioMuted = !audioMuted;
+    app.gainNode.gain.value = audioMuted ? 0 : 0.5;
+    $('btnMute').textContent = audioMuted ? '🔇 Unmute' : '🔊 Mute';
+    $('mMute').textContent = audioMuted ? 'Unmute' : 'Mute';
+  }
+  function saveState() { if (!running) return toast('Emulator not running', true); window.myApp.saveStateLocal(); toast('State saved'); }
+  function loadState() { if (!running) return toast('Emulator not running', true); window.myApp.loadStateLocal(); toast('State loaded'); }
+  function resetGame() { if (!running) return toast('Emulator not running', true); window.Module._neil_reset(); toast('Reset'); }
+  function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasDiv'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
+  $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnMute').addEventListener('click', toggleMute); $('btnReset').addEventListener('click', resetGame); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
+
+  function openMobileMenu() { $('mobileMenu').classList.add('open'); } function closeMobileMenu() { $('mobileMenu').classList.remove('open'); }
+  function applyGhost(on) { $('mobileShell').classList.toggle('ghost', on); if ($('mGhost')) $('mGhost').textContent = 'Transparent Controls: ' + (on ? 'On' : 'Off'); }
+  function toggleGhost() { var on = !$('mobileShell').classList.contains('ghost'); localStorage.setItem('n64wasm_ghost', on ? '1' : '0'); applyGhost(on); }
+  applyGhost(localStorage.getItem('n64wasm_ghost') === '1');
+  function applyHide(on) { $('mobileShell').classList.toggle('hide-controls', on); if ($('mHide')) $('mHide').textContent = 'Hide Controls: ' + (on ? 'On' : 'Off'); }
+  function toggleHide() { var on = !$('mobileShell').classList.contains('hide-controls'); localStorage.setItem('n64wasm_hide', on ? '1' : '0'); applyHide(on); }
+  applyHide(localStorage.getItem('n64wasm_hide') === '1');
+  $('mobileMenuBtn').addEventListener('click', openMobileMenu); $('mClose').addEventListener('click', closeMobileMenu); $('mSave').addEventListener('click', () => { saveState(); closeMobileMenu(); }); $('mLoad').addEventListener('click', () => { loadState(); closeMobileMenu(); }); $('mMute').addEventListener('click', () => { toggleMute(); closeMobileMenu(); }); $('mReset').addEventListener('click', () => { resetGame(); closeMobileMenu(); }); $('mGhost').addEventListener('click', toggleGhost); $('mHide').addEventListener('click', () => { toggleHide(); closeMobileMenu(); }); $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMobileMenu(); });
+  $('mobileHideHint').addEventListener('click', () => { applyHide(false); localStorage.setItem('n64wasm_hide', '0'); });
+
+  // ---- Control remapping ----
+  // Same data model + persistence as the vendored UI: a KeyMappings object
+  // (Mapping_* = e.key names for the keyboard, Joy_Mapping_* = gamepad button
+  // indices, -1 = unbound) stored in localStorage 'n64wasm_mappings_v3'.
+  // script.js's setupInputController() loads that key at boot, so mappings
+  // customized on the old page carry over here unchanged. The core reads them
+  // from config.txt written at game start — changes made while a game is
+  // running apply on the next start.
+  var MAPPING_DEFAULTS = {
+    Mapping_Left: 'ArrowLeft', Mapping_Right: 'ArrowRight', Mapping_Up: 'ArrowUp', Mapping_Down: 'ArrowDown',
+    Mapping_Action_A: 'm', Mapping_Action_B: 'n', Mapping_Action_Start: 'Enter',
+    Mapping_Action_CUP: 'i', Mapping_Action_CDOWN: 'k', Mapping_Action_CLEFT: 'j', Mapping_Action_CRIGHT: 'l',
+    Mapping_Action_Analog_Up: 'w', Mapping_Action_Analog_Down: 's', Mapping_Action_Analog_Left: 'a', Mapping_Action_Analog_Right: 'd',
+    Mapping_Action_Z: 'z', Mapping_Action_L: 'q', Mapping_Action_R: 'e', Mapping_Menu: '`',
+    Joy_Mapping_Left: 14, Joy_Mapping_Right: 15, Joy_Mapping_Down: 13, Joy_Mapping_Up: 12,
+    Joy_Mapping_Action_A: 0, Joy_Mapping_Action_B: 2, Joy_Mapping_Action_Start: 9,
+    Joy_Mapping_Action_Z: 4, Joy_Mapping_Action_L: 6, Joy_Mapping_Action_R: 5, Joy_Mapping_Menu: 11,
+    Joy_Mapping_Action_CLEFT: -1, Joy_Mapping_Action_CRIGHT: -1, Joy_Mapping_Action_CUP: -1, Joy_Mapping_Action_CDOWN: -1
+  };
+  var REMAP_ACTIONS = [
+    { label: 'Analog Up', key: 'Mapping_Action_Analog_Up' }, { label: 'Analog Down', key: 'Mapping_Action_Analog_Down' },
+    { label: 'Analog Left', key: 'Mapping_Action_Analog_Left' }, { label: 'Analog Right', key: 'Mapping_Action_Analog_Right' },
+    { label: 'D-pad Up', key: 'Mapping_Up', joy: 'Joy_Mapping_Up' }, { label: 'D-pad Down', key: 'Mapping_Down', joy: 'Joy_Mapping_Down' },
+    { label: 'D-pad Left', key: 'Mapping_Left', joy: 'Joy_Mapping_Left' }, { label: 'D-pad Right', key: 'Mapping_Right', joy: 'Joy_Mapping_Right' },
+    { label: 'A', key: 'Mapping_Action_A', joy: 'Joy_Mapping_Action_A' }, { label: 'B', key: 'Mapping_Action_B', joy: 'Joy_Mapping_Action_B' },
+    { label: 'Start', key: 'Mapping_Action_Start', joy: 'Joy_Mapping_Action_Start' },
+    { label: 'Z', key: 'Mapping_Action_Z', joy: 'Joy_Mapping_Action_Z' },
+    { label: 'L', key: 'Mapping_Action_L', joy: 'Joy_Mapping_Action_L' }, { label: 'R', key: 'Mapping_Action_R', joy: 'Joy_Mapping_Action_R' },
+    { label: 'C Up', key: 'Mapping_Action_CUP', joy: 'Joy_Mapping_Action_CUP' }, { label: 'C Down', key: 'Mapping_Action_CDOWN', joy: 'Joy_Mapping_Action_CDOWN' },
+    { label: 'C Left', key: 'Mapping_Action_CLEFT', joy: 'Joy_Mapping_Action_CLEFT' }, { label: 'C Right', key: 'Mapping_Action_CRIGHT', joy: 'Joy_Mapping_Action_CRIGHT' },
+    { label: 'Menu', key: 'Mapping_Menu', joy: 'Joy_Mapping_Menu' }
+  ];
+  var MAPPINGS_LS_KEY = 'n64wasm_mappings_v3';
+  function loadMappings() {
+    var m = Object.assign({}, MAPPING_DEFAULTS);
+    try { var saved = JSON.parse(localStorage.getItem(MAPPINGS_LS_KEY) || '{}'); for (var k in saved) { if (k in m) m[k] = saved[k]; } } catch (e) {}
+    return m;
+  }
+  var remapState = null; // working copy while the panel is open
+  var captureCancel = null;
+  function fmtKey(v) { return v === ' ' ? 'Space' : String(v); }
+  function fmtJoy(v) { return v === -1 || v === '-1' ? '—' : 'Btn ' + v; }
+  function renderRemapRows() {
+    var box = $('remapRows'); box.innerHTML = '';
+    REMAP_ACTIONS.forEach(function (a) {
+      var row = document.createElement('div'); row.className = 'remapRow';
+      var lbl = document.createElement('span'); lbl.className = 'lbl'; lbl.textContent = a.label; row.appendChild(lbl);
+      if (a.key) {
+        var kb = document.createElement('button'); kb.textContent = fmtKey(remapState[a.key]);
+        kb.addEventListener('click', function () { captureKey(a.key, kb); });
+        row.appendChild(kb);
+      }
+      if (a.joy) {
+        var jb = document.createElement('button'); jb.textContent = fmtJoy(remapState[a.joy]);
+        jb.addEventListener('click', function () { captureJoy(a.joy, jb); });
+        row.appendChild(jb);
+      } else if (a.key) {
+        var pad = document.createElement('button'); pad.disabled = true; pad.style.visibility = 'hidden'; row.appendChild(pad);
+      }
+      box.appendChild(row);
+    });
+  }
+  function stopCapture() { if (captureCancel) { captureCancel(); captureCancel = null; } $('remapHint').textContent = 'Click a binding, then press the new key or controller button.'; }
+  function captureKey(field, btn) {
+    stopCapture();
+    btn.classList.add('capturing'); btn.textContent = '…';
+    $('remapHint').textContent = 'Press a key (Esc cancels).';
+    function onKey(e) {
+      e.preventDefault(); e.stopImmediatePropagation();
+      if (e.key !== 'Escape') { remapState[field] = e.key; }
+      cleanup();
+    }
+    function cleanup() { window.removeEventListener('keydown', onKey, true); btn.classList.remove('capturing'); btn.textContent = fmtKey(remapState[field]); $('remapHint').textContent = 'Click a binding, then press the new key or controller button.'; captureCancel = null; }
+    window.addEventListener('keydown', onKey, true);
+    captureCancel = cleanup;
+  }
+  function captureJoy(field, btn) {
+    stopCapture();
+    btn.classList.add('capturing'); btn.textContent = '…';
+    $('remapHint').textContent = 'Press a controller button (or wait to cancel).';
+    var baseline = {};
+    Array.from((navigator.getGamepads && navigator.getGamepads()) || []).forEach(function (gp) { if (gp) (gp.buttons || []).forEach(function (b, i) { if (b && b.pressed) baseline[gp.index + ':' + i] = true; }); });
+    var deadline = Date.now() + 10000;
+    var iv = setInterval(function () {
+      if (Date.now() > deadline) { cleanup(); return; }
+      var pads = Array.from((navigator.getGamepads && navigator.getGamepads()) || []);
+      for (var p = 0; p < pads.length; p++) {
+        var gp = pads[p]; if (!gp) continue;
+        var btns = gp.buttons || [];
+        for (var i = 0; i < btns.length; i++) {
+          if (btns[i] && btns[i].pressed && !baseline[gp.index + ':' + i]) { remapState[field] = i; cleanup(); return; }
+        }
+      }
+    }, 50);
+    function cleanup() { clearInterval(iv); btn.classList.remove('capturing'); btn.textContent = fmtJoy(remapState[field]); $('remapHint').textContent = 'Click a binding, then press the new key or controller button.'; captureCancel = null; }
+    captureCancel = cleanup;
+  }
+  function openRemap() { remapState = loadMappings(); renderRemapRows(); $('remapPanel').classList.add('open'); closeMobileMenu(); }
+  function closeRemap() { stopCapture(); $('remapPanel').classList.remove('open'); }
+  function saveRemap() {
+    stopCapture();
+    localStorage.setItem(MAPPINGS_LS_KEY, JSON.stringify(remapState));
+    // apply live where possible: pre-boot, config.txt picks these up at start
+    if (window.myApp && window.myApp.rivetsData && window.myApp.rivetsData.inputController) {
+      var km = window.myApp.rivetsData.inputController.KeyMappings;
+      for (var k in remapState) { if (k in km) km[k] = remapState[k]; }
+      if (window.myApp.rivetsData.inputController.setGamePadButtons) window.myApp.rivetsData.inputController.setGamePadButtons();
+    }
+    toast(running ? 'Saved — restart the game to apply' : 'Mappings saved');
+    closeRemap();
+  }
+  $('btnRemap').addEventListener('click', openRemap);
+  $('mRemap').addEventListener('click', openRemap);
+  $('remapClose').addEventListener('click', closeRemap);
+  $('remapSave').addEventListener('click', saveRemap);
+  $('remapDefaults').addEventListener('click', function () { remapState = Object.assign({}, MAPPING_DEFAULTS); renderRemapRows(); });
+
+  // Xbox Edge: L3 triggers browser-back; trap it so it can't unload the page.
+  // (Physical gamepads are read natively by the core via the emscripten HTML5
+  // gamepad API + config.txt button mappings — no page-side polling needed.)
+  try { history.pushState({ n64: 1 }, ''); } catch (e) {}
+  window.addEventListener('popstate', function () { try { history.pushState({ n64: 1 }, ''); } catch (_) {} });
+  window.addEventListener('keydown', function (e) { if (e.key === 'BrowserBack' || e.key === 'BrowserForward' || e.key === 'GoBack') { e.preventDefault(); e.stopPropagation(); } }, true);
+
+  // Portrait is playable (e.g. Star Fox), so the rotate prompt is a dismissible
+  // hint, not a blocker: tap once to play vertically; it stays gone until the
+  // page reloads.
+  var rotateHintDismissed = false;
+  function checkOrientation() { if (!isMobile) return; var landscape = window.innerWidth > window.innerHeight; var show = started && !landscape && !rotateHintDismissed; $('rotateHint').style.display = show ? 'flex' : 'none'; }
+  $('rotateHint').addEventListener('pointerdown', function (e) { e.preventDefault(); rotateHintDismissed = true; checkOrientation(); });
+  window.addEventListener('resize', checkOrientation); window.addEventListener('orientationchange', checkOrientation);
+  if (isMobile) { $('desktop').style.display = 'none'; var c = $('canvas'); c.style.width = ''; c.style.height = ''; $('mobileScreen').appendChild(c); $('mobileShell').style.display = 'block'; $('mobileSplash').style.display = 'flex'; wireMobileControls(); checkOrientation(); $('mobileSplashStart').addEventListener('pointerdown', function (e) { e.preventDefault(); var mSel = $('mobileRomSelect'); var dSel = $('romSelect'); if (mSel && dSel) dSel.value = mSel.value; $('mobileSplash').style.display = 'none'; startEmulator(); checkOrientation(); }); setStatus('Pick a game and tap Start.'); }
+
+  // ?game=<index or filename> preselects; &autostart boots immediately (audio
+  // resumes on first interaction).
+  (function applyUrlParams() {
+    var qs = new URLSearchParams(location.search);
+    if (qs.has('game')) {
+      var g = qs.get('game');
+      var idx = ROMS.findIndex(function (r) { return r.file === g || r.file === g + '.z64'; });
+      if (idx < 0 && /^\d+$/.test(g) && +g < ROMS.length) idx = +g;
+      if (idx >= 0) { ['romSelect', 'mobileRomSelect'].forEach(function (id) { var s = $(id); if (s) s.value = String(idx); }); }
+    }
+    if (qs.has('autostart')) { if (isMobile) $('mobileSplash').style.display = 'none'; startEmulator(); }
+  })();
+})();
+</script>
+</body>
+</html>
