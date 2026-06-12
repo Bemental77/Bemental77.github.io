@@ -869,7 +869,9 @@ static constexpr u32 LOCAL_PSQ_F64 = 100;
 // IEEE-bit-exact for normal/zero/subnormal/inf, so: promote for the common
 // case, integer splice for exp==255 (FPU:607-612 arm, y=1 -> z=0x7<<59:
 // ((x&0xc0000000)<<32) | z | ((x&0x3fffffff)<<29)) — also exact for inf.
-static void emit_psq_convert_to_double(WasmModuleBuilder& wb) {
+// Non-static: also used by jit_floating_point.cpp (op59 singles / frsp)
+// to widen the ForceSingle result back to the f64 register format.
+void emit_psq_convert_to_double(WasmModuleBuilder& wb) {
     // splice value (exp==255 arm)
     wb.op_local_get(LOCAL_PSQ_T0);
     wb.op_i64_extend_i32_u();

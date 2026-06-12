@@ -1368,6 +1368,226 @@ static bool test_psq_lu_ra_writeback() {
     return ra == 0x80100008u;
 }
 
+// ---------------------------------------------------------------------------
+// op59 single-precision arithmetic + op63 frsp (2026-06-12 wave).
+// Reference semantics: Interpreter_FloatingPoint.cpp — result =
+// ForceSingle(fpscr, <f64 op>), ps[FD].Fill(result) (BOTH lanes);
+// fmuls/fmadds-family apply Force25Bit to frC first (Interpreter_FPUtils.h:91).
+// ForceSingle is gated on runtime FPSCR.NI (bit 2): pre-cast flush of
+// |x| < 2^-126 to signed zero + post-cast f32-denormal flush.
+// Red under fallback: the harness interp stub is a no-op, so fd keeps its
+// sentinel until the native emitters land.
+// ---------------------------------------------------------------------------
+
+static void fp_env_common(TestEnv& env) {
+    *(u32*)((u8*)env.ctx_raw + ppc_off::MSR) = 0x2000u;    // MSR.FP=1
+    *(u32*)((u8*)env.ctx_raw + ppc_off::FPSCR) = 0u;       // NI=0 default
+}
+
+static void set_ps(TestEnv& env, u32 n, u64 lane0, u64 lane1) {
+    *(u64*)((u8*)env.ctx_raw + ppc_off::ps0(n)) = lane0;
+    *(u64*)((u8*)env.ctx_raw + ppc_off::ps1(n)) = lane1;
+}
+
+static u64 get_ps0(TestEnv& env, u32 n) { return *(const u64*)((const u8*)env.ctx_raw + ppc_off::ps0(n)); }
+static u64 get_ps1(TestEnv& env, u32 n) { return *(const u64*)((const u8*)env.ctx_raw + ppc_off::ps1(n)); }
+
+static u64 dbits(double d) { u64 r; std::memcpy(&r, &d, 8); return r; }
+
+// Host mirror of Interpreter_FPUtils.h Force25Bit (normal-path only — test
+// vectors avoid double subnormals).
+static double host_force25(double d) {
+    u64 i = dbits(d);
+    i = (i & 0xFFFFFFFFF8000000ull) + (i & 0x8000000ull);
+    double r; std::memcpy(&r, &i, 8); return r;
+}
+
+static const u64 FP_SENTINEL = 0xDEADBEEFCAFEF00Dull;
+
+// fadds f0,f1,f2: 2.5 + 0.25 = 2.75 exactly; BOTH lanes filled.
+static bool test_fadds_fill_both_lanes() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    fp_env_common(env);
+    set_ps(env, 0, FP_SENTINEL, FP_SENTINEL);
+    set_ps(env, 1, 0x4004000000000000ull, 0);  // 2.5
+    set_ps(env, 2, 0x3FD0000000000000ull, 0);  // 0.25
+    const u32 insts[] = { 0xEC01102Au };       // fadds f0,f1,f2
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = get_ps0(env, 0), ps1 = get_ps1(env, 0);
+    std::printf("[diag fadds] ps0=0x%016llx ps1=0x%016llx (exp 4006.. both)\n",
+                (unsigned long long)ps0, (unsigned long long)ps1);
+    return ps0 == 0x4006000000000000ull && ps1 == 0x4006000000000000ull;
+}
+
+// fadds under NI=1: 2^-127 + 0 — result is a single-subnormal magnitude,
+// ForceSingle pre-cast flush => +0.0. Control arm NI=0 keeps 2^-127
+// (exactly representable as f32 subnormal).
+static bool test_fadds_ni_flush_vs_keep() {
+    const u32 PC = 0x80300000;
+    const u32 insts[] = { 0xEC01102Au };       // fadds f0,f1,f2
+    u64 got_ni1, got_ni0;
+    {
+        TestEnv env;
+        if (!env.init()) return false;
+        fp_env_common(env);
+        *(u32*)((u8*)env.ctx_raw + ppc_off::FPSCR) = 0x4u;  // NI=1
+        set_ps(env, 0, FP_SENTINEL, FP_SENTINEL);
+        set_ps(env, 1, 0x3800000000000000ull, 0);  // 2^-127
+        set_ps(env, 2, 0, 0);                      // +0.0
+        s32 next_pc = -1;
+        if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+        got_ni1 = get_ps0(env, 0);
+    }
+    {
+        TestEnv env;
+        if (!env.init()) return false;
+        fp_env_common(env);                         // NI=0
+        set_ps(env, 0, FP_SENTINEL, FP_SENTINEL);
+        set_ps(env, 1, 0x3800000000000000ull, 0);
+        set_ps(env, 2, 0, 0);
+        s32 next_pc = -1;
+        if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+        got_ni0 = get_ps0(env, 0);
+    }
+    std::printf("[diag fadds-ni] ni1=0x%016llx (exp 0) ni0=0x%016llx (exp 3800..)\n",
+                (unsigned long long)got_ni1, (unsigned long long)got_ni0);
+    return got_ni1 == 0ull && got_ni0 == 0x3800000000000000ull;
+}
+
+// fmuls f0,f1,f2: frC=1+2^-25 must be Force25Bit-rounded to 1+2^-24
+// BEFORE the multiply — 3.0 * (1+2^-24) rounds f32-up to 3+2^-22, whereas
+// the un-rounded product 3*(1+2^-25) would round f32-down to 3.0.
+static bool test_fmuls_force25bit_c() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    fp_env_common(env);
+    const u64 c_bits = 0x3FF0000008000000ull;  // 1 + 2^-25
+    set_ps(env, 0, FP_SENTINEL, FP_SENTINEL);
+    set_ps(env, 1, 0x4008000000000000ull, 0);  // 3.0
+    set_ps(env, 2, c_bits, 0);
+    double c; std::memcpy(&c, &c_bits, 8);
+    const u64 expected = dbits((double)(float)(3.0 * host_force25(c)));
+    const u64 naive    = dbits((double)(float)(3.0 * c));
+    const u32 insts[] = { 0xEC0100B2u };       // fmuls f0,f1,f2 (frC=2)
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = get_ps0(env, 0), ps1 = get_ps1(env, 0);
+    std::printf("[diag fmuls-25] ps0=0x%016llx exp=0x%016llx naive=0x%016llx\n",
+                (unsigned long long)ps0, (unsigned long long)expected, (unsigned long long)naive);
+    return ps0 == expected && ps1 == expected && expected != naive;
+}
+
+// fmadds f0,f1,f2,f3 — 2*3 + 0.5 = 6.5 exact, both lanes.
+static bool test_fmadds_basic() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    fp_env_common(env);
+    set_ps(env, 0, FP_SENTINEL, FP_SENTINEL);
+    set_ps(env, 1, 0x4000000000000000ull, 0);  // 2.0 (frA)
+    set_ps(env, 2, 0x4008000000000000ull, 0);  // 3.0 (frC)
+    set_ps(env, 3, 0x3FE0000000000000ull, 0);  // 0.5 (frB)
+    const u32 insts[] = { 0xEC0118BAu };       // fmadds f0,f1,f2,f3
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = get_ps0(env, 0), ps1 = get_ps1(env, 0);
+    std::printf("[diag fmadds] ps0=0x%016llx ps1=0x%016llx (exp 401A.. both)\n",
+                (unsigned long long)ps0, (unsigned long long)ps1);
+    return ps0 == 0x401A000000000000ull && ps1 == 0x401A000000000000ull;
+}
+
+// fnmsubs f0,f1,f2,f3 — -(2*3 - 0.5) = -5.5 both lanes.
+static bool test_fnmsubs_sign() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    fp_env_common(env);
+    set_ps(env, 0, FP_SENTINEL, FP_SENTINEL);
+    set_ps(env, 1, 0x4000000000000000ull, 0);
+    set_ps(env, 2, 0x4008000000000000ull, 0);
+    set_ps(env, 3, 0x3FE0000000000000ull, 0);
+    const u32 insts[] = { 0xEC0118BCu };       // fnmsubs f0,f1,f2,f3 (sub5=30)
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = get_ps0(env, 0), ps1 = get_ps1(env, 0);
+    std::printf("[diag fnmsubs] ps0=0x%016llx ps1=0x%016llx (exp C016.. both)\n",
+                (unsigned long long)ps0, (unsigned long long)ps1);
+    return ps0 == 0xC016000000000000ull && ps1 == 0xC016000000000000ull;
+}
+
+// fdivs f0,f1,f2 — 1.0/3.0 rounded to single, both lanes.
+static bool test_fdivs_round_single() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    fp_env_common(env);
+    set_ps(env, 0, FP_SENTINEL, FP_SENTINEL);
+    set_ps(env, 1, 0x3FF0000000000000ull, 0);  // 1.0
+    set_ps(env, 2, 0x4008000000000000ull, 0);  // 3.0
+    const u64 expected = dbits((double)(float)(1.0 / 3.0));
+    const u32 insts[] = { 0xEC011024u };       // fdivs f0,f1,f2 (sub5=18)
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = get_ps0(env, 0), ps1 = get_ps1(env, 0);
+    std::printf("[diag fdivs] ps0=0x%016llx exp=0x%016llx\n",
+                (unsigned long long)ps0, (unsigned long long)expected);
+    return ps0 == expected && ps1 == expected;
+}
+
+// frsp f0,f2 — 1+2^-30 rounds to 1.0f; Fill BOTH lanes
+// (Interpreter frspx: ps[FD].Fill(rounded)).
+static bool test_frsp_fill_both() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    fp_env_common(env);
+    set_ps(env, 0, FP_SENTINEL, FP_SENTINEL);
+    set_ps(env, 2, 0x3FF0000000400000ull, 0);  // 1 + 2^-30
+    const u32 insts[] = { 0xFC001018u };       // frsp f0,f2 (op63 sub10=12)
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = get_ps0(env, 0), ps1 = get_ps1(env, 0);
+    std::printf("[diag frsp] ps0=0x%016llx ps1=0x%016llx (exp 3FF0.. both)\n",
+                (unsigned long long)ps0, (unsigned long long)ps1);
+    return ps0 == 0x3FF0000000000000ull && ps1 == 0x3FF0000000000000ull;
+}
+
+// fctiwz f14,f14 (0xFDC0701E — the exact encoding in PSO HandleReverb's
+// inner loop at 0x803bf1bc, the loop's LAST interp fallback).
+// Reference: Interpreter ConvertToInteger (TowardsZero): value =
+// NaN -> 0x80000000; >= 2^31 -> 0x7FFFFFFF; < -2^31 -> 0x80000000;
+// else (s32)trunc(b). ps0 = 0xFFF8000000000000 | value, PLUS bit 32 set
+// when value==0 && signbit(b). ps1 UNTOUCHED (SetPS0, not Fill).
+static bool test_fctiwz_vectors() {
+    struct V { u64 in; u64 expect; };
+    const V vs[] = {
+        { 0xBFFC000000000000ull, 0xFFF80000FFFFFFFFull },  // -1.75 -> -1
+        { 0xBFD0000000000000ull, 0xFFF8000100000000ull },  // -0.25 -> 0, signbit quirk
+        { 0x7FF8000000000000ull, 0xFFF8000080000000ull },  // NaN -> 0x80000000
+        { 0x421BF08EB0000000ull, 0xFFF800007FFFFFFFull },  // 3e10 -> saturate +
+    };
+    for (unsigned i = 0; i < sizeof(vs)/sizeof(vs[0]); ++i) {
+        TestEnv env;
+        if (!env.init()) return false;
+        const u32 PC = 0x80300000;
+        fp_env_common(env);
+        set_ps(env, 14, vs[i].in, FP_SENTINEL);
+        const u32 insts[] = { 0xFDC0701Eu };
+        s32 next_pc = -1;
+        if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+        const u64 ps0 = get_ps0(env, 14), ps1 = get_ps1(env, 14);
+        std::printf("[diag fctiwz] v%u in=0x%016llx ps0=0x%016llx exp=0x%016llx ps1=0x%016llx\n",
+                    i, (unsigned long long)vs[i].in, (unsigned long long)ps0,
+                    (unsigned long long)vs[i].expect, (unsigned long long)ps1);
+        if (ps0 != vs[i].expect || ps1 != FP_SENTINEL) return false;
+    }
+    return true;
+}
+
 static const TestCase k_tests[] = {
     {"addi_sequential",                  &test_addi_sequential},
     {"viwait_recheck_block",             &test_viwait_recheck_block},
@@ -1381,6 +1601,14 @@ static const TestCase k_tests[] = {
     {"psq_st_float_ftz_denormal",        &test_psq_st_float_ftz_denormal},
     {"psq_st_s16_clamp_trunc",           &test_psq_st_s16_clamp_trunc},
     {"psq_lu_ra_writeback",              &test_psq_lu_ra_writeback},
+    {"fadds_fill_both_lanes",            &test_fadds_fill_both_lanes},
+    {"fadds_ni_flush_vs_keep",           &test_fadds_ni_flush_vs_keep},
+    {"fmuls_force25bit_c",               &test_fmuls_force25bit_c},
+    {"fmadds_basic",                     &test_fmadds_basic},
+    {"fnmsubs_sign",                     &test_fnmsubs_sign},
+    {"fdivs_round_single",               &test_fdivs_round_single},
+    {"frsp_fill_both",                   &test_frsp_fill_both},
+    {"fctiwz_vectors",                   &test_fctiwz_vectors},
     {"add_register",                     &test_add_register},
     {"bx_unconditional",                 &test_bx_unconditional},
     {"bx_with_link",                     &test_bx_with_link},

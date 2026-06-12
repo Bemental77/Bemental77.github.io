@@ -342,19 +342,31 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     case 60: emit_psq_st(wb, rc, frc, params, op, /*update=*/false); return true;
     case 61: emit_psq_st(wb, rc, frc, params, op, /*update=*/true ); return true;
 
-    case 59:
+    // Opcode 59 — single-precision arith (2026-06-12, the HandleReverb /
+    // audio-mixer hot class). sub5-keyed; fres (24) stays interp (reciprocal
+    // estimate table).
+    case 59: {
+        const u32 sub5_59 = GekkoOperands::SUBOP5(inst);
+        switch (sub5_59) {
+        case 18: case 20: case 21: case 25:  emit_fp_arith_single(wb, rc, frc, op, params.ctx_ptr); return true;
+        case 28: case 29: case 30: case 31:  emit_fp_fma_single  (wb, rc, frc, op, params.ctx_ptr); return true;
+        default: break;
+        }
         emit_fallback(wb, rc, frc, op, params.ctx_ptr);
         return false;
+    }
 
-    // Opcode 63 — scalar f64 trivial sign/copy ops (fmr/fneg/fabs/fnabs).
-    // All others (fadd/fsub/fmul/fdiv/fmadd family/fcmpu/o/frsp/fctiw*/
-    // mffs/mtfsf*) still routed to interp pending full op63 port.
+    // Opcode 63 — scalar f64 trivial sign/copy ops (fmr/fneg/fabs/fnabs),
+    // arith/FMA doubles, frsp. Remaining (fcmpu/o/fctiw*/mffs/mtfsf*/fsel/
+    // frsqrte) still routed to interp.
     case 63: {
         switch (sub10) {
         case  72: emit_fmrx  (wb, rc, frc, op, params.ctx_ptr); return true;
         case  40: emit_fnegx (wb, rc, frc, op, params.ctx_ptr); return true;
         case 264: emit_fabsx (wb, rc, frc, op, params.ctx_ptr); return true;
         case 136: emit_fnabsx(wb, rc, frc, op, params.ctx_ptr); return true;
+        case  12: emit_frsp  (wb, rc, frc, op, params.ctx_ptr); return true;
+        case  15: emit_fctiwz(wb, rc, frc, op, params.ctx_ptr); return true;
         default: break;
         }
         // SUBOP5-keyed arith — 4-operand form (table63 in ppc_tables.cpp
@@ -513,9 +525,12 @@ std::vector<u8> build_block_next(u32 start_pc,
     {
         // Groups 4+5: psq scratch — 2 i32 pair-element stages (locals 98,
         // 99) + one f64 clamp stage (local 100); jit_load_store LOCAL_PSQ_*.
-        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u };
-        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64, WASM_TYPE_I32, WASM_TYPE_F64 };
-        b.emitLocals(5u, counts, types);
+        // Group 6: 2 i64 scratch (locals 101, 102) for op59/frsp
+        // Force25Bit + ForceSingle bit-twiddling; jit_floating_point
+        // LOCAL_FP_I64_*.
+        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u };
+        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64, WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64 };
+        b.emitLocals(6u, counts, types);
     }
 
     // RegCache: assign per-PPC-GPR WASM locals + emit prologue loads

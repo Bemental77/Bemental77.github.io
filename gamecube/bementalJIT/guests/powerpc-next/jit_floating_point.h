@@ -29,5 +29,27 @@ void emit_fnabsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
 void emit_fp_arith_double(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr);
 void emit_fp_fma_double  (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr);
 
+// op59 single-precision arith — result = ForceSingle(fpscr, <f64 op>),
+// Fill BOTH lanes (Interpreter_FloatingPoint.cpp fadds/fmuls/etc use
+// ps[FD].Fill). fmuls/fmadds-family Force25Bit frC first. ForceSingle's
+// NI flushes are RUNTIME-gated on ctx FPSCR bit 2. Documented divergences
+// (same class as the doubles): no FPSCR status/exception bit updates; the
+// FMA family is unfused (f64 mul then add — Jit64-without-hardware-FMA
+// parity; PPC fuses, divergence only on rounding ties).
+// sub5 18=fdivs, 20=fsubs, 21=fadds, 25=fmuls.
+// sub5 28=fmsubs, 29=fmadds, 30=fnmsubs, 31=fnmadds.
+void emit_fp_arith_single(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr);
+void emit_fp_fma_single  (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr);
+
+// op63 sub10=12 frsp — ps[FD].Fill(ForceSingle(fpscr, ps0(fB))).
+// Divergence: SNaN + FPSCR.VE!=0 suppression of the write is not modeled
+// (VE is 0 in shipped titles); VXSNAN/FPRF not updated.
+void emit_frsp(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr);
+
+// op63 sub10=15 fctiwz — round-toward-zero f64->s32 box (ps0 only).
+// PSO HandleReverb inner-loop hot op (0x803bf1bc). fctiw (sub10=14) stays
+// interp (runtime FPSCR.RN dependence).
+void emit_fctiwz(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr);
+
 }  // namespace powerpc
 }  // namespace bemental

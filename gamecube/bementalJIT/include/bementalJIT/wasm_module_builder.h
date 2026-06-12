@@ -114,6 +114,9 @@ namespace wop {
 	constexpr u8 f32_sub       = 0x93;
 	constexpr u8 f32_mul       = 0x94;
 	constexpr u8 f32_div       = 0x95;
+	// i64 comparisons
+	constexpr u8 i64_eqz       = 0x50;
+	constexpr u8 i64_lt_u      = 0x54;
 	// i64 arithmetic
 	constexpr u8 i64_clz       = 0x79;
 	constexpr u8 i64_add       = 0x7C;
@@ -575,6 +578,9 @@ public:
 	void op_i64_shl()   { emitByte(wop::i64_shl); }
 	void op_i64_shr_s() { emitByte(wop::i64_shr_s); }
 	void op_i64_shr_u() { emitByte(wop::i64_shr_u); }
+	void op_i64_clz()   { emitByte(wop::i64_clz); }
+	void op_i64_eqz()   { emitByte(wop::i64_eqz); }
+	void op_i64_lt_u()  { emitByte(wop::i64_lt_u); }
 	void op_i64_const(s64 val) {
 		emitByte(wop::i64_const);
 		// signed LEB128 for i64

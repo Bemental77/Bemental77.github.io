@@ -291,7 +291,19 @@ int g_ax_wake_ring_n = 0;
 // links — tests have no bridge TU, so a hard extern breaks wasm-ld).
 void (*g_block_watch_hook)(int phase) = nullptr;
 
+// [pc-census 2026-06-12] temporary (strip per gate #8): hot-handle ring.
+// Dispatch-context EM_ASM output (postMessage AND console.error) does not
+// reach the probe (same constraint as the g_ax_wake_ring below) — so
+// RECORD ONLY here; dolphin_gather_drain (dolphin_jit_wimports.cpp) drains
+// + NOTICE_LOGs on the proven channel and resets the fill level, so each
+// drained window is 256 consecutive dispatch handles.
+int g_pc_census_ring[256];
+int g_pc_census_n = 0;
+u64 g_pc_census_total = 0;
+
 s32 dispatch_raw(int handle) {
+    g_pc_census_total++;
+    if (g_pc_census_n < 256) g_pc_census_ring[g_pc_census_n++] = handle;
     if (g_block_watch_hook) {
         if (handle == g_recheck_handle && g_recheck_handle >= 0) g_block_watch_hook(0);
         if (handle == g_vwaitset_handle && g_vwaitset_handle >= 0) g_block_watch_hook(1);
@@ -423,11 +435,22 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
             return 0;
         }
         let count = 0;
+        // [pc-census 2026-06-12] temporary (strip per gate #8): record PCs
+        // into the C ring ($4 = &g_pc_census_ring, $5 = &g_pc_census_n);
+        // drained + printed by dolphin_gather_drain (output from this
+        // context does not reach the probe).
         while (count < max) {
             const handle = map.get(pc);
             if (handle === undefined) break;
             const inst = cache[handle];
             if (!inst || !inst.exports || typeof inst.exports.run !== 'function') break;
+            {
+                const czn = HEAP32[$5 >> 2];
+                if (czn < 256) {
+                    HEAP32[($4 >> 2) + czn] = pc | 0;
+                    HEAP32[$5 >> 2] = czn + 1;
+                }
+            }
             try {
                 pc = inst.exports.run() >>> 0;
             } catch (e) {
@@ -449,7 +472,7 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
         HEAP32[finalPcPtr >>> 2] = pc | 0;
         HEAP32[trapPcPtr >>> 2] = 0;
         return count;
-    }, initial_pc, max_iters, final_pc, trap_pc);
+    }, initial_pc, max_iters, final_pc, trap_pc, g_pc_census_ring, &g_pc_census_n);
 #else
     (void)initial_pc; (void)max_iters;
     if (final_pc) *final_pc = initial_pc;
@@ -1075,6 +1098,17 @@ bool BlockCache::region_dispatch(u32 pc, s32* out) {
         if (!region) return 0;
         const idx = region.pcMap.get(pc);
         if (idx === undefined) return 0;
+        // [pc-census 2026-06-12] temporary (strip per gate #8): record PCs
+        // into the C ring ($3=&ring, $4=&fill); drained + printed by
+        // dolphin_gather_drain (output from this context never reaches the
+        // probe).
+        {
+            const czn = HEAP32[$4 >> 2];
+            if (czn < 256) {
+                HEAP32[($3 >> 2) + czn] = pc | 0;
+                HEAP32[$4 >> 2] = czn + 1;
+            }
+        }
         // Pre-dispatch trace: every 100K calls log the pc ABOUT to be
         // dispatched. If a wasm region function infinite-loops, the LAST
         // log line identifies the hung pc.
@@ -1104,7 +1138,7 @@ bool BlockCache::region_dispatch(u32 pc, s32* out) {
             }
             return 0;
         }
-    }, (int)r, (int)pc, out) != 0;
+    }, (int)r, (int)pc, out, g_pc_census_ring, &g_pc_census_n) != 0;
 #else
     (void)pc; (void)out;
     return false;

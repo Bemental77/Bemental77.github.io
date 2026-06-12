@@ -116,4 +116,9 @@ void emit_lfs (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 void emit_stfs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op, bool update);
 
+// Shared widen helper: push ConvertToDouble(f32 bits in LOCAL_PSQ_T0=98)
+// as i64 — NaN-payload-exact (promote + exp==255 splice). Used by the psq
+// loads here and by jit_floating_point.cpp's ForceSingle result widening.
+void emit_psq_convert_to_double(WasmModuleBuilder& wb);
+
 }  // namespace bemental::powerpc

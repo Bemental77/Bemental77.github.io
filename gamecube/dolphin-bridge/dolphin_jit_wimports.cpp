@@ -28,6 +28,8 @@
 
 #include <emscripten.h>
 #include <cstdint>
+#include <string>
+#include <utility>
 
 #include "Common/CommonTypes.h"
 #include "Common/Logging/Log.h"
@@ -48,6 +50,14 @@ namespace bemental {
 extern int g_ax_wake_arm;
 extern int g_ax_wake_ring[256];
 extern int g_ax_wake_ring_n;
+// [pc-census 2026-06-12] temporary (strip per gate #8): hot-PC/handle ring
+// filled by block_cache dispatch sites; drained + NOTICE_LOG'd from
+// dolphin_gather_drain below (dispatch-context output never reaches the
+// probe). Values >= 0x80000000 are guest PCs (chain/region paths); small
+// ints are block handles (dispatch_raw path).
+extern int g_pc_census_ring[256];
+extern int g_pc_census_n;
+extern u64 g_pc_census_total;
 }
 static void ax_wake_arm_set() { bemental::g_ax_wake_arm = 192; }
 
@@ -545,6 +555,42 @@ void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
     static u64 s_drain_n = 0;
     if ((++s_drain_n & 0xFFu) == 1) {
         NOTICE_LOG_FMT(POWERPC, "[ax-pe] dolphin_gather_drain n={}", s_drain_n);
+    }
+    // [pc-census] drain: every ~256K drains, if the ring is full, count
+    // duplicates and log ONE line of the top entries, then re-arm. Each
+    // window = 256 consecutive dispatches at the time the ring was open.
+    if ((s_drain_n & 0x3FFFFu) == 2 && bemental::g_pc_census_n >= 256) {
+        int vals[256];
+        int cnts[256];
+        int nuniq = 0;
+        for (int i = 0; i < 256; ++i) {
+            const int v = bemental::g_pc_census_ring[i];
+            int j = 0;
+            for (; j < nuniq; ++j) if (vals[j] == v) { cnts[j]++; break; }
+            if (j == nuniq) { vals[nuniq] = v; cnts[nuniq] = 1; nuniq++; }
+        }
+        // selection-sort top 10 by count; translate handles -> guest PCs via
+        // the same-thread JS map (values >= 0x80000000 are already PCs).
+        std::string line;
+        for (int k = 0; k < 10 && k < nuniq; ++k) {
+            int best = k;
+            for (int j = k + 1; j < nuniq; ++j) if (cnts[j] > cnts[best]) best = j;
+            std::swap(cnts[k], cnts[best]);
+            std::swap(vals[k], vals[best]);
+            u32 pc = (u32)vals[k];
+            if (pc < 0x80000000u) {
+                const u32 mapped = (u32)EM_ASM_INT({
+                    var m = Module.bemental_handle_to_pc;
+                    var v = m && m[$0];
+                    return (v === undefined) ? 0 : (v | 0);
+                }, vals[k]);
+                if (mapped) pc = mapped;
+            }
+            line += fmt::format(" {:x}x{}", pc, cnts[k]);
+        }
+        NOTICE_LOG_FMT(POWERPC, "[pc-census] total={} uniq={}{}",
+                       bemental::g_pc_census_total, nuniq, line);
+        bemental::g_pc_census_n = 0;
     }
     auto& system = Core::System::GetInstance();
     GPFifo::UpdateGatherPipe(system.GetGPFifo());
