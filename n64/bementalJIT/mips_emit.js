@@ -65,7 +65,7 @@
   };
 
   // locals: 0,1 = i32 scratch (addr, word); 2..33 = i64 guest r0..r31
-  var L_ADDR = 0, L_WORD = 1, L_REG0 = 2, L_I64S = 34; // 34 = i64 scratch (mult products)
+  var L_ADDR = 0, L_WORD = 1, L_REG0 = 2, L_I64S = 34, L_JT = 35; // i64 scratch (mult), i32 jump target
 
   function loadI64(addr) { return [OP.i32_const, 0x00, OP.i64_load, 0x03].concat(leb(addr)); }
   function loadI32(addr) { return [OP.i32_const, 0x00, OP.i32_load, 0x02].concat(leb(addr)); }
@@ -209,6 +209,13 @@
     var bTarget = (addr + 4 + imm * 4) >>> 0;
     function cmpRR(opc) { return function (C) { return C.read(rs).concat(C.read(rt), [opc]); }; }
     function cmpRZ(opc) { return function (C) { return C.read(rs).concat([OP.i64_const, 0x00, opc]); }; }
+    if (op === 0x00) { // SPECIAL: JR/JALR — runtime register target, ALWAYS the _OUT path
+      var fn0 = word & 0x3F;
+      var rdJ = (word >>> 11) & 0x1F;
+      if (fn0 === 0x08) return { cond: null, link: false, likely: false, target: null, targetReg: rs };
+      if (fn0 === 0x09) return { cond: null, link: true, linkReg: rdJ, likely: false, target: null, targetReg: rs };
+      return null;
+    }
     switch (op) {
       case 0x02: return { cond: null, link: false, likely: false, target: (((addr + 4) & 0xF0000000) | ((word & 0x3FFFFFF) << 2)) >>> 0 };
       case 0x03: return { cond: null, link: true, likely: false, target: (((addr + 4) & 0xF0000000) | ((word & 0x3FFFFFF) << 2)) >>> 0 };
@@ -258,6 +265,22 @@
       loadI32(p.pcGlobal), [OP.i32_const], sleb(finalPtr), [OP.i32_ne],
       [OP.br_if].concat(leb(exitDepth + 1)),
       [OP.end]
+    );
+  }
+
+  // _OUT taken-tail: jump_to(target); last_addr = PC->addr (runtime — PC was
+  // set by jump_to); poll gen_interrupt (PC already correct, no recheck —
+  // the block exits regardless). targetBytes pushes the i32 target.
+  function emitOutJumpTail(p, targetBytes, exitDepth) {
+    return [].concat(
+      storeI32(p.jumpToAddr, targetBytes),
+      [OP.i32_const], sleb(p.jumpToFunc), [OP.call_indirect, 0x00, 0x00],
+      storeI32(p.lastAddr, loadI32(p.pcGlobal).concat([OP.i32_load, 0x02], leb(p.addrOff))),
+      loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
+      [OP.if_, OP.void_],
+        [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00],
+      [OP.end],
+      [OP.br].concat(leb(exitDepth))
     );
   }
 
@@ -537,91 +560,99 @@
       var nextPtr = instrPtr + p.stride;
 
       // (b) native branch?
-      var br = null;
+      var br = null, brOut = false;
       var dec = decodeBranch(word, addr);
       if (dec && i + 1 < p.span) {
         var slotWord = HEAPU32[(p.srcPtr >> 2) + i + 1];
-        var isIdle = (dec.target === addr) && (slotWord === 0);
-        var isOut = (dec.target < p.blockStart) || (dec.target >= p.blockEnd) || (addr === p.blockEnd - 4);
+        var isIdle = dec.target !== null && (dec.target === addr) && (slotWord === 0);
+        // _OUT mirror: runtime targets (JR/JALR) are ALWAYS the OUT path
+        // (cached_interp table binds JR->JR_OUT); constant targets follow
+        // recomp.c's variant conditions
+        var isOut = dec.target === null || (dec.target < p.blockStart) || (dec.target >= p.blockEnd) || (addr === p.blockEnd - 4);
         // probe the slot with a throwaway cache clone — a rejected probe
         // must leave no compile-state behind
         var probeC = new RegCache(p.reg);
         probeC.loaded = C.loaded.slice(); probeC.dirty = C.dirty.slice();
-        if (!isIdle && !isOut && emitAlu(slotWord, probeC) !== null) br = dec;
+        if (!isIdle && emitAlu(slotWord, probeC) !== null) { br = dec; brOut = isOut; }
       }
       if (br) {
-        var targetIdx = ((br.target - p.vaddr) | 0) / 4;
-        var targetPtr = p.entryPtr + targetIdx * p.stride;
+        var slotWord2 = HEAPU32[(p.srcPtr >> 2) + i + 1];
         var fallPtr = p.entryPtr + (i + 2) * p.stride;
         var fallAddr = (addr + 8) | 0;
-        var slotWord2 = HEAPU32[(p.srcPtr >> 2) + i + 1];
-        var linkBytes = br.link ? [OP.i64_const].concat(sleb((addr + 8) | 0), C.writeFromStack(31)) : [];
+        var targetIdx = 0, targetPtr = 0;
+        if (!brOut) {
+          targetIdx = ((br.target - p.vaddr) | 0) / 4;
+          targetPtr = p.entryPtr + targetIdx * p.stride;
+        }
+        var linkRegNo = br.link ? (br.linkReg !== undefined ? br.linkReg : 31) : -1;
+        var linkBytes = br.link ? [OP.i64_const].concat(sleb((addr + 8) | 0), C.writeFromStack(linkRegNo)) : [];
+        // runtime target captured BEFORE link/slot (they may clobber the register)
+        var captureBytes = (br.targetReg !== undefined)
+          ? C.read(br.targetReg).concat([OP.i32_wrap_i64, OP.local_set], leb(L_JT))
+          : [];
+        // taken-control tail at a given $exit/$top depth (PLAIN: static PC,
+        // back-edge for self-entry; OUT: jump_to with const or captured target)
+        function takenTail(Cx, exitD, topD) {
+          if (brOut) {
+            var tb = (br.targetReg !== undefined)
+              ? [OP.local_get].concat(leb(L_JT))
+              : [OP.i32_const].concat(sleb(br.target | 0));
+            return emitOutJumpTail(p, tb, exitD);
+          }
+          return emitTailPoll(p, Cx, br.target, targetPtr, exitD).concat(
+            targetIdx === 0
+              ? [OP.br].concat(leb(topD))
+              : storeI32Const(p.pcGlobal, targetPtr).concat([OP.br], leb(exitD)));
+        }
+        function skipJumpSplit(Cx, exitD, topD) {
+          // if (skip_jump == 0) take else behave-as-not-taken-and-exit
+          return loadI32(p.skipJump).concat([OP.i32_eqz, OP.if_, OP.void_],
+            takenTail(Cx, exitD + 1, topD + 1),
+            [OP.else_],
+              emitTailPoll(p, Cx, fallAddr, fallPtr, exitD + 1),
+              storeI32Const(p.pcGlobal, fallPtr),
+              [OP.br].concat(leb(exitD + 1)),
+            [OP.end]);
+        }
         if (br.cond === null) {
-          // J/JAL — link, slot, count; flush before the control transfer
+          // unconditional: J/JAL/JR/JALR — capture, link, slot, count, flush, split
           body = body.concat(
+            captureBytes,
             linkBytes,
             emitAlu(slotWord2, C),
             emitCountBatch(p, addr),
             C.flush(),
-            loadI32(p.skipJump), [OP.i32_eqz, OP.if_, OP.void_],
-              emitTailPoll(p, C, br.target, targetPtr, EXIT + 1),
-              (targetIdx === 0
-                ? [OP.br].concat(leb(TOP + 1))
-                : storeI32Const(p.pcGlobal, targetPtr).concat([OP.br], leb(EXIT + 1))),
-            [OP.else_],
-              emitTailPoll(p, C, fallAddr, fallPtr, EXIT + 1),
-              storeI32Const(p.pcGlobal, fallPtr),
-              [OP.br].concat(leb(EXIT + 1)),
-            [OP.end]
+            skipJumpSplit(C, EXIT, TOP)
           );
-          C.invalidate(); // join state (only fallthrough continues, but keep conservative)
+          C.invalidate();
         } else if (!br.likely) {
           body = body.concat(
             br.cond(C),
             linkBytes,
             emitAlu(slotWord2, C),
             emitCountBatch(p, addr),
-            C.flush(), // single flush point before the control split; locals stay loaded
+            C.flush(),
             [OP.if_, OP.void_],
-              loadI32(p.skipJump), [OP.i32_eqz, OP.if_, OP.void_],
-                emitTailPoll(p, C, br.target, targetPtr, EXIT + 2),
-                (targetIdx === 0
-                  ? [OP.br].concat(leb(TOP + 2))
-                  : storeI32Const(p.pcGlobal, targetPtr).concat([OP.br], leb(EXIT + 2))),
-              [OP.else_],
-                emitTailPoll(p, C, fallAddr, fallPtr, EXIT + 2),
-                storeI32Const(p.pcGlobal, fallPtr),
-                [OP.br].concat(leb(EXIT + 2)),
-              [OP.end],
+              skipJumpSplit(C, EXIT + 1, TOP + 1),
             [OP.else_],
               emitTailPoll(p, C, fallAddr, fallPtr, EXIT + 1),
             [OP.end]
           );
-          C.invalidate(); // conservative join after control flow
+          C.invalidate();
         } else {
           body = body.concat(
             br.cond(C),
             linkBytes,
-            C.flush(), // before the split: the taken arm runs the slot, so flush common state first
+            C.flush(),
             [OP.if_, OP.void_]
           );
-          // taken arm: slot on a scratch cache (compile-state must not leak)
           var Ct = new RegCache(p.reg);
           Ct.loaded = C.loaded.slice(); Ct.dirty = C.dirty.slice();
           body = body.concat(
             emitAlu(slotWord2, Ct),
             emitCountBatch(p, addr),
             Ct.flush(),
-            loadI32(p.skipJump), [OP.i32_eqz, OP.if_, OP.void_],
-              emitTailPoll(p, Ct, br.target, targetPtr, EXIT + 2),
-              (targetIdx === 0
-                ? [OP.br].concat(leb(TOP + 2))
-                : storeI32Const(p.pcGlobal, targetPtr).concat([OP.br], leb(EXIT + 2))),
-            [OP.else_],
-              emitTailPoll(p, Ct, fallAddr, fallPtr, EXIT + 2),
-              storeI32Const(p.pcGlobal, fallPtr),
-              [OP.br].concat(leb(EXIT + 2)),
-            [OP.end],
+            skipJumpSplit(Ct, EXIT + 1, TOP + 1),
             [OP.else_],
               emitCountBatch(p, addr),
               emitTailPoll(p, C, fallAddr, fallPtr, EXIT + 1),
@@ -686,7 +717,7 @@
       storeI32Const(p.pcGlobal, p.entryPtr + p.span * p.stride)
     );
 
-    var full = [0x03, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E,  // locals: 2 x i32, 32 x i64 regs, 1 x i64 scratch
+    var full = [0x04, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F,  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target
       OP.block, OP.void_,
       OP.loop, OP.void_]
       .concat(body,
