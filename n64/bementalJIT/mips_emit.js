@@ -54,13 +54,18 @@
     i64_eq: 0x51, i64_ne: 0x52, i64_lt_s: 0x53, i64_lt_u: 0x54, i64_gt_s: 0x55, i64_le_s: 0x57, i64_ge_s: 0x59,
     i32_add: 0x6A, i32_sub: 0x6B, i32_mul: 0x6C, i32_and: 0x71, i32_or: 0x72, i32_xor: 0x73, i32_shl: 0x74, i32_shr_s: 0x75, i32_shr_u: 0x76,
     i32_extend8_s: 0xC0, i32_extend16_s: 0xC1,
-    i64_add: 0x7C, i64_and: 0x83, i64_or: 0x84, i64_xor: 0x85,
+    i64_add: 0x7C, i64_mul: 0x7E, i64_shr_s: 0x87, i64_and: 0x83, i64_or: 0x84, i64_xor: 0x85,
+    i32_div_s: 0x6D, i32_div_u: 0x6E, i32_rem_s: 0x6F, i32_rem_u: 0x70,
     i32_wrap_i64: 0xA7, i64_extend_i32_s: 0xAC, i64_extend_i32_u: 0xAD,
+    i64_shl: 0x86, i64_shr_u: 0x88,
+    f32_load: 0x2A, f32_store: 0x38, f64_load: 0x2B, f64_store: 0x39,
+    f32_abs: 0x8B, f32_neg: 0x8C, f32_sqrt: 0x91, f32_add: 0x92, f32_sub: 0x93, f32_mul: 0x94, f32_div: 0x95,
+    f64_abs: 0x99, f64_neg: 0x9A, f64_sqrt: 0x9F, f64_add: 0xA0, f64_sub: 0xA1, f64_mul: 0xA2, f64_div: 0xA3,
     void_: 0x40,
   };
 
   // locals: 0,1 = i32 scratch (addr, word); 2..33 = i64 guest r0..r31
-  var L_ADDR = 0, L_WORD = 1, L_REG0 = 2;
+  var L_ADDR = 0, L_WORD = 1, L_REG0 = 2, L_I64S = 34; // 34 = i64 scratch (mult products)
 
   function loadI64(addr) { return [OP.i32_const, 0x00, OP.i64_load, 0x03].concat(leb(addr)); }
   function loadI32(addr) { return [OP.i32_const, 0x00, OP.i32_load, 0x02].concat(leb(addr)); }
@@ -122,6 +127,7 @@
 
   // ---- native ALU emitters ----
   // Returns body bytes (value computed and written into the cache) or null.
+  var p_hi_lo = { hi: 0, lo: 0 }; // bound per-compile (hi/lo addresses)
   function emitAlu(word, C) {
     if (word === 0) return []; // NOP
     var op = (word >>> 26) & 0x3F;
@@ -147,6 +153,30 @@
         case 0x25: v = C.read(rs).concat(C.read(rt), [OP.i64_or]); break;                             // OR
         case 0x26: v = C.read(rs).concat(C.read(rt), [OP.i64_xor]); break;                            // XOR
         case 0x27: v = C.read(rs).concat(C.read(rt), [OP.i64_or, OP.i64_const], sleb(-1), [OP.i64_xor]); break; // NOR
+        case 0x10: return loadI64(p_hi_lo.hi).concat(C.writeFromStack(rd));                            // MFHI
+        case 0x12: return loadI64(p_hi_lo.lo).concat(C.writeFromStack(rd));                            // MFLO
+        case 0x11: return storeI64(p_hi_lo.hi, C.read(rs));                                            // MTHI
+        case 0x13: return storeI64(p_hi_lo.lo, C.read(rs));                                            // MTLO
+        case 0x18: // MULT: temp = rs64 * rt64 (FULL 64-bit operands); hi = temp>>32 (arith); lo = SE32(temp)
+          return C.read(rs).concat(C.read(rt), [OP.i64_mul, OP.local_set], leb(L_I64S),
+            storeI64(p_hi_lo.hi, [OP.local_get].concat(leb(L_I64S), [OP.i64_const], sleb(32), [OP.i64_shr_s])),
+            storeI64(p_hi_lo.lo, [OP.local_get].concat(leb(L_I64S), wrap, xs)));
+        case 0x19: // MULTU: (u64)(u32)rs * (u64)(u32)rt; hi = (i64)temp>>32 (ARITH — product can set bit 63); lo = SE32
+          return C.read(rs).concat(wrap, xu, C.read(rt), wrap, xu, [OP.i64_mul, OP.local_set], leb(L_I64S),
+            storeI64(p_hi_lo.hi, [OP.local_get].concat(leb(L_I64S), [OP.i64_const], sleb(32), [OP.i64_shr_s])),
+            storeI64(p_hi_lo.lo, [OP.local_get].concat(leb(L_I64S), wrap, xs)));
+        case 0x1A: // DIV: if (rt32 != 0) { lo=SE32(rs32/rt32); hi=SE32(rs32%rt32) } else SKIP (stale hi/lo)
+          return C.read(rs).concat(wrap, [OP.local_set, L_ADDR], C.read(rt), wrap, [OP.local_set, L_WORD],
+            [OP.local_get, L_WORD, OP.if_, OP.void_],
+            storeI64(p_hi_lo.lo, [OP.local_get, L_ADDR, OP.local_get, L_WORD, OP.i32_div_s].concat(xs)),
+            storeI64(p_hi_lo.hi, [OP.local_get, L_ADDR, OP.local_get, L_WORD, OP.i32_rem_s].concat(xs)),
+            [OP.end]);
+        case 0x1B: // DIVU
+          return C.read(rs).concat(wrap, [OP.local_set, L_ADDR], C.read(rt), wrap, [OP.local_set, L_WORD],
+            [OP.local_get, L_WORD, OP.if_, OP.void_],
+            storeI64(p_hi_lo.lo, [OP.local_get, L_ADDR, OP.local_get, L_WORD, OP.i32_div_u].concat(xs)),
+            storeI64(p_hi_lo.hi, [OP.local_get, L_ADDR, OP.local_get, L_WORD, OP.i32_rem_u].concat(xs)),
+            [OP.end]);
         case 0x2A: v = C.read(rs).concat(C.read(rt), [OP.i64_lt_s], xu); break;                       // SLT
         case 0x2B: v = C.read(rs).concat(C.read(rt), [OP.i64_lt_u], xu); break;                       // SLTU
         default: return null;
@@ -284,6 +314,28 @@
     );
   }
 
+  // CHECK_MEMORY mirror (cached_interp.c): if (!invalid_code[a>>12]) and the
+  // page block instr at (a&0xFFF)/4 has ops != NOTCOMPILED, mark the page
+  // invalid; blocks[x] dereferenced only under invalid_code[x]==0.
+  function checkMemoryBytes(p) {
+    return [].concat(
+      [OP.local_get, L_ADDR, OP.i32_const, 0x0C, OP.i32_shr_u],
+      [OP.i32_load8_u, 0x00], leb(p.invalidCode),
+      [OP.i32_eqz, OP.if_, OP.void_],
+        [OP.local_get, L_ADDR, OP.i32_const, 0x0C, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
+        [OP.i32_load, 0x02], leb(p.blocksBase),
+        [OP.i32_load, 0x02, 0x00],
+        [OP.local_get, L_ADDR, OP.i32_const], sleb(0xFFF), [OP.i32_and, OP.i32_const, 0x02, OP.i32_shr_u, OP.i32_const], sleb(p.stride), [OP.i32_mul, OP.i32_add],
+        [OP.i32_load, 0x02, 0x00],
+        [OP.i32_const], sleb(p.notCompiled), [OP.i32_ne],
+        [OP.if_, OP.void_],
+          [OP.local_get, L_ADDR, OP.i32_const, 0x0C, OP.i32_shr_u, OP.i32_const, 0x01],
+          [OP.i32_store8, 0x00], leb(p.invalidCode),
+        [OP.end],
+      [OP.end]
+    );
+  }
+
   // SW/SB/SH: fast path writes the host-endian u32 dram array with the
   // mask-merge write_rdram_dram performs (SW mask ~0 = plain store), then
   // mirrors CHECK_MEMORY (cached_interp.c): if (!invalid_code[a>>12]) and
@@ -323,23 +375,7 @@
         [OP.i32_store, 0x02], leb(p.dramBase)
       );
     }
-    var checkMemory = [].concat(
-      [OP.local_get, L_ADDR, OP.i32_const, 0x0C, OP.i32_shr_u],
-      [OP.i32_load8_u, 0x00], leb(p.invalidCode),
-      [OP.i32_eqz, OP.if_, OP.void_],
-        // ops = *( blocks[a>>12]->block + ((a&0xFFF)>>2)*stride ); ->block is field 0
-        [OP.local_get, L_ADDR, OP.i32_const, 0x0C, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
-        [OP.i32_load, 0x02], leb(p.blocksBase),
-        [OP.i32_load, 0x02, 0x00], // ->block (offset 0)
-        [OP.local_get, L_ADDR, OP.i32_const], sleb(0xFFF), [OP.i32_and, OP.i32_const, 0x02, OP.i32_shr_u, OP.i32_const], sleb(p.stride), [OP.i32_mul, OP.i32_add],
-        [OP.i32_load, 0x02, 0x00], // .ops (offset 0)
-        [OP.i32_const], sleb(p.notCompiled), [OP.i32_ne],
-        [OP.if_, OP.void_],
-          [OP.local_get, L_ADDR, OP.i32_const, 0x0C, OP.i32_shr_u, OP.i32_const, 0x01],
-          [OP.i32_store8, 0x00], leb(p.invalidCode),
-        [OP.end],
-      [OP.end]
-    );
+    var checkMemory = checkMemoryBytes(p);
     return [].concat(
       C.read(rs), [OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR],
       [OP.local_get, L_ADDR, OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
@@ -361,13 +397,136 @@
     );
   }
 
+  // ---- COP1 (wave 6) ----
+  // Every COP1 op is wrapped in the CU1 guard (Status bit 0x20000000): when
+  // clear, the interpreter op raises the coprocessor-unusable exception
+  // (Cause/EPC handled there) and PC always diverges — so the guard's else
+  // arm is snapshot-flush + interp call + unconditional exit. Pointer-bank
+  // indirection is performed at RUNTIME (reg_cop1_simple/double[i] loads),
+  // which makes Status.FR bank flips automatically correct.
+  function cuGuard(p, C, nativeBytes, instrPtr, opsIdx, exitDepth) {
+    return [].concat(
+      loadI32(p.cp0Status), [OP.i32_const], sleb(0x20000000), [OP.i32_and],
+      [OP.if_, OP.void_],
+        nativeBytes,
+      [OP.else_],
+        C.flushSnapshot(),
+        storeI32Const(p.pcGlobal, instrPtr),
+        [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
+        [OP.br].concat(leb(exitDepth + 1)),
+      [OP.end]
+    );
+  }
+  // push the float*/double* for FPR index i from the live bank
+  function fprPtr(bank, i) { return [OP.i32_const, 0x00, OP.i32_load, 0x02].concat(leb(bank + i * 4)); }
+
+  function emitCop1(word, instrPtr, p, C, opsIdx, exitDepth) {
+    var op = (word >>> 26) & 0x3F;
+    if (op !== 0x11) return null;
+    var sub = (word >>> 21) & 0x1F;       // rs field: move/bc/fmt
+    var rt = (word >>> 16) & 0x1F;        // GPR for moves; ft for arith
+    var fs = (word >>> 11) & 0x1F;
+    var fd = (word >>> 6) & 0x1F;
+    var fn = word & 0x3F;
+    var nat = null;
+    if (sub === 0x00) {        // MFC1: rt = SE32(*(i32*)simple[fs])
+      nat = fprPtr(p.cp1Simple, fs).concat([OP.i32_load, 0x02, 0x00], [OP.i64_extend_i32_s], C.writeFromStack(rt));
+    } else if (sub === 0x04) { // MTC1: *(i32*)simple[fs] = rt32
+      nat = fprPtr(p.cp1Simple, fs).concat(C.read(rt), [OP.i32_wrap_i64], [OP.i32_store, 0x02, 0x00]);
+    } else if (sub === 0x01) { // DMFC1: rt = *(i64*)double[fs]
+      nat = fprPtr(p.cp1Double, fs).concat([OP.i64_load, 0x03, 0x00], C.writeFromStack(rt));
+    } else if (sub === 0x05) { // DMTC1
+      nat = fprPtr(p.cp1Double, fs).concat(C.read(rt), [OP.i64_store, 0x03, 0x00]);
+    } else if (sub === 0x10 || sub === 0x11) { // fmt S / D arithmetic
+      var S = (sub === 0x10);
+      var ldop = S ? [OP.f32_load, 0x02, 0x00] : [OP.f64_load, 0x03, 0x00];
+      var stop = S ? [OP.f32_store, 0x02, 0x00] : [OP.f64_store, 0x03, 0x00];
+      var bank = S ? p.cp1Simple : p.cp1Double;
+      var binop = null, unop = null;
+      switch (fn) {
+        case 0x00: binop = S ? OP.f32_add : OP.f64_add; break;
+        case 0x01: binop = S ? OP.f32_sub : OP.f64_sub; break;
+        case 0x02: binop = S ? OP.f32_mul : OP.f64_mul; break;
+        case 0x03: binop = S ? OP.f32_div : OP.f64_div; break;
+        case 0x04: unop = S ? OP.f32_sqrt : OP.f64_sqrt; break;
+        case 0x05: unop = S ? OP.f32_abs : OP.f64_abs; break;
+        case 0x06: unop = -1; break; // MOV: pure copy
+        case 0x07: unop = S ? OP.f32_neg : OP.f64_neg; break;
+        default: return null; // CVT/ROUND/TRUNC/compares: explicit rounding/flags — fallback
+      }
+      // store sig: push fd ptr, compute value, store
+      var valBytes;
+      if (binop !== null) {
+        valBytes = fprPtr(bank, fs).concat(ldop, fprPtr(bank, rt), ldop, [binop]);
+      } else if (unop === -1) {
+        valBytes = fprPtr(bank, fs).concat(ldop);
+      } else {
+        valBytes = fprPtr(bank, fs).concat(ldop, [unop]);
+      }
+      nat = fprPtr(bank, fd).concat(valBytes, stop);
+    } else {
+      return null; // BC1 branches, fmt W/L: fallback
+    }
+    return cuGuard(p, C, nat, instrPtr, opsIdx, exitDepth);
+  }
+
+  // LWC1/LDC1/SWC1/SDC1: CU1 guard outside, then the same live-dispatch-table
+  // fast path as integer loads/stores; FPR access through the runtime banks.
+  function emitCop1Mem(word, instrPtr, p, C, opsIdx, exitDepth) {
+    var op = (word >>> 26) & 0x3F;
+    if (op !== 0x31 && op !== 0x35 && op !== 0x39 && op !== 0x3D) return null;
+    var base = (word >>> 21) & 0x1F, ft = (word >>> 16) & 0x1F;
+    var imm = sext16(word & 0xFFFF);
+    var ea = C.read(base).concat([OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR]);
+    var tblIdx = [OP.local_get, L_ADDR, OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl];
+    var wordOff = [OP.local_get, L_ADDR, OP.i32_const].concat(sleb(0xFFFFFC), [OP.i32_and]);
+    var word4Off = [OP.local_get, L_ADDR, OP.i32_const, 0x04, OP.i32_add, OP.i32_const].concat(sleb(0xFFFFFC), [OP.i32_and]);
+    var fast, tableBase, cmpVal;
+    if (op === 0x31) {        // LWC1: *(u32*)simple[ft] = dram word
+      tableBase = p.readmemW; cmpVal = p.rdRdram;
+      fast = fprPtr(p.cp1Simple, ft).concat(wordOff, [OP.i32_load, 0x02], leb(p.dramBase), [OP.i32_store, 0x02, 0x00]);
+    } else if (op === 0x35) { // LDC1: *(u64*)double[ft] = (w0<<32)|w1
+      tableBase = p.readmemD; cmpVal = p.rdRdramD;
+      fast = fprPtr(p.cp1Double, ft).concat(
+        wordOff, [OP.i32_load, 0x02], leb(p.dramBase), [OP.i64_extend_i32_u, OP.i64_const], sleb(32), [OP.i64_shl],
+        word4Off, [OP.i32_load, 0x02], leb(p.dramBase), [OP.i64_extend_i32_u],
+        [OP.i64_or, OP.i64_store, 0x03, 0x00]);
+    } else if (op === 0x39) { // SWC1: dram word = *(u32*)simple[ft]; CHECK_MEMORY
+      tableBase = p.writememW; cmpVal = p.wrRdram;
+      fast = wordOff.concat(fprPtr(p.cp1Simple, ft), [OP.i32_load, 0x02, 0x00], [OP.i32_store, 0x02], leb(p.dramBase), checkMemoryBytes(p));
+    } else {                  // SDC1: dram[a]=hi32(v), dram[a+4]=lo32(v); CHECK_MEMORY
+      tableBase = p.writememD; cmpVal = p.wrRdramD;
+      fast = [].concat(
+        fprPtr(p.cp1Double, ft), [OP.i64_load, 0x03, 0x00, OP.local_set], leb(L_I64S),
+        wordOff, [OP.local_get].concat(leb(L_I64S), [OP.i64_const], sleb(32), [OP.i64_shr_u, OP.i32_wrap_i64]), [OP.i32_store, 0x02], leb(p.dramBase),
+        word4Off, [OP.local_get].concat(leb(L_I64S), [OP.i32_wrap_i64]), [OP.i32_store, 0x02], leb(p.dramBase),
+        checkMemoryBytes(p));
+    }
+    var nat = [].concat(
+      ea,
+      tblIdx, [OP.i32_load, 0x02], leb(tableBase),
+      [OP.i32_const], sleb(cmpVal), [OP.i32_eq],
+      [OP.if_, OP.void_],
+        fast,
+      [OP.else_],
+        C.flushSnapshot(),
+        storeI32Const(p.pcGlobal, instrPtr),
+        [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
+        loadI32(p.pcGlobal), [OP.i32_const], sleb(instrPtr + p.stride), [OP.i32_ne],
+        [OP.br_if].concat(leb(exitDepth + 2)), // inside cu-if + this if
+      [OP.end]
+    );
+    return cuGuard(p, C, nat, instrPtr, opsIdx, exitDepth);
+  }
+
   // ---- block compiler ----
-  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeLoads: 0, nativeStores: 0, fallbackOps: 0, fails: 0 };
+  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeLoads: 0, nativeStores: 0, nativeFP: 0, fallbackOps: 0, fails: 0 };
 
   function compileSpan(p, Module) {
     var HEAPU32 = Module.HEAPU32;
     var C = new RegCache(p.reg);
     p.regBase = p.reg;
+    p_hi_lo.hi = p.hi; p_hi_lo.lo = p.lo;
     var body = [];
     var EXIT = 1, TOP = 0;
     var i = 0;
@@ -492,6 +651,15 @@
         continue;
       }
 
+      // (e) COP1?
+      var fp = emitCop1(word, instrPtr, p, C, opsIdxL, EXIT) || emitCop1Mem(word, instrPtr, p, C, opsIdxL, EXIT);
+      if (fp) {
+        body = body.concat(fp);
+        stats.nativeFP++;
+        i++;
+        continue;
+      }
+
       // (a) native ALU?
       var alu = emitAlu(word, C);
       if (alu !== null) {
@@ -518,7 +686,7 @@
       storeI32Const(p.pcGlobal, p.entryPtr + p.span * p.stride)
     );
 
-    var full = [0x02, 0x02, 0x7F, 0x20, 0x7E,  // locals: 2 x i32, 32 x i64
+    var full = [0x03, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E,  // locals: 2 x i32, 32 x i64 regs, 1 x i64 scratch
       OP.block, OP.void_,
       OP.loop, OP.void_]
       .concat(body,

@@ -46,6 +46,7 @@ extern int g_jit_bridge; /* defined in mymain.cpp; toggled via _neil_set_jit_bri
 #include "api/callbacks.h"
 #include "api/m64p_types.h"
 #include "cached_interp.h"
+#include "cp1_private.h" /* reg_cop1_simple/double for the JIT bridge */
 #include "cp0_private.h"
 #include "main/main.h"
 #include "main/device.h"
@@ -2489,7 +2490,7 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
       void gen_interrupt(void); /* interrupt.h not included in this TU */
       uint32_t jit_entry_i = (func & UINT32_C(0xFFF)) / 4;
       struct precomp_instr* jit_entry = block->block + jit_entry_i;
-      static uint32_t jit_params[34];
+      static uint32_t jit_params[43];
       int jit_idx;
       jit_params[0] = func;                                        /* entry vaddr */
       jit_params[1] = (uint32_t)(uintptr_t)jit_entry;              /* entry precomp_instr* */
@@ -2532,6 +2533,16 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
       jit_params[31] = (uint32_t)(uintptr_t)&invalid_code[0];
       jit_params[32] = (uint32_t)(uintptr_t)&blocks[0];
       jit_params[33] = (uint32_t)(uintptr_t)current_instruction_table.NOTCOMPILED;
+      /* wave 6 (COP1 + dword memory + register jumps) */
+      jit_params[34] = (uint32_t)(uintptr_t)&reg_cop1_simple[0];
+      jit_params[35] = (uint32_t)(uintptr_t)&reg_cop1_double[0];
+      jit_params[36] = (uint32_t)(uintptr_t)&g_cp0_regs[CP0_STATUS_REG];
+      jit_params[37] = (uint32_t)(uintptr_t)&readmemd[0];
+      jit_params[38] = (uint32_t)(uintptr_t)&writememd[0];
+      jit_params[39] = (uint32_t)(uintptr_t)&read_rdramd;
+      jit_params[40] = (uint32_t)(uintptr_t)&write_rdramd;
+      jit_params[41] = (uint32_t)(uintptr_t)&jump_to_address;
+      jit_params[42] = (uint32_t)(uintptr_t)&jump_to_func;
       jit_idx = EM_ASM_INT({
          return (typeof window !== 'undefined' && window.myApp && window.myApp.jitCompile)
             ? (window.myApp.jitCompile($0) | 0) : 0;

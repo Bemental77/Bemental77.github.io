@@ -525,6 +525,10 @@
         writememW: Module.HEAPU32[q + 25], writememB: Module.HEAPU32[q + 26], writememH: Module.HEAPU32[q + 27],
         wrRdram: Module.HEAPU32[q + 28], wrRdramB: Module.HEAPU32[q + 29], wrRdramH: Module.HEAPU32[q + 30],
         invalidCode: Module.HEAPU32[q + 31], blocksBase: Module.HEAPU32[q + 32], notCompiled: Module.HEAPU32[q + 33],
+        cp1Simple: Module.HEAPU32[q + 34], cp1Double: Module.HEAPU32[q + 35], cp0Status: Module.HEAPU32[q + 36],
+        readmemD: Module.HEAPU32[q + 37], writememD: Module.HEAPU32[q + 38],
+        rdRdramD: Module.HEAPU32[q + 39], wrRdramD: Module.HEAPU32[q + 40],
+        jumpToAddr: Module.HEAPU32[q + 41], jumpToFunc: Module.HEAPU32[q + 42],
       };
       var entryOpsIdx = Module.HEAPU32[p.entryPtr >> 2];
       var idx = 0;
@@ -552,7 +556,7 @@
     };
     window.__jitStats = function () {
       var s = { mode: mode, wrapped: wrapped, calls: calls, canaryFired: canaryFired, instantiateFail: instantiateFail };
-      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; }
+      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; }
       return s;
     };
     // sync-compile size-limit probe (M1 open question): padded empty modules

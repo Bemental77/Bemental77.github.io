@@ -455,12 +455,16 @@ unsigned int neil_diff_get(int i) { return (i >= 0 && i < g_diff_n) ? g_diff_buf
 static void neil_diff_capture(void)
 {
     extern uint32_t g_cp0_regs[32];
+    extern int64_t reg_cop1_fgr_64[32]; /* cp1.c:41 — FPR backing storage (FR-stable) */
+    extern uint32_t FCR31;
     uint32_t h = 2166136261u;
     int k;
 #define NEIL_MIX(x) h = (h ^ (uint32_t)(x)) * 16777619u
     for (k = 0; k < 32; k++) { NEIL_MIX(reg[k]); NEIL_MIX(reg[k] >> 32); }
     NEIL_MIX(hi); NEIL_MIX(hi >> 32); NEIL_MIX(lo); NEIL_MIX(lo >> 32);
     for (k = 0; k < 32; k++) NEIL_MIX(g_cp0_regs[k]);
+    for (k = 0; k < 32; k++) { NEIL_MIX(reg_cop1_fgr_64[k]); NEIL_MIX(reg_cop1_fgr_64[k] >> 32); }
+    NEIL_MIX(FCR31);
     NEIL_MIX(PC->addr);
 #undef NEIL_MIX
     if (g_diff_n < NEIL_DIFF_MAX) g_diff_buf[g_diff_n++] = h;
