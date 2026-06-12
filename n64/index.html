@@ -433,7 +433,11 @@
             node.port.postMessage({ s: out }, [out.buffer]);
             workletBacklog += count; // optimistic until the next worklet report
           }
-          if (self.setRemainingAudio) self.setRemainingAudio(Math.max(0, workletBacklog - SLACK));
+          // DELIBERATELY no setRemainingAudio report: a nonzero report makes
+          // the core SKIP GAMEPLAY FRAMES to drain audio (mymain.cpp:1163) —
+          // the audio-governs-gameplay coupling behind 'the whole game slows
+          // when audio breaks'. Pacing belongs to IsFrameReady alone; the
+          // worklet DRC absorbs clock drift and the ring bounds overshoot.
         }, 8);
         pageLog('[audio] AudioWorklet pump active');
       }).catch(function (err) {

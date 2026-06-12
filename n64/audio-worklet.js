@@ -67,13 +67,10 @@ class N64AudioProcessor extends AudioWorkletProcessor {
     if (this.buffering && backlog >= this.targetFrames) this.buffering = false;
     let i = 0;
     if (!this.buffering) {
-      // steer the resample ratio to hold the queue at target (±5%, smoothed).
-      // EMERGENCY STRETCH: when the queue dips below a quarter of target
-      // (a long main-thread stall is draining it), allow the floor to drop
-      // to 0.90 — stretching the remaining audio buys recovery room and
-      // turns a would-be dropout into a brief pitch dip.
-      const floor = backlog < this.targetFrames / 4 ? 0.90 : 0.95;
-      const want = Math.min(1.05, Math.max(floor, 1 + (backlog - this.targetFrames) / (this.targetFrames * 8)));
+      // steer the resample ratio to hold the queue at target (±5%, smoothed);
+      // the audible 0.90 'emergency stretch' is gone — pitch warble traded a
+      // dropout for an equally objectionable artifact (user-rejected)
+      const want = Math.min(1.05, Math.max(0.95, 1 + (backlog - this.targetFrames) / (this.targetFrames * 8)));
       this.ratio += 0.05 * (want - this.ratio);
       const mask = RING_FRAMES - 1;
       for (; i < frames; i++) {
