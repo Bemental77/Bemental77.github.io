@@ -10,6 +10,7 @@
 
 #include "Common/Config/Config.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/ConfigManager.h"
 #include "Core/HLE/HLE.h"
 
 // Item 7 Phase IV: dolphin_service_iter routes here when CT_PHASE4_ENABLE
@@ -356,40 +357,55 @@ void run_iter_batch(int n) {
         if (!s_sab_patches_installed) {
             s_sab_patches_installed = true;
             auto& system = Core::System::GetInstance();
-            // Full 7-patch set per native dolphin.log.preserved:
-            HLE::Patch(system, 0x800e34a4u, "PPCMfhid2");
-            HLE::Patch(system, 0x800e34acu, "PPCMfhid2");
-            HLE::Patch(system, 0x800e34e0u, "PPCMfhid2");
-            HLE::Patch(system, 0x8010dfb4u, "strncpy");
-            HLE::Patch(system, 0x800e5bf0u, "OSReport");
-            HLE::Patch(system, 0x800ecfa4u, "___blank");
-            HLE::Patch(system, 0x800fe3c0u, "___blank");
-            // pass-5 instrumentation — Start-hook on interrupt-mask-decoder
-            // at 0x800e7e9c. Hook logs r3/r4/LR; spin diagnostic.
-            HLE::Patch(system, 0x800e7e9cu, "TraceDispatcher");
-            // MP4 (GMPE01_01) GXWaitDrawDone unblock: libretro init never
-            // calls VideoBackend::Initialize (Core.cpp:488-489 libretro
-            // init_video lambda returns true without it), so CommandProcessor
-            // / Fifo / PixelEngine never Init, CPReadWriteDistance stays 0,
-            // RunGpuOnCpu's gate never passes, BPWritten never reached, no
-            // BPMEM_SETDRAWDONE -> PixelEngine::SetFinish, PE_FINISH never
-            // fires, GXWaitDrawDone (GXMisc.c:116-127) sleeps on FinishQueue
-            // forever. HLE-skip lets main thread proceed; renders nothing
-            // but unblocks boot past Start New OVL 1.
-            HLE::Patch(system, 0x800CA840u, "FAKE_TO_SKIP_0");
-            // Evict any pre-existing m_wasm_cache entries at all PCs.
-            dolphin_evict_block(0x800e34a4u);
-            dolphin_evict_block(0x800e34acu);
-            dolphin_evict_block(0x800e34e0u);
-            dolphin_evict_block(0x8010dfb4u);
-            dolphin_evict_block(0x800e5bf0u);
-            dolphin_evict_block(0x800ecfa4u);
-            dolphin_evict_block(0x800fe3c0u);
-            dolphin_evict_block(0x800e7e9cu);
-            dolphin_evict_block(0x800CA840u);
+            // 2026-06-12: GATED BY GAME ID. These PCs come from SAB's
+            // (GSNE8P) native dolphin.log plus one MP4 (GMPE01) skip; they
+            // were installed unconditionally, and on PSO (GPOE8P) all nine
+            // land MID-FUNCTION in unrelated live code (pso.map: e.g.
+            // strncpy-replace inside zz_8010df9c_+0x18, FAKE_TO_SKIP_0
+            // inside zz_800ca454_+0x3ec) — silent function corruption on
+            // every non-SAB/MP4 title. MP4 keeps the full historical set
+            // (its current boot baseline was established with all nine
+            // installed); revisiting MP4's true minimal set is queued work.
+            const std::string& gid = SConfig::GetInstance().GetGameID();
+            const bool is_sab = gid.rfind("GSNE", 0) == 0;
+            const bool is_mp4 = gid.rfind("GMPE", 0) == 0;
+            if (is_sab || is_mp4) {
+                // Full 7-patch set per native dolphin.log.preserved:
+                HLE::Patch(system, 0x800e34a4u, "PPCMfhid2");
+                HLE::Patch(system, 0x800e34acu, "PPCMfhid2");
+                HLE::Patch(system, 0x800e34e0u, "PPCMfhid2");
+                HLE::Patch(system, 0x8010dfb4u, "strncpy");
+                HLE::Patch(system, 0x800e5bf0u, "OSReport");
+                HLE::Patch(system, 0x800ecfa4u, "___blank");
+                HLE::Patch(system, 0x800fe3c0u, "___blank");
+                // pass-5 instrumentation — Start-hook on interrupt-mask-decoder
+                // at 0x800e7e9c. Hook logs r3/r4/LR; spin diagnostic.
+                HLE::Patch(system, 0x800e7e9cu, "TraceDispatcher");
+                dolphin_evict_block(0x800e34a4u);
+                dolphin_evict_block(0x800e34acu);
+                dolphin_evict_block(0x800e34e0u);
+                dolphin_evict_block(0x8010dfb4u);
+                dolphin_evict_block(0x800e5bf0u);
+                dolphin_evict_block(0x800ecfa4u);
+                dolphin_evict_block(0x800fe3c0u);
+                dolphin_evict_block(0x800e7e9cu);
+            }
+            if (is_mp4) {
+                // MP4 (GMPE01_01) GXWaitDrawDone unblock: libretro init never
+                // calls VideoBackend::Initialize (Core.cpp:488-489 libretro
+                // init_video lambda returns true without it), so CommandProcessor
+                // / Fifo / PixelEngine never Init, CPReadWriteDistance stays 0,
+                // RunGpuOnCpu's gate never passes, BPWritten never reached, no
+                // BPMEM_SETDRAWDONE -> PixelEngine::SetFinish, PE_FINISH never
+                // fires, GXWaitDrawDone (GXMisc.c:116-127) sleeps on FinishQueue
+                // forever. HLE-skip lets main thread proceed; renders nothing
+                // but unblocks boot past Start New OVL 1.
+                HLE::Patch(system, 0x800CA840u, "FAKE_TO_SKIP_0");
+                dolphin_evict_block(0x800CA840u);
+            }
             MAIN_THREAD_EM_ASM({
-                postMessage({cmd: 'print', txt: '[worker] installed all 7 SAB HLE patches + dispatcher trace + evicted m_wasm_cache'});
-            });
+                postMessage({cmd: 'print', txt: '[worker] HLE patch install: gameid-gated (sab=' + $0 + ' mp4=' + $1 + ')'});
+            }, (int)is_sab, (int)is_mp4);
         }
         if (!g_loaded) break;
     }

@@ -479,6 +479,12 @@ function startServer() {
       }
       return {
         addr: gaddr,
+        // Saved OSContext (struct head): gpr[32] @+0x00, lr @+0x84,
+        // srr0 @+0x198. Valid resume point for READY/WAITING threads;
+        // stale for the RUNNING thread (use the stack scan instead).
+        ctx_r1:          guestRead32(gaddr + 0x04),
+        ctx_lr:          guestRead32(gaddr + 0x84),
+        ctx_srr0:        guestRead32(gaddr + 0x198),
         state:           guestRead16(gaddr + 0x2C8),
         attr:            guestRead16(gaddr + 0x2CA),
         suspend:         guestRead32(gaddr + 0x2CC) | 0,
@@ -515,6 +521,21 @@ function startServer() {
       seen.add(cur);
       const t = readThread(cur);
       if (!t || t.error) { threads.push(t || { addr: cur, error: 'null_read' }); break; }
+      // Return-address scan of the thread's stack region: every word in
+      // [stackEnd, stackBase) that looks like a text address. For the
+      // RUNNING thread this is the only live backtrace evidence (its saved
+      // context is stale). Most-recent (lowest, near live r1) first.
+      const codeHits = [];
+      const sb = t.stackBase >>> 0, se = t.stackEnd >>> 0;
+      if (sb > se && sb - se <= 0x100000 && se >= 0x80000000 && sb < 0x81800000) {
+        for (let a = se; a < sb && codeHits.length < 64; a += 4) {
+          const w = guestRead32(a) >>> 0;
+          if (w >= 0x80003100 && w < 0x80450000 && (w & 3) === 0) {
+            codeHits.push({ at: a, val: w });
+          }
+        }
+      }
+      t.stackScan = codeHits;
       threads.push(t);
       cur = t.linkActive_next >>> 0;
       iters++;
@@ -583,6 +604,20 @@ function startServer() {
       console.log(`    queueJoin   head=0x${t.queueJoin_head.toString(16)} tail=0x${t.queueJoin_tail.toString(16)}`);
       console.log(`    mutex       = 0x${t.mutex.toString(16)}  queueMutex head=0x${t.queueMutex_head.toString(16)} tail=0x${t.queueMutex_tail.toString(16)}`);
       console.log(`    stack       base=0x${t.stackBase.toString(16)} end=0x${t.stackEnd.toString(16)}`);
+      console.log(`    ctx         srr0=0x${t.ctx_srr0.toString(16)} (${resolveAddr(syms, t.ctx_srr0)})  lr=0x${t.ctx_lr.toString(16)} (${resolveAddr(syms, t.ctx_lr)})  r1=0x${t.ctx_r1.toString(16)}`);
+      if (t.stackScan && t.stackScan.length) {
+        const uniq = new Map();
+        for (const h of t.stackScan) {
+          const sym = resolveAddr(syms, h.val);
+          if (!uniq.has(sym)) uniq.set(sym, h.val);
+        }
+        console.log(`    stack code refs (${t.stackScan.length} words, ${uniq.size} uniq fns):`);
+        let shown = 0;
+        for (const [sym, val] of uniq) {
+          if (shown++ >= 14) { console.log(`      ... (${uniq.size - 14} more)`); break; }
+          console.log(`      0x${val.toString(16)}  ${sym}`);
+        }
+      }
     }
   }
 

@@ -41,29 +41,68 @@ var bootLoopRunning = false;
 // for a running game (matches GC VBlank) but throttles us 10–16× during
 // early OS init when there's no rendering budget to fill. After the first
 // frame arrives we switch to the steady-state 60 Hz loop.
+// [tick-diag 2026-06-12] temporary (strip per gate #8): pin WHERE the
+// worker's event loop dies. mailbox-diag proved zero inbound deliveries
+// post-romEnd; the discriminator is whether _run_iter_batch ever RETURNS.
+// If "[tick-diag] boot batch 1 returned" never prints, the first batch
+// call blocks forever. If boot batches return but "[tick-diag] tick N"
+// never prints, the setInterval callback is starved some other way.
+var __bootBatches = 0;
+var __ticks = 0;
+
+// 2026-06-12 EVENT-LOOP STARVATION FIX: the old batch sizes (100000 boot /
+// 10000 tick) date from when one iter was a cheap dispatch slice. Today one
+// iter = one full retro_run frame-quantum (measured via the SAB counter at
+// 0x025010D4: retror 0->315 across a 60s MP4 probe, ~5/s wall), so the FIRST
+// boot batch alone needed ~100000/5 s of wall time — the worker never
+// returned to its event loop and NO page->worker message (input, get-ram-
+// info) was ever delivered post-romEnd ([mailbox-diag] n=1 cmd=romEnd was
+// the lifetime total). Pump with a wall-clock budget instead: run retro_run
+// repeatedly until BUDGET_MS elapses, then yield so queued messages deliver.
+var PUMP_BUDGET_MS = 40;
+
+function pumpBatch() {
+  var t0 = performance.now();
+  if (Module && Module._run_iter_batch) {
+    do { Module._run_iter_batch(1); }
+    while ((performance.now() - t0) < PUMP_BUDGET_MS);
+  } else if (Module && Module._run_iter) {
+    do { Module._run_iter(); }
+    while ((performance.now() - t0) < PUMP_BUDGET_MS);
+  }
+}
+
 async function bootLoop() {
   if (bootLoopRunning) return;
   bootLoopRunning = true;
   while (!firstFrameSeen) {
-    if (Module && Module._run_iter_batch) {
-      Module._run_iter_batch(100000);
-    } else if (Module && Module._run_iter) {
-      for (var i = 0; i < 10000; i++) Module._run_iter();
+    pumpBatch();
+    __bootBatches++;
+    if (__bootBatches <= 3 || (__bootBatches % 100) === 0) {
+      try { postMessage({ cmd: 'print', txt: '[tick-diag] boot batch ' + __bootBatches + ' returned' }); } catch (_) {}
     }
     await new Promise(function (r) { setTimeout(r, 0); });
   }
   bootLoopRunning = false;
+  try { postMessage({ cmd: 'print', txt: '[tick-diag] bootLoop exited after ' + __bootBatches + ' batches' }); } catch (_) {}
+  startTickLoop();
 }
 
 function startTickLoop() {
   if (tickInterval) return;
-  tickInterval = setInterval(function () {
-    if (Module && Module._run_iter_batch) {
-      Module._run_iter_batch(10000);
-    } else if (Module && Module._run_iter) {
-      for (var i = 0; i < 10000; i++) Module._run_iter();
+  // setTimeout(0) chain, not setInterval(16): while we're below native
+  // speed there is no idle budget to give back — run flat-out, yielding
+  // each turn so input/mailbox messages keep flowing. (A 16ms pace only
+  // makes sense once a frame completes in under 16ms.)
+  var pump = function () {
+    pumpBatch();
+    __ticks++;
+    if (__ticks <= 3 || (__ticks % 200) === 0) {
+      try { postMessage({ cmd: 'print', txt: '[tick-diag] tick ' + __ticks + ' returned' }); } catch (_) {}
     }
-  }, 16); // ~60 fps
+    tickInterval = setTimeout(pump, 0);
+  };
+  tickInterval = setTimeout(pump, 0);
 }
 
 // Called once we know rendering has begun (set by video_cb in
@@ -268,6 +307,14 @@ self.onmessage = function (e) {
         var ptr = Module._get_pad_ptr();
         if (data.states && data.states.length) {
           Module.HEAPU8.set(data.states, ptr);
+          // [mailbox-diag] log non-neutral pad arrivals (edge-triggered) so
+          // synthetic presses are provable at the g_pad sink. Strip per gate #8.
+          var nz = 0;
+          for (var si = 0; si < data.states.length; si++) nz |= data.states[si];
+          if (nz !== self.__lastPadNz) {
+            self.__lastPadNz = nz;
+            try { postMessage({ cmd: 'print', txt: '[mailbox-diag] pad bits=0x' + nz.toString(16) + ' b0=0x' + data.states[0].toString(16) + ' b1=0x' + data.states[1].toString(16) }); } catch (_) {}
+          }
         }
       }
       break;

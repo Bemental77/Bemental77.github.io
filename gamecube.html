@@ -1491,16 +1491,21 @@
     }
   };
   var mobilePadState = { a: false, b: false, x: false, y: false, l: false, r: false, z: false, start: false, select: false, up: false, down: false, left: false, right: false };
+  // 2026-06-12 INPUT REPAIR. The old body was active-low read-modify-write
+  // (only ever CLEARED bits) against a buffer pinned to 0 by the fill(0) in
+  // var_setup, in a bit layout the worker never read — so no press EVER
+  // changed the bytes shipped to the worker. The worker's input_state_cb
+  // (EmscriptenWorker.cpp:171-180) reads ACTIVE-HIGH libretro joypad-id
+  // bits: g_pad[port*8 + id/8] bit (id%8). Dolphin's GC descriptor table
+  // (DolphinLibretro/Input.cpp:80-106) maps GC Z to RETRO R (id 11) and GC
+  // L/R to L2/R2 (ids 12/13). Compose that layout here, full recompute so
+  // releases work too.
   function updatePadState() {
     if (!padStatus1) return;
-    var b0 = Module.HEAPU8[padStatus1], b1 = Module.HEAPU8[padStatus1 + 1];
-    if (mobilePadState.select) b0 &= ~(1 << 0); if (mobilePadState.start) b0 &= ~(1 << 1);
-    if (mobilePadState.up) b0 &= ~(1 << 2); if (mobilePadState.down) b0 &= ~(1 << 3);
-    if (mobilePadState.left) b0 &= ~(1 << 4); if (mobilePadState.right) b0 &= ~(1 << 5);
-    if (mobilePadState.a) b0 &= ~(1 << 6); if (mobilePadState.b) b0 &= ~(1 << 7);
-    if (mobilePadState.x) b1 &= ~(1 << 0); if (mobilePadState.y) b1 &= ~(1 << 1);
-    if (mobilePadState.z) b1 &= ~(1 << 2); if (mobilePadState.l) b1 &= ~(1 << 3);
-    if (mobilePadState.r) b1 &= ~(1 << 4);
+    var s = mobilePadState;
+    var b0 = (s.b ? 1 : 0) | (s.y ? 2 : 0) | (s.select ? 4 : 0) | (s.start ? 8 : 0)
+           | (s.up ? 16 : 0) | (s.down ? 32 : 0) | (s.left ? 64 : 0) | (s.right ? 128 : 0);
+    var b1 = (s.a ? 1 : 0) | (s.x ? 2 : 0) | (s.z ? 8 : 0) | (s.l ? 16 : 0) | (s.r ? 32 : 0);
     Module.HEAPU8[padStatus1] = b0; Module.HEAPU8[padStatus1 + 1] = b1;
   }
   var KEY_CODES = { 'ArrowUp': ['ArrowUp', 38], 'ArrowDown': ['ArrowDown', 40], 'ArrowLeft': ['ArrowLeft', 37], 'ArrowRight': ['ArrowRight', 39], 'x': ['KeyX', 88], 'z': ['KeyZ', 90], 's': ['KeyS', 83], 'd': ['KeyD', 68], 'w': ['KeyW', 87], 'r': ['KeyR', 82], 'e': ['KeyE', 69], 'v': ['KeyV', 86], 'c': ['KeyC', 67] };
@@ -1511,6 +1516,27 @@
     var info = KEY_CODES[key]; if (!info) return;
     try { var evt = new KeyboardEvent(type, { key: key, code: info[0], keyCode: info[1], which: info[1], bubbles: true, cancelable: true }); Object.defineProperty(evt, 'keyCode', { get: function () { return info[1]; } }); Object.defineProperty(evt, 'which', { get: function () { return info[1]; } }); window.dispatchEvent(evt); document.dispatchEvent(evt); } catch (e) {}
   }
+  // 2026-06-12: physical keyboard wiring. The vendored page module's
+  // _CheckKeyboard is a stub (EmscriptenMain.cpp), so real key presses
+  // never reached the pad buffer — route them through the same
+  // mobilePadState path the touch controls use. Synthetic events from
+  // dispatchKey carry isTrusted=false and are already applied there, so
+  // skip them to avoid double-toggling.
+  (function () {
+    var keyToPad = { 'ArrowUp': 'up', 'ArrowDown': 'down', 'ArrowLeft': 'left', 'ArrowRight': 'right', 'x': 'a', 'z': 'b', 's': 'x', 'd': 'y', 'w': 'l', 'r': 'r', 'e': 'z', 'v': 'start', 'c': 'select' };
+    function onKey(type, e) {
+      if (!e.isTrusted) return;
+      var padBtn = keyToPad[e.key];
+      if (!padBtn) return;
+      e.preventDefault();
+      if (mobilePadState[padBtn] !== (type === 'keydown')) {
+        mobilePadState[padBtn] = (type === 'keydown');
+        updatePadState();
+      }
+    }
+    window.addEventListener('keydown', function (e) { onKey('keydown', e); });
+    window.addEventListener('keyup', function (e) { onKey('keyup', e); });
+  })();
   function wireButton(id, key) {
     var el = $(id); if (!el) return;
     function press(e) { if (e && e.preventDefault) e.preventDefault(); dispatchKey('keydown', key); el.classList.add('held'); }

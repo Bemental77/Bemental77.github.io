@@ -237,6 +237,32 @@ function startServer() {
   await page.evaluate(() => { const b = document.getElementById('btnStart'); if (b) b.click(); });
   console.log('[probe] Start clicked, observing for ' + (TEST_DURATION_MS/1000) + 's...');
 
+  // ---- synthetic pad presses ----------------------------------------------
+  // PROBE_PRESS="start@45000,a@52000" → at each offset (ms from Start
+  // click), hold the named GC button for PRESS_HOLD_MS via the page's own
+  // dispatchKey path (same route the touch controls use), so the press
+  // flows pad-buffer → 10ms input pump → worker g_pad → input_state_cb.
+  const PRESS_HOLD_MS = 500;
+  const PRESS_KEY = { start: 'v', select: 'c', a: 'x', b: 'z', x: 's', y: 'd', l: 'w', r: 'r', z: 'e', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight' };
+  (process.env.PROBE_PRESS || '').split(',').filter(Boolean).forEach((spec) => {
+    const m = spec.trim().match(/^(\w+)@(\d+)$/);
+    if (!m || !PRESS_KEY[m[1]]) { console.log('[probe] PROBE_PRESS spec ignored: ' + spec); return; }
+    const key = PRESS_KEY[m[1]];
+    // page.keyboard emits TRUSTED events — exercises the real
+    // physical-keyboard path in gamecube.html (keydown/keyup listeners
+    // → mobilePadState → updatePadState → 10ms input pump).
+    setTimeout(async () => {
+      try {
+        await page.keyboard.down(key);
+        console.log('[probe] press ' + m[1] + ' down @' + m[2] + 'ms');
+        setTimeout(async () => {
+          try { await page.keyboard.up(key); console.log('[probe] press ' + m[1] + ' up'); }
+          catch (e) { console.log('[probe] press keyup failed: ' + e.message); }
+        }, PRESS_HOLD_MS);
+      } catch (e) { console.log('[probe] press keydown failed: ' + e.message); }
+    }, parseInt(m[2], 10));
+  });
+
   // ---- page.metrics() snapshots over the run -----------------------------
   // Captures heap size, JS event count, frame count, etc. every
   // METRICS_INTERVAL_MS so we can see growth/leak/stall patterns over time.
@@ -351,6 +377,11 @@ function startServer() {
   buckets.other.filter(l => /\[mp4-wedge-diag\] disp-counts/.test(l)).forEach(l => console.log('  ' + l));
   console.log('\n--- mp4-wedge-diag block-compiled (full) ---');
   buckets.other.filter(l => /\[mp4-wedge-diag\] block-compiled/.test(l)).forEach(l => console.log('  ' + l));
+  console.log('\n--- mailbox/tick diag (event-loop starvation pin) ---');
+  buckets.other.filter(l => /\[tick-diag\]|\[mailbox-diag\]/.test(l)).slice(0, 40).forEach(l => console.log('  ' + l));
+  const p4c = buckets.other.filter(l => /\[phase4-counters\]/.test(l));
+  console.log('--- phase4-counters (first 3 + last 3 of ' + p4c.length + ') ---');
+  p4c.slice(0, 3).concat(p4c.length > 6 ? ['  ...'] : [], p4c.slice(-3)).forEach(l => console.log('  ' + l));
   console.log('\n--- other (last 15 of ' + buckets.other.length + ') ---');
   buckets.other.slice(-15).forEach(l => console.log('  ' + l));
   console.log('\n--- wtraj (full, count=' + ((buckets.wtraj||[]).length) + ') ---');
