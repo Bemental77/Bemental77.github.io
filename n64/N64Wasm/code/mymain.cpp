@@ -31,6 +31,7 @@ int mouseX = 0;
 int mouseY = 0;
 int mousePressed = 0;
 int mouseRange = 40;
+int g_jit_bridge = 0; /* JIT bridge toggle, read by r4300/recomp.c; set via neil_set_jit_bridge */
 
 }
 
@@ -1891,5 +1892,10 @@ extern "C" {
             doubleSpeed = true;
         else
             doubleSpeed = false;
+    }
+
+    void neil_set_jit_bridge(int set)
+    {
+        g_jit_bridge = set;
     }
 }

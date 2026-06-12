@@ -16,23 +16,27 @@ build, baseline first, one change at a time.
 ## M1 — funcref plumbing: one JIT block executes in-browser
 The decisive spike: prove a JS-built wasm function can be installed as a
 block-head `PC->ops` and execute correctly mid-game.
-- [ ] Re-link with `-sALLOW_TABLE_GROWTH -sEXPORTED_RUNTIME_METHODS=addFunction,...`
-      and pick TOTAL_MEMORY deliberately (512MB unless measured otherwise);
-      verify boot parity (mariokart 98%±, sm64, starfox) on the relinked core
-- [ ] C-side bridge at recompile_block/NOTCOMPILED: EM_ASM up-call
-      `myApp.jitCompile(blockStart, byteLen, ramPtr, blockPtr)` returning a
-      table index; install as ops for the block head; flag to disable
-      (`?jit=0` style) so interpreter remains the control arm
-- [ ] JS-side compiler v0: build a wasm module per block that simply CALLS
-      the per-op cached-interpreter functions in sequence (call-threaded
-      block) — zero new semantics, proves: module instantiation against the
-      main memory, table install, dispatch through PC->ops, interrupt-poll
-      placement at block exit, invalidation flush path
+- [x] Re-link with table growth + addFunction/removeFunction/wasmTable
+      exports, TOTAL_MEMORY 512MB (matches vendored); boot parity verified:
+      mariokart 98%, sm64 100%, starfox 99%, zero page errors (2026-06-12)
+- [x] C-side bridge: EM_ASM up-call at the tail of recompile_block
+      (recomp.c) → `myApp.jitCompile(entryVaddr, entryInstrPtr, origOpsIdx,
+      spanLen)`; nonzero return installed as the entry instruction's ops.
+      OFF by default (g_jit_bridge=0, mymain.cpp); page enables via
+      `_neil_set_jit_bridge(1)` behind the `?jit` URL flag (index.html
+      setupJitBridge) — interpreter remains the control arm
+- [x] v0 call-through compiler PASSED: Mario Kart with ?jit — 587 spans
+      wrapped, 4.22M dispatches through JS-created funcrefs installed as
+      PC->ops, speed 107% vs 105% control, identical rendering, 0 errors.
+      Plumbing (EM_ASM up-call, addFunction funcref, table install,
+      dispatch, state integrity) fully validated in live gameplay
+- [ ] v0.5: same flow but the funcref is a REAL per-block
+      WebAssembly.Module built in JS (imports: main memory + interp-fallback)
+      executing one trivial native op — proves module instantiation path +
+      measures sync-Module size limits
 - [ ] Differential harness v0 (the GC test_diff pattern, in-process oracle):
-      run N frames interp-only vs jit-v0, compare reg[]/hi/lo/PC/g_cp0_regs
+      run N frames interp-only vs jit, compare reg[]/hi/lo/PC/g_cp0_regs
       checksums per VI; PASS required on mariokart + sm64 + oot boot
-- [ ] Verify Chrome sync-Module size limit claim; if real, async-compile
-      with NOTCOMPILED fallback until funcref lands (structure supports it)
 - [ ] Savestate round-trip with JIT active (save → load → diff vs interp)
 
 ## M2 — n64/bementalJIT fork + native integer emitters

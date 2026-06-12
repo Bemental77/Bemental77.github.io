@@ -448,7 +448,37 @@
     // input_controller.js has run by now; route the core's per-frame mobile
     // pull to our pad state.
     window.myApp.rivetsData.inputController.updateMobileControls = pushControlsToCore;
+    setupJitBridge();
     if (pendingRom) { var r = pendingRom; pendingRom = null; loadRom(r); }
+  }
+
+  // ---- N64 JIT bridge (M1 spike — n64/docs/jit/TASKS.md) ----
+  // ?jit enables the C-side up-call in recompile_block: every freshly
+  // compiled block span is offered to myApp.jitCompile, and a returned
+  // wasm-table index is installed as the entry instruction's PC->ops.
+  // v0 proves the plumbing only: the returned funcref is a JS wrapper that
+  // counts the call and runs the ORIGINAL interpreter op — identical
+  // semantics by construction, so boot parity + a nonzero call count is a
+  // complete pass. Real per-block wasm emission replaces the wrapper in M2.
+  function setupJitBridge() {
+    if (!new URLSearchParams(location.search).has('jit')) return;
+    if (!window.Module || !Module.addFunction || !Module._neil_set_jit_bridge) {
+      pageLog('[jit] bridge unavailable in this core build');
+      return;
+    }
+    var wrapped = 0, calls = 0, reused = 0;
+    var map = Object.create(null);
+    window.myApp.jitCompile = function (vaddr, entryPtr, origOpsIdx, spanLen) {
+      var key = vaddr + ':' + origOpsIdx;
+      if (map[key]) { reused++; return map[key]; }
+      var orig = Module.wasmTable.get(origOpsIdx);
+      var idx = Module.addFunction(function () { calls++; orig(); }, 'v');
+      map[key] = idx; wrapped++;
+      return idx;
+    };
+    window.__jitStats = function () { return { wrapped: wrapped, calls: calls, reused: reused }; };
+    Module._neil_set_jit_bridge(1);
+    pageLog('[jit] bridge enabled (v0 call-through)');
   }
 
   async function loadRom(rom) {

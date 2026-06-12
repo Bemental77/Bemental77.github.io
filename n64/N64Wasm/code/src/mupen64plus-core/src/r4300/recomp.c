@@ -23,6 +23,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+extern int g_jit_bridge; /* defined in mymain.cpp; toggled via _neil_set_jit_bridge */
+#endif
+
 #define __STDC_FORMAT_MACROS
 #ifdef CORE_DBG
 #include <inttypes.h>
@@ -2465,6 +2470,26 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
 
 #ifdef CORE_DBG
    DebugMessage(M64MSG_INFO, "block recompiled (%" PRIX32 "-%" PRIX32 ")", func, block->start+i*4);
+#endif
+
+#ifdef __EMSCRIPTEN__
+   /* N64 JIT bridge (n64/docs/jit/README.md): offer the freshly compiled
+    * span to the page-side JIT. On a nonzero return, the entry
+    * instruction's ops becomes that wasm-table funcref — PC->ops() in
+    * r4300_step dispatches into it with zero further changes. Off by
+    * default; page enables via _neil_set_jit_bridge(1). Function pointers
+    * ARE table indices under wasm32, so the int<->funcptr casts are exact. */
+   if (g_jit_bridge)
+   {
+      uint32_t jit_entry_i = (func & UINT32_C(0xFFF)) / 4;
+      struct precomp_instr* jit_entry = block->block + jit_entry_i;
+      int jit_idx = EM_ASM_INT({
+         return (typeof window !== 'undefined' && window.myApp && window.myApp.jitCompile)
+            ? (window.myApp.jitCompile($0, $1, $2, $3) | 0) : 0;
+      }, (int)func, (int)(uintptr_t)jit_entry, (int)(uintptr_t)jit_entry->ops, (int)(i - jit_entry_i));
+      if (jit_idx > 0)
+         jit_entry->ops = (void (*)(void))(uintptr_t)jit_idx;
+   }
 #endif
    timed_section_end(TIMED_SECTION_COMPILER);
 }
