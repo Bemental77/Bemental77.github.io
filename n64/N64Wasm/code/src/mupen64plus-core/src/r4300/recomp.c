@@ -25,6 +25,7 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#include <stddef.h> /* offsetof for the JIT bridge param block */
 extern int g_jit_bridge; /* defined in mymain.cpp; toggled via _neil_set_jit_bridge */
 #endif
 
@@ -2478,15 +2479,31 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
     * instruction's ops becomes that wasm-table funcref — PC->ops() in
     * r4300_step dispatches into it with zero further changes. Off by
     * default; page enables via _neil_set_jit_bridge(1). Function pointers
-    * ARE table indices under wasm32, so the int<->funcptr casts are exact. */
+    * ARE table indices under wasm32, so the int<->funcptr casts are exact.
+    * Params are packed through one static block so the JS emitter has
+    * everything it needs: raw instruction words, the precomp_instr array
+    * layout (per-instruction interpreter-fallback funcrefs), and the
+    * architectural state addresses. */
    if (g_jit_bridge)
    {
       uint32_t jit_entry_i = (func & UINT32_C(0xFFF)) / 4;
       struct precomp_instr* jit_entry = block->block + jit_entry_i;
-      int jit_idx = EM_ASM_INT({
+      static uint32_t jit_params[10];
+      int jit_idx;
+      jit_params[0] = func;                                        /* entry vaddr */
+      jit_params[1] = (uint32_t)(uintptr_t)jit_entry;              /* entry precomp_instr* */
+      jit_params[2] = (uint32_t)(i - jit_entry_i);                 /* span length (instructions) */
+      jit_params[3] = (uint32_t)(uintptr_t)(source + jit_entry_i); /* raw instruction words */
+      jit_params[4] = (uint32_t)sizeof(struct precomp_instr);      /* precomp stride */
+      jit_params[5] = (uint32_t)offsetof(struct precomp_instr, addr);
+      jit_params[6] = (uint32_t)(uintptr_t)&PC;                    /* PC global (precomp_instr**) */
+      jit_params[7] = (uint32_t)(uintptr_t)&reg[0];                /* int64_t reg[32] */
+      jit_params[8] = (uint32_t)(uintptr_t)&hi;
+      jit_params[9] = (uint32_t)(uintptr_t)&lo;
+      jit_idx = EM_ASM_INT({
          return (typeof window !== 'undefined' && window.myApp && window.myApp.jitCompile)
-            ? (window.myApp.jitCompile($0, $1, $2, $3) | 0) : 0;
-      }, (int)func, (int)(uintptr_t)jit_entry, (int)(uintptr_t)jit_entry->ops, (int)(i - jit_entry_i));
+            ? (window.myApp.jitCompile($0) | 0) : 0;
+      }, (int)(uintptr_t)jit_params);
       if (jit_idx > 0)
          jit_entry->ops = (void (*)(void))(uintptr_t)jit_idx;
    }
