@@ -75,8 +75,22 @@ up in measurements.
 - [ ] Wave 3 — loads/stores (TLB-aware: KSEG0/KSEG1 fast path via direct
       RDRAM offset, mapped/MMIO via fallback), LW/SW/LBU/LB/LH/LHU/SB/SH,
       then LD/SD/unaligned pairs
-- [ ] Wave 4 — MULT/MULTU/DIV/DIVU + MFHI/MFLO/MTHI/MTLO (hi/lo addresses
-      already in the param block)
+- [x] Wave 4 (2026-06-12, f1d2f84): BLOCK-LOCAL REGISTER CACHE — guest
+      GPRs in 32 i64 wasm locals, lazy load, dirty flush before fallback/
+      gen_interrupt/exit/back-edge, full invalidate after fallbacks.
+      Differential green x3; speedup ratio 1.10x (from 1.01x). Design
+      traps documented in the commit (deferred cond emission, throwaway
+      probe clones, conservative joins)
+- [ ] Wave 5 — native stores SW/SB/SH (writemem-table runtime check +
+      CHECK_MEMORY invalid_code mirror): stores are the most frequent
+      remaining fallback and each one invalidates the whole cache —
+      this is the lever that lets cached registers live
+- [ ] Wave 5b — runtime per-opcode fallback census (?jitcensus) to rank
+      remaining work by EXECUTION frequency (gate #6: measured, not
+      compile-time counts)
+- [ ] Wave 6 — MULT/MULTU/DIV/DIVU + MFHI/MFLO/MTHI/MTLO (hi/lo addresses
+      already in the param block); JR/JALR (dynamic targets via jump_to
+      fallback exit, native condition-free form)
 - [ ] Delay-slot exception semantics: red tests for EPC/BD around lw/sw in
       delay slots, branch-likely skip, ERET (required before Wave 2 ships)
 - [ ] Per-instruction conformance runner (port gamecube/tools/conformance
@@ -99,6 +113,18 @@ up in measurements.
       "throughput" cause — CLAUDE.md gate #6)
 - [ ] Bar: ≥100% native-speed sustained in-game on the heavy set
       (Gauntlet Legends, DK64, Conker, Pod Racer in-race), on-device
+
+## Measurement rules (M4 spine, learned 2026-06-12)
+- Per-frame CPU cost via _neil_frame_cost_* (timed retro_run) is the
+  throughput metric — immune to the frame limiter. tools/_jit_speed_ab.mjs
+  runs the interleaved A/B.
+- THERMAL THROTTLING invalidates absolute numbers on this machine (i9 MBP;
+  pmset -g therm CPU_Speed_Limit observed at 20 under campaign load).
+  Only same-window interleaved ratios are valid; discard rounds whose
+  absolute costs shifted mid-round.
+- The wave-gate is: differential x3 (mariokart/sm64/oot) + page e2e +
+  interleaved A/B ratio. Correctness gates alone DO NOT catch perf
+  regressions — and a 'regression' under throttle may be the machine.
 
 ## Standing rules
 - The interpreter is the always-available oracle: every emitter lands with
