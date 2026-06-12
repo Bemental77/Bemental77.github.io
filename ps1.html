@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <title>PS1 Wasm — Monster Rancher 2</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <link rel="icon" href=",">
+  <link rel="icon" href="data:,">
   <script src="/coi-serviceworker.js"></script>
   <script>if (new URLSearchParams(location.search).has('eruda')) { var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/eruda'; s.onload=function(){eruda.init();}; document.head.appendChild(s); }</script>
   <style>
@@ -217,8 +217,20 @@
 
   function updatePadState() {
     if (!padStatus1) return;
-    var b0 = Module.HEAPU8[padStatus1];
-    var b1 = Module.HEAPU8[padStatus1 + 1];
+    // padStatus1 = get_ptr(1) = &PadState[0], whose layout (wasm32, see
+    // pcsx-wasm-src/plugins/sdlinput/pad.h tagPadState) is:
+    //   +0 SDL_Joystick* JoyDev; +4 u8 PadMode; +5 u8 PadID;
+    //   +6 u16 KeyStatus (active-low buttons); +8 u16 JoyKeyStatus; ...
+    // This function used to write bytes +0/+1 — the JoyDev POINTER — so
+    // mobile touches (and Edge-gamepad input, which feeds the same state)
+    // never reached the emulator; only desktop keyboard worked because
+    // CheckKeyboard writes the real KeyStatus in-wasm (2026-06-12 fix).
+    // On the mobile shell, this function OWNS KeyStatus: rebuild from the
+    // all-released base each call (CheckKeyboard is event-driven, so a
+    // read-modify-write would latch released buttons forever). Desktop
+    // keeps keyboard ownership — don't touch the field there.
+    if (!isMobile) return;
+    var b0 = 0xFF, b1 = 0xFF;
     if (mobilePadState.select) b0 &= ~(1 << 0); if (mobilePadState.start) b0 &= ~(1 << 3);
     if (mobilePadState.up) b0 &= ~(1 << 4); if (mobilePadState.right) b0 &= ~(1 << 5);
     if (mobilePadState.down) b0 &= ~(1 << 6); if (mobilePadState.left) b0 &= ~(1 << 7);
@@ -226,7 +238,7 @@
     if (mobilePadState.l1) b1 &= ~(1 << 2); if (mobilePadState.r1) b1 &= ~(1 << 3);
     if (mobilePadState.triangle) b1 &= ~(1 << 4); if (mobilePadState.circle) b1 &= ~(1 << 5);
     if (mobilePadState.cross) b1 &= ~(1 << 6); if (mobilePadState.square) b1 &= ~(1 << 7);
-    Module.HEAPU8[padStatus1] = b0; Module.HEAPU8[padStatus1 + 1] = b1;
+    Module.HEAPU8[padStatus1 + 6] = b0; Module.HEAPU8[padStatus1 + 7] = b1;
   }
 
   var KEY_CODES = { 'ArrowUp': ['ArrowUp', 38], 'ArrowDown': ['ArrowDown', 40], 'ArrowLeft': ['ArrowLeft', 37], 'ArrowRight': ['ArrowRight', 39], 'z': ['KeyZ', 90], 'x': ['KeyX', 88], 's': ['KeyS', 83], 'd': ['KeyD', 68], 'w': ['KeyW', 87], 'r': ['KeyR', 82], 'e': ['KeyE', 69], 't': ['KeyT', 84], 'v': ['KeyV', 86], 'c': ['KeyC', 67] };
