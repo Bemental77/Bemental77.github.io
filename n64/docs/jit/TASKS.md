@@ -98,6 +98,22 @@ up in measurements.
 - [ ] Fallback census tooling: per-opcode counts from real gameplay to
       drive wave priorities by measured weight (gate #6: no guessing)
 
+## Campaign state (2026-06-12, end of first push)
+M0-M2 COMPLETE through wave 7. The JIT is correctness-proven (every wave
+600-1200 VI frames bit-identical vs the interpreter on mariokart/sm64/oot
+with GPR+CP0+FPR+FCR31 in the checksum; savestates; invalidation; zero
+emit failures ever shipped) at ~90%+ native instruction coverage. The
+acceptance bar (>=100% native sustained in-game on heavy titles ON
+DEVICE) is UNVERIFIED: every speed measurement in the campaign window ran
+under thermal throttle (this i9 MBP pins CPU_Speed_Limit low under
+build+probe load). Last valid reading: 1.10x at wave 4; post-wave-6
+0.89x-under-throttle is suspect (see open question above). FIRST ACTION
+NEXT SESSION: cool machine -> order-alternating A/B (full vs ?jit=nofp vs
+interp) -> attribute -> then either FP-emit fixes (hoisted CU1/bank-ptr
+caching) or page-batched modules (V8 tier-up budget), THEN the on-device
+bar. The ?jit flag remains opt-in; the shipped default is unchanged
+interpreter behavior.
+
 ## M3 — FPU (COP1) + the long tail
 - [ ] COP1 moves/arith/converts/compares native (the GC lfs/stfs lesson:
       bit-exactness first, fp-rounding parity tests)
@@ -131,8 +147,13 @@ up in measurements.
       fixes if real: hoisted CU1/bank-pointer caching with
       fallback-invalidate; page-batched multi-function modules
       (amortized instantiation + V8 tier-up budget accumulation).
-- [ ] Cross-page jumps native (J/JAL/JR/JALR _OUT via jump_to_address +
-      jump_to_func — bridge params [41,42] already passed)
+- [x] Wave 7 (2026-06-12, e3e1eba): cross-page + register jumps native —
+      all _OUT branches via jump_to_address/jump_to_func, runtime
+      last_addr = PC->addr after jump_to, JR/JALR target captured pre-
+      link/slot, JALR links rd. Branch family complete except IDLE.
+      Census: mariokart fallback 4,632->2,716; sm64 ->3,406; oot ->10,013.
+      Remaining fallback: CVT/FP-compares/BC1, COP0/ERET/cache, LWL/LWR,
+      IDLE — all rare classes; emit only if a runtime census shows weight
 
 ## Measurement rules (M4 spine, learned 2026-06-12)
 - Per-frame CPU cost via _neil_frame_cost_* (timed retro_run) is the
