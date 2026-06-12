@@ -2489,7 +2489,7 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
       void gen_interrupt(void); /* interrupt.h not included in this TU */
       uint32_t jit_entry_i = (func & UINT32_C(0xFFF)) / 4;
       struct precomp_instr* jit_entry = block->block + jit_entry_i;
-      static uint32_t jit_params[25];
+      static uint32_t jit_params[34];
       int jit_idx;
       jit_params[0] = func;                                        /* entry vaddr */
       jit_params[1] = (uint32_t)(uintptr_t)jit_entry;              /* entry precomp_instr* */
@@ -2521,6 +2521,17 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
       jit_params[22] = (uint32_t)(uintptr_t)&read_rdramb;
       jit_params[23] = (uint32_t)(uintptr_t)&read_rdramh;
       jit_params[24] = (uint32_t)(uintptr_t)&g_dev.ri.rdram.dram[0];
+      /* wave 5 (native stores) — write-side dispatch tables + the
+       * CHECK_MEMORY mirror surface (invalid_code/blocks/NOTCOMPILED) */
+      jit_params[25] = (uint32_t)(uintptr_t)&writemem[0];
+      jit_params[26] = (uint32_t)(uintptr_t)&writememb[0];
+      jit_params[27] = (uint32_t)(uintptr_t)&writememh[0];
+      jit_params[28] = (uint32_t)(uintptr_t)&write_rdram;
+      jit_params[29] = (uint32_t)(uintptr_t)&write_rdramb;
+      jit_params[30] = (uint32_t)(uintptr_t)&write_rdramh;
+      jit_params[31] = (uint32_t)(uintptr_t)&invalid_code[0];
+      jit_params[32] = (uint32_t)(uintptr_t)&blocks[0];
+      jit_params[33] = (uint32_t)(uintptr_t)current_instruction_table.NOTCOMPILED;
       jit_idx = EM_ASM_INT({
          return (typeof window !== 'undefined' && window.myApp && window.myApp.jitCompile)
             ? (window.myApp.jitCompile($0) | 0) : 0;

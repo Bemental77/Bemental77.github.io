@@ -48,7 +48,7 @@
     block: 0x02, loop: 0x03, if_: 0x04, else_: 0x05, end: 0x0B,
     br: 0x0C, br_if: 0x0D, call_indirect: 0x11,
     local_get: 0x20, local_set: 0x21,
-    i32_load: 0x28, i64_load: 0x29, i32_store: 0x36, i64_store: 0x37,
+    i32_load: 0x28, i64_load: 0x29, i32_load8_u: 0x2D, i32_store: 0x36, i64_store: 0x37, i32_store8: 0x3A,
     i32_const: 0x41, i64_const: 0x42,
     i32_eqz: 0x45, i32_eq: 0x46, i32_ne: 0x47, i32_le_u: 0x4D,
     i64_eq: 0x51, i64_ne: 0x52, i64_lt_s: 0x53, i64_lt_u: 0x54, i64_gt_s: 0x55, i64_le_s: 0x57, i64_ge_s: 0x59,
@@ -101,6 +101,15 @@
     }
     return out;
   };
+  // flush bytes for the CURRENT dirty set WITHOUT mutating compile-state —
+  // for fallback arms that exit the block (their state dies with them)
+  RegCache.prototype.flushSnapshot = function () {
+    var out = [];
+    for (var r = 0; r < 32; r++) {
+      if (this.dirty[r]) out = out.concat(storeI64(this.regBase + r * 8, [OP.local_get].concat(leb(L_REG0 + r))));
+    }
+    return out;
+  };
   RegCache.prototype.invalidate = function () {
     this.loaded.fill(false);
     this.dirty.fill(false);
@@ -130,7 +139,9 @@
         case 0x04: v = C.read(rt).concat(wrap, C.read(rs), wrap, [OP.i32_shl], xs); break;           // SLLV
         case 0x06: v = C.read(rt).concat(wrap, C.read(rs), wrap, [OP.i32_shr_u], xs); break;         // SRLV
         case 0x07: v = C.read(rt).concat(wrap, C.read(rs), wrap, [OP.i32_shr_s], xs); break;         // SRAV
+        case 0x20:                                                                                     // ADD (no trap in this core)
         case 0x21: v = C.read(rs).concat(wrap, C.read(rt), wrap, [OP.i32_add], xs); break;           // ADDU
+        case 0x22:                                                                                     // SUB (no trap in this core)
         case 0x23: v = C.read(rs).concat(wrap, C.read(rt), wrap, [OP.i32_sub], xs); break;           // SUBU
         case 0x24: v = C.read(rs).concat(C.read(rt), [OP.i64_and]); break;                            // AND
         case 0x25: v = C.read(rs).concat(C.read(rt), [OP.i64_or]); break;                             // OR
@@ -144,6 +155,7 @@
     }
     dest = rt;
     switch (op) {
+      case 0x08:                                                                                          // ADDI (no trap in this core)
       case 0x09: v = C.read(rs).concat(wrap, [OP.i32_const], sleb(sext16(imm)), [OP.i32_add], xs); break; // ADDIU
       case 0x0A: v = C.read(rs).concat([OP.i64_const], sleb(sext16(imm)), [OP.i64_lt_s], xu); break;      // SLTI
       case 0x0B: v = C.read(rs).concat([OP.i64_const], sleb(sext16(imm)), [OP.i64_lt_u], xu); break;      // SLTIU
@@ -219,8 +231,15 @@
     );
   }
 
-  // ---- native loads ----
-  function emitLoad(word, instrPtr, nextPtr, p, C, opsIdx) {
+  // ---- native loads & stores ----
+  // Shared structure (exit-don't-join): the fast arm operates on the cache
+  // and CONTINUES — the fallback arm flushes a snapshot, calls the interp op
+  // and EXITS the block unconditionally (PC is correct either way after the
+  // op). The register cache therefore stays hot across native memory
+  // traffic; only genuinely slow accesses (TLB/MMIO/fb-protected) pay an
+  // exit. Compile-state mutations inside the fast arm are sound because the
+  // fast arm is the only continuing path.
+  function emitLoad(word, instrPtr, p, C, opsIdx, exitDepth) {
     var op = (word >>> 26) & 0x3F;
     if (op !== 0x20 && op !== 0x21 && op !== 0x23 && op !== 0x24 && op !== 0x25 && op !== 0x27) return null;
     var rs = (word >>> 21) & 0x1F, rt = (word >>> 16) & 0x1F;
@@ -240,40 +259,110 @@
       case 0x25: val = [OP.local_get, L_WORD].concat(shiftH, [OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i64_extend_i32_u]); break;
       case 0x21: val = [OP.local_get, L_WORD].concat(shiftH, [OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i32_extend16_s, OP.i64_extend_i32_s]); break;
     }
-    // Strategy: compute address (reads rs via cache), THEN flush dirty (the
-    // fast arm keeps locals valid — flush does not invalidate), then branch.
-    // After the fallback arm, the cache is invalidated at COMPILE time; the
-    // fast arm writes rt through the cache, which is still valid (loaded
-    // flags survive a flush). To keep one compile-state for both arms, the
-    // fast arm's rt write is therefore done as a direct local write AND
-    // memory store (cache-coherent on both views).
-    var bytes = [].concat(
+    return [].concat(
       C.read(rs), [OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR],
-      C.flush(), // dirty -> memory; locals stay loaded
       [OP.local_get, L_ADDR, OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
       [OP.i32_load, 0x02], leb(tableBase),
       [OP.i32_const], sleb(cmpVal), [OP.i32_eq],
       [OP.if_, OP.void_],
         [OP.local_get, L_ADDR, OP.i32_const], sleb(0xFFFFFC), [OP.i32_and],
         [OP.i32_load, 0x02], leb(p.dramBase), [OP.local_set, L_WORD],
-        // write rt to BOTH the local and memory so both arms agree
-        val, [OP.local_set].concat(leb(L_REG0 + rt)),
-        storeI64(p.regBase + rt * 8, [OP.local_get].concat(leb(L_REG0 + rt))),
+        val, C.writeFromStack(rt), // join: rt loaded+dirty (slow arm refreshes the local; its redundant flush is benign)
       [OP.else_],
+        // continue-after-fallback: snapshot-flush (compile-state untouched —
+        // the redundant later flush rewrites identical values), run the
+        // interp op, then refresh ONLY the op's write-set (rt) into its
+        // local so both arms join in the same compile-state (rt loaded).
+        // PC divergence (TLB exception) still exits.
+        C.flushSnapshot(),
         storeI32Const(p.pcGlobal, instrPtr),
         [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
-        loadI32(p.pcGlobal), [OP.i32_const], sleb(nextPtr), [OP.i32_ne],
-        [OP.br_if, 0x02],
+        loadI64(p.regBase + rt * 8), [OP.local_set], leb(L_REG0 + rt),
+        loadI32(p.pcGlobal), [OP.i32_const], sleb(instrPtr + p.stride), [OP.i32_ne],
+        [OP.br_if].concat(leb(exitDepth + 1)),
       [OP.end]
     );
-    // unified compile-state after the if/else: the fallback arm invalidated
-    // everything; adopt the conservative join (nothing loaded, nothing dirty)
-    C.invalidate();
-    return bytes;
+  }
+
+  // SW/SB/SH: fast path writes the host-endian u32 dram array with the
+  // mask-merge write_rdram_dram performs (SW mask ~0 = plain store), then
+  // mirrors CHECK_MEMORY (cached_interp.c): if (!invalid_code[a>>12]) and
+  // the page block instr at (a&0xFFF)/4 has ops != NOTCOMPILED, mark the
+  // page invalid. blocks[x] is only dereferenced when invalid_code[x]==0,
+  // exactly like the interpreter (a page with no block has invalid_code 1).
+  function emitStore(word, instrPtr, p, C, opsIdx, exitDepth) {
+    var op = (word >>> 26) & 0x3F;
+    if (op !== 0x28 && op !== 0x29 && op !== 0x2B) return null;
+    var rs = (word >>> 21) & 0x1F, rt = (word >>> 16) & 0x1F;
+    var imm = sext16(word & 0xFFFF);
+    var tableBase, cmpVal;
+    if (op === 0x2B) { tableBase = p.writememW; cmpVal = p.wrRdram; }
+    else if (op === 0x28) { tableBase = p.writememB; cmpVal = p.wrRdramB; }
+    else { tableBase = p.writememH; cmpVal = p.wrRdramH; }
+    var shiftB = [OP.local_get, L_ADDR, OP.i32_const, 0x03, OP.i32_and, OP.i32_const, 0x03, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
+    var shiftH = [OP.local_get, L_ADDR, OP.i32_const, 0x02, OP.i32_and, OP.i32_const, 0x02, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
+    // dram word address bytes (push i32 address of the containing word)
+    var wordAddr = [OP.local_get, L_ADDR, OP.i32_const].concat(sleb(0xFFFFFC), [OP.i32_and]);
+    var storeBytes;
+    if (op === 0x2B) {
+      // SW: dram[word] = (u32)reg[rt]
+      storeBytes = wordAddr.concat(C.read(rt), [OP.i32_wrap_i64], [OP.i32_store, 0x02], leb(p.dramBase));
+    } else {
+      var isByte = (op === 0x28);
+      var maskC = isByte ? 0xFF : 0xFFFF;
+      var sh = isByte ? shiftB : shiftH;
+      // w = dram[word]; merged = (w & ~(mask<<s)) | (((u32)rt & mask) << s)
+      storeBytes = [].concat(
+        wordAddr, [OP.i32_load, 0x02], leb(p.dramBase), [OP.local_set, L_WORD],
+        wordAddr,
+        // (w & ~(mask<<s))
+        [OP.local_get, L_WORD, OP.i32_const], sleb(maskC), sh, [OP.i32_shl, OP.i32_const], sleb(-1), [OP.i32_xor, OP.i32_and],
+        // ((rt & mask) << s)
+        C.read(rt), [OP.i32_wrap_i64, OP.i32_const], sleb(maskC), [OP.i32_and], sh, [OP.i32_shl],
+        [OP.i32_or],
+        [OP.i32_store, 0x02], leb(p.dramBase)
+      );
+    }
+    var checkMemory = [].concat(
+      [OP.local_get, L_ADDR, OP.i32_const, 0x0C, OP.i32_shr_u],
+      [OP.i32_load8_u, 0x00], leb(p.invalidCode),
+      [OP.i32_eqz, OP.if_, OP.void_],
+        // ops = *( blocks[a>>12]->block + ((a&0xFFF)>>2)*stride ); ->block is field 0
+        [OP.local_get, L_ADDR, OP.i32_const, 0x0C, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
+        [OP.i32_load, 0x02], leb(p.blocksBase),
+        [OP.i32_load, 0x02, 0x00], // ->block (offset 0)
+        [OP.local_get, L_ADDR, OP.i32_const], sleb(0xFFF), [OP.i32_and, OP.i32_const, 0x02, OP.i32_shr_u, OP.i32_const], sleb(p.stride), [OP.i32_mul, OP.i32_add],
+        [OP.i32_load, 0x02, 0x00], // .ops (offset 0)
+        [OP.i32_const], sleb(p.notCompiled), [OP.i32_ne],
+        [OP.if_, OP.void_],
+          [OP.local_get, L_ADDR, OP.i32_const, 0x0C, OP.i32_shr_u, OP.i32_const, 0x01],
+          [OP.i32_store8, 0x00], leb(p.invalidCode),
+        [OP.end],
+      [OP.end]
+    );
+    return [].concat(
+      C.read(rs), [OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR],
+      [OP.local_get, L_ADDR, OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
+      [OP.i32_load, 0x02], leb(tableBase),
+      [OP.i32_const], sleb(cmpVal), [OP.i32_eq],
+      [OP.if_, OP.void_],
+        storeBytes,
+        checkMemory,
+      [OP.else_],
+        // continue-after-fallback: store ops write no guest registers, so
+        // both arms join with the cache untouched; snapshot-flush keeps
+        // memory current for the interp op (it reads rs/rt from reg[])
+        C.flushSnapshot(),
+        storeI32Const(p.pcGlobal, instrPtr),
+        [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
+        loadI32(p.pcGlobal), [OP.i32_const], sleb(instrPtr + p.stride), [OP.i32_ne],
+        [OP.br_if].concat(leb(exitDepth + 1)),
+      [OP.end]
+    );
   }
 
   // ---- block compiler ----
-  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeLoads: 0, fallbackOps: 0, fails: 0 };
+  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeLoads: 0, nativeStores: 0, fallbackOps: 0, fails: 0 };
 
   function compileSpan(p, Module) {
     var HEAPU32 = Module.HEAPU32;
@@ -386,12 +475,19 @@
         continue;
       }
 
-      // (c) native load?
+      // (c) native load / store?
       var opsIdxL = HEAPU32[instrPtr >> 2];
-      var ld = emitLoad(word, instrPtr, nextPtr, p, C, opsIdxL);
+      var ld = emitLoad(word, instrPtr, p, C, opsIdxL, EXIT);
       if (ld) {
         body = body.concat(ld);
         stats.nativeLoads++;
+        i++;
+        continue;
+      }
+      var st = emitStore(word, instrPtr, p, C, opsIdxL, EXIT);
+      if (st) {
+        body = body.concat(st);
+        stats.nativeStores++;
         i++;
         continue;
       }
