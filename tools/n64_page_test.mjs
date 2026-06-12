@@ -11,7 +11,7 @@
 import puppeteer from 'puppeteer';
 
 const rom = process.argv[2] || 'mariokart.z64';
-const base = 'http://localhost:8080/n64/';
+const base = process.env.N64_PAGE_URL || 'http://localhost:8080/n64/';
 const result = { rom, desktop: {}, mobile: {} };
 
 const browser = await puppeteer.launch({
