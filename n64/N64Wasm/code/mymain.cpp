@@ -33,6 +33,12 @@ int mousePressed = 0;
 int mouseRange = 40;
 int g_jit_bridge = 0; /* JIT bridge toggle, read by r4300/recomp.c; set via neil_set_jit_bridge */
 
+/* per-frame emulation cost meter (n64/docs/jit M2 perf): wall time spent
+ * inside retro_run, accumulated so the page can compute avg cost per VI
+ * frame — the direct CPU-throughput metric, immune to the frame limiter */
+double g_frame_cost_ms = 0.0;
+unsigned int g_frame_cost_n = 0;
+
 }
 
 #include "neil_controller.h"
@@ -894,6 +900,14 @@ void mainLoop()
     }
 }
 
+static void timed_retro_run()
+{
+    double t0 = emscripten_get_now();
+    retro_run();
+    g_frame_cost_ms += emscripten_get_now() - t0;
+    g_frame_cost_n++;
+}
+
 void mainLoopInner()
 {
 	#ifdef __EMSCRIPTEN__
@@ -1154,7 +1168,7 @@ void mainLoopInner()
 
     if (doubleSpeed)
     {
-        retro_run();
+        timed_retro_run();
     }
     else
     {
@@ -1162,7 +1176,7 @@ void mainLoopInner()
         //if emulator is too far ahead
         audioBufferQueue = SDL_GetQueuedAudioSize(audioDeviceId);
         if (audioBufferQueue < 20000 && fpsAudioRemaining < 5000)
-            retro_run();
+            timed_retro_run();
         else
         {
             hadSkip = 1;
@@ -1898,4 +1912,8 @@ extern "C" {
     {
         g_jit_bridge = set;
     }
+
+    double neil_frame_cost_ms(void) { return g_frame_cost_ms; }
+    int neil_frame_cost_n(void) { return (int)g_frame_cost_n; }
+    void neil_frame_cost_reset(void) { g_frame_cost_ms = 0.0; g_frame_cost_n = 0; }
 }
