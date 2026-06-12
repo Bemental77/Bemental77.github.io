@@ -224,7 +224,7 @@ struct TestEnv {
     BlockCache cache;
 
     bool init() {
-        constexpr u32 CTX_BYTES = 0x400;
+        constexpr u32 CTX_BYTES = 0x1400; // covers spr[] through GQR0-7 (912 -> 0x1180) and HID2 (920 -> 0x1190); was 0x400, which made any spr(912+) write silent heap corruption
         ctx_raw = std::calloc(1, CTX_BYTES);
         if (!ctx_raw) return false;
         ctx_ptr = (u32)(uintptr_t)ctx_raw;
@@ -1149,6 +1149,225 @@ struct TestCase {
     bool (*run)();
 };
 
+// ---------------------------------------------------------------------------
+// psq_l / psq_st conformance (red-first for the native paired-single
+// quantized load/store emitters; bit-exact reference =
+// Interpreter_LoadStorePaired.cpp). All tests: MSR.FP=1, HID2.PSE|LSQE set
+// (spr 920 = 0xA0000000), GQR via spr(912+I). Encodings hand-verified
+// against Gekko.h field positions (W=bit15, I=bits12-14, SIMM_12=bits0-11).
+// ---------------------------------------------------------------------------
+
+static void psq_env_common(TestEnv& env) {
+    *(u32*)((u8*)env.ctx_raw + ppc_off::MSR) = 0x2000u;   // MSR.FP=1
+    env.spr(920) = 0xA0000000u;                            // HID2.PSE|LSQE
+}
+
+// psq_l f1, 8(r3), W=0, I=0; GQR0 ld FLOAT scale 0.
+// Pair load: read32(EA)=1.0f, read32(EA+4)=2.0f -> ps0=1.0, ps1=2.0.
+static bool test_psq_l_float_pair() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);
+    env.spr(912) = 0;              // GQR0: ld_type FLOAT, scale 0
+    env.gpr(3) = 0x80100000u;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_reads = [];
+        Module.bemental_imports.env.ppc_read32 = function(addr) {
+            addr = addr >>> 0;
+            Module.test_reads.push(addr);
+            if (addr === 0x80100008) return 0x3F800000 | 0;  // 1.0f
+            if (addr === 0x8010000C) return 0x40000000 | 0;  // 2.0f
+            return 0;
+        };
+    });
+#endif
+    const u32 insts[] = { 0xE0230008u }; // psq_l f1, 8(r3), W=0, I=0
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, 1, &next_pc);
+#ifdef __EMSCRIPTEN__
+    const u32 n_reads = (u32)EM_ASM_INT({ return Module.test_reads.length | 0; });
+    EM_ASM({ Module.bemental_imports.env.ppc_read32 = function(addr) { return 0; }; });
+#else
+    const u32 n_reads = 0;
+#endif
+    if (!dispatched) return false;
+    const u64 ps0 = *(const u64*)((const u8*)env.ctx_raw + ppc_off::ps0(1));
+    const u64 ps1 = *(const u64*)((const u8*)env.ctx_raw + ppc_off::ps1(1));
+    std::printf("[diag psq_l-f] reads=%u ps0=0x%016llx (exp 3ff0..) ps1=0x%016llx (exp 4000..) next=0x%08x\n",
+                n_reads, (unsigned long long)ps0, (unsigned long long)ps1, (u32)next_pc);
+    return ps0 == 0x3FF0000000000000ull && ps1 == 0x4000000000000000ull
+        && n_reads == 2u && next_pc == (s32)(PC + 4);
+}
+
+// psq_l f1, 8(r3), W=1: single read; ps1 MUST be 1.0
+// (Interpreter_LoadStorePaired.cpp:238 — not 0, not a copy of ps0).
+static bool test_psq_l_w1_ps1_one() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);
+    env.spr(912) = 0;
+    env.gpr(3) = 0x80100000u;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_reads = [];
+        Module.bemental_imports.env.ppc_read32 = function(addr) {
+            Module.test_reads.push(addr >>> 0);
+            return 0x40400000 | 0;  // 3.0f
+        };
+    });
+#endif
+    const u32 insts[] = { 0xE0238008u }; // psq_l f1, 8(r3), W=1, I=0
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, 1, &next_pc);
+#ifdef __EMSCRIPTEN__
+    const u32 n_reads = (u32)EM_ASM_INT({ return Module.test_reads.length | 0; });
+    EM_ASM({ Module.bemental_imports.env.ppc_read32 = function(addr) { return 0; }; });
+#else
+    const u32 n_reads = 0;
+#endif
+    if (!dispatched) return false;
+    const u64 ps0 = *(const u64*)((const u8*)env.ctx_raw + ppc_off::ps0(1));
+    const u64 ps1 = *(const u64*)((const u8*)env.ctx_raw + ppc_off::ps1(1));
+    std::printf("[diag psq_l-w1] reads=%u ps0=0x%016llx (exp 4008..) ps1=0x%016llx (exp 3ff0..)\n",
+                n_reads, (unsigned long long)ps0, (unsigned long long)ps1);
+    return ps0 == 0x4008000000000000ull && ps1 == 0x3FF0000000000000ull && n_reads == 1u;
+}
+
+// psq_l f1, 8(r3), W=0, I=1; GQR1 ld U8 scale 4: pair is ONE u16 read
+// (ReadPair<u8>, ILSP:83 — ps0 = hi byte); ps = f32(byte) * 2^-4.
+static bool test_psq_l_u8_scale4() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);
+    env.spr(913) = 0x04040000u;    // GQR1: ld_type U8(4), ld_scale 4
+    env.gpr(3) = 0x80100000u;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_reads16 = [];
+        Module.bemental_imports.env.ppc_read16 = function(addr) {
+            Module.test_reads16.push(addr >>> 0);
+            return 0xC80A | 0;     // ps0 byte=200, ps1 byte=10
+        };
+    });
+#endif
+    const u32 insts[] = { 0xE0231008u }; // psq_l f1, 8(r3), W=0, I=1
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, 1, &next_pc);
+#ifdef __EMSCRIPTEN__
+    const u32 n_reads = (u32)EM_ASM_INT({ return Module.test_reads16.length | 0; });
+    EM_ASM({ Module.bemental_imports.env.ppc_read16 = function(addr) { return 0; }; });
+#else
+    const u32 n_reads = 0;
+#endif
+    if (!dispatched) return false;
+    const u64 ps0 = *(const u64*)((const u8*)env.ctx_raw + ppc_off::ps0(1));
+    const u64 ps1 = *(const u64*)((const u8*)env.ctx_raw + ppc_off::ps1(1));
+    std::printf("[diag psq_l-u8] reads16=%u ps0=0x%016llx (exp 4029.. = 12.5) ps1=0x%016llx (exp 3fe4.. = 0.625)\n",
+                n_reads, (unsigned long long)ps0, (unsigned long long)ps1);
+    return ps0 == 0x4029000000000000ull && ps1 == 0x3FE4000000000000ull && n_reads == 1u;
+}
+
+// psq_st f2, 16(r4), W=1, I=0; GQR0 st FLOAT scale 0. ps0 holds a double in
+// the single-DENORMAL range (exp 890, sign set): ConvertToSingleFTZ
+// (ILSP:159, FPU:565-577) flushes to SIGNED ZERO 0x80000000 — the non-FTZ
+// stfs converter would denormalize instead. THE distinguishing FTZ vector.
+static bool test_psq_st_float_ftz_denormal() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);
+    env.spr(912) = 0;
+    env.gpr(4) = 0x80200000u;
+    *(u64*)((u8*)env.ctx_raw + ppc_off::ps0(2)) = 0xB7A0000000000000ull;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_writes = [];
+        Module.bemental_imports.env.ppc_write32 = function(addr, val) {
+            Module.test_writes.push([addr >>> 0, val >>> 0]);
+        };
+    });
+#endif
+    const u32 insts[] = { 0xF0448010u }; // psq_st f2, 16(r4), W=1, I=0
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, 1, &next_pc);
+#ifdef __EMSCRIPTEN__
+    const u32 n_writes = (u32)EM_ASM_INT({ return Module.test_writes.length | 0; });
+    const u32 wa = (u32)EM_ASM_INT({ return (Module.test_writes[0] || [0,0])[0] | 0; });
+    const u32 wv = (u32)EM_ASM_INT({ return (Module.test_writes[0] || [0,0])[1] | 0; });
+    EM_ASM({ Module.bemental_imports.env.ppc_write32 = function(addr, val) {}; });
+#else
+    const u32 n_writes = 0, wa = 0, wv = 0;
+#endif
+    if (!dispatched) return false;
+    std::printf("[diag psq_st-ftz] n=%u w=(0x%08x,0x%08x exp 0x80200010,0x80000000)\n", n_writes, wa, wv);
+    return n_writes == 1u && wa == 0x80200010u && wv == 0x80000000u;
+}
+
+// psq_st f2, 16(r4), W=0, I=2; GQR2 st S16 scale 0. ps0=40000.75 clamps to
+// 32767; ps1=-5.9 truncates toward zero to -5. Pair = ONE u32 write
+// (WritePair<u16>, ILSP:118): (32767<<16)|0xFFFB.
+static bool test_psq_st_s16_clamp_trunc() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);
+    env.spr(914) = 0x00000007u;    // GQR2: st_type S16(7), st_scale 0
+    env.gpr(4) = 0x80200000u;
+    *(u64*)((u8*)env.ctx_raw + ppc_off::ps0(2)) = 0x40E3881800000000ull; // 40000.75
+    *(u64*)((u8*)env.ctx_raw + ppc_off::ps1(2)) = 0xC01799999999999Aull; // -5.9
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_writes = [];
+        Module.bemental_imports.env.ppc_write32 = function(addr, val) {
+            Module.test_writes.push([addr >>> 0, val >>> 0]);
+        };
+    });
+#endif
+    const u32 insts[] = { 0xF0442010u }; // psq_st f2, 16(r4), W=0, I=2
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, 1, &next_pc);
+#ifdef __EMSCRIPTEN__
+    const u32 n_writes = (u32)EM_ASM_INT({ return Module.test_writes.length | 0; });
+    const u32 wa = (u32)EM_ASM_INT({ return (Module.test_writes[0] || [0,0])[0] | 0; });
+    const u32 wv = (u32)EM_ASM_INT({ return (Module.test_writes[0] || [0,0])[1] | 0; });
+    EM_ASM({ Module.bemental_imports.env.ppc_write32 = function(addr, val) {}; });
+#else
+    const u32 n_writes = 0, wa = 0, wv = 0;
+#endif
+    if (!dispatched) return false;
+    std::printf("[diag psq_st-s16] n=%u w=(0x%08x,0x%08x exp 0x80200010,0x7ffffffb)\n", n_writes, wa, wv);
+    return n_writes == 1u && wa == 0x80200010u && wv == 0x7FFFFFFBu;
+}
+
+// psq_lu f1, 8(r3): RA writeback = EA on the non-faulting path.
+static bool test_psq_lu_ra_writeback() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);
+    env.spr(912) = 0;
+    env.gpr(3) = 0x80100000u;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.bemental_imports.env.ppc_read32 = function(addr) { return 0x3F800000 | 0; };
+    });
+#endif
+    const u32 insts[] = { 0xE4230008u }; // psq_lu f1, 8(r3), W=0, I=0
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, 1, &next_pc);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ Module.bemental_imports.env.ppc_read32 = function(addr) { return 0; }; });
+#endif
+    if (!dispatched) return false;
+    const u32 ra = env.gpr(3);
+    std::printf("[diag psq_lu-wb] r3=0x%08x (exp 0x80100008)\n", ra);
+    return ra == 0x80100008u;
+}
+
 static const TestCase k_tests[] = {
     {"addi_sequential",                  &test_addi_sequential},
     {"viwait_recheck_block",             &test_viwait_recheck_block},
@@ -1156,6 +1375,12 @@ static const TestCase k_tests[] = {
     {"lfs_msr_fp_disabled",              &test_lfs_msr_fp_disabled},
     {"mfspr_interp_writeback_visible",   &test_mfspr_interp_writeback_visible},
     {"stfs_native_converttosingle",      &test_stfs_native_converttosingle},
+    {"psq_l_float_pair",                 &test_psq_l_float_pair},
+    {"psq_l_w1_ps1_one",                 &test_psq_l_w1_ps1_one},
+    {"psq_l_u8_scale4",                  &test_psq_l_u8_scale4},
+    {"psq_st_float_ftz_denormal",        &test_psq_st_float_ftz_denormal},
+    {"psq_st_s16_clamp_trunc",           &test_psq_st_s16_clamp_trunc},
+    {"psq_lu_ra_writeback",              &test_psq_lu_ra_writeback},
     {"add_register",                     &test_add_register},
     {"bx_unconditional",                 &test_bx_unconditional},
     {"bx_with_link",                     &test_bx_with_link},

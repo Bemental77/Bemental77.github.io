@@ -846,6 +846,495 @@ void emit_stfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// psq_l / psq_st — native paired-single quantized load/store (D-forms,
+// opcd 56/57/60/61). Bit-exact reference: Interpreter_LoadStorePaired.cpp
+// (ILSP). Documented divergences (header comment): no HID2.PSE/LSQE gate
+// (Jit64 parity — Jit64 emits none); DSI handling follows the lfs/stfs
+// precedent (no gate; queued with the update-form RA audit item). GQR is a
+// RUNTIME load every execution — no constant-GQR speculation (mtspr GQR is
+// an interp fallback mutating spr[] mid-block).
+// ---------------------------------------------------------------------------
+
+// Extra scratch appended as the 4th locals group by build_block_next:
+// two i32 pair-element stages + one f64 clamp stage.
+static constexpr u32 LOCAL_PSQ_T0  = 98;
+static constexpr u32 LOCAL_PSQ_T1  = 99;
+static constexpr u32 LOCAL_PSQ_F64 = 100;
+
+// Push ConvertToDouble(f32 bits in LOCAL_PSQ_T0) as i64. ILSP:237 uses the
+// PEM widening that PRESERVES NaN payloads (incl. the SNaN quiet bit) while
+// wasm f64.promote_f32 may canonicalize NaNs (spec-permitted). Promote is
+// IEEE-bit-exact for normal/zero/subnormal/inf, so: promote for the common
+// case, integer splice for exp==255 (FPU:607-612 arm, y=1 -> z=0x7<<59:
+// ((x&0xc0000000)<<32) | z | ((x&0x3fffffff)<<29)) — also exact for inf.
+static void emit_psq_convert_to_double(WasmModuleBuilder& wb) {
+    // splice value (exp==255 arm)
+    wb.op_local_get(LOCAL_PSQ_T0);
+    wb.op_i64_extend_i32_u();
+    wb.op_i64_const((s64)0xC0000000ll);
+    wb.op_i64_and();
+    wb.op_i64_const(32);
+    wb.op_i64_shl();
+    wb.op_i64_const(0x3800000000000000ll);  // 0x7 << 59
+    wb.op_i64_or();
+    wb.op_local_get(LOCAL_PSQ_T0);
+    wb.op_i64_extend_i32_u();
+    wb.op_i64_const(0x3FFFFFFFll);
+    wb.op_i64_and();
+    wb.op_i64_const(29);
+    wb.op_i64_shl();
+    wb.op_i64_or();
+    // promote value
+    wb.op_local_get(LOCAL_PSQ_T0);
+    wb.op_f32_reinterpret_i32();
+    wb.op_f64_promote_f32();
+    wb.op_i64_reinterpret_f64();
+    // cond: exp == 255 -> pick splice
+    wb.op_local_get(LOCAL_PSQ_T0);
+    wb.op_i32_const(23);
+    wb.op_i32_shr_u();
+    wb.op_i32_const(0xFF);
+    wb.op_i32_and();
+    wb.op_i32_const(0xFF);
+    wb.op_i32_eq();
+    wb.op_select();
+}
+
+// Push ConvertToSingleFTZ(ps_local) as i32 (ILSP:159; FPU:565-577):
+//   (exp > 896 || magnitude == 0) -> ((x>>32)&0xC0000000)|((x>>29)&0x3FFFFFFF)
+//   else                          -> (x>>32)&0x80000000  (flush to signed 0)
+static void emit_convert_to_single_ftz(WasmModuleBuilder& wb, u32 ps_local) {
+    // fast value (val1)
+    wb.op_local_get(ps_local);
+    wb.op_i64_const(32);
+    wb.op_i64_shr_u();
+    wb.op_i32_wrap_i64();
+    wb.op_i32_const((s32)0xC0000000u);
+    wb.op_i32_and();
+    wb.op_local_get(ps_local);
+    wb.op_i64_const(29);
+    wb.op_i64_shr_u();
+    wb.op_i32_wrap_i64();
+    wb.op_i32_const(0x3FFFFFFF);
+    wb.op_i32_and();
+    wb.op_i32_or();
+    // sign-only flush value (val2)
+    wb.op_local_get(ps_local);
+    wb.op_i64_const(32);
+    wb.op_i64_shr_u();
+    wb.op_i32_wrap_i64();
+    wb.op_i32_const((s32)0x80000000u);
+    wb.op_i32_and();
+    // cond: exp > 896 || mag == 0 -> pick fast
+    wb.op_local_get(ps_local);
+    wb.op_i64_const(52);
+    wb.op_i64_shr_u();
+    wb.op_i32_wrap_i64();
+    wb.op_i32_const(0x7FF);
+    wb.op_i32_and();
+    wb.op_i32_const(896);
+    wb.op_i32_gt_u();
+    wb.op_local_get(ps_local);
+    wb.op_i64_const(32);
+    wb.op_i64_shr_u();
+    wb.op_i32_wrap_i64();
+    wb.op_i32_const(0x7FFFFFFF);
+    wb.op_i32_and();
+    wb.op_local_get(ps_local);
+    wb.op_i32_wrap_i64();
+    wb.op_i32_or();
+    wb.op_i32_eqz();
+    wb.op_i32_or();
+    wb.op_select();
+}
+
+// Push the scale factor as f32 from a 6-bit scale field on the stack:
+// dequantize factor = 2^-scale (f32 bits (127-sext6(s))<<23), quantize =
+// 2^scale ((127+sext6(s))<<23). scale in [-32,31] -> exponent stays normal.
+static void emit_psq_factor_from_scale(WasmModuleBuilder& wb, bool quantize) {
+    wb.op_i32_const(26);
+    wb.op_i32_shl();
+    wb.op_i32_const(26);
+    wb.op_i32_shr_s();
+    if (quantize) {
+        wb.op_i32_const(127);
+        wb.op_i32_add();
+    } else {
+        wb.op_i32_const(-1);
+        wb.op_i32_mul();
+        wb.op_i32_const(127);
+        wb.op_i32_add();
+    }
+    wb.op_i32_const(23);
+    wb.op_i32_shl();
+    wb.op_f32_reinterpret_i32();
+}
+
+// Clamp LOCAL_PSQ_F64 to [lo, hi] in place. Bounds are exactly
+// f32-representable; f64 comparison of f32-valued data gives identical
+// ordering to the interpreter's f32-domain std::clamp. NaN survives both
+// selects (comparisons false keep it) and trunc_sat maps it to 0 — equal
+// to the interpreter's host cast (0x80000000) truncated to any psq width.
+static void emit_psq_clamp_f64(WasmModuleBuilder& wb, double lo, double hi) {
+    // x = (x > hi) ? hi : x
+    wb.op_f64_const(hi);
+    wb.op_local_get(LOCAL_PSQ_F64);
+    wb.op_local_get(LOCAL_PSQ_F64);
+    wb.op_f64_const(hi);
+    wb.op_f64_gt();
+    wb.op_select();
+    wb.op_local_set(LOCAL_PSQ_F64);
+    // x = (x < lo) ? lo : x
+    wb.op_f64_const(lo);
+    wb.op_local_get(LOCAL_PSQ_F64);
+    wb.op_local_get(LOCAL_PSQ_F64);
+    wb.op_f64_const(lo);
+    wb.op_f64_lt();
+    wb.op_select();
+    wb.op_local_set(LOCAL_PSQ_F64);
+}
+
+void emit_psq_l(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+                LoadStoreParams params, const CodeOp& op, bool update) {
+    const u32 inst = op.inst;
+    const u32 rt = GekkoOperands::RD(inst);
+    const u32 ra = GekkoOperands::RA(inst);
+    const u32 W  = (inst >> 15) & 1u;
+    const u32 I  = (inst >> 12) & 7u;
+    const u32 simm12 = (u32)(((s32)(inst << 20)) >> 20);
+
+    emit_ea_d_form(wb, rc, ra, simm12);
+    rc.Flush(params.ctx_ptr);
+    frc.Flush(params.ctx_ptr);
+
+    auto rt_pair = frc.Bind(rt, FPRMode::Write, FPR_LANE_BOTH);
+
+    // gqr -> LOCAL_TMP_VAL (ld_type bits 16-18, ld_scale 24-29)
+    wb.op_i32_const((s32)params.ctx_ptr);
+    wb.op_i32_load(ppc_off::spr(912u + I));
+    wb.op_local_set(LOCAL_TMP_VAL);
+
+    wb.op_local_get(LOCAL_TMP_VAL);
+    wb.op_i32_const(16);
+    wb.op_i32_shr_u();
+    wb.op_i32_const(7);
+    wb.op_i32_and();
+    wb.op_i32_eqz();
+    wb.op_if(BLOCK_TYPE_VOID);
+    {
+        // FLOAT: raw f32 patterns, no scale (ILSP:233-246)
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_call(WIMPORT_READ32);
+        wb.op_local_set(LOCAL_PSQ_T0);
+        emit_psq_convert_to_double(wb);
+        wb.op_local_set(rt_pair.ps0_idx);
+        if (W) {
+            wb.op_i64_const(0x3FF0000000000000ll);  // ps1 = 1.0 (ILSP:238)
+            wb.op_local_set(rt_pair.ps1_idx);
+        } else {
+            wb.op_local_get(LOCAL_TMP_EA);
+            wb.op_i32_const(4);
+            wb.op_i32_add();
+            wb.op_call(WIMPORT_READ32);
+            wb.op_local_set(LOCAL_PSQ_T0);
+            emit_psq_convert_to_double(wb);
+            wb.op_local_set(rt_pair.ps1_idx);
+        }
+    }
+    wb.op_else();
+    {
+        wb.op_local_get(LOCAL_TMP_VAL);
+        wb.op_i32_const(16);
+        wb.op_i32_shr_u();
+        wb.op_i32_const(4);
+        wb.op_i32_and();
+        wb.op_if(BLOCK_TYPE_VOID);
+        {
+            // U8/U16/S8/S16. Pair = ONE wide access (ILSP ReadPair):
+            // u8 pair -> read16 (ps0 = hi byte); u16 pair -> read32.
+            wb.op_local_get(LOCAL_TMP_VAL);
+            wb.op_i32_const(16);
+            wb.op_i32_shr_u();
+            wb.op_i32_const(1);
+            wb.op_i32_and();
+            wb.op_if(BLOCK_TYPE_VOID);
+            {   // 16-bit elements
+                if (W) {
+                    wb.op_local_get(LOCAL_TMP_EA);
+                    wb.op_call(WIMPORT_READ16);
+                    wb.op_local_set(LOCAL_PSQ_T0);
+                } else {
+                    wb.op_local_get(LOCAL_TMP_EA);
+                    wb.op_call(WIMPORT_READ32);
+                    wb.op_local_tee(LOCAL_PSQ_T1);
+                    wb.op_i32_const(16);
+                    wb.op_i32_shr_u();
+                    wb.op_local_set(LOCAL_PSQ_T0);
+                    wb.op_local_get(LOCAL_PSQ_T1);
+                    wb.op_i32_const(0xFFFF);
+                    wb.op_i32_and();
+                    wb.op_local_set(LOCAL_PSQ_T1);
+                }
+            }
+            wb.op_else();
+            {   // 8-bit elements
+                if (W) {
+                    wb.op_local_get(LOCAL_TMP_EA);
+                    wb.op_call(WIMPORT_READ8);
+                    wb.op_local_set(LOCAL_PSQ_T0);
+                } else {
+                    wb.op_local_get(LOCAL_TMP_EA);
+                    wb.op_call(WIMPORT_READ16);
+                    wb.op_local_tee(LOCAL_PSQ_T1);
+                    wb.op_i32_const(8);
+                    wb.op_i32_shr_u();
+                    wb.op_i32_const(0xFF);
+                    wb.op_i32_and();
+                    wb.op_local_set(LOCAL_PSQ_T0);
+                    wb.op_local_get(LOCAL_PSQ_T1);
+                    wb.op_i32_const(0xFF);
+                    wb.op_i32_and();
+                    wb.op_local_set(LOCAL_PSQ_T1);
+                }
+            }
+            wb.op_end();
+
+            const u32 lanes[2] = { LOCAL_PSQ_T0, LOCAL_PSQ_T1 };
+            const u32 dests[2] = { rt_pair.ps0_idx, rt_pair.ps1_idx };
+            const u32 nlanes = W ? 1u : 2u;
+            for (u32 ln = 0; ln < nlanes; ++ln) {
+                // signed? sign-extend the element in place (shl/shr_s pair)
+                wb.op_local_get(LOCAL_TMP_VAL);
+                wb.op_i32_const(16);
+                wb.op_i32_shr_u();
+                wb.op_i32_const(2);
+                wb.op_i32_and();
+                wb.op_if(BLOCK_TYPE_VOID);
+                {
+                    wb.op_local_get(LOCAL_TMP_VAL);
+                    wb.op_i32_const(16);
+                    wb.op_i32_shr_u();
+                    wb.op_i32_const(1);
+                    wb.op_i32_and();
+                    wb.op_if(BLOCK_TYPE_VOID);
+                    {
+                        wb.op_local_get(lanes[ln]);
+                        wb.op_i32_const(16);
+                        wb.op_i32_shl();
+                        wb.op_i32_const(16);
+                        wb.op_i32_shr_s();
+                        wb.op_local_set(lanes[ln]);
+                    }
+                    wb.op_else();
+                    {
+                        wb.op_local_get(lanes[ln]);
+                        wb.op_i32_const(24);
+                        wb.op_i32_shl();
+                        wb.op_i32_const(24);
+                        wb.op_i32_shr_s();
+                        wb.op_local_set(lanes[ln]);
+                    }
+                    wb.op_end();
+                }
+                wb.op_end();
+
+                // ps = f64( f32(elem) * 2^-scale ). Signed i32->f32 convert
+                // is exact for the unsigned elements too (<= 65535).
+                wb.op_local_get(lanes[ln]);
+                wb.op_f32_convert_i32_s();
+                wb.op_local_get(LOCAL_TMP_VAL);
+                wb.op_i32_const(24);
+                wb.op_i32_shr_u();
+                wb.op_i32_const(0x3F);
+                wb.op_i32_and();
+                emit_psq_factor_from_scale(wb, /*quantize=*/false);
+                wb.op_f32_mul();
+                wb.op_f64_promote_f32();
+                wb.op_i64_reinterpret_f64();
+                wb.op_local_set(dests[ln]);
+            }
+            if (W) {
+                wb.op_i64_const(0x3FF0000000000000ll);  // ps1 = 1.0
+                wb.op_local_set(rt_pair.ps1_idx);
+            }
+        }
+        wb.op_else();
+        {
+            // INVALID1/2/3: ps0 = ps1 = 0.0, NO memory access (ILSP:264-270)
+            wb.op_i64_const(0);
+            wb.op_local_set(rt_pair.ps0_idx);
+            wb.op_i64_const(0);
+            wb.op_local_set(rt_pair.ps1_idx);
+        }
+        wb.op_end();
+    }
+    wb.op_end();
+
+    if (update && ra != 0) {
+        auto rc_ra = rc.Bind(ra, RCMode::Write);
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_local_set(rc_ra.local_idx());
+    }
+}
+
+void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+                 LoadStoreParams params, const CodeOp& op, bool update) {
+    const u32 inst = op.inst;
+    const u32 rs = GekkoOperands::RD(inst);  // FS field, same bit position
+    const u32 ra = GekkoOperands::RA(inst);
+    const u32 W  = (inst >> 15) & 1u;
+    const u32 I  = (inst >> 12) & 7u;
+    const u32 simm12 = (u32)(((s32)(inst << 20)) >> 20);
+
+    emit_ea_d_form(wb, rc, ra, simm12);
+    auto rs_pair = frc.Bind(rs, FPRMode::Read, W ? FPR_LANE_PS0 : FPR_LANE_BOTH);
+    rc.Flush(params.ctx_ptr);
+    frc.Flush(params.ctx_ptr);
+
+    // gqr -> LOCAL_TMP_VAL (st_type bits 0-2, st_scale 8-13)
+    wb.op_i32_const((s32)params.ctx_ptr);
+    wb.op_i32_load(ppc_off::spr(912u + I));
+    wb.op_local_set(LOCAL_TMP_VAL);
+
+    wb.op_local_get(LOCAL_TMP_VAL);
+    wb.op_i32_const(7);
+    wb.op_i32_and();
+    wb.op_i32_eqz();
+    wb.op_if(BLOCK_TYPE_VOID);
+    {
+        // FLOAT: ConvertToSingleFTZ per lane, no scale (ILSP:156-168)
+        wb.op_local_get(LOCAL_TMP_EA);
+        emit_convert_to_single_ftz(wb, rs_pair.ps0_idx);
+        wb.op_call(WIMPORT_WRITE32);
+        if (!W) {
+            wb.op_local_get(LOCAL_TMP_EA);
+            wb.op_i32_const(4);
+            wb.op_i32_add();
+            emit_convert_to_single_ftz(wb, rs_pair.ps1_idx);
+            wb.op_call(WIMPORT_WRITE32);
+        }
+    }
+    wb.op_else();
+    {
+        wb.op_local_get(LOCAL_TMP_VAL);
+        wb.op_i32_const(4);
+        wb.op_i32_and();
+        wb.op_if(BLOCK_TYPE_VOID);
+        {
+            // ScaleAndClamp per lane (ILSP:60-68): conv = f32(ps) * 2^scale
+            // (f32 domain), clamp to type bounds, C-cast truncation.
+            const u32 srcs[2] = { rs_pair.ps0_idx, rs_pair.ps1_idx };
+            const u32 outs[2] = { LOCAL_PSQ_T0, LOCAL_PSQ_T1 };
+            const u32 nlanes = W ? 1u : 2u;
+            for (u32 ln = 0; ln < nlanes; ++ln) {
+                wb.op_local_get(srcs[ln]);
+                wb.op_f64_reinterpret_i64();
+                wb.op_f32_demote_f64();
+                wb.op_local_get(LOCAL_TMP_VAL);
+                wb.op_i32_const(8);
+                wb.op_i32_shr_u();
+                wb.op_i32_const(0x3F);
+                wb.op_i32_and();
+                emit_psq_factor_from_scale(wb, /*quantize=*/true);
+                wb.op_f32_mul();
+                wb.op_f64_promote_f32();
+                wb.op_local_set(LOCAL_PSQ_F64);
+                // clamp bounds by type at runtime: sign = bit1, width = bit0
+                wb.op_local_get(LOCAL_TMP_VAL);
+                wb.op_i32_const(2);
+                wb.op_i32_and();
+                wb.op_if(BLOCK_TYPE_VOID);
+                {
+                    wb.op_local_get(LOCAL_TMP_VAL);
+                    wb.op_i32_const(1);
+                    wb.op_i32_and();
+                    wb.op_if(BLOCK_TYPE_VOID);
+                    emit_psq_clamp_f64(wb, -32768.0, 32767.0);
+                    wb.op_else();
+                    emit_psq_clamp_f64(wb, -128.0, 127.0);
+                    wb.op_end();
+                }
+                wb.op_else();
+                {
+                    wb.op_local_get(LOCAL_TMP_VAL);
+                    wb.op_i32_const(1);
+                    wb.op_i32_and();
+                    wb.op_if(BLOCK_TYPE_VOID);
+                    emit_psq_clamp_f64(wb, 0.0, 65535.0);
+                    wb.op_else();
+                    emit_psq_clamp_f64(wb, 0.0, 255.0);
+                    wb.op_end();
+                }
+                wb.op_end();
+                wb.op_local_get(LOCAL_PSQ_F64);
+                wb.op_i32_trunc_sat_f64_s();
+                wb.op_local_set(outs[ln]);
+            }
+            // pack + write (WritePair: ps0 in the high element)
+            wb.op_local_get(LOCAL_TMP_VAL);
+            wb.op_i32_const(1);
+            wb.op_i32_and();
+            wb.op_if(BLOCK_TYPE_VOID);
+            {   // 16-bit elements
+                if (W) {
+                    wb.op_local_get(LOCAL_TMP_EA);
+                    wb.op_local_get(LOCAL_PSQ_T0);
+                    wb.op_i32_const(0xFFFF);
+                    wb.op_i32_and();
+                    wb.op_call(WIMPORT_WRITE16);
+                } else {
+                    wb.op_local_get(LOCAL_TMP_EA);
+                    wb.op_local_get(LOCAL_PSQ_T0);
+                    wb.op_i32_const(16);
+                    wb.op_i32_shl();
+                    wb.op_local_get(LOCAL_PSQ_T1);
+                    wb.op_i32_const(0xFFFF);
+                    wb.op_i32_and();
+                    wb.op_i32_or();
+                    wb.op_call(WIMPORT_WRITE32);
+                }
+            }
+            wb.op_else();
+            {   // 8-bit elements
+                if (W) {
+                    wb.op_local_get(LOCAL_TMP_EA);
+                    wb.op_local_get(LOCAL_PSQ_T0);
+                    wb.op_i32_const(0xFF);
+                    wb.op_i32_and();
+                    wb.op_call(WIMPORT_WRITE8);
+                } else {
+                    wb.op_local_get(LOCAL_TMP_EA);
+                    wb.op_local_get(LOCAL_PSQ_T0);
+                    wb.op_i32_const(0xFF);
+                    wb.op_i32_and();
+                    wb.op_i32_const(8);
+                    wb.op_i32_shl();
+                    wb.op_local_get(LOCAL_PSQ_T1);
+                    wb.op_i32_const(0xFF);
+                    wb.op_i32_and();
+                    wb.op_i32_or();
+                    wb.op_call(WIMPORT_WRITE16);
+                }
+            }
+            wb.op_end();
+        }
+        wb.op_else();
+        {
+            // INVALID1/2/3: assert-only in the interpreter; NO write (ILSP:191-195)
+        }
+        wb.op_end();
+    }
+    wb.op_end();
+
+    if (update && ra != 0) {
+        auto rc_ra = rc.Bind(ra, RCMode::Write);
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_local_set(rc_ra.local_idx());
+    }
+}
+
 // lfs  FRD, d(rA) — load f32 at EA, naive f32->f64 promote, store at
 // ps0(FRD) + splat to ps1(FRD). Mirrors emit_lfsx (jit_load_store.cpp:546).
 // Naive promote vs PEM ConvertToDouble — same approximation as existing

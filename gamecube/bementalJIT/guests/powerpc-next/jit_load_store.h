@@ -97,6 +97,20 @@ void emit_stmw(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 // ----- FP D-form (immediate offset) single load/store (opc 48 lfs,
 // 49 lfsu, 52 stfs, 53 stfsu). Store uses PEM ConvertToSingle (bit-exact
 // port of Interpreter_FPUtils.h:541-562, native as of 2026-06-11).
+// psq_l/psq_lu (opcd 56/57) and psq_st/psq_stu (opcd 60/61) — native
+// paired-single quantized load/store, D-forms. Bit-exact reference:
+// Interpreter_LoadStorePaired.cpp. GQR type/scale are RUNTIME loads from
+// spr[912+I] (no Jit64-style constant-GQR speculation — mtspr-to-GQR is an
+// interp fallback that mutates spr[] mid-block; see jit_system_registers.cpp
+// spr_is_direct). HID2.PSE/LSQE gates are NOT emitted (Jit64 parity — Jit64
+// emits none of these; the interpreter raises Program when violated; games
+// enable these bits in __LCEnable before any psq executes). DSI follows the
+// lfs/stfs precedent (no gate — queued with the update-form RA audit item).
+void emit_psq_l (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+                 LoadStoreParams params, const CodeOp& op, bool update);
+void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+                 LoadStoreParams params, const CodeOp& op, bool update);
+
 void emit_lfs (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                LoadStoreParams params, const CodeOp& op, bool update);
 void emit_stfs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,

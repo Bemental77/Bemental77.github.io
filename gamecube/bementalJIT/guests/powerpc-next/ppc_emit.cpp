@@ -335,9 +335,14 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     case 52: emit_stfs(wb, rc, frc, params, op, /*update=*/false); return true;
     case 53: emit_stfs(wb, rc, frc, params, op, /*update=*/true ); return true;
 
-    case 56: case 57:
+    // psq_l/psq_lu/psq_st/psq_stu — native paired-single quantized
+    // load/store (2026-06-12; the HandleReverb hot-loop fallback class).
+    case 56: emit_psq_l (wb, rc, frc, params, op, /*update=*/false); return true;
+    case 57: emit_psq_l (wb, rc, frc, params, op, /*update=*/true ); return true;
+    case 60: emit_psq_st(wb, rc, frc, params, op, /*update=*/false); return true;
+    case 61: emit_psq_st(wb, rc, frc, params, op, /*update=*/true ); return true;
+
     case 59:
-    case 60: case 61:
         emit_fallback(wb, rc, frc, op, params.ctx_ptr);
         return false;
 
@@ -506,9 +511,11 @@ std::vector<u8> build_block_next(u32 start_pc,
     // wasm_local_base=2; FPRRegCache uses wasm_local_base=34. Total 98
     // locals, well within wasm engine limits.
     {
-        const u32 counts[] = { 2u, 32u, 64u };
-        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64 };
-        b.emitLocals(3u, counts, types);
+        // Groups 4+5: psq scratch — 2 i32 pair-element stages (locals 98,
+        // 99) + one f64 clamp stage (local 100); jit_load_store LOCAL_PSQ_*.
+        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u };
+        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64, WASM_TYPE_I32, WASM_TYPE_F64 };
+        b.emitLocals(5u, counts, types);
     }
 
     // RegCache: assign per-PPC-GPR WASM locals + emit prologue loads
