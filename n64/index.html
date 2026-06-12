@@ -505,6 +505,7 @@
     //        'v05' (per-block module, call_indirect to entry op only),
     //        'wrap' (v0 JS call-through)
     var mode = qs.get('jit') || 'emit';
+    if (mode === 'nofp') { window.__jitNoFP = true; mode = 'emit'; }
     if (mode !== 'wrap' && mode !== 'v05') mode = 'emit';
     var wrapped = 0, calls = 0, canaryFired = 0, instantiateFail = 0;
     function ping() { canaryFired++; if (canaryFired === 1) pageLog('[jit] canary: native block module EXECUTED'); }

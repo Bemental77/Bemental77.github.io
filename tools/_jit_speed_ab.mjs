@@ -2,7 +2,7 @@
 // (immune to the frame limiter), interpreter vs ?jit, same scene window.
 import puppeteer from 'puppeteer';
 const rom = process.argv[2] || 'gauntletLegends.z64';
-const browser = await puppeteer.launch({ headless: 'new', executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox'], protocolTimeout: 240000 });
+const browser = await puppeteer.launch({ headless: 'new', executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox'].concat(process.env.JS_FLAGS ? ['--js-flags=' + process.env.JS_FLAGS] : []), protocolTimeout: 240000 });
 async function run(jit) {
   const ctx = await browser.createIncognitoBrowserContext();
   const page = await ctx.newPage();
@@ -16,14 +16,16 @@ async function run(jit) {
   await ctx.close();
   return { perFrame: m.ms / m.n, frames: m.n, stats };
 }
-const interp = await run(false);
-const jit = await run(true);
+// alternate arm order (CLI arg order=ba) so monotonic thermal drift cancels
+// across paired rounds: the second-run arm is penalized while heating
+const order = process.argv[3] === 'ba' ? ['jit', 'interp'] : ['interp', 'jit'];
+const res = {};
+for (const arm of order) res[arm] = await run(arm === 'jit');
 await browser.close();
-const speedup = interp.perFrame / jit.perFrame;
+const speedup = res.interp.perFrame / res.jit.perFrame;
 console.log(JSON.stringify({
-  rom,
-  interpPerFrameMs: Math.round(interp.perFrame * 1000) / 1000,
-  jitPerFrameMs: Math.round(jit.perFrame * 1000) / 1000,
+  rom, order: order.join(','),
+  interpPerFrameMs: Math.round(res.interp.perFrame * 1000) / 1000,
+  jitPerFrameMs: Math.round(res.jit.perFrame * 1000) / 1000,
   speedupX: Math.round(speedup * 1000) / 1000,
-  frames: [interp.frames, jit.frames],
 }));

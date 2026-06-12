@@ -651,8 +651,8 @@
         continue;
       }
 
-      // (e) COP1?
-      var fp = emitCop1(word, instrPtr, p, C, opsIdxL, EXIT) || emitCop1Mem(word, instrPtr, p, C, opsIdxL, EXIT);
+      // (e) COP1? (window.__jitNoFP disables FP emission for perf attribution)
+      var fp = window.__jitNoFP ? null : (emitCop1(word, instrPtr, p, C, opsIdxL, EXIT) || emitCop1Mem(word, instrPtr, p, C, opsIdxL, EXIT));
       if (fp) {
         body = body.concat(fp);
         stats.nativeFP++;

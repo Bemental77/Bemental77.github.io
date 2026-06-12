@@ -114,6 +114,26 @@ up in measurements.
 - [ ] Bar: ≥100% native-speed sustained in-game on the heavy set
       (Gauntlet Legends, DK64, Conker, Pod Racer in-race), on-device
 
+- [x] Wave 6 (2026-06-12, 43eb990+): FPR-aware differential checksum
+      (reg_cop1_fgr_64 + FCR31) FIRST, then native MULT/MULTU/DIV/DIVU
+      (exact def mirrors incl. full-64-bit MULT operands, arithmetic-shift
+      MULTU hi, skip-on-zero-divisor) + MFHI/MFLO/MTHI/MTLO + the COP1
+      family (CU1-guarded moves/arith/loads/stores through the LIVE
+      pointer banks; CVT/compares/BC1 stay fallback). Fallback census
+      HALVED on FP-heavy titles (sm64 14,260->6,740; oot 27,452->14,387).
+      All gates green with float state in the checksum.
+- [ ] OPEN PERF QUESTION (measure on a COOL machine before any fix):
+      order-alternating A/B under full throttle reads ~0.89x after wave 6
+      (was 1.10x at wave 4) — either FP emission costs more than the
+      interp ops it replaces, or it is throttle-regime distortion.
+      ?jit=nofp isolates FP emission for one-variable attribution;
+      --no-liftoff probe was inconclusive under thermal drift. Candidate
+      fixes if real: hoisted CU1/bank-pointer caching with
+      fallback-invalidate; page-batched multi-function modules
+      (amortized instantiation + V8 tier-up budget accumulation).
+- [ ] Cross-page jumps native (J/JAL/JR/JALR _OUT via jump_to_address +
+      jump_to_func — bridge params [41,42] already passed)
+
 ## Measurement rules (M4 spine, learned 2026-06-12)
 - Per-frame CPU cost via _neil_frame_cost_* (timed retro_run) is the
   throughput metric — immune to the frame limiter. tools/_jit_speed_ab.mjs
@@ -121,7 +141,10 @@ up in measurements.
 - THERMAL THROTTLING invalidates absolute numbers on this machine (i9 MBP;
   pmset -g therm CPU_Speed_Limit observed at 20 under campaign load).
   Only same-window interleaved ratios are valid; discard rounds whose
-  absolute costs shifted mid-round.
+  absolute costs shifted mid-round. ALSO: alternate arm order between
+  rounds (tools/_jit_speed_ab.mjs second arg ab|ba) — the second arm is
+  penalized under monotonic heating; and fully-throttled-regime ratios
+  shift the bottleneck mix (not representative of healthy hardware).
 - The wave-gate is: differential x3 (mariokart/sm64/oot) + page e2e +
   interleaved A/B ratio. Correctness gates alone DO NOT catch perf
   regressions — and a 'regression' under throttle may be the machine.
