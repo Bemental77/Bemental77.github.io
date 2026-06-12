@@ -47,22 +47,42 @@ block-head `PC->ops` and execute correctly mid-game.
       full block-cache flush → 121 blocks lazily rebuilt by the JIT →
       runs at full speed, 0 errors
 
-## M2 — n64/bementalJIT fork + native integer emitters
-- [ ] Fork gamecube/bementalJIT → n64/bementalJIT, STRIP guests/powerpc*,
-      rename every import/export seam (block_cache.cpp ppc_*/_dolphin_*
-      names, GC watch PCs, region bounds) — then prove ONE trivial block
-      instantiates before porting any emitter
-- [ ] guests/mips/: analyzer + opcode table for the R4300 integer core
-      (SPECIAL/REGIMM/I-type/loads/stores/branches+delay slots), per-op
-      emitters with block-local reg cache, interpreter-fallback import per
-      op (gencallinterp role)
-- [ ] Count/interrupt contract in emitted code: batch Count at block tails,
-      poll next_interrupt<=Count, exact PC->addr/last_addr maintenance (or
-      take over Count wholesale — decide ONCE, document)
+## M2 — n64/bementalJIT + native MIPS emitters
+Implementation decision (deviation from the GC fork plan, documented):
+mupen already provides the block cache, dispatch, and invalidation that
+block_cache.cpp provides on GC — so n64/bementalJIT is a NEW JS-hosted
+emitter library (n64/bementalJIT/mips_emit.js) reusing the proven v0.5
+instantiation pipeline, not a C++ fork carrying redundant machinery. Same
+conceptual decomposition (opcode table, per-op emitters, per-op
+interpreter fallback = the gencallinterp role); JS hosting makes the
+emitter iteration loop a page reload instead of a core rebuild. Can
+migrate to C++-side emission later if per-block compile cost ever shows
+up in measurements.
+- [x] Wave 1 (2026-06-12, dev/prod 18a2749): unrolled call-threaded
+      skeleton + native integer ALU (shifts incl. variable, ADDU/SUBU,
+      64-bit logicals, SLT family, ADDIU/LUI/imm-logicals; exact MIPS-III
+      sign-extension semantics; r0 discarded). Fallback ops store exact PC,
+      call_indirect the original interp funcref, exit on PC divergence —
+      interrupt/Count contract preserved by construction. Differential
+      gate PASS ×3: mariokart 47% native ops, sm64 42%, oot 38%; zero
+      emit failures; page e2e green
+- [ ] Wave 2 — branches/jumps with delay slots (biggest win: every taken
+      branch currently exits the block through a fallback): native
+      BEQ/BNE/BLEZ/BGTZ + REGIMM, J/JAL/JR/JALR, in-block back-edges for
+      hot loops, Count batch + next_interrupt<=Count poll at block tails
+      (the contract decision: keep interpreter Count derivation, batch at
+      tails exactly like cached_interp's DECLARE_JUMP)
+- [ ] Wave 3 — loads/stores (TLB-aware: KSEG0/KSEG1 fast path via direct
+      RDRAM offset, mapped/MMIO via fallback), LW/SW/LBU/LB/LH/LHU/SB/SH,
+      then LD/SD/unaligned pairs
+- [ ] Wave 4 — MULT/MULTU/DIV/DIVU + MFHI/MFLO/MTHI/MTLO (hi/lo addresses
+      already in the param block)
 - [ ] Delay-slot exception semantics: red tests for EPC/BD around lw/sw in
-      delay slots, branch-likely skip, ERET
+      delay slots, branch-likely skip, ERET (required before Wave 2 ships)
 - [ ] Per-instruction conformance runner (port gamecube/tools/conformance
       shape; oracle = cached interpreter in the same binary)
+- [ ] Fallback census tooling: per-opcode counts from real gameplay to
+      drive wave priorities by measured weight (gate #6: no guessing)
 
 ## M3 — FPU (COP1) + the long tail
 - [ ] COP1 moves/arith/converts/compares native (the GC lfs/stfs lesson:
