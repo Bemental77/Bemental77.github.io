@@ -155,7 +155,8 @@ public:
     //   *trap_pc   = pc whose block trapped (caller must evict + fall back
     //                to interpreter for one instruction); 0 if no trap
     // Returns the count of blocks dispatched (use for downcount accounting).
-    s32 chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_pc);
+    s32 chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_pc,
+                       const u32* exceptions_addr, const s32* downcount_addr);
 
     // ---- Phase 2 multi-module region API (additive — not yet wired into
     // the dispatcher path; Phase 4 routes dolphin_interp through it). ----
@@ -229,6 +230,13 @@ void register_pc_handle(u64 pc, int handle);
 void unregister_pc(u64 pc);
 
 // Free-helper variant of BlockCache::chain_dispatch.
-s32  chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_pc);
+// 2026-06-12: chains cached blocks inside ONE EM_ASM loop (no host
+// round-trip per block). Requires blocks that self-account downcount
+// (build_block_next prologue emits downcount -= numCycles). Bails on:
+// cache miss, max_iters, trap, *exceptions_addr != 0, or
+// *(s32*)downcount_addr <= 0 — the caller services CoreTiming /
+// CheckExceptions exactly as it would between single dispatches.
+s32  chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_pc,
+                        const u32* exceptions_addr, const s32* downcount_addr);
 
 } // namespace bemental

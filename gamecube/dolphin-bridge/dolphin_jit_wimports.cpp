@@ -58,6 +58,7 @@ extern int g_ax_wake_ring_n;
 extern int g_pc_census_ring[256];
 extern int g_pc_census_n;
 extern u64 g_pc_census_total;
+extern u32 g_chain_iters;
 }
 static void ax_wake_arm_set() { bemental::g_ax_wake_arm = 192; }
 
@@ -588,8 +589,8 @@ void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
             }
             line += fmt::format(" {:x}x{}", pc, cnts[k]);
         }
-        NOTICE_LOG_FMT(POWERPC, "[pc-census] total={} uniq={}{}",
-                       bemental::g_pc_census_total, nuniq, line);
+        NOTICE_LOG_FMT(POWERPC, "[pc-census] total={} chain={} uniq={}{}",
+                       bemental::g_pc_census_total, bemental::g_chain_iters, nuniq, line);
         bemental::g_pc_census_n = 0;
     }
     auto& system = Core::System::GetInstance();

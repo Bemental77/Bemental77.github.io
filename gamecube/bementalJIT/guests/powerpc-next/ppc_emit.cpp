@@ -533,6 +533,39 @@ std::vector<u8> build_block_next(u32 start_pc,
         b.emitLocals(6u, counts, types);
     }
 
+    // IN-BLOCK CYCLE ACCOUNTING (2026-06-12, Jit64 parity: Jit.cpp charges
+    // js.downcountAmount at block entry). downcount -= numCycles emitted in
+    // the block prologue so the chain dispatcher can run block-to-block
+    // without a host round-trip per block; JitWasm.cpp's C-side decrement
+    // is REMOVED in the same change (double-charge otherwise). Early block
+    // exits overcharge slightly — same behavior as Jit64.
+    //
+    // IDLE BLOCKS (analyzer branchIsIdleLoop — the canonical Dolphin
+    // IsBusyWaitLoop port, covers mftb spins AND lwz-poll loops like
+    // SelectThread's RunQueueBits wait) write downcount = 0 instead:
+    // Jit64's HandleIdle semantics at slice granularity. Without this the
+    // chain burns idle spins at real cycle cost and guest time crawls in
+    // wall terms once the guest is event-bound (PSO deep park: ViSwap
+    // 2560 -> 4, AID 45x under its own schedule — events weren't broken,
+    // guest-time advance was).
+    {
+        const bool idle_block = block.m_num_instructions > 0 &&
+            buffer.data()[block.m_num_instructions - 1].branchIsIdleLoop;
+        if (idle_block) {
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_const(0);
+            b.op_i32_store(ppc_off::DOWNCOUNT);
+        } else {
+            const u32 charge = stats.numCycles ? stats.numCycles : (u32)count;
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_load(ppc_off::DOWNCOUNT);
+            b.op_i32_const((s32)charge);
+            b.op_i32_sub();
+            b.op_i32_store(ppc_off::DOWNCOUNT);
+        }
+    }
+
     // RegCache: assign per-PPC-GPR WASM locals + emit prologue loads
     // for live-in registers.
     RegCache rc(b);

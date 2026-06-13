@@ -48,6 +48,15 @@
 #include "ppc_analyst.h"  // bemental::powerpc::IsBlockTerminator — single source of truth.
 #include "ppc_emit.h"     // bementalJIT/guests/powerpc-next/ppc_emit.h (PUBLIC include dir)
 
+// Compiler-verified anchors for the hand-maintained wasm32 offsets in
+// bementalJIT ppc_offsets.h (EXCEPTIONS / DOWNCOUNT). The emitted blocks'
+// in-block downcount accounting and the chain dispatcher's bail reads
+// depend on these exact offsets.
+static_assert(offsetof(PowerPC::PowerPCState, Exceptions) == 0x2EC,
+              "ppc_off::EXCEPTIONS out of sync with PowerPCState layout");
+static_assert(offsetof(PowerPC::PowerPCState, downcount) == 0x2F0,
+              "ppc_off::DOWNCOUNT out of sync with PowerPCState layout");
+
 namespace
 {
 // Block-decode limit. Matches the conservative cap the legacy build_block
@@ -215,31 +224,43 @@ void JitWasm::Run()
       }
 
       const u32 pc = ppc_state.pc;
-      s32 next_pc = 0;
 
-      if (m_wasm_cache.dispatch(pc, &next_pc))
+      // CHAIN DISPATCH (2026-06-12): run cached blocks back-to-back inside
+      // ONE EM_ASM loop (block_cache.cpp chain_dispatch_raw) instead of one
+      // host round-trip per block. Pre-chain measurement (PSO, [pc-census]):
+      // ~930K dispatches/s wall with ~7-instruction blocks — the round trip
+      // per block WAS the throughput wall once HandleReverb's loop went
+      // fully native. Blocks self-account downcount in their prologue
+      // (build_block_next emits downcount -= numCycles; the C-side
+      // decrement that lived here is gone — double-charge otherwise). The
+      // chain bails on: cache miss, max_iters, wasm trap, pending
+      // ppc_state.Exceptions (set by in-block imports), or downcount <= 0;
+      // this loop then services CoreTiming / CheckExceptions exactly as it
+      // did between single dispatches.
+      u32 final_pc = pc;
+      u32 trap_pc = 0;
+      const s32 chained = m_wasm_cache.chain_dispatch(
+          pc, /*max_iters=*/4096u, &final_pc, &trap_pc,
+          &ppc_state.Exceptions, reinterpret_cast<const s32*>(&ppc_state.downcount));
+
+      if (trap_pc != 0u)
       {
-        // Hit. INT32_MIN sentinel = the dispatched block trapped at
-        // runtime (block_cache.cpp dispatch_raw try/catch returns it on
-        // any wasm exception). Evict so the next iteration re-compiles,
-        // then bail to the interpreter for the rest of this slice — the
-        // interpreter is responsible for surfacing whatever underlying
-        // fault caused the trap.
-        if (next_pc == std::numeric_limits<s32>::min())
-        {
-          m_wasm_cache.evict(pc);
-          m_block_inst_counts.erase(pc);
-          CachedInterpreter::Run();
-          return;
-        }
+        // A block trapped mid-chain. chain_dispatch already evicted it
+        // from the block cache; drop our per-pc metadata, resume the
+        // interpreter at the trapped block's start (its in-block set_pc
+        // writes were per-op, but block-start resume matches the old
+        // single-dispatch trap behavior).
+        m_block_inst_counts.erase(trap_pc);
+        m_block_guest_end.erase(trap_pc);
+        ppc_state.pc = trap_pc;
+        ppc_state.npc = trap_pc;
+        CachedInterpreter::Run();
+        return;
+      }
 
-        // Decrement downcount by the block's compile-time instruction
-        // count (1 cycle/instr — matches Interpreter::SingleStep
-        // accounting). If somehow the count is missing (race / explicit
-        // cache clear elsewhere), use 1 as a conservative floor.
-        auto it = m_block_inst_counts.find(pc);
-        const u32 cycles = (it != m_block_inst_counts.end()) ? it->second : 1u;
-        ppc_state.downcount -= static_cast<int>(cycles);
+      if (chained > 0)
+      {
+        const s32 next_pc = static_cast<s32>(final_pc);
 
         // Self-dispatch idle-skip — when emit_idle_skip marked the block's
         // terminator as branchIsIdleLoop, the analyzer collapsed the bcx

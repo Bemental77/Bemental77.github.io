@@ -300,6 +300,9 @@ void (*g_block_watch_hook)(int phase) = nullptr;
 int g_pc_census_ring[256];
 int g_pc_census_n = 0;
 u64 g_pc_census_total = 0;
+// Chain block-transitions counter (JS-side increment, u32 wrap acceptable
+// for rate reads between drains).
+u32 g_chain_iters = 0;
 
 s32 dispatch_raw(int handle) {
     g_pc_census_total++;
@@ -418,9 +421,13 @@ void unregister_pc(u64 pc) {
 
 // JS-side chain dispatch. Loops inside one EM_ASM call dispatching cached
 // blocks via `Module.bemental_pc_to_handle.get(pc)`. Each block's return
-// value becomes the next lookup key. Bails on cache miss, max_iters, or
-// trap. Returns chain count; writes final pc + trap pc via pointer args.
-s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_pc) {
+// value becomes the next lookup key. Bails on cache miss, max_iters, trap,
+// pending guest exceptions (*exceptions_addr != 0), or expired downcount
+// (*downcount_addr <= 0 — blocks self-account cycles in their prologue as
+// of 2026-06-12). Returns chain count; writes final pc + trap pc via
+// pointer args.
+s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_pc,
+                       const u32* exceptions_addr, const s32* downcount_addr) {
 #ifdef __EMSCRIPTEN__
     return EM_ASM_INT({
         const map = Module.bemental_pc_to_handle;
@@ -429,22 +436,39 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
         const max = $1 >>> 0;
         const finalPcPtr = $2;
         const trapPcPtr = $3;
+        const excPtr = $6 >> 2;
+        const dcPtr = $7 >> 2;
         if (!map || !cache) {
             HEAP32[finalPcPtr >>> 2] = pc | 0;
             HEAP32[trapPcPtr >>> 2] = 0;
             return 0;
         }
         let count = 0;
+        // Exception bail must be CHANGE-triggered, not nonzero-triggered:
+        // during boot the guest often carries a masked-pending exception
+        // (e.g. DEC raised while MSR.EE=0) for long stretches — the old
+        // per-block loop called CheckExceptions (a no-op when masked) and
+        // dispatched anyway. Bailing on nonzero froze dispatch into a
+        // compile-retry loop (MP4 60s probe: gather_drain n=20,993 vs
+        // baseline 10.2M). Only a NEW/changed Exceptions value needs the
+        // C caller's CheckExceptions service.
+        const exc0 = HEAP32[excPtr];
         // [pc-census 2026-06-12] temporary (strip per gate #8): record PCs
         // into the C ring ($4 = &g_pc_census_ring, $5 = &g_pc_census_n);
         // drained + printed by dolphin_gather_drain (output from this
         // context does not reach the probe).
         while (count < max) {
+            // Service points the C caller owns: newly-raised exceptions and
+            // the CoreTiming slice budget. HEAP32[excPtr] is u32 Exceptions;
+            // HEAP32[dcPtr] is s32 downcount (signed compare intended).
+            if (HEAP32[excPtr] !== exc0) break;
+            if (count > 0 && HEAP32[dcPtr] <= 0) break;
             const handle = map.get(pc);
             if (handle === undefined) break;
             const inst = cache[handle];
             if (!inst || !inst.exports || typeof inst.exports.run !== 'function') break;
             {
+                HEAP32[$8 >> 2] = (HEAP32[$8 >> 2] + 1) | 0;
                 const czn = HEAP32[$5 >> 2];
                 if (czn < 256) {
                     HEAP32[($4 >> 2) + czn] = pc | 0;
@@ -472,9 +496,10 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
         HEAP32[finalPcPtr >>> 2] = pc | 0;
         HEAP32[trapPcPtr >>> 2] = 0;
         return count;
-    }, initial_pc, max_iters, final_pc, trap_pc, g_pc_census_ring, &g_pc_census_n);
+    }, initial_pc, max_iters, final_pc, trap_pc, g_pc_census_ring, &g_pc_census_n,
+       exceptions_addr, downcount_addr, &g_chain_iters);
 #else
-    (void)initial_pc; (void)max_iters;
+    (void)initial_pc; (void)max_iters; (void)exceptions_addr; (void)downcount_addr;
     if (final_pc) *final_pc = initial_pc;
     if (trap_pc) *trap_pc = 0;
     return 0;
@@ -586,10 +611,12 @@ void BlockCache::invalidate_overlap(u32 addr, u32 max_block_bytes) {
     }
 }
 
-s32 BlockCache::chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_pc) {
+s32 BlockCache::chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_pc,
+                               const u32* exceptions_addr, const s32* downcount_addr) {
     u32 fpc = initial_pc;
     u32 tpc = 0;
-    s32 count = chain_dispatch_raw(initial_pc, max_iters, &fpc, &tpc);
+    s32 count = chain_dispatch_raw(initial_pc, max_iters, &fpc, &tpc,
+                                   exceptions_addr, downcount_addr);
     if (tpc != 0u) {
         // Evict the trapped block from the C++ map. release_raw inside
         // chain_dispatch_raw does not run for the trapped block (the chain
