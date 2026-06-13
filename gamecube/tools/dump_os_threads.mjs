@@ -536,6 +536,21 @@ function startServer() {
         }
       }
       t.stackScan = codeHits;
+      // Proper PPC back-chain walk from the saved r1: fp -> [fp] = caller
+      // fp, [fp+4] = saved LR. Gives the true call stack of a WAITING
+      // thread (the raw stack scan can't distinguish live frames from
+      // stale data).
+      const chain = [];
+      let fp = t.ctx_r1 >>> 0;
+      for (let d = 0; d < 16; d++) {
+        if (fp < 0x80000000 || fp >= 0x81800000 || (fp & 3) !== 0) break;
+        const nextFp = guestRead32(fp) >>> 0;
+        const savedLr = guestRead32(fp + 4) >>> 0;
+        chain.push({ fp: fp, lr: savedLr });
+        if (nextFp <= fp) break;
+        fp = nextFp;
+      }
+      t.backChain = chain;
       threads.push(t);
       cur = t.linkActive_next >>> 0;
       iters++;
@@ -605,6 +620,12 @@ function startServer() {
       console.log(`    mutex       = 0x${t.mutex.toString(16)}  queueMutex head=0x${t.queueMutex_head.toString(16)} tail=0x${t.queueMutex_tail.toString(16)}`);
       console.log(`    stack       base=0x${t.stackBase.toString(16)} end=0x${t.stackEnd.toString(16)}`);
       console.log(`    ctx         srr0=0x${t.ctx_srr0.toString(16)} (${resolveAddr(syms, t.ctx_srr0)})  lr=0x${t.ctx_lr.toString(16)} (${resolveAddr(syms, t.ctx_lr)})  r1=0x${t.ctx_r1.toString(16)}`);
+      if (t.backChain && t.backChain.length) {
+        console.log(`    backchain (${t.backChain.length} frames):`);
+        for (const fr of t.backChain) {
+          console.log(`      fp=0x${fr.fp.toString(16)}  lr=0x${fr.lr.toString(16)}  ${resolveAddr(syms, fr.lr)}`);
+        }
+      }
       if (t.stackScan && t.stackScan.length) {
         const uniq = new Map();
         for (const h of t.stackScan) {

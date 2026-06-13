@@ -157,6 +157,19 @@ void SerialInterfaceManager::RunSIBuffer(u64 user_data, s64 cycles_late)
     auto* const device = m_channel[m_com_csr.CHANNEL].device.get();
     const s32 actual_response_length = device->RunBuffer(m_si_buffer.data(), request_length);
 
+    // [ax-si2] temporary diag (strip per gate #8): direct-transfer trace.
+    {
+      static u64 n3 = 0;
+      const u64 nn = ++n3;
+      if (nn <= 16 || (nn & 0xFFu) == 0)
+      {
+        NOTICE_LOG_FMT(POWERPC,
+                       "[ax-si2] xfer n={} chan={} cmd={:#04x} reqlen={} explen={} actlen={}", nn,
+                       (u32)m_com_csr.CHANNEL, m_si_buffer[0], request_length,
+                       expected_response_length, actual_response_length);
+      }
+    }
+
     DEBUG_LOG_FMT(SERIALINTERFACE,
                   "RunSIBuffer  chan: {}  request_length: {}  expected_response_length: {}  "
                   "actual_response_length: {}",
@@ -585,6 +598,24 @@ void SerialInterfaceManager::UpdateDevices()
     }
 
     m_channel[i].in_hi.ERRLATCH = errlatch;
+  }
+
+  // [ax-si2] temporary diag (strip per gate #8): poll outcome — per-channel
+  // response codes happened above; log the resulting status/csr state so a
+  // probe shows (a) RDST bits setting, (b) guest mask state, (c) whether
+  // the PI line will rise. Every 256th poll + the first 8.
+  {
+    static u64 n2 = 0;
+    const u64 nn = ++n2;
+    if (nn <= 8 || (nn & 0xFFu) == 0)
+    {
+      NOTICE_LOG_FMT(POWERPC,
+                     "[ax-si2] poll n={} status={:#010x} comcsr={:#010x} rdstint={} rdstmsk={} "
+                     "tcint={} tcmsk={} en0={} en1={} en2={} en3={}",
+                     nn, m_status_reg.hex, m_com_csr.hex, (u32)m_com_csr.RDSTINT,
+                     (u32)m_com_csr.RDSTINTMSK, (u32)m_com_csr.TCINT, (u32)m_com_csr.TCINTMSK,
+                     (u32)m_poll.EN0, (u32)m_poll.EN1, (u32)m_poll.EN2, (u32)m_poll.EN3);
+    }
   }
 
   UpdateInterrupts();

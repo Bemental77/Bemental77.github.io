@@ -95,6 +95,14 @@ private:
   static void IPC_HLE_UpdateCallback(Core::System& system, u64 userdata, s64 cycles_late);
   static void GPUSleepCallback(Core::System& system, u64 userdata, s64 cycles_late);
   static void VICallback(Core::System& system, u64 userdata, s64 cycles_late);
+  // SI controller poll — restored 2026-06-12. Upstream Dolphin schedules
+  // this from SystemTimers; the libretro fork lost it, leaving
+  // SerialInterface::UpdateDevices() with NO caller: RDST bits never set,
+  // so the SDK's standard polling-mode PAD flow (SIEnablePollingInterrupt /
+  // SIGetResponse) never completes — PSO's pad layer watchdog-spun forever
+  // at 0x805D1E40+0x20 while direct RunSIBuffer transfers (MP4's path)
+  // kept working.
+  static void SICallback(Core::System& system, u64 userdata, s64 cycles_late);
   static void DecrementerCallback(Core::System& system, u64 userdata, s64 cycles_late);
   static void PatchEngineCallback(Core::System& system, u64 userdata, s64 cycles_late);
 
@@ -111,6 +119,7 @@ private:
 
   CoreTiming::EventType* m_event_type_decrementer = nullptr;
   CoreTiming::EventType* m_event_type_vi = nullptr;
+  CoreTiming::EventType* m_event_type_si = nullptr;
   CoreTiming::EventType* m_event_type_audio_dma = nullptr;
   CoreTiming::EventType* m_event_type_dsp = nullptr;
   CoreTiming::EventType* m_event_type_ipc_hle = nullptr;
