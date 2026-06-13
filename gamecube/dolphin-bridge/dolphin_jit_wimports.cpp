@@ -570,10 +570,10 @@ void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
             for (; j < nuniq; ++j) if (vals[j] == v) { cnts[j]++; break; }
             if (j == nuniq) { vals[nuniq] = v; cnts[nuniq] = 1; nuniq++; }
         }
-        // selection-sort top 10 by count; translate handles -> guest PCs via
+        // selection-sort top 22 by count; translate handles -> guest PCs via
         // the same-thread JS map (values >= 0x80000000 are already PCs).
         std::string line;
-        for (int k = 0; k < 10 && k < nuniq; ++k) {
+        for (int k = 0; k < 22 && k < nuniq; ++k) {
             int best = k;
             for (int j = k + 1; j < nuniq; ++j) if (cnts[j] > cnts[best]) best = j;
             std::swap(cnts[k], cnts[best]);
