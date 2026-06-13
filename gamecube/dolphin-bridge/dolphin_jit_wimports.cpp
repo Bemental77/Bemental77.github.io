@@ -39,6 +39,10 @@
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/Interpreter/Interpreter.h"
+#include "Core/CoreTiming.h"
+#include "Core/HW/EXI/EXI.h"          // [ax-card] EXI present check
+#include "Core/HW/EXI/EXI_Channel.h"  // [ax-card] CEXIChannel::GetDevice
+#include "Core/HW/EXI/EXI_Device.h"   // [ax-card] IEXIDevice::IsPresent
 #include "Core/PowerPC/MMU.h"
 #include "VideoCommon/CommandProcessor.h"
 #include "Core/PowerPC/PowerPC.h"
@@ -550,6 +554,63 @@ void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
             if (fn <= 8 || (fn & 0x3FFF) == 0) {
                 NOTICE_LOG_FMT(POWERPC, "[ax-fill] n={} pc={:#x} lr={:#x} r3={:#x} r4={:#x} r5={:#x} ctr={:#x}",
                                fn, ps_f.pc, LR(ps_f), ps_f.gpr[3], ps_f.gpr[4], ps_f.gpr[5], CTR(ps_f));
+            }
+        }
+    }
+    // [ax-card] temporary diag (strip per gate #8): settle the CARDProbeEx
+    // BUSY-spin root cause. The EXI insertion debounce (PSO EXIProbe
+    // zz_8042f914_) returns BUSY until guest deciseconds t advances >= 3 past
+    // the stamp at guest 0x800030C0 (OS low-mem __gUnknown800030C0[chan]).
+    // Three decisive reads discriminate: (a) CoreTiming GetTicks — is Advance
+    // firing? (b) guest TB (ReadFullTimeBaseValue = what OSGetTime sees) — is
+    // guest time advancing? (c) stamp[0] @ 0x800030C0 — does it accumulate or
+    // reset every iteration? TB->deciseconds: GC TB ticks at busclk/4
+    // (~40.5MHz), so decisec = TB / 4_050_000.
+    {
+        auto& sys2 = Core::System::GetInstance();
+        auto& ps_c = sys2.GetPPCState();
+        // Debounce-exit capture: the block ending at 0x8042fa10/fa18 just ran
+        // the stamp store (0x8042fa00, r4=t) + the (t-stamp) subf+cmpi. Catch
+        // r0/r3/r4 there with NO rate limit (first 40) to read the actual t.
+        if (ps_c.pc >= 0x8042fa00u && ps_c.pc <= 0x8042fa70u) {
+            static u64 s_dbnc = 0;
+            if (++s_dbnc <= 40) {
+                const u32 stamp2  = sys2.GetMMU().Read<u32>(0x800030C0u);
+                const u32 busclk  = sys2.GetMMU().Read<u32>(0x800000F8u); // __OSBusClock
+                const u32 coreclk = sys2.GetMMU().Read<u32>(0x800000FCu); // __OSCoreClock
+                NOTICE_LOG_FMT(POWERPC,
+                    "[ax-dbnc] n={} pc={:#x} r4_t={:#x} memstamp={:#x} r27div={} busclk={} coreclk={}",
+                    s_dbnc, ps_c.pc, ps_c.gpr[4], stamp2, ps_c.gpr[27], busclk, coreclk);
+            }
+        }
+        if (ps_c.pc >= 0x8042f000u && ps_c.pc < 0x80431000u) {
+            static u64 s_card_n = 0;
+            const u64 cn = ++s_card_n;
+            if (cn <= 12 || (cn & 0x3FFu) == 0) {
+                const u64 tb = sys2.GetPowerPC().ReadFullTimeBaseValue();
+                const u64 ticks = sys2.GetCoreTiming().GetTicks();
+                const u32 stamp = sys2.GetMMU().Read<u32>(0x800030C0u);
+                const u64 t_decis = tb / 4050000ull + 1ull;
+                // The decisive EXT source: ComplexRead sets CSR EXT bit from
+                // channel-0 device-0 IsPresent() (chip_select bit0 = 1). If
+                // this is false the card is seen ABSENT -> EXIProbe else-branch
+                // -> CARDProbeEx BUSY forever (synthesis alt #2).
+                // Guest-visible TB: what mftb last wrote into SPR_TL/TU
+                // (Gekko.h SPR_TL=268, SPR_TU=269). The SDK's OSGetTime reads
+                // these. If they are NOT advancing (or tiny) while the fake TB
+                // (tb, above) IS huge+advancing, emit_mftb is the divergence:
+                // guest decisec stays 0 -> stamp=1 -> (t-stamp) signed-wraps
+                // negative -> EXIProbe BUSY forever.
+                const u32 g_tl = (u32)ps_c.spr[268];
+                const u32 g_tu = (u32)ps_c.spr[269];
+                const u64 g_tb = ((u64)g_tu << 32) | g_tl;
+                // r0/r3/r4 around the debounce store (0x8042f9f0..fa10):
+                // r0 = loaded stamp, r3 = stamp addr (0x800030C0+chan*4),
+                // r4 = t (deciseconds_low + 1). Catches the actual stored t.
+                NOTICE_LOG_FMT(POWERPC,
+                    "[ax-card] n={} pc={:#x} ticks={} guesttb={} stamp={} r0={:#x} r3={:#x} r4={:#x}",
+                    cn, ps_c.pc, ticks, g_tb, stamp,
+                    ps_c.gpr[0], ps_c.gpr[3], ps_c.gpr[4]);
             }
         }
     }

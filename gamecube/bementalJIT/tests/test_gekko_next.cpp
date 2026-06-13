@@ -1588,7 +1588,34 @@ static bool test_fctiwz_vectors() {
     return true;
 }
 
+// adde rX,rX,rX carry-out when rt==ra==rb (the __div2i 0x80396dc4 shift-
+// through-carry pattern). Pre-fix bug: emit_ca_chain wrote dest before
+// reading operand_a for carry1, so for rt==ra the carry-out collapsed to
+// CA_in and the real (2*rX overflow) carry was dropped — corrupting any
+// 64-bit divide with a high-word-set dividend (PSO OSGetTime/CARDProbeEx).
+// Sequence: r3=0x80000000, r4=0, CA=0.
+//   adde r3,r3,r3 -> r3 = 0 (0x80000000+0x80000000 wraps), CA_out MUST = 1
+//   adde r4,r4,r4 -> r4 = 0+CA_in(1) = 1, CA_out = 0
+// Pre-fix gave r3=0,r4=0 (CA dropped). Post-fix: r3=0,r4=1.
+static bool test_adde_alias_carry_chain() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    *(u8*)((u8*)env.ctx_raw + ppc_off::XER_CA) = 0;
+    env.gpr(3) = 0x80000000u;
+    env.gpr(4) = 0u;
+    const u32 insts[] = { 0x7C631914u /* adde r3,r3,r3 */,
+                          0x7C842114u /* adde r4,r4,r4 */ };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 2, &next_pc)) return false;
+    const u32 r3 = env.gpr(3), r4 = env.gpr(4);
+    const u8 ca = *(const u8*)((const u8*)env.ctx_raw + ppc_off::XER_CA);
+    std::printf("[diag adde-alias] r3=0x%08x r4=0x%08x ca=%u (exp r3=0 r4=1 ca=0)\n", r3, r4, ca);
+    return r3 == 0u && r4 == 1u && ca == 0u;
+}
+
 static const TestCase k_tests[] = {
+    {"adde_alias_carry_chain",           &test_adde_alias_carry_chain},
     {"addi_sequential",                  &test_addi_sequential},
     {"viwait_recheck_block",             &test_viwait_recheck_block},
     {"lfs_sda2_negative_offset",         &test_lfs_sda2_negative_offset},

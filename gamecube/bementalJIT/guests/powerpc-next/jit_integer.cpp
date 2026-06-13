@@ -809,30 +809,44 @@ static void emit_ca_chain(WasmModuleBuilder& wb, u32 ctx_ptr,
                           u32 operand_a_local, u32 operand_b_local,
                           u32 dest_local,
                           bool ca_discardable = false) {
-    // sum1 = a + b → tee TMP_SCRATCH
+    // sum1 = a + b → tee TMP_SCRATCH (leaves sum1 on the stack)
     wb.op_local_get(operand_a_local);
     wb.op_local_get(operand_b_local);
     wb.op_i32_add();
     wb.op_local_tee(LOCAL_TMP_SCRATCH);
 
-    // dest = sum1 + xer_ca
+    if (ca_discardable) {
+        // dest = sum1 + xer_ca  (sum1 still on the stack from the tee)
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i32_load8_u(ppc_off::XER_CA);
+        wb.op_i32_add();
+        wb.op_local_set(dest_local);
+        return;
+    }
+
+    // 2026-06-12 ALIAS FIX: carry1 = (sum1 < a) MUST read the ORIGINAL
+    // operand_a — but dest = sum1 + CA may overwrite operand_a's local when
+    // rt == ra (e.g. __div2i's hot-loop `adde rX,rX,rX`). Compute carry1
+    // FIRST (operand_a still intact), hold it on the stack, then write dest.
+    // sum1 is on the stack from the tee above.
+    wb.op_local_get(operand_a_local);
+    wb.op_i32_lt_u();                       // stack: [carry1]
+
+    // dest = sum1 (from TMP_SCRATCH) + CA, tee so it stays on the stack
+    wb.op_local_get(LOCAL_TMP_SCRATCH);
     wb.op_i32_const((s32)ctx_ptr);
     wb.op_i32_load8_u(ppc_off::XER_CA);
     wb.op_i32_add();
-    wb.op_local_set(dest_local);
+    wb.op_local_tee(dest_local);            // stack: [carry1, dest]
 
-    if (!ca_discardable) {
-        // carry1 = (sum1 < a); carry2 = (dest < sum1); new_ca = carry1 | carry2
-        wb.op_i32_const((s32)ctx_ptr);
-        wb.op_local_get(LOCAL_TMP_SCRATCH);
-        wb.op_local_get(operand_a_local);
-        wb.op_i32_lt_u();
-        wb.op_local_get(dest_local);
-        wb.op_local_get(LOCAL_TMP_SCRATCH);
-        wb.op_i32_lt_u();
-        wb.op_i32_or();
-        wb.op_i32_store8(ppc_off::XER_CA);
-    }
+    // carry2 = (dest < sum1); new_ca = carry1 | carry2
+    wb.op_local_get(LOCAL_TMP_SCRATCH);
+    wb.op_i32_lt_u();                       // stack: [carry1, carry2]
+    wb.op_i32_or();                         // stack: [new_ca]
+    wb.op_local_set(LOCAL_TMP_SCRATCH);     // sum1 no longer needed; stash new_ca
+    wb.op_i32_const((s32)ctx_ptr);
+    wb.op_local_get(LOCAL_TMP_SCRATCH);
+    wb.op_i32_store8(ppc_off::XER_CA);
 }
 
 void emit_addex(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
