@@ -125,11 +125,15 @@ static bool environment_cb(unsigned cmd, void* data) {
 static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
     static int frame_log = 0;
     static bool first_frame_signaled = false;
-    if (frame_log < 3) {
-        frame_log++;
+    // [ax-vcb] the "video_cb (count=N)" probe metric parses these lines. The
+    // old `< 3` cap made it look like only 3 frames ever presented — but the
+    // render postMessage below fires EVERY call. Log first 3 + every 128th so
+    // the true present rate is visible.
+    frame_log++;
+    if (frame_log <= 3 || (frame_log & 0x7F) == 0) {
         MAIN_THREAD_EM_ASM({
-            postMessage({cmd: 'print', txt: '[worker] video_cb data=' + $0 + ' w=' + $1 + ' h=' + $2 + ' pitch=' + $3});
-        }, (uintptr_t)data, w, h, (uint32_t)pitch);
+            postMessage({cmd: 'print', txt: '[worker] video_cb data=' + $0 + ' w=' + $1 + ' h=' + $2 + ' pitch=' + $3 + ' n=' + $4});
+        }, (uintptr_t)data, w, h, (uint32_t)pitch, frame_log);
     }
     if (!data || !w || !h) return;
     // First real frame — flip the boot-loop pacing flag so worker_funcs.js
