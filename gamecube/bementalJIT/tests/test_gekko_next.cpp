@@ -1614,7 +1614,39 @@ static bool test_adde_alias_carry_chain() {
     return r3 == 0u && r4 == 1u && ca == 0u;
 }
 
+// ps_merge10 fD,fA,fB with fD==fA (PSMTXIdentity 0x803763d4: ps_merge10
+// f1,f1,f0 building identity matrix[2][2]=1.0). fD.ps0 <- fA.ps1; fD.ps1 <-
+// fB.ps0. When fD==fA, d.ps1 and a.ps1 share a local; the pre-fix "write
+// d.ps1 first" order clobbered a.ps1 before d.ps0 read it -> fD.ps0
+// collapsed to fB.ps0 instead of fA.ps1, zeroing the matrix Z-row and
+// clipping all 3D geometry (PSO renders only 2D overlay). Bit-move, so use
+// i64 lane sentinels: f1=(ps0=0xAAA.., ps1=0x111..), f0=(ps0=0x000..).
+// Expect f1=(0x111.., 0x000..). Pre-fix gave (0x000.., 0x000..).
+static bool test_ps_merge10_alias_fd_eq_fa() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    *(u32*)((u8*)env.ctx_raw + ppc_off::MSR) = 0x2000u;   // MSR.FP=1
+    env.spr(920) = 0xA0000000u;                            // HID2.PSE|LSQE
+    const u64 F1_PS0 = 0xAAAAAAAAAAAAAAAAull;
+    const u64 F1_PS1 = 0x1111111111111111ull;  // the "1.0" lane -> must reach ps0
+    const u64 F0_PS0 = 0x0000000000000000ull;  // the "0.0" lane -> must reach ps1
+    *(u64*)((u8*)env.ctx_raw + ppc_off::ps0(1)) = F1_PS0;
+    *(u64*)((u8*)env.ctx_raw + ppc_off::ps1(1)) = F1_PS1;
+    *(u64*)((u8*)env.ctx_raw + ppc_off::ps0(0)) = F0_PS0;
+    *(u64*)((u8*)env.ctx_raw + ppc_off::ps1(0)) = 0xBBBBBBBBBBBBBBBBull;
+    const u32 insts[] = { 0x102104A0u };  // ps_merge10 f1,f1,f0
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = *(const u64*)((const u8*)env.ctx_raw + ppc_off::ps0(1));
+    const u64 ps1 = *(const u64*)((const u8*)env.ctx_raw + ppc_off::ps1(1));
+    std::printf("[diag ps_merge10] f1.ps0=0x%016llx (exp 1111..) f1.ps1=0x%016llx (exp 0000..)\n",
+                (unsigned long long)ps0, (unsigned long long)ps1);
+    return ps0 == F1_PS1 && ps1 == F0_PS0;
+}
+
 static const TestCase k_tests[] = {
+    {"ps_merge10_alias_fd_eq_fa",        &test_ps_merge10_alias_fd_eq_fa},
     {"adde_alias_carry_chain",           &test_adde_alias_carry_chain},
     {"addi_sequential",                  &test_addi_sequential},
     {"viwait_recheck_block",             &test_viwait_recheck_block},
