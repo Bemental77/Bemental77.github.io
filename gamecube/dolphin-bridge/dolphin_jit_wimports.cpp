@@ -614,10 +614,11 @@ void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
             }
         }
     }
+    // [ax-pe] per-256-drain heartbeat removed 2026-06-13 (gate #8 clean
+    // baseline): it was ~847 cross-thread postMessage prints/s, the dominant
+    // diag overhead perturbing throughput measurement.
     static u64 s_drain_n = 0;
-    if ((++s_drain_n & 0xFFu) == 1) {
-        NOTICE_LOG_FMT(POWERPC, "[ax-pe] dolphin_gather_drain n={}", s_drain_n);
-    }
+    ++s_drain_n;
     // [pc-census] drain: every ~256K drains, if the ring is full, count
     // duplicates and log ONE line of the top entries, then re-arm. Each
     // window = 256 consecutive dispatches at the time the ring was open.
@@ -656,27 +657,8 @@ void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
     }
     auto& system = Core::System::GetInstance();
     GPFifo::UpdateGatherPipe(system.GetGPFifo());
-    // [ax-cp] every 4096th drain (after UpdateGatherPipe → GatherPipeBursted
-    // → RunGpu has run), snapshot CP/FIFO state so we can see whether the
-    // game's CP enables/disables vs CPReadWriteDistance evolution. The
-    // wedge investigation question is: is the FIFO actually being parsed,
-    // or is CPReadWriteDistance stuck at 0 because GPLinkEnable is false
-    // (so GatherPipeBursted skips the CPWritePointer/distance update)?
-    if ((s_drain_n & 0xFFFu) == 1) {
-        auto& fifo = system.GetCommandProcessor().GetFifo();
-        const u32 gp_link  = fifo.bFF_GPLinkEnable.load(std::memory_order_relaxed) ? 1u : 0u;
-        const u32 gp_read  = fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) ? 1u : 0u;
-        const u32 bp_en    = fifo.bFF_BPEnable.load(std::memory_order_relaxed) ? 1u : 0u;
-        const u32 dist     = fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
-        const u32 wptr     = fifo.CPWritePointer.load(std::memory_order_relaxed);
-        const u32 rptr     = fifo.CPReadPointer.load(std::memory_order_relaxed);
-        // POWERPC channel — the probe captures only N[PowerPC]: lines per
-        // gamecube/tools/dolphin_render_probe.js, not COMMANDPROCESSOR.
-        NOTICE_LOG_FMT(POWERPC,
-                       "[ax-cp] state @drain={} gp_link={} gp_read={} bp_en={} "
-                       "dist=0x{:x} wptr=0x{:x} rptr=0x{:x}",
-                       s_drain_n, gp_link, gp_read, bp_en, dist, wptr, rptr);
-    }
+    // [ax-cp] per-4096-drain CP/FIFO snapshot removed 2026-06-13 (gate #8
+    // clean baseline) — second-largest diag print source.
 }
 
 // dolphin_evict_block lives in JitWasm.cpp (which has the bementalJIT
