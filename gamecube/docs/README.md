@@ -71,7 +71,7 @@ Use this as the starting point when populating a topic's resource table.
 
 #### `dolphin_render_probe.js` configuration
 
-No CLI flags — env vars only: `PROBE_DURATION_MS` (default 60000), `PROBE_QUERY` (URL query string, e.g. `ppcbootdispatch=1`), `ROM_IDX` (0=SAB, 1=PSO), `PROBE_TRACE_PATH`, `PROBE_METRICS_PATH`, `PROBE_NO_TRACE`, `PROBE_JS_FLAGS`, plus stuck-pattern early-exit knobs (`PROBE_STUCK_*`) — see the constants at the top of the script.
+No CLI flags — env vars only: `PROBE_DURATION_MS` (default 60000), `PROBE_QUERY` (URL query string, e.g. `ppcbootdispatch=1`), `ROM_IDX` (live gamecube.html ROMS[] index, verified 2026-06-14: 0=Mario Party 4, 1=SAB, 2=PSO, 3=240pSuite — the old "0=SAB,1=PSO" was stale), `PROBE_TRACE_PATH`, `PROBE_METRICS_PATH`, `PROBE_NO_TRACE`, `PROBE_JS_FLAGS`, plus stuck-pattern early-exit knobs (`PROBE_STUCK_*`) — see the constants at the top of the script.
 
 ### Runtime-state tools (gamecube/tools/)
 

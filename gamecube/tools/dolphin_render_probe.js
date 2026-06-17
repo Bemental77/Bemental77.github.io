@@ -199,7 +199,10 @@ function startServer() {
   const _extra = process.env.PROBE_QUERY ? ('&' + process.env.PROBE_QUERY) : '';
   await page.goto(`http://127.0.0.1:${PORT}/gamecube.html?v=${Date.now()}${_extra}`, { waitUntil: 'load', timeout: 60000 });
   await new Promise((r) => setTimeout(r, 1000));
-  // Allow override via env var ROM_IDX (0=SAB, 1=PSO).
+  // ROM_IDX selects gamecube.html ROMS[] by index (verified live 2026-06-14):
+  //   0 = Mario Party 4, 1 = Sonic Adventure 2 Battle,
+  //   2 = Phantasy Star Online Ep I&II Plus (PSO), 3 = 240pSuite (homebrew).
+  // (The old "0=SAB,1=PSO" note predated the MP4 + 240pSuite additions.)
   const romIdx = parseInt(process.env.ROM_IDX || '0', 10);
   await page.evaluate((idx) => {
     localStorage.setItem('gcwasm_romIdx', String(idx));
@@ -234,8 +237,13 @@ function startServer() {
     }
   }
 
-  await page.evaluate(() => { const b = document.getElementById('btnStart'); if (b) b.click(); });
-  console.log('[probe] Start clicked, observing for ' + (TEST_DURATION_MS/1000) + 's...');
+  const picked = await page.evaluate(() => {
+    const sel = document.getElementById('romSelect');
+    const b = document.getElementById('btnStart');
+    if (b) b.click();
+    return sel && sel.options[+sel.value] ? sel.options[+sel.value].textContent : 'unknown';
+  });
+  console.log('[probe] Start clicked (ROM=' + picked + '), observing for ' + (TEST_DURATION_MS/1000) + 's...');
 
   // ---- synthetic pad presses ----------------------------------------------
   // PROBE_PRESS="start@45000,a@52000" → at each offset (ms from Start
