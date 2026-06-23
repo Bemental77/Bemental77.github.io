@@ -53,7 +53,6 @@ jobs:
             --exclude='gamecube/build-*' \
             --exclude='gamecube/ppc-worker/build-*' \
             --exclude='gamecube/tools' \
-            --exclude='gamecube/roms' \
             --exclude='dolphin_captures' \
             --exclude='research_findings.md' \
             --exclude='tools' \
