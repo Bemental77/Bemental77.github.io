@@ -28,6 +28,7 @@
 
 #include <emscripten.h>
 #include <cstdint>
+#include <cstdlib>  // [xinst-fix] getenv/strtoull for the promote-after-ticks gate
 #include <string>
 #include <utility>
 
@@ -64,6 +65,11 @@ extern int g_pc_census_n;
 extern u64 g_pc_census_total;
 extern u32 g_chain_iters;
 }
+// [region-debug TEMP] region_dispatch outcome counters (block_cache.cpp).
+extern "C" {
+extern uint32_t g_rd_calls, g_rd_nohandle, g_rd_noregion, g_rd_miss, g_rd_hit, g_rd_nogen;
+extern unsigned char g_bem_promote_active;  // [xinst-fix] gate the promote drain past boot
+}
 static void ax_wake_arm_set() { bemental::g_ax_wake_arm = 192; }
 
 
@@ -85,6 +91,24 @@ extern "C" {
 // BAT mapping → DSI exception → 26K "Invalid write to 0x0c00xxxx" warnings
 // that fully wedged __OSInitAudioSystem on the DSP_CR bit-0x20 poll.
 
+// [perf gather-gate] Set when a guest store targets the write-gather pipe
+// (WPAR, phys 0x0C008000). The JIT block epilogue reads this WASM-side and
+// only crosses to dolphin_gather_drain (the wasm->JS UpdateGatherPipe flush)
+// when a GP write is actually pending — pure-compute store-blocks (the bulk)
+// skip the crossing (~3.6% of JIT-worker self-time). Hang-proof: EVERY GP
+// write path routes through dolphin_write{8,16,32}. This holds for BOTH
+// integer and FP stores because the fastmem REGION CLASSIFIER (jit_load_store
+// .cpp emit_fastmem_guard) admits only the RAM mirrors (EA & 0xFE000000 in
+// {0x00,0x80,0xC0}000000) and routes WPAR (0xCC008000 / phys 0x0C008000 /
+// mirrors) + all MMIO to the slow import arm — so stfs/stfsx (now fastmem-
+// fast-armed) still reach dolphin_write32 for any GP target, and stfd/psq_st/
+// lfd remain slowmem-only. dolphin_interp also sets the flag conservatively.
+// The flag therefore can never miss a GP write and starve the FIFO.
+extern "C" int g_bem_gp_dirty;   // defined in bementalJIT src/block_cache.cpp
+static inline void gp_dirty_check(uint32_t addr) {
+    if ((addr & 0x0FFFFFFFu) == 0x0C008000u) g_bem_gp_dirty = 1;
+}
+
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_read8(uint32_t addr) {
     return Core::System::GetInstance().GetMMU().Read<u8>(addr);
@@ -102,32 +126,19 @@ uint32_t dolphin_read32(uint32_t addr) {
 
 EMSCRIPTEN_KEEPALIVE
 void dolphin_write8(uint32_t addr, uint32_t val) {
+    gp_dirty_check(addr);
     Core::System::GetInstance().GetMMU().Write<u8>(static_cast<u8>(val), addr);
 }
 
 EMSCRIPTEN_KEEPALIVE
 void dolphin_write16(uint32_t addr, uint32_t val) {
-    // [ax-vi-w] Trace VI MMIO 16-bit writes (0xCC002000..0xCC0020FF). VI
-    // registers are 16-bit per Source/Core/Core/HW/VideoInterface.cpp.
-    // Diagnostic for "VI vblank IRQ never fires" — check whether MP4 ever
-    // programs the VI Interrupt Registers (0xCC002030..0xCC002037).
-    {
-        const uint32_t phys = addr & 0x0FFFFFFF;
-        if (phys >= 0x0C002000 && phys <= 0x0C0020FF) {
-            static uint32_t s_viw_n = 0;
-            if (s_viw_n < 80) {
-                ++s_viw_n;
-                NOTICE_LOG_FMT(VIDEOINTERFACE,
-                               "[ax-vi-w] VI MMIO write16 n={} addr={:#x} val={:#x}",
-                               s_viw_n, addr, val & 0xFFFF);
-            }
-        }
-    }
+    gp_dirty_check(addr);
     Core::System::GetInstance().GetMMU().Write<u16>(static_cast<u16>(val), addr);
 }
 
 EMSCRIPTEN_KEEPALIVE
 void dolphin_write32(uint32_t addr, uint32_t val) {
+    gp_dirty_check(addr);
     Core::System::GetInstance().GetMMU().Write<u32>(val, addr);
 }
 
@@ -158,187 +169,10 @@ uint32_t dolphin_check_exc(uint32_t /*unused*/) {
     auto& ps = sys.GetPPCState();
     auto& ppc = sys.GetPowerPC();
 
-    // [ax-queue] Snapshot RunQueueBits (0x1D4350) + retraceQueue (0x1D4430) +
-    // retraceCount (0x1D4428 — the value VIWaitForRetrace's do-while watches).
-    // Per ~/gc_refs/dolsdk2001/src/vi/vi.c:432-443, main thread re-sleeps if
-    // retraceCount doesn't advance between OSSleepThread wakes. Log on CHANGE.
-    {
-        static u32 s_prev_run_bits = 0xFFFFFFFFu;
-        static u32 s_prev_q_head = 0xFFFFFFFFu;
-        static u32 s_prev_q_tail = 0xFFFFFFFFu;
-        static u32 s_prev_rcount = 0xFFFFFFFFu;
-        static u32 s_run_log_count = 0;
-        static u32 s_q_log_count = 0;
-        static u32 s_rc_log_count = 0;
-        const u8* ram = sys.GetMemory().GetRAM();
-        if (ram) {
-            u32 run_bits = (u32(ram[0x1D4350]) << 24) | (u32(ram[0x1D4351]) << 16) |
-                           (u32(ram[0x1D4352]) << 8) | u32(ram[0x1D4353]);
-            u32 q_head  = (u32(ram[0x1D4430]) << 24) | (u32(ram[0x1D4431]) << 16) |
-                          (u32(ram[0x1D4432]) << 8) | u32(ram[0x1D4433]);
-            u32 q_tail  = (u32(ram[0x1D4434]) << 24) | (u32(ram[0x1D4435]) << 16) |
-                          (u32(ram[0x1D4436]) << 8) | u32(ram[0x1D4437]);
-            u32 rcount  = (u32(ram[0x1D4428]) << 24) | (u32(ram[0x1D4429]) << 16) |
-                          (u32(ram[0x1D442A]) << 8) | u32(ram[0x1D442B]);
-            if (run_bits != s_prev_run_bits && s_run_log_count < 200) {
-                s_run_log_count++;
-                NOTICE_LOG_FMT(POWERPC,
-                               "[ax-queue] RunQueueBits {:#x} -> {:#x} (n={})",
-                               s_prev_run_bits, run_bits, s_run_log_count);
-                s_prev_run_bits = run_bits;
-            }
-            if ((q_head != s_prev_q_head || q_tail != s_prev_q_tail) && s_q_log_count < 200) {
-                s_q_log_count++;
-                NOTICE_LOG_FMT(POWERPC,
-                               "[ax-queue] retraceQueue head:{:#x}->{:#x} tail:{:#x}->{:#x} (n={})",
-                               s_prev_q_head, q_head, s_prev_q_tail, q_tail, s_q_log_count);
-                s_prev_q_head = q_head;
-                s_prev_q_tail = q_tail;
-            }
-            // [ax-gates] boot-gate timeline (2026-06-10): GlobalCounter
-            // 0x1D3A54 (main-loop completions), omcurovl/omnextovl
-            // 0x1D3CE0/E4, fadeStat 0x1D3D18, HuDvdErrWait 0x1D3A04,
-            // GXWaitDrawDone flag region — log on ANY change, sampled.
-            {
-                static u32 s_prev_gc = 0xFFFFFFFFu, s_prev_ovl = 0xFFFFFFFFu,
-                           s_prev_misc = 0xFFFFFFFFu;
-                static u32 s_gate_log_n = 0;
-                u32 gc   = (u32(ram[0x1D3A54]) << 24) | (u32(ram[0x1D3A55]) << 16) |
-                           (u32(ram[0x1D3A56]) << 8) | u32(ram[0x1D3A57]);
-                u32 ovl  = (u32(ram[0x1D3CE0]) << 24) | (u32(ram[0x1D3CE3]) << 16) |
-                           (u32(ram[0x1D3CE4]) << 8) | u32(ram[0x1D3CE7]);
-                u32 misc = (u32(ram[0x1D3D18]) << 24) | (u32(ram[0x1D3A07]) << 16) |
-                           u32(ram[0x1D3A04]);
-                // Wild-store watch: minimumVcount/minimumVcountf
-                // (0x1D3B04/0x1D3B00, zero-initialized .sbss) read -1 /
-                // 0x59800000 every run with HuSysVWaitSet NEVER dispatched.
-                {
-                    static u32 s_prev_mv = 0xEEEEEEEEu;
-                    u32 mv = (u32(ram[0x1D3B04]) << 24) | (u32(ram[0x1D3B05]) << 16) |
-                             (u32(ram[0x1D3B06]) << 8) | u32(ram[0x1D3B07]);
-                    if (mv != s_prev_mv) {
-                        NOTICE_LOG_FMT(POWERPC,
-                                       "[ax-minvc] minimumVcount {:#x} -> {:#x} (detect pc={:#x} lr={:#x})",
-                                       s_prev_mv, mv, ps.pc, LR(ps));
-                        s_prev_mv = mv;
-                    }
-                }
-                // PAD driver state (authoritative host-side read; the SAB
-                // dump tool showed all-zero here, contradicting its own
-                // ResettingChan=32 initializer — suspected stale-MEM1-copy
-                // scan hit).
-                static u32 s_prev_pad = 0xFFFFFFFFu;
-                u32 pad_bits = (u32(ram[0x1D44EF]) << 24) | (u32(ram[0x1D44F3]) << 16) |
-                               (u32(ram[0x1D44FB]) << 8) | u32(ram[0x1D391B]);
-                if (pad_bits != s_prev_pad) {
-                    NOTICE_LOG_FMT(POWERPC,
-                                   "[ax-pad] EnabledBits={:#x} ResettingBits={:#x} WaitingBits={:#x} CheckingBits={:#x} PendingBits={:#x} ResettingChan={}",
-                                   (u32(ram[0x1D44EC]) << 24) | (u32(ram[0x1D44ED]) << 16) | (u32(ram[0x1D44EE]) << 8) | u32(ram[0x1D44EF]),
-                                   (u32(ram[0x1D44F0]) << 24) | (u32(ram[0x1D44F1]) << 16) | (u32(ram[0x1D44F2]) << 8) | u32(ram[0x1D44F3]),
-                                   (u32(ram[0x1D44F8]) << 24) | (u32(ram[0x1D44F9]) << 16) | (u32(ram[0x1D44FA]) << 8) | u32(ram[0x1D44FB]),
-                                   (u32(ram[0x1D44FC]) << 24) | (u32(ram[0x1D44FD]) << 16) | (u32(ram[0x1D44FE]) << 8) | u32(ram[0x1D44FF]),
-                                   (u32(ram[0x1D4500]) << 24) | (u32(ram[0x1D4501]) << 16) | (u32(ram[0x1D4502]) << 8) | u32(ram[0x1D4503]),
-                                   (u32(ram[0x1D3918]) << 24) | (u32(ram[0x1D3919]) << 16) | (u32(ram[0x1D391A]) << 8) | u32(ram[0x1D391B]));
-                    s_prev_pad = pad_bits;
-                }
-                // DrawDone byte 0x1D45F0 + FinishQueue head 0x1D45F4 (GX
-                // draw-done handshake; __GXFinishHandler must pulse DrawDone
-                // 0->1 for GXWaitDrawDone to exit).
-                u32 gxdd = (u32(ram[0x1D45F0]) << 8) | u32(ram[0x1D45F5]);
-                static u32 s_prev_gxdd = 0xFFFFFFFFu;
-                if (gxdd != s_prev_gxdd) {
-                    NOTICE_LOG_FMT(POWERPC, "[ax-gxdd] DrawDone={:#x} FinishQ.head=..{:02x}{:02x}",
-                                   u32(ram[0x1D45F0]), u32(ram[0x1D45F6]), u32(ram[0x1D45F7]));
-                    s_prev_gxdd = gxdd;
-                }
-                // [ax-park] DefaultThread (0x1A5828) saved context: srr0
-                // (ctx+0x198), lr (ctx+0x84), state (thread+0x2C8 u16),
-                // queue ptr (thread+0x2DC) — host-side authoritative read of
-                // WHERE main parks. Log on change of srr0/queue.
-                {
-                    auto rd32 = [&](u32 off) {
-                        return (u32(ram[off]) << 24) | (u32(ram[off + 1]) << 16) |
-                               (u32(ram[off + 2]) << 8) | u32(ram[off + 3]);
-                    };
-                    const u32 thr = 0x1A5828;
-                    u32 srr0 = rd32(thr + 0x198);
-                    u32 lr = rd32(thr + 0x84);
-                    u32 queue = rd32(thr + 0x2DC);
-                    u32 state = (u32(ram[thr + 0x2C8]) << 8) | u32(ram[thr + 0x2C9]);
-                    static u32 s_prev_srr0 = 0xFFFFFFFFu, s_prev_queue = 0xFFFFFFFFu;
-                    static u32 s_park_n = 0;
-                    if (srr0 != s_prev_srr0 || queue != s_prev_queue) {
-                        s_park_n++;
-                        // Arm a 48-block dispatch trace on selected wakes
-                        // (READY transitions) — consumed by block_cache.cpp's
-                        // pre-dispatch EM_ASM via Module.ax_wake_arm.
-                        // Drain the wake-trace ring (filled by dispatch_raw).
-                        if (bemental::g_ax_wake_arm == 0 && bemental::g_ax_wake_ring_n > 0) {
-                            for (int ri = 0; ri < bemental::g_ax_wake_ring_n; ++ri) {
-                                NOTICE_LOG_FMT(POWERPC, "[ax-wake-traj] i={} handle={}", ri,
-                                               bemental::g_ax_wake_ring[ri]);
-                            }
-                            bemental::g_ax_wake_ring_n = 0;
-                        }
-                        static u32 s_wake_n = 0;
-                        if (state == 1) s_wake_n++;
-                        if (state == 1 && (s_wake_n & 0xFF) == 2) {
-                            // Same-thread EM_ASM: check_exc runs on the CPU
-                            // pthread — the same JS realm as dispatch_raw's
-                            // EM_ASM (MAIN_THREAD_EM_ASM lands in the wrong
-                            // realm under PROXY_TO_PTHREAD).
-                            ax_wake_arm_set();
-                            NOTICE_LOG_FMT(POWERPC, "[ax-arm] armed, readback={}",
-                                           bemental::g_ax_wake_arm);
-                        }
-                        if (s_park_n <= 16 || (s_park_n & 0x3F) == 0) {
-                            // r31 = VIWaitForRetrace's startCount (callee-
-                            // saved); live rcount = ram retraceCount. If the
-                            // saved r31 TRACKS rcount across cycles, the JIT
-                            // corrupts r31 (audit r28-r31 class) and the
-                            // do-while equality never breaks.
-                            u32 r30 = rd32(thr + 0x78);
-                            u32 r31 = rd32(thr + 0x7C);
-                            u32 live_rcount = rd32(0x1D4428);
-                            const u32 pi_cause =
-                                sys.GetProcessorInterface().m_interrupt_cause;
-                            const u32 pi_mask =
-                                sys.GetProcessorInterface().m_interrupt_mask;
-                            NOTICE_LOG_FMT(POWERPC,
-                                           "[ax-park] srr0={:#x} state={:#x} queue={:#x} r30={} rcount={} cause={:#x} mask={:#x} (n={})",
-                                           srr0, state, queue, r30, live_rcount, pi_cause,
-                                           pi_mask, s_park_n);
-                        }
-                        s_prev_srr0 = srr0;
-                        s_prev_queue = queue;
-                    }
-                }
-                if (gc != s_prev_gc || ovl != s_prev_ovl || misc != s_prev_misc) {
-                    s_gate_log_n++;
-                    if (s_gate_log_n <= 16 || (s_gate_log_n & 0x3F) == 0) {
-                        NOTICE_LOG_FMT(POWERPC,
-                                       "[ax-gates] GlobalCounter={} curovl={:#x}{:02x} nextovl={:#x}{:02x} fade={:#x} dvderr={:#x} (n={})",
-                                       gc, u32(ram[0x1D3CE0]), u32(ram[0x1D3CE3]),
-                                       u32(ram[0x1D3CE4]), u32(ram[0x1D3CE7]),
-                                       u32(ram[0x1D3D18]), u32(ram[0x1D3A04]),
-                                       s_gate_log_n);
-                    }
-                    s_prev_gc = gc; s_prev_ovl = ovl; s_prev_misc = misc;
-                }
-            }
-            if (rcount != s_prev_rcount) {
-                s_rc_log_count++;
-                // Uncapped (was <400 — the cap produced a phantom "frozen at
-                // 399" wedge, 2026-06-10); sample every 64th change + first 8.
-                if (s_rc_log_count <= 8 || (s_rc_log_count & 0x3F) == 0) {
-                    NOTICE_LOG_FMT(POWERPC,
-                                   "[ax-rcount] retraceCount {} -> {} (n={})",
-                                   s_prev_rcount, rcount, s_rc_log_count);
-                }
-                s_prev_rcount = rcount;
-            }
-        }
-    }
+    // [gate-8] Stripped per-block-exit diagnostic preamble
+    // ([ax-queue]/[ax-minvc]/[ax-pad]/[ax-gxdd]/[ax-park]/[ax-gates]/[ax-rcount]:
+    // ~20 guest-RAM reads + change-logging that ran on EVERY block exit, the bulk
+    // of dolphin_check_exc self-time). Real exception logic follows.
 
     if (ps.Exceptions & EXCEPTION_EXTERNAL_INT) {
         // Read MEM[0xC0] directly from host RAM (avoids MMU translation
@@ -458,6 +292,12 @@ void dolphin_interp(uint32_t /*unused*/, uint32_t pc) {
     auto& system = Core::System::GetInstance();
     auto& ppc_state = system.GetPPCState();
     if (ppc_state.pc != pc) return;
+    // [perf gather-gate] An interp-stepped op may store to the gather pipe via
+    // a path that does not go through dolphin_write* (belt-and-suspenders).
+    // Interp fallback is rare (~0% of profiled JIT time), so conservatively
+    // marking the FIFO dirty here costs nothing and removes the only way the
+    // epilogue gate could miss a GP write.
+    g_bem_gp_dirty = 1;
     system.GetInterpreter().SingleStepInner();
 }
 
@@ -524,96 +364,9 @@ void dolphin_msr_updated(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
 // forever on GP-triggered fences.
 EMSCRIPTEN_KEEPALIVE
 void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
-    // [ax-minvc2] per-store-block wild-store bracket for minimumVcount
-    // (0x1D3B04): detection lands within ONE block of the writer.
-    {
-        auto& sys_m = Core::System::GetInstance();
-        const u8* ram_m = sys_m.GetMemory().GetRAM();
-        if (ram_m) {
-            static u32 s_prev_mv2 = 0xEEEEEEEEu;
-            u32 mv = (u32(ram_m[0x1D3B04]) << 24) | (u32(ram_m[0x1D3B05]) << 16) |
-                     (u32(ram_m[0x1D3B06]) << 8) | u32(ram_m[0x1D3B07]);
-            if (mv != s_prev_mv2) {
-                auto& ps_m = sys_m.GetPPCState();
-                NOTICE_LOG_FMT(POWERPC,
-                               "[ax-minvc2] {:#x} -> {:#x} (block pc={:#x} lr={:#x})",
-                               s_prev_mv2, mv, ps_m.pc, LR(ps_m));
-                s_prev_mv2 = mv;
-            }
-        }
-    }
-    // [ax-fill] __fill_mem (0x800033D8..0x80003490) dominates wedged-phase
-    // dispatch; check_exc never fires from its stw/bdnz loop, but this drain
-    // runs at every store-block exit. Capture caller LR + args (r3=dst,
-    // r4=fill, r5=size at entry) + CTR (remaining words).
-    {
-        auto& ps_f = Core::System::GetInstance().GetPPCState();
-        if (ps_f.pc >= 0x800033D8 && ps_f.pc < 0x80003490) {
-            static u64 s_fill_n = 0;
-            const u64 fn = ++s_fill_n;
-            if (fn <= 8 || (fn & 0x3FFF) == 0) {
-                NOTICE_LOG_FMT(POWERPC, "[ax-fill] n={} pc={:#x} lr={:#x} r3={:#x} r4={:#x} r5={:#x} ctr={:#x}",
-                               fn, ps_f.pc, LR(ps_f), ps_f.gpr[3], ps_f.gpr[4], ps_f.gpr[5], CTR(ps_f));
-            }
-        }
-    }
-    // [ax-card] temporary diag (strip per gate #8): settle the CARDProbeEx
-    // BUSY-spin root cause. The EXI insertion debounce (PSO EXIProbe
-    // zz_8042f914_) returns BUSY until guest deciseconds t advances >= 3 past
-    // the stamp at guest 0x800030C0 (OS low-mem __gUnknown800030C0[chan]).
-    // Three decisive reads discriminate: (a) CoreTiming GetTicks — is Advance
-    // firing? (b) guest TB (ReadFullTimeBaseValue = what OSGetTime sees) — is
-    // guest time advancing? (c) stamp[0] @ 0x800030C0 — does it accumulate or
-    // reset every iteration? TB->deciseconds: GC TB ticks at busclk/4
-    // (~40.5MHz), so decisec = TB / 4_050_000.
-    {
-        auto& sys2 = Core::System::GetInstance();
-        auto& ps_c = sys2.GetPPCState();
-        // Debounce-exit capture: the block ending at 0x8042fa10/fa18 just ran
-        // the stamp store (0x8042fa00, r4=t) + the (t-stamp) subf+cmpi. Catch
-        // r0/r3/r4 there with NO rate limit (first 40) to read the actual t.
-        if (ps_c.pc >= 0x8042fa00u && ps_c.pc <= 0x8042fa70u) {
-            static u64 s_dbnc = 0;
-            if (++s_dbnc <= 40) {
-                const u32 stamp2  = sys2.GetMMU().Read<u32>(0x800030C0u);
-                const u32 busclk  = sys2.GetMMU().Read<u32>(0x800000F8u); // __OSBusClock
-                const u32 coreclk = sys2.GetMMU().Read<u32>(0x800000FCu); // __OSCoreClock
-                NOTICE_LOG_FMT(POWERPC,
-                    "[ax-dbnc] n={} pc={:#x} r4_t={:#x} memstamp={:#x} r27div={} busclk={} coreclk={}",
-                    s_dbnc, ps_c.pc, ps_c.gpr[4], stamp2, ps_c.gpr[27], busclk, coreclk);
-            }
-        }
-        if (ps_c.pc >= 0x8042f000u && ps_c.pc < 0x80431000u) {
-            static u64 s_card_n = 0;
-            const u64 cn = ++s_card_n;
-            if (cn <= 12 || (cn & 0x3FFu) == 0) {
-                const u64 tb = sys2.GetPowerPC().ReadFullTimeBaseValue();
-                const u64 ticks = sys2.GetCoreTiming().GetTicks();
-                const u32 stamp = sys2.GetMMU().Read<u32>(0x800030C0u);
-                const u64 t_decis = tb / 4050000ull + 1ull;
-                // The decisive EXT source: ComplexRead sets CSR EXT bit from
-                // channel-0 device-0 IsPresent() (chip_select bit0 = 1). If
-                // this is false the card is seen ABSENT -> EXIProbe else-branch
-                // -> CARDProbeEx BUSY forever (synthesis alt #2).
-                // Guest-visible TB: what mftb last wrote into SPR_TL/TU
-                // (Gekko.h SPR_TL=268, SPR_TU=269). The SDK's OSGetTime reads
-                // these. If they are NOT advancing (or tiny) while the fake TB
-                // (tb, above) IS huge+advancing, emit_mftb is the divergence:
-                // guest decisec stays 0 -> stamp=1 -> (t-stamp) signed-wraps
-                // negative -> EXIProbe BUSY forever.
-                const u32 g_tl = (u32)ps_c.spr[268];
-                const u32 g_tu = (u32)ps_c.spr[269];
-                const u64 g_tb = ((u64)g_tu << 32) | g_tl;
-                // r0/r3/r4 around the debounce store (0x8042f9f0..fa10):
-                // r0 = loaded stamp, r3 = stamp addr (0x800030C0+chan*4),
-                // r4 = t (deciseconds_low + 1). Catches the actual stored t.
-                NOTICE_LOG_FMT(POWERPC,
-                    "[ax-card] n={} pc={:#x} ticks={} guesttb={} stamp={} r0={:#x} r3={:#x} r4={:#x}",
-                    cn, ps_c.pc, ticks, g_tb, stamp,
-                    ps_c.gpr[0], ps_c.gpr[3], ps_c.gpr[4]);
-            }
-        }
-    }
+    // [gate-8] Stripped stale [ax-minvc2]/[ax-fill]/[ax-card]/[ax-dbnc] per-drain
+    // diagnostic blocks (RAM/MMU reads + pc-range checks ran on every block exit,
+    // ~3.3% of JIT-worker self-time) for a clean throughput baseline.
     // [ax-pe] per-256-drain heartbeat removed 2026-06-13 (gate #8 clean
     // baseline): it was ~847 cross-thread postMessage prints/s, the dominant
     // diag overhead perturbing throughput measurement.
@@ -651,12 +404,32 @@ void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
             }
             line += fmt::format(" {:x}x{}", pc, cnts[k]);
         }
-        NOTICE_LOG_FMT(POWERPC, "[pc-census] total={} chain={} uniq={}{}",
-                       bemental::g_pc_census_total, bemental::g_chain_iters, nuniq, line);
+        NOTICE_LOG_FMT(POWERPC, "[pc-census] total={} chain={} ticks={} uniq={}{}",
+                       bemental::g_pc_census_total, bemental::g_chain_iters,
+                       Core::System::GetInstance().GetCoreTiming().GetTicks(), nuniq, line);
+        NOTICE_LOG_FMT(POWERPC, "[region-dbg] calls={} hit={} miss={} nogen={}", g_rd_calls, g_rd_hit, g_rd_miss, g_rd_nogen);
         bemental::g_pc_census_n = 0;
     }
     auto& system = Core::System::GetInstance();
+    // [xinst-fix] Open the promote gate once past boot: the region's re-emit/seal
+    // cost only pays off in steady-state running, and running it during boot's
+    // block-discovery stalls the path to a running state. Threshold in guest
+    // ticks (env-overridable for tuning); default chosen to clear the apploader.
+    if (!g_bem_promote_active)
+    {
+        static const u64 s_promote_after = []() -> u64 {
+            const char* e = std::getenv("BJIT_PROMOTE_AFTER_TICKS");
+            return e ? static_cast<u64>(std::strtoull(e, nullptr, 10)) : 150000000ull;
+        }();
+        if (system.GetCoreTiming().GetTicks() > s_promote_after)
+            g_bem_promote_active = 1;
+    }
     GPFifo::UpdateGatherPipe(system.GetGPFifo());
+    // [perf gather-gate] Flushed all complete 32-byte chunks; any residual
+    // (< 32 bytes) stays in the pipe buffer and needs no re-drain until the
+    // next GP write re-arms the flag. Clear it so pure-compute store-blocks
+    // skip the crossing until then.
+    g_bem_gp_dirty = 0;
     // [ax-cp] per-4096-drain CP/FIFO snapshot removed 2026-06-13 (gate #8
     // clean baseline) — second-largest diag print source.
 }

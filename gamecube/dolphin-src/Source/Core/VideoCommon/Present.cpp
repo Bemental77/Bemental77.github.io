@@ -238,8 +238,26 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
     return flag;
   }();
 
-  if (is_duplicate && ignore_duplicate_flag)
-    is_duplicate = false;
+  // [render-opt 2026-06-19] DUPLICATE-FRAME SUPPRESSION. The original override
+  // forced a full Present() (RenderXFBToScreen bufferSubData + commit) on EVERY
+  // duplicate field under OGL — ~22% of the busy CPU worker when the guest
+  // produces no new frame (CPU profile worker_0). The wasm OffscreenCanvas
+  // PERSISTS the last committed image, so re-presenting a frozen XFB at field
+  // rate is pure waste. Present the first DUP_PRESENT_MARGIN consecutive
+  // duplicates (so any content change reaches the canvas + cover backend
+  // first-frame quirks), then suppress the rest. Reset on a real new frame.
+  constexpr u32 DUP_PRESENT_MARGIN = 3u;
+  static u32 s_dup_run = 0u;
+  if (is_duplicate)
+  {
+    if (ignore_duplicate_flag && s_dup_run < DUP_PRESENT_MARGIN)
+      is_duplicate = false;  // present this one (margin)
+    ++s_dup_run;
+  }
+  else
+  {
+    s_dup_run = 0u;
+  }
 #endif
 
   if (!is_duplicate || !g_ActiveConfig.bSkipPresentingDuplicateXFBs)

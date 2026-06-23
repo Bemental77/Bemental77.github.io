@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace bemental {
@@ -78,6 +79,7 @@ struct BlockEmitInputs {
     // re-emit path preserves the pre-gate decision (default true keeps
     // legacy callers conservative — they pay the round-trip).
     bool                            emit_hle_check = true;
+    u32                             block_cycles = 0;  // analyzer numCycles (R2 downcount charge)
     std::vector<u32>                insts;          // raw guest opcodes
     std::vector<u32>                instr_pcs;      // parallel PC array
 };
@@ -193,6 +195,16 @@ public:
     // false → caller falls through to the legacy per-block / interp path.
     bool region_dispatch(u32 pc, s32* out);
 
+    // ---- Hot-only merge (2026-06-17) ----
+    // stash_block: at compile time, remember a block's emit inputs (cheap; no
+    // body emitted). promote_hot: once a block has been dispatched enough times
+    // (counted in chain_dispatch_raw), re-emit its body and accumulate it into
+    // the single hot merged region (REGION_REL_0, repurposed) so only the
+    // actually-hot loop is merged — not all ~8900 mostly-cold blocks.
+    // (The hot region is REGION_REL_0, an otherwise-unused Phase-5 REL slot.)
+    void stash_block(u32 pc, const BlockEmitInputs& in);
+    void promote_hot(u32 pc);
+
     // For REL unload (Phase 5). Drops the module and clears accumulator.
     void region_drop(Region r);
 
@@ -211,8 +223,27 @@ public:
     int         region_generation(Region r) const;
 
 private:
+    // [sealed-multi-gen 2026-06-21] Seal the pending REGION_REL_0 batch into a
+    // fresh IMMUTABLE generation module and append it (never rebuilt -> V8 tiers
+    // it up once and keeps it). Replaces the grow-and-relink path for the hot
+    // region, which cold-relinked the whole growing module every generation
+    // (measured net-negative: 650 blocks halved ticks). region_relink routes
+    // REGION_REL_0 here; non-REL_0 regions keep the legacy relink body.
+    void region_seal(u32 mem_pages);
+
     std::unordered_map<u64, int>          m_map;
     std::array<RegionState, REGION_COUNT> m_regions{};
+    // Hot-only merge: per-pc emit inputs stashed at compile, consumed by
+    // promote_hot when a block goes hot. Bodies are re-emitted on promotion
+    // (not stored) to keep this bounded by unique-block count.
+    std::unordered_map<u32, BlockEmitInputs> m_pending_emit;
+    // [sealed-multi-gen] Dedup: every PC ever sealed into ANY generation. Gates
+    // promote_hot so a sealed PC is not re-promoted into the next pending batch
+    // (pc_to_idx resets each seal). m_sealed_gen_count = live generation count
+    // (also the next gen's index, and the MAX_GENS cap counter).
+    std::unordered_set<u32> m_sealed_pcs;
+    u32  m_sealed_gen_count = 0u;
+    bool m_region_has_sealed = false;
 };
 
 // ---- Lower-level free helpers ----

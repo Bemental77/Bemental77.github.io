@@ -49,6 +49,12 @@ static constexpr u32 WIMPORT_WRITE32 = 5;
 // LOCAL_TMP_A/B locked indices).
 static constexpr u32 LOCAL_TMP_EA  = 0;
 static constexpr u32 LOCAL_TMP_VAL = 1;
+// [perf] Scratch i32 for a scalar-FP store's converted single-precision bits.
+// It must NOT be LOCAL_TMP_VAL: emit_fastmem_guard tees the region selector
+// into LOCAL_TMP_VAL and emit_bswap_i32 uses it too, so a value parked there
+// before the guard is destroyed. Aliases the psq-scratch slot (98) — free for
+// scalar stfs/stfsx (psq_st never co-emits with a scalar FP store in one op).
+static constexpr u32 LOCAL_TMP_FPVAL = 98;
 
 // ---------------------------------------------------------------------------
 // EA computation
@@ -105,11 +111,38 @@ static void emit_fastmem_guard(WasmModuleBuilder& wb, LoadStoreParams params,
         wb.op_i32_const(0);
         return;
     }
-    // (EA & 0x1F000000) == 0  — top bits zero (filters out MMIO @ 0xCC* etc.)
+#ifndef BEM_FASTMEM_REGION_FIX
+#define BEM_FASTMEM_REGION_FIX 1
+#endif
+#if BEM_FASTMEM_REGION_FIX
+    // FASTMEM REGION CLASSIFIER (fix 2026-06-21): the old `(EA & 0x1F000000)==0`
+    // test only admitted the first 16 MB, so guest addresses above 0x80FFFFFF —
+    // INCLUDING the PSO stack at 0x817xxxxx (top of 24 MB MEM1) — were wrongly
+    // rejected to the ppc_read/write import slow path on every spill. Admit
+    // exactly the three RAM mirrors {phys 0x00, cached 0x80, uncached 0xC0} via
+    // (EA & 0xFE000000), which groups 0x80/0x81 (and 0xC0/0xC1) to one selector;
+    // 0xCC* MMIO masks to 0xCC000000, matches none, and correctly stays on the
+    // import (no aliasing). The bound check below still confines to ram_size.
+    wb.op_local_get(LOCAL_TMP_EA);
+    wb.op_i32_const((s32)0xFE000000u);
+    wb.op_i32_and();
+    wb.op_local_tee(LOCAL_TMP_VAL);          // region selector (LOCAL_TMP_VAL dead until byteswap, in the fast-arm body)
+    wb.op_i32_eqz();                         // == 0x00000000 (physical mirror)
+    wb.op_local_get(LOCAL_TMP_VAL);
+    wb.op_i32_const((s32)0x80000000u);
+    wb.op_i32_eq();                          // == cached RAM
+    wb.op_i32_or();
+    wb.op_local_get(LOCAL_TMP_VAL);
+    wb.op_i32_const((s32)0xC0000000u);
+    wb.op_i32_eq();                          // == uncached RAM
+    wb.op_i32_or();
+#else
+    // (EA & 0x1F000000) == 0  — legacy guard (16 MB only; rejects 0x817xxxxx).
     wb.op_local_get(LOCAL_TMP_EA);
     wb.op_i32_const(0x1F000000);
     wb.op_i32_and();
     wb.op_i32_eqz();
+#endif
     // (EA & mem1_mask) <= ram_size - access_bytes — the masked EA plus the
     // access width must fit within ram_size. Use lt_u with bound = ram_size
     // - (access_bytes - 1) which is the smallest EA that would write past
@@ -564,6 +597,115 @@ static void emit_ea_x_stack(WasmModuleBuilder& wb, RegCache& rc,
     }
 }
 
+// [perf] Fastmem-guarded scalar f32 load into both FPR lanes of rt. Precondition:
+// EA in LOCAL_TMP_EA, rc/frc already flushed, rt bound FPR_LANE_BOTH Write.
+// Mirrors the integer emit_load_common fast/slow split — emit_fastmem_guard
+// rejects WPAR/MMIO so any MMIO-mapped f32 read still takes the slow import —
+// then runs the shared f32->f64 promote tail. The loaded (logical, byte-swapped)
+// u32 is parked in LOCAL_TMP_FPVAL (NOT LOCAL_TMP_VAL: the guard + bswap clobber
+// it). Removes the unconditional dolphin_read32 wasm->JS crossing for RAM f32s.
+static void emit_fastmem_lfs_body(WasmModuleBuilder& wb, LoadStoreParams params,
+                                  u32 ps0_idx, u32 ps1_idx) {
+    emit_fastmem_guard(wb, params, 4);
+    wb.op_if(BLOCK_TYPE_VOID);
+        emit_fastmem_load_value(wb, params, LoadWidth::U32);   // fast: i32.load+bswap
+        wb.op_local_set(LOCAL_TMP_FPVAL);
+    wb.op_else();
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_call(WIMPORT_READ32);                            // slow: host MMU read
+        wb.op_local_set(LOCAL_TMP_FPVAL);
+    wb.op_end();
+    wb.op_local_get(LOCAL_TMP_FPVAL);
+    wb.op_f32_reinterpret_i32();
+    wb.op_f64_promote_f32();
+    wb.op_i64_reinterpret_f64();
+    wb.op_local_tee(ps0_idx);
+    wb.op_local_set(ps1_idx);
+}
+
+// [perf] Fastmem-guarded f64 LOAD (8 bytes BE) into the rt ps0 i64 lane.
+// Precondition: EA in LOCAL_TMP_EA, rc/frc flushed, rt bound. The fast arm
+// computes the host base once (into LOCAL_TMP_FPVAL) and does two i32.load +
+// bswap (offsets 0/4); the slow arm keeps the two WIMPORT_READ32 calls. Both
+// build the same big-endian i64 (hi = bytes 0..3 logical << 32 | lo = 4..7).
+static void emit_fastmem_lfd_body(WasmModuleBuilder& wb, LoadStoreParams params,
+                                  u32 ps0_idx) {
+    emit_fastmem_guard(wb, params, 8);
+    wb.op_if(BLOCK_TYPE_VOID);
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_i32_const((s32)params.mem1_mask);
+        wb.op_i32_and();
+        wb.op_i32_const((s32)params.mem1_base);
+        wb.op_i32_add();
+        wb.op_local_set(LOCAL_TMP_FPVAL);       // host base addr
+        wb.op_local_get(LOCAL_TMP_FPVAL);
+        wb.op_i32_load(0);
+        emit_bswap_i32(wb);
+        wb.op_i64_extend_i32_u();
+        wb.op_i64_const(32);
+        wb.op_i64_shl();
+        wb.op_local_get(LOCAL_TMP_FPVAL);
+        wb.op_i32_load(4);
+        emit_bswap_i32(wb);
+        wb.op_i64_extend_i32_u();
+        wb.op_i64_or();
+        wb.op_local_set(ps0_idx);
+    wb.op_else();
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_call(WIMPORT_READ32);
+        wb.op_i64_extend_i32_u();
+        wb.op_i64_const(32);
+        wb.op_i64_shl();
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_i32_const(4);
+        wb.op_i32_add();
+        wb.op_call(WIMPORT_READ32);
+        wb.op_i64_extend_i32_u();
+        wb.op_i64_or();
+        wb.op_local_set(ps0_idx);
+    wb.op_end();
+}
+
+// [perf] Fastmem-guarded f64 STORE (8 bytes BE) from the rs ps0 i64 lane.
+// Fast arm: two bswap + i32.store (offsets 0/4); slow arm: two WIMPORT_WRITE32.
+static void emit_fastmem_stfd_body(WasmModuleBuilder& wb, LoadStoreParams params,
+                                   u32 rs_ps0_idx) {
+    emit_fastmem_guard(wb, params, 8);
+    wb.op_if(BLOCK_TYPE_VOID);
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_i32_const((s32)params.mem1_mask);
+        wb.op_i32_and();
+        wb.op_i32_const((s32)params.mem1_base);
+        wb.op_i32_add();
+        wb.op_local_set(LOCAL_TMP_FPVAL);       // host base addr
+        wb.op_local_get(LOCAL_TMP_FPVAL);       // addr (bytes 0..3)
+        wb.op_local_get(rs_ps0_idx);
+        wb.op_i64_const(32);
+        wb.op_i64_shr_u();
+        wb.op_i32_wrap_i64();
+        emit_bswap_i32(wb);
+        wb.op_i32_store(0);
+        wb.op_local_get(LOCAL_TMP_FPVAL);       // addr+4 (bytes 4..7)
+        wb.op_local_get(rs_ps0_idx);
+        wb.op_i32_wrap_i64();
+        emit_bswap_i32(wb);
+        wb.op_i32_store(4);
+    wb.op_else();
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_local_get(rs_ps0_idx);
+        wb.op_i64_const(32);
+        wb.op_i64_shr_u();
+        wb.op_i32_wrap_i64();
+        wb.op_call(WIMPORT_WRITE32);
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_i32_const(4);
+        wb.op_i32_add();
+        wb.op_local_get(rs_ps0_idx);
+        wb.op_i32_wrap_i64();
+        wb.op_call(WIMPORT_WRITE32);
+    wb.op_end();
+}
+
 // lfsx fT, rA, rB — load f32 at EA, promote to f64, store at ps0(rt) +
 // splat to ps1(rt). Cache-local form: write the promoted f64 (as i64 bits)
 // to both ps0 and ps1 cache locals. No memory traffic for the FPR side;
@@ -590,14 +732,7 @@ void emit_lfsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // round-trip). Land it in BOTH ps0 + ps1 cache locals.
     auto rt_pair = frc.Bind(rt, FPRMode::Write, FPR_LANE_BOTH);
 
-    wb.op_local_get(LOCAL_TMP_EA);
-    wb.op_call(WIMPORT_READ32);
-    wb.op_f32_reinterpret_i32();
-    wb.op_f64_promote_f32();
-    wb.op_i64_reinterpret_f64();
-    // Use local_tee so the i64 stays on the stack for the second local_set.
-    wb.op_local_tee(rt_pair.ps0_idx);
-    wb.op_local_set(rt_pair.ps1_idx);
+    emit_fastmem_lfs_body(wb, params, rt_pair.ps0_idx, rt_pair.ps1_idx);
 }
 
 // emit_convert_to_single — push ConvertToSingle(ps0_bits) as i32.
@@ -701,12 +836,24 @@ void emit_stfsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 
     auto rs_pair = frc.Bind(rs, FPRMode::Read, FPR_LANE_PS0);
 
-    // GPR flush — host WRITE32 may dispatch into MMIO that reads gpr[].
-    rc.Flush(params.ctx_ptr);
+    // [perf] fastmem fast-arm (was unconditional WIMPORT_WRITE32 — every
+    // RAM-resident f32 store crossed wasm->JS). Convert ps0 (f64) to single
+    // bits and park them in LOCAL_TMP_FPVAL BEFORE the guard (the guard +
+    // bswap clobber LOCAL_TMP_VAL). Then guard + flush + if/else exactly like
+    // emit_store_common. WPAR (0xCC008000) and all MMIO are rejected by the
+    // region classifier so GP/MMIO writes still take the slow import arm
+    // (preserving gp_dirty_check / FIFO ordering).
+    emit_convert_to_single(wb, rs_pair.ps0_idx);   // single bits -> stack
+    wb.op_local_set(LOCAL_TMP_FPVAL);
 
-    wb.op_local_get(LOCAL_TMP_EA);
-    emit_convert_to_single(wb, rs_pair.ps0_idx);
-    wb.op_call(WIMPORT_WRITE32);
+    emit_fastmem_guard(wb, params, 4);
+    rc.Flush(params.ctx_ptr);   // host WRITE32 (slow arm) may read gpr[]
+    frc.Flush(params.ctx_ptr);
+    wb.op_if(BLOCK_TYPE_VOID);
+    emit_fastmem_store(wb, params, StoreWidth::U32, LOCAL_TMP_FPVAL);
+    wb.op_else();
+    emit_slowmem_store(wb, StoreWidth::U32, LOCAL_TMP_FPVAL);
+    wb.op_end();
 }
 
 // stfs  fS, d(rA) — D-form single store, PEM ConvertToSingle semantics.
@@ -725,12 +872,20 @@ void emit_stfs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 
     auto rs_pair = frc.Bind(rs, FPRMode::Read, FPR_LANE_PS0);
 
-    // GPR flush — host WRITE32 may dispatch into MMIO that reads gpr[].
-    rc.Flush(params.ctx_ptr);
+    // [perf] fastmem fast-arm — see emit_stfsx. stfs is the highest-frequency
+    // FP store the guest makes; this removes the per-store wasm->JS crossing
+    // for RAM-resident f32s (matrix/vertex data), MMIO still slow-pathed.
+    emit_convert_to_single(wb, rs_pair.ps0_idx);   // single bits -> stack
+    wb.op_local_set(LOCAL_TMP_FPVAL);
 
-    wb.op_local_get(LOCAL_TMP_EA);
-    emit_convert_to_single(wb, rs_pair.ps0_idx);
-    wb.op_call(WIMPORT_WRITE32);
+    emit_fastmem_guard(wb, params, 4);
+    rc.Flush(params.ctx_ptr);   // host WRITE32 (slow arm) may read gpr[]
+    frc.Flush(params.ctx_ptr);
+    wb.op_if(BLOCK_TYPE_VOID);
+    emit_fastmem_store(wb, params, StoreWidth::U32, LOCAL_TMP_FPVAL);
+    wb.op_else();
+    emit_slowmem_store(wb, StoreWidth::U32, LOCAL_TMP_FPVAL);
+    wb.op_end();
 
     if (update && ra != 0) {
         auto rc_ra = rc.Bind(ra, RCMode::Write);
@@ -766,23 +921,7 @@ void emit_lfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // preserved per scalar-FP semantics, unlike lfsx/lfs which DO splat).
     auto rt_pair = frc.Bind(rt, FPRMode::Write, FPR_LANE_PS0);
 
-    // high u32 = read32(EA) <<i64 32
-    wb.op_local_get(LOCAL_TMP_EA);
-    wb.op_call(WIMPORT_READ32);
-    wb.op_i64_extend_i32_u();
-    wb.op_i64_const(32);
-    wb.op_i64_shl();
-
-    // low u32 = read32(EA + 4)
-    wb.op_local_get(LOCAL_TMP_EA);
-    wb.op_i32_const(4);
-    wb.op_i32_add();
-    wb.op_call(WIMPORT_READ32);
-    wb.op_i64_extend_i32_u();
-
-    // Combine + store into ps0 cache local (i64 — preserves bit pattern).
-    wb.op_i64_or();
-    wb.op_local_set(rt_pair.ps0_idx);
+    emit_fastmem_lfd_body(wb, params, rt_pair.ps0_idx);
 
     if (update && ra != 0) {
         auto rc_ra = rc.Bind(ra, RCMode::Write);
@@ -820,24 +959,10 @@ void emit_stfd(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // (we're reading from the local, not memory).
     auto rs_pair = frc.Bind(rs, FPRMode::Read, FPR_LANE_PS0);
 
-    // GPR flush — host WRITE32 may dispatch into MMIO that reads gpr[].
+    // GPR flush — host WRITE32 (slow arm) may dispatch into MMIO that reads gpr[].
     rc.Flush(params.ctx_ptr);
 
-    // write32(EA, wrap(rs_local >> 32))  — guest BYTES 0..3 (high i64 bits).
-    wb.op_local_get(LOCAL_TMP_EA);
-    wb.op_local_get(rs_pair.ps0_idx);
-    wb.op_i64_const(32);
-    wb.op_i64_shr_u();
-    wb.op_i32_wrap_i64();
-    wb.op_call(WIMPORT_WRITE32);
-
-    // write32(EA + 4, wrap(rs_local))    — guest BYTES 4..7 (low i64 bits).
-    wb.op_local_get(LOCAL_TMP_EA);
-    wb.op_i32_const(4);
-    wb.op_i32_add();
-    wb.op_local_get(rs_pair.ps0_idx);
-    wb.op_i32_wrap_i64();
-    wb.op_call(WIMPORT_WRITE32);
+    emit_fastmem_stfd_body(wb, params, rs_pair.ps0_idx);
 
     if (update && ra != 0) {
         auto rc_ra = rc.Bind(ra, RCMode::Write);
@@ -1026,23 +1151,61 @@ void emit_psq_l(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     wb.op_i32_eqz();
     wb.op_if(BLOCK_TYPE_VOID);
     {
-        // FLOAT: raw f32 patterns, no scale (ILSP:233-246)
-        wb.op_local_get(LOCAL_TMP_EA);
-        wb.op_call(WIMPORT_READ32);
-        wb.op_local_set(LOCAL_PSQ_T0);
-        emit_psq_convert_to_double(wb);
-        wb.op_local_set(rt_pair.ps0_idx);
+        // FLOAT: raw f32 patterns, no scale (ILSP:233-246).
+        // [perf] fastmem-guarded — RAM f32 reads skip the dolphin_read32
+        // wasm->JS crossing; MMIO/WGPIPE rejected by the region classifier ->
+        // slow import arm. Loaded u32 lands in LOCAL_PSQ_T0 (the value scratch
+        // emit_psq_convert_to_double reads); the pair fast arm parks the host
+        // base in LOCAL_PSQ_T1 (free in the FLOAT path) and i32.load's at +0/+4.
         if (W) {
+            emit_fastmem_guard(wb, params, 4);
+            wb.op_if(BLOCK_TYPE_VOID);
+                emit_fastmem_load_value(wb, params, LoadWidth::U32);
+                wb.op_local_set(LOCAL_PSQ_T0);
+            wb.op_else();
+                wb.op_local_get(LOCAL_TMP_EA);
+                wb.op_call(WIMPORT_READ32);
+                wb.op_local_set(LOCAL_PSQ_T0);
+            wb.op_end();
+            emit_psq_convert_to_double(wb);
+            wb.op_local_set(rt_pair.ps0_idx);
             wb.op_i64_const(0x3FF0000000000000ll);  // ps1 = 1.0 (ILSP:238)
             wb.op_local_set(rt_pair.ps1_idx);
         } else {
-            wb.op_local_get(LOCAL_TMP_EA);
-            wb.op_i32_const(4);
-            wb.op_i32_add();
-            wb.op_call(WIMPORT_READ32);
-            wb.op_local_set(LOCAL_PSQ_T0);
-            emit_psq_convert_to_double(wb);
-            wb.op_local_set(rt_pair.ps1_idx);
+            emit_fastmem_guard(wb, params, 8);
+            wb.op_if(BLOCK_TYPE_VOID);
+                wb.op_local_get(LOCAL_TMP_EA);
+                wb.op_i32_const((s32)params.mem1_mask);
+                wb.op_i32_and();
+                wb.op_i32_const((s32)params.mem1_base);
+                wb.op_i32_add();
+                wb.op_local_set(LOCAL_PSQ_T1);          // host base addr
+                wb.op_local_get(LOCAL_PSQ_T1);
+                wb.op_i32_load(0);
+                emit_bswap_i32(wb);
+                wb.op_local_set(LOCAL_PSQ_T0);
+                emit_psq_convert_to_double(wb);
+                wb.op_local_set(rt_pair.ps0_idx);
+                wb.op_local_get(LOCAL_PSQ_T1);
+                wb.op_i32_load(4);
+                emit_bswap_i32(wb);
+                wb.op_local_set(LOCAL_PSQ_T0);
+                emit_psq_convert_to_double(wb);
+                wb.op_local_set(rt_pair.ps1_idx);
+            wb.op_else();
+                wb.op_local_get(LOCAL_TMP_EA);
+                wb.op_call(WIMPORT_READ32);
+                wb.op_local_set(LOCAL_PSQ_T0);
+                emit_psq_convert_to_double(wb);
+                wb.op_local_set(rt_pair.ps0_idx);
+                wb.op_local_get(LOCAL_TMP_EA);
+                wb.op_i32_const(4);
+                wb.op_i32_add();
+                wb.op_call(WIMPORT_READ32);
+                wb.op_local_set(LOCAL_PSQ_T0);
+                emit_psq_convert_to_double(wb);
+                wb.op_local_set(rt_pair.ps1_idx);
+            wb.op_end();
         }
     }
     wb.op_else();
@@ -1206,16 +1369,55 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     wb.op_i32_eqz();
     wb.op_if(BLOCK_TYPE_VOID);
     {
-        // FLOAT: ConvertToSingleFTZ per lane, no scale (ILSP:156-168)
-        wb.op_local_get(LOCAL_TMP_EA);
-        emit_convert_to_single_ftz(wb, rs_pair.ps0_idx);
-        wb.op_call(WIMPORT_WRITE32);
-        if (!W) {
-            wb.op_local_get(LOCAL_TMP_EA);
-            wb.op_i32_const(4);
-            wb.op_i32_add();
-            emit_convert_to_single_ftz(wb, rs_pair.ps1_idx);
-            wb.op_call(WIMPORT_WRITE32);
+        // FLOAT: ConvertToSingleFTZ per lane, no scale (ILSP:156-168).
+        // [perf] fastmem-guarded — RAM f32 stores skip the dolphin_write32
+        // crossing. WGPIPE (0xCC008000) + MMIO are rejected by the region
+        // classifier -> slow import arm, so gp_dirty_check / FIFO ordering is
+        // preserved for direct GX vertex submission. The fast arm parks the
+        // host base in LOCAL_PSQ_T1 and bswap+i32.store's at +0/+4.
+        if (W) {
+            emit_fastmem_guard(wb, params, 4);
+            wb.op_if(BLOCK_TYPE_VOID);
+                wb.op_local_get(LOCAL_TMP_EA);
+                wb.op_i32_const((s32)params.mem1_mask);
+                wb.op_i32_and();
+                wb.op_i32_const((s32)params.mem1_base);
+                wb.op_i32_add();
+                emit_convert_to_single_ftz(wb, rs_pair.ps0_idx);
+                emit_bswap_i32(wb);
+                wb.op_i32_store(0);
+            wb.op_else();
+                wb.op_local_get(LOCAL_TMP_EA);
+                emit_convert_to_single_ftz(wb, rs_pair.ps0_idx);
+                wb.op_call(WIMPORT_WRITE32);
+            wb.op_end();
+        } else {
+            emit_fastmem_guard(wb, params, 8);
+            wb.op_if(BLOCK_TYPE_VOID);
+                wb.op_local_get(LOCAL_TMP_EA);
+                wb.op_i32_const((s32)params.mem1_mask);
+                wb.op_i32_and();
+                wb.op_i32_const((s32)params.mem1_base);
+                wb.op_i32_add();
+                wb.op_local_set(LOCAL_PSQ_T1);          // host base addr
+                wb.op_local_get(LOCAL_PSQ_T1);
+                emit_convert_to_single_ftz(wb, rs_pair.ps0_idx);
+                emit_bswap_i32(wb);
+                wb.op_i32_store(0);
+                wb.op_local_get(LOCAL_PSQ_T1);
+                emit_convert_to_single_ftz(wb, rs_pair.ps1_idx);
+                emit_bswap_i32(wb);
+                wb.op_i32_store(4);
+            wb.op_else();
+                wb.op_local_get(LOCAL_TMP_EA);
+                emit_convert_to_single_ftz(wb, rs_pair.ps0_idx);
+                wb.op_call(WIMPORT_WRITE32);
+                wb.op_local_get(LOCAL_TMP_EA);
+                wb.op_i32_const(4);
+                wb.op_i32_add();
+                emit_convert_to_single_ftz(wb, rs_pair.ps1_idx);
+                wb.op_call(WIMPORT_WRITE32);
+            wb.op_end();
         }
     }
     wb.op_else();
@@ -1354,15 +1556,7 @@ void emit_lfs(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 
     auto rt_pair = frc.Bind(rt, FPRMode::Write, FPR_LANE_BOTH);
 
-    wb.op_local_get(LOCAL_TMP_EA);
-    wb.op_call(WIMPORT_READ32);
-    wb.op_f32_reinterpret_i32();
-    wb.op_f64_promote_f32();
-    wb.op_i64_reinterpret_f64();
-    // Splat to both ps0 + ps1 cache locals — paired-singles ops that read
-    // ps1 see fresh value. Use local_tee to keep the i64 on the stack.
-    wb.op_local_tee(rt_pair.ps0_idx);
-    wb.op_local_set(rt_pair.ps1_idx);
+    emit_fastmem_lfs_body(wb, params, rt_pair.ps0_idx, rt_pair.ps1_idx);
 
     if (update && ra != 0) {
         auto rc_ra = rc.Bind(ra, RCMode::Write);

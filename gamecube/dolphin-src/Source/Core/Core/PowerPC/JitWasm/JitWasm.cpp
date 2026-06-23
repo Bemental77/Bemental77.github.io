@@ -207,7 +207,7 @@ void JitWasm::Run()
     // block-per-slice cadence on unrelated code. Bug found by branch-
     // emit audit 2026-06-07; was previously declared `static` causing
     // process-lifetime contamination of the heuristic.
-    u32 last_next[4] = {0, 0, 0, 0};
+    u32 last_next[16] = {0};  // [xinst-fix] 16-deep for scheduler-length idle cycles
     u32 ring_streak = 0;
     u32 last_idx = 0;
 
@@ -221,6 +221,65 @@ void JitWasm::Run()
         if (*state_ptr != CPU::State::Running)
           return;
         // Fall through; pc may now be at a vector (0x400/0x500/etc).
+      }
+
+      // HOT-REGION DISPATCH (step 4, 2026-06-17): if the current pc is in the
+      // hot merged region, run it in-wasm via the merged br_table function (no
+      // per-block JS Map.get + cross-instance run() round-trip) until it
+      // branches out of the region OR the slice budget expires. The merged fn
+      // charges downcount per internal block and bails at downcount<=0 (R2
+      // fix), so we honor the same downcount + exception disciplines as the
+      // chain loop. A miss (pc not promoted/hot) returns false -> fall straight
+      // through to chain_dispatch below (which advances ppc_state.pc itself).
+      {
+        const u32 region_exc0 = ppc_state.Exceptions;
+        // [xinst-fix] Multi-PC idle-skip streak ring — mirrors the chain path's
+        // ring (below, ~340-360). Without it, a multi-PC poll cycle (e.g. MP4's
+        // VIWaitForRetrace spin at 0x800ba2f0, whose store-bearing outer block is
+        // sealed into the region) never returns its own entry pc, so the
+        // self-cycle break never fires, the region loop burns the ENTIRE slice,
+        // core_timing.Advance() is starved, and the awaited VI/retrace interrupt
+        // is never delivered -> permanent spin. This is why promotion regressed
+        // games to a stall. Force downcount=0 on an 8-deep <=4-PC cycle so the
+        // outer Advance runs and the IRQ fires, identical to the chain path.
+        // [xinst-fix] 16-deep ring — the OS thread-scheduler / idle cluster is a
+        // ~9-PC cycle (MP4 0x800e56a8..0x800e5794), which a 4-deep ring can NEVER
+        // match 8x, so it was never idle-skipped and burned full slices at
+        // ~2.5M ticks/s. 16 deep recognizes scheduler-length cycles -> forces an
+        // early Advance -> CoreTiming ticks the scheduler timers -> the blocked
+        // thread wakes and the guest leaves the cluster.
+        u32 r_last[16] = {0};
+        u32 r_streak = 0;
+        u32 r_idx = 0;
+        while (ppc_state.downcount > 0 && ppc_state.Exceptions == region_exc0)
+        {
+          const u32 region_cur = ppc_state.pc;
+          s32 rnext = 0;
+          if (!m_wasm_cache.region_dispatch(region_cur, &rnext))
+            break;
+          ppc_state.pc  = static_cast<u32>(rnext);
+          ppc_state.npc = static_cast<u32>(rnext);
+          // A direct self-cycle (region dispatch returns its own entry pc) is an
+          // idle poll or a CTR self-loop — hand it to chain_dispatch.
+          if (static_cast<u32>(rnext) == region_cur)
+            break;
+          // <=16-PC cycle streak: force a CoreTiming slice end so Advance runs.
+          {
+            const u32 np = static_cast<u32>(rnext);
+            bool m = false;
+            for (u32 j = 0; j < 16u; ++j) { if (np == r_last[j]) { m = true; break; } }
+            if (m)
+            {
+              if (++r_streak >= 8) { ppc_state.downcount = 0; break; }
+            }
+            else
+            {
+              r_streak = 0;
+            }
+            r_last[r_idx & 15] = np;
+            ++r_idx;
+          }
+        }
       }
 
       const u32 pc = ppc_state.pc;
@@ -242,6 +301,18 @@ void JitWasm::Run()
       const s32 chained = m_wasm_cache.chain_dispatch(
           pc, /*max_iters=*/4096u, &final_pc, &trap_pc,
           &ppc_state.Exceptions, reinterpret_cast<const s32*>(&ppc_state.downcount));
+      // [ax-memset] DECISIVE: at the frozen SAB memset block, is it running
+      // (chained>0) or never executing (chained==0 -> compile path)? does r3
+      // advance? Isolates ALT-1 (throttled) vs ALT-2 (never dispatched).
+      if (pc == 0x800053c0u)
+      {
+        static u64 s_mv = 0;
+        if ((++s_mv & 0x3FFFu) == 0)
+          NOTICE_LOG_FMT(POWERPC,
+            "[ax-memset] visit={} chained={} final_pc={:#x} r3={:#x} downcount={} streak={}",
+            s_mv, chained, final_pc, ppc_state.gpr[3],
+            static_cast<s32>(ppc_state.downcount), ring_streak);
+      }
 
       if (trap_pc != 0u)
       {
@@ -282,8 +353,12 @@ void JitWasm::Run()
         // if `next_pc` matches any → we just closed a ≤4-PC cycle → idle.
         {
           const u32 np = static_cast<u32>(next_pc);
-          const bool ring_match = (np == pc || np == last_next[0] || np == last_next[1] ||
-                                   np == last_next[2] || np == last_next[3]);
+          // [xinst-fix] 16-deep (was 4): the OS scheduler/idle cluster is a ~9-PC
+          // cycle that a 4-deep ring can never match 8x — so it never idle-skips
+          // and crawls at ~2.5M ticks/s. 16 recognizes scheduler-length cycles.
+          bool ring_match = (np == pc);
+          if (!ring_match)
+            for (u32 j = 0; j < 16u; ++j) { if (np == last_next[j]) { ring_match = true; break; } }
           // STREAK GATE (2026-06-11, v2 of the wake-starvation fix): a real
           // idle spin (mftb TBU-retry, 0x800e4c5c 3-PC poll) matches the
           // ring thousands of consecutive iterations; a woken thread's
@@ -305,7 +380,7 @@ void JitWasm::Run()
           {
             ring_streak = 0;
           }
-          last_next[last_idx & 3] = np;
+          last_next[last_idx & 15] = np;
           ++last_idx;
         }
 
@@ -317,8 +392,20 @@ void JitWasm::Run()
       // Cache miss. Try to compile a block at this PC.
       if (TryCompileBlock(pc, ctx_ptr, mem1_base, mem1_mask, ram_size))
       {
+        if (pc == 0x800053c0u)
+        {
+          static u64 s_mc = 0;
+          if ((++s_mc & 0x3FFFu) == 0)
+            NOTICE_LOG_FMT(POWERPC, "[ax-memset] TryCompileBlock OK (chained=0 then recompile) n={}", s_mc);
+        }
         // Compile produced a cached entry. Loop and retry dispatch.
         continue;
+      }
+      {
+        static u64 s_ci = 0;
+        if (++s_ci <= 12)
+          NOTICE_LOG_FMT(POWERPC, "[ax-handoff] JitWasm -> CachedInterpreter at pc={:#x} (compile FAILED) n={}",
+                         pc, s_ci);
       }
 
       // Compile failed (decode hit unsupported stream, build_block_next
@@ -353,7 +440,13 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
     // arrangements it'd stay correctness-preserving.
     const u32 inst = mem.Read_U32(pc);
     insts.push_back(inst);
-    if (IsBlockTerminator(inst))
+    // [coalesce] Keep decoding past a FORWARD conditional branch (emitted as a
+    // mid-block conditional exit; the not-taken fall-through stays in this
+    // block). MUST use the same predicate as PPCAnalyzer::Analyze so the
+    // decoded count matches the analyst length. Backward/self conditionals and
+    // all unconditional terminators still end the block.
+    if (IsBlockTerminator(inst) &&
+        !bemental::powerpc::IsForwardConditionalBranch(inst, pc))
       break;
     pc += 4u;
   }
@@ -387,6 +480,33 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
   m_block_inst_counts[start_pc] = block_cycles ? block_cycles : count;
   // Guest span for icbi range-eviction (InvalidateICacheRange).
   m_block_guest_end[start_pc] = start_pc + count * 4u;
+
+  // STEP 2 (region wiring, side-channel — NO dispatch change yet): accumulate
+  // this block's bare BODY (no module wrapper) into its region so a later
+  // region_relink can merge contiguous blocks into ONE wasm function with
+  // internal br_table dispatch, eliminating the per-block JS Map.get +
+  // cross-instance run() round-trip. First-emit intra-region branches are
+  // unresolved (lookup_fn=null); region_relink re-emits each stored body with
+  // the up-to-date pc_to_idx map. region_dispatch is NOT called here, so this
+  // is pure side-channel: steady-state fps/cycles must stay at the baseline.
+  {
+    // Hot-only merge (step 2, revised): stash this block's emit inputs only
+    // (NO body emitted at compile, NO accumulate-all). promote_hot re-emits +
+    // merges it into the hot region once it has been dispatched enough times,
+    // so the merged region stays small (the hot loop), not all ~8900 blocks.
+    bemental::BlockEmitInputs rec;
+    rec.start_pc      = start_pc;
+    rec.ctx_ptr_const = ctx_ptr;
+    rec.mem1_base     = mem1_base;
+    rec.mem1_mask     = mem1_mask;
+    rec.ram_size      = ram_size;
+    rec.block_cycles  = block_cycles ? block_cycles : count;
+    rec.insts         = insts;
+    rec.instr_pcs.resize(count);
+    for (u32 i = 0; i < count; ++i)
+      rec.instr_pcs[i] = start_pc + i * 4u;
+    m_wasm_cache.stash_block(start_pc, rec);
+  }
   return true;
 }
 

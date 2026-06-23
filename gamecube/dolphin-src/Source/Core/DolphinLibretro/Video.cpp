@@ -117,13 +117,14 @@ void Init()
   }
   hw_render.context_type = RETRO_HW_CONTEXT_NONE;
 #ifdef __EMSCRIPTEN__
-  // wasm worker: no hw context is ever serviceable (nothing answers
-  // SET_HW_RENDER), and the "Software" option value is _DEBUG-gated out of
-  // Options.cpp — so the desktop fallback below always picked "Null",
-  // clobbering EmscriptenWorker main()'s SetBase("Software Renderer") and
-  // leaving a backend that rasterizes nothing and presents headless
-  // (2026-06-11: "[ax-vbi] ActivateBackend name='Null'", video_cb=0).
-  // The SW renderer presents via libretro's video_cb — it IS the wasm path.
+  // [HW-render 2026-06-17] The worker (EmscriptenWorker.cpp) now ANSWERS
+  // SET_HW_RENDER and creates a WebGL2 context on the OffscreenCanvas, so try
+  // Dolphin's OGL backend (GLES3 ≈ WebGL2) FIRST — it rasterizes on the GPU
+  // instead of the CPU-thread Software Renderer (the measured ~90%-infrastructure
+  // bottleneck). Only if the handshake fails do we fall back to SW, which
+  // presents via libretro's video_cb.
+  if (SetHWRender(RETRO_HW_CONTEXT_OPENGLES3))
+    return;
   Config::SetBase(Config::MAIN_GFX_BACKEND, "Software Renderer");
 #else
   if (renderer == "Software")

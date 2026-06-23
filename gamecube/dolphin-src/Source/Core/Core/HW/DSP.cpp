@@ -401,14 +401,6 @@ void DSPManager::GenerateDSPInterrupt(u64 DSPIntType, s64 cyclesLate)
 {
   // [ax-dspint] TRUE raise-site census (the [ei-trace] diag below at
   // GlobalGenerateDSPInterrupt only sees the CoreTiming event path).
-  {
-    static u64 axdi_n[3] = {0, 0, 0};
-    const int idx = (DSPIntType & 0x80) ? 0 : ((DSPIntType & 0x20) ? 1 : 2);
-    const u64 n = ++axdi_n[idx];
-    if (n <= 4 || (n & 0xFF) == 0)
-      NOTICE_LOG_FMT(POWERPC, "[ax-dspint] type={:#x} n={} ctl={:#x} pc={:#x}", DSPIntType, n,
-                     m_dsp_control.Hex, m_system.GetPPCState().pc);
-  }
   // The INT_* enumeration members have values that reflect their bit positions in
   // DSP_CONTROL - we mask by (INT_DSP | INT_ARAM | INT_AID) just to ensure people
   // don't call this with bogus values.

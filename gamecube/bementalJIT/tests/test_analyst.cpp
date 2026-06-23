@@ -199,10 +199,49 @@ static void case_c_sda_relative_loadstore() {
            buffer[2].gprInUse.m_val == 0u);
 }
 
+// ---------------------------------------------------------------------------
+// Case (d) — forward conditional branch COALESCING: cmpwi crf0,r3,0;
+// bne +2 (forward, skips the addi); addi r4,r3,1; blr. The analyst must KEEP
+// DECODING past the forward bne (it becomes a mid-block conditional exit), so
+// the block is 4 instructions — NOT truncated at the bne like case-b's backward
+// self-loop. IsForwardConditionalBranch distinguishes the two.
+// ---------------------------------------------------------------------------
+static void case_d_forward_branch_coalesce() {
+    const std::uint32_t fwd_bne = enc_bne_self(2);   // bne +8 bytes (forward)
+    const std::uint32_t back_bne = enc_bne_self(-1);  // bne -4 bytes (backward)
+    const std::uint32_t insts[] = {
+        enc_cmpwi(0, 3, 0),     // 0: cmpwi crf0, r3, 0
+        fwd_bne,                // 1: bne +2 (forward — coalesced, NOT terminal)
+        enc_addi(4, 3, 1),      // 2: addi r4, r3, 1 (the not-taken fall-through)
+        enc_bclr(),             // 3: blr — true block terminator
+    };
+    Fixture fx{0x80020000, insts, 4};
+    CodeBlock block;
+    BlockStats stats;
+    block.m_stats = &stats;
+    CodeBuffer buffer;
+    PPCAnalyzer pa;
+    pa.Analyze(fx.base_pc, &block, &buffer, 32, fetch_from_fixture, &fx);
+
+    report("case-d: 4 instructions decoded (forward bne did NOT end the block)",
+           block.m_num_instructions == 4);
+    report("case-d: bne — canEndBlock=true (still a branch terminator op)",
+           buffer[1].canEndBlock);
+    report("case-d: bne — branchIsIdleLoop=false (forward, not a self-loop)",
+           !buffer[1].branchIsIdleLoop);
+    report("case-d: blr — canEndBlock=true (the real terminator)",
+           buffer[3].canEndBlock);
+    report("case-d: IsForwardConditionalBranch(fwd bne)==true",
+           IsForwardConditionalBranch(fwd_bne, fx.base_pc + 4));
+    report("case-d: IsForwardConditionalBranch(backward bne)==false",
+           !IsForwardConditionalBranch(back_bne, fx.base_pc + 4));
+}
+
 int main() {
     case_a_basic_reg_flow();
     case_b_idle_loop_minimal();
     case_c_sda_relative_loadstore();
+    case_d_forward_branch_coalesce();
     std::printf("\n%d passed, %d failed\n", g_pass, g_fail);
 #ifdef __EMSCRIPTEN__
     EM_ASM({

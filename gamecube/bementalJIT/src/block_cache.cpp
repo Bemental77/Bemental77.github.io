@@ -3,11 +3,107 @@
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <unordered_map>
 #include <vector>
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #endif
+
+// ---- in-WASM block chaining dispatch cache ------------------------------
+// Direct-mapped guest-PC -> wasmTable-slot cache, probed ENTIRELY in WASM by
+// each per-block module's epilogue (see ppc_emit.cpp emit_chain_or_return).
+// When a block's successor PC resolves here AND no service point is pending
+// (downcount>0, Exceptions unchanged), the block return_call_indirect's the
+// successor's exported run() directly — no JS dispatch round-trip. A tag
+// mismatch (empty bucket or collision) falls back to the JS chain_dispatch_raw
+// loop, which is always correct. bucket = (pc>>2) & BEM_DISP_MASK.
+//
+// Stale entries are SAFE: slots are released (never wrong-block reused —
+// _bemental_next_idx is monotonic), so a tail-call to a released slot traps
+// and is caught by the JS try/catch around the chain head; register_pc_handle
+// overwrites the bucket on recompile (self-heal). clear() invalidates en masse
+// to avoid post-clear trap-churn. Tags init to 0xFFFFFFFF so no real guest PC
+// (always 0x8xxxxxxx) and no zero-PC matches an unpopulated bucket.
+extern "C" {
+// [dispatch-cache 2026-06-21] 18 bits = 262144 buckets. At 16 bits PSO's ~4MB
+// code range 16-way-aliased into the cache, so hot blocks evicted each other and
+// every eviction turned an in-WASM tail-chain into a bem_chain_loop_c return
+// (profiled at 22% of worker_0 — the #1 CPU cost, vs ~4.6% in block bodies).
+// MUST stay in sync with ppc_emit.cpp BEM_DISP_MASK_NEXT.
+#define BEM_DISP_BITS    18u
+#define BEM_DISP_BUCKETS (1u << BEM_DISP_BITS)
+#define BEM_DISP_MASK    (BEM_DISP_BUCKETS - 1u)
+uint32_t      g_bem_disp_tag[BEM_DISP_BUCKETS];   // guest PC, 0xFFFFFFFF = empty
+int32_t       g_bem_disp_slot[BEM_DISP_BUCKETS];  // wasmTable index (== handle)
+// [region] Region-local direct-mapped cache: same bucket scheme, but the slot
+// is the region module's INTERNAL funcref-table index (0..N-1), not the global
+// wasmTable handle. The region body epilogue (emit_chain_or_return with the
+// override) probes this -> return_call_indirect on the region module's INTERNAL
+// table 0 (V8-inlined intra-region). A miss -> host return (per-block path).
+// Single active region for now (the seal path repopulates on each gen build).
+uint32_t      g_bem_rtag[BEM_DISP_BUCKETS];       // guest PC, 0xFFFFFFFF = empty
+int32_t       g_bem_rslot[BEM_DISP_BUCKETS];      // region internal-table slot
+uint32_t      g_bem_chain_exc0    = 0u;           // Exceptions at chain entry
+unsigned char g_bem_chain_enabled = 1;            // master A/B toggle (gate #8)
+// [perf gather-gate] Defined HERE (bementalJIT, linked by both the main dolphin
+// build AND the test targets) rather than in the bridge, so ppc_emit.cpp's
+// epilogue gate resolves it in the test build too. The bridge (dolphin_jit_
+// wimports.cpp) externs it and owns the set (dolphin_write*/interp) + clear
+// (dolphin_gather_drain). Set => a write-gather-pipe store is pending.
+int g_bem_gp_dirty = 0;
+// Phase A: per-block execution counter + promote ring, written by the BLOCK
+// PROLOGUE in-WASM (so it counts tail-chained executions the C dispatch loop
+// never sees — the chain-head promotion was net-negative). On the
+// HOT_THRESHOLD crossing the block pushes its start_pc here; BlockCache::
+// chain_dispatch drains g_bem_promote_ring -> promote_hot -> region build,
+// moving the actual hot path to intra-module dispatch. bucket=(pc>>2)&mask.
+uint32_t      g_bem_pc_exec[BEM_DISP_BUCKETS];    // per-pc execution count
+uint32_t      g_bem_promote_ring[256];            // prologue-pushed hot pcs
+uint32_t      g_bem_promote_n = 0u;               // count in the ring
+// [region-debug TEMP gate#8] region_dispatch outcome counters.
+uint32_t      g_rd_calls = 0u, g_rd_nohandle = 0u, g_rd_noregion = 0u, g_rd_miss = 0u, g_rd_hit = 0u;
+uint32_t      g_rd_nogen = 0u;   // [region-debug] sealed dispatch: no gens sealed yet OR gen slot missing
+// Phase A: DEFAULT OFF. The prologue counter correctly captures the hot path
+// (n_funcs 42->650) but the existing region path is net-negative as-is: it
+// (a) doesn't dispatch (region_dispatch=0% — routing/build bug) and (b)
+// cold-relinks per generation (ticks 7.14B->3.45B). Re-enable only with the
+// dispatch fix + region SEAL (no relink-on-growth). Toggle for continued work.
+// [sealed-multi-gen 2026-06-21] OFF: the seal is implemented + verified correct
+// (6 gens, 0 traps, dedup/cap/teardown all work) and removes the cold-relink,
+// but MEASURED net-negative — region hit% stays ~5% (coverage wall: ~570 of a
+// far-larger working set promoted -> 94% miss), and dispatching a 5%-hit region
+// FIRST (JitWasm.cpp:240) pays a wasted EM_ASM membrane crossing per miss. The
+// binding constraint is promotion COVERAGE, not the cold-relink the seal fixed.
+// Gate off to preserve the verified baseline; flip to 1 to resume coverage work.
+unsigned char g_bem_promote_enabled = 0;  // [region] gated OFF (Phase 1 net-negative: seal cost + coverage; needs in-wasm entry + coverage routing)
+// [xinst-fix] Runtime gate for the EXPENSIVE promote drain (re-emit + seal).
+// Held OFF through boot's heavy block-discovery (where re-emit overhead stalls
+// progress to a running state) and flipped ON by the dolphin-side drain once
+// guest ticks pass a boot threshold — so the shared-instance region populates
+// during steady-state running, where the cross-instance trampoline cost lives.
+unsigned char g_bem_promote_active = 0;
+}
+static const int _bem_disp_cache_init = []() {
+    for (unsigned i = 0; i < BEM_DISP_BUCKETS; ++i) {
+        g_bem_disp_tag[i]  = 0xFFFFFFFFu;
+        g_bem_disp_slot[i] = -1;
+        g_bem_rtag[i]      = 0xFFFFFFFFu;
+        g_bem_rslot[i]     = -1;
+    }
+    return 0;
+}();
+
+// ---- C-side in-WASM dispatch (membrane fix) -----------------------------
+// EXACT guest-PC -> wasmTable-slot resolver (and its reverse for O(1) erase on
+// eviction). The direct-mapped g_bem_disp_* cache above is lossy (collisions
+// bail to the host) — safe for the in-WASM tail-chain miss path, but a C
+// dispatch LOOP must resolve exactly or colliding hot blocks would thrash
+// through TryCompileBlock. Populated by register_pc_handle, erased by
+// release_raw, cleared by BlockCache::clear.
+static std::unordered_map<uint32_t, int> g_bem_pc_handle;   // pc  -> handle(slot)
+static std::unordered_map<int, uint32_t> g_bem_handle_pc;   // handle -> pc
+unsigned char g_bem_cdispatch_enabled = 1;  // C-loop vs legacy JS loop (A/B / fallback)
 
 namespace bemental {
 
@@ -53,6 +149,7 @@ namespace powerpc {
         // is identical when this translation unit hands a BlockInputs
         // array to build_region_function.
         bool emit_hle_check_native = false;
+        u32  block_cycles = 0;  // R2 — match gekko_emit.h BlockInputs layout
     };
     std::vector<u8> build_region_function(const BlockInputs* blocks,
                                           u32 n_blocks,
@@ -124,7 +221,7 @@ int compile_raw(const u8* bytes, std::size_t size) {
                     || !Module.bemental_imports.env.ppc_write16)) {
                 if (typeof Module._dolphin_write16 === 'function') {
                     Module.bemental_imports_need_upgrade = true;
-                    console.error('[bemental] bootstrap: pthread-side bemental_imports init');
+                    console.log('[bemental] bootstrap: pthread-side bemental_imports init');
                 }
             }
             if (Module.bemental_imports_need_upgrade) {
@@ -208,7 +305,7 @@ int compile_raw(const u8* bytes, std::size_t size) {
                     const isWasm = (typeof WebAssembly.Function !== 'undefined')
                         ? Module._dolphin_read32 instanceof WebAssembly.Function
                         : true;
-                    console.error('[bemental] direct-binding upgrade complete (raw WASM funcs: ' + isWasm + ')');
+                    console.log('[bemental] direct-binding upgrade complete (raw WASM funcs: ' + isWasm + ')');
                 } catch (e) {
                     console.error('[bemental] direct-binding upgrade failed:', e && e.message);
                 }
@@ -222,6 +319,10 @@ int compile_raw(const u8* bytes, std::size_t size) {
             if (Module.bemental_imports && Module.bemental_imports.env) {
                 Object.assign(env, Module.bemental_imports.env);
             }
+            // In-WASM block chaining: hand each per-block module the host's
+            // shared __indirect_function_table (where every block's run() is
+            // registered) so its epilogue can return_call_indirect a sibling.
+            env.__indirect_function_table = wasmTable;
             const importObj = { env: env };
 
             const inst = new WebAssembly.Instance(mod, importObj);
@@ -251,12 +352,6 @@ int compile_raw(const u8* bytes, std::size_t size) {
             if (!Module.bemental_cache) Module.bemental_cache = {};
             Module.bemental_cache[idx] = inst;
 
-            // Throttle visibility — log every 256th compile.
-            if ((Module._bemental_compile_n |0) % 256 === 0) {
-                console.log('[bemental] compile #' + (Module._bemental_compile_n|0)
-                            + ' table_idx=' + idx
-                            + ' table_size=' + wasmTable.length);
-            }
             Module._bemental_compile_n = ((Module._bemental_compile_n|0) + 1) | 0;
             return idx;
         } catch (e) {
@@ -303,6 +398,38 @@ u64 g_pc_census_total = 0;
 // Chain block-transitions counter (JS-side increment, u32 wrap acceptable
 // for rate reads between drains).
 u32 g_chain_iters = 0;
+
+// Hot-only merge (2026-06-17): per-handle dispatch counter + promotion queue.
+// chain_dispatch_raw bumps g_disp_count[handle] each dispatch and, on the
+// HOT_THRESHOLD crossing, pushes the pc onto g_promote_ring; BlockCache::
+// chain_dispatch drains the ring into promote_hot (re-emit + accumulate into
+// the hot merged region REGION_REL_0). Counts reset on cache clear (handles
+// are reused). The JS literal 2048 in chain_dispatch_raw MUST match this.
+static constexpr u32 HOT_THRESHOLD = 4u;
+u32 g_disp_count[16384] = {0};   // indexed by cache handle (< MAX_CACHE_BLOCKS)
+u32 g_promote_ring[256];
+u32 g_promote_n = 0;
+
+// [return-linking 2026-06-18] BLR return-address cache (RAS) for the merged
+// region. The live gekko merged emit currently op_return()s on every blr/bctr
+// (gekko_emit.cpp:2332-2361) — a host round-trip per function return that costs
+// the measured 30-36x dispatch gap on call-heavy guest code (the PSO boot LZ
+// decompressor: 2 bl/blr pairs per output byte). emit_at_bl pushes
+// (ret_pc=bl_pc+4, ret_slot) when the return block resolves to a region slot;
+// emit_at_blr pops and, on ret_pc==LR within the chain budget, tail-chains
+// in-WASM to ret_slot (set entry_sel + br to the region loop) instead of
+// returning to the host. Power-of-two ring: index = (sp & MASK); a leak from
+// longjmp/exception simply makes a later pop mispredict -> safe op_return
+// fallback. g_blr_chain bounds CONSECUTIVE in-WASM tail-chains so the host-side
+// idle-skip streak detector still observes idle cycles (OSGetTick spins): force
+// op_return every BLR_CHAIN_MAX. Reset: sp at cache-clear + region relink
+// (slots are per-generation); chain at every region entry (host boundary).
+// Plain u32 pairs so the gekko emitter can `extern` them without sharing a
+// struct: entry i = g_blr_ras[2*i] (ret_pc), g_blr_ras[2*i+1] (ret_slot).
+// 256 entries, power-of-two ring (index = sp & 255).
+u32 g_blr_ras[256u * 2u] = {};
+u32 g_blr_ras_sp = 0u;   // free-running; ring slot = sp & 255
+u32 g_blr_chain  = 0u;   // consecutive in-WASM tail-chains since last host entry
 
 s32 dispatch_raw(int handle) {
     g_pc_census_total++;
@@ -365,6 +492,16 @@ s32 dispatch_raw(int handle) {
 }
 
 void release_raw(int handle) {
+    // Exact-resolver erase (membrane-fix C dispatch loop). O(1) via the reverse
+    // map; without this a freed slot stays resolvable and the C loop would
+    // call_indirect a null table entry (trap).
+    {
+        auto rit = g_bem_handle_pc.find(handle);
+        if (rit != g_bem_handle_pc.end()) {
+            g_bem_pc_handle.erase(rit->second);
+            g_bem_handle_pc.erase(rit);
+        }
+    }
 #ifdef __EMSCRIPTEN__
     EM_ASM({
         // Clear the wasmTable slot — subsequent call_indirect on this
@@ -379,11 +516,21 @@ void release_raw(int handle) {
             for (const [k, v] of Module.bemental_pc_to_handle) {
                 if (v === $0) {
                     Module.bemental_pc_to_handle.delete(k);
+                    // Invalidate this PC's in-WASM chaining dispatch-cache bucket
+                    // so no sibling tail-calls the now-null slot (the source of
+                    // the "null function" chain traps). $1=tag base, $2=slot
+                    // base, $3=mask.
+                    const bkt = (k >>> 2) & $3;
+                    if ((HEAP32[($1 >> 2) + bkt] >>> 0) === (k >>> 0)) {
+                        HEAP32[($1 >> 2) + bkt] = -1;  // tag = 0xFFFFFFFF
+                        HEAP32[($2 >> 2) + bkt] = -1;  // slot = -1
+                    }
                     break;
                 }
             }
         }
-    }, handle);
+    }, handle, (int)(uintptr_t)g_bem_disp_tag, (int)(uintptr_t)g_bem_disp_slot,
+       (int)BEM_DISP_MASK);
 #else
     (void)handle;
 #endif
@@ -392,6 +539,15 @@ void release_raw(int handle) {
 void register_pc_handle(u64 pc, int handle) {
     if ((u32)pc == 0x800C1544u) g_recheck_handle = handle;
     if ((u32)pc == 0x800059ECu) g_vwaitset_handle = handle;
+    // Populate the in-WASM chaining dispatch cache (block START pc -> slot).
+    {
+        const u32 bkt = (((u32)pc) >> 2) & BEM_DISP_MASK;
+        g_bem_disp_tag[bkt]  = (u32)pc;
+        g_bem_disp_slot[bkt] = handle;
+    }
+    // Exact resolver for the C dispatch loop (membrane fix).
+    g_bem_pc_handle[(uint32_t)pc] = handle;
+    g_bem_handle_pc[handle]       = (uint32_t)pc;
 #ifdef __EMSCRIPTEN__
     EM_ASM({
         if (!Module.bemental_pc_to_handle) Module.bemental_pc_to_handle = new Map();
@@ -426,9 +582,102 @@ void unregister_pc(u64 pc) {
 // (*downcount_addr <= 0 — blocks self-account cycles in their prologue as
 // of 2026-06-12). Returns chain count; writes final pc + trap pc via
 // pointer args.
+#ifdef __EMSCRIPTEN__
+// ---- Membrane fix: in-WASM C dispatch loop --------------------------------
+// Runs cached blocks back-to-back via C call_indirect (a function-pointer cast
+// of the wasmTable slot == handle — the Andy-Wingo JIT-in-WASM pattern emscripten
+// lowers to call_indirect) instead of one EM_ASM `inst.exports.run()` JS-membrane
+// crossing per block. Block bodies still tail-chain in-WASM (return_call_indirect);
+// this handles chain heads + the cache-miss / exception / downcount bails. The C
+// caller cannot catch WASM traps (a direct fn() unwinds the pthread), so
+// chain_dispatch_raw invokes this through ONE EM_ASM try/catch per chain (not per
+// block). Resolves pc->handle EXACTLY via g_bem_pc_handle — the lossy direct-mapped
+// cache would thrash TryCompileBlock on collisions. Writes *final_pc before each
+// call so the wrapper's catch can recover the trapping PC. Returns blocks run.
+extern "C" EMSCRIPTEN_KEEPALIVE
+s32 bem_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc,
+                     const u32* exc_addr, const s32* dc_addr) {
+    typedef u32 (*BemBlockFnC)(void);
+    *trap_pc = 0;
+    // MSR sits 0xC bytes before Exceptions in PowerPCState (ppc_off MSR=0x2E0,
+    // EXCEPTIONS=0x2EC) — used for the deliverability-based service-point bail
+    // that mirrors emit_chain_or_return (ppc_emit.cpp): only return to the host
+    // when CheckExceptions would actually act. The old `*exc_addr != exc0`
+    // (snapshot-change) bail returned on a MASKED async IRQ (EE=0) that
+    // CheckExternalExceptions cannot deliver — wasted round-trips that, on the
+    // in-WASM tail-chain path, starved SAB's __fill_mem arena clear into a wedge.
+    const u32* msr_addr = exc_addr ? reinterpret_cast<const u32*>(
+        reinterpret_cast<const char*>(exc_addr) - 0xC) : nullptr;
+    s32 count = 0;
+    while ((u32)count < max) {
+        if (exc_addr) {
+            const u32 e  = *exc_addr;
+            const u32 ee = msr_addr ? (*msr_addr & 0x8000u) : 0x8000u;
+            // deliverable = (sync/non-maskable pending) OR (maskable pending AND MSR.EE)
+            if ((e & 0x2FAu) || ((e & 0x105u) && ee)) break;
+        }
+        if (count > 0 && dc_addr && *dc_addr <= 0) break;    // CoreTiming slice budget spent
+        // Resolve pc->handle. Fast path: the O(1) direct-mapped array (no hash).
+        // Slow path (direct-mapped collision only — rare): the exact map.
+        int handle;
+        const u32 bkt = (pc >> 2) & BEM_DISP_MASK;
+        if (g_bem_disp_tag[bkt] == pc) {
+            handle = g_bem_disp_slot[bkt];
+        } else {
+            auto it = g_bem_pc_handle.find(pc);
+            if (it == g_bem_pc_handle.end()) break;          // uncompiled -> host compiles
+            handle = it->second;
+        }
+        g_chain_iters = g_chain_iters + 1u;
+        if (g_pc_census_n < 256) g_pc_census_ring[g_pc_census_n++] = (int)pc;
+        // Phase A NOTE: chain-head promotion here was net-negative — the in-WASM
+        // tail-chaining means hot loop bodies never pass through this C loop, so
+        // counting chain heads promotes the wrong blocks (boot chain-starts, not
+        // the hot path) and the region builds without dispatching (region_dispatch
+        // = 0%, ticks 7.14B->6.83B). The correct promotion signal is per-block
+        // execution count emitted in the BLOCK PROLOGUE (counts tail-chained
+        // executions too) — the next Phase-A increment.
+        *final_pc = pc;                                      // trap-recovery breadcrumb
+        BemBlockFnC fn = (BemBlockFnC)(intptr_t)handle;
+        pc = fn();                                           // in-WASM call_indirect
+        ++count;
+    }
+    *final_pc = pc;
+    return count;
+}
+#endif
+
 s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_pc,
                        const u32* exceptions_addr, const s32* downcount_addr) {
+    // Snapshot Exceptions for the in-WASM chaining bail check: each chained
+    // block compares ctx.Exceptions to g_bem_chain_exc0 and returns to this JS
+    // loop the moment a NEW (async IRQ) exception is posted — preserving the
+    // per-block IRQ-delivery latency the JS loop's `exc0` check below gives.
+    g_bem_chain_exc0 = exceptions_addr ? *exceptions_addr : 0u;
 #ifdef __EMSCRIPTEN__
+    // Membrane fix (default): run the dispatch loop in C with call_indirect,
+    // guarded by ONE EM_ASM try/catch for WASM-trap recovery. g_bem_cdispatch_
+    // enabled=0 falls back to the legacy per-block JS dispatch loop below.
+    if (g_bem_cdispatch_enabled) {
+        return EM_ASM_INT({
+            try {
+                return Module._bem_chain_loop_c($0, $1, $2, $3, $4, $5) | 0;
+            } catch (e) {
+                // A block trapped. bem_chain_loop_c wrote *final_pc ($2) before
+                // the trapping call; surface it as trap_pc ($3) so JitWasm::Run
+                // evicts + resumes the interpreter at that PC (same protocol as
+                // the legacy loop's catch).
+                if (Module.bemental_traps === undefined) Module.bemental_traps = 0;
+                Module.bemental_traps++;
+                if (Module.bemental_traps <= 16) {
+                    console.error('[bemental] C-dispatch trap #' + Module.bemental_traps
+                        + ' msg=' + (e && e.message ? e.message : String(e)));
+                }
+                HEAP32[$3 >> 2] = HEAP32[$2 >> 2] | 0;
+                return 0;
+            }
+        }, initial_pc, max_iters, final_pc, trap_pc, exceptions_addr, downcount_addr);
+    }
     return EM_ASM_INT({
         const map = Module.bemental_pc_to_handle;
         const cache = Module.bemental_cache;
@@ -467,6 +716,29 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
             if (handle === undefined) break;
             const inst = cache[handle];
             if (!inst || !inst.exports || typeof inst.exports.run !== 'function') break;
+            // Hot-only merge: per-handle dispatch counter; on the HOT_THRESHOLD
+            // (2048 — must match the C-side HOT_THRESHOLD) crossing, queue this
+            // pc for promotion into the merged hot region (drained C-side in
+            // BlockCache::chain_dispatch).
+            // L2-revival fix (2026-06-19): `handle` is the MONOTONIC wasmTable
+            // index (_bemental_next_idx, starts at _bemental_table_base, never
+            // reset), so late-compiled blocks (the audio/gameplay hot cluster)
+            // get handle >= 16384 and were silently excluded from promotion
+            // counting — they could never cross HOT_THRESHOLD or enter the
+            // merged region. Index the 16384-entry counter by the table-base-
+            // relative slot (& 16383) so EVERY block can promote. Aliasing only
+            // begins after 16384 distinct JIT blocks (vs the old bug excluding
+            // everything past table_base+16384).
+            {
+                const slot = ((handle - (Module._bemental_table_base | 0)) & 16383);
+                const di = ($9 >> 2) + slot;
+                const dc = (HEAP32[di] + 1) | 0;
+                HEAP32[di] = dc;
+                if (dc === 2048) {
+                    const pn = HEAP32[$11 >> 2];
+                    if (pn < 256) { HEAP32[($10 >> 2) + pn] = pc | 0; HEAP32[$11 >> 2] = pn + 1; }
+                }
+            }
             {
                 HEAP32[$8 >> 2] = (HEAP32[$8 >> 2] + 1) | 0;
                 const czn = HEAP32[$5 >> 2];
@@ -497,7 +769,8 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
         HEAP32[trapPcPtr >>> 2] = 0;
         return count;
     }, initial_pc, max_iters, final_pc, trap_pc, g_pc_census_ring, &g_pc_census_n,
-       exceptions_addr, downcount_addr, &g_chain_iters);
+       exceptions_addr, downcount_addr, &g_chain_iters,
+       g_disp_count, g_promote_ring, &g_promote_n);
 #else
     (void)initial_pc; (void)max_iters; (void)exceptions_addr; (void)downcount_addr;
     if (final_pc) *final_pc = initial_pc;
@@ -587,10 +860,74 @@ void BlockCache::evict(u64 key) {
 }
 
 void BlockCache::clear() {
+    // Hot-only merge: reset per-handle dispatch counts (handles get reused).
+    for (std::size_t i = 0; i < 16384; ++i) g_disp_count[i] = 0;
+    g_promote_n = 0;
+    g_blr_ras_sp = 0u;   // [return-linking] handles/slots reused after clear
+    g_blr_chain  = 0u;
     for (const auto& kv : m_map) release_raw(kv.second);
     m_map.clear();
+    // Invalidate the in-WASM chaining dispatch cache: slots just got released,
+    // so every stale entry would tail-call a trapped slot until recompile.
+    for (unsigned i = 0; i < BEM_DISP_BUCKETS; ++i) {
+        g_bem_disp_tag[i]  = 0xFFFFFFFFu;
+        g_bem_disp_slot[i] = -1;
+    }
+    // Exact resolver (membrane-fix C dispatch loop) — release_raw above already
+    // erased per-handle, but clear defensively in case of any drift.
+    g_bem_pc_handle.clear();
+    g_bem_handle_pc.clear();
+    // Reset the merged hot region(s). WITHOUT this, a state load (which calls
+    // ClearCache via JitInterface::DoState in read mode) wipes m_map but leaves
+    // REGION_REL_0 holding the STALE pre-load block bodies (e.g. the boot
+    // decompressor at 0x806cxxxx). region_dispatch (gated on module_handle>=0,
+    // block_cache.cpp:1229) then keeps running those stale bodies, so the guest
+    // executes pre-load code regardless of the loaded scene — every loaded
+    // savestate landed in the same 0x806c7xxx loop. Setting module_handle=-1
+    // disables region_dispatch immediately; clearing the accumulation state lets
+    // the region rebuild cleanly from post-load blocks. (2026-06-20)
+    for (u32 ri = 0; ri < REGION_COUNT; ++ri) {
+        RegionState& rs = m_regions[ri];
+        rs.fn_bodies_concat.clear();
+        rs.n_funcs                 = 0u;
+        rs.pc_keys.clear();
+        rs.pc_to_idx.clear();
+        rs.block_records.clear();
+        rs.blocks_since_link       = 0u;
+        rs.last_accum_ms           = 0.0;
+        rs.module_handle           = -1;
+        rs.generation              = 0;
+        rs.last_relink_ms          = 0.0;
+        rs.dispatches_since_relink = 0u;
+    }
+    // [sealed-multi-gen 2026-06-21] Tear down the sealed-generation state too —
+    // WITHOUT this, a savestate load (clear() via JitInterface::DoState) wipes
+    // m_map + the pending region but leaves the sealed gens + global pc2gen map
+    // holding STALE pre-load block bodies; region_dispatch would keep running
+    // pre-load code post-load (the exact corruption class the per-region reset
+    // above was added for on 2026-06-20).
+    m_sealed_pcs.clear();
+    m_sealed_gen_count = 0u;
+    m_region_has_sealed = false;
 #ifdef __EMSCRIPTEN__
-    EM_ASM({ if (Module.bemental_pc_to_handle) Module.bemental_pc_to_handle.clear(); });
+    EM_ASM({
+        if (Module.bemental_pc_to_handle) Module.bemental_pc_to_handle.clear();
+        if (Module.bemental_regions) {
+            for (const k in Module.bemental_regions) {
+                const rg = Module.bemental_regions[k];
+                if (rg && rg.pcMap) rg.pcMap.clear();
+            }
+        }
+        // Drop sealed-gen instances + the global dispatch map so post-load PCs
+        // can't dispatch into freed/pre-load generation bodies.
+        if (Module.bemental_gens) {
+            for (let i = 0; i < Module.bemental_gens.length; i++) {
+                if (Module.bemental_gens[i]) Module.bemental_gens[i].instance = null;
+            }
+            Module.bemental_gens = [];
+        }
+        if (Module.bemental_pc2gen) Module.bemental_pc2gen.clear();
+    });
 #endif
 }
 
@@ -617,6 +954,28 @@ s32 BlockCache::chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32
     u32 tpc = 0;
     s32 count = chain_dispatch_raw(initial_pc, max_iters, &fpc, &tpc,
                                    exceptions_addr, downcount_addr);
+    // Hot-only merge: drain blocks that crossed the dispatch threshold this
+    // slice into the hot merged region (re-emit + accumulate), then relink the
+    // hot region into one merged wasm function once enough have accumulated.
+    // region_should_relink's tiered thresholds + tier-up grace gate keep this
+    // from rebuilding on every call. NOT dispatched yet (step 4).
+    // [xinst-fix] Only run the expensive promote drain (re-emit + seal) once
+    // past boot — see g_bem_promote_active. During boot it stays OFF so block
+    // discovery isn't taxed; the prologue still cheaply fills the ring, which we
+    // simply discard until the gate opens.
+    if (g_bem_promote_active) {
+        for (u32 i = 0; i < g_promote_n; ++i)
+            promote_hot(g_promote_ring[i]);
+        // Phase A: drain the BLOCK-PROLOGUE promote ring (the correct hot signal —
+        // counts tail-chained executions). These are the actual steady-state hot
+        // blocks (e.g. the asset loader at 0x8036f4xx), unlike the chain-head signal.
+        for (u32 i = 0; i < g_bem_promote_n && i < 256u; ++i)
+            promote_hot(g_bem_promote_ring[i]);
+        if (region_should_relink(REGION_REL_0))
+            region_relink(REGION_REL_0, /*mem_pages=*/1u);
+    }
+    g_promote_n = 0;
+    g_bem_promote_n = 0;
     if (tpc != 0u) {
         // Evict the trapped block from the C++ map. release_raw inside
         // chain_dispatch_raw does not run for the trapped block (the chain
@@ -696,19 +1055,40 @@ void BlockCache::region_accumulate(Region r, u32 pc,
     // Diagnostic uses [worker] prefix so the probe puts it in the
     // worker bucket (displayed in full); generic [bemental] strings land
     // in the "other" bucket which is truncated to last 15 lines.
-    if (local_idx == 0u) {
-        EM_ASM({
-            console.error('[worker] [bemental] region ' + $0 + ' first accumulate pc=0x'
-                + ($1>>>0).toString(16) + ' body_size=' + $2);
-        }, (int)r, pc, (int)body_size);
-    }
-    if ((rs.n_funcs & 63u) == 0u) {
-        EM_ASM({
-            console.error('[worker] [bemental] region ' + $0 + ' n_funcs=' + $1
-                + ' blocks_since_link=' + $2);
-        }, (int)r, (int)rs.n_funcs, (int)rs.blocks_since_link);
-    }
 #endif
+}
+
+// Hot-only merge: stash emit inputs at compile (no body emitted yet).
+void BlockCache::stash_block(u32 pc, const BlockEmitInputs& in) {
+    m_pending_emit[pc] = in;
+}
+
+// Promote a hot block into the merged hot region (REGION_REL_0). Re-emits the
+// body from stashed inputs and accumulates it; region_relink (driven by
+// region_should_relink) later merges the hot region into one wasm function
+// with internal br_table dispatch. First-emit branches are unresolved
+// (lookup_fn=null) — region_relink re-emits with the complete pc_to_idx map.
+void BlockCache::promote_hot(u32 pc) {
+    // [sealed-multi-gen] Dedup across ALL sealed gens: pc_to_idx (checked by
+    // region_has_pc) only holds the CURRENT pending batch, so without this a pc
+    // sealed in a prior gen would re-promote into the next batch -> duplicate
+    // body in two gens. m_sealed_pcs is the cumulative seal set.
+    if (m_sealed_pcs.find(pc) != m_sealed_pcs.end()) return;
+    if (region_has_pc(REGION_REL_0, pc)) return;            // already pending
+    auto it = m_pending_emit.find(pc);
+    if (it == m_pending_emit.end()) return;
+    const BlockEmitInputs& in = it->second;
+#ifdef BEMENTALJIT_USE_REBUILD
+    std::vector<u8> body = powerpc::emit_block_body_next(
+#else
+    std::vector<u8> body = powerpc::emit_block_body(
+#endif
+        in.start_pc, in.insts.data(), static_cast<u32>(in.insts.size()),
+        in.ctx_ptr_const, in.mem1_base, in.mem1_mask, in.ram_size,
+        in.instr_pcs.data(), /*lookup_fn=*/nullptr, /*lookup_user=*/nullptr,
+        in.emit_hle_check, in.emit_perf_stub, in.emit_hle_check_native);
+    if (!body.empty())
+        region_accumulate(REGION_REL_0, pc, body.data(), body.size(), &in);
 }
 
 bool BlockCache::region_has_pc(Region r, u32 pc) const {
@@ -744,9 +1124,22 @@ bool BlockCache::region_should_relink(Region r) const {
     // (cross-instance call_indirect deopt) path. Tiered threshold lets
     // boot stabilize the region quickly, then settles for steady state.
     u32 threshold;
-    if (rs.n_funcs < 256u)        threshold = 32u;
-    else if (rs.n_funcs < 1024u)  threshold = 128u;
-    else                          threshold = 256u;
+    if (r == REGION_REL_0) {
+        // [sealed-multi-gen 2026-06-21] The hot region seals fixed-size batches
+        // into immutable generations; the batch size IS the seal cadence. Small
+        // enough that the first seal fires early (chain_dispatch covers the
+        // pre-first-seal window); large enough to amortize the one-time per-gen
+        // Liftoff compile and keep most intra-loop branches intra-gen. The old
+        // tiered 32/128/256 keyed on total n_funcs is meaningless here — n_funcs
+        // resets to 0 after every seal, so it's purely the pending batch size.
+        static const u32 s_seal_batch =
+            (std::getenv("BJIT_SEAL_BATCH") != nullptr)
+                ? static_cast<u32>(std::atoi(std::getenv("BJIT_SEAL_BATCH")))
+                : 96u;
+        threshold = s_seal_batch ? s_seal_batch : 96u;
+    } else if (rs.n_funcs < 256u)  threshold = 32u;
+    else if (rs.n_funcs < 1024u)   threshold = 128u;
+    else                           threshold = 256u;
     const bool block_trigger = (rs.blocks_since_link >= threshold);
 
     // [determinism] JITWASM_DETERMINISTIC=1 makes relink timing reproducible:
@@ -793,7 +1186,13 @@ bool BlockCache::region_should_relink(Region r) const {
     // Disabled while still in warmup (n_funcs < 256) — boot needs fast
     // catch-up to surface PCs into the module before they pile up on the
     // slow per-block dispatch path.
-    if (rs.n_funcs >= 256u && rs.last_relink_ms > 0.0) {
+    //
+    // [sealed-multi-gen 2026-06-21] The hot region (REGION_REL_0) is exempt: a
+    // seal builds a FRESH immutable gen and never rebuilds it, so there is no
+    // tier-up'd module to protect from discard — deferring a seal just strands
+    // hot blocks on the slow per-block path. Grace stays only for the legacy
+    // non-REL_0 relink path.
+    if (r != REGION_REL_0 && rs.n_funcs >= 256u && rs.last_relink_ms > 0.0) {
         static const double s_grace_ms =
             (std::getenv("BJIT_TIERUP_GRACE_MS") != nullptr)
                 ? std::atof(std::getenv("BJIT_TIERUP_GRACE_MS"))
@@ -838,10 +1237,252 @@ namespace {
     }
 }
 
+// [sealed-multi-gen 2026-06-21] Seal the pending REGION_REL_0 batch into ONE
+// fresh immutable generation module and append it. Unlike region_relink it
+// NEVER rebuilds a prior gen — each gen is built once, V8 tiers it up, and it
+// stays. region_dispatch routes via a global pc -> (genIdx<<16 | localIdx) map.
+// The cold-relink that made grow-and-rebuild net-negative (650 blocks halved
+// ticks) is gone: a seal's one-time Liftoff cost is paid once per gen.
+void BlockCache::region_seal(u32 mem_pages) {
+    RegionState& rs = m_regions[REGION_REL_0];
+    if (rs.n_funcs == 0u) return;
+
+    // Generation cap — leak guard. Beyond MAX_GENS the pending batch stays
+    // unmerged (region_dispatch misses those PCs -> chain_dispatch handles them,
+    // correctness-safe). PSO's steady-state working set (~500 blocks, per
+    // gc_merged_region_net_negative memo) sits far below MAX_GENS*SEAL_BATCH, so
+    // the cap is a guard, not a functional limit.
+    static const u32 s_max_gens =
+        (std::getenv("BJIT_MAX_GENS") != nullptr)
+            ? static_cast<u32>(std::atoi(std::getenv("BJIT_MAX_GENS")))
+            : 48u;
+    if (m_sealed_gen_count >= (s_max_gens ? s_max_gens : 48u)) {
+#ifdef __EMSCRIPTEN__
+        static bool s_warned = false;
+        if (!s_warned) {
+            s_warned = true;
+            EM_ASM({ console.log('[worker] [bemental] seal: MAX_GENS reached ('
+                + $0 + ') — pending hot blocks stay on per-block dispatch'); },
+                (int)m_sealed_gen_count);
+        }
+#endif
+        return;
+    }
+
+    // [return-linking] A fresh gen has its own slot layout; drop the RAS so a
+    // stale entry under-flows to the safe op_return fallback (never tail-chains
+    // to a wrong slot). Cross-gen blr falls back to op_return -> host dispatch,
+    // which is correct. Same discipline as the legacy relink path.
+    g_blr_ras_sp = 0u;
+    g_blr_chain  = 0u;
+
+    // ---- Re-emit pass (lever #2) over THIS pending batch ONLY ----
+    // CRITICAL (sealed-multi-gen): region_lookup_for_emit binds to rs.pc_to_idx,
+    // which holds ONLY the current pending batch (it is cleared after each
+    // seal). A branch whose target was sealed in a PRIOR gen is therefore NOT
+    // found -> set_pc + return (cross-gen EXIT to the dispatcher, which
+    // re-enters the owning gen). This is exactly what keeps every gen's internal
+    // br_table arms in range [0, batch) — NEVER feed a cumulative/global map
+    // into region_lookup_for_emit, or a `br $L` could land out of range.
+    static const bool s_reemit_enabled =
+        (std::getenv("JITWASM_REEMIT_AT_RELINK_OFF") == nullptr);
+    bool have_records = s_reemit_enabled && (rs.block_records.size() == rs.n_funcs);
+    for (const auto& rec : rs.block_records) {
+        if (rec.insts.empty()) { have_records = false; break; }
+    }
+    if (have_records) {
+        rs.fn_bodies_concat.clear();
+        RegionLookupCtx ctx{ &rs };
+        for (u32 i = 0; i < rs.n_funcs; ++i) {
+            const BlockEmitInputs& rec = rs.block_records[i];
+#ifdef BEMENTALJIT_USE_REBUILD
+            std::vector<u8> body = powerpc::emit_block_body_next(
+#else
+            std::vector<u8> body = powerpc::emit_block_body(
+#endif
+                rec.start_pc, rec.insts.data(), static_cast<u32>(rec.insts.size()),
+                rec.ctx_ptr_const, rec.mem1_base, rec.mem1_mask, rec.ram_size,
+                rec.instr_pcs.data(), &region_lookup_for_emit, &ctx,
+                rec.emit_hle_check, rec.emit_perf_stub, rec.emit_hle_check_native);
+            rs.fn_bodies_concat.insert(rs.fn_bodies_concat.end(),
+                                       body.begin(), body.end());
+        }
+    }
+
+    // ---- Build the generation module (single-fn merged shape preferred) ----
+    static const bool s_merged_enabled = (std::getenv("BJIT_LEVER2_MERGED_OFF") == nullptr);
+    bool use_merged_fn = s_merged_enabled && (rs.block_records.size() == rs.n_funcs);
+    if (use_merged_fn) {
+        for (const auto& rec : rs.block_records) {
+            if (rec.insts.empty()) { use_merged_fn = false; break; }
+        }
+    }
+
+    std::vector<u8> bytes;
+    if (use_merged_fn) {
+        std::vector<powerpc::BlockInputs> bins(rs.n_funcs);
+        for (u32 i = 0; i < rs.n_funcs; ++i) {
+            const BlockEmitInputs& rec = rs.block_records[i];
+            bins[i].start_pc       = rec.start_pc;
+            bins[i].insts          = rec.insts.data();
+            bins[i].count          = (u32)rec.insts.size();
+            bins[i].ctx_ptr_const  = rec.ctx_ptr_const;
+            bins[i].mem1_base      = rec.mem1_base;
+            bins[i].mem1_mask      = rec.mem1_mask;
+            bins[i].ram_size       = rec.ram_size;
+            bins[i].instr_pcs      = rec.instr_pcs.data();
+            bins[i].emit_hle_check = rec.emit_hle_check;
+            bins[i].emit_perf_stub = rec.emit_perf_stub;
+            bins[i].emit_hle_check_native = rec.emit_hle_check_native;
+            bins[i].block_cycles   = rec.block_cycles;
+        }
+        RegionLookupCtx ctx{ &rs };
+#ifdef BEMENTALJIT_USE_REBUILD
+        bytes = powerpc::build_region_function_next(
+            bins.data(), rs.n_funcs, &region_lookup_for_emit, &ctx, mem_pages);
+#else
+        bytes = powerpc::build_region_function(
+            bins.data(), rs.n_funcs, &region_lookup_for_emit, &ctx, mem_pages);
+#endif
+    } else {
+#ifdef BEMENTALJIT_USE_REBUILD
+        bytes = powerpc::build_region_module_next(
+            rs.fn_bodies_concat.data(), rs.fn_bodies_concat.size(),
+            rs.n_funcs, mem_pages);
+#else
+        bytes = powerpc::build_region_module(
+            rs.fn_bodies_concat.data(), rs.fn_bodies_concat.size(),
+            rs.n_funcs, mem_pages);
+#endif
+    }
+    if (bytes.empty()) {
+#ifdef __EMSCRIPTEN__
+        EM_ASM({ console.error('[bemental] seal: build_region returned empty bytes gen='
+            + $0); }, (int)m_sealed_gen_count);
+#endif
+        return;
+    }
+
+    // [region] N-fn path: populate the region-local dispatch cache so each
+    // region body's in-WASM tail-chain (emit_chain_or_return with the rtag/rslot
+    // override) resolves a successor PC -> this gen's INTERNAL funcref-table
+    // slot (block i -> internal slot i, matching the active element segment).
+    // A miss falls through to the host (per-block path). Single active region:
+    // the most-recently-sealed gen owns the cache; older gens' PCs tag-miss and
+    // stay on the per-block path (correct, just unaccelerated). The internal
+    // table is V8-inline-eligible (declared, not imported) — the whole point.
+    if (!use_merged_fn) {
+        for (u32 i = 0; i < rs.n_funcs; ++i) {
+            const u32 pc  = rs.block_records[i].start_pc;
+            const u32 bkt = (pc >> 2) & BEM_DISP_MASK;
+            g_bem_rtag[bkt]  = pc;
+            g_bem_rslot[bkt] = (int32_t)i;
+        }
+    }
+
+#ifdef __EMSCRIPTEN__
+    // Append the immutable generation to Module.bemental_gens and register its
+    // PCs in the global Module.bemental_pc2gen map. nFuncs <= SEAL_BATCH (96) so
+    // the 16-bit localIdx pack (genIdx<<16 | localIdx) never overflows.
+    const int sealed_idx = EM_ASM_INT({
+        const bytesPtr  = $0;
+        const bytesLen  = $1 >>> 0;
+        const pcKeysPtr = $2;
+        const nFuncs    = $3 >>> 0;
+        const genIdx    = $4 | 0;
+        const mergedFn  = $5 | 0;
+        try {
+            const view = new Uint8Array(Module.HEAPU8.buffer, bytesPtr, bytesLen);
+            const copy = new Uint8Array(view);
+            const mod  = new WebAssembly.Module(copy);
+            const memObj = (typeof wasmMemory !== 'undefined') ? wasmMemory : null;
+            const env = {};
+            if (memObj) env.memory = memObj;
+            if (Module.bemental_imports && Module.bemental_imports.env) {
+                Object.assign(env, Module.bemental_imports.env);
+            }
+            const inst = new WebAssembly.Instance(mod, { env: env });
+            // NOTE: build `gen` with separate assignments — a `{a:x, b:y}` object
+            // literal here has bare commas which the C preprocessor (balances
+            // parens only) would split as EM_ASM macro args. Same reason the
+            // legacy region_relink builds its region object field-by-field.
+            const gen = {};
+            gen.instance = inst;
+            gen.nFuncs   = nFuncs;
+            gen.merged   = !!mergedFn;
+            if (gen.merged) {
+                gen.regionFn = inst.exports['region'];
+                gen.entrySel = inst.exports['entry_sel'];
+                if (!gen.regionFn || !gen.entrySel) {
+                    console.error('[bemental] seal gen ' + genIdx
+                        + ' merged shape missing exports');
+                    return -1;
+                }
+            } else {
+                const fns = new Array(nFuncs);
+                for (let i = 0; i < nFuncs; i++) fns[i] = inst.exports['fn_' + i];
+                gen.fns = fns;
+            }
+            if (!Module.bemental_gens)   Module.bemental_gens   = [];
+            if (!Module.bemental_pc2gen) Module.bemental_pc2gen = new Map();
+            Module.bemental_gens[genIdx] = gen;
+            for (let i = 0; i < nFuncs; i++) {
+                const pc = HEAPU32[(pcKeysPtr >>> 2) + i] >>> 0;
+                Module.bemental_pc2gen.set(pc, ((genIdx << 16) | i) >>> 0);
+            }
+            console.log('[worker] [bemental] sealed gen ' + genIdx + ' n_funcs=' + nFuncs
+                + ' bytes=' + bytesLen + (gen.merged ? ' shape=merged' : ' shape=Nfn'));
+            return genIdx;
+        } catch (e) {
+            console.error('[bemental] seal gen ' + genIdx + ' failed: '
+                + (e && e.message ? e.message : String(e)));
+            return -1;
+        }
+    },
+    bytes.data(), (int)bytes.size(),
+    rs.pc_keys.data(), (int)rs.n_funcs,
+    (int)m_sealed_gen_count,
+    use_merged_fn ? 1 : 0);
+
+    if (sealed_idx < 0) return;   // instantiate failed; keep pending for retry
+
+    // Commit: record the sealed PCs (dedup) and advance the generation count.
+    for (u32 pc : rs.pc_keys) m_sealed_pcs.insert(pc);
+    m_sealed_gen_count += 1u;
+    m_region_has_sealed = true;
+#else
+    (void)mem_pages;
+#endif
+
+    // Reset the pending batch for the next generation. The sealed gen is
+    // immutable and lives in Module.bemental_gens; pending state starts empty.
+    rs.fn_bodies_concat.clear();
+    rs.n_funcs                 = 0u;
+    rs.pc_keys.clear();
+    rs.pc_to_idx.clear();
+    rs.block_records.clear();
+    rs.blocks_since_link       = 0u;
+    rs.last_accum_ms           = now_ms();
+    rs.last_relink_ms          = now_ms();
+    rs.dispatches_since_relink = 0u;
+}
+
 void BlockCache::region_relink(Region r, u32 mem_pages) {
     if (r >= REGION_COUNT) return;
+    // [sealed-multi-gen 2026-06-21] The hot region uses append-only sealing,
+    // not grow-and-rebuild. Route it to region_seal; the legacy relink body
+    // below serves only the non-REL_0 (Phase-5 REL slot) regions.
+    if (r == REGION_REL_0) { region_seal(mem_pages); return; }
     RegionState& rs = m_regions[r];
     if (rs.n_funcs == 0u) return;
+    // [return-linking] The relink rebuilds the merged module: a given return PC
+    // can map to a DIFFERENT slot in the new generation, so any RAS entry holding
+    // an old-generation slot is now stale. Drop the whole RAS — a subsequent blr
+    // then under-flows -> mispredict -> safe op_return fallback (no tail-chain to
+    // a wrong slot). Relink happens OUTSIDE the region while-loop (chain_dispatch),
+    // so no in-flight region tail-chain races this.
+    g_blr_ras_sp = 0u;
+    g_blr_chain  = 0u;
 
     // ---- Re-emit pass (lever #2 — block-link patching) ----
     // The bodies in fn_bodies_concat were emitted at first-accumulate time
@@ -893,12 +1534,6 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
             rs.fn_bodies_concat.insert(rs.fn_bodies_concat.end(),
                                        body.begin(), body.end());
         }
-#ifdef __EMSCRIPTEN__
-        EM_ASM({
-            console.error('[worker] [bemental] region ' + $0
-                + ' re-emitted ' + $1 + ' bodies for relink (lever #2)');
-        }, (int)r, (int)rs.n_funcs);
-#endif
     }
 
     // Lever #2 alt path — single-function merged region. Toggled by
@@ -941,6 +1576,7 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
             bins[i].emit_hle_check = rec.emit_hle_check;
             bins[i].emit_perf_stub = rec.emit_perf_stub;
             bins[i].emit_hle_check_native = rec.emit_hle_check_native;
+            bins[i].block_cycles   = rec.block_cycles;
         }
         RegionLookupCtx ctx{ &rs };
 #ifdef __EMSCRIPTEN__
@@ -948,27 +1584,6 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
         // map (br_table arm i lands on bins[i]) plus what the emit-time lookup
         // maps the wedge fn's key successors to. If lookup says 0x800e3958=slot
         // K but bins[K].start_pc != 0x800e3958, that mismatch is the self-loop.
-        {
-            bool has_wedge = false;
-            for (u32 i = 0; i < rs.n_funcs; ++i)
-                if (bins[i].start_pc == 0x800e362cu) { has_wedge = true; break; }
-            static int s_slotmap_logged = 0;
-            if (has_wedge && s_slotmap_logged < 2) {
-                s_slotmap_logged++;
-                EM_ASM({ console.error('[slotmap] n_funcs=' + ($0|0)); }, rs.n_funcs);
-                for (u32 i = 0; i < rs.n_funcs; ++i)
-                    EM_ASM({ console.error('[slotmap] slot=' + ($0|0)
-                        + ' pc=0x' + ($1>>>0).toString(16)); }, i, bins[i].start_pc);
-                u32 i3958 = 0xffffffffu, i362c = 0xffffffffu, i3654 = 0xffffffffu;
-                const bool r3958 = region_lookup_for_emit(&ctx, 0x800e3958u, &i3958);
-                const bool r362c = region_lookup_for_emit(&ctx, 0x800e362cu, &i362c);
-                const bool r3654 = region_lookup_for_emit(&ctx, 0x800e3654u, &i3654);
-                EM_ASM({ console.error('[slotmap] lookup 3958 res=' + ($0|0) + ' idx=' + ($1|0)
-                    + ' | 362c res=' + ($2|0) + ' idx=' + ($3|0)
-                    + ' | 3654 res=' + ($4|0) + ' idx=' + ($5|0)); },
-                    r3958, (int)i3958, r362c, (int)i362c, r3654, (int)i3654);
-            }
-        }
 #endif
 #ifdef BEMENTALJIT_USE_REBUILD
         bytes = powerpc::build_region_function_next(
@@ -1030,13 +1645,6 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
             if (memObj) env.memory = memObj;
             if (Module.bemental_imports && Module.bemental_imports.env) {
                 Object.assign(env, Module.bemental_imports.env);
-            }
-            // DIAG: print env keys to see if ppc_stack_corrupt is wired
-            {
-                const keys = Object.keys(env).join(',');
-                const has_sc = ('ppc_stack_corrupt' in env) ? 1 : 0;
-                const has_dsc = (typeof Module._dolphin_stack_corrupt === 'function') ? 1 : 0;
-                console.error('[region-env-diag] keys=[' + keys + '] has_sc=' + has_sc + ' has_dsc=' + has_dsc);
             }
             const inst = new WebAssembly.Instance(mod, { env: env });
 
@@ -1106,66 +1714,56 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
 }
 
 bool BlockCache::region_dispatch(u32 pc, s32* out) {
-    const Region r = classify(pc);
-    if (r >= REGION_COUNT) return false;
-    if (m_regions[r].module_handle < 0) return false;
-    // Tier-up grace counter — V8 type feedback is per-instance and starts
-    // empty. region_should_relink consults this to know whether the
-    // current module has had enough traffic for TurboFan to have material
-    // worth preserving. Bump on every call into region_dispatch regardless
-    // of hit/miss; on miss the caller falls through to compile path, the
-    // feedback investment in the current module is unchanged.
-    m_regions[r].dispatches_since_relink += 1u;
+    // [return-linking] Host boundary: reset the consecutive in-WASM tail-chain
+    // counter so the idle-skip streak detector observes idle cycles. The RAS sp
+    // PERSISTS across region entries (a call's blr can come after a downcount
+    // bail + re-entry); only the chain budget resets here.
+    g_blr_chain = 0u;
+    // [sealed-multi-gen 2026-06-21] Route via the global pc -> (genIdx<<16 |
+    // localIdx) map. Each promoted hot block lives in exactly one immutable
+    // generation (dedup at promote time). A pc not in the map returns false ->
+    // caller falls through to chain_dispatch. Intra-gen branches chain in-WASM
+    // (entry_sel + br $L); cross-gen targets exit set_pc+return and re-dispatch
+    // here into the owning gen.
+    g_rd_calls++;                                            // [region-debug]
+    if (m_sealed_gen_count == 0u) { g_rd_nogen++; return false; }  // [region-debug] cold window -> chain_dispatch
+    if (m_sealed_pcs.find(pc) == m_sealed_pcs.end()) { g_rd_miss++; return false; }  // [xinst-fix] C-side miss: skip the JS-membrane EM_ASM
+    m_regions[REGION_REL_0].dispatches_since_relink += 1u;  // diagnostic meter only
 #ifdef __EMSCRIPTEN__
     return EM_ASM_INT({
-        const r        = $0 | 0;
-        const pc       = $1 >>> 0;
-        const outPtr   = $2;
-        const region   = Module.bemental_regions && Module.bemental_regions[r];
-        if (!region) return 0;
-        const idx = region.pcMap.get(pc);
-        if (idx === undefined) return 0;
-        // [pc-census 2026-06-12] temporary (strip per gate #8): record PCs
-        // into the C ring ($3=&ring, $4=&fill); drained + printed by
-        // dolphin_gather_drain (output from this context never reaches the
-        // probe).
-        {
-            const czn = HEAP32[$4 >> 2];
-            if (czn < 256) {
-                HEAP32[($3 >> 2) + czn] = pc | 0;
-                HEAP32[$4 >> 2] = czn + 1;
-            }
-        }
-        // Pre-dispatch trace: every 100K calls log the pc ABOUT to be
-        // dispatched. If a wasm region function infinite-loops, the LAST
-        // log line identifies the hung pc.
-        if (Module.bemental_region_dispatch_n === undefined) Module.bemental_region_dispatch_n = 0;
-        Module.bemental_region_dispatch_n++;
-        if ((Module.bemental_region_dispatch_n % 10000) === 0) {
-            console.error('[bemental] pre-region-dispatch n=' + Module.bemental_region_dispatch_n
-                + ' r=' + r + ' pc=0x' + pc.toString(16) + ' idx=' + idx);
-        }
+        const pc       = $0 >>> 0;
+        const outPtr   = $1;
+        const map = Module.bemental_pc2gen;
+        if (!map) { HEAP32[$5 >> 2] = (HEAP32[$5 >> 2] + 1) | 0; return 0; }   // [region-debug] nogen
+        const packed = map.get(pc);
+        if (packed === undefined) { HEAP32[$3 >> 2] = (HEAP32[$3 >> 2] + 1) | 0; return 0; }  // [region-debug] miss
+        const g   = packed >>> 16;
+        const idx = packed & 0xFFFF;
+        const gen = Module.bemental_gens && Module.bemental_gens[g];
+        if (!gen) { HEAP32[$5 >> 2] = (HEAP32[$5 >> 2] + 1) | 0; return 0; }   // [region-debug] nogen (stale)
         try {
             let next;
-            if (region.merged) {
-                region.entrySel.value = idx | 0;
-                next = region.regionFn() >>> 0;
+            if (gen.merged) {
+                gen.entrySel.value = idx | 0;
+                next = gen.regionFn() >>> 0;
             } else {
-                next = region.fns[idx]() >>> 0;
+                next = gen.fns[idx]() >>> 0;
             }
             HEAP32[outPtr >>> 2] = next | 0;
+            HEAP32[$4 >> 2] = (HEAP32[$4 >> 2] + 1) | 0;   // [region-debug] hit
             return 1;
         } catch (e) {
             if (Module.bemental_region_traps === undefined) Module.bemental_region_traps = 0;
             Module.bemental_region_traps++;
             if (Module.bemental_region_traps <= 16) {
-                console.error('[bemental] region', r, 'dispatch trap pc=0x'
+                console.error('[bemental] sealed gen', g, 'dispatch trap pc=0x'
                     + pc.toString(16) + ' idx=' + idx
                     + ' msg=' + (e && e.message ? e.message : String(e)));
             }
             return 0;
         }
-    }, (int)r, (int)pc, out, g_pc_census_ring, &g_pc_census_n) != 0;
+    }, (int)pc, out, /*$2 unused*/0,
+       &g_rd_miss, &g_rd_hit, &g_rd_nogen) != 0;
 #else
     (void)pc; (void)out;
     return false;

@@ -121,7 +121,17 @@ bool VideoBackend::FillBackendInfo(GLContext* context)
   g_backend_info.bSupports3DVision = false;
   g_backend_info.bSupportsPostProcessing = true;
   g_backend_info.bSupportsSSAA = true;
+  // [webgl2-depthrange 2026-06-20] WebGL2 raises INVALID_OPERATION on
+  // glDepthRange(zNear>zFar) and ignores the call, so the GameCube reverse-Z
+  // (near>far) silently drops → inverted 3D depth + console-flooding errors.
+  // Disabling reverse-Z routes BPFunctions to the WebGL2-legal near=1-max/far=1-min
+  // path — the same first-class path D3D11/D3D12/Metal ship — at a small depth-
+  // precision cost and no speed change. Native (non-emscripten) keeps reverse-Z.
+#ifdef __EMSCRIPTEN__
+  g_backend_info.bSupportsReversedDepthRange = false;
+#else
   g_backend_info.bSupportsReversedDepthRange = true;
+#endif
   g_backend_info.bSupportsLogicOp = true;
   g_backend_info.bSupportsMultithreading = false;
   g_backend_info.bSupportsCopyToVram = true;

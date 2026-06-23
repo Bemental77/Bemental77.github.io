@@ -435,9 +435,27 @@ void Jit64::ImHere(Jit64& jit)
   if (jit.m_im_here_log)
   {
     if (!f)
-      f.Open("log64.txt", "w");
+      f.Open("/tmp/dolphin_traj.txt", "w");  // [traj-oracle] absolute path — RetroArch CWD is read-only
 
-    f.WriteString(fmt::format("{0:08x}\n", ppc_state.pc));
+    f.WriteString(fmt::format("[traj] {0:08x}\n", ppc_state.pc));
+  }
+  // [mem1-diff-oracle 2026-06-20] aligned-state dump: when the guest first
+  // reaches TRAJ_DUMP_PC, write all of MEM1 to /tmp/native_mem1.bin so it can be
+  // byte-compared against the WASM's MEM1 at the same instruction-aligned PC.
+  {
+    static const char* env = std::getenv("TRAJ_DUMP_PC");
+    static const u32 dump_pc = env ? (u32)std::strtoul(env, nullptr, 16) : 0u;
+    static bool dumped = false;
+    if (dump_pc && !dumped && ppc_state.pc == dump_pc)
+    {
+      dumped = true;
+      auto& memory = Core::System::GetInstance().GetMemory();
+      if (FILE* fp = std::fopen("/tmp/native_mem1.bin", "wb"))
+      {
+        std::fwrite(memory.GetRAM(), 1, memory.GetRamSizeReal(), fp);
+        std::fclose(fp);
+      }
+    }
   }
   auto& been_here = jit.m_been_here;
   auto it = been_here.find(ppc_state.pc);

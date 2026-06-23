@@ -25,6 +25,7 @@
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/HW/SI/SI_DeviceGBA.h"
 #include "Core/HW/SystemTimers.h"
+#include "Core/PowerPC/PowerPC.h"  // [ax-si-deliver] PowerPCState EE/Exceptions
 #include "Core/Movie.h"
 #include "Core/NetPlayProto.h"
 #include "Core/System.h"
@@ -155,6 +156,7 @@ void SerialInterfaceManager::RunSIBuffer(u64 user_data, s64 cycles_late)
 #endif
 
     auto* const device = m_channel[m_com_csr.CHANNEL].device.get();
+    const u8 request_copy_cmd = m_si_buffer[0];  // [ax-si2] cmd before RunBuffer overwrites with response
     const s32 actual_response_length = device->RunBuffer(m_si_buffer.data(), request_length);
 
     // [ax-si2] temporary diag (strip per gate #8): direct-transfer trace.
@@ -164,9 +166,12 @@ void SerialInterfaceManager::RunSIBuffer(u64 user_data, s64 cycles_late)
       if (nn <= 16 || (nn & 0xFFu) == 0)
       {
         NOTICE_LOG_FMT(POWERPC,
-                       "[ax-si2] xfer n={} chan={} cmd={:#04x} reqlen={} explen={} actlen={}", nn,
-                       (u32)m_com_csr.CHANNEL, m_si_buffer[0], request_length,
-                       expected_response_length, actual_response_length);
+                       "[ax-si2] xfer n={} chan={} reqcmd={:#04x} resp=[{:#04x} {:#04x} {:#04x}] "
+                       "reqlen={} explen={} actlen={}",
+                       nn, (u32)m_com_csr.CHANNEL,
+                       (u32)request_copy_cmd, (u32)m_si_buffer[0], (u32)m_si_buffer[1],
+                       (u32)m_si_buffer[2], request_length, expected_response_length,
+                       actual_response_length);
       }
     }
 
@@ -619,6 +624,37 @@ void SerialInterfaceManager::UpdateDevices()
   }
 
   UpdateInterrupts();
+
+  // [ax-si-deliver] oracle-diff: native boots SAB through this poll in ~1s;
+  // WASM spins 33M. After UpdateInterrupts asserts SI to PI, log whether the
+  // chain SI->PI cause->Exceptions->(EE) is intact. If EE=1 AND EXTERNAL_INT is
+  // in Exceptions yet the guest keeps polling => the JIT isn't delivering; if
+  // Exceptions lacks EXTERNAL_INT => PI->Exceptions propagation is the break.
+  {
+    static u64 nd = 0;
+    if (++nd <= 8 || (nd & 0xFFu) == 0)
+    {
+      auto& ps = m_system.GetPPCState();
+      const u32 cause = m_system.GetProcessorInterface().GetCause();
+      const u32 mask = m_system.GetProcessorInterface().GetMask();
+      // [ax-guestpc] DUMP the guest's current PC + LR + loop GPRs so the stuck
+      // loop can be disassembled (gsne8p.map) and GDB'd against native at the
+      // SAME pc. No unknowns — this is the dump.
+      NOTICE_LOG_FMT(POWERPC,
+                     "[ax-si-deliver] n={} pc={:#010x} lr={:#010x} EE={} Exceptions={:#x} "
+                     "msr={:#x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r31={:#010x} "
+                     "cause_and_mask={:#x}",
+                     nd, ps.pc, ps.spr[8], (u32)ps.msr.EE, ps.Exceptions, ps.msr.Hex,
+                     ps.gpr[3], ps.gpr[4], ps.gpr[5], ps.gpr[6], ps.gpr[31], cause & mask);
+      // [ax-dsi] is a store fault (DSI) freezing the memset? DAR/DSISR/SRR0 +
+      // the DBATs that should map 0x8099567c (in the 16MB DBAT0 window).
+      NOTICE_LOG_FMT(POWERPC,
+                     "[ax-dsi] DAR={:#010x} DSISR={:#010x} SRR0={:#010x} SRR1={:#010x} "
+                     "DBAT0U={:#010x} DBAT0L={:#010x} DBAT1U={:#010x} DBAT1L={:#010x}",
+                     ps.spr[19], ps.spr[18], ps.spr[26], ps.spr[27],
+                     ps.spr[536], ps.spr[537], ps.spr[538], ps.spr[539]);
+    }
+  }
 
   // Polling finished
   NetPlay::SetSIPollBatching(false);

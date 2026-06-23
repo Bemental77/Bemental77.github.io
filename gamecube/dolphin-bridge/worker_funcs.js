@@ -1,7 +1,80 @@
 // Bundled into dolphin_worker.js via emcc --post-js.
 // Routes messages from main thread into the Dolphin core.
-// Skip entirely in pthread child workers — they have their own onmessage
-// handler installed by emscripten's pthread runtime.
+
+// [FIX#1 render-worker] installGLRecorder MUST be defined on BOTH worker-main
+// AND the proxy-pthread, because Dolphin's GL backend (load_iso -> ContextReset
+// -> retro_run, all on the proxy-pthread per EmscriptenWorker.cpp) is where the
+// _glXXX calls execute, so the recording GLctx must be installed into THAT
+// thread's GL/GLctx. JS-object SABs do NOT propagate to emscripten pthreads, so
+// the GL command ring + ctrl block are embedded in the shared wasm heap at fixed
+// byte offsets; the page writes a descriptor at GL_DESC_OFF (magic, ringOff,
+// ringWords, ctrlOff, enabled) that BOTH threads read from the shared heap.
+//
+//   ── UNCERTAIN STEP (must be probe-confirmed) ──────────────────────────────
+//   GL_RING_OFF / GL_CTRL_OFF (0x08000000 / 0x09100000) are chosen in the gap
+//   between the scratch SAB region (ends ~0x026Bxxxx) and Dolphin's data section
+//   (GLOBAL_BASE=0x10000000). They are unreferenced in sab_layout.h, but I have
+//   NOT verified the wasm STACK (STACK_SIZE=8MB) or low malloc arena doesn't
+//   reach 0x08000000. The probe's first run will show [fix1] gl-error / wrong
+//   render if these collide; bump them (e.g. to just-below 0x10000000) if so.
+var GL_DESC_OFF  = 0x07FF0000;  // descriptor: i32[0]=magic i32[1]=ringByteOff i32[2]=ringWords i32[3]=ctrlByteOff i32[4]=enabled
+var GL_DESC_MAGIC = 0x474C5244; // 'GLRD'
+var __gcRec = null;
+self.installGLRecorder = function () {
+  try {
+    if (typeof GL === 'undefined') { postMessage({ cmd: 'print', txt: '[fix1] GL undefined on this thread' }); return 0; }
+    var R = self.__GLRecord;
+    if (!R || !R.GLRecorder) {
+      // gl-record.js wasn't importScripts'd on THIS thread. On the pthread the
+      // shim doesn't run, so load it here (same-origin, defines self.__GLRecord).
+      try { importScripts('/gamecube/gl-record.js'); R = self.__GLRecord; } catch (e) {}
+    }
+    if (!R || !R.GLRecorder) { postMessage({ cmd: 'print', txt: '[fix1] __GLRecord unavailable on this thread' }); return 0; }
+    var heap32 = Module.HEAPU32 || new Uint32Array(Module.HEAPU8.buffer);
+    if (heap32[GL_DESC_OFF >> 2] !== GL_DESC_MAGIC || heap32[(GL_DESC_OFF >> 2) + 4] !== 1) {
+      postMessage({ cmd: 'print', txt: '[fix1] GL descriptor absent/disabled at 0x' + GL_DESC_OFF.toString(16) }); return 0;
+    }
+    var ringByteOff = heap32[(GL_DESC_OFF >> 2) + 1];
+    var ringWords   = heap32[(GL_DESC_OFF >> 2) + 2];
+    var ctrlByteOff = heap32[(GL_DESC_OFF >> 2) + 3];
+    var buf = Module.HEAPU8.buffer;
+    var ringView = new Int32Array(buf, ringByteOff, 4 + ringWords);
+    var ctrlView = ctrlByteOff ? new Int32Array(buf, ctrlByteOff, 256) : null;
+    // OVERLAY mode: EmscriptenWorker.cpp already created a REAL WebGL2 context
+    // via emscripten_webgl_create_context("#canvas") (on the throwaway 1x1
+    // hwOffscreenCanvas) and made it current, so Dolphin's get_proc_address has
+    // resolved against a real emscripten context. We now overlay the recorder on
+    // THAT context: caps/proc-addresses stay real; draw/state/upload calls divert
+    // to the ring. We do NOT create our own context (GL.createContext bypassed
+    // get_proc_address and left a null function at boot).
+    var cur = GL.currentContext;
+    if (!cur || !cur.GLctx) {
+      postMessage({ cmd: 'print', txt: '[fix1] no current GL context to overlay' }); return 0;
+    }
+    var handle = cur.handle;
+    var qctx = cur.GLctx;                      // the REAL WebGL2 context — caps + fallback
+    __gcRec = new R.GLRecorder(ringView, function () { return Module.HEAPU8; }, qctx, ctrlView);
+    // Recorder records the 65-method draw surface; falls back to the real context
+    // for any other method (init queries, get_proc_address existence checks).
+    var recGL = R.makeRecordingGL(__gcRec, qctx);
+    Module.__gcGlEmitPresent = function () { recGL.present(); };
+    // OVERLAY: replace the real context's GLctx with the recorder, then re-make
+    // current so the module-scoped GLctx (read by every _glXXX on this thread)
+    // becomes the recorder. GL.currentContext keeps its real defaultFbo/handle.
+    cur.GLctx = recGL;
+    if (typeof GL.makeContextCurrent === 'function' && handle != null) GL.makeContextCurrent(handle);
+    else if (typeof GLctx !== 'undefined') GLctx = recGL;
+    postMessage({ cmd: 'print', txt: '[fix1] recording GLctx OVERLAY on handle=' + handle
+      + ' ring@0x' + ringByteOff.toString(16) + ' words=' + ringWords + ' caps=' + (!!qctx) + ' ctrl=' + (!!ctrlView) });
+    return 1;
+  } catch (e) {
+    postMessage({ cmd: 'print', txt: '[fix1] installGLRecorder failed: ' + (e && e.message ? e.message : e) });
+    return 0;
+  }
+};
+
+// Skip the message-routing half entirely in pthread child workers — they have
+// their own onmessage handler installed by emscripten's pthread runtime.
 if (typeof ENVIRONMENT_IS_PTHREAD === 'undefined' || !ENVIRONMENT_IS_PTHREAD) {
 
 // 4f-6: surface a 'runtime-ready' postMessage when emscripten has
@@ -141,15 +214,31 @@ async function bootIso(name, size) {
   try {
     var iniDir = '/home/web_user/retroarch/userdata/system/dolphin-emu/User/Config';
     Module.FS.mkdirTree(iniDir);
-    // GFXBackend must be in the ini: EmscriptenWorker main() does
-    // Config::SetBase(MAIN_GFX_BACKEND, "Software Renderer"), but the boot-
-    // time load of this file resets the base layer — without the key here
-    // the backend falls back to Null (2026-06-11 probe: "[ax-vbi] calling
-    // g_video_backend->Initialize (backend=Null)"), which rasterizes
-    // nothing and presents headless, so video_cb never fires.
-    var iniBody = '[Core]\nMMU = True\nSkipIPL = False\nGFXBackend = Software Renderer\n';
+    // GFXBackend must be in the ini: the boot-time load of this file resets
+    // the base config layer, so this key is the AUTHORITATIVE backend choice.
+    // [HW-render 2026-06-17] "OGL" = Dolphin's OpenGL backend, which under emcc
+    // routes GLES3 -> WebGL2 (libvideoogl.a linked; SET_HW_RENDER answered in
+    // EmscriptenWorker.cpp; context on the transferred OffscreenCanvas). This
+    // rasterizes on the GPU instead of the CPU-thread Software Renderer.
+    // [HW-render path-b] CPUThread = True enables Dolphin dual-core: the video
+    // backend (OGL) runs on a separate GPU thread spawned via real
+    // pthread_create, which CAN own the OffscreenCanvas (unlike the
+    // _emscripten_proxy_main main thread). GLContextLR::Initialize then runs on
+    // that GPU thread, where the WebGL2 context is created locally.
+    // [HW-render 2026-06-17] CPUThread (dual-core) was TESTED and did NOT fix the
+    // post-frame-4 wedge (identical stall: guest spins at 0x806c7f44, OutputXFB
+    // stops at n=4) — so the wedge is not CPU/GPU-thread present blocking. Reverted
+    // to single-core to keep the working HW-render baseline clean (gate #8).
+    // [render-opt 2026-06-19] CPUThread=True (off-thread present) RE-TESTED post-
+    // getParameter-fix: now WEDGE-SAFE (frames advance to n=256), BUT does NOT
+    // offload the render — under OffscreenCanvas + proxyContextToMainThread the GL
+    // context is pinned to worker_0, so the GPU pthread's GL calls just proxy back
+    // (worker_0 texSubImage3D rose to 37%). And guest progress was identical
+    // (ticks 2336.33M), confirming the boot is CoreTiming-pacing/dispatch bound,
+    // not render-bound. Reverted to single-core (no offload benefit + dual-core risk).
+    var iniBody = '[Core]\nMMU = True\nSkipIPL = False\nGFXBackend = OGL\n';
     Module.FS.writeFile(iniDir + '/Dolphin.ini', iniBody);
-    postMessage({ cmd: 'print', txt: '[worker] wrote Dolphin.ini (MMU=True, SkipIPL=False, GFXBackend=Software Renderer) at ' + iniDir });
+    postMessage({ cmd: 'print', txt: '[worker] wrote Dolphin.ini (MMU=True, SkipIPL=False, GFXBackend=OGL) at ' + iniDir });
     try {
       var cfg = Module.FS.readFile(iniDir + '/Dolphin.ini', { encoding: 'utf8' });
       postMessage({ cmd: 'print', txt: '[config] Dolphin.ini: ' + cfg.replace(/\n/g, ' \\n ') });
@@ -277,12 +366,6 @@ self.onmessage = function (e) {
   // (get-ram-info) never reach this switch in live runs (ramInfoSeen=0 on
   // BOTH MP4 and PSO dumps while print/audio replies flow). Logs every
   // non-romChunk command arrival. Strip with the other diags per gate #8.
-  if (data.cmd && data.cmd !== 'romChunk') {
-    self.__mbCount = (self.__mbCount || 0) + 1;
-    if (data.cmd !== 'input' || (self.__mbCount % 200) === 1) {
-      try { postMessage({ cmd: 'print', txt: '[mailbox-diag] n=' + self.__mbCount + ' cmd=' + data.cmd }); } catch (_) {}
-    }
-  }
   switch (data.cmd) {
     case 'romChunk':
       if (data.buf && data.buf.byteLength) {
@@ -307,14 +390,6 @@ self.onmessage = function (e) {
         var ptr = Module._get_pad_ptr();
         if (data.states && data.states.length) {
           Module.HEAPU8.set(data.states, ptr);
-          // [mailbox-diag] log non-neutral pad arrivals (edge-triggered) so
-          // synthetic presses are provable at the g_pad sink. Strip per gate #8.
-          var nz = 0;
-          for (var si = 0; si < data.states.length; si++) nz |= data.states[si];
-          if (nz !== self.__lastPadNz) {
-            self.__lastPadNz = nz;
-            try { postMessage({ cmd: 'print', txt: '[mailbox-diag] pad bits=0x' + nz.toString(16) + ' b0=0x' + data.states[0].toString(16) + ' b1=0x' + data.states[1].toString(16) }); } catch (_) {}
-          }
         }
       }
       break;
@@ -352,7 +427,7 @@ self.onmessage = function (e) {
         var src = data.data || new Uint8Array(0);
         var ptr = Module._malloc(src.length);
         Module.HEAPU8.set(src, ptr);
-        Module._load_state(ptr, src.length);
+        var _lsret = Module._load_state(ptr, src.length);
         Module._free(ptr);
         postMessage({ cmd: 'stateLoaded' });
       } catch (e) {

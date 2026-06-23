@@ -33,8 +33,14 @@ void emit_bx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp
 // BLR-stack: the inline BO=20 LK=1 path pushes. The interp-fallback path
 // does NOT push (interp owns LR mutation for the LK arm); this is a known
 // gap in the mispredict diagnostic, tolerated because bclXX,LK is rare.
+// is_terminal=true (default): the bcx ends the block — store PC=target on taken,
+// PC=fallthrough on not-taken, then the epilogue returns next-PC (today's
+// behavior). is_terminal=false (forward-conditional coalescing): emit a mid-
+// block conditional EXIT — taken stores PC=target, drains a pending gather-pipe
+// write, and returns to the dispatcher; the not-taken arm stores NOTHING and
+// the block keeps emitting the fall-through instructions.
 void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
-              u32 ctx_ptr);
+              u32 ctx_ptr, bool is_terminal = true);
 
 // Indirect: bclr (op19:16) takes target from LR; bcctr (op19:528) takes
 // target from CTR. Both support LK to set LR=next_pc.

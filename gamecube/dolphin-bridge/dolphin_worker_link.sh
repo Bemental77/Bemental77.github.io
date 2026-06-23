@@ -18,7 +18,7 @@ source $ROOT/emsdk/emsdk_env.sh > /dev/null 2>&1
 # all sanitized away in df03d80 / canonical bridge cleanup. Page-side calls to
 # any of those will fail with a clear "missing export" at runtime — that
 # becomes the trigger for canonical re-introduction work, file by file.
-EXPORTED_FUNCS='["_main","_malloc","_free","_load_iso","_load_state","_save_state","_state_size","_run_iter","_run_iter_batch","_get_pad_ptr","_dolphin_read8","_dolphin_read16","_dolphin_read32","_dolphin_write8","_dolphin_write16","_dolphin_write32","_dolphin_check_exc","_dolphin_break_block","_dolphin_hle_check","_dolphin_hle_fire","_dolphin_interp","_dolphin_msr_updated","_dolphin_gather_drain","_dolphin_get_ram_addr","_dolphin_get_ram_size","_dolphin_get_cp_state"]'
+EXPORTED_FUNCS='["_main","_malloc","_free","_load_iso","_load_state","_save_state","_state_size","_run_iter","_run_iter_batch","_get_pad_ptr","_dolphin_read8","_dolphin_read16","_dolphin_read32","_dolphin_write8","_dolphin_write16","_dolphin_write32","_dolphin_check_exc","_dolphin_break_block","_dolphin_hle_check","_dolphin_hle_fire","_dolphin_interp","_dolphin_msr_updated","_dolphin_gather_drain","_dolphin_get_ram_addr","_dolphin_get_ram_size","_dolphin_get_cp_state","_bem_chain_loop_c"]'
 
 EXPORTED_RUNTIME='["ccall","cwrap","getValue","setValue","addFunction","removeFunction","addRunDependency","removeRunDependency","FS","FS_createDataFile","FS_createPath","FS_createDevice","FS_createLazyFile","FS_createPreloadedFile","FS_unlink","callMain","ENV","stringToNewUTF8","HEAP8","HEAPU8","HEAP16","HEAPU16","HEAP32","HEAPU32","HEAPF32","HEAPF64"]'
 
@@ -100,9 +100,17 @@ emcc \
   -sSTACK_SIZE=8388608 \
   -sENVIRONMENT=worker \
   -sNO_EXIT_RUNTIME=1 \
-  -sASSERTIONS=1 \
+  -sASSERTIONS=0 \
   --profiling-funcs \
   -sALLOW_TABLE_GROWTH=1 \
+  -sUSE_WEBGL2=1 \
+  -sFULL_ES3=1 \
+  -sMIN_WEBGL_VERSION=2 \
+  -sMAX_WEBGL_VERSION=2 \
+  -sOFFSCREENCANVAS_SUPPORT=1 \
+  -sOFFSCREEN_FRAMEBUFFER=1 \
+  --pre-js $BRIDGE/webgl2-compat.js \
+  --js-library $BRIDGE/gl_override.js \
   -Wl,--allow-multiple-definition \
   -sEXPORTED_FUNCTIONS="$EXPORTED_FUNCS" \
   -sEXPORTED_RUNTIME_METHODS="$EXPORTED_RUNTIME" \
@@ -110,5 +118,22 @@ emcc \
   --embed-file $ROOT/gamecube/dolphin-src/Data/Sys/totaldb.dsy@/totaldb.dsy \
   --embed-file $ROOT/tools/gsne8p.map@/User/Maps/GSNE8P.map \
   --embed-file $ROOT/tools/gpoe8p.map@/User/Maps/GPOE8P.map
+
+# [HW-render] Post-build patch: Emscripten's pthread_create canvas-transfer
+# does a `for (var name of transferredCanvasNames)` without a null guard, so any
+# pthread_create with no canvas (e.g. libusb) throws "transferredCanvasNames is
+# not iterable". Insert the missing guard on the minified output. No-op if a
+# future emscripten fixes it (won't match).
+sed -i '' 's|for(var name of transferredCanvasNames)|if(!transferredCanvasNames)transferredCanvasNames=[];for(var name of transferredCanvasNames)|' "$OUT/dolphin_worker_emcc.js"
+
+# [HW-render getParameter fix 2026-06-17] Emscripten's OFFSCREEN_FRAMEBUFFER blit
+# (GL.blitOffscreenFramebuffer, called every present from _emscripten_webgl_do_commit_frame)
+# saves+restores ~11 pieces of GL state via gl.getParameter. Under
+# proxyContextToMainThread each getParameter is a SYNCHRONOUS cross-thread round-trip;
+# the CPU profile measured this at 24.4% of the busy render worker. Dolphin re-binds
+# its full pipeline state every frame, so the save/restore is pure waste — replace the
+# blit body with a getParameter-free version. Measured: 24.4% -> ~0, and PSO's guest
+# frame loop unblocked from stuck-at-4 to advancing (OutputXFB n=256+).
+node "$BRIDGE/patch_blit_getparameter.mjs" "$OUT/dolphin_worker_emcc.js"
 
 echo "linked: $OUT/dolphin_worker_emcc.js"

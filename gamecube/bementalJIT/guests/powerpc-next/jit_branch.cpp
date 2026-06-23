@@ -58,6 +58,31 @@
 namespace bemental::powerpc {
 
 static constexpr u32 WIMPORT_INTERP = 6;
+// Block-module import index for ppc_gather_drain (ppc_emit.cpp emitImportFunc
+// order; idx 12). Used by the coalesced taken-exit below to drain a pending
+// gather-pipe write, since the early op_return bypasses the block epilogue's
+// store-gated drain.
+static constexpr u32 WIMPORT_GATHER_DRAIN = 12;
+// [perf gather-gate] runtime "a write-gather-pipe store is pending" flag
+// (defined in src/block_cache.cpp). The coalesced taken-exit gates its drain on
+// this so it is a no-op when no GP write happened on the taken path.
+extern "C" { extern int g_bem_gp_dirty; }
+
+// emit_coalesced_taken_exit — the taken arm of a mid-block (is_terminal=false)
+// forward conditional branch: drain a pending gather-pipe write, then return
+// the just-stored target PC to the dispatcher. PC=target must already be stored.
+static void emit_coalesced_taken_exit(WasmModuleBuilder& wb, u32 ctx_ptr) {
+    wb.op_i32_const((s32)(uintptr_t)&g_bem_gp_dirty);
+    wb.op_i32_load(0);
+    wb.op_if();                       // void block (0x40)
+        wb.op_i32_const(0);
+        wb.op_i32_const(0);
+        wb.op_call(WIMPORT_GATHER_DRAIN);
+    wb.op_end();
+    wb.op_i32_const((s32)ctx_ptr);
+    wb.op_i32_load(ppc_off::PC);
+    wb.op_return();
+}
 
 // BLR-stack SAB layout. See header comment.
 static constexpr u32 BLR_RING_HEAD       = 0x026B0500u;
@@ -264,7 +289,7 @@ void emit_bx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp
 // WIMPORT_INTERP via the trailing path.
 // ---------------------------------------------------------------------------
 void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
-              u32 ctx_ptr) {
+              u32 ctx_ptr, bool is_terminal) {
     const u32 inst = op.inst;
     const u32 bo   = GekkoOperands::BO(inst);
 
@@ -319,8 +344,11 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
         if (is_bdnz) wb.op_i32_ne(); else wb.op_i32_eq();
         wb.op_if();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, target);
-        wb.op_else();
+            if (!is_terminal) emit_coalesced_taken_exit(wb, ctx_ptr);
+        if (is_terminal) {
+            wb.op_else();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, fallthrough);
+        }
         wb.op_end();
         return;
     }
@@ -373,8 +401,14 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
         if (!branch_if_true) wb.op_i32_eqz();        // invert: stack=1 iff taken
         wb.op_if();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, target);
-        wb.op_else();
+            // [coalesce] mid-block: taken drains a pending GP write + returns to
+            // the dispatcher; the not-taken arm stores nothing and the block
+            // continues with the fall-through instructions.
+            if (!is_terminal) emit_coalesced_taken_exit(wb, ctx_ptr);
+        if (is_terminal) {
+            wb.op_else();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, fallthrough);
+        }
         wb.op_end();
         return;
     }

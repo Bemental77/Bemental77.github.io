@@ -244,22 +244,40 @@ void emit_mtmsr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Cod
     rc.Flush(ctx_ptr);
     frc.Flush(ctx_ptr);
 
-    // Store new MSR.
+    // [perf] Gate the msr_updated host crossing on MSR.IR/DR actually
+    // changing. PowerPCManager::MSRUpdated() (PowerPC.cpp:681) derives
+    // feature_flags + membase SOLELY from MSR bits 4 (DR) and 5 (IR)
+    // ((msr.Hex>>4)&0x3); nothing else it does is observable on GC (the
+    // pagetable path needs DR set AND pagetable_update_pending, which GC's
+    // BAT-only MMU never sets). OSDisableInterrupts/OSRestoreInterrupts
+    // toggle only MSR.EE (bit 15) and dominate mtmsr traffic — for them the
+    // recompute is a pure no-op, but we were paying the wasm->JS crossing
+    // (profiled ~4% of JIT-worker time) every time. Compute (old^new)&0x30
+    // BEFORE the store, leave it on the wasm stack across the balanced store
+    // (store consumes only its own 2 operands), then call msr_updated only
+    // when IR/DR moved. rfi (which can also change IR/DR) keeps its own
+    // unconditional recompute. Mirrors the intent of Jit64::mtmsr
+    // (Jit_SystemRegisters.cpp:446 EmitUpdateMembase).
+    constexpr s32 MSR_IR_DR = 0x30;  // bit4 DR | bit5 IR
+    wb.op_i32_const((s32)ctx_ptr);
+    wb.op_i32_load(ppc_off::MSR);            // old MSR
+    wb.op_local_get(rc_rs.local_idx());      // new MSR
+    wb.op_i32_xor();
+    wb.op_i32_const(MSR_IR_DR);
+    wb.op_i32_and();                          // gate value (stays on stack)
+
+    // Store new MSR (balanced: pushes ctx+val, i32_store pops both).
     wb.op_i32_const((s32)ctx_ptr);
     wb.op_local_get(rc_rs.local_idx());
     wb.op_i32_store(ppc_off::MSR);
 
-    // Recompute feature_flags / membase from the new MSR (MSR.IR/DR drive
-    // address translation; without this they go stale and the host MMIO/RAM
-    // router rejects subsequent translated accesses as "Unable to resolve"
-    // — which is exactly the cascade seen on SAB boot leading to a
-    // misrouted EXT_INT vector trampoline → DBExceptionDestination →
-    // PPCHalt). Mirrors Jit64::mtmsr which calls EmitUpdateMembase at
-    // Jit_SystemRegisters.cpp:446. type-2 import takes (i32,i32) — args
-    // unused (handler reads global m_ppc_state).
-    wb.op_i32_const(0);
-    wb.op_i32_const(0);
-    wb.op_call(WIMPORT_MSR_UPDATED);
+    // Recompute feature_flags/membase ONLY when IR/DR changed. type-2
+    // import takes (i32,i32) — args unused (handler reads m_ppc_state).
+    wb.op_if();
+        wb.op_i32_const(0);
+        wb.op_i32_const(0);
+        wb.op_call(WIMPORT_MSR_UPDATED);
+    wb.op_end();
 
     // Advance PC to op.address+4. The op-level FL_ENDBLOCK ends the block
     // here; epilogue reads PC back. Without this advance the dispatcher

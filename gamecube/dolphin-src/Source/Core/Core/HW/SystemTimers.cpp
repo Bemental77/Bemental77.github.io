@@ -90,14 +90,6 @@ void SystemTimersManager::AudioDMACallback(Core::System& system, u64 userdata, s
   auto& system_timers = system.GetSystemTimers();
   const int callback_period = GetAudioDMACallbackPeriod(
       system_timers.m_cpu_core_clock, system.GetAudioInterface().GetAIDSampleRateDivisor());
-  {
-    static u64 axad_n = 0;
-    const u64 n = ++axad_n;
-    if (n <= 4 || (n & 0x3FF) == 0)
-      NOTICE_LOG_FMT(POWERPC, "[ax-aid] AudioDMACallback n={} period={} divisor={} late={}", n,
-                     callback_period, system.GetAudioInterface().GetAIDSampleRateDivisor(),
-                     cycles_late);
-  }
   system.GetCoreTiming().ScheduleEvent(callback_period - cycles_late,
                                        system_timers.m_event_type_audio_dma);
 }
@@ -149,9 +141,23 @@ void SystemTimersManager::SICallback(Core::System& system, u64 userdata, s64 cyc
   // Poll cadence: X half-lines per poll (SI_POLL.X, guest-programmed;
   // default 492 ~= one NTSC field ~= per-frame polling). Mirrors the
   // VICallback half-line idiom above.
+  //
+  // [si-poll-floor] GetPollXLines() can be 0 — before the guest programs
+  // SI_POLL during early boot, and (observed) under the WASM raw-DoState path
+  // that left m_poll.X=0. X=0 reschedules the SI event at -cycles_late (at/behind
+  // global_timer), so it re-fires EVERY CoreTiming::Advance: a poll storm
+  // (confirmed: 600K+ polls with xlines=0) that pins the slice length <=0 and
+  // starves guest forward progress — the deterministic SAB __fill_mem boot
+  // wedge (memset halts at a fixed address when the slice can never advance).
+  // The SI hardware cannot poll at a 0-line interval; native carries X=492 here.
+  // Floor the DEGENERATE 0 to the hardware default so the cadence matches native;
+  // any legitimate guest-programmed value (>=7 per SI_POLL.X) is left untouched.
+  u32 xlines = si.GetPollXLines();
+  if (xlines == 0)
+    xlines = 492;
   auto& core_timing = system.GetCoreTiming();
   core_timing.ScheduleEvent(
-      static_cast<s64>(si.GetPollXLines()) *
+      static_cast<s64>(xlines) *
               system.GetVideoInterface().GetTicksPerHalfLine() -
           cycles_late,
       system.GetSystemTimers().m_event_type_si);

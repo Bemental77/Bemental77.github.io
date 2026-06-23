@@ -3,6 +3,8 @@
 // and forwards video/audio out via postMessage to the main thread.
 
 #include <emscripten.h>
+#include <emscripten/html5.h>
+#include <emscripten/html5_webgl.h>
 #include <libretro.h>
 #include <cstdint>
 #include <cstdio>
@@ -94,8 +96,42 @@ static uint8_t g_pad[32] = {};
 
 static bool g_loaded = false;
 
+// [HW-render 2026-06-17] WebGL2 hardware-render path (adapted from the working
+// dreamcast/flycast-bridge). Dolphin's OGL backend is already linked
+// (libvideoogl.a); these answer SET_HW_RENDER + provide the WebGL2 context so
+// the backend rasterizes on the GPU instead of the CPU-thread Software
+// Renderer. The context is created on this pthread in main() (PROXY_TO_PTHREAD)
+// on the OffscreenCanvas the page transfers as Module.canvas ("#canvas").
+static struct retro_hw_render_callback g_hw_render = {};
+static bool g_hw_render_registered = false;
+static EMSCRIPTEN_WEBGL_CONTEXT_HANDLE g_gl_ctx = 0;
+
+static uintptr_t hw_get_current_framebuffer_cb(void) {
+    return 0;  // default FB = OffscreenCanvas backbuffer
+}
+static retro_proc_address_t hw_get_proc_address_cb(const char* sym) {
+    return (retro_proc_address_t)emscripten_webgl_get_proc_address(sym);
+}
+
 static bool environment_cb(unsigned cmd, void* data) {
     switch (cmd) {
+        case RETRO_ENVIRONMENT_SET_HW_RENDER: {
+            auto* req = (struct retro_hw_render_callback*)data;
+            g_hw_render = *req;
+            req->get_current_framebuffer        = hw_get_current_framebuffer_cb;
+            req->get_proc_address               = hw_get_proc_address_cb;
+            g_hw_render.get_current_framebuffer = hw_get_current_framebuffer_cb;
+            g_hw_render.get_proc_address        = hw_get_proc_address_cb;
+            g_hw_render_registered = true;
+            MAIN_THREAD_EM_ASM({
+                postMessage({cmd: 'print', txt: '[worker] SET_HW_RENDER captured (ctx_type=' + $0 + ', ver=' + $1 + '.' + $2 + ')'});
+            }, (int)g_hw_render.context_type, (int)g_hw_render.version_major, (int)g_hw_render.version_minor);
+            return true;
+        }
+        case RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER:
+            // Steer Dolphin to OpenGL ES 3 (WebGL2 is GLES3-compatible).
+            *(unsigned*)data = RETRO_HW_CONTEXT_OPENGLES3;
+            return true;
         case RETRO_ENVIRONMENT_GET_CAN_DUPE:
             *(bool*)data = true;
             return true;
@@ -134,6 +170,39 @@ static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
         MAIN_THREAD_EM_ASM({
             postMessage({cmd: 'print', txt: '[worker] video_cb data=' + $0 + ' w=' + $1 + ' h=' + $2 + ' pitch=' + $3 + ' n=' + $4});
         }, (uintptr_t)data, w, h, (uint32_t)pitch, frame_log);
+    }
+    // [HW-render] libretro passes (void*)-1 (RETRO_HW_FRAME_BUFFER_VALID) when
+    // the OGL backend rendered the frame into the WebGL2 backbuffer. Present it
+    // via the explicit swap on this GL-owning thread; do NOT dereference `data`.
+    if (data == (const void*)(intptr_t)-1) {
+        // [FIX#1] When the GL descriptor is enabled, this thread holds no
+        // canvas-bound GL context — the render worker owns the canvas and the
+        // OffscreenCanvas auto-presents its default FB. Emit the present opcode
+        // (56) into the ring instead of committing here; commit on this thread
+        // would error (no real context). Read the descriptor from the shared heap
+        // (same reason as the install gate). Cache after first read (per-frame).
+        static int rw = -1;
+        if (rw < 0) {
+            rw = EM_ASM_INT({
+                var h = Module.HEAPU32 || new Uint32Array(Module.HEAPU8.buffer);
+                return (h[0x07FF0000 >> 2] === 0x474C5244 && h[(0x07FF0000 >> 2) + 4] === 1) ? 1 : 0;
+            });
+        }
+        if (rw) {
+            EM_ASM({ if (Module.__gcGlEmitPresent) Module.__gcGlEmitPresent(); });
+        } else {
+            // Present the OGL-rendered backbuffer via the explicit swap on this
+            // GL-owning thread. (NB: the real per-frame OGL presents currently
+            // route through VideoCommon's presenter, not this path — verified
+            // 2026-06-17 by the [ax-commit] bracket never firing while
+            // [ax-present] ViSwap did.)
+            emscripten_webgl_commit_frame();
+        }
+        if (!first_frame_signaled) {
+            first_frame_signaled = true;
+            MAIN_THREAD_EM_ASM({ if (typeof markFirstFrame === 'function') markFirstFrame(); });
+        }
+        return;
     }
     if (!data || !w || !h) return;
     // First real frame — flip the boot-loop pacing flag so worker_funcs.js
@@ -210,6 +279,85 @@ int load_iso(const char* path) {
     MAIN_THREAD_EM_ASM({
         postMessage({cmd: 'print', txt: '[worker] load_iso: PowerPCState redirect set on pthread (0x02400000) — entry, path=' + UTF8ToString($0)});
     }, path);
+    // [HW-render path-c FIXED] Register the OffscreenCanvas in GL.offscreenCanvases
+    // on the worker-main (where proxyContextToMainThread+OFFSCREEN_FRAMEBUFFER
+    // resolves the WebGL2 context). The earlier version never compiled — a bare
+    // comma in the object literal split the variadic MAIN_THREAD_EM_ASM macro —
+    // so path-c was never actually tested. Build the entry field-by-field to
+    // avoid any top-level comma.
+    MAIN_THREAD_EM_ASM({
+        try {
+            if (typeof GL !== 'undefined' && Module.hwOffscreenCanvas
+                && !GL.offscreenCanvases['canvas']) {
+                var o = {};
+                o.offscreenCanvas = Module.hwOffscreenCanvas;
+                o.id = 'canvas';
+                GL.offscreenCanvases['canvas'] = o;
+                postMessage({cmd: 'print', txt: '[worker] GL.offscreenCanvases registered on worker-main'});
+            } else {
+                postMessage({cmd: 'print', txt: '[worker] GL reg skipped: GL=' + (typeof GL) + ' off=' + (!!Module.hwOffscreenCanvas)});
+            }
+        } catch (e) {
+            postMessage({cmd: 'print', txt: '[worker] GL reg error: ' + e});
+        }
+    });
+    // [FIX#1 render-worker] When the GL descriptor in the SHARED WASM HEAP is
+    // present+enabled (page wrote it at GL_DESC_OFF=0x07FF0000, magic 'GLRD',
+    // enabled=1), this thread does NOT own the on-screen canvas (the render
+    // worker does) and must NOT create a real on-canvas WebGL2 context. Instead
+    // install a RECORDING GLctx that streams every draw/state/upload into the
+    // heap-embedded ring for the render worker to replay. The descriptor is read
+    // from the shared heap (NOT Module.__gcRenderWorker) precisely because THIS
+    // code runs on the proxy-pthread where Module flags don't propagate but the
+    // shared heap is visible. Default path (descriptor absent) is byte-identical.
+    int g_render_worker = EM_ASM_INT({
+        var h = Module.HEAPU32 || new Uint32Array(Module.HEAPU8.buffer);
+        return (h[0x07FF0000 >> 2] === 0x474C5244 && h[(0x07FF0000 >> 2) + 4] === 1) ? 1 : 0;
+    });
+    // FIX#1: when render-worker offload is enabled the REAL WebGL2 context is
+    // still created below (on the throwaway 1x1 hwOffscreenCanvas the shim set),
+    // so Dolphin's get_proc_address resolves against a real emscripten context —
+    // skipping creation made boot call_indirect a null function. The RECORDER is
+    // then installed as an OVERLAY right after make_current (see just below),
+    // diverting draw/state/upload calls to the heap-embedded ring.
+    if (g_gl_ctx <= 0) {
+        EmscriptenWebGLContextAttributes attrs;
+        emscripten_webgl_init_context_attributes(&attrs);
+        attrs.majorVersion                 = 2;
+        attrs.minorVersion                 = 0;
+        attrs.alpha                        = false;
+        attrs.depth                        = true;
+        attrs.stencil                      = true;
+        attrs.antialias                    = false;
+        attrs.preserveDrawingBuffer        = false;
+        attrs.failIfMajorPerformanceCaveat = false;
+        attrs.enableExtensionsByDefault    = true;
+        attrs.explicitSwapControl          = true;
+        attrs.renderViaOffscreenBackBuffer = true;   // OFFSCREEN_FRAMEBUFFER path
+        // [HW-render path-a] The proxied main pthread does not own the canvas
+        // (OFFSCREENCANVASES_TO_PTHREAD doesn't reach _emscripten_proxy_main), so
+        // proxy context creation + GL to the canvas-owning thread (worker-main),
+        // backed by OFFSCREEN_FRAMEBUFFER. FALLBACK proxies only when the canvas
+        // isn't local to this thread (which it isn't here).
+        attrs.proxyContextToMainThread     = EMSCRIPTEN_WEBGL_CONTEXT_PROXY_FALLBACK;
+        g_gl_ctx = emscripten_webgl_create_context("#canvas", &attrs);
+        EMSCRIPTEN_RESULT mc =
+            (g_gl_ctx > 0) ? emscripten_webgl_make_context_current(g_gl_ctx) : (EMSCRIPTEN_RESULT)-1;
+        MAIN_THREAD_EM_ASM({
+            postMessage({cmd: 'print', txt: '[worker] WebGL2 ctx (load_iso) handle=' + $0 + ' make_current=' + $1});
+        }, (int)g_gl_ctx, (int)mc);
+        // FIX#1 render-worker: overlay the recorder on the now-current REAL
+        // context. get_proc_address already resolved against it; from here every
+        // _glXXX records into the ring for the render worker to replay.
+        if (g_render_worker && g_gl_ctx > 0) {
+            int ok = EM_ASM_INT({
+                return (typeof installGLRecorder === 'function') ? installGLRecorder() : 0;
+            });
+            MAIN_THREAD_EM_ASM({
+                postMessage({cmd: 'print', txt: '[worker] FIX#1 recording GLctx overlay installed=' + $0});
+            }, ok);
+        }
+    }
     if (g_loaded) retro_unload_game();
     retro_game_info info{};
     info.path = path;
@@ -443,13 +591,13 @@ int main(void) {
     retro_set_input_poll(input_poll_cb);
     retro_set_input_state(input_state_cb);
     retro_init();
-    // Force the software renderer. The default-Hardware path probes for
-    // GL/Vulkan/D3D contexts via env_cb (which we don't service), so it
-    // falls through to Null which renders nothing. The "Software" option is
-    // _DEBUG-gated in Options.cpp, so we must override Config directly.
-    Config::SetBase(Config::MAIN_GFX_BACKEND, std::string("Software Renderer"));
+    // [HW-render] The WebGL2 context is created at the START of load_iso (which
+    // runs on the same proxied pthread that then drives retro_load_game / the
+    // OGL backend), NOT here — under PROXY_TO_PTHREAD main() and load_iso may be
+    // different threads and the GL context is thread-current. Backend selection
+    // to "OGL" happens via SET_HW_RENDER (Video.cpp); no SW force here.
     MAIN_THREAD_EM_ASM({
-        postMessage({cmd: 'print', txt: '[worker] dolphin core inited (SW renderer)'});
+        postMessage({cmd: 'print', txt: '[worker] dolphin core inited (HW/OGL renderer pending ctx)'});
         postMessage({cmd: 'setStatus', txt: 'Dolphin core ready, waiting for ROM'});
     });
     emscripten_exit_with_live_runtime();

@@ -1,5 +1,13 @@
 
-add_library(dolphin_libretro STATIC
+# [traj-oracle 2026-06-20] STATIC for the emscripten/WASM build (linked into the
+# emcc output); MODULE for a native build so it loads in RetroArch as the Jit64
+# trajectory oracle. Native-only change — does not affect the shipping WASM build.
+if(EMSCRIPTEN)
+  set(_dolphin_libretro_libtype STATIC)
+else()
+  set(_dolphin_libretro_libtype MODULE)
+endif()
+add_library(dolphin_libretro ${_dolphin_libretro_libtype}
   Audio.cpp
   Boot.cpp
   Host.cpp

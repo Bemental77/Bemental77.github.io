@@ -30,3 +30,9 @@ ps1/ps1Wasm/roms/*.bin.parta* filter= diff= merge= -text
 n64/N64Wasm/dist/*.wasm              filter= diff= merge= -text
 n64/N64Wasm/dist/*.zip               filter= diff= merge= -text
 n64/N64Wasm/roms/*.z64               filter= diff= merge= -text
+
+# GameCube (Dolphin) deployable worker WASM must be served as real content by
+# GitHub Pages (does not resolve LFS pointers) — same fix as PS1/N64 above.
+# On prod it was a 133-byte LFS pointer (2026-06-22), so gamecube.html could
+# not load the worker. Override the *.wasm LFS rule for the deployable worker.
+gamecube/dolphin_libretro/dolphin_worker_emcc.wasm filter= diff= merge= -text

@@ -19,6 +19,16 @@
 #include <emscripten.h>
 #endif
 
+// [return-linking] RAS storage is defined in block_cache.cpp at the OUTER
+// `bemental` namespace scope (alongside g_disp_count), NOT bemental::powerpc —
+// declare the externs there so the mangled names match (else wasm-ld can't
+// resolve bemental::powerpc::g_blr_ras vs the bemental::g_blr_ras definition).
+namespace bemental {
+extern u32 g_blr_ras[];
+extern u32 g_blr_ras_sp;
+extern u32 g_blr_chain;
+}
+
 namespace bemental::powerpc {
 
 // ===========================================================================
@@ -1126,6 +1136,19 @@ static void emit_branch_resolution(EmitCtx& c, u32 target_pc, const u32* local_i
                 c.b.op_i32_const((s32)target_pc);
                 c.b.op_return();
             c.b.op_end();
+            // R2 (2026-06-17): bound the merged loop + feed CoreTiming. If the
+            // slice budget is exhausted, exit the region with target_pc so the
+            // host loop runs CoreTiming::Advance before re-entering. Mirrors the
+            // chain loop's per-block downcount bail (chain_dispatch_raw:465).
+            c.b.op_i32_const((s32)CTX);
+            c.b.op_i32_load(ppc_off::DOWNCOUNT);
+            c.b.op_i32_const(1);
+            c.b.op_i32_lt_s();              // downcount < 1  ==  downcount <= 0
+            c.b.op_if(0x40);
+                emit_set_pc(c, CTX, target_pc);
+                c.b.op_i32_const((s32)target_pc);
+                c.b.op_return();
+            c.b.op_end();
             c.b.op_br(actual_depth);
             return;
         }
@@ -1184,6 +1207,42 @@ static inline void emit_block_exit_flush(EmitCtx& c) {
     emit_flush_dirty_gprs_impl(c, g_ctx_ptr);
 }
 
+// [return-linking] RAS storage (g_blr_ras / g_blr_ras_sp / g_blr_chain) is
+// declared at bemental scope above and defined in block_cache.cpp. Plain u32
+// pairs: entry i = g_blr_ras[2i] (ret_pc), g_blr_ras[2i+1] (ret_slot). 256-entry
+// power-of-two ring. (Unqualified refs below resolve via parent-namespace lookup
+// from bemental::powerpc to bemental.)
+static constexpr u32 BLR_CHAIN_MAX = 64u;   // host boundary every 64 tail-chains
+
+// emit_blr_ras_push: at a merged-region `bl` (LK direct call) whose return
+// block (pc+4) resolves to a region slot, push (ret_pc=pc+4, ret_slot) onto the
+// RAS ring so the matching `blr` can tail-chain in-WASM. Clobbers TMP_A/TMP_B
+// (scratch; not live here — the bl already flushed+invalidated GPRs, and the
+// following callee branch-resolution sets them fresh). No-op if not merged or
+// the return slot isn't in-region (then the matching blr just mispredicts ->
+// safe op_return fallback).
+static void emit_blr_ras_push(EmitCtx& c) {
+    if (!c.merged_mode) return;
+    u32 ret_slot;
+    if (!try_resolve_target(c, c.pc + 4u, &ret_slot)) return;
+    const u32 ras_base = (u32)(uintptr_t)&g_blr_ras[0];
+    const u32 sp_addr  = (u32)(uintptr_t)&g_blr_ras_sp;
+    // TMP_A = sp
+    c.b.op_i32_const(0); c.b.op_i32_load(sp_addr); c.b.op_local_tee(LOCAL_TMP_A);
+    // TMP_B = (sp & 255) << 3  (byte offset of entry)
+    c.b.op_i32_const(255); c.b.op_i32_and();
+    c.b.op_i32_const(3);   c.b.op_i32_shl();
+    c.b.op_local_set(LOCAL_TMP_B);
+    // mem[ras_base + TMP_B + 0] = ret_pc (pc+4)
+    c.b.op_local_get(LOCAL_TMP_B); c.b.op_i32_const((s32)(c.pc + 4u)); c.b.op_i32_store(ras_base);
+    // mem[ras_base + TMP_B + 4] = ret_slot
+    c.b.op_local_get(LOCAL_TMP_B); c.b.op_i32_const((s32)ret_slot);    c.b.op_i32_store(ras_base + 4u);
+    // sp = sp + 1
+    c.b.op_i32_const(0);
+    c.b.op_local_get(LOCAL_TMP_A); c.b.op_i32_const(1); c.b.op_i32_add();
+    c.b.op_i32_store(sp_addr);
+}
+
 // bx/bl — primary 18, unconditional branch (with optional link).
 static void emit_bx_impl(EmitCtx& c) {
     const s32 li = LI(c.inst);
@@ -1204,6 +1263,7 @@ static void emit_bx_impl(EmitCtx& c) {
         // Matches JIT64's "flush all caller-saved on call" contract.
         emit_flush_dirty_gprs_impl(c, g_ctx_ptr);
         emit_invalidate_gpr_locals(c);
+        emit_blr_ras_push(c);   // [return-linking] record (pc+4 -> slot) for the matching blr
     }
     u32 lidx = 0u;
     const bool resolved = try_resolve_target(c, target, &lidx);
@@ -2321,6 +2381,70 @@ static void emit_indirect_branch_native(EmitCtx& c, u32 target_spr_idx) {
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::spr(target_spr_idx));
     c.b.op_local_set(LOCAL_TMP_A);
+
+    // [return-linking] Plain `blr` (LR, no link) in the merged region: pop the
+    // RAS and, if the predicted return PC == LR and the chain budget allows,
+    // tail-chain in-WASM to the return slot (set entry_sel + br $L) instead of
+    // op_return-ing to the host dispatcher. Any mismatch / empty / budget-out /
+    // self-slot-alias / downcount-exhausted falls through to the op_return
+    // fallback below — all correctness-preserving. TMP_A holds LR.
+    if (c.merged_mode && target_spr_idx == 8u && !LK(c.inst)) {
+        const u32 ras_base   = (u32)(uintptr_t)&g_blr_ras[0];
+        const u32 sp_addr    = (u32)(uintptr_t)&g_blr_ras_sp;
+        const u32 chain_addr = (u32)(uintptr_t)&g_blr_chain;
+        c.b.op_i32_const(0); c.b.op_i32_load(sp_addr);        // sp
+        c.b.op_i32_const(0); c.b.op_i32_ne();                 // sp != 0 (non-empty)
+        emit_local_op_if(c, 0x40);
+            // sp -= 1; TMP_B = new sp; store sp (commit pop before the match test)
+            c.b.op_i32_const(0); c.b.op_i32_load(sp_addr);
+            c.b.op_i32_const(1); c.b.op_i32_sub();
+            c.b.op_local_set(LOCAL_TMP_B);
+            c.b.op_i32_const(0); c.b.op_local_get(LOCAL_TMP_B); c.b.op_i32_store(sp_addr);
+            // TMP_C = (TMP_B & 255) << 3  (entry byte offset)
+            c.b.op_local_get(LOCAL_TMP_B); c.b.op_i32_const(255); c.b.op_i32_and();
+            c.b.op_i32_const(3); c.b.op_i32_shl();
+            c.b.op_local_set(LOCAL_TMP_C);
+            // (mem[ras_base + TMP_C] == LR) && (chain < BLR_CHAIN_MAX)
+            c.b.op_local_get(LOCAL_TMP_C); c.b.op_i32_load(ras_base);
+            c.b.op_local_get(LOCAL_TMP_A); c.b.op_i32_eq();
+            c.b.op_i32_const(0); c.b.op_i32_load(chain_addr);
+            c.b.op_i32_const((s32)BLR_CHAIN_MAX); c.b.op_i32_lt_s();
+            c.b.op_i32_and();
+            emit_local_op_if(c, 0x40);
+                // chain += 1
+                c.b.op_i32_const(0);
+                c.b.op_i32_const(0); c.b.op_i32_load(chain_addr); c.b.op_i32_const(1); c.b.op_i32_add();
+                c.b.op_i32_store(chain_addr);
+                // TMP_C = ret_slot = mem[ras_base + TMP_C + 4]
+                c.b.op_local_get(LOCAL_TMP_C); c.b.op_i32_load(ras_base + 4u);
+                c.b.op_local_set(LOCAL_TMP_C);
+                // ppc_state.pc := LR (canonical even though we tail-chain)
+                c.b.op_i32_const((s32)CTX); c.b.op_local_get(LOCAL_TMP_A); c.b.op_i32_store(ppc_off::PC);
+                // flush dirty GPRs WITHOUT clearing compile-time dirty[] so the
+                // op_return fallback below still flushes on the no-match path.
+                emit_flush_dirty_gprs_inside_branch(c, g_ctx_ptr);
+                // entry_sel := ret_slot
+                c.b.op_local_get(LOCAL_TMP_C); c.b.op_global_set(c.entry_sel_global_idx);
+                // self-slot guard: entry_sel == self_local_idx -> op_return(LR)
+                c.b.op_global_get(c.entry_sel_global_idx); c.b.op_i32_const((s32)c.self_local_idx); c.b.op_i32_eq();
+                c.b.op_if(0x40);
+                    c.b.op_i32_const((s32)CTX); c.b.op_local_get(LOCAL_TMP_A); c.b.op_i32_store(ppc_off::PC);
+                    c.b.op_local_get(LOCAL_TMP_A); c.b.op_return();
+                c.b.op_end();
+                // downcount guard: downcount < 1 -> op_return(LR) so the host
+                // runs CoreTiming::Advance before re-entering (slice budget).
+                c.b.op_i32_const((s32)CTX); c.b.op_i32_load(ppc_off::DOWNCOUNT);
+                c.b.op_i32_const(1); c.b.op_i32_lt_s();
+                c.b.op_if(0x40);
+                    c.b.op_i32_const((s32)CTX); c.b.op_local_get(LOCAL_TMP_A); c.b.op_i32_store(ppc_off::PC);
+                    c.b.op_local_get(LOCAL_TMP_A); c.b.op_return();
+                c.b.op_end();
+                // tail-chain: br to the region loop $L. local_block_depth tracks
+                // the two emit_local_op_if we opened (HOLE 1 fix).
+                c.b.op_br(c.br_to_loop_depth + c.local_block_depth);
+            emit_local_op_end(c);   // close match-if
+        emit_local_op_end(c);       // close sp!=0-if
+    }
 
     if (LK(c.inst)) {
         // LR = pc + 4. Note: for `blrl` (LK + bclr), the current LR was
@@ -4957,8 +5081,20 @@ std::vector<u8> build_region_function(const BlockInputs* blocks,
     for (u32 i = 0; i < n_blocks; ++i) {
         // Close the (N-i)-th nested block — landing point for sel == i.
         b.op_end();
-        // Emit block i's body. br_to_loop_depth = N - 1 - i.
         const BlockInputs& bi = blocks[i];
+        // R2 (2026-06-17): gekko bodies emit no downcount charge, so charge here
+        // on block entry (the br_table landing for sel==i) — mirrors
+        // build_block_next's prologue (downcount -= numCycles). Without this the
+        // merged loop never decrements downcount -> CoreTiming stalls; with it
+        // plus the per-iteration bail before `br $L` (emit_branch_resolution),
+        // the merged loop matches the chain loop's accounting exactly.
+        b.op_i32_const((s32)bi.ctx_ptr_const);
+        b.op_i32_const((s32)bi.ctx_ptr_const);
+        b.op_i32_load(ppc_off::DOWNCOUNT);
+        b.op_i32_const((s32)(bi.block_cycles ? bi.block_cycles : bi.count));
+        b.op_i32_sub();
+        b.op_i32_store(ppc_off::DOWNCOUNT);
+        // Emit block i's body. br_to_loop_depth = N - 1 - i.
         MergedModeArgs m;
         m.merged              = true;
         m.br_to_loop_depth    = (n_blocks - 1u) - i;

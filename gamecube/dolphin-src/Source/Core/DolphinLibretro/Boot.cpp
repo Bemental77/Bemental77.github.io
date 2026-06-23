@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <cstring>
 #include <libretro.h>
 #include <string>
 #include <functional>
@@ -214,6 +215,25 @@ bool retro_load_game(const struct retro_game_info* game)
   Common::RegisterMsgAlertHandler([](const char* caption, const char* text,
     bool yes_no, Common::MsgType style) -> bool
   {
+    // Rate-limit the MMU "Invalid write/read to 0x..., PC = 0x..." popups
+    // (MMU.cpp GenerateDSIException, real-mode boot). __fill_mem walks a buffer
+    // past the 24MB MEM1 boundary during early boot, firing this accurate-but-
+    // useless warning ~4,900x/sec — the dominant worker postMessage/format cost
+    // (~12% of worker_0) and a console flood. Keep the first one as a breadcrumb
+    // and a periodic heartbeat; drop the rest. All other popups log normally.
+    if (text && (std::strstr(text, "Invalid write to") ||
+                 std::strstr(text, "Invalid read from")))
+    {
+      static unsigned long s_invalid_mem_popups = 0;
+      if (s_invalid_mem_popups == 0)
+        INFO_LOG_FMT(COMMON, "Suppressed popup (first of many, rest rate-limited): {} - {}",
+                     caption, text);
+      else if ((s_invalid_mem_popups % 100000UL) == 0)
+        INFO_LOG_FMT(COMMON, "Suppressed {} MMU invalid-access popups so far",
+                     s_invalid_mem_popups);
+      ++s_invalid_mem_popups;
+      return true;
+    }
     // Log the message instead of showing a popup
     INFO_LOG_FMT(COMMON, "Suppressed popup: {} - {}", caption, text);
     return true; // Always "continue"

@@ -48,6 +48,118 @@ static constexpr u32 WIMPORT_INTERP    = 6;
 static constexpr u32 WIMPORT_CHECK_EXC = 7;
 static constexpr u8  BLOCK_TYPE_VOID   = 0x40;
 
+// In-WASM block chaining (defined in src/block_cache.cpp). Each per-block
+// module imports the host __indirect_function_table and, at its epilogue,
+// probes this direct-mapped pc->slot cache to return_call_indirect its
+// successor instead of returning the next-PC to the JS dispatch loop.
+extern "C" {
+    extern uint32_t      g_bem_disp_tag[];     // [BEM_DISP_BUCKETS] guest PC / 0xFFFFFFFF
+    extern int32_t       g_bem_disp_slot[];    // [BEM_DISP_BUCKETS] wasmTable index
+    extern uint32_t      g_bem_rtag[];         // [region] region-local cache: PC
+    extern int32_t       g_bem_rslot[];        // [region] region internal-table slot
+    extern uint32_t      g_bem_chain_exc0;     // Exceptions snapshot at chain entry
+    extern unsigned char g_bem_chain_enabled;  // master A/B toggle
+    extern uint32_t      g_bem_pc_exec[];       // Phase A: per-pc execution count
+    extern uint32_t      g_bem_promote_ring[];  // Phase A: prologue promote ring
+    extern uint32_t      g_bem_promote_n;       // Phase A: ring count
+    extern unsigned char g_bem_promote_enabled; // Phase A: A/B toggle
+    extern int           g_bem_gp_dirty;        // [perf] gather-pipe write pending (bridge)
+}
+static constexpr u32 BEM_DISP_MASK_NEXT = 0x3FFFFu;  // MUST match block_cache.cpp BEM_DISP_MASK (BEM_DISP_BITS=18)
+static constexpr u32 LOCAL_TMP_A_CHAIN  = 0u;       // build_block_next i32 scratch 0
+static constexpr u32 LOCAL_TMP_B_CHAIN  = 1u;       // build_block_next i32 scratch 1
+
+// Emit the block terminal: either tail-chain to the successor block in-WASM
+// (return_call_indirect via the imported table) or return the next-PC to the
+// JS chain_dispatch_raw loop. Precondition: ctx.PC already holds the next-PC
+// and RegCache/FPRRegCache have been flushed (successor reloads from memory).
+// tag_addr_ovr/slot_addr_ovr: when non-zero, resolve the successor via a
+// caller-supplied direct-mapped cache + return_call_indirect on TABLE 0 of the
+// current module. The per-block path passes 0/0 -> the global g_bem_disp_*
+// cache + the IMPORTED table 0. The region path passes its OWN cache addresses
+// (g_bem_rtag/g_bem_rslot, holding region-local internal-table slots) -> the
+// INTERNAL table 0 of the region module, which V8 inlines (same instance).
+static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
+                                 u32 tag_addr_ovr = 0u, u32 slot_addr_ovr = 0u) {
+    if (!g_bem_chain_enabled) {
+        b.op_i32_const((s32)ctx_ptr);
+        b.op_i32_load(ppc_off::PC);
+        b.op_return();
+        return;
+    }
+    const u32 tag_addr  = tag_addr_ovr  ? tag_addr_ovr  : (u32)(uintptr_t)&g_bem_disp_tag[0];
+    const u32 slot_addr = slot_addr_ovr ? slot_addr_ovr : (u32)(uintptr_t)&g_bem_disp_slot[0];
+    const u32 exc0_addr = (u32)(uintptr_t)&g_bem_chain_exc0;
+
+    // Service-point bail: return next-PC to the JS loop when the CoreTiming
+    // slice is spent OR a pending exception is actually DELIVERABLE by
+    // PowerPC::CheckExceptions. Verified to ~halve the SAB __fill_mem boot
+    // freeze in a load-matched interleaved A/B (BASE 6/12 -> FIX 3/12,
+    // 2026-06-22).
+    //
+    // The old form bailed on `Exceptions != g_bem_chain_exc0` (chain-entry
+    // snapshot). For a block reached by in-WASM tail-chain that snapshot is the
+    // PREDECESSOR's (stale): a masked async IRQ (SI EXTERNAL_INT posted while
+    // MSR.EE=0) made Exceptions(0x4) != exc0(0) fire, so the predecessor bailed
+    // BEFORE tail-chaining into its successor — SAB's __fill_mem arena clear
+    // then made zero forward progress and never reached OSEnableInterrupts to
+    // unmask the IRQ (the nondeterministic boot freeze). CheckExternalExceptions
+    // is a no-op while EE=0 (PowerPC.cpp:598), so bailing there was pure waste.
+    //
+    // Deliverable = (any non-maskable/synchronous exception pending) OR
+    //   (a maskable IRQ pending AND MSR.EE=1) — matches CheckExceptions exactly
+    //   and removes the stale-snapshot HEAD/TAIL asymmetry.
+    constexpr s32 EXC_SYNC     = 0x2FA;   // SYSCALL|DSI|ISI|ALIGN|FPU|PROGRAM|FAKE_MEMCHECK
+    constexpr s32 EXC_MASKABLE = 0x105;   // DECREMENTER|EXTERNAL_INT|PERFORMANCE_MONITOR
+    constexpr s32 MSR_EE       = 0x8000;
+    (void)exc0_addr;
+    // [a] downcount <= 0
+    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::DOWNCOUNT);
+    b.op_i32_const(0); b.op_i32_le_s();
+    // [b] (Exceptions & EXC_SYNC) != 0
+    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::EXCEPTIONS);
+    b.op_i32_const(EXC_SYNC); b.op_i32_and();
+    b.op_i32_const(0); b.op_i32_ne();
+    b.op_i32_or();
+    // [c] (Exceptions & EXC_MASKABLE) != 0  AND  (MSR & MSR_EE) != 0
+    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::EXCEPTIONS);
+    b.op_i32_const(EXC_MASKABLE); b.op_i32_and();
+    b.op_i32_const(0); b.op_i32_ne();
+    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::MSR);
+    b.op_i32_const(MSR_EE); b.op_i32_and();
+    b.op_i32_const(0); b.op_i32_ne();
+    b.op_i32_and();
+    b.op_i32_or();
+    b.op_if(BLOCK_TYPE_VOID);
+        b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
+    b.op_end();
+
+    // bucket byte-offset = ((PC>>2) & MASK) * 4 ; keep PC in TMP_A, byteoff in TMP_B
+    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
+    b.op_local_tee(LOCAL_TMP_A_CHAIN);
+    b.op_i32_const(2); b.op_i32_shr_u();
+    b.op_i32_const((s32)BEM_DISP_MASK_NEXT); b.op_i32_and();
+    b.op_i32_const(4); b.op_i32_mul();
+    b.op_local_tee(LOCAL_TMP_B_CHAIN);
+    // tag hit?  g_bem_disp_tag[bucket] == PC
+    b.op_i32_const((s32)tag_addr); b.op_i32_add(); b.op_i32_load(0);
+    b.op_local_get(LOCAL_TMP_A_CHAIN); b.op_i32_eq();
+    b.op_if(BLOCK_TYPE_VOID);
+        // slot = g_bem_disp_slot[bucket]; if slot >= 0 → return_call_indirect
+        b.op_i32_const((s32)slot_addr); b.op_local_get(LOCAL_TMP_B_CHAIN);
+        b.op_i32_add(); b.op_i32_load(0);
+        b.op_local_tee(LOCAL_TMP_A_CHAIN);
+        b.op_i32_const(0); b.op_i32_ge_s();
+        b.op_if(BLOCK_TYPE_VOID);
+            b.op_local_get(LOCAL_TMP_A_CHAIN);       // table index operand
+            b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+        b.op_end();
+    b.op_end();
+
+    // No chain (bail / tag miss / freed slot): return next-PC to the JS loop.
+    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
+}
+
 // Emit a fallback call to WIMPORT_INTERP for an op without a native
 // emitter. Flushes regcache (dirty wasm locals → PowerPCState memory) so
 // the interp sees current GPR state, calls into single-step, then
@@ -433,106 +545,17 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 // Set by host integrator (JitWasm) to HLE::GetHookByAddress wrapper.
 HleHookQueryFn g_hle_hook_query = nullptr;
 
-std::vector<u8> build_block_next(u32 start_pc,
-                                 const u32* insts, u32 count,
-                                 u32 ctx_ptr,
+// [region] Shared block-body emit: prologue (downcount/idle + promote ring) +
+// RegCache/FPRRegCache setup + the per-op dispatch loop + epilogue (gather
+// drain + flush + terminal). Extracted from build_block_next so the region
+// builder reuses the EXACT same op emission (13 imports, coalescing, gather/
+// msr gates). The caller declares locals + the module scaffolding. Live
+// per-block path is byte-identical (region_mode defaults false).
+static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
+                                 CodeBuffer& buffer, BlockStats& stats,
+                                 u32 count, u32 start_pc, u32 ctx_ptr,
                                  u32 mem1_base, u32 mem1_mask, u32 ram_size,
-                                 u32* out_cycles,
-                                 bool* out_is_idle_loop) {
-    // Wrap raw insts[] in a fetch callback for PPCAnalyzer.
-    struct FetchCtx { const u32* insts; u32 base_pc; u32 count; };
-    FetchCtx fc{insts, start_pc, count};
-    auto fetch = +[](u32 pc, void* user) -> u32 {
-        const FetchCtx* f = static_cast<const FetchCtx*>(user);
-        const u32 idx = (pc - f->base_pc) / 4;
-        if (idx >= f->count) return 0;
-        return f->insts[idx];
-    };
-
-    PPCAnalyzer pa;
-    CodeBlock block;
-    BlockStats stats;
-    block.m_stats = &stats;
-    CodeBuffer buffer;
-    pa.Analyze(start_pc, &block, &buffer, count, fetch, &fc);
-
-    if (out_cycles) *out_cycles = stats.numCycles;
-    if (out_is_idle_loop) {
-        // True iff the analyst's IsBusyWaitLoop classified the terminator
-        // as an mftb-style busy-wait. CTR-counted loops (bdnz) and other
-        // non-timing-poll self-loops set this false so the JitWasm
-        // dispatcher's idle-skip ring won't force downcount=0 on them.
-        const bool n_ops_positive = block.m_num_instructions > 0;
-        *out_is_idle_loop = n_ops_positive &&
-            buffer.data()[block.m_num_instructions - 1].branchIsIdleLoop;
-    }
-
-    WasmModuleBuilder b;
-    b.emitHeader();
-
-    // ---- Type section: 4 types (matches live) ----
-    //   type 0: () -> i32                 — block "run" function
-    //   type 1: (i32) -> i32              — ppc_read8/16/32, check_exc, hle_check
-    //   type 2: (i32, i32) -> ()          — ppc_write8/16/32, interp, break_block
-    //   type 3: (i32, i32) -> i32         — ppc_hle_fire
-    b.emitTypeSection(4);
-    {
-        const u8 i32t[]  = { WASM_TYPE_I32 };
-        const u8 i32x2[] = { WASM_TYPE_I32, WASM_TYPE_I32 };
-        b.emitFuncType(nullptr, 0, i32t, 1);     // type 0
-        b.emitFuncType(i32t, 1, i32t, 1);        // type 1
-        b.emitFuncType(i32x2, 2, nullptr, 0);    // type 2
-        b.emitFuncType(i32x2, 2, i32t, 1);       // type 3
-    }
-    b.endSection();
-
-    // ---- Import section: 1 memory + WIMPORT_COUNT (= 13) host functions ----
-    b.emitImportSection(1u + WIMPORT_COUNT);
-    b.emitImportMemory("env", "memory", /*initialPages=*/1u);
-    b.emitImportFunc("env", "ppc_read8",       /*type*/1);   // idx 0
-    b.emitImportFunc("env", "ppc_read16",      /*type*/1);   // idx 1
-    b.emitImportFunc("env", "ppc_read32",      /*type*/1);   // idx 2
-    b.emitImportFunc("env", "ppc_write8",      /*type*/2);   // idx 3
-    b.emitImportFunc("env", "ppc_write16",     /*type*/2);   // idx 4
-    b.emitImportFunc("env", "ppc_write32",     /*type*/2);   // idx 5
-    b.emitImportFunc("env", "ppc_interp",      /*type*/2);   // idx 6
-    b.emitImportFunc("env", "ppc_check_exc",   /*type*/1);   // idx 7
-    b.emitImportFunc("env", "ppc_break_block", /*type*/2);   // idx 8
-    b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);   // idx 9
-    b.emitImportFunc("env", "ppc_hle_fire",    /*type*/3);   // idx 10
-    b.emitImportFunc("env", "ppc_msr_updated", /*type*/2);   // idx 11
-    b.emitImportFunc("env", "ppc_gather_drain", /*type*/2);  // idx 12
-    b.endSection();
-
-    // ---- Function section: 1 function of type 0 ----
-    {
-        const u32 typeIdx[] = { 0u };
-        b.emitFunctionSection(1u, typeIdx);
-    }
-
-    // ---- Export section: "run" → func index = WIMPORT_COUNT ----
-    b.emitExportSection("run", WIMPORT_COUNT);
-
-    // ---- Code section: 1 function body ----
-    b.beginCodeSection(1u);
-    b.beginFuncBody();
-
-    // Locals: 2 i32 scratch (LOCAL_TMP_A=0, LOCAL_TMP_B=1) + 32 i32 GPR
-    // cache locals (indices 2..33) + 64 i64 FPR-lane locals (indices
-    // 34..97 — 32 ps0 lanes then 32 ps1 lanes). RegCache uses
-    // wasm_local_base=2; FPRRegCache uses wasm_local_base=34. Total 98
-    // locals, well within wasm engine limits.
-    {
-        // Groups 4+5: psq scratch — 2 i32 pair-element stages (locals 98,
-        // 99) + one f64 clamp stage (local 100); jit_load_store LOCAL_PSQ_*.
-        // Group 6: 2 i64 scratch (locals 101, 102) for op59/frsp
-        // Force25Bit + ForceSingle bit-twiddling; jit_floating_point
-        // LOCAL_FP_I64_*.
-        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u };
-        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64, WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64 };
-        b.emitLocals(6u, counts, types);
-    }
-
+                                 u32 chain_tag_addr = 0u, u32 chain_slot_addr = 0u) {
     // IN-BLOCK CYCLE ACCOUNTING (2026-06-12, Jit64 parity: Jit.cpp charges
     // js.downcountAmount at block entry). downcount -= numCycles emitted in
     // the block prologue so the chain dispatcher can run block-to-block
@@ -563,6 +586,54 @@ std::vector<u8> build_block_next(u32 start_pc,
             b.op_i32_const((s32)charge);
             b.op_i32_sub();
             b.op_i32_store(ppc_off::DOWNCOUNT);
+            // Phase A: per-block execution counter for region promotion. Counts
+            // EVERY execution (including in-WASM tail-chained entries the C
+            // dispatch loop never sees). On crossing HOT_THRESHOLD push start_pc
+            // to g_bem_promote_ring (drained C-side -> promote_hot -> region).
+            // Non-idle blocks only (idle/poll loops are idle-skipped, not hot).
+            // Uses scratch locals 0/1 (free here; RegCache uses 2..). TMP_A/B.
+            if (g_bem_promote_enabled) {
+                const u32 bkt       = (start_pc >> 2) & BEM_DISP_MASK_NEXT;
+                const u32 exec_addr = (u32)(uintptr_t)&g_bem_pc_exec[bkt];
+                const u32 ring_addr = (u32)(uintptr_t)&g_bem_promote_ring[0];
+                const u32 n_addr    = (u32)(uintptr_t)&g_bem_promote_n;
+                // count = *exec_addr + 1 ; *exec_addr = count ; (count in TMP_A)
+                b.op_i32_const((s32)exec_addr);
+                b.op_i32_const((s32)exec_addr); b.op_i32_load(0);
+                b.op_i32_const(1); b.op_i32_add();
+                b.op_local_tee(LOCAL_TMP_A_CHAIN);
+                b.op_i32_store(0);
+                // [xinst-fix] if ((count & 15) == 0) — fire EVERY 16 executions,
+                // not once at count==N. The promote drain is gated OFF during boot
+                // (g_bem_promote_active); the steady-state hot loop's blocks were
+                // compiled during boot, so a one-shot count==N trigger already
+                // passed before the gate opened and they'd never be captured. The
+                // every-16 trigger re-fires for already-warm blocks once the gate
+                // opens (promote_hot dedups, so repeats are cheap), while blocks
+                // run <16 times never push (cold-block filter).
+                b.op_local_get(LOCAL_TMP_A_CHAIN);
+                b.op_i32_const(15);
+                b.op_i32_and();
+                b.op_i32_const(0);
+                b.op_i32_eq();
+                b.op_if(BLOCK_TYPE_VOID);
+                    // pn = *n_addr ; if (pn < 256)
+                    b.op_i32_const((s32)n_addr); b.op_i32_load(0);
+                    b.op_local_tee(LOCAL_TMP_B_CHAIN);
+                    b.op_i32_const(256); b.op_i32_lt_u();
+                    b.op_if(BLOCK_TYPE_VOID);
+                        // g_bem_promote_ring[pn] = start_pc
+                        b.op_i32_const((s32)ring_addr);
+                        b.op_local_get(LOCAL_TMP_B_CHAIN); b.op_i32_const(4); b.op_i32_mul(); b.op_i32_add();
+                        b.op_i32_const((s32)start_pc);
+                        b.op_i32_store(0);
+                        // *n_addr = pn + 1
+                        b.op_i32_const((s32)n_addr);
+                        b.op_local_get(LOCAL_TMP_B_CHAIN); b.op_i32_const(1); b.op_i32_add();
+                        b.op_i32_store(0);
+                    b.op_end();
+                b.op_end();
+            }
         }
     }
 
@@ -721,7 +792,19 @@ std::vector<u8> build_block_next(u32 start_pc,
             first_fp_found = true;
         }
 
-        const bool emitted_native = dispatch_op(b, rc, frc, op, params);
+        // [coalesce] A FORWARD conditional branch that is NOT the block
+        // terminator (the decode loop + analyst kept decoding past it) is
+        // emitted as a mid-block conditional EXIT: taken stores PC=target +
+        // returns to the dispatcher, not-taken falls through to the next op in
+        // this same block. The pre-op set_pc above left PC=op.address for the
+        // not-taken arm; the next op's set_pc advances it to the fall-through.
+        bool emitted_native;
+        if (!is_terminator && IsForwardConditionalBranch(op.inst, op.address)) {
+            emit_bcx(b, rc, frc, op, ctx_ptr, /*is_terminal=*/false);
+            emitted_native = true;
+        } else {
+            emitted_native = dispatch_op(b, rc, frc, op, params);
+        }
 
         // Block-exit PC correctness for non-branch-terminated blocks (decode-
         // cap cuts, FL_ENDBLOCK non-branch terminators like mtspr MMCR0).
@@ -777,9 +860,20 @@ std::vector<u8> build_block_next(u32 start_pc,
     // any store could route to MMIO (including the gather-pipe range), so
     // we always drain when stores exist; only fully store-free blocks skip.
     if (block_has_store) {
-        b.op_i32_const(0);
-        b.op_i32_const(0);
-        b.op_call(WIMPORT_GATHER_DRAIN);
+        // [perf] Only cross to the host gather-pipe drain (a wasm->JS
+        // UpdateGatherPipe flush) when a gather-pipe write is actually
+        // pending. g_bem_gp_dirty (bridge) is set by dolphin_write* / interp
+        // on any WPAR (0xCC008000) store and cleared by the drain. Pure-
+        // compute store-blocks (the bulk) skip the crossing. UpdateGatherPipe
+        // only flushes complete 32-byte chunks, so skipping it while no GP
+        // write is pending is bit-identical to calling it (it would no-op).
+        b.op_i32_const((s32)(uintptr_t)&g_bem_gp_dirty);
+        b.op_i32_load(0);
+        b.op_if(BLOCK_TYPE_VOID);
+            b.op_i32_const(0);
+            b.op_i32_const(0);
+            b.op_call(WIMPORT_GATHER_DRAIN);
+        b.op_end();
     }
 
     // Flush dirty FPR lanes back to PowerPCState before the GPR flush.
@@ -789,9 +883,118 @@ std::vector<u8> build_block_next(u32 start_pc,
     // epilogue flush form a bit-exact round-trip on FPR memory.
     frc.Flush(ctx_ptr);
     rc.Flush(ctx_ptr);
-    b.op_i32_const((s32)ctx_ptr);
-    b.op_i32_load(ppc_off::PC);
-    b.op_return();
+    // Terminal: tail-chain to the successor block in-WASM when it resolves and
+    // no service point is pending; otherwise return next-PC to the JS loop.
+    emit_chain_or_return(b, ctx_ptr, chain_tag_addr, chain_slot_addr);
+}
+
+std::vector<u8> build_block_next(u32 start_pc,
+                                 const u32* insts, u32 count,
+                                 u32 ctx_ptr,
+                                 u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                                 u32* out_cycles,
+                                 bool* out_is_idle_loop) {
+    // Wrap raw insts[] in a fetch callback for PPCAnalyzer.
+    struct FetchCtx { const u32* insts; u32 base_pc; u32 count; };
+    FetchCtx fc{insts, start_pc, count};
+    auto fetch = +[](u32 pc, void* user) -> u32 {
+        const FetchCtx* f = static_cast<const FetchCtx*>(user);
+        const u32 idx = (pc - f->base_pc) / 4;
+        if (idx >= f->count) return 0;
+        return f->insts[idx];
+    };
+
+    PPCAnalyzer pa;
+    CodeBlock block;
+    BlockStats stats;
+    block.m_stats = &stats;
+    CodeBuffer buffer;
+    pa.Analyze(start_pc, &block, &buffer, count, fetch, &fc);
+
+    if (out_cycles) *out_cycles = stats.numCycles;
+    if (out_is_idle_loop) {
+        // True iff the analyst's IsBusyWaitLoop classified the terminator
+        // as an mftb-style busy-wait. CTR-counted loops (bdnz) and other
+        // non-timing-poll self-loops set this false so the JitWasm
+        // dispatcher's idle-skip ring won't force downcount=0 on them.
+        const bool n_ops_positive = block.m_num_instructions > 0;
+        *out_is_idle_loop = n_ops_positive &&
+            buffer.data()[block.m_num_instructions - 1].branchIsIdleLoop;
+    }
+
+    WasmModuleBuilder b;
+    b.emitHeader();
+
+    // ---- Type section: 4 types (matches live) ----
+    //   type 0: () -> i32                 — block "run" function
+    //   type 1: (i32) -> i32              — ppc_read8/16/32, check_exc, hle_check
+    //   type 2: (i32, i32) -> ()          — ppc_write8/16/32, interp, break_block
+    //   type 3: (i32, i32) -> i32         — ppc_hle_fire
+    b.emitTypeSection(4);
+    {
+        const u8 i32t[]  = { WASM_TYPE_I32 };
+        const u8 i32x2[] = { WASM_TYPE_I32, WASM_TYPE_I32 };
+        b.emitFuncType(nullptr, 0, i32t, 1);     // type 0
+        b.emitFuncType(i32t, 1, i32t, 1);        // type 1
+        b.emitFuncType(i32x2, 2, nullptr, 0);    // type 2
+        b.emitFuncType(i32x2, 2, i32t, 1);       // type 3
+    }
+    b.endSection();
+
+    // ---- Import section: 1 memory + WIMPORT_COUNT (= 13) host functions
+    //      + 1 table (__indirect_function_table, for in-WASM block chaining) ----
+    b.emitImportSection(1u + WIMPORT_COUNT + 1u);
+    b.emitImportMemory("env", "memory", /*initialPages=*/1u);
+    b.emitImportFunc("env", "ppc_read8",       /*type*/1);   // idx 0
+    b.emitImportFunc("env", "ppc_read16",      /*type*/1);   // idx 1
+    b.emitImportFunc("env", "ppc_read32",      /*type*/1);   // idx 2
+    b.emitImportFunc("env", "ppc_write8",      /*type*/2);   // idx 3
+    b.emitImportFunc("env", "ppc_write16",     /*type*/2);   // idx 4
+    b.emitImportFunc("env", "ppc_write32",     /*type*/2);   // idx 5
+    b.emitImportFunc("env", "ppc_interp",      /*type*/2);   // idx 6
+    b.emitImportFunc("env", "ppc_check_exc",   /*type*/1);   // idx 7
+    b.emitImportFunc("env", "ppc_break_block", /*type*/2);   // idx 8
+    b.emitImportFunc("env", "ppc_hle_check",   /*type*/1);   // idx 9
+    b.emitImportFunc("env", "ppc_hle_fire",    /*type*/3);   // idx 10
+    b.emitImportFunc("env", "ppc_msr_updated", /*type*/2);   // idx 11
+    b.emitImportFunc("env", "ppc_gather_drain", /*type*/2);  // idx 12
+    // Imported table = table index 0; emit_chain_or_return targets it via
+    // return_call_indirect. initial=0 so any host table (which is far larger)
+    // satisfies the import's minimum-size check.
+    b.emitImportTable("env", "__indirect_function_table", /*initial*/0u, /*hasMax*/false);
+    b.endSection();
+
+    // ---- Function section: 1 function of type 0 ----
+    {
+        const u32 typeIdx[] = { 0u };
+        b.emitFunctionSection(1u, typeIdx);
+    }
+
+    // ---- Export section: "run" → func index = WIMPORT_COUNT ----
+    b.emitExportSection("run", WIMPORT_COUNT);
+
+    // ---- Code section: 1 function body ----
+    b.beginCodeSection(1u);
+    b.beginFuncBody();
+
+    // Locals: 2 i32 scratch (LOCAL_TMP_A=0, LOCAL_TMP_B=1) + 32 i32 GPR
+    // cache locals (indices 2..33) + 64 i64 FPR-lane locals (indices
+    // 34..97 — 32 ps0 lanes then 32 ps1 lanes). RegCache uses
+    // wasm_local_base=2; FPRRegCache uses wasm_local_base=34. Total 98
+    // locals, well within wasm engine limits.
+    {
+        // Groups 4+5: psq scratch — 2 i32 pair-element stages (locals 98,
+        // 99) + one f64 clamp stage (local 100); jit_load_store LOCAL_PSQ_*.
+        // Group 6: 2 i64 scratch (locals 101, 102) for op59/frsp
+        // Force25Bit + ForceSingle bit-twiddling; jit_floating_point
+        // LOCAL_FP_I64_*.
+        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u };
+        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64, WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64 };
+        b.emitLocals(6u, counts, types);
+    }
+
+    emit_block_body_into(b, block, buffer, stats, count, start_pc, ctx_ptr,
+                         mem1_base, mem1_mask, ram_size);
 
     b.endFuncBody();
     b.endSection();
@@ -844,18 +1047,111 @@ std::vector<u8> emit_block_body_next(u32 start_pc, const u32* insts, u32 count,
                                      bool emit_hle_check,
                                      bool emit_perf_stub,
                                      bool emit_hle_check_native) {
-    return emit_block_body(start_pc, insts, count, ctx_ptr_const,
-                           mem1_base, mem1_mask, ram_size, instr_pcs,
-                           lookup_fn, lookup_user, emit_hle_check,
-                           emit_perf_stub, emit_hle_check_native);
+    // Real ppc-next region body: analyze, then emit ONLY the function body
+    // (locals + code, no module wrapper) so build_region_module_next can copy
+    // it verbatim into the region module's code section. Uses the SAME op
+    // emission as the live per-block path (emit_block_body_into) — 13 imports,
+    // coalescing, gather/msr gates — with the REGION-LOCAL cache so the
+    // in-WASM tail-chain resolves into the region module's INTERNAL table 0.
+    (void)instr_pcs; (void)lookup_fn; (void)lookup_user;
+    (void)emit_hle_check; (void)emit_perf_stub; (void)emit_hle_check_native;
+    struct FetchCtx { const u32* insts; u32 base_pc; u32 count; };
+    FetchCtx fc{insts, start_pc, count};
+    auto fetch = +[](u32 pc, void* user) -> u32 {
+        const FetchCtx* f = static_cast<const FetchCtx*>(user);
+        const u32 idx = (pc - f->base_pc) / 4u;
+        if (idx >= f->count) return 0u;
+        return f->insts[idx];
+    };
+    PPCAnalyzer pa;
+    CodeBlock block;
+    BlockStats stats;
+    block.m_stats = &stats;
+    CodeBuffer buffer;
+    pa.Analyze(start_pc, &block, &buffer, count, fetch, &fc);
+
+    WasmModuleBuilder b;
+    b.beginFuncBody();
+    {
+        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u };
+        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64,
+                               WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64 };
+        b.emitLocals(6u, counts, types);
+    }
+    const u32 rtag  = (u32)(uintptr_t)&g_bem_rtag[0];
+    const u32 rslot = (u32)(uintptr_t)&g_bem_rslot[0];
+    emit_block_body_into(b, block, buffer, stats, count, start_pc, ctx_ptr_const,
+                         mem1_base, mem1_mask, ram_size, rtag, rslot);
+    b.endFuncBody();
+    return b.getBytes();
 }
 
 std::vector<u8> build_region_module_next(const u8* concatenated_bodies,
                                          std::size_t concatenated_size,
                                          u32 n_funcs,
                                          u32 mem_pages) {
-    return build_region_module(concatenated_bodies, concatenated_size,
-                               n_funcs, mem_pages);
+    // Real ppc-next region module: N pre-emitted bodies + an INTERNAL funcref
+    // table (V8 inlines intra-region return_call_indirect because the table is
+    // declared, not imported). 13 imports (incl ppc_msr_updated/ppc_gather_drain
+    // — the gekko region path omitted these, the staleness bug). Section order
+    // per spec: type, import, function, table, export, element, code.
+    if (n_funcs == 0u || concatenated_bodies == nullptr || concatenated_size == 0u)
+        return {};
+    WasmModuleBuilder b;
+    b.emitHeader();
+    b.emitTypeSection(4);
+    {
+        const u8 i32t[]  = { WASM_TYPE_I32 };
+        const u8 i32x2[] = { WASM_TYPE_I32, WASM_TYPE_I32 };
+        b.emitFuncType(nullptr, 0, i32t, 1);
+        b.emitFuncType(i32t, 1, i32t, 1);
+        b.emitFuncType(i32x2, 2, nullptr, 0);
+        b.emitFuncType(i32x2, 2, i32t, 1);
+    }
+    b.endSection();
+    b.emitImportSection(1u + WIMPORT_COUNT);
+    b.emitImportMemory("env", "memory", mem_pages > 0u ? mem_pages : 1u);
+    b.emitImportFunc("env", "ppc_read8",       1);   // 0
+    b.emitImportFunc("env", "ppc_read16",      1);   // 1
+    b.emitImportFunc("env", "ppc_read32",      1);   // 2
+    b.emitImportFunc("env", "ppc_write8",      2);   // 3
+    b.emitImportFunc("env", "ppc_write16",     2);   // 4
+    b.emitImportFunc("env", "ppc_write32",     2);   // 5
+    b.emitImportFunc("env", "ppc_interp",      2);   // 6
+    b.emitImportFunc("env", "ppc_check_exc",   1);   // 7
+    b.emitImportFunc("env", "ppc_break_block", 2);   // 8
+    b.emitImportFunc("env", "ppc_hle_check",   1);   // 9
+    b.emitImportFunc("env", "ppc_hle_fire",    3);   // 10
+    b.emitImportFunc("env", "ppc_msr_updated", 2);   // 11
+    b.emitImportFunc("env", "ppc_gather_drain", 2);  // 12
+    b.endSection();
+    {
+        std::vector<u32> typeIndices(n_funcs, 0u);
+        b.emitFunctionSection(n_funcs, typeIndices.data());
+    }
+    b.beginTableSection(1);
+    b.emitTable(n_funcs, /*hasMax=*/true, n_funcs, WASM_REF_FUNCREF);
+    b.endSection();
+    b.beginExportSection(n_funcs);
+    {
+        char name[24];
+        for (u32 i = 0; i < n_funcs; ++i) {
+            std::snprintf(name, sizeof(name), "fn_%u", (unsigned)i);
+            b.emitExport(name, WASM_EXPORT_FUNC, WIMPORT_COUNT + i);
+        }
+    }
+    b.endSection();
+    b.beginElementSection(1);
+    {
+        std::vector<u32> indices(n_funcs);
+        for (u32 i = 0; i < n_funcs; ++i) indices[i] = WIMPORT_COUNT + i;
+        b.emitActiveElementSegment(/*offset=*/0u, indices.data(), n_funcs);
+    }
+    b.endSection();
+    b.beginCodeSection(n_funcs);
+    b.emitBytes(concatenated_bodies, concatenated_size);
+    b.endSection();
+    return b.getBytes();
 }
 
 std::vector<u8> build_region_function_next(const BlockInputs* blocks,

@@ -15,6 +15,14 @@ const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 // the V8 wasm tier-up signal is not visible from console logs alone.
 const CAPTURE_TRACE = process.env.PROBE_NO_TRACE ? false : true;
 const TRACE_PATH    = process.env.PROBE_TRACE_PATH || '/tmp/probe-trace.json';
+// [worker CPU profile] PROBE_CPU_PROFILE=1 attaches a CDP Profiler to every
+// worker target (the CPU loop runs on a PROXY_TO_PTHREAD worker, not main),
+// samples during steady-state gameplay, and prints a self-time category
+// breakdown (dispatch vs host-imports vs block-bodies vs coretiming) — grounds
+// where worker wall-time actually goes instead of the [pc-census] snapshot.
+const CPU_PROFILE      = process.env.PROBE_CPU_PROFILE === '1';
+const CPU_PROFILE_DELAY = parseInt(process.env.PROBE_CPU_PROFILE_DELAY_MS || '12000', 10);
+const CPU_PROFILE_OUT  = process.env.PROBE_CPU_PROFILE_OUT || '/tmp/worker.cpuprofile';
 const METRICS_PATH  = process.env.PROBE_METRICS_PATH || '/tmp/probe-metrics.json';
 const METRICS_INTERVAL_MS = parseInt(process.env.PROBE_METRICS_INTERVAL_MS || '5000', 10);
 
@@ -51,6 +59,19 @@ function startServer() {
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       let urlPath = decodeURIComponent(req.url.split('?')[0]);
       if (urlPath === '/') urlPath = '/gamecube.html';
+      // Headless gameplay-state injection: serve the PROBE_LOAD_STATE file
+      // (a gzipped save-state exported from gamecube.html) at a fixed route so
+      // the page can fetch + restore it without a giant page.evaluate arg.
+      if (urlPath === '/__probe_state' && process.env.PROBE_LOAD_STATE) {
+        const sp = process.env.PROBE_LOAD_STATE;
+        fs.stat(sp, (e, st) => {
+          if (e) { res.statusCode = 404; res.end('no state'); return; }
+          res.setHeader('Content-Type', 'application/octet-stream');
+          res.setHeader('Content-Length', st.size);
+          fs.createReadStream(sp).pipe(res);
+        });
+        return;
+      }
       const filePath = path.join(ROOT, urlPath);
       fs.stat(filePath, (err, stat) => {
         if (err) { res.statusCode = 404; res.end('404'); return; }
@@ -72,12 +93,20 @@ function startServer() {
   const browser = await puppeteer.launch({
     executablePath: CHROME,
     headless: 'new',
+    // Persistent profile so IndexedDB savestates (SAVE_KEY) survive across runs —
+    // lets the slow PSO boot be checkpointed and resumed (PROBE_LOAD_IDB_MS).
+    ...(process.env.PROBE_PROFILE_DIR ? { userDataDir: process.env.PROBE_PROFILE_DIR } : {}),
     // V8 flag default = `--no-liftoff` (TurboFan-only). On the post-
     // gate JIT (lever-2 + andc + HLE-check inline), this measured 2.2x
     // throughput vs default V8 (Liftoff baseline + dynamic-tiering)
     // on real-game SAB. Override via PROBE_JS_FLAGS env var.
     args: ['--no-sandbox', '--enable-features=SharedArrayBuffer', '--disable-web-security',
            `--js-flags=--max-old-space-size=4096 ${process.env.PROBE_JS_FLAGS || '--no-liftoff'}`,
+           // [cache-bust] disable Chrome's HTTP cache so pthread WORKERS (which
+           // fetch dolphin_worker.js / emcc.js / .wasm by bare name, outside the
+           // page's setCacheEnabled scope) always load the freshly-linked build.
+           // Otherwise new bridge code silently never runs on the proxy-main pthread.
+           '--disk-cache-size=1', '--disable-application-cache', '--disable-back-forward-cache',
            '--disable-dev-shm-usage'],
     protocolTimeout: 600000,
   });
@@ -245,6 +274,29 @@ function startServer() {
   });
   console.log('[probe] Start clicked (ROM=' + picked + '), observing for ' + (TEST_DURATION_MS/1000) + 's...');
 
+  // ---- worker CPU profiler (PROBE_CPU_PROFILE=1) --------------------------
+  const cpuProf = { sessions: [], started: false };
+  if (CPU_PROFILE) {
+    setTimeout(async () => {
+      try {
+        const wts = browser.targets().filter(
+          (t) => ['worker', 'shared_worker', 'other'].includes(t.type()));
+        for (const t of wts) {
+          try {
+            const s = await t.createCDPSession();
+            await s.send('Profiler.enable');
+            await s.send('Profiler.setSamplingInterval', { interval: 200 });
+            await s.send('Profiler.start');
+            cpuProf.sessions.push({ url: t.url(), type: t.type(), s });
+          } catch (_e) { /* not profilable */ }
+        }
+        cpuProf.started = true;
+        console.log('[probe] CPU profiler started on ' + cpuProf.sessions.length
+          + ' worker target(s) after ' + CPU_PROFILE_DELAY + 'ms boot-skip');
+      } catch (e) { console.error('[probe] CPU profiler start failed: ' + e.message); }
+    }, CPU_PROFILE_DELAY);
+  }
+
   // ---- synthetic pad presses ----------------------------------------------
   // PROBE_PRESS="start@45000,a@52000" → at each offset (ms from Start
   // click), hold the named GC button for PRESS_HOLD_MS via the page's own
@@ -269,6 +321,76 @@ function startServer() {
         }, PRESS_HOLD_MS);
       } catch (e) { console.log('[probe] press keydown failed: ' + e.message); }
     }, parseInt(m[2], 10));
+  });
+
+  // ---- gameplay-state injection (skip the boot) ---------------------------
+  // PROBE_LOAD_STATE=<path to gzipped state exported from gamecube.html>.
+  // After PROBE_LOAD_STATE_MS (default 25000ms post-Start, enough for the core
+  // to finish retro_load_game), fetch /__probe_state and restore it so the
+  // probe measures GAMEPLAY rather than the boot decompressor.
+  if (process.env.PROBE_LOAD_STATE) {
+    const loadAt = parseInt(process.env.PROBE_LOAD_STATE_MS || '25000', 10);
+    setTimeout(async () => {
+      try {
+        const r = await page.evaluate(async () => {
+          if (typeof window.__probeLoadStateFromGz !== 'function') return 'no-hook';
+          const resp = await fetch('/__probe_state', { cache: 'no-store' });
+          if (!resp.ok) return 'fetch-' + resp.status;
+          const buf = new Uint8Array(await resp.arrayBuffer());
+          await window.__probeLoadStateFromGz(buf);
+          return 'loaded ' + buf.byteLength + ' bytes';
+        });
+        console.log('[probe] PROBE_LOAD_STATE @' + loadAt + 'ms -> ' + r);
+      } catch (e) { console.log('[probe] PROBE_LOAD_STATE failed: ' + e.message); }
+    }, loadAt);
+  }
+
+  // ---- screenshot capture (verify what's actually on screen) --------------
+  // PROBE_SHOT="/tmp/x.png@50000" → CDP compositor screenshot at that offset.
+  // Captures the composited page incl. the worker-owned OffscreenCanvas, which
+  // main-thread getImageData cannot reach.
+  (process.env.PROBE_SHOT || '').split(',').filter(Boolean).forEach((spec) => {
+    const m = spec.trim().match(/^(.+)@(\d+)$/);
+    if (!m) { console.log('[probe] PROBE_SHOT spec ignored: ' + spec); return; }
+    setTimeout(async () => {
+      try { await page.screenshot({ path: m[1], captureBeyondViewport: false }); console.log('[probe] screenshot -> ' + m[1] + ' @' + m[2] + 'ms'); }
+      catch (e) { console.log('[probe] screenshot failed: ' + e.message); }
+    }, parseInt(m[2], 10));
+  });
+
+  // ---- report the WASM build's own raw DoState size (format-compat check) --
+  if (process.env.PROBE_STATE_SIZE_MS) {
+    setTimeout(async () => {
+      try {
+        const sz = await page.evaluate(() => window.__probeStateSize ? window.__probeStateSize() : -1);
+        console.log('[probe] WASM raw DoState size = ' + sz + ' bytes');
+      } catch (e) { console.log('[probe] state-size check failed: ' + e.message); }
+    }, parseInt(process.env.PROBE_STATE_SIZE_MS, 10));
+  }
+
+  // ---- checkpoint: resume the slow boot from IndexedDB ---------------------
+  // PROBE_LOAD_IDB_MS=<ms>: restore the saved checkpoint (SAVE_KEY) so the run
+  // continues from where a prior run left off (needs PROBE_PROFILE_DIR).
+  if (process.env.PROBE_LOAD_IDB_MS) {
+    setTimeout(async () => {
+      try {
+        const r = await page.evaluate(async () => {
+          if (!window.__probeHasState || !(await window.__probeHasState())) return 'no-checkpoint';
+          await window.__probeLoadState(); return 'resumed';
+        });
+        console.log('[probe] PROBE_LOAD_IDB @' + process.env.PROBE_LOAD_IDB_MS + 'ms -> ' + r);
+      } catch (e) { console.log('[probe] PROBE_LOAD_IDB failed: ' + e.message); }
+    }, parseInt(process.env.PROBE_LOAD_IDB_MS, 10));
+  }
+
+  // PROBE_SAVE_AT_MS=<ms>[,<ms>...]: checkpoint to IndexedDB at each offset.
+  (process.env.PROBE_SAVE_AT_MS || '').split(',').filter(Boolean).forEach((ms) => {
+    setTimeout(async () => {
+      try {
+        const r = await page.evaluate(async () => { if (!window.__probeSaveState) return 'no-hook'; await window.__probeSaveState(); return 'saved'; });
+        console.log('[probe] PROBE_SAVE_AT @' + ms + 'ms -> ' + r);
+      } catch (e) { console.log('[probe] PROBE_SAVE_AT failed: ' + e.message); }
+    }, parseInt(ms, 10));
   });
 
   // ---- page.metrics() snapshots over the run -----------------------------
@@ -301,6 +423,34 @@ function startServer() {
   clearInterval(metricsTimer);
   if (stuckReason) console.log('[probe] EXIT-STUCK: ' + stuckReason);
 
+  // ---- stop CPU profiler + categorize self-time --------------------------
+  if (CPU_PROFILE && cpuProf.started) {
+    let wi = 0;
+    for (const ps of cpuProf.sessions) {
+      try {
+        const { profile } = await ps.s.send('Profiler.stop');
+        const named = {}; let total = 0, idle = 0;
+        for (const node of (profile.nodes || [])) {
+          const h = node.hitCount || 0; if (!h) continue;
+          total += h;
+          const fn = node.callFrame.functionName || '(anon)';
+          if (fn === '(idle)') idle += h;
+          named[fn] = (named[fn] || 0) + h;
+        }
+        if (total === 0) { wi++; continue; }
+        const isCpu = !!(named['JitWasm::Run()'] || named['retro_run'] || named['(anon)']);
+        const pct = (n) => (100 * n / total).toFixed(1);
+        const top = Object.entries(named).sort((a, b) => b[1] - a[1]).slice(0, 10);
+        console.log('\n--- worker[' + wi + '] ' + (isCpu ? 'CPU/RENDER' : 'pool') + '  total=' + total
+          + '  idle=' + pct(idle) + '%  ' + ps.url.replace(/^https?:\/\/[^/]+/, ''));
+        top.forEach(([fn, h]) => console.log('  ' + pct(h) + '%  ' + fn));
+        try { fs.writeFileSync('/tmp/worker_' + wi + '.cpuprofile', JSON.stringify(profile)); } catch (_e) {}
+        wi++;
+      } catch (e) { console.error('[probe] Profiler.stop failed (' + ps.url + '): ' + e.message); wi++; }
+    }
+    console.log('  (per-worker cpuprofiles → /tmp/worker_<i>.cpuprofile)');
+  }
+
   // ---- stop tracing & dump metrics ---------------------------------------
   if (CAPTURE_TRACE) {
     try {
@@ -317,9 +467,15 @@ function startServer() {
     }
   }
 
-  const canvasInfo = await page.evaluate(async () => {
-    const c = document.getElementById('canvas');
-    if (!c) return { found: false };
+  // Non-fatal: a saturated busy scene (heavy GL proxied worker→main) can jam
+  // the main thread so this evaluate times out. Don't let it kill the bucket
+  // printout — the buckets are collected live via page.on('console').
+  let canvasInfo = { found: false, note: 'not-collected' };
+  try {
+    canvasInfo = await Promise.race([
+      page.evaluate(async () => {
+        const c = document.getElementById('canvas');
+        if (!c) return { found: false };
     // Try main-thread getContext('2d') first — works when paint runs on
     // main thread. Fails with InvalidStateError if the canvas has been
     // transferControlToOffscreen'd to a worker, in which case we fall
@@ -341,9 +497,12 @@ function startServer() {
       return { found: true, has2d: false, offscreen: true, w: c.width, h: c.height, transferredError: String(e) };
     }
     return { found: true, has2d: false, w: c.width, h: c.height };
-  });
+      }),
+      new Promise((res) => setTimeout(() => res({ found: false, note: 'canvasInfo-timeout (main thread saturated)' }), 15000)),
+    ]);
+  } catch (e) { canvasInfo = { found: false, note: 'canvasInfo-error: ' + e.message }; }
 
-  await browser.close();
+  try { await browser.close(); } catch (_e) {}
   srv.close();
 
   console.log('\n========== RENDER PROBE RESULT ==========');
@@ -366,6 +525,11 @@ function startServer() {
   console.log('\n--- jit heartbeat lines (last 8 of ' + buckets.jit_heartbeat_count + ') ---');
   buckets.jit_heartbeat_lines.slice(-8).forEach(l => console.log('  ' + l));
   console.log('\n--- BS2 0x80003140 entry dump ---');
+  console.log('\n--- FIX#1 render-worker offload (page-side) ---');
+  const _fix1re = /fix.?1|render-worker|GL descriptor|GLRD|render-offload|recording GLctx|\[shim\]|gl-record|hwOffscreen|overlay/i;
+  buckets.other.filter(l => _fix1re.test(l)).forEach(l => console.log('  ' + l));
+  buckets.render.filter(l => _fix1re.test(l)).forEach(l => console.log('  ' + l));
+  buckets.worker.filter(l => _fix1re.test(l)).forEach(l => console.log('  ' + l));
   console.log('\n--- ppc-worker handshake ---');
   buckets.other.filter(l => /\[ppc-worker/.test(l)).forEach(l => console.log('  ' + l));
   buckets.other.filter(l => /\[3140/.test(l)).forEach(l => console.log('  ' + l));

@@ -119,4 +119,12 @@ constexpr u32 BRANCH_FOLLOWING_THRESHOLD = 2;
 // mtspr does not carry FL_ENDBLOCK, so the special-case is moot here).
 bool IsBlockTerminator(u32 inst);
 
+// IsForwardConditionalBranch — true for a coalescable forward conditional bcx
+// (OPCD 16, BO!=20, LK==0, AA==0, (s32)BD>0). The JitWasm decode loop and
+// PPCAnalyzer::Analyze both use this to KEEP DECODING past such a branch (it
+// becomes a mid-block conditional exit; the not-taken fall-through stays in the
+// block). Backward/self conditional branches stay terminal so IsBusyWaitLoop
+// idle detection (SAB boot-freeze downcount=0 fix) still keys on the last op.
+bool IsForwardConditionalBranch(u32 inst, u32 pc);
+
 }  // namespace bemental::powerpc

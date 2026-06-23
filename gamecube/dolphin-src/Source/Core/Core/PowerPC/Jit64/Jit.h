@@ -297,8 +297,13 @@ private:
   Common::RangeSizeSet<u8*> m_free_ranges_near;
   Common::RangeSizeSet<u8*> m_free_ranges_far;
 
-  const bool m_im_here_debug = false;
-  const bool m_im_here_log = false;
+  // [traj-oracle 2026-06-20] NATIVE-ORACLE-ONLY: enable per-block ImHere trace
+  // (writes log64.txt, one block-start PC per line as {pc:08x}) so the native
+  // Jit64 block trajectory can be diffed against the WASM bementalJIT via
+  // trace_diff_gc.py. Native build only — the shipping WASM emulator uses
+  // JitWasm, not Jit64, so this does not affect it.
+  const bool m_im_here_debug = true;
+  const bool m_im_here_log = true;
   std::map<u32, int> m_been_here;
   std::unique_ptr<HostDisassembler> m_disassembler;
 };

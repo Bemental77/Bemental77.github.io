@@ -97,6 +97,9 @@
     <button id="btnStart">Start</button>
     <button id="btnSave" disabled>Save State</button>
     <button id="btnLoad" disabled>Load State</button>
+    <button id="btnExport" disabled>⬇ Export State</button>
+    <button id="btnImport" disabled>⬆ Import State</button>
+    <input id="importFile" type="file" accept=".gcs,.gz,application/octet-stream" style="display:none">
     <button id="btnMute" disabled>🔊 Mute</button>
     <button id="btnResetAudio" disabled>↻ Reset Audio</button>
     <button id="btnFull" disabled>⛶ Fullscreen</button>
@@ -213,6 +216,50 @@
   });
   var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/gamecube/dolphin_libretro/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: _moduleDummyCanvas, setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {}, wasmMemory: sharedMemory };
   console.log('[ppc-worker-handshake] sharedMemory allocated at page-load (initial=' + (sharedMemory.buffer.byteLength >>> 20) + ' MB)');
+
+  // [FIX#1 render-worker] OFF by default — when false EVERYTHING below behaves
+  // byte-identically to the legacy path. Set window.__gcRenderWorker=true (e.g.
+  // via the probe page-eval BEFORE var_setup) to move the WebGL2 draw stream onto
+  // a dedicated render Worker that owns the canvas.
+  //
+  // Transport: the GL command ring + ctrl block live IN the shared wasm heap at
+  // fixed byte offsets (NOT separate SABs), because the producer runs on Dolphin's
+  // GL thread which under PROXY_TO_PTHREAD is an emscripten proxy-pthread — and
+  // JS-object SABs don't propagate to pthreads, while the shared heap is visible
+  // to every thread + the render worker. A small descriptor at GL_DESC_OFF tells
+  // both the producer (worker_funcs.installGLRecorder) and the render worker where
+  // the regions are. Offsets sit in the gap above the scratch SAB region
+  // (~0x026Bxxxx) and below Dolphin's data (GLOBAL_BASE=0x10000000). See the
+  // UNCERTAIN-STEP note in worker_funcs.js — bump if the wasm stack collides.
+  // Flag default OFF. Probe-settable without page edits via ?renderWorker=1
+  // (the GC probe forwards PROBE_QUERY into the URL). Explicit window assignment
+  // before this script still wins.
+  if (typeof window.__gcRenderWorker === 'undefined') {
+    // [perf] Default ON: offloading GL replay/texture-upload to a dedicated
+    // render worker frees the JIT/CPU worker and measured ~1.4x guest-tick
+    // throughput (66M vs 46M ticks/s, A/B 2026-06-22). Disable with ?renderWorker=0.
+    try { window.__gcRenderWorker = !/[?&]renderWorker=0\b/.test(location.search); }
+    catch (e) { window.__gcRenderWorker = true; }
+  }
+  // Region constants (always defined). The descriptor is written into the shared
+  // heap LATER, inside var_setup (window.__gcWriteGlDesc), so a probe that flips
+  // window.__gcRenderWorker after page-load but before var_setup still takes
+  // effect. The C++ install/present gates read this descriptor from the heap.
+  window.__gcGl = { descOff: 0x07FF0000, magic: 0x474C5244 /*'GLRD'*/,
+                    ringOff: 0x08000000 /*128MB*/, ringWords: 1 << 22 /*16MB i32*/,
+                    ctrlOff: 0x09100000 };
+  window.__gcWriteGlDesc = function () {
+    var d = window.__gcGl;
+    var i32 = new Int32Array(sharedMemory.buffer);
+    var r0 = d.ringOff >> 2;
+    i32[r0 + 0] = 0; i32[r0 + 1] = 0; i32[r0 + 2] = d.ringWords; i32[r0 + 3] = 1; // HEAD,TAIL,CAPACITY,ELEMSIZE
+    var c0 = d.ctrlOff >> 2;
+    for (var ci = 0; ci < 256; ci++) i32[c0 + ci] = 0;                            // ctrl FUTEX idle
+    var x0 = d.descOff >> 2;
+    i32[x0 + 0] = d.magic; i32[x0 + 1] = d.ringOff; i32[x0 + 2] = d.ringWords; i32[x0 + 3] = d.ctrlOff; i32[x0 + 4] = 1;
+    console.log('[fix1] GL descriptor written: ring 16MB @0x' + d.ringOff.toString(16)
+      + ' ctrl @0x' + d.ctrlOff.toString(16) + ' desc @0x' + d.descOff.toString(16));
+  };
   var padStatus1, vram_ptr; var dolphin_worker = null; var ppc_worker = null; var states_arrs = []; var audioMuted = false; var pendingSaveResolve = null; var pendingLoadResolve = null;
   function getAudioCtx() { try { return (Module && Module.preCreatedAudioContext) || (Module && Module.SDL && Module.SDL.audioContext) || null; } catch (e) { return null; } }
   function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } }
@@ -256,7 +303,70 @@
     // starts at 256 MB; ppc-worker's stays at low addresses; the
     // PowerPCState region at SAB[0x02400000] sits between them
     // (safe from both modules' instantiation-time data init).
-    dolphin_worker.postMessage({ cmd: 'mem-init', memory: sharedMemory });
+    // [HW-render] Transfer the static <canvas id="canvas"> to dolphin_worker so
+    // Dolphin's OGL backend renders WebGL2 directly into it on the GPU (instead
+    // of the CPU-thread Software Renderer). transferControlToOffscreen is
+    // once-only, so flag it and have the gpu-worker SW-present path stand down.
+    var _hwOff = null;
+    if (window.__gcRenderWorker) {
+      // [FIX#1] Transfer #canvas to the RENDER WORKER (it owns the WebGL2 ctx),
+      // NOT to dolphin_worker. transferControlToOffscreen is once-only, so under
+      // the flag dolphin_worker gets offscreen:null and the recording GLctx.
+      try {
+        // Write the GL descriptor + ring/ctrl headers into the shared heap NOW
+        // (final flag value known), so dolphin_worker's load_iso (proxy-pthread)
+        // and the render worker both see it. Must precede load_iso.
+        window.__gcWriteGlDesc();
+        var _rwCanvas = document.getElementById('canvas');
+        var _rwOff = (_rwCanvas && typeof _rwCanvas.transferControlToOffscreen === 'function')
+          ? _rwCanvas.transferControlToOffscreen() : null;
+        if (_rwOff) {
+          window.__gcHwCanvasTransferred = true;
+          var rw = new Worker('/gamecube/render-worker.js?v=' + Date.now());
+          window.__gcRenderWorkerObj = rw;
+          rw.onmessage = function (e) {
+            var m = e.data || {};
+            if (m.cmd === 'ready') pageLog('[fix1] render-worker ready');
+            else if (m.cmd === 'init-failed') pageLog('[fix1] render-worker init FAILED: ' + m.reason);
+            else if (m.cmd === 'gl-error') pageLog('[fix1] render-worker gl-error op=' + m.op + ' ' + m.msg);
+            else if (m.cmd === 'stats') pageLog('[fix1] render-worker framesPainted=' + m.framesPainted);
+          };
+          rw.postMessage({ cmd: 'init', canvas: _rwOff, memory: sharedMemory,
+                           ringByteOff: window.__gcGl.ringOff, ringWords: window.__gcGl.ringWords,
+                           ctrlByteOff: window.__gcGl.ctrlOff },
+                         [_rwOff]);
+          pageLog('[fix1] render-worker spawned, canvas transferred to it');
+          // dolphin_worker still needs its OWN GL context (for get_proc_address +
+          // the recording GLctx). Give it a PAGE-CREATED throwaway OffscreenCanvas
+          // transferred via the normal mem-init path — a worker-created canvas is
+          // NOT proxied to the proxy-pthread the way a transferred one is, which
+          // left a null function in retro_load_game. The real #canvas is the
+          // render worker's; this 640x480 is never presented.
+          _hwOff = new OffscreenCanvas(640, 480);
+          pageLog('[fix1] dolphin_worker throwaway canvas created (page-side, transferred)');
+        } else {
+          pageLog('[fix1] WARN: transferControlToOffscreen unavailable; render-worker disabled');
+          window.__gcRenderWorker = false;
+        }
+      } catch (e) {
+        console.error('[fix1] render-worker setup FAILED: ' + (e && e.message ? e.message : e) + ' | stack: ' + (e && e.stack ? e.stack : ''));
+        pageLog('[fix1] render-worker setup failed: ' + (e && e.message));
+        window.__gcRenderWorker = false;
+      }
+    } else {
+      // [HW-render legacy] Transfer #canvas to dolphin_worker (default path).
+      try {
+        var _hwCanvas = document.getElementById('canvas');
+        if (_hwCanvas && typeof _hwCanvas.transferControlToOffscreen === 'function') {
+          _hwOff = _hwCanvas.transferControlToOffscreen();
+          window.__gcHwCanvasTransferred = true;
+        }
+      } catch (e) { pageLog('[hw-render] canvas transfer failed: ' + (e && e.message)); }
+    }
+    dolphin_worker.postMessage({
+      cmd: 'mem-init', memory: sharedMemory, offscreen: _hwOff,
+      gcRenderWorker: !!window.__gcRenderWorker,
+    }, _hwOff ? [_hwOff] : []);
     // 2e.3c: pre-write a cross-boundary sentinel at SAB[0x02400000].
     // dolphin's heartbeat (every 4096 JIT iters) reads this address
     // and logs '[dolphin-sab-read] SAB[0x02400000]=0xCAFE1234'. If
@@ -270,6 +380,7 @@
     try {
       var _dspSentBuf = new Uint32Array(sharedMemory.buffer);
       window._dspSentPoll = setInterval(function () {
+        return; // [dsp-sentinel/op0-hist/phase4] throwaway diagnostic DISABLED — it floods the console (thousands of msgs) and the per-tick SAB scan + console.log is real overhead, worse with DevTools open. (gate #8)
         var A = _dspSentBuf[0x026B0000 >> 2] >>> 0;
         var B = _dspSentBuf[0x026B0010 >> 2] >>> 0;
         var C = _dspSentBuf[0x026B0020 >> 2] >>> 0;
@@ -1769,6 +1880,17 @@
   // if Worker spawn fails, fall back to main-thread WebGPU then 2D.
   (function () {
     function tryInit() {
+      // [HW-render] HW (WebGL2/OGL) render owns the canvas — dolphin_worker
+      // takes it via transferControlToOffscreen at mem-init and renders WebGL2
+      // directly into it, so the gpu-worker SW-present path stands down. CRUCIAL
+      // ORDER: tryInit runs at PAGE-LOAD, before dolphin_worker is created at
+      // Start, so it must NOT grab the canvas first (else line-259's transfer
+      // fails and the canvas is stuck on the gpu-worker). HW is the default;
+      // set window.__gcHwMode = false to fall back to the gpu-worker SW present.
+      if (window.__gcHwMode !== false) {
+        pageLog('[render] HW render mode: gpu-worker SW-present disabled, canvas reserved for dolphin_worker');
+        return;
+      }
       var c = $('canvas');
       if (!c) { setTimeout(tryInit, 50); return; }
       var hasOffscreen = typeof c.transferControlToOffscreen === 'function';
@@ -1877,9 +1999,7 @@
       });
       node.port.onmessage = function (e) {
         if (e.data && e.data.cmd === 'stats') {
-          if (e.data.underrunFrames > 0) {
-            pageLog('[audio] underrun ' + e.data.underrunFrames + 'f / consumed ' + e.data.consumedFrames + 'f');
-          }
+          if (false) { /* [audio] underrun log disabled — console flood; underruns are a symptom of the slow boot, not actionable here */ }
         }
       };
       node.connect(ctx.destination);
@@ -2158,7 +2278,7 @@
     setStatus('Booting emulator…');
     dolphin_worker.postMessage({ cmd: 'romEnd', name: ROM_NAME + (window.__romExt || '.iso'), size: totalSize });
     setTimeout(pollController, 10);
-    [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
+    [$('btnSave'), $('btnLoad'), $('btnExport'), $('btnImport'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
   }
   var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; window.__romExt = pick.ext || '.iso'; SAVE_KEY = ROM_NAME + '.gcs'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /gamecube/dolphin_libretro/dolphin_libretro.js ...'); setStatus('Loading Dolphin libretro core...'); var s = document.createElement('script'); s.src = '/gamecube/dolphin_libretro/dolphin_libretro.js?v=' + Date.now(); document.body.appendChild(s); }
   $('btnStart').addEventListener('click', startEmulator);
@@ -2170,10 +2290,28 @@
   async function gunzip(u8) { var ds = new DecompressionStream('gzip'); var w = ds.writable.getWriter(); w.write(u8); w.close(); return new Uint8Array(await new Response(ds.readable).arrayBuffer()); }
   async function saveState() { if (!dolphin_worker) return toast('Emulator not ready', true); toast('Saving state…'); try { var data = await new Promise(res => { pendingSaveResolve = res; dolphin_worker.postMessage({ cmd: 'saveState' }); }); var compressed = await gzip(data); await idbPut(SAVE_KEY, compressed); toast('Saved (' + (compressed.byteLength / 1048576).toFixed(1) + ' MB)'); } catch (e) { toast('Save failed: ' + e.message, true); } }
   async function loadState() { if (!dolphin_worker) return toast('Emulator not ready', true); try { var stored = await idbGet(SAVE_KEY); if (!stored) return toast('No save state found', true); toast('Restoring…'); var data = await gunzip(stored instanceof Uint8Array ? stored : new Uint8Array(stored)); await new Promise(res => { pendingLoadResolve = res; dolphin_worker.postMessage({ cmd: 'loadState', data: data }, [data.buffer]); }); toast('State restored'); } catch (e) { toast('Load failed: ' + (e.message || e), true); } }
+  // Export the gzipped save-state from IndexedDB to a downloadable file so it
+  // can be loaded headlessly by the render probe (PROBE_LOAD_STATE). Save first.
+  async function exportState() { try { var stored = await idbGet(SAVE_KEY); if (!stored) return toast('No save state — click Save State first', true); var u8 = stored instanceof Uint8Array ? stored : new Uint8Array(stored); var blob = new Blob([u8], { type: 'application/octet-stream' }); var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = SAVE_KEY + '.gz'; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000); toast('Exported ' + a.download + ' (' + (u8.byteLength / 1048576).toFixed(1) + ' MB)'); } catch (e) { toast('Export failed: ' + (e.message || e), true); } }
+  async function importState(file) { try { if (!file) return; var buf = new Uint8Array(await file.arrayBuffer()); await idbPut(SAVE_KEY, buf); toast('Imported ' + (buf.byteLength / 1048576).toFixed(1) + ' MB — click Load State'); } catch (e) { toast('Import failed: ' + (e.message || e), true); } }
+  // Headless-probe hook: accept gzipped state bytes, gunzip, and restore.
+  // Returns a promise that resolves once the worker confirms the load.
+  window.__probeLoadStateFromGz = async function (gzBytes) { if (!dolphin_worker) throw new Error('worker not ready'); var data = await gunzip(gzBytes instanceof Uint8Array ? gzBytes : new Uint8Array(gzBytes)); await new Promise(res => { pendingLoadResolve = res; dolphin_worker.postMessage({ cmd: 'loadState', data: data }, [data.buffer]); }); return true; };
+  // Headless-probe hook: report the WASM build's own raw DoState size (bytes),
+  // for comparing against a native .s01's uncompressed_size (format compat check).
+  window.__probeStateSize = function () { if (!dolphin_worker) throw new Error('worker not ready'); return new Promise(res => { pendingSaveResolve = function (d) { res(d.byteLength || (d.length||0)); }; dolphin_worker.postMessage({ cmd: 'saveState' }); }); };
+  // Headless-probe checkpoint hooks: save/load to IndexedDB (SAVE_KEY) so a
+  // persistent-profile probe can resume the slow boot across runs.
+  window.__probeSaveState = async function () { await saveState(); return true; };
+  window.__probeLoadState = async function () { await loadState(); return true; };
+  window.__probeHasState = async function () { try { var s = await idbGet(SAVE_KEY); return !!s; } catch (e) { return false; } };
+  // Headless-driver export: return the gzipped IndexedDB state blob as base64
+  // (so the node harness can write it to a file via exposeFunction). Save first.
+  window.__probeExportGzB64 = async function () { try { var stored = await idbGet(SAVE_KEY); if (!stored) return ''; var u8 = stored instanceof Uint8Array ? stored : new Uint8Array(stored); var bin = ''; for (var i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]); return btoa(bin); } catch (e) { return ''; } };
   function toggleMute() { audioMuted = !audioMuted; var ctx = getAudioCtx(); if (ctx) { audioMuted ? ctx.suspend() : ctx.resume(); } $('btnMute').textContent = audioMuted ? '🔇 Unmute' : '🔊 Mute'; $('mMute').textContent = audioMuted ? 'Unmute' : 'Mute'; }
   async function resetAudio() { var ctx = getAudioCtx(); if (!ctx) { toast('Audio not ready', true); return; } toast('Resetting audio…'); try { await ctx.suspend(); } catch (e) {} await new Promise(r => setTimeout(r, 150)); if (!audioMuted) { try { await ctx.resume(); } catch (e) {} } toast('Audio reset'); }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasWrap'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
-  $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
+  $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', () => $('importFile').click()); $('importFile').addEventListener('change', (e) => { if (e.target.files && e.target.files[0]) importState(e.target.files[0]); e.target.value = ''; }); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
   function openMobileMenu() { $('mobileMenu').classList.add('open'); } function closeMobileMenu() { $('mobileMenu').classList.remove('open'); }
   function applyGhost(on) { $('mobileShell').classList.toggle('ghost', on); if ($('mGhost')) $('mGhost').textContent = 'Transparent Controls: ' + (on ? 'On' : 'Off'); }
   function toggleGhost() { var on = !$('mobileShell').classList.contains('ghost'); localStorage.setItem('gcwasm_ghost', on ? '1' : '0'); applyGhost(on); }

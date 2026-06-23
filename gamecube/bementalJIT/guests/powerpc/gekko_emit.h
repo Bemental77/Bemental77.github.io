@@ -453,6 +453,7 @@ struct BlockInputs {
     // on the miss path and one i32-const + load + eq + br_if on the
     // hit path. Only meaningful when emit_hle_check is also true.
     bool emit_hle_check_native = false;
+    u32 block_cycles = 0;  // analyzer numCycles — R2 merged-region downcount charge
 };
 std::vector<u8> build_region_function(const BlockInputs* blocks,
                                       u32 n_blocks,

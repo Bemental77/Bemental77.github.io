@@ -630,26 +630,41 @@ static bool test_bcx_eq_not_taken() {
 // continue the chain, leaving the addi un-emitted; trailing fallback read
 // PC = pre-op set_pc(start_pc) and returned start_pc forever.
 static bool test_bcx_chain_fallthrough_runs_next() {
-    TestEnv env;
-    if (!env.init()) return false;
+    // [coalesce] The FORWARD conditional beq is now coalesced as a mid-block
+    // exit: the analyzer keeps decoding past it (IsForwardConditionalBranch),
+    // so a NOT-taken beq falls through to the addi IN THE SAME block and the
+    // block returns next_pc = PC+12 (past the addi). A TAKEN beq exits to the
+    // target with the addi un-executed. (Pre-coalescing this was two dispatches:
+    // block ended at the bcx, next_pc = PC+8, addi ran in a second block.)
     const u32 PC = 0x80003000;
-    env.gpr(3) = 1;  // ensure NOT taken
-    env.gpr(4) = 0;
     u32 insts[] = {
         enc_cmpi_cr0(3, 0),
-        enc_bc(12, 2, PC + 4u, PC + 0x200, false),  // beq+, not taken
-        enc_addi(4, 0, 42),                          // must execute
+        enc_bc(12, 2, PC + 4u, PC + 0x200, false),  // beq+, FORWARD
+        enc_addi(4, 0, 42),                          // fall-through target
     };
-    // powerpc-next's Phase-1 analyzer cuts the block at any canEndBlock op
-    // (ppc_analyst.cpp Analyze loop) — no branch-following like legacy
-    // build_block's instr_pcs chain. So the not-taken bcx ends block 1 at
-    // next_pc = PC+8, and the addi runs in a SECOND dispatch from there —
-    // exactly the production JitWasm loop (pc = next_pc; continue).
-    s32 next_pc = -1;
-    if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
-    if (next_pc != (s32)(PC + 8u)) return false;     // fallthrough after bcx
-    if (!env.dispatch_block((u32)next_pc, &insts[2], 1, &next_pc)) return false;
-    return next_pc == (s32)(PC + 12u) && env.gpr(4) == 42;
+
+    // not-taken (r3 != 0): addi runs in the coalesced block, next_pc = PC+12.
+    {
+        TestEnv env;
+        if (!env.init()) return false;
+        env.gpr(3) = 1;
+        env.gpr(4) = 0;
+        s32 next_pc = -1;
+        if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
+        if (!(next_pc == (s32)(PC + 12u) && env.gpr(4) == 42)) return false;
+    }
+
+    // taken (r3 == 0 -> EQ): mid-block exit to target, addi NOT executed.
+    {
+        TestEnv env;
+        if (!env.init()) return false;
+        env.gpr(3) = 0;
+        env.gpr(4) = 0;
+        s32 next_pc = -1;
+        if (!env.dispatch_block(PC, insts, 3, &next_pc)) return false;
+        if (!(next_pc == (s32)(PC + 0x200u) && env.gpr(4) == 0)) return false;
+    }
+    return true;
 }
 
 // blr: indirect branch via LR. Set LR via mtspr in a real ISA, but for

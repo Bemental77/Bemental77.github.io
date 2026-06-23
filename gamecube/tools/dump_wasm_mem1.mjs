@@ -69,6 +69,13 @@ const REGIONS = [
     out: '/tmp/wasm-mem1-padstate1.bin' },
   { name: 'padstate2', guestStart: 0x801d44e0, guestEnd: 0x801d4520, expectedSize: 64,
     out: '/tmp/wasm-mem1-padstate2.bin' },
+  // [HW-render wedge 2026-06-17] post-frame-4 spin loop: guest MAIN thread
+  // spins in a tight 8-PC loop 0x806c7f2c..0x806c8000 (hot 0x806c7f44) while
+  // OutputXFB stops at n=4. This is a REL-module addr ABOVE pso.map's top
+  // (0x80433e3c) → unresolvable from static maps. Dump the code window to
+  // disassemble what the loop polls (and thus what the guest is waiting on).
+  { name: 'spinloop', guestStart: 0x806c7e00, guestEnd: 0x806c8200, expectedSize: 1024,
+    out: '/tmp/wasm-mem1-spinloop.bin' },
 ];
 
 const MIME = {
@@ -117,6 +124,11 @@ function startServer() {
   let mem1Wired = false;
   let lastWildPivec = null;
   let lastSlice = null;
+  // [2026-06-17] The SAB[0x02500020] sentinel is no longer written by the
+  // re-extracted dolphin-src (JitWasm::Run publication dropped). Parse the
+  // authoritative MEM1 base from Dolphin's own "Memory system initialized.
+  // RAM at 0x<host-ptr>" line (Memmap.cpp:170 -> GetRAM(), a wasm/SAB offset).
+  let ramBase = 0;
 
   page.on('console', (msg) => {
     const t = msg.text();
@@ -130,6 +142,11 @@ function startServer() {
     }
     if (t.includes('[slice]')) {
       lastSlice = t;
+    }
+    const rm = t.match(/RAM at 0x([0-9a-fA-F]+)/);
+    if (rm && !ramBase) {
+      ramBase = parseInt(rm[1], 16) >>> 0;
+      console.log('[dump] parsed MEM1 ramBase=0x' + ramBase.toString(16) + ' from: ' + t.trim());
     }
   });
   page.on('pageerror', (err) => console.error('[dump] pageerror:', err.message || err));
@@ -157,8 +174,8 @@ function startServer() {
 
     const m1 = await page.evaluate(() => !!window._ppcMem1Wired);
 
-    if (DUMP_AT_MS != null && (Date.now() - startMs) >= DUMP_AT_MS && m1) {
-      triggered = true; triggerReason = `wall=${Date.now()-startMs}ms`; break;
+    if (DUMP_AT_MS != null && (Date.now() - startMs) >= DUMP_AT_MS && (ramBase || m1)) {
+      triggered = true; triggerReason = `wall=${Date.now()-startMs}ms ramBase=0x${ramBase.toString(16)}`; break;
     }
     if (m1 && wildPivecCount >= MIN_WILD_PIVEC) {
       triggered = true; triggerReason = `mem1Wired+wildPivec=${wildPivecCount}`; break;
@@ -172,14 +189,15 @@ function startServer() {
   if (lastSlice)     console.log(`[dump] last slice:      ${lastSlice}`);
 
   // Now read MEM1 base from SAB[0x02500020] AND dump each region.
-  const dumpResult = await page.evaluate((regions) => {
+  const dumpResult = await page.evaluate((regions, parsedRamBase) => {
     if (!window.sharedMemory || !window.sharedMemory.buffer) {
       return { ok: false, err: 'no window.sharedMemory.buffer' };
     }
     const sab = window.sharedMemory.buffer;
     const u32 = new Uint32Array(sab);
     const u8  = new Uint8Array(sab);
-    const mem1Addr = u32[0x02500020 >> 2] >>> 0;
+    // Prefer the parsed "RAM at 0x.." base; fall back to the (now-dead) sentinel.
+    const mem1Addr = (parsedRamBase >>> 0) || (u32[0x02500020 >> 2] >>> 0);
     const mem1Size = u32[0x02500024 >> 2] >>> 0;
     const sentinel = u32[0x02500028 >> 2] >>> 0;
     const result = { ok: true, mem1Addr, mem1Size, sentinel, regions: [] };
@@ -197,7 +215,7 @@ function startServer() {
       });
     }
     return result;
-  }, REGIONS);
+  }, REGIONS, ramBase);
 
   if (!dumpResult.ok) {
     console.error('[dump] FAIL: ' + dumpResult.err);

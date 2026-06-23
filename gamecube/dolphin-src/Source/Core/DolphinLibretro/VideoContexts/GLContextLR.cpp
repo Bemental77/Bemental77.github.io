@@ -1,4 +1,5 @@
 #include "GLContextLR.h"
+#include <pthread.h>
 #include "Common/Logging/Log.h"
 #include "Core/Config/MainSettings.h"
 #include "VideoCommon/VideoCommon.h"
@@ -20,6 +21,12 @@ void* GLContextLR::GetFuncAddress(const std::string& name)
 
 bool GLContextLR::Initialize(const WindowSystemInfo& wsi, bool stereo, bool core)
 {
+  // [hw-glctx] which thread runs the libretro GL context init? In dual-core
+  // this should be the GPU thread (a real pthread that can own the canvas),
+  // distinct from EmscriptenWorker load_iso's proxy-main tid.
+  NOTICE_LOG_FMT(VIDEO, "[hw-glctx] GLContextLR::Initialize tid={} ctx_type={}",
+                 (unsigned long long)(uintptr_t)pthread_self(),
+                 (int)Libretro::Video::hw_render.context_type);
   m_backbuffer_width = EFB_WIDTH * Libretro::Options::GetCached<int>(Libretro::Options::gfx_settings::EFB_SCALE, 1);
   m_backbuffer_height = EFB_HEIGHT * Libretro::Options::GetCached<int>(Libretro::Options::gfx_settings::EFB_SCALE, 1);
 

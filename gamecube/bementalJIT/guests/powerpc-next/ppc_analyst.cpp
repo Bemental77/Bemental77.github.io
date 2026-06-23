@@ -58,6 +58,24 @@ bool IsBlockTerminator(u32 inst) {
     return spr == ppc_off::SPR_MMCR0 || spr == ppc_off::SPR_MMCR1;
 }
 
+// IsForwardConditionalBranch — true for a bcx (OPCD 16) that is coalescable:
+// CR/CTR conditional (BO != 20 branch-always), NOT a linked call (LK==0), pc-
+// relative (AA==0), and FORWARD ((s32)BD > 0). Forward conditional branches can
+// be emitted as a mid-block conditional EXIT so the not-taken fall-through stays
+// in the same block (native Jit64 coalescing). BACKWARD/self branches (BD<=0)
+// are deliberately EXCLUDED so they stay block terminators — IsBusyWaitLoop
+// idle detection (and the SAB boot-freeze downcount=0 fix) requires the idle
+// branch to be the block's last op. AA==1 (absolute target, undefined fwd/back)
+// and LK conditional calls also stay terminal. The pc arg is unused (BD is
+// already pc-relative and sign-extended) but kept for call-site symmetry.
+bool IsForwardConditionalBranch(u32 inst, u32 /*pc*/) {
+    if (GekkoOperands::OPCD(inst) != 16u) return false;
+    if (GekkoOperands::BO(inst) == 20u)   return false;  // branch-always
+    if (GekkoOperands::LK(inst))          return false;  // conditional call
+    if (GekkoOperands::AA(inst))          return false;  // absolute target
+    return (s32)GekkoOperands::BD(inst) > 0;             // forward only
+}
+
 // EvaluateBranchTarget — return the absolute target PC for any branch
 // instruction at `pc`, or INVALID_BRANCH_TARGET if not a branch. The host
 // supplies the instruction word indirectly via the inst parameter.
@@ -473,8 +491,16 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
         pc += 4;
 
         if (op.canEndBlock) {
-            reached_endblock = true;
-            break;
+            // [coalesce] A FORWARD conditional branch does not end the block —
+            // it is emitted as a mid-block conditional exit and the not-taken
+            // fall-through continues here. reached_endblock stays false so the
+            // idle-loop classification below keys on the TRUE terminator. Must
+            // mirror the JitWasm.cpp decode loop's identical predicate so this
+            // analyst length matches the decoded inst count.
+            if (!IsForwardConditionalBranch(op.inst, op.address)) {
+                reached_endblock = true;
+                break;
+            }
         }
     }
 
