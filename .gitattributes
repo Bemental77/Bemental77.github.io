@@ -30,6 +30,9 @@ ps1/ps1Wasm/roms/*.bin.parta* filter= diff= merge= -text
 n64/N64Wasm/dist/*.wasm              filter= diff= merge= -text
 n64/N64Wasm/dist/*.zip               filter= diff= merge= -text
 n64/N64Wasm/roms/*.z64               filter= diff= merge= -text
+# GameCube split ROM parts: like PS1/N64, served directly by Pages (LFS
+# pointers 404/serve-stub -> games dead on prod). Override the *.bin.parta* LFS rule.
+gamecube/roms/*.bin.parta* filter= diff= merge= -text
 
 # GameCube (Dolphin) deployable worker WASM must be served as real content by
 # GitHub Pages (does not resolve LFS pointers) — same fix as PS1/N64 above.
