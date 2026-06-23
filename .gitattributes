@@ -36,3 +36,8 @@ n64/N64Wasm/roms/*.z64               filter= diff= merge= -text
 # On prod it was a 133-byte LFS pointer (2026-06-22), so gamecube.html could
 # not load the worker. Override the *.wasm LFS rule for the deployable worker.
 gamecube/dolphin_libretro/dolphin_worker_emcc.wasm filter= diff= merge= -text
+# dolphin_libretro.wasm (14KB main-thread module instantiated by startEmulator)
+# was an LFS pointer on prod -> GitHub Pages served "version https://..." ("vers"
+# magic word) -> WebAssembly.instantiate CompileError, all GC games dead. Same
+# override as the worker.
+gamecube/dolphin_libretro/dolphin_libretro.wasm filter= diff= merge= -text
