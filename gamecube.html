@@ -2276,7 +2276,13 @@
     }
     pageLog('[rom] streamed ' + (total/1048576).toFixed(1) + ' MB — booting');
     setStatus('Booting emulator…');
-    dolphin_worker.postMessage({ cmd: 'romEnd', name: ROM_NAME + (window.__romExt || '.iso'), size: totalSize });
+    // [rom-size fix] Send the ACTUAL accumulated byte count (total), NOT the
+    // HEAD-request hint (totalSize). HEAD Content-Length can undercount when a
+    // chunk's HEAD 404s during CDN propagation right after a deploy, leaving
+    // totalSize < real size -> bootIso's new Uint8Array(size) overflows on
+    // total.set(chunk) ("RangeError: offset is out of bounds"). total is summed
+    // from each chunk's real byteLength at fetch time, so it is authoritative.
+    dolphin_worker.postMessage({ cmd: 'romEnd', name: ROM_NAME + (window.__romExt || '.iso'), size: total });
     setTimeout(pollController, 10);
     [$('btnSave'), $('btnLoad'), $('btnExport'), $('btnImport'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
   }
