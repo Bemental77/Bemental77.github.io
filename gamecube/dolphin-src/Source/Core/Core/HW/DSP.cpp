@@ -256,8 +256,21 @@ void DSPManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
   mmio->Register(
       base | DSP_CONTROL, MMIO::ComplexRead<u16>([](Core::System& system, u32) {
         auto& dsp = system.GetDSP();
-        return (dsp.m_dsp_control.Hex & ~DSP_CONTROL_MASK) |
+        const u16 rv = (dsp.m_dsp_control.Hex & ~DSP_CONTROL_MASK) |
                (dsp.m_dsp_emulator->DSP_ReadControlRegister() & DSP_CONTROL_MASK);
+        // [aram-diag3 2026-07-17] does the guest SEE the ARAM bit when it reads DSP_CONTROL post-
+        // takeover? total reads @0x026B27CC, reads-with-ARAM(0x20)-set @0x026B27C8. If the guest reads
+        // DSP_CR often but ARAM is rarely set (2C8 << 2CC), the ARAM completion is cleared before the
+        // guest's ISR reads it (coherency/timing) -> __ARHandler never dispatched -> pend never drains.
+        if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u) {
+          volatile u32* t = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B27CCu));
+          *t = *t + 1u;
+          if ((rv & 0x20u) != 0u) {
+            volatile u32* a = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B27C8u));
+            *a = *a + 1u;
+          }
+        }
+        return rv;
       }),
       MMIO::ComplexWrite<u16>([](Core::System& system, u32, u16 val) {
         auto& dsp = system.GetDSP();
@@ -396,6 +409,18 @@ void DSPManager::UpdateInterrupts()
   bool ints_set =
       (((m_dsp_control.Hex >> 1) & m_dsp_control.Hex & (INT_DSP | INT_ARAM | INT_AID)) != 0);
 
+  // [dsp-cr-fastpath 2026-07-17] keep the guest-visible DSP_CONTROL (0xCC00500A) mirror fresh in SAB
+  // @0x026B27D4 so the worker's ISR reads it DIRECTLY (no mailbox round-trip). Same value the
+  // ComplexRead returns: (Hex & ~MASK) | (DSP_emu ctrl & MASK). UpdateInterrupts runs after every
+  // GenerateDSPInterrupt (sets ARAM/AID/DSP) and after the DSP_CONTROL ack write, so the interrupt
+  // bits the ISR checks are always current. Throughput fix for the ARAM ARQ-chain (oracle diagnosis).
+  {
+    const u16 cr = static_cast<u16>((m_dsp_control.Hex & ~DSP_CONTROL_MASK) |
+                   (m_dsp_emulator->DSP_ReadControlRegister() & DSP_CONTROL_MASK));
+    __atomic_store_n(reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B27D4u)),
+                     static_cast<u32>(cr), __ATOMIC_RELEASE);
+  }
+
   // [aram-diag 2026-07-16] post-takeover: is INT_ARAM active-bit set (0x026B2704) and did it pass the
   // DSP_CONTROL enable check into ints_set (0x026B2708)? If 2704>0 but 2708==0, the guest never
   // ENABLED the ARAM interrupt in DSP_CONTROL (its enable write didn't reach dolphin) -> masked here.
@@ -493,7 +518,40 @@ void DSPManager::UpdateAudioDMA()
       m_audio_dma.current_source_address = m_audio_dma.SourceAddress;
       m_audio_dma.remaining_blocks_count = m_audio_dma.AudioDMAControl.NumBlocks;
 
+      // [aid-selfack 2026-07-16 — ACK-ROUTING correct-mechanism fix] Post-takeover (cpu_owner==1)
+      // the AID audio-DMA interrupt fires from this 4kHz CoreTiming callback (dolphin device thread),
+      // DECOUPLED from how fast the cross-thread WASM guest ISR can ack it (every DSP-reg access is a
+      // mailbox round-trip). AID is the LOWEST-priority DSP sub-interrupt (dolsdk OSInterrupt.c
+      // InterruptPrioTable: DSP_ARAM=idx6 group precedes DSP_AI=idx8) and AID + ARAM + DSP all share
+      // the SINGLE PI cause bit INT_CAUSE_DSP. The audio buffer is already delivered to the host mixer
+      // by AudioCommon::SendAIBuffer above (line 483) — INDEPENDENT of the guest ISR — and dolphin
+      // auto-reloads remaining_blocks_count/current_source_address itself (lines 493-494), so the DMA
+      // keeps cycling with no guest help. The guest's AID handler (__AIDHandler, ai.c: writes
+      // __DSPRegs[5]=0xCC00500A with the AID bit) is pure buffer-index bookkeeping (salCallback ->
+      // AIInitDMA) that game progress never waits on — aramSyncTransferQueue (0x801116e0) spin-waits
+      // on ARAM, not AID. Because the throttled guest can't ack AID at 4kHz, an unacked AID keeps
+      // INT_CAUSE_DSP asserted forever, drowning the guest in a DSP interrupt storm so globalCounter
+      // never advances. FIX: self-ack AID on the dolphin side post-takeover — generate it (a fast
+      // guest may still catch it) then immediately clear the AID active bit so it NEVER accumulates
+      // into INT_CAUSE_DSP. That leaves INT_CAUSE_DSP driven ONLY by ARAM/DSP (the interrupts the
+      // guest genuinely services), so ARAM completions deliver, aramQueueLo.valid drains, the spin
+      // exits, and the main loop resumes. Native has no MMIO round-trip cost so it never backs up;
+      // single-core boot (cpu_owner!=1) is UNAFFECTED (guest AID handler runs normally there).
+      const bool takeover =
+          *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u;
       GenerateDSPInterrupt(DSP::INT_AID, 0);
+      if (takeover)
+      {
+        // Self-ack: clear the AID active bit so INT_CAUSE_DSP is not held asserted by AID.
+        // UpdateInterrupts() recomputes INT_CAUSE_DSP from the remaining (ARAM/DSP) sub-bits.
+        m_dsp_control.AID = 0;
+        UpdateInterrupts();
+        // [aid-selfack diag] count self-acks @0x026B2798 (free slot; 0x2700-2794 are in use) so the
+        // probe can confirm the path fires. If this climbs while globalCounter advances past 156, the
+        // fix worked; if it climbs but globalCounter stays frozen, AID was not the blocker.
+        volatile u32* k = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2798u));
+        *k = *k + 1u;
+      }
     }
   }
   else

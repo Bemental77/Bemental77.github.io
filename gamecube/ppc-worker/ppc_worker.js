@@ -105,9 +105,38 @@
       // counts @0x026B1A3C; dolphin counts gather arrivals @0x026B1A40. Deficit = lost
       // stores; per-snap deltas date the losing window.
       const _gpSeq = () => { u32[0x026B1A3C >> 2] = ((u32[0x026B1A3C >> 2] >>> 0) + 1) >>> 0; };
-      env.ppc_write8  = (addr, val) => { if (_isGp(addr)) { _gpSeq(); if (gpPush && gpPush(1, val)) return; } call2(5, addr, val); };
-      env.ppc_write16 = (addr, val) => { if (_isGp(addr)) { _gpSeq(); if (gpPush && gpPush(2, val)) return; } call2(6, addr, val); };
-      env.ppc_write32 = (addr, val) => { if (_isGp(addr)) { _gpSeq(); if (gpPush && gpPush(4, val)) return; } call2(7, addr, val); };
+      // [mmio-write-fastpath 2026-07-17] The oracle proved the ARAM audio-init chain runs 400/s
+      // native vs ~2/s here because the guest ISR issues ~6 DSP/AR_DMA register WRITES per DMA
+      // (DSP_CONTROL ack 0x500A + AR_DMA regs 0x5020-0x5037), each a blocking worker->dolphin
+      // mailbox round-trip (call2 -> _mailbox_call_sync2). Route those to an async ring (like gpPush)
+      // so the ISR doesn't stall: worker pushes {addr,val,width}, dolphin drains+applies them in
+      // dolphin_drain_gp_ring (before any mailbox op, same ordering guarantee). Excludes the DSP
+      // MAIL 0x5000-0x5006 (needs sync read-back for the HLE handshake). Ring @0x02710000: +0 head
+      // +4 tail, 12-byte entries {addr,val,width} @+0x40, cap 4096. Only post-takeover.
+      // [DISABLED 2026-07-17] async-ing the AR_DMA writes breaks completion scheduling: Do_ARAM_DMA
+      // schedules a TIMED event at the guest's global_timer, so those writes MUST be sync (applied at
+      // the exact sim-time), not batched. aramComplete dropped 87->1. Only the DSP_CONTROL ack could be
+      // async (1 of 6 ISR writes) — too small. Restored sync writes. The real bottleneck is the SYNC
+      // write round-trip LATENCY (gated by dolphin's service-loop / blocked-render cadence), not the count.
+      const _isDspAr = (addr) => false;
+      let mmioPush = null;
+      if (_gsab) {
+        const mi32 = new Int32Array(_gsab), mu32 = new Uint32Array(_gsab);
+        const MW_HEAD = 0x02710000 >> 2, MW_TAIL = 0x02710004 >> 2, MW_DATA = 0x02710040, MW_CAP = 4096;
+        mmioPush = (addr, val, width) => {
+          if (Atomics.load(mi32, 0x026A0000 >> 2) !== 1) return false;   // pre-takeover -> sync mailbox
+          const h = Atomics.load(mi32, MW_HEAD) >>> 0;
+          const t = Atomics.load(mi32, MW_TAIL) >>> 0;
+          if (((h - t) >>> 0) >= (MW_CAP - 8)) return false;             // full -> fall back to sync
+          const b = (MW_DATA + (h & (MW_CAP - 1)) * 12) >> 2;
+          mu32[b] = addr >>> 0; mu32[b + 1] = val >>> 0; mu32[b + 2] = width;
+          Atomics.store(mi32, MW_HEAD, (h + 1) | 0);
+          return true;
+        };
+      }
+      env.ppc_write8  = (addr, val) => { if (_isGp(addr)) { _gpSeq(); if (gpPush && gpPush(1, val)) return; } if (_isDspAr(addr) && mmioPush && mmioPush(addr, val, 1)) return; call2(5, addr, val); };
+      env.ppc_write16 = (addr, val) => { if (_isGp(addr)) { _gpSeq(); if (gpPush && gpPush(2, val)) return; } if (_isDspAr(addr) && mmioPush && mmioPush(addr, val, 2)) return; call2(6, addr, val); };
+      env.ppc_write32 = (addr, val) => { if (_isGp(addr)) { _gpSeq(); if (gpPush && gpPush(4, val)) return; } if (_isDspAr(addr) && mmioPush && mmioPush(addr, val, 4)) return; call2(7, addr, val); };
       return;
     }
     // W2 mode: enqueue into the pending-writes ring. SPSC discipline —
@@ -231,9 +260,27 @@
         // EE=0 poll handler can DISCRIMINATE beam polls (VI range -> smooth-step) from
         // device-completion polls (DSP/EXI/AI -> jump-to-next-event). Only MMIO routes
         // through env reads, so a fresh addr here IS the polled register.
+        // [mmio-read-fastpath 2026-07-17] The oracle proved the audio-init stall is THROUGHPUT: every
+        // guest ISR MMIO read is a blocking worker->dolphin mailbox round-trip (call1(4,addr)), so the
+        // ARAM ARQ-chain runs ~2/s vs native ~400/s and gc freezes at 156. Read the two HOT ISR
+        // registers straight from a dolphin-maintained SAB mirror (no round-trip): PI cause 0xCC003000
+        // @0x026B27D0 (ProcessorInterface::UpdateException release-store), DSP_CONTROL 0xCC00500A
+        // @0x026B27D4 (DSP::UpdateInterrupts). Only post-takeover (cpu_owner==1); the fixed 512MB SAB
+        // never grows so this view stays valid. Atomics.load = acquire, pairs with dolphin's release.
+        self.__mmr = self.__mmr || new Int32Array(sharedMemoryRef.buffer);
         env.ppc_read8       = (addr) => { self.__lastMmioRdAddr = addr >>> 0; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(2, addr); };
-        env.ppc_read16      = (addr) => { self.__lastMmioRdAddr = addr >>> 0; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(3, addr); };
-        env.ppc_read32      = (addr) => { self.__lastMmioRdAddr = addr >>> 0; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(4, addr); };
+        env.ppc_read16      = (addr) => {
+          const a = addr >>> 0;
+          if (a === 0xCC00500A && Atomics.load(self.__mmr, 0x026A0000 >> 2) === 1) {
+            Atomics.add(self.__mmr, 0x026B27DC >> 2, 1);                  // [fastpath-hit] DSP_CONTROL
+            return Atomics.load(self.__mmr, 0x026B27D4 >> 2) & 0xFFFF; }  // DSP_CONTROL fast-path
+          self.__lastMmioRdAddr = a; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(3, a); };
+        env.ppc_read32      = (addr) => {
+          const a = addr >>> 0;
+          if (a === 0xCC003000 && Atomics.load(self.__mmr, 0x026A0000 >> 2) === 1) {
+            Atomics.add(self.__mmr, 0x026B27D8 >> 2, 1);                  // [fastpath-hit] PI cause
+            return Atomics.load(self.__mmr, 0x026B27D0 >> 2) >>> 0; }     // PI cause fast-path
+          self.__lastMmioRdAddr = a; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(4, a); };
         // Item 6 Stage 2 — writes go either via mailbox (W1, default) or
         // SAB pending-writes ring (W2, gated by `useWriteRing`).
         installWriteEnv(env, call2);
@@ -618,9 +665,27 @@
         // EE=0 poll handler can DISCRIMINATE beam polls (VI range -> smooth-step) from
         // device-completion polls (DSP/EXI/AI -> jump-to-next-event). Only MMIO routes
         // through env reads, so a fresh addr here IS the polled register.
+        // [mmio-read-fastpath 2026-07-17] The oracle proved the audio-init stall is THROUGHPUT: every
+        // guest ISR MMIO read is a blocking worker->dolphin mailbox round-trip (call1(4,addr)), so the
+        // ARAM ARQ-chain runs ~2/s vs native ~400/s and gc freezes at 156. Read the two HOT ISR
+        // registers straight from a dolphin-maintained SAB mirror (no round-trip): PI cause 0xCC003000
+        // @0x026B27D0 (ProcessorInterface::UpdateException release-store), DSP_CONTROL 0xCC00500A
+        // @0x026B27D4 (DSP::UpdateInterrupts). Only post-takeover (cpu_owner==1); the fixed 512MB SAB
+        // never grows so this view stays valid. Atomics.load = acquire, pairs with dolphin's release.
+        self.__mmr = self.__mmr || new Int32Array(sharedMemoryRef.buffer);
         env.ppc_read8       = (addr) => { self.__lastMmioRdAddr = addr >>> 0; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(2, addr); };
-        env.ppc_read16      = (addr) => { self.__lastMmioRdAddr = addr >>> 0; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(3, addr); };
-        env.ppc_read32      = (addr) => { self.__lastMmioRdAddr = addr >>> 0; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(4, addr); };
+        env.ppc_read16      = (addr) => {
+          const a = addr >>> 0;
+          if (a === 0xCC00500A && Atomics.load(self.__mmr, 0x026A0000 >> 2) === 1) {
+            Atomics.add(self.__mmr, 0x026B27DC >> 2, 1);                  // [fastpath-hit] DSP_CONTROL
+            return Atomics.load(self.__mmr, 0x026B27D4 >> 2) & 0xFFFF; }  // DSP_CONTROL fast-path
+          self.__lastMmioRdAddr = a; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(3, a); };
+        env.ppc_read32      = (addr) => {
+          const a = addr >>> 0;
+          if (a === 0xCC003000 && Atomics.load(self.__mmr, 0x026A0000 >> 2) === 1) {
+            Atomics.add(self.__mmr, 0x026B27D8 >> 2, 1);                  // [fastpath-hit] PI cause
+            return Atomics.load(self.__mmr, 0x026B27D0 >> 2) >>> 0; }     // PI cause fast-path
+          self.__lastMmioRdAddr = a; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(4, a); };
         // Item 6 Stage 2 — writes go either via mailbox (W1, default) or
         // SAB pending-writes ring (W2, gated by `useWriteRing`).
         installWriteEnv(env, call2);
@@ -1349,16 +1414,48 @@
           // [deliv-reconcile] adopt any dolphin-delivered redirect BEFORE dispatching (the
           // stale-cursor race, task #18 root — see the helper above).
           __delivReconcile();
-          // [ext-inflight guard 2026-07-16] The in-flight EXT delivery completes when the
-          // guest's ISR handler finishes: its terminal OSLoadContext/rfi restores an EE=1
-          // context (SRR1 had EE=1) — so MSR.EE, forced to 0 by the 0x500 vector, transitions
-          // back to 1. That EE 0->1 edge is the robust "handler done" signal (survives a thread
-          // switch via __OSReschedule, unlike an exact SRR0 rfi-return match). Also accept the
-          // direct rfi-to-SRR0 return as a fast path, and a bounded safety cap so a genuinely
-          // stuck handler can never wedge delivery forever (the pending bit then re-attempts).
+          // [livepc-diag 2026-07-16 TEMP] Where is the guest ACTUALLY spinning while EXT
+          // deliveries freeze? Publish live pc/msr @0x026B2728/272C and a tiny top-8 histogram
+          // of the live pc @0x026B2730..0x026B276F (8 slots of {pc,count}). Gated cpu_owner==1.
+          if (Atomics.load(i32, 0x026A0000 >> 2) === 1) {
+            const _lpc = pc >>> 0;
+            const _lmsr = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
+            u32[0x026B2728 >> 2] = _lpc;
+            u32[0x026B272C >> 2] = _lmsr;
+            u32[0x026B2778 >> 2] = __extInFlight ? 1 : 0;   // is guard set right now
+            u32[0x026B277C >> 2] = __extInflightIters >>> 0; // how deep in the safety cap
+            // histogram: 8 slots at 0x026B2730 (pc) / 0x026B2734 (count), stride 8
+            let _slot = -1, _free = -1;
+            for (let k = 0; k < 8; k++) {
+              const sp = 0x026B2730 + k * 8;
+              const spc = u32[sp >> 2] >>> 0;
+              if (spc === _lpc) { _slot = k; break; }
+              if (_free < 0 && spc === 0 && (u32[(sp + 4) >> 2] >>> 0) === 0) _free = k;
+            }
+            if (_slot < 0 && _free >= 0) { _slot = _free; u32[(0x026B2730 + _free * 8) >> 2] = _lpc; }
+            if (_slot >= 0) {
+              const cp = (0x026B2730 + _slot * 8 + 4) >> 2;
+              u32[cp] = ((u32[cp] >>> 0) + 1) >>> 0;
+            }
+          }
+          // [ext-inflight guard FIX 2026-07-17 — DEVICE-SIDE "serviced" signal kills the 0x500 storm]
+          // The old clear fired on the MSR.EE 0->1 edge, but MP4's ARQ ISR chain calls
+          // OSRestoreInterrupts MID-handler (the AR-DMA callback re-enables interrupts to issue the
+          // NEXT queued DMA) — dolsdk arq.c / OSInterrupt.c:476-480 — flipping EE to 1 BEFORE __ARHandler
+          // acks INT_ARAM. Clearing the guard there let the still-asserted INT_CAUSE_DSP re-fire pc=0x500
+          // ~1000x per service (96030 samples @0x500 / 91 acks), starving the idle fast-forward so the
+          // trailing ARAM completions never fired and the ARQ queue byte (0x801D0539) never drained ->
+          // gc frozen 198 (native drains pend->0, gc->214). The robust "this delivery is SERVICED" signal
+          // is DEVICE-SIDE and flicker-free: INT_CAUSE_DSP (0x40) in the PI-cause mirror @0x026B27D0
+          // (ProcessorInterface::UpdateException RELEASE-store = m_interrupt_cause) stays set until the
+          // guest's __ARHandler ACKs ARAM (DSP_CONTROL write clears INT_ARAM -> UpdateInterrupts ->
+          // SetInterrupt(INT_CAUSE_DSP,false)). Hold the one-at-a-time guard until that bit clears (or the
+          // guest rfi'd back to the interrupted pc, or the safety cap). Survives the mid-ISR EE toggles
+          // and __OSReschedule thread switch; matches native's one-delivery-per-completion cadence. For a
+          // non-DSP EXT (VI etc.) the DSP bit is already 0 so it clears immediately — no over-hold.
           if (__extInFlight) {
-            const _eeNow = (u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0) & 0x8000;  // MSR.EE
-            if (_eeNow !== 0 || (pc >>> 0) === (__extSrr0 >>> 0)
+            const _piDsp = (u32[0x026B27D0 >> 2] >>> 0) & 0x40;   // INT_CAUSE_DSP still pending device-side?
+            if (_piDsp === 0 || (pc >>> 0) === (__extSrr0 >>> 0)
                 || ++__extInflightIters > 200000) {
               __extInFlight = false;
               __extInflightIters = 0;
@@ -1375,6 +1472,23 @@
           if ((pc >>> 0) === 0x800ca7a8) u32[0x026B1A9C >> 2] = ((u32[0x026B1A9C >> 2] >>> 0) + 1) >>> 0;
           if ((pc >>> 0) === 0x800ca594) u32[0x026B1AA0 >> 2] = ((u32[0x026B1AA0 >> 2] >>> 0) + 1) >>> 0;
           if ((pc >>> 0) === 0x800ca840) u32[0x026B1AA4 >> 2] = ((u32[0x026B1AA4 >> 2] >>> 0) + 1) >>> 0;
+          // [arq-diag 2026-07-16 TEMP] Does the ARAM-complete ISR chain reach the byte-decrement?
+          // __ARQInterruptServiceRoutine@0x800c706c -> aramQueueCallback@0x8011145c (decrements the
+          // aramQueueLo depth byte @0x801D0539 that aramSyncTransferQueue spins on). Also sample the
+          // live spin byte itself. arqIsrN@0x026B27A4, aramCbN@0x026B27A8, spinByte@0x026B27AC.
+          if ((pc >>> 0) === 0x800c706c) u32[0x026B27A4 >> 2] = ((u32[0x026B27A4 >> 2] >>> 0) + 1) >>> 0;
+          if ((pc >>> 0) === 0x8011145c) u32[0x026B27A8 >> 2] = ((u32[0x026B27A8 >> 2] >>> 0) + 1) >>> 0;
+          // [arq-diag2] which handler does __OSDispatchInterrupt route to? __OSDispatchInterrupt
+          // @0x800b7714, __DSPHandler@0x800c7558, __ARHandler@0x800c65dc, __ARChecksTdmaOverflow via
+          // __AICallback. dispN@0x026B27B0, dspHN@0x026B27B4, arHN@0x026B27B8.
+          if ((pc >>> 0) === 0x800b7714) u32[0x026B27B0 >> 2] = ((u32[0x026B27B0 >> 2] >>> 0) + 1) >>> 0;
+          if ((pc >>> 0) === 0x800c7558) u32[0x026B27B4 >> 2] = ((u32[0x026B27B4 >> 2] >>> 0) + 1) >>> 0;
+          if ((pc >>> 0) === 0x800c65dc) u32[0x026B27B8 >> 2] = ((u32[0x026B27B8 >> 2] >>> 0) + 1) >>> 0;
+          if (mem1Base !== 0 && Atomics.load(i32, 0x026A0000 >> 2) === 1) {
+            const _byteOff = (mem1Base + (0x801D0539 - 0x80000000)) >>> 0;   // wasm-heap byte addr
+            const _alignedWord = u32[(_byteOff & ~3) >> 2] >>> 0;             // containing 32-bit word
+            u32[0x026B27AC >> 2] = (_alignedWord >>> ((_byteOff & 3) * 8)) & 0xFF;  // extract the target byte (LE heap)
+          }
           // [await-pc 2026-07-03] The boot dispatcher can start before dolphin publishes
           // the first real pc — the SAB slot is zero-initialized, and dispatching pc=0
           // walks the reset vector's stub, manufacturing 'Unhandled Exception 0' (guest
@@ -1489,6 +1603,42 @@
               mod._ppc_worker_ct_fire_due_pure(gtl, gth);
             }
           }
+          // [ext-reassert 2026-07-16 — DELIVERY-RATE FIX for the MP4 audio-init wedge]
+          // Root cause (verified via live-pc histogram + gate telemetry): during MP4's
+          // aramStoreData queue-full wait (a tight OSDisableInterrupts/OSRestoreInterrupts
+          // EE-toggle spin) the guest reaches EE=1 thousands of times, but EXTERNAL_INT is
+          // NOT set in ppc_state.Exceptions at those moments — so the vectoring gate below
+          // never fires. WHY: our inline vector CLEARS EXTERNAL_INT (line ~1577); dolphin's
+          // ProcessorInterface::UpdateException is the ONLY thing that RE-asserts it, and it
+          // runs on the DEVICE worker only when kicked (mailbox cmd-4 / CoreTiming::Advance).
+          // pollAdvance kicks dolphin only while EE=0 (line 1253 early-returns on EE=1), so the
+          // EE=1 windows see a STALE-cleared EXTERNAL_INT. AID/ARAM stay asserted at the PI
+          // level (dspToExt climbs to ~22k) but never reach the guest -> gExtEe froze at 131
+          // and globalCounter stuck at 156. FIX: when the CPU worker owns the CPU, the guest is
+          // at EE=1, and EXTERNAL_INT is NOT currently set, kick dolphin (cmd-4) so its
+          // Advance()->UpdateException re-commits any PI-asserted device IRQ into Exceptions,
+          // then re-read exc so the SAME iteration's gate below vectors it. Rate-limited to a
+          // WAIT-LOOP spin so hot forward-progress code pays nothing. The aramStoreData toggle
+          // is a MULTI-pc ping-pong (0x80111a48<->0x80111bb4) that never accumulates samePcCount
+          // (see the loop-window note below) — so gate on EITHER same-pc (single-pc spin) OR the
+          // multi-pc loop-window counter self.__lwN. The kick is the identical cmd-4 pollAdvance
+          // already issues at EE=0.
+          if (!ignoreDowncount && Atomics.load(i32, 0x026A0000 >> 2) === 1) {
+            const _msrEE = (u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0) & 0x8000;
+            const _excNow = u32[(PPC_STATE_BASE + OFFSET_EXC) >> 2] >>> 0;
+            if (_msrEE !== 0 && (_excNow & 0x00000004) === 0
+                && !__extInFlight && (((samePcCount | 0) >= 2) || ((self.__lwN | 0) >= 2))
+                && ((self.__reassertN = (self.__reassertN | 0) + 1) & 3) === 0) {
+              // dolphin Advance fires due AID/ARAM CoreTiming events + re-runs
+              // ProcessorInterface::UpdateException, re-committing EXTERNAL_INT if a device
+              // IRQ is asserted at the PI level. Re-read exc below picks it up this iteration.
+              // [vi-dsp-prio A/B 2026-07-16] DISABLED: reassertN=2929 fires storm the guest at the
+              // 0x500 EXT vector (pcHist 500:21104), starving __OSDispatchInterrupt (dispN~0) — the
+              // reassert is redundant once VI-hide (dolphin_read32) lets DSP_ARAM through the prio walk.
+              // mod._ppc_worker_mailbox_call_sync(4, 0x80000000);
+              u32[0x026B279C >> 2] = ((u32[0x026B279C >> 2] >>> 0) + 1) >>> 0;  // reassert-kick count (probe)
+            }
+          }
           // Exception pending? Deliver via dolphin_check_exc (mailbox cmd 10),
           // then re-read PC from SAB and continue dispatching from the vector.
           // Under Phase IV, exiting the slice would deadlock — dolphin's
@@ -1534,6 +1684,22 @@
                 // Interface UpdateException, __atomic RELEASE) can't be lost (deferral != drop).
                 // DEC/sync exceptions still route via cmd-10 below. Deferred bits re-attempt
                 // loop-natively (this block re-runs every dispatch iteration).
+                // [gate-diag 2026-07-16 TEMP] why does EXT vectoring freeze while the idle loop
+                // reaches EE=1? Count gate outcomes @0x026B2780..0x026B279F (cpu_owner==1 only).
+                if (Atomics.load(i32, 0x026A0000 >> 2) === 1) {
+                  const _hasExt = (exc & EXC_EXTERNAL_INT) !== 0;
+                  const _eeOn = (msr & MSR_EE) !== 0;
+                  if (_hasExt) u32[0x026B2780 >> 2] = ((u32[0x026B2780 >> 2] >>> 0) + 1) >>> 0;         // EXT pending seen
+                  if (_hasExt && _eeOn) u32[0x026B2784 >> 2] = ((u32[0x026B2784 >> 2] >>> 0) + 1) >>> 0; // EXT+EE=1
+                  if (_hasExt && _eeOn && !__extInFlight) u32[0x026B2788 >> 2] = ((u32[0x026B2788 >> 2] >>> 0) + 1) >>> 0; // +guard clear
+                  if (_hasExt && _eeOn && !__extInFlight && (pc >>> 0) >= 0x4000 && mem1Base !== 0) {
+                    const _c0 = u32[(mem1Base + 0xC0) >> 2] >>> 0;
+                    const _oc = (((_c0 & 0xFF) << 24) | ((_c0 & 0xFF00) << 8) | ((_c0 >>> 8) & 0xFF00) | (_c0 >>> 24)) >>> 0;
+                    u32[0x026B278C >> 2] = _oc;  // last osCtx value seen at a would-be vector
+                    if (_oc !== 0 && _oc < 0x01800000) u32[0x026B2790 >> 2] = ((u32[0x026B2790 >> 2] >>> 0) + 1) >>> 0; // osCtx OK
+                    else u32[0x026B2794 >> 2] = ((u32[0x026B2794 >> 2] >>> 0) + 1) >>> 0; // osCtx REJECT
+                  }
+                }
                 if ((exc & EXC_EXTERNAL_INT) !== 0 && (msr & MSR_EE) !== 0
                     && (pc >>> 0) >= 0x4000
                     && !__extInFlight   // [ext-inflight guard 2026-07-16] one EXT at a time (native parity)
@@ -1571,19 +1737,42 @@
                     continue;
                   }
                 }
-                // mailbox cmd 10 (dolphin_check_exc) — call directly; the
-                // call1 helper is scoped to the env-setup block, not here.
-                self.__delivN = (self.__delivN | 0) + 1;  // [r31-trap] count deliveries
-                mod._ppc_worker_mailbox_call_sync(10, pc >>> 0) >>> 0;
-                pc = u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] >>> 0;
-                // [redirect-trace 2026-07-07] publish this loop's base + the re-read pc
-                // (SAB 0x026B0E98/0x026B0E9C) — the active-loop discriminator.
-                {
-                  const _v = new Uint32Array(sharedMemoryRef.buffer);
-                  _v[0x026B0E98 >> 2] = PPC_STATE_BASE >>> 0;
-                  _v[0x026B0E9C >> 2] = pc >>> 0;
+                // [ext-storm fix 2026-07-16 — serialize EXT via cmd-10 too] When an EXT is
+                // already in flight (__extInFlight: a 0x500 vector delivered, its ISR running
+                // at EE=0 and not yet rfi'd back), DO NOT deliver a second EXTERNAL_INT here.
+                // The inline path above already honors __extInFlight; but the cmd-10 fall-
+                // through did NOT — so when the inline gate was skipped BY the guard, cmd-10
+                // (dolphin_check_exc) re-vectored 0x500 anyway, defeating one-at-a-time
+                // serialization. That is the MP4 audio-init STORM: pcring/wring pinned at
+                // 0x500 <-> 0x801116e0 (aramSyncTransferQueue), each ARAM completion re-raising
+                // INT_ARAM and cmd-10 re-vectoring before the ARQ ISR chain (aramQueueCallback,
+                // which decrements the aramQueueLo depth byte @0x801D0539) finishes — so the
+                // spin byte never drains and globalCounter froze at 156. Defer the EXT (leave
+                // the pending bit set) when the guard is up; it re-attempts once the ISR rfi's
+                // (guard clears on the EE 0->1 edge at the loop head). NON-EXTERNAL exceptions
+                // (DEC alone / sync) are NOT guarded and still route through cmd-10.
+                if (__extInFlight && (exc & EXC_EXTERNAL_INT) !== 0
+                    && (exc & ~EXC_EXTERNAL_INT & ~EXC_DECREMENTER) === 0
+                    && Atomics.load(i32, 0x026A0000 >> 2) === 1) {
+                  // Deferred: an EXT is in flight. Do NOT re-deliver — fall through to normal
+                  // block dispatch so the guest keeps executing its CURRENT ISR (which, on rfi,
+                  // clears the guard at the loop head, and the deferred EXT re-attempts then).
+                  u32[0x026B27A0 >> 2] = ((u32[0x026B27A0 >> 2] >>> 0) + 1) >>> 0;  // cmd-10 EXT defers (probe)
+                } else {
+                  // mailbox cmd 10 (dolphin_check_exc) — call directly; the
+                  // call1 helper is scoped to the env-setup block, not here.
+                  self.__delivN = (self.__delivN | 0) + 1;  // [r31-trap] count deliveries
+                  mod._ppc_worker_mailbox_call_sync(10, pc >>> 0) >>> 0;
+                  pc = u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] >>> 0;
+                  // [redirect-trace 2026-07-07] publish this loop's base + the re-read pc
+                  // (SAB 0x026B0E98/0x026B0E9C) — the active-loop discriminator.
+                  {
+                    const _v = new Uint32Array(sharedMemoryRef.buffer);
+                    _v[0x026B0E98 >> 2] = PPC_STATE_BASE >>> 0;
+                    _v[0x026B0E9C >> 2] = pc >>> 0;
+                  }
+                  continue;
                 }
-                continue;
               }
             }
             const downcount = i32[(PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2];

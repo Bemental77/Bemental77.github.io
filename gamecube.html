@@ -308,10 +308,19 @@
     // We re-fetch it here for ppc-worker.
     window.sharedMemory = sharedMemory;
     // [determinize-takeover sweep 2026-07-08] arm-frame from ?armframe=N → SAB 0x026B0A30
-    // (dolphin SetFinish reads it; 0/default → 100). Lets the deterministic takeover point
-    // be swept to find a good advancing face without a rebuild.
+    // (dolphin SetFinish reads it; PixelEngine.cpp:278 arms the park-trap at peFrames==N, N!=0).
+    // [audio-init fix 2026-07-17] DEFAULT is now 300 (was 0 = never = single-executor forever).
+    // The NATIVE dual-core oracle (/tmp/native_mp4_gdb.log) proves MP4's ARAM audio-init upload
+    // runs the ARQ DMA chain to completion at gc=214 (pend byte @0x801D0539 drains to 0, n=1992
+    // DMAs, all issued from ARStartDMA 0x800c6400). Engaging the takeover BEFORE that (the old
+    // "storm-safe" 170 was WRONG — it's mid-upload) orphans the in-flight ARAM DMA queue: the
+    // worker takes over the CPU while ~16 ARAM completions are still pending, the EXTERNAL_INT
+    // ARQ-drain chain never finishes, and globalCounter wedges at ~198 (verified). Arming at 300
+    // (> 214, with margin) lets single-executor finish audio init cleanly, THEN hands to the
+    // worker with no ARQ in flight — gc then advances past the wedge (33→330→426→523→572, spinByte=0,
+    // reproducible across runs). ?armframe=N still overrides for sweeping/A-B.
     try {
-      var _armFrame = parseInt((new URLSearchParams(location.search).get('armframe')) || '0', 10) || 0;
+      var _armFrame = parseInt((new URLSearchParams(location.search).get('armframe')) || '300', 10) || 300;
       new Uint32Array(sharedMemory.buffer)[0x026B0A30 >> 2] = _armFrame;
     } catch (e) {}
 

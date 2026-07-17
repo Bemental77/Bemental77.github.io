@@ -127,6 +127,13 @@ uint32_t dolphin_read32(uint32_t addr) {
         // eff_cause hide: the post-audio-init guest has DSP/AI in its PI mask (0xffc) and NEEDS
         // the ARAM-DMA interrupt (aramStoreData wedge). See ProcessorInterface.cpp:UpdateException.
         // if ((pf & 0x2u) || g_dc_handover_done) val &= ~0x60u;
+        // [cause-fastpath 2026-07-17] Keep this mirror FRESH so the worker can read the PI cause
+        // WITHOUT a mailbox round-trip. The oracle proved the audio-init stall is THROUGHPUT: native
+        // runs the ARAM ARQ-chain at ~400 DMAs/s and clears gc 156->214; the WASM guest manages ~2/s
+        // because EVERY ISR MMIO read (cause 0xCC003000, DSP_CONTROL 0xCC00500A) is a blocking
+        // worker->dolphin mailbox round-trip. The eager update is in ProcessorInterface::UpdateException
+        // (runs on every cause change); this write covers the rare slow-path read too. Mirror @0x026B27D0.
+        *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B27D0u)) = val;
     }
     return val;
 }

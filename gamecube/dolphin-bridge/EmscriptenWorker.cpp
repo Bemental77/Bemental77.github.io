@@ -460,6 +460,36 @@ extern "C" void dolphin_gp_unseal();  // [dual-core FIFO splice fix] (dolphin_ji
 // consuming (the producer's bounded watermark wait).
 static u32 g_cp_read_cooldown = 0;  // [torn HI/LO] suppress the per-iter pump right after a CP-range read
 static void dolphin_drain_gp_ring(void) {
+    // [mmio-write-fastpath 2026-07-17] Drain the async DSP/AR-DMA MMIO write ring FIRST — before the
+    // gp ring's empty early-return and before any mailbox op (same ordering guarantee as the gp ring)
+    // — so the guest ISR's DSP_CONTROL ack + AR_DMA-issue writes reach dolphin IN ORDER without a
+    // blocking mailbox round-trip. Applying AR_DMA_CNT_L triggers Do_ARAM_DMA; DSP_CONTROL clears the
+    // ack. Ring @0x02710000: +0 head, +4 tail, 12-byte {addr,val,width} entries @+0x40, cap 4096.
+    // THIS is the throughput fix: native runs the ARAM ARQ-chain 400/s, we managed ~2/s because each
+    // of the ~6 register writes per DMA was a round-trip; now they're fire-and-forget.
+    {
+        volatile uint32_t* const mw_head = reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x02710000u));
+        volatile uint32_t* const mw_tail = reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x02710004u));
+        uint32_t mt = *mw_tail;
+        const uint32_t mh = __atomic_load_n(const_cast<const uint32_t*>(mw_head), __ATOMIC_ACQUIRE);
+        uint32_t mn = 0;
+        while (mt != mh && mn < 65536u) {
+            const uintptr_t slot = 0x02710040u + ((mt & 4095u) * 12u);
+            const uint32_t a = *reinterpret_cast<volatile uint32_t*>(slot);
+            const uint32_t v = *reinterpret_cast<volatile uint32_t*>(slot + 4u);
+            const uint32_t w = *reinterpret_cast<volatile uint32_t*>(slot + 8u);
+            if (w == 1u) dolphin_write8(a, v);
+            else if (w == 2u) dolphin_write16(a, v);
+            else dolphin_write32(a, v);
+            ++mt; ++mn;
+        }
+        if (mn != 0u) {
+            __atomic_store_n(const_cast<uint32_t*>(mw_tail), mt, __ATOMIC_RELEASE);
+            volatile uint32_t* const p_mwapplied =
+                reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x02710008u));
+            *p_mwapplied = *p_mwapplied + mn;   // [diag] MMIO writes applied via the fast-path ring
+        }
+    }
     volatile uint32_t* const p_head = reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026C0000u));
     volatile uint32_t* const p_tail = reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026C0004u));
     uint32_t t = *p_tail;
@@ -792,6 +822,14 @@ void dolphin_service_iter(void) {
             // never a bounded/unbounded mailbox stall) AND keep dolphin's event pump alive at
             // native rate while the worker executes a real slice. Reverted to 1024-burst until
             // that coupled fix lands (this state at least keeps audio + guest alive).
+            // [mmio-write-fastpath ORDERING 2026-07-17] Apply any pending async DSP/AR_DMA writes the
+            // guest just posted in its ISR (the DMA-issue for the NEXT ARQ chunk) BEFORE the ff advances
+            // time — otherwise Do_ARAM_DMA runs against an already-advanced global_timer and schedules
+            // the completion far in the future, so it never fires (aramComplete=0). Draining here means
+            // the DMA is issued + its completion scheduled at the current sim-time, then the ff crosses
+            // to it and fires it. dolphin_drain_gp_ring drains the MMIO ring first (its own early-return
+            // only guards the GX ring), so this is cheap when the GX ring is empty (the audio phase).
+            dolphin_drain_gp_ring();
             *ff_flag = 1u;
             for (int k = 0; k < 1024; ++k)
             {

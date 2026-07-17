@@ -1066,6 +1066,49 @@ function startServer() {
             bw.enDSP = A[0x026B271C >> 2] >>> 0;          // INT_DSP enabled+active (mailbox)
             bw.enARAM = A[0x026B2720 >> 2] >>> 0;         // INT_ARAM enabled+active
             bw.enAID = A[0x026B2724 >> 2] >>> 0;          // INT_AID enabled+active (audio interface DMA)
+            // [livepc-diag 2026-07-16 TEMP] live guest pc/msr + guard state + top-8 pc histogram
+            bw.livePc = (A[0x026B2728 >> 2] >>> 0).toString(16);
+            bw.liveMsr = (A[0x026B272C >> 2] >>> 0).toString(16);
+            bw.guardSet = A[0x026B2778 >> 2] >>> 0;
+            bw.guardIters = A[0x026B277C >> 2] >>> 0;
+            bw.pcHist = Array.from({length: 8}, (_, k) =>
+              (A[(0x026B2730 + k * 8) >> 2] >>> 0).toString(16) + ':' + (A[(0x026B2730 + k * 8 + 4) >> 2] >>> 0)
+            ).filter(s => !s.startsWith('0:')).join(' ');
+            bw.gExtSeen  = A[0x026B2780 >> 2] >>> 0;   // EXT pending at check
+            bw.gExtEe    = A[0x026B2784 >> 2] >>> 0;   // + EE=1
+            bw.gExtGuard = A[0x026B2788 >> 2] >>> 0;   // + guard clear
+            bw.gOsCtx    = (A[0x026B278C >> 2] >>> 0).toString(16); // last osCtx
+            bw.gOsOk     = A[0x026B2790 >> 2] >>> 0;   // osCtx passed -> vectored
+            bw.gOsRej    = A[0x026B2794 >> 2] >>> 0;   // osCtx rejected
+            bw.aidSelfAck = A[0x026B2798 >> 2] >>> 0;  // [aid-selfack] dolphin self-acked AID post-takeover
+            bw.reassertN = A[0x026B279C >> 2] >>> 0;    // [ext-reassert] worker dolphin-kick count (EE=1 wait-loop)
+            bw.cmd10Defer = A[0x026B27A0 >> 2] >>> 0;    // [ext-storm] cmd-10 EXT deliveries deferred by the guard
+            bw.arqIsrN   = A[0x026B27A4 >> 2] >>> 0;      // [arq] __ARQInterruptServiceRoutine runs
+            bw.aramCbN   = A[0x026B27A8 >> 2] >>> 0;      // [arq] aramQueueCallback runs (decrements spin byte)
+            bw.spinByte  = A[0x026B27AC >> 2] >>> 0;      // [arq] live aramQueueLo depth byte @0x801D0539
+            bw.dispN     = A[0x026B27B0 >> 2] >>> 0;      // [arq] __OSDispatchInterrupt runs
+            bw.dspHN     = A[0x026B27B4 >> 2] >>> 0;      // [arq] __DSPHandler runs
+            bw.arHN      = A[0x026B27B8 >> 2] >>> 0;      // [arq] __ARHandler runs (calls the AR DMA callback)
+            bw.viHide    = A[0x026B27C0 >> 2] >>> 0;      // [vi-dsp-prio] VI hidden from cause read while DSP co-pending
+            bw.dspCrReads = A[0x026B27CC >> 2] >>> 0;     // [aram-diag3] guest DSP_CONTROL reads post-takeover
+            bw.aramSeen   = A[0x026B27C8 >> 2] >>> 0;     // [aram-diag3] ...of which had ARAM(0x20) set (guest sees it)
+            bw.fpCause = A[0x026B27D8 >> 2] >>> 0;         // [fastpath-hit] PI cause reads served from SAB mirror
+            bw.fpDspCr = A[0x026B27DC >> 2] >>> 0;         // [fastpath-hit] DSP_CONTROL reads served from SAB mirror
+            bw.mwApplied = A[0x02710008 >> 2] >>> 0;       // [mmio-write-fastpath] DSP/AR writes applied via async ring
+            bw.ffEnter = A[0x026B2A00 >> 2] >>> 0;         // [ff-cost] ff excursion count
+            bw.ffAdv = A[0x026B2A04 >> 2] >>> 0;           // [ff-cost] total Advance() calls in the ff loop
+            bw.ffMs = A[0x026B2A08 >> 2] >>> 0;            // [ff-cost] total wall-ms spent in the ff loop
+            bw.vHit = A[0x026B2A0C >> 2] >>> 0;            // [vec-wedge] vector-page (0x100-0x3fff) region-dispatch HIT
+            bw.vMiss = A[0x026B2A10 >> 2] >>> 0;           // [vec-wedge] vector-page region-dispatch MISS
+            bw.vPoll = A[0x026B2A14 >> 2] >>> 0;           // [vec-wedge] pollAdvance calls at a vector-page pc
+            bw.stall500idle = A[0x026B2A18 >> 2] >>> 0;     // [0x500-stall] 0x500 ate by the downcount idle-continue
+            bw.stall500disp = A[0x026B2A1C >> 2] >>> 0;     // [0x500-stall] 0x500 reached the block-dispatch section
+            bw.vHit = A[0x026B2A0C >> 2] >>> 0;              // [0x500-stall] vector-page dispatch HIT
+            bw.vMiss = A[0x026B2A10 >> 2] >>> 0;            // [0x500-stall] vector-page dispatch MISS
+            bw.disp500next = (A[0x026B2A20 >> 2] >>> 0).toString(16);  // [0x500-stall] dispatch return for 0x500
+            // [live-pc histogram] top-8 {pc,count} the guest actually visits (worker publishes @0x026B2730, stride 8)
+            bw.lpcHist = (() => { const o = []; for (let k = 0; k < 8; k++) { const sp = 0x026B2730 + k * 8;
+              const p = A[sp >> 2] >>> 0, c = A[(sp + 4) >> 2] >>> 0; if (c) o.push('0x' + p.toString(16) + ':' + c); } return o.join(' '); })();
             bw.peFrames = A[0x026B0930 >> 2] >>> 0;        // SetFinish counter (SAB, replaces [ax-pe] print)
             bw.eeViolations = A[0x026B0934 >> 2] >>> 0;    // Step-2 tripwire: EXT delivered at EE=0 (must be 0)
             // [crash-ctx] the OS exception context (0x801a5b38 in every captured dump):

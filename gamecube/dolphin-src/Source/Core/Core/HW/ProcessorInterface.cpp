@@ -205,6 +205,14 @@ void ProcessorInterfaceManager::UpdateException()
     __atomic_or_fetch(&ppc_state.Exceptions, EXCEPTION_EXTERNAL_INT, __ATOMIC_RELEASE);
   else
     __atomic_and_fetch(&ppc_state.Exceptions, ~static_cast<u32>(EXCEPTION_EXTERNAL_INT), __ATOMIC_RELEASE);
+  // [cause-fastpath 2026-07-17] Keep the guest-visible PI-cause mirror (0xCC003000 read value = cause
+  // with INT_CAUSE_CP 0x800 hidden, matching dolphin_read32) fresh in SAB @0x026B27D0 so the worker's
+  // ISR reads it DIRECTLY instead of a blocking mailbox round-trip. UpdateException runs on every
+  // cause set/clear, so the mirror tracks the live cause. RELEASE store pairs with the worker's
+  // Atomics.load(ACQUIRE). This is the throughput fix for the ARAM audio-init chain (oracle: native
+  // ~400 ARAM DMAs/s vs our ~2/s, bottlenecked on per-ISR MMIO mailbox round-trips).
+  __atomic_store_n(reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B27D0u)),
+                   eff_cause & ~static_cast<u32>(0x800u), __ATOMIC_RELEASE);
 }
 
 static const char* Debug_GetInterruptName(u32 cause_mask)
