@@ -151,6 +151,15 @@ void emit_mfspr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Cod
         // the interp sees current GPR state, then ReloadAll after so later
         // ops' Flush doesn't overwrite the interp's writes with stale
         // locals.
+        // [pc-sync A4 2026-06-28] Store ppc_state.pc = op.address BEFORE the interp.
+        // mfspr/mtspr of non-direct SPRs (TBL/TBU/DEC) is NOT canEndBlock/FL_USE_FPU,
+        // so the set_pc gate (ppc_emit.cpp:755) does not set pc; under the cutover the
+        // dolphin_interp guard `if (ppc_state.pc != pc) return;` (dolphin_jit_wimports.cpp:294)
+        // then SILENTLY SKIPS the op -> stale/torn DEC + timebase feeding __OSGetSystemTime/
+        // InsertAlarm. Matches emit_fallback (ppc_emit.cpp:187-189).
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i32_const((s32)op.address);
+        wb.op_i32_store(ppc_off::PC);
         rc.Flush(ctx_ptr);
         frc.Flush(ctx_ptr);
         wb.op_i32_const((s32)inst);
@@ -192,6 +201,15 @@ void emit_mtspr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Cod
         // the interp sees current GPR state, then ReloadAll after so later
         // ops' Flush doesn't overwrite the interp's writes with stale
         // locals.
+        // [pc-sync A4 2026-06-28] Store ppc_state.pc = op.address BEFORE the interp.
+        // mfspr/mtspr of non-direct SPRs (TBL/TBU/DEC) is NOT canEndBlock/FL_USE_FPU,
+        // so the set_pc gate (ppc_emit.cpp:755) does not set pc; under the cutover the
+        // dolphin_interp guard `if (ppc_state.pc != pc) return;` (dolphin_jit_wimports.cpp:294)
+        // then SILENTLY SKIPS the op -> stale/torn DEC + timebase feeding __OSGetSystemTime/
+        // InsertAlarm. Matches emit_fallback (ppc_emit.cpp:187-189).
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i32_const((s32)op.address);
+        wb.op_i32_store(ppc_off::PC);
         rc.Flush(ctx_ptr);
         frc.Flush(ctx_ptr);
         wb.op_i32_const((s32)inst);
@@ -315,6 +333,16 @@ void emit_mtmsr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Cod
 static void emit_simple_fallback(WasmModuleBuilder& wb, RegCache& rc,
                                  FPRRegCache& frc, const CodeOp& op,
                                  u32 ctx_ptr) {
+    // [pc-sync fix 2026-06-28] Write ppc_state.pc = op.address BEFORE the interp,
+    // exactly like emit_fallback (ppc_emit.cpp:187-189). The cutover's dolphin_interp
+    // guard `if (ppc_state.pc != pc) return;` (dolphin_jit_wimports.cpp:294) SILENTLY
+    // SKIPS this op otherwise. mfcr/mtcrf/mtsr/mfsr/mtsrin/mfsrin/tlbie route through
+    // here and are common in game code; the skip diverged the worker to garbage
+    // (0x840480, executing Hu3DPreProc/HuSprFinish). The conformance harness missed
+    // it — its env.ppc_interp is a no-op stub (test_diff_next.cpp:178) with no guard.
+    wb.op_i32_const((s32)ctx_ptr);
+    wb.op_i32_const((s32)op.address);
+    wb.op_i32_store(ppc_off::PC);
     // Mirror emit_fallback (ppc_emit.cpp:56-63): Flush dirty locals so the
     // interp sees current GPR state, then ReloadAll after so later ops'
     // Flush doesn't overwrite the interp's writes with stale locals.

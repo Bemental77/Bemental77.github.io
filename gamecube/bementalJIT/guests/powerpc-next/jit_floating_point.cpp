@@ -9,6 +9,8 @@
 #include "bementalJIT/wasm_module_builder.h"
 #include "code_op.h"
 #include "fpr_reg_cache.h"
+#include "jit_fp_helpers.h"   // [oracle-audit 2026-07-12] shared Force25Bit/
+                              // ForceSingle/ForceDouble/NaN-ladder/FMA helpers
 #include "jit_load_store.h"   // emit_psq_convert_to_double (NaN-exact widen)
 #include "ppc_analyst.h"
 #include "ppc_offsets.h"
@@ -24,6 +26,13 @@ static void emit_rc_fallback(WasmModuleBuilder& wb, RegCache& rc,
     // FP Rc=1 routes through interp (CR1 update from FPSCR not modeled).
     // The interp can mutate ps[] via FPSCR side effects; flush+reload the
     // FPR cache around the call, same boundary as ppc_emit.cpp:emit_fallback.
+    // [pc-sync A4 2026-06-28] fmr./fabs./fneg./fsel. lack FL_USE_FPU (ppc_tables.cpp)
+    // so the set_pc gate (ppc_emit.cpp:755) does not set pc; under the cutover the
+    // dolphin_interp guard (dolphin_jit_wimports.cpp:294) would silently skip the
+    // whole op. Store pc first. Matches ppc_emit.cpp:187-189.
+    wb.op_i32_const((s32)ctx_ptr);
+    wb.op_i32_const((s32)op.address);
+    wb.op_i32_store(ppc_off::PC);
     rc.Flush(ctx_ptr);
     frc.Flush(ctx_ptr);
     wb.op_i32_const((s32)op.inst);
@@ -98,10 +107,10 @@ void emit_fnabsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
 // sub5: 18=div, 20=sub, 21=add, 25=mul. Mirrors ps_binary but single-lane.
 // No demote/promote: scalar double-precision keeps full f64 precision.
 //
-// Cache-local form: bind fa/arg2 ps0 (Read), bind fd ps0 (Write).
-// Operands loaded from cache locals (i64) and reinterpreted to f64 at the
-// use site; result reinterpreted back to i64 and stored into fd's local.
-// Memory becomes canonical at block-exit Flush — no per-op memory traffic.
+// [C8+C12a 2026-07-12 oracle-audit] faddx/fsubx/fmulx/fdivx call NI_add/sub/
+// mul/div (NaN ladder: MakeQuiet(first-NaN a->b) or PPC_NAN default) then
+// ForceDouble (NI-gated FlushToZero, Interpreter_FloatingPoint.cpp:354/443/
+// 483/744). fmulx double does NOT Force25Bit (only fmulsx/ps_mul do — C3).
 void emit_fp_arith_double(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     if (GekkoOperands::Rc(op.inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 fd   = GekkoOperands::FD(op.inst);
@@ -115,10 +124,16 @@ void emit_fp_arith_double(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     auto arg2_pair = frc.Bind(arg2, FPRMode::Read,  FPR_LANE_PS0);
     auto fd_pair   = frc.Bind(fd,   FPRMode::Write, FPR_LANE_PS0);
 
+    // Stash a, b for the NaN ladder (emit_nan_fixup_2op reads LOCAL_FMA_A/B).
     wb.op_local_get(fa_pair.ps0_idx);
     wb.op_f64_reinterpret_i64();
+    wb.op_local_set(LOCAL_FMA_A);
     wb.op_local_get(arg2_pair.ps0_idx);
     wb.op_f64_reinterpret_i64();
+    wb.op_local_set(LOCAL_FMA_B);
+    // raw op
+    wb.op_local_get(LOCAL_FMA_A);
+    wb.op_local_get(LOCAL_FMA_B);
     switch (sub5) {
     case 18: wb.op_f64_div(); break;
     case 20: wb.op_f64_sub(); break;
@@ -126,12 +141,19 @@ void emit_fp_arith_double(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     case 25: wb.op_f64_mul(); break;
     default: break;
     }
-    wb.op_i64_reinterpret_f64();
-    wb.op_local_set(fd_pair.ps0_idx);
+    emit_nan_fixup_2op(wb);          // [C8] NaN ladder
+    emit_force_double_setps0(wb, fd_pair, ctx_ptr);  // [C12a] ForceDouble->ps0
 }
 
 // Double-precision FMA family — ps0 lane only.
-// sub5: 28=fmsub, 29=fmadd, 30=fnmsub, 31=fnmadd. Mirrors ps_fma.
+// sub5: 28=fmsub, 29=fmadd, 30=fnmsub, 31=fnmadd.
+// [C2+C8+C12a 2026-07-12 oracle-audit] fused std::fma via emit_fma_core
+// (bit-exact for single-prec inputs; ~1-ULP-on-subnormal-double residual
+// documented in jit_fp_helpers.h). NaN ladder (MakeQuiet first-NaN a->b->c
+// or PPC_NAN default) then ForceDouble; fnmadd/fnmsub apply the NaN-safe
+// negate (std::isnan(tmp)?tmp:-tmp) AFTER ForceDouble, matching lines 653-654
+// / 699-700. Note: fnmadd/fnmsub negate ForceDouble(product) — so negate goes
+// after emit_force_double, on the value re-loaded from ps0.
 void emit_fp_fma_double(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     if (GekkoOperands::Rc(op.inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 fd   = GekkoOperands::FD(op.inst);
@@ -147,16 +169,17 @@ void emit_fp_fma_double(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, c
     auto fc_pair = frc.Bind(fc, FPRMode::Read,  FPR_LANE_PS0);
     auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_PS0);
 
-    wb.op_local_get(fa_pair.ps0_idx);
+    // Stage a, c (double FMA: NO Force25Bit — only the single family rounds c),
+    // b. emit_fma_stage keeps A0/C0/B0 (primitive) + A/M2/B (NaN-ladder
+    // originals) disjoint, so no re-stage is needed after emit_fma_core.
+    emit_fma_stage(wb, fa_pair.ps0_idx, fc_pair.ps0_idx, fb_pair.ps0_idx,
+                   /*force25_c=*/false);
+    emit_fma_core(wb, subtract, /*single=*/false);  // [C2] round(a*c+(sub?-b:b))
+    emit_nan_fixup_fma(wb);          // [C8] NaN ladder (gated on isnan(result), a->b->c)
+    // ForceDouble then optional NaN-safe negate (fnmadd/fnmsub).
+    emit_force_double_i64(wb, ctx_ptr);
     wb.op_f64_reinterpret_i64();
-    wb.op_local_get(fc_pair.ps0_idx);
-    wb.op_f64_reinterpret_i64();
-    wb.op_f64_mul();
-    wb.op_local_get(fb_pair.ps0_idx);
-    wb.op_f64_reinterpret_i64();
-    if (subtract) wb.op_f64_sub();
-    else          wb.op_f64_add();
-    if (negate)   wb.op_f64_neg();
+    if (negate) emit_nan_safe_neg(wb);  // [C8b] isnan(tmp)?tmp:-tmp
     wb.op_i64_reinterpret_f64();
     wb.op_local_set(fd_pair.ps0_idx);
 }
@@ -167,143 +190,20 @@ void emit_fp_fma_double(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, c
 // Result = ForceSingle(fpscr, <f64 op>) Filled into BOTH lanes of fd.
 // ---------------------------------------------------------------------------
 
-// Scratch locals — group 6 in build_block_next ({2,32,64,2,1,2}); the two
-// i32 psq stages (98/99) are reused for f32-bit twiddling / the NI flag.
-static constexpr u32 LOCAL_FP_T0    = 98;   // i32 — f32 result bits (widen input)
-static constexpr u32 LOCAL_FP_T1    = 99;   // i32 — runtime FPSCR.NI flag
-static constexpr u32 LOCAL_FP_I64_A = 101;  // i64 — bit-twiddle stage
-static constexpr u32 LOCAL_FP_I64_B = 102;  // i64 — Force25Bit shift
-
-// Force25Bit (Interpreter_FPUtils.h:91-124): i64 double bits on stack ->
-// i64 on stack. Normal path: (i & ~0x7FFFFFF) + (i & 0x8000000) — round-
-// half-up at 25 significant bits (carry may propagate, intended). Subnormal
-// path shifts the mask/round right until the fraction MSB would reach the
-// exponent: shift = clz(frac) - (63 - 52); keep_mask is an ARITHMETIC
-// shift (s64 in the reference), round a logical one.
-static void emit_force25bit(WasmModuleBuilder& wb) {
-    wb.op_local_set(LOCAL_FP_I64_A);
-    // subnormal? exp==0 && frac!=0
-    wb.op_local_get(LOCAL_FP_I64_A);
-    wb.op_i64_const(0x7FF0000000000000ll);
-    wb.op_i64_and();
-    wb.op_i64_eqz();
-    wb.op_local_get(LOCAL_FP_I64_A);
-    wb.op_i64_const(0x000FFFFFFFFFFFFFll);
-    wb.op_i64_and();
-    wb.op_i64_eqz();
-    wb.op_i32_eqz();
-    wb.op_i32_and();
-    wb.op_if(/*BLOCK_TYPE_VOID*/);
-    {
-        wb.op_local_get(LOCAL_FP_I64_A);
-        wb.op_i64_const(0x000FFFFFFFFFFFFFll);
-        wb.op_i64_and();
-        wb.op_i64_clz();
-        wb.op_i64_const(11);  // 63 - DOUBLE_FRAC_WIDTH(52)
-        wb.op_i64_sub();
-        wb.op_local_set(LOCAL_FP_I64_B);
-        wb.op_i64_const((s64)0xFFFFFFFFF8000000ll);
-        wb.op_local_get(LOCAL_FP_I64_B);
-        wb.op_i64_shr_s();
-        wb.op_local_get(LOCAL_FP_I64_A);
-        wb.op_i64_and();
-        wb.op_i64_const(0x8000000ll);
-        wb.op_local_get(LOCAL_FP_I64_B);
-        wb.op_i64_shr_u();
-        wb.op_local_get(LOCAL_FP_I64_A);
-        wb.op_i64_and();
-        wb.op_i64_add();
-        wb.op_local_set(LOCAL_FP_I64_A);
-    }
-    wb.op_else();
-    {
-        wb.op_local_get(LOCAL_FP_I64_A);
-        wb.op_i64_const((s64)0xFFFFFFFFF8000000ll);
-        wb.op_i64_and();
-        wb.op_local_get(LOCAL_FP_I64_A);
-        wb.op_i64_const(0x8000000ll);
-        wb.op_i64_and();
-        wb.op_i64_add();
-        wb.op_local_set(LOCAL_FP_I64_A);
-    }
-    wb.op_end();
-    wb.op_local_get(LOCAL_FP_I64_A);
-}
-
-// ForceSingle(fpscr, f64-on-stack) + Fill(fd both lanes).
-// Interpreter_FPUtils.h:53-80 with the NI gate read from ctx FPSCR at
-// RUNTIME (bit 2 = 0x4):
-//   NI: |x| < 2^-126 (double compare, pre-cast)  -> signed zero
-//   cast to f32 (wasm f32.demote_f64 = host cvtsd2ss = interp cast)
-//   NI: f32 subnormal result                     -> signed zero (FlushToZero)
-// Widen back NaN-payload-exact via emit_psq_convert_to_double (reads
-// LOCAL_FP_T0); both fd lanes set (ps[FD].Fill).
-static void emit_force_single_fill(WasmModuleBuilder& wb, const RCFprPair& fd_pair, u32 ctx_ptr) {
-    wb.op_i64_reinterpret_f64();
-    wb.op_local_set(LOCAL_FP_I64_A);
-    // T1 = FPSCR & 4 (NI)
-    wb.op_i32_const((s32)ctx_ptr);
-    wb.op_i32_load(ppc_off::FPSCR);
-    wb.op_i32_const(4);
-    wb.op_i32_and();
-    wb.op_local_set(LOCAL_FP_T1);
-    // stage 1 — NI pre-cast flush of single-subnormal magnitudes
-    wb.op_local_get(LOCAL_FP_T1);
-    wb.op_if(/*VOID*/);
-    {
-        wb.op_local_get(LOCAL_FP_I64_A);
-        wb.op_i64_const(0x7FFFFFFFFFFFFFFFll);
-        wb.op_i64_and();
-        wb.op_i64_const(0x3810000000000000ll);  // smallest normal single, as double
-        wb.op_i64_lt_u();
-        wb.op_if(/*VOID*/);
-        {
-            wb.op_local_get(LOCAL_FP_I64_A);
-            wb.op_i64_const((s64)0x8000000000000000ll);
-            wb.op_i64_and();
-            wb.op_local_set(LOCAL_FP_I64_A);
-        }
-        wb.op_end();
-    }
-    wb.op_end();
-    // stage 2 — demote
-    wb.op_local_get(LOCAL_FP_I64_A);
-    wb.op_f64_reinterpret_i64();
-    wb.op_f32_demote_f64();
-    wb.op_i32_reinterpret_f32();
-    wb.op_local_set(LOCAL_FP_T0);
-    // stage 3 — NI post-cast f32 denormal flush (Common::FlushToZero).
-    // (bits & 0x7FFFFFFF) < 0x00800000 covers subnormal AND zero (zero is
-    // unchanged by the sign-only mask).
-    wb.op_local_get(LOCAL_FP_T1);
-    wb.op_if(/*VOID*/);
-    {
-        wb.op_local_get(LOCAL_FP_T0);
-        wb.op_i32_const(0x7FFFFFFF);
-        wb.op_i32_and();
-        wb.op_i32_const(0x00800000);
-        wb.op_i32_lt_u();
-        wb.op_if(/*VOID*/);
-        {
-            wb.op_local_get(LOCAL_FP_T0);
-            wb.op_i32_const((s32)0x80000000);
-            wb.op_i32_and();
-            wb.op_local_set(LOCAL_FP_T0);
-        }
-        wb.op_end();
-    }
-    wb.op_end();
-    // widen + Fill both lanes
-    emit_psq_convert_to_double(wb);
-    wb.op_local_set(fd_pair.ps0_idx);
-    wb.op_local_get(fd_pair.ps0_idx);
-    wb.op_local_set(fd_pair.ps1_idx);
-}
+// [oracle-audit 2026-07-12] Force25Bit, ForceSingle (emit_force_single_i64 /
+// emit_force_single_fill), ForceDouble (emit_force_double_i64 /
+// emit_force_double_setps0), the NaN ladder (emit_nan_fixup_2op /
+// emit_nan_fixup_fma), emit_nan_safe_neg, and the correctly-rounded FMA core
+// (emit_fma_core) now live in jit_fp_helpers.h so the paired emitters can
+// share them. Scratch-local constants (LOCAL_FP_*, LOCAL_FMA_*) also moved
+// there. All numerically cross-checked vs Interpreter_FPUtils.h (see report).
 
 // op59 singles arith. sub5: 18=fdivs, 20=fsubs, 21=fadds, 25=fmuls.
-// fmuls applies Force25Bit to frC (Interpreter fmulsx:371). Result
-// ForceSingle'd and Filled into both lanes. Double-then-single rounding is
-// EXACT for add/sub/mul/div (Interpreter_FPUtils.h:297-318 comment).
+// [C8 2026-07-12 oracle-audit] add the NI_add/sub/mul/div NaN ladder before
+// ForceSingle (Interpreter fadds/fsubs/fmuls/fdivs). fmuls applies Force25Bit
+// to frC (Interpreter fmulsx:371 — C3). Result ForceSingle'd + Filled into
+// both lanes. Double-then-single rounding is EXACT for add/sub/mul/div
+// (Interpreter_FPUtils.h:297-318 comment).
 void emit_fp_arith_single(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     if (GekkoOperands::Rc(op.inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 fd   = GekkoOperands::FD(op.inst);
@@ -317,11 +217,19 @@ void emit_fp_arith_single(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     auto arg2_pair = frc.Bind(arg2, FPRMode::Read,  FPR_LANE_PS0);
     auto fd_pair   = frc.Bind(fd,   FPRMode::Write, FPR_LANE_BOTH);
 
+    // Stash a and the (possibly Force25Bit'd) b for the NaN ladder. The NaN
+    // ladder must see the SAME b the multiply used; for fmuls that is the
+    // Force25Bit'd c — which matches the oracle (NI_mul(a, c_value)).
     wb.op_local_get(fa_pair.ps0_idx);
     wb.op_f64_reinterpret_i64();
+    wb.op_local_set(LOCAL_FMA_A);
     wb.op_local_get(arg2_pair.ps0_idx);
-    if (sub5 == 25) emit_force25bit(wb);
+    if (sub5 == 25) emit_force25bit(wb);  // [C3] Force25Bit(frC) for fmuls
     wb.op_f64_reinterpret_i64();
+    wb.op_local_set(LOCAL_FMA_B);
+    // raw op
+    wb.op_local_get(LOCAL_FMA_A);
+    wb.op_local_get(LOCAL_FMA_B);
     switch (sub5) {
     case 18: wb.op_f64_div(); break;
     case 20: wb.op_f64_sub(); break;
@@ -329,13 +237,19 @@ void emit_fp_arith_single(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     case 25: wb.op_f64_mul(); break;
     default: break;
     }
+    emit_nan_fixup_2op(wb);          // [C8] NaN ladder
     emit_force_single_fill(wb, fd_pair, ctx_ptr);
 }
 
 // op59 FMA family. sub5: 28=fmsubs, 29=fmadds, 30=fnmsubs, 31=fnmadds.
-// frC Force25Bit'd (NI_madd_msub<single=true> quirk #2/#3). UNFUSED
-// f64 mul-then-add (Jit64-without-hardware-FMA parity) — PPC fuses;
-// divergence only on round-to-nearest ties (Interpreter_FPUtils.h:297+).
+// [C2+C3+C8 2026-07-12 oracle-audit] FUSED std::fma via emit_fma_core (VERIFIED
+// bit-exact for single-precision inputs, 0/1.58e8 vs std::fma incl. sub
+// variants). frC Force25Bit'd for the multiply (NI_madd_msub<single=true>
+// quirk #2/#3 — C3); the NaN ladder still uses ORIGINAL c (C8). NaN ladder
+// (gated on isnan(result), MakeQuiet first-NaN a->b->c or PPC_NAN default),
+// then ForceSingle; fnmadds/fnmsubs apply the NaN-safe negate AFTER
+// ForceSingle (isnan(tmp)?tmp:-tmp, Interpreter_FloatingPoint.cpp:676-677 /
+// 722-723). Result Filled into both lanes.
 void emit_fp_fma_single(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     if (GekkoOperands::Rc(op.inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 fd   = GekkoOperands::FD(op.inst);
@@ -351,18 +265,23 @@ void emit_fp_fma_single(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, c
     auto fc_pair = frc.Bind(fc, FPRMode::Read,  FPR_LANE_PS0);
     auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_BOTH);
 
-    wb.op_local_get(fa_pair.ps0_idx);
-    wb.op_f64_reinterpret_i64();
-    wb.op_local_get(fc_pair.ps0_idx);
-    emit_force25bit(wb);
-    wb.op_f64_reinterpret_i64();
-    wb.op_f64_mul();
-    wb.op_local_get(fb_pair.ps0_idx);
-    wb.op_f64_reinterpret_i64();
-    if (subtract) wb.op_f64_sub();
-    else          wb.op_f64_add();
-    if (negate)   wb.op_f64_neg();
-    emit_force_single_fill(wb, fd_pair, ctx_ptr);
+    // Stage a, Force25Bit(c) (for the multiply), original c (for the NaN
+    // ladder), b. single=true adds the NI_madd_msub tie-correction.
+    emit_fma_stage(wb, fa_pair.ps0_idx, fc_pair.ps0_idx, fb_pair.ps0_idx,
+                   /*force25_c=*/true);            // [C3] Force25Bit(frC)
+    emit_fma_core(wb, subtract, /*single=*/true);  // [C2] fused + tie-correct
+    emit_nan_fixup_fma(wb);          // [C8] NaN ladder -> f64 on stack
+
+    // ForceSingle -> i64 (widened single), optional NaN-safe negate, Fill both.
+    emit_force_single_i64(wb, ctx_ptr);   // i64 on stack
+    if (negate) {
+        wb.op_f64_reinterpret_i64();
+        emit_nan_safe_neg(wb);            // [C8b] isnan(tmp)?tmp:-tmp (f64->f64)
+        wb.op_i64_reinterpret_f64();
+    }
+    wb.op_local_set(fd_pair.ps0_idx);
+    wb.op_local_get(fd_pair.ps0_idx);
+    wb.op_local_set(fd_pair.ps1_idx);
 }
 
 // fctiwz (op63 sub10=15): ps0(fD) = 0xFFF8000000000000 | value, where

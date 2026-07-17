@@ -99,6 +99,11 @@ void DSPManager::GlobalCompleteARAM(Core::System& system, u64 userdata, s64 cycl
 void DSPManager::CompleteARAM(u64 userdata, s64 cyclesLate)
 {
   m_dsp_control.DMAState = 0;
+  // [aram-diag 2026-07-16] does the ARAM-DMA completion event fire post-takeover? counter @0x026B2700.
+  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u) {
+    volatile u32* c = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2700u));
+    *c = *c + 1u;
+  }
   GenerateDSPInterrupt(INT_ARAM, 0);
 }
 
@@ -281,6 +286,19 @@ void DSPManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
         dsp.m_dsp_control.ARAM_mask = tmpControl.ARAM_mask;
         dsp.m_dsp_control.DSP_mask = tmpControl.DSP_mask;
 
+        // [aram-diag 2026-07-16] does the worker's DSP-CR ACK write REACH dolphin post-takeover?
+        // any DSP_CONTROL write @0x026B2714; an ARAM-ack write (clears INT_ARAM) @0x026B2718. If
+        // 2714 climbs but 2718 stays 0, the guest writes DSP_CR but never with the ARAM-clear bit;
+        // if BOTH stay 0, the worker's ack MMIO never reaches dolphin (routing gap) -> storm.
+        if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u) {
+          volatile u32* w = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2714u));
+          *w = *w + 1u;
+          if (tmpControl.ARAM) {
+            volatile u32* a = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2718u));
+            *a = *a + 1u;
+          }
+        }
+
         // Interrupt
         if (tmpControl.AID)
           dsp.m_dsp_control.AID = 0;
@@ -378,6 +396,27 @@ void DSPManager::UpdateInterrupts()
   bool ints_set =
       (((m_dsp_control.Hex >> 1) & m_dsp_control.Hex & (INT_DSP | INT_ARAM | INT_AID)) != 0);
 
+  // [aram-diag 2026-07-16] post-takeover: is INT_ARAM active-bit set (0x026B2704) and did it pass the
+  // DSP_CONTROL enable check into ints_set (0x026B2708)? If 2704>0 but 2708==0, the guest never
+  // ENABLED the ARAM interrupt in DSP_CONTROL (its enable write didn't reach dolphin) -> masked here.
+  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u) {
+    if ((m_dsp_control.Hex & INT_ARAM) != 0) {
+      volatile u32* a = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2704u));
+      *a = *a + 1u;
+    }
+    if (ints_set) {
+      volatile u32* s = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2708u));
+      *s = *s + 1u;
+    }
+    // [aram-diag2] which DSP sub-interrupt is enabled+active (keeps INT_CAUSE_DSP pending)?
+    // enable bit is directly left of the active bit: (Hex>>1) & Hex & <bit>. INT_DSP@0x026B271C,
+    // INT_ARAM@0x026B2720, INT_AID@0x026B2724 -> the storm source is whichever climbs with dspToExt.
+    const u32 en = (m_dsp_control.Hex >> 1) & m_dsp_control.Hex;
+    if (en & INT_DSP)  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B271Cu)); *p = *p + 1u; }
+    if (en & INT_ARAM) { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2720u)); *p = *p + 1u; }
+    if (en & INT_AID)  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2724u)); *p = *p + 1u; }
+  }
+
   m_system.GetProcessorInterface().SetInterrupt(ProcessorInterface::INT_CAUSE_DSP, ints_set);
 }
 
@@ -468,15 +507,19 @@ void DSPManager::Do_ARAM_DMA()
   auto& core_timing = m_system.GetCoreTiming();
   auto& memory = m_system.GetMemory();
 
-  static u64 axar_n = 0;
-  const u64 n = ++axar_n;
-  if (n <= 8 || (n & 0x3F) == 0)
-    NOTICE_LOG_FMT(POWERPC, "[ax-aram] DMA n={} dir={} count={:#x} ARAddr={:#x} MMAddr={:#x}", n,
-                   static_cast<u32>(m_aram_dma.Cnt.dir), static_cast<u32>(m_aram_dma.Cnt.count),
-                   m_aram_dma.ARAddr, m_aram_dma.MMAddr);
-
   m_dsp_control.DMAState = 1;
 
+  // [C5 2026-07-12 oracle-audit] Restored the oracle (real-hw, upstream DSP.cpp:484) ARAM-DMA
+  // completion timing: (count/32)*246 ticks. The removed #ifdef __EMSCRIPTEN__ block replaced
+  // this with ticksToTransfer/16 + 20000, altering guest-visible INT_ARAM interrupt cadence and
+  // diverging from the interpreter spec. That override was an ANTI-STORM HACK: 64-tick instant
+  // completion once caused an interrupt storm on the worker path (deliv-ring: EXT alternating
+  // OSRestoreInterrupts/aramSyncTransferQueue forever; cause=0x10144 — a new DSP completion always
+  // pending before the guest's rfi lands). The in-tree note (2026-07-12) recorded that reverting to
+  // real-hw timing did NOT change the ~45% audio-subsystem instruction share, so the ARAM DMA rate
+  // is NOT the audio-overwork driver. MUST BE BOOT-TESTED (a central boot test follows); if this
+  // re-wedges the boot into the interrupt storm, it will be reverted. Not attempting to fix the
+  // storm here.
   // ARAM DMA transfer rate has been measured on real hw
   int ticksToTransfer = (m_aram_dma.Cnt.count / 32) * 246;
   core_timing.ScheduleEvent(ticksToTransfer, m_event_type_complete_aram);

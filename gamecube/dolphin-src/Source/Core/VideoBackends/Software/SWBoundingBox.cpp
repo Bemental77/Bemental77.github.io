@@ -5,15 +5,32 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 
 #include "Common/CommonTypes.h"
+
+#include "VideoBackends/Software/Rasterizer.h"
 
 namespace BBoxManager
 {
 namespace
 {
-// Current bounding box coordinates.
+// Current bounding box coordinates (the canonical/reduced state, read by Read()).
 std::array<u16, 4> s_coordinates{};
+
+// Per-raster-worker partials. Update() runs on worker threads and folds into its own row (no
+// race); ReducePartials() merges all rows into s_coordinates (min of lefts/tops, max of
+// rights/bottoms — commutative + associative, so the result is exact regardless of band order).
+// Each row's identity is {left=MAX, right=0, top=MAX, bottom=0} so it is a no-op until written.
+constexpr u16 U16_MAX = std::numeric_limits<u16>::max();
+struct PartialBox
+{
+  u16 left = U16_MAX;
+  u16 right = 0;
+  u16 top = U16_MAX;
+  u16 bottom = 0;
+};
+std::array<PartialBox, Rasterizer::MaxRasterWorkers()> s_partials{};
 }  // Anonymous namespace
 
 u16 GetCoordinate(Coordinate coordinate)
@@ -28,15 +45,38 @@ void SetCoordinate(Coordinate coordinate, u16 value)
 
 void Update(u16 left, u16 right, u16 top, u16 bottom)
 {
-  const u16 new_left = std::min(left, GetCoordinate(Coordinate::Left));
-  const u16 new_right = std::max(right, GetCoordinate(Coordinate::Right));
-  const u16 new_top = std::min(top, GetCoordinate(Coordinate::Top));
-  const u16 new_bottom = std::max(bottom, GetCoordinate(Coordinate::Bottom));
+  const int wid = Rasterizer::g_raster_worker_id;
+  if (wid == 0)
+  {
+    // FIFO thread (single-band fast path, and band 0 of a split): write the canonical state
+    // directly — bit-identical to the pre-pool behavior.
+    SetCoordinate(Coordinate::Left, std::min(left, GetCoordinate(Coordinate::Left)));
+    SetCoordinate(Coordinate::Right, std::max(right, GetCoordinate(Coordinate::Right)));
+    SetCoordinate(Coordinate::Top, std::min(top, GetCoordinate(Coordinate::Top)));
+    SetCoordinate(Coordinate::Bottom, std::max(bottom, GetCoordinate(Coordinate::Bottom)));
+    return;
+  }
+  PartialBox& p = s_partials[wid];
+  p.left = std::min(left, p.left);
+  p.right = std::max(right, p.right);
+  p.top = std::min(top, p.top);
+  p.bottom = std::max(bottom, p.bottom);
+}
 
-  SetCoordinate(Coordinate::Left, new_left);
-  SetCoordinate(Coordinate::Right, new_right);
-  SetCoordinate(Coordinate::Top, new_top);
-  SetCoordinate(Coordinate::Bottom, new_bottom);
+void ReducePartials()
+{
+  const int n = Rasterizer::NumRasterWorkers();
+  for (int w = 1; w < n; w++)  // row 0 is the FIFO thread, written directly by Update()
+  {
+    PartialBox& p = s_partials[w];
+    if (p.left == U16_MAX && p.right == 0 && p.top == U16_MAX && p.bottom == 0)
+      continue;  // identity — this band hit no pixels
+    SetCoordinate(Coordinate::Left, std::min(p.left, GetCoordinate(Coordinate::Left)));
+    SetCoordinate(Coordinate::Right, std::max(p.right, GetCoordinate(Coordinate::Right)));
+    SetCoordinate(Coordinate::Top, std::min(p.top, GetCoordinate(Coordinate::Top)));
+    SetCoordinate(Coordinate::Bottom, std::max(p.bottom, GetCoordinate(Coordinate::Bottom)));
+    p = PartialBox{};  // reset to identity for the next triangle
+  }
 }
 
 }  // namespace BBoxManager

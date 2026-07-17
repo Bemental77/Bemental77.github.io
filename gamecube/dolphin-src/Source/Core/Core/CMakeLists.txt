@@ -675,6 +675,7 @@ PUBLIC
   videonull
   videoogl
   videosoftware
+  videowgpu
 
 PRIVATE
   FatFs

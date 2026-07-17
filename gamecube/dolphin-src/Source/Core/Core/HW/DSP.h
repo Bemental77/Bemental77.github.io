@@ -71,6 +71,8 @@ union UDSPControl
 class DSPManager
 {
 public:
+  // [storm diag] guest-visible DSP CONTROL image (what __OSDispatchInterrupt sub-decodes)
+  u16 GetDSPControlHex() const { return m_dsp_control.Hex; }
   explicit DSPManager(Core::System& system);
   DSPManager(const DSPManager&) = delete;
   DSPManager(DSPManager&&) = delete;

@@ -82,6 +82,15 @@
         // native dolphin.log will appear in the page console too.
         self.Module.print    = function (t) { postMessage({ cmd: 'print', txt: '[stdout] ' + t }); };
         self.Module.printErr = function (t) { postMessage({ cmd: 'print', txt: '[stderr] ' + t }); };
+        // [region-sweep] Apply BJIT_* tuning env vars from the page URL (getenv-read
+        // by the JIT block-cache region caps — sweep coverage with NO rebuild).
+        if (data.bjitEnv) {
+          self.Module.ENV = self.Module.ENV || {};
+          for (var _k in data.bjitEnv) {
+            self.Module.ENV[_k] = String(data.bjitEnv[_k]);
+            postMessage({ cmd: 'print', txt: '[shim] ENV ' + _k + '=' + data.bjitEnv[_k] });
+          }
+        }
         // [HW-render] The page transferred an OffscreenCanvas. Emscripten's
         // pthread_create canvas-transfer (which hands "#canvas" to the
         // PROXY_TO_PTHREAD proxied main pthread, where the OGL backend + GL
@@ -95,16 +104,34 @@
         // re-transfers it to the pthread and "#canvas" resolves there.
         if (data.offscreen) {
           var _off = data.offscreen;
-          // Keep the OffscreenCanvas ATTACHED on the worker-main and DON'T set
-          // transferredCanvasNames / a transferControlToOffscreen wrapper — those
-          // make emscripten ship the canvas to a pthread, detaching it. We instead
-          // register it directly into GL.offscreenCanvases in EmscriptenWorker
-          // (MAIN_THREAD_EM_ASM has GL scope) and create the context here on the
-          // worker-main via proxyContextToMainThread + OFFSCREEN_FRAMEBUFFER.
-          self.Module.canvas = _off;
-          self.Module.hwOffscreenCanvas = _off;
-          postMessage({ cmd: 'print', txt: '[shim] OffscreenCanvas attached on worker-main '
-            + _off.width + 'x' + _off.height + ' for HW render' });
+          if (data.wgpu) {
+            // [WGPU present — CORRECTED 2026-07-13] The claim below ("no WebGPU surface, the
+            // worker does NOT need the page canvas") was FALSE: emdawnwebgpu fully supports a
+            // direct canvas surface present, and the page canvas CAN be routed to the proxied
+            // pthread (faux-canvas + transferredCanvasNames). The readback is a self-imposed M1
+            // shortcut. It is kept for now because converting to direct present does NOT raise
+            // fps (the worker's jit is the frame-rate wall; the readback is async, off the
+            // worker's critical path) — it's a quality/latency change, tracked in memory
+            // gc_wgpu_readback_present_is_avoidable_direct_canvas_2026_07_13. Current behavior:
+            // render to an offscreen texture, read back, postMessage pixels; GC_WGPU skips WebGL.
+            self.Module.canvas = _off;
+            self.Module.hwOffscreenCanvas = _off;
+            self.Module.ENV = self.Module.ENV || {};
+            self.Module.ENV.GC_WGPU = '1';
+            postMessage({ cmd: 'print', txt: '[shim] WGPU: offscreen render-to-texture mode '
+              + '(page canvas not used) ' + _off.width + 'x' + _off.height });
+          } else {
+            // Keep the OffscreenCanvas ATTACHED on the worker-main and DON'T set
+            // transferredCanvasNames / a transferControlToOffscreen wrapper — those
+            // make emscripten ship the canvas to a pthread, detaching it. We instead
+            // register it directly into GL.offscreenCanvases in EmscriptenWorker
+            // (MAIN_THREAD_EM_ASM has GL scope) and create the context here on the
+            // worker-main via proxyContextToMainThread + OFFSCREEN_FRAMEBUFFER.
+            self.Module.canvas = _off;
+            self.Module.hwOffscreenCanvas = _off;
+            postMessage({ cmd: 'print', txt: '[shim] OffscreenCanvas attached on worker-main '
+              + _off.width + 'x' + _off.height + ' for HW render' });
+          }
         }
         // [FIX#1 render-worker] Set the flag on Module BEFORE importing the emcc
         // module so EmscriptenWorker's EM_ASM gate sees it. The GL ring + ctrl

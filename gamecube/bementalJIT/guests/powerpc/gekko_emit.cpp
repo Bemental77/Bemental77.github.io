@@ -16,7 +16,9 @@
 #include <cstring>
 
 #ifdef __EMSCRIPTEN__
+#ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+#endif  // [aot] native offline driver compiles this TU without emscripten
 #endif
 
 // [return-linking] RAS storage is defined in block_cache.cpp at the OUTER
@@ -57,6 +59,31 @@ u32 g_ctx_ptr = 0;
 // reverting to legacy memory-direct GPR access. Used in tests to isolate
 // JIT bugs from B11 cache logic.
 bool g_disable_b11 = false;
+// [aot-ras 2026-07-03] TRUE in the offline AoT driver: the blr return-linking (RAS) bakes
+// &g_blr_ras/&g_blr_ras_sp/&g_blr_chain — NATIVE-process heap addresses at emit time — into
+// the emitted wasm; in the browser those point at arbitrary SAB memory (AoT modules scribbled
+// random locations and blr tail-chains read garbage slots -> rfi to pc=0, 'GARBAGE next=0x0'
+// in 3/4 aot=1 runs vs 0/3 plain). Suppressed => blr uses the plain op_return path (correct).
+bool g_aot_suppress_ras = false;
+// [ras-suppress] extern-C alias (consumers live inside extern "C" regions): when set,
+// suppresses RAS emission exactly like g_aot_suppress_ras.
+extern "C" bool g_suppress_ras_all;
+bool g_suppress_ras_all = false;
+// [aot-chain 2026-07-03] In-wasm dispatch for the AoT pack: cross-function block exits
+// tail-call the target function through a shared funcref table ("env"."aot_table")
+// instead of returning to the JS loop. Entry-block selection travels through ONE shared
+// SAB cell (all modules single-threaded on the worker). The flat index maps
+// (pc - 0x80000000) -> packed ((table_slot+1)<<12 | entry_idx); 0 = miss -> return to JS.
+// Downcount<=0 and exception bails still return to JS (events/refill/delivery).
+bool g_aot_chain = false;
+// Retained only for external-file linkage (ppc_worker_main.cpp, tools/aot/aot_emit.cpp
+// assign it); this emitter no longer reads it now that the diagnostic retired counter /
+// pc-ring prologue was removed.
+extern "C" bool g_emit_retired;
+bool g_emit_retired = false;
+constexpr u32 AOT_CHAIN_INDEX_BASE = 0x02700000u;  // SAB flat index (1.125MB, span below)
+constexpr u32 AOT_CHAIN_PC_SPAN    = 0x00120000u;  // covers MP4 .text 0x800057C0-0x8011DCA8
+constexpr u32 AOT_ENTRY_CELL       = 0x026B0904u;  // shared entry_sel cell
 // Linear-memory offset of MEM1 in the shared host heap, set per-build by
 // build_block(). Zero means "fast-path direct memory access disabled, fall
 // back to ppc_read*/ppc_write* trampolines for everything." When non-zero,
@@ -64,6 +91,17 @@ bool g_disable_b11 = false;
 // MEM1 hits go via i32.load/store offset=g_mem1_base, everything else
 // (MMIO, MEM2 etc.) falls through to the trampoline.
 static u32 g_mem1_base = 0;
+// [indirect-base 2026-07-07] The mem1 base is LOADED from the published SAB cell
+// (0x02500020, written by the bridge before any dispatch) instead of baked as a
+// constant — three different bases observed across environments (0x1a4b7498 /
+// 0x1a4bb4a0 / 0x15a50f00) made baked packs whack-a-mole ('[aot] DISABLED (mem1 !=
+// baked)' in the user's Chrome). One extra i32.load per access; emitted code becomes
+// environment-independent. g_mem1_base's VALUE no longer matters — nonzero = enable.
+static inline void emit_mem1_base_load(WasmModuleBuilder& b) {
+    b.op_i32_const((s32)0x02500020);
+    b.op_i32_load(0);
+}
+
 static u32 g_mem1_mask = 0;
 static u32 g_ram_size  = 0;
 // True when the per-block trust DFA proved every D-form load/store base
@@ -737,52 +775,6 @@ static void emit_mmio_mirror_store_else_or_import(EmitCtx& c, u32 import_idx) {
 //
 // We embed the load width in `import_idx` (WIMPORT_READ8/16/32). The fast
 // path emits the matching native i32.load8_u / load16_u / load.
-// [dsp-sentinel L0..L5] Returns SAB base offset for the slot if c.pc is one of
-// the six target polling-loop PCs (0x800f6470, 0x64ec, 0x6564, 0x65dc, 0x6654,
-// 0x6700); returns 0 otherwise. Emit-time check — caller only pays runtime
-// cost in the six blocks of interest.
-static inline u32 l_sentinel_slot_base(u32 pc) {
-    switch (pc) {
-        case 0x800e8040u: return 0x026B0110u;
-        case 0x800f64ecu: return 0x026B011Cu;
-        case 0x800f6564u: return 0x026B0128u;
-        case 0x800f65dcu: return 0x026B0134u;
-        case 0x800f6654u: return 0x026B0140u;
-        case 0x800f6700u: return 0x026B014Cu;
-        default:          return 0u;
-    }
-}
-
-// Emit a per-PC read recorder. Called from inside the MEM1-direct if-arm of
-// emit_load_d / emit_load_x. Precondition: the loaded value is on top of the
-// WASM stack and TMP_A holds the runtime EA. Postcondition: value remains on
-// top of stack (so the surrounding `if (result i32)` shape is preserved).
-// Writes:
-//   SAB[slot_base + 0] = count
-//   SAB[slot_base + 4] = addr (from TMP_A)
-//   SAB[slot_base + 8] = val
-static inline void emit_l_recorder(EmitCtx& c, u32 slot_base) {
-    // Capture value into TMP_B so we can re-push it after the SAB writes.
-    c.b.op_local_set(LOCAL_TMP_B);
-    // counter: SAB[slot_base + 0] += 1
-    c.b.op_i32_const((s32)slot_base);
-    c.b.op_i32_const((s32)slot_base);
-    c.b.op_i32_load(0);
-    c.b.op_i32_const(1);
-    c.b.op_i32_add();
-    c.b.op_i32_store(0);
-    // addr: SAB[slot_base + 4] = TMP_A
-    c.b.op_i32_const((s32)(slot_base + 4u));
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_store(0);
-    // val: SAB[slot_base + 8] = TMP_B
-    c.b.op_i32_const((s32)(slot_base + 8u));
-    c.b.op_local_get(LOCAL_TMP_B);
-    c.b.op_i32_store(0);
-    // Re-push the value so the surrounding if-arm result is unchanged.
-    c.b.op_local_get(LOCAL_TMP_B);
-}
-
 static void emit_load_d(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool update) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
@@ -857,15 +849,9 @@ static void emit_load_d(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
         c.b.op_i32_and();
         emit_local_op_if(c, WASM_TYPE_I32);
             c.b.op_local_get(LOCAL_TMP_B);
-            c.b.op_i32_const((s32)g_mem1_base);
+            emit_mem1_base_load(c.b);
             c.b.op_i32_add();
             emit_direct_load_post();
-            // [dsp-sentinel L0..L5] JIT-side MEM1-direct read trace — only
-            // emitted in the six target polling-loop blocks. Value is on top
-            // of stack here; emit_l_recorder preserves it.
-            if (u32 slot = l_sentinel_slot_base(c.pc); slot != 0u) {
-                emit_l_recorder(c, slot);
-            }
         c.b.op_else();
             // MEM1 missed; try MMIO mirror before falling to import.
             emit_mmio_mirror_else_or_import(c, import_idx);
@@ -958,41 +944,6 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
             c.b.op_i32_store8(0);
         }
     };
-    // PLANTER TRIPWIRE 1: EA-match (store to mem[0x802bafcc]).
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)0x802bafccu);
-    c.b.op_i32_eq();
-    c.b.op_if(0x40);
-        c.b.op_i32_const((s32)0xFFFFFFFFu);
-        c.b.op_i32_const((s32)c.pc);
-        emit_import_or_stub(c, WIMPORT_INTERP);
-    c.b.op_end();
-    // PLANTER TRIPWIRE 2: val-match (storing the magic value 0x38500000).
-    // Catches the planter when it goes through the fastmem-direct path
-    // (which bypasses dolphin_write32's trampoline).
-    emit_gpr_get_impl(c, rs, g_ctx_ptr);
-    c.b.op_i32_const((s32)0x38500000u);
-    c.b.op_i32_eq();
-    c.b.op_if(0x40);
-        c.b.op_i32_const((s32)0xFFFFFFFEu);
-        c.b.op_i32_const((s32)c.pc);
-        emit_import_or_stub(c, WIMPORT_INTERP);
-    c.b.op_end();
-    // [test4-writer-trace] EA-match for 0x800e3a30..0x800e3a34
-    // ((EA & 0xFFFFFFFC) == 0x800e3a30). Logs via WIMPORT_INTERP marker
-    // 0xFFFFFFFDu — handler in JitWasm.cpp dolphin_interp logs storing PC
-    // + pre-mem value + gpr[1/3/13/31].
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)0xFFFFFFFCu);
-    c.b.op_i32_and();
-    c.b.op_i32_const((s32)0x800e3a30u);
-    c.b.op_i32_eq();
-    c.b.op_if(0x40);
-        c.b.op_i32_const((s32)0xFFFFFFFDu);
-        c.b.op_i32_const((s32)c.pc);
-        emit_import_or_stub(c, WIMPORT_INTERP);
-    c.b.op_end();
-
     if (g_mem1_base == 0u) {
         // (a) No fastmem base; full import.
         // Item 6 Stage 2: route through the MMIO mirror helper. For
@@ -1030,32 +981,8 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
         // uninitialized in the other arm. (Bug exposed by SAB
         // 0x800e7c68 PI mask write — see b11_coherence_bug_2026_05_07.)
         emit_b11_op_if(c, /*no result*/ 0x40);
-            // [dsp-sentinel K] JIT-side writer trace for guest 0x803c136c.
-            // Runs at every MEM1-direct store; cheap single i32.eq + if.
-            // Records K count at SAB[0x026B0100], PC at +4, val at +8.
-            c.b.op_local_get(LOCAL_TMP_A);
-            c.b.op_i32_const((s32)0x803c136cu);
-            c.b.op_i32_eq();
-            emit_b11_op_if(c, /*void*/ 0x40);
-                // counter: SAB[0x026B0100] += 1
-                c.b.op_i32_const((s32)0x026B0100);
-                c.b.op_i32_const((s32)0x026B0100);
-                c.b.op_i32_load(0);
-                c.b.op_i32_const(1);
-                c.b.op_i32_add();
-                c.b.op_i32_store(0);
-                // PC: SAB[0x026B0104] = c.pc
-                c.b.op_i32_const((s32)0x026B0104);
-                c.b.op_i32_const((s32)c.pc);
-                c.b.op_i32_store(0);
-                // val: SAB[0x026B0108] = gpr[rs]
-                c.b.op_i32_const((s32)0x026B0108);
-                emit_gpr_get_impl(c, rs, g_ctx_ptr);
-                c.b.op_i32_store(0);
-            emit_b11_op_end(c);
-
             c.b.op_local_get(LOCAL_TMP_B);
-            c.b.op_i32_const((s32)g_mem1_base);
+            emit_mem1_base_load(c.b);
             c.b.op_i32_add();
             emit_direct_store_post_with_addr_on_stack();
         emit_b11_op_else(c);
@@ -1096,6 +1023,51 @@ static void emit_stwu_impl (EmitCtx& c) { emit_store_d(c, WIMPORT_WRITE32, true)
 // Forward declaration — body is defined alongside try_resolve_target below.
 static inline void emit_block_exit_flush(EmitCtx& c);
 
+// [aot-chain] Chain epilogue. Precondition: ctx.PC holds the target and dirty GPRs are
+// flushed (all call sites are block exits that previously did `const target; return`).
+// Falls back to a plain return-to-JS on: out-of-span pc, index miss, exhausted downcount.
+static void emit_aot_chain_exit(EmitCtx& c) {
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_load(ppc_off::PC);
+    c.b.op_local_tee(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)0x80000000);
+    c.b.op_i32_sub();
+    c.b.op_local_tee(LOCAL_TMP_B);
+    c.b.op_i32_const((s32)AOT_CHAIN_PC_SPAN);
+    c.b.op_i32_ge_u();
+    c.b.op_if(0x40);
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_return();
+    c.b.op_end();
+    c.b.op_local_get(LOCAL_TMP_B);
+    c.b.op_i32_load(AOT_CHAIN_INDEX_BASE);
+    c.b.op_local_tee(LOCAL_TMP_C);
+    c.b.op_i32_eqz();
+    c.b.op_if(0x40);
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_return();
+    c.b.op_end();
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_load(ppc_off::DOWNCOUNT);
+    c.b.op_i32_const(1);
+    c.b.op_i32_lt_s();
+    c.b.op_if(0x40);
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_return();
+    c.b.op_end();
+    c.b.op_i32_const((s32)AOT_ENTRY_CELL);
+    c.b.op_local_get(LOCAL_TMP_C);
+    c.b.op_i32_const(0xFFF);
+    c.b.op_i32_and();
+    c.b.op_i32_store(0);
+    c.b.op_local_get(LOCAL_TMP_C);
+    c.b.op_i32_const(12);
+    c.b.op_i32_shr_u();
+    c.b.op_i32_const(1);
+    c.b.op_i32_sub();
+    c.b.op_return_call_indirect(/*type () -> i32*/0u, /*table*/0u);
+}
+
 static void emit_branch_resolution(EmitCtx& c, u32 target_pc, const u32* local_idx) {
     // B11: flush before either exit path. The tail-call path lands in
     // another block in the same region, which expects ppc_state.gpr to
@@ -1116,6 +1088,20 @@ static void emit_branch_resolution(EmitCtx& c, u32 target_pc, const u32* local_i
             // br emitted from inside e.g. an op_if arm would jump to the
             // wrong label (one of the if's nested blocks rather than $L).
             const u32 actual_depth = c.br_to_loop_depth + c.local_block_depth;
+            if (g_aot_chain) {
+                // Chain mode: the region head reads the shared SAB cell, so intra-region
+                // re-dispatch must write it. Self-slot aliasing is decidable at compile
+                // time here (both indices are constants) — bail to host on alias.
+                if (*local_idx == c.self_local_idx) {
+                    emit_set_pc(c, g_ctx_ptr, target_pc);
+                    c.b.op_i32_const((s32)target_pc);
+                    c.b.op_return();
+                    return;
+                }
+                c.b.op_i32_const((s32)AOT_ENTRY_CELL);
+                c.b.op_i32_const((s32)*local_idx);
+                c.b.op_i32_store(0);
+            }
             c.b.op_i32_const((s32)*local_idx);
             c.b.op_global_set(c.entry_sel_global_idx);
             // Runtime self-slot guard (2026-05-19). The compile-time
@@ -1174,6 +1160,10 @@ static void emit_branch_resolution(EmitCtx& c, u32 target_pc, const u32* local_i
         return;
     }
     emit_set_pc(c, CTX, target_pc);
+    if (g_aot_chain) {
+        emit_aot_chain_exit(c);
+        return;
+    }
     c.b.op_i32_const((s32)target_pc);
     c.b.op_return();
 }
@@ -1222,6 +1212,7 @@ static constexpr u32 BLR_CHAIN_MAX = 64u;   // host boundary every 64 tail-chain
 // the return slot isn't in-region (then the matching blr just mispredicts ->
 // safe op_return fallback).
 static void emit_blr_ras_push(EmitCtx& c) {
+    if (g_aot_suppress_ras || g_suppress_ras_all) return;  // [aot-ras/ras-suppress] host addrs are poison
     if (!c.merged_mode) return;
     u32 ret_slot;
     if (!try_resolve_target(c, c.pc + 4u, &ret_slot)) return;
@@ -2388,7 +2379,7 @@ static void emit_indirect_branch_native(EmitCtx& c, u32 target_spr_idx) {
     // op_return-ing to the host dispatcher. Any mismatch / empty / budget-out /
     // self-slot-alias / downcount-exhausted falls through to the op_return
     // fallback below — all correctness-preserving. TMP_A holds LR.
-    if (c.merged_mode && target_spr_idx == 8u && !LK(c.inst)) {
+    if (!g_aot_suppress_ras && !g_suppress_ras_all && c.merged_mode && target_spr_idx == 8u && !LK(c.inst)) {
         const u32 ras_base   = (u32)(uintptr_t)&g_blr_ras[0];
         const u32 sp_addr    = (u32)(uintptr_t)&g_blr_ras_sp;
         const u32 chain_addr = (u32)(uintptr_t)&g_blr_chain;
@@ -2467,6 +2458,11 @@ static void emit_indirect_branch_native(EmitCtx& c, u32 target_spr_idx) {
     emit_block_exit_flush(c);
     emit_invalidate_gpr_locals(c);
 
+    if (g_aot_chain) {
+        // ctx.PC was stored above; chain to the (indirect) target if packed.
+        emit_aot_chain_exit(c);
+        return;
+    }
     // Return target.
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_return();
@@ -2612,9 +2608,26 @@ static void emit_mtmsr_impl(EmitCtx& c) {
     c.b.op_i32_const(0x8000);
     c.b.op_i32_and();
     emit_b11_op_if(c, /*no result*/ 0x40);
-        // EE=1 → call interpreter (via emit_fallback). Interpreter advances
-        // pc to pc+4 internally, so we don't need to do it here.
-        emit_fallback(c);
+        // [mtmsr-native-EE1 RESTORED 2026-07-06] The A/B proved this arm innocent (halt
+        // persisted with it off — root was the CP cause, now hidden at the source). The
+        // fallback reversion cost 3.7M interp round-trips/run (user console byCmd
+        // op31_146, 37% of wall in mailbox). Native: store MSR + pc+4, inline
+        // deliverability gate, host call only when something can vector.
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_store(ppc_off::MSR);
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_const((s32)(c.pc + 4u));
+        c.b.op_i32_store(ppc_off::PC);
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::EXCEPTIONS);
+        c.b.op_i32_const(0x3FF);
+        c.b.op_i32_and();
+        emit_b11_op_if(c, 0x40);
+            c.b.op_i32_const((s32)(c.pc + 4u));
+            emit_import_or_stub(c, WIMPORT_CHECK_EXC);
+            c.b.op_drop();
+        emit_b11_op_end(c);
     emit_b11_op_else(c);
         // EE=0 → fast path: store new MSR + advance pc to pc+4 (mtmsr is a
         // non-branch terminator; without advancing, the dispatcher would
@@ -2717,30 +2730,6 @@ static void emit_mtspr_impl(EmitCtx& c) {
     c.b.op_i32_const((s32)CTX);
     emit_gpr_get_impl(c, rs, g_ctx_ptr);
     c.b.op_i32_store(ppc_off::spr(spr_num));
-
-    // [srr0-side-channel] When emitting mtspr SRR0 (SPR 26), ALSO write a
-    // (pc, value, counter) tuple to fixed SAB slots so dolphin-side can
-    // identify which JIT-emitted mtspr instruction wrote each SRR0 value.
-    // SAB[0x026B0600] = pc of emitting instruction
-    // SAB[0x026B0604] = value written to SRR0
-    // SAB[0x026B0608] = monotonic counter (incremented every fire)
-    if (spr_num == 26u) {
-        // sab[0x600] = pc
-        c.b.op_i32_const((s32)0x026B0600);
-        c.b.op_i32_const((s32)c.pc);
-        c.b.op_i32_store(0);
-        // sab[0x604] = value (re-read gpr[rs] since prior get consumed the stack value)
-        c.b.op_i32_const((s32)0x026B0604);
-        emit_gpr_get_impl(c, rs, g_ctx_ptr);
-        c.b.op_i32_store(0);
-        // sab[0x608] = counter (load, +1, store)
-        c.b.op_i32_const((s32)0x026B0608);
-        c.b.op_i32_const((s32)0x026B0608);
-        c.b.op_i32_load(0);
-        c.b.op_i32_const(1);
-        c.b.op_i32_add();
-        c.b.op_i32_store(0);
-    }
 }
 
 // mftb rD, TBR  (op31 sub-op 371).
@@ -2814,17 +2803,204 @@ static void emit_mtcrf_impl(EmitCtx& c) { emit_fallback(c); }
 // ===========================================================================
 
 // lfs rT, d(rA)  — load 32-bit float, promote to f64, store to FPR
+
+// [fp-fastmem 2026-07-03] Range-check helper for the FP load/store family: pushes the
+// "EA (in TMP_A) is a plain-RAM span of `bytes`" condition. Census: ~3M mailbox
+// round-trips/run were r80/w80 (EA 0x80xxxxxx) from the FP family's unconditional
+// imports while integer D/X-forms already had direct arms.
+static inline void emit_fp_fastmem_cond(EmitCtx& c, u32 bytes) {
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const(0x1F000000);
+    c.b.op_i32_and();
+    c.b.op_i32_eqz();
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const(0x01FFFFFF);
+    c.b.op_i32_and();
+    c.b.op_i32_const((s32)bytes);
+    c.b.op_i32_add();
+    c.b.op_i32_const((s32)g_ram_size);
+    c.b.op_i32_le_u();
+    c.b.op_i32_and();
+}
+// [indirect-base] emit_mem1_base_load defined near g_mem1_base (top of file).
+// Pushes host addr = mem1_base + (TMP_A & 0x01FFFFFF) (+extra).
+static inline void emit_fp_fastmem_addr(EmitCtx& c, u32 extra) {
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const(0x01FFFFFF);
+    c.b.op_i32_and();
+    emit_mem1_base_load(c.b);
+    c.b.op_i32_add();
+    if (extra != 0u) {
+        c.b.op_i32_const((s32)extra);
+        c.b.op_i32_add();
+    }
+}
+// bswap32 of top-of-stack via TMP_C.
+static inline void emit_bswap32_tmpc(EmitCtx& c) {
+    c.b.op_local_tee(LOCAL_TMP_C);
+    c.b.op_i32_const(24); c.b.op_i32_shr_u();
+    c.b.op_local_get(LOCAL_TMP_C);
+    c.b.op_i32_const(8);  c.b.op_i32_shr_u();
+    c.b.op_i32_const(0xFF00); c.b.op_i32_and();
+    c.b.op_i32_or();
+    c.b.op_local_get(LOCAL_TMP_C);
+    c.b.op_i32_const(8);  c.b.op_i32_shl();
+    c.b.op_i32_const(0x00FF0000); c.b.op_i32_and();
+    c.b.op_i32_or();
+    c.b.op_local_get(LOCAL_TMP_C);
+    c.b.op_i32_const(24); c.b.op_i32_shl();
+    c.b.op_i32_or();
+}
+
+
+// [fp-fastmem 2026-07-03 pt2] Whole-access helpers, EA precomputed in TMP_A.
+// f32 load -> promoted f64 into ps0(rt).
+static void emit_fp_load32_tmpa(EmitCtx& c, u32 rt) {
+    if (g_mem1_base != 0u) {
+        emit_fp_fastmem_cond(c, 4u);
+        emit_b11_op_if(c, 0x40);
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            emit_fp_fastmem_addr(c, 0u);
+            c.b.op_i32_load(0);
+            emit_bswap32_tmpc(c);
+            c.b.op_f32_reinterpret_i32();
+            c.b.op_f64_promote_f32();
+            c.b.op_f64_store(ppc_off::ps0(rt));
+        emit_b11_op_else(c);
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            c.b.op_local_get(LOCAL_TMP_A);
+            emit_import_or_stub(c, WIMPORT_READ32);
+            c.b.op_f32_reinterpret_i32();
+            c.b.op_f64_promote_f32();
+            c.b.op_f64_store(ppc_off::ps0(rt));
+        emit_b11_op_end(c);
+        return;
+    }
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_local_get(LOCAL_TMP_A);
+    emit_import_or_stub(c, WIMPORT_READ32);
+    c.b.op_f32_reinterpret_i32();
+    c.b.op_f64_promote_f32();
+    c.b.op_f64_store(ppc_off::ps0(rt));
+}
+// f64 demoted to f32 bits, stored at EA.
+static void emit_fp_store32_tmpa(EmitCtx& c, u32 rs) {
+    if (g_mem1_base != 0u) {
+        emit_fp_fastmem_cond(c, 4u);
+        emit_b11_op_if(c, 0x40);
+            emit_fp_fastmem_addr(c, 0u);
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            c.b.op_f64_load(ppc_off::ps0(rs));
+            c.b.op_f32_demote_f64();
+            c.b.op_i32_reinterpret_f32();
+            emit_bswap32_tmpc(c);
+            c.b.op_i32_store(0);
+        emit_b11_op_else(c);
+            c.b.op_local_get(LOCAL_TMP_A);
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            c.b.op_f64_load(ppc_off::ps0(rs));
+            c.b.op_f32_demote_f64();
+            c.b.op_i32_reinterpret_f32();
+            emit_import_or_stub(c, WIMPORT_WRITE32);
+        emit_b11_op_end(c);
+        return;
+    }
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_f64_load(ppc_off::ps0(rs));
+    c.b.op_f32_demote_f64();
+    c.b.op_i32_reinterpret_f32();
+    emit_import_or_stub(c, WIMPORT_WRITE32);
+}
+// f64 (two words) load into ps0(rt).
+static void emit_fp_load64_tmpa(EmitCtx& c, u32 rt) {
+    if (g_mem1_base != 0u) {
+        emit_fp_fastmem_cond(c, 8u);
+        emit_b11_op_if(c, 0x40);
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            emit_fp_fastmem_addr(c, 4u);
+            c.b.op_i32_load(0);
+            emit_bswap32_tmpc(c);
+            c.b.op_i32_store(ppc_off::ps0(rt));
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            emit_fp_fastmem_addr(c, 0u);
+            c.b.op_i32_load(0);
+            emit_bswap32_tmpc(c);
+            c.b.op_i32_store(ppc_off::ps0(rt) + 4u);
+        emit_b11_op_else(c);
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            c.b.op_local_get(LOCAL_TMP_A);
+            c.b.op_i32_const(4);
+            c.b.op_i32_add();
+            emit_import_or_stub(c, WIMPORT_READ32);
+            c.b.op_i32_store(ppc_off::ps0(rt));
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            c.b.op_local_get(LOCAL_TMP_A);
+            emit_import_or_stub(c, WIMPORT_READ32);
+            c.b.op_i32_store(ppc_off::ps0(rt) + 4u);
+        emit_b11_op_end(c);
+        return;
+    }
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const(4);
+    c.b.op_i32_add();
+    emit_import_or_stub(c, WIMPORT_READ32);
+    c.b.op_i32_store(ppc_off::ps0(rt));
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_local_get(LOCAL_TMP_A);
+    emit_import_or_stub(c, WIMPORT_READ32);
+    c.b.op_i32_store(ppc_off::ps0(rt) + 4u);
+}
+// f64 (two words) store from ps0(rs).
+static void emit_fp_store64_tmpa(EmitCtx& c, u32 rs) {
+    if (g_mem1_base != 0u) {
+        emit_fp_fastmem_cond(c, 8u);
+        emit_b11_op_if(c, 0x40);
+            emit_fp_fastmem_addr(c, 0u);
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            c.b.op_i32_load(ppc_off::ps0(rs) + 4u);
+            emit_bswap32_tmpc(c);
+            c.b.op_i32_store(0);
+            emit_fp_fastmem_addr(c, 4u);
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            c.b.op_i32_load(ppc_off::ps0(rs));
+            emit_bswap32_tmpc(c);
+            c.b.op_i32_store(0);
+        emit_b11_op_else(c);
+            c.b.op_local_get(LOCAL_TMP_A);
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            c.b.op_i32_load(ppc_off::ps0(rs) + 4u);
+            emit_import_or_stub(c, WIMPORT_WRITE32);
+            c.b.op_local_get(LOCAL_TMP_A);
+            c.b.op_i32_const(4);
+            c.b.op_i32_add();
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            c.b.op_i32_load(ppc_off::ps0(rs));
+            emit_import_or_stub(c, WIMPORT_WRITE32);
+        emit_b11_op_end(c);
+        return;
+    }
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_load(ppc_off::ps0(rs) + 4u);
+    emit_import_or_stub(c, WIMPORT_WRITE32);
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const(4);
+    c.b.op_i32_add();
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_load(ppc_off::ps0(rs));
+    emit_import_or_stub(c, WIMPORT_WRITE32);
+}
+
 static void emit_lfs_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
     // EA -> read32 (returns IEEE-754 f32 bits as i32) -> reinterpret f32 ->
     // promote to f64 -> store to FPR.
-    c.b.op_i32_const((s32)CTX);     // dest ctx for store
     emit_ea_d(c, ra, simm);
-    emit_import_or_stub(c, WIMPORT_READ32);
-    c.b.op_f32_reinterpret_i32();
-    c.b.op_f64_promote_f32();
-    c.b.op_f64_store(ppc_off::ps0(rt));
+    c.b.op_local_set(LOCAL_TMP_A);
+    emit_fp_load32_tmpa(c, rt);
 }
 
 // lfsu rT, d(rA) — like lfs but EA writes back to rA. RA must be != 0.
@@ -2839,12 +3015,7 @@ static void emit_lfsu_impl(EmitCtx& c) {
     c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
     // Load f32, promote, store to FPR.
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_local_get(LOCAL_TMP_A);
-    emit_import_or_stub(c, WIMPORT_READ32);
-    c.b.op_f32_reinterpret_i32();
-    c.b.op_f64_promote_f32();
-    c.b.op_f64_store(ppc_off::ps0(rt));
+    emit_fp_load32_tmpa(c, rt);
     // ra = EA
     c.b.op_local_get(LOCAL_TMP_A);
     emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_B);
@@ -2872,6 +3043,34 @@ static void emit_lfd_impl(EmitCtx& c) {
         c.b.op_i32_add();
     }
     c.b.op_local_set(LOCAL_TMP_A);
+    if (g_mem1_base != 0u) {
+        emit_fp_fastmem_cond(c, 8u);
+        emit_b11_op_if(c, 0x40);
+            // low half <- bswap(load(host+4)) at ps0+0; high <- bswap(load(host)) at ps0+4.
+            c.b.op_i32_const((s32)CTX);
+            emit_fp_fastmem_addr(c, 4u);
+            c.b.op_i32_load(0);
+            emit_bswap32_tmpc(c);
+            c.b.op_i32_store(ppc_off::ps0(rt));
+            c.b.op_i32_const((s32)CTX);
+            emit_fp_fastmem_addr(c, 0u);
+            c.b.op_i32_load(0);
+            emit_bswap32_tmpc(c);
+            c.b.op_i32_store(ppc_off::ps0(rt) + 4u);
+        emit_b11_op_else(c);
+            c.b.op_i32_const((s32)CTX);
+            c.b.op_local_get(LOCAL_TMP_A);
+            c.b.op_i32_const(4);
+            c.b.op_i32_add();
+            emit_import_or_stub(c, WIMPORT_READ32);
+            c.b.op_i32_store(ppc_off::ps0(rt));
+            c.b.op_i32_const((s32)CTX);
+            c.b.op_local_get(LOCAL_TMP_A);
+            emit_import_or_stub(c, WIMPORT_READ32);
+            c.b.op_i32_store(ppc_off::ps0(rt) + 4u);
+        emit_b11_op_end(c);
+        return;
+    }
     // FPR low half: read32(EA + 4) — stores at ps0(rt) + 0.
     c.b.op_i32_const((s32)CTX);
     c.b.op_local_get(LOCAL_TMP_A);
@@ -2895,16 +3094,7 @@ static void emit_lfdu_impl(EmitCtx& c) {
     c.b.op_i32_add();
     c.b.op_local_set(LOCAL_TMP_A);
     // Same as lfd above, using TMP_A as EA.
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const(4);
-    c.b.op_i32_add();
-    emit_import_or_stub(c, WIMPORT_READ32);
-    c.b.op_i32_store(ppc_off::ps0(rt));
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_local_get(LOCAL_TMP_A);
-    emit_import_or_stub(c, WIMPORT_READ32);
-    c.b.op_i32_store(ppc_off::ps0(rt) + 4u);
+    emit_fp_load64_tmpa(c, rt);
     // ra = EA
     c.b.op_local_get(LOCAL_TMP_A);
     emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_B);
@@ -2914,14 +3104,9 @@ static void emit_lfdu_impl(EmitCtx& c) {
 static void emit_stfs_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
-    // EA on stack as arg-1, then value as arg-2.
     emit_ea_d(c, ra, simm);
-    // Load f64 from FPR, demote to f32, reinterpret to i32.
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_f64_load(ppc_off::ps0(rs));
-    c.b.op_f32_demote_f64();
-    c.b.op_i32_reinterpret_f32();
-    emit_import_or_stub(c, WIMPORT_WRITE32);
+    c.b.op_local_set(LOCAL_TMP_A);
+    emit_fp_store32_tmpa(c, rs);
 }
 
 static void emit_stfsu_impl(EmitCtx& c) {
@@ -2931,13 +3116,8 @@ static void emit_stfsu_impl(EmitCtx& c) {
     emit_gpr_get_impl(c, ra, g_ctx_ptr);
     c.b.op_i32_const(simm);
     c.b.op_i32_add();
-    c.b.op_local_tee(LOCAL_TMP_A);
-    // Stack: [EA]
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_f64_load(ppc_off::ps0(rs));
-    c.b.op_f32_demote_f64();
-    c.b.op_i32_reinterpret_f32();
-    emit_import_or_stub(c, WIMPORT_WRITE32);
+    c.b.op_local_set(LOCAL_TMP_A);
+    emit_fp_store32_tmpa(c, rs);
     // ra = EA
     c.b.op_local_get(LOCAL_TMP_A);
     emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_B);
@@ -2957,23 +3137,17 @@ static void emit_ea_x(EmitCtx& c, u32 ra, u32 rb);
 // EA = (ra ? gpr[ra] : 0) + gpr[rb]
 static void emit_lfsx_impl(EmitCtx& c) {
     const u32 rt = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
-    c.b.op_i32_const((s32)CTX);
     emit_ea_x(c, ra, rb);
-    emit_import_or_stub(c, WIMPORT_READ32);
-    c.b.op_f32_reinterpret_i32();
-    c.b.op_f64_promote_f32();
-    c.b.op_f64_store(ppc_off::ps0(rt));
+    c.b.op_local_set(LOCAL_TMP_A);
+    emit_fp_load32_tmpa(c, rt);
 }
 
 // stfsx rS, rA, rB — store 32-bit float (indexed) (demote f64 from FPR).
 static void emit_stfsx_impl(EmitCtx& c) {
     const u32 rs = RT(c.inst), ra = RA(c.inst), rb = RB(c.inst);
     emit_ea_x(c, ra, rb);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_f64_load(ppc_off::ps0(rs));
-    c.b.op_f32_demote_f64();
-    c.b.op_i32_reinterpret_f32();
-    emit_import_or_stub(c, WIMPORT_WRITE32);
+    c.b.op_local_set(LOCAL_TMP_A);
+    emit_fp_store32_tmpa(c, rs);
 }
 
 // stfiwx rS, rA, rB — store FPR as integer word (indexed). Writes the
@@ -3004,12 +3178,37 @@ static void emit_stfd_impl(EmitCtx& c) {
         c.b.op_i32_add();
     }
     c.b.op_local_set(LOCAL_TMP_A);
-    // write32(EA, high32 of FPR) — high32 lives at ps0(rs) + 4.
+    if (g_mem1_base != 0u) {
+        emit_fp_fastmem_cond(c, 8u);
+        emit_b11_op_if(c, 0x40);
+            emit_fp_fastmem_addr(c, 0u);
+            c.b.op_i32_const((s32)CTX);
+            c.b.op_i32_load(ppc_off::ps0(rs) + 4u);
+            emit_bswap32_tmpc(c);
+            c.b.op_i32_store(0);
+            emit_fp_fastmem_addr(c, 4u);
+            c.b.op_i32_const((s32)CTX);
+            c.b.op_i32_load(ppc_off::ps0(rs));
+            emit_bswap32_tmpc(c);
+            c.b.op_i32_store(0);
+        emit_b11_op_else(c);
+            c.b.op_local_get(LOCAL_TMP_A);
+            c.b.op_i32_const((s32)CTX);
+            c.b.op_i32_load(ppc_off::ps0(rs) + 4u);
+            emit_import_or_stub(c, WIMPORT_WRITE32);
+            c.b.op_local_get(LOCAL_TMP_A);
+            c.b.op_i32_const(4);
+            c.b.op_i32_add();
+            c.b.op_i32_const((s32)CTX);
+            c.b.op_i32_load(ppc_off::ps0(rs));
+            emit_import_or_stub(c, WIMPORT_WRITE32);
+        emit_b11_op_end(c);
+        return;
+    }
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const((s32)CTX);
     c.b.op_i32_load(ppc_off::ps0(rs) + 4u);
     emit_import_or_stub(c, WIMPORT_WRITE32);
-    // write32(EA + 4, low32 of FPR) — low32 lives at ps0(rs) + 0.
     c.b.op_local_get(LOCAL_TMP_A);
     c.b.op_i32_const(4);
     c.b.op_i32_add();
@@ -3027,16 +3226,7 @@ static void emit_stfdu_impl(EmitCtx& c) {
     c.b.op_i32_add();
     c.b.op_local_set(LOCAL_TMP_A);
     // Same as stfd.
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::ps0(rs) + 4u);
-    emit_import_or_stub(c, WIMPORT_WRITE32);
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const(4);
-    c.b.op_i32_add();
-    c.b.op_i32_const((s32)CTX);
-    c.b.op_i32_load(ppc_off::ps0(rs));
-    emit_import_or_stub(c, WIMPORT_WRITE32);
+    emit_fp_store64_tmpa(c, rs);
     // ra = EA
     c.b.op_local_get(LOCAL_TMP_A);
     emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_B);
@@ -3461,12 +3651,15 @@ static void emit_fctiwzx_impl(EmitCtx& c) { emit_fctiwx_common(c, true);  }
 // 0x18(r1); stmw r24, 0x18(r1) etc.
 // ===========================================================================
 static void emit_lmw_impl(EmitCtx& c) {
-    // B11 Phase 2.5 — re-migrated after the per-helper-scratch-param fix.
-    // The base EA stays in LOCAL_TMP_A across the loop; per-iter
-    // emit_gpr_set_impl uses LOCAL_TMP_B as its swap scratch (passed
-    // explicitly), so TMP_A is preserved.
+    // [multi-word fastmem 2026-07-03 — Task-2 perf + write-ring replacement] lmw/stmw used to
+    // route EVERY word through the mailbox import (the only reason SIGetType's stack saves sat
+    // in the async write ring). With the ring OFF for correctness, mailbox-per-word made guest
+    // stores ~synchronous-RPC slow (measured 0.001 MIPS post-handover). Range-check the whole
+    // span once (base in MEM1 && base+len <= ram_size) -> per-word DIRECT SAB access with
+    // byteswap (immediate visibility = correct store->load ordering); else the import loop.
     const u32 rt = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
+    const u32 nwords = 32u - rt;
     if (ra == 0) {
         c.b.op_i32_const(simm);
     } else {
@@ -3475,23 +3668,83 @@ static void emit_lmw_impl(EmitCtx& c) {
         c.b.op_i32_add();
     }
     c.b.op_local_set(LOCAL_TMP_A);
+    if (g_mem1_base != 0u) {
+        // span check: (EA & 0x1F000000)==0 && ((EA & 0x01FFFFFF) + nwords*4) <= ram_size
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x1F000000);
+        c.b.op_i32_and();
+        c.b.op_i32_eqz();
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x01FFFFFF);
+        c.b.op_i32_and();
+        c.b.op_i32_const((s32)(nwords * 4u));
+        c.b.op_i32_add();
+        c.b.op_i32_const((s32)g_ram_size);
+        c.b.op_i32_le_u();
+        c.b.op_i32_and();
+        emit_b11_op_if(c, 0x40);
+            // TMP_B = host base addr = g_mem1_base + (EA & 0x01FFFFFF)
+            c.b.op_local_get(LOCAL_TMP_A);
+            c.b.op_i32_const(0x01FFFFFF);
+            c.b.op_i32_and();
+            emit_mem1_base_load(c.b);
+            c.b.op_i32_add();
+            c.b.op_local_set(LOCAL_TMP_B);
+            for (u32 i = rt; i < 32; ++i) {
+                const u32 off = (i - rt) * 4u;
+                // value = bswap32(load(TMP_B + off)) -> gpr[i] (if_depth>0 => memory-direct set)
+                c.b.op_local_get(LOCAL_TMP_B);
+                c.b.op_i32_load(off);
+                c.b.op_local_tee(LOCAL_TMP_C);
+                c.b.op_i32_const(24); c.b.op_i32_shr_u();
+                c.b.op_local_get(LOCAL_TMP_C);
+                c.b.op_i32_const(8);  c.b.op_i32_shr_u();
+                c.b.op_i32_const(0xFF00); c.b.op_i32_and();
+                c.b.op_i32_or();
+                c.b.op_local_get(LOCAL_TMP_C);
+                c.b.op_i32_const(8);  c.b.op_i32_shl();
+                c.b.op_i32_const(0x00FF0000); c.b.op_i32_and();
+                c.b.op_i32_or();
+                c.b.op_local_get(LOCAL_TMP_C);
+                c.b.op_i32_const(24); c.b.op_i32_shl();
+                c.b.op_i32_or();
+                emit_gpr_set_impl(c, i, g_ctx_ptr, LOCAL_TMP_C);
+            }
+        emit_b11_op_else(c);
+            for (u32 i = rt; i < 32; ++i) {
+                const s32 offset = (s32)((i - rt) * 4u);
+                c.b.op_local_get(LOCAL_TMP_A);
+                if (offset != 0) { c.b.op_i32_const(offset); c.b.op_i32_add(); }
+                emit_import_or_stub(c, WIMPORT_READ32);
+                emit_gpr_set_impl(c, i, g_ctx_ptr, LOCAL_TMP_B);
+            }
+        emit_b11_op_end(c);
+        return;
+    }
     for (u32 i = rt; i < 32; ++i) {
         const s32 offset = (s32)((i - rt) * 4u);
         c.b.op_local_get(LOCAL_TMP_A);
-        if (offset != 0) {
-            c.b.op_i32_const(offset);
-            c.b.op_i32_add();
-        }
+        if (offset != 0) { c.b.op_i32_const(offset); c.b.op_i32_add(); }
         emit_import_or_stub(c, WIMPORT_READ32);
         emit_gpr_set_impl(c, i, g_ctx_ptr, LOCAL_TMP_B);
+    }
+
+    // [b11-lmw invalidate 2026-07-03] lmw rewrote ctx.gpr[rt..31] in MEMORY; any B11-cached
+    // wasm-locals for those registers are now stale — and a stale DIRTY local would flush
+    // OVER the restored value at block exit (gclongjmp-class context restores: the chain
+    // corruption's trashed r1). Discard cache bookkeeping for the loaded range.
+    for (u32 r = rt; r < 32u; ++r) {
+        c.gpr_loaded[r] = false;
+        c.gpr_dirty[r]  = false;
     }
 }
 
 static void emit_stmw_impl(EmitCtx& c) {
-    // B11 Phase 2.5 — symmetric with emit_lmw_impl. No emit_gpr_set_impl
-    // here (we do GPR reads only), so technically TMP_B is also free.
+    // [multi-word fastmem 2026-07-03] See emit_lmw_impl. Direct-arm stores byteswap gpr[i]
+    // and write straight to the SAB — synchronous, ordered, no mailbox.
     const u32 rs = RT(c.inst), ra = RA(c.inst);
     const s32 simm = SIMM_16(c.inst);
+    const u32 nwords = 32u - rs;
     if (ra == 0) {
         c.b.op_i32_const(simm);
     } else {
@@ -3500,13 +3753,60 @@ static void emit_stmw_impl(EmitCtx& c) {
         c.b.op_i32_add();
     }
     c.b.op_local_set(LOCAL_TMP_A);
+    if (g_mem1_base != 0u) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x1F000000);
+        c.b.op_i32_and();
+        c.b.op_i32_eqz();
+        c.b.op_local_get(LOCAL_TMP_A);
+        c.b.op_i32_const(0x01FFFFFF);
+        c.b.op_i32_and();
+        c.b.op_i32_const((s32)(nwords * 4u));
+        c.b.op_i32_add();
+        c.b.op_i32_const((s32)g_ram_size);
+        c.b.op_i32_le_u();
+        c.b.op_i32_and();
+        emit_b11_op_if(c, 0x40);
+            c.b.op_local_get(LOCAL_TMP_A);
+            c.b.op_i32_const(0x01FFFFFF);
+            c.b.op_i32_and();
+            emit_mem1_base_load(c.b);
+            c.b.op_i32_add();
+            c.b.op_local_set(LOCAL_TMP_B);
+            for (u32 i = rs; i < 32; ++i) {
+                const u32 off = (i - rs) * 4u;
+                c.b.op_local_get(LOCAL_TMP_B);          // store addr (word offset in store op)
+                emit_gpr_get_impl(c, i, g_ctx_ptr);      // value (if_depth>0 => memory-direct)
+                c.b.op_local_tee(LOCAL_TMP_C);
+                c.b.op_i32_const(24); c.b.op_i32_shr_u();
+                c.b.op_local_get(LOCAL_TMP_C);
+                c.b.op_i32_const(8);  c.b.op_i32_shr_u();
+                c.b.op_i32_const(0xFF00); c.b.op_i32_and();
+                c.b.op_i32_or();
+                c.b.op_local_get(LOCAL_TMP_C);
+                c.b.op_i32_const(8);  c.b.op_i32_shl();
+                c.b.op_i32_const(0x00FF0000); c.b.op_i32_and();
+                c.b.op_i32_or();
+                c.b.op_local_get(LOCAL_TMP_C);
+                c.b.op_i32_const(24); c.b.op_i32_shl();
+                c.b.op_i32_or();
+                c.b.op_i32_store(off);
+            }
+        emit_b11_op_else(c);
+            for (u32 i = rs; i < 32; ++i) {
+                const s32 offset = (s32)((i - rs) * 4u);
+                c.b.op_local_get(LOCAL_TMP_A);
+                if (offset != 0) { c.b.op_i32_const(offset); c.b.op_i32_add(); }
+                emit_gpr_get_impl(c, i, g_ctx_ptr);
+                emit_import_or_stub(c, WIMPORT_WRITE32);
+            }
+        emit_b11_op_end(c);
+        return;
+    }
     for (u32 i = rs; i < 32; ++i) {
         const s32 offset = (s32)((i - rs) * 4u);
         c.b.op_local_get(LOCAL_TMP_A);
-        if (offset != 0) {
-            c.b.op_i32_const(offset);
-            c.b.op_i32_add();
-        }
+        if (offset != 0) { c.b.op_i32_const(offset); c.b.op_i32_add(); }
         emit_gpr_get_impl(c, i, g_ctx_ptr);
         emit_import_or_stub(c, WIMPORT_WRITE32);
     }
@@ -3578,7 +3878,7 @@ static void emit_load_x(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
         emit_local_op_if(c, WASM_TYPE_I32);        // (result i32)
             // Fast path: direct linear-memory load + bswap.
             c.b.op_local_get(LOCAL_TMP_B);
-            c.b.op_i32_const((s32)g_mem1_base);
+            emit_mem1_base_load(c.b);
             c.b.op_i32_add();
             if (import_idx == WIMPORT_READ32) {
                 c.b.op_i32_load(0);
@@ -3615,13 +3915,6 @@ static void emit_load_x(EmitCtx& c, u32 import_idx, bool sign_extend_h, bool upd
             } else {
                 c.b.op_i32_load8_u(0);
             }
-            // [dsp-sentinel L0..L5] JIT-side MEM1-direct read trace — only
-            // emitted in the six target polling-loop blocks. Value is on top
-            // of stack here; emit_l_recorder preserves it (clobbers TMP_B,
-            // which is safe — the surrounding code re-sets TMP_B post-if).
-            if (u32 slot = l_sentinel_slot_base(c.pc); slot != 0u) {
-                emit_l_recorder(c, slot);
-            }
         c.b.op_else();
             // MEM1 missed; try MMIO mirror, then fall to import.
             emit_mmio_mirror_else_or_import(c, import_idx);
@@ -3652,38 +3945,6 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
     c.b.op_local_tee(LOCAL_TMP_A);
     c.b.op_drop();
 
-    // [stack-corrupt] removed 2026-06-09 (X-form variant — see D-form site).
-
-    // PLANTER TRIPWIRE 1 (X-form EA-match).
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)0x802bafccu);
-    c.b.op_i32_eq();
-    c.b.op_if(0x40);
-        c.b.op_i32_const((s32)0xFFFFFFFFu);
-        c.b.op_i32_const((s32)c.pc);
-        emit_import_or_stub(c, WIMPORT_INTERP);
-    c.b.op_end();
-    // PLANTER TRIPWIRE 2 (X-form val-match).
-    emit_gpr_get_impl(c, rs, g_ctx_ptr);
-    c.b.op_i32_const((s32)0x38500000u);
-    c.b.op_i32_eq();
-    c.b.op_if(0x40);
-        c.b.op_i32_const((s32)0xFFFFFFFEu);
-        c.b.op_i32_const((s32)c.pc);
-        emit_import_or_stub(c, WIMPORT_INTERP);
-    c.b.op_end();
-    // [test4-writer-trace] X-form EA-match for 0x800e3a30..0x800e3a34.
-    c.b.op_local_get(LOCAL_TMP_A);
-    c.b.op_i32_const((s32)0xFFFFFFFCu);
-    c.b.op_i32_and();
-    c.b.op_i32_const((s32)0x800e3a30u);
-    c.b.op_i32_eq();
-    c.b.op_if(0x40);
-        c.b.op_i32_const((s32)0xFFFFFFFDu);
-        c.b.op_i32_const((s32)c.pc);
-        emit_import_or_stub(c, WIMPORT_INTERP);
-    c.b.op_end();
-
     if (g_mem1_base == 0u) {
         // Item 6 Stage 2: same MMIO mirror routing as emit_store_d path (a).
         emit_gpr_get_impl(c, rs, g_ctx_ptr);
@@ -3707,29 +3968,9 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
         // B11-aware: bumps if_depth so emit_gpr_get_impl in either arm
         // takes the memory-direct path. See b11_coherence_bug_2026_05_07.
         emit_b11_op_if(c, /*no result*/ 0x40);
-            // [dsp-sentinel K] JIT-side X-form writer trace for guest 0x803c136c.
-            // Mirrors the emit_store_d K sentinel; shared SAB[0x026B0100..0108].
-            c.b.op_local_get(LOCAL_TMP_A);
-            c.b.op_i32_const((s32)0x803c136cu);
-            c.b.op_i32_eq();
-            emit_b11_op_if(c, /*void*/ 0x40);
-                c.b.op_i32_const((s32)0x026B0100);
-                c.b.op_i32_const((s32)0x026B0100);
-                c.b.op_i32_load(0);
-                c.b.op_i32_const(1);
-                c.b.op_i32_add();
-                c.b.op_i32_store(0);
-                c.b.op_i32_const((s32)0x026B0104);
-                c.b.op_i32_const((s32)c.pc);
-                c.b.op_i32_store(0);
-                c.b.op_i32_const((s32)0x026B0108);
-                emit_gpr_get_impl(c, rs, g_ctx_ptr);
-                c.b.op_i32_store(0);
-            emit_b11_op_end(c);
-
             // Fast: addr-host = mem1_base + phys; load val; bswap; store.
             c.b.op_local_get(LOCAL_TMP_B);
-            c.b.op_i32_const((s32)g_mem1_base);
+            emit_mem1_base_load(c.b);
             c.b.op_i32_add();
             emit_gpr_get_impl(c, rs, g_ctx_ptr);
             if (import_idx == WIMPORT_WRITE32) {
@@ -4100,21 +4341,53 @@ EmitFn gekko_lookup(u32 inst) {
 // true on every op and this helper is dead. Becomes live once any group of
 // native emitters is re-enabled.
 static void emit_exception_bail(EmitCtx& c) {
-    c.b.op_i32_const((s32)c.pc);
-    emit_import_or_stub(c, WIMPORT_CHECK_EXC);
-    emit_b11_op_if(c, WASM_TYPE_I32);
-        // B11: flush WITHOUT clearing compile-time dirty[]: we're inside
-        // an if-branch that returns. If the runtime takes this branch,
-        // the flush ops execute. If the runtime doesn't take it, the post-
-        // if code path still believes its locals are dirty (correctly).
-        emit_flush_dirty_gprs_inside_branch(c, g_ctx_ptr);
-        c.b.op_i32_const((s32)g_ctx_ptr);
-        c.b.op_i32_load(ppc_off::PC);
-        c.b.op_return();
-    emit_b11_op_else(c);
-        c.b.op_i32_const(0);  // dummy to satisfy if-result type
+    // [post-op pc fix 2026-07-02 KEPT] This bail runs AFTER the op at c.pc has fully executed,
+    // but ppc_state.pc still held c.pc (the pre-op set_pc). A delivery fired inside
+    // ppc_check_exc then captured SRR0 = npc-sync'd pc = c.pc — a COMPLETED op — so the
+    // handler's rfi RE-EXECUTED it; non-idempotent ops (stwu, pops, update-forms) corrupt
+    // r1/state. The architectural boundary after a completed op is c.pc+4 — present THAT.
+    // [inline-exc gate 2026-07-03 — THE mailbox wall] mbx-census: cmd-10 (this bail's host
+    // call) was 1,381,127 of 1,675,000 total round-trips (82%), ~one per retired instruction,
+    // 55s of a 107s run parked in Atomics.wait. Pre-check ppc_state.Exceptions INLINE (one
+    // i32.load) and only cross to the host when an exception is actually pending (rare).
+    // Deliverability predicate (mirrors block_cache.cpp:632-637): sync/non-maskable bits
+    // (0x2FA) always deliver; maskable (EXT|DEC = 0x105) only at MSR.EE=1. A merely-HELD
+    // maskable (exc=0x5 at EE=0 — pending in 519/570 sampled slices) must NOT cross to the
+    // host: that kept cmd-10 at 1.32M/run even with the nonzero-only gate.
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_load(ppc_off::EXCEPTIONS);
+    c.b.op_local_tee(LOCAL_TMP_A);
+    c.b.op_i32_const(0x2FA);
+    c.b.op_i32_and();
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const(0x105);
+    c.b.op_i32_and();
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_load(ppc_off::MSR);
+    c.b.op_i32_const(0x8000);
+    c.b.op_i32_and();
+    c.b.op_i32_const(0);
+    c.b.op_i32_ne();          // ee = 0/1
+    c.b.op_i32_mul();          // maskable-if-ee
+    c.b.op_i32_or();           // deliverable
+    emit_b11_op_if(c, 0x40);  // void arm: DELIVERABLE exception -> full host bail
+        emit_set_pc(c, g_ctx_ptr, c.pc + 4u);
+        c.b.op_i32_const((s32)(c.pc + 4u));
+        emit_import_or_stub(c, WIMPORT_CHECK_EXC);
+        emit_b11_op_if(c, WASM_TYPE_I32);
+            // B11: flush WITHOUT clearing compile-time dirty[]: we're inside
+            // an if-branch that returns. If the runtime takes this branch,
+            // the flush ops execute. If the runtime doesn't take it, the post-
+            // if code path still believes its locals are dirty (correctly).
+            emit_flush_dirty_gprs_inside_branch(c, g_ctx_ptr);
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            c.b.op_i32_load(ppc_off::PC);
+            c.b.op_return();
+        emit_b11_op_else(c);
+            c.b.op_i32_const(0);  // dummy to satisfy if-result type
+        emit_b11_op_end(c);
+        c.b.op_drop();
     emit_b11_op_end(c);
-    c.b.op_drop();
 }
 
 void gekko_emit_instr(EmitCtx& c) {
@@ -4249,7 +4522,8 @@ static void verify_block_can_advance_pc(const std::vector<u8>& body, u32 start_p
 static bool detect_self_loop(const u32* insts, u32 count,
                              const u32* instr_pcs, u32 start_pc,
                              u32* out_bdnz_idx,
-                             u32* out_loop_entry_idx) {
+                             u32* out_loop_entry_idx,
+                             bool* out_is_cr = nullptr) {
     if (count < 2) return false;
     for (u32 i = 0; i < count; ++i) {
         const u32 inst = insts[i];
@@ -4270,11 +4544,19 @@ static bool detect_self_loop(const u32* insts, u32 count,
         const u32 bo = (inst >> 21) & 0x1Fu;
         const bool is_bdnz = (bo == 0b10000u);
         const bool is_bdz  = (bo == 0b10010u);
-        // CR-branches deliberately rejected: see header comment about
-        // MMIO-poll deadlock.
-        if (!is_bdnz && !is_bdz) continue;
+        // [CR self-loops ACCEPTED 2026-07-10] historically rejected (MMIO-poll deadlock);
+        // now safe: the wrap adds a per-iteration downcount guard (see
+        // emit_self_loop_terminator) so the loop yields every slice. This is the memcpy/
+        // work-loop throughput lever: MP4's MSL copy loops are CR-branch shaped and were
+        // grinding at ~20k JS-bounced iterations/s (the 800034xx 'face').
+        const bool is_cr = !is_bdnz && !is_bdz &&
+                           ((bo & 0b10000u) == 0u);  // CR-test conditionals only (BO bit4
+                                                     // clear = 001at/011at; excludes
+                                                     // branch-always 10100 and CTR forms)
+        if (!is_bdnz && !is_bdz && !is_cr) continue;
         if (out_bdnz_idx)        *out_bdnz_idx        = i;
         if (out_loop_entry_idx)  *out_loop_entry_idx  = entry_idx;
+        if (out_is_cr)           *out_is_cr           = is_cr;
         return true;
     }
     return false;
@@ -4284,7 +4566,7 @@ static bool detect_self_loop(const u32* insts, u32 count,
 // branch: `br_if 0` continues the loop, fall-through exits. The CR-test
 // path mirrors emit_bcx_impl's CR-bit decode but emits br_if 0 instead of
 // emit_branch_resolution. The BO encodes which of (bdnz/bdz/cr_branch).
-static void emit_self_loop_terminator(EmitCtx& c, u32 inst) {
+static void emit_self_loop_terminator(EmitCtx& c, u32 inst, u32 iter_cycles = 0) {
     const u32 bo = BO(inst), bi = BI(inst);
     const bool is_bdnz = (bo == 0b10000u);
     const bool is_bdz  = (bo == 0b10010u);
@@ -4345,6 +4627,25 @@ static void emit_self_loop_terminator(EmitCtx& c, u32 inst) {
     }
     if (!branch_if_true) {
         c.b.op_i32_eqz();
+    }
+    // [CR self-loop downcount guard 2026-07-10] a CR-branch loop wrapped in-wasm could
+    // deadlock an MMIO poll (the dispatcher never fires the event it waits on) — the
+    // reason CR loops were historically rejected. The guard makes them deadlock-proof:
+    // every iteration burns its cycles from ctx.DOWNCOUNT and the back-edge is taken
+    // only while downcount > 0, so control returns to the dispatcher every slice and
+    // events fire. (bdnz/bdz keep the unguarded fast path — CTR self-terminates.)
+    if (iter_cycles > 0) {
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_const((s32)CTX);
+        c.b.op_i32_load(ppc_off::DOWNCOUNT);
+        c.b.op_i32_const((s32)iter_cycles);
+        c.b.op_i32_sub();
+        c.b.op_local_tee(LOCAL_TMP_B);
+        c.b.op_i32_store(ppc_off::DOWNCOUNT);
+        c.b.op_local_get(LOCAL_TMP_B);
+        c.b.op_i32_const(0);
+        c.b.op_i32_gt_s();
+        c.b.op_i32_and();
     }
     c.b.op_br_if(0);
 }
@@ -4571,6 +4872,48 @@ static void emit_body_into(WasmModuleBuilder& b,
         b.op_drop();
     }
 
+    // [fp-check] Block-level lazy-FP enforcement (KEPT FIX). The gekko JIT was running FP ops
+    // regardless of MSR[FP], violating the trap-on-FP-disabled contract that makes GameCube
+    // lazy-FP work. MSR[FP] is CONSTANT within a block (any mtmsr ends the block), so ONE
+    // prologue check suffices: if this block uses FP and MSR[FP]==0, raise FPU_UNAVAILABLE
+    // (0x40) with pc=start_pc (=> SRR0 at delivery, vector 0x800) and exit. Nothing has
+    // executed yet, so re-execution after the handler enables FP is safe. Prologue placement
+    // is flush-safe by construction (per-body gpr_dirty[] all false here; wf_432ecde7 audit).
+    {
+        bool _uses_fp = false;
+        for (u32 _i = 0; _i < count && !_uses_fp; ++_i) {
+            const u32 _op = insts[_i] >> 26;             // primary opcode
+            // 48-55 FP ld/st, 56/57 psq_l/lu, 60/61 psq_st/stu, 59/63 FP arith, 4 paired-single.
+            if (_op == 4 || _op == 59 || _op == 63 || (_op >= 48 && _op <= 57) || _op == 60 || _op == 61)
+                _uses_fp = true;
+            else if (_op == 31) {                        // FP-indexed ld/st (lfsx/lfdx/stfsx/.../stfiwx)
+                const u32 _xo = (insts[_i] >> 1) & 0x3FFu;
+                if (_xo==535||_xo==567||_xo==599||_xo==631||_xo==663||_xo==695||_xo==727||_xo==759||_xo==983)
+                    _uses_fp = true;
+            }
+        }
+        if (_uses_fp) {
+            b.op_i32_const((s32)ctx_ptr_const);
+            b.op_i32_load(ppc_off::MSR);
+            b.op_i32_const((s32)0x2000);                 // MSR[FP]
+            b.op_i32_and();
+            b.op_i32_eqz();                              // (MSR & FP)==0 => FP disabled
+            b.op_if(0x40);
+                b.op_i32_const((s32)ctx_ptr_const);
+                b.op_i32_const((s32)ctx_ptr_const);
+                b.op_i32_load(ppc_off::EXCEPTIONS);
+                b.op_i32_const((s32)0x40);               // EXCEPTION_FPU_UNAVAILABLE
+                b.op_i32_or();
+                b.op_i32_store(ppc_off::EXCEPTIONS);
+                b.op_i32_const((s32)ctx_ptr_const);
+                b.op_i32_const((s32)start_pc);
+                b.op_i32_store(ppc_off::PC);             // pc = start_pc (SRR0 = start_pc at delivery)
+                b.op_i32_const((s32)start_pc);
+                b.op_return();
+            b.op_end();
+        }
+    }
+
     // Self-loop fast path: detect "block ends with bdnz/bdz/bne/beq back
     // to start_pc" and wrap the body in WASM `loop` + `br_if 0` so the
     // entire iter chain runs inside ONE function call. Eliminates the
@@ -4588,9 +4931,11 @@ static void emit_body_into(WasmModuleBuilder& b,
     bool emitted_terminator = false;
     u32 self_loop_bdnz_idx  = 0;
     u32 self_loop_entry_idx = 0;
+    bool self_loop_is_cr    = false;
     if (count >= 2 && detect_self_loop(insts, count, instr_pcs, start_pc,
                                        &self_loop_bdnz_idx,
-                                       &self_loop_entry_idx)) {
+                                       &self_loop_entry_idx,
+                                       &self_loop_is_cr)) {
         // Emit setup instructions [0, entry_idx) as straight-line.
         for (u32 i = 0; i < self_loop_entry_idx; ++i) {
             ctx.pc = instr_pcs ? instr_pcs[i] : (start_pc + i * 4u);
@@ -4625,7 +4970,10 @@ static void emit_body_into(WasmModuleBuilder& b,
                 ctx.pc = instr_pcs ? instr_pcs[self_loop_bdnz_idx]
                                    : (start_pc + self_loop_bdnz_idx * 4u);
                 ctx.inst = insts[self_loop_bdnz_idx];
-                emit_self_loop_terminator(ctx, ctx.inst);
+                // CR loops carry the per-iteration downcount guard (cycles = body length);
+                // bdnz/bdz stay unguarded (CTR-bounded).
+                emit_self_loop_terminator(ctx, ctx.inst,
+                    self_loop_is_cr ? (self_loop_bdnz_idx - self_loop_entry_idx + 1u) : 0u);
             emit_local_op_end(ctx);  // close loop
             // Emit post-loop instructions [bdnz_idx+1, count). These run
             // when the bdnz fall-through path exits the loop. Each may be
@@ -4711,6 +5059,10 @@ static void emit_body_into(WasmModuleBuilder& b,
     // bcx-fallback), emit_fallback hands control to the interpreter which
     // writes the real branch target into ppc_state.pc. Reading PC back
     // here is what carries that target out to the dispatcher.
+    if (g_aot_chain) {
+        emit_aot_chain_exit(ctx);
+        return;
+    }
     b.op_i32_const((s32)g_ctx_ptr);
     b.op_i32_load(ppc_off::PC);
     b.op_return();
@@ -4884,8 +5236,10 @@ std::vector<u8> build_region_module(const u8* concatenated_bodies,
     b.endSection();
 
     // ---- Import section: memory + WIMPORT_COUNT host functions ----
-    b.emitImportSection(1u + (u32)WIMPORT_COUNT);
+    b.emitImportSection((g_aot_chain ? 2u : 1u) + (u32)WIMPORT_COUNT);
     b.emitImportMemory("env", "memory", mem_pages > 0u ? mem_pages : 1u);
+    if (g_aot_chain)
+        b.emitImportTable("env", "aot_table", /*initial*/1u);
     b.emitImportFunc("env", "ppc_read8",       /*type*/1);
     b.emitImportFunc("env", "ppc_read16",      /*type*/1);
     b.emitImportFunc("env", "ppc_read32",      /*type*/1);
@@ -5009,8 +5363,10 @@ std::vector<u8> build_region_function(const BlockInputs* blocks,
     b.endSection();
 
     // ---- Import section: env.memory + WIMPORT_COUNT host functions ----
-    b.emitImportSection(1u + (u32)WIMPORT_COUNT);
+    b.emitImportSection((g_aot_chain ? 2u : 1u) + (u32)WIMPORT_COUNT);
     b.emitImportMemory("env", "memory", mem_pages > 0u ? mem_pages : 1u);
+    if (g_aot_chain)
+        b.emitImportTable("env", "aot_table", /*initial*/1u);
     b.emitImportFunc("env", "ppc_read8",       /*type*/1);
     b.emitImportFunc("env", "ppc_read16",      /*type*/1);
     b.emitImportFunc("env", "ppc_read32",      /*type*/1);
@@ -5068,7 +5424,12 @@ std::vector<u8> build_region_function(const BlockInputs* blocks,
     // br_table dispatch — innermost, depth 0 = $b_0, ..., depth N-1 = $b_{N-1},
     // depth N = $L. Default = 0 (silent fall to block 0 if sel out of range;
     // dispatcher is responsible for passing sel ∈ [0, N)).
-    b.op_global_get(/*entry_sel*/0u);
+    if (g_aot_chain) {
+        b.op_i32_const((s32)AOT_ENTRY_CELL);
+        b.op_i32_load(0);
+    } else {
+        b.op_global_get(/*entry_sel*/0u);
+    }
     {
         std::vector<u32> arms(n_blocks);
         for (u32 i = 0; i < n_blocks; ++i) arms[i] = i;

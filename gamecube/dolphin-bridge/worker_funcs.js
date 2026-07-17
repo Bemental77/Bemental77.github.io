@@ -132,29 +132,46 @@ var __ticks = 0;
 // info) was ever delivered post-romEnd ([mailbox-diag] n=1 cmd=romEnd was
 // the lifetime total). Pump with a wall-clock budget instead: run retro_run
 // repeatedly until BUDGET_MS elapses, then yield so queued messages deliver.
-var PUMP_BUDGET_MS = 40;
+// [determinize-boot 2026-07-08] REPLACED the wall-clock budget (while performance.now()-t0
+// < 40ms) with a FIXED ITERATION COUNT. The wall-loop ran a VARIABLE number of retro_run
+// quanta per pump (however many fit in 40ms — JIT-warmup/GC/scheduler dependent), so the
+// dolphin-driven boot reached different points at the same wall time → the two-run diff
+// showed snap0 divergence (det_A xpc=800bffc8 vs det_B 800c0008, same input). A fixed count
+// makes each pump advance the guest a DETERMINISTIC amount per pump. One retro_run quantum
+// = ~one dispatch slice; PUMP_BATCH_ITERS ~40ms-equivalent at boot pace but constant.
+// [present-cadence 2026-07-13] 16 -> 2. WGPU readback map callbacks (and ALL worker JS events)
+// resolve only in the yield BETWEEN batches. At 16 quanta/batch the menu yielded ~16x/s and
+// presents capped at 16fps with the emulator itself at ~90 VI/s (frame=11ms, jit=9ms); the
+// movie yielded ~0.9x/s -> 2.6fps. 2 keeps the fixed-count determinism contract (constant
+// guest-advance per pump), just yields ~8x more often so presents track the emulated rate.
+var PUMP_BATCH_ITERS = 2;
 
 function pumpBatch() {
-  var t0 = performance.now();
   if (Module && Module._run_iter_batch) {
-    do { Module._run_iter_batch(1); }
-    while ((performance.now() - t0) < PUMP_BUDGET_MS);
+    for (var i = 0; i < PUMP_BATCH_ITERS; i++) Module._run_iter_batch(1);
   } else if (Module && Module._run_iter) {
-    do { Module._run_iter(); }
-    while ((performance.now() - t0) < PUMP_BUDGET_MS);
+    for (var j = 0; j < PUMP_BATCH_ITERS; j++) Module._run_iter();
   }
 }
 
 async function bootLoop() {
   if (bootLoopRunning) return;
   bootLoopRunning = true;
+  var __turnMax = 0, __turnSum = 0, __turnN = 0;
   while (!firstFrameSeen) {
     pumpBatch();
     __bootBatches++;
-    if (__bootBatches <= 3 || (__bootBatches % 100) === 0) {
-      try { postMessage({ cmd: 'print', txt: '[tick-diag] boot batch ' + __bootBatches + ' returned' }); } catch (_) {}
-    }
+    // [turn-latency 2026-07-06] the pump ticks ~2/s on slow runs (should be ~25/s with a
+    // 40ms budget): measure what one setTimeout(0) event-loop turn actually costs.
+    var __t0 = performance.now();
     await new Promise(function (r) { setTimeout(r, 0); });
+    var __dt = performance.now() - __t0;
+    __turnSum += __dt; __turnN++; if (__dt > __turnMax) __turnMax = __dt;
+    if (__bootBatches <= 3 || (__bootBatches % 100) === 0) {
+      try { postMessage({ cmd: 'print', txt: '[tick-diag] boot batch ' + __bootBatches
+        + ' turnAvg=' + (__turnSum / __turnN).toFixed(1) + 'ms turnMax=' + __turnMax.toFixed(0) + 'ms' }); } catch (_) {}
+      __turnMax = 0; __turnSum = 0; __turnN = 0;
+    }
   }
   bootLoopRunning = false;
   try { postMessage({ cmd: 'print', txt: '[tick-diag] bootLoop exited after ' + __bootBatches + ' batches' }); } catch (_) {}
@@ -236,9 +253,18 @@ async function bootIso(name, size) {
     // (worker_0 texSubImage3D rose to 37%). And guest progress was identical
     // (ticks 2336.33M), confirming the boot is CoreTiming-pacing/dispatch bound,
     // not render-bound. Reverted to single-core (no offload benefit + dual-core risk).
-    var iniBody = '[Core]\nMMU = True\nSkipIPL = False\nGFXBackend = OGL\n';
+    // [WGPU] When the page set the WGPU shared-heap flag (0x07FF0100 = 'WGPU'), make the
+    // .ini's AUTHORITATIVE backend WGPU so Dolphin activates the WGPU backend, not OGL
+    // (which has no HW context here and falls back to the Software renderer).
+    var _wgpu = false;
+    try {
+      var _h = Module.HEAPU32 || new Uint32Array(Module.HEAPU8.buffer);
+      _wgpu = (_h[0x07FF0100 >> 2] === 0x57475055);
+    } catch (e) {}
+    var _gfxBackend = _wgpu ? 'WGPU' : 'OGL';
+    var iniBody = '[Core]\nMMU = True\nSkipIPL = False\nGFXBackend = ' + _gfxBackend + '\n';
     Module.FS.writeFile(iniDir + '/Dolphin.ini', iniBody);
-    postMessage({ cmd: 'print', txt: '[worker] wrote Dolphin.ini (MMU=True, SkipIPL=False, GFXBackend=OGL) at ' + iniDir });
+    postMessage({ cmd: 'print', txt: '[worker] wrote Dolphin.ini (MMU=True, SkipIPL=False, GFXBackend=' + _gfxBackend + ') at ' + iniDir });
     try {
       var cfg = Module.FS.readFile(iniDir + '/Dolphin.ini', { encoding: 'utf8' });
       postMessage({ cmd: 'print', txt: '[config] Dolphin.ini: ' + cfg.replace(/\n/g, ' \\n ') });
@@ -344,20 +370,26 @@ async function bootIso(name, size) {
   }
 
   postMessage({ cmd: 'print', txt: '[worker] ISO written to /' + name + ' (' + size + ' bytes), calling load_iso' });
-  var ret = Module._load_iso ? Module.ccall('load_iso', 'number', ['string'], ['/' + name]) : -99;
-  if (ret !== 0) {
-    postMessage({ cmd: 'print', txt: '[worker] load_iso returned ' + ret });
-    postMessage({ cmd: 'setStatus', txt: 'load_iso failed (' + ret + ')' });
+  // load_iso is ASYNCIFY-async under WGPU (WGPUGfx creates its device via an emscripten_sleep
+  // event-loop pump), so a plain ccall returns a Promise — `ret` would be a Promise, trip the
+  // !== 0 check, and bootLoop would never run. Use {async:true} + .then (works for the sync SW
+  // path too — there the Promise just resolves immediately with the real return value).
+  if (!Module._load_iso) {
+    postMessage({ cmd: 'setStatus', txt: 'load_iso failed (no _load_iso)' });
     return;
   }
-  // Phase A1: cls-table init runs on the dolphin pthread inside
-  // HW::Init (HW.cpp routes through dolphin_mmio_mirror_init C-extern
-  // to defeat LTO DCE). Don't call it from JS — under PROXY_TO_PTHREAD
-  // the JS-thread call would land in main-thread memory while
-  // Core::System lives in the pthread's memory.
-  postMessage({ cmd: 'setStatus', txt: 'Running' });
-  // Run flat-out during boot. Switch to 60 Hz once first frame fires.
-  bootLoop();
+  Module.ccall('load_iso', 'number', ['string'], ['/' + name], { async: true }).then(function (ret) {
+    if (ret !== 0) {
+      postMessage({ cmd: 'print', txt: '[worker] load_iso returned ' + ret });
+      postMessage({ cmd: 'setStatus', txt: 'load_iso failed (' + ret + ')' });
+      return;
+    }
+    // Phase A1: cls-table init runs on the dolphin pthread inside HW::Init (HW.cpp routes
+    // through dolphin_mmio_mirror_init C-extern to defeat LTO DCE). Don't call it from JS —
+    // under PROXY_TO_PTHREAD the JS-thread call would land in main-thread memory.
+    postMessage({ cmd: 'setStatus', txt: 'Running' });
+    bootLoop();  // run flat-out during boot; switch to 60 Hz once first frame fires
+  });
 }
 
 self.onmessage = function (e) {

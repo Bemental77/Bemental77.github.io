@@ -85,6 +85,28 @@ static void emit_ea_x_form(WasmModuleBuilder& wb, RegCache& rc, u32 ra, u32 rb) 
 }
 
 // ---------------------------------------------------------------------------
+// [C6 2026-07-12 oracle-audit] emit_no_dsi_guard — push i32 (1 = no DSI, so
+// commit; 0 = DSI raised, so suppress) onto the wasm stack.
+//
+// Every load/store in Interpreter_LoadStore.cpp gates its RT/RA commit on
+// `!(ppc_state.Exceptions & EXCEPTION_DSI)` (e.g. lbz :46, lbzu :56-60,
+// stb :454-460, stbu — the update-form RA writeback + the load RT writeback
+// are ALL inside this guard). The fastmem fast arm is a raw i32.load/store on
+// wasm linear memory and cannot fault, so it never sets DSI; but the slow arm
+// (WIMPORT_READ*/WRITE* → host MMU) can. Reading Exceptions from PowerPCState
+// after the if/else and gating the commit matches the oracle exactly for both
+// arms (a no-op on the fast arm, an architectural suppression on a faulting
+// slow arm). Consumes nothing from the stack; leaves one i32.
+// ---------------------------------------------------------------------------
+static void emit_no_dsi_guard(WasmModuleBuilder& wb, LoadStoreParams params) {
+    wb.op_i32_const((s32)params.ctx_ptr);
+    wb.op_i32_load(ppc_off::EXCEPTIONS);
+    wb.op_i32_const((s32)ppc_off::EXCEPTION_DSI);
+    wb.op_i32_and();
+    wb.op_i32_eqz();   // (Exceptions & EXCEPTION_DSI) == 0  ->  commit
+}
+
+// ---------------------------------------------------------------------------
 // emit_fastmem_guard — push i32 (1 = fastmem hit, 0 = miss) onto stack.
 //
 // `access_bytes` is the size of the upcoming load/store (1/2/4) so the
@@ -123,19 +145,23 @@ static void emit_fastmem_guard(WasmModuleBuilder& wb, LoadStoreParams params,
     // (EA & 0xFE000000), which groups 0x80/0x81 (and 0xC0/0xC1) to one selector;
     // 0xCC* MMIO masks to 0xCC000000, matches none, and correctly stays on the
     // import (no aliasing). The bound check below still confines to ram_size.
+    // [fastmem-classify-1op 2026-07-14] The 3-mirror admit {0x00,0x80,0xC0}
+    // (mask 0xFE000000 + eqz + two eq-compares OR'd, ~13 ops) is EQUIVALENT, for
+    // every address a GameCube title actually issues, to the single test
+    // (EA & 0x3E000000) == 0:
+    //   0x00/0x01 phys, 0x80/0x81 cached, 0xC0/0xC1 uncached -> &0x3E000000 == 0 (admit)
+    //   0xCC MMIO (->0x0C), 0xC8 EFB (->0x08), 0xE0 locked-cache (->0x20) -> !=0 (reject->import)
+    // The only EAs this admits that the 3-compare rejected are 0x40/0x41 and the
+    // physical mirror above 24MB — regions no GC game accesses; and the
+    // (EA & mem1_mask) in emit_fastmem_store confines any admitted EA to the 32MB
+    // window regardless, so there is no new aliasing for real addresses. Cuts ~9
+    // wasm ops off EVERY load/store — the per-op fastmem gap vs the oracle JIT the
+    // header (line ~175) flags. Validated by boot byte-identity + render probe
+    // (region classify is NOT conformance-covered).
     wb.op_local_get(LOCAL_TMP_EA);
-    wb.op_i32_const((s32)0xFE000000u);
+    wb.op_i32_const((s32)0x3E000000u);
     wb.op_i32_and();
-    wb.op_local_tee(LOCAL_TMP_VAL);          // region selector (LOCAL_TMP_VAL dead until byteswap, in the fast-arm body)
-    wb.op_i32_eqz();                         // == 0x00000000 (physical mirror)
-    wb.op_local_get(LOCAL_TMP_VAL);
-    wb.op_i32_const((s32)0x80000000u);
-    wb.op_i32_eq();                          // == cached RAM
-    wb.op_i32_or();
-    wb.op_local_get(LOCAL_TMP_VAL);
-    wb.op_i32_const((s32)0xC0000000u);
-    wb.op_i32_eq();                          // == uncached RAM
-    wb.op_i32_or();
+    wb.op_i32_eqz();
 #else
     // (EA & 0x1F000000) == 0  — legacy guard (16 MB only; rejects 0x817xxxxx).
     wb.op_local_get(LOCAL_TMP_EA);
@@ -143,17 +169,23 @@ static void emit_fastmem_guard(WasmModuleBuilder& wb, LoadStoreParams params,
     wb.op_i32_and();
     wb.op_i32_eqz();
 #endif
-    // (EA & mem1_mask) <= ram_size - access_bytes — the masked EA plus the
-    // access width must fit within ram_size. Use lt_u with bound = ram_size
-    // - (access_bytes - 1) which is the smallest EA that would write past
-    // the end. For 4-byte access, bound = ram_size - 3.
-    wb.op_local_get(LOCAL_TMP_EA);
-    wb.op_i32_const((s32)params.mem1_mask);
-    wb.op_i32_and();
-    wb.op_i32_const((s32)(params.ram_size - (access_bytes - 1)));
-    wb.op_i32_lt_u();
-    // AND
-    wb.op_i32_and();
+    // [fastmem-narrow 2026-07-13 oracle-match] Bounds check ELIDED when mem1_mask == ram_size-1
+    // (ALWAYS true for a real config: Memmap.cpp m_ram_size = NextPowerOf2(real) = 32MB,
+    // m_ram_mask = ram_size-1 = 0x01FFFFFF). Then (EA & mask) is unconditionally in [0, ram_size),
+    // so base+(EA&mask) is always inside the 32MB allocation — the region classify above already
+    // rejected MMIO (the only aliasing risk). The lone exception is a multi-byte access straddling
+    // the very TOP of the 32MB mirror (0x81FFFFFD+, padding no game touches; the wasm engine still
+    // bounds-checks the whole linear memory, and Dolphin's fastmem does no per-access bound
+    // either). This removes ~6 ops from EVERY memory access — the biggest per-op gap vs the oracle
+    // JIT (Dolphin fastmem = raw access + SIGSEGV backpatch, zero guard). Kept for odd configs.
+    if (params.mem1_mask != params.ram_size - 1u) {
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_i32_const((s32)params.mem1_mask);
+        wb.op_i32_and();
+        wb.op_i32_const((s32)(params.ram_size - (access_bytes - 1)));
+        wb.op_i32_lt_u();
+        wb.op_i32_and();
+    }
 }
 
 static u32 load_width_bytes(LoadWidth w) {
@@ -181,25 +213,22 @@ static u32 store_width_bytes(StoreWidth w) {
 // fastmem store we byte-swap.
 // ---------------------------------------------------------------------------
 static void emit_bswap_i32(WasmModuleBuilder& wb) {
-    // Pattern: ((x << 8) & 0xFF00FF00) | ((x >>> 8) & 0x00FF00FF), then
-    // (y << 16) | (y >>> 16). Two stages, each saved through LOCAL_TMP_VAL.
+    // [bswap-rotate 2026-07-14] bswap32(x) = (rotr(x,8) & 0xFF00FF00) | (rotl(x,8) & 0x00FF00FF).
+    // 11 ops vs the prior 18-op two-stage shl/shr/or form — fires on EVERY 32-bit fastmem
+    // load and store, so a load+store pair drops ~36->22 emitted ops. Verified bit-exact
+    // (0/500000 mismatches vs true bswap; workflow wf_d90f8071 adversarial verify): e.g.
+    // x=0x11223344 -> rotr8=0x44112233 &0xFF00FF00=0x44002200 ; rotl8=0x22334411 &0x00FF00FF=
+    // 0x00330011 ; OR=0x44332211. Pure ALU equivalence; conformance-covered (test_diff_next).
     wb.op_local_tee(LOCAL_TMP_VAL);
     wb.op_i32_const(8);
-    wb.op_i32_shl();
+    wb.op_i32_rotr();
     wb.op_i32_const((s32)0xFF00FF00u);
     wb.op_i32_and();
     wb.op_local_get(LOCAL_TMP_VAL);
     wb.op_i32_const(8);
-    wb.op_i32_shr_u();
+    wb.op_i32_rotl();
     wb.op_i32_const(0x00FF00FF);
     wb.op_i32_and();
-    wb.op_i32_or();
-    wb.op_local_tee(LOCAL_TMP_VAL);
-    wb.op_i32_const(16);
-    wb.op_i32_shl();
-    wb.op_local_get(LOCAL_TMP_VAL);
-    wb.op_i32_const(16);
-    wb.op_i32_shr_u();
     wb.op_i32_or();
 }
 
@@ -210,6 +239,8 @@ static void emit_bswap_i16(WasmModuleBuilder& wb) {
     wb.op_local_get(LOCAL_TMP_VAL);
     wb.op_i32_const(8);
     wb.op_i32_shr_u();
+    wb.op_i32_const(0xFF);
+    wb.op_i32_and();
     wb.op_i32_or();
     wb.op_i32_const(0xFFFF);
     wb.op_i32_and();
@@ -334,7 +365,16 @@ static void emit_load_common(WasmModuleBuilder& wb, RegCache& rc,
     // returning to PC=0 (caller-saved r31 = 0 after function return).
     emit_fastmem_guard(wb, params, load_width_bytes(width));
     rc.Flush(params.ctx_ptr);  // stack-neutral — guard stays on top
-    frc.Flush(params.ctx_ptr);
+    // [flush-narrow 2026-07-13] NO frc.Flush here. This is the INTEGER load path
+    // (rt is a GPR); the slow arm's host handler (MMU/MMIO — dolphin_read*) reads
+    // guest gpr[] (e.g. ExpansionInterface gpr[3..5]) but NEVER ps[]/FPRs, and
+    // every exception-delivery / HLE / block-exit point re-flushes FPRs itself
+    // (emit_fallback ppc_emit.cpp:215-216, FP-unavail :800-801, epilogue). The old
+    // unconditional frc.Flush ran EmitPromoteToDouble on every live Single FPR
+    // before every integer load — promote/demote thrash in FP-interleaved loops
+    // (PSMTXROMultVecArray, THP). Removing it is coherence-neutral for the integer
+    // path. (rc.Flush for GPRs STAYS — host handlers do read gpr, and the
+    // flush-before-Bind(rt,Write) ordering below still requires it.)
 
     // Bind RT now (post-flush). Marks rt dirty so its end-of-block flush
     // writes the loaded value back to memory.
@@ -344,14 +384,18 @@ static void emit_load_common(WasmModuleBuilder& wb, RegCache& rc,
     wb.op_if(BLOCK_TYPE_VOID);
 
     // ---- fast path ----
+    // [C6 2026-07-12 oracle-audit] Park the loaded value in LOCAL_TMP_FPVAL
+    // (free for integer loads — only psq/scalar-FP use slot 98) instead of
+    // committing to rt_local here; the RT commit is gated on !DSI below to
+    // match Interpreter_LoadStore.cpp lbz:46 / lbzu:56-60.
     emit_fastmem_load_value(wb, params, width);
-    wb.op_local_set(rt_local);
+    wb.op_local_set(LOCAL_TMP_FPVAL);
 
     wb.op_else();
 
     // ---- slow path ----
     emit_slowmem_load_value(wb, width);
-    wb.op_local_set(rt_local);
+    wb.op_local_set(LOCAL_TMP_FPVAL);
 
     wb.op_end();
 
@@ -359,11 +403,27 @@ static void emit_load_common(WasmModuleBuilder& wb, RegCache& rc,
     // need to do it manually since we marked rt dirty via Bind(Write) and
     // both arms wrote through to the same local.
 
-    if (update && ra != 0) {
-        auto rc_ra = rc.Bind(ra, RCMode::Write);
-        wb.op_local_get(LOCAL_TMP_EA);
-        wb.op_local_set(rc_ra.local_idx());
+    // [C6 2026-07-12 oracle-audit] Gate the RT (and update-form RA) commit on
+    // !(Exceptions & EXCEPTION_DSI). Oracle: lbz/lhz/lwz commit RT only inside
+    // the guard (Interpreter_LoadStore.cpp:46 etc.); the *u forms commit both
+    // RT and RA inside one guard (:56-60). Bind RA for Write BEFORE the guard
+    // so its cache local exists on both paths; the writeback op is inside.
+    RCWasmLocal rc_ra;
+    u32 ra_local = 0;
+    const bool do_ra = update && ra != 0;
+    if (do_ra) {
+        rc_ra = rc.Bind(ra, RCMode::Write);
+        ra_local = rc_ra.local_idx();
     }
+    emit_no_dsi_guard(wb, params);
+    wb.op_if(BLOCK_TYPE_VOID);
+    wb.op_local_get(LOCAL_TMP_FPVAL);
+    wb.op_local_set(rt_local);
+    if (do_ra) {
+        wb.op_local_get(LOCAL_TMP_EA);
+        wb.op_local_set(ra_local);
+    }
+    wb.op_end();
 }
 
 static void emit_store_common(WasmModuleBuilder& wb, RegCache& rc,
@@ -376,7 +436,11 @@ static void emit_store_common(WasmModuleBuilder& wb, RegCache& rc,
 
     emit_fastmem_guard(wb, params, store_width_bytes(width));
     rc.Flush(params.ctx_ptr);
-    frc.Flush(params.ctx_ptr);
+    // [flush-narrow 2026-07-13] NO frc.Flush — INTEGER store path (rs is a GPR).
+    // The slow arm's host WRITE handler (dolphin_write*: MMU / GPFifo / DSP mailbox
+    // / EXI) reads the value from gpr and inspects gpr[], never ps[]/FPRs; FPRs are
+    // re-flushed at every exception/HLE/exit point. Removes per-store Single-FPR
+    // promote thrash in FP-interleaved code. rc.Flush (GPRs) stays. See emit_load_common.
     wb.op_if(BLOCK_TYPE_VOID);
 
     emit_fastmem_store(wb, params, width, rs_local);
@@ -387,19 +451,20 @@ static void emit_store_common(WasmModuleBuilder& wb, RegCache& rc,
 
     wb.op_end();
 
-    // TODO(audit 2026-06-01): update-form stores (opcd 37/39/41/43/45 — Rc/L
-    // low-bit set) should suppress the RA writeback if the slow path raised
-    // EXCEPTION_DSI. PowerPC architecture spec: update-form ops must NOT
-    // commit RA on a DSI/Alignment/data-page-fault. Currently the writeback
-    // is unconditional, which can desynchronize RA from the architectural
-    // state on a faulting store. Cleanly emitting the guard requires a
-    // ppc_off::Exceptions and EXCEPTION_DSI constant; neither is in
-    // ppc_offsets.h today (only PC/NPC/GPR/CR/MSR/FPSCR/XER/SPR are
-    // defined). Skipped per the audit instructions' PARTIAL fallback path.
+    // [C6 2026-07-12 oracle-audit] Update-form stores (stbu/sthu/stwu, opcd
+    // 39/45/37) commit RA <- EA only when the store did not raise DSI. Oracle:
+    // Interpreter_LoadStore.cpp stbu:457-460 (`if (!(Exceptions & EXCEPTION_DSI))
+    // gpr[RA] = address`). Previously unconditional (TODO 2026-06-01) — now the
+    // ppc_off::EXCEPTION_DSI constant exists so the guard is emitted. The fast
+    // arm cannot fault, so this is a no-op there; on a faulting slow arm it
+    // suppresses the RA desync.
     if (update && ra != 0) {
         auto rc_ra = rc.Bind(ra, RCMode::Write);
+        emit_no_dsi_guard(wb, params);
+        wb.op_if(BLOCK_TYPE_VOID);
         wb.op_local_get(LOCAL_TMP_EA);
         wb.op_local_set(rc_ra.local_idx());
+        wb.op_end();
     }
 }
 
@@ -511,12 +576,28 @@ void emit_load_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
             wb.op_i32_const(16);
             wb.op_i32_shr_s();
         }
-        wb.op_local_set(rc_rt.local_idx());
-        if (update && ra != 0) {
-            auto rc_ra = rc.Bind(ra, RCMode::Write);
-            wb.op_i32_const((s32)op.const_ea);
-            wb.op_local_set(rc_ra.local_idx());
+        // [C6 2026-07-12 oracle-audit] Park the read value and gate the RT (and
+        // update-form RA) commit on !(Exceptions & EXCEPTION_DSI). This MMIO
+        // path always uses the host import, which can raise DSI on an
+        // unmapped/faulting register access — oracle lbz:46 / lbzu:56-60.
+        wb.op_local_set(LOCAL_TMP_FPVAL);
+        const u32 rt_local = rc_rt.local_idx();
+        RCWasmLocal rc_ra;
+        u32 ra_local = 0;
+        const bool do_ra = update && ra != 0;
+        if (do_ra) {
+            rc_ra = rc.Bind(ra, RCMode::Write);
+            ra_local = rc_ra.local_idx();
         }
+        emit_no_dsi_guard(wb, params);
+        wb.op_if(BLOCK_TYPE_VOID);
+        wb.op_local_get(LOCAL_TMP_FPVAL);
+        wb.op_local_set(rt_local);
+        if (do_ra) {
+            wb.op_i32_const((s32)op.const_ea);
+            wb.op_local_set(ra_local);
+        }
+        wb.op_end();
         return;
     }
 
@@ -540,10 +621,15 @@ void emit_store_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         auto rc_rs = rc.Bind(rs, RCMode::Read);
         emit_const_mmio_store(wb, rc, frc, params, op.const_ea, width,
                               rc_rs.local_idx());
+        // [C6 2026-07-12 oracle-audit] Update-form RA commit gated on !DSI
+        // (oracle stbu:457-460). The MMIO host write can raise DSI.
         if (update && ra != 0) {
             auto rc_ra = rc.Bind(ra, RCMode::Write);
+            emit_no_dsi_guard(wb, params);
+            wb.op_if(BLOCK_TYPE_VOID);
             wb.op_i32_const((s32)op.const_ea);
             wb.op_local_set(rc_ra.local_idx());
+            wb.op_end();
         }
         return;
     }
@@ -615,10 +701,18 @@ static void emit_fastmem_lfs_body(WasmModuleBuilder& wb, LoadStoreParams params,
         wb.op_call(WIMPORT_READ32);                            // slow: host MMU read
         wb.op_local_set(LOCAL_TMP_FPVAL);
     wb.op_end();
-    wb.op_local_get(LOCAL_TMP_FPVAL);
-    wb.op_f32_reinterpret_i32();
-    wb.op_f64_promote_f32();
-    wb.op_i64_reinterpret_f64();
+    // [C9 2026-07-12 oracle-audit] lfs/lfsu/lfsx widen the loaded f32 with the
+    // PEM ConvertToDouble (Interpreter_LoadStore.cpp:152 -> Interpreter_FPUtils.h
+    // :579-613), an exact integer bit-splice that PRESERVES the 23-bit NaN
+    // payload + SNaN quiet bit. The old tail (f32_reinterpret_i32; f64.promote_f32;
+    // i64_reinterpret_f64) let the wasm engine canonicalize NaN payloads
+    // (spec-permitted) — e.g. 0x7FC00001 became 0x7FF8000000000000 instead of
+    // the oracle's 0x7FF8000020000000. Reuse emit_psq_convert_to_double, which
+    // reads LOCAL_PSQ_T0 (== LOCAL_TMP_FPVAL, slot 98) and does promote for
+    // normal/zero/subnormal/inf + integer splice for exp==255. Verified equal
+    // to ConvertToDouble over 500017 cases (all NaN/inf/subnormal/tie edges).
+    static_assert(LOCAL_TMP_FPVAL == 98, "emit_psq_convert_to_double reads slot 98");
+    emit_psq_convert_to_double(wb);   // reads slot 98, pushes ConvertToDouble(bits)
     wb.op_local_tee(ps0_idx);
     wb.op_local_set(ps1_idx);
 }
@@ -1136,7 +1230,13 @@ void emit_psq_l(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     rc.Flush(params.ctx_ptr);
     frc.Flush(params.ctx_ptr);
 
-    auto rt_pair = frc.Bind(rt, FPRMode::Write, FPR_LANE_BOTH);
+    // [psq raw-f32 2026-07-13] Each arm below leaves the EXACT f32 BIT pattern it previously fed
+    // to emit_psq_convert_to_double in LOCAL_PSQ_T0 (ps0 lane) / LOCAL_PSQ_T1 (ps1 lane); the
+    // Single v128 is built ONCE at the end via f32.reinterpret_i32 — NO f64 promote/demote
+    // round-trip (the residual cost prior analysis named for the FP-heavy paired-single paths).
+    // Bit-identical to the old path for all finite values; NaN payloads are now PRESERVED rather
+    // than canonicalized by the old f32.demote_f64 in Phase 3 — strictly closer to the ILSP
+    // oracle (which loads the raw f32). No i64 rt bind; frc.BindSingleWrite at the end.
 
     // gqr -> LOCAL_TMP_VAL (ld_type bits 16-18, ld_scale 24-29)
     wb.op_i32_const((s32)params.ctx_ptr);
@@ -1151,60 +1251,45 @@ void emit_psq_l(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     wb.op_i32_eqz();
     wb.op_if(BLOCK_TYPE_VOID);
     {
-        // FLOAT: raw f32 patterns, no scale (ILSP:233-246).
-        // [perf] fastmem-guarded — RAM f32 reads skip the dolphin_read32
-        // wasm->JS crossing; MMIO/WGPIPE rejected by the region classifier ->
-        // slow import arm. Loaded u32 lands in LOCAL_PSQ_T0 (the value scratch
-        // emit_psq_convert_to_double reads); the pair fast arm parks the host
-        // base in LOCAL_PSQ_T1 (free in the FLOAT path) and i32.load's at +0/+4.
+        // FLOAT: raw f32 patterns, no scale (ILSP:233-246). fastmem-guarded.
         if (W) {
             emit_fastmem_guard(wb, params, 4);
             wb.op_if(BLOCK_TYPE_VOID);
                 emit_fastmem_load_value(wb, params, LoadWidth::U32);
-                wb.op_local_set(LOCAL_PSQ_T0);
+                wb.op_local_set(LOCAL_PSQ_T0);      // ps0 f32 bits
             wb.op_else();
                 wb.op_local_get(LOCAL_TMP_EA);
                 wb.op_call(WIMPORT_READ32);
                 wb.op_local_set(LOCAL_PSQ_T0);
             wb.op_end();
-            emit_psq_convert_to_double(wb);
-            wb.op_local_set(rt_pair.ps0_idx);
-            wb.op_i64_const(0x3FF0000000000000ll);  // ps1 = 1.0 (ILSP:238)
-            wb.op_local_set(rt_pair.ps1_idx);
+            wb.op_i32_const((s32)0x3F800000);       // ps1 = 1.0f bits (ILSP:238)
+            wb.op_local_set(LOCAL_PSQ_T1);
         } else {
             emit_fastmem_guard(wb, params, 8);
             wb.op_if(BLOCK_TYPE_VOID);
+                // host base -> T1; lane0 bits -> T0; lane1 bits -> T1 (base free after).
                 wb.op_local_get(LOCAL_TMP_EA);
                 wb.op_i32_const((s32)params.mem1_mask);
                 wb.op_i32_and();
                 wb.op_i32_const((s32)params.mem1_base);
                 wb.op_i32_add();
-                wb.op_local_set(LOCAL_PSQ_T1);          // host base addr
-                wb.op_local_get(LOCAL_PSQ_T1);
+                wb.op_local_tee(LOCAL_PSQ_T1);          // host base addr
                 wb.op_i32_load(0);
                 emit_bswap_i32(wb);
-                wb.op_local_set(LOCAL_PSQ_T0);
-                emit_psq_convert_to_double(wb);
-                wb.op_local_set(rt_pair.ps0_idx);
+                wb.op_local_set(LOCAL_PSQ_T0);          // ps0 f32 bits
                 wb.op_local_get(LOCAL_PSQ_T1);
                 wb.op_i32_load(4);
                 emit_bswap_i32(wb);
-                wb.op_local_set(LOCAL_PSQ_T0);
-                emit_psq_convert_to_double(wb);
-                wb.op_local_set(rt_pair.ps1_idx);
+                wb.op_local_set(LOCAL_PSQ_T1);          // ps1 f32 bits (base overwritten)
             wb.op_else();
                 wb.op_local_get(LOCAL_TMP_EA);
                 wb.op_call(WIMPORT_READ32);
-                wb.op_local_set(LOCAL_PSQ_T0);
-                emit_psq_convert_to_double(wb);
-                wb.op_local_set(rt_pair.ps0_idx);
+                wb.op_local_set(LOCAL_PSQ_T0);          // ps0 f32 bits
                 wb.op_local_get(LOCAL_TMP_EA);
                 wb.op_i32_const(4);
                 wb.op_i32_add();
                 wb.op_call(WIMPORT_READ32);
-                wb.op_local_set(LOCAL_PSQ_T0);
-                emit_psq_convert_to_double(wb);
-                wb.op_local_set(rt_pair.ps1_idx);
+                wb.op_local_set(LOCAL_PSQ_T1);          // ps1 f32 bits
             wb.op_end();
         }
     }
@@ -1267,7 +1352,6 @@ void emit_psq_l(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
             wb.op_end();
 
             const u32 lanes[2] = { LOCAL_PSQ_T0, LOCAL_PSQ_T1 };
-            const u32 dests[2] = { rt_pair.ps0_idx, rt_pair.ps1_idx };
             const u32 nlanes = W ? 1u : 2u;
             for (u32 ln = 0; ln < nlanes; ++ln) {
                 // signed? sign-extend the element in place (shl/shr_s pair)
@@ -1316,32 +1400,71 @@ void emit_psq_l(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                 wb.op_i32_and();
                 emit_psq_factor_from_scale(wb, /*quantize=*/false);
                 wb.op_f32_mul();
-                wb.op_f64_promote_f32();
-                wb.op_i64_reinterpret_f64();
-                wb.op_local_set(dests[ln]);
+                wb.op_i32_reinterpret_f32();            // f32 bits (no f64 round-trip)
+                wb.op_local_set(lanes[ln]);
             }
             if (W) {
-                wb.op_i64_const(0x3FF0000000000000ll);  // ps1 = 1.0
-                wb.op_local_set(rt_pair.ps1_idx);
+                wb.op_i32_const((s32)0x3F800000);       // ps1 = 1.0f bits
+                wb.op_local_set(LOCAL_PSQ_T1);
             }
         }
         wb.op_else();
         {
-            // INVALID1/2/3: ps0 = ps1 = 0.0, NO memory access (ILSP:264-270)
-            wb.op_i64_const(0);
-            wb.op_local_set(rt_pair.ps0_idx);
-            wb.op_i64_const(0);
-            wb.op_local_set(rt_pair.ps1_idx);
+            // INVALID1/2/3: ps0 = ps1 = 0.0f, NO memory access (ILSP:264-270)
+            wb.op_i32_const(0);
+            wb.op_local_set(LOCAL_PSQ_T0);
+            wb.op_i32_const(0);
+            wb.op_local_set(LOCAL_PSQ_T1);
         }
         wb.op_end();
     }
     wb.op_end();
+
+    // [psq raw-f32 2026-07-13] Build the Single v128 [ps0,ps1,ps0,ps0] from the lane f32 BITS in
+    // T0/T1 — one splat + one replace_lane, zero f64 promote/demote. rt is tagged Single so the
+    // jit_paired ps_add/sub/mul/FMA consumers (movie IDCT __THPDecompressiMCURowNxN, matrix code)
+    // take the wasm-SIMD f32x2 fast path. Memory reconciliation at flush goes through
+    // EmitPromoteToDouble (NaN-payload-exact), so ps[] stores are bit-identical to the old i64
+    // path for finite values and PRESERVE NaN payloads (the old Phase-3 f32.demote_f64
+    // canonicalized them — the conformance gate confirms the corpus is unaffected).
+    {
+        auto rt_s = frc.BindSingleWrite(rt);
+        wb.op_local_get(LOCAL_PSQ_T0);
+        wb.op_f32_reinterpret_i32();
+        wb.op_f32x4_splat();                 // v128 [ps0,ps0,ps0,ps0]
+        wb.op_local_get(LOCAL_PSQ_T1);
+        wb.op_f32_reinterpret_i32();
+        wb.op_f32x4_replace_lane(1);         // v128 [ps0,ps1,ps0,ps0]
+        wb.op_local_set(rt_s.v128_idx);
+    }
 
     if (update && ra != 0) {
         auto rc_ra = rc.Bind(ra, RCMode::Write);
         wb.op_local_get(LOCAL_TMP_EA);
         wb.op_local_set(rc_ra.local_idx());
     }
+}
+
+// [psq_st raw-f32 2026-07-14] FTZ a raw f32 (bits in `bits_local`, i32) to the stored single bits.
+// When rs is Single-repr, its v128 lane IS the single value, and ConvertToSingleFTZ(promote(f32))
+// reduces to a pure f32-domain flush: subnormal (exp field == 0 AND mantissa != 0) -> signed zero,
+// else keep the f32 bits. This replaces the Bind-promote (~27 ops) + emit_convert_to_single_ftz
+// (~35 ops, reads the i64/f64 form) with ~11 ops on the already-single f32. Pushes the i32 result.
+static void emit_ftz_f32_bits(WasmModuleBuilder& wb, u32 bits_local) {
+    wb.op_local_get(bits_local);                         // keep-value (not subnormal)
+    wb.op_local_get(bits_local);
+    wb.op_i32_const((s32)0x80000000u);
+    wb.op_i32_and();                                     // flush-value (sign only)
+    // cond nonzero => pick keep-value: keep = (exp field != 0) | (mantissa == 0)
+    wb.op_local_get(bits_local);
+    wb.op_i32_const(0x7F800000);
+    wb.op_i32_and();                                     // exp field (nonzero if exp!=0)
+    wb.op_local_get(bits_local);
+    wb.op_i32_const(0x007FFFFF);
+    wb.op_i32_and();
+    wb.op_i32_eqz();                                     // mantissa == 0
+    wb.op_i32_or();                                      // (exp!=0) | (mant==0) = keep
+    wb.op_select();
 }
 
 void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
@@ -1354,9 +1477,44 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     const u32 simm12 = (u32)(((s32)(inst << 20)) >> 20);
 
     emit_ea_d_form(wb, rc, ra, simm12);
-    auto rs_pair = frc.Bind(rs, FPRMode::Read, W ? FPR_LANE_PS0 : FPR_LANE_BOTH);
+    // [psq_st raw-f32 2026-07-14] If rs is Single-repr, bind it as the v128 (BindSingleRead) and
+    // read the store value straight from the f32 lanes — skip the Bind promote to Double + the
+    // f64->single ConvertToSingleFTZ round-trip. NO frc.Flush (same as emit_store_common's
+    // flush-narrow: the host WRITE handler reads gpr[] never ps[], and a frc.Flush here would
+    // promote a still-Single rs back to Double, defeating this). rc.Flush (GPRs) stays.
+    const bool rs_single = frc.IsSingle(rs);
+    RCFprPair rs_pair{};
+    u32 rs_v128 = 0;
+    if (rs_single)
+        rs_v128 = frc.BindSingleRead(rs).v128_idx;
+    else
+        rs_pair = frc.Bind(rs, FPRMode::Read, W ? FPR_LANE_PS0 : FPR_LANE_BOTH);
     rc.Flush(params.ctx_ptr);
-    frc.Flush(params.ctx_ptr);
+
+    // Push the FTZ'd single store-bits (i32) for lane `lane` (rs_pair.psN_idx is the Double-form
+    // i64 local, used only in the !rs_single path).
+    auto emit_store_bits = [&](u32 ps_i64_local, u32 lane) {
+        if (rs_single) {
+            wb.op_local_get(rs_v128);
+            wb.op_f32x4_extract_lane((u8)lane);
+            wb.op_i32_reinterpret_f32();
+            wb.op_local_set(LOCAL_PSQ_T0);              // i32 scratch (free in the FLOAT arm)
+            emit_ftz_f32_bits(wb, LOCAL_PSQ_T0);
+        } else {
+            emit_convert_to_single_ftz(wb, ps_i64_local);
+        }
+    };
+    // Push the lane's f32 value (for the quantized scale/clamp math).
+    auto emit_lane_f32 = [&](u32 ps_i64_local, u32 lane) {
+        if (rs_single) {
+            wb.op_local_get(rs_v128);
+            wb.op_f32x4_extract_lane((u8)lane);
+        } else {
+            wb.op_local_get(ps_i64_local);
+            wb.op_f64_reinterpret_i64();
+            wb.op_f32_demote_f64();
+        }
+    };
 
     // gqr -> LOCAL_TMP_VAL (st_type bits 0-2, st_scale 8-13)
     wb.op_i32_const((s32)params.ctx_ptr);
@@ -1383,12 +1541,12 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                 wb.op_i32_and();
                 wb.op_i32_const((s32)params.mem1_base);
                 wb.op_i32_add();
-                emit_convert_to_single_ftz(wb, rs_pair.ps0_idx);
+                emit_store_bits(rs_pair.ps0_idx, 0);
                 emit_bswap_i32(wb);
                 wb.op_i32_store(0);
             wb.op_else();
                 wb.op_local_get(LOCAL_TMP_EA);
-                emit_convert_to_single_ftz(wb, rs_pair.ps0_idx);
+                emit_store_bits(rs_pair.ps0_idx, 0);
                 wb.op_call(WIMPORT_WRITE32);
             wb.op_end();
         } else {
@@ -1401,21 +1559,21 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                 wb.op_i32_add();
                 wb.op_local_set(LOCAL_PSQ_T1);          // host base addr
                 wb.op_local_get(LOCAL_PSQ_T1);
-                emit_convert_to_single_ftz(wb, rs_pair.ps0_idx);
+                emit_store_bits(rs_pair.ps0_idx, 0);
                 emit_bswap_i32(wb);
                 wb.op_i32_store(0);
                 wb.op_local_get(LOCAL_PSQ_T1);
-                emit_convert_to_single_ftz(wb, rs_pair.ps1_idx);
+                emit_store_bits(rs_pair.ps1_idx, 1);
                 emit_bswap_i32(wb);
                 wb.op_i32_store(4);
             wb.op_else();
                 wb.op_local_get(LOCAL_TMP_EA);
-                emit_convert_to_single_ftz(wb, rs_pair.ps0_idx);
+                emit_store_bits(rs_pair.ps0_idx, 0);
                 wb.op_call(WIMPORT_WRITE32);
                 wb.op_local_get(LOCAL_TMP_EA);
                 wb.op_i32_const(4);
                 wb.op_i32_add();
-                emit_convert_to_single_ftz(wb, rs_pair.ps1_idx);
+                emit_store_bits(rs_pair.ps1_idx, 1);
                 wb.op_call(WIMPORT_WRITE32);
             wb.op_end();
         }
@@ -1433,9 +1591,7 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
             const u32 outs[2] = { LOCAL_PSQ_T0, LOCAL_PSQ_T1 };
             const u32 nlanes = W ? 1u : 2u;
             for (u32 ln = 0; ln < nlanes; ++ln) {
-                wb.op_local_get(srcs[ln]);
-                wb.op_f64_reinterpret_i64();
-                wb.op_f32_demote_f64();
+                emit_lane_f32(srcs[ln], ln);            // [psq_st raw-f32] f32 lane (Single) or f64->f32 demote (Double)
                 wb.op_local_get(LOCAL_TMP_VAL);
                 wb.op_i32_const(8);
                 wb.op_i32_shr_u();

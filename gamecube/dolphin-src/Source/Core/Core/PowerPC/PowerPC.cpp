@@ -20,6 +20,10 @@
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/HW/CPU.h"
+#include "Core/HW/Memmap.h"  // [os-ready gate] GetRAM for the MEM[0xC0] check
+#include "Core/HW/ProcessorInterface.h"
+
+extern "C" u32 g_in_cmd10;  // worker-requested delivery in progress; defined in dolphin_jit_wimports.cpp
 #include "Core/HW/SystemTimers.h"
 #include "Core/Host.h"
 #include "Core/PowerPC/CPUCoreBase.h"
@@ -60,7 +64,12 @@ static void InvalidateCacheThreadSafe(Core::System& system, u64 userdata, s64 cy
 }
 
 PowerPCManager::PowerPCManager(Core::System& system)
-    : m_breakpoints(system), m_memchecks(system), m_debug_interface(system, m_symbol_db),
+    :
+#if defined(__EMSCRIPTEN__)
+      // [ppc-state-collapse] bind m_ppc_state onto the shared SAB slice-state (see PowerPC.h).
+      m_ppc_state(*reinterpret_cast<PowerPCState*>(static_cast<uintptr_t>(0x02400000u))),
+#endif
+      m_breakpoints(system), m_memchecks(system), m_debug_interface(system, m_symbol_db),
       m_system(system)
 {
 }
@@ -479,6 +488,25 @@ void PowerPCManager::CheckExceptions()
 {
   u32 exceptions = m_ppc_state.Exceptions;
 
+#if defined(__EMSCRIPTEN__)
+  // [os-ready sync-hold REVERTED 2026-07-03: starved boot to retired=3058 (a held DSI
+  //  re-faults forever); and the orbit seed proved to be an rfi/branch entry, not a
+  //  delivery — see gc_executor_collapse_plan.md]
+
+  // [single-owner SYNC gate TRIED AND REVERTED 2026-07-09 — do not re-add as a bare
+  // defer] Gating sync arms on (owner==1 && !g_in_cmd10) REGRESSED: halt 2/6 (350/491
+  // hits), reconcileN stayed 1024-2304, ir1 persisted. Mechanism: sync exceptions
+  // raised inside SingleStepInner (mid-op DSI/ISI from the worker's cmd-9 interp) are
+  // load-bearing when delivered synchronously WITH the faulting op — defer-to-boundary
+  // lets the block's remaining emitted ops run on half-advanced state, then delivers a
+  // wrong resume image. Owner-coherence for sync delivery therefore needs delivery AT
+  // THE POINT OF RAISE under a changed emitted-code contract (block honors a
+  // "delivered" signal from the interp import), not an entry gate. The stale-cursor
+  // race is handled at the consumer instead: ppc_worker.js [deliv-reconcile]
+  // (halt 0/6, verified 2026-07-09).
+#endif
+
+
   // Example procedure:
   // Set SRR0 to either PC or NPC
   // SRR0 = NPC;
@@ -507,6 +535,14 @@ void PowerPCManager::CheckExceptions()
     SRR1(m_ppc_state) = (m_ppc_state.msr.Hex & 0x87C0FFFF) | (1 << 30);
     m_ppc_state.msr.LE = m_ppc_state.msr.ILE;
     m_ppc_state.msr.Hex &= ~0x04EF36;
+#ifdef __EMSCRIPTEN__
+  // [me-preserve 2026-07-07] real HW keeps ME set through interrupt delivery (GC never
+  // runs ME-less; msr=0 is fatal). The dolphin-executor intermittently drops ME
+  // pre-takeover (the documented ME-drop, powerpc-next msr-handling — separate audit);
+  // delivery from an 0x8032-class context then computed msr=0x0000 and wedged the
+  // post-takeover guest. Make the mutation robust: ME survives delivery uncondionally.
+  m_ppc_state.msr.Hex |= 0x1000;
+#endif
     m_ppc_state.pc = m_ppc_state.npc = 0x00000400;
 
     DEBUG_LOG_FMT(POWERPC, "EXCEPTION_ISI");
@@ -519,6 +555,14 @@ void PowerPCManager::CheckExceptions()
     SRR1(m_ppc_state) |= m_ppc_state.msr.Hex & 0x87C0FFFF;
     m_ppc_state.msr.LE = m_ppc_state.msr.ILE;
     m_ppc_state.msr.Hex &= ~0x04EF36;
+#ifdef __EMSCRIPTEN__
+  // [me-preserve 2026-07-07] real HW keeps ME set through interrupt delivery (GC never
+  // runs ME-less; msr=0 is fatal). The dolphin-executor intermittently drops ME
+  // pre-takeover (the documented ME-drop, powerpc-next msr-handling — separate audit);
+  // delivery from an 0x8032-class context then computed msr=0x0000 and wedged the
+  // post-takeover guest. Make the mutation robust: ME survives delivery uncondionally.
+  m_ppc_state.msr.Hex |= 0x1000;
+#endif
     m_ppc_state.pc = m_ppc_state.npc = 0x00000700;
 
     DEBUG_LOG_FMT(POWERPC, "EXCEPTION_PROGRAM");
@@ -530,6 +574,14 @@ void PowerPCManager::CheckExceptions()
     SRR1(m_ppc_state) = m_ppc_state.msr.Hex & 0x87C0FFFF;
     m_ppc_state.msr.LE = m_ppc_state.msr.ILE;
     m_ppc_state.msr.Hex &= ~0x04EF36;
+#ifdef __EMSCRIPTEN__
+  // [me-preserve 2026-07-07] real HW keeps ME set through interrupt delivery (GC never
+  // runs ME-less; msr=0 is fatal). The dolphin-executor intermittently drops ME
+  // pre-takeover (the documented ME-drop, powerpc-next msr-handling — separate audit);
+  // delivery from an 0x8032-class context then computed msr=0x0000 and wedged the
+  // post-takeover guest. Make the mutation robust: ME survives delivery uncondionally.
+  m_ppc_state.msr.Hex |= 0x1000;
+#endif
     m_ppc_state.pc = m_ppc_state.npc = 0x00000C00;
 
     DEBUG_LOG_FMT(POWERPC, "EXCEPTION_SYSCALL (PC={:08x})", m_ppc_state.pc);
@@ -542,6 +594,14 @@ void PowerPCManager::CheckExceptions()
     SRR1(m_ppc_state) = m_ppc_state.msr.Hex & 0x87C0FFFF;
     m_ppc_state.msr.LE = m_ppc_state.msr.ILE;
     m_ppc_state.msr.Hex &= ~0x04EF36;
+#ifdef __EMSCRIPTEN__
+  // [me-preserve 2026-07-07] real HW keeps ME set through interrupt delivery (GC never
+  // runs ME-less; msr=0 is fatal). The dolphin-executor intermittently drops ME
+  // pre-takeover (the documented ME-drop, powerpc-next msr-handling — separate audit);
+  // delivery from an 0x8032-class context then computed msr=0x0000 and wedged the
+  // post-takeover guest. Make the mutation robust: ME survives delivery uncondionally.
+  m_ppc_state.msr.Hex |= 0x1000;
+#endif
     m_ppc_state.pc = m_ppc_state.npc = 0x00000800;
 
     DEBUG_LOG_FMT(POWERPC, "EXCEPTION_FPU_UNAVAILABLE");
@@ -557,6 +617,14 @@ void PowerPCManager::CheckExceptions()
     SRR1(m_ppc_state) = m_ppc_state.msr.Hex & 0x87C0FFFF;
     m_ppc_state.msr.LE = m_ppc_state.msr.ILE;
     m_ppc_state.msr.Hex &= ~0x04EF36;
+#ifdef __EMSCRIPTEN__
+  // [me-preserve 2026-07-07] real HW keeps ME set through interrupt delivery (GC never
+  // runs ME-less; msr=0 is fatal). The dolphin-executor intermittently drops ME
+  // pre-takeover (the documented ME-drop, powerpc-next msr-handling — separate audit);
+  // delivery from an 0x8032-class context then computed msr=0x0000 and wedged the
+  // post-takeover guest. Make the mutation robust: ME survives delivery uncondionally.
+  m_ppc_state.msr.Hex |= 0x1000;
+#endif
     m_ppc_state.pc = m_ppc_state.npc = 0x00000300;
     // DSISR and DAR regs are changed in GenerateDSIException()
 
@@ -569,6 +637,14 @@ void PowerPCManager::CheckExceptions()
     SRR1(m_ppc_state) = m_ppc_state.msr.Hex & 0x87C0FFFF;
     m_ppc_state.msr.LE = m_ppc_state.msr.ILE;
     m_ppc_state.msr.Hex &= ~0x04EF36;
+#ifdef __EMSCRIPTEN__
+  // [me-preserve 2026-07-07] real HW keeps ME set through interrupt delivery (GC never
+  // runs ME-less; msr=0 is fatal). The dolphin-executor intermittently drops ME
+  // pre-takeover (the documented ME-drop, powerpc-next msr-handling — separate audit);
+  // delivery from an 0x8032-class context then computed msr=0x0000 and wedged the
+  // post-takeover guest. Make the mutation robust: ME survives delivery uncondionally.
+  m_ppc_state.msr.Hex |= 0x1000;
+#endif
     m_ppc_state.pc = m_ppc_state.npc = 0x00000600;
 
     // TODO crazy amount of DSISR options to check out
@@ -583,28 +659,156 @@ void PowerPCManager::CheckExceptions()
     return;
   }
 
+#ifdef __EMSCRIPTEN__
+  // [deliv-gen MONOTONIC 2026-07-09 — FUNCTIONAL] Bump the DELIVERY GENERATION at
+  // SAB 0x026B0970 on every vectored SYNC delivery. The worker's deliv-reconcile
+  // (ppc_worker.js) reads this monotonic head to adopt a dolphin-delivered redirect
+  // BEFORE dispatching; a stale/aliased generation left the redirect un-reconciled
+  // (the reconN=0 halt). Load-bearing dual-core coordination, not telemetry.
+  {
+    volatile u32* const hd = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B0970u));
+    *hd = *hd + 1u;
+  }
+#endif
   MSRUpdated();
 }
 
 void PowerPCManager::CheckExternalExceptions()
 {
+#ifdef __EMSCRIPTEN__
+  // [torn-send fix 2026-07-10 — PERMANENT] Never deliver while the worker has a WRITE cmd
+  // (5/6/7) posted-unserviced in the mailbox slot. The torn-send forensic proved the DSP-family
+  // wedge: a delivery lands during a store's round-trip window, samples ctx.PC = the store's own
+  // pre-op pc, and the rfi RE-EXECUTES the committed store (same-HI re-write at 0x800c733c) —
+  // the send never reaches its LO and the entry-guard poll wedges. Post-takeover is inherently
+  // safe (one mailbox slot: can't be mid-write AND mid-cmd-10); this closes the BOOT-ERA window
+  // where dolphin delivers autonomously while the worker's store awaits service. Bits stay
+  // pending — the next call (write serviced, pc advanced) delivers with a coherent resume pc.
+  {
+    volatile u32* const mbx = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x02000000u));
+    const u32 mcmd = mbx[0];
+    if (mbx[3] != 0u && mcmd >= 5u && mcmd <= 7u)
+      return;
+  }
+  // [slice-active gate 2026-07-10 — PERMANENT, generalizes the torn-send gate] Never deliver
+  // autonomously while the worker is MID-SLICE (SAB 0x026B1A00, set for the whole slice incl.
+  // time parked in mailbox round-trips). The write-cmd gate above only closed the in-slot
+  // window; ctx.PC LAGS at the last set_pc'd op (pre-op set_pc fires only for some op classes),
+  // so a delivery during a READ round-trip — or between round-trips — still samples a stale
+  // store pc and the rfi re-executes committed side-effecting stores from it (duplicate-LO
+  // into AX = the -8 imbalance; same class as HI-re-exec and candidate root for the EXI face).
+  // Invariant: an interrupted block resumes at the interrupted instruction or the interrupt
+  // defers to a boundary — never re-enter at a rewound pc. Deliveries reach the worker's guest
+  // only at true boundaries: the worker's own loop-top vectoring, cmd-10 (g_in_cmd10), or
+  // between slices (flag=0, pc committed coherent). Bits stay pending; no deadlock — this
+  // gates delivery, not the mailbox drain.
+  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A00u)) != 0u &&
+      g_in_cmd10 == 0u)
+  {
+    return;
+  }
+#endif
+#ifdef __EMSCRIPTEN__
+  // [os-ready gate 2026-07-03 — choke point] Hold ALL maskable delivery until MEM[0xC0]
+  // (OSCurrentContext, stored as a PHYSICAL MEM1 pointer, e.g. 0x001a5b38) is valid. The
+  // r1=0 orbit was seeded at gt=841 by a boot-era dispatch through the canonical stub with
+  // MEM[0xC0]=garbage (0x074d5045) -> OSDefaultExceptionHandler looped on a null stack
+  // forever (~470k mailbox calls/60s). dolphin_check_exc has the same gate, but boot-era
+  // callers (JitWasm.cpp:287 via the terminal else, CoreTiming Advance) bypass it — this is
+  // the single funnel every route shares.
+  {
+    const u8* ram0 = m_system.GetMemory().GetRAM();
+    u32 os_ctx = 0;
+    if (ram0)
+      os_ctx = (u32(ram0[0xC0]) << 24) | (u32(ram0[0xC1]) << 16) |
+               (u32(ram0[0xC2]) << 8) | u32(ram0[0xC3]);
+    if (os_ctx == 0u || os_ctx >= 0x01800000u)
+      return;  // OS context not installed: nothing maskable may vector.
+  }
+#endif
   u32 exceptions = m_ppc_state.Exceptions;
-
-  // [ax-ee] sampling stripped 2026-06-11 per gate #8 — 284K lines per 60s
-  // probe (the single largest console-traffic source).
 
   // EXTERNAL INTERRUPT
   // Handling is delayed until MSR.EE=1.
+#if defined(__EMSCRIPTEN__)
+  // [single-owner delivery 2026-07-03 — THE halt root] While the ppc-worker owns the CPU,
+  // ONLY the worker-requested cmd-10 route (g_in_cmd10, worker parked in Atomics.wait) may
+  // vector. Autonomous dolphin paths (JitWasm excursions -> CheckExceptions terminal-else)
+  // were delivering EXT into the worker's LIVE execution (ri-trace: caller=2 owner=1
+  // in_cmd10=0, srr0 inside OSDisable/RestoreInterrupts); when the collision landed in
+  // OSLoadContext's mtsrr1 tail, the worker clobbered the delivery's SRR1 to an RI=0 image,
+  // the vector stub branched to OSDefaultExceptionHandler by design (dolsdk OS.c stub:
+  // non-recoverable check), and the guest PPCHalted mid-boot. Bits stay pending; the worker
+  // delivers them at its next safe block boundary.
+  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u &&
+      g_in_cmd10 == 0u)
+  {
+    return;
+  }
+#endif
   if (exceptions && m_ppc_state.msr.EE)
   {
     if (exceptions & EXCEPTION_EXTERNAL_INT)
     {
+#if defined(__EMSCRIPTEN__)
+      // [npc-sync — root fix of the deterministic PC=0 ISI, common delivery point] Upstream keeps the
+      // do_timing invariant NPC=PC=DISPATCHER_PC, so at an external-interrupt boundary npc==pc and SRR0
+      // = the instruction about to execute. Our dual-core block-dispatch/chain path advances pc per
+      // block but leaves npc at an OLD value (observed npc=0x80010640, an old HuSprDisp epilogue, while
+      // pc=0x8000d9f8 in HuSprExec) on some delivery routes (JIT-emitted CheckExternalExceptionsFromJIT).
+      // SRR0=stale-npc then rfi's the guest into a dead frame -> blr 0. Enforce the boundary invariant
+      // here, the single site all routes funnel through, so SRR0 = the true interrupted pc.
+      if (m_ppc_state.npc != m_ppc_state.pc)
+        m_ppc_state.npc = m_ppc_state.pc;
+#endif
+#ifdef __EMSCRIPTEN__
+      // [ee-gate — PERMANENT, Step 2] No external interrupt vectors with the interrupted
+      // context at EE=0. PLACEMENT FIX 2026-07-07: the gate previously ran AFTER the
+      // SRR0/SRR1 writes — a REFUSAL still clobbered the live SPRs (destroying an
+      // in-flight ISR's resume image; its rfi then restored an EE=0 msr → the idle-spin
+      // EE=0 wedge). HW touches SRR0/SRR1 only when delivery COMMITS — gate FIRST.
+      if (!m_ppc_state.msr.EE)
+      {
+        return;
+      }
+      // [vector-page deliv gate 2026-07-09 — PERMANENT] Never deliver an external
+      // interrupt while the interrupted context is INSIDE an exception vector stub
+      // (pc < 0x4000). Native runs the stubs with EE=0 (masked), so it NEVER takes a
+      // nested async interrupt there; a delivery here saves SRR0 = the vector addr
+      // (0x500), and a later OSLoadContext rfi back into that bogus context resumes
+      // the stub under IR=1 → the 0x594 fetch-translation ISI → PPCHalt (symbolized
+      // 2026-07-09: OSLoadContext SRR0=0x500, msr=0x1030). Gate BEFORE the SRR0/SRR1
+      // writes (same placement rule as the ee-gate above — a refusal must not clobber
+      // the live SPRs). Bits stay pending; delivered once the guest leaves the stub
+      // (the stub's rfi restores an EE=1 non-vector context).
+      if (m_ppc_state.pc < 0x4000u)
+      {
+        return;
+      }
+#endif
       // Pokemon gets this "too early", it hasn't a handler yet
       SRR0(m_ppc_state) = m_ppc_state.npc;
       SRR1(m_ppc_state) = m_ppc_state.msr.Hex & 0x87C0FFFF;
       m_ppc_state.msr.LE = m_ppc_state.msr.ILE;
       m_ppc_state.msr.Hex &= ~0x04EF36;
+#ifdef __EMSCRIPTEN__
+  // [me-preserve 2026-07-07] real HW keeps ME set through interrupt delivery (GC never
+  // runs ME-less; msr=0 is fatal). The dolphin-executor intermittently drops ME
+  // pre-takeover (the documented ME-drop, powerpc-next msr-handling — separate audit);
+  // delivery from an 0x8032-class context then computed msr=0x0000 and wedged the
+  // post-takeover guest. Make the mutation robust: ME survives delivery uncondionally.
+  m_ppc_state.msr.Hex |= 0x1000;
+#endif
       m_ppc_state.pc = m_ppc_state.npc = 0x00000500;
+#ifdef __EMSCRIPTEN__
+      // [deliv-gen MONOTONIC 2026-07-09 — FUNCTIONAL] Bump the delivery generation at
+      // SAB 0x026B0970 so the worker's deliv-reconcile (ppc_worker.js) adopts this
+      // 0x500 redirect before its next dispatch. Load-bearing dual-core coordination.
+      {
+        volatile u32* const hd = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B0970u));
+        *hd = *hd + 1u;
+      }
+#endif
 
       DEBUG_LOG_FMT(POWERPC, "EXCEPTION_EXTERNAL_INT");
       m_ppc_state.Exceptions &= ~EXCEPTION_EXTERNAL_INT;
@@ -617,6 +821,14 @@ void PowerPCManager::CheckExternalExceptions()
       SRR1(m_ppc_state) = m_ppc_state.msr.Hex & 0x87C0FFFF;
       m_ppc_state.msr.LE = m_ppc_state.msr.ILE;
       m_ppc_state.msr.Hex &= ~0x04EF36;
+#ifdef __EMSCRIPTEN__
+  // [me-preserve 2026-07-07] real HW keeps ME set through interrupt delivery (GC never
+  // runs ME-less; msr=0 is fatal). The dolphin-executor intermittently drops ME
+  // pre-takeover (the documented ME-drop, powerpc-next msr-handling — separate audit);
+  // delivery from an 0x8032-class context then computed msr=0x0000 and wedged the
+  // post-takeover guest. Make the mutation robust: ME survives delivery uncondionally.
+  m_ppc_state.msr.Hex |= 0x1000;
+#endif
       m_ppc_state.pc = m_ppc_state.npc = 0x00000F00;
 
       DEBUG_LOG_FMT(POWERPC, "EXCEPTION_PERFORMANCE_MONITOR");
@@ -624,11 +836,50 @@ void PowerPCManager::CheckExternalExceptions()
     }
     else if (exceptions & EXCEPTION_DECREMENTER)
     {
+#if defined(__EMSCRIPTEN__)
+      if (m_ppc_state.npc != m_ppc_state.pc)
+        m_ppc_state.npc = m_ppc_state.pc;
+#endif
+#ifdef __EMSCRIPTEN__
+      // [ee-gate, DEC arm — Step 2] same enforcement + same PLACEMENT FIX as the EXT arm:
+      // refuse BEFORE touching SRR0/SRR1.
+      if (!m_ppc_state.msr.EE)
+      {
+        return;
+      }
+      // [gate #3, DEC arm — 2026-07-10 PERMANENT] Same rationale as the EXT arm's gate:
+      // never write SRR0/SRR1 while pc is inside an exception stub. The DEC arm was the
+      // one delivery arm WITHOUT it — a DEC delivered at pc=0x500 (npc-sync'd) saved
+      // SRR0=0x500; the DEC ISR's rfi then returned INTO the stub with EE=1, the stub
+      // re-ran as normal code, and the guest orbited 0x500<->0x900 forever = the 0x500
+      // re-delivery storm face (pcring all-500 at ~3.9K/s, VI+DSP causes never acked,
+      // wFrames frozen at the armframe). Deferred, not dropped: the bit stays pending
+      // and delivers at the next boundary with pc outside the stubs.
+      if (m_ppc_state.pc < 0x4000u)
+        return;
+#endif
       SRR0(m_ppc_state) = m_ppc_state.npc;
       SRR1(m_ppc_state) = m_ppc_state.msr.Hex & 0x87C0FFFF;
       m_ppc_state.msr.LE = m_ppc_state.msr.ILE;
       m_ppc_state.msr.Hex &= ~0x04EF36;
+#ifdef __EMSCRIPTEN__
+  // [me-preserve 2026-07-07] real HW keeps ME set through interrupt delivery (GC never
+  // runs ME-less; msr=0 is fatal). The dolphin-executor intermittently drops ME
+  // pre-takeover (the documented ME-drop, powerpc-next msr-handling — separate audit);
+  // delivery from an 0x8032-class context then computed msr=0x0000 and wedged the
+  // post-takeover guest. Make the mutation robust: ME survives delivery uncondionally.
+  m_ppc_state.msr.Hex |= 0x1000;
+#endif
       m_ppc_state.pc = m_ppc_state.npc = 0x00000900;
+#ifdef __EMSCRIPTEN__
+      // [deliv-gen MONOTONIC 2026-07-09 — FUNCTIONAL] Bump the delivery generation at
+      // SAB 0x026B0970 so the worker's deliv-reconcile adopts this 0x900 (DEC) redirect
+      // before its next dispatch (un-adopted stale cursor = the 0x900-stub clobber race).
+      {
+        volatile u32* const hd = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B0970u));
+        *hd = *hd + 1u;
+      }
+#endif
 
       DEBUG_LOG_FMT(POWERPC, "EXCEPTION_DECREMENTER");
       m_ppc_state.Exceptions &= ~EXCEPTION_DECREMENTER;

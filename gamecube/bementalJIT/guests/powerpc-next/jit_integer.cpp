@@ -1346,6 +1346,13 @@ void emit_mftb(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Code
     // interp call so the host sees current GPRs, then ReloadAll AFTER so
     // subsequent ops in the block see the post-interp rt value (otherwise
     // the regcache flush at block end overwrites it with a stale local).
+    // [pc-sync A4 2026-06-28] Store ppc_state.pc=op.address BEFORE the interp so
+    // the cutover dolphin_interp pc-guard (dolphin_jit_wimports.cpp:294) does not
+    // silently skip the 2nd/3rd mftb of a 64-bit timebase read -> torn TB. Matches
+    // emit_fallback (ppc_emit.cpp:187-189).
+    wb.op_i32_const((s32)ctx_ptr);
+    wb.op_i32_const((s32)op.address);
+    wb.op_i32_store(ppc_off::PC);
     rc.Flush(ctx_ptr);
     wb.op_i32_const((s32)inst);
     wb.op_i32_const((s32)op.address);
@@ -1356,27 +1363,103 @@ void emit_mftb(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Code
 // ---------------------------------------------------------------------------
 // dcbz — zero a 32-byte cache line at EA = (ra?gpr[ra]:0) + gpr[rb], aligned
 // down to 32-byte boundary. The Gekko's memset/__fill_mem zero-init paths
-// rely on this. Conservative correctness fix 2026-06-01: route to
-// WIMPORT_INTERP so MMU::ClearDCacheLine (and the JIT block-cache
-// invalidation hook) fire correctly. The prior 8x WIMPORT_WRITE32 inline
-// bypassed those — fast but wrong. Until a dedicated WIMPORT for
-// ClearDCacheLine lands, the interp delegate is the safe shape.
+// rely on this. History: 2026-06-01 routed ALL dcbz to WIMPORT_INTERP after an
+// unguarded 8x WIMPORT_WRITE32 inline proved semantically wrong; 2026-07-15
+// restores a GUARDED Jit64-parity fast path (classify-admitted RAM -> in-wasm
+// fill, everything else -> the same interp delegate). See the body comment.
 // ---------------------------------------------------------------------------
 void emit_dcbz(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
-               u32 ctx_ptr) {
-    // CONSERVATIVE FIX (2026-06-01): the prior 8x per-word WIMPORT_WRITE32
-    // inline was semantically WRONG — it bypassed MMU::ClearDCacheLine, did
-    // not honor cache-disabled regions, did not signal the JIT block-cache
-    // invalidation hook, and missed exception delivery on bad EA. The
-    // proper fix is to route to MMU::ClearDCacheLine via a new WIMPORT.
-    // Interim: WIMPORT_INTERP delegates the whole op to Dolphin's
-    // Interpreter::dcbz, which calls ClearDCacheLine correctly. Cost is one
-    // host call per dcbz instead of eight, plus correctness.
-    rc.Flush(ctx_ptr);
-    wb.op_i32_const((s32)op.inst);
-    wb.op_i32_const((s32)op.address);
-    wb.op_call(/*WIMPORT_INTERP=*/6);
-    rc.ReloadAll(ctx_ptr);
+               LoadStoreParams params) {
+    // [dcbz-fastpath 2026-07-15] Jit64-parity inline 32-byte zero fill.
+    // MEASURED: the 2026-06-01 interp delegation costs 3.81% of the JIT worker
+    // (Interpreter::dcbz -> MMU::ClearDCacheLine -> 8x byte-wise WriteToHardware;
+    // /tmp/worker_0.cpuprofile, movie). The ORACLE JIT (Jit64 Jit_LoadStore.cpp:
+    // 424-483) emits: EA=(ra?gpr[ra]:0)+gpr[rb]; EA&=~31; per-address BAT guard ->
+    // two 16-byte MOVAPS zero stores through fastmem; slow-call otherwise. It has
+    // NO HID0.DCE check (interp-only edge) and LowDCBZHack (MainSettings.cpp:225)
+    // defaults false and is not set by our libretro Options — both omitted here,
+    // matching Jit64 exactly.
+    // Guard parity: the same (EA & 0x3E000000)==0 region classify every inline
+    // store uses (emit_fastmem_guard) plays Jit64's BAT-lookup role: it admits the
+    // RAM mirrors {0x00,0x80,0xC0}; classify-reject (MMIO, direct-store segments,
+    // exotic translations) falls back to the EXACT prior path (WIMPORT_INTERP ->
+    // Interpreter::dcbz), preserving the direct-store-ignore + DSI + alignment-
+    // exception semantics there (ClearDCacheLine, MMU.cpp:1017-1043).
+    // The 2026-06-01 revert reasons are each addressed: ClearDCacheLine's real
+    // work for RAM IS the 32-byte zero (its translation/direct-store arms live in
+    // the fallback); cache-disabled regions classify-reject to the fallback; the
+    // "JIT block-cache invalidation hook" concern is vacuous — MMU's data-write
+    // path performs NO JIT invalidation (verified: MMU.cpp invalidation is only
+    // dCache/TLB entry points), identical to our inline fastmem stw, so the fill
+    // introduces no new skew; bad-EA exceptions only arise on classify-rejected
+    // EAs, which take the fallback.
+    const u32 inst = op.inst;
+    const u32 ra   = GekkoOperands::RA(inst);
+    const u32 rb   = GekkoOperands::RB(inst);
+    constexpr u32 LOCAL_EA = 0;  // block-level i32 scratch (build_block_next declares 2 at 0/1)
+
+    // Degenerate/unconfigured MEM1 (test harness): keep the prior interp-only
+    // shape, mirroring emit_fastmem_guard's constant-false (jit_load_store.cpp:132).
+    const bool fast_ok = params.ram_size >= 32u && params.mem1_mask == params.ram_size - 1u;
+    if (!fast_ok) {
+        rc.Flush(params.ctx_ptr);
+        wb.op_i32_const((s32)inst);
+        wb.op_i32_const((s32)op.address);
+        wb.op_call(/*WIMPORT_INTERP=*/6);
+        rc.ReloadAll(params.ctx_ptr);
+        return;
+    }
+
+    // EA = (ra?gpr[ra]:0) + gpr[rb], line-aligned.
+    emit_ra_or_zero(wb, rc, ra);
+    {
+        auto rc_rb = rc.Bind(rb, RCMode::Read);
+        wb.op_local_get(rc_rb.local_idx());
+    }
+    wb.op_i32_add();
+    wb.op_i32_const((s32)~31);
+    wb.op_i32_and();
+    wb.op_local_tee(LOCAL_EA);
+    // Region classify — the single-mask admit shared with emit_fastmem_guard.
+    wb.op_i32_const((s32)0x3E000000u);
+    wb.op_i32_and();
+    wb.op_i32_eqz();
+    // Flush BEFORE the branch (stack-neutral; guard stays on top) so both arms
+    // share one compile-time regcache state — the emit_load/store_common rule.
+    rc.Flush(params.ctx_ptr);
+    wb.op_if();
+    {
+        // Fast arm: zero the line in-wasm. (EA & mask) confines to [0, ram_size)
+        // and EA is 32-byte aligned, so +24 stays inside the 32MB window.
+        wb.op_local_get(LOCAL_EA);
+        wb.op_i32_const((s32)params.mem1_mask);
+        wb.op_i32_and();
+        wb.op_i32_const((s32)params.mem1_base);
+        wb.op_i32_add();
+        wb.op_local_tee(LOCAL_EA);
+        wb.op_i64_const(0); wb.op_i64_store(0);
+        wb.op_local_get(LOCAL_EA); wb.op_i64_const(0); wb.op_i64_store(8);
+        wb.op_local_get(LOCAL_EA); wb.op_i64_const(0); wb.op_i64_store(16);
+        wb.op_local_get(LOCAL_EA); wb.op_i64_const(0); wb.op_i64_store(24);
+    }
+    wb.op_else();
+    {
+        // Slow arm: the exact prior behavior. Store pc first so the dolphin_interp
+        // pc-guard cannot skip the op (pre-op set_pc fired via FL_LOADSTORE; this
+        // is cheap insurance matching emit_fallback, ppc_emit.cpp:203-219).
+        wb.op_i32_const((s32)params.ctx_ptr);
+        wb.op_i32_const((s32)op.address);
+        wb.op_i32_store(ppc_off::PC);
+        wb.op_i32_const((s32)inst);
+        wb.op_i32_const((s32)op.address);
+        wb.op_call(/*WIMPORT_INTERP=*/6);
+    }
+    wb.op_end();
+    // No rc.ReloadAll here: Interpreter::dcbz writes memory + (on fault) SRR0/
+    // SRR1/MSR/Exceptions only — never GPRs/FPRs — and the fast arm writes no
+    // registers, so cached locals stay coherent in both arms. (A ReloadAll inside
+    // ONE arm would desync the compile-time cache state between the arms.)
+    (void)frc;
 }
 
 }  // namespace bemental::powerpc

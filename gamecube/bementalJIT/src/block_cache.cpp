@@ -1,9 +1,13 @@
 #include "bementalJIT/block_cache.h"
 
+#include "bementalJIT/region_desc.h"   // [region-merged] RegionBlockDesc + merged builder
+
 #include <climits>
 #include <cstdint>
 #include <cstdlib>
+#include <algorithm>     // [top-k window] partial_sort for the promotion ranking
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef __EMSCRIPTEN__
@@ -44,6 +48,12 @@ int32_t       g_bem_disp_slot[BEM_DISP_BUCKETS];  // wasmTable index (== handle)
 // Single active region for now (the seal path repopulates on each gen build).
 uint32_t      g_bem_rtag[BEM_DISP_BUCKETS];       // guest PC, 0xFFFFFFFF = empty
 int32_t       g_bem_rslot[BEM_DISP_BUCKETS];      // region internal-table slot
+// [region-merged 2026-07-15] Dedicated probe pair for MERGED gens: slots are
+// PACKED (gen_idx<<16)|br_table_idx so a body can distinguish its own gen's
+// entries (warm in-function re-dispatch) from other gens' (host fallthrough).
+// Separate from rtag/rslot because the N-fn shape stores RAW internal indices.
+uint32_t      g_bem_mrtag[BEM_DISP_BUCKETS];      // guest PC, 0xFFFFFFFF = empty
+int32_t       g_bem_mrslot[BEM_DISP_BUCKETS];     // packed (gen<<16)|k, -1 = empty
 uint32_t      g_bem_chain_exc0    = 0u;           // Exceptions at chain entry
 unsigned char g_bem_chain_enabled = 1;            // master A/B toggle (gate #8)
 // [perf gather-gate] Defined HERE (bementalJIT, linked by both the main dolphin
@@ -76,7 +86,27 @@ uint32_t      g_rd_nogen = 0u;   // [region-debug] sealed dispatch: no gens seal
 // FIRST (JitWasm.cpp:240) pays a wasted EM_ASM membrane crossing per miss. The
 // binding constraint is promotion COVERAGE, not the cold-relink the seal fixed.
 // Gate off to preserve the verified baseline; flip to 1 to resume coverage work.
-unsigned char g_bem_promote_enabled = 0;  // [region] gated OFF (Phase 1 net-negative: seal cost + coverage; needs in-wasm entry + coverage routing)
+// [region-ab 2026-07-13] A/B RE-RUN on the Party-Mode LOBBY (flat profile, the workload
+// promotion targets — direct flip + full rebuild): promote ON = 13.3fps / jit=55-56ms vs
+// OFF = 14.5fps / jit=51ms, same scene (draws=248 vs 247). NET-NEGATIVE (~-8%) — the
+// coverage-wall verdict (~5% region hit -> per-miss membrane tax) holds on the lobby too,
+// not just the cutscene. OFF stays the verified baseline; promotion needs the coverage
+// redesign before it can win on any measured workload.
+// [coverage-census 2026-07-15] MEASURED with counters TEMP-enabled (movie +
+// board, 54s/240s probes): dynamic-entry coverage is CONCENTRATED — movie
+// top-256 blocks = 94.4% of entries (top-512 97.8%, ~6.7k live blocks); board
+// top-512 = 77.8% / top-1024 = 91.0% / top-2048 = 97.9% (~13.9k live). The old
+// ~5%-hit wall was promotion SELECTION (chain-head signal / ~570 wrong blocks),
+// NOT thin locality.
+// [region-merged 2026-07-15] ON: counter-driven promotion into MERGED
+// powerpc-next gens entered via the GLOBAL dispatch table (fn_k wrappers).
+// A/B OFF arm = flip this back to 0 (the verified per-block baseline).
+unsigned char g_bem_promote_enabled = 0;  // [2026-07-16 verdict] OFF = shipping config.
+// The full merged-region + residency machinery is LANDED and correct (zero traps/
+// CompileErrors across ~150 sealed gens; conformance 3457/0) but scene-matched
+// A/B (IDB save-state anchor) measured NEUTRAL — hypothesis: the 256-arm br_table
+// loop-head phi-merge defeats V8 register allocation of the resident locals.
+// Flip to 1 to re-test; see memory gc_60fps_roadmap_verified_2026_07_15.
 // [xinst-fix] Runtime gate for the EXPENSIVE promote drain (re-emit + seal).
 // Held OFF through boot's heavy block-discovery (where re-emit overhead stalls
 // progress to a running state) and flipped ON by the dolphin-side drain once
@@ -90,6 +120,8 @@ static const int _bem_disp_cache_init = []() {
         g_bem_disp_slot[i] = -1;
         g_bem_rtag[i]      = 0xFFFFFFFFu;
         g_bem_rslot[i]     = -1;
+        g_bem_mrtag[i]     = 0xFFFFFFFFu;
+        g_bem_mrslot[i]    = -1;
     }
     return 0;
 }();
@@ -157,15 +189,12 @@ namespace powerpc {
                                           const void* lookup_user,
                                           u32 mem_pages = 1);
 
-#ifdef BEMENTALJIT_USE_REBUILD
-    // Interim _next entry points provided by guests/powerpc-next/ppc_emit.cpp.
-    // Currently wrappers around the unsuffixed versions above; will become
-    // distinct JIT64-modeled implementations as the rebuild lands. Declared
-    // here so block_cache.cpp stays guest-agnostic at the include level (no
-    // ppc_emit.h include — same pattern as the live forward decls above).
-    // LocalIdxLookupFn and BlockInputs are reused unchanged: both libraries
-    // share the bemental::powerpc namespace, so the types are identical
-    // entities on either side of the link.
+    // [region-merged 2026-07-15] _next entry points provided UNCONDITIONALLY by
+    // guests/powerpc-next/ppc_emit.cpp (the USE_REBUILD guards are gone — the
+    // canonical build compiled the flag OFF, silently routing sealed regions
+    // through the legacy gekko emitter). Declared here so block_cache.cpp stays
+    // guest-agnostic at the include level. The merged builder + RegionBlockDesc
+    // come from bementalJIT/region_desc.h (included at the top of this file).
     std::vector<u8> emit_block_body_next(u32 start_pc, const u32* insts, u32 count,
                                          u32 ctx_ptr_const,
                                          u32 mem1_base, u32 mem1_mask,
@@ -181,13 +210,6 @@ namespace powerpc {
                                              std::size_t concatenated_size,
                                              u32 n_funcs,
                                              u32 mem_pages);
-
-    std::vector<u8> build_region_function_next(const BlockInputs* blocks,
-                                               u32 n_blocks,
-                                               LocalIdxLookupFn lookup_fn,
-                                               const void* lookup_user,
-                                               u32 mem_pages = 1);
-#endif
 }
 
 int compile_raw(const u8* bytes, std::size_t size) {
@@ -398,6 +420,16 @@ u64 g_pc_census_total = 0;
 // Chain block-transitions counter (JS-side increment, u32 wrap acceptable
 // for rate reads between drains).
 u32 g_chain_iters = 0;
+// [gate-8] The pc-census + chain-iters counters are DIAGNOSTIC-ONLY (drained
+// for [pc-census]/g_chain_iters NOTICE_LOGs in dolphin_jit_wimports.cpp). They
+// rode along inside the hot bem_chain_loop_c iteration (a global RMW + bounds
+// branch per dispatch), inflating the very bem_chain_loop_c self-time the CPU
+// profile measures (25.4% on the clean baseline 2026-06-23). Compile-gated OFF
+// so the dispatch loop carries zero diagnostic overhead; flip to 1 to re-arm
+// the census tool for an investigation.
+#ifndef BEM_DISPATCH_CENSUS
+#define BEM_DISPATCH_CENSUS 0
+#endif
 
 // Hot-only merge (2026-06-17): per-handle dispatch counter + promotion queue.
 // chain_dispatch_raw bumps g_disp_count[handle] each dispatch and, on the
@@ -432,8 +464,10 @@ u32 g_blr_ras_sp = 0u;   // free-running; ring slot = sp & 255
 u32 g_blr_chain  = 0u;   // consecutive in-WASM tail-chains since last host entry
 
 s32 dispatch_raw(int handle) {
+#if BEM_DISPATCH_CENSUS
     g_pc_census_total++;
     if (g_pc_census_n < 256) g_pc_census_ring[g_pc_census_n++] = handle;
+#endif
     if (g_block_watch_hook) {
         if (handle == g_recheck_handle && g_recheck_handle >= 0) g_block_watch_hook(0);
         if (handle == g_vwaitset_handle && g_vwaitset_handle >= 0) g_block_watch_hook(1);
@@ -609,7 +643,17 @@ s32 bem_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc,
     const u32* msr_addr = exc_addr ? reinterpret_cast<const u32*>(
         reinterpret_cast<const char*>(exc_addr) - 0xC) : nullptr;
     s32 count = 0;
+    // [idle-collapse 2026-07-11] per-block busy-poll clock-jump state (see below).
+    u32 idle_ring[32]; for (u32 i = 0; i < 32u; ++i) idle_ring[i] = 0;
+    u32 idle_ri = 0, idle_streak = 0;
     while ((u32)count < max) {
+#ifdef __EMSCRIPTEN__
+        // [collapse] per-block ownership: bail the chain the instant the WORKER owns the CPU, alongside the
+        // downcount/exception bails below. This is the mid-chain check the between-run_iter_batch flag could
+        // never do — without it, dolphin's chain runs a long OS loop (OSLoadContext etc.) into the shared
+        // ppc_state after ownership flips. cpu_owner @ SAB 0x026A0000: 0=DOLPHIN, 1=WORKER.
+        if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u) break;
+#endif
         if (exc_addr) {
             const u32 e  = *exc_addr;
             const u32 ee = msr_addr ? (*msr_addr & 0x8000u) : 0x8000u;
@@ -628,8 +672,10 @@ s32 bem_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc,
             if (it == g_bem_pc_handle.end()) break;          // uncompiled -> host compiles
             handle = it->second;
         }
+#if BEM_DISPATCH_CENSUS
         g_chain_iters = g_chain_iters + 1u;
         if (g_pc_census_n < 256) g_pc_census_ring[g_pc_census_n++] = (int)pc;
+#endif
         // Phase A NOTE: chain-head promotion here was net-negative — the in-WASM
         // tail-chaining means hot loop bodies never pass through this C loop, so
         // counting chain heads promotes the wrong blocks (boot chain-starts, not
@@ -639,8 +685,69 @@ s32 bem_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc,
         // executions too) — the next Phase-A increment.
         *final_pc = pc;                                      // trap-recovery breadcrumb
         BemBlockFnC fn = (BemBlockFnC)(intptr_t)handle;
+        const u32 ran_pc = pc;                               // the block we're about to run
         pc = fn();                                           // in-WASM call_indirect
+#ifdef __EMSCRIPTEN__
+        // [vector-page guard 2026-07-09, INVARIANT-KEYED 2026-07-09-pm] mirror
+        // emit_chain_or_return: chain INTO an exception vector (0 < pc < 0x4000) is
+        // blocked ONLY when the carried MSR has IR set (0x20) — the crash invariant
+        // (an rfi's 0x1030 output, IR=1, makes the vector fetch translate and fault,
+        // ISI at 0x594). At IR=0 the vector is fetched physical (legit real-mode stub
+        // execution) — allow it, so the stub advances instead of the worker re-
+        // dispatching 0x500 forever (the over-fire that caused the 0x500 spin face).
+        // Break so JitWasm::Run's delivery re-enters IR=1 vectors in real-mode.
+        if (pc != 0u && pc < 0x4000u && msr_addr && (*msr_addr & 0x20u)) {
+            *final_pc = pc; ++count; break;
+        }
+#endif
+#ifdef __EMSCRIPTEN__
+        // [bcl-pc0 TEMP — strip per gate #8] A bementalJIT block returned next-pc 0 (rfi into
+        // srr0=0, or blr/bctr to a 0 target). ran_pc = the block that did it — the prior PC behind
+        // the deterministic PC=0 ISI that no dolphin-side hook ([jw-pc0]/[rfi0]/[br0-*]) could see.
+        if (pc == 0u) {
+            // [bcl-pc0 -> SAB] ran_pc = the block whose terminator set pc=0 (the REAL faulting
+            // function, since the crash is NOT HuSprDisp). r1 at that point names the frame.
+            // SAB 0x026B0690=ran_pc, +4=r1, +8=count (EM_ASM console.log did NOT relay from dolphin).
+            volatile uint32_t* s = reinterpret_cast<volatile uint32_t*>(
+                static_cast<uintptr_t>(0x026B0690u));
+            s[0] = ran_pc;
+            if (exc_addr)
+                s[1] = *reinterpret_cast<const u32*>(
+                    reinterpret_cast<const char*>(exc_addr) - 0x2D4);  // gpr[1]
+            s[2] = s[2] + 1u;
+        }
+#endif
         ++count;
+        // [idle-collapse 2026-07-11] Busy-poll clock-jump. Blocks that can't tail-chain
+        // in-WASM (bl/blr through DVDGetDriveStatus, MMIO reads) return to THIS C loop per
+        // block, so MP4's multi-block DVD-status poll grinds ~982 iters/chain to
+        // downcount<=0 with a quasi-random final_pc the JitWasm outer ring can't match
+        // (measured: idleSkip stays 0, ringMatch~39% but never 8 consecutive). Upstream
+        // branchIsIdleLoop only flags SINGLE self-branch blocks so native doesn't idle-skip
+        // this multi-block poll either — but native runs it at 486MHz; our JIT is ~10x
+        // slower so grinding it IS the pre-takeover boot wedge. Detect the tight recurring
+        // PC set HERE (per-block) and force downcount=0 so JitWasm::Run's CoreTiming::Advance
+        // clock-jumps to the NEXT event (VI/DI); the DI-completion event sets the polled RAM
+        // flag and the poll exits. Only the non-tail-chainable SLOW path uses this C loop
+        // (hot compute loops tail-chain in-WASM, block_cache.cpp:654), so they're unaffected.
+        // Bounded (jumps to the next event only) and gated on Exceptions==0 + a long streak so
+        // real pending work / short forward chains are never skipped; count>64 skips the
+        // per-block ring scan for normal short chains.
+        if (count > 64 && dc_addr && (!exc_addr || *exc_addr == 0u)) {
+            bool in_ring = false;
+            for (u32 j = 0; j < 32u; ++j) { if (idle_ring[j] == pc) { in_ring = true; break; } }
+            if (in_ring) {
+                if (++idle_streak >= 96u) {
+                    *const_cast<s32*>(dc_addr) = 0;   // clock-jump via the outer Advance
+                    *final_pc = pc;
+                    break;
+                }
+            } else {
+                idle_streak = 0;
+            }
+            idle_ring[idle_ri & 31u] = pc;
+            ++idle_ri;
+        }
     }
     *final_pc = pc;
     return count;
@@ -852,11 +959,69 @@ bool BlockCache::dispatch(u64 key, s32* out) {
     return true;
 }
 
+// [C4 2026-07-12 oracle-audit] JS-side per-PC seal teardown — the eviction
+// analog of clear()'s en-masse sealed-gen wipe (block_cache.cpp:1000-1019).
+// Drops the single PC from Module.bemental_pc2gen (so region_dispatch's JS
+// map.get(pc) misses) and clears its GLOBAL dispatch-cache bucket
+// (g_bem_disp_tag/slot) + REGION-local bucket (g_bem_rtag/rslot) IF they still
+// tag this PC — otherwise a C-loop resolve or an in-WASM tail-chain would route
+// the freed PC into the now-stale sealed region fn. Does NOT touch
+// Module.bemental_gens (the immutable gen instance is shared by its other PCs)
+// nor m_sealed_gen_count — matching the "single PC" scope. Idempotent; a no-op
+// when the PC was never promoted/sealed (buckets tag-mismatch, map has no key).
+static void unseal_pc_js(u32 pc) {
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        const pc = $0 >>> 0;
+        if (Module.bemental_pc2gen) Module.bemental_pc2gen.delete(pc);
+        // Global dispatch cache ($1=tag base, $2=slot base, $3=mask): only clear
+        // the bucket if it currently tags THIS pc (a collision victim tags a
+        // different pc — leave it).
+        const bkt = (pc >>> 2) & ($3 >>> 0);
+        if ((HEAPU32[($1 >>> 2) + bkt] >>> 0) === pc) {
+            HEAP32[($1 >>> 2) + bkt] = -1;   // tag = 0xFFFFFFFF (empty)
+            HEAP32[($2 >>> 2) + bkt] = -1;   // slot = -1
+        }
+        // Region-local dispatch cache ($4=rtag base, $5=rslot base): same guard.
+        if ((HEAPU32[($4 >>> 2) + bkt] >>> 0) === pc) {
+            HEAP32[($4 >>> 2) + bkt] = -1;
+            HEAP32[($5 >>> 2) + bkt] = -1;
+        }
+    }, pc,
+       (int)(uintptr_t)&g_bem_disp_tag[0], (int)(uintptr_t)&g_bem_disp_slot[0],
+       (int)BEM_DISP_MASK,
+       (int)(uintptr_t)&g_bem_rtag[0], (int)(uintptr_t)&g_bem_rslot[0]);
+#else
+    (void)pc;
+#endif
+}
+
 void BlockCache::evict(u64 key) {
     auto it = m_map.find(key);
     if (it == m_map.end()) return;
     release_raw(it->second);
     m_map.erase(it);
+    // [C4 2026-07-12 oracle-audit] Also drop this PC from the sealed-region
+    // state. WITHOUT this, region_dispatch (gated on m_sealed_pcs, run BEFORE
+    // chain_dispatch at JitWasm.cpp) keeps running the STALE sealed body for a
+    // targeted icbi/dcbf of a promoted PC, so the recompiled block never runs.
+    // Erasing from m_sealed_pcs makes region_dispatch (block_cache.cpp:1850)
+    // miss and fall through to chain_dispatch -> the freshly compiled block.
+    // m_pending_emit drop prevents a stale promote_hot re-seal. Keeps
+    // m_sealed_gen_count intact so region_dispatch's cold-window early-out
+    // (block_cache.cpp:1849) is unaffected for the PCs still sealed.
+    const u32 pc = static_cast<u32>(key);
+    m_sealed_pcs.erase(pc);
+    m_pending_emit.erase(pc);
+    // [region-merged 2026-07-15] Clear the merged-gen probe bucket (tag-guard)
+    // so no sealed body warm-edges into the evicted PC's stale arm. Runtime-
+    // resolved edges make per-PC eviction SUFFICIENT for merged gens (no baked
+    // edges — the gekko baked-edge eviction hole does not apply).
+    {
+        const u32 bkt = (pc >> 2) & BEM_DISP_MASK;
+        if (g_bem_mrtag[bkt] == pc) { g_bem_mrtag[bkt] = 0xFFFFFFFFu; g_bem_mrslot[bkt] = -1; }
+    }
+    unseal_pc_js(pc);
 }
 
 void BlockCache::clear() {
@@ -869,9 +1034,16 @@ void BlockCache::clear() {
     m_map.clear();
     // Invalidate the in-WASM chaining dispatch cache: slots just got released,
     // so every stale entry would tail-call a trapped slot until recompile.
+    // [region-merged 2026-07-15] ALSO wipe both region probe pairs — clear()
+    // previously left rtag/rslot stale (evict-map gotcha 4: clear-then-reseal
+    // could dispatch the WRONG block via a stale internal-slot mapping).
     for (unsigned i = 0; i < BEM_DISP_BUCKETS; ++i) {
         g_bem_disp_tag[i]  = 0xFFFFFFFFu;
         g_bem_disp_slot[i] = -1;
+        g_bem_rtag[i]      = 0xFFFFFFFFu;
+        g_bem_rslot[i]     = -1;
+        g_bem_mrtag[i]     = 0xFFFFFFFFu;
+        g_bem_mrslot[i]    = -1;
     }
     // Exact resolver (membrane-fix C dispatch loop) — release_raw above already
     // erased per-handle, but clear defensively in case of any drift.
@@ -942,6 +1114,18 @@ void BlockCache::invalidate_overlap(u32 addr, u32 max_block_bytes) {
         if (addr >= start_pc && addr < start_pc + max_block_bytes) {
             release_raw(it->second);
             it = m_map.erase(it);
+            // [C4 2026-07-12 oracle-audit] Mirror evict()'s sealed-region clear
+            // on the SMC/icbi-overlap path too: without it a promoted PC in this
+            // overlap window keeps its stale sealed body live in region_dispatch
+            // (gated on m_sealed_pcs, run BEFORE chain_dispatch), so the
+            // recompiled block never runs after a self-modifying write.
+            m_sealed_pcs.erase(start_pc);
+            m_pending_emit.erase(start_pc);
+            {   // [region-merged] merged-gen probe bucket too (tag-guard)
+                const u32 bkt = (start_pc >> 2) & BEM_DISP_MASK;
+                if (g_bem_mrtag[bkt] == start_pc) { g_bem_mrtag[bkt] = 0xFFFFFFFFu; g_bem_mrslot[bkt] = -1; }
+            }
+            unseal_pc_js(start_pc);
         } else {
             ++it;
         }
@@ -963,16 +1147,71 @@ s32 BlockCache::chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32
     // past boot — see g_bem_promote_active. During boot it stays OFF so block
     // discovery isn't taxed; the prologue still cheaply fills the ring, which we
     // simply discard until the gate opens.
+    // [region-merged 2026-07-15] Promotion signal = the BLOCK-PROLOGUE exec
+    // counters ONLY (every 16th execution pushes; counts in-WASM tail-chained
+    // entries). The chain-head g_promote_ring drain is DELETED — it was the
+    // proven-wrong selector (~570 wrong blocks -> the historic ~5% region hit;
+    // the 2026-07-15 census measured the true concentration: board top-1024
+    // blocks = 91% of dynamic entries). Gen-capacity gate (adversarial-verify
+    // wf_0ce30bf7): at the MAX_GENS cap, region_seal early-returns leaving the
+    // pending batch stranded while every window promotes 256 fresh pcs — pure
+    // churn. Skip promotion entirely at cap.
     if (g_bem_promote_active) {
-        for (u32 i = 0; i < g_promote_n; ++i)
-            promote_hot(g_promote_ring[i]);
-        // Phase A: drain the BLOCK-PROLOGUE promote ring (the correct hot signal —
-        // counts tail-chained executions). These are the actual steady-state hot
-        // blocks (e.g. the asset loader at 0x8036f4xx), unlike the chain-head signal.
-        for (u32 i = 0; i < g_bem_promote_n && i < 256u; ++i)
-            promote_hot(g_bem_promote_ring[i]);
-        if (region_should_relink(REGION_REL_0))
-            region_relink(REGION_REL_0, /*mem_pages=*/1u);
+        static const u32 s_max_gens = []() -> u32 {
+            const char* e = std::getenv("BJIT_MAX_GENS");
+            if (!e) return 24u;                      // default: 24 gens x 256 = 6144 PCs
+                                                     // (boot+movie consumed 8 gens in 60s;
+                                                     // the BOARD's hot set needs its own slots)
+            const unsigned long v = std::strtoul(e, nullptr, 10);
+            return v == 0ul ? 48u : (u32)v;
+        }();
+        if (m_sealed_gen_count < s_max_gens) {
+            // [top-k window 2026-07-15] The ring is a SAMPLER, not the selector.
+            // Ring-arrival promotion flooded gens with every >=16-exec block in
+            // whatever order boot/scene produced them (measured: the -25%
+            // aggregate regression; delaying activation recovered to -6% but
+            // gens still filled arrival-order). Accumulate samples into a
+            // histogram; once a settle window has elapsed, promote the TOP
+            // SEAL_BATCH blocks by execution count — gens then hold PROVEN-hot
+            // steady-state blocks (census: board top-1024 = 91% of entries).
+            static std::unordered_map<u32, u32> s_hit_hist;
+            static u32 s_hist_samples = 0u;
+            const u32 n = (g_bem_promote_n < 256u) ? g_bem_promote_n : 256u;
+            for (u32 i = 0; i < n; ++i)
+                s_hit_hist[g_bem_promote_ring[i]] += 16u;   // each push = 16 execs
+            s_hist_samples += n;
+            constexpr u32 kWindowSamples = 65536u;          // ~1M block executions
+            if (s_hist_samples >= kWindowSamples) {
+                std::vector<std::pair<u32, u32>> rank(s_hit_hist.begin(),
+                                                      s_hit_hist.end());
+                const std::size_t topn =
+                    rank.size() < (std::size_t)256u ? rank.size() : (std::size_t)256u;
+                std::partial_sort(rank.begin(), rank.begin() + topn, rank.end(),
+                                  [](const std::pair<u32, u32>& a,
+                                     const std::pair<u32, u32>& b) {
+                                      return a.second > b.second;
+                                  });
+                u32 promoted = 0u;
+                for (std::size_t i = 0; i < topn && promoted < 256u; ++i) {
+                    const u32 before = m_regions[REGION_REL_0].n_funcs;
+                    promote_hot(rank[i].first);   // dedups sealed/pending internally
+                    if (m_regions[REGION_REL_0].n_funcs != before) ++promoted;
+                }
+                s_hit_hist.clear();
+                s_hist_samples = 0u;
+                if (region_should_relink(REGION_REL_0)) {
+                    region_relink(REGION_REL_0, /*mem_pages=*/1u);
+                } else if (promoted == 0u && m_regions[REGION_REL_0].n_funcs >= 64u) {
+                    // Scene stable + nothing new ranked in: seal a SUBSTANTIAL
+                    // partial batch rather than stranding it below the 256
+                    // trigger. Batches under 64 stay pending — ON5 measured the
+                    // unconditional force-seal fragmenting the 24-gen capacity
+                    // into 1-3-block gens (gens 20-23), wasting slots + compiles
+                    // on marginal blocks.
+                    region_relink(REGION_REL_0, /*mem_pages=*/1u);
+                }
+            }
+        }
     }
     g_promote_n = 0;
     g_bem_promote_n = 0;
@@ -985,6 +1224,16 @@ s32 BlockCache::chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32
             release_raw(it->second);
             m_map.erase(it);
         }
+        // [region-merged 2026-07-15] The trap path previously skipped ALL
+        // sealed cleanup (adversarial map: a trapped sealed pc stayed sealed
+        // and kept being re-entered). Mirror evict()'s sealed clear.
+        m_sealed_pcs.erase(tpc);
+        m_pending_emit.erase(tpc);
+        {
+            const u32 bkt = (tpc >> 2) & BEM_DISP_MASK;
+            if (g_bem_mrtag[bkt] == tpc) { g_bem_mrtag[bkt] = 0xFFFFFFFFu; g_bem_mrslot[bkt] = -1; }
+        }
+        unseal_pc_js(tpc);
     }
     if (final_pc) *final_pc = fpc;
     if (trap_pc) *trap_pc = tpc;
@@ -1021,7 +1270,12 @@ void BlockCache::region_accumulate(Region r, u32 pc,
                                    const u8* body_bytes, std::size_t body_size,
                                    const BlockEmitInputs* inputs) {
     if (r >= REGION_COUNT) return;
-    if (body_bytes == nullptr || body_size == 0) return;
+    // [region-merged 2026-07-15] RECORD-ONLY accumulation is allowed (empty
+    // body + non-null inputs): promote_hot no longer emits at promote time —
+    // the seal emits every body itself (merged from records; N-fn via the
+    // re-emit pass, which clears+rebuilds fn_bodies_concat). Reject only the
+    // legacy shape (no body AND no record — nothing to seal from).
+    if ((body_bytes == nullptr || body_size == 0) && inputs == nullptr) return;
     RegionState& rs = m_regions[r];
 
     // Dedup: if this pc is already accumulated, skip. The first emission
@@ -1036,8 +1290,9 @@ void BlockCache::region_accumulate(Region r, u32 pc,
     // produced by WasmModuleBuilder. The merged-module emitter concats
     // these directly into its code section.
     const u32 local_idx = rs.n_funcs;
-    rs.fn_bodies_concat.insert(rs.fn_bodies_concat.end(),
-                               body_bytes, body_bytes + body_size);
+    if (body_bytes != nullptr && body_size != 0)
+        rs.fn_bodies_concat.insert(rs.fn_bodies_concat.end(),
+                                   body_bytes, body_bytes + body_size);
     rs.pc_keys.push_back(pc);
     rs.pc_to_idx.emplace(pc, local_idx);
     // Save emit inputs for re-emit at relink. Only if the caller provided
@@ -1078,17 +1333,14 @@ void BlockCache::promote_hot(u32 pc) {
     auto it = m_pending_emit.find(pc);
     if (it == m_pending_emit.end()) return;
     const BlockEmitInputs& in = it->second;
-#ifdef BEMENTALJIT_USE_REBUILD
-    std::vector<u8> body = powerpc::emit_block_body_next(
-#else
-    std::vector<u8> body = powerpc::emit_block_body(
-#endif
-        in.start_pc, in.insts.data(), static_cast<u32>(in.insts.size()),
-        in.ctx_ptr_const, in.mem1_base, in.mem1_mask, in.ram_size,
-        in.instr_pcs.data(), /*lookup_fn=*/nullptr, /*lookup_user=*/nullptr,
-        in.emit_hle_check, in.emit_perf_stub, in.emit_hle_check_native);
-    if (!body.empty())
-        region_accumulate(REGION_REL_0, pc, body.data(), body.size(), &in);
+    // [region-merged 2026-07-15] NO body emission at promote time: the seal's
+    // own pass emits every body (merged builder from records; N-fn via the
+    // emit_block_body_next re-emit loop). The old per-promote emission (gekko
+    // under the OFF flag — the staleness bug) was pure wasted work: the seal
+    // re-emit ALWAYS rebuilt fn_bodies_concat when records were complete.
+    // Accumulate the RECORD only (region_accumulate now accepts empty bytes
+    // when inputs are provided; the pc->idx bookkeeping is identical).
+    region_accumulate(REGION_REL_0, pc, nullptr, 0u, &in);
 }
 
 bool BlockCache::region_has_pc(Region r, u32 pc) const {
@@ -1135,8 +1387,9 @@ bool BlockCache::region_should_relink(Region r) const {
         static const u32 s_seal_batch =
             (std::getenv("BJIT_SEAL_BATCH") != nullptr)
                 ? static_cast<u32>(std::atoi(std::getenv("BJIT_SEAL_BATCH")))
-                : 96u;
-        threshold = s_seal_batch ? s_seal_batch : 96u;
+                : 256u;   // [region-merged 2026-07-15] 96 -> 256 (census: movie
+                          // top-256 = 94.4% of dynamic entries)
+        threshold = s_seal_batch ? s_seal_batch : 1024u;  // [Phase2] one big gen
     } else if (rs.n_funcs < 256u)  threshold = 32u;
     else if (rs.n_funcs < 1024u)   threshold = 128u;
     else                           threshold = 256u;
@@ -1255,7 +1508,10 @@ void BlockCache::region_seal(u32 mem_pages) {
     static const u32 s_max_gens =
         (std::getenv("BJIT_MAX_GENS") != nullptr)
             ? static_cast<u32>(std::atoi(std::getenv("BJIT_MAX_GENS")))
-            : 48u;
+            : 24u;  // [region-merged 2026-07-15] 24 gens x 256 = 6144 PCs (boot+movie
+                    // sealed 8 gens in the first 60s; the board needs its own ~2k —
+                    // census: board top-2048 = 97.9%). MUST match the drain's
+                    // gen-cap gate default in chain_dispatch.
     if (m_sealed_gen_count >= (s_max_gens ? s_max_gens : 48u)) {
 #ifdef __EMSCRIPTEN__
         static bool s_warned = false;
@@ -1290,16 +1546,24 @@ void BlockCache::region_seal(u32 mem_pages) {
     for (const auto& rec : rs.block_records) {
         if (rec.insts.empty()) { have_records = false; break; }
     }
-    if (have_records) {
+    // ---- Shape choice FIRST (single-fn merged shape preferred) ----
+    static const bool s_merged_enabled = (std::getenv("BJIT_LEVER2_MERGED_OFF") == nullptr);
+    const bool use_merged_fn = s_merged_enabled && have_records;
+
+    // [region-merged 2026-07-15] N-fn ONLY: re-emit the pending batch into
+    // concatenated bodies (the merged builder emits its own bodies from the
+    // records, with runtime-resolved intra-region edges — region_lookup_for_emit
+    // and its baked-edge eviction hole do not apply to it). Unconditionally
+    // powerpc-next: the gekko arms are RETIRED (the canonical build compiled
+    // USE_REBUILD=OFF, silently routing every sealed region through the legacy
+    // emitter — no ppc_msr_updated/ppc_gather_drain, no powerpc-next semantics:
+    // the staleness bug).
+    if (have_records && !use_merged_fn) {
         rs.fn_bodies_concat.clear();
         RegionLookupCtx ctx{ &rs };
         for (u32 i = 0; i < rs.n_funcs; ++i) {
             const BlockEmitInputs& rec = rs.block_records[i];
-#ifdef BEMENTALJIT_USE_REBUILD
             std::vector<u8> body = powerpc::emit_block_body_next(
-#else
-            std::vector<u8> body = powerpc::emit_block_body(
-#endif
                 rec.start_pc, rec.insts.data(), static_cast<u32>(rec.insts.size()),
                 rec.ctx_ptr_const, rec.mem1_base, rec.mem1_mask, rec.ram_size,
                 rec.instr_pcs.data(), &region_lookup_for_emit, &ctx,
@@ -1309,51 +1573,29 @@ void BlockCache::region_seal(u32 mem_pages) {
         }
     }
 
-    // ---- Build the generation module (single-fn merged shape preferred) ----
-    static const bool s_merged_enabled = (std::getenv("BJIT_LEVER2_MERGED_OFF") == nullptr);
-    bool use_merged_fn = s_merged_enabled && (rs.block_records.size() == rs.n_funcs);
-    if (use_merged_fn) {
-        for (const auto& rec : rs.block_records) {
-            if (rec.insts.empty()) { use_merged_fn = false; break; }
-        }
-    }
-
     std::vector<u8> bytes;
     if (use_merged_fn) {
-        std::vector<powerpc::BlockInputs> bins(rs.n_funcs);
+        // Merged single-function gen via the REAL powerpc-next builder
+        // (region_desc.h). gen_idx packs into g_bem_mrslot below; the bodies'
+        // own-gen check uses the same value — consistency is local to this seal.
+        std::vector<powerpc::RegionBlockDesc> descs(rs.n_funcs);
         for (u32 i = 0; i < rs.n_funcs; ++i) {
             const BlockEmitInputs& rec = rs.block_records[i];
-            bins[i].start_pc       = rec.start_pc;
-            bins[i].insts          = rec.insts.data();
-            bins[i].count          = (u32)rec.insts.size();
-            bins[i].ctx_ptr_const  = rec.ctx_ptr_const;
-            bins[i].mem1_base      = rec.mem1_base;
-            bins[i].mem1_mask      = rec.mem1_mask;
-            bins[i].ram_size       = rec.ram_size;
-            bins[i].instr_pcs      = rec.instr_pcs.data();
-            bins[i].emit_hle_check = rec.emit_hle_check;
-            bins[i].emit_perf_stub = rec.emit_perf_stub;
-            bins[i].emit_hle_check_native = rec.emit_hle_check_native;
-            bins[i].block_cycles   = rec.block_cycles;
+            descs[i].start_pc  = rec.start_pc;
+            descs[i].insts     = rec.insts.data();
+            descs[i].count     = (u32)rec.insts.size();
+            descs[i].ctx_ptr   = rec.ctx_ptr_const;
+            descs[i].mem1_base = rec.mem1_base;
+            descs[i].mem1_mask = rec.mem1_mask;
+            descs[i].ram_size  = rec.ram_size;
         }
-        RegionLookupCtx ctx{ &rs };
-#ifdef BEMENTALJIT_USE_REBUILD
-        bytes = powerpc::build_region_function_next(
-            bins.data(), rs.n_funcs, &region_lookup_for_emit, &ctx, mem_pages);
-#else
-        bytes = powerpc::build_region_function(
-            bins.data(), rs.n_funcs, &region_lookup_for_emit, &ctx, mem_pages);
-#endif
+        bytes = powerpc::build_region_function_next_merged(
+            descs.data(), rs.n_funcs, /*gen_idx=*/m_sealed_gen_count,
+            (u32)(uintptr_t)&g_blr_chain, mem_pages);
     } else {
-#ifdef BEMENTALJIT_USE_REBUILD
         bytes = powerpc::build_region_module_next(
             rs.fn_bodies_concat.data(), rs.fn_bodies_concat.size(),
             rs.n_funcs, mem_pages);
-#else
-        bytes = powerpc::build_region_module(
-            rs.fn_bodies_concat.data(), rs.fn_bodies_concat.size(),
-            rs.n_funcs, mem_pages);
-#endif
     }
     if (bytes.empty()) {
 #ifdef __EMSCRIPTEN__
@@ -1378,30 +1620,67 @@ void BlockCache::region_seal(u32 mem_pages) {
             g_bem_rtag[bkt]  = pc;
             g_bem_rslot[bkt] = (int32_t)i;
         }
+    } else {
+        // [region-merged] Populate the DEDICATED merged probe pair with
+        // GEN-PACKED slots. Bodies warm-chain only into their OWN gen
+        // (slot>>16 == gen_idx); other gens' entries host-fallthrough to the
+        // global-table wrapper. Bucket collisions across gens just overwrite —
+        // the loser degrades to the (measured-free) per-block/global path.
+        for (u32 i = 0; i < rs.n_funcs; ++i) {
+            const u32 pc  = rs.block_records[i].start_pc;
+            const u32 bkt = (pc >> 2) & BEM_DISP_MASK;
+            g_bem_mrtag[bkt]  = pc;
+            g_bem_mrslot[bkt] = (int32_t)((m_sealed_gen_count << 16) | i);
+        }
     }
 
 #ifdef __EMSCRIPTEN__
     // Append the immutable generation to Module.bemental_gens and register its
     // PCs in the global Module.bemental_pc2gen map. nFuncs <= SEAL_BATCH (96) so
     // the 16-bit localIdx pack (genIdx<<16 | localIdx) never overflows.
-    const int sealed_idx = EM_ASM_INT({
+    // [region-merged async-seal 2026-07-15] The old synchronous
+    // `new WebAssembly.Module` on a 250-480KB gen module stalled the GUEST for
+    // the whole V8 compile — measured: 24 seals froze gameLoop in ~12s windows
+    // (A/B: promote-ON aggregate -27% despite ~2x post-seal bursts). Compile +
+    // instantiate ASYNC: the guest keeps running on the per-block path and the
+    // gen goes live (table/bucket/pc2gen registration inside .then) when V8
+    // finishes on its own time. C++ commits m_sealed_pcs/gen_count
+    // optimistically below — safe: the packed mrtag entries of a not-yet-live
+    // gen only gen-mismatch-fall-through in other gens' bodies, and the global
+    // buckets repoint only inside .then. A failed compile leaves those PCs
+    // sealed-but-unregistered: correct, unaccelerated, logged.
+    EM_ASM({
         const bytesPtr  = $0;
         const bytesLen  = $1 >>> 0;
         const pcKeysPtr = $2;
         const nFuncs    = $3 >>> 0;
         const genIdx    = $4 | 0;
         const mergedFn  = $5 | 0;
+        const dispTag   = $6;
+        const dispSlot  = $7;
+        const dispMask  = $8 >>> 0;
         try {
+            // Copy bytes + pc keys SYNCHRONOUSLY — the C++ buffers are reset
+            // as soon as this EM_ASM returns.
             const view = new Uint8Array(Module.HEAPU8.buffer, bytesPtr, bytesLen);
             const copy = new Uint8Array(view);
-            const mod  = new WebAssembly.Module(copy);
+            const pcs = new Array(nFuncs);
+            for (let i = 0; i < nFuncs; i++) {
+                pcs[i] = HEAPU32[(pcKeysPtr >>> 2) + i] >>> 0;
+            }
             const memObj = (typeof wasmMemory !== 'undefined') ? wasmMemory : null;
             const env = {};
             if (memObj) env.memory = memObj;
             if (Module.bemental_imports && Module.bemental_imports.env) {
                 Object.assign(env, Module.bemental_imports.env);
             }
-            const inst = new WebAssembly.Instance(mod, { env: env });
+            // [cross-gen fix 2026-07-15] merged modules import the GLOBAL table
+            // for the standard-chain fallthrough (per-block compile_raw parity).
+            if (typeof wasmTable !== 'undefined') {
+                env['__indirect_function_table'] = wasmTable;
+            }
+            WebAssembly.instantiate(copy, { env: env }).then(function(res) {
+            const inst = res.instance;
             // NOTE: build `gen` with separate assignments — a `{a:x, b:y}` object
             // literal here has bare commas which the C preprocessor (balances
             // parens only) would split as EM_ASM macro args. Same reason the
@@ -1416,37 +1695,83 @@ void BlockCache::region_seal(u32 mem_pages) {
                 if (!gen.regionFn || !gen.entrySel) {
                     console.error('[bemental] seal gen ' + genIdx
                         + ' merged shape missing exports');
-                    return -1;
+                    return;
                 }
-            } else {
+            }
+            // [region-merged 2026-07-15] BOTH shapes register fn_k in the
+            // GLOBAL wasmTable + dispatch buckets. For the merged shape the
+            // fn_k exports are the ENTRY WRAPPERS (reset blr-chain budget +
+            // zero laps + set entry_sel + return_call $region), so a promoted
+            // PC is entered by the normal per-block tail-chain / C loop at
+            // measured-zero cross-instance cost — no JS per-hit dispatch.
+            // For the N-fn shape they are the block functions (unchanged).
+            {
                 const fns = new Array(nFuncs);
-                for (let i = 0; i < nFuncs; i++) fns[i] = inst.exports['fn_' + i];
+                let haveFns = true;
+                for (let i = 0; i < nFuncs; i++) {
+                    fns[i] = inst.exports['fn_' + i];
+                    if (!fns[i]) { haveFns = false; break; }
+                }
+                if (!haveFns) {
+                    console.error('[bemental] seal gen ' + genIdx
+                        + ' missing fn_k exports (shape='
+                        + (gen.merged ? 'merged' : 'Nfn') + ')');
+                    return;
+                }
                 gen.fns = fns;
+                if (!Module._bemental_table_base) {
+                    Module._bemental_table_base = wasmTable.length;
+                    Module._bemental_next_idx   = wasmTable.length;
+                    wasmTable.grow(8192);
+                }
+                gen.globalSlots = new Array(nFuncs);
+                for (let i = 0; i < nFuncs; i++) {
+                    let gi = Module._bemental_next_idx;
+                    if (gi >= wasmTable.length) wasmTable.grow(4096);
+                    wasmTable.set(gi, fns[i]);
+                    Module._bemental_next_idx = gi + 1;
+                    gen.globalSlots[i] = gi;
+                }
             }
             if (!Module.bemental_gens)   Module.bemental_gens   = [];
             if (!Module.bemental_pc2gen) Module.bemental_pc2gen = new Map();
             Module.bemental_gens[genIdx] = gen;
             for (let i = 0; i < nFuncs; i++) {
-                const pc = HEAPU32[(pcKeysPtr >>> 2) + i] >>> 0;
+                const pc = pcs[i];   // [async-seal] pre-copied — C++ buffer is gone
                 Module.bemental_pc2gen.set(pc, ((genIdx << 16) | i) >>> 0);
+                // [Phase2] Point the GLOBAL dispatch cache (g_bem_disp_tag/slot,
+                // $6/$7, mask $8) at this region fn's wasmTable slot so BOTH the
+                // C-loop AND the per-block in-WASM tail-chain dispatch this PC
+                // into the region instead of its per-block module.
+                if (gen.globalSlots) {
+                    const bkt = (pc >>> 2) & dispMask;
+                    HEAPU32[(dispTag >>> 2) + bkt] = pc;
+                    HEAP32[(dispSlot >>> 2) + bkt] = gen.globalSlots[i] | 0;
+                }
             }
             console.log('[worker] [bemental] sealed gen ' + genIdx + ' n_funcs=' + nFuncs
-                + ' bytes=' + bytesLen + (gen.merged ? ' shape=merged' : ' shape=Nfn'));
-            return genIdx;
+                + ' bytes=' + bytesLen + (gen.merged ? ' shape=merged' : ' shape=Nfn')
+                + ' emitter=next async');   // [region-merged] gekko-relapse tripwire (gate greps this)
+            }).catch(function(e) {
+                console.error('[bemental] async seal gen ' + genIdx + ' failed: '
+                    + (e && e.message ? e.message : String(e)));
+            });
         } catch (e) {
             console.error('[bemental] seal gen ' + genIdx + ' failed: '
                 + (e && e.message ? e.message : String(e)));
-            return -1;
         }
     },
     bytes.data(), (int)bytes.size(),
     rs.pc_keys.data(), (int)rs.n_funcs,
     (int)m_sealed_gen_count,
-    use_merged_fn ? 1 : 0);
+    use_merged_fn ? 1 : 0,
+    (int)(uintptr_t)&g_bem_disp_tag[0], (int)(uintptr_t)&g_bem_disp_slot[0],
+    (int)BEM_DISP_MASK);
 
-    if (sealed_idx < 0) return;   // instantiate failed; keep pending for retry
-
-    // Commit: record the sealed PCs (dedup) and advance the generation count.
+    // [async-seal] Commit OPTIMISTICALLY (dedup set + gen numbering). The gen
+    // registers itself (table/buckets/pc2gen) inside .then when V8 finishes
+    // compiling; a failed compile leaves these PCs sealed-but-unregistered —
+    // correct (per-block path keeps serving them), just unaccelerated.
     for (u32 pc : rs.pc_keys) m_sealed_pcs.insert(pc);
     m_sealed_gen_count += 1u;
     m_region_has_sealed = true;

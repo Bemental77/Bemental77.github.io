@@ -29,6 +29,7 @@
 #include "VideoCommon/OnScreenDisplay.h"
 #include "VideoCommon/PerformanceMetrics.h"
 #include "VideoCommon/VideoBackendBase.h"
+
 #include "VideoCommon/VideoConfig.h"
 #include "VideoCommon/VideoEvents.h"
 
@@ -344,6 +345,13 @@ void CoreTimingManager::MoveEvents()
   }
 }
 
+void CoreTimingManager::RebaseTime(s64 delta)
+{
+  m_globals.global_timer += delta;
+  for (auto& evt : m_event_queue)
+    evt.time += delta;
+}
+
 void CoreTimingManager::Advance()
 {
   CPUThreadConfigCallback::CheckForConfigChanges();
@@ -353,10 +361,69 @@ void CoreTimingManager::Advance()
   auto& power_pc = m_system.GetPowerPC();
   auto& ppc_state = power_pc.GetPPCState();
 
+#ifdef __EMSCRIPTEN__
+  // [fire-only advance 2026-07-03 — THE aramStoreData boot gate] While the ppc-worker owns
+  // the CPU (cpu_owner @0x026A0000 == 1), Advance runs in FIRE-ONLY mode: credit no cycles
+  // (the worker advances global_timer via its own commit path) and leave downcount/
+  // slice_length alone (the worker's live countdown must not be clobbered mid-slice). This
+  // lets sim-time completions (ARAM-DMA/ARQ, DSP, VI) fire WHILE the worker executes —
+  // previously Advance only ran in dolphin's exclusive yield window (~2/s), so each of the
+  // ~1000 audio-upload chunks waited ~0.5s for its DMA-complete event: MP4 ground forever in
+  // aramStoreData (pc-histo: 3.6M+3.6M hits at +0x48/+0x1b4 over 5min, wipeData never
+  // written). Delivery stays single-owner per the [ee-race fix] below.
+  const bool worker_owns_cpu =
+      (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u) &&
+      (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0008u)) == 0u);
+  // ^ 0x026A0008 = ff-excursion flag: inside the idle fast-forward the dc=0 full-slice
+  //   credit IS the mechanism that crosses event gaps — grant normal credit there.
+  int cyclesExecuted =
+      worker_owns_cpu ? 0 : m_globals.slice_length - DowncountToCycles(ppc_state.downcount);
+  // [gt-monotonic 2026-07-08 fix-a] never rewind: a negative cyclesExecuted (downcount >
+  // slice_length, seen worker_owns=0, ~-19000) would decrement global_timer. Clamp to 0 so
+  // the clock only advances — restores native Dolphin's global_timer-only-increments invariant.
+  if (cyclesExecuted < 0)
+    cyclesExecuted = 0;
+#else
   int cyclesExecuted = m_globals.slice_length - DowncountToCycles(ppc_state.downcount);
+#endif
   m_globals.global_timer += cyclesExecuted;
+#ifdef __EMSCRIPTEN__
+  // [gt-adopt 2026-07-06 — the post-takeover finish line] Fire-only mode credits 0 cycles
+  // on the assumption that "the worker advances global_timer via its own commit path" —
+  // but those commits land in the WORKER's ct mirror (SAB 0x02680008/0C), never here, so
+  // m_globals.global_timer froze at the handover point and NO event ever came due
+  // (measured: worker idle-jumps Δ2.1B ticks, ct-track events=0, VI never fires,
+  // VIWaitForRetrace spins forever at retired=137M). Adopt the worker's published time
+  // monotonically so due events (VI retrace, DSP, AI) fire against real sim-time.
+  if (worker_owns_cpu)
+  {
+    const u64 wgt =
+        static_cast<u64>(*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x02680008u))) |
+        (static_cast<u64>(*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x0268000Cu))) << 32);
+    // [one-clock 2026-07-07] EXACT assignment (was max()): one-way-up adoption let the
+    // ff excursion's full-slice credits INFLATE this timer above honest worker time —
+    // adoption then never lifted again, the timer froze, and every queued event hung
+    // above it (evFired froze; the deep-ISR DSP-mailbox poll starved). The worker's
+    // smooth-paced cells are THE clock; this timer follows exactly. The takeover-edge
+    // RebaseTime shifts pre-existing events into the unified domain.
+    if (wgt != 0u)
+    {
+      const s64 wsigned = static_cast<s64>(wgt);
+      // [gt-monotonic 2026-07-08 fix-a] ONLY ADVANCE. The worker's published gt can transiently
+      // LAG dolphin's (dolphin over-advanced via an excursion, wgt < current by ~one slice) —
+      // adopting it exactly REWOUND the clock (measured -20001) and killed CoreTiming events.
+      // Follow the worker UP only; never backward. (The takeover-edge RebaseTime still does the
+      // one intentional reset into the unified domain.)
+      if (wsigned > m_globals.global_timer)
+        m_globals.global_timer = wsigned;
+    }
+  }
+#endif
   m_last_oc_factor = m_config_oc_factor;
   m_globals.last_OC_factor_inverted = m_config_oc_inv_factor;
+#ifdef __EMSCRIPTEN__
+  if (!worker_owns_cpu)
+#endif
   m_globals.slice_length = MAX_SLICE_LENGTH;
 
   m_is_global_timer_sane = true;
@@ -377,13 +444,55 @@ void CoreTimingManager::Advance()
     m_globals.slice_length = static_cast<int>(
         std::min<s64>(m_event_queue.front().time - m_globals.global_timer, MAX_SLICE_LENGTH));
   }
+#ifdef __EMSCRIPTEN__
+  // [ct-next publish 2026-07-03] Expose the HYBRID queue's next-event time so the worker's
+  // sleep-tick can jump sim-time to VI/ARAM/DSP events. The worker's own CT mirror holds
+  // only its pure events — dolphin's queue was invisible, so idle spins burned real slices
+  // toward every VI (measured: frames capped ~156/300s with 1.5B retired). Layout:
+  // 0x026B0910 = lo, 0x026B0914 = hi, 0x026B0918 = valid flag (0 when queue empty).
+  {
+    volatile u32* const cell =
+        reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B0910u));
+    if (!m_event_queue.empty())
+    {
+      const u64 t = static_cast<u64>(m_event_queue.front().time);
+      cell[0] = static_cast<u32>(t & 0xFFFFFFFFu);
+      cell[1] = static_cast<u32>(t >> 32);
+      cell[2] = 1u;
+    }
+    else
+    {
+      cell[2] = 0u;
+    }
+  }
+#endif
 
+#ifdef __EMSCRIPTEN__
+  if (!worker_owns_cpu)  // [fire-only advance] never clobber the worker's live countdown
+#endif
   ppc_state.downcount = CyclesToDowncount(m_globals.slice_length);
 
   // Check for any external exceptions.
   // It's important to do this after processing events otherwise any exceptions will be delayed
   // until the next slice:
   //        Pokemon Box refuses to boot if the first exception from the audio DMA is received late
+#ifdef __EMSCRIPTEN__
+  // [ee-race fix 2026-07-02] SINGLE-OWNER DELIVERY. When the ppc-worker owns the
+  // CPU (cpu_owner @ SAB 0x026A0000 == 1), dolphin's excursion must still FIRE
+  // events above (hybrid VI/DSP/AI fire only here — the worker's
+  // ct_fire_due_pure ignores hybrids without CT_PHASE3_ENABLE), but must NOT
+  // vector: this call races the worker's concurrent guest execution on the
+  // SHARED ppc_state — the PowerPC.cpp:671 msr.EE gate is TOCTOU across
+  // executors (gate reads EE=1, worker's guest reaches EE=0, SRR0=stale npc /
+  // SRR1=EE-0 MSR / PC=0x500 land mid-block). Observed as a nested
+  // __OSDispatchInterrupt (SRR1.EE=0): a second VI-retrace handler chain on the
+  // SAME interrupt-stack base as the live first one, whose PADRead data[2]
+  // write trampled SIGetType's saved-callback slot (0x8019d3e4 -> 0x808080 SI
+  // crash). Pending bits stay set; the worker delivers them via its own
+  // EE-gated cmd-10 path (worker parked during service — no race).
+  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u)
+    return;
+#endif
   power_pc.CheckExternalExceptions();
 }
 

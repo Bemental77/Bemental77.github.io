@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <vector>
 
+#include "bementalJIT/region_desc.h"   // [region-merged] RegionBlockDesc + merged builder
 #include "bementalJIT/types.h"
 #include "code_op.h"
 #include "fpr_reg_cache.h"
@@ -127,10 +128,12 @@ std::vector<u8> build_region_module_next(const u8* concatenated_bodies,
                                          u32 n_funcs,
                                          u32 mem_pages = 1);
 
-std::vector<u8> build_region_function_next(const BlockInputs* blocks,
-                                           u32 n_blocks,
-                                           LocalIdxLookupFn lookup_fn,
-                                           const void* lookup_user,
-                                           u32 mem_pages = 1);
+// [region-merged 2026-07-15] The REAL merged builder + RegionBlockDesc live in
+// bementalJIT/region_desc.h (shared with block_cache.cpp's seal call site,
+// sidestepping the BlockInputs ODR tangle). Implementation: ppc_emit.cpp
+// build_region_function_next_merged.
+
+// (build_region_function_next — the gekko passthrough — is GONE; the merged
+// shape is built by build_region_function_next_merged in region_desc.h.)
 
 }  // namespace bemental::powerpc

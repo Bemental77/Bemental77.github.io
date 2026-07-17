@@ -129,6 +129,10 @@ public:
   // instructions is executed.
   // NOTE: Advance updates the PowerPC downcount and performs a PPC external exception check.
   void Advance();
+  // [one-clock 2026-07-07] Shift global_timer AND every queued event by delta — used at
+  // the worker-takeover edge to unify the two time domains (uniform shift preserves heap
+  // order). See CoreTiming.cpp gt-adopt.
+  void RebaseTime(s64 delta);
   void MoveEvents();
 
   // Pretend that the main CPU has executed enough cycles to reach the next event.

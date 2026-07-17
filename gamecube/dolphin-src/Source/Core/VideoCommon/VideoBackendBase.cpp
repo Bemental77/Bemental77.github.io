@@ -31,6 +31,9 @@
 #include "VideoBackends/D3D12/VideoBackend.h"
 #endif
 #include "VideoBackends/Null/VideoBackend.h"
+#ifdef __EMSCRIPTEN__
+#include "VideoBackends/WGPU/VideoBackend.h"
+#endif
 #ifdef HAS_OPENGL
 #include "VideoBackends/OGL/VideoBackend.h"
 #endif
@@ -104,13 +107,6 @@ std::string VideoBackendBase::BadShaderFilename(const char* shader_stage, int co
 void VideoBackendBase::Video_OutputXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
                                        u64 ticks)
 {
-  {
-    static u64 axp_n = 0;
-    const u64 n = ++axp_n;
-    if (n <= 4 || (n & 0xFF) == 0)
-      NOTICE_LOG_FMT(POWERPC, "[ax-present] OutputXFB n={} init={} presenter={} addr={:#x} {}x{}",
-                     n, m_initialized ? 1 : 0, g_presenter ? 1 : 0, xfb_addr, fb_width, fb_height);
-  }
   if (!m_initialized || !g_presenter)
     return;
 
@@ -247,6 +243,10 @@ const std::vector<std::unique_ptr<VideoBackendBase>>& VideoBackendBase::GetAvail
     backends.push_back(std::make_unique<SW::VideoSoftware>());
 #endif
     backends.push_back(std::make_unique<Null::VideoBackend>());
+#ifdef __EMSCRIPTEN__
+    // WebGPU (emdawnwebgpu) backend — Milestone 1 presents a cleared color frame.
+    backends.push_back(std::make_unique<WGPU::VideoBackend>());
+#endif
 
     if (!backends.empty())
       g_video_backend = backends.front().get();
@@ -264,20 +264,6 @@ void VideoBackendBase::ActivateBackend(const std::string& name)
 
   const auto& backends = GetAvailableBackends();
   const auto iter = std::ranges::find(backends, name, &VideoBackendBase::GetConfigName);
-
-  // [ax-vbi] temporary diag (2026-06-11 video_cb bring-up, strip per gate
-  // #8): every activation with the requested name, the registered list,
-  // and the outcome — pins why the SW backend isn't selected.
-  {
-    std::string avail;
-    for (const auto& b : backends)
-    {
-      avail += b->GetConfigName();
-      avail += ',';
-    }
-    NOTICE_LOG_FMT(POWERPC, "[ax-vbi] ActivateBackend name='{}' avail=[{}] found={}", name,
-                   avail, iter != backends.end() ? 1 : 0);
-  }
 
   if (iter == backends.end())
     return;
@@ -363,7 +349,6 @@ bool VideoBackendBase::InitializeShared(std::unique_ptr<AbstractGfx> gfx,
   g_texture_cache = std::move(texture_cache);
   g_efb_interface = std::move(efb_interface);
 
-  NOTICE_LOG_FMT(POWERPC, "[ax-vbi] InitializeShared: objects moved, creating presenter");
   g_presenter = std::make_unique<VideoCommon::Presenter>();
   g_frame_dumper = std::make_unique<FrameDumper>();
   g_framebuffer_manager = std::make_unique<FramebufferManager>();
@@ -371,26 +356,23 @@ bool VideoBackendBase::InitializeShared(std::unique_ptr<AbstractGfx> gfx,
   g_graphics_mod_manager = std::make_unique<GraphicsModManager>();
   g_widescreen = std::make_unique<WidescreenManager>();
 
-  NOTICE_LOG_FMT(POWERPC, "[ax-vbi] InitializeShared: running stage inits");
   bool stage_fail = false;
   {
-    NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: vertex_manager");
     if (!g_vertex_manager->Initialize()) stage_fail = true;
-    if (!stage_fail) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: shader_cache");
+    if (!stage_fail) {
       if (!g_shader_cache->Initialize()) stage_fail = true; }
-    if (!stage_fail) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: perf_query");
+    if (!stage_fail) {
       if (!g_perf_query->Initialize()) stage_fail = true; }
-    if (!stage_fail) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: presenter");
+    if (!stage_fail) {
       if (!g_presenter->Initialize()) stage_fail = true; }
-    if (!stage_fail) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: framebuffer_manager");
+    if (!stage_fail) {
       if (!g_framebuffer_manager->Initialize(g_ActiveConfig.iEFBScale)) stage_fail = true; }
-    if (!stage_fail) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: texture_cache");
+    if (!stage_fail) {
       if (!g_texture_cache->Initialize()) stage_fail = true; }
-    if (!stage_fail && g_backend_info.bSupportsBBox) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: bounding_box");
+    if (!stage_fail && g_backend_info.bSupportsBBox) {
       if (!g_bounding_box->Initialize()) stage_fail = true; }
-    if (!stage_fail) { NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage: graphics_mod");
+    if (!stage_fail) {
       if (!g_graphics_mod_manager->Initialize()) stage_fail = true; }
-    NOTICE_LOG_FMT(POWERPC, "[ax-vbi] stage inits done fail={}", stage_fail ? 1 : 0);
   }
   if (stage_fail)
   {
@@ -403,7 +385,6 @@ bool VideoBackendBase::InitializeShared(std::unique_ptr<AbstractGfx> gfx,
   if(is_initialized)
     return true;
 #endif
-  NOTICE_LOG_FMT(POWERPC, "[ax-vbi] InitializeShared: stage inits OK, HW init block");
   auto& system = Core::System::GetInstance();
   auto& command_processor = system.GetCommandProcessor();
   command_processor.Init();

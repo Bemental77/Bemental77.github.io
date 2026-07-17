@@ -16,6 +16,12 @@
 #include "Core/System.h"
 #include "VideoCommon/CommandProcessor.h"
 
+// [dual-core FIFO splice fix 2026-06-30] When set (by EmscriptenWorker run_iter_batch on a
+// Phase-IV SET->CLEAR transition = the ISR excursion), GPFifo::Write* become no-ops so dolphin's
+// CPU GX (the interrupt-handler overshoot) never reaches the shared FIFO and can't splice the
+// worker's stream. Cleared on CLEAR->SET (worker re-engaged). Boot (Phase IV never set) keeps it.
+extern "C" int g_gp_discard = 0;
+
 namespace GPFifo
 {
 GPFifoManager::GPFifoManager(Core::System& system) : m_system(system)
@@ -90,11 +96,45 @@ void GPFifoManager::UpdateGatherPipe()
 
   size_t pipe_count = GetGatherPipeCount();
   size_t processed;
+  // [wp-invariant 2026-07-10 — PERMANENT, the last shared cursor] The memcpy target (PI's
+  // m_fifo_cpu_write_pointer) and the decoder's accounting (CP's CPWritePointer +
+  // CPReadWriteDistance) are TWO pointer domains whose sync is ASSERT-only — compiled out
+  // here. When they diverge, chunk bytes land at one address while distance credits
+  // another: the decoder consumes a region that still holds ZEROS (= GX NOPs, silently
+  // legal) and the real bytes arrive where nothing will ever decode them. Observed as the
+  // armframe present-stall's final layer (fifo_window: 5-byte 'hole' mid-landing;
+  // fifo_window2: intact-token-uncounted post-landing). Enforce the invariant at every
+  // burst: the copy target IS the accounted pointer.
+  {
+    auto& cp_fifo = system.GetCommandProcessor().GetFifo();
+    const u32 cp_wp = cp_fifo.CPWritePointer.load(std::memory_order_relaxed);
+    if (processor_interface.m_fifo_cpu_write_pointer != cp_wp &&
+        cp_fifo.bFF_GPLinkEnable.load(std::memory_order_relaxed) != 0)
+    {
+      processor_interface.m_fifo_cpu_write_pointer = cp_wp;
+    }
+  }
   for (processed = 0; pipe_count >= GATHER_PIPE_SIZE; processed += GATHER_PIPE_SIZE)
   {
+    // [domino3-wtgt 2026-07-16] dump each memcpy TARGET address (the guest FIFO addr this burst
+    // lands at) so it can be diffed 1:1 against dolphin's READ addresses (ReadDataFromFifo) — if a
+    // read chunk addr never appears as a write target, that chunk is STALE (misplaced-write proof).
+    // Gated cpu_owner (inert on shipping). u32 targets at 0x026B2200, counter 0x026B21F0, first 96.
+    if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u)
+    {
+      volatile u32* wc = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B21F0u));
+      const u32 wi = *wc;
+      if (wi < 96u)
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2200u + wi * 4u)) =
+            processor_interface.m_fifo_cpu_write_pointer;
+      *wc = wi + 1u;
+    }
     // copy the GatherPipe
     memory.CopyToEmu(processor_interface.m_fifo_cpu_write_pointer, m_gather_pipe + processed,
                      GATHER_PIPE_SIZE);
+    // [wp-invariant] bytes land BEFORE any accounting advances (release pairs with the
+    // decoder's acquire loads in Fifo.cpp RunGpuOnCpu/ReadDataFromFifo).
+    std::atomic_thread_fence(std::memory_order_release);
     pipe_count -= GATHER_PIPE_SIZE;
 
     // increase the CPUWritePointer
@@ -130,26 +170,113 @@ void GPFifoManager::CheckGatherPipe()
   }
 }
 
+extern "C" int g_in_drain = 0;  // [domino3-src 2026-07-16] 1 while dolphin_drain_gp_ring replays the ring
+// [domino3 2026-07-16] The matrix that splices into the worker's stream is a TORN GXLoadPosMtxImm:
+// the worker recorded the XF header (int stores -> ring) then parked mid-command at the handover;
+// dolphin's CPU ran the 12 float data stores (-> gather pipe direct, NON-drain). The data is a
+// LEGITIMATE part of the frame (gpSent==ring head: the worker never issued those 12 stores), so it
+// must NOT be discarded. Kept as diagnostic counters only (drain vs non-drain word source).
+// [single-ordered-GX 2026-07-16] Post-takeover (cpu_owner==1) the gather pipe MUST have exactly one
+// ordered writer: the worker's WPAR-store stream, materialized by dolphin_drain_gp_ring replaying
+// the worker's Atomics ring (tagged g_in_drain=1 around the replay). A WPAR write that reaches
+// GPFifo::Write* while cpu_owner==1 and g_in_drain==0 is dolphin's OWN thread running a guest store
+// (the interpreter single-step path dolphin_interp -> SingleStepInner, taken while the worker is
+// PARKED on the cmd-9 reply — so the worker is NOT producing concurrently). Letting that write land
+// in the gather pipe splices the worker's mid-command stream out of order (the torn GXLoadPosMtxImm
+// -> decoder desync -> SETDRAWDONE never decoded -> peFrames frozen). DROPPING it instead loses a
+// legitimately-needed word (the prior discard-fix failure: fifo==ring but frozen). The correct move
+// is to REDIRECT it into the SAME ring, at the head, so the very next drain replays it in program
+// order relative to the worker's own words -> a single ordered stream, no tear, no loss.
+//
+// Ring layout (producer: ppc_worker.js gpPush; consumer: dolphin_drain_gp_ring): head @0x026C0000,
+// tail @0x026C0004, 8192 slots of {u32 width, u32 val} at 0x026C0040. Safe to bump head here without
+// a CAS: the worker producer is parked (blocked in mailbox_call_sync waiting for this single-step to
+// return), so there is a single producer at a time. Pre-takeover (cpu_owner==0) this path is never
+// entered — the guest's gather writes flow normally through Fast*/CheckGatherPipe below.
+// g_in_drain is defined above (:173).
+static bool gpfifo_redirect_excursion_to_ring(u32 width, u32 value)
+{
+  if (g_gp_discard) return true;  // boot-era seal (single-core only); swallow (unchanged legacy)
+  if (*reinterpret_cast<volatile int*>(static_cast<uintptr_t>(0x026A0000u)) != 1 || g_in_drain != 0)
+    return false;  // not an excursion (boot single-core, or this IS the ring replay) -> write normally
+  // Excursion GX: push {width,value} into the worker's ring instead of the gather pipe.
+  volatile u32* const p_head = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026C0000u));
+  volatile u32* const p_tail = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026C0004u));
+  const u32 h = *p_head;
+  const u32 t = __atomic_load_n(const_cast<const u32*>(p_tail), __ATOMIC_ACQUIRE);
+  if (((h - t) & 0xFFFFFFFFu) >= (8192u - 16u))
+  {
+    // Ring full (should not happen — worker is parked, drain runs every iter). Last resort: allow the
+    // direct write rather than lose the word. A rare in-order-but-late byte beats a dropped command.
+    return false;
+  }
+  const uintptr_t slot = 0x026C0040u + ((h & 8191u) * 8u);
+  *reinterpret_cast<volatile u32*>(slot)      = width;
+  *reinterpret_cast<volatile u32*>(slot + 4u) = value;
+  __atomic_store_n(const_cast<u32*>(p_head), (h + 1u), __ATOMIC_RELEASE);
+  // Diagnostic: excursion words redirected into the ring @0x026B1A50 (should track the prior
+  // otherWrites=36; if peFrames now advances, the redirect closed the splice).
+  {
+    volatile u32* const d = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A50u));
+    *d = *d + 1u;
+  }
+  return true;  // handled — do NOT also write the gather pipe
+}
+
 void GPFifoManager::Write8(const u8 value)
 {
+  if (gpfifo_redirect_excursion_to_ring(1u, value)) return;  // [single-ordered-GX] excursion -> ring
   FastWrite8(value);
   CheckGatherPipe();
 }
 
 void GPFifoManager::Write16(const u16 value)
 {
+  if (gpfifo_redirect_excursion_to_ring(2u, value)) return;
   FastWrite16(value);
   CheckGatherPipe();
 }
 
 void GPFifoManager::Write32(const u32 value)
 {
+  if (gpfifo_redirect_excursion_to_ring(4u, value)) {
+    return;
+  }
+  // [domino3-src] count drain vs NON-drain GP words + record first 24 non-drain values (diagnostic).
+  // drain-count @0x026B1A48, other-count @0x026B1A4C, non-drain values @0x026B2600.
+  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u)
+  {
+    if (g_in_drain) {
+      volatile u32* d = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A48u));
+      *d = *d + 1u;
+    } else {
+      volatile u32* o = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A4Cu));
+      const u32 oi = *o;
+      if (oi < 24u)
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2600u + oi * 4u)) = value;
+      *o = oi + 1u;
+    }
+  }
   FastWrite32(value);
   CheckGatherPipe();
 }
 
 void GPFifoManager::Write64(const u64 value)
 {
+  // [single-ordered-GX] A 64-bit gather write is two big-endian 32-bit words; redirect as two ring
+  // slots (hi then lo) to preserve byte order in the worker's u32-slot ring. If the excursion path
+  // is not active both redirect calls return false and we fall through to the normal FastWrite64.
+  const u32 hi = static_cast<u32>(value >> 32);
+  const u32 lo = static_cast<u32>(value & 0xFFFFFFFFu);
+  // Peek once so we don't push a half word: if excursion is active, push both; else write normally.
+  if (*reinterpret_cast<volatile int*>(static_cast<uintptr_t>(0x026A0000u)) == 1 && g_in_drain == 0
+      && !g_gp_discard)
+  {
+    gpfifo_redirect_excursion_to_ring(4u, hi);
+    gpfifo_redirect_excursion_to_ring(4u, lo);
+    return;
+  }
+  if (g_gp_discard) return;  // boot-era seal
   FastWrite64(value);
   CheckGatherPipe();
 }

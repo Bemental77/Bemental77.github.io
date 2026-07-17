@@ -57,6 +57,9 @@ void EncodeXFB(u8* xfb_in_ram, u32 memory_stride, const MathUtil::Rectangle<int>
 u32 GetPerfQueryResult(PerfQueryType type);
 void ResetPerfQuery();
 void IncPerfCounterQuadCount(PerfQueryType type);
+// Fold the per-raster-worker perf-query partials (slots 1..N-1) into the canonical slot 0. Called
+// by the FIFO thread at the end-of-triangle barrier once all worker bands have completed.
+void ReducePerfPartials();
 }  // namespace EfbInterface
 
 namespace SW

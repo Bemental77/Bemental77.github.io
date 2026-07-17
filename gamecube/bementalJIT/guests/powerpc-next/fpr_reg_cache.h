@@ -48,6 +48,12 @@ enum class FPRMode {
     ReadWrite,
 };
 
+// [simd-paired 2026-07-12] Precision representation of an FPR's live value.
+// Double = authoritative in the i64 lane pair (f64 bits); Single = authoritative
+// in the v128 local (f32x2 in lanes 0-1), the fast paired-single form matching
+// JitArm64's RegType::Single. Memory (PowerPCState.ps[]) is ALWAYS f64.
+enum class FPRPrec : u8 { Double, Single };
+
 // Result of a Bind — the two wasm-local indices for the FPR's two lanes.
 // The emit site consumes only the lanes it cares about; the other index is
 // still valid (the lane is allocated/loaded as needed by Bind itself based
@@ -55,6 +61,8 @@ enum class FPRMode {
 struct RCFprPair {
     u32 ps0_idx = 0;
     u32 ps1_idx = 0;
+    u32 v128_idx = 0;      // single-form v128 local (valid when is_single)
+    bool is_single = false;
 };
 
 class FPRRegCache {
@@ -68,7 +76,7 @@ public:
     // fallback when the analyzer's m_fpr_inputs is incomplete (e.g. psq_*
     // whose opinfo flags may not express FPR reads).
     void OnBlockEntry(const CodeBlock& block, u32 wasm_local_base,
-                      u32 ctx_ptr);
+                      u32 ctx_ptr, u32 v128_local_base = 120u);
 
     // Prologue: for every preg in block.m_fpr_inputs emit
     //   local.set(ps0_idx, i64.load(ctx_ptr + ppc_off::ps0(N)))
@@ -85,6 +93,16 @@ public:
     // PowerPCState. In Write/ReadWrite mode, requested lanes are marked
     // dirty. Pure-Write lanes skip the lazy-load (the emit defines them).
     RCFprPair Bind(u32 preg, FPRMode mode, u8 lane_mask = FPR_LANE_BOTH);
+
+    // [simd-paired] Single-precision (v128 f32x2) fast path. IsSingle peeks
+    // (no emit) whether the FPR's live value is already in single form — the
+    // gate an op checks on ALL inputs before taking the SIMD path.
+    bool IsSingle(u32 preg) const { return m_state[preg].repr == FPRPrec::Single; }
+    // BindSingleRead: FPR is already Single (caller checked IsSingle). Returns
+    // its v128 local. BindSingleWrite: mark the FPR Single (the op computes an
+    // f32x2 into the returned v128 local); the i64 pair becomes stale.
+    RCFprPair BindSingleRead(u32 preg);
+    RCFprPair BindSingleWrite(u32 preg);
 
     // Flush dirty lanes back to PowerPCState. `preg_mask` selects which
     // FPRs (default all 32). `lane_mask` selects which lanes (default both).
@@ -120,6 +138,9 @@ private:
     struct PregState {
         u32  ps0_local_idx = 0;
         u32  ps1_local_idx = 0;
+        u32  v128_local_idx = 0;   // [simd-paired] single-form local
+        FPRPrec repr      = FPRPrec::Double;  // Double until a Single-write
+        bool v128_dirty   = false; // single value not yet reconciled to i64/memory
         bool ps0_loaded   = false;
         bool ps1_loaded   = false;
         bool ps0_dirty    = false;
@@ -131,10 +152,14 @@ private:
     void EmitLaneLoad(u32 ctx_ptr, u32 preg, u8 lane);
     // Internal: emit a single-lane store from the lane's local to PowerPCState.
     void EmitLaneStore(u32 ctx_ptr, u32 preg, u8 lane);
+    // [simd-paired] Reconcile a Single-repr FPR back into its i64 lane pair
+    // (NaN-payload-exact per-lane widen). Sets repr=Double, marks lanes dirty.
+    void EmitPromoteToDouble(u32 preg);
 
     WasmModuleBuilder& m_wb;
     PregState m_state[32]{};
     u32 m_local_base    = 0;
+    u32 m_v128_base     = 120u;
     u32 m_if_depth      = 0;
     u32 m_lazy_ctx_ptr  = 0;
 };

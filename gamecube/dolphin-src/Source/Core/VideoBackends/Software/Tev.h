@@ -104,6 +104,52 @@ class Tev
     signed t : 24;
   };
 
+  // Per-primitive-invariant TEV stage state, precomputed once per primitive by SetupStages()
+  // and read (instead of recomputed) from the per-pixel Draw() stage loop. Everything stored
+  // here depends only on bpmem / const LUTs / per-frame constants (KonstantColors), all of which
+  // are stable for the duration of a primitive's rasterization (bpmem only changes via FIFO
+  // BP-writes between draw calls). The *pointers* into m_ColorInputLUT / m_AlphaInputLUT select
+  // which input ref is used; the referenced values themselves are per-pixel and are still gathered
+  // each pixel via the pointer.
+  struct StageCache
+  {
+    // copies of the combiner config unions (per-primitive-invariant)
+    TevStageCombiner::ColorCombiner cc;
+    TevStageCombiner::AlphaCombiner ac;
+
+    // resolved texture sampling state
+    u32 texcoordSel;
+    u32 texmap;
+    bool enable;
+
+    // konst color/alpha for this stage (fully resolved value; copied into StageKonst per pixel
+    // so the m_ColorInputLUT konst ref keeps pointing at the live StageKonst member)
+    TevColor konst;
+
+    // rasterized-color args for SetRasColor()
+    RasColorChan rasColorChan;
+    u32 rswap;
+
+    // selected texel swap table (GetSwapTable returns by value)
+    Common::EnumMap<ColorChannel, ColorChannel::Alpha> tswapTable;
+
+    // selected input refs (pointers into the const LUTs; the LUT entries hold const refs into
+    // per-pixel storage, so the gather of .r/.g/.b/.a stays per-pixel)
+    const TevColorRef* cInput[4];  // a,b,c,d
+    const TevAlphaRef* aInput[4];  // a,b,c,d
+  };
+
+  struct IndStageCache
+  {
+    u32 texcoordSel;
+    u32 texmap;
+    s32 scaleS;
+    s32 scaleT;
+  };
+
+  StageCache m_StageCache[16 + 1];
+  IndStageCache m_IndStageCache[4];
+
   // color order: ABGR
   Common::EnumMap<TevColor, TevOutput::Color2> Reg;
   std::array<TevColor, 4> KonstantColors;
@@ -231,5 +277,9 @@ public:
   };
 
   void SetKonstColors();
+  // Precompute per-primitive-invariant stage state. MUST be called once per primitive (after any
+  // BP-write that could change bpmem, i.e. between draw calls) and before the per-pixel Draw()
+  // loop for that primitive. See Rasterizer::DrawTriangleFrontFace.
+  void SetupStages();
   void Draw();
 };

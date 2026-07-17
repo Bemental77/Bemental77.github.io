@@ -4,13 +4,21 @@
 #include "VideoBackends/Software/Rasterizer.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstring>
+#include <pthread.h>
 #include <vector>
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten/threading.h>
+#endif
 
 #include "Common/Assert.h"
 #include "Common/CommonTypes.h"
 
 #include "VideoBackends/Software/NativeVertexFormat.h"
+#include "VideoBackends/Software/SWBoundingBox.h"
 #include "VideoBackends/Software/SWEfbInterface.h"
 #include "VideoBackends/Software/Tev.h"
 #include "VideoCommon/BPFunctions.h"
@@ -23,6 +31,12 @@
 namespace Rasterizer
 {
 static constexpr int BLOCK_SIZE = 2;
+
+// Tile-parallel (strategy B) worker pool: each triangle's scanline rows are split into
+// MAX_RASTER_WORKERS BLOCK_SIZE-aligned bands. Index 0 = the calling/FIFO thread (runs band 0 in
+// place); indices 1..T-1 are persistent worker pthreads. Capped at 4 to stay inside
+// PTHREAD_POOL_SIZE (see dolphin_worker_link.sh).
+static constexpr int MAX_RASTER_WORKERS = 4;
 
 struct SlopeContext
 {
@@ -96,14 +110,145 @@ struct Slope
 };
 
 static Slope ZSlope;
-static Slope WSlope;
-static Slope ColorSlopes[2][4];
-static Slope TexSlopes[8][3];
+struct RasterContext
+{
+  Slope WSlope;
+  Slope ColorSlopes[2][4];
+  Slope TexSlopes[8][3];
+  Tev tev;
+  RasterBlock rasterBlock;
+};
+// One context per band. [0] is the calling/FIFO thread's; [1..T-1] are the worker threads'. Each
+// owns its own Tev (a Tev CANNOT be shared or memcpy'd — its m_*InputLUT/m_KonstLUT hold const
+// refs into that same object's members, so each must be default-constructed in place and rebound).
+static RasterContext g_ctx_pool[MAX_RASTER_WORKERS];
 
-static Tev tev;
-static RasterBlock rasterBlock;
+// Alias for the FIFO-thread / band-0 context used by the single-threaded entry paths.
+static RasterContext& g_ctx = g_ctx_pool[0];
+
+thread_local int g_raster_worker_id = 0;
 
 static std::vector<BPFunctions::ScissorRect> scissors;
+
+// ---------------------------------------------------------------------------------------------
+// Tile-parallel worker pool (strategy B). Persistent pthreads parked on a per-worker condvar.
+// The FIFO thread fills each worker's job and broadcasts; workers run RasterizeBand on their own
+// RasterContext over a disjoint, BLOCK_SIZE-aligned y-band, then signal completion. Real
+// pthread mutex/condvar (NOT emscripten_sleep — that deadlocks under ASYNCIFY).
+// ---------------------------------------------------------------------------------------------
+struct BandJob
+{
+  // Per-band variable inputs.
+  s32 y_begin = 0;
+  s32 y_end = 0;
+  // Per-primitive invariants (shared by value across all bands of one triangle).
+  s32 minx = 0, maxx = 0, miny = 0, maxy = 0, block_minx = 0;
+  s32 C1 = 0, C2 = 0, C3 = 0;
+  s32 DX12 = 0, DX23 = 0, DX31 = 0;
+  s32 DY12 = 0, DY23 = 0, DY31 = 0;
+  s32 FDX12 = 0, FDX23 = 0, FDX31 = 0;
+  s32 FDY12 = 0, FDY23 = 0, FDY31 = 0;
+};
+
+static void RasterizeBand(RasterContext& ctx, s32 y_begin, s32 y_end, s32 minx, s32 maxx, s32 miny,
+                          s32 maxy, s32 block_minx, s32 C1, s32 C2, s32 C3, s32 DX12, s32 DX23,
+                          s32 DX31, s32 DY12, s32 DY23, s32 DY31, s32 FDX12, s32 FDX23, s32 FDX31,
+                          s32 FDY12, s32 FDY23, s32 FDY31);
+
+struct RasterWorker
+{
+  pthread_t thread{};
+  pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+  pthread_cond_t go_cv = PTHREAD_COND_INITIALIZER;
+  pthread_cond_t done_cv = PTHREAD_COND_INITIALIZER;
+  int wid = 0;
+  bool has_job = false;   // a job is pending for this worker
+  bool job_done = true;   // the pending job has completed
+  bool quit = false;      // shutdown requested
+  BandJob job{};
+};
+
+static RasterWorker s_workers[MAX_RASTER_WORKERS];  // [0] unused (calling thread runs band 0)
+static int s_num_workers = 1;                        // total bands incl. band 0; 1 == no threads
+static bool s_pool_started = false;
+
+static void RunJob(const BandJob& j, RasterContext& ctx)
+{
+  RasterizeBand(ctx, j.y_begin, j.y_end, j.minx, j.maxx, j.miny, j.maxy, j.block_minx, j.C1, j.C2,
+                j.C3, j.DX12, j.DX23, j.DX31, j.DY12, j.DY23, j.DY31, j.FDX12, j.FDX23, j.FDX31,
+                j.FDY12, j.FDY23, j.FDY31);
+}
+
+static void* RasterWorkerMain(void* arg)
+{
+  RasterWorker* w = static_cast<RasterWorker*>(arg);
+  g_raster_worker_id = w->wid;  // per-thread id for the stats/perf/bbox partial routing
+  pthread_mutex_lock(&w->mtx);
+  for (;;)
+  {
+    while (!w->has_job && !w->quit)
+      pthread_cond_wait(&w->go_cv, &w->mtx);
+    if (w->quit)
+      break;
+    // Snapshot the job, release the lock while rasterizing (the FIFO thread is barriered out).
+    BandJob job = w->job;
+    w->has_job = false;
+    pthread_mutex_unlock(&w->mtx);
+
+    RunJob(job, g_ctx_pool[w->wid]);
+
+    pthread_mutex_lock(&w->mtx);
+    w->job_done = true;
+    pthread_cond_signal(&w->done_cv);
+  }
+  pthread_mutex_unlock(&w->mtx);
+  return nullptr;
+}
+
+int NumRasterWorkers()
+{
+  return s_num_workers;
+}
+
+void InitWorkerPool()
+{
+  if (s_pool_started)
+    return;
+
+  int cores = 1;
+#ifdef __EMSCRIPTEN__
+  cores = (int)emscripten_num_logical_cores();
+#endif
+  s_num_workers = std::clamp(cores - 1, 1, MAX_RASTER_WORKERS);
+
+  for (int i = 1; i < s_num_workers; i++)
+  {
+    RasterWorker& w = s_workers[i];
+    w.wid = i;
+    w.has_job = false;
+    w.job_done = true;
+    w.quit = false;
+    pthread_create(&w.thread, nullptr, &RasterWorkerMain, &w);
+  }
+  s_pool_started = true;
+}
+
+void ShutdownWorkerPool()
+{
+  if (!s_pool_started)
+    return;
+  for (int i = 1; i < s_num_workers; i++)
+  {
+    RasterWorker& w = s_workers[i];
+    pthread_mutex_lock(&w.mtx);
+    w.quit = true;
+    pthread_cond_signal(&w.go_cv);
+    pthread_mutex_unlock(&w.mtx);
+    pthread_join(w.thread, nullptr);
+  }
+  s_num_workers = 1;
+  s_pool_started = false;
+}
 
 void Init()
 {
@@ -143,12 +288,18 @@ static inline int iround(float x)
 
 void SetTevKonstColors()
 {
-  tev.SetKonstColors();
+  // Every worker's Tev needs its own konst colors — a Tev cannot be shared, and the per-band
+  // SetupStages() konst refs read each ctx's own KonstantColors. Set ALL contexts, not just [0].
+  for (auto& ctx : g_ctx_pool)
+    ctx.tev.SetKonstColors();
 }
 
-static void Draw(s32 x, s32 y, s32 xi, s32 yi)
+static void Draw(RasterContext& ctx, s32 x, s32 y, s32 xi, s32 yi)
 {
-  INCSTAT(g_stats.this_frame.rasterized_pixels);
+  // g_stats is non-atomic and diagnostic-only; under MT only count on the FIFO thread (band 0) to
+  // avoid torn increments. The lost worker-band pixels are accepted (sanctioned in the design).
+  if (g_raster_worker_id == 0)
+    INCSTAT(g_stats.this_frame.rasterized_pixels);
 
   s32 z = (s32)std::clamp<float>(ZSlope.GetValue(x, y), 0.0f, 16777215.0f);
 
@@ -165,19 +316,19 @@ static void Draw(s32 x, s32 y, s32 xi, s32 yi)
     EfbInterface::IncPerfCounterQuadCount(PQ_ZCOMP_OUTPUT_ZCOMPLOC);
   }
 
-  RasterBlockPixel& pixel = rasterBlock.Pixel[xi][yi];
+  RasterBlockPixel& pixel = ctx.rasterBlock.Pixel[xi][yi];
 
-  tev.Position[0] = x;
-  tev.Position[1] = y;
-  tev.Position[2] = z;
+  ctx.tev.Position[0] = x;
+  ctx.tev.Position[1] = y;
+  ctx.tev.Position[2] = z;
 
   //  colors
   for (unsigned int i = 0; i < bpmem.genMode.numcolchans; i++)
   {
     for (int comp = 0; comp < 4; comp++)
     {
-      const float color = ColorSlopes[i][comp].GetValue(x, y);
-      tev.Color[i][comp] = (u8)std::clamp<float>(color, 0.0f, 255.0f);
+      const float color = ctx.ColorSlopes[i][comp].GetValue(x, y);
+      ctx.tev.Color[i][comp] = (u8)std::clamp<float>(color, 0.0f, 255.0f);
     }
   }
 
@@ -185,26 +336,27 @@ static void Draw(s32 x, s32 y, s32 xi, s32 yi)
   for (unsigned int i = 0; i < bpmem.genMode.numtexgens; i++)
   {
     // multiply by 128 because TEV stores UVs as s17.7
-    tev.Uv[i].s = (s32)(pixel.Uv[i][0] * 128);
-    tev.Uv[i].t = (s32)(pixel.Uv[i][1] * 128);
+    ctx.tev.Uv[i].s = (s32)(pixel.Uv[i][0] * 128);
+    ctx.tev.Uv[i].t = (s32)(pixel.Uv[i][1] * 128);
   }
 
   for (unsigned int i = 0; i < bpmem.genMode.numindstages; i++)
   {
-    tev.IndirectLod[i] = rasterBlock.IndirectLod[i];
-    tev.IndirectLinear[i] = rasterBlock.IndirectLinear[i];
+    ctx.tev.IndirectLod[i] = ctx.rasterBlock.IndirectLod[i];
+    ctx.tev.IndirectLinear[i] = ctx.rasterBlock.IndirectLinear[i];
   }
 
   for (unsigned int i = 0; i <= bpmem.genMode.numtevstages; i++)
   {
-    tev.TextureLod[i] = rasterBlock.TextureLod[i];
-    tev.TextureLinear[i] = rasterBlock.TextureLinear[i];
+    ctx.tev.TextureLod[i] = ctx.rasterBlock.TextureLod[i];
+    ctx.tev.TextureLinear[i] = ctx.rasterBlock.TextureLinear[i];
   }
 
-  tev.Draw();
+  ctx.tev.Draw();
 }
 
-static inline void CalculateLOD(s32* lodp, bool* linear, u32 texmap, u32 texcoord)
+static inline void CalculateLOD(RasterContext& ctx, s32* lodp, bool* linear, u32 texmap,
+                                u32 texcoord)
 {
   auto texUnit = bpmem.tex.GetUnit(texmap);
 
@@ -215,9 +367,9 @@ static inline void CalculateLOD(s32* lodp, bool* linear, u32 texmap, u32 texcoor
 
   float sDelta, tDelta;
 
-  float* uv00 = rasterBlock.Pixel[0][0].Uv[texcoord];
-  float* uv10 = rasterBlock.Pixel[1][0].Uv[texcoord];
-  float* uv01 = rasterBlock.Pixel[0][1].Uv[texcoord];
+  float* uv00 = ctx.rasterBlock.Pixel[0][0].Uv[texcoord];
+  float* uv10 = ctx.rasterBlock.Pixel[1][0].Uv[texcoord];
+  float* uv01 = ctx.rasterBlock.Pixel[0][1].Uv[texcoord];
 
   float dudx = fabsf(uv00[0] - uv10[0]);
   float dvdx = fabsf(uv00[1] - uv10[1]);
@@ -255,30 +407,30 @@ static inline void CalculateLOD(s32* lodp, bool* linear, u32 texmap, u32 texcoor
   *lodp = lod;
 }
 
-static void BuildBlock(s32 blockX, s32 blockY)
+static void BuildBlock(RasterContext& ctx, s32 blockX, s32 blockY)
 {
   for (s32 yi = 0; yi < BLOCK_SIZE; yi++)
   {
     for (s32 xi = 0; xi < BLOCK_SIZE; xi++)
     {
-      RasterBlockPixel& pixel = rasterBlock.Pixel[xi][yi];
+      RasterBlockPixel& pixel = ctx.rasterBlock.Pixel[xi][yi];
 
       s32 x = xi + blockX;
       s32 y = yi + blockY;
 
-      float invW = 1.0f / WSlope.GetValue(x, y);
+      float invW = 1.0f / ctx.WSlope.GetValue(x, y);
       pixel.InvW = invW;
 
       // tex coords
       for (unsigned int i = 0; i < bpmem.genMode.numtexgens; i++)
       {
         float projection = invW;
-        float q = TexSlopes[i][2].GetValue(x, y) * invW;
+        float q = ctx.TexSlopes[i][2].GetValue(x, y) * invW;
         if (q != 0.0f)
           projection = invW / q;
 
-        pixel.Uv[i][0] = TexSlopes[i][0].GetValue(x, y) * projection;
-        pixel.Uv[i][1] = TexSlopes[i][1].GetValue(x, y) * projection;
+        pixel.Uv[i][0] = ctx.TexSlopes[i][0].GetValue(x, y) * projection;
+        pixel.Uv[i][1] = ctx.TexSlopes[i][1].GetValue(x, y) * projection;
       }
     }
   }
@@ -288,7 +440,8 @@ static void BuildBlock(s32 blockX, s32 blockY)
     u32 texmap = bpmem.tevindref.getTexMap(i);
     u32 texcoord = bpmem.tevindref.getTexCoord(i);
 
-    CalculateLOD(&rasterBlock.IndirectLod[i], &rasterBlock.IndirectLinear[i], texmap, texcoord);
+    CalculateLOD(ctx, &ctx.rasterBlock.IndirectLod[i], &ctx.rasterBlock.IndirectLinear[i], texmap,
+                 texcoord);
   }
 
   for (unsigned int i = 0; i <= bpmem.genMode.numtevstages; i++)
@@ -300,7 +453,8 @@ static void BuildBlock(s32 blockX, s32 blockY)
       u32 texmap = order.getTexMap(stageOdd);
       u32 texcoord = order.getTexCoord(stageOdd);
 
-      CalculateLOD(&rasterBlock.TextureLod[i], &rasterBlock.TextureLinear[i], texmap, texcoord);
+      CalculateLOD(ctx, &ctx.rasterBlock.TextureLod[i], &ctx.rasterBlock.TextureLinear[i], texmap,
+                   texcoord);
     }
   }
 }
@@ -317,8 +471,106 @@ void UpdateZSlope(const OutputVertexData* v0, const OutputVertexData* v1,
   }
 }
 
-static void DrawTriangleFrontFace(const OutputVertexData* v0, const OutputVertexData* v1,
-                                  const OutputVertexData* v2,
+// Rasterizes a horizontal band of 2x2 blocks for a single primitive, covering scanline rows in
+// [y_begin, y_end). y_begin must already be aligned down to a BLOCK_SIZE multiple and stepped by
+// BLOCK_SIZE, matching the original full-triangle block loop. All edge/half-edge constants and the
+// (scissor-clamped) bounding box are per-primitive invariants passed by value from
+// DrawTriangleFrontFace; the per-pixel slopes/tev/rasterBlock state lives in ctx, and ZSlope/bpmem
+// are globals. STEP 4 will invoke this once per worker thread with disjoint [y_begin, y_end) ranges.
+static void RasterizeBand(RasterContext& ctx, s32 y_begin, s32 y_end, s32 minx, s32 maxx, s32 miny,
+                          s32 maxy, s32 block_minx, s32 C1, s32 C2, s32 C3, s32 DX12, s32 DX23,
+                          s32 DX31, s32 DY12, s32 DY23, s32 DY31, s32 FDX12, s32 FDX23, s32 FDX31,
+                          s32 FDY12, s32 FDY23, s32 FDY31)
+{
+  // Loop through blocks
+  for (s32 y = y_begin; y < y_end; y += BLOCK_SIZE)
+  {
+    for (s32 x = block_minx; x < maxx; x += BLOCK_SIZE)
+    {
+      s32 x1_ = (x + BLOCK_SIZE - 1);
+      s32 y1_ = (y + BLOCK_SIZE - 1);
+
+      // Corners of block
+      s32 x0 = x << 4;
+      s32 x1 = x1_ << 4;
+      s32 y0 = y << 4;
+      s32 y1 = y1_ << 4;
+
+      // Evaluate half-space functions
+      bool a00 = C1 + DX12 * y0 - DY12 * x0 > 0;
+      bool a10 = C1 + DX12 * y0 - DY12 * x1 > 0;
+      bool a01 = C1 + DX12 * y1 - DY12 * x0 > 0;
+      bool a11 = C1 + DX12 * y1 - DY12 * x1 > 0;
+      int a = (a00 << 0) | (a10 << 1) | (a01 << 2) | (a11 << 3);
+
+      bool b00 = C2 + DX23 * y0 - DY23 * x0 > 0;
+      bool b10 = C2 + DX23 * y0 - DY23 * x1 > 0;
+      bool b01 = C2 + DX23 * y1 - DY23 * x0 > 0;
+      bool b11 = C2 + DX23 * y1 - DY23 * x1 > 0;
+      int b = (b00 << 0) | (b10 << 1) | (b01 << 2) | (b11 << 3);
+
+      bool c00 = C3 + DX31 * y0 - DY31 * x0 > 0;
+      bool c10 = C3 + DX31 * y0 - DY31 * x1 > 0;
+      bool c01 = C3 + DX31 * y1 - DY31 * x0 > 0;
+      bool c11 = C3 + DX31 * y1 - DY31 * x1 > 0;
+      int c = (c00 << 0) | (c10 << 1) | (c01 << 2) | (c11 << 3);
+
+      // Skip block when outside an edge
+      if (a == 0x0 || b == 0x0 || c == 0x0)
+        continue;
+
+      BuildBlock(ctx, x, y);
+
+      // Accept whole block when totally covered
+      // We still need to check min/max x/y because of the scissor
+      if (a == 0xF && b == 0xF && c == 0xF && x >= minx && x1_ < maxx && y >= miny && y1_ < maxy)
+      {
+        for (s32 iy = 0; iy < BLOCK_SIZE; iy++)
+        {
+          for (s32 ix = 0; ix < BLOCK_SIZE; ix++)
+          {
+            Draw(ctx, x + ix, y + iy, ix, iy);
+          }
+        }
+      }
+      else  // Partially covered block
+      {
+        s32 CY1 = C1 + DX12 * y0 - DY12 * x0;
+        s32 CY2 = C2 + DX23 * y0 - DY23 * x0;
+        s32 CY3 = C3 + DX31 * y0 - DY31 * x0;
+
+        for (s32 iy = 0; iy < BLOCK_SIZE; iy++)
+        {
+          s32 CX1 = CY1;
+          s32 CX2 = CY2;
+          s32 CX3 = CY3;
+
+          for (s32 ix = 0; ix < BLOCK_SIZE; ix++)
+          {
+            if (CX1 > 0 && CX2 > 0 && CX3 > 0)
+            {
+              // This check enforces the scissor rectangle, since it might not be aligned with the
+              // blocks
+              if (x + ix >= minx && x + ix < maxx && y + iy >= miny && y + iy < maxy)
+                Draw(ctx, x + ix, y + iy, ix, iy);
+            }
+
+            CX1 -= FDY12;
+            CX2 -= FDY23;
+            CX3 -= FDY31;
+          }
+
+          CY1 += FDX12;
+          CY2 += FDX23;
+          CY3 += FDX31;
+        }
+      }
+    }
+  }
+}
+
+static void DrawTriangleFrontFace(RasterContext& ctx, const OutputVertexData* v0,
+                                  const OutputVertexData* v1, const OutputVertexData* v2,
                                   const BPFunctions::ScissorRect& scissor)
 {
   // The zslope should be updated now, even if the triangle is rejected by the scissor test, as
@@ -376,28 +628,35 @@ static void DrawTriangleFrontFace(const OutputVertexData* v0, const OutputVertex
     return;
 
   // Set up the remaining slopes
-  const SlopeContext ctx(v0, v1, v2, (X1 + 0xF) >> 4, (Y1 + 0xF) >> 4, scissor.x_off,
-                         scissor.y_off);
+  const SlopeContext slope_ctx(v0, v1, v2, (X1 + 0xF) >> 4, (Y1 + 0xF) >> 4, scissor.x_off,
+                               scissor.y_off);
 
   float w[3] = {1.0f / v0->projectedPosition.w, 1.0f / v1->projectedPosition.w,
                 1.0f / v2->projectedPosition.w};
-  WSlope = Slope(w[0], w[1], w[2], ctx);
+  ctx.WSlope = Slope(w[0], w[1], w[2], slope_ctx);
 
   for (unsigned int i = 0; i < bpmem.genMode.numcolchans; i++)
   {
     for (int comp = 0; comp < 4; comp++)
-      ColorSlopes[i][comp] = Slope(v0->color[i][comp], v1->color[i][comp], v2->color[i][comp], ctx);
+      ctx.ColorSlopes[i][comp] =
+          Slope(v0->color[i][comp], v1->color[i][comp], v2->color[i][comp], slope_ctx);
   }
 
   for (unsigned int i = 0; i < bpmem.genMode.numtexgens; i++)
   {
-    TexSlopes[i][0] =
-        Slope(v0->texCoords[i].x * w[0], v1->texCoords[i].x * w[1], v2->texCoords[i].x * w[2], ctx);
-    TexSlopes[i][1] =
-        Slope(v0->texCoords[i].y * w[0], v1->texCoords[i].y * w[1], v2->texCoords[i].y * w[2], ctx);
-    TexSlopes[i][2] =
-        Slope(v0->texCoords[i].z * w[0], v1->texCoords[i].z * w[1], v2->texCoords[i].z * w[2], ctx);
+    ctx.TexSlopes[i][0] = Slope(v0->texCoords[i].x * w[0], v1->texCoords[i].x * w[1],
+                                v2->texCoords[i].x * w[2], slope_ctx);
+    ctx.TexSlopes[i][1] = Slope(v0->texCoords[i].y * w[0], v1->texCoords[i].y * w[1],
+                                v2->texCoords[i].y * w[2], slope_ctx);
+    ctx.TexSlopes[i][2] = Slope(v0->texCoords[i].z * w[0], v1->texCoords[i].z * w[1],
+                                v2->texCoords[i].z * w[2], slope_ctx);
   }
+
+  // Hoist per-primitive-invariant TEV stage state out of the per-pixel tev.Draw() hot loop.
+  // bpmem cannot change between here and the pixel loop below (it only changes via FIFO BP-writes
+  // between draw calls, never during rasterization of a primitive), so this is computed exactly
+  // once per primitive and read by every tev.Draw() pixel.
+  ctx.tev.SetupStages();
 
   // Half-edge constants
   s32 C1 = DY12 * X1 - DX12 * Y1;
@@ -416,91 +675,113 @@ static void DrawTriangleFrontFace(const OutputVertexData* v0, const OutputVertex
   s32 block_minx = minx & ~(BLOCK_SIZE - 1);
   s32 block_miny = miny & ~(BLOCK_SIZE - 1);
 
-  // Loop through blocks
-  for (s32 y = block_miny & ~(BLOCK_SIZE - 1); y < maxy; y += BLOCK_SIZE)
+  const s32 y_start = block_miny & ~(BLOCK_SIZE - 1);
+
+  const s32 total_rows = maxy - y_start;
+  const s32 block_rows = (total_rows + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+  // Choose how many bands to actually use. Splitting a triangle costs a per-band slope copy +
+  // SetupStages() + a condvar signal + a barrier wait; on the intro's many SMALL triangles that
+  // fixed cost dominates if each band gets only a row or two. So only hand a band to a worker when
+  // it would own at least MIN_BLOCK_ROWS_PER_BAND 2x2 block-rows, and never more bands than the
+  // pool provides. A triangle too short to fill 2 bands runs entirely on the calling thread
+  // (bit-identical to the pre-pool path) — no thread hop, no barrier.
+  static constexpr s32 MIN_BLOCK_ROWS_PER_BAND = 12;  // 24 scanlines / band before it's worth it
+  int T = std::min<int>(s_num_workers, std::max<s32>(1, block_rows / MIN_BLOCK_ROWS_PER_BAND));
+  if (T <= 1)
   {
-    for (s32 x = block_minx; x < maxx; x += BLOCK_SIZE)
-    {
-      s32 x1_ = (x + BLOCK_SIZE - 1);
-      s32 y1_ = (y + BLOCK_SIZE - 1);
-
-      // Corners of block
-      s32 x0 = x << 4;
-      s32 x1 = x1_ << 4;
-      s32 y0 = y << 4;
-      s32 y1 = y1_ << 4;
-
-      // Evaluate half-space functions
-      bool a00 = C1 + DX12 * y0 - DY12 * x0 > 0;
-      bool a10 = C1 + DX12 * y0 - DY12 * x1 > 0;
-      bool a01 = C1 + DX12 * y1 - DY12 * x0 > 0;
-      bool a11 = C1 + DX12 * y1 - DY12 * x1 > 0;
-      int a = (a00 << 0) | (a10 << 1) | (a01 << 2) | (a11 << 3);
-
-      bool b00 = C2 + DX23 * y0 - DY23 * x0 > 0;
-      bool b10 = C2 + DX23 * y0 - DY23 * x1 > 0;
-      bool b01 = C2 + DX23 * y1 - DY23 * x0 > 0;
-      bool b11 = C2 + DX23 * y1 - DY23 * x1 > 0;
-      int b = (b00 << 0) | (b10 << 1) | (b01 << 2) | (b11 << 3);
-
-      bool c00 = C3 + DX31 * y0 - DY31 * x0 > 0;
-      bool c10 = C3 + DX31 * y0 - DY31 * x1 > 0;
-      bool c01 = C3 + DX31 * y1 - DY31 * x0 > 0;
-      bool c11 = C3 + DX31 * y1 - DY31 * x1 > 0;
-      int c = (c00 << 0) | (c10 << 1) | (c01 << 2) | (c11 << 3);
-
-      // Skip block when outside an edge
-      if (a == 0x0 || b == 0x0 || c == 0x0)
-        continue;
-
-      BuildBlock(x, y);
-
-      // Accept whole block when totally covered
-      // We still need to check min/max x/y because of the scissor
-      if (a == 0xF && b == 0xF && c == 0xF && x >= minx && x1_ < maxx && y >= miny && y1_ < maxy)
-      {
-        for (s32 iy = 0; iy < BLOCK_SIZE; iy++)
-        {
-          for (s32 ix = 0; ix < BLOCK_SIZE; ix++)
-          {
-            Draw(x + ix, y + iy, ix, iy);
-          }
-        }
-      }
-      else  // Partially covered block
-      {
-        s32 CY1 = C1 + DX12 * y0 - DY12 * x0;
-        s32 CY2 = C2 + DX23 * y0 - DY23 * x0;
-        s32 CY3 = C3 + DX31 * y0 - DY31 * x0;
-
-        for (s32 iy = 0; iy < BLOCK_SIZE; iy++)
-        {
-          s32 CX1 = CY1;
-          s32 CX2 = CY2;
-          s32 CX3 = CY3;
-
-          for (s32 ix = 0; ix < BLOCK_SIZE; ix++)
-          {
-            if (CX1 > 0 && CX2 > 0 && CX3 > 0)
-            {
-              // This check enforces the scissor rectangle, since it might not be aligned with the
-              // blocks
-              if (x + ix >= minx && x + ix < maxx && y + iy >= miny && y + iy < maxy)
-                Draw(x + ix, y + iy, ix, iy);
-            }
-
-            CX1 -= FDY12;
-            CX2 -= FDY23;
-            CX3 -= FDY31;
-          }
-
-          CY1 += FDX12;
-          CY2 += FDX23;
-          CY3 += FDX31;
-        }
-      }
-    }
+    RasterizeBand(ctx, y_start, maxy, minx, maxx, miny, maxy, block_minx, C1, C2, C3, DX12, DX23,
+                  DX31, DY12, DY23, DY31, FDX12, FDX23, FDX31, FDY12, FDY23, FDY31);
+    return;
   }
+
+  // Split [y_start, maxy) into T contiguous BLOCK_SIZE-aligned bands. Misaligned bands would make
+  // two workers touch the same 2x2 block -> double-blend + EFB data race, so every band start is
+  // floored to a BLOCK_SIZE multiple. Distribute the block-rows as evenly as possible across bands.
+  const s32 base = block_rows / T;
+  const s32 extra = block_rows % T;
+
+  // Per-band setup: each worker's context needs its OWN slopes + its OWN SetupStages() result.
+  // A Tev cannot be shared or memcpy'd, but Slope is a copyable POD; copy the resolved slopes from
+  // g_ctx_pool[0] into each worker ctx, then run SetupStages() against that ctx's own Tev (cheap,
+  // reads shared read-only bpmem, writes that ctx's own m_StageCache). Konst colors were already
+  // set on every ctx by SetTevKonstColors().
+  for (int b = 1; b < T; b++)
+  {
+    RasterContext& wctx = g_ctx_pool[b];
+    wctx.WSlope = ctx.WSlope;
+    std::memcpy(wctx.ColorSlopes, ctx.ColorSlopes, sizeof(ctx.ColorSlopes));
+    std::memcpy(wctx.TexSlopes, ctx.TexSlopes, sizeof(ctx.TexSlopes));
+    wctx.tev.SetupStages();
+  }
+
+  // Compute the band boundaries, dispatch bands 1..T-1 to the workers, run band 0 in-place.
+  s32 band_y = y_start;
+  for (int b = 0; b < T; b++)
+  {
+    const s32 rows_b = (base + (b < extra ? 1 : 0)) * BLOCK_SIZE;
+    s32 y_begin = band_y;
+    s32 y_end = std::min(band_y + rows_b, maxy);
+    band_y = y_end;
+
+    if (b == 0)
+      continue;  // band 0 runs last, in place, so the FIFO thread overlaps with the workers
+
+    RasterWorker& wkr = s_workers[b];
+    pthread_mutex_lock(&wkr.mtx);
+    BandJob& j = wkr.job;
+    j.y_begin = y_begin;
+    j.y_end = y_end;
+    j.minx = minx;
+    j.maxx = maxx;
+    j.miny = miny;
+    j.maxy = maxy;
+    j.block_minx = block_minx;
+    j.C1 = C1;
+    j.C2 = C2;
+    j.C3 = C3;
+    j.DX12 = DX12;
+    j.DX23 = DX23;
+    j.DX31 = DX31;
+    j.DY12 = DY12;
+    j.DY23 = DY23;
+    j.DY31 = DY31;
+    j.FDX12 = FDX12;
+    j.FDX23 = FDX23;
+    j.FDX31 = FDX31;
+    j.FDY12 = FDY12;
+    j.FDY23 = FDY23;
+    j.FDY31 = FDY31;
+    wkr.has_job = true;
+    wkr.job_done = false;
+    pthread_cond_signal(&wkr.go_cv);
+    pthread_mutex_unlock(&wkr.mtx);
+  }
+
+  // Band 0 on the calling thread (overlaps the workers' bands).
+  {
+    const s32 rows_0 = (base + (0 < extra ? 1 : 0)) * BLOCK_SIZE;
+    const s32 y0_end = std::min(y_start + rows_0, maxy);
+    RasterizeBand(g_ctx_pool[0], y_start, y0_end, minx, maxx, miny, maxy, block_minx, C1, C2, C3,
+                  DX12, DX23, DX31, DY12, DY23, DY31, FDX12, FDX23, FDX31, FDY12, FDY23, FDY31);
+  }
+
+  // Barrier: wait for every dispatched worker band to finish before this triangle returns (so the
+  // next primitive / BP command sees a fully-rasterized EFB). Real condvar wait, no busy-yield.
+  for (int b = 1; b < T; b++)
+  {
+    RasterWorker& wkr = s_workers[b];
+    pthread_mutex_lock(&wkr.mtx);
+    while (!wkr.job_done)
+      pthread_cond_wait(&wkr.done_cv, &wkr.mtx);
+    pthread_mutex_unlock(&wkr.mtx);
+  }
+
+  // Reduce the per-worker non-atomic partials (perf-query counters + bounding box) into the
+  // canonical slots now that all bands are complete. g_stats is diagnostic-only and dropped on
+  // worker threads (see the INCSTAT sites).
+  EfbInterface::ReducePerfPartials();
+  BBoxManager::ReducePartials();
 }
 
 void DrawTriangleFrontFace(const OutputVertexData* v0, const OutputVertexData* v1,
@@ -509,6 +790,6 @@ void DrawTriangleFrontFace(const OutputVertexData* v0, const OutputVertexData* v
   INCSTAT(g_stats.this_frame.num_triangles_drawn);
 
   for (const auto& scissor : scissors)
-    DrawTriangleFrontFace(v0, v1, v2, scissor);
+    DrawTriangleFrontFace(g_ctx, v0, v1, v2, scissor);
 }
 }  // namespace Rasterizer

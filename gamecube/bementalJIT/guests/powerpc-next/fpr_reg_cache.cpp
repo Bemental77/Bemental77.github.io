@@ -16,6 +16,12 @@
 
 namespace bemental::powerpc {
 
+// [simd-paired] NaN-payload-exact ConvertToDouble(f32 bits in LOCAL_PSQ_T0=98)
+// -> pushes i64 f64-bits. Defined in jit_load_store.cpp; forward-declared here
+// to avoid pulling the whole jit_load_store.h surface into the reg cache.
+void emit_psq_convert_to_double(WasmModuleBuilder& wb);
+static constexpr u32 LOCAL_PSQ_T0 = 98u;  // shared i32 scratch (jit_load_store.cpp:1061)
+
 FPRRegCache::FPRRegCache(WasmModuleBuilder& wb)
     : m_wb(wb) {}
 
@@ -24,18 +30,40 @@ FPRRegCache::FPRRegCache(WasmModuleBuilder& wb)
 // Live-in pregs (block.m_fpr_inputs) get the assigned bit so the prologue
 // emits their loads. Other pregs are lazily assigned on first Bind.
 void FPRRegCache::OnBlockEntry(const CodeBlock& block, u32 wasm_local_base,
-                               u32 ctx_ptr) {
+                               u32 ctx_ptr, u32 v128_local_base) {
     m_local_base   = wasm_local_base;
+    m_v128_base    = v128_local_base;
     m_if_depth     = 0;
     m_lazy_ctx_ptr = ctx_ptr;
     for (u32 i = 0; i < 32; ++i) {
         m_state[i] = PregState{};
-        m_state[i].ps0_local_idx = wasm_local_base + i;
-        m_state[i].ps1_local_idx = wasm_local_base + 32u + i;
+        m_state[i].ps0_local_idx  = wasm_local_base + i;
+        m_state[i].ps1_local_idx  = wasm_local_base + 32u + i;
+        m_state[i].v128_local_idx = v128_local_base + i;
+        m_state[i].repr = FPRPrec::Double;   // memory is f64; single is produced
         if (block.m_fpr_inputs[i]) {
             m_state[i].assigned = true;
         }
     }
+}
+
+// EmitPromoteToDouble — reconcile a Single-repr FPR (v128 f32x2) back into its
+// i64 lane pair, per-lane, via the NaN-payload-exact ConvertToDouble widen
+// (matches the interpreter's ps[] f64 write). Sets repr=Double, lanes dirty.
+void FPRRegCache::EmitPromoteToDouble(u32 preg) {
+    PregState& s = m_state[preg];
+    for (u8 lane = 0; lane < 2; ++lane) {
+        m_wb.op_local_get(s.v128_local_idx);
+        m_wb.op_f32x4_extract_lane(lane);
+        m_wb.op_i32_reinterpret_f32();
+        m_wb.op_local_set(LOCAL_PSQ_T0);
+        emit_psq_convert_to_double(m_wb);           // -> i64 f64-bits
+        m_wb.op_local_set(lane == 0 ? s.ps0_local_idx : s.ps1_local_idx);
+    }
+    s.repr = FPRPrec::Double;
+    s.v128_dirty = false;
+    s.ps0_loaded = s.ps1_loaded = true;
+    s.ps0_dirty  = s.ps1_dirty  = true;
 }
 
 // EmitPrologueLoads — for every live-in preg, emit i64 loads for BOTH lanes.
@@ -88,9 +116,15 @@ RCFprPair FPRRegCache::Bind(u32 preg, FPRMode mode, u8 lane_mask) {
     if (!s.assigned) {
         // Analyzer didn't mark this preg as live-in. Lazy-assign + lazy-
         // load — same shape as RegCache::Bind for analyzer-blind ops.
-        s.ps0_local_idx = m_local_base + preg;
-        s.ps1_local_idx = m_local_base + 32u + preg;
+        s.ps0_local_idx  = m_local_base + preg;
+        s.ps1_local_idx  = m_local_base + 32u + preg;
+        s.v128_local_idx = m_v128_base + preg;
         s.assigned = true;
+    }
+    // [simd-paired] A double-domain consumer must see the i64 pair. If the live
+    // value is in single form, reconcile it first (repr->Double, lanes loaded).
+    if (s.repr == FPRPrec::Single) {
+        EmitPromoteToDouble(preg);
     }
     // 2026-06-11: lazy-load fires for PURE-WRITE binds too — same class as
     // RegCache::Bind (see reg_cache.cpp): an RMW emitter that binds the
@@ -107,13 +141,47 @@ RCFprPair FPRRegCache::Bind(u32 preg, FPRMode mode, u8 lane_mask) {
         if (lane_mask & FPR_LANE_PS0) s.ps0_dirty = true;
         if (lane_mask & FPR_LANE_PS1) s.ps1_dirty = true;
     }
-    return RCFprPair{s.ps0_local_idx, s.ps1_local_idx};
+    RCFprPair r; r.ps0_idx = s.ps0_local_idx; r.ps1_idx = s.ps1_local_idx;
+    r.v128_idx = s.v128_local_idx; r.is_single = false;
+    return r;
+}
+
+// BindSingleRead — the FPR is already Single (caller checked IsSingle). Just
+// hand back its v128 local. No conversion, no emit.
+RCFprPair FPRRegCache::BindSingleRead(u32 preg) {
+    PregState& s = m_state[preg];
+    RCFprPair r; r.ps0_idx = s.ps0_local_idx; r.ps1_idx = s.ps1_local_idx;
+    r.v128_idx = s.v128_local_idx; r.is_single = true;
+    return r;
+}
+
+// BindSingleWrite — mark the FPR Single; the op writes an f32x2 into the v128
+// local. The i64 pair is now stale (not dirty — reconciled lazily from v128).
+RCFprPair FPRRegCache::BindSingleWrite(u32 preg) {
+    PregState& s = m_state[preg];
+    if (!s.assigned) {
+        s.ps0_local_idx  = m_local_base + preg;
+        s.ps1_local_idx  = m_local_base + 32u + preg;
+        s.v128_local_idx = m_v128_base + preg;
+        s.assigned = true;
+    }
+    s.repr = FPRPrec::Single;
+    s.v128_dirty = true;
+    s.ps0_dirty = s.ps1_dirty = false;   // i64 form stale, not to be flushed
+    RCFprPair r; r.ps0_idx = s.ps0_local_idx; r.ps1_idx = s.ps1_local_idx;
+    r.v128_idx = s.v128_local_idx; r.is_single = true;
+    return r;
 }
 
 // Flush dirty lanes back to PowerPCState.
 void FPRRegCache::Flush(u32 ctx_ptr, BitSet32 preg_mask, u8 lane_mask) {
     for (u32 i = 0; i < 32; ++i) {
         if (!preg_mask[i]) continue;
+        // [simd-paired] A Single-form FPR must be promoted to f64 before its
+        // i64 pair is stored — PowerPCState.ps[] is always f64.
+        if (m_state[i].repr == FPRPrec::Single && m_state[i].v128_dirty) {
+            EmitPromoteToDouble(i);   // repr->Double, both lanes dirty
+        }
         if ((lane_mask & FPR_LANE_PS0) && m_state[i].ps0_dirty) {
             EmitLaneStore(ctx_ptr, i, FPR_LANE_PS0);
         }
@@ -129,6 +197,10 @@ void FPRRegCache::Flush(u32 ctx_ptr, BitSet32 preg_mask, u8 lane_mask) {
 void FPRRegCache::ReloadAll(u32 ctx_ptr) {
     for (u32 i = 0; i < 32; ++i) {
         if (!m_state[i].assigned) continue;
+        // [simd-paired] Host mutated ps[] (f64) — memory is authoritative; drop
+        // any single-form value and reload the i64 pair.
+        m_state[i].repr = FPRPrec::Double;
+        m_state[i].v128_dirty = false;
         // Force-reload both lanes regardless of dirty state. The host may
         // have mutated either lane; the cache must reflect that.
         m_wb.op_i32_const((s32)ctx_ptr);

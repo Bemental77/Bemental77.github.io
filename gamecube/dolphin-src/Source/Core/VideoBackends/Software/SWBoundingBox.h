@@ -26,6 +26,10 @@ void SetCoordinate(Coordinate coordinate, u16 value);
 
 // Updates all bounding box coordinates.
 void Update(u16 left, u16 right, u16 top, u16 bottom);
+
+// Fold the per-raster-worker bounding-box partials (min/max) into the canonical coordinates.
+// Called by the FIFO thread at the end-of-triangle barrier once all worker bands are complete.
+void ReducePartials();
 }  // namespace BBoxManager
 
 namespace SW

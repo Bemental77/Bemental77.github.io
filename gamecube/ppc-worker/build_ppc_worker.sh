@@ -23,13 +23,22 @@ OUT=$ROOT/gamecube/ppc-worker
 
 source $ROOT/emsdk/emsdk_env.sh > /dev/null 2>&1
 
-# Build bementalJIT static libs against emcc if not present.
-if [ ! -f "$BJIT_BUILD/libbementalJIT.a" ] || [ ! -f "$BJIT_BUILD/guests/powerpc/libbementalJITPowerPC.a" ]; then
-  echo "=== bementalJIT emcc lib build ==="
+# Build/refresh the bementalJIT static libs against emcc. Configure cmake ONCE (first run),
+# but ALWAYS run make so edits to gekko_emit.cpp / block_cache.cpp / any bementalJIT source are
+# recompiled into the lib the worker links. make is incremental — a near-no-op when nothing
+# changed. Previously the whole block was gated on the .a NOT existing, so any edit after the
+# first build silently linked a STALE lib (2026-06-30: cost a full session of JIT instrumentation
+# whose markers read as "silent" because they were never compiled into the worker).
+if [ ! -f "$BJIT_BUILD/Makefile" ]; then
+  echo "=== bementalJIT emcc cmake configure (first run) ==="
   mkdir -p "$BJIT_BUILD"
   cd "$BJIT_BUILD"
   emcmake cmake -DCMAKE_BUILD_TYPE=Release "$ROOT/gamecube/bementalJIT" > /tmp/bjit_cmake.log 2>&1
-  emmake make -j4 bementalJIT bementalJITPowerPC > /tmp/bjit_build.log 2>&1
+fi
+echo "=== bementalJIT emcc lib build (incremental — recompiles changed sources) ==="
+cd "$BJIT_BUILD"
+if ! emmake make -j4 bementalJIT bementalJITPowerPC > /tmp/bjit_build.log 2>&1; then
+  echo "bementalJIT emcc lib build FAILED — see /tmp/bjit_build.log"; tail -20 /tmp/bjit_build.log; exit 1
 fi
 
 EXPORTED_FUNCS='["_main","_malloc","_free","_dolphin_stack_corrupt","_ppc_worker_init","_ppc_worker_dispatch","_ppc_worker_shutdown","_ppc_worker_version","_ppc_worker_peek_u32","_ppc_worker_poke_u32","_ppc_worker_mailbox_post_demo","_ppc_worker_mailbox_call_sync","_ppc_worker_mailbox_call_sync2","_ppc_worker_mmio_read8","_ppc_worker_mmio_read16","_ppc_worker_mmio_read32","_ppc_worker_mmio_write8","_ppc_worker_mmio_write16","_ppc_worker_mmio_write32","_ppc_worker_compile_block","_ppc_worker_compile_buf_addr","_ppc_worker_compile_cycles","_ppc_worker_region_n_funcs","_ppc_worker_compile_and_accumulate","_ppc_worker_relink_region_if_due","_ppc_worker_region_generation","_ppc_worker_region_dispatch_pc","_ppc_worker_force_relink_all","_ppc_worker_ct_queue_init","_ppc_worker_ct_queue_count","_ppc_worker_ct_queue_ready","_ppc_worker_ct_fire_due_pure","_ppc_worker_ct_dolphin_pending_mask","_ppc_worker_ct_publish_event","_ppc_worker_ct_set_phase_flags","_ppc_worker_ct_get_phase_flags","_ppc_worker_ct_global_timer_lo","_ppc_worker_ct_global_timer_hi","_ppc_worker_advance_global_timer","_ppc_worker_set_downcount","_ppc_worker_slice_budget","_ppc_worker_commit_slice","_ppc_worker_set_perf_stub","_ppc_worker_set_hle_check_native","_ppc_worker_get_perf_stub","_ppc_worker_get_hle_check_native","_ppc_worker_run_slice"'

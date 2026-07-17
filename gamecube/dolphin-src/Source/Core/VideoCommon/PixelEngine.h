@@ -179,6 +179,11 @@ union UPECtrlReg
 class PixelEngineManager
 {
 public:
+  // [dual-core PE-finish flush 2026-07-07] force any pending token/finish interrupt to
+  // assert NOW (the CoreTiming set_token_finish event doesn't fire promptly under worker
+  // ownership — peFrames pinned, PE_FINISH never in piCause, GXDrawDone slept). Called
+  // from EmscriptenWorker service_iter after the GPU pump. Idempotent.
+  void FlushPendingTokenFinish();
   explicit PixelEngineManager(Core::System& system);
 
   void Init();

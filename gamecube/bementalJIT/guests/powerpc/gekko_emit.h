@@ -521,6 +521,7 @@ inline void emit_store_gpr(EmitCtx& c, u32 i) {
 void emit_gpr_get_impl(EmitCtx& c, u32 i, u32 ctx_ptr);
 void emit_gpr_set_impl(EmitCtx& c, u32 i, u32 ctx_ptr, u32 scratch);
 void emit_flush_dirty_gprs_impl(EmitCtx& c, u32 ctx_ptr);
+void emit_flush_dirty_gprs_inside_branch(EmitCtx& c, u32 ctx_ptr);  // no compile-state mutation (branch-safe)
 void emit_invalidate_gpr_locals(EmitCtx& c);
 
 // Wrappers around c.b.op_if/op_else/op_end that maintain
@@ -619,10 +620,49 @@ inline void emit_set_pc_dyn(EmitCtx& c, u32 ctx_ptr) {
 inline void emit_fallback(EmitCtx& c) {
     extern u32 g_ctx_ptr;
     emit_flush_dirty_gprs_impl(c, g_ctx_ptr);
+    // [fallback-pc fix 2026-07-09 — task #18] Write ctx.PC = this op's address BEFORE the
+    // interp call. dolphin_interp guards `if (ppc_state.pc != pc) return;` — with gekko's
+    // gated pre-op set_pc, ppc_state.pc is STALE at fallback sites whose preceding ops were
+    // native (observed live: [interp-vec-skip] ppc_state.pc = pc+4/other inside the
+    // 0x500/0x900/0xC00 exception stubs), so stub instructions were SILENTLY SKIPPED ->
+    // corrupted exception handling -> bogus SRR0/SRR1 contexts -> the ISI-at-0x594(IR=1)/
+    // PPCHalt face-lottery. Mirrors powerpc-next's emit_fallback (its documented fix for
+    // this exact class). Safe to force: within a gekko block no legit mid-block redirect
+    // precedes a fallback (deliveries are block-boundary-only; redirecting fallbacks
+    // rfi/sc/bclr are terminators), and the guard-passing path's post-op PC behavior is
+    // unchanged. NOTE: AoT pack blocks bake the OLD fallback until regen (task #19);
+    // vector stubs are runtime-compiled ([vector no-cache]) so they get this fix now.
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_const((s32)c.pc);
+    c.b.op_i32_store(ppc_off::PC);
     c.b.op_i32_const((s32)c.inst);
     c.b.op_i32_const((s32)c.pc);
     c.b.op_call(WIMPORT_INTERP);
     emit_invalidate_gpr_locals(c);
+    // [redirect-honor 2026-07-09 — THE mid-block delivery window fix] SingleStepInner can
+    // REDIRECT ctx.PC inside this call (rfi/sc branch targets, and sync-exception delivery at
+    // the faulting op — which is load-bearing and must stay synchronous per the owner-gate
+    // revert). If post-call ctx.PC is neither this op's address (guard-skip/no-move) nor the
+    // sequential next (normal advance), the interp redirected: END THE BLOCK NOW and return
+    // the redirect target, so no later emitted op (native, or a fallback whose PC pre-store
+    // would clobber the redirect) runs over it. Mirrors powerpc-next's emit_fallback contract.
+    // Observed kill-class: sc/DEC delivery mid-flow -> 0xC00/0x900 stubs entered at raw IR=1
+    // msr -> ISI at 0xC18/0x994 -> nested -> PPCHalt (deliv-ring, rolls pr_1/pr_3).
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_load(ppc_off::PC);
+    c.b.op_local_tee(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)c.pc);
+    c.b.op_i32_ne();
+    c.b.op_local_get(LOCAL_TMP_A);
+    c.b.op_i32_const((s32)(c.pc + 4u));
+    c.b.op_i32_ne();
+    c.b.op_i32_and();
+    c.b.op_if(0x40);
+        emit_flush_dirty_gprs_inside_branch(c, g_ctx_ptr);
+        c.b.op_i32_const((s32)g_ctx_ptr);
+        c.b.op_i32_load(ppc_off::PC);
+        c.b.op_return();
+    c.b.op_end();
     c.used_fallback = true;
 }
 

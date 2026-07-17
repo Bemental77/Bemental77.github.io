@@ -503,11 +503,47 @@ void ProgramShaderCache::CreateAttributelessVAO()
   // Initialize the buffer with nothing. 16 floats is an arbitrary size that may work around driver
   // issues.
   glBindBuffer(GL_ARRAY_BUFFER, s_attributeless_VBO);
-  glBufferData(GL_ARRAY_BUFFER, sizeof(GLfloat) * 16, nullptr, GL_STATIC_DRAW);
-
-  // We must also define vertex attribute 0.
   glBindVertexArray(s_attributeless_VAO);
+#ifdef __EMSCRIPTEN__
+  // WebGL2/proxied-OffscreenCanvas does not honor the bufferless gl_VertexID +
+  // attributeless fullscreen-triangle (glDrawArrays renders zero coverage — proven by
+  // the blue-clear test; same class as the base-vertex no-op forced false in
+  // OGLConfig.cpp). Back attribute 0 (ShaderAttrib::Position / "rawpos") with the 3
+  // real fullscreen-triangle verts so the blit VS reads them instead of gl_VertexID.
+  // Per vertex vec4(clip.x, clip.y, tex.x, tex.y); matches tex=((id<<1)&2,id&2),
+  // clip=tex*(2,-2)+(-1,1): tex{(0,0),(2,0),(0,2)} -> clip{(-1,1),(3,1),(-1,-3)}.
+  // 16 verts so glDrawElements size-validation passes for ANY bufferless Draw(0,N<=16)
+  // (the index buffer is {0..15}); only the first 3 matter for the rawpos fullscreen
+  // triangle, the rest are padding (gl_VertexID-driven blits read gl_VertexID=index,
+  // not the attribute). Undersizing this -> "vertex buffer not big enough" -> ANGLE
+  // turns it into a fatal GPU-process crash on the Metal path.
+  static const GLfloat s_fst_verts[64] = {
+      -1.0f, 1.0f,  0.0f, 0.0f,  // v0 (fullscreen-triangle)
+      3.0f,  1.0f,  2.0f, 0.0f,  // v1
+      -1.0f, -3.0f, 0.0f, 2.0f,  // v2
+      // v3..v15 padding (copies of v0) — present only to satisfy the size check:
+      -1.0f, 1.0f, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f, 0.0f,  //
+      -1.0f, 1.0f, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f, 0.0f,  //
+      -1.0f, 1.0f, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f, 0.0f,  //
+      -1.0f, 1.0f, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f, 0.0f, -1.0f, 1.0f, 0.0f, 0.0f,  //
+      -1.0f, 1.0f, 0.0f, 0.0f,                                                    //
+  };
+  glBufferData(GL_ARRAY_BUFFER, sizeof(s_fst_verts), s_fst_verts, GL_STATIC_DRAW);
+  glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, nullptr);
+  // Index buffer {0..15} captured by this VAO so OGLGfx::Draw can use glDrawElements
+  // (glDrawArrays renders nothing on the proxied WebGL2 ctx). VAO captures the bound
+  // GL_ELEMENT_ARRAY_BUFFER, so this association persists with s_attributeless_VAO.
+  GLuint s_attributeless_IBO = 0;
+  glGenBuffers(1, &s_attributeless_IBO);
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s_attributeless_IBO);
+  static const GLushort s_fst_idx[16] = {0, 1, 2,  3,  4,  5,  6,  7,
+                                         8, 9, 10, 11, 12, 13, 14, 15};
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(s_fst_idx), s_fst_idx, GL_STATIC_DRAW);
+#else
+  glBufferData(GL_ARRAY_BUFFER, sizeof(GLfloat) * 16, nullptr, GL_STATIC_DRAW);
+  // We must also define vertex attribute 0.
   glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+#endif
   glEnableVertexAttribArray(0);
 }
 

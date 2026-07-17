@@ -206,16 +206,17 @@
   _moduleDummyCanvas.height = 1;
   // Phase 2c Step 3: PAGE allocates ONE shared WebAssembly.Memory
   // (sized to dolphin_worker's INITIAL_MEMORY = 512 MB, MAX = 4 GB).
-  // Set on Module.wasmMemory BEFORE dolphin_libretro.js runs so the
-  // emcc bootstrap uses it for the main pthread (which becomes
-  // dolphin_worker). ppc-worker is given the SAME memory in var_setup.
+  // [fixed-heap tried+reverted 2026-07-14] A fixed 1.5GB heap (drop ALLOW_MEMORY_GROWTH) removed
+  // the 644 growMemViews guards but was fps-NEUTRAL — the inlined guard is a branch-predicted
+  // buffer compare, ~free in wall-time (2.2% of profile SAMPLES != 2.2% removable). Kept growable
+  // to avoid the 3x upfront-memory cost. Measured wasm peak = 729 MB, no leak.
   var sharedMemory = new WebAssembly.Memory({
     initial: 536870912 / 65536,    // 512 MB / 64 KB pages = 8192
     maximum: 4294967296 / 65536,   // 4 GB / 64 KB pages = 65536
     shared: true,
   });
   var Module = window.Module = { preRun: [], postRun: [], locateFile: f => '/gamecube/dolphin_libretro/' + f, print: t => pageLog(String(t)), printErr: t => pageLog('[err] ' + String(t)), canvas: _moduleDummyCanvas, setStatus: setStatus, totalDependencies: 0, monitorRunDependencies: () => {}, wasmMemory: sharedMemory };
-  console.log('[ppc-worker-handshake] sharedMemory allocated at page-load (initial=' + (sharedMemory.buffer.byteLength >>> 20) + ' MB)');
+  console.log('[ppc-worker-handshake] sharedMemory allocated at page-load (fixed=' + (sharedMemory.buffer.byteLength >>> 20) + ' MB)');
 
   // [FIX#1 render-worker] OFF by default — when false EVERYTHING below behaves
   // byte-identically to the legacy path. Set window.__gcRenderWorker=true (e.g.
@@ -234,12 +235,28 @@
   // Flag default OFF. Probe-settable without page edits via ?renderWorker=1
   // (the GC probe forwards PROBE_QUERY into the URL). Explicit window assignment
   // before this script still wins.
+  // [SW-render 2026-06-25] The dolphin .wasm now FORCES Dolphin's Software Renderer
+  // (Video.cpp Init early-return under __EMSCRIPTEN__): it rasterizes the XFB on the
+  // CPU and presents it via libretro video_cb -> dolphin_worker postMessage
+  // {cmd:'render',pixels} -> paintFrame2D (putImageData to the MAIN-THREAD #canvas,
+  // the PS1 model). No WebGL2, no OffscreenCanvas, no GPU overlay -> runs on any
+  // device, no crbug-948249 crash. The render-worker / bitmaprenderer HW path is
+  // moot under Software, so default it OFF. Opt back into HW by setting
+  // window.__gcSoftwareRender=false before this script runs.
+  if (typeof window.__gcSoftwareRender === 'undefined') {
+    try { window.__gcSoftwareRender = !/[?&]hwRender=1\b/.test(location.search); }
+    catch (e) { window.__gcSoftwareRender = true; }
+  }
   if (typeof window.__gcRenderWorker === 'undefined') {
-    // [perf] Default ON: offloading GL replay/texture-upload to a dedicated
-    // render worker frees the JIT/CPU worker and measured ~1.4x guest-tick
-    // throughput (66M vs 46M ticks/s, A/B 2026-06-22). Disable with ?renderWorker=0.
-    try { window.__gcRenderWorker = !/[?&]renderWorker=0\b/.test(location.search); }
-    catch (e) { window.__gcRenderWorker = true; }
+    if (window.__gcSoftwareRender) {
+      window.__gcRenderWorker = false;  // Software presents via paintFrame2D, not GL-record
+    } else {
+      // [perf] Default ON: offloading GL replay/texture-upload to a dedicated
+      // render worker frees the JIT/CPU worker and measured ~1.4x guest-tick
+      // throughput (66M vs 46M ticks/s, A/B 2026-06-22). Disable with ?renderWorker=0.
+      try { window.__gcRenderWorker = !/[?&]renderWorker=0\b/.test(location.search); }
+      catch (e) { window.__gcRenderWorker = true; }
+    }
   }
   // Region constants (always defined). The descriptor is written into the shared
   // heap LATER, inside var_setup (window.__gcWriteGlDesc), so a probe that flips
@@ -290,6 +307,13 @@
     // Module.wasmMemory so dolphin_libretro.js's pthread spawn picks it up.
     // We re-fetch it here for ppc-worker.
     window.sharedMemory = sharedMemory;
+    // [determinize-takeover sweep 2026-07-08] arm-frame from ?armframe=N → SAB 0x026B0A30
+    // (dolphin SetFinish reads it; 0/default → 100). Lets the deterministic takeover point
+    // be swept to find a good advancing face without a rebuild.
+    try {
+      var _armFrame = parseInt((new URLSearchParams(location.search).get('armframe')) || '0', 10) || 0;
+      new Uint32Array(sharedMemory.buffer)[0x026B0A30 >> 2] = _armFrame;
+    } catch (e) {}
 
     // Spawn dolphin (its main pthread inherits sharedMemory via
     // Module.wasmMemory which was set in the page Module above).
@@ -307,51 +331,130 @@
     // Dolphin's OGL backend renders WebGL2 directly into it on the GPU (instead
     // of the CPU-thread Software Renderer). transferControlToOffscreen is
     // once-only, so flag it and have the gpu-worker SW-present path stand down.
+    // [WGPU M1] ?wgpu=1 selects the native WebGPU backend, which renders into an OFFSCREEN
+    // texture on the proxied-main pthread, reads the pixels back, and postMessages them to the
+    // page in the SAME {cmd:'render',pixels} shape the Software renderer's video_cb uses. So the
+    // page side is the SOFTWARE PRESENT path: #canvas stays main-thread and paintFrame2D draws
+    // the worker's pixels. Do NOT force __gcSoftwareRender=false / transfer #canvas away — that
+    // would steal the 2D context the present path needs. The WGPU-select SAB flag is still
+    // written below (it's what makes the worker pick the WGPU backend).
+    // [default dual-core WebGPU 2026-06-30] bare localhost:8080/gamecube.html IS the
+    // dual-core WebGPU build (testing + production). ?wgpu=0 disables for A/B debugging.
+    // [webgpu fallback 2026-07-11] __gcWebGPUUnavailable is set by startEmulator's adapter+device
+    // probe when WebGPU can't be created — force the OGL/WebGL2 backend (WebGPU-independent, boots)
+    // instead of the WGPU backend (freezes the boot at frame 0 on a null device).
+    // [2026-07-13] WGPU stays the default per user directive (dual-core gamecube.html with
+    // WebGPU IS the product — no URL forks). Known-open: WGPU output corruption (desaturated +
+    // offset chroma ghosts + scanline junk; MP4 opening A/B vs OGL: /tmp/gcshots vs
+    // /tmp/gcshots-ogl 2026-07-13). Fix lands in VideoBackends/WGPU, not in backend selection.
+    var _wgpu = !/[?&]wgpu=0/.test(location.search) && !window.__gcWebGPUUnavailable;
+    if (_wgpu) { window.__gcSoftwareRender = true; window.__gcRenderWorker = false; }
+    // [region-sweep] Thread BJIT_* tuning env vars from the URL into the worker's
+    // Module.ENV (getenv-read by the JIT block cache region caps — no rebuild needed).
+    // e.g. ?wgpu=1&bjit_max_gens=8&bjit_seal_batch=256&bjit_promote_after_ticks=20000000
+    var _bjitEnv = (function () {
+      var o = {}; new URLSearchParams(location.search).forEach(function (v, k) {
+        if (/^bjit_/i.test(k)) o[k.toUpperCase()] = v;
+      }); return o;
+    })();
     var _hwOff = null;
-    if (window.__gcRenderWorker) {
-      // [FIX#1] Transfer #canvas to the RENDER WORKER (it owns the WebGL2 ctx),
-      // NOT to dolphin_worker. transferControlToOffscreen is once-only, so under
-      // the flag dolphin_worker gets offscreen:null and the recording GLctx.
+    if (window.__gcSoftwareRender) {
+      // [SW-render 2026-06-25] Dolphin Software Renderer presents the XFB via
+      // libretro video_cb -> dolphin_worker postMessage{cmd:'render',pixels} ->
+      // paintFrame2D (putImageData to the MAIN-THREAD #canvas). #canvas MUST stay
+      // main-thread (do NOT transferControlToOffscreen) so getContext('2d') works.
+      // dolphin_worker gets a throwaway 640x480 OffscreenCanvas: under Software it
+      // never renders WebGL, but the worker's GL bring-up (get_proc_address) wants
+      // a handle; it is never presented.
+      _hwOff = new OffscreenCanvas(640, 480);
+      window.__gcHwCanvasTransferred = false;
+      pageLog('[sw-render] Software Renderer: #canvas kept main-thread for paintFrame2D');
+    } else if (window.__gcRenderWorker) {
+      // [main-thread WebGL2 replay, variant A-ii — crbug 948249 fix] The dolphin
+      // worker RECORDS the GX->GL command stream into the SAB ring (gl-record.js,
+      // unchanged); the REPLAY runs HERE, on the MAIN THREAD, against a WebGL2
+      // context bound directly to #canvas, presented by the normal composited
+      // canvas swap. No worker owns a GPU surface, so the macOS-Metal overlay /
+      // SharedImage-teardown path (worker OffscreenCanvas scanned out, or a
+      // per-frame transferToImageBitmap minting IOSurface-backed SharedImages)
+      // never forms. This is the only architecture that is both GPU-accelerated
+      // 3D (real OGL rasterization) AND crash-free on this platform.
       try {
-        // Write the GL descriptor + ring/ctrl headers into the shared heap NOW
-        // (final flag value known), so dolphin_worker's load_iso (proxy-pthread)
-        // and the render worker both see it. Must precede load_iso.
-        window.__gcWriteGlDesc();
         var _rwCanvas = document.getElementById('canvas');
-        var _rwOff = (_rwCanvas && typeof _rwCanvas.transferControlToOffscreen === 'function')
-          ? _rwCanvas.transferControlToOffscreen() : null;
-        if (_rwOff) {
-          window.__gcHwCanvasTransferred = true;
-          var rw = new Worker('/gamecube/render-worker.js?v=' + Date.now());
-          window.__gcRenderWorkerObj = rw;
-          rw.onmessage = function (e) {
-            var m = e.data || {};
-            if (m.cmd === 'ready') pageLog('[fix1] render-worker ready');
-            else if (m.cmd === 'init-failed') pageLog('[fix1] render-worker init FAILED: ' + m.reason);
-            else if (m.cmd === 'gl-error') pageLog('[fix1] render-worker gl-error op=' + m.op + ' ' + m.msg);
-            else if (m.cmd === 'stats') pageLog('[fix1] render-worker framesPainted=' + m.framesPainted);
+        // Create the SOLE WebGL2 context on the MAIN THREAD, on #canvas. NO
+        // `desynchronized` (that forces the SingleBuffer/overlay present path that
+        // is broken on macOS). Default = double-buffered, composited, scanned out
+        // through the normal renderer-compositor queue — the path that never crashed.
+        var _mtGl = null;
+        try {
+          _mtGl = _rwCanvas && _rwCanvas.getContext ? _rwCanvas.getContext('webgl2', {
+            alpha: false, depth: true, stencil: true, antialias: false,
+            preserveDrawingBuffer: false, premultipliedAlpha: false,
+            failIfMajorPerformanceCaveat: false,
+          }) : null;
+        } catch (e) { pageLog('[mtgl] getContext(webgl2) threw: ' + (e && e.message)); }
+        if (_mtGl && !(typeof _mtGl.isContextLost === 'function' && _mtGl.isContextLost())) {
+          // Write the GL descriptor ONLY once the main-thread WebGL2 context
+          // exists. The C++ recorder-install gate (EmscriptenWorker load_iso)
+          // keys off this descriptor in the shared heap, so writing it commits
+          // Dolphin's GL stream to OUR ring. Must precede load_iso. (If we fell
+          // back to software below, we must NOT write it — Dolphin would record
+          // into a ring nobody drains.)
+          window.__gcWriteGlDesc();
+          window.__gcHwCanvasTransferred = false;   // #canvas stays main-thread
+          window.__gcMtGl = _mtGl;
+          // Route render-worker.js's logger to the page log.
+          window.pageLog = pageLog;
+          // Context-loss → fall back to software present (paintFrame2D). The
+          // software path already exists; flip the flag so a later context loss
+          // routes the worker's video_cb pixel path back to the 2D canvas.
+          _rwCanvas.addEventListener('webglcontextlost', function (ev) {
+            ev.preventDefault();
+            pageLog('[mtgl] WebGL2 context LOST — routing to software present');
+            window.__gcSoftwareRender = true; window.__gcRenderWorker = false;
+            canvasCtx2D = null; canvasImg2D = null; // re-init 2D ctx on next paintFrame2D
+          }, false);
+          // Load render-worker.js as a MAIN-THREAD script (NOT a Worker) and run
+          // its replay loop here. The dolphin worker won't emit GL frames until
+          // well after boot (seconds), so the async script load completes first.
+          var _mtScript = document.createElement('script');
+          _mtScript.src = '/gamecube/render-worker.js?v=' + Date.now();
+          _mtScript.onload = function () {
+            try {
+              var ok = window.__gcStartMainThreadReplay && window.__gcStartMainThreadReplay({
+                gl: _mtGl, canvas: _rwCanvas, memory: sharedMemory,
+                ringByteOff: window.__gcGl.ringOff, ringWords: window.__gcGl.ringWords,
+                ctrlByteOff: window.__gcGl.ctrlOff,
+              });
+              pageLog('[mtgl] main-thread WebGL2 replay ' + (ok ? 'STARTED' : 'FAILED to start'));
+              if (!ok) { window.__gcSoftwareRender = true; window.__gcRenderWorker = false; }
+            } catch (e) {
+              pageLog('[mtgl] startMainThreadReplay threw: ' + (e && e.message));
+            }
           };
-          rw.postMessage({ cmd: 'init', canvas: _rwOff, memory: sharedMemory,
-                           ringByteOff: window.__gcGl.ringOff, ringWords: window.__gcGl.ringWords,
-                           ctrlByteOff: window.__gcGl.ctrlOff },
-                         [_rwOff]);
-          pageLog('[fix1] render-worker spawned, canvas transferred to it');
-          // dolphin_worker still needs its OWN GL context (for get_proc_address +
-          // the recording GLctx). Give it a PAGE-CREATED throwaway OffscreenCanvas
-          // transferred via the normal mem-init path — a worker-created canvas is
-          // NOT proxied to the proxy-pthread the way a transferred one is, which
-          // left a null function in retro_load_game. The real #canvas is the
-          // render worker's; this 640x480 is never presented.
+          _mtScript.onerror = function () { pageLog('[mtgl] render-worker.js failed to load'); };
+          document.head.appendChild(_mtScript);
+          pageLog('[mtgl] #canvas WebGL2 ctx created on MAIN thread; replay loads next');
+          // dolphin_worker still needs its OWN throwaway GL context (for
+          // get_proc_address + the recording GLctx overlay). Give it a page-created
+          // 640x480 OffscreenCanvas transferred via the normal mem-init path. It is
+          // NEVER presented/scanned out — only get_proc_address resolves against it,
+          // and the recorder diverts every draw into the ring.
           _hwOff = new OffscreenCanvas(640, 480);
-          pageLog('[fix1] dolphin_worker throwaway canvas created (page-side, transferred)');
+          pageLog('[mtgl] dolphin_worker throwaway canvas created (never presented)');
         } else {
-          pageLog('[fix1] WARN: transferControlToOffscreen unavailable; render-worker disabled');
+          pageLog('[mtgl] WARN: main-thread WebGL2 unavailable — falling back to Software present');
           window.__gcRenderWorker = false;
+          window.__gcSoftwareRender = true;
+          // Software path keeps #canvas main-thread; give dolphin its throwaway ctx.
+          _hwOff = new OffscreenCanvas(640, 480);
+          window.__gcHwCanvasTransferred = false;
         }
       } catch (e) {
-        console.error('[fix1] render-worker setup FAILED: ' + (e && e.message ? e.message : e) + ' | stack: ' + (e && e.stack ? e.stack : ''));
-        pageLog('[fix1] render-worker setup failed: ' + (e && e.message));
+        console.error('[mtgl] main-thread replay setup FAILED: ' + (e && e.message ? e.message : e) + ' | stack: ' + (e && e.stack ? e.stack : ''));
+        pageLog('[mtgl] main-thread replay setup failed: ' + (e && e.message));
         window.__gcRenderWorker = false;
+        window.__gcSoftwareRender = true;
       }
     } else {
       // [HW-render legacy] Transfer #canvas to dolphin_worker (default path).
@@ -365,8 +468,13 @@
     }
     dolphin_worker.postMessage({
       cmd: 'mem-init', memory: sharedMemory, offscreen: _hwOff,
-      gcRenderWorker: !!window.__gcRenderWorker,
+      gcRenderWorker: !!window.__gcRenderWorker, wgpu: _wgpu, bjitEnv: _bjitEnv,
     }, _hwOff ? [_hwOff] : []);
+    if (_wgpu) {
+      // [WGPU] Shared-heap flag the worker's proxy-pthread reads (EM_ASM in load_iso) to
+      // skip its WebGL bring-up. 'WGPU' = 0x57475055 at 0x07FF0100; written before load_iso.
+      new Uint32Array(sharedMemory.buffer)[0x07FF0100 >> 2] = 0x57475055;
+    }
     // 2e.3c: pre-write a cross-boundary sentinel at SAB[0x02400000].
     // dolphin's heartbeat (every 4096 JIT iters) reads this address
     // and logs '[dolphin-sab-read] SAB[0x02400000]=0xCAFE1234'. If
@@ -673,7 +781,12 @@
       // heartbeat so its pthread can drain the proxied MMIO/HLE call
       // queue from page-mediated mailbox traffic. Default OFF until
       // boot-dispatch is validated.
-      var ppcBootDispatchEnabled = new URLSearchParams(location.search).has('ppcbootdispatch');
+      // [default dual-core 2026-06-30] bare URL runs the ppc-worker boot dispatcher; ?ppcbootdispatch=0 disables.
+      var ppcBootDispatchEnabled = !/[?&]ppcbootdispatch=0/.test(location.search);
+          // [direction 2026-07-06, user directive] DUAL-CORE IS THE PRODUCT and the page
+          // default. The single-executor path (?ppcbootdispatch=0) is the REFERENCE ONLY —
+          // its measured bar: 25.7 guest-fps avg, steady frame=10-24ms (probe table
+          // 2026-07-06). Dual-core work is judged against that bar.
       window._ppcDispatchEnabled = ppcDispatchEnabled;  // surfaced for onWorkerMsg (outer scope)
       window._ppcPerfEnabled = ppcPerfEnabled;
       window._ppcPerfSynthEnabled = ppcPerfSynthEnabled;
@@ -930,21 +1043,51 @@
                   if (sentinel !== 0xCAFEBABE) return;
                   var addr = u32[0x02500020 >> 2] >>> 0;
                   var size = u32[0x02500024 >> 2] >>> 0;
+                  var ctxPtr = u32[0x0250002C >> 2] >>> 0;  // [ppc-bridge] dolphin's real &ppc_state
                   if (addr === 0 || size === 0) return;
                   if (window._ppcMem1Wired) return;
                   window._ppcMem1Wired = true;
+                  window._ppcRealCtxPtr = ctxPtr;  // [ppc-bridge] gate poll reads PC (OFFSET_PC=0) here
                   console.log('[ppc-worker-handshake] dolphin ram (SAB-direct)'
                     + ' addr=0x' + addr.toString(16)
-                    + ' size=0x' + size.toString(16));
+                    + ' size=0x' + size.toString(16)
+                    + ' ctx=0x' + ctxPtr.toString(16));
                   clearInterval(window._ppcRamInfoPoll);
                   window._ppcRamInfoPoll = null;
-                  try {
-                    window.ppc_worker.postMessage({
-                      cmd: 'update-mem',
-                      mem1Addr: addr,
-                      mem1Size: size,
+                  // [AoT — Task 2] ?aot=1: fetch the pre-compiled MP4 pack and hand it to the
+                  // worker BEFORE update-mem (the worker enables it on mem1 verify).
+                  // [aot default-on 2026-07-04] the chain pack IS the CPU — plain
+                  // gamecube.html loads it; ?noaot opts out (runtime compile only).
+                  var _aotWanted = !new URLSearchParams(location.search).has('noaot');
+                  var _sendUpdateMem = function () {
+                    try {
+                      window.ppc_worker.postMessage({
+                        cmd: 'update-mem',
+                        mem1Addr: addr,
+                        mem1Size: size,
+                        ppcStateAddr: ctxPtr,
+                      });
+                    } catch (e) {}
+                  };
+                  if (_aotWanted && !window._aotSent) {
+                    window._aotSent = true;
+                    Promise.all([
+                      fetch('/gamecube/aot/mp4/aot_funcs.bin').then(function (r) { return r.arrayBuffer(); }),
+                      fetch('/gamecube/aot/mp4/aot_blocks.bin').then(function (r) { return r.arrayBuffer(); }),
+                      fetch('/gamecube/aot/mp4/aot_pack.bin').then(function (r) { return r.arrayBuffer(); }),
+                    ]).then(function (bufs) {
+                      window.ppc_worker.postMessage({ cmd: 'load-aot',
+                        funcs: bufs[0], blocks: bufs[1], pack: bufs[2],
+                        mem1: 0x1A4B7498 }, bufs);
+                      console.log('[aot] pack posted to worker');
+                      _sendUpdateMem();
+                    }).catch(function (e) {
+                      console.log('[aot] fetch failed: ' + e + ' — runtime compile only');
+                      _sendUpdateMem();
                     });
-                  } catch (e) {}
+                  } else {
+                    _sendUpdateMem();
+                  }
                 }, 100);
               }
               return;
@@ -1008,10 +1151,31 @@
             deliverReply(msg.reply, msg.reply_extra1, msg.reply_extra2);
           };
           dolphin_worker.addEventListener('message', window._ppcMboxReplyListener);
-          window._ppcMboxConsumer = setInterval(function () {
+          // [atomics-handoff 2026-07-06, Step 3] waitAsync-driven consumer: wakes on the
+          // worker's Atomics.notify within microseconds instead of the 4ms interval clamp.
+          // The interval remains as a low-rate fallback sweep (missed-notify safety).
+          var _mbxConsume;
+          var _armWaitAsync = function () {
+            if (typeof Atomics.waitAsync !== 'function') return;
+            try {
+              var cur = Atomics.load(i32, MBX_REQ_READY >> 2);
+              if (cur === 1) { _mbxConsume(); }
+              var res = Atomics.waitAsync(i32, MBX_REQ_READY >> 2, cur);
+              if (res.async) { res.value.then(function () { _mbxConsume(); _armWaitAsync(); }); }
+              else { setTimeout(_armWaitAsync, 0); }
+            } catch (e) { /* fall back to the interval sweep */ }
+          };
+          setTimeout(_armWaitAsync, 0);
+          window._ppcMboxConsumer = setInterval(_mbxConsume = function () {
             if (inFlight) return;
-            var req = Atomics.load(i32, MBX_REQ_READY >> 2);
-            if (req !== 1) return;
+            // [single-consumer claim 2026-07-10 — PERMANENT] The in-process pthread drain
+            // (EmscriptenWorker.cpp dolphin_drain_mailbox_once) watches the SAME slot. The
+            // old load-without-clear here let BOTH consumers service one posted request —
+            // the page's forwarded copy executed LATE on dolphin worker-main while the
+            // ppc-worker was already mid-slice past it: duplicate guest MMIO ops (duplicate
+            // DSP mail HI/LO = the torn/frankenstein-mail wedge family). CAS-claim the slot;
+            // only the winner services. The drain claims with the same CAS.
+            if (Atomics.compareExchange(i32, MBX_REQ_READY >> 2, 1, 0) !== 1) return;
             var cmd  = Atomics.load(i32, MBX_CMD  >> 2);
             var arg0 = Atomics.load(i32, MBX_ARG0 >> 2);
             var arg1 = Atomics.load(i32, MBX_ARG1 >> 2);
@@ -1061,9 +1225,22 @@
             }
             inFlight = true;
             dolphin_worker.postMessage({ cmd: 'mbx-cmd', mboxCmd: cmd, arg0: arg0, arg1: arg1 });
-          }, 4);
+          }, 20);
           // 2c.4c PING test.
-          ppc_worker.postMessage({ cmd: 'mailbox-call', mboxCmd: 1, arg0: 42 });
+          // [bisect 2026-06-28] Under ?ppcbootdispatch alone (no ?ppctest)
+          // the gate-flag listener + page mailbox consumer are now LIVE;
+          // the boot-dispatch gate (the setInterval below) opens on its
+          // own once dolphin posts runtime-ready + MEM1 wires. Everything
+          // past this point is the VERIFICATION chain (mmio-suite, env,
+          // region-instantiate, and the `run startPc=0x80003100` apploader
+          // dispatch test that executes guest code on the SHARED ppc_state
+          // CONCURRENTLY with dolphin's own apploader boot). That
+          // concurrent double-execution is the prime corruption suspect
+          // for the 0x80003434 runaway memset. Skip it under boot-dispatch
+          // to isolate cascade-corrupts vs takeover-corrupts.
+          if (ppcTestEnabled) {
+            ppc_worker.postMessage({ cmd: 'mailbox-call', mboxCmd: 1, arg0: 42 });
+          }
         } else if (m.cmd === 'mailbox-call-ack') {
           if (window._routingProbeInFlight) {
             window._routingProbeInFlight = false;
@@ -1447,6 +1624,330 @@
         }
       }, 250);
     }
+    // [blr-mismatch diag — strip later] Surface the worker's BLR-RAS mismatch
+    // recorder (jit_branch.cpp emit_blr_pop_and_check). SAB slots:
+    // 0x026B0504=count, 0x026B0508=site PC (the blr), 0x026B050C=actual SPR_LR,
+    // 0x026B0510=expected/pushed return. The HuSprDisp blr-to-LR=0 root should
+    // show site=0x800106c0, actualLR=0, expected=<valid HuSprExec return>.
+    (function () {
+      var _blrU32 = new Uint32Array(sharedMemory.buffer);
+      var _gtDone = false;
+      window._blrMismatchPoll = setInterval(function () {
+        // [garbage-trace] the WORKER latches (ppc_worker_main.cpp:1154) the FIRST
+        // region_dispatch next-pc < 0x80000000 (incl. 0): SAB 0x025000C0=producing
+        // pc, 0x025000C4=next, 0x025000C8..=24-pc ring (oldest->newest). This is the
+        // block whose terminator (HuSprDisp's blr to LR=0) sets pc=0 + its call chain.
+        var gtPc = _blrU32[0x025000C0 >> 2] >>> 0;
+        if (gtPc && !_gtDone) {
+          _gtDone = true;
+          var ring = [];
+          for (var gi = 0; gi < 24; gi++)
+            ring.push('0x' + (_blrU32[(0x025000C8 + gi * 4) >> 2] >>> 0).toString(16));
+          console.log('[garbage-trace] producingPc=0x' + gtPc.toString(16)
+            + ' next=0x' + (_blrU32[0x025000C4 >> 2] >>> 0).toString(16));
+          console.log('[garbage-trace] ring(old->new) ' + ring.join(' '));
+        }
+        // [lr-slot watch] worker latches (ppc_worker_main.cpp) the region pc + 16-pc
+        // ring when HuSprDisp's saved-LR slot 0x801e6d34 (a valid PC) is zeroed by a
+        // stray store. 0x025000E0=flag/pc, +4=prev(zeroed LR), +8..=16-pc ring.
+        var lwPc = _blrU32[0x025000E0 >> 2] >>> 0;
+        if (lwPc && !window._lwDone) {
+          window._lwDone = true;
+          var lring = [];
+          for (var li = 0; li < 16; li++)
+            lring.push('0x' + (_blrU32[(0x025000E8 + li * 4) >> 2] >>> 0).toString(16));
+          console.log('[lr-slot] zeroed-at regionPc=0x' + lwPc.toString(16)
+            + ' prevLR=0x' + (_blrU32[0x025000E4 >> 2] >>> 0).toString(16));
+          console.log('[lr-slot] ring(old->new) ' + lring.join(' '));
+        }
+        // [mips-probe] guest instructions RETIRED (gekko block prologue += count into SAB 0x026B0800)
+        // vs wall-time => REAL guest MIPS (the 60fps go/no-go). NOTE: boot-slice "iters" = region-
+        // dispatch calls (JS round-trips), NOT instructions — this counts actual retired instructions.
+        {
+          var _mi = _blrU32[0x026B0800 >> 2] >>> 0;
+          var _mnow = performance.now();
+          if (window._mipsLast === undefined) {
+            window._mipsLast = _mi; window._mipsLastT = _mnow;
+          } else {
+            var _dt = (_mnow - window._mipsLastT) / 1000;
+            if (_dt >= 1.0) {
+              var _dI = (_mi - window._mipsLast) >>> 0;  // unsigned delta (wraps correctly)
+              // [console-sanitize 2026-07-13] Suppress [mips-probe] when the counter cell is DEAD
+              // (0x026B0800 writer was the OLD gekko block prologue; live emitter is powerpc-next).
+              // Printing "0.000 MIPS total=0" while the game visibly runs misled the live console
+              // (user call-out). Re-enable by wiring a powerpc-next retired counter to the cell.
+              if (_mi !== 0) {
+                console.log('[mips-probe] ' + ((_dI / _dt) / 1e6).toFixed(3) + ' MIPS ('
+                  + _dI + ' instrs / ' + _dt.toFixed(2) + 's, total=' + _mi + ')');
+              }
+              // [me-monitor] the mechanism-agnostic ME(0x1000)-drop catch. If count>0, ME vanished at
+              // the named block boundary: prev-msr had ME, this-msr doesn't. this pc a mtmsr target =>
+              // (a) coherence drop; an rfi/context-resume target => (b) ME-less context loaded.
+              var _mmc = _blrU32[0x026B0870 >> 2] >>> 0;
+              if (_mmc > 0) {
+                console.log('[me-monitor] ME-DROP count=' + _mmc
+                  + ' at block pc=0x' + (_blrU32[0x026B0864 >> 2] >>> 0).toString(16)
+                  + ' prev-msr=0x' + (_blrU32[0x026B0868 >> 2] >>> 0).toString(16)
+                  + ' this-msr=0x' + (_blrU32[0x026B086C >> 2] >>> 0).toString(16));
+              }
+              // [first-block] worker's first gekko block after handover vs the gate: same gpr1 & MSR
+              // changed => race; different gpr1 => thread switch; PC=handler => resumed a suspended handler.
+              if ((_blrU32[0x026B0874 >> 2] >>> 0) === 1 && !window._fbLogged) {
+                window._fbLogged = true;
+                var _fbPc = _blrU32[0x026B087C >> 2] >>> 0;
+                var _fbCls = (_fbPc >= 0x800ba1b8 && _fbPc < 0x800ba3b8) ? 'SelThread'
+                  : ((_fbPc >= 0x800b7714 && _fbPc < 0x800b7aa8) ? 'HANDLER-ExtInt'
+                  : ((_fbPc >= 0x800b6e7c && _fbPc < 0x800b70a4) ? 'HANDLER-FPU' : 'thread-body'));
+                console.log('[first-block] worker 1st gekko block pc=0x' + _fbPc.toString(16) + ' class=' + _fbCls
+                  + ' msr=0x' + (_blrU32[0x026B0878 >> 2] >>> 0).toString(16)
+                  + ' ME=' + (((_blrU32[0x026B0878 >> 2] >>> 0) & 0x1000) ? 1 : 0)
+                  + ' gpr1=0x' + (_blrU32[0x026B0880 >> 2] >>> 0).toString(16)
+                  + '  (compare vs gate psGpr1/psMsr)');
+              }
+              window._mipsLast = _mi; window._mipsLastT = _mnow;
+            }
+          }
+        }
+        // [mtmsr0] a mtmsr wrote MSR=0 (the HuSprFinish halt runs with msr=0, NOT from rfi).
+        // SAB 0x026B0810 = the mtmsr's guest pc, +4 = count. If this fires, a mtmsr is zeroing MSR.
+        {
+          var _m0c = _blrU32[0x026B0814 >> 2] >>> 0;
+          if (_m0c && _m0c !== window._m0cLast) {
+            window._m0cLast = _m0c;
+            console.log('[mtmsr0] MSR=0 written by mtmsr @pc=0x'
+              + (_blrU32[0x026B0810 >> 2] >>> 0).toString(16) + ' count=' + _m0c);
+          }
+        }
+        // [worker-msr] the WORKER's OWN msr for HuSprFinish blocks. Compare vs dolphin's prim-exc msr:
+        // differ => mirror gap; both 0 => shared/real (not coherence). RI = msr&0x2.
+        {
+          var _wmc = _blrU32[0x026B081C >> 2] >>> 0;
+          if (_wmc && _wmc !== window._wmcLast) {
+            window._wmcLast = _wmc;
+            var _wm = _blrU32[0x026B0818 >> 2] >>> 0;
+            console.log('[worker-msr] worker msr=0x' + _wm.toString(16) + ' RI=' + ((_wm & 0x2) ? 1 : 0)
+              + ' @block=0x' + (_blrU32[0x026B0820 >> 2] >>> 0).toString(16) + ' count=' + _wmc);
+          }
+        }
+        // [deliv-rate] ext-int (0x500) + decrementer (0x900) delivery rates by source vs native ~480/s
+        // (decrementer-dominated). rate ~= native => pure race (boundary gate); >> native (esp dec) =>
+        // the 1024x Advance loop over-fires => real downcount too.
+        {
+          var _now2 = performance.now();
+          if (window._drLastT === undefined) { window._drLastT = _now2; window._drExt = 0; window._drDec = 0; }
+          else if ((_now2 - window._drLastT) / 1000 >= 2.0) {
+            var _dt2 = (_now2 - window._drLastT) / 1000;
+            var _ext = _blrU32[0x026B0828 >> 2] >>> 0, _dec = _blrU32[0x026B082C >> 2] >>> 0;
+            var _dExt = (_ext - window._drExt) >>> 0, _dDec = (_dec - window._drDec) >>> 0;
+            // [console-sanitize 2026-07-13] Suppress [deliv-rate] while both cells read 0 (dead
+            // writers, same class as the 07-11 removals) — "ext=0 dec=0" spam misled the live
+            // console (user call-out). Prints again the moment a real writer feeds the cells.
+            if (_ext !== 0 || _dec !== 0) {
+              console.log('[deliv-rate] ext-int=' + (_dExt / _dt2).toFixed(1) + '/s dec=' + (_dDec / _dt2).toFixed(1)
+                + '/s (native~480/s) | totals ext=' + _ext + ' dec=' + _dec + ' over ' + _dt2.toFixed(1) + 's');
+            }
+            // [console-sanitize 2026-07-11] Removed [vi-cause]/[isr-reach]/[mtmsr-last] here: their SAB
+            // writers (0x026B0834/0838/083C/0840/0844/0848/084C) were stripped, so they printed
+            // misleading zeros. Re-add with real writers if the VI/ISR-reach counters are needed again.
+            window._drExt = _ext; window._drDec = _dec; window._drLastT = _now2;
+          }
+        }
+        // [lr-slot-store] EA-gated (any c.pc) D-form WRITE32 whose EA hits either LR slot: worker
+        // 0x801e6af4 or crash 0x801e6d34. 0x026B0610=actual c.pc, +0x614=value, +0x618=count,
+        // +0x61C=EA. Shows the REAL pc/value/EA of the LR store the pc-gated probe missed.
+        var ssCount = _blrU32[0x026B0618 >> 2] >>> 0;
+        if (ssCount && ssCount !== window._ssLast) {
+          window._ssLast = ssCount;
+          if ((window._ssN = (window._ssN | 0) + 1) <= 12) {
+            var ssEA = _blrU32[0x026B061C >> 2] >>> 0;
+            console.log('[lr-slot-store] LR-slot WRITE pc=0x' + (_blrU32[0x026B0610 >> 2] >>> 0).toString(16)
+              + ' value=0x' + (_blrU32[0x026B0614 >> 2] >>> 0).toString(16)
+              + ' EA=0x' + ssEA.toString(16) + ' callerLR=0x' + (_blrU32[0x026B0660 >> 2] >>> 0).toString(16)
+              + ' count=' + ssCount
+              + (ssEA === 0x801e6af4 ? ' [worker frame]' : ssEA === 0x801e6d34 ? ' [CRASH frame]' : ''));
+          }
+        }
+        // [crash-slot-direct] read the CRASH-frame LR slot guest 0x801e6d34 (and worker 0x801e6af4)
+        // DIRECTLY from shared MEM1 (host base @SAB 0x02500020). worker+dolphin share MEM1 (both
+        // 0x1a4cf478) so this is the byte-exact value ALL executors see = the expert's dual-mem dump.
+        // Logs on every transition: always-0 => crash slot never written; valid->0 => clobbered.
+        if (!window._pvLogged) { window._pvLogged = true; console.log('[pv] poll build v4 (og2 self-contained)'); }
+        // [og2] self-contained OS-globals dump — proves the poll can read guest RAM regardless of the
+        // downstream ctx-track code. Logs first 8 times. curThr/curCtx = __OSCurrentThread/Context.
+        (function(){
+          var _mb = _blrU32[0x02500020 >> 2] >>> 0; if (!_mb) return;
+          var _s = function(x){ return (((x&0xff)<<24)|((x&0xff00)<<8)|((x>>>8)&0xff00)|((x>>>24)&0xff))>>>0; };
+          var _r = function(o){ return _s(_blrU32[((_mb + (o>>>0))>>>0) >> 2] >>> 0); };
+          var thr = _r(0xE4), ctx = _r(0xD4);
+          if (thr !== window._og2Thr || ctx !== window._og2Ctx) {
+            window._og2Thr = thr; window._og2Ctx = ctx;
+            if ((window._og2N = (window._og2N|0)+1) <= 12) {
+              var out = '[og2] curThr=0x'+thr.toString(16)+' curCtx=0x'+ctx.toString(16);
+              if ((thr>>>24)===0x80) { var cp=(thr&0x01FFFFFF)>>>0;
+                out += ' | thr.srr0=0x'+_r(cp+0x198).toString(16)+' thr.r1=0x'+_r(cp+0x4).toString(16)
+                     + ' thr.lr=0x'+_r(cp+0x84).toString(16); }
+              console.log(out + (_r(0xE4)===0 && _r(0xD4)===0 ? ' (OS globals both 0 here)' : ''));
+            }
+          }
+        })();
+        var _mem1b = _blrU32[0x02500020 >> 2] >>> 0;
+        if (_mem1b) {
+          // MEM1 stores guest RAM BIG-ENDIAN; _blrU32 reads host little-endian -> byte-swap every read.
+          var _bsw = function(x){ return (((x & 0xff) << 24) | ((x & 0xff00) << 8)
+            | ((x >>> 8) & 0xff00) | ((x >>> 24) & 0xff)) >>> 0; };
+          var _rdm = function(off){ return _bsw(_blrU32[((_mem1b + (off >>> 0)) >>> 0) >> 2] >>> 0); };
+          var _d34 = _rdm(0x1e6d34), _af4 = _rdm(0x1e6af4);
+          if (_d34 !== window._d34Last || _af4 !== window._af4Last) {
+            window._d34Last = _d34; window._af4Last = _af4;
+            if ((window._csN = (window._csN | 0) + 1) <= 60)
+              console.log('[crash-slot-direct] MEM1[0x801e6d34/CRASH]=0x' + _d34.toString(16)
+                + ' MEM1[0x801e6af4/worker]=0x' + _af4.toString(16)
+                + ' (mem1base=0x' + _mem1b.toString(16) + ')');
+          }
+          // [ctx-track] DefaultThread context lifecycle. __OSCurrentThread@0x800000E4; OSContext is at
+          // the OSThread start; srr0@+0x198, r1(gpr1)@+0x4, lr@+0x84. Logs when the current thread's
+          // saved srr0 changes — catches WHEN srr0 becomes 0x80010640 / r1=0x801e6ac0 (the phantom
+          // resume). Early+stable => legit boot save, slot clobbered while suspended; late => fabricated.
+          var _curThr = _rdm(0xE4), _curCtx = _rdm(0xD4);
+          // First: dump the raw OS-globals so we find the real thread pointer (0xE4 read as non-0x80).
+          if ((window._ogN = (window._ogN | 0) + 1) <= 6)
+            console.log('[os-globals] curThr@E4=0x' + _curThr.toString(16) + ' curCtx@D4=0x' + _curCtx.toString(16)
+              + ' rawE4=0x' + (_blrU32[((_mem1b + 0xE4) >>> 0) >> 2] >>> 0).toString(16));
+          var _thr = ((_curThr >>> 24) === 0x80) ? _curThr : (((_curCtx >>> 24) === 0x80) ? _curCtx : 0);
+          if (_thr) {
+            var _cp = (_thr & 0x01FFFFFF) >>> 0;
+            var _cSrr0 = _rdm(_cp + 0x198), _cR1 = _rdm(_cp + 0x4), _cLR = _rdm(_cp + 0x84);
+            if (_cSrr0 !== window._ctxSrr0Last || _thr !== window._ctxThrLast) {
+              window._ctxSrr0Last = _cSrr0; window._ctxThrLast = _thr;
+              if ((window._ctxN = (window._ctxN | 0) + 1) <= 40)
+                console.log('[ctx-track] thr=0x' + _thr.toString(16) + ' srr0=0x' + _cSrr0.toString(16)
+                  + ' r1=0x' + _cR1.toString(16) + ' lr=0x' + _cLR.toString(16)
+                  + (_cSrr0 === 0x80010640 ? ' <== PHANTOM srr0 (HuSprDisp epilogue)' : ''));
+            }
+          }
+        }
+        // [lr-slot-fp] stfs/stfd whose write hits 0x801e6d34: 0x026B0620=pc, +4=count, +8=EA.
+        var fpCount = _blrU32[0x026B0624 >> 2] >>> 0;
+        if (fpCount && fpCount !== window._fpLast) {
+          window._fpLast = fpCount;
+          if ((window._fpN = (window._fpN | 0) + 1) <= 12) {
+            console.log('[lr-slot-fp] STRAY fp-store pc=0x' + (_blrU32[0x026B0620 >> 2] >>> 0).toString(16)
+              + ' EA=0x' + (_blrU32[0x026B0628 >> 2] >>> 0).toString(16) + ' count=' + fpCount);
+          }
+        }
+        // [prologue-store] HuSprDisp prologue stw r0,628(r1) @0x8000f800: 0x026B0630=EA, +4=value, +8=count.
+        var pgCount = _blrU32[0x026B0638 >> 2] >>> 0;
+        if (pgCount && pgCount !== window._pgLast) {
+          window._pgLast = pgCount;
+          if ((window._pgN = (window._pgN | 0) + 1) <= 4) {
+            var pgEA = _blrU32[0x026B0630 >> 2] >>> 0, pgVal = _blrU32[0x026B0634 >> 2] >>> 0;
+            console.log('[prologue-store] EA=0x' + pgEA.toString(16) + ' value=0x' + pgVal.toString(16)
+              + ' count=' + pgCount
+              + (pgEA === 0x801e6d34 ? ' (EA=slot OK)' : ' (EA != 0x801e6d34 — WRONG BASE)'));
+          }
+        }
+        // [epilogue] worker executes HuSprDisp epilogue lwz r0,628 @0x800106b4: 0x026B0640=count, +4=EA.
+        var epCount = _blrU32[0x026B0640 >> 2] >>> 0;
+        if (epCount && epCount !== window._epLast) {
+          window._epLast = epCount;
+          if ((window._epN = (window._epN | 0) + 1) <= 4) {
+            var epEA = _blrU32[0x026B0644 >> 2] >>> 0, epGpr1 = _blrU32[0x026B0648 >> 2] >>> 0;
+            var cachedR1 = (epEA - 0x274) >>> 0;
+            console.log('[epilogue] WORKER epilogue lwz count=' + epCount
+              + ' EA=0x' + epEA.toString(16) + ' cachedR1=0x' + cachedR1.toString(16)
+              + ' sharedGpr1=0x' + epGpr1.toString(16)
+              + (cachedR1 === epGpr1 ? ' (r1 coherent)' : ' (r1 DIVERGED: cache != shared)'));
+          }
+        }
+        // [bcl-pc0] dolphin chain block whose terminator set pc=0 — the REAL faulting block.
+        // 0x026B0690=block pc, +4=r1 there, +8=count.
+        var bpCount = _blrU32[0x026B0698 >> 2] >>> 0;
+        if (bpCount && bpCount !== window._bpLast) {
+          window._bpLast = bpCount;
+          if ((window._bpN = (window._bpN | 0) + 1) <= 8) {
+            console.log('[bcl-pc0] FAULTING block pc=0x' + (_blrU32[0x026B0690 >> 2] >>> 0).toString(16)
+              + ' r1=0x' + (_blrU32[0x026B0694 >> 2] >>> 0).toString(16) + ' count=' + bpCount);
+          }
+        }
+        // [hle-table] one-time dump: is HuSprDisp (0x8000f7f8) HLE-hooked? The gekko HLE-check
+        // prologue (gekko_emit.cpp:4672-4736) op_returns on a hit, skipping the block body incl. the
+        // prologue stw — which would explain husprdisp-lr firing but prologue-store never firing.
+        // Table @0x02690000, 1024 slots x 8B (slot.pc@+0). Hash = imul((pc>>2),0x9E3779B1)&1023, 4 probes.
+        if (!window._hleDumped) {
+          var hooked = [];
+          for (var hi = 0; hi < 1024; hi++) {
+            var spc = _blrU32[(0x02690000 + hi * 8) >> 2] >>> 0;
+            if (spc) hooked.push('0x' + spc.toString(16));
+          }
+          if (hooked.length) {
+            window._hleDumped = true;
+            var hp = 0x8000f7f8;
+            var b0 = (Math.imul(hp >>> 2, 0x9E3779B1) >>> 0) & 1023;
+            var husprHooked = false, hbInfo = [];
+            for (var hp4 = 0; hp4 < 4; hp4++) {
+              var bi = (b0 + hp4) & 1023;
+              var bpc = _blrU32[(0x02690000 + bi * 8) >> 2] >>> 0;
+              hbInfo.push('slot[' + bi + ']=0x' + bpc.toString(16));
+              if (bpc === hp) husprHooked = true;
+            }
+            console.log('[hle-table] ' + hooked.length + ' hooked PCs: ' + hooked.join(' '));
+            console.log('[hle-table] HuSprDisp 0x8000f7f8 HLE-hooked? ' + husprHooked
+              + ' (bucket0=' + b0 + ' ' + hbInfo.join(' ') + ')');
+          }
+        }
+        // [post-hle-marker] worker block @0x8000f7f8 reached the body PAST the HLE check (0x026B06A0=count).
+        // Fires => HLE check did NOT early-return; the store-silence early-out is in the instruction stream.
+        // Silent (while husprdisp-lr fires) => the HLE check op_return'd (H1).
+        var phCount = _blrU32[0x026B06A0 >> 2] >>> 0;
+        if (phCount && phCount !== window._phLast) {
+          window._phLast = phCount;
+          if ((window._phN = (window._phN | 0) + 1) <= 4)
+            console.log('[post-hle-marker] HuSprDisp block body REACHED past HLE check count=' + phCount);
+        }
+        // [hle-check-marker] dolphin_hle_check(0x8000f7f8): 0x026B06B0=hook_index, +4=call count.
+        var hcCount = _blrU32[0x026B06B4 >> 2] >>> 0;
+        if (hcCount && hcCount !== window._hcLast) {
+          window._hcLast = hcCount;
+          if ((window._hcN = (window._hcN | 0) + 1) <= 4)
+            console.log('[hle-check-marker] dolphin_hle_check(HuSprDisp) hook_index=0x'
+              + (_blrU32[0x026B06B0 >> 2] >>> 0).toString(16) + ' callCount=' + hcCount
+              + (((_blrU32[0x026B06B0 >> 2] >>> 0) === 0) ? ' (NOT hooked -> returns 0, no skip)' : ' (HOOKED!)'));
+        }
+        // [hle-result] the value ppc_hle_check returned to the worker's block (what the early-return
+        // `if` tests) for HuSprDisp. 0x026B06C0=result, +4=count. NON-ZERO => worker skips HuSprDisp's
+        // body despite dolphin_hle_check=0 (worker-side HLE-check wiring bug = the real root).
+        var hrCount = _blrU32[0x026B06C4 >> 2] >>> 0;
+        if (hrCount && hrCount !== window._hrLast) {
+          window._hrLast = hrCount;
+          if ((window._hrN = (window._hrN | 0) + 1) <= 6) {
+            var hrVal = _blrU32[0x026B06C0 >> 2] >>> 0;
+            console.log('[hle-result] ppc_hle_check(HuSprDisp) returned=0x' + hrVal.toString(16)
+              + ' count=' + hrCount
+              + (hrVal !== 0 ? ' => WORKER EARLY-RETURNS (skips HuSprDisp body!)' : ' => 0, body should run'));
+          }
+        }
+        // [hle-mode] which HLE path HuSprDisp's block emits: 0x026B06D0=flags (3=native/mode-a,
+        // 2=import/mode-c, 0=none), +4=count (== husprdisp-lr count; runs before the early-return).
+        var hmCount = _blrU32[0x026B06D4 >> 2] >>> 0;
+        if (hmCount && hmCount !== window._hmLast) {
+          window._hmLast = hmCount;
+          if ((window._hmN = (window._hmN | 0) + 1) <= 4) {
+            var hmF = _blrU32[0x026B06D0 >> 2] >>> 0;
+            console.log('[hle-mode] HuSprDisp block HLE flags=' + hmF + ' count=' + hmCount
+              + (hmF === 3 ? ' (NATIVE mode-a)' : hmF === 2 ? ' (IMPORT mode-c)' : ' (no HLE check)'));
+          }
+        }
+        // [hle-nativehit] mode-(a) native table HIT for HuSprDisp: 0x026B06D8=count, +4=idx_and_type.
+        // Fires => the SAB HLE table has a bogus 0x8000f7f8 entry => op_return skips HuSprDisp's body.
+        var nhCount = _blrU32[0x026B06D8 >> 2] >>> 0;
+        if (nhCount && nhCount !== window._nhLast) {
+          window._nhLast = nhCount;
+          if ((window._nhN = (window._nhN | 0) + 1) <= 4)
+            console.log('[hle-nativehit] HuSprDisp NATIVE-TABLE HIT count=' + nhCount
+              + ' idx_and_type=0x' + (_blrU32[0x026B06DC >> 2] >>> 0).toString(16) + ' => body SKIPPED');
+        }
+      }, 50);
+    })();
     if (ppcPerfEnabled) {
       var _perfWaitStart = performance.now();
       var _perfPoll = setInterval(function () {
@@ -1506,15 +2007,141 @@
       var _bdWaitStart = performance.now();
       var _bdPoll = setInterval(function () {
         var u32bd = new Uint32Array(sharedMemory.buffer);
-        var pcBd  = u32bd[0x02400000 >> 2] >>> 0;
-        var pcOk  = (pcBd >= 0x80000000 && pcBd < 0x81800000);
-        var ready = pcOk && !!window._ppcMem1Wired && !!window._ppcDolphinRoutingReady;
+        var _ctxBd = (window._ppcRealCtxPtr || 0x02400000) >>> 0;  // [ppc-bridge] real &ppc_state, PC at +0
+        var pcBd  = u32bd[_ctxBd >> 2] >>> 0;
+        // [ee-pre PHASE0-A 2026-06-28] Does an EE=1 handover moment even exist?
+        // Per the design panel: VI is already raised (exc=0x4 pending); the ONLY
+        // gate between raised and delivered is MSR.EE, which is JS-controllable via
+        // this handover gate. Before spending a dolphin build, sample the EE/PC
+        // distribution while dolphin drives (real ctx only). eeAny==0 over the whole
+        // boot ⇒ the SAB MSR mirror is stale (impossible at 8fps) — fix that first.
+        if (window._ppcRealCtxPtr) {
+          var _msrBd = u32bd[(_ctxBd + 0x2E0) >> 2] >>> 0;
+          var _ee = (_msrBd & 0x8000) ? 1 : 0;
+          var _viw = (pcBd >= 0x800c151c && pcBd <= 0x800c15c0) ? 1 : 0;
+          window._ppN = (window._ppN|0)+1;
+          window._ppEe = (window._ppEe|0)+_ee;
+          window._ppVi = (window._ppVi|0)+_viw;
+          window._ppEeVi = (window._ppEeVi|0)+((_ee&&_viw)?1:0);
+          window._ppEeHi = (window._ppEeHi|0)+((_ee&&pcBd>=0x80004000)?1:0);
+          // [me-at-selthread] does an EE&ME SelectThread moment (the ideal ME-ful handover) EXIST at all?
+          // sel&ee&me>0 => yes, gate on ME will find it; ==0 with sel&ee>0 => SelectThread has EE but
+          // NEVER ME => the ME-drop is permanent by this point (deeper dolphin-side fix, not a gate tweak).
+          var _mePre = (_msrBd & 0x1000) ? 1 : 0;
+          var _inSelPre = (pcBd >= 0x800ba1b8 && pcBd < 0x800ba3b8) ? 1 : 0;
+          window._ppMe = (window._ppMe|0)+_mePre;
+          window._ppSelEe = (window._ppSelEe|0)+((_inSelPre&&_ee)?1:0);
+          window._ppSelEeMe = (window._ppSelEeMe|0)+((_inSelPre&&_ee&&_mePre)?1:0);
+          // [console-sanitize 2026-07-11] Removed the per-50-sample [ppc-worker-handshake] ee-pre spam
+          // (stale boot-phase PHASE0-A handover diagnostic; the game renders now). Counters left in place
+          // (cheap) in case a future handover probe needs them.
+        }
+        // [bisect 2026-06-28] Hand off only POST-apploader. The apploader
+        // (0x80003xxx: entry 0x80003100, memset wrapper 0x800033b0) drives
+        // DVD-DMA + DVD-complete interrupts the worker can't service, so
+        // taking over mid-apploader wedges it (idle-skip spin at 0x800034cc).
+        // dolphin drives boot/IPL/apploader with full device emulation;
+        // the worker drives the game from the OS range up. Requiring
+        // pcBd >= 0x80004000 makes the handover PC deterministic (was
+        // racing dolphin's boot: run-to-run handoff at 0x800bb3b0 vs
+        // 0x800032bc gave divergent trajectories). Matches the
+        // boot/gameplay split direction.
+        var pcOk  = (pcBd >= 0x80004000 && pcBd < 0x81800000);
+        // [gameplay-split 2026-06-28] Hand over only once DOLPHIN has booted the
+        // game to a RENDERING state (>=1 real video frame, window._firstFrame).
+        // This sidesteps every boot-phase interrupt problem — apploader DVD-DMA,
+        // the overlay-load external-int wait that spins with EE=0, AND the
+        // mid-computation handover that ran the worker away into 0x016xxxxx.
+        // dolphin drives ALL of boot with full device emulation; the worker
+        // takes over the steady-state game/render loop, which is exactly where
+        // 60fps matters. The path to native speed is driving the hot loop, not
+        // re-deriving dolphin's boot interrupt delivery under the cutover.
+        var rendered = !!window._firstFrame;
+        // [deterministic handover 2026-06-28] ALSO require the guest to be parked
+        // in VIWaitForRetrace (0x800c151c, MP4 decomp ELF main.elf) — its
+        // once-per-frame VI sync point — so the handover PC is REPRODUCIBLE
+        // run-to-run (was racing dolphin's boot: gate PC differed every run —
+        // 0x800bff9c DVD-wait / 0x8002ecf4 omWatchOverlayProc / 0x8000acxx HuMem —
+        // each a different wedge, making iteration impossible). Handing over here
+        // (a) lands the worker in the STEADY render loop past the DVD data-load
+        // that dolphin drives with full device emulation, and (b) is exactly the
+        // VI-wait the worker must learn to advance. omMain@0x8002fb40 ->
+        // VIWaitForRetrace@0x800c151c -> (VI delivered) -> next frame = the 60fps loop.
+        // [EE-gate PHASE0-B 2026-06-28] Phase-0-A measured eeAny~70% but
+        // ee&inVIWait==0 (VIWaitForRetrace never dwells — it OSSleepThread's away).
+        // So hand over at the first MSR.EE=1 moment in game/OS code (pc>=0x80004000):
+        // the worker INHERITS EE=1 and can take the already-pending VI (exc=0x4),
+        // which a _firstFrame-only handover (arbitrary moment, often EE=0) could not.
+        var _cxR  = u32bd[0x0250002C >> 2] >>> 0;
+        var _eeOn = _cxR ? ((u32bd[(_cxR + 0x2E0) >> 2] >>> 0) & 0x8000) !== 0 : false;
+        // [gate-on-ME 2026-07-01] ALSO require ME (0x1000): handing over an EE-set/ME-clear (0x8032)
+        // SelectThread gave the worker a no-ME MSR (confirmed psME=0). Require an EE&ME (0x9032-class)
+        // moment so the worker inherits ME. If the gate never opens, sel&ee&me stays 0 => no such moment.
+        var _meOn = _cxR ? ((u32bd[(_cxR + 0x2E0) >> 2] >>> 0) & 0x1000) !== 0 : false;
+        // [SelectThread handover 2026-06-28] Native (oracle /tmp/native-dvd.log)
+        // delivers 13600/26950 external ints at SelectThread (0x800ba1b8..0x800ba3b8,
+        // dominant PC 0x800ba2f0) — the OS scheduler idle loop, the ONE stable,
+        // recurring, EE=1 point. Handing over wherever-EE=1 landed at a different PC
+        // every run (long2str/omDLLStart/PPCSync/__fwrite — each a different wedge),
+        // making nothing reproducible. Gate on SelectThread so every run is identical.
+        var inSelThread = (pcBd >= 0x800ba1b8 && pcBd < 0x800ba3b8);
+        // [deterministic-handover 2026-07-06] Key the attempt on GUEST state, not wall
+        // time: require the frame counter (SAB 0x026B0930) to reach a fixed point so every
+        // run attempts the catch at the same guest progress. Removes the wall-clock fork
+        // that produced three different terminal states from identical inputs.
+        var _framesNow = u32bd[0x026B0930 >> 2] >>> 0;
+        // [me-gate relaxed 2026-07-06] ME-less operation is measured-functional (runs
+        // progress at msr=0xa032; meAny=0/300 samples on healthy runs) and the delivery
+        // corruption that made ME-less handover dangerous is closed at the funnel by the
+        // enforcing EE-gates (PowerPC.cpp, counters 0x026B0934/38). deliv-ring catches any
+        // regression. EE + SelectThread + frame-anchor remain required.
+        var ready = (_framesNow >= 100) && _eeOn && rendered && !!window._ppcMem1Wired && !!window._ppcDolphinRoutingReady;
+        // anchor 600→170 (2026-07-06): every observed roll passes 220 within the window
+        // with the upload complete (aramWrite terminal by ~frame 160); 600 was unreachable
+        // on slow rolls, leaving the takeover untestable. 170 is post-upload (storm-safe).
+        // [deterministic-trap] inSelThread REMOVED from the gate: with the park-trap armed,
+        // dolphin halts itself at the idle spin — the page no longer needs to sample-catch
+        // the guest inside SelectThread. Arm as soon as the anchor conditions hold.
+        // [determinize-takeover 2026-07-08] The park-trap arm is now set DOLPHIN-SIDE at
+        // exactly peFrames==100 (PixelEngine SetFinish, guest-tick-deterministic) instead
+        // of here (wall-timed setInterval poll armed at a varying frame → the post-takeover
+        // face-lottery). The page only PROCEEDS to the catch once dolphin reports PARKED
+        // (flag==2); the readiness (`ready`) still gates the cutover below.
+        ready = ready && (u32bd[0x026B0980 >> 2] === 2);
+        // frames>=600: post-upload steady-state anchor. Taking over at frame ~24 (DSP-init
+        // era) reproduced the interrupt-storm class (deliv-ring: VIWait spin, cause=0x10140,
+        // DSP sub-cause undecodable by the dispatcher — OSInterrupt.c:359 unmasked==0 ⇒ no
+        // ack ⇒ infinite redelivery). The steady frame loop is the design target anyway.
+        // Visibility for the never-ready outcome: one status line if the gate stays shut.
+        if (!window._hoGateDiagT0) window._hoGateDiagT0 = performance.now();
+        if (!ready && !window._hoGateDiagDone && (performance.now() - window._hoGateDiagT0) > 60000) {
+          window._hoGateDiagDone = true;
+          console.log('[handover-gate] still waiting: frames=' + _framesNow
+            + ' ee=' + (_eeOn ? 1 : 0) + ' me=' + (_meOn ? 1 : 0)
+            + ' selThread=' + (inSelThread ? 1 : 0) + ' rendered=' + (rendered ? 1 : 0)
+            + ' mem1=' + (window._ppcMem1Wired ? 1 : 0) + ' routing=' + (window._ppcDolphinRoutingReady ? 1 : 0));
+        }
         var elapsed = performance.now() - _bdWaitStart;
         if (ready) {
           clearInterval(_bdPoll);
+          // [handover-ctx] MERGED into this log (a separate console.log inexplicably didn't surface).
+          // Selection-vs-fidelity: pc-class (SelectThread=thread vs handler), ME in gate ctx (_cxR) AND
+          // in the worker's actual ppc_state (0x02400000), and whether their PCs agree.
+          var _cxR2  = u32bd[0x0250002C >> 2] >>> 0;
+          var _cxMsr = u32bd[((_cxR2 || 0x02400000) + 0x2E0) >> 2] >>> 0;
+          var _psPc  = u32bd[0x02400000 >> 2] >>> 0;
+          var _psMsr = u32bd[(0x02400000 + 0x2E0) >> 2] >>> 0;
+          var _cls = (pcBd >= 0x800ba1b8 && pcBd < 0x800ba3b8) ? 'SelThread'
+                   : ((pcBd >= 0x800b7714 && pcBd < 0x800b7aa8) ? 'HANDLER-ExtInt'
+                   : ((pcBd >= 0x800b6e7c && pcBd < 0x800b70a4) ? 'HANDLER-FPU' : 'other'));
           console.log('[ppc-worker-handshake] boot-dispatch: gate open'
             + ' (waited=' + elapsed.toFixed(0) + 'ms)'
-            + ' PC=0x' + pcBd.toString(16));
+            + ' PC=0x' + pcBd.toString(16)
+            + ' HANDOVER-CTX class=' + _cls
+            + ' cxR=0x' + _cxR2.toString(16) + ' cxME=' + ((_cxMsr & 0x1000) ? 1 : 0)
+            + ' psPC=0x' + _psPc.toString(16) + ' psMsr=0x' + _psMsr.toString(16)
+            + ' psME=' + ((_psMsr & 0x1000) ? 1 : 0)
+            + ' psGpr1=0x' + (u32bd[(0x02400000 + 0x18) >> 2] >>> 0).toString(16));
           // Item 7 Phase IV: enable cadence-handoff so dolphin reads
           // canonical global_timer from SAB and run_iter_batch routes
           // through dolphin_service_iter (no PPC dispatch — ppc-worker
@@ -1530,11 +2157,51 @@
             // PHASE4=0x2, PHASE5=0x4. Use Atomics.store for release-order
             // semantics so dolphin's __atomic_load_n(ACQUIRE) sees the write.
             Atomics.store(new Int32Array(sharedMemory.buffer), (0x02680000 + 0x2C) >> 2, 0x6);
+            // [collapse] AUTHORITATIVE OWNERSHIP handoff: grant the CPU to the WORKER. Both run loops check
+            // cpu_owner @ SAB 0x026A0000 (0=DOLPHIN, 1=WORKER) before dispatching ANY block, so dolphin's
+            // in-flight retro_run yields at its next per-block boundary (JitWasm do-loop / region loop /
+            // bem_chain_loop_c) — the fine-grained stop the advisory Phase-IV flag could not do. Task 2 gates
+            // this behind a quiescence handshake (wait for dolphin to publish quiesced @0x02680064 before
+            // flipping) + Atomics.wait; Task 1 sets it directly and relies on the per-block yield.
+            Atomics.store(new Int32Array(sharedMemory.buffer), 0x026A0000 >> 2, 1);
+            // [domino3-bisect] zero the gp counters AT the flip so post-takeover deltas show
+            // ONLY the worker's GX fate (fw32>0 => written but frame incomplete; ==0 => discarded).
+            { var _z = new Uint32Array(sharedMemory.buffer);
+              _z[0x026B1A40 >> 2] = 0; _z[0x026B1A44 >> 2] = 0; _z[0x026B1A48 >> 2] = 0; _z[0x026B1A3C >> 2] = 0;
+              _z[0x026B1A50 >> 2] = 0; _z[0x026B1A54 >> 2] = 0; }
             // Also send postMessage as a backup in case dolphin caches a
             // copy of the flags somewhere (it shouldn't — flag is read
             // directly via dolphin_ct_get_phase_flags from SAB).
             dolphin_worker.postMessage({ cmd: 'ct-phase-set', flags: 0x6 });
             console.log('[ppc-worker-handshake] CT_PHASE4|PHASE5 set in SAB + postMessage sent');
+            // [collapse-accept] clean acceptance instrument (the stripped diag readers are gone). Per 1s:
+            //  pc=guest PC (SAB 0x02400000) — advance => booting; pinned near HuSprDisp 0x8000f7f8 => stuck.
+            //  mipsD=gekko block-dispatch counter (SAB 0x026B0800) delta — worker actually dispatching.
+            //  srr0ch=[srr0-side-channel] (SAB 0x0600/0604/0608) last mtspr SRR0 pc/val/ctr; val==0 with ctr>0
+            //  VIOLATES the sharpened GATE-0 invariant (post-collapse SRR0=0 must NEVER be written).
+            (function(){
+              var A = new Int32Array(sharedMemory.buffer);
+              var lastMips = 0, lastPc = 0, n = 0;
+              var iv = setInterval(function(){
+                var pc = A[0x02400000 >> 2] >>> 0, mips = A[0x026B0800 >> 2] >>> 0;
+                var exc = A[0x024002EC >> 2] >>> 0, msr = A[0x024002E0 >> 2] >>> 0, dc = A[0x024002F0 >> 2] | 0;
+                var owner = A[0x026A0000 >> 2] >>> 0, exitR = A[0x025000A4 >> 2] >>> 0;
+                var stopF = A[0x02500004 >> 2] >>> 0, exitI = A[0x025000A0 >> 2] >>> 0;
+                var bdLoop = window._bdLoopRunning ? 1 : 0, bdDisp = window._bdDispatching ? 1 : 0;
+                var cLR = A[0x026B0910 >> 2] >>> 0, cCtx = A[0x026B0914 >> 2] >>> 0, cN = A[0x026B0918 >> 2] >>> 0;
+                var m1 = A[0x02500020 >> 2] >>> 0;
+                var rdbe = function(off){ if(!cCtx||!m1) return 0; var v = A[(m1 + (((cCtx + off) >>> 0) & 0x01FFFFFF)) >> 2] >>> 0; return (((v&0xFF)<<24)|((v&0xFF00)<<8)|((v>>>8)&0xFF00)|(v>>>24))>>>0; };
+                var cs = rdbe(0x198);
+                var siR4 = A[0x026B0920 >> 2] >>> 0, siPre = A[0x026B0924 >> 2] >>> 0, siPost = A[0x026B0928 >> 2] >>> 0, siN = A[0x026B092C >> 2] >>> 0;
+                var siSP = A[0x026B0930 >> 2] >>> 0;
+                // [domino3-bisect] gpSent (worker pushed GX) vs gpApplied (dolphin drained) vs peFrames.
+                var gpSent = A[0x026B1A3C >> 2] >>> 0, gpApplied = A[0x026B1A40 >> 2] >>> 0, peF = A[0x026B0930 >> 2] >>> 0;
+                console.log('[collapse-accept] mipsD=' + ((mips - lastMips) >>> 0) + ' siN=' + siN + ' cbPre=0x' + siPre.toString(16) + ' cbPost=0x' + siPost.toString(16) + ' siSP=0x' + siSP.toString(16)
+                  + ' | gpSent=' + gpSent + ' gpApplied=' + gpApplied + ' peFrames=' + peF + ' owner=' + owner);
+                lastMips = mips; lastPc = pc;
+                if (++n >= 40) clearInterval(iv);
+              }, 1000);
+            })();
           }
           // Confirm boot-mode flags on ppc-worker. perfStub=false ensures
           // dispatched blocks call real env.ppc_* imports through the
@@ -1548,8 +2215,95 @@
           window._bdLoopRunning = true;
           window._bdLoopStart   = performance.now();
           var i32bd = new Int32Array(sharedMemory.buffer);
+          // [EE-loss root cause CONFIRMED 2026-06-28, force reverted] The MP4
+          // DVD-read wait (game/dvd.c:54 `while(!CallBackStatus) HuDvdErrorWatch()`)
+          // deadlocks because its completion callback runs from the DI ISR, which
+          // needs MSR.EE=1 — but the handover race leaves the worker at EE=0.
+          // Crudely forcing MSR.EE|=0x8000 here DID deliver the IRQ (guest left the
+          // DVD cluster) but vectored at an unsafe mid-critical-section point ->
+          // jumped to garbage 0x82ce80, MSR=0 (corruption, exactly the design-panel
+          // warning). The real fix is an ATOMIC handover: engage Phase IV to FREEZE
+          // dolphin first, then read the FROZEN MSR, and only hand to the worker if
+          // EE=1 (retry if it froze in a critical section) — no forcing.
           var startBootDispatchSlice = function () {
             if (!window._bdLoopRunning) return;
+            // [dolphin-isr fix 2026-06-29] BEFORE running the worker, if an external interrupt
+            // (EXCEPTION_EXTERNAL_INT=0x4 @ ppc_state+0x2EC) is pending, hand it to dolphin in
+            // LOCKSTEP. The worker's per-block IRQ poll would otherwise vector + run the OS
+            // handler with incoherent dual-core mask/priority state, and __OSDispatchInterrupt's
+            // UNBOUNDED for(;;++prio) loop (OSInterrupt.c:467) overruns into garbage -> runaway.
+            // Native services this exact interrupt cleanly in lockstep (oracle: context
+            // 0x801a5828, mask 0xF7FFF7E0, no overrun). Clearing Phase IV routes dolphin's 60Hz
+            // tick (_run_iter_batch) to retro_run -> JitWasm::Run, which runs the handler right.
+            var _ctxR0 = i32bd[0x0250002C >> 2] >>> 0;  // real &ppc_state
+            var _exc0  = _ctxR0 ? (i32bd[(_ctxR0 + 0x2EC) >> 2] >>> 0) : 0;
+            // [dual-core FIFO splice fix EXPERIMENT 2026-06-30] The dolphin-ISR excursion
+            // (Phase IV OFF -> dolphin's CPU services EXTERNAL_INT via retro_run) makes
+            // dolphin a SECOND gather-pipe writer that splices the worker's mid-command FIFO
+            // (~370 bytes, confirmed via gp-producer attribution) -> GFX Unknown Opcode -> hang.
+            // ?workerisr=1 keeps Phase IV SET and lets the worker dispatch EXTERNAL_INT itself
+            // (one producer). The excursion predates the DSP/AI runaway mask, so the worker may
+            // now handle it coherently. If it runs away, drop ?workerisr=1 to restore the excursion.
+            // [2026-07-01] workerisr=1 (one-producer: the worker dispatches EXTERNAL_INT itself via
+            // its synchronous cmd-10, no concurrent page excursion) is now the DEFAULT — it closes the
+            // atomicity race that halted at HuSprFinish (dolphin's excursion raced the worker's vector,
+            // running the lfs with the vector-entry msr=0 -> RI=0 -> PPCHalt; native-oracle-confirmed
+            // RACE not over-firing). Opt BACK into the old concurrent excursion with ?workerisr=0.
+            if ((_exc0 & 0x4) !== 0 && /[?&]workerisr=0/.test(location.search)) {
+              Atomics.store(i32bd, (0x02680000 + 0x2C) >> 2, 0);  // Phase IV OFF -> dolphin dispatches
+              if (window.dolphin_worker) window.dolphin_worker.postMessage({ cmd: 'ct-phase-set', flags: 0 });  // backup: ensure dolphin sees the flip
+              Atomics.store(i32bd, 0x02500000 >> 2, 0);           // yield clear -> dolphin runs
+              window._isrTries = 0;
+              window._isrR0 = i32bd[0x025010D4 >> 2] >>> 0;       // retro_run call counter at entry
+              if (window._isrPoll) clearInterval(window._isrPoll);
+              window._isrPoll = setInterval(function () {
+                var _e = _ctxR0 ? (i32bd[(_ctxR0 + 0x2EC) >> 2] >>> 0) : 0;
+                if ((_e & 0x4) === 0 || (++window._isrTries) > 600) {
+                  clearInterval(window._isrPoll); window._isrPoll = null;
+                  window._isrN = (window._isrN | 0) + 1;
+                  if ((window._isrN % 20) === 1 || window._isrTries > 600) {
+                    var _pcNow = _ctxR0 ? (i32bd[_ctxR0 >> 2] >>> 0) : 0;
+                    var _lrNow = _ctxR0 ? (i32bd[(_ctxR0 + 0x360) >> 2] >>> 0) : 0;
+                    var _srr0Now = _ctxR0 ? (i32bd[(_ctxR0 + 0x3A8) >> 2] >>> 0) : 0;
+                    // PPCHalt (0x800b4334/38) LR discriminates the halt caller: OSPanic=0x8002ff4c..
+                    // (real assert, H1) vs __OSUnhandledException=0x800b6fe4.. (my delivery, H2).
+                    var _halt = (_pcNow === 0x800b4338 || _pcNow === 0x800b4334)
+                      ? ((_lrNow >= 0x8002ff4c && _lrNow <= 0x8003009c) ? ' HALT<-OSPanic(H1?)'
+                        : (_lrNow >= 0x800b6fe4 && _lrNow <= 0x800b71e4) ? ' HALT<-__OSUnhandledException(H2!)'
+                        : ' HALT<-lr=0x' + _lrNow.toString(16)) : '';
+                    console.log('[ppc-worker-handshake] dolphin-isr #' + window._isrN
+                      + ' polls=' + window._isrTries + ' exc=0x' + _e.toString(16)
+                      + ' retroRunDelta=' + (((i32bd[0x025010D4 >> 2] >>> 0) - window._isrR0) >>> 0)
+                      + ' pc=0x' + _pcNow.toString(16) + ' lr=0x' + _lrNow.toString(16)
+                      + ' srr0=0x' + _srr0Now.toString(16) + _halt);
+                  }
+                  Atomics.store(i32bd, (0x02680000 + 0x2C) >> 2, 0x6);  // Phase IV ON
+                  if (window.dolphin_worker) window.dolphin_worker.postMessage({ cmd: 'ct-phase-set', flags: 0x6 });
+                  // [dual-core handover race fix 2026-06-30] gate the worker re-engage on dolphin
+                  // retiring its in-flight retro_run (same as the post-slice excursion). The crash
+                  // routes through whichever re-engage is un-gated, so BOTH edges need this.
+                  (function () {
+                    var _qR = i32bd[0x025010D4 >> 2] >>> 0, _qS0 = i32bd[0x025010D0 >> 2] >>> 0;
+                    var _qStab = 0, _qT = 0;
+                    var _qPoll = function () {
+                      if (!window._bdLoopRunning) return;
+                      var r = i32bd[0x025010D4 >> 2] >>> 0, s = i32bd[0x025010D0 >> 2] >>> 0;
+                      _qStab = (r === _qR) ? (_qStab + 1) : 0; _qR = r; _qT++;
+                      if ((_qStab >= 3 && ((s - _qS0) >>> 0) >= 4) || _qT > 300) {
+                        if (window._qisrN2 === undefined) window._qisrN2 = 0;
+                        if ((++window._qisrN2) <= 6 || _qT > 300)
+                          console.log('[ppc-worker-handshake] isr-requiesce(pre) tries=' + _qT
+                            + ' retror=' + r + ' svciDelta=' + ((s - _qS0) >>> 0)
+                            + (_qT > 300 ? ' (TIMEOUT)' : ''));
+                        startBootDispatchSlice();
+                      } else { setTimeout(_qPoll, 4); }
+                    };
+                    setTimeout(_qPoll, 4);
+                  })();
+                }
+              }, 2);
+              return;
+            }
             // Set yield flag so dolphin's Run() returns at next heartbeat.
             Atomics.store(i32bd, 0x02500000 >> 2, 1);
             window._bdDispatching = true;
@@ -1559,11 +2313,29 @@
             // mode: real imports, real downcount, real idle-skip.
             window.ppc_worker.postMessage({
               cmd: 'run-continuous',
+              // [advance-starvation test 2026-06-28] Shrunk the slice (was
+              // safetyCap 500000 / wallTimeMs 250) so the worker yields FAR more
+              // often. Advance() is yield-gated OFF during a worker slice
+              // (EmscriptenWorker.cpp:528), so while the worker spins ~500K iters
+              // on the multi-PC DVD-read wait (DVDGetDriveStatus), dolphin can't
+              // advance CoreTiming to fire the DI completion -> the read never
+              // finishes -> the guest spins forever at EE=0. Yielding every ~20K
+              // iters gives dolphin frequent Advance windows to complete the DVD.
               compileOnMiss: true,
-              safetyCap: 500000,
+              safetyCap: 20000,
               ignoreDowncount: false,
+              // [idle-skip 2026-06-28] Kept ON: idle-skip-off reaches the EE=1 delivery
+              // point but the delivered ISR then diverges to a garbage runaway
+              // (0x80dXXXXX) — a distinct ISR-execution blocker. Clean-idle (skip on)
+              // is the safer baseline (no corruption, no runaway) until the ISR path
+              // is fixed.
               disableIdleSkip: false,
-              wallTimeMs: 250,
+              // [determinize-boot 2026-07-08] wallTimeMs 8 → 0: the slice yielded to dolphin
+              // every 8ms WALL, so the yield boundary (= when dolphin fires device events)
+              // was wall-timed → divergent trajectory across identical runs. safetyCap=20000
+              // iters now bounds the slice deterministically (yields just as often, on a
+              // guest-tick boundary instead of wall).
+              wallTimeMs: 0,
               mergedRegion: ppcMergedEnabled,
             });
           };
@@ -1573,13 +2345,268 @@
           // its behaviour without rewriting that branch.
           window._bdReengageOnAck = function (m) {
             if (!window._bdLoopRunning) return;
+            // [ack-publish 2026-07-07 — silent, always-on] last slice's telemetry to SAB
+            // so the probe sees EVERY face's slice shape (the console log is conditional):
+            // 0x026B1430=lastPc, 34=iters, 38=compileCalls, 3C=ack count.
+            i32bd[0x026B1430 >> 2] = (m.lastPc >>> 0) | 0;
+            i32bd[0x026B1434 >> 2] = (m.iters >>> 0) | 0;
+            i32bd[0x026B1438 >> 2] = (m.compileCalls >>> 0) | 0;
+            i32bd[0x026B143C >> 2] = ((i32bd[0x026B143C >> 2] | 0) + 1) | 0;
+            i32bd[0x026B1444 >> 2] = (performance.now() - (window._bdSliceStart || performance.now())) | 0;
             var sliceMs = performance.now() - (window._bdSliceStart || performance.now());
-            console.log('[ppc-worker-handshake] boot-dispatch slice'
-              + ' iters=' + (m.iters >>> 0)
-              + ' compileCalls=' + (m.compileCalls >>> 0)
-              + ' exit=' + m.exitReason
-              + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
-              + ' sliceMs=' + sliceMs.toFixed(1));
+            // Log the first few worker slices + any anomaly (lastPc sub-0x80000000) for visibility;
+            // per-slice spam would obscure the fps measurement.
+            var _bdN = (window._bdSliceLogN = (window._bdSliceLogN || 0) + 1);
+            if (_bdN <= 5 || (m.lastPc >>> 0) < 0x80000000)
+              console.log('[ppc-worker-handshake] boot-dispatch slice #' + _bdN
+                + ' iters=' + (m.iters >>> 0)
+                + ' compileCalls=' + (m.compileCalls >>> 0)
+                + ' exit=' + m.exitReason
+                + ' lastPc=0x' + (m.lastPc >>> 0).toString(16)
+                + ' sliceMs=' + sliceMs.toFixed(1));
+            // [dolphin-isr fix 2026-06-29] On a pending external interrupt, hand it to dolphin in
+            // LOCKSTEP (coherent CPU+device state — exactly what native does at this same OS
+            // context 0x801a5828; verified via the native oracle: __OSDispatchInterrupt dispatches
+            // cleanly there with mask 0xF7FFF7E0, no overrun). Clearing Phase IV routes dolphin's
+            // 60Hz tick (_run_iter_batch) to retro_run -> JitWasm::Run, which runs the OS interrupt
+            // handler correctly. Park the worker (don't re-engage) until EXTERNAL_INT clears so they
+            // never race the shared CPU.
+            if (m.exitReason === 'isr-to-dolphin') {
+              var _CTF2 = (0x02680000 + 0x2C) >> 2;
+              Atomics.store(i32bd, _CTF2, 0);              // Phase IV OFF -> dolphin dispatches the handler
+              Atomics.store(i32bd, 0x02500000 >> 2, 0);    // yield clear -> dolphin runs freely
+              var _isrCtx = i32bd[0x0250002C >> 2] >>> 0;  // real &ppc_state
+              window._isrN = (window._isrN | 0) + 1;
+              window._isrTries = 0;
+              if (window._isrPoll) clearInterval(window._isrPoll);
+              window._isrPoll = setInterval(function () {
+                var _exc = _isrCtx ? (i32bd[(_isrCtx + 0x2EC) >> 2] >>> 0) : 0;  // ppc_state.Exceptions
+                if ((_exc & 0x804) === 0 || (++window._isrTries) > 400) {
+                  clearInterval(window._isrPoll); window._isrPoll = null;
+                  if ((window._isrN % 30) === 1 || window._isrTries > 400)
+                    console.log('[ppc-worker-handshake] dolphin-isr #' + window._isrN
+                      + ' serviced in ' + window._isrTries + ' polls (exc=0x' + _exc.toString(16) + ')');
+                  Atomics.store(i32bd, _CTF2, 0x6);         // Phase IV back ON (worker drives)
+                  // [dual-core handover race fix 2026-06-30] Do NOT resume the worker immediately.
+                  // Flipping Phase IV SET does not abort dolphin's IN-FLIGHT retro_run (the flag is
+                  // re-read only between iters, EmscriptenWorker.cpp:640), so dolphin keeps mutating
+                  // the SHARED ppc_state for ~a frame, racing the freshly-started worker slice ->
+                  // a fastmem store lands on a saved-LR stack slot -> control-flow corruption/PPCHalt.
+                  // Gate the re-engage on dolphin RETIRING its retro_run: c_retror(0x025010D4) stable
+                  // across 3 polls AND c_svci(0x025010D0) advanced >=4 (dolphin alive, event-only).
+                  // Mirrors the main-handover waitQuiescent (gamecube.html:~2039). Bounded (300 tries).
+                  (function () {
+                    var _qR = i32bd[0x025010D4 >> 2] >>> 0, _qS0 = i32bd[0x025010D0 >> 2] >>> 0;
+                    var _qStab = 0, _qT = 0;
+                    var _qPoll = function () {
+                      if (!window._bdLoopRunning) return;
+                      var r = i32bd[0x025010D4 >> 2] >>> 0, s = i32bd[0x025010D0 >> 2] >>> 0;
+                      _qStab = (r === _qR) ? (_qStab + 1) : 0; _qR = r; _qT++;
+                      if ((_qStab >= 3 && ((s - _qS0) >>> 0) >= 4) || _qT > 300) {
+                        if (window._qisrN === undefined) window._qisrN = 0;
+                        if ((++window._qisrN) <= 6 || _qT > 300)
+                          console.log('[ppc-worker-handshake] isr-requiesce tries=' + _qT
+                            + ' retror=' + r + ' svciDelta=' + ((s - _qS0) >>> 0)
+                            + (_qT > 300 ? ' (TIMEOUT)' : ''));
+                        startBootDispatchSlice();          // resume worker AFTER dolphin quiesced
+                      } else { setTimeout(_qPoll, 4); }
+                    };
+                    setTimeout(_qPoll, 4);
+                  })();
+                }
+              }, 2);
+              return;
+            }
+            // [ppc-bridge idle fast-forward 2026-06-28] Same lastPc across >=3
+            // consecutive slices = guest making no progress (idle wait-spin,
+            // e.g. MP4 VIWaitForRetrace 0x800ba2f0). Set the CT idle hint
+            // (CT_QUEUE+0x30=0x02680030) so dolphin_service_iter fast-forwards
+            // CoreTiming to the next event in-process instead of crawling
+            // ~20000 cyc per ~60ms round-trip. Cleared the moment lastPc changes.
+            // [multi-PC idle 2026-06-28] The post-handover wedge is a MULTI-PC
+            // cycle, not a single repeating PC — the loop PCs resolve (MP4 decomp
+            // ELF) to __RAS_OSDisableInterrupts_begin / OSRestoreInterrupts /
+            // DVDGetDriveStatus / HuDvdDataReadDirect / HuDvdErrorWatch: a DVD
+            // data-read wait polling DVDGetDriveStatus for a read dolphin's DI
+            // device completes via a CoreTiming event. The old single-lastPc
+            // streak never tripped on this cycle, so the idle-hint was never set
+            // and dolphin_service_iter's Advance-loop fast-forward (which fires the
+            // pending DVD/VI/DEC completion) never ran. Mirror JitWasm's 16-deep
+            // ring: if lastPc recurs within the recent window we're cycling → set
+            // the CT idle-hint (CT_QUEUE+0x30=0x02680030). Reset on a PC not seen
+            // in the ring (genuine forward progress).
+            var _bdPc = (m.lastPc >>> 0);
+            if (!window._bdPcRing) { window._bdPcRing = []; window._bdLoopCount = 0; }
+            var _ring = window._bdPcRing;
+            if (_ring.indexOf(_bdPc) >= 0) {
+              window._bdLoopCount = (window._bdLoopCount | 0) + 1;
+            } else {
+              window._bdLoopCount = 0;
+            }
+            _ring.push(_bdPc);
+            if (_ring.length > 16) _ring.shift();
+            // [ho-quiet 2026-07-02] While the atomic-handover catch window is open, force the
+            // idle-hint OFF so the service_iter fast-forward stops flooding events — the guest
+            // then drains to the SelectThread idle spin during the release windows and the
+            // freeze catches it (4/6 FAILED with the ff active: every sample was mid-ISR EE=0).
+            var _hintOn = (!window._hoSuppressFF) && (window._bdLoopCount >= 6);
+            Atomics.store(i32bd, 0x02680030 >> 2, _hintOn ? 1 : 0);
+            // [ff-pc gate 2026-07-02] Publish the PC that tripped the hint (0x02680034). The
+            // fast-forward gates on ppc_state.pc == this PC: teleporting sim-time is only safe when
+            // the guest is AT the observed spin PC — not mid-ISR at an EE=1 blip (hwIRQLeaveCritical/
+            // OSEnableInterrupts windows), where firing the next VI nests a retrace into the live
+            // handler chain (the SI crash / PADRead re-entrancy).
+            Atomics.store(i32bd, 0x02680034 >> 2, _hintOn ? _bdPc : 0);
+            // [e5-spin TEMP 2026-06-28] After the apploader-runaway fix the guest
+            // settled into a tight 3-block loop 0x800e56bc/56fc/5754 (slice-budget,
+            // 0 compileCalls) — an interrupt-wait spin. Dump exc/msr/srr0/lr + regs
+            // + the loop bytes (from MEM1) once, to disassemble what it waits on.
+            if (_bdPc >= 0x800e5000 && _bdPc < 0x800e6000) {
+              window._e5Slices = (window._e5Slices | 0) + 1;
+            }
+            // [ee-track TEMP 2026-06-28] Per-slice EE/exc sampler. Does the
+            // guest EVER re-enable EE during the wedge (brief window we miss /
+            // region chains past the EE-on mtmsr), or stay EE=0 forever? If
+            // EE is never 1, the divergence is upstream (no int ever
+            // deliverable under the cutover); if EE=1 occurs with exc&0x4, the
+            // worker's Q2 gate should have broken — a delivery-path bug.
+            (function(){
+              var cxe = i32bd[0x0250002C >> 2] >>> 0;
+              if (!cxe) return;
+              var msrE = i32bd[(cxe + 0x2E0) >> 2] >>> 0;
+              var excE = i32bd[(cxe + 0x2EC) >> 2] >>> 0;
+              window._eeAny = (window._eeAny | 0) + ((msrE & 0x8000) ? 1 : 0);
+              window._excAny = (window._excAny | 0) + ((excE & 0x4) ? 1 : 0);
+              window._deliv = (window._deliv | 0) + (((msrE & 0x8000) && (excE & 0x4)) ? 1 : 0);
+              window._eeTot = (window._eeTot | 0) + 1;
+              if ((window._eeTot % 10) === 0) {
+                // CT globals: is global_timer advancing + any device event scheduled?
+                var gtLo = i32bd[(0x02680000 + 0x08) >> 2] >>> 0;
+                var gtHi = i32bd[(0x02680000 + 0x0C) >> 2] >>> 0;
+                var slen = i32bd[(0x02680000 + 0x10) >> 2] >>> 0;
+                var ecnt = i32bd[(0x02680000 + 0x18) >> 2] >>> 0;
+                var dmask = i32bd[(0x02680000 + 0x20) >> 2] >>> 0;
+                var psch = i32bd[(0x02680000 + 0x24) >> 2] >>> 0;
+                var gtDelta = (gtLo >>> 0) - ((window._lastGtLo || 0) >>> 0);
+                window._lastGtLo = gtLo;
+                var _wpc = i32bd[cxe >> 2] >>> 0;  // worker's live PC (frozen-state readable when stalled)
+                window._wpcSame = (window._wpcPrev === _wpc) ? ((window._wpcSame|0)+1) : 0;
+                window._wpcPrev = _wpc;
+                // [mem-c0] the exception-save context pointer at guest MEM[0xc0] (=&__OSDefaultContext,
+                // set by OSInit). The 0x500 vector does `lwz r4,0xc0(r0)`; if MEM[0xc0]=0 the save writes
+                // through null → corrupts low MEM → __OSUnhandledException → PPCHalt (jit_system_registers.cpp:248).
+                // Guest RAM is big-endian; byte-swap. MEM1 host base published at 0x02500020.
+                var _mem1b = i32bd[0x02500020 >> 2] >>> 0;
+                var _c0raw = _mem1b ? (i32bd[(_mem1b + 0xc0) >> 2] >>> 0) : 0;
+                var _memC0 = ((_c0raw & 0xff) << 24) | ((_c0raw & 0xff00) << 8) | ((_c0raw >>> 8) & 0xff00) | ((_c0raw >>> 24) & 0xff);
+                console.log('[ppc-worker-handshake] ee-track slices=' + window._eeTot
+                  + ' EE=1:' + window._eeAny + ' exc&4:' + window._excAny
+                  + ' deliverable(EE&exc):' + window._deliv
+                  + ' lastMsr=0x' + msrE.toString(16) + ' lastExc=0x' + excE.toString(16)
+                  + ' pc=0x' + _wpc.toString(16) + ' pcStuckFor=' + window._wpcSame
+                  + ' MEM[0xc0]=0x' + (_memC0 >>> 0).toString(16)
+                  + ' | osLoadLR=0x' + (i32bd[0x026B0890 >> 2] >>> 0).toString(16)
+                  + ' osLoadPtr=0x' + (i32bd[0x026B0894 >> 2] >>> 0).toString(16)
+                  + ' osLoadN=' + (i32bd[0x026B0898 >> 2] >>> 0));
+                // [osthread-dump] once stuck, dump the OSThread at the crashing osLoadPtr. Coherent
+                // THREAD fields (state 1/2/4/8, prio 0-31, valid queue/next/prev 0x8xxxxxxx) + zeroed CTX
+                // (srr0=0) => (1)corrupted-live OR (3)never-populated; garbage in BOTH => (2)bad-pointer.
+                // srr0=0 (a save sets srr0=lr, init sets srr0=entry — both nonzero) => never saved/init =>
+                // leans (3): a never-run thread admitted to the run queue. Guest RAM is big-endian.
+                if (window._wpcSame > 3 && !window._otDumped) {
+                  var _otPtr = i32bd[0x026B0894 >> 2] >>> 0;
+                  var _mem1x = i32bd[0x02500020 >> 2] >>> 0;
+                  if (_otPtr && _mem1x) {
+                    window._otDumped = true;
+                    var _rdG = function(ga){ var raw = i32bd[(_mem1x + (ga & 0x01FFFFFF)) >> 2] >>> 0;
+                      return (((raw&0xff)<<24)|((raw&0xff00)<<8)|((raw>>>8)&0xff00)|((raw>>>24)&0xff))>>>0; };
+                    console.log('[osthread-dump] ptr=0x' + _otPtr.toString(16)
+                      + ' | CTX gpr1=0x' + _rdG(_otPtr+0x4).toString(16) + ' gpr13=0x' + _rdG(_otPtr+0x34).toString(16)
+                      + ' lr=0x' + _rdG(_otPtr+0x84).toString(16) + ' srr0=0x' + _rdG(_otPtr+0x198).toString(16)
+                      + ' srr1=0x' + _rdG(_otPtr+0x19c).toString(16)
+                      + ' || THREAD stateWd=0x' + _rdG(_otPtr+0x2c8).toString(16) + ' prio=0x' + _rdG(_otPtr+0x2d0).toString(16)
+                      + ' queue=0x' + _rdG(_otPtr+0x2dc).toString(16) + ' next=0x' + _rdG(_otPtr+0x2e0).toString(16)
+                      + ' prev=0x' + _rdG(_otPtr+0x2e4).toString(16));
+                  }
+                }
+                // [console-sanitize 2026-07-11] Removed [ctx-write]/[srr0-watch] stale crash-debug logs:
+                // their SAB writers (0x026B08A0..08D8) were stripped, so they printed misleading zeros.
+                var _idleHint = i32bd[0x02680030 >> 2] >>> 0;
+                console.log('[ppc-worker-handshake] ct-track gtimer=0x' + gtHi.toString(16) + ':' + gtLo.toString(16)
+                  + ' Δlo=' + (gtDelta|0) + ' sliceLen=' + slen + ' events=' + ecnt
+                  + ' dolphinPendMask=0x' + dmask.toString(16) + ' ppcPendSched=0x' + psch.toString(16)
+                  + ' idleHint=' + _idleHint + ' VIpend=' + (dmask & 1));
+                // [ff-diag] dolphin_service_iter fast-forward gate (why the pending VI event isn't firing).
+                console.log('[ff-diag] ctx=0x' + (i32bd[0x026B0700 >> 2] >>> 0).toString(16)
+                  + ' idleHint=' + (i32bd[0x026B0704 >> 2] >>> 0) + ' yieldFlag=' + (i32bd[0x026B0708 >> 2] >>> 0)
+                  + ' reached=' + (i32bd[0x026B070C >> 2] >>> 0) + ' ran=' + (i32bd[0x026B0710 >> 2] >>> 0)
+                  + ' lastAdvances=' + (i32bd[0x026B0714 >> 2] >>> 0) + ' brokeOnExc=' + (i32bd[0x026B0718 >> 2] >>> 0)
+                  + ' msrAfter=0x' + (i32bd[0x026B071C >> 2] >>> 0).toString(16)
+                  + ' excAfter=0x' + (i32bd[0x026B0720 >> 2] >>> 0).toString(16));
+                // [pi-track TEMP 2026-06-29] PI cause/mask published by dolphin's
+                // UpdateException (ProcessorInterface.cpp:170-171 → SAB 0x025010F8/FC).
+                // BUG 2 root: is the SI interrupt (INT_CAUSE_SI=0x8) MASKED? exc=0x4 is
+                // set only when (cause & mask)!=0. If SI bit is in cause but NOT mask,
+                // the SI completion never becomes deliverable → async reset never done.
+                var piCause = i32bd[0x025010F8 >> 2] >>> 0;
+                var piMask  = i32bd[0x025010FC >> 2] >>> 0;
+                console.log('[ppc-worker-handshake] pi-track cause=0x' + piCause.toString(16)
+                  + ' mask=0x' + piMask.toString(16) + ' active(c&m)=0x' + ((piCause & piMask) >>> 0).toString(16)
+                  + ' SIcause=' + ((piCause & 0x8) ? 1 : 0) + ' SImask=' + ((piMask & 0x8) ? 1 : 0));
+                // [ee-diag] worker-side first-EE-PC + EE=1 iter count across the whole boot.
+                var eePc = i32bd[0x025000B0 >> 2] >>> 0;
+                var eeCnt = i32bd[0x025000B4 >> 2] >>> 0;
+                console.log('[ppc-worker-handshake] ee-diag firstEEpc=0x' + eePc.toString(16)
+                  + ' eeSetIters=' + eeCnt);
+                // [garbage-trace] the ISR block that produced the first sub-0x80000000
+                // next-pc + the 24-pc ring leading into it (worker path vs native's
+                // 0x500->0x588->0x800b7a58). Logged once.
+                var gtPc = i32bd[0x025000C0 >> 2] >>> 0;
+                if (gtPc && !window._gtLogged) {
+                  window._gtLogged = true;
+                  var gtNext = i32bd[0x025000C4 >> 2] >>> 0;
+                  var ring = [];
+                  for (var gi = 0; gi < 24; gi++) ring.push('0x' + (i32bd[(0x025000C8 + gi*4) >> 2] >>> 0).toString(16));
+                  console.log('[ppc-worker-handshake] garbage-trace divergingPc=0x' + gtPc.toString(16)
+                    + ' -> next=0x' + gtNext.toString(16));
+                  console.log('[ppc-worker-handshake] garbage-path ' + ring.join(' '));
+                }
+              }
+            })();
+            if ((window._e5Slices | 0) === 30 && !window._dumpedE5) {
+              window._dumpedE5 = true;
+              var cx = i32bd[0x0250002C >> 2] >>> 0;
+              var mem1 = i32bd[0x02500020 >> 2] >>> 0;  // MEM1 host base (SAB-published)
+              var rd = function(a){ return i32bd[a >> 2] >>> 0; };
+              var exc = cx ? rd(cx + 0x2EC) : 0;
+              var msr = cx ? rd(cx + 0x2E0) : 0;
+              var srr0 = cx ? rd(cx + 0x340 + 26*4) : 0;
+              var srr1 = cx ? rd(cx + 0x340 + 27*4) : 0;
+              var lr  = cx ? rd(cx + 0x340 + 8*4) : 0;
+              var pcNow = cx ? rd(cx) : 0;
+              console.log('[ppc-worker-handshake] e5-spin pc=0x' + pcNow.toString(16)
+                + ' exc=0x' + exc.toString(16) + ' msr=0x' + msr.toString(16)
+                + ' srr0=0x' + srr0.toString(16) + ' srr1=0x' + srr1.toString(16)
+                + ' lr=0x' + lr.toString(16));
+              if (cx) {
+                var gp = function(i){ return (rd(cx + 0x8 + i*4)).toString(16); };
+                var rs = '';
+                for (var ri = 0; ri < 13; ri++) rs += ' r' + ri + '=0x' + gp(ri);
+                console.log('[ppc-worker-handshake] e5-regs' + rs);
+              }
+              // Dump the loop bytes from MEM1: 0x800e56a0..0x800e5760 (0xC0 bytes).
+              if (mem1) {
+                var u8d = new Uint8Array(sharedMemory.buffer);
+                var start = 0x800e56a0, n = 0xC0;
+                var hex = '';
+                for (var bi = 0; bi < n; bi++) {
+                  var b = u8d[(mem1 + (start - 0x80000000) + bi) >>> 0];
+                  hex += (b < 16 ? '0' : '') + b.toString(16);
+                }
+                console.log('[ppc-worker-handshake] e5-bytes base=0x' + start.toString(16)
+                  + ' mem1=0x' + mem1.toString(16) + ' hex=' + hex);
+              }
+            }
             // Clear yield flag and give dolphin a brief window to vector
             // exceptions / advance scheduler. setTimeout 0 yields the
             // event loop; the page's mbx consumer (4 ms interval) keeps
@@ -1587,18 +2614,213 @@
             // through 1-2 batches.
             Atomics.store(i32bd, 0x02500000 >> 2, 0);
             window._bdDispatching = false;
-            setTimeout(startBootDispatchSlice, 30);
+            // [determinize-boot 2026-07-08] 30ms → 0: the 30ms WALL re-engage delay made the
+            // worker/dolphin alternation cadence wall-timed (the dominant residual entropy
+            // after the pump/CT-fire/slice-cap constant fixes). The in-slice due-kick already
+            // services dolphin synchronously via the mailbox during the slice, so the post-
+            // slice window doesn't need a wall delay. setTimeout(0) still yields for message
+            // liveness but removes the 30ms magnitude. (Full sync = internal worker loop, next.)
+            setTimeout(startBootDispatchSlice, 0);
           };
-          // Initial kick.
-          startBootDispatchSlice();
-        } else if (elapsed > 60000) {
-          clearInterval(_bdPoll);
-          console.log('[ppc-worker-handshake] boot-dispatch: timed out'
+          // [atomic handover 2026-06-28] Phase IV is set above, so dolphin's next
+          // heartbeat routes to service_iter and STOPS dispatching — freezing the
+          // guest PC/MSR. Read the FROZEN MSR and hand to the worker ONLY at EE=1
+          // (the MP4 DVD-read wait needs the DI IRQ, which needs EE=1; an EE=0
+          // takeover deadlocks). If it froze in an EE=0 critical section, briefly
+          // turn Phase IV OFF so dolphin dispatches forward to the next EE=1 point,
+          // then re-freeze and recheck. No forcing (forcing vectors mid-critical-
+          // section -> corruption). EE=1 is ~70% of steady state, so this converges
+          // in a few tries.
+          window._hoTries = 0;
+          var _ctxHo = i32bd[0x0250002C >> 2] >>> 0;
+          var _CTF = (0x02680000 + 0x2C) >> 2;
+          // [atomic-handover quiescence 2026-06-28] ROOT-RACE FIX. Toggling Phase
+          // IV on does NOT abort dolphin's IN-FLIGHT retro_run: run_iter_batch
+          // re-checks the Phase flag only at the top of each iteration
+          // (EmscriptenWorker.cpp:635), AFTER a full retro_run frame-quantum. So
+          // sampling msrFrozen/pcFrozen right after the toggle reads a snapshot
+          // dolphin is STILL mutating — dolphin keeps dispatching guest PowerPC
+          // into the shared ppc_state concurrently with the worker. That single
+          // unsynchronized cross-thread mutation is the root of BOTH wedge modes:
+          //   Mode A: dolphin runs the scheduler into GXInitTexObj, leaving shared
+          //           r1=0x801e67b0; the worker's SI poll then runs SIGetType on
+          //           that foreign frame -> r28/r31 garbage -> 0x808080 runaway.
+          //   Mode B: a guest rfi/mtmsr executes in dolphin's thread after the
+          //           sample -> MSR 0x8032->0x2032 (EE cleared); exc=0x5 stays
+          //           masked, idle never re-enables EE -> permanent wedge.
+          // FIX: gate EVERY sample behind a proof that dolphin retired its in-flight
+          // retro_run and is now event-only — c_retror (0x025010D4) stops
+          // incrementing AND c_svci (0x025010D0) advances >=2 (counters published
+          // by run_iter_batch, EmscriptenWorker.cpp:600-606). Bounded async
+          // setTimeout poll: never a busy loop (Atomics.wait is illegal on the page
+          // main thread, and dolphin's pthread must keep pumping run_iter_batch for
+          // the counters to move). Page stays the sole yield-flag owner (worker
+          // never writes 0x02500000). Verified by an adversarial design panel.
+          var _C_SVCI = 0x025010D0 >> 2, _C_RETROR = 0x025010D4 >> 2;
+          // c_svci advances in BURSTS (dolphin pumpBatch do-while, worker_funcs.js:137)
+          // that don't align with the 4ms poll windows, so a per-window svci-delta is
+          // unreliable. Instead: quiescent = c_retror UNCHANGED across N consecutive
+          // polls (proves no in-flight retro_run is dispatching guest code) AND c_svci
+          // advanced CUMULATIVELY since the wait began (proves dolphin is alive and
+          // event-only, not merely stalled). Bounded; surfaces on timeout.
+          var waitQuiescent = function (cb) {
+            if (!window._bdLoopRunning) return;
+            var svciStart = i32bd[_C_SVCI] >>> 0;
+            var lastR = i32bd[_C_RETROR] >>> 0;
+            var stable = 0, tries = 0;
+            var poll = function () {
+              if (!window._bdLoopRunning) return;
+              var r = i32bd[_C_RETROR] >>> 0, s = i32bd[_C_SVCI] >>> 0;
+              stable = (r === lastR) ? (stable + 1) : 0;
+              lastR = r;
+              tries++;
+              var svciAlive = ((s - svciStart) >>> 0) >= 4;
+              if ((stable >= 3 && svciAlive) || tries > 300) {
+                if ((window._qN = (window._qN|0)+1) <= 6 || tries > 300)
+                  console.log('[qdiag] converged tries=' + tries + ' retror=' + r
+                    + ' svciDelta=' + ((s - svciStart) >>> 0) + ' stable=' + stable
+                    + (tries > 300 ? ' (TIMEOUT)' : ''));
+                cb(tries > 300); return;
+              }
+              setTimeout(poll, 4);
+            };
+            setTimeout(poll, 4);
+          };
+          var doCheck = function (qGaveUp) {
+            if (!window._bdLoopRunning) return;
+            var msrFrozen = _ctxHo ? (i32bd[(_ctxHo + 0x2E0) >> 2] >>> 0) : 0;
+            var pcFrozen  = _ctxHo ? (i32bd[_ctxHo >> 2] >>> 0) : 0;
+            var eeFrozen = (msrFrozen & 0x8000) !== 0;
+            // [consistency gate 2026-06-29] Accept the FROZEN state iff it is OS-consistent
+            // per the native oracle (this session, MP4/GMPE01). Requiring the FROZEN pc to be
+            // EXACTLY the idle spin 0x800ba2f0 does NOT work: dolphin IDLE-SKIPS the spin
+            // (fast-forwards CoreTiming past `while(RunQueueBits==0)`), so the quiescent freeze
+            // never dwells there — observed 275+ tries, 0 hits, all quantum-end PCs. So instead
+            // detect consistency directly via the guest's own scheduler invariant. Two
+            // consistent shapes:
+            //   (1) idle spin 0x800ba2f0 — IdleContext current, CurrentThread NULL, every real
+            //       thread context fully saved, EE=1; OR
+            //   (2) a normal running thread — the OS invariant CurrentContext ==
+            //       &CurrentThread->context holds. OSContext is offset 0 of OSThread, so that is
+            //       exactly mem32[0x800000D4] (__OSCurrentContext) == mem32[0x800000E4]
+            //       (__OSCurrentThread), both != 0.
+            // The TORN state the old fallback handed over (PC=0x0 via OSLoadContext rfi of a
+            // zeroed/idle context, the 0x800b6ad8->0x0 null-jump) is precisely when NEITHER
+            // holds: mid thread-switch, CurrentThread transiently NULL but pc not the stable
+            // idle spin. Reading the guest invariant detects it directly. waitQuiescent
+            // guarantees a TRUE freeze, so these guest pointers are not torn by concurrent
+            // dolphin dispatch. (MEM1 is byte-swapped to guest BE order in the SAB.)
+            var mem1Ho = i32bd[0x02500020 >> 2] >>> 0;  // SAB-published MEM1 host base
+            var u8bd = new Uint8Array(sharedMemory.buffer);
+            var rdGuestBE = function (a) {
+              if (!mem1Ho) return 0;
+              var o = (mem1Ho + (a & 0x01FFFFFF)) >>> 0;
+              return ((u8bd[o] << 24) | (u8bd[o + 1] << 16) | (u8bd[o + 2] << 8) | u8bd[o + 3]) >>> 0;
+            };
+            var curCtx = rdGuestBE(0x800000D4) >>> 0;   // __OSCurrentContext
+            var curThr = rdGuestBE(0x800000E4) >>> 0;   // __OSCurrentThread
+            var idleSpin = (pcFrozen === 0x800ba2f0);
+            var threadConsistent = (curThr !== 0) && (curCtx === curThr);
+            var clean = eeFrozen && (idleSpin || threadConsistent);
+            window._hoTries++;
+            if (window._hoTries <= 8 || (window._hoTries % 25) === 0)
+              console.log('[qdiag] doCheck #' + window._hoTries + ' msr=0x' + msrFrozen.toString(16)
+                + ' pc=0x' + pcFrozen.toString(16) + ' ee=' + (eeFrozen ? 1 : 0)
+                + ' idle=' + (idleSpin ? 1 : 0) + ' curCtx=0x' + curCtx.toString(16)
+                + ' curThr=0x' + curThr.toString(16) + ' consistent=' + (threadConsistent ? 1 : 0)
+                + ' qGaveUp=' + (qGaveUp ? 1 : 0));
+            // [quiescent-fallback TEST 2026-06-28] If we can't catch the guest at the
+            // SelectThread idle-spin within a bounded number of QUIESCENT samples
+            // (at the active-render phase it passes through SelectThread only briefly
+            // and the in-flight retro_run overshoots to Hu3DPreProc), hand over at the
+            // quiescent EE=1 point anyway. The whole point of the quiescence wait is
+            // that dolphin is now event-only with NO concurrent dispatch, so even a
+            // non-SelectThread frozen pc is a CONSISTENT context (no OS struct mid-
+            // modification, no torn read). Test whether the worker can run the game
+            // loop from there now that the race is gone.
+            // [idle-spin gate 2026-06-29] REMOVED the quiescent-fallback. Handing over
+            // at an arbitrary EE=1 NON-idle pc (the old `eeFrozen && hoTries>40` path)
+            // is exactly what inherited a torn context (mid-thread / mid-switch) ->
+            // OSLoadContext rfi of a zeroed/idle context -> PC=0x0. Native proves
+            // 0x800ba2f0 is the DOMINANT state (~57%, caught within a couple of freeze
+            // tries since the spin block-entry == the freeze PC), so we just retry until
+            // the freeze lands EXACTLY on it. No fallback, no torn takeover.
+            if (clean) {
+              console.log('[ppc-worker-handshake] atomic-handover: CLEAN takeover ('
+                + (idleSpin ? 'idle-spin 0x800ba2f0' : 'consistent thread curCtx==curThr=0x' + curThr.toString(16))
+                + ') MSR=0x' + msrFrozen.toString(16) + ' EE=' + (eeFrozen ? 1 : 0)
+                + ' pc=0x' + pcFrozen.toString(16)
+                + ' tries=' + window._hoTries + ' qGaveUp=' + (qGaveUp ? 1 : 0));
+              window._hoSuppressFF = false;
+              startBootDispatchSlice();
+              return;
+            }
+            if (window._hoTries > 800) {
+              // Could not catch the idle spin in 800 quiescent samples. Do NOT hand over
+              // a torn context — stay dolphin-driven and surface the failure.
+              console.log('[ppc-worker-handshake] atomic-handover: FAILED to catch idle'
+                + ' spin 0x800ba2f0 in ' + window._hoTries + ' tries (last pc=0x'
+                + pcFrozen.toString(16) + ' ee=' + (eeFrozen ? 1 : 0) + ') —'
+                + ' staying dolphin-driven, NO torn handover');
+              // [ho-retry 2026-07-04] Keep retrying — the FAILED path runs at ~0.007 MIPS
+              // (user-frozen); measured CLEAN rate was ~1-in-4 rounds, so bounded retries
+              // convert nearly all loads. Each round re-freezes at a later, quieter moment.
+              window._hoRetryN = (window._hoRetryN | 0) + 1;
+              if (window._hoRetryN <= 12) {
+                window._hoTries = 0;
+                console.log('[ppc-worker-handshake] atomic-handover: RETRY round ' + window._hoRetryN);
+                Atomics.store(i32bd, _CTF, 0);
+                setTimeout(function () {
+                  Atomics.store(i32bd, _CTF, 0x6);
+                  setTimeout(function () { waitQuiescent(doCheck); }, 6);
+                }, 2500);
+                return;
+              }
+              window._bdLoopRunning = false;
+              window._hoSuppressFF = false;
+              Atomics.store(i32bd, _CTF, 0);   // release Phase IV; dolphin keeps driving
+              return;
+            }
+            // Not the idle spin: release Phase IV (dolphin dispatches forward — back
+            // into the dominant idle spin), re-engage, then RE-CONFIRM quiescence
+            // before re-sampling. Retries until the freeze lands on 0x800ba2f0.
+            Atomics.store(i32bd, _CTF, 0);
+            setTimeout(function () {
+              Atomics.store(i32bd, _CTF, 0x6);
+              setTimeout(function () { waitQuiescent(doCheck); }, 6);
+            }, 4);
+          };
+          var tryHandover = function () { window._hoSuppressFF = true; waitQuiescent(doCheck); };
+          setTimeout(tryHandover, 20);
+        } else if (elapsed > 60000 && !window._bdTimeoutNoted) {
+          // [no-wall-deadline 2026-07-06] This clause used to clearInterval(_bdPoll) —
+          // a 60s WALL deadline racing the guest-state anchor. Confirmed firing on every
+          // non-arming run (grep 'timed out': gt_run1 ✓ gt_run5 ✓, absent on the run that
+          // parked CLEAN). The poll now lives until the anchor fires; this prints once as
+          // status only.
+          window._bdTimeoutNoted = true;
+          console.log('[ppc-worker-handshake] boot-dispatch: anchor not reached after 60s (poll stays alive)'
             + ' PC=0x' + pcBd.toString(16)
             + ' mem1Wired=' + !!window._ppcMem1Wired
-            + ' routingReady=' + !!window._ppcDolphinRoutingReady);
+            + ' routingReady=' + !!window._ppcDolphinRoutingReady
+            // [takeover-gate-diag 2026-07-16] which of the 5 ready inputs is stuck false?
+            + ' | framesNow=' + _framesNow + '(>=100? ' + (_framesNow >= 100) + ')'
+            + ' eeOn=' + _eeOn + ' cxR=0x' + _cxR.toString(16)
+            + ' rendered=' + rendered
+            + ' READY=' + ready);
         }
-      }, 250);
+        // [takeover-gate-diag] also sample the gate inputs every ~3s so we see them
+        // EVOLVE, not just the 60s snapshot (the stuck input may only settle late).
+        if (!window._bdGateDiagN) window._bdGateDiagN = 0;
+        if ((window._bdGateDiagN++ % 100) === 0) {
+          console.log('[gate-diag] t~' + (elapsed/1000).toFixed(0) + 's framesNow=' + _framesNow
+            + ' eeOn=' + _eeOn + ' cxR=0x' + _cxR.toString(16) + ' rendered=' + rendered
+            + ' mem1=' + !!window._ppcMem1Wired + ' routing=' + !!window._ppcDolphinRoutingReady
+            + ' PC=0x' + pcBd.toString(16) + ' READY=' + ready);
+        }
+      }, 30);  // [deterministic handover] 30ms poll reliably catches the brief
+               // VIWaitForRetrace dwell (was 250ms — too coarse for the gate's
+               // new in-VIWaitForRetrace condition).
     }
   };
   var mobilePadState = { a: false, b: false, x: false, y: false, l: false, r: false, z: false, start: false, select: false, up: false, down: false, left: false, right: false };
@@ -1833,10 +3055,14 @@
     for (var y = 0; y < h; y++) {
       var so = y * stride;
       for (var x = 0; x < w; x++) {
-        // Source is XRGB8888 little-endian = bytes [B,G,R,X]; canvas wants RGBA.
-        dst[di++] = src[so + 2];
-        dst[di++] = src[so + 1];
+        // SW present buffer is memory-order [R,G,B,A] (SWTexture Pixel{r,g,b,a}, handed to
+        // video_cb UNSWIZZLED by VideoBackends/Software SWGfx::ShowImage — the same buffer the
+        // native SWOGLWindow uploads as GL_RGBA). The old [B,G,R,X] assumption read byte-2(B) into
+        // canvas-R and byte-0(R) into canvas-B, inverting R<->B (red Nintendo logo rendered blue).
+        // Copy straight through; force opaque alpha for the present.
         dst[di++] = src[so + 0];
+        dst[di++] = src[so + 1];
+        dst[di++] = src[so + 2];
         dst[di++] = 255;
         so += 4;
       }
@@ -2035,8 +3261,25 @@
     switch (data.cmd) {
       case 'print': pageLog('> ' + data.txt); break;
       case 'setStatus': setStatus(data.txt); break;
-      case 'render': { if (data.pixels) paintFrame(data.pixels, data.w, data.h, data.pitch); if (data.h > 0 && !window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame received w:' + data.w + ' h:' + data.h); } renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now - lastFpsLog)).toFixed(1); renderFrames = 0; lastFpsLog = now; } break; }
+      case 'render': { if (data.pixels) paintFrame(data.pixels, data.w, data.h, data.pitch); if (data.h > 0 && !window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame received w:' + data.w + ' h:' + data.h); } renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { var _fps = (renderFrames * 1000 / (now - lastFpsLog)); fpsEl.textContent = 'FPS: ' + _fps.toFixed(1); console.log('[fps] ' + _fps.toFixed(2) + ' @t=' + (now / 1000).toFixed(0) + 's totalFrames=' + (window._totalRenderFrames = (window._totalRenderFrames || 0) + renderFrames)); renderFrames = 0; lastFpsLog = now; } break; }
       case 'audio': {
+        // [audio-diag 2026-07-13] User reports NO SOUND (task #6). Log the delivery chain:
+        // arrival rate from the worker + which sink is live + AudioContext state (a
+        // 'suspended' ctx is the classic silent-audio cause). ~1 line per 5s.
+        window._audN = (window._audN | 0) + (data.len | 0);
+        var _anow = performance.now();
+        if (!window._audT0) { window._audT0 = _anow;
+          console.log('[audio-diag] FIRST audio msg: len=' + data.len + ' muted=' + audioMuted
+            + ' sink=' + (window._gcAudioPushSamples ? 'worklet' : (Module._feedAudio ? 'legacy' : 'NONE')));
+        }
+        if (_anow - (window._audLog || 0) > 5000) {
+          window._audLog = _anow;
+          var _actx = getAudioCtx();
+          console.log('[audio-diag] ' + ((window._audN * 1000) / (_anow - window._audT0)).toFixed(0)
+            + ' samples/s (native 32000) muted=' + audioMuted
+            + ' sink=' + (window._gcAudioPushSamples ? 'worklet' : (Module._feedAudio ? 'legacy' : 'NONE'))
+            + ' ctx=' + (_actx ? _actx.state : 'null'));
+        }
         if (audioMuted) break;
         // Prefer AudioWorklet path (lock-free SAB ring buffer); fall back
         // to legacy Module._feedAudio if the worklet hasn't been initialized
@@ -2286,7 +3529,26 @@
     setTimeout(pollController, 10);
     [$('btnSave'), $('btnLoad'), $('btnExport'), $('btnImport'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
   }
-  var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; window.__romExt = pick.ext || '.iso'; SAVE_KEY = ROM_NAME + '.gcs'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /gamecube/dolphin_libretro/dolphin_libretro.js ...'); setStatus('Loading Dolphin libretro core...'); var s = document.createElement('script'); s.src = '/gamecube/dolphin_libretro/dolphin_libretro.js?v=' + Date.now(); document.body.appendChild(s); }
+  var started = false; async function startEmulator() { if (started) return; started = true;
+    // [webgpu fallback 2026-07-11] The WGPU video backend HARD-FREEZES the boot when WebGPU is
+    // unavailable: the worker's WGPUGfx gets a null device, and the null-device path wedges the
+    // dolphin worker right after DSP-AX ucode init (CoreTiming stops, guest idles in SelectThread
+    // at frame 0 — reproduced locally with --disable-features=WebGPU, matching the user's live
+    // Chrome "Failed to create WebGPU Context Provider"). The OGL/WebGL2 backend is WebGPU-
+    // independent and boots fine. Probe adapter+device here (same requests WGPUGfx makes on the
+    // proxied pthread; the page + worker share one GPU process, so this predicts the worker's
+    // outcome) BEFORE the backend is chosen in var_setup. On failure, force the OGL fallback.
+    if (!/[?&]wgpu=0/.test(location.search)) {
+      try {
+        var _wgAd = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
+        var _wgDev = _wgAd ? await _wgAd.requestDevice() : null;
+        if (!_wgDev) window.__gcWebGPUUnavailable = true;
+      } catch (e) { window.__gcWebGPUUnavailable = true; }
+      pageLog(window.__gcWebGPUUnavailable
+        ? '[webgpu] adapter/device UNAVAILABLE — falling back to OGL/WebGL2 backend (WGPU would freeze boot)'
+        : '[webgpu] adapter+device OK — using WGPU backend');
+    }
+    var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; window.__romExt = pick.ext || '.iso'; SAVE_KEY = ROM_NAME + '.gcs'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /gamecube/dolphin_libretro/dolphin_libretro.js ...'); setStatus('Loading Dolphin libretro core...'); var s = document.createElement('script'); s.src = '/gamecube/dolphin_libretro/dolphin_libretro.js?v=' + Date.now(); document.body.appendChild(s); }
   $('btnStart').addEventListener('click', startEmulator);
   const DB_NAME = 'GCWASMDB', STORE = 'GCWASMSTATES'; var SAVE_KEY = ROM_NAME + '.gcs';
   function openDB() { return new Promise((resolve, reject) => { var req = indexedDB.open(DB_NAME); req.onupgradeneeded = e => e.target.result.createObjectStore(STORE); req.onsuccess = e => resolve(e.target.result); req.onerror = () => reject(req.error); }); }

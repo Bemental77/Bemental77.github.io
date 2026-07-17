@@ -19,6 +19,7 @@
 #include "bementalJIT/types.h"
 #include "code_op.h"
 #include "fpr_reg_cache.h"
+#include "jit_load_store.h"   // LoadStoreParams (dcbz fastmem fill)
 #include "reg_cache.h"
 
 class WasmModuleBuilder;
@@ -121,8 +122,11 @@ void emit_divwux(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
 void emit_mftb(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr);
 
 // dcbz — zero a 32-byte cache line at EA = (ra?gpr[ra]:0) + gpr[rb].
-// Op31 xo=1014. EA is 32-byte aligned. Emit as 8 x i32 store via
-// WIMPORT_WRITE32 (matches gekko_emit.cpp:3707).
-void emit_dcbz(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr);
+// Op31 xo=1014. EA is 32-byte aligned. [dcbz-fastpath 2026-07-15] Jit64-parity
+// inline fill: classify-admitted RAM lines are zeroed with four in-wasm
+// i64.stores; classify-reject falls back to WIMPORT_INTERP (Interpreter::dcbz,
+// the exact prior path). Takes LoadStoreParams for the fastmem window.
+void emit_dcbz(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
+               LoadStoreParams params);
 
 }  // namespace bemental::powerpc

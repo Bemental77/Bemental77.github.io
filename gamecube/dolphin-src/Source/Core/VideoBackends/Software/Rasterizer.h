@@ -9,6 +9,25 @@ struct OutputVertexData;
 
 namespace Rasterizer
 {
+// Tile-parallel raster pool. Index 0 is the calling/FIFO thread; 1..N-1 are worker pthreads.
+// Must be <= the MAX_RASTER_WORKERS cap in Rasterizer.cpp (and PTHREAD_POOL_SIZE in the link).
+constexpr int MaxRasterWorkers() { return 4; }
+
+// Per-thread raster worker id, used by the per-pixel statistics / perf-query / bounding-box sinks
+// (which run on worker threads) to accumulate into a disjoint per-worker partial that the FIFO
+// thread reduces at the end-of-triangle barrier. Defaults to 0 (the FIFO thread and any
+// non-raster thread). Set once per worker thread when the pool spawns.
+extern thread_local int g_raster_worker_id;
+
+// Number of bands/contexts currently in use for a triangle (1..MaxRasterWorkers()). Read by the
+// reduction paths so they only fold the live worker slots. Stable after InitWorkerPool().
+int NumRasterWorkers();
+
+// Spawn / join the persistent raster worker pool. Called from VideoSoftware::Initialize /
+// ::Shutdown. Spawn is idempotent; shutdown joins all workers.
+void InitWorkerPool();
+void ShutdownWorkerPool();
+
 void Init();
 void ScissorChanged();
 

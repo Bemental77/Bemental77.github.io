@@ -12,6 +12,7 @@
 
 #include "Core/System.h"
 
+#include "VideoBackends/Software/Rasterizer.h"
 #include "VideoBackends/Software/SWBoundingBox.h"
 #include "VideoBackends/Software/SWEfbInterface.h"
 #include "VideoBackends/Software/TextureSampler.h"
@@ -384,12 +385,94 @@ void Tev::Indirect(unsigned int stageNum, s32 s, s32 t)
   }
 }
 
+void Tev::SetupStages()
+{
+  // Precompute everything in the per-stage loop that depends only on bpmem / const LUTs /
+  // per-frame constants. bpmem is stable for the whole primitive (it only changes via FIFO
+  // BP-writes between draw calls), so this is correctness-preserving: each cached value is
+  // exactly what the old per-pixel code would have recomputed.
+
+  // Indirect stages (mirrors the indirect loop in Draw()).
+  for (unsigned int stageNum = 0; stageNum < bpmem.genMode.numindstages; stageNum++)
+  {
+    const int stageNum2 = stageNum >> 1;
+    const int stageOdd = stageNum & 1;
+    IndStageCache& ind = m_IndStageCache[stageNum];
+
+    u32 texcoordSel = bpmem.tevindref.getTexCoord(stageNum);
+    ind.texmap = bpmem.tevindref.getTexMap(stageNum);
+
+    // Quirk: tex coord >= numtexgens falls back to tex coord 0 (bug 11462).
+    if (texcoordSel >= bpmem.genMode.numtexgens)
+      texcoordSel = 0;
+    ind.texcoordSel = texcoordSel;
+
+    const TEXSCALE& texscale = bpmem.texscale[stageNum2];
+    ind.scaleS = stageOdd ? texscale.ss1 : texscale.ss0;
+    ind.scaleT = stageOdd ? texscale.ts1 : texscale.ts0;
+  }
+
+  // Color/alpha TEV stages (mirrors the main stage loop in Draw()).
+  for (unsigned int stageNum = 0; stageNum <= bpmem.genMode.numtevstages; stageNum++)
+  {
+    const int stageNum2 = stageNum >> 1;
+    const int stageOdd = stageNum & 1;
+    const TwoTevStageOrders& order = bpmem.tevorders[stageNum2];
+    StageCache& sc = m_StageCache[stageNum];
+
+    // combiner config (whole unions are per-primitive-invariant). BitField copy-
+    // assignment is deleted; the union is trivially-copyable storage, so memcpy the
+    // raw bits (same value the original per-pixel `const ColorCombiner& cc` read).
+    std::memcpy(&sc.cc, &bpmem.combiners[stageNum].colorC, sizeof(sc.cc));
+    std::memcpy(&sc.ac, &bpmem.combiners[stageNum].alphaC, sizeof(sc.ac));
+
+    u32 texcoordSel = order.getTexCoord(stageOdd);
+    sc.texmap = order.getTexMap(stageOdd);
+
+    // Quirk: tex coord >= numtexgens falls back to tex coord 0.
+    if (texcoordSel >= bpmem.genMode.numtexgens)
+      texcoordSel = 0;
+    sc.texcoordSel = texcoordSel;
+
+    sc.enable = order.getEnable(stageOdd);
+
+    // texel swap table for the sampled texture color
+    sc.tswapTable = bpmem.tevksel.GetSwapTable(sc.ac.tswap);
+
+    // konst color/alpha for this stage
+    const auto kc = bpmem.tevksel.GetKonstColor(stageNum);
+    const auto ka = bpmem.tevksel.GetKonstAlpha(stageNum);
+    sc.konst.r = m_KonstLUT[kc].r;
+    sc.konst.g = m_KonstLUT[kc].g;
+    sc.konst.b = m_KonstLUT[kc].b;
+    sc.konst.a = m_KonstLUT[ka].a;
+
+    // rasterized-color selection args (the actual color read stays per-pixel in SetRasColor)
+    sc.rasColorChan = order.getColorChan(stageOdd);
+    sc.rswap = sc.ac.rswap;
+
+    // input-ref selection: pick which LUT entry each combiner input maps to. The LUT entries
+    // hold const refs into per-pixel storage (Reg/TexColor/RasColor/StageKonst), so the *values*
+    // are still gathered per pixel; only the selection is hoisted.
+    sc.cInput[0] = &m_ColorInputLUT[sc.cc.a];
+    sc.cInput[1] = &m_ColorInputLUT[sc.cc.b];
+    sc.cInput[2] = &m_ColorInputLUT[sc.cc.c];
+    sc.cInput[3] = &m_ColorInputLUT[sc.cc.d];
+    sc.aInput[0] = &m_AlphaInputLUT[sc.ac.a];
+    sc.aInput[1] = &m_AlphaInputLUT[sc.ac.b];
+    sc.aInput[2] = &m_AlphaInputLUT[sc.ac.c];
+    sc.aInput[3] = &m_AlphaInputLUT[sc.ac.d];
+  }
+}
+
 void Tev::Draw()
 {
   ASSERT(Position[0] >= 0 && Position[0] < s32(EFB_WIDTH));
   ASSERT(Position[1] >= 0 && Position[1] < s32(EFB_HEIGHT));
 
-  INCSTAT(g_stats.this_frame.tev_pixels_in);
+  // g_stats is non-atomic diagnostic state; under MT count only on the FIFO thread (band 0).
+  if (Rasterizer::g_raster_worker_id == 0)
+    INCSTAT(g_stats.this_frame.tev_pixels_in);
 
   auto& system = Core::System::GetInstance();
   auto& pixel_shader_manager = system.GetPixelShaderManager();
@@ -405,50 +488,30 @@ void Tev::Draw()
 
   for (unsigned int stageNum = 0; stageNum < bpmem.genMode.numindstages; stageNum++)
   {
-    const int stageNum2 = stageNum >> 1;
-    const int stageOdd = stageNum & 1;
+    // Per-primitive-invariant selection/scale precomputed in SetupStages(); the texture Sample
+    // (which reads per-pixel Uv) stays per pixel.
+    const IndStageCache& ind = m_IndStageCache[stageNum];
 
-    u32 texcoordSel = bpmem.tevindref.getTexCoord(stageNum);
-    const u32 texmap = bpmem.tevindref.getTexMap(stageNum);
-
-    // Quirk: when the tex coord is not less than the number of tex gens (i.e. the tex coord does
-    // not exist), then tex coord 0 is used (though sometimes glitchy effects happen on console).
-    // This affects the Mario portrait in Luigi's Mansion, where the developers forgot to set
-    // the number of tex gens to 2 (bug 11462).
-    if (texcoordSel >= bpmem.genMode.numtexgens)
-      texcoordSel = 0;
-
-    const TEXSCALE& texscale = bpmem.texscale[stageNum2];
-    const s32 scaleS = stageOdd ? texscale.ss1 : texscale.ss0;
-    const s32 scaleT = stageOdd ? texscale.ts1 : texscale.ts0;
-
-    TextureSampler::Sample(Uv[texcoordSel].s >> scaleS, Uv[texcoordSel].t >> scaleT,
-                           IndirectLod[stageNum], IndirectLinear[stageNum], texmap,
+    TextureSampler::Sample(Uv[ind.texcoordSel].s >> ind.scaleS, Uv[ind.texcoordSel].t >> ind.scaleT,
+                           IndirectLod[stageNum], IndirectLinear[stageNum], ind.texmap,
                            IndirectTex[stageNum]);
   }
 
   for (unsigned int stageNum = 0; stageNum <= bpmem.genMode.numtevstages; stageNum++)
   {
-    const int stageNum2 = stageNum >> 1;
-    const int stageOdd = stageNum & 1;
-    const TwoTevStageOrders& order = bpmem.tevorders[stageNum2];
+    // Per-primitive-invariant config precomputed in SetupStages(). All per-pixel work (the
+    // texture sample, Indirect(), the actual raster color read, the input-value gather, and the
+    // combiner math) stays below.
+    const StageCache& sc = m_StageCache[stageNum];
 
-    // stage combiners
-    const TevStageCombiner::ColorCombiner& cc = bpmem.combiners[stageNum].colorC;
-    const TevStageCombiner::AlphaCombiner& ac = bpmem.combiners[stageNum].alphaC;
+    // stage combiners (copies of the per-primitive-invariant config unions)
+    const TevStageCombiner::ColorCombiner& cc = sc.cc;
+    const TevStageCombiner::AlphaCombiner& ac = sc.ac;
 
-    u32 texcoordSel = order.getTexCoord(stageOdd);
-    const u32 texmap = order.getTexMap(stageOdd);
-
-    // Quirk: when the tex coord is not less than the number of tex gens (i.e. the tex coord does
-    // not exist), then tex coord 0 is used (though sometimes glitchy effects happen on console).
-    if (texcoordSel >= bpmem.genMode.numtexgens)
-      texcoordSel = 0;
-
-    Indirect(stageNum, Uv[texcoordSel].s, Uv[texcoordSel].t);
+    Indirect(stageNum, Uv[sc.texcoordSel].s, Uv[sc.texcoordSel].t);
 
     // sample texture
-    if (order.getEnable(stageOdd))
+    if (sc.enable)
     {
       // RGBA
       u8 texel[4];
@@ -456,7 +519,7 @@ void Tev::Draw()
       if (bpmem.genMode.numtexgens > 0)
       {
         TextureSampler::Sample(TexCoord.s, TexCoord.t, TextureLod[stageNum],
-                               TextureLinear[stageNum], texmap, texel);
+                               TextureLinear[stageNum], sc.texmap, texel);
       }
       else
       {
@@ -470,42 +533,39 @@ void Tev::Draw()
       RawTexColor.b = texel[u32(ColorChannel::Blue)];
       RawTexColor.a = texel[u32(ColorChannel::Alpha)];
 
-      const auto& swap = bpmem.tevksel.GetSwapTable(ac.tswap);
+      const auto& swap = sc.tswapTable;
       TexColor.r = texel[u32(swap[ColorChannel::Red])];
       TexColor.g = texel[u32(swap[ColorChannel::Green])];
       TexColor.b = texel[u32(swap[ColorChannel::Blue])];
       TexColor.a = texel[u32(swap[ColorChannel::Alpha])];
     }
 
-    // set konst for this stage
-    const auto kc = bpmem.tevksel.GetKonstColor(stageNum);
-    const auto ka = bpmem.tevksel.GetKonstAlpha(stageNum);
-    StageKonst.r = m_KonstLUT[kc].r;
-    StageKonst.g = m_KonstLUT[kc].g;
-    StageKonst.b = m_KonstLUT[kc].b;
-    StageKonst.a = m_KonstLUT[ka].a;
+    // set konst for this stage (value precomputed; copy into the live StageKonst member so the
+    // konst input ref in m_ColorInputLUT/m_AlphaInputLUT keeps pointing at valid storage)
+    StageKonst = sc.konst;
 
-    // set color
-    SetRasColor(order.getColorChan(stageOdd), ac.rswap);
+    // set color (channel/swap selection hoisted; the interpolated color read is per-pixel)
+    SetRasColor(sc.rasColorChan, sc.rswap);
 
-    // combine inputs
+    // combine inputs: the input *refs* were selected in SetupStages(); gather their per-pixel
+    // values here.
     InputRegType inputs[4];
-    inputs[BLU_C].a = m_ColorInputLUT[cc.a].b;
-    inputs[BLU_C].b = m_ColorInputLUT[cc.b].b;
-    inputs[BLU_C].c = m_ColorInputLUT[cc.c].b;
-    inputs[BLU_C].d = m_ColorInputLUT[cc.d].b;
-    inputs[GRN_C].a = m_ColorInputLUT[cc.a].g;
-    inputs[GRN_C].b = m_ColorInputLUT[cc.b].g;
-    inputs[GRN_C].c = m_ColorInputLUT[cc.c].g;
-    inputs[GRN_C].d = m_ColorInputLUT[cc.d].g;
-    inputs[RED_C].a = m_ColorInputLUT[cc.a].r;
-    inputs[RED_C].b = m_ColorInputLUT[cc.b].r;
-    inputs[RED_C].c = m_ColorInputLUT[cc.c].r;
-    inputs[RED_C].d = m_ColorInputLUT[cc.d].r;
-    inputs[ALP_C].a = m_AlphaInputLUT[ac.a].a;
-    inputs[ALP_C].b = m_AlphaInputLUT[ac.b].a;
-    inputs[ALP_C].c = m_AlphaInputLUT[ac.c].a;
-    inputs[ALP_C].d = m_AlphaInputLUT[ac.d].a;
+    inputs[BLU_C].a = sc.cInput[0]->b;
+    inputs[BLU_C].b = sc.cInput[1]->b;
+    inputs[BLU_C].c = sc.cInput[2]->b;
+    inputs[BLU_C].d = sc.cInput[3]->b;
+    inputs[GRN_C].a = sc.cInput[0]->g;
+    inputs[GRN_C].b = sc.cInput[1]->g;
+    inputs[GRN_C].c = sc.cInput[2]->g;
+    inputs[GRN_C].d = sc.cInput[3]->g;
+    inputs[RED_C].a = sc.cInput[0]->r;
+    inputs[RED_C].b = sc.cInput[1]->r;
+    inputs[RED_C].c = sc.cInput[2]->r;
+    inputs[RED_C].d = sc.cInput[3]->r;
+    inputs[ALP_C].a = sc.aInput[0]->a;
+    inputs[ALP_C].b = sc.aInput[1]->a;
+    inputs[ALP_C].c = sc.aInput[2]->a;
+    inputs[ALP_C].d = sc.aInput[3]->a;
 
     if (cc.bias != TevBias::Compare)
       DrawColorRegular(cc, inputs);
@@ -676,7 +736,8 @@ void Tev::Draw()
   BBoxManager::Update(static_cast<u16>(Position[0] & ~1), static_cast<u16>(Position[0] | 1),
                       static_cast<u16>(Position[1] & ~1), static_cast<u16>(Position[1] | 1));
 
-  INCSTAT(g_stats.this_frame.tev_pixels_out);
+  if (Rasterizer::g_raster_worker_id == 0)
+    INCSTAT(g_stats.this_frame.tev_pixels_out);
   EfbInterface::IncPerfCounterQuadCount(PQ_BLEND_INPUT);
 
   EfbInterface::BlendTev(Position[0], Position[1], output);

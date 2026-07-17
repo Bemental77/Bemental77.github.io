@@ -324,6 +324,14 @@ bool PopulateConfig(GLContext* m_main_gl_context)
   g_ogl_config.bSupportsGLBaseVertex = GLExtensions::Supports("GL_ARB_draw_elements_base_vertex") ||
                                        GLExtensions::Supports("GL_EXT_draw_elements_base_vertex") ||
                                        GLExtensions::Supports("GL_OES_draw_elements_base_vertex");
+#ifdef __EMSCRIPTEN__
+  // WebGL2 has NO base-vertex draw entrypoint. If the emscripten GL shim advertises
+  // GL_OES_draw_elements_base_vertex, glDrawElementsBaseVertex's base_vertex would
+  // silently no-op while StreamBuffer uploads game vertices at a non-zero offset ->
+  // wrong/empty reads -> black geometry. Force the proven offset-0 path (BufferSubData
+  // + glDrawElements, base_index/base_vertex both 0).
+  g_ogl_config.bSupportsGLBaseVertex = false;
+#endif
   g_ogl_config.bSupportsGLBufferStorage = GLExtensions::Supports("GL_ARB_buffer_storage") ||
                                           GLExtensions::Supports("GL_EXT_buffer_storage");
   g_ogl_config.bSupportsMSAA = GLExtensions::Supports("GL_ARB_texture_multisample");

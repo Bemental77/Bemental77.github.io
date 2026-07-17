@@ -22,6 +22,9 @@
 #include "VideoCommon/PerfQueryBase.h"
 #include "VideoCommon/VideoBackendBase.h"
 
+extern "C" u32 g_pe_setfinish_count;
+u32 g_pe_setfinish_count = 0;
+
 namespace PixelEngine
 {
 enum
@@ -66,6 +69,9 @@ void PixelEngineManager::Init()
   m_token_pending = 0;
   m_token_interrupt_pending = false;
   m_finish_interrupt_pending = false;
+  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A30u)) =
+      (m_finish_interrupt_pending || m_signal_finish_interrupt) ? 1u : 0u;  // [finish-inflight PERMANENT]
+
   m_event_raised = false;
 
   m_signal_token_interrupt = false;
@@ -133,15 +139,14 @@ void PixelEngineManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
 
                    if (tmpCtrl.pe_finish)
                      pe.m_signal_finish_interrupt = false;
+                     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A30u)) =
+                         (pe.m_finish_interrupt_pending || pe.m_signal_finish_interrupt) ? 1u : 0u;  // [finish-inflight]
 
                    pe.m_control.pe_token_enable = tmpCtrl.pe_token_enable.Value();
                    pe.m_control.pe_finish_enable = tmpCtrl.pe_finish_enable.Value();
                    pe.m_control.pe_token = false;   // this flag is write only
                    pe.m_control.pe_finish = false;  // this flag is write only
 
-                   NOTICE_LOG_FMT(POWERPC, "[ax-pe2] CTRL write val={:#x} finish_en={} token_en={}",
-                                  val, static_cast<u32>(pe.m_control.pe_finish_enable),
-                                  static_cast<u32>(pe.m_control.pe_token_enable));
                    pe.UpdateInterrupts();
                  }));
 
@@ -169,8 +174,8 @@ void PixelEngineManager::UpdateInterrupts()
                                    m_signal_token_interrupt && m_control.pe_token_enable);
 
   // check if there is a finish-interrupt
-  processor_interface.SetInterrupt(INT_CAUSE_PE_FINISH,
-                                   m_signal_finish_interrupt && m_control.pe_finish_enable);
+  const bool _fin = m_signal_finish_interrupt && m_control.pe_finish_enable;
+  processor_interface.SetInterrupt(INT_CAUSE_PE_FINISH, _fin);
 }
 
 void PixelEngineManager::SetTokenFinish_OnMainThread_Static(Core::System& system, u64 userdata,
@@ -179,12 +184,14 @@ void PixelEngineManager::SetTokenFinish_OnMainThread_Static(Core::System& system
   system.GetPixelEngine().SetTokenFinish_OnMainThread(userdata, cycles_late);
 }
 
+void PixelEngineManager::FlushPendingTokenFinish()
+{
+  SetTokenFinish_OnMainThread(0, 0);
+}
+
 void PixelEngineManager::SetTokenFinish_OnMainThread(u64 userdata, s64 cycles_late)
 {
   std::unique_lock lk(m_token_finish_mutex);
-  NOTICE_LOG_FMT(POWERPC, "[ax-pe2] SetTokenFinish_OnMainThread tok_pend={} fin_pend={} fin_en={}",
-                 m_token_interrupt_pending ? 1 : 0, m_finish_interrupt_pending ? 1 : 0,
-                 static_cast<u32>(m_control.pe_finish_enable));
   m_event_raised = false;
 
   m_token = m_token_pending;
@@ -200,6 +207,9 @@ void PixelEngineManager::SetTokenFinish_OnMainThread(u64 userdata, s64 cycles_la
   {
     m_finish_interrupt_pending = false;
     m_signal_finish_interrupt = true;
+  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A30u)) =
+      (m_finish_interrupt_pending || m_signal_finish_interrupt) ? 1u : 0u;  // [finish-inflight PERMANENT]
+
     UpdateInterrupts();
     lk.unlock();
     Core::FrameUpdateOnCPUThread();
@@ -249,15 +259,42 @@ void PixelEngineManager::SetFinish(int cycles_into_future)
 {
   DEBUG_LOG_FMT(PIXELENGINE, "VIDEO Set Finish");
   {
-    static u64 s_pe_finish_n = 0;
-    s_pe_finish_n++;
-    NOTICE_LOG_FMT(PIXELENGINE, "[ax-pe] PixelEngine::SetFinish n={} cycles_into_future={}",
-                   s_pe_finish_n, cycles_into_future);
+    // [frame counter] published to SAB for probes/page; NOTICE print stripped (per-frame
+    // console cost, gate #8 — the c360b20-class lesson).
+    ++g_pe_setfinish_count;
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B0930u)) = g_pe_setfinish_count;
+    // [takeover park-trap ARM — RESTORED 2026-07-16, default-DISARMED] The arm
+    // hunk this SetFinish comment block (below) references was deleted; without it
+    // 0x026B0980 never reaches 1, JitWasm never parks (never sets 2), and the page
+    // ownership gate (gamecube.html:2110) never opens — so the second core stays
+    // 100% idle and the guest runs single-threaded forever. Restore it default-
+    // DISARMED: arm ONLY at the explicit armframe (SAB 0x026B0A30, from ?armframe=N;
+    // 0 = never arm = safe default, boot unchanged). Idempotent 0->1 exactly at the
+    // armframe. JitWasm (JitWasm.cpp:315) then flips 1->2 at the idle spin under the
+    // EE=1 / Exceptions==0 / finish-inflight(0x026B1A30)==0 one-frame-race gate.
+    {
+      const u32 _armframe =
+          *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B0A30u));
+      if (_armframe != 0u && g_pe_setfinish_count == _armframe)
+      {
+        volatile u32* const _ho_arm =
+            reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B0980u));
+        if (*_ho_arm == 0u)
+          *_ho_arm = 1u;
+      }
+    }
   }
 
   std::lock_guard lk(m_token_finish_mutex);
 
   m_finish_interrupt_pending |= true;
+  // [finish-inflight PERMANENT 2026-07-10] publish (pending||signal) @0x026B1A30 — the
+  // takeover park-trap gates on it: SetFinish N ARMS the park a few lines above, then
+  // raises N's finish interrupt HERE; parking before the guest consumes it (event fired,
+  // interrupt delivered, ISR acked + FinishQueue woken — all inside one EE=0 handler)
+  // swallowed the wake: DefaultThread slept in GXWaitDrawDone forever = the armframe
+  // present-stall in EVERY draw, at EVERY armframe N (the one-frame race).
+  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A30u)) = 1u;
 
   RaiseEvent(cycles_into_future);
 }

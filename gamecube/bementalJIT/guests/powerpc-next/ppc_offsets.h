@@ -21,6 +21,12 @@ constexpr u32 MSR         = 0x2E0;
 constexpr u32 FPSCR       = 0x2E4;
 // feature_flags (CPUEmuFeatureFlags : u32, Gekko.h:937) sits at 0x2E8.
 constexpr u32 EXCEPTIONS  = 0x2EC;      // PowerPCState.Exceptions (PowerPC.h:150)
+// [C6 2026-07-12 oracle-audit] EXCEPTION_DSI bit — gates every load/store
+// RT/RA commit in Interpreter_LoadStore.cpp (`!(Exceptions & EXCEPTION_DSI)`).
+// Value from Gekko.h:927 (EXCEPTION_DSI = 0x00000008). EXCEPTIONS offset
+// 0x2EC confirmed by static_assert(offsetof(PowerPCState,Exceptions)==0x2EC)
+// in JitWasm.cpp:60.
+constexpr u32 EXCEPTION_DSI = 0x00000008u;
 constexpr u32 DOWNCOUNT   = 0x2F0;      // PowerPCState.downcount (int) — bracketed by
                                         // EXCEPTIONS 0x2EC / XER_CA 0x2F4; compiler-
                                         // verified by static_assert in JitWasm.cpp

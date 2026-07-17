@@ -5,6 +5,7 @@
 #include <emscripten.h>
 #include <emscripten/html5.h>
 #include <emscripten/html5_webgl.h>
+#include <emscripten/atomic.h>  // [ppc-bridge cutover] emscripten_atomic_notify for the mailbox drain
 #include <libretro.h>
 #include <cstdint>
 #include <cstdio>
@@ -33,6 +34,16 @@
 // to still be referenced below, re-evaluate as canonical-source work.
 #include "Core/HW/SystemTimers.h"
 #include "Core/CoreTiming.h"
+#include "Core/PowerPC/MMU.h"  // [mmio-mirror16] MMU::Read<u16> for the mirror refresher
+#include "VideoCommon/Fifo.h"              // [gpu-pump]
+#include "VideoCommon/CommandProcessor.h"  // [gpu-pump]
+#include "VideoCommon/PixelEngine.h"          // [PE-finish flush]
+#include "Core/HW/ProcessorInterface.h"     // [msr-zero watch cause/mask]
+#include "Core/HW/DSP.h"                    // [msr-zero watch dspctl]
+#include "Core/HW/VideoInterface.h"         // [VI-tick] beam advance under worker ownership
+#include "Core/HW/Memmap.h"                 // [r1-watch GetRAM]
+#include "Core/HW/GPFifo.h"                 // [domino3] GPFifoManager::GetGatherPipeCount/Write8 (residual pad-flush)
+#include "Common/Swap.h"                    // [r1-watch swap32]
 
 // CT phase flag accessor + queue mask drain live in JitWasm.cpp.
 extern "C" {
@@ -279,6 +290,18 @@ int load_iso(const char* path) {
     MAIN_THREAD_EM_ASM({
         postMessage({cmd: 'print', txt: '[worker] load_iso: PowerPCState redirect set on pthread (0x02400000) — entry, path=' + UTF8ToString($0)});
     }, path);
+    // [WGPU] Skip the entire WebGL bring-up (canvas register + emscripten_webgl_create_context
+    // + recorder overlay) — the WGPU backend makes its own device+surface, this WebGL context
+    // is unused for WGPU, and its getContext throws on the OffscreenCanvas we routed to this
+    // pthread (now detached from worker-main). The flag lives in the SHARED HEAP (page wrote
+    // 'WGPU'=0x57475055 at 0x07FF0100) — read it the same way as the GL descriptor below,
+    // because this runs on the proxy-pthread where Module flags / getenv don't reliably
+    // propagate but the shared heap does.
+    int g_wgpu_mode = EM_ASM_INT({
+        var h = Module.HEAPU32 || new Uint32Array(Module.HEAPU8.buffer);
+        return (h[0x07FF0100 >> 2] === 0x57475055) ? 1 : 0;
+    });
+    if (!g_wgpu_mode) {
     // [HW-render path-c FIXED] Register the OffscreenCanvas in GL.offscreenCanvases
     // on the worker-main (where proxyContextToMainThread+OFFSCREEN_FRAMEBUFFER
     // resolves the WebGL2 context). The earlier version never compiled — a bare
@@ -358,6 +381,9 @@ int load_iso(const char* path) {
             }, ok);
         }
     }
+    } else {
+        MAIN_THREAD_EM_ASM({ postMessage({cmd: 'print', txt: '[worker] WGPU mode: WebGL bring-up skipped'}); });
+    }
     if (g_loaded) retro_unload_game();
     retro_game_info info{};
     info.path = path;
@@ -396,15 +422,195 @@ static constexpr unsigned EW_CT_PHASE4_ENABLE = 1u << 1;
 // audio_*_cb fire when the SW renderer produces a frame). JitWasm::Run
 // inside that retro_run will exit on the first downcount<=0 because
 // ppc-worker owns downcount under Phase IV — so this call is cheap.
+
+// [ppc-bridge cutover 2026-06-28] Proxied MMIO/HLE exports (defined in
+// dolphin_jit_wimports.cpp, same module). The ppc-worker's dispatched boot blocks
+// issue SYNCHRONOUS env.ppc_* mailbox round-trips and block in Atomics.wait until
+// serviced. retro_run's 4096-iter heartbeat was the only thing giving dolphin a
+// turn to service them; under Phase IV (service_iter only) that pump is gone, so
+// the first slice hangs. dolphin_drain_mailbox_once services the single-slot SAB
+// mailbox (0x02000000) IN-PROCESS on the proxy pthread (valid emulator state) —
+// the page->onmessage hop ran the exports on worker-main, thread-isolated under
+// PROXY_TO_PTHREAD. Mirrors worker_funcs.js:580-601.
+extern "C" {
+    uint32_t dolphin_read8(uint32_t);
+    uint32_t dolphin_read16(uint32_t);
+    uint32_t dolphin_read32(uint32_t);
+    void     dolphin_write8(uint32_t, uint32_t);
+    void     dolphin_write16(uint32_t, uint32_t);
+    void     dolphin_write32(uint32_t, uint32_t);
+    uint32_t dolphin_hle_check(uint32_t);
+    void     dolphin_interp(uint32_t, uint32_t);
+    uint32_t dolphin_check_exc(uint32_t);
+    void     dolphin_break_block(uint32_t, uint32_t);
+    uint32_t dolphin_hle_fire(uint32_t, uint32_t);
+    void     dolphin_gather_drain(uint32_t, uint32_t);
+    extern int g_bem_gp_dirty;
+}
+
+extern "C" void dolphin_gp_seal();    // [dual-core FIFO splice fix] (dolphin_jit_wimports.cpp)
+extern "C" void dolphin_gp_unseal();  // [dual-core FIFO splice fix] (dolphin_jit_wimports.cpp)
+// [gp-ring STEP 3 2026-07-09 — PERMANENT] Consumer of the worker's WPAR-only Atomics ring
+// (producer: ppc_worker.js installWriteEnv gpPush; layout @0x026C0000: +0 head/+4 tail
+// monotonic, +8 producer-wait flag, +0xC fallbacks, +0x10 applied, +0x40 data 8192x{width,val}).
+// Runs on the dolphin thread, so GPFifo/gather-pipe stay single-threaded (audit constraint).
+// Call sites: TOP of dolphin_drain_mailbox_once (ordering: ring applies BEFORE any mailbox op,
+// so a guest CP/MMIO read never observes state that excludes its own earlier GX words) + the
+// always-runs run_iter_batch body (the branch-gated-drain starvation lesson). Notify after
+// consuming (the producer's bounded watermark wait).
+static u32 g_cp_read_cooldown = 0;  // [torn HI/LO] suppress the per-iter pump right after a CP-range read
+static void dolphin_drain_gp_ring(void) {
+    volatile uint32_t* const p_head = reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026C0000u));
+    volatile uint32_t* const p_tail = reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026C0004u));
+    uint32_t t = *p_tail;
+    const uint32_t h = __atomic_load_n(const_cast<const uint32_t*>(p_head), __ATOMIC_ACQUIRE);
+    if (t == h) return;
+    // [domino3 FIX 2026-07-16 — the dropped-GX root, take 2] These ring entries ARE the
+    // worker's own legitimate GX (it owns the CPU). GPFifo::Write* no-ops them when
+    // g_gp_discard==1 (GPFifo.cpp:162) — and the run_iter_batch clear (line ~916) runs
+    // AFTER line-900's drain, so this replay can fire while the seal is still set and drop
+    // the whole frame (main thread then sleeps forever in GXWaitDrawDone @queue 0x801d45f4,
+    // peFinRaised=0). The seal only exists to drop DOLPHIN's ISR-excursion GX; the worker's
+    // replayed stream must never be discarded. Force-clear around the apply loop, restore
+    // after (so dolphin's own excursion GX at other times still obeys the seal).
+    extern int g_gp_discard;  // global-scope C-linkage var resolves to the same symbol
+    const int _saved_discard = g_gp_discard;
+    g_gp_discard = 0;
+    extern int g_in_drain;    // [domino3-src] tag ring-replay writes vs dolphin's own GP writes
+    g_in_drain = 1;
+    uint32_t n = 0;
+    while (t != h && n < 65536u) {
+        const uintptr_t slot = 0x026C0040u + ((t & 8191u) * 8u);
+        const uint32_t w = *reinterpret_cast<volatile uint32_t*>(slot);
+        const uint32_t v = *reinterpret_cast<volatile uint32_t*>(slot + 4u);
+        if (w == 1u) dolphin_write8(0xCC008000u, v);
+        else if (w == 2u) dolphin_write16(0xCC008000u, v);
+        else dolphin_write32(0xCC008000u, v);
+        ++t; ++n;
+    }
+    g_in_drain = 0;
+    g_gp_discard = _saved_discard;
+    __atomic_store_n(const_cast<uint32_t*>(p_tail), t, __ATOMIC_RELEASE);
+    emscripten_atomic_notify(const_cast<uint32_t*>(p_tail), 1);
+    // [domino3-bisect 2026-07-16] RELIABLE gpApplied counter @0x026B1A40: total ring
+    // entries actually drained+applied to the gather pipe on THIS (dolphin) thread. If
+    // this stays 0 while worker gpSent(0x026B1A3C)>0, the worker's GX writes never reach
+    // the drain (routing break). If it climbs but peFrames(0x026B0930) stays frozen, the
+    // break is downstream (gather->CP->RunGpuOnCpu->SetFinish).
+    if (n != 0u) {
+        volatile uint32_t* const p_applied =
+            reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B1A40u));
+        *p_applied = (*p_applied + n);
+    }
+}
+
+static bool dolphin_drain_mailbox_once(void) {
+    static const uintptr_t MBX = 0x02000000u;  // single-slot mailbox base (sab_layout)
+    volatile uint32_t* const p_req = reinterpret_cast<volatile uint32_t*>(MBX + 12u);
+    // [gp-ring] ring applies BEFORE any mailbox op (ordering guarantee — see above).
+    dolphin_drain_gp_ring();
+    if (__atomic_load_n(p_req, __ATOMIC_ACQUIRE) == 0u) return false;
+    // [single-consumer claim 2026-07-10 — PERMANENT, the duplicate-service root] TWO consumers
+    // watch this slot: this in-process drain AND the page's _mbxConsume (gamecube.html —
+    // waitAsync wake + 20ms sweep, forwarding cmds to dolphin worker-main via 'mbx-cmd').
+    // The old check-then-clear here plus the page's never-clear let BOTH service the SAME
+    // posted request: the worker unparked on this drain's reply and resumed its slice, then
+    // the page's forwarded copy executed LATE on worker-main — a duplicate guest MMIO op.
+    // For cmd 6/7 to 0xCC005000/2 that is a duplicate DSP mail HI/LO write (the [LO-dup]/
+    // [torn-send] frankenstein mails, same-LR duplicates, lagging guestPc — the armframe-
+    // freeze rate); for cmd 2-4 reads of 0xCC005004/6 a duplicate DESTRUCTIVE mail pop.
+    // Exactly one consumer may win: CAS-claim req 1->0 and read cmd/args only AFTER the
+    // claim (the producer is parked until reply, so slot content is stable). The page
+    // consumer claims with the same CAS (gamecube.html _mbxConsume).
+    {
+        uint32_t expected = 1u;
+        if (!__atomic_compare_exchange_n(p_req, &expected, 0u, false,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return false;  // the page consumer claimed this request
+    }
+    const uint32_t c  = *reinterpret_cast<volatile uint32_t*>(MBX + 0u);
+    const uint32_t a0 = *reinterpret_cast<volatile uint32_t*>(MBX + 4u);
+    const uint32_t a1 = *reinterpret_cast<volatile uint32_t*>(MBX + 8u);
+    // [torn HI/LO fix STEP 3 2026-07-09] a guest 32-bit CP read arrives as TWO 16-bit mailbox
+    // round-trips; the per-iter pump between them can advance CPReadPointer/RWDistance and tear
+    // the pair (upstream single-core has no such window). On any CP-range read, suppress the
+    // next 2 pump iterations so the paired half reads the SAME GPU quantum. (The ComplexRead
+    // handlers' own SyncGPUForRegisterAccess still runs inside each read — accuracy preserved.)
+    if ((c >= 2u && c <= 4u) && (a0 & 0x0FFFFF00u) == 0x0C000000u)
+        g_cp_read_cooldown = 2u;
+    uint32_t r = 0u;
+    switch (c) {
+        case 2:   r = dolphin_read8(a0);  break;
+        case 3:   r = dolphin_read16(a0); break;
+        case 4:   r = dolphin_read32(a0); break;
+        case 5:   dolphin_write8(a0, a1);  break;
+        case 6:   dolphin_write16(a0, a1); break;
+        case 7:   dolphin_write32(a0, a1); break;
+        case 8:   r = dolphin_hle_check(a0); break;
+        case 9:   dolphin_interp(a0, a1); break;
+        case 10:  r = dolphin_check_exc(a0); break;
+        case 11:  dolphin_break_block(a0, a1); break;
+        case 12:  r = 0u; break;  // dolphin_read_tb unimplemented (page path returns 0)
+        case 14:  r = dolphin_hle_fire(a0, a1); break;
+        case 100: r = 0xCAFEBABEu; break;  // routing-live probe
+        default:  r = 0u; break;
+    }
+    *reinterpret_cast<volatile uint32_t*>(MBX + 16u) = r;  // reply
+    volatile uint32_t* const p_rr = reinterpret_cast<volatile uint32_t*>(MBX + 20u);
+    __atomic_store_n(p_rr, 1u, __ATOMIC_RELEASE);
+    emscripten_atomic_notify(const_cast<uint32_t*>(p_rr), 1);
+    return true;
+}
+
 EMSCRIPTEN_KEEPALIVE
 void dolphin_service_iter(void) {
     if (!g_loaded) return;
+    // [ppc-bridge cutover] Drain the worker's pending env.ppc_* mailbox round-trips
+    // in-process FIRST (the pump retro_run used to provide). Runs every call,
+    // including during a worker slice (yield set), because the worker BLOCKS until
+    // each call is serviced. Bounded so a runaway burst can't starve Advance.
+    for (int _md = 0; _md < 256 && dolphin_drain_mailbox_once(); ++_md) {}
     // 1. Pull ppc-worker DIRECT_W mirror writes back into dolphin's
     //    struct, then drain the pending-writes ring (replays
     //    ComplexWrite handlers, which may schedule CoreTiming events).
-    // bemental_sab::mmio_mirror_* lived in the prior fork's Core/HW/MMIOMirror.h
-    // (sanitized away in df03d80). No replacement on the canonical tree yet;
-    // re-introducing the mirror is canonical work, not a .bak port. No-op here.
+    // [mmio-mirror16 2026-07-03 — census-driven] Fresh minimal 16-bit READ mirror for the
+    // status registers the guest polls hottest (mbx-census: 1.17M read16 round-trips/run,
+    // 100% at 0xCC0050xx/0xCC0020xx — DSP_CONTROL, ARAM-DMA, VI). Poll-push model: each
+    // service iter re-reads the real registers via MMU (side-effect-free status regs ONLY —
+    // mailbox LO pops mail and is deliberately NOT mirrored) and refreshes the SAB mirror
+    // the JIT's emit_mmio_mirror_else_or_import arm reads directly. Class tables enable
+    // per-register; everything else still routes to the import. Layout per gekko_emit.cpp
+    // :490-496 (mirror @0x02600000, cls16 @0x02640000, rel = EA - 0xCC000000).
+    if (false) {  // [mmio-mirror16 DISABLED 2026-07-03: measured NET LOSS — retired 17-31M -> 7M.
+                  //  The poll-loop mailbox exits were load-bearing for the dolphin-advance cadence;
+                  //  re-enable only with worker-local event advance. Census-verified the mirror
+                  //  itself works (read16 1.17M -> 0).]
+        static const uint32_t kMirror16[] = {
+            0xCC00500Au,                                          // DSP_CONTROL
+            0xCC005020u, 0xCC005022u, 0xCC005024u, 0xCC005026u,   // AR_DMA MMADDR/ARADDR
+            0xCC005028u, 0xCC00502Au,                             // AR_DMA_CNT
+            0xCC002000u, 0xCC002002u,                             // VI vertical timing
+            0xCC00202Cu, 0xCC00202Eu,                             // VI half-line (VIGetRetraceCount adj)
+            0xCC002030u, 0xCC002032u, 0xCC002034u, 0xCC002036u,   // VI DI0/DI1
+            0xCC002038u, 0xCC00203Au, 0xCC00203Cu, 0xCC00203Eu,   // VI DI2/DI3
+        };
+        static bool cls_init = false;
+        auto& mmu = Core::System::GetInstance().GetMMU();
+        if (!cls_init) {
+            cls_init = true;
+            for (uint32_t ea : kMirror16) {
+                const uint32_t rel = ea - 0xCC000000u;
+                *reinterpret_cast<volatile uint8_t*>(
+                    static_cast<uintptr_t>(0x02640000u + (rel >> 1))) = 1u;  // DIRECT_RW
+            }
+        }
+        for (uint32_t ea : kMirror16) {
+            const uint32_t rel = ea - 0xCC000000u;
+            const uint16_t v = mmu.Read<u16>(ea);
+            *reinterpret_cast<volatile uint16_t*>(
+                static_cast<uintptr_t>(0x02600000u + rel)) = v;
+        }
+    }
     // 2. Fire hybrid events whose cadence ppc-worker already advanced.
     //    Dolphin's local m_event_queue still holds these entries — the
     //    pending mask is a latency short-cut, not a replacement, so the
@@ -431,14 +637,205 @@ void dolphin_service_iter(void) {
             (void)mask; (void)timers; (void)sched_now;
         }
     }
-    // 3. NO retro_run() — under Phase IV ppc-worker owns dispatch entirely.
-    //    retro_run calls into Core::ExecuteCPULoop → JitWasm::Run, which
-    //    will still execute the inner dispatch even though downcount may
-    //    have been burned, because Run reads downcount AFTER advancing the
-    //    next slice. That defeats the cadence handoff. Frame/audio
-    //    presentation needs to be wired separately (libretro video_cb /
-    //    audio_sample_batch_cb invoked from here when SW FIFO has output).
-    //    For now: 0 frames in Phase IV mode (boot-progress diagnosis first).
+    // 3. Advance CoreTiming DIRECTLY (NOT via retro_run, so dolphin's own
+    //    JitWasm::Run does not also dispatch — only the event queue is
+    //    processed). While the ppc-worker owns PPC dispatch, dolphin's VI/PI/
+    //    DSP scheduled events would otherwise never fire. Advancing them here
+    //    raises EXCEPTION_EXTERNAL_INT into the SHARED ppc_state (now that
+    //    &ppc_state is wired into the SAB) on VI vblank, which wakes the guest
+    //    from EE-enabled wait-spins (e.g. 0x800ba2f0). The ppc-worker observes
+    //    Exceptions!=0, exits PPC_SLICE_EXIT_EXCEPTION, and the page clears the
+    //    yield flag so dolphin vectors the interrupt (CheckExternalExceptions).
+    //    [ppc-bridge IRQ delivery 2026-06-28]
+    auto& core_timing = Core::System::GetInstance().GetCoreTiming();
+    // [ppc-bridge cutover] Only advance CoreTiming in dolphin's EXCLUSIVE window
+    // (yield flag clear). During a worker slice (yield set) Advance refills
+    // ppc_state.downcount (CoreTiming.cpp:381), fighting the worker's primed 20000
+    // and erasing its downcount-exhausted exit. The mailbox drain above still runs
+    // every call, so the worker is serviced mid-slice regardless of the yield flag.
+    {
+        // [fire-only advance 2026-07-03] Advance now runs UNCONDITIONALLY — during worker
+        // slices it is fire-only (CoreTiming.cpp guards cycle credit + downcount refill by
+        // cpu_owner), so sim-time events (ARAM-DMA, VI, DSP) fire while the worker executes.
+        core_timing.Advance();
+    }
+    // [gpu-pump 2026-07-03 — THE boot finish line] Post-handover NOTHING pumps the GPU
+    // FIFO ([ax-fifo] SyncGPUCallback: ZERO fires across a full stalled run), so
+    // BPMEM_SETDRAWDONE is never processed, PixelEngine::SetFinish never raises PE_FINISH,
+    // and main() sleeps forever at main->HuSysDoneRender->GXDrawDone->OSSleepThread
+    // (thread-walk backtrace, queue 0x801d45f4). Pump whenever the CP FIFO holds data:
+    // SyncGPUForRegisterAccess -> RunGpuOnCpu processes commands on THIS pthread (the WGPU
+    // backend already renders here for the boot frames).
+    {
+        auto& system2 = Core::System::GetInstance();
+        // [unconditional pump 2026-07-07] dist>0 rarely fires (CP consumes as fast as the
+        // gather bursts → cpDist=0), so a frame's SETDRAWDONE could sit unprocessed →
+        // finish never pending → flush no-op → wedge at that frame. Pump every iter so the
+        // FIFO always drains and every frame's draw completes.
+        {
+            // [torn HI/LO fix STEP 3] skip the pump during a CP-read-pair cooldown so a guest
+            // lhz/lhz 32-bit CP read can't be torn by CP state advancing between its halves.
+            if (g_cp_read_cooldown > 0u) {
+                --g_cp_read_cooldown;
+            } else {
+                system2.GetFifo().SyncGPUForRegisterAccess();
+            }
+        }
+        // [workarounds REMOVED 2026-07-08 Step 2] The PE-finish flush [19], DSP force-tick
+        // [22], and VI 8x-per-iter beam force [23] were all manual compensations for ONE
+        // defect: global_timer was non-monotonic (the one-clock rebase rewound it), so no
+        // CoreTiming event ever came due and VI/DSP/PE never fired on their own. That defect
+        // is now fixed at the source (CoreTiming.cpp gt-monotonic fix-a: cyclesExecuted clamp
+        // + adopt only-advance; gt-DEC dropped 12→1). Device events fire NATIVELY off the
+        // (now monotonic) global_timer via the fire-only Advance event loop — the forced
+        // ticks delivered events at arbitrary instants (the FP-storm / SI-reentrancy class)
+        // and are deleted. Verify: evFired climbs, frames reach ≥100 without them.
+    }
+
+    // [ppc-bridge idle fast-forward 2026-06-28] Under Phase IV the ppc-worker
+    // owns dispatch, so JitWasm::Run's idle-skip (JitWasm.cpp:264-394) never
+    // runs. When the guest parks in an EE-enabled wait-spin (e.g. MP4
+    // VIWaitForRetrace 0x800ba2f0), a single Advance() only moves global_timer by
+    // one MAX_SLICE (20000 cyc); the awaited VI event is ~8M cycles out, and one
+    // Advance per cross-worker round-trip (~60ms) takes ~24s -> the guest never
+    // wakes (video_cb=0). Native crosses the gap via a fast in-loop Advance(); we
+    // do the same here, in-process, when the page flags the idle streak (same
+    // lastPc across slices) at CT_QUEUE+0x30. Force downcount=0 each iter so
+    // Advance burns a full slice; stop as soon as an event raises a guest
+    // exception (VI/PI -> EXTERNAL_INT; the worker then vectors it), a cap, or the
+    // ppc-worker re-engaging (yield flag set). Gated on yield-flag==0 so it only
+    // runs in dolphin's exclusive window and never races the ppc-worker on
+    // downcount. Fields via the SAB-published real &ppc_state (ctx at 0x0250002C;
+    // OFFSET_EXC=0x2EC, OFFSET_DOWNCOUNT=0x2F0 per ppc_worker.js:646-649).
+    {
+        const uint32_t ctx =
+            *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x0250002Cu));
+        const uint32_t idle_hint =
+            *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x02680030u));
+        // NOTE (2026-06-30): the old `*yield_flag == 0u` guard here meant this NEVER ran during an idle
+        // spin — the worker runs slices back-to-back so yield_flag is always SET, so CoreTiming never
+        // advanced to the pending VI event and the guest hung at VIWaitForRetrace forever (ff-diag:
+        // yieldFlag=1, ran=0). The guard exists to avoid Advance fighting a PRODUCTIVE worker slice's
+        // downcount — but idle_hint is set only when the worker is provably spinning (no progress), so
+        // advancing is safe (the worker cooperatively exits on downcount<=0 / exc). Gate on idle_hint
+        // alone. [Proper fix is PRIORITY 3: the worker should yield on idle so this window opens naturally.]
+        // [ff-pc gate 2026-07-02, supersedes the EE-only attempt] Fast-forward ONLY while the guest
+        // is AT the observed spin PC (page publishes it at 0x02680034 with the hint). The EE=1 gate
+        // was insufficient: the retrace handler's audio sub-chain re-enables EE mid-chain
+        // (hwIRQLeaveCritical -> OSEnableInterrupts, MP4 0x801125b4/0x800b7250), and the idle-hint
+        // PC-ring stays saturated during idle phases, so the ff loop teleported the NEXT VI event to
+        // those EE=1 blips — vec-ring: alternating [idle-spin 0x800ba2f0 EE=1] / [OSEnableInterrupts
+        // +0xc EE=1 r1=0x8019d450] deliveries, n~4676 — nesting a fresh retrace into the live handler
+        // chain. PadReadVSync re-entered PADRead; its data[2] write trampled the outer SIGetType's
+        // saved callback (0x8019d3e4 -> 0x808080 = the SI crash). Native cadence can never nest a
+        // 60Hz retrace inside a us-scale handler. pc==hintPc keeps every protected case working:
+        // single-PC spins match directly; the DVD multi-PC poll cycle passes through the sampled PC
+        // every iteration (including its EE=0 sections, which this predicate deliberately permits).
+        const uint32_t hint_pc =
+            *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x02680034u));
+        const uint32_t pc_now = (ctx != 0u)
+            ? *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(ctx + 0x000u))
+            : 0u;
+        // [ff re-enabled under owner 2026-07-07] the exc=0-at-idle-spin wedge (guest waits
+        // for a device completion that never becomes a pending interrupt under worker
+        // ownership — measured: piCause has no PE_FINISH, exc=0, frames pinned). The ff
+        // excursion advances time and fires due CoreTiming events until one raises a guest
+        // exception — exactly what crosses the gap. Runs REGARDLESS of owner now; the
+        // one-clock conflict (ff inflates dolphin's timer, gt-adopt pulls it back, undoing
+        // the gap-cross) is resolved by syncing the WORKER gt to the ff-advanced time at
+        // the end (below), so the cross sticks.
+        if (ctx != 0u && idle_hint != 0u && hint_pc != 0u && pc_now == hint_pc)
+        {
+            volatile int32_t* const dc =
+                reinterpret_cast<volatile int32_t*>(static_cast<uintptr_t>(ctx + 0x2F0u));
+            volatile uint32_t* const exc =
+                reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(ctx + 0x2ECu));
+            // Advance time so the device event the idle guest is waiting on (DI/ARAM
+            // completion, VI retrace) actually fires. Stop ONLY on a DELIVERABLE
+            // interrupt (exc set AND MSR.EE) so the worker can vector it. A HELD
+            // external int (exc=0x4, EE=0) must NOT stop us — the guest can't take
+            // it yet and is polling a device/memory state that only changes if we
+            // keep advancing. Cap bounds the per-window fast-forward.
+            // [2026-06-30 H2 fix] Deliver ONE event at a time: break the instant ANY NEW exception bit
+            // appears (vs the old "keep advancing until a deliverable EXTERNAL_INT", which let the
+            // DECREMENTER + other CoreTiming events pile up into a burst — exc=0x5 = EXTERNAL_INT|DEC —
+            // that the guest can't handle -> __OSUnhandledException -> PPCHalt). Advancing to the next
+            // event, firing it, and stopping lets the guest's ISR run and re-arm before the next event,
+            // matching native's natural one-at-a-time cadence.
+            // [ff-restore 2026-07-02] The one-event fix's `exc0 == 0` entry gate made the ff
+            // PERMANENTLY INERT (browser ff-diag: ran=135M lastAdvances=0 excAfter=0x1 — a DEC is
+            // pending nearly always at the idle spin), so sim-time crawled (~32k ticks/s), VI never
+            // fired, and the guest froze at VIWaitForRetrace (Hudson logo). The teleport hazard that
+            // gate guarded against (events fired into a live handler chain corrupting SI state) is
+            // now fixed at its TRUE root — the async write ring (store->load ordering) is off.
+            // Restore the original semantics with two guards: advance until the pending-exception
+            // SET CHANGES (a newly-raised event, e.g. DEC-pending 0x1 -> VI makes it 0x5) or the
+            // guest LEAVES the hinted idle PC (it took an interrupt / made progress).
+            volatile uint32_t* const pc_live =
+                reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(ctx + 0x000u));
+            const uint32_t exc0 = *exc;
+            // [ff-credit flag 2026-07-03] The fire-only Advance credits 0 cycles while the
+            // worker owns the CPU — correct for the concurrent service-iter Advance, but the
+            // ff excursion EXISTS to cross event gaps via dc=0 full-slice credits. Flag the
+            // excursion (SAB 0x026A0008) so CoreTiming grants normal credit inside it.
+            volatile uint32_t* const ff_flag =
+                reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026A0008u));
+            // [ff 2026-07-07 — restored to the known-good 1024 burst after the pace A/B]
+            // NOTE (2026-07-10): pacing this loop to native rate (wall-clock budget) CORRECTLY
+            // unstarves the prio-16 render thread (wpc moves from audio -> GXCopyDisp), proving
+            // this ff burst's sim-time over-drive (3.75-7.5x native) is the render-starvation
+            // root. BUT the ff is ALSO the sole pump for dolphin's VI/DEC events while the
+            // worker is idle; once paced, when the render thread leaves the idle spin it parks
+            // on its GXCopyDisp WPAR store (gather-ring-full -> unbounded mailbox wait) and
+            // NOTHING pumps events -> harder freeze, audio dead. The real fix is COUPLED: pace
+            // the ff AND make the render thread's WPAR store non-blocking (fire-and-forget ring,
+            // never a bounded/unbounded mailbox stall) AND keep dolphin's event pump alive at
+            // native rate while the worker executes a real slice. Reverted to 1024-burst until
+            // that coupled fix lands (this state at least keeps audio + guest alive).
+            *ff_flag = 1u;
+            for (int k = 0; k < 1024; ++k)
+            {
+                *dc = 0;
+                core_timing.Advance();
+                if (*exc != exc0) break;
+                if (*pc_live != hint_pc) break;
+            }
+            *ff_flag = 0u;
+            // [gt-sync 2026-07-07] the ff loop advanced dolphin's global_timer to cross the
+            // idle gap; push that time into the WORKER gt cells (0x02680008/0C) so the
+            // subsequent gt-adopt (exact assignment) doesn't pull dolphin BACK below it and
+            // undo the cross. This is what makes ff + one-clock coexist under owner==1.
+            {
+                const u64 dgt = static_cast<u64>(core_timing.GetTicks());
+                *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x02680008u)) =
+                    static_cast<uint32_t>(dgt & 0xFFFFFFFFu);
+                *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x0268000Cu)) =
+                    static_cast<uint32_t>((dgt >> 32) & 0xFFFFFFFFu);
+            }
+        }
+    }
+    // [present-pump 2026-07-04] The comment at the top of this file's Phase IV section
+    // promises retro_run() drives video_cb — the body never called it, so post-takeover
+    // the canvas froze on the last boot-era frame while [ax-pe] guest frames completed
+    // at speed (user-visible 'frozen at hudson logo' with FPS 47.0 = the page redrawing
+    // a stale texture). Call it at a bounded cadence; JitWasm::Run inside exits on the
+    // first downcount<=0 because the worker owns downcount — cheap by design.
+    {
+        // [present-pump 2026-07-12] Present at a wall-clock ~60Hz cadence, NOT every
+        // 4096th service-iter. The old (++s_pp & 0xFFF) gate throttled video_cb to a
+        // fixed ~1/4096 of the service-iter rate — ~4fps on the display regardless of
+        // how fast the guest renders (measured: guest completed ~15-20 peFrames/s but
+        // only ~4 presented, a 5:1 drop). retro_run post-takeover is cheap (JitWasm::Run
+        // exits on the first downcount<=0 since the worker owns downcount), so gating on
+        // real elapsed wall-time gives native's VBlank display cadence instead of a
+        // service-iter-rate-dependent throttle.
+        static double s_last_present_ms = 0.0;
+        const double now_ms = emscripten_get_now();
+        if (g_loaded && (now_ms - s_last_present_ms) >= 16.0) {
+            s_last_present_ms = now_ms;
+            retro_run();
+        }
+    }
 }
 
 // Drain N retro_run slices in one call. Amortizes the JS↔WASM (and
@@ -496,8 +893,59 @@ void run_iter_batch(int n) {
     for (int i = 0; i < n; i++) {
         (*c_total)++;
         const unsigned flags = dolphin_ct_get_phase_flags();
+        // [single-ordered-GX 2026-07-16] The Phase-IV-edge seal (dolphin_gp_seal/unseal on the
+        // ISR-excursion transition) is RETIRED. It was fragile: it toggled g_gp_discard on a
+        // coarse phase edge and the owner-clear below then dropped it for whole iterations, leaving
+        // a window where dolphin's excursion GX spliced the worker's ring stream (the torn
+        // GXLoadPosMtxImm -> SETDRAWDONE never decoded -> peFrames frozen at armframe). The reject
+        // is now STRUCTURAL and always-current at the write site (GPFifo::Write* gate on
+        // cpu_owner==1 && g_in_drain==0). No edge tracking, no owner-clear race. Boot single-core
+        // (cpu_owner==0) is unaffected. See GPFifo.cpp gpfifo_reject_non_ring_gx().
         if (flags == 0u) (*c_flag0)++;
         else if (flags == 0x6u) (*c_flag6)++;
+        // [unconditional drain 2026-07-07 — deadlock root fix] The mailbox drain lived
+        // ONLY in the service_iter branch; with the Phase-IV flag clear the retro_run
+        // branch never drained, so a worker parked in a synchronous MMIO call starved
+        // FOREVER (measured: mbx=4/0x80000000 reqReady=1 pinned, worker pc-ring frozen
+        // at 0x800b4338, guest at msr=0x1030 exc=0x5). Drain in BOTH branches — a no-op
+        // (single atomic load) when the slot is empty.
+        for (int _md = 0; _md < 256 && dolphin_drain_mailbox_once(); ++_md) {}
+        // [gp-drain post-takeover 2026-07-07 — THE healthy-face frame stall] the gather
+        // drain was a BLOCK-EXIT wimport called only by dolphin's parked dispatch loop:
+        // worker GP writes set g_bem_gp_dirty (dolphin_jit_wimports.cpp:109) but nothing
+        // drained the gather buffer to the FIFO — measured cpDist=0/cpPumps=48-static
+        // while the guest slept in GXWaitDrawDone. Drain here, the path that always runs.
+        // [single-ordered-GX 2026-07-16] The owner-clear of g_gp_discard is RETIRED along with the
+        // Phase-IV-edge seal above: g_gp_discard is no longer toggled post-takeover (it retains
+        // only its original boot-era single-core meaning, which stays 0 here). The excursion drop
+        // is enforced structurally at GPFifo::Write* (gpfifo_reject_non_ring_gx), so nothing needs
+        // to clear a seal per-iteration.
+        if (g_bem_gp_dirty) {
+            g_bem_gp_dirty = 0;
+            dolphin_gather_drain(0u, 0u);
+        }
+        // [one-clock rebase, owner-edge 2026-07-07] the JitWasm placement was UNREACHABLE
+        // (owner-check returned first — zero '[one-clock] rebased' prints in any log), so
+        // pre-takeover events (frame ~101's PE_FINISH wake among them) stayed stranded in
+        // the old time domain: guest slept in GXWaitDrawDone forever (cpPumps frozen,
+        // cpDist=0, frames pinned — measured). Rebase at the owner 0→1 edge HERE, the
+        // path that always runs.
+        {
+            static unsigned s_prev_owner = 0u;
+            const unsigned owner_now =
+                *reinterpret_cast<volatile unsigned*>(static_cast<uintptr_t>(0x026A0000u));
+            if (owner_now == 1u && s_prev_owner != 1u)
+            {
+                const unsigned long long wgt0 =
+                    static_cast<unsigned long long>(*reinterpret_cast<volatile unsigned*>(static_cast<uintptr_t>(0x02680008u))) |
+                    (static_cast<unsigned long long>(*reinterpret_cast<volatile unsigned*>(static_cast<uintptr_t>(0x0268000Cu))) << 32);
+                auto& ct = Core::System::GetInstance().GetCoreTiming();
+                const long long delta =
+                    static_cast<long long>(wgt0) - static_cast<long long>(ct.GetTicks());
+                ct.RebaseTime(delta);
+            }
+            s_prev_owner = owner_now;
+        }
         if (flags & EW_CT_PHASE4_ENABLE) {
             (*c_p4br)++;
             (*c_svci)++;

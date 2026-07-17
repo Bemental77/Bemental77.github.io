@@ -278,7 +278,6 @@ void VideoInterfaceManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
   {
     mmio->Register(base | mapped_var.addr, MMIO::DirectRead<u16>(mapped_var.ptr),
                    MMIO::ComplexWrite<u16>([mapped_var](Core::System& system, u32 addr, u16 val) {
-                     NOTICE_LOG_FMT(POWERPC, "[ax-vi-timing] write addr={:#x} val={:#x}", addr, val);
                      *mapped_var.ptr = val;
                      system.GetVideoInterface().UpdateParameters();
                    }));
@@ -319,10 +318,6 @@ void VideoInterfaceManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
       base | VI_VERTICAL_BEAM_POSITION, MMIO::ComplexRead<u16>([](Core::System& system, u32) {
         auto& vi = system.GetVideoInterface();
         const u16 v = static_cast<u16>(1 + (vi.m_half_line_count) / 2);
-        static u64 axb_n = 0;
-        const u64 n = ++axb_n;
-        if (n <= 4 || (n & 0xFF) == 0)
-          NOTICE_LOG_FMT(POWERPC, "[ax-vi-beam] vcount read n={} -> {}", n, v);
         return v;
       }),
       MMIO::ComplexWrite<u16>([](Core::System& system, u32, u16 val) {
@@ -351,16 +346,12 @@ void VideoInterfaceManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
   mmio->Register(base | VI_PRERETRACE_HI, MMIO::DirectRead<u16>(&m_interrupt_register[0].Hi),
                  MMIO::ComplexWrite<u16>([](Core::System& system, u32, u16 val) {
                    auto& vi = system.GetVideoInterface();
-                   NOTICE_LOG_FMT(VIDEOINTERFACE, "[ax-vi-ack] reg=0 hi={:#x} (prev_int={})", val,
-                                  static_cast<u32>(vi.m_interrupt_register[0].IR_INT));
                    vi.m_interrupt_register[0].Hi = val;
                    vi.UpdateInterrupts();
                  }));
   mmio->Register(base | VI_POSTRETRACE_HI, MMIO::DirectRead<u16>(&m_interrupt_register[1].Hi),
                  MMIO::ComplexWrite<u16>([](Core::System& system, u32, u16 val) {
                    auto& vi = system.GetVideoInterface();
-                   NOTICE_LOG_FMT(VIDEOINTERFACE, "[ax-vi-ack] reg=1 hi={:#x} (prev_int={})", val,
-                                  static_cast<u32>(vi.m_interrupt_register[1].IR_INT));
                    vi.m_interrupt_register[1].Hi = val;
                    vi.UpdateInterrupts();
                  }));
@@ -368,8 +359,6 @@ void VideoInterfaceManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
                  MMIO::DirectRead<u16>(&m_interrupt_register[2].Hi),
                  MMIO::ComplexWrite<u16>([](Core::System& system, u32, u16 val) {
                    auto& vi = system.GetVideoInterface();
-                   NOTICE_LOG_FMT(VIDEOINTERFACE, "[ax-vi-ack] reg=2 hi={:#x} (prev_int={})", val,
-                                  static_cast<u32>(vi.m_interrupt_register[2].IR_INT));
                    vi.m_interrupt_register[2].Hi = val;
                    vi.UpdateInterrupts();
                  }));
@@ -377,8 +366,6 @@ void VideoInterfaceManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
                  MMIO::DirectRead<u16>(&m_interrupt_register[3].Hi),
                  MMIO::ComplexWrite<u16>([](Core::System& system, u32, u16 val) {
                    auto& vi = system.GetVideoInterface();
-                   NOTICE_LOG_FMT(VIDEOINTERFACE, "[ax-vi-ack] reg=3 hi={:#x} (prev_int={})", val,
-                                  static_cast<u32>(vi.m_interrupt_register[3].IR_INT));
                    vi.m_interrupt_register[3].Hi = val;
                    vi.UpdateInterrupts();
                  }));
@@ -879,8 +866,53 @@ void VideoInterfaceManager::OutputField(FieldType field, u64 ticks)
   // Outputting the entire frame using a single set of VI register values isn't accurate, as games
   // can change the register values during scanout. To correctly emulate the scanout process, we
   // would need to collate all changes to the VI registers during scanout.
+#ifdef __EMSCRIPTEN__
+  // [present-first 2026-07-16] PRESENT-FIRST decouple. Post-takeover the guest runs in the
+  // ppc-worker; its VI framebuffer-register writes (VISetNextFrameBuffer -> VI_FB_LEFT_TOP_LO/HI)
+  // may not reach dolphin's m_xfb_info_top (worker-local write / mirror), so GetXFBAddressTop()
+  // reads 0 here even though the GPU is rendering to EFB (peFrames climbs). Native path gates
+  // Video_OutputXFB on (xfbAddr != 0); with a zero addr NOTHING presents -> ShowImage never runs
+  // -> canvas frozen. Fix: latch the last NON-ZERO xfbAddr/dims dolphin ever saw and, when the
+  // live read is 0, present with the latch so the rendered frame reaches ShowImage. When even the
+  // latch is empty (guest never wrote XFB), present with a sentinel address (0x1) + current dims so
+  // Video_OutputXFB -> ViSwap -> Present -> WGPUGfx::ShowImage. Ground-truth cells:
+  //   0x026B1A68 = last presented xfbAddr, 0x026B1A6C = (fbWidth<<16)|fbHeight,
+  //   0x026B1B00 = OutputField reached count, 0x026B1B04 = Video_OutputXFB called count.
+  {
+    static u32 s_last_xfb = 0u, s_last_dims = 0u, s_last_stride = 0u, s_last_height = 0u;
+    ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B00u));
+    if (xfbAddr)
+    {
+      s_last_xfb = xfbAddr;
+      s_last_dims = (fbWidth << 16) | (fbHeight & 0xFFFFu);
+      s_last_stride = fbStride;
+      s_last_height = fbHeight;
+    }
+    u32 out_addr = xfbAddr;
+    u32 out_width = fbWidth, out_stride = fbStride, out_height = fbHeight;
+    if (!out_addr && s_last_xfb)
+    {
+      // Live VI-register read is 0 (worker-local write not mirrored to dolphin this field), but we
+      // have a latched real XFB address from an earlier field — present that so the rendered frame
+      // still reaches ShowImage instead of dropping to a frozen canvas.
+      out_addr = s_last_xfb;
+      out_width = s_last_dims >> 16;
+      out_stride = s_last_stride;
+      out_height = s_last_height;
+    }
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A68u)) = out_addr;
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A6Cu)) =
+        (out_width << 16) | (out_height & 0xFFFFu);
+    if (out_addr && g_video_backend)
+    {
+      ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B04u));
+      g_video_backend->Video_OutputXFB(out_addr, out_width, out_stride, out_height, ticks);
+    }
+  }
+#else
   if (xfbAddr)
     g_video_backend->Video_OutputXFB(xfbAddr, fbWidth, fbStride, fbHeight, ticks);
+#endif
 }
 
 void VideoInterfaceManager::BeginField(FieldType field, u64 ticks)
@@ -1003,29 +1035,16 @@ void VideoInterfaceManager::Update(u64 ticks)
   // Check if we need to assert IR_INT. Note that the granularity of our current horizontal
   // position is limited to half-lines.
 
-  int axvi_idx = 0;
   for (UVIInterruptRegister& reg : m_interrupt_register)
   {
     u32 target_halfline = (reg.HCT > m_h_timing_0.HLW) ? 1 : 0;
     if ((1 + (m_half_line_count) / 2 == reg.VCT) && ((m_half_line_count & 1) == target_halfline))
     {
       reg.IR_INT = 1;
-      static u64 axvi_fire_n[4] = {0, 0, 0, 0};
-      const u64 fn = ++axvi_fire_n[axvi_idx];
-      if (fn <= 4 || (fn & 0x3F) == 0)
-      {
-        NOTICE_LOG_FMT(VIDEOINTERFACE,
-                       "[ax-vi-fire] reg={} n={} VCT={} HCT={} MASK={} halfline={}", axvi_idx, fn,
-                       static_cast<u32>(reg.VCT), static_cast<u32>(reg.HCT),
-                       static_cast<u32>(reg.IR_MASK), m_half_line_count);
-      }
     }
-    axvi_idx++;
   }
 
   UpdateInterrupts();
-
-  // [ax-vi-upd] sampling stripped 2026-06-11 per gate #8 (7.4K lines/60s).
 }
 
 // Create a fake VI mode for a fifolog

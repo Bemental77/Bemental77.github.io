@@ -78,12 +78,22 @@ ShaderCode GenerateVertexShader(APIType api_type)
   {
     out.Write("VARYING_LOCATION(0) out float3 v_tex0;\n");
   }
+#ifdef __EMSCRIPTEN__
+  // WebGL2: drive the fullscreen triangle from real attribute 0 (rawpos = clip.xy,
+  // tex.zw) instead of the bufferless gl_VertexID path (zero coverage here).
+  out.Write("ATTRIBUTE_LOCATION(0) in float4 rawpos;\n"
+            "#define opos gl_Position\n"
+            "void main() {{\n");
+  out.Write("  v_tex0 = float3(rawpos.zw, 0.0f);\n");
+  out.Write("  opos = float4(rawpos.xy, 0.0f, 1.0f);\n");
+#else
   out.Write("#define id gl_VertexID\n"
             "#define opos gl_Position\n"
             "void main() {{\n");
   out.Write("  v_tex0 = float3(float((id << 1) & 2), float(id & 2), 0.0f);\n");
   out.Write(
       "  opos = float4(v_tex0.xy * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);\n");
+#endif
   out.Write("  v_tex0 = float3(src_offset + (src_size * v_tex0.xy), 0.0f);\n");
 
   // NDC space is flipped in Vulkan

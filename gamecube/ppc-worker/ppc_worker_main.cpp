@@ -248,6 +248,19 @@ constexpr u32 MBX_OFF_REPLY_READY = 20;
 EMSCRIPTEN_KEEPALIVE
 u32 ppc_worker_mailbox_call_sync2(u32 cmd, u32 arg0, u32 arg1);
 
+extern bool g_emit_retired;  // extern-C linkage (this scope is inside extern "C")
+static const bool s_retired_on = [] { g_emit_retired = true; return true; }();
+// [ras-suppress 2026-07-07] runtime compiles emitted RAS-based blr chaining with HOST
+// addresses (the AoT pack already suppresses — 'host-address RAS bake is poison').
+// Three GARBAGE crashes shared: r1=0x1207xxxx (worker-heap ptr) + wild next
+// (0x20000088-class) + lr=0x800ba2f0 — RAS mispops leak host pointers into guest state.
+// Suppress everywhere; blr falls to plain return. (C++ symbol — declared outside the
+// extern "C" region via the namespace block below? No: inside extern "C", reference the
+// mangled global through a helper defined in gekko_emit.cpp is overkill — the simple
+// route: gekko_emit.cpp exposes it extern "C" as well.)
+extern bool g_suppress_ras_all;
+static const bool s_ras_off = [] { g_suppress_ras_all = true; return true; }();
+
 EMSCRIPTEN_KEEPALIVE
 u32 ppc_worker_mailbox_call_sync(u32 cmd, u32 arg0) {
     return ppc_worker_mailbox_call_sync2(cmd, arg0, 0u);
@@ -283,9 +296,16 @@ u32 ppc_worker_mailbox_call_sync2(u32 cmd, u32 arg0, u32 arg1) {
     __atomic_store_n(p_req_ready, 1u, __ATOMIC_RELEASE);
     emscripten_atomic_notify(p_req_ready, 1);
 
-    // Wait until reply_ready becomes non-zero. Bound the wait so a
-    // consumer crash doesn't hang the worker forever.
-    for (int i = 0; i < 100; ++i) {
+    // Wait until reply_ready becomes non-zero — UNBOUNDED (2026-07-10 PERMANENT).
+    // The old bound (100 x 100ms = 10s) then read a STALE reply, cleared req_ready
+    // (destroying the posted request), and returned as if serviced: a guest STORE
+    // that timed out during a drain stall was silently DROPPED. Observed as the
+    // __DSPHandler deadlock face: the guest's mail LO vanished at the takeover
+    // window (dspHiW=dspLoW+1 frozen from the armframe snap), the ucode waited for
+    // the missing half, the guest polled for a reply forever. A silent drop
+    // corrupts guest state; a hang on a dead consumer is diagnosable and the probe
+    // bounds the run anyway. Guest-visible ops must never be droppable.
+    for (;;) {
         const u32 ready = __atomic_load_n(p_reply_ready, __ATOMIC_ACQUIRE);
         if (ready != 0u) break;
         emscripten_atomic_wait_u32(p_reply_ready, 0u, 100000000ll /* 100 ms */);
@@ -382,7 +402,15 @@ u32 ppc_worker_compile_and_accumulate(u32 start_pc) {
     if (g_mem1_base == 0u || g_mem1_size == 0u) return 0u;
 
     const Region region = classify(start_pc);
-    if (g_bcache.region_has_pc(region, start_pc)) {
+    // [vector no-cache, C-SIDE 2026-07-07] the REGION cache was the persistent stale
+    // copy: the first compile of a vector block (made while the OS stub was PARTIALLY
+    // installed) stayed accumulated forever — the JS-side no-cache only governed the JS
+    // pcMap, and 'already accumulated → return 0' re-served the stale region block on
+    // every later delivery (the vector+0x94 rfi fall-through crashes: 0x594 and 0x994 —
+    // guest's own 'Non-recoverable Exception 3' dumps). Vector-page pcs bypass the
+    // bcache entirely: compile fresh from live bytes every time, never accumulate.
+    const bool vector_page = (start_pc < 0x4000u);
+    if (!vector_page && g_bcache.region_has_pc(region, start_pc)) {
         // Already accumulated; nothing to do.
         return 0u;
     }
@@ -444,6 +472,7 @@ u32 ppc_worker_compile_and_accumulate(u32 start_pc) {
     inputs.instr_pcs.assign(instr_pcs, instr_pcs + count);
 
     const std::size_t body_size = body.size();
+    if (!vector_page)
     g_bcache.region_accumulate(region, start_pc,
                                body.data(), body.size(), &inputs);
 
@@ -560,6 +589,15 @@ EMSCRIPTEN_KEEPALIVE
 u32 ppc_worker_region_dispatch_pc(u32 pc) {
     s32 next = 0;
     if (g_bcache.region_dispatch(pc, &next)) {
+        // npc-sync (root of the deterministic PC=0 ISI): the JS boot-dispatch loop writes
+        // ppc_state.pc = next but never touches ppc_state.npc, so npc stays stale. Dolphin's
+        // exception delivery does SRR0 = ppc_state.npc (PowerPC.cpp:675) — a stale npc (e.g.
+        // 0x80010640, an old HuSprDisp epilogue) makes the guest rfi to the wrong PC. Keep pc
+        // AND npc coherent with the real dispatch cursor here so SRR0 = the true resume point.
+        volatile u32* p_state = reinterpret_cast<volatile u32*>(
+            static_cast<uintptr_t>(0x02400000u));  // PowerPCState base (== PPC_SLICE_STATE_BASE)
+        p_state[0] = static_cast<u32>(next);  // ppc_state.pc  @ +0x0
+        p_state[1] = static_cast<u32>(next);  // ppc_state.npc @ +0x4
         return static_cast<u32>(next);
     }
     return PPC_WORKER_DISPATCH_MISS;
@@ -586,7 +624,12 @@ static void fire_pure_decrementer() {
     constexpr u32 SPR_BASE_OFF  = 0x340u;  // matches PowerPCState layout (per ppc_worker_main.cpp header comment)
     constexpr u32 SPR_DEC_INDEX = 22u;
     constexpr u32 EXCEPTIONS_OFF = 0x2ECu;
-    constexpr u32 EXCEPTION_DECREMENTER = 0x00000800u;
+    // Canonical Dolphin value (Gekko.h:924) is 0x1 — verified against BOTH
+    // gamecube/dolphin-src and ~/gc_refs/dolphin-upstream 2026-06-28. The
+    // prior 0x800 set a bit Dolphin's CheckExceptions never reads as DEC, so
+    // worker-fired decrementers never vectored (native delivers DEC at the
+    // 0x800ba2f0 boot loop; we delivered a no-op bit).
+    constexpr u32 EXCEPTION_DECREMENTER = 0x00000001u;
 
     volatile u32* dec_slot = reinterpret_cast<volatile u32*>(
         static_cast<uintptr_t>(g_ppc_state_base + SPR_BASE_OFF + SPR_DEC_INDEX * 4u));
@@ -1067,6 +1110,12 @@ void ppc_worker_run_slice(u32 max_iters, u32 wall_deadline_ms, u32 flags) {
 
     volatile u32* p_pc  = reinterpret_cast<volatile u32*>(
         static_cast<uintptr_t>(PPC_SLICE_STATE_BASE + PPC_SLICE_OFF_PC));
+    // ppc_state.npc @ pc+4. The worker uses its own `pc` cursor and never maintains npc, but dolphin's
+    // exception delivery does SRR0 = ppc_state.npc (PowerPC.cpp:675) — so a stale npc makes the guest
+    // rfi to the wrong PC (root of the deterministic PC=0 ISI: npc=0x80010640 stale while pc=HuSprExec).
+    // Sync npc=pc at every cursor update + the exception exit so SRR0 = the real resume point.
+    volatile u32* p_npc = reinterpret_cast<volatile u32*>(
+        static_cast<uintptr_t>(PPC_SLICE_STATE_BASE + PPC_SLICE_OFF_PC + 4u));
     u32* p_msr          = reinterpret_cast<u32*>(
         static_cast<uintptr_t>(PPC_SLICE_STATE_BASE + PPC_SLICE_OFF_MSR));
     u32* p_exc          = reinterpret_cast<u32*>(
@@ -1102,13 +1151,106 @@ void ppc_worker_run_slice(u32 max_iters, u32 wall_deadline_ms, u32 flags) {
             constexpr u32 EXC_EXTERNAL_INT = 0x00000004u;
             constexpr u32 MSR_EE           = 0x00008000u;
             const u32 msr = __atomic_load_n(p_msr, __ATOMIC_ACQUIRE);
-            const bool external_only = (exc & ~EXC_EXTERNAL_INT) == 0u;
-            const bool ee_set        = (msr & MSR_EE) != 0u;
-            if (!external_only || ee_set) {
-                reason = PPC_SLICE_EXIT_EXCEPTION;
-                break;
+            const bool ee_set = (msr & MSR_EE) != 0u;
+            // [STEP 2 worker-side vectoring 2026-07-09] The CPU worker VECTORS the async external
+            // interrupt ITSELF at this block boundary — no cmd-10 round-trip. Reproduces
+            // CheckExternalExceptions' commit (PowerPC.cpp:734-796) EXACTLY. Gates, in order:
+            //   os-ready : hold until OSCurrentContext (MEM[0xC0]) is a valid physical ptr — else an
+            //              early-boot delivery through the stub with a garbage context seeds the r1=0
+            //              orbit (the gate dolphin has; must NOT drop it).
+            //   ee-gate  : EE=1 only (maskable; never vector into an EE=0 context).
+            //   vec-page : pc>=0x4000 (never vector inside a stub; native runs stubs EE=0).
+            // If any gate fails the bit stays pending and we keep dispatching — the loop re-reads
+            // p_exc next iteration (re-attempt is loop-native, no fresh notify needed). The device
+            // worker writes Exceptions with __atomic RELEASE (ProcessorInterface UpdateException);
+            // we clear our bit with an atomic AND so a concurrent device set can't be lost.
+            u32 _os_ctx = 0u;
+            if (g_mem1_base)
+                _os_ctx = __builtin_bswap32(*reinterpret_cast<volatile u32*>(g_mem1_base + 0xC0u));
+            const bool os_ready = (_os_ctx != 0u && _os_ctx < 0x01800000u);
+            if ((exc & EXC_EXTERNAL_INT) && ee_set && pc >= 0x4000u && os_ready) {
+                volatile u32* const p_srr0 = reinterpret_cast<volatile u32*>(
+                    static_cast<uintptr_t>(PPC_SLICE_STATE_BASE + 0x340u + 26u * 4u));  // SPR_SRR0
+                volatile u32* const p_srr1 = reinterpret_cast<volatile u32*>(
+                    static_cast<uintptr_t>(PPC_SLICE_STATE_BASE + 0x340u + 27u * 4u));  // SPR_SRR1
+                *p_srr0 = pc;                                   // SRR0 = interrupted pc (npc==pc here)
+                *p_srr1 = msr & 0x87C0FFFFu;                    // SRR1 = masked msr image
+                // [srr0-side-channel — STEP 2 acceptance instrument] the worker's SRR0 write MUST
+                // carry a valid interrupted pc (guest code >=0x80000000, NEVER 0/garbage). SAB
+                // 0x026B0600=SRR0(pc), 0x0604=SRR1, 0x0608=monotonic counter. The probe asserts
+                // srr0>=0x80000000 with counter>0 (post-collapse SRR0=0 must never be written).
+                *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B0600u)) = pc;
+                *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B0604u)) = msr & 0x87C0FFFFu;
+                ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B0608u));
+                u32 nmsr = (msr & ~0x1u) | ((msr >> 16) & 0x1u); // MSR.LE(bit0) = MSR.ILE(bit16)
+                nmsr &= ~0x04EF36u;                             // clear IR/DR/EE/... (dolphin parity)
+                nmsr |= 0x1000u;                                // ME-preserve (GC never runs ME-less)
+                __atomic_store_n(p_msr, nmsr, __ATOMIC_RELEASE);
+                __atomic_and_fetch(p_exc, ~EXC_EXTERNAL_INT, __ATOMIC_ACQ_REL);  // clear, no lost-set
+                pc = 0x00000500u;                               // vector
+                *p_pc = pc; *p_npc = pc;
+                continue;
             }
-            // EE-gated external_int — fall through and keep dispatching.
+            // Non-external (DEC/sync), or external held by a gate: DEC->0x900 + sync still route via
+            // dolphin cmd-10 (CheckExternalExceptions). external-only + EE=0 is deferred (ignore).
+            const bool external_only = (exc & ~EXC_EXTERNAL_INT) == 0u;
+            if (!external_only || ee_set) {
+                *p_npc = pc;
+                (void)ppc_worker_mailbox_call_sync(10u, 0u);
+                const u32 vectored_pc = *p_pc;
+                if (vectored_pc != pc) {
+                    pc = vectored_pc;
+                    *p_npc = pc;
+                    continue;
+                }
+            }
+        }
+
+        // [lr-slot watch TEMP — strip per gate #8] Localize where HuSprDisp's saved-LR
+        // slot (guest 0x801e6d34 = the deterministic crash frame) is zeroed. Latch the
+        // region-entry pc + 16-pc ring when a VALID-PC word there transitions to 0 — the
+        // valid-PC filter (0x80000000..0x81800000) rejects ordinary stack churn so only the
+        // stray-store-zeroes-a-saved-return-address event fires. SAB: 0x025000E0=flag/pc,
+        // +4=prev(BE) value, +8..+44=16-pc ring (oldest->newest). Published once.
+        {
+            static u32 lw_ring[16];
+            static u32 lw_head = 0;
+            static u32 lw_prev_be = 0;
+            lw_ring[lw_head & 15u] = pc;
+            ++lw_head;
+            if (g_mem1_base && g_mem1_size) {
+                const u32 ram_mask = g_mem1_size - 1u;
+                const u32 raw = *reinterpret_cast<volatile u32*>(
+                    g_mem1_base + (0x801e6d34u & ram_mask));
+                const u32 be = __builtin_bswap32(raw);  // MEM1 is big-endian
+                volatile u32* lw = reinterpret_cast<volatile u32*>(
+                    static_cast<uintptr_t>(0x025000E0u));
+                if (lw_prev_be >= 0x80000000u && lw_prev_be < 0x81800000u
+                    && be == 0u && lw[0] == 0u) {
+                    lw[1] = lw_prev_be;
+                    for (u32 k = 0; k < 16u; ++k) lw[2u + k] = lw_ring[(lw_head + k) & 15u];
+                    lw[0] = pc;  // publish flag LAST
+                }
+                lw_prev_be = be;
+            }
+        }
+
+        // [ee-diag TEMP 2026-06-28] Capture whether the guest EVER runs with
+        // MSR.EE=1 during dispatch, and the first PC where it does. Native
+        // delivers ext-int only with EE=1 (PowerPC.cpp:616); our wedge samples
+        // EE=0 at every slice boundary, but slice boundaries miss the boot
+        // loop. This per-iter probe answers: does EE=1 occur anywhere in the
+        // boot, and at what PC. Slots 0x025000B0 (first-EE pc) / 0xB4 (count).
+        {
+            const u32 msr_now = __atomic_load_n(p_msr, __ATOMIC_RELAXED);
+            if (msr_now & 0x00008000u) {
+                volatile u32* ee_pc  = reinterpret_cast<volatile u32*>(
+                    static_cast<uintptr_t>(0x025000B0u));
+                volatile u32* ee_cnt = reinterpret_cast<volatile u32*>(
+                    static_cast<uintptr_t>(0x025000B4u));
+                if (*ee_pc == 0u) *ee_pc = pc;
+                *ee_cnt = *ee_cnt + 1u;
+            }
         }
 
         // Downcount exhausted?
@@ -1128,15 +1270,37 @@ void ppc_worker_run_slice(u32 max_iters, u32 wall_deadline_ms, u32 flags) {
             break;
         }
 
+        // [garbage-trace TEMP 2026-06-28] Capture the ISR path that ends in a
+        // sub-0x80000000 (garbage) next-pc, to diff vs native's 0x500->0x588->
+        // 0x800b7a58->handler->SelectThread. Ring = last 24 dispatched pcs; on the
+        // FIRST garbage `next`, copy the diverging (pc,next) + the ring to SAB
+        // (0x025000C0 flag/pc, +4 next, +8.. ring oldest->newest) for the page.
+        {
+            static u32 gt_ring[24];
+            static u32 gt_head = 0;
+            gt_ring[gt_head % 24u] = pc;
+            ++gt_head;
+            volatile u32* gt = reinterpret_cast<volatile u32*>(
+                static_cast<uintptr_t>(0x025000C0u));
+            if (static_cast<u32>(next) < 0x80000000u && gt[0] == 0u) {
+                gt[1] = static_cast<u32>(next);
+                for (u32 k = 0; k < 24u; ++k)
+                    gt[2u + k] = gt_ring[(gt_head + k) % 24u];
+                gt[0] = pc;  // set flag LAST (publish)
+            }
+        }
+
         // Hit: decrement downcount by one cycle (block-cycles plumbing
         // is step 2 / Q3). Use __atomic_sub_fetch to stay race-free with
         // dolphin's parallel writes to downcount, matching the JS
         // Atomics.sub(i32, dc, 1) call this replaces.
         __atomic_sub_fetch(p_dc, 1, __ATOMIC_ACQ_REL);
 
-        // Publish next PC back to SAB and update local cursor.
+        // Publish next PC back to SAB and update local cursor. Keep npc synced with pc so any
+        // dolphin excursion that reads ppc_state.npc (SRR0 = npc) resumes at the real cursor.
         pc = static_cast<u32>(next);
         *p_pc = pc;
+        *p_npc = pc;
     }
 
     // safety-cap if we fell out of the loop normally.

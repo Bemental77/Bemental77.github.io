@@ -90,7 +90,7 @@ emcc \
   -pthread \
   -matomics -mbulk-memory \
   -sPROXY_TO_PTHREAD=1 \
-  -sPTHREAD_POOL_SIZE=4 \
+  -sPTHREAD_POOL_SIZE=8 \
   -sINITIAL_MEMORY=536870912 \
   -sMAXIMUM_MEMORY=4294967296 \
   -sALLOW_MEMORY_GROWTH=1 \

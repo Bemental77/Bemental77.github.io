@@ -26,11 +26,14 @@
 
 #include "Core/PowerPC/JitWasm/JitWasm.h"
 
+#include <emscripten.h>  // [WGPU-PROF — TEMP] emscripten_get_now for the Advance() frame timer
+
 #include <climits>
 #include <cstdint>
 #include <vector>
 
 #include <emscripten.h>
+#include <emscripten/threading.h>
 
 #include "Common/CommonTypes.h"
 #include "Core/CoreTiming.h"
@@ -46,6 +49,8 @@
 
 #include "bementalJIT/types.h"
 #include "ppc_analyst.h"  // bemental::powerpc::IsBlockTerminator — single source of truth.
+
+namespace WGPU { extern double g_prof_advance_ms; }  // [WGPU-PROF — TEMP] defined in WGPUGfx.cpp
 #include "ppc_emit.h"     // bementalJIT/guests/powerpc-next/ppc_emit.h (PUBLIC include dir)
 
 // Compiler-verified anchors for the hand-maintained wasm32 offsets in
@@ -56,6 +61,9 @@ static_assert(offsetof(PowerPC::PowerPCState, Exceptions) == 0x2EC,
               "ppc_off::EXCEPTIONS out of sync with PowerPCState layout");
 static_assert(offsetof(PowerPC::PowerPCState, downcount) == 0x2F0,
               "ppc_off::DOWNCOUNT out of sync with PowerPCState layout");
+
+// [dual-core diag] sticky handover flag (ProcessorInterface.cpp) — gates [chain0] post-handover.
+extern "C" int g_dc_handover_done;
 
 namespace
 {
@@ -186,6 +194,28 @@ void JitWasm::Run()
   const u32 mem1_mask = mem.GetRamMask();
   const u32 ram_size  = mem.GetRamSize();
 
+#ifdef __EMSCRIPTEN__
+  // [ppc-bridge] Publish the REAL ppc_state + RAM addresses into the SAB for the
+  // ppc-worker. dolphin_set_ppc_state_external_storage() is a stub and g_jit_wasm /
+  // PowerPCManager are pthread-isolated under PROXY_TO_PTHREAD, so the page's mailbox
+  // query sees nullptr. This runs on the pthread where &ppc_state and m_ram are valid.
+  // The page's ram-info poll (gamecube.html ~:1018) consumes addr/size + the new
+  // ctx_ptr slot and inits the ppc-worker with the REAL &ppc_state (not the reserved
+  // 0x02400000 the stubbed redirect never populated). Sentinel written LAST so the
+  // poll only fires once all fields are valid.
+  {
+    static bool s_bridge_published = false;
+    if (!s_bridge_published && mem1_base != 0u && ram_size != 0u && ctx_ptr != 0u)
+    {
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x02500020u)) = mem1_base;
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x02500024u)) = ram_size;
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x0250002Cu)) = ctx_ptr;
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x02500028u)) = 0xCAFEBABEu;
+      s_bridge_published = true;
+    }
+  }
+#endif
+
   // Mirror canonical CachedInterpreter::Run: outer loop on CPU::State,
   // CoreTiming::Advance starts each slice (refills downcount + advances
   // scheduled events), inner loop dispatches blocks until downcount expires.
@@ -196,9 +226,26 @@ void JitWasm::Run()
   // dispatches (probe_fix.js, 2026-05-30).
   while (*state_ptr == CPU::State::Running)
   {
+    // [ee-race fix 2026-07-02] NOTE: Advance must keep RUNNING under worker
+    // ownership (hybrid VI/DSP/AI events fire ONLY via dolphin's local Advance —
+    // CT_PHASE3_ENABLE is not set in the live tree, so the worker's
+    // ct_fire_due_pure ignores hybrids). The single-owner-delivery gate lives
+    // inside Advance's CheckExternalExceptions call (CoreTiming.cpp): events
+    // fire (pending bits set), but vectoring into shared ppc_state is
+    // suppressed while the worker owns the CPU.
     // Start new timing slice. Refills downcount; scheduled events fire
     // here (VI, AI, DSP, etc.). NOTE: Advance may set Exceptions / change PC.
+    // [WGPU-PROF — gated 2026-07-14] emscripten_get_now runs PER do-loop iter (~400 Advance/frame),
+    // and the CPU profile (gc_jit_thread_cpu_profile_2026_07_14) measured get_now at 5.4% of the
+    // JIT thread — the hottest removable overhead. Gated behind BEMENTAL_WGPU_PROF (undefined by
+    // default = zero cost; rebuild with -DBEMENTAL_WGPU_PROF to restore the advance/jit split).
+#ifdef BEMENTAL_WGPU_PROF
+    const double t_adv0 = emscripten_get_now();
     core_timing.Advance();
+    WGPU::g_prof_advance_ms += emscripten_get_now() - t_adv0;
+#else
+    core_timing.Advance();
+#endif
 
     // Per-slice idle-skip ring. Must be SLICE-LOCAL (not static), or PCs
     // from a real idle loop in one slice will throttle unrelated blocks
@@ -213,10 +260,87 @@ void JitWasm::Run()
 
     do
     {
+#ifdef __EMSCRIPTEN__
+      // [collapse] AUTHORITATIVE CPU OWNERSHIP. If the WORKER owns the CPU, dolphin dispatches ZERO guest
+      // blocks. Checked per do-iteration (the coherent block boundary that already reads Exceptions +
+      // supports mid-slice return) — the advisory Phase-IV flag failed because it was re-read only BETWEEN
+      // run_iter_batch calls, letting an in-flight retro_run run a whole CoreTiming slice into the shared
+      // ppc_state concurrently with the worker. cpu_owner @ SAB 0x026A0000: 0=DOLPHIN (boot default,
+      // SAB zero-inits), 1=WORKER. Returning ends this retro_run; run_iter_batch re-evaluates next tick.
+      if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u)
+        return;
+      // [deterministic-trap 2026-07-06] The page's handover catch was a SAMPLER (freeze +
+      // 801 pc reads hoping to coincide with the 4-byte idle spin — the last wall-clock
+      // lottery; FAILED runs starved dolphin via endless retries). When the page ARMS
+      // (SAB 0x026B0980=1), dolphin parks ITSELF at exactly the idle spin with EE=1 and
+      // no pending exceptions (flag=2, event-only busy-wait). The page's existing catch
+      // then finds pc==0x800ba2f0 deterministically on its first sample. Unpark on
+      // cutover (owner→1), disarm (page abort), or CPU stop.
+      {
+        volatile u32* const ho_arm =
+            reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B0980u));
+        // While armed, clamp the slice so region functions exit at near-per-block
+        // granularity — the head otherwise only sees pc at region EXITS (hot-region
+        // dispatch loops internally), making the spin catch a downcount-exhaustion
+        // coincidence again (measured: one run tries=1, next run never). Costs ms,
+        // only during the catch window.
+        if (*ho_arm == 1u && ppc_state.downcount > 64)
+          ppc_state.downcount = 64;
+        // Parked (flag==2): stay frozen at the spin but RETURN — a busy-wait here
+        // blocked retro_run, killed the dolphin worker's event loop, and the page's
+        // cutover protocol (which needs that loop) deadlocked at frame 600. Returning
+        // keeps the pump ticking no-ops; guest state stays untouched until the page
+        // flips owner or disarms.
+        if (*ho_arm == 2u &&
+            *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) != 1u)
+          return;
+        // [one-clock rebase] MOVED to run_iter_batch (EmscriptenWorker.cpp): this
+        // placement was unreachable — the owner-check return above fires first post-cutover.
+        // Park condition: the idle spin when it exists, OR the OS consistency invariant
+        // curCtx(0x800000D4)==curThr(0x800000E4) — post-upload MP4 never enters the idle
+        // spin (gate stats: inVIWait=0 across every run's samples), so the pc anchor alone
+        // never fires there. The invariant is the same condition the validated 2026-06-29
+        // handover gate used: a coherent, non-torn context at a block boundary.
+        // [quiescent-boundary park 2026-07-10 — PERMANENT, the one-frame race fix] The arm
+        // fires INSIDE SetFinish N, BEFORE N's finish interrupt is raised (PixelEngine.cpp
+        // SetFinish: arm at :~289, pending|=true below it). Exceptions==0 passes while the
+        // finish event is scheduled-but-unfired, so the park swallowed the in-flight finish:
+        // its wake of FinishQueue (DefaultThread's GXWaitDrawDone) never landed -> no frame
+        // N+1, ever, at every armframe (months of face-lottery). Gate the park on the
+        // OBSERVABLE: finish-inflight @0x026B1A30 == 0 (pending||signal, published by
+        // PixelEngine at every transition; cleared only by the guest ISR's ack, and the
+        // FinishQueue wake runs in that same EE=0 handler while this park requires EE=1 at
+        // the idle spin — so flag==0 here proves raised+delivered+acked+woken). The takeover
+        // engages only at a truly quiescent boundary; deferred, never dropped.
+        if (*ho_arm == 1u && (ppc_state.msr.Hex & 0x8000u) != 0u && ppc_state.Exceptions == 0 &&
+            *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A30u)) == 0u)
+        {
+          // [idle-spin-only 2026-07-07] The curCtx==curThr fallback accepted
+          // consistent-but-MID-MACHINERY states — every post-takeover wedge face
+          // (EE=0 VI polls, 0x900 parked, default-handler orbit, PPCHalt) traced to
+          // taking over a guest with interrupt processing in flight. The idle spin is
+          // the ONE state the downstream stack is debugged against. The armed downcount
+          // clamp above makes the spin catchable at per-block granularity.
+          if (ppc_state.pc == 0x800ba2f0u)
+          {
+            ppc_state.npc = ppc_state.pc;
+            *ho_arm = 2u;
+            return;
+          }
+        }
+      }
+#endif
       // Pending exceptions: let upstream CheckExceptions transition PC to
       // the handler vector; the next iteration dispatches the handler.
       if (ppc_state.Exceptions != 0)
       {
+        // [npc-sync — root fix of the deterministic PC=0 ISI] At this dispatch point pc IS the resume
+        // instruction; upstream dolphin's do_timing keeps NPC=PC=DISPATCHER_PC so CheckExternalExceptions'
+        // SRR0=npc is correct. Our block-dispatch maintains npc only INSIDE region/chain dispatch (below),
+        // not at the top of the loop — so a delivery here does SRR0 = a STALE npc (observed npc=0x80010640,
+        // an old HuSprDisp epilogue, while pc=0x8000d9f8 in HuSprExec) -> rfi to a dead frame, blr 0.
+        // Force npc=pc so the interrupt saves the true interrupted PC.
+        ppc_state.npc = ppc_state.pc;
         m_system.GetPowerPC().CheckExceptions();
         if (*state_ptr != CPU::State::Running)
           return;
@@ -231,6 +355,18 @@ void JitWasm::Run()
       // fix), so we honor the same downcount + exception disciplines as the
       // chain loop. A miss (pc not promoted/hot) returns false -> fall straight
       // through to chain_dispatch below (which advances ppc_state.pc itself).
+      // [region-merged 2026-07-15] The region-FIRST dispatch loop that lived
+      // here (region_dispatch + its own 16-deep idle-cycle ring) is DELETED:
+      // sealed-gen entries now register their fn_k wrappers directly in the
+      // GLOBAL dispatch table (block_cache.cpp seal JS), so the normal chain
+      // path below enters regions at measured-zero cross-instance cost — no
+      // per-hit EM_ASM, no JS-first loop. Its idle protections are replaced by
+      // (a) the in-region lap-counter escape emitted by the merged builder
+      // (forces downcount=0 at REGION_LAP_MAX warm edges, exc==0-gated) and
+      // (b) the chain path's own idle-collapse ring, which region exits reach
+      // via the per-edge downcount bail. g_blr_chain's per-entry reset moved
+      // into the fn_k wrappers (host-boundary contract, block_cache.cpp:448).
+      if (false)
       {
         const u32 region_exc0 = ppc_state.Exceptions;
         // [xinst-fix] Multi-PC idle-skip streak ring — mirrors the chain path's
@@ -253,6 +389,10 @@ void JitWasm::Run()
         u32 r_idx = 0;
         while (ppc_state.downcount > 0 && ppc_state.Exceptions == region_exc0)
         {
+#ifdef __EMSCRIPTEN__
+          // [collapse] per-block ownership: bail the multi-block region loop the instant the worker owns.
+          if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u) break;
+#endif
           const u32 region_cur = ppc_state.pc;
           s32 rnext = 0;
           if (!m_wasm_cache.region_dispatch(region_cur, &rnext))
@@ -270,7 +410,9 @@ void JitWasm::Run()
             for (u32 j = 0; j < 16u; ++j) { if (np == r_last[j]) { m = true; break; } }
             if (m)
             {
-              if (++r_streak >= 8) { ppc_state.downcount = 0; break; }
+              if (++r_streak >= 8) {
+                ppc_state.downcount = 0; break;
+              }
             }
             else
             {
@@ -301,19 +443,6 @@ void JitWasm::Run()
       const s32 chained = m_wasm_cache.chain_dispatch(
           pc, /*max_iters=*/4096u, &final_pc, &trap_pc,
           &ppc_state.Exceptions, reinterpret_cast<const s32*>(&ppc_state.downcount));
-      // [ax-memset] DECISIVE: at the frozen SAB memset block, is it running
-      // (chained>0) or never executing (chained==0 -> compile path)? does r3
-      // advance? Isolates ALT-1 (throttled) vs ALT-2 (never dispatched).
-      if (pc == 0x800053c0u)
-      {
-        static u64 s_mv = 0;
-        if ((++s_mv & 0x3FFFu) == 0)
-          NOTICE_LOG_FMT(POWERPC,
-            "[ax-memset] visit={} chained={} final_pc={:#x} r3={:#x} downcount={} streak={}",
-            s_mv, chained, final_pc, ppc_state.gpr[3],
-            static_cast<s32>(ppc_state.downcount), ring_streak);
-      }
-
       if (trap_pc != 0u)
       {
         // A block trapped mid-chain. chain_dispatch already evicted it
@@ -374,7 +503,9 @@ void JitWasm::Run()
           if (ring_match)
           {
             if (++ring_streak >= 8)
+            {
               ppc_state.downcount = 0;
+            }
           }
           else
           {
@@ -392,20 +523,8 @@ void JitWasm::Run()
       // Cache miss. Try to compile a block at this PC.
       if (TryCompileBlock(pc, ctx_ptr, mem1_base, mem1_mask, ram_size))
       {
-        if (pc == 0x800053c0u)
-        {
-          static u64 s_mc = 0;
-          if ((++s_mc & 0x3FFFu) == 0)
-            NOTICE_LOG_FMT(POWERPC, "[ax-memset] TryCompileBlock OK (chained=0 then recompile) n={}", s_mc);
-        }
         // Compile produced a cached entry. Loop and retry dispatch.
         continue;
-      }
-      {
-        static u64 s_ci = 0;
-        if (++s_ci <= 12)
-          NOTICE_LOG_FMT(POWERPC, "[ax-handoff] JitWasm -> CachedInterpreter at pc={:#x} (compile FAILED) n={}",
-                         pc, s_ci);
       }
 
       // Compile failed (decode hit unsupported stream, build_block_next
@@ -414,6 +533,12 @@ void JitWasm::Run()
       // CachedInterpreter has its own outer Advance loop and yields to
       // CoreTiming when budget exhausts; returning out of our Run lets
       // RunSingleFrame complete the frame.
+      // [npc-sync — root fix of the PC=0 ISI] The chain advanced ppc_state.pc per block but left npc
+      // at the chain's ENTRY pc (bem_chain_loop_c/chain_dispatch_raw never touch npc); the chained>0
+      // path re-syncs at line ~500 but THIS compile-fail fallback did not. CachedInterpreter checks
+      // exceptions at entry via ppc_state.npc, so a stale npc (0x80010640, an old HuSprDisp epilogue)
+      // -> SRR0=npc -> rfi to a dead frame -> blr 0. pc is the real resume instruction; force npc=pc.
+      ppc_state.npc = ppc_state.pc;
       CachedInterpreter::Run();
       return;
     } while (ppc_state.downcount > 0 && *state_ptr == CPU::State::Running);

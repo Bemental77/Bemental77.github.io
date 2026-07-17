@@ -126,6 +126,20 @@ public:
   OPCODE_CALLBACK(void OnPrimitiveCommand(OpcodeDecoder::Primitive primitive, u8 vat,
                                           u32 vertex_size, u16 num_vertices, const u8* vertex_data))
   {
+    // [domino3-real] dump the first 24 post-takeover draws' (vertex_size, num_vertices) so the
+    // exact dolphin decode walk can be replayed against the known-deterministic ring byte-stream
+    // to find where sizing diverges from the SETDRAWDONE. Gated cpu_owner (inert on shipping).
+    if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u)
+    {
+      volatile u32* dc = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B90u));
+      const u32 idx = *dc;
+      if (idx < 24u)
+      {
+        volatile u32* slot = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AC8u + idx * 8u));
+        slot[0] = vertex_size; slot[1] = num_vertices;
+      }
+      *dc = idx + 1u;
+    }
     // load vertices
     const u32 size = vertex_size * num_vertices;
 
@@ -229,6 +243,18 @@ public:
     ASSERT(size >= 1);
     if constexpr (!is_preprocess)
     {
+      // [domino3-real] record dolphin's actual decoded opcode SEQUENCE (first 256) + sizes so we can
+      // diff vs the known-deterministic worker stream and find the exact desync opcode. Gated cpu_owner.
+      if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u)
+      {
+        volatile u32* cc = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1BF0u));
+        const u32 i = *cc;
+        if (i < 256u) {
+          *reinterpret_cast<volatile u8*>(static_cast<uintptr_t>(0x026B1C00u + i)) = data[0];
+          *reinterpret_cast<volatile u8*>(static_cast<uintptr_t>(0x026B1E00u + i)) = static_cast<u8>(size > 255 ? 255 : size);
+        }
+        *cc = i + 1u;
+      }
       // Display lists get added directly into the FIFO stream since this same callback is used to
       // process them.
       if (g_record_fifo_data && static_cast<Opcode>(data[0]) != Opcode::GX_CMD_CALL_DL)

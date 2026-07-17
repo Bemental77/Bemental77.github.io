@@ -625,37 +625,6 @@ void SerialInterfaceManager::UpdateDevices()
 
   UpdateInterrupts();
 
-  // [ax-si-deliver] oracle-diff: native boots SAB through this poll in ~1s;
-  // WASM spins 33M. After UpdateInterrupts asserts SI to PI, log whether the
-  // chain SI->PI cause->Exceptions->(EE) is intact. If EE=1 AND EXTERNAL_INT is
-  // in Exceptions yet the guest keeps polling => the JIT isn't delivering; if
-  // Exceptions lacks EXTERNAL_INT => PI->Exceptions propagation is the break.
-  {
-    static u64 nd = 0;
-    if (++nd <= 8 || (nd & 0xFFu) == 0)
-    {
-      auto& ps = m_system.GetPPCState();
-      const u32 cause = m_system.GetProcessorInterface().GetCause();
-      const u32 mask = m_system.GetProcessorInterface().GetMask();
-      // [ax-guestpc] DUMP the guest's current PC + LR + loop GPRs so the stuck
-      // loop can be disassembled (gsne8p.map) and GDB'd against native at the
-      // SAME pc. No unknowns — this is the dump.
-      NOTICE_LOG_FMT(POWERPC,
-                     "[ax-si-deliver] n={} pc={:#010x} lr={:#010x} EE={} Exceptions={:#x} "
-                     "msr={:#x} r3={:#010x} r4={:#010x} r5={:#010x} r6={:#010x} r31={:#010x} "
-                     "cause_and_mask={:#x}",
-                     nd, ps.pc, ps.spr[8], (u32)ps.msr.EE, ps.Exceptions, ps.msr.Hex,
-                     ps.gpr[3], ps.gpr[4], ps.gpr[5], ps.gpr[6], ps.gpr[31], cause & mask);
-      // [ax-dsi] is a store fault (DSI) freezing the memset? DAR/DSISR/SRR0 +
-      // the DBATs that should map 0x8099567c (in the 16MB DBAT0 window).
-      NOTICE_LOG_FMT(POWERPC,
-                     "[ax-dsi] DAR={:#010x} DSISR={:#010x} SRR0={:#010x} SRR1={:#010x} "
-                     "DBAT0U={:#010x} DBAT0L={:#010x} DBAT1U={:#010x} DBAT1L={:#010x}",
-                     ps.spr[19], ps.spr[18], ps.spr[26], ps.spr[27],
-                     ps.spr[536], ps.spr[537], ps.spr[538], ps.spr[539]);
-    }
-  }
-
   // Polling finished
   NetPlay::SetSIPollBatching(false);
 }

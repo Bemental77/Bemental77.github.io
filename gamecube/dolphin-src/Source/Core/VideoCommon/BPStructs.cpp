@@ -56,6 +56,15 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
                       GeometryShaderManager& geometry_shader_manager, const BPCmd& bp,
                       int cycles_into_future)
 {
+  // [domino3-real] post-takeover-only (gated). 0x026B1AC0 = total BPWritten decoded; 0x026B1AC4 =
+  // BPMEM_SETDRAWDONE reg (0x45) reached at ANY value. Distinguishes decoder-desync (both stay ~0
+  // relative to native) from value-misread (0x45 reached but sddDecode value-0x02 not).
+  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u)
+  {
+    volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AC0u)); *p = *p + 1u;
+    if (bp.address == BPMEM_SETDRAWDONE)
+    { volatile u32* q = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AC4u)); *q = *q + 1u; }
+  }
   /*
   ----------------------------------------------------------------------------------------------------------------
   Purpose: Writes to the BP registers
@@ -182,6 +191,9 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
     {
     case 0x02:
     {
+      // [domino3-real] 0x026B1ABC = SETDRAWDONE decode-case reached post-takeover (gated cpu_owner).
+      if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u)
+      { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1ABCu)); *p = *p + 1u; }
       INCSTAT(g_stats.this_frame.num_draw_done);
       g_texture_cache->FlushEFBCopies();
       g_texture_cache->FlushStaleBinds();

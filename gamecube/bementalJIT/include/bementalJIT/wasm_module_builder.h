@@ -13,6 +13,7 @@ constexpr u8 WASM_TYPE_I32 = 0x7F;
 constexpr u8 WASM_TYPE_I64 = 0x7E;
 constexpr u8 WASM_TYPE_F32 = 0x7D;
 constexpr u8 WASM_TYPE_F64 = 0x7C;
+constexpr u8 WASM_TYPE_V128 = 0x7B;   // fixed-width SIMD (paired-single f32x2 in lanes 0-1)
 constexpr u8 WASM_TYPE_FUNC = 0x60;
 
 // WASM section IDs (full set in spec order: type=1, import=2, function=3,
@@ -622,6 +623,40 @@ public:
 	void op_f64_promote_f32()    { emitByte(wop::f64_promote_f32); }
 	void op_f32_demote_f64()     { emitByte(wop::f32_demote_f64); }
 
+	// ---- v128 fixed-width SIMD (0xFD prefix + LEB128 subopcode) ----
+	// Paired-single fast path: a single-typed FPR is held as f32x2 in v128
+	// lanes 0-1. Only the subset the paired emitters need. Subopcodes per the
+	// WebAssembly SIMD spec (values >127 LEB128-encode to 2 bytes).
+	static constexpr u8 V128_PREFIX = 0xFD;
+	void op_v128_load(u32 off, u32 align = 4)  { emitByte(V128_PREFIX); emitLEB128(0x00u); emitLEB128(align); emitLEB128(off); }        // v128.load
+	void op_v128_load64_zero(u32 off, u32 align = 3) { emitByte(V128_PREFIX); emitLEB128(0x5Du); emitLEB128(align); emitLEB128(off); } // v128.load64_zero
+	void op_v128_store(u32 off, u32 align = 4) { emitByte(V128_PREFIX); emitLEB128(0x0Bu); emitLEB128(align); emitLEB128(off); }        // v128.store
+	void op_v128_store64_lane(u32 off, u8 lane, u32 align = 3) { emitByte(V128_PREFIX); emitLEB128(0x5Bu); emitLEB128(align); emitLEB128(off); emitByte(lane); } // v128.store64_lane
+	void op_f32x4_splat()        { emitByte(V128_PREFIX); emitLEB128(0x13u); }   // f32x4.splat (f32 -> v128)
+	void op_f64x2_splat()        { emitByte(V128_PREFIX); emitLEB128(0x14u); }   // f64x2.splat
+	void op_f32x4_extract_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x1Fu); emitByte(l); }  // -> f32
+	void op_f32x4_replace_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x20u); emitByte(l); }  // (v128,f32) -> v128
+	void op_i32x4_extract_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x1Bu); emitByte(l); }  // -> i32
+	void op_i32x4_replace_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x1Cu); emitByte(l); }  // (v128,i32) -> v128
+	void op_f64x2_extract_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x21u); emitByte(l); }  // -> f64
+	void op_f64x2_replace_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x22u); emitByte(l); }  // (v128,f64) -> v128
+	void op_v128_and()           { emitByte(V128_PREFIX); emitLEB128(0x4Eu); }
+	void op_v128_or()            { emitByte(V128_PREFIX); emitLEB128(0x50u); }
+	void op_v128_xor()           { emitByte(V128_PREFIX); emitLEB128(0x51u); }
+	void op_i8x16_shuffle(const u8 lanes[16]) { emitByte(V128_PREFIX); emitLEB128(0x0Du); for (int i = 0; i < 16; ++i) emitByte(lanes[i]); }
+	void op_f32x4_abs()          { emitByte(V128_PREFIX); emitLEB128(0xE0u); }
+	void op_f32x4_neg()          { emitByte(V128_PREFIX); emitLEB128(0xE1u); }
+	void op_f32x4_add()          { emitByte(V128_PREFIX); emitLEB128(0xE4u); }
+	void op_f32x4_sub()          { emitByte(V128_PREFIX); emitLEB128(0xE5u); }
+	void op_f32x4_mul()          { emitByte(V128_PREFIX); emitLEB128(0xE6u); }
+	void op_f32x4_div()          { emitByte(V128_PREFIX); emitLEB128(0xE7u); }
+	void op_f64x2_promote_low_f32x4() { emitByte(V128_PREFIX); emitLEB128(0x5Fu); }  // low 2 f32 -> f64x2
+	void op_f32x4_demote_f64x2_zero() { emitByte(V128_PREFIX); emitLEB128(0x5Eu); }  // f64x2 -> low 2 f32
+	// relaxed-SIMD fused multiply-add: (a,b,c) -> a*b+c, fused on FMA hardware
+	// (matches native JitArm64's f32 FMLA on its singles path). Subopcodes 261/262.
+	void op_f32x4_relaxed_madd()  { emitByte(V128_PREFIX); emitLEB128(261u); }  // a*b+c
+	void op_f32x4_relaxed_nmadd() { emitByte(V128_PREFIX); emitLEB128(262u); }  // -(a*b)+c
+
 	// Conversions
 	void op_i32_trunc_f32_s()    { emitByte(wop::i32_trunc_f32_s); }
 	void op_i32_trunc_f32_u()    { emitByte(wop::i32_trunc_f32_u); }
@@ -679,11 +714,20 @@ public:
 	void op_select()     { emitByte(wop::select); }
 	void op_unreachable() { emitByte(wop::unreachable); }
 
-	void op_if(u8 blockType = 0x40) { emitByte(wop::if_); emitByte(blockType); }
+	// [region-resident 2026-07-15] Control-nesting depth tracker: op_if/op_block/
+	// op_loop push, op_end pops (op_else stays — same construct). Lets the merged-
+	// region edge emitter compute a correct `br` immediate back to the region loop
+	// from ANY nesting inside a spliced body (br imm = ctrlDepth() + the body's
+	// splice offset) — the powerpc-next answer to gekko's hand-threaded
+	// local_block_depth wrappers. Depth is builder-relative (0 at construction);
+	// endFuncBody's function terminator is emitted directly, not via op_end, so
+	// the counter stays balanced across bodies.
+	void op_if(u8 blockType = 0x40) { emitByte(wop::if_); emitByte(blockType); ++m_ctrl_depth; }
 	void op_else()       { emitByte(wop::else_); }
-	void op_end()        { emitByte(wop::end); }
-	void op_block(u8 blockType = 0x40) { emitByte(wop::block); emitByte(blockType); }
-	void op_loop(u8 blockType = 0x40) { emitByte(wop::loop_); emitByte(blockType); }
+	void op_end()        { emitByte(wop::end); if (m_ctrl_depth) --m_ctrl_depth; }
+	void op_block(u8 blockType = 0x40) { emitByte(wop::block); emitByte(blockType); ++m_ctrl_depth; }
+	void op_loop(u8 blockType = 0x40) { emitByte(wop::loop_); emitByte(blockType); ++m_ctrl_depth; }
+	u32 ctrlDepth() const { return m_ctrl_depth; }
 	void op_br(u32 depth) { emitByte(wop::br); emitLEB128(depth); }
 	void op_br_if(u32 depth) { emitByte(wop::br_if); emitLEB128(depth); }
 	// br_table: branch to one of the labels indexed by the i32 on stack.
@@ -708,6 +752,7 @@ private:
 	u32 sectionContentStart = 0;
 	u32 funcBodySizePos = 0;
 	u32 funcBodyStart = 0;
+	u32 m_ctrl_depth = 0;   // [region-resident] control-nesting depth (see op_block)
 
 	// Write a u32 as a 5-byte fixed-length LEB128 at a specific position
 	void patchLEB128_5(u32 pos, u32 value) {

@@ -57,6 +57,8 @@ extern "C" {
     extern int32_t       g_bem_disp_slot[];    // [BEM_DISP_BUCKETS] wasmTable index
     extern uint32_t      g_bem_rtag[];         // [region] region-local cache: PC
     extern int32_t       g_bem_rslot[];        // [region] region internal-table slot
+    extern uint32_t      g_bem_mrtag[];        // [region-merged] merged-gen cache: PC
+    extern int32_t       g_bem_mrslot[];       // [region-merged] PACKED (gen<<16)|br_table_idx
     extern uint32_t      g_bem_chain_exc0;     // Exceptions snapshot at chain entry
     extern unsigned char g_bem_chain_enabled;  // master A/B toggle
     extern uint32_t      g_bem_pc_exec[];       // Phase A: per-pc execution count
@@ -79,8 +81,42 @@ static constexpr u32 LOCAL_TMP_B_CHAIN  = 1u;       // build_block_next i32 scra
 // cache + the IMPORTED table 0. The region path passes its OWN cache addresses
 // (g_bem_rtag/g_bem_rslot, holding region-local internal-table slots) -> the
 // INTERNAL table 0 of the region module, which V8 inlines (same instance).
+// [region-merged 2026-07-15] Context for emitting a block body INTO the merged
+// single-function region (build_region_function_next). When non-null, the
+// terminal's chain-hit arm re-dispatches INSIDE the region function via
+// `entry_sel = k; return_call $region` instead of return_call_indirect on a
+// table — V8 compiles the self-tail-call as a jump, so intra-region edges cost
+// ~the microbench a2 (6.64 ns) instead of the cross-module chain (9.82 ns).
+// The probe arrays are the REGION rtag/rslot; rslot values are PACKED
+// (gen_idx << 16) | br_table_index so a body can tell its OWN gen's entries
+// (warm: sel+return_call) from another gen's (cold: fall through to the host
+// return — the host chain then enters the other gen via its global-table
+// wrapper, which the microbench measured as free).
+// laps: per-invocation intra-region edge counter (module global, zeroed by the
+// fn_k entry wrappers). At REGION_LAP_MAX with no pending exception the edge
+// forces downcount=0 and exits to the host — the in-region idle-poll escape
+// (adversarial-verify wf_0ce30bf7: fully-sealed analyzer-unflagged multi-PC
+// polls otherwise burn whole slices at real cycle cost, the historic JS-ring
+// wedge). Threshold high enough that hot COMPUTE loops (downcount-bounded well
+// below it per entry) never trip it in practice.
+struct MergedRegionCtx {
+    u32 gen_idx;          // this gen's index (packed-slot ownership check)
+    u32 region_func_idx;  // module-local func index of $region (cold re-entry)
+    u32 sel_global_idx;   // entry_sel mutable-i32 global index
+    u32 laps_global_idx;  // lap-counter mutable-i32 global index
+    // [region-resident 2026-07-15] Warm edges are `br` back to the region LOOP
+    // (same activation — locals persist, enabling GPR residency; a return_call
+    // would reset locals to zero). br immediate from an edge site =
+    // bodyBuilder.ctrlDepth() + br_extra_depth, where br_extra_depth =
+    // (n_blocks - k) accounts for body k's splice nesting (loop + $DEF +
+    // the (n-1-k) enclosing $B blocks, minus the loop interior itself).
+    u32 br_extra_depth;   // per-body splice offset (set by the merged builder)
+};
+static constexpr u32 REGION_LAP_MAX = 2048u;
+
 static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
-                                 u32 tag_addr_ovr = 0u, u32 slot_addr_ovr = 0u) {
+                                 u32 tag_addr_ovr = 0u, u32 slot_addr_ovr = 0u,
+                                 const MergedRegionCtx* merged = nullptr) {
     if (!g_bem_chain_enabled) {
         b.op_i32_const((s32)ctx_ptr);
         b.op_i32_load(ppc_off::PC);
@@ -134,6 +170,27 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
         b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
     b.op_end();
 
+    // [vector-page guard 2026-07-09, INVARIANT-KEYED 2026-07-09-pm] Never tail-chain
+    // INTO an exception vector (pc < 0x4000) WHEN THE CARRIED MSR HAS IR SET (0x20).
+    // The crash was a chain/rfi into the vector carrying a translated-mode MSR (rfi
+    // output 0x1030, IR=1): the vector INSTRUCTION fetch then translates and faults
+    // (ISI at 0x594). Guard the INVARIANT (MSR.IR = fetch translation state), NOT the
+    // geography — an earlier PC<0x4000-only guard OVER-FIRED on LEGIT real-mode stub
+    // execution (msr=0x1000, IR=0), stranding the worker re-dispatching 0x500 forever
+    // (the 0x500 dispatch-spin face, autopsied 2026-07-09: block runs, next=0x500).
+    // At IR=0 the vector is fetched physical (real-mode, correct) — let it chain
+    // natively so the stub advances to its handler. At IR=1, force the JS dispatch
+    // loop (CheckExternalExceptions/delivery clears IR to real-mode).
+    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
+    b.op_i32_const(0x4000); b.op_i32_lt_u();                 // (PC < 0x4000) -> 0/1
+    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::MSR);
+    b.op_i32_const(0x20); b.op_i32_and();                    // MSR & IR(0x20) -> 0/0x20
+    b.op_i32_const(0); b.op_i32_ne();                        // -> 0/1 (normalize before AND)
+    b.op_i32_and();                                          // (PC<0x4000) AND (IR set)
+    b.op_if(BLOCK_TYPE_VOID);
+        b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
+    b.op_end();
+
     // bucket byte-offset = ((PC>>2) & MASK) * 4 ; keep PC in TMP_A, byteoff in TMP_B
     b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
     b.op_local_tee(LOCAL_TMP_A_CHAIN);
@@ -145,16 +202,84 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
     b.op_i32_const((s32)tag_addr); b.op_i32_add(); b.op_i32_load(0);
     b.op_local_get(LOCAL_TMP_A_CHAIN); b.op_i32_eq();
     b.op_if(BLOCK_TYPE_VOID);
-        // slot = g_bem_disp_slot[bucket]; if slot >= 0 → return_call_indirect
+        // slot = g_bem_disp_slot[bucket]; if slot >= 0 → dispatch
         b.op_i32_const((s32)slot_addr); b.op_local_get(LOCAL_TMP_B_CHAIN);
         b.op_i32_add(); b.op_i32_load(0);
         b.op_local_tee(LOCAL_TMP_A_CHAIN);
         b.op_i32_const(0); b.op_i32_ge_s();
         b.op_if(BLOCK_TYPE_VOID);
+        if (merged) {
+            // [region-merged] slot is PACKED (gen<<16)|k. Own-gen hit → warm
+            // in-function re-dispatch; other gen → fall through to the host
+            // return (its global-table wrapper is a free tail-chain away).
+            b.op_local_get(LOCAL_TMP_A_CHAIN);
+            b.op_i32_const(16); b.op_i32_shr_u();
+            b.op_i32_const((s32)merged->gen_idx); b.op_i32_eq();
+            b.op_if(BLOCK_TYPE_VOID);
+                // laps++
+                b.op_global_get(merged->laps_global_idx);
+                b.op_i32_const(1); b.op_i32_add();
+                b.op_global_set(merged->laps_global_idx);
+                // laps < REGION_LAP_MAX → warm edge
+                b.op_global_get(merged->laps_global_idx);
+                b.op_i32_const((s32)REGION_LAP_MAX); b.op_i32_lt_u();
+                b.op_if(BLOCK_TYPE_VOID);
+                    b.op_local_get(LOCAL_TMP_A_CHAIN);
+                    b.op_i32_const(0xFFFF); b.op_i32_and();
+                    b.op_global_set(merged->sel_global_idx);
+                    // [region-resident] warm edge = br back to the region LOOP:
+                    // same activation, GPR locals persist (a return_call would
+                    // zero them). Depth = body-relative nesting + splice offset.
+                    b.op_br(b.ctrlDepth() + merged->br_extra_depth);
+                b.op_end();
+                // lap threshold: in-region idle-poll escape. With no pending
+                // exception, force downcount=0 so the host slice ends and
+                // CoreTiming::Advance fires the awaited event (VI/DSP/timer)
+                // instead of the poll burning the whole slice at cycle cost.
+                b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::EXCEPTIONS);
+                b.op_i32_eqz();
+                b.op_if(BLOCK_TYPE_VOID);
+                    b.op_i32_const((s32)ctx_ptr); b.op_i32_const(0);
+                    b.op_i32_store(ppc_off::DOWNCOUNT);
+                b.op_end();
+                // fall through → global-table chain / host return below
+            b.op_end();
+        } else {
             b.op_local_get(LOCAL_TMP_A_CHAIN);       // table index operand
             b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+        }
         b.op_end();
     b.op_end();
+
+    if (merged) {
+        // [cross-gen fix 2026-07-15] mrtag miss / other-gen / lap-overflow-with-
+        // pending-exception land here. Probe the STANDARD global dispatch cache
+        // (g_bem_disp_tag/slot) and return_call_indirect on the imported global
+        // table — chaining IN-WASM to the other gen's wrapper, an unsealed
+        // per-block module, or anything else registered, exactly like a normal
+        // block epilogue. Without this every such exit was a host bounce
+        // (measured: promote-ON -25% aggregate on the 300s chain A/B).
+        const u32 gtag  = (u32)(uintptr_t)&g_bem_disp_tag[0];
+        const u32 gslot = (u32)(uintptr_t)&g_bem_disp_slot[0];
+        b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
+        b.op_local_tee(LOCAL_TMP_A_CHAIN);
+        b.op_i32_const(2); b.op_i32_shr_u();
+        b.op_i32_const((s32)BEM_DISP_MASK_NEXT); b.op_i32_and();
+        b.op_i32_const(4); b.op_i32_mul();
+        b.op_local_tee(LOCAL_TMP_B_CHAIN);
+        b.op_i32_const((s32)gtag); b.op_i32_add(); b.op_i32_load(0);
+        b.op_local_get(LOCAL_TMP_A_CHAIN); b.op_i32_eq();
+        b.op_if(BLOCK_TYPE_VOID);
+            b.op_i32_const((s32)gslot); b.op_local_get(LOCAL_TMP_B_CHAIN);
+            b.op_i32_add(); b.op_i32_load(0);
+            b.op_local_tee(LOCAL_TMP_A_CHAIN);
+            b.op_i32_const(0); b.op_i32_ge_s();
+            b.op_if(BLOCK_TYPE_VOID);
+                b.op_local_get(LOCAL_TMP_A_CHAIN);
+                b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+            b.op_end();
+        b.op_end();
+    }
 
     // No chain (bail / tag miss / freed slot): return next-PC to the JS loop.
     b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
@@ -181,6 +306,12 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
 // stale ppc_state.
 static void emit_fallback(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                           const CodeOp& op, u32 ctx_ptr) {
+    // [set_pc-gate] The pre-op set_pc is now skipped for native non-block-ending
+    // ops, so a fallback op must write its OWN pc here — the dolphin_interp guard
+    // (if ppc_state.pc != pc) bails otherwise, and CHECK_EXC's SRR0 below needs it.
+    wb.op_i32_const((s32)ctx_ptr);
+    wb.op_i32_const((s32)op.address);
+    wb.op_i32_store(ppc_off::PC);
     // FPR cache must flush BEFORE the interp call (interp reads ps[] from
     // PowerPCState directly), and reload AFTER (interp may have mutated
     // ps[] — any FP op fallback, OSContext save/restore via interp). Same
@@ -366,7 +497,7 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         case 659: emit_mfsrin(wb, rc, frc, op, params.ctx_ptr);                 return true;
 
         // dcbz — 32-byte zero block. Memset/__fill_mem hot path.
-        case 1014: emit_dcbz(wb, rc, frc, op, params.ctx_ptr);                  return true;
+        case 1014: emit_dcbz(wb, rc, frc, op, params);                          return true;
 
         // Sync / DATA-cache barriers / hints — emit nothing. The linear
         // memory model has no real data cache to flush/invalidate/prefetch.
@@ -555,7 +686,8 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                                  CodeBuffer& buffer, BlockStats& stats,
                                  u32 count, u32 start_pc, u32 ctx_ptr,
                                  u32 mem1_base, u32 mem1_mask, u32 ram_size,
-                                 u32 chain_tag_addr = 0u, u32 chain_slot_addr = 0u) {
+                                 u32 chain_tag_addr = 0u, u32 chain_slot_addr = 0u,
+                                 const MergedRegionCtx* merged = nullptr) {
     // IN-BLOCK CYCLE ACCOUNTING (2026-06-12, Jit64 parity: Jit.cpp charges
     // js.downcountAmount at block entry). downcount -= numCycles emitted in
     // the block prologue so the chain dispatcher can run block-to-block
@@ -639,9 +771,14 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
 
     // RegCache: assign per-PPC-GPR WASM locals + emit prologue loads
     // for live-in registers.
+    // [region-resident 2026-07-15] Merged-region bodies SKIP the prologue
+    // loads: the $region activation pad loaded all 32 GPRs once, warm edges
+    // are same-activation `br`s (locals persist), and every host-visible
+    // point still sees coherent memory via the unchanged dirty flushes.
     RegCache rc(b);
     rc.OnBlockEntry(block, /*wasm_local_base=*/2u, ctx_ptr);
-    rc.EmitPrologueLoads(ctx_ptr);
+    if (merged) rc.MarkAllLoaded();
+    else        rc.EmitPrologueLoads(ctx_ptr);
 
     // FPRRegCache: assign per-PPC-FPR WASM locals (both ps0/ps1 lanes) +
     // emit i64 prologue loads for live-in FPRs (block.m_fpr_inputs).
@@ -730,19 +867,29 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             frc.ReloadAll(ctx_ptr);
         }
 
-        // Pre-op set_pc — mirrors live gekko_emit.cpp:4023+. Native
-        // emitters don't write ppc_state.pc; without this pre-set, a later
-        // op in the same block that falls back to dolphin_interp sees a
-        // stale pc and the dolphin_interp guard (`if (ppc_state.pc != pc)
-        // return`, search JitWasm.cpp for that conditional) bails before
-        // SingleStepInner runs. Historically observed on the SAB 0x500
-        // EXT_INT path: addis/addi/mtspr ran natively without updating pc,
-        // then rfi fell back; the interp guard saw stale pc and skipped
-        // the rfi, leaving the block in a self-loop until idle-skip
-        // heuristics tripped.
-        b.op_i32_const((s32)ctx_ptr);
-        b.op_i32_const((s32)op.address);
-        b.op_i32_store(ppc_off::PC);
+        // Pre-op set_pc — mirrors Jit64 FallBackToInterpreter (Jit.cpp:357):
+        // write ppc_state.pc only when op.canEndBlock, NOT before every op.
+        // [set_pc-gate] op.canEndBlock = FL_ENDBLOCK + bclr/bcctr/rfi
+        // (ppc_analyst.cpp:481). Also keep it for FL_LOADSTORE (slow-path DSI
+        // reads ctx.PC), FL_USE_FPU (the FP-unavailable bailout below uses ctx.PC),
+        // and canCauseException (trap/syscall/div). Pure native ALU ops (add/addi/
+        // or/rlwinm/mtspr...) skip it — drops 3 wasm ops from the bulk of the body.
+        // The historical SAB 0x500 EXT_INT self-loop (addis/addi/mtspr native then
+        // rfi fell back; interp guard `if (ppc_state.pc != pc)` saw a stale pc and
+        // skipped rfi) STAYS fixed: rfi is canEndBlock (gets the pre-op pc) AND
+        // emit_fallback now sets its own pc. (An FL_ENDBLOCK-only gate broke boot —
+        // it missed bclr/bcctr/rfi, sending returns/jumps to stale PCs.)
+        // is_terminator: the non-branch block-exit PC fixup (~line 846) does
+        // `if (PC == op.address) PC = op.address+4` and REQUIRES the pre-op pc to
+        // have written op.address (a cap-cut ALU terminator otherwise leaves PC
+        // stale -> epilogue returns the wrong next-pc -> the 27-PC +4 walk).
+        if (is_terminator || op.canEndBlock || op.canCauseException ||
+            (op.opinfo && (op.opinfo->flags & (FL_LOADSTORE | FL_USE_FPU))))
+        {
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_const((s32)op.address);
+            b.op_i32_store(ppc_off::PC);
+        }
 
         // Always route through dispatch_op for the terminator. The
         // emit_idle_skip override was wrong for benign polling loops
@@ -885,7 +1032,8 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     rc.Flush(ctx_ptr);
     // Terminal: tail-chain to the successor block in-WASM when it resolves and
     // no service point is pending; otherwise return next-PC to the JS loop.
-    emit_chain_or_return(b, ctx_ptr, chain_tag_addr, chain_slot_addr);
+    // (Merged-region bodies re-dispatch in-function instead — see MergedRegionCtx.)
+    emit_chain_or_return(b, ctx_ptr, chain_tag_addr, chain_slot_addr, merged);
 }
 
 std::vector<u8> build_block_next(u32 start_pc,
@@ -988,9 +1136,14 @@ std::vector<u8> build_block_next(u32 start_pc,
         // Group 6: 2 i64 scratch (locals 101, 102) for op59/frsp
         // Force25Bit + ForceSingle bit-twiddling; jit_floating_point
         // LOCAL_FP_I64_*.
-        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u };
-        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64, WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64 };
-        b.emitLocals(6u, counts, types);
+        // Group 7 [oracle-audit 2026-07-12]: 17 f64 scratch (locals 103..119)
+        // for the bit-exact fused multiply-add (Boldo-Melquiond FMA + single
+        // tie-correction) in jit_fp_helpers.h LOCAL_FMA_* (C2).
+        // Group 8 [simd-paired 2026-07-12]: 32 v128 (locals 120..151) — the
+        // single-precision f32x2 form of each FPR (FPRRegCache v128_local_idx).
+        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u, 17u, 32u };
+        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64, WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64, WASM_TYPE_F64, WASM_TYPE_V128 };
+        b.emitLocals(8u, counts, types);
     }
 
     emit_block_body_into(b, block, buffer, stats, count, start_pc, ctx_ptr,
@@ -1003,40 +1156,12 @@ std::vector<u8> build_block_next(u32 start_pc,
 }
 
 
-#ifdef BEMENTALJIT_USE_REBUILD
-
-// Region-path _next implementations: PASSTHROUGHS to the live bemental::
-// powerpc:: functions in guests/powerpc/gekko_emit.cpp. Real implementations
-// were attempted but require including ../powerpc/gekko_emit.h, which ODR-
-// collides with powerpc-next's own ppc_offsets.h (both define ppc_off::spr/
-// gpr/etc in the same namespace) and with the local WIMPORT_INTERP constant.
-//
-// Follow-up: extract BlockInputs + LocalIdxLookupFn + WIMPORT_* + ppc_off::*
-// into a third shared header (e.g. bementalJIT/include/bementalJIT/ppc_shared.h)
-// that both gekko_emit.h and powerpc-next headers can include without
-// collision. Then re-introduce the real region impls so the region path
-// exercises the per-op HLE check, const-MMIO routing, and LR-stack push/pop
-// natively rather than via the live-gekko forward.
-
-// Forward decls for the live functions we forward to.
-std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
-                                u32 ctx_ptr_const,
-                                u32 mem1_base, u32 mem1_mask, u32 ram_size,
-                                const u32* instr_pcs,
-                                LocalIdxLookupFn lookup_fn,
-                                const void* lookup_user,
-                                bool emit_hle_check,
-                                bool emit_perf_stub,
-                                bool emit_hle_check_native);
-std::vector<u8> build_region_module(const u8* concatenated_bodies,
-                                    std::size_t concatenated_size,
-                                    u32 n_funcs,
-                                    u32 mem_pages);
-std::vector<u8> build_region_function(const BlockInputs* blocks,
-                                      u32 n_blocks,
-                                      LocalIdxLookupFn lookup_fn,
-                                      const void* lookup_user,
-                                      u32 mem_pages);
+// [region-merged 2026-07-15] Region-path _next implementations — REAL, and
+// compiled UNCONDITIONALLY (the BEMENTALJIT_USE_REBUILD guards are gone: the
+// canonical build-wasm-4010 compiles with the flag OFF, which silently routed
+// the whole region path to the LEGACY gekko emitter — regions lacked
+// ppc_msr_updated/ppc_gather_drain and every powerpc-next semantic fix, the
+// "staleness bug"). block_cache's seal now calls these directly.
 
 std::vector<u8> emit_block_body_next(u32 start_pc, const u32* insts, u32 count,
                                      u32 ctx_ptr_const,
@@ -1073,10 +1198,16 @@ std::vector<u8> emit_block_body_next(u32 start_pc, const u32* insts, u32 count,
     WasmModuleBuilder b;
     b.beginFuncBody();
     {
-        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u };
+        // Group 7 [oracle-audit 2026-07-12]: 17 f64 scratch (103..119) for the
+        // bit-exact FMA (jit_fp_helpers.h LOCAL_FMA_*, C2). MUST match the
+        // build_block_next declaration above (region path shares emitters).
+        // Group 8 [simd-paired 2026-07-12]: 32 v128 (120..151). MUST match the
+        // build_block_next declaration above (region path shares emitters).
+        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u, 17u, 32u };
         const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64,
-                               WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64 };
-        b.emitLocals(6u, counts, types);
+                               WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64,
+                               WASM_TYPE_F64, WASM_TYPE_V128 };
+        b.emitLocals(8u, counts, types);
     }
     const u32 rtag  = (u32)(uintptr_t)&g_bem_rtag[0];
     const u32 rslot = (u32)(uintptr_t)&g_bem_rslot[0];
@@ -1154,16 +1285,187 @@ std::vector<u8> build_region_module_next(const u8* concatenated_bodies,
     return b.getBytes();
 }
 
-std::vector<u8> build_region_function_next(const BlockInputs* blocks,
-                                           u32 n_blocks,
-                                           LocalIdxLookupFn lookup_fn,
-                                           const void* lookup_user,
-                                           u32 mem_pages) {
-    return build_region_function(blocks, n_blocks, lookup_fn, lookup_user,
-                                 mem_pages);
-}
+std::vector<u8> build_region_function_next_merged(const RegionBlockDesc* blocks,
+                                                  u32 n_blocks,
+                                                  u32 gen_idx,
+                                                  u32 blr_chain_addr,
+                                                  u32 mem_pages) {
+    // [region-merged 2026-07-15] ONE wasm function for the whole generation.
+    // Shape: func $region (idx 13) = 8-group locals + (N+1) nested void blocks
+    // + br_table(entry_sel) + the N spliced block-body expressions + a default
+    // arm returning ctx.PC. Bodies are the SAME emit_block_body_into output as
+    // the live per-block path (13-import contract, all powerpc-next semantics),
+    // emitted expression-only with MergedRegionCtx so intra-region edges become
+    // `entry_sel = k; return_call $region` (microbench a2, 6.64ns) resolved at
+    // RUNTIME via the gen-packed rtag/rslot cache — no br-depth tracking, no
+    // build-time lookup (bctr/blr targets warm-chain too when sealed). fn_k
+    // wrappers (idx 14+k) are the GLOBAL-dispatch-table entry points: reset the
+    // blr-chain budget (host-boundary contract, block_cache.cpp:448) + zero the
+    // lap counter + set entry_sel + tail into $region.
+    // Splice validity: bodies are self-contained expressions whose brs only
+    // reference their own nesting and which terminate every path with
+    // return/return_call — relative br depths survive splicing untouched.
+    if (blocks == nullptr || n_blocks == 0u || n_blocks > 0xFFFFu) return {};
 
-#endif  // BEMENTALJIT_USE_REBUILD
+    // ---- Emit the N bodies (expression bytes only; locals live in $region) ----
+    MergedRegionCtx mctx;
+    mctx.gen_idx         = gen_idx;
+    mctx.region_func_idx = WIMPORT_COUNT;        // func 13 = $region
+    mctx.sel_global_idx  = 0u;                   // global 0 = entry_sel
+    mctx.laps_global_idx = 1u;                   // global 1 = laps
+    // Merged gens probe DEDICATED arrays (g_bem_mrtag/mrslot) — the N-fn
+    // shape's rtag/rslot hold RAW internal-table indices; merged slots are
+    // gen-packed. Sharing one array would collide the two semantics.
+    const u32 rtag  = (u32)(uintptr_t)&g_bem_mrtag[0];
+    const u32 rslot = (u32)(uintptr_t)&g_bem_mrslot[0];
+    std::vector<std::vector<u8>> bodies(n_blocks);
+    for (u32 i = 0; i < n_blocks; ++i) {
+        const RegionBlockDesc& d = blocks[i];
+        if (d.insts == nullptr || d.count == 0u) return {};
+        struct FetchCtx { const u32* insts; u32 base_pc; u32 count; };
+        FetchCtx fc{d.insts, d.start_pc, d.count};
+        auto fetch = +[](u32 pc, void* user) -> u32 {
+            const FetchCtx* f = static_cast<const FetchCtx*>(user);
+            const u32 idx = (pc - f->base_pc) / 4u;
+            return idx >= f->count ? 0u : f->insts[idx];
+        };
+        PPCAnalyzer pa;
+        CodeBlock block;
+        BlockStats stats;
+        block.m_stats = &stats;
+        CodeBuffer buffer;
+        pa.Analyze(d.start_pc, &block, &buffer, d.count, fetch, &fc);
+        WasmModuleBuilder bb;   // no framing: getBytes() = raw expression bytes
+        // [region-resident] body k splices inside loop + $DEF + (n-1-k) $B
+        // blocks; warm-edge br imm = bodyDepth + (n_blocks - k) reaches $L.
+        mctx.br_extra_depth = n_blocks - i;
+        emit_block_body_into(bb, block, buffer, stats, d.count, d.start_pc,
+                             d.ctx_ptr, d.mem1_base, d.mem1_mask, d.ram_size,
+                             rtag, rslot, &mctx);
+        bodies[i] = bb.getBytes();
+    }
+    const u32 ctx_ptr_any = blocks[0].ctx_ptr;   // one PowerPCState for all
+
+    // ---- Module assembly (section order: type, import, func, global, export, code) ----
+    WasmModuleBuilder b;
+    b.emitHeader();
+    b.emitTypeSection(4);
+    {
+        const u8 i32t[]  = { WASM_TYPE_I32 };
+        const u8 i32x2[] = { WASM_TYPE_I32, WASM_TYPE_I32 };
+        b.emitFuncType(nullptr, 0, i32t, 1);
+        b.emitFuncType(i32t, 1, i32t, 1);
+        b.emitFuncType(i32x2, 2, nullptr, 0);
+        b.emitFuncType(i32x2, 2, i32t, 1);
+    }
+    b.endSection();
+    b.emitImportSection(2u + WIMPORT_COUNT);
+    b.emitImportMemory("env", "memory", mem_pages > 0u ? mem_pages : 1u);
+    b.emitImportFunc("env", "ppc_read8",        1);   // 0
+    b.emitImportFunc("env", "ppc_read16",       1);   // 1
+    b.emitImportFunc("env", "ppc_read32",       1);   // 2
+    b.emitImportFunc("env", "ppc_write8",       2);   // 3
+    b.emitImportFunc("env", "ppc_write16",      2);   // 4
+    b.emitImportFunc("env", "ppc_write32",      2);   // 5
+    b.emitImportFunc("env", "ppc_interp",       2);   // 6
+    b.emitImportFunc("env", "ppc_check_exc",    1);   // 7
+    b.emitImportFunc("env", "ppc_break_block",  2);   // 8
+    b.emitImportFunc("env", "ppc_hle_check",    1);   // 9
+    b.emitImportFunc("env", "ppc_hle_fire",     3);   // 10
+    b.emitImportFunc("env", "ppc_msr_updated",  2);   // 11
+    b.emitImportFunc("env", "ppc_gather_drain", 2);   // 12
+    // [cross-gen fix 2026-07-15] Import the GLOBAL __indirect_function_table so
+    // merged bodies can fall through mrtag-miss/gen-mismatch to the STANDARD
+    // global-table chain (return_call_indirect) instead of a host bounce —
+    // without this, every cross-gen/unsealed exit cost a host round-trip that
+    // the per-block path chained in-wasm (measured: promote-ON -25% aggregate).
+    b.emitImportTable("env", "__indirect_function_table", /*initial*/0u, /*hasMax*/false);
+    b.endSection();
+    {
+        std::vector<u32> typeIndices(1u + n_blocks, 0u);
+        b.emitFunctionSection(1u + n_blocks, typeIndices.data());
+    }
+    b.beginGlobalSection(2u);
+    b.emitGlobalI32Mut(0);   // global 0: entry_sel
+    b.emitGlobalI32Mut(0);   // global 1: laps
+    b.endSection();
+    b.beginExportSection(2u + n_blocks);
+    b.emitExport("region",    WASM_EXPORT_FUNC,   WIMPORT_COUNT);
+    b.emitExport("entry_sel", WASM_EXPORT_GLOBAL, 0u);
+    {
+        char name[24];
+        for (u32 i = 0; i < n_blocks; ++i) {
+            std::snprintf(name, sizeof(name), "fn_%u", (unsigned)i);
+            b.emitExport(name, WASM_EXPORT_FUNC, WIMPORT_COUNT + 1u + i);
+        }
+    }
+    b.endSection();
+    b.beginCodeSection(1u + n_blocks);
+    // ---- $region ----
+    b.beginFuncBody();
+    {
+        // Identical 8-group local layout to build_block_next — the spliced
+        // bodies hardcode these indices.
+        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u, 17u, 32u };
+        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64,
+                               WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64,
+                               WASM_TYPE_F64, WASM_TYPE_V128 };
+        b.emitLocals(8u, counts, types);
+    }
+    // [region-resident 2026-07-15] Activation pad: load ALL 32 GPRs into their
+    // identity locals (preg n -> local 2+n, RegCache::OnBlockEntry layout) ONCE
+    // per host entry. Warm edges `br` back to the loop below — the SAME
+    // activation — so bodies skip every GPR prologue reload (MarkAllLoaded)
+    // and V8 can keep the guest registers in host registers across edges.
+    // GPR offsets: PowerPCState gpr[] base 0x14 + 4n (reg_cache.cpp
+    // ppc_gpr_off, matches gekko ppc_off::gpr()).
+    for (u32 n = 0; n < 32u; ++n) {
+        b.op_i32_const((s32)ctx_ptr_any);
+        b.op_i32_load(0x14u + 4u * n);
+        b.op_local_set(2u + n);
+    }
+    b.op_loop(BLOCK_TYPE_VOID);                   // $L — warm edges land here
+    // Dispatch skeleton: $DEF outermost (inside $L), then $B_{N-1} .. $B_0.
+    for (u32 i = 0; i < n_blocks + 1u; ++i) b.op_block(BLOCK_TYPE_VOID);
+    b.op_global_get(0u);                          // entry_sel
+    {
+        std::vector<u32> labels(n_blocks);
+        for (u32 k = 0; k < n_blocks; ++k) labels[k] = k;   // depth k = $B_k
+        b.op_br_table(labels.data(), n_blocks, /*default=*/n_blocks);  // = $DEF
+    }
+    for (u32 k = 0; k < n_blocks; ++k) {
+        b.op_end();                               // close $B_k — br_table lands here
+        b.emitBytes(bodies[k].data(), bodies[k].size());
+    }
+    b.op_end();                                   // close $DEF — default arm
+    // Default (sel out of range — never set by wrappers/edges, but the
+    // validator needs the arm): return current PC to the host, which
+    // re-resolves through the normal dispatch. NOT gekko's silent block-0.
+    b.op_i32_const((s32)ctx_ptr_any);
+    b.op_i32_load(ppc_off::PC);
+    b.op_return();
+    b.op_end();                                   // close $L (unreachable edge)
+    b.op_unreachable();                           // loop never falls through
+    b.endFuncBody();
+    // ---- fn_k entry wrappers ----
+    for (u32 k = 0; k < n_blocks; ++k) {
+        b.beginFuncBody();
+        b.emitLocals(0u, nullptr, nullptr);
+        // Host-boundary contract: reset the consecutive-tail-chain budget so
+        // the idle-skip streak detector keeps observing (block_cache.cpp:448).
+        b.op_i32_const((s32)blr_chain_addr);
+        b.op_i32_const(0);
+        b.op_i32_store(0);
+        b.op_i32_const(0);
+        b.op_global_set(1u);                      // laps = 0 (per host entry)
+        b.op_i32_const((s32)k);
+        b.op_global_set(0u);                      // entry_sel = k
+        b.op_return_call(WIMPORT_COUNT);          // tail into $region
+        b.endFuncBody();
+    }
+    b.endSection();
+    return b.getBytes();
+}
 
 
 }  // namespace bemental::powerpc

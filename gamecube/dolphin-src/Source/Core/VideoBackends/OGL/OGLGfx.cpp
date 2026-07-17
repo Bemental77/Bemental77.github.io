@@ -23,6 +23,33 @@
 #include <algorithm>
 #include <string_view>
 
+// ===== THROWAWAY DIAGNOSTIC: per-glDrawElements draw-stream logger =====
+// Native-only diagnostic to capture MP4's draw stream as a reference for the
+// WASM build. Guarded behind the GC_DRAW_LOG env var so it is inert unless
+// explicitly enabled, and excluded from the Emscripten/WASM build entirely.
+// Remove when the native-vs-WASM draw diff is done.
+#ifndef __EMSCRIPTEN__
+#include <cstdio>
+#include <cstdlib>
+namespace
+{
+FILE* gc_draw_log_file()
+{
+  static FILE* f = []() -> FILE* {
+    const char* path = std::getenv("GC_DRAW_LOG");
+    if (!path || !*path)
+      return nullptr;
+    FILE* fp = std::fopen(path, "w");
+    if (fp)
+      std::setvbuf(fp, nullptr, _IOLBF, 0);
+    return fp;
+  }();
+  return f;
+}
+}  // namespace
+#endif
+// ===== END THROWAWAY DIAGNOSTIC =====
+
 namespace OGL
 {
 VideoConfig g_ogl_config;
@@ -272,12 +299,48 @@ void OGLGfx::SetViewport(float x, float y, float width, float height, float near
 
 void OGLGfx::Draw(u32 base_vertex, u32 num_vertices)
 {
-  glDrawArrays(static_cast<const OGLPipeline*>(m_current_pipeline)->GetGLPrimitive(), base_vertex,
-               num_vertices);
+  const auto* pipeline = static_cast<const OGLPipeline*>(m_current_pipeline);
+  const GLenum prim = pipeline->GetGLPrimitive();
+#ifdef __EMSCRIPTEN__
+  // WebGL2/proxied OffscreenCanvas: glDrawArrays with the attributeless VAO renders ZERO
+  // coverage (blue-clear test), while glDrawElements (the game/OSD path) works. Route ONLY
+  // the bufferless fullscreen-triangle blits (vertex_format==null -> s_attributeless_VAO,
+  // which carries our 3-vert VBO + {0..15} index buffer) through glDrawElements.
+  // Real-vertex-format Draws keep glDrawArrays: they have no element buffer bound, so
+  // glDrawElements there reads OOB -> GL_INVALID_OPERATION "vertex buffer not big enough"
+  // -> SwiftShader tolerates it but ANGLE-Metal kills the GPU process.
+  if (base_vertex == 0 && pipeline->GetVertexFormat() == nullptr)
+  {
+    glDrawElements(prim, num_vertices, GL_UNSIGNED_SHORT, nullptr);
+    return;
+  }
+#endif
+  glDrawArrays(prim, base_vertex, num_vertices);
 }
 
 void OGLGfx::DrawIndexed(u32 base_index, u32 num_indices, u32 base_vertex)
 {
+#ifndef __EMSCRIPTEN__
+  // THROWAWAY DIAGNOSTIC: log this indexed draw's index count, bound draw FBO,
+  // whether it is the system backbuffer FBO, target dimensions/format and blend.
+  if (FILE* f = gc_draw_log_file())
+  {
+    const OGLFramebuffer* fb = static_cast<const OGLFramebuffer*>(m_current_framebuffer);
+    const GLuint fbo = fb ? const_cast<OGLFramebuffer*>(fb)->GetFBO() : 0;
+    const bool is_system = (m_current_framebuffer == m_system_framebuffer.get());
+    const u32 w = fb ? fb->GetWidth() : 0;
+    const u32 h = fb ? fb->GetHeight() : 0;
+    const int cfmt = fb ? static_cast<int>(fb->GetColorFormat()) : -1;
+    const auto& b = m_current_blend_state;
+    std::fprintf(f,
+                 "DRAW idx=%u fbo=%u system=%d w=%u h=%u cfmt=%d blend=%u src=%u dst=%u "
+                 "colorupd=%u alphaupd=%u logic=%u\n",
+                 num_indices, fbo, is_system ? 1 : 0, w, h, cfmt,
+                 static_cast<u32>(b.blend_enable), static_cast<u32>(b.src_factor.Value()),
+                 static_cast<u32>(b.dst_factor.Value()), static_cast<u32>(b.color_update),
+                 static_cast<u32>(b.alpha_update), static_cast<u32>(b.logic_op_enable));
+  }
+#endif
   if (g_ogl_config.bSupportsGLBaseVertex)
   {
     glDrawElementsBaseVertex(static_cast<const OGLPipeline*>(m_current_pipeline)->GetGLPrimitive(),
@@ -431,6 +494,12 @@ void OGLGfx::PresentBackbuffer()
 
   // Swap the back and front buffers, presenting the image.
   m_main_gl_context->Swap();
+
+#ifndef __EMSCRIPTEN__
+  // THROWAWAY DIAGNOSTIC: frame boundary marker for the draw-stream logger.
+  if (FILE* f = gc_draw_log_file())
+    std::fprintf(f, "FRAME\n");
+#endif
 }
 
 void OGLGfx::OnConfigChanged(u32 bits)

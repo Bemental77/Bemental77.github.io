@@ -111,6 +111,8 @@ if(BEMENTAL_GUEST_POWERPC)
             "SHELL:-s MAXIMUM_MEMORY=67108864"
             "SHELL:-s ALLOW_TABLE_GROWTH=1"
             "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+            # newer emsdk no longer exports HEAP views by default; the harness reads them.
+            "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP8','HEAP16','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']"
         )
         target_compile_options(test_diff_next PRIVATE "-pthread")
     endif()
@@ -128,6 +130,9 @@ if(BEMENTAL_GUEST_POWERPC)
         set_target_properties(test_gekko_next PROPERTIES SUFFIX ".html")
         target_link_options(test_gekko_next PRIVATE
             "SHELL:-s EXIT_RUNTIME=1"
+            # newer emsdk no longer exports HEAP views by default; the harness reads them
+            # (was missing here vs test_diff_next -> "HEAPU8 not exported" abort on load).
+            "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP8','HEAP16','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']"
             "SHELL:-pthread"
             "SHELL:-s PTHREAD_POOL_SIZE=0"
             # 64MB (not 32): powerpc-next's bl/blr emit LR-shadow-ring diag

@@ -92,7 +92,7 @@ function startServer() {
   console.log('[probe] server up on :' + PORT);
   const browser = await puppeteer.launch({
     executablePath: CHROME,
-    headless: 'new',
+    headless: process.env.PROBE_HEADLESS === '0' ? false : 'new',
     // Persistent profile so IndexedDB savestates (SAVE_KEY) survive across runs —
     // lets the slow PSO boot be checkpointed and resumed (PROBE_LOAD_IDB_MS).
     ...(process.env.PROBE_PROFILE_DIR ? { userDataDir: process.env.PROBE_PROFILE_DIR } : {}),
@@ -101,6 +101,32 @@ function startServer() {
     // throughput vs default V8 (Liftoff baseline + dynamic-tiering)
     // on real-game SAB. Override via PROBE_JS_FLAGS env var.
     args: ['--no-sandbox', '--enable-features=SharedArrayBuffer', '--disable-web-security',
+           // [pace determinism 2026-07-06] headless Chrome throttles page timers for
+           // "backgrounded" tabs (setTimeout chains → 1Hz; IntensiveWakeUpThrottling →
+           // 1/min after 5min). Measured as 25fps-vs-2fps run-to-run pace forks on
+           // identical builds. Pin the scheduler.
+           '--disable-background-timer-throttling',
+           '--disable-renderer-backgrounding',
+           '--disable-backgrounding-occluded-windows',
+           '--disable-features=IntensiveWakeUpThrottling',
+           // [wgpu probe] real-Chrome WebGPU (Dawn/Metal) for ?wgpu=1 runs.
+           // PROBE_NO_WEBGPU=1 forces WebGPU UNAVAILABLE to reproduce the user's live Chrome
+           // ("Failed to create WebGPU Context Provider") — tests whether WebGPU-failure stalls
+           // the CPU boot at frame 0 (headful WITH webgpu boots to 100; user WITHOUT stalls at 0).
+           ...(process.env.PROBE_NO_WEBGPU === '1'
+               ? ['--disable-features=WebGPU,WebGPUService']
+               : process.env.PROBE_VANILLA_WEBGPU === '1'
+               ? []  // vanilla: no webgpu flag at all — matches the user's normal Chrome exactly
+               : ['--enable-unsafe-webgpu']),
+           // [overlay-teardown-race] crbug 948249 / issues.chromium.org/40621077: on macOS
+           // ANGLE-Metal, viz promotes the worker-owned OffscreenCanvas backbuffer to a
+           // CALayer/IOSurface overlay SharedImage every present; a mailbox is torn down
+           // before scan-out -> ProduceOverlay "non-existent mailbox" -> "Invalid mailbox"
+           // -> GPU process dies ~512 presents. Disabling overlay/delegated compositing
+           // removes that present path. Set PROBE_DISABLE_OVERLAYS=0 to A/B against it.
+           ...((process.env.PROBE_DISABLE_OVERLAYS === '0') ? [] :
+               ['--disable-features=DelegatedCompositing,UseMultipleOverlays,MacOverlays,CanvasOopRasterization',
+                '--disable-mac-overlays']),
            `--js-flags=--max-old-space-size=4096 ${process.env.PROBE_JS_FLAGS || '--no-liftoff'}`,
            // [cache-bust] disable Chrome's HTTP cache so pthread WORKERS (which
            // fetch dolphin_worker.js / emcc.js / .wasm by bare name, outside the
@@ -109,8 +135,12 @@ function startServer() {
            '--disk-cache-size=1', '--disable-application-cache', '--disable-back-forward-cache',
            '--disable-dev-shm-usage'],
     protocolTimeout: 600000,
+    dumpio: !!process.env.PROBE_DUMPIO,  // pipe Chrome stdout/stderr (GPU crash reason)
   });
   const page = await browser.newPage();
+  // GPU-process / page crash reason capture (ANGLE-Metal crash diagnosis).
+  page.on('crash', () => console.log('[probe] PAGE CRASHED (renderer/GPU process died)'));
+  page.on('error', (e) => console.log('[probe] PAGE ERROR: ' + (e && e.message)));
 
   const buckets = {
     worker: [],
@@ -349,6 +379,390 @@ function startServer() {
   // PROBE_SHOT="/tmp/x.png@50000" → CDP compositor screenshot at that offset.
   // Captures the composited page incl. the worker-owned OffscreenCanvas, which
   // main-thread getImageData cannot reach.
+  // [phase-snap] periodic phase progress for nondeterminism diffing: every 20s print
+  // one line of the boot-progress markers (probe-side page.evaluate; no runtime cost).
+  const _frameMilestones = {};  // [determinism] xpc at first cross of fixed guest frames
+  const _fineMiles = {};
+  const _fineTimer = setInterval(async () => {
+    try {
+      const s = await page.evaluate(() => {
+        try {
+          if (!window.sharedMemory) return null;
+          const A = new Uint32Array(window.sharedMemory.buffer);
+          const f = A[0x026B0930 >> 2] >>> 0;
+          const c = A[0x0250002C >> 2] >>> 0;
+          const xpc = c ? (A[c >> 2] >>> 0).toString(16) + ':' + (A[(c + 0x2E0) >> 2] >>> 0).toString(16) : '0';
+          return { f, xpc };
+        } catch (e) { return null; }
+      });
+      if (!s) return;
+      for (const M of [40, 50, 60, 80, 120]) {
+        if (!_fineMiles[M] && (s.f >>> 0) >= M) {
+          _fineMiles[M] = s;
+          console.log('[fine-mile] F' + M + ' frames=' + s.f + ' xpc=' + s.xpc);
+        }
+      }
+    } catch (e) {}
+  }, 50);
+  _fineTimer.unref && _fineTimer.unref();
+  const phaseTimer = setInterval(async () => {
+    try {
+      const s = await page.evaluate(() => {
+        try {
+          if (!window.sharedMemory) return { wait: 1 };
+          const A = new Uint32Array(window.sharedMemory.buffer);
+          const m1 = A[0x02500020 >> 2] >>> 0;
+          const rd32 = (va) => {
+            if (!m1) return 0;
+            const u8 = new Uint8Array(window.sharedMemory.buffer);
+            const o = m1 + (va & 0x01FFFFFF);
+            return ((u8[o] << 24 | u8[o+1] << 16 | u8[o+2] << 8 | u8[o+3]) >>> 0);
+          };
+          return {
+            aramWrite: rd32(0x801D4908).toString(16),
+            omcurovl: rd32(0x801D3CE0).toString(16),
+            peFrames: A.length > 1 ? (A[0x026B0930 >> 2] >>> 0) : 0,
+            advN: A[0x026B0984 >> 2] >>> 0,
+            wgtLo: (A[0x026B0988 >> 2] >>> 0).toString(16),
+            ogtLo: (A[0x026B098C >> 2] >>> 0).toString(16),
+            evFired: A[0x026B0990 >> 2] >>> 0,
+            aid: A[0x026B0994 >> 2] >>> 0, aram: A[0x026B0998 >> 2] >>> 0, dsp: A[0x026B099C >> 2] >>> 0,
+            // [stub500 2026-07-09] the 0x500-spin autopsy: dump the guest instruction words at
+            // physical 0x500-0x51C (what the worker re-dispatches) + MEM[0xC0] (OSCurrentContext,
+            // the os-ready gate's subject). If 0x500=0x48000000 => `b .` (vector not installed).
+            stub500: [0,1,2,3,4,5,6,7].map(function(k){return (rd32(0x80000500 + k*4) >>> 0).toString(16);}).join(','),
+            osCtxC0: (rd32(0x800000C0) >>> 0).toString(16),
+            // [vec-spin worker autopsy] the 0x500 spin lives in the WORKER's region_dispatch loop.
+            // [vec-exit autopsy] attempts (worker loop, every vector dispatch) vs epilogue
+            // (block actually ran). attempts climb + epilogue flat => miss loop (no block runs).
+            vecAttempts: A[0x026B1800 >> 2] >>> 0, vecLastPc: (A[0x026B1804 >> 2] >>> 0).toString(16),
+            vecLastRdOk: A[0x026B1808 >> 2] >>> 0, vecLastNext: (A[0x026B180C >> 2] >>> 0).toString(16),
+            vecEpilogue: A[0x026B1810 >> 2] >>> 0, vecExitPc: (A[0x026B1814 >> 2] >>> 0).toString(16),
+            // [gekko vec-exit] the LIVE emitter (worker=gekko). gekkoExitN climbs + gekkoExitPc=0x500
+            // at the wedge => the gekko vector block commits its own start (outcome-1 bug, right file).
+            gekkoExitN: A[0x026B1818 >> 2] >>> 0, gekkoExitPc: (A[0x026B181C >> 2] >>> 0).toString(16),
+            // [step1 verify] dolphin retro-run PPC-dispatch count — MUST stay 0 post-takeover.
+            retroDispatch: A[0x025010D8 >> 2] >>> 0,
+            // [gate-soundness 2026-07-09] guest-EVENT-captured milestone (dolphin snapshots at the
+            // peFrames==40/50 SetFinish increment, NOT the wall-clock poll): pc + global_timer at
+            // the guest event. If these MATCH across rolls while the wall-clock fine-mile xpc
+            // scatters => boot is deterministic, the fine-mile gate is just phase-noisy.
+            gm40: (A[0x026B1824 >> 2] >>> 0).toString(16) + ':' + (A[0x026B1820 >> 2] >>> 0).toString(16),
+            gm50: (A[0x026B182C >> 2] >>> 0).toString(16) + ':' + (A[0x026B1828 >> 2] >>> 0).toString(16),
+            // [STEP 2 REDO acceptance] dSrr0 = the LIVE-loop worker inline-delivery channel
+            // (ppc_worker.js, FRESH cells — 0x0600 is AoT-pack-polluted, audit wf_fa7314c9).
+            // Assertions: dSrr0 >= 0x80000000 (valid interrupted pc, never 0/vector);
+            // dSrr0Msr & 0x87C0FFFF == dSrr0Msr AND (dSrr0Msr & 0x8000) != 0 (true SRR1 image, EE was set);
+            // dSrr0N grows post-takeover while extSeen FREEZES (EXT deliveries left dolphin entirely).
+            dSrr0: (A[0x026B0630 >> 2] >>> 0).toString(16), dSrr0Msr: (A[0x026B0634 >> 2] >>> 0).toString(16),
+            dSrr0N: A[0x026B0638 >> 2] >>> 0,
+            // [cfg-provenance — PERMANENT] the ACTIVE configuration this run verified against.
+            // cfg bits: 1=C-slice loop, 2=AoT enabled, 4=legacy JS loop. cfgLoopN = loop liveness.
+            // packLen = AoT pack byte length (regen fingerprint). A verify without these recorded
+            // is invalid (the dead-C-slice / stale-pack false-"done" class).
+            cfg: A[0x026B1840 >> 2] >>> 0, cfgLoopN: A[0x026B1848 >> 2] >>> 0,
+            packLen: A[0x026B1844 >> 2] >>> 0, packStamp: (A[0x026B184C >> 2] >>> 0).toString(16),
+            // [deliv-reconcile — PERMANENT] times the JS cursor adopted a dolphin-delivered redirect.
+            reconcileN: A[0x026B1904 >> 2] >>> 0,
+            // [gp-ring STEP 3 — PERMANENT] WPAR Atomics ring: head/tail (monotonic), producer
+            // fallbacks (bounded-wait exhausted -> sync mailbox), applied (consumer count).
+            gpRingHead: A[0x026C0000 >> 2] >>> 0, gpRingTail: A[0x026C0004 >> 2] >>> 0,
+            gpRingFall: A[0x026C000C >> 2] >>> 0, gpRingApplied: A[0x026C0010 >> 2] >>> 0,
+            // [wFrames STEP 5 — PERMANENT] worker-era UNIQUE presented frames (Presenter::ViSwap
+            // non-duplicate; VI CoreTiming-driven, valid under worker ownership — peFrames is not).
+            wFrames: A[0x026C0018 >> 2] >>> 0,
+            // [pollAdvance — PERMANENT] completion-wait jumps taken (episode-capped).
+            pollJumpN: A[0x026C0030 >> 2] >>> 0,
+            // packSrr0* = STALE AoT-pack guest-mtspr channel at 0x0600 (contamination monitor only).
+            packSrr0N: A[0x026B0608 >> 2] >>> 0,
+            gSrr0: (A[0x026B0610 >> 2] >>> 0).toString(16), gSrr0N: A[0x026B0618 >> 2] >>> 0,
+            // [stepA 2026-07-09] EXTERNAL_INT deferral↔commit accounting (identity:
+            // extSeen == extCommit + extEeRefuse + extVecDefer). Delta across snaps: if
+            // (extVecDefer+extSingleOwnerBlk) grows but extCommit is FLAT → deferred EXT
+            // bits DROPPED (gate is the wedge). decRefusals = DEC ee-refuse (sole owner 0938).
+            extSeen: A[0x026B0828 >> 2] >>> 0, extCommit: A[0x026B0974 >> 2] >>> 0,
+            extEeRefuse: A[0x026B0934 >> 2] >>> 0, extVecDefer: A[0x026B093C >> 2] >>> 0,
+            extSingleOwnerBlk: A[0x026B0824 >> 2] >>> 0, decRefusals: A[0x026B0938 >> 2] >>> 0,
+            // [dsp-probe 2026-07-09] DSP CPU-mailbox handshake. dspLoW FROZEN + dspHiR advancing
+            // => guest's LO store (consume trigger) never reaches dolphin (routing gap). dspMboxAtPoll
+            // bit31 set (0x8xxxxxxx) = what the spinning poll sees; dspMboxAfter should be 0x7xxxxxxx.
+            dspHiW: A[0x026B0A10 >> 2] >>> 0, dspLoW: A[0x026B0A14 >> 2] >>> 0,
+            dspRespRdN: A[0x026C0034 >> 2] >>> 0, dspRespVal: (A[0x026C0038 >> 2] >>> 0).toString(16),
+            dspUpdN: A[0x026C003C >> 2] >>> 0, dspPushN: A[0x026B1A20 >> 2] >>> 0,
+            dspHiPc: (A[0x026B1A28 >> 2] >>> 0).toString(16), dspLoPc: (A[0x026B1A2C >> 2] >>> 0).toString(16),
+            dspPushVal: (A[0x026B1A24 >> 2] >>> 0).toString(16),
+            dspHiR: A[0x026B0A18 >> 2] >>> 0,
+            dspMboxAfter: (A[0x026B0A1C >> 2] >>> 0).toString(16),
+            dspMboxAtPoll: (A[0x026B0820 >> 2] >>> 0).toString(16),
+            // [exi-cw-probe] EXI DMA_CONTROL writes reaching dolphin's ComplexWrite (count + last val).
+            exiCwN: A[0x026B0A20 >> 2] >>> 0, exiCwVal: (A[0x026B0A24 >> 2] >>> 0).toString(16),
+            exiCwPc: (A[0x026B1A1C >> 2] >>> 0).toString(16),
+            // [LO-dup] duplicate LO sends (re-executed-store class) + [slice-active] delivery defers
+            loDupN: A[0x026B1A08 >> 2] >>> 0, sliceDeferN: A[0x026B1A04 >> 2] >>> 0,
+            drawDoneN: A[0x026B1A34 >> 2] >>> 0,
+            gpSent: A[0x026B1A3C >> 2] >>> 0, gpArrived: A[0x026B1A40 >> 2] >>> 0,
+            wpDivergeN: A[0x026B1A44 >> 2] >>> 0,
+            // [xfb-live] FNV over 3 stripes of high MEM1 (arena-top XFB territory) — a
+            // CHANGING hash across snaps = CPU-decoded video (direct-to-XFB movie) living
+            // in guest RAM that the EFB-based present path never shows.
+            xfbAddr: (A[0x026B1A68 >> 2] >>> 0).toString(16),
+            xfbDims: (A[0x026B1A6C >> 2] >>> 0).toString(16),
+            ofReached: A[0x026B1B00 >> 2] >>> 0, voxCalled: A[0x026B1B04 >> 2] >>> 0,
+            xfbHash: m1 ? (() => {
+              const xa = A[0x026B1A68 >> 2] >>> 0; const pa = xa & 0x01FFFFFF;
+              if (!xa || pa > 0x017F0000) return 'noxfb';
+              let h = 0x811c9dc5;
+              for (let k = 0; k < 0x8000; k += 32) { h ^= A[(m1 + pa + k) >> 2]; h = (h * 0x01000193) >>> 0; }
+              return (h >>> 0).toString(16);
+            })() : '',
+            burstN: A[0x026B1A48 >> 2] >>> 0, wpAfter: (A[0x026B1A4C >> 2] >>> 0).toString(16),
+            distAfter: (A[0x026B1A50 >> 2] >>> 0).toString(16),
+            rgocN: A[0x026B1A54 >> 2] >>> 0, decIterN: A[0x026B1A58 >> 2] >>> 0,
+            gpbEarly: A[0x026B1AB0 >> 2] >>> 0, gpbAdv: A[0x026B1AB4 >> 2] >>> 0,
+            rgocChunks: A[0x026B1AB8 >> 2] >>> 0, sddDecode: A[0x026B1ABC >> 2] >>> 0,
+            bpTot: A[0x026B1AC0 >> 2] >>> 0, sddReg: A[0x026B1AC4 >> 2] >>> 0,
+            rpBefore: (A[0x026B1A5C >> 2] >>> 0).toString(16),
+            wrRpN: A[0x026B1A60 >> 2] >>> 0, wrDistN: A[0x026B1A64 >> 2] >>> 0,
+            // [render-gate] the MP4 main-loop skip flags (main.c:83): HuDvdErrWait@0x801D3A04
+            // (set by ToeThread's ToeDispCheck unless DVDGetDriveStatus==DVD_STATE_END),
+            // SR_ExecReset@0x801D3EC0, beforeDvdStatus@0x801D3AE0. Nonzero HuDvdErrWait =
+            // the game skips ALL rendering. (guest BE in SAB, byteswap.)
+            ffWinN: A[0x026B1A80 >> 2] >>> 0, ffCeilN: A[0x026B1A84 >> 2] >>> 0,
+            gpSent: A[0x026B1A3C >> 2] >>> 0, gpArrived: A[0x026B0F00 >> 2] >>> 0,
+            peFinEvt: A[0x026B1A8C >> 2] >>> 0, peFinEnSnap: A[0x026B1A90 >> 2] >>> 0,
+            peFinRaised: A[0x026B1A94 >> 2] >>> 0, gxFinHandlerN: A[0x026B1A98 >> 2] >>> 0,
+            // [drawdone] DrawDone byte @guest 0x801D45F0; DrawDoneCB @0x801D45EC. If DrawDone=1
+            // the handler ran+set it but the wake/visibility failed; =0 the handler never set it.
+            drawDone: m1 ? (new Uint8Array(window.sharedMemory.buffer)[m1 + 0x1D45F0]) : -1,
+            drawDoneCB: m1 ? ((() => { const v = A[(m1 + 0x1D45EC) >> 2] >>> 0;
+              return ((v>>>24)|((v>>>8)&0xFF00)|((v&0xFF00)<<8)|((v&0xFF)<<24))>>>0; })()).toString(16) : '',
+            globalCounter: m1 ? (() => { const v = A[(m1 + (0x801D3A54 - 0x80000000)) >> 2] >>> 0;
+              return ((v>>>24)|((v>>>8)&0xFF00)|((v&0xFF00)<<8)|((v&0xFF)<<24))>>>0; })() : 0,
+            renderGate: m1 ? (() => {
+              const bs = (ga) => { const v = A[(m1 + ((ga>>>0)-0x80000000)) >> 2] >>> 0;
+                return ((v>>>24)|((v>>>8)&0xFF00)|((v&0xFF00)<<8)|((v&0xFF)<<24))>>>0; };
+              return 'dvdErrWait=' + bs(0x801D3A04) + ' srReset=' + bs(0x801D3EC0)
+                + ' beforeDvdStatus=' + (bs(0x801D3AE0)|0);
+            })() : '',
+            dvdCmdN: A[0x026B1A70 >> 2] >>> 0, dvdCmd: (A[0x026B1A74 >> 2] >>> 0).toString(16),
+            dvdIntN: A[0x026B1A78 >> 2] >>> 0, dvdIntT: A[0x026B1A7C >> 2] >>> 0,
+            finInflight: A[0x026B1A30 >> 2] >>> 0,
+            // [token-scan] search FIFO memory behind cpWp (guest phys, 2KB window) for the
+            // draw-done BP pattern 61 45 00 00 02: present-behind-rp = decoder walked past
+            // it (decode/accounting); absent = the chunk never landed (target/attach).
+            tokenScan: m1 ? (() => {
+              const wp = A[0x026B0F28 >> 2] >>> 0;
+              if (!wp || wp > 0x01800000) return 'wp?';
+              const u8 = new Uint8Array(window.sharedMemory.buffer);
+              const base = m1 + Math.max(0, wp - 0x800), end = m1 + wp + 0x40;
+              let hits = [];
+              for (let a = base; a < end - 5 && hits.length < 4; a++)
+                if (u8[a] === 0x61 && u8[a+1] === 0x45 && u8[a+2] === 0 && u8[a+3] === 0 && u8[a+4] === 2)
+                  hits.push((a - m1).toString(16));
+              return hits.length ? hits.join(',') : 'none';
+            })() : '',
+            // [fifo-window] hex dump 0x345800..wp+0x20 (the two-token window) for offline
+            // GX disassembly — locating the one-byte framing desync.
+            fifoDump: m1 ? (() => {
+              const wp = A[0x026B0F28 >> 2] >>> 0;
+              if (!wp || wp > 0x01800000) return '';
+              const u8 = new Uint8Array(window.sharedMemory.buffer);
+              const lo = Math.max(0, wp - 0x700), hi = wp + 0x20;
+              let out = '';
+              for (let a = lo; a < hi; a++) out += u8[m1 + a].toString(16).padStart(2, '0');
+              return out;
+            })() : '',
+            // [sc-census] sc execs / 0xC00 deliveries / rfi execs — spurious-0xC00 discriminator
+            scExecN: A[0x026B1A0C >> 2] >>> 0, scDelivN: A[0x026B1A10 >> 2] >>> 0,
+            rfiExecN: A[0x026B1A14 >> 2] >>> 0,
+            // mailbox state @0x02000000 (MBX_OFF_*: cmd/arg0/reqReady@12/replyReady@20)
+            mbx: [A[0x02000000 >> 2], A[0x02000004 >> 2], A[(0x02000000 + 12) >> 2],
+                  A[(0x02000000 + 20) >> 2]].map(x => (x >>> 0).toString(16)).join('/'),
+            wpc: (A[0x02400000 >> 2] >>> 0).toString(16),
+            jsBase: (A[0x026B0E98 >> 2] >>> 0).toString(16),
+            realCtx: (A[0x0250002C >> 2] >>> 0).toString(16),
+            reread: (A[0x026B0E9C >> 2] >>> 0).toString(16),
+            smooth1: A[0x026B0E48 >> 2] >>> 0, smooth2: A[0x026B0E4C >> 2] >>> 0,
+            wgt: (A[0x0268000C >> 2] >>> 0).toString(16) + ':' + (A[0x02680008 >> 2] >>> 0).toString(16),
+            drainA: A[0x026B0EF0 >> 2] >>> 0, drainS: A[0x026B0EF4 >> 2] >>> 0,
+            ctf: A[(0x02680000 + 0x2C) >> 2] >>> 0,
+            cpDist: A[0x026B0EF8 >> 2] >>> 0, cpPumps: A[0x026B0EFC >> 2] >>> 0,
+            gpW: A[0x026B0F00 >> 2] >>> 0, gpD: A[0x026B0F04 >> 2] >>> 0,
+            gpDiscard: A[0x026B0F08 >> 2] >>> 0,
+            gpFifoW: A[0x026B0F0C >> 2] >>> 0, gpFifoDrop: A[0x026B0F10 >> 2] >>> 0,
+            gpSeals: A[0x026B0F14 >> 2] >>> 0, gpBursts: A[0x026B0F18 >> 2] >>> 0,
+            gpTrue: A[0x026B0F1C >> 2] >>> 0, gpCount: A[0x026B0F20 >> 2] >>> 0,
+            cpFlags: A[0x026B0F24 >> 2] >>> 0,
+            cpWp: (A[0x026B0F28 >> 2] >>> 0).toString(16), cpRp: (A[0x026B0F2C >> 2] >>> 0).toString(16),
+            resid: Array.from({length: 8}, (_, k) =>
+              (A[(0x026B0F30 >> 2) + k] >>> 0).toString(16).padStart(8, '0')).join(' '),
+            p4br: A[0x025010CC >> 2] >>> 0, svci: A[0x025010D0 >> 2] >>> 0, retror: A[0x025010D4 >> 2] >>> 0,
+            wring: Array.from({length: 16}, (_, k) =>
+              (A[(0x026B1000 >> 2) + ((((A[0x026B1404 >> 2] >>> 0) + 240 + k) & 255))] >>> 0).toString(16)).join(','),
+            pcringN: A[0x026B0E44 >> 2] >>> 0,
+            pcring: Array.from({length: 64}, (_, k) =>
+              (A[(0x026B0A40 >> 2) + ((((A[0x026B0E44 >> 2] >>> 0) + 192 + k) & 255))] >>> 0).toString(16)).join(','),
+            ring: Array.from({length: 4}, (_, k) =>
+              [A[(0x026B0940 >> 2) + k * 4] >>> 0, A[(0x026B0940 >> 2) + k * 4 + 1] >>> 0,
+               A[(0x026B0940 >> 2) + k * 4 + 2] >>> 0, A[(0x026B0940 >> 2) + k * 4 + 3] >>> 0]
+                .map(x => x.toString(16)).join('/')).join(','),
+            xpc: (() => { const c = A[0x0250002C >> 2] >>> 0; return c ?
+              (A[c >> 2] >>> 0).toString(16) + ':' + (A[(c + 0x2E0) >> 2] >>> 0).toString(16)
+              + ':' + (A[(c + 0x2EC) >> 2] >>> 0).toString(16) : '0'; })(),
+            gc: rd32(0x801D3A54) >>> 0,
+            xpc: (() => { const c=A[0x0250002C>>2]>>>0; return c ? (A[c>>2]>>>0).toString(16)+':'+(A[(c+0x2E0)>>2]>>>0).toString(16) : '0'; })(),
+            prcSleep: rd32(0x8042c340 + 0x24) >>> 0,
+            viFires: A[0x026B0834 >> 2] >>> 0, viAsserts: A[0x026B0838 >> 2] >>> 0,
+            viIR: (A[0x026B083C >> 2] >>> 0).toString(16),
+            exitReason: A[0x025000A4 >> 2] >>> 0,
+            ackPc: (A[0x026B1430 >> 2] >>> 0).toString(16), ackIters: A[0x026B1434 >> 2] >>> 0,
+            ackCompiles: A[0x026B1438 >> 2] >>> 0, ackN: A[0x026B143C >> 2] >>> 0,
+            ackMs: A[0x026B1444 >> 2] >>> 0, interpN: A[0x026B1440 >> 2] >>> 0,
+            spinN: A[0x026B1448 >> 2] >>> 0, spinEE1: A[0x026B144C >> 2] >>> 0, spinExc: (A[0x026B1450 >> 2] >>> 0).toString(16),
+            piCause: (A[0x026B1454 >> 2] >>> 0).toString(16), piMask: (A[0x026B1458 >> 2] >>> 0).toString(16),
+            rfiN: A[0x026B1470 >> 2] >>> 0, rfiMsrBefore: (A[0x026B1474 >> 2] >>> 0).toString(16),
+            rfiSrr1: (A[0x026B1478 >> 2] >>> 0).toString(16), rfiMsrAfter: (A[0x026B147C >> 2] >>> 0).toString(16),
+            rfiEELost: A[0x026B1480 >> 2] >>> 0,
+            mtmsrLowPc: (A[0x026B0620 >> 2] >>> 0).toString(16), mtmsrLowVal: (A[0x026B0624 >> 2] >>> 0).toString(16), mtmsrLowN: A[0x026B0628 >> 2] >>> 0,
+            b7a58N: A[0x026B0A34 >> 2] >>> 0, b7a58Next: (A[0x026B0A38 >> 2] >>> 0).toString(16),
+            b7a58Msr: (A[0x026B0A3C >> 2] >>> 0).toString(16), b7a58Exc: (A[0x026B0A40 >> 2] >>> 0).toString(16),
+            viCause: (A[0x026B0A44 >> 2] >>> 0).toString(16), viGlobal: (A[0x026B0A48 >> 2] >>> 0).toString(16),
+            viLocal: (A[0x026B0A50 >> 2] >>> 0).toString(16), viHwMask: (A[0x026B0A54 >> 2] >>> 0).toString(16), viCauseN: A[0x026B0A4C >> 2] >>> 0,
+            piMaskWrites: (() => { const hd = A[0x026B0B40 >> 2] >>> 0; const out = [];
+              for (let k = 0; k < 8; k++) { const b = (0x026B0A60 >> 2) + k * 6;
+                out.push('v=' + (A[b]>>>0).toString(16) + ' pc=' + (A[b+1]>>>0).toString(16) + ' lr=' + (A[b+2]>>>0).toString(16)
+                  + ' C4=' + (A[b+3]>>>0).toString(16) + ' C8=' + (A[b+4]>>>0).toString(16) + ' hw=' + (A[b+5]>>>0).toString(16)); }
+              return 'head=' + hd + ' | ' + out.join(' || '); })(),
+            viFlip: 'flag=' + (A[0x026B0D0C >> 2]>>>0) + ' newSW=0x' + (A[0x026B0D00 >> 2]>>>0).toString(16)
+              + ' prevSW=0x' + (A[0x026B0D04 >> 2]>>>0).toString(16) + ' pc=0x' + (A[0x026B0D08 >> 2]>>>0).toString(16)
+              + ' HWmask=0x' + (A[0x026B0D10 >> 2]>>>0).toString(16),
+            ilN: A[0x026B1484 >> 2] >>> 0, ilPc: (A[0x026B1488 >> 2] >>> 0).toString(16),
+            ilMsr: (A[0x026B148C >> 2] >>> 0).toString(16), ilExc: (A[0x026B1490 >> 2] >>> 0).toString(16), ilEE0: A[0x026B1494 >> 2] >>> 0,
+            piCtxExc: (A[0x026B145C >> 2] >>> 0).toString(16), piCtxMsr: (A[0x026B1460 >> 2] >>> 0).toString(16),
+            exiR: (A[0x026B1410 >> 2] >>> 0).toString(16) + '=' + (A[0x026B1414 >> 2] >>> 0).toString(16) + ' n' + (A[0x026B1418 >> 2] >>> 0),
+            exiW: (A[0x026B141C >> 2] >>> 0).toString(16) + '=' + (A[0x026B1420 >> 2] >>> 0).toString(16) + ' n' + (A[0x026B1424 >> 2] >>> 0),
+            // [snap-validate] identity checks: real SAB has this byteLength + mem1 slot
+            bl: window.sharedMemory.buffer.byteLength,
+            m1: m1.toString(16),
+            // [vi-wake characterization] MP4 retraceCount SDA @ guest 0x1D4428 (byteswapped)
+            // + the VI TFBL/BFBL XFB base regs the guest programs via VIFlush. If retrace
+            // climbs but the XFB regs never change post-takeover, the video thread never
+            // flushed; if retrace is frozen, the VI retrace arm never dispatched.
+            guestRetrace: m1 ? (() => { const v = A[(m1 + 0x1D4428) >> 2] >>> 0;
+              return ((v>>>24)|((v>>>8)&0xFF00)|((v&0xFF00)<<8)|((v&0xFF)<<24))>>>0; })() : 0,
+            // [thread-table] walk the guest OS active-thread list from __gCurrentThread
+            // (guest 0x800000E4; dolsdk OSThread: state@+0x2C8(u16) prio@+0x2D0
+            // waitQueue@+0x2DC linkActive@+0x2FC; OSContext srr0@+0x198 lr@+0x84).
+            // states: 1=READY 2=RUNNING 4=WAITING 8=MORIBUND.
+            guestThreads: m1 ? (() => {
+              const bs = (v) => ((v>>>24)|((v>>>8)&0xFF00)|((v&0xFF00)<<8)|((v&0xFF)<<24))>>>0;
+              const rd = (ga) => (ga && (ga>>>0) >= 0x80000000 && (ga>>>0) < 0x81800000)
+                ? bs(A[(m1 + ((ga>>>0) - 0x80000000)) >> 2] >>> 0) : 0;
+              // active queue head @0x800000DC (verified: MP4 OSCreateThread+0xC8 dol bytes
+              // 'lis r4,0x8000 ... stw r31,0xdc(r4)'); cur (0xE4) is NULL while SelectThread idles.
+              const head = bs(A[(m1 + 0xDC) >> 2] >>> 0);
+              const cur = bs(A[(m1 + 0xE4) >> 2] >>> 0);
+              const seen = new Set(); const out = ['cur=' + cur.toString(16)];
+              const emit = (t) => {
+                if (!t || seen.has(t) || seen.size > 15) return 0;
+                seen.add(t);
+                const st = rd(t + 0x2C8) >>> 16;
+                out.push((t>>>0).toString(16) + ':s' + st
+                  + ':p' + rd(t + 0x2D0)
+                  + ':q' + (rd(t + 0x2DC)>>>0).toString(16)
+                  + ':pc' + (rd(t + 0x198)>>>0).toString(16)
+                  + ':lr' + (rd(t + 0x84)>>>0).toString(16));
+                return t;
+              };
+              let n = head; while (n && emit(n)) n = rd(n + 0x2FC);
+              // wait-queue contents for the two observed queues: is the READY thread
+              // still LINKED in its old wait queue (torn wake: state flipped, dequeue
+              // lost) or fully dequeued (RunQueue enqueue lost)?
+              out.push('q5458=' + (rd(0x801a5458)>>>0).toString(16) + '/' + (rd(0x801a545C)>>>0).toString(16));
+              out.push('q45f4=' + (rd(0x801d45f4)>>>0).toString(16) + '/' + (rd(0x801d45f8)>>>0).toString(16));
+              // [scheduler-bits] 0x801a5458 IS RunQueue[8] (RunQueue base 0x801a5418 from
+              // OSWakeupThread+0x1c dol bytes, 8-byte entries) — the "wake" completed and
+              // the thread IS run-queued. SelectThread idles over it iff RunQueueBits
+              // (r13-0x70d0, bit 31-prio) is clear. Dump bits + hint via live gpr13.
+              try {
+                // r13 = 0x801db420, link-time constant (MP4 __init_registers+0x10 dol bytes:
+                // lis r13,0x801d; ori r13,r13,0xb420). RunQueueBits = r13-0x70d0 = 0x801d4350.
+                out.push('bits=' + (rd(0x801d4350)>>>0).toString(16)
+                  + ' hint=' + (rd(0x801d4354)>>>0).toString(16));
+              } catch (e) { out.push('bits-err'); }
+              return out.join(' ');
+            })() : '',
+          };
+        } catch (e) { return { err: String(e).slice(0, 60) }; }
+      });
+      console.log('[phase-snap] ' + JSON.stringify(s));
+      // [domino3 ring-bytestream] reconstruct the worker's recorded GX byte stream from the ring
+      // (0x026C0000 head, data @0x026C0040 = {width,val} pairs) and dump as hex ONCE post-takeover,
+      // so we can decode it offline and find where GX parsing desyncs before the SETDRAWDONE.
+      if (!global._ringDumped) {
+        try {
+          const hx = await page.evaluate(() => {
+            const A = new Uint32Array(window.sharedMemory.buffer);
+            if ((A[0x026A0000 >> 2] >>> 0) !== 1) return null;   // takeover only
+            const head = A[0x026C0000 >> 2] >>> 0;
+            if (head < 500) return null;                          // wait until a frame's worth pushed
+            const bytes = [];
+            const raw = [];   // per-entry {cumOff, w, v} near the divergence for FP-store diagnosis
+            for (let i = 0; i < head && i < 4096; i++) {
+              const b = (0x026C0040 + (i & 8191) * 8) >> 2;
+              const w = A[b] >>> 0, v = A[b + 1] >>> 0;
+              const cum = bytes.length;
+              if (cum >= 620 && cum <= 720) raw.push(cum + ':' + w + ':' + (v >>> 0).toString(16));
+              if (w === 1) bytes.push(v & 0xFF);
+              else if (w === 2) { bytes.push((v >>> 8) & 0xFF, v & 0xFF); }
+              else { bytes.push((v >>> 24) & 0xFF, (v >>> 16) & 0xFF, (v >>> 8) & 0xFF, v & 0xFF); }
+            }
+            const nd = A[0x026B1B90 >> 2] >>> 0;
+            const draws = [];
+            for (let d = 0; d < Math.min(nd, 24); d++) {
+              const s = (0x026B1AC8 + d * 8) >> 2;
+              draws.push((A[s] >>> 0) + 'x' + (A[s + 1] >>> 0));   // vertex_size x num_vertices
+            }
+            const nrp = A[0x026B1BF8 >> 2] >>> 0;
+            const rps = [];
+            const A8b = new Uint8Array(window.sharedMemory.buffer);
+            for (let r = 0; r < Math.min(nrp, 32); r++) {
+              const addr = (A[(0x026B2000 + r * 4) >> 2] >>> 0).toString(16);
+              let hb = '';
+              for (let k = 0; k < 32; k++) hb += A8b[0x026B2100 + r * 32 + k].toString(16).padStart(2, '0');
+              rps.push(addr + ':' + hb);
+            }
+            const nc = A[0x026B1BF0 >> 2] >>> 0;
+            const A8 = new Uint8Array(window.sharedMemory.buffer);
+            const dops = [];
+            for (let c = 0; c < Math.min(nc, 200); c++) dops.push(A8[0x026B1C00 + c].toString(16).padStart(2,'0') + ':' + A8[0x026B1E00 + c]);
+            const nwt = A[0x026B21F0 >> 2] >>> 0;
+            const wts = [];
+            for (let r = 0; r < Math.min(nwt, 96); r++) wts.push((A[(0x026B2200 + r * 4) >> 2] >>> 0).toString(16));
+            const gpwDrain = A[0x026B1A48 >> 2] >>> 0, gpwOther = A[0x026B1A4C >> 2] >>> 0;
+            const otherVals = [];
+            for (let r = 0; r < Math.min(gpwOther, 24); r++) otherVals.push((A[(0x026B2600 + r * 4) >> 2] >>> 0).toString(16));
+            return { head, hex: bytes.map(x => x.toString(16).padStart(2, '0')).join(''), nd, draws, nc, dops, nrp, rps, nwt, wts, raw, gpwDrain, gpwOther, otherVals };
+          });
+          if (hx) { global._ringDumped = true; console.log('[ring-bytes] head=' + hx.head + ' bytes=' + hx.hex.length/2 + ' hex=' + hx.hex);
+            console.log('[draws] nd=' + hx.nd + ' sizeXcount=' + hx.draws.join(','));
+            console.log('[dolphin-ops] nc=' + hx.nc + ' op:size=' + hx.dops.join(' '));
+            console.log('[fifo-rptr] nrp=' + hx.nrp + ' addr/word=' + hx.rps.join(' '));
+            console.log('[fifo-wtgt] nwt=' + hx.nwt + ' targets=' + hx.wts.join(' '));
+            console.log('[ring-raw] cum:w:v=' + hx.raw.join(' '));
+            console.log('[gpw-src] drainWrites=' + hx.gpwDrain + ' otherWrites=' + hx.gpwOther + ' otherVals=' + hx.otherVals.join(' ')); }
+        } catch (e) {}
+      }
+      for (const M of [100, 300, 500, 1000]) {
+        if (!_frameMilestones[M] && (s.peFrames >>> 0) >= M) {
+          _frameMilestones[M] = { frames: s.peFrames, xpc: s.xpc || (s.gc), aram: s.aramWrite };
+          console.log('[frame-milestone] F' + M + ' ' + JSON.stringify(_frameMilestones[M]));
+        }
+      }
+    } catch (e) {}
+  }, 20000);
+  phaseTimer.unref && phaseTimer.unref();
+
   (process.env.PROBE_SHOT || '').split(',').filter(Boolean).forEach((spec) => {
     const m = spec.trim().match(/^(.+)@(\d+)$/);
     if (!m) { console.log('[probe] PROBE_SHOT spec ignored: ' + spec); return; }
@@ -501,6 +915,231 @@ function startServer() {
       new Promise((res) => setTimeout(() => res({ found: false, note: 'canvasInfo-timeout (main thread saturated)' }), 15000)),
     ]);
   } catch (e) { canvasInfo = { found: false, note: 'canvasInfo-error: ' + e.message }; }
+
+  // [si-final] Page-poll-independent SI-crash detection: read the [si-cb] SAB slots
+  // (0x026B0920 r4 / 0x0924 cbPre / 0x0928 cbPost / 0x092C count) directly at exit.
+  // The gamecube.html [collapse-accept] poll proved unreliable (silently absent on
+  // some runs), making "no siN=1 line" indistinguishable from "no crash".
+  try {
+    const siFinal = await Promise.race([
+      page.evaluate(() => {
+        try {
+          const A = new Uint32Array(sharedMemory.buffer);
+          // [seq-ring] dump: 16 entries of [tag, gt_lo, r1, aux] @0x026B0D10, idx @0x026B0D00.
+          const idx = A[0x026B0D00 >> 2] >>> 0;
+          const names = ['?', 'PADRead', 'OSDispInt', 'SIGetType', 'SIGetResp', 'PADMotor', 'SIGetTypeAsync',
+                         'post413', 'postMemcpyE', 'postSIDisPoll', 'postMemcpyH', 'post397', 'memcpy33a8', 'postStmw', 'SITransfer', 'eaWatch', 'eaWatchStmw', 'eaWatchX', 'eaWatchFP', 'hostW32'];
+          const seq = [];
+          for (let k = 0; k < 16; k++) {
+            const e = (0x026B0D10 + (((idx - 16 + k) & 15) << 4)) >> 2;
+            const tag = A[e] >>> 0;
+            if (!tag) continue;
+            seq.push((names[tag] || tag) + ' gt=' + (A[e + 1] >>> 0)
+              + ' r1=' + (A[e + 2] >>> 0).toString(16) + ' aux=' + (A[e + 3] >>> 0).toString(16));
+          }
+          // [vec-dump] raw guest bytes at exception vectors 0x500/0x800/0x900 (BE words).
+          const m1 = A[0x02500020 >> 2] >>> 0;
+          const vecs = {};
+          if (m1) {
+            const u8 = new Uint8Array(sharedMemory.buffer);
+            for (const v of [0x500, 0x800, 0x900, 0xC00]) {
+              let s = '';
+              for (let k = 0; k < 16; k++) {
+                const o = m1 + v + k * 4;
+                s += ((u8[o] << 24 | u8[o+1] << 16 | u8[o+2] << 8 | u8[o+3]) >>> 0).toString(16).padStart(8, '0') + ' ';
+              }
+              vecs['v' + v.toString(16)] = s.trim();
+            }
+          }
+          // [ctx-hunt] scan MEM1 for OSContext structs whose SRR0 field (+0x198) = the
+          // default handler 0x800b4c54 — the source of the r1=0 rfi orbit.
+          const hunts = [];
+          if (m1) {
+            const u8h = new Uint8Array(sharedMemory.buffer);
+            for (let a = 0; a < 0x01800000 - 4; a += 4) {
+              const o = m1 + a;
+              if (u8h[o] === 0x80 && u8h[o+1] === 0x0b && u8h[o+2] === 0x4c && u8h[o+3] === 0x54) {
+                // if this is a context's SRR0, the struct starts at a-0x198; gpr[1] at +0x04.
+                const cs = a - 0x198;
+                let g1 = -1;
+                if (cs >= 0) {
+                  const go = m1 + cs + 4;
+                  g1 = ((u8h[go] << 24 | u8h[go+1] << 16 | u8h[go+2] << 8 | u8h[go+3]) >>> 0);
+                }
+                hunts.push('0x' + (0x80000000 + a >>> 0).toString(16) + (g1 === 0 ? '(CTX! r1=0)' : ''));
+                if (hunts.length >= 10) break;
+              }
+            }
+          }
+          // [boot-watch] logo-scene progress: wipeData (0x80192360: mode/type/frame counters),
+          // omovlevtno, TB via ctx (spr TBL @ ctx? read global_timer SAB), sampled at exit.
+          const bw = {};
+          if (m1) {
+            const u8b = new Uint8Array(sharedMemory.buffer);
+            const rd32 = (va) => {
+              const o = m1 + (va & 0x01FFFFFF);
+              return ((u8b[o] << 24 | u8b[o+1] << 16 | u8b[o+2] << 8 | u8b[o+3]) >>> 0);
+            };
+            bw.wipe0 = rd32(0x80192360).toString(16);   // wipeData.mode/type
+            bw.wipe4 = rd32(0x80192364).toString(16);   // wipeData +4 (frame/duration)
+            bw.wipe8 = rd32(0x80192368).toString(16);
+            bw.omovlevtno = rd32(0x801D3CD4).toString(16);
+            bw.omovlstat = rd32(0x801D3CCC).toString(16);  // overlay-load state machine
+            bw.omcurovl  = rd32(0x801D3CE0).toString(16);  // current overlay (-1 = none)
+            bw.omovlhisidx = rd32(0x801D3CD8).toString(16);
+            bw.aramWrite = rd32(0x801D4908).toString(16);  // upload progress pointer
+            bw.aramTop = rd32(0x801D490C).toString(16);
+            bw.arqValid = rd32(0x801D02B8).toString(16);    // aramQueueLo.valid (spin condition)
+            bw.exc = (A[(0x02400000 + 0x2EC) >> 2] >>> 0).toString(16);
+            bw.msr = (A[(0x02400000 + 0x2E0) >> 2] >>> 0).toString(16);
+            bw.pc  = (A[0x02400000 >> 2] >>> 0).toString(16);
+            bw.srr0 = (A[(0x02400000 + 0x340 + 26 * 4) >> 2] >>> 0).toString(16);
+            bw.srr1 = (A[(0x02400000 + 0x340 + 27 * 4) >> 2] >>> 0).toString(16);
+            bw.dar  = (A[(0x02400000 + 0x340 + 19 * 4) >> 2] >>> 0).toString(16);
+            bw.dsisr= (A[(0x02400000 + 0x340 + 18 * 4) >> 2] >>> 0).toString(16);
+            // OS exception-handler table (0x80003000 + 4*i): junk entries = trampled table
+            let _ht = '';
+            for (let k = 0; k < 15; k++) _ht += rd32(0x80003000 + k * 4).toString(16) + ',';
+            bw.htab = _ht;
+            // [thread-walk] every OSThread on __OSActiveThreadQueue: state + saved srr0/lr/r1
+            // (OSThread: context@0 [srr0@+0x198, lr@+0x84, gpr1@+0x04], state@0x2C8,
+            //  linkActive@0x2FC per dolsdk OSThread.h). Names the sleeper + its wait site.
+            let tw = [];
+            let thr = rd32(0x800000DC);  // __OSActiveThreadQueue.head (verify vs symbols)
+            for (let k = 0; k < 12 && (thr >>> 28) === 8; k++) {
+              // stack backchain: 0(r1)=caller frame, 4(frame)=saved LR — the wait chain.
+              let chain = '';
+              let fr = rd32(thr + 0x04);
+              for (let d = 0; d < 8 && (fr >>> 28) === 8; d++) {
+                const slr = rd32(fr + 4);
+                if ((slr >>> 28) === 8) chain += slr.toString(16) + '>';
+                fr = rd32(fr);
+              }
+              tw.push('t=' + thr.toString(16)
+                + ' st=' + (rd32(thr + 0x2C8) >>> 16).toString(16)
+                + ' q=' + rd32(thr + 0x2DC).toString(16)
+                + ' srr0=' + rd32(thr + 0x198).toString(16)
+                + ' stk=' + chain);
+              thr = rd32(thr + 0x2FC);  // linkActive.next
+            }
+            bw.threads = tw;
+            // [prc-walk] HuPrc process list: processtop @0x801D3B44; Process: next@0,
+            // heap@0x18, exec@0x1C(u16), stat@0x1E(u16), prio@0x20, sleep_time@0x24,
+            // jump@0x2C (lr first word). exec: 0=NORMAL 1=SLEEP? (enum from decomp usage).
+            let pw = [];
+            let prc = rd32(0x801D3B44);
+            for (let k = 0; k < 10 && (prc >>> 28) === 8; k++) {
+              const execStat = rd32(prc + 0x1C);
+              pw.push('p=' + prc.toString(16)
+                + ' exec=' + ((execStat >>> 16) & 0xFFFF).toString(16)
+                + ' stat=' + (execStat & 0xFFFF).toString(16)
+                + ' sleep=' + (rd32(prc + 0x24) | 0)
+                + ' lr=' + rd32(prc + 0x30).toString(16)   // jump @0x30 (jmp_buf align-8: flt_regs doubles)
+                + ' sp=' + rd32(prc + 0x38).toString(16)
+                + ' stk=' + (function (sp0) {
+                    let s = '', fr = sp0;
+                    for (let d = 0; d < 6 && (fr >>> 28) === 8; d++) {
+                      const slr = rd32(fr + 4);
+                      if ((slr >>> 28) === 8) s += slr.toString(16) + '>';
+                      fr = rd32(fr);
+                    }
+                    return s;
+                  })(rd32(prc + 0x38)));
+              prc = rd32(prc);
+            }
+            bw.prcs = pw;
+            // [dvd-state] guest DVD driver: executing @0x801D43D0 (current command block,
+            // stuck-nonzero = completion lost), DVDInitialized @0x801D4410.
+            // what lives at the odd frame target 0x80df42e0 (code or data?)
+            let dfw = '';
+            for (let k = 0; k < 8; k++) dfw += rd32(0x80df42c0 + k * 4).toString(16).padStart(8, '0') + ' ';
+            bw.df = dfw;
+            bw.globalCounter = rd32(0x801D3A54) >>> 0;  // main-loop frame count @GlobalCounter
+            // [aram-diag 2026-07-16] ARAM-DMA-complete interrupt delivery chain, post-takeover:
+            bw.aramComplete = A[0x026B2700 >> 2] >>> 0;   // ARAMint completion event fired (dolphin)
+            bw.aramIntActive = A[0x026B2704 >> 2] >>> 0;  // INT_ARAM bit in DSP_CONTROL
+            bw.aramIntsSet = A[0x026B2708 >> 2] >>> 0;    // passed DSP_CONTROL enable check
+            bw.dspPending = A[0x026B270C >> 2] >>> 0;     // INT_CAUSE_DSP pending in eff_cause
+            bw.dspToExt = A[0x026B2710 >> 2] >>> 0;       // passed PI mask -> EXT set in worker Exceptions
+            bw.dspCrWrite = A[0x026B2714 >> 2] >>> 0;     // guest DSP_CR (0xCC00500A) writes reaching dolphin
+            bw.dspAramAck = A[0x026B2718 >> 2] >>> 0;     // DSP_CR writes with ARAM-clear bit (the ack)
+            bw.enDSP = A[0x026B271C >> 2] >>> 0;          // INT_DSP enabled+active (mailbox)
+            bw.enARAM = A[0x026B2720 >> 2] >>> 0;         // INT_ARAM enabled+active
+            bw.enAID = A[0x026B2724 >> 2] >>> 0;          // INT_AID enabled+active (audio interface DMA)
+            bw.peFrames = A[0x026B0930 >> 2] >>> 0;        // SetFinish counter (SAB, replaces [ax-pe] print)
+            bw.eeViolations = A[0x026B0934 >> 2] >>> 0;    // Step-2 tripwire: EXT delivered at EE=0 (must be 0)
+            // [crash-ctx] the OS exception context (0x801a5b38 in every captured dump):
+            // srr0/srr1 at +0x198/+0x19C = the crash-moment pc/msr, readable without
+            // waiting for the guest's minutes-long EXI report print.
+            bw.crashSrr0 = rd32(0x801a5b38 + 0x198).toString(16);
+            bw.crashSrr1 = rd32(0x801a5b38 + 0x19C).toString(16);
+            bw.crashLr   = rd32(0x801a5b38 + 0x84).toString(16);
+            bw.crashR1   = rd32(0x801a5b38 + 0x04).toString(16);
+            bw.decRefusals = A[0x026B0938 >> 2] >>> 0;     // DEC EE-gate refusals (now sole owner of 0938)
+            // [stepA 2026-07-09] EXTERNAL_INT deferral↔commit accounting. Identity:
+            //   extSeen == extCommit + extEeRefuse + extVecDefer   (calls that passed single-owner gate)
+            // Two-snapshot delta test: if (extVecDefer + extSingleOwnerBlock) grows but extCommit
+            // is FLAT, deferred EXT bits are being DROPPED (my gate is the wedge, not a device).
+            bw.extSeen           = A[0x026B0828 >> 2] >>> 0; // EXT reached delivery logic (pre-gate)
+            bw.extEeRefuse       = A[0x026B0934 >> 2] >>> 0; // EXT ee-gate refusals (same cell as eeViolations)
+            bw.extVecDefer       = A[0x026B093C >> 2] >>> 0; // EXT vector-page (stub) defers — clean cell
+            bw.extSingleOwnerBlk = A[0x026B0824 >> 2] >>> 0; // single-owner-gate blocks w/ EXT pending (no cmd-10)
+            bw.extCommit         = A[0x026B0974 >> 2] >>> 0; // EXT committed deliveries (TRUE deliver count)
+            bw.delivRing = Array.from({length: 4}, (_, k) =>
+              [A[(0x026B0940 >> 2) + k * 4 + 1] >>> 0, A[(0x026B0940 >> 2) + k * 4 + 2] >>> 0,
+               A[(0x026B0940 >> 2) + k * 4 + 3] >>> 0].map(x => x.toString(16)).join('/'));
+            bw.delivHead = A[0x026B0970 >> 2] >>> 0;
+            bw.vecTrace = Array.from({length: 18}, (_, k) =>
+              (A[(0x026B0E50 >> 2) + k] >>> 0).toString(16)).join(',');
+            // [isr-trace] blocks executed after the most recent delivery: the deliv-ring's
+            // newest entry stamps the wasm-ring head; dump ring[stamp..stamp+32].
+            {
+              const hd = ((A[0x026B0970 >> 2] >>> 0) + 3) & 3;
+              const stamp = A[(0x026B0940 >> 2) + hd * 4 + 3] >>> 0;
+              bw.isrTrace = Array.from({length: 32}, (_, k) =>
+                (A[(0x026B1000 >> 2) + ((stamp + k) & 255)] >>> 0).toString(16)).join(',');
+              bw.isrStamp = stamp;
+              bw.wasmHead = A[0x026B1404 >> 2] >>> 0;
+            }
+            bw.wasmRing = Array.from({length: 16}, (_, k) =>
+              (A[(0x026B0EA0 >> 2) + ((((A[0x026B0EE0 >> 2] >>> 0) + k) & 15))] >>> 0).toString(16)).join(',');
+            // p2 raw frame words (jump.sp of process 2): first 3 frames unfiltered
+            bw.dvdExecuting = rd32(0x801D43D0).toString(16);
+            bw.dvdInit = rd32(0x801D4410).toString(16);
+            if ((rd32(0x801D43D0) >>> 28) === 8) {
+              const cb = rd32(0x801D43D0);
+              bw.dvdCmd = rd32(cb + 0x8).toString(16) + '/state=' + rd32(cb + 0xC).toString(16);
+            }
+            // If the guest is in the printf/fwrite path, dump the strings at r3/r4/r5 —
+            // likely the MUSY_ASSERT/OSPanic text that never reaches a console.
+            const rdstr = (va) => {
+              if ((va >>> 28) !== 8) return '';
+              let s = '';
+              for (let k = 0; k < 120; k++) {
+                const ch = u8b[m1 + ((va + k) & 0x01FFFFFF)];
+                if (ch === 0) break;
+                s += (ch >= 32 && ch < 127) ? String.fromCharCode(ch) : '.';
+              }
+              return s;
+            };
+            bw.r3s = rdstr(A[(0x02400000 + 0x20) >> 2] >>> 0);
+            bw.r4s = rdstr(A[(0x02400000 + 0x24) >> 2] >>> 0);
+            bw.r5s = rdstr(A[(0x02400000 + 0x28) >> 2] >>> 0);
+            bw.r31s = rdstr(A[(0x02400000 + 0x18 + 30 * 4) >> 2] >>> 0);
+            bw.gtl = (A[(0x02690000) >> 2] >>> 0).toString(16);  // CT global_timer lo (if mapped)
+          }
+          return { bw, hunts, vecs,
+                   siN: A[0x026B092C >> 2] >>> 0,
+                   cbPre: (A[0x026B0924 >> 2] >>> 0).toString(16),
+                   cbPost: (A[0x026B0928 >> 2] >>> 0).toString(16),
+                   retired: A[0x026B0800 >> 2] >>> 0,
+                   seqN: idx, seq };
+        } catch (e) { return { err: '' + e }; }
+      }),
+      new Promise((res) => setTimeout(() => res({ err: 'si-final timeout' }), 10000)),
+    ]);
+    console.log('[si-final] ' + JSON.stringify(siFinal));
+  } catch (_e) { console.log('[si-final] {"err":"evaluate failed"}'); }
 
   try { await browser.close(); } catch (_e) {}
   srv.close();

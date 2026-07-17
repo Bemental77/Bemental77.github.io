@@ -111,11 +111,18 @@ bool VideoSoftware::Initialize(const WindowSystemInfo& wsi)
 
   Clipper::Init();
   Rasterizer::Init();
+  // Spawn the persistent tile-parallel raster worker pool (strategy B). Workers park on a real
+  // pthread condvar until DrawTriangleFrontFace dispatches per-band jobs. Joined in Shutdown().
+  Rasterizer::InitWorkerPool();
 
+#ifdef __LIBRETRO__
   std::unique_ptr<SWGfx> gfx =
       (g_libretro_swgfx_factory && wsi.type == WindowSystemType::Libretro) ?
           g_libretro_swgfx_factory(std::move(window)) :
           std::make_unique<SWGfx>(std::move(window));
+#else
+  std::unique_ptr<SWGfx> gfx = std::make_unique<SWGfx>(std::move(window));
+#endif
 
   return InitializeShared(std::move(gfx),
                           std::make_unique<SWVertexLoader>(), std::make_unique<PerfQuery>(),
@@ -125,6 +132,7 @@ bool VideoSoftware::Initialize(const WindowSystemInfo& wsi)
 
 void VideoSoftware::Shutdown()
 {
+  Rasterizer::ShutdownWorkerPool();
   ShutdownShared();
 }
 }  // namespace SW

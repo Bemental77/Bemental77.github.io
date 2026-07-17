@@ -51,6 +51,12 @@ void Init()
   mgr->SetEnable(Common::Log::LogType::BOOT,               true);
   mgr->SetEnable(Common::Log::LogType::CORE,               true);
   mgr->SetEnable(Common::Log::LogType::OSHLE,              true);  // short name "HLE"
+  // OSREPORT is the GAME's own debug output (OSReport: "Rest Memory", "ARAM Trans",
+  // "DLL DBG OUT", ...). Games like MP4 spam it every boot step; with DevTools open
+  // Chrome rendering that flood throttles the emulator. It is noise for players ->
+  // disabled. Re-enable only when debugging guest boot.
+  // [crash-narrate 2026-07-07 TEMP] guest reached PPCHalt post-takeover — its
+  // OSReport crash message names the unhandled exception. Re-enabled to read it.
   mgr->SetEnable(Common::Log::LogType::OSREPORT,           true);
   mgr->SetEnable(Common::Log::LogType::OSREPORT_HLE,       true);
   mgr->SetEnable(Common::Log::LogType::SYMBOLS,            true);
@@ -62,19 +68,26 @@ void Init()
   // PAD - Get Origin between Arena and game-code entry; none of those
   // surfaced in wasm before because the LogType was disabled at the source).
   mgr->SetEnable(Common::Log::LogType::DSPHLE,             true);
-  mgr->SetEnable(Common::Log::LogType::DSP_MAIL,           true);
-  mgr->SetEnable(Common::Log::LogType::DSPINTERFACE,       true);
-  mgr->SetEnable(Common::Log::LogType::AUDIO,              true);
-  mgr->SetEnable(Common::Log::LogType::AUDIO_INTERFACE,    true);  // [AI]
-  mgr->SetEnable(Common::Log::LogType::SERIALINTERFACE,    true);  // [SI]
-  mgr->SetEnable(Common::Log::LogType::PROCESSORINTERFACE, true);  // [PI]
-  mgr->SetEnable(Common::Log::LogType::EXPANSIONINTERFACE, true);  // [EXI]
-  mgr->SetEnable(Common::Log::LogType::POWERPC,            true);  // DBAT updated, MMU events
-  mgr->SetEnable(Common::Log::LogType::VIDEOINTERFACE,     true);  // [VI]
-  mgr->SetEnable(Common::Log::LogType::PIXELENGINE,        true);  // [PE] — ax-pe trace
-  mgr->SetEnable(Common::Log::LogType::DVDINTERFACE,       true);  // [DVD]
-  mgr->SetEnable(Common::Log::LogType::FILEMON,            true);  // file access
-  mgr->SetEnable(Common::Log::LogType::DISCIO,             true);  // disc IO
+  mgr->SetEnable(Common::Log::LogType::EXPANSIONINTERFACE, true);  // [EXI] (boot, low-freq)
+  mgr->SetEnable(Common::Log::LogType::DISCIO,             true);  // disc IO (low-freq)
+
+  // PER-FRAME FLOOD types DISABLED: the native-vs-wasm bring-up diagnosis is done
+  // (render fixed 2026-06-25). At NOTICE these [ax-*] traces flooded the page console
+  // every VI write / vcount read / FIFO run / PE finish / DMA / SI xfer — with DevTools
+  // open that backs up the main thread and stalls the emulator multi-second. POWERPC
+  // carries ~27 of these ([ax-vi-timing/beam], [ax-fifo], [ax-di], [ax-present], etc.) so
+  // it is disabled too. Re-enable individually only when diagnosing.
+  mgr->SetEnable(Common::Log::LogType::POWERPC,            false);
+  mgr->SetEnable(Common::Log::LogType::DSP_MAIL,           false);
+  mgr->SetEnable(Common::Log::LogType::DSPINTERFACE,       false);
+  mgr->SetEnable(Common::Log::LogType::AUDIO,              false);
+  mgr->SetEnable(Common::Log::LogType::AUDIO_INTERFACE,    false);  // [AI] [ei-trace]
+  mgr->SetEnable(Common::Log::LogType::SERIALINTERFACE,    false);  // [SI]
+  mgr->SetEnable(Common::Log::LogType::PROCESSORINTERFACE, false);  // [PI]
+  mgr->SetEnable(Common::Log::LogType::VIDEOINTERFACE,     false);  // [VI] [ax-vi-ack]
+  mgr->SetEnable(Common::Log::LogType::PIXELENGINE,        false);  // [PE] [ax-pe]
+  mgr->SetEnable(Common::Log::LogType::DVDINTERFACE,       false);  // [DVD]
+  mgr->SetEnable(Common::Log::LogType::FILEMON,            false);  // file access
 }
 
 void Shutdown()

@@ -1135,6 +1135,92 @@ static bool test_stw_fast_path() {
         && buffer[2] == 0x56 && buffer[3] == 0x78;
 }
 
+// [dcbz-fastpath 2026-07-15] dcbz inline fill: classify-admitted RAM line is
+// zeroed with four in-wasm i64.stores (Jit64 parity). mem1_mask == ram_size-1
+// so fast_ok holds (the production config shape). Buffer pre-filled 0xAA;
+// dcbz 0,r4 with r4=0x80000020 zeroes bytes [32,64) and leaves [0,32) intact.
+static bool test_dcbz_line_zero_fastmem() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    u8 buffer[64];
+    for (u32 i = 0; i < 64u; ++i) buffer[i] = 0xAA;
+    const u32 host_buffer_addr = (u32)(uintptr_t)&buffer[0];
+    env.gpr(4) = 0x80000020u;
+    u32 insts[] = { (31u << 26) | (0u << 16) | (4u << 11) | (1014u << 1) };  // dcbz 0,r4
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc,
+                            host_buffer_addr, 63u, 64u)) return false;
+    bool low_intact = true, high_zero = true;
+    for (u32 i = 0; i < 32u; ++i)  if (buffer[i] != 0xAA) low_intact = false;
+    for (u32 i = 32u; i < 64u; ++i) if (buffer[i] != 0x00) high_zero = false;
+    std::printf("[diag dcbz-fill] next=0x%x lowIntact=%d highZero=%d\n",
+                (u32)next_pc, (int)low_intact, (int)high_zero);
+    return next_pc == (s32)(PC + 4u) && low_intact && high_zero;
+}
+
+// dcbz with an unaligned EA rounds DOWN to the 32-byte line (EA & ~31):
+// r3=0x80000000 r4=0x3C -> EA 0x8000003C -> line 0x80000020 -> zero [32,64).
+static bool test_dcbz_unaligned_rounds_down() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    u8 buffer[64];
+    for (u32 i = 0; i < 64u; ++i) buffer[i] = 0x55;
+    const u32 host_buffer_addr = (u32)(uintptr_t)&buffer[0];
+    env.gpr(3) = 0x80000000u;
+    env.gpr(4) = 0x0000003Cu;
+    u32 insts[] = { (31u << 26) | (3u << 16) | (4u << 11) | (1014u << 1) };  // dcbz r3,r4
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc,
+                            host_buffer_addr, 63u, 64u)) return false;
+    bool low_intact = true, high_zero = true;
+    for (u32 i = 0; i < 32u; ++i)  if (buffer[i] != 0x55) low_intact = false;
+    for (u32 i = 32u; i < 64u; ++i) if (buffer[i] != 0x00) high_zero = false;
+    std::printf("[diag dcbz-align] next=0x%x lowIntact=%d highZero=%d\n",
+                (u32)next_pc, (int)low_intact, (int)high_zero);
+    return next_pc == (s32)(PC + 4u) && low_intact && high_zero;
+}
+
+// dcbz to a classify-REJECTED EA (0xCC005000, MMIO) must take the interp
+// fallback (Interpreter::dcbz owns direct-store/DSI semantics) and must NOT
+// touch the RAM window.
+static bool test_dcbz_mmio_falls_back_to_interp() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80003000;
+    u8 buffer[64];
+    for (u32 i = 0; i < 64u; ++i) buffer[i] = 0x77;
+    const u32 host_buffer_addr = (u32)(uintptr_t)&buffer[0];
+    env.gpr(4) = 0xCC005000u;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_interp_calls = [];
+        Module.__saved_interp = Module.bemental_imports.env.ppc_interp;
+        Module.bemental_imports.env.ppc_interp = function(inst, addr) {
+            Module.test_interp_calls.push([inst >>> 0, addr >>> 0]);
+        };
+    });
+#endif
+    u32 insts[] = { (31u << 26) | (0u << 16) | (4u << 11) | (1014u << 1) };  // dcbz 0,r4
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, 1, &next_pc,
+                                         host_buffer_addr, 63u, 64u);
+#ifdef __EMSCRIPTEN__
+    const u32 n_interp = (u32)EM_ASM_INT({ return Module.test_interp_calls.length | 0; });
+    const u32 ia = (u32)EM_ASM_INT({ return (Module.test_interp_calls[0] || [0, 0])[1] | 0; });
+    EM_ASM({ Module.bemental_imports.env.ppc_interp = Module.__saved_interp; });
+#else
+    const u32 n_interp = 1, ia = PC;
+#endif
+    if (!dispatched) return false;
+    bool ram_intact = true;
+    for (u32 i = 0; i < 64u; ++i) if (buffer[i] != 0x77) ram_intact = false;
+    std::printf("[diag dcbz-mmio] n_interp=%u addr=0x%x ramIntact=%d\n",
+                n_interp, ia, (int)ram_intact);
+    return n_interp == 1u && ia == PC && ram_intact;
+}
+
 // Block with no terminator (count cap reached without hitting a branch).
 // Trailing fallback emits set_pc(next_pc) + return. next_pc must be
 // start_pc + count*4.
@@ -1660,7 +1746,223 @@ static bool test_ps_merge10_alias_fd_eq_fa() {
     return ps0 == F1_PS1 && ps1 == F0_PS0;
 }
 
+// ===========================================================================
+// +2 RELOCATION REPRODUCTION (task 2026-06-23). The live MP4 boot wedge:
+// the JIT mis-relocates EVERY R_PPC_ADDR16_LO by +2 while R_PPC_ADDR16_HA is
+// correct. dolsdk Relocate() compiles the two arms as:
+//   LO: lwz r0,4(r30); add r0,r5,r0; sth r0,0(r28)   <- add rt==rb (rt=r0,rb=r0)
+//   HA: lwz r0,4(r30); add r4,r5,r0; ...             <- add rt!=rb (rt=r4,rb=r0)
+// Same inputs (r5=section offset, r0=addend from lwz). Repro builds each shape
+// as a real block, runs it, and reports actual vs expected. Unambiguous numbers:
+//   r5 = 0x80420000 (section base offset)
+//   addend-in-mem at [r3+4] = 0x00001D24 (a plausible 16-bit-LO+HA reconstruction)
+//   correct sum = 0x80421D24 ; a +2 bug shows 0x80421D26.
+// ===========================================================================
+
+// ---- wasm byte dumper: print the emitted module hex for a given block ----
+static void dump_block_wasm(const char* tag, u32 start_pc, const u32* insts,
+                            u32 count, u32 ctx_ptr,
+                            u32 mem1_base, u32 mem1_mask, u32 ram_size) {
+    std::vector<u8> bytes = build_block_next(start_pc, insts, count, ctx_ptr,
+                                             mem1_base, mem1_mask, ram_size);
+    std::printf("[wasmdump %s] %u bytes\n", tag, (unsigned)bytes.size());
+    char line[160];
+    for (std::size_t i = 0; i < bytes.size(); i += 16) {
+        int n = std::snprintf(line, sizeof(line), "[wasmdump %s] %04zx:", tag, i);
+        for (std::size_t j = i; j < i + 16 && j < bytes.size(); ++j)
+            n += std::snprintf(line + n, sizeof(line) - n, " %02x", bytes[j]);
+        std::printf("%s\n", line);
+    }
+}
+
+// Standalone adds (no load): exercise emit_binop_x in BOTH alias shapes.
+//   (a) add r0,r5,r0  (rt==rb)  r0=0x24, r5=0x80420000 -> expect 0x80420024
+//   (b) add r4,r5,r0  (rt!=rb)  same inputs            -> expect 0x80420024
+static bool test_reloc_standalone_add_rt_eq_rb() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x800B7BF4;
+    env.gpr(0) = 0x24u;
+    env.gpr(5) = 0x80420000u;
+    const u32 insts[] = { enc_add(0, 5, 0) };   // add r0,r5,r0  (rt==rb)
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u32 r0 = env.gpr(0);
+    std::printf("[reloc standalone rt==rb] r0=0x%08x (exp 0x80420024)\n", r0);
+    return r0 == 0x80420024u;
+}
+static bool test_reloc_standalone_add_rt_ne_rb() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x800B7C18;
+    env.gpr(0) = 0x24u;
+    env.gpr(5) = 0x80420000u;
+    const u32 insts[] = { enc_add(4, 5, 0) };   // add r4,r5,r0  (rt!=rb)
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u32 r4 = env.gpr(4);
+    std::printf("[reloc standalone rt!=rb] r4=0x%08x (exp 0x80420024)\n", r4);
+    return r4 == 0x80420024u;
+}
+
+// load->add: lwz r0,4(r3); add r0,r5,r0   vs   lwz r0,4(r3); add r4,r5,r0.
+// r3 points into a 64-byte MEM1-backed buffer; [r3+4] (big-endian) = 0x00001D24.
+// r5 = 0x80420000. correct sum = 0x80421D24, watch for 0x80421D26.
+static bool test_reloc_load_add_rt_eq_rb() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x800B7BF4;
+    static u8 mem[64];
+    std::memset(mem, 0, sizeof(mem));
+    // big-endian 0x00001D24 at offset 4
+    mem[4] = 0x00; mem[5] = 0x00; mem[6] = 0x1D; mem[7] = 0x24;
+    const u32 host_base = (u32)(uintptr_t)&mem[0];
+    env.gpr(3) = 0x80000000u;     // masks to offset 0 in the buffer; +4 -> [4..7]
+    env.gpr(5) = 0x80420000u;
+    const u32 insts[] = {
+        enc_lwz(0, 3, 4),         // lwz r0, 4(r3)  -> r0 = 0x1D24
+        enc_add(0, 5, 0),         // add r0, r5, r0 (rt==rb) -> expect 0x80421D24
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 2, &next_pc, host_base, 0x017FFFFFu, sizeof(mem)))
+        return false;
+    const u32 r0 = env.gpr(0);
+    std::printf("[reloc load-add rt==rb] r0=0x%08x (exp 0x80421D24, +2 bug=0x80421D26)\n", r0);
+    return r0 == 0x80421D24u;
+}
+static bool test_reloc_load_add_rt_ne_rb() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x800B7C18;
+    static u8 mem[64];
+    std::memset(mem, 0, sizeof(mem));
+    mem[4] = 0x00; mem[5] = 0x00; mem[6] = 0x1D; mem[7] = 0x24;
+    const u32 host_base = (u32)(uintptr_t)&mem[0];
+    env.gpr(3) = 0x80000000u;
+    env.gpr(5) = 0x80420000u;
+    const u32 insts[] = {
+        enc_lwz(0, 3, 4),         // lwz r0, 4(r3)  -> r0 = 0x1D24
+        enc_add(4, 5, 0),         // add r4, r5, r0 (rt!=rb) -> expect 0x80421D24
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 2, &next_pc, host_base, 0x017FFFFFu, sizeof(mem)))
+        return false;
+    const u32 r4 = env.gpr(4);
+    std::printf("[reloc load-add rt!=rb] r4=0x%08x (exp 0x80421D24, +2 bug=0x80421D26)\n", r4);
+    return r4 == 0x80421D24u;
+}
+
+// FULL LO arm: lwz r0,4(r30); add r0,r5,r0; sth r0,0(r28)  vs the HA shape.
+// r30 base load buffer; r28 store buffer. The sth writes the reconstructed
+// half-word back; we capture the store value (the relocated low 16 bits the
+// guest patches into the instruction stream). LO sth value should be 0x1D24;
+// a +2 bug stores 0x1D26.
+static bool test_reloc_full_lo_arm() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x800B7BEC;
+    static u8 mem[256];
+    std::memset(mem, 0, sizeof(mem));
+    mem[4] = 0x00; mem[5] = 0x00; mem[6] = 0x1D; mem[7] = 0x24;  // [r30+4] = 0x1D24
+    const u32 host_base = (u32)(uintptr_t)&mem[0];
+    env.gpr(30) = 0x80000000u;    // masks to offset 0; +4 -> addend
+    env.gpr(28) = 0x80000040u;    // masks to offset 0x40; sth target
+    env.gpr(5)  = 0x80420000u;    // section base offset
+    const u32 insts[] = {
+        enc_lwz(0, 30, 4),                                   // lwz r0,4(r30) -> 0x1D24
+        enc_add(0, 5, 0),                                    // add r0,r5,r0  (rt==rb)
+        (44u << 26) | (0u << 21) | (28u << 16) | 0u,         // sth r0,0(r28)
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 3, &next_pc, host_base, 0x017FFFFFu, sizeof(mem)))
+        return false;
+    // sth stores the LOW 16 bits big-endian at offset 0x40: bytes [0x40],[0x41].
+    const u32 stored_hw = ((u32)mem[0x40] << 8) | (u32)mem[0x41];
+    // BUG: emit_bswap_i16's `(x>>>8)` term is not masked to a byte before the
+    // OR, so bits 16..23 of the register (0x42 here) leak into the low byte.
+    // Stored hw observed = 0x1D66 instead of the correct 0x1D24.
+    std::printf("[reloc full-lo] sth-stored-hw=0x%04x (exp 0x1D24; bswap16 bug stores 0x1D66) full-r0=0x%08x\n",
+                stored_hw, env.gpr(0));
+    return stored_hw == 0x1D24u && env.gpr(0) == 0x80421D24u;
+}
+static bool test_reloc_full_ha_arm() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x800B7C10;
+    static u8 mem[256];
+    std::memset(mem, 0, sizeof(mem));
+    mem[4] = 0x00; mem[5] = 0x00; mem[6] = 0x1D; mem[7] = 0x24;
+    const u32 host_base = (u32)(uintptr_t)&mem[0];
+    env.gpr(30) = 0x80000000u;
+    env.gpr(28) = 0x80000040u;
+    env.gpr(5)  = 0x80420000u;
+    const u32 insts[] = {
+        enc_lwz(0, 30, 4),                                   // lwz r0,4(r30) -> 0x1D24
+        enc_add(4, 5, 0),                                    // add r4,r5,r0  (rt!=rb)
+        (44u << 26) | (4u << 21) | (28u << 16) | 0u,         // sth r4,0(r28)
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 3, &next_pc, host_base, 0x017FFFFFu, sizeof(mem)))
+        return false;
+    const u32 stored_hw = ((u32)mem[0x40] << 8) | (u32)mem[0x41];
+    std::printf("[reloc full-ha] sth-stored-hw=0x%04x (exp 0x1D24) full-r4=0x%08x\n",
+                stored_hw, env.gpr(4));
+    return stored_hw == 0x1D24u && env.gpr(4) == 0x80421D24u;
+}
+
+// Dump-only "test": emits the wasm hex for the load->add LO and HA shapes so
+// the bytes can be diffed. Always returns true (it is a dumper, not an
+// assertion). The dump goes to the full conformance log.
+static bool test_reloc_wasm_dump() {
+    TestEnv env;
+    if (!env.init()) return false;
+    static u8 mem[64];
+    std::memset(mem, 0, sizeof(mem));
+    mem[4] = 0x00; mem[5] = 0x00; mem[6] = 0x1D; mem[7] = 0x24;
+    const u32 host_base = (u32)(uintptr_t)&mem[0];
+    {
+        const u32 lo[] = { enc_lwz(0, 3, 4), enc_add(0, 5, 0) };   // rt==rb
+        dump_block_wasm("LO_load_add", 0x800B7BF4, lo, 2, env.ctx_ptr,
+                        host_base, 0x017FFFFFu, sizeof(mem));
+    }
+    {
+        const u32 ha[] = { enc_lwz(0, 3, 4), enc_add(4, 5, 0) };   // rt!=rb
+        dump_block_wasm("HA_load_add", 0x800B7C18, ha, 2, env.ctx_ptr,
+                        host_base, 0x017FFFFFu, sizeof(mem));
+    }
+    {
+        const u32 lo1[] = { enc_add(0, 5, 0) };   // standalone rt==rb
+        dump_block_wasm("LO_standalone", 0x800B7BF4, lo1, 1, env.ctx_ptr,
+                        host_base, 0x017FFFFFu, sizeof(mem));
+    }
+    {
+        const u32 ha1[] = { enc_add(4, 5, 0) };   // standalone rt!=rb
+        dump_block_wasm("HA_standalone", 0x800B7C18, ha1, 1, env.ctx_ptr,
+                        host_base, 0x017FFFFFu, sizeof(mem));
+    }
+    {
+        const u32 lo3[] = { enc_lwz(0, 30, 4), enc_add(0, 5, 0),
+                            (44u << 26) | (0u << 21) | (28u << 16) | 0u };
+        dump_block_wasm("LO_full", 0x800B7BEC, lo3, 3, env.ctx_ptr,
+                        host_base, 0x017FFFFFu, sizeof(mem));
+    }
+    {
+        const u32 ha3[] = { enc_lwz(0, 30, 4), enc_add(4, 5, 0),
+                            (44u << 26) | (4u << 21) | (28u << 16) | 0u };
+        dump_block_wasm("HA_full", 0x800B7C10, ha3, 3, env.ctx_ptr,
+                        host_base, 0x017FFFFFu, sizeof(mem));
+    }
+    return true;
+}
+
 static const TestCase k_tests[] = {
+    {"reloc_standalone_add_rt_eq_rb",    &test_reloc_standalone_add_rt_eq_rb},
+    {"reloc_standalone_add_rt_ne_rb",    &test_reloc_standalone_add_rt_ne_rb},
+    {"reloc_load_add_rt_eq_rb",          &test_reloc_load_add_rt_eq_rb},
+    {"reloc_load_add_rt_ne_rb",          &test_reloc_load_add_rt_ne_rb},
+    {"reloc_full_lo_arm",                &test_reloc_full_lo_arm},
+    {"reloc_full_ha_arm",                &test_reloc_full_ha_arm},
+    {"reloc_wasm_dump",                  &test_reloc_wasm_dump},
     {"ps_merge10_alias_fd_eq_fa",        &test_ps_merge10_alias_fd_eq_fa},
     {"adde_alias_carry_chain",           &test_adde_alias_carry_chain},
     {"addi_sequential",                  &test_addi_sequential},
@@ -1714,6 +2016,9 @@ static const TestCase k_tests[] = {
     {"mtcrf",                            &test_mtcrf},
     {"lwz_fast_path",                    &test_lwz_fast_path},
     {"stw_fast_path",                    &test_stw_fast_path},
+    {"dcbz_line_zero_fastmem",           &test_dcbz_line_zero_fastmem},
+    {"dcbz_unaligned_rounds_down",       &test_dcbz_unaligned_rounds_down},
+    {"dcbz_mmio_falls_back_to_interp",   &test_dcbz_mmio_falls_back_to_interp},
 };
 
 int main() {

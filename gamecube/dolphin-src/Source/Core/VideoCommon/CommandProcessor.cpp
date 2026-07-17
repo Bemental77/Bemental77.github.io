@@ -94,6 +94,11 @@ void CommandProcessorManager::DoState(PointerWrap& p)
   p.Do(m_interrupt_waiting);
 }
 
+static inline void WriteLow(std::atomic<u32>& reg, u16 lowbits)
+{
+  reg.store((reg.load(std::memory_order_relaxed) & 0xFFFF0000) | lowbits,
+            std::memory_order_relaxed);
+}
 static inline void WriteHigh(std::atomic<u32>& reg, u16 highbits)
 {
   reg.store((reg.load(std::memory_order_relaxed) & 0x0000FFFF) | (static_cast<u32>(highbits) << 16),
@@ -252,9 +257,19 @@ void CommandProcessorManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
     fifo_rw_distance_lo_r =
         MMIO::DirectRead<u16>(MMIO::Utils::LowPart(&m_fifo.CPReadWriteDistance));
   }
+  // [lo-sync 2026-07-10 — PERMANENT, the deferred-decode discard] The LO-half writes of
+  // RW_DISTANCE and READ_POINTER were DirectWrite (no SyncGPUForRegisterAccess) while the
+  // HI halves sync. dolsdk __GXCleanGPFifo (GXInit/GXAbortFrame) writes rp:=wp,distance:=0
+  // — on real HW the GPU has already drained; with OUR deferred decode the clean landed on
+  // a NON-EMPTY fifo and DISCARDED the backlog wholesale (the frame-101 draw-done token:
+  // rp==wp over an intact, perfectly-framed, never-decoded stream — the armframe present-
+  // stall's final layer). Decode the backlog BEFORE applying, matching the HI-half semantics.
   mmio->Register(base | FIFO_RW_DISTANCE_LO, fifo_rw_distance_lo_r,
-                 MMIO::DirectWrite<u16>(MMIO::Utils::LowPart(&m_fifo.CPReadWriteDistance),
-                                        WMASK_LO_ALIGN_32BIT));
+                 MMIO::ComplexWrite<u16>([WMASK_LO_ALIGN_32BIT](Core::System& system_, u32, u16 val) {
+                   auto& fifo_ = system_.GetCommandProcessor().GetFifo();
+                   system_.GetFifo().SyncGPUForRegisterAccess();
+                   WriteLow(fifo_.CPReadWriteDistance, val & WMASK_LO_ALIGN_32BIT);
+                 }));
 
   MMIO::ReadHandlingMethod<u16>* fifo_rw_distance_hi_r;
   if (is_on_thread)
@@ -299,7 +314,11 @@ void CommandProcessorManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
       base | FIFO_READ_POINTER_LO,
       is_on_thread ? MMIO::DirectRead<u16>(MMIO::Utils::LowPart(&m_fifo.SafeCPReadPointer)) :
                      MMIO::DirectRead<u16>(MMIO::Utils::LowPart(&m_fifo.CPReadPointer)),
-      MMIO::DirectWrite<u16>(MMIO::Utils::LowPart(&m_fifo.CPReadPointer), WMASK_LO_ALIGN_32BIT));
+      MMIO::ComplexWrite<u16>([WMASK_LO_ALIGN_32BIT](Core::System& system_, u32, u16 val) {
+        auto& fifo_ = system_.GetCommandProcessor().GetFifo();
+        system_.GetFifo().SyncGPUForRegisterAccess();  // [lo-sync] decode backlog before rp move
+        WriteLow(fifo_.CPReadPointer, val & WMASK_LO_ALIGN_32BIT);
+      }));
 
   MMIO::ReadHandlingMethod<u16>* fifo_read_hi_r;
   MMIO::WriteHandlingMethod<u16>* fifo_read_hi_w;
@@ -342,9 +361,14 @@ void CommandProcessorManager::GatherPipeBursted()
 
   auto& processor_interface = m_system.GetProcessorInterface();
 
+  // [domino3-real] post-takeover-only counters (gated cpu_owner). 0x026B1AB0 = GatherPipeBursted
+  // early-returns (!GPLinkEnable, burst NOT credited to CP); 0x026B1AB4 = normal advances (credited).
+  const bool _dc_owner =
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u;
   // if we aren't linked, we don't care about gather pipe data
   if (!m_cp_ctrl_reg.GPLinkEnable)
   {
+    if (_dc_owner) { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AB0u)); *p = *p + 1u; }
     if (IsOnThread(m_system) && !m_system.GetFifo().UseDeterministicGPUThread())
     {
       // In multibuffer mode is not allowed write in the same FIFO attached to the GPU.
@@ -384,6 +408,7 @@ void CommandProcessorManager::GatherPipeBursted()
     m_system.GetCoreTiming().ForceExceptionCheck(0);
 
   m_fifo.CPReadWriteDistance.fetch_add(GPFifo::GATHER_PIPE_SIZE, std::memory_order_seq_cst);
+  if (_dc_owner) { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AB4u)); *p = *p + 1u; }
 
   m_system.GetFifo().RunGpu();
 

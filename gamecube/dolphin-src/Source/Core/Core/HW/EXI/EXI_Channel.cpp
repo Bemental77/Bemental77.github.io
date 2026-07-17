@@ -102,7 +102,6 @@ void CEXIChannel::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
   mmio->Register(base + EXI_DMA_CONTROL, MMIO::DirectRead<u32>(&m_control.Hex),
                  MMIO::ComplexWrite<u32>([this](Core::System&, u32, u32 val) {
                    m_control.Hex = val;
-
                    if (m_control.TSTART)
                    {
                      IEXIDevice* device = GetDevice(m_status.CHIP_SELECT);

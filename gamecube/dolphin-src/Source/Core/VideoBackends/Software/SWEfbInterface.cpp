@@ -14,6 +14,7 @@
 #include "Core/Config/GraphicsSettings.h"
 
 #include "VideoBackends/Software/CopyRegion.h"
+#include "VideoBackends/Software/Rasterizer.h"
 #include "VideoCommon/BPMemory.h"
 #include "VideoCommon/LookUpTables.h"
 #include "VideoCommon/PerfQueryBase.h"
@@ -23,7 +24,12 @@ namespace EfbInterface
 {
 static std::array<u8, EFB_WIDTH * EFB_HEIGHT * 6> efb;
 
-static std::array<u32, PQ_NUM_MEMBERS> perf_values;
+// Per-raster-worker perf-query partials (one row per band; row 0 is the canonical/FIFO slot, read
+// by GetPerfQueryResult). IncPerfCounterQuadCount runs on worker threads and writes its own row,
+// so the per-pixel increments never race; ReducePerfPartials folds rows 1..N-1 into row 0 at the
+// end-of-triangle barrier. The "quad" 3-pixel accumulator is likewise per-worker.
+static std::array<std::array<u32, PQ_NUM_MEMBERS>, Rasterizer::MaxRasterWorkers()> perf_values{};
+static std::array<std::array<u32, PQ_NUM_MEMBERS>, Rasterizer::MaxRasterWorkers()> perf_quad{};
 
 static inline u32 GetColorOffset(u16 x, u16 y)
 {
@@ -527,15 +533,28 @@ static u32 VerticalFilter(const std::array<u32, 3>& colors,
 
 static u32 GammaCorrection(u32 color, const float gamma_rcp)
 {
+  // [perf 2026-06-26] EncodeXFB calls this per output pixel (~307k/frame); std::pow was 3 pow() per
+  // pixel — the dominant scalar cost in the serial EFB->XFB present tail. gamma is a pure u8->u8
+  // function of (value, gamma_rcp), so tabulate it: a 256-entry LUT rebuilt only when gamma_rcp
+  // changes (rare — EFB-copy config). LUT[v] == clamp(pow(v/255,gamma_rcp)*255) so it is bit-identical
+  // to the prior per-pixel result. Encode is single-threaded (not banded), so the function-static LUT
+  // is race-free; if EncodeXFB is later banded across the raster pool, make this thread-local/per-worker.
+  static float s_lut_gamma_rcp = -1.0f;
+  static u8 s_gamma_lut[256];
+  if (gamma_rcp != s_lut_gamma_rcp)
+  {
+    for (int v = 0; v < 256; ++v)
+      s_gamma_lut[v] =
+          static_cast<u8>(std::clamp(std::pow(v / 255.0f, gamma_rcp) * 255.0f, 0.0f, 255.0f));
+    s_lut_gamma_rcp = gamma_rcp;
+  }
+
   u8 in_colors[4];
   std::memcpy(&in_colors, &color, sizeof(in_colors));
 
   u8 out_color[4];
   for (int i = BLU_C; i <= RED_C; i++)
-  {
-    out_color[i] = static_cast<u8>(
-        std::clamp(std::pow(in_colors[i] / 255.0f, gamma_rcp) * 255.0f, 0.0f, 255.0f));
-  }
+    out_color[i] = s_gamma_lut[in_colors[i]];
 
   u32 out_color32;
   std::memcpy(&out_color32, out_color, sizeof(out_color32));
@@ -712,12 +731,28 @@ bool ZCompare(u16 x, u16 y, u32 z)
 
 u32 GetPerfQueryResult(PerfQueryType type)
 {
-  return perf_values[type];
+  // Read on the FIFO thread after ReducePerfPartials has folded all worker rows into row 0.
+  return perf_values[0][type];
 }
 
 void ResetPerfQuery()
 {
   perf_values = {};
+  perf_quad = {};
+}
+
+void ReducePerfPartials()
+{
+  const int n = Rasterizer::NumRasterWorkers();
+  for (int w = 1; w < n; w++)
+  {
+    for (u32 i = 0; i < PQ_NUM_MEMBERS; i++)
+      perf_values[0][i] += perf_values[w][i];
+    perf_values[w].fill(0);
+    // The quad accumulator carries partial 3-pixel state across triangles within a frame; keep it
+    // per-worker (do NOT fold it — folding would corrupt the modulo-3 counting). Each worker keeps
+    // accumulating into its own perf_quad row across the frame.
+  }
 }
 
 void IncPerfCounterQuadCount(PerfQueryType type)
@@ -726,11 +761,11 @@ void IncPerfCounterQuadCount(PerfQueryType type)
   // Current software renderer architecture works on pixels though, so
   // we have this "quad" hack here to only increment the registers on
   // every fourth rendered pixel
-  static u32 quad[PQ_NUM_MEMBERS];
-  if (++quad[type] != 3)
+  const int w = Rasterizer::g_raster_worker_id;
+  if (++perf_quad[w][type] != 3)
     return;
-  quad[type] = 0;
-  ++perf_values[type];
+  perf_quad[w][type] = 0;
+  ++perf_values[w][type];
 }
 }  // namespace EfbInterface
 

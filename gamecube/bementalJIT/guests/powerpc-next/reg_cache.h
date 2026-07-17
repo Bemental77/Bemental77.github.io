@@ -54,6 +54,21 @@ public:
     // the block-entry values of every live-in PPC GPR.
     void EmitPrologueLoads(u32 ctx_ptr);
 
+    // [region-resident 2026-07-15] Merged-region residency: mark ALL 32 pregs
+    // assigned+loaded WITHOUT emitting loads. Valid ONLY inside the merged
+    // region function, whose activation pad loads every GPR once per host
+    // entry and whose intra-region `br` edges keep the SAME activation alive
+    // (locals persist; the identity preg->local mapping — OnBlockEntry's
+    // local_idx = base + i — makes every body see the same layout). Memory
+    // stays host-coherent through the unchanged terminal/mid-op dirty
+    // flushes; interp/HLE ReloadAll refills locals after host mutations.
+    void MarkAllLoaded() {
+        for (u32 i = 0; i < 32u; ++i) {
+            m_state[i].assigned = true;
+            m_state[i].loaded   = true;
+        }
+    }
+
     // Bind a preg for the next emitted op. Read mode binds the current
     // local; Write invalidates immediates and prior cached state; ReadWrite
     // does both.

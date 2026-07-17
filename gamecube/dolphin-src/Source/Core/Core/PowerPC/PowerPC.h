@@ -314,7 +314,17 @@ private:
   void ResetRegisters();
   void RefreshConfig();
 
+#if defined(__EMSCRIPTEN__)
+  // [ppc-state-collapse 2026-07-01] Alias dolphin's PowerPCState onto the SHARED SAB slice-state at
+  // 0x02400000 — the SAME bytes the ppc-worker uses (the page hands both modules ONE shared
+  // WebAssembly.Memory: gamecube.html:212/217/455). This fixes the worker<->dolphin ppc_state MIRROR
+  // GAP (dolphin ran with a stale private msr=0 -> RI=0 FP fault at HuSprFinish -> PPCHalt) by actually
+  // doing what dolphin_set_ppc_state_external_storage was stubbed to do. Layout matches (msr@0x2E0).
+  // Bound in the ctor; the empty ctor body never resets it, so the shared bytes are untouched at build.
+  PowerPCState& m_ppc_state;
+#else
   PowerPCState m_ppc_state;
+#endif
 
   CPUCoreBase* m_cpu_core_base = nullptr;
   bool m_cpu_core_base_is_injected = false;

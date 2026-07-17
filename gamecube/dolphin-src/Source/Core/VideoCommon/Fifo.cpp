@@ -240,6 +240,22 @@ void FifoManager::ReadDataFromFifo(u32 read_ptr)
   // Copy new video instructions to m_video_buffer for future use in rendering the new picture
   auto& memory = m_system.GetMemory();
   memory.CopyFromEmu(m_video_buffer_write_ptr, read_ptr, GPFifo::GATHER_PIPE_SIZE);
+  // [domino3-full 2026-07-16] dump read_ptr + ALL 32 bytes (8 words) of each chunk dolphin reads,
+  // first 32 chunks post-takeover — the definitive FIFO content to diff byte-for-byte against the
+  // ring reconstruction (first-word-only missed mid-chunk divergences). read_ptr[i] @0x026B2000+i*4,
+  // 8 data words @0x026B2100+i*32. Gated cpu_owner (inert on shipping).
+  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u)
+  {
+    volatile u32* cc = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1BF8u));
+    const u32 i = *cc;
+    if (i < 32u) {
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2000u + i * 4u)) = read_ptr;
+      const u32* src = reinterpret_cast<const u32*>(m_video_buffer_write_ptr.load(std::memory_order_relaxed));
+      volatile u32* d = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2100u + i * 32u));
+      for (u32 k = 0; k < 8u; ++k) d[k] = src[k];
+    }
+    *cc = i + 1u;
+  }
   m_video_buffer_write_ptr += GPFifo::GATHER_PIPE_SIZE;
 }
 
@@ -422,16 +438,6 @@ bool AtBreakpoint(Core::System& system)
 void FifoManager::RunGpu()
 {
   const bool is_dual_core = m_system.IsDualCoreMode();
-  // [ax-fifo] diag (temporary): discriminate lost-event vs suspended-desync
-  // vs tick-starvation for the frozen-rptr wedge. POWERPC channel — the
-  // probe captures only N[PowerPC].
-  static u64 axf_rungpu_n = 0;
-  axf_rungpu_n++;
-  if (axf_rungpu_n <= 4 || (axf_rungpu_n & 0xFFF) == 0)
-  {
-    NOTICE_LOG_FMT(POWERPC, "[ax-fifo] rungpu n={} suspended={}", axf_rungpu_n,
-                   m_syncing_suspended ? 1 : 0);
-  }
 
   // wake up GPU thread
   if (is_dual_core && !m_use_deterministic_gpu_thread)
@@ -457,31 +463,8 @@ int FifoManager::RunGpuOnCpu(int ticks)
   auto& fifo = command_processor.GetFifo();
   bool reset_simd_state = false;
   int available_ticks = int(ticks * m_config_sync_gpu_overclock) + m_sync_ticks.load();
-  // [ax-fifo] diag (temporary): loop-entry snapshot to catch tick starvation
-  // (avail<0 with data pending) — the loop below would then run 0 iterations.
-  {
-    static u64 axf_run_n = 0;
-    axf_run_n++;
-    const u32 axf_dist = fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
-    if (available_ticks < 0 && axf_dist != 0)
-    {
-      static u64 axf_starv_n = 0;
-      axf_starv_n++;
-      if (axf_starv_n <= 4 || (axf_starv_n & 0x3FF) == 0)
-      {
-        NOTICE_LOG_FMT(POWERPC, "[ax-fifo] starv n={} run_n={} avail={} dist={:#x}", axf_starv_n,
-                       axf_run_n, available_ticks, axf_dist);
-      }
-    }
-    else if (axf_run_n <= 4 || (axf_run_n & 0xFFF) == 0)
-    {
-      NOTICE_LOG_FMT(POWERPC, "[ax-fifo] run n={} avail={} dist={:#x} rd_en={}", axf_run_n,
-                     available_ticks, axf_dist,
-                     fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) ? 1 : 0);
-    }
-  }
   while (fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) &&
-         fifo.CPReadWriteDistance.load(std::memory_order_relaxed) && !AtBreakpoint(m_system) &&
+         fifo.CPReadWriteDistance.load(std::memory_order_acquire) && !AtBreakpoint(m_system) &&
          available_ticks >= 0)
   {
     if (m_use_deterministic_gpu_thread)
@@ -516,6 +499,9 @@ int FifoManager::RunGpuOnCpu(int ticks)
     }
 
     fifo.CPReadWriteDistance.fetch_sub(GPFifo::GATHER_PIPE_SIZE, std::memory_order_relaxed);
+    // [domino3-real] 0x026B1AB8 = 32B chunks RunGpuOnCpu actually consumed post-takeover (gated).
+    if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u)
+    { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AB8u)); *p = *p + 1u; }
   }
 
   command_processor.SetCPStatusFromGPU();
@@ -606,23 +592,25 @@ void FifoManager::SyncGPUCallback(Core::System& system, u64 ticks, s64 cyclesLat
   auto& fifo = system.GetFifo();
   if (!system.IsDualCoreMode() || fifo.m_use_deterministic_gpu_thread)
   {
+#ifdef __EMSCRIPTEN__
+    // [fifo tick-deficit fix 2026-07-11 v3 — gentle] The bug: m_sync_ticks accumulates a
+    // negative deficit that never recovers (live: dist=0xb80 stuck, available_ticks=-72, loop
+    // runs 0 iters) so the FIFO never decodes -> frame 0 in the user's Chrome. v1/v2 used a
+    // HUGE budget (RunGpuOnCpu(1<<24)) which over-drained and broke boot (peFrames stuck at
+    // 0, 4 bursts then stop). v3: just RESET the deficit to 0 so available_ticks = ticks
+    // (positive, normal budget) -> the loop runs each callback and drains at the normal rate.
+    // No over-drain, no owner gate — safe during boot AND post-takeover.
+    fifo.m_sync_ticks.store(0);
     next = fifo.RunGpuOnCpu(int(ticks));
+#else
+    next = fifo.RunGpuOnCpu(int(ticks));
+#endif
   }
   else if (fifo.m_config_sync_gpu)
   {
     next = fifo.WaitForGpuThread(int(ticks));
   }
 
-  // [ax-fifo] diag (temporary)
-  static u64 axf_cb_n = 0;
-  axf_cb_n++;
-  if (axf_cb_n <= 4 || (axf_cb_n & 0x3FF) == 0)
-  {
-    NOTICE_LOG_FMT(POWERPC, "[ax-fifo] cb n={} ticks={} next={} dist={:#x}", axf_cb_n, ticks,
-                   next,
-                   fifo.m_system.GetCommandProcessor().GetFifo().CPReadWriteDistance.load(
-                       std::memory_order_relaxed));
-  }
   fifo.m_syncing_suspended = next < 0;
   if (!fifo.m_syncing_suspended)
     system.GetCoreTiming().ScheduleEvent(next, fifo.m_event_sync_gpu, next);
@@ -633,7 +621,25 @@ void FifoManager::SyncGPUForRegisterAccess()
   SyncGPU(SyncGPUReason::Other);
 
   if (!m_system.IsDualCoreMode() || m_use_deterministic_gpu_thread)
+  {
+#ifdef __EMSCRIPTEN__
+    // [fifo force-drain 2026-07-11 — the DefaultThread/GXWaitDrawDone freeze root] The
+    // per-callback SyncGPUCallback budget starved post-takeover (live console: dist=0xb80
+    // stuck, available_ticks=-72, RunGpuOnCpu ran 0 iterations). So the guest's frame-N
+    // draw-done token sat in the FIFO undecoded -> PixelEngine::SetFinish never fired ->
+    // PE_FINISH never raised -> GXFinishInterruptHandler never ran (gxFinHandlerN=0) ->
+    // DrawDone stayed 0 -> DefaultThread stuck forever in GXWaitDrawDone -> GlobalCounter
+    // frozen at 100. This pump runs unconditionally per service-iter; the guest is BLOCKED
+    // (not mid-write), so fully draining the pending FIFO here is safe and correct. Reset
+    // the accumulated tick deficit and give a large budget so RunGpuOnCpu loops until
+    // CPReadWriteDistance == 0 (decodes the draw-done token -> SetFinish -> the wake chain).
+    // [v3 gentle — see SyncGPUCallback] reset the deficit, normal budget; no over-drain.
+    m_sync_ticks.store(0);
     RunGpuOnCpu(GPU_TIME_SLOT_SIZE);
+#else
+    RunGpuOnCpu(GPU_TIME_SLOT_SIZE);
+#endif
+  }
   else if (m_config_sync_gpu)
     WaitForGpuThread(GPU_TIME_SLOT_SIZE);
 }

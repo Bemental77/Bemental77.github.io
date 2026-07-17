@@ -28,6 +28,8 @@
                                // to splat a ring of pre-emitted PowerPC
                                // instructions into the guest RAM mirror.
   let mem1Size    = 0;
+  let ppcStateBase = 0x02400000; // [ppc-bridge] real &ppc_state once dolphin publishes it;
+                               // until then the legacy sentinel region (default unchanged)
 
   // Item 6 Stage 2 — feature flag. When true, env.ppc_write{8,16,32}
   // enqueue into the pending-writes SPSC ring at SAB[0x02670000] for
@@ -43,13 +45,69 @@
   const PWR_OFF_HEAD      = 0x08;
   const PWR_OFF_ENQ_COUNT = 0x14;
   const PWR_OFF_DROP_COUNT= 0x18;
-  let useWriteRing = true;  // Item 6 W2 default-on under Phase IV
+  // [SI-crash ROOT FIX 2026-07-02] W2 ring OFF. The fire-and-forget pending-writes ring made
+  // guest STORES asynchronous (dolphin drains later) while LOADS are synchronous — a
+  // store->load ordering violation on the guest's own memory. MP4: SIGetType's stmw enqueued
+  // saved-r31 -> 0x8019d3e4; when the drain ran late (first-compile/DoReset window), the lmw
+  // read the PRE-STORE bytes (0x00808080, PADRead's dead poll data) and SIGetTypeAsync blrl'd
+  // into 0x808080 -> __OSUnhandledException. Proven by the seq-ring: eaWatchStmw fired
+  // (enqueue) at gt=3822, slot still old at gt=4138, dolphin_write32 tag NEVER fired (writes
+  // bypassed the sync trampoline entirely). Synchronous mailbox writes restore ordering.
+  // Correct fast path later: MEM1-direct SAB stores in-wasm + ring for MMIO only.
+  let useWriteRing = false;
 
   function installWriteEnv(env, call2) {
     if (!useWriteRing) {
-      env.ppc_write8  = (addr, val) => call2(5, addr, val);
-      env.ppc_write16 = (addr, val) => call2(6, addr, val);
-      env.ppc_write32 = (addr, val) => call2(7, addr, val);
+      // [gp-ring STEP 3 2026-07-09] WPAR-ONLY Atomics ring (the 'ring for MMIO only' fast path
+      // the W2 postmortem above prescribes). Guest RAM stores stay on the SYNC mailbox (the
+      // store->load ordering that W2 violated is untouched); ONLY writes to the write-gather
+      // pipe (0x0C008000 mirrors — write-only MMIO the guest never loads back) go through the
+      // ring, replacing one full mailbox round-trip PER GX WORD (~374k/run measured).
+      // Ordering vs other MMIO: dolphin drains ring-before-ANY-mailbox-op (EmscriptenWorker
+      // dolphin_drain_gp_ring at the top of dolphin_drain_mailbox_once) and on the always-runs
+      // run_iter_batch body. WATERMARK: near-full -> bounded producer Atomics.wait with
+      // predicate re-check (never unbounded — the consumer can be page-blocked in HW-GL mode);
+      // past the bound, fall back to the sync mailbox write (ordering-safe, counted).
+      // Layout @0x026C0000: +0 head (monotonic, producer) +4 tail (monotonic, consumer)
+      // +8 producer-waiting flag +0xC fallback count +0x10 applied count (consumer)
+      // +0x40.. data: 8192 entries x 2 words {widthBytes, value}.
+      const _gsab = sharedMemoryRef && sharedMemoryRef.buffer;
+      let gpPush = null;
+      if (_gsab) {
+        const gi32 = new Int32Array(_gsab);
+        const gu32 = new Uint32Array(_gsab);
+        const GP_HEAD = 0x026C0000 >> 2, GP_TAIL = 0x026C0004 >> 2, GP_WAITF = 0x026C0008 >> 2,
+              GP_FALL = 0x026C000C >> 2, GP_DATA = 0x026C0040 >> 2, GP_CAP = 8192;
+        gpPush = (width, val) => {
+          const h = Atomics.load(gi32, GP_HEAD) >>> 0;
+          let t = Atomics.load(gi32, GP_TAIL) >>> 0;
+          if (((h - t) >>> 0) >= (GP_CAP - 16)) {
+            Atomics.store(gi32, GP_WAITF, 1);
+            for (let s = 0; s < 400; s++) {           // bounded: 400 x 5ms max
+              Atomics.wait(gi32, GP_TAIL, t | 0, 5);
+              t = Atomics.load(gi32, GP_TAIL) >>> 0;
+              if (((h - t) >>> 0) < (GP_CAP - 16)) break;
+            }
+            Atomics.store(gi32, GP_WAITF, 0);
+            if (((h - t) >>> 0) >= (GP_CAP - 16)) {
+              gu32[GP_FALL] = ((gu32[GP_FALL] >>> 0) + 1) >>> 0;
+              return false;                            // caller falls back to sync mailbox
+            }
+          }
+          const idx = GP_DATA + ((h & (GP_CAP - 1)) * 2);
+          gu32[idx] = width; gu32[idx + 1] = val >>> 0;
+          Atomics.store(gi32, GP_HEAD, (h + 1) | 0);
+          return true;
+        };
+      }
+      const _isGp = (addr) => (((addr & 0x0FFFFFFF) >>> 0) === 0x0C008000);
+      // [gp-seq TEMP 2026-07-10] sequence check: every guest WPAR store issued (any route)
+      // counts @0x026B1A3C; dolphin counts gather arrivals @0x026B1A40. Deficit = lost
+      // stores; per-snap deltas date the losing window.
+      const _gpSeq = () => { u32[0x026B1A3C >> 2] = ((u32[0x026B1A3C >> 2] >>> 0) + 1) >>> 0; };
+      env.ppc_write8  = (addr, val) => { if (_isGp(addr)) { _gpSeq(); if (gpPush && gpPush(1, val)) return; } call2(5, addr, val); };
+      env.ppc_write16 = (addr, val) => { if (_isGp(addr)) { _gpSeq(); if (gpPush && gpPush(2, val)) return; } call2(6, addr, val); };
+      env.ppc_write32 = (addr, val) => { if (_isGp(addr)) { _gpSeq(); if (gpPush && gpPush(4, val)) return; } call2(7, addr, val); };
       return;
     }
     // W2 mode: enqueue into the pending-writes ring. SPSC discipline —
@@ -105,7 +163,7 @@
         // and each block compiles fresh (~85ms each), so throughput
         // regresses vs dolphin-owned dispatch until the cache warms up.
         // Enable explicitly with =1 to test the architectural cutover.
-        if (mod.PPC_WORKER_USE_C_SLICE === undefined) mod.PPC_WORKER_USE_C_SLICE = 0;
+        if (mod.PPC_WORKER_USE_C_SLICE === undefined) mod.PPC_WORKER_USE_C_SLICE = 0;  // [throughput A/B 2026-07-03: C-slice+merged retire ZERO (region pipeline WIP, endless gen-relink) — stay on legacy until AoT]
         const v = mod._ppc_worker_version();
         postMessage({ cmd: 'ready', version: v });
       })
@@ -136,6 +194,7 @@
         const mem1Size     = (data.mem1Size     | 0) >>> 0;
         const mailboxAddr  = (data.mailboxAddr  | 0) >>> 0;
         mod._ppc_worker_init(ppcStateAddr, mem1Addr, mem1Size, mailboxAddr);
+        ppcStateBase = ppcStateAddr;
         mailboxBase = mailboxAddr;
         // Boot-dispatcher mode wiring. By default ppc-worker is the
         // real-boot dispatcher: dispatched blocks call real env.ppc_*
@@ -168,14 +227,44 @@
         const call1 = (cmd, a) => mod._ppc_worker_mailbox_call_sync(cmd, a >>> 0) >>> 0;
         const call2 = (cmd, a, b) => { mod._ppc_worker_mailbox_call_sync2(cmd, a >>> 0, b >>> 0); };
         env.memory          = sharedMemoryRef;
-        env.ppc_read8       = (addr) => call1(2, addr);
-        env.ppc_read16      = (addr) => call1(3, addr);
-        env.ppc_read32      = (addr) => call1(4, addr);
+        // [poll-target 2026-07-09] record the last slow-path MMIO read (addr + seq) so the
+        // EE=0 poll handler can DISCRIMINATE beam polls (VI range -> smooth-step) from
+        // device-completion polls (DSP/EXI/AI -> jump-to-next-event). Only MMIO routes
+        // through env reads, so a fresh addr here IS the polled register.
+        env.ppc_read8       = (addr) => { self.__lastMmioRdAddr = addr >>> 0; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(2, addr); };
+        env.ppc_read16      = (addr) => { self.__lastMmioRdAddr = addr >>> 0; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(3, addr); };
+        env.ppc_read32      = (addr) => { self.__lastMmioRdAddr = addr >>> 0; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(4, addr); };
         // Item 6 Stage 2 — writes go either via mailbox (W1, default) or
         // SAB pending-writes ring (W2, gated by `useWriteRing`).
         installWriteEnv(env, call2);
         env.ppc_hle_check   = (pc) => call1(8, pc);
-        env.ppc_interp      = (inst, pc) => call2(9, inst, pc);
+        env.ppc_interp      = (inst, pc) => {
+          // [store-watch 2026-06-29 TEMP] BUG 2: marker 0xFFFFFFFB = a 32-bit store of
+          // 0x808080 into the SIGetType stack frame (the callback-corruption write).
+          // pc = the EXACT storing instruction; log it (no dolphin round-trip). Other
+          // 0xFFFFFFF{F,E,D} markers pass through to dolphin_interp.
+          if ((inst >>> 0) === 0xFFFFFFFB) {
+            if ((self.__swN = (self.__swN | 0) + 1) <= 64) {
+              var _sm = new Int32Array(sharedMemoryRef.buffer);
+              var _ctx = _sm[0x0250002C >> 2] >>> 0;          // real &ppc_state
+              var _lr  = _ctx ? (_sm[(_ctx + 0x360) >> 2] >>> 0) : 0;  // LR (caller)
+              var _r30 = _ctx ? (_sm[(_ctx + 0x8c) >> 2] >>> 0) : 0;   // r30 (store EA base)
+              var _r1  = _ctx ? (_sm[(_ctx + 0x18) >> 2] >>> 0) : 0;   // r1 (sp)
+              // SAVED caller-LR is on the guest stack at r1+0x2c (SIGetResponse
+              // prologue: stw lr,4(old_r1); stwu -40). Read it via MEM1 base (SAB
+              // 0x02500020), BE. That's the function that CALLED SIGetResponse.
+              var _u8 = new Uint8Array(sharedMemoryRef.buffer);
+              var _mem1 = _sm[0x02500020 >> 2] >>> 0;
+              var _clrA = (_mem1 + ((_r1 + 0x2c) & 0x01FFFFFF)) >>> 0;
+              var _clr = _mem1 ? (((_u8[_clrA] << 24) | (_u8[_clrA+1] << 16) | (_u8[_clrA+2] << 8) | _u8[_clrA+3]) >>> 0) : 0;
+              postMessage({ cmd: 'print', txt: '[store-watch] 0x808080 storePC=0x' + (pc >>> 0).toString(16)
+                + ' EA(r30)=0x' + _r30.toString(16) + ' r1=0x' + _r1.toString(16)
+                + ' callerLR=0x' + _clr.toString(16) });
+            }
+            return;
+          }
+          call2(9, inst, pc);
+        };
         env.ppc_check_exc   = (pc) => call1(10, pc);
         env.ppc_break_block = (pc, x) => call2(11, pc, x);
         env.ppc_read_tb     = (which) => call1(12, which);
@@ -211,6 +300,36 @@
           hleNative: mod._ppc_worker_get_hle_check_native() >>> 0 });
         break;
       }
+      case 'load-aot': {
+        // [AoT — Task 2] Pre-compiled PPC->WASM pack (gamecube/tools/aot/aot_emit.cpp).
+        // data: { funcs: ArrayBuffer (5xu32 LE per fn: addr,offset,size,firstBlk,nBlks),
+        //         blocks: ArrayBuffer (flat u32 LE block pcs), pack: ArrayBuffer (wasm concat) }.
+        // Baked constants: ctx=0x02400000, mem1=0x1A4B7498 — VERIFY mem1 before enabling.
+        try {
+          const funcs = new Uint32Array(data.funcs);
+          const blockPcs = new Uint32Array(data.blocks);
+          const pack = new Uint8Array(data.pack);
+          const map = new Map();
+          const nf = funcs.length / 5;
+          for (let f = 0; f < nf; f++) {
+            const first = funcs[f * 5 + 3], nb = funcs[f * 5 + 4];
+            for (let b = 0; b < nb; b++) map.set(blockPcs[first + b] >>> 0, (f << 8) | 0); // funcIdx in high bits; local idx recomputed below
+          }
+          // store local idx precisely: rebuild map with [funcIdx, localIdx]
+          map.clear();
+          for (let f = 0; f < nf; f++) {
+            const first = funcs[f * 5 + 3], nb = funcs[f * 5 + 4];
+            for (let b = 0; b < nb; b++) map.set(blockPcs[first + b] >>> 0, [f, b]);
+          }
+          self.__aot = { funcs, blockPcs, pack, map, instCache: new Array(nf), enabled: false,
+                         bakedMem1: (data.mem1 >>> 0) || 0x1A4B7498 };
+          postMessage({ cmd: 'print', txt: '[aot] pack loaded: ' + nf + ' funcs, '
+            + map.size + ' blocks, ' + pack.length + ' bytes (mem1 verify pending)' });
+        } catch (e) {
+          postMessage({ cmd: 'print', txt: '[aot] load failed: ' + (e && e.message) });
+        }
+        break;
+      }
       case 'update-mem': {
         // 2g: deferred MEM1 wiring. Page calls Module._dolphin_get_ram_addr
         // once dolphin's runtime is ready, posts here. ppc-worker's
@@ -219,13 +338,111 @@
         if (!mod) { postMessage({ cmd: 'update-mem-nack', reason: 'wasm not yet ready' }); return; }
         const newMem1Addr = (data.mem1Addr | 0) >>> 0;
         const newMem1Size = (data.mem1Size | 0) >>> 0;
-        // Re-init keeps ppcStateAddr/mailboxAddr the same (we don't have a
-        // separate setter for just mem1).
-        const ppcStateAddr = 0x02400000;
+        // [ppc-bridge] Bind to the REAL &ppc_state dolphin published (data.ppcStateAddr),
+        // not the 0x02400000 sentinel the stubbed redirect never populated.
+        const ppcStateAddr = (data.ppcStateAddr >>> 0) || ppcStateBase || 0x02400000;
+        ppcStateBase = ppcStateAddr;
         const mailboxAddr  = mailboxBase || 0x02000000;
         mod._ppc_worker_init(ppcStateAddr, newMem1Addr, newMem1Size, mailboxAddr);
         mem1Base = newMem1Addr;
         mem1Size = newMem1Size;
+        if (self.__aot) {
+          // [indirect-base 2026-07-07] the pack no longer bakes mem1 — emitted code loads
+          // the base from SAB 0x02500020 at runtime. Enable unconditionally.
+          self.__aot.enabled = true;
+          // [cfg-provenance 2026-07-09 — PERMANENT] Publish the ACTIVE configuration so every
+          // acceptance run records what it verified (the dead-C-slice + stale-pack false-"done"
+          // class). SAB 0x026B1840 = cfg bits (bit1=AoT enabled; bit0=C-slice loop, bit2=legacy
+          // loop — set at loop entry), 0x026B1844 = pack byte length (regen fingerprint).
+          {
+            const _cv = new Uint32Array(sharedMemoryRef.buffer);
+            _cv[0x026B1840 >> 2] = (_cv[0x026B1840 >> 2] | 2) >>> 0;
+            _cv[0x026B1844 >> 2] = (self.__aot.pack ? self.__aot.pack.length : 0) >>> 0;
+            // [pack-stamp 2026-07-10 — PERMANENT provenance] content fingerprint (FNV-1a over
+            // every 4096th byte + length) @0x026B184C. A stale pack (emitter changed, pack not
+            // regenerated — the 0x0600-channel contamination incident) is now VISIBLE in every
+            // verify row, not discoverable only by byte-level audit.
+            if (self.__aot.pack) {
+              let h = 0x811c9dc5;
+              const pk = self.__aot.pack;
+              for (let i = 0; i < pk.length; i += 4096) { h ^= pk[i]; h = (h * 0x01000193) >>> 0; }
+              h ^= pk.length; h = (h * 0x01000193) >>> 0;
+              _cv[0x026B184C >> 2] = h >>> 0;
+            }
+          }
+          postMessage({ cmd: 'print', txt: '[aot] ENABLED (indirect base; runtime mem1=0x'
+            + (newMem1Addr >>> 0).toString(16) + ')' });
+          if (self.__aot.enabled && !self.__aot.table) {
+            // [aot-chain] Eager-instantiate the whole pack with a shared funcref table so
+            // cross-function block exits tail-call in-wasm. Flat index in SAB @0x02700000:
+            // (pc-0x80000000) -> ((table_slot+1)<<12 | entry_idx); entry cell @0x026B0904.
+            try {
+              const a = self.__aot;
+              const nf = a.funcs.length / 5;
+              a.table = new WebAssembly.Table({ initial: nf, element: 'anyfunc' });
+              const baseEnv = mod.bemental_imports ? mod.bemental_imports.env : {};
+              a.env = new Proxy({ aot_table: a.table }, {
+                get: (t, k) => (t[k] !== undefined ? t[k] : baseEnv[k]),
+                has: (t, k) => (k in t) || (k in baseEnv),
+              });
+              // zero the index span, then instantiate + fill
+              const U = new Uint32Array(sharedMemoryRef.buffer);  // handler scope lacks u32
+              const idxBase = 0x02700000 >>> 2;
+              for (let w = 0; w < (0x120000 >> 2); w++) U[idxBase + w] = 0;
+              // [#2 WPAR->ring 2026-07-11] The AoT binds env.ppc_write* at instantiation (below)
+              // to whatever baseEnv holds NOW. The emcc glue set it to _dolphin_write8 (a mailbox
+              // trampoline) — the source of the GXCopyDisp WPAR-store deadlock: the render thread's
+              // WPAR stores park the worker on the unbounded mailbox wait. Override baseEnv.ppc_write*
+              // HERE so the AoT binds a ring-routing version: WPAR bulk data -> the GP ring
+              // (0x026C0000, consumer = dolphin_drain_gp_ring -> GPFifo::Write) with a BOUNDED
+              // watermark Atomics.wait for ring space (consumer drains+notifies GP_TAIL; 2ms safety
+              // poll) — NEVER a mailbox round-trip, NEVER dropped (per step-3 watermark: the 5-byte-
+              // hole class is data loss, forbidden). Non-WPAR MMIO keeps the original trampoline. No
+              // pack regen — the binding is a runtime JS ref resolved at line ~396. gpSent@0x026B1A3C.
+              {
+                const _origW8 = baseEnv.ppc_write8, _origW16 = baseEnv.ppc_write16, _origW32 = baseEnv.ppc_write32;
+                const _gi = new Int32Array(sharedMemoryRef.buffer);
+                const GPH = 0x026C0000 >> 2, GPT = 0x026C0004 >> 2, GPD = 0x026C0040 >> 2, GPCAP = 8192;
+                const _isGpA = (addr) => (((addr & 0x0FFFFFFF) >>> 0) === 0x0C008000);
+                const _ringPush = (width, val) => {
+                  const h = Atomics.load(_gi, GPH) >>> 0;
+                  let t = Atomics.load(_gi, GPT) >>> 0, spins = 0;
+                  while (((h - t) >>> 0) >= (GPCAP - 16)) {   // bounded watermark; consumer drains+notifies
+                    Atomics.wait(_gi, GPT, t | 0, 2);
+                    t = Atomics.load(_gi, GPT) >>> 0;
+                    if (++spins > 2000) break;                // ~4s absolute safety (consumer-dead only)
+                  }
+                  const slot = GPD + ((h & (GPCAP - 1)) * 2);
+                  U[slot] = width; U[slot + 1] = val >>> 0;
+                  Atomics.store(_gi, GPH, (h + 1) | 0);
+                  U[0x026B1A3C >> 2] = ((U[0x026B1A3C >> 2] >>> 0) + 1) >>> 0;  // gpSent
+                };
+                baseEnv.ppc_write8  = (addr, val) => { if (_isGpA(addr)) { _ringPush(1, val); return; } return _origW8(addr, val); };
+                baseEnv.ppc_write16 = (addr, val) => { if (_isGpA(addr)) { _ringPush(2, val); return; } return _origW16(addr, val); };
+                baseEnv.ppc_write32 = (addr, val) => { if (_isGpA(addr)) { _ringPush(4, val); return; } return _origW32(addr, val); };
+              }
+              let okN = 0;
+              for (let f = 0; f < nf; f++) {
+                const off = a.funcs[f * 5 + 1], size = a.funcs[f * 5 + 2];
+                const wmod = new WebAssembly.Module(a.pack.subarray(off, off + size));
+                const inst = new WebAssembly.Instance(wmod, { env: a.env });
+                a.instCache[f] = inst;
+                a.table.set(f, inst.exports.region);
+                const first = a.funcs[f * 5 + 3], nb = a.funcs[f * 5 + 4];
+                for (let b = 0; b < nb; b++) {
+                  const rel = (a.blockPcs[first + b] >>> 0) - 0x80000000;
+                  if (rel < 0x120000) U[(0x02700000 + rel) >> 2] = (((f + 1) << 12) | b) >>> 0;
+                }
+                okN++;
+              }
+              postMessage({ cmd: 'print', txt: '[aot-chain] ' + okN + '/' + nf
+                + ' functions instantiated, table+index live' });
+            } catch (e) {
+              self.__aot.enabled = false;
+              postMessage({ cmd: 'print', txt: '[aot-chain] init failed, aot disabled: ' + (e && e.message) });
+            }
+          }
+        }
         postMessage({ cmd: 'update-mem-ack', mem1Addr: newMem1Addr, mem1Size: newMem1Size });
         break;
       }
@@ -397,14 +614,44 @@
         const call1 = (cmd, a) => mod._ppc_worker_mailbox_call_sync(cmd, a >>> 0) >>> 0;
         const call2 = (cmd, a, b) => { mod._ppc_worker_mailbox_call_sync2(cmd, a >>> 0, b >>> 0); };
         env.memory          = sharedMemoryRef;
-        env.ppc_read8       = (addr) => call1(2, addr);
-        env.ppc_read16      = (addr) => call1(3, addr);
-        env.ppc_read32      = (addr) => call1(4, addr);
+        // [poll-target 2026-07-09] record the last slow-path MMIO read (addr + seq) so the
+        // EE=0 poll handler can DISCRIMINATE beam polls (VI range -> smooth-step) from
+        // device-completion polls (DSP/EXI/AI -> jump-to-next-event). Only MMIO routes
+        // through env reads, so a fresh addr here IS the polled register.
+        env.ppc_read8       = (addr) => { self.__lastMmioRdAddr = addr >>> 0; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(2, addr); };
+        env.ppc_read16      = (addr) => { self.__lastMmioRdAddr = addr >>> 0; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(3, addr); };
+        env.ppc_read32      = (addr) => { self.__lastMmioRdAddr = addr >>> 0; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(4, addr); };
         // Item 6 Stage 2 — writes go either via mailbox (W1, default) or
         // SAB pending-writes ring (W2, gated by `useWriteRing`).
         installWriteEnv(env, call2);
         env.ppc_hle_check   = (pc) => call1(8, pc);
-        env.ppc_interp      = (inst, pc) => call2(9, inst, pc);
+        env.ppc_interp      = (inst, pc) => {
+          // [store-watch 2026-06-29 TEMP] BUG 2: marker 0xFFFFFFFB = a 32-bit store of
+          // 0x808080 into the SIGetType stack frame (the callback-corruption write).
+          // pc = the EXACT storing instruction; log it (no dolphin round-trip). Other
+          // 0xFFFFFFF{F,E,D} markers pass through to dolphin_interp.
+          if ((inst >>> 0) === 0xFFFFFFFB) {
+            if ((self.__swN = (self.__swN | 0) + 1) <= 64) {
+              var _sm = new Int32Array(sharedMemoryRef.buffer);
+              var _ctx = _sm[0x0250002C >> 2] >>> 0;          // real &ppc_state
+              var _lr  = _ctx ? (_sm[(_ctx + 0x360) >> 2] >>> 0) : 0;  // LR (caller)
+              var _r30 = _ctx ? (_sm[(_ctx + 0x8c) >> 2] >>> 0) : 0;   // r30 (store EA base)
+              var _r1  = _ctx ? (_sm[(_ctx + 0x18) >> 2] >>> 0) : 0;   // r1 (sp)
+              // SAVED caller-LR is on the guest stack at r1+0x2c (SIGetResponse
+              // prologue: stw lr,4(old_r1); stwu -40). Read it via MEM1 base (SAB
+              // 0x02500020), BE. That's the function that CALLED SIGetResponse.
+              var _u8 = new Uint8Array(sharedMemoryRef.buffer);
+              var _mem1 = _sm[0x02500020 >> 2] >>> 0;
+              var _clrA = (_mem1 + ((_r1 + 0x2c) & 0x01FFFFFF)) >>> 0;
+              var _clr = _mem1 ? (((_u8[_clrA] << 24) | (_u8[_clrA+1] << 16) | (_u8[_clrA+2] << 8) | _u8[_clrA+3]) >>> 0) : 0;
+              postMessage({ cmd: 'print', txt: '[store-watch] 0x808080 storePC=0x' + (pc >>> 0).toString(16)
+                + ' EA(r30)=0x' + _r30.toString(16) + ' r1=0x' + _r1.toString(16)
+                + ' callerLR=0x' + _clr.toString(16) });
+            }
+            return;
+          }
+          call2(9, inst, pc);
+        };
         env.ppc_check_exc   = (pc) => call1(10, pc);
         env.ppc_break_block = (pc, x) => call2(11, pc, x);
         env.ppc_read_tb     = (which) => call1(12, which);
@@ -435,10 +682,13 @@
         // lowest offset). dolphin_read8(addr) returns the byte at addr.
         const byte0 = mod._ppc_worker_mmio_read8(PI_MASK)  >>> 0;
         const half0 = mod._ppc_worker_mmio_read16(PI_MASK) >>> 0;
-        // Write into a benign register slot — re-write the SAME mask
-        // back to itself so we don't disturb dolphin state.
-        mod._ppc_worker_mmio_write32(PI_MASK, mask32);
-        const mask32b = mod._ppc_worker_mmio_read32(PI_MASK) >>> 0;
+        // [bisect TEMP] PI-mask write-back DISABLED. The "re-write the SAME mask"
+        // is only idempotent if nothing changes it in between — but the read (line
+        // 434) and this write are several mailbox round-trips apart, so the
+        // apploader's __OSInterruptInit can set the mask in that window and we'd
+        // clobber it. Testing whether this race is the runaway corruptor.
+        // mod._ppc_worker_mmio_write32(PI_MASK, mask32);
+        const mask32b = mask32;
         postMessage({ cmd: 'mmio-rw-suite-ack',
           mask32, byte0, half0, mask32b });
         break;
@@ -638,8 +888,12 @@
         }
         const wallStart = (typeof performance !== 'undefined') ? performance.now() : Date.now();
         // PowerPCState SAB offsets per ppc_worker_main.cpp layout comment.
-        const PPC_STATE_BASE   = 0x02400000;
+        const PPC_STATE_BASE   = ppcStateBase;  // [ppc-bridge] real &ppc_state (was 0x02400000 sentinel)
+        // [base-publish 2026-07-07] publish the ACTUAL base this loop uses (SAB 0x026B0E98)
+        // — own view: u32 is declared LATER in this scope (TDZ — the recorded trap, 5th hit).
+        new Uint32Array(sharedMemoryRef.buffer)[0x026B0E98 >> 2] = PPC_STATE_BASE >>> 0;
         const OFFSET_PC        = 0x000;
+        const OFFSET_NPC       = 0x004;   // ppc_offsets.h: NPC = 0x004 (SRR0 source on async-int delivery)
         const OFFSET_MSR       = 0x2E0;
         const OFFSET_EXC       = 0x2EC;
         const OFFSET_DOWNCOUNT = 0x2F0;
@@ -669,6 +923,15 @@
              + ' MSR=0x' + _diag_msr.toString(16)
              + ' downcount=' + _diag_dc
              + ' bufBytes=' + _diag_buf });
+        // [determinize-boot / atomics-only loop 2026-07-08] Internal re-engage loop:
+        // on a benign slice exit while the worker still owns the CPU, service dolphin
+        // SYNCHRONOUSLY via the mailbox (Atomics) a fixed count, then re-run the slice —
+        // NO postMessage ack → page setTimeout → re-engage round-trip (the residual
+        // async-ordering entropy after the 4 wall-constant fixes). The page keeps control
+        // via the owner flag (0x026A0000) + stop flag (0x02500004): clearing owner or
+        // setting stop drops out of the benign list → posts ack → breaks to the switch.
+        let _sliceLoop = true;
+        while (_sliceLoop) {
         let iters = 0;
         let compileCalls = 0;
         let totalCompileBytes = 0;
@@ -685,6 +948,11 @@
         // Mirror that pattern here.
         let lastCtFireMs = wallStart;
         const CT_FIRE_INTERVAL_MS = 16.0;  // ~60 Hz, matches native VI cadence.
+        // [determinize-boot 2026-07-08] CT-fire on GUEST CYCLES, not wall ms — wall-timed
+        // event firing made the post-takeover trajectory nondeterministic (two-run face
+        // divergence). 20000 cyc ~= one slice; ties device-event cadence to guest ticks.
+        let lastCtFireCycles = 0;
+        const CT_FIRE_CYCLES = 20000;
         // Item 7 Phase II — periodically drain DEC (and Phase III hybrid)
         // events from the SAB shared CT queue. The fire is a no-op if
         // the queue is empty, so calling every N iters is cheap. N=256
@@ -723,6 +991,15 @@
             const tHi = u32[(recBase + 4) >> 2] >>> 0;
             if (!anyValid || tHi < minHi || (tHi === minHi && tLo < minLo)) {
               minLo = tLo; minHi = tHi; anyValid = true;
+            }
+          }
+          // [ct-next] fold in dolphin's hybrid-queue head (published by Advance at
+          // 0x026B0910/14/18) — VI/ARAM/DSP live there; the pure mirror never sees them.
+          if ((u32[0x026B0918 >> 2] >>> 0) === 1) {
+            const dLo = u32[0x026B0910 >> 2] >>> 0;
+            const dHi = u32[0x026B0914 >> 2] >>> 0;
+            if (!anyValid || dHi < minHi || (dHi === minHi && dLo < minLo)) {
+              minLo = dLo; minHi = dHi; anyValid = true;
             }
           }
           return anyValid ? { lo: minLo, hi: minHi } : null;
@@ -853,13 +1130,23 @@
                 const exc = u32[(PPC_STATE_BASE + OFFSET_EXC) >> 2] >>> 0;
                 const msr = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
                 const EXC_EXTERNAL_INT = 0x00000004;
+                const EXC_DECREMENTER  = 0x00000001;
+                // [ee-gate fix 2026-07-02] BOTH EXTERNAL_INT and DECREMENTER are EE-maskable — match the
+                // sibling gate at ~line 1187 (fixed 2026-06-28). The old mask counted only EXTERNAL, so a
+                // pending DEC made exc=0x5 (EXT+DEC) look non-maskable -> delivered at EE=0 -> guest spins
+                // at 0x801138c4 instead of advancing to OSRestoreInterrupts + the idle spin 0x800ba2f0, so
+                // the atomic handover can't catch it. Deferring maskable at EE=0 lets it advance.
+                const EXC_MASKABLE = EXC_EXTERNAL_INT | EXC_DECREMENTER;
                 const MSR_EE = 0x8000;
-                const externalOnly = (exc & ~EXC_EXTERNAL_INT) === 0;
+                const externalOnly = (exc & ~EXC_MASKABLE) === 0;
                 if (!externalOnly || (msr & MSR_EE) !== 0) {
+                  // [dual-core DSP/AI mask 2026-06-29] The worker now dispatches the interrupt
+                  // itself again (fast path) — the DSP/AI overrun root is fixed in dolphin
+                  // (ProcessorInterface::UpdateException + dolphin_read32 hide INT_CAUSE_DSP/AI),
+                  // so __OSDispatchInterrupt only sees handleable interrupts (VI etc.) and the
+                  // unbounded prio loop no longer overruns. Vector + re-enter.
                   _mboxCall10(pc >>> 0);
                   pc = u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] >>> 0;
-                  // Continue: re-enter slice from the (possibly
-                  // vector-redirected) new pc.
                 } else {
                   // EE off + external-only: dolphin will hold the
                   // interrupt until EE comes on. Exit the slice so
@@ -922,9 +1209,219 @@
         }
         // Legacy JS inner loop (default path). Skipped when the C-slice
         // path above ran to completion.
+        // [slice-active 2026-07-10 — PERMANENT, the mid-block delivery invariant] SAB
+        // 0x026B1A00 = 1 while a worker slice executes (including parked-in-round-trip time).
+        // Dolphin's autonomous delivery defers on it: an interrupted block must resume at the
+        // interrupted instruction or defer the interrupt to a boundary — NEVER rewind to a
+        // lagging set_pc (the HI-re-exec / duplicate-LO / torn-transfer class). Deliveries
+        // reach the guest only via the worker's own loop-top or cmd-10.
+        Atomics.store(i32, 0x026B1A00 >> 2, 1);
+        // [cfg-provenance 2026-07-09 — PERMANENT] record WHICH loop is live (bit2=legacy,
+        // bit0=C-slice) + a liveness counter, so acceptance runs verify against the actual
+        // configuration, not the ledger's intent (the dead-C-slice false-"done" class).
+        if (!(mod && mod.PPC_WORKER_USE_C_SLICE === 1)) {
+          u32[0x026B1840 >> 2] = (u32[0x026B1840 >> 2] | 4) >>> 0;
+          u32[0x026B1848 >> 2] = ((u32[0x026B1848 >> 2] >>> 0) + 1) >>> 0;
+        } else {
+          u32[0x026B1840 >> 2] = (u32[0x026B1840 >> 2] | 1) >>> 0;
+        }
+        // [vec-edge — task-18 instrument STRIPPED 2026-07-09 per gate #8; ring was 0x026B1850-18B0]
+        // [deliv-reconcile 2026-07-09 — task #18 ROOT FIX] Dolphin delivers worker-raised SYNC
+        // exceptions (ISI/DSI from cmd-9 interp fetches) on ITS thread between worker dispatches
+        // — the sync arms are not owner-gated. The JS cursor then goes STALE and "block return
+        // is canonical" dispatches OVER the redirect (proven: vec-disp 594(400)@1000>594 — the
+        // rfi block re-ran with the ISI's SRR0/SRR1, clobbering the delivery and birthing the
+        // self-sustaining 0x594@IR=1 ISI loop). Every dolphin delivery commit bumps the deliv-
+        // ring head (SAB 0x026B0970, EXT + sync arms). Adopt ctx.PC as the cursor whenever the
+        // generation moved since our last look. (Worker-inline deliveries move the cursor
+        // themselves; cmd-10 re-reads ctx.PC — both already coherent.)
+        // [pollAdvance 2026-07-09 — unified EE=0 completion-wait handler, ALL engagement sites]
+        // Census (28 rolls): 21 wedged in DSP/EXI polls with sim-time at ~30k ticks/s — the
+        // smooth-step never engaged (mailbox-bound polls never exhaust downcount; the sleep-tick
+        // threshold of 1024 same-pc iters = 68s at 15Hz) and the old jumps targeted ONLY the
+        // worker's PURE queue and never woke dolphin (the completing DSP/EXI events are HYBRIDS
+        // in DOLPHIN's queue, head published @0x026B0910/14/18). This helper:
+        //   - discriminates by the polled register (env read wrappers record addr+seq):
+        //     fresh non-VI MMIO read => JUMP to min(pure head, dolphin head), LANDING ON the
+        //     target (due now) + cmd-4 kick so dolphin's Advance fires the hybrid immediately;
+        //     VI-range (0x0C002xxx beam) or no fresh MMIO (mftb/RAM polls) => smooth +2000;
+        //   - caps jumps at 4 per same-pc episode (the H2 one-event lesson: uncapped jumping
+        //     stormed 7k events/s -> exception burst -> PPCHalt on rolls 3/4) then smooths.
+        // Returns true when it advanced time (caller refills downcount and continues).
+        const pollAdvance = (pcNow) => {
+          const msrP = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
+          if ((msrP & 0x8000) !== 0) return false;                 // EE=1: event delivery wakes it
+          if ((self.__pjPc >>> 0) !== (pcNow >>> 0)) { self.__pjPc = pcNow >>> 0; self.__pjN = 0; self.__pjCall = 0; }
+          self.__pjCall = (self.__pjCall | 0) + 1;
+          const lrs = (self.__lastMmioRdSeq | 0);
+          const fresh = lrs !== (self.__pollSeqSeen | 0);
+          self.__pollSeqSeen = lrs;
+          const lra = (self.__lastMmioRdAddr >>> 0) & 0x0FFFFF00;
+          // [periodic-event waits 2026-07-09] a hard 4-jump cap strangled waits fed by PERIODIC
+          // events (the AX ucode pushes its response mail from the 1-ms DSP_Update tick — the
+          // guest needs DOZENS of events, observed: 53 jumps then smooth-crawl forever at the
+          // DSPCheckMailFromDSP face). After the first 4 burst jumps, keep jumping at a BOUNDED
+          // rate (1 per 64 pollAdvance calls ~ few hundred events/s max — under storm levels).
+          const jumpOk = ((self.__pjN | 0) < 4) || ((self.__pjCall & 63) === 0);
+          if (fresh && lra !== 0x0C002000 && jumpOk) {
+            let tl = 0, th = 0, have = false;
+            const nx = findNextEventCycles();
+            if (nx) { tl = nx.lo >>> 0; th = nx.hi >>> 0; have = true; }
+            if (u32[0x026B0918 >> 2] !== 0) {
+              const dl = u32[0x026B0910 >> 2] >>> 0, dh = u32[0x026B0914 >> 2] >>> 0;
+              if (!have || (dh >>> 0) < (th >>> 0) || (dh === th && (dl >>> 0) < (tl >>> 0))) {
+                tl = dl; th = dh; have = true;
+              }
+            }
+            if (have) {
+              const gl = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
+              const gh = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
+              const far = ((th >>> 0) > gh) || (th === gh && ((tl - gl) >>> 0) > 1024);
+              if (far) {
+                u32[(CT_BASE + CT_OFF_GTL) >> 2] = tl;             // land ON the target: due NOW
+                u32[(CT_BASE + CT_OFF_GTH) >> 2] = th;
+                mod._ppc_worker_ct_fire_due_pure(tl, th);
+                mod._ppc_worker_mailbox_call_sync(4, 0x80000000);  // dolphin Advance fires hybrids NOW
+                self.__pjN = (self.__pjN | 0) + 1;
+                u32[0x026C0030 >> 2] = (self.__pollJumpN = (self.__pollJumpN | 0) + 1) >>> 0;
+                lastPc = pcNow;
+                Atomics.store(i32, (PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2, 20000);
+                return true;
+              }
+            }
+          }
+          // beam / no-fresh-MMIO / jump-capped: smooth step + due-kick (the 2026-07-07 semantics)
+          const gtl1 = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
+          const step = (gtl1 + 2000) >>> 0;
+          u32[(CT_BASE + CT_OFF_GTL) >> 2] = step;
+          if (step < gtl1) u32[(CT_BASE + CT_OFF_GTH) >> 2] =
+            ((u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0) + 1) >>> 0;
+          mod._ppc_worker_ct_fire_due_pure(step, u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0);
+          u32[0x026B0E48 >> 2] = (self.__smoothN = (self.__smoothN | 0) + 1) >>> 0;
+          if (u32[0x026B0918 >> 2] !== 0) {
+            const nl = u32[0x026B0910 >> 2] >>> 0, nh = u32[0x026B0914 >> 2] >>> 0;
+            const g2 = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
+            if (g2 > nh || (g2 === nh && step >= nl))
+              mod._ppc_worker_mailbox_call_sync(4, 0x80000000);
+          } else if ((self.__smoothN & 63) === 0)
+            mod._ppc_worker_mailbox_call_sync(4, 0x80000000);
+          lastPc = pcNow;
+          Atomics.store(i32, (PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2, 20000);
+          return true;
+        };
+        let __lastDelivGen = u32[0x026B0970 >> 2] >>> 0;
+        // [ext-inflight guard 2026-07-16 — SUSTAIN: kill the ARAM/DSP interrupt storm]
+        // Native delivers ONE external interrupt at a block boundary, runs its handler to
+        // completion at EE=0 (the 0x500 vector clears MSR.EE; __OSDispatchInterrupt keeps
+        // scheduler disabled), ACKs the device register, then rfi's back to the interrupted
+        // pc (SRR0). It does NOT deliver the next EXT until that rfi lands. Our worker's
+        // inline vectoring re-fired 0x500 on the very NEXT dispatch iteration whenever
+        // EXTERNAL_INT was pending with EE=1 — so once the MP4 audio path parks in
+        // aramStoreData's `while (HuARDMACheck())` spin (arqCnt, decremented ONLY by the
+        // ARAM-DMA-complete ISR callback ArqCallBackAM), each ARAM completion (scheduled by
+        // Do_ARAM_DMA every (count/32)*246 ticks, DSP.cpp) re-raised the DSP cause before the
+        // guest's rfi + poll could observe arqCnt==0. The re-entry re-saved GPRs into the
+        // handler's on-stack exceptionContext (OSCurrentContext is swapped by __ARHandler),
+        // corrupted r1/the resume image, and the guest derailed (null-deref at __start). The
+        // storm is exactly the one documented at DSP.cpp:476-479. Fix: track the SRR0 of the
+        // in-flight delivery and REFUSE to vector another EXT until the guest's live pc returns
+        // to it (rfi landed = handler finished = device ACKed). The pending EXT bit is left set
+        // (deferred, not dropped) and re-attempts on a later iteration once the handler resumes.
+        let __extInFlight = false;   // an EXT 0x500 vector is in progress; block re-delivery
+        let __extSrr0 = 0;           // interrupted pc we vectored from (rfi must return here)
+        let __extInflightIters = 0;  // safety: force-clear if the handler never returns to SRR0
+        const __delivReconcile = () => {
+          const _g = u32[0x026B0970 >> 2] >>> 0;
+          if (_g !== __lastDelivGen) {
+            __lastDelivGen = _g;
+            const _live = u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] >>> 0;
+            if (_live !== (pc >>> 0)) {
+              u32[0x026B1904 >> 2] = ((u32[0x026B1904 >> 2] >>> 0) + 1) >>> 0;  // reconcile count
+              pc = _live;
+            }
+            return true;
+          }
+          return false;
+        };
         for (; (!(mod && mod.PPC_WORKER_USE_C_SLICE === 1
                   && typeof mod._ppc_worker_run_slice === 'function'))
                && iters < safetyCap; ++iters) {
+          // [deliv-reconcile] adopt any dolphin-delivered redirect BEFORE dispatching (the
+          // stale-cursor race, task #18 root — see the helper above).
+          __delivReconcile();
+          // [ext-inflight guard 2026-07-16] The in-flight EXT delivery completes when the
+          // guest's ISR handler finishes: its terminal OSLoadContext/rfi restores an EE=1
+          // context (SRR1 had EE=1) — so MSR.EE, forced to 0 by the 0x500 vector, transitions
+          // back to 1. That EE 0->1 edge is the robust "handler done" signal (survives a thread
+          // switch via __OSReschedule, unlike an exact SRR0 rfi-return match). Also accept the
+          // direct rfi-to-SRR0 return as a fast path, and a bounded safety cap so a genuinely
+          // stuck handler can never wedge delivery forever (the pending bit then re-attempts).
+          if (__extInFlight) {
+            const _eeNow = (u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0) & 0x8000;  // MSR.EE
+            if (_eeNow !== 0 || (pc >>> 0) === (__extSrr0 >>> 0)
+                || ++__extInflightIters > 200000) {
+              __extInFlight = false;
+              __extInflightIters = 0;
+            }
+          }
+          // [pe-finish handler-run counter TEMP 2026-07-11] does the guest run
+          // GXFinishInterruptHandler (0x800CAB3C, sets DrawDone=1 + wakes FinishQueue)
+          // post-takeover? @0x026B1A98. If 0 -> PE_FINISH never dispatched to the guest.
+          if ((pc >>> 0) === 0x800cab3c) u32[0x026B1A98 >> 2] = ((u32[0x026B1A98 >> 2] >>> 0) + 1) >>> 0;
+          // [wall-2 TEMP] does the render thread execute GXSetDrawDone(0x800ca7a8)/the WPAR-token
+          // block(0x800ca594)/GXWaitDrawDone(0x800ca840) post-takeover? gxSetDD@0x026B1A9C,
+          // gxFlushTok@0x026B1AA0, gxWaitDD@0x026B1AA4. If all 0 -> render thread never runs the
+          // draw-done path (stuck/asleep elsewhere), DrawDone=0 is stale from dolphin.
+          if ((pc >>> 0) === 0x800ca7a8) u32[0x026B1A9C >> 2] = ((u32[0x026B1A9C >> 2] >>> 0) + 1) >>> 0;
+          if ((pc >>> 0) === 0x800ca594) u32[0x026B1AA0 >> 2] = ((u32[0x026B1AA0 >> 2] >>> 0) + 1) >>> 0;
+          if ((pc >>> 0) === 0x800ca840) u32[0x026B1AA4 >> 2] = ((u32[0x026B1AA4 >> 2] >>> 0) + 1) >>> 0;
+          // [await-pc 2026-07-03] The boot dispatcher can start before dolphin publishes
+          // the first real pc — the SAB slot is zero-initialized, and dispatching pc=0
+          // walks the reset vector's stub, manufacturing 'Unhandled Exception 0' (guest
+          // OSREPORT) that tramples the boot process state (the invisible scene-killer).
+          // Gate ONLY the initial zero state; once any nonzero pc is seen, never re-gate
+          // (mid-run vectors to low memory stay legal — the old blanket guard starved boot).
+          if (!self.__pcEverValid) {
+            if ((pc >>> 0) === 0) { exitReason = 'await-pc'; break; }
+            self.__pcEverValid = true;
+          }
+          // [vec-trace 2026-07-07] one-shot: on the first vector-page dispatch
+          // (pc<0x4000), record it + the next 16 dispatched pcs @0x026B0E50 (17 slots +
+          // armed-flag at +0x44). Answers "does the stub chain execute after delivery".
+          {
+            const _vt = u32[0x026B0E94 >> 2] >>> 0;  // 0=idle, 1..17=recording, 18=done
+            if (_vt === 0 && pc < 0x4000 && pc >= 0x100) {
+              u32[0x026B0E50 >> 2] = pc >>> 0;
+              u32[0x026B0E94 >> 2] = 1;
+            } else if (_vt >= 1 && _vt < 17) {
+              u32[(0x026B0E50 + (_vt << 2)) >> 2] = pc >>> 0;
+              u32[0x026B0E94 >> 2] = _vt + 1;
+            }
+          }
+          // [pc-ring — PERMANENT, cheap] last-256 dispatched pcs @SAB 0x026B0A40 (head
+          // ctr @0x026B0E44, monotonic). One store per block-exit; the deliv-ring stamps
+          // this counter at each delivery so post-mortems align dispatches to deliveries.
+          {
+            const _h = u32[0x026B0E44 >> 2] >>> 0;
+            u32[(0x026B0A40 + ((_h & 255) << 2)) >> 2] = pc >>> 0;
+            u32[0x026B0E44 >> 2] = _h + 1;
+          }
+          if ((((pc < 0x80000000) && (pc < 0x100 || pc > 0xfff)) || pc >= 0x81800000) && !self.__rawLogged) {
+            // Skip the legit real-mode exception vectors (0x100..0xd00) so the ring
+            // captures the HANDLER's execution (e.g. 0xc00 syscall handler) up to the
+            // REAL garbage (0x840480), pinpointing where the handler diverges.
+            self.__rawLogged = true;
+            // [garbage-path] pc went out of guest range: the block dispatched at
+            // the PRECEDING ring entry returned this bad next-pc. Dump the path so
+            // we can disassemble that block + diff what value it read (the cutover
+            // state bug) vs native. Also dump the diverging block's regs.
+            postMessage({ cmd: 'print', txt: '[ppc-path] GARBAGE next=0x' + (pc >>> 0).toString(16)
+              + ' r1=0x' + (u32[(PPC_STATE_BASE + 0x14 + 1*4) >> 2] >>> 0).toString(16)
+              + ' r3=0x' + (u32[(PPC_STATE_BASE + 0x14 + 3*4) >> 2] >>> 0).toString(16)
+              + ' r5=0x' + (u32[(PPC_STATE_BASE + 0x14 + 5*4) >> 2] >>> 0).toString(16)
+              + ' srr0=0x' + (u32[(PPC_STATE_BASE + 0x340 + 26*4) >> 2] >>> 0).toString(16)
+              + ' lr=0x' + (u32[(PPC_STATE_BASE + 0x340 + 8*4) >> 2] >>> 0).toString(16) });
+          }
           // Update SAB diag every 256 iters so we can see progress
           // from the page even if no ack ever fires.
           if ((iters & 0xFF) === 0) {
@@ -939,10 +1436,25 @@
           if (Atomics.load(i32, STOP_FLAG_ADDR >> 2) !== 0) {
             exitReason = 'stop-flag'; break;
           }
+          // [collapse] AUTHORITATIVE CPU OWNERSHIP. If the WORKER does not own the CPU, dispatch ZERO guest
+          // blocks. This clean boundary has pc/downcount/exc already flushed to SAB with no block in flight.
+          // cpu_owner @ SAB 0x026A0000: 0=DOLPHIN (boot default), 1=WORKER. Task 1 first cut: yield the slice
+          // when not owner; Task 2 replaces the break with Atomics.wait to park until ownership is re-granted.
+          if (Atomics.load(i32, 0x026A0000 >> 2) !== 1) {
+            exitReason = 'not-owner'; break;
+          }
           // Phase IV slice cycles budget exhausted — yield to dolphin
           // service_iter so MMIO mirror drains and hybrid-event cadence
           // gets applied to CoreTiming.
-          if (sliceCyclesCap > 0 && sliceCyclesBurned >= sliceCyclesCap) {
+          // [owner-no-yield 2026-07-07] Every purpose of this yield is superseded under
+          // worker ownership: the mailbox drain is unconditional in run_iter_batch
+          // (fix 1), the due-kick fires dolphin synchronously at event-due points, and
+          // the mmio-mirror is disabled. The exit only cost a full page round-trip PER
+          // SLICE — measured ackIters=1/slice at the spin ≈ one block per ~1ms+latency,
+          // the pace root in its purest form. The wall-time-cap above still bounds the
+          // slice, so the page keeps getting acks.
+          if (sliceCyclesCap > 0 && sliceCyclesBurned >= sliceCyclesCap
+              && Atomics.load(i32, 0x026A0000 >> 2) !== 1) {
             exitReason = 'slice-budget'; break;
           }
           // Wall-time gated CT fire (was dispatch-count gated on
@@ -952,9 +1464,8 @@
           // matches native VI cadence (60 Hz) regardless of dispatch
           // throughput, so events scheduled to fire at wall-60Hz
           // actually fire at wall-60Hz rather than at JIT-disp-rate/256.
-          const _nowMs_ct = (typeof performance !== 'undefined') ? performance.now() : Date.now();
-          if ((_nowMs_ct - lastCtFireMs) >= CT_FIRE_INTERVAL_MS) {
-            lastCtFireMs = _nowMs_ct;
+          if ((sliceCyclesBurned - lastCtFireCycles) >= CT_FIRE_CYCLES) {
+            lastCtFireCycles = sliceCyclesBurned;
             // Phase 2e fix: advance global_timer by the cycles burned
             // since the last CT-fire, THEN fire_due_pure with the new
             // time. Without this advance, events scheduled mid-slice
@@ -987,16 +1498,146 @@
             if (exc !== 0) {
               const msr = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
               const EXC_EXTERNAL_INT = 0x00000004;
+              const EXC_DECREMENTER  = 0x00000001;
+              // [maskable-set fix 2026-06-28] BOTH EXTERNAL_INT and DECREMENTER are
+              // EE-maskable async interrupts (PowerPC.cpp CheckExternalExceptions gates
+              // both on MSR.EE). The old code masked only EXTERNAL_INT, so a pending DEC
+              // (exc=0x5 at the SelectThread idle loop) looked "non-maskable" -> the worker
+              // issued cmd-10 every iter, dolphin couldn't vector at EE=0, and it spun
+              // forever (safety-cap) WITHOUT advancing the guest to its OSRestoreInterrupts.
+              const EXC_MASKABLE = EXC_EXTERNAL_INT | EXC_DECREMENTER;
               const MSR_EE = 0x8000;
-              const externalOnly = (exc & ~EXC_EXTERNAL_INT) === 0;
+              const externalOnly = (exc & ~EXC_MASKABLE) === 0;
               if (!externalOnly || (msr & MSR_EE) !== 0) {
-                call1(10, pc >>> 0);
+                // [npc-sync fix 2026-06-28] CheckExternalExceptions captures
+                // SRR0 = ppc_state.npc (PowerPC.cpp:603/627). The worker maintains
+                // PC on dispatch but NOT NPC, so at a non-mtmsr block (e.g. the
+                // SelectThread idle spin 0x800ba2f0 = lwz/cmplwi/beq) NPC stays
+                // STALE at dolphin's last pre-cutover block (observed SRR0 =
+                // ReverbHICallback+0x54). Delivery then sets SRR0 = garbage, and
+                // the handler's rfi returns to the wrong context (EE=0) instead of
+                // the spin -> guest wedges at EE=0, never wakes. Native takes the
+                // async int at the block boundary with SRR0 = the about-to-run pc
+                // (native trace: DEC vector srr0=0x800ba2f0). Mirror that: NPC = pc.
+                u32[(PPC_STATE_BASE + OFFSET_NPC) >> 2] = pc >>> 0;
+                // [STEP 2 REDO 2026-07-09 — worker-side EXT vectoring ON THE LIVE LOOP] The prior
+                // step-2 implementation sat in the dead C-slice (PPC_WORKER_USE_C_SLICE=0); THIS
+                // is the live dispatch loop, so the inline delivery lives here. Post-takeover
+                // (cpu_owner==1) the CPU worker vectors the async EXTERNAL_INT itself — no cmd-10
+                // round-trip — reproducing CheckExternalExceptions' commit exactly (PowerPC.cpp):
+                // SRR0=pc (npc-synced above), SRR1=msr&0x87C0FFFF, MSR.LE=ILE, msr&=~0x04EF36,
+                // msr|=0x1000 (ME-preserve), pc=0x500. Gates: EE=1 (checked in the enclosing if,
+                // re-checked here for the EXT bit specifically), pc>=0x4000 (never vector inside a
+                // stub), os-ready (MEM[0xC0] = valid physical OSCurrentContext), owner==1 (pre-
+                // takeover boot keeps cmd-10 byte-identical — protects gm40/gm50 determinism).
+                // The EXC clear is Atomics.and so a concurrent device-worker set (Processor-
+                // Interface UpdateException, __atomic RELEASE) can't be lost (deferral != drop).
+                // DEC/sync exceptions still route via cmd-10 below. Deferred bits re-attempt
+                // loop-natively (this block re-runs every dispatch iteration).
+                if ((exc & EXC_EXTERNAL_INT) !== 0 && (msr & MSR_EE) !== 0
+                    && (pc >>> 0) >= 0x4000
+                    && !__extInFlight   // [ext-inflight guard 2026-07-16] one EXT at a time (native parity)
+                    && Atomics.load(i32, 0x026A0000 >> 2) === 1
+                    && mem1Base !== 0) {
+                  const _rawC0 = u32[(mem1Base + 0xC0) >> 2] >>> 0;
+                  const _osCtx = (((_rawC0 & 0xFF) << 24) | ((_rawC0 & 0xFF00) << 8)
+                                  | ((_rawC0 >>> 8) & 0xFF00) | (_rawC0 >>> 24)) >>> 0;
+                  if (_osCtx !== 0 && _osCtx < 0x01800000) {
+                    u32[(PPC_STATE_BASE + 0x3A8) >> 2] = pc >>> 0;            // SRR0 = interrupted pc
+                    const _srr1 = (msr & 0x87C0FFFF) >>> 0;
+                    u32[(PPC_STATE_BASE + 0x3AC) >> 2] = _srr1;               // SRR1 = masked msr image
+                    let _nmsr = ((msr & ~1) | ((msr >>> 16) & 1)) >>> 0;      // LE(bit0) = ILE(bit16)
+                    _nmsr = (_nmsr & ~0x04EF36) >>> 0;                        // clear EE/IR/DR/... (dolphin parity)
+                    _nmsr = (_nmsr | 0x1000) >>> 0;                           // ME-preserve
+                    Atomics.store(i32, (PPC_STATE_BASE + OFFSET_MSR) >> 2, _nmsr | 0);
+                    Atomics.and(i32, (PPC_STATE_BASE + OFFSET_EXC) >> 2, ~EXC_EXTERNAL_INT);
+                    // [dSrr0 side-channel — STEP-2 acceptance, FRESH cells (0x0600 is AoT-pack-
+                    // polluted per audit wf_fa7314c9)]: 0x026B0630=SRR0, 0x0634=SRR1 image
+                    // (identity: v&0x87C0FFFF==v AND bit 0x8000 set), 0x0638=delivery count.
+                    u32[0x026B0630 >> 2] = pc >>> 0;
+                    u32[0x026B0634 >> 2] = _srr1;
+                    u32[0x026B0638 >> 2] = ((u32[0x026B0638 >> 2] >>> 0) + 1) >>> 0;
+                    // [ext-inflight guard 2026-07-16] Mark this delivery in-flight and remember
+                    // the interrupted pc (== SRR0). The loop-head clears the guard once the
+                    // guest's ISR chain rfi's back here, gating the next EXT until then (native
+                    // one-at-a-time delivery; ends the ARAM/DSP re-entry storm).
+                    __extInFlight = true;
+                    __extSrr0 = pc >>> 0;
+                    __extInflightIters = 0;
+                    u32[0x026B063C >> 2] = pc >>> 0;  // [ext-inflight] published SRR0 for probe
+                    pc = 0x500;
+                    u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] = pc;
+                    u32[(PPC_STATE_BASE + OFFSET_NPC) >> 2] = pc;
+                    continue;
+                  }
+                }
+                // mailbox cmd 10 (dolphin_check_exc) — call directly; the
+                // call1 helper is scoped to the env-setup block, not here.
+                self.__delivN = (self.__delivN | 0) + 1;  // [r31-trap] count deliveries
+                mod._ppc_worker_mailbox_call_sync(10, pc >>> 0) >>> 0;
                 pc = u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] >>> 0;
+                // [redirect-trace 2026-07-07] publish this loop's base + the re-read pc
+                // (SAB 0x026B0E98/0x026B0E9C) — the active-loop discriminator.
+                {
+                  const _v = new Uint32Array(sharedMemoryRef.buffer);
+                  _v[0x026B0E98 >> 2] = PPC_STATE_BASE >>> 0;
+                  _v[0x026B0E9C >> 2] = pc >>> 0;
+                }
                 continue;
               }
             }
             const downcount = i32[(PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2];
-            if (downcount <= 0) { exitReason = 'downcount-exhausted'; break; }
+            if (downcount <= 0) {
+              // [slice self-refill 2026-07-03] THE cadence wall: the worker burned its
+              // 20000-cycle slice ~instantly and used to exit-and-wait for dolphin's tick
+              // to refill — measured <2 slices/s (retired 3332404/90s ÷ 20000). Post-
+              // handover the worker OWNS the CPU: refill locally and keep executing. The
+              // per-iter CT-fire path advances the shared global timer + fires due pure
+              // events as cycles accrue; dolphin's own tick keeps firing hybrid (VI/DSP)
+              // events at its wall cadence from the published time. Pre-handover
+              // (cpu_owner==0) keeps the old exit so boot-dispatch behavior is unchanged.
+              if (Atomics.load(i32, 0x026A0000 >> 2) === 1) {
+                // [idle-slice jump 2026-07-03] Chain mode burns a full 20000-cycle slice
+                // in-wasm; a slice that returned at the SAME pc it entered = the guest is
+                // wait-spinning (VIWaitForRetrace/ARQ). Jump sim-time to the next event NOW
+                // instead of waiting ~100 idle slices for the legacy detector — frames were
+                // gated at sim-cycles/8.1M (measured 285 frames vs 1.95B retired).
+                if (pc === lastPc) {
+                  // [smooth-poll 2026-07-07] EE=0 spin = a POLL of time-derived hardware
+                  // (VI beam position: pcring caught 0x800c730c/7598/759c looping at
+                  // msr=0x1032 exc=4 for 12K+ dispatches — the jump aliased the beam
+                  // position past the poll's target window every sample). No event can
+                  // wake an EE=0 poll; it exits only by OBSERVING the value sweep. Step
+                  // time smoothly instead of jumping.
+                  if (pollAdvance(pc)) {
+                    self.__selfRefills = (self.__selfRefills | 0) + 1;
+                    continue;
+                  }
+                  const nxt = findNextEventCycles();
+                  if (nxt) {
+                    const gtl0 = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
+                    const gth0 = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
+                    const farHi = (nxt.hi >>> 0) > (gth0 >>> 0);
+                    const farLo = (nxt.hi === gth0) && ((nxt.lo - gtl0) >>> 0) > 1024;
+                    if (farHi || farLo) {
+                      let newLo = (nxt.lo - 1) >>> 0;
+                      let newHi = nxt.hi >>> 0;
+                      if (newLo === 0xFFFFFFFF && nxt.lo === 0) newHi = (newHi - 1) >>> 0;
+                      u32[(CT_BASE + CT_OFF_GTL) >> 2] = newLo;
+                      u32[(CT_BASE + CT_OFF_GTH) >> 2] = newHi;
+                      mod._ppc_worker_ct_fire_due_pure(newLo, newHi);
+                      self.__isjN = (self.__isjN | 0) + 1;
+                      mod._ppc_worker_mailbox_call_sync(4, 0x80000000);  // wake dolphin: fire hybrids NOW
+                    }
+                  }
+                }
+                lastPc = pc;
+                Atomics.store(i32, (PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2, 20000);
+                self.__selfRefills = (self.__selfRefills | 0) + 1;
+                continue;
+              }
+              exitReason = 'downcount-exhausted'; break;
+            }
           }
           // Wall-time cap (perf-measurement mode).
           if (wallTimeMs > 0 && (iters & 0xfff) === 0) {
@@ -1026,6 +1667,13 @@
               // Same-PC idle-skip detector applies to merged path too.
               if (next === lastPc) {
                 ++samePcCount;
+                // [pollAdvance engage 2026-07-09] mailbox-bound EE=0 polls run at ~15Hz — the
+                // 1024-iter sleep-tick threshold = 68s (never engages in a roll). Engage the
+                // unified poll handler FAST (>=8 same-pc, rate-limited every 8 iters).
+                if (Atomics.load(i32, 0x026A0000 >> 2) === 1
+                    && samePcCount >= 8 && (samePcCount & 7) === 0) {
+                  if (pollAdvance(next)) { pc = next; continue; }
+                }
                 // Item 7 sleep-tick: aggressively bump SAB global_timer
                 // when same-PC is sustained and next event is far. Runs
                 // BEFORE the 100-iter idle-skip exit so we don't bounce
@@ -1094,6 +1742,85 @@
               break;
             }
           }
+          // [vec-check 2026-07-03] Vector-page blocks (pc<0x4000) are rewritten by
+          // OSExceptionInit (dolsdk OS.c:282-284: memcpy + DCFlushRangeNoSync + sync +
+          // ICInvalidateRange) — an icbi our cache can't see. Re-verify the first
+          // instruction word each dispatch; mismatch = stale compile -> drop + recompile.
+          if (region && (pc >>> 0) < 0x4000 && mem1Base && self.__vecWord) {
+            // [vec-check FULL-BLOCK 2026-07-07] First-word-only verification let a stale
+            // stub TAIL execute: the 0x500 block compiled from PARTIAL stub bytes (first
+            // word already final), ran off the end to 0x594 -> guest ISI -> 'Non-recoverable
+            // Exception 3' -> PPCHalt (the post-takeover crash). Record + verify a 32-word
+            // window (the OS stub template is <= 0x80 bytes) — full staleness coverage at
+            // delivery-rate cost only.
+            const _base = (mem1Base + (pc & 0x01FFFFFF)) >> 2;
+            let _rec = self.__vecWord.get(pc >>> 0);
+            if (_rec === undefined) {
+              _rec = new Uint32Array(40);
+              for (let _w = 0; _w < 40; _w++) _rec[_w] = u32[_base + _w] >>> 0;
+              self.__vecWord.set(pc >>> 0, _rec);
+              if ((self.__vecRecN = (self.__vecRecN | 0) + 1) <= 8)
+                postMessage({ cmd: 'print', txt: '[vec-rec] pc=0x' + pc.toString(16)
+                  + ' mem1Base=0x' + (mem1Base >>> 0).toString(16)
+                  + ' w0=0x' + (_rec[0] >>> 0).toString(16) });
+            } else {
+              let _stale = -1;
+              for (let _w = 0; _w < 40; _w++) {
+                if (_rec[_w] !== (u32[_base + _w] >>> 0)) { _stale = _w; break; }
+              }
+              if (_stale >= 0) {
+                const _oldW = _rec[_stale] >>> 0, _newW = u32[_base + _stale] >>> 0;
+                region.pcMap.delete(pc >>> 0);
+                self.__vecWord.delete(pc >>> 0);
+                region = null; idx = -1;
+                if ((self.__vecStale = (self.__vecStale | 0) + 1) <= 8)
+                  postMessage({ cmd: 'print', txt: '[vec-check] stale vector block dropped pc=0x' + pc.toString(16)
+                    + ' word[' + _stale + ']@0x' + ((pc + _stale * 4) >>> 0).toString(16)
+                    + ' 0x' + _oldW.toString(16) + ' -> 0x' + _newW.toString(16)
+                    + ' mem1Base=0x' + (mem1Base >>> 0).toString(16) });
+              }
+            }
+          }
+          if (!region && self.__aot && self.__aot.enabled && self.__aot.map.has(pc >>> 0)) {
+            // [AoT — Task 2] pre-compiled function pack hit: instantiate the owning
+            // function's module once, register ALL its block pcs as pseudo-instances
+            // ({exports:{run}} — the dispatcher's inst.exports.run fallback), dispatch.
+            const _a = self.__aot;
+            const _ent = _a.map.get(pc >>> 0);
+            const _fi = _ent[0], _li = _ent[1];
+            let _inst = _a.instCache[_fi];
+            if (_inst === undefined) {
+              try {
+                const _off = _a.funcs[_fi * 5 + 1], _sz = _a.funcs[_fi * 5 + 2];
+                const _wm = new WebAssembly.Module(_a.pack.subarray(_off, _off + _sz));
+                _inst = new WebAssembly.Instance(_wm, mod.bemental_imports ? { env: mod.bemental_imports.env } : {});
+              } catch (e) {
+                _inst = null;
+                if ((self.__aotFail = (self.__aotFail | 0) + 1) <= 4)
+                  postMessage({ cmd: 'print', txt: '[aot] instantiate fail f' + _fi + ': ' + (e && e.message) });
+              }
+              _a.instCache[_fi] = _inst;
+            }
+            if (_inst) {
+              if (!regions[0]) regions[0] = { pcMap: new Map(), cycleMap: new Map(), instances: [] };
+              const _first = _a.funcs[_fi * 5 + 3], _nb = _a.funcs[_fi * 5 + 4];
+              for (let _b = 0; _b < _nb; _b++) {
+                const _bpc = _a.blockPcs[_first + _b] >>> 0;
+                if (regions[0].pcMap.has(_bpc)) continue;
+                const _idx = regions[0].instances.length;
+                regions[0].instances.push({ aot: true, exports: { run: (function (I, sel) {
+                  return function () { u32[0x026B0904 >> 2] = sel; return I.exports.region() >>> 0; };
+                })(_inst, _b) } });
+                regions[0].pcMap.set(_bpc, _idx);
+                regions[0].cycleMap.set(_bpc, 1);
+              }
+              if (regions[0].pcMap.has(pc >>> 0)) {
+                region = regions[0]; idx = regions[0].pcMap.get(pc >>> 0); blockCycles = 1;
+                if ((self.__aotHits = (self.__aotHits | 0) + 1) === 1)
+                  postMessage({ cmd: 'print', txt: '[aot] first dispatch hit pc=0x' + pc.toString(16) });
+              }
+            }
+          }
           if (!region) {
             if (!compileOnMiss) { exitReason = 'unmapped'; break; }
             // 2g: ppc-worker self-compile. Reads guest instructions from
@@ -1121,8 +1848,33 @@
                 ? { env: mod.bemental_imports.env } : {};
               const inst = new WebAssembly.Instance(wmod, importObj);
               regions[regionIdx].instances.push(inst);
-              regions[regionIdx].pcMap.set(pc >>> 0, fnIdx);
+              // [vector-page no-cache 2026-07-03] NEVER cache real-mode vector-page blocks
+              // (pc < 0x4000): the early pc=0-ISI storm executes the vectors BEFORE
+              // OSExceptionInit writes the real stubs, and the guest's later ICFlushRange
+              // never reaches this cache — halts traced to stale pre-install stub code
+              // dispatching EXT to OSDefaultExceptionHandler with a HEALTHY table
+              // (seed-watch ring: 500,588 -> 800b4c54; prim-exc: no sync faults; htab intact).
+              // Deliveries are ~250/s; per-delivery recompile of a tiny stub is cheap.
+              // [vector no-cache ENFORCED 2026-07-07] the comment above documented
+              // no-cache but the set() ran unconditionally — a stale vector block could
+              // be re-dispatched from the cache between OS rewrites (the 0x594-ISI class
+              // survived the full-block vec-check via paths that skip it). Vector-page
+              // blocks are NEVER cached: every delivery recompiles ~250/s, trivially
+              // cheap, and closes every staleness path by construction.
+              if ((pc >>> 0) >= 0x4000) {
+                regions[regionIdx].pcMap.set(pc >>> 0, fnIdx);
+              }
               regions[regionIdx].cycleMap.set(pc >>> 0, cycles);
+              if ((pc >>> 0) < 0x4000 && mem1Base) {
+                // record the 32-word window (format MUST match the full-block vec-check —
+                // the old single-number seed made every dispatch mismatch → perpetual
+                // drop/recompile loop → the vector never serviced within its window).
+                if (!self.__vecWord) self.__vecWord = new Map();
+                const _vb = (mem1Base + (pc & 0x01FFFFFF)) >> 2;
+                const _vr = new Uint32Array(40);
+                for (let _vw = 0; _vw < 40; _vw++) _vr[_vw] = u32[_vb + _vw] >>> 0;
+                self.__vecWord.set(pc >>> 0, _vr);
+              }
               region = regions[regionIdx];
               idx = fnIdx;
               blockCycles = cycles;
@@ -1137,10 +1889,69 @@
           // patterns from sab_polling_loop_skip). After 100 same-pc
           // dispatches, exit so dolphin's CoreTiming::Idle() can
           // fast-forward to the next event.
-          if (pc === lastPc) {
-            ++samePcCount;
-            // Item 7 sleep-tick (legacy path mirror).
-            if (samePcCount >= SLEEP_TICK_THRESHOLD) {
+          // [loop-window 2026-07-03] Multi-pc wait loops (e.g. the ARQ DMA wait ping-pongs
+          // 0x80111a48<->0x80111bb4 — measured 7.2KB/s ARAM upload, ~2.3s per chunk) never
+          // accumulate samePcCount. Track membership in a tiny 8-pc window; sustained
+          // membership counts like same-pc so the sleep-tick can jump sim-time to the next
+          // event. Compute loops that false-positive only get events sooner — safe.
+          if (!self.__lw) self.__lw = new Uint32Array(8);
+          var _inWin = false;
+          for (var _wi = 0; _wi < 8; _wi++) { if (self.__lw[_wi] === (pc >>> 0)) { _inWin = true; break; } }
+          if (!_inWin) {
+            self.__lw[(self.__lwI = ((self.__lwI | 0) + 1) & 7)] = pc >>> 0;
+          }
+          self.__lwN = _inWin ? ((self.__lwN | 0) + 1) : 0;
+          if (pc === lastPc || _inWin) {
+            if (pc === lastPc) ++samePcCount;  // idle-skip exit keyed on SINGLE-pc only
+            // [pollAdvance engage 2026-07-09] see the merged-path twin above.
+            // [multi-pc engage 2026-07-09] DSPCheckMailFromDSP-class polls are CALLS in a loop
+            // (3-4 pc cycle) — samePcCount resets every other dispatch and the single-pc
+            // engagement never fires (roll 5: DSP_Update 5x/20s = sim-time starved). Engage
+            // from the windowed detector (__lwN) too.
+            if (Atomics.load(i32, 0x026A0000 >> 2) === 1
+                && ((samePcCount >= 8 && (samePcCount & 7) === 0)
+                    || ((self.__lwN | 0) >= 8 && ((self.__lwN | 0) & 7) === 0))) {
+              if (pollAdvance(pc)) continue;
+            }
+            // Item 7 sleep-tick (legacy path mirror). Windowed (multi-pc) wait loops
+            // drive the gt-jump but never the idle-skip exit — exiting the pass per 100
+            // dispatches re-imposed the yield cadence (measured: upload rate DROPPED).
+            if (samePcCount >= SLEEP_TICK_THRESHOLD || (self.__lwN | 0) >= 400) {
+              // [dolphin-wake 2026-07-03] With fastmem the wait spins fully in-wasm — zero
+              // mailbox traffic — and the dolphin pthread parks in its futex; hybrid events
+              // (ARAM completion, VI) only fire from ITS Advance. Bimodal upload rates
+              // (17KB vs 5.1MB per 120s) = whether unrelated traffic kept dolphin awake.
+              // Ping it with a harmless read32 so Advance runs while we wait.
+              if (((self.__dwN = (self.__dwN | 0) + 1) & 63) === 0) {
+                mod._ppc_worker_mailbox_call_sync(4, 0x80000000);
+              }
+              // [smooth-poll, multi-pc 2026-07-07] Same semantics as the same-pc branch:
+              // an EE=0 loop is a TIME-OBSERVING poll (post-crash-fix wedge: VI field poll
+              // cycling 0x800c7710/7714/72fc at msr=0x32) — event-jumps alias the observed
+              // value; no event can wake EE=0. Step time smoothly instead.
+              {
+                const _msrW = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
+                if ((_msrW & 0x8000) === 0) {
+                  const gtlw = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
+                  const stepw = (gtlw + 2000) >>> 0;  // realtime-paced, see same-pc branch
+                  u32[(CT_BASE + CT_OFF_GTL) >> 2] = stepw;
+                  if (stepw < gtlw) u32[(CT_BASE + CT_OFF_GTH) >> 2] =
+                    ((u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0) + 1) >>> 0;
+                  mod._ppc_worker_ct_fire_due_pure(stepw, u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0);
+                  u32[0x026B0E4C >> 2] = (self.__smoothN2 = (self.__smoothN2 | 0) + 1) >>> 0;
+                  // [due-kick] see the same-pc branch.
+                  if (u32[0x026B0918 >> 2] !== 0) {
+                    const _nl2 = u32[0x026B0910 >> 2] >>> 0, _nh2 = u32[0x026B0914 >> 2] >>> 0;
+                    const _gh2 = u32[(CT_BASE + CT_OFF_GTH) >> 2] >>> 0;
+                    if (_gh2 > _nh2 || (_gh2 === _nh2 && stepw >= _nl2))
+                      mod._ppc_worker_mailbox_call_sync(4, 0x80000000);
+                  }
+                  lastPc = pc;
+                  Atomics.store(i32, (PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2, 20000);
+                  self.__selfRefills = (self.__selfRefills | 0) + 1;
+                  continue;
+                }
+              }
               const nxt = findNextEventCycles();
               if (nxt) {
                 const gtl0 = u32[(CT_BASE + CT_OFF_GTL) >> 2] >>> 0;
@@ -1183,12 +1994,22 @@
           }
           if (typeof fn !== 'function') { exitReason = 'no-block-export'; break; }
           let nextPc;
+          // [aot-chain] chained dispatches charge downcount INSIDE wasm across many
+          // blocks; derive cycles from the downcount delta (for gt-advance accounting)
+          // and skip the loop's own subtract to avoid double-charging.
+          const _isAotChain = !!(region.instances && region.instances[idx] && region.instances[idx].aot);
+          const _dc0 = _isAotChain ? i32[(PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2] : 0;
           try {
             nextPc = fn() >>> 0;
           } catch (e) {
             exitReason = 'block-trap: ' + (e && e.message ? e.message : String(e));
             break;
           }
+          if (_isAotChain) {
+            let _burn = (_dc0 - i32[(PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2]) | 0;
+            if (_burn < 1) _burn = 1;
+            sliceCyclesBurned += _burn;
+          } else {
           // Decrement downcount per dispatch (post-2f.0 cycles plumbing).
           // Use Atomics.sub to keep this race-free with dolphin's parallel
           // Run() until 2f.2 wires the yield handshake. In perf mode we
@@ -1197,9 +2018,21 @@
             Atomics.sub(i32, (PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2, blockCycles);
           }
           sliceCyclesBurned += blockCycles;
+          }
           // Update SAB pc to the new value (block return is canonical
           // per Q2 finding).
           u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] = nextPc;
+          // [b7a58-trace 2026-07-08] ExternalInterruptHandler (0x800b7a58) ends with
+          // `b __OSDispatchInterrupt (0x800b7714)`; the vec-trace showed the worker going
+          // to 0x500 instead. Capture the ACTUAL nextPc this block returns + msr/exc, to
+          // see if the branch produces 0x800b7714 (emitter OK, delivery intervenes) or a
+          // wrong target (emitter bug). 0x026B0A34=count,+4=nextPc,+8=msr,+C=exc.
+          if ((pc >>> 0) === 0x800b7a58) {
+            u32[0x026B0A34 >> 2] = (u32[0x026B0A34 >> 2] >>> 0) + 1;
+            u32[0x026B0A38 >> 2] = nextPc >>> 0;
+            u32[0x026B0A3C >> 2] = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
+            u32[0x026B0A40 >> 2] = u32[(PPC_STATE_BASE + OFFSET_EXC) >> 2] >>> 0;
+          }
           pc = nextPc;
         }
         // Phase IV commit: advance SAB global_timer atomically and fire
@@ -1227,11 +2060,32 @@
             mod._ppc_worker_ct_fire_due_pure(sumLo, sumHi);
           }
         }
+        // [determinize-boot / atomics-only loop 2026-07-08] Re-engage decision.
+        // Benign slice boundaries (the worker owns the CPU and just ran out of slice) do
+        // NOT need the page: service dolphin synchronously via the mailbox (each cmd-4 runs
+        // one dolphin_service_iter in-process, Atomics-blocking = deterministic ordering)
+        // a FIXED count, then re-run the slice. Only genuine exits (exception the page must
+        // route, stop-flag, owner lost, trap) post the ack + break to the switch.
+        {
+          const _ownerNow = Atomics.load(i32, 0x026A0000 >> 2);
+          const _stop = Atomics.load(i32, 0x02500004 >> 2);
+          const _benignExit = (exitReason === 'slice-budget'
+                            || exitReason === 'downcount-exhausted'
+                            || exitReason === 'safety-cap');
+          if (_ownerNow === 1 && _stop === 0 && _benignExit) {
+            // deterministic dolphin service (drain mailbox + Advance + tick devices)
+            for (let _s = 0; _s < 4; _s++) mod._ppc_worker_mailbox_call_sync(4, 0x80000000);
+            continue;  // re-run the slice internally — no postMessage round-trip
+          }
+        }
+        Atomics.store(i32, 0x026B1A00 >> 2, 0);  // [slice-active clear — true slice exit]
         postMessage({
           cmd: 'run-continuous-ack',
           iters, lastPc: pc, exitReason, compileCalls, totalCompileBytes,
           samePcCount, sliceCyclesBurned,
         });
+        _sliceLoop = false;
+        }
         break;
       }
       case 'mailbox-call': {

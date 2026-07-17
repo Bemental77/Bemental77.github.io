@@ -133,7 +133,23 @@ std::unique_ptr<NetPlayGolfUI> g_netplay_golf_ui;
 // CoreTiming-publish wiring lands as its own commit.
 extern "C" {
 unsigned dolphin_ct_drain_pending_mask() { return 0; }
-unsigned dolphin_ct_get_phase_flags() { return 0; }
+// [ppc-bridge cutover 2026-06-28] Read the phase flags the page publishes into the
+// SAB CT queue header (CT_QUEUE 0x02680000 + CT_OFF_PHASE_FLAGS 0x2C). Engages
+// Phase IV (dolphin runs event-only dolphin_service_iter, the ppc-worker is sole
+// PPC dispatcher) when the page sets CT_PHASE4|PHASE5 under ?ppcbootdispatch=1
+// (gamecube.html:1628). The cutover is completed by the in-process mailbox drain
+// in dolphin_service_iter (EmscriptenWorker.cpp). The default single-worker build
+// never writes the flag (SAB zero-init) -> 0 -> retro_run, so it is unaffected.
+unsigned dolphin_ct_get_phase_flags() {
+    // [dual-core handover fence 2026-06-30] ACQUIRE load to pair with the page's release/seq-cst
+    // Atomics.store of the Phase IV flag, so when dolphin observes the flag flip it also observes
+    // the worker's prior shared-ppc_state writes (happens-before). A plain volatile load lowers to
+    // a bare i32.load with no acquire barrier and does NOT form that edge -> stale-ppc_state risk.
+    // The ppc-worker side already does __ATOMIC_ACQUIRE (ppc_worker_main.cpp:825-830).
+    return __atomic_load_n(
+        reinterpret_cast<volatile unsigned*>(static_cast<uintptr_t>(0x0268002Cu)),
+        __ATOMIC_ACQUIRE);
+}
 void dolphin_set_ppc_state_external_storage(unsigned) {}
 }  // extern "C"
 

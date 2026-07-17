@@ -9,6 +9,10 @@
 #include <sstream>
 #include <vector>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 #ifdef _WIN32
 #include "Common/DynamicLibrary.h"
 #include "VideoBackends/D3D/VideoBackend.h"
@@ -87,6 +91,63 @@ void Init()
   std::string renderer = Libretro::Options::GetCached<std::string>(
     Libretro::Options::gfx_settings::RENDERER);
 
+#ifdef __EMSCRIPTEN__
+  // [main-thread WebGL2 render 2026-06-25] Re-enable Dolphin's OGL/GLES3 hardware
+  // backend under wasm so the GX draw stream is GPU-rasterized (the path to
+  // native-ish speed) instead of CPU-rasterized by the Software Renderer — but
+  // ONLY when the page opted into the main-thread WebGL2 replay path (variant
+  // A-ii). The page signals this by writing the GL descriptor into the shared
+  // wasm heap (gamecube.html __gcWriteGlDesc: magic 'GLRD'=0x474C5244 at word
+  // 0x07FF0000>>2, enabled flag at +4). It writes that descriptor ONLY after a
+  // main-thread WebGL2 context exists on #canvas, so its presence == "a consumer
+  // for the GL command stream is running on the main thread."
+  //
+  // When present: SetHWRender(OPENGLES3) → EmscriptenWorker's environment_cb
+  // answers SET_HW_RENDER, gl-record overlays the throwaway worker context, and
+  // the stream is replayed on the main thread (the only GPU surface; presented by
+  // the normal composited canvas swap → no worker GPU surface → no macOS-Metal
+  // SharedImage/IOSurface overlay-teardown crbug-948249 path).
+  //
+  // When absent: force the Software Renderer (the never-crashing CPU path that
+  // presents the XFB via video_cb -> page paintFrame2D). This keeps the safe
+  // software-default page working — without this gate the OGL backend would emit
+  // video_cb(data=-1) HW frames that the software page presents to nowhere (black).
+  {
+    // [WGPU M1] If the page set the WGPU shared-heap flag (0x07FF0100 = 'WGPU' = 0x57475055),
+    // select the native WebGPU backend. context_type stays NONE — WGPUGfx renders into an
+    // OFFSCREEN texture, reads the pixels back, and postMessages them to the page in the same
+    // {cmd:'render',pixels} shape the Software renderer's video_cb uses (no libretro video_cb,
+    // no HW-render FBO, no WebGPU canvas surface). This MUST run before the Software-Renderer
+    // default below, which previously returned unconditionally and made the later Video.cpp
+    // force-select dead code (the real reason WGPU never activated).
+    int want_wgpu = EM_ASM_INT({
+      var h = Module.HEAPU32 || new Uint32Array(Module.HEAPU8.buffer);
+      return (h[0x07FF0100 >> 2] === 0x57475055) ? 1 : 0;
+    });
+    if (want_wgpu)
+    {
+      Config::SetBase(Config::MAIN_GFX_BACKEND, "WGPU");
+      // [WGPU B1] Force UBERSHADER-EXCLUSIVE shader compilation. The WGPU backend's
+      // CreateShaderFromSource returns the PRE-TRANSLATED naga uber WGSL (gamecube/wgsl/
+      // dolphin_vk.{vert,frag}.wgsl) per stage; it has no runtime GLSL->WGSL translator, so it can
+      // only serve the ubershaders. SynchronousUberShaders makes Dolphin emit/compile ubershaders
+      // exclusively (g_ActiveConfig.UsingUberShaders()==true, no specialized GX shaders).
+      Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
+                      ShaderCompilationMode::SynchronousUberShaders);
+      MAIN_THREAD_EM_ASM({ postMessage({cmd: 'print', txt: '[wgpu] Init: MAIN_GFX_BACKEND = WGPU (ubershader-exclusive)'}); });
+      return;
+    }
+    int want_gl = EM_ASM_INT({
+      var h = Module.HEAPU32 || new Uint32Array(Module.HEAPU8.buffer);
+      return (h[0x07FF0000 >> 2] === 0x474C5244 && h[(0x07FF0000 >> 2) + 4] === 1) ? 1 : 0;
+    });
+    if (want_gl && SetHWRender(RETRO_HW_CONTEXT_OPENGLES3))
+      return;
+  }
+  Config::SetBase(Config::MAIN_GFX_BACKEND, "Software Renderer");
+  return;
+#endif
+
   if (renderer == "Hardware")
   {
     retro_hw_context_type preferred = RETRO_HW_CONTEXT_NONE;
@@ -117,6 +178,16 @@ void Init()
   }
   hw_render.context_type = RETRO_HW_CONTEXT_NONE;
 #ifdef __EMSCRIPTEN__
+  // [WebGPU M1 force-select] Uncomment the next two lines to force the WGPU
+  // (emdawnwebgpu) backend, which presents a SOLID CLEARED COLOR FRAME via the
+  // WGPUGfx clear+present path. Default OFF — this is the single line to flip
+  // for the Milestone 1 cleared-frame test.
+  Config::SetBase(Config::MAIN_GFX_BACKEND, "WGPU");
+  // [WGPU B1] Ubershader-exclusive (see want_wgpu path above for rationale).
+  Config::SetBase(Config::GFX_SHADER_COMPILATION_MODE,
+                  ShaderCompilationMode::SynchronousUberShaders);
+  return;
+
   // [HW-render 2026-06-17] The worker (EmscriptenWorker.cpp) now ANSWERS
   // SET_HW_RENDER and creates a WebGL2 context on the OffscreenCanvas, so try
   // Dolphin's OGL backend (GLES3 ≈ WebGL2) FIRST — it rasterizes on the GPU

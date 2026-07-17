@@ -49,29 +49,9 @@
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
-// Cross-TU arm channel for the [ax-wake-traj] dispatch trace (consumed in
-// bementalJIT block_cache.cpp dispatch_raw).
-namespace bemental {
-extern int g_ax_wake_arm;
-extern int g_ax_wake_ring[256];
-extern int g_ax_wake_ring_n;
-// [pc-census 2026-06-12] temporary (strip per gate #8): hot-PC/handle ring
-// filled by block_cache dispatch sites; drained + NOTICE_LOG'd from
-// dolphin_gather_drain below (dispatch-context output never reaches the
-// probe). Values >= 0x80000000 are guest PCs (chain/region paths); small
-// ints are block handles (dispatch_raw path).
-extern int g_pc_census_ring[256];
-extern int g_pc_census_n;
-extern u64 g_pc_census_total;
-extern u32 g_chain_iters;
-}
-// [region-debug TEMP] region_dispatch outcome counters (block_cache.cpp).
 extern "C" {
-extern uint32_t g_rd_calls, g_rd_nohandle, g_rd_noregion, g_rd_miss, g_rd_hit, g_rd_nogen;
 extern unsigned char g_bem_promote_active;  // [xinst-fix] gate the promote drain past boot
 }
-static void ax_wake_arm_set() { bemental::g_ax_wake_arm = 192; }
-
 
 extern "C" {
 
@@ -105,8 +85,11 @@ extern "C" {
 // lfd remain slowmem-only. dolphin_interp also sets the flag conservatively.
 // The flag therefore can never miss a GP write and starve the FIFO.
 extern "C" int g_bem_gp_dirty;   // defined in bementalJIT src/block_cache.cpp
+extern "C" int g_dc_handover_done;  // defined in ProcessorInterface.cpp (sticky post-handover)
 static inline void gp_dirty_check(uint32_t addr) {
-    if ((addr & 0x0FFFFFFFu) == 0x0C008000u) g_bem_gp_dirty = 1;
+    if ((addr & 0x0FFFFFFFu) == 0x0C008000u) {
+        g_bem_gp_dirty = 1;
+    }
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -121,25 +104,81 @@ uint32_t dolphin_read16(uint32_t addr) {
 
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_read32(uint32_t addr) {
-    return Core::System::GetInstance().GetMMU().Read<u32>(addr);
+    uint32_t val = Core::System::GetInstance().GetMMU().Read<u32>(addr);
+    // [dual-core DSP/AI mask 2026-06-29] Hide INT_CAUSE_DSP(0x40)+AI(0x20) from the PI interrupt-
+    // cause read (0xCC003000) so the worker's __OSDispatchInterrupt doesn't decode the unhandled
+    // DSP/AI interrupt and overrun its unbounded prio loop. PHASE-GATED (CT_PHASE_FLAGS bit1 @
+    // 0x0268002C): dolphin's OWN JitWasm CPU also reads MMIO through this trampoline during the
+    // single-core boot-batch phase (bootLoop -> _run_iter_batch -> retro_run, Phase IV CLEAR),
+    // where __OSDispatchInterrupt MUST see DSP or salInitDsp's `while(!salDspInitIsDone)` spins
+    // forever (the DSP init-complete interrupt never reaches dspInitCallback -> black screen, no
+    // handover). Only mask once the worker drives. Pairs with ProcessorInterface::UpdateException.
+    if (addr == 0xCC003000u) {
+        // Hide CP from the guest's cause read — the FIFO is host-pumped ([gpu-pump]);
+        // the guest's CP handler has nothing to do.
+        val &= ~0x800u;  // INT_CAUSE_CP
+        const uint32_t pf =
+            *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x0268002Cu));
+        // [dual-core DSP/AI mask STICKY 2026-06-30] mask DSP/AI (0x60) from the dispatcher's cause
+        // read once the worker has engaged — including the ISR excursion (Phase IV momentarily CLEAR).
+        // g_dc_handover_done is the sticky flag set in ProcessorInterface::UpdateException.
+        if (pf & 0x2u) g_dc_handover_done = 1;
+        // [dsp-unhide A/B 2026-07-02] cause-read hide DISABLED alongside ProcessorInterface's
+        // eff_cause hide: the post-audio-init guest has DSP/AI in its PI mask (0xffc) and NEEDS
+        // the ARAM-DMA interrupt (aramStoreData wedge). See ProcessorInterface.cpp:UpdateException.
+        // if ((pf & 0x2u) || g_dc_handover_done) val &= ~0x60u;
+    }
+    return val;
 }
 
 EMSCRIPTEN_KEEPALIVE
 void dolphin_write8(uint32_t addr, uint32_t val) {
     gp_dirty_check(addr);
+    if ((addr & 0x0FFFFFFFu) == 0x0C008000u) {
+        Core::System::GetInstance().GetGPFifo().Write8(static_cast<u8>(val));
+        return;
+    }
     Core::System::GetInstance().GetMMU().Write<u8>(static_cast<u8>(val), addr);
 }
 
 EMSCRIPTEN_KEEPALIVE
 void dolphin_write16(uint32_t addr, uint32_t val) {
     gp_dirty_check(addr);
+    if ((addr & 0x0FFFFFFFu) == 0x0C008000u) {
+        Core::System::GetInstance().GetGPFifo().Write16(static_cast<u16>(val));
+        return;
+    }
     Core::System::GetInstance().GetMMU().Write<u16>(static_cast<u16>(val), addr);
 }
 
 EMSCRIPTEN_KEEPALIVE
 void dolphin_write32(uint32_t addr, uint32_t val) {
     gp_dirty_check(addr);
+    // [gp-direct 2026-07-07] GP writes bypass the MMU route: measured 85% loss between
+    // MMU.Write and GPFifo::Write32 (gpW=374,733 vs gpFifoW=57,119) with the surviving
+    // fragments never completing a 32B chunk — zero bursts, FIFO empty, GXDrawDone slept
+    // forever. Direct routing guarantees ordered, lossless gather-pipe delivery.
+    if ((addr & 0x0FFFFFFFu) == 0x0C008000u) {
+        Core::System::GetInstance().GetGPFifo().Write32(val);
+        return;
+    }
     Core::System::GetInstance().GetMMU().Write<u32>(val, addr);
+}
+
+// [single-ordered-GX 2026-07-16 — RETIRED] dolphin_gp_seal/unseal were the Phase-IV-edge seal of
+// the shared gather pipe. They are NO LONGER CALLED: the excursion-GX drop is now structural at the
+// write site (GPFifo::gpfifo_reject_non_ring_gx gates on cpu_owner==1 && g_in_drain==0). Kept as
+// inert stubs (KEEPALIVE) so any stale JS/C reference resolves, but they must NOT touch
+// g_gp_discard — re-wiring the edge-toggle reintroduces the owner-clear splice race. Do not re-arm.
+extern "C" int g_gp_discard;  // defined in GPFifo.cpp — post-takeover stays 0 (boot-era use only)
+EMSCRIPTEN_KEEPALIVE
+void dolphin_gp_seal() {
+    // [single-ordered-GX 2026-07-16 — RETIRED] inert. The structural GPFifo::Write* reject replaced
+    // this. Must not set g_gp_discard (the old edge-toggle + owner-clear was the splice race).
+}
+EMSCRIPTEN_KEEPALIVE
+void dolphin_gp_unseal() {
+    // [single-ordered-GX 2026-07-16 — RETIRED] inert.
 }
 
 // Pending-exception drain after a block exit. Mirrors what every native
@@ -164,10 +203,60 @@ void dolphin_write32(uint32_t addr, uint32_t val) {
 // reach DSP halt 0954→0950). Gate is load-bearing for our path even if
 // not present in upstream. Restored.
 EMSCRIPTEN_KEEPALIVE
+extern "C" u32 g_in_cmd10 = 0;  // worker-requested delivery in progress (parked, safe)
 uint32_t dolphin_check_exc(uint32_t /*unused*/) {
+    g_in_cmd10 = 1;
+    struct Cmd10Guard { ~Cmd10Guard() { g_in_cmd10 = 0; } } _cmd10_guard;
     auto& sys = Core::System::GetInstance();
     auto& ps = sys.GetPPCState();
     auto& ppc = sys.GetPowerPC();
+
+    // [fp-eager A/B 2026-07-03] FP-unavailable -> set MSR.FP and RESUME (no vector). The
+    // mbx/ffAt census caught the vectored path looping forever in OSDefaultExceptionHandler
+    // with a garbage context (r3=7, r4="GMPE" = live junk, r1=0, srr1=0x30): the guest's
+    // 0x800 slot is not a context-loading FPU stub, so every fp-check raise recursed on a
+    // null stack (~470k mailbox calls/60s). Eager-FP trades lazy FP context-switch fidelity
+    // (FPRs are still saved/restored by OSContext switches per the context's own flags) for
+    // correctness-of-control-flow + throughput. Revisit with handler-presence detection if
+    // FP state corruption appears.
+    if (ps.Exceptions & EXCEPTION_FPU_UNAVAILABLE) {
+        ps.msr.FP = 1;
+        ps.Exceptions &= ~EXCEPTION_FPU_UNAVAILABLE;
+        PowerPC::RoundingModeUpdated(ps);
+        PowerPC::RecalculateAllFeatureFlags(ps);
+        if ((ps.Exceptions) == 0)
+            return 0;  // nothing else pending — resume the block path immediately
+    }
+
+    // [os-ready gate 2026-07-03 — the r1=0 orbit seed fix] NOTHING may vector until the OS
+    // context pointer at MEM[0xC0] is a plausible cached-MEM1 pointer. seed-watch caught an
+    // exception dispatched at gt=841 (earliest boot-dispatch) with MEM[0xC0] garbage: the
+    // canonical vector stub loaded r4=junk, OSDefaultExceptionHandler ran on r1=0 forever
+    // (~470k mailbox calls/60s). Generalizes the old EI-only 0xC0==0 suppression to ALL
+    // delivery — pre-OSInit, native never vectors either.
+    {
+        const u8* ram0 = sys.GetMemory().GetRAM();
+        u32 os_ctx = 0;
+        if (ram0) {
+            os_ctx = (u32(ram0[0xC0]) << 24) | (u32(ram0[0xC1]) << 16) |
+                     (u32(ram0[0xC2]) << 8) | u32(ram0[0xC3]);
+        }
+        // Valid = nonzero PHYSICAL MEM1 pointer (the OS stores the context pointer at 0xC0
+        // as physical: steady-state observed 0x001a5b38; the seed-era garbage was 0x074d5045).
+        const bool os_ready = (os_ctx != 0u) && (os_ctx < 0x01800000u);
+        if (!os_ready) {
+            // OS not ready: hold the MASKABLE classes (EXT|DEC — they dispatch through the
+            // OSContext-loading stubs and seeded the r1=0 orbit); let sync exceptions
+            // (syscall etc.) through — the blanket hold starved boot to retired=2121.
+            const u32 held = ps.Exceptions & (EXCEPTION_EXTERNAL_INT | EXCEPTION_DECREMENTER);
+            ps.Exceptions &= ~(EXCEPTION_EXTERNAL_INT | EXCEPTION_DECREMENTER);
+            const u32 pc0 = ps.pc;
+            if (ps.Exceptions != 0)
+                PowerPC::CheckExceptionsFromJIT(ppc);
+            ps.Exceptions |= held;
+            return (ps.pc != pc0) ? 1u : 0u;
+        }
+    }
 
     // [gate-8] Stripped per-block-exit diagnostic preamble
     // ([ax-queue]/[ax-minvc]/[ax-pad]/[ax-gxdd]/[ax-park]/[ax-gates]/[ax-rcount]:
@@ -194,9 +283,10 @@ uint32_t dolphin_check_exc(uint32_t /*unused*/) {
             // it so subsequent dolphin_check_exc calls re-evaluate.
             const u32 saved = ps.Exceptions & EXCEPTION_EXTERNAL_INT;
             ps.Exceptions &= ~EXCEPTION_EXTERNAL_INT;
+            const u32 pc_before_supp = ps.pc;
             PowerPC::CheckExceptionsFromJIT(ppc);
             ps.Exceptions |= saved;
-            return 0;
+            return (ps.pc != pc_before_supp) ? 1u : 0u;
         }
 
         // Jit64 mtmsr "issue 4336": when the EI is caused by the Command
@@ -205,12 +295,25 @@ uint32_t dolphin_check_exc(uint32_t /*unused*/) {
         // Jit_SystemRegisters.cpp:462-465.
         const u32 int_cause = sys.GetProcessorInterface().GetCause();
         if (int_cause & ProcessorInterface::INT_CAUSE_CP) {
-            return 0;
+            // [cp-hide 2026-07-06] CP is hidden from the guest (cause read masks 0x800);
+            // deassert it host-side so a stuck watermark can't keep the PI cause hot, and
+            // never defer on it — VI/SI/DSP deliveries proceed normally.
+            Core::System::GetInstance().GetCommandProcessor().SetCPStatusFromCPU();
         }
     }
 
+    // [post-op pc fix 2026-07-02 — SI-crash root, part 2] Report whether this call VECTORED
+    // (pc changed to a handler). The per-op exception bail (gekko emit_exception_bail) emits
+    // `if (ppc_check_exc(pc)) return ppc_state.pc;` — but this function returned 0
+    // unconditionally, so the bail NEVER exited the block: after an in-call vectoring
+    // (SRR0/MSR saved, pc=0x500) the block's REMAINING ops kept executing post-context-save,
+    // and then re-ran after the handler's rfi. Non-idempotent ops (stwu/pops/update-forms)
+    // corrupted r1/state — MP4's SI crash. Returning vectored=1 lets the bail exit
+    // immediately, so the dispatcher re-enters at the handler and rfi resumes at the
+    // post-op boundary (part 1: the bail now presents pc+4).
+    const u32 pc_before = ps.pc;
     PowerPC::CheckExceptionsFromJIT(ppc);
-    return 0;
+    return (ps.pc != pc_before) ? 1u : 0u;
 }
 
 // Block-exit marker. Reserved for future trap reporting / hot-path stats.
@@ -237,6 +340,13 @@ void dolphin_break_block(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
 // or advancing.
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_hle_check(uint32_t pc) {
+    // [hle-vector guard 2026-07-07] the 0x500 compile storm (slice acks: iters=4096==
+    // compileCalls, lastPc=0x500 forever) matches this file's own documented HLE-check
+    // loop class. Vector-page pcs are OS stubs — never HLE targets; skip the lookup
+    // entirely.
+    if (pc < 0x4000u) {
+        return 0u;
+    }
     // Pass-3 audit reverted the FIX 4 entry-only + IsEnabled gates: the
     // bridge installs HLE patches via HLE::Patch(addr, name) at
     // EmscriptenWorker.cpp:332-334 without populating PPCSymbolDB, so
@@ -292,6 +402,16 @@ void dolphin_interp(uint32_t /*unused*/, uint32_t pc) {
     auto& system = Core::System::GetInstance();
     auto& ppc_state = system.GetPPCState();
     if (ppc_state.pc != pc) return;
+    // [msr-refresh 2026-07-10 — PERMANENT, the manufactured-ISI root] The worker's inline
+    // EXT vectoring (ppc_worker.js STEP 2) mutates msr directly in the SAB (Atomics.store)
+    // — dolphin's msr-DERIVED state (feature_flags, membase) is never recomputed, so the
+    // next interpreter fallback fetched through a STALE translation context: the exception
+    // stub's terminal rfi at vector+0x94 hit Read_Opcode(0x594/0x994) with IR=1 semantics
+    // while the guest's msr.IR=0 -> BAT miss -> manufactured ISI (SRR1=0x40001030,
+    // impossible on HW at IR=0) -> stub sees SRR1.RI=0 -> OSDefaultExceptionHandler ->
+    // PPCHalt (the armframe-freeze face). Refresh here — the single funnel every
+    // interpreter fallback shares; fallbacks are rare (~0% of JIT time, see below).
+    system.GetPowerPC().MSRUpdated();
     // [perf gather-gate] An interp-stepped op may store to the gather pipe via
     // a path that does not go through dolphin_write* (belt-and-suspenders).
     // Interp fallback is rare (~0% of profiled JIT time), so conservatively
@@ -310,45 +430,6 @@ void dolphin_interp(uint32_t /*unused*/, uint32_t pc) {
 // (Jit.cpp:714) which is called from every MSR-changing op. Type-2 import
 // signature (i32, i32) -> () — both args unused; the handler reads the
 // global m_ppc_state via Core::System.
-extern "C" EMSCRIPTEN_KEEPALIVE void dolphin_log_recheck(int phase) {
-    // Compare inputs of the VIWaitForRetrace wake re-check block at the
-    // moment of its dispatch: r30 = startCount (live register), the SDA
-    // load source = ram[0x1D4428] (retraceCount), r13 (SDA base sanity).
-    static u64 n = 0;
-    auto& sys = Core::System::GetInstance();
-    if (phase == 1) {
-        auto& ps1 = sys.GetPPCState();
-        NOTICE_LOG_FMT(POWERPC, "[ax-vwaitset] r3={:#x} r2={:#x} r13={:#x} lr={:#x}", ps1.gpr[3],
-                       ps1.gpr[2], ps1.gpr[13], LR(ps1));
-        return;
-    }
-    ++n;
-    if (n > 64 && (n & 0x3FF) != 0) return;
-    auto& ps = sys.GetPPCState();
-    const u8* ram = sys.GetMemory().GetRAM();
-    const u32 rcount = ram ? ((u32(ram[0x1D4428]) << 24) | (u32(ram[0x1D4429]) << 16) |
-                              (u32(ram[0x1D442A]) << 8) | u32(ram[0x1D442B])) : 0;
-    // Caller of VIWaitForRetrace: its prologue stores the caller LR at
-    // [r1+0x14] (mflr r0; stw r0,4(r1); stwu r1,-0x10(r1) -> slot at +0x14).
-    u32 caller = 0;
-    if (ram) {
-        const u32 sp = ps.gpr[1] & 0x01FFFFFFu;
-        caller = (u32(ram[sp + 0x14]) << 24) | (u32(ram[sp + 0x15]) << 16) |
-                 (u32(ram[sp + 0x16]) << 8) | u32(ram[sp + 0x17]);
-    }
-    u32 min_vc = 0, min_vcf = 0;
-    if (ram) {
-        min_vc  = (u32(ram[0x1D3B04]) << 24) | (u32(ram[0x1D3B05]) << 16) |
-                  (u32(ram[0x1D3B06]) << 8) | u32(ram[0x1D3B07]);
-        min_vcf = (u32(ram[0x1D3B00]) << 24) | (u32(ram[0x1D3B01]) << 16) |
-                  (u32(ram[0x1D3B02]) << 8) | u32(ram[0x1D3B03]);
-    }
-    NOTICE_LOG_FMT(POWERPC,
-                   "[ax-recheck] n={} r30={} mem_rcount={} caller={:#x} minVcount={} minVcountF={:#x}",
-                   n, ps.gpr[30], rcount, caller, (s32)min_vc, min_vcf);
-    (void)phase;
-}
-
 EMSCRIPTEN_KEEPALIVE
 void dolphin_msr_updated(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
     Core::System::GetInstance().GetPowerPC().MSRUpdated();
@@ -370,46 +451,6 @@ void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
     // [ax-pe] per-256-drain heartbeat removed 2026-06-13 (gate #8 clean
     // baseline): it was ~847 cross-thread postMessage prints/s, the dominant
     // diag overhead perturbing throughput measurement.
-    static u64 s_drain_n = 0;
-    ++s_drain_n;
-    // [pc-census] drain: every ~256K drains, if the ring is full, count
-    // duplicates and log ONE line of the top entries, then re-arm. Each
-    // window = 256 consecutive dispatches at the time the ring was open.
-    if ((s_drain_n & 0x3FFFFu) == 2 && bemental::g_pc_census_n >= 256) {
-        int vals[256];
-        int cnts[256];
-        int nuniq = 0;
-        for (int i = 0; i < 256; ++i) {
-            const int v = bemental::g_pc_census_ring[i];
-            int j = 0;
-            for (; j < nuniq; ++j) if (vals[j] == v) { cnts[j]++; break; }
-            if (j == nuniq) { vals[nuniq] = v; cnts[nuniq] = 1; nuniq++; }
-        }
-        // selection-sort top 22 by count; translate handles -> guest PCs via
-        // the same-thread JS map (values >= 0x80000000 are already PCs).
-        std::string line;
-        for (int k = 0; k < 22 && k < nuniq; ++k) {
-            int best = k;
-            for (int j = k + 1; j < nuniq; ++j) if (cnts[j] > cnts[best]) best = j;
-            std::swap(cnts[k], cnts[best]);
-            std::swap(vals[k], vals[best]);
-            u32 pc = (u32)vals[k];
-            if (pc < 0x80000000u) {
-                const u32 mapped = (u32)EM_ASM_INT({
-                    var m = Module.bemental_handle_to_pc;
-                    var v = m && m[$0];
-                    return (v === undefined) ? 0 : (v | 0);
-                }, vals[k]);
-                if (mapped) pc = mapped;
-            }
-            line += fmt::format(" {:x}x{}", pc, cnts[k]);
-        }
-        NOTICE_LOG_FMT(POWERPC, "[pc-census] total={} chain={} ticks={} uniq={}{}",
-                       bemental::g_pc_census_total, bemental::g_chain_iters,
-                       Core::System::GetInstance().GetCoreTiming().GetTicks(), nuniq, line);
-        NOTICE_LOG_FMT(POWERPC, "[region-dbg] calls={} hit={} miss={} nogen={}", g_rd_calls, g_rd_hit, g_rd_miss, g_rd_nogen);
-        bemental::g_pc_census_n = 0;
-    }
     auto& system = Core::System::GetInstance();
     // [xinst-fix] Open the promote gate once past boot: the region's re-emit/seal
     // cost only pays off in steady-state running, and running it during boot's
@@ -419,7 +460,12 @@ void dolphin_gather_drain(uint32_t /*unused_a*/, uint32_t /*unused_b*/) {
     {
         static const u64 s_promote_after = []() -> u64 {
             const char* e = std::getenv("BJIT_PROMOTE_AFTER_TICKS");
-            return e ? static_cast<u64>(std::strtoull(e, nullptr, 10)) : 150000000ull;
+            // [region-resident 2026-07-15] 5B ticks (~10s sim): past boot's
+            // block-discovery, early enough that most of a run executes
+            // promoted. The round-3 30B band-aid guarded ARRIVAL-ORDER
+            // selection; the top-K windowed histogram now owns selection
+            // quality, so activation can come down.
+            return e ? static_cast<u64>(std::strtoull(e, nullptr, 10)) : 5000000000ull;
         }();
         if (system.GetCoreTiming().GetTicks() > s_promote_after)
             g_bem_promote_active = 1;
@@ -470,8 +516,7 @@ uint32_t dolphin_get_ram_size() {
 //   bit 2  : SCPFifoStruct::bFF_BPEnable
 //   bit 3  : 1 if CPReadWriteDistance != 0
 //   bits 4..7   : reserved
-//   bits 8..31  : CPReadWriteDistance >> 5 (truncated; full value via NOTICE)
-// Also emits a NOTICE_LOG line so the full state is captured in the probe.
+//   bits 8..31  : CPReadWriteDistance >> 5 (truncated)
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_get_cp_state() {
     auto& system = Core::System::GetInstance();
@@ -480,12 +525,6 @@ uint32_t dolphin_get_cp_state() {
     const u32 gp_read  = fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) ? 1u : 0u;
     const u32 bp_en    = fifo.bFF_BPEnable.load(std::memory_order_relaxed) ? 1u : 0u;
     const u32 dist     = fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
-    const u32 wptr     = fifo.CPWritePointer.load(std::memory_order_relaxed);
-    const u32 rptr     = fifo.CPReadPointer.load(std::memory_order_relaxed);
-    NOTICE_LOG_FMT(POWERPC,
-                   "[ax-cp] state gp_link={} gp_read={} bp_en={} dist=0x{:x} "
-                   "wptr=0x{:x} rptr=0x{:x}",
-                   gp_link, gp_read, bp_en, dist, wptr, rptr);
     return (gp_link << 0) | (gp_read << 1) | (bp_en << 2) |
            ((dist != 0 ? 1u : 0u) << 3) |
            ((dist >> 5) << 8);

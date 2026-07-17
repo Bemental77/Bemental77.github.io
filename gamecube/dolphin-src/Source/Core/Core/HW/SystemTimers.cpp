@@ -128,40 +128,12 @@ void SystemTimersManager::VICallback(Core::System& system, u64 userdata, s64 cyc
                             system.GetSystemTimers().m_event_type_vi);
 }
 
-void SystemTimersManager::SICallback(Core::System& system, u64 userdata, s64 cycles_late)
-{
-  auto& si = system.GetSerialInterface();
-  si.UpdateDevices();
-  // [ax-si] temporary diag (strip per gate #8): poll heartbeat.
-  {
-    static u64 n = 0;
-    if ((++n & 0x3FFu) == 1)
-      NOTICE_LOG_FMT(POWERPC, "[ax-si] poll n={} xlines={}", n, si.GetPollXLines());
-  }
-  // Poll cadence: X half-lines per poll (SI_POLL.X, guest-programmed;
-  // default 492 ~= one NTSC field ~= per-frame polling). Mirrors the
-  // VICallback half-line idiom above.
-  //
-  // [si-poll-floor] GetPollXLines() can be 0 — before the guest programs
-  // SI_POLL during early boot, and (observed) under the WASM raw-DoState path
-  // that left m_poll.X=0. X=0 reschedules the SI event at -cycles_late (at/behind
-  // global_timer), so it re-fires EVERY CoreTiming::Advance: a poll storm
-  // (confirmed: 600K+ polls with xlines=0) that pins the slice length <=0 and
-  // starves guest forward progress — the deterministic SAB __fill_mem boot
-  // wedge (memset halts at a fixed address when the slice can never advance).
-  // The SI hardware cannot poll at a 0-line interval; native carries X=492 here.
-  // Floor the DEGENERATE 0 to the hardware default so the cadence matches native;
-  // any legitimate guest-programmed value (>=7 per SI_POLL.X) is left untouched.
-  u32 xlines = si.GetPollXLines();
-  if (xlines == 0)
-    xlines = 492;
-  auto& core_timing = system.GetCoreTiming();
-  core_timing.ScheduleEvent(
-      static_cast<s64>(xlines) *
-              system.GetVideoInterface().GetTicksPerHalfLine() -
-          cycles_late,
-      system.GetSystemTimers().m_event_type_si);
-}
+// [oracle-audit 2026-07-12] The added SICallback CoreTiming event was a REDUNDANT
+// second SI driver: upstream polls SI exclusively from VideoInterfaceManager::Update
+// every 2*GetPollXLines() half-lines. Running both drove UpdateDevices() at ~3x native
+// cadence (input-latch + INT_CAUSE_SI drift every field). Removed to match the oracle;
+// the VI poll is self-limiting on the degenerate X==0 (field-boundary reset at
+// VideoInterface.cpp:969), so no floor relocation is needed.
 
 void SystemTimersManager::DecrementerCallback(Core::System& system, u64 userdata, s64 cycles_late)
 {
@@ -305,7 +277,6 @@ void SystemTimersManager::Init()
 
   m_event_type_decrementer = core_timing.RegisterEvent("DecCallback", DecrementerCallback);
   m_event_type_vi = core_timing.RegisterEvent("VICallback", VICallback);
-  m_event_type_si = core_timing.RegisterEvent("SICallback", SICallback);
   m_event_type_dsp = core_timing.RegisterEvent("DSPCallback", DSPCallback);
   m_event_type_audio_dma = core_timing.RegisterEvent("AudioDMACallback", AudioDMACallback);
   m_event_type_ipc_hle =
@@ -315,7 +286,6 @@ void SystemTimersManager::Init()
 
   core_timing.ScheduleEvent(0, m_event_type_gpu_sleeper);
   core_timing.ScheduleEvent(vi.GetTicksPerHalfLine(), m_event_type_vi);
-  core_timing.ScheduleEvent(static_cast<s64>(492) * vi.GetTicksPerHalfLine(), m_event_type_si);
   core_timing.ScheduleEvent(0, m_event_type_dsp);
 
   const int audio_dma_callback_period = GetAudioDMACallbackPeriod(

@@ -8,6 +8,7 @@
   "dependencies": {
     "@types/react": "18.0.38",
     "@types/react-dom": "18.0.11",
+    "@webgpu/glslang": "^0.0.15",
     "autoprefixer": "10.4.14",
     "aws-sdk": "^2.1368.0",
     "buffer": "^6.0.3",

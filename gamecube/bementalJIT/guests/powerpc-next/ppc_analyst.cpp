@@ -29,6 +29,9 @@ namespace bemental::powerpc {
 static inline bool IsMtspr(u32 inst) {
     return GekkoOperands::OPCD(inst) == 31 && GekkoOperands::SUBOP10(inst) == 467;
 }
+static inline bool IsMfspr(u32 inst) {
+    return GekkoOperands::OPCD(inst) == 31 && GekkoOperands::SUBOP10(inst) == 339;
+}
 static inline u32 GetSPRIndex(u32 inst) {
     const u32 sprl = (inst >> 11) & 0x1F;
     const u32 spru = (inst >> 16) & 0x1F;
@@ -106,6 +109,15 @@ void PPCAnalyzer::SetInstructionStats(CodeBlock* block, CodeOp* code,
     code->outputCR.m_val     = 0;
     code->outputFPRF         = (opinfo->flags & FL_SET_FPRF) != 0;
     code->outputCA           = (opinfo->flags & FL_SET_CA) != 0;
+    // [C11 2026-07-12 oracle-audit] mfspr/mtspr XER touch the carry bit, but
+    // the opinfo table carries no FL_READ_CA/FL_SET_CA for them. Mirror Dolphin
+    // PPCAnalyst.cpp:643-646: mfxer READS CA (keep the producing carry op's
+    // xer_ca store live), mtxer WRITES CA. Without this a `addc;mfxer;addc`
+    // reconstructs XER from a stale carry bit.
+    if (IsMfspr(code->inst))
+        code->wantsCA = GetSPRIndex(code->inst) == ppc_off::SPR_XER;
+    if (IsMtspr(code->inst))
+        code->outputCA = GetSPRIndex(code->inst) == ppc_off::SPR_XER;
     code->canEndBlock        = (opinfo->flags & FL_ENDBLOCK) != 0;
     code->canCauseException  =
         (opinfo->flags & (FL_LOADSTORE | FL_USE_FPU | FL_PROGRAMEXCEPTION |
@@ -513,6 +525,9 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
     // CR / CA conservatively live at block end (next block may read them).
     BitSet8  cr_live_after(0xFF);
     bool     ca_live_after = true;
+    // FPRF (FPSCR[12:16]) conservatively live at block end — mirrors ca_live_after.
+    // Dolphin forces FPRF live at may-exit ops (PPCAnalyst.cpp:1010-1013) too.
+    bool     fprf_live_after = true;
     for (std::size_t i = block->m_num_instructions; i-- > 0; ) {
         CodeOp& op = (*buffer)[i];
         op.gprInUse       = live_after;
@@ -522,12 +537,34 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
         op.crInUse        = cr_live_after;
         op.crDiscardable  = BitSet8(op.crOut.m_val & ~cr_live_after.m_val);
         op.ca_discardable = op.outputCA && !ca_live_after;
-        // Live-after for predecessor = (live_after | reads) & ~writes.
-        live_after = BitSet32((live_after.m_val | op.regsIn.m_val) & ~op.regsOut.m_val);
-        BitSet32 fregs_out = op.GetFregsOut();
-        fpr_live_after = BitSet32((fpr_live_after.m_val | op.fregsIn.m_val) & ~fregs_out.m_val);
-        cr_live_after = BitSet8((cr_live_after.m_val | op.crIn.m_val) & ~op.crOut.m_val);
-        ca_live_after = (ca_live_after && !op.outputCA) || op.wantsCA;
+        op.fprf_discardable = op.outputFPRF && !fprf_live_after;
+        // [C1 2026-07-12 oracle-audit] A mid-block op that can exit to an
+        // exception vector (canEndBlock terminators; or a fault-causing op —
+        // FL_USE_FPU lazy-FPU bailout at ppc_emit.cpp:816-847, FL_LOADSTORE)
+        // commits ALL live guest state to PowerPCState for the handler, and its
+        // own outputs may not be produced. So every CR0/XER.CA/GPR/FPR value
+        // written by a predecessor must stay live across it — otherwise an
+        // elided store leaves the handler reading STALE architectural state.
+        // Mirrors Dolphin PPCAnalyst.cpp:1041-1046 (empties the discardable
+        // sets at every may_exit op) + :1010-1012 (may_exit keeps CA live).
+        // Safe superset: only ever keeps MORE state live, never elides a needed
+        // store. (A future perf refinement could narrow to ops that actually
+        // emit op_return mid-block, but correctness comes first.)
+        if (op.canEndBlock || op.canCauseException) {
+            live_after     = BitSet32(0xFFFFFFFFu);
+            fpr_live_after = BitSet32(0xFFFFFFFFu);
+            cr_live_after  = BitSet8(0xFF);
+            ca_live_after  = true;
+            fprf_live_after = true;
+        } else {
+            // Live-after for predecessor = (live_after | reads) & ~writes.
+            live_after = BitSet32((live_after.m_val | op.regsIn.m_val) & ~op.regsOut.m_val);
+            BitSet32 fregs_out = op.GetFregsOut();
+            fpr_live_after = BitSet32((fpr_live_after.m_val | op.fregsIn.m_val) & ~fregs_out.m_val);
+            cr_live_after = BitSet8((cr_live_after.m_val | op.crIn.m_val) & ~op.crOut.m_val);
+            ca_live_after = (ca_live_after && !op.outputCA) || op.wantsCA;
+            fprf_live_after = (fprf_live_after && !op.outputFPRF) || op.wantsFPRF;
+        }
     }
 
     // Idle-loop classification — only valid for a fully-decoded short block
