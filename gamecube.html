@@ -3225,7 +3225,16 @@
     if (GcAudio.inited || GcAudio.initing) return;
     GcAudio.initing = true;
     try {
-      var ctx = new (window.AudioContext || window.webkitAudioContext)();
+      // [audio rate 2026-07-17] Create the AudioContext at the core's actual output rate (reported
+      // by the worker via 'audioRate' from retro av_info — GC ~48043 Hz). The worklet reads the ring
+      // 1:1 with no resampling, so the ctx MUST match the source or the pitch/rate is wrong (the old
+      // unspecified-rate default was 44100 -> ~9% high). Fall back to 48000 if the rate isn't known
+      // yet, and to the browser default if it rejects the explicit rate.
+      var _AC = window.AudioContext || window.webkitAudioContext;
+      var _rate = (window._gcAudioRate | 0) || 48000;
+      var ctx;
+      try { ctx = new _AC({ sampleRate: _rate }); } catch (e) { ctx = new _AC(); }
+      if (ctx.state === 'suspended' && ctx.resume) ctx.resume().catch(function () {});
       // Ring buffer SAB: 4 i32 header + 4096 i16 samples.
       var RING_SAMPLES = 4096 * 2;  // 4096 frames * 2 channels
       var sab = new SharedArrayBuffer(16 + RING_SAMPLES * 2);
@@ -3259,13 +3268,17 @@
       GcAudio.initing = false;
     }
   }
-  // Wire user-gesture init.
+  // Wire user-gesture init. [audio rate 2026-07-17] The gesture only RECORDS activation; the actual
+  // AudioContext is created later at the core's reported rate (the 'audioRate' worker message), because
+  // the rate isn't known until retro_load_game runs — a few seconds after the Start click. Creating it
+  // on the raw gesture used the wrong default rate (48000/44100 vs the game's 32029) -> pitch/speed off.
   (function () {
     function once() {
       window.removeEventListener('pointerdown', once, true);
       window.removeEventListener('keydown', once, true);
       window.removeEventListener('touchstart', once, true);
-      initGcAudio();
+      window._gcAudioGestured = true;              // sticky activation recorded
+      if (window._gcAudioRate) initGcAudio();      // rate already known -> safe to create the ctx now
     }
     window.addEventListener('pointerdown', once, true);
     window.addEventListener('keydown', once, true);
@@ -3277,6 +3290,19 @@
       case 'print': pageLog('> ' + data.txt); break;
       case 'setStatus': setStatus(data.txt); break;
       case 'render': { if (data.pixels) paintFrame(data.pixels, data.w, data.h, data.pitch); if (data.h > 0 && !window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame received w:' + data.w + ' h:' + data.h); } renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { var _fps = (renderFrames * 1000 / (now - lastFpsLog)); fpsEl.textContent = 'FPS: ' + _fps.toFixed(1); console.log('[fps] ' + _fps.toFixed(2) + ' @t=' + (now / 1000).toFixed(0) + 's totalFrames=' + (window._totalRenderFrames = (window._totalRenderFrames || 0) + renderFrames)); renderFrames = 0; lastFpsLog = now; } break; }
+      case 'audioRate': {
+        // [audio rate 2026-07-17] The worker reports the core's real output sample rate (retro
+        // av_info). Record it and init the worklet NOW — the Start-button click already gave the
+        // page sticky activation, so the AudioContext can be created + resumed here at the correct
+        // rate (this fires before the first 'audio' message, so the ctx is right the first time).
+        window._gcAudioRate = data.rate | 0;
+        pageLog('[audio] core output sample rate = ' + window._gcAudioRate + ' Hz');
+        // The Start-button click already recorded a gesture (sticky activation), so the AudioContext
+        // can be created + resumed here at the now-known correct rate. This fires before the first
+        // 'audio' message, so the ctx has the right rate the first time (no re-create needed).
+        if (window._gcAudioGestured && !GcAudio.inited && !GcAudio.initing) initGcAudio();
+        break;
+      }
       case 'audio': {
         // [audio-diag 2026-07-13] User reports NO SOUND (task #6). Log the delivery chain:
         // arrival rate from the worker + which sink is live + AudioContext state (a

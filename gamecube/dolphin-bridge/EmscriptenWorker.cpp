@@ -395,6 +395,16 @@ int load_iso(const char* path) {
         postMessage({cmd: 'print', txt: '[worker] load_iso: retro_load_game returned ' + ($0 ? 'true' : 'false')});
     }, ok ? 1 : 0);
     if (!ok) return -1;
+    // [audio rate 2026-07-17] Report the core's audio output sample rate so the page creates the
+    // AudioContext at the matching rate (GC is ~48043 Hz, or ~32029 for 32kHz games — NOT the 44100
+    // the page defaulted to). The worklet reads the ring 1:1 with no resampling, so a ctx-vs-source
+    // mismatch played audio at the wrong pitch (~9% high at 44100 vs 48043) with rate glitches.
+    {
+        struct retro_system_av_info _av;
+        retro_get_system_av_info(&_av);
+        MAIN_THREAD_EM_ASM({ postMessage({cmd: 'audioRate', rate: $0}); },
+                           (unsigned)_av.timing.sample_rate);
+    }
     retro_set_controller_port_device(0, EMW_RETRO_DEVICE_JOYPAD);
     MAIN_THREAD_EM_ASM({
         postMessage({cmd: 'print', txt: '[worker] SI port 0 = GC controller (joypad)'});
