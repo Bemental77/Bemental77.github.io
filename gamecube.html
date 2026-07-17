@@ -3196,7 +3196,7 @@
   // stereo audio at 44.1 kHz (4096 frames * 2 ch = 8192 i16 samples).
   var GcAudio = { ctx: null, node: null, ring: null, ringHdr: null,
                   ringData: null, ringCap: 0, inited: false };
-  function pushAudioSamples(int16Buf, frameCount) {
+  function pushAudioSamples(byteBuf, byteLen) {
     if (!GcAudio.inited) return;
     var hdr = GcAudio.ringHdr;
     var data = GcAudio.ringData;
@@ -3204,10 +3204,16 @@
     var head = Atomics.load(hdr, 0);
     var tail = Atomics.load(hdr, 1);
     var free = cap - ((head - tail) | 0);
-    var samplesIn = (frameCount | 0) * 2;
+    // [audio fix 2026-07-17] The worker posts a Uint8Array of int16 stereo PCM and `len` is BYTES
+    // (frames*4, EmscriptenWorker.cpp audio_sample_batch_cb). The old code did `new Int16Array(byteBuf)`
+    // — which ELEMENT-WISE copies each byte (0..255) into an int16 slot instead of reinterpreting the
+    // byte pairs — and treated `len` as a frame count (samplesIn = len*2). Net: real full-scale audio
+    // (peak 32768) was mangled into near-silence (peak 255, verified by headless tap). Reinterpret the
+    // bytes as int16 over the same ArrayBuffer, and derive the int16 sample count from the byte length.
+    var src = new Int16Array(byteBuf.buffer, byteBuf.byteOffset || 0, (byteLen | 0) >> 1);
+    var samplesIn = src.length;
     var n = samplesIn > free ? free : samplesIn;
     if (n === 0) return;
-    var src = new Int16Array(int16Buf);
     var start = (head >>> 0) % cap;
     var first = Math.min(n, cap - start);
     for (var i = 0; i < first; ++i) data[start + i] = src[i];
