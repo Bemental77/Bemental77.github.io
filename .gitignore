@@ -66,3 +66,10 @@ dreamcast/**/build-*/
 
 # Old fork tree — preserved for MemArena port reference; remove after build Stage 0 passes (CC-1)
 gamecube/dolphin-src.bak/
+
+# Untracked-but-kept-local full disc/ROM images (2026-07-20 LFS teardown):
+# their content ships as the split .bin.parta* chunks; these full copies are
+# local oracle/test inputs only. Do NOT re-track (LFS budget exceeded).
+gamecube/roms/Sonic Adventure 2 - Battle (USA).iso
+dreamcast/discs/pso2/Track3.bin
+ps1/ps1Wasm/roms/MonsterRancher2.bin

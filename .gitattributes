@@ -52,3 +52,19 @@ gamecube/ppc-worker/ppc_worker_mb.wasm filter= diff= merge= -text
 # not resolve LFS pointers) + LFS budget exceeded 2026-07-20. Ship as real
 # blobs like the ROM parts / worker wasm above.
 gamecube/aot/**/*.bin filter= diff= merge= -text
+# 2026-07-20 LFS teardown: budget exceeded + GitHub Pages cannot serve LFS
+# pointers. Everything below is runtime-fetched by a page or worker — ship as
+# real blobs (same fix as the PS1/N64/GC overrides above). After this, the
+# ONLY remaining LFS objects are dreamcast/discs/pso2/Track3.bin.parta* —
+# 12x100MB, DC not yet shipping; converting would bloat every clone by 1.2GB.
+gamecube/IPL.bin filter= diff= merge= -text
+gba/gbaWasm/dist/*.wasm filter= diff= merge= -text
+snes/snesWasm/*.wasm filter= diff= merge= -text
+snes/snesWasm/roms/*.smc filter= diff= merge= -text
+ps1/*.bin filter= diff= merge= -text
+ps1/*.wasm filter= diff= merge= -text
+ps1/ps1Wasm/roms/bios/*.bin filter= diff= merge= -text
+dreamcast/flycast_libretro/*.wasm filter= diff= merge= -text
+dreamcast/discs/pso2/Track1.bin filter= diff= merge= -text
+dreamcast/discs/pso2/Track2.bin filter= diff= merge= -text
+dreamcast/discs/pso2/*.cue filter= diff= merge= -text
