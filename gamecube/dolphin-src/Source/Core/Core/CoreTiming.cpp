@@ -397,9 +397,33 @@ void CoreTimingManager::Advance()
   // monotonically so due events (VI retrace, DSP, AI) fire against real sim-time.
   if (worker_owns_cpu)
   {
-    const u64 wgt =
-        static_cast<u64>(*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x02680008u))) |
-        (static_cast<u64>(*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x0268000Cu))) << 32);
+    // [determinism 2026-07-17 — seqlock the gt-adopt READ] The worker publishes the split-64
+    // global_timer (0x02680008/0C) under a seqlock at CT header +0x14 (odd during a write). A
+    // plain 32+32 read here can observe a torn (new_lo,old_hi) value up to 4.29e9 ticks off,
+    // which the monotonic-max at :417 can PERMANENTLY LATCH — fast-forwarding dolphin forever
+    // and starving every future event. Retry-read under the same seqlock the writer honors so a
+    // torn value can never reach the max(). (rank-2 nondeterminism source.)
+    u32 wlo = 0u, whi = 0u;
+    {
+      volatile u32* const p_seq =
+          reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x02680000u + 0x14u));
+      volatile u32* const p_lo =
+          reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x02680008u));
+      volatile u32* const p_hi =
+          reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x0268000Cu));
+      for (int attempt = 0; attempt < 4; ++attempt)
+      {
+        const u32 s0 = __atomic_load_n(p_seq, __ATOMIC_ACQUIRE);
+        if (s0 & 1u)
+          continue;  // writer mid-update
+        wlo = *p_lo;
+        whi = *p_hi;
+        const u32 s1 = __atomic_load_n(p_seq, __ATOMIC_ACQUIRE);
+        if (s1 == s0)
+          break;  // stable snapshot
+      }
+    }
+    const u64 wgt = static_cast<u64>(wlo) | (static_cast<u64>(whi) << 32);
     // [one-clock 2026-07-07] EXACT assignment (was max()): one-way-up adoption let the
     // ff excursion's full-slice credits INFLATE this timer above honest worker time —
     // adoption then never lifted again, the timer froze, and every queued event hung
@@ -495,6 +519,51 @@ void CoreTimingManager::Advance()
 #endif
   power_pc.CheckExternalExceptions();
 }
+
+#ifdef __EMSCRIPTEN__
+s64 CoreTimingManager::FirstEventTime() const
+{
+  return m_event_queue.empty() ? static_cast<s64>(-1) : m_event_queue.front().time;
+}
+
+s64 CoreTimingManager::FfAdvanceTo(s64 target)
+{
+  // [determinism 2026-07-17] Deterministic idle-gap cross. Set global_timer to an EXACT
+  // caller-supplied target and fire every due hybrid event in ONE step — replaces the ff
+  // excursion's race-terminated 1024-burst whose trip count was set by concurrently-mutated
+  // *exc/*pc_live reads (rank-1 nondeterminism). Fires ONLY dolphin's hybrid queue; pure/DEC
+  // events stay the CPU worker's. Mirrors Advance's event-drain + slice_length + hybrid-head
+  // publish, minus cyclesExecuted/gt-adopt/CheckExternalExceptions (single-owner delivery).
+  if (target <= m_globals.global_timer)
+    return m_globals.global_timer;
+  m_globals.global_timer = target;
+  m_is_global_timer_sane = true;
+  while (!m_event_queue.empty() && m_event_queue.front().time <= m_globals.global_timer)
+  {
+    Event evt = std::move(m_event_queue.front());
+    std::ranges::pop_heap(m_event_queue, std::ranges::greater{});
+    m_event_queue.pop_back();
+    evt.type->callback(m_system, evt.userdata, m_globals.global_timer - evt.time);
+  }
+  m_is_global_timer_sane = false;
+  volatile u32* const cell =
+      reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B0910u));
+  if (!m_event_queue.empty())
+  {
+    m_globals.slice_length = static_cast<int>(
+        std::min<s64>(m_event_queue.front().time - m_globals.global_timer, MAX_SLICE_LENGTH));
+    const u64 t = static_cast<u64>(m_event_queue.front().time);
+    cell[0] = static_cast<u32>(t & 0xFFFFFFFFu);
+    cell[1] = static_cast<u32>(t >> 32);
+    cell[2] = 1u;
+  }
+  else
+  {
+    cell[2] = 0u;
+  }
+  return m_globals.global_timer;
+}
+#endif
 
 TimePoint CoreTimingManager::CalculateTargetHostTimeInternal(s64 target_cycle)
 {

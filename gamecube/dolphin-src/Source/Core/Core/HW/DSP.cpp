@@ -539,18 +539,35 @@ void DSPManager::UpdateAudioDMA()
       // single-core boot (cpu_owner!=1) is UNAFFECTED (guest AID handler runs normally there).
       const bool takeover =
           *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u;
-      GenerateDSPInterrupt(DSP::INT_AID, 0);
       if (takeover)
       {
-        // Self-ack: clear the AID active bit so INT_CAUSE_DSP is not held asserted by AID.
-        // UpdateInterrupts() recomputes INT_CAUSE_DSP from the remaining (ARAM/DSP) sub-bits.
-        m_dsp_control.AID = 0;
+        // [aid-recompute-only 2026-07-17] Post-takeover: do NOT generate the AID interrupt (skip
+        // its cause-SET), but DO keep the periodic 4kHz UpdateInterrupts() recompute.
+        //
+        // Two failure modes bound this. (a) Baseline (GenerateDSPInterrupt(INT_AID) + self-ack):
+        // the generate's first UpdateInterrupts SETs INT_CAUSE_DSP for AID alone -> SetInterrupt
+        // (DSP,true) -> UpdateException raises EXTERNAL_INT (RELEASE). The cross-thread CPU worker
+        // (~100x slower to service than native's in-thread delivery) catches that EXT SET edge,
+        // vectors 0x500, but the immediate AID self-ack has already cleared the PI-cause mirror by
+        // the time its ISR reads it -> __OSDispatchInterrupt early-returns. Measured enAID=753 such
+        // EMPTY vectors -> ~47% of guest cycles burned in the 0x500 storm, starving the data-load
+        // thread (HuDataSelHeapReadNum -> HuDecodeData) so GlobalCounter crawls and stays at 33.
+        // (b) Skipping AID *and* the recompute (tried 2026-07-17): removes the only 4kHz
+        // UpdateInterrupts, so a pending ARAM/DSP cause is never re-freshed and INT_CAUSE_DSP
+        // STICKS asserted (0x500:248359, dspToExt:34389) — strictly worse.
+        //
+        // This is the middle path: no AID cause-set (kills the 753 empty EXTs) but keep the
+        // recompute (SetInterrupt(DSP, ints_set) from ARAM/DSP sub-bits only) so a genuinely
+        // pending ARAM completion stays asserted until the guest acks it and a cleared one clears.
+        // Audio still flows (SendAIBuffer above delivers the buffer; DMA self-reloads); the guest's
+        // AID handler is bookkeeping game progress never waits on. Single-core boot (else) unchanged.
         UpdateInterrupts();
-        // [aid-selfack diag] count self-acks @0x026B2798 (free slot; 0x2700-2794 are in use) so the
-        // probe can confirm the path fires. If this climbs while globalCounter advances past 156, the
-        // fix worked; if it climbs but globalCounter stays frozen, AID was not the blocker.
         volatile u32* k = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2798u));
         *k = *k + 1u;
+      }
+      else
+      {
+        GenerateDSPInterrupt(DSP::INT_AID, 0);
       }
     }
   }

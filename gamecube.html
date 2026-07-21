@@ -320,7 +320,7 @@
     // worker with no ARQ in flight — gc then advances past the wedge (33→330→426→523→572, spinByte=0,
     // reproducible across runs). ?armframe=N still overrides for sweeping/A-B.
     try {
-      var _armFrame = parseInt((new URLSearchParams(location.search).get('armframe')) || '300', 10) || 300;
+      var _armFrame = parseInt((new URLSearchParams(location.search).get('armframe')) || '12', 10) || 12;
       new Uint32Array(sharedMemory.buffer)[0x026B0A30 >> 2] = _armFrame;
     } catch (e) {}
 
@@ -2104,7 +2104,12 @@
         // corruption that made ME-less handover dangerous is closed at the funnel by the
         // enforcing EE-gates (PowerPC.cpp, counters 0x026B0934/38). deliv-ring catches any
         // regression. EE + SelectThread + frame-anchor remain required.
-        var ready = (_framesNow >= 100) && _eeOn && rendered && !!window._ppcMem1Wired && !!window._ppcDolphinRoutingReady;
+        // [dual-core-from-boot 2026-07-17] Hand the CPU to the worker as SOON as the game is loaded
+        // and running (mem1 wired + MMIO routing ready + EE on + first frame rendered), not at a late
+        // frame anchor. The old `>= 100` (with armframe=300) left it SINGLE-CORE for ~30s. The product
+        // is dual-core (worker=CPU + dolphin=GPU) from boot — mirror native. Small frame floor just
+        // ensures the guest is past the apploader into its own render loop.
+        var ready = (_framesNow >= 12) && _eeOn && rendered && !!window._ppcMem1Wired && !!window._ppcDolphinRoutingReady;
         // anchor 600→170 (2026-07-06): every observed roll passes 220 within the window
         // with the upload complete (aramWrite terminal by ~frame 160); 600 was unreachable
         // on slow rolls, leaving the takeover untestable. 170 is post-upload (storm-safe).
@@ -2165,7 +2170,7 @@
             // workers see. CT_QUEUE_ADDR=0x02680000, CT_OFF_PHASE_FLAGS=0x2C,
             // PHASE4=0x2, PHASE5=0x4. Use Atomics.store for release-order
             // semantics so dolphin's __atomic_load_n(ACQUIRE) sees the write.
-            Atomics.store(new Int32Array(sharedMemory.buffer), (0x02680000 + 0x2C) >> 2, 0x6);
+            Atomics.store(new Int32Array(sharedMemory.buffer), (0x02680000 + 0x2C) >> 2, 0x7);  // [2026-07-18] +CT_PHASE3_ENABLE(0x1): ppc-worker fires VI/DSP hybrids at ITS guest cycles = deterministic delivery (native CoreTiming-on-CPU parity), fixing the gc=33 retrace-coalescing nondeterminism
             // [collapse] AUTHORITATIVE OWNERSHIP handoff: grant the CPU to the WORKER. Both run loops check
             // cpu_owner @ SAB 0x026A0000 (0=DOLPHIN, 1=WORKER) before dispatching ANY block, so dolphin's
             // in-flight retro_run yields at its next per-block boundary (JitWasm do-loop / region loop /
@@ -2181,8 +2186,8 @@
             // Also send postMessage as a backup in case dolphin caches a
             // copy of the flags somewhere (it shouldn't — flag is read
             // directly via dolphin_ct_get_phase_flags from SAB).
-            dolphin_worker.postMessage({ cmd: 'ct-phase-set', flags: 0x6 });
-            console.log('[ppc-worker-handshake] CT_PHASE4|PHASE5 set in SAB + postMessage sent');
+            dolphin_worker.postMessage({ cmd: 'ct-phase-set', flags: 0x7 });
+            console.log('[ppc-worker-handshake] CT_PHASE3|PHASE4|PHASE5 set in SAB + postMessage sent');
             // [collapse-accept] clean acceptance instrument (the stripped diag readers are gone). Per 1s:
             //  pc=guest PC (SAB 0x02400000) — advance => booting; pinned near HuSprDisp 0x8000f7f8 => stuck.
             //  mipsD=gekko block-dispatch counter (SAB 0x026B0800) delta — worker actually dispatching.
@@ -2287,7 +2292,7 @@
                       + ' srr0=0x' + _srr0Now.toString(16) + _halt);
                   }
                   Atomics.store(i32bd, (0x02680000 + 0x2C) >> 2, 0x6);  // Phase IV ON
-                  if (window.dolphin_worker) window.dolphin_worker.postMessage({ cmd: 'ct-phase-set', flags: 0x6 });
+                  if (window.dolphin_worker) window.dolphin_worker.postMessage({ cmd: 'ct-phase-set', flags: 0x7 });
                   // [dual-core handover race fix 2026-06-30] gate the worker re-engage on dolphin
                   // retiring its in-flight retro_run (same as the post-slice excursion). The crash
                   // routes through whichever re-engage is un-gated, so BOTH edges need this.
@@ -2458,14 +2463,20 @@
             // idle-hint OFF so the service_iter fast-forward stops flooding events — the guest
             // then drains to the SelectThread idle spin during the release windows and the
             // freeze catches it (4/6 FAILED with the ff active: every sample was mid-ISR EE=0).
+            // [dual-core ff-hint 2026-07-17] Once the WORKER owns the CPU (cpu_owner @0x026A0000 == 1)
+            // it drives the ff idle-hint itself (ppc_worker.js latches its device-wait spin PC). The page
+            // must NOT stomp that to 0 here, or dolphin's fast-forward never runs for the worker's spins
+            // (HuARDMACheck ARAM-wait) -> ARAM never completes -> wedge. Page only drives the hint pre-collapse.
             var _hintOn = (!window._hoSuppressFF) && (window._bdLoopCount >= 6);
-            Atomics.store(i32bd, 0x02680030 >> 2, _hintOn ? 1 : 0);
+            if ((i32bd[0x026A0000 >> 2] >>> 0) === 1) { _hintOn = null; }  // worker owns -> leave its hint alone
+            if (_hintOn === null) { /* worker-driven; skip page store */ }
+            else Atomics.store(i32bd, 0x02680030 >> 2, _hintOn ? 1 : 0);
             // [ff-pc gate 2026-07-02] Publish the PC that tripped the hint (0x02680034). The
             // fast-forward gates on ppc_state.pc == this PC: teleporting sim-time is only safe when
             // the guest is AT the observed spin PC — not mid-ISR at an EE=1 blip (hwIRQLeaveCritical/
             // OSEnableInterrupts windows), where firing the next VI nests a retrace into the live
             // handler chain (the SI crash / PADRead re-entrancy).
-            Atomics.store(i32bd, 0x02680034 >> 2, _hintOn ? _bdPc : 0);
+            if (_hintOn !== null) Atomics.store(i32bd, 0x02680034 >> 2, _hintOn ? _bdPc : 0);
             // [e5-spin TEMP 2026-06-28] After the apploader-runaway fix the guest
             // settled into a tight 3-block loop 0x800e56bc/56fc/5754 (slice-budget,
             // 0 compileCalls) — an interrupt-wait spin. Dump exc/msr/srr0/lr + regs

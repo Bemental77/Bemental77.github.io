@@ -784,7 +784,17 @@ void dolphin_service_iter(void) {
         // one-clock conflict (ff inflates dolphin's timer, gt-adopt pulls it back, undoing
         // the gap-cross) is resolved by syncing the WORKER gt to the ff-advanced time at
         // the end (below), so the cross sticks.
-        if (ctx != 0u && idle_hint != 0u && hint_pc != 0u && pc_now == hint_pc)
+        // [dual-core ff-hint 2026-07-17] When the WORKER owns the CPU (cpu_owner @0x026A0000 == 1) it
+        // sets idle_hint ITSELF only when its own multi-PC loop detector (__lwN) proves a device-wait
+        // busy-spin (e.g. HuARDMACheck 0x80049488 waiting on the ARAM DMA completion). Trust that: the
+        // `pc_now == hint_pc` gate reads the guest PC from the SAB mirror (0x2400000), which doesn't
+        // reliably reflect a fast 3-PC worker loop, so the ff never fired post-collapse (ffEnter=0,
+        // aramComplete=7 vs native 1992, gc wedged at 33). Drop the strict PC match under worker
+        // ownership; keep it pre-collapse (page-driven hint) so the SI-crash teleport guard still holds.
+        const uint32_t ff_cpu_owner =
+            *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026A0000u));
+        if (ctx != 0u && idle_hint != 0u && hint_pc != 0u
+            && (pc_now == hint_pc || ff_cpu_owner == 1u))
         {
             volatile int32_t* const dc =
                 reinterpret_cast<volatile int32_t*>(static_cast<uintptr_t>(ctx + 0x2F0u));
@@ -840,20 +850,40 @@ void dolphin_service_iter(void) {
             // to it and fires it. dolphin_drain_gp_ring drains the MMIO ring first (its own early-return
             // only guards the GX ring), so this is cheap when the GX ring is empty (the audio phase).
             dolphin_drain_gp_ring();
-            *ff_flag = 1u;
-            for (int k = 0; k < 1024; ++k)
+            // [determinism 2026-07-17] Deterministic idle-gap cross. The old body was a
+            // for(k<1024){*dc=0; Advance(); if(*exc!=exc0)break; if(*pc_live!=hint_pc)break;}
+            // burst whose trip count K was set by two reads of *exc/*pc_live that the CPU worker
+            // MUTATES CONCURRENTLY — so two identical runs crossed a DIFFERENT amount of sim-time,
+            // and every device event scheduled at global_timer+delta fired at a different absolute
+            // time (verified rank-1 root of the GlobalCounter=33 A/B nondeterminism: two runs wedge
+            // at different guest PC/MSR). Replace with a SINGLE skip to the exact next scheduled
+            // hybrid-event boundary — the crossed sim-time is now a pure function of the event
+            // queue, matching native's one-event-at-a-time cadence. The CPU worker still fires its
+            // own pure/DEC events; dolphin's regular per-iter fire-only Advance (line ~700) keeps
+            // firing hybrids at the adopted gt between excursions.
+            (void)dc; (void)exc0; (void)pc_live; (void)ff_flag;
+            // [ff-burst-deterministic 2026-07-18] The single skip-to-FirstEventTime advanced ONE
+            // event per service_iter — but the FRONT event is the 4kHz audio-buffer tick (~8000 cyc),
+            // so sim-time crawled ~0.5% real-time and the 60Hz VI retrace that VIWaitForRetrace needs
+            // fired ~1/15s -> GlobalCounter stuck near 12 (measured ffAdvN=40107 events over 120s yet
+            // retraceCount frozen at 50). BURST through the non-interrupting audio events to the next
+            // EXT-raising boundary in ONE excursion (native crosses idle gaps with a fast in-loop
+            // Advance), but STOP on the DETERMINISTIC signal — the EXTERNAL_INT bit (0x4) becoming set
+            // by a fired VI/DSP event — NOT the *pc_live race that made the old 1024-burst nondet.
+            // During an idle spin the CPU worker does not set EXT, so *exc changes ONLY from the events
+            // fired here = a pure function of the event queue = deterministic trip count.
             {
-                *dc = 0;
-                core_timing.Advance();
-                if (*exc != exc0) break;
-                if (*pc_live != hint_pc) break;
-            }
-            *ff_flag = 0u;
-            // [gt-sync 2026-07-07] the ff loop advanced dolphin's global_timer to cross the
-            // idle gap; push that time into the WORKER gt cells (0x02680008/0C) so the
-            // subsequent gt-adopt (exact assignment) doesn't pull dolphin BACK below it and
-            // undo the cross. This is what makes ff + one-clock coexist under owner==1.
-            {
+                for (int k = 0; k < 4096; ++k)
+                {
+                    if ((*exc & 0x4u) != 0u) break;                    // deliverable device IRQ pending -> stop
+                    const s64 t = core_timing.FirstEventTime();
+                    if (t < 0) break;                                 // event queue empty
+                    if (t <= static_cast<s64>(core_timing.GetTicks())) core_timing.Advance();
+                    else core_timing.FfAdvanceTo(t);
+                }
+                // Publish the crossed time to the WORKER gt cells (its idle logic + the next gt-adopt
+                // read it). Plain write; the gt-adopt READ is seqlocked so a concurrent worker write
+                // can't tear it into the monotonic-max.
                 const u64 dgt = static_cast<u64>(core_timing.GetTicks());
                 *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x02680008u)) =
                     static_cast<uint32_t>(dgt & 0xFFFFFFFFu);

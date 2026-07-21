@@ -743,6 +743,23 @@ bool DVDInterface::ExecuteReadCommand(u64 dvd_offset, u32 output_address, u32 dv
                                       u32 output_length, const DiscIO::Partition& partition,
                                       ReplyType reply_type, DIInterruptType* interrupt_type)
 {
+  // [dvd-read-trace 2026-07-17] Real DVD-read census (the old dvdCmdN cell 0x026B1A70 was dead).
+  // The native dual-core oracle streams 512KB movie/scene chunks via ExecuteReadCommand while gc
+  // advances 33->158->205; our worker-CPU build freezes gc at 33. Count reads @0x026B1A70, split by
+  // takeover state @0x026B1A74 (post-takeover reads) / offset @0x026B1A78, so the probe (dvdCmdN)
+  // shows whether the guest issues+routes DVD reads once the worker owns the CPU.
+  {
+    const bool tk = *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u;
+    volatile u32* c = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A70u));
+    *c = *c + 1u;
+    if (tk)
+    {
+      volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A74u));
+      *p = *p + 1u;
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A78u)) =
+          static_cast<u32>(dvd_offset);
+    }
+  }
   if (!CheckReadPreconditions())
   {
     // Disc read fails

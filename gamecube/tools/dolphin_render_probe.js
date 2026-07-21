@@ -1055,6 +1055,97 @@ function startServer() {
             for (let k = 0; k < 8; k++) dfw += rd32(0x80df42c0 + k * 4).toString(16).padStart(8, '0') + ' ';
             bw.df = dfw;
             bw.globalCounter = rd32(0x801D3A54) >>> 0;  // main-loop frame count @GlobalCounter
+            bw.gxFinishN = (A[0x026B1A98 >> 2] >>> 0); bw.viRetHandN = (A[0x026B1AA0 >> 2] >>> 0); bw.huDecodeN = (A[0x026B1AA4 >> 2] >>> 0); bw.huDvdErrWait = rd32(0x801D3A04) >>> 0; bw.retraceCount = rd32(0x801D4428) >>> 0; bw.huSoftReset = rd32(0x801D3A00) >>> 0; bw.arqCnt = rd32(0x801D3E04) >>> 0;         // [arq-spin 2026-07-17] HuAR_DVDtoARAM spins while(arqCnt!=0); ArqCallBack@0x800490ac decrements on ARAM-completion ISR
+            bw.v500runs = (A[0x026B0680 >> 2] >>> 0);     // [vec-dispatch-trace] count of 0x500-block runs
+            bw.v500next = (A[0x026B0684 >> 2] >>> 0).toString(16);  // next-pc the 0x500 block returned (0x504 split? 0x588/0x578 bne target?)
+            bw.v500msr = (A[0x026B0688 >> 2] >>> 0).toString(16);   // MSR at 0x500-block run
+            bw.vgbrkPc = (A[0x026B068C >> 2] >>> 0).toString(16);   // guard-break pc
+            bw.piCauseMirror = (A[0x026B27D0 >> 2] >>> 0).toString(16);  // [pi-mirror 2026-07-17] live guest-visible PI cause (bit0x4=DI, 0x40=DSP, 0x100=VI) — stuck bit = missed ISR ack
+            bw.delivSrr0 = (A[0x026B0630 >> 2] >>> 0).toString(16);  // [vec-rfi] worker EXT delivery SRR0
+            bw.delivSrr1 = (A[0x026B0634 >> 2] >>> 0).toString(16);  // [vec-rfi] worker EXT delivery SRR1 — bit0x2=RI; if CLEAR the 0x500 vector routes to the UNRECOVERABLE fault path
+            bw.liveSrr1 = (() => { const c = A[0x0250002C >> 2] >>> 0; return c ? (A[(c + 0x3AC) >> 2] >>> 0).toString(16) : '0'; })();  // ppc_state SRR1
+            { const _ctx = rd32(0x800000C0) >>> 0;   // OSCurrentContext
+              bw.savedSrr0 = _ctx ? (rd32(_ctx + 0x198) >>> 0).toString(16) : '0';  // vector-saved ctx->srr0
+              bw.osDefExc = (A[0x026B1A9C >> 2] >>> 0); bw.savedSrr1b = _ctx ? (rd32(_ctx + 0x19c) >>> 0).toString(16) : '0'; }  // vector-saved ctx->srr1 — RI(0x2) is what the bne 0x574 tests
+            // [round-trip profiler 2026-07-18] mailbox round-trips by cmd during the decode.
+            bw.rtcTotal = (A[0x025000FC >> 2] >>> 0);
+            bw.rtcByCmd = [2,3,4,8,9,10,14].map(c => c + ':' + (A[(0x02500100 + (c<<2)) >> 2] >>> 0)).join(' ');
+            bw.m1fp = (A[0x025000F8 >> 2] >>> 0);         // MEM1-direct fastpath hits (should be ~0: MEM1 is inlined)
+            bw.hleFpMiss = (A[0x02500180 >> 2] >>> 0);    // hle_check fastpath misses (no round-trip)
+            bw.sysFp = (A[0x02500184 >> 2] >>> 0);         // mfcr/mtcrf sys-op fastpath hits (no round-trip)
+            // [MDObjMesh alloc-spin diag 2026-07-18] read the computed buffer sizes (huge = wrong face count)
+            { const _m1b = (A[0x02500020 >> 2] >>> 0); const _g32 = (ga) => { if(!_m1b) return 0; const w = A[((_m1b + (ga & 0x01FFFFFF)) >>> 0) >> 2] >>> 0; return (((w & 0xFF) << 24) | ((w & 0xFF00) << 8) | ((w >>> 8) & 0xFF00) | (w >>> 24)) >>> 0; };
+              bw.DLTotalNum = _g32(0x801D3BB0) | 0;            // s32 computed DL buffer size
+              bw.matChgCnt = _g32(0x801D3BBC) & 0xFFFF;        // u16 @0x801D3BBE (low half of word @BBC)
+              bw.faceCnt = (_g32(0x801D3BB8) >>> 16) & 0xFFFF; // u16 @0x801D3BB8 (high half)
+              bw.DrawData = '0x'+(_g32(0x801D3C14) >>> 0).toString(16);
+              bw.DLBufStartP = '0x'+(_g32(0x801D3C18) >>> 0).toString(16);
+              bw.totalPolyCnt = _g32(0x801D3BE4) >>> 0;        // billions = looping; thousands = normal
+              bw.drawCnt = _g32(0x801D3C10) | 0;
+              // GlobalCounter object-loop context: read GXDrawDone queue + HuSysDoneRender reach
+              bw.gcObjIdx = '0x'+(_g32(0x801D3C1C) >>> 0).toString(16);
+              // [free-list walk 2026-07-19] walk HuMemMemoryAlloc2's circular free-list from head r27
+              // (gpr27) via next-ptr @node+0xc; the wedge = this chain never wraps back to r27.
+              const _ctx = A[0x0250002C >> 2] >>> 0;
+              const _r27 = _ctx ? (A[(_ctx + 0x14 + 27*4) >> 2] >>> 0) : 0;
+              const _r31 = _ctx ? (A[(_ctx + 0x14 + 31*4) >> 2] >>> 0) : 0;
+              bw.flHead = '0x'+_r27.toString(16); bw.flCur = '0x'+_r31.toString(16);
+              if (_r27 >= 0x80000000 && _r27 < 0x81800000 && _m1b) {
+                const seen = new Set(); let node = _r27 >>> 0; const out = []; let end = ''; let prevNode = 0;
+                for (let i = 0; i < 400; i++) {
+                  if (seen.has(node)) { end = 'CYCLE@0x'+node.toString(16); break; }
+                  seen.add(node);
+                  const sz = _g32(node) >>> 0; const w4 = _g32(node+4) >>> 0;
+                  const inuse = (w4 >>> 16) & 0xFF; const magic = (w4 >>> 24) & 0xFF;
+                  const nxt = _g32(node+0xc) >>> 0;
+                  out.push('0x'+node.toString(16)+'[sz'+sz+',u'+inuse+',m'+magic.toString(16)+',n0x'+nxt.toString(16)+']');
+                  prevNode = node;
+                  node = nxt;
+                  if (node === (_r27 >>> 0)) { end = 'WRAP-OK@'+(i+1)+'nodes'; break; }
+                  if (!(node >= 0x80000000 && node < 0x81800000)) { end = 'BADPTR-0x'+node.toString(16); break; }
+                }
+                if (!end) end = 'NOEND-400';
+                bw.freeListEnd = end; bw.freeListN = seen.size;
+                bw.freeList = out.slice(0, 20).join(' ');
+                // [corrupt-node 2026-07-20] the node whose ->next is the bad ptr, + raw 16 words around it,
+                // + its full memory_block header {size@0, magic@4, flag@5, prev@8, next@c, num@10, retaddr@14}.
+                bw.freeListTail = out.slice(-4).join(' ');
+                if (prevNode >= 0x80000000 && prevNode < 0x81800000) {
+                  bw.corruptNode = '0x'+prevNode.toString(16);
+                  const cn = []; for (let k = -2; k < 8; k++) cn.push(((_g32(prevNode + k*4))>>>0).toString(16).padStart(8,'0'));
+                  bw.corruptWords = cn.join(' ');
+                  bw.corruptRetaddr = '0x'+((_g32(prevNode+0x14))>>>0).toString(16);  // who allocated the corrupt block
+                  // [dl-window 2026-07-20 TEMP] dump the overflowing DL buffer: the heap block right
+                  // before corruptNode is the DL buffer whose generate ran past its reserve. Window
+                  // [corruptNode-512, corruptNode+96) = hdr + full 448-byte DL + the spill, hex rows
+                  // of 16 for byte-diff against the native oracle's 384-byte reference stream.
+                  { const base = (prevNode - 512) >>> 0; const rows = [];
+                    for (let off = 0; off < 608; off += 16) {
+                      const bs = [];
+                      for (let w = 0; w < 4; w++) { const v = _g32(base + off + w*4) >>> 0;
+                        bs.push(((v>>>24)&0xFF), ((v>>>16)&0xFF), ((v>>>8)&0xFF), (v&0xFF)); }
+                      rows.push('+'+off.toString(16).padStart(3,'0')+': '+bs.map(b=>b.toString(16).padStart(2,'0')).join(' '));
+                    }
+                    bw.dlWindowBase = '0x'+base.toString(16); bw.dlWindow = rows; }
+                }
+              } }
+            bw.mfcrMismatch = (A[0x02500190 >> 2] >>> 0); bw.mfcrMatch = (A[0x02500194 >> 2] >>> 0); bw.rfiMismatch = (A[0x02500198 >> 2] >>> 0); bw.rfiMatch = (A[0x0250019C >> 2] >>> 0); bw.xerMismatch = (A[0x025001A0 >> 2] >>> 0); bw.xerMatch = (A[0x025001A4 >> 2] >>> 0);
+            bw.mem1RdMM = (A[0x025001A8 >> 2] >>> 0); bw.mem1RdOK = (A[0x025001AC >> 2] >>> 0); bw.mem1WrMM = (A[0x025001B0 >> 2] >>> 0); bw.mem1WrOK = (A[0x025001B4 >> 2] >>> 0);
+            bw.mmioRdTop = (() => { const rows=[]; for(let b=0;b<256;b++){const sp=0x02500400+b*8; const c=A[(sp+4)>>2]>>>0; if(c) rows.push(['0x'+(A[sp>>2]>>>0).toString(16),c]);} rows.sort((x,y)=>y[1]-x[1]); return rows.slice(0,12).map(r=>r[0]+'='+r[1]).join(' '); })();
+            bw.interpHist = Array.from({length:8}, (_,k) => { const sp = 0x02500200 + k*12; const c = A[(sp+8)>>2]>>>0; return c ? ('0x'+(A[sp>>2]>>>0).toString(16)+'/i'+(A[(sp+4)>>2]>>>0).toString(16)+'='+c) : null; }).filter(Boolean).join(' ');
+            bw.gtLo = (A[0x02680008 >> 2] >>> 0);         // [det 2026-07-17] worker global_timer lo — is the deterministic ff advancing it? frozen = under-pump
+            bw.gtHi = (A[0x0268000C >> 2] >>> 0);         // global_timer hi
+            bw.ctNextValid = (A[0x026B0918 >> 2] >>> 0);  // dolphin hybrid-head valid flag (is there a next VI event to target?)
+            bw.ctNextLo = (A[0x026B0910 >> 2] >>> 0);     // hybrid-head time lo
+            bw.extIdleDeliv = (A[0x026B2760 >> 2] >>> 0); // [ext-during-idle] worker delivered pending EXT at the idle spin (should climb like native's 2523)
+            bw.ffAdvN = (A[0x02680038 >> 2] >>> 0);       // [ff-diag] deterministic ff actual advances (target>now)
+            bw.ffNoopN = (A[0x0268003C >> 2] >>> 0);      // [ff-diag] ff no-ops (target<=now / due-now fixed point)
+            // [decode-progress 2026-07-17] worker is hot in HuDecodeData LZSS loop (r31=decode struct: src@0, remaining@8).
+            // gpr[31]=ctx+0x90. src advancing + remaining shrinking = progressing (slow); stuck/huge = worker mis-emit.
+            { const c = A[0x0250002C >> 2] >>> 0; if (c) { const g31 = A[(c + 0x90) >> 2] >>> 0;
+              bw.dec_r31 = g31.toString(16);
+              bw.dec_src = (g31 ? rd32(g31 + 0) : 0).toString(16);
+              bw.dec_remain = (g31 ? (rd32(g31 + 8) | 0) : 0); } }
             // [aram-diag 2026-07-16] ARAM-DMA-complete interrupt delivery chain, post-takeover:
             bw.aramComplete = A[0x026B2700 >> 2] >>> 0;   // ARAMint completion event fired (dolphin)
             bw.aramIntActive = A[0x026B2704 >> 2] >>> 0;  // INT_ARAM bit in DSP_CONTROL
@@ -1088,6 +1179,8 @@ function startServer() {
             bw.spinByte  = A[0x026B27AC >> 2] >>> 0;      // [arq] live aramQueueLo depth byte @0x801D0539
             bw.dispN     = A[0x026B27B0 >> 2] >>> 0;      // [arq] __OSDispatchInterrupt runs
             bw.dspHN     = A[0x026B27B4 >> 2] >>> 0;      // [arq] __DSPHandler runs
+            bw.wgpGateN  = A[0x026B27E0 >> 2] >>> 0;      // [wgp-order] CP/PI-page MMIO gate checks
+            bw.wgpGateWaitN = A[0x026B27E4 >> 2] >>> 0;   // [wgp-order] ...that actually waited on a non-empty ring
             bw.arHN      = A[0x026B27B8 >> 2] >>> 0;      // [arq] __ARHandler runs (calls the AR DMA callback)
             bw.viHide    = A[0x026B27C0 >> 2] >>> 0;      // [vi-dsp-prio] VI hidden from cause read while DSP co-pending
             bw.dspCrReads = A[0x026B27CC >> 2] >>> 0;     // [aram-diag3] guest DSP_CONTROL reads post-takeover
@@ -1100,7 +1193,14 @@ function startServer() {
             bw.ffMs = A[0x026B2A08 >> 2] >>> 0;            // [ff-cost] total wall-ms spent in the ff loop
             bw.vHit = A[0x026B2A0C >> 2] >>> 0;            // [vec-wedge] vector-page (0x100-0x3fff) region-dispatch HIT
             bw.vMiss = A[0x026B2A10 >> 2] >>> 0;           // [vec-wedge] vector-page region-dispatch MISS
-            bw.vPoll = A[0x026B2A14 >> 2] >>> 0;           // [vec-wedge] pollAdvance calls at a vector-page pc
+            bw.vPoll = A[0x026B2A14 >> 2] >>> 0;
+            bw.d500cnt = A[0x026B0A44 >> 2] >>> 0;  bw.d500next=(A[0x026B0A48>>2]>>>0).toString(16);
+            bw.d500msr=(A[0x026B0A4C>>2]>>>0).toString(16); bw.d500exc=(A[0x026B0A50>>2]>>>0).toString(16);
+            bw.b7a58cnt=A[0x026B0A34>>2]>>>0; bw.b7a58next=(A[0x026B0A38>>2]>>>0).toString(16);
+            bw.ffHintPub = A[0x026B2A24 >> 2] >>> 0;   // [ff-hint] times worker latched the ff hint
+            bw.ffHintPc = (A[0x026B2A28 >> 2] >>> 0).toString(16);
+            bw.idleHintLive = A[0x02680030 >> 2] >>> 0; // ff idle-hint cell value
+            bw.hintPcLive = (A[0x02680034 >> 2] >>> 0).toString(16);           // [vec-wedge] pollAdvance calls at a vector-page pc
             bw.stall500idle = A[0x026B2A18 >> 2] >>> 0;     // [0x500-stall] 0x500 ate by the downcount idle-continue
             bw.stall500disp = A[0x026B2A1C >> 2] >>> 0;     // [0x500-stall] 0x500 reached the block-dispatch section
             bw.vHit = A[0x026B2A0C >> 2] >>> 0;              // [0x500-stall] vector-page dispatch HIT

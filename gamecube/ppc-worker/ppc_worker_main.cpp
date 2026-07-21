@@ -382,6 +382,95 @@ u32 ppc_worker_compile_block(u32 start_pc) {
     return static_cast<u32>(g_compile_buf.size());
 }
 
+// [chain-dispatch port 2026-07-18] Compile a block AND register it into the
+// per-block dispatch table (g_bem_pc_handle + __indirect_function_table via
+// BlockCache::compile -> compile_raw + register_pc_handle) so
+// chain_dispatch_raw / bem_chain_loop_c can chain it in-WASM via call_indirect
+// (fn-ptr `pc=fn()`), exactly like dolphin_worker's single-executor path
+// (JitWasm.cpp chain_dispatch_raw, max_iters=4096). This is the fast path the
+// ppc-worker was missing — the legacy JS `inst.exports.run()` per-block loop is
+// ~200x slower on tight loops (the bootDll LZSS decode = the gc=33 wedge).
+// Returns compiled byte size (>0 = success; block now chainable at start_pc).
+EMSCRIPTEN_KEEPALIVE
+u32 ppc_worker_compile_and_register(u32 start_pc) {
+    if (g_mem1_base == 0u || g_mem1_size == 0u) return 0u;
+    const u32 ram_mask = g_mem1_size - 1u;
+    const u32 phys     = start_pc & ram_mask;
+    const uintptr_t ram_addr = g_mem1_base + phys;
+    const u32* ram_ptr = reinterpret_cast<const u32*>(ram_addr);
+
+    u32 insts[PPC_MAX_BLOCK_INSTRS];
+    u32 count = 0;
+    while (count < PPC_MAX_BLOCK_INSTRS) {
+        const u32 inst = byteswap32(ram_ptr[count]);
+        insts[count]   = inst;
+        const u32 op   = (inst >> 26) & 0x3Fu;
+        ++count;
+        if (op == 16u || op == 17u || op == 18u || op == 19u) break;
+    }
+    if (count == 0u) return 0u;
+
+    auto bytes = bemental::powerpc::build_block(
+        start_pc, insts, count,
+        static_cast<u32>(g_ppc_state_base), 0u,
+        static_cast<u32>(g_mem1_base), ram_mask, g_mem1_size,
+        nullptr,
+        /* emit_hle_check        = */ true,
+        /* emit_perf_stub        = */ g_emit_perf_stub,
+        /* emit_hle_check_native = */ g_emit_hle_check_native);
+    if (bytes.empty()) return 0u;
+    // BlockCache::compile instantiates the module (compile_raw) and registers
+    // the block's `run` export into g_bem_pc_handle + the indirect fn-table
+    // keyed by start_pc — the key bem_chain_loop_c resolves on (block_cache.cpp:671).
+    int h = g_bcache.compile(static_cast<u64>(start_pc), bytes.data(), bytes.size());
+    if (h < 0) return 0u;
+    return static_cast<u32>(bytes.size());
+}
+
+// [chain-dispatch port 2026-07-18] ppc-worker-native batched chain loop. Runs up
+// to `max` compiled blocks in-WASM via fn-ptr call_indirect (pc=fn()) — the same
+// mechanism dolphin_worker's bem_chain_loop_c uses, but WITHOUT its two dolphin-
+// specific behaviors that are wrong for the ppc-worker:
+//   (1) owner-bail is INVERTED: the ppc-worker runs WHILE it owns (cpu_owner==1);
+//       dolphin bails when the worker takes over. Here we bail when ownership is
+//       LOST (cpu_owner != 1).
+//   (2) NO idle-collapse clock-jump (bem_chain_loop_c force-zeros downcount on any
+//       tight recurring PC set — that heuristic would MISFIRE on the productive
+//       bootDll LZSS decode loop, the gc=33 wedge, and stall it).
+// Bails on: ownership lost, a DELIVERABLE exception (sync/non-maskable 0x2FA OR
+// maskable 0x105 with MSR.EE), downcount<=0 after >=1 block, or an uncompiled pc
+// (caller compiles via ppc_worker_compile_and_register + retries). Blocks may wasm-
+// trap; the JS caller wraps this in try/catch and treats *final_pc as the trap pc.
+// Returns the number of blocks run; writes the resume pc to *final_pc. Downcount is
+// decremented by the JS caller (by the return value) to match the legacy path.
+EMSCRIPTEN_KEEPALIVE
+s32 ppc_worker_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc) {
+    typedef u32 (*BlockFnC)(void);
+    *trap_pc = 0;
+    if (g_ppc_state_base == 0u) { *final_pc = pc; return 0; }
+    volatile u32* p_exc = reinterpret_cast<volatile u32*>(g_ppc_state_base + 0x2ECu);  // Exceptions
+    volatile u32* p_msr = reinterpret_cast<volatile u32*>(g_ppc_state_base + 0x2E0u);  // MSR
+    volatile s32* p_dc  = reinterpret_cast<volatile s32*>(g_ppc_state_base + 0x2F0u);  // downcount
+    s32 count = 0;
+    while (static_cast<u32>(count) < max) {
+        // ppc-worker owns the CPU while cpu_owner==1; bail if it loses ownership.
+        if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) != 1u) break;
+        // Deliverable async/sync exception? (mirror bem_chain_loop_c line 657-661)
+        const u32 e  = *p_exc;
+        const u32 ee = *p_msr & 0x8000u;
+        if ((e & 0x2FAu) || ((e & 0x105u) && ee)) break;
+        if (count > 0 && *p_dc <= 0) break;   // CoreTiming slice budget spent
+        const int handle = g_bcache.lookup(static_cast<u64>(pc));
+        if (handle < 0) break;                // uncompiled -> caller compiles + retries
+        *final_pc = pc;                       // trap-recovery breadcrumb (set BEFORE the call)
+        BlockFnC fn = reinterpret_cast<BlockFnC>(static_cast<uintptr_t>(handle));
+        pc = fn();                            // in-WASM call_indirect
+        ++count;
+    }
+    *final_pc = pc;
+    return count;
+}
+
 // Phase 3a.2 — compile block AND accumulate into its region. Replaces
 // the per-block standalone-module path (build_block + JS instantiate)
 // with the multi-block region path (emit_block_body + region_accumulate;

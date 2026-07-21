@@ -192,7 +192,13 @@
         // and each block compiles fresh (~85ms each), so throughput
         // regresses vs dolphin-owned dispatch until the cache warms up.
         // Enable explicitly with =1 to test the architectural cutover.
-        if (mod.PPC_WORKER_USE_C_SLICE === undefined) mod.PPC_WORKER_USE_C_SLICE = 0;  // [throughput A/B 2026-07-03: C-slice+merged retire ZERO (region pipeline WIP, endless gen-relink) — stay on legacy until AoT]
+        // [C-slice A/B 2026-07-18] Batched C dispatch loop (removes the JS per-block gate
+        // overhead). Default ON now (the gc=33 wedge is the ppc-worker's per-block JS dispatch
+        // being ~200x slower than dolphin_worker's chain_dispatch_raw). Set self.__PPC_C_SLICE=0
+        // to force the legacy JS loop for A/B. Original default was 0 (parked 2026-07-03 due to
+        // the merged-region relink storm — but region promotion is OFF now, g_bem_promote_enabled=0).
+        if (mod.PPC_WORKER_USE_C_SLICE === undefined)
+          mod.PPC_WORKER_USE_C_SLICE = (typeof self !== 'undefined' && self.__PPC_C_SLICE === 1) ? 1 : 0;
         const v = mod._ppc_worker_version();
         postMessage({ cmd: 'ready', version: v });
       })
@@ -253,8 +259,14 @@
         // too. Idempotent — overwrites any prior values.
         if (!mod.bemental_imports) mod.bemental_imports = { env: {} };
         const env = mod.bemental_imports.env;
-        const call1 = (cmd, a) => mod._ppc_worker_mailbox_call_sync(cmd, a >>> 0) >>> 0;
-        const call2 = (cmd, a, b) => { mod._ppc_worker_mailbox_call_sync2(cmd, a >>> 0, b >>> 0); };
+        // [round-trip profiler 2026-07-18] Count JS-side mailbox round-trips by cmd (per-cmd @
+        // SAB 0x02500100+cmd*4, total @0x025000FC) to SEE which import dominates the gc=33 decode.
+        const _rtc = new Int32Array(sharedMemoryRef.buffer);
+        if (self.__interpValidate === undefined) self.__interpValidate = 0;  // 1 = validate fastpaths vs round-trip
+        if (self.__mem1Validate === undefined) self.__mem1Validate = 0;  // 1 = sampled MEM1 validate
+        const _rtcBump = (cmd) => { _rtc[0x025000FC >> 2] = (_rtc[0x025000FC >> 2] + 1) | 0; _rtc[(0x02500100 + ((cmd & 31) << 2)) >> 2] = (_rtc[(0x02500100 + ((cmd & 31) << 2)) >> 2] + 1) | 0; };
+        const call1 = (cmd, a) => { _rtcBump(cmd); return mod._ppc_worker_mailbox_call_sync(cmd, a >>> 0) >>> 0; };
+        const call2 = (cmd, a, b) => { _rtcBump(cmd); mod._ppc_worker_mailbox_call_sync2(cmd, a >>> 0, b >>> 0); };
         env.memory          = sharedMemoryRef;
         // [poll-target 2026-07-09] record the last slow-path MMIO read (addr + seq) so the
         // EE=0 poll handler can DISCRIMINATE beam polls (VI range -> smooth-step) from
@@ -280,12 +292,140 @@
           if (a === 0xCC003000 && Atomics.load(self.__mmr, 0x026A0000 >> 2) === 1) {
             Atomics.add(self.__mmr, 0x026B27D8 >> 2, 1);                  // [fastpath-hit] PI cause
             return Atomics.load(self.__mmr, 0x026B27D0 >> 2) >>> 0; }     // PI cause fast-path
-          self.__lastMmioRdAddr = a; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(4, a); };
+          self.__lastMmioRdAddr = a; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1;
+          // [mmio-read-addr HASH profiler 2026-07-18] 256-bucket hash counter @0x02500400
+          // (bucket=(addr>>2)&0xFF stores addr@+0, count@+4 stride8) — reliable vs the 8-slot
+          // (which filled with boot addrs). Hot model-build/ISR reg dominates its bucket.
+          { const _b = ((a >>> 2) & 0xFF); const _sp = 0x02500400 + _b * 8; _rtc[_sp >> 2] = a; _rtc[(_sp + 4) >> 2] = (_rtc[(_sp + 4) >> 2] + 1) | 0; }
+          return call1(4, a); };
         // Item 6 Stage 2 — writes go either via mailbox (W1, default) or
         // SAB pending-writes ring (W2, gated by `useWriteRing`).
         installWriteEnv(env, call2);
         env.ppc_hle_check   = (pc) => call1(8, pc);
         env.ppc_interp      = (inst, pc) => {
+          // [interp sys-op fastpath 2026-07-18] THE gc=33 FIX (measured): mfcr/mtcrf are interp-
+          // fallback stubs in powerpc-next (jit_system_registers.cpp:358) → one mailbox round-trip
+          // each, and they fire per interrupt (mtcrf 11762x, mfcr 7753x in 45s). Execute them
+          // DIRECTLY on the SAB ppc_state here (no round-trip), using Dolphin's exact CR encoding
+          // (ConditionRegister.h: PPCToInternal/GetField; cr(n)=0x2A0+n*8 u64, gpr(n)=0x14+n*4).
+          // The block Flush'd GPR/CR to ppc_state before this call and ReloadAll's after, so
+          // direct SAB read/write is coherent. self.__interpFastOff=1 => original round-trip.
+          if (!self.__interpFastOff) {
+            const _op = (inst >>> 26) & 0x3F, _xo = (inst >>> 1) & 0x3FF, _b20 = (inst >>> 20) & 1;
+            const _CTXr = _rtc[0x0250002C >> 2] >>> 0;   // real &ppc_state
+            // rfi (op19 xo50): MSR=(MSR&~0x87C0FFFF)|(SRR1&0x87C0FFFF); pc=npc=SRR0&~3.
+            // Dolphin Interpreter::rfi. MEM1 access is MSR-independent in the worker (fixed base),
+            // so no membase recompute needed. Biggest interrupt-path round-trip (16292x/55s).
+            if (_op === 19 && _xo === 50 && _CTXr !== 0) {
+              const _msr = _rtc[(_CTXr + 0x2E0) >> 2] >>> 0;
+              const _srr1 = _rtc[(_CTXr + 0x3AC) >> 2] >>> 0;   // spr(27)=0x340+27*4
+              const _srr0 = _rtc[(_CTXr + 0x3A8) >> 2] >>> 0;   // spr(26)=0x340+26*4
+              const _nmsr = (((_msr & ~0x87C0FFFF) >>> 0) | (_srr1 & 0x87C0FFFF)) >>> 0;
+              const _npc = (_srr0 & ~3) >>> 0;
+              if (self.__interpValidate) {
+                call2(9, inst, pc);
+                const _rM = _rtc[(_CTXr + 0x2E0) >> 2] >>> 0, _rP = _rtc[(_CTXr + 0x0) >> 2] >>> 0;
+                if (_nmsr !== _rM || _npc !== _rP) { _rtc[0x02500198 >> 2] = (_rtc[0x02500198 >> 2] + 1) | 0; if ((self.__rfiMm = (self.__rfiMm | 0) + 1) <= 4) postMessage({ cmd: 'print', txt: '[rfi-MM] mineMsr=0x' + _nmsr.toString(16) + ' realMsr=0x' + _rM.toString(16) + ' minePc=0x' + _npc.toString(16) + ' realPc=0x' + _rP.toString(16) }); }
+                else _rtc[0x0250019C >> 2] = (_rtc[0x0250019C >> 2] + 1) | 0;
+                return;
+              }
+              _rtc[(_CTXr + 0x2E0) >> 2] = _nmsr | 0;
+              _rtc[(_CTXr + 0x0) >> 2] = _npc | 0;   // pc
+              _rtc[(_CTXr + 0x4) >> 2] = _npc | 0;   // npc
+              _rtc[0x02500184 >> 2] = (_rtc[0x02500184 >> 2] + 1) | 0;
+              return;
+            }
+            // mtxer (mtspr XER, op31 xo467 SPR=1): split storage XER_CA(0x2F4 u8)=CA(bit29),
+            // XER_SO_OV(0x2F5)=(SO<<1)|OV (bits30-31), XER_STRINGCTRL(0x2F6 u16 low=BYTE_COUNT
+            // bits0-6, high=BYTE_CMP preserved). #1 remaining interrupt-path round-trip (14042x).
+            if (_op === 31 && _xo === 467 && _CTXr !== 0
+                && ((((inst >>> 16) & 0x1F) | (((inst >>> 11) & 0x1F) << 5)) === 1)) {
+              const _rS = _rtc[(_CTXr + 0x14 + (((inst >>> 21) & 0x1F) * 4)) >> 2] >>> 0;
+              const _xi = (_CTXr + 0x2F4) >> 2;
+              const _bc = (_rtc[_xi] >>> 24) & 0xFF;   // preserve BYTE_CMP (byte 0x2F7)
+              if (self.__interpValidate) {
+                const _myX = (((_rS >>> 29) & 1) | (((_rS >>> 30) & 3) << 8) | ((_rS & 0x7F) << 16)) >>> 0;
+                call2(9, inst, pc);
+                const _rX = (_rtc[_xi] >>> 0) & 0x00FFFFFF;   // CA/SO_OV/TBC (mask byte_cmp)
+                if (_myX !== _rX) { _rtc[0x025001A0 >> 2] = (_rtc[0x025001A0 >> 2] + 1) | 0; if ((self.__xerMm = (self.__xerMm | 0) + 1) <= 4) postMessage({ cmd: 'print', txt: '[mtxer-MM] mine=0x' + _myX.toString(16) + ' real=0x' + _rX.toString(16) + ' rS=0x' + _rS.toString(16) }); }
+                else _rtc[0x025001A4 >> 2] = (_rtc[0x025001A4 >> 2] + 1) | 0;
+                return;
+              }
+              _rtc[_xi] = (((_rS >>> 29) & 1) | (((_rS >>> 30) & 3) << 8) | ((_rS & 0x7F) << 16) | (_bc << 24)) | 0;
+              _rtc[0x02500184 >> 2] = (_rtc[0x02500184 >> 2] + 1) | 0;
+              return;
+            }
+            // [mtspr WPAR fastpath 2026-07-20] THE gc=33 dual-core deadlock fix. mtspr WPAR (op31 xo467
+            // SPR=921) is the GX write-gather-pipe redirect (GXBegin/EndDisplayList -> GXRedirect/Restore
+            // WriteGatherPipe, MDFaceDraw). The powerpc emitter interp-falls-back this SPR -> ONE blocking
+            // mailbox cmd-9 round-trip PER display-list boundary; dolphin_worker wasn't servicing it (the
+            // guest hard-froze here, mbx="9/7c79e3a6", drainA=0). Dolphin's handler (Interpreter_System
+            // Registers.cpp:393) just does GPFifo::ResetGatherPipe() — a NO-OP in our model: WPAR-region
+            // stores (0x0C008000) already route straight to the GP ring (line ~628), there is NO
+            // intermediate gather buffer to flush. So execute it DIRECTLY on ppc_state: write spr[921]
+            // (=SPR_BASE 0x340 + 921*4 = 0x11A4) with BNE (bit0) CLEAR — our gather buffer is always empty,
+            // so the display-list mfspr WPAR[BNE] poll (mfspr reads spr[921] directly, gekko_emit.cpp:2722)
+            // passes immediately. Kills the round-trip -> breaks the deadlock. self.__interpFastOff=1 => orig.
+            if (_op === 31 && _xo === 467 && _CTXr !== 0
+                && ((((inst >>> 16) & 0x1F) | (((inst >>> 11) & 0x1F) << 5)) === 921)) {
+              const _rSw = _rtc[(_CTXr + 0x14 + (((inst >>> 21) & 0x1F) * 4)) >> 2] >>> 0;
+              _rtc[(_CTXr + 0x11A4) >> 2] = (_rSw & ~1) | 0;   // spr[921]=WPAR, BNE(bit0)=0 (buffer empty)
+              _rtc[0x02500184 >> 2] = (_rtc[0x02500184 >> 2] + 1) | 0;   // sysFp counter
+              return;
+            }
+            if (_op === 31 && _b20 === 0 && (_xo === 19 || _xo === 144)) {
+              const _CTX = _CTXr;
+              if (_CTX !== 0) {
+                if (_xo === 19) {                          // mfcr: pack CR[0..7] -> GPR[rD]
+                  let _cr = 0;
+                  for (let n = 0; n < 8; n++) {
+                    const _co = (_CTX + 0x2A0 + n * 8) >> 2;
+                    const _lo = _rtc[_co] >>> 0, _hi = _rtc[_co + 1] >>> 0;
+                    let _nib = ((_hi >>> 27) & 1) | (((_hi >>> 30) & 1) << 3);  // SO(bit59)->b0, LT(bit62)->b3
+                    if (_lo === 0) _nib |= 2;                                   // EQ: low32==0
+                    if ((_hi & 0x80000000) === 0 && (_hi !== 0 || _lo !== 0)) _nib |= 4;  // GT: (s64)cr_val>0 (bit63 clear AND cr_val!=0 — cr_val CAN be 0)
+                    _cr = (_cr | (_nib << ((7 - n) * 4))) >>> 0;
+                  }
+                  if (self.__interpValidate) {             // [validate] compare my mfcr to dolphin's round-trip
+                    call2(9, inst, pc);                    // dolphin executes mfcr -> writes rD
+                    const _rd = (inst >>> 21) & 0x1F;
+                    const _real = _rtc[(_CTX + 0x14 + _rd * 4) >> 2] >>> 0;
+                    if ((_cr >>> 0) !== _real) { _rtc[0x02500190 >> 2] = (_rtc[0x02500190 >> 2] + 1) | 0; if ((self.__mfcrMm = (self.__mfcrMm | 0) + 1) <= 4) postMessage({ cmd: 'print', txt: '[mfcr-MISMATCH] inst=0x' + (inst >>> 0).toString(16) + ' mine=0x' + (_cr >>> 0).toString(16) + ' real=0x' + _real.toString(16) }); }
+                    else _rtc[0x02500194 >> 2] = (_rtc[0x02500194 >> 2] + 1) | 0;
+                    return;
+                  }
+                  _rtc[(_CTX + 0x14 + (((inst >>> 21) & 0x1F) * 4)) >> 2] = _cr | 0;
+                } else {                                   // mtcrf: unpack GPR[rS] -> CR fields (FXM-masked)
+                  const _rS = _rtc[(_CTX + 0x14 + (((inst >>> 21) & 0x1F) * 4)) >> 2] >>> 0;
+                  const _fxm = (inst >>> 12) & 0xFF;
+                  for (let n = 0; n < 8; n++) {
+                    if (_fxm & (0x80 >>> n)) {
+                      const _nib = (_rS >>> ((7 - n) * 4)) & 0xF;
+                      let _hi = 1;                          // marker bit32 (0x100000000)
+                      if (_nib & 1) _hi |= (1 << 27);       // SO -> bit59
+                      if (!(_nib & 4)) _hi = (_hi | 0x80000000) >>> 0;  // !GT -> bit63
+                      if (_nib & 8) _hi |= (1 << 30);       // LT -> bit62
+                      const _co = (_CTX + 0x2A0 + n * 8) >> 2;
+                      _rtc[_co] = (_nib & 2) ? 0 : 1;       // !EQ -> low bit0
+                      _rtc[_co + 1] = _hi | 0;
+                    }
+                  }
+                }
+                _rtc[0x02500184 >> 2] = (_rtc[0x02500184 >> 2] + 1) | 0;  // sys-op fastpath hits
+                return;   // executed in-worker — no mailbox round-trip
+              }
+            }
+          }
+          // [interp-pc profiler 2026-07-18] cmd 9 (interp) is the #1 round-trip after the hle
+          // fastpath — record WHICH pcs fall to the interpreter (8-slot {pc,inst,count} histogram
+          // @0x02500200, stride 12) so we can see what op to JIT-emit or fastpath.
+          { const _p = pc >>> 0; let _free = -1, _done = false;
+            for (let _k = 0; _k < 8; _k++) { const _sp = 0x02500200 + _k * 12;
+              const _spc = _rtc[_sp >> 2] >>> 0;
+              if (_spc === _p) { _rtc[(_sp + 8) >> 2] = (_rtc[(_sp + 8) >> 2] + 1) | 0; _done = true; break; }
+              if (_free < 0 && _spc === 0) _free = _k; }
+            if (!_done && _free >= 0) { const _sp = 0x02500200 + _free * 12;
+              _rtc[_sp >> 2] = _p; _rtc[(_sp + 4) >> 2] = inst >>> 0; _rtc[(_sp + 8) >> 2] = 1; } }
           // [store-watch 2026-06-29 TEMP] BUG 2: marker 0xFFFFFFFB = a 32-bit store of
           // 0x808080 into the SIGetType stack frame (the callback-corruption write).
           // pc = the EXACT storing instruction; log it (no dolphin round-trip). Other
@@ -315,6 +455,12 @@
         env.ppc_check_exc   = (pc) => call1(10, pc);
         env.ppc_break_block = (pc, x) => call2(11, pc, x);
         env.ppc_read_tb     = (which) => call1(12, which);
+        // [aot-next 2026-07-20] powerpc-next block modules import these two (gekko didn't).
+        // Both are NO-OPs in the ppc-worker model: MEM1 base is fixed/indirect (MSR-independent,
+        // no membase recompute on MSR change), and WPAR-region stores already route straight to
+        // the GP ring (ppc_worker.js:~628) so there is no gather buffer to flush at block exit.
+        env.ppc_msr_updated  = () => {};
+        env.ppc_gather_drain = () => {};
         // Item 5 — env.ppc_hle_fire wired via mailbox cmd 14 (HleFire).
         // Routes to dolphin_hle_fire(pc, idx_and_type) -> next_pc. Counted
         // via mod._ppc_hle_fire_hits for the Phase 5 perf assertion.
@@ -323,6 +469,59 @@
             mod._ppc_hle_fire_hits = (mod._ppc_hle_fire_hits | 0) + 1;
             return mod._ppc_worker_mailbox_call_sync2(14, pc >>> 0, it >>> 0) >>> 0;
         };
+        // [mem1-direct fastpath 2026-07-18] THE gc=33 FIX. Per the 2026-07-17 oracle finding
+        // (line ~269), EVERY guest memory access in the ppc-worker is a BLOCKING mailbox round-
+        // trip to dolphin_worker (call1(N,addr)) — native does it in-process. For the bootDll
+        // LZSS decode's ~3MB of MEM1 byte-writes that is ~38us/byte = 26KB/s = the gc=33 wedge.
+        // But MEM1 IS the SHARED SAB heap: read/write it DIRECTLY (big-endian, matching dolphin's
+        // Memory buffer) with ZERO round-trip. Only TRUE MMIO (0xCC*/EXI/etc.) still round-trips.
+        // Runtime MEM1 base is published by dolphin @ SAB 0x02500020. Wraps read8/16/32 + write8/
+        // 16/32; the later AoT WPAR-ring override (line ~456) composes on top (GP addrs first).
+        // Set self.__mem1DirectOff=1 to force the all-round-trip path (A/B).
+        if (!self.__mem1DirectOff) {
+          const _u8v  = new Uint8Array(sharedMemoryRef.buffer);
+          const _sab32 = new Int32Array(sharedMemoryRef.buffer);
+          const _isMem1 = (a) => ((a >= 0x80000000 && a < 0x81800000) ||
+                                  (a >= 0xC0000000 && a < 0xC1800000));   // cached + uncached MEM1 (24MB)
+          const _bump = () => { _sab32[0x025000F8 >> 2] = (_sab32[0x025000F8 >> 2] + 1) | 0; };
+          const _oR8 = env.ppc_read8, _oR16 = env.ppc_read16, _oR32 = env.ppc_read32;
+          const _oW8 = env.ppc_write8, _oW16 = env.ppc_write16, _oW32 = env.ppc_write32;
+          // [MEM1-validate 2026-07-19] Sampled dual-compute: 1-in-64 MEM1 accesses ALSO round-trip to
+          // dolphin (the correct-by-definition path) and compare. Read: my-direct vs dolphin-read.
+          // Write: my direct write, then dolphin read-back vs the value I wrote (proves my write landed
+          // where dolphin reads). Counters: rd-MM 0x025001A8 / rd-OK 0x025001AC / wr-MM 0x025001B0 /
+          // wr-OK 0x025001B4. self.__mem1Validate=1 to enable (default off = zero overhead).
+          let _m1vn = 0;
+          const _m1rd = (a, mine) => { if (self.__mem1Validate && ((_m1vn = (_m1vn + 1) | 0) & 0x3F) === 0) { const real = (a >= 0x80000000 ? _oR32(a) : _oR32(a)) >>> 0; if ((mine >>> 0) !== real) { _sab32[0x025001A8 >> 2] = (_sab32[0x025001A8 >> 2] + 1) | 0; if ((self.__m1Mm = (self.__m1Mm | 0) + 1) <= 8) postMessage({ cmd: 'print', txt: '[MEM1-rd-MM] a=0x' + (a >>> 0).toString(16) + ' mine=0x' + (mine >>> 0).toString(16) + ' real=0x' + real.toString(16) }); } else _sab32[0x025001AC >> 2] = (_sab32[0x025001AC >> 2] + 1) | 0; } };
+          const _m1wr = (a, val) => { if (self.__mem1Validate && ((_m1vn = (_m1vn + 1) | 0) & 0x3F) === 0) { const rb = _oR32(a) >>> 0; if (rb !== (val >>> 0)) { _sab32[0x025001B0 >> 2] = (_sab32[0x025001B0 >> 2] + 1) | 0; if ((self.__m1Wm = (self.__m1Wm | 0) + 1) <= 8) postMessage({ cmd: 'print', txt: '[MEM1-wr-MM] a=0x' + (a >>> 0).toString(16) + ' wrote=0x' + (val >>> 0).toString(16) + ' readback=0x' + rb.toString(16) }); } else _sab32[0x025001B4 >> 2] = (_sab32[0x025001B4 >> 2] + 1) | 0; } };
+          env.ppc_read8 = (addr) => { const a = addr >>> 0; if (_isMem1(a)) { const b = _sab32[0x02500020 >> 2] >>> 0; if (b) { _bump(); const v = _u8v[(b + (a & 0x01FFFFFF)) >>> 0]; if (self.__mem1Validate && ((_m1vn = (_m1vn + 1) | 0) & 0x3F) === 0) { const real = _oR8(a) & 0xFF; if ((v & 0xFF) !== real) { _sab32[0x025001A8 >> 2] = (_sab32[0x025001A8 >> 2] + 1) | 0; if ((self.__m1Mm = (self.__m1Mm | 0) + 1) <= 8) postMessage({ cmd: 'print', txt: '[MEM1-rd8-MM] a=0x' + a.toString(16) + ' mine=0x' + (v & 0xFF).toString(16) + ' real=0x' + real.toString(16) }); } else _sab32[0x025001AC >> 2] = (_sab32[0x025001AC >> 2] + 1) | 0; } return v; } } return _oR8(a); };
+          env.ppc_read16 = (addr) => { const a = addr >>> 0; if (_isMem1(a)) { const b = _sab32[0x02500020 >> 2] >>> 0; if (b) { const p = (b + (a & 0x01FFFFFF)) >>> 0; _bump(); const v = ((_u8v[p] << 8) | _u8v[p + 1]) >>> 0; if (self.__mem1Validate && ((_m1vn = (_m1vn + 1) | 0) & 0x3F) === 0) { const real = _oR16(a) >>> 0; if (v !== real) { _sab32[0x025001A8 >> 2] = (_sab32[0x025001A8 >> 2] + 1) | 0; if ((self.__m1Mm = (self.__m1Mm | 0) + 1) <= 8) postMessage({ cmd: 'print', txt: '[MEM1-rd16-MM] a=0x' + a.toString(16) + ' mine=0x' + v.toString(16) + ' real=0x' + real.toString(16) }); } else _sab32[0x025001AC >> 2] = (_sab32[0x025001AC >> 2] + 1) | 0; } return v; } } return _oR16(a); };
+          env.ppc_read32 = (addr) => { const a = addr >>> 0; if (_isMem1(a)) { const b = _sab32[0x02500020 >> 2] >>> 0; if (b) { const p = (b + (a & 0x01FFFFFF)) >>> 0; _bump(); const v = ((_u8v[p] << 24) | (_u8v[p + 1] << 16) | (_u8v[p + 2] << 8) | _u8v[p + 3]) >>> 0; _m1rd(a, v); return v; } } return _oR32(a); };
+          env.ppc_write8 = (addr, val) => { const a = addr >>> 0; if (_isMem1(a)) { const b = _sab32[0x02500020 >> 2] >>> 0; if (b) { _bump(); _u8v[(b + (a & 0x01FFFFFF)) >>> 0] = val & 0xFF; if (self.__mem1Validate && ((_m1vn = (_m1vn + 1) | 0) & 0x3F) === 0) { const rb = _oR8(a) & 0xFF; if (rb !== (val & 0xFF)) { _sab32[0x025001B0 >> 2] = (_sab32[0x025001B0 >> 2] + 1) | 0; if ((self.__m1Wm = (self.__m1Wm | 0) + 1) <= 8) postMessage({ cmd: 'print', txt: '[MEM1-wr8-MM] a=0x' + a.toString(16) + ' wrote=0x' + (val & 0xFF).toString(16) + ' rb=0x' + rb.toString(16) }); } else _sab32[0x025001B4 >> 2] = (_sab32[0x025001B4 >> 2] + 1) | 0; } return; } } return _oW8(a, val); };
+          env.ppc_write16 = (addr, val) => { const a = addr >>> 0; if (_isMem1(a)) { const b = _sab32[0x02500020 >> 2] >>> 0; if (b) { const p = (b + (a & 0x01FFFFFF)) >>> 0; _bump(); _u8v[p] = (val >>> 8) & 0xFF; _u8v[p + 1] = val & 0xFF; return; } } return _oW16(a, val); };
+          env.ppc_write32 = (addr, val) => { const a = addr >>> 0; if (_isMem1(a)) { const b = _sab32[0x02500020 >> 2] >>> 0; if (b) { const p = (b + (a & 0x01FFFFFF)) >>> 0; _bump(); _u8v[p] = (val >>> 24) & 0xFF; _u8v[p + 1] = (val >>> 16) & 0xFF; _u8v[p + 2] = (val >>> 8) & 0xFF; _u8v[p + 3] = val & 0xFF; _m1wr(a, val); return; } } return _oW32(a, val); };
+        }
+        // [hle-check fastpath 2026-07-18] THE gc=33 FIX (measured): ppc_hle_check (cmd 8) was
+        // the #1 round-trip — 152K/45s, ONE blocking mailbox call per block dispatch (~3400
+        // blocks/s = 26KB/s decode). But the HLE hit-set is a SAB hash table @0x02690000 (1024
+        // slots x8B, 4-probe, hash (pc>>2)*0x9E3779B1&1023) — the SAME table emit_hle_check_native
+        // probes in-WASM. Do that 4-probe here: on MISS (the ~95% path, incl. the entire decode)
+        // return 0 with ZERO round-trip; on HIT fall back to the original round-trip for exact
+        // semantics. Matches the native check's behavior precisely. self.__hleFastOff=1 => original.
+        if (!self.__hleFastOff) {
+          const _origHle = env.ppc_hle_check;
+          const _ht = new Int32Array(sharedMemoryRef.buffer);
+          env.ppc_hle_check = (pc) => {
+            const p = pc >>> 0;
+            const b0 = (Math.imul(p >>> 2, 0x9E3779B1) >>> 0) & 1023;
+            for (let i = 0; i < 4; i++) {
+              const b = (b0 + i) & 1023;
+              if ((_ht[(0x02690000 + b * 8) >> 2] >>> 0) === p) return _origHle(p);  // HLE'd: exact round-trip
+            }
+            _ht[0x02500180 >> 2] = (_ht[0x02500180 >> 2] + 1) | 0;  // fastpath miss (no round-trip) count
+            return 0;  // not HLE'd — no mailbox round-trip (matches emit_hle_check_native fall-through)
+          };
+        }
         if (!mod.bemental_regions) mod.bemental_regions = {};
         postMessage({ cmd: 'init-ack' });
         break;
@@ -419,6 +618,51 @@
           }
           postMessage({ cmd: 'print', txt: '[aot] ENABLED (indirect base; runtime mem1=0x'
             + (newMem1Addr >>> 0).toString(16) + ')' });
+          // [wgp-order fix 2026-07-20 — the gc=33 DLBuf-overflow ROOT] PPC program order between
+          // WGP stores and CP/PI-FIFO register MMIO is VIOLATED cross-worker: WGP data rides the
+          // async GP ring (0x026C0000) while GXBeginDisplayList/GXEndDisplayList's FIFO repoint
+          // writes + write-pointer reads ride the sync mailbox — and only ONE of the two mailbox
+          // consumers (EmscriptenWorker dolphin_drain_mailbox_once:551) drains the ring first; the
+          // page's _mbxConsume -> 'mbx-cmd' path (worker_funcs.js:596) does NOT. When the page
+          // consumer wins the CAS, the repoint lands while the ring still holds the PREVIOUS
+          // object's DL tail, which then drains into the NEW buffer. Oracle-proven byte-for-byte:
+          // our overflowed reserve-448 buffer @0x80b2f8e0 contained EXACTLY the last 485 bytes of
+          // the preceding 53KB object's stream (native tail @0x80b2eba0+0x40) -> GXEndDisplayList
+          // over-counts (736>448) -> heap free-list corruption -> HuMemMemoryAlloc2 spins, gc=33.
+          // FIX = emulate the gather-pipe `sync` at the consumer-independent spot: before ANY
+          // true-MMIO round-trip to the CP page (0x0C000xxx) or PI-FIFO page (0x0C003xxx), wait
+          // until the GP ring is EMPTY (drain applies bytes BEFORE its RELEASE tail store, so
+          // empty == applied). WGP pushes themselves skip this (the AoT override below catches
+          // them first). Bounded like _ringPush (2ms waits, ~4s cap). self.__wgpOrderOff=1 to A/B.
+          // Gate count @0x026B27E0, waited-gates @0x026B27E4 (probe: wgpGateN/wgpGateWaitN).
+          if (!self.__wgpOrderOff && mod.bemental_imports && mod.bemental_imports.env) {
+            const genv = mod.bemental_imports.env;
+            const _gi3 = new Int32Array(sharedMemoryRef.buffer);
+            const _gu3 = new Uint32Array(sharedMemoryRef.buffer);
+            const GPH3 = 0x026C0000 >> 2, GPT3 = 0x026C0004 >> 2;
+            const _isFifoPage = (a) => { const p = ((a >>> 0) & 0x0FFFF000) >>> 0; return p === 0x0C000000 || p === 0x0C003000; };
+            const _drainWait = () => {
+              _gu3[0x026B27E0 >> 2] = ((_gu3[0x026B27E0 >> 2] >>> 0) + 1) >>> 0;
+              let t = Atomics.load(_gi3, GPT3) >>> 0;
+              if ((Atomics.load(_gi3, GPH3) >>> 0) === t) return;   // already drained (fast path)
+              _gu3[0x026B27E4 >> 2] = ((_gu3[0x026B27E4 >> 2] >>> 0) + 1) >>> 0;
+              let spins = 0;
+              while ((Atomics.load(_gi3, GPH3) >>> 0) !== t) {
+                Atomics.wait(_gi3, GPT3, t | 0, 2);                 // consumer notifies GP_TAIL on drain
+                t = Atomics.load(_gi3, GPT3) >>> 0;
+                if (++spins > 2000) break;                          // ~4s absolute safety (consumer-dead only)
+              }
+            };
+            const _fR8 = genv.ppc_read8, _fR16 = genv.ppc_read16, _fR32 = genv.ppc_read32;
+            const _fW8 = genv.ppc_write8, _fW16 = genv.ppc_write16, _fW32 = genv.ppc_write32;
+            genv.ppc_read8   = (a) => { if (_isFifoPage(a)) _drainWait(); return _fR8(a); };
+            genv.ppc_read16  = (a) => { if (_isFifoPage(a)) _drainWait(); return _fR16(a); };
+            genv.ppc_read32  = (a) => { if (_isFifoPage(a)) _drainWait(); return _fR32(a); };
+            genv.ppc_write8  = (a, v) => { if (_isFifoPage(a)) _drainWait(); return _fW8(a, v); };
+            genv.ppc_write16 = (a, v) => { if (_isFifoPage(a)) _drainWait(); return _fW16(a, v); };
+            genv.ppc_write32 = (a, v) => { if (_isFifoPage(a)) _drainWait(); return _fW32(a, v); };
+            postMessage({ cmd: 'print', txt: '[wgp-order] CP/PI-page MMIO gated on GP-ring drain' });
+          }
           if (self.__aot.enabled && !self.__aot.table) {
             // [aot-chain] Eager-instantiate the whole pack with a shared funcref table so
             // cross-function block exits tail-call in-wasm. Flat index in SAB @0x02700000:
@@ -474,7 +718,10 @@
                 const wmod = new WebAssembly.Module(a.pack.subarray(off, off + size));
                 const inst = new WebAssembly.Instance(wmod, { env: a.env });
                 a.instCache[f] = inst;
-                a.table.set(f, inst.exports.region);
+                // [aot-next 2026-07-20] gekko modules export ONE `region` (in-wasm aot_table chain).
+                // powerpc-next modules (build_region_module_next) export per-block funcs fn_0..fn_N and
+                // do NOT chain via aot_table — dispatch is per-block (fn_<blk>), so skip the table.
+                if (inst.exports.region) a.table.set(f, inst.exports.region);
                 const first = a.funcs[f * 5 + 3], nb = a.funcs[f * 5 + 4];
                 for (let b = 0; b < nb; b++) {
                   const rel = (a.blockPcs[first + b] >>> 0) - 0x80000000;
@@ -658,8 +905,14 @@
         if (!inited) { postMessage({ cmd: 'setup-bemental-env-nack', reason: 'not initialised' }); return; }
         if (!mod.bemental_imports) mod.bemental_imports = { env: {} };
         const env = mod.bemental_imports.env;
-        const call1 = (cmd, a) => mod._ppc_worker_mailbox_call_sync(cmd, a >>> 0) >>> 0;
-        const call2 = (cmd, a, b) => { mod._ppc_worker_mailbox_call_sync2(cmd, a >>> 0, b >>> 0); };
+        // [round-trip profiler 2026-07-18] Count JS-side mailbox round-trips by cmd (per-cmd @
+        // SAB 0x02500100+cmd*4, total @0x025000FC) to SEE which import dominates the gc=33 decode.
+        const _rtc = new Int32Array(sharedMemoryRef.buffer);
+        if (self.__interpValidate === undefined) self.__interpValidate = 0;  // 1 = validate fastpaths vs round-trip
+        if (self.__mem1Validate === undefined) self.__mem1Validate = 0;  // 1 = sampled MEM1 validate
+        const _rtcBump = (cmd) => { _rtc[0x025000FC >> 2] = (_rtc[0x025000FC >> 2] + 1) | 0; _rtc[(0x02500100 + ((cmd & 31) << 2)) >> 2] = (_rtc[(0x02500100 + ((cmd & 31) << 2)) >> 2] + 1) | 0; };
+        const call1 = (cmd, a) => { _rtcBump(cmd); return mod._ppc_worker_mailbox_call_sync(cmd, a >>> 0) >>> 0; };
+        const call2 = (cmd, a, b) => { _rtcBump(cmd); mod._ppc_worker_mailbox_call_sync2(cmd, a >>> 0, b >>> 0); };
         env.memory          = sharedMemoryRef;
         // [poll-target 2026-07-09] record the last slow-path MMIO read (addr + seq) so the
         // EE=0 poll handler can DISCRIMINATE beam polls (VI range -> smooth-step) from
@@ -685,12 +938,140 @@
           if (a === 0xCC003000 && Atomics.load(self.__mmr, 0x026A0000 >> 2) === 1) {
             Atomics.add(self.__mmr, 0x026B27D8 >> 2, 1);                  // [fastpath-hit] PI cause
             return Atomics.load(self.__mmr, 0x026B27D0 >> 2) >>> 0; }     // PI cause fast-path
-          self.__lastMmioRdAddr = a; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(4, a); };
+          self.__lastMmioRdAddr = a; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1;
+          // [mmio-read-addr HASH profiler 2026-07-18] 256-bucket hash counter @0x02500400
+          // (bucket=(addr>>2)&0xFF stores addr@+0, count@+4 stride8) — reliable vs the 8-slot
+          // (which filled with boot addrs). Hot model-build/ISR reg dominates its bucket.
+          { const _b = ((a >>> 2) & 0xFF); const _sp = 0x02500400 + _b * 8; _rtc[_sp >> 2] = a; _rtc[(_sp + 4) >> 2] = (_rtc[(_sp + 4) >> 2] + 1) | 0; }
+          return call1(4, a); };
         // Item 6 Stage 2 — writes go either via mailbox (W1, default) or
         // SAB pending-writes ring (W2, gated by `useWriteRing`).
         installWriteEnv(env, call2);
         env.ppc_hle_check   = (pc) => call1(8, pc);
         env.ppc_interp      = (inst, pc) => {
+          // [interp sys-op fastpath 2026-07-18] THE gc=33 FIX (measured): mfcr/mtcrf are interp-
+          // fallback stubs in powerpc-next (jit_system_registers.cpp:358) → one mailbox round-trip
+          // each, and they fire per interrupt (mtcrf 11762x, mfcr 7753x in 45s). Execute them
+          // DIRECTLY on the SAB ppc_state here (no round-trip), using Dolphin's exact CR encoding
+          // (ConditionRegister.h: PPCToInternal/GetField; cr(n)=0x2A0+n*8 u64, gpr(n)=0x14+n*4).
+          // The block Flush'd GPR/CR to ppc_state before this call and ReloadAll's after, so
+          // direct SAB read/write is coherent. self.__interpFastOff=1 => original round-trip.
+          if (!self.__interpFastOff) {
+            const _op = (inst >>> 26) & 0x3F, _xo = (inst >>> 1) & 0x3FF, _b20 = (inst >>> 20) & 1;
+            const _CTXr = _rtc[0x0250002C >> 2] >>> 0;   // real &ppc_state
+            // rfi (op19 xo50): MSR=(MSR&~0x87C0FFFF)|(SRR1&0x87C0FFFF); pc=npc=SRR0&~3.
+            // Dolphin Interpreter::rfi. MEM1 access is MSR-independent in the worker (fixed base),
+            // so no membase recompute needed. Biggest interrupt-path round-trip (16292x/55s).
+            if (_op === 19 && _xo === 50 && _CTXr !== 0) {
+              const _msr = _rtc[(_CTXr + 0x2E0) >> 2] >>> 0;
+              const _srr1 = _rtc[(_CTXr + 0x3AC) >> 2] >>> 0;   // spr(27)=0x340+27*4
+              const _srr0 = _rtc[(_CTXr + 0x3A8) >> 2] >>> 0;   // spr(26)=0x340+26*4
+              const _nmsr = (((_msr & ~0x87C0FFFF) >>> 0) | (_srr1 & 0x87C0FFFF)) >>> 0;
+              const _npc = (_srr0 & ~3) >>> 0;
+              if (self.__interpValidate) {
+                call2(9, inst, pc);
+                const _rM = _rtc[(_CTXr + 0x2E0) >> 2] >>> 0, _rP = _rtc[(_CTXr + 0x0) >> 2] >>> 0;
+                if (_nmsr !== _rM || _npc !== _rP) { _rtc[0x02500198 >> 2] = (_rtc[0x02500198 >> 2] + 1) | 0; if ((self.__rfiMm = (self.__rfiMm | 0) + 1) <= 4) postMessage({ cmd: 'print', txt: '[rfi-MM] mineMsr=0x' + _nmsr.toString(16) + ' realMsr=0x' + _rM.toString(16) + ' minePc=0x' + _npc.toString(16) + ' realPc=0x' + _rP.toString(16) }); }
+                else _rtc[0x0250019C >> 2] = (_rtc[0x0250019C >> 2] + 1) | 0;
+                return;
+              }
+              _rtc[(_CTXr + 0x2E0) >> 2] = _nmsr | 0;
+              _rtc[(_CTXr + 0x0) >> 2] = _npc | 0;   // pc
+              _rtc[(_CTXr + 0x4) >> 2] = _npc | 0;   // npc
+              _rtc[0x02500184 >> 2] = (_rtc[0x02500184 >> 2] + 1) | 0;
+              return;
+            }
+            // mtxer (mtspr XER, op31 xo467 SPR=1): split storage XER_CA(0x2F4 u8)=CA(bit29),
+            // XER_SO_OV(0x2F5)=(SO<<1)|OV (bits30-31), XER_STRINGCTRL(0x2F6 u16 low=BYTE_COUNT
+            // bits0-6, high=BYTE_CMP preserved). #1 remaining interrupt-path round-trip (14042x).
+            if (_op === 31 && _xo === 467 && _CTXr !== 0
+                && ((((inst >>> 16) & 0x1F) | (((inst >>> 11) & 0x1F) << 5)) === 1)) {
+              const _rS = _rtc[(_CTXr + 0x14 + (((inst >>> 21) & 0x1F) * 4)) >> 2] >>> 0;
+              const _xi = (_CTXr + 0x2F4) >> 2;
+              const _bc = (_rtc[_xi] >>> 24) & 0xFF;   // preserve BYTE_CMP (byte 0x2F7)
+              if (self.__interpValidate) {
+                const _myX = (((_rS >>> 29) & 1) | (((_rS >>> 30) & 3) << 8) | ((_rS & 0x7F) << 16)) >>> 0;
+                call2(9, inst, pc);
+                const _rX = (_rtc[_xi] >>> 0) & 0x00FFFFFF;   // CA/SO_OV/TBC (mask byte_cmp)
+                if (_myX !== _rX) { _rtc[0x025001A0 >> 2] = (_rtc[0x025001A0 >> 2] + 1) | 0; if ((self.__xerMm = (self.__xerMm | 0) + 1) <= 4) postMessage({ cmd: 'print', txt: '[mtxer-MM] mine=0x' + _myX.toString(16) + ' real=0x' + _rX.toString(16) + ' rS=0x' + _rS.toString(16) }); }
+                else _rtc[0x025001A4 >> 2] = (_rtc[0x025001A4 >> 2] + 1) | 0;
+                return;
+              }
+              _rtc[_xi] = (((_rS >>> 29) & 1) | (((_rS >>> 30) & 3) << 8) | ((_rS & 0x7F) << 16) | (_bc << 24)) | 0;
+              _rtc[0x02500184 >> 2] = (_rtc[0x02500184 >> 2] + 1) | 0;
+              return;
+            }
+            // [mtspr WPAR fastpath 2026-07-20] THE gc=33 dual-core deadlock fix. mtspr WPAR (op31 xo467
+            // SPR=921) is the GX write-gather-pipe redirect (GXBegin/EndDisplayList -> GXRedirect/Restore
+            // WriteGatherPipe, MDFaceDraw). The powerpc emitter interp-falls-back this SPR -> ONE blocking
+            // mailbox cmd-9 round-trip PER display-list boundary; dolphin_worker wasn't servicing it (the
+            // guest hard-froze here, mbx="9/7c79e3a6", drainA=0). Dolphin's handler (Interpreter_System
+            // Registers.cpp:393) just does GPFifo::ResetGatherPipe() — a NO-OP in our model: WPAR-region
+            // stores (0x0C008000) already route straight to the GP ring (line ~628), there is NO
+            // intermediate gather buffer to flush. So execute it DIRECTLY on ppc_state: write spr[921]
+            // (=SPR_BASE 0x340 + 921*4 = 0x11A4) with BNE (bit0) CLEAR — our gather buffer is always empty,
+            // so the display-list mfspr WPAR[BNE] poll (mfspr reads spr[921] directly, gekko_emit.cpp:2722)
+            // passes immediately. Kills the round-trip -> breaks the deadlock. self.__interpFastOff=1 => orig.
+            if (_op === 31 && _xo === 467 && _CTXr !== 0
+                && ((((inst >>> 16) & 0x1F) | (((inst >>> 11) & 0x1F) << 5)) === 921)) {
+              const _rSw = _rtc[(_CTXr + 0x14 + (((inst >>> 21) & 0x1F) * 4)) >> 2] >>> 0;
+              _rtc[(_CTXr + 0x11A4) >> 2] = (_rSw & ~1) | 0;   // spr[921]=WPAR, BNE(bit0)=0 (buffer empty)
+              _rtc[0x02500184 >> 2] = (_rtc[0x02500184 >> 2] + 1) | 0;   // sysFp counter
+              return;
+            }
+            if (_op === 31 && _b20 === 0 && (_xo === 19 || _xo === 144)) {
+              const _CTX = _CTXr;
+              if (_CTX !== 0) {
+                if (_xo === 19) {                          // mfcr: pack CR[0..7] -> GPR[rD]
+                  let _cr = 0;
+                  for (let n = 0; n < 8; n++) {
+                    const _co = (_CTX + 0x2A0 + n * 8) >> 2;
+                    const _lo = _rtc[_co] >>> 0, _hi = _rtc[_co + 1] >>> 0;
+                    let _nib = ((_hi >>> 27) & 1) | (((_hi >>> 30) & 1) << 3);  // SO(bit59)->b0, LT(bit62)->b3
+                    if (_lo === 0) _nib |= 2;                                   // EQ: low32==0
+                    if ((_hi & 0x80000000) === 0 && (_hi !== 0 || _lo !== 0)) _nib |= 4;  // GT: (s64)cr_val>0 (bit63 clear AND cr_val!=0 — cr_val CAN be 0)
+                    _cr = (_cr | (_nib << ((7 - n) * 4))) >>> 0;
+                  }
+                  if (self.__interpValidate) {             // [validate] compare my mfcr to dolphin's round-trip
+                    call2(9, inst, pc);                    // dolphin executes mfcr -> writes rD
+                    const _rd = (inst >>> 21) & 0x1F;
+                    const _real = _rtc[(_CTX + 0x14 + _rd * 4) >> 2] >>> 0;
+                    if ((_cr >>> 0) !== _real) { _rtc[0x02500190 >> 2] = (_rtc[0x02500190 >> 2] + 1) | 0; if ((self.__mfcrMm = (self.__mfcrMm | 0) + 1) <= 4) postMessage({ cmd: 'print', txt: '[mfcr-MISMATCH] inst=0x' + (inst >>> 0).toString(16) + ' mine=0x' + (_cr >>> 0).toString(16) + ' real=0x' + _real.toString(16) }); }
+                    else _rtc[0x02500194 >> 2] = (_rtc[0x02500194 >> 2] + 1) | 0;
+                    return;
+                  }
+                  _rtc[(_CTX + 0x14 + (((inst >>> 21) & 0x1F) * 4)) >> 2] = _cr | 0;
+                } else {                                   // mtcrf: unpack GPR[rS] -> CR fields (FXM-masked)
+                  const _rS = _rtc[(_CTX + 0x14 + (((inst >>> 21) & 0x1F) * 4)) >> 2] >>> 0;
+                  const _fxm = (inst >>> 12) & 0xFF;
+                  for (let n = 0; n < 8; n++) {
+                    if (_fxm & (0x80 >>> n)) {
+                      const _nib = (_rS >>> ((7 - n) * 4)) & 0xF;
+                      let _hi = 1;                          // marker bit32 (0x100000000)
+                      if (_nib & 1) _hi |= (1 << 27);       // SO -> bit59
+                      if (!(_nib & 4)) _hi = (_hi | 0x80000000) >>> 0;  // !GT -> bit63
+                      if (_nib & 8) _hi |= (1 << 30);       // LT -> bit62
+                      const _co = (_CTX + 0x2A0 + n * 8) >> 2;
+                      _rtc[_co] = (_nib & 2) ? 0 : 1;       // !EQ -> low bit0
+                      _rtc[_co + 1] = _hi | 0;
+                    }
+                  }
+                }
+                _rtc[0x02500184 >> 2] = (_rtc[0x02500184 >> 2] + 1) | 0;  // sys-op fastpath hits
+                return;   // executed in-worker — no mailbox round-trip
+              }
+            }
+          }
+          // [interp-pc profiler 2026-07-18] cmd 9 (interp) is the #1 round-trip after the hle
+          // fastpath — record WHICH pcs fall to the interpreter (8-slot {pc,inst,count} histogram
+          // @0x02500200, stride 12) so we can see what op to JIT-emit or fastpath.
+          { const _p = pc >>> 0; let _free = -1, _done = false;
+            for (let _k = 0; _k < 8; _k++) { const _sp = 0x02500200 + _k * 12;
+              const _spc = _rtc[_sp >> 2] >>> 0;
+              if (_spc === _p) { _rtc[(_sp + 8) >> 2] = (_rtc[(_sp + 8) >> 2] + 1) | 0; _done = true; break; }
+              if (_free < 0 && _spc === 0) _free = _k; }
+            if (!_done && _free >= 0) { const _sp = 0x02500200 + _free * 12;
+              _rtc[_sp >> 2] = _p; _rtc[(_sp + 4) >> 2] = inst >>> 0; _rtc[(_sp + 8) >> 2] = 1; } }
           // [store-watch 2026-06-29 TEMP] BUG 2: marker 0xFFFFFFFB = a 32-bit store of
           // 0x808080 into the SIGetType stack frame (the callback-corruption write).
           // pc = the EXACT storing instruction; log it (no dolphin round-trip). Other
@@ -720,6 +1101,12 @@
         env.ppc_check_exc   = (pc) => call1(10, pc);
         env.ppc_break_block = (pc, x) => call2(11, pc, x);
         env.ppc_read_tb     = (which) => call1(12, which);
+        // [aot-next 2026-07-20] powerpc-next block modules import these two (gekko didn't).
+        // Both are NO-OPs in the ppc-worker model: MEM1 base is fixed/indirect (MSR-independent,
+        // no membase recompute on MSR change), and WPAR-region stores already route straight to
+        // the GP ring (ppc_worker.js:~628) so there is no gather buffer to flush at block exit.
+        env.ppc_msr_updated  = () => {};
+        env.ppc_gather_drain = () => {};
         // Item 5 — env.ppc_hle_fire wired via mailbox cmd 14 (HleFire).
         if (!mod._ppc_hle_fire_hits) mod._ppc_hle_fire_hits = 0;
         env.ppc_hle_fire    = (pc, it) => {
@@ -941,6 +1328,8 @@
           env.ppc_check_exc   = () => 0;
           env.ppc_break_block = () => {};
           env.ppc_read_tb     = () => 0;
+          env.ppc_msr_updated  = () => {};   // [aot-next] powerpc-next imports
+          env.ppc_gather_drain = () => {};
           // Item 5: in ignoreDowncount perf mode, dolphin owns canonical
           // state and HLE bypass is acceptable. Stub returns pc unchanged
           // so the block falls through. Real boot wires this through the
@@ -1395,6 +1784,12 @@
         let __extInFlight = false;   // an EXT 0x500 vector is in progress; block re-delivery
         let __extSrr0 = 0;           // interrupted pc we vectored from (rfi must return here)
         let __extInflightIters = 0;  // safety: force-clear if the handler never returns to SRR0
+        // [gate#8 clean-baseline 2026-07-18] Master switch for the accumulated per-dispatch
+        // TEMP diagnostics (livepc histogram, pc-check counters, gate-diag). The LZSS decode
+        // is ~1 block/byte, so these run per decoded byte and tax the exact wedge being measured.
+        // OFF => clean perf baseline; flip true to re-enable telemetry. Load-bearing delivery
+        // logic (__extInFlight guard, CT-fire, EXT vectoring) is NOT gated by this.
+        const __DIAG = (typeof self !== 'undefined' && self.__PPC_DIAG === 1);
         const __delivReconcile = () => {
           const _g = u32[0x026B0970 >> 2] >>> 0;
           if (_g !== __lastDelivGen) {
@@ -1417,7 +1812,7 @@
           // [livepc-diag 2026-07-16 TEMP] Where is the guest ACTUALLY spinning while EXT
           // deliveries freeze? Publish live pc/msr @0x026B2728/272C and a tiny top-8 histogram
           // of the live pc @0x026B2730..0x026B276F (8 slots of {pc,count}). Gated cpu_owner==1.
-          if (Atomics.load(i32, 0x026A0000 >> 2) === 1) {
+          if (__DIAG && Atomics.load(i32, 0x026A0000 >> 2) === 1) {
             const _lpc = pc >>> 0;
             const _lmsr = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
             u32[0x026B2728 >> 2] = _lpc;
@@ -1454,8 +1849,14 @@
           // and __OSReschedule thread switch; matches native's one-delivery-per-completion cadence. For a
           // non-DSP EXT (VI etc.) the DSP bit is already 0 so it clears immediately — no over-hold.
           if (__extInFlight) {
-            const _piDsp = (u32[0x026B27D0 >> 2] >>> 0) & 0x40;   // INT_CAUSE_DSP still pending device-side?
-            if (_piDsp === 0 || (pc >>> 0) === (__extSrr0 >>> 0)
+            // [dual-core 2026-07-17] Clear the one-at-a-time EXT guard on the ISR's terminal rfi
+            // (MSR.EE 0->1, restored from SRR1) OR a direct return to the interrupted pc OR a bounded
+            // cap. The device-side INT_CAUSE_DSP variant DEADLOCKED: it held the guard until the guest
+            // acked ARAM, but the guest can't ack until the EXT is delivered, which the guard blocks.
+            // EE-edge clears reliably (the handler always ends by restoring EE=1) so delivery can't
+            // wedge; if a mid-ISR OSRestoreInterrupts re-fires early, that self-corrects at the next rfi.
+            const _eeNow = (u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0) & 0x8000;  // MSR.EE
+            if (_eeNow !== 0 || (pc >>> 0) === (__extSrr0 >>> 0)
                 || ++__extInflightIters > 200000) {
               __extInFlight = false;
               __extInflightIters = 0;
@@ -1464,6 +1865,9 @@
           // [pe-finish handler-run counter TEMP 2026-07-11] does the guest run
           // GXFinishInterruptHandler (0x800CAB3C, sets DrawDone=1 + wakes FinishQueue)
           // post-takeover? @0x026B1A98. If 0 -> PE_FINISH never dispatched to the guest.
+          if (__DIAG) {
+          if ((pc >>> 0) === 0x800097d8) u32[0x026B1AA4 >> 2] = ((u32[0x026B1AA4 >> 2] >>> 0) + 1) >>> 0;
+          if ((pc >>> 0) === 0x800c0b6c) u32[0x026B1AA0 >> 2] = ((u32[0x026B1AA0 >> 2] >>> 0) + 1) >>> 0;
           if ((pc >>> 0) === 0x800cab3c) u32[0x026B1A98 >> 2] = ((u32[0x026B1A98 >> 2] >>> 0) + 1) >>> 0;
           // [wall-2 TEMP] does the render thread execute GXSetDrawDone(0x800ca7a8)/the WPAR-token
           // block(0x800ca594)/GXWaitDrawDone(0x800ca840) post-takeover? gxSetDD@0x026B1A9C,
@@ -1489,6 +1893,7 @@
             const _alignedWord = u32[(_byteOff & ~3) >> 2] >>> 0;             // containing 32-bit word
             u32[0x026B27AC >> 2] = (_alignedWord >>> ((_byteOff & 3) * 8)) & 0xFF;  // extract the target byte (LE heap)
           }
+          } // __DIAG (pc-check counters)
           // [await-pc 2026-07-03] The boot dispatcher can start before dolphin publishes
           // the first real pc — the SAB slot is zero-initialized, and dispatching pc=0
           // walks the reset vector's stub, manufacturing 'Unhandled Exception 0' (guest
@@ -1686,7 +2091,7 @@
                 // loop-natively (this block re-runs every dispatch iteration).
                 // [gate-diag 2026-07-16 TEMP] why does EXT vectoring freeze while the idle loop
                 // reaches EE=1? Count gate outcomes @0x026B2780..0x026B279F (cpu_owner==1 only).
-                if (Atomics.load(i32, 0x026A0000 >> 2) === 1) {
+                if (__DIAG && Atomics.load(i32, 0x026A0000 >> 2) === 1) {
                   const _hasExt = (exc & EXC_EXTERNAL_INT) !== 0;
                   const _eeOn = (msr & MSR_EE) !== 0;
                   if (_hasExt) u32[0x026B2780 >> 2] = ((u32[0x026B2780 >> 2] >>> 0) + 1) >>> 0;         // EXT pending seen
@@ -1833,6 +2238,53 @@
             const now = (typeof performance !== 'undefined') ? performance.now() : Date.now();
             if ((now - wallStart) >= wallTimeMs) { exitReason = 'wall-time-cap'; break; }
           }
+          // [chain-dispatch port 2026-07-18] THE gc=33 FIX — batched in-WASM dispatch.
+          // ppc_worker_chain_loop_c runs up to 4096 already-compiled blocks per JS
+          // round-trip via fn-ptr call_indirect (dolphin_worker parity), instead of one
+          // block per JS iteration through the legacy inst.exports.run() scan (~200x slower
+          // on tight loops — the bootDll LZSS decode that wedges gc=33). On uncompiled-miss
+          // compile+register the block (populates g_bem_pc_handle) and retry; on wasm-trap
+          // or compile-fail fall through to the legacy path. self.__ppcChainOff=1 => legacy.
+          if (self.__ppcChainOn) {
+            // Ensure downcount room — the chain bails on downcount<=0 (after >=1 block),
+            // so a low/exhausted counter would cap the chain at 1 block. Refill like the
+            // legacy self-refill (line ~1840) so the chain runs its full budget.
+            if (i32[(PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2] < 4096)
+              Atomics.store(i32, (PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2, 20000);
+            const _FPC = 0x025000F0, _TPC = 0x025000F4;  // scratch SAB (final_pc / trap_pc)
+            let _cnt = 0, _trapPc = 0;
+            try {
+              _cnt = mod._ppc_worker_chain_loop_c(pc >>> 0, 4096, _FPC, _TPC) >>> 0;
+            } catch (e) {
+              _trapPc = u32[_FPC >> 2] >>> 0;
+              self.__chainTraps = (self.__chainTraps | 0) + 1;
+            }
+            const _finalPc = u32[_FPC >> 2] >>> 0;
+            if (_trapPc === 0) _trapPc = u32[_TPC >> 2] >>> 0;
+            if (_cnt > 0) {
+              // The chain ran `_cnt` productive blocks in-WASM. Commit the cursor + cycles,
+              // then FALL THROUGH to the legacy dispatch for ONE block — that path owns the
+              // idle-spin / interrupt-delivery machinery (pollAdvance kicks dolphin to fire
+              // hybrid VI/DI events, sleep-tick jumps the clock). Running it once per chain
+              // (~1 legacy dispatch per 4096 chain blocks) keeps idle waits correct while the
+              // chain provides the tight-loop speedup (the gc=33 decode).
+              sliceCyclesBurned += _cnt;
+              if (!ignoreDowncount) Atomics.sub(i32, (PPC_STATE_BASE + OFFSET_DOWNCOUNT) >> 2, _cnt | 0);
+              pc = _finalPc >>> 0;
+              u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] = pc;
+              u32[(PPC_STATE_BASE + OFFSET_NPC) >> 2] = pc;
+              self.__chainBlocks = ((self.__chainBlocks | 0) + _cnt) >>> 0;
+              // fall through to legacy dispatch of `pc`
+            } else if (_trapPc === 0) {
+              // No progress + no trap: loop-top gates already handled owner/exc this iter,
+              // so this is an uncompiled miss. Compile+register the block, then retry the chain.
+              const _sz = mod._ppc_worker_compile_and_register(pc >>> 0) >>> 0;
+              self.__chainCompiles = ((self.__chainCompiles | 0) + 1) >>> 0;
+              if (_sz > 0) continue;         // registered → retry chain next iter
+              // compile-fail (bad pc / non-code) → fall through to legacy dispatch below
+            }
+            // trap → fall through to legacy dispatch below (recompiles _finalPc the legacy way)
+          }
           // Phase 3a.4 fast-path: merged-region dispatch via C side.
           // Phase 3a.5: also a startup force-relink. On the very first
           // miss-storm (no module yet for the entry region) the natural
@@ -1896,7 +2348,12 @@
                     }
                   }
                 }
-                if (samePcCount > 100 && !disableIdleSkip) { exitReason = 'idle-skip'; break; }
+                // [dual-core 2026-07-17] Never idle-skip out of an exception-vector PC (<0x4000): that's a
+                // handler that MUST run to completion, not an idle spin. Exiting the slice there re-drives
+                // the guest through a page round-trip per ~100 dispatches, so the 0x500 interrupt handler
+                // crawled and never serviced the device IRQ (0x500 pinned 133115 vs 226 reaching the C
+                // handler). Keep dispatching so it runs 500->prologue->__OSDispatchInterrupt->__ARHandler.
+                if (samePcCount > 100 && !disableIdleSkip && (next >>> 0) >= 0x4000) { exitReason = 'idle-skip'; break; }
               } else { samePcCount = 0; lastPc = next; }
               pc = next;
               continue;
@@ -1993,18 +2450,32 @@
             if (_inst) {
               if (!regions[0]) regions[0] = { pcMap: new Map(), cycleMap: new Map(), instances: [] };
               const _first = _a.funcs[_fi * 5 + 3], _nb = _a.funcs[_fi * 5 + 4];
+              // [aot-next 2026-07-20] gekko region modules export ONE `region` (in-wasm chain that
+              // charges downcount internally -> loader reads the delta, aot:true). build_region_module
+              // per-block modules export fn_0..fn_N and emit NO downcount charge (gekko_emit.cpp:5446)
+              // -> mark aot:false so the loop charges downcount by the block's instr count, else
+              // CoreTiming stalls (DVD read never fires -> gc=11/33 poll wedge, gpSent=11049).
+              const _hasRegion = !!_inst.exports.region;
               for (let _b = 0; _b < _nb; _b++) {
                 const _bpc = _a.blockPcs[_first + _b] >>> 0;
                 if (regions[0].pcMap.has(_bpc)) continue;
                 const _idx = regions[0].instances.length;
-                regions[0].instances.push({ aot: true, exports: { run: (function (I, sel) {
-                  return function () { u32[0x026B0904 >> 2] = sel; return I.exports.region() >>> 0; };
+                regions[0].instances.push({ aot: _hasRegion, exports: { run: (function (I, sel) {
+                  if (I.exports.region)
+                    return function () { u32[0x026B0904 >> 2] = sel; return I.exports.region() >>> 0; };
+                  const _fn = I.exports['fn_' + sel];   // powerpc-next / gekko-per-block: fn_0..fn_N
+                  return function () { return _fn() >>> 0; };
                 })(_inst, _b) } });
                 regions[0].pcMap.set(_bpc, _idx);
-                regions[0].cycleMap.set(_bpc, 1);
+                let _cyc = 1;
+                if (!_hasRegion) {   // per-block: charge downcount by instr count = (nextBlockPc - pc)/4
+                  const _np = _a.blockPcs[_first + _b + 1] >>> 0;
+                  _cyc = (_np > _bpc) ? Math.max(1, Math.min(255, (_np - _bpc) >>> 2)) : 8;
+                }
+                regions[0].cycleMap.set(_bpc, _cyc);
               }
               if (regions[0].pcMap.has(pc >>> 0)) {
-                region = regions[0]; idx = regions[0].pcMap.get(pc >>> 0); blockCycles = 1;
+                region = regions[0]; idx = regions[0].pcMap.get(pc >>> 0); blockCycles = regions[0].cycleMap.get(pc >>> 0) || 1;
                 if ((self.__aotHits = (self.__aotHits | 0) + 1) === 1)
                   postMessage({ cmd: 'print', txt: '[aot] first dispatch hit pc=0x' + pc.toString(16) });
               }
@@ -2090,6 +2561,26 @@
             self.__lw[(self.__lwI = ((self.__lwI | 0) + 1) & 7)] = pc >>> 0;
           }
           self.__lwN = _inWin ? ((self.__lwN | 0) + 1) : 0;
+          // [dual-core ff-hint 2026-07-17] Publish the busy-spin PC as dolphin's ff idle-hint so its
+          // Advance() fast-forward runs HERE and crosses the gap to the pending device CoreTiming event
+          // (the ARAM DMA completion that HuARDMACheck 0x80049488 waits on). The ff was gated on ONLY the
+          // SelectThread idle PC (published page-side off the boot-dispatch msg, which stops post-collapse),
+          // so device-wait spins never advanced dolphin's clock -> ARAM never completed (aramComplete=7,
+          // gc wedged at 33 the instant the worker took over the CPU). A mailbox ping only nudges dolphin a
+          // sliver; the ff crosses the whole gap. Latch a STABLE hint PC (multi-PC loops cycle) and clear on
+          // real forward progress (__lwN resets). Gated owner==1 + high-mem so vectors/boot are untouched.
+          if (Atomics.load(i32, 0x026A0000 >> 2) === 1) {
+            if ((self.__lwN | 0) >= 4 && (pc >>> 0) >= 0x4000 && !self.__ffHintLatched) {
+              u32[0x02680034 >> 2] = pc >>> 0;   // ff hint pc (CT_QUEUE+0x34)
+              u32[0x02680030 >> 2] = 1;          // ff idle-hint ON  (CT_QUEUE+0x30)
+              u32[0x026B2A24 >> 2] = ((u32[0x026B2A24 >> 2] >>> 0) + 1) >>> 0;  // [ff-hint diag] publish count
+              u32[0x026B2A28 >> 2] = pc >>> 0;   // [ff-hint diag] last published hint pc
+              self.__ffHintLatched = 1;
+            } else if ((self.__lwN | 0) === 0 && self.__ffHintLatched) {
+              u32[0x02680030 >> 2] = 0;          // progress -> clear the hint
+              self.__ffHintLatched = 0;
+            }
+          }
           if (pc === lastPc || _inWin) {
             if (pc === lastPc) ++samePcCount;  // idle-skip exit keyed on SINGLE-pc only
             // [pollAdvance engage 2026-07-09] see the merged-path twin above.
@@ -2164,8 +2655,8 @@
                 }
               }
             }
-            if (samePcCount > 100 && !disableIdleSkip) {
-              exitReason = 'idle-skip'; break;
+            if (samePcCount > 100 && !disableIdleSkip && (pc >>> 0) >= 0x4000) {
+              exitReason = 'idle-skip'; break;   // [dual-core 2026-07-17] never idle-skip a <0x4000 exception vector
             }
           } else {
             samePcCount = 0;
@@ -2221,6 +2712,14 @@
             u32[0x026B0A38 >> 2] = nextPc >>> 0;
             u32[0x026B0A3C >> 2] = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
             u32[0x026B0A40 >> 2] = u32[(PPC_STATE_BASE + OFFSET_EXC) >> 2] >>> 0;
+          }
+          // [0x500-return diag 2026-07-17] What next-PC does the 0x500 EXT vector block return?
+          // 0x500->0x504 (advances) = emitter OK; 0x500 (self) = emitter/decode bug. count/next/msr/exc.
+          if ((pc >>> 0) === 0x500) {
+            u32[0x026B0A44 >> 2] = (u32[0x026B0A44 >> 2] >>> 0) + 1;
+            u32[0x026B0A48 >> 2] = nextPc >>> 0;
+            u32[0x026B0A4C >> 2] = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
+            u32[0x026B0A50 >> 2] = u32[(PPC_STATE_BASE + OFFSET_EXC) >> 2] >>> 0;
           }
           pc = nextPc;
         }

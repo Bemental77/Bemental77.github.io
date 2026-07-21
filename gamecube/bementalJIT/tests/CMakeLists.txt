@@ -85,6 +85,9 @@ if(BEMENTAL_GUEST_POWERPC)
         "SHELL:-s MAXIMUM_MEMORY=67108864"
         "SHELL:-s ALLOW_TABLE_GROWTH=1"
         "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
+        # [2026-07-20] match test_diff_next — the harness reads Module.HEAPU8; without this the
+        # page aborts on load ("HEAPU8 not exported").
+        "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP8','HEAP16','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']"
     )
     target_compile_options(test_diff PRIVATE "-pthread")
 

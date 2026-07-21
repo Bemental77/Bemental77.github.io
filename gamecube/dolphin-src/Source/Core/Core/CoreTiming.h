@@ -129,6 +129,19 @@ public:
   // instructions is executed.
   // NOTE: Advance updates the PowerPC downcount and performs a PPC external exception check.
   void Advance();
+#ifdef __EMSCRIPTEN__
+  // [determinism 2026-07-17] In-thread authoritative time of the earliest queued HYBRID event
+  // (-1 if the queue is empty). The dual-core idle fast-forward uses this to compute a
+  // DETERMINISTIC skip target instead of the race-terminated *exc/*pc_live 1024-burst.
+  s64 FirstEventTime() const;
+  // Advance global_timer to an EXACT target and fire every hybrid event whose time <= target,
+  // in ONE step. No cyclesExecuted math, no gt-adopt: the caller supplies the authoritative
+  // target (min of the hybrid queue head + the worker's pure/DEC head), so the amount of
+  // sim-time crossed is a pure function of the scheduled events, not of thread-scheduler
+  // timing. No-op if target <= global_timer. Does NOT CheckExternalExceptions (single-owner
+  // delivery: the CPU worker vectors). Returns the resulting global_timer.
+  s64 FfAdvanceTo(s64 target);
+#endif
   // [one-clock 2026-07-07] Shift global_timer AND every queued event by delta — used at
   // the worker-takeover edge to unify the two time domains (uniform shift preserves heap
   // order). See CoreTiming.cpp gt-adopt.

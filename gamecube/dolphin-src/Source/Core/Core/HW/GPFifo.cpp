@@ -108,8 +108,18 @@ void GPFifoManager::UpdateGatherPipe()
   {
     auto& cp_fifo = system.GetCommandProcessor().GetFifo();
     const u32 cp_wp = cp_fifo.CPWritePointer.load(std::memory_order_relaxed);
-    if (processor_interface.m_fifo_cpu_write_pointer != cp_wp &&
-        cp_fifo.bFF_GPLinkEnable.load(std::memory_order_relaxed) != 0)
+    const u32 cp_base = cp_fifo.CPBase.load(std::memory_order_relaxed);
+    const bool linked = cp_fifo.bFF_GPLinkEnable.load(std::memory_order_relaxed) != 0;
+    // [dl-fifo fix 2026-07-20] The wp-invariant only holds when the CPU FIFO and the CP (GP) FIFO
+    // describe the SAME buffer (a genuinely LINKED GP FIFO). For a display-list / MEMORY FIFO the
+    // guest UNLINKS the CP (GXSetCPUFifo else-branch -> __GXFifoLink(0)), so m_fifo_cpu_base (= the
+    // DL heap buffer DLBufP) != CPBase (the GP FIFO base). Clobbering the DL write pointer with the
+    // CP-domain cp_wp there misroutes one 32B burst to the GP FIFO while the accountant still
+    // advances +32 -> the +32 DLBuf overflow that corrupts the heap free-list (MP4 gc=33 wedge).
+    // bFF_GPLinkEnable can be STALE=1 during DL build (sync CTRL-write vs async GP-ring WGP-drain
+    // race), so gate on same_buffer, not just on linked.
+    const bool same_buffer = (processor_interface.m_fifo_cpu_base == cp_base);
+    if (processor_interface.m_fifo_cpu_write_pointer != cp_wp && linked && same_buffer)
     {
       processor_interface.m_fifo_cpu_write_pointer = cp_wp;
     }

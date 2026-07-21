@@ -2853,8 +2853,21 @@ static inline void emit_bswap32_tmpc(EmitCtx& c) {
 }
 
 
+// [lfs ps1-splat fix 2026-07-20] Gekko lfs/lfsu/lfsx load a single into ps0 but MUST also splat
+// it into ps1 (Broadway PairedSingle::Fill -> SetBoth(v,v); Dolphin Interpreter::lfs ps[FD].Fill;
+// powerpc-next FPR_LANE_BOTH). Without the ps1 write, paired-single ops (MDFaceDraw's display-list
+// geometry: ps_ merges/NBT) read a STALE ps1 -> wrong DL bytes -> totalSize > MDFaceCnt's DLTotalNum
+// -> DLBuf overflow -> free-list corruption -> HuMemMemoryAlloc2 spin frozen at gc=33 (MP4). Reload
+// the just-stored ps0 and store it to ps1 (no scratch local needed; ps0 is memory-resident).
+static void emit_splat_ps0_to_ps1(EmitCtx& c, u32 rt) {
+    c.b.op_i32_const((s32)g_ctx_ptr);          // addr base for the ps1 store
+    c.b.op_i32_const((s32)g_ctx_ptr);          // addr base for the ps0 load
+    c.b.op_f64_load(ppc_off::ps0(rt));
+    c.b.op_f64_store(ppc_off::ps1(rt));
+}
+
 // [fp-fastmem 2026-07-03 pt2] Whole-access helpers, EA precomputed in TMP_A.
-// f32 load -> promoted f64 into ps0(rt).
+// f32 load -> promoted f64 into ps0(rt), splatted into ps1(rt).
 static void emit_fp_load32_tmpa(EmitCtx& c, u32 rt) {
     if (g_mem1_base != 0u) {
         emit_fp_fastmem_cond(c, 4u);
@@ -2874,6 +2887,7 @@ static void emit_fp_load32_tmpa(EmitCtx& c, u32 rt) {
             c.b.op_f64_promote_f32();
             c.b.op_f64_store(ppc_off::ps0(rt));
         emit_b11_op_end(c);
+        emit_splat_ps0_to_ps1(c, rt);
         return;
     }
     c.b.op_i32_const((s32)g_ctx_ptr);
@@ -2882,6 +2896,7 @@ static void emit_fp_load32_tmpa(EmitCtx& c, u32 rt) {
     c.b.op_f32_reinterpret_i32();
     c.b.op_f64_promote_f32();
     c.b.op_f64_store(ppc_off::ps0(rt));
+    emit_splat_ps0_to_ps1(c, rt);
 }
 // f64 demoted to f32 bits, stored at EA.
 static void emit_fp_store32_tmpa(EmitCtx& c, u32 rs) {

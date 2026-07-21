@@ -48,3 +48,7 @@ gamecube/dolphin_libretro/dolphin_libretro.wasm filter= diff= merge= -text
 # same LFS-pointer-on-prod break as the dolphin modules.
 gamecube/ppc-worker/ppc_worker_emcc.wasm filter= diff= merge= -text
 gamecube/ppc-worker/ppc_worker_mb.wasm filter= diff= merge= -text
+# GameCube AoT pack (fetched at runtime by ppc_worker.js on prod — Pages does
+# not resolve LFS pointers) + LFS budget exceeded 2026-07-20. Ship as real
+# blobs like the ROM parts / worker wasm above.
+gamecube/aot/**/*.bin filter= diff= merge= -text
