@@ -320,7 +320,22 @@
     // worker with no ARQ in flight — gc then advances past the wedge (33→330→426→523→572, spinByte=0,
     // reproducible across runs). ?armframe=N still overrides for sweeping/A-B.
     try {
-      var _armFrame = parseInt((new URLSearchParams(location.search).get('armframe')) || '12', 10) || 12;
+      // [armframe default 12->300 2026-07-21] The 12 default (determinize-sweep era) arms the
+      // takeover MID-BOOT-DVD-STREAM: the in-flight DVD read's completion is orphaned at cutover
+      // and the guest's serialized async chain never issues another read (measured: dvdCmdN
+      // frozen at 25, THP movie texture never updates, screen stuck on the boot logo). With 300
+      // (the audio-init-safe value this comment block already documents) dvdCmdN climbs and the
+      // intro movie renders in dual-core. Proper fix (cutover preserving in-flight DI/ARAM
+      // transfers) tracked in memory; until then 300 is the correct default.
+      // [dual-core restructure 2026-07-21] dolphin is now compiled REAL dual-core (its own
+      // CPU thread + GPU thread). Native has NO takeover/handoff — the CPU thread runs the
+      // guest from boot. The old cpu_owner=1 flip (ppc-worker takeover) SUPPRESSES dolphin's
+      // CPU thread + its interrupt delivery (CoreTiming.cpp:517 returns before
+      // CheckExternalExceptions when cpu_owner==1), which left exc=4 pending + game threads
+      // sleeping forever (globalCounter=0). Disable the takeover: dolphin's CPU thread owns
+      // the CPU for the whole session (native model). self.__dcTakeover=1 to re-enable.
+      window.__dolphinDualCore = true;
+      var _armFrame = parseInt((new URLSearchParams(location.search).get('armframe')) || '300', 10) || 300;
       new Uint32Array(sharedMemory.buffer)[0x026B0A30 >> 2] = _armFrame;
     } catch (e) {}
 
@@ -2138,6 +2153,14 @@
         var elapsed = performance.now() - _bdWaitStart;
         if (ready) {
           clearInterval(_bdPoll);
+          // [dual-core 2026-07-21] NO takeover under real dual-core: dolphin's CPU thread owns
+          // the CPU (cpu_owner stays 0) and runs the guest + delivers interrupts natively.
+          // Flipping cpu_owner=1 here suppressed dolphin's CheckExternalExceptions (CoreTiming
+          // .cpp:517) -> exc pending, game threads sleep forever, globalCounter=0.
+          if (window.__dolphinDualCore && !window.__dcTakeover) {
+            console.log('[dual-core] takeover DISABLED — dolphin CPU thread owns the CPU (native model), cpu_owner stays 0');
+            return;
+          }
           // [handover-ctx] MERGED into this log (a separate console.log inexplicably didn't surface).
           // Selection-vs-fidelity: pc-class (SelectThread=thread vs handler), ME in gate ctx (_cxR) AND
           // in the worker's actual ppc_state (0x02400000), and whether their PCs agree.

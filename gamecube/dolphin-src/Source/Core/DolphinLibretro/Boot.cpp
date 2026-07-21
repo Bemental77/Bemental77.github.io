@@ -280,13 +280,14 @@ bool retro_load_game(const struct retro_game_info* game)
   // MainSettings.cpp:63 (DEFAULT_CPU_THREAD = false) and avoids the
   // worker-handoff hang entirely — EmuThread becomes a synchronous call
   // from Main.cpp:227 and the CPU pipeline runs on the retro_run caller.
-#ifdef __EMSCRIPTEN__
-  Config::SetBase(Config::MAIN_CPU_THREAD,
-    Libretro::GetOption<bool>(core::MAIN_CPU_THREAD, /*def=*/false));
-#else
+  // [dual-core restructure 2026-07-21] DUAL-CORE (native's model). emdawnwebgpu 4.0.10 fixed
+  // the 2026-05-30 PROVER-2.1 video-init deadlock (ContextReset completes). Now doing the
+  // coordinated restructure so the guest boots+runs under dolphin's real dual-core threading:
+  // retro_run spawns Core::EmuThread (CPU thread) + RunGpuLoop (GPU thread); the ppc-worker
+  // bementalJIT becomes the CPU thread, dolphin_worker the GPU thread; only the GX FIFO
+  // crosses. Same def both branches now — dual-core is the product.
   Config::SetBase(Config::MAIN_CPU_THREAD,
     Libretro::GetOption<bool>(core::MAIN_CPU_THREAD, /*def=*/true));
-#endif
 
   Config::SetBase(Config::MAIN_ENABLE_CHEATS,
                      Libretro::GetOption<bool>(core::CHEATS_ENABLED, /*def=*/false));
@@ -526,7 +527,17 @@ bool retro_load_game(const struct retro_game_info* game)
 
   /* disable throttling emulation to match GetTargetRefreshRate() */
   Core::SetIsThrottlerTempDisabled(true);
+  // [dual-core STEP2 2026-07-21] bBootToPause=true parks the CPU thread in State::Paused
+  // (CPUSetInitialExecutionState, Core.cpp:342-343) so it only advances one field per
+  // Core::DoFrameStep — the guest boot crawled/stalled (globalCounter=0 after 11856
+  // retro_runs). Native dual-core runs the CPU thread CONTINUOUSLY (RunLoop back-to-back at
+  // state==Running). Boot Running under emscripten so the CPU thread self-drives like native;
+  // native (non-emscripten) keeps boot-to-pause UX.
+#ifdef __EMSCRIPTEN__
+  SConfig::GetInstance().bBootToPause = false;
+#else
   SConfig::GetInstance().bBootToPause = true;
+#endif
 
 #ifdef IPHONEOS
   bool can_jit = false;

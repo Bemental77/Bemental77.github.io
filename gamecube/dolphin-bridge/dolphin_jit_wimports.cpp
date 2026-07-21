@@ -45,6 +45,8 @@
 #include "Core/HW/EXI/EXI_Channel.h"  // [ax-card] CEXIChannel::GetDevice
 #include "Core/HW/EXI/EXI_Device.h"   // [ax-card] IEXIDevice::IsPresent
 #include "Core/PowerPC/MMU.h"
+#include "Core/HW/MMIO.h"
+#include "Common/Swap.h"
 #include "VideoCommon/CommandProcessor.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
@@ -92,19 +94,87 @@ static inline void gp_dirty_check(uint32_t addr) {
     }
 }
 
+// [stateless-xlate 2026-07-21 — the dropped-VI-write root] Post-takeover, the WORKER owns guest
+// execution and dolphin's mirrored ppc_state.MSR sits at whatever the last sync left it —
+// including exception-entry windows with MSR.DR=0 (PC 0x500/0x900). MMU().Read/Write(EA)
+// translate with THAT momentary state, so any mailbox MMIO op serviced during such a window
+// failed ("Unable to resolve read/write address", ~4.4K/120s baseline): reads returned 0 and
+// writes were SILENTLY DROPPED. Dropped per-frame VI XFB-flip writes are why dual-core
+// presented a stale boot XFB forever (probe xfbAddr garbage 0x27cc27 vs single-exec's sane
+// 0x1e6c00 — the frozen-Nintendo-logo screen). Post-takeover the GC address map is STATIC
+// (BS2 BATs never change), so translate by ADDRESS SHAPE: strip the 0x8/0xC prefix, route
+// MMIO pages via GetMMIOMapping (state-independent), access RAM directly (no icache concern:
+// dolphin's JIT executes no guest code post-takeover). Pre-takeover keeps the MMU path
+// EXACTLY — dolphin's own JIT needs BAT+icache semantics (the prior blanket-mask attempt
+// broke DR=1 ops; see the 2026-06-04 note above). Exotic targets (EFB/L1/ARAM-mapped) fall
+// back to the MMU path even post-takeover.
+static inline bool worker_owns_cpu(void) {
+    return *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026A0000u)) == 1u;
+}
+// (width-parameterized plain functions — this file's trampolines sit in an extern "C"
+// block, where templates are not allowed.)
+static bool stateless_read_w(uint32_t addr, uint32_t width, uint32_t* out) {
+    if (!worker_owns_cpu()) return false;
+    auto& system = Core::System::GetInstance();
+    const uint32_t phys = addr & 0x3FFFFFFFu;
+    if ((phys & 0x0FFF0000u) == 0x0C000000u) {
+        MMIO::Mapping* const mmio = system.GetMemory().GetMMIOMapping();
+        if (width == 1u) *out = mmio->Read<u8>(system, phys);
+        else if (width == 2u) *out = mmio->Read<u16>(system, phys);
+        else *out = mmio->Read<u32>(system, phys);
+        return true;
+    }
+    auto& memory = system.GetMemory();
+    if (phys + width <= memory.GetRamSizeReal()) {
+        const u8* const pmem = memory.GetRAM() + phys;
+        if (width == 1u) { *out = pmem[0]; }
+        else if (width == 2u) { u16 v; std::memcpy(&v, pmem, 2); *out = Common::swap16(v); }
+        else { u32 v; std::memcpy(&v, pmem, 4); *out = Common::swap32(v); }
+        return true;
+    }
+    return false;
+}
+static bool stateless_write_w(uint32_t addr, uint32_t width, uint32_t val) {
+    if (!worker_owns_cpu()) return false;
+    auto& system = Core::System::GetInstance();
+    const uint32_t phys = addr & 0x3FFFFFFFu;
+    if ((phys & 0x0FFF0000u) == 0x0C000000u) {
+        MMIO::Mapping* const mmio = system.GetMemory().GetMMIOMapping();
+        if (width == 1u) mmio->Write<u8>(system, phys, (u8)val);
+        else if (width == 2u) mmio->Write<u16>(system, phys, (u16)val);
+        else mmio->Write<u32>(system, phys, val);
+        return true;
+    }
+    auto& memory = system.GetMemory();
+    if (phys + width <= memory.GetRamSizeReal()) {
+        u8* const pmem = memory.GetRAM() + phys;
+        if (width == 1u) { pmem[0] = (u8)val; }
+        else if (width == 2u) { const u16 v = Common::swap16((u16)val); std::memcpy(pmem, &v, 2); }
+        else { const u32 v = Common::swap32(val); std::memcpy(pmem, &v, 4); }
+        return true;
+    }
+    return false;
+}
+
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_read8(uint32_t addr) {
+    uint32_t v;
+    if (stateless_read_w(addr, 1u, &v)) return v;
     return Core::System::GetInstance().GetMMU().Read<u8>(addr);
 }
 
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_read16(uint32_t addr) {
+    uint32_t v;
+    if (stateless_read_w(addr, 2u, &v)) return v;
     return Core::System::GetInstance().GetMMU().Read<u16>(addr);
 }
 
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_read32(uint32_t addr) {
-    uint32_t val = Core::System::GetInstance().GetMMU().Read<u32>(addr);
+    uint32_t val;
+    if (!stateless_read_w(addr, 4u, &val))
+        val = Core::System::GetInstance().GetMMU().Read<u32>(addr);
     // [dual-core DSP/AI mask 2026-06-29] Hide INT_CAUSE_DSP(0x40)+AI(0x20) from the PI interrupt-
     // cause read (0xCC003000) so the worker's __OSDispatchInterrupt doesn't decode the unhandled
     // DSP/AI interrupt and overrun its unbounded prio loop. PHASE-GATED (CT_PHASE_FLAGS bit1 @
@@ -145,6 +215,7 @@ void dolphin_write8(uint32_t addr, uint32_t val) {
         Core::System::GetInstance().GetGPFifo().Write8(static_cast<u8>(val));
         return;
     }
+    if (stateless_write_w(addr, 1u, val)) return;
     Core::System::GetInstance().GetMMU().Write<u8>(static_cast<u8>(val), addr);
 }
 
@@ -155,6 +226,7 @@ void dolphin_write16(uint32_t addr, uint32_t val) {
         Core::System::GetInstance().GetGPFifo().Write16(static_cast<u16>(val));
         return;
     }
+    if (stateless_write_w(addr, 2u, val)) return;
     Core::System::GetInstance().GetMMU().Write<u16>(static_cast<u16>(val), addr);
 }
 
@@ -169,6 +241,7 @@ void dolphin_write32(uint32_t addr, uint32_t val) {
         Core::System::GetInstance().GetGPFifo().Write32(val);
         return;
     }
+    if (stateless_write_w(addr, 4u, val)) return;
     Core::System::GetInstance().GetMMU().Write<u32>(val, addr);
 }
 

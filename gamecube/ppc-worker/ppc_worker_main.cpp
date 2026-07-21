@@ -51,6 +51,17 @@ std::vector<u8> emit_block_body(u32 start_pc, const u32* insts, u32 count,
                                 bool emit_hle_check,
                                 bool emit_perf_stub = false,
                                 bool emit_hle_check_native = false);
+// [runtime per-block 2026-07-21] The powerpc-next per-block emitter — EXACTLY what
+// dolphin_worker/JitWasm::TryCompileBlock uses (JitWasm.cpp:588), the ONE path proven
+// to render MP4 correctly. The dual-core ppc-worker now compiles blocks at runtime
+// through this instead of loading the broken AoT region pack (both gekko
+// build_region_function AND powerpc-next build_region_module_next miscompile the THP
+// decode). Signature = guests/powerpc-next/ppc_emit.h:67.
+std::vector<u8> build_block_next(u32 start_pc, const u32* insts, u32 count,
+                                 u32 ctx_ptr, u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                                 u32* out_cycles, bool* out_is_idle_loop);
+bool IsBlockTerminator(u32 inst);
+bool IsForwardConditionalBranch(u32 inst, u32 pc);
 }
 
 #ifdef __EMSCRIPTEN__
@@ -399,25 +410,33 @@ u32 ppc_worker_compile_and_register(u32 start_pc) {
     const uintptr_t ram_addr = g_mem1_base + phys;
     const u32* ram_ptr = reinterpret_cast<const u32*>(ram_addr);
 
+    // [decode 2026-07-21] Mirror JitWasm::TryCompileBlock (JitWasm.cpp:559-577) EXACTLY:
+    // decode until a terminator that is NOT a forward conditional branch (those coalesce
+    // into the block as mid-block exits — build_block_next's analyst expects this).
     u32 insts[PPC_MAX_BLOCK_INSTRS];
     u32 count = 0;
-    while (count < PPC_MAX_BLOCK_INSTRS) {
-        const u32 inst = byteswap32(ram_ptr[count]);
-        insts[count]   = inst;
-        const u32 op   = (inst >> 26) & 0x3Fu;
-        ++count;
-        if (op == 16u || op == 17u || op == 18u || op == 19u) break;
+    {
+        u32 dpc = start_pc;
+        for (; count < PPC_MAX_BLOCK_INSTRS; ++count) {
+            const u32 inst = byteswap32(ram_ptr[count]);
+            insts[count] = inst;
+            if (bemental::powerpc::IsBlockTerminator(inst) &&
+                !bemental::powerpc::IsForwardConditionalBranch(inst, dpc)) {
+                ++count;
+                break;
+            }
+            dpc += 4u;
+        }
     }
     if (count == 0u) return 0u;
 
-    auto bytes = bemental::powerpc::build_block(
+    // [runtime per-block 2026-07-21] build_block_next = dolphin_worker's exact emitter.
+    u32 block_cycles = 0;
+    auto bytes = bemental::powerpc::build_block_next(
         start_pc, insts, count,
-        static_cast<u32>(g_ppc_state_base), 0u,
+        static_cast<u32>(g_ppc_state_base),
         static_cast<u32>(g_mem1_base), ram_mask, g_mem1_size,
-        nullptr,
-        /* emit_hle_check        = */ true,
-        /* emit_perf_stub        = */ g_emit_perf_stub,
-        /* emit_hle_check_native = */ g_emit_hle_check_native);
+        &block_cycles, nullptr);
     if (bytes.empty()) return 0u;
     // BlockCache::compile instantiates the module (compile_raw) and registers
     // the block's `run` export into g_bem_pc_handle + the indirect fn-table

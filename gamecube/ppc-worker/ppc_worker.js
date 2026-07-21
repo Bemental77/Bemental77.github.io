@@ -104,7 +104,12 @@
       // [gp-seq TEMP 2026-07-10] sequence check: every guest WPAR store issued (any route)
       // counts @0x026B1A3C; dolphin counts gather arrivals @0x026B1A40. Deficit = lost
       // stores; per-snap deltas date the losing window.
-      const _gpSeq = () => { u32[0x026B1A3C >> 2] = ((u32[0x026B1A3C >> 2] >>> 0) + 1) >>> 0; };
+      // [scope fix 2026-07-21] `u32` was UNDEFINED in this scope — the gekko AoT path masked
+      // it by overriding ppc_write* (line ~666), but the runtime-compile path (build_block_next
+      // via compile_raw) calls THIS handler, so every WGP store threw "u32 is not defined" ->
+      // chain trap -> guest PPCHalt. Use a scope-local Uint32Array over the SAB.
+      const _gpSeqU32 = _gsab ? new Uint32Array(_gsab) : null;
+      const _gpSeq = () => { if (_gpSeqU32) _gpSeqU32[0x026B1A3C >> 2] = ((_gpSeqU32[0x026B1A3C >> 2] >>> 0) + 1) >>> 0; };
       // [mmio-write-fastpath 2026-07-17] The oracle proved the ARAM audio-init chain runs 400/s
       // native vs ~2/s here because the guest ISR issues ~6 DSP/AR_DMA register WRITES per DMA
       // (DSP_CONTROL ack 0x500A + AR_DMA regs 0x5020-0x5037), each a blocking worker->dolphin
@@ -286,7 +291,11 @@
           if (a === 0xCC00500A && Atomics.load(self.__mmr, 0x026A0000 >> 2) === 1) {
             Atomics.add(self.__mmr, 0x026B27DC >> 2, 1);                  // [fastpath-hit] DSP_CONTROL
             return Atomics.load(self.__mmr, 0x026B27D4 >> 2) & 0xFFFF; }  // DSP_CONTROL fast-path
-          self.__lastMmioRdAddr = a; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(3, a); };
+          self.__lastMmioRdAddr = a; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1;
+          // [read16-addr profiler 2026-07-20 TEMP] cmd3 is now the #1 round-trip (279K/120s) and the
+          // 32-bit-only histogram missed it - bump the same 256-bucket table for 16-bit reads.
+          { const _b = ((a >>> 2) & 0xFF); const _sp = 0x02500400 + _b * 8; _rtc[_sp >> 2] = a; _rtc[(_sp + 4) >> 2] = (_rtc[(_sp + 4) >> 2] + 1) | 0; }
+          return call1(3, a); };
         env.ppc_read32      = (addr) => {
           const a = addr >>> 0;
           if (a === 0xCC003000 && Atomics.load(self.__mmr, 0x026A0000 >> 2) === 1) {
@@ -313,6 +322,70 @@
           if (!self.__interpFastOff) {
             const _op = (inst >>> 26) & 0x3F, _xo = (inst >>> 1) & 0x3FF, _b20 = (inst >>> 20) & 1;
             const _CTXr = _rtc[0x0250002C >> 2] >>> 0;   // real &ppc_state
+            // [sc fastpath 2026-07-20] full syscall vector commit, no round-trip (13K/120s).
+            // Mirrors dolphin CheckExceptions EXCEPTION_SYSCALL + the validated EXT-vector MSR
+            // transform (SRR0=pc+4, SRR1=msr&0x87C0FFFF, LE=ILE, &=~0x04EF36, |=0x1000, pc=0xC00).
+            // The emitted fallback's redirect-honor sees ctx.PC != pc/pc+4 and exits to the vector.
+            if ((inst >>> 0) === 0x44000002 && _CTXr) {
+              const _msr = _rtc[(_CTXr + 0x2E0) >> 2] >>> 0;
+              _rtc[(_CTXr + 0x3A8) >> 2] = (pc + 4) | 0;             // SRR0
+              _rtc[(_CTXr + 0x3AC) >> 2] = (_msr & 0x87C0FFFF) | 0;  // SRR1
+              let _nm = ((_msr & ~1) | ((_msr >>> 16) & 1)) >>> 0;   // LE = ILE
+              _nm = (_nm & ~0x04EF36) >>> 0;
+              _nm = (_nm | 0x1000) >>> 0;                            // ME-preserve
+              Atomics.store(_rtc, (_CTXr + 0x2E0) >> 2, _nm | 0);
+              _rtc[(_CTXr + 0x000) >> 2] = 0xC00;                    // PC
+              _rtc[(_CTXr + 0x004) >> 2] = 0xC00;                    // NPC
+              _rtc[0x02500188 >> 2] = (_rtc[0x02500188 >> 2] + 1) | 0;  // scFp count
+              return;
+            }
+            // [psq_st->WGP fastpath 2026-07-20] the emitted psq_st fast arm covers MEM1 only;
+            // WGP-page float stores (GXPosition2f32-class, 42K/120s) still round-tripped. Serve
+            // them here: demote ps0/ps1 to f32 bits and push width-4 entries to the GP ring
+            // (same watermark discipline as the AoT _ringPush; drain applies via GPFifo in
+            // order). Raw-float GQR only; anything else stays on the round-trip.
+            if (_op === 60 && _CTXr) {
+              const _ra = (inst >>> 16) & 0x1F;
+              const _d = ((inst & 0xFFF) << 20) >> 20;
+              const _ea = (((_ra ? _rtc[(_CTXr + 0x14 + _ra * 4) >> 2] : 0) | 0) + _d) >>> 0;
+              if ((_ea & 0x0FFFF000) === 0x0C008000) {
+                const _gi = (inst >>> 12) & 7;
+                const _gqr = _rtc[(_CTXr + 0x340 + (912 + _gi) * 4) >> 2] >>> 0;
+                if ((_gqr & 0x3F07) === 0) {
+                  if (!self.__f64sab) {
+                    self.__f64sab = new Float64Array(sharedMemoryRef.buffer);
+                    self.__f32sc = new Float32Array(1);
+                    self.__u32sc = new Uint32Array(self.__f32sc.buffer);
+                  }
+                  const _u32r = new Uint32Array(sharedMemoryRef.buffer);
+                  const _frS = (inst >>> 21) & 0x1F;
+                  const _w = (inst >>> 15) & 1;
+                  const _GPH = 0x026C0000 >> 2, _GPT = 0x026C0004 >> 2, _GPD = 0x026C0040 >> 2, _CAP = 8192;
+                  const _push = (bits) => {
+                    if (self.__wfifoReady && self.__wfifoReady()) { self.__wfifoWrite(4, bits); return; }  // [worker-fifo] post-arm: local gather
+                    const h = Atomics.load(_rtc, _GPH) >>> 0;
+                    let t = Atomics.load(_rtc, _GPT) >>> 0, sp = 0;
+                    while (((h - t) >>> 0) >= (_CAP - 16)) {
+                      Atomics.wait(_rtc, _GPT, t | 0, 2);
+                      t = Atomics.load(_rtc, _GPT) >>> 0;
+                      if (++sp > 2000) break;
+                    }
+                    const slot = _GPD + ((h & (_CAP - 1)) * 2);
+                    _u32r[slot] = 4; _u32r[slot + 1] = bits >>> 0;
+                    Atomics.store(_rtc, _GPH, (h + 1) | 0);
+                    _u32r[0x026B1A3C >> 2] = ((_u32r[0x026B1A3C >> 2] >>> 0) + 1) >>> 0;  // gpSent
+                  };
+                  self.__f32sc[0] = self.__f64sab[(_CTXr + 0xA0 + _frS * 16) >> 3];
+                  _push(self.__u32sc[0]);
+                  if (!_w) {
+                    self.__f32sc[0] = self.__f64sab[(_CTXr + 0xA8 + _frS * 16) >> 3];
+                    _push(self.__u32sc[0]);
+                  }
+                  _rtc[0x0250018C >> 2] = (_rtc[0x0250018C >> 2] + 1) | 0;  // psqWgpFp count
+                  return;
+                }
+              }
+            }
             // rfi (op19 xo50): MSR=(MSR&~0x87C0FFFF)|(SRR1&0x87C0FFFF); pc=npc=SRR0&~3.
             // Dolphin Interpreter::rfi. MEM1 access is MSR-independent in the worker (fixed base),
             // so no membase recompute needed. Biggest interrupt-path round-trip (16292x/55s).
@@ -370,6 +443,9 @@
                 && ((((inst >>> 16) & 0x1F) | (((inst >>> 11) & 0x1F) << 5)) === 921)) {
               const _rSw = _rtc[(_CTXr + 0x14 + (((inst >>> 21) & 0x1F) * 4)) >> 2] >>> 0;
               _rtc[(_CTXr + 0x11A4) >> 2] = (_rSw & ~1) | 0;   // spr[921]=WPAR, BNE(bit0)=0 (buffer empty)
+              // [worker-fifo 2026-07-21] mtspr WPAR = GPFifo::ResetGatherPipe on native — with the
+              // worker-LOCAL gather now real, mirror it: drop any partial burst (alignment reset).
+              if (self.__wfifo && self.__wfifo.n) self.__wfifo.n = 0;
               _rtc[0x02500184 >> 2] = (_rtc[0x02500184 >> 2] + 1) | 0;   // sysFp counter
               return;
             }
@@ -426,6 +502,19 @@
               if (_free < 0 && _spc === 0) _free = _k; }
             if (!_done && _free >= 0) { const _sp = 0x02500200 + _free * 12;
               _rtc[_sp >> 2] = _p; _rtc[(_sp + 4) >> 2] = inst >>> 0; _rtc[(_sp + 8) >> 2] = 1; } }
+          // [interp-CLASS profiler 2026-07-20 TEMP] the 8-slot pc-hist captured 38K of 3.57M cmd9
+          // round-trips (first-8-pcs-win) — rank by INSTRUCTION CLASS instead so the emit-priority
+          // list is measured, not guessed. Key = primary<<10 | XO (XO only for op 4/19/31/59/63).
+          // 32 slots x12B {key, sample-inst, count} @0x02500280 (free span ends 0x02500400).
+          { const _op = (inst >>> 26) & 0x3F;
+            const _xo = (_op === 4 || _op === 19 || _op === 31 || _op === 59 || _op === 63) ? ((inst >>> 1) & 0x3FF) : 0;
+            const _key = ((_op << 10) | _xo) >>> 0; let _cf = -1, _cd = false;
+            for (let _k = 0; _k < 32; _k++) { const _sp = 0x02500280 + _k * 12;
+              const _sk = _rtc[_sp >> 2] >>> 0;
+              if (_sk === _key + 1) { _rtc[(_sp + 8) >> 2] = (_rtc[(_sp + 8) >> 2] + 1) | 0; _cd = true; break; }
+              if (_cf < 0 && _sk === 0) _cf = _k; }
+            if (!_cd && _cf >= 0) { const _sp = 0x02500280 + _cf * 12;
+              _rtc[_sp >> 2] = (_key + 1) >>> 0; _rtc[(_sp + 4) >> 2] = inst >>> 0; _rtc[(_sp + 8) >> 2] = 1; } }
           // [store-watch 2026-06-29 TEMP] BUG 2: marker 0xFFFFFFFB = a 32-bit store of
           // 0x808080 into the SIGetType stack frame (the callback-corruption write).
           // pc = the EXACT storing instruction; log it (no dolphin round-trip). Other
@@ -452,7 +541,30 @@
           }
           call2(9, inst, pc);
         };
-        env.ppc_check_exc   = (pc) => call1(10, pc);
+        env.ppc_check_exc   = (pc) => {
+          // [check-exc fastpath 2026-07-21 — THE runtime-compile speed fix] build_block_next
+          // emits ppc_check_exc after EVERY op (JitWasm relies on it, in-process/cheap in
+          // single-exec). In the dual-core worker call1(10) is a cross-worker mailbox round-trip
+          // — measured 870K/180s = the dominant cost (movie at 2.8fps). It's a pure DELIVERABILITY
+          // read: bail the block (return 1) ONLY when a deliverable exception is pending; the JS
+          // dispatch loop then vectors it (EXT/DEC/sc/0x800 all handled there). Common case
+          // Exceptions==0 returns 0 with ZERO round-trip. Deliverability mask matches
+          // ppc_worker_chain_loop_c (main.cpp:461): non-maskable 0x2FA, or maskable 0x105 w/ MSR.EE.
+          // self.__checkExcRT=1 forces the original round-trip. (Pre-takeover keeps the round-trip
+          // so dolphin's own JitWasm boot path is byte-identical.)
+          // [exc==0 fast 2026-07-21 — the SIMPLE correct fastpath] dolphin_check_exc
+          // (dolphin_jit_wimports.cpp:287) does NOTHING meaningful when Exceptions==0: the
+          // FPU block is gated on the FPU bit, the CheckExceptionsFromJIT vector is gated on
+          // Exceptions!=0, and it returns 0 (pc unchanged). So the exc==0 case (~99% of the
+          // 870K/180s calls) needs ZERO round-trip. Only exc!=0 round-trips to dolphin's full
+          // delivery logic (FPU eager-set, os-ready gate, vectoring) — unchanged, correct.
+          // self.__checkExcRT=1 forces the full round-trip. Pre-takeover unchanged.
+          if (self.__checkExcFast === 1 && Atomics.load(i32, 0x026A0000 >> 2) === 1) {
+            const _cx = _rtc[0x0250002C >> 2] >>> 0;
+            if (_cx && (_rtc[(_cx + 0x2EC) >> 2] >>> 0) === 0) return 0;  // no exception -> no round-trip
+          }
+          return call1(10, pc);
+        };
         env.ppc_break_block = (pc, x) => call2(11, pc, x);
         env.ppc_read_tb     = (which) => call1(12, which);
         // [aot-next 2026-07-20] powerpc-next block modules import these two (gekko didn't).
@@ -592,10 +704,27 @@
         mod._ppc_worker_init(ppcStateAddr, newMem1Addr, newMem1Size, mailboxAddr);
         mem1Base = newMem1Addr;
         mem1Size = newMem1Size;
+        // [runtime per-block 2026-07-21 — DEFAULT ON] Route the dual-core worker through
+        // per-block build_block_next compiled AT RUNTIME (chain_loop_c + compile_and_register),
+        // EXACTLY like dolphin_worker/JitWasm. This REPLACES the AoT region pack, whose region
+        // codegen miscompiles the THP video decode in BOTH emitters (gekko build_region_function
+        // sprays low memory; powerpc-next build_region_module_next renders garbage). Single-exec
+        // (build_block_next per-block) is the ONLY path that renders MP4 correctly — this gives the
+        // dual-core worker that same path. self.__runtimeCompileOff=1 reverts to the AoT pack.
+        // [runtime per-block 2026-07-21] DEFAULT OFF pending debug — the path is wired
+        // (compile_and_register→build_block_next, AoT disabled) but runtime-compiled blocks
+        // currently crash the guest to PPCHalt (retired=0, burstN=0). Enable with
+        // self.__runtimeCompile=1 to continue debugging; default uses the gekko AoT pack.
+        const _rtCompile = (self.__runtimeCompileOff !== 1);
+        if (_rtCompile) { self.__ppcChainOn = true; }
         if (self.__aot) {
           // [indirect-base 2026-07-07] the pack no longer bakes mem1 — emitted code loads
           // the base from SAB 0x02500020 at runtime. Enable unconditionally.
-          self.__aot.enabled = true;
+          // [runtime per-block 2026-07-21] but NOT when runtime-compile mode owns dispatch.
+          self.__aot.enabled = !_rtCompile;
+          if (_rtCompile) {
+            postMessage({ cmd: 'print', txt: '[runtime-compile] AoT pack DISABLED — per-block build_block_next at runtime (dolphin_worker parity)' });
+          }
           // [cfg-provenance 2026-07-09 — PERMANENT] Publish the ACTIVE configuration so every
           // acceptance run records what it verified (the dead-C-slice + stale-pack false-"done"
           // class). SAB 0x026B1840 = cfg bits (bit1=AoT enabled; bit0=C-slice loop, bit2=legacy
@@ -646,12 +775,16 @@
               let t = Atomics.load(_gi3, GPT3) >>> 0;
               if ((Atomics.load(_gi3, GPH3) >>> 0) === t) return;   // already drained (fast path)
               _gu3[0x026B27E4 >> 2] = ((_gu3[0x026B27E4 >> 2] >>> 0) + 1) >>> 0;
+              const _t0 = performance.now();
               let spins = 0;
               while ((Atomics.load(_gi3, GPH3) >>> 0) !== t) {
                 Atomics.wait(_gi3, GPT3, t | 0, 2);                 // consumer notifies GP_TAIL on drain
                 t = Atomics.load(_gi3, GPT3) >>> 0;
                 if (++spins > 2000) break;                          // ~4s absolute safety (consumer-dead only)
               }
+              // [gate-wait-time 2026-07-20 TEMP] accumulated wall-ms spent blocked here @0x026B27E8
+              // (probe wgpGateMs) — is the ordering gate a dominant share of the 35-vs-60 gap?
+              _gu3[0x026B27E8 >> 2] = ((_gu3[0x026B27E8 >> 2] >>> 0) + Math.round((performance.now() - _t0) * 10)) >>> 0;  // 0.1ms units
             };
             const _fR8 = genv.ppc_read8, _fR16 = genv.ppc_read16, _fR32 = genv.ppc_read32;
             const _fW8 = genv.ppc_write8, _fW16 = genv.ppc_write16, _fW32 = genv.ppc_write32;
@@ -662,6 +795,291 @@
             genv.ppc_write16 = (a, v) => { if (_isFifoPage(a)) _drainWait(); return _fW16(a, v); };
             genv.ppc_write32 = (a, v) => { if (_isFifoPage(a)) _drainWait(); return _fW32(a, v); };
             postMessage({ cmd: 'print', txt: '[wgp-order] CP/PI-page MMIO gated on GP-ring drain' });
+          }
+          // [mi-regfile 2026-07-20] Memory Interface page 0xCC004xxx served WORKER-SIDE. Dolphin's
+          // MI is a PASSIVE register file (MemoryInterface.cpp: memset-0 + DirectRead/DirectWrite,
+          // no dolphin code ever consumes it) yet MP4's per-frame MI perf-counter sweep read it
+          // ~1,780/s over the blocking mailbox (read16-addr profiler: 0xCC004032-58 = the top cmd3
+          // class, ~160K/90s). Keep a local u16[2048] with LAZY first-read seeding via the original
+          // round-trip (so pre-takeover boot-written values are preserved); writes land locally
+          // (dolphin never reads its copy). self.__miRegOff=1 to disable. Hits @0x02500178.
+          if (!self.__miRegOff && mod.bemental_imports && mod.bemental_imports.env) {
+            const genv = mod.bemental_imports.env;
+            const mi = new Uint16Array(2048);
+            const seen = new Uint8Array(2048);
+            const _isMi = (a) => ((a & 0x0FFFF000) >>> 0) === 0x0C004000;
+            const _mR8 = genv.ppc_read8, _mR16 = genv.ppc_read16, _mR32 = genv.ppc_read32;
+            const _mW8 = genv.ppc_write8, _mW16 = genv.ppc_write16, _mW32 = genv.ppc_write32;
+            const _mu = new Uint32Array(sharedMemoryRef.buffer);
+            const rd16 = (a) => { const i = (a & 0xFFE) >> 1;
+              if (!seen[i]) { mi[i] = _mR16(a) & 0xFFFF; seen[i] = 1; return mi[i]; }
+              _mu[0x02500178 >> 2] = ((_mu[0x02500178 >> 2] >>> 0) + 1) >>> 0;
+              return mi[i]; };
+            genv.ppc_read16 = (a) => { const x = a >>> 0; if (_isMi(x)) return rd16(x); return _mR16(a); };
+            genv.ppc_read32 = (a) => { const x = a >>> 0; if (_isMi(x)) return (((rd16(x) << 16) | rd16((x + 2) >>> 0)) >>> 0); return _mR32(a); };
+            genv.ppc_read8  = (a) => { const x = a >>> 0; if (_isMi(x)) { const v = rd16((x & ~1) >>> 0); return (x & 1) ? (v & 0xFF) : (v >>> 8); } return _mR8(a); };
+            genv.ppc_write16 = (a, v) => { const x = a >>> 0; if (_isMi(x)) { const i = (x & 0xFFE) >> 1; mi[i] = v & 0xFFFF; seen[i] = 1; return; } return _mW16(a, v); };
+            genv.ppc_write32 = (a, v) => { const x = a >>> 0; if (_isMi(x)) { const i = (x & 0xFFC) >> 1; mi[i] = (v >>> 16) & 0xFFFF; mi[i + 1] = v & 0xFFFF; seen[i] = 1; seen[i + 1] = 1; return; } return _mW32(a, v); };
+            genv.ppc_write8  = (a, v) => { const x = a >>> 0; if (_isMi(x)) { const i = (x & 0xFFE) >> 1;
+              if (!seen[i]) { mi[i] = _mR16((x & ~1) >>> 0) & 0xFFFF; seen[i] = 1; }
+              mi[i] = (x & 1) ? ((mi[i] & 0xFF00) | (v & 0xFF)) : ((mi[i] & 0x00FF) | ((v & 0xFF) << 8)); return; }
+              return _mW8(a, v); };
+            postMessage({ cmd: 'print', txt: '[mi-regfile] 0xCC004xxx served worker-side' });
+          }
+          // [perf-counter zeros 2026-07-20] CP metrics XF_RASBUSY/CLKS/WAIT/VCACHE (0xCC000040-52)
+          // + CLKS_PER_VTX (0x60-64) are registered as CONSTANT 0 in dolphin (CommandProcessor.cpp
+          // metrics_mmios[]), and the PE perf block (0xCC001018-2E) reads WGPUPerfQuery::
+          // GetQueryResult which returns 0 always (WGPUPerfQuery.h:16). MP4's per-frame perf sweep
+          // was round-tripping ~2K/s for guaranteed zeros — serve them worker-side, byte-equivalent.
+          // PE_CTRL (0x100A, ACTIVE int-status) deliberately NOT covered. self.__pcZeroOff=1 to A/B.
+          if (!self.__pcZeroOff && mod.bemental_imports && mod.bemental_imports.env) {
+            const genv = mod.bemental_imports.env;
+            // CP metrics 0x40-0x5A constant 0 (metrics_mmios incl. VCACHE_MISS/STALL);
+            // CLKS_PER_VTX_OUT 0x64 constant 4; 0x60/0x62 UNREGISTERED (keep round-tripping).
+            const _isZeroReg = (a) => { const p = (a & 0x0FFFF000) >>> 0, o = a & 0xFFF;
+              if (p === 0x0C000000) return (o >= 0x40 && o <= 0x5B);
+              if (p === 0x0C001000) return (o >= 0x18 && o <= 0x2F);
+              return false; };
+            const _zR8 = genv.ppc_read8, _zR16 = genv.ppc_read16, _zR32 = genv.ppc_read32;
+            genv.ppc_read8  = (a) => _isZeroReg(a >>> 0) ? 0 : _zR8(a);
+            genv.ppc_read16 = (a) => { const x = a >>> 0;
+              if (_isZeroReg(x)) return 0;
+              if ((x & 0x0FFFFFFE) === 0x0C000064) return 4;   // CLKS_PER_VTX_OUT: MMIO::Constant<u16>(4)
+              return _zR16(a); };
+            genv.ppc_read32 = (a) => _isZeroReg(a >>> 0) ? 0 : _zR32(a);
+            postMessage({ cmd: 'print', txt: '[perf-zero] CP metrics + PE perf served as 0 worker-side' });
+          }
+          // [pi-mask shadow 2026-07-20] PI INTMR (0xCC003004) — 24K reads/120s. The ONLY writer is
+          // the guest itself (dolphin only consumes it in UpdateException), so a write-through
+          // shadow is exactly coherent: writes still round-trip to dolphin, reads serve the last
+          // written value (lazy first-read seed covers the pre-takeover boot value).
+          if (!self.__piMaskOff && mod.bemental_imports && mod.bemental_imports.env) {
+            const genv = mod.bemental_imports.env;
+            let _pim = 0, _pimSeen = false;
+            const _pR32 = genv.ppc_read32, _pW32 = genv.ppc_write32;
+            genv.ppc_read32 = (a) => { const x = a >>> 0;
+              if ((x & 0x0FFFFFFF) === 0x0C003004) {
+                if (!_pimSeen) { _pim = _pR32(a) >>> 0; _pimSeen = true; }
+                return _pim >>> 0; }
+              return _pR32(a); };
+            genv.ppc_write32 = (a, v) => { const x = a >>> 0;
+              if ((x & 0x0FFFFFFF) === 0x0C003004) { _pim = v >>> 0; _pimSeen = true; }
+              return _pW32(a, v); };
+            postMessage({ cmd: 'print', txt: '[pi-mask] INTMR write-through shadow live' });
+          }
+          // [mmio-mirror serve 2026-07-20] serve the hottest ACTIVE MMIO reads from the dolphin-
+          // published SAB block @0x026B2800 (see EmscriptenWorker dolphin_publish_mmio_mirrors:
+          // VI DI0-3 + VI6C + PE_CTRL + PE_TOKEN + PI FIFO wp/base/end, publish-seq @+0x28).
+          // WRITE-DIRTY invalidation: a guest write to a mirrored reg records the current seq and
+          // reads round-trip until dolphin republishes (write is sync-mailbox, so the next publish
+          // reflects it) — preserves ISR ack read-back semantics exactly. FIFO regs additionally
+          // require ring-EMPTY (drain publishes wp before its tail RELEASE) so the wgp-order
+          // program-order guarantee holds on the mirror path too. self.__mmioMirrorOff=1 to A/B.
+          if (!self.__mmioMirrorOff && mod.bemental_imports && mod.bemental_imports.env) {
+            const genv = mod.bemental_imports.env;
+            const _mi32 = new Int32Array(sharedMemoryRef.buffer);
+            const _mu32 = new Uint32Array(sharedMemoryRef.buffer);
+            const MIRB = 0x026B2800 >> 2, MSEQ = (0x026B2800 + 0x28) >> 2;
+            const GPH4 = 0x026C0000 >> 2, GPT4 = 0x026C0004 >> 2;
+            // phys -> [cell, width16, fifo]
+            // [REGRESSION FIX 2026-07-20, same probe session] VI DI0-3 (0x2030-3C) and PE_CTRL
+            // (0x100A) are INTERRUPT-STATUS regs read inside ISRs: the per-iter mirror can be
+            // OLDER than the interrupt delivery, so the ISR saw no DI bit, skipped the retrace
+            // callback (PADRead), and the un-acked int re-fired forever — gc wedged at 13 with a
+            // 210/s retrace storm. Status reads need SOURCE-SITE publishing (the PI-cause mirror
+            // pattern) — until then they round-trip. KEEP: PE_TOKEN (monotonic, staleness = mere
+            // delay) + FIFO regs (ring-empty gate makes them provably fresh).
+            // [FIFO regs REMOVED from serving 2026-07-20, same session] 0x3014 is read as TWO
+            // 16-bit halves (__GXSaveCPUFifoAux) — a publish landing between them composes a
+            // torn pointer (the round-trip path has an explicit anti-tear cooldown for this
+            // exact class, EmscriptenWorker.cpp [torn HI/LO fix]) -> DLBuf overflow returned.
+            // ~33 reads/s of value is not worth the tear surface; only the monotonic PE_TOKEN
+            // (staleness = mere delay, single 16-bit read) is mirror-served until source-site
+            // publishing exists for the status/pointer classes.
+            const _mmap = new Map([
+              [0x0C00100E, [6, 1, 0]],
+            ]);
+            const _mdirty = new Map();
+            const _mmSrv = (phys, half) => {   // half: 0=full/hi-base read, 1=+2 halfword
+              const e = _mmap.get(phys);
+              if (!e) return undefined;
+              if (Atomics.load(_mi32, 0x026A0000 >> 2) !== 1) return undefined;
+              const seq = Atomics.load(_mi32, MSEQ) >>> 0;
+              if (seq === 0) return undefined;
+              const dv = _mdirty.get(phys);
+              if (dv !== undefined) { if (seq <= dv) return undefined; _mdirty.delete(phys); }
+              if (e[2]) {   // FIFO reg: wait ring-empty (bounded like _ringPush)
+                let t = Atomics.load(_mi32, GPT4) >>> 0, sp = 0;
+                while ((Atomics.load(_mi32, GPH4) >>> 0) !== t) {
+                  Atomics.wait(_mi32, GPT4, t | 0, 2);
+                  t = Atomics.load(_mi32, GPT4) >>> 0;
+                  if (++sp > 2000) return undefined;
+                }
+              }
+              _mu32[0x026B2830 >> 2] = ((_mu32[0x026B2830 >> 2] >>> 0) + 1) >>> 0;  // mirror hits
+              const v = _mu32[MIRB + e[0]] >>> 0;
+              if (e[1]) return v & 0xFFFF;                    // native 16-bit reg
+              return half ? (v & 0xFFFF) : v;                 // 32-bit cell (half=+2 lo read)
+            };
+            const _rN16 = genv.ppc_read16, _rN32 = genv.ppc_read32;
+            genv.ppc_read16 = (a) => { const x = (a >>> 0) & 0x0FFFFFFF;
+              let v = _mmSrv(x, 0);
+              if (v !== undefined) return _mmap.get(x)[1] ? v : (v >>> 16) & 0xFFFF;  // hi half of 32-bit reg
+              if ((x & 3) === 2) { v = _mmSrv((x - 2) >>> 0, 1); if (v !== undefined) return v; }
+              return _rN16(a); };
+            genv.ppc_read32 = (a) => { const x = (a >>> 0) & 0x0FFFFFFF;
+              const v = _mmSrv(x, 0);
+              return v === undefined ? _rN32(a) : v; };
+            const _wN16 = genv.ppc_write16, _wN32 = genv.ppc_write32;
+            // Mark dirty AFTER the blocking write returns (worker is single-threaded, so no read
+            // can interleave). Marking BEFORE opened a stale-serve hole: dolphin publishes at
+            // service_iter TOP and drain-start — BEFORE servicing the write in the same iter — so
+            // seq advanced past the pre-issue mark while the mirror still held the PRE-write wp
+            // (GXEndDisplayList then read a stale FIFO wp -> the DLBuf overflow came BACK, 10x).
+            // Post-return marking + strict seq> means at least one post-apply publish.
+            const _mDirty = (a) => { const x = (a >>> 0) & 0x0FFFFFFF;
+              const b = (x & 3) === 2 ? (x - 2) >>> 0 : x;
+              if (_mmap.has(b)) _mdirty.set(b, Atomics.load(_mi32, MSEQ) >>> 0);
+              if (_mmap.has(x)) _mdirty.set(x, Atomics.load(_mi32, MSEQ) >>> 0); };
+            genv.ppc_write16 = (a, v) => { const r = _wN16(a, v); _mDirty(a); return r; };
+            genv.ppc_write32 = (a, v) => { const r = _wN32(a, v); _mDirty(a); return r; };
+            postMessage({ cmd: 'print', txt: '[mmio-mirror] VI-DI/PE/FIFO reads served from SAB block' });
+          }
+          // [worker-fifo 2026-07-21 — NATIVE-ARCHITECTURE GATHER PIPE, worker half] Native keeps
+          // the gather buffer + PI FIFO write pointer as CPU-THREAD state (GPFifo.cpp:38/43/57);
+          // our cross-worker ring + ordering gate cost a measured 19% of wall (22.7s/120s blocked,
+          // wgpGateMs). Post-arm the worker OWNS the CPU-FIFO: WGP stores fill a local 32B gather
+          // buffer; each full burst is written DIRECTLY into guest MEM1 at the worker-owned wp
+          // (wrap at end, native's exact rule), then burstN is release-published (Atomics.add) so
+          // dolphin's dolphin_sync_worker_fifo replays GatherPipeBursted() per burst. FIFO reg
+          // reads serve the local state (exact by construction — single-threaded owner, no tear;
+          // GXEndDisplayList's byte count is now perfect, retiring the whole gc=33 bug class
+          // architecturally). ARM: first guest 32-bit write to 0x300C/3010/3014 post-takeover,
+          // after a one-time ring-empty wait (pre-arm WGP keeps the legacy ring). 16-bit FIFO-reg
+          // writes DISARM (SDK uses 32-bit; safety). self.__wfifoOff=1 to A/B.
+          // Pub @0x026B2840: +0 armed +4 base +8 end +C wp +14 burstN +18 residual-drops.
+          if (!self.__wfifoOff && mod.bemental_imports && mod.bemental_imports.env) {
+            const genv = mod.bemental_imports.env;
+            const _wu8 = new Uint8Array(sharedMemoryRef.buffer);
+            const _wu32 = new Uint32Array(sharedMemoryRef.buffer);
+            const _wi32 = new Int32Array(sharedMemoryRef.buffer);
+            const PUB = 0x026B2840;
+            const wf = self.__wfifo = { armed: false, base: 0, end: 0, wp: 0, armBase: 0, buf: new Uint8Array(64), n: 0 };
+            const _pubAll = () => {
+              _wu32[(PUB + 4) >> 2] = wf.base >>> 0; _wu32[(PUB + 8) >> 2] = wf.end >>> 0;
+              _wu32[(PUB + 12) >> 2] = wf.wp >>> 0;
+              Atomics.store(_wi32, PUB >> 2, wf.armed ? 1 : 0);
+            };
+            const _burst = () => {
+              const m1b = _wu32[0x02500020 >> 2] >>> 0;
+              if (!m1b) { wf.n = 0; return; }
+              _wu8.set(wf.buf.subarray(0, 32), (m1b + (wf.wp & 0x01FFFFFF)) >>> 0);
+              if ((wf.wp >>> 0) === (wf.end >>> 0)) wf.wp = wf.base >>> 0;
+              else wf.wp = (wf.wp + 32) >>> 0;
+              wf.buf.copyWithin(0, 32, wf.n); wf.n -= 32;
+              _wu32[(PUB + 12) >> 2] = wf.wp >>> 0;
+              // [burst-time epoch discrimination 2026-07-21] ONLY bursts written into the REAL
+              // GP fifo (base == armBase) bump the CREDITED counter the dolphin sync replays via
+              // GatherPipeBursted — DL-buffer bursts are bytes-only (separate count @+24).
+              // Sync-time discrimination was defeated by the page mailbox consumer servicing
+              // FIFO-config writes without a preceding sync (epoch mixing: 8,616 credits vs
+              // ~3,100 true fifo bursts -> CP wp ran 193KB ahead -> decoder-consumed-zeros wedge).
+              if ((wf.base >>> 0) === (wf.armBase >>> 0)) Atomics.add(_wi32, (PUB + 20) >> 2, 1);
+              else _wu32[(PUB + 24) >> 2] = ((_wu32[(PUB + 24) >> 2] >>> 0) + 1) >>> 0;
+            };
+            self.__wfifoWrite = (width, val) => {
+              const b = wf.buf; const n = wf.n;
+              if (width === 4) { b[n] = (val >>> 24) & 0xFF; b[n + 1] = (val >>> 16) & 0xFF; b[n + 2] = (val >>> 8) & 0xFF; b[n + 3] = val & 0xFF; wf.n = n + 4; }
+              else if (width === 2) { b[n] = (val >>> 8) & 0xFF; b[n + 1] = val & 0xFF; wf.n = n + 2; }
+              else { b[n] = val & 0xFF; wf.n = n + 1; }
+              if (wf.n >= 32) _burst();
+              _wu32[0x026B1A3C >> 2] = ((_wu32[0x026B1A3C >> 2] >>> 0) + 1) >>> 0;  // gpSent continuity
+            };
+            const _isWgp = (a) => ((a & 0x0FFFF000) >>> 0) === 0x0C008000;
+            const _isFifoReg = (p) => p === 0x0C00300C || p === 0x0C003010 || p === 0x0C003014;
+            const _localReg = (p) => p === 0x0C00300C ? wf.base : (p === 0x0C003010 ? wf.end : wf.wp);
+            const _fR16 = genv.ppc_read16, _fR32 = genv.ppc_read32;
+            const _fW8 = genv.ppc_write8, _fW16 = genv.ppc_write16, _fW32 = genv.ppc_write32;
+            genv.ppc_read32 = (a) => { const p = (a >>> 0) & 0x0FFFFFFF;
+              if (wf.armed && _isFifoReg(p)) return _localReg(p) >>> 0;
+              return _fR32(a); };
+            genv.ppc_read16 = (a) => { const x = (a >>> 0) & 0x0FFFFFFF;
+              if (wf.armed) {
+                const bse = (x & 3) === 2 ? (x - 2) >>> 0 : x;
+                if (_isFifoReg(bse)) { const v = _localReg(bse) >>> 0; return (x & 3) === 2 ? (v & 0xFFFF) : (v >>> 16) & 0xFFFF; }
+              }
+              return _fR16(a); };
+            // [worker-fifo v2 2026-07-21] v1 regressed two ways (probe-wfifo): (a) the guest
+            // writes FIFO regs as 16-BIT HALVES routinely (20,524 disarms = thrash), (b) arming
+            // on the FIRST config write seeded MID-SEQUENCE state (base new + end old ->
+            // base 0xaee2a0 > end 0x412c20 garbage). v2: half-writes update the local reg (hi @+0,
+            // lo @+2); arming happens at the first WGP STORE post-takeover (a config-quiescent
+            // point) with a sanity-checked seed; gather residue PERSISTS across config writes
+            // (native: the gather buffer survives repointing — only mtspr WPAR resets it, mirrored
+            // by the WPAR interp fastpath clearing wf.n). Arm-rejects counted @PUB+0x1C.
+            const _setLocalReg = (p, val) => {
+              if (p === 0x0C00300C) wf.base = val >>> 0;
+              else if (p === 0x0C003010) wf.end = val >>> 0;
+              else wf.wp = val >>> 0;
+            };
+            self.__wfifoReady = () => {
+              if (wf.armed) return true;
+              if (Atomics.load(_wi32, 0x026A0000 >> 2) !== 1) return false;
+              // one-time arm attempt at a config-quiescent point: drain the legacy ring,
+              // seed from dolphin, sanity-check the config before taking ownership.
+              let t = Atomics.load(_wi32, 0x026C0004 >> 2) >>> 0, sp = 0;
+              while ((Atomics.load(_wi32, 0x026C0000 >> 2) >>> 0) !== t) {
+                Atomics.wait(_wi32, 0x026C0004 >> 2, t | 0, 2);
+                t = Atomics.load(_wi32, 0x026C0004 >> 2) >>> 0;
+                if (++sp > 2000) return false;
+              }
+              // [wf-arm gate 2026-07-21] dolphin's gather must be EMPTY (published @0x026B28B0)
+              // or arming loses its partial burst AND misphases the stream by <32B forever
+              // (the garbage-draw 5735x5735 / stale-EFB class). Defer arming to a later store.
+              if ((Atomics.load(_wi32, 0x026B28B0 >> 2) >>> 0) !== 0) {
+                _wu32[0x026B28B4 >> 2] = ((_wu32[0x026B28B4 >> 2] >>> 0) + 1) >>> 0;  // arm deferrals
+                return false;
+              }
+              const b = _fR32(0xCC00300C) >>> 0, e = _fR32(0xCC003010) >>> 0, w = _fR32(0xCC003014) >>> 0;
+              const pb = b & 0x0FFFFFFF, pe = e & 0x0FFFFFFF, pw = w & 0x0FFFFFFF;
+              if (!(pb < 0x01800000 && pe < 0x01800000 && pe > pb && pw >= pb && pw <= pe)) {
+                _wu32[(PUB + 28) >> 2] = ((_wu32[(PUB + 28) >> 2] >>> 0) + 1) >>> 0;  // arm-reject
+                return false;
+              }
+              wf.base = b; wf.end = e; wf.wp = w; wf.armBase = b; wf.armed = true; _pubAll();
+              postMessage({ cmd: 'print', txt: '[worker-fifo] ARMED base=0x' + b.toString(16)
+                + ' end=0x' + e.toString(16) + ' wp=0x' + w.toString(16) });
+              return true;
+            };
+            genv.ppc_write8 = (a, v) => {
+              if (_isWgp(a >>> 0) && self.__wfifoReady()) { self.__wfifoWrite(1, v); return; }
+              return _fW8(a, v); };
+            genv.ppc_write16 = (a, v) => { const x = (a >>> 0) & 0x0FFFFFFF;
+              // [vi-fb-diag 2026-07-21 TEMP] capture guest writes to VI_FB_LEFT_TOP halves
+              if (x === 0x0C00201C) { _wu32[0x026B287C >> 2] = v >>> 0; _wu32[0x026B2884 >> 2] = ((_wu32[0x026B2884 >> 2] >>> 0) + 1) >>> 0; }
+              else if (x === 0x0C00201E) { _wu32[0x026B2880 >> 2] = v >>> 0; _wu32[0x026B2888 >> 2] = ((_wu32[0x026B2888 >> 2] >>> 0) + 1) >>> 0; }
+              if (_isWgp(x) && self.__wfifoReady()) { self.__wfifoWrite(2, v); return; }
+              const bse = (x & 3) === 2 ? (x - 2) >>> 0 : x;
+              if (wf.armed && _isFifoReg(bse)) {
+                const r = _fW16(a, v);                    // dolphin canonical apply FIRST
+                const cur = _localReg(bse) >>> 0;
+                _setLocalReg(bse, (x & 3) === 2 ? ((cur & 0xFFFF0000) | (v & 0xFFFF)) >>> 0
+                                                : ((cur & 0x0000FFFF) | ((v & 0xFFFF) << 16)) >>> 0);
+                _pubAll();
+                return r;
+              }
+              return _fW16(a, v); };
+            genv.ppc_write32 = (a, v) => { const x = (a >>> 0) & 0x0FFFFFFF;
+              if (x === 0x0C00201C) { _wu32[0x026B288C >> 2] = v >>> 0; _wu32[0x026B2890 >> 2] = ((_wu32[0x026B2890 >> 2] >>> 0) + 1) >>> 0; }  // [vi-fb-diag] 32-bit form
+              if (_isWgp(x) && self.__wfifoReady()) { self.__wfifoWrite(4, v); return; }
+              if (wf.armed && _isFifoReg(x)) {
+                const r = _fW32(a, v);                    // dolphin canonical apply FIRST
+                _setLocalReg(x, v);
+                _pubAll();
+                return r;
+              }
+              return _fW32(a, v); };
+            postMessage({ cmd: 'print', txt: '[worker-fifo] native-architecture gather pipe (arms at first WGP store)' });
           }
           if (self.__aot.enabled && !self.__aot.table) {
             // [aot-chain] Eager-instantiate the whole pack with a shared funcref table so
@@ -708,9 +1126,12 @@
                   Atomics.store(_gi, GPH, (h + 1) | 0);
                   U[0x026B1A3C >> 2] = ((U[0x026B1A3C >> 2] >>> 0) + 1) >>> 0;  // gpSent
                 };
-                baseEnv.ppc_write8  = (addr, val) => { if (_isGpA(addr)) { _ringPush(1, val); return; } return _origW8(addr, val); };
-                baseEnv.ppc_write16 = (addr, val) => { if (_isGpA(addr)) { _ringPush(2, val); return; } return _origW16(addr, val); };
-                baseEnv.ppc_write32 = (addr, val) => { if (_isGpA(addr)) { _ringPush(4, val); return; } return _origW32(addr, val); };
+                // [worker-fifo 2026-07-21] post-arm, WGP bypasses the ring entirely: bytes go into
+                // the worker-local gather -> direct MEM1 burst (native architecture). Pre-arm keeps
+                // the legacy blocking ring.
+                baseEnv.ppc_write8  = (addr, val) => { if (_isGpA(addr)) { if (self.__wfifoReady && self.__wfifoReady()) { self.__wfifoWrite(1, val); return; } _ringPush(1, val); return; } return _origW8(addr, val); };
+                baseEnv.ppc_write16 = (addr, val) => { if (_isGpA(addr)) { if (self.__wfifoReady && self.__wfifoReady()) { self.__wfifoWrite(2, val); return; } _ringPush(2, val); return; } return _origW16(addr, val); };
+                baseEnv.ppc_write32 = (addr, val) => { if (_isGpA(addr)) { if (self.__wfifoReady && self.__wfifoReady()) { self.__wfifoWrite(4, val); return; } _ringPush(4, val); return; } return _origW32(addr, val); };
               }
               let okN = 0;
               for (let f = 0; f < nf; f++) {
@@ -932,7 +1353,11 @@
           if (a === 0xCC00500A && Atomics.load(self.__mmr, 0x026A0000 >> 2) === 1) {
             Atomics.add(self.__mmr, 0x026B27DC >> 2, 1);                  // [fastpath-hit] DSP_CONTROL
             return Atomics.load(self.__mmr, 0x026B27D4 >> 2) & 0xFFFF; }  // DSP_CONTROL fast-path
-          self.__lastMmioRdAddr = a; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1; return call1(3, a); };
+          self.__lastMmioRdAddr = a; self.__lastMmioRdSeq = (self.__lastMmioRdSeq | 0) + 1;
+          // [read16-addr profiler 2026-07-20 TEMP] cmd3 is now the #1 round-trip (279K/120s) and the
+          // 32-bit-only histogram missed it - bump the same 256-bucket table for 16-bit reads.
+          { const _b = ((a >>> 2) & 0xFF); const _sp = 0x02500400 + _b * 8; _rtc[_sp >> 2] = a; _rtc[(_sp + 4) >> 2] = (_rtc[(_sp + 4) >> 2] + 1) | 0; }
+          return call1(3, a); };
         env.ppc_read32      = (addr) => {
           const a = addr >>> 0;
           if (a === 0xCC003000 && Atomics.load(self.__mmr, 0x026A0000 >> 2) === 1) {
@@ -959,6 +1384,70 @@
           if (!self.__interpFastOff) {
             const _op = (inst >>> 26) & 0x3F, _xo = (inst >>> 1) & 0x3FF, _b20 = (inst >>> 20) & 1;
             const _CTXr = _rtc[0x0250002C >> 2] >>> 0;   // real &ppc_state
+            // [sc fastpath 2026-07-20] full syscall vector commit, no round-trip (13K/120s).
+            // Mirrors dolphin CheckExceptions EXCEPTION_SYSCALL + the validated EXT-vector MSR
+            // transform (SRR0=pc+4, SRR1=msr&0x87C0FFFF, LE=ILE, &=~0x04EF36, |=0x1000, pc=0xC00).
+            // The emitted fallback's redirect-honor sees ctx.PC != pc/pc+4 and exits to the vector.
+            if ((inst >>> 0) === 0x44000002 && _CTXr) {
+              const _msr = _rtc[(_CTXr + 0x2E0) >> 2] >>> 0;
+              _rtc[(_CTXr + 0x3A8) >> 2] = (pc + 4) | 0;             // SRR0
+              _rtc[(_CTXr + 0x3AC) >> 2] = (_msr & 0x87C0FFFF) | 0;  // SRR1
+              let _nm = ((_msr & ~1) | ((_msr >>> 16) & 1)) >>> 0;   // LE = ILE
+              _nm = (_nm & ~0x04EF36) >>> 0;
+              _nm = (_nm | 0x1000) >>> 0;                            // ME-preserve
+              Atomics.store(_rtc, (_CTXr + 0x2E0) >> 2, _nm | 0);
+              _rtc[(_CTXr + 0x000) >> 2] = 0xC00;                    // PC
+              _rtc[(_CTXr + 0x004) >> 2] = 0xC00;                    // NPC
+              _rtc[0x02500188 >> 2] = (_rtc[0x02500188 >> 2] + 1) | 0;  // scFp count
+              return;
+            }
+            // [psq_st->WGP fastpath 2026-07-20] the emitted psq_st fast arm covers MEM1 only;
+            // WGP-page float stores (GXPosition2f32-class, 42K/120s) still round-tripped. Serve
+            // them here: demote ps0/ps1 to f32 bits and push width-4 entries to the GP ring
+            // (same watermark discipline as the AoT _ringPush; drain applies via GPFifo in
+            // order). Raw-float GQR only; anything else stays on the round-trip.
+            if (_op === 60 && _CTXr) {
+              const _ra = (inst >>> 16) & 0x1F;
+              const _d = ((inst & 0xFFF) << 20) >> 20;
+              const _ea = (((_ra ? _rtc[(_CTXr + 0x14 + _ra * 4) >> 2] : 0) | 0) + _d) >>> 0;
+              if ((_ea & 0x0FFFF000) === 0x0C008000) {
+                const _gi = (inst >>> 12) & 7;
+                const _gqr = _rtc[(_CTXr + 0x340 + (912 + _gi) * 4) >> 2] >>> 0;
+                if ((_gqr & 0x3F07) === 0) {
+                  if (!self.__f64sab) {
+                    self.__f64sab = new Float64Array(sharedMemoryRef.buffer);
+                    self.__f32sc = new Float32Array(1);
+                    self.__u32sc = new Uint32Array(self.__f32sc.buffer);
+                  }
+                  const _u32r = new Uint32Array(sharedMemoryRef.buffer);
+                  const _frS = (inst >>> 21) & 0x1F;
+                  const _w = (inst >>> 15) & 1;
+                  const _GPH = 0x026C0000 >> 2, _GPT = 0x026C0004 >> 2, _GPD = 0x026C0040 >> 2, _CAP = 8192;
+                  const _push = (bits) => {
+                    if (self.__wfifoReady && self.__wfifoReady()) { self.__wfifoWrite(4, bits); return; }  // [worker-fifo] post-arm: local gather
+                    const h = Atomics.load(_rtc, _GPH) >>> 0;
+                    let t = Atomics.load(_rtc, _GPT) >>> 0, sp = 0;
+                    while (((h - t) >>> 0) >= (_CAP - 16)) {
+                      Atomics.wait(_rtc, _GPT, t | 0, 2);
+                      t = Atomics.load(_rtc, _GPT) >>> 0;
+                      if (++sp > 2000) break;
+                    }
+                    const slot = _GPD + ((h & (_CAP - 1)) * 2);
+                    _u32r[slot] = 4; _u32r[slot + 1] = bits >>> 0;
+                    Atomics.store(_rtc, _GPH, (h + 1) | 0);
+                    _u32r[0x026B1A3C >> 2] = ((_u32r[0x026B1A3C >> 2] >>> 0) + 1) >>> 0;  // gpSent
+                  };
+                  self.__f32sc[0] = self.__f64sab[(_CTXr + 0xA0 + _frS * 16) >> 3];
+                  _push(self.__u32sc[0]);
+                  if (!_w) {
+                    self.__f32sc[0] = self.__f64sab[(_CTXr + 0xA8 + _frS * 16) >> 3];
+                    _push(self.__u32sc[0]);
+                  }
+                  _rtc[0x0250018C >> 2] = (_rtc[0x0250018C >> 2] + 1) | 0;  // psqWgpFp count
+                  return;
+                }
+              }
+            }
             // rfi (op19 xo50): MSR=(MSR&~0x87C0FFFF)|(SRR1&0x87C0FFFF); pc=npc=SRR0&~3.
             // Dolphin Interpreter::rfi. MEM1 access is MSR-independent in the worker (fixed base),
             // so no membase recompute needed. Biggest interrupt-path round-trip (16292x/55s).
@@ -1016,6 +1505,9 @@
                 && ((((inst >>> 16) & 0x1F) | (((inst >>> 11) & 0x1F) << 5)) === 921)) {
               const _rSw = _rtc[(_CTXr + 0x14 + (((inst >>> 21) & 0x1F) * 4)) >> 2] >>> 0;
               _rtc[(_CTXr + 0x11A4) >> 2] = (_rSw & ~1) | 0;   // spr[921]=WPAR, BNE(bit0)=0 (buffer empty)
+              // [worker-fifo 2026-07-21] mtspr WPAR = GPFifo::ResetGatherPipe on native — with the
+              // worker-LOCAL gather now real, mirror it: drop any partial burst (alignment reset).
+              if (self.__wfifo && self.__wfifo.n) self.__wfifo.n = 0;
               _rtc[0x02500184 >> 2] = (_rtc[0x02500184 >> 2] + 1) | 0;   // sysFp counter
               return;
             }
@@ -1072,6 +1564,19 @@
               if (_free < 0 && _spc === 0) _free = _k; }
             if (!_done && _free >= 0) { const _sp = 0x02500200 + _free * 12;
               _rtc[_sp >> 2] = _p; _rtc[(_sp + 4) >> 2] = inst >>> 0; _rtc[(_sp + 8) >> 2] = 1; } }
+          // [interp-CLASS profiler 2026-07-20 TEMP] the 8-slot pc-hist captured 38K of 3.57M cmd9
+          // round-trips (first-8-pcs-win) — rank by INSTRUCTION CLASS instead so the emit-priority
+          // list is measured, not guessed. Key = primary<<10 | XO (XO only for op 4/19/31/59/63).
+          // 32 slots x12B {key, sample-inst, count} @0x02500280 (free span ends 0x02500400).
+          { const _op = (inst >>> 26) & 0x3F;
+            const _xo = (_op === 4 || _op === 19 || _op === 31 || _op === 59 || _op === 63) ? ((inst >>> 1) & 0x3FF) : 0;
+            const _key = ((_op << 10) | _xo) >>> 0; let _cf = -1, _cd = false;
+            for (let _k = 0; _k < 32; _k++) { const _sp = 0x02500280 + _k * 12;
+              const _sk = _rtc[_sp >> 2] >>> 0;
+              if (_sk === _key + 1) { _rtc[(_sp + 8) >> 2] = (_rtc[(_sp + 8) >> 2] + 1) | 0; _cd = true; break; }
+              if (_cf < 0 && _sk === 0) _cf = _k; }
+            if (!_cd && _cf >= 0) { const _sp = 0x02500280 + _cf * 12;
+              _rtc[_sp >> 2] = (_key + 1) >>> 0; _rtc[(_sp + 4) >> 2] = inst >>> 0; _rtc[(_sp + 8) >> 2] = 1; } }
           // [store-watch 2026-06-29 TEMP] BUG 2: marker 0xFFFFFFFB = a 32-bit store of
           // 0x808080 into the SIGetType stack frame (the callback-corruption write).
           // pc = the EXACT storing instruction; log it (no dolphin round-trip). Other
@@ -1098,7 +1603,30 @@
           }
           call2(9, inst, pc);
         };
-        env.ppc_check_exc   = (pc) => call1(10, pc);
+        env.ppc_check_exc   = (pc) => {
+          // [check-exc fastpath 2026-07-21 — THE runtime-compile speed fix] build_block_next
+          // emits ppc_check_exc after EVERY op (JitWasm relies on it, in-process/cheap in
+          // single-exec). In the dual-core worker call1(10) is a cross-worker mailbox round-trip
+          // — measured 870K/180s = the dominant cost (movie at 2.8fps). It's a pure DELIVERABILITY
+          // read: bail the block (return 1) ONLY when a deliverable exception is pending; the JS
+          // dispatch loop then vectors it (EXT/DEC/sc/0x800 all handled there). Common case
+          // Exceptions==0 returns 0 with ZERO round-trip. Deliverability mask matches
+          // ppc_worker_chain_loop_c (main.cpp:461): non-maskable 0x2FA, or maskable 0x105 w/ MSR.EE.
+          // self.__checkExcRT=1 forces the original round-trip. (Pre-takeover keeps the round-trip
+          // so dolphin's own JitWasm boot path is byte-identical.)
+          // [exc==0 fast 2026-07-21 — the SIMPLE correct fastpath] dolphin_check_exc
+          // (dolphin_jit_wimports.cpp:287) does NOTHING meaningful when Exceptions==0: the
+          // FPU block is gated on the FPU bit, the CheckExceptionsFromJIT vector is gated on
+          // Exceptions!=0, and it returns 0 (pc unchanged). So the exc==0 case (~99% of the
+          // 870K/180s calls) needs ZERO round-trip. Only exc!=0 round-trips to dolphin's full
+          // delivery logic (FPU eager-set, os-ready gate, vectoring) — unchanged, correct.
+          // self.__checkExcRT=1 forces the full round-trip. Pre-takeover unchanged.
+          if (self.__checkExcFast === 1 && Atomics.load(i32, 0x026A0000 >> 2) === 1) {
+            const _cx = _rtc[0x0250002C >> 2] >>> 0;
+            if (_cx && (_rtc[(_cx + 0x2EC) >> 2] >>> 0) === 0) return 0;  // no exception -> no round-trip
+          }
+          return call1(10, pc);
+        };
         env.ppc_break_block = (pc, x) => call2(11, pc, x);
         env.ppc_read_tb     = (which) => call1(12, which);
         // [aot-next 2026-07-20] powerpc-next block modules import these two (gekko didn't).
@@ -1881,6 +2409,8 @@
           // aramQueueLo depth byte @0x801D0539 that aramSyncTransferQueue spins on). Also sample the
           // live spin byte itself. arqIsrN@0x026B27A4, aramCbN@0x026B27A8, spinByte@0x026B27AC.
           if ((pc >>> 0) === 0x800c706c) u32[0x026B27A4 >> 2] = ((u32[0x026B27A4 >> 2] >>> 0) + 1) >>> 0;
+          // [dvd-isr diag 2026-07-21 TEMP] __DVDInterruptHandler entries @0x026B2910 (vs diIntN generates)
+          if ((pc >>> 0) === 0x800BCA28) u32[0x026B2910 >> 2] = ((u32[0x026B2910 >> 2] >>> 0) + 1) >>> 0;
           if ((pc >>> 0) === 0x8011145c) u32[0x026B27A8 >> 2] = ((u32[0x026B27A8 >> 2] >>> 0) + 1) >>> 0;
           // [arq-diag2] which handler does __OSDispatchInterrupt route to? __OSDispatchInterrupt
           // @0x800b7714, __DSPHandler@0x800c7558, __ARHandler@0x800c65dc, __ARChecksTdmaOverflow via
@@ -1924,6 +2454,22 @@
             const _h = u32[0x026B0E44 >> 2] >>> 0;
             u32[(0x026B0A40 + ((_h & 255) << 2)) >> 2] = pc >>> 0;
             u32[0x026B0E44 >> 2] = _h + 1;
+            // [lowmem tripwire 2026-07-21 TEMP] every 64 dispatches, check the OS block
+            // @phys 0xC0 (OSCurrentContext) for the pixel-spray corruption; on FIRST hit
+            // capture the dispatch pc + head + the 32 most recent ring pcs to 0x026B2918+.
+            if (mem1Base !== 0 && !self.__lowmemHit) {  // every dispatch during diagnosis
+              const _cw = u32[(mem1Base + 0xC0) >> 2] >>> 0;
+              const _co = (((_cw & 0xFF) << 24) | ((_cw & 0xFF00) << 8) | ((_cw >>> 8) & 0xFF00) | (_cw >>> 24)) >>> 0;
+              if (_co >= 0x01800000) {  // 0xC0 holds the PHYSICAL ctx ptr — trip only on >=24MB garbage
+                self.__lowmemHit = true;
+                u32[0x026B2918 >> 2] = 1;
+                u32[0x026B29A8 >> 2] = _cw >>> 0;   // raw corrupt word (LE) @0xC0
+                u32[0x026B291C >> 2] = pc >>> 0;
+                u32[0x026B2920 >> 2] = _h >>> 0;
+                for (let _k = 0; _k < 32; _k++)
+                  u32[(0x026B2924 + _k * 4) >> 2] = u32[(0x026B0A40 + (((_h - _k) & 255) << 2)) >> 2] >>> 0;
+              }
+            }
           }
           if ((((pc < 0x80000000) && (pc < 0x100 || pc > 0xfff)) || pc >= 0x81800000) && !self.__rawLogged) {
             // Skip the legit real-mode exception vectors (0x100..0xd00) so the ring
@@ -2052,6 +2598,42 @@
             const exc = u32[(PPC_STATE_BASE + OFFSET_EXC) >> 2] >>> 0;
             if (exc !== 0) {
               const msr = u32[(PPC_STATE_BASE + OFFSET_MSR) >> 2] >>> 0;
+              // [fpu-unavailable vector 2026-07-21] Deliver EXCEPTION_FPU_UNAVAILABLE (0x40)
+              // INLINE — vector 0x800, non-maskable. The gekko FP-check prologue raises it with
+              // pc=block-start whenever MSR.FP=0 (lazy-FP contract), but the worker path had NO
+              // 0x800 delivery (the JS loop vectors only EXT/DEC; dolphin_check_exc doesn't
+              // vector) -> the block re-dispatched forever (measured: 2.25M dispatches pinned at
+              // __THPDecompressiMCURowNxN 0x800df858, msr=0xB032 FP clear, movie wedge at
+              // takeover once the quantized psq arms made the THP decoder run NATIVE — the old
+              // interp round-trips never enforced MSR.FP, hiding this since forever). Commit
+              // mirrors the validated EXT/sc pattern: SRR0=pc (re-execute after the handler
+              // enables FP), SRR1=msr&0x87C0FFFF, LE=ILE, &~0x04EF36, |0x1000, pc=npc=0x800.
+              if ((exc & 0x40) !== 0
+                  && Atomics.load(i32, 0x026A0000 >> 2) === 1
+                  && (pc >>> 0) >= 0x4000 && mem1Base !== 0) {
+                const _c0f = u32[(mem1Base + 0xC0) >> 2] >>> 0;
+                const _ocf = (((_c0f & 0xFF) << 24) | ((_c0f & 0xFF00) << 8)
+                              | ((_c0f >>> 8) & 0xFF00) | (_c0f >>> 24)) >>> 0;
+                if (_ocf !== 0 && _ocf < 0x01800000) {
+                  u32[(PPC_STATE_BASE + 0x3A8) >> 2] = pc >>> 0;             // SRR0
+                  u32[(PPC_STATE_BASE + 0x3AC) >> 2] = (msr & 0x87C0FFFF) >>> 0;  // SRR1
+                  let _nmf = ((msr & ~1) | ((msr >>> 16) & 1)) >>> 0;
+                  _nmf = (_nmf & ~0x04EF36) >>> 0;
+                  _nmf = (_nmf | 0x1000) >>> 0;
+                  Atomics.store(i32, (PPC_STATE_BASE + OFFSET_MSR) >> 2, _nmf | 0);
+                  Atomics.and(i32, (PPC_STATE_BASE + OFFSET_EXC) >> 2, ~0x40);
+                  u32[0x026B2914 >> 2] = ((u32[0x026B2914 >> 2] >>> 0) + 1) >>> 0;  // fpuVecN
+                  // The 0x800 flow breaks the in-flight EXT's return-pc tracking (SRR0/SRR1 are
+                  // architecturally clobbered; the guard's __extSrr0 match can never fire) —
+                  // clear the guard so the still-pending EXT redelivers freshly. Without this:
+                  // exc=0x4 pinned + cmd-10 loop at the THP decode (EXT starvation face).
+                  __extInFlight = false;
+                  pc = 0x800;
+                  u32[(PPC_STATE_BASE + OFFSET_PC) >> 2] = pc;
+                  u32[(PPC_STATE_BASE + OFFSET_NPC) >> 2] = pc;
+                  continue;
+                }
+              }
               const EXC_EXTERNAL_INT = 0x00000004;
               const EXC_DECREMENTER  = 0x00000001;
               // [maskable-set fix 2026-06-28] BOTH EXTERNAL_INT and DECREMENTER are
@@ -2062,6 +2644,11 @@
               // forever (safety-cap) WITHOUT advancing the guest to its OSRestoreInterrupts.
               const EXC_MASKABLE = EXC_EXTERNAL_INT | EXC_DECREMENTER;
               const MSR_EE = 0x8000;
+              // [ee-grounded guard 2026-07-21] EE=1 architecturally means the previous ISR has
+              // rfi'd — a still-set __extInFlight is STALE (its SRR0-return tracking breaks
+              // whenever another vector (0x800 FPU lazy-enable) redirects the flow; measured:
+              // exc=0x4 pinned + cmd-10 loop at the THP decode with EE=1 = EXT starvation).
+              if (__extInFlight && (msr & MSR_EE) !== 0) __extInFlight = false;
               const externalOnly = (exc & ~EXC_MASKABLE) === 0;
               if (!externalOnly || (msr & MSR_EE) !== 0) {
                 // [npc-sync fix 2026-06-28] CheckExternalExceptions captures

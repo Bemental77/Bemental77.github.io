@@ -608,6 +608,8 @@ public:
 	void op_f64_mul()            { emitByte(wop::f64_mul); }
 	void op_f64_div()            { emitByte(wop::f64_div); }
 	void op_f64_abs()            { emitByte(wop::f64_abs); }
+	void op_f64_min()            { emitByte(wop::f64_min); }
+	void op_f64_max()            { emitByte(wop::f64_max); }
 	void op_f64_neg()            { emitByte(wop::f64_neg); }
 	void op_f64_sqrt()           { emitByte(wop::f64_sqrt); }
 	void op_f64_trunc()          { emitByte(wop::f64_trunc); }

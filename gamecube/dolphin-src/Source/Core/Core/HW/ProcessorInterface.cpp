@@ -201,6 +201,13 @@ void ProcessorInterfaceManager::UpdateException()
       }
     }
   }
+  // [mirror-before-raise 2026-07-21] Publish the cause mirror BEFORE raising EXTERNAL_INT:
+  // the worker vectors on the Exceptions bit and its ISR reads the mirror — with the old
+  // order (RMW first, mirror second) a coalesced delivery (VI pending + DI landing) could
+  // read a PRE-DI mirror, service only VI, and the inline vector's EXC clear dropped the DI
+  // delivery — the mid-movie dvdCmdN freeze class (chain dead at #116 while diIntN=118).
+  __atomic_store_n(reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B27D0u)),
+                   eff_cause & ~static_cast<u32>(0x800u), __ATOMIC_RELEASE);
   if ((eff_cause & m_interrupt_mask) != 0)
     __atomic_or_fetch(&ppc_state.Exceptions, EXCEPTION_EXTERNAL_INT, __ATOMIC_RELEASE);
   else

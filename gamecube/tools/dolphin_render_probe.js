@@ -1133,6 +1133,8 @@ function startServer() {
             bw.mem1RdMM = (A[0x025001A8 >> 2] >>> 0); bw.mem1RdOK = (A[0x025001AC >> 2] >>> 0); bw.mem1WrMM = (A[0x025001B0 >> 2] >>> 0); bw.mem1WrOK = (A[0x025001B4 >> 2] >>> 0);
             bw.mmioRdTop = (() => { const rows=[]; for(let b=0;b<256;b++){const sp=0x02500400+b*8; const c=A[(sp+4)>>2]>>>0; if(c) rows.push(['0x'+(A[sp>>2]>>>0).toString(16),c]);} rows.sort((x,y)=>y[1]-x[1]); return rows.slice(0,12).map(r=>r[0]+'='+r[1]).join(' '); })();
             bw.interpHist = Array.from({length:8}, (_,k) => { const sp = 0x02500200 + k*12; const c = A[(sp+8)>>2]>>>0; return c ? ('0x'+(A[sp>>2]>>>0).toString(16)+'/i'+(A[(sp+4)>>2]>>>0).toString(16)+'='+c) : null; }).filter(Boolean).join(' ');
+            // [interp-CLASS 2026-07-20] cmd9 fallbacks ranked by op<<10|XO class (complete, unlike the 8-slot pc hist)
+            bw.interpClassHist = (() => { const rows=[]; for(let k=0;k<32;k++){const sp=0x02500280+k*12; const key=A[sp>>2]>>>0; const c=A[(sp+8)>>2]>>>0; if(key&&c) rows.push(['op'+(((key-1)>>>10)&0x3F)+((((key-1)&0x3FF))?('.'+((key-1)&0x3FF)):'')+'/i'+(A[(sp+4)>>2]>>>0).toString(16), c]);} rows.sort((x,y)=>y[1]-x[1]); return rows.map(r=>r[0]+'='+r[1]).join(' '); })();
             bw.gtLo = (A[0x02680008 >> 2] >>> 0);         // [det 2026-07-17] worker global_timer lo — is the deterministic ff advancing it? frozen = under-pump
             bw.gtHi = (A[0x0268000C >> 2] >>> 0);         // global_timer hi
             bw.ctNextValid = (A[0x026B0918 >> 2] >>> 0);  // dolphin hybrid-head valid flag (is there a next VI event to target?)
@@ -1181,6 +1183,56 @@ function startServer() {
             bw.dspHN     = A[0x026B27B4 >> 2] >>> 0;      // [arq] __DSPHandler runs
             bw.wgpGateN  = A[0x026B27E0 >> 2] >>> 0;      // [wgp-order] CP/PI-page MMIO gate checks
             bw.wgpGateWaitN = A[0x026B27E4 >> 2] >>> 0;   // [wgp-order] ...that actually waited on a non-empty ring
+            bw.wgpGateMs = (A[0x026B27E8 >> 2] >>> 0) / 10;  // [gate-wait-time] total wall-ms blocked in the gate
+            // [worker-fifo 2026-07-21] native-architecture gather pipe state
+            bw.wfArmed = A[0x026B2840 >> 2] >>> 0;
+            bw.wfWp = '0x' + (A[(0x026B2840 + 12) >> 2] >>> 0).toString(16);
+            bw.wfBurstN = A[(0x026B2840 + 20) >> 2] >>> 0;
+            bw.wfDlBurstN = A[(0x026B2840 + 24) >> 2] >>> 0;  // DL-buffer (uncredited) bursts
+            bw.wfDisarm16 = A[(0x026B2840 + 28) >> 2] >>> 0;
+            bw.wfSyncedBursts = A[0x026B285C >> 2] >>> 0;
+            // [vi-struct diag 2026-07-21 TEMP] setFbbRegs INPUTS + outputs from guest memory:
+            // fbBase @0x801A6168 (stw r30,288(r31)), PanPosX @0x801A614E (lhz 22(r3), r3=base+0xF0),
+            // computed tfbl scratch @0x801A616C (r4=base+292), shadow TFBL pair @0x801A6064 (sth 28/30(r9)).
+            bw.viStruct = (() => { const m1 = A[0x02500020 >> 2] >>> 0; if (!m1) return 'nomem';
+              const g = (ga) => { const w = A[((m1 + (ga & 0x01FFFFFF)) >>> 0) >> 2] >>> 0; return (((w & 0xFF) << 24) | ((w & 0xFF00) << 8) | ((w >>> 8) & 0xFF00) | (w >>> 24)) >>> 0; };
+              return 'fb=0x' + g(0x801A6168).toString(16) + ' panX=0x' + ((g(0x801A614C) & 0xFFFF) >>> 0).toString(16)
+                + ' tfblScratch=0x' + g(0x801A616C).toString(16) + ' shadowTFBL=0x' + g(0x801A6064).toString(16); })();
+            bw.viFbW = 'hi16=0x' + (A[0x026B287C >> 2] >>> 0).toString(16) + '/' + (A[0x026B2884 >> 2] >>> 0)
+              + ' lo16=0x' + (A[0x026B2880 >> 2] >>> 0).toString(16) + '/' + (A[0x026B2888 >> 2] >>> 0)
+              + ' w32=0x' + (A[0x026B288C >> 2] >>> 0).toString(16) + '/' + (A[0x026B2890 >> 2] >>> 0);
+            bw.lowmemHit = (A[0x026B2918 >> 2] >>> 0) ? ('val=0x' + (A[0x026B29A8 >> 2] >>> 0).toString(16) + ' pc=0x' + (A[0x026B291C >> 2] >>> 0).toString(16)
+              + ' head=' + (A[0x026B2920 >> 2] >>> 0)
+              + ' ring=' + Array.from({length: 32}, (_, k) => (A[(0x026B2924 + k*4) >> 2] >>> 0).toString(16)).join(',')) : 'clean';
+            bw.fpuVecN = A[0x026B2914 >> 2] >>> 0;   // [fpu-vec] inline 0x800 deliveries
+            bw.gqrs = (() => { const c = A[0x0250002C >> 2] >>> 0; if (!c) return 'noctx';
+              return Array.from({length: 8}, (_, i) => i + ':0x' + (A[(c + 0x340 + (912 + i) * 4) >> 2] >>> 0).toString(16)).join(' '); })();
+            bw.dvdIsrN = A[0x026B2910 >> 2] >>> 0;   // [dvd-isr] guest __DVDInterruptHandler entries
+            bw.diIntN = (A[0x026B2908 >> 2] >>> 0) + '/t' + (A[0x026B290C >> 2] >>> 0);  // DI int generates / last type
+            bw.texImg3 = '0x' + (A[0x026B2900 >> 2] >>> 0).toString(16) + '/' + (A[0x026B2904 >> 2] >>> 0);
+            bw.texHash = (() => { const m1 = A[0x02500020 >> 2] >>> 0; const t3 = A[0x026B2900 >> 2] >>> 0;
+              if (!m1 || !t3) return 'none';
+              const pa = (t3 << 5) & 0x01FFFFFF; let h = 0x811c9dc5;
+              for (let k = 0; k < 0x2000; k += 16) { h ^= A[(m1 + pa + k) >> 2]; h = (h * 0x01000193) >>> 0; }
+              return '0x' + (h >>> 0).toString(16); })();
+            bw.garbageDraw = (A[0x026B28B8 >> 2] >>> 0) ? Array.from({length: 16}, (_, k) => {
+              const w = A[(0x026B28C0 + k*4) >> 2] >>> 0;
+              return [w & 0xFF, (w >>> 8) & 0xFF, (w >>> 16) & 0xFF, (w >>> 24) & 0xFF].map(b => b.toString(16).padStart(2, '0')).join(' ');
+            }).join(' ') : 'none';
+            bw.drawN = A[0x026B289C >> 2] >>> 0;                                     // [copy-gap] prim draws decoded
+            bw.drawVerts = A[0x026B28A0 >> 2] >>> 0;                                 // total vertices
+            bw.dlCallN = A[0x026B28A4 >> 2] >>> 0;                                   // CALL_DL count
+            bw.dlCallLast = '0x' + (A[0x026B28A8 >> 2] >>> 0).toString(16) + '/' + (A[0x026B28AC >> 2] >>> 0);
+            bw.draw24 = Array.from({length: 8}, (_, k) => (A[(0x026B1AC8 + k*8) >> 2] >>> 0) + 'x' + (A[(0x026B1AC8 + k*8 + 4) >> 2] >>> 0)).join(' ');
+            bw.efbCopyN = A[0x026B2894 >> 2] >>> 0;                                  // [copy-diag] EFB-copy executes
+            bw.efbCopyDest = '0x' + (A[0x026B2898 >> 2] >>> 0).toString(16);          // last copy dest
+            bw.xfbRaw = '0x' + (A[0x026B2834 >> 2] >>> 0).toString(16);      // pre-latch VI xfbAddr
+            bw.xfbRegTop = '0x' + (A[0x026B2838 >> 2] >>> 0).toString(16);   // raw m_xfb_info_top.Hex
+            bw.wfCp = 'wp=0x' + (A[0x026B2860 >> 2] >>> 0).toString(16) + ' rp=0x' + (A[0x026B2864 >> 2] >>> 0).toString(16)
+              + ' dist=' + (A[0x026B2868 >> 2] >>> 0) + ' base=0x' + (A[0x026B286C >> 2] >>> 0).toString(16)
+              + ' end=0x' + (A[0x026B2870 >> 2] >>> 0).toString(16) + ' link=' + (A[0x026B2874 >> 2] >>> 0)
+              + ' wfwp=0x' + (A[0x026B2878 >> 2] >>> 0).toString(16);
+            bw.mirrorHits = A[0x026B2830 >> 2] >>> 0;     // [mmio-mirror] reads served from the SAB block
             bw.arHN      = A[0x026B27B8 >> 2] >>> 0;      // [arq] __ARHandler runs (calls the AR DMA callback)
             bw.viHide    = A[0x026B27C0 >> 2] >>> 0;      // [vi-dsp-prio] VI hidden from cause read while DSP co-pending
             bw.dspCrReads = A[0x026B27CC >> 2] >>> 0;     // [aram-diag3] guest DSP_CONTROL reads post-takeover

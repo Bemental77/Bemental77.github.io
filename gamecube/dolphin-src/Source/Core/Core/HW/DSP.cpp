@@ -541,7 +541,26 @@ void DSPManager::UpdateAudioDMA()
           *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u;
       if (takeover)
       {
-        // [aid-recompute-only 2026-07-17] Post-takeover: do NOT generate the AID interrupt (skip
+        // [aid-restore 2026-07-21] GENERATE the AID interrupt post-takeover again — native
+        // semantics, NO self-ack (the guest acks). The 2026-07-17 suppression's rationale
+        // ("the guest's AID handler is bookkeeping game progress never waits on") is FALSIFIED
+        // by the MP4 decomp: THPSimple.c:35 registers THPAudioMixCallback via
+        // AIRegisterDMACallback — the ENTIRE intro-movie A/V pacing runs off AID. Suppressing
+        // it froze the movie mid-play (video holds last frame, THP ring fills, dvdCmdN dead at
+        // 116) and killed game audio. The empty-vector storm the suppression fixed was caused
+        // by (a) the AID SELF-ACK clearing the cause before the ISR read it (we no longer
+        // self-ack) and (b) the PI-cause mirror being published AFTER the EXT raise (fixed
+        // 2026-07-21, ProcessorInterface [mirror-before-raise]); the ISR is also ~100x cheaper
+        // now (round-trip fastpaths). If the storm ever returns, its face is pcring@0x500 with
+        // gc stalled at audio-init (~156) — re-triage there, do not re-suppress blindly.
+        GenerateDSPInterrupt(DSP::INT_AID, 0);
+        volatile u32* k = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2798u));
+        *k = *k + 1u;
+      }
+      else if (false)
+      {
+        // [aid-recompute-only 2026-07-17 — RETIRED by aid-restore above, kept for the record]
+        // Post-takeover: do NOT generate the AID interrupt (skip
         // its cause-SET), but DO keep the periodic 4kHz UpdateInterrupts() recompute.
         //
         // Two failure modes bound this. (a) Baseline (GenerateDSPInterrupt(INT_AID) + self-ack):

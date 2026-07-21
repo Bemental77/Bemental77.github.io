@@ -4,6 +4,19 @@
 >
 > **The rule (per `feedback_native_dolphin_dualcore_first_resource_2026_07_11`): for ANY GameCube / dual-core unknown, run local native Dolphin in DUAL-CORE and read the answer off the oracle BEFORE any hypothesis, instrumentation, or fix.** The WASM build is the patient, never the reference. Skipping this has burned whole sessions ≥8 times.
 
+## ★ DUAL-CORE ONLY — the product + the reference (2026-07-21, user directive: "RUN DUAL CORE, USE ONLY DUAL CORE, FORGET SINGLE CORE")
+
+The product is **gamecube.html dual-core + WebGPU**. Single-executor / single-core is ABANDONED — do not measure it, propose it, or use it as a fallback. Match native Dolphin's dual-core split EXACTLY.
+
+**Native dual-core thread model (THE reference to match; source in `gamecube/dolphin-src`, confirmed live: `-C Dolphin.Core.CPUThread=True` boots MP4 to gc=214 in 16s = full-speed movie):**
+- **CPU thread** = PowerPC JIT + **CoreTiming** + ALL synchronous devices (PI/DSP/AI/VI/DI/SI/EXI/MI) + interrupt delivery (`CheckExternalExceptions`), ALL in-process function calls, never blocks. `retro_run` (DolphinLibretro/Main.cpp) spawns `Core::EmuThread` as the CPU thread and waits for `HasCPURunStateBeenReached`. `CoreTiming::Advance` runs on THIS thread, crediting exactly the cycles just executed and firing VI/DSP/AI/DI in lockstep.
+- **GPU thread** = `FifoManager::RunGpuLoop` (VideoCommon/Fifo.cpp:311), spawned in dual-core, drains the CP/gather-pipe FIFO continuously in parallel and renders (WebGPU). `IsDualCoreMode()` (System.cpp:116 = `Config::Get(MAIN_CPU_THREAD)`) gates it.
+- **ONE cross-thread boundary** = the GX FIFO: fire-and-forget from CPU, drained by GPU, bounded by `CPReadWriteDistance` (CPU only stalls on FIFO-full, rare).
+
+**Our target mapping:** ppc-worker (bementalJIT) = the CPU thread (gets CoreTiming + devices in-process); dolphin_worker = the GPU thread (RunGpuLoop + WebGPU). Only the GX FIFO crosses.
+
+**Dolphin dual-core compile:** `DolphinLibretro/Boot.cpp` `MAIN_CPU_THREAD` def = **true** (2026-07-21; was emscripten-forced false). MEASURED: emdawnwebgpu 4.0.10 FIXED the old PROVER-2.1 video-init deadlock (ContextReset completes). Flipping the flag alone breaks boot (guest never executes) — the restructure (CPU/device placement + FIFO + takeover removal) must land WITH the flag. See `gc_dualcore_wrong_seam_root_2026_07_21` for the full deviation list.
+
 ## For ANY unknown, do THIS first
 
 1. **Boot native Dolphin dual-core on the same ISO** and observe (≤10s; init completes in 1–2s):

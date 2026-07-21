@@ -10,6 +10,7 @@
 // existing Interpreter::RunInterpreterOp.
 
 #include "gekko_emit.h"
+#include <cstdlib>
 #include "bementalJIT/perf_runtime.h"
 #include <array>
 #include <cstdio>
@@ -91,6 +92,14 @@ constexpr u32 AOT_ENTRY_CELL       = 0x026B0904u;  // shared entry_sel cell
 // MEM1 hits go via i32.load/store offset=g_mem1_base, everything else
 // (MMIO, MEM2 etc.) falls through to the trampoline.
 static u32 g_mem1_base = 0;
+// [ps-kill A/B 2026-07-21 TEMP] BEMENTAL_NO_PS=1 -> route ALL new paired-single native emits
+// (op4 ps arith + quantized psq load/store arms) to the interp fallback, to confirm whether
+// they are the THP-IDCT miscompile (movie-start spray wedge). Read once, lazily.
+static int g_no_ps = -1;
+static inline bool ps_native_off() {
+    if (g_no_ps < 0) { const char* e = getenv("BEMENTAL_NO_PS"); g_no_ps = (e && e[0] == '1') ? 1 : 0; }
+    return g_no_ps != 0;
+}
 // [indirect-base 2026-07-07] The mem1 base is LOADED from the published SAB cell
 // (0x02500020, written by the bridge before any dispatch) instead of baked as a
 // constant — three different bases observed across environments (0x1a4b7498 /
@@ -933,6 +942,15 @@ static void emit_store_d(EmitCtx& c, u32 import_idx, bool update) {
             c.b.op_local_tee(LOCAL_TMP_B);
             c.b.op_i32_const(8);
             c.b.op_i32_shr_u();
+            // [sth-swap fix 2026-07-21] MASK the >>8 term to 0xFF: unmasked, its bits 8-15
+            // are the VALUE's bits 16-23, which survive the final &0xFFFF and corrupt the
+            // stored low byte whenever rs has bits above 15 (repro: sth of 0x001E6C00 stored
+            // 0x6C1E, not 0x6C00 — the frozen-Nintendo-logo VI shadow corruption; offline
+            // harness scratchpad/xsth_emit.cpp reproduced in BOTH build_block and region).
+            // Tiny-value sths (byte2==0, the overwhelming majority + the conformance corpus)
+            // were unaffected, which is why this survived test_diff.
+            c.b.op_i32_const(0xFF);
+            c.b.op_i32_and();
             c.b.op_local_get(LOCAL_TMP_B);
             c.b.op_i32_const(8);
             c.b.op_i32_shl();
@@ -2700,6 +2718,12 @@ static bool spr_write_is_direct(u32 spr_num) {
       case 912: case 913: case 914: case 915:  // GQR0-3
       case 916: case 917: case 918: case 919:  // GQR4-7
         return true;
+      case 1008:  // HID0 — [2026-07-20] measured 28K interp round-trips/120s (the exception
+        // epilogue's icache-flash-invalidate). Dolphin's handler only does ICACHE bookkeeping
+        // (ICFI -> iCache reset) which NEVER reaches the worker's own block cache — the prior
+        // round-trip was already a de-facto storage write for our dispatch, so a direct spr
+        // store is behavior-equivalent post-takeover (dolphin executes no guest code then).
+        return true;
       default:
         return false;
     }
@@ -4013,6 +4037,15 @@ static void emit_store_x(EmitCtx& c, u32 import_idx, bool update) {
                 c.b.op_local_tee(LOCAL_TMP_B);
                 c.b.op_i32_const(8);
                 c.b.op_i32_shr_u();
+                // [sth-swap fix 2026-07-21] MASK the >>8 term to 0xFF: unmasked, its bits 8-15
+                // are the VALUE's bits 16-23, which survive the final &0xFFFF and corrupt the
+                // stored low byte whenever rs has bits above 15 (repro: sth of 0x001E6C00 stored
+                // 0x6C1E, not 0x6C00 — the frozen-Nintendo-logo VI shadow corruption; offline
+                // harness scratchpad/xsth_emit.cpp reproduced in BOTH build_block and region).
+                // Tiny-value sths (byte2==0, the overwhelming majority + the conformance corpus)
+                // were unaffected, which is why this survived test_diff.
+                c.b.op_i32_const(0xFF);
+                c.b.op_i32_and();
                 c.b.op_local_get(LOCAL_TMP_B);
                 c.b.op_i32_const(8);
                 c.b.op_i32_shl();
@@ -4092,6 +4125,631 @@ static void emit_dcbz_impl(EmitCtx& c) {
 
 namespace {
 
+// [psq native emit 2026-07-20 — the steady-state round-trip killer] psq_l/psq_lu/psq_st/psq_stu
+// measured as 88% of ALL dual-core mailbox round-trips (interp-CLASS profiler @0x02500280:
+// psq_l=790938 + psq_st=789516 of 1.79M cmd9 in 120s — the PSMTX/PSVEC SDK matrix path, all
+// GQR0 raw-float in the samples). Emit the raw-float case natively: GQR ld/st type=0 scale=0
+// (UGQR: st_type 0-2, st_scale 8-13, ld_type 16-18, ld_scale 24-29; Gekko.h:340) means the
+// access is plain f32 pairs — two bswapped f32 loads/stores (one + splat 1.0 for W=1), MEM1
+// fastmem only. The fast arm is gated on fastmem_cond AND gqr==raw at RUNTIME; every other
+// case — quantized u8/u16/s8/s16, nonzero scale, or a non-MEM1 EA (WGP/MMIO psq_st must keep
+// dolphin's WriteQuantized semantics and the GP-ring routing) — takes emit_fallback VERBATIM.
+// GPRs are flushed BEFORE the runtime branch so both arms share a clean compile-time cache
+// model (the float arm dirties none; emit_fallback's invalidate applies conservatively).
+// Encoding (Gekko D-form): frD/frS 6-10, rA 11-15, W bit16 (inst>>15&1), I bits17-19
+// (inst>>12&7, GQR index -> spr 912+I), d = 12-bit SIGNED displacement (inst&0xFFF).
+// EA computation shared by D-form (d12 displacement) and X-form (rB-indexed) psq variants.
+// Leaves EA in TMP_A. X-form W/I live at bits 21/22-24 ((inst>>10)&1 / (inst>>7)&7);
+// D-form at bits 16/17-19 ((inst>>15)&1 / (inst>>12)&7).
+static void emit_psq_ea_tmpa(EmitCtx& c, bool update, bool indexed) {
+    const u32 ra = RA(c.inst);
+    if (indexed) {
+        const u32 rb = RB(c.inst);
+        if (update || ra != 0) {
+            emit_gpr_get_impl(c, ra, g_ctx_ptr);
+            emit_gpr_get_impl(c, rb, g_ctx_ptr);
+            c.b.op_i32_add();
+        } else {
+            emit_gpr_get_impl(c, rb, g_ctx_ptr);
+        }
+    } else {
+        const s32 d12 = ((s32)(c.inst << 20)) >> 20;
+        if (update) {
+            emit_gpr_get_impl(c, ra, g_ctx_ptr);
+            c.b.op_i32_const(d12);
+            c.b.op_i32_add();
+        } else {
+            emit_ea_d(c, ra, d12);
+        }
+    }
+    c.b.op_local_set(LOCAL_TMP_A);
+}
+static void emit_psq_l_common(EmitCtx& c, bool update, bool indexed) {
+    // [bisect 2026-07-21] psq re-enabled; ps ARITH still gated. Corruption return => arith bug.
+    const u32 rt = RT(c.inst), ra = RA(c.inst);
+    const u32 w = indexed ? ((c.inst >> 10) & 1u) : ((c.inst >> 15) & 1u);
+    const u32 gqr_i = indexed ? ((c.inst >> 7) & 7u) : ((c.inst >> 12) & 7u);
+    if (g_mem1_base == 0u) { emit_fallback(c); return; }   // no fastmem -> exact interp
+    if (update && ra == 0) { emit_fallback(c); return; }   // illegal form
+    emit_psq_ea_tmpa(c, update, indexed);
+    emit_flush_dirty_gprs_impl(c, g_ctx_ptr);
+    // cond = EA-in-MEM1(8B or 4B) AND (GQR[i] & ld_type|ld_scale) == 0
+    emit_fp_fastmem_cond(c, w ? 4u : 8u);
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_load(ppc_off::spr(912u + gqr_i));
+    c.b.op_i32_const((s32)0x3F070000);
+    c.b.op_i32_and();
+    c.b.op_i32_eqz();
+    c.b.op_i32_and();
+    emit_b11_op_if(c, 0x40);
+        // ps0 = f64(f32[EA])
+        c.b.op_i32_const((s32)g_ctx_ptr);
+        emit_fp_fastmem_addr(c, 0u);
+        c.b.op_i32_load(0);
+        emit_bswap32_tmpc(c);
+        c.b.op_f32_reinterpret_i32();
+        c.b.op_f64_promote_f32();
+        c.b.op_f64_store(ppc_off::ps0(rt));
+        // ps1 = W ? 1.0 : f64(f32[EA+4])
+        c.b.op_i32_const((s32)g_ctx_ptr);
+        if (w) {
+            c.b.op_f64_const(1.0);
+        } else {
+            emit_fp_fastmem_addr(c, 4u);
+            c.b.op_i32_load(0);
+            emit_bswap32_tmpc(c);
+            c.b.op_f32_reinterpret_i32();
+            c.b.op_f64_promote_f32();
+        }
+        c.b.op_f64_store(ppc_off::ps1(rt));
+    emit_b11_op_else(c);
+        // [psq-quant s16 2026-07-21] QUANTIZED s16 arm (ld_type==7, any scale) — the MusyX
+        // audio mixer's dominant format (measured 1.09M psq_l + 4.08M psq_st round-trips per
+        // 300s once AID was restored; GQR5/6). Dequant factor = 2^-s6 (s6 = 6-bit two's
+        // complement of ld_scale, matching dolphin's dequantize table: s<32 -> 2^-s,
+        // s>=32 -> 2^(64-s)) built EXACTLY via exponent bits (1055-((s+32)&63))<<52.
+        emit_fp_fastmem_cond(c, w ? 2u : 4u);
+        c.b.op_i32_const((s32)g_ctx_ptr);
+        c.b.op_i32_load(ppc_off::spr(912u + gqr_i));
+        c.b.op_local_tee(LOCAL_TMP_B);
+        c.b.op_i32_const(16); c.b.op_i32_shr_u();
+        c.b.op_i32_const(7); c.b.op_i32_and();
+        c.b.op_i32_const(7); c.b.op_i32_eq();
+        c.b.op_i32_and();
+        emit_b11_op_if(c, 0x40);
+            // TMP_F = dequant factor
+            c.b.op_i32_const(1055);
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const(24); c.b.op_i32_shr_u();
+            c.b.op_i32_const(63); c.b.op_i32_and();
+            c.b.op_i32_const(32); c.b.op_i32_add();
+            c.b.op_i32_const(63); c.b.op_i32_and();
+            c.b.op_i32_sub();
+            c.b.op_i64_extend_i32_u();
+            c.b.op_i64_const(52);
+            c.b.op_i64_shl();
+            c.b.op_f64_reinterpret_i64();
+            c.b.op_local_set(LOCAL_TMP_F);
+            // ps0 = (f64)(s16 BE @EA) * factor
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            emit_fp_fastmem_addr(c, 0u);
+            c.b.op_i32_load16_u(0);
+            c.b.op_local_tee(LOCAL_TMP_C);
+            c.b.op_i32_const(8); c.b.op_i32_shl();
+            c.b.op_i32_const(0xFF00); c.b.op_i32_and();
+            c.b.op_local_get(LOCAL_TMP_C);
+            c.b.op_i32_const(8); c.b.op_i32_shr_u();
+            c.b.op_i32_or();
+            c.b.op_i32_const(16); c.b.op_i32_shl();
+            c.b.op_i32_const(16); c.b.op_i32_shr_s();
+            c.b.op_f64_convert_i32_s();
+            c.b.op_local_get(LOCAL_TMP_F);
+            c.b.op_f64_mul();
+            c.b.op_f64_store(ppc_off::ps0(rt));
+            // ps1 = W ? 1.0 : (f64)(s16 BE @EA+2) * factor
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            if (w) {
+                c.b.op_f64_const(1.0);
+            } else {
+                emit_fp_fastmem_addr(c, 2u);
+                c.b.op_i32_load16_u(0);
+                c.b.op_local_tee(LOCAL_TMP_C);
+                c.b.op_i32_const(8); c.b.op_i32_shl();
+                c.b.op_i32_const(0xFF00); c.b.op_i32_and();
+                c.b.op_local_get(LOCAL_TMP_C);
+                c.b.op_i32_const(8); c.b.op_i32_shr_u();
+                c.b.op_i32_or();
+                c.b.op_i32_const(16); c.b.op_i32_shl();
+                c.b.op_i32_const(16); c.b.op_i32_shr_s();
+                c.b.op_f64_convert_i32_s();
+                c.b.op_local_get(LOCAL_TMP_F);
+                c.b.op_f64_mul();
+            }
+            c.b.op_f64_store(ppc_off::ps1(rt));
+        emit_b11_op_else(c);
+            emit_fallback(c);
+        emit_b11_op_end(c);
+    emit_b11_op_end(c);
+    if (update) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_B);
+    }
+}
+static void emit_psq_st_common(EmitCtx& c, bool update, bool indexed) {
+    // [bisect 2026-07-21] psq re-enabled; ps ARITH still gated.
+    const u32 rs = RT(c.inst), ra = RA(c.inst);
+    const u32 w = indexed ? ((c.inst >> 10) & 1u) : ((c.inst >> 15) & 1u);
+    const u32 gqr_i = indexed ? ((c.inst >> 7) & 7u) : ((c.inst >> 12) & 7u);
+    if (g_mem1_base == 0u) { emit_fallback(c); return; }
+    if (update && ra == 0) { emit_fallback(c); return; }
+    emit_psq_ea_tmpa(c, update, indexed);
+    emit_flush_dirty_gprs_impl(c, g_ctx_ptr);
+    // cond = EA-in-MEM1 AND (GQR[i] & st_type|st_scale) == 0. Non-MEM1 (WGP 0xCC008000
+    // psq_st!) stays on the interp arm: dolphin WriteQuantized -> correct gather routing.
+    emit_fp_fastmem_cond(c, w ? 4u : 8u);
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_load(ppc_off::spr(912u + gqr_i));
+    c.b.op_i32_const((s32)0x00003F07);
+    c.b.op_i32_and();
+    c.b.op_i32_eqz();
+    c.b.op_i32_and();
+    emit_b11_op_if(c, 0x40);
+        // f32[EA] = demote(ps0)
+        emit_fp_fastmem_addr(c, 0u);
+        c.b.op_i32_const((s32)g_ctx_ptr);
+        c.b.op_f64_load(ppc_off::ps0(rs));
+        c.b.op_f32_demote_f64();
+        c.b.op_i32_reinterpret_f32();
+        emit_bswap32_tmpc(c);
+        c.b.op_i32_store(0);
+        if (!w) {
+            // f32[EA+4] = demote(ps1)
+            emit_fp_fastmem_addr(c, 4u);
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            c.b.op_f64_load(ppc_off::ps1(rs));
+            c.b.op_f32_demote_f64();
+            c.b.op_i32_reinterpret_f32();
+            emit_bswap32_tmpc(c);
+            c.b.op_i32_store(0);
+        }
+    emit_b11_op_else(c);
+        // [psq-quant s16 2026-07-21] QUANTIZED s16 STORE arm (st_type==7, any scale) — 4.08M
+        // round-trips/300s from the MusyX mixer. Quant factor = 2^s6 (exponent 991+((s+32)&63));
+        // value*factor is CLAMPED to [-32768,32767] then truncated (dolphin ScaleAndClamp
+        // semantics; f64.max/min then trunc_sat — NaN saturates to 0, no trap), stored BE via
+        // the MASKED halfword swap.
+        emit_fp_fastmem_cond(c, w ? 2u : 4u);
+        c.b.op_i32_const((s32)g_ctx_ptr);
+        c.b.op_i32_load(ppc_off::spr(912u + gqr_i));
+        c.b.op_local_tee(LOCAL_TMP_B);
+        c.b.op_i32_const(7); c.b.op_i32_and();
+        c.b.op_i32_const(7); c.b.op_i32_eq();
+        c.b.op_i32_and();
+        emit_b11_op_if(c, 0x40);
+            // TMP_F = quant factor 2^s6, s = (gqr>>8)&0x3F
+            c.b.op_i32_const(991);
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const(8); c.b.op_i32_shr_u();
+            c.b.op_i32_const(63); c.b.op_i32_and();
+            c.b.op_i32_const(32); c.b.op_i32_add();
+            c.b.op_i32_const(63); c.b.op_i32_and();
+            c.b.op_i32_add();
+            c.b.op_i64_extend_i32_u();
+            c.b.op_i64_const(52);
+            c.b.op_i64_shl();
+            c.b.op_f64_reinterpret_i64();
+            c.b.op_local_set(LOCAL_TMP_F);
+            // s16[EA] = clamp(ps0 * factor)
+            emit_fp_fastmem_addr(c, 0u);
+            c.b.op_i32_const((s32)g_ctx_ptr);
+            c.b.op_f64_load(ppc_off::ps0(rs));
+            c.b.op_local_get(LOCAL_TMP_F);
+            c.b.op_f64_mul();
+            c.b.op_f64_const(-32768.0);
+            c.b.op_f64_max();
+            c.b.op_f64_const(32767.0);
+            c.b.op_f64_min();
+            c.b.op_i32_trunc_sat_f64_s();
+            c.b.op_local_tee(LOCAL_TMP_C);
+            c.b.op_i32_const(8); c.b.op_i32_shr_u();
+            c.b.op_i32_const(0xFF); c.b.op_i32_and();
+            c.b.op_local_get(LOCAL_TMP_C);
+            c.b.op_i32_const(8); c.b.op_i32_shl();
+            c.b.op_i32_or();
+            c.b.op_i32_const(0xFFFF); c.b.op_i32_and();
+            c.b.op_i32_store16(0);
+            if (!w) {
+                // s16[EA+2] = clamp(ps1 * factor)
+                emit_fp_fastmem_addr(c, 2u);
+                c.b.op_i32_const((s32)g_ctx_ptr);
+                c.b.op_f64_load(ppc_off::ps1(rs));
+                c.b.op_local_get(LOCAL_TMP_F);
+                c.b.op_f64_mul();
+                c.b.op_f64_const(-32768.0);
+                c.b.op_f64_max();
+                c.b.op_f64_const(32767.0);
+                c.b.op_f64_min();
+                c.b.op_i32_trunc_sat_f64_s();
+                c.b.op_local_tee(LOCAL_TMP_C);
+                c.b.op_i32_const(8); c.b.op_i32_shr_u();
+                c.b.op_i32_const(0xFF); c.b.op_i32_and();
+                c.b.op_local_get(LOCAL_TMP_C);
+                c.b.op_i32_const(8); c.b.op_i32_shl();
+                c.b.op_i32_or();
+                c.b.op_i32_const(0xFFFF); c.b.op_i32_and();
+                c.b.op_i32_store16(0);
+            }
+        emit_b11_op_else(c);
+            // [psq-quant u8 2026-07-21] u8 STORE arm (st_type==4) — MusyX GQR6=0x3D043D04
+            // (u8, scale 61 = s6 -3): the 5.06M-round-trip class the s16 arm missed.
+            emit_fp_fastmem_cond(c, w ? 1u : 2u);
+            c.b.op_local_get(LOCAL_TMP_B);
+            c.b.op_i32_const(7); c.b.op_i32_and();
+            c.b.op_i32_const(4); c.b.op_i32_eq();
+            c.b.op_i32_and();
+            emit_b11_op_if(c, 0x40);
+                c.b.op_i32_const(991);
+                c.b.op_local_get(LOCAL_TMP_B);
+                c.b.op_i32_const(8); c.b.op_i32_shr_u();
+                c.b.op_i32_const(63); c.b.op_i32_and();
+                c.b.op_i32_const(32); c.b.op_i32_add();
+                c.b.op_i32_const(63); c.b.op_i32_and();
+                c.b.op_i32_add();
+                c.b.op_i64_extend_i32_u();
+                c.b.op_i64_const(52);
+                c.b.op_i64_shl();
+                c.b.op_f64_reinterpret_i64();
+                c.b.op_local_set(LOCAL_TMP_F);
+                // u8[EA] = clamp(ps0 * factor, 0, 255)
+                emit_fp_fastmem_addr(c, 0u);
+                c.b.op_i32_const((s32)g_ctx_ptr);
+                c.b.op_f64_load(ppc_off::ps0(rs));
+                c.b.op_local_get(LOCAL_TMP_F);
+                c.b.op_f64_mul();
+                c.b.op_f64_const(0.0);
+                c.b.op_f64_max();
+                c.b.op_f64_const(255.0);
+                c.b.op_f64_min();
+                c.b.op_i32_trunc_sat_f64_s();
+                c.b.op_i32_store8(0);
+                if (!w) {
+                    // u8[EA+1] = clamp(ps1 * factor, 0, 255)
+                    emit_fp_fastmem_addr(c, 1u);
+                    c.b.op_i32_const((s32)g_ctx_ptr);
+                    c.b.op_f64_load(ppc_off::ps1(rs));
+                    c.b.op_local_get(LOCAL_TMP_F);
+                    c.b.op_f64_mul();
+                    c.b.op_f64_const(0.0);
+                    c.b.op_f64_max();
+                    c.b.op_f64_const(255.0);
+                    c.b.op_f64_min();
+                    c.b.op_i32_trunc_sat_f64_s();
+                    c.b.op_i32_store8(0);
+                }
+            emit_b11_op_else(c);
+                emit_fallback(c);
+            emit_b11_op_end(c);
+        emit_b11_op_end(c);
+    emit_b11_op_end(c);
+    if (update) {
+        c.b.op_local_get(LOCAL_TMP_A);
+        emit_gpr_set_impl(c, ra, g_ctx_ptr, LOCAL_TMP_B);
+    }
+}
+static void emit_psq_l_impl(EmitCtx& c)    { emit_psq_l_common(c, false, false); }
+static void emit_psq_lu_impl(EmitCtx& c)   { emit_psq_l_common(c, true,  false); }
+static void emit_psq_st_impl(EmitCtx& c)   { emit_psq_st_common(c, false, false); }
+static void emit_psq_stu_impl(EmitCtx& c)  { emit_psq_st_common(c, true,  false); }
+static void emit_psq_lx_impl(EmitCtx& c)   { emit_psq_l_common(c, false, true); }
+static void emit_psq_lux_impl(EmitCtx& c)  { emit_psq_l_common(c, true,  true); }
+static void emit_psq_stx_impl(EmitCtx& c)  { emit_psq_st_common(c, false, true); }
+static void emit_psq_stux_impl(EmitCtx& c) { emit_psq_st_common(c, true,  true); }
+
+// [ps arith native emit 2026-07-20] op4 paired-single arithmetic — the next 55% of cmd9
+// round-trips after psq (interp-CLASS profiler: ps_muls0/madds0/madds1/mul/sum0/madd/neg/
+// merge00 dominate). Lanewise f64 ops, results rounded to single via demote+promote —
+// SAME exactness bar as the op59 emitters (fmulsx etc.: no Force25Bit; MakeNBT byte-
+// exactness vs native validated that convention offline). Alias-safe two-store pattern:
+// lane0 result -> TMP_F (f64 scratch), lane1 computed ON STACK with all source reads
+// BEFORE any store (frD may alias frA/frB/frC), store ps1 then ps0. Rc=1 (CR1 update)
+// and the estimate ops ps_res/ps_rsqrte (dolphin table-approx — exact 1/sqrt would
+// DIVERGE from the native oracle) stay on the interp fallback.
+static void emit_fp_load_ps1(EmitCtx& c, u32 fr) {
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_f64_load(ppc_off::ps1(fr));
+}
+// Call with the lane0 result on stack: stash it, open the ps1 store (ctx pushed).
+static void emit_ps_begin_lane1(EmitCtx& c) {
+    c.b.op_local_set(LOCAL_TMP_F);
+    c.b.op_i32_const((s32)g_ctx_ptr);
+}
+// Call with the lane1 result on stack: store ps1, then ps0 from the stash.
+static void emit_ps_finish(EmitCtx& c, u32 fd) {
+    c.b.op_f64_store(ppc_off::ps1(fd));
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_local_get(LOCAL_TMP_F);
+    c.b.op_f64_store(ppc_off::ps0(fd));
+}
+// Lanewise A-form binary on (A op B): ps_add/ps_sub/ps_div.
+static void emit_ps_ab_lanewise(EmitCtx& c, void (WasmModuleBuilder::*op)()) {
+    if (ps_native_off()) { emit_fallback(c); return; }
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fa); emit_fp_load_ps0(c, fb); (c.b.*op)(); emit_fp_round_to_single(c);
+    emit_ps_begin_lane1(c);
+    emit_fp_load_ps1(c, fa); emit_fp_load_ps1(c, fb); (c.b.*op)(); emit_fp_round_to_single(c);
+    emit_ps_finish(c, fd);
+}
+static void emit_ps_addx_impl(EmitCtx& c) {
+    if (c.inst & 1u) { emit_fallback(c); return; }
+    emit_ps_ab_lanewise(c, &WasmModuleBuilder::op_f64_add);
+}
+static void emit_ps_subx_impl(EmitCtx& c) {
+    if (c.inst & 1u) { emit_fallback(c); return; }
+    emit_ps_ab_lanewise(c, &WasmModuleBuilder::op_f64_sub);
+}
+static void emit_ps_divx_impl(EmitCtx& c) {
+    if (c.inst & 1u) { emit_fallback(c); return; }
+    emit_ps_ab_lanewise(c, &WasmModuleBuilder::op_f64_div);
+}
+// ps_mul: lanewise A*C.
+static void emit_ps_mulx_impl(EmitCtx& c) {
+    if (c.inst & 1u) { emit_fallback(c); return; }
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fa); emit_fp_load_ps0(c, fc); c.b.op_f64_mul(); emit_fp_round_to_single(c);
+    emit_ps_begin_lane1(c);
+    emit_fp_load_ps1(c, fa); emit_fp_load_ps1(c, fc); c.b.op_f64_mul(); emit_fp_round_to_single(c);
+    emit_ps_finish(c, fd);
+}
+// ps_muls0/1: both lanes multiplied by ONE lane of C (0 or 1).
+static void emit_ps_muls_common(EmitCtx& c, bool c_lane1) {
+    if (ps_native_off()) { emit_fallback(c); return; }
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fa);
+    if (c_lane1) emit_fp_load_ps1(c, fc); else emit_fp_load_ps0(c, fc);
+    c.b.op_f64_mul(); emit_fp_round_to_single(c);
+    emit_ps_begin_lane1(c);
+    emit_fp_load_ps1(c, fa);
+    if (c_lane1) emit_fp_load_ps1(c, fc); else emit_fp_load_ps0(c, fc);
+    c.b.op_f64_mul(); emit_fp_round_to_single(c);
+    emit_ps_finish(c, fd);
+}
+static void emit_ps_muls0x_impl(EmitCtx& c) { if (ps_native_off() || (c.inst & 1u)) { emit_fallback(c); return; } emit_ps_muls_common(c, false); }
+static void emit_ps_muls1x_impl(EmitCtx& c) { if (ps_native_off() || (c.inst & 1u)) { emit_fallback(c); return; } emit_ps_muls_common(c, true); }
+// ps_madd family: lanewise A*C (+/-) B, optionally negated. neg-after-round is exact
+// (f32 rounding is sign-symmetric).
+static void emit_ps_madd_common(EmitCtx& c, bool sub_b, bool negate) {
+    if (ps_native_off()) { emit_fallback(c); return; }
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fb = RB(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fa); emit_fp_load_ps0(c, fc); c.b.op_f64_mul();
+    emit_fp_load_ps0(c, fb); if (sub_b) c.b.op_f64_sub(); else c.b.op_f64_add();
+    if (negate) c.b.op_f64_neg();
+    emit_fp_round_to_single(c);
+    emit_ps_begin_lane1(c);
+    emit_fp_load_ps1(c, fa); emit_fp_load_ps1(c, fc); c.b.op_f64_mul();
+    emit_fp_load_ps1(c, fb); if (sub_b) c.b.op_f64_sub(); else c.b.op_f64_add();
+    if (negate) c.b.op_f64_neg();
+    emit_fp_round_to_single(c);
+    emit_ps_finish(c, fd);
+}
+static void emit_ps_maddx_impl(EmitCtx& c)  { if (c.inst & 1u) { emit_fallback(c); return; } emit_ps_madd_common(c, false, false); }
+static void emit_ps_msubx_impl(EmitCtx& c)  { if (c.inst & 1u) { emit_fallback(c); return; } emit_ps_madd_common(c, true,  false); }
+static void emit_ps_nmaddx_impl(EmitCtx& c) { if (ps_native_off() || (c.inst & 1u)) { emit_fallback(c); return; } emit_ps_madd_common(c, false, true); }
+static void emit_ps_nmsubx_impl(EmitCtx& c) { if (ps_native_off() || (c.inst & 1u)) { emit_fallback(c); return; } emit_ps_madd_common(c, true,  true); }
+// ps_madds0/1: A*C.lane (+B lanewise).
+static void emit_ps_madds_common(EmitCtx& c, bool c_lane1) {
+    if (ps_native_off()) { emit_fallback(c); return; }
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fb = RB(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fa);
+    if (c_lane1) emit_fp_load_ps1(c, fc); else emit_fp_load_ps0(c, fc);
+    c.b.op_f64_mul(); emit_fp_load_ps0(c, fb); c.b.op_f64_add(); emit_fp_round_to_single(c);
+    emit_ps_begin_lane1(c);
+    emit_fp_load_ps1(c, fa);
+    if (c_lane1) emit_fp_load_ps1(c, fc); else emit_fp_load_ps0(c, fc);
+    c.b.op_f64_mul(); emit_fp_load_ps1(c, fb); c.b.op_f64_add(); emit_fp_round_to_single(c);
+    emit_ps_finish(c, fd);
+}
+static void emit_ps_madds0x_impl(EmitCtx& c) { if (ps_native_off() || (c.inst & 1u)) { emit_fallback(c); return; } emit_ps_madds_common(c, false); }
+static void emit_ps_madds1x_impl(EmitCtx& c) { if (ps_native_off() || (c.inst & 1u)) { emit_fallback(c); return; } emit_ps_madds_common(c, true); }
+// ps_sum0: ps0=single(a0+b1), ps1=single(c1). ps_sum1: ps0=single(c0), ps1=single(a0+b1).
+static void emit_ps_sum0x_impl(EmitCtx& c) {
+    if (c.inst & 1u) { emit_fallback(c); return; }
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fb = RB(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fa); emit_fp_load_ps1(c, fb); c.b.op_f64_add(); emit_fp_round_to_single(c);
+    emit_ps_begin_lane1(c);
+    emit_fp_load_ps1(c, fc); emit_fp_round_to_single(c);
+    emit_ps_finish(c, fd);
+}
+static void emit_ps_sum1x_impl(EmitCtx& c) {
+    if (c.inst & 1u) { emit_fallback(c); return; }
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fb = RB(c.inst), fc = FC(c.inst);
+    emit_fp_load_ps0(c, fc); emit_fp_round_to_single(c);           // lane0 = c0
+    emit_ps_begin_lane1(c);
+    emit_fp_load_ps0(c, fa); emit_fp_load_ps1(c, fb); c.b.op_f64_add(); emit_fp_round_to_single(c);
+    emit_ps_finish(c, fd);
+}
+// X-form moves (no rounding — operands already single; dolphin does raw copies).
+static void emit_ps_mrx_impl(EmitCtx& c) {
+    if (c.inst & 1u) { emit_fallback(c); return; }
+    const u32 fd = RT(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fb);
+    emit_ps_begin_lane1(c);
+    emit_fp_load_ps1(c, fb);
+    emit_ps_finish(c, fd);
+}
+static void emit_ps_negx_impl(EmitCtx& c) {
+    if (c.inst & 1u) { emit_fallback(c); return; }
+    const u32 fd = RT(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fb); c.b.op_f64_neg();
+    emit_ps_begin_lane1(c);
+    emit_fp_load_ps1(c, fb); c.b.op_f64_neg();
+    emit_ps_finish(c, fd);
+}
+static void emit_ps_absx_impl(EmitCtx& c) {
+    if (c.inst & 1u) { emit_fallback(c); return; }
+    const u32 fd = RT(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fb); c.b.op_f64_abs();
+    emit_ps_begin_lane1(c);
+    emit_fp_load_ps1(c, fb); c.b.op_f64_abs();
+    emit_ps_finish(c, fd);
+}
+static void emit_ps_nabsx_impl(EmitCtx& c) {
+    if (c.inst & 1u) { emit_fallback(c); return; }
+    const u32 fd = RT(c.inst), fb = RB(c.inst);
+    emit_fp_load_ps0(c, fb); c.b.op_f64_abs(); c.b.op_f64_neg();
+    emit_ps_begin_lane1(c);
+    emit_fp_load_ps1(c, fb); c.b.op_f64_abs(); c.b.op_f64_neg();
+    emit_ps_finish(c, fd);
+}
+// ps_mergeXY: ps0 = a.laneX, ps1 = b.laneY.
+static void emit_ps_merge_common(EmitCtx& c, bool a_lane1, bool b_lane1) {
+    if (ps_native_off()) { emit_fallback(c); return; }
+    const u32 fd = RT(c.inst), fa = RA(c.inst), fb = RB(c.inst);
+    if (a_lane1) emit_fp_load_ps1(c, fa); else emit_fp_load_ps0(c, fa);
+    emit_ps_begin_lane1(c);
+    if (b_lane1) emit_fp_load_ps1(c, fb); else emit_fp_load_ps0(c, fb);
+    emit_ps_finish(c, fd);
+}
+static void emit_ps_merge00x_impl(EmitCtx& c) { if (ps_native_off() || (c.inst & 1u)) { emit_fallback(c); return; } emit_ps_merge_common(c, false, false); }
+static void emit_ps_merge01x_impl(EmitCtx& c) { if (ps_native_off() || (c.inst & 1u)) { emit_fallback(c); return; } emit_ps_merge_common(c, false, true); }
+static void emit_ps_merge10x_impl(EmitCtx& c) { if (ps_native_off() || (c.inst & 1u)) { emit_fallback(c); return; } emit_ps_merge_common(c, true,  false); }
+static void emit_ps_merge11x_impl(EmitCtx& c) { if (ps_native_off() || (c.inst & 1u)) { emit_fallback(c); return; } emit_ps_merge_common(c, true,  true); }
+
+// [cr-logical native emit 2026-07-20] op19 CR-logical family — cror alone measured 262,653 of
+// 365K cmd9 round-trips (72%) after the psq/ps-arith emits landed (fcmp+cror compare idioms).
+// Bit extraction/re-encoding uses EXACTLY the canonical internal-CR encoding the dual-compute-
+// validated JS mfcr/mtcrf fastpaths use (ppc_worker.js: SO=hi bit27, LT=hi bit30, EQ=lo==0,
+// GT=bit63-clear AND cr!=0; re-encode hi=marker1|SO<<27|LT<<30|(!GT)<<31, lo=EQ?0:1 — the
+// same nibble canonicalization mtcrf performs, 0-mismatch across 34K validated ops). The
+// write is a FIELD canonicalization: exact result values in cr_val are replaced by flag-
+// equivalent canonical forms, which is precisely mtcrf's contract.
+// Push 0/1 for PPC CR bit index crb (0-31; in-field 0=LT,1=GT,2=EQ,3=SO).
+static void emit_cr_read_bit(EmitCtx& c, u32 crb) {
+    const u32 f = crb >> 2, w = crb & 3;
+    switch (w) {
+      case 0:   // LT = hi bit30
+        c.b.op_i32_const((s32)g_ctx_ptr); c.b.op_i32_load(ppc_off::cr_field(f) + 4);
+        c.b.op_i32_const(30); c.b.op_i32_shr_u(); c.b.op_i32_const(1); c.b.op_i32_and();
+        break;
+      case 1:   // GT = bit63 clear AND cr_val != 0
+        c.b.op_i32_const((s32)g_ctx_ptr); c.b.op_i32_load(ppc_off::cr_field(f) + 4);
+        c.b.op_i32_const((s32)0x80000000); c.b.op_i32_and(); c.b.op_i32_eqz();
+        c.b.op_i32_const((s32)g_ctx_ptr); c.b.op_i32_load(ppc_off::cr_field(f) + 4);
+        c.b.op_i32_const((s32)g_ctx_ptr); c.b.op_i32_load(ppc_off::cr_field(f));
+        c.b.op_i32_or(); c.b.op_i32_eqz(); c.b.op_i32_eqz();
+        c.b.op_i32_and();
+        break;
+      case 2:   // EQ = lo == 0
+        c.b.op_i32_const((s32)g_ctx_ptr); c.b.op_i32_load(ppc_off::cr_field(f));
+        c.b.op_i32_eqz();
+        break;
+      default:  // SO = hi bit27
+        c.b.op_i32_const((s32)g_ctx_ptr); c.b.op_i32_load(ppc_off::cr_field(f) + 4);
+        c.b.op_i32_const(27); c.b.op_i32_shr_u(); c.b.op_i32_const(1); c.b.op_i32_and();
+        break;
+    }
+}
+static void emit_crlogic_common(EmitCtx& c, u32 xo) {
+    const u32 bd = RT(c.inst), ba = RA(c.inst), bb = RB(c.inst);
+    // v = f(bitA, bitB) -> TMP_A
+    emit_cr_read_bit(c, ba);
+    emit_cr_read_bit(c, bb);
+    switch (xo) {
+      case 257: c.b.op_i32_and(); break;                                          // crand
+      case 129: c.b.op_i32_const(1); c.b.op_i32_xor(); c.b.op_i32_and(); break;   // crandc a&~b
+      case 289: c.b.op_i32_xor(); c.b.op_i32_const(1); c.b.op_i32_xor(); break;   // creqv
+      case 225: c.b.op_i32_and(); c.b.op_i32_const(1); c.b.op_i32_xor(); break;   // crnand
+      case 33:  c.b.op_i32_or();  c.b.op_i32_const(1); c.b.op_i32_xor(); break;   // crnor
+      case 449: c.b.op_i32_or(); break;                                           // cror
+      case 417: c.b.op_i32_const(1); c.b.op_i32_xor(); c.b.op_i32_or(); break;    // crorc a|~b
+      default:  c.b.op_i32_xor(); break;                                          // 193 crxor
+    }
+    c.b.op_local_set(LOCAL_TMP_A);
+    // nib(field of bd) -> stack (b0=SO, b1=EQ, b2=GT, b3=LT — the JS-fastpath nib order)
+    const u32 fd = bd >> 2, wd = bd & 3;
+    emit_cr_read_bit(c, (fd << 2) | 3u);                        // SO
+    emit_cr_read_bit(c, (fd << 2) | 2u);                        // EQ
+    c.b.op_i32_const(1); c.b.op_i32_shl(); c.b.op_i32_or();
+    emit_cr_read_bit(c, (fd << 2) | 1u);                        // GT
+    c.b.op_i32_const(2); c.b.op_i32_shl(); c.b.op_i32_or();
+    emit_cr_read_bit(c, (fd << 2) | 0u);                        // LT
+    c.b.op_i32_const(3); c.b.op_i32_shl(); c.b.op_i32_or();
+    // override target bit (nib index = 3 - in-field index) with TMP_A -> TMP_B
+    const u32 nb = 3u - wd;
+    c.b.op_i32_const((s32)~(1u << nb)); c.b.op_i32_and();
+    c.b.op_local_get(LOCAL_TMP_A);
+    if (nb != 0u) { c.b.op_i32_const((s32)nb); c.b.op_i32_shl(); }
+    c.b.op_i32_or();
+    c.b.op_local_set(LOCAL_TMP_B);
+    // lo = EQ ? 0 : 1  ( = ((nib>>1)&1)^1 )
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_local_get(LOCAL_TMP_B); c.b.op_i32_const(1); c.b.op_i32_shr_u();
+    c.b.op_i32_const(1); c.b.op_i32_and(); c.b.op_i32_const(1); c.b.op_i32_xor();
+    c.b.op_i32_store(ppc_off::cr_field(fd));
+    // hi = SO<<27 | LT<<30 | (!GT)<<31 | marker(1)
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_local_get(LOCAL_TMP_B); c.b.op_i32_const(1); c.b.op_i32_and();
+    c.b.op_i32_const(27); c.b.op_i32_shl();
+    c.b.op_local_get(LOCAL_TMP_B); c.b.op_i32_const(3); c.b.op_i32_shr_u();
+    c.b.op_i32_const(1); c.b.op_i32_and();
+    c.b.op_i32_const(30); c.b.op_i32_shl(); c.b.op_i32_or();
+    c.b.op_local_get(LOCAL_TMP_B); c.b.op_i32_const(2); c.b.op_i32_shr_u();
+    c.b.op_i32_const(1); c.b.op_i32_and(); c.b.op_i32_const(1); c.b.op_i32_xor();
+    c.b.op_i32_const(31); c.b.op_i32_shl(); c.b.op_i32_or();
+    c.b.op_i32_const(1); c.b.op_i32_or();
+    c.b.op_i32_store(ppc_off::cr_field(fd) + 4);
+}
+static void emit_crand_impl(EmitCtx& c)  { emit_crlogic_common(c, 257); }
+static void emit_crandc_impl(EmitCtx& c) { emit_crlogic_common(c, 129); }
+static void emit_creqv_impl(EmitCtx& c)  { emit_crlogic_common(c, 289); }
+static void emit_crnand_impl(EmitCtx& c) { emit_crlogic_common(c, 225); }
+static void emit_crnor_impl(EmitCtx& c)  { emit_crlogic_common(c, 33); }
+static void emit_cror_impl(EmitCtx& c)   { emit_crlogic_common(c, 449); }
+static void emit_crorc_impl(EmitCtx& c)  { emit_crlogic_common(c, 417); }
+static void emit_crxor_impl(EmitCtx& c)  { emit_crlogic_common(c, 193); }
+// mcrf crfD, crfS — exact u64 field copy (no canonicalization needed).
+static void emit_mcrf_impl(EmitCtx& c) {
+    const u32 fd = (c.inst >> 23) & 7u, fs = (c.inst >> 18) & 7u;
+    if (fd == fs) return;   // no-op
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_const((s32)g_ctx_ptr); c.b.op_i32_load(ppc_off::cr_field(fs));
+    c.b.op_i32_store(ppc_off::cr_field(fd));
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_const((s32)g_ctx_ptr); c.b.op_i32_load(ppc_off::cr_field(fs) + 4);
+    c.b.op_i32_store(ppc_off::cr_field(fd) + 4);
+}
+
+// [fpscr storage emit 2026-07-20] mffs/mtfsf — 27K round-trips/120s. STORAGE-ONLY semantics:
+// dolphin's FPSCRUpdated host-rounding side effect never influenced OUR wasm arithmetic
+// (always round-nearest) even on the interp path, so a ppc_state.FPSCR (0x2E4) load/store
+// is behavior-equivalent for worker execution. Dolphin mffsx (Interpreter_SystemRegisters
+// .cpp:638): ps0 raw u64 = 0xFFF8000000000000 | FPSCR; ps1 untouched. mtfsfx (:81-97):
+// mask m from FM bit i -> nibble i*4 (low-first), fpscr = (fpscr & ~m) | (frB.ps0 low32 & m).
+static void emit_mffs_impl(EmitCtx& c) {
+    if (c.inst & 1u) { emit_fallback(c); return; }   // Rc=1 -> CR1
+    const u32 fd = RT(c.inst);
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_const((s32)g_ctx_ptr); c.b.op_i32_load(ppc_off::FPSCR);
+    c.b.op_i32_store(ppc_off::ps0(fd));               // low word = FPSCR
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_const((s32)0xFFF80000);
+    c.b.op_i32_store(ppc_off::ps0(fd) + 4);           // high word = 0xFFF80000
+}
+static void emit_mtfsf_impl(EmitCtx& c) {
+    if (c.inst & 1u) { emit_fallback(c); return; }
+    const u32 fb = RB(c.inst);
+    const u32 fm = (c.inst >> 17) & 0xFFu;
+    u32 m = 0;
+    for (u32 i = 0; i < 8; i++)
+        if (fm & (1u << i)) m |= (0xFu << (i * 4));
+    c.b.op_i32_const((s32)g_ctx_ptr);
+    c.b.op_i32_const((s32)g_ctx_ptr); c.b.op_i32_load(ppc_off::FPSCR);
+    c.b.op_i32_const((s32)~m); c.b.op_i32_and();
+    c.b.op_i32_const((s32)g_ctx_ptr); c.b.op_i32_load(ppc_off::ps0(fb));   // frB ps0 low 32
+    c.b.op_i32_const((s32)m); c.b.op_i32_and();
+    c.b.op_i32_or();
+    c.b.op_i32_store(ppc_off::FPSCR);
+}
+
 // Sentinels used in primary[64] to indicate "look up sub-table".
 // We give them distinct dummy function bodies that should never be called.
 static void __sentinel_table4 (EmitCtx&) {}
@@ -4157,6 +4815,11 @@ constexpr OpEntry primary_entries[] = {
     {55, &emit_stfdu_impl},
     // 17=sc — fallback; explicit so we end the block
     {17, &emit_sc_impl},
+    // Paired-single quantized load/store — 88% of dual-core interp round-trips (2026-07-20).
+    {56, &emit_psq_l_impl},
+    {57, &emit_psq_lu_impl},
+    {60, &emit_psq_st_impl},
+    {61, &emit_psq_stu_impl},
 };
 
 constexpr OpEntry table19_entries[] = {
@@ -4164,7 +4827,16 @@ constexpr OpEntry table19_entries[] = {
     { 16, &emit_bclrx_impl},
     { 50, &emit_rfi_impl},
     {150, &emit_nop_impl},   // isync — context-sync, no WASM equivalent needed
-    // crand/crandc/creqv/crnand/crnor/cror/crorc/crxor/mcrf — fallback
+    // CR-logical family — native since 2026-07-20 (cror alone was 72% of cmd9 round-trips).
+    {  0, &emit_mcrf_impl},
+    { 33, &emit_crnor_impl},
+    {129, &emit_crandc_impl},
+    {193, &emit_crxor_impl},
+    {225, &emit_crnand_impl},
+    {257, &emit_crand_impl},
+    {289, &emit_creqv_impl},
+    {417, &emit_crorc_impl},
+    {449, &emit_cror_impl},
 };
 
 constexpr OpEntry table31_entries[] = {
@@ -4263,6 +4935,37 @@ constexpr OpEntry table31_entries[] = {
 };
 
 // op59 sub-ops (single-precision FP arith). Dispatch via SUBOP5 (bits 26-30).
+// op4 paired-single: A-form arith keyed by SUBOP5 (mirrors table63's arith/other split).
+// ps_res(24)/ps_rsqrte(26) intentionally ABSENT (dolphin table-approx estimates — exact wasm
+// 1/sqrt would diverge from the native oracle); they stay on the interp fallback.
+constexpr OpEntry table4_arith_entries[] = {
+    {10, &emit_ps_sum0x_impl},
+    {11, &emit_ps_sum1x_impl},
+    {12, &emit_ps_muls0x_impl},
+    {13, &emit_ps_muls1x_impl},
+    {14, &emit_ps_madds0x_impl},
+    {15, &emit_ps_madds1x_impl},
+    {18, &emit_ps_divx_impl},
+    {20, &emit_ps_subx_impl},
+    {21, &emit_ps_addx_impl},
+    {25, &emit_ps_mulx_impl},
+    {28, &emit_ps_msubx_impl},
+    {29, &emit_ps_maddx_impl},
+    {30, &emit_ps_nmsubx_impl},
+    {31, &emit_ps_nmaddx_impl},
+};
+// op4 X-form (10-bit XO): moves + merges. ps_cmp* / dcbz_l absent -> fallback.
+constexpr OpEntry table4_other_entries[] = {
+    { 40, &emit_ps_negx_impl},
+    { 72, &emit_ps_mrx_impl},
+    {136, &emit_ps_nabsx_impl},
+    {264, &emit_ps_absx_impl},
+    {528, &emit_ps_merge00x_impl},
+    {560, &emit_ps_merge01x_impl},
+    {592, &emit_ps_merge10x_impl},
+    {624, &emit_ps_merge11x_impl},
+};
+
 constexpr OpEntry table59_entries[] = {
     {18, &emit_fdivsx_impl},
     {20, &emit_fsubsx_impl},
@@ -4295,6 +4998,8 @@ constexpr OpEntry table63_other_entries[] = {
     { 14, &emit_fctiwx_impl},  // FP → i32 (round-to-nearest, FPSCR.RN=0 assumed)
     { 15, &emit_fctiwzx_impl}, // FP → i32 (round-toward-zero)
     { 32, &emit_fcmpu_impl},   // FP compare ordered (same impl — FPSCR diffs skipped)
+    {583, &emit_mffs_impl},    // FPSCR read (storage semantics — 2026-07-20)
+    {711, &emit_mtfsf_impl},   // FPSCR masked write (storage semantics — 2026-07-20)
     { 40, &emit_fnegx_impl},   // -rB
     { 72, &emit_fmrx_impl},    // rD = rB (move)
     {136, &emit_fnabsx_impl},  // -|rB|
@@ -4316,7 +5021,24 @@ EmitFn gekko_lookup(u32 inst) {
                             sizeof(primary_entries)/sizeof(primary_entries[0]),
                             op);
     if (!p) return nullptr;
-    if (p == S_T4)  return table_lookup(nullptr, 0, SUBOP10(inst)); // not yet populated
+    if (p == S_T4) {
+        // psq_lx/stx/lux/stux carry a 6-bit XO at bits 25-30 with W/I as OPERANDS in
+        // bits 21-24, so SUBOP10 keying would vary with W/I — route them by SUBOP6
+        // first. No collision: every real A-form/X-form op4's (inst>>1)&0x3F is
+        // outside {6,7,38,39} (verified against the full Gekko op4 map 2026-07-20).
+        const u32 xo6 = (inst >> 1) & 0x3Fu;
+        if (xo6 == 6u)  return &emit_psq_lx_impl;
+        if (xo6 == 7u)  return &emit_psq_stx_impl;
+        if (xo6 == 38u) return &emit_psq_lux_impl;
+        if (xo6 == 39u) return &emit_psq_stux_impl;
+        EmitFn f = table_lookup(table4_arith_entries,
+                                sizeof(table4_arith_entries)/sizeof(table4_arith_entries[0]),
+                                SUBOP5(inst));
+        if (f) return f;
+        return table_lookup(table4_other_entries,
+                            sizeof(table4_other_entries)/sizeof(table4_other_entries[0]),
+                            SUBOP10(inst));
+    }
     if (p == S_T19) return table_lookup(table19_entries,
                                         sizeof(table19_entries)/sizeof(table19_entries[0]),
                                         SUBOP10(inst));
@@ -4914,6 +5636,14 @@ static void emit_body_into(WasmModuleBuilder& b,
             b.op_i32_and();
             b.op_i32_eqz();                              // (MSR & FP)==0 => FP disabled
             b.op_if(0x40);
+                // [fp-check region flush 2026-07-21] The "flush-safe by construction" claim
+                // above holds only for build_block (prologue, nothing dirty). In a MERGED
+                // REGION this check runs at EVERY body entry — prior bodies' GPR writes sit
+                // DIRTY in the shared locals, and the bare op_return DISCARDED them: resume
+                // re-executed the body with stale memory GPRs -> garbage pointers -> the THP
+                // decoder sprayed pixels over 0x800000C0 (OSCurrentContext) and killed all
+                // interrupt delivery (the deterministic movie-start wedge). Flush first.
+                emit_flush_dirty_gprs_inside_branch(ctx, ctx_ptr_const);
                 b.op_i32_const((s32)ctx_ptr_const);
                 b.op_i32_const((s32)ctx_ptr_const);
                 b.op_i32_load(ppc_off::EXCEPTIONS);

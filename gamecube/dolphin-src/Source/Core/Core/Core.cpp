@@ -516,10 +516,19 @@ static void FifoPlayerThread(Core::System& system, const std::optional<std::stri
       if (!is_init)
         return;
 
-#ifndef __LIBRETRO__
+      // [dual-core STEP3 2026-07-21] Run RunGpuLoop ON the spawned gpu_thread (native's
+      // GPU core). Native libretro instead runs RunGpuLoop from retro_run (Main.cpp:428) on
+      // RetroArch's dedicated thread — but our retro_run IS the JS pump pthread and can't
+      // block. Without RunGpuLoop on SOME core, Fifo::Prepare's SyncGPU handler makes the CPU
+      // thread's CoreTiming::Advance BLOCK forever (SafeCPReadPointer only advances inside
+      // RunGpuLoop) — the guest boot stalls at the apploader (dvdCmdN=11, globalCounter=0).
+      // The gpu_thread is a Web Worker pthread (not the proxied main thread) so it may block
+      // in the loop. This is the "GPU on the correct core" fix.
+#if defined(__EMSCRIPTEN__) || !defined(__LIBRETRO__)
       system.GetFifo().RunGpuLoop();
       INFO_LOG_FMT(CONSOLE, "{}", StopMessage(false, "Video Loop Ended"));
-
+#endif
+#ifndef __LIBRETRO__
       deinit_video();
 #endif
     }};

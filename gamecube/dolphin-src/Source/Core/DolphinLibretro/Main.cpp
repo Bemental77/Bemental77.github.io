@@ -219,10 +219,18 @@ void retro_run(void)
       Core::s_emu_thread = std::thread(Core::EmuThread,
         std::ref(Core::System::GetInstance()), std::move(Core::g_boot_params), wsi);
 
+#ifndef __EMSCRIPTEN__
       // Wait until CPU thread has reached Run()
       auto& cpu_manager = Core::System::GetInstance().GetCPU();
       while (!cpu_manager.HasCPURunStateBeenReached())
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+#endif
+      // [dual-core STEP1a 2026-07-21] Under emscripten PROXY_TO_PTHREAD this busy-wait
+      // DEADLOCKS: the spawned EmuThread pthread needs the main (pump) pthread to service
+      // its proxied main-thread calls, but the main pthread is stuck here spinning
+      // (measured: retror=1, HasCPURunStateBeenReached never true, globalCounter=0). Launch
+      // NON-BLOCKING; retro_run's per-frame body (Main.cpp ~430) gates on
+      // HasCPURunStateBeenReached() and only steps the CPU/GPU once the EmuThread is Running.
     }
     else
       Core::EmuThread(Core::System::GetInstance(), std::move(Core::g_boot_params), wsi);
@@ -424,8 +432,18 @@ void retro_run(void)
 
   if (system.IsDualCoreMode())
   {
+#ifdef __EMSCRIPTEN__
+    // [dual-core STEP3 2026-07-21] retro_run's dual-core body is EMPTY under emscripten. The
+    // CPU thread runs continuously on its own pthread (bBootToPause=false); the gpu_thread
+    // runs RunGpuLoop (Core.cpp GetInitializedVideoGuard) draining the FIFO + presenting in
+    // parallel — native's exact CPU-thread ‖ GPU-thread split. retro_run just returns per call
+    // so the JS pump loop keeps yielding; it must NOT DoFrameStep (pauses the CPU) or
+    // SyncGPUForRegisterAccess (second GPU drainer, races the gpu_thread's RunGpuLoop).
+    (void)system;
+#else
     Core::DoFrameStep(system);
     system.GetFifo().RunGpuLoop();
+#endif
   }
   else
   {

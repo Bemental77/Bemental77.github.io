@@ -28,6 +28,9 @@
 // one Advance + outer-while iter overhead per service tick. Minimal-risk
 // shape: no rewiring of libretro pipeline, only a service detour.
 #include "Core/System.h"
+#include "Core/HW/Memmap.h"
+#include "Core/HW/MMIO.h"
+#include "Core/PowerPC/PowerPC.h"
 // MMIOMirror.h was part of the prior dolphin-src fork's diagnostic stack and
 // is deliberately not present in the sanitized tree (df03d80 + canonical
 // CMake gates). Removed unused include; if any MMIOMirror.h symbol turns out
@@ -469,7 +472,101 @@ extern "C" void dolphin_gp_unseal();  // [dual-core FIFO splice fix] (dolphin_ji
 // always-runs run_iter_batch body (the branch-gated-drain starvation lesson). Notify after
 // consuming (the producer's bounded watermark wait).
 static u32 g_cp_read_cooldown = 0;  // [torn HI/LO] suppress the per-iter pump right after a CP-range read
+static void dolphin_publish_mmio_mirrors(void);  // defined below service_iter
+
+// [worker-fifo sync 2026-07-21 — the NATIVE-architecture gather pipe, dolphin half] The ppc-worker
+// now owns the CPU-FIFO state post-arm (SAB pub block @0x026B2840: +0 armed, +4 base, +8 end,
+// +C wp, +14 burstN release-published AFTER the 32B burst bytes land in MEM1, +18 dropped-residual
+// count) and writes WGP bursts DIRECTLY into guest memory — native's design (GPFifo.cpp: gather
+// buffer + m_fifo_cpu_write_pointer are CPU-thread state; only the burst notification crosses).
+// This half adopts the worker's pointer state and replays GatherPipeBursted() once per burst —
+// the EXACT native per-burst path (linked-vs-unlinked branch, CPWritePointer lockstep advance,
+// hi-watermark ForceExceptionCheck, distance credit, RunGpu kick) with zero reimplementation.
+// Called from dolphin_drain_gp_ring's head so it inherits every ordering call site (before ANY
+// mailbox op + the service-iter pump), replacing the retired ring's guarantee.
+static void dolphin_sync_worker_fifo(void) {
+    volatile uint32_t* const pub =
+        reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B2840u));
+    if (__atomic_load_n(const_cast<const uint32_t*>(&pub[0]), __ATOMIC_ACQUIRE) != 1u)
+        return;
+    auto& system = Core::System::GetInstance();
+    auto& processor_interface = system.GetProcessorInterface();
+    static uint32_t s_last_burst = 0u;
+    const uint32_t bn = __atomic_load_n(const_cast<const uint32_t*>(&pub[5]), __ATOMIC_ACQUIRE);
+    uint32_t delta = bn - s_last_burst;
+    // Always adopt the worker-owned pointer state (FIFO reg writes update pub without bursts).
+    processor_interface.m_fifo_cpu_base = pub[1];
+    processor_interface.m_fifo_cpu_end = pub[2];
+    if (delta == 0u) {
+        processor_interface.m_fifo_cpu_write_pointer = pub[3];
+        return;
+    }
+    s_last_burst = bn;
+    if (delta > 65536u) delta = 65536u;   // sanity clamp (would mean ~2MB unsynced)
+    auto& cp = system.GetCommandProcessor();
+    // [wf same_buffer 2026-07-21] Credit the CP ONLY when the CPU fifo IS the CP fifo. MP4's
+    // GPLinkEnable is STALE-1 during display-list builds (the exact trap the GPFifo [dl-fifo fix]
+    // documents — it gates on same_buffer, not linked), so replaying GatherPipeBursted for DL
+    // bursts credited the CP ~193KB ahead of the actual bytes (probe wfCp: CP wp 0x35aca0 vs
+    // worker wp 0x32a840) -> decoder consumed ZEROS -> no PE_FINISH -> gc=33 wedge. Deltas are
+    // config-epoch-pure (this sync runs BEFORE every mailbox op, so bursts preceding a base
+    // switch are always synced under their own epoch), so the gate is exact per delta.
+    {
+        auto& fifo_s = cp.GetFifo();
+        const bool linked = fifo_s.bFF_GPLinkEnable.load(std::memory_order_relaxed) != 0;
+        const bool same_buffer = fifo_s.CPBase.load(std::memory_order_relaxed) == pub[1];
+        if (linked && same_buffer) {
+            // [direct install 2026-07-21] Do NOT replay GatherPipeBursted (its wp advance relies
+            // on CPWritePointer starting in lockstep with the worker wp — FALSE at arm: CP was
+            // ~21KB behind PI, so credits landed short and the decoder starved at the gap).
+            // Install the truth directly: wp = where the worker's bytes ARE; distance += the
+            // credited bursts' bytes exactly. Replicate GatherPipeBursted's side effects
+            // (watermark exception pressure, CP status, GPU kick) verbatim.
+            fifo_s.CPWritePointer.store(pub[3], std::memory_order_relaxed);
+            // Derive distance from the POINTERS (invariant distance == (wp - rp) mod size) —
+            // incremental credit would preserve the arm-time CP-vs-PI gap as a permanent
+            // decoder short-stop. Safe: the GPU runs on THIS thread (RunGpuOnCpu), rp is not
+            // concurrently advancing.
+            {
+                const uint32_t rp = fifo_s.CPReadPointer.load(std::memory_order_relaxed);
+                const uint32_t fb = fifo_s.CPBase.load(std::memory_order_relaxed);
+                const uint32_t fe = fifo_s.CPEnd.load(std::memory_order_relaxed);
+                int64_t dist = static_cast<int64_t>(pub[3]) - static_cast<int64_t>(rp);
+                if (dist < 0)
+                    dist += static_cast<int64_t>(fe - fb) + 32;
+                fifo_s.CPReadWriteDistance.store(static_cast<uint32_t>(dist),
+                                                 std::memory_order_seq_cst);
+            }
+            if (fifo_s.bFF_HiWatermark.load(std::memory_order_relaxed) != 0)
+                system.GetCoreTiming().ForceExceptionCheck(0);
+            cp.SetCPStatusFromCPU();
+            system.GetFifo().RunGpu();
+        }
+    }
+    // Authoritative worker wp AFTER the replay (linked lockstep lands on the same value; the
+    // unlinked/DL branch never touches it — the worker's copy is the only true one).
+    processor_interface.m_fifo_cpu_write_pointer = pub[3];
+    volatile uint32_t* const n =
+        reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B285Cu));
+    *n = *n + delta;   // total bursts credited (probe wfSyncedBursts)
+    // [wf-cp-dbg 2026-07-21 TEMP] CP fifo state per sync @0x026B2860 — diagnose the
+    // credit-vs-bytes divergence (wedge face: cpDist=0, peFin never, decoder-reads-zeros class).
+    {
+        auto& fifo = cp.GetFifo();
+        volatile uint32_t* const dbg =
+            reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B2860u));
+        dbg[0] = fifo.CPWritePointer.load(std::memory_order_relaxed);
+        dbg[1] = fifo.CPReadPointer.load(std::memory_order_relaxed);
+        dbg[2] = fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
+        dbg[3] = fifo.CPBase.load(std::memory_order_relaxed);
+        dbg[4] = fifo.CPEnd.load(std::memory_order_relaxed);
+        dbg[5] = fifo.bFF_GPLinkEnable.load(std::memory_order_relaxed);
+        dbg[6] = pub[3];   // worker wp at this sync
+    }
+}
+
 static void dolphin_drain_gp_ring(void) {
+    dolphin_sync_worker_fifo();
     // [mmio-write-fastpath 2026-07-17] Drain the async DSP/AR-DMA MMIO write ring FIRST — before the
     // gp ring's empty early-return and before any mailbox op (same ordering guarantee as the gp ring)
     // — so the guest ISR's DSP_CONTROL ack + AR_DMA-issue writes reach dolphin IN ORDER without a
@@ -530,6 +627,9 @@ static void dolphin_drain_gp_ring(void) {
     }
     g_in_drain = 0;
     g_gp_discard = _saved_discard;
+    // [mmio-mirror publish 2026-07-20] publish (incl. the just-advanced FIFO wp) BEFORE the tail
+    // RELEASE store so a worker that observes ring-empty also observes the fresh wp mirror.
+    dolphin_publish_mmio_mirrors();
     __atomic_store_n(const_cast<uint32_t*>(p_tail), t, __ATOMIC_RELEASE);
     emscripten_atomic_notify(const_cast<uint32_t*>(p_tail), 1);
     // [domino3-bisect 2026-07-16] RELIABLE gpApplied counter @0x026B1A40: total ring
@@ -603,8 +703,71 @@ static bool dolphin_drain_mailbox_once(void) {
 }
 
 EMSCRIPTEN_KEEPALIVE
+// [mmio-mirror publish 2026-07-20] SAB mirror block @0x026B2800 for the hottest ACTIVE-state
+// guest MMIO reads (measured post-round-trip-elimination: VI DI0-3 19K/120s, PE_CTRL 19K,
+// PE_TOKEN 12K, VI 0x6C 5K, PI FIFO wp/base/end 6K). All are DirectRead registers (VideoInterface
+// .cpp:346+, PixelEngine.cpp:131/154, ProcessorInterface FIFO vars) so the publish is ~10 plain
+// loads per service iter. The worker serves reads from these cells with WRITE-DIRTY invalidation
+// (a guest write marks the cell stale until the next publish seq — preserves ISR ack semantics)
+// and a ring-empty guard on the FIFO regs (this fn is also called at drain-end BEFORE the tail
+// RELEASE store, so ring-empty => wp fresh => the wgp-order program-order guarantee holds).
+// NOTE the 2026-07-03 mirror16 experiment (below, disabled) measured a NET LOSS because the
+// mailbox exits were then load-bearing for dolphin's advance cadence; its stated precondition
+// "worker-local event advance" EXISTS now (CT_PHASE3, 2026-07-18) and this session's round-trip
+// eliminations sped the system up monotonically (gc/s 2.5 -> 41) with no cadence collapse.
+// Layout (u32 cells): +0 VI2030 +4 VI2034 +8 VI2038 +C VI203C +10 VI206C +14 PE_CTRL +18 PE_TOKEN
+// +1C PI3014(wp) +20 PI300C(base) +24 PI3010(end) +28 publish-seq.
+static void dolphin_publish_mmio_mirrors(void) {
+    // [boot-flood fix 2026-07-21] Publish ONLY post-takeover (cpu_owner==1). Publishing from
+    // page-load onward read these MMIO regs while the guest was still in the IPL (PC 0x900,
+    // mappings unresolvable) -> "Suppressed popup: Unable to resolve read address" x ~480/s
+    // flooding the browser console/main thread (live page froze at the Nintendo logo, FPS 13.7;
+    // probe logs: 4.8K baseline warnings -> 52-58K with the unconditional publish). The serve
+    // side is owner-gated anyway, so pre-takeover publishing had zero value.
+    if (*reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026A0000u)) != 1u)
+        return;
+    // [phys-mmio fix 2026-07-21] Read via the MMIO mapping with PHYSICAL addresses, NOT
+    // dolphin_read32 (= MMU().Read<u32>(EA)): the EA path depends on the guest's MOMENTARY
+    // translation state — whenever ppc_state is in an exception window (MSR.DR=0, e.g. the
+    // 0x900 DEC vector) EA 0xCCxxxxxx fails ("Unable to resolve read address ... PC 900",
+    // ~4.8K/reg/120s console flood that froze the live page) and RETURNS 0 — so the published
+    // cells were intermittently ZEROS (also the real cause of the wp=0 DLBuf overflow when the
+    // FIFO regs were mirror-served). The MMIO mapping read is state-independent.
+    auto& system = Core::System::GetInstance();
+    MMIO::Mapping* const mmio = system.GetMemory().GetMMIOMapping();
+    if (!mmio)
+        return;
+    volatile uint32_t* const mir = reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B2800u));
+    const auto rd32 = [&](u32 pa) -> uint32_t {
+        return (static_cast<uint32_t>(mmio->Read<u16>(system, pa)) << 16) |
+               mmio->Read<u16>(system, pa + 2u);
+    };
+    mir[0] = rd32(0x0C002030u);
+    mir[1] = rd32(0x0C002034u);
+    mir[2] = rd32(0x0C002038u);
+    mir[3] = rd32(0x0C00203Cu);
+    mir[4] = rd32(0x0C00206Cu);
+    mir[5] = mmio->Read<u16>(system, 0x0C00100Au);
+    mir[6] = mmio->Read<u16>(system, 0x0C00100Eu);
+    mir[7] = mmio->Read<u32>(system, 0x0C003014u);
+    mir[8] = mmio->Read<u32>(system, 0x0C00300Cu);
+    mir[9] = mmio->Read<u32>(system, 0x0C003010u);
+    // [wf-arm gate 2026-07-21] publish dolphin's pending gather-pipe byte count @0x026B28B0:
+    // arming the worker-fifo while dolphin's gather holds a PARTIAL burst would lose those
+    // bytes AND misphase the fifo stream by <32B forever (the garbage-draw 5735x5735 class).
+    // The worker's tryArm refuses to arm until this reads 0.
+    {
+        auto& ppcs = system.GetPPCState();
+        *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B28B0u)) =
+            (uint32_t)(ppcs.gather_pipe_ptr - ppcs.gather_pipe_base_ptr);
+    }
+    const uint32_t s = mir[10];
+    __atomic_store_n(const_cast<uint32_t*>(&mir[10]), s + 1u, __ATOMIC_RELEASE);
+}
+
 void dolphin_service_iter(void) {
     if (!g_loaded) return;
+    dolphin_publish_mmio_mirrors();
     // [ppc-bridge cutover] Drain the worker's pending env.ppc_* mailbox round-trips
     // in-process FIRST (the pump retro_run used to provide). Runs every call,
     // including during a worker slice (yield set), because the worker BLOCKS until

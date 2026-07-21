@@ -140,6 +140,31 @@ public:
       }
       *dc = idx + 1u;
     }
+    // [copy-gap diag 2026-07-21 TEMP] ungated draw census (dual AND single-exec):
+    // draws @0x026B289C, total verts @0x026B28A0.
+    {
+      volatile u32* const dn = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B289Cu));
+      *dn = *dn + 1u;
+      volatile u32* const dv = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B28A0u));
+      *dv = *dv + num_vertices;
+    }
+    // [garbage-draw trap 2026-07-21 TEMP] first draw with absurd num_vertices: capture the
+    // 64 stream bytes around vertex_data (host ptr into fifo/RAM) @0x026B28C0, flag @0x026B28B8.
+    if (num_vertices > 2000u)
+    {
+      volatile u32* const flag = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B28B8u));
+      if (*flag == 0u)
+      {
+        *flag = 1u;
+        const u8* const dump_base = vertex_data - 16;
+        for (int k = 0; k < 16; k++)
+        {
+          u32 w;
+          std::memcpy(&w, dump_base + k * 4, 4);
+          reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B28C0u))[k] = w;
+        }
+      }
+    }
     // load vertices
     const u32 size = vertex_size * num_vertices;
 
@@ -156,6 +181,13 @@ public:
   // to inlining Run for the display list directly.
   OPCODE_CALLBACK_NOINLINE(void OnDisplayList(u32 address, u32 size))
   {
+    // [copy-gap diag 2026-07-21 TEMP] CALL_DL census: count @0x026B28A4, last addr/size @28A8/28AC.
+    {
+      volatile u32* const dl = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B28A4u));
+      *dl = *dl + 1u;
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B28A8u)) = address;
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B28ACu)) = size;
+    }
     m_cycles += 6;
 
     if (m_in_display_list)

@@ -256,6 +256,14 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
     // this function
 
     u32 destAddr = bpmem.copyTexDest << 5;
+    // [copy-diag 2026-07-21 TEMP] EFB-copy executes: count @0x026B2894, last dest @0x026B2898.
+    // Dual-core presents a stale boot frame while SetFinish (peFrames) climbs — is the copy
+    // command itself decoding, and to WHICH destination?
+    {
+      volatile u32* const cd = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2894u));
+      *cd = *cd + 1u;
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2898u)) = destAddr;
+    }
     u32 destStride = bpmem.copyDestStride << 5;
 
     MathUtil::Rectangle<s32> srcRect;
@@ -766,6 +774,14 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
     case TexUnitAddress::Register::SETIMAGE1:
     case TexUnitAddress::Register::SETIMAGE2:
     case TexUnitAddress::Register::SETIMAGE3:
+      // [tex-diag 2026-07-21 TEMP] last SETIMAGE3 (texture base >>5) @0x026B2900, count @0x026B2904
+      // — is the movie quad's texture address arriving, and where does it point?
+      if (tex_address.Reg == TexUnitAddress::Register::SETIMAGE3)
+      {
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2900u)) = bp.newvalue;
+        volatile u32* const tc = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2904u));
+        *tc = *tc + 1u;
+      }
       TMEM::ConfigurationChanged(tex_address, bp.newvalue);
       return;
 

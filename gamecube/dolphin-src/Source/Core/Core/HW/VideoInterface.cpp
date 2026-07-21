@@ -900,6 +900,11 @@ void VideoInterfaceManager::OutputField(FieldType field, u64 ticks)
       out_stride = s_last_stride;
       out_height = s_last_height;
     }
+    // [xfb-raw diag 2026-07-21 TEMP] pre-latch xfbAddr + the raw VI FB_LEFT_TOP reg pair —
+    // the presented addr decodes garbage (0x27cc27, POFF clear) post-takeover; pin whether the
+    // REGISTER holds garbage (VI write path corrupts) or the latch replays stale garbage.
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2834u)) = xfbAddr;
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2838u)) = m_xfb_info_top.Hex;
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A68u)) = out_addr;
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A6Cu)) =
         (out_width << 16) | (out_height & 0xFFFFu);

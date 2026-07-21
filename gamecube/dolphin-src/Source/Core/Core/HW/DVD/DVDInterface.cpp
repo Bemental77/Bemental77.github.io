@@ -644,6 +644,15 @@ void DVDInterface::UpdateInterrupts()
 
 void DVDInterface::GenerateDIInterrupt(DIInterruptType dvd_interrupt)
 {
+  // [dvd-completion diag 2026-07-21 TEMP] DI interrupt generates: count @0x026B2908, last type
+  // @0x026B290C — vs issue count @0x026B1A70. issues>completions = a completion event never
+  // fired (the dual-core movie-stream starvation: dvdCmdN=25 then dead).
+  {
+    volatile u32* const gc = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2908u));
+    *gc = *gc + 1u;
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B290Cu)) =
+        static_cast<u32>(dvd_interrupt);
+  }
   switch (dvd_interrupt)
   {
   case DIInterruptType::DEINT:
