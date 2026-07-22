@@ -90,6 +90,9 @@ void GPFifoManager::ResetGatherPipe()
 
 void GPFifoManager::UpdateGatherPipe()
 {
+  // [dc-diag 2026-07-21 TEMP] UpdateGatherPipe entry — is the gather-pipe flush being called
+  // on the CPU thread's block epilogue? Remove after localizing the CP-FIFO break.
+  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AF0u)); *p = *p + 1u; }
   auto& system = m_system;
   auto& memory = system.GetMemory();
   auto& processor_interface = system.GetProcessorInterface();
@@ -110,6 +113,19 @@ void GPFifoManager::UpdateGatherPipe()
     const u32 cp_wp = cp_fifo.CPWritePointer.load(std::memory_order_relaxed);
     const u32 cp_base = cp_fifo.CPBase.load(std::memory_order_relaxed);
     const bool linked = cp_fifo.bFF_GPLinkEnable.load(std::memory_order_relaxed) != 0;
+    // [dc-diag 2026-07-21 TEMP] publish LIVE CP link/read/distance (UpdateGatherPipe runs
+    // frequently, unlike the asleep RunGpuLoop) — is the CP FIFO enabled+linked under dual-core?
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AD8u)) =
+        cp_fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AE4u)) =
+        cp_fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) ? 1u : 0u;
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AF8u)) = linked ? 1u : 0u;
+    // [dc-diag TEMP] &m_fifo address + CPReadPointer/CPBase from the CPU/guest thread — compare
+    // &fifo against the gpu_thread's (0x026B1B48). Same addr + different values => reset/coherence;
+    // different addr => two System/CommandProcessor instances (the real root).
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B4Cu)) = static_cast<u32>(reinterpret_cast<uintptr_t>(&cp_fifo));
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B50u)) = cp_fifo.CPReadPointer.load(std::memory_order_relaxed);
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B54u)) = cp_base;
     // [dl-fifo fix 2026-07-20] The wp-invariant only holds when the CPU FIFO and the CP (GP) FIFO
     // describe the SAME buffer (a genuinely LINKED GP FIFO). For a display-list / MEMORY FIFO the
     // guest UNLINKS the CP (GXSetCPUFifo else-branch -> __GXFifoLink(0)), so m_fifo_cpu_base (= the
@@ -154,6 +170,7 @@ void GPFifoManager::UpdateGatherPipe()
       processor_interface.m_fifo_cpu_write_pointer += GATHER_PIPE_SIZE;
 
     system.GetCommandProcessor().GatherPipeBursted();
+    { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AECu)); *p = *p + 1u; }
   }
 
   // move back the spill bytes
@@ -249,6 +266,9 @@ void GPFifoManager::Write16(const u16 value)
 
 void GPFifoManager::Write32(const u32 value)
 {
+  // [dc-diag 2026-07-21 TEMP] Write32 entry (all calls) — is the guest's WPAR store reaching
+  // dolphin's GPFifo at all? Remove after localizing the CP-FIFO break.
+  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AE8u)); *p = *p + 1u; }
   if (gpfifo_redirect_excursion_to_ring(4u, value)) {
     return;
   }
@@ -267,6 +287,8 @@ void GPFifoManager::Write32(const u32 value)
       *o = oi + 1u;
     }
   }
+  // [dc-diag TEMP] reached FastWrite32 (past the excursion-redirect) = write hit the gather pipe.
+  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AF4u)); *p = *p + 1u; }
   FastWrite32(value);
   CheckGatherPipe();
 }

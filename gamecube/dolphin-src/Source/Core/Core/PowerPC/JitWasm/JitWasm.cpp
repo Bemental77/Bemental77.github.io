@@ -46,6 +46,7 @@
 #include "Core/PowerPC/MMU.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
+#include "VideoCommon/Fifo.h"  // [dc 2026-07-21] DrainFifoOnCpuThread — CPU-side GX FIFO decode
 
 #include "bementalJIT/types.h"
 #include "ppc_analyst.h"  // bemental::powerpc::IsBlockTerminator — single source of truth.
@@ -226,6 +227,9 @@ void JitWasm::Run()
   // dispatches (probe_fix.js, 2026-05-30).
   while (*state_ptr == CPU::State::Running)
   {
+    // [dc-diag 2026-07-21 TEMP] dolphin EmuThread JitWasm::Run active — proves dolphin (not the
+    // ppc-worker) executes the guest CPU.
+    { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B58u)); *p = *p + 1u; }
     // [ee-race fix 2026-07-02] NOTE: Advance must keep RUNNING under worker
     // ownership (hybrid VI/DSP/AI events fire ONLY via dolphin's local Advance —
     // CT_PHASE3_ENABLE is not set in the live tree, so the worker's
@@ -246,6 +250,11 @@ void JitWasm::Run()
 #else
     core_timing.Advance();
 #endif
+
+    // [gpu-drain 2026-07-21] The GX FIFO decode does NOT run here on the EmuThread: RunFifo issues
+    // WebGPU device calls (EFB/texture/XFB copies) and this thread does not own the device — it hangs
+    // (verified: un-wedged GXDrawDone -> reached Hu3DAnimInit, then froze in an ungated device call).
+    // The decode runs on the proxy-main thread that owns the device, pumped from retro_run (Main.cpp).
 
     // Per-slice idle-skip ring. Must be SLICE-LOCAL (not static), or PCs
     // from a real idle loop in one slice will throttle unrelated blocks

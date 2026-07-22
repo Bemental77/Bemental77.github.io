@@ -439,7 +439,29 @@ void retro_run(void)
     // parallel — native's exact CPU-thread ‖ GPU-thread split. retro_run just returns per call
     // so the JS pump loop keeps yielding; it must NOT DoFrameStep (pauses the CPU) or
     // SyncGPUForRegisterAccess (second GPU drainer, races the gpu_thread's RunGpuLoop).
-    (void)system;
+    //
+    // [gpu-gate fix 2026-07-21] EXCEPT: open the GPU gate once. Native opens it via the CPU
+    // Running transition (CPUSetInitialExecutionState -> SetState(Running) -> SetStepping(false)
+    // -> RunAdjacentSystems(true) -> Fifo::EmulatorState(true)). Our restructured boot trips
+    // SetState's `if (s_state != Running) return` guard, so EmulatorState(true) never runs and
+    // RunGpuLoop's payload early-returns without draining (verified: emuRunning=0, rglDrain=0,
+    // 2976 CP bytes stuck -> PE_FINISH never fires -> GXWaitDrawDone wedge). Set the GPU
+    // running-state + wake the loop once the core is operational.
+    // Unconditional every-frame (matches the old RunSingleFrame path, which called
+    // SetState(Running) per retro_run): the global Core s_state never reaches Running in our
+    // restructured boot (the CPU's own m_state does, so the guest executes), so a GetState guard
+    // never fires. EmulatorState(true) is idempotent (Flag.Set + GPU mainloop Wakeup).
+    system.GetFifo().EmulatorState(true);
+
+    // [gpu-drain-on-proxy-main 2026-07-21] Decode the GX FIFO HERE, on the proxy-main pthread.
+    // The guest CPU runs on dolphin's EmuThread and fills the CP FIFO in THIS same memory; the
+    // dolphin gpu_thread is memory-isolated (verified: identical &m_fifo, but it reads distance=0
+    // while the EmuThread fills 2976) so RunGpuLoop can never drain it. The decode must run where
+    // the WebGPU device lives — the proxy-main thread that ran ContextReset — because RunFifo
+    // issues device calls (EFB/texture/XFB); running it on the EmuThread hung on those ungated
+    // calls (reached Hu3DAnimInit then froze). Pumping it here (device thread) drains + renders +
+    // raises PE_FINISH so GXDrawDone/GXWaitDrawDone completes — the design that rendered pre-restructure.
+    system.GetFifo().DrainFifoOnCpuThread(100000);
 #else
     Core::DoFrameStep(system);
     system.GetFifo().RunGpuLoop();

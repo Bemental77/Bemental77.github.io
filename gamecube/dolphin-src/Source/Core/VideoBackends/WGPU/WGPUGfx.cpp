@@ -13,6 +13,8 @@
 
 #include <emscripten.h>  // emscripten_sleep (ASYNCIFY pump) + MAIN_THREAD_EM_ASM
 
+#include "Core/Core.h"  // Core::MarkWGPUDeviceThread — TLS device-owner marker (dual-core hybrid)
+
 #include "VideoBackends/WGPU/WGPUTexture.h"
 #include "VideoBackends/WGPU/WGPUUberShaders.h"
 #include "VideoBackends/WGPU/WGPUVertexManager.h"  // WGPUVertexFormat (vertex buffer layout)
@@ -142,6 +144,12 @@ WGPUGfx::WGPUGfx(const WindowSystemInfo& wsi)
 
   m_device = device;
   m_queue = device ? wgpuDeviceGetQueue(m_device) : nullptr;
+  // [dual-core hybrid 2026-07-21] WebGPU objects don't cross pthreads (emscripten #19645). Mark
+  // THIS thread as the live-device owner so the FIFO-decode path (which runs on the separate
+  // gpu_thread that does NOT own the device) skips device calls while still decoding the FIFO to
+  // raise PE_FINISH. See Core::WGPUDeviceLiveOnThisThread().
+  if (m_device)
+    Core::MarkWGPUDeviceThread();
   MAIN_THREAD_EM_ASM({ postMessage({cmd: 'print', txt: '[wgpu] device=' + ($0 ? 'OK' : 'NULL')
                        + ' queue=' + ($1 ? 'OK' : 'NULL')}); },
                      (int)(m_device != nullptr), (int)(m_queue != nullptr));

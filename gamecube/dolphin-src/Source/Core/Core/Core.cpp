@@ -141,6 +141,8 @@ static std::queue<HostJob> s_host_jobs_queue;
 
 static thread_local bool tls_is_cpu_thread = false;
 static thread_local bool tls_is_gpu_thread = false;
+// [dual-core hybrid 2026-07-21] see Core.h — TLS "this thread owns the live WGPU device".
+static thread_local bool tls_wgpu_device_live = false;
 
 #ifndef __LIBRETRO__
 static
@@ -333,6 +335,19 @@ void DeclareAsGPUThread()
 void UndeclareAsGPUThread()
 {
   tls_is_gpu_thread = false;
+}
+
+// [dual-core hybrid 2026-07-21] Marks the calling thread as the live WGPU-device owner. Called
+// from the WGPUGfx ctor (the thread that created the device). The FIFO-decode path reads this to
+// skip cross-pthread device calls on the deviceless gpu_thread while still raising PE_FINISH.
+void MarkWGPUDeviceThread()
+{
+  tls_wgpu_device_live = true;
+}
+
+bool WGPUDeviceLiveOnThisThread()
+{
+  return tls_wgpu_device_live;
 }
 
 // For the CPU Thread only.

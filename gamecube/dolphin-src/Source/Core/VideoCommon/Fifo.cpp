@@ -17,6 +17,7 @@
 
 #include "Core/Config/MainSettings.h"
 #include "Core/ConfigManager.h"
+#include "Core/Core.h"  // Core::WGPUDeviceLiveOnThisThread — dual-core hybrid device-thread gate
 #include "Core/CoreTiming.h"
 #include "Core/HW/GPFifo.h"
 #include "Core/HW/Memmap.h"
@@ -310,11 +311,21 @@ void FifoManager::ResetVideoBuffer()
 // Purpose: Keep the Core HW updated about the CPU-GPU distance
 void FifoManager::RunGpuLoop()
 {
+  // [dc-diag 2026-07-21 TEMP] RunGpuLoop ENTRY (before the mainloop) — proves the gpu_thread
+  // reached RunGpuLoop at all.
+  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B10u)); *p = *p + 1u; }
   m_gpu_mainloop.Run(
       [this] {
+        // [dc-diag 2026-07-21 TEMP] RunGpuLoop callback entry count (non-gated) — proves the
+        // gpu_thread mainloop is ticking. Remove after localizing the PE_FINISH break.
+        { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AD0u)); *p = *p + 1u; }
         // Run events from the CPU thread.
         AsyncRequests::GetInstance()->PullEvents();
+        // [dc-diag TEMP] payload reached past PullEvents (did PullEvents block?).
+        { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B18u)); *p = *p + 1u; }
 
+        // [dc-diag TEMP] publish emu_running_state — is the GPU gate open under dual-core boot?
+        { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B1Cu)); *p = m_emu_running_state.IsSet() ? 1u : 0u; }
         // Do nothing while paused
         if (!m_emu_running_state.IsSet())
           return;
@@ -338,12 +349,28 @@ void FifoManager::RunGpuLoop()
           auto& fifo = command_processor.GetFifo();
           command_processor.SetCPStatusFromGPU();
 
+          // [dc-diag TEMP] else-branch reached + the 4 while-loop conditions (which one blocks?)
+          { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B20u)); *p = *p + 1u; }
+          { volatile u32* w = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B24u)); *w = command_processor.IsInterruptWaiting() ? 1u : 0u; }
+          { volatile u32* b = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B28u)); *b = AtBreakpoint(m_system) ? 1u : 0u; }
+          { volatile u32* d = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B30u)); *d = fifo.CPReadWriteDistance.load(std::memory_order_relaxed); }
+          // [dc-diag TEMP] MAX CPReadWriteDistance the GPU ever observes + live FIFO pointers —
+          // did the GPU EVER see the credit, or was it reset to 0 before the GPU's first check?
+          { const u32 dd = fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
+            volatile u32* mx = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B3Cu));
+            if (dd > *mx) *mx = dd;
+            *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B40u)) = fifo.CPReadPointer.load(std::memory_order_relaxed);
+            *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B44u)) = fifo.CPWritePointer.load(std::memory_order_relaxed);
+            // [dc-diag TEMP] &m_fifo address from the GPU thread — compare to the CPU thread's (0x026B1B4C)
+            *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B48u)) = static_cast<u32>(reinterpret_cast<uintptr_t>(&fifo)); }
+
           // check if we are able to run this buffer
           while (!command_processor.IsInterruptWaiting() &&
                  fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) &&
                  fifo.CPReadWriteDistance.load(std::memory_order_relaxed) &&
                  !AtBreakpoint(m_system))
           {
+            { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AD4u)); *p = *p + 1u; }
             if (m_config_sync_gpu && m_sync_ticks.load() < m_config_sync_gpu_min_distance)
               break;
 
@@ -406,8 +433,15 @@ void FifoManager::RunGpuLoop()
 
           // The fifo is empty and it's unlikely we will get any more work in the near future.
           // Make sure VertexManager finishes drawing any primitives it has stored in it's buffer.
-          g_vertex_manager->Flush();
-          g_framebuffer_manager->RefreshPeekCache();
+          // [dual-core hybrid 2026-07-21] Flush()/RefreshPeekCache() issue wgpu* draws. Skip on a
+          // thread with no live WGPU device (the gpu_thread only decodes the FIFO to raise
+          // PE_FINISH in the hybrid seam). The FIFO drain + CP pointer advance above are
+          // device-independent and still run. Re-enables under Option A automatically.
+          if (Core::WGPUDeviceLiveOnThisThread())
+          {
+            g_vertex_manager->Flush();
+            g_framebuffer_manager->RefreshPeekCache();
+          }
         }
       },
       100);
@@ -467,6 +501,9 @@ int FifoManager::RunGpuOnCpu(int ticks)
          fifo.CPReadWriteDistance.load(std::memory_order_acquire) && !AtBreakpoint(m_system) &&
          available_ticks >= 0)
   {
+    // [dc-diag 2026-07-21 TEMP] RunGpuOnCpu drain iterations — is the CPU-side drain consuming
+    // the FIFO (explaining cpDistGpu=0 while RunGpuLoop's rglDrain=0)?
+    { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B34u)); *p = *p + 1u; }
     if (m_use_deterministic_gpu_thread)
     {
       ReadDataFromFifoOnCPU(fifo.CPReadPointer.load(std::memory_order_relaxed));

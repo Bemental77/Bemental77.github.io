@@ -1262,6 +1262,35 @@ function startServer() {
             bw.lpcHist = (() => { const o = []; for (let k = 0; k < 8; k++) { const sp = 0x026B2730 + k * 8;
               const p = A[sp >> 2] >>> 0, c = A[(sp + 4) >> 2] >>> 0; if (c) o.push('0x' + p.toString(16) + ':' + c); } return o.join(' '); })();
             bw.peFrames = A[0x026B0930 >> 2] >>> 0;        // SetFinish counter (SAB, replaces [ax-pe] print)
+            // [dc-diag 2026-07-21 TEMP] localize the PE_FINISH break in the gpu_thread RunGpuLoop chain
+            bw.rglEntry = A[0x026B1AD0 >> 2] >>> 0;        // RunGpuLoop callback ticks (gpu_thread alive?)
+            bw.rglDrain = A[0x026B1AD4 >> 2] >>> 0;        // RunGpuLoop while-loop drain iterations
+            bw.cpDistLive = A[0x026B1AD8 >> 2] >>> 0;      // last CPReadWriteDistance seen by RunGpuLoop
+            bw.gpReadEn = A[0x026B1AE4 >> 2] >>> 0;        // bFF_GPReadEnable seen by RunGpuLoop
+            bw.gpfWrite32 = A[0x026B1AE8 >> 2] >>> 0;      // GPFifo::Write32 entries (WPAR reaching dolphin GPFifo?)
+            bw.gpfFastWrite = A[0x026B1AF4 >> 2] >>> 0;    // reached FastWrite32 (past excursion-redirect)
+            bw.gpfUpdate = A[0x026B1AF0 >> 2] >>> 0;       // UpdateGatherPipe entries (flush called?)
+            bw.gpfBurst = A[0x026B1AEC >> 2] >>> 0;        // GatherPipeBursted -> CP FIFO bursts
+            bw.cpLinkEn = A[0x026B1AF8 >> 2] >>> 0;        // bFF_GPLinkEnable (live, from UpdateGatherPipe)
+            bw.rglOuter = A[0x026B1B10 >> 2] >>> 0;        // RunGpuLoop entered (before mainloop)
+            bw.rglPastPull = A[0x026B1B18 >> 2] >>> 0;     // payload reached past PullEvents
+            bw.waitForN = A[0x026B1B14 >> 2] >>> 0;        // Event::WaitFor poll entries (any Event)
+            bw.emuRunning = A[0x026B1B1C >> 2] >>> 0;      // m_emu_running_state.IsSet() (GPU gate)
+            bw.rglElse = A[0x026B1B20 >> 2] >>> 0;         // reached else-branch (past emu-running gate)
+            bw.cpIntWait = A[0x026B1B24 >> 2] >>> 0;       // command_processor.IsInterruptWaiting()
+            bw.cpAtBp = A[0x026B1B28 >> 2] >>> 0;          // AtBreakpoint
+            bw.cpDistGpu = A[0x026B1B30 >> 2] >>> 0;       // CPReadWriteDistance seen inside else-branch
+            bw.rgocIter = A[0x026B1B34 >> 2] >>> 0;        // RunGpuOnCpu drain iterations (CPU-side drain)
+            bw.sddDecodeNG = A[0x026B1B38 >> 2] >>> 0;     // NON-gated SETDRAWDONE decodes (FINISH reached decoder?)
+            bw.cpDistGpuMax = A[0x026B1B3C >> 2] >>> 0;    // MAX CPReadWriteDistance GPU ever saw
+            bw.cpRpGpu = (A[0x026B1B40 >> 2] >>> 0).toString(16);   // CPReadPointer (GPU view)
+            bw.cpWpGpu = (A[0x026B1B44 >> 2] >>> 0).toString(16);   // CPWritePointer (GPU view)
+            bw.fifoAddrGpu = (A[0x026B1B48 >> 2] >>> 0).toString(16); // &m_fifo from GPU thread
+            bw.fifoAddrCpu = (A[0x026B1B4C >> 2] >>> 0).toString(16); // &m_fifo from CPU/guest thread
+            bw.cpRpCpu = (A[0x026B1B50 >> 2] >>> 0).toString(16);   // CPReadPointer (CPU view)
+            bw.cpBaseCpu = (A[0x026B1B54 >> 2] >>> 0).toString(16); // CPBase (CPU view)
+            bw.jitwasmRun = A[0x026B1B58 >> 2] >>> 0;      // dolphin EmuThread JitWasm::Run iters (guest on dolphin?)
+            bw.gpRingDrain = A[0x026B1B5C >> 2] >>> 0;     // GP-ring non-empty events (guest on ppc-worker?)
             bw.eeViolations = A[0x026B0934 >> 2] >>> 0;    // Step-2 tripwire: EXT delivered at EE=0 (must be 0)
             // [crash-ctx] the OS exception context (0x801a5b38 in every captured dump):
             // srr0/srr1 at +0x198/+0x19C = the crash-moment pc/msr, readable without

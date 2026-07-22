@@ -13,6 +13,7 @@
 #include "Common/EnumMap.h"
 #include "Common/Logging/Log.h"
 
+#include "Core/Core.h"  // Core::WGPUDeviceLiveOnThisThread — dual-core hybrid device-thread gate
 #include "Core/DolphinAnalytics.h"
 #include "Core/FifoPlayer/FifoPlayer.h"
 #include "Core/FifoPlayer/FifoRecorder.h"
@@ -195,10 +196,21 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
       if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u)
       { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1ABCu)); *p = *p + 1u; }
       INCSTAT(g_stats.this_frame.num_draw_done);
-      g_texture_cache->FlushEFBCopies();
-      g_texture_cache->FlushStaleBinds();
-      g_framebuffer_manager->InvalidatePeekCache(false);
-      g_framebuffer_manager->RefreshPeekCache();
+      // [dc-diag 2026-07-21 TEMP] NON-gated SETDRAWDONE-decode counter — is the FINISH token
+      // actually reaching the opcode decoder (regardless of which thread drains)?
+      { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B38u)); *p = *p + 1u; }
+      // [dual-core hybrid 2026-07-21] These flushes touch the WGPU device (texture cache /
+      // framebuffer). On the gpu_thread that DECODES the FIFO but does not own the device,
+      // issuing them is a cross-pthread wgpu* call. PE_FINISH does not depend on them, so skip
+      // them when this thread has no live device — the SetFinish below still raises the interrupt
+      // and un-wedges GXWaitDrawDone. Re-enables automatically once the device moves here (Opt A).
+      if (Core::WGPUDeviceLiveOnThisThread())
+      {
+        g_texture_cache->FlushEFBCopies();
+        g_texture_cache->FlushStaleBinds();
+        g_framebuffer_manager->InvalidatePeekCache(false);
+        g_framebuffer_manager->RefreshPeekCache();
+      }
       auto& system = Core::System::GetInstance();
       if (!system.GetFifo().UseDeterministicGPUThread())
         system.GetPixelEngine().SetFinish(cycles_into_future);  // may generate interrupt

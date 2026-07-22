@@ -129,6 +129,11 @@ void DeclareAsCPUThread();
 void UndeclareAsCPUThread();
 void DeclareAsGPUThread();
 void UndeclareAsGPUThread();
+// [dual-core hybrid 2026-07-21] TLS marker: the WGPU device was created on (and is usable from)
+// the calling thread. Set in the WGPUGfx ctor; read by the FIFO-decode path so the deviceless
+// gpu_thread can decode + raise PE_FINISH without issuing cross-pthread wgpu* calls.
+void MarkWGPUDeviceThread();
+bool WGPUDeviceLiveOnThisThread();
 
 std::string StopMessage(bool main_thread, std::string_view message);
 

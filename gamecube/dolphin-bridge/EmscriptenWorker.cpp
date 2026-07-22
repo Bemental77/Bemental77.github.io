@@ -601,6 +601,9 @@ static void dolphin_drain_gp_ring(void) {
     volatile uint32_t* const p_tail = reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026C0004u));
     uint32_t t = *p_tail;
     const uint32_t h = __atomic_load_n(const_cast<const uint32_t*>(p_head), __ATOMIC_ACQUIRE);
+    // [dc-diag 2026-07-21 TEMP] GP-ring non-empty => the ppc-worker is producing GX via the ring
+    // (guest-on-ppc-worker). If this stays 0 while gpfWrite32>0, the guest runs on dolphin's EmuThread.
+    if (t != h) { volatile uint32_t* p = reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B1B5Cu)); *p = *p + 1u; }
     if (t == h) return;
     // [domino3 FIX 2026-07-16 — the dropped-GX root, take 2] These ring entries ARE the
     // worker's own legitimate GX (it owns the CPU). GPFifo::Write* no-ops them when

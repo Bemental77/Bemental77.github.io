@@ -65,6 +65,22 @@ public:
   // In dual core mode, this synchronizes with the GPU thread.
   void SyncGPUForRegisterAccess();
 
+  // [dc 2026-07-21] Drain+decode the CP FIFO on the CALLING (CPU) thread, unconditionally (ignores
+  // dual-core mode). Needed under emscripten: dolphin's spawned gpu_thread runs in a DIFFERENT
+  // WebAssembly.Memory than the EmuThread that fills the FIFO (verified: identical &m_fifo offset,
+  // but the gpu_thread reads CPReadWriteDistance=0 while the EmuThread fills it to 2976), so
+  // RunGpuLoop can NEVER see the FIFO — SETDRAWDONE never decodes, PE_FINISH never fires, and
+  // GXDrawDone/HuSysDoneRender wedges. Reset the tick deficit + give a large budget so RunGpuOnCpu
+  // loops until CPReadWriteDistance==0. Inline so it reaches the private RunGpuOnCpu/m_sync_ticks.
+  void DrainFifoOnCpuThread(int ticks)
+  {
+    // m_config_sync_gpu_overclock defaults to 0.0 (sync-gpu off), so RunGpuOnCpu's
+    // ticks*overclock budget term is 0 — seed the budget via m_sync_ticks so it actually
+    // drains the pending FIFO instead of one 32-byte chunk per call.
+    m_sync_ticks.store(ticks);
+    RunGpuOnCpu(ticks);
+  }
+
   void PushFifoAuxBuffer(const void* ptr, size_t size);
   void* PopFifoAuxBuffer(size_t size);
 
