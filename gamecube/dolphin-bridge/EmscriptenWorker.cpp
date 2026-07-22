@@ -1164,7 +1164,18 @@ void run_iter_batch(int n) {
         // only its original boot-era single-core meaning, which stays 0 here). The excursion drop
         // is enforced structurally at GPFifo::Write* (gpfifo_reject_non_ring_gx), so nothing needs
         // to clear a seal per-iteration.
-        if (g_bem_gp_dirty) {
+        // [restructure gather-ownership 2026-07-22] The gather pipe is CPU-thread-private in
+        // native (buffer + cursor live in ppc_state: GPFifo::FastWrite* / UpdateGatherPipe).
+        // This proxy-main drain was the OLD architecture's flush (worker ring -> parked
+        // dolphin thread). Under the restructure the EmuThread produces AND flushes at block
+        // epilogues, and a concurrent proxy-main UpdateGatherPipe races the shared cursor
+        // byte-granularly (caught by the cmd-ring: a BP load's 0x61 opcode byte deleted
+        // mid-stream -> decoder walked vertex floats -> SAB SEGA-logo / MP4 board wedges).
+        // Drain here ONLY in takeover mode (cpu_owner==1); otherwise leave g_bem_gp_dirty
+        // alone — clearing it here steals the EmuThread epilogue's pending flag and
+        // suppresses its own drain (a second byte-loss mode).
+        if (g_bem_gp_dirty &&
+            *reinterpret_cast<volatile unsigned*>(static_cast<uintptr_t>(0x026A0000u)) == 1u) {
             g_bem_gp_dirty = 0;
             dolphin_gather_drain(0u, 0u);
         }

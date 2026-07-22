@@ -279,6 +279,22 @@ void ProcessorInterfaceManager::SetInterrupt(u32 cause_mask, bool set)
                   Debug_GetInterruptName(cause_mask));
   }
 
+  // [aram-diag 2026-07-22 TEMP] count INT_CAUSE_DSP 0->1 cause-sets @0x026B1BC0 and 1->0
+  // clears @0x026B1BCC (pair with EXT-delivery-with-DSP @0x026B1BC4). sets>deliveries with
+  // clears==sets = the cause is being acked/cleared before any delivery vectors.
+  if ((cause_mask & INT_CAUSE_DSP) != 0)
+  {
+    if (set && !(m_interrupt_cause & INT_CAUSE_DSP))
+    {
+      volatile u32* c = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1BC0u));
+      *c = *c + 1u;
+    }
+    else if (!set && (m_interrupt_cause & INT_CAUSE_DSP))
+    {
+      volatile u32* c = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1BCCu));
+      *c = *c + 1u;
+    }
+  }
   if (set)
     m_interrupt_cause |= cause_mask;
   else

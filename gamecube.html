@@ -335,8 +335,21 @@
       // sleeping forever (globalCounter=0). Disable the takeover: dolphin's CPU thread owns
       // the CPU for the whole session (native model). self.__dcTakeover=1 to re-enable.
       window.__dolphinDualCore = true;
-      var _armFrame = parseInt((new URLSearchParams(location.search).get('armframe')) || '300', 10) || 300;
+      // [park-trap disarm 2026-07-22] The restructure above disabled the ppc-worker takeover,
+      // but the armframe=300 default still ARMED the park-trap: PixelEngine arms at
+      // SetFinish#300, JitWasm parks at MP4's 0x800ba2f0 idle spin (non-MP4 games instead get
+      // the armed downcount=64 clamp forever), and with no worker taking over the page gate
+      // never opens — every game froze at framesNow==300 (MP4 board / SAB SEGA-logo wedge,
+      // PPCHalt + garbage-FIFO-tail faces). No takeover => nothing may arm: default 0.
+      // ?armframe=N still overrides for takeover A/B (pair with self.__dcTakeover=1).
+      var _armFrame = parseInt((new URLSearchParams(location.search).get('armframe')) || '0', 10) || 0;
       new Uint32Array(sharedMemory.buffer)[0x026B0A30 >> 2] = _armFrame;
+      // [native dual-core 2026-07-22 — UNCONDITIONAL, user directive "no flags, it is the only
+      // way"] SAB 0x026B0AF0 = 1 always: Core.cpp runs the REAL RunGpuLoop on the spawned
+      // gpu_thread pthread and Main.cpp retro_run has no proxy-main decode. The 2026-07-22
+      // ?gputhread=1 experiment PROVED the gpu_thread shares memory (fifoAddrGpu==fifoAddrCpu,
+      // rglEntry 4.6M) — the old "memory-isolated" neuter rationale was false.
+      new Uint32Array(sharedMemory.buffer)[0x026B0AF0 >> 2] = 1;
     } catch (e) {}
 
     // Spawn dolphin (its main pthread inherits sharedMemory via

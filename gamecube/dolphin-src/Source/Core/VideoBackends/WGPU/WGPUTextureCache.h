@@ -5,6 +5,7 @@
 
 #include <emscripten.h>  // MAIN_THREAD_EM_ASM (one-shot diagnostics)
 
+#include "Core/Core.h"  // [dc device-gate 2026-07-22] WGPUDeviceLiveOnThisThread
 #include "VideoBackends/WGPU/WGPUGfx.h"
 #include "VideoBackends/WGPU/WGPUTexture.h"
 #include "VideoCommon/FramebufferManager.h"
@@ -39,6 +40,23 @@ protected:
                            float gamma, bool clamp_top, bool clamp_bottom,
                            const std::array<u32, 3>& filter_coefficients) override
   {
+    // [dc device-gate 2026-07-22 — the drain-#59 freeze] The gpu_thread decode reaches this on
+    // the boot scene's first EFB copy; BlitToTexture then issues wgpu* calls on a thread with
+    // NO WebGPU device (emdawnwebgpu objects are per-thread) and the thread never returns —
+    // seq-diag: last drain stamp #59, then 34 producer bursts with zero further GPU stamps, no
+    // trap event. Same interim gate as VertexManager Flush (Fifo.cpp [dual-core hybrid]);
+    // lifts when the device moves to this thread.
+    if (!Core::WGPUDeviceLiveOnThisThread())
+    {
+      static bool s_gate_logged = false;
+      if (!s_gate_logged)
+      {
+        s_gate_logged = true;
+        MAIN_THREAD_EM_ASM({ postMessage({cmd: 'print', txt:
+          '[wgpu] CopyEFBToCacheEntry SKIPPED on non-device thread (interim gate)'}); });
+      }
+      return;
+    }
     if (!entry || !entry->texture || !g_framebuffer_manager)
       return;
 

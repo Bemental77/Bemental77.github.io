@@ -676,37 +676,17 @@ void PowerPCManager::CheckExceptions()
 void PowerPCManager::CheckExternalExceptions()
 {
 #ifdef __EMSCRIPTEN__
-  // [torn-send fix 2026-07-10 — PERMANENT] Never deliver while the worker has a WRITE cmd
-  // (5/6/7) posted-unserviced in the mailbox slot. The torn-send forensic proved the DSP-family
-  // wedge: a delivery lands during a store's round-trip window, samples ctx.PC = the store's own
-  // pre-op pc, and the rfi RE-EXECUTES the committed store (same-HI re-write at 0x800c733c) —
-  // the send never reaches its LO and the entry-guard poll wedges. Post-takeover is inherently
-  // safe (one mailbox slot: can't be mid-write AND mid-cmd-10); this closes the BOOT-ERA window
-  // where dolphin delivers autonomously while the worker's store awaits service. Bits stay
-  // pending — the next call (write serviced, pc advanced) delivers with a coherent resume pc.
-  {
-    volatile u32* const mbx = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x02000000u));
-    const u32 mcmd = mbx[0];
-    if (mbx[3] != 0u && mcmd >= 5u && mcmd <= 7u)
-      return;
-  }
-  // [slice-active gate 2026-07-10 — PERMANENT, generalizes the torn-send gate] Never deliver
-  // autonomously while the worker is MID-SLICE (SAB 0x026B1A00, set for the whole slice incl.
-  // time parked in mailbox round-trips). The write-cmd gate above only closed the in-slot
-  // window; ctx.PC LAGS at the last set_pc'd op (pre-op set_pc fires only for some op classes),
-  // so a delivery during a READ round-trip — or between round-trips — still samples a stale
-  // store pc and the rfi re-executes committed side-effecting stores from it (duplicate-LO
-  // into AX = the -8 imbalance; same class as HI-re-exec and candidate root for the EXI face).
-  // Invariant: an interrupted block resumes at the interrupted instruction or the interrupt
-  // defers to a boundary — never re-enter at a rewound pc. Deliveries reach the worker's guest
-  // only at true boundaries: the worker's own loop-top vectoring, cmd-10 (g_in_cmd10), or
-  // between slices (flag=0, pc committed coherent). Bits stay pending; no deadlock — this
-  // gates delivery, not the mailbox drain.
-  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A00u)) != 0u &&
-      g_in_cmd10 == 0u)
-  {
-    return;
-  }
+  // [takeover-gate strip 2026-07-22 — native-exact delivery] The torn-send mailbox gate
+  // (mbx cmd 5-7) and the slice-active gate (SAB 0x026B1A00) are DELETED. Both guarded the
+  // ppc-worker takeover's mailbox-round-trip store windows — a topology that no longer exists
+  // (the in-process EmuThread executes guest stores directly; the worker never owns the CPU).
+  // The slice-active flag was WORSE than dead: the boot handshake's single dispatch round-trip
+  // sets 0x026B1A00=1 (ppc_worker.js:2200) and the no-takeover path can leave it set forever,
+  // gating ALL autonomous EXTERNAL_INT delivery. One-shot interrupts (ARAM-DMA completion #10)
+  // then outwaited the guest's own DSP_CONTROL poll-write, which ack-cleared the cause before
+  // delivery — audio-init froze at aramWrite=0x4500, overlay never started, DVD read 12 never
+  // issued (MP4 boot stall; VI survived only because it re-fires every frame). Native delivers
+  // at the first EE=1 boundary with no such gates.
 #endif
 #ifdef __EMSCRIPTEN__
   // [os-ready gate 2026-07-03 — choke point] Hold ALL maskable delivery until MEM[0xC0]
@@ -731,20 +711,9 @@ void PowerPCManager::CheckExternalExceptions()
   // EXTERNAL INTERRUPT
   // Handling is delayed until MSR.EE=1.
 #if defined(__EMSCRIPTEN__)
-  // [single-owner delivery 2026-07-03 — THE halt root] While the ppc-worker owns the CPU,
-  // ONLY the worker-requested cmd-10 route (g_in_cmd10, worker parked in Atomics.wait) may
-  // vector. Autonomous dolphin paths (JitWasm excursions -> CheckExceptions terminal-else)
-  // were delivering EXT into the worker's LIVE execution (ri-trace: caller=2 owner=1
-  // in_cmd10=0, srr0 inside OSDisable/RestoreInterrupts); when the collision landed in
-  // OSLoadContext's mtsrr1 tail, the worker clobbered the delivery's SRR1 to an RI=0 image,
-  // the vector stub branched to OSDefaultExceptionHandler by design (dolsdk OS.c stub:
-  // non-recoverable check), and the guest PPCHalted mid-boot. Bits stay pending; the worker
-  // delivers them at its next safe block boundary.
-  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u &&
-      g_in_cmd10 == 0u)
-  {
-    return;
-  }
+  // [takeover-gate strip 2026-07-22] single-owner delivery gate DELETED with the takeover
+  // architecture (cpu_owner is never 1 in the native dual-core topology; see the strip note
+  // at the top of this function).
 #endif
   if (exceptions && m_ppc_state.msr.EE)
   {
@@ -811,6 +780,19 @@ void PowerPCManager::CheckExternalExceptions()
 #endif
 
       DEBUG_LOG_FMT(POWERPC, "EXCEPTION_EXTERNAL_INT");
+#ifdef __EMSCRIPTEN__
+      // [aram-diag 2026-07-22 TEMP] EXT delivery commits @0x026B1BC8; commits with the DSP
+      // bit live in the PI cause @0x026B1BC4 (pair with cause-set/clear @0x026B1BC0/1BCC).
+      {
+        volatile u32* t = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1BC8u));
+        *t = *t + 1u;
+        if ((m_system.GetProcessorInterface().m_interrupt_cause & 0x00000040u) != 0u)
+        {
+          volatile u32* d = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1BC4u));
+          *d = *d + 1u;
+        }
+      }
+#endif
       m_ppc_state.Exceptions &= ~EXCEPTION_EXTERNAL_INT;
 
       DEBUG_ASSERT_MSG(POWERPC, (SRR1(m_ppc_state) & 0x02) != 0, "EXTERNAL_INT unrecoverable???");

@@ -7,6 +7,10 @@
 #include <mutex>
 #include <thread>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/threading.h>  // [dc wait fix 2026-07-22] emscripten_futex_wait
+#endif
+
 #include "Common/Event.h"
 #include "Common/Flag.h"
 
@@ -177,6 +181,38 @@ public:
 
       case STATE_SLEEPING:
         // Just relax
+#ifdef __EMSCRIPTEN__
+        // [dc-diag sleep-heartbeat 2026-07-22 TEMP] pre/post-wait counters @0x026B1BE4/1BE8.
+        {
+          volatile unsigned* p =
+              reinterpret_cast<volatile unsigned*>(static_cast<uintptr_t>(0x026B1BE4u));
+          *p = *p + 1u;
+        }
+        // [dc wait fix 2026-07-22 — the PM10 primitive hang] Common::Event::WaitFor
+        // (condition_variable::wait_for -> emscripten condvar+clock) stops returning on the
+        // spawned gpu_thread after ~81 cycles: both the timed wait's own timeout AND Wakeup()'s
+        // notify fail to rouse it (loop-exit marker stays 0, iterations freeze, distance
+        // credits pile up into a dead loop — the MP4 boot stall's terminal cause). Wait on
+        // m_running_state DIRECTLY with engine-level futex slices (memory.atomic.wait32 via
+        // emscripten_futex_wait, 1ms timeout): no condvar, no Common::Event, no chrono clock;
+        // Wakeup()'s state exchange is observed by the poll condition itself, so a lost
+        // notify costs at most 1ms.
+        {
+          const int max_slices = (timeout > 0) ? static_cast<int>(timeout) : 100;
+          for (int i = 0; i < max_slices && m_running_state.load() == STATE_SLEEPING &&
+                          !m_shutdown.IsSet();
+               ++i)
+          {
+            emscripten_futex_wait(reinterpret_cast<volatile void*>(&m_running_state),
+                                  static_cast<uint32_t>(STATE_SLEEPING), 1.0);
+          }
+        }
+        {
+          volatile unsigned* p =
+              reinterpret_cast<volatile unsigned*>(static_cast<uintptr_t>(0x026B1BE8u));
+          *p = *p + 1u;
+        }
+#else
         if (timeout > 0)
         {
           m_new_work_event.WaitFor(std::chrono::milliseconds(timeout));
@@ -185,6 +221,7 @@ public:
         {
           m_new_work_event.Wait();
         }
+#endif
         break;
       }
     }

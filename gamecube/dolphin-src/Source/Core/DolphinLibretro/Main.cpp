@@ -453,15 +453,13 @@ void retro_run(void)
     // never fires. EmulatorState(true) is idempotent (Flag.Set + GPU mainloop Wakeup).
     system.GetFifo().EmulatorState(true);
 
-    // [gpu-drain-on-proxy-main 2026-07-21] Decode the GX FIFO HERE, on the proxy-main pthread.
-    // The guest CPU runs on dolphin's EmuThread and fills the CP FIFO in THIS same memory; the
-    // dolphin gpu_thread is memory-isolated (verified: identical &m_fifo, but it reads distance=0
-    // while the EmuThread fills 2976) so RunGpuLoop can never drain it. The decode must run where
-    // the WebGPU device lives — the proxy-main thread that ran ContextReset — because RunFifo
-    // issues device calls (EFB/texture/XFB); running it on the EmuThread hung on those ungated
-    // calls (reached Hu3DAnimInit then froze). Pumping it here (device thread) drains + renders +
-    // raises PE_FINISH so GXDrawDone/GXWaitDrawDone completes — the design that rendered pre-restructure.
-    system.GetFifo().DrainFifoOnCpuThread(100000);
+    // [dc gpu-slice 2026-07-22 — device-migration Phase 1] THIS proxied-main pthread owns the
+    // WebGPU device (per-thread JS objects; async init needs its yielding event loop), so it IS
+    // the GPU thread: run the exact RunGpuLoop payload per pump. Native per-chunk protocol,
+    // device-gates auto-lift here (geometry renders), PullEvents happens inside the slice
+    // (head + per-chunk) — GATE B retired. The spawned gpu_thread parks (Core.cpp); the
+    // CPU/GPU dual-core split is EmuThread ∥ this thread.
+    system.GetFifo().RunGpuLoopSlice();
 #else
     Core::DoFrameStep(system);
     system.GetFifo().RunGpuLoop();

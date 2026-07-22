@@ -16,6 +16,7 @@
 
 #include "Common/Assert.h"
 #include "Common/Logging/Log.h"
+#include "Core/Core.h"  // [dc device-gate 2026-07-22] WGPUDeviceLiveOnThisThread
 #include "Core/FifoPlayer/FifoRecorder.h"
 #include "Core/HW/Memmap.h"
 #include "Core/System.h"
@@ -168,6 +169,20 @@ public:
     // load vertices
     const u32 size = vertex_size * num_vertices;
 
+#ifdef __EMSCRIPTEN__
+    // [dc device-gate 2026-07-22 — the drain-#79 RunFifo freeze] The frozen chunk decodes to
+    // the FIRST DRAW (0x80 quads, VAT setup preceding); RunVertices reaches the WGPU vertex-
+    // manager buffer paths on the gpu_thread, where no per-thread WebGPU device exists, and
+    // never returns. Stream advance is computed by detail::RunCommand independently of
+    // RunVertices, so skipping vertex processing here is size-safe. Interim gate, same class
+    // as the Flush/EFB-copy gates; lifts with the device migration. Gate-hit flag @0x026B3370.
+    if (!Core::WGPUDeviceLiveOnThisThread())
+    {
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3370u)) = 1u;
+      m_cycles += num_vertices * 4 * 3 + 6;
+      return;
+    }
+#endif
     const u32 bytes =
         VertexLoaderManager::RunVertices<is_preprocess>(vat, primitive, num_vertices, vertex_data);
 

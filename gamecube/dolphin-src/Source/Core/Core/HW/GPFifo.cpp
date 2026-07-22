@@ -126,6 +126,7 @@ void GPFifoManager::UpdateGatherPipe()
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B4Cu)) = static_cast<u32>(reinterpret_cast<uintptr_t>(&cp_fifo));
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B50u)) = cp_fifo.CPReadPointer.load(std::memory_order_relaxed);
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B54u)) = cp_base;
+    // [nonce STRIPPED 2026-07-22 — proved same-address coherence (PM11); done.]
     // [dl-fifo fix 2026-07-20] The wp-invariant only holds when the CPU FIFO and the CP (GP) FIFO
     // describe the SAME buffer (a genuinely LINKED GP FIFO). For a display-list / MEMORY FIFO the
     // guest UNLINKS the CP (GXSetCPUFifo else-branch -> __GXFifoLink(0)), so m_fifo_cpu_base (= the

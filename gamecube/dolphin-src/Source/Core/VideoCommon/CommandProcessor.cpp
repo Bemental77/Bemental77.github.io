@@ -206,6 +206,17 @@ void CommandProcessorManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
   mmio->Register(base | CTRL_REGISTER, MMIO::DirectRead<u16>(&m_cp_ctrl_reg.Hex),
                  MMIO::ComplexWrite<u16>([](Core::System& system_, u32, u16 val) {
                    auto& cp = system_.GetCommandProcessor();
+                   // [link-diag ring 2026-07-22 TEMP] CP CTRL writes {val, guest pc} — the
+                   // link/unlink timeline. head @0x026B3240, 16 entries @0x026B3250 (8B each).
+                   {
+                     volatile u32* const head =
+                         reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3240u));
+                     const u32 h = *head;
+                     const uintptr_t e = 0x026B3250u + (h & 15u) * 8u;
+                     *reinterpret_cast<volatile u32*>(e) = val;
+                     *reinterpret_cast<volatile u32*>(e + 4u) = system_.GetPPCState().pc;
+                     *head = h + 1u;
+                   }
                    UCPCtrlReg tmp(val & 0x3F);
                    cp.m_cp_ctrl_reg.Hex = tmp.Hex;
                    cp.SetCpControlRegister();
@@ -368,7 +379,7 @@ void CommandProcessorManager::GatherPipeBursted()
   // if we aren't linked, we don't care about gather pipe data
   if (!m_cp_ctrl_reg.GPLinkEnable)
   {
-    if (_dc_owner) { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AB0u)); *p = *p + 1u; }
+    { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AB0u)); *p = *p + 1u; }  // [UNGATED 2026-07-22]
     if (IsOnThread(m_system) && !m_system.GetFifo().UseDeterministicGPUThread())
     {
       // In multibuffer mode is not allowed write in the same FIFO attached to the GPU.
@@ -408,7 +419,8 @@ void CommandProcessorManager::GatherPipeBursted()
     m_system.GetCoreTiming().ForceExceptionCheck(0);
 
   m_fifo.CPReadWriteDistance.fetch_add(GPFifo::GATHER_PIPE_SIZE, std::memory_order_seq_cst);
-  if (_dc_owner) { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AB4u)); *p = *p + 1u; }
+  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AB4u)); *p = *p + 1u; }  // [UNGATED 2026-07-22]
+  // [dist/seq-diag STRIPPED 2026-07-22 — served PM11/PM12; per-burst publish cost removed.]
 
   m_system.GetFifo().RunGpu();
 

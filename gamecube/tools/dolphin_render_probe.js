@@ -1277,6 +1277,54 @@ function startServer() {
             bw.waitForN = A[0x026B1B14 >> 2] >>> 0;        // Event::WaitFor poll entries (any Event)
             bw.emuRunning = A[0x026B1B1C >> 2] >>> 0;      // m_emu_running_state.IsSet() (GPU gate)
             bw.rglElse = A[0x026B1B20 >> 2] >>> 0;         // reached else-branch (past emu-running gate)
+            // [dc-diag nonce 2026-07-22] split-memory decider (GPFifo.cpp CPU half / Fifo.cpp GPU half)
+            bw.nonceCpuN = A[0x026B1BF0 >> 2] >>> 0;                     // CPU counter (shared region)
+            bw.nonceCpuFifo0 = (A[0x026B1BF4 >> 2] >>> 0).toString(16);  // CPU raw read of fifo[0]
+            bw.nonceGpuFifo0 = (A[0x026B1BF8 >> 2] >>> 0).toString(16);  // GPU raw read of fifo[0]
+            bw.nonceGpuSeen = A[0x026B1BFC >> 2] >>> 0;                  // GPU re-read of CPU counter
+            bw.dcInitDual = A[0x026B1BE0 >> 2] >>> 0;                    // Fifo::Init IsDualCoreMode (1=yes 2=no)
+            bw.aramReqN = A[0x026B1BD0 >> 2] >>> 0;                      // ARAM DMA requests (Do_ARAM_DMA)
+            bw.mailPopN = A[0x026B1BB0 >> 2] >>> 0;                      // DSP_MAIL_FROM_DSP_LO reads (mail pops)
+            bw.maskedAramN = A[0x026B3004 >> 2] >>> 0;                   // completions with ARAM enable CLEAR
+            bw.arqCb = (A[0x026B3220 >> 2] >>> 0).toString(16);          // guest __AR_Callback at last completion
+            bw.mq45f4 = (A[0x026B3230 >> 2] >>> 0) + '/' + (A[0x026B3234 >> 2] >>> 0) + '/' + (A[0x026B3238 >> 2] >>> 0); // msgCount/first/used
+            // [dist-diag] GPU {plain,rmw,addr} vs CPU {val,addr} distance views
+            bw.distGpu3 = (A[0x026B3300 >> 2] >>> 0) + '/' + (A[0x026B3304 >> 2] >>> 0) + '/0x' + (A[0x026B3308 >> 2] >>> 0).toString(16);
+            bw.distCpu2 = (A[0x026B3310 >> 2] >>> 0) + '/0x' + (A[0x026B3314 >> 2] >>> 0).toString(16);
+            bw.rglExited = A[0x026B331C >> 2] >>> 0;                     // 1 = RunGpuLoop's mainloop returned
+            // [perf-split] device-thread slice 0.1ms accum / slice count / CPU throttle-sleep 0.1ms accum
+            bw.perfSplit = (A[0x026B3380 >> 2] >>> 0) + '/' + (A[0x026B3384 >> 2] >>> 0) + '/' + (A[0x026B3388 >> 2] >>> 0)
+              + '/' + (A[0x026B3390 >> 2] >>> 0) + '/' + (A[0x026B3394 >> 2] >>> 0); // +advance 0.1ms/count
+            // [seq-diag] shared seq: now / payload / burst / drain / sleep / mainloop-tick
+            bw.seqs = (A[0x026B3320 >> 2] >>> 0) + '/' + (A[0x026B3324 >> 2] >>> 0) + '/' + (A[0x026B3328 >> 2] >>> 0)
+              + '/' + (A[0x026B3330 >> 2] >>> 0) + '/' + (A[0x026B3334 >> 2] >>> 0) + '/' + (A[0x026B3338 >> 2] >>> 0);
+            // [stage-diag] drain-body stages A(post-Read)/B(post-RunFifo)/C(post-Status)
+            bw.stages = (A[0x026B3360 >> 2] >>> 0) + '/' + (A[0x026B3364 >> 2] >>> 0) + '/' + (A[0x026B3368 >> 2] >>> 0);
+            // [stage-diag] the frozen chunk: 32 bytes of guest MEM1 at the GPU's last CPReadPointer
+            bw.frozenChunk = (function() { var rp = A[0x026B1B40 >> 2] >>> 0, out = [];
+              if (rp) for (var k = 0; k < 8; k++) out.push((rd32((0x80000000 + rp + k * 4) >>> 0) >>> 0).toString(16).padStart(8, '0'));
+              return '0x' + rp.toString(16) + ': ' + out.join(' '); })();
+            // [link-diag] CP CTRL write ring {val@pc}, oldest-first
+            bw.ctrlRing = (function() { var h = A[0x026B3240 >> 2] >>> 0, out = [];
+              for (var k = (h >= 16 ? h - 16 : 0); k < h; k++) { var e = (0x026B3250 + (k & 15) * 8) >> 2;
+                out.push((A[e] >>> 0).toString(16) + '@' + (A[e + 1] >>> 0).toString(16)); }
+              return out.join(' '); })();
+            bw.arqQLo = (A[0x026B3224 >> 2] >>> 0).toString(16);         // guest __ARQRequestQueueLo
+            bw.arqQHi = (A[0x026B3228 >> 2] >>> 0).toString(16);         // guest __ARQRequestQueueHi
+            bw.complCtl = (A[0x026B3008 >> 2] >>> 0).toString(16);       // control Hex at last completion
+            bw.cwTotal = A[0x026B2714 >> 2] >>> 0;                       // DSP_CONTROL writes
+            bw.cwAramAck = A[0x026B2718 >> 2] >>> 0;                     // ...that ack ARAM
+            // [aram-diag ring] last-32 DSP_CONTROL writes {val,pc,preHex,seq}, oldest-first
+            bw.cwRing = (function() { var h = A[0x026B3000 >> 2] >>> 0, out = [];
+              for (var k = (h >= 32 ? h - 32 : 0); k < h; k++) { var e = (0x026B3010 + (k & 31) * 16) >> 2;
+                out.push((A[e] >>> 0).toString(16) + '@' + (A[e + 1] >>> 0).toString(16) + '/' + (A[e + 2] >>> 0).toString(16)); }
+              return out.join(' '); })();
+            bw.dspCauseSet = A[0x026B1BC0 >> 2] >>> 0;                   // PI INT_CAUSE_DSP 0->1 sets
+            bw.dspCauseClr = A[0x026B1BCC >> 2] >>> 0;                   // PI INT_CAUSE_DSP 1->0 clears
+            bw.extDelivN = A[0x026B1BC8 >> 2] >>> 0;                     // EXT delivery commits
+            bw.extDelivDsp = A[0x026B1BC4 >> 2] >>> 0;                   // ...with DSP bit in cause
+            bw.sleepPre = A[0x026B1BE4 >> 2] >>> 0;                      // BlockingLoop pre-wait heartbeat
+            bw.sleepPost = A[0x026B1BE8 >> 2] >>> 0;                     // BlockingLoop post-wait heartbeat
             bw.cpIntWait = A[0x026B1B24 >> 2] >>> 0;       // command_processor.IsInterruptWaiting()
             bw.cpAtBp = A[0x026B1B28 >> 2] >>> 0;          // AtBreakpoint
             bw.cpDistGpu = A[0x026B1B30 >> 2] >>> 0;       // CPReadWriteDistance seen inside else-branch

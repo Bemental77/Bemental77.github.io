@@ -6,6 +6,10 @@
 #include <atomic>
 #include <cstring>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>  // [perf-split 2026-07-22 TEMP] emscripten_get_now
+#endif
+
 #include "Common/Assert.h"
 #include "Common/BlockingLoop.h"
 #include "Common/ChunkFile.h"
@@ -20,6 +24,7 @@
 #include "Core/Core.h"  // Core::WGPUDeviceLiveOnThisThread — dual-core hybrid device-thread gate
 #include "Core/CoreTiming.h"
 #include "Core/HW/GPFifo.h"
+#include "Core/HW/MMIO.h"  // [dc cp-gate 2026-07-22] DcCpRegGate
 #include "Core/HW/Memmap.h"
 #include "Core/Host.h"
 #include "Core/System.h"
@@ -96,8 +101,20 @@ void FifoManager::Init()
   // Padded so that SIMD overreads in the vertex loader are safe
   m_video_buffer = static_cast<u8*>(Common::AllocateMemoryPages(FIFO_SIZE + 4));
   ResetVideoBuffer();
+#ifdef __EMSCRIPTEN__
+  // [dc prepare fix 2026-07-22] Prepare() was gated on IsDualCoreMode() — if the config isn't
+  // yet dual-core at Init time in our boot order, RunGpuLoop runs on an UNPREPARED BlockingLoop
+  // whose sleep/wake state machine then breaks exactly as observed (loop completed 4.5M boot-era
+  // payloads, entered an unbounded wait, and 93 later RunGpu() Wakeups never woke it — see
+  // native-exact-dualcore/TASKS.md). Dual-core is unconditional now; Prepare unconditionally,
+  // and publish the Init-time IsDualCoreMode() @0x026B1BE0 to confirm the order theory.
+  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1BE0u)) =
+      m_system.IsDualCoreMode() ? 1u : 2u;
+  m_gpu_mainloop.Prepare();
+#else
   if (m_system.IsDualCoreMode())
     m_gpu_mainloop.Prepare();
+#endif
   m_sync_ticks.store(0);
 }
 
@@ -307,20 +324,37 @@ void FifoManager::ResetVideoBuffer()
   m_fifo_aux_read_ptr = m_fifo_aux_data;
 }
 
-// Description: Main FIFO update loop
-// Purpose: Keep the Core HW updated about the CPU-GPU distance
-void FifoManager::RunGpuLoop()
+// [dc gpu-slice 2026-07-22 — device-migration Phase 1] The EXACT RunGpuLoop payload as a
+// callable slice. Under emscripten the WebGPU device's JS objects are per-thread and its async
+// init can only complete on a thread that yields to its worker event loop — so the DEVICE
+// thread (proxied-main, which pumps JS every retro_run) IS the GPU thread, and it runs this
+// slice per pump. Native per-chunk protocol preserved verbatim (SafeCPReadPointer publication,
+// per-chunk PullEvents, SetCPStatusFromGPU, watermark/sync handling); the three decode
+// device-gates (EFB-copy trigger, RunVertices, VertexManager Flush) auto-lift here because
+// WGPUDeviceLiveOnThisThread() is true on the calling thread — geometry renders again. The
+// spawned gpu_thread parks (Core.cpp); its never-Run mainloop keeps FlushGpu/ExitGpuLoop no-op.
+void FifoManager::RunGpuLoopSlice()
 {
-  // [dc-diag 2026-07-21 TEMP] RunGpuLoop ENTRY (before the mainloop) — proves the gpu_thread
-  // reached RunGpuLoop at all.
-  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B10u)); *p = *p + 1u; }
-  m_gpu_mainloop.Run(
-      [this] {
-        // [dc-diag 2026-07-21 TEMP] RunGpuLoop callback entry count (non-gated) — proves the
-        // gpu_thread mainloop is ticking. Remove after localizing the PE_FINISH break.
+#ifdef __EMSCRIPTEN__
+  // [perf-split 2026-07-22 TEMP] device-thread slice self-time: accumulated 0.1ms units
+  // @0x026B3380, slice count @0x026B3384. Utilization = accum / wall — vs the CPU thread's
+  // throttle-sleep accumulation @0x026B3388 (CoreTiming::SleepUntil). Names the 60fps limiter:
+  // EmuThread-never-sleeps = guest JIT bound; slice-eats-pump = render/readback bound.
+  const double slice_t0 = emscripten_get_now();
+#endif
+  {
+        // [dc-diag 2026-07-21 TEMP] slice entry count (non-gated).
         { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AD0u)); *p = *p + 1u; }
         // Run events from the CPU thread.
-        AsyncRequests::GetInstance()->PullEvents();
+        // [dc device-events 2026-07-22] Native's GPU thread pulls AsyncRequests because it IS the
+        // render/device thread. Until the WGPU device moves to this thread, pulling here STEALS
+        // ViSwap/EFB events from the device-owning proxy-main (GATE B in retro_run) and the
+        // device-gate drops them (observed: rendered=false, presents eaten, MP4 boot stalled in
+        // audio/overlay init at dvdCmdN=11). Pull only where the device lives.
+#ifdef __EMSCRIPTEN__
+        if (Core::WGPUDeviceLiveOnThisThread())
+#endif
+          AsyncRequests::GetInstance()->PullEvents();
         // [dc-diag TEMP] payload reached past PullEvents (did PullEvents block?).
         { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B18u)); *p = *p + 1u; }
 
@@ -354,6 +388,8 @@ void FifoManager::RunGpuLoop()
           { volatile u32* w = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B24u)); *w = command_processor.IsInterruptWaiting() ? 1u : 0u; }
           { volatile u32* b = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B28u)); *b = AtBreakpoint(m_system) ? 1u : 0u; }
           { volatile u32* d = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B30u)); *d = fifo.CPReadWriteDistance.load(std::memory_order_relaxed); }
+          // [dist-diag STRIPPED 2026-07-22 — served its purpose (PM11/PM12): proved coherence
+          // and located the RunFifo freezes; the per-iteration RMW probe was hot-path cost.]
           // [dc-diag TEMP] MAX CPReadWriteDistance the GPU ever observes + live FIFO pointers —
           // did the GPU EVER see the credit, or was it reset to 0 before the GPU's first check?
           { const u32 dd = fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
@@ -362,7 +398,9 @@ void FifoManager::RunGpuLoop()
             *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B40u)) = fifo.CPReadPointer.load(std::memory_order_relaxed);
             *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B44u)) = fifo.CPWritePointer.load(std::memory_order_relaxed);
             // [dc-diag TEMP] &m_fifo address from the GPU thread — compare to the CPU thread's (0x026B1B4C)
-            *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B48u)) = static_cast<u32>(reinterpret_cast<uintptr_t>(&fifo)); }
+            *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B48u)) = static_cast<u32>(reinterpret_cast<uintptr_t>(&fifo));
+            // [nonce STRIPPED 2026-07-22 — proved same-address coherence (PM11); done.]
+            }
 
           // check if we are able to run this buffer
           while (!command_processor.IsInterruptWaiting() &&
@@ -377,6 +415,7 @@ void FifoManager::RunGpuLoop()
             u32 cyclesExecuted = 0;
             u32 readPtr = fifo.CPReadPointer.load(std::memory_order_relaxed);
             ReadDataFromFifo(readPtr);
+            // [stage-diag STRIPPED 2026-07-22 — located the drain-#59/#79 freezes (PM12).]
 
             if (readPtr == fifo.CPEnd.load(std::memory_order_relaxed))
               readPtr = fifo.CPBase.load(std::memory_order_relaxed);
@@ -420,7 +459,11 @@ void FifoManager::RunGpuLoop()
             // If we don't, s_swapRequested or s_efbAccessRequested won't be set to false
             // leading the CPU thread to wait in Video_OutputXFB or Video_AccessEFB thus slowing
             // things down.
-            AsyncRequests::GetInstance()->PullEvents();
+            // [dc device-events 2026-07-22] see the payload-head gate — device thread pulls.
+#ifdef __EMSCRIPTEN__
+            if (Core::WGPUDeviceLiveOnThisThread())
+#endif
+              AsyncRequests::GetInstance()->PullEvents();
           }
 
           // fast skip remaining GPU time if fifo is empty
@@ -443,8 +486,24 @@ void FifoManager::RunGpuLoop()
             g_framebuffer_manager->RefreshPeekCache();
           }
         }
-      },
-      100);
+  }
+#ifdef __EMSCRIPTEN__
+  {
+    volatile u32* const acc = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3380u));
+    *acc = *acc + static_cast<u32>((emscripten_get_now() - slice_t0) * 10.0);
+    volatile u32* const n = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3384u));
+    *n = *n + 1u;
+  }
+#endif
+}
+
+// Description: Main FIFO update loop
+// Purpose: Keep the Core HW updated about the CPU-GPU distance
+void FifoManager::RunGpuLoop()
+{
+  // [dc-diag 2026-07-21 TEMP] RunGpuLoop ENTRY (before the mainloop).
+  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B10u)); *p = *p + 1u; }
+  m_gpu_mainloop.Run([this] { RunGpuLoopSlice(); }, 100);
 }
 
 void FifoManager::FlushGpu()
@@ -501,6 +560,16 @@ int FifoManager::RunGpuOnCpu(int ticks)
          fifo.CPReadWriteDistance.load(std::memory_order_acquire) && !AtBreakpoint(m_system) &&
          available_ticks >= 0)
   {
+#ifdef __EMSCRIPTEN__
+    // [dc cp-gate 2026-07-22] Hold the CP-reg gate for the whole 32B chunk so an EmuThread
+    // CP/PI FIFO-register MMIO write (ctrl/base/end/rp/reset) can never land mid-chunk —
+    // the atomicity native dual-core gets from its per-chunk bFF_GPReadEnable check plus the
+    // guest's ReadDisable-before-reconfig protocol. See MMIO.h DcCpRegGate().
+    std::lock_guard<std::mutex> dc_cp_lk(MMIO::DcCpRegGate());
+    if (!fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) ||
+        !fifo.CPReadWriteDistance.load(std::memory_order_acquire) || AtBreakpoint(m_system))
+      break;  // re-check under the gate: a reconfig may have landed while we waited
+#endif
     // [dc-diag 2026-07-21 TEMP] RunGpuOnCpu drain iterations — is the CPU-side drain consuming
     // the FIFO (explaining cpDistGpu=0 while RunGpuLoop's rglDrain=0)?
     { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B34u)); *p = *p + 1u; }
@@ -536,6 +605,21 @@ int FifoManager::RunGpuOnCpu(int ticks)
     }
 
     fifo.CPReadWriteDistance.fetch_sub(GPFifo::GATHER_PIPE_SIZE, std::memory_order_relaxed);
+    // [dc safe-rp fix 2026-07-22] Publish the consumed read pointer to the guest-visible
+    // SafeCPReadPointer exactly as native RunGpuLoop does per chunk (Fifo.cpp RunGpuLoop
+    // buffer-empty branch). RunGpuOnCpu is the single-core drain and never updated it —
+    // single-core registers the raw-CPReadPointer MMIO handlers so it never needed Safe*.
+    // Our emscripten dual-core seam registers the DUAL-CORE (is_on_thread) handlers but
+    // drains through THIS path, so every guest read of FIFO_READ_POINTER / RW_DISTANCE was
+    // served from a FROZEN SafeCPReadPointer while the drain consumed invisibly — the
+    // guest's FIFO math then ran on stale state at the MP4 movie transition (observed
+    // faces: "FIFOs linked but out of sync" + GFX FIFO Unknown Opcode; unhandled-exception
+    // PPCHalt at 0x800B4334).
+    if ((m_video_buffer_write_ptr - m_video_buffer_read_ptr) == 0)
+    {
+      fifo.SafeCPReadPointer.store(fifo.CPReadPointer.load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+    }
     // [domino3-real] 0x026B1AB8 = 32B chunks RunGpuOnCpu actually consumed post-takeover (gated).
     if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u)
     { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AB8u)); *p = *p + 1u; }

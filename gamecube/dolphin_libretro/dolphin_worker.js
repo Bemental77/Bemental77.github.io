@@ -38,6 +38,17 @@
     self.Module = self.Module || {};
     self.Module.print    = function (t) { postMessage({ cmd: 'print', txt: '[dolphin:stdout] ' + t }); };
     self.Module.printErr = function (t) { postMessage({ cmd: 'print', txt: '[dolphin:stderr] ' + t }); };
+    // [worker-error capture 2026-07-22] A wasm trap / uncaught error in ANY pthread (incl. the
+    // gpu_thread) was INVISIBLE: emscripten's own handlers don't reach the page, and the probe's
+    // pageerror never fires for worker deaths. Ride the same {cmd:'print'} relay the
+    // stdout/stderr bridge above uses (proven to reach the page console).
+    self.addEventListener('error', function (ev) {
+      try { postMessage({ cmd: 'print', txt: '[pthread-ERROR ' + self.name + '] '
+        + (ev && (ev.message || ev.type)) + ' @' + (ev && ev.filename) + ':' + (ev && ev.lineno) }); } catch (_) {}
+    });
+    self.addEventListener('unhandledrejection', function (ev) {
+      try { postMessage({ cmd: 'print', txt: '[pthread-REJECT ' + self.name + '] ' + (ev && ev.reason) }); } catch (_) {}
+    });
     // [cache-bust] The PROXY-main pthread (which runs the emulator main + the
     // video_cb present path) is an 'em-pthread' loaded HERE — without a buster it
     // reused a STALE cached emcc.js/.wasm, so new bridge code (e.g. the HW-render

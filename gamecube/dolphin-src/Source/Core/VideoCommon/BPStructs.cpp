@@ -263,6 +263,21 @@ static void BPWritten(PixelShaderManager& pixel_shader_manager, XFStateManager& 
   // first and clear afterwards.
   case BPMEM_TRIGGER_EFB_COPY:  // Copy EFB Region or Render to the XFB or Clear the screen.
   {
+#ifdef __EMSCRIPTEN__
+    // [dc device-gate 2026-07-22 — the drain-#59 RunFifo freeze] The frozen chunk decodes to
+    // this trigger (stage-diag: post-ReadDataFromFifo stamped, RunFifo never returned; chunk
+    // bytes "61 52 ..." at rp). The copy path CREATES the destination texture (WGPUGfx::
+    // CreateTexture -> wgpu device calls) before ever reaching the gated CopyEFBToCacheEntry —
+    // on the gpu_thread there is no per-thread WebGPU device and the call never returns. Skip
+    // the whole copy on non-device threads (interim, same class as the VertexManager Flush
+    // gate; lifts when the device migrates to the gpu_thread). Pointer advance + PE machinery
+    // continue, so the finish token still decodes. One-shot gate-hit flag @0x026B336C.
+    if (!Core::WGPUDeviceLiveOnThisThread())
+    {
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B336Cu)) = 1u;
+      return;
+    }
+#endif
     // The bottom right is within the rectangle
     // The values in bpmem.copyTexSrcXY and bpmem.copyTexSrcWH are updated in case 0x49 and 0x4a in
     // this function

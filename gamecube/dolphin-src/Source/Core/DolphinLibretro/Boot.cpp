@@ -302,8 +302,20 @@ bool retro_load_game(const struct retro_game_info* game)
   Config::SetBase(Config::MAIN_AUDIO_LATENCY, 0);
   Config::SetBase(Config::MAIN_AUDIO_FILL_GAPS, false);
 
+#ifdef __EMSCRIPTEN__
+  // [dc throttle fix 2026-07-22 — the DSP-storm raiser] The libretro default 0.0 = UNLIMITED
+  // (frontend paces via retro_run) let the freed EmuThread race emulated time at wasm-max once
+  // the native dual-core topology landed: audio hit 743K samples/s (23x native 32K), the MusyX
+  // per-audio-frame service (AID + DSP-mail lockstep, measured 74,868 each/90s with 74,871 mail
+  // pops) consumed the guest CPU, and MP4's init never advanced (gc=0, ARAM upload frozen at
+  // 10/1992 DMAs). Native dual-core runs EmulationSpeed=1.0 with CoreTiming::Throttle sleeping
+  // the CPU thread at VI fields — match it exactly.
+  Config::SetBase(Config::MAIN_EMULATION_SPEED,
+                     Libretro::GetOption<double>(core::EMULATION_SPEED, /*def=*/1.0));
+#else
   Config::SetBase(Config::MAIN_EMULATION_SPEED,
                      Libretro::GetOption<double>(core::EMULATION_SPEED, /*def=*/0.0));
+#endif
   {
     // Overclock (cpu clock rate) — option values in option_defs used strings like "100%" etc.
     double multiplier = Libretro::GetOption<double>(core::CPU_CLOCK_RATE, 1.0);
@@ -526,7 +538,18 @@ bool retro_load_game(const struct retro_game_info* game)
   }
 
   /* disable throttling emulation to match GetTargetRefreshRate() */
+#ifdef __EMSCRIPTEN__
+  // [dc throttle fix 2026-07-22 — the ACTUAL switch] The unconditional temp-disable is the
+  // libretro "frontend paces via retro_run" idiom. Nothing paces our freed EmuThread, so
+  // IsSpeedUnlimited() stayed true regardless of MAIN_EMULATION_SPEED (this flag ORs into it,
+  // CoreTiming.cpp:577) and emulated time raced at wasm-max: audio 750K samples/s (23x native
+  // 32K), MusyX per-audio-frame DSP/AID service storm (~150K interrupts/90s), MP4 init starved
+  // at gc=0. Native dual-core throttles itself (CoreTiming::Throttle at VI fields, speed 1.0)
+  // — match it.
+  Core::SetIsThrottlerTempDisabled(false);
+#else
   Core::SetIsThrottlerTempDisabled(true);
+#endif
   // [dual-core STEP2 2026-07-21] bBootToPause=true parks the CPU thread in State::Paused
   // (CPUSetInitialExecutionState, Core.cpp:342-343) so it only advances one field per
   // Core::DoFrameStep — the guest boot crawled/stalled (globalCounter=0 after 11856

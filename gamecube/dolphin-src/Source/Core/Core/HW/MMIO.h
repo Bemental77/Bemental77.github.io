@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -22,6 +23,16 @@ class System;
 
 namespace MMIO
 {
+#ifdef __EMSCRIPTEN__
+// [dc cp-gate 2026-07-22] Serializes guest CP/PI-page FIFO-register MMIO writes (EmuThread)
+// against each proxy-main FIFO decode chunk (Fifo::RunGpuOnCpu). Native dual-core gets this
+// atomicity structurally: its GPU thread checks bFF_GPReadEnable per 32B chunk and the guest's
+// ReadDisable CTRL write precedes every reconfig, so the decoder never observes a half-applied
+// base/end/rp/ctrl change. Our seam decodes on the proxy-main pthread concurrently with the
+// EmuThread's MMIO writes, which produced the nondeterministic MP4 movie-transition faces
+// ("FIFOs linked but out of sync", GFX FIFO Unknown Opcode, guest PPCHalt). Defined in MMIO.cpp.
+std::mutex& DcCpRegGate();
+#endif
 // There are three main MMIO blocks on the Wii (only one on the GameCube):
 //  - 0x0C00xxxx: GameCube MMIOs (CP, PE, VI, PI, MI, DSP, DVD, SI, EI, AI, GP)
 //  - 0x0D00xxxx: Wii MMIOs and GC mirrors (IPC, DVD, SI, EI, AI)
@@ -142,6 +153,18 @@ public:
   template <typename Unit>
   void Write(Core::System& system, u32 addr, Unit val)
   {
+#ifdef __EMSCRIPTEN__
+    // [dc cp-gate 2026-07-22] CP page (0x0C000xxx: ctrl/clear/base/end/rp/wp/bp/distance) and
+    // PI page (0x0C003xxx: PI_FIFO_RESET -> ResetFifo) writes mutate decode-visible FIFO state;
+    // hold the gate so the proxy-main decoder is never mid-chunk across the mutation.
+    const u32 page = addr & 0x0FFFF000u;
+    if (page == 0x0C000000u || page == 0x0C003000u)
+    {
+      std::lock_guard<std::mutex> lk(DcCpRegGate());
+      GetHandlerForWrite<Unit>(addr).Write(system, addr, val);
+      return;
+    }
+#endif
     GetHandlerForWrite<Unit>(addr).Write(system, addr, val);
   }
 

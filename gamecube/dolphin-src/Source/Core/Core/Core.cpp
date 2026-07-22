@@ -539,7 +539,17 @@ static void FifoPlayerThread(Core::System& system, const std::optional<std::stri
       // RunGpuLoop) — the guest boot stalls at the apploader (dvdCmdN=11, globalCounter=0).
       // The gpu_thread is a Web Worker pthread (not the proxied main thread) so it may block
       // in the loop. This is the "GPU on the correct core" fix.
-#if defined(__EMSCRIPTEN__) || !defined(__LIBRETRO__)
+#if defined(__EMSCRIPTEN__)
+      // [dc gpu-slice 2026-07-22 — device-migration Phase 1] The gpu_thread PARKS. The WebGPU
+      // device's JS objects are per-thread and its async init can only complete on a thread
+      // that yields to its worker event loop — so the DEVICE thread (proxied-main, retro_run
+      // pump) is the GPU thread and runs RunGpuLoopSlice() per pump (Main.cpp). Running the
+      // blocking RunGpuLoop here produced the PM12 RunFifo freezes (wgpu calls on a device-less
+      // thread never return). The never-Run mainloop keeps FlushGpu/ExitGpuLoop no-op. True
+      // parallel GPU thread returns with route A (message-driven GPU worker owning the device)
+      // or JSPI — see native-exact-dualcore/TASKS.md.
+      (void)system;
+#elif !defined(__LIBRETRO__)
       system.GetFifo().RunGpuLoop();
       INFO_LOG_FMT(CONSOLE, "{}", StopMessage(false, "Video Loop Ended"));
 #endif
@@ -1024,9 +1034,18 @@ void Callback_NewField(Core::System& system)
   }
 
   AchievementManager::GetInstance().DoFrame();
-#ifdef __LIBRETRO__
+#if defined(__LIBRETRO__) && !defined(__EMSCRIPTEN__)
+  // Native-libretro idiom: retro_run calls RunGpuLoop() once per frame (Main.cpp #else branch)
+  // and this per-frame Stop breaks it back out so retro_run can return.
   if (system.IsDualCoreMode())
     system.GetFifo().StopGpuLoop();
+#elif defined(__EMSCRIPTEN__)
+  // [dc gpu-loop-murder fix 2026-07-22] Under the native dual-core topology RunGpuLoop runs
+  // PERSISTENTLY on the spawned gpu_thread (Core.cpp EmuThread hunk) — the per-frame
+  // StopGpuLoop above KILLED it ~300ms into every boot (BlockingLoop m_shutdown set after 3
+  // sleeps; all later RunGpu() wakeups no-oped on the stopped loop). This was the actual
+  // mechanism behind the 2026-07-21 "gpu_thread is memory-isolated" misdiagnosis: every
+  // GPU-side zero was a snapshot from a loop already murdered by this callback.
 #endif
 }
 

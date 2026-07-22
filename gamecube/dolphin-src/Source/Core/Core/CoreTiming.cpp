@@ -3,6 +3,10 @@
 
 #include "Core/CoreTiming.h"
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>  // [perf-split 2026-07-22 TEMP] emscripten_get_now
+#endif
+
 #include <algorithm>
 #include <mutex>
 #include <string>
@@ -354,6 +358,26 @@ void CoreTimingManager::RebaseTime(s64 delta)
 
 void CoreTimingManager::Advance()
 {
+#ifdef __EMSCRIPTEN__
+  // [perf-split 2026-07-22 TEMP] EmuThread bucket: CoreTiming::Advance self-time (events +
+  // device service + throttle path), 0.1ms units @0x026B3390, count @0x026B3394. Pair with
+  // slice-time @0x026B3380 and throttle-sleep @0x026B3388: EmuThread-busy minus Advance-time
+  // = emitted-block execution + dispatch — the JIT-vs-devices split of the 95%-busy CPU thread.
+  const double adv_t0 = emscripten_get_now();
+  struct AdvTimer
+  {
+    double t0;
+    ~AdvTimer()
+    {
+      volatile u32* const acc =
+          reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3390u));
+      *acc = *acc + static_cast<u32>((emscripten_get_now() - t0) * 10.0);
+      volatile u32* const n =
+          reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3394u));
+      *n = *n + 1u;
+    }
+  } adv_timer{adv_t0};
+#endif
   CPUThreadConfigCallback::CheckForConfigChanges();
 
   MoveEvents();
@@ -601,6 +625,20 @@ void CoreTimingManager::SleepUntil(TimePoint time_point)
     // Count amount of time sleeping for analytics
     const TimePoint time_after_sleep = Clock::now();
     g_perf_metrics.CountThrottleSleep(time_after_sleep - time);
+#ifdef __EMSCRIPTEN__
+    // [perf-split 2026-07-22 TEMP] CPU-thread throttle-sleep accumulation, 0.1ms units
+    // @0x026B3388 (pair with the device-thread slice time @0x026B3380). Near-zero over a run
+    // = the EmuThread never keeps up = guest JIT is the 60fps limiter.
+    {
+      const double ms =
+          std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(time_after_sleep -
+                                                                                time)
+              .count();
+      volatile u32* const acc =
+          reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3388u));
+      *acc = *acc + static_cast<u32>(ms * 10.0);
+    }
+#endif
   }
   else
   {

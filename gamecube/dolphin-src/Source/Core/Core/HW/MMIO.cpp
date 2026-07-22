@@ -11,6 +11,14 @@
 
 namespace MMIO
 {
+#ifdef __EMSCRIPTEN__
+// [dc cp-gate 2026-07-22] see MMIO.h DcCpRegGate() declaration.
+static std::mutex s_dc_cp_reg_gate;
+std::mutex& DcCpRegGate()
+{
+  return s_dc_cp_reg_gate;
+}
+#endif
 // Base classes for the two handling method hierarchies. Note that a single
 // class can inherit from both.
 //

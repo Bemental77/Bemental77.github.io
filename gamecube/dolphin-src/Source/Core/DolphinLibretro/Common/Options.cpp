@@ -141,7 +141,10 @@ static struct retro_core_option_v2_definition option_defs[] = {
       { "0.0", "Unlimited" },
       { nullptr, nullptr }
     },
-    "0.0"
+    // [dc throttle fix 2026-07-22] default 1.0 = native-matching 100% throttle (was "0.0"
+    // Unlimited, which let the freed EmuThread race emulated time at wasm-max — the DSP/AID
+    // storm that froze MP4's audio-init; see Boot.cpp MAIN_EMULATION_SPEED note).
+    "1.0"
   },
   {
     Libretro::Options::core::MAIN_CPU_THREAD,

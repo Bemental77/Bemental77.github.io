@@ -88,6 +88,9 @@ public:
   void RunGpu();
   void GpuMaySleep();
   void RunGpuLoop();
+  // [dc gpu-slice 2026-07-22] The RunGpuLoop payload as a per-pump slice — run on the WebGPU
+  // device-owning thread (proxied-main) under emscripten; see Fifo.cpp for the rationale.
+  void RunGpuLoopSlice();
   void ExitGpuLoop();
   void EmulatorState(bool running);
   void ResetVideoBuffer();

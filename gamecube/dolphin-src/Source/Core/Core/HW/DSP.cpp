@@ -99,10 +99,36 @@ void DSPManager::GlobalCompleteARAM(Core::System& system, u64 userdata, s64 cycl
 void DSPManager::CompleteARAM(u64 userdata, s64 cyclesLate)
 {
   m_dsp_control.DMAState = 0;
-  // [aram-diag 2026-07-16] does the ARAM-DMA completion event fire post-takeover? counter @0x026B2700.
-  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u) {
+  // [aram-diag 2026-07-16, UNGATED 2026-07-22] ARAM-DMA completion count @0x026B2700 — was
+  // owner-gated (dead cell in the no-takeover topology; verify publish sites before trusting 0s).
+  {
     volatile u32* c = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2700u));
     *c = *c + 1u;
+    // [aram-diag ring 2026-07-22 TEMP] control Hex at THIS completion @0x026B3008; completions
+    // arriving with the ARAM enable (0x40) CLEAR @0x026B3004 — the masked-completion census.
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3008u)) = m_dsp_control.Hex;
+    if ((m_dsp_control.Hex & 0x40u) == 0u)
+    {
+      volatile u32* m = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3004u));
+      *m = *m + 1u;
+    }
+    // [aram-diag guest-state 2026-07-22 TEMP] MP4 guest ARQ state at each completion (symbols.txt):
+    // __AR_Callback @0x801D4550 -> 0x026B3220 (null => __ARHandler silently skips the chain);
+    // __ARQRequestQueueLo @0x801D4578 -> 0x026B3224; __ARQRequestQueueHi @0x801D4570 -> 0x026B3228.
+    {
+      auto& memory = m_system.GetMemory();
+      const u8* p = memory.GetPointerForRange(0x001D4550u, 0x30u);
+      if (p)
+      {
+        u32 cb, qlo, qhi;
+        std::memcpy(&cb, p, 4);
+        std::memcpy(&qhi, p + 0x20, 4);
+        std::memcpy(&qlo, p + 0x28, 4);
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3220u)) = Common::swap32(cb);
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3224u)) = Common::swap32(qlo);
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3228u)) = Common::swap32(qhi);
+      }
+    }
   }
   GenerateDSPInterrupt(INT_ARAM, 0);
 }
@@ -249,6 +275,13 @@ void DSPManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
                  MMIO::InvalidWrite<u16>());
   mmio->Register(base | DSP_MAIL_FROM_DSP_LO, MMIO::ComplexRead<u16>([](Core::System& system, u32) {
                    auto& dsp = system.GetDSP();
+                   // [aram-diag 2026-07-22 TEMP] mail POPS @0x026B1BB0 (reading LO consumes the
+                   // mail) — vs dspCauseSet: pending-mail-never-popped shows as sets>>pops.
+                   {
+                     volatile u32* c =
+                         reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1BB0u));
+                     *c = *c + 1u;
+                   }
                    return dsp.m_dsp_emulator->DSP_ReadMailBoxLow(false);
                  }),
                  MMIO::InvalidWrite<u16>());
@@ -262,7 +295,8 @@ void DSPManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
         // takeover? total reads @0x026B27CC, reads-with-ARAM(0x20)-set @0x026B27C8. If the guest reads
         // DSP_CR often but ARAM is rarely set (2C8 << 2CC), the ARAM completion is cleared before the
         // guest's ISR reads it (coherency/timing) -> __ARHandler never dispatched -> pend never drains.
-        if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u) {
+        // [UNGATED 2026-07-22] total reads @0x026B27CC, reads-with-ARAM-set @0x026B27C8.
+        {
           volatile u32* t = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B27CCu));
           *t = *t + 1u;
           if ((rv & 0x20u) != 0u) {
@@ -274,6 +308,23 @@ void DSPManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
       }),
       MMIO::ComplexWrite<u16>([](Core::System& system, u32, u16 val) {
         auto& dsp = system.GetDSP();
+
+        // [aram-diag ring 2026-07-22 TEMP, rev2 ARAM-FILTERED] ring only ARAM-relevant writes:
+        // ARAM status acks (val&0x20) and enable transitions (pre 0x40 != val 0x40) — the
+        // steady AID/DSP ack churn rotated the interesting init-era writes out of rev1's
+        // window. {val, guest pc, pre-write control Hex} @0x026B3010, head @0x026B3000.
+        if ((val & 0x20u) != 0u || ((dsp.m_dsp_control.Hex ^ val) & 0x40u) != 0u)
+        {
+          volatile u32* const head =
+              reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3000u));
+          const u32 h = *head;
+          const uintptr_t e = 0x026B3010u + (h & 31u) * 16u;
+          *reinterpret_cast<volatile u32*>(e) = val;
+          *reinterpret_cast<volatile u32*>(e + 4u) = system.GetPPCState().pc;
+          *reinterpret_cast<volatile u32*>(e + 8u) = dsp.m_dsp_control.Hex;
+          *reinterpret_cast<volatile u32*>(e + 12u) = h;
+          *head = h + 1u;
+        }
 
         UDSPControl tmpControl;
         tmpControl.Hex = (val & ~DSP_CONTROL_MASK) |
@@ -299,11 +350,9 @@ void DSPManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
         dsp.m_dsp_control.ARAM_mask = tmpControl.ARAM_mask;
         dsp.m_dsp_control.DSP_mask = tmpControl.DSP_mask;
 
-        // [aram-diag 2026-07-16] does the worker's DSP-CR ACK write REACH dolphin post-takeover?
-        // any DSP_CONTROL write @0x026B2714; an ARAM-ack write (clears INT_ARAM) @0x026B2718. If
-        // 2714 climbs but 2718 stays 0, the guest writes DSP_CR but never with the ARAM-clear bit;
-        // if BOTH stay 0, the worker's ack MMIO never reaches dolphin (routing gap) -> storm.
-        if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u) {
+        // [aram-diag 2026-07-16, UNGATED 2026-07-22] any DSP_CONTROL write @0x026B2714; an
+        // ARAM-ack write (clears INT_ARAM) @0x026B2718.
+        {
           volatile u32* w = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2714u));
           *w = *w + 1u;
           if (tmpControl.ARAM) {
@@ -421,10 +470,10 @@ void DSPManager::UpdateInterrupts()
                      static_cast<u32>(cr), __ATOMIC_RELEASE);
   }
 
-  // [aram-diag 2026-07-16] post-takeover: is INT_ARAM active-bit set (0x026B2704) and did it pass the
-  // DSP_CONTROL enable check into ints_set (0x026B2708)? If 2704>0 but 2708==0, the guest never
-  // ENABLED the ARAM interrupt in DSP_CONTROL (its enable write didn't reach dolphin) -> masked here.
-  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u) {
+  // [aram-diag 2026-07-16, UNGATED 2026-07-22] INT_ARAM active-bit @0x026B2704; passed enable
+  // check into ints_set @0x026B2708; sub-interrupt classifier (enable&active) INT_DSP@0x026B271C
+  // INT_ARAM@0x026B2720 INT_AID@0x026B2724 — the storm raiser is whichever climbs.
+  {
     if ((m_dsp_control.Hex & INT_ARAM) != 0) {
       volatile u32* a = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2704u));
       *a = *a + 1u;
@@ -442,6 +491,8 @@ void DSPManager::UpdateInterrupts()
     if (en & INT_AID)  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2724u)); *p = *p + 1u; }
   }
 
+  // [guest-queue diag STRIPPED 2026-07-22 — 0x801d45f4 turned out to be FinishQueue (PM9);
+  // the per-UpdateInterrupts guest-memory reads were hot-path cost.]
   m_system.GetProcessorInterface().SetInterrupt(ProcessorInterface::INT_CAUSE_DSP, ints_set);
 }
 
@@ -600,6 +651,14 @@ void DSPManager::Do_ARAM_DMA()
 {
   auto& core_timing = m_system.GetCoreTiming();
   auto& memory = m_system.GetMemory();
+
+  // [aram-diag 2026-07-22 TEMP] ARAM-DMA REQUEST count @0x026B1BD0 (pair with completion
+  // @0x026B2700): requests>completions = the CompleteARAM CoreTiming event never fires;
+  // both zero = the guest's DMA-kick MMIO never reaches here.
+  {
+    volatile u32* c = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1BD0u));
+    *c = *c + 1u;
+  }
 
   m_dsp_control.DMAState = 1;
 
