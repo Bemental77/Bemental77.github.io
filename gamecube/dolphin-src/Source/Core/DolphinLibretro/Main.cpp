@@ -361,7 +361,8 @@ void retro_run(void)
     );
 
   if (Libretro::Options::IsUpdated(Libretro::Options::gfx_hacks::EFB_TO_TEXTURE))
-    g_Config.bSkipEFBCopyToRam = Libretro::Options::GetCached<bool>(Libretro::Options::gfx_hacks::EFB_TO_TEXTURE, true);
+    // [render-gaps R1 PM38] default false: the WGPU EFB->RAM path writes real data now (Boot.cpp).
+    g_Config.bSkipEFBCopyToRam = Libretro::Options::GetCached<bool>(Libretro::Options::gfx_hacks::EFB_TO_TEXTURE, false);
 
   if (Libretro::Options::IsUpdated(Libretro::Options::gfx_hacks::EFB_ACCESS_ENABLE))
     g_Config.bEFBAccessEnable = Libretro::Options::GetCached<bool>(Libretro::Options::gfx_hacks::EFB_ACCESS_ENABLE, false);
@@ -551,14 +552,31 @@ bool retro_unserialize(const void* data, size_t size)
   Core::System& system = Core::System::GetInstance();
   AsyncRequests* ar = AsyncRequests::GetInstance();
 
+  // [savestate-fix PM61c] LOAD must NOT be passthrough. VideoBackendBase::DoState
+  // routes the video restore (g_texture_cache->DoState → wgpuDeviceCreateTexture)
+  // via AsyncRequests::PushBlockingEvent so it runs on the GPU/device-owning thread.
+  // Passthrough=true forces it INLINE on whatever thread calls DoState — here the
+  // CPU/EmuThread (our savestate-deadlock fix routes DoState there), which does NOT
+  // own the WebGPU device (Main.cpp:457) → `device` is undefined → createTexture
+  // traps → the EmuThread's dispatch dies and the whole core freezes. With
+  // passthrough=false the video DoState queues + blocks until the message thread's
+  // PullEvents drains it on the device thread (worker_funcs.js pumpBatch drives
+  // bem_drain_async while serving). Save (serialize) has no createTexture and stays
+  // passthrough. Restore passthrough=true after so normal render events run inline.
   if (system.IsDualCoreMode())
-    ar->SetPassthrough(true);
+    ar->SetPassthrough(false);
 
   Core::RunOnCPUThread(Core::System::GetInstance(), [&] {
     PointerWrap p((u8**)&data, size, PointerWrap::Mode::Read);
     State::DoState(Core::System::GetInstance(), p);
   }, true);
 
+  // Leave passthrough FALSE (the pre-existing steady state after every serialize op):
+  // Presenter::Present routes ShowImage via AsyncRequests, and passthrough=true would
+  // run it INLINE on whichever thread fires the VI CoreTiming event — the EmuThread's
+  // Advance() does, and it doesn't own the WebGPU device, so wgpuRenderPassEncoderEnd
+  // hits an undefined pass and traps (stack: JitWasm::Run→Advance→VICallback→ViSwap→
+  // Present→ShowImage→EndRenderPass). false keeps the present on the device thread.
   if (system.IsDualCoreMode())
     ar->SetPassthrough(false);
 

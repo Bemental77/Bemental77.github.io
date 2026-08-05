@@ -361,8 +361,22 @@ void FifoManager::RunGpuLoopSlice()
         // [dc-diag TEMP] publish emu_running_state — is the GPU gate open under dual-core boot?
         { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B1Cu)); *p = m_emu_running_state.IsSet() ? 1u : 0u; }
         // Do nothing while paused
+        // [sync-gpu slice-pump FIX PM45g 2026-07-31] Native couples CPU and GPU pause,
+        // so SyncGPU ticks never accrue against a stopped GPU loop. Under the slice
+        // pump the CPU BOOTS while this gate is still false; SyncGPUCallback keeps
+        // crediting m_sync_ticks, nothing consumes them, and the CPU deadlocks in
+        // WaitForGpuThread (measured: gc frozen at 33, white frame). Drain + wake
+        // exactly like the fifo-empty fast-skip below before bailing.
         if (!m_emu_running_state.IsSet())
+        {
+          if (m_config_sync_gpu && m_sync_ticks.load() > 0)
+          {
+            int old = m_sync_ticks.exchange(0);
+            if (old >= m_config_sync_gpu_max_distance)
+              m_sync_wakeup_event.Set();
+          }
           return;
+        }
 
         if (m_use_deterministic_gpu_thread)
         {
@@ -403,9 +417,19 @@ void FifoManager::RunGpuLoopSlice()
             }
 
           // check if we are able to run this buffer
+          // [xf-word-loss FIX PM37 2026-07-23] The distance gate MUST be an ACQUIRE to pair
+          // with UpdateGatherPipe's release fence (GPFifo.cpp "bytes land BEFORE any
+          // accounting advances"). With relaxed, this thread can observe the +32 credit
+          // while the chunk's memcpy'd bytes are not yet visible -> CopyFromEmu captures
+          // stale ZEROS inside an accounted chunk. Proven signature: GXLoadPosMtxImm's
+          // first payload word (1.0f) arrived at GPFifo::Write32 correctly (3016/3016)
+          // but decoded as 0 in LoadXFReg -> cpnmtx row0=(0,0,0,tx) -> every vertex
+          // collapsed to one clip point -> the black-canvas render. RunGpuOnCpu (the
+          // other consumer) already had acquire (this file, SyncGPU path); this slice
+          // loop is the dual-core path and was left relaxed.
           while (!command_processor.IsInterruptWaiting() &&
                  fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) &&
-                 fifo.CPReadWriteDistance.load(std::memory_order_relaxed) &&
+                 fifo.CPReadWriteDistance.load(std::memory_order_acquire) &&
                  !AtBreakpoint(m_system))
           {
             { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AD4u)); *p = *p + 1u; }

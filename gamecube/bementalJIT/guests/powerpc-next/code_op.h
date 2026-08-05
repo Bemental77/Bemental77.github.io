@@ -46,6 +46,16 @@ struct CodeOp {
 
     bool   canEndBlock        = false;
     bool   canCauseException  = false;
+    // [fprf-narrow PM24] FL_USE_FPU op (first one per block carries the
+    // MSR.FP-unavailable mid-block exit — the reverse scan treats it may-exit).
+    bool   usesFPU            = false;
+    // [fprf-narrow PM24] canCauseException comes ONLY from the FP-arith flags
+    // (FL_USE_FPU/FL_FLOAT_EXCEPTION/FL_FLOAT_DIV — no FL_LOADSTORE, no
+    // FL_PROGRAMEXCEPTION): such an op CANNOT exit mid-block in this build (FP
+    // exceptions are not delivered per-op; DSI needs a load/store; traps need
+    // FL_PROGRAMEXCEPTION), so the C1 keep-everything-live reset is skipped for
+    // it — dead-store/FPRF elision now fires in psq/ps-dense code.
+    bool   pureFpNoExit       = false;
     bool   skipLRStack        = false;
     bool   skip               = false;  // followed BL-s, e.g.
 
@@ -115,6 +125,9 @@ struct CodeBlock {
     BlockRegStats* m_fpa   = nullptr;
 
     bool m_broken          = false;
+    // [FUSION v2] any per-op pc jump (seal-time fused run). Gates self-loop/
+    // int-fusion fast paths and idle classification off for such blocks.
+    bool m_noncontiguous   = false;
     bool m_memory_exception = false;
 
     BitSet8  m_gqr_used;

@@ -147,6 +147,20 @@ var __ticks = 0;
 var PUMP_BATCH_ITERS = 2;
 
 function pumpBatch() {
+  // [savestate-fix PM61] while DoState serializes on the CPU/EmuThread, skip the
+  // GPU pump so RunGpuLoopSlice can't race the memory/GPU restore. Gated on the
+  // SERVING flag (set only DURING DoState, not on the request) so the EmuThread is
+  // still fed until it enters the save; the tick loop keeps yielding so the
+  // EmuThread's proxied DoState calls still complete.
+  if (Module && Module._bem_is_state_serving && Module._bem_is_state_serving()) {
+    // [savestate-fix PM61c] Still skip RunGpuLoopSlice (would race the RAM restore),
+    // but DRAIN AsyncRequests here on the message thread: a LOAD runs with
+    // passthrough=false so the video-backend DoState (texture cache → WebGPU
+    // createTexture) is QUEUED and the EmuThread blocks on it. This thread owns the
+    // WebGPU device, so PullEvents runs that restore correctly and unblocks the load.
+    if (Module._bem_drain_async) Module._bem_drain_async();
+    return;
+  }
   if (Module && Module._run_iter_batch) {
     for (var i = 0; i < PUMP_BATCH_ITERS; i++) Module._run_iter_batch(1);
   } else if (Module && Module._run_iter) {
@@ -157,42 +171,71 @@ function pumpBatch() {
 async function bootLoop() {
   if (bootLoopRunning) return;
   bootLoopRunning = true;
-  var __turnMax = 0, __turnSum = 0, __turnN = 0;
+  // [tick-diag stripped 2026-08-05 per gate #8] the per-batch postMessage('print')
+  // + page console.log (and 2 performance.now()/batch) ran the WHOLE session (the
+  // "boot batch 1.3M" spam) — a real drain with DevTools open. Bare pump+yield now.
   while (!firstFrameSeen) {
     pumpBatch();
     __bootBatches++;
-    // [turn-latency 2026-07-06] the pump ticks ~2/s on slow runs (should be ~25/s with a
-    // 40ms budget): measure what one setTimeout(0) event-loop turn actually costs.
-    var __t0 = performance.now();
-    await new Promise(function (r) { setTimeout(r, 0); });
-    var __dt = performance.now() - __t0;
-    __turnSum += __dt; __turnN++; if (__dt > __turnMax) __turnMax = __dt;
-    if (__bootBatches <= 3 || (__bootBatches % 100) === 0) {
-      try { postMessage({ cmd: 'print', txt: '[tick-diag] boot batch ' + __bootBatches
-        + ' turnAvg=' + (__turnSum / __turnN).toFixed(1) + 'ms turnMax=' + __turnMax.toFixed(0) + 'ms' }); } catch (_) {}
-      __turnMax = 0; __turnSum = 0; __turnN = 0;
-    }
+    await new Promise(function (r) { zeroYield(r); });
   }
   bootLoopRunning = false;
-  try { postMessage({ cmd: 'print', txt: '[tick-diag] bootLoop exited after ' + __bootBatches + ' batches' }); } catch (_) {}
   startTickLoop();
+}
+
+// [PM54 zero-yield 2026-08-04] setTimeout(0) is CLAMPED by Chrome to ~4ms+
+// after a few nested turns — measured turnAvg=4.8ms on the user's machine
+// ([tick-diag]): every pump turn (PUMP_BATCH_ITERS quanta) paid ~4.8ms of
+// DEAD SLEEP, capping the pump to ~200 turns/s regardless of emulator speed.
+// A MessageChannel self-post yields the event loop (messages/mailbox/WGPU map
+// callbacks all still deliver — it is a real macrotask turn) with ~0.03ms
+// latency and NO clamp.
+var _yieldChan = null, _yieldQueue = [];
+function _zeroYieldRaw(cb) {
+  if (!_yieldChan) {
+    _yieldChan = new MessageChannel();
+    _yieldChan.port1.onmessage = function () {
+      var f = _yieldQueue.shift();
+      if (f) f();
+    };
+  }
+  _yieldQueue.push(cb);
+  _yieldChan.port2.postMessage(0);
+}
+// HYBRID: a pure MessageChannel loop floods the message task source and
+// STARVES the timer source — Dawn device ticks / readback completions are
+// timer-scheduled, so presents froze after frame 1 (measured: gc +17% but
+// zero recurring paints). Take the unclamped yield normally, but drop to a
+// real setTimeout(0) periodically so timer tasks get a slot.
+// [PM54e 2026-08-04] interval 4 -> 16ms: at 4ms, any pump turn taking >=4ms
+// of WORK routed EVERY yield through the clamped setTimeout (~4.8ms dead
+// sleep per turn — the user's steady-state console showed turnAvg=4.8ms
+// return exactly when the emulator was busiest, halving the pump). Timer
+// tasks only need ~60Hz service; 16ms keeps Dawn ticking at frame rate
+// while heavy turns stay on the unclamped path.
+var _lastTimerYield = 0;
+function zeroYield(cb) {
+  var now = performance.now();
+  if (now - _lastTimerYield >= 16) {
+    _lastTimerYield = now;
+    setTimeout(cb, 0);
+  } else {
+    _zeroYieldRaw(cb);
+  }
 }
 
 function startTickLoop() {
   if (tickInterval) return;
-  // setTimeout(0) chain, not setInterval(16): while we're below native
+  // Zero-clamp yield chain, not setInterval(16): while we're below native
   // speed there is no idle budget to give back — run flat-out, yielding
-  // each turn so input/mailbox messages keep flowing. (A 16ms pace only
-  // makes sense once a frame completes in under 16ms.)
+  // each turn so input/mailbox messages keep flowing.
   var pump = function () {
     pumpBatch();
     __ticks++;
-    if (__ticks <= 3 || (__ticks % 200) === 0) {
-      try { postMessage({ cmd: 'print', txt: '[tick-diag] tick ' + __ticks + ' returned' }); } catch (_) {}
-    }
-    tickInterval = setTimeout(pump, 0);
+    zeroYield(pump);   // [tick-diag stripped 2026-08-05 per gate #8]
   };
-  tickInterval = setTimeout(pump, 0);
+  tickInterval = 1;   // marker: loop armed (no timer id under zeroYield)
+  zeroYield(pump);
 }
 
 // Called once we know rendering has begun (set by video_cb in
@@ -426,46 +469,59 @@ self.onmessage = function (e) {
       }
       break;
     case 'saveState':
-      if (!Module || !Module.calledRun) {
-        postMessage({ cmd: 'stateSaved', data: new Uint8Array(0) });
-        break;
-      }
-      try {
-        var size = Module._state_size();
-        if (size <= 0) {
+      // [savestate-deadlock-fix PM61] do NOT call _state_size/_save_state here —
+      // they use RunOnCPUThread(wait) and BLOCK this (message/pump) thread, which
+      // the dual-core EmuThread needs → deadlock. Flag a request; the JIT dispatch
+      // loop services it ON the CPU thread; poll async so the pump keeps running.
+      (async function () {
+        if (!Module || !Module.calledRun) { postMessage({ cmd: 'stateSaved', data: new Uint8Array(0) }); return; }
+        try {
+          var cap = 96 * 1024 * 1024;   // GC state ~56MB; generous headroom
+          if (Module._bem_save_request(cap) !== 0) { postMessage({ cmd: 'stateSaved', data: new Uint8Array(0) }); return; }
+          var len = -1, tries = 0;
+          while (len < 0 && tries < 4000) {
+            await new Promise(function (r) { setTimeout(r, 5); });
+            len = Module._bem_state_poll();
+            tries++;
+          }
+          if (len > 0) {
+            var ptr = Module._bem_state_buf_ptr();
+            var buf = new Uint8Array(Module.HEAPU8.subarray(ptr, ptr + len));
+            postMessage({ cmd: 'stateSaved', data: buf });
+          } else {
+            postMessage({ cmd: 'print', txt: '[worker] saveState: len=' + len + ' (timeout or too big)' });
+            postMessage({ cmd: 'stateSaved', data: new Uint8Array(0) });
+          }
+          Module._bem_state_release();
+        } catch (e) {
+          postMessage({ cmd: 'print', txt: '[worker] saveState failed: ' + e });
           postMessage({ cmd: 'stateSaved', data: new Uint8Array(0) });
-          break;
         }
-        var ptr = Module._malloc(size);
-        var ret = Module._save_state(ptr, size);
-        if (ret > 0) {
-          var buf = new Uint8Array(Module.HEAPU8.subarray(ptr, ptr + ret));
-          postMessage({ cmd: 'stateSaved', data: buf });
-        } else {
-          postMessage({ cmd: 'stateSaved', data: new Uint8Array(0) });
-        }
-        Module._free(ptr);
-      } catch (e) {
-        postMessage({ cmd: 'print', txt: '[worker] saveState failed: ' + e });
-        postMessage({ cmd: 'stateSaved', data: new Uint8Array(0) });
-      }
+      })();
       break;
     case 'loadState':
-      if (!Module || !Module.calledRun) {
-        postMessage({ cmd: 'stateLoaded' });
-        break;
-      }
-      try {
-        var src = data.data || new Uint8Array(0);
-        var ptr = Module._malloc(src.length);
-        Module.HEAPU8.set(src, ptr);
-        var _lsret = Module._load_state(ptr, src.length);
-        Module._free(ptr);
-        postMessage({ cmd: 'stateLoaded' });
-      } catch (e) {
-        postMessage({ cmd: 'print', txt: '[worker] loadState failed: ' + e });
-        postMessage({ cmd: 'stateLoaded' });
-      }
+      // [savestate-deadlock-fix PM61] same CPU-thread routing as saveState:
+      // alloc + fill the buffer, commit, then the JIT loop runs load_state inline.
+      (async function () {
+        if (!Module || !Module.calledRun) { postMessage({ cmd: 'stateLoaded' }); return; }
+        try {
+          var src = data.data || new Uint8Array(0);
+          if (Module._bem_load_request(src.length) !== 0) { postMessage({ cmd: 'stateLoaded' }); return; }
+          Module.HEAPU8.set(src, Module._bem_state_buf_ptr());
+          Module._bem_load_commit();   // sets op=2 AFTER the buffer is filled
+          var done = -1, tries = 0;
+          while (done < 0 && tries < 4000) {
+            await new Promise(function (r) { setTimeout(r, 5); });
+            done = Module._bem_state_poll();
+            tries++;
+          }
+          Module._bem_state_release();
+          postMessage({ cmd: 'stateLoaded' });
+        } catch (e) {
+          postMessage({ cmd: 'print', txt: '[worker] loadState failed: ' + e });
+          postMessage({ cmd: 'stateLoaded' });
+        }
+      })();
       break;
     case 'setup-ppc-mailbox':
       // 4f-6 reframe: dolphin no longer polls the SAB mailbox itself

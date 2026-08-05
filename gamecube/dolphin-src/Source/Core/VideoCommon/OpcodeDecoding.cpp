@@ -35,6 +35,7 @@ namespace OpcodeDecoder
 {
 bool g_record_fifo_data = false;
 
+
 template <bool is_preprocess>
 class RunCallback final : public Callback
 {

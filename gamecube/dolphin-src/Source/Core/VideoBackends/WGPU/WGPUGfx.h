@@ -109,6 +109,21 @@ public:
                      const MathUtil::Rectangle<int>& src_rect, ::WGPUTexture dst_texture,
                      u32 dst_w, u32 dst_h, bool linear_filter);
 
+  // [render-gaps R2 PM38] EFB DEPTH -> RGBA8 copy (textureLoad, reversed-Z undone,
+  // depth replicated to RGB). Used by WGPUTextureCache for is_depth_copy entries.
+  bool BlitDepthToTexture(::WGPUTexture src_texture, u32 src_width, u32 src_height,
+                          const MathUtil::Rectangle<int>& src_rect, ::WGPUTexture dst_texture,
+                          u32 dst_w, u32 dst_h);
+
+  // [render-gaps R1 PM38] End the open pass + submit the shared encoder so a follow-up
+  // texture->buffer readback observes all rendering issued so far. Public for
+  // WGPUTextureCache's EFB->RAM copy path.
+  void FlushPendingWork()
+  {
+    EndRenderPass();
+    SubmitFrame();
+  }
+
   // Records one indexed draw into the (lazily-begun) render pass on the bound framebuffer. Builds
   // GROUP0 (VS+PS uniform dynamic offsets) and GROUP1 (8 textures + 8 samplers, dummy for unbound)
   // bind groups per-draw. No-op (cleanly) if any required handle is missing.
@@ -224,6 +239,10 @@ private:
   WGPUShaderModule m_util_module = nullptr;
   WGPUBindGroupLayout m_util_blit_bgl = nullptr;    // texture + sampler + params uniform
   WGPUPipelineLayout m_util_blit_layout = nullptr;
+  // [render-gaps R2 PM38] depth-blit variant (uniform @0 + depth texture @3)
+  WGPUBindGroupLayout m_util_depthblit_bgl = nullptr;
+  WGPUPipelineLayout m_util_depthblit_layout = nullptr;
+  WGPURenderPipeline m_util_depthblit_pipeline = nullptr;
   WGPURenderPipeline m_util_blit_pipeline = nullptr;         // RGBA8 target, no depth
   WGPUBindGroupLayout m_util_clear_bgl = nullptr;   // params uniform only
   WGPUPipelineLayout m_util_clear_layout = nullptr;

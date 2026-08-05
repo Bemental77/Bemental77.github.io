@@ -14,9 +14,11 @@
 
 #include "VideoBackends/WGPU/WGPUGfx.h"
 
+#include "VideoCommon/CPMemory.h"   // [xf-diag PM36 TEMP] g_main_cp_state.matrix_index_a
 #include "VideoCommon/IndexGenerator.h"
 #include "VideoCommon/PixelShaderManager.h"
 #include "VideoCommon/VertexShaderGen.h"  // ShaderAttrib (vertex @location indices)
+#include "VideoCommon/XFMemory.h"   // [xf-diag PM36 TEMP] xfmem.posMatrices scan
 #include "VideoCommon/VertexShaderManager.h"
 
 namespace WGPU
@@ -230,6 +232,13 @@ void WGPUVertexManager::ResetBuffer(u32 vertex_stride)
   m_index_generator.Start(m_index_cpu.data());
 }
 
+// [basevertex-fold EXPERIMENT PM34 - evaluate] if emdawnwebgpu mis-marshals
+// baseVertex/firstIndex on drawIndexed, the GPU fetches garbage vertices while
+// the CPU arena holds real data — fits every observation (and the util draws,
+// which use neither, land). Fold both into the buffer-binding byte offsets.
+static u32 s_last_vtx_byte = 0;
+static u32 s_last_idx_byte = 0;
+
 void WGPUVertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 num_indices,
                                      u32* out_base_vertex, u32* out_base_index)
 {
@@ -281,10 +290,46 @@ void WGPUVertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 nu
 
   *out_base_vertex = vertex_stride > 0 ? static_cast<u32>(m_vertex_offset / vertex_stride) : 0;
   *out_base_index = static_cast<u32>(m_index_offset / sizeof(u16));
+  // [basevertex-fold EXPERIMENT PM34] stash byte offsets for the fold test.
+  s_last_vtx_byte = static_cast<u32>(m_vertex_offset);
+  s_last_idx_byte = static_cast<u32>(m_index_offset);
 
+  // [sab-diag PM31 TEMP] vertex-content probe: vertex0 dword0 @0x026B3580,
+  // XOR of first 16 dwords @0x026B3584, (num_vertices<<16)|stride @0x026B3588.
+  if (vertex_data_size >= 4)
+  {
+    const u32* vw = reinterpret_cast<const u32*>(m_vertex_cpu.data());
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3580u)) = vw[0];
+    u32 ck = 0;
+    const u32 nw = vertex_data_size >= 64 ? 16u : (u32)(vertex_data_size / 4);
+    for (u32 i = 0; i < nw; i++) ck ^= vw[i] + i;
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3584u)) = ck;
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3588u)) =
+        (num_vertices << 16) | (vertex_stride & 0xFFFFu);
+    // [sab-diag PM33 TEMP] vertex0 raw position xyz (pos is at offset 0 of the
+    // vertex per the decl) @0x026B35B4/B8/BC.
+    if (vertex_data_size >= 12)
+    {
+      const float* vf = reinterpret_cast<const float*>(m_vertex_cpu.data());
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35B4u)) = vw[0];
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35B8u)) = vw[1];
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35BCu)) = vw[2];
+      (void)vf;
+    }
+  }
   if (queue && m_vertex_buffer && vertex_data_size > 0)
     wgpuQueueWriteBuffer(queue, m_vertex_buffer, m_vertex_offset, m_vertex_cpu.data(),
                          static_cast<size_t>(vertex_write_size));
+  // [sab-diag PM35 TEMP] first 4 indices (two u16 pairs) @0x026B35E8/EC +
+  // num_indices @0x35F0 — all-zero indices = degenerate triangles = the
+  // zero-fragment mechanism the vertex probe couldn't see.
+  if (index_data_size >= 8)
+  {
+    const u32* iw = reinterpret_cast<const u32*>(m_index_cpu.data());
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35E8u)) = iw[0];
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35ECu)) = iw[1];
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35F0u)) = num_indices;
+  }
   if (queue && m_index_buffer && index_data_size > 0)
     wgpuQueueWriteBuffer(queue, m_index_buffer, m_index_offset, m_index_cpu.data(),
                          static_cast<size_t>(index_write_size));
@@ -334,6 +379,26 @@ void WGPUVertexManager::UploadAllConstants()
                        static_cast<size_t>(ps_size));
   wgpuQueueWriteBuffer(queue, m_uniform_buffer, vs_off, &vertex_shader_manager.constants,
                        static_cast<size_t>(vs_size));
+  // [sab-diag PM30 TEMP] uniform-content checksums: XOR-fold the blocks so the
+  // probe can tell zeros from real TEV/XF state. ps @0x026B3558, vs @0x026B355C.
+  {
+    const u32* pw = reinterpret_cast<const u32*>(&pixel_shader_manager.constants);
+    const u32* vw = reinterpret_cast<const u32*>(&vertex_shader_manager.constants);
+    u32 pcs = 0, vcs = 0;
+    for (size_t i = 0; i < ps_size / 4; i++) pcs ^= pw[i] + (u32)i;
+    for (size_t i = 0; i < vs_size / 4; i++) vcs ^= vw[i] + (u32)i;
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3558u)) = pcs;
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B355Cu)) = vcs;
+    // [sab-diag PM32 TEMP] cproj row0[0] and row0[3] (byte offsets 128, 140):
+    // a zeroed projection -> o.pos = 0 for every vertex -> zero fragments.
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B358Cu)) = vw[128 / 4];
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3590u)) = vw[140 / 4];
+    // [sab-diag PM32 TEMP] cpnmtx row0[0] (offset 32) + row0 XOR — the position
+    // matrix applied BEFORE projection; zeros here collapse every vertex.
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3594u)) = vw[32 / 4];
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3598u)) =
+        vw[8] ^ vw[9] ^ vw[10] ^ vw[11];
+  }
 
   m_ps_uniform_offset = static_cast<u32>(ps_off);
   m_vs_uniform_offset = static_cast<u32>(vs_off);
@@ -345,6 +410,8 @@ void WGPUVertexManager::UploadAllConstants()
 
 void WGPUVertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 base_vertex)
 {
+  // [present-diag TEMP PM28] real GPU draw submissions @0x026B352C.
+  ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B352Cu));
   static bool s_first_logged = false;
   if (!s_first_logged)
   {
@@ -358,8 +425,17 @@ void WGPUVertexManager::DrawCurrentBatch(u32 base_index, u32 num_indices, u32 ba
   if (!gfx)
     return;
 
+#define BEM_BASEVERTEX_FOLD 0
+#if BEM_BASEVERTEX_FOLD
+  // byte offsets ride the base_index/base_vertex params; DrawIndexed's fold
+  // branch binds the buffers AT those offsets and draws with bases = 0.
+  gfx->DrawIndexed(m_vertex_buffer, m_index_buffer, m_uniform_buffer, m_vs_uniform_offset,
+                   m_ps_uniform_offset, num_indices, s_last_idx_byte | 0x80000000u,
+                   s_last_vtx_byte);
+#else
   gfx->DrawIndexed(m_vertex_buffer, m_index_buffer, m_uniform_buffer, m_vs_uniform_offset,
                    m_ps_uniform_offset, num_indices, base_index, base_vertex);
+#endif
 }
 
 }  // namespace WGPU

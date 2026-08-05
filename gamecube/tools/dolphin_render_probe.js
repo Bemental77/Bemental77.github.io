@@ -21,6 +21,11 @@ const TRACE_PATH    = process.env.PROBE_TRACE_PATH || '/tmp/probe-trace.json';
 // breakdown (dispatch vs host-imports vs block-bodies vs coretiming) — grounds
 // where worker wall-time actually goes instead of the [pc-census] snapshot.
 const CPU_PROFILE      = process.env.PROBE_CPU_PROFILE === '1';
+// [pc-sample 2026-07-23] PROBE_PC_SAMPLE=1 installs a page-side guest-PC sampler:
+// reads live ppc_state.pc via the published ctx ptr (@0x0250002C, same source as
+// bw.xpc), buckets 256B, segments per 10s with gc min/max — the WASM-side twin of
+// the native oracle's /tmp/native_pc_hist.txt. Dump → /tmp/wasm_pc_hist.json.
+const PC_SAMPLE        = process.env.PROBE_PC_SAMPLE === '1';
 const CPU_PROFILE_DELAY = parseInt(process.env.PROBE_CPU_PROFILE_DELAY_MS || '12000', 10);
 const CPU_PROFILE_OUT  = process.env.PROBE_CPU_PROFILE_OUT || '/tmp/worker.cpuprofile';
 const METRICS_PATH  = process.env.PROBE_METRICS_PATH || '/tmp/probe-metrics.json';
@@ -375,6 +380,57 @@ function startServer() {
     }, loadAt);
   }
 
+  // ---- save-state CREATION (make a menu checkpoint) -----------------------
+  // PROBE_SAVE_STATE=<outfile.gz> + PROBE_SAVE_STATE_MS=<t> → at t (ms from Start),
+  // trigger the worker DoState save (to IndexedDB) then persist the gz bytes to the
+  // outfile for reuse via PROBE_LOAD_STATE. Drive to the menu first with PROBE_PRESS.
+  if (process.env.PROBE_SAVE_STATE) {
+    const saveAt = parseInt(process.env.PROBE_SAVE_STATE_MS || '60000', 10);
+    const outFile = process.env.PROBE_SAVE_STATE;
+    setTimeout(async () => {
+      try {
+        const r = await page.evaluate(async () => {
+          if (typeof window.__probeSaveState !== 'function') return 'no-hook';
+          await window.__probeSaveState();
+          const arr = await window.__probeGetStateGz();
+          return arr || 'no-state';
+        });
+        if (Array.isArray(r)) {
+          fs.writeFileSync(outFile, Buffer.from(r));
+          console.log('[probe] PROBE_SAVE_STATE @' + saveAt + 'ms -> wrote ' + r.length + ' bytes to ' + outFile);
+        } else {
+          console.log('[probe] PROBE_SAVE_STATE -> ' + r);
+        }
+      } catch (e) { console.log('[probe] PROBE_SAVE_STATE failed: ' + e.message); }
+    }, saveAt);
+  }
+
+  // ---- export the EXISTING IndexedDB save to a portable file --------------
+  // PROBE_EXPORT_STATE=<outfile.gz> + PROBE_EXPORT_STATE_MS (default 8000) →
+  // read the already-saved SAVE_KEY (from a persistent-profile Save State the
+  // user clicked) and write it to a portable .gz WITHOUT re-saving, so it can be
+  // reused via PROBE_LOAD_STATE regardless of profile/origin. Fire early — it
+  // just reads IndexedDB and does not need the core to be booted.
+  if (process.env.PROBE_EXPORT_STATE) {
+    const expAt = parseInt(process.env.PROBE_EXPORT_STATE_MS || '8000', 10);
+    const outFile = process.env.PROBE_EXPORT_STATE;
+    setTimeout(async () => {
+      try {
+        const r = await page.evaluate(async () => {
+          if (typeof window.__probeGetStateGz !== 'function') return 'no-hook';
+          const arr = await window.__probeGetStateGz();
+          return arr || 'no-state';
+        });
+        if (Array.isArray(r)) {
+          fs.writeFileSync(outFile, Buffer.from(r));
+          console.log('[probe] PROBE_EXPORT_STATE -> wrote ' + r.length + ' bytes to ' + outFile);
+        } else {
+          console.log('[probe] PROBE_EXPORT_STATE -> ' + r);
+        }
+      } catch (e) { console.log('[probe] PROBE_EXPORT_STATE failed: ' + e.message); }
+    }, expAt);
+  }
+
   // ---- screenshot capture (verify what's actually on screen) --------------
   // PROBE_SHOT="/tmp/x.png@50000" → CDP compositor screenshot at that offset.
   // Captures the composited page incl. the worker-owned OffscreenCanvas, which
@@ -383,6 +439,10 @@ function startServer() {
   // one line of the boot-progress markers (probe-side page.evaluate; no runtime cost).
   const _frameMilestones = {};  // [determinism] xpc at first cross of fixed guest frames
   const _fineMiles = {};
+  // [fpscr one-shot] print the live guest FPSCR once (ctx+740; NI = bit 2,
+  // mask 4). Decides whether the emitted per-ps-op NI denormal-flush arms
+  // (~1024 wasm ops/iter in the THP IDCT loop) actually execute at runtime.
+  let _fpscrLast = -1;
   const _fineTimer = setInterval(async () => {
     try {
       const s = await page.evaluate(() => {
@@ -392,10 +452,15 @@ function startServer() {
           const f = A[0x026B0930 >> 2] >>> 0;
           const c = A[0x0250002C >> 2] >>> 0;
           const xpc = c ? (A[c >> 2] >>> 0).toString(16) + ':' + (A[(c + 0x2E0) >> 2] >>> 0).toString(16) : '0';
-          return { f, xpc };
+          const fpscr = c ? (A[(c + 740) >> 2] >>> 0) : 0;
+          return { f, xpc, fpscr, hasCtx: !!c };
         } catch (e) { return null; }
       });
       if (!s) return;
+      if (s.hasCtx && (s.fpscr & 4) !== _fpscrLast) {
+        _fpscrLast = s.fpscr & 4;
+        console.log('[fpscr] 0x' + s.fpscr.toString(16) + ' NI=' + ((s.fpscr & 4) ? 1 : 0));
+      }
       for (const M of [40, 50, 60, 80, 120]) {
         if (!_fineMiles[M] && (s.f >>> 0) >= M) {
           _fineMiles[M] = s;
@@ -405,6 +470,41 @@ function startServer() {
     } catch (e) {}
   }, 50);
   _fineTimer.unref && _fineTimer.unref();
+  // [pc-sample] page-side guest-PC sampler (see PC_SAMPLE at top). Self-guards on
+  // sharedMemory/ctx existing, so installing immediately is safe.
+  if (PC_SAMPLE) {
+    try {
+      await page.evaluate(() => {
+        window.__pcSamp = { t0: performance.now(), segs: [], n: 0 };
+        setInterval(() => {
+          try {
+            if (!window.sharedMemory) return;
+            const A = new Uint32Array(window.sharedMemory.buffer);
+            const c = A[0x0250002C >> 2] >>> 0;      // live ppc_state ctx ptr
+            if (!c) return;
+            const pc = A[c >> 2] >>> 0;
+            if (!pc) return;
+            const st = window.__pcSamp;
+            const seg = Math.min(17, Math.floor((performance.now() - st.t0) / 10000));
+            let sg = st.segs[seg];
+            if (!sg) sg = st.segs[seg] = { hist: new Map(), gcmin: 0xFFFFFFFF, gcmax: 0, n: 0 };
+            const m1 = A[0x02500020 >> 2] >>> 0;
+            if (m1) {
+              const u8 = new Uint8Array(window.sharedMemory.buffer);
+              const o = m1 + 0x1D3A54;               // GlobalCounter (guest BE)
+              const gc = ((u8[o] << 24 | u8[o+1] << 16 | u8[o+2] << 8 | u8[o+3]) >>> 0);
+              if (gc < sg.gcmin) sg.gcmin = gc;
+              if (gc > sg.gcmax) sg.gcmax = gc;
+            }
+            const b = (pc & ~0xFF) >>> 0;
+            sg.hist.set(b, (sg.hist.get(b) || 0) + 1);
+            sg.n++; st.n++;
+          } catch (_e) {}
+        }, 2);
+      });
+      console.log('[probe] pc-sample: page-side guest-PC sampler installed');
+    } catch (e) { console.error('[probe] pc-sample install failed: ' + e.message); }
+  }
   const phaseTimer = setInterval(async () => {
     try {
       const s = await page.evaluate(() => {
@@ -508,6 +608,236 @@ function startServer() {
             xfbAddr: (A[0x026B1A68 >> 2] >>> 0).toString(16),
             xfbDims: (A[0x026B1A6C >> 2] >>> 0).toString(16),
             ofReached: A[0x026B1B00 >> 2] >>> 0, voxCalled: A[0x026B1B04 >> 2] >>> 0,
+            // [present-diag TEMP PM28] ViSwap entries / duplicates / Present() calls
+            viSwapN: A[0x026B1B08 >> 2] >>> 0, viDupN: A[0x026B1B10 >> 2] >>> 0,
+            presentN: A[0x026B1B0C >> 2] >>> 0,
+            presentGate: (A[0x026B1B14 >> 2] >>> 0).toString(16),
+            // [present-diag TEMP] ShowImage / ReadbackAndPresent / map-cb / pixels-posted
+            wgpuChain: (A[0x026B3500 >> 2] >>> 0) + '/' + (A[0x026B3504 >> 2] >>> 0) + '/'
+              + (A[0x026B3508 >> 2] >>> 0) + '/' + (A[0x026B350C >> 2] >>> 0),
+            // [present-diag TEMP] CopyEFBToCacheEntry entries/gate-skips/depth-skips/blits
+            xfbBlit: (A[0x026B351C >> 2] >>> 0) + '/' + (A[0x026B3520 >> 2] >>> 0) + '/'
+              + (A[0x026B3524 >> 2] >>> 0) + '/' + (A[0x026B3528 >> 2] >>> 0),
+            // [present-diag TEMP] RunVertices-gate-ever-hit flag / real GPU draw submissions
+            gpuDraw: (A[0x026B3370 >> 2] >>> 0) + '/' + (A[0x026B352C >> 2] >>> 0),
+            // [sab-diag] device errors: count/type + first message text (ASCII @0x026B3540)
+            wgpuErr: (A[0x026B3530 >> 2] >>> 0) + '/t' + (A[0x026B3534 >> 2] >>> 0)
+              + ' ' + (() => { const u8 = new Uint8Array(window.sharedMemory.buffer);
+                let s = ''; for (let i = 0; i < 120; i++) { const b = u8[0x026B3540 + i];
+                if (!b) break; s += String.fromCharCode(b); } return s; })(),
+            // [sab-diag] applied viewport whxh / scissor swxsh / degenerate-vp count
+            vpState: (A[0x026B3548 >> 2] >>> 0).toString(16) + '/' + (A[0x026B354C >> 2] >>> 0).toString(16)
+              + '/' + (A[0x026B3550 >> 2] >>> 0),
+            // [sab-diag] PS/VS uniform-block XOR checksums (zeros-detector: an
+            // all-zero block folds to XOR of indices — compare across snapshots)
+            uniCk: (A[0x026B3558 >> 2] >>> 0).toString(16) + '/' + (A[0x026B355C >> 2] >>> 0).toString(16),
+            // [sab-diag] DrawIndexed entries/null-pipeline/other-bail/encoder-executed
+            drawPath: (A[0x026B3560 >> 2] >>> 0) + '/' + (A[0x026B3564 >> 2] >>> 0) + '/'
+              + (A[0x026B3568 >> 2] >>> 0) + '/' + (A[0x026B356C >> 2] >>> 0),
+            // [sab-diag] pipelines created: writeMask-None / color-enabled
+            wmask: (A[0x026B3570 >> 2] >>> 0) + '/' + (A[0x026B3574 >> 2] >>> 0),
+            // [sab-diag] draw-pass color view ptr / blit-source EFB texture ptr
+            fbIds: (A[0x026B3578 >> 2] >>> 0).toString(16) + '/' + (A[0x026B357C >> 2] >>> 0).toString(16),
+            // [sab-diag] vertex0 dword / 16-dword XOR / (nverts<<16|stride)
+            vtx: (A[0x026B3580 >> 2] >>> 0).toString(16) + '/' + (A[0x026B3584 >> 2] >>> 0).toString(16)
+              + '/' + (A[0x026B3588 >> 2] >>> 0).toString(16),
+            // [sab-diag] cproj row0[0] / row0[3] (f32 bits)
+            proj: (A[0x026B358C >> 2] >>> 0).toString(16) + '/' + (A[0x026B3590 >> 2] >>> 0).toString(16)
+              + ' pn=' + (A[0x026B3594 >> 2] >>> 0).toString(16) + '/' + (A[0x026B3598 >> 2] >>> 0).toString(16),
+            // [thread-id] init / pipeline-create / draw pthread identities
+            gfxThreads: (A[0x026B359C >> 2] >>> 0).toString(16) + '/' + (A[0x026B35A0 >> 2] >>> 0).toString(16)
+              + '/' + (A[0x026B35A4 >> 2] >>> 0).toString(16),
+            // [sab-diag] RAW viewport y/x/h (f32 bits)
+            vpRaw: (A[0x026B35A8 >> 2] >>> 0).toString(16) + '/' + (A[0x026B35AC >> 2] >>> 0).toString(16)
+              + '/' + (A[0x026B35B0 >> 2] >>> 0).toString(16),
+            // [sab-diag] replicated clip x/y/w of vertex0 (f32 bits)
+            clip: (A[0x026B35C0 >> 2] >>> 0).toString(16) + '/' + (A[0x026B35C4 >> 2] >>> 0).toString(16)
+              + '/' + (A[0x026B35C8 >> 2] >>> 0).toString(16),
+            // [pass-diff] util pass/pipe/count/scissor ; game pass/pipe
+            passDiff: (A[0x026B35D0 >> 2] >>> 0).toString(16) + '/' + (A[0x026B35D4 >> 2] >>> 0).toString(16)
+              + '/' + (A[0x026B35D8 >> 2] >>> 0) + '/' + (A[0x026B35DC >> 2] >>> 0).toString(16)
+              + ' vs ' + (A[0x026B35E0 >> 2] >>> 0).toString(16) + '/' + (A[0x026B35E4 >> 2] >>> 0).toString(16),
+            // [sab-diag] first 4 indices (u16 pairs) / num_indices
+            idx: (A[0x026B35E8 >> 2] >>> 0).toString(16) + '/' + (A[0x026B35EC >> 2] >>> 0).toString(16)
+              + '/' + (A[0x026B35F0 >> 2] >>> 0),
+            // [errscope] scoped-error status + message
+            escope: (A[0x026B35F4 >> 2] >>> 0).toString(16) + ' ' + (() => {
+              const u8 = new Uint8Array(window.sharedMemory.buffer);
+              let s2 = ''; for (let i = 0; i < 120; i++) { const b = u8[0x026B3600 + i];
+              if (!b) break; s2 += String.fromCharCode(b); } return s2; })(),
+            // [sab-diag] dual-source-blending adapter support (0x11=yes, 0x10=NO)
+            dsb: (A[0x026B35F8 >> 2] >>> 0).toString(16),
+            // [oob-arith PM36] base_vertex / vbuf size / (num_indices<<16|base_index)
+            oob: (A[0x026B3680 >> 2] >>> 0) + '/' + (A[0x026B3684 >> 2] >>> 0)
+              + '/' + (A[0x026B3688 >> 2] >>> 0).toString(16),
+            // [oob-arith PM36] created-pipeline (stride<<16|attrs) / bound-pipeline
+            // (stride<<16|usage<<8|attrs)
+            strides: (A[0x026B368C >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B3690 >> 2] >>> 0).toString(16),
+            // [xf-diag PM36] MatrixIndexA.Hex / selected xfmem row0.x bits /
+            // (healthyRows<<8|firstRow) / selected row XOR
+            xf: (A[0x026B369C >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B36A0 >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B36A4 >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B36A8 >> 2] >>> 0).toString(16),
+            // [xf-diag PM36] raw posMatrices words 0-15
+            xfw: Array.from({length: 16}, (_, i) =>
+              (A[(0x026B36AC + i * 4) >> 2] >>> 0).toString(16)).join('/'),
+            // [xf-diag PM36] immN/lastImm(addr<<16|size) | indxN/lastIndx(addr<<16|size)/srcW0
+            xfl: (A[0x026B36EC >> 2] >>> 0) + '/' + (A[0x026B36F8 >> 2] >>> 0).toString(16)
+              + '|' + (A[0x026B36F0 >> 2] >>> 0) + '/' + (A[0x026B36FC >> 2] >>> 0).toString(16)
+              + '/' + (A[0x026B36F4 >> 2] >>> 0).toString(16),
+            // [xf-diag PM36] producer capture: triggerN + first 4 Write32 payload words
+            xfp: (A[0x026B3710 >> 2] >>> 0) + ':' + Array.from({length: 4}, (_, i) =>
+              (A[(0x026B3700 + i * 4) >> 2] >>> 0).toString(16)).join('/'),
+            // [xf-word-loss PM37] chunk scan: off / copiedW0 / ramReread / matchN / guestAddr
+            xfc: (A[0x026B3720 >> 2] >>> 0) + '/' + (A[0x026B3724 >> 2] >>> 0).toString(16)
+              + '/' + (A[0x026B3728 >> 2] >>> 0).toString(16) + '/' + (A[0x026B372C >> 2] >>> 0)
+              + '/' + (A[0x026B3730 >> 2] >>> 0).toString(16),
+            // [xf-word-loss PM37] xfmem[0] read-back right after write / &xfmem host addr
+            xfg: (A[0x026B3734 >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B3738 >> 2] >>> 0).toString(16),
+            // [xf-word-loss PM37] spurious small XF loads at addr0: count / (size<<28|xfmem0-low28)
+            xfs: (A[0x026B373C >> 2] >>> 0) + '/' + (A[0x026B3740 >> 2] >>> 0).toString(16),
+            // [xf-word-loss PM37] canary: lastGoodSite / transFingerprint(hex prev<<8|bad)
+            // / transitions / opAtTrans / culpritXfParams(hex base<<8|size)
+            xfy: (A[0x026B3744 >> 2] >>> 0) + '/' + (A[0x026B3748 >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B374C >> 2] >>> 0) + '/' + (A[0x026B3750 >> 2] >>> 0) + '/'
+              + (A[0x026B3758 >> 2] >>> 0).toString(16),
+            // [xf-word-loss PM37] display-list scan: dlN + last DL addr/size + scan of
+            // the DL bytes IN GUEST RAM for the PNMTX0 header (10 00 0B 00 00) ->
+            // word0 value AS STORED IN THE DL BUFFER (dead 0 here = record-time hole).
+            xfd: (() => {
+              const dlN = A[0x026B28A4 >> 2] >>> 0;
+              const dlA = A[0x026B28A8 >> 2] >>> 0;
+              const dlS = A[0x026B28AC >> 2] >>> 0;
+              const m1v = A[0x02500020 >> 2] >>> 0;
+              if (!dlN || !m1v || !dlA) return dlN + '/none';
+              const u8 = new Uint8Array(window.sharedMemory.buffer);
+              const base = m1v + (dlA & 0x01FFFFFF);
+              const lim = Math.min(dlS >>> 0, 0x4000);
+              let found = [];
+              for (let i = 0; i + 9 <= lim; i++) {
+                if (u8[base + i] === 0x10 && u8[base + i + 1] === 0x00 &&
+                    u8[base + i + 2] === 0x0B && u8[base + i + 3] === 0x00 &&
+                    u8[base + i + 4] === 0x00) {
+                  const w0 = (u8[base + i + 5] << 24 | u8[base + i + 6] << 16 |
+                              u8[base + i + 7] << 8 | u8[base + i + 8]) >>> 0;
+                  found.push(i + ':' + w0.toString(16));
+                  if (found.length >= 4) break;
+                }
+              }
+              return dlN + '/' + dlA.toString(16) + '/' + dlS + '/[' + found.join(',') + ']';
+            })(),
+            // [xf-word-loss PM37] producer first-word split: n(1.0) / n(0) / n(other) / lastOther
+            // [m00-hunt PM37] runtime lanes at 0x800bb8f4: fbps1 / faps0 / result / hits
+            xfi: (A[0x026B37B4 >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B37B8 >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B37BC >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B37C0 >> 2] >>> 0),
+            // [m00-hunt PM37] the 0x800bb90c psq_st: storedPs0Bits / hostAddr / EA
+            // / fastN / slowN
+            xfj: (A[0x026B37C4 >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B37C8 >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B37CC >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B37D0 >> 2] >>> 0) + '/' + (A[0x026B37D4 >> 2] >>> 0),
+            // [m00-hunt PM37] Concat m00 store 0x800bb4dc: bits / lastEA / N /
+            // group-mtx-pinned bits / pinned N
+            xfk: (A[0x026B37D8 >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B37DC >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B37E0 >> 2] >>> 0) + '/'
+              + (A[0x026B37E4 >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B37E8 >> 2] >>> 0) + '|f64='
+              + (A[0x026B37F0 >> 2] >>> 0).toString(16) + ':'
+              + (A[0x026B37EC >> 2] >>> 0).toString(16)
+              + '|a00=' + (A[0x026B37F4 >> 2] >>> 0).toString(16)
+              + ' b00=' + (A[0x026B37F8 >> 2] >>> 0).toString(16)
+              + ' r3=' + (A[0x026B37FC >> 2] >>> 0).toString(16)
+              + ' r4=' + (A[0x026B3820 >> 2] >>> 0).toString(16),
+            // [m00-hunt PM37] PSMTXScale stfs xS: zeroN / nonzeroN / lastNonzero / lastEA
+            xfl2: (A[0x026B3800 >> 2] >>> 0) + '/' + (A[0x026B3804 >> 2] >>> 0) + '/'
+              + (A[0x026B3808 >> 2] >>> 0).toString(16) + '/'
+              + (A[0x026B380C >> 2] >>> 0).toString(16),
+            // [m00-hunt PM37] Scale stfs PINNED to 0x801E6AC4: zeroN / nonzeroN / lastBits
+            // + stfs host @3840 | psq_l pinned: host @3830 / bits @3834 / fastN / slowN
+            xfn: (A[0x026B3824 >> 2] >>> 0) + '/' + (A[0x026B3828 >> 2] >>> 0) + '/'
+              + (A[0x026B382C >> 2] >>> 0).toString(16) + '/sthost='
+              + (A[0x026B3840 >> 2] >>> 0).toString(16) + '|ldhost='
+              + (A[0x026B3830 >> 2] >>> 0).toString(16) + ' ldbits='
+              + (A[0x026B3834 >> 2] >>> 0).toString(16) + ' fastN='
+              + (A[0x026B3838 >> 2] >>> 0) + ' slowN=' + (A[0x026B383C >> 2] >>> 0),
+            // [m00-hunt PM37] resting bytes of sprman temp row0 (guest 0x801E6AC4,
+            // 16 bytes = m00,m01,m02,m03) read directly from shared memory
+            xfo: (() => {
+              const m1v = A[0x02500020 >> 2] >>> 0;
+              if (!m1v) return 'nomem';
+              const u8 = new Uint8Array(window.sharedMemory.buffer);
+              const b = m1v + 0x1E6AC4;
+              const w = o => ((u8[b + o] << 24 | u8[b + o + 1] << 16 | u8[b + o + 2] << 8 |
+                               u8[b + o + 3]) >>> 0).toString(16);
+              return [0, 4, 8, 12].map(w).join('/');
+            })(),
+            // [PM51 TEMP] chain bail census: serviceBail/vectorBail/chainTaken/tagMiss
+            chainCensus: (A[0x026B38D0 >> 2] >>> 0) + '/' + (A[0x026B38D4 >> 2] >>> 0)
+              + '/' + (A[0x026B38D8 >> 2] >>> 0) + '/' + (A[0x026B38DC >> 2] >>> 0),
+            // [render-gaps R1 PM38] EFB->RAM copies: entries / readbacks started / encodes done
+            efbram: (A[0x026B384C >> 2] >>> 0) + '/' + (A[0x026B3850 >> 2] >>> 0) + '/'
+              + (A[0x026B3854 >> 2] >>> 0) + '/flags='
+              + (A[0x026B3858 >> 2] >>> 0).toString(16),
+            // [m00-hunt PM37] mem1_base rebase detector: changes / first / latest / probe m1v
+            xfb: (A[0x026B3810 >> 2] >>> 0) + '/' + (A[0x026B3814 >> 2] >>> 0).toString(16)
+              + '/' + (A[0x026B3818 >> 2] >>> 0).toString(16) + '/'
+              + (A[0x02500020 >> 2] >>> 0).toString(16),
+            xfz: (A[0x026B37A4 >> 2] >>> 0) + '/' + (A[0x026B37A8 >> 2] >>> 0) + '/'
+              + (A[0x026B37AC >> 2] >>> 0) + '/' + (A[0x026B37B0 >> 2] >>> 0).toString(16),
+            // [xf-word-loss PM37] MEM1 scan for the movie matrix BODY (words 1-11 BE:
+            // 0,0,153f,0, 1f,0,402f,0, 0,0,1f? -> see bytes below); reports each hit's
+            // guest addr + word0 (m00) AS STORED IN RAM. m00==0 in RAM = the JIT
+            // COMPUTED the matrix wrong; all-1.0 = the psq streaming lies.
+            xfm: (() => {
+              const m1v = A[0x02500020 >> 2] >>> 0;
+              if (!m1v) return 'nomem';
+              const u8 = new Uint8Array(window.sharedMemory.buffer);
+              // w1..w11 big-endian bytes (44 bytes): 0,0,43 19 00 00,0, 3F 80 00 00,
+              // 0, 43 C9 00 00, 0, 0, 3F 80 00 00, 0
+              const pat = [];
+              const pw = [0, 0, 0x43190000, 0, 0x3F800000, 0, 0x43C90000, 0, 0, 0x3F800000, 0];
+              for (const w of pw) { pat.push((w >>> 24) & 255, (w >>> 16) & 255, (w >>> 8) & 255, w & 255); }
+              const hits = [];
+              const end = m1v + 0x01800000 - 48;
+              for (let p = m1v; p < end; p += 4) {
+                if (u8[p + 4] !== pat[0]) continue;  // quick reject on w1 byte0 (0)
+                if (u8[p + 12] !== 0x43 || u8[p + 13] !== 0x19) continue;  // w3 = 153f
+                let ok = true;
+                for (let k = 0; k < 44; k++) { if (u8[p + 4 + k] !== pat[k]) { ok = false; break; } }
+                if (!ok) continue;
+                const w0 = (u8[p] << 24 | u8[p + 1] << 16 | u8[p + 2] << 8 | u8[p + 3]) >>> 0;
+                hits.push(((p - m1v) >>> 0).toString(16) + ':' + w0.toString(16));
+                if (hits.length >= 8) break;
+              }
+              return '[' + hits.join(',') + ']';
+            })(),
+            // [xf-word-loss PM37] HuSprGrpData[4] fields (guest 0x80155BE0):
+            // cap/x/y/z_rot/scale_x/scale_y/center_x/center_y (BE f32 hex)
+            xfh: (() => {
+              const m1v = A[0x02500020 >> 2] >>> 0;
+              if (!m1v) return 'nomem';
+              const u8 = new Uint8Array(window.sharedMemory.buffer);
+              const b = m1v + 0x155BE0;
+              const w = o => ((u8[b + o] << 24 | u8[b + o + 1] << 16 | u8[b + o + 2] << 8 |
+                               u8[b + o + 3]) >>> 0).toString(16);
+              return [4, 8, 0xC, 0x10, 0x14, 0x18, 0x1C].map(w).join('/');
+            })(),
+            // [xf-word-loss PM37] event ring (head + 16 tag:seq entries, oldest->newest)
+            xfr: (() => {
+              const h = A[0x026B37A0 >> 2] >>> 0;
+              const es = [];
+              for (let i = 0; i < 16; i++) {
+                const e = A[(0x026B3760 + (((h + i) & 15) * 4)) >> 2] >>> 0;
+                es.push((e >>> 28) + ':' + (e & 0x0FFFFFFF));
+              }
+              return h + '|' + es.join(',');
+            })(),
             xfbHash: m1 ? (() => {
               const xa = A[0x026B1A68 >> 2] >>> 0; const pa = xa & 0x01FFFFFF;
               if (!xa || pa > 0x017F0000) return 'noxfb';
@@ -772,6 +1102,31 @@ function startServer() {
     }, parseInt(m[2], 10));
   });
 
+  // ---- [xfb-band PM45 TEMP] PROBE_MEM1_PEEK="hexoff,hexoff,...@ms": dump 32 bytes of
+  // guest MEM1 at each offset (mem1base from SAB cell 0x02500020, crash-slot pattern).
+  if (process.env.PROBE_MEM1_PEEK) {
+    const pm = process.env.PROBE_MEM1_PEEK.match(/^(.+)@(\d+)$/);
+    if (pm) setTimeout(async () => {
+      try {
+        const offs = pm[1].split(',').map(s => parseInt(s, 16));
+        const out = await page.evaluate((offsets) => {
+          if (!window.sharedMemory) return 'no sharedMemory';
+          const A = new Uint32Array(window.sharedMemory.buffer);
+          const B = new Uint8Array(window.sharedMemory.buffer);
+          const base = A[0x02500020 >> 2] >>> 0;
+          if (!base) return 'mem1base=0';
+          return offsets.map((off) => {
+            let s = 'off=0x' + off.toString(16) + ':';
+            for (let i = 0; i < 32; i++)
+              s += ' ' + B[base + off + i].toString(16).padStart(2, '0');
+            return s;
+          }).join('\n');
+        }, offs);
+        console.log('[mem1-peek @' + pm[2] + 'ms]\n' + out);
+      } catch (e) { console.log('[probe] mem1-peek failed: ' + e.message); }
+    }, parseInt(pm[2], 10));
+  }
+
   // ---- report the WASM build's own raw DoState size (format-compat check) --
   if (process.env.PROBE_STATE_SIZE_MS) {
     setTimeout(async () => {
@@ -837,6 +1192,20 @@ function startServer() {
   clearInterval(metricsTimer);
   if (stuckReason) console.log('[probe] EXIT-STUCK: ' + stuckReason);
 
+  // ---- dump pc-sample histogram ------------------------------------------
+  if (PC_SAMPLE) {
+    try {
+      const dump = await page.evaluate(() => {
+        const st = window.__pcSamp; if (!st) return null;
+        return st.segs.map((sg, i) => sg ? ({ seg: i, n: sg.n, gcmin: sg.gcmin,
+          gcmax: sg.gcmax, hist: Array.from(sg.hist.entries()) }) : null);
+      });
+      fs.writeFileSync('/tmp/wasm_pc_hist.json', JSON.stringify(dump));
+      const tot = (dump || []).reduce((a, s) => a + (s ? s.n : 0), 0);
+      console.log('[probe] pc-sample: ' + tot + ' samples → /tmp/wasm_pc_hist.json');
+    } catch (e) { console.error('[probe] pc-sample dump failed: ' + e.message); }
+  }
+
   // ---- stop CPU profiler + categorize self-time --------------------------
   if (CPU_PROFILE && cpuProf.started) {
     let wi = 0;
@@ -898,11 +1267,26 @@ function startServer() {
       const ctx = c.getContext('2d');
       if (ctx) {
         const data = ctx.getImageData(0, 0, c.width, c.height).data;
-        let nonBlack = 0;
+        let nonBlack = 0, firstRow = -1, lastRow = -1;
+        const rowPx = c.width;
         for (let i = 0; i < data.length; i += 4) {
-          if (data[i] !== 0 || data[i+1] !== 0 || data[i+2] !== 0) nonBlack++;
+          if (data[i] !== 0 || data[i+1] !== 0 || data[i+2] !== 0) {
+            nonBlack++;
+            const row = Math.floor((i / 4) / rowPx);
+            if (firstRow < 0) firstRow = row;
+            lastRow = row;
+          }
         }
-        return { found: true, has2d: true, w: c.width, h: c.height, nonBlack, total: data.length / 4 };
+        // sample 4 pixels across the first non-black row (color variety test)
+        let samples = [];
+        if (firstRow >= 0) {
+          for (const x of [0, 160, 320, 560]) {
+            const o = (firstRow * rowPx + x) * 4;
+            samples.push(data[o] + ',' + data[o+1] + ',' + data[o+2]);
+          }
+        }
+        return { found: true, has2d: true, w: c.width, h: c.height, nonBlack,
+                 total: data.length / 4, firstRow, lastRow, samples };
       }
     } catch (e) {
       // Canvas is owned by an OffscreenCanvas worker; main-thread inspection
@@ -1295,6 +1679,23 @@ function startServer() {
             // [perf-split] device-thread slice 0.1ms accum / slice count / CPU throttle-sleep 0.1ms accum
             bw.perfSplit = (A[0x026B3380 >> 2] >>> 0) + '/' + (A[0x026B3384 >> 2] >>> 0) + '/' + (A[0x026B3388 >> 2] >>> 0)
               + '/' + (A[0x026B3390 >> 2] >>> 0) + '/' + (A[0x026B3394 >> 2] >>> 0); // +advance 0.1ms/count
+            // [slowmem-audit] slow-path host calls (ALL widths as of PM23) by class:
+            // RAM-mirror(fastmem-eligible) / MMIO-other / GP / locked-L1 0xE0
+            bw.slowmem = (A[0x026B33B0 >> 2] >>> 0) + '/' + (A[0x026B33B4 >> 2] >>> 0) + '/'
+              + (A[0x026B33B8 >> 2] >>> 0) + '/' + (A[0x026B33BC >> 2] >>> 0);
+            // [slowmem-class] runtime slow-arm executions by op family: integer / scalar-FP / (psq=remainder)
+            bw.slowClass = (A[0x026B33C0 >> 2] >>> 0) + '/' + (A[0x026B33C4 >> 2] >>> 0) + '/' + (A[0x026B33C8 >> 2] >>> 0);
+            // [simd-census TEMP] EMIT-TIME ps path census: simd-arith/scalar-arith/simd-fma/scalar-fma
+            // + [single-spec] shadow mask (hex) + cumulative deopt count
+            bw.simdCensus = (A[0x026B33D0 >> 2] >>> 0) + '/' + (A[0x026B33D4 >> 2] >>> 0) + '/'
+              + (A[0x026B33D8 >> 2] >>> 0) + '/' + (A[0x026B33DC >> 2] >>> 0)
+              + ' mask=0x' + (A[0x026B33E0 >> 2] >>> 0).toString(16)
+              + ' deopt=' + (A[0x026B33E8 >> 2] >>> 0)
+              + ' psWith=' + (A[0x026B33EC >> 2] >>> 0)
+              + ' psWithout=' + (A[0x026B33F0 >> 2] >>> 0)
+              + ' failBits=0x' + (A[0x026B33F8 >> 2] >>> 0).toString(16)
+              + ' ring=' + Array.from({length: Math.min(32, A[0x026B33F4 >> 2] >>> 0)},
+                  (_, k) => (A[(0x026B3400 >> 2) + k] >>> 0).toString(16)).join(',');
             // [seq-diag] shared seq: now / payload / burst / drain / sleep / mainloop-tick
             bw.seqs = (A[0x026B3320 >> 2] >>> 0) + '/' + (A[0x026B3324 >> 2] >>> 0) + '/' + (A[0x026B3328 >> 2] >>> 0)
               + '/' + (A[0x026B3330 >> 2] >>> 0) + '/' + (A[0x026B3334 >> 2] >>> 0) + '/' + (A[0x026B3338 >> 2] >>> 0);

@@ -28,6 +28,10 @@
 
 #include <emscripten.h>  // [WGPU-PROF — TEMP] emscripten_get_now for the Advance() frame timer
 
+// [fprf-gate PM46] Config::MAIN_FPRF for the native-exact FPRF emission gate.
+#include "Common/Config/Config.h"
+#include "Core/Config/MainSettings.h"
+
 #include <climits>
 #include <cstdint>
 #include <vector>
@@ -65,12 +69,30 @@ static_assert(offsetof(PowerPC::PowerPCState, downcount) == 0x2F0,
 
 // [dual-core diag] sticky handover flag (ProcessorInterface.cpp) — gates [chain0] post-handover.
 extern "C" int g_dc_handover_done;
+// [lc-window PM23] defined in bementalJIT block_cache.cpp; consumed by the
+// powerpc-next emitters' LC slow-arm shortcut.
+extern "C" uint32_t g_bem_lc_base;
+// [fprf-gate PM46] bFPRF half of the FPRF emission gate (block_cache.cpp).
+extern "C" uint32_t g_bem_fprf_enabled;
+// [accurate-nans-gate PM59] m_accurate_nans half (block_cache.cpp).
+extern "C" uint32_t g_bem_accurate_nans;
+// [single-spec PM26] sticky force-double registry (block_cache.cpp).
+extern "C" void bem_pc_force_double_add(uint32_t pc);
 
 namespace
 {
 // Block-decode limit. Matches the conservative cap the legacy build_block
 // path used. Branches always terminate; this is the upper bound for
 // fall-through fetch.
+// [block-cap PM52 2026-08-03 — TRIED 160, WASH, REVERTED] The chain census
+// (4.8M tail-calls/s, 99.66% hit-rate) put the cross-module
+// return_call_indirect tax at ~12.9%; raising the cap to 160 left chainTaken
+// UNCHANGED (370.9M vs 362.5M/75s) — the hot working set is
+// TERMINATOR-bounded (branches every <64 instrs), not cap-bounded, and
+// bigger blocks worsen the cold-compile transient. The boundary killer for
+// branchy code is BRANCH-FOLLOWING / region merging (analyst flag
+// m_enable_branch_following exists, defaults false — PM39's #1 structural
+// item), not a larger straight-line cap.
 constexpr u32 kMaxBlockInsts = 64;
 
 // IsBlockTerminator — forwards to bemental::powerpc::IsBlockTerminator
@@ -136,8 +158,9 @@ void JitWasm::InvalidateICacheRange(u32 lo, u32 hi)
 {
   // Blocks decode at most 64 instructions (256 guest bytes — see
   // TryCompileBlock), so any block overlapping [lo, hi) starts at or
-  // after lo - 256.
-  auto it = m_block_guest_end.lower_bound(lo >= 256u ? lo - 256u : 0u);
+  // after lo - kMaxBlockInsts*4 (PM52: bound scales with the decode cap).
+  constexpr u32 kMaxBlockBytes = kMaxBlockInsts * 4u;
+  auto it = m_block_guest_end.lower_bound(lo >= kMaxBlockBytes ? lo - kMaxBlockBytes : 0u);
   while (it != m_block_guest_end.end() && it->first < hi)
   {
     if (it->second > lo)
@@ -194,6 +217,20 @@ void JitWasm::Run()
   const u32 mem1_base = static_cast<u32>(reinterpret_cast<uintptr_t>(mem.GetRAM()));
   const u32 mem1_mask = mem.GetRamMask();
   const u32 ram_size  = mem.GetRamSize();
+  // [lc-window PM23] publish the 256KB locked-L1 backing address so the emitter's
+  // slow arms serve [0xE0000000, 0xE0040000) with raw in-wasm loads/stores instead
+  // of a cross-instance import per access (THP pixel workspace: 222.7M calls/120s).
+  g_bem_lc_base = static_cast<u32>(reinterpret_cast<uintptr_t>(mem.GetL1Cache()));
+  // [fprf-gate PM46 2026-07-31] native-exact FPRF gating: Jit64 emits FPRF only when
+  // `bFPRF && wantsFPRF`; bFPRF defaults false and GMPE01 has no override, so native
+  // MP4 emits NO FPRF code. We paid a ~150-op classifier on nearly every ps op
+  // (IDCT dump: 223 lines per SIMD arith op). Mirror the config half here.
+  g_bem_fprf_enabled = Config::Get(Config::MAIN_FPRF) ? 1u : 0u;
+  // [accurate-nans-gate PM59] same native-parity class: Jit64 emits the paired-
+  // single NaN ladder only when m_accurate_nans (Config MAIN_ACCURATE_NANS,
+  // default false). Mirror it so games get native-default fast FP; the accurate
+  // path stays validated by test_diff_next (which forces it on).
+  g_bem_accurate_nans = Config::Get(Config::MAIN_ACCURATE_NANS) ? 1u : 0u;
 
 #ifdef __EMSCRIPTEN__
   // [ppc-bridge] Publish the REAL ppc_state + RAM addresses into the SAB for the
@@ -449,9 +486,36 @@ void JitWasm::Run()
       // did between single dispatches.
       u32 final_pc = pc;
       u32 trap_pc = 0;
+#ifdef __EMSCRIPTEN__
+      // [self-loop PM47] every HOST-initiated dispatch invalidates the
+      // self-chain flag: the flag may only be honored across a DIRECT
+      // self-tail-call (anything host-side — interp, exceptions, regions —
+      // could have rewritten ps[], making the scratch stale).
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B38C0u)) = 0u;
+#endif
       const s32 chained = m_wasm_cache.chain_dispatch(
           pc, /*max_iters=*/4096u, &final_pc, &trap_pc,
           &ppc_state.Exceptions, reinterpret_cast<const s32*>(&ppc_state.downcount));
+#ifdef __EMSCRIPTEN__
+      // [single-spec PM26] A block's single-valued prologue guard mismatched:
+      // it published its pc, zeroed the downcount (which broke the chain), and
+      // returned its own start. Evict + sticky-force-double so the recompile
+      // drops the assumption — once per pc, converges.
+      {
+        volatile u32* dcell =
+            reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B33E4u));
+        const u32 dp = *dcell;
+        if (dp != 0u)
+        {
+          *dcell = 0u;
+          bem_pc_force_double_add(dp);
+          EvictBlock(dp);
+          volatile u32* dn =
+              reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B33E8u));
+          *dn = *dn + 1u;   // cumulative deopt count (probe: simdCensus tail)
+        }
+      }
+#endif
       if (trap_pc != 0u)
       {
         // A block trapped mid-chain. chain_dispatch already evicted it
@@ -463,6 +527,13 @@ void JitWasm::Run()
         m_block_guest_end.erase(trap_pc);
         ppc_state.pc = trap_pc;
         ppc_state.npc = trap_pc;
+#ifdef __EMSCRIPTEN__
+        // [single-spec PM26] the host interpreter may write ps[] — the shadow
+        // mask is stale for anything it touches; clear wholesale.
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B33E0u)) = 0u;
+        // [self-loop PM47] scratch stale with the mask — invalidate the flag too.
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B38C0u)) = 0u;
+#endif
         CachedInterpreter::Run();
         return;
       }
@@ -548,6 +619,12 @@ void JitWasm::Run()
       // exceptions at entry via ppc_state.npc, so a stale npc (0x80010640, an old HuSprDisp epilogue)
       // -> SRR0=npc -> rfi to a dead frame -> blr 0. pc is the real resume instruction; force npc=pc.
       ppc_state.npc = ppc_state.pc;
+#ifdef __EMSCRIPTEN__
+      // [single-spec PM26] see the trap path — interp may write ps[].
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B33E0u)) = 0u;
+        // [self-loop PM47] scratch stale with the mask — invalidate the flag too.
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B38C0u)) = 0u;
+#endif
       CachedInterpreter::Run();
       return;
     } while (ppc_state.downcount > 0 && *state_ptr == CPU::State::Running);

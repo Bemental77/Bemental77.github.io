@@ -198,6 +198,11 @@ static void XFRegWritten(Core::System& system, XFStateManager& xf_state_manager,
   }
 }
 
+// [xf-word-loss PM37 TEMP] canary: track WHERE in the frame xfmem word0 (host
+// 0x10730330, = posMatrices[0]) flips 1.0 -> 0. Sites call bem_xf_canary(id);
+// on the 1.0->0 transition we record the site id + a running op counter.
+// last-good site @0x026B3744, first-bad site @0x3748, transition count @0x374C,
+// op counter at transition @0x3750.
 void LoadXFReg(u16 base_address, u8 transfer_size, const u8* data)
 {
   if (base_address > XFMEM_REGISTERS_END)

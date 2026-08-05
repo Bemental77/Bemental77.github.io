@@ -32,6 +32,14 @@
 #include "fpr_reg_cache.h"
 #include "reg_cache.h"
 
+namespace bemental::powerpc {
+// [v9b] exact inverse of the PEM widen (defined in jit_load_store.cpp) —
+// i64 lane local -> f32 bits on stack, round-trip identity incl. NaN
+// payloads + single denormals. Clobbers LOCAL_TMP_VAL (=95). Same
+// forward-decl pattern as fpr_reg_cache.cpp:26.
+void emit_convert_to_single(WasmModuleBuilder& wb, u32 ps0_local);
+}
+
 // NOTE: Cannot include "../powerpc/gekko_emit.h" — both libs share the
 // `bemental::powerpc` namespace and have parallel definitions for spr/gpr/
 // WIMPORT_* enum / BlockInputs, causing ODR redefinition collisions.
@@ -47,6 +55,23 @@ namespace bemental::powerpc {
 static constexpr u32 WIMPORT_INTERP    = 6;
 static constexpr u32 WIMPORT_CHECK_EXC = 7;
 static constexpr u8  BLOCK_TYPE_VOID   = 0x40;
+// [chain-edge REVERTED 2026-08-03 PM53] The one-hop spill-pack protocol
+// (generalize PM47's self-loop flag to any chain edge A->B: singles epilogue
+// spills all Singles + writes a mask cell 0x026B38C4, taken arm publishes
+// flag=target PC, FPR-clean blocks forward, FP-dirty arms clear, entry skips
+// the verify on flag+mask hit) was implemented TWICE (clear-only and
+// forward-mode) and MEASURED WORSE both times on the live MP4 probe:
+// baseline 40.0 gc/s -> 36.5 (v1) / 35.8 (v2-forward), all per-function
+// cost_x inflated, self-loop bench 152 -> 174/161 ns/iter. The added
+// per-transition overhead (epilogue spill 3S+3, 12-op two-cell entry check,
+// forward branch on int-block taken arms) outweighs the fast-entry hits.
+// DO NOT RE-TRY this shape; the remaining fix for per-entry prologue cost is
+// the structural graph merge (branch-following / regions).
+static constexpr u32 BEM_SELFCHAIN_FLAG_CELL = 0x026B38C0u;
+// [PM51] chain bail-class census (cells 0x026B38D0-38DC). Census DONE
+// 2026-08-03: serviceBail 1.16M / vector 0 / chainTaken 362.5M / tagMiss 69K
+// per 75s = 99.66%% hit-rate, 4.8M tail-calls/s (the return_call tax).
+static constexpr bool BEM_PM51_CENSUS = false;
 
 // In-WASM block chaining (defined in src/block_cache.cpp). Each per-block
 // module imports the host __indirect_function_table and, at its epilogue,
@@ -66,6 +91,8 @@ extern "C" {
     extern uint32_t      g_bem_promote_n;       // Phase A: ring count
     extern unsigned char g_bem_promote_enabled; // Phase A: A/B toggle
     extern int           g_bem_gp_dirty;        // [perf] gather-pipe write pending (bridge)
+    extern uint32_t      g_bem_lc_base;         // [lc-window PM23] Memory::GetL1Cache() addr
+    int  bem_pc_force_double(uint32_t pc);      // [single-spec PM26] sticky deopt registry
 }
 static constexpr u32 BEM_DISP_MASK_NEXT = 0x3FFFFu;  // MUST match block_cache.cpp BEM_DISP_MASK (BEM_DISP_BITS=18)
 static constexpr u32 LOCAL_TMP_A_CHAIN  = 0u;       // build_block_next i32 scratch 0
@@ -114,9 +141,19 @@ struct MergedRegionCtx {
 };
 static constexpr u32 REGION_LAP_MAX = 2048u;
 
+// [PM54d payload] direct_pcs/direct_fidx: up to 2 STATIC successor pcs whose
+// blocks live in THIS gen module, with their ABSOLUTE wasm function indices
+// (WIMPORT_COUNT + internal idx). Emitted as PC-compare arms AFTER the
+// service checks and BEFORE the runtime bucket probe: same-instance direct
+// return_call is the V8-inlining-eligible edge shape the N-fn design exists
+// for (per-block modules' cross-instance calls are categorically ineligible).
 static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                                  u32 tag_addr_ovr = 0u, u32 slot_addr_ovr = 0u,
-                                 const MergedRegionCtx* merged = nullptr) {
+                                 const MergedRegionCtx* merged = nullptr,
+                                 s32 region_gen = -1,
+                                 const u32* direct_pcs = nullptr,
+                                 const u32* direct_fidx = nullptr,
+                                 u32 n_direct = 0u) {
     if (!g_bem_chain_enabled) {
         b.op_i32_const((s32)ctx_ptr);
         b.op_i32_load(ppc_off::PC);
@@ -167,6 +204,12 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
     b.op_i32_and();
     b.op_i32_or();
     b.op_if(BLOCK_TYPE_VOID);
+        // [PM51 bail-census — gated; census DONE: 99.66% hit-rate]
+        if (BEM_PM51_CENSUS && g_bem_lc_base) {
+            b.op_i32_const((s32)0x026B38D0u);
+            b.op_i32_const((s32)0x026B38D0u);
+            b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
+        }
         b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
     b.op_end();
 
@@ -188,8 +231,26 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
     b.op_i32_const(0); b.op_i32_ne();                        // -> 0/1 (normalize before AND)
     b.op_i32_and();                                          // (PC<0x4000) AND (IR set)
     b.op_if(BLOCK_TYPE_VOID);
+        // [PM51 bail-census — gated]
+        if (BEM_PM51_CENSUS && g_bem_lc_base) {
+            b.op_i32_const((s32)0x026B38D4u);
+            b.op_i32_const((s32)0x026B38D4u);
+            b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
+        }
         b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
     b.op_end();
+
+    // [PM54d payload] STATIC same-gen edges: PC-compare -> direct return_call
+    // (same instance; ~500-wire-byte callees are TurboFan-inline candidates).
+    // Sits after the service/vector checks (identical gating to the probe
+    // path) and short-circuits the bucket probe for the common static edges.
+    for (u32 di = 0; di < n_direct; ++di) {
+        b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
+        b.op_i32_const((s32)direct_pcs[di]); b.op_i32_eq();
+        b.op_if(BLOCK_TYPE_VOID);
+            b.op_return_call(direct_fidx[di]);
+        b.op_end();
+    }
 
     // bucket byte-offset = ((PC>>2) & MASK) * 4 ; keep PC in TMP_A, byteoff in TMP_B
     b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
@@ -245,8 +306,35 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                 // fall through → global-table chain / host return below
             b.op_end();
         } else {
-            b.op_local_get(LOCAL_TMP_A_CHAIN);       // table index operand
-            b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+            // [PM51 bail-census — gated]
+            if (BEM_PM51_CENSUS && g_bem_lc_base) {
+                b.op_i32_const((s32)0x026B38D8u);
+                b.op_i32_const((s32)0x026B38D8u);
+                b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
+            }
+            if (region_gen >= 0) {
+                // [PM54c fix 1c] N-fn region body: rslot entries are
+                // GEN-PACKED ((gen<<16)|i; gen-G entries written only by gen
+                // G's SUCCESSFUL seal). Call through OUR internal table ONLY
+                // on an own-gen match — the masked index is then < n_funcs
+                // by construction. Other-gen tag-hits fall through to the
+                // host return (the global buckets re-enter the owning gen).
+                // A -1 slot shifts to 0xFFFF != gen, subsuming the sign
+                // check. Cross-gen slot confusion is impossible BY
+                // CONSTRUCTION.
+                b.op_local_get(LOCAL_TMP_A_CHAIN);
+                b.op_i32_const(16); b.op_i32_shr_u();
+                b.op_i32_const((s32)region_gen); b.op_i32_eq();
+                b.op_if(BLOCK_TYPE_VOID);
+                    b.op_local_get(LOCAL_TMP_A_CHAIN);
+                    b.op_i32_const(0xFFFF); b.op_i32_and();
+                    b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+                b.op_end();
+                // other-gen hit: fall through to the host return below.
+            } else {
+                b.op_local_get(LOCAL_TMP_A_CHAIN);   // table index operand
+                b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+            }
         }
         b.op_end();
     b.op_end();
@@ -282,6 +370,12 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
     }
 
     // No chain (bail / tag miss / freed slot): return next-PC to the JS loop.
+    // [PM51 bail-census — gated]
+    if (BEM_PM51_CENSUS && g_bem_lc_base) {
+        b.op_i32_const((s32)0x026B38DCu);
+        b.op_i32_const((s32)0x026B38DCu);
+        b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
+    }
     b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
 }
 
@@ -358,8 +452,8 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // ---- D-form integer / logical ----
     case 7:  emit_mulli  (wb, rc, frc, op);                       return true;
     case 8:  emit_subfic (wb, rc, frc, op, params.ctx_ptr);       return true;
-    case 10: emit_cmpli  (wb, rc, frc, op, params.ctx_ptr);       return true;
-    case 11: emit_cmpi   (wb, rc, frc, op, params.ctx_ptr);       return true;
+    case 10: emit_cmpli  (wb, rc, frc, op, params.ctx_ptr, params.cmp_fuse); return true;
+    case 11: emit_cmpi   (wb, rc, frc, op, params.ctx_ptr, params.cmp_fuse); return true;
     case 12: emit_addic    (wb, rc, frc, op, params.ctx_ptr);     return true;
     case 13: emit_addic_rc (wb, rc, frc, op, params.ctx_ptr);     return true;
     case 14: emit_addi     (wb, rc, frc, op);                     return true;
@@ -402,7 +496,8 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     case 23: emit_rlwnmx (wb, rc, frc, op, params.ctx_ptr);       return true;
 
     // ---- Branch (D-form) ----
-    case 16: emit_bcx    (wb, rc, frc, op, params.ctx_ptr);       return true;
+    case 16: emit_bcx    (wb, rc, frc, op, params.ctx_ptr, /*is_terminal=*/true,
+                          BitSet32(0), params.cmp_fuse);          return true;
     case 18: emit_bx     (wb, rc, frc, op, params.ctx_ptr);       return true;
 
     case 19:
@@ -411,6 +506,10 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         case 528: emit_bcctrx(wb, rc, frc, op, params.ctx_ptr);   return true;
         case 50:  emit_rfi   (wb, rc, frc, op, params.ctx_ptr);   return true;
         case 150: /* isync */                                return true;
+        // CR-logical family — native (jit_compare.cpp). mcrf (0) stays interp.
+        case 257: case 129: case 289: case 225:
+        case  33: case 449: case 417: case 193:
+            emit_cr_logic(wb, rc, frc, op, params.ctx_ptr);      return true;
         default:  break;
         }
         break;
@@ -452,8 +551,8 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         case 232: case 744: emit_subfmex(wb, rc, frc, op, params.ctx_ptr);      return true;
         case 202: case 714: emit_addzex(wb, rc, frc, op, params.ctx_ptr);       return true;
         case 200: case 712: emit_subfzex(wb, rc, frc, op, params.ctx_ptr);      return true;
-        case 0:             emit_cmp   (wb, rc, frc, op, params.ctx_ptr);       return true;
-        case 32:            emit_cmpl  (wb, rc, frc, op, params.ctx_ptr);       return true;
+        case 0:             emit_cmp   (wb, rc, frc, op, params.ctx_ptr, params.cmp_fuse); return true;
+        case 32:            emit_cmpl  (wb, rc, frc, op, params.ctx_ptr, params.cmp_fuse); return true;
 
         // X-form loads
         case 23:  emit_load_x (wb, rc, frc, params, op, LoadWidth::U32, false); return true;
@@ -604,6 +703,8 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // frsqrte) still routed to interp.
     case 63: {
         switch (sub10) {
+        case   0: emit_fcmpu (wb, rc, frc, op, params.ctx_ptr); return true;  // fcmpu
+        case  32: emit_fcmpu (wb, rc, frc, op, params.ctx_ptr); return true;  // fcmpo (same impl)
         case  72: emit_fmrx  (wb, rc, frc, op, params.ctx_ptr); return true;
         case  40: emit_fnegx (wb, rc, frc, op, params.ctx_ptr); return true;
         case 264: emit_fabsx (wb, rc, frc, op, params.ctx_ptr); return true;
@@ -618,6 +719,7 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         switch (sub5_63) {
         case 18: case 20: case 21: case 25:  emit_fp_arith_double(wb, rc, frc, op, params.ctx_ptr); return true;
         case 28: case 29: case 30: case 31:  emit_fp_fma_double  (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 23:                             emit_fsel           (wb, rc, frc, op, params.ctx_ptr); return true;
         default: break;
         }
         // fcmpu/fcmpo/frsp/fctiw*/mffs/mtfsf* still routed to interp.
@@ -676,6 +778,95 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 // Set by host integrator (JitWasm) to HLE::GetHookByAddress wrapper.
 HleHookQueryFn g_hle_hook_query = nullptr;
 
+// [PM53h int-fusion] emit-time census: blocks compiled with the fused
+// integer-self-loop shape (tests assert this to prove the path emitted —
+// "one dispatch consumed N iterations" is also true for chain-dispatched
+// unfused blocks, so runtime observation alone cannot).
+extern "C" u32 g_bem_stat_int_fused = 0;
+
+// [PM53h int-fusion] Pre-scan for the fusable integer self-loop shape.
+// Conservatism property: a FALSE NEGATIVE only loses the fusion (the block
+// emits exactly as today); only a false positive can be a correctness bug —
+// every check below is therefore a verified whitelist.
+static bool fusable_terminal_bcx(u32 inst) {
+    // is_self_loop already proved OPCD 16 / AA=0 / LK=0. Additionally require
+    // a BO form emit_bcx resolves natively: bdnz/bdz or the CR-bit families.
+    const u32 bo = GekkoOperands::BO(inst);
+    if (bo == 0b10000u || bo == 0b10010u) return true;      // bdnz / bdz
+    return (bo & 0b10100u) == 0b00100u;                     // CR-bit forms
+}
+static bool fusable_body_op(u32 inst) {
+    // Whitelist mirroring dispatch_op's native rows MINUS every compile-time
+    // interp escape. Notable v1 exclusions (each verified interp-capable):
+    // mfspr/mtspr (non-direct SPRs fall back), mfmsr/mtmsr/mfcr/mtcrf/mtsr/
+    // tlbie (emit_simple_fallback), srawx/divwx/divwux/dcbz (runtime-guarded
+    // cold interp arms — admit only after auditing their Flush brackets).
+    const u32 opcd = inst >> 26;
+    switch (opcd) {
+        case 7: case 8: case 10: case 11: case 12: case 13: case 14: case 15:
+        case 20: case 21: case 23: case 24: case 25: case 26: case 27:
+        case 28: case 29:
+            return true;                                    // D-form arith/cmp/logic/rot
+        case 32: case 33: case 34: case 35: case 36: case 37: case 38:
+        case 39: case 40: case 41: case 42: case 43: case 44: case 45:
+        case 46: case 47:
+            return true;                                    // D-form int loads/stores
+        case 19:
+            return ((inst >> 1) & 0x3FFu) == 150u;          // isync only
+        case 31: {
+            const u32 sub = (inst >> 1) & 0x3FFu;
+            switch (sub) {
+                // OE-capable arith: native only when OE=0 (emit_oe_fallback_if_set).
+                case 266: case 40: case 235: case 10: case 8:
+                case 138: case 234: case 200: case 202: case 232:
+                case 136: case 104:
+                    return ((inst >> 10) & 1u) == 0u;
+                case 75: case 11:                            // mulhw/mulhwu (no OE)
+                case 28: case 60: case 444: case 316: case 124: case 476:
+                case 284: case 412:                          // and/andc/or/xor/nor/nand/eqv/orc
+                case 24: case 536: case 824:                 // slw/srw/srawi
+                case 954: case 922: case 26:                 // extsb/extsh/cntlzw
+                case 0: case 32:                             // cmp/cmpl
+                case 23: case 87: case 119: case 279: case 343:
+                case 375: case 55: case 311:                 // load-indexed (+update)
+                case 151: case 215: case 407: case 183:
+                case 247: case 439:                          // store-indexed (+update)
+                case 371:                                    // mftb
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        default:
+            return false;
+    }
+}
+static bool prescan_int_self_loop(const CodeBlock& block, const CodeBuffer& buffer) {
+    const u32 n = block.m_num_instructions;
+    if (n == 0) return false;
+    if (block.m_fpr_inputs.m_val != 0) return false;
+    for (u32 i = 0; i < n; ++i) {
+        const CodeOp& op = buffer.data()[i];
+        if (!op.opinfo || op.skip) return false;
+        if (op.opinfo->flags & FL_USE_FPU) return false;
+        if (op.usesFPU) return false;
+        if (op.fregsIn.m_val != 0 || op.fregOut >= 0) return false;
+        // HLE: null query means "every op may have a hook" — no fusion.
+        // Hooks installed post-compile evict the block (existing contract),
+        // so the pre-scan adds no new invalidation burden.
+        if (g_hle_hook_query == nullptr || g_hle_hook_query(op.address))
+            return false;
+        if (i + 1 < n) {
+            if (op.opinfo->type == OpType::Branch) return false;
+            if (op.canEndBlock || op.canCauseException) return false;
+            if (!fusable_body_op(op.inst)) return false;
+        } else {
+            if (!fusable_terminal_bcx(op.inst)) return false;
+        }
+    }
+    return true;
+}
+
 // [region] Shared block-body emit: prologue (downcount/idle + promote ring) +
 // RegCache/FPRRegCache setup + the per-op dispatch loop + epilogue (gather
 // drain + flush + terminal). Extracted from build_block_next so the region
@@ -687,7 +878,10 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                                  u32 count, u32 start_pc, u32 ctx_ptr,
                                  u32 mem1_base, u32 mem1_mask, u32 ram_size,
                                  u32 chain_tag_addr = 0u, u32 chain_slot_addr = 0u,
-                                 const MergedRegionCtx* merged = nullptr) {
+                                 const MergedRegionCtx* merged = nullptr,
+                                 s32 region_gen = -1,
+                                 LocalIdxLookupFn region_lookup = nullptr,
+                                 const void* region_lookup_user = nullptr) {
     // IN-BLOCK CYCLE ACCOUNTING (2026-06-12, Jit64 parity: Jit.cpp charges
     // js.downcountAmount at block entry). downcount -= numCycles emitted in
     // the block prologue so the chain dispatcher can run block-to-block
@@ -703,15 +897,17 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // wall terms once the guest is event-bound (PSO deep park: ViSwap
     // 2560 -> 4, AID 45x under its own schedule — events weren't broken,
     // guest-time advance was).
+    // [PM53h] idle_block + charge hoisted from the block below: the fused
+    // integer self-loop's back-edge re-charges the same per-iteration cost.
+    const bool idle_block = block.m_num_instructions > 0 &&
+        buffer.data()[block.m_num_instructions - 1].branchIsIdleLoop;
+    const u32 charge = stats.numCycles ? stats.numCycles : (u32)count;
     {
-        const bool idle_block = block.m_num_instructions > 0 &&
-            buffer.data()[block.m_num_instructions - 1].branchIsIdleLoop;
         if (idle_block) {
             b.op_i32_const((s32)ctx_ptr);
             b.op_i32_const(0);
             b.op_i32_store(ppc_off::DOWNCOUNT);
         } else {
-            const u32 charge = stats.numCycles ? stats.numCycles : (u32)count;
             b.op_i32_const((s32)ctx_ptr);
             b.op_i32_const((s32)ctx_ptr);
             b.op_i32_load(ppc_off::DOWNCOUNT);
@@ -724,7 +920,12 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             // to g_bem_promote_ring (drained C-side -> promote_hot -> region).
             // Non-idle blocks only (idle/poll loops are idle-skipped, not hot).
             // Uses scratch locals 0/1 (free here; RegCache uses 2..). TMP_A/B.
-            if (g_bem_promote_enabled) {
+            // [PM55 int-quality B] region bodies skip the profiling
+            // prologue: their pcs are already sealed (promote_hot dedups
+            // against m_sealed_pcs), so the ~20-op counter+ring sequence on
+            // EVERY execution of the hottest code was pure waste (15-40% of
+            // executed ops on 3-9-instr blocks).
+            if (g_bem_promote_enabled && region_gen < 0) {
                 const u32 bkt       = (start_pc >> 2) & BEM_DISP_MASK_NEXT;
                 const u32 exec_addr = (u32)(uintptr_t)&g_bem_pc_exec[bkt];
                 const u32 ring_addr = (u32)(uintptr_t)&g_bem_promote_ring[0];
@@ -769,6 +970,102 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         }
     }
 
+    // [single-spec v9 DUAL-ARM PM44 2026-07-31] Single-valued speculation for
+    // ps blocks, deopt-free. The shadow mask (0x026B33E0, maintained by
+    // FPRRegCache::Flush + the lfd tri-state runtime checks) is BIMODAL per
+    // code region: inside the THP decoder every FPR (incl. volatile f0-f13)
+    // is single-valued; inside MusyX/audio the volatiles hold genuine
+    // doubles. The v2-v8 designs (compile-time mask intersect + runtime
+    // guard -> deopt/evict/force-double) could not hold assumptions on the
+    // hot IDCT self-loop: rare genuine flaps (~0.5/s, audio ISR interleave)
+    // deopted the block and the recompile happened in the bits-just-cleared
+    // window, permanently pessimizing exactly the hottest blocks (measured:
+    // IDCT stuck at ~70% guest share, fps flat). v9 instead emits the block
+    // body TWICE under the entry guard: the match arm assumes ALL FPR
+    // live-ins single (Single repr -> jit_paired f32x4/relaxed_madd paths),
+    // the else arm is the plain Double body. Per-ENTRY selection, zero
+    // deopts, zero evictions, no compile-time mask timing sensitivity.
+    // Cost: ~2x emit size for ps blocks only (assumed==0 -> single arm).
+    BitSet32 assumed(0);
+// 1 = disable single-valued speculation entirely (single Double arm).
+#define BEM_SSPEC_DISABLE 0
+#if !BEM_SSPEC_DISABLE
+    // [PM53d singles-in-regions] merged bodies now build the assumed set too:
+    // the step-0 regions A/B measured IDCT 7.3x -> 15.4x with Double-only
+    // merged bodies (ps blocks lost the PM44/46/47 singles arms) — the region
+    // structure win cannot offset that loss. The dual-arm guard + both arms
+    // emit inside the region body; only the PM47 self-chain protocol stays
+    // per-block (its spill/flag exit is !merged-gated below).
+    if (g_bem_lc_base) {
+        bool has_ps = false;
+        for (u32 oi = 0; oi < block.m_num_instructions; ++oi) {
+            if (GekkoOperands::OPCD(buffer.data()[oi].inst) == 4u) { has_ps = true; break; }
+        }
+        if (has_ps) {
+// [v9 bisect 2026-07-31] 1 = assume volatile f0-f13 live-ins too (the IDCT
+// loop-carried set). 0 = stable half f14-f31 only (the PM26-proven set) —
+// isolates dual-arm structure from volatile-assumption widening. The first
+// v9 probe (volatiles on) hit +25-40%% gc but a BLACK canvas (pn matrix
+// value corrupted): bisecting which delta is at fault.
+#ifndef BEM_SSPEC_V9_VOLATILE
+#define BEM_SSPEC_V9_VOLATILE 1   // v9b: safe — volatiles VALUE-verified at entry
+#endif
+            constexpr u32 v9_lo = BEM_SSPEC_V9_VOLATILE ? 0u : 14u;
+            for (u32 i = v9_lo; i < 32; ++i)
+                if (block.m_fpr_inputs[i]) assumed[i] = true;
+        }
+    }
+#endif
+
+    // [self-loop PM47 2026-07-31] Loop-resident fast path for SELF-LOOP ps
+    // blocks (terminator = conditional backward branch to start_pc — the THP
+    // IDCT bdnz shape). The singles arm's self-chain exit spills the assumed
+    // v128s to scratch (0x026B3C00 + preg*16, 3 ops/reg) and publishes the
+    // flag (0x026B38C0 = start_pc) IMMEDIATELY before the direct tail-call to
+    // itself — nothing can run in between, so on re-entry flag==start_pc
+    // proves scratch is current and both the volatile VALUE-VERIFY and the
+    // PEM-inverse v128 rebuilds (~160 ops/reg) collapse to one v128.load
+    // each. Every other exit of this block writes flag=0; host trap/interp
+    // paths clear it too (JitWasm) — the flag is only ever live across the
+    // direct self-tail-call.
+    bool is_self_loop = false;
+    if (block.m_num_instructions > 0) {
+        const CodeOp& term = buffer.data()[block.m_num_instructions - 1];
+        const u32 ti = term.inst;
+        if ((ti >> 26) == 16u && (ti & 3u) == 0u) {   // bcx, AA=0, LK=0
+            const s32 bd = (s32)(s16)(u16)(ti & 0xFFFCu);
+            if (term.address + (u32)bd == start_pc) is_self_loop = true;
+        }
+    }
+    // [PM53d] !merged: the PM47 self-chain exit protocol (spill/flag/tail-call)
+    // is per-block-module only; without its publisher the flag-check entry
+    // would be dead ops inside a region body.
+    const bool fast_loop = is_self_loop && assumed.m_val != 0u && !merged &&
+                           !block.m_noncontiguous;   // [FUSION v2] fused: off (new surface)
+    // [PM53h int-fusion] Integer self-loops (no FPR speculation set) get the
+    // in-function loop instead: the body is wrapped in wasm loop/br, so
+    // iterations reuse the SAME activation — no per-iteration GPR prologue,
+    // chain probe, or tail-call. Convergence is free: emit_bcx_fused's head
+    // flush (same as emit_bcx's) runs inside the loop, so the back-edge lands
+    // exactly the post-prologue compile-time state (dirty=false everywhere;
+    // immediates have zero producers in this emitter; analyst const-facts are
+    // rooted in-block and re-execute each iteration — see the fusion design,
+    // TASKS PM53h). Excluded: merged bodies (splice depth), idle loops (must
+    // store downcount=0 and bail to the slice), non-whitelisted ops.
+    const bool int_fused = is_self_loop && !merged && assumed.m_val == 0u &&
+                           !idle_block && !block.m_noncontiguous &&
+                           prescan_int_self_loop(block, buffer);
+    if (int_fused) ++g_bem_stat_int_fused;
+    constexpr u32 PM47_FLAG_CELL = 0x026B38C0u;
+
+    // One arm = the complete block body (register caches, prologue loads,
+    // per-op emission, epilogue flush, chain-or-return). Every arm ends in
+    // op_return / return_call_indirect (emit_chain_or_return is terminal),
+    // so arms never fall through. Cache state is arm-local by construction:
+    // fresh RegCache/FPRRegCache per arm over the same identity-mapped
+    // wasm-local layout (GPR preg n -> local 2+n; FPR lanes/v128 fixed by
+    // OnBlockEntry), so both arms address identical locals.
+    auto emit_arm = [&](bool with_singles) {
     // RegCache: assign per-PPC-GPR WASM locals + emit prologue loads
     // for live-in registers.
     // [region-resident 2026-07-15] Merged-region bodies SKIP the prologue
@@ -782,18 +1079,68 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
 
     // FPRRegCache: assign per-PPC-FPR WASM locals (both ps0/ps1 lanes) +
     // emit i64 prologue loads for live-in FPRs (block.m_fpr_inputs).
-    // Step-3 wiring: prologue+epilogue only — no emit_* site references
-    // frc yet. Bit-exact round-trip safe because i64 load+store preserves
-    // any 64-bit pattern (NaN payload + signed-zero preserved).
+    // Bit-exact round-trip safe because i64 load+store preserves any 64-bit
+    // pattern (NaN payload + signed-zero preserved). The singles arm loads
+    // assumed live-ins as Single repr first (v128 from the exact f32 bits,
+    // PEM-inverse — see EmitAssumedSingleLoads); EmitPrologueLoads then
+    // skips their already-loaded lanes.
     FPRRegCache frc(b);
     frc.OnBlockEntry(block, /*wasm_local_base=*/34u, ctx_ptr);
+    if (with_singles) {
+        if (fast_loop) {
+            // [self-loop PM47] flag==start_pc -> scratch is ours-and-current:
+            // one v128.load per assumed reg. Else the full PEM-inverse rebuild
+            // (which also seeds scratch). Both emitters land the IDENTICAL
+            // compile-time state (Single, v128 valid+dirty, lanes unloaded),
+            // so the shared body below is correct for either runtime path.
+            b.op_i32_const((s32)PM47_FLAG_CELL);
+            b.op_i32_load(0);
+            b.op_i32_const((s32)start_pc);
+            b.op_i32_eq();
+            b.op_if(BLOCK_TYPE_VOID);
+                frc.EmitFastReentry(assumed);
+            b.op_else();
+                frc.EmitAssumedSingleLoads(ctx_ptr, assumed, /*fast_loop_mode=*/true);
+            b.op_end();
+            // [PM47 v2] entries are CLEAN; every host-visible Flush must still
+            // write these regs (the fast path's ps[] is stale until then).
+            frc.SetForceFlush(assumed);
+        } else {
+            frc.EmitAssumedSingleLoads(ctx_ptr, assumed);
+        }
+    }
     frc.EmitPrologueLoads(ctx_ptr);
+
+    // [self-loop PW-skip] Pure-write dirty Singles at the fast-loop terminal
+    // (dirty && Single && NOT a block live-in && not already in `assumed`).
+    // Filled at the terminal bdnz call site; the self-chain taken arm skips
+    // their Single->Double promote-flush entirely: the next iteration's
+    // psq_l/ps writes redefine them before any read (not live-in => the block
+    // never reads them first, in either arm), and nothing runs inside the
+    // flag window. Every OTHER exit still flushes them (plain-path epilogue
+    // full Flush — they stay Single+dirty through the bcx skip). Their ps[]
+    // staleness during the window is the same class PM47 already ships for
+    // the assumed set.
+    BitSet32 selfloop_pw(0);
 
     LoadStoreParams params;
     params.ctx_ptr   = ctx_ptr;
     params.mem1_base = mem1_base;
     params.mem1_mask = mem1_mask;
     params.ram_size  = ram_size;
+    params.lc_base   = g_bem_lc_base;  // [lc-window PM23] 0 until JitWasm publishes it
+    // [PM55 EA-CSE] per-block last-D-form-EA cache (LOCAL_TMP_EA reuse across
+    // consecutive same-base same-offset integer accesses — the scheduler
+    // stw/lwz-to-the-same-slot idiom). Invalidated below after any op that
+    // writes the cached base or could clobber LOCAL_TMP_EA.
+    EaCache ea_cache;
+    params.ea_cache = &ea_cache;
+    // [PM57 cmp-fuse] per-block adjacent cmp->branch fusion record. Set by a
+    // deferring cmp (lazy-CR); consumed by the immediately-following conditional
+    // branch (direct operand compare). Aged out below so it is valid ONLY for
+    // the op right after the cmp. Inert when BEM_LAZY_CR is false.
+    CmpFuse cmp_fuse;
+    params.cmp_fuse = &cmp_fuse;
 
     // Per-CodeOp dispatch. 2026-05-18 port of JIT64's HandleFunctionHooking
     // (Jit.cpp:1065-1066): JIT64 calls HLE::TryReplaceFunction on EVERY op's
@@ -828,6 +1175,14 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // the stfs — storing stale f1 (f64 2^52 → 0x59800000) and saturating
     // minimumVcount to 0xFFFFFFFF (red test: lfs_msr_fp_disabled).
     bool first_fp_found = false;
+    // [PM53h int-fusion] Loop head: AFTER all prologue emissions (earlier
+    // placement would re-run prologue loads / recharge entry downcount per
+    // iteration), immediately before the per-op body.
+    u32 fused_loop_depth = 0u;
+    if (int_fused) {
+        b.op_loop(BLOCK_TYPE_VOID);
+        fused_loop_depth = b.ctrlDepth();
+    }
     for (std::size_t i = 0; i < n_ops; ++i) {
         const CodeOp& op = buffer[i];
         const bool is_terminator = (i + 1 == n_ops);
@@ -883,8 +1238,19 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         // `if (PC == op.address) PC = op.address+4` and REQUIRES the pre-op pc to
         // have written op.address (a cap-cut ALU terminator otherwise leaves PC
         // stale -> epilogue returns the wrong next-pc -> the 27-PC +4 walk).
+        // [set_pc-narrow PM50 2026-08-03] FL_USE_FPU only needs the pre-op pc
+        // for the FP-unavailable BAILOUT (SRR0 = this op), which is emitted
+        // ONCE per block at the first FP op — Jit64 parity: it writes no pc
+        // for subsequent FP ops either (Jit.cpp:1104-1128 emits the MSR.FP
+        // check once; ordinary FP arith cannot raise). Loads/stores keep the
+        // store via FL_LOADSTORE (slow-path DSI reads ctx.PC). Saves 3 ops on
+        // EVERY ps/FP arith op after the block's first FP op (34/iter in the
+        // THP IDCT loop) — a norm-shaving cut, applies to all FP-heavy code.
+        const bool fpu_needs_pc =
+            op.opinfo && (op.opinfo->flags & FL_USE_FPU) && !first_fp_found;
         if (is_terminator || op.canEndBlock || op.canCauseException ||
-            (op.opinfo && (op.opinfo->flags & (FL_LOADSTORE | FL_USE_FPU))))
+            fpu_needs_pc ||
+            (op.opinfo && (op.opinfo->flags & FL_LOADSTORE)))
         {
             b.op_i32_const((s32)ctx_ptr);
             b.op_i32_const((s32)op.address);
@@ -907,14 +1273,25 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         // Jit64's MOV(pc, op.address) — SRR0 lands on THIS op so the whole
         // FP sequence re-executes after __OSLoadFPUContext.
         if (op.opinfo && (op.opinfo->flags & FL_USE_FPU) && !first_fp_found) {
-            rc.Flush(ctx_ptr);
-            frc.Flush(ctx_ptr);
+            // [self-loop PM47 v2] flushes moved INSIDE the bail arm, with the
+            // compile-time cache state snapshotted around them: the arm
+            // RETURNS, so the fall-through path must keep the pre-bail state
+            // (the old common-path flush demoted every dirty/forced Single at
+            // the FIRST FP op of every ps block — the residency killer).
             b.op_i32_const((s32)ctx_ptr);
             b.op_i32_load(ppc_off::MSR);
             b.op_i32_const(0x2000);          // MSR.FP (Jit64 Jit.cpp:1107)
             b.op_i32_and();
             b.op_i32_eqz();
             b.op_if(BLOCK_TYPE_VOID);
+                {
+                    const auto rc_fp_snap  = rc.SaveState();
+                    const auto frc_fp_snap = frc.SaveState();
+                    rc.Flush(ctx_ptr);
+                    frc.Flush(ctx_ptr);
+                    rc.RestoreState(rc_fp_snap);
+                    frc.RestoreState(frc_fp_snap);
+                }
                 // Exceptions |= EXCEPTION_FPU_UNAVAILABLE (0x40, Gekko.h:930)
                 b.op_i32_const((s32)ctx_ptr);
                 b.op_i32_const((s32)ctx_ptr);
@@ -946,11 +1323,121 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         // this same block. The pre-op set_pc above left PC=op.address for the
         // not-taken arm; the next op's set_pc advances it to the fall-through.
         bool emitted_native;
-        if (!is_terminator && IsForwardConditionalBranch(op.inst, op.address)) {
-            emit_bcx(b, rc, frc, op, ctx_ptr, /*is_terminal=*/false);
+        if (!is_terminator && block.m_noncontiguous &&
+            i + 1 < n_ops &&
+            IsSeamInlineBl(op.inst, op.address, buffer[i + 1].address)) {
+            // [FUSION v3] inline-callee seam: the callee's stream follows at
+            // the next op, so the bl reduces to LR := ret. No PC store, no
+            // exit, registers stay live.
+            b.op_i32_const((s32)ctx_ptr);
+            b.op_i32_const((s32)(op.address + 4u));
+            b.op_i32_store(ppc_off::lr_off());
+            emitted_native = true;
+        } else if (!is_terminator && block.m_noncontiguous &&
+                   i + 1 < n_ops && IsPlainBlr(op.inst)) {
+            // [FUSION v3] software-RAS at an inlined callee's blr: the driver
+            // placed the caller's continuation next in the stream. Predict
+            // LR == that continuation; on mispredict (any LR writer ran —
+            // interp/HLE surprises included) flush and exit with PC = LR&~3,
+            // byte-equivalent to the standalone bclr path.
+            const u32 ras_ret = buffer[i + 1].address;
+            b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::lr_off());
+            b.op_i32_const((s32)0xFFFFFFFCu); b.op_i32_and();
+            b.op_i32_const((s32)ras_ret); b.op_i32_ne();
+            b.op_if(BLOCK_TYPE_VOID);
+            {
+                const auto ras_rs = rc.SaveState();
+                const auto ras_fs = frc.SaveState();
+                rc.Flush(ctx_ptr);
+                frc.Flush(ctx_ptr);
+                b.op_i32_const((s32)ctx_ptr);
+                b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::lr_off());
+                b.op_i32_const((s32)0xFFFFFFFCu); b.op_i32_and();
+                b.op_i32_store(ppc_off::PC);
+                b.op_i32_const((s32)(uintptr_t)&g_bem_gp_dirty);
+                b.op_i32_load(0);
+                b.op_if(BLOCK_TYPE_VOID);
+                    b.op_i32_const(0); b.op_i32_const(0);
+                    b.op_call(WIMPORT_GATHER_DRAIN);
+                b.op_end();
+                b.op_i32_const((s32)PM47_FLAG_CELL);
+                b.op_i32_const(0);
+                b.op_i32_store(0);
+                b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
+                b.op_return();
+                rc.RestoreState(ras_rs);
+                frc.RestoreState(ras_fs);
+            }
+            b.op_end();
+            emitted_native = true;
+        } else if (!is_terminator && (IsForwardConditionalBranch(op.inst, op.address) ||
+                               IsSeamBackwardConditional(op.inst))) {
+            // [FUSION v2] a seam backward conditional of a fused stream is a
+            // mid-block coalesced exit too: taken = drain+flag-clear+return
+            // target, not-taken continues inline at op.address+4 (the fused
+            // successor). Unreachable on non-fused paths (the analyzer breaks
+            // at backward conditionals there).
+            emit_bcx(b, rc, frc, op, ctx_ptr, /*is_terminal=*/false,
+                     BitSet32(0), params.cmp_fuse);
+            emitted_native = true;
+        } else if (is_terminator && int_fused) {
+            // [PM53h int-fusion] fused back-edge terminal (see emit_bcx_fused).
+            const u32 fused_bucket =
+                ((start_pc >> 2) & BEM_DISP_MASK_NEXT) * 4u;
+            const u32 fused_tag_addr =
+                (chain_tag_addr ? chain_tag_addr
+                                : (u32)(uintptr_t)&g_bem_disp_tag[0]) + fused_bucket;
+            emit_bcx_fused(b, rc, frc, op, ctx_ptr, charge, fused_loop_depth,
+                           block_has_store, fused_tag_addr, start_pc, params.cmp_fuse);
+            emitted_native = true;
+        } else if (is_terminator && with_singles && fast_loop &&
+                   GekkoOperands::OPCD(op.inst) == 16u && frc.AllSingle(assumed)) {
+            // [self-loop PM47] the terminal bdnz of a fast-loop singles arm:
+            // skip the bcx flush for the assumed set — the split epilogue owns
+            // them (scratch spill on self-chain, full flush otherwise). They
+            // stay Single+dirty here, which is exactly what the epilogue's
+            // AllSingle gate keys on.
+            // [self-loop PW-skip] also skip pure-write dirty Singles (see the
+            // selfloop_pw declaration): the taken arm never flushes them, the
+            // plain path's full epilogue Flush still does.
+            selfloop_pw.m_val = frc.DirtySingles().m_val &
+                                ~assumed.m_val & ~block.m_fpr_inputs.m_val;
+            emit_bcx(b, rc, frc, op, ctx_ptr, /*is_terminal=*/true,
+                     BitSet32(assumed.m_val | selfloop_pw.m_val), params.cmp_fuse);
             emitted_native = true;
         } else {
             emitted_native = dispatch_op(b, rc, frc, op, params);
+        }
+
+        // [PM55 EA-CSE] KEEP the last-EA cache only when this op preserves the
+        // invariant "LOCAL_TMP_EA == gpr[ra] + simm" for the NEXT op: a
+        // NON-UPDATE single integer D-form load/store (even opcd 32..44,
+        // excluding lmw/stmw 46/47 and all odd update forms — those set
+        // TMP_EA to the new base, staling the record) that did not write the
+        // cached base register. Everything else — FP/psq/X-form (reuse
+        // TMP_EA unkeyed), update forms, multi-reg lmw/stmw, and any op
+        // writing the base — invalidates. Conservative on plain ALU (clears
+        // it too): forfeits a reuse, never breaks one.
+        if (ea_cache.valid) {
+            const u32 opcd = op.inst >> 26;
+            const bool simple_dform =
+                (opcd == 32u || opcd == 34u || opcd == 36u || opcd == 38u ||
+                 opcd == 40u || opcd == 42u || opcd == 44u);
+            const bool wrote_base =
+                op.opinfo && ea_cache.ra >= 0 && op.regsOut[(u32)ea_cache.ra];
+            if (!simple_dform || wrote_base) ea_cache.valid = false;
+        }
+
+        // [PM57 cmp-fuse] Age out the adjacent-cmp fusion record. A deferring cmp
+        // sets {valid, age=0}; the fuse is consumable ONLY by the op immediately
+        // after it (a conditional branch reads the cmp's operand locals directly
+        // — sound only while no intervening op can have rewritten them). age 0->1
+        // after the cmp's own op; cleared after the following op, whether or not
+        // it consumed. A later cmp overwrites the record with age=0, refreshing
+        // the window. Inert when BEM_LAZY_CR is false (no cmp ever sets valid).
+        if (cmp_fuse.valid) {
+            if (cmp_fuse.age) cmp_fuse.valid = false;
+            else              cmp_fuse.age = 1;
         }
 
         // Block-exit PC correctness for non-branch-terminated blocks (decode-
@@ -991,6 +1478,10 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             b.op_end();
         }
     }
+    // [PM53h int-fusion] Close the loop. Fall-through out of a wasm loop body
+    // exits the loop (only br re-iterates), so the not-taken and bail paths
+    // land here naturally and run the unchanged epilogue below.
+    if (int_fused) b.op_end();
 
     // Epilogue: drain gather-pipe (so GPU FIFO sees CP_INT/PE_TOKEN/PE_FINISH
     // after stw-to-0xCC008000 family stores), flush dirty GPR locals, then
@@ -1023,6 +1514,79 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         b.op_end();
     }
 
+    // [self-loop PM47] FAST SELF-CHAIN EXIT: when the loop continues (PC came
+    // back to start_pc), no service point is due, and the dispatch cache still
+    // maps start_pc to a live slot, skip the assumed regs' promote-flush
+    // (v128 spill to scratch instead), publish the flag, and tail-call
+    // ourselves directly. The plain path below stays byte-equivalent to the
+    // pre-PM47 epilogue (plus one flag=0 store). Both Flush emissions start
+    // from the same snapshotted compile-time state.
+    if (with_singles && fast_loop && frc.AllSingle(assumed) && g_bem_chain_enabled && !merged) {
+        const u32 bucket_off = ((start_pc >> 2) & BEM_DISP_MASK_NEXT) * 4u;
+        const u32 self_tag_addr =
+            (chain_tag_addr ? chain_tag_addr : (u32)(uintptr_t)&g_bem_disp_tag[0]) + bucket_off;
+        const u32 self_slot_addr =
+            (chain_slot_addr ? chain_slot_addr : (u32)(uintptr_t)&g_bem_disp_slot[0]) + bucket_off;
+        // cond = PC==start_pc && downcount>0 && Exceptions==0 && tag==pc && slot>=0
+        b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
+        b.op_i32_const((s32)start_pc); b.op_i32_eq();
+        b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::DOWNCOUNT);
+        b.op_i32_const(0); b.op_i32_gt_s();
+        b.op_i32_and();
+        b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::EXCEPTIONS);
+        b.op_i32_eqz();
+        b.op_i32_and();
+        b.op_i32_const((s32)self_tag_addr); b.op_i32_load(0);
+        b.op_i32_const((s32)start_pc); b.op_i32_eq();
+        b.op_i32_and();
+        b.op_i32_const((s32)self_slot_addr); b.op_i32_load(0);
+        if (region_gen >= 0) {
+            // [PM54c fix 1d] region body: the slot cache is GEN-PACKED —
+            // require own-gen (subsumes the sign check; -1 >> 16 = 0xFFFF).
+            b.op_i32_const(16); b.op_i32_shr_u();
+            b.op_i32_const((s32)region_gen); b.op_i32_eq();
+        } else {
+            b.op_i32_const(0); b.op_i32_ge_s();
+        }
+        b.op_i32_and();
+        b.op_if(BLOCK_TYPE_VOID);
+        {
+            const auto rc_snap  = rc.SaveState();
+            const auto frc_snap = frc.SaveState();
+            rc.Flush(ctx_ptr);
+            // assumed stay in scratch; selfloop_pw skipped outright (redefined
+            // before read on every re-entry path — see its declaration).
+            frc.Flush(ctx_ptr, BitSet32(~(assumed.m_val | selfloop_pw.m_val)));
+            frc.EmitScratchSpill(assumed);
+            b.op_i32_const((s32)PM47_FLAG_CELL);
+            b.op_i32_const((s32)start_pc);
+            b.op_i32_store(0);
+            u32 self_iidx = 0u;
+            if (region_gen >= 0 && region_lookup &&
+                region_lookup(region_lookup_user, start_pc, &self_iidx)) {
+                // [PM54d payload] self edge in-batch: DIRECT same-instance
+                // return_call — the hottest edge skips the slot cache
+                // entirely (the guard's tag term above still gates liveness).
+                b.op_return_call(WIMPORT_COUNT + self_iidx);
+            } else {
+                b.op_i32_const((s32)self_slot_addr);
+                b.op_i32_load(0);
+                if (region_gen >= 0) {   // [PM54c fix 1d] unpack the internal idx
+                    b.op_i32_const(0xFFFF);
+                    b.op_i32_and();
+                }
+                b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
+            }
+            rc.RestoreState(rc_snap);
+            frc.RestoreState(frc_snap);
+        }
+        b.op_end();
+        // plain path: any other exit of this block invalidates the flag.
+        b.op_i32_const((s32)PM47_FLAG_CELL);
+        b.op_i32_const(0);
+        b.op_i32_store(0);
+    }
+
     // Flush dirty FPR lanes back to PowerPCState before the GPR flush.
     // In step 3 wiring no emit_* writes the cache so this is a no-op (no
     // dirty bits set), but the call sits structurally where future emit-
@@ -1033,7 +1597,129 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // Terminal: tail-chain to the successor block in-WASM when it resolves and
     // no service point is pending; otherwise return next-PC to the JS loop.
     // (Merged-region bodies re-dispatch in-function instead — see MergedRegionCtx.)
-    emit_chain_or_return(b, ctx_ptr, chain_tag_addr, chain_slot_addr, merged);
+    // [PM54d payload] Resolve the terminator's STATIC successors against this
+    // gen's batch (region_lookup = rs.pc_to_idx at seal re-emit). Mirrors the
+    // branch emitters' target arithmetic exactly (u32 wraparound, emit_bx /
+    // emit_bcx conventions). Non-hits and runtime targets (blr/bctr) keep the
+    // probe path.
+    u32 direct_pcs[2]; u32 direct_fidx[2]; u32 n_direct = 0u;
+    if (region_gen >= 0 && region_lookup && n_ops > 0) {
+        const CodeOp& term = buffer[n_ops - 1];
+        u32 cands[2]; u32 n_cands = 0u;
+        if (term.opinfo) {
+            const u32 opcd = term.inst >> 26;
+            if (opcd == 18u) {                                   // bx
+                const u32 li = GekkoOperands::LI(term.inst);
+                const bool aa = GekkoOperands::AA(term.inst);
+                cands[n_cands++] = aa ? li : (term.address + li);
+            } else if (opcd == 16u) {                            // bcx
+                const s32 bd = GekkoOperands::BD(term.inst);
+                const bool aa = GekkoOperands::AA(term.inst);
+                cands[n_cands++] = aa ? (u32)bd : (u32)((s32)term.address + bd);
+                cands[n_cands++] = term.address + 4u;            // fallthrough
+            } else if (term.opinfo->type != OpType::Branch) {
+                cands[n_cands++] = term.address + 4u;            // non-branch end
+            }
+        }
+        for (u32 c = 0; c < n_cands && n_direct < 2u; ++c) {
+            u32 iidx = 0u;
+            if (region_lookup(region_lookup_user, cands[c], &iidx)) {
+                direct_pcs[n_direct]  = cands[c];
+                direct_fidx[n_direct] = WIMPORT_COUNT + iidx;
+                ++n_direct;
+            }
+        }
+    }
+    emit_chain_or_return(b, ctx_ptr, chain_tag_addr, chain_slot_addr, merged,
+                         region_gen, direct_pcs, direct_fidx, n_direct);
+    };  // emit_arm
+
+    if (assumed.m_val != 0u) {
+        // Entry guard: ALL assumed live-in bits set in the shadow mask ->
+        // candidate for the singles arm; anything else -> the Double arm.
+        // Both arms are terminal, so the trailing i32 is dead code for the
+        // validator.
+        b.op_i32_const((s32)0x026B33E0u);        // shadow mask cell
+        b.op_i32_load(0);
+        b.op_i32_const((s32)assumed.m_val);
+        b.op_i32_and();
+        b.op_i32_const((s32)assumed.m_val);
+        b.op_i32_eq();
+        // [v9b VALUE-VERIFY 2026-07-31] The mask alone is NOT trustworthy for
+        // volatile f0-f13: writers outside the powerpc-next flush path
+        // (legacy-emitted region bodies, interp fallbacks classified as
+        // non-FP) mutate ps[] without clearing bits, and a stale-SET bit let
+        // the singles arm narrow a genuine double (measured: v9-volatile
+        // probe = +25-40% gc but BLACK canvas, pn matrix value 0x7C100000;
+        // stable-half-only rendered clean). So for each assumed VOLATILE
+        // live-in, additionally verify the VALUE at entry with the exact lfd
+        // tri-state round-trip (widen(narrow(x)) == x, NaN payloads + single
+        // denormals exact — fpr_reg_cache.cpp Flush v6): any genuine double
+        // routes to the Double arm. The stable half keeps mask-only trust
+        // (weeks of rendering evidence + the callee-saved discipline).
+        // Stack shape: running ok (i32) stays below; each lane check pushes
+        // one i32 and ANDs. Lane locals 34+i / 34+32+i are the FPR pool —
+        // scratch here, both arms reload them. Clobbers locals 95/98 (free
+        // at block entry; PM37 landmine audited).
+        // [self-loop PM47] fast_loop blocks SHORT-CIRCUIT the verify behind
+        // the self-chain flag: flag==start_pc proves our own arm's flush was
+        // the last writer of every assumed reg — values are singles by
+        // construction, no round-trip needed. cond = mask_eq && (flag_eq ||
+        // verify_all).
+        auto emit_verify_chain = [&]() {
+            for (u32 i = 0; i < 14; ++i) {
+                if (!assumed[i]) continue;
+                b.op_i32_const((s32)ctx_ptr);
+                b.op_i64_load(ppc_off::ps0(i));
+                b.op_local_set(34u + i);
+                b.op_i32_const((s32)ctx_ptr);
+                b.op_i64_load(ppc_off::ps1(i));
+                b.op_local_set(34u + 32u + i);
+                for (u32 lane = 0; lane < 2; ++lane) {
+                    const u32 lane_local = lane == 0 ? (34u + i) : (34u + 32u + i);
+                    emit_convert_to_single(b, lane_local);   // i32 f32 bits
+                    b.op_local_set(98u);                     // LOCAL_PSQ_T0
+                    emit_psq_convert_to_double(b);           // i64 widened
+                    b.op_local_get(lane_local);
+                    b.op_i64_xor();
+                    b.op_i64_eqz();                          // 1 iff round-trips
+                    b.op_i32_and();
+                }
+            }
+        };
+        if (fast_loop) {
+            b.op_if(/*i32*/ 0x7F);                   // mask_eq ? (...) : 0
+                b.op_i32_const((s32)PM47_FLAG_CELL);
+                b.op_i32_load(0);
+                b.op_i32_const((s32)start_pc);
+                b.op_i32_eq();
+                b.op_if(/*i32*/ 0x7F);               // flag_eq ? 1 : verify
+                    b.op_i32_const(1);
+                b.op_else();
+                    b.op_i32_const(1);               // seed for the AND chain
+                    emit_verify_chain();
+                b.op_end();
+            b.op_else();
+                b.op_i32_const(0);
+            b.op_end();
+        } else {
+            emit_verify_chain();                     // ANDs onto mask_eq
+        }
+        b.op_if(BLOCK_TYPE_VOID);
+            emit_arm(true);
+        b.op_else();
+            emit_arm(false);
+        b.op_end();
+        // [PM53d] Unreachable filler: both arms are terminal, but the
+        // validator still tracks the stack after the void if/end. Per-block
+        // functions type () -> i32, so the dead const satisfies the result;
+        // inside a MERGED region body the splice context is void and the
+        // dangling i32 FAILS VALIDATION (measured: every ps-heavy gen
+        // validate=false, non-ps gens fine) — emit nothing there.
+        if (!merged) b.op_i32_const(0);          // unreachable function result
+    } else {
+        emit_arm(false);
+    }
 }
 
 std::vector<u8> build_block_next(u32 start_pc,
@@ -1041,23 +1727,28 @@ std::vector<u8> build_block_next(u32 start_pc,
                                  u32 ctx_ptr,
                                  u32 mem1_base, u32 mem1_mask, u32 ram_size,
                                  u32* out_cycles,
-                                 bool* out_is_idle_loop) {
-    // Wrap raw insts[] in a fetch callback for PPCAnalyzer.
-    struct FetchCtx { const u32* insts; u32 base_pc; u32 count; };
-    FetchCtx fc{insts, start_pc, count};
-    auto fetch = +[](u32 pc, void* user) -> u32 {
-        const FetchCtx* f = static_cast<const FetchCtx*>(user);
-        const u32 idx = (pc - f->base_pc) / 4;
-        if (idx >= f->count) return 0;
-        return f->insts[idx];
-    };
-
+                                 bool* out_is_idle_loop,
+                                 const u32* instr_pcs) {
     PPCAnalyzer pa;
     CodeBlock block;
     BlockStats stats;
     block.m_stats = &stats;
     CodeBuffer buffer;
-    pa.Analyze(start_pc, &block, &buffer, count, fetch, &fc);
+    if (instr_pcs) {
+        // [FUSION v2] test/fused entry: exact per-op pcs.
+        pa.AnalyzeOps(insts, instr_pcs, count, &block, &buffer);
+    } else {
+        // Wrap raw insts[] in a fetch callback for PPCAnalyzer.
+        struct FetchCtx { const u32* insts; u32 base_pc; u32 count; };
+        FetchCtx fc{insts, start_pc, count};
+        auto fetch = +[](u32 pc, void* user) -> u32 {
+            const FetchCtx* f = static_cast<const FetchCtx*>(user);
+            const u32 idx = (pc - f->base_pc) / 4;
+            if (idx >= f->count) return 0;
+            return f->insts[idx];
+        };
+        pa.Analyze(start_pc, &block, &buffer, count, fetch, &fc);
+    }
 
     if (out_cycles) *out_cycles = stats.numCycles;
     if (out_is_idle_loop) {
@@ -1171,29 +1862,34 @@ std::vector<u8> emit_block_body_next(u32 start_pc, const u32* insts, u32 count,
                                      const void* lookup_user,
                                      bool emit_hle_check,
                                      bool emit_perf_stub,
-                                     bool emit_hle_check_native) {
+                                     bool emit_hle_check_native,
+                                     s32 region_gen_idx) {
     // Real ppc-next region body: analyze, then emit ONLY the function body
     // (locals + code, no module wrapper) so build_region_module_next can copy
     // it verbatim into the region module's code section. Uses the SAME op
     // emission as the live per-block path (emit_block_body_into) — 13 imports,
     // coalescing, gather/msr gates — with the REGION-LOCAL cache so the
     // in-WASM tail-chain resolves into the region module's INTERNAL table 0.
-    (void)instr_pcs; (void)lookup_fn; (void)lookup_user;
     (void)emit_hle_check; (void)emit_perf_stub; (void)emit_hle_check_native;
-    struct FetchCtx { const u32* insts; u32 base_pc; u32 count; };
-    FetchCtx fc{insts, start_pc, count};
-    auto fetch = +[](u32 pc, void* user) -> u32 {
-        const FetchCtx* f = static_cast<const FetchCtx*>(user);
-        const u32 idx = (pc - f->base_pc) / 4u;
-        if (idx >= f->count) return 0u;
-        return f->insts[idx];
-    };
     PPCAnalyzer pa;
     CodeBlock block;
     BlockStats stats;
     block.m_stats = &stats;
     CodeBuffer buffer;
-    pa.Analyze(start_pc, &block, &buffer, count, fetch, &fc);
+    if (instr_pcs) {
+        // [FUSION v2] exact-list mode: per-op pcs (non-contiguous at seams).
+        pa.AnalyzeOps(insts, instr_pcs, count, &block, &buffer);
+    } else {
+        struct FetchCtx { const u32* insts; u32 base_pc; u32 count; };
+        FetchCtx fc{insts, start_pc, count};
+        auto fetch = +[](u32 pc, void* user) -> u32 {
+            const FetchCtx* f = static_cast<const FetchCtx*>(user);
+            const u32 idx = (pc - f->base_pc) / 4u;
+            if (idx >= f->count) return 0u;
+            return f->insts[idx];
+        };
+        pa.Analyze(start_pc, &block, &buffer, count, fetch, &fc);
+    }
 
     WasmModuleBuilder b;
     b.beginFuncBody();
@@ -1212,7 +1908,9 @@ std::vector<u8> emit_block_body_next(u32 start_pc, const u32* insts, u32 count,
     const u32 rtag  = (u32)(uintptr_t)&g_bem_rtag[0];
     const u32 rslot = (u32)(uintptr_t)&g_bem_rslot[0];
     emit_block_body_into(b, block, buffer, stats, count, start_pc, ctx_ptr_const,
-                         mem1_base, mem1_mask, ram_size, rtag, rslot);
+                         mem1_base, mem1_mask, ram_size, rtag, rslot,
+                         /*merged=*/nullptr, region_gen_idx,
+                         lookup_fn, lookup_user);   // [PM54d payload]
     b.endFuncBody();
     return b.getBytes();
 }

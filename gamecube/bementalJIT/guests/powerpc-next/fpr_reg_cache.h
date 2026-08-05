@@ -97,7 +97,16 @@ public:
     // [simd-paired] Single-precision (v128 f32x2) fast path. IsSingle peeks
     // (no emit) whether the FPR's live value is already in single form — the
     // gate an op checks on ALL inputs before taking the SIMD path.
+// [m00-hunt A/B PM37 2026-07-23] 1 = kill the Single (v128) representation:
+// IsSingle always false -> every SIMD fast path (jit_paired gates, lfs-Single
+// consumers) bypassed, all regs stay i64-pair repr. Tests whether the
+// Single-repr chain zeroes PSMTXRotAxisRad's m00 (probe field xfm). REVERT.
+#define BEM_SINGLE_REPR_DISABLE 0  // A/B done (m00 still died with 1 -> not the culprit; real root = slot-98 park clobber, fixed in jit_load_store.cpp)
+#if BEM_SINGLE_REPR_DISABLE
+    bool IsSingle(u32) const { return false; }
+#else
     bool IsSingle(u32 preg) const { return m_state[preg].repr == FPRPrec::Single; }
+#endif
     // BindSingleRead: FPR is already Single (caller checked IsSingle). Returns
     // its v128 local. BindSingleWrite: mark the FPR Single (the op computes an
     // f32x2 into the returned v128 local); the i64 pair becomes stale.
@@ -115,7 +124,84 @@ public:
     // PowerPCState. Used after host-side mutations of ps[] (interp
     // fallback, HLE that may touch FPRs) so subsequent emit_* calls see
     // post-mutation state instead of stale cached locals.
-    void ReloadAll(u32 ctx_ptr);
+    // [single-spec v7] host_may_write_fprs=false for interp fallbacks that
+    // CANNOT touch ps[] (mfspr/mtspr TBL/DEC, mfcr/mtcrf/mtsr/tlbie, integer
+    // Rc forms, lmw) — those must NOT wholesale-clear the shadow mask. The
+    // unconditional clear fired on every timer read (thousands per s) and
+    // zeroed the mask constantly: psWith == deopt (every speculating block
+    // eventually entered on a just-zeroed mask), failBits == the whole
+    // assumed set.
+    void ReloadAll(u32 ctx_ptr, bool host_may_write_fprs = true);
+
+    // [single-spec PM26] Prologue loads for FPRs assumed f32-valued in ps[]
+    // (caller emitted the shadow-mask guard; runs on the match arm only).
+    // Lands each FPR as Single repr (v128 rebuilt via the PEM-widen inverse)
+    // with lanes loaded + everything clean. See fpr_reg_cache.cpp.
+    // [self-loop PM47] fast_loop_mode: additionally spill each rebuilt v128 to
+    // the scratch window (0x026B3C00 + preg*16) and land the FAST-REENTRY
+    // uniform state instead (v128 valid + DIRTY, lanes UNLOADED) so both entry
+    // paths of a self-loop block converge on identical compile-time state.
+    void EmitAssumedSingleLoads(u32 ctx_ptr, BitSet32 assumed,
+                                bool fast_loop_mode = false);
+
+    // [self-loop PM47] Fast re-entry: rebuild each assumed FPR's v128 straight
+    // from the scratch window (one v128.load each — replaces the ~160-op/reg
+    // verify + PEM-inverse rebuild). Valid ONLY when the self-chain flag
+    // (0x026B38C0) proves the last exit was THIS block's own singles arm.
+    // Lands the same uniform state as fast_loop_mode above.
+    void EmitFastReentry(BitSet32 assumed);
+
+    // [self-loop PM47] Spill each assumed FPR's v128 to the scratch window
+    // (3 ops/reg). Caller must have verified AllSingle(assumed) at COMPILE
+    // time — a Double-repr reg's v128 local is stale.
+    void EmitScratchSpill(BitSet32 assumed);
+
+    // [self-loop PM47] All `regs` currently Single repr? (compile-time; gates
+    // the fast-exit emission — any assumed reg the body demoted disables it.)
+    bool AllSingle(BitSet32 regs) const {
+        for (u32 i = 0; i < 32; ++i)
+            if (regs[i] && m_state[i].repr != FPRPrec::Single) return false;
+        return true;
+    }
+
+    // [self-loop PW-skip] FPRs for which Flush() would emit the expensive
+    // Single->Double promote right now — the exact latch predicate Flush()
+    // uses (repr Single && (v128 dirty || force-flush)). Lets the fast-loop
+    // terminal identify pure-write Singles it may skip on the self-chain arm.
+    BitSet32 DirtySingles() const {
+        BitSet32 s(0);
+        for (u32 i = 0; i < 32; ++i)
+            if (m_state[i].repr == FPRPrec::Single &&
+                (m_state[i].v128_dirty || m_force_flush[i]))
+                s[i] = true;
+        return s;
+    }
+
+    // [self-loop PM47] Force-flush set: fast-loop assumed regs enter CLEAN
+    // (so common-path flush sites like the MSR.FP bailout emit nothing for
+    // them) but on the FAST path their ps[] is stale — any Flush that could
+    // make ps[] host-visible must still write them. Members are treated as
+    // dirty-if-Single by Flush().
+    void SetForceFlush(BitSet32 s) { m_force_flush = s; }
+
+    // [self-loop PM47] SaveState/RestoreState (defined after PregState below):
+    // the split epilogue emits Flush into BOTH runtime arms from the SAME
+    // pre-flush state (the first emission would otherwise clear dirty bits
+    // and make the second emit nothing).
+
+    // [single-spec v3] producer marks its Double-repr output as single-VALUED
+    // (ForceSingle'd widened single in both lanes) — call AFTER the Bind(Write)
+    // that conservatively cleared it. Keys the shadow-mask SET at flush.
+    void MarkValueSingle(u32 preg) {
+        m_state[preg].value_single  = true;
+        m_state[preg].value_unknown = false;
+    }
+    // [single-spec v5] lfd-family producer: value unknown until the flush's
+    // runtime round-trip check. Call AFTER the Bind(Write).
+    void MarkValueUnknown(u32 preg) {
+        m_state[preg].value_single  = false;
+        m_state[preg].value_unknown = true;
+    }
 
     // Control-flow wrappers — mirror RegCache::EmitIf/Else/EndIf. Flush
     // dirty lanes on entry to each arm + at merge so divergent dirty
@@ -146,7 +232,34 @@ private:
         bool ps0_dirty    = false;
         bool ps1_dirty    = false;
         bool assigned     = false;
+        // [single-spec v3] the VALUE is a widened single in both lanes even
+        // when repr is Double (scalar ps paths ForceSingle their outputs but
+        // keep i64 repr). The shadow-mask SET decision keys on THIS, not on
+        // repr — repr-keyed masking cleared bits for scalar-era ps results
+        // and deopted the exact IDCT loop bodies speculation targets.
+        bool value_single = false;
+        // [single-spec v5 lfd tri-state] value UNKNOWN at compile time (lfd
+        // loads arbitrary memory). Flush emits a RUNTIME widened-single
+        // round-trip check on the stored lanes and ANDs it into the mask bit
+        // — so __OSLoadFPUContext's lfd-restores of round-tripped singles
+        // (the ISR path that cleared f27-f30 every ~ms and deopted the IDCT)
+        // KEEP the bit, while a genuine double still clears it.
+        bool value_unknown = false;
     };
+
+public:
+    // [self-loop PM47] see the comment in the API block above.
+    struct StateSnapshot { PregState s[32]; };
+    StateSnapshot SaveState() const {
+        StateSnapshot snap;
+        for (u32 i = 0; i < 32; ++i) snap.s[i] = m_state[i];
+        return snap;
+    }
+    void RestoreState(const StateSnapshot& snap) {
+        for (u32 i = 0; i < 32; ++i) m_state[i] = snap.s[i];
+    }
+
+private:
 
     // Internal: emit a single-lane load from PowerPCState into the lane's local.
     void EmitLaneLoad(u32 ctx_ptr, u32 preg, u8 lane);
@@ -158,6 +271,7 @@ private:
 
     WasmModuleBuilder& m_wb;
     PregState m_state[32]{};
+    BitSet32 m_force_flush{0};   // [self-loop PM47]
     u32 m_local_base    = 0;
     u32 m_v128_base     = 120u;
     u32 m_if_depth      = 0;

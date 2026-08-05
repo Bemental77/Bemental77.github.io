@@ -62,6 +62,34 @@ unsigned char g_bem_chain_enabled = 1;            // master A/B toggle (gate #8)
 // wimports.cpp) externs it and owns the set (dolphin_write*/interp) + clear
 // (dolphin_gather_drain). Set => a write-gather-pipe store is pending.
 int g_bem_gp_dirty = 0;
+// [lc-window PM23] linear-memory address of Memory::GetL1Cache() (256KB locked-L1
+// backing). Published by JitWasm at compile-input setup; 0 disables the emitters'
+// LC slow-arm shortcut. Blocks compiled before publication bake 0 (import path) —
+// harmless, they recompile only if evicted, and publication precedes guest exec.
+uint32_t g_bem_lc_base = 0;
+// [fprf-gate PM46 2026-07-31] bFPRF half of the FPRF emission gate — native
+// Jit64 emits FPRF only when `bFPRF && wantsFPRF`; default false = zero FPRF
+// code, matching native MP4. Published by JitWasm from Config::MAIN_FPRF.
+uint32_t g_bem_fprf_enabled = 0;
+// [accurate-nans-gate PM59 2026-08-05] The SAME native-parity class as FPRF:
+// native Jit64 emits the paired-single NaN ladder ONLY when m_accurate_nans
+// (Config MAIN_ACCURATE_NANS, default FALSE — Jit_Paired.cpp:87,108). GMPE01
+// has no INI override, so native MP4 emits ZERO accurate-NaN code, while we
+// emitted the ~15-op ladder on EVERY ps arith/FMA op. default 0 = raw IEEE
+// result (what native produces at default), matching the real dual-core oracle
+// AND cutting the ladder from the 55.8% guest-body cost. Published by JitWasm
+// from Config::MAIN_ACCURATE_NANS. Set to 1 by test_diff_next to keep the
+// accurate path validated bit-for-bit against DolphinPPCTests.
+uint32_t g_bem_accurate_nans = 0;
+// [ni-flush-gate PM60 2026-08-05] The paired-single NI/FTZ subnormal flush is a
+// pure wasm-vs-native TAX: native x86 gets flush-to-zero FREE from the host FPU
+// (MXCSR FTZ/DAZ set once), but wasm has NO host FP-mode control, so we emit a
+// per-op subnormal check+flush on every SIMD ps result (emit_v128_ni_flush ~14
+// ops). Subnormals are astronomically rare in game math and invisible, so
+// default 0 = skip (raw IEEE, faster than native's per-op-free-but-we-can't).
+// Set to 1 by test_diff_next to keep the flushed path validated. Guest-observable
+// (unlike accurate_nans which native also skips) — validate all 3 games render.
+uint32_t g_bem_ni_flush = 0;
 // Phase A: per-block execution counter + promote ring, written by the BLOCK
 // PROLOGUE in-WASM (so it counts tail-chained executions the C dispatch loop
 // never sees — the chain-head promotion was net-negative). On the
@@ -101,7 +129,41 @@ uint32_t      g_rd_nogen = 0u;   // [region-debug] sealed dispatch: no gens seal
 // [region-merged 2026-07-15] ON: counter-driven promotion into MERGED
 // powerpc-next gens entered via the GLOBAL dispatch table (fn_k wrappers).
 // A/B OFF arm = flip this back to 0 (the verified per-block baseline).
-unsigned char g_bem_promote_enabled = 0;  // [2026-07-16 verdict] OFF = shipping config.
+unsigned char g_bem_promote_enabled = 1;  // [PM54c A/B 2026-08-04] ON: N-fn shape
+// with the audited fix set (gen-packed rslot + own-gen checks by construction,
+// pending cap == seal_batch, seal-success-gated commit/populate, seal-time
+// compaction). Acceptance: all sealed-gen n_funcs<=256, zero FAILED, zero
+// traps, boot past the PM53e wedge, then page-fps vs the no-patch baselines
+// (MP4 44.6, SAB 11.8-14.2). PM53e history (the pre-fix wedge):
+// N-fn shape A/B WEDGED the guest (gc froze ~184 ticks post-boot, no fps,
+// dataAddSampleReference spin at ~2900x, and gen 2 reported n_funcs=284 > the
+// 256 batch cap = bookkeeping corruption): the N-fn dispatch path needs its
+// own bring-up (registration/rtag wiring incomplete for the current topology)
+// before it can be measured. Do not flip this ON in ANY shape without a
+// dedicated bring-up leg. The PM53d merged-shape verdict below still stands:
+// Step-1 (singles-in-regions: !merged lifted at ppc_emit.cpp:843 + the
+// merged-context filler fix) ran ALL gens live (580 blocks, validate=true,
+// zero traps, renders) under --no-liftoff — and still measured 34.4 gc/s vs
+// 39.7 per-block baseline (IDCT 8.3x vs 7.3, MixAudio 9.5x). With step-0
+// (-38%) and the 07-16 (-8%) results, three consistent measurements say the
+// GIANT-FUNCTION br_table merged shape loses on V8 at this scale (the
+// phi-merge microbench refutation didn't cover 152 locals x 580 arms), even
+// TurboFan'd, even with singles arms. NEXT SHAPE (do not re-flip for merged):
+// N-fn gens with intra-gen DIRECT return_call edges — the seal's re-emit pass
+// knows every batch pc's module-local function index (rs.pc_to_idx), so chain
+// exits targeting the batch can become direct calls (no table/signature tax),
+// while small per-block functions keep V8's per-function optimization.
+// Step-0 history:
+// Regions-on A/B with the pipeline FIXED (sync seal + seal-cadence, below):
+// 7 gens sealed/registered/ran (zero traps, renders) — the pipeline is proven
+// under dual-core for the first time (the async .then NEVER fired on the
+// non-yielding EmuThread; every post-07-22 region A/B silently measured
+// per-block dispatch). But MEASURED: 24.6 gc/s vs 39.7 baseline, IDCT 7.3x ->
+// 15.4x — merged bodies are Double-only; THP ps blocks lose the PM44/46/47
+// singles arms inside regions and the structure win cannot offset it. Flip to
+// 1 ONLY together with singles-in-regions (lift the !merged exclusion at
+// ppc_emit.cpp:843 + MergedRegionCtx-aware entry guard) — that pairing is the
+// measured path to the ~40%-of-thread per-entry prologue+call-tax prize.
 // The full merged-region + residency machinery is LANDED and correct (zero traps/
 // CompileErrors across ~150 sealed gens; conformance 3457/0) but scene-matched
 // A/B (IDB save-state anchor) measured NEUTRAL — hypothesis: the 256-arm br_table
@@ -135,6 +197,43 @@ static const int _bem_disp_cache_init = []() {
 // release_raw, cleared by BlockCache::clear.
 static std::unordered_map<uint32_t, int> g_bem_pc_handle;   // pc  -> handle(slot)
 static std::unordered_map<int, uint32_t> g_bem_handle_pc;   // handle -> pc
+
+// [single-spec PM26] Sticky per-pc force-double registry: a block whose
+// single-valued prologue guard MISMATCHED at runtime deopts once (SAB cell
+// 0x026B33E4 + downcount=0 + return start_pc); JitWasm::Run evicts + adds the
+// pc here; the recompile queries bem_pc_force_double and emits WITHOUT the
+// assumption. Sticky (never cleared) so speculation converges — a block whose
+// live-in FPRs are genuinely double deopts exactly once.
+static std::unordered_map<uint32_t, int> g_bem_force_double_map;
+// [single-spec v4] retry budget: force-double only after 3 deopts of the same
+// pc — a one-off mask flap (rare with the stable-reg restriction) recovers,
+// a genuinely-flapping block still converges to double.
+// [single-spec v8b PM44 2026-07-31] threshold 3 -> effectively-never: with
+// volatile f0-f13 assumptions live, the audio ISR's interleaving flaps mask
+// bits ~0.5/s and 3-strike PERMANENTLY force-doubled exactly the hot IDCT
+// blocks (probe: deopt=41, ring all 800dexxx-800e0xxx, fps flat). The
+// compile-time mask intersect already self-corrects each recompile (a
+// genuinely-double live-in has its bit clear at recompile time and is not
+// assumed), so unbounded deopt->recompile converges per-entry-state at
+// ~0.5 recompiles/s — noise. Counter kept for the deopt-ring diagnostics.
+extern "C" int bem_pc_force_double(uint32_t pc) {
+    auto it = g_bem_force_double_map.find(pc);
+    return (it != g_bem_force_double_map.end() && it->second >= 1000000) ? 1 : 0;
+}
+extern "C" void bem_pc_force_double_add(uint32_t pc) {
+    g_bem_force_double_map[pc]++;
+#ifdef __EMSCRIPTEN__
+    // [single-spec TEMP diag] deopt-pc RING @0x026B3400 (32 slots) + count
+    // @0x026B33F4 — worker EM_ASM console.log does NOT relay to the probe
+    // (bcl-pc0 precedent), so publish via SAB.
+    volatile uint32_t* n =
+        reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B33F4u));
+    volatile uint32_t* ring =
+        reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B3400u));
+    ring[*n & 31u] = pc;
+    *n = *n + 1u;
+#endif
+}
 unsigned char g_bem_cdispatch_enabled = 1;  // C-loop vs legacy JS loop (A/B / fallback)
 
 namespace bemental {
@@ -204,7 +303,13 @@ namespace powerpc {
                                          const void* lookup_user,
                                          bool emit_hle_check = true,
                                          bool emit_perf_stub = false,
-                                         bool emit_hle_check_native = false);
+                                         bool emit_hle_check_native = false,
+                                         s32 region_gen_idx = -1);
+
+    bool IsForwardConditionalBranch(u32 inst, u32 pc);
+    bool IsSeamBackwardConditional(u32 inst);
+    bool IsSeamInlineBl(u32 inst, u32 pc, u32 next_pc);
+    bool IsPlainBlr(u32 inst);
 
     std::vector<u8> build_region_module_next(const u8* concatenated_bodies,
                                              std::size_t concatenated_size,
@@ -214,7 +319,7 @@ namespace powerpc {
 
 int compile_raw(const u8* bytes, std::size_t size) {
 #ifdef __EMSCRIPTEN__
-    return EM_ASM_INT({
+    const int ret = EM_ASM_INT({
         const view = new Uint8Array(Module.HEAPU8.buffer, $0, $1);
         const copy = new Uint8Array(view); // detach: HEAPU8 may grow
         try {
@@ -386,6 +491,7 @@ int compile_raw(const u8* bytes, std::size_t size) {
             return -1;
         }
     }, bytes, (int)size);
+    return ret;
 #else
     (void)bytes; (void)size;
     return -1;
@@ -428,8 +534,22 @@ u32 g_chain_iters = 0;
 // so the dispatch loop carries zero diagnostic overhead; flip to 1 to re-arm
 // the census tool for an investigation.
 #ifndef BEM_DISPATCH_CENSUS
-#define BEM_DISPATCH_CENSUS 0
+#define BEM_DISPATCH_CENSUS 0  // [PM51 census DONE: 99.66% chain hit-rate, 4.8M calls/s]
 #endif
+
+// [PM54c fix 2a] Single source of truth for the seal batch size: the drain's
+// pending cap and region_should_relink's trigger must never desync (the old
+// per-window promoted<256 cap let leftover pending stack to (256,511] —
+// measured n_funcs=284 — overflowing the 16-bit slot pack's assumptions).
+static u32 seal_batch() {
+    static const u32 v = []() -> u32 {
+        const char* e = std::getenv("BJIT_SEAL_BATCH");
+        if (!e) return 256u;
+        const u32 n = (u32)std::atoi(e);
+        return n ? n : 1024u;
+    }();
+    return v;
+}
 
 // Hot-only merge (2026-06-17): per-handle dispatch counter + promotion queue.
 // chain_dispatch_raw bumps g_disp_count[handle] each dispatch and, on the
@@ -628,6 +748,15 @@ void unregister_pc(u64 pc) {
 // block). Resolves pc->handle EXACTLY via g_bem_pc_handle — the lossy direct-mapped
 // cache would thrash TryCompileBlock on collisions. Writes *final_pc before each
 // call so the wrapper's catch can recover the trapping PC. Returns blocks run.
+// [savestate-deadlock-fix PM61] a pending save/load, serviced ON THIS (CPU/Emu)
+// thread so retro_(un)serialize's RunOnCPUThread runs inline (EmscriptenWorker.cpp).
+// WEAK fallbacks so the standalone conformance test + ppc-worker builds (which
+// don't link the dolphin bridge) resolve these. EmscriptenWorker.cpp provides
+// the STRONG defs in the dolphin build (savestate service on the CPU/EmuThread),
+// which override these weak ones; the test build gets op=0 (hook never fires).
+extern "C" __attribute__((weak)) volatile int g_bem_state_op = 0;
+extern "C" __attribute__((weak)) void bem_service_pending_state(void) {}
+
 extern "C" EMSCRIPTEN_KEEPALIVE
 s32 bem_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc,
                      const u32* exc_addr, const s32* dc_addr) {
@@ -647,6 +776,31 @@ s32 bem_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc,
     u32 idle_ring[32]; for (u32 i = 0; i < 32u; ++i) idle_ring[i] = 0;
     u32 idle_ri = 0, idle_streak = 0;
     while ((u32)count < max) {
+        // [savestate-fix PM61] service a pending save/load HERE (CPU/Emu thread) so
+        // retro_(un)serialize runs inline. Cheap volatile gate; the body only runs
+        // when the message handler flagged a request.
+        if (g_bem_state_op) {
+            const int __sop = g_bem_state_op;
+            bem_service_pending_state();
+            if (__sop == 2) {
+                // [savestate-fix PM61] a LOAD overwrote ppc_state.pc + regs + memory
+                // (and cleared the block cache). This loop's local `pc` is STALE (the
+                // pre-load PC). The unconditional `*final_pc = pc` at loop exit would
+                // carry it, and JitWasm::Run writes final_pc back over the restored PC
+                // (JitWasm.cpp:598) → the guest runs the pre-load scene. Re-sync `pc`
+                // from the restored ppc_state.pc: exc_addr points into ppc_state at
+                // EXCEPTIONS(0x2EC); PC is at ctx+0. Then the return carries the loaded
+                // PC and the write-back is a no-op.
+                if (exc_addr) pc = *reinterpret_cast<const u32*>(
+                    reinterpret_cast<const char*>(exc_addr) - 0x2ECu);
+                break;
+            }
+        }
+        // [PM47 flag hygiene] the self-chain flag (0x026B38C0) is only valid
+        // across a direct in-wasm self-tail-call. Any host-loop dispatch
+        // breaks the hop: clear it, so a later revisit of the flagged pc
+        // cannot fast-enter on scratch that intervening blocks overwrote.
+        *(volatile u32*)(uintptr_t)0x026B38C0u = 0u;
 #ifdef __EMSCRIPTEN__
         // [collapse] per-block ownership: bail the chain the instant the WORKER owns the CPU, alongside the
         // downcount/exception bails below. This is the mid-chain check the between-run_iter_batch flag could
@@ -685,7 +839,6 @@ s32 bem_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc,
         // executions too) — the next Phase-A increment.
         *final_pc = pc;                                      // trap-recovery breadcrumb
         BemBlockFnC fn = (BemBlockFnC)(intptr_t)handle;
-        const u32 ran_pc = pc;                               // the block we're about to run
         pc = fn();                                           // in-WASM call_indirect
 #ifdef __EMSCRIPTEN__
         // [vector-page guard 2026-07-09, INVARIANT-KEYED 2026-07-09-pm] mirror
@@ -698,23 +851,6 @@ s32 bem_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc,
         // Break so JitWasm::Run's delivery re-enters IR=1 vectors in real-mode.
         if (pc != 0u && pc < 0x4000u && msr_addr && (*msr_addr & 0x20u)) {
             *final_pc = pc; ++count; break;
-        }
-#endif
-#ifdef __EMSCRIPTEN__
-        // [bcl-pc0 TEMP — strip per gate #8] A bementalJIT block returned next-pc 0 (rfi into
-        // srr0=0, or blr/bctr to a 0 target). ran_pc = the block that did it — the prior PC behind
-        // the deterministic PC=0 ISI that no dolphin-side hook ([jw-pc0]/[rfi0]/[br0-*]) could see.
-        if (pc == 0u) {
-            // [bcl-pc0 -> SAB] ran_pc = the block whose terminator set pc=0 (the REAL faulting
-            // function, since the crash is NOT HuSprDisp). r1 at that point names the frame.
-            // SAB 0x026B0690=ran_pc, +4=r1, +8=count (EM_ASM console.log did NOT relay from dolphin).
-            volatile uint32_t* s = reinterpret_cast<volatile uint32_t*>(
-                static_cast<uintptr_t>(0x026B0690u));
-            s[0] = ran_pc;
-            if (exc_addr)
-                s[1] = *reinterpret_cast<const u32*>(
-                    reinterpret_cast<const char*>(exc_addr) - 0x2D4);  // gpr[1]
-            s[2] = s[2] + 1u;
         }
 #endif
         ++count;
@@ -1192,7 +1328,10 @@ s32 BlockCache::chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32
                                       return a.second > b.second;
                                   });
                 u32 promoted = 0u;
-                for (std::size_t i = 0; i < topn && promoted < 256u; ++i) {
+                // [PM54c fix 2a] cap the PENDING TOTAL, not per-window adds:
+                // invariant n_funcs <= seal_batch() at all times.
+                for (std::size_t i = 0;
+                     i < topn && m_regions[REGION_REL_0].n_funcs < seal_batch(); ++i) {
                     const u32 before = m_regions[REGION_REL_0].n_funcs;
                     promote_hot(rank[i].first);   // dedups sealed/pending internally
                     if (m_regions[REGION_REL_0].n_funcs != before) ++promoted;
@@ -1201,13 +1340,17 @@ s32 BlockCache::chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32
                 s_hist_samples = 0u;
                 if (region_should_relink(REGION_REL_0)) {
                     region_relink(REGION_REL_0, /*mem_pages=*/1u);
-                } else if (promoted == 0u && m_regions[REGION_REL_0].n_funcs >= 64u) {
-                    // Scene stable + nothing new ranked in: seal a SUBSTANTIAL
-                    // partial batch rather than stranding it below the 256
-                    // trigger. Batches under 64 stay pending — ON5 measured the
-                    // unconditional force-seal fragmenting the 24-gen capacity
-                    // into 1-3-block gens (gens 20-23), wasting slots + compiles
-                    // on marginal blocks.
+                } else if (promoted <= 4u && m_regions[REGION_REL_0].n_funcs >= 64u) {
+                    // Scene stable: seal a SUBSTANTIAL partial batch rather
+                    // than stranding it below the 256 trigger. Batches under
+                    // 64 stay pending — ON5 measured the unconditional
+                    // force-seal fragmenting the 24-gen capacity into
+                    // 1-3-block gens, wasting slots + compiles on marginal
+                    // blocks. [PM53c] promoted==0 was a CADENCE DEADLOCK:
+                    // per-window histogram jitter trickles >=1 marginal new
+                    // block every window (measured: pending 244->245->246,
+                    // never sealing), so tolerate a small trickle instead of
+                    // requiring perfect quiescence.
                     region_relink(REGION_REL_0, /*mem_pages=*/1u);
                 }
             }
@@ -1332,6 +1475,10 @@ void BlockCache::promote_hot(u32 pc) {
     if (region_has_pc(REGION_REL_0, pc)) return;            // already pending
     auto it = m_pending_emit.find(pc);
     if (it == m_pending_emit.end()) return;
+    // [PM54c fix 2c] an empty-insts record must never enter the batch: it
+    // would flip have_records=false at seal, the builder returns empty bytes,
+    // and the whole batch strands (overflow PATH B).
+    if (it->second.insts.empty()) return;
     const BlockEmitInputs& in = it->second;
     // [region-merged 2026-07-15] NO body emission at promote time: the seal's
     // own pass emits every body (merged builder from records; N-fn via the
@@ -1384,12 +1531,8 @@ bool BlockCache::region_should_relink(Region r) const {
         // Liftoff compile and keep most intra-loop branches intra-gen. The old
         // tiered 32/128/256 keyed on total n_funcs is meaningless here — n_funcs
         // resets to 0 after every seal, so it's purely the pending batch size.
-        static const u32 s_seal_batch =
-            (std::getenv("BJIT_SEAL_BATCH") != nullptr)
-                ? static_cast<u32>(std::atoi(std::getenv("BJIT_SEAL_BATCH")))
-                : 256u;   // [region-merged 2026-07-15] 96 -> 256 (census: movie
-                          // top-256 = 94.4% of dynamic entries)
-        threshold = s_seal_batch ? s_seal_batch : 1024u;  // [Phase2] one big gen
+        // [PM54c fix 2a] shared seal_batch() — cap and trigger cannot desync.
+        threshold = seal_batch();
     } else if (rs.n_funcs < 256u)  threshold = 32u;
     else if (rs.n_funcs < 1024u)   threshold = 128u;
     else                           threshold = 256u;
@@ -1496,9 +1639,52 @@ namespace {
 // stays. region_dispatch routes via a global pc -> (genIdx<<16 | localIdx) map.
 // The cold-relink that made grow-and-rebuild net-negative (650 blocks halved
 // ticks) is gone: a seal's one-time Liftoff cost is paid once per gen.
+// [PM54c fix 2c] pending-batch reset, factored so EVERY early exit from
+// region_seal can release the batch instead of stranding it (overflow PATH B:
+// the empty-bytes return previously left the batch pending forever, stacking
+// +256 per window and re-attempting a failing seal).
+void BlockCache::region_reset_pending(RegionState& rs) {
+    rs.fn_bodies_concat.clear();
+    rs.n_funcs                 = 0u;
+    rs.pc_keys.clear();
+    rs.pc_to_idx.clear();
+    rs.block_records.clear();
+    rs.blocks_since_link       = 0u;
+    rs.last_accum_ms           = now_ms();
+    rs.last_relink_ms          = now_ms();
+    rs.dispatches_since_relink = 0u;
+}
+
 void BlockCache::region_seal(u32 mem_pages) {
     RegionState& rs = m_regions[REGION_REL_0];
     if (rs.n_funcs == 0u) return;
+
+    // [PM54c fix 3a] Seal-time compaction+refresh against the LIVE
+    // m_pending_emit: a pc evicted/SMC-invalidated/trapped while pending is
+    // DROPPED (it re-promotes after recompile+re-heat — safe now that slots
+    // are gen-packed), and surviving records are refreshed to the CURRENT
+    // m_pending_emit content (a sealed gen must never serve stale pre-SMC
+    // code). One site closes the content-desync class for all three
+    // eviction paths.
+    {
+        u32 kept = 0u;
+        for (u32 i = 0; i < rs.n_funcs; ++i) {
+            const u32 pc = rs.pc_keys[i];
+            auto it = m_pending_emit.find(pc);
+            if (it == m_pending_emit.end() || it->second.insts.empty()) continue;
+            rs.pc_keys[kept]       = pc;
+            rs.block_records[kept] = it->second;
+            ++kept;
+        }
+        if (kept != rs.n_funcs) {
+            rs.pc_keys.resize(kept);
+            rs.block_records.resize(kept);
+            rs.pc_to_idx.clear();
+            for (u32 i = 0; i < kept; ++i) rs.pc_to_idx[rs.pc_keys[i]] = i;
+            rs.n_funcs = kept;
+        }
+        if (rs.n_funcs == 0u) { region_reset_pending(rs); return; }
+    }
 
     // Generation cap — leak guard. Beyond MAX_GENS the pending batch stays
     // unmerged (region_dispatch misses those PCs -> chain_dispatch handles them,
@@ -1547,7 +1733,13 @@ void BlockCache::region_seal(u32 mem_pages) {
         if (rec.insts.empty()) { have_records = false; break; }
     }
     // ---- Shape choice FIRST (single-fn merged shape preferred) ----
-    static const bool s_merged_enabled = (std::getenv("BJIT_LEVER2_MERGED_OFF") == nullptr);
+    // [PM53e 2026-08-03] Default FLIPPED to the N-fn shape: the merged
+    // giant-function br_table shape lost three A/Bs (see g_bem_promote_enabled
+    // note). N-fn = small per-block functions in one module per gen, intra-gen
+    // edges via the module-INTERNAL declared table (V8-inline-eligible),
+    // singles arms emit per-block-style (merged=null). getenv is dead in the
+    // worker (no ENV plumbing) — the default IS the config.
+    static const bool s_merged_enabled = false;
     const bool use_merged_fn = s_merged_enabled && have_records;
 
     // [region-merged 2026-07-15] N-fn ONLY: re-emit the pending batch into
@@ -1561,16 +1753,155 @@ void BlockCache::region_seal(u32 mem_pages) {
     if (have_records && !use_merged_fn) {
         rs.fn_bodies_concat.clear();
         RegionLookupCtx ctx{ &rs };
+        // [FUSION v2 PM54f] run-fusion over three seam shapes:
+        //  FWD terminal forward cond, fallthrough in-batch (v1 — measured 0
+        //      fires: analyzer-coalesced in-block, kept for completeness);
+        //  BWD terminal BACKWARD cond (native BO only): NOT-TAKEN side
+        //      last_pc+4 in-batch — the bcx stays in the stream and emits as
+        //      a coalesced mid-block exit (taken keeps its exit);
+        //  B   terminal unconditional b (LK=0, AA=0) to an in-batch target —
+        //      the b is DELETED (inline adjacency IS the branch), the
+        //      successor continues at its OWN pcs (non-contiguous stream via
+        //      AnalyzeOps). Successors KEEP their standalone functions.
+        auto rec_is_fp_free = [](const BlockEmitInputs& r) -> bool {
+            for (u32 w : r.insts) {
+                const u32 opcd = w >> 26;
+                if (opcd == 4u || (opcd >= 48u && opcd <= 63u)) return false;
+            }
+            return true;
+        };
+        auto pcs_of = [](const BlockEmitInputs& r) -> std::vector<u32> {
+            if (r.instr_pcs.size() == r.insts.size()) return r.instr_pcs;
+            std::vector<u32> p(r.insts.size());
+            for (u32 j = 0; j < (u32)p.size(); ++j) p[j] = r.start_pc + j * 4u;
+            return p;
+        };
+        auto seam_kind = [](u32 inst) -> int {   // 0 none, 1 fwd, 2 bwd, 3 b, 4 bl, 5 blr
+            const u32 opcd = inst >> 26;
+            if (opcd == 18u) {
+                if ((inst & 3u) == 0u) return 3;              // b
+                if ((inst & 3u) == 1u) return 4;              // bl (AA=0)
+                return 0;
+            }
+            if (opcd == 19u) return powerpc::IsPlainBlr(inst) ? 5 : 0;
+            if (opcd != 16u) return 0;
+            if (powerpc::IsForwardConditionalBranch(inst, 0u)) return 1;
+            return powerpc::IsSeamBackwardConditional(inst) ? 2 : 0;
+        };
+        // [FUSION v3] callee eligibility: no LR writers inside (mtlr, any
+        // LK-set branch) — the software-RAS check assumes the inlined bl was
+        // the last LR writer on the good path.
+        auto rec_no_lr_writers = [](const BlockEmitInputs& r) -> bool {
+            for (u32 w : r.insts) {
+                const u32 opcd = w >> 26;
+                if ((opcd == 18u || opcd == 16u) && (w & 1u)) return false;
+                if ((w & 0xFC1FFFFFu) == 0x7C0803A6u) return false;   // mtlr rX
+            }
+            return true;
+        };
+        auto seam_succ = [](u32 inst, u32 last_pc) -> u32 {
+            if ((inst >> 26) == 18u) {           // b and bl: static target
+                u32 raw = inst & 0x03FFFFFCu;
+                return last_pc + ((raw & 0x02000000u) ? (raw | 0xFC000000u) : raw);
+            }
+            return last_pc + 4u;                 // conditional fallthrough
+        };
+        std::unordered_map<u32, u32> fuse_preds;  // succ pc -> #fusable edges
+        for (u32 i = 0; i < rs.n_funcs; ++i) {
+            const BlockEmitInputs& r = rs.block_records[i];
+            if (r.insts.empty()) continue;
+            const std::vector<u32> p = pcs_of(r);
+            const int pk = seam_kind(r.insts.back());
+            if (pk == 0 || pk >= 4) continue;   // bl/blr edges skip the pred rule
+            const u32 succ = seam_succ(r.insts.back(), p.back());
+            if (rs.pc_to_idx.find(succ) != rs.pc_to_idx.end()) fuse_preds[succ] += 1u;
+        }
+        u32 fused_runs = 0u, fused_blocks = 0u, fused_b = 0u, fused_bwd = 0u;
+        u32 fused_bl = 0u, fused_blr = 0u;
         for (u32 i = 0; i < rs.n_funcs; ++i) {
             const BlockEmitInputs& rec = rs.block_records[i];
+            std::vector<u32> fused = rec.insts;
+            std::vector<u32> fpcs  = pcs_of(rec);
+            u32 depth = 1u;
+            if (rec_is_fp_free(rec)) {
+                u32 visited[8]; u32 n_vis = 0u; visited[n_vis++] = rec.start_pc;
+                u32 pending_ret = 0u;            // [FUSION v3] one bl deep, no nesting
+                for (;;) {
+                    if (depth >= 8u || fused.size() >= 96u) break;
+                    const int k = seam_kind(fused.back());
+                    if (!k) break;
+                    u32 succ;
+                    if (k == 5) {                // blr: continue at the RAS ret
+                        if (!pending_ret) break;
+                        succ = pending_ret;
+                    } else {
+                        succ = seam_succ(fused.back(), fpcs.back());
+                    }
+                    if (k == 4 && pending_ret) break;      // no nested bl
+                    auto sit = rs.pc_to_idx.find(succ);
+                    if (sit == rs.pc_to_idx.end()) break;
+                    if (k <= 3) {                // pred rule only for branch shapes
+                        auto pit = fuse_preds.find(succ);
+                        if (pit == fuse_preds.end() || pit->second != 1u) break;
+                    }
+                    bool seen = false;
+                    for (u32 v = 0; v < n_vis; ++v)
+                        if (visited[v] == succ) { seen = true; break; }
+                    if (seen) break;             // no cycle unrolling
+                    const BlockEmitInputs& nxt = rs.block_records[sit->second];
+                    if (nxt.insts.empty() || nxt.start_pc != succ) break;
+                    if (!rec_is_fp_free(nxt)) break;
+                    if (k == 4 && !rec_no_lr_writers(nxt)) break;   // callee must keep LR
+                    if (nxt.ctx_ptr_const != rec.ctx_ptr_const ||
+                        nxt.mem1_base != rec.mem1_base ||
+                        nxt.mem1_mask != rec.mem1_mask ||
+                        nxt.ram_size  != rec.ram_size) break;
+                    if (k == 3) { fused.pop_back(); fpcs.pop_back(); ++fused_b; }
+                    if (k == 2) ++fused_bwd;
+                    if (k == 4) { pending_ret = fpcs.back() + 4u; ++fused_bl; }
+                    if (k == 5) { pending_ret = 0u; ++fused_blr; }
+                    const std::vector<u32> np = pcs_of(nxt);
+                    fused.insert(fused.end(), nxt.insts.begin(), nxt.insts.end());
+                    fpcs.insert(fpcs.end(), np.begin(), np.end());
+                    visited[n_vis++] = succ;
+                    ++depth;
+                }
+                // [seam contract] every non-terminal coalescable conditional
+                // must have its +4 successor ADJACENT in the stream (the
+                // not-taken arms store NOTHING). Violation => drop the fusion.
+                if (depth > 1u) {
+                    for (std::size_t j = 0; j + 1 < fused.size(); ++j) {
+                        const u32 w = fused[j];
+                        if ((powerpc::IsForwardConditionalBranch(w, fpcs[j]) ||
+                             powerpc::IsSeamBackwardConditional(w)) &&
+                            fpcs[j + 1] != fpcs[j] + 4u) {
+                            fused = rec.insts; fpcs = pcs_of(rec); depth = 1u;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (depth > 1u) { ++fused_runs; fused_blocks += depth; }
             std::vector<u8> body = powerpc::emit_block_body_next(
-                rec.start_pc, rec.insts.data(), static_cast<u32>(rec.insts.size()),
+                rec.start_pc, fused.data(), static_cast<u32>(fused.size()),
                 rec.ctx_ptr_const, rec.mem1_base, rec.mem1_mask, rec.ram_size,
-                rec.instr_pcs.data(), &region_lookup_for_emit, &ctx,
-                rec.emit_hle_check, rec.emit_perf_stub, rec.emit_hle_check_native);
+                fpcs.data(),                     // REAL parallel pcs
+                &region_lookup_for_emit, &ctx,
+                rec.emit_hle_check, rec.emit_perf_stub, rec.emit_hle_check_native,
+                (s32)m_sealed_gen_count);
             rs.fn_bodies_concat.insert(rs.fn_bodies_concat.end(),
                                        body.begin(), body.end());
         }
+#ifdef __EMSCRIPTEN__
+        if (fused_runs) {
+            EM_ASM({ console.log('[worker] [bemental] run-fusion: ' + $0
+                + ' runs / ' + $1 + ' blocks (b ' + $2 + ', bwd ' + $3
+                + ', bl ' + $4 + ', blr ' + $5 + ') gen ' + $6); },
+                (int)fused_runs, (int)fused_blocks, (int)fused_b,
+                (int)fused_bwd, (int)fused_bl, (int)fused_blr,
+                (int)m_sealed_gen_count);
+        }
+#endif
     }
 
     std::vector<u8> bytes;
@@ -1599,39 +1930,14 @@ void BlockCache::region_seal(u32 mem_pages) {
     }
     if (bytes.empty()) {
 #ifdef __EMSCRIPTEN__
-        EM_ASM({ console.error('[bemental] seal: build_region returned empty bytes gen='
-            + $0); }, (int)m_sealed_gen_count);
+        EM_ASM({ console.log('[worker] [bemental] seal gen ' + $0
+            + ' FAILED: build_region returned empty bytes'); },
+            (int)m_sealed_gen_count);
 #endif
+        // [PM54c fix 2c] release the batch — pcs stay per-block-served and
+        // re-promotable; never strand-and-retry.
+        region_reset_pending(rs);
         return;
-    }
-
-    // [region] N-fn path: populate the region-local dispatch cache so each
-    // region body's in-WASM tail-chain (emit_chain_or_return with the rtag/rslot
-    // override) resolves a successor PC -> this gen's INTERNAL funcref-table
-    // slot (block i -> internal slot i, matching the active element segment).
-    // A miss falls through to the host (per-block path). Single active region:
-    // the most-recently-sealed gen owns the cache; older gens' PCs tag-miss and
-    // stay on the per-block path (correct, just unaccelerated). The internal
-    // table is V8-inline-eligible (declared, not imported) — the whole point.
-    if (!use_merged_fn) {
-        for (u32 i = 0; i < rs.n_funcs; ++i) {
-            const u32 pc  = rs.block_records[i].start_pc;
-            const u32 bkt = (pc >> 2) & BEM_DISP_MASK;
-            g_bem_rtag[bkt]  = pc;
-            g_bem_rslot[bkt] = (int32_t)i;
-        }
-    } else {
-        // [region-merged] Populate the DEDICATED merged probe pair with
-        // GEN-PACKED slots. Bodies warm-chain only into their OWN gen
-        // (slot>>16 == gen_idx); other gens' entries host-fallthrough to the
-        // global-table wrapper. Bucket collisions across gens just overwrite —
-        // the loser degrades to the (measured-free) per-block/global path.
-        for (u32 i = 0; i < rs.n_funcs; ++i) {
-            const u32 pc  = rs.block_records[i].start_pc;
-            const u32 bkt = (pc >> 2) & BEM_DISP_MASK;
-            g_bem_mrtag[bkt]  = pc;
-            g_bem_mrslot[bkt] = (int32_t)((m_sealed_gen_count << 16) | i);
-        }
     }
 
 #ifdef __EMSCRIPTEN__
@@ -1649,7 +1955,7 @@ void BlockCache::region_seal(u32 mem_pages) {
     // gen only gen-mismatch-fall-through in other gens' bodies, and the global
     // buckets repoint only inside .then. A failed compile leaves those PCs
     // sealed-but-unregistered: correct, unaccelerated, logged.
-    EM_ASM({
+    const int seal_ok = EM_ASM_INT({
         const bytesPtr  = $0;
         const bytesLen  = $1 >>> 0;
         const pcKeysPtr = $2;
@@ -1679,8 +1985,18 @@ void BlockCache::region_seal(u32 mem_pages) {
             if (typeof wasmTable !== 'undefined') {
                 env['__indirect_function_table'] = wasmTable;
             }
-            WebAssembly.instantiate(copy, { env: env }).then(function(res) {
-            const inst = res.instance;
+            // [PM53c SYNC SEAL] The async .then NEVER RAN under the dual-core
+            // topology: the EmuThread pthread never returns to its JS event
+            // loop (continuous run loop + Atomics.wait throttle), so promise
+            // microtasks never drain — gens sealed optimistically C++-side but
+            // never registered (measured: pending resets, zero 'sealed gen'
+            // prints, zero perf delta). Workers may sync-compile without size
+            // limits; one Liftoff compile per gen is the intended cost.
+            // NOTE: report failures via console.log — worker console.error
+            // does NOT relay to the probe log (measured PM53d: every catch
+            // print was silently lost; validate=false was invisible).
+            const inst = new WebAssembly.Instance(
+                new WebAssembly.Module(copy), { env: env });
             // NOTE: build `gen` with separate assignments — a `{a:x, b:y}` object
             // literal here has bare commas which the C preprocessor (balances
             // parens only) would split as EM_ASM macro args. Same reason the
@@ -1693,9 +2009,9 @@ void BlockCache::region_seal(u32 mem_pages) {
                 gen.regionFn = inst.exports['region'];
                 gen.entrySel = inst.exports['entry_sel'];
                 if (!gen.regionFn || !gen.entrySel) {
-                    console.error('[bemental] seal gen ' + genIdx
-                        + ' merged shape missing exports');
-                    return;
+                    console.log('[worker] [bemental] seal gen ' + genIdx
+                        + ' FAILED: merged shape missing exports');
+                    return 0;
                 }
             }
             // [region-merged 2026-07-15] BOTH shapes register fn_k in the
@@ -1713,10 +2029,10 @@ void BlockCache::region_seal(u32 mem_pages) {
                     if (!fns[i]) { haveFns = false; break; }
                 }
                 if (!haveFns) {
-                    console.error('[bemental] seal gen ' + genIdx
-                        + ' missing fn_k exports (shape='
+                    console.log('[worker] [bemental] seal gen ' + genIdx
+                        + ' FAILED: missing fn_k exports (shape='
                         + (gen.merged ? 'merged' : 'Nfn') + ')');
-                    return;
+                    return 0;
                 }
                 gen.fns = fns;
                 if (!Module._bemental_table_base) {
@@ -1751,15 +2067,16 @@ void BlockCache::region_seal(u32 mem_pages) {
             }
             console.log('[worker] [bemental] sealed gen ' + genIdx + ' n_funcs=' + nFuncs
                 + ' bytes=' + bytesLen + (gen.merged ? ' shape=merged' : ' shape=Nfn')
-                + ' emitter=next async');   // [region-merged] gekko-relapse tripwire (gate greps this)
-            }).catch(function(e) {
-                console.error('[bemental] async seal gen ' + genIdx + ' failed: '
-                    + (e && e.message ? e.message : String(e)));
-            });
+                + ' emitter=next sync');   // [region-merged] gekko-relapse tripwire (gate greps this)
+            return 1;
         } catch (e) {
-            console.error('[bemental] seal gen ' + genIdx + ' failed: '
+            // console.log, NOT console.error — worker error lines don't relay
+            // to the probe log (PM53d finding).
+            console.log('[worker] [bemental] seal gen ' + genIdx + ' FAILED: '
                 + (e && e.message ? e.message : String(e)));
+            return 0;
         }
+        return 0;
     },
     bytes.data(), (int)bytes.size(),
     rs.pc_keys.data(), (int)rs.n_funcs,
@@ -1768,28 +2085,57 @@ void BlockCache::region_seal(u32 mem_pages) {
     (int)(uintptr_t)&g_bem_disp_tag[0], (int)(uintptr_t)&g_bem_disp_slot[0],
     (int)BEM_DISP_MASK);
 
-    // [async-seal] Commit OPTIMISTICALLY (dedup set + gen numbering). The gen
-    // registers itself (table/buckets/pc2gen) inside .then when V8 finishes
-    // compiling; a failed compile leaves these PCs sealed-but-unregistered —
-    // correct (per-block path keeps serving them), just unaccelerated.
-    for (u32 pc : rs.pc_keys) m_sealed_pcs.insert(pc);
-    m_sealed_gen_count += 1u;
-    m_region_has_sealed = true;
+    // [PM54c N-fn fix 2b] Commit ONLY on seal success (the seal is SYNCHRONOUS
+    // since PM53c; the old optimistic commit misdocumented async semantics and
+    // burned gen slots + permanently retired pcs on failure). On failure: pcs
+    // stay per-block-served AND re-promotable; the genIdx is reused by the
+    // next successful seal (a failed attempt registers nothing JS-side and,
+    // with the populate relocated below, writes no rtag entries). Storm brake:
+    // after 3 consecutive failures, commit the pcs anyway (permanently
+    // per-block, today's semantics) so a deterministic compile failure cannot
+    // retry forever.
+    static u32 s_seal_fail_streak = 0;
+    if (seal_ok) {
+        s_seal_fail_streak = 0;
+        for (u32 pc : rs.pc_keys) m_sealed_pcs.insert(pc);
+        // [PM54c fix 1a] populate the region-local probe caches ONLY for a
+        // LIVE gen, with GEN-PACKED slots in BOTH shapes ((gen<<16)|i — the
+        // merged scheme, now shared). Bodies own-gen-check before calling
+        // through their internal table, so other gens' surviving entries are
+        // inert fallthroughs, never wrong-function calls. NOTE: BJIT_MAX_GENS
+        // must stay < 32768 for the 16-bit pack (default 24; getenv is dead
+        // in the worker so the default is the config).
+        if (!use_merged_fn) {
+            for (u32 i = 0; i < rs.n_funcs; ++i) {
+                const u32 pc  = rs.block_records[i].start_pc;
+                const u32 bkt = (pc >> 2) & BEM_DISP_MASK;
+                g_bem_rtag[bkt]  = pc;
+                g_bem_rslot[bkt] = (int32_t)((m_sealed_gen_count << 16) | i);
+            }
+        } else {
+            for (u32 i = 0; i < rs.n_funcs; ++i) {
+                const u32 pc  = rs.block_records[i].start_pc;
+                const u32 bkt = (pc >> 2) & BEM_DISP_MASK;
+                g_bem_mrtag[bkt]  = pc;
+                g_bem_mrslot[bkt] = (int32_t)((m_sealed_gen_count << 16) | i);
+            }
+        }
+        m_sealed_gen_count += 1u;
+        m_region_has_sealed = true;
+    } else {
+        ++s_seal_fail_streak;
+        if (s_seal_fail_streak >= 3u) {
+            for (u32 pc : rs.pc_keys) m_sealed_pcs.insert(pc);
+            s_seal_fail_streak = 0;
+        }
+    }
 #else
     (void)mem_pages;
 #endif
 
     // Reset the pending batch for the next generation. The sealed gen is
     // immutable and lives in Module.bemental_gens; pending state starts empty.
-    rs.fn_bodies_concat.clear();
-    rs.n_funcs                 = 0u;
-    rs.pc_keys.clear();
-    rs.pc_to_idx.clear();
-    rs.block_records.clear();
-    rs.blocks_since_link       = 0u;
-    rs.last_accum_ms           = now_ms();
-    rs.last_relink_ms          = now_ms();
-    rs.dispatches_since_relink = 0u;
+    region_reset_pending(rs);
 }
 
 void BlockCache::region_relink(Region r, u32 mem_pages) {

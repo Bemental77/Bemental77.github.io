@@ -11,8 +11,86 @@
 #include "bementalJIT/types.h"
 #include "bementalJIT/wasm_module_builder.h"
 #include "ppc_offsets.h"
+#include "cr_shadow.h"
 
 namespace bemental::powerpc {
+
+// [PM56 lazy-CR] the deferred shadow + per-field pending flags (see cr_shadow.h).
+extern "C" {
+BemCrShadow g_bem_cr_shadow[8] = {};
+uint8_t     g_bem_cr_pending[8] = {};
+}
+
+// [PM56 lazy-CR] Deferred store: park (a,b,tag,SO-snapshot) into the shadow and
+// set pending[crfd]. ~11 ops vs the ~30-op eager build. b_is_imm bakes B as a
+// const (cmpi/cmpli — also drops the LOCAL_TMP_IMM round-trip at the caller).
+static void emit_defer_cr(WasmModuleBuilder& wb, u32 ctx_ptr, u32 crfd,
+                          u32 a_local, u32 b_local, s32 b_imm, bool b_is_imm,
+                          u8 tag) {
+    const u32 S = (u32)(uintptr_t)&g_bem_cr_shadow[crfd];
+    const u32 P = (u32)(uintptr_t)&g_bem_cr_pending[crfd];
+    // shadow.a = a_local
+    wb.op_i32_const((s32)S); wb.op_local_get(a_local); wb.op_i32_store(0);
+    // shadow.b = b (reg or baked imm)
+    wb.op_i32_const((s32)S);
+    if (b_is_imm) wb.op_i32_const(b_imm); else wb.op_local_get(b_local);
+    wb.op_i32_store(4);
+    // shadow.tag = tag
+    wb.op_i32_const((s32)S); wb.op_i32_const((s32)tag); wb.op_i32_store8(8);
+    // shadow.so = (XER.SO_OV >> 1) & 1  — FREEZE SO now (produce-time value)
+    wb.op_i32_const((s32)S);
+    wb.op_i32_const((s32)ctx_ptr); wb.op_i32_load8_u(ppc_off::XER_SO_OV);
+    wb.op_i32_const(1); wb.op_i32_shr_u();
+    wb.op_i32_store8(9);
+    // pending[crfd] = 1
+    wb.op_i32_const((s32)P); wb.op_i32_const(1); wb.op_i32_store8(0);
+}
+
+void emit_defer_cr_reg(WasmModuleBuilder& wb, u32 ctx_ptr, u32 crfd,
+                       u32 a_local, u32 b_local, u8 tag) {
+    emit_defer_cr(wb, ctx_ptr, crfd, a_local, b_local, 0, /*b_is_imm=*/false, tag);
+}
+void emit_defer_cr_imm(WasmModuleBuilder& wb, u32 ctx_ptr, u32 crfd,
+                       u32 a_local, s32 b_imm, u8 tag) {
+    emit_defer_cr(wb, ctx_ptr, crfd, a_local, 0, b_imm, /*b_is_imm=*/true, tag);
+}
+
+// [PM56 lazy-CR] Reconstruct eager cr[] from the deferred shadow for every
+// pending field, then clear pending. THE single source of truth for the
+// deferred→eager encoding (the bridge funnel + the test harness both call
+// this — no second encoding to drift). ctx_base = PowerPCState host address
+// (the emitters' ctx_ptr). Must match emit_cr_from_*_pair/local exactly:
+// hi32 = 1 | so<<27 | lt<<30 | (a<=b)<<31 ; lo32 = a-b (CMP) or a (RC_VS0).
+extern "C" void bem_materialize_pending_cr(void* ctx_base) {
+    auto* base = static_cast<unsigned char*>(ctx_base);
+    for (int f = 0; f < 8; ++f) {
+        if (!g_bem_cr_pending[f]) continue;
+        const BemCrShadow& sh = g_bem_cr_shadow[f];
+        const int32_t a = sh.a, b = sh.b;
+        const uint32_t so = sh.so & 1u;
+        const uint32_t kind = sh.tag & BEM_CR_KIND_MASK;
+        const bool uns = (sh.tag & BEM_CR_UNSIGNED) != 0;
+        bool lt, le;
+        uint32_t lo;
+        if (kind == BEM_CR_RC_VS0) { lt = a < 0; le = a <= 0; lo = (uint32_t)a; }
+        else if (uns) { lt = (uint32_t)a < (uint32_t)b; le = (uint32_t)a <= (uint32_t)b;
+                        lo = (uint32_t)a - (uint32_t)b; }
+        else { lt = a < b; le = a <= b; lo = (uint32_t)a - (uint32_t)b; }
+        const uint32_t hi = 1u | (so << 27) | ((uint32_t)lt << 30) | ((uint32_t)le << 31);
+        *reinterpret_cast<uint64_t*>(base + ppc_off::cr((u32)f)) =
+            ((uint64_t)hi << 32) | (uint64_t)lo;
+        g_bem_cr_pending[f] = 0;
+    }
+}
+
+// [PM56 lazy-CR] Clear pending[crfd] — every EAGER CR writer that survives
+// (Rc-form ops still calling emit_cr0_from_local; interp SetField is covered by
+// the host materialize) MUST call this so a stale pending flag can't make a
+// later consumer read the shadow instead of the freshly-written eager cr[].
+static void emit_clear_cr_pending(WasmModuleBuilder& wb, u32 crfd) {
+    const u32 P = (u32)(uintptr_t)&g_bem_cr_pending[crfd];
+    wb.op_i32_const((s32)P); wb.op_i32_const(0); wb.op_i32_store8(0);
+}
 
 // Helper (file-local, inlined at emit time): push the "high32" word of
 // the CR encoding onto the wasm stack as an i32. Caller is responsible
@@ -167,7 +245,15 @@ void emit_cr_from_unsigned_pair(WasmModuleBuilder& wb, u32 ctx_ptr,
 
 void emit_cr0_from_local(WasmModuleBuilder& wb, u32 ctx_ptr,
                          u32 value_local) {
-    emit_cr_from_signed_local(wb, ctx_ptr, 0, value_local);
+    // [PM56 lazy-CR Stage 6a] gated: defer (RC_VS0) when lazy-CR is on, else
+    // the eager build (shipping default). See BEM_LAZY_CR in cr_shadow.h.
+    if (BEM_LAZY_CR) {
+        emit_defer_cr(wb, ctx_ptr, 0, value_local, /*b_local=*/0, /*b_imm=*/0,
+                      /*b_is_imm=*/false, BEM_CR_RC_VS0);
+    } else {
+        emit_cr_from_signed_local(wb, ctx_ptr, 0, value_local);
+    }
+    (void)&emit_clear_cr_pending;  // retained for the adjacent-fusion follow-up
 }
 
 }  // namespace bemental::powerpc

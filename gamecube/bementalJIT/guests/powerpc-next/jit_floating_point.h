@@ -21,6 +21,10 @@ void emit_fmrx  (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
 void emit_fnegx (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr);
 void emit_fabsx (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr);
 void emit_fnabsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr);
+// fcmpu (sub 0) / fcmpo (sub 32) — native scalar FP compare → CR field.
+void emit_fcmpu (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr);
+// fsel (A-form sub5 23) — native branchless FP select.
+void emit_fsel  (WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr);
 
 // Double-precision scalar arith (ps0 lane only; ps1 untouched).
 // sub5 18=fdiv, 20=fsub, 21=fadd, 25=fmul.

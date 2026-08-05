@@ -404,8 +404,18 @@ bool retro_load_game(const struct retro_game_info* game)
       )
     )
   );
+  // [xfb-band FIX PM45e 2026-07-31] def 128 -> 0 (Safe/full hash) = native Dolphin's
+  // default; sampled hashing left stale THP plane textures -> TEV green band.
   Config::SetBase(Config::GFX_SAFE_TEXTURE_CACHE_COLOR_SAMPLES,
-                 Libretro::GetOption<int>(gfx_settings::TEXTURE_CACHE_ACCURACY, 128));
+                 Libretro::GetOption<int>(gfx_settings::TEXTURE_CACHE_ACCURACY, 0));
+  // [xfb-band PM45g 2026-07-31 — MEASURED, CADENCE-INCOMPATIBLE, OFF] MAIN_SYNC_GPU
+  // under the RAF slice pump throttles the CPU to ~max_distance ticks per 16ms pump
+  // interval (200K/16ms = ~2.6% of Gekko; probe: gc=52, ~5fps presents, white frame)
+  // even WITH the RunGpuLoopSlice paused-path drain fix (kept — it is correct). Native's
+  // GPU loop wakes the waiting CPU in microseconds; a 16ms pump cannot. SyncGPU (and the
+  // residual THP upload-tear stripes it would fix) therefore requires the parallel GPU
+  // worker topology (sub-frame drain cadence off the RAF) or the speed campaign closing
+  // the lag by pace, exactly as native does.
   Config::SetBase(Config::GFX_HIRES_TEXTURES,
                  Libretro::GetOption<bool>(gfx_enhancements::LOAD_CUSTOM_TEXTURES, /*def=*/false));
   Config::SetBase(Config::GFX_CACHE_HIRES_TEXTURES,
@@ -476,8 +486,12 @@ bool retro_load_game(const struct retro_game_info* game)
                  Libretro::GetOption<bool>(gfx_hacks::BBOX_ENABLED, /*def=*/false));
   Config::SetBase(Config::GFX_HACK_FORCE_PROGRESSIVE,
                  Libretro::GetOption<bool>(gfx_hacks::FORCE_PROGRESSIVE, /*def=*/true));
+  // [render-gaps R1 PM38 2026-07-24] default flipped true->false: the WGPU EFB->RAM
+  // path now writes REAL encoded data (WGPUTextureCache::CopyEFB readback+tile-encode).
+  // With skip=true the RAM region was ZEROED (UninitializeEFBMemory) and hash-mismatch
+  // re-decodes produced the block-garbage textures (MP4 post-menu class).
   Config::SetBase(Config::GFX_HACK_SKIP_EFB_COPY_TO_RAM,
-                 Libretro::GetOption<bool>(gfx_hacks::EFB_TO_TEXTURE, /*def=*/true));
+                 Libretro::GetOption<bool>(gfx_hacks::EFB_TO_TEXTURE, /*def=*/false));
   Config::SetBase(Config::GFX_HACK_SKIP_XFB_COPY_TO_RAM,
                  Libretro::GetOption<bool>(gfx_hacks::XFB_TO_TEXTURE_ENABLE, /*def=*/true));
   Config::SetBase(Config::GFX_HACK_DISABLE_COPY_TO_VRAM,

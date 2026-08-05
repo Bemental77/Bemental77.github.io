@@ -479,6 +479,13 @@ static void RefreshConfig()
 
 void Init()
 {
+#ifdef __EMSCRIPTEN__
+  // [wasm perf PM38 2026-07-24] No USB in the browser build, but constructing the
+  // LibusbUtils::Context spawns an event thread that busy-spins a FULL CORE in
+  // libusb_handle_events_timeout_completed (worker_8 = 100.0% of 45.7s in the
+  // CPU profile, first flagged PM16). Skip adapter init entirely.
+  return;
+#endif
 #if GCADAPTER_USE_LIBUSB_IMPLEMENTATION
   if (s_handle != nullptr)
     return;

@@ -79,6 +79,36 @@ bool IsForwardConditionalBranch(u32 inst, u32 /*pc*/) {
     return (s32)GekkoOperands::BD(inst) > 0;             // forward only
 }
 
+// [FUSION v2] see ppc_analyst.h. Same native-BO whitelist as the emitters'
+// fusable_terminal_bcx: bdnz/bdz or the CR-bit families.
+// [FUSION v3] mid-list bl whose static target is the NEXT op in the fused
+// stream (the driver placed the callee inline): emits LR:=pc+4 only.
+bool IsSeamInlineBl(u32 inst, u32 pc, u32 next_pc) {
+    if (GekkoOperands::OPCD(inst) != 18u) return false;
+    if (!GekkoOperands::LK(inst) || GekkoOperands::AA(inst)) return false;
+    const u32 li = GekkoOperands::LI(inst);
+    return pc + li == next_pc;
+}
+
+// [FUSION v3] plain blr (bclr BO=20, LK=0): mid-list it emits the software-RAS
+// check (LR==ret ? continue inline : PC=LR exit).
+bool IsPlainBlr(u32 inst) {
+    if (GekkoOperands::OPCD(inst) != 19u) return false;
+    if (((inst >> 1) & 0x3FFu) != 16u) return false;      // bclr
+    if (GekkoOperands::LK(inst)) return false;
+    return GekkoOperands::BO(inst) == 20u;                 // unconditional
+}
+
+bool IsSeamBackwardConditional(u32 inst) {
+    if (GekkoOperands::OPCD(inst) != 16u) return false;
+    const u32 bo = GekkoOperands::BO(inst);
+    if (bo == 20u)               return false;   // branch-always
+    if (GekkoOperands::LK(inst)) return false;
+    if (GekkoOperands::AA(inst)) return false;
+    if ((s32)GekkoOperands::BD(inst) > 0) return false;   // backward/self only
+    return (bo == 0b10000u || bo == 0b10010u || (bo & 0b10100u) == 0b00100u);
+}
+
 // EvaluateBranchTarget — return the absolute target PC for any branch
 // instruction at `pc`, or INVALID_BRANCH_TARGET if not a branch. The host
 // supplies the instruction word indirectly via the inst parameter.
@@ -122,6 +152,10 @@ void PPCAnalyzer::SetInstructionStats(CodeBlock* block, CodeOp* code,
     code->canCauseException  =
         (opinfo->flags & (FL_LOADSTORE | FL_USE_FPU | FL_PROGRAMEXCEPTION |
                           FL_FLOAT_EXCEPTION | FL_FLOAT_DIV)) != 0;
+    code->usesFPU            = (opinfo->flags & FL_USE_FPU) != 0;
+    // [fprf-narrow PM24] see code_op.h — pure-FP ops cannot exit mid-block.
+    code->pureFpNoExit       = code->canCauseException && !code->canEndBlock &&
+        (opinfo->flags & (FL_LOADSTORE | FL_PROGRAMEXCEPTION)) == 0;
 
     const u32 inst = code->inst;
 
@@ -274,7 +308,23 @@ bool PPCAnalyzer::IsBusyWaitLoop(CodeBlock* block, CodeOp* code,
 u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
                          std::size_t block_size, FetchFn fetch,
                          void* fetch_user) const {
+    return AnalyzeCore(address, block, buffer, block_size, fetch, fetch_user,
+                       nullptr, nullptr);
+}
+
+// [FUSION v2] exact-list mode: per-op pcs, no fetch.
+u32 PPCAnalyzer::AnalyzeOps(const u32* insts, const u32* pcs, std::size_t n,
+                            CodeBlock* block, CodeBuffer* buffer) const {
+    return AnalyzeCore(pcs && n ? pcs[0] : 0u, block, buffer, n,
+                       nullptr, nullptr, insts, pcs);
+}
+
+u32 PPCAnalyzer::AnalyzeCore(u32 address, CodeBlock* block, CodeBuffer* buffer,
+                             std::size_t block_size, FetchFn fetch,
+                             void* fetch_user,
+                             const u32* pre_insts, const u32* pre_pcs) const {
     block->m_address          = address;
+    block->m_noncontiguous    = false;
     block->m_num_instructions = 0;
     block->m_broken           = false;
     block->m_memory_exception = false;
@@ -307,7 +357,12 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
     bool reached_endblock = false;
 
     for (std::size_t i = 0; i < block_size; ++i) {
-        const u32 inst = fetch(pc, fetch_user);
+        if (pre_pcs) {
+            // [FUSION v2] exact-list mode: seams jump addresses.
+            if (i > 0 && pre_pcs[i] != pc) block->m_noncontiguous = true;
+            pc = pre_pcs[i];
+        }
+        const u32 inst = pre_insts ? pre_insts[i] : fetch(pc, fetch_user);
         const GekkoOPInfo* opinfo = lookup_op_info(inst, pc);
 
         CodeOp op{};
@@ -509,7 +564,15 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
             // idle-loop classification below keys on the TRUE terminator. Must
             // mirror the JitWasm.cpp decode loop's identical predicate so this
             // analyst length matches the decoded inst count.
-            if (!IsForwardConditionalBranch(op.inst, op.address)) {
+            if (pre_pcs && i + 1 < block_size &&
+                (IsSeamBackwardConditional(op.inst) ||
+                 IsSeamInlineBl(op.inst, op.address, pre_pcs[i + 1]) ||
+                 IsPlainBlr(op.inst))) {
+                // [FUSION v2] mid-list seam conditional of a pre-built fused
+                // stream — emitted as a coalesced mid-block exit; keep
+                // decoding. Any OTHER unexpected mid-list terminator still
+                // truncates conservatively below.
+            } else if (!IsForwardConditionalBranch(op.inst, op.address)) {
                 reached_endblock = true;
                 break;
             }
@@ -528,6 +591,13 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
     // FPRF (FPSCR[12:16]) conservatively live at block end — mirrors ca_live_after.
     // Dolphin forces FPRF live at may-exit ops (PPCAnalyst.cpp:1010-1013) too.
     bool     fprf_live_after = true;
+    // [fprf-narrow PM24] the FIRST FL_USE_FPU op per block is a REAL may-exit
+    // (ppc_emit's MSR.FP-unavailable gate emits a mid-block return there); every
+    // later pure-FP op cannot exit and must not trigger the C1 full reset.
+    std::size_t first_fpu_idx = SIZE_MAX;
+    for (std::size_t i = 0; i < block->m_num_instructions; ++i) {
+        if ((*buffer)[i].usesFPU) { first_fpu_idx = i; break; }
+    }
     for (std::size_t i = block->m_num_instructions; i-- > 0; ) {
         CodeOp& op = (*buffer)[i];
         op.gprInUse       = live_after;
@@ -548,9 +618,18 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
         // Mirrors Dolphin PPCAnalyst.cpp:1041-1046 (empties the discardable
         // sets at every may_exit op) + :1010-1012 (may_exit keeps CA live).
         // Safe superset: only ever keeps MORE state live, never elides a needed
-        // store. (A future perf refinement could narrow to ops that actually
-        // emit op_return mid-block, but correctness comes first.)
-        if (op.canEndBlock || op.canCauseException) {
+        // store.
+        // [fprf-narrow PM24] narrowed to ops that can ACTUALLY exit mid-block:
+        // terminators, load/stores (DSI), FL_PROGRAMEXCEPTION, and the block's
+        // first FL_USE_FPU op (MSR.FP-unavailable gate). Pure-FP arith after
+        // that point cannot exit (FP exceptions are not delivered per-op in
+        // this build), so the reset previously fired for EVERY ps op — keeping
+        // all state live and forcing the ~50-op FPRF classifier + FPSCR RMW on
+        // every ps op in psq/ps-dense code (938 ops in the THP IDCT alone).
+        const bool may_exit_mid_block =
+            op.canEndBlock ||
+            (op.canCauseException && (!op.pureFpNoExit || i == first_fpu_idx));
+        if (may_exit_mid_block) {
             live_after     = BitSet32(0xFFFFFFFFu);
             fpr_live_after = BitSet32(0xFFFFFFFFu);
             cr_live_after  = BitSet8(0xFF);
@@ -569,7 +648,10 @@ u32 PPCAnalyzer::Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
 
     // Idle-loop classification — only valid for a fully-decoded short block
     // whose terminator branches back to start.
-    if (reached_endblock && block->m_num_instructions > 0) {
+    if (reached_endblock && block->m_num_instructions > 0 &&
+        !block->m_noncontiguous) {
+        // [FUSION v2] fused streams skip idle classification (conservative:
+        // a fused multi-block poll loop loses idle-skip — perf-only).
         if (IsBusyWaitLoop(block, buffer->data(), block->m_num_instructions)) {
             (*buffer)[block->m_num_instructions - 1].branchIsIdleLoop = true;
         }

@@ -41,7 +41,7 @@ static bool emit_oe_fallback_if_set(WasmModuleBuilder& wb, RegCache& rc,
     wb.op_i32_const((s32)op.address);
     wb.op_call(/*WIMPORT_INTERP=*/6);
     rc.ReloadAll(ctx_ptr);
-    frc.ReloadAll(ctx_ptr);
+    frc.ReloadAll(ctx_ptr, /*host_may_write_fprs=*/false);
     return true;
 }
 

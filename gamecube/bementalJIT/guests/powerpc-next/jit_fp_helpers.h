@@ -21,6 +21,17 @@
 #include "jit_load_store.h"   // emit_psq_convert_to_double (NaN-exact widen)
 #include "ppc_offsets.h"
 
+// [fprf-gate PM46] Dolphin's bFPRF half of the FPRF gate (Config MAIN_FPRF,
+// default false). Published by JitWasm::Init; defined in block_cache.cpp.
+extern "C" { extern uint32_t g_bem_fprf_enabled; }
+// [accurate-nans-gate PM59] native Jit64's m_accurate_nans (Config
+// MAIN_ACCURATE_NANS, default false). 0 = skip the paired-single NaN ladder,
+// leaving the raw IEEE result native produces at default (see block_cache.cpp).
+extern "C" { extern uint32_t g_bem_accurate_nans; }
+// [ni-flush-gate PM60] paired-single NI/FTZ subnormal flush. 0 = skip (wasm has
+// no host FTZ; native gets it free via MXCSR — see block_cache.cpp).
+extern "C" { extern uint32_t g_bem_ni_flush; }
+
 namespace bemental {
 namespace powerpc {
 
@@ -661,6 +672,9 @@ inline void emit_fma_core(WasmModuleBuilder& wb, bool sub, bool single) {
 // (incl. the low-bit-NaN-c -> inf case).
 // ===========================================================================
 inline void emit_nan_fixup_fma(WasmModuleBuilder& wb) {
+    // [accurate-nans-gate PM59] native default skips the ladder — raw IEEE fused
+    // result stays on the stack. Guard FIRST, before the stash (stack-neutral).
+    if (!g_bem_accurate_nans) return;
     wb.op_local_set(LOCAL_FMA_TMP);   // stash result
     // gate: if isnan(result)
     wb.op_local_get(LOCAL_FMA_TMP);
@@ -736,6 +750,10 @@ inline void emit_nan_fixup_fma(WasmModuleBuilder& wb) {
 // Verified 0 mismatches vs NI_add over the special-value cross product.
 // ===========================================================================
 inline void emit_nan_fixup_2op(WasmModuleBuilder& wb) {
+    // [accurate-nans-gate PM59] native default (m_accurate_nans=false) skips the
+    // ladder entirely, leaving the raw IEEE f64 result on the stack. Guard FIRST,
+    // before the stash — early-return must leave the stack ([result]) untouched.
+    if (!g_bem_accurate_nans) return;
     wb.op_local_set(LOCAL_FMA_TMP);   // stash result
     wb.op_local_get(LOCAL_FMA_A);
     wb.op_local_get(LOCAL_FMA_A);
@@ -801,6 +819,14 @@ inline void emit_nan_fixup_2op(WasmModuleBuilder& wb) {
 inline void emit_update_fprf_single(WasmModuleBuilder& wb, u32 val_local, u32 ctx_ptr,
                                     bool needed = true) {
     if (!needed) return;  // dead FPRF — analyzer proved no downstream reader
+    // [fprf-gate PM46 2026-07-31] the OTHER half of Dolphin's gate: Jit64
+    // SetFPRFIfNeeded emits ONLY when `bFPRF && js.op->wantsFPRF`
+    // (Jit_FloatingPoint.cpp:33-38). bFPRF (Config MAIN_FPRF) defaults FALSE
+    // and GMPE01 has no INI override — native MP4 emits ZERO FPRF code, while
+    // we paid the ~150-op classifier on nearly every ps op (IDCT dump: 223
+    // lines per SIMD arith op, ~150 of it this classifier). g_bem_fprf_enabled
+    // is published by JitWasm from the same Config value; defaults 0.
+    if (!g_bem_fprf_enabled) return;
     // T0 = f32 bits of the widened value.
     wb.op_local_get(val_local);
     wb.op_f64_reinterpret_i64();
@@ -931,16 +957,135 @@ inline void emit_nan_safe_neg(WasmModuleBuilder& wb) {
 inline void emit_single_fma_lane(WasmModuleBuilder& wb, u32 a_local, u32 c_local,
                                  u32 b_local, u32 d_local, bool sub, bool negate,
                                  u32 ctx_ptr) {
-    emit_fma_stage(wb, a_local, c_local, b_local, /*force25_c=*/true);  // [C3]
-    emit_fma_core(wb, sub, /*single=*/true);   // [C2] fused + tie-correct
-    emit_nan_fixup_fma(wb);                     // [C8] NaN ladder
-    emit_force_single_i64(wb, ctx_ptr);         // [C10] ForceSingle -> i64
-    if (negate) {
+    // [fma-single-fast PM24] Runtime shortcut for f32-VALUED inputs (the THP
+    // IDCT scalar fall-off: psq_l coefficients x lfs constants held as
+    // Doubles): the f64 product of two f32-valued doubles is EXACT (24x24 <=
+    // 53 mantissa bits), so fma(a, Force25Bit(c), +-b) == f64.mul + f64.add
+    // BY CONSTRUCTION — Force25Bit is a no-op on <=24-bit mantissas, the
+    // exact product makes fused == unfused (one rounding either way), and the
+    // ForceSingle two-step (round_f64 then round_f32) is the interpreter's
+    // own sequence. Guard: each input survives an f32 round-trip (NaN inputs
+    // fail x==x and fall through); NaN RESULTS (inf*0, inf-inf) also fall to
+    // the full pipeline so the NaN ladder / FPSCR semantics are byte-identical
+    // there. Fast arm ~70 executed ops vs ~600-900 for the pipeline.
+    // Scratch: LOCAL_FP_T1 (guard flag; dead at entry, freely clobbered once
+    // the selecting `if` has consumed it), LOCAL_FMA_RES (f64 sum).
+    auto push_f32_roundtrip_ok = [&](u32 vlocal) {
+        wb.op_local_get(vlocal);
         wb.op_f64_reinterpret_i64();
-        emit_nan_safe_neg(wb);                  // [C8b] isnan(tmp)?tmp:-tmp
-        wb.op_i64_reinterpret_f64();
+        wb.op_f32_demote_f64();
+        wb.op_f64_promote_f32();
+        wb.op_local_get(vlocal);
+        wb.op_f64_reinterpret_i64();
+        wb.op_f64_eq();
+    };
+    push_f32_roundtrip_ok(a_local);
+    push_f32_roundtrip_ok(c_local);
+    wb.op_i32_and();
+    push_f32_roundtrip_ok(b_local);
+    wb.op_i32_and();
+    wb.op_local_set(LOCAL_FP_T1);
+    wb.op_local_get(LOCAL_FP_T1);
+    wb.op_if(/*VOID*/);
+    {
+        // RES = a*c +- b (exact-product ⇒ equals the fused result)
+        wb.op_local_get(a_local);
+        wb.op_f64_reinterpret_i64();
+        wb.op_local_get(c_local);
+        wb.op_f64_reinterpret_i64();
+        wb.op_f64_mul();
+        wb.op_local_get(b_local);
+        wb.op_f64_reinterpret_i64();
+        if (sub) wb.op_f64_sub(); else wb.op_f64_add();
+        wb.op_local_tee(LOCAL_FMA_RES);
+        wb.op_local_get(LOCAL_FMA_RES);
+        wb.op_f64_ne();                          // 1 iff NaN result
+        wb.op_if(/*VOID*/);
+        {
+            wb.op_i32_const(0);
+            wb.op_local_set(LOCAL_FP_T1);        // demote to the full pipeline
+        }
+        wb.op_end();
     }
-    wb.op_local_set(d_local);
+    wb.op_end();
+    wb.op_local_get(LOCAL_FP_T1);
+    wb.op_if(/*VOID*/);
+    {
+        // Lean ForceSingle for a KNOWN-non-NaN result: stages 1-3 of
+        // emit_force_single_i64 (NI flushes + demote) but the widen is a plain
+        // f64.promote_f32 (bit-exact for every non-NaN) instead of the 29-op
+        // NaN-payload-exact convert.
+        wb.op_local_get(LOCAL_FMA_RES);
+        wb.op_i64_reinterpret_f64();
+        wb.op_local_set(LOCAL_FP_I64_A);
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i32_load(ppc_off::FPSCR);
+        wb.op_i32_const(4);
+        wb.op_i32_and();
+        wb.op_if(/*VOID*/);                      // NI pre-cast flush
+        {
+            wb.op_local_get(LOCAL_FP_I64_A);
+            wb.op_i64_const(0x7FFFFFFFFFFFFFFFll);
+            wb.op_i64_and();
+            wb.op_i64_const(0x3810000000000000ll);
+            wb.op_i64_lt_u();
+            wb.op_if(/*VOID*/);
+            {
+                wb.op_local_get(LOCAL_FP_I64_A);
+                wb.op_i64_const((s64)0x8000000000000000ll);
+                wb.op_i64_and();
+                wb.op_local_set(LOCAL_FP_I64_A);
+            }
+            wb.op_end();
+        }
+        wb.op_end();
+        wb.op_local_get(LOCAL_FP_I64_A);
+        wb.op_f64_reinterpret_i64();
+        wb.op_f32_demote_f64();
+        wb.op_i32_reinterpret_f32();
+        wb.op_local_set(LOCAL_FP_T0);            // f32 result BITS (i32, as :169)
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i32_load(ppc_off::FPSCR);
+        wb.op_i32_const(4);
+        wb.op_i32_and();
+        wb.op_if(/*VOID*/);                      // NI post-cast f32 denormal flush
+        {
+            wb.op_local_get(LOCAL_FP_T0);
+            wb.op_i32_const(0x7FFFFFFF);
+            wb.op_i32_and();
+            wb.op_i32_const(0x00800000);
+            wb.op_i32_lt_u();
+            wb.op_if(/*VOID*/);
+            {
+                wb.op_local_get(LOCAL_FP_T0);
+                wb.op_i32_const((s32)0x80000000);
+                wb.op_i32_and();
+                wb.op_local_set(LOCAL_FP_T0);
+            }
+            wb.op_end();
+        }
+        wb.op_end();
+        wb.op_local_get(LOCAL_FP_T0);
+        wb.op_f32_reinterpret_i32();
+        wb.op_f64_promote_f32();                 // non-NaN ⇒ bit-exact widen
+        if (negate) wb.op_f64_neg();             // non-NaN ⇒ plain neg == nan-safe neg
+        wb.op_i64_reinterpret_f64();
+        wb.op_local_set(d_local);
+    }
+    wb.op_else();
+    {
+        emit_fma_stage(wb, a_local, c_local, b_local, /*force25_c=*/true);  // [C3]
+        emit_fma_core(wb, sub, /*single=*/true);   // [C2] fused + tie-correct
+        emit_nan_fixup_fma(wb);                     // [C8] NaN ladder
+        emit_force_single_i64(wb, ctx_ptr);         // [C10] ForceSingle -> i64
+        if (negate) {
+            wb.op_f64_reinterpret_i64();
+            emit_nan_safe_neg(wb);                  // [C8b] isnan(tmp)?tmp:-tmp
+            wb.op_i64_reinterpret_f64();
+        }
+        wb.op_local_set(d_local);
+    }
+    wb.op_end();
 }
 
 }  // namespace powerpc

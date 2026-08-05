@@ -140,6 +140,21 @@ private:
         bool assigned  = false; // a WASM local has been reserved for this preg
     };
 
+public:
+    // [self-loop PM47] snapshot/restore — the split epilogue emits Flush into
+    // BOTH runtime arms from the same pre-flush compile-time state.
+    struct StateSnapshot { PregState s[32]; };
+    StateSnapshot SaveState() const {
+        StateSnapshot snap;
+        for (u32 i = 0; i < 32; ++i) snap.s[i] = m_state[i];
+        return snap;
+    }
+    void RestoreState(const StateSnapshot& snap) {
+        for (u32 i = 0; i < 32; ++i) m_state[i] = snap.s[i];
+    }
+
+private:
+
     WasmModuleBuilder& m_wb;
     PregState m_state[32]{};
     u32 m_local_base = 0;

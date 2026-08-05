@@ -54,7 +54,20 @@ public:
     u32 Analyze(u32 address, CodeBlock* block, CodeBuffer* buffer,
                 std::size_t block_size, FetchFn fetch, void* fetch_user) const;
 
+    // [FUSION v2] Analyze a PRE-BUILT instruction list with an explicit
+    // per-op PC array (seal-time fused runs — pcs may be NON-CONTIGUOUS at
+    // seams). Exact-list semantics: the canEndBlock decode break is
+    // suppressed for a MID-LIST seam conditional (IsSeamBackwardConditional)
+    // — the caller already cut the list; any OTHER mid-list terminator still
+    // truncates conservatively. Sets block->m_noncontiguous when any
+    // pcs[i] != pcs[i-1]+4.
+    u32 AnalyzeOps(const u32* insts, const u32* pcs, std::size_t n,
+                   CodeBlock* block, CodeBuffer* buffer) const;
+
 private:
+    u32 AnalyzeCore(u32 address, CodeBlock* block, CodeBuffer* buffer,
+                    std::size_t block_size, FetchFn fetch, void* fetch_user,
+                    const u32* pre_insts, const u32* pre_pcs) const;
     bool IsBusyWaitLoop(CodeBlock* block, CodeOp* code, std::size_t instructions) const;
     void SetInstructionStats(CodeBlock* block, CodeOp* code, const GekkoOPInfo* opinfo) const;
 
@@ -126,5 +139,15 @@ bool IsBlockTerminator(u32 inst);
 // block). Backward/self conditional branches stay terminal so IsBusyWaitLoop
 // idle detection (SAB boot-freeze downcount=0 fix) still keys on the last op.
 bool IsForwardConditionalBranch(u32 inst, u32 pc);
+
+// [FUSION v2] bcx eligible to sit MID-BUFFER at a fused-run seam: conditional
+// (BO!=20), LK=0, AA=0, (s32)BD<=0 (backward/self), and a BO form emit_bcx
+// resolves natively (bdnz/bdz or the CR-bit families) — the rare-BO interp
+// fallback cannot exit mid-function.
+bool IsSeamBackwardConditional(u32 inst);
+// [FUSION v3] mid-list bl with target == next stream pc (inline callee seam).
+bool IsSeamInlineBl(u32 inst, u32 pc, u32 next_pc);
+// [FUSION v3] plain blr (bclr BO=20, LK=0).
+bool IsPlainBlr(u32 inst);
 
 }  // namespace bemental::powerpc

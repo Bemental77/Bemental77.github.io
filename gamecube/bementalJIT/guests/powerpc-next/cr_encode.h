@@ -65,6 +65,13 @@ void emit_cr_from_signed_pair(WasmModuleBuilder& wb, u32 ctx_ptr,
 void emit_cr_from_unsigned_pair(WasmModuleBuilder& wb, u32 ctx_ptr,
                                 u32 crfd, u32 a_local, u32 b_local);
 
+// [PM56 lazy-CR] Deferred stores (see cr_shadow.h): park operands+tag+frozen-SO
+// into the shadow and set pending[crfd], instead of building the eager field.
+void emit_defer_cr_reg(WasmModuleBuilder& wb, u32 ctx_ptr, u32 crfd,
+                       u32 a_local, u32 b_local, u8 tag);
+void emit_defer_cr_imm(WasmModuleBuilder& wb, u32 ctx_ptr, u32 crfd,
+                       u32 a_local, s32 b_imm, u8 tag);
+
 // Convenience: CR0 from local, signed-vs-0 semantic. Equivalent to
 // emit_cr_from_signed_local(wb, ctx_ptr, 0, value_local).
 void emit_cr0_from_local(WasmModuleBuilder& wb, u32 ctx_ptr,

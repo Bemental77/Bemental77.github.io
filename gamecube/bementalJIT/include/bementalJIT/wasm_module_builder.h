@@ -445,6 +445,7 @@ public:
 		bytes.push_back(0); bytes.push_back(0); bytes.push_back(0);
 		bytes.push_back(0); bytes.push_back(0);
 		funcBodyStart = (u32)bytes.size();
+		m_branch_hints.clear();   // [PM59 branch hints] per-body offsets
 	}
 
 	void emitLocals(u32 groupCount, const u32* counts, const u8* types) {
@@ -645,6 +646,16 @@ public:
 	void op_v128_and()           { emitByte(V128_PREFIX); emitLEB128(0x4Eu); }
 	void op_v128_or()            { emitByte(V128_PREFIX); emitLEB128(0x50u); }
 	void op_v128_xor()           { emitByte(V128_PREFIX); emitLEB128(0x51u); }
+	// (v1,v2,c) -> (v1 & c) | (v2 & ~c). Opcode bytes verified vs wat2wasm.
+	void op_v128_bitselect()     { emitByte(V128_PREFIX); emitLEB128(0x52u); }
+	void op_i32x4_lt_u()         { emitByte(V128_PREFIX); emitLEB128(0x3Au); }
+	// v128.const with all four i32 lanes equal (the only form the paired
+	// emitters need). 16 literal bytes, each lane LE.
+	void op_v128_const_i32_splat(u32 v) {
+		emitByte(V128_PREFIX); emitLEB128(0x0Cu);
+		for (int lane = 0; lane < 4; ++lane)
+			for (int b = 0; b < 4; ++b) emitByte((u8)((v >> (8 * b)) & 0xFFu));
+	}
 	void op_i8x16_shuffle(const u8 lanes[16]) { emitByte(V128_PREFIX); emitLEB128(0x0Du); for (int i = 0; i < 16; ++i) emitByte(lanes[i]); }
 	void op_f32x4_abs()          { emitByte(V128_PREFIX); emitLEB128(0xE0u); }
 	void op_f32x4_neg()          { emitByte(V128_PREFIX); emitLEB128(0xE1u); }
@@ -725,6 +736,19 @@ public:
 	// endFuncBody's function terminator is emitted directly, not via op_end, so
 	// the counter stays balanced across bodies.
 	void op_if(u8 blockType = 0x40) { emitByte(wop::if_); emitByte(blockType); ++m_ctrl_depth; }
+	// [PM59 branch hints] Emit an `if` whose bias is recorded for the WebAssembly
+	// branch-hinting custom section (metadata.code.branch_hint). `likely`=1 means
+	// the THEN arm (fall-through into the if-body) is the hot path; `likely`=0 =
+	// cold. The offset recorded is the position of the `if` opcode relative to the
+	// function-body start (proposal semantics). Recording is a pure no-op on the
+	// emitted bytes — the hints only matter when a caller emits the custom section
+	// from branchHints(); until then this is identical to op_if.
+	struct BranchHint { u32 offset; u8 likely; };
+	void op_if_hinted(u8 likely, u8 blockType = 0x40) {
+		m_branch_hints.push_back({ (u32)bytes.size() - funcBodyStart, likely });
+		op_if(blockType);
+	}
+	const std::vector<BranchHint>& branchHints() const { return m_branch_hints; }
 	void op_else()       { emitByte(wop::else_); }
 	void op_end()        { emitByte(wop::end); if (m_ctrl_depth) --m_ctrl_depth; }
 	void op_block(u8 blockType = 0x40) { emitByte(wop::block); emitByte(blockType); ++m_ctrl_depth; }
@@ -755,6 +779,10 @@ private:
 	u32 funcBodySizePos = 0;
 	u32 funcBodyStart = 0;
 	u32 m_ctrl_depth = 0;   // [region-resident] control-nesting depth (see op_block)
+	// [PM59 branch hints] per-func-body (offset-from-body-start, likely) records,
+	// populated by op_if_hinted, cleared at beginFuncBody. Consumed by the module
+	// assembler to emit the metadata.code.branch_hint custom section.
+	std::vector<BranchHint> m_branch_hints;
 
 	// Write a u32 as a 5-byte fixed-length LEB128 at a specific position
 	void patchLEB128_5(u32 pos, u32 value) {

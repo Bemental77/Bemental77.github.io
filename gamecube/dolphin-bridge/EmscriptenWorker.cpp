@@ -39,10 +39,12 @@
 #include "Core/CoreTiming.h"
 #include "Core/PowerPC/MMU.h"  // [mmio-mirror16] MMU::Read<u16> for the mirror refresher
 #include "VideoCommon/Fifo.h"              // [gpu-pump]
+#include "VideoCommon/AsyncRequests.h"     // [savestate-fix PM61] drain routed video DoState
 #include "VideoCommon/CommandProcessor.h"  // [gpu-pump]
 #include "VideoCommon/PixelEngine.h"          // [PE-finish flush]
 #include "Core/HW/ProcessorInterface.h"     // [msr-zero watch cause/mask]
 #include "Core/HW/DSP.h"                    // [msr-zero watch dspctl]
+#include "Core/HW/CPU.h"                    // [savestate-fix PM61] resume CPU m_state after load
 #include "Core/HW/VideoInterface.h"         // [VI-tick] beam advance under worker ownership
 #include "Core/HW/Memmap.h"                 // [r1-watch GetRAM]
 #include "Core/HW/GPFifo.h"                 // [domino3] GPFifoManager::GetGatherPipeCount/Write8 (residual pad-flush)
@@ -1211,6 +1213,22 @@ void run_iter_batch(int n) {
         }
         if (!s_sab_patches_installed) {
             s_sab_patches_installed = true;
+            // [PM54b NATIVE PARITY — user directive 2026-08-04] Native
+            // dual-core Dolphin installs ZERO HLE patches for retail games:
+            // pristine HLE.cpp PatchFunctions (:109-137) applies non-Fixed
+            // patches only for names found in the symbol DB, and the oracle
+            // invocations load no symbol map — the reference runs these
+            // titles on pure PowerPC execution. Every per-game patch below
+            // is a compensation the reference does not have. Default OFF;
+            // flip ONLY for a controlled A/B. If boot/render breaks with
+            // patches off, the breakage names a real seam deviation to fix
+            // natively — that fix, not the patch, is the work.
+            constexpr bool kInstallLegacyPatches = false;
+            if (!kInstallLegacyPatches) {
+                MAIN_THREAD_EM_ASM({
+                    postMessage({cmd: 'print', txt: '[worker] HLE patches: NONE (native parity)'});
+                });
+            } else {
             auto& system = Core::System::GetInstance();
             // 2026-06-12: GATED BY GAME ID. These PCs come from SAB's
             // (GSNE8P) native dolphin.log plus one MP4 (GMPE01) skip; they
@@ -1261,6 +1279,7 @@ void run_iter_batch(int n) {
             MAIN_THREAD_EM_ASM({
                 postMessage({cmd: 'print', txt: '[worker] HLE patch install: gameid-gated (sab=' + $0 + ' mp4=' + $1 + ')'});
             }, (int)is_sab, (int)is_mp4);
+            }  // kInstallLegacyPatches
         }
         if (!g_loaded) break;
     }
@@ -1282,6 +1301,110 @@ int load_state(const uint8_t* in_buf, int bytes) {
 EMSCRIPTEN_KEEPALIVE
 int state_size(void) {
     return (int)retro_serialize_size();
+}
+
+// [savestate-deadlock-fix PM61 2026-08-05] save_state/load_state (via
+// retro_serialize/retro_unserialize) call RunOnCPUThread(wait=true). From the
+// CPU/EmuThread that runs INLINE (Core.cpp:946 IsCPUThread), but from the worker
+// MESSAGE thread it BLOCKS that thread — which is the very thread the dual-core
+// EmuThread needs serviced (proxied-main) → deadlock (froze at guest PC
+// 800e253c). Fix: the message handler flags a request; the JIT dispatch loop
+// bem_chain_loop_c (which runs ON the CPU/EmuThread) services it INLINE at a
+// block boundary; the handler polls async so the pump keeps servicing the
+// EmuThread. op: 0=none 1=save 2=load.
+volatile int    g_bem_state_op      = 0;
+volatile int    g_bem_state_done    = 0;
+volatile int    g_bem_state_serving = 0;   // 1 while DoState runs: pump quiesces GPU
+static int      g_bem_state_len     = 0;
+static uint8_t* g_bem_state_buf     = nullptr;
+static int      g_bem_state_cap     = 0;
+
+EMSCRIPTEN_KEEPALIVE int bem_is_state_serving(void) { return g_bem_state_serving; }
+
+// [savestate-fix PM61c] Drain AsyncRequests on the MESSAGE thread (device owner).
+// Called from worker_funcs.js pumpBatch while a load is serving: retro_unserialize
+// runs with passthrough=false, so VideoBackendBase::DoState QUEUES the video restore
+// and the EmuThread blocks on its future. This runs PullEvents here (on the device
+// thread) to execute that queued VideoCommon_DoState — createTexture etc. hit the
+// device that exists on THIS thread — unblocking the EmuThread. Cheap no-op when the
+// queue is empty.
+EMSCRIPTEN_KEEPALIVE void bem_drain_async(void) {
+    AsyncRequests::GetInstance()->PullEvents();
+}
+
+EMSCRIPTEN_KEEPALIVE int  bem_state_buf_ptr(void) { return (int)(intptr_t)g_bem_state_buf; }
+EMSCRIPTEN_KEEPALIVE int  bem_state_poll(void)    { return g_bem_state_done ? g_bem_state_len : -1; }
+EMSCRIPTEN_KEEPALIVE void bem_state_release(void) {
+    if (g_bem_state_buf) { free(g_bem_state_buf); g_bem_state_buf = nullptr; }
+    g_bem_state_op = 0; g_bem_state_done = 0; g_bem_state_len = 0; g_bem_state_cap = 0;
+}
+EMSCRIPTEN_KEEPALIVE int  bem_save_request(int cap) {
+    if (g_bem_state_buf) { free(g_bem_state_buf); g_bem_state_buf = nullptr; }
+    g_bem_state_buf = (uint8_t*)malloc(cap);
+    if (!g_bem_state_buf) return -1;
+    g_bem_state_cap = cap; g_bem_state_len = 0; g_bem_state_done = 0;
+    g_bem_state_op  = 1;   // set LAST — the CPU thread reads op as the go signal
+    return 0;
+}
+// Two-step load: alloc, caller fills buf via HEAPU8 at bem_state_buf_ptr(), then commit.
+EMSCRIPTEN_KEEPALIVE int  bem_load_request(int len) {
+    if (g_bem_state_buf) { free(g_bem_state_buf); g_bem_state_buf = nullptr; }
+    g_bem_state_buf = (uint8_t*)malloc(len ? len : 1);
+    if (!g_bem_state_buf) return -1;
+    g_bem_state_cap = len; g_bem_state_len = len; g_bem_state_done = 0;
+    return 0;
+}
+EMSCRIPTEN_KEEPALIVE void bem_load_commit(void) { g_bem_state_op = 2; }
+
+// Called from bem_chain_loop_c ON THE CPU/EmuThread — retro_(un)serialize's
+// RunOnCPUThread therefore runs inline, no cross-thread block.
+void bem_service_pending_state(void) {
+    const int op = g_bem_state_op;
+    if (op == 0 || g_bem_state_done) return;
+    // Quiesce the GPU pump: DoState reads/writes guest RAM + GPU state, and the
+    // pump's RunGpuLoopSlice runs concurrently on the message thread — racing the
+    // restore corrupts memory (loaded state ran ~165 frames then wedged on
+    // bad-r1). The pump gates RunGpuLoopSlice on bem_is_state_serving().
+    g_bem_state_serving = 1;
+    if (op == 1) {                                   // save
+        int sz = state_size();
+        int w  = (sz > 0 && sz <= g_bem_state_cap) ? save_state(g_bem_state_buf, g_bem_state_cap) : 0;
+        g_bem_state_len = (w > 0) ? w : 0;
+    } else {                                          // load
+        int r = load_state(g_bem_state_buf, g_bem_state_len);
+        if (r != 0) g_bem_state_len = 0;
+        // [savestate-fix PM61] DoState restores m_interrupt_cause/m_interrupt_mask and
+        // ppc_state.Exceptions, but NOTHING re-derives the EXTERNAL_INT bit from the
+        // restored cause&mask, and NOTHING republishes the PI-cause SAB mirror
+        // (0x026B27D0) the CPU worker reads for fast ISR delivery. Post-load both are
+        // stale, so a pending ARAM/DSP completion IRQ is never delivered and the guest
+        // spins forever in aramSyncTransferQueue / SelectThread (confirmed load-only via
+        // no-load control: boot climbs to gCtr 4092, load pins present at 198).
+        // SetInterrupt(0,true) ORs in ZERO cause bits (no state change) but forces
+        // UpdateException() to re-sync ppc_state.Exceptions + the mirror. Runs on the
+        // CPU/EmuThread, satisfying SetInterrupt's IsCPUThread assert.
+        if (r == 0) {
+            Core::System::GetInstance().GetProcessorInterface().SetInterrupt(0u, true);
+            // [savestate-fix PM61b] THE freeze fix. jitwasmRun (0x026B1B58, the
+            // JitWasm::Run outer-loop counter incremented per iteration of
+            // `while (*state_ptr == CPU::State::Running)`) freezes after a load →
+            // the outer loop stopped → CPUManager::m_state is no longer Running, so
+            // the EmuThread returns from JitWasm::Run and parks in CPUManager::Run's
+            // cvar wait. Advance() never runs again → CoreTiming/VI freeze → every
+            // guest thread blocks in SelectThread. In single-core, RunSingleFrame
+            // calls Core::SetState(Running) EVERY frame (CPU.cpp:244); dual-core has
+            // no such per-frame reset, and Core::SetState is a no-op here anyway (its
+            // `s_state != Running` guard, Core.cpp:801, never passes in our restructured
+            // boot — Main.cpp:452). Call the underlying resume directly. SetStepping(false)
+            // sets m_state=Running without blocking (the CPU-thread wait is only in the
+            // stepping=true branch, CPU.cpp:341) and re-runs Fifo/audio (idempotent), so
+            // it is safe from this EmuThread and harmless if already Running.
+            Core::System::GetInstance().GetCPU().SetStepping(false);
+        }
+    }
+    g_bem_state_op      = 0;   // clear the CPU-thread gate (loop reads it)
+    g_bem_state_serving = 0;   // let the pump resume
+    g_bem_state_done    = 1;   // signal the polling message handler
 }
 
 }

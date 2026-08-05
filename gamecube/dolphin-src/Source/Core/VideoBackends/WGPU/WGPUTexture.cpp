@@ -267,7 +267,13 @@ WGPUStagingTexture::WGPUStagingTexture(StagingTextureType type, const TextureCon
   m_map_stride = m_texel_size * config.width;
 }
 
-WGPUStagingTexture::~WGPUStagingTexture() = default;
+WGPUStagingTexture::~WGPUStagingTexture()
+{
+  // [wgpu xfb-band 2026-07-31] a still-pending async encode must not touch this
+  // object (or its map buffer) after destruction; its callback owns + frees the ctx.
+  if (m_pending_encode)
+    m_pending_encode->orphaned = true;
+}
 
 void WGPUStagingTexture::CopyFromTexture(const AbstractTexture* src,
                                          const MathUtil::Rectangle<int>& src_rect, u32 src_layer,
@@ -296,6 +302,30 @@ void WGPUStagingTexture::Unmap()
 void WGPUStagingTexture::Flush()
 {
   m_needs_flush = false;
+}
+
+void WGPUStagingTexture::ReadTexels(const MathUtil::Rectangle<int>& rect, void* out_ptr,
+                                    u32 out_stride)
+{
+  // [wgpu xfb-band 2026-07-31] If an async EFB-copy encode targets this staging and has
+  // not landed yet, do NOT copy the map buffer (its bytes are the PREVIOUS copy's, or
+  // zeros on first touch — the guest-XFB green-band class). Record the guest destination
+  // and let the MapAsync callback write guest RAM directly when the encode completes.
+  // Guest RAM keeps the previous frame's bytes in the interim (strictly better than a
+  // stale/zero band). Ownership of the ctx stays with the callback.
+  if (WGPUEfbEncodePending* p = m_pending_encode)
+  {
+    m_pending_encode = nullptr;   // consumed either way
+    if (!p->encode_done)
+    {
+      p->deferred = true;
+      p->def_dst = out_ptr;
+      p->def_stride = out_stride;
+      return;
+    }
+    // encode already landed in the map buffer — fall through to the normal copy
+  }
+  AbstractStagingTexture::ReadTexels(rect, out_ptr, out_stride);
 }
 
 WGPUFramebuffer::WGPUFramebuffer(AbstractTexture* color_attachment,

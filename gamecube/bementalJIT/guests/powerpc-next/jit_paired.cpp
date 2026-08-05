@@ -24,6 +24,23 @@ namespace powerpc {
 
 static constexpr u32 WIMPORT_INTERP = 6;
 
+// [simd-census TEMP PM24 — strip per gate #8] emit-time SIMD-vs-scalar path
+// census. Runs in the COMPILER, not the emitted code — zero runtime cost.
+// Gated on g_bem_lc_base (nonzero only inside the dolphin build with the big
+// SAB; test-harness memories are smaller and must not take absolute stores).
+extern "C" { extern uint32_t g_bem_lc_base; }
+static inline void bem_emit_census(u32 cell) {
+#ifdef __EMSCRIPTEN__
+    if (g_bem_lc_base) {
+        volatile uint32_t* p =
+            reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(cell));
+        *p = *p + 1u;
+    }
+#else
+    (void)cell;
+#endif
+}
+
 static void emit_rc_fallback(WasmModuleBuilder& wb, RegCache& rc,
                              FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     // PS Rc=1 falls back to interp (CR1 update from FPSCR not modeled);
@@ -308,32 +325,35 @@ void emit_ps_sel(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
 // [simd-paired C10] NI (FTZ) subnormal flush on a v128 f32x2 (lanes 0-1), gated
 // at RUNTIME on FPSCR.NI. Mirrors emit_force_single_i64's post-cast stage-3:
 // if NI and the single result is subnormal (|bits| < 0x00800000), flush to
-// signed zero. Inert (if-skipped) when NI=0 — the common IDCT/movie case, so
-// the fast path stays a straight f32x4 op.
+// signed zero.
+// [ni-vec 2026-08-03] NI=1 is the LIVE MP4 configuration ([fpscr] probe:
+// FPSCR=0x4 through boot+movie), so this arm runs on every ps arith op —
+// the old two-lane extract/select/replace ladder (32 ops, SIMD->scalar->SIMD
+// round-trips ON the result dependency chain) is replaced by a whole-vector
+// form (11 ops, stays in v128 domain): mask = (bits & ~sign) <u 0x00800000;
+// result = bitselect(bits & sign, bits, mask). Lanes 2-3 flush too — inert,
+// only lanes 0-1 are ever consumed by the paired emitters.
 static void emit_v128_ni_flush(WasmModuleBuilder& wb, u32 v128_local, u32 ctx_ptr) {
+    // [ni-flush-gate PM60] default off = raw IEEE result (native gets FTZ free
+    // via host MXCSR; wasm can't, so we'd pay this per-op). Stack-neutral: the
+    // flush is an in-place transform on v128_local, nothing on the value stack.
+    if (!g_bem_ni_flush) return;
     wb.op_i32_const((s32)ctx_ptr);
     wb.op_i32_load(ppc_off::FPSCR);
     wb.op_i32_const(4);
     wb.op_i32_and();
     wb.op_if();
-    for (u8 lane = 0; lane < 2; ++lane) {
         wb.op_local_get(v128_local);
-        wb.op_i32x4_extract_lane(lane);
-        wb.op_local_set(LOCAL_FP_T1);            // T1 = f32 bits
-        wb.op_local_get(v128_local);             // v128 for replace_lane
-        wb.op_local_get(LOCAL_FP_T1);
-        wb.op_i32_const((s32)0x80000000);
-        wb.op_i32_and();                         // signed-zero candidate
-        wb.op_local_get(LOCAL_FP_T1);            // keep candidate
-        wb.op_local_get(LOCAL_FP_T1);
-        wb.op_i32_const(0x7FFFFFFF);
-        wb.op_i32_and();
-        wb.op_i32_const(0x00800000);
-        wb.op_i32_lt_u();                        // subnormal?
-        wb.op_select();                          // -> flushed or kept
-        wb.op_i32x4_replace_lane(lane);
+        wb.op_v128_const_i32_splat(0x80000000u);
+        wb.op_v128_and();                        // sign-only (flushed candidate)
+        wb.op_local_get(v128_local);             // keep candidate
+        wb.op_local_get(v128_local);
+        wb.op_v128_const_i32_splat(0x7FFFFFFFu);
+        wb.op_v128_and();                        // |bits|
+        wb.op_v128_const_i32_splat(0x00800000u);
+        wb.op_i32x4_lt_u();                      // per-lane subnormal mask
+        wb.op_v128_bitselect();                  // flushed where subnormal
         wb.op_local_set(v128_local);
-    }
     wb.op_end();
 }
 
@@ -342,6 +362,7 @@ static void emit_v128_ni_flush(WasmModuleBuilder& wb, u32 v128_local, u32 ctx_pt
 static void emit_fprf_single_from_v128(WasmModuleBuilder& wb, u32 v128_local, u32 ctx_ptr,
                                        bool needed = true) {
     if (!needed) return;  // [dead-fprf] analyzer proved FPRF dead downstream
+    if (!g_bem_fprf_enabled) return;  // [fprf-gate PM46] bFPRF half — see jit_fp_helpers.h
     wb.op_local_get(v128_local);
     wb.op_f32x4_extract_lane(0);
     wb.op_i32_reinterpret_f32();
@@ -368,7 +389,10 @@ void emit_ps_binary(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const
     // singles path). Bit-exact for add/sub/mul/div with single inputs: an
     // f32 op == ForceSingle(f64 op) for <=24-bit operands. Force25Bit on frC is
     // a no-op here (input is already single). NI subnormal-flush reproduced.
+    // [simd-census TEMP PM24 — strip per gate #8] emit-time path census
+    // (zero runtime cost): D0=simd-arith D4=scalar-arith D8=simd-fma DC=scalar-fma.
     if (frc.IsSingle(fa) && frc.IsSingle(arg2)) {
+        bem_emit_census(0x026B33D0u);
         auto a = frc.BindSingleRead(fa);
         auto b = frc.BindSingleRead(arg2);
         auto d = frc.BindSingleWrite(fd);
@@ -387,6 +411,7 @@ void emit_ps_binary(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const
         return;
     }
 
+    bem_emit_census(0x026B33D4u);   // [simd-census TEMP] scalar-arith
     auto fa_pair   = frc.Bind(fa,   FPRMode::Read,  FPR_LANE_BOTH);
     auto arg2_pair = frc.Bind(arg2, FPRMode::Read,  FPR_LANE_BOTH);
     auto fd_pair   = frc.Bind(fd,   FPRMode::Write, FPR_LANE_BOTH);
@@ -418,6 +443,7 @@ void emit_ps_binary(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const
     };
     lane(fa_pair.ps0_idx, arg2_pair.ps0_idx, fd_pair.ps0_idx);
     lane(fa_pair.ps1_idx, arg2_pair.ps1_idx, fd_pair.ps1_idx);
+    frc.MarkValueSingle(fd);   // [single-spec v3] ForceSingle'd output
     emit_update_fprf_single(wb, fd_pair.ps0_idx, ctx_ptr, !op.fprf_discardable);  // [C12b] FPRF from ps0
 }
 
@@ -444,6 +470,7 @@ void emit_ps_fma(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
     // Force25Bit on frC is a no-op in the single domain. madd: a*c+b; msub:
     // a*c-b (negate b addend); nmadd/nmsub negate the whole result.
     if (frc.IsSingle(fa) && frc.IsSingle(fb) && frc.IsSingle(fc)) {
+        bem_emit_census(0x026B33D8u);   // [simd-census TEMP] simd-fma
         auto a = frc.BindSingleRead(fa);
         auto b = frc.BindSingleRead(fb);
         auto c = frc.BindSingleRead(fc);
@@ -460,6 +487,7 @@ void emit_ps_fma(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
         return;
     }
 
+    bem_emit_census(0x026B33DCu);   // [simd-census TEMP] scalar-fma
     auto fa_pair = frc.Bind(fa, FPRMode::Read,  FPR_LANE_BOTH);
     auto fb_pair = frc.Bind(fb, FPRMode::Read,  FPR_LANE_BOTH);
     auto fc_pair = frc.Bind(fc, FPRMode::Read,  FPR_LANE_BOTH);
@@ -469,6 +497,7 @@ void emit_ps_fma(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
                          fd_pair.ps0_idx, subtract, negate, ctx_ptr);
     emit_single_fma_lane(wb, fa_pair.ps1_idx, fc_pair.ps1_idx, fb_pair.ps1_idx,
                          fd_pair.ps1_idx, subtract, negate, ctx_ptr);
+    frc.MarkValueSingle(fd);   // [single-spec v3] ForceSingle'd output
     emit_update_fprf_single(wb, fd_pair.ps0_idx, ctx_ptr, !op.fprf_discardable);  // [C12b] FPRF from ps0
 }
 
@@ -515,8 +544,14 @@ void emit_ps_sum(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
         emit_copy_c(fc_pair.ps1_idx, fd_pair.ps1_idx);
         emit_update_fprf_single(wb, fd_pair.ps0_idx, ctx_ptr, !op.fprf_discardable);  // [C12b] ps0
     } else {  // ps_sum1 (sub5 == 11)
-        emit_copy_c(fc_pair.ps0_idx, fd_pair.ps0_idx);
+        // [2026-07-31 audit] sum FIRST: with FD==FA, fd.ps0 and fa.ps0 are the
+        // SAME wasm local (fpr_reg_cache ps0_local_idx = m_local_base + preg),
+        // so copy-before-sum clobbered a.ps0 and computed c.ps0+b.ps1 (the
+        // interpreter reads all inputs before SetBoth). Sum writes only fd.ps1
+        // — it can never clobber fc.ps0 (distinct lane locals), so this order
+        // is alias-safe for every FD/FA/FB/FC overlap.
         emit_sum(fd_pair.ps1_idx);
+        emit_copy_c(fc_pair.ps0_idx, fd_pair.ps0_idx);
         emit_update_fprf_single(wb, fd_pair.ps1_idx, ctx_ptr, !op.fprf_discardable);  // [C12b] ps1
     }
 }

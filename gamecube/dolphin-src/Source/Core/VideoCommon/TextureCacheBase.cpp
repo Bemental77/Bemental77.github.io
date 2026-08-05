@@ -1832,6 +1832,7 @@ RcTcacheEntry TextureCacheBase::GetXFBTexture(u32 address, u32 width, u32 height
   // Compute total texture size. XFB textures aren't tiled, so this is simple.
   const u32 total_size = height * stride;
 
+
   auto& system = Core::System::GetInstance();
   auto& memory = system.GetMemory();
   const u8* src_data = memory.GetPointerForRange(address, total_size);
@@ -2248,6 +2249,7 @@ void TextureCacheBase::CopyRenderTargetToTexture(
 
   const u32 bytes_per_row = num_blocks_x * bytes_per_block;
   const u32 covered_range = num_blocks_y * dstStride;
+
 
   auto& system = Core::System::GetInstance();
   auto& memory = system.GetMemory();

@@ -88,6 +88,80 @@ void emit_fabsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Cod
     wb.op_local_set(fd_pair.ps0_idx);
 }
 
+// fcmpu (op63 sub 0) / fcmpo (op63 sub 32) — scalar FP compare, NATIVE.
+// [PM62 2026-08-05] Board profile: fcmpu 21.2M + fcmpo 15.1M interp fallbacks
+// (36M, the dominant EmuThread interpreter cost on the MP4 3D board). Ported
+// from the proven gekko emit_fcmpu_impl, RE-ENCODED to the powerpc-next packed
+// CR scheme (cr_encode.cpp): u64 @ ppc_off::cr(crfd),
+//   hi32 = 1 | (fu<<27) | (lt<<30) | (not_gt<<31),  lo32 = (ne ? 1 : 0)
+// decoded as LT=bit30, GT=!bit31, EQ=(lo32==0), SO=bit27. bit27 here is the FP
+// UNORDERED bit (either operand NaN), NOT XER.SO — so emit_cr_from_*_pair (which
+// hardcodes XER.SO in bit27) can't be reused. not_gt = !(fa>fb) is true for
+// LT/EQ/unordered and false only for GT, matching the integer decode's rule that
+// EQ have not_gt=1. WASM f64 compares return 0 on NaN, so lt/gt/ne fall out
+// correctly for the unordered case. fcmpo differs only in FPSCR VXVC / SNaN
+// exception raising, which we skip (FP exceptions run masked, like native) —
+// identical impl. FPSCR FX/VXSNAN/FPCC skipped (games read the CR field).
+void emit_fcmpu(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+                const CodeOp& op, u32 ctx_ptr) {
+    const u32 crfd = GekkoOperands::CRFD(op.inst);
+    if (op.crDiscardable[crfd]) return;               // CR field dead — skip
+    const u32 fa = GekkoOperands::FA(op.inst);
+    const u32 fb = GekkoOperands::FB(op.inst);
+    auto fa_pair = frc.Bind(fa, FPRMode::Read, FPR_LANE_PS0);
+    auto fb_pair = frc.Bind(fb, FPRMode::Read, FPR_LANE_PS0);
+    const u32 A = fa_pair.ps0_idx, B = fb_pair.ps0_idx;
+    auto push_fa = [&] { wb.op_local_get(A); wb.op_f64_reinterpret_i64(); };
+    auto push_fb = [&] { wb.op_local_get(B); wb.op_f64_reinterpret_i64(); };
+
+    wb.op_i32_const((s32)ctx_ptr);                    // i64.store address
+
+    // ---- hi32 ----
+    wb.op_i32_const(1);                               // bit0 marker (u64 bit 32)
+    push_fa(); push_fa(); wb.op_f64_ne();             // is_nan = (fa!=fa)|(fb!=fb)
+    push_fb(); push_fb(); wb.op_f64_ne();
+    wb.op_i32_or();
+    wb.op_i32_const(27); wb.op_i32_shl(); wb.op_i32_or();   // | fu<<27
+    push_fa(); push_fb(); wb.op_f64_lt();             // lt = fa<fb
+    wb.op_i32_const(30); wb.op_i32_shl(); wb.op_i32_or();   // | lt<<30
+    push_fa(); push_fb(); wb.op_f64_gt(); wb.op_i32_eqz();  // not_gt = !(fa>fb)
+    wb.op_i32_const(31); wb.op_i32_shl(); wb.op_i32_or();   // | not_gt<<31
+    wb.op_i64_extend_i32_u(); wb.op_i64_const(32); wb.op_i64_shl();  // hi32 << 32
+
+    // ---- lo32 = (ne ? 1 : 0) : 0 only on true EQ ----
+    push_fa(); push_fb(); wb.op_f64_ne();
+    wb.op_i64_extend_i32_u(); wb.op_i64_or();
+
+    wb.op_i64_store(ppc_off::cr(crfd));
+}
+
+// fsel (op63 A-form sub5 23) — frD = (ps0(frA) >= 0.0) ? ps0(frC) : ps0(frB).
+// [PM62] board: 3.3M interp fallbacks. Branchless FP select. PPC semantics:
+// -0.0 >= 0.0 is TRUE (→frC), NaN >= 0.0 is FALSE (→frB) — WASM f64.ge matches
+// both. Operates on the raw i64 ps0 patterns via wasm `select` (numeric-typed),
+// so no reinterpret round-trip on the selected value (bit-exact). fsel. (Rc=1)
+// updates CR1 from FPSCR — rare, kept on the interp path.
+void emit_fsel(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+               const CodeOp& op, u32 ctx_ptr) {
+    if (GekkoOperands::Rc(op.inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
+    const u32 fd = GekkoOperands::FD(op.inst);
+    const u32 fa = GekkoOperands::FA(op.inst);
+    const u32 fb = GekkoOperands::FB(op.inst);
+    const u32 fc = GekkoOperands::FC(op.inst);
+    auto fa_pair = frc.Bind(fa, FPRMode::Read,  FPR_LANE_PS0);
+    auto fb_pair = frc.Bind(fb, FPRMode::Read,  FPR_LANE_PS0);
+    auto fc_pair = frc.Bind(fc, FPRMode::Read,  FPR_LANE_PS0);
+    auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_PS0);
+    // select(fc, fb, cond) : cond!=0 ? fc : fb ; cond = ps0(fa) >= 0.0
+    wb.op_local_get(fc_pair.ps0_idx);          // true value  (i64)
+    wb.op_local_get(fb_pair.ps0_idx);          // false value (i64)
+    wb.op_local_get(fa_pair.ps0_idx); wb.op_f64_reinterpret_i64();
+    wb.op_f64_const(0.0);
+    wb.op_f64_ge();                            // cond (0 for <0 or NaN)
+    wb.op_select();
+    wb.op_local_set(fd_pair.ps0_idx);
+}
+
 // fnabs fD, fB — ps0(fD) = -|ps0(fB)|. abs then neg.
 void emit_fnabsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     if (GekkoOperands::Rc(op.inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }

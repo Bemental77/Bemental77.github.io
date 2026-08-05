@@ -69,7 +69,8 @@ std::vector<u8> build_block_next(u32 start_pc,
                                  u32 ctx_ptr,
                                  u32 mem1_base, u32 mem1_mask, u32 ram_size,
                                  u32* out_cycles = nullptr,
-                                 bool* out_is_idle_loop = nullptr);
+                                 bool* out_is_idle_loop = nullptr,
+                                 const u32* instr_pcs = nullptr);   // [FUSION v2] exact per-op pcs
 
 // Compile-time HLE-hook query. Set by the host integrator (JitWasm) to
 // HLE::GetHookByAddress != 0. When set, build_block_next skips the per-op
@@ -121,7 +122,8 @@ std::vector<u8> emit_block_body_next(u32 start_pc, const u32* insts, u32 count,
                                      const void* lookup_user,
                                      bool emit_hle_check = true,
                                      bool emit_perf_stub = false,
-                                     bool emit_hle_check_native = false);
+                                     bool emit_hle_check_native = false,
+                                     s32 region_gen_idx = -1);
 
 std::vector<u8> build_region_module_next(const u8* concatenated_bodies,
                                          std::size_t concatenated_size,

@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <title>GameCube Wasm — Sonic Adventure 2 Battle</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
-  <link rel="icon" href=",">
+  <link rel="icon" href="data:,">
   <script src="/coi-serviceworker.js"></script>
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -354,6 +354,15 @@
 
     // Spawn dolphin (its main pthread inherits sharedMemory via
     // Module.wasmMemory which was set in the page Module above).
+    // [build-stamp PM48c] prove build freshness in the console on every load:
+    // Last-Modified + size of the wasm actually being served. The whole load
+    // chain is Date.now()-cache-busted (worker/emcc.js/locateFile), so this
+    // stamp IS the build the session runs.
+    fetch('/gamecube/dolphin_libretro/dolphin_worker_emcc.wasm', { method: 'HEAD' })
+      .then(function (r) {
+        pageLog('[build] dolphin_worker_emcc.wasm — ' + (r.headers.get('Last-Modified') || '?')
+          + ' — ' + (r.headers.get('Content-Length') || '?') + ' bytes');
+      }).catch(function () {});
     dolphin_worker = new Worker('/gamecube/dolphin_libretro/dolphin_worker.js?v=' + Date.now());
     dolphin_worker.onmessage = onWorkerMsg;
     window.dolphin_worker = dolphin_worker;
@@ -1836,7 +1845,11 @@
           var _d34 = _rdm(0x1e6d34), _af4 = _rdm(0x1e6af4);
           if (_d34 !== window._d34Last || _af4 !== window._af4Last) {
             window._d34Last = _d34; window._af4Last = _af4;
-            if ((window._csN = (window._csN | 0) + 1) <= 60)
+            // [PM49 2026-08-03 SILENCED] this monitor predates the XFB analysis:
+            // 0x801e6d34 is INSIDE the second XFB buffer (0x801e6c00+0x134) — the
+            // "CRASH" values are just video memory changing. Kept the read (cheap,
+            // may matter for a future investigation), killed the misleading print.
+            if (false && (window._csN = (window._csN | 0) + 1) <= 60)
               console.log('[crash-slot-direct] MEM1[0x801e6d34/CRASH]=0x' + _d34.toString(16)
                 + ' MEM1[0x801e6af4/worker]=0x' + _af4.toString(16)
                 + ' (mem1base=0x' + _mem1b.toString(16) + ')');
@@ -2867,8 +2880,12 @@
         }
         // [takeover-gate-diag] also sample the gate inputs every ~3s so we see them
         // EVOLVE, not just the 60s snapshot (the stuck input may only settle late).
+        // [PM49 2026-08-03 SILENCED] the takeover this gate served was RETIRED
+        // 2026-07-21 ("NO takeover under real dual-core" — dolphin's CPU thread
+        // owns the guest); READY=false is BY DESIGN now. The recurring print
+        // read as a standing failure signal in the console — it is not one.
         if (!window._bdGateDiagN) window._bdGateDiagN = 0;
-        if ((window._bdGateDiagN++ % 100) === 0) {
+        if (false && (window._bdGateDiagN++ % 100) === 0) {
           console.log('[gate-diag] t~' + (elapsed/1000).toFixed(0) + 's framesNow=' + _framesNow
             + ' eeOn=' + _eeOn + ' cxR=0x' + _cxR.toString(16) + ' rendered=' + rendered
             + ' mem1=' + !!window._ppcMem1Wired + ' routing=' + !!window._ppcDolphinRoutingReady
@@ -3098,6 +3115,60 @@
     GPU.device.queue.submit([enc.finish()]);
   }
   var canvasCtx2D = null, canvasImg2D = null;
+  // [sab-present PM28] WGPU frames arrive via the SHARED HEAP, not postMessage
+  // (MAIN_THREAD_EM_ASM from the gpu_thread never delivers — its proxy queue
+  // starves; forensic counters showed the full readback chain running with zero
+  // frames reaching the page). Cells: 0x026B3510 = pixels ptr, 0x026B3514 =
+  // (w<<16)|h, 0x026B3518 = frame seq. A 16ms poll paints on seq change; once
+  // active, the video_cb 'render' messages (the SW buffer — zeros under WGPU)
+  // are ignored so they can't paint black over real frames.
+  var _sabPresentSeq = 0, _sabPresentActive = false, _sabFrames = 0, _sabFpsT = 0;
+  setInterval(function () {
+    try {
+      if (!sharedMemory) return;
+      var A = new Uint32Array(sharedMemory.buffer);
+      var seq = A[0x026B3518 >> 2] >>> 0;
+      if (seq === _sabPresentSeq) return;
+      _sabPresentSeq = seq;
+      var ptr = A[0x026B3510 >> 2] >>> 0;
+      var dims = A[0x026B3514 >> 2] >>> 0;
+      var w = dims >>> 16, h = dims & 0xFFFF;
+      if (!ptr || !w || !h) return;
+      var c = $('canvas');
+      if (c.width !== w) c.width = w;
+      if (c.height !== h) c.height = h;
+      if (!canvasCtx2D) canvasCtx2D = c.getContext('2d');
+      if (!canvasImg2D || canvasImg2D.width !== w || canvasImg2D.height !== h) {
+        canvasImg2D = canvasCtx2D.createImageData(w, h);
+      }
+      // ImageData rejects SharedArrayBuffer views — copy into its backing store.
+      canvasImg2D.data.set(new Uint8Array(sharedMemory.buffer, ptr, w * h * 4));
+      // [takeover-unblock PM49 2026-08-03] the takeover gate's `rendered` input
+      // reads window._firstFrame, which only the LEGACY postMessage 'render'
+      // handler set — dead since the sab-present migration (PM28), leaving
+      // READY=false forever (the standing [gate-diag] console signal). The
+      // sab-present path IS the first-frame source now.
+      if (!window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame (sab-present) ' + w + 'x' + h); }
+      // Force opaque alpha (readback alpha is undefined for the EFB).
+      var d = canvasImg2D.data;
+      for (var i = 3; i < d.length; i += 4) d[i] = 255;
+      canvasCtx2D.putImageData(canvasImg2D, 0, 0);
+      if (!_sabPresentActive) {
+        _sabPresentActive = true;
+        pageLog('[sab-present] WGPU shared-heap present ACTIVE ' + w + 'x' + h);
+      }
+      _sabFrames++;
+      var now = performance.now();
+      if (now - _sabFpsT > 1000) {
+        if (_sabFpsT > 0) {
+          var f = _sabFrames * 1000 / (now - _sabFpsT);
+          fpsEl.textContent = 'FPS: ' + f.toFixed(1);
+          console.log('[fps] ' + f.toFixed(2) + ' @t=' + (now / 1000).toFixed(0) + 's (sab-present)');
+        }
+        _sabFrames = 0; _sabFpsT = now;
+      }
+    } catch (e) { /* transient during boot */ }
+  }, 16);
   function paintFrame2D(pixels, w, h, pitch) {
     var c = $('canvas');
     if (!canvasCtx2D) canvasCtx2D = c.getContext('2d');
@@ -3336,7 +3407,7 @@
     switch (data.cmd) {
       case 'print': pageLog('> ' + data.txt); break;
       case 'setStatus': setStatus(data.txt); break;
-      case 'render': { if (data.pixels) paintFrame(data.pixels, data.w, data.h, data.pitch); if (data.h > 0 && !window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame received w:' + data.w + ' h:' + data.h); } renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { var _fps = (renderFrames * 1000 / (now - lastFpsLog)); fpsEl.textContent = 'FPS: ' + _fps.toFixed(1); console.log('[fps] ' + _fps.toFixed(2) + ' @t=' + (now / 1000).toFixed(0) + 's totalFrames=' + (window._totalRenderFrames = (window._totalRenderFrames || 0) + renderFrames)); renderFrames = 0; lastFpsLog = now; } break; }
+      case 'render': { if (data.pixels && !_sabPresentActive) paintFrame(data.pixels, data.w, data.h, data.pitch); if (data.h > 0 && !window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame received w:' + data.w + ' h:' + data.h); } renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { var _fps = (renderFrames * 1000 / (now - lastFpsLog)); fpsEl.textContent = 'FPS: ' + _fps.toFixed(1); console.log('[fps] ' + _fps.toFixed(2) + ' @t=' + (now / 1000).toFixed(0) + 's totalFrames=' + (window._totalRenderFrames = (window._totalRenderFrames || 0) + renderFrames)); renderFrames = 0; lastFpsLog = now; } break; }
       case 'audioRate': {
         // [audio rate 2026-07-17] The worker reports the core's real output sample rate (retro
         // av_info). Record it and init the worklet NOW — the Start-button click already gave the
@@ -3354,17 +3425,21 @@
         // [audio-diag 2026-07-13] User reports NO SOUND (task #6). Log the delivery chain:
         // arrival rate from the worker + which sink is live + AudioContext state (a
         // 'suspended' ctx is the classic silent-audio cause). ~1 line per 5s.
-        window._audN = (window._audN | 0) + (data.len | 0);
+        // [audio-diag units FIX PM38 2026-07-24] data.len is BYTES (frames*4,
+        // EmscriptenWorker.cpp audio_sample_batch_cb) — the old accumulator counted
+        // bytes as samples, printing a phantom "69121 samples/s vs 32000" (4x
+        // inflated). Count FRAMES and compare against the ~48kHz output rate.
+        window._audN = (window._audN | 0) + ((data.len | 0) >> 2);
         var _anow = performance.now();
         if (!window._audT0) { window._audT0 = _anow;
-          console.log('[audio-diag] FIRST audio msg: len=' + data.len + ' muted=' + audioMuted
+          console.log('[audio-diag] FIRST audio msg: bytes=' + data.len + ' muted=' + audioMuted
             + ' sink=' + (window._gcAudioPushSamples ? 'worklet' : (Module._feedAudio ? 'legacy' : 'NONE')));
         }
         if (_anow - (window._audLog || 0) > 5000) {
           window._audLog = _anow;
           var _actx = getAudioCtx();
           console.log('[audio-diag] ' + ((window._audN * 1000) / (_anow - window._audT0)).toFixed(0)
-            + ' samples/s (native 32000) muted=' + audioMuted
+            + ' frames/s (output ~48000; <48000 = core below real-time) muted=' + audioMuted
             + ' sink=' + (window._gcAudioPushSamples ? 'worklet' : (Module._feedAudio ? 'legacy' : 'NONE'))
             + ' ctx=' + (_actx ? _actx.state : 'null'));
         }
@@ -3661,6 +3736,9 @@
   window.__probeSaveState = async function () { await saveState(); return true; };
   window.__probeLoadState = async function () { await loadState(); return true; };
   window.__probeHasState = async function () { try { var s = await idbGet(SAVE_KEY); return !!s; } catch (e) { return false; } };
+  // Headless-probe hook: return the gzipped save-state bytes (from IndexedDB) as a
+  // plain Array so node can persist them to a portable .gz for PROBE_LOAD_STATE.
+  window.__probeGetStateGz = async function () { var s = await idbGet(SAVE_KEY); if (!s) return null; var u8 = s instanceof Uint8Array ? s : new Uint8Array(s); return Array.from(u8); };
   // Headless-driver export: return the gzipped IndexedDB state blob as base64
   // (so the node harness can write it to a file via exposeFunction). Save first.
   window.__probeExportGzB64 = async function () { try { var stored = await idbGet(SAVE_KEY); if (!stored) return ''; var u8 = stored instanceof Uint8Array ? stored : new Uint8Array(stored); var bin = ''; for (var i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]); return btoa(bin); } catch (e) { return ''; } };

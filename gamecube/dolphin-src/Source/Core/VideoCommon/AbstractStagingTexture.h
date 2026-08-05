@@ -70,7 +70,10 @@ public:
   // Reads the specified rectangle from the staging texture to out_ptr, with the specified stride
   // (length in bytes of each row). CopyFromTexture must be called first. The contents of any
   // texels outside of the rectangle used for CopyFromTexture is undefined.
-  void ReadTexels(const MathUtil::Rectangle<int>& rect, void* out_ptr, u32 out_stride);
+  // [wgpu xfb-band 2026-07-31] virtual: the WGPU backend's EFB-copy encodes land via a
+  // non-blocking MapAsync callback (ASYNCIFY forbids a blocking pump), so its staging read
+  // must DEFER the guest-RAM write to that callback instead of copying stale bytes.
+  virtual void ReadTexels(const MathUtil::Rectangle<int>& rect, void* out_ptr, u32 out_stride);
   void ReadTexel(u32 x, u32 y, void* out_ptr);
 
   // Copies the texels from in_ptr to the staging texture, which can be read by the GPU, with the

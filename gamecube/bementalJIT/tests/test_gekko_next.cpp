@@ -79,6 +79,23 @@ static u32 enc_cmpi_cr0(u32 ra, s32 simm) {
          | ((u32)(s32)(s16)simm & 0xFFFFu);
 }
 
+// cmpli crfD, L, ra, uimm  (op 10; here L=0, crfD=0) — unsigned immediate compare
+static u32 enc_cmpli_cr0(u32 ra, u32 uimm) {
+    return (10u << 26) | (0u << 23) | (0u << 21) | ((ra & 0x1F) << 16)
+         | (uimm & 0xFFFFu);
+}
+
+// cmp crfD, L, ra, rb  (op 31, sub-op 0; L=0, crfD=0) — signed register compare
+static u32 enc_cmp_cr0(u32 ra, u32 rb) {
+    return (31u << 26) | ((ra & 0x1F) << 16) | ((rb & 0x1F) << 11) | (0u << 1);
+}
+
+// cmpl crfD, L, ra, rb  (op 31, sub-op 32; L=0, crfD=0) — unsigned register compare
+// (verified against MP4 retail 0x7C1E0040 = cmplw cr0,r30,r0)
+static u32 enc_cmpl_cr0(u32 ra, u32 rb) {
+    return (31u << 26) | ((ra & 0x1F) << 16) | ((rb & 0x1F) << 11) | (32u << 1);
+}
+
 // b  target_pc  (op 18; encodes signed 26-bit displacement, AA=0, LK=lk)
 static u32 enc_b(u32 cur_pc, u32 target_pc, bool lk) {
     s32 disp = (s32)target_pc - (s32)cur_pc;
@@ -246,6 +263,21 @@ struct TestEnv {
         (void)instr_pcs;  // build_block_next derives per-op PCs internally
         std::vector<u8> bytes = build_block_next(start_pc, insts, count, ctx_ptr,
                                                  mem1_base, mem1_mask, ram_size);
+        int handle = cache.compile(start_pc, bytes.data(), bytes.size());
+        if (handle < 0) return false;
+        s32 next_pc = -1;
+        if (!cache.dispatch(start_pc, &next_pc)) return false;
+        if (out_next_pc) *out_next_pc = next_pc;
+        return true;
+    }
+
+    // [FUSION v2] dispatch a PRE-FUSED stream with explicit per-op pcs
+    // (non-contiguous at seams) — exercises AnalyzeOps + seam emission.
+    bool dispatch_fused(u32 start_pc, const u32* insts, const u32* pcs,
+                        u32 count, s32* out_next_pc) {
+        std::vector<u8> bytes = build_block_next(start_pc, insts, count,
+                                                 ctx_ptr, 0, 0, 0,
+                                                 nullptr, nullptr, pcs);
         int handle = cache.compile(start_pc, bytes.data(), bytes.size());
         if (handle < 0) return false;
         s32 next_pc = -1;
@@ -1657,6 +1689,51 @@ static bool test_frsp_fill_both() {
     return ps0 == 0x3FF0000000000000ull && ps1 == 0x3FF0000000000000ull;
 }
 
+// ps_sum1 f4,f1,f2,f3 — control (FD distinct from all inputs).
+// Reference (Interpreter_Paired.cpp ps_sum1): ps0 = ForceSingle(c.ps0);
+// ps1 = ForceSingle(a.ps0 + b.ps1). a=f1.ps0=3.0, b=f3.ps1=5.0, c=f2.ps0=7.0
+// -> f4 = (7.0, 8.0). Off-lanes are junk to prove they're unread.
+static bool test_ps_sum1_basic() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);                                   // MSR.FP + HID2.PSE|LSQE
+    set_ps(env, 1, dbits(3.0), dbits(9.0));                // a (ps1 junk)
+    set_ps(env, 2, dbits(7.0), dbits(11.0));               // c (ps1 junk)
+    set_ps(env, 3, dbits(13.0), dbits(5.0));               // b (ps0 junk)
+    set_ps(env, 4, FP_SENTINEL, FP_SENTINEL);
+    const u32 insts[] = { 0x10811896u };       // ps_sum1 f4,f1,f2,f3 (op4 xo5=11)
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = get_ps0(env, 4), ps1 = get_ps1(env, 4);
+    std::printf("[diag ps_sum1] ps0=0x%016llx (exp 401C..=7.0) ps1=0x%016llx (exp 4020..=8.0)\n",
+                (unsigned long long)ps0, (unsigned long long)ps1);
+    return ps0 == dbits(7.0) && ps1 == dbits(8.0);
+}
+
+// ps_sum1 f1,f1,f2,f3 — FD ALIASES FA (2026-07-31 audit finding). The copy
+// lane (fd.ps0 <- ForceSingle(c.ps0)) must NOT clobber a.ps0 before the sum
+// lane reads it: expected ps1 = ForceSingle(a.ps0_old + b.ps1) = 3.0+5.0 =
+// 8.0. The copy-before-sum emit order computed 7.0+5.0 = 12.0 (fd.ps0 and
+// fa.ps0 are the same wasm local when FD==FA — fpr_reg_cache ps0_local_idx
+// = m_local_base + preg).
+static bool test_ps_sum1_fd_aliases_fa() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);                                   // MSR.FP + HID2.PSE|LSQE
+    set_ps(env, 1, dbits(3.0), dbits(9.0));                // a AND d (ps1 junk)
+    set_ps(env, 2, dbits(7.0), dbits(11.0));               // c (ps1 junk)
+    set_ps(env, 3, dbits(13.0), dbits(5.0));               // b (ps0 junk)
+    const u32 insts[] = { 0x10211896u };       // ps_sum1 f1,f1,f2,f3
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = get_ps0(env, 1), ps1 = get_ps1(env, 1);
+    std::printf("[diag ps_sum1-alias] ps0=0x%016llx (exp 401C..=7.0) ps1=0x%016llx (exp 4020..=8.0; buggy 4028..=12.0)\n",
+                (unsigned long long)ps0, (unsigned long long)ps1);
+    return ps0 == dbits(7.0) && ps1 == dbits(8.0);
+}
+
 // fctiwz f14,f14 (0xFDC0701E — the exact encoding in PSO HandleReverb's
 // inner loop at 0x803bf1bc, the loop's LAST interp fallback).
 // Reference: Interpreter ConvertToInteger (TowardsZero): value =
@@ -1955,7 +2032,662 @@ static bool test_reloc_wasm_dump() {
     return true;
 }
 
+extern "C" { extern uint32_t g_bem_lc_base; }
+
+// ---- [single-spec v9 dual-arm] SINGLES-ARM execution coverage ----
+// The dual-arm emitter (ppc_emit.cpp PM44) emits ps blocks twice; the
+// singles arm executes only when g_bem_lc_base != 0 AND the shadow-mask
+// guard passes at entry. The standard suite runs with lc_base=0 (Double
+// arm only), so these cases force the singles arm: lc_base set, hook
+// query installed, mask all-ones, all FPR inputs exact widened singles.
+struct SinglesArmEnv {
+    u32 saved_lc;
+    bemental::powerpc::HleHookQueryFn saved_query;
+    u32 saved_mask;
+    volatile u32* mask_cell =
+        reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B33E0u));
+    SinglesArmEnv() {
+        saved_lc = g_bem_lc_base;
+        g_bem_lc_base = 0x03000000u;
+        saved_query = bemental::powerpc::g_hle_hook_query;
+        bemental::powerpc::g_hle_hook_query = [](u32) -> bool { return false; };
+        saved_mask = *mask_cell;
+        *mask_cell = 0xFFFFFFFFu;
+    }
+    ~SinglesArmEnv() {
+        *mask_cell = saved_mask;
+        g_bem_lc_base = saved_lc;
+        bemental::powerpc::g_hle_hook_query = saved_query;
+    }
+};
+
+// S1: psq_l f1 (float pair) ; ps_add f2,f1,f1 ; psq_st f2 (float pair).
+// f1=(1.0f,2.0f) loaded, f2=(2.0,4.0) stored -> writes 0x40000000,0x40800000.
+// The ps_add makes the block dual-arm; mask all-ones -> singles arm runs.
+static bool test_singles_arm_psq_chain() {
+    TestEnv env;
+    if (!env.init()) return false;
+    SinglesArmEnv sa;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);
+    env.spr(912) = 0;
+    env.gpr(3) = 0x80100000u;
+    env.gpr(4) = 0x80200000u;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_reads = [];
+        Module.test_writes = [];
+        Module.bemental_imports.env.ppc_read32 = function(addr) {
+            addr = addr >>> 0;
+            if (addr === 0x80100008) return 0x3F800000 | 0;  // 1.0f
+            if (addr === 0x8010000C) return 0x40000000 | 0;  // 2.0f
+            return 0;
+        };
+        Module.bemental_imports.env.ppc_write32 = function(addr, val) {
+            Module.test_writes.push([addr >>> 0, val >>> 0]);
+        };
+    });
+#endif
+    const u32 insts[] = {
+        0xE0230008u,   // psq_l  f1, 8(r3), W=0, I=0
+        0x1041082Au,   // ps_add f2, f1, f1
+        0xF0440010u,   // psq_st f2, 16(r4), W=0, I=0
+    };
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, 3, &next_pc);
+#ifdef __EMSCRIPTEN__
+    const u32 nw = (u32)EM_ASM_INT({ return Module.test_writes.length | 0; });
+    const u32 w0a = (u32)EM_ASM_INT({ return (Module.test_writes[0]||[0,0])[0] | 0; });
+    const u32 w0v = (u32)EM_ASM_INT({ return (Module.test_writes[0]||[0,0])[1] | 0; });
+    const u32 w1a = (u32)EM_ASM_INT({ return (Module.test_writes[1]||[0,0])[0] | 0; });
+    const u32 w1v = (u32)EM_ASM_INT({ return (Module.test_writes[1]||[0,0])[1] | 0; });
+    EM_ASM({
+        Module.bemental_imports.env.ppc_read32 = function(addr) { return 0; };
+        Module.bemental_imports.env.ppc_write32 = function(addr, val) {};
+    });
+#else
+    const u32 nw = 0, w0a = 0, w0v = 0, w1a = 0, w1v = 0;
+#endif
+    if (!dispatched) return false;
+    const u64 ps0 = get_ps0(env, 2), ps1 = get_ps1(env, 2);
+    std::printf("[diag singles-chain] f2=(%016llx,%016llx exp 4000..,4010..) writes n=%u "
+                "[0]=%08x:%08x [1]=%08x:%08x (exp 80200010:40000000 80200014:40800000)\n",
+                (unsigned long long)ps0, (unsigned long long)ps1,
+                nw, w0a, w0v, w1a, w1v);
+    return ps0 == dbits(2.0) && ps1 == dbits(4.0) &&
+           nw == 2 && w0a == 0x80200010u && w0v == 0x40000000u &&
+           w1a == 0x80200014u && w1v == 0x40800000u;
+}
+
+// S2: ps_mr f2,f1 ; stfs f2,0(r4) with f1 an assumed widened single (3.5).
+// The PM37 black-canvas class ran through stfs-of-Single — verify the
+// stored f32 bits are exact under the singles arm.
+static bool test_singles_arm_stfs() {
+    TestEnv env;
+    if (!env.init()) return false;
+    SinglesArmEnv sa;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);
+    env.gpr(4) = 0x80200000u;
+    set_ps(env, 1, dbits(3.5), dbits(9.0));
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        Module.test_writes = [];
+        Module.bemental_imports.env.ppc_write32 = function(addr, val) {
+            Module.test_writes.push([addr >>> 0, val >>> 0]);
+        };
+    });
+#endif
+    const u32 insts[] = {
+        0x10400890u,   // ps_mr f2, f1   (op4 sub10=72)
+        0xD0440000u,   // stfs  f2, 0(r4)
+    };
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, 2, &next_pc);
+#ifdef __EMSCRIPTEN__
+    const u32 nw = (u32)EM_ASM_INT({ return Module.test_writes.length | 0; });
+    const u32 wa = (u32)EM_ASM_INT({ return (Module.test_writes[0]||[0,0])[0] | 0; });
+    const u32 wv = (u32)EM_ASM_INT({ return (Module.test_writes[0]||[0,0])[1] | 0; });
+    EM_ASM({ Module.bemental_imports.env.ppc_write32 = function(addr, val) {}; });
+#else
+    const u32 nw = 0, wa = 0, wv = 0;
+#endif
+    if (!dispatched) return false;
+    std::printf("[diag singles-stfs] writes n=%u [0]=%08x:%08x (exp 80200000:40600000)\n",
+                nw, wa, wv);
+    return nw == 1 && wa == 0x80200000u && wv == 0x40600000u;
+}
+
+// S3: the ps_sum1 FD==FA alias case under the singles arm (inputs exact
+// singles, mask all-ones) — the SIMD-path variant of the PM43 fix.
+static bool test_singles_arm_ps_sum1_alias() {
+    TestEnv env;
+    if (!env.init()) return false;
+    SinglesArmEnv sa;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);
+    set_ps(env, 1, dbits(3.0), dbits(9.0));
+    set_ps(env, 2, dbits(7.0), dbits(11.0));
+    set_ps(env, 3, dbits(13.0), dbits(5.0));
+    const u32 insts[] = { 0x10211896u };       // ps_sum1 f1,f1,f2,f3
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = get_ps0(env, 1), ps1 = get_ps1(env, 1);
+    std::printf("[diag singles-sum1] ps0=%016llx (exp 401C..) ps1=%016llx (exp 4020..)\n",
+                (unsigned long long)ps0, (unsigned long long)ps1);
+    return ps0 == dbits(7.0) && ps1 == dbits(8.0);
+}
+
+// Dump-only "test": the exact __THPDecompressiMCURowNxN hot bdnz loop
+// (0x800df2a4-0x800df378, disassembled 2026-07-31 from the byte-identical
+// GMPE01_01 decomp ISO — the MEASURED ~20x-native 60fps limiter, oracle
+// PM39/PM43+). 53 instrs: 8x psq_l GQR0-float(r9 workspace), 34x ps arith
+// (add/sub butterflies, mul, madd/msub vs f27-f30 constants), 8x psq_st
+// GQR6 U8-quantized (LC pixel rows), 5x int, bdnz self-loop. Emitted under
+// production-equivalent config: fastmem armed, live GQR values (probe
+// 2026-07-31: GQR6=0x3d043d04), g_bem_lc_base set, single-spec shadow mask
+// = stable-half all-single. Dump feeds wasm-dis for per-guest-op cost
+// attribution (the ps-emit campaign's measuring instrument).
+extern "C" { extern uint32_t g_bem_lc_base; }
+static bool test_idct_wasm_dump() {
+    TestEnv env;
+    if (!env.init()) return false;
+    psq_env_common(env);
+    env.spr(912) = 0;                          // GQR0: float ld
+    env.spr(918) = 0x3d043d04u;                // GQR6: live MP4 value (U8 st)
+    static const u32 idct[] = {
+        0xe1690020u, 0x104246f8u, 0xe1490060u, 0x11894028u, 0x1023102au,
+        0xe12900a0u, 0x11a31028u, 0xe10900e0u, 0x1069502au, 0x11295028u,
+        0x39290008u, 0x104b402au, 0x116b4028u, 0xe0e90000u, 0x1102182au,
+        0x11421828u, 0x1069582au, 0xe0c90080u, 0x1044402au, 0x10630732u,
+        0xe0a90040u, 0x10044028u, 0x11291fbau, 0xe08900c0u, 0x11294028u,
+        0x38e70002u, 0xf0456000u, 0x116b1f78u, 0x1041482au, 0x114a4ef8u,
+        0x10214828u, 0xf0456008u, 0x106d502au, 0x116b502au, 0xf0656010u,
+        0x38c60002u, 0x104c5828u, 0x106c582au, 0xf0456018u, 0x104d5028u,
+        0x1127302au, 0xf0636000u, 0x10673028u, 0x1129f82au, 0xf0436008u,
+        0x1105202au, 0x10452028u, 0xf0236010u, 0x7ca83a14u, 0x1089402au,
+        0xf0036018u, 0x1063f82au, 0x7c683214u, 0x4200ff2cu,
+    };
+    const u32 n = (u32)(sizeof(idct) / sizeof(idct[0]));
+    const u32 saved_lc = g_bem_lc_base;
+    g_bem_lc_base = 0x03000000u;               // arm LC/spec paths (emit-only)
+    // Mirror production (JitWasm.cpp:109 installs a real hook query): a null
+    // g_hle_hook_query makes the emitter wrap EVERY op in Flush + HLE
+    // prologue + ReloadAll — repr resets to Double per op, all SIMD paths
+    // dead, ~10x emit blowup. That artifact config is NOT what ships.
+    const auto saved_query = bemental::powerpc::g_hle_hook_query;
+    bemental::powerpc::g_hle_hook_query = [](u32) -> bool { return false; };
+    volatile u32* mask_cell =
+        reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B33E0u));
+    const u32 saved_mask = *mask_cell;
+    *mask_cell = 0xFFFFFFFFu;                  // all-single (v8 incl. volatiles)
+    dump_block_wasm("IDCT_spec", 0x800DF2A4u, idct, n, env.ctx_ptr,
+                    0x10000000u, 0x017FFFFFu, 0x01800000u);
+    *mask_cell = 0;                            // A/B: no single-spec
+    dump_block_wasm("IDCT_nospec", 0x800DF2A4u, idct, n, env.ctx_ptr,
+                    0x10000000u, 0x017FFFFFu, 0x01800000u);
+    *mask_cell = saved_mask;
+    g_bem_lc_base = saved_lc;
+    bemental::powerpc::g_hle_hook_query = saved_query;
+    return true;
+}
+
+// [PM53 fixed-cost bench] Execute the exact IDCT self-loop through the REAL
+// self-chain path (compile once, dispatch; each host entry self-tail-calls
+// CTR-1 times in-wasm) and report ns/iteration. Purpose: decide whether the
+// loop is bound by body op count (~2135 executed ops post PM53 => ~150-250ns
+// at plausible IPC) or by per-iteration FIXED cost (return_call_indirect
+// back-edge + fresh-activation setup + V8 per-call dispatch) — the PM53
+// wall-time-invariance finding predicts the latter. Zero-filled source rows
+// (0.0f loads, no subnormals), NI=1 to mirror the live MP4 config, stores
+// and loads in disjoint windows of one 1MB fastmem buffer.
+static bool test_idct_selfchain_bench() {
+#ifndef __EMSCRIPTEN__
+    return true;
+#else
+    TestEnv env;
+    if (!env.init()) return false;
+    psq_env_common(env);
+    env.spr(912) = 0;                          // GQR0: float ld
+    env.spr(918) = 0x3d043d04u;                // GQR6: live MP4 value (U8 st)
+    *(u32*)((u8*)env.ctx_raw + ppc_off::FPSCR) = 0x4u;   // NI=1 (live config)
+    static const u32 idct[] = {
+        0xe1690020u, 0x104246f8u, 0xe1490060u, 0x11894028u, 0x1023102au,
+        0xe12900a0u, 0x11a31028u, 0xe10900e0u, 0x1069502au, 0x11295028u,
+        0x39290008u, 0x104b402au, 0x116b4028u, 0xe0e90000u, 0x1102182au,
+        0x11421828u, 0x1069582au, 0xe0c90080u, 0x1044402au, 0x10630732u,
+        0xe0a90040u, 0x10044028u, 0x11291fbau, 0xe08900c0u, 0x11294028u,
+        0x38e70002u, 0xf0456000u, 0x116b1f78u, 0x1041482au, 0x114a4ef8u,
+        0x10214828u, 0xf0456008u, 0x106d502au, 0x116b502au, 0xf0656010u,
+        0x38c60002u, 0x104c5828u, 0x106c582au, 0xf0456018u, 0x104d5028u,
+        0x1127302au, 0xf0636000u, 0x10673028u, 0x1129f82au, 0xf0436008u,
+        0x1105202au, 0x10452028u, 0xf0236010u, 0x7ca83a14u, 0x1089402au,
+        0xf0036018u, 0x1063f82au, 0x7c683214u, 0x4200ff2cu,
+    };
+    const u32 n = (u32)(sizeof(idct) / sizeof(idct[0]));
+    const u32 PC = 0x800DF2A4u;
+    const u32 saved_lc = g_bem_lc_base;
+    g_bem_lc_base = 0x03000000u;
+    const auto saved_query = bemental::powerpc::g_hle_hook_query;
+    bemental::powerpc::g_hle_hook_query = [](u32) -> bool { return false; };
+    volatile u32* mask_cell =
+        reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B33E0u));
+    const u32 saved_mask = *mask_cell;
+    *mask_cell = 0xFFFFFFFFu;                  // all-single
+
+    // 1MB fastmem window: loads at masked 0x40000+, stores at 0x0/0x1000+.
+    static std::vector<u8> buf;
+    buf.assign(0x100000u, 0);
+    const u32 host_base = (u32)(uintptr_t)buf.data();
+
+    std::vector<u8> bytes = build_block_next(PC, idct, n, env.ctx_ptr,
+                                             host_base, 0x000FFFFFu, 0x100000u);
+    int handle = env.cache.compile(PC, bytes.data(), bytes.size());
+    if (handle < 0) { std::printf("[bench] compile failed\n"); return false; }
+
+    const u32 CTR_PER_PASS = 4096u;
+    auto reset_pass = [&]() {
+        env.spr(9)  = CTR_PER_PASS;            // CTR
+        env.gpr(9)  = 0x80040000u;             // psq_l source row (zeros)
+        env.gpr(8)  = 0x80000000u;             // store base
+        env.gpr(7)  = 0u;                      // row 1 cursor (r5 = r8+r7)
+        env.gpr(6)  = 0x1000u;                 // row 2 cursor (r3 = r8+r6)
+        *(s32*)((u8*)env.ctx_raw + ppc_off::DOWNCOUNT)  = 50000000;
+        *(u32*)((u8*)env.ctx_raw + ppc_off::EXCEPTIONS) = 0;
+        *(u32*)((u8*)env.ctx_raw + ppc_off::PC)         = PC;
+    };
+
+    // Warmup (tier-up) then timed passes.
+    const int WARM = 60, TIMED = 200;
+    s32 next_pc = -1;
+    for (int p = 0; p < WARM; ++p) { reset_pass(); env.cache.dispatch(PC, &next_pc); }
+    // Self-chain engagement check: one dispatch must consume the whole CTR.
+    reset_pass();
+    env.cache.dispatch(PC, &next_pc);
+    const u32 ctr_after = env.spr(9);
+    std::printf("[bench] chain check: CTR after one dispatch = %u (0 = self-chain live)\n",
+                ctr_after);
+    double t0 = emscripten_get_now();
+    for (int p = 0; p < TIMED; ++p) { reset_pass(); env.cache.dispatch(PC, &next_pc); }
+    double t1 = emscripten_get_now();
+    const double iters = (double)TIMED * (double)CTR_PER_PASS;
+    std::printf("[bench] %d passes x %u iters: %.1f ms total, %.1f ns/iteration\n",
+                TIMED, CTR_PER_PASS, t1 - t0, (t1 - t0) * 1e6 / iters);
+
+    // Variant A — NI=0: the 32 per-arith-op denormal-flush arms (1024 ops/
+    // iter) are runtime-gated on FPSCR bit 2; same code, arms skipped.
+    // Times equal to the NI=1 run => iteration time is NOT op-count-bound.
+    *(u32*)((u8*)env.ctx_raw + ppc_off::FPSCR) = 0u;
+    for (int p = 0; p < 20; ++p) { reset_pass(); env.cache.dispatch(PC, &next_pc); }
+    t0 = emscripten_get_now();
+    for (int p = 0; p < TIMED; ++p) { reset_pass(); env.cache.dispatch(PC, &next_pc); }
+    t1 = emscripten_get_now();
+    std::printf("[bench] NI=0 variant: %.1f ms total, %.1f ns/iteration\n",
+                t1 - t0, (t1 - t0) * 1e6 / iters);
+    *(u32*)((u8*)env.ctx_raw + ppc_off::FPSCR) = 0x4u;
+
+    // Variant B — CTR=64/entry: 64x more host entries + slow re-entries for
+    // the same iteration count. (ns_B - ns_A_at_4096) * 64 ~= per-entry cost
+    // (host dispatch + verify/PEM slow entry + epilogue).
+    const u32 SMALL = 64u;
+    const int PASSES_B = (int)(iters / SMALL);
+    auto reset_small = [&]() {
+        env.spr(9)  = SMALL;
+        env.gpr(9)  = 0x80040000u;
+        env.gpr(8)  = 0x80000000u;
+        env.gpr(7)  = 0u;
+        env.gpr(6)  = 0x1000u;
+        *(s32*)((u8*)env.ctx_raw + ppc_off::DOWNCOUNT)  = 50000000;
+        *(u32*)((u8*)env.ctx_raw + ppc_off::EXCEPTIONS) = 0;
+        *(u32*)((u8*)env.ctx_raw + ppc_off::PC)         = PC;
+    };
+    for (int p = 0; p < 500; ++p) { reset_small(); env.cache.dispatch(PC, &next_pc); }
+    t0 = emscripten_get_now();
+    for (int p = 0; p < PASSES_B; ++p) { reset_small(); env.cache.dispatch(PC, &next_pc); }
+    t1 = emscripten_get_now();
+    std::printf("[bench] CTR=64 variant: %.1f ms total, %.1f ns/iteration (%d entries)\n",
+                t1 - t0, (t1 - t0) * 1e6 / iters, PASSES_B);
+
+    *mask_cell = saved_mask;
+    g_bem_lc_base = saved_lc;
+    bemental::powerpc::g_hle_hook_query = saved_query;
+    return ctr_after == 0u;
+#endif
+}
+
+// [PM53h int-fusion] The fused integer self-loop: addi r3,r3,1; cmpw cr0,r3,r4;
+// blt -8. With r4=10 the loop runs 10 iterations IN ONE WASM ACTIVATION (the
+// br back-edge), exits on not-LT with PC=+12. The emit-time census counter
+// proves the fused path actually emitted — "one dispatch consumed N
+// iterations" is also true for chain-dispatched unfused self-loops.
+extern "C" { extern u32 g_bem_stat_int_fused; }
+static bool test_fused_intloop_runs_to_exit() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80402000;
+    // prescan requires a non-null HLE query answering "no hook".
+    const auto saved_query = bemental::powerpc::g_hle_hook_query;
+    bemental::powerpc::g_hle_hook_query = [](u32) -> bool { return false; };
+    env.gpr(3) = 0;
+    env.gpr(4) = 10;
+    *(s32*)((u8*)env.ctx_raw + ppc_off::DOWNCOUNT) = 1000000;
+    const u32 insts[] = {
+        0x38630001u,   // addi r3,r3,1
+        0x7C032000u,   // cmpw cr0,r3,r4
+        0x4180FFF8u,   // blt cr0,-8  -> self-loop
+    };
+    const u32 fused_before = g_bem_stat_int_fused;
+    s32 next_pc = -1;
+    const bool ok = env.dispatch_block(PC, insts, 3, &next_pc);
+    bemental::powerpc::g_hle_hook_query = saved_query;
+    if (!ok) { std::printf("[fused] dispatch failed\n"); return false; }
+    const bool fused = g_bem_stat_int_fused > fused_before;
+    std::printf("[fused] emitted=%d next_pc=0x%08x r3=%u (exp fused=1, 0x%08x, 10)\n",
+                (int)fused, (u32)next_pc, env.gpr(3), PC + 12u);
+    return fused && (u32)next_pc == PC + 12u && env.gpr(3) == 10u;
+}
+
+// [FUSION v2] Seam tests: pre-fused streams with non-contiguous per-op pcs.
+// Test 1: elided-b seam — {addi r3,0,7 @0x80010000 | addi r4,r3,1 @0x80020000;
+// b->0x80030000 @0x80020004}. The terminal b's target must anchor to ITS OWN
+// address (contiguous-poisoned math would compute from 0x80010008).
+static bool test_fused_b_elision_seam() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 insts[] = { 0x38600007u, 0x38830001u, 0x4800FFFCu };
+    const u32 pcs[]   = { 0x80010000u, 0x80020000u, 0x80020004u };
+    s32 next_pc = -1;
+    if (!env.dispatch_fused(0x80010000u, insts, pcs, 3, &next_pc)) return false;
+    std::printf("[fused-v2 b-elide] r3=%u r4=%u next=0x%08x (exp 7,8,0x80030000)\n",
+                env.gpr(3), env.gpr(4), (u32)next_pc);
+    return env.gpr(3) == 7u && env.gpr(4) == 8u && (u32)next_pc == 0x80030000u;
+}
+
+// Test 2: backward-cond seam ROUTING — {addi r3,r3,1; bdnz->0x8000FF00;
+// addi r4,0,5; b->0x80040000}, contiguous pcs from 0x80010000. Taken (CTR=2):
+// real mid-function exit, B never runs. Not-taken (CTR=1): continues inline.
+static bool test_fused_bwd_seam() {
+    const u32 insts[] = { 0x38630001u, 0x4200FEFCu, 0x38800005u, 0x4802FFF4u };
+    const u32 pcs[]   = { 0x80010000u, 0x80010004u, 0x80010008u, 0x8001000Cu };
+    {   // taken
+        TestEnv env;
+        if (!env.init()) return false;
+        env.spr(9) = 2u;                        // CTR
+        s32 next_pc = -1;
+        if (!env.dispatch_fused(0x80010000u, insts, pcs, 4, &next_pc)) return false;
+        std::printf("[fused-v2 bwd taken] next=0x%08x r4=%u ctr=%u (exp 0x8000FF00,0,1)\n",
+                    (u32)next_pc, env.gpr(4), env.spr(9));
+        if (!((u32)next_pc == 0x8000FF00u && env.gpr(4) == 0u && env.spr(9) == 1u))
+            return false;
+    }
+    {   // not-taken
+        TestEnv env;
+        if (!env.init()) return false;
+        env.spr(9) = 1u;
+        s32 next_pc = -1;
+        if (!env.dispatch_fused(0x80010000u, insts, pcs, 4, &next_pc)) return false;
+        std::printf("[fused-v2 bwd not-taken] next=0x%08x r4=%u ctr=%u (exp 0x80040000,5,0)\n",
+                    (u32)next_pc, env.gpr(4), env.spr(9));
+        if (!((u32)next_pc == 0x80040000u && env.gpr(4) == 5u && env.spr(9) == 0u))
+            return false;
+    }
+    return true;
+}
+
+// Test 3: terminator fixup on a fused stream — non-branch terminal at
+// 0x80500004 must fix up next_pc to 0x80500008 (poisoned: 0x8001000C).
+static bool test_fused_terminator_fixup() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 insts[] = { 0x38600002u, 0x38830003u, 0x38A40004u };
+    const u32 pcs[]   = { 0x80010000u, 0x80500000u, 0x80500004u };
+    s32 next_pc = -1;
+    if (!env.dispatch_fused(0x80010000u, insts, pcs, 3, &next_pc)) return false;
+    std::printf("[fused-v2 fixup] r5=%u next=0x%08x (exp 9, 0x80500008)\n",
+                env.gpr(5), (u32)next_pc);
+    return env.gpr(5) == 9u && (u32)next_pc == 0x80500008u;
+}
+
+// [FUSION v3] bl-inline + software-RAS tests.
+// Good path: {addi r3,0,1 @A; bl->C @A+4 | [callee] addi r4,0,2 @C; blr @C+4 |
+// [continuation] addi r5,0,3 @A+8; b->0x80090000 @A+12}. The bl emits LR:=A+8
+// only; the blr's RAS check hits (LR==A+8) and falls through inline.
+static bool test_fused_bl_inline_ras_hit() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 A = 0x80010000u, C = 0x80050000u;
+    const u32 insts[] = {
+        0x38600001u,                          // addi r3,0,1      @A
+        0x48000001u | ((C - (A + 4u)) & 0x03FFFFFCu),   // bl C  @A+4
+        0x38800002u,                          // addi r4,0,2      @C
+        0x4E800020u,                          // blr              @C+4
+        0x38A00003u,                          // addi r5,0,3      @A+8
+        0x48000000u | ((0x80090000u - (A + 12u)) & 0x03FFFFFCu), // b @A+12
+    };
+    const u32 pcs[] = { A, A + 4u, C, C + 4u, A + 8u, A + 12u };
+    s32 next_pc = -1;
+    if (!env.dispatch_fused(A, insts, pcs, 6, &next_pc)) return false;
+    const u32 lr = env.spr(8);
+    std::printf("[fused-v3 ras-hit] r3=%u r4=%u r5=%u lr=0x%08x next=0x%08x"
+                " (exp 1,2,3,0x%08x,0x80090000)\n",
+                env.gpr(3), env.gpr(4), env.gpr(5), lr, (u32)next_pc, A + 8u);
+    return env.gpr(3) == 1u && env.gpr(4) == 2u && env.gpr(5) == 3u &&
+           lr == A + 8u && (u32)next_pc == 0x80090000u;
+}
+
+// Mispredict: the callee overwrites LR (mtlr r7, r7=0x80777700) — the driver
+// would never build this stream, but the EMITTER must exit correctly:
+// PC = LR&~3, continuation ops never run.
+static bool test_fused_bl_inline_ras_miss() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 A = 0x80010000u, C = 0x80050000u;
+    env.gpr(7) = 0x80777700u;
+    const u32 insts[] = {
+        0x38600001u,                          // addi r3,0,1      @A
+        0x48000001u | ((C - (A + 4u)) & 0x03FFFFFCu),   // bl C  @A+4
+        0x7CE803A6u,                          // mtlr r7          @C
+        0x4E800020u,                          // blr              @C+4
+        0x38A00003u,                          // addi r5,0,3      @A+8 (must NOT run)
+        0x48000000u | ((0x80090000u - (A + 12u)) & 0x03FFFFFCu), // b @A+12
+    };
+    const u32 pcs[] = { A, A + 4u, C, C + 4u, A + 8u, A + 12u };
+    s32 next_pc = -1;
+    if (!env.dispatch_fused(A, insts, pcs, 6, &next_pc)) return false;
+    std::printf("[fused-v3 ras-miss] r5=%u next=0x%08x (exp 0, 0x80777700)\n",
+                env.gpr(5), (u32)next_pc);
+    return env.gpr(5) == 0u && (u32)next_pc == 0x80777700u;
+}
+
+// [PM55 int-quality] Dump the SAB scheduler hot block (0x800ebe00, 17.9% of
+// our SAB time vs native 1.28%): rlwinm/add/stw/lwz/lwz/cmplwi/bne(coalesced)/
+// stw/b — the integer working set (queue unlink). Fastmem armed, production
+// hook query. Feeds wasm-dis per-op attribution vs Jit64's 2-4-instr loads.
+static bool test_sab_sched_wasm_dump() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const auto saved_query = bemental::powerpc::g_hle_hook_query;
+    bemental::powerpc::g_hle_hook_query = [](u32) -> bool { return false; };
+    static const u32 sched[] = {
+        0x54001838u,  // rlwinm r0,r0,3,0,28
+        0x7C1F0214u,  // add    r0,r31,r0
+        0x900602DCu,  // stw    r0,732(r6)
+        0x80A602DCu,  // lwz    r5,732(r6)
+        0x80850004u,  // lwz    r4,4(r5)
+        0x28040000u,  // cmplwi r4,0
+        0x4082000Cu,  // bne    +0xc (coalesced mid-block exit)
+        0x90C50000u,  // stw    r6,0(r5)
+        0x48000008u,  // b      +8 (terminator)
+    };
+    dump_block_wasm("SAB_SCHED", 0x800EBE00u, sched, 9, env.ctx_ptr,
+                    0x10000000u, 0x017FFFFFu, 0x01800000u);
+    bemental::powerpc::g_hle_hook_query = saved_query;
+    return true;
+}
+
+// [PM55 EA-CSE] stw rX,off(rB) then lwz rY,off(rB) — same base+offset. The
+// second EA reuses LOCAL_TMP_EA from the first; the load must read back
+// exactly what the store wrote, proving the reused address is identical.
+static bool test_ea_cse_stw_then_lwz_same_slot() {
+    TestEnv env;
+    if (!env.init()) return false;
+    static u8 mem[1024];
+    std::memset(mem, 0, sizeof(mem));
+    const u32 host_base = (u32)(uintptr_t)&mem[0];
+    env.gpr(6) = 0x80000000u;              // masks to offset 0
+    env.gpr(0) = 0xAABBCCDDu;              // value to store
+    const u32 insts[] = {
+        enc_stw(0, 6, 732),               // stw r0,732(r6)  -> mem[732..735] BE
+        enc_lwz(5, 6, 732),               // lwz r5,732(r6)  -> r5 = 0xAABBCCDD (EA reused)
+    };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(0x80010000u, insts, 2, &next_pc,
+                            host_base, 0x017FFFFFu, sizeof(mem))) return false;
+    std::printf("[ea-cse] r5=0x%08x (exp 0xAABBCCDD) mem[732]=0x%02x%02x%02x%02x\n",
+                env.gpr(5), mem[732], mem[733], mem[734], mem[735]);
+    return env.gpr(5) == 0xAABBCCDDu &&
+           mem[732] == 0xAA && mem[733] == 0xBB &&
+           mem[734] == 0xCC && mem[735] == 0xDD;
+}
+
+// [PM56 lazy-CR] CROSS-BLOCK soundness: block A defers CR0 (cmpi, sets pending),
+// exits; a SEPARATELY-dispatched block B reads CR0 via the branch's pending
+// path. Proves the deferred form survives a block boundary with no liveness/
+// materialize at exit — the core soundness claim. r3==0 → beq taken.
+static bool test_lazycr_cross_block_beq() {
+    for (int variant = 0; variant < 2; ++variant) {
+        TestEnv env;
+        if (!env.init()) return false;
+        const u32 PC_A = 0x80010000u, PC_B = 0x80020000u;
+        const u32 TGT  = 0x80020040u;   // within bc 16-bit range of PC_B
+        env.gpr(3) = (variant == 0) ? 0u : 5u;   // 0 → EQ set → taken
+        // block A: cmpi r3,0 (defers CR0)
+        const u32 a_insts[] = { enc_cmpi_cr0(3, 0) };
+        s32 na = -1;
+        if (!env.dispatch_block(PC_A, a_insts, 1, &na)) return false;
+        // block B: beq (BO=12 branch-true, BI=2 EQ) → TGT — reads CR0 pending
+        const u32 b_insts[] = { enc_bc(12, 2, PC_B, TGT, false) };
+        s32 nb = -1;
+        if (!env.dispatch_block(PC_B, b_insts, 1, &nb)) return false;
+        const u32 want = (variant == 0) ? TGT : (PC_B + 4u);
+        std::printf("[lazycr xblock] r3=%u next=0x%08x (exp 0x%08x)\n",
+                    env.gpr(3), (u32)nb, want);
+        if ((u32)nb != want) return false;
+    }
+    return true;
+}
+
+// [PM56 lazy-CR] SO-FREEZE: CR.SO copies XER.SO at compare time. bso reads the
+// FROZEN shadow byte, not live XER. XER.SO=1 at cmp → CR0.SO set → bso taken.
+static bool test_lazycr_so_freeze() {
+    for (int so = 0; so < 2; ++so) {
+        TestEnv env;
+        if (!env.init()) return false;
+        const u32 PC = 0x80030000u, TGT = 0x80030040u;   // within bc 16-bit range
+        env.gpr(3) = 5;
+        // XER.SO_OV byte = (SO<<1)|OV
+        *(u8*)((u8*)env.ctx_raw + 0x2F5) = (u8)((so << 1) | 0);
+        // cmpi r3,0 then bso (BO=12 branch-true, BI=3 SO) → TGT
+        const u32 insts[] = {
+            enc_cmpi_cr0(3, 0),
+            enc_bc(12, 3, PC + 4u, TGT, false),
+        };
+        s32 nx = -1;
+        if (!env.dispatch_block(PC, insts, 2, &nx)) return false;
+        const u32 want = so ? TGT : (PC + 8u);
+        std::printf("[lazycr so-freeze] so=%d next=0x%08x (exp 0x%08x)\n",
+                    so, (u32)nx, want);
+        if ((u32)nx != want) return false;
+    }
+    return true;
+}
+
+// [PM57 adjacent cmp->branch fusion] Differential over the FUSED cmp;bc path.
+// For every {cmp form, operand pair (incl. signed/unsigned boundaries), tested
+// bit LT/GT/EQ, branch polarity}, a 2-op block {cmp; bc} — adjacent, so the bc
+// reads the cmp's operand locals DIRECTLY via emit_crbit_fused — must branch
+// exactly as the ISA prescribes. Oracle computed here in C++; a mismatch means
+// emit_crbit_fused's predicate or signedness is wrong. Covers lt_s/lt_u/gt_s/
+// gt_u/eq for reg (cmp/cmpl) and imm (cmpi/cmpli) forms. Inert (still passes via
+// the eager/materialize path) when BEM_LAZY_CR is false — the branch decision is
+// form-correct either way; this test guards the FUSED arm specifically.
+static bool test_lazycr_fused_adjacent() {
+    enum Form { F_CMP, F_CMPL, F_CMPI, F_CMPLI };
+    struct Vec { Form form; u32 va; u32 vb; };  // vb = rb value or immediate
+    const Vec vecs[] = {
+        // signed reg (cmp)
+        {F_CMP, 5u, 5u}, {F_CMP, 5u, 3u}, {F_CMP, 3u, 5u},
+        {F_CMP, 0x80000000u, 1u}, {F_CMP, 0x7FFFFFFFu, 0x80000000u},
+        {F_CMP, 0xFFFFFFFFu, 0u}, {F_CMP, 0u, 0xFFFFFFFFu},
+        {F_CMP, 0x80000000u, 0x80000000u},
+        // unsigned reg (cmpl) — same operands, unsigned semantics
+        {F_CMPL, 5u, 5u}, {F_CMPL, 5u, 3u}, {F_CMPL, 3u, 5u},
+        {F_CMPL, 0x80000000u, 1u}, {F_CMPL, 0x7FFFFFFFu, 0x80000000u},
+        {F_CMPL, 0xFFFFFFFFu, 0u}, {F_CMPL, 0u, 0xFFFFFFFFu},
+        // signed imm (cmpi), imm sign-extended: -1, 1, 5
+        {F_CMPI, 0u, (u32)(s32)-1}, {F_CMPI, 0xFFFFFFFFu, (u32)(s32)-1},
+        {F_CMPI, 0x80000000u, (u32)(s32)-1}, {F_CMPI, 5u, (u32)(s32)-1},
+        {F_CMPI, 5u, 5u}, {F_CMPI, 0x7FFFFFFFu, 1u},
+        // unsigned imm (cmpli), imm zero-extended: 0, 1
+        {F_CMPLI, 0u, 0u}, {F_CMPLI, 1u, 0u}, {F_CMPLI, 0xFFFFFFFFu, 0u},
+        {F_CMPLI, 0u, 1u}, {F_CMPLI, 1u, 1u}, {F_CMPLI, 2u, 1u},
+    };
+    const u32 PC = 0x80004000u;
+    const u32 TARGET = PC + 0x40u;         // within bc 16-bit displacement
+    int failures = 0;
+    for (const Vec& v : vecs) {
+        const bool is_signed = (v.form == F_CMP || v.form == F_CMPI);
+        const bool lt = is_signed ? ((s32)v.va < (s32)v.vb) : (v.va < v.vb);
+        const bool gt = is_signed ? ((s32)v.va > (s32)v.vb) : (v.va > v.vb);
+        const bool eq = (v.va == v.vb);
+        const bool bitval[3] = { lt, gt, eq };
+        for (u32 bit = 0; bit < 3u; ++bit) {
+            for (u32 pol = 0; pol < 2u; ++pol) {   // pol=1 -> BO=12 (branch true)
+                TestEnv env;
+                if (!env.init()) return false;
+                env.gpr(3) = v.va;
+                u32 cmp_inst;
+                switch (v.form) {
+                    case F_CMP:   env.gpr(4) = v.vb; cmp_inst = enc_cmp_cr0(3, 4);  break;
+                    case F_CMPL:  env.gpr(4) = v.vb; cmp_inst = enc_cmpl_cr0(3, 4); break;
+                    case F_CMPI:  cmp_inst = enc_cmpi_cr0(3, (s32)v.vb);            break;
+                    default:      cmp_inst = enc_cmpli_cr0(3, v.vb & 0xFFFFu);      break;
+                }
+                const u32 bo = pol ? 12u : 4u;
+                const u32 insts[] = { cmp_inst,
+                                      enc_bc(bo, bit, PC + 4u, TARGET, false) };
+                s32 next_pc = -1;
+                if (!env.dispatch_block(PC, insts, 2, &next_pc)) { failures++; continue; }
+                const bool want_taken = pol ? bitval[bit] : !bitval[bit];
+                const s32 expect = want_taken ? (s32)TARGET : (s32)(PC + 8u);
+                if (next_pc != expect) {
+                    std::printf("[lazycr fused] form=%d va=0x%08x vb=0x%08x bit=%u "
+                                "pol=%u next=0x%08x exp=0x%08x\n",
+                                (int)v.form, v.va, v.vb, bit, pol,
+                                (u32)next_pc, (u32)expect);
+                    failures++;
+                }
+            }
+        }
+    }
+    return failures == 0;
+}
+
 static const TestCase k_tests[] = {
+    {"lazycr_cross_block_beq",           &test_lazycr_cross_block_beq},
+    {"lazycr_so_freeze",                 &test_lazycr_so_freeze},
+    {"lazycr_fused_adjacent",            &test_lazycr_fused_adjacent},
+    // [PM53] bench first: the wasmdump hex stream takes ~15 min through the
+    // headless console pipe; the bench result must not sit behind it.
+    {"idct_selfchain_bench",             &test_idct_selfchain_bench},
+    {"fused_intloop_runs_to_exit",       &test_fused_intloop_runs_to_exit},
+    {"fused_b_elision_seam",             &test_fused_b_elision_seam},
+    {"fused_bwd_seam",                   &test_fused_bwd_seam},
+    {"fused_terminator_fixup",           &test_fused_terminator_fixup},
+    {"fused_bl_inline_ras_hit",          &test_fused_bl_inline_ras_hit},
+    {"fused_bl_inline_ras_miss",         &test_fused_bl_inline_ras_miss},
+    {"sab_sched_wasm_dump",              &test_sab_sched_wasm_dump},
+    {"ea_cse_stw_then_lwz_same_slot",    &test_ea_cse_stw_then_lwz_same_slot},
     {"reloc_standalone_add_rt_eq_rb",    &test_reloc_standalone_add_rt_eq_rb},
     {"reloc_standalone_add_rt_ne_rb",    &test_reloc_standalone_add_rt_ne_rb},
     {"reloc_load_add_rt_eq_rb",          &test_reloc_load_add_rt_eq_rb},
@@ -1984,6 +2716,12 @@ static const TestCase k_tests[] = {
     {"fnmsubs_sign",                     &test_fnmsubs_sign},
     {"fdivs_round_single",               &test_fdivs_round_single},
     {"frsp_fill_both",                   &test_frsp_fill_both},
+    {"ps_sum1_basic",                    &test_ps_sum1_basic},
+    {"ps_sum1_fd_aliases_fa",            &test_ps_sum1_fd_aliases_fa},
+    {"singles_arm_psq_chain",            &test_singles_arm_psq_chain},
+    {"singles_arm_stfs",                 &test_singles_arm_stfs},
+    {"singles_arm_ps_sum1_alias",        &test_singles_arm_ps_sum1_alias},
+    {"idct_wasm_dump",                   &test_idct_wasm_dump},
     {"fctiwz_vectors",                   &test_fctiwz_vectors},
     {"add_register",                     &test_add_register},
     {"bx_unconditional",                 &test_bx_unconditional},

@@ -166,7 +166,7 @@ void emit_mfspr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Cod
         wb.op_i32_const((s32)op.address);
         wb.op_call(WIMPORT_INTERP);
         rc.ReloadAll(ctx_ptr);
-        frc.ReloadAll(ctx_ptr);
+        frc.ReloadAll(ctx_ptr, /*host_may_write_fprs=*/false);
         return;
     }
 
@@ -216,7 +216,7 @@ void emit_mtspr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Cod
         wb.op_i32_const((s32)op.address);
         wb.op_call(WIMPORT_INTERP);
         rc.ReloadAll(ctx_ptr);
-        frc.ReloadAll(ctx_ptr);
+        frc.ReloadAll(ctx_ptr, /*host_may_write_fprs=*/false);
         return;
     }
 
@@ -352,7 +352,7 @@ static void emit_simple_fallback(WasmModuleBuilder& wb, RegCache& rc,
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
     rc.ReloadAll(ctx_ptr);
-    frc.ReloadAll(ctx_ptr);
+    frc.ReloadAll(ctx_ptr, /*host_may_write_fprs=*/false);
 }
 
 void emit_mfcr(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,

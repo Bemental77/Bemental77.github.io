@@ -230,6 +230,9 @@ private:
     // (measured net-negative: 650 blocks halved ticks). region_relink routes
     // REGION_REL_0 here; non-REL_0 regions keep the legacy relink body.
     void region_seal(u32 mem_pages);
+    // [PM54c fix 2c] release the pending batch (every early seal exit must
+    // call this instead of stranding the batch).
+    void region_reset_pending(RegionState& rs);
 
     std::unordered_map<u64, int>          m_map;
     std::array<RegionState, REGION_COUNT> m_regions{};

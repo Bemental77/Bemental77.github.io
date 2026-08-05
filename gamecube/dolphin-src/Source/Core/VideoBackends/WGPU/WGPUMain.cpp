@@ -38,11 +38,18 @@ void VideoBackend::InitBackendInfo(const WindowSystemInfo& wsi)
   g_backend_info.bSupports3DVision = false;
   g_backend_info.bSupportsEarlyZ = true;
   g_backend_info.bSupportsBindingLayout = true;
-  g_backend_info.bSupportsBBox = true;
+  // [render-gaps R8 PM38 2026-07-24] WGPUBoundingBox is a zeros-returning stub and the
+  // uber WGSL has no bbox storage buffer — advertising support gives games degenerate
+  // 0-extent rects. FALSE engages BoundingBox.cpp's sane fallback until a real impl.
+  g_backend_info.bSupportsBBox = false;
   // [WGPU B1] GS instancing depends on geometry shaders (unsupported); turn off.
   g_backend_info.bSupportsGSInstancing = false;
   g_backend_info.bSupportsPostProcessing = false;
-  g_backend_info.bSupportsPaletteConversion = true;
+  // [render-gaps R3 PM38 2026-07-24] The palette-conversion path is a triple no-op on
+  // WGPU (uber-substituted shaders + UploadTexelBuffer=false + AbstractGfx::Draw empty)
+  // producing BLACK cache entries. FALSE makes TextureCacheBase use the unconverted
+  // EFB-copy entry (visible content, approximate palette) until a native TLUT pipeline.
+  g_backend_info.bSupportsPaletteConversion = false;
   g_backend_info.bSupportsClipControl = true;
   g_backend_info.bSupportsSSAA = true;
   g_backend_info.bSupportsDepthClamp = true;

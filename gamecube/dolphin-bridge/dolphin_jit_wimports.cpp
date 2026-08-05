@@ -94,6 +94,25 @@ static inline void gp_dirty_check(uint32_t addr) {
     }
 }
 
+// [slowmem-audit 2026-07-22 TEMP] bucket slow-path host calls by address class to find
+// fastmem-eligible traffic that fell to the cross-instance slow trampoline (the PM19 boundary
+// cost). @0x026B33B0 = RAM-mirror hits (top byte 0x00/0x80/0xC0, phys < 32MB — SHOULD be
+// fastmem; a hit = classifier miss or non-armed store type), @0x026B33B4 = MMIO/other
+// (legitimately slow), @0x026B33B8 = GP(0xCC008000, expected). Reads + writes share buckets.
+static inline void slowmem_audit(uint32_t addr) {
+    const uint32_t top = addr & 0xFE000000u;
+    const uint32_t phys = addr & 0x03FFFFFFu;
+    uintptr_t cell;
+    if ((addr & 0x0FFFFFFFu) == 0x0C008000u) cell = 0x026B33B8u;
+    else if ((top == 0x00000000u || top == 0x80000000u || top == 0xC0000000u) && phys < 0x02000000u)
+        cell = 0x026B33B0u;   // RAM mirror — fastmem-eligible
+    else if (top == 0xE0000000u)
+        cell = 0x026B33BCu;   // locked-L1 cache — THP pixel-store candidate (PM23)
+    else cell = 0x026B33B4u;  // MMIO / EFB / ARAM-mapped etc.
+    volatile uint32_t* p = reinterpret_cast<volatile uint32_t*>(cell);
+    *p = *p + 1u;
+}
+
 // [stateless-xlate 2026-07-21 — the dropped-VI-write root] Post-takeover, the WORKER owns guest
 // execution and dolphin's mirrored ppc_state.MSR sits at whatever the last sync left it —
 // including exception-entry windows with MSR.DR=0 (PC 0x500/0x900). MMU().Read/Write(EA)
@@ -114,8 +133,25 @@ static inline bool worker_owns_cpu(void) {
 // (width-parameterized plain functions — this file's trampolines sit in an extern "C"
 // block, where templates are not allowed.)
 static bool stateless_read_w(uint32_t addr, uint32_t width, uint32_t* out) {
-    if (!worker_owns_cpu()) return false;
     auto& system = Core::System::GetInstance();
+    // [lc-window PM23] locked-L1 [0xE0000000, 0xE0040000): direct backing-store
+    // access (MMU.cpp:246-253 locked-L1 memcpy parity) — skips the full MMU
+    // fallback for residual LC imports the emitter's in-wasm LC arm doesn't
+    // cover. NOT gated on worker_owns_cpu(): the MMU path performs the IDENTICAL
+    // ownership-independent memcpy for this range (no BAT/icache semantics).
+    if ((addr & 0xFFFC0000u) == 0xE0000000u) {
+        u8* const l1 = system.GetMemory().GetL1Cache();
+        if (l1) {
+            const u8* const pmem = l1 + (addr & 0x3FFFFu);
+            if (width == 1u) { *out = pmem[0]; }
+            else if (width == 2u) { u16 v; std::memcpy(&v, pmem, 2); *out = Common::swap16(v); }
+            else { u32 v; std::memcpy(&v, pmem, 4); *out = Common::swap32(v); }
+            return true;
+        }
+    }
+    // Everything below is the post-takeover shape-routed path — pre-takeover
+    // MUST keep exact MMU semantics (see the 2026-06-04 note above).
+    if (!worker_owns_cpu()) return false;
     const uint32_t phys = addr & 0x3FFFFFFFu;
     if ((phys & 0x0FFF0000u) == 0x0C000000u) {
         MMIO::Mapping* const mmio = system.GetMemory().GetMMIOMapping();
@@ -135,8 +171,20 @@ static bool stateless_read_w(uint32_t addr, uint32_t width, uint32_t* out) {
     return false;
 }
 static bool stateless_write_w(uint32_t addr, uint32_t width, uint32_t val) {
-    if (!worker_owns_cpu()) return false;
     auto& system = Core::System::GetInstance();
+    // [lc-window PM23] locked-L1 direct write — ownership-independent, see
+    // stateless_read_w.
+    if ((addr & 0xFFFC0000u) == 0xE0000000u) {
+        u8* const l1 = system.GetMemory().GetL1Cache();
+        if (l1) {
+            u8* const pmem = l1 + (addr & 0x3FFFFu);
+            if (width == 1u) { pmem[0] = (u8)val; }
+            else if (width == 2u) { const u16 v = Common::swap16((u16)val); std::memcpy(pmem, &v, 2); }
+            else { const u32 v = Common::swap32(val); std::memcpy(pmem, &v, 4); }
+            return true;
+        }
+    }
+    if (!worker_owns_cpu()) return false;
     const uint32_t phys = addr & 0x3FFFFFFFu;
     if ((phys & 0x0FFF0000u) == 0x0C000000u) {
         MMIO::Mapping* const mmio = system.GetMemory().GetMMIOMapping();
@@ -158,6 +206,7 @@ static bool stateless_write_w(uint32_t addr, uint32_t width, uint32_t val) {
 
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_read8(uint32_t addr) {
+    slowmem_audit(addr);
     uint32_t v;
     if (stateless_read_w(addr, 1u, &v)) return v;
     return Core::System::GetInstance().GetMMU().Read<u8>(addr);
@@ -165,6 +214,7 @@ uint32_t dolphin_read8(uint32_t addr) {
 
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_read16(uint32_t addr) {
+    slowmem_audit(addr);
     uint32_t v;
     if (stateless_read_w(addr, 2u, &v)) return v;
     return Core::System::GetInstance().GetMMU().Read<u16>(addr);
@@ -172,6 +222,7 @@ uint32_t dolphin_read16(uint32_t addr) {
 
 EMSCRIPTEN_KEEPALIVE
 uint32_t dolphin_read32(uint32_t addr) {
+    slowmem_audit(addr);
     uint32_t val;
     if (!stateless_read_w(addr, 4u, &val))
         val = Core::System::GetInstance().GetMMU().Read<u32>(addr);
@@ -211,6 +262,7 @@ uint32_t dolphin_read32(uint32_t addr) {
 EMSCRIPTEN_KEEPALIVE
 void dolphin_write8(uint32_t addr, uint32_t val) {
     gp_dirty_check(addr);
+    slowmem_audit(addr);
     if ((addr & 0x0FFFFFFFu) == 0x0C008000u) {
         Core::System::GetInstance().GetGPFifo().Write8(static_cast<u8>(val));
         return;
@@ -222,6 +274,7 @@ void dolphin_write8(uint32_t addr, uint32_t val) {
 EMSCRIPTEN_KEEPALIVE
 void dolphin_write16(uint32_t addr, uint32_t val) {
     gp_dirty_check(addr);
+    slowmem_audit(addr);
     if ((addr & 0x0FFFFFFFu) == 0x0C008000u) {
         Core::System::GetInstance().GetGPFifo().Write16(static_cast<u16>(val));
         return;
@@ -233,6 +286,7 @@ void dolphin_write16(uint32_t addr, uint32_t val) {
 EMSCRIPTEN_KEEPALIVE
 void dolphin_write32(uint32_t addr, uint32_t val) {
     gp_dirty_check(addr);
+    slowmem_audit(addr);
     // [gp-direct 2026-07-07] GP writes bypass the MMU route: measured 85% loss between
     // MMU.Write and GPFifo::Write32 (gpW=374,733 vs gpFifoW=57,119) with the surviving
     // fragments never completing a 32B chunk — zero bursts, FIFO empty, GXDrawDone slept
@@ -473,7 +527,14 @@ uint32_t dolphin_hle_fire(uint32_t pc, uint32_t hook_index) {
 // catches the case where an earlier op in the same block branched and
 // already updated pc — re-stepping the original op would corrupt state.
 EMSCRIPTEN_KEEPALIVE
-void dolphin_interp(uint32_t /*unused*/, uint32_t pc) {
+// [PM56 lazy-CR] The deferred-CR settle funnel: reconstruct eager cr[] from the
+// shadow before the interp (which reads cr for mfcr/mtcrf/cr-logical/mcrf/
+// mcrxr/isel/CR-bclr — all fall back here). bem_materialize_pending_cr is the
+// single source of truth (bementalJIT cr_encode.cpp), takes the PowerPCState
+// host base = the emitters' ctx_ptr.
+extern "C" void bem_materialize_pending_cr(void* ctx_base);
+
+void dolphin_interp(uint32_t /*inst*/, uint32_t pc) {
     // Pass-2 audit (w6oeq0l6e RANK 5): SingleStep() calls CoreTiming.Advance,
     // sets slice_length=1, forces downcount=0, and calls CheckExceptions —
     // all of which mutate state mid-block. SingleStepInner is the per-op-only
@@ -498,6 +559,9 @@ void dolphin_interp(uint32_t /*unused*/, uint32_t pc) {
     // marking the FIFO dirty here costs nothing and removes the only way the
     // epilogue gate could miss a GP write.
     g_bem_gp_dirty = 1;
+    // [PM56 lazy-CR] settle deferred CR fields to eager cr[] before the interp
+    // reads them (mfcr/cr-logical/mcrf/isel/CR-bclr all route here).
+    bem_materialize_pending_cr(&ppc_state);
     system.GetInterpreter().SingleStepInner();
 }
 

@@ -36,6 +36,8 @@ using namespace bemental::powerpc;
 // Reconstruct mfcr-equivalent u32 from Dolphin's per-field cr storage.
 // Mirrors ConditionRegister::GetField exactly. (Same as test_diff.cpp;
 // powerpc-next ppc_offsets.h values are byte-identical to legacy ppc_off.)
+extern "C" void bem_materialize_pending_cr(void* ctx_base);  // [PM56 lazy-CR]
+
 static u32 dolphin_to_mfcr(const void* ctx_raw) {
     const u8* base = (const u8*)ctx_raw;
     u32 mfcr = 0;
@@ -163,7 +165,15 @@ static int drain_interp_calls() {
 #endif
 }
 
+// [accurate-nans-gate PM59] The conformance differential validates the ACCURATE
+// paired-single NaN path bit-for-bit vs DolphinPPCTests, so force it on here
+// (runtime/games default it off to match native Jit64's m_accurate_nans=false).
+extern "C" uint32_t g_bem_accurate_nans;
+extern "C" uint32_t g_bem_ni_flush;
+
 int main() {
+    g_bem_accurate_nans = 1u;   // validate the accurate ladder path
+    g_bem_ni_flush      = 1u;   // validate the NI/FTZ subnormal-flush path
 #ifdef __EMSCRIPTEN__
     EM_ASM({
         if (!Module.bemental_imports) Module.bemental_imports = { env: {} };
@@ -253,6 +263,11 @@ int main() {
             continue;
         }
 
+        // [PM56 lazy-CR] a raw cr[] read is a materialization boundary (like
+        // mfcr/savestate in the real system): settle deferred fields first, so
+        // the differential validates the deferred->eager reconstruction against
+        // the oracle's eager cr.
+        bem_materialize_pending_cr(ctx_raw);
         const u32 got_rd  = *(u32*)(base + ppc_off::gpr(3));
         const u32 got_xer = dolphin_to_mfxer(ctx_raw);
         const u32 got_cr  = dolphin_to_mfcr(ctx_raw);

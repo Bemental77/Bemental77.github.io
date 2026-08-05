@@ -57,6 +57,31 @@ private:
   WGPUTextureViewHandle m_binding_view = nullptr;  // lazy 2DArray view (released in dtor)
 };
 
+// [wgpu xfb-band 2026-07-31] Handshake header between WGPUTextureCache::CopyEFB's async
+// MapAsync encode and the frame-end staging->guest-RAM flush (TextureCacheBase
+// WriteEFBCopyToRAM -> ReadTexels). CopyEFB's EfbRamCtx embeds this as its FIRST member;
+// the staging texture holds an opaque pointer to it. Single-threaded by construction:
+// CopyEFB/ReadTexels and the AllowSpontaneous callback all run on the device thread.
+// Race being fixed (the MP4 movie GREEN-BAND class): a late callback let the flush
+// memcpy the staging buffer's PREVIOUS contents (or zeros on first touch — YUYV zeros
+// render green) into guest XFB RAM. Native encodes in pipeline order so this cannot
+// happen there; deferring the RAM write to the callback restores "correct bytes always"
+// (worst case = one callback-latency-late frame, never stale/zero bands).
+class WGPUStagingTexture;
+
+struct WGPUEfbEncodePending
+{
+  bool encode_done = false;   // callback ran, staging bytes valid
+  bool deferred = false;      // flush arrived first; write guest RAM in the callback
+  bool orphaned = false;      // staging reused/destroyed; don't touch its map
+  void* def_dst = nullptr;    // deferred guest-RAM destination
+  u32 def_stride = 0;
+  // Registration back-pointer: the callback unregisters itself from the staging
+  // before deleting the ctx (else a later ReadTexels would read freed memory).
+  // Only dereferenced on the !orphaned path; the staging dtor sets orphaned.
+  WGPUStagingTexture* owner = nullptr;
+};
+
 class WGPUStagingTexture final : public AbstractStagingTexture
 {
 public:
@@ -73,6 +98,11 @@ public:
   bool Map() override;
   void Unmap() override;
   void Flush() override;
+  void ReadTexels(const MathUtil::Rectangle<int>& rect, void* out_ptr, u32 out_stride) override;
+
+  // Set by WGPUTextureCache::CopyEFB when an async encode targets this staging's map.
+  // Ownership of the pointee stays with the MapAsync callback (it deletes the ctx).
+  WGPUEfbEncodePending* m_pending_encode = nullptr;
 
 private:
   std::vector<u8> m_texture_buf;

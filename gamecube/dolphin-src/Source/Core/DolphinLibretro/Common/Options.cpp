@@ -816,12 +816,18 @@ static struct retro_core_option_v2_definition option_defs[] = {
     nullptr,
     CATEGORY_GFX_SETTINGS,
     {
-      { "128", "Fast" },
-      { "512", "Middle" },
+      // [xfb-band FIX PM45e 2026-07-31] default "Safe" (0 = full-texture hash) —
+      // NATIVE Dolphin's default. "Fast" (128 sampled points) let the THP movie's
+      // Y/U/V plane textures hash-collide across frames when the samples missed
+      // changed rows: the cache kept a STALE entry whose boot-era zero rows the
+      // game's own TEV YUV->RGB rendered as the GREEN BAND (readback masks proved
+      // the band is in the EFB at copy time; every downstream layer exonerated).
       { "0",   "Safe" },
+      { "512", "Middle" },
+      { "128", "Fast" },
       { nullptr, nullptr }
     },
-    "128"
+    "0"
   },
   {
     Libretro::Options::gfx_settings::GPU_TEXTURE_DECODING,
@@ -1096,6 +1102,9 @@ static struct retro_core_option_v2_definition option_defs[] = {
     Libretro::Options::gfx_hacks::EFB_TO_TEXTURE,
     "Graphics > Hacks > Skip EFB Copy to RAM",
     "Skip EFB Copy to RAM",
+    // [render-gaps R1 PM38 2026-07-24] registered default flipped enabled->disabled:
+    // the WGPU EFB->RAM path writes real tile-encoded data now; skipping zeroed RAM
+    // (the block-garbage class).
     "Store EFB in texture memory.",
     nullptr,
     CATEGORY_GFX_HACKS,
@@ -1104,7 +1113,7 @@ static struct retro_core_option_v2_definition option_defs[] = {
       { "enabled",  nullptr },
       { nullptr, nullptr }
     },
-    "enabled"
+    "disabled"
   },
   {
     Libretro::Options::gfx_hacks::XFB_TO_TEXTURE_ENABLE,

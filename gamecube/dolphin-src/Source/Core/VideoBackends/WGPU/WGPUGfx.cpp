@@ -11,7 +11,8 @@
 #include <string>
 #include <vector>
 
-#include <emscripten.h>  // emscripten_sleep (ASYNCIFY pump) + MAIN_THREAD_EM_ASM
+#include <emscripten.h>
+#include <pthread.h>  // emscripten_sleep (ASYNCIFY pump) + MAIN_THREAD_EM_ASM
 
 #include "Core/Core.h"  // Core::MarkWGPUDeviceThread — TLS device-owner marker (dual-core hybrid)
 
@@ -36,6 +37,24 @@ namespace WGPU
 static void OnUncapturedError(WGPUDevice const*, WGPUErrorType type, WGPUStringView message,
                               void*, void*)
 {
+  // [sab-diag PM29] MAIN_THREAD_EM_ASM does NOT deliver from the gpu_thread (the PM28
+  // black-canvas delivery bug class) — every device/validation error has been INVISIBLE.
+  // Publish via SAB: count @0x026B3530, type @0x026B3534, first message text (120 bytes)
+  // @0x026B3540 (written once; probe decodes as ASCII).
+  {
+    volatile u32* const n =
+        reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3530u));
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3534u)) = (u32)type;
+    if (*n == 0u && message.data && message.length)
+    {
+      volatile char* dst = reinterpret_cast<volatile char*>(static_cast<uintptr_t>(0x026B3540u));
+      const size_t len = message.length < 119 ? message.length : 119;
+      for (size_t i = 0; i < len; i++)
+        dst[i] = message.data[i];
+      dst[len] = 0;
+    }
+    *n = *n + 1u;
+  }
   MAIN_THREAD_EM_ASM({
     var msg = $2 ? UTF8ToString($1, $2) : '(no message)';
     postMessage({cmd: 'print', txt: '[wgpu] DEVICE ERROR type=' + $0 + ': ' + msg});
@@ -137,6 +156,12 @@ WGPUGfx::WGPUGfx(const WindowSystemInfo& wsi)
     MAIN_THREAD_EM_ASM({ postMessage({cmd: 'print', txt:
       '[wgpu] dual-source-blending: ' + ($0 ? 'requested' : 'NOT supported by adapter')}); },
       (int)has_dsb);
+    // [sab-diag PM35] has_dsb @0x026B35F8 (0x10|flag) — the init prints from
+    // this thread never relay; if 0, every uber fragment module (which begins
+    // with `enable dual_source_blending;`) is INVALID per the comment above =
+    // the exact observed zero-fragment-from-game-pipelines symptom.
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35F8u)) =
+        0x10u | (has_dsb ? 1u : 0u);
 
     wgpuAdapterRequestDevice(adapter, &dev_desc, cb);
     pump(&device_done);
@@ -254,6 +279,12 @@ void WGPUGfx::BeginRenderPassIfNeeded()
   WGPUTextureView color_view = m_bound_fb->GetColorView();
   if (!color_view)
     return;
+  // [sab-diag PM30 TEMP] draw-pass color TEXTURE identity @0x026B3578 (same
+  // type as the blit-source publish — view-vs-texture was incomparable).
+  if (m_bound_fb->GetColorAttachment())
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3578u)) =
+        static_cast<u32>(reinterpret_cast<uintptr_t>(
+            static_cast<WGPUTexture*>(m_bound_fb->GetColorAttachment())->GetTexture()));
 
   // Preserve existing contents (loadOp=Load). A draw or present that needs the pass open begins
   // it here; SetAndClearFramebuffer takes the explicit-clear path instead.
@@ -344,6 +375,14 @@ void WGPUGfx::SetAndClearFramebuffer(AbstractFramebuffer* framebuffer,
   att.loadOp = WGPULoadOp_Clear;
   att.storeOp = WGPUStoreOp_Store;
   att.clearValue = {color_value[0], color_value[1], color_value[2], color_value[3]};
+  // [red-clear EXPERIMENT PM29 — REVERT] force red + count clears @0x026B3554:
+  // canvas red => attachment writes land (bug = game pipelines: depth/blend/
+  // uniforms); still black => the written framebuffer isn't the read texture.
+#define BEM_RED_CLEAR 0
+#if BEM_RED_CLEAR
+  att.clearValue = {1.0, 0.0, 0.0, 1.0};
+#endif
+  ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3554u));
 
   WGPURenderPassDescriptor rp = {};
   rp.colorAttachmentCount = 1;
@@ -433,6 +472,20 @@ struct UtilClearOut {
 @fragment fn util_fs_clear_nodepth(in : UtilVSOut) -> @location(0) vec4<f32> {
   return uparams.clear_color;
 }
+
+// [render-gaps R2 PM38] EFB depth -> RGBA8 texture copy. textureLoad (no sampler:
+// depth textures are unfilterable). Undo the reversed-Z convention (backend uses the
+// 1-z remap, WGPUMain bSupportsReversedDepthRange=false) and replicate the 8-bit
+// depth across RGB (intensity-style Z copy — the common shadow-projection usage;
+// full per-ZFormat Z24 byte-encode is a follow-up).
+@group(0) @binding(3) var utexdepth : texture_depth_2d;
+@fragment fn util_fs_blit_depth(in : UtilVSOut) -> @location(0) vec4<f32> {
+  let dims = vec2<f32>(textureDimensions(utexdepth));
+  let c = vec2<i32>(clamp(in.uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (dims - vec2<f32>(1.0)));
+  let d = textureLoad(utexdepth, c, 0);
+  let z = clamp(1.0 - d, 0.0, 1.0);
+  return vec4<f32>(z, z, z, 1.0);
+}
 )";
 
 constexpr u32 UTIL_UNIFORM_SLOT = 256;                      // min uniform alignment
@@ -481,8 +534,23 @@ void WGPUGfx::ApplyViewportAndScissor()
   float h = std::min(m_viewport[3], fb_h - y);
   float zn = std::min(std::max(m_viewport[4], 0.0f), 1.0f);
   float zf = std::min(std::max(m_viewport[5], 0.0f), 1.0f);
+  // [sab-diag PM29] publish the applied viewport/scissor: vp (w<<16|h) @0x026B3548,
+  // scissor (sw<<16|sh) @0x026B354C, vp-degenerate count @0x026B3550.
+  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3548u)) =
+      ((u32)(w < 0 ? 0 : w) << 16) | ((u32)(h < 0 ? 0 : h) & 0xFFFFu);
+  // [sab-diag PM33 TEMP] RAW pre-clamp viewport origin+extent (f32 bits of y
+  // @0x026B35A8, x @0x026B35AC, raw h @0x026B35B0): a raw y ~ +/-480 = the
+  // GC viewport-origin bias mis-sign shifting the scene out of the raster.
+  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35A8u)) =
+      *reinterpret_cast<const u32*>(&m_viewport[1]);
+  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35ACu)) =
+      *reinterpret_cast<const u32*>(&m_viewport[0]);
+  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35B0u)) =
+      *reinterpret_cast<const u32*>(&m_viewport[3]);
   if (w > 0.0f && h > 0.0f)
     wgpuRenderPassEncoderSetViewport(m_pass, x, y, w, h, zn, zf);
+  else
+    ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3550u));
 
   int sx = 0, sy = 0, sw = static_cast<int>(fb_w), sh = static_cast<int>(fb_h);
   if (m_scissor_valid)
@@ -492,6 +560,8 @@ void WGPUGfx::ApplyViewportAndScissor()
     sw = std::min(m_scissor.right, static_cast<int>(fb_w)) - sx;
     sh = std::min(m_scissor.bottom, static_cast<int>(fb_h)) - sy;
   }
+  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B354Cu)) =
+      ((u32)(sw < 0 ? 0 : sw) << 16) | ((u32)(sh < 0 ? 0 : sh) & 0xFFFFu);
   if (sw > 0 && sh > 0)
     wgpuRenderPassEncoderSetScissorRect(m_pass, static_cast<u32>(sx), static_cast<u32>(sy),
                                         static_cast<u32>(sw), static_cast<u32>(sh));
@@ -574,6 +644,46 @@ bool WGPUGfx::EnsureUtilPipelines()
     pd.multisample.mask = 0xFFFFFFFF;
     pd.fragment = &fragment;
     m_util_blit_pipeline = wgpuDeviceCreateRenderPipeline(m_device, &pd);
+  }
+  // [render-gaps R2 PM38] Depth-blit BGL (uniform @0 + depth texture @3) + pipeline.
+  {
+    WGPUBindGroupLayoutEntry entries[2] = {};
+    entries[0].binding = 0;
+    entries[0].visibility = WGPUShaderStage_Vertex | WGPUShaderStage_Fragment;
+    entries[0].buffer.type = WGPUBufferBindingType_Uniform;
+    entries[0].buffer.minBindingSize = sizeof(UtilParamsCPU);
+    entries[1].binding = 3;
+    entries[1].visibility = WGPUShaderStage_Fragment;
+    entries[1].texture.sampleType = WGPUTextureSampleType_Depth;
+    entries[1].texture.viewDimension = WGPUTextureViewDimension_2D;
+    WGPUBindGroupLayoutDescriptor bgld = {};
+    bgld.entryCount = 2;
+    bgld.entries = entries;
+    m_util_depthblit_bgl = wgpuDeviceCreateBindGroupLayout(m_device, &bgld);
+    WGPUPipelineLayoutDescriptor pld = {};
+    pld.bindGroupLayoutCount = 1;
+    pld.bindGroupLayouts = &m_util_depthblit_bgl;
+    m_util_depthblit_layout = wgpuDeviceCreatePipelineLayout(m_device, &pld);
+
+    WGPUVertexState vertex = {};
+    vertex.module = m_util_module;
+    vertex.entryPoint = {"util_vs", WGPU_STRLEN};
+    WGPUColorTargetState target = {};
+    target.format = WGPUTextureFormat_RGBA8Unorm;
+    target.writeMask = WGPUColorWriteMask_All;
+    WGPUFragmentState fragment = {};
+    fragment.module = m_util_module;
+    fragment.entryPoint = {"util_fs_blit_depth", WGPU_STRLEN};
+    fragment.targetCount = 1;
+    fragment.targets = &target;
+    WGPURenderPipelineDescriptor pd = {};
+    pd.layout = m_util_depthblit_layout;
+    pd.vertex = vertex;
+    pd.primitive.topology = WGPUPrimitiveTopology_TriangleList;
+    pd.multisample.count = 1;
+    pd.multisample.mask = 0xFFFFFFFF;
+    pd.fragment = &fragment;
+    m_util_depthblit_pipeline = wgpuDeviceCreateRenderPipeline(m_device, &pd);
   }
   // Samplers + uniform ring.
   {
@@ -682,6 +792,17 @@ void WGPUGfx::ClearRegion(const MathUtil::Rectangle<int>& target_rc, bool colorE
   params.clear_color[1] = static_cast<float>((color >> 8) & 0xFF) / 255.0f;
   params.clear_color[2] = static_cast<float>((color >> 0) & 0xFF) / 255.0f;
   params.clear_color[3] = static_cast<float>((color >> 24) & 0xFF) / 255.0f;
+  // [clearregion-red EXPERIMENT PM35 - REVERT] the earlier red test forced only
+  // the loadOp path; THIS is the per-frame 640x480 clear-DRAW (1009/60s, same
+  // pass as game draws). Red fills rows 0-479 => util DRAWS WORK and the black
+  // scene is CONTENT black (texture/TEV level); still black => no draw lands.
+#define BEM_CLEARREGION_RED 0
+#if BEM_CLEARREGION_RED
+  params.clear_color[0] = 1.0f;
+  params.clear_color[1] = 0.0f;
+  params.clear_color[2] = 0.0f;
+  params.clear_color[3] = 1.0f;
+#endif
   params.clear_depth[0] = static_cast<float>(z & 0xFFFFFF) / 16777216.0f;
   // Reverse-Z: bSupportsReversedDepthRange=false, so the stored depth convention is 1-z
   // (mirrors AbstractGfx::ClearRegion's uniforms.clear_depth flip at AbstractGfx.cpp:83-84).
@@ -721,6 +842,15 @@ void WGPUGfx::ClearRegion(const MathUtil::Rectangle<int>& target_rc, bool colorE
                                         static_cast<u32>(sw), static_cast<u32>(sh));
     wgpuRenderPassEncoderSetPipeline(m_pass, m_util_clear_pipelines[key]);
     wgpuRenderPassEncoderSetBindGroup(m_pass, 0, grp, 0, nullptr);
+    // [pass-diff PM35 TEMP] util tuple: pass @0x026B35D0, pipeline @0x35D4,
+    // count @0x35D8, scissor (sw<<16|sh) @0x35DC.
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35D0u)) =
+        static_cast<u32>(reinterpret_cast<uintptr_t>(m_pass));
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35D4u)) =
+        static_cast<u32>(reinterpret_cast<uintptr_t>(m_util_clear_pipelines[key]));
+    ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35D8u));
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35DCu)) =
+        ((u32)sw << 16) | ((u32)sh & 0xFFFFu);
     wgpuRenderPassEncoderDraw(m_pass, 3, 1, 0, 0);
   }
   wgpuBindGroupRelease(grp);
@@ -835,6 +965,105 @@ bool WGPUGfx::BlitToTexture(::WGPUTexture src_texture, u32 src_width, u32 src_he
   return ok;
 }
 
+// [render-gaps R2 PM38 2026-07-24] EFB DEPTH -> RGBA8 texture copy (was: skipped
+// entirely, leaving depth-copy cache entries lazy-zero => black shadows/effects).
+// Same structure as BlitToTexture; depth view (DepthOnly aspect), no sampler
+// (textureLoad in util_fs_blit_depth), reversed-Z undone in-shader.
+bool WGPUGfx::BlitDepthToTexture(::WGPUTexture src_texture, u32 src_width, u32 src_height,
+                                 const MathUtil::Rectangle<int>& src_rect,
+                                 ::WGPUTexture dst_texture, u32 dst_w, u32 dst_h)
+{
+  if (!m_device || !src_texture || !dst_texture || !EnsureUtilPipelines() ||
+      !m_util_depthblit_pipeline || src_width == 0 || src_height == 0 || dst_w == 0 || dst_h == 0)
+    return false;
+
+  UtilParamsCPU params = {};
+  params.uv_off_scale[0] = static_cast<float>(src_rect.left) / static_cast<float>(src_width);
+  params.uv_off_scale[1] = static_cast<float>(src_rect.top) / static_cast<float>(src_height);
+  params.uv_off_scale[2] = static_cast<float>(src_rect.GetWidth()) / static_cast<float>(src_width);
+  params.uv_off_scale[3] =
+      static_cast<float>(src_rect.GetHeight()) / static_cast<float>(src_height);
+  const u32 uoff = AllocUtilUniformSlot(&params, sizeof(params));
+  if (uoff == UINT32_MAX)
+    return false;
+
+  EndRenderPass();
+  EnsureEncoder();
+  if (!m_encoder)
+    return false;
+
+  WGPUTextureViewDescriptor src_vd = {};
+  src_vd.dimension = WGPUTextureViewDimension_2D;
+  src_vd.baseMipLevel = 0;
+  src_vd.mipLevelCount = 1;
+  src_vd.baseArrayLayer = 0;
+  src_vd.arrayLayerCount = 1;
+  src_vd.aspect = WGPUTextureAspect_DepthOnly;
+  WGPUTextureView src_view = wgpuTextureCreateView(src_texture, &src_vd);
+  WGPUTextureViewDescriptor dst_vd = src_vd;
+  dst_vd.aspect = WGPUTextureAspect_All;
+  WGPUTextureView dst_view = wgpuTextureCreateView(dst_texture, &dst_vd);
+  if (!src_view || !dst_view)
+  {
+    if (src_view)
+      wgpuTextureViewRelease(src_view);
+    if (dst_view)
+      wgpuTextureViewRelease(dst_view);
+    return false;
+  }
+
+  WGPUBindGroupEntry entries[2] = {};
+  entries[0].binding = 0;
+  entries[0].buffer = m_util_uniforms;
+  entries[0].offset = uoff;
+  entries[0].size = sizeof(UtilParamsCPU);
+  entries[1].binding = 3;
+  entries[1].textureView = src_view;
+  WGPUBindGroupDescriptor bgd = {};
+  bgd.layout = m_util_depthblit_bgl;
+  bgd.entryCount = 2;
+  bgd.entries = entries;
+  WGPUBindGroup grp = wgpuDeviceCreateBindGroup(m_device, &bgd);
+
+  bool ok = false;
+  if (grp)
+  {
+    WGPURenderPassColorAttachment att = {};
+    att.view = dst_view;
+    att.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+    att.loadOp = WGPULoadOp_Clear;
+    att.storeOp = WGPUStoreOp_Store;
+    WGPURenderPassDescriptor rp = {};
+    rp.colorAttachmentCount = 1;
+    rp.colorAttachments = &att;
+    WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(m_encoder, &rp);
+    if (pass)
+    {
+      wgpuRenderPassEncoderSetViewport(pass, 0.0f, 0.0f, static_cast<float>(dst_w),
+                                       static_cast<float>(dst_h), 0.0f, 1.0f);
+      wgpuRenderPassEncoderSetPipeline(pass, m_util_depthblit_pipeline);
+      wgpuRenderPassEncoderSetBindGroup(pass, 0, grp, 0, nullptr);
+      wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+      wgpuRenderPassEncoderEnd(pass);
+      wgpuRenderPassEncoderRelease(pass);
+      ok = true;
+    }
+    wgpuBindGroupRelease(grp);
+  }
+  wgpuTextureViewRelease(src_view);
+  wgpuTextureViewRelease(dst_view);
+
+  static bool s_depthblit_logged = false;
+  if (!s_depthblit_logged && ok)
+  {
+    s_depthblit_logged = true;
+    MAIN_THREAD_EM_ASM({ postMessage({cmd: 'print', txt:
+      '[wgpu] EFB DEPTH->texture blit ACTIVE ' + $0 + 'x' + $1 + ' -> ' + $2 + 'x' + $3}); },
+      (int)src_rect.GetWidth(), (int)src_rect.GetHeight(), (int)dst_w, (int)dst_h);
+  }
+  return ok;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Readback present (NON-BLOCKING). A blocking emscripten_sleep pump inside ShowImage stalls: the
 // emulator frame loop already yields via ASYNCIFY, so a nested sleep-pump corrupts the unwind
@@ -858,6 +1087,7 @@ struct ReadbackCtx
 void WGPUGfx::ReadbackAndPresent(::WGPUTexture src_texture, u32 origin_x, u32 origin_y, u32 width,
                                  u32 height)
 {
+  ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3504u));  // [present-diag TEMP]
   if (!m_device || !m_queue || !src_texture || width == 0 || height == 0)
     return;
   if (m_readback_in_flight >= 3)  // [pipeline] cap depth; each readback owns a fresh buffer
@@ -942,6 +1172,7 @@ void WGPUGfx::ReadbackAndPresent(::WGPUTexture src_texture, u32 origin_x, u32 or
   cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void* ud, void*) {
     auto* c = static_cast<ReadbackCtx*>(ud);
     WGPUGfx* gfx = c->gfx;
+    ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3508u));  // [present-diag TEMP] map cb fired
     static bool s_cb_logged = false;
     if (!s_cb_logged)
     {
@@ -963,15 +1194,22 @@ void WGPUGfx::ReadbackAndPresent(::WGPUTexture src_texture, u32 origin_x, u32 or
         // (unmap moved below — unconditional on Success, so a null mapped-range edge can't
         // leave a mapped buffer in the staging pool)
 
-        // Mirror EmscriptenWorker.cpp video_cb's render message: {cmd:'render', x,y,w,h,pixels,pitch}.
-        const size_t total = (size_t)c->width * 4 * c->height;
-        MAIN_THREAD_EM_ASM({
-          var s = $0;
-          var view = HEAPU8.subarray(s, s + $3);
-          var copy = new Uint8Array(view);
-          postMessage({cmd: 'render', x: 0, y: 0, w: $1, h: $2, pixels: copy, pitch: $4},
-                      [copy.buffer]);
-        }, gfx->m_pixels.data(), (int)c->width, (int)c->height, (int)total, (int)(c->width * 4));
+        // [sab-present PM28] The old MAIN_THREAD_EM_ASM postMessage NEVER DELIVERED from this
+        // thread (runtime-main's proxy queue starves in steady state — counters proved the
+        // whole chain ran 1030/1030/1030/1030 with zero frames reaching the page; every [wgpu]
+        // one-shot print was lost the same way, which is why this bug looked like "ShowImage
+        // never runs"). Publish through the SHARED HEAP instead: m_pixels lives in the wasm
+        // heap == the page-visible SharedArrayBuffer, so the page can paint directly from it.
+        // Cells: 0x026B3510 = pixels ptr, 0x026B3514 = (w<<16)|h, 0x026B3518 = frame seq
+        // (bumped LAST). Tearing on a mid-write read is acceptable (video frames).
+        ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B350Cu));  // [present-diag TEMP] frames published
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3510u)) =
+            static_cast<u32>(reinterpret_cast<uintptr_t>(gfx->m_pixels.data()));
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3514u)) =
+            (c->width << 16) | (c->height & 0xFFFFu);
+        volatile u32* const seq =
+            reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3518u));
+        *seq = *seq + 1u;
       }
     }
     if (status == WGPUMapAsyncStatus_Success)
@@ -1006,6 +1244,9 @@ void WGPUGfx::PresentBackbuffer()
 void WGPUGfx::ShowImage(const AbstractTexture* source_texture,
                         const MathUtil::Rectangle<int>& source_rc)
 {
+  // [present-diag TEMP PM28] plain SAB counters (no EM_ASM — proxy-queue
+  // independent): ShowImage entries @0x026B1B18.
+  ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3500u));
   // [WGPU M2-A] Continuous present. SupportsUtilityDrawing()==false routes every frame's Present()
   // into ShowImage (Present.cpp:905) with the XFB copy + rect.
   // [WGPU C1 2026-07-13] Present the XFB SNAPSHOT the game actually presented (source_texture,
@@ -1021,13 +1262,23 @@ void WGPUGfx::ShowImage(const AbstractTexture* source_texture,
   ::WGPUTexture present_src = nullptr;  // C handle (not WGPU::WGPUTexture)
   u32 ox = 0, oy = 0;
   u32 w = m_width, h = m_height;
-  if (source_texture)
+  // [efb-direct EXPERIMENT PM29 — one-run toggle, REVERT] present the LIVE EFB
+  // instead of the XFB copy: splits "blit broken" (EFB non-black) from "draws
+  // never land" (EFB black too). Zero device errors + 2053 valid draws + black
+  // XFB readback justify the bisect.
+#define BEM_EFB_DIRECT_PRESENT 0
+#if BEM_EFB_DIRECT_PRESENT
+  const AbstractTexture* source_texture_eff = nullptr;
+#else
+  const AbstractTexture* source_texture_eff = source_texture;
+#endif
+  if (source_texture_eff)
   {
-    present_src = static_cast<const WGPUTexture*>(source_texture)->GetTexture();
+    present_src = static_cast<const WGPUTexture*>(source_texture_eff)->GetTexture();
     const int rc_left = std::max(0, source_rc.left);
     const int rc_top = std::max(0, source_rc.top);
-    const int rc_w = std::min<int>(source_rc.right, source_texture->GetWidth()) - rc_left;
-    const int rc_h = std::min<int>(source_rc.bottom, source_texture->GetHeight()) - rc_top;
+    const int rc_w = std::min<int>(source_rc.right, source_texture_eff->GetWidth()) - rc_left;
+    const int rc_h = std::min<int>(source_rc.bottom, source_texture_eff->GetHeight()) - rc_top;
     if (rc_w <= 0 || rc_h <= 0)
       present_src = nullptr;
     else
@@ -1257,6 +1508,9 @@ WGPUPipelineLayout WGPUGfx::GetUberPipelineLayout()
   WGPUBindGroupLayoutDescriptor g0_desc = {};
   g0_desc.entryCount = g0.size();
   g0_desc.entries = g0.data();
+  // [thread-id PM33 TEMP] init-thread identity @0x026B359C.
+  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B359Cu)) =
+      static_cast<u32>(reinterpret_cast<uintptr_t>(pthread_self()));
   m_uber_bgl_uniforms = wgpuDeviceCreateBindGroupLayout(m_device, &g0_desc);
 
   // --- Group 1: 8 separate scalar textures (binding 0..7) + 8 separate scalar samplers
@@ -1397,6 +1651,18 @@ void WGPUGfx::SetPipeline(const AbstractPipeline* pipeline)
   // AbstractPipeline*, but DrawIndexed needs the raw WGPURenderPipeline handle).
   m_current_pipeline =
       pipeline ? static_cast<const WGPUPipeline*>(pipeline)->GetPipeline() : nullptr;
+  // [oob-arith PM36 TEMP] BOUND pipeline's vertex layout @0x026B3690:
+  // (arrayStride<<16)|(usage<<8)|attrCount — the stride the GPU actually fetches
+  // with; compare to the stream stride base_vertex was computed from (0x3680 set).
+  if (pipeline && pipeline->m_config.vertex_format)
+  {
+    const auto& pvbl = static_cast<const WGPUVertexFormat*>(pipeline->m_config.vertex_format)
+                           ->GetVertexBufferLayout();
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3690u)) =
+        (static_cast<u32>(pvbl.arrayStride) << 16) |
+        (static_cast<u32>(pipeline->m_config.usage) << 8) |
+        static_cast<u32>(pvbl.attributeCount);
+  }
 }
 
 void WGPUGfx::SetTexture(u32 index, const AbstractTexture* texture)
@@ -1549,9 +1815,20 @@ void WGPUGfx::DrawIndexed(WGPUBuffer vertex_buffer, WGPUBuffer index_buffer,
                           WGPUBuffer uniform_buffer, u32 vs_uniform_offset, u32 ps_uniform_offset,
                           u32 num_indices, u32 base_index, u32 base_vertex)
 {
-  if (!m_device || !m_current_pipeline || !vertex_buffer || !index_buffer || !uniform_buffer ||
-      num_indices == 0)
+  // [sab-diag PM30 TEMP] DrawIndexed entries @0x026B3560, null-pipeline bails
+  // @0x026B3564, other bails @0x026B3568, encoder draws executed @0x026B356C.
+  ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3560u));
+  // [thread-id PM33 TEMP] draw thread @0x026B35A4.
+  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35A4u)) =
+      static_cast<u32>(reinterpret_cast<uintptr_t>(pthread_self()));
+  if (!m_current_pipeline)
   {
+    ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3564u));
+    return;
+  }
+  if (!m_device || !vertex_buffer || !index_buffer || !uniform_buffer || num_indices == 0)
+  {
+    ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3568u));
     return;
   }
 #ifdef BEMENTAL_WGPU_PROF
@@ -1632,16 +1909,92 @@ void WGPUGfx::DrawIndexed(WGPUBuffer vertex_buffer, WGPUBuffer index_buffer,
 
   if (grp0 && grp1)
   {
+    // [errscope PM35 TEMP] wrap the first few game draws in an explicit
+    // validation error scope — popErrorScope reports errors the uncaptured
+    // handler can miss. status @0x026B35F4 (0x100|type on callback), first
+    // message text @0x026B3600 (120 bytes).
+    static int s_scope_n = 0;
+    const bool scope_this = s_scope_n < 4 && m_instance;
+    if (scope_this)
+    {
+      s_scope_n++;
+      wgpuDevicePushErrorScope(m_device, WGPUErrorFilter_Validation);
+    }
     wgpuRenderPassEncoderSetPipeline(m_pass, m_current_pipeline);
-    wgpuRenderPassEncoderSetVertexBuffer(m_pass, 0, vertex_buffer, 0, WGPU_WHOLE_SIZE);
-    wgpuRenderPassEncoderSetIndexBuffer(m_pass, index_buffer, WGPUIndexFormat_Uint16, 0,
-                                        WGPU_WHOLE_SIZE);
+    // [basevertex-fold EXPERIMENT PM34] high bit of base_index marks folded
+    // byte offsets: bind buffers AT the offsets, draw with bases 0.
+    const bool fold = (base_index & 0x80000000u) != 0;
+    if (fold)
+    {
+      wgpuRenderPassEncoderSetVertexBuffer(m_pass, 0, vertex_buffer, base_vertex,
+                                           WGPU_WHOLE_SIZE);
+      wgpuRenderPassEncoderSetIndexBuffer(m_pass, index_buffer, WGPUIndexFormat_Uint16,
+                                          base_index & 0x7FFFFFFFu, WGPU_WHOLE_SIZE);
+      base_index = 0;
+      base_vertex = 0;
+    }
+    else
+    {
+      wgpuRenderPassEncoderSetVertexBuffer(m_pass, 0, vertex_buffer, 0, WGPU_WHOLE_SIZE);
+      wgpuRenderPassEncoderSetIndexBuffer(m_pass, index_buffer, WGPUIndexFormat_Uint16, 0,
+                                          WGPU_WHOLE_SIZE);
+    }
     // Dynamic offsets ordered by ascending binding: [PS@0, VS@1].
+    // [dynoff-swap EXPERIMENT PM32 - evaluate] if Dawn applies these in the
+    // OPPOSITE order, the VS reads PS-block bytes as constants (near-zero
+    // "projection" -> every vertex collapses -> zero fragments, no errors).
+#define BEM_DYNOFF_SWAP 0
+#if BEM_DYNOFF_SWAP
+    const uint32_t dyn_offsets[2] = {vs_uniform_offset, ps_uniform_offset};
+#else
     const uint32_t dyn_offsets[2] = {ps_uniform_offset, vs_uniform_offset};
+#endif
     wgpuRenderPassEncoderSetBindGroup(m_pass, 0, grp0, 2, dyn_offsets);
     wgpuRenderPassEncoderSetBindGroup(m_pass, 1, grp1, 0, nullptr);
+    ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B356Cu));
+    if (scope_this)
+    {
+      WGPUPopErrorScopeCallbackInfo cbi = {};
+      cbi.mode = WGPUCallbackMode_AllowSpontaneous;
+      cbi.callback = [](WGPUPopErrorScopeStatus, WGPUErrorType type, WGPUStringView message,
+                        void*, void*) {
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35F4u)) =
+            0x100u | (u32)type;
+        if (message.data && message.length)
+        {
+          volatile char* dst =
+              reinterpret_cast<volatile char*>(static_cast<uintptr_t>(0x026B3600u));
+          const size_t len = message.length < 119 ? message.length : 119;
+          for (size_t i = 0; i < len; i++)
+            dst[i] = message.data[i];
+          dst[len] = 0;
+        }
+      };
+      wgpuDevicePopErrorScope(m_device, cbi);
+    }
+    // [pass-diff PM35 TEMP] game tuple: pass @0x026B35E0, pipeline @0x35E4.
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35E0u)) =
+        static_cast<u32>(reinterpret_cast<uintptr_t>(m_pass));
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35E4u)) =
+        static_cast<u32>(reinterpret_cast<uintptr_t>(m_current_pipeline));
+    // [oob-arith PM36 TEMP] draw-time fetch arithmetic (latest-wins):
+    // base_vertex @0x026B3680, vertex-buffer size @0x3684, num_indices|base_index
+    // @0x3688 (hi16|lo16). OOB is provable as (base_vertex+max_idx)*stride > size.
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3680u)) = base_vertex;
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3684u)) =
+        static_cast<u32>(wgpuBufferGetSize(vertex_buffer));
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3688u)) =
+        (num_indices << 16) | (base_index & 0xFFFFu);
     wgpuRenderPassEncoderDrawIndexed(m_pass, num_indices, 1, base_index,
                                      static_cast<int32_t>(base_vertex), 0);
+    // [nonindexed-probe EXPERIMENT PM35 - REVERT] issue an ADDITIONAL
+    // non-indexed 3-vertex draw from the same base with the same pipeline:
+    // magenta shape appears => DrawIndexed is the broken call; nothing =>
+    // the game PIPELINE object is the broken piece.
+#define BEM_NONINDEXED_PROBE 0
+#if BEM_NONINDEXED_PROBE
+    wgpuRenderPassEncoderDraw(m_pass, 3, 1, base_vertex, 0);
+#endif
   }
 
   // [WGPU C3] grp0/grp1 are cache-owned now — NOT released per-draw (the encoder takes its own
@@ -1719,6 +2072,11 @@ std::unique_ptr<AbstractPipeline> WGPUGfx::CreatePipeline(const AbstractPipeline
   }
   vertex.bufferCount = 1;
   vertex.buffers = &vbl;
+  // [oob-arith PM36 TEMP] pipeline-side vertex layout @0x026B368C:
+  // (arrayStride<<16)|attributeCount — compare against the draw-time stream
+  // stride (vtx field lo16). Latest-wins; game pipelines dominate.
+  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B368Cu)) =
+      (static_cast<u32>(vbl.arrayStride) << 16) | static_cast<u32>(vbl.attributeCount);
 
   // --- Primitive (topology / cull / front-face). GameCube front faces are CW. ---
   static constexpr std::array<WGPUPrimitiveTopology, 4> kTopo = {
@@ -1727,6 +2085,15 @@ std::unique_ptr<AbstractPipeline> WGPUGfx::CreatePipeline(const AbstractPipeline
   WGPUPrimitiveState primitive = {};
   primitive.topology = kTopo[(u32)config.rasterization_state.primitive.Value()];
   primitive.frontFace = WGPUFrontFace_CW;
+  // [cull-none EXPERIMENT PM32 - evaluate] the vertex WGSL double-negates Y
+  // (WGPUUberShaders.h:1150 then :1172) — if the net orientation is wrong for
+  // frontFace=CW, Back-culling discards EVERY triangle: zero fragments, zero
+  // errors, clears unaffected (the exact observed signature; also explains the
+  // depth-Always and forced-magenta no-ops — culling precedes both).
+#define BEM_CULL_NONE 0  // [PM36 re-test with top-magenta: still black -> cull validly eliminated]
+#if BEM_CULL_NONE
+  primitive.cullMode = WGPUCullMode_None;
+#else
   switch (config.rasterization_state.cull_mode.Value())
   {
   case CullMode::None: primitive.cullMode = WGPUCullMode_None; break;
@@ -1734,6 +2101,7 @@ std::unique_ptr<AbstractPipeline> WGPUGfx::CreatePipeline(const AbstractPipeline
   case CullMode::Front: primitive.cullMode = WGPUCullMode_Front; break;
   default: primitive.cullMode = WGPUCullMode_None; break;  // All -> handled in shader; no native
   }
+#endif
   if (primitive.topology == WGPUPrimitiveTopology_TriangleStrip ||
       primitive.topology == WGPUPrimitiveTopology_LineStrip)
     primitive.stripIndexFormat = WGPUIndexFormat_Uint16;
@@ -1751,6 +2119,12 @@ std::unique_ptr<AbstractPipeline> WGPUGfx::CreatePipeline(const AbstractPipeline
   depth.depthCompare = config.depth_state.test_enable
                            ? MapCompare(config.depth_state.func.Value(), inverted_depth)
                            : WGPUCompareFunction_Always;
+  // [depth-always EXPERIMENT PM31 - REVERT] content appears => depth test was
+  // rejecting all fragments (reversed-Z compare/clear pairing bug).
+#define BEM_DEPTH_ALWAYS 0  // [PM36 re-test with top-magenta: still black -> depth validly eliminated]
+#if BEM_DEPTH_ALWAYS
+  depth.depthCompare = WGPUCompareFunction_Always;
+#endif
   // No stencil aspect in Depth32Float; WebGPU wants the disabled-stencil canonical form
   // (compare=Always, all ops=Keep) on both faces, not the zero/Undefined default.
   depth.stencilFront = {WGPUCompareFunction_Always, WGPUStencilOperation_Keep,
@@ -1779,6 +2153,14 @@ std::unique_ptr<AbstractPipeline> WGPUGfx::CreatePipeline(const AbstractPipeline
   if (config.blending_state.alpha_update)
     write_mask |= WGPUColorWriteMask_Alpha;
 
+  // [sab-diag PM30 TEMP] pipelines created with writeMask None @0x026B3570 vs
+  // with color enabled @0x026B3574 — an all-None census = the BP blending
+  // state feeding configs is zeros (dual-core state-split class).
+  ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(
+      write_mask == WGPUColorWriteMask_None ? 0x026B3570u : 0x026B3574u));
+  // [thread-id PM33 TEMP] pipeline-create thread @0x026B35A0.
+  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35A0u)) =
+      static_cast<u32>(reinterpret_cast<uintptr_t>(pthread_self()));
   WGPUColorTargetState color_target = {};
   color_target.format = WGPUTextureFormat_RGBA8Unorm;
   color_target.blend = config.blending_state.blend_enable ? &blend : nullptr;
