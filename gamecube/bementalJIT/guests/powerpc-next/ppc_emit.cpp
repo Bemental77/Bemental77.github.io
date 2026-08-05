@@ -692,6 +692,7 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         switch (sub5_59) {
         case 18: case 20: case 21: case 25:  emit_fp_arith_single(wb, rc, frc, op, params.ctx_ptr); return true;
         case 28: case 29: case 30: case 31:  emit_fp_fma_single  (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 24:                             emit_fres           (wb, rc, frc, op, params.ctx_ptr); return true;  // fres
         default: break;
         }
         emit_fallback(wb, rc, frc, op, params.ctx_ptr);
@@ -720,6 +721,7 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         case 18: case 20: case 21: case 25:  emit_fp_arith_double(wb, rc, frc, op, params.ctx_ptr); return true;
         case 28: case 29: case 30: case 31:  emit_fp_fma_double  (wb, rc, frc, op, params.ctx_ptr); return true;
         case 23:                             emit_fsel           (wb, rc, frc, op, params.ctx_ptr); return true;
+        case 26:                             emit_frsqrte        (wb, rc, frc, op, params.ctx_ptr); return true;  // frsqrte
         default: break;
         }
         // fcmpu/fcmpo/frsp/fctiw*/mffs/mtfsf* still routed to interp.

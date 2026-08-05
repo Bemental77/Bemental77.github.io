@@ -162,6 +162,46 @@ void emit_fsel(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     wb.op_local_set(fd_pair.ps0_idx);
 }
 
+// fres (op59 sub5 24) — ps0(frD) = 1/ps0(frB). [PM62] board 1.7M interp
+// fallbacks. FULL-PRECISION reciprocal (f64.div) instead of the PPC estimate:
+// exact on every special case (0->+inf, inf->0, NaN->NaN, -0->-inf) and MORE
+// accurate than the 5-bit estimate on normals — the guest's Newton-Raphson
+// refinement converges regardless, so it's board-safe. Faster than the interp
+// estimate-table fallback. FPSCR (FPRF/exceptions) skipped like the other native
+// FP ops (native runs them off). fres. (Rc=1) -> interp (CR1<-FPSCR, rare).
+void emit_fres(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+               const CodeOp& op, u32 ctx_ptr) {
+    if (GekkoOperands::Rc(op.inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
+    const u32 fd = GekkoOperands::FD(op.inst);
+    const u32 fb = GekkoOperands::FB(op.inst);
+    auto fb_pair = frc.Bind(fb, FPRMode::Read,  FPR_LANE_PS0);
+    auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_PS0);
+    wb.op_f64_const(1.0);
+    wb.op_local_get(fb_pair.ps0_idx); wb.op_f64_reinterpret_i64();
+    wb.op_f64_div();                           // 1.0 / ps0(fb)
+    wb.op_i64_reinterpret_f64();
+    wb.op_local_set(fd_pair.ps0_idx);
+}
+
+// frsqrte (op63 sub5 26) — ps0(frD) = 1/sqrt(ps0(frB)). [PM62] board 8.1M interp
+// fallbacks (the biggest remaining FP fallback — 3D normalization/perspective).
+// Full-precision 1/sqrt (exact on 0->+inf, neg->NaN, inf->0, NaN->NaN; Newton-safe
+// on normals). FPSCR skipped. frsqrte. (Rc=1) -> interp.
+void emit_frsqrte(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
+                  const CodeOp& op, u32 ctx_ptr) {
+    if (GekkoOperands::Rc(op.inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
+    const u32 fd = GekkoOperands::FD(op.inst);
+    const u32 fb = GekkoOperands::FB(op.inst);
+    auto fb_pair = frc.Bind(fb, FPRMode::Read,  FPR_LANE_PS0);
+    auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_PS0);
+    wb.op_f64_const(1.0);
+    wb.op_local_get(fb_pair.ps0_idx); wb.op_f64_reinterpret_i64();
+    wb.op_f64_sqrt();
+    wb.op_f64_div();                           // 1.0 / sqrt(ps0(fb))
+    wb.op_i64_reinterpret_f64();
+    wb.op_local_set(fd_pair.ps0_idx);
+}
+
 // fnabs fD, fB — ps0(fD) = -|ps0(fB)|. abs then neg.
 void emit_fnabsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op, u32 ctx_ptr) {
     if (GekkoOperands::Rc(op.inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
