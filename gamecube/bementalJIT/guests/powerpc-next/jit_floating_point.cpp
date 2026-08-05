@@ -105,7 +105,10 @@ void emit_fabsx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Cod
 void emit_fcmpu(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                 const CodeOp& op, u32 ctx_ptr) {
     const u32 crfd = GekkoOperands::CRFD(op.inst);
-    if (op.crDiscardable[crfd]) return;               // CR field dead — skip
+    // [PM63] Do NOT honor op.crDiscardable here — the analyzer's CR-liveness may
+    // not model fcmpu as a CR writer (it was always interp-fallback before), so a
+    // "dead" field it flags could actually be read by a later branch (cold boot
+    // DVD stall). Always write; the interp fallback always did.
     const u32 fa = GekkoOperands::FA(op.inst);
     const u32 fb = GekkoOperands::FB(op.inst);
     auto fa_pair = frc.Bind(fa, FPRMode::Read, FPR_LANE_PS0);
