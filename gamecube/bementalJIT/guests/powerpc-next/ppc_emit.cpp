@@ -506,10 +506,11 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         case 528: emit_bcctrx(wb, rc, frc, op, params.ctx_ptr);   return true;
         case 50:  emit_rfi   (wb, rc, frc, op, params.ctx_ptr);   return true;
         case 150: /* isync */                                return true;
-        // CR-logical family — native (jit_compare.cpp). mcrf (0) stays interp.
-        case 257: case 129: case 289: case 225:
-        case  33: case 449: case 417: case 193:
-            emit_cr_logic(wb, rc, frc, op, params.ctx_ptr);      return true;
+        // [PM63 REGRESSION REVERT] CR-logical natives disabled pending bisect
+        // (cold-boot DVD stall at cmd 12) — fall back to interp.
+        // case 257: case 129: case 289: case 225:
+        // case  33: case 449: case 417: case 193:
+        //     emit_cr_logic(wb, rc, frc, op, params.ctx_ptr);      return true;
         default:  break;
         }
         break;
@@ -692,7 +693,8 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         switch (sub5_59) {
         case 18: case 20: case 21: case 25:  emit_fp_arith_single(wb, rc, frc, op, params.ctx_ptr); return true;
         case 28: case 29: case 30: case 31:  emit_fp_fma_single  (wb, rc, frc, op, params.ctx_ptr); return true;
-        case 24:                             emit_fres           (wb, rc, frc, op, params.ctx_ptr); return true;  // fres
+        // [PM63 REGRESSION REVERT] disabled pending bisect (cold-boot DVD stall):
+        // case 24:                             emit_fres           (wb, rc, frc, op, params.ctx_ptr); return true;
         default: break;
         }
         emit_fallback(wb, rc, frc, op, params.ctx_ptr);
@@ -704,8 +706,10 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // frsqrte) still routed to interp.
     case 63: {
         switch (sub10) {
-        case   0: emit_fcmpu (wb, rc, frc, op, params.ctx_ptr); return true;  // fcmpu
-        case  32: emit_fcmpu (wb, rc, frc, op, params.ctx_ptr); return true;  // fcmpo (same impl)
+        // [PM63 REGRESSION REVERT] fcmpu/fcmpo natives broke the cold-boot DVD load
+        // (dvdCmdN stuck at 12) — disabled pending bisect; fall back to interp.
+        // case   0: emit_fcmpu (wb, rc, frc, op, params.ctx_ptr); return true;  // fcmpu
+        // case  32: emit_fcmpu (wb, rc, frc, op, params.ctx_ptr); return true;  // fcmpo
         case  72: emit_fmrx  (wb, rc, frc, op, params.ctx_ptr); return true;
         case  40: emit_fnegx (wb, rc, frc, op, params.ctx_ptr); return true;
         case 264: emit_fabsx (wb, rc, frc, op, params.ctx_ptr); return true;
@@ -720,8 +724,9 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         switch (sub5_63) {
         case 18: case 20: case 21: case 25:  emit_fp_arith_double(wb, rc, frc, op, params.ctx_ptr); return true;
         case 28: case 29: case 30: case 31:  emit_fp_fma_double  (wb, rc, frc, op, params.ctx_ptr); return true;
-        case 23:                             emit_fsel           (wb, rc, frc, op, params.ctx_ptr); return true;
-        case 26:                             emit_frsqrte        (wb, rc, frc, op, params.ctx_ptr); return true;  // frsqrte
+        // [PM63 REGRESSION REVERT] disabled pending bisect (cold-boot DVD stall):
+        // case 23:                             emit_fsel           (wb, rc, frc, op, params.ctx_ptr); return true;
+        // case 26:                             emit_frsqrte        (wb, rc, frc, op, params.ctx_ptr); return true;
         default: break;
         }
         // fcmpu/fcmpo/frsp/fctiw*/mffs/mtfsf* still routed to interp.
