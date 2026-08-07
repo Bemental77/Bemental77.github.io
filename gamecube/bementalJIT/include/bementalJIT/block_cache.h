@@ -247,6 +247,13 @@ private:
     std::unordered_set<u32> m_sealed_pcs;
     u32  m_sealed_gen_count = 0u;
     bool m_region_has_sealed = false;
+    // [PM54f SMC fix 2026-08-07] fused-successor pc -> predecessor pcs that
+    // spliced it in via run-fusion. Eviction of a fused successor MUST also evict
+    // these predecessors: the predecessor's compiled body embeds the successor's
+    // (now stale) instructions, but JitWasm's m_block_guest_end[pred] covers only
+    // the predecessor's own contiguous range, so InvalidateICacheRange(succ) never
+    // selects the predecessor and it would keep running the stale spliced bytes.
+    std::unordered_map<u32, std::vector<u32>> m_fused_succ_to_pred;
 };
 
 // ---- Lower-level free helpers ----

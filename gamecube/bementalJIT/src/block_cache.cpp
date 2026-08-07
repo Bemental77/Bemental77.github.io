@@ -222,17 +222,6 @@ extern "C" int bem_pc_force_double(uint32_t pc) {
 }
 extern "C" void bem_pc_force_double_add(uint32_t pc) {
     g_bem_force_double_map[pc]++;
-#ifdef __EMSCRIPTEN__
-    // [single-spec TEMP diag] deopt-pc RING @0x026B3400 (32 slots) + count
-    // @0x026B33F4 — worker EM_ASM console.log does NOT relay to the probe
-    // (bcl-pc0 precedent), so publish via SAB.
-    volatile uint32_t* n =
-        reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B33F4u));
-    volatile uint32_t* ring =
-        reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B3400u));
-    ring[*n & 31u] = pc;
-    *n = *n + 1u;
-#endif
 }
 unsigned char g_bem_cdispatch_enabled = 1;  // C-loop vs legacy JS loop (A/B / fallback)
 
@@ -1158,6 +1147,20 @@ void BlockCache::evict(u64 key) {
         if (g_bem_mrtag[bkt] == pc) { g_bem_mrtag[bkt] = 0xFFFFFFFFu; g_bem_mrslot[bkt] = -1; }
     }
     unseal_pc_js(pc);
+    // [PM54f SMC fix 2026-08-07] If pc was fused into predecessor(s) by run-
+    // fusion, evict them too: their compiled body embeds pc's now-stale
+    // instructions and their own guest-end range does not cover pc, so this
+    // targeted evict/icbi would otherwise leave the stale splice live. Move-out +
+    // erase before recursing so the (fusion-depth-bounded) recursion cannot
+    // observe a half-updated map; self-guard against a degenerate pred==pc.
+    {
+        auto fit = m_fused_succ_to_pred.find(pc);
+        if (fit != m_fused_succ_to_pred.end()) {
+            std::vector<u32> preds = std::move(fit->second);
+            m_fused_succ_to_pred.erase(fit);
+            for (u32 p : preds) if (p != pc) evict(static_cast<u64>(p));
+        }
+    }
 }
 
 void BlockCache::clear() {
@@ -1217,6 +1220,7 @@ void BlockCache::clear() {
     m_sealed_pcs.clear();
     m_sealed_gen_count = 0u;
     m_region_has_sealed = false;
+    m_fused_succ_to_pred.clear();   // [PM54f] fusion mappings die with the gens
 #ifdef __EMSCRIPTEN__
     EM_ASM({
         if (Module.bemental_pc_to_handle) Module.bemental_pc_to_handle.clear();
@@ -1245,6 +1249,7 @@ void BlockCache::invalidate_overlap(u32 addr, u32 max_block_bytes) {
     // so use max_block_bytes (default 256B = 64 instructions) as the upper
     // bound on block length. Over-eviction is correctness-safe: blocks just
     // recompile on next dispatch.
+    std::vector<u32> fused_preds;   // [PM54f] predecessors to evict after the loop
     for (auto it = m_map.begin(); it != m_map.end(); ) {
         const u32 start_pc = static_cast<u32>(it->first);
         if (addr >= start_pc && addr < start_pc + max_block_bytes) {
@@ -1262,10 +1267,21 @@ void BlockCache::invalidate_overlap(u32 addr, u32 max_block_bytes) {
                 if (g_bem_mrtag[bkt] == start_pc) { g_bem_mrtag[bkt] = 0xFFFFFFFFu; g_bem_mrslot[bkt] = -1; }
             }
             unseal_pc_js(start_pc);
+            // [PM54f SMC fix 2026-08-07] collect any predecessors that fused this
+            // successor; evict them AFTER the m_map iteration so evict()'s own
+            // m_map mutation can't invalidate this iterator.
+            auto fit = m_fused_succ_to_pred.find(start_pc);
+            if (fit != m_fused_succ_to_pred.end()) {
+                fused_preds.insert(fused_preds.end(), fit->second.begin(), fit->second.end());
+                m_fused_succ_to_pred.erase(fit);
+            }
         } else {
             ++it;
         }
     }
+    // [PM54f SMC fix] Evict the fused predecessors now that iteration is done
+    // (evict() safely mutates m_map and recurses for chained fusions).
+    for (u32 p : fused_preds) evict(static_cast<u64>(p));
 }
 
 s32 BlockCache::chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_pc,
@@ -1879,6 +1895,16 @@ void BlockCache::region_seal(u32 mem_pages) {
                             break;
                         }
                     }
+                }
+                // [PM54f SMC fix 2026-08-07] Record each successor spliced into
+                // THIS predecessor (visited[0]=rec.start_pc itself; [1,n_vis) are
+                // the fused successors) so evict()/invalidate_overlap of a fused
+                // successor also evicts the predecessor holding its stale bytes.
+                // Gated on depth>1 so a seam-contract-reverted fusion (depth reset
+                // to 1 above) records nothing.
+                if (depth > 1u) {
+                    for (u32 v = 1u; v < n_vis; ++v)
+                        m_fused_succ_to_pred[visited[v]].push_back(rec.start_pc);
                 }
             }
             if (depth > 1u) { ++fused_runs; fused_blocks += depth; }

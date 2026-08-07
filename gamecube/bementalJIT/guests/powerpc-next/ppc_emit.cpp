@@ -244,9 +244,39 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
     // (same instance; ~500-wire-byte callees are TurboFan-inline candidates).
     // Sits after the service/vector checks (identical gating to the probe
     // path) and short-circuits the bucket probe for the common static edges.
-    for (u32 di = 0; di < n_direct; ++di) {
+    //
+    // [PM54d correctness fix 2026-08-07] The bare PC-compare had NO liveness
+    // guard: after evict()/invalidate_overlap of direct_pcs[di] (SMC icbi, or a
+    // PM26 single-spec deopt) the successor's block is unsealed but its baked
+    // function still lives in the IMMUTABLE gen module, so this arm would
+    // return_call the STALE body forever (SMC-stale execution; and for a deopt,
+    // an A->stale-B->re-deopt livelock where the recompiled B is unreachable via
+    // A). Fix: gate the direct call with the SAME own-gen check the probe path
+    // uses (g_bem_disp_tag[bucket]==PC && (g_bem_disp_slot[bucket]>>16)==gen) —
+    // evict clears that tag bucket, so the guard misses and we fall through to
+    // the probe/host return (self-healing), exactly like the runtime edges the
+    // old "no baked edges to patch" invariant assumed. The successor PC is known
+    // at emit, so its bucket is a COMPILE-TIME constant: this is a const-address
+    // load, not a runtime bucket probe, and the edge stays a DIRECT (inline-
+    // candidate) return_call rather than an indirect table call. The gen check
+    // (not just the tag) is required: after evict+recompile into a DIFFERENT gen
+    // the tag re-populates but slot.gen != region_gen, so the stale fidx is
+    // correctly rejected. Only meaningful for region bodies (region_gen>=0);
+    // direct edges are never emitted otherwise.
+    for (u32 di = 0; region_gen >= 0 && di < n_direct; ++di) {
+        const u32 d_bucket_off = (((direct_pcs[di] >> 2) & BEM_DISP_MASK_NEXT) * 4u);
+        // (PC == direct_pcs[di])
         b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
         b.op_i32_const((s32)direct_pcs[di]); b.op_i32_eq();
+        // AND (g_bem_disp_tag[bucket] == direct_pcs[di])  — target still resident
+        b.op_i32_const((s32)(tag_addr + d_bucket_off)); b.op_i32_load(0);
+        b.op_i32_const((s32)direct_pcs[di]); b.op_i32_eq();
+        b.op_i32_and();
+        // AND ((g_bem_disp_slot[bucket] >> 16) == region_gen)  — still OUR gen
+        b.op_i32_const((s32)(slot_addr + d_bucket_off)); b.op_i32_load(0);
+        b.op_i32_const(16); b.op_i32_shr_u();
+        b.op_i32_const((s32)region_gen); b.op_i32_eq();
+        b.op_i32_and();
         b.op_if(BLOCK_TYPE_VOID);
             b.op_return_call(direct_fidx[di]);
         b.op_end();
