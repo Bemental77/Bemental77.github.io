@@ -104,6 +104,21 @@
     <button id="btnResetAudio" disabled>↻ Reset Audio</button>
     <button id="btnFull" disabled>⛶ Fullscreen</button>
     <button id="btnLog" type="button">Toggle Log</button>
+    <button id="btnControls" type="button">🎮 Controls</button>
+    <div id="controlsOverlay" style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.72);align-items:center;justify-content:center;">
+      <div style="background:#1b1b1f;color:#eee;border:1px solid #444;border-radius:10px;padding:20px 26px;max-width:460px;font:14px/1.7 system-ui,sans-serif;box-shadow:0 8px 40px rgba(0,0,0,.6);">
+        <div style="font-size:18px;font-weight:600;margin-bottom:12px;">🎮 Keyboard Controls</div>
+        <table style="border-collapse:collapse;width:100%;">
+          <tr><td style="padding:3px 0;color:#8bd;">Control Stick&nbsp;(move)</td><td style="text-align:right;"><b>W&nbsp; A&nbsp; S&nbsp; D</b></td></tr>
+          <tr><td style="padding:3px 0;color:#8bd;">C-Stick</td><td style="text-align:right;"><b>P&nbsp; L&nbsp; ;&nbsp; '</b></td></tr>
+          <tr><td style="padding:3px 0;color:#8bd;">A / B / Y / X</td><td style="text-align:right;"><b>M / N / J / K</b></td></tr>
+          <tr><td style="padding:3px 0;color:#8bd;">L / R / Z</td><td style="text-align:right;"><b>Q / R / E</b></td></tr>
+          <tr><td style="padding:3px 0;color:#8bd;">Start / Select</td><td style="text-align:right;"><b>V / C</b></td></tr>
+          <tr><td style="padding:3px 0;color:#8bd;">D-Pad</td><td style="text-align:right;"><b>Arrow Keys</b></td></tr>
+        </table>
+        <div style="text-align:right;margin-top:16px;"><button id="controlsClose" type="button">Close</button></div>
+      </div>
+    </div>
   </div>
   <div id="canvasWrap"><canvas id="canvas" width="640" height="528"></canvas></div>
   <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
@@ -2896,7 +2911,7 @@
                // new in-VIWaitForRetrace condition).
     }
   };
-  var mobilePadState = { a: false, b: false, x: false, y: false, l: false, r: false, z: false, start: false, select: false, up: false, down: false, left: false, right: false };
+  var mobilePadState = { a: false, b: false, x: false, y: false, l: false, r: false, z: false, start: false, select: false, up: false, down: false, left: false, right: false, cup: false, cdown: false, cleft: false, cright: false };
   // 2026-06-12 INPUT REPAIR. The old body was active-low read-modify-write
   // (only ever CLEARED bits) against a buffer pinned to 0 by the fill(0) in
   // var_setup, in a bit layout the worker never read — so no press EVER
@@ -2912,7 +2927,8 @@
     var b0 = (s.b ? 1 : 0) | (s.y ? 2 : 0) | (s.select ? 4 : 0) | (s.start ? 8 : 0)
            | (s.up ? 16 : 0) | (s.down ? 32 : 0) | (s.left ? 64 : 0) | (s.right ? 128 : 0);
     var b1 = (s.a ? 1 : 0) | (s.x ? 2 : 0) | (s.z ? 8 : 0) | (s.l ? 16 : 0) | (s.r ? 32 : 0);
-    Module.HEAPU8[padStatus1] = b0; Module.HEAPU8[padStatus1 + 1] = b1;
+    var b2 = (s.cup ? 1 : 0) | (s.cdown ? 2 : 0) | (s.cleft ? 4 : 0) | (s.cright ? 8 : 0);  // C-stick: ids 16-19 (worker synthesizes RIGHT analog)
+    Module.HEAPU8[padStatus1] = b0; Module.HEAPU8[padStatus1 + 1] = b1; Module.HEAPU8[padStatus1 + 2] = b2;
   }
   var KEY_CODES = { 'ArrowUp': ['ArrowUp', 38], 'ArrowDown': ['ArrowDown', 40], 'ArrowLeft': ['ArrowLeft', 37], 'ArrowRight': ['ArrowRight', 39], 'x': ['KeyX', 88], 'z': ['KeyZ', 90], 's': ['KeyS', 83], 'd': ['KeyD', 68], 'w': ['KeyW', 87], 'r': ['KeyR', 82], 'e': ['KeyE', 69], 'v': ['KeyV', 86], 'c': ['KeyC', 67] };
   function dispatchKey(type, key) {
@@ -2929,8 +2945,16 @@
   // dispatchKey carry isTrusted=false and are already applied there, so
   // skip them to avoid double-toggling.
   (function () {
-    var keyToPad = { 'ArrowUp': 'up', 'ArrowDown': 'down', 'ArrowLeft': 'left', 'ArrowRight': 'right', 'x': 'a', 'z': 'b', 's': 'x', 'd': 'y', 'w': 'l', 'r': 'r', 'e': 'z', 'v': 'start', 'c': 'select' };
+    // Physical keyboard → GC pad. WASD = Main Stick (analog, synthesized worker-
+    // side from these d-pad bits — EmscriptenWorker input_state_cb); M/N/J/K =
+    // A/B/Y/X. Arrows kept as a redundant d-pad; L/R/Z/Start/Select on q/r/e/v/c.
+    var keyToPad = { 'w': 'up', 'a': 'left', 's': 'down', 'd': 'right',
+                     'ArrowUp': 'up', 'ArrowDown': 'down', 'ArrowLeft': 'left', 'ArrowRight': 'right',
+                     'm': 'a', 'n': 'b', 'j': 'y', 'k': 'x',
+                     'p': 'cup', 'l': 'cleft', ';': 'cdown', "'": 'cright',
+                     'q': 'l', 'r': 'r', 'e': 'z', 'v': 'start', 'c': 'select' };
     function onKey(type, e) {
+      if (e && e.key && e.key.length === 1) e = { isTrusted: e.isTrusted, key: e.key.toLowerCase(), preventDefault: e.preventDefault.bind(e) };
       if (!e.isTrusted) return;
       var padBtn = keyToPad[e.key];
       if (!padBtn) return;
@@ -3746,6 +3770,7 @@
   async function resetAudio() { var ctx = getAudioCtx(); if (!ctx) { toast('Audio not ready', true); return; } toast('Resetting audio…'); try { await ctx.suspend(); } catch (e) {} await new Promise(r => setTimeout(r, 150)); if (!audioMuted) { try { await ctx.resume(); } catch (e) {} } toast('Audio reset'); }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasWrap'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
   $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', () => $('importFile').click()); $('importFile').addEventListener('change', (e) => { if (e.target.files && e.target.files[0]) importState(e.target.files[0]); e.target.value = ''; }); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
+  (function () { var o = $('controlsOverlay'), b = $('btnControls'), c = $('controlsClose'); if (!o || !b) return; b.addEventListener('click', function () { o.style.display = (o.style.display === 'flex') ? 'none' : 'flex'; }); if (c) c.addEventListener('click', function () { o.style.display = 'none'; }); o.addEventListener('click', function (e) { if (e.target === o) o.style.display = 'none'; }); })();
   function openMobileMenu() { $('mobileMenu').classList.add('open'); } function closeMobileMenu() { $('mobileMenu').classList.remove('open'); }
   function applyGhost(on) { $('mobileShell').classList.toggle('ghost', on); if ($('mGhost')) $('mGhost').textContent = 'Transparent Controls: ' + (on ? 'On' : 'Off'); }
   function toggleGhost() { var on = !$('mobileShell').classList.contains('ghost'); localStorage.setItem('gcwasm_ghost', on ? '1' : '0'); applyGhost(on); }

@@ -259,8 +259,39 @@ static void audio_sample_cb(int16_t l, int16_t r) {
 static void input_poll_cb(void) {}
 
 static int16_t input_state_cb(unsigned port, unsigned device, unsigned index, unsigned id) {
-    (void)device; (void)index;
-    if (port < 4 && id < 64) {
+    if (port >= 4) return 0;
+    // [analog-stick-from-dpad 2026-08-07] The page ships DIGITAL libretro joypad
+    // bits only (g_pad). But GC games move the character with the ANALOG Main
+    // Stick (bound to RETRO_DEVICE_ANALOG LEFT X0/Y0), NOT the D-Pad — so digital
+    // d-pad presses never move anyone. Synthesize FULL-deflection analog for the
+    // left stick from the d-pad bits so keyboard WASD (→ UP/DOWN/LEFT/RIGHT)
+    // drives the Main Stick. Sign convention matches Input.cpp AddAxis: RIGHT/DOWN
+    // = +0x7FFF, LEFT/UP = -0x8000.
+    if (device == RETRO_DEVICE_ANALOG && index == RETRO_DEVICE_INDEX_ANALOG_LEFT) {
+        const unsigned base = port * 8;
+        auto padbit = [&](unsigned rid) -> int { return (g_pad[base + rid / 8] >> (rid % 8)) & 1; };
+        if (id == RETRO_DEVICE_ID_ANALOG_X)
+            return padbit(RETRO_DEVICE_ID_JOYPAD_RIGHT) ? 0x7FFF
+                 : padbit(RETRO_DEVICE_ID_JOYPAD_LEFT)  ? -0x8000 : 0;
+        if (id == RETRO_DEVICE_ID_ANALOG_Y)
+            return padbit(RETRO_DEVICE_ID_JOYPAD_DOWN)  ? 0x7FFF
+                 : padbit(RETRO_DEVICE_ID_JOYPAD_UP)    ? -0x8000 : 0;
+        return 0;
+    }
+    // [c-stick-from-keys 2026-08-07] The GC C-Stick (RETRO_DEVICE_ANALOG RIGHT) is
+    // synthesized from 4 virtual digital bits the page writes at joypad ids 16-19
+    // (g_pad byte 2 for port 0): 16=C-up, 17=C-down, 18=C-left, 19=C-right. Keyboard
+    // P/L/;/' set these. Same full-deflection + sign convention as the Main Stick.
+    if (device == RETRO_DEVICE_ANALOG && index == RETRO_DEVICE_INDEX_ANALOG_RIGHT) {
+        const unsigned base = port * 8;
+        auto padbit = [&](unsigned rid) -> int { return (g_pad[base + rid / 8] >> (rid % 8)) & 1; };
+        if (id == RETRO_DEVICE_ID_ANALOG_X)
+            return padbit(19) ? 0x7FFF : padbit(18) ? -0x8000 : 0;   // C-right / C-left
+        if (id == RETRO_DEVICE_ID_ANALOG_Y)
+            return padbit(17) ? 0x7FFF : padbit(16) ? -0x8000 : 0;   // C-down / C-up
+        return 0;
+    }
+    if (id < 64) {
         unsigned byte = port * 8 + (id / 8);
         if (byte < sizeof(g_pad)) {
             return (g_pad[byte] >> (id % 8)) & 1;
