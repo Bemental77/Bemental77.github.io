@@ -193,6 +193,26 @@ void emit_fres(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     wb.op_local_get(fb_pair.ps0_idx); wb.op_f64_reinterpret_i64();
     wb.op_f64_div();                           // 1.0 / ps0(fb)
     wb.op_i64_reinterpret_f64();
+    // [PM62 special-case fix 2026-08-07] Dolphin ApproximateReciprocal clamps
+    // |input| < 2^-128 (denormals + tiny normals; FloatUtils.cpp:172 exponent<895<<52)
+    // to copysign(FLT_MAX, input); our 1.0/tiny overflows to +-inf. copysign(FLT_MAX,
+    // x) = (x & sign) | 0x47efffffe0000000. Guard excludes +-0 (Dolphin sends those to
+    // +-inf, which our 1/+-0 already gives); +-inf/NaN have |x| >= 2^-128, untouched.
+    wb.op_local_set(LOCAL_FP_I64_A);               // computed 1/x
+    wb.op_local_get(fb_pair.ps0_idx);
+    wb.op_i64_const((s64)0x8000000000000000ull);   // input sign bit
+    wb.op_i64_and();
+    wb.op_i64_const((s64)0x47efffffe0000000ll);    // FLT_MAX as double
+    wb.op_i64_or();                                // val1 = copysign(FLT_MAX, input)
+    wb.op_local_get(LOCAL_FP_I64_A);               // val2 = computed
+    wb.op_local_get(fb_pair.ps0_idx); wb.op_f64_reinterpret_i64(); wb.op_f64_abs();
+    wb.op_f64_const(0x1p-128);
+    wb.op_f64_lt();                                // |input| < 2^-128
+    wb.op_f64_const(0.0);
+    wb.op_local_get(fb_pair.ps0_idx); wb.op_f64_reinterpret_i64(); wb.op_f64_abs();
+    wb.op_f64_lt();                                // 0.0 < |input|  (excludes +-0)
+    wb.op_i32_and();
+    wb.op_select();                                // cond ? FLT_MAX : computed
     wb.op_local_set(fd_pair.ps0_idx);
     wb.op_local_get(fd_pair.ps0_idx);          // Fill: ps1 = ps0 (both-lane single)
     wb.op_local_set(fd_pair.ps1_idx);
@@ -214,6 +234,19 @@ void emit_frsqrte(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     wb.op_f64_sqrt();
     wb.op_f64_div();                           // 1.0 / sqrt(ps0(fb))
     wb.op_i64_reinterpret_f64();
+    // [PM62 special-case fix 2026-08-07] Dolphin ApproximateReciprocalSquareRoot
+    // returns +qNaN (0x7ff8..., sign CLEAR; FloatUtils.cpp:114 `if(sign) return
+    // quiet_NaN()`) for a negative-finite input or -inf; wasm 1.0/sqrt(neg) yields
+    // -qNaN (0xfff8..., sign SET). f64.lt(input,0.0) is TRUE for exactly {-inf,
+    // negative-finite} and FALSE for -0 (->-inf, already correct) and NaN
+    // (sign-preserving passthrough, already correct) — select the canonical +qNaN.
+    wb.op_local_set(LOCAL_FP_I64_A);               // computed 1/sqrt bits
+    wb.op_i64_const((s64)0x7ff8000000000000ll);    // val1 = +qNaN
+    wb.op_local_get(LOCAL_FP_I64_A);               // val2 = computed
+    wb.op_local_get(fb_pair.ps0_idx); wb.op_f64_reinterpret_i64();
+    wb.op_f64_const(0.0);
+    wb.op_f64_lt();                                // cond = input < 0.0
+    wb.op_select();                                // cond ? +qNaN : computed
     wb.op_local_set(fd_pair.ps0_idx);
 }
 

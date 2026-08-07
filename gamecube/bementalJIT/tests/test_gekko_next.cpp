@@ -2975,7 +2975,71 @@ static bool test_psmtxconcat_row2_build() {
     return ok;
 }
 
+// [PM62 special-case conformance 2026-08-07] frsqrte/fres native emitters vs the
+// Dolphin ApproximateReciprocalSquareRoot / ApproximateReciprocal special-value
+// ladders (Common/FloatUtils.cpp). Workflow wf_d6c659d7 (both sides run in V8) found:
+//   frsqrte(negative)  -> our -qNaN (0xfff8..)  should be +qNaN (0x7ff8..)   [FIXED]
+//   fres(denormal)     -> our +-inf              should be copysign(FLT_MAX)  [FIXED]
+// Special values are Dolphin-exact; the +2.0/4.0 normal cases are OUR full-precision
+// (PM62 replaced the 5-bit estimate — intentionally more accurate — so they check the
+// normal path is intact, not Gekko-estimate parity).
+static bool test_frsqrte_special_values() {
+    struct V { u64 in; u64 exp; const char* name; };
+    static const V vs[] = {
+        { 0xBFF0000000000000ull, 0x7FF8000000000000ull, "frsqrte(-1.0)=+qNaN" },
+        { 0xFFF0000000000000ull, 0x7FF8000000000000ull, "frsqrte(-inf)=+qNaN" },
+        { 0x8010000000000000ull, 0x7FF8000000000000ull, "frsqrte(-2^-1022)=+qNaN" },
+        { 0x8000000000000000ull, 0xFFF0000000000000ull, "frsqrte(-0)=-inf" },
+        { 0x0000000000000000ull, 0x7FF0000000000000ull, "frsqrte(+0)=+inf" },
+        { 0x7FF0000000000000ull, 0x0000000000000000ull, "frsqrte(+inf)=+0" },
+        { 0x4010000000000000ull, 0x3FE0000000000000ull, "frsqrte(4.0)=0.5" },
+    };
+    bool ok = true;
+    for (const auto& v : vs) {
+        TestEnv env; if (!env.init()) return false;
+        *(u32*)((u8*)env.ctx_raw + ppc_off::MSR) = 0x2000u;   // MSR.FP=1
+        set_ps(env, 2, v.in, 0);
+        const u32 insts[] = { 0xFC201034u };                  // frsqrte f1, f2
+        s32 next_pc = -1;
+        if (!env.dispatch_block(0x80300000u, insts, 1, &next_pc)) return false;
+        const u64 got = get_ps0(env, 1);
+        const bool m = (got == v.exp); ok = ok && m;
+        std::printf("[diag frsqrte-sp] %-20s got=0x%016llx exp=0x%016llx %s\n",
+                    v.name, (unsigned long long)got, (unsigned long long)v.exp, m ? "OK" : "MISMATCH");
+    }
+    return ok;
+}
+static bool test_fres_special_values() {
+    struct V { u64 in; u64 exp; const char* name; };
+    static const V vs[] = {
+        { 0x0000000000000001ull, 0x47EFFFFFE0000000ull, "fres(+denorm)=+FLTMAX" },
+        { 0x8000000000000001ull, 0xC7EFFFFFE0000000ull, "fres(-denorm)=-FLTMAX" },
+        { 0x0000000000000000ull, 0x7FF0000000000000ull, "fres(+0)=+inf" },
+        { 0x8000000000000000ull, 0xFFF0000000000000ull, "fres(-0)=-inf" },
+        { 0x7FF0000000000000ull, 0x0000000000000000ull, "fres(+inf)=+0" },
+        { 0xFFF0000000000000ull, 0x8000000000000000ull, "fres(-inf)=-0" },
+        { 0x4000000000000000ull, 0x3FE0000000000000ull, "fres(2.0)=0.5" },
+    };
+    bool ok = true;
+    for (const auto& v : vs) {
+        TestEnv env; if (!env.init()) return false;
+        *(u32*)((u8*)env.ctx_raw + ppc_off::MSR) = 0x2000u;   // MSR.FP=1
+        set_ps(env, 2, v.in, 0);
+        const u32 insts[] = { 0xEC201030u };                  // fres f1, f2
+        s32 next_pc = -1;
+        if (!env.dispatch_block(0x80300000u, insts, 1, &next_pc)) return false;
+        const u64 got0 = get_ps0(env, 1), got1 = get_ps1(env, 1);
+        const bool m = (got0 == v.exp) && (got1 == v.exp); ok = ok && m;   // both lanes
+        std::printf("[diag fres-sp] %-20s ps0=0x%016llx ps1=0x%016llx exp=0x%016llx %s\n",
+                    v.name, (unsigned long long)got0, (unsigned long long)got1,
+                    (unsigned long long)v.exp, m ? "OK" : "MISMATCH");
+    }
+    return ok;
+}
+
 static const TestCase k_tests[] = {
+    {"frsqrte_special_values",           &test_frsqrte_special_values},
+    {"fres_special_values",              &test_fres_special_values},
     {"writemtxps4x3_send_sequence",      &test_writemtxps4x3_send_sequence},
     {"psmtxconcat_row2_build",           &test_psmtxconcat_row2_build},
     {"lazycr_cross_block_beq",           &test_lazycr_cross_block_beq},
