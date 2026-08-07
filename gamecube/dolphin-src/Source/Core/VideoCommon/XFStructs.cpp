@@ -240,7 +240,8 @@ void LoadXFReg(u16 base_address, u8 transfer_size, const u8* data)
     XFMemWritten(xf_state_manager, xf_mem_transfer_size, xf_mem_base);
     for (u32 i = 0; i < xf_mem_transfer_size; i++)
     {
-      ((u32*)&xfmem)[xf_mem_base + i] = Common::swap32(data);
+      const u32 val = Common::swap32(data);
+      ((u32*)&xfmem)[xf_mem_base + i] = val;
       data += 4;
     }
   }

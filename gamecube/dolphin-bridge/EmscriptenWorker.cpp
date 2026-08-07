@@ -1096,20 +1096,6 @@ void dolphin_service_iter(void) {
 EMSCRIPTEN_KEEPALIVE
 void run_iter_batch(int n) {
     if (!g_loaded) return;
-    // Diag counters in SAB so we can read them from the page without
-    // depending on MAIN_THREAD_EM_ASM blocking the pthread.
-    // 0x025010C0 = total iters
-    // 0x025010C4 = iters with flags=0
-    // 0x025010C8 = iters with flags=0x6
-    // 0x025010CC = iters that took the Phase IV branch
-    // 0x025010D0 = iters that called service_iter
-    // 0x025010D4 = iters that called retro_run
-    static volatile unsigned* const c_total   = (volatile unsigned*)0x025010C0u;
-    static volatile unsigned* const c_flag0   = (volatile unsigned*)0x025010C4u;
-    static volatile unsigned* const c_flag6   = (volatile unsigned*)0x025010C8u;
-    static volatile unsigned* const c_p4br    = (volatile unsigned*)0x025010CCu;
-    static volatile unsigned* const c_svci    = (volatile unsigned*)0x025010D0u;
-    static volatile unsigned* const c_retror  = (volatile unsigned*)0x025010D4u;
     // ENTIRE SAB HLE patch set per native dolphin.log:
     //   [HLE]: Patching PPCMfhid2 0x800e34a4
     //   [HLE]: Patching PPCMfhid2 0x800e34ac
@@ -1137,7 +1123,6 @@ void run_iter_batch(int n) {
     // the patches persist.
     static bool s_sab_patches_installed = false;
     for (int i = 0; i < n; i++) {
-        (*c_total)++;
         const unsigned flags = dolphin_ct_get_phase_flags();
         // [single-ordered-GX 2026-07-16] The Phase-IV-edge seal (dolphin_gp_seal/unseal on the
         // ISR-excursion transition) is RETIRED. It was fragile: it toggled g_gp_discard on a
@@ -1147,8 +1132,6 @@ void run_iter_batch(int n) {
         // is now STRUCTURAL and always-current at the write site (GPFifo::Write* gate on
         // cpu_owner==1 && g_in_drain==0). No edge tracking, no owner-clear race. Boot single-core
         // (cpu_owner==0) is unaffected. See GPFifo.cpp gpfifo_reject_non_ring_gx().
-        if (flags == 0u) (*c_flag0)++;
-        else if (flags == 0x6u) (*c_flag6)++;
         // [unconditional drain 2026-07-07 — deadlock root fix] The mailbox drain lived
         // ONLY in the service_iter branch; with the Phase-IV flag clear the retro_run
         // branch never drained, so a worker parked in a synchronous MMIO call starved
@@ -1204,11 +1187,8 @@ void run_iter_batch(int n) {
             s_prev_owner = owner_now;
         }
         if (flags & EW_CT_PHASE4_ENABLE) {
-            (*c_p4br)++;
-            (*c_svci)++;
             dolphin_service_iter();
         } else {
-            (*c_retror)++;
             retro_run();
         }
         if (!s_sab_patches_installed) {

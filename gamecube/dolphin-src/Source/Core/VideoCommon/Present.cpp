@@ -176,12 +176,6 @@ bool Presenter::FetchXFB(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_heigh
 void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height, u64 ticks,
                        TimePoint presentation_time)
 {
-#ifdef __EMSCRIPTEN__
-  // [present-diag TEMP PM28] black-canvas forensics: ViSwap entries @0x026B1B08,
-  // duplicate verdicts @0x026B1B10, Present() calls @0x026B1B0C. Names which hop
-  // of Video_OutputXFB(3298/run) -> ViSwap -> Present -> ShowImage(0) is dead.
-  ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B08u));
-#endif
   bool is_duplicate = FetchXFB(xfb_addr, fb_width, fb_stride, fb_height, ticks);
 
   PresentInfo present_info{
@@ -260,15 +254,8 @@ void Presenter::ViSwap(u32 xfb_addr, u32 fb_width, u32 fb_stride, u32 fb_height,
   }
 #endif
 
-#ifdef __EMSCRIPTEN__
-  if (is_duplicate)
-    ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B10u));
-#endif
   if (!is_duplicate || !g_ActiveConfig.bSkipPresentingDuplicateXFBs)
   {
-#ifdef __EMSCRIPTEN__
-    ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B0Cu));
-#endif
     Present(&present_info);
     ProcessFrameDumping(ticks);
 
@@ -906,18 +893,6 @@ void Presenter::RenderXFBToScreen(const MathUtil::Rectangle<int>& target_rc,
 void Presenter::Present(PresentInfo* present_info)
 {
   m_present_count++;
-#ifdef __EMSCRIPTEN__
-  // [present-diag TEMP PM28] gate forensics @0x026B1B14:
-  // bit0=xfb_entry nonnull, bit1=SupportsUtilityDrawing, bit2=IsHeadless,
-  // bit3=onscreen_ui nonnull; high 16 bits = count of Present() entries.
-  {
-    volatile u32* const cell =
-        reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B14u));
-    const u32 flags = (m_xfb_entry ? 1u : 0u) | (g_gfx->SupportsUtilityDrawing() ? 2u : 0u) |
-                      (g_gfx->IsHeadless() ? 4u : 0u) | (m_onscreen_ui ? 8u : 0u);
-    *cell = ((*cell + 0x10000u) & 0xFFFF0000u) | flags;
-  }
-#endif
   if (g_gfx->IsHeadless() || (!m_onscreen_ui && !m_xfb_entry))
     return;
 
