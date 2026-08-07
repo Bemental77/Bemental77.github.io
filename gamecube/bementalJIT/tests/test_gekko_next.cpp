@@ -2802,7 +2802,182 @@ static bool test_lazycr_fused_adjacent() {
     return failures == 0;
 }
 
+// [skin-detect (b) Stage-2 2026-08-07] WriteMTXPS4x3 send-sequence reproduction.
+// Retail GXLoadPosMtxImm (dolsdk2001 src/gx/GXTransform.c) ships a 3x4 pos
+// matrix to WGPIPE via WriteMTXPS4x3: SIX psq_l (f0..f5, ALL live) then SIX
+// psq_st to the gather pipe. Decode-side skin-detect shows PSO characters
+// arrive with matrix row 2 = (0,0,0,tz) — rotation zeroed, only the final lane
+// surviving — while rows 0/1 (identical send path) are intact. That partial,
+// positionally-stable drop is the fingerprint of a sequence-dependent
+// scratch-local clobber that single-op psq conformance cannot see (six loads
+// keep all six regs live before the first store). Feed a KNOWN-GOOD matrix
+// (1.0..12.0) through the exact sequence and assert all 12 f32 arrive in order.
+//   RED  (words 9,10,11 vanish, 12 survives) => send/psq emit bug  (suspect #1b)
+//   GREEN => send is faithful; corruption is upstream in the skinning math that
+//            BUILT the matrix in RAM (suspect #1a) — reproduce THAT next.
+static const u32 kMtxWords[12] = {
+    0x3F800000u, 0x40000000u, 0x40400000u, 0x40800000u,  // R0: 1,2,3,4
+    0x40A00000u, 0x40C00000u, 0x40E00000u, 0x41000000u,  // R1: 5,6,7,8
+    0x41100000u, 0x41200000u, 0x41300000u, 0x41400000u   // R2: 9,10,11,12
+};
+static bool test_writemtxps4x3_send_sequence() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);
+    env.spr(912) = 0;                 // GQR0: FLOAT, scale 0
+    env.gpr(3) = 0x80100000u;         // matrix source (mtx[3][4])
+    env.gpr(4) = 0x80200000u;         // dest (stand-in for &GXWGFifo.f32)
+#ifdef __EMSCRIPTEN__
+    // Feed the matrix words from the C-side kMtxWords via HEAPU32 (a JS array
+    // literal would break the EM_ASM macro: the C preprocessor splits {} bodies
+    // on bare commas — only () protect them).
+    EM_ASM({
+        Module.mtxPtr = $0;
+        Module.bemental_imports.env.ppc_read32 = function(addr) {
+            var off = ((addr >>> 0) - 0x80100000) >>> 2;   // word index 0..11
+            return (off < 12) ? (HEAPU32[(Module.mtxPtr >>> 2) + off] | 0) : 0;
+        };
+        Module.test_writes = [];
+        Module.bemental_imports.env.ppc_write32 = function(addr, val) {
+            Module.test_writes.push(val >>> 0);
+        };
+    }, (u32)(uintptr_t)kMtxWords);
+#endif
+    const u32 insts[] = {
+        0xE0030000u,  // psq_l  f0, 0x00(r3)
+        0xE0230008u,  // psq_l  f1, 0x08(r3)
+        0xE0430010u,  // psq_l  f2, 0x10(r3)
+        0xE0630018u,  // psq_l  f3, 0x18(r3)
+        0xE0830020u,  // psq_l  f4, 0x20(r3)
+        0xE0A30028u,  // psq_l  f5, 0x28(r3)
+        0xF0040000u,  // psq_st f0, 0(r4)
+        0xF0240000u,  // psq_st f1, 0(r4)
+        0xF0440000u,  // psq_st f2, 0(r4)
+        0xF0640000u,  // psq_st f3, 0(r4)
+        0xF0840000u,  // psq_st f4, 0(r4)
+        0xF0A40000u,  // psq_st f5, 0(r4)
+    };
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, 12, &next_pc);
+    u32 got[12] = {0}; u32 n_writes = 0;
+#ifdef __EMSCRIPTEN__
+    n_writes = (u32)EM_ASM_INT({ return Module.test_writes.length | 0; });
+    for (u32 i = 0; i < 12; ++i)
+        got[i] = (u32)EM_ASM_INT({ return (Module.test_writes[$0] >>> 0) | 0; }, i);
+    EM_ASM({ Module.bemental_imports.env.ppc_write32 = function(addr, val) {};
+             Module.bemental_imports.env.ppc_read32  = function(addr) { return 0; }; });
+#endif
+    if (!dispatched) return false;
+    std::printf("[diag writemtx] n=%u | R0 %08x %08x %08x %08x | R1 %08x %08x %08x %08x | R2 %08x %08x %08x %08x\n",
+                n_writes, got[0],got[1],got[2],got[3], got[4],got[5],got[6],got[7], got[8],got[9],got[10],got[11]);
+    bool ok = (n_writes == 12u);
+    for (u32 i = 0; i < 12 && ok; ++i)
+        ok = ok && (got[i] == kMtxWords[i]);
+    return ok;
+}
+
+// [skin-detect (b) Stage-2b 2026-08-07] PSMTXConcat matrix-build reproduction.
+// The send path is proven faithful (writemtxps4x3_send_sequence GREEN), so the
+// degenerate row 2 = (0,0,0,tz) exists in guest RAM BEFORE the send. PSO skinning
+// matrices are built with paired-single PSMTXConcat (dolsdk2001 src/mtx/mtx.c).
+// Its R2 outputs (f2=m20,m21 ; f0=m22,m23) are computed LAST, and their source
+// registers f0/f2 are REUSED as accumulators mid-stream, interleaved with the
+// psq_st of f12..f15 — the register-reuse-across-store shape single-op
+// conformance can't reach. Feed two known non-degenerate (all-positive) matrices
+// and compare against a float reference concat.
+//   RED  (R2 words collapse to 0 / off-reference) => PSMTXConcat emit bug.
+//   GREEN => concat is faithful; the dead row is built even further upstream.
+static const float kA_f[12]  = {0.1f,0.2f,0.3f,1.0f, 0.4f,0.5f,0.6f,2.0f, 0.7f,0.8f,0.9f,3.0f};
+static const float kB_f[12]  = {1.1f,1.2f,1.3f,4.0f, 1.4f,1.5f,1.6f,5.0f, 1.7f,1.8f,1.9f,6.0f};
+static const float kU01_f[2] = {0.0f, 1.0f};
+static bool test_psmtxconcat_row2_build() {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80380000;
+    psq_env_common(env);
+    env.spr(912) = 0;                 // GQR0: FLOAT, scale 0
+    env.gpr(3) = 0x80100000u;         // mA
+    env.gpr(4) = 0x80200000u;         // mB
+    env.gpr(5) = 0x80500000u;         // mAB (dest, captured)
+    env.gpr(6) = 0x80400000u;         // Unit01 = (0.0, 1.0)
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        var mA = []; var mB = []; var u01 = [];
+        for (var i = 0; i < 12; i++) mA.push(HEAPU32[($0 >> 2) + i] >>> 0);
+        for (var j = 0; j < 12; j++) mB.push(HEAPU32[($1 >> 2) + j] >>> 0);
+        for (var k = 0; k < 2;  k++) u01.push(HEAPU32[($2 >> 2) + k] >>> 0);
+        Module.bemental_imports.env.ppc_read32 = function(addr) {
+            addr = addr >>> 0;
+            if (addr >= 0x80100000 && addr < 0x80100030) return mA[(addr - 0x80100000) >> 2] | 0;
+            if (addr >= 0x80200000 && addr < 0x80200030) return mB[(addr - 0x80200000) >> 2] | 0;
+            if (addr >= 0x80400000 && addr < 0x80400008) return u01[(addr - 0x80400000) >> 2] | 0;
+            return 0;
+        };
+        Module.test_writes = [];
+        Module.bemental_imports.env.ppc_write32 = function(addr, val) {
+            Module.test_writes.push(addr >>> 0);   // pushed as separate scalars —
+            Module.test_writes.push(val >>> 0);    // an array-literal comma breaks EM_ASM
+        };
+    }, (u32)(uintptr_t)kA_f, (u32)(uintptr_t)kB_f, (u32)(uintptr_t)kU01_f);
+#endif
+    auto L  = [](u32 D, u32 A, u32 dsp) { return 0xE0000000u | (D<<21) | (A<<16) | (dsp & 0xFFFu); };
+    auto S  = [](u32 D, u32 A, u32 dsp) { return 0xF0000000u | (D<<21) | (A<<16) | (dsp & 0xFFFu); };
+    auto M0 = [](u32 D, u32 A, u32 C)          { return 0x10000000u | (D<<21) | (A<<16) | (C<<6) | (12u<<1); };
+    auto A0 = [](u32 D, u32 A, u32 C, u32 B)   { return 0x10000000u | (D<<21) | (A<<16) | (B<<11) | (C<<6) | (14u<<1); };
+    auto A1 = [](u32 D, u32 A, u32 C, u32 B)   { return 0x10000000u | (D<<21) | (A<<16) | (B<<11) | (C<<6) | (15u<<1); };
+    const u32 insts[] = {
+        L(0,3,0),  L(6,4,0),  L(7,4,8),  L(8,4,16),
+        M0(12,6,0), L(2,3,16), M0(13,7,0), L(31,6,0),
+        M0(14,6,2), L(9,4,24), M0(15,7,2), L(1,3,8),
+        A1(12,8,0,12), L(3,3,24), A1(14,8,2,14), L(10,4,32),
+        A1(13,9,0,13), L(11,4,40), A1(15,9,2,15), L(4,3,32),
+        L(5,3,40), A0(12,10,1,12), A0(13,11,1,13), A0(14,10,3,14),
+        A0(15,11,3,15), S(12,5,0), M0(2,6,4), A1(13,31,1,13),
+        M0(0,7,4), S(14,5,16), A1(15,31,3,15), S(13,5,8),
+        A1(2,8,4,2), A1(0,9,4,0), A0(2,10,5,2), S(15,5,24),
+        A0(0,11,5,0), S(2,5,32), A1(0,31,5,0), S(0,5,40),
+    };
+    const u32 ninsts = (u32)(sizeof(insts)/sizeof(insts[0]));
+    s32 next_pc = -1;
+    bool dispatched = env.dispatch_block(PC, insts, ninsts, &next_pc);
+    u32 out[12] = {0}; u32 n_writes = 0;
+#ifdef __EMSCRIPTEN__
+    n_writes = (u32)EM_ASM_INT({ return Module.test_writes.length | 0; });
+    const u32 npairs = n_writes / 2u;
+    for (u32 p = 0; p < npairs; ++p) {
+        u32 a = (u32)EM_ASM_INT({ return Module.test_writes[$0 * 2] >>> 0; }, p);
+        u32 v = (u32)EM_ASM_INT({ return Module.test_writes[$0 * 2 + 1] >>> 0; }, p);
+        u32 idx = (a - 0x80500000u) >> 2;
+        if (idx < 12) out[idx] = v;
+    }
+    EM_ASM({ Module.bemental_imports.env.ppc_write32 = function(addr, val) {};
+             Module.bemental_imports.env.ppc_read32  = function(addr) { return 0; }; });
+#endif
+    if (!dispatched) return false;
+    // float reference: 3x4 concat with implicit (0,0,0,1) bottom row.
+    float ref[12];
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j)
+            ref[i*4+j] = kA_f[i*4+0]*kB_f[0*4+j] + kA_f[i*4+1]*kB_f[1*4+j] + kA_f[i*4+2]*kB_f[2*4+j];
+        ref[i*4+3] = kA_f[i*4+0]*kB_f[0*4+3] + kA_f[i*4+1]*kB_f[1*4+3] + kA_f[i*4+2]*kB_f[2*4+3] + kA_f[i*4+3];
+    }
+    auto asf = [](u32 b){ float f; std::memcpy(&f, &b, 4); return f; };
+    std::printf("[diag psmtxcc] n=%u | out R2 %08x %08x %08x %08x  (ref %.4f %.4f %.4f %.4f)\n",
+                n_writes, out[8],out[9],out[10],out[11], ref[8],ref[9],ref[10],ref[11]);
+    bool ok = (n_writes == 24u);
+    for (int i = 0; i < 12 && ok; ++i) {
+        float g = asf(out[i]);
+        float d = g - ref[i]; if (d < 0) d = -d;
+        float m = ref[i] < 0 ? -ref[i] : ref[i];
+        ok = ok && (d <= 0.01f * (m + 1.0f));   // rel tol; a zeroed R2 fails hard
+    }
+    return ok;
+}
+
 static const TestCase k_tests[] = {
+    {"writemtxps4x3_send_sequence",      &test_writemtxps4x3_send_sequence},
+    {"psmtxconcat_row2_build",           &test_psmtxconcat_row2_build},
     {"lazycr_cross_block_beq",           &test_lazycr_cross_block_beq},
     {"lazycr_so_freeze",                 &test_lazycr_so_freeze},
     {"lazycr_fused_adjacent",            &test_lazycr_fused_adjacent},
