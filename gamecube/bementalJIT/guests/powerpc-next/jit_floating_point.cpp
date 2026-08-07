@@ -165,25 +165,37 @@ void emit_fsel(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     wb.op_local_set(fd_pair.ps0_idx);
 }
 
-// fres (op59 sub5 24) — ps0(frD) = 1/ps0(frB). [PM62] board 1.7M interp
-// fallbacks. FULL-PRECISION reciprocal (f64.div) instead of the PPC estimate:
-// exact on every special case (0->+inf, inf->0, NaN->NaN, -0->-inf) and MORE
-// accurate than the 5-bit estimate on normals — the guest's Newton-Raphson
-// refinement converges regardless, so it's board-safe. Faster than the interp
-// estimate-table fallback. FPSCR (FPRF/exceptions) skipped like the other native
-// FP ops (native runs them off). fres. (Rc=1) -> interp (CR1<-FPSCR, rare).
+// fres (op59 sub5 24) — frD = 1/ps0(frB), FILLED INTO BOTH PAIRED-SINGLE LANES.
+// [PM62] board 1.7M interp fallbacks. FULL-PRECISION reciprocal (f64.div) instead
+// of the PPC estimate: exact on every special case (0->+inf, inf->0, NaN->NaN,
+// -0->-inf) and MORE accurate than the 5-bit estimate on normals — the guest's
+// Newton-Raphson refinement converges regardless, so it's board-safe. Faster than
+// the interp estimate-table fallback. FPSCR (FPRF/exceptions) skipped like the
+// other native FP ops (native runs them off). fres. (Rc=1) -> interp (rare).
+//
+// [PM64] fres is op59 (single-precision family): Gekko fills BOTH ps0 AND ps1
+// (Dolphin fresx -> ps[FD].Fill(result), Interpreter_FloatingPoint.cpp:520), same
+// as the fdivs/fmuls sibling emit_fp_arith_single (FPR_LANE_BOTH +
+// emit_force_single_fill). The original ps0-only write left ps1 STALE — a later
+// paired-single consumer (ps_mul/ps_madd/psq_st reads ps1, jit_paired.cpp) picked
+// up garbage in lane 1, warping 3D transform math while the scalar-only 2D HUD
+// stayed correct (the SAB City-Escape shear). Fix: bind BOTH lanes and replicate
+// ps0 into ps1 (both lanes hold the same full-precision value — that equality is
+// the invariant that matters; ps0's estimate-vs-exact value is unchanged).
 void emit_fres(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                const CodeOp& op, u32 ctx_ptr) {
     if (GekkoOperands::Rc(op.inst)) { emit_rc_fallback(wb, rc, frc, op, ctx_ptr); return; }
     const u32 fd = GekkoOperands::FD(op.inst);
     const u32 fb = GekkoOperands::FB(op.inst);
     auto fb_pair = frc.Bind(fb, FPRMode::Read,  FPR_LANE_PS0);
-    auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_PS0);
+    auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_BOTH);
     wb.op_f64_const(1.0);
     wb.op_local_get(fb_pair.ps0_idx); wb.op_f64_reinterpret_i64();
     wb.op_f64_div();                           // 1.0 / ps0(fb)
     wb.op_i64_reinterpret_f64();
     wb.op_local_set(fd_pair.ps0_idx);
+    wb.op_local_get(fd_pair.ps0_idx);          // Fill: ps1 = ps0 (both-lane single)
+    wb.op_local_set(fd_pair.ps1_idx);
 }
 
 // frsqrte (op63 sub5 26) — ps0(frD) = 1/sqrt(ps0(frB)). [PM62] board 8.1M interp

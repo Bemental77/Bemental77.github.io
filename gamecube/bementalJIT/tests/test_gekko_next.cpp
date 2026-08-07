@@ -1734,6 +1734,135 @@ static bool test_ps_sum1_fd_aliases_fa() {
     return ps0 == dbits(7.0) && ps1 == dbits(8.0);
 }
 
+// ---------------------------------------------------------------------------
+// A-form paired-single arithmetic (ps_add/ps_sub/ps_mul/ps_madd) via the
+// SIMD single-form fast path — the PSMTXConcat/PSMTXInverse matrix-math path
+// used by J3D character skinning (SAB Sonic). Operands are primed into SINGLE
+// (v128) form with psq_l float-pair loads so emit_ps_binary/emit_ps_fma take
+// the frc.IsSingle f32x4 fast path (NOT the scalar per-lane path that set_ps
+// exercises). DISTINCT ps0/ps1 lanes catch a stale-lane bug (the fres class).
+// All operands/results are f32-exact, so f32x4 == reference bit-for-bit.
+// ---------------------------------------------------------------------------
+static bool run_ps_simd(const char* tag, u32 op_inst, u32 fd,
+                        u32 a0, u32 a1, u32 b0, u32 b1, u32 c0, u32 c1,
+                        u64 exp_ps0, u64 exp_ps1) {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);
+    env.spr(912) = 0;                 // GQR0: ld FLOAT scale 0
+    env.gpr(3) = 0x80100000u;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        var m = {};
+        m[0x80100000] = $0 >>> 0; m[0x80100004] = $1 >>> 0;
+        m[0x80100008] = $2 >>> 0; m[0x8010000C] = $3 >>> 0;
+        m[0x80100010] = $4 >>> 0; m[0x80100014] = $5 >>> 0;
+        Module.__psmem = m;
+        Module.bemental_imports.env.ppc_read32 = function(addr) {
+            addr = addr >>> 0;
+            return (addr in Module.__psmem) ? (Module.__psmem[addr] | 0) : 0;
+        };
+    }, a0, a1, b0, b1, c0, c1);
+#endif
+    const u32 insts[] = {
+        0xE0230000u,  // psq_l f1, 0(r3)   W=0 I=0
+        0xE0430008u,  // psq_l f2, 8(r3)
+        0xE0630010u,  // psq_l f3, 16(r3)
+        op_inst,
+    };
+    s32 next_pc = -1;
+    bool ok = env.dispatch_block(PC, insts, 4, &next_pc);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ Module.bemental_imports.env.ppc_read32 = function(addr) { return 0; }; });
+#endif
+    if (!ok) return false;
+    const u64 ps0 = get_ps0(env, fd), ps1 = get_ps1(env, fd);
+    std::printf("[diag %s] ps0=0x%016llx (exp 0x%016llx) ps1=0x%016llx (exp 0x%016llx)\n",
+                tag, (unsigned long long)ps0, (unsigned long long)exp_ps0,
+                (unsigned long long)ps1, (unsigned long long)exp_ps1);
+    return ps0 == exp_ps0 && ps1 == exp_ps1;
+}
+// a={2.5,7.0} b={0.25,3.0} c={1.0,2.0}. ps_add f0,f1,f2 -> {2.75,10.0}
+static bool test_ps_add_simd() {
+    return run_ps_simd("ps_add-simd", 0x1001102Au, 0,
+        0x40200000,0x40E00000, 0x3E800000,0x40400000, 0x3F800000,0x40000000,
+        dbits(2.75), dbits(10.0));
+}
+// ps_sub f0,f1,f2 -> {2.25,4.0}
+static bool test_ps_sub_simd() {
+    return run_ps_simd("ps_sub-simd", 0x10011028u, 0,
+        0x40200000,0x40E00000, 0x3E800000,0x40400000, 0x3F800000,0x40000000,
+        dbits(2.25), dbits(4.0));
+}
+// ps_mul f0,f1,f2 (2nd operand = FC) -> {0.625,21.0}
+static bool test_ps_mul_simd() {
+    return run_ps_simd("ps_mul-simd", 0x100100B2u, 0,
+        0x40200000,0x40E00000, 0x3E800000,0x40400000, 0x3F800000,0x40000000,
+        dbits(0.625), dbits(21.0));
+}
+// ps_madd f0,f1,f2,f3 = f1*f2 + f3 -> {1.625,23.0}
+static bool test_ps_madd_simd() {
+    return run_ps_simd("ps_madd-simd", 0x100118BAu, 0,
+        0x40200000,0x40E00000, 0x3E800000,0x40400000, 0x3F800000,0x40000000,
+        dbits(1.625), dbits(23.0));
+}
+// ps_madd f1,f1,f2,f3 — FD==FA aliasing (matrix code reuses regs) -> {1.625,23.0}
+static bool test_ps_madd_alias_fa() {
+    return run_ps_simd("ps_madd-alias", 0x102118BAu, 1,
+        0x40200000,0x40E00000, 0x3E800000,0x40400000, 0x3F800000,0x40000000,
+        dbits(1.625), dbits(23.0));
+}
+
+// ps_madds0/1, ps_muls0/1, ps_merge00/01/11 — the ACTUAL ops PSMTXROMultVecArray
+// / PSMTXROSkin2VecArray (J3D skinning) are built on. emit_ps_madds/muls have NO
+// SIMD fast path: frc.Bind(FPR_LANE_BOTH) must CONVERT the psq_l single-form regs
+// to double form, then broadcast one frC lane. run_ps_simd primes via psq_l so
+// this single->double conversion + broadcast path is exercised (previously only
+// ps_merge10/ps_sum1 were covered). a={2.5,7.0} b={0.25,3.0} c={1.0,2.0}.
+// ps_madds0 f0,f1,f2,f3 = f1*f2.ps0 + f3 = {2.5*.25+1, 7*.25+2} = {1.625, 3.75}
+static bool test_ps_madds0_simd() {
+    return run_ps_simd("ps_madds0-simd", 0x1001189Cu, 0,
+        0x40200000,0x40E00000, 0x3E800000,0x40400000, 0x3F800000,0x40000000,
+        dbits(1.625), dbits(3.75));
+}
+// ps_madds1 = f1*f2.ps1 + f3 = {2.5*3+1, 7*3+2} = {8.5, 23.0}
+static bool test_ps_madds1_simd() {
+    return run_ps_simd("ps_madds1-simd", 0x1001189Eu, 0,
+        0x40200000,0x40E00000, 0x3E800000,0x40400000, 0x3F800000,0x40000000,
+        dbits(8.5), dbits(23.0));
+}
+// ps_muls0 f0,f1,f2 = f1*f2.ps0 = {0.625, 1.75}
+static bool test_ps_muls0_simd() {
+    return run_ps_simd("ps_muls0-simd", 0x10010098u, 0,
+        0x40200000,0x40E00000, 0x3E800000,0x40400000, 0x3F800000,0x40000000,
+        dbits(0.625), dbits(1.75));
+}
+// ps_muls1 f0,f1,f2 = f1*f2.ps1 = {7.5, 21.0}
+static bool test_ps_muls1_simd() {
+    return run_ps_simd("ps_muls1-simd", 0x1001009Au, 0,
+        0x40200000,0x40E00000, 0x3E800000,0x40400000, 0x3F800000,0x40000000,
+        dbits(7.5), dbits(21.0));
+}
+// ps_merge00 f0,f1,f2 -> {f1.ps0, f2.ps0} = {2.5, 0.25}
+static bool test_ps_merge00_simd() {
+    return run_ps_simd("ps_merge00-simd", 0x10011420u, 0,
+        0x40200000,0x40E00000, 0x3E800000,0x40400000, 0x3F800000,0x40000000,
+        dbits(2.5), dbits(0.25));
+}
+// ps_merge01 f0,f1,f2 -> {f1.ps0, f2.ps1} = {2.5, 3.0}
+static bool test_ps_merge01_simd() {
+    return run_ps_simd("ps_merge01-simd", 0x10011460u, 0,
+        0x40200000,0x40E00000, 0x3E800000,0x40400000, 0x3F800000,0x40000000,
+        dbits(2.5), dbits(3.0));
+}
+// ps_merge11 f0,f1,f2 -> {f1.ps1, f2.ps1} = {7.0, 3.0}
+static bool test_ps_merge11_simd() {
+    return run_ps_simd("ps_merge11-simd", 0x100114E0u, 0,
+        0x40200000,0x40E00000, 0x3E800000,0x40400000, 0x3F800000,0x40000000,
+        dbits(7.0), dbits(3.0));
+}
+
 // fctiwz f14,f14 (0xFDC0701E — the exact encoding in PSO HandleReverb's
 // inner loop at 0x803bf1bc, the loop's LAST interp fallback).
 // Reference: Interpreter ConvertToInteger (TowardsZero): value =
@@ -2717,6 +2846,18 @@ static const TestCase k_tests[] = {
     {"fdivs_round_single",               &test_fdivs_round_single},
     {"frsp_fill_both",                   &test_frsp_fill_both},
     {"ps_sum1_basic",                    &test_ps_sum1_basic},
+    {"ps_add_simd",                      &test_ps_add_simd},
+    {"ps_sub_simd",                      &test_ps_sub_simd},
+    {"ps_mul_simd",                      &test_ps_mul_simd},
+    {"ps_madd_simd",                     &test_ps_madd_simd},
+    {"ps_madd_alias_fa",                 &test_ps_madd_alias_fa},
+    {"ps_madds0_simd",                   &test_ps_madds0_simd},
+    {"ps_madds1_simd",                   &test_ps_madds1_simd},
+    {"ps_muls0_simd",                    &test_ps_muls0_simd},
+    {"ps_muls1_simd",                    &test_ps_muls1_simd},
+    {"ps_merge00_simd",                  &test_ps_merge00_simd},
+    {"ps_merge01_simd",                  &test_ps_merge01_simd},
+    {"ps_merge11_simd",                  &test_ps_merge11_simd},
     {"ps_sum1_fd_aliases_fa",            &test_ps_sum1_fd_aliases_fa},
     {"singles_arm_psq_chain",            &test_singles_arm_psq_chain},
     {"singles_arm_stfs",                 &test_singles_arm_stfs},
