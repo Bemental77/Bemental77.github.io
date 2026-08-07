@@ -1384,6 +1384,19 @@ void bem_service_pending_state(void) {
     } else {                                          // load
         int r = load_state(g_bem_state_buf, g_bem_state_len);
         if (r != 0) g_bem_state_len = 0;
+        // [savestate singles-mask hygiene 2026-08-07] load_state (DoState) restores
+        // EVERY FPR with a full double, OUTSIDE any powerpc-next block flush — the
+        // largest possible "writer outside the flush path". The singles shadow-mask
+        // (0x026B33E0) and PM47 self-chain flag (0x026B38C0) still hold stale-SET bits
+        // from the PRE-load run; a block that trusts a stale bit narrows the restored
+        // double. The v9b value-verify safety net covers volatile f0-f13, but STABLE
+        // f14-f31 are MASK-ONLY trust (ppc_emit.cpp:1691) — and skinning PSMTXConcat
+        // uses f14/f15/f31, so restored stable doubles get narrowed with no net = the
+        // bent-limb signature (subtly-wrong non-zero values), only ever from Load State.
+        // Mirror the trap/compile-fail wholesale clear (JitWasm.cpp:533/624) so every
+        // post-load block reloads from ps[] instead of trusting a pre-load single bit.
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B33E0u)) = 0u;
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B38C0u)) = 0u;
         // [savestate-fix PM61] DoState restores m_interrupt_cause/m_interrupt_mask and
         // ppc_state.Exceptions, but NOTHING re-derives the EXTERNAL_INT bit from the
         // restored cause&mask, and NOTHING republishes the PI-cause SAB mirror
