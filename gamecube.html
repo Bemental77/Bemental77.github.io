@@ -3151,9 +3151,11 @@
     try {
       if (!sharedMemory) return;
       var A = new Uint32Array(sharedMemory.buffer);
-      var seq = A[0x026B3518 >> 2] >>> 0;
-      if (seq === _sabPresentSeq) return;
-      _sabPresentSeq = seq;
+      // [present-seqlock 2026-08-07] Read seq with an acquire; skip if unchanged, or ODD
+      // (the worker is mid-write). Commit _sabPresentSeq only AFTER the post-copy re-check
+      // passes — so a torn read is discarded instead of painted (fixes the flashing).
+      var seq0 = Atomics.load(A, 0x026B3518 >> 2) >>> 0;
+      if (seq0 === _sabPresentSeq || (seq0 & 1)) return;
       var ptr = A[0x026B3510 >> 2] >>> 0;
       var dims = A[0x026B3514 >> 2] >>> 0;
       var w = dims >>> 16, h = dims & 0xFFFF;
@@ -3167,6 +3169,10 @@
       }
       // ImageData rejects SharedArrayBuffer views — copy into its backing store.
       canvasImg2D.data.set(new Uint8Array(sharedMemory.buffer, ptr, w * h * 4));
+      // [present-seqlock 2026-08-07] Re-check: if the worker bumped seq during the copy, the
+      // frame tore — discard it (don't paint, don't advance _sabPresentSeq; retry next tick).
+      if ((Atomics.load(A, 0x026B3518 >> 2) >>> 0) !== seq0) return;
+      _sabPresentSeq = seq0;
       // [takeover-unblock PM49 2026-08-03] the takeover gate's `rendered` input
       // reads window._firstFrame, which only the LEGACY postMessage 'render'
       // handler set — dead since the sab-present migration (PM28), leaving

@@ -1186,7 +1186,14 @@ void WGPUGfx::ReadbackAndPresent(::WGPUTexture src_texture, u32 origin_x, u32 or
           static_cast<const uint8_t*>(wgpuBufferGetConstMappedRange(c->buffer, 0, c->buf_size));
       if (mapped)
       {
-        gfx->m_pixels.assign((size_t)c->width * 4 * c->height, 0);
+        // [present-seqlock 2026-08-07] Seqlocked publish so the page never paints a torn
+        // or stale frame (the "flashing" render race). resize (NOT assign(...,0)) skips the
+        // whole-buffer zero-fill — the memcpy overwrites every row, so a residual tear
+        // degrades from a BLACK flash to an ordinary 2-frame tear. Begin the seqlock write
+        // (seq -> odd) BEFORE touching the shared buffer.
+        u32* const seq = reinterpret_cast<u32*>(static_cast<uintptr_t>(0x026B3518u));
+        __atomic_add_fetch(seq, 1u, __ATOMIC_RELEASE);   // seqlock begin: -> odd
+        gfx->m_pixels.resize((size_t)c->width * 4 * c->height);
         const size_t row_bytes = (size_t)c->width * 4;
         for (u32 y = 0; y < c->height; y++)
           std::memcpy(&gfx->m_pixels[(size_t)y * row_bytes],
@@ -1207,9 +1214,7 @@ void WGPUGfx::ReadbackAndPresent(::WGPUTexture src_texture, u32 origin_x, u32 or
             static_cast<u32>(reinterpret_cast<uintptr_t>(gfx->m_pixels.data()));
         *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3514u)) =
             (c->width << 16) | (c->height & 0xFFFFu);
-        volatile u32* const seq =
-            reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3518u));
-        *seq = *seq + 1u;
+        __atomic_add_fetch(seq, 1u, __ATOMIC_RELEASE);   // seqlock end: -> even
       }
     }
     if (status == WGPUMapAsyncStatus_Success)
