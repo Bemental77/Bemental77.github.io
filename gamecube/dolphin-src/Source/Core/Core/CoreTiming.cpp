@@ -3,6 +3,13 @@
 
 #include "Core/CoreTiming.h"
 
+// [throttle-sizing TEMP 2026-08-07 — set to 0 to disable; gated one-shot for the
+// track-2 step-0 sizing, remove after. Splits throttle sleep by finish-inflight.]
+#define BEM_THROTTLE_SIZING 0
+#if defined(__EMSCRIPTEN__) && BEM_THROTTLE_SIZING
+#include <emscripten.h>
+#endif
+
 #include <algorithm>
 #include <mutex>
 #include <string>
@@ -668,6 +675,40 @@ void CoreTimingManager::Throttle(const s64 target_cycle)
   }
 
   UpdateVISkip(time, target_time);
+
+#if defined(__EMSCRIPTEN__) && BEM_THROTTLE_SIZING
+  {
+    // [throttle-sizing TEMP] Split the about-to-be-taken sleep by finish-inflight
+    // (0x026B1A30): sleep WHILE a PE_FINISH is pending == wall-clock-bound wait
+    // (the Case-B bad regime the narrow fix targets) vs WHILE none pending ==
+    // legitimate emulated-time VI pacing to keep. If open >> closed, "decline/cap
+    // sleep while finish-inflight != 0" is confirmed and Advance stays untouched.
+    const double sleep_ms =
+        std::chrono::duration<double, std::milli>(target_time - time).count();
+    if (sleep_ms > 0.0)
+    {
+      const bool fin =
+          *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A30u)) != 0u;
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(fin ? 0x026B3410u : 0x026B3414u)) +=
+          static_cast<u32>(sleep_ms * 10.0);  // 0.1ms units
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(fin ? 0x026B3418u : 0x026B341Cu)) += 1u;
+      static u32 s_dump = 0u;
+      if ((++s_dump & 0xFFu) == 0u)
+      {
+        EM_ASM(
+            {
+              console.log('[throttle-sizing] sleepMs finish-open=' + ($0 / 10).toFixed(0) +
+                          ' finish-closed=' + ($1 / 10).toFixed(0) + ' | sleeps open=' + $2 +
+                          ' closed=' + $3);
+            },
+            *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3410u)),
+            *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3414u)),
+            *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3418u)),
+            *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B341Cu)));
+      }
+    }
+  }
+#endif
 
   SleepUntil(target_time);
 }
