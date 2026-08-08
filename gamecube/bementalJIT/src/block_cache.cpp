@@ -1702,6 +1702,41 @@ void BlockCache::region_seal(u32 mem_pages) {
         if (rs.n_funcs == 0u) { region_reset_pending(rs); return; }
     }
 
+    // [seal-size cap 2026-08-08] Byte-budget block-count trim. build_region_module_next
+    // roughly DOUBLES the concatenated bodies, and even ~256 un-fused blocks blow the
+    // budget (measured: 256 blocks -> 642KB..1.1MB modules, fps whipsaw on the sync
+    // WebAssembly.Module compile). Estimate body bytes (~insts*120 + 512 per block, which
+    // matched the observed 1.3KB/block) and cap the batch near ~200KB of bodies so the
+    // sealed module lands well under the 512KB budget. Trimmed blocks stay UNSEALED and
+    // re-promote next window (histogram-driven) — the deferred carryover, not a drop.
+    // Trimmed HERE, before re-emit, so rs.pc_to_idx omits them and no intra-region direct
+    // edge is baked to a block outside the module (a post-emit cut would dangle + fail
+    // validation). n_funcs<=256 (PM54c) is the ceiling; this budget binds below it.
+    {
+        constexpr size_t kSealBodyBudget = 150u * 1024u;
+        size_t est = 0u;
+        u32 keep = 0u;
+        for (u32 i = 0; i < rs.n_funcs; ++i) {
+            est += rs.block_records[i].insts.size() * 120u + 512u;
+            if (est > kSealBodyBudget && i > 0u) break;   // always keep >= 1 block
+            ++keep;
+        }
+        if (keep < rs.n_funcs) {
+#ifdef __EMSCRIPTEN__
+            EM_ASM({ console.log('[worker] [bemental] seal-cap gen ' + $0
+                + ': batch ' + $1 + ' -> ' + $2 + ' blocks (carry ' + $3 + ', ~'
+                + $4 + 'B est bodies)'); },
+                (int)m_sealed_gen_count, (int)rs.n_funcs, (int)keep,
+                (int)(rs.n_funcs - keep), (int)est);
+#endif
+            rs.pc_keys.resize(keep);
+            rs.block_records.resize(keep);
+            rs.pc_to_idx.clear();
+            for (u32 i = 0; i < keep; ++i) rs.pc_to_idx[rs.pc_keys[i]] = i;
+            rs.n_funcs = keep;
+        }
+    }
+
     // Generation cap — leak guard. Beyond MAX_GENS the pending batch stays
     // unmerged (region_dispatch misses those PCs -> chain_dispatch handles them,
     // correctness-safe). PSO's steady-state working set (~500 blocks, per
@@ -1834,12 +1869,26 @@ void BlockCache::region_seal(u32 mem_pages) {
         }
         u32 fused_runs = 0u, fused_blocks = 0u, fused_b = 0u, fused_bwd = 0u;
         u32 fused_bl = 0u, fused_blr = 0u;
+        // [seal-size cap 2026-08-08] run-fusion inlines successor blocks and is the
+        // source of the unbounded gen blowup (2.1MB observed vs the ~480KB envelope; a
+        // synchronous WebAssembly.Module compile of an oversized gen stalls the EmuThread
+        // for multiple frames — the fps whipsaw — and blows V8's per-function inlining
+        // budget, wasting the N-fn design). Once the concatenated bodies pass this cutoff,
+        // stop fusing and emit the remaining blocks UN-FUSED (small, valid, no dangling
+        // intra-region edges) so the gen stays near the 512KB budget. n_funcs<=256 (PM54c)
+        // is retained; this binds IN ADDITION. Truncating the batch is NOT done here — the
+        // re-emitted bodies bake direct edges via rs.pc_to_idx which still holds every
+        // batch pc, so a mid-batch cut would dangle those edges.
+        constexpr size_t kSealFusionCutoff = 192u * 1024u;
+        u32 unfused_by_cap = 0u;
         for (u32 i = 0; i < rs.n_funcs; ++i) {
             const BlockEmitInputs& rec = rs.block_records[i];
             std::vector<u32> fused = rec.insts;
             std::vector<u32> fpcs  = pcs_of(rec);
             u32 depth = 1u;
-            if (rec_is_fp_free(rec)) {
+            const bool fusion_ok = rs.fn_bodies_concat.size() < kSealFusionCutoff;
+            if (!fusion_ok) ++unfused_by_cap;
+            if (rec_is_fp_free(rec) && fusion_ok) {
                 u32 visited[8]; u32 n_vis = 0u; visited[n_vis++] = rec.start_pc;
                 u32 pending_ret = 0u;            // [FUSION v3] one bl deep, no nesting
                 for (;;) {
@@ -1926,6 +1975,12 @@ void BlockCache::region_seal(u32 mem_pages) {
                 (int)fused_runs, (int)fused_blocks, (int)fused_b,
                 (int)fused_bwd, (int)fused_bl, (int)fused_blr,
                 (int)m_sealed_gen_count);
+        }
+        if (unfused_by_cap) {
+            EM_ASM({ console.log('[worker] [bemental] seal-cap gen ' + $0 + ': ' + $1
+                + ' blocks un-fused, bodies=' + $2 + 'B (cutoff ' + $3 + 'B)'); },
+                (int)m_sealed_gen_count, (int)unfused_by_cap,
+                (int)rs.fn_bodies_concat.size(), (int)kSealFusionCutoff);
         }
 #endif
     }
