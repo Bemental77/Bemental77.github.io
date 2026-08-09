@@ -1279,6 +1279,28 @@ void BlockCache::invalidate_overlap(u32 addr, u32 max_block_bytes) {
             ++it;
         }
     }
+    // [fused-extent SMC 2026-08-09 — FP-fusion correctness prerequisite] Close
+    // the PM54f coverage hole: the m_map loop above only consults
+    // m_fused_succ_to_pred for fused successors that are THEMSELVES cached (a
+    // standalone m_map entry) AND overlap addr. A successor inlined into its
+    // predecessor with no standalone entry escapes both P's own
+    // [start,start+256) window and every m_map overlap hit — so a guest SMC of
+    // that successor's bytes leaves P's stale fused body live. Scan the fusion
+    // map DIRECTLY by the same 256B window so a write anywhere in a fused
+    // successor's extent evicts its predecessor(s) regardless of standalone-
+    // cache status. Entries the m_map loop already followed were erased there,
+    // so no double-eviction; over-eviction is correctness-safe (recompile).
+    // This makes the fused-extent SMC coverage complete before FP-fusion (which
+    // multiplies fused blocks) can safely land.
+    for (auto fit = m_fused_succ_to_pred.begin(); fit != m_fused_succ_to_pred.end(); ) {
+        const u32 succ_pc = fit->first;
+        if (addr >= succ_pc && addr < succ_pc + max_block_bytes) {
+            fused_preds.insert(fused_preds.end(), fit->second.begin(), fit->second.end());
+            fit = m_fused_succ_to_pred.erase(fit);
+        } else {
+            ++fit;
+        }
+    }
     // [PM54f SMC fix] Evict the fused predecessors now that iteration is done
     // (evict() safely mutates m_map and recurses for chained fusions).
     for (u32 p : fused_preds) evict(static_cast<u64>(p));
