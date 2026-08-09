@@ -616,10 +616,30 @@ void emit_ps_madds(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const 
     auto fd_pair = frc.Bind(fd, FPRMode::Write, FPR_LANE_BOTH);
     const u32 c_local = (c_lane == FPR_LANE_PS0) ? fc_pair.ps0_idx : fc_pair.ps1_idx;
 
-    emit_single_fma_lane(wb, fa_pair.ps0_idx, c_local, fb_pair.ps0_idx,
-                         fd_pair.ps0_idx, /*sub=*/false, /*negate=*/false, ctx_ptr);
-    emit_single_fma_lane(wb, fa_pair.ps1_idx, c_local, fb_pair.ps1_idx,
-                         fd_pair.ps1_idx, /*sub=*/false, /*negate=*/false, ctx_ptr);
+    // [bent-legs fix 2026-08-09] fd==fc write-before-read aliasing hazard.
+    // c_local is ONE shared lane local (fc.ps0 for madds0, fc.ps1 for madds1)
+    // fed to BOTH output lanes. emit_single_fma_lane reads c at its head and
+    // writes d_local at its tail (jit_fp_helpers.h:1073/1086). If the output
+    // lane whose d_local == c_local (fd==fc) is emitted FIRST, its tail-write
+    // clobbers c before the OTHER lane reads it -> that lane computes
+    // a*<stale fd> + b. ps_madds0 (fD=fA*fC[0]+fB) is a canonical skinning
+    // matrix-vector op with fd==fc when accumulating into the scalar's reg;
+    // this corrupted the PSO character legs (native-calibrated bbox |x|=6.6 vs
+    // native <=3.9; SIMD path exonerated, this is the scalar per-lane arm).
+    // Precedent: ps_merge10 / ps_sum1 same class. Fix (no extra scratch, mirrors
+    // ps_muls's stash-c-once intent): emit the NON-c-lane output first so the
+    // c-lane output write happens LAST, after both lanes have read c.
+    if (c_lane == FPR_LANE_PS0) {
+        emit_single_fma_lane(wb, fa_pair.ps1_idx, c_local, fb_pair.ps1_idx,
+                             fd_pair.ps1_idx, /*sub=*/false, /*negate=*/false, ctx_ptr);
+        emit_single_fma_lane(wb, fa_pair.ps0_idx, c_local, fb_pair.ps0_idx,
+                             fd_pair.ps0_idx, /*sub=*/false, /*negate=*/false, ctx_ptr);
+    } else {
+        emit_single_fma_lane(wb, fa_pair.ps0_idx, c_local, fb_pair.ps0_idx,
+                             fd_pair.ps0_idx, /*sub=*/false, /*negate=*/false, ctx_ptr);
+        emit_single_fma_lane(wb, fa_pair.ps1_idx, c_local, fb_pair.ps1_idx,
+                             fd_pair.ps1_idx, /*sub=*/false, /*negate=*/false, ctx_ptr);
+    }
     emit_update_fprf_single(wb, fd_pair.ps0_idx, ctx_ptr, !op.fprf_discardable);  // [C12b] ps0
 }
 

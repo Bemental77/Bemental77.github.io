@@ -1863,6 +1863,72 @@ static bool test_ps_merge11_simd() {
         dbits(7.0), dbits(3.0));
 }
 
+// ---------------------------------------------------------------------------
+// ps_madds0/1 DEST==SRC ALIASING regression (2026-08-09 bent-legs fix in
+// emit_ps_madds, jit_paired.cpp:604). The op broadcasts ONE fC lane (fC.ps0
+// for madds0, fC.ps1 for madds1) into BOTH output lanes; that lane is a single
+// shared wasm local. emit_single_fma_lane reads c at its head and writes
+// d_local at its tail. The OLD emitter emitted the ps0 output lane FIRST,
+// UNCONDITIONALLY. For ps_madds0 with fd==fc, the ps0 output's d_local IS the
+// shared c local (fpr_reg_cache: ps0_local[N]=base+N, so fd.ps0==fc.ps0 iff
+// d==c), so writing ps0 first clobbered fC.ps0 before the ps1 lane read it ->
+// ps1 computed fA.ps1 * <stale fD.ps0> + fB.ps1. Fix emits the NON-c-lane
+// output first. These pin fd aliasing every source (fc/fa/fb) which the
+// existing FD-distinct ps_madds*_simd tests do NOT cover.
+//
+// The existing run_ps_simd already exercises the SCALAR per-lane arm for
+// ps_madds (emit_ps_madds has no SIMD fast path — frc.Bind(FPR_LANE_BOTH)
+// converts the psq_l single-form inputs to double), which is exactly the arm
+// that carried the bug.
+//
+// Inputs chosen so a stale ps0->ps1 leak is numerically loud AND f32-exact:
+//   fA={2.0,3.0}(f1)  fC={5.0,7.0}(f2)  fB={1.0,1.0}(f3)
+// run_ps_simd arg mapping: arg a->fA(f1), arg b->fC(f2), arg c->fB(f3).
+//   a0,a1=fA=0x40000000,0x40400000 ; b0,b1=fC=0x40A00000,0x40E00000 ;
+//   c0,c1=fB=0x3F800000,0x3F800000.
+//
+// ps_madds0 f2,f1,f2,f3  (fd==fc — THE bug): d=2 a=1 b=3 c=2 xo=14 -> 0x1041189C
+//   correct: ps0 = fA.ps0*fC.ps0+fB.ps0 = 2*5+1 = 11.0
+//            ps1 = fA.ps1*fC.ps0+fB.ps1 = 3*5+1 = 16.0
+//   OLD buggy: ps0=11.0 (written first, clobbers shared fC.ps0 local),
+//              ps1 = fA.ps1*<stale fD.ps0=11>+fB.ps1 = 3*11+1 = 34.0 (0x4041.. != 0x4030..)
+static bool test_ps_madds0_alias_fd_eq_fc() {
+    return run_ps_simd("ps_madds0-alias-fd-eq-fc", 0x1041189Cu, 2,
+        0x40000000,0x40400000, 0x40A00000,0x40E00000, 0x3F800000,0x3F800000,
+        dbits(11.0), dbits(16.0));   // OLD buggy ps1 = 34.0
+}
+// ps_madds0 f1,f1,f2,f3  (fd==fa): d=1 a=1 b=3 c=2 xo=14 -> 0x1021189C
+//   fd==fa is alias-safe in BOTH old and new (fA and fC are distinct locals;
+//   the fd.ps0 write clobbers fA.ps0, but fA.ps0 is never re-read — each output
+//   lane reads only its own fA lane). Correct == same as the FD-distinct result.
+//   correct: ps0 = 2*5+1 = 11.0 ; ps1 = 3*5+1 = 16.0.
+static bool test_ps_madds0_alias_fd_eq_fa() {
+    return run_ps_simd("ps_madds0-alias-fd-eq-fa", 0x1021189Cu, 1,
+        0x40000000,0x40400000, 0x40A00000,0x40E00000, 0x3F800000,0x3F800000,
+        dbits(11.0), dbits(16.0));
+}
+// ps_madds0 f3,f1,f2,f3  (fd==fb): d=3 a=1 b=3 c=2 xo=14 -> 0x1061189C
+//   fd==fb also alias-safe (fB.psN read then that same lane's fD.psN written —
+//   different lanes never collide). correct: ps0=11.0 ps1=16.0.
+static bool test_ps_madds0_alias_fd_eq_fb() {
+    return run_ps_simd("ps_madds0-alias-fd-eq-fb", 0x1061189Cu, 3,
+        0x40000000,0x40400000, 0x40A00000,0x40E00000, 0x3F800000,0x3F800000,
+        dbits(11.0), dbits(16.0));
+}
+// ps_madds1 f2,f1,f2,f3  (fd==fc, other variant): d=2 a=1 b=3 c=2 xo=15 -> 0x1041189E
+//   c_lane=ps1: shared local = fC.ps1, output collision is on the PS1 lane.
+//   Under the OLD unconditional ps0-first order this variant did NOT fail (the
+//   c-lane == ps1 write happened LAST, after both lanes had already read fC.ps1),
+//   so it PASSES on both old and new code — kept as forward coverage that the
+//   fix's c_lane==PS1 branch stays correct.
+//   correct: ps0 = fA.ps0*fC.ps1+fB.ps0 = 2*7+1 = 15.0
+//            ps1 = fA.ps1*fC.ps1+fB.ps1 = 3*7+1 = 22.0
+static bool test_ps_madds1_alias_fd_eq_fc() {
+    return run_ps_simd("ps_madds1-alias-fd-eq-fc", 0x1041189Eu, 2,
+        0x40000000,0x40400000, 0x40A00000,0x40E00000, 0x3F800000,0x3F800000,
+        dbits(15.0), dbits(22.0));
+}
+
 // fctiwz f14,f14 (0xFDC0701E — the exact encoding in PSO HandleReverb's
 // inner loop at 0x803bf1bc, the loop's LAST interp fallback).
 // Reference: Interpreter ConvertToInteger (TowardsZero): value =
@@ -3092,6 +3158,10 @@ static const TestCase k_tests[] = {
     {"ps_madd_alias_fa",                 &test_ps_madd_alias_fa},
     {"ps_madds0_simd",                   &test_ps_madds0_simd},
     {"ps_madds1_simd",                   &test_ps_madds1_simd},
+    {"ps_madds0_alias_fd_eq_fc",         &test_ps_madds0_alias_fd_eq_fc},
+    {"ps_madds0_alias_fd_eq_fa",         &test_ps_madds0_alias_fd_eq_fa},
+    {"ps_madds0_alias_fd_eq_fb",         &test_ps_madds0_alias_fd_eq_fb},
+    {"ps_madds1_alias_fd_eq_fc",         &test_ps_madds1_alias_fd_eq_fc},
     {"ps_muls0_simd",                    &test_ps_muls0_simd},
     {"ps_muls1_simd",                    &test_ps_muls1_simd},
     {"ps_merge00_simd",                  &test_ps_merge00_simd},
