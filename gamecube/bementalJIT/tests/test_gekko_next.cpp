@@ -1929,6 +1929,464 @@ static bool test_ps_madds1_alias_fd_eq_fc() {
         dbits(15.0), dbits(22.0));
 }
 
+// ===========================================================================
+// ps_madd / ps_msub / ps_nmadd / ps_nmsub DEST==SRC ALIASING coverage (sibling
+// class of the 2026-08-09 ps_madds0 bent-legs bug — emit_ps_fma, jit_paired.cpp
+// :455). These forward-cover the SAME write-before-read hazard shape that hit
+// ps_madds/ps_merge10/ps_sum1, closing the "per-op conformance never tested
+// dest==src" gap that let the ps_madds0 bug evade ~10 sessions.
+//
+// AUDIT VERDICT: emit_ps_fma's scalar per-lane arm is ALIAS-SAFE for fd==fa,
+// fd==fb, AND fd==fc — UNLIKE ps_madds. The difference is the c operand:
+//   * ps_madds fed ONE shared fC lane local (fc.ps0 for madds0) to BOTH output
+//     lane calls, so writing the c-aliasing output lane FIRST clobbered c
+//     before the other lane read it (the bug).
+//   * emit_ps_fma passes PER-LANE locals: lane ps0 reads {fa.ps0, fc.ps0,
+//     fb.ps0} and writes fd.ps0; lane ps1 reads {fa.ps1, fc.ps1, fb.ps1} and
+//     writes fd.ps1 (jit_paired.cpp:496-499). emit_single_fma_lane reads all
+//     THREE source locals at its head and writes d_local only at its tail
+//     (jit_fp_helpers.h:982-986/1077 reads; :1073/1086 write).
+//   Lane-local model (fpr_reg_cache.cpp:58-59): ps0_local[N]=base+N,
+//   ps1_local[N]=base+32+N. The ps0 write (base+fd) can NEVER equal any ps1
+//   read (base+32+X), and each lane reads its own sources before its own write.
+//   => no cross-lane and no intra-lane clobber for ANY fd overlap. Every case
+//   below is FORWARD COVERAGE: the correct value == the value the old (always-
+//   ps0-first) order would have produced. If a future refactor introduced a
+//   shared-source-across-lanes shape (as ps_madds had), these would go red.
+//
+// PRIMING: set_ps writes ctx ps[] as DOUBLE-form i64 bits, so frc.IsSingle is
+// false and emit_ps_fma takes the SCALAR per-lane arm (the arm that carried the
+// ps_madds bug) — NOT the f32x4 relaxed_madd SIMD fast path that psq_l/
+// run_ps_simd would trigger. All operands are f32-exact integers, so
+// Force25Bit(fC), the FMA tie-correction, and ForceSingle are all no-ops and
+// the f64 fused result is bit-exact to the reference.
+//
+// Register file (double-form, f32-exact):
+//   f1 = fA = {2.0, 3.0}   f2 = fC = {5.0, 7.0}   f3 = fB = {1.0, 1.0}
+// A-form fields (assembler order fD,fA,fC,fB): FA=f1, FC=f2, FB=f3.
+//   ps_madd  a*c+b   XO=29 : ps0=2*5+1=11.0  ps1=3*7+1=22.0
+//   ps_msub  a*c-b   XO=28 : ps0=2*5-1= 9.0  ps1=3*7-1=20.0
+//   ps_nmadd -(a*c+b)XO=31 : ps0=   -11.0    ps1=   -22.0
+//   ps_nmsub -(a*c-b)XO=30 : ps0=    -9.0    ps1=   -20.0
+// ===========================================================================
+static bool run_ps_fma_alias(const char* tag, u32 op_inst, u32 fd,
+                             u64 exp_ps0, u64 exp_ps1) {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);                        // MSR.FP=1 + HID2.PSE|LSQE
+    fp_env_common(env);                         // FPSCR NI=0 (ForceSingle no-op)
+    set_ps(env, 1, dbits(2.0), dbits(3.0));     // fA
+    set_ps(env, 2, dbits(5.0), dbits(7.0));     // fC
+    set_ps(env, 3, dbits(1.0), dbits(1.0));     // fB
+    const u32 insts[] = { op_inst };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = get_ps0(env, fd), ps1 = get_ps1(env, fd);
+    std::printf("[diag %s] ps0=0x%016llx (exp 0x%016llx) ps1=0x%016llx (exp 0x%016llx)\n",
+                tag, (unsigned long long)ps0, (unsigned long long)exp_ps0,
+                (unsigned long long)ps1, (unsigned long long)exp_ps1);
+    return ps0 == exp_ps0 && ps1 == exp_ps1;
+}
+
+// ---- ps_madd  (XO=29) : fd = fA*fC + fB ----
+// ps_madd f1,f1,f2,f3 (fd==fa) -> {11.0, 22.0}; word 0x102118BA
+static bool test_ps_madd_alias_fd_eq_fa() {
+    return run_ps_fma_alias("ps_madd-alias-fd-eq-fa", 0x102118BAu, 1,
+                            dbits(11.0), dbits(22.0));
+}
+// ps_madd f3,f1,f2,f3 (fd==fb) -> {11.0, 22.0}; word 0x106118BA
+static bool test_ps_madd_alias_fd_eq_fb() {
+    return run_ps_fma_alias("ps_madd-alias-fd-eq-fb", 0x106118BAu, 3,
+                            dbits(11.0), dbits(22.0));
+}
+// ps_madd f2,f1,f2,f3 (fd==fc) -> {11.0, 22.0}; word 0x104118BA
+static bool test_ps_madd_alias_fd_eq_fc() {
+    return run_ps_fma_alias("ps_madd-alias-fd-eq-fc", 0x104118BAu, 2,
+                            dbits(11.0), dbits(22.0));
+}
+
+// ---- ps_msub  (XO=28) : fd = fA*fC - fB ----
+// ps_msub f1,f1,f2,f3 (fd==fa) -> {9.0, 20.0}; word 0x102118B8
+static bool test_ps_msub_alias_fd_eq_fa() {
+    return run_ps_fma_alias("ps_msub-alias-fd-eq-fa", 0x102118B8u, 1,
+                            dbits(9.0), dbits(20.0));
+}
+// ps_msub f3,f1,f2,f3 (fd==fb) -> {9.0, 20.0}; word 0x106118B8
+static bool test_ps_msub_alias_fd_eq_fb() {
+    return run_ps_fma_alias("ps_msub-alias-fd-eq-fb", 0x106118B8u, 3,
+                            dbits(9.0), dbits(20.0));
+}
+// ps_msub f2,f1,f2,f3 (fd==fc) -> {9.0, 20.0}; word 0x104118B8
+static bool test_ps_msub_alias_fd_eq_fc() {
+    return run_ps_fma_alias("ps_msub-alias-fd-eq-fc", 0x104118B8u, 2,
+                            dbits(9.0), dbits(20.0));
+}
+
+// ---- ps_nmadd (XO=31) : fd = -(fA*fC + fB) ----
+// ps_nmadd f1,f1,f2,f3 (fd==fa) -> {-11.0, -22.0}; word 0x102118BE
+static bool test_ps_nmadd_alias_fd_eq_fa() {
+    return run_ps_fma_alias("ps_nmadd-alias-fd-eq-fa", 0x102118BEu, 1,
+                            dbits(-11.0), dbits(-22.0));
+}
+// ps_nmadd f3,f1,f2,f3 (fd==fb) -> {-11.0, -22.0}; word 0x106118BE
+static bool test_ps_nmadd_alias_fd_eq_fb() {
+    return run_ps_fma_alias("ps_nmadd-alias-fd-eq-fb", 0x106118BEu, 3,
+                            dbits(-11.0), dbits(-22.0));
+}
+// ps_nmadd f2,f1,f2,f3 (fd==fc) -> {-11.0, -22.0}; word 0x104118BE
+static bool test_ps_nmadd_alias_fd_eq_fc() {
+    return run_ps_fma_alias("ps_nmadd-alias-fd-eq-fc", 0x104118BEu, 2,
+                            dbits(-11.0), dbits(-22.0));
+}
+
+// ---- ps_nmsub (XO=30) : fd = -(fA*fC - fB) ----
+// ps_nmsub f1,f1,f2,f3 (fd==fa) -> {-9.0, -20.0}; word 0x102118BC
+static bool test_ps_nmsub_alias_fd_eq_fa() {
+    return run_ps_fma_alias("ps_nmsub-alias-fd-eq-fa", 0x102118BCu, 1,
+                            dbits(-9.0), dbits(-20.0));
+}
+// ps_nmsub f3,f1,f2,f3 (fd==fb) -> {-9.0, -20.0}; word 0x106118BC
+static bool test_ps_nmsub_alias_fd_eq_fb() {
+    return run_ps_fma_alias("ps_nmsub-alias-fd-eq-fb", 0x106118BCu, 3,
+                            dbits(-9.0), dbits(-20.0));
+}
+// ps_nmsub f2,f1,f2,f3 (fd==fc) -> {-9.0, -20.0}; word 0x104118BC
+static bool test_ps_nmsub_alias_fd_eq_fc() {
+    return run_ps_fma_alias("ps_nmsub-alias-fd-eq-fc", 0x104118BCu, 2,
+                            dbits(-9.0), dbits(-20.0));
+}
+
+// ===========================================================================
+// PAIRED-SINGLE DEST==SRC ALIASING GRID — coda-1 completion (2026-08-09).
+// Completes the bug-class-extinction sweep started by the ps_madds0/1 fix and
+// the ps_madd/msub/nmadd/nmsub cases above. Covers the remaining ps families:
+//   * arith (ps_add/sub/div, ps_mul) + broadcast-c (ps_muls0/1)  [emit_ps_binary,
+//     emit_ps_muls]
+//   * lane-shuffle / move / sign (ps_merge00/01/10/11, ps_mr, ps_neg/abs/nabs)
+//   * ps_sum0/ps_sum1 (asymmetric sum+copy) and ps_sel
+// AUDIT VERDICT for every emitter here: ALIAS-SAFE. The two cases that would
+// FAIL a regressed emitter are ps_muls0 fd==fc (per-lane-c/ps0-first -> ps1=48
+// instead of 6) and the merge b-first / stack-both-first pins (ps_merge00 fd==fb,
+// ps_merge10 fd==fa); the rest are FORWARD coverage locking lane-disjointness.
+// Cited: fpr_reg_cache.cpp:58-59 (ps0_local[N]=base+N, ps1_local[N]=base+32+N,
+// disjoint lanes); jit_paired.cpp:423-445 (binary read-before-write),
+// :576-579 (muls stash-c-once), :174-179 (merge00 b-first), :235-238 (merge10
+// stack-both), :542-556 (sum0/sum1 order), :279-311 (sel per-lane).
+//
+// arith/muls use run_ps_simd (psq_l single-form -> the SIMD f32x4 arm, which is
+// itself read-before-write atomic); merge/mr/sign/sum/sel use set_ps direct-ctx
+// priming (Double-form -> the SCALAR per-lane arm that carried the ps_madds bug).
+// arg mapping for run_ps_simd: argA->fA(f1), argB->fC(f2), argC->fB(f3).
+// ---------------------------------------------------------------------------
+
+// ---- ps_add / ps_sub / ps_div : operands (fA, fB); fA in a-slot, fB in c-slot
+//      (f3), f2-slot junk. fA={8,3}(f1) fB={2,5}(f3). ------------------------
+// ps_add fD,f1,f3 = {10.0, 8.0}. All alias-safe -> forward coverage.
+static bool test_ps_add_alias_ctrl() {
+    return run_ps_simd("ps_add-ctrl", 0x1001182Au, 0,
+        0x41000000,0x40400000, 0x42C60000,0x429A0000, 0x40000000,0x40A00000,
+        dbits(10.0), dbits(8.0));
+}
+static bool test_ps_add_alias_fd_eq_fa() {
+    return run_ps_simd("ps_add-alias-fd-eq-fa", 0x1021182Au, 1,
+        0x41000000,0x40400000, 0x42C60000,0x429A0000, 0x40000000,0x40A00000,
+        dbits(10.0), dbits(8.0));
+}
+static bool test_ps_add_alias_fd_eq_fb() {
+    return run_ps_simd("ps_add-alias-fd-eq-fb", 0x1061182Au, 3,
+        0x41000000,0x40400000, 0x42C60000,0x429A0000, 0x40000000,0x40A00000,
+        dbits(10.0), dbits(8.0));
+}
+// ps_sub fD,f1,f3 = {6.0, -2.0}.
+static bool test_ps_sub_alias_ctrl() {
+    return run_ps_simd("ps_sub-ctrl", 0x10011828u, 0,
+        0x41000000,0x40400000, 0x42C60000,0x429A0000, 0x40000000,0x40A00000,
+        dbits(6.0), dbits(-2.0));
+}
+static bool test_ps_sub_alias_fd_eq_fa() {
+    return run_ps_simd("ps_sub-alias-fd-eq-fa", 0x10211828u, 1,
+        0x41000000,0x40400000, 0x42C60000,0x429A0000, 0x40000000,0x40A00000,
+        dbits(6.0), dbits(-2.0));
+}
+static bool test_ps_sub_alias_fd_eq_fb() {
+    return run_ps_simd("ps_sub-alias-fd-eq-fb", 0x10611828u, 3,
+        0x41000000,0x40400000, 0x42C60000,0x429A0000, 0x40000000,0x40A00000,
+        dbits(6.0), dbits(-2.0));
+}
+// ps_div fD,f1,f3 = {4.0, 0.6f}. 0.6f f32-exact -> promote to f64 for compare.
+static bool test_ps_div_alias_ctrl() {
+    return run_ps_simd("ps_div-ctrl", 0x10011824u, 0,
+        0x41000000,0x40400000, 0x42C60000,0x429A0000, 0x40000000,0x40A00000,
+        dbits(4.0), dbits((double)(float)(3.0/5.0)));
+}
+static bool test_ps_div_alias_fd_eq_fa() {
+    return run_ps_simd("ps_div-alias-fd-eq-fa", 0x10211824u, 1,
+        0x41000000,0x40400000, 0x42C60000,0x429A0000, 0x40000000,0x40A00000,
+        dbits(4.0), dbits((double)(float)(3.0/5.0)));
+}
+static bool test_ps_div_alias_fd_eq_fb() {
+    return run_ps_simd("ps_div-alias-fd-eq-fb", 0x10611824u, 3,
+        0x41000000,0x40400000, 0x42C60000,0x429A0000, 0x40000000,0x40A00000,
+        dbits(4.0), dbits((double)(float)(3.0/5.0)));
+}
+
+// ---- ps_mul / ps_muls0 / ps_muls1 : operands (fA, fC); fA in a-slot, fC in
+//      b-slot (f2), f3-slot junk. fA={8,3}(f1) fC={2,5}(f2). -----------------
+// ps_mul fD,f1,f2 — PER-LANE c: {16.0, 15.0}. fd==fc read-before-write in-lane.
+static bool test_ps_mul_alias_ctrl() {
+    return run_ps_simd("ps_mul-ctrl", 0x100100B2u, 0,
+        0x41000000,0x40400000, 0x40000000,0x40A00000, 0x42C60000,0x429A0000,
+        dbits(16.0), dbits(15.0));
+}
+static bool test_ps_mul_alias_fd_eq_fa() {
+    return run_ps_simd("ps_mul-alias-fd-eq-fa", 0x102100B2u, 1,
+        0x41000000,0x40400000, 0x40000000,0x40A00000, 0x42C60000,0x429A0000,
+        dbits(16.0), dbits(15.0));
+}
+static bool test_ps_mul_alias_fd_eq_fc() {
+    return run_ps_simd("ps_mul-alias-fd-eq-fc", 0x104100B2u, 2,
+        0x41000000,0x40400000, 0x40000000,0x40A00000, 0x42C60000,0x429A0000,
+        dbits(16.0), dbits(15.0));
+}
+// ps_muls0 fD,f1,f2 — BROADCAST fC.ps0: {16.0, 6.0}.
+static bool test_ps_muls0_alias_ctrl() {
+    return run_ps_simd("ps_muls0-ctrl", 0x10010098u, 0,
+        0x41000000,0x40400000, 0x40000000,0x40A00000, 0x42C60000,0x429A0000,
+        dbits(16.0), dbits(6.0));
+}
+static bool test_ps_muls0_alias_fd_eq_fa() {
+    return run_ps_simd("ps_muls0-alias-fd-eq-fa", 0x10210098u, 1,
+        0x41000000,0x40400000, 0x40000000,0x40A00000, 0x42C60000,0x429A0000,
+        dbits(16.0), dbits(6.0));
+}
+// ps_muls0 fd==fc (0x10410098) — THE ps_madds-class collision. emit_ps_muls
+// stashes Force25Bit(c) into LOCAL_FMA_C0 (jit_paired.cpp:576-579) before either
+// lane, so ps1 reads the intact c. Correct ps1=6.0; a per-lane-c/ps0-first
+// regression would give ps1 = fA.ps1*<stale fd.ps0=16> = 48.0. DISCRIMINATES.
+static bool test_ps_muls0_alias_fd_eq_fc() {
+    return run_ps_simd("ps_muls0-alias-fd-eq-fc", 0x10410098u, 2,
+        0x41000000,0x40400000, 0x40000000,0x40A00000, 0x42C60000,0x429A0000,
+        dbits(16.0), dbits(6.0));   // OLD/naive-buggy ps1 = 48.0
+}
+// ps_muls1 fD,f1,f2 — BROADCAST fC.ps1: {40.0, 15.0}.
+static bool test_ps_muls1_alias_ctrl() {
+    return run_ps_simd("ps_muls1-ctrl", 0x1001009Au, 0,
+        0x41000000,0x40400000, 0x40000000,0x40A00000, 0x42C60000,0x429A0000,
+        dbits(40.0), dbits(15.0));
+}
+static bool test_ps_muls1_alias_fd_eq_fa() {
+    return run_ps_simd("ps_muls1-alias-fd-eq-fa", 0x1021009Au, 1,
+        0x41000000,0x40400000, 0x40000000,0x40A00000, 0x42C60000,0x429A0000,
+        dbits(40.0), dbits(15.0));
+}
+static bool test_ps_muls1_alias_fd_eq_fc() {
+    return run_ps_simd("ps_muls1-alias-fd-eq-fc", 0x1041009Au, 2,
+        0x41000000,0x40400000, 0x40000000,0x40A00000, 0x42C60000,0x429A0000,
+        dbits(40.0), dbits(15.0));
+}
+
+// ---- ps_sum0 / ps_sum1 : A-form (fD,fA,fC,fB). fA={2,3}(f1) fC={11,13}(f2)
+//      fB={5,7}(f3). sum lane = fA.ps0+fB.ps1 = 2+7 = 9.0. -------------------
+// ps_sum0: ps0=9.0, ps1=fC.ps1=13.0. All alias-safe -> forward coverage.
+static bool test_ps_sum0_basic() {
+    return run_ps_simd("ps_sum0-basic", 0x10811894u, 4,
+        0x40000000,0x40400000, 0x41300000,0x41500000, 0x40A00000,0x40E00000,
+        dbits(9.0), dbits(13.0));
+}
+static bool test_ps_sum0_alias_fd_eq_fa() {
+    return run_ps_simd("ps_sum0-alias-fd-eq-fa", 0x10211894u, 1,
+        0x40000000,0x40400000, 0x41300000,0x41500000, 0x40A00000,0x40E00000,
+        dbits(9.0), dbits(13.0));
+}
+static bool test_ps_sum0_alias_fd_eq_fb() {
+    return run_ps_simd("ps_sum0-alias-fd-eq-fb", 0x10611894u, 3,
+        0x40000000,0x40400000, 0x41300000,0x41500000, 0x40A00000,0x40E00000,
+        dbits(9.0), dbits(13.0));
+}
+static bool test_ps_sum0_alias_fd_eq_fc() {
+    return run_ps_simd("ps_sum0-alias-fd-eq-fc", 0x10411894u, 2,
+        0x40000000,0x40400000, 0x41300000,0x41500000, 0x40A00000,0x40E00000,
+        dbits(9.0), dbits(13.0));
+}
+// ps_sum1: ps0=fC.ps0=11.0, ps1=9.0. fd==fa is DISCRIMINATING (2026-07-31
+// sum-first fix): the old copy-first order clobbered fA.ps0 with fC.ps0 before
+// the sum read it -> ps1 = fC.ps0+fB.ps1 = 11+7 = 18.0.
+static bool test_ps_sum1_alias_fd_eq_fa_simd() {
+    return run_ps_simd("ps_sum1-alias-fd-eq-fa-simd", 0x10211896u, 1,
+        0x40000000,0x40400000, 0x41300000,0x41500000, 0x40A00000,0x40E00000,
+        dbits(11.0), dbits(9.0));   // OLD buggy ps1 = 18.0
+}
+static bool test_ps_sum1_alias_fd_eq_fb() {
+    return run_ps_simd("ps_sum1-alias-fd-eq-fb", 0x10611896u, 3,
+        0x40000000,0x40400000, 0x41300000,0x41500000, 0x40A00000,0x40E00000,
+        dbits(11.0), dbits(9.0));
+}
+static bool test_ps_sum1_alias_fd_eq_fc() {
+    return run_ps_simd("ps_sum1-alias-fd-eq-fc", 0x10411896u, 2,
+        0x40000000,0x40400000, 0x41300000,0x41500000, 0x40A00000,0x40E00000,
+        dbits(11.0), dbits(9.0));
+}
+
+// ---- ps_sel fD,fA,fC,fB : per lane d.psN = (a.psN >= -0.0) ? c.psN : b.psN.
+//      a MIXED {+1.0,-1.0} exercises both arms: ps0 picks c(=100), ps1 picks
+//      b(=400). All alias-safe -> forward coverage. -----------------------
+static bool run_ps_sel_alias(const char* tag, u32 op_inst, u32 fd) {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);                                   // MSR.FP + HID2.PSE|LSQE
+    set_ps(env, 1, dbits(1.0),   dbits(-1.0));             // fa : ps0->pick c, ps1->pick b
+    set_ps(env, 2, dbits(100.0), dbits(200.0));            // fc
+    set_ps(env, 3, dbits(300.0), dbits(400.0));            // fb
+    if (fd != 1 && fd != 2 && fd != 3) set_ps(env, fd, FP_SENTINEL, FP_SENTINEL);
+    s32 next_pc = -1;
+    const u32 insts[] = { op_inst };
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = get_ps0(env, fd), ps1 = get_ps1(env, fd);
+    std::printf("[diag %s] ps0=0x%016llx (exp 4059..=100.0) ps1=0x%016llx (exp 4079..=400.0)\n",
+                tag, (unsigned long long)ps0, (unsigned long long)ps1);
+    return ps0 == dbits(100.0) && ps1 == dbits(400.0);
+}
+static bool test_ps_sel_basic() {
+    return run_ps_sel_alias("ps_sel-basic", 0x100118AEu, 0);
+}
+static bool test_ps_sel_alias_fd_eq_fa() {
+    return run_ps_sel_alias("ps_sel-alias-fd-eq-fa", 0x102118AEu, 1);
+}
+static bool test_ps_sel_alias_fd_eq_fb() {
+    return run_ps_sel_alias("ps_sel-alias-fd-eq-fb", 0x106118AEu, 3);
+}
+static bool test_ps_sel_alias_fd_eq_fc() {
+    return run_ps_sel_alias("ps_sel-alias-fd-eq-fc", 0x104118AEu, 2);
+}
+
+// ---- ps_merge00/01/10/11 : lane-shuffle bit-moves. i64 lane sentinels so a
+//      stale-lane leak is bit-loud. f1={0x1111..,0x1F1F..} f2={0x2222..,0x2F2F..}.
+//      DISCRIMINATING: merge00 fd==fb (b-first fix), merge10 fd==fa (stack-both
+//      fix). set_ps -> Double-form -> scalar per-lane path. --------------------
+static const u64 MRG_F1_PS0 = 0x1111111111111111ull;
+static const u64 MRG_F1_PS1 = 0x1F1F1F1F1F1F1F1Full;
+static const u64 MRG_F2_PS0 = 0x2222222222222222ull;
+static const u64 MRG_F2_PS1 = 0x2F2F2F2F2F2F2F2Full;
+
+static bool run_merge_alias(const char* tag, u32 word, u32 fd,
+                            u64 exp_ps0, u64 exp_ps1) {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);                                   // MSR.FP + HID2.PSE|LSQE
+    set_ps(env, 1, MRG_F1_PS0, MRG_F1_PS1);
+    set_ps(env, 2, MRG_F2_PS0, MRG_F2_PS1);
+    if (fd != 1 && fd != 2) set_ps(env, fd, FP_SENTINEL, FP_SENTINEL);
+    const u32 insts[] = { word };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = get_ps0(env, fd), ps1 = get_ps1(env, fd);
+    std::printf("[diag %s] fd%u ps0=0x%016llx (exp 0x%016llx) ps1=0x%016llx (exp 0x%016llx)\n",
+                tag, fd, (unsigned long long)ps0, (unsigned long long)exp_ps0,
+                (unsigned long long)ps1, (unsigned long long)exp_ps1);
+    return ps0 == exp_ps0 && ps1 == exp_ps1;
+}
+// ps_merge00 (d.ps0<-a.ps0, d.ps1<-b.ps0).
+static bool test_ps_merge00_alias_fd_distinct() {
+    return run_merge_alias("ps_merge00-distinct", 0x10011420u, 0, MRG_F1_PS0, MRG_F2_PS0);
+}
+static bool test_ps_merge00_alias_fd_eq_fa() {
+    return run_merge_alias("ps_merge00-fd-eq-fa", 0x10211420u, 1, MRG_F1_PS0, MRG_F2_PS0);
+}
+// fd==fb DISCRIMINATES: b-first order gives ps1=f2.ps0; the OLD d.ps0-first
+// order clobbered the shared f2.ps0 local with f1.ps0 -> ps1=0x1111...
+static bool test_ps_merge00_alias_fd_eq_fb() {
+    return run_merge_alias("ps_merge00-fd-eq-fb", 0x10411420u, 2, MRG_F1_PS0, MRG_F2_PS0);
+}
+// ps_merge01 (d.ps0<-a.ps0, d.ps1<-b.ps1) — lane-disjoint, forward coverage.
+static bool test_ps_merge01_alias_fd_distinct() {
+    return run_merge_alias("ps_merge01-distinct", 0x10011460u, 0, MRG_F1_PS0, MRG_F2_PS1);
+}
+static bool test_ps_merge01_alias_fd_eq_fa() {
+    return run_merge_alias("ps_merge01-fd-eq-fa", 0x10211460u, 1, MRG_F1_PS0, MRG_F2_PS1);
+}
+static bool test_ps_merge01_alias_fd_eq_fb() {
+    return run_merge_alias("ps_merge01-fd-eq-fb", 0x10411460u, 2, MRG_F1_PS0, MRG_F2_PS1);
+}
+// ps_merge10 (d.ps0<-a.ps1, d.ps1<-b.ps0).
+static bool test_ps_merge10_alias_fd_distinct() {
+    return run_merge_alias("ps_merge10-distinct", 0x100114A0u, 0, MRG_F1_PS1, MRG_F2_PS0);
+}
+// fd==fa DISCRIMINATES: stack-both-first gives ps0=f1.ps1; the OLD ps1-first
+// order clobbered f1.ps1 (==d.ps1) with f2.ps0 before the d.ps0 read -> ps0=0x2222...
+static bool test_ps_merge10_alias_fd_eq_fa_b2() {
+    return run_merge_alias("ps_merge10-fd-eq-fa", 0x102114A0u, 1, MRG_F1_PS1, MRG_F2_PS0);
+}
+static bool test_ps_merge10_alias_fd_eq_fb() {
+    return run_merge_alias("ps_merge10-fd-eq-fb", 0x104114A0u, 2, MRG_F1_PS1, MRG_F2_PS0);
+}
+// ps_merge11 (d.ps0<-a.ps1, d.ps1<-b.ps1) — lane-disjoint, forward coverage.
+static bool test_ps_merge11_alias_fd_distinct() {
+    return run_merge_alias("ps_merge11-distinct", 0x100114E0u, 0, MRG_F1_PS1, MRG_F2_PS1);
+}
+static bool test_ps_merge11_alias_fd_eq_fa() {
+    return run_merge_alias("ps_merge11-fd-eq-fa", 0x102114E0u, 1, MRG_F1_PS1, MRG_F2_PS1);
+}
+static bool test_ps_merge11_alias_fd_eq_fb() {
+    return run_merge_alias("ps_merge11-fd-eq-fb", 0x104114E0u, 2, MRG_F1_PS1, MRG_F2_PS1);
+}
+
+// ---- ps_mr / ps_neg / ps_abs / ps_nabs : single-source (fD,fB); only fd==fb
+//      aliasing. Real f64 doubles so the scalar emit_lane_bit_op path runs.
+//      fB.ps0=+2.5, fB.ps1=-7.0. ----------------------------------------------
+static const u64 SS_B_PS0 = 0x4004000000000000ull;  // +2.5
+static const u64 SS_B_PS1 = 0xC01C000000000000ull;  // -7.0
+
+static bool run_single_src(const char* tag, u32 word, u32 fd, u32 fb,
+                           u64 exp_ps0, u64 exp_ps1) {
+    TestEnv env;
+    if (!env.init()) return false;
+    const u32 PC = 0x80300000;
+    psq_env_common(env);
+    set_ps(env, fb, SS_B_PS0, SS_B_PS1);
+    if (fd != fb) set_ps(env, fd, FP_SENTINEL, FP_SENTINEL);
+    const u32 insts[] = { word };
+    s32 next_pc = -1;
+    if (!env.dispatch_block(PC, insts, 1, &next_pc)) return false;
+    const u64 ps0 = get_ps0(env, fd), ps1 = get_ps1(env, fd);
+    std::printf("[diag %s] fd%u ps0=0x%016llx (exp 0x%016llx) ps1=0x%016llx (exp 0x%016llx)\n",
+                tag, fd, (unsigned long long)ps0, (unsigned long long)exp_ps0,
+                (unsigned long long)ps1, (unsigned long long)exp_ps1);
+    return ps0 == exp_ps0 && ps1 == exp_ps1;
+}
+static bool test_ps_mr_alias_fd_distinct() {          // ps_mr f0,f2 = 0x10001090
+    return run_single_src("ps_mr-distinct", 0x10001090u, 0, 2, SS_B_PS0, SS_B_PS1);
+}
+static bool test_ps_mr_alias_fd_eq_fb() {             // ps_mr f2,f2 = 0x10401090
+    return run_single_src("ps_mr-fd-eq-fb", 0x10401090u, 2, 2, SS_B_PS0, SS_B_PS1);
+}
+static bool test_ps_neg_alias_fd_distinct() {         // neg(+2.5)=-2.5, neg(-7.0)=+7.0
+    return run_single_src("ps_neg-distinct", 0x10001050u, 0, 2,
+                          0xC004000000000000ull, 0x401C000000000000ull);
+}
+static bool test_ps_neg_alias_fd_eq_fb() {
+    return run_single_src("ps_neg-fd-eq-fb", 0x10401050u, 2, 2,
+                          0xC004000000000000ull, 0x401C000000000000ull);
+}
+static bool test_ps_abs_alias_fd_distinct() {         // abs(+2.5)=+2.5, abs(-7.0)=+7.0
+    return run_single_src("ps_abs-distinct", 0x10001210u, 0, 2,
+                          0x4004000000000000ull, 0x401C000000000000ull);
+}
+static bool test_ps_abs_alias_fd_eq_fb() {
+    return run_single_src("ps_abs-fd-eq-fb", 0x10401210u, 2, 2,
+                          0x4004000000000000ull, 0x401C000000000000ull);
+}
+static bool test_ps_nabs_alias_fd_distinct() {        // nabs(+2.5)=-2.5, nabs(-7.0)=-7.0
+    return run_single_src("ps_nabs-distinct", 0x10001110u, 0, 2,
+                          0xC004000000000000ull, 0xC01C000000000000ull);
+}
+static bool test_ps_nabs_alias_fd_eq_fb() {
+    return run_single_src("ps_nabs-fd-eq-fb", 0x10401110u, 2, 2,
+                          0xC004000000000000ull, 0xC01C000000000000ull);
+}
+
 // fctiwz f14,f14 (0xFDC0701E — the exact encoding in PSO HandleReverb's
 // inner loop at 0x803bf1bc, the loop's LAST interp fallback).
 // Reference: Interpreter ConvertToInteger (TowardsZero): value =
@@ -3162,6 +3620,67 @@ static const TestCase k_tests[] = {
     {"ps_madds0_alias_fd_eq_fa",         &test_ps_madds0_alias_fd_eq_fa},
     {"ps_madds0_alias_fd_eq_fb",         &test_ps_madds0_alias_fd_eq_fb},
     {"ps_madds1_alias_fd_eq_fc",         &test_ps_madds1_alias_fd_eq_fc},
+    {"ps_madd_alias_fd_eq_fa",           &test_ps_madd_alias_fd_eq_fa},
+    {"ps_madd_alias_fd_eq_fb",           &test_ps_madd_alias_fd_eq_fb},
+    {"ps_madd_alias_fd_eq_fc",           &test_ps_madd_alias_fd_eq_fc},
+    {"ps_msub_alias_fd_eq_fa",           &test_ps_msub_alias_fd_eq_fa},
+    {"ps_msub_alias_fd_eq_fb",           &test_ps_msub_alias_fd_eq_fb},
+    {"ps_msub_alias_fd_eq_fc",           &test_ps_msub_alias_fd_eq_fc},
+    {"ps_nmadd_alias_fd_eq_fa",          &test_ps_nmadd_alias_fd_eq_fa},
+    {"ps_nmadd_alias_fd_eq_fb",          &test_ps_nmadd_alias_fd_eq_fb},
+    {"ps_nmadd_alias_fd_eq_fc",          &test_ps_nmadd_alias_fd_eq_fc},
+    {"ps_nmsub_alias_fd_eq_fa",          &test_ps_nmsub_alias_fd_eq_fa},
+    {"ps_nmsub_alias_fd_eq_fb",          &test_ps_nmsub_alias_fd_eq_fb},
+    {"ps_nmsub_alias_fd_eq_fc",          &test_ps_nmsub_alias_fd_eq_fc},
+    {"ps_add_alias_ctrl",                &test_ps_add_alias_ctrl},
+    {"ps_add_alias_fd_eq_fa",            &test_ps_add_alias_fd_eq_fa},
+    {"ps_add_alias_fd_eq_fb",            &test_ps_add_alias_fd_eq_fb},
+    {"ps_sub_alias_ctrl",                &test_ps_sub_alias_ctrl},
+    {"ps_sub_alias_fd_eq_fa",            &test_ps_sub_alias_fd_eq_fa},
+    {"ps_sub_alias_fd_eq_fb",            &test_ps_sub_alias_fd_eq_fb},
+    {"ps_div_alias_ctrl",                &test_ps_div_alias_ctrl},
+    {"ps_div_alias_fd_eq_fa",            &test_ps_div_alias_fd_eq_fa},
+    {"ps_div_alias_fd_eq_fb",            &test_ps_div_alias_fd_eq_fb},
+    {"ps_mul_alias_ctrl",                &test_ps_mul_alias_ctrl},
+    {"ps_mul_alias_fd_eq_fa",            &test_ps_mul_alias_fd_eq_fa},
+    {"ps_mul_alias_fd_eq_fc",            &test_ps_mul_alias_fd_eq_fc},
+    {"ps_muls0_alias_ctrl",              &test_ps_muls0_alias_ctrl},
+    {"ps_muls0_alias_fd_eq_fa",          &test_ps_muls0_alias_fd_eq_fa},
+    {"ps_muls0_alias_fd_eq_fc",          &test_ps_muls0_alias_fd_eq_fc},
+    {"ps_muls1_alias_ctrl",              &test_ps_muls1_alias_ctrl},
+    {"ps_muls1_alias_fd_eq_fa",          &test_ps_muls1_alias_fd_eq_fa},
+    {"ps_muls1_alias_fd_eq_fc",          &test_ps_muls1_alias_fd_eq_fc},
+    {"ps_sum0_basic",                    &test_ps_sum0_basic},
+    {"ps_sum0_alias_fd_eq_fa",           &test_ps_sum0_alias_fd_eq_fa},
+    {"ps_sum0_alias_fd_eq_fb",           &test_ps_sum0_alias_fd_eq_fb},
+    {"ps_sum0_alias_fd_eq_fc",           &test_ps_sum0_alias_fd_eq_fc},
+    {"ps_sum1_alias_fd_eq_fa_simd",      &test_ps_sum1_alias_fd_eq_fa_simd},
+    {"ps_sum1_alias_fd_eq_fb",           &test_ps_sum1_alias_fd_eq_fb},
+    {"ps_sum1_alias_fd_eq_fc",           &test_ps_sum1_alias_fd_eq_fc},
+    {"ps_sel_basic",                     &test_ps_sel_basic},
+    {"ps_sel_alias_fd_eq_fa",            &test_ps_sel_alias_fd_eq_fa},
+    {"ps_sel_alias_fd_eq_fb",            &test_ps_sel_alias_fd_eq_fb},
+    {"ps_sel_alias_fd_eq_fc",            &test_ps_sel_alias_fd_eq_fc},
+    {"ps_merge00_alias_fd_distinct",     &test_ps_merge00_alias_fd_distinct},
+    {"ps_merge00_alias_fd_eq_fa",        &test_ps_merge00_alias_fd_eq_fa},
+    {"ps_merge00_alias_fd_eq_fb",        &test_ps_merge00_alias_fd_eq_fb},
+    {"ps_merge01_alias_fd_distinct",     &test_ps_merge01_alias_fd_distinct},
+    {"ps_merge01_alias_fd_eq_fa",        &test_ps_merge01_alias_fd_eq_fa},
+    {"ps_merge01_alias_fd_eq_fb",        &test_ps_merge01_alias_fd_eq_fb},
+    {"ps_merge10_alias_fd_distinct",     &test_ps_merge10_alias_fd_distinct},
+    {"ps_merge10_alias_fd_eq_fa_b2",     &test_ps_merge10_alias_fd_eq_fa_b2},
+    {"ps_merge10_alias_fd_eq_fb",        &test_ps_merge10_alias_fd_eq_fb},
+    {"ps_merge11_alias_fd_distinct",     &test_ps_merge11_alias_fd_distinct},
+    {"ps_merge11_alias_fd_eq_fa",        &test_ps_merge11_alias_fd_eq_fa},
+    {"ps_merge11_alias_fd_eq_fb",        &test_ps_merge11_alias_fd_eq_fb},
+    {"ps_mr_alias_fd_distinct",          &test_ps_mr_alias_fd_distinct},
+    {"ps_mr_alias_fd_eq_fb",             &test_ps_mr_alias_fd_eq_fb},
+    {"ps_neg_alias_fd_distinct",         &test_ps_neg_alias_fd_distinct},
+    {"ps_neg_alias_fd_eq_fb",            &test_ps_neg_alias_fd_eq_fb},
+    {"ps_abs_alias_fd_distinct",         &test_ps_abs_alias_fd_distinct},
+    {"ps_abs_alias_fd_eq_fb",            &test_ps_abs_alias_fd_eq_fb},
+    {"ps_nabs_alias_fd_distinct",        &test_ps_nabs_alias_fd_distinct},
+    {"ps_nabs_alias_fd_eq_fb",           &test_ps_nabs_alias_fd_eq_fb},
     {"ps_muls0_simd",                    &test_ps_muls0_simd},
     {"ps_muls1_simd",                    &test_ps_muls1_simd},
     {"ps_merge00_simd",                  &test_ps_merge00_simd},
