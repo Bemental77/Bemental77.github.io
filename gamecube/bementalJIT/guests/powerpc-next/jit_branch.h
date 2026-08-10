@@ -57,7 +57,8 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
 void emit_bcx_fused(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                     const CodeOp& op, u32 ctx_ptr, u32 charge,
                     u32 loop_head_depth, bool block_has_store,
-                    u32 tag_addr, u32 start_pc, const CmpFuse* fuse = nullptr);
+                    u32 tag_addr, u32 start_pc, const CmpFuse* fuse = nullptr,
+                    bool fp_resident = false);
 
 // Indirect: bclr (op19:16) takes target from LR; bcctr (op19:528) takes
 // target from CTR. Both support LK to set LR=next_pc.

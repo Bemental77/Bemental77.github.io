@@ -375,7 +375,7 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
 void emit_bcx_fused(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                     const CodeOp& op, u32 ctx_ptr, u32 charge,
                     u32 loop_head_depth, bool block_has_store,
-                    u32 tag_addr, u32 start_pc, const CmpFuse* fuse) {
+                    u32 tag_addr, u32 start_pc, const CmpFuse* fuse, bool fp_resident) {
     const u32  inst = op.inst;
     const u32  bo   = GekkoOperands::BO(inst);
     const u32  bi   = GekkoOperands::BI(inst);
@@ -385,7 +385,12 @@ void emit_bcx_fused(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     constexpr u32 LOCAL_TMP_A = 0u;
 
     rc.Flush(ctx_ptr);
-    frc.Flush(ctx_ptr);          // compile-time no-op: pre-scan admits no FPRs
+    // [WS-1 STEP-3 store-residency] fp_resident keeps the assumed/body v128s
+    // resident across the op_br back-edge (wasm locals persist) — the loop-exit
+    // epilogue flushes them, and SetForceFlush(assumed) covers host-visible
+    // points inside the loop. Non-resident (int_fused): pre-scan admits no FPRs,
+    // so this stays the original compile-time no-op.
+    if (!fp_resident) frc.Flush(ctx_ptr);
 
     // Condition -> stack 1 iff taken. Mirrors emit_bcx's native forms.
     if (bo == 0b10000u || bo == 0b10010u) {

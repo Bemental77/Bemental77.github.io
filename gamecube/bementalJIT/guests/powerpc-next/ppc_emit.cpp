@@ -1161,6 +1161,11 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             frc.SetForceFlush(assumed);
         } else {
             frc.EmitAssumedSingleLoads(ctx_ptr, assumed);
+            // [WS-1 STEP-3 store-residency] the fp_resident_loop singles arm keeps
+            // its assumed v128s resident across the op_br back-edge (the terminal
+            // emit_bcx_fused skips the FPR flush), so — like fast_loop above —
+            // every host-visible Flush inside the loop must still write ps[].
+            if (fp_resident_loop) frc.SetForceFlush(assumed);
         }
     }
     frc.EmitPrologueLoads(ctx_ptr);
@@ -1446,7 +1451,8 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                 (chain_tag_addr ? chain_tag_addr
                                 : (u32)(uintptr_t)&g_bem_disp_tag[0]) + fused_bucket;
             emit_bcx_fused(b, rc, frc, op, ctx_ptr, charge, fused_loop_depth,
-                           block_has_store, fused_tag_addr, start_pc, params.cmp_fuse);
+                           block_has_store, fused_tag_addr, start_pc, params.cmp_fuse,
+                           /*fp_resident=*/(fp_resident_loop && with_singles));
             emitted_native = true;
         } else if (is_terminator && with_singles && fast_loop &&
                    GekkoOperands::OPCD(op.inst) == 16u && frc.AllSingle(assumed)) {
