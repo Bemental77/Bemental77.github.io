@@ -527,6 +527,16 @@
         }
       } catch (e) { pageLog('[hw-render] canvas transfer failed: ' + (e && e.message)); }
     }
+    // [WS-1 STEP-3] fp_resident_loop kill switch / A/B. getenv is dead in the
+    // worker, so the toggle rides SAB scratch cell 0x026B3408 (above the wasm
+    // bss, browser-zeroed = default ON; the emitter reads it per block-emit).
+    // ?bjit_fp_resident_loop=0 -> write 1 = force OFF. Written before the worker
+    // boots so it's set long before the matrix blocks compile.
+    try {
+      var _fpr = new URLSearchParams(location.search).get('bjit_fp_resident_loop');
+      if (_fpr !== null)
+        new Uint32Array(sharedMemory.buffer)[0x026B3408 >> 2] = (parseInt(_fpr, 10) !== 0) ? 0 : 1;
+    } catch (e) { pageLog('[fp-resident] toggle write failed: ' + (e && e.message)); }
     dolphin_worker.postMessage({
       cmd: 'mem-init', memory: sharedMemory, offscreen: _hwOff,
       gcRenderWorker: !!window.__gcRenderWorker, wgpu: _wgpu, bjitEnv: _bjitEnv,

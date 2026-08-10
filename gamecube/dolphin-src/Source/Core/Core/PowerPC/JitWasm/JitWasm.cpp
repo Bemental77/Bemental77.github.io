@@ -34,6 +34,7 @@
 
 #include <climits>
 #include <cstdint>
+#include <cstdlib>  // [WS-1 STEP-3] getenv/atoi for BEM_FP_RESIDENT_LOOP toggle
 #include <vector>
 
 #include <emscripten.h>
@@ -76,6 +77,8 @@ extern "C" uint32_t g_bem_lc_base;
 extern "C" uint32_t g_bem_fprf_enabled;
 // [accurate-nans-gate PM59] m_accurate_nans half (block_cache.cpp).
 extern "C" uint32_t g_bem_accurate_nans;
+// [WS-1 STEP-3] fp_resident_loop region A/B + kill switch (block_cache.cpp).
+extern "C" uint32_t g_bem_fp_resident_loop;
 // [single-spec PM26] sticky force-double registry (block_cache.cpp).
 extern "C" void bem_pc_force_double_add(uint32_t pc);
 
@@ -231,6 +234,11 @@ void JitWasm::Run()
   // default false). Mirror it so games get native-default fast FP; the accurate
   // path stays validated by test_diff_next (which forces it on).
   g_bem_accurate_nans = Config::Get(Config::MAIN_ACCURATE_NANS) ? 1u : 0u;
+  // [WS-1 STEP-3] The fp_resident_loop runtime toggle does NOT go through here:
+  // getenv is dead in the worker (cross-thread Module.ENV never reaches the C
+  // environ — week-one dispatch-audit lesson). The kill switch rides a shared SAB
+  // cell (0x026B3408) the page writes from ?bjit_fp_resident_loop, read per-emit
+  // in ppc_emit.cpp. The global g_bem_fp_resident_loop stays the compile default.
 
 #ifdef __EMSCRIPTEN__
   // [ppc-bridge] Publish the REAL ppc_state + RAM addresses into the SAB for the

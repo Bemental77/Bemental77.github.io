@@ -1689,6 +1689,10 @@ function startServer() {
             // + [single-spec] shadow mask (hex) + cumulative deopt count
             bw.simdCensus = (A[0x026B33D0 >> 2] >>> 0) + '/' + (A[0x026B33D4 >> 2] >>> 0) + '/'
               + (A[0x026B33D8 >> 2] >>> 0) + '/' + (A[0x026B33DC >> 2] >>> 0)
+              // [madds-census STEP-1] EMIT-TIME ps_madds arm split: simd-madds / scalar-madds
+              + ' madds=' + (A[0x026B33CC >> 2] >>> 0) + '/' + (A[0x026B33FC >> 2] >>> 0)
+              // [WS-1 STEP-3] fp_resident_loop region-entry emit count
+              + ' region=' + (A[0x026B3404 >> 2] >>> 0)
               + ' mask=0x' + (A[0x026B33E0 >> 2] >>> 0).toString(16)
               + ' deopt=' + (A[0x026B33E8 >> 2] >>> 0)
               + ' psWith=' + (A[0x026B33EC >> 2] >>> 0)

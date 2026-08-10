@@ -92,6 +92,7 @@ extern "C" {
     extern unsigned char g_bem_promote_enabled; // Phase A: A/B toggle
     extern int           g_bem_gp_dirty;        // [perf] gather-pipe write pending (bridge)
     extern uint32_t      g_bem_lc_base;         // [lc-window PM23] Memory::GetL1Cache() addr
+    extern uint32_t      g_bem_fp_resident_loop; // [WS-1 STEP-3] FP self-loop op_loop residency A/B
     int  bem_pc_force_double(uint32_t pc);      // [single-spec PM26] sticky deopt registry
 }
 static constexpr u32 BEM_DISP_MASK_NEXT = 0x3FFFFu;  // MUST match block_cache.cpp BEM_DISP_MASK (BEM_DISP_BITS=18)
@@ -1073,8 +1074,28 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // [PM53d] !merged: the PM47 self-chain exit protocol (spill/flag/tail-call)
     // is per-block-module only; without its publisher the flag-check entry
     // would be dead ops inside a region body.
+    // [WS-1 STEP-3 fp-resident-loop] FP self-loops take int_fused's op_loop/op_br
+    // residency shape (assumed singles established ONCE in the preheader, v128
+    // resident across the back-edge) instead of PM47's tail-call + per-iter
+    // v128 re-establishment. Supersedes fast_loop for the same shape when the
+    // A/B flag is on (default). Region-OFF (flag 0) falls back to fast_loop.
+    // Runtime kill switch / A/B: getenv is DEAD in the worker (week-one lesson —
+    // cross-thread Module.ENV never reaches the EmuThread's C environ), so the
+    // toggle rides a shared SAB cell the page writes from ?bjit_fp_resident_loop
+    // (0x026B3408: 0/default-zeroed = ON, nonzero = force OFF). Read per-emit so
+    // it needs no Init-timing dance; lc_base-gated (test memories are small).
+    const bool fp_force_off = g_bem_lc_base &&
+        (*reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B3408u)) != 0u);
+    const bool fp_resident_loop = g_bem_fp_resident_loop && !fp_force_off && is_self_loop &&
+                                  assumed.m_val != 0u && !merged &&
+                                  !idle_block && !block.m_noncontiguous;
+    if (fp_resident_loop && g_bem_lc_base) {     // g_bem_lc_base gate: test memories are
+        volatile uint32_t* rc_cell =             // small and must not take absolute stores
+            reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026B3404u));
+        *rc_cell = *rc_cell + 1u;                // region-entry counter (probe: region=<n>)
+    }
     const bool fast_loop = is_self_loop && assumed.m_val != 0u && !merged &&
-                           !block.m_noncontiguous;   // [FUSION v2] fused: off (new surface)
+                           !block.m_noncontiguous && !fp_resident_loop;   // [FUSION v2] fused: off (new surface)
     // [PM53h int-fusion] Integer self-loops (no FPR speculation set) get the
     // in-function loop instead: the body is wrapped in wasm loop/br, so
     // iterations reuse the SAME activation — no per-iteration GPR prologue,
@@ -1212,7 +1233,11 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // placement would re-run prologue loads / recharge entry downcount per
     // iteration), immediately before the per-op body.
     u32 fused_loop_depth = 0u;
-    if (int_fused) {
+    // [WS-1 STEP-3] the op_loop residency shape applies to int_fused (assumed==0,
+    // single arm) AND fp_resident_loop's SINGLES arm (with_singles); the double
+    // fallback arm (with_singles==false) stays a normal deopt block.
+    const bool resident_loop_arm = int_fused || (fp_resident_loop && with_singles);
+    if (resident_loop_arm) {
         b.op_loop(BLOCK_TYPE_VOID);
         fused_loop_depth = b.ctrlDepth();
     }
@@ -1413,8 +1438,8 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             emit_bcx(b, rc, frc, op, ctx_ptr, /*is_terminal=*/false,
                      BitSet32(0), params.cmp_fuse);
             emitted_native = true;
-        } else if (is_terminator && int_fused) {
-            // [PM53h int-fusion] fused back-edge terminal (see emit_bcx_fused).
+        } else if (is_terminator && resident_loop_arm) {
+            // [PM53h int-fusion / WS-1 STEP-3] fused back-edge terminal (see emit_bcx_fused).
             const u32 fused_bucket =
                 ((start_pc >> 2) & BEM_DISP_MASK_NEXT) * 4u;
             const u32 fused_tag_addr =
@@ -1514,7 +1539,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // [PM53h int-fusion] Close the loop. Fall-through out of a wasm loop body
     // exits the loop (only br re-iterates), so the not-taken and bail paths
     // land here naturally and run the unchanged epilogue below.
-    if (int_fused) b.op_end();
+    if (resident_loop_arm) b.op_end();
 
     // Epilogue: drain gather-pipe (so GPU FIFO sees CP_INT/PE_TOKEN/PE_FINISH
     // after stw-to-0xCC008000 family stores), flush dirty GPR locals, then

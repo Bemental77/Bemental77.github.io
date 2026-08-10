@@ -610,6 +610,35 @@ void emit_ps_madds(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const 
     const u32 sub5 = GekkoOperands::SUBOP5(inst);
     const u8  c_lane = (sub5 == 14) ? FPR_LANE_PS0 : FPR_LANE_PS1;
 
+    // [simd-paired madds] All inputs single -> one f32x4.relaxed_madd, with the
+    // single fc lane (ps0 for madds0, ps1 for madds1) broadcast across the
+    // vector. Mirrors emit_ps_fma's SIMD arm (a*c+b, no negate/subtract); the
+    // ONLY delta is the c-lane broadcast. BindSingleWrite(fd) marks the output
+    // Single, so the accumulator chain (fd read by a later madds) stays single
+    // and the whole nest runs SIMD instead of cascading back to the f64 arm.
+    // relaxed_madd reads the whole vector before writing d, so the fd==fc (and
+    // fd==fa/fd==fb) write-before-read aliasing the scalar arm hand-orders
+    // around below is auto-safe here. IsSingle-gated so the f64 arm is dead.
+    if (frc.IsSingle(fa) && frc.IsSingle(fb) && frc.IsSingle(fc)) {
+        bem_emit_census(0x026B33CCu);   // [madds-census] simd-madds (STEP-1 arm fire)
+        auto a = frc.BindSingleRead(fa);
+        auto b = frc.BindSingleRead(fb);
+        auto c = frc.BindSingleRead(fc);
+        auto d = frc.BindSingleWrite(fd);
+        const u32 c_idx = (c_lane == FPR_LANE_PS0) ? 0u : 1u;
+        wb.op_local_get(a.v128_idx);            // x = a
+        wb.op_local_get(c.v128_idx);            // y = broadcast(c[c_lane])
+        wb.op_f32x4_extract_lane(c_idx);
+        wb.op_f32x4_splat();
+        wb.op_local_get(b.v128_idx);            // z = b (addend)
+        wb.op_f32x4_relaxed_madd();             // a*c + b
+        wb.op_local_set(d.v128_idx);
+        emit_v128_ni_flush(wb, d.v128_idx, ctx_ptr);
+        emit_fprf_single_from_v128(wb, d.v128_idx, ctx_ptr, !op.fprf_discardable);
+        return;
+    }
+
+    bem_emit_census(0x026B33FCu);   // [madds-census] scalar-madds (STEP-1 fallback)
     auto fa_pair = frc.Bind(fa, FPRMode::Read,  FPR_LANE_BOTH);
     auto fb_pair = frc.Bind(fb, FPRMode::Read,  FPR_LANE_BOTH);
     auto fc_pair = frc.Bind(fc, FPRMode::Read,  c_lane);

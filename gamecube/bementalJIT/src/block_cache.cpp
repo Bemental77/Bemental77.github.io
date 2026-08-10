@@ -90,6 +90,13 @@ uint32_t g_bem_accurate_nans = 0;
 // Set to 1 by test_diff_next to keep the flushed path validated. Guest-observable
 // (unlike accurate_nans which native also skips) — validate all 3 games render.
 uint32_t g_bem_ni_flush = 0;
+// [WS-1 STEP-3 fp-resident-loop 2026-08-10] FP self-loops (assumed!=0) take the
+// int_fused op_loop/op_br residency shape instead of PM47's tail-call + per-iter
+// v128 re-establishment: assumed singles are loaded ONCE in the preheader and
+// stay v128-resident across the back-edge. default 1 = on; the STEP-4 A/B sets 0
+// to fall back to fast_loop (region-OFF baseline). Region-entry count -> cell
+// 0x026B3404 (read by the probe as region=<n>).
+uint32_t g_bem_fp_resident_loop = 1;
 // Phase A: per-block execution counter + promote ring, written by the BLOCK
 // PROLOGUE in-WASM (so it counts tail-chained executions the C dispatch loop
 // never sees — the chain-head promotion was net-negative). On the
