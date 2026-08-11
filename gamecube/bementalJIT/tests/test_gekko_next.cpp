@@ -3615,6 +3615,48 @@ static bool test_psmtxro_diff() {
     return okA && okB && mem_eq && st_eq && nwA > 0u && nwA == nwB;
 }
 
+// [B1 Blocker-1 isolation 2026-08-11] Is the denormal hang the PM26 deopt storm
+// (JIT) or a reused-env artifact? FRESH env, chaining OFF (deopts return start_pc
+// to THIS loop instead of an internal self-chain storm), denormal-only live-ins,
+// bounded. Watch the PM26 deopt cell 0x026B33E4 + count self-re-dispatches
+// (npc==cur = the guard deopted + returned its own start). Cell/self-redispatch
+// climbing => PM26 CONFIRMED (the live build's JitWasm::Run would evict+force-
+// double; the harness can't, so it loops). Quiet => env-reuse artifact.
+extern "C" unsigned char g_bem_chain_enabled;
+static bool test_psmtxro_denorm_isolate() {
+    TestEnv env; if (!env.init()) return false;
+    // FRESH env, chaining ON (default) — the ACTUAL hang condition. Denormal SINGLE
+    // memory (psq_l loads them, as the real fn does), N=1, run the full function.
+    // If run_psmtxro HANGS internally, the COMPLETED line never prints => JIT hang
+    // (fresh-env => NOT the reuse artifact). COMPLETED => reuse/memset was the artifact.
+    volatile u32* cell = (volatile u32*)(uintptr_t)0x026B33E4u;
+    u32 before = *cell;
+    u32 mtx[12], src[3];
+    for (u32 i = 0; i < 12; i++) mtx[i] = 0x00000001u | ((0x155555u * (i + 1)) & 0x007FFFFEu);  // denormal singles
+    for (u32 i = 0; i < 3;  i++) src[i] = 0x00000001u | ((0x0ABCDu  * (i + 1)) & 0x007FFFFEu);
+    psq_env_common(env); env.spr(912) = 0;
+    env.gpr(3) = 0x80100000u; env.gpr(4) = 0x80200000u; env.gpr(5) = 0x80500000u; env.gpr(6) = 1u;
+    env.gpr(1) = 0x8010F000u;
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        var m = []; var s = [];
+        for (var i = 0; i < 12; i++) m.push(HEAPU32[($0 >> 2) + i] >>> 0);
+        for (var j = 0; j < 3; j++) s.push(HEAPU32[($1 >> 2) + j] >>> 0);
+        Module.bemental_imports.env.ppc_read32 = function(a) { a = a >>> 0;
+            if (a >= 0x80100000 && a < 0x80100030) return m[(a - 0x80100000) >> 2] | 0;
+            if (a >= 0x80200000 && a < 0x8020000c) return s[(a - 0x80200000) >> 2] | 0; return 0; };
+        Module.bemental_imports.env.ppc_write32 = function(a, v) {};
+    }, (u32)(uintptr_t)mtx, (u32)(uintptr_t)src);
+#endif
+    std::printf("[pm26-isolate] fresh-env chain-on denorm-memory: dispatching (NO 'COMPLETED' below => JIT hang)\n");
+    bool ok = run_psmtxro(env);                              // reproduces the hang if it's the JIT
+    u32 after = *cell;
+    std::printf("[pm26-isolate] COMPLETED ok=%d deopt-cell %08x->%08x => denorm does NOT hang fresh-env; reuse/memset was the artifact\n",
+                ok, before, after);
+    (void)g_bem_chain_enabled;
+    return true;   // diagnostic probe; read the printf (or its absence)
+}
+
 // [PM62 special-case conformance 2026-08-07] frsqrte/fres native emitters vs the
 // Dolphin ApproximateReciprocalSquareRoot / ApproximateReciprocal special-value
 // ladders (Common/FloatUtils.cpp). Workflow wf_d6c659d7 (both sides run in V8) found:
@@ -3683,6 +3725,7 @@ static const TestCase k_tests[] = {
     {"writemtxps4x3_send_sequence",      &test_writemtxps4x3_send_sequence},
     {"psmtxconcat_row2_build",           &test_psmtxconcat_row2_build},
     {"psmtxro_diff",                     &test_psmtxro_diff},
+    {"psmtxro_denorm_isolate",           &test_psmtxro_denorm_isolate},
     {"lazycr_cross_block_beq",           &test_lazycr_cross_block_beq},
     {"lazycr_so_freeze",                 &test_lazycr_so_freeze},
     {"lazycr_fused_adjacent",            &test_lazycr_fused_adjacent},
