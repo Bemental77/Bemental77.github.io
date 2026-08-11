@@ -5,11 +5,16 @@ accurate outputs, for the B1 template fixture. Break at the fn entry + its blr;
 at entry capture inputs (ROMtx 48B @r3, src vecs count*12 @r4, count @r6, dstBase
 @r5); at blr capture outputs (dst vecs @dstBase) + architected end-state. -> JSON.
 
-Launch the oracle first (MP4 = 0x800bc8d0):
+Launch the oracle first (MP4 PSMTX = 0x800bc8d0). CRITICAL: DebugModeEnabled=True
+makes the JIT emit breakpoint checks (else Z0 sets OK but NEVER fires — verified).
+A native SAVESTATE (-s) is what reaches the board/skinning scene that calls PSMTX
+(boot/attract does not; needs Casey's mint of MP4-board/SAB-CityEscape/PSO-char states):
   ~/gc_refs/dolphin-upstream/build-oracle/Binaries/dolphin-emu-nogui \
-    -d -C Dolphin.General.GDBPort=9091 -C Dolphin.Core.CPUThread=True \
-    -C Dolphin.Core.CPUCore=1 -e "/Users/caseybement/Downloads/Mario Party 4 (USA).iso"
-then run this. Env: PSMTX_ENTRY, PSMTX_BLR, GDB_PORT, GOLDEN_OUT, MAX_REC, MAX_CNT, DURATION.
+    -C Dolphin.Interface.DebugModeEnabled=True \
+    -C Dolphin.General.GDBPort=9091 -C Dolphin.Core.CPUThread=True -C Dolphin.Core.CPUCore=1 \
+    -s "<native board savestate>" -e "/Users/caseybement/Downloads/Mario Party 4 (USA).iso"
+then run this (FIRST connection; the stub is one-shot). Env: PSMTX_ENTRY, PSMTX_BLR,
+GDB_PORT, GOLDEN_OUT, MAX_REC, MAX_CNT, DURATION.
 """
 import socket, sys, time, os, json
 
@@ -42,14 +47,29 @@ def recv(s):
         buf += c
 
 
+def rdreg1(s, n):
+    """Read a single register by number via the p<hex> packet; None if unsupported."""
+    send(s, f"p{n:x}"); r = recv(s)
+    if not r or r.startswith("E") or len(r) < 8:
+        return None
+    try:
+        return int(r[:8], 16)
+    except ValueError:
+        return None
+
+
 def rdregs(s):
+    """Parse the 'g' dump defensively: Dolphin's stub packs 32 GPRs (always present)
+    then FPRs; the special-register block layout is unreliable, so read CTR via 'p'.
+    Never index past the returned string."""
     send(s, "g"); g = recv(s)
-    gprs = [int(g[i * 8:(i + 1) * 8], 16) for i in range(32)]
+    n = len(g)
+    gprs = [int(g[i * 8:(i + 1) * 8], 16) if (i + 1) * 8 <= n else 0 for i in range(32)]
     fbase = 32 * 8
-    fprs = [g[fbase + i * 16:fbase + (i + 1) * 16] for i in range(32)]   # 8-byte doubles, hex
-    sbase = 32 * 8 + 32 * 16
-    keys = ["PC", "MSR", "CR", "LR", "CTR", "XER", "FPSCR"]
-    spec = {k: int(g[sbase + i * 8:sbase + i * 8 + 8], 16) for i, k in enumerate(keys)}
+    fprs = [g[fbase + i * 16:fbase + (i + 1) * 16] if fbase + (i + 1) * 16 <= n else "0" * 16
+            for i in range(32)]   # 8-byte doubles, hex
+    ctr = rdreg1(s, 68)                         # reg 68 = CTR, per Dolphin GDBStub.cpp:447
+    spec = {"CTR": ctr if ctr is not None else 0}
     return gprs, fprs, spec
 
 
@@ -86,7 +106,16 @@ def main():
             break
         if not stop or stop[0] != "T":
             break
-        gprs, fprs, spec = rdregs(s); pc = spec["PC"]
+        # PC is in the T-stop packet (register 0x40), reliable; the 'g' offset varies.
+        pc = None
+        for kv in stop[3:].split(";"):
+            if ":" in kv:
+                rr, vv = kv.split(":", 1)
+                if rr == "40":
+                    pc = int(vv, 16); break
+        if pc is None:
+            continue
+        gprs, fprs, spec = rdregs(s)
         if pc == ENTRY:
             cnt = gprs[6]
             if cnt == 0 or cnt > MAX_CNT:
