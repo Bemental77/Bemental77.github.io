@@ -511,7 +511,8 @@ function startServer() {
   // makes phantom (idle-skip) credit a visible number. Steady window default 35s.
   try {
     await page.evaluate((winMs) => {
-      window.__mips = { t0: performance.now(), execAccum: 0, execPrev: 0, winStart: null, last: null };
+      window.__mips = { t0: performance.now(), execAccum: 0, execPrev: 0, winStart: null, last: null,
+        traceN: 0, tracePrevCtr: 0, tracePrevFin: null, tracePeriod: 0, traceGap: 0, traceDecode: 0, tracePresent: 0 };
       setInterval(() => {
         try {
           if (!window.sharedMemory) return;
@@ -525,8 +526,25 @@ function startServer() {
           const snap = { execAccum: st.execAccum, cred: cred, wall: now };
           st.last = snap;
           if (!st.winStart && (now - st.t0) >= winMs) st.winStart = snap;
+          // [turnaround trace] on frame-counter (0x026B3448) advance: period = pe_finish
+          // (0x026B3440 f64) delta; device_busy = summed RunFifo+Flush wall-time this
+          // frame (0x026B3458 f64); idle = period - busy. Splits GPU-throughput vs guest-wait.
+          const F = new Float64Array(window.sharedMemory.buffer);
+          const ctr = A[0x026B3448 >> 2] >>> 0;
+          if (ctr !== st.tracePrevCtr) {
+            const fin = F[0x026B3440 >> 3], busy = F[0x026B3458 >> 3];
+            st.lastFin = fin; st.lastBusy = busy; st.lastCtr = ctr;  // raw diag
+            if (st.winStart && st.tracePrevFin != null &&
+                fin > st.tracePrevFin && (fin - st.tracePrevFin) < 2000 && busy >= 0) {
+              st.tracePeriod += fin - st.tracePrevFin;
+              st.traceDecode += busy;                 // device busy (decode+flush)
+              st.traceN++;
+            }
+            st.tracePrevFin = fin;
+            st.tracePrevCtr = ctr;
+          }
         } catch (_e) {}
-      }, 250);
+      }, 100);
     }, (+process.env.MIPS_WINDOW_MS || 35000));
     console.log('[probe] mips-meter: executed/credited sampler installed (window '
       + (+process.env.MIPS_WINDOW_MS || 35000) + 'ms)');
@@ -1233,6 +1251,20 @@ function startServer() {
         + '%  (steady ' + wallS.toFixed(1) + 's; native Gekko=486 MHz)');
     } else {
       console.log('[mips] no steady-window sample (run shorter than MIPS_WINDOW_MS or meter compiled off)');
+    }
+    if (m && m.traceN > 0) {
+      const p = m.tracePeriod / m.traceN, busy = m.traceDecode / m.traceN;
+      const idle = p - busy;
+      const pct = (x) => p > 0 ? (100 * x / p).toFixed(0) : '0';
+      console.log('[trace] frame_period=' + p.toFixed(1) + 'ms = device_busy(decode+flush) ' + busy.toFixed(1)
+        + ' + idle/guest-wait ' + idle.toFixed(1) + ' ms  (' + m.traceN + ' frames)  → device '
+        + pct(busy) + '% / guest-wait ' + pct(idle) + '%');
+    } else {
+      console.log('[trace] no frame-turnaround samples');
+    }
+    if (m) {
+      console.log('[trace-raw] counter=' + (m.lastCtr || 0) + '  last_busy=' + (m.lastBusy || 0).toFixed(2)
+        + 'ms  pe_finish=' + (m.lastFin || 0).toFixed(1) + ' (epoch ms)');
     }
   } catch (e) { console.error('[mips] readout failed: ' + e.message); }
 

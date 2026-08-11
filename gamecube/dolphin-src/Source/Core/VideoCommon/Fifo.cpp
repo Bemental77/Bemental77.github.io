@@ -421,9 +421,22 @@ void FifoManager::RunGpuLoopSlice()
                        "instability in the game. Please report it.",
                        distance);
 
+#ifdef __EMSCRIPTEN__
+            // [turnaround trace 2026-08-11] STAGE 2 decode-start: stamp the FIRST decode
+            // of this frame (armed=0 set at pe_finish). emscripten_date_now = system
+            // wall clock, cross-thread comparable with the EmuThread/pe_finish stamps.
+            const double bem_dec_t0 = emscripten_get_now();  // device-busy timing
+#endif
             u8* write_ptr = m_video_buffer_write_ptr;
             m_video_buffer_read_ptr = OpcodeDecoder::RunFifo(
                 DataReader(m_video_buffer_read_ptr, write_ptr), &cyclesExecuted);
+#ifdef __EMSCRIPTEN__
+            // [turnaround trace] accumulate this decode chunk's WALL duration into the
+            // per-frame device-busy sum (0x026B3450 f64). Decode is chunked across pumps,
+            // so busy-time (not span) is what separates GPU-throughput from guest-wait.
+            *reinterpret_cast<volatile double*>(static_cast<uintptr_t>(0x026B3450u)) +=
+                emscripten_get_now() - bem_dec_t0;
+#endif
 
             fifo.CPReadPointer.store(readPtr, std::memory_order_relaxed);
             fifo.CPReadWriteDistance.fetch_sub(GPFifo::GATHER_PIPE_SIZE, std::memory_order_seq_cst);
@@ -473,8 +486,16 @@ void FifoManager::RunGpuLoopSlice()
           // device-independent and still run. Re-enables under Option A automatically.
           if (Core::WGPUDeviceLiveOnThisThread())
           {
+#ifdef __EMSCRIPTEN__
+            const double bem_fl_t0 = emscripten_get_now();
+#endif
             g_vertex_manager->Flush();
             g_framebuffer_manager->RefreshPeekCache();
+#ifdef __EMSCRIPTEN__
+            // [turnaround trace] add flush/render wall duration to the device-busy sum.
+            *reinterpret_cast<volatile double*>(static_cast<uintptr_t>(0x026B3450u)) +=
+                emscripten_get_now() - bem_fl_t0;
+#endif
           }
         }
   }

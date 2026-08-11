@@ -4,6 +4,9 @@
 #include "VideoCommon/PixelEngine.h"
 
 #include <mutex>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>  // [turnaround trace] emscripten_date_now (cross-thread wall clock)
+#endif
 
 #include "Common/BitField.h"
 #include "Common/ChunkFile.h"
@@ -263,6 +266,22 @@ void PixelEngineManager::SetFinish(int cycles_into_future)
     // console cost, gate #8 — the c360b20-class lesson).
     ++g_pe_setfinish_count;
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B0930u)) = g_pe_setfinish_count;
+#ifdef __EMSCRIPTEN__
+    // [turnaround trace 2026-08-11] STAGE 4 pe_finish. All 3 stamps are f64 (no
+    // u32 truncation — get_now is epoch-scale here and saturates a u32 cast to a
+    // constant, which zeroed the first two attempts). Probe reads the 3 f64 +
+    // counter and computes gap(guest-side)/decode/present = frame_period. Cells:
+    // 3430 decode-start f64 / 3438 decode-end f64 / 3440 pe_finish f64 / 3448
+    // frame counter u32 / 344C decode-start armed flag.
+    {
+      *reinterpret_cast<volatile double*>(static_cast<uintptr_t>(0x026B3440u)) = emscripten_get_now(); // pe_finish f64
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3448u)) += 1u;  // frame counter
+      // snapshot the per-frame device-busy sum (0x026B3450) into 0x026B3458 and reset.
+      *reinterpret_cast<volatile double*>(static_cast<uintptr_t>(0x026B3458u)) =
+          *reinterpret_cast<volatile double*>(static_cast<uintptr_t>(0x026B3450u));
+      *reinterpret_cast<volatile double*>(static_cast<uintptr_t>(0x026B3450u)) = 0.0;
+    }
+#endif
     // [takeover park-trap ARM — RESTORED 2026-07-16, default-DISARMED] The arm
     // hunk this SetFinish comment block (below) references was deleted; without it
     // 0x026B0980 never reaches 1, JitWasm never parks (never sets 2), and the page
