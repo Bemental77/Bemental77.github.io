@@ -3499,6 +3499,122 @@ static bool test_psmtxconcat_row2_build() {
     return ok;
 }
 
+// ===========================================================================
+// [B1 template pilot fixture 2026-08-11] PSMTXROMultVecArray differential harness.
+// The target is SOFTWARE-PIPELINED (stores results 2 iters back, prefetches next).
+// The reference is the REAL function executed faithfully via the generic JIT over
+// a multi-block dispatch loop — NEVER a hand-derived matrix result (the bent-legs
+// trap by name). Diffs FULL PowerPCState + captured dst memory. The template plugs
+// into leg B once registered; this harness validates the runner on the generic
+// path (determinism/sanity) so the emitter gets built against a working oracle.
+// Bytes extracted byte-exact from the decomp asm (psmtx.s).
+static const u32 kPSMTXRO_ENTRY = 0x800bc8d0u;
+static const u32 kPSMTXRO_RET   = 0x800bc9e8u;   // addr past blr (LR sentinel)
+static const u32 kPSMTXRO[70] = {
+  0x9421ffc0, 0xd9c10008, 0x38e6ffff, 0xd9e10010, 0x54e7f87e, 0xda010018,
+  0xda210020, 0xda410028, 0x7ce903a6, 0xe0030000, 0x3884fff8, 0xe0238008,
+  0x38a5fffc, 0xe0c30024, 0xe5040008, 0xe0e3802c, 0xe5240008, 0x1160321c,
+  0xe043000c, 0x11813a1c, 0xe0638014, 0x11a0325e, 0xe5440008, 0x11c13a5e,
+  0xe0a38020, 0x11625a1e, 0x1183621e, 0xe0830018, 0x11a26a9c, 0xe5040008,
+  0x11c3729c, 0x11e45a5c, 0x1205625c, 0xe5240008, 0x12246a9e, 0x1245729e,
+  0xe5440008, 0x1160321c, 0xf5e50004, 0x11813a1c, 0xf6058008, 0x11a0325e,
+  0xf6250004, 0x11c13a5e, 0xf6458008, 0x11625a1e, 0x1183621e, 0xe5040008,
+  0x11a26a9c, 0x11c3729c, 0x11e45a5c, 0x1205625c, 0xe5240008, 0x12246a9e,
+  0x1245729e, 0xe5440008, 0x4200ffb4, 0xf5e50004, 0x54c707ff, 0xf6058008,
+  0x4082000c, 0xf6250004, 0xf6458008, 0xc9c10008, 0xc9e10010, 0xca010018,
+  0xca210020, 0xca410028, 0x38210040, 0x4e800020,
+};
+
+// Dispatch from entry, follow next_pc until the blr returns to the LR sentinel.
+// mem1_base=0 -> psq loads/stores route through the EM_ASM ppc_read32/write32
+// slowmem stubs. Re-dispatch of the self-loop block is idempotent via the cache.
+static bool run_psmtxro(TestEnv& env) {
+    env.spr(8) = kPSMTXRO_RET;               // LR: blr -> RET sentinel
+    *(u32*)((u8*)env.ctx_raw + 0x2F0) = 0x40000000u;  // DOWNCOUNT large: branch blocks must not service-bail
+    // Pre-compile every block at its known start so the pipelined loop's chains
+    // resolve (entry bdnz -> 0x800bc964; unless compiled, dispatch returns -1).
+    static const u32 kStarts[] = {0x800bc8d0u, 0x800bc964u, 0x800bc9b4u, 0x800bc9c4u, 0x800bc9ccu};
+    for (u32 si = 0; si < 5u; ++si) {
+        u32 s = kStarts[si], i = (s - kPSMTXRO_ENTRY) >> 2;
+        std::vector<u8> b = build_block_next(s, &kPSMTXRO[i], 70u - i, env.ctx_ptr, 0, 0, 0);
+        if (env.cache.compile(s, b.data(), (u32)b.size()) < 0) {
+            std::printf("[psmtxro] compile FAIL @0x%08x\n", s); return false; }
+    }
+    s32 npc = (s32)kPSMTXRO_ENTRY;
+    for (int g = 0; g < 200000; ++g) {
+        u32 cur = (u32)npc; npc = -1;
+        if (!env.cache.dispatch(cur, &npc)) { std::printf("[psmtxro] dispatch FAIL @0x%08x g=%d\n", cur, g); return false; }
+        // npc<0 (chained to the uncompiled LR sentinel) OR ==RET = the blr terminus reached.
+        if (npc < 0 || (u32)npc == kPSMTXRO_RET) return true;
+    }
+    return false;   // guard exhausted (should not happen)
+}
+
+static bool test_psmtxro_diff() {
+    const u32 MBASE = 0x80100000u, SBASE = 0x80200000u, DBASE = 0x80500000u;
+    const u32 N = 4;
+    u32 mtx[12], src[12];  // 12 floats matrix, N*3=12 floats input
+    for (u32 i = 0; i < 12; i++) { float f = 0.1f * (float)(i + 1) - 0.35f; std::memcpy(&mtx[i], &f, 4); }
+    for (u32 i = 0; i < N * 3; i++) { float f = 1.0f + 0.3f * (float)i; std::memcpy(&src[i], &f, 4); }
+
+    auto run_once = [&](u32* dst, u32* state, u32& nw) -> bool {
+        TestEnv env; if (!env.init()) return false;
+        psq_env_common(env);
+        env.spr(912) = 0;                    // GQR0 = FLOAT, scale 0
+        env.gpr(3) = MBASE; env.gpr(4) = SBASE; env.gpr(5) = DBASE; env.gpr(6) = N;
+        nw = 0;
+#ifdef __EMSCRIPTEN__
+        EM_ASM({
+            var m = []; var s = [];
+            for (var i = 0; i < 12; i++) m.push(HEAPU32[($0 >> 2) + i] >>> 0);
+            for (var j = 0; j < $2; j++) s.push(HEAPU32[($1 >> 2) + j] >>> 0);
+            Module.bemental_imports.env.ppc_read32 = function(a) { a = a >>> 0;
+                if (a >= 0x80100000 && a < 0x80100030) return m[(a - 0x80100000) >> 2] | 0;
+                if (a >= 0x80200000 && a < 0x80200000 + $2 * 4) return s[(a - 0x80200000) >> 2] | 0;
+                return 0; };
+            Module.test_writes = [];
+            Module.bemental_imports.env.ppc_write32 = function(a, v) {
+                Module.test_writes.push(a >>> 0); Module.test_writes.push(v >>> 0); };
+        }, (u32)(uintptr_t)mtx, (u32)(uintptr_t)src, (u32)(N * 3));
+#endif
+        bool ok = run_psmtxro(env);
+#ifdef __EMSCRIPTEN__
+        nw = (u32)EM_ASM_INT({ return Module.test_writes.length | 0; });
+        for (u32 p = 0; p < nw / 2u && p < 64u; ++p) {
+            u32 a = (u32)EM_ASM_INT({ return Module.test_writes[$0 * 2] >>> 0; }, p);
+            u32 v = (u32)EM_ASM_INT({ return Module.test_writes[$0 * 2 + 1] >>> 0; }, p);
+            u32 idx = (a - DBASE) >> 2; if (idx < 3u * N) dst[idx] = v;
+        }
+        EM_ASM({ Module.bemental_imports.env.ppc_write32 = function(a, v) {};
+                 Module.bemental_imports.env.ppc_read32  = function(a) { return 0; }; });
+#endif
+        for (u32 r = 0; r < 32; r++) state[r] = env.gpr(r);
+        state[32] = env.spr(9);              // CTR
+        for (u32 f = 0; f < 32; f++) {
+            u64 p0 = *(u64*)((u8*)env.ctx_raw + ppc_off::ps0(f));
+            u64 p1 = *(u64*)((u8*)env.ctx_raw + ppc_off::ps1(f));
+            state[33 + f * 4 + 0] = (u32)p0; state[33 + f * 4 + 1] = (u32)(p0 >> 32);
+            state[33 + f * 4 + 2] = (u32)p1; state[33 + f * 4 + 3] = (u32)(p1 >> 32);
+        }
+        return ok;
+    };
+
+    u32 dstA[12] = {0}, dstB[12] = {0}, stA[33 + 128] = {0}, stB[33 + 128] = {0}, nwA = 0, nwB = 0;
+    bool okA = run_once(dstA, stA, nwA);
+    bool okB = run_once(dstB, stB, nwB);     // leg B := template later; generic now
+    if (!okA || !okB) { std::printf("[psmtxro] run FAILED A=%d B=%d nwA=%u nwB=%u dst0=%08x\n", okA, okB, nwA, nwB, dstA[0]); return false; }
+    bool mem_eq = (nwA == nwB);
+    for (u32 i = 0; i < 12 && mem_eq; i++) mem_eq = (dstA[i] == dstB[i]);
+    bool st_eq = true; for (u32 i = 0; i < 33 + 128 && st_eq; i++) st_eq = (stA[i] == stB[i]);
+    auto asf = [](u32 b){ float f; std::memcpy(&f, &b, 4); return f; };
+    std::printf("[psmtxro] N=%u writes=%u dst=[%.3f %.3f %.3f ...] state_eq=%d mem_eq=%d\n",
+                N, nwA, asf(dstA[0]), asf(dstA[1]), asf(dstA[2]), st_eq, mem_eq);
+    // Gate #1 harness validated when: the function runs, produces writes, and is
+    // deterministic (full state + memory identical). Exact count tightened after
+    // the first run shows the psq_st write pattern.
+    return okA && okB && mem_eq && st_eq && nwA > 0u && nwA == nwB;
+}
+
 // [PM62 special-case conformance 2026-08-07] frsqrte/fres native emitters vs the
 // Dolphin ApproximateReciprocalSquareRoot / ApproximateReciprocal special-value
 // ladders (Common/FloatUtils.cpp). Workflow wf_d6c659d7 (both sides run in V8) found:
@@ -3566,6 +3682,7 @@ static const TestCase k_tests[] = {
     {"fres_special_values",              &test_fres_special_values},
     {"writemtxps4x3_send_sequence",      &test_writemtxps4x3_send_sequence},
     {"psmtxconcat_row2_build",           &test_psmtxconcat_row2_build},
+    {"psmtxro_diff",                     &test_psmtxro_diff},
     {"lazycr_cross_block_beq",           &test_lazycr_cross_block_beq},
     {"lazycr_so_freeze",                 &test_lazycr_so_freeze},
     {"lazycr_fused_adjacent",            &test_lazycr_fused_adjacent},
