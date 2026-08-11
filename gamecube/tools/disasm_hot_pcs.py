@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""Disassemble hot WASM PCs from post-fix SAB probe."""
-import sys, struct, re
+"""Disassemble hot guest PCs. Per-game via ROM_IDX (0=MP4 1=SAB 2=PSO)."""
+import sys, struct, re, os
 
-ISO = "/Users/caseybement/Bemental77.github.io/gamecube/roms/Sonic Adventure 2 - Battle (USA).iso"
-MAP = "/Users/caseybement/Bemental77.github.io/tools/gsne8p.map"
-DOL_OFF = 0x1e700
+# per-game (ROM_IDX env): binary + its DOL offset + symbol map. MP4 = decomp main.dol (offset 0).
+_ROM = int(os.environ.get("ROM_IDX", "1"))
+_CFG = {
+    0: ("/Users/caseybement/gc_refs/marioparty4/build/GMPE01_01/main.dol", 0x0,
+        "/Users/caseybement/Bemental77.github.io/tools/gmpe01_full.map"),
+    1: ("/Users/caseybement/Bemental77.github.io/gamecube/roms/Sonic Adventure 2 - Battle (USA).iso", 0x1e700,
+        "/Users/caseybement/Bemental77.github.io/tools/gsne8p.map"),
+    2: ("/Users/caseybement/Downloads/Phantasy Star Online Episode I & II Plus (USA).iso", 0x1e700,
+        "/Users/caseybement/Bemental77.github.io/tools/gpoe8p_full.map"),
+}
+ISO, DOL_OFF, MAP = _CFG.get(_ROM, _CFG[1])
 
 HOT_PCS = [
     0x800e4e3c, 0x800e4e6c,
@@ -19,7 +27,8 @@ HOT_PCS = [
 ]
 
 SYMS = []
-sym_re = re.compile(r'^\s*([0-9a-f]{8})\s+([0-9a-f]{8})\s+[0-9a-f]{8}\s+[0-9a-f]{8}\s+(\S+)\s*(\S*)')
+# size may be 4-8 hex (decomp map) or 8 (CodeWarrior); 4th field 0 or 00000000
+sym_re = re.compile(r'^\s*([0-9a-f]{8})\s+([0-9a-f]{4,8})\s+[0-9a-f]{8}\s+[0-9a-f]+\s+(\S+)\s*(\S*)')
 with open(MAP) as f:
     for line in f:
         m = sym_re.match(line)
