@@ -913,6 +913,31 @@ static bool prescan_int_self_loop(const CodeBlock& block, const CodeBuffer& buff
     return true;
 }
 
+// [B1 template pilot 2026-08-11] PSMTXROMultVecArray function-level template
+// support. Match the ENTRY block by a content HASH of its prologue words (never
+// address alone — a wrong game/revision at 0x800bc8d0 can then only fall to the
+// generic emit, never mis-execute). FNV-1a over the first 9 entry words
+// (stwu/stfd../subi/srwi/mtctr, psmtx.s:33-41). Constant baked from the byte-exact
+// decomp stream (test_gekko_next.cpp:3513 kPSMTXRO). Revision-stable GMPE01_00/_01.
+static constexpr u32 kPsmtxroEntryPc   = 0x800bc8d0u;
+static constexpr u32 kPsmtxroHashWords = 9u;
+static constexpr u32 kPsmtxroHash      = 0x5666ee66u;
+// Runtime toggle + efficacy census travel by reserved SAB scratch cells (never
+// getenv — dead cross-thread; see gc_runtime_flags_via_sab_cell_not_env). Both
+// free of the occupied cells (region 0x026B3404, fp-loop 0x026B3408, MIPS
+// 0x026B3420, PM26 0x026B33E4). Flag DEFAULT-OFF (0 = OFF, nonzero = ON) so a
+// cold boot is byte-identical to today until the page sets ?bjit_psmtxro_template.
+static constexpr uintptr_t kPsmtxroFlagCell = 0x026B345Cu;   // 0=OFF (default), nonzero=ON
+static constexpr uintptr_t kPsmtxroHitsCell = 0x026B3460u;   // template_hits census
+static bool psmtxro_hash_match(const CodeBuffer& buffer, u32 n_ops) {
+    if (n_ops < kPsmtxroHashWords) return false;
+    u32 h = 2166136261u;
+    for (u32 i = 0; i < kPsmtxroHashWords; ++i) {
+        h = (h ^ buffer.data()[i].inst) * 16777619u;
+    }
+    return h == kPsmtxroHash;
+}
+
 // [region] Shared block-body emit: prologue (downcount/idle + promote ring) +
 // RegCache/FPRRegCache setup + the per-op dispatch loop + epilogue (gather
 // drain + flush + terminal). Extracted from build_block_next so the region
@@ -1025,6 +1050,21 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                 b.op_end();
             }
         }
+    }
+
+    // [B1 template pilot 2026-08-11] PSMTXROMultVecArray function-level template.
+    // Fires ONLY on the hash-verified entry block, flag-gated (default-OFF), lc_base-
+    // gated like every emit-time SAB read (test heaps are small). Increment 1 =
+    // PLUMBING ONLY: bump the efficacy census, then FALL THROUGH to the generic emit
+    // (zero behavior change — goldens must stay 26/26). Increment 2 replaces the
+    // fall-through with emit_psmtxro_template(...) + `return` (skip the generic loop).
+    if (g_bem_lc_base && start_pc == kPsmtxroEntryPc &&
+        (*reinterpret_cast<volatile uint32_t*>(kPsmtxroFlagCell) != 0u) &&
+        psmtxro_hash_match(buffer, block.m_num_instructions)) {
+        volatile uint32_t* hits = reinterpret_cast<volatile uint32_t*>(kPsmtxroHitsCell);
+        *hits = *hits + 1u;
+        // TODO(increment 2): emit_psmtxro_template(b, block, buffer, count, start_pc,
+        //                    ctx_ptr, ...); return;
     }
 
     // [single-spec v9 DUAL-ARM PM44 2026-07-31] Single-valued speculation for

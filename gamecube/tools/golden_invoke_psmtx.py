@@ -263,6 +263,11 @@ def main():
 
     for pc in (ANCHOR, A_RET):
         send(s, f"z0,{pc:x},4"); recv(s)
+    # Restore CPU state before detaching so the oracle can resume/shutdown cleanly
+    # instead of running off the hijacked PC (else a SIGSEGV in MemoryManager::Shutdown
+    # on the CPU thread). PC back to the anchor, MSR restored (re-enable EE/clear FP).
+    wreg(s, 0x41, msr)
+    wreg(s, 0x40, ANCHOR)
     send(s, "D")
     try: recv(s)
     except Exception: pass

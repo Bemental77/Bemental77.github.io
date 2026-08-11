@@ -3682,6 +3682,35 @@ static bool test_psmtxro_goldens() {
     return fail == 0;
 }
 
+// [B1 template pilot — increment 1: plumbing] With the template flag ON, the
+// registry hook must (a) FIRE on the hash-matched entry block (census climbs) and
+// (b) stay bit-exact — increment 1 falls through to the generic emit, so all 26
+// goldens must still match. Arms g_bem_lc_base (emit-time SAB reads are lc_base-
+// gated; the standard suite runs lc_base=0) + sets the flag cell, then restores.
+extern "C" { extern uint32_t g_bem_lc_base; }
+static bool test_psmtxro_template_hook() {
+    volatile uint32_t* flag = (volatile uint32_t*)(uintptr_t)0x026B345Cu;
+    volatile uint32_t* hits = (volatile uint32_t*)(uintptr_t)0x026B3460u;
+    uint32_t saved_lc = g_bem_lc_base;
+    g_bem_lc_base = 0x03000000u;                 // arm emit-time SAB reads (as line ~2704 does)
+    *flag = 1u;                                  // template flag ON
+    uint32_t before = *hits;
+    u32 pass = 0, fail = 0;
+    for (unsigned k = 0; k < k_psmtx_goldens_n; ++k) {
+        const PsmtxGolden& g = k_psmtx_goldens[k];
+        uint32_t dst[128]; for (u32 i = 0; i < 128; i++) dst[i] = 0xdeadbeefu;
+        if (!run_psmtxro_case(g.romtx, g.src, g.count, dst)) { fail++; continue; }
+        bool eq = true; for (u32 i = 0; i < g.count * 3u; i++) if (dst[i] != g.dst[i]) { eq = false; break; }
+        if (eq) pass++; else fail++;
+    }
+    uint32_t after = *hits;
+    *flag = 0u;                                  // restore OFF
+    g_bem_lc_base = saved_lc;
+    std::printf("[psmtxro-tmpl] flag ON: %u/%u bit-exact, template_hits %u->%u (delta=%u)\n",
+                pass, pass + fail, before, after, after - before);
+    return fail == 0 && after > before;          // hook FIRED and NO regression
+}
+
 // [B1 Blocker-1 isolation 2026-08-11] Is the denormal hang the PM26 deopt storm
 // (JIT) or a reused-env artifact? FRESH env, chaining OFF (deopts return start_pc
 // to THIS loop instead of an internal self-chain storm), denormal-only live-ins,
@@ -3793,6 +3822,7 @@ static const TestCase k_tests[] = {
     {"psmtxconcat_row2_build",           &test_psmtxconcat_row2_build},
     {"psmtxro_diff",                     &test_psmtxro_diff},
     {"psmtxro_goldens",                  &test_psmtxro_goldens},
+    {"psmtxro_template_hook",            &test_psmtxro_template_hook},
     {"psmtxro_denorm_isolate",           &test_psmtxro_denorm_isolate},
     {"lazycr_cross_block_beq",           &test_lazycr_cross_block_beq},
     {"lazycr_so_freeze",                 &test_lazycr_so_freeze},
