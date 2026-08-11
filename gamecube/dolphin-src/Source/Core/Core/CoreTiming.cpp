@@ -395,6 +395,19 @@ void CoreTimingManager::Advance()
 #endif
   m_globals.global_timer += cyclesExecuted;
 #ifdef __EMSCRIPTEN__
+  // [MIPS meter 2026-08-11] Mirror the EmuThread's CREDITED emulated clock to
+  // dedicated meter cells (0x026B3424 lo / 0x026B3428 hi). The existing
+  // 0x02680008/0C mirror is written only on the device FfAdvanceTo catch-up
+  // path (stale during steady gameplay), so the meter needs its own. This is
+  // the total emulated cycles (real charges + idle-skip phantom); executed
+  // (0x026B3420) subtracted from this = phantom credit.
+  {
+    const u64 bem_gt = static_cast<u64>(m_globals.global_timer);
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3424u)) =
+        static_cast<u32>(bem_gt & 0xFFFFFFFFu);
+    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3428u)) =
+        static_cast<u32>((bem_gt >> 32) & 0xFFFFFFFFu);
+  }
   // [gt-adopt 2026-07-06 — the post-takeover finish line] Fire-only mode credits 0 cycles
   // on the assumption that "the worker advances global_timer via its own commit path" —
   // but those commits land in the WORKER's ct mirror (SAB 0x02680008/0C), never here, so

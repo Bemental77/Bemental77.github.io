@@ -73,6 +73,18 @@ static constexpr u32 BEM_SELFCHAIN_FLAG_CELL = 0x026B38C0u;
 // per 75s = 99.66%% hit-rate, 4.8M tail-calls/s (the return_call tax).
 static constexpr bool BEM_PM51_CENSUS = false;
 
+// [MIPS meter 2026-08-11 — v2 op-order instrument #1] Accumulate EXECUTED
+// downcount charge (real block cycles, idle-skip force-zeros excluded by
+// construction) into SAB cell 0x026B3420 (u32 lo; probe samples for wrap).
+// credited = global_timer mirror 0x02680008/0C (free); executed = this cell;
+// phantom = credited - executed (the idle-skip jumps). The executed/credited
+// ratio makes phantom credit a visible number, ending the 5%-vs-37% class of
+// instrument confusion. Compile-time gate (like BEM_PM51_CENSUS): ON for the
+// measurement phase, flip false for a final overhead-free fps read. MUST stay
+// in sync with the identical const in jit_branch.cpp (the fused back-edge charge).
+static constexpr bool BEM_MIPS_CENSUS   = true;
+static constexpr u32  BEM_MIPS_EXEC_CELL = 0x026B3420u;
+
 // In-WASM block chaining (defined in src/block_cache.cpp). Each per-block
 // module imports the host __indirect_function_table and, at its epilogue,
 // probes this direct-mapped pc->slot cache to return_call_indirect its
@@ -948,6 +960,17 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             b.op_i32_const((s32)charge);
             b.op_i32_sub();
             b.op_i32_store(ppc_off::DOWNCOUNT);
+            // [MIPS meter] executed cycles += charge (this fires on EVERY real
+            // block execution incl. tail-chained region bodies; idle blocks take
+            // the force-zero branch above and are excluded by construction).
+            if (BEM_MIPS_CENSUS) {
+                b.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
+                b.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
+                b.op_i32_load(0);
+                b.op_i32_const((s32)charge);
+                b.op_i32_add();
+                b.op_i32_store(0);
+            }
             // Phase A: per-block execution counter for region promotion. Counts
             // EVERY execution (including in-WASM tail-chained entries the C
             // dispatch loop never sees). On crossing HOT_THRESHOLD push start_pc

@@ -505,6 +505,32 @@ function startServer() {
       console.log('[probe] pc-sample: page-side guest-PC sampler installed');
     } catch (e) { console.error('[probe] pc-sample install failed: ' + e.message); }
   }
+  // [MIPS meter v2] browser-side sampler: wrap-accumulate the executed-cycle cell
+  // (0x026B3420, emitted += charge in the block prologue / fused back-edge) and
+  // snapshot credited (global_timer mirror 0x02680008/0C). executed/credited ratio
+  // makes phantom (idle-skip) credit a visible number. Steady window default 35s.
+  try {
+    await page.evaluate((winMs) => {
+      window.__mips = { t0: performance.now(), execAccum: 0, execPrev: 0, winStart: null, last: null };
+      setInterval(() => {
+        try {
+          if (!window.sharedMemory) return;
+          const A = new Uint32Array(window.sharedMemory.buffer);
+          const st = window.__mips;
+          const lo = A[0x026B3420 >> 2] >>> 0;                 // executed cycles (u32 lo)
+          let d = lo - st.execPrev; if (d < 0) d += 4294967296; // wrap-correct (<1 wrap/250ms even at 6x)
+          st.execAccum += d; st.execPrev = lo;
+          const cred = (A[0x026B3424 >> 2] >>> 0) + (A[0x026B3428 >> 2] >>> 0) * 4294967296; // credited (EmuThread global_timer mirror)
+          const now = performance.now();
+          const snap = { execAccum: st.execAccum, cred: cred, wall: now };
+          st.last = snap;
+          if (!st.winStart && (now - st.t0) >= winMs) st.winStart = snap;
+        } catch (_e) {}
+      }, 250);
+    }, (+process.env.MIPS_WINDOW_MS || 35000));
+    console.log('[probe] mips-meter: executed/credited sampler installed (window '
+      + (+process.env.MIPS_WINDOW_MS || 35000) + 'ms)');
+  } catch (e) { console.error('[probe] mips-meter install failed: ' + e.message); }
   const phaseTimer = setInterval(async () => {
     try {
       const s = await page.evaluate(() => {
@@ -1191,6 +1217,24 @@ function startServer() {
   });
   clearInterval(metricsTimer);
   if (stuckReason) console.log('[probe] EXIT-STUCK: ' + stuckReason);
+
+  // ---- MIPS meter readout (executed vs credited, steady window) -----------
+  try {
+    const m = await page.evaluate(() => window.__mips || null);
+    if (m && m.winStart && m.last) {
+      const execD = m.last.execAccum - m.winStart.execAccum;
+      const credD = m.last.cred - m.winStart.cred;
+      const wallS = (m.last.wall - m.winStart.wall) / 1000;
+      const execMHz = wallS > 0 ? execD / wallS / 1e6 : 0;
+      const credMHz = wallS > 0 ? credD / wallS / 1e6 : 0;
+      const ratio = credD > 0 ? execD / credD : 0;
+      console.log('[mips] EXECUTED=' + execMHz.toFixed(1) + ' MHz  CREDITED=' + credMHz.toFixed(1)
+        + ' MHz  ratio=' + (ratio * 100).toFixed(1) + '%  phantom=' + ((1 - ratio) * 100).toFixed(1)
+        + '%  (steady ' + wallS.toFixed(1) + 's; native Gekko=486 MHz)');
+    } else {
+      console.log('[mips] no steady-window sample (run shorter than MIPS_WINDOW_MS or meter compiled off)');
+    }
+  } catch (e) { console.error('[mips] readout failed: ' + e.message); }
 
   // ---- dump pc-sample histogram ------------------------------------------
   if (PC_SAMPLE) {

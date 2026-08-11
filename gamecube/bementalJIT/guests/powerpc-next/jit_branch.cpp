@@ -27,6 +27,13 @@
 namespace bemental::powerpc {
 
 static constexpr u32 WIMPORT_INTERP = 6;
+
+// [MIPS meter 2026-08-11] Fused-loop back-edge charge accumulation — MUST stay
+// in sync with ppc_emit.cpp's BEM_MIPS_CENSUS / BEM_MIPS_EXEC_CELL (that file
+// owns the design comment). Counts the per-iteration re-charge so loop-resident
+// hot code is not undercounted (which would falsely inflate phantom).
+static constexpr bool BEM_MIPS_CENSUS    = true;
+static constexpr u32  BEM_MIPS_EXEC_CELL = 0x026B3420u;
 // Block-module import index for ppc_gather_drain (ppc_emit.cpp emitImportFunc
 // order; idx 12). Used by the coalesced taken-exit below to drain a pending
 // gather-pipe write, since the early op_return bypasses the block epilogue's
@@ -446,6 +453,15 @@ void emit_bcx_fused(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
             wb.op_i32_const((s32)charge);
             wb.op_i32_sub();
             wb.op_i32_store(ppc_off::DOWNCOUNT);
+            // [MIPS meter] executed cycles += charge on each fused-loop iteration.
+            if (BEM_MIPS_CENSUS) {
+                wb.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
+                wb.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
+                wb.op_i32_load(0);
+                wb.op_i32_const((s32)charge);
+                wb.op_i32_add();
+                wb.op_i32_store(0);
+            }
             wb.op_br(wb.ctrlDepth() - loop_head_depth);   // continue the loop
         wb.op_end();
         // Bail: exactly the non-fused taken arm's residue.
