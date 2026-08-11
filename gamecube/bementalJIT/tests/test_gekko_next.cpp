@@ -3615,6 +3615,73 @@ static bool test_psmtxro_diff() {
     return okA && okB && mem_eq && st_eq && nwA > 0u && nwA == nwB;
 }
 
+// [B1 3-way cross-check 2026-08-11] Generic JIT vs NATIVE goldens. The goldens are
+// bit-exact PSMTXROMultVecArray outputs captured from native Dolphin's interpreter by
+// DIRECT INVOCATION (gamecube/tools/golden_invoke_psmtx.py), embedded in psmtx_goldens.h.
+// We feed each golden's exact romtx (native PSMTXReorder output) + src through the REAL
+// function on the generic JIT and require the captured dst to equal the native dst
+// bit-for-bit. Passing proves: (1) the generic JIT is faithful to native on this kernel,
+// so (2) the goldens are a trustworthy gate for the template that replaces leg B next.
+#include "psmtx_goldens.h"
+static bool run_psmtxro_case(const uint32_t* romtx, const uint32_t* src, u32 count,
+                             uint32_t* dst_out /*count*3*/) {
+    const u32 MBASE = 0x80100000u, SBASE = 0x80200000u, DBASE = 0x80500000u;
+    TestEnv env; if (!env.init()) return false;
+    psq_env_common(env);
+    env.spr(912) = 0;                        // GQR0 = FLOAT, scale 0 (as PSMTX assumes)
+    env.gpr(3) = MBASE; env.gpr(4) = SBASE; env.gpr(5) = DBASE; env.gpr(6) = count;
+    env.gpr(1) = 0x8010F000u;                // valid stack for the stwu prologue
+#ifdef __EMSCRIPTEN__
+    EM_ASM({
+        var m = []; var s = [];
+        for (var i = 0; i < 12; i++)   m.push(HEAPU32[($0 >> 2) + i] >>> 0);
+        for (var j = 0; j < $3; j++)   s.push(HEAPU32[($1 >> 2) + j] >>> 0);
+        var mb = $2 >>> 0; var sb = 0x80200000; var se = 0x80200000 + $3 * 4;
+        Module.bemental_imports.env.ppc_read32 = function(a) { a = a >>> 0;
+            if (a >= mb && a < mb + 48) return m[(a - mb) >> 2] | 0;
+            if (a >= sb && a < se)      return s[(a - sb) >> 2] | 0;
+            return 0; };
+        Module.test_writes = [];
+        Module.bemental_imports.env.ppc_write32 = function(a, v) {
+            Module.test_writes.push(a >>> 0); Module.test_writes.push(v >>> 0); };
+    }, (u32)(uintptr_t)romtx, (u32)(uintptr_t)src, MBASE, (u32)(count * 3u));
+#endif
+    bool ok = run_psmtxro(env);
+#ifdef __EMSCRIPTEN__
+    u32 nw = (u32)EM_ASM_INT({ return Module.test_writes.length | 0; });
+    for (u32 p = 0; p < nw / 2u && p < 256u; ++p) {
+        u32 a = (u32)EM_ASM_INT({ return Module.test_writes[$0 * 2] >>> 0; }, p);
+        u32 v = (u32)EM_ASM_INT({ return Module.test_writes[$0 * 2 + 1] >>> 0; }, p);
+        u32 idx = (a - DBASE) >> 2; if (idx < 3u * count) dst_out[idx] = v;
+    }
+    EM_ASM({ Module.bemental_imports.env.ppc_write32 = function(a, v) {};
+             Module.bemental_imports.env.ppc_read32  = function(a) { return 0; }; });
+#endif
+    return ok;
+}
+
+static bool test_psmtxro_goldens() {
+    u32 pass = 0, fail = 0;
+    for (unsigned k = 0; k < k_psmtx_goldens_n; ++k) {
+        const PsmtxGolden& g = k_psmtx_goldens[k];
+        uint32_t dst[128];
+        for (u32 i = 0; i < 128; i++) dst[i] = 0xdeadbeefu;   // poison: catch missed writes
+        if (!run_psmtxro_case(g.romtx, g.src, g.count, dst)) {
+            std::printf("[psmtxro-gold] %-12s count=%u RUN FAILED\n", g.name, g.count); fail++; continue;
+        }
+        bool eq = true; u32 bad = 0;
+        for (u32 i = 0; i < g.count * 3u; i++) if (dst[i] != g.dst[i]) { eq = false; bad = i; break; }
+        if (eq) pass++;
+        else {
+            fail++;
+            std::printf("[psmtxro-gold] %-12s count=%u MISMATCH @word%u got=%08x want=%08x\n",
+                        g.name, g.count, bad, dst[bad], g.dst[bad]);
+        }
+    }
+    std::printf("[psmtxro-gold] %u/%u goldens bit-exact (generic JIT vs native)\n", pass, pass + fail);
+    return fail == 0;
+}
+
 // [B1 Blocker-1 isolation 2026-08-11] Is the denormal hang the PM26 deopt storm
 // (JIT) or a reused-env artifact? FRESH env, chaining OFF (deopts return start_pc
 // to THIS loop instead of an internal self-chain storm), denormal-only live-ins,
@@ -3725,6 +3792,7 @@ static const TestCase k_tests[] = {
     {"writemtxps4x3_send_sequence",      &test_writemtxps4x3_send_sequence},
     {"psmtxconcat_row2_build",           &test_psmtxconcat_row2_build},
     {"psmtxro_diff",                     &test_psmtxro_diff},
+    {"psmtxro_goldens",                  &test_psmtxro_goldens},
     {"psmtxro_denorm_isolate",           &test_psmtxro_denorm_isolate},
     {"lazycr_cross_block_beq",           &test_lazycr_cross_block_beq},
     {"lazycr_so_freeze",                 &test_lazycr_so_freeze},
