@@ -18,8 +18,8 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MAPS = {
     0: "tools/gmpe01_full.map",  # MP4  GMPE01 (full decomp)
-    1: "tools/gsne8p.map",       # SAB  GSNE8P (+ SelectThread xref)
-    2: "tools/gpoe8p_full.map",  # PSO  GPOE8P (headless scan)
+    1: "tools/gsne8p_xref.map",   # SAB  GSNE8P (+165 cross-ref SDK inherited from MP4)
+    2: "tools/gpoe8p_xref.map",   # PSO  GPOE8P (+cross-ref SDK inherited from MP4)
 }
 GAME = {0: "MP4/GMPE01", 1: "SAB/GSNE8P", 2: "PSO/GPOE8P", 3: "240pSuite"}
 
