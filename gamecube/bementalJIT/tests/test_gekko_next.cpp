@@ -20,6 +20,7 @@
 #include "bementalJIT/bemental.h"
 #include "guests/powerpc-next/ppc_emit.h"
 #include "guests/powerpc-next/ppc_offsets.h"
+#include "ppc_encode.h"   // [2026-08-12 cycle-ledger] li/add/lwzx/... encoders for the tax kernels
 
 #include <cstdio>
 #include <cstring>
@@ -3815,6 +3816,69 @@ static bool test_fres_special_values() {
     return ok;
 }
 
+// [2026-08-12 CYCLE LEDGER] The Summit-1 fork instrument, on the LIVE build_block_next
+// emitter via the proven TestEnv+self-chain harness (test_idct_selfchain_bench pattern) —
+// NOT the legacy test_perf_t1 (retracted: wrong emitter). Measures the per-tax EXECUTED
+// cost (ns/iter, native_ratio vs 486MHz Gekko) of INT+eager-CR (t1a) and bswap (t1b lwzx/
+// stwx fastmem). Compare against BEM_STRIP_BSWAP / BEM_LAZY_CR rebuilds for the tax delta.
+static bool test_cycle_ledger() {
+#ifndef __EMSCRIPTEN__
+    return true;
+#else
+    using namespace ppc;   // ppc_encode.h encoders live in namespace ppc
+    TestEnv env; if (!env.init()) return false;
+    psq_env_common(env);
+    static std::vector<u8> buf; buf.assign(0x100000u, 0);         // 1MB fastmem window
+    const u32 host_base = (u32)(uintptr_t)buf.data();
+    // Pure loop bodies, bdnz -> start (self-chain); reset sets regs + CTR each pass.
+    static const u32 bare[] = {    // 4 ALU + bdnz, NO cmpwi — isolates base per-op overhead
+        add(4,4,5), subf(4,6,4), rlwinm(4,4,1,0,30), xor_(4,4,7), bdnz(-16),
+    };
+    static const u32 intcr[] = {   // 5 body ops incl the eager-CR cmpwi
+        add(4,4,5), subf(4,6,4), rlwinm(4,4,1,0,30), xor_(4,4,7), cmpwi(0,4,0), bdnz(-20),
+    };
+    static const u32 bsw[] = {     // lwzx/stwx = fastmem load/store => emit_bswap present
+        lwzx(8,4,7), stwx(8,5,7), addi(7,7,4), bdnz(-12),
+    };
+    struct Kern { const char* name; const u32* insts; u32 n; u32 refcyc; };
+    const Kern kerns[] = {
+        {"bare ", bare,  (u32)(sizeof(bare)/4),  4u},
+        {"intcr", intcr, (u32)(sizeof(intcr)/4), 5u},
+        {"bswap", bsw,   (u32)(sizeof(bsw)/4),   3u},
+    };
+    const u32 CTR = 4096u;
+    for (u32 ki = 0; ki < 3u; ++ki) {
+        const Kern& k = kerns[ki];
+        const u32 PC = 0x80010000u + ki * 0x10000u;
+        std::vector<u8> bytes = build_block_next(PC, k.insts, k.n, env.ctx_ptr,
+                                                 host_base, 0x000FFFFFu, 0x100000u);
+        int handle = env.cache.compile(PC, bytes.data(), bytes.size());
+        if (handle < 0) { std::printf("[ledger] %s compile FAILED\n", k.name); continue; }
+        auto reset = [&]() {
+            env.gpr(4) = 0x80000000u; env.gpr(5) = 0x80000000u; env.gpr(6) = 3u; env.gpr(7) = 0u;
+            env.spr(9) = CTR;                                     // CTR
+            *(s32*)((u8*)env.ctx_raw + ppc_off::DOWNCOUNT)  = 50000000;
+            *(u32*)((u8*)env.ctx_raw + ppc_off::EXCEPTIONS) = 0;
+            *(u32*)((u8*)env.ctx_raw + ppc_off::PC)         = PC;
+        };
+        s32 next_pc = -1;
+        for (int p = 0; p < 60; ++p) { reset(); env.cache.dispatch(PC, &next_pc); }
+        reset(); env.cache.dispatch(PC, &next_pc);
+        const u32 ctr_after = env.spr(9);
+        double t0 = emscripten_get_now();
+        const int TIMED = 200;
+        for (int p = 0; p < TIMED; ++p) { reset(); env.cache.dispatch(PC, &next_pc); }
+        double t1 = emscripten_get_now();
+        const double iters = (double)TIMED * (double)CTR;
+        const double ns = (t1 - t0) * 1e6 / iters;
+        const double ratio = (double)k.refcyc / (ns * 1e-9 * 486e6);
+        std::printf("[ledger] %-6s %.3f ns/iter  native_ratio=%.3f  (%u refcyc, chain-CTR-after=%u %s)\n",
+                    k.name, ns, ratio, k.refcyc, ctr_after, ctr_after == 0 ? "self-chain" : "per-iter");
+    }
+    return true;
+#endif
+}
+
 static const TestCase k_tests[] = {
     {"frsqrte_special_values",           &test_frsqrte_special_values},
     {"fres_special_values",              &test_fres_special_values},
@@ -3830,6 +3894,7 @@ static const TestCase k_tests[] = {
     // [PM53] bench first: the wasmdump hex stream takes ~15 min through the
     // headless console pipe; the bench result must not sit behind it.
     {"idct_selfchain_bench",             &test_idct_selfchain_bench},
+    {"cycle_ledger",                     &test_cycle_ledger},
     {"fused_intloop_runs_to_exit",       &test_fused_intloop_runs_to_exit},
     {"fused_b_elision_seam",             &test_fused_b_elision_seam},
     {"fused_bwd_seam",                   &test_fused_bwd_seam},

@@ -210,7 +210,14 @@ static u32 store_width_bytes(StoreWidth w) {
 // little-endian. After every fastmem load we byte-swap; before every
 // fastmem store we byte-swap.
 // ---------------------------------------------------------------------------
+// [2026-08-12 cycle-ledger strip instrument] true = emit NO byte-swap (value passes
+// through unswapped — WRONG results, measurement-ONLY). Sizes the bswap emit cost as a
+// cycle delta via test_gekko_next's cycle_ledger. Result 2026-08-12: bswap kernel
+// 42.6->40.6 ns/iter = FLAT (V8 folds the rotr/and) — bswap is NOT a convertible tax.
+// Keep default false (gated instrument).
+static constexpr bool BEM_STRIP_BSWAP = false;
 static void emit_bswap_i32(WasmModuleBuilder& wb) {
+    if (BEM_STRIP_BSWAP) return;   // value already on the stack; leave it unswapped
     // [bswap-rotate 2026-07-14] bswap32(x) = (rotr(x,8) & 0xFF00FF00) | (rotl(x,8) & 0x00FF00FF).
     // 11 ops vs the prior 18-op two-stage shl/shr/or form — fires on EVERY 32-bit fastmem
     // load and store, so a load+store pair drops ~36->22 emitted ops. Verified bit-exact
@@ -231,6 +238,7 @@ static void emit_bswap_i32(WasmModuleBuilder& wb) {
 }
 
 static void emit_bswap_i16(WasmModuleBuilder& wb) {
+    if (BEM_STRIP_BSWAP) return;
     wb.op_local_tee(LOCAL_TMP_VAL);
     wb.op_i32_const(8);
     wb.op_i32_shl();
