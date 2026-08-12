@@ -206,6 +206,7 @@ public:
     // existing evict()/unseal_pc_js per-PC path (no baked edges in merged gens).
     bool aot_seal_merged(const u8* bytes, std::size_t len, const u32* pc_keys, u32 n, u32 gen_idx);
     bool aot_is_sealed() const { return m_aot_sealed; }
+    bool is_sealed_pc(u32 pc) const { return m_sealed_pcs.count(pc) != 0; }  // [AOT A3.1] SMC test observe
 
     // ---- Hot-only merge (2026-06-17) ----
     // stash_block: at compile time, remember a block's emit inputs (cheap; no

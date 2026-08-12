@@ -1187,13 +1187,17 @@ function startServer() {
   if (process.env.PROBE_AOT) {
     const pollMs = parseInt(process.env.PROBE_AOT, 10) || 2000;
     const killReq = process.env.PROBE_AOT_KILL === '1';
+    const smcReq = process.env.PROBE_AOT_SMC === '1';
     const dumpAot = async () => {
       try {
-        const r = await page.evaluate((doKill) => {
+        const r = await page.evaluate((flags) => {
           if (!window.sharedMemory) return null;
           const A = new Uint32Array(window.sharedMemory.buffer);
           const rd = (a) => A[a >> 2] >>> 0;
-          if (doKill) A[0x026B3474 >> 2] = 1;  // KILL switch on: force JIT path
+          if (flags[0]) A[0x026B3474 >> 2] = 1;  // KILL switch on: force JIT path
+          // [AOT A3.1 SMC] arm the SMC trigger once the AOT gen is sealed, via the
+          // SAME write path the kill switch proved works cross-thread.
+          if (flags[1] && A[0x026B34CC >> 2] === 1 && A[0x026B34D0 >> 2] === 0) A[0x026B34C8 >> 2] = 1;
           return {
             ptr: rd(0x026B3468), len: rd(0x026B346C), n: rd(0x026B3470),
             kill: rd(0x026B3474), hits: rd(0x026B3478), integ_mm: rd(0x026B347C),
@@ -1201,20 +1205,24 @@ function startServer() {
             baked_ctx: rd(0x026B3488), status: rd(0x026B348C),
             m_status: rd(0x026B34A4), m_n: rd(0x026B34A8), m_gen: rd(0x026B34AC),
             m_ctx_mm: rd(0x026B34B4), m_seals: rd(0x026B34B8), m_auth_mm: rd(0x026B34BC),
-            m_disp: rd(0x026B34C0),
+            m_disp: rd(0x026B34C0), m_sealed: rd(0x026B34CC), m_smc: rd(0x026B34D0),
           };
-        }, killReq);
+        }, [killReq, smcReq]);
         if (r) console.log('[aot] n=' + r.n + ' status=0x' + r.status.toString(16) +
           ' hits=' + r.hits + ' hash_mm=' + r.integ_mm + ' ctx_mm=' + r.ctx_mm +
           ' live_ctx=0x' + r.live_ctx.toString(16) + ' kill=' + r.kill +
           ' | MERGED n=' + r.m_n + ' status=0x' + r.m_status.toString(16) + ' gen=0x' + r.m_gen.toString(16) +
-          ' seals=' + r.m_seals + ' auth_mm=' + r.m_auth_mm + ' ctx_mm=' + r.m_ctx_mm +
-          ' DISPATCHES=' + r.m_disp);
+          ' seals=' + r.m_seals + ' auth_mm=' + r.m_auth_mm +
+          ' DISPATCHES=' + r.m_disp + (smcReq ? ' | SMC sealed=' + r.m_sealed + ' evicted=' + r.m_smc : ''));
       } catch (e) { console.log('[aot] peek failed: ' + e.message); }
     };
     const aotTimer = setInterval(dumpAot, pollMs);
     if (typeof cleanupFns !== 'undefined') cleanupFns.push(() => clearInterval(aotTimer));
   }
+
+  // [AOT A3.1 acceptance #2] scripted SMC test: PROBE_AOT_SMC=<ms> flips a bit in
+  // HandleReverb's guest range (worker writes 0x026B34C8=1 trigger) and asserts
+  // the AOT gen unseals (0x026B34CC 1->0) + dispatch stops climbing (JIT fallback).
 
   // ---- checkpoint: resume the slow boot from IndexedDB ---------------------
   // PROBE_LOAD_IDB_MS=<ms>: restore the saved checkpoint (SAVE_KEY) so the run

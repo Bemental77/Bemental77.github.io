@@ -516,6 +516,28 @@ void JitWasm::Run()
     // [dc-diag 2026-07-21 TEMP] dolphin EmuThread JitWasm::Run active — proves dolphin (not the
     // ppc-worker) executes the guest CPU.
     { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B58u)); *p = *p + 1u; }
+#ifdef __EMSCRIPTEN__
+    // [AOT A3.1 acceptance #2] per-slice SMC poll (the Run()-entry region runs
+    // only once, so the trigger must be checked here). Publish the AOT entry's
+    // seal state (0x026B34CC); on the scripted trigger (0x026B34C8=1) flip a bit
+    // in HandleReverb + drive the REAL invalidation path (unseals sealed PCs) ->
+    // per-block JIT fallback; restore the byte so guest code stays correct.
+    if (g_aotm_parsed && !g_aotm_blocks.empty())
+    {
+      const u32 aot_entry = g_aotm_blocks[0].pc;
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B34CCu)) =
+          m_wasm_cache.is_sealed_pc(aot_entry) ? 1u : 0u;
+      if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B34C8u)) == 1u)
+      {
+        const u8 orig = mem.Read_U8(aot_entry + 3u);
+        mem.Write_U8(static_cast<u8>(orig ^ 0x01u), aot_entry + 3u);
+        InvalidateICacheRange(aot_entry, aot_entry + 0x50cu);
+        mem.Write_U8(orig, aot_entry + 3u);
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B34D0u)) = 1u;
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B34C8u)) = 0u;
+      }
+    }
+#endif
     // [ee-race fix 2026-07-02] NOTE: Advance must keep RUNNING under worker
     // ownership (hybrid VI/DSP/AI events fire ONLY via dolphin's local Advance —
     // CT_PHASE3_ENABLE is not set in the live tree, so the worker's
