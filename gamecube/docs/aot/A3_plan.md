@@ -48,13 +48,41 @@ per-region `pc → local_fn_idx` Map, resolve each `fn_<k>` export, and dispatch
 edges through the gen-packed `rtag/rslot` cache (`(gen_idx<<16)|k`; own-gen warm, other-gen
 falls through to the host chain + enters via the global-table wrapper).
 
-**Decision: reuse the seal-JS registration path** (the region_desc.h comment: "the seal JS
-registration handles both shapes identically") rather than build an AOT-specific single-function
-emitter. The AOT loader replicates region_relink's instantiate-and-register for the asset-loaded
-merged module. Correctness path even before the rtag/rslot warms: register ALL `fn_k` in the
-global table, so cold intra-region edges resolve by global-table fall-through (identical to A1's
-per-block registration); warm edges then upgrade to in-region jumps. This is the main A3.1
-integration task.
+**Decision: register the AOT merged module as a PRE-SEALED immutable region gen** (reserved
+`gen_idx`), then `region_dispatch` (block_cache.cpp:2497, which the game already calls) handles
+it for free. Safest impl: a self-contained AOT seal that COPIES `region_seal`'s recipe, leaving
+the proven runtime region path untouched.
+
+**Registration recipe** (extracted verbatim from `region_seal`, block_cache.cpp:2068-2181 — the
+exact set the AOT seal replicates):
+1. Instantiate: `new WebAssembly.Instance(new WebAssembly.Module(bytes), { env })`, env = the
+   shared `wasmMemory` + `Module.bemental_imports.env` (13 `ppc_*`) + `__indirect_function_table`
+   = `wasmTable`.
+2. Resolve exports: `gen.regionFn = exports['region']`, `gen.entrySel = exports['entry_sel']`,
+   `gen.fns[i] = exports['fn_'+i]`.
+3. Grow `wasmTable`, `wasmTable.set(gi, fns[i])` per block → `gen.globalSlots[i] = gi`.
+4. `Module.bemental_gens[genIdx] = gen`.
+5. Per block: `Module.bemental_pc2gen.set(pc, (genIdx<<16)|i)` AND point the global dispatch
+   cache at the slot: `g_bem_disp_tag[(pc>>2)&mask] = pc; g_bem_disp_slot[...] = globalSlots[i]`
+   (so BOTH the C-loop and the in-wasm tail-chain reach the gen directly).
+6. C-side: `m_sealed_pcs.insert(pc)` per block + `m_sealed_gen_count++` (gates `region_dispatch`).
+
+`g_bem_mrtag/mrslot` (the merged warm-edge cache) start empty → intra-region edges fall through
+to the global dispatch cache (step 5, populated) until they warm — correct + fast from boot,
+identical to A1's per-block correctness path. Authenticity: each block carries an FNV guest-hash
+(v3 asset) verified against live guest code before the seal; any mismatch → skip (JIT fallback).
+
+**Three riders (registration step):**
+1. **Bytes/function is a tracked line metric.** HandleReverb = 539KB module from 1.3KB guest
+   (~415×); at 40+ functions ~20MB+ assets, and V8 commits ~4× wire bytes + stacked instantiate
+   time. Evaluate an offline `wasm-opt` post-pass at asset #2-3 (offline emission gets passes the
+   runtime never could); the cold-arm question may return here in offline form.
+2. **Follow A1's load path to the letter**: fetch async on the pump thread → hand bytes via SAB →
+   instantiate + register on the EmuThread (tables are per-agent; A1 proved this exact
+   choreography, hits=4). Registration writes keep tag-last publication order. Boot-time sync
+   instantiate is fine; watch cumulative boot cost as assets stack, stagger if it grows.
+3. **Per-asset gate = in-situ AOT-vs-JIT body timing + correctness**, scene fps only at batch
+   milestones (~every +10% cumulative coverage, and A4).
 
 ## ★ Singles-arm precondition (existential — gates every matrix function)
 

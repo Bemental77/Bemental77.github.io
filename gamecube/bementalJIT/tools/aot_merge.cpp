@@ -129,10 +129,33 @@ int main(int argc, char** argv) {
   std::printf("[aot-merge] merged module: %zu bytes, wasm-magic=%s\n", mod.size(), ok ? "OK" : "BAD");
   if (!ok) return 2;
 
+  // --- write the v3 MERGED asset the AOT loader seals as a pre-built gen ---
+  // Format: "BJAOTM\0" | ver=3 u32 | baked_ctx u32 | gen_idx u32 | n_blocks u32
+  //   | n_blocks*(pc u32, gspan u32, ghash u32)   [fn_k order; ghash authenticates guest code]
+  //   | module_len u32 | module bytes
+  auto put32 = [](std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back(x & 0xFF); v.push_back((x >> 8) & 0xFF); v.push_back((x >> 16) & 0xFF); v.push_back((x >> 24) & 0xFF);
+  };
+  std::vector<uint8_t> asset;
+  const char magic[7] = {'B','J','A','O','T','M','\0'};
+  asset.insert(asset.end(), magic, magic + 7);
+  put32(asset, 3u);
+  put32(asset, ctx_ptr);
+  put32(asset, gen_idx);
+  put32(asset, (uint32_t)descs.size());
+  for (const RegionBlockDesc& d : descs) {
+    uint32_t h = 0x811c9dc5u;   // FNV-1a over the block's guest words (== loader's AotGuestHash)
+    for (uint32_t j = 0; j < d.count; ++j) { const uint32_t gw = d.insts[j]; for (int k = 0; k < 4; ++k) { h ^= (gw >> (8 * k)) & 0xFFu; h *= 0x01000193u; } }
+    put32(asset, d.start_pc); put32(asset, d.count); put32(asset, h);
+  }
+  put32(asset, (uint32_t)mod.size());
+  asset.insert(asset.end(), mod.begin(), mod.end());
+
   FILE* f = std::fopen(out_path, "wb");
   if (!f) { std::perror("fopen"); return 1; }
-  std::fwrite(mod.data(), 1, mod.size(), f);
+  std::fwrite(asset.data(), 1, asset.size(), f);
   std::fclose(f);
-  std::printf("[aot-merge] wrote %s (validate with node: WebAssembly.validate)\n", out_path);
+  std::printf("[aot-merge] wrote %s: %zu-byte asset (%zu blocks + %zu-byte module, gen=0x%x, ctx=0x%08x)\n",
+              out_path, asset.size(), descs.size(), mod.size(), gen_idx, ctx_ptr);
   return 0;
 }
