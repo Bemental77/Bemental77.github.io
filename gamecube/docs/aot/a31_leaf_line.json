@@ -1,144 +1,150 @@
 {
  "derived": "2026-08-12",
- "samples": 16289,
+ "build": "AOT-OFF (kill=1) — coverage MUST be sampled clean; AOT slowmem self-inflates",
+ "samples": 16256,
  "eligible": 17,
- "share_pct": 39.51,
+ "share_pct": 23.77,
+ "pure_compute": 9,
+ "stateful": 8,
  "functions": [
-  {
-   "name": "PSMTXROMultVecArray",
-   "addr": "0x800bc8d0",
-   "size": "0x118",
-   "share": 22.17,
-   "class": "pure_compute",
-   "blocks": 5
-  },
   {
    "name": "HandleReverb",
    "addr": "0x801136f0",
    "size": "0x50c",
-   "share": 5.13,
+   "share": 6.44,
    "class": "pure_compute",
-   "blocks": 59
+   "verified": "workflow"
+  },
+  {
+   "name": "PSMTXROMultVecArray",
+   "addr": "0x800bc8d0",
+   "size": "0x118",
+   "share": 1.75,
+   "class": "pure_compute",
+   "verified": "workflow"
   },
   {
    "name": "PSMTXInverse",
    "addr": "0x800bb57c",
    "size": "0xf8",
-   "share": 1.4,
+   "share": 1.63,
    "class": "pure_compute",
-   "blocks": 3
-  },
-  {
-   "name": "C_MTXOrtho",
-   "addr": "0x800bbeb4",
-   "size": "0x98",
-   "share": 1.14,
-   "class": "pure_compute",
-   "blocks": 1
+   "verified": "workflow"
   },
   {
    "name": "__GXSetVAT",
    "addr": "0x800ca0cc",
    "size": "0x9c",
-   "share": 1.1,
+   "share": 1.56,
    "class": "stateful",
-   "blocks": 6
-  },
-  {
-   "name": "GXSetChanCtrl",
-   "addr": "0x800cc3dc",
-   "size": "0x1e4",
-   "share": 0.99,
-   "class": "stateful",
-   "blocks": 12
-  },
-  {
-   "name": "PSMTXConcat",
-   "addr": "0x800bb460",
-   "size": "0xcc",
-   "share": 0.88,
-   "class": "pure_compute",
-   "blocks": 1
-  },
-  {
-   "name": "GXGetTexBufferSize",
-   "addr": "0x800cc5c0",
-   "size": "0x15c",
-   "share": 0.8,
-   "class": "pure_compute",
-   "blocks": 24
+   "verified": "workflow"
   },
   {
    "name": "GXSetTevKColor",
    "addr": "0x800ce3a4",
    "size": "0x74",
-   "share": 0.79,
+   "share": 1.31,
    "class": "stateful",
-   "blocks": 1
+   "verified": "workflow"
   },
   {
-   "name": "GXSetFogRangeAdj",
-   "addr": "0x800cea7c",
-   "size": "0x100",
-   "share": 0.73,
-   "class": "stateful",
-   "blocks": 3
-  },
-  {
-   "name": "__SetSURegs",
-   "addr": "0x800cd190",
-   "size": "0xcc",
-   "share": 0.72,
-   "class": "stateful",
-   "blocks": 1
+   "name": "C_MTXOrtho",
+   "addr": "0x800bbeb4",
+   "size": "0x98",
+   "share": 1.25,
+   "class": "pure_compute",
+   "verified": "workflow"
   },
   {
    "name": "GXLoadLightObjImm",
    "addr": "0x800cbf78",
    "size": "0x148",
-   "share": 0.69,
+   "share": 1.25,
    "class": "stateful",
-   "blocks": 20
+   "verified": "workflow"
+  },
+  {
+   "name": "PSMTXConcat",
+   "addr": "0x800bb460",
+   "size": "0xcc",
+   "share": 1.05,
+   "class": "pure_compute",
+   "verified": "workflow"
+  },
+  {
+   "name": "GXSetChanCtrl",
+   "addr": "0x800cc3dc",
+   "size": "0x1e4",
+   "share": 1.04,
+   "class": "stateful",
+   "verified": "workflow"
   },
   {
    "name": "GXSetBlendMode",
    "addr": "0x800ceb7c",
    "size": "0x104",
-   "share": 0.67,
+   "share": 1,
    "class": "stateful",
-   "blocks": 4
+   "verified": "workflow"
+  },
+  {
+   "name": "__SetSURegs",
+   "addr": "0x800cd190",
+   "size": "0xcc",
+   "share": 0.89,
+   "class": "stateful",
+   "verified": "workflow"
+  },
+  {
+   "name": "GXSetFogRangeAdj",
+   "addr": "0x800cea7c",
+   "size": "0x100",
+   "share": 0.87,
+   "class": "stateful",
+   "verified": "workflow"
   },
   {
    "name": "__cvt_fp2unsigned",
    "addr": "0x800e23cc",
    "size": "0x5c",
-   "share": 0.6,
+   "share": 0.8,
    "class": "pure_compute",
-   "blocks": 6
+   "verified": "workflow"
   },
   {
-   "name": "PSMTXMultVec",
-   "addr": "0x800bbcb0",
-   "size": "0x54",
-   "share": 0.58,
+   "name": "GXGetTexBufferSize",
+   "addr": "0x800cc5c0",
+   "size": "0x15c",
+   "share": 0.78,
    "class": "pure_compute",
-   "blocks": 1
+   "switch": true,
+   "verified": "workflow"
+  },
+  {
+   "name": "PSMTXInvXpose",
+   "addr": "0x800bb674",
+   "size": "0xc8",
+   "share": 0.78,
+   "class": "pure_compute",
+   "verified": "spot"
+  },
+  {
+   "name": "GetObjTRXPtr",
+   "addr": "0x800274f4",
+   "size": "0x14c",
+   "share": 0.71,
+   "class": "pure_compute",
+   "switch": true,
+   "verified": "spot"
   },
   {
    "name": "GXSetVtxDesc",
    "addr": "0x800c984c",
    "size": "0x360",
-   "share": 0.56,
+   "share": 0.66,
    "class": "stateful",
-   "blocks": 29
-  },
-  {
-   "name": "GXInitTexObjLOD",
-   "addr": "0x800ccaa0",
-   "size": "0x194",
-   "share": 0.56,
-   "class": "pure_compute",
-   "blocks": 19
+   "switch": true,
+   "verified": "workflow"
   }
  ]
 }
