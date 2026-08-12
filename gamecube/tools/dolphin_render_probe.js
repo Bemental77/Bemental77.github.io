@@ -1199,12 +1199,17 @@ function startServer() {
             kill: rd(0x026B3474), hits: rd(0x026B3478), integ_mm: rd(0x026B347C),
             ctx_mm: rd(0x026B3480), live_ctx: rd(0x026B3484),
             baked_ctx: rd(0x026B3488), status: rd(0x026B348C),
+            m_status: rd(0x026B34A4), m_n: rd(0x026B34A8), m_gen: rd(0x026B34AC),
+            m_ctx_mm: rd(0x026B34B4), m_seals: rd(0x026B34B8), m_auth_mm: rd(0x026B34BC),
+            m_disp: rd(0x026B34C0),
           };
         }, killReq);
         if (r) console.log('[aot] n=' + r.n + ' status=0x' + r.status.toString(16) +
           ' hits=' + r.hits + ' hash_mm=' + r.integ_mm + ' ctx_mm=' + r.ctx_mm +
-          ' live_ctx=0x' + r.live_ctx.toString(16) + ' baked_ctx=0x' + r.baked_ctx.toString(16) +
-          ' kill=' + r.kill);
+          ' live_ctx=0x' + r.live_ctx.toString(16) + ' kill=' + r.kill +
+          ' | MERGED n=' + r.m_n + ' status=0x' + r.m_status.toString(16) + ' gen=0x' + r.m_gen.toString(16) +
+          ' seals=' + r.m_seals + ' auth_mm=' + r.m_auth_mm + ' ctx_mm=' + r.m_ctx_mm +
+          ' DISPATCHES=' + r.m_disp);
       } catch (e) { console.log('[aot] peek failed: ' + e.message); }
     };
     const aotTimer = setInterval(dumpAot, pollMs);

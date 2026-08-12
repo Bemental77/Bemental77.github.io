@@ -30,7 +30,7 @@
 using namespace bemental;
 using namespace bemental::powerpc;
 
-extern "C" { extern uint32_t g_bem_lc_base; }
+extern "C" { extern uint32_t g_bem_lc_base; extern uint32_t g_bem_aot_count_fnk; }
 // g_hle_hook_query is bemental::powerpc::g_hle_hook_query (via using namespace) — not extern "C".
 
 // --- PPC branch-target decode (for the CFG walk) ---
@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
   // the HLE prologue; HandleReverb is scalar-FP so lc_base=0 (no singles spec).
   g_hle_hook_query = [](uint32_t) -> bool { return false; };
   g_bem_lc_base = 0u;
+  g_bem_aot_count_fnk = 1u;   // emit the fn_k proof-of-run counter into the AOT asset
 
   // --- block starts: entry + EVERY internal branch target (forward conditionals
   // coalesce mid-block, but their TAKEN target is still a block start the merged

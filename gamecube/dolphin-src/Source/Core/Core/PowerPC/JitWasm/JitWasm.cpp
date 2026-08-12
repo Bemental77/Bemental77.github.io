@@ -266,6 +266,84 @@ void AotPollAndLoad()
   *AotCell(0x026B3468u) = 0u;               // consume the trigger
   std::free(reinterpret_cast<void*>(static_cast<uintptr_t>(ptr)));
 }
+
+// ---------------------------------------------------------------------------
+// [AOT A3.1] MERGED whole-function asset (BJAOTM v3) — a pre-built $region module
+// (aot_merge.cpp) registered as an IMMUTABLE region gen via aot_seal_merged.
+// Separate SAB trigger cell (0x026B3490 ptr / 0x026B3494 len) + telemetry
+// 0x026B34A4..34BC. Re-seals after clear() (savestate load wipes all gens).
+struct AotMergedBlk { u32 pc, gspan, ghash; };
+std::vector<AotMergedBlk> g_aotm_blocks;
+std::vector<u8> g_aotm_module;
+u32  g_aotm_ctx = 0u, g_aotm_gen = 0u;
+bool g_aotm_parsed = false;
+
+void AotParseMerged(const u8* data, u32 len)
+{
+  g_aotm_blocks.clear(); g_aotm_module.clear(); g_aotm_parsed = false;
+  if (!data || len < 23u || std::memcmp(data, "BJAOTM", 7) != 0) { *AotCell(0x026B34A4u) = 0x80000001u; return; }
+  u32 off = 7u;
+  const u32 ver = AotRd32LE(data + off); off += 4u;
+  g_aotm_ctx    = AotRd32LE(data + off); off += 4u;
+  g_aotm_gen    = AotRd32LE(data + off); off += 4u;
+  const u32 n   = AotRd32LE(data + off); off += 4u;
+  if (ver != 3u || n == 0u || n > 4096u) { *AotCell(0x026B34A4u) = 0x80000002u; return; }
+  if (static_cast<u64>(off) + static_cast<u64>(n) * 12ull + 4ull > len) { *AotCell(0x026B34A4u) = 0x80000003u; return; }
+  g_aotm_blocks.resize(n);
+  for (u32 i = 0; i < n; ++i)
+  {
+    g_aotm_blocks[i].pc    = AotRd32LE(data + off); off += 4u;
+    g_aotm_blocks[i].gspan = AotRd32LE(data + off); off += 4u;
+    g_aotm_blocks[i].ghash = AotRd32LE(data + off); off += 4u;
+  }
+  const u32 mlen = AotRd32LE(data + off); off += 4u;
+  if (static_cast<u64>(off) + mlen > len) { *AotCell(0x026B34A4u) = 0x80000004u; return; }
+  g_aotm_module.assign(data + off, data + off + mlen);
+  g_aotm_parsed = true;
+  *AotCell(0x026B34A8u) = n;
+  *AotCell(0x026B34ACu) = g_aotm_gen;
+  *AotCell(0x026B34A4u) = 1u;
+}
+
+void AotMergedPoll()
+{
+  if (g_aotm_parsed) return;
+  const u32 ptr = *AotCell(0x026B3490u);    // trigger (JS writes LAST)
+  if (ptr == 0u) return;
+  const u32 len = *AotCell(0x026B3494u);
+  AotParseMerged(reinterpret_cast<const u8*>(static_cast<uintptr_t>(ptr)), len);
+  *AotCell(0x026B3490u) = 0u;
+  std::free(reinterpret_cast<void*>(static_cast<uintptr_t>(ptr)));
+}
+
+// Authenticate every block's LIVE guest code (FNV vs the asset ghash — the game
+// binary is byte-identical to the decomp we compiled from), require baked_ctx ==
+// live ctx + KILL off, then seal the immutable gen. Re-runs until the guest code
+// is loaded (auth passes) and again after clear(). Template avoids naming the
+// Dolphin Memory / BlockCache types here.
+template <typename Cache, typename Mem>
+void AotMergedTrySeal(Cache& cache, Mem& mem, u32 live_ctx)
+{
+  if (!g_aotm_parsed || cache.aot_is_sealed()) return;
+  if (*AotCell(0x026B3474u) != 0u) return;                 // shared KILL switch
+  *AotCell(0x026B34B0u) = live_ctx;
+  if (g_aotm_ctx != live_ctx) { AotBump(0x026B34B4u); return; }  // ctx mismatch
+  std::vector<u32> pcs; pcs.reserve(g_aotm_blocks.size());
+  for (const AotMergedBlk& b : g_aotm_blocks)
+  {
+    u32 h = 0x811c9dc5u;
+    for (u32 j = 0; j < b.gspan; ++j)
+    {
+      const u32 w = mem.Read_U32(b.pc + j * 4u);
+      for (int k = 0; k < 4; ++k) { h ^= (w >> (8 * k)) & 0xFFu; h *= 0x01000193u; }
+    }
+    if (h != b.ghash) { AotBump(0x026B34BCu); return; }     // auth mismatch (code not ready / SMC / wrong game)
+    pcs.push_back(b.pc);
+  }
+  if (cache.aot_seal_merged(g_aotm_module.data(), g_aotm_module.size(),
+                            pcs.data(), static_cast<u32>(pcs.size()), g_aotm_gen))
+    AotBump(0x026B34B8u);                                   // seals
+}
 }  // namespace
 
 void JitWasm::Init()
@@ -414,6 +492,15 @@ void JitWasm::Run()
   // into shared memory, and parse them ON THIS pthread instance (see the
   // AotEntry registry note — file-statics are per-instance under PROXY_TO_PTHREAD).
   AotPollAndLoad();
+  AotMergedPoll();
+  // [AOT A3.1] re-seal cadence: cheap aot_is_sealed() check every entry; the
+  // auth+seal (bounded guest-code reads) fires only until the gen is live and
+  // again after a clear() (savestate load). Low cadence bounds the auth cost.
+  {
+    static u32 s_aotm_tick = 0u;
+    if (!m_wasm_cache.aot_is_sealed() && (s_aotm_tick++ & 0xFFu) == 0u)
+      AotMergedTrySeal(m_wasm_cache, mem, ctx_ptr);
+  }
 #endif
 
   // Mirror canonical CachedInterpreter::Run: outer loop on CPU::State,

@@ -106,6 +106,7 @@ extern "C" {
     extern int           g_bem_gp_dirty;        // [perf] gather-pipe write pending (bridge)
     extern uint32_t      g_bem_lc_base;         // [lc-window PM23] Memory::GetL1Cache() addr
     extern uint32_t      g_bem_fp_resident_loop; // [WS-1 STEP-3] FP self-loop op_loop residency A/B
+    extern uint32_t      g_bem_aot_count_fnk;    // [AOT A3.1] emit a proof-of-run counter in fn_k wrappers (offline aot_merge only)
     int  bem_pc_force_double(uint32_t pc);      // [single-spec PM26] sticky deopt registry
 }
 static constexpr u32 BEM_DISP_MASK_NEXT = 0x3FFFFu;  // MUST match block_cache.cpp BEM_DISP_MASK (BEM_DISP_BITS=18)
@@ -2277,6 +2278,16 @@ std::vector<u8> build_region_function_next_merged(const RegionBlockDesc* blocks,
     for (u32 k = 0; k < n_blocks; ++k) {
         b.beginFuncBody();
         b.emitLocals(0u, nullptr, nullptr);
+        // [AOT A3.1 proof-of-run] ++*(u32*)0x026B34C0 on every fn_k entry —
+        // catches in-wasm tail-chained dispatches the C chain loop never sees.
+        // Gated: only the offline aot_merge tool sets g_bem_aot_count_fnk, so
+        // runtime-sealed gens never emit it.
+        if (g_bem_aot_count_fnk) {
+            b.op_i32_const((s32)0x026B34C0u);
+            b.op_i32_const((s32)0x026B34C0u); b.op_i32_load(0u);
+            b.op_i32_const(1); b.op_i32_add();
+            b.op_i32_store(0u);
+        }
         // Host-boundary contract: reset the consecutive-tail-chain budget so
         // the idle-skip streak detector keeps observing (block_cache.cpp:448).
         b.op_i32_const((s32)blr_chain_addr);

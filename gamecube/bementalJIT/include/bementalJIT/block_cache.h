@@ -195,6 +195,18 @@ public:
     // false → caller falls through to the legacy per-block / interp path.
     bool region_dispatch(u32 pc, s32* out);
 
+    // [AOT A3.1] Register a PRE-BUILT merged module (offline aot_merge.cpp) as an
+    // IMMUTABLE region gen at a reserved gen_idx (0xa07). Copies region_seal's
+    // registration recipe (instantiate + wasmTable + bemental_gens/pc2gen + global
+    // dispatch cache) + m_sealed_pcs, but uses a SEPARATE budget (m_aot_gen_count)
+    // so it consumes no runtime gen slot. Returns true on success. Caller
+    // (JitWasm) FNV-authenticates each block's live guest code before calling.
+    // Idempotent-ish: sets m_aot_sealed; clear() resets it so Run() re-seals after
+    // a savestate load (which wipes all gens). SMC eviction is handled by the
+    // existing evict()/unseal_pc_js per-PC path (no baked edges in merged gens).
+    bool aot_seal_merged(const u8* bytes, std::size_t len, const u32* pc_keys, u32 n, u32 gen_idx);
+    bool aot_is_sealed() const { return m_aot_sealed; }
+
     // ---- Hot-only merge (2026-06-17) ----
     // stash_block: at compile time, remember a block's emit inputs (cheap; no
     // body emitted). promote_hot: once a block has been dispatched enough times
@@ -247,6 +259,11 @@ private:
     std::unordered_set<u32> m_sealed_pcs;
     u32  m_sealed_gen_count = 0u;
     bool m_region_has_sealed = false;
+    // [AOT A3.1] AOT gens are counted SEPARATELY so they never consume the 24-gen
+    // runtime budget; region_dispatch's cold gate sums both. m_aot_sealed drives
+    // re-seal after clear() (savestate load wipes all gens).
+    u32  m_aot_gen_count = 0u;
+    bool m_aot_sealed = false;
     // [PM54f SMC fix 2026-08-07] fused-successor pc -> predecessor pcs that
     // spliced it in via run-fusion. Eviction of a fused successor MUST also evict
     // these predecessors: the predecessor's compiled body embeds the successor's

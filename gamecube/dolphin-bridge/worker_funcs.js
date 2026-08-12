@@ -123,6 +123,27 @@ if (typeof Module !== 'undefined') {
           postMessage({ cmd: 'print', txt: '[worker][aot] asset fetch failed: ' + e });
         });
     } catch (e) {}
+
+    // [AOT A3.1] MERGED whole-function asset (BJAOTM) — same choreography, its
+    // own SAB cells (len 0x026B3494 first, ptr 0x026B3490 last = the trigger).
+    try {
+      fetch('/gamecube/dolphin_libretro/handlereverb.bjaotm')
+        .then(function (r) { return r.ok ? r.arrayBuffer() : null; })
+        .then(function (ab) {
+          if (!ab || !Module._malloc) return;
+          var bytes = new Uint8Array(ab);
+          var ptr = Module._malloc(bytes.length);
+          if (!ptr) return;
+          Module.HEAPU8.set(bytes, ptr);
+          var h32 = Module.HEAPU32 || new Uint32Array(Module.HEAPU8.buffer);
+          h32[0x026B3494 >> 2] = bytes.length >>> 0;  // len first
+          Atomics.store(h32, 0x026B3490 >> 2, ptr >>> 0);  // ptr last (trigger)
+          postMessage({ cmd: 'print', txt: '[worker][aot] handlereverb.bjaotm streamed: ' + bytes.length + ' bytes @0x' + (ptr >>> 0).toString(16) });
+        })
+        .catch(function (e) {
+          postMessage({ cmd: 'print', txt: '[worker][aot] merged asset fetch failed: ' + e });
+        });
+    } catch (e) {}
   };
 }
 

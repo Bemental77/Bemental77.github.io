@@ -54,6 +54,9 @@ int32_t       g_bem_rslot[BEM_DISP_BUCKETS];      // region internal-table slot
 // Separate from rtag/rslot because the N-fn shape stores RAW internal indices.
 uint32_t      g_bem_mrtag[BEM_DISP_BUCKETS];      // guest PC, 0xFFFFFFFF = empty
 int32_t       g_bem_mrslot[BEM_DISP_BUCKETS];     // packed (gen<<16)|k, -1 = empty
+// [AOT A3.1] wasmTable slot range of the sealed AOT gen's fn_k (contiguous), so
+// the chain loop can COUNT executions of the AOT merged blocks (proof-of-run).
+static uint32_t g_aot_slot_lo = 0u, g_aot_slot_hi = 0u;
 uint32_t      g_bem_chain_exc0    = 0u;           // Exceptions at chain entry
 unsigned char g_bem_chain_enabled = 1;            // master A/B toggle (gate #8)
 // [perf gather-gate] Defined HERE (bementalJIT, linked by both the main dolphin
@@ -67,6 +70,7 @@ int g_bem_gp_dirty = 0;
 // LC slow-arm shortcut. Blocks compiled before publication bake 0 (import path) —
 // harmless, they recompile only if evicted, and publication precedes guest exec.
 uint32_t g_bem_lc_base = 0;
+uint32_t g_bem_aot_count_fnk = 0u;   // [AOT A3.1] set by offline aot_merge to emit fn_k proof-of-run counters
 // [fprf-gate PM46 2026-07-31] bFPRF half of the FPRF emission gate — native
 // Jit64 emits FPRF only when `bFPRF && wantsFPRF`; default false = zero FPRF
 // code, matching native MP4. Published by JitWasm from Config::MAIN_FPRF.
@@ -822,6 +826,10 @@ s32 bem_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc,
             if (it == g_bem_pc_handle.end()) break;          // uncompiled -> host compiles
             handle = it->second;
         }
+        // [AOT A3.1] proof-of-run: count chain dispatches into the sealed AOT gen's
+        // fn_k slot range (contiguous wasmTable indices published by aot_seal_merged).
+        if (g_aot_slot_hi && (u32)handle >= g_aot_slot_lo && (u32)handle < g_aot_slot_hi)
+            *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B34C0u)) += 1u;
 #if BEM_DISPATCH_CENSUS
         g_chain_iters = g_chain_iters + 1u;
         if (g_pc_census_n < 256) g_pc_census_ring[g_pc_census_n++] = (int)pc;
@@ -1227,6 +1235,11 @@ void BlockCache::clear() {
     m_sealed_pcs.clear();
     m_sealed_gen_count = 0u;
     m_region_has_sealed = false;
+    // [AOT A3.1] the EM_ASM below wipes ALL bemental_gens incl. the AOT gen, so
+    // drop our AOT bookkeeping too — JitWasm::Run re-seals from the asset (with a
+    // fresh FNV auth) once m_aot_sealed is false again.
+    m_aot_gen_count = 0u;
+    m_aot_sealed = false;
     m_fused_succ_to_pred.clear();   // [PM54f] fusion mappings die with the gens
 #ifdef __EMSCRIPTEN__
     EM_ASM({
@@ -2494,6 +2507,102 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
 #endif
 }
 
+bool BlockCache::aot_seal_merged(const u8* bytes, std::size_t len,
+                                 const u32* pc_keys, u32 n, u32 gen_idx) {
+#ifdef __EMSCRIPTEN__
+    if (!bytes || len == 0u || !pc_keys || n == 0u) return false;
+    // COPY of region_seal's registration recipe (block_cache.cpp:2068-2181) — the
+    // runtime path is deliberately NOT refactored. Registers the pre-built merged
+    // module as an immutable gen: instantiate -> wasmTable slots -> bemental_gens
+    // + pc2gen + global dispatch cache. gen_idx is reserved (0xa07), no collision.
+    const int ok = EM_ASM_INT({
+        const bytesPtr  = $0;
+        const bytesLen  = $1 >>> 0;
+        const pcKeysPtr = $2;
+        const nFuncs    = $3 >>> 0;
+        const genIdx    = $4 | 0;
+        const dispTag   = $5;
+        const dispSlot  = $6;
+        const dispMask  = $7 >>> 0;
+        try {
+            const view = new Uint8Array(Module.HEAPU8.buffer, bytesPtr, bytesLen);
+            const copy = new Uint8Array(view);
+            const pcs = new Array(nFuncs);
+            for (let i = 0; i < nFuncs; i++) pcs[i] = HEAPU32[(pcKeysPtr >>> 2) + i] >>> 0;
+            const memObj = (typeof wasmMemory !== 'undefined') ? wasmMemory : null;
+            const env = {};
+            if (memObj) env.memory = memObj;
+            // Direct-bind the 13 ppc_* imports from the exported C fns (compile_raw
+            // parity) — do NOT depend on Module.bemental_imports being bootstrapped
+            // at seal time (it may not be; the merged Instance() needs all callable).
+            env.ppc_read8       = Module._dolphin_read8;
+            env.ppc_read16      = Module._dolphin_read16;
+            env.ppc_read32      = Module._dolphin_read32;
+            env.ppc_write8      = Module._dolphin_write8;
+            env.ppc_write16     = Module._dolphin_write16;
+            env.ppc_write32     = Module._dolphin_write32;
+            env.ppc_interp      = Module._dolphin_interp;
+            env.ppc_check_exc   = Module._dolphin_check_exc;
+            env.ppc_break_block = Module._dolphin_break_block;
+            env.ppc_hle_check   = Module._dolphin_hle_check;
+            env.ppc_hle_fire    = Module._dolphin_hle_fire;
+            env.ppc_msr_updated = Module._dolphin_msr_updated;
+            env.ppc_gather_drain= Module._dolphin_gather_drain;
+            if (Module.bemental_imports && Module.bemental_imports.env) {
+                const be = Module.bemental_imports.env;
+                for (const k in be) if (typeof env[k] === 'undefined') env[k] = be[k];
+            }
+            if (typeof wasmTable !== 'undefined') env['__indirect_function_table'] = wasmTable;
+            const inst = new WebAssembly.Instance(new WebAssembly.Module(copy), { env: env });
+            const gen = {};
+            gen.instance = inst;
+            gen.nFuncs   = nFuncs;
+            gen.merged   = true;
+            gen.regionFn = inst.exports['region'];
+            gen.entrySel = inst.exports['entry_sel'];
+            if (!gen.regionFn || !gen.entrySel) { console.log('[worker] [aot] seal gen ' + genIdx + ' FAILED: missing region/entry_sel'); return 0; }
+            const fns = new Array(nFuncs);
+            for (let i = 0; i < nFuncs; i++) { fns[i] = inst.exports['fn_' + i]; if (!fns[i]) { console.log('[worker] [aot] seal gen ' + genIdx + ' FAILED: missing fn_' + i); return 0; } }
+            gen.fns = fns;
+            if (!Module._bemental_table_base) { Module._bemental_table_base = wasmTable.length; Module._bemental_next_idx = wasmTable.length; wasmTable.grow(8192); }
+            gen.globalSlots = new Array(nFuncs);
+            for (let i = 0; i < nFuncs; i++) { let gi = Module._bemental_next_idx; if (gi >= wasmTable.length) wasmTable.grow(4096); wasmTable.set(gi, fns[i]); Module._bemental_next_idx = gi + 1; gen.globalSlots[i] = gi; }
+            if (!Module.bemental_gens)   Module.bemental_gens   = [];
+            if (!Module.bemental_pc2gen) Module.bemental_pc2gen = new Map();
+            Module.bemental_gens[genIdx] = gen;
+            for (let i = 0; i < nFuncs; i++) {
+                const pc = pcs[i];
+                Module.bemental_pc2gen.set(pc, ((genIdx << 16) | i) >>> 0);
+                const bkt = (pc >>> 2) & dispMask;
+                HEAPU32[(dispTag >>> 2) + bkt] = pc;
+                HEAP32[(dispSlot >>> 2) + bkt] = gen.globalSlots[i] | 0;
+            }
+            // [AOT A3.1] publish the fn_k wasmTable slot range for the chain-loop
+            // proof-of-run counter ($9=&g_aot_slot_lo, $10=&g_aot_slot_hi).
+            HEAP32[$9 >> 2]  = gen.globalSlots[0] | 0;
+            HEAP32[$10 >> 2] = (gen.globalSlots[0] + nFuncs) | 0;
+            console.log('[worker] [aot] sealed AOT gen ' + genIdx + ' n_funcs=' + nFuncs + ' bytes=' + bytesLen + ' slots=' + gen.globalSlots[0] + '..' + (gen.globalSlots[0]+nFuncs) + ' shape=merged');
+            return 1;
+        } catch (e) {
+            console.log('[worker] [aot] seal gen ' + genIdx + ' EXC: ' + (e && e.message ? e.message : String(e)));
+            return 0;
+        }
+    },
+    (int)(uintptr_t)bytes, (int)len,
+    (int)(uintptr_t)pc_keys, (int)n, (int)gen_idx,
+    (int)(uintptr_t)&g_bem_disp_tag[0], (int)(uintptr_t)&g_bem_disp_slot[0], (int)BEM_DISP_MASK,
+    (int)(uintptr_t)&g_aot_slot_lo, (int)(uintptr_t)&g_aot_slot_hi);
+    if (!ok) return false;
+    for (u32 i = 0; i < n; ++i) m_sealed_pcs.insert(pc_keys[i]);
+    m_aot_gen_count += 1u;    // SEPARATE budget — does not touch m_sealed_gen_count
+    m_aot_sealed = true;
+    return true;
+#else
+    (void)bytes; (void)len; (void)pc_keys; (void)n; (void)gen_idx;
+    return false;
+#endif
+}
+
 bool BlockCache::region_dispatch(u32 pc, s32* out) {
     // [return-linking] Host boundary: reset the consecutive in-WASM tail-chain
     // counter so the idle-skip streak detector observes idle cycles. The RAS sp
@@ -2507,7 +2616,7 @@ bool BlockCache::region_dispatch(u32 pc, s32* out) {
     // (entry_sel + br $L); cross-gen targets exit set_pc+return and re-dispatch
     // here into the owning gen.
     g_rd_calls++;                                            // [region-debug]
-    if (m_sealed_gen_count == 0u) { g_rd_nogen++; return false; }  // [region-debug] cold window -> chain_dispatch
+    if (m_sealed_gen_count + m_aot_gen_count == 0u) { g_rd_nogen++; return false; }  // [region-debug] cold window (+AOT gens) -> chain_dispatch
     if (m_sealed_pcs.find(pc) == m_sealed_pcs.end()) { g_rd_miss++; return false; }  // [xinst-fix] C-side miss: skip the JS-membrane EM_ASM
     m_regions[REGION_REL_0].dispatches_since_relink += 1u;  // diagnostic meter only
 #ifdef __EMSCRIPTEN__
