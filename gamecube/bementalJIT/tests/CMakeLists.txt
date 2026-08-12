@@ -63,6 +63,9 @@ if(BEMENTAL_GUEST_POWERPC)
         "SHELL:-s ALLOW_MEMORY_GROWTH=1"
         "SHELL:-s MAXIMUM_MEMORY=67108864"
         "SHELL:-s ALLOW_TABLE_GROWTH=1"
+        # [2026-08-12] the run_perf_t1 harness reads Module.HEAPU8; without this the
+        # page aborts on load ("HEAPU8 not exported") — same fix as test_gekko_next/test_diff.
+        "SHELL:-s EXPORTED_RUNTIME_METHODS=['HEAPU8','HEAP8','HEAP16','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']"
         "SHELL:-s DEFAULT_LIBRARY_FUNCS_TO_INCLUDE=[]"
     )
     target_compile_options(test_perf_t1 PRIVATE "-pthread")
