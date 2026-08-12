@@ -148,7 +148,7 @@ inline bool IsBlockTerminator(u32 inst)
 //   0x026B3484  u32  last live ctx_ptr at a matching compile (bake target)
 //   0x026B3488  u32  asset baked_ctx echo
 //   0x026B348C  u32  load status: 1 ok, 0x8000000x = parse error code
-struct AotEntry { std::vector<u8> wasm; u32 gspan = 0; u32 ghash = 0; u32 cycles = 0; };
+struct AotEntry { std::vector<u8> wasm; std::vector<u32> gwords; u32 gspan = 0; u32 ghash = 0; u32 cycles = 0; };
 std::unordered_map<u32, AotEntry> g_aot_blocks;
 u32  g_aot_baked_ctx = 0;
 bool g_aot_loaded    = false;
@@ -217,8 +217,19 @@ void AotLoadFromMemory(const u8* data, u32 len)
     tbl[i].cycles = AotRd32LE(data + off); off += 4u;
     tbl[i].wlen   = AotRd32LE(data + off); off += 4u;
   }
-  // Skip the guest-words region (gspan words per block).
-  for (u32 i = 0; i < n; ++i) off += tbl[i].gspan * 4u;
+  // Guest-words region (gspan words per block) — kept for exact-compare
+  // authentication (the ghash is a fast pre-filter; the words are the authority).
+  std::vector<std::vector<u32>> words(n);
+  for (u32 i = 0; i < n; ++i)
+  {
+    if (static_cast<u64>(off) + static_cast<u64>(tbl[i].gspan) * 4ull > len)
+    {
+      *AotCell(0x026B348Cu) = 0x80000005u;
+      return;
+    }
+    words[i].resize(tbl[i].gspan);
+    for (u32 j = 0; j < tbl[i].gspan; ++j) { words[i][j] = AotRd32LE(data + off); off += 4u; }
+  }
   for (u32 i = 0; i < n; ++i)
   {
     if (static_cast<u64>(off) + tbl[i].wlen > len)
@@ -228,6 +239,7 @@ void AotLoadFromMemory(const u8* data, u32 len)
     }
     AotEntry e;
     e.wasm.assign(data + off, data + off + tbl[i].wlen);
+    e.gwords = std::move(words[i]);
     e.gspan = tbl[i].gspan;
     e.ghash = tbl[i].ghash;
     e.cycles = tbl[i].cycles;
@@ -842,8 +854,14 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
     {
       *AotCell(0x026B3484u) = ctx_ptr;  // publish the live &ppc_state (bake target)
       const bool ctx_ok  = (g_aot_baked_ctx == ctx_ptr);
-      const bool hash_ok = (count == it->second.gspan &&
-                            AotGuestHash(insts.data(), count) == it->second.ghash);
+      // Authenticate the guest code: span + FNV hash (fast pre-filter) THEN a
+      // full word-for-word compare (collision-proof authority). The offline tool
+      // stores the exact guest words the block was compiled from.
+      bool hash_ok = (count == it->second.gspan &&
+                      AotGuestHash(insts.data(), count) == it->second.ghash &&
+                      it->second.gwords.size() == count);
+      for (u32 i = 0; hash_ok && i < count; ++i)
+        if (insts[i] != it->second.gwords[i]) hash_ok = false;
       if (hash_ok && ctx_ok)
       {
         bytes = it->second.wasm;

@@ -3662,6 +3662,15 @@ static bool run_psmtxro_case(const uint32_t* romtx, const uint32_t* src, u32 cou
 }
 
 static bool test_psmtxro_goldens() {
+    // [AOT A2] Emit in the EXACT context the offline AOT tool uses
+    // (gamecube/bementalJIT/tools/aot_compile.cpp): g_hle_hook_query returning
+    // false for the un-hooked PSMTX PCs + instr_pcs=null (run_psmtxro already
+    // passes null). Passing 26/26 here proves build_block_next(PSMTX, hle=false)
+    // — the asset's exact emit — is native-bit-exact, so the shipped psmtxro.bjaot
+    // blocks are correct (ctx placement is separately guaranteed: PowerPCState is
+    // pinned at 0x02400000 via dolphin_set_ppc_state_external_storage).
+    const auto saved_query = bemental::powerpc::g_hle_hook_query;
+    bemental::powerpc::g_hle_hook_query = [](u32) -> bool { return false; };
     u32 pass = 0, fail = 0;
     for (unsigned k = 0; k < k_psmtx_goldens_n; ++k) {
         const PsmtxGolden& g = k_psmtx_goldens[k];
@@ -3679,7 +3688,8 @@ static bool test_psmtxro_goldens() {
                         g.name, g.count, bad, dst[bad], g.dst[bad]);
         }
     }
-    std::printf("[psmtxro-gold] %u/%u goldens bit-exact (generic JIT vs native)\n", pass, pass + fail);
+    bemental::powerpc::g_hle_hook_query = saved_query;
+    std::printf("[psmtxro-gold] %u/%u goldens bit-exact (generic JIT vs native, hle=false = AOT asset settings)\n", pass, pass + fail);
     return fail == 0;
 }
 
