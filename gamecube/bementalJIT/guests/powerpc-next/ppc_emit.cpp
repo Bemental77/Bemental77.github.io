@@ -15,6 +15,7 @@
 
 #include "ppc_emit.h"
 
+#include <cstdio>   // std::snprintf (export-name gen) — transitive under emscripten, explicit for native AOT builds
 #include "bementalJIT/types.h"
 #include "bementalJIT/wasm_module_builder.h"
 #include "code_op.h"
