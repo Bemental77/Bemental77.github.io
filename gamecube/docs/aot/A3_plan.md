@@ -105,6 +105,23 @@ SAB publish tag-last → `AotPollAndLoad` on EmuThread).
   `m_sealed_gen_count` as the next index → never picks 0xa07; compaction/relink operate on their
   own region gen → never touch 0xa07. (Minimal block_cache.cpp edits; recipe copied, not refactored.)
 
+### Timing gate result — HandleReverb (asset #1), 2026-08-12
+
+Counter-free asset, PC-sample share on the SAME MP4 board savestate (like-for-like call
+distribution), AOT-on vs AOT-off(kill): **JIT 6.14% → AOT 5.04% = −18% body time. PASS
+(AOT ≤ JIT).** The merged path updates ppc_state.pc (share > 0), so the PC-sample IS a valid
+per-asset timing instrument here — and this is a per-asset measure, NOT scene fps (HandleReverb's
+predicted +0.7 fps is inside the board's ±1.8 noise, exactly why scene fps can't gate this).
+
+★CALIBRATION (honest, pre-registered vs measured): the merged emit reuses `emit_block_body_into`
+verbatim, so **−18% is the DISPATCH-savings + GPR-residency win ONLY — NOT a body-quality win.**
+The pre-registered 2–3× assumed a better BODY (hand-optimal SIMD vs generic emit). Whole-function
+merging alone does not deliver that; the body-quality lever for AOT is the **offline `wasm-opt`
+pass** (rider #1 — the runtime path never had it) and, for matrix functions, the singles-in-merged
+fix. So the Amdahl input recalibrates: leaf line 24% × ~1.2× (merge only) ≈ +4–5% board; reaching
+the pre-registered +13–19% needs the wasm-opt body pass layered on top. A3.1's next measurement
+question: how much does offline wasm-opt add on HandleReverb (asset #1's rider-#1 evaluation).
+
 **Acceptance #2 (SMC evicts the AOT gen) — comes FREE from reusing the recipe.** `evict(pc)`
 (block_cache.cpp:1131) → `unseal_pc_js(pc)` already per-PC drops the pc from `m_sealed_pcs` +
 `bemental_pc2gen` + the global dispatch cache + `g_bem_mrtag/mrslot`, for ANY sealed gen; the

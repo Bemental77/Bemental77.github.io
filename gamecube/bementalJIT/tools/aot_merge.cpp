@@ -55,6 +55,9 @@ static uint32_t branch_target(uint32_t w, uint32_t pc) {
 int main(int argc, char** argv) {
   const uint32_t ctx_ptr = (argc > 1) ? (uint32_t)strtoul(argv[1], nullptr, 0) : 0x02400000u;
   const char* out_path   = (argc > 2) ? argv[2] : "handlereverb.wasm";
+  // argv[3]=1 bakes the fn_k proof-of-run counter (skews timing — off by default;
+  // the counter-free asset is what ships and what the timing gate measures).
+  const uint32_t count_fnk = (argc > 3) ? (uint32_t)strtoul(argv[3], nullptr, 0) : 0u;
 
   const uint32_t entry = kHandleReverbEntry;
   const uint32_t n_words = (uint32_t)(sizeof(kHandleReverb) / sizeof(kHandleReverb[0]));
@@ -69,7 +72,7 @@ int main(int argc, char** argv) {
   // the HLE prologue; HandleReverb is scalar-FP so lc_base=0 (no singles spec).
   g_hle_hook_query = [](uint32_t) -> bool { return false; };
   g_bem_lc_base = 0u;
-  g_bem_aot_count_fnk = 1u;   // emit the fn_k proof-of-run counter into the AOT asset
+  g_bem_aot_count_fnk = count_fnk;   // fn_k proof-of-run counter (argv[3]; default OFF)
 
   // --- block starts: entry + EVERY internal branch target (forward conditionals
   // coalesce mid-block, but their TAKEN target is still a block start the merged
