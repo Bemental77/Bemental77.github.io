@@ -35,6 +35,8 @@
 #include <climits>
 #include <cstdint>
 #include <cstdlib>  // [WS-1 STEP-3] getenv/atoi for BEM_FP_RESIDENT_LOOP toggle
+#include <cstring>  // [AOT A1] std::memcmp for the asset magic
+#include <unordered_map>  // [AOT A1] the prebuilt-block registry
 #include <vector>
 
 #include <emscripten.h>
@@ -115,6 +117,142 @@ constexpr u32 kMaxBlockInsts = 64;
 inline bool IsBlockTerminator(u32 inst)
 {
   return bemental::powerpc::IsBlockTerminator(inst);
+}
+
+// ---------------------------------------------------------------------------
+// [AOT A1] Ahead-of-time block registry.
+//
+// Blocks are emitted OFFLINE by the native aot_compile tool
+// (gamecube/bementalJIT/tools/aot_compile.cpp) into a psmtxro.bjaot asset,
+// streamed in at boot by the worker glue (worker_funcs.js onRuntimeInitialized),
+// and handed to bem_aot_load. In TryCompileBlock a matching PC swaps the
+// prebuilt bytes for build_block_next's output — the point of AOT. A1 proves
+// the PIPELINE (async load -> integrity re-emit -> ctx-match -> swap ->
+// counters -> kill-switch), not fps; PSMTXROMultVecArray is ~1.6% of samples.
+//
+// PROXY_TO_PTHREAD constraint (see the onRuntimeInitialized note ~L94): wasm
+// file-statics are PER-INSTANCE. The JS fetch runs on the worker-main instance
+// but TryCompileBlock runs on the EmuThread pthread instance. So JS only
+// mallocs the bytes into SHARED linear memory and publishes (ptr,len) via SAB
+// cells; bem_aot_load is invoked FROM Run() (the pthread) so g_aot_blocks lives
+// on the instance that reads it. Same handshake shape as s_bridge_published.
+//
+// SAB cells (reserved 0x026B34xx, verified free 2026-08-12):
+//   0x026B3468  u32  asset ptr in shared heap (JS sets LAST = the trigger)
+//   0x026B346C  u32  asset byte length      (JS sets FIRST)
+//   0x026B3470  u32  blocks parsed from the asset (bem_aot_load)
+//   0x026B3474  u32  KILL switch: 0 = AOT active (default), nonzero = forced off
+//   0x026B3478  u32  swaps performed (AOT bytes registered instead of JIT)
+//   0x026B347C  u32  integrity mismatches (re-emit != asset -> safe fallback)
+//   0x026B3480  u32  ctx mismatches (asset baked_ctx != live &ppc_state)
+//   0x026B3484  u32  last live ctx_ptr at a matching compile (bake target)
+//   0x026B3488  u32  asset baked_ctx echo
+//   0x026B348C  u32  load status: 1 ok, 0x8000000x = parse error code
+struct AotEntry { std::vector<u8> wasm; u32 gspan = 0; u32 ghash = 0; u32 cycles = 0; };
+std::unordered_map<u32, AotEntry> g_aot_blocks;
+u32  g_aot_baked_ctx = 0;
+bool g_aot_loaded    = false;
+
+inline volatile u32* AotCell(u32 addr)
+{
+  return reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(addr));
+}
+inline u32 AotRd32LE(const u8* p)
+{
+  return static_cast<u32>(p[0]) | (static_cast<u32>(p[1]) << 8) |
+         (static_cast<u32>(p[2]) << 16) | (static_cast<u32>(p[3]) << 24);
+}
+inline void AotBump(u32 addr)  // volatile RMW without the C++20 ++volatile deprecation
+{
+  volatile u32* c = AotCell(addr);
+  *c = *c + 1u;
+}
+// FNV-1a over guest instruction words — the registration hash. MUST match the
+// offline tool (aot_compile.cpp): the emitter is context-sensitive so we cannot
+// bit-compare emitted wasm; instead we verify the GUEST CODE is what we AOT'd.
+inline u32 AotGuestHash(const u32* insts, u32 count)
+{
+  u32 h = 0x811c9dc5u;
+  for (u32 i = 0; i < count; ++i)
+    for (int k = 0; k < 4; ++k) { h ^= (insts[i] >> (8 * k)) & 0xFFu; h *= 0x01000193u; }
+  return h;
+}
+
+// Parse a psmtxro.bjaot v2 blob. MUST run on the EmuThread pthread instance.
+// Format: "BJAOT\0" | ver=2 u32 | baked_ctx u32 | n u32
+//   | n*(pc u32, gspan u32, ghash u32, cycles u32, wasm_len u32)
+//   | for each block: gspan guest words (skipped at load — the ghash covers them)
+//   | for each block: wasm_len bytes.
+void AotLoadFromMemory(const u8* data, u32 len)
+{
+  g_aot_blocks.clear();
+  g_aot_loaded = false;
+  *AotCell(0x026B3470u) = 0u;
+  if (!data || len < 18u || std::memcmp(data, "BJAOT", 6) != 0)
+  {
+    *AotCell(0x026B348Cu) = 0x80000001u;
+    return;
+  }
+  u32 off = 6u;
+  const u32 ver   = AotRd32LE(data + off); off += 4u;
+  g_aot_baked_ctx = AotRd32LE(data + off); off += 4u;
+  const u32 n     = AotRd32LE(data + off); off += 4u;
+  if (ver != 2u || n == 0u || n > 4096u)
+  {
+    *AotCell(0x026B348Cu) = 0x80000002u;
+    return;
+  }
+  if (static_cast<u64>(off) + static_cast<u64>(n) * 20ull > len)
+  {
+    *AotCell(0x026B348Cu) = 0x80000003u;
+    return;
+  }
+  struct Ent { u32 pc, gspan, ghash, cycles, wlen; };
+  std::vector<Ent> tbl(n);
+  for (u32 i = 0; i < n; ++i)
+  {
+    tbl[i].pc     = AotRd32LE(data + off); off += 4u;
+    tbl[i].gspan  = AotRd32LE(data + off); off += 4u;
+    tbl[i].ghash  = AotRd32LE(data + off); off += 4u;
+    tbl[i].cycles = AotRd32LE(data + off); off += 4u;
+    tbl[i].wlen   = AotRd32LE(data + off); off += 4u;
+  }
+  // Skip the guest-words region (gspan words per block).
+  for (u32 i = 0; i < n; ++i) off += tbl[i].gspan * 4u;
+  for (u32 i = 0; i < n; ++i)
+  {
+    if (static_cast<u64>(off) + tbl[i].wlen > len)
+    {
+      *AotCell(0x026B348Cu) = 0x80000004u;
+      return;
+    }
+    AotEntry e;
+    e.wasm.assign(data + off, data + off + tbl[i].wlen);
+    e.gspan = tbl[i].gspan;
+    e.ghash = tbl[i].ghash;
+    e.cycles = tbl[i].cycles;
+    off += tbl[i].wlen;
+    g_aot_blocks[tbl[i].pc] = std::move(e);
+  }
+  g_aot_loaded = true;
+  *AotCell(0x026B3470u) = n;
+  *AotCell(0x026B3488u) = g_aot_baked_ctx;
+  *AotCell(0x026B348Cu) = 1u;
+}
+
+// Called once from Run() (pthread) after JS publishes (ptr,len). One-shot:
+// consumes + clears the trigger cell + frees the shared buffer.
+void AotPollAndLoad()
+{
+  if (g_aot_loaded)
+    return;
+  const u32 ptr = *AotCell(0x026B3468u);   // trigger (JS writes this LAST)
+  if (ptr == 0u)
+    return;
+  const u32 len = *AotCell(0x026B346Cu);
+  AotLoadFromMemory(reinterpret_cast<const u8*>(static_cast<uintptr_t>(ptr)), len);
+  *AotCell(0x026B3468u) = 0u;               // consume the trigger
+  std::free(reinterpret_cast<void*>(static_cast<uintptr_t>(ptr)));
 }
 }  // namespace
 
@@ -260,6 +398,10 @@ void JitWasm::Run()
       s_bridge_published = true;
     }
   }
+  // [AOT A1] one-shot: pick up the psmtxro.bjaot bytes JS fetched + published
+  // into shared memory, and parse them ON THIS pthread instance (see the
+  // AotEntry registry note — file-statics are per-instance under PROXY_TO_PTHREAD).
+  AotPollAndLoad();
 #endif
 
   // Mirror canonical CachedInterpreter::Run: outer loop on CPU::State,
@@ -679,9 +821,50 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
   // guests/powerpc-next/ppc_emit.h:52-55. block_cycles receives the
   // analyzer's opinfo num_cycles sum (PPCAnalyzer stats.numCycles).
   u32 block_cycles = 0;
-  std::vector<u8> bytes = bemental::powerpc::build_block_next(
-      start_pc, insts.data(), count, ctx_ptr, mem1_base, mem1_mask, ram_size,
-      &block_cycles);
+  std::vector<u8> bytes;
+  bool used_aot = false;
+
+  // [AOT A1] Prebuilt-block swap via HASH-MATCHED registration. build_block_next
+  // is context-sensitive (identical guest insts emit different wasm depending on
+  // runtime state: HLE-wrapping, lc-specialization, singles-spec) — proven by
+  // measurement — so we CANNOT authenticate by re-emitting and byte-comparing.
+  // Instead we hash the LIVE-decoded guest instruction words and match them
+  // against the asset's per-block (gspan, ghash): this confirms the guest code
+  // at start_pc is exactly what we compiled offline. The offline block is the
+  // UNSPECIALIZED general path (lc_base=0, slowmem) — golden-validated correct
+  // in ALL runtime states. With a guest-hash match, a matching baked_ctx, and
+  // the KILL switch off, we register the prebuilt bytes instead of JIT'ing.
+  // Any mismatch falls through to the normal JIT emit — the swap is never unsafe.
+  if (g_aot_loaded && *AotCell(0x026B3474u) == 0u)
+  {
+    auto it = g_aot_blocks.find(start_pc);
+    if (it != g_aot_blocks.end())
+    {
+      *AotCell(0x026B3484u) = ctx_ptr;  // publish the live &ppc_state (bake target)
+      const bool ctx_ok  = (g_aot_baked_ctx == ctx_ptr);
+      const bool hash_ok = (count == it->second.gspan &&
+                            AotGuestHash(insts.data(), count) == it->second.ghash);
+      if (hash_ok && ctx_ok)
+      {
+        bytes = it->second.wasm;
+        block_cycles = it->second.cycles;
+        used_aot = true;
+        AotBump(0x026B3478u);  // hit
+      }
+      else
+      {
+        if (!hash_ok) AotBump(0x026B347Cu);  // guest-hash mismatch
+        if (!ctx_ok)  AotBump(0x026B3480u);  // ctx mismatch
+      }
+    }
+  }
+
+  if (!used_aot)
+  {
+    bytes = bemental::powerpc::build_block_next(
+        start_pc, insts.data(), count, ctx_ptr, mem1_base, mem1_mask, ram_size,
+        &block_cycles);
+  }
 
   if (bytes.empty())
     return false;

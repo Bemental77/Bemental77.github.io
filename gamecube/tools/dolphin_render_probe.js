@@ -1181,6 +1181,36 @@ function startServer() {
     }, parseInt(process.env.PROBE_STATE_SIZE_MS, 10));
   }
 
+  // ---- [AOT A1] prebuilt-block registry telemetry (absolute SAB cells) -----
+  // PROBE_AOT=<pollMs>: dump the AOT registry/swap counters every pollMs. Reads
+  // 0x026B3468..0x026B348C (see JitWasm.cpp AotEntry note). Read-only probe-side.
+  if (process.env.PROBE_AOT) {
+    const pollMs = parseInt(process.env.PROBE_AOT, 10) || 2000;
+    const killReq = process.env.PROBE_AOT_KILL === '1';
+    const dumpAot = async () => {
+      try {
+        const r = await page.evaluate((doKill) => {
+          if (!window.sharedMemory) return null;
+          const A = new Uint32Array(window.sharedMemory.buffer);
+          const rd = (a) => A[a >> 2] >>> 0;
+          if (doKill) A[0x026B3474 >> 2] = 1;  // KILL switch on: force JIT path
+          return {
+            ptr: rd(0x026B3468), len: rd(0x026B346C), n: rd(0x026B3470),
+            kill: rd(0x026B3474), hits: rd(0x026B3478), integ_mm: rd(0x026B347C),
+            ctx_mm: rd(0x026B3480), live_ctx: rd(0x026B3484),
+            baked_ctx: rd(0x026B3488), status: rd(0x026B348C),
+          };
+        }, killReq);
+        if (r) console.log('[aot] n=' + r.n + ' status=0x' + r.status.toString(16) +
+          ' hits=' + r.hits + ' hash_mm=' + r.integ_mm + ' ctx_mm=' + r.ctx_mm +
+          ' live_ctx=0x' + r.live_ctx.toString(16) + ' baked_ctx=0x' + r.baked_ctx.toString(16) +
+          ' kill=' + r.kill);
+      } catch (e) { console.log('[aot] peek failed: ' + e.message); }
+    };
+    const aotTimer = setInterval(dumpAot, pollMs);
+    if (typeof cleanupFns !== 'undefined') cleanupFns.push(() => clearInterval(aotTimer));
+  }
+
   // ---- checkpoint: resume the slow boot from IndexedDB ---------------------
   // PROBE_LOAD_IDB_MS=<ms>: restore the saved checkpoint (SAVE_KEY) so the run
   // continues from where a prior run left off (needs PROBE_PROFILE_DIR).
