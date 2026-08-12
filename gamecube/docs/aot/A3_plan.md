@@ -116,11 +116,23 @@ predicted +0.7 fps is inside the board's ±1.8 noise, exactly why scene fps can'
 ★CALIBRATION (honest, pre-registered vs measured): the merged emit reuses `emit_block_body_into`
 verbatim, so **−18% is the DISPATCH-savings + GPR-residency win ONLY — NOT a body-quality win.**
 The pre-registered 2–3× assumed a better BODY (hand-optimal SIMD vs generic emit). Whole-function
-merging alone does not deliver that; the body-quality lever for AOT is the **offline `wasm-opt`
-pass** (rider #1 — the runtime path never had it) and, for matrix functions, the singles-in-merged
-fix. So the Amdahl input recalibrates: leaf line 24% × ~1.2× (merge only) ≈ +4–5% board; reaching
-the pre-registered +13–19% needs the wasm-opt body pass layered on top. A3.1's next measurement
-question: how much does offline wasm-opt add on HandleReverb (asset #1's rider-#1 evaluation).
+merging alone does not deliver that. So the Amdahl input recalibrates: leaf line 24% × ~1.2×
+(merge only) ≈ **+4–5% board** — the merge is necessary infrastructure, not the multiplier.
+
+**Where the multiplier actually lives — two levers, honestly priced:**
+- **wasm-opt (offline post-pass, rider #1) — pre-registered ~10–30%, NOT 2–3×.** Binaryen is
+  deliberately conservative with SHARED-memory loads/stores (it may not freely eliminate them) and
+  the singles dual-arm branches are RUNTIME-GUARDED, not statically dead — and those are precisely
+  the two biggest tax classes in the emitted bodies. Both sit largely outside a post-pass's reach.
+  Run the evaluation (one cheap pass on the existing asset through the existing timing gate) but do
+  NOT plan the line on it; if it surprises upward, bonus.
+- **★A3.1b — function-scope register RESIDENCY in the emit itself = the true multiplier (3–4×).**
+  ctx→locals ONCE at function entry; per-block bodies read/write LOCALS, not memory; flush only at
+  exits, service points, and import calls. This removes the per-op ctx traffic the cycle ledger
+  identified as the STRUCTURAL core of the 5–6× cost (the true §6.5 shape). The merge infrastructure
+  just built IS its delivery vehicle, and the full validation net (goldens, shadow-verify, timing
+  gate) already stands to keep it honest. Substantial emitter work — the real kind — and where the
+  3–4×/function the Amdahl line demands lives.
 
 **Acceptance #2 (SMC evicts the AOT gen) — comes FREE from reusing the recipe.** `evict(pc)`
 (block_cache.cpp:1131) → `unseal_pc_js(pc)` already per-PC drops the pc from `m_sealed_pcs` +
@@ -162,6 +174,19 @@ singles bug, while the singles-in-merged-bodies fix lands for the matrix family 
    pc map for the asset-loaded module.
 4. **HandleReverb asset** + offline direct-invocation goldens (characterize its MusyX reverb ABI
    from the decomp: reverb work-struct pointer + I/O buffers) + the live timing gate.
-5. Singles-arm-in-merged fix → wire the matrix family (PSMTX*, C_MTX*, …).
-6. Walk the rest of the leaf line (stateful → live shadow-verify). Batch MIPS gate.
-7. A3.2 design from A3.1's measured per-function speedups → the road to 60.
+5. ✅ A3.1 HandleReverb asset COMPLETE: execution (5.8M) + timing (−18%) + immutability (#1) +
+   SMC evict (#2). Cold-boot clean, cross-game safe. (commits 3e06d43 / 3f59a6a / ebdc815)
+
+### Updated order (post-calibration, 2026-08-12)
+
+1. **Singles-in-merged fix** (existential, unchanged) — ppc_emit.cpp:1093, the step-0 −38%
+   mechanism. Acceptance: a merged MATRIX body executing the singles arm via **simdCensus
+   attribution**. Gates the matrix family.
+2. **wasm-opt evaluation** — one pass on the HandleReverb asset through the timing gate.
+   Pre-registered **~10–30%, not 2–3×** (Binaryen can't touch shared-mem loads/stores or the
+   runtime-guarded dual-arm branches — the two biggest tax classes).
+3. **A3.1b go/no-go** — function-scope register residency (ctx→locals at entry; the true 3–4×);
+   decided by (2)'s number + the residency thesis. The merge infra is its delivery vehicle.
+4. **Generalize `aot_merge`** down `a31_leaf_line.json` with whichever body path won.
+5. **A3.2** — call-bearing machinery (FaceDraw/HuSprDisp/Hu3DMotionExec… ~half the board) = where
+   A4's 60 lives, on the proven substrate.
