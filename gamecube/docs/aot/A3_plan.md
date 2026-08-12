@@ -84,6 +84,35 @@ identical to A1's per-block correctness path. Authenticity: each block carries a
 3. **Per-asset gate = in-situ AOT-vs-JIT body timing + correctness**, scene fps only at batch
    milestones (~every +10% cumulative coverage, and A4).
 
+### Loader seal design (acceptance-driven — investigated 2026-08-12, before building)
+
+Reserved AOT gen `0xa07` (no collision with runtime gens 0..23). The seal copies the
+`region_seal` recipe (above) into `BlockCache::aot_seal_merged`, with FNV per-block auth done in
+JitWasm (read live guest words at each pc via `mem.Read_U32`, compare to the asset ghash; any
+mismatch → skip the whole seal, JIT fallback). Load path = A1's exactly (async fetch on pump →
+SAB publish tag-last → `AotPollAndLoad` on EmuThread).
+
+**Acceptance #1 (immutability respected by the runtime) — the hazard investigation found two:**
+- **`BlockCache::clear()` (savestate load / DoState, block_cache.cpp:1227-1249) WIPES ALL gens**
+  incl. the AOT gen (`bemental_gens=[]`, `m_sealed_pcs.clear()`, `pc2gen.clear()`). The probe
+  USES `PROBE_LOAD_STATE`, so without a response the AOT gen vanishes at load and HandleReverb
+  silently runs JIT. FIX: **re-seal after clear()** — Run() re-fires the seal when the asset is
+  loaded but `m_aot_sealed` is false; `clear()` also resets `m_aot_gen_count=0`/`m_aot_sealed`.
+  Re-seal re-auths (FNV) so a state that changed the code can't run stale.
+- **24-gen budget**: the AOT seal must NOT consume a runtime slot. Track `m_aot_gen_count`
+  SEPARATELY; `region_dispatch`'s cold gate becomes `(m_sealed_gen_count + m_aot_gen_count) == 0`;
+  the allocation cap stays `m_sealed_gen_count < 24` (AOT uncounted). Runtime allocation uses
+  `m_sealed_gen_count` as the next index → never picks 0xa07; compaction/relink operate on their
+  own region gen → never touch 0xa07. (Minimal block_cache.cpp edits; recipe copied, not refactored.)
+
+**Acceptance #2 (SMC evicts the AOT gen) — comes FREE from reusing the recipe.** `evict(pc)`
+(block_cache.cpp:1131) → `unseal_pc_js(pc)` already per-PC drops the pc from `m_sealed_pcs` +
+`bemental_pc2gen` + the global dispatch cache + `g_bem_mrtag/mrslot`, for ANY sealed gen; the
+comment: "per-PC eviction is SUFFICIENT for merged gens (no baked edges)." So a write into
+HandleReverb's range → `InvalidateICacheRange` → `invalidate_overlap`/`evict` → region_dispatch
+misses → per-block JIT recompile. **Scripted test**: write one byte into the guest range, assert
+the AOT hit-counter stops climbing and a JIT recompile of those PCs occurs.
+
 ## ★ Singles-arm precondition (existential — gates every matrix function)
 
 `emit_block_body_into` under `MergedRegionCtx` is flagged (ppc_emit.cpp:1093) to lose the
