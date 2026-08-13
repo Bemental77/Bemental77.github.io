@@ -537,14 +537,13 @@ void JitWasm::Run()
   // AotEntry registry note — file-statics are per-instance under PROXY_TO_PTHREAD).
   AotPollAndLoad();
   AotMergedPoll();
-  // [AOT A3.1] re-seal cadence: cheap aot_is_sealed() check every entry; the
-  // auth+seal (bounded guest-code reads) fires only until the gen is live and
-  // again after a clear() (savestate load). Low cadence bounds the auth cost.
-  {
-    static u32 s_aotm_tick = 0u;
-    if (!m_wasm_cache.aot_is_sealed() && (s_aotm_tick++ & 0xFFu) == 0u)
-      AotMergedTrySeal(m_wasm_cache, mem, ctx_ptr);
-  }
+  // [AOT A3.1 re-seal — MOVED INTO THE PER-SLICE LOOP 2026-08-13] The Run()-entry
+  // region runs ONLY ONCE (see the SMC-poll note in the loop). A savestate load
+  // calls clear() (unseal) from INSIDE the while loop (DoState serviced on the
+  // EmuThread via bem_chain_loop_c), so an entry-region re-seal was never
+  // re-reached post-load — AOT stayed off for the rest of the session (seals
+  // pinned at 1, DISPATCHES flat past the ~25s load). The re-seal now lives in
+  // the loop below so it re-fires after a mid-loop clear().
 #endif
 
   // Mirror canonical CachedInterpreter::Run: outer loop on CPU::State,
@@ -580,6 +579,16 @@ void JitWasm::Run()
         *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B34D0u)) = 1u;
         *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B34C8u)) = 0u;
       }
+    }
+    // [AOT A3.1 re-seal 2026-08-13] Per-slice, low cadence. Re-seals after a
+    // mid-loop clear() (savestate load unseals via DoState-on-EmuThread) so AOT
+    // resumes in the loaded scene — seals >= 2 across a load boundary, DISPATCHES
+    // resume. aot_is_sealed() makes it a cheap no-op once the gen is live; the
+    // FNV re-auth in AotMergedTrySeal keeps a code-changing state from running stale.
+    {
+      static u32 s_aotm_reseal_tick = 0u;
+      if (!m_wasm_cache.aot_is_sealed() && (s_aotm_reseal_tick++ & 0xFFu) == 0u)
+        AotMergedTrySeal(m_wasm_cache, mem, ctx_ptr);
     }
 #endif
     // [ee-race fix 2026-07-02] NOTE: Advance must keep RUNNING under worker
