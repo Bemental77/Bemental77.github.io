@@ -144,19 +144,9 @@ static constexpr u32 LOCAL_TMP_B_CHAIN  = 1u;       // build_block_next i32 scra
 // polls otherwise burn whole slices at real cycle cost, the historic JS-ring
 // wedge). Threshold high enough that hot COMPUTE loops (downcount-bounded well
 // below it per entry) never trip it in practice.
-struct MergedRegionCtx {
-    u32 gen_idx;          // this gen's index (packed-slot ownership check)
-    u32 region_func_idx;  // module-local func index of $region (cold re-entry)
-    u32 sel_global_idx;   // entry_sel mutable-i32 global index
-    u32 laps_global_idx;  // lap-counter mutable-i32 global index
-    // [region-resident 2026-07-15] Warm edges are `br` back to the region LOOP
-    // (same activation — locals persist, enabling GPR residency; a return_call
-    // would reset locals to zero). br immediate from an edge site =
-    // bodyBuilder.ctrlDepth() + br_extra_depth, where br_extra_depth =
-    // (n_blocks - k) accounts for body k's splice nesting (loop + $DEF +
-    // the (n-1-k) enclosing $B blocks, minus the loop interior itself).
-    u32 br_extra_depth;   // per-body splice offset (set by the merged builder)
-};
+// [order 13d] MergedRegionCtx moved to jit_branch.h (included above) so
+// emit_coalesced_taken_exit can route merged mid-block taken exits through the
+// same warm cascade.
 static constexpr u32 REGION_LAP_MAX = 2048u;
 
 // [AOT v4 reloc 2026-08-13] Native-static address const. A native offline tool's
@@ -189,15 +179,17 @@ static inline void emit_exit_census(WasmModuleBuilder& b, u32 cell) {
     b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
 }
 
-static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
-                                 u32 tag_addr_ovr = 0u, u32 slot_addr_ovr = 0u,
-                                 const MergedRegionCtx* merged = nullptr,
-                                 s32 region_gen = -1,
-                                 const u32* direct_pcs = nullptr,
-                                 const u32* direct_fidx = nullptr,
-                                 u32 n_direct = 0u,
-                                 u16 tag_sym = (u16)BEM_RSYM_NONE,
-                                 u16 slot_sym = (u16)BEM_RSYM_NONE) {
+// [order 13d] non-static (declared in jit_branch.h) so emit_coalesced_taken_exit
+// can call it; defaults live in the header declaration only.
+void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
+                          u32 tag_addr_ovr, u32 slot_addr_ovr,
+                          const MergedRegionCtx* merged,
+                          s32 region_gen,
+                          const u32* direct_pcs,
+                          const u32* direct_fidx,
+                          u32 n_direct,
+                          u16 tag_sym,
+                          u16 slot_sym) {
     if (!g_bem_chain_enabled) {
         b.op_i32_const((s32)ctx_ptr);
         b.op_i32_load(ppc_off::PC);
@@ -1548,7 +1540,11 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             // successor). Unreachable on non-fused paths (the analyzer breaks
             // at backward conditionals there).
             emit_bcx(b, rc, frc, op, ctx_ptr, /*is_terminal=*/false,
-                     BitSet32(0), params.cmp_fuse);
+                     BitSet32(0), params.cmp_fuse,
+                     // [order 13d] thread the merged region so the mid-block taken
+                     // exit warm-chains (br $L) instead of op_return-ing to the C loop.
+                     merged, region_gen, chain_tag_addr, chain_slot_addr,
+                     chain_tag_sym, chain_slot_sym);
             emitted_native = true;
         } else if (is_terminator && resident_loop_arm) {
             // [PM53h int-fusion / WS-1 STEP-3] fused back-edge terminal (see emit_bcx_fused).

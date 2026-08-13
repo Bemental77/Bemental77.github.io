@@ -7,6 +7,7 @@
 // the read-PC-and-return after Flush.
 
 #include "bementalJIT/types.h"
+#include "bementalJIT/region_desc.h"  // [order 13d] BemRelocSym (BEM_RSYM_NONE) for merged-aware branch exits
 #include "code_op.h"
 #include "cr_shadow.h"        // [PM57] CmpFuse
 #include "fpr_reg_cache.h"
@@ -15,6 +16,35 @@
 class WasmModuleBuilder;
 
 namespace bemental::powerpc {
+
+// [region-merged 2026-07-15; moved here for order 13d merged-aware branch exits]
+// Context for emitting a block body INTO the merged single-function region.
+struct MergedRegionCtx {
+    u32 gen_idx;          // this gen's index (packed-slot ownership check)
+    u32 region_func_idx;  // module-local func index of $region (cold re-entry)
+    u32 sel_global_idx;   // entry_sel mutable-i32 global index
+    u32 laps_global_idx;  // lap-counter mutable-i32 global index
+    // [region-resident 2026-07-15] Warm edges are `br` back to the region LOOP
+    // (same activation — locals persist, enabling GPR residency; a return_call
+    // would reset locals to zero). br immediate from an edge site =
+    // bodyBuilder.ctrlDepth() + br_extra_depth, where br_extra_depth =
+    // (n_blocks - k) accounts for body k's splice nesting (loop + $DEF +
+    // the (n-1-k) enclosing $B blocks, minus the loop interior itself).
+    u32 br_extra_depth;   // per-body splice offset (set by the merged builder)
+};
+
+// [order 13d] The block-epilogue chain-or-return cascade (defined in ppc_emit.cpp).
+// Declared here so emit_coalesced_taken_exit (jit_branch.cpp) can route a merged
+// mid-block taken exit through the SAME warm cascade instead of op_return.
+void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
+                          u32 tag_addr_ovr = 0u, u32 slot_addr_ovr = 0u,
+                          const MergedRegionCtx* merged = nullptr,
+                          s32 region_gen = -1,
+                          const u32* direct_pcs = nullptr,
+                          const u32* direct_fidx = nullptr,
+                          u32 n_direct = 0u,
+                          u16 tag_sym = (u16)BEM_RSYM_NONE,
+                          u16 slot_sym = (u16)BEM_RSYM_NONE);
 
 
 // Unconditional. LK=1 sets LR = next_pc; LK=0 doesn't touch LR.
@@ -39,10 +69,17 @@ void emit_bx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp
 // [PM57 cmp-fuse] fuse: when non-null and valid for THIS branch's CR field, the
 // CR-bit conditional arm emits a direct operand compare from the preceding cmp's
 // locals instead of the pending-check+materialize read. nullptr = no fusion.
+// [order 13d] merged/region args: when merged != nullptr AND is_terminal == false,
+// the mid-block coalesced taken exit routes through emit_chain_or_return's warm
+// cascade (entry_sel=k; br $L, GPR locals live) instead of op_return to the C loop
+// (artifact #4). Defaults reproduce the legacy per-block behavior.
 void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
               u32 ctx_ptr, bool is_terminal = true,
               BitSet32 fpr_flush_skip = BitSet32(0),
-              const CmpFuse* fuse = nullptr);
+              const CmpFuse* fuse = nullptr,
+              const MergedRegionCtx* merged = nullptr, s32 region_gen = -1,
+              u32 chain_tag_addr = 0u, u32 chain_slot_addr = 0u,
+              u16 chain_tag_sym = (u16)BEM_RSYM_NONE, u16 chain_slot_sym = (u16)BEM_RSYM_NONE);
 
 // [PM53h int-fusion] Terminal bcx of a fused integer self-loop: taken arm
 // re-enters the enclosing wasm loop (br) behind a downcount/exception/

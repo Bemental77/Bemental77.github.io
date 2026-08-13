@@ -68,7 +68,12 @@ static inline void emit_exit_census_jb(WasmModuleBuilder& wb, u32 cell) {
 // emit_coalesced_taken_exit — the taken arm of a mid-block (is_terminal=false)
 // forward conditional branch: drain a pending gather-pipe write, then return
 // the just-stored target PC to the dispatcher. PC=target must already be stored.
-static void emit_coalesced_taken_exit(WasmModuleBuilder& wb, u32 ctx_ptr) {
+static void emit_coalesced_taken_exit(WasmModuleBuilder& wb, u32 ctx_ptr,
+                                      const MergedRegionCtx* merged = nullptr,
+                                      s32 region_gen = -1,
+                                      u32 chain_tag_addr = 0u, u32 chain_slot_addr = 0u,
+                                      u16 chain_tag_sym = (u16)BEM_RSYM_NONE,
+                                      u16 chain_slot_sym = (u16)BEM_RSYM_NONE) {
     emit_gp_dirty_addr(wb);
     wb.op_i32_load(0);
     wb.op_if();                       // void block (0x40)
@@ -83,10 +88,20 @@ static void emit_coalesced_taken_exit(WasmModuleBuilder& wb, u32 ctx_ptr) {
     wb.op_i32_const((s32)0x026B38C0);
     wb.op_i32_const(0);
     wb.op_i32_store(0);
-    emit_exit_census_jb(wb, 0x026B34D8u);   // [census] coalesced_taken_exit — THE artifact #4 site
-    wb.op_i32_const((s32)ctx_ptr);
-    wb.op_i32_load(ppc_off::PC);
-    wb.op_return();
+    // [order 13d] merged: route the taken exit through the SAME warm cascade as the
+    // block epilogue (PC=target already stored above; probe mrtag/mrslot -> own-gen
+    // warm entry_sel=k; br $L with GPR locals live -> else global-fallback in-wasm
+    // chain -> host return) INSTEAD of op_return-ing to the C loop (artifact #4). The
+    // warm br depth auto-adjusts via ctrlDepth() to the enclosing taken op_if.
+    if (merged) {
+        emit_chain_or_return(wb, ctx_ptr, chain_tag_addr, chain_slot_addr, merged,
+                             region_gen, nullptr, nullptr, 0u, chain_tag_sym, chain_slot_sym);
+    } else {
+        emit_exit_census_jb(wb, 0x026B34D8u);   // [census] only the non-merged op_return path (post-fix: taken collapses)
+        wb.op_i32_const((s32)ctx_ptr);
+        wb.op_i32_load(ppc_off::PC);
+        wb.op_return();
+    }
 }
 
 // Write a compile-time-constant value to a PowerPCState field. Stack-neutral.
@@ -270,7 +285,10 @@ static void emit_crbit_fused(WasmModuleBuilder& wb, const CmpFuse& f,
 // ---------------------------------------------------------------------------
 void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeOp& op,
               u32 ctx_ptr, bool is_terminal, BitSet32 fpr_flush_skip,
-              const CmpFuse* fuse) {
+              const CmpFuse* fuse,
+              const MergedRegionCtx* merged, s32 region_gen,
+              u32 chain_tag_addr, u32 chain_slot_addr,
+              u16 chain_tag_sym, u16 chain_slot_sym) {
     const u32 inst = op.inst;
     const u32 bo   = GekkoOperands::BO(inst);
 
@@ -335,7 +353,9 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
         if (is_bdnz) wb.op_i32_ne(); else wb.op_i32_eq();
         wb.op_if();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, target);
-            if (!is_terminal) emit_coalesced_taken_exit(wb, ctx_ptr);
+            if (!is_terminal) emit_coalesced_taken_exit(wb, ctx_ptr, merged, region_gen,
+                                                        chain_tag_addr, chain_slot_addr,
+                                                        chain_tag_sym, chain_slot_sym);
         if (is_terminal) {
             wb.op_else();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, fallthrough);
@@ -366,7 +386,9 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
             // [coalesce] mid-block: taken drains a pending GP write + returns to
             // the dispatcher; the not-taken arm stores nothing and the block
             // continues with the fall-through instructions.
-            if (!is_terminal) emit_coalesced_taken_exit(wb, ctx_ptr);
+            if (!is_terminal) emit_coalesced_taken_exit(wb, ctx_ptr, merged, region_gen,
+                                                        chain_tag_addr, chain_slot_addr,
+                                                        chain_tag_sym, chain_slot_sym);
         if (is_terminal) {
             wb.op_else();
             emit_store_const_to_ctx(wb, ctx_ptr, ppc_off::PC, fallthrough);
