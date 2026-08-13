@@ -208,6 +208,12 @@ static const int _bem_disp_cache_init = []() {
 // through TryCompileBlock. Populated by register_pc_handle, erased by
 // release_raw, cleared by BlockCache::clear.
 static std::unordered_map<uint32_t, int> g_bem_pc_handle;   // pc  -> handle(slot)
+// [AOT A3.1 dispatch precedence] collision-free pc -> AOT gen fn_k wasmTable slot.
+// AOT-sealed PCs have NO per-block handle, so a direct-mapped bucket alias/interior
+// entry MISSES and the per-block path would STEAL the PC. The chain miss-path
+// re-asserts from this map instead (self-healing); a steal counter (0x026B34D4)
+// makes any residual coverage loss visible per asset.
+static std::unordered_map<uint32_t, uint32_t> g_bem_aot_pc_slot;
 static std::unordered_map<int, uint32_t> g_bem_handle_pc;   // handle -> pc
 
 // [single-spec PM26] Sticky per-pc force-double registry: a block whose
@@ -824,8 +830,21 @@ s32 bem_chain_loop_c(u32 pc, u32 max, u32* final_pc, u32* trap_pc,
             handle = g_bem_disp_slot[bkt];
         } else {
             auto it = g_bem_pc_handle.find(pc);
-            if (it == g_bem_pc_handle.end()) break;          // uncompiled -> host compiles
-            handle = it->second;
+            if (it == g_bem_pc_handle.end()) {
+                // [AOT A3.1 re-assert] AOT-sealed PCs have no per-block handle, so a
+                // bucket alias/interior entry misses here. Before falling through to
+                // a per-block compile that would STEAL the PC from its gen, re-point
+                // the bucket at the gen slot and dispatch it — self-healing. Count
+                // the steal-that-didn't-happen (0x026B34D4) so under-coverage shows.
+                auto ai = g_bem_aot_pc_slot.find(pc);
+                if (ai == g_bem_aot_pc_slot.end()) break;    // truly uncompiled -> host compiles
+                handle = (int)ai->second;
+                g_bem_disp_tag[bkt]  = pc;
+                g_bem_disp_slot[bkt] = handle;
+                *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B34D4u)) += 1u;
+            } else {
+                handle = it->second;
+            }
         }
         // [AOT A3.1] proof-of-run: count chain dispatches into the sealed AOT gen's
         // fn_k slot range (contiguous wasmTable indices published by aot_seal_merged).
@@ -1153,6 +1172,7 @@ void BlockCache::evict(u64 key) {
     // (block_cache.cpp:1849) is unaffected for the PCs still sealed.
     const u32 pc = static_cast<u32>(key);
     m_sealed_pcs.erase(pc);
+    g_bem_aot_pc_slot.erase(pc);
     m_pending_emit.erase(pc);
     // [region-merged 2026-07-15] Clear the merged-gen probe bucket (tag-guard)
     // so no sealed body warm-edges into the evicted PC's stale arm. Runtime-
@@ -1241,6 +1261,7 @@ void BlockCache::clear() {
     // fresh FNV auth) once m_aot_sealed is false again.
     m_aot_gen_count = 0u;
     m_aot_sealed = false;
+    g_bem_aot_pc_slot.clear();       // [AOT A3.1] gen dies with clear(); re-seal repopulates
     m_fused_succ_to_pred.clear();   // [PM54f] fusion mappings die with the gens
 #ifdef __EMSCRIPTEN__
     EM_ASM({
@@ -1282,6 +1303,7 @@ void BlockCache::invalidate_overlap(u32 addr, u32 max_block_bytes) {
             // (gated on m_sealed_pcs, run BEFORE chain_dispatch), so the
             // recompiled block never runs after a self-modifying write.
             m_sealed_pcs.erase(start_pc);
+            g_bem_aot_pc_slot.erase(start_pc);
             m_pending_emit.erase(start_pc);
             {   // [region-merged] merged-gen probe bucket too (tag-guard)
                 const u32 bkt = (start_pc >> 2) & BEM_DISP_MASK;
@@ -1430,6 +1452,7 @@ s32 BlockCache::chain_dispatch(u32 initial_pc, u32 max_iters, u32* final_pc, u32
         // sealed cleanup (adversarial map: a trapped sealed pc stayed sealed
         // and kept being re-entered). Mirror evict()'s sealed clear.
         m_sealed_pcs.erase(tpc);
+        g_bem_aot_pc_slot.erase(tpc);
         m_pending_emit.erase(tpc);
         {
             const u32 bkt = (tpc >> 2) & BEM_DISP_MASK;
@@ -2594,7 +2617,13 @@ bool BlockCache::aot_seal_merged(const u8* bytes, std::size_t len,
     (int)(uintptr_t)&g_bem_disp_tag[0], (int)(uintptr_t)&g_bem_disp_slot[0], (int)BEM_DISP_MASK,
     (int)(uintptr_t)&g_aot_slot_lo, (int)(uintptr_t)&g_aot_slot_hi);
     if (!ok) return false;
-    for (u32 i = 0; i < n; ++i) m_sealed_pcs.insert(pc_keys[i]);
+    // g_aot_slot_lo was set by the EM_ASM to gen.globalSlots[0]; slots are
+    // contiguous, so pc_keys[i] -> g_aot_slot_lo + i. Record the collision-free
+    // map the chain miss-path re-asserts from.
+    for (u32 i = 0; i < n; ++i) {
+        m_sealed_pcs.insert(pc_keys[i]);
+        g_bem_aot_pc_slot[pc_keys[i]] = g_aot_slot_lo + i;
+    }
     m_aot_gen_count += 1u;    // SEPARATE budget — does not touch m_sealed_gen_count
     m_aot_sealed = true;
     return true;

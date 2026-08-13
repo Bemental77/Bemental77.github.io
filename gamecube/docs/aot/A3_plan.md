@@ -105,6 +105,32 @@ SAB publish tag-last → `AotPollAndLoad` on EmuThread).
   `m_sealed_gen_count` as the next index → never picks 0xa07; compaction/relink operate on their
   own region gen → never touch 0xa07. (Minimal block_cache.cpp edits; recipe copied, not refactored.)
 
+### ★ Dispatch precedence — line-wide infrastructure (found 2026-08-12, fixed 2026-08-13)
+
+**The steal mechanism.** AOT-sealed PCs have NO per-block handle. The seal points the
+direct-mapped dispatch cache (`g_bem_disp_tag/slot[bkt]`) at the gen's fn_k slot, but that cache
+is collision-prone: any bucket ALIAS (another hot PC hashing to the same bkt) or interior entry
+produces a MISS; the exact resolver (`g_bem_pc_handle`) finds nothing (sealed PCs aren't in it);
+so `chain_dispatch_raw` breaks → `TryCompileBlock` compiles the PC per-block and CLAIMS it
+permanently, overwriting the gen slot. HandleReverb dispatched 5.8M by a LUCKY collision surface;
+merged PSMTX (`DISPATCHES=0`) lost by an unlucky one. **Any asset can silently lose coverage this
+way — and coverage loss is the one failure the Amdahl arithmetic (coverage × speedup) cannot
+tolerate.** Found by refusing to trust `seals=1` without a dispatch counter.
+
+**Three pieces (all belt-and-suspenders + self-healing):**
+1. **Miss-path re-assert** (`chain_dispatch_raw`): on a miss, if the PC is AOT-sealed (C-side
+   `g_bem_aot_pc_slot` map, collision-free), re-point `g_bem_disp_tag/slot[bkt]` at the gen slot
+   and dispatch the fn_k — NEVER fall through to compile. Self-heals against collisions forever.
+2. **`TryCompileBlock` guard**: refuse to compile an AOT-sealed PC (the belt to #1's suspenders) —
+   a per-block compile must never overwrite a gen slot.
+3. **Steal-detector** (permanent): count misses-on-sealed-PCs per asset, next to the fn_k
+   dispatch counter. An asset "executing" with a climbing steal count is UNDER-COVERED, not
+   healthy — silent coverage loss made visible.
+
+**Post-fix obligation: re-certify the template.** HandleReverb's 5.8M may have been PARTIAL
+coverage under the same steal mechanism (luckier surface). Re-run its gates on the fixed
+precedence — execution + timing — and re-certify the numbers (the −18% may improve).
+
 ### Timing gate result — HandleReverb (asset #1), 2026-08-12
 
 Counter-free asset, PC-sample share on the SAME MP4 board savestate (like-for-like call

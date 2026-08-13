@@ -905,6 +905,15 @@ void JitWasm::Run()
 bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
                               u32 mem1_mask, u32 ram_size)
 {
+  // [AOT A3.1 dispatch precedence — guard, belt to the chain re-assert's suspenders]
+  // Never per-block-compile a PC owned by an AOT gen: that would register a
+  // per-block handle and STEAL the PC from its merged gen. The chain miss-path
+  // re-asserts sealed PCs to the gen slot; this guard prevents the overwrite even
+  // if some path reaches here. Returning false lets Run single-step once, then the
+  // next dispatch re-asserts into the gen.
+  if (m_wasm_cache.is_sealed_pc(start_pc))
+    return false;
+
   auto& mem = m_system.GetMemory();
 
   // Decode block: read guest instructions starting at start_pc until we hit

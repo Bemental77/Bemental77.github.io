@@ -1206,6 +1206,7 @@ function startServer() {
             m_status: rd(0x026B34A4), m_n: rd(0x026B34A8), m_gen: rd(0x026B34AC),
             m_ctx_mm: rd(0x026B34B4), m_seals: rd(0x026B34B8), m_auth_mm: rd(0x026B34BC),
             m_disp: rd(0x026B34C0), m_sealed: rd(0x026B34CC), m_smc: rd(0x026B34D0),
+            m_steal: rd(0x026B34D4),
           };
         }, [killReq, smcReq]);
         if (r) console.log('[aot] n=' + r.n + ' status=0x' + r.status.toString(16) +
@@ -1213,7 +1214,7 @@ function startServer() {
           ' live_ctx=0x' + r.live_ctx.toString(16) + ' kill=' + r.kill +
           ' | MERGED n=' + r.m_n + ' status=0x' + r.m_status.toString(16) + ' gen=0x' + r.m_gen.toString(16) +
           ' seals=' + r.m_seals + ' auth_mm=' + r.m_auth_mm +
-          ' DISPATCHES=' + r.m_disp + (smcReq ? ' | SMC sealed=' + r.m_sealed + ' evicted=' + r.m_smc : ''));
+          ' DISPATCHES=' + r.m_disp + ' steals=' + r.m_steal + (smcReq ? ' | SMC sealed=' + r.m_sealed + ' evicted=' + r.m_smc : ''));
       } catch (e) { console.log('[aot] peek failed: ' + e.message); }
     };
     const aotTimer = setInterval(dumpAot, pollMs);
