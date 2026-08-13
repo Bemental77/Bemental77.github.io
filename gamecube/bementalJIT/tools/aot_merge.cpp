@@ -121,9 +121,14 @@ int main(int argc, char** argv) {
       const uint32_t t = branch_target(w, pc);
       if (t >= entry && t < end) starts_set.insert(t);
     }
-    // instruction after an UNCONDITIONAL terminator begins a new block (if reached
-    // at all it's via a branch, but seed it so straight-line-after-b is covered).
-    if ((is_b(w) || is_blr(w)) && pc + 4u < end) starts_set.insert(pc + 4u);
+    // The instruction AFTER any block-ending terminator is a new block start. This
+    // is REQUIRED for conditional terminators (bdnz/backward-bc): their NOT-TAKEN
+    // fall-through is a distinct block (e.g. PSMTX's loop-exit 0x800bc9b4). A
+    // FORWARD conditional coalesces (its fall-through stays in-block) so it is NOT
+    // a terminator here. (For unconditional b/blr the fall-through is dead unless
+    // it's also a branch target — harmless to seed.)
+    if (IsBlockTerminator(w) && !IsForwardConditionalBranch(w, pc) && pc + 4u < end)
+      starts_set.insert(pc + 4u);
   }
   // decode each start until its terminator (coalescing forward conditionals).
   std::map<uint32_t, uint32_t> block_count;
