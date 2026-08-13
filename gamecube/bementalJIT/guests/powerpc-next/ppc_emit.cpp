@@ -107,6 +107,7 @@ extern "C" {
     extern uint32_t      g_bem_lc_base;         // [lc-window PM23] Memory::GetL1Cache() addr
     extern uint32_t      g_bem_fp_resident_loop; // [WS-1 STEP-3] FP self-loop op_loop residency A/B
     extern uint32_t      g_bem_aot_count_fnk;    // [AOT A3.1] emit a proof-of-run counter in fn_k wrappers (offline aot_merge only)
+    extern uint32_t      g_bem_aot_build_singles; // [AOT A3.1b singles] build the ps dual-arm WITHOUT lc_base (offline, no emit-time SAB reads)
     int  bem_pc_force_double(uint32_t pc);      // [single-spec PM26] sticky deopt registry
 }
 static constexpr u32 BEM_DISP_MASK_NEXT = 0x3FFFFu;  // MUST match block_cache.cpp BEM_DISP_MASK (BEM_DISP_BITS=18)
@@ -1095,7 +1096,11 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // structure win cannot offset that loss. The dual-arm guard + both arms
     // emit inside the region body; only the PM47 self-chain protocol stays
     // per-block (its spill/flag exit is !merged-gated below).
-    if (g_bem_lc_base) {
+    // [AOT A3.1b] g_bem_aot_build_singles enables the ps dual-arm for OFFLINE
+    // AOT emit without setting lc_base (whose emit-time SAB reads segfault the
+    // native tool). The assumed set below is STATIC (block.m_fpr_inputs); the
+    // singles shadow MASK stays a runtime read in the emitted arm.
+    if (g_bem_lc_base || g_bem_aot_build_singles) {
         bool has_ps = false;
         for (u32 oi = 0; oi < block.m_num_instructions; ++oi) {
             if (GekkoOperands::OPCD(buffer.data()[oi].inst) == 4u) { has_ps = true; break; }

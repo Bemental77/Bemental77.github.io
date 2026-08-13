@@ -71,6 +71,7 @@ int g_bem_gp_dirty = 0;
 // harmless, they recompile only if evicted, and publication precedes guest exec.
 uint32_t g_bem_lc_base = 0;
 uint32_t g_bem_aot_count_fnk = 0u;   // [AOT A3.1] set by offline aot_merge to emit fn_k proof-of-run counters
+uint32_t g_bem_aot_build_singles = 0u;  // [AOT A3.1b] set by offline aot_merge to build the ps dual-arm without lc_base
 // [fprf-gate PM46 2026-07-31] bFPRF half of the FPRF emission gate — native
 // Jit64 emits FPRF only when `bFPRF && wantsFPRF`; default false = zero FPRF
 // code, matching native MP4. Published by JitWasm from Config::MAIN_FPRF.

@@ -30,7 +30,7 @@
 using namespace bemental;
 using namespace bemental::powerpc;
 
-extern "C" { extern uint32_t g_bem_lc_base; extern uint32_t g_bem_aot_count_fnk; }
+extern "C" { extern uint32_t g_bem_lc_base; extern uint32_t g_bem_aot_count_fnk; extern uint32_t g_bem_aot_build_singles; }
 // g_hle_hook_query is bemental::powerpc::g_hle_hook_query (via using namespace) — not extern "C".
 
 // --- PPC branch-target decode (for the CFG walk) ---
@@ -58,12 +58,43 @@ int main(int argc, char** argv) {
   // argv[3]=1 bakes the fn_k proof-of-run counter (skews timing — off by default;
   // the counter-free asset is what ships and what the timing gate measures).
   const uint32_t count_fnk = (argc > 3) ? (uint32_t)strtoul(argv[3], nullptr, 0) : 0u;
+  // argv[4]=1 ENABLES the paired-single dual-arm for matrix bodies (the
+  // singles-in-merged fix) WITHOUT setting lc_base — decoupling the singles-arm
+  // build from lc_base's emit-time SAB reads (0x026B3404/3408), which would
+  // SIGSEGV offline (macOS __PAGEZERO reserves the low 4GB, so mapping those
+  // fixed addresses is impossible). The singles shadow MASK stays a RUNTIME read
+  // (i32.const 0x026B33E0 in the emitted block), so the live worker's real mask
+  // drives the dual-arm selection. 0 = scalar-FP fns (HandleReverb) where moot.
+  const uint32_t build_singles = (argc > 4) ? (uint32_t)strtoul(argv[4], nullptr, 0) : 0u;
 
-  const uint32_t entry = kHandleReverbEntry;
-  const uint32_t n_words = (uint32_t)(sizeof(kHandleReverb) / sizeof(kHandleReverb[0]));
+  // Function spec: argv[5] = a raw file (entry u32 | n_words u32 | words[n]) for
+  // ANY guest function (extract by ADDRESS). Falls back to the built-in
+  // HandleReverb. This is the leaf-line generalization.
+  const char* spec_path = (argc > 5) ? argv[5] : nullptr;
+  std::vector<uint32_t> spec_words;
+  uint32_t entry;
+  const uint32_t* WORDS;
+  uint32_t n_words;
+  if (spec_path) {
+    FILE* sf = std::fopen(spec_path, "rb");
+    if (!sf) { std::perror("spec"); return 5; }
+    uint32_t hdr[2] = {0, 0};
+    if (std::fread(hdr, 4, 2, sf) != 2) { std::fclose(sf); std::fprintf(stderr, "[aot-merge] bad spec header\n"); return 5; }
+    entry = hdr[0]; n_words = hdr[1];
+    if (n_words == 0u || n_words > 65536u) { std::fclose(sf); std::fprintf(stderr, "[aot-merge] bad n_words %u\n", n_words); return 5; }
+    spec_words.resize(n_words);
+    if (std::fread(spec_words.data(), 4, n_words, sf) != n_words) { std::fclose(sf); std::fprintf(stderr, "[aot-merge] short spec\n"); return 5; }
+    std::fclose(sf);
+    WORDS = spec_words.data();
+    std::printf("[aot-merge] fn-spec %s: entry 0x%08x, %u words\n", spec_path, entry, n_words);
+  } else {
+    entry = kHandleReverbEntry;
+    WORDS = kHandleReverb;
+    n_words = (uint32_t)(sizeof(kHandleReverb) / sizeof(kHandleReverb[0]));
+  }
   const uint32_t end = entry + n_words * 4u;
   auto at = [&](uint32_t pc) -> uint32_t {
-    const uint32_t i = (pc - entry) >> 2; return (i < n_words) ? kHandleReverb[i] : 0u;
+    const uint32_t i = (pc - entry) >> 2; return (i < n_words) ? WORDS[i] : 0u;
   };
   const bool in_fn = [&](uint32_t pc){ return pc >= entry && pc < end; }(entry);
   (void)in_fn;
@@ -71,7 +102,8 @@ int main(int argc, char** argv) {
   // Match the golden/live emit context (see aot_compile.cpp): un-hooked PCs skip
   // the HLE prologue; HandleReverb is scalar-FP so lc_base=0 (no singles spec).
   g_hle_hook_query = [](uint32_t) -> bool { return false; };
-  g_bem_lc_base = 0u;
+  g_bem_lc_base = 0u;                       // stays 0 (no emit-time SAB reads)
+  g_bem_aot_build_singles = build_singles;  // decoupled singles-arm enable (argv[4])
   g_bem_aot_count_fnk = count_fnk;   // fn_k proof-of-run counter (argv[3]; default OFF)
 
   // --- block starts: entry + EVERY internal branch target (forward conditionals
@@ -114,14 +146,14 @@ int main(int argc, char** argv) {
   for (size_t k = 0; k < starts.size(); ++k) {
     const uint32_t s = starts[k];
     descs[k].start_pc  = s;
-    descs[k].insts     = &kHandleReverb[(s - entry) >> 2];
+    descs[k].insts     = &WORDS[(s - entry) >> 2];
     descs[k].count     = block_count[s];
     descs[k].ctx_ptr   = ctx_ptr;
     descs[k].mem1_base = 0u;      // slowmem (address-independent)
     descs[k].mem1_mask = 0u;
     descs[k].ram_size  = 0u;
   }
-  std::printf("[aot-merge] HandleReverb @0x%08x: %zu blocks discovered\n", entry, starts.size());
+  std::printf("[aot-merge] fn @0x%08x: %zu blocks discovered\n", entry, starts.size());
 
   // --- emit the merged $region module ---
   const uint32_t gen_idx = 0xA07u;                 // reserved AOT gen

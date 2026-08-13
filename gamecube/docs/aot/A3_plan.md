@@ -179,9 +179,19 @@ singles bug, while the singles-in-merged-bodies fix lands for the matrix family 
 
 ### Updated order (post-calibration, 2026-08-12)
 
-1. **Singles-in-merged fix** (existential, unchanged) — ppc_emit.cpp:1093, the step-0 −38%
-   mechanism. Acceptance: a merged MATRIX body executing the singles arm via **simdCensus
-   attribution**. Gates the matrix family.
+1. **Singles-in-merged fix** (existential) — ppc_emit.cpp:1093, the step-0 −38% mechanism.
+   **Demonstrator = PSMTXROMultVecArray** (NOT PSMTXInverse): pure paired-single (ideal arm
+   exerciser — Inverse's scalar-double determinant/divide ops route to the Double arm and would
+   muddy simdCensus attribution); its 26/26 goldens + differential fixture already exist
+   (correctness free, no new driver); sharp acceptance = **ps-class ops in the merged body execute
+   the SIMD arm** (not a fuzzy "whole-function single"). Its small share is irrelevant — this is
+   the acceptance vehicle, not the win; Inverse follows as an ordinary asset. Fix = decouple the
+   singles-arm build from lc_base via `g_bem_aot_build_singles` (lc_base=0 → no emit-time SAB reads;
+   the `mmap` workaround is dead on macOS `__PAGEZERO`). Two consequences banked:
+   - **AOT assets are GENERAL-PATH** (lc_base=0 → no locked-cache shortcut) — accepted by design,
+     consistent with the impurity doctrine and irrelevant for matrix-on-RAM anyway.
+   - **v9b value-verify at entry MUST survive the decoupling** — confirm it in the acceptance;
+     that's the NaN-flap safety the dual-arm machinery depends on.
 2. **wasm-opt evaluation** — one pass on the HandleReverb asset through the timing gate.
    Pre-registered **~10–30%, not 2–3×** (Binaryen can't touch shared-mem loads/stores or the
    runtime-guarded dual-arm branches — the two biggest tax classes).
