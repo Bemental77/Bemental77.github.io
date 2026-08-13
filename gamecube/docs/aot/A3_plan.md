@@ -131,6 +131,57 @@ tolerate.** Found by refusing to trust `seals=1` without a dispatch counter.
 coverage under the same steal mechanism (luckier surface). Re-run its gates on the fixed
 precedence — execution + timing — and re-certify the numbers (the −18% may improve).
 
+### ★★ WILD-ADDRESS CLASS (found 2026-08-13) — every offline asset bakes native-tool pointers
+
+**The finding.** `emit_block_body_into` (and the chain epilogues) bake `(u32)(uintptr_t)&g_bem_*`
+for runtime statics. Emitted BY THE WORKER at runtime, those resolve to the worker's own memory —
+correct. Emitted OFFLINE by the native tool, they are the tool process's ASLR-slid, truncated
+static addresses — **wild pointers in the worker's heap**. Every offline asset shipped so far
+(handlereverb.bjaotm, psmtxro.bjaot) carries them.
+
+**Evidence (exact).** Regenerating the counter-free asset at HEAD produces a module that differs
+from shipping by 532 constants, ALL shifted by one uniform delta (0x9180000 = the tool-launch
+slide difference). Symbol-delta matching against the tool binary identifies, per merged block:
+`g_bem_pc_exec[bkt]` + `g_bem_promote_ring` + `g_bem_promote_n` (profiling prologue — a wild
+STORE every execution, ring append every 16th), `g_bem_gp_dirty` (253 sites), `g_bem_disp_tag[bkt]`
++ `g_bem_disp_slot[bkt]` (chain epilogue — a garbage tag compare whose accidental match feeds
+`call_indirect` a garbage slot), and `g_bem_mrtag`/`g_bem_mrslot` (warm-edge cache — wild WRITES
+per warm edge). `blr_chain_addr` is likewise a baked placeholder (0x026B3500), not the real cell.
+
+**Consequences.** (a) Offline assets have been silently corrupting worker heap on every
+execution; goldens/shadow passed because the stomps missed the compared state. (b) In-wasm warm
+chaining out of offline assets cannot have worked as designed (garbage tag ≈ never matches →
+host round-trip per edge; when it DOES match → the observed `function signature mismatch` trap
+class). (c) **All A3.1 runtime certifications (5.8M / 4.94M dispatches, −18% timing) were
+measured on corrupting assets** — mechanism proofs stand, numbers need re-certification on
+clean assets.
+
+**Live repro + discriminators (2026-08-13, board savestate, all AOT-on):** every run logs
+exactly ONE C-dispatch trap `function signature mismatch` with steals=1 — including the healthy
+ones, so the morning cert's "no traps" was misread; the trap has been there all along.
+- **Counter-free asset → guest wedges** (100% of post-load samples in SelectThread, audio thread
+  dead): 3/3 runs across TWO different garbage-address sets (shipping + fresh regen). DISPATCHES
+  reads 1 (the C-side re-assert dispatch; no in-wasm counter in this variant).
+- **Counter-ON regen → survives the same trap and executes 4,940,623 dispatches** (reproduces
+  the cert number, with a third garbage set, psmtxro co-loaded). 1/1 run.
+- psmtxro interaction REFUTED (D1: trap+wedge persists with it removed); AOT-off is clean.
+Structural diff of the two variants: the ONLY non-slide difference is the fn_k counter RMW at
+the fixed (correct) SAB cell 0x26B34C0. **So wedge-vs-survive is per-asset garbage-address
+luck — deterministic per asset, random across assets — and every "healthy" certified run was a
+lucky address draw, nothing more.** The trap itself is common to ALL AOT-on runs (survivable;
+leading site candidate: the miss-path re-assert's first dispatch — under investigation). The
+shipping counter-free asset was never live-certified before shipping.
+
+**Fix direction (design pass before code):** offline emit must yield ZERO native-address bakes —
+(i) omit the promote-ring profiling prologue in AOT bodies (an AOT gen is pre-promoted by
+definition; also deletes the 15–40% small-block op-overhead class from AOT bodies = a real body
+win); (ii) a RELOCATION TABLE in a BJAOTM v4 (emit fixed-width consts + record (symbol, offset);
+the seal — which runs IN the worker, where `&g_bem_*` is trivially correct — patches before
+instantiate; robust across worker rebuilds, and it is exactly the linker infrastructure A3.2's
+in-asset calls need); (iii) the loader REFUSES v3 assets (obsolete the corrupt format loudly);
+(iv) regenerate + fully re-certify both shipping assets. Per-symbol calls (gp_dirty functional
+vs diag; blr_chain routing) settle in the design pass.
+
 ### Timing gate result — HandleReverb (asset #1), 2026-08-12
 
 Counter-free asset, PC-sample share on the SAME MP4 board savestate (like-for-like call
