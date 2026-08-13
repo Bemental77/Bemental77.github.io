@@ -205,7 +205,7 @@ singles bug, while the singles-in-merged-bodies fix lands for the matrix family 
 
 ### Updated order (post-calibration, 2026-08-12)
 
-1. **Singles-in-merged fix** (existential) — ppc_emit.cpp:1093, the step-0 −38% mechanism.
+1. ✅ **Singles-in-merged fix** (existential) — ppc_emit.cpp:1093, the step-0 −38% mechanism.
    **Demonstrator = PSMTXROMultVecArray** (NOT PSMTXInverse): pure paired-single (ideal arm
    exerciser — Inverse's scalar-double determinant/divide ops route to the Double arm and would
    muddy simdCensus attribution); its 26/26 goldens + differential fixture already exist
@@ -218,6 +218,19 @@ singles bug, while the singles-in-merged-bodies fix lands for the matrix family 
      consistent with the impurity doctrine and irrelevant for matrix-on-RAM anyway.
    - **v9b value-verify at entry MUST survive the decoupling** — confirm it in the acceptance;
      that's the NaN-flap safety the dual-arm machinery depends on.
+
+   **STATUS (2026-08-13): matrix third = BUILD ✓ + CONFORMANCE ✓ + RUNTIME arm-fires DEFERRED.**
+   BUILD: `g_bem_aot_build_singles=1` emits the SIMD dual-arm offline (+48% module bytes,
+   69294→102523 B, commit 4e98ae9). CONFORMANCE: 26/26 goldens + differential fixture prove the
+   values. RUNTIME: all three MP4 savestates are skinning-light board/menu scenes — the
+   fully-covered 4-block PSMTX merged asset seals (n=5) but PSMTX executes 4 / 0 / 4 times then
+   stops (HandleReverb ran 4.94M dispatches in the same window), and steals=0 on the fixed
+   precedence (d8c9503) — so DISPATCHES=0 is **scene starvation, not a dispatch bug**. The
+   simdCensus arm-fires attribution re-opens when a skinning-continuous scene exists (an MP4
+   minigame savestate, or PSO by-signature extraction — PSMTX is in neither gpoe8p.map nor the
+   SAB map). Until then the line proceeds on build+conformance evidence; **the per-asset timing
+   gate remains the hard backstop for every matrix asset** (a non-firing SIMD arm = Double
+   routing = slower-than-JIT, which the gate catches per asset before it ships).
 2. **wasm-opt evaluation** — one pass on the HandleReverb asset through the timing gate.
    Pre-registered **~10–30%, not 2–3×** (Binaryen can't touch shared-mem loads/stores or the
    runtime-guarded dual-arm branches — the two biggest tax classes).
