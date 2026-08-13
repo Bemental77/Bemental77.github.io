@@ -2638,9 +2638,14 @@ bool BlockCache::aot_seal_merged(const u8* bytes, std::size_t len,
                 HEAP32[(dispSlot >>> 2) + bkt] = gen.globalSlots[i] | 0;
             }
             // [AOT A3.1] publish the fn_k wasmTable slot range for the chain-loop
-            // proof-of-run counter ($9=&g_aot_slot_lo, $10=&g_aot_slot_hi).
-            HEAP32[$9 >> 2]  = gen.globalSlots[0] | 0;
-            HEAP32[$10 >> 2] = (gen.globalSlots[0] + nFuncs) | 0;
+            // proof-of-run counter AND the re-assert map base. Params bind
+            // &g_aot_slot_lo=$8, &g_aot_slot_hi=$9 (8 leading args $0..$7). The
+            // prior $9/$10 was OFF BY ONE (introduced 3e06d43): it left
+            // g_aot_slot_lo=0 (so g_bem_aot_pc_slot[pc]=0+i pointed the re-assert
+            // at Emscripten table slots 0..N -> "function signature mismatch"
+            // trap + SelectThread wedge) and wild-wrote HEAP32[0] via undefined $10.
+            HEAP32[$8 >> 2] = gen.globalSlots[0] | 0;              // g_aot_slot_lo
+            HEAP32[$9 >> 2] = (gen.globalSlots[0] + nFuncs) | 0;   // g_aot_slot_hi
             console.log('[worker] [aot] sealed AOT gen ' + genIdx + ' n_funcs=' + nFuncs + ' bytes=' + bytesLen + ' slots=' + gen.globalSlots[0] + '..' + (gen.globalSlots[0]+nFuncs) + ' shape=merged');
             return 1;
         } catch (e) {
