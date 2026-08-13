@@ -71,6 +71,7 @@ int g_bem_gp_dirty = 0;
 // harmless, they recompile only if evicted, and publication precedes guest exec.
 uint32_t g_bem_lc_base = 0;
 uint32_t g_bem_aot_count_fnk = 0u;   // [AOT A3.1] set by offline aot_merge to emit fn_k proof-of-run counters
+uint32_t g_bem_aot_count_exits = 0u; // [census 2026-08-13c] set by offline aot_merge to emit per-exit-reason counters (Item 1, artifact-#4 diagnosis)
 uint32_t g_bem_aot_build_singles = 0u;  // [AOT A3.1b] set by offline aot_merge to build the ps dual-arm without lc_base
 int g_bem_aot_reloc_mode = 0;   // [AOT v4 reloc] set by offline aot_merge: emit OOB sentinels + reloc records instead of native &g_bem_* (wild-address class, A3_plan.md)
 // [fprf-gate PM46 2026-07-31] bFPRF half of the FPRF emission gate — native

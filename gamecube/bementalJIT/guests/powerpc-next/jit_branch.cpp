@@ -43,7 +43,7 @@ static constexpr u32 WIMPORT_GATHER_DRAIN = 12;
 // [perf gather-gate] runtime "a write-gather-pipe store is pending" flag
 // (defined in src/block_cache.cpp). The coalesced taken-exit gates its drain on
 // this so it is a no-op when no GP write happened on the taken path.
-extern "C" { extern int g_bem_gp_dirty; extern int g_bem_aot_reloc_mode; }
+extern "C" { extern int g_bem_gp_dirty; extern int g_bem_aot_reloc_mode; extern uint32_t g_bem_aot_count_exits; }
 
 // [AOT v4 reloc 2026-08-13] gp_dirty address const: sentinel + reloc record in
 // offline reloc mode (a native tool's &g_bem_gp_dirty is a wild pointer in the
@@ -55,6 +55,14 @@ static inline void emit_gp_dirty_addr(WasmModuleBuilder& wb) {
                                   (u16)bemental::powerpc::BEM_RSYM_GP_DIRTY, 0u));
     else
         wb.op_i32_const((s32)(uintptr_t)&g_bem_gp_dirty);
+}
+
+// [census 2026-08-13c Item 1] per-exit-reason counter (offline diag asset only,
+// gated on g_bem_aot_count_exits which only aot_merge sets). Stack-neutral.
+static inline void emit_exit_census_jb(WasmModuleBuilder& wb, u32 cell) {
+    if (!g_bem_aot_count_exits) return;
+    wb.op_i32_const((s32)cell); wb.op_i32_const((s32)cell);
+    wb.op_i32_load(0); wb.op_i32_const(1); wb.op_i32_add(); wb.op_i32_store(0);
 }
 
 // emit_coalesced_taken_exit — the taken arm of a mid-block (is_terminal=false)
@@ -75,6 +83,7 @@ static void emit_coalesced_taken_exit(WasmModuleBuilder& wb, u32 ctx_ptr) {
     wb.op_i32_const((s32)0x026B38C0);
     wb.op_i32_const(0);
     wb.op_i32_store(0);
+    emit_exit_census_jb(wb, 0x026B34D8u);   // [census] coalesced_taken_exit — THE artifact #4 site
     wb.op_i32_const((s32)ctx_ptr);
     wb.op_i32_load(ppc_off::PC);
     wb.op_return();

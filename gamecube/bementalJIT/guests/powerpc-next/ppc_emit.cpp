@@ -107,6 +107,7 @@ extern "C" {
     extern uint32_t      g_bem_lc_base;         // [lc-window PM23] Memory::GetL1Cache() addr
     extern uint32_t      g_bem_fp_resident_loop; // [WS-1 STEP-3] FP self-loop op_loop residency A/B
     extern uint32_t      g_bem_aot_count_fnk;    // [AOT A3.1] emit a proof-of-run counter in fn_k wrappers (offline aot_merge only)
+    extern uint32_t      g_bem_aot_count_exits;  // [census 2026-08-13c] emit per-exit-reason counters (offline aot_merge only)
     extern uint32_t      g_bem_aot_build_singles; // [AOT A3.1b singles] build the ps dual-arm WITHOUT lc_base (offline, no emit-time SAB reads)
     extern int           g_bem_aot_reloc_mode;    // [AOT v4 reloc] offline: emit OOB sentinels + reloc records instead of native &g_bem_* (wild-address class)
     int  bem_pc_force_double(uint32_t pc);      // [single-spec PM26] sticky deopt registry
@@ -178,6 +179,16 @@ static inline void emit_addr_const(WasmModuleBuilder& b, u32 addr, u16 sym, u32 
 // service checks and BEFORE the runtime bucket probe: same-instance direct
 // return_call is the V8-inlining-eligible edge shape the N-fn design exists
 // for (per-block modules' cross-instance calls are categorically ineligible).
+// [census 2026-08-13c Item 1] emit a per-exit-reason counter increment (*(u32*)cell += 1)
+// into the block body. Gated on g_bem_aot_count_exits, which ONLY the offline aot_merge
+// tool sets — the runtime JIT emits nothing. Diagnoses where the merged AOT gen's exits go
+// (artifact #4: coalesced taken exits -> C-loop round-trips). Stripped after the census.
+static inline void emit_exit_census(WasmModuleBuilder& b, u32 cell) {
+    if (!g_bem_aot_count_exits) return;
+    b.op_i32_const((s32)cell); b.op_i32_const((s32)cell);
+    b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
+}
+
 static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                                  u32 tag_addr_ovr = 0u, u32 slot_addr_ovr = 0u,
                                  const MergedRegionCtx* merged = nullptr,
@@ -243,6 +254,7 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
             b.op_i32_const((s32)0x026B38D0u);
             b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
         }
+        emit_exit_census(b, 0x026B34DCu);   // [census] service_bail
         b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
     b.op_end();
 
@@ -270,6 +282,7 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
             b.op_i32_const((s32)0x026B38D4u);
             b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
         }
+        emit_exit_census(b, 0x026B34E0u);   // [census] vector_guard
         b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
     b.op_end();
 
@@ -311,6 +324,7 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
         b.op_i32_const((s32)region_gen); b.op_i32_eq();
         b.op_i32_and();
         b.op_if(BLOCK_TYPE_VOID);
+            emit_exit_census(b, 0x026B34E4u);   // [census] direct_edge (PM54d same-gen)
             b.op_return_call(direct_fidx[di]);
         b.op_end();
     }
@@ -354,6 +368,7 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                     // [region-resident] warm edge = br back to the region LOOP:
                     // same activation, GPR locals persist (a return_call would
                     // zero them). Depth = body-relative nesting + splice offset.
+                    emit_exit_census(b, 0x026B34E8u);   // [census] warm_br_hit (the good in-region edge)
                     b.op_br(b.ctrlDepth() + merged->br_extra_depth);
                 b.op_end();
                 // lap threshold: in-region idle-poll escape. With no pending
@@ -365,6 +380,7 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                 b.op_if(BLOCK_TYPE_VOID);
                     b.op_i32_const((s32)ctx_ptr); b.op_i32_const(0);
                     b.op_i32_store(ppc_off::DOWNCOUNT);
+                    emit_exit_census(b, 0x026B34F4u);   // [census] lap_overflow (forced downcount=0)
                 b.op_end();
                 // fall through → global-table chain / host return below
             b.op_end();
@@ -427,6 +443,7 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
             b.op_i32_const(0); b.op_i32_ge_s();
             b.op_if(BLOCK_TYPE_VOID);
                 b.op_local_get(LOCAL_TMP_A_CHAIN);
+                emit_exit_census(b, 0x026B34ECu);   // [census] global_fallback_chain (merged in-wasm)
                 b.op_return_call_indirect(/*typeIdx*/0, /*tableIdx*/0);
             b.op_end();
         b.op_end();
@@ -439,6 +456,7 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
         b.op_i32_const((s32)0x026B38DCu);
         b.op_i32_load(0); b.op_i32_const(1); b.op_i32_add(); b.op_i32_store(0);
     }
+    emit_exit_census(b, 0x026B34F0u);   // [census] host_return (terminal fallback)
     b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
 }
 

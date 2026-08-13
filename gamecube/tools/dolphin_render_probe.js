@@ -1207,6 +1207,10 @@ function startServer() {
             m_ctx_mm: rd(0x026B34B4), m_seals: rd(0x026B34B8), m_auth_mm: rd(0x026B34BC),
             m_disp: rd(0x026B34C0), m_sealed: rd(0x026B34CC), m_smc: rd(0x026B34D0),
             m_steal: rd(0x026B34D4),
+            // [census 2026-08-13c Item 1] per-exit-reason counters (diag asset only)
+            cx_taken: rd(0x026B34D8), cx_svc: rd(0x026B34DC), cx_vec: rd(0x026B34E0),
+            cx_direct: rd(0x026B34E4), cx_warm: rd(0x026B34E8), cx_gfb: rd(0x026B34EC),
+            cx_host: rd(0x026B34F0), cx_lap: rd(0x026B34F4),
           };
         }, [killReq, smcReq]);
         if (r) console.log('[aot] n=' + r.n + ' status=0x' + r.status.toString(16) +
@@ -1215,6 +1219,7 @@ function startServer() {
           ' | MERGED n=' + r.m_n + ' status=0x' + r.m_status.toString(16) + ' gen=0x' + r.m_gen.toString(16) +
           ' seals=' + r.m_seals + ' auth_mm=' + r.m_auth_mm +
           ' DISPATCHES=' + r.m_disp + ' steals=' + r.m_steal + (smcReq ? ' | SMC sealed=' + r.m_sealed + ' evicted=' + r.m_smc : ''));
+        if (r) console.log('[census] taken=' + r.cx_taken + ' warm_br=' + r.cx_warm + ' svc_bail=' + r.cx_svc + ' vec=' + r.cx_vec + ' direct=' + r.cx_direct + ' global_fb=' + r.cx_gfb + ' host_ret=' + r.cx_host + ' lap=' + r.cx_lap);
       } catch (e) { console.log('[aot] peek failed: ' + e.message); }
     };
     const aotTimer = setInterval(dumpAot, pollMs);

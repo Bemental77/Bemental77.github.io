@@ -39,7 +39,7 @@ static_assert(!bemental::powerpc::BEM_LAZY_CR,
 using namespace bemental;
 using namespace bemental::powerpc;
 
-extern "C" { extern uint32_t g_bem_lc_base; extern uint32_t g_bem_aot_count_fnk; extern uint32_t g_bem_aot_build_singles; extern int g_bem_aot_reloc_mode; extern unsigned char g_bem_promote_enabled; }
+extern "C" { extern uint32_t g_bem_lc_base; extern uint32_t g_bem_aot_count_fnk; extern uint32_t g_bem_aot_build_singles; extern int g_bem_aot_reloc_mode; extern unsigned char g_bem_promote_enabled; extern uint32_t g_bem_aot_count_exits; }
 // g_hle_hook_query is bemental::powerpc::g_hle_hook_query (via using namespace) — not extern "C".
 
 // --- PPC branch-target decode (for the CFG walk) ---
@@ -114,6 +114,7 @@ int main(int argc, char** argv) {
   g_bem_lc_base = 0u;                       // stays 0 (no emit-time SAB reads)
   g_bem_aot_build_singles = build_singles;  // decoupled singles-arm enable (argv[4])
   g_bem_aot_count_fnk = count_fnk;   // fn_k proof-of-run counter (argv[3]; default OFF)
+  g_bem_aot_count_exits = (std::getenv("AOT_COUNT_EXITS") && std::atoi(std::getenv("AOT_COUNT_EXITS"))) ? 1u : 0u;  // [census 2026-08-13c Item 1] per-exit-reason counters (env, default OFF)
   // [AOT v4 reloc — wild-address class, A3_plan.md 2026-08-13] This tool's own
   // &g_bem_* are ASLR-slid native addresses = wild pointers in the worker. Emit
   // ZERO native addresses: OOB sentinels + a reloc table the seal patches
