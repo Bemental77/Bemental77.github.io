@@ -72,6 +72,7 @@ int g_bem_gp_dirty = 0;
 uint32_t g_bem_lc_base = 0;
 uint32_t g_bem_aot_count_fnk = 0u;   // [AOT A3.1] set by offline aot_merge to emit fn_k proof-of-run counters
 uint32_t g_bem_aot_build_singles = 0u;  // [AOT A3.1b] set by offline aot_merge to build the ps dual-arm without lc_base
+int g_bem_aot_reloc_mode = 0;   // [AOT v4 reloc] set by offline aot_merge: emit OOB sentinels + reloc records instead of native &g_bem_* (wild-address class, A3_plan.md)
 // [fprf-gate PM46 2026-07-31] bFPRF half of the FPRF emission gate — native
 // Jit64 emits FPRF only when `bFPRF && wantsFPRF`; default false = zero FPRF
 // code, matching native MP4. Published by JitWasm from Config::MAIN_FPRF.
@@ -2532,9 +2533,44 @@ void BlockCache::region_relink(Region r, u32 mem_pages) {
 }
 
 bool BlockCache::aot_seal_merged(const u8* bytes, std::size_t len,
-                                 const u32* pc_keys, u32 n, u32 gen_idx) {
+                                 const u32* pc_keys, u32 n, u32 gen_idx,
+                                 const powerpc::BemAotReloc* relocs, u32 n_relocs) {
 #ifdef __EMSCRIPTEN__
     if (!bytes || len == 0u || !pc_keys || n == 0u) return false;
+    // [AOT v4 reloc] Patch every recorded sentinel with THIS worker's real
+    // address — the offline tool cannot know them (the wild-address class:
+    // native &g_bem_* is ASLR-slid tool garbage). Patch a local copy: shipped
+    // bytes stay pristine sentinels, so the post-clear() re-seal re-patches
+    // fresh and an unpatched sentinel can only ever trap OOB, never corrupt.
+    std::vector<u8> patched;
+    if (n_relocs) {
+        if (!relocs) return false;
+        patched.assign(bytes, bytes + len);
+        for (u32 i = 0; i < n_relocs; ++i) {
+            const powerpc::BemAotReloc& r = relocs[i];
+            u32 target = 0u;
+            switch (r.sym) {
+                case powerpc::BEM_RSYM_DISP_TAG:  target = (u32)(uintptr_t)&g_bem_disp_tag[0];  break;
+                case powerpc::BEM_RSYM_DISP_SLOT: target = (u32)(uintptr_t)&g_bem_disp_slot[0]; break;
+                case powerpc::BEM_RSYM_MRTAG:     target = (u32)(uintptr_t)&g_bem_mrtag[0];     break;
+                case powerpc::BEM_RSYM_MRSLOT:    target = (u32)(uintptr_t)&g_bem_mrslot[0];    break;
+                case powerpc::BEM_RSYM_GP_DIRTY:  target = (u32)(uintptr_t)&g_bem_gp_dirty;     break;
+                case powerpc::BEM_RSYM_BLR_CHAIN: target = (u32)(uintptr_t)&g_blr_chain;        break;
+                default: return false;                        // unknown sym: refuse loudly
+            }
+            if (r.offset < 1u || r.offset + 5u > len || patched[r.offset - 1u] != 0x41u)
+                return false;                                 // bad site: refuse loudly
+            const u32 v = target + r.addend;
+            patched[r.offset + 0u] = (u8)((v & 0x7Fu) | 0x80u);
+            patched[r.offset + 1u] = (u8)(((v >> 7) & 0x7Fu) | 0x80u);
+            patched[r.offset + 2u] = (u8)(((v >> 14) & 0x7Fu) | 0x80u);
+            patched[r.offset + 3u] = (u8)(((v >> 21) & 0x7Fu) | 0x80u);
+            // i32.const sign extension: bits 32-34 of a 5-byte varint must
+            // extend bit 31 or the validator rejects the module.
+            patched[r.offset + 4u] = (u8)(((v >> 28) & 0x0Fu) | ((v & 0x80000000u) ? 0x70u : 0x00u));
+        }
+        bytes = patched.data();
+    }
     // COPY of region_seal's registration recipe (block_cache.cpp:2068-2181) — the
     // runtime path is deliberately NOT refactored. Registers the pre-built merged
     // module as an immutable gen: instantiate -> wasmTable slots -> bemental_gens
@@ -2624,11 +2660,23 @@ bool BlockCache::aot_seal_merged(const u8* bytes, std::size_t len,
         m_sealed_pcs.insert(pc_keys[i]);
         g_bem_aot_pc_slot[pc_keys[i]] = g_aot_slot_lo + i;
     }
+    // [AOT v4] Seed the merged warm-edge cache exactly like region_seal does
+    // for live gens — before this, NOTHING populated mrtag/mrslot for AOT gens,
+    // so AOT warm edges could never hit (found in the wild-address
+    // investigation; the baked probe addresses were tool garbage anyway).
+    // Existing trap-cleanup/unseal paths clear these buckets per-PC as usual.
+    for (u32 i = 0; i < n; ++i) {
+        const u32 pc  = pc_keys[i];
+        const u32 bkt = (pc >> 2) & BEM_DISP_MASK;
+        g_bem_mrtag[bkt]  = pc;
+        g_bem_mrslot[bkt] = (int32_t)((gen_idx << 16) | i);
+    }
     m_aot_gen_count += 1u;    // SEPARATE budget — does not touch m_sealed_gen_count
     m_aot_sealed = true;
     return true;
 #else
     (void)bytes; (void)len; (void)pc_keys; (void)n; (void)gen_idx;
+    (void)relocs; (void)n_relocs;
     return false;
 #endif
 }

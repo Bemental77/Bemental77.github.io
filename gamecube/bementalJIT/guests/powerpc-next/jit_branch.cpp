@@ -15,6 +15,7 @@
 
 #include "jit_branch.h"
 
+#include "bementalJIT/region_desc.h"   // [AOT v4 reloc] BemRelocSym + sentinel
 #include "bementalJIT/types.h"
 #include "bementalJIT/wasm_module_builder.h"
 #include "code_op.h"
@@ -42,13 +43,25 @@ static constexpr u32 WIMPORT_GATHER_DRAIN = 12;
 // [perf gather-gate] runtime "a write-gather-pipe store is pending" flag
 // (defined in src/block_cache.cpp). The coalesced taken-exit gates its drain on
 // this so it is a no-op when no GP write happened on the taken path.
-extern "C" { extern int g_bem_gp_dirty; }
+extern "C" { extern int g_bem_gp_dirty; extern int g_bem_aot_reloc_mode; }
+
+// [AOT v4 reloc 2026-08-13] gp_dirty address const: sentinel + reloc record in
+// offline reloc mode (a native tool's &g_bem_gp_dirty is a wild pointer in the
+// worker), byte-identical to the plain const otherwise. See region_desc.h.
+static inline void emit_gp_dirty_addr(WasmModuleBuilder& wb) {
+    if (g_bem_aot_reloc_mode)
+        wb.op_i32_const_reloc((u16)bemental::powerpc::BEM_RSYM_GP_DIRTY, 0u,
+                              bemental::powerpc::bem_reloc_sentinel(
+                                  (u16)bemental::powerpc::BEM_RSYM_GP_DIRTY, 0u));
+    else
+        wb.op_i32_const((s32)(uintptr_t)&g_bem_gp_dirty);
+}
 
 // emit_coalesced_taken_exit — the taken arm of a mid-block (is_terminal=false)
 // forward conditional branch: drain a pending gather-pipe write, then return
 // the just-stored target PC to the dispatcher. PC=target must already be stored.
 static void emit_coalesced_taken_exit(WasmModuleBuilder& wb, u32 ctx_ptr) {
-    wb.op_i32_const((s32)(uintptr_t)&g_bem_gp_dirty);
+    emit_gp_dirty_addr(wb);
     wb.op_i32_load(0);
     wb.op_if();                       // void block (0x40)
         wb.op_i32_const(0);
@@ -382,7 +395,8 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
 void emit_bcx_fused(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                     const CodeOp& op, u32 ctx_ptr, u32 charge,
                     u32 loop_head_depth, bool block_has_store,
-                    u32 tag_addr, u32 start_pc, const CmpFuse* fuse, bool fp_resident) {
+                    u32 tag_addr, u32 start_pc, const CmpFuse* fuse, bool fp_resident,
+                    u32 tag_sentinel) {
     const u32  inst = op.inst;
     const u32  bo   = GekkoOperands::BO(inst);
     const u32  bi   = GekkoOperands::BI(inst);
@@ -429,7 +443,7 @@ void emit_bcx_fused(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
             // Per-iteration gather-drain parity: the non-fused path drains
             // once per block execution (epilogue); the fused loop must not
             // accumulate GP chunks across iterations. No-op when clean.
-            wb.op_i32_const((s32)(uintptr_t)&g_bem_gp_dirty);
+            emit_gp_dirty_addr(wb);
             wb.op_i32_load(0);
             wb.op_if();
                 wb.op_i32_const(0);
@@ -443,7 +457,14 @@ void emit_bcx_fused(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         wb.op_i32_const((s32)ctx_ptr); wb.op_i32_load(ppc_off::EXCEPTIONS);
         wb.op_i32_eqz();
         wb.op_i32_and();
-        wb.op_i32_const((s32)tag_addr); wb.op_i32_load(0);
+        // [AOT v4 reloc] tag const: sentinel + record when offline (sym/addend
+        // ride pre-encoded in tag_sentinel; see ppc_emit.cpp caller).
+        if (tag_sentinel)
+            wb.op_i32_const_reloc((u16)((tag_sentinel >> 24) & 0x0Fu),
+                                  tag_sentinel & 0x00FFFFFFu, tag_sentinel);
+        else
+            wb.op_i32_const((s32)tag_addr);
+        wb.op_i32_load(0);
         wb.op_i32_const((s32)start_pc); wb.op_i32_eq();
         wb.op_i32_and();
         wb.op_if();

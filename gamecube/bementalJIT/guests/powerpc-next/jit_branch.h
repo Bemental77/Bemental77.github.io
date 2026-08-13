@@ -54,11 +54,13 @@ void emit_bcx(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
 // self-loop's terminal CR-bit test reads the preceding cmp's operand locals
 // directly. This is the HOT path (IDCT self-chain), so fusing here is where the
 // materialize tax is most worth removing. nullptr = no fusion.
+// tag_sentinel: [AOT v4 reloc] non-zero in offline reloc mode — the tag const
+// is emitted as this OOB sentinel + a reloc record instead of tag_addr.
 void emit_bcx_fused(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                     const CodeOp& op, u32 ctx_ptr, u32 charge,
                     u32 loop_head_depth, bool block_has_store,
                     u32 tag_addr, u32 start_pc, const CmpFuse* fuse = nullptr,
-                    bool fp_resident = false);
+                    bool fp_resident = false, u32 tag_sentinel = 0u);
 
 // Indirect: bclr (op19:16) takes target from LR; bcctr (op19:528) takes
 // target from CTR. Both support LK to set LR=next_pc.

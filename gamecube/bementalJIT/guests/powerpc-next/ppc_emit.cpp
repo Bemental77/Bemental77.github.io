@@ -108,6 +108,7 @@ extern "C" {
     extern uint32_t      g_bem_fp_resident_loop; // [WS-1 STEP-3] FP self-loop op_loop residency A/B
     extern uint32_t      g_bem_aot_count_fnk;    // [AOT A3.1] emit a proof-of-run counter in fn_k wrappers (offline aot_merge only)
     extern uint32_t      g_bem_aot_build_singles; // [AOT A3.1b singles] build the ps dual-arm WITHOUT lc_base (offline, no emit-time SAB reads)
+    extern int           g_bem_aot_reloc_mode;    // [AOT v4 reloc] offline: emit OOB sentinels + reloc records instead of native &g_bem_* (wild-address class)
     int  bem_pc_force_double(uint32_t pc);      // [single-spec PM26] sticky deopt registry
 }
 static constexpr u32 BEM_DISP_MASK_NEXT = 0x3FFFFu;  // MUST match block_cache.cpp BEM_DISP_MASK (BEM_DISP_BITS=18)
@@ -157,6 +158,20 @@ struct MergedRegionCtx {
 };
 static constexpr u32 REGION_LAP_MAX = 2048u;
 
+// [AOT v4 reloc 2026-08-13] Native-static address const. A native offline tool's
+// &g_bem_* is its own ASLR-slid address — a wild pointer in the worker (the
+// wild-address class, A3_plan.md). In reloc mode (aot_merge only) emit an OOB
+// sentinel (traps loudly if ever left unpatched — sentinels always encode as
+// exactly 5 LEB bytes, so the seal patches any real address in place) and record
+// a reloc; the seal resolves &g_bem_* in-worker. Flag 0 → byte-identical to
+// op_i32_const(addr): the runtime JIT emit path is unchanged.
+static inline void emit_addr_const(WasmModuleBuilder& b, u32 addr, u16 sym, u32 addend = 0u) {
+    if (g_bem_aot_reloc_mode && sym != (u16)BEM_RSYM_NONE)
+        b.op_i32_const_reloc(sym, addend, bem_reloc_sentinel(sym, addend));
+    else
+        b.op_i32_const((s32)addr);
+}
+
 // [PM54d payload] direct_pcs/direct_fidx: up to 2 STATIC successor pcs whose
 // blocks live in THIS gen module, with their ABSOLUTE wasm function indices
 // (WIMPORT_COUNT + internal idx). Emitted as PC-compare arms AFTER the
@@ -169,7 +184,9 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
                                  s32 region_gen = -1,
                                  const u32* direct_pcs = nullptr,
                                  const u32* direct_fidx = nullptr,
-                                 u32 n_direct = 0u) {
+                                 u32 n_direct = 0u,
+                                 u16 tag_sym = (u16)BEM_RSYM_NONE,
+                                 u16 slot_sym = (u16)BEM_RSYM_NONE) {
     if (!g_bem_chain_enabled) {
         b.op_i32_const((s32)ctx_ptr);
         b.op_i32_load(ppc_off::PC);
@@ -306,11 +323,11 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
     b.op_i32_const(4); b.op_i32_mul();
     b.op_local_tee(LOCAL_TMP_B_CHAIN);
     // tag hit?  g_bem_disp_tag[bucket] == PC
-    b.op_i32_const((s32)tag_addr); b.op_i32_add(); b.op_i32_load(0);
+    emit_addr_const(b, tag_addr, tag_sym); b.op_i32_add(); b.op_i32_load(0);
     b.op_local_get(LOCAL_TMP_A_CHAIN); b.op_i32_eq();
     b.op_if(BLOCK_TYPE_VOID);
         // slot = g_bem_disp_slot[bucket]; if slot >= 0 → dispatch
-        b.op_i32_const((s32)slot_addr); b.op_local_get(LOCAL_TMP_B_CHAIN);
+        emit_addr_const(b, slot_addr, slot_sym); b.op_local_get(LOCAL_TMP_B_CHAIN);
         b.op_i32_add(); b.op_i32_load(0);
         b.op_local_tee(LOCAL_TMP_A_CHAIN);
         b.op_i32_const(0); b.op_i32_ge_s();
@@ -401,10 +418,10 @@ static void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
         b.op_i32_const((s32)BEM_DISP_MASK_NEXT); b.op_i32_and();
         b.op_i32_const(4); b.op_i32_mul();
         b.op_local_tee(LOCAL_TMP_B_CHAIN);
-        b.op_i32_const((s32)gtag); b.op_i32_add(); b.op_i32_load(0);
+        emit_addr_const(b, gtag, (u16)BEM_RSYM_DISP_TAG); b.op_i32_add(); b.op_i32_load(0);
         b.op_local_get(LOCAL_TMP_A_CHAIN); b.op_i32_eq();
         b.op_if(BLOCK_TYPE_VOID);
-            b.op_i32_const((s32)gslot); b.op_local_get(LOCAL_TMP_B_CHAIN);
+            emit_addr_const(b, gslot, (u16)BEM_RSYM_DISP_SLOT); b.op_local_get(LOCAL_TMP_B_CHAIN);
             b.op_i32_add(); b.op_i32_load(0);
             b.op_local_tee(LOCAL_TMP_A_CHAIN);
             b.op_i32_const(0); b.op_i32_ge_s();
@@ -955,7 +972,9 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                                  const MergedRegionCtx* merged = nullptr,
                                  s32 region_gen = -1,
                                  LocalIdxLookupFn region_lookup = nullptr,
-                                 const void* region_lookup_user = nullptr) {
+                                 const void* region_lookup_user = nullptr,
+                                 u16 chain_tag_sym = (u16)BEM_RSYM_NONE,
+                                 u16 chain_slot_sym = (u16)BEM_RSYM_NONE) {
     // IN-BLOCK CYCLE ACCOUNTING (2026-06-12, Jit64 parity: Jit.cpp charges
     // js.downcountAmount at block entry). downcount -= numCycles emitted in
     // the block prologue so the chain dispatcher can run block-to-block
@@ -1487,7 +1506,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
                 b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::lr_off());
                 b.op_i32_const((s32)0xFFFFFFFCu); b.op_i32_and();
                 b.op_i32_store(ppc_off::PC);
-                b.op_i32_const((s32)(uintptr_t)&g_bem_gp_dirty);
+                emit_addr_const(b, (u32)(uintptr_t)&g_bem_gp_dirty, (u16)BEM_RSYM_GP_DIRTY);
                 b.op_i32_load(0);
                 b.op_if(BLOCK_TYPE_VOID);
                     b.op_i32_const(0); b.op_i32_const(0);
@@ -1520,9 +1539,16 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             const u32 fused_tag_addr =
                 (chain_tag_addr ? chain_tag_addr
                                 : (u32)(uintptr_t)&g_bem_disp_tag[0]) + fused_bucket;
+            // [AOT v4 reloc] fused tag = (threaded base sym) + bucket addend.
+            const u32 fused_tag_sentinel = g_bem_aot_reloc_mode
+                ? bem_reloc_sentinel(chain_tag_addr ? chain_tag_sym
+                                                    : (u16)BEM_RSYM_DISP_TAG,
+                                     fused_bucket)
+                : 0u;
             emit_bcx_fused(b, rc, frc, op, ctx_ptr, charge, fused_loop_depth,
                            block_has_store, fused_tag_addr, start_pc, params.cmp_fuse,
-                           /*fp_resident=*/(fp_resident_loop && with_singles));
+                           /*fp_resident=*/(fp_resident_loop && with_singles),
+                           fused_tag_sentinel);
             emitted_native = true;
         } else if (is_terminator && with_singles && fast_loop &&
                    GekkoOperands::OPCD(op.inst) == 16u && frc.AllSingle(assumed)) {
@@ -1639,7 +1665,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         // compute store-blocks (the bulk) skip the crossing. UpdateGatherPipe
         // only flushes complete 32-byte chunks, so skipping it while no GP
         // write is pending is bit-identical to calling it (it would no-op).
-        b.op_i32_const((s32)(uintptr_t)&g_bem_gp_dirty);
+        emit_addr_const(b, (u32)(uintptr_t)&g_bem_gp_dirty, (u16)BEM_RSYM_GP_DIRTY);
         b.op_i32_load(0);
         b.op_if(BLOCK_TYPE_VOID);
             b.op_i32_const(0);
@@ -1765,7 +1791,8 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
         }
     }
     emit_chain_or_return(b, ctx_ptr, chain_tag_addr, chain_slot_addr, merged,
-                         region_gen, direct_pcs, direct_fidx, n_direct);
+                         region_gen, direct_pcs, direct_fidx, n_direct,
+                         chain_tag_sym, chain_slot_sym);
     };  // emit_arm
 
     if (assumed.m_val != 0u) {
@@ -2121,7 +2148,8 @@ std::vector<u8> build_region_function_next_merged(const RegionBlockDesc* blocks,
                                                   u32 n_blocks,
                                                   u32 gen_idx,
                                                   u32 blr_chain_addr,
-                                                  u32 mem_pages) {
+                                                  u32 mem_pages,
+                                                  std::vector<BemAotReloc>* out_relocs) {
     // [region-merged 2026-07-15] ONE wasm function for the whole generation.
     // Shape: func $region (idx 13) = 8-group locals + (N+1) nested void blocks
     // + br_table(entry_sel) + the N spliced block-body expressions + a default
@@ -2151,6 +2179,8 @@ std::vector<u8> build_region_function_next_merged(const RegionBlockDesc* blocks,
     const u32 rtag  = (u32)(uintptr_t)&g_bem_mrtag[0];
     const u32 rslot = (u32)(uintptr_t)&g_bem_mrslot[0];
     std::vector<std::vector<u8>> bodies(n_blocks);
+    // [AOT v4 reloc] per-body reloc lists (body-relative offsets; rebased at splice)
+    std::vector<std::vector<WasmModuleBuilder::Reloc>> brelocs(n_blocks);
     for (u32 i = 0; i < n_blocks; ++i) {
         const RegionBlockDesc& d = blocks[i];
         if (d.insts == nullptr || d.count == 0u) return {};
@@ -2173,8 +2203,12 @@ std::vector<u8> build_region_function_next_merged(const RegionBlockDesc* blocks,
         mctx.br_extra_depth = n_blocks - i;
         emit_block_body_into(bb, block, buffer, stats, d.count, d.start_pc,
                              d.ctx_ptr, d.mem1_base, d.mem1_mask, d.ram_size,
-                             rtag, rslot, &mctx);
+                             rtag, rslot, &mctx,
+                             /*region_gen=*/-1, /*region_lookup=*/nullptr,
+                             /*region_lookup_user=*/nullptr,
+                             (u16)BEM_RSYM_MRTAG, (u16)BEM_RSYM_MRSLOT);
         bodies[i] = bb.getBytes();
+        brelocs[i] = bb.relocs();
     }
     const u32 ctx_ptr_any = blocks[0].ctx_ptr;   // one PowerPCState for all
 
@@ -2267,7 +2301,14 @@ std::vector<u8> build_region_function_next_merged(const RegionBlockDesc* blocks,
     }
     for (u32 k = 0; k < n_blocks; ++k) {
         b.op_end();                               // close $B_k — br_table lands here
+        // [AOT v4 reloc] splice base: no byte ever moves after append (all size
+        // fields are 5-byte in-place patches), so base + body-relative offset =
+        // final module-absolute offset.
+        const u32 splice_base = (u32)b.size();
         b.emitBytes(bodies[k].data(), bodies[k].size());
+        if (out_relocs)
+            for (const auto& r : brelocs[k])
+                out_relocs->push_back({ r.sym, 0u, r.addend, splice_base + r.offset });
     }
     b.op_end();                                   // close $DEF — default arm
     // Default (sel out of range — never set by wrappers/edges, but the
@@ -2295,7 +2336,9 @@ std::vector<u8> build_region_function_next_merged(const RegionBlockDesc* blocks,
         }
         // Host-boundary contract: reset the consecutive-tail-chain budget so
         // the idle-skip streak detector keeps observing (block_cache.cpp:448).
-        b.op_i32_const((s32)blr_chain_addr);
+        // [AOT v4 reloc] offline, blr_chain_addr is a placeholder → reloc to the
+        // worker's real &g_blr_chain at seal.
+        emit_addr_const(b, blr_chain_addr, (u16)BEM_RSYM_BLR_CHAIN);
         b.op_i32_const(0);
         b.op_i32_store(0);
         b.op_i32_const(0);
@@ -2306,6 +2349,11 @@ std::vector<u8> build_region_function_next_merged(const RegionBlockDesc* blocks,
         b.endFuncBody();
     }
     b.endSection();
+    // [AOT v4 reloc] top-level builder offsets (fn_k blr_chain consts) are
+    // already module-absolute — merge them after the rebased body relocs.
+    if (out_relocs)
+        for (const auto& r : b.relocs())
+            out_relocs->push_back({ r.sym, 0u, r.addend, r.offset });
     return b.getBytes();
 }
 

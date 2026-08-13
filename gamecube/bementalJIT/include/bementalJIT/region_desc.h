@@ -24,6 +24,38 @@ struct RegionBlockDesc {
     u32        ram_size  = 0;
 };
 
+// [AOT v4 reloc 2026-08-13] Offline emit must bake ZERO native static addresses
+// (the wild-address class: a native tool's &g_bem_* is ASLR-slid garbage in the
+// worker). In reloc mode the emitter emits an OOB sentinel const
+// (0xE0000000 | sym<<24 | addend, fixed 5-byte LEB — traps loudly if ever left
+// unpatched) and records a reloc; the SEAL, which runs in the worker where
+// &g_bem_* is trivially correct, patches the module bytes before instantiate.
+enum BemRelocSym : u16 {
+    BEM_RSYM_DISP_TAG   = 0,   // &g_bem_disp_tag[0]
+    BEM_RSYM_DISP_SLOT  = 1,   // &g_bem_disp_slot[0]
+    BEM_RSYM_MRTAG      = 2,   // &g_bem_mrtag[0]
+    BEM_RSYM_MRSLOT     = 3,   // &g_bem_mrslot[0]
+    BEM_RSYM_GP_DIRTY   = 4,   // &g_bem_gp_dirty
+    BEM_RSYM_BLR_CHAIN  = 5,   // &bemental::g_blr_chain
+    BEM_RSYM_RTAG       = 6,   // reserved (N-fn path, not in v4 scope)
+    BEM_RSYM_RSLOT      = 7,   // reserved
+    BEM_RSYM_CR_SHADOW  = 8,   // reserved (BEM_LAZY_CR latent class)
+    BEM_RSYM_CR_PENDING = 9,   // reserved
+    BEM_RSYM_COUNT      = 10,
+    BEM_RSYM_NONE       = 0xFFFF,
+};
+
+struct BemAotReloc {
+    u16 sym    = BEM_RSYM_NONE;
+    u16 rsvd   = 0;
+    u32 addend = 0;
+    u32 offset = 0;   // module-absolute byte offset of the 5-byte const immediate
+};
+
+static inline u32 bem_reloc_sentinel(u16 sym, u32 addend) {
+    return 0xE0000000u | ((u32)sym << 24) | (addend & 0x00FFFFFFu);
+}
+
 // Merged single-function region, powerpc-next codegen. Module: 13 imports +
 // memory; func 13 = $region (8-group locals, (N+1)-deep block nest,
 // br_table(entry_sel), N spliced emit_block_body_into bodies, default arm
@@ -42,10 +74,13 @@ struct RegionBlockDesc {
 // blr_chain_addr: host address of bemental::g_blr_chain (C++-linkage symbol
 // at bemental:: scope in block_cache.cpp — passed by value to avoid namespace
 // surgery in the emitter TU).
+// out_relocs: non-null ONLY in offline reloc mode (g_bem_aot_reloc_mode=1) —
+// receives the module-absolute reloc table for the BJAOTM v4 asset.
 std::vector<u8> build_region_function_next_merged(const RegionBlockDesc* blocks,
                                                   u32 n_blocks,
                                                   u32 gen_idx,
                                                   u32 blr_chain_addr,
-                                                  u32 mem_pages = 1);
+                                                  u32 mem_pages = 1,
+                                                  std::vector<BemAotReloc>* out_relocs = nullptr);
 
 }  // namespace bemental::powerpc

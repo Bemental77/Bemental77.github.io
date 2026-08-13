@@ -749,6 +749,31 @@ public:
 		op_if(blockType);
 	}
 	const std::vector<BranchHint>& branchHints() const { return m_branch_hints; }
+
+	// [AOT v4 reloc] i32.const as a FIXED 5-byte signed LEB (padded encodings are
+	// spec-legal). Unlike patchLEB128_5, byte 4 carries the i32 sign-extension
+	// bits (32-34 must extend bit 31) or the validator rejects the const.
+	void op_i32_const_fixed5(s32 val) {
+		const u32 v = (u32)val;
+		emitByte(wop::i32_const);
+		emitByte((v & 0x7F) | 0x80);
+		emitByte(((v >> 7) & 0x7F) | 0x80);
+		emitByte(((v >> 14) & 0x7F) | 0x80);
+		emitByte(((v >> 21) & 0x7F) | 0x80);
+		emitByte(((v >> 28) & 0x0F) | ((v & 0x80000000u) ? 0x70 : 0x00));
+	}
+	// Emit a relocatable address const: OOB sentinel value (traps loudly if left
+	// unpatched), fixed width so the seal can patch any address in place. Records
+	// {sym, addend, offset-of-immediate} — offsets are relative to THIS builder's
+	// buffer start and never move (all size fields are patched in place), so a
+	// top-level builder's offsets are final module offsets; spliced bodies are
+	// rebased by the splice position. Module-lifetime (NOT cleared per body).
+	struct Reloc { u16 sym; u16 rsvd; u32 addend; u32 offset; };
+	void op_i32_const_reloc(u16 sym, u32 addend, u32 sentinel) {
+		m_relocs.push_back({ sym, 0, addend, (u32)bytes.size() + 1 });
+		op_i32_const_fixed5((s32)sentinel);
+	}
+	const std::vector<Reloc>& relocs() const { return m_relocs; }
 	void op_else()       { emitByte(wop::else_); }
 	void op_end()        { emitByte(wop::end); if (m_ctrl_depth) --m_ctrl_depth; }
 	void op_block(u8 blockType = 0x40) { emitByte(wop::block); emitByte(blockType); ++m_ctrl_depth; }
@@ -783,6 +808,8 @@ private:
 	// populated by op_if_hinted, cleared at beginFuncBody. Consumed by the module
 	// assembler to emit the metadata.code.branch_hint custom section.
 	std::vector<BranchHint> m_branch_hints;
+	// [AOT v4 reloc] module-lifetime reloc records (see op_i32_const_reloc).
+	std::vector<Reloc> m_relocs;
 
 	// Write a u32 as a 5-byte fixed-length LEB128 at a specific position
 	void patchLEB128_5(u32 pos, u32 value) {

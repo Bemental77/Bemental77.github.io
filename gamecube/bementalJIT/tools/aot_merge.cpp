@@ -17,6 +17,15 @@
 #include "bementalJIT/region_desc.h"
 #include "guests/powerpc-next/ppc_emit.h"
 #include "guests/powerpc-next/ppc_analyst.h"
+#include "guests/powerpc-next/cr_shadow.h"
+
+// [AOT v4 reloc] g_bem_cr_shadow/g_bem_cr_pending are baked as native addresses
+// by cr_encode/jit_branch when BEM_LAZY_CR is on — a wild-address class with NO
+// reloc coverage yet (syms 8-9 reserved). Refuse to build offline assets until
+// that coverage exists.
+static_assert(!bemental::powerpc::BEM_LAZY_CR,
+              "BEM_LAZY_CR bakes g_bem_cr_shadow/g_bem_cr_pending natively — add "
+              "BEM_RSYM_CR_SHADOW/CR_PENDING reloc coverage before offline emit");
 
 #include <cstdio>
 #include <cstdint>
@@ -30,7 +39,7 @@
 using namespace bemental;
 using namespace bemental::powerpc;
 
-extern "C" { extern uint32_t g_bem_lc_base; extern uint32_t g_bem_aot_count_fnk; extern uint32_t g_bem_aot_build_singles; }
+extern "C" { extern uint32_t g_bem_lc_base; extern uint32_t g_bem_aot_count_fnk; extern uint32_t g_bem_aot_build_singles; extern int g_bem_aot_reloc_mode; extern unsigned char g_bem_promote_enabled; }
 // g_hle_hook_query is bemental::powerpc::g_hle_hook_query (via using namespace) — not extern "C".
 
 // --- PPC branch-target decode (for the CFG walk) ---
@@ -105,6 +114,13 @@ int main(int argc, char** argv) {
   g_bem_lc_base = 0u;                       // stays 0 (no emit-time SAB reads)
   g_bem_aot_build_singles = build_singles;  // decoupled singles-arm enable (argv[4])
   g_bem_aot_count_fnk = count_fnk;   // fn_k proof-of-run counter (argv[3]; default OFF)
+  // [AOT v4 reloc — wild-address class, A3_plan.md 2026-08-13] This tool's own
+  // &g_bem_* are ASLR-slid native addresses = wild pointers in the worker. Emit
+  // ZERO native addresses: OOB sentinels + a reloc table the seal patches
+  // in-worker. And skip the promote-ring profiling prologue entirely — an AOT
+  // gen is pre-promoted (promote_hot dedups sealed pcs; pc_exec has no reader).
+  g_bem_promote_enabled = 0;
+  g_bem_aot_reloc_mode  = 1;
 
   // --- block starts: entry + EVERY internal branch target (forward conditionals
   // coalesce mid-block, but their TAKEN target is still a block start the merged
@@ -163,24 +179,68 @@ int main(int argc, char** argv) {
   // --- emit the merged $region module ---
   const uint32_t gen_idx = 0xA07u;                 // reserved AOT gen
   const uint32_t blr_chain_addr = 0x026B3500u;     // placeholder (module validity is addr-independent)
+  std::vector<BemAotReloc> relocs;
   std::vector<uint8_t> mod = build_region_function_next_merged(
-      descs.data(), (uint32_t)descs.size(), gen_idx, blr_chain_addr, /*mem_pages=*/1u);
+      descs.data(), (uint32_t)descs.size(), gen_idx, blr_chain_addr, /*mem_pages=*/1u,
+      &relocs);
 
   const bool ok = mod.size() >= 8 && mod[0] == 0x00 && mod[1] == 0x61 && mod[2] == 0x73 && mod[3] == 0x6D;
-  std::printf("[aot-merge] merged module: %zu bytes, wasm-magic=%s\n", mod.size(), ok ? "OK" : "BAD");
+  std::printf("[aot-merge] merged module: %zu bytes, wasm-magic=%s, relocs=%zu\n",
+              mod.size(), ok ? "OK" : "BAD", relocs.size());
   if (!ok) return 2;
 
-  // --- write the v3 MERGED asset the AOT loader seals as a pre-built gen ---
-  // Format: "BJAOTM\0" | ver=3 u32 | baked_ctx u32 | gen_idx u32 | n_blocks u32
+  // [AOT v4 reloc] self-check: every recorded site must be an i32.const (0x41)
+  // whose fixed 5-byte immediate decodes to EXACTLY the expected sentinel; and a
+  // whole-module sweep must find no sentinel-shaped 5-byte const that was NOT
+  // recorded (a missed-record would survive as a live OOB trap in the worker).
+  auto leb5 = [&](size_t off) -> uint32_t {
+    return (uint32_t)(mod[off] & 0x7F) | ((uint32_t)(mod[off + 1] & 0x7F) << 7) |
+           ((uint32_t)(mod[off + 2] & 0x7F) << 14) | ((uint32_t)(mod[off + 3] & 0x7F) << 21) |
+           ((uint32_t)(mod[off + 4] & 0x0F) << 28);
+  };
+  for (const BemAotReloc& r : relocs) {
+    if (r.offset < 1 || r.offset + 5 > mod.size() || mod[r.offset - 1] != 0x41 ||
+        (mod[r.offset] & 0x80) == 0 || leb5(r.offset) != bem_reloc_sentinel(r.sym, r.addend)) {
+      std::fprintf(stderr, "[aot-merge] RELOC SELF-CHECK FAILED: sym=%u addend=0x%x offset=%u\n",
+                   (unsigned)r.sym, r.addend, r.offset);
+      return 3;
+    }
+  }
+  {
+    std::set<uint32_t> recorded;
+    for (const BemAotReloc& r : relocs) recorded.insert(r.offset);
+    size_t unrecorded = 0;
+    for (size_t i = 0; i + 6 <= mod.size(); ++i) {
+      if (mod[i] != 0x41) continue;
+      if ((mod[i+1] & 0x80) && (mod[i+2] & 0x80) && (mod[i+3] & 0x80) && (mod[i+4] & 0x80) &&
+          (mod[i+5] & 0x80) == 0 && (leb5(i + 1) & 0xF0000000u) == 0xE0000000u &&
+          ((leb5(i + 1) >> 24) & 0x0Fu) < BEM_RSYM_COUNT && !recorded.count((uint32_t)i + 1))
+        ++unrecorded;   // sentinel-shaped const with no reloc record
+    }
+    // NOTE: a guest immediate can legitimately match the sentinel shape (e.g.
+    // 0xE0000000 locked-cache constants scan as sym 0) — such bytes are NOT
+    // consts at those offsets necessarily (raw byte scan). Report, don't fail,
+    // unless relocs missed entirely.
+    if (unrecorded) std::printf("[aot-merge] note: %zu sentinel-shaped unrecorded byte patterns (guest imms scan-alias; recorded relocs are authoritative)\n", unrecorded);
+    if (relocs.empty()) { std::fprintf(stderr, "[aot-merge] RELOC SELF-CHECK: zero relocs recorded — reloc mode inert?\n"); return 3; }
+  }
+
+  // --- write the v4 MERGED asset the AOT loader validates + seals (patched in-worker) ---
+  // Format: "BJAOTM\0" | ver=4 u32 | baked_ctx u32 | gen_idx u32 | n_blocks u32
   //   | n_blocks*(pc u32, gspan u32, ghash u32)   [fn_k order; ghash authenticates guest code]
+  //   | n_reloc u32 | n_reloc*(sym u16, rsvd u16, addend u32, offset u32)
+  //   | module_fnv u32 (FNV-1a over module bytes AS SHIPPED, sentinels in place)
   //   | module_len u32 | module bytes
   auto put32 = [](std::vector<uint8_t>& v, uint32_t x) {
     v.push_back(x & 0xFF); v.push_back((x >> 8) & 0xFF); v.push_back((x >> 16) & 0xFF); v.push_back((x >> 24) & 0xFF);
   };
+  auto put16 = [](std::vector<uint8_t>& v, uint16_t x) {
+    v.push_back(x & 0xFF); v.push_back((x >> 8) & 0xFF);
+  };
   std::vector<uint8_t> asset;
   const char magic[7] = {'B','J','A','O','T','M','\0'};
   asset.insert(asset.end(), magic, magic + 7);
-  put32(asset, 3u);
+  put32(asset, 4u);
   put32(asset, ctx_ptr);
   put32(asset, gen_idx);
   put32(asset, (uint32_t)descs.size());
@@ -189,6 +249,15 @@ int main(int argc, char** argv) {
     for (uint32_t j = 0; j < d.count; ++j) { const uint32_t gw = d.insts[j]; for (int k = 0; k < 4; ++k) { h ^= (gw >> (8 * k)) & 0xFFu; h *= 0x01000193u; } }
     put32(asset, d.start_pc); put32(asset, d.count); put32(asset, h);
   }
+  put32(asset, (uint32_t)relocs.size());
+  for (const BemAotReloc& r : relocs) {
+    put16(asset, r.sym); put16(asset, 0u); put32(asset, r.addend); put32(asset, r.offset);
+  }
+  {
+    uint32_t mh = 0x811c9dc5u;   // module FNV-1a (pristine shipped bytes)
+    for (uint8_t byte : mod) { mh ^= byte; mh *= 0x01000193u; }
+    put32(asset, mh);
+  }
   put32(asset, (uint32_t)mod.size());
   asset.insert(asset.end(), mod.begin(), mod.end());
 
@@ -196,7 +265,7 @@ int main(int argc, char** argv) {
   if (!f) { std::perror("fopen"); return 1; }
   std::fwrite(asset.data(), 1, asset.size(), f);
   std::fclose(f);
-  std::printf("[aot-merge] wrote %s: %zu-byte asset (%zu blocks + %zu-byte module, gen=0x%x, ctx=0x%08x)\n",
-              out_path, asset.size(), descs.size(), mod.size(), gen_idx, ctx_ptr);
+  std::printf("[aot-merge] wrote %s: %zu-byte v4 asset (%zu blocks + %zu relocs + %zu-byte module, gen=0x%x, ctx=0x%08x)\n",
+              out_path, asset.size(), descs.size(), relocs.size(), mod.size(), gen_idx, ctx_ptr);
   return 0;
 }

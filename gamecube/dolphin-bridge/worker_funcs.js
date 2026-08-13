@@ -99,30 +99,12 @@ if (typeof Module !== 'undefined') {
     postMessage({ cmd: 'runtime-ready' });
     postMessage({ cmd: 'print', txt: '[worker] runtime-ready posted' });
 
-    // [AOT A1] Async-stream the prebuilt-block asset. We only malloc it into
-    // SHARED linear memory here (worker-main instance) and publish (len,ptr)
-    // via SAB cells; the EmuThread pthread parses it in Run()->AotPollAndLoad
-    // (file-statics are per-instance under PROXY_TO_PTHREAD). Publish len
-    // FIRST, ptr LAST — ptr is the pthread's trigger. Non-fatal on failure:
-    // a missing/short asset just leaves AOT inactive (JIT path unchanged).
-    try {
-      fetch('/gamecube/dolphin_libretro/psmtxro.bjaot')
-        .then(function (r) { return r.ok ? r.arrayBuffer() : null; })
-        .then(function (ab) {
-          if (!ab || !Module._malloc) return;
-          var bytes = new Uint8Array(ab);
-          var ptr = Module._malloc(bytes.length);
-          if (!ptr) return;
-          Module.HEAPU8.set(bytes, ptr);
-          var h32 = Module.HEAPU32 || new Uint32Array(Module.HEAPU8.buffer);
-          h32[0x026B346C >> 2] = bytes.length >>> 0;  // len first
-          Atomics.store(h32, 0x026B3468 >> 2, ptr >>> 0);  // ptr last (trigger)
-          postMessage({ cmd: 'print', txt: '[worker][aot] psmtxro.bjaot streamed: ' + bytes.length + ' bytes @0x' + (ptr >>> 0).toString(16) });
-        })
-        .catch(function (e) {
-          postMessage({ cmd: 'print', txt: '[worker][aot] asset fetch failed: ' + e });
-        });
-    } catch (e) {}
+    // [AOT v4 reloc 2026-08-13] psmtxro.bjaot (v2 per-block) fetch DISABLED:
+    // every offline v2 asset bakes the native tool's ASLR-slid &g_bem_* — its
+    // promote-prologue stray-writes worker heap on EVERY execution (the
+    // wild-address class, A3_plan.md). Re-enable only with a v4-per-block
+    // regen (reloc table + seal-time patching).
+    // (The A1 per-block load path itself is unchanged and stays proven.)
 
     // [AOT A3.1] MERGED whole-function asset (BJAOTM) — same choreography, its
     // own SAB cells (len 0x026B3494 first, ptr 0x026B3490 last = the trigger).

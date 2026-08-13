@@ -1,5 +1,6 @@
 #pragma once
 #include "types.h"
+#include "region_desc.h"   // [AOT v4 reloc] BemAotReloc for aot_seal_merged
 #include <array>
 #include <cstddef>
 #include <unordered_map>
@@ -204,7 +205,12 @@ public:
     // Idempotent-ish: sets m_aot_sealed; clear() resets it so Run() re-seals after
     // a savestate load (which wipes all gens). SMC eviction is handled by the
     // existing evict()/unseal_pc_js per-PC path (no baked edges in merged gens).
-    bool aot_seal_merged(const u8* bytes, std::size_t len, const u32* pc_keys, u32 n, u32 gen_idx);
+    // [AOT v4 reloc] relocs: sentinel sites to patch with THIS worker's real
+    // &g_bem_* before instantiate (the wild-address fix — offline tools cannot
+    // bake native addresses). Patching runs on a local copy; shipped bytes stay
+    // pristine so the post-clear() re-seal re-patches fresh.
+    bool aot_seal_merged(const u8* bytes, std::size_t len, const u32* pc_keys, u32 n, u32 gen_idx,
+                         const powerpc::BemAotReloc* relocs = nullptr, u32 n_relocs = 0u);
     bool aot_is_sealed() const { return m_aot_sealed; }
     bool is_sealed_pc(u32 pc) const { return m_sealed_pcs.count(pc) != 0; }  // [AOT A3.1] SMC test observe
 

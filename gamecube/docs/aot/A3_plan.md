@@ -172,7 +172,38 @@ lucky address draw, nothing more.** The trap itself is common to ALL AOT-on runs
 leading site candidate: the miss-path re-assert's first dispatch — under investigation). The
 shipping counter-free asset was never live-certified before shipping.
 
-**Fix direction (design pass before code):** offline emit must yield ZERO native-address bakes —
+**FIX LANDED (2026-08-13, BJAOTM v4 reloc-seal — 12-agent design workflow wf_ac8389fd-bff,
+2 adversarial verifiers):** offline emit now yields ZERO native-address bakes. (a) The tool sets
+`g_bem_promote_enabled=0` (prologue omitted — AOT gens are pre-promoted; zero consumers lose
+anything) + `g_bem_aot_reloc_mode=1`: every remaining native-address site emits an OOB sentinel
+`0xE0000000|sym<<24|addend` (always exactly 5 LEB bytes; traps loudly if ever left unpatched)
+and records a reloc. (b) BJAOTM v4 = v3 + reloc table + module-FNV; the loader REJECTS v3 and
+validates bounds/opcode/expected-sentinel/FNV with distinct statuses (0x80000005-7) before
+accepting. (c) `aot_seal_merged` patches each site with the WORKER's real `&g_bem_*` (same-TU)
+on a local copy — shipped bytes stay pristine; re-seal after clear() re-patches fresh. (d) The
+seal now also SEEDS mrtag/mrslot like region_seal (AOT warm edges had NEVER worked — nothing
+populated them). (e) psmtxro.bjaot v2 fetch DISABLED (its prologue stray-writes heap every
+execution; regen as v4-per-block later). (f) `static_assert(!BEM_LAZY_CR)` in the tool guards
+the reserved cr_shadow/cr_pending class. **Offline proofs:** two tool launches emit
+byte-identical assets (the determinism gate ASLR made impossible before); 408 relocs = exactly
+the census (253 gp_dirty + 31×{mrtag,mrslot,disp_tag,disp_slot,blr_chain}); sentinel AND
+patched modules validate in V8; exports intact.
+
+**Re-cert status (honest): the wedge SURVIVES the v4 fix — it is a SEPARATE bug.** v4 seals
+clean (auth_mm=0) and the counter-ON asset executes 4.59M dispatches, but every AOT-on run
+still logs steals=1 + ONE `function signature mismatch` C-dispatch trap and the guest wedges
+100% in SelectThread post-load (histogram-verified; dispatches accumulate pre-wedge).
+**Isolation:** clean addresses ⇒ not the wild-address class; psmtxro absent ⇒ not cross-asset;
+AOT-off clean ⇒ merged-seal-dependent. Timeline: the last KNOWN-healthy AOT-on scene (share>0)
+is the 3f59a6a timing gate — BEFORE e716794's miss-path re-assert; every certified run since
+read only counters, never the histogram, so the morning 4.94M "cert" was likely wedged too.
+**Prime suspect: the re-assert dispatch path itself** (block_cache.cpp:839-866: aot_pc_slot →
+bucket re-point → C fn-ptr call = call_indirect ()->i32): its first exercise traps and the
+trapped thread wedges the game thread. Next session opens here — instrument trap_pc
+(chain_dispatch_raw already captures it) + the re-assert's handle value, and check the
+clear()/re-seal slot-freshness interplay.
+
+**Original fix direction (executed above, kept for the record):** offline emit must yield ZERO native-address bakes —
 (i) omit the promote-ring profiling prologue in AOT bodies (an AOT gen is pre-promoted by
 definition; also deletes the 15–40% small-block op-overhead class from AOT bodies = a real body
 win); (ii) a RELOCATION TABLE in a BJAOTM v4 (emit fixed-width consts + record (symbol, offset);

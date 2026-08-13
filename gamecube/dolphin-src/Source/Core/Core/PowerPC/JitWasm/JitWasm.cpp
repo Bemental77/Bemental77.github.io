@@ -274,20 +274,26 @@ void AotPollAndLoad()
 // 0x026B34A4..34BC. Re-seals after clear() (savestate load wipes all gens).
 struct AotMergedBlk { u32 pc, gspan, ghash; };
 std::vector<AotMergedBlk> g_aotm_blocks;
+std::vector<bemental::powerpc::BemAotReloc> g_aotm_relocs;
 std::vector<u8> g_aotm_module;
 u32  g_aotm_ctx = 0u, g_aotm_gen = 0u;
 bool g_aotm_parsed = false;
 
+// [AOT v4 reloc] v3 is REJECTED: every v3 asset bakes the offline tool's native
+// static addresses (the wild-address class — silent worker-heap corruption).
+// v4 = v3 layout + reloc table + module FNV; the seal patches each sentinel
+// with this worker's real &g_bem_* before instantiate. All failures land a
+// DISTINCT status in 0x026B34A4 and leave the asset unparsed (JIT fallback).
 void AotParseMerged(const u8* data, u32 len)
 {
-  g_aotm_blocks.clear(); g_aotm_module.clear(); g_aotm_parsed = false;
+  g_aotm_blocks.clear(); g_aotm_relocs.clear(); g_aotm_module.clear(); g_aotm_parsed = false;
   if (!data || len < 23u || std::memcmp(data, "BJAOTM", 7) != 0) { *AotCell(0x026B34A4u) = 0x80000001u; return; }
   u32 off = 7u;
   const u32 ver = AotRd32LE(data + off); off += 4u;
   g_aotm_ctx    = AotRd32LE(data + off); off += 4u;
   g_aotm_gen    = AotRd32LE(data + off); off += 4u;
   const u32 n   = AotRd32LE(data + off); off += 4u;
-  if (ver != 3u || n == 0u || n > 4096u) { *AotCell(0x026B34A4u) = 0x80000002u; return; }
+  if (ver != 4u || n == 0u || n > 4096u) { *AotCell(0x026B34A4u) = 0x80000002u; return; }
   if (static_cast<u64>(off) + static_cast<u64>(n) * 12ull + 4ull > len) { *AotCell(0x026B34A4u) = 0x80000003u; return; }
   g_aotm_blocks.resize(n);
   for (u32 i = 0; i < n; ++i)
@@ -296,9 +302,46 @@ void AotParseMerged(const u8* data, u32 len)
     g_aotm_blocks[i].gspan = AotRd32LE(data + off); off += 4u;
     g_aotm_blocks[i].ghash = AotRd32LE(data + off); off += 4u;
   }
+  const u32 nrel = AotRd32LE(data + off); off += 4u;
+  if (nrel > 65536u ||
+      static_cast<u64>(off) + static_cast<u64>(nrel) * 12ull + 8ull > len)
+  { *AotCell(0x026B34A4u) = 0x80000003u; return; }
+  g_aotm_relocs.resize(nrel);
+  for (u32 i = 0; i < nrel; ++i)
+  {
+    g_aotm_relocs[i].sym    = static_cast<u16>(data[off] | (data[off + 1u] << 8)); off += 2u;
+    g_aotm_relocs[i].rsvd   = 0u; off += 2u;
+    g_aotm_relocs[i].addend = AotRd32LE(data + off); off += 4u;
+    g_aotm_relocs[i].offset = AotRd32LE(data + off); off += 4u;
+  }
+  const u32 mfnv = AotRd32LE(data + off); off += 4u;
   const u32 mlen = AotRd32LE(data + off); off += 4u;
   if (static_cast<u64>(off) + mlen > len) { *AotCell(0x026B34A4u) = 0x80000004u; return; }
   g_aotm_module.assign(data + off, data + off + mlen);
+  // Validate BEFORE accepting: (a) every reloc site is an i32.const whose fixed
+  // 5-byte immediate decodes to EXACTLY the expected sentinel; (b) the module
+  // FNV matches (pristine shipped bytes). Any failure = the asset lies about
+  // its own patch sites — refuse it entirely rather than patch blind.
+  for (u32 i = 0; i < nrel; ++i)
+  {
+    const auto& r = g_aotm_relocs[i];
+    if (r.sym >= bemental::powerpc::BEM_RSYM_COUNT || r.offset < 1u || r.offset + 5u > mlen ||
+        g_aotm_module[r.offset - 1u] != 0x41u)
+    { g_aotm_module.clear(); *AotCell(0x026B34A4u) = 0x80000005u; return; }
+    const u8* p = g_aotm_module.data() + r.offset;
+    const u32 dec = static_cast<u32>(p[0] & 0x7Fu) | (static_cast<u32>(p[1] & 0x7Fu) << 7) |
+                    (static_cast<u32>(p[2] & 0x7Fu) << 14) | (static_cast<u32>(p[3] & 0x7Fu) << 21) |
+                    (static_cast<u32>(p[4] & 0x0Fu) << 28);
+    const u32 expect = 0xE0000000u | (static_cast<u32>(r.sym) << 24) | (r.addend & 0x00FFFFFFu);
+    if (!(p[0] & 0x80u) || !(p[1] & 0x80u) || !(p[2] & 0x80u) || !(p[3] & 0x80u) ||
+        (p[4] & 0x80u) || dec != expect)
+    { g_aotm_module.clear(); *AotCell(0x026B34A4u) = 0x80000006u; return; }
+  }
+  {
+    u32 h = 0x811c9dc5u;
+    for (const u8 byte : g_aotm_module) { h ^= byte; h *= 0x01000193u; }
+    if (h != mfnv) { g_aotm_module.clear(); *AotCell(0x026B34A4u) = 0x80000007u; return; }
+  }
   g_aotm_parsed = true;
   *AotCell(0x026B34A8u) = n;
   *AotCell(0x026B34ACu) = g_aotm_gen;
@@ -341,7 +384,8 @@ void AotMergedTrySeal(Cache& cache, Mem& mem, u32 live_ctx)
     pcs.push_back(b.pc);
   }
   if (cache.aot_seal_merged(g_aotm_module.data(), g_aotm_module.size(),
-                            pcs.data(), static_cast<u32>(pcs.size()), g_aotm_gen))
+                            pcs.data(), static_cast<u32>(pcs.size()), g_aotm_gen,
+                            g_aotm_relocs.data(), static_cast<u32>(g_aotm_relocs.size())))
     AotBump(0x026B34B8u);                                   // seals
 }
 }  // namespace
