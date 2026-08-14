@@ -28,6 +28,10 @@
 namespace bemental::powerpc {
 
 static constexpr u32 WIMPORT_INTERP = 6;
+// [EDGE-DIET 13h] dolphin_check_exc import (idx 7) — delivers any pending exception
+// (sets PC=vector; arg unused). Used post-rfi since the diet removed the edge's
+// maskable-exception check and rfi can flip MSR.EE=1 with an IRQ pending.
+static constexpr u32 WIMPORT_CHECK_EXC = 7;
 
 // [MIPS meter 2026-08-11] Fused-loop back-edge charge accumulation — MUST stay
 // in sync with ppc_emit.cpp's BEM_MIPS_CENSUS / BEM_MIPS_EXEC_CELL (that file
@@ -607,6 +611,13 @@ void emit_rfi(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const CodeO
     wb.op_i32_const((s32)op.inst);
     wb.op_i32_const((s32)op.address);
     wb.op_call(WIMPORT_INTERP);
+    // [EDGE-DIET 13h] rfi restored MSR from SRR1 (may flip EE=1 with an IRQ pending).
+    // The edge predicate no longer checks maskable exceptions, so deliver here — the
+    // WIMPORT_CHECK_EXC integration the original comment noted this op needs. Stack-
+    // neutral (const +1, call -1+1, drop -1 = 0). Mirrors emit_mtmsr's check.
+    wb.op_i32_const(0);
+    wb.op_call(WIMPORT_CHECK_EXC);
+    wb.op_drop();
 }
 
 }  // namespace bemental::powerpc

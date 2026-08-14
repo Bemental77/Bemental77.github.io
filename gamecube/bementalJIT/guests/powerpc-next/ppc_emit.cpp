@@ -222,23 +222,16 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
     constexpr s32 EXC_MASKABLE = 0x105;   // DECREMENTER|EXTERNAL_INT|PERFORMANCE_MONITOR
     constexpr s32 MSR_EE       = 0x8000;
     (void)exc0_addr;
-    // [a] downcount <= 0
+    // [a] downcount <= 0  — [EDGE-DIET 13h] predicate COLLAPSED to downcount-only.
+    // The removed [b]/[c] exception checks are covered by: sync exceptions raise via
+    // ForceExceptionCheck(0) (sets downcount<=0 -> [a] catches, CommandProcessor.cpp:
+    // 418-419,460) or the interp setting PC=vector directly; maskable IRQs deliver via
+    // CoreTiming::Advance's cpu_owner==1 CheckExternalExceptions (CoreTiming.cpp:537-540);
+    // rfi's EE-flip is caught by the post-rfi WIMPORT_CHECK_EXC added to emit_rfi. The
+    // vector-page guard below stays PERMANENT. (void)EXC_SYNC/EXC_MASKABLE/MSR_EE.
+    (void)EXC_SYNC; (void)EXC_MASKABLE; (void)MSR_EE;
     b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::DOWNCOUNT);
     b.op_i32_const(0); b.op_i32_le_s();
-    // [b] (Exceptions & EXC_SYNC) != 0
-    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::EXCEPTIONS);
-    b.op_i32_const(EXC_SYNC); b.op_i32_and();
-    b.op_i32_const(0); b.op_i32_ne();
-    b.op_i32_or();
-    // [c] (Exceptions & EXC_MASKABLE) != 0  AND  (MSR & MSR_EE) != 0
-    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::EXCEPTIONS);
-    b.op_i32_const(EXC_MASKABLE); b.op_i32_and();
-    b.op_i32_const(0); b.op_i32_ne();
-    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::MSR);
-    b.op_i32_const(MSR_EE); b.op_i32_and();
-    b.op_i32_const(0); b.op_i32_ne();
-    b.op_i32_and();
-    b.op_i32_or();
     b.op_if(BLOCK_TYPE_VOID);
         // [PM51 bail-census — gated; census DONE: 99.66% hit-rate]
         if (BEM_PM51_CENSUS && g_bem_lc_base) {
