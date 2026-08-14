@@ -556,9 +556,6 @@ void JitWasm::Run()
   // dispatches (probe_fix.js, 2026-05-30).
   while (*state_ptr == CPU::State::Running)
   {
-    // [dc-diag 2026-07-21 TEMP] dolphin EmuThread JitWasm::Run active — proves dolphin (not the
-    // ppc-worker) executes the guest CPU.
-    { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1B58u)); *p = *p + 1u; }
 #ifdef __EMSCRIPTEN__
     // [AOT A3.1 acceptance #2] per-slice SMC poll (the Run()-entry region runs
     // only once, so the trigger must be checked here). Publish the AOT entry's

@@ -372,14 +372,11 @@ void CommandProcessorManager::GatherPipeBursted()
 
   auto& processor_interface = m_system.GetProcessorInterface();
 
-  // [domino3-real] post-takeover-only counters (gated cpu_owner). 0x026B1AB0 = GatherPipeBursted
-  // early-returns (!GPLinkEnable, burst NOT credited to CP); 0x026B1AB4 = normal advances (credited).
   const bool _dc_owner =
       *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u;
   // if we aren't linked, we don't care about gather pipe data
   if (!m_cp_ctrl_reg.GPLinkEnable)
   {
-    { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AB0u)); *p = *p + 1u; }  // [UNGATED 2026-07-22]
     if (IsOnThread(m_system) && !m_system.GetFifo().UseDeterministicGPUThread())
     {
       // In multibuffer mode is not allowed write in the same FIFO attached to the GPU.
@@ -419,7 +416,6 @@ void CommandProcessorManager::GatherPipeBursted()
     m_system.GetCoreTiming().ForceExceptionCheck(0);
 
   m_fifo.CPReadWriteDistance.fetch_add(GPFifo::GATHER_PIPE_SIZE, std::memory_order_seq_cst);
-  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AB4u)); *p = *p + 1u; }  // [UNGATED 2026-07-22]
   // [dist/seq-diag STRIPPED 2026-07-22 — served PM11/PM12; per-burst publish cost removed.]
 
   m_system.GetFifo().RunGpu();

@@ -90,9 +90,6 @@ void GPFifoManager::ResetGatherPipe()
 
 void GPFifoManager::UpdateGatherPipe()
 {
-  // [dc-diag 2026-07-21 TEMP] UpdateGatherPipe entry — is the gather-pipe flush being called
-  // on the CPU thread's block epilogue? Remove after localizing the CP-FIFO break.
-  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AF0u)); *p = *p + 1u; }
   auto& system = m_system;
   auto& memory = system.GetMemory();
   auto& processor_interface = system.GetProcessorInterface();
@@ -113,13 +110,6 @@ void GPFifoManager::UpdateGatherPipe()
     const u32 cp_wp = cp_fifo.CPWritePointer.load(std::memory_order_relaxed);
     const u32 cp_base = cp_fifo.CPBase.load(std::memory_order_relaxed);
     const bool linked = cp_fifo.bFF_GPLinkEnable.load(std::memory_order_relaxed) != 0;
-    // [dc-diag 2026-07-21 TEMP] publish LIVE CP link/read/distance (UpdateGatherPipe runs
-    // frequently, unlike the asleep RunGpuLoop) — is the CP FIFO enabled+linked under dual-core?
-    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AD8u)) =
-        cp_fifo.CPReadWriteDistance.load(std::memory_order_relaxed);
-    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AE4u)) =
-        cp_fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) ? 1u : 0u;
-    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AF8u)) = linked ? 1u : 0u;
     // [dc-diag TEMP] &m_fifo address + CPReadPointer/CPBase from the CPU/guest thread — compare
     // &fifo against the gpu_thread's (0x026B1B48). Same addr + different values => reset/coherence;
     // different addr => two System/CommandProcessor instances (the real root).
@@ -171,7 +161,6 @@ void GPFifoManager::UpdateGatherPipe()
       processor_interface.m_fifo_cpu_write_pointer += GATHER_PIPE_SIZE;
 
     system.GetCommandProcessor().GatherPipeBursted();
-    { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AECu)); *p = *p + 1u; }
   }
 
   // move back the spill bytes
@@ -242,12 +231,6 @@ static bool gpfifo_redirect_excursion_to_ring(u32 width, u32 value)
   *reinterpret_cast<volatile u32*>(slot)      = width;
   *reinterpret_cast<volatile u32*>(slot + 4u) = value;
   __atomic_store_n(const_cast<u32*>(p_head), (h + 1u), __ATOMIC_RELEASE);
-  // Diagnostic: excursion words redirected into the ring @0x026B1A50 (should track the prior
-  // otherWrites=36; if peFrames now advances, the redirect closed the splice).
-  {
-    volatile u32* const d = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A50u));
-    *d = *d + 1u;
-  }
   return true;  // handled — do NOT also write the gather pipe
 }
 
@@ -267,29 +250,9 @@ void GPFifoManager::Write16(const u16 value)
 
 void GPFifoManager::Write32(const u32 value)
 {
-  // [dc-diag 2026-07-21 TEMP] Write32 entry (all calls) — is the guest's WPAR store reaching
-  // dolphin's GPFifo at all? Remove after localizing the CP-FIFO break.
-  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AE8u)); *p = *p + 1u; }
   if (gpfifo_redirect_excursion_to_ring(4u, value)) {
     return;
   }
-  // [domino3-src] count drain vs NON-drain GP words + record first 24 non-drain values (diagnostic).
-  // drain-count @0x026B1A48, other-count @0x026B1A4C, non-drain values @0x026B2600.
-  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026A0000u)) == 1u)
-  {
-    if (g_in_drain) {
-      volatile u32* d = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A48u));
-      *d = *d + 1u;
-    } else {
-      volatile u32* o = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1A4Cu));
-      const u32 oi = *o;
-      if (oi < 24u)
-        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B2600u + oi * 4u)) = value;
-      *o = oi + 1u;
-    }
-  }
-  // [dc-diag TEMP] reached FastWrite32 (past the excursion-redirect) = write hit the gather pipe.
-  { volatile u32* p = reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B1AF4u)); *p = *p + 1u; }
   FastWrite32(value);
   CheckGatherPipe();
 }
