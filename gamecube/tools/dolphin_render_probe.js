@@ -338,7 +338,12 @@ function startServer() {
   // dispatchKey path (same route the touch controls use), so the press
   // flows pad-buffer → 10ms input pump → worker g_pad → input_state_cb.
   const PRESS_HOLD_MS = 500;
-  const PRESS_KEY = { start: 'v', select: 'c', a: 'x', b: 'z', x: 's', y: 'd', l: 'w', r: 'r', z: 'e', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight' };
+  // page.keyboard emits TRUSTED events → gamecube.html's PHYSICAL-keyboard path
+  // (onKey, `if (!e.isTrusted) return`), whose keyToPad is: WASD=analog stick,
+  // M/N/J/K=A/B/Y/X, q/r/e/v/c=L/R/Z/Start/Select (gamecube.html:2961-2965).
+  // The old map (a:'x' etc.) was the NON-trusted dispatchKey map and silently
+  // no-op'd on this path (and l:'w' pressed UP). Match the physical map:
+  const PRESS_KEY = { start: 'v', select: 'c', a: 'm', b: 'n', x: 'k', y: 'j', l: 'q', r: 'r', z: 'e', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight' };
   (process.env.PROBE_PRESS || '').split(',').filter(Boolean).forEach((spec) => {
     const m = spec.trim().match(/^(\w+)@(\d+)$/);
     if (!m || !PRESS_KEY[m[1]]) { console.log('[probe] PROBE_PRESS spec ignored: ' + spec); return; }
