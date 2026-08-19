@@ -1,7 +1,12 @@
 add_subdirectory(OGL)
 add_subdirectory(Null)
 add_subdirectory(Software)
-add_subdirectory(WGPU)
+# WGPU (emdawnwebgpu) is Emscripten-only; native builds must not compile it
+# (native clang++ rejects --use-port=emdawnwebgpu). VideoBackendBase.cpp already
+# gates the WGPU registration on __EMSCRIPTEN__.
+if(EMSCRIPTEN)
+  add_subdirectory(WGPU)
+endif()
 
 if(WIN32)
   add_subdirectory(D3DCommon)

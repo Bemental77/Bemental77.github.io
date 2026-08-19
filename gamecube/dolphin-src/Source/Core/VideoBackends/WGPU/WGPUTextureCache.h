@@ -340,9 +340,13 @@ protected:
   // [WGPU C1 2026-07-13] Native EFB->texture copy via WGPUGfx::BlitToTexture (hand-written WGSL
   // blit — the base TextureCacheBase implementation renders through utility shaders that this
   // backend's CreateShaderFromSource cannot provide). This is what fills the XFB copy the present
-  // path (ShowImage) reads. Approximations, logged one-shot below: dst_format quantization
-  // (RGB565/I4/...), is_intensity (Y formula), gamma!=1, and the deflicker filter_coefficients
-  // are not applied — the blit is a straight RGBA8 sample (linear/nearest per linear_filter).
+  // path (ShowImage) reads.
+  // [efb-encode-exact 2026-08-19] The blit shader now ports VideoCommon/TextureConverterShaderGen
+  // EXACTLY: gamma -> intensity(YUV) -> dst_format channel-select/quantization, and preserves
+  // alpha (the old straight-RGBA8 sample dropped it: 0x792cc0 read back (76,76,76,0) vs native
+  // (76,76,76,76)). is_intensity/dst_format/gamma are passed through to BlitToTexture below. The
+  // deflicker filter_coefficients (3-tap vertical) are still not applied — hedge: unverified
+  // whether the card scene sets them; a separate lane if a copy needs them.
   void CopyEFBToCacheEntry(RcTcacheEntry& entry, bool is_depth_copy,
                            const MathUtil::Rectangle<int>& src_rect, bool scale_by_half,
                            bool linear_filter, EFBCopyFormat dst_format, bool is_intensity,
@@ -402,24 +406,18 @@ protected:
     if (!efb_color || !gfx)
       return;
 
-    static bool s_approx_logged = false;
-    if (!s_approx_logged && (is_intensity || gamma != 1.0f))
-    {
-      s_approx_logged = true;
-      MAIN_THREAD_EM_ASM({ postMessage({cmd: 'print', txt:
-        '[wgpu] CopyEFBToCacheEntry: intensity/gamma approximated as straight blit'
-        + ' (is_intensity=' + $0 + ' gamma=' + $1 + ')'}); }, (int)is_intensity, (double)gamma);
-    }
-
     ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3528u));
     // [sab-diag PM30 TEMP] blit-source EFB texture identity @0x026B357C.
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B357Cu)) =
         static_cast<u32>(reinterpret_cast<uintptr_t>(
             static_cast<WGPUTexture*>(efb_color)->GetTexture()));
+    // Pass the copy-encode params so the blit matches native EXACTLY (intensity/dst_format/gamma
+    // instead of the old straight RGBA8 sample that dropped alpha + skipped quantization).
     gfx->BlitToTexture(static_cast<WGPUTexture*>(efb_color)->GetTexture(), efb_color->GetWidth(),
                        efb_color->GetHeight(), src_rect,
                        static_cast<WGPUTexture*>(entry->texture.get())->GetTexture(),
-                       entry->texture->GetWidth(), entry->texture->GetHeight(), linear_filter);
+                       entry->texture->GetWidth(), entry->texture->GetHeight(), linear_filter,
+                       is_intensity, static_cast<int>(dst_format), gamma);
   }
 };
 

@@ -107,7 +107,8 @@ public:
   // src_rect is in src texel coordinates; dst is written at (0,0) dst_w x dst_h (mip/layer 0).
   bool BlitToTexture(::WGPUTexture src_texture, u32 src_width, u32 src_height,
                      const MathUtil::Rectangle<int>& src_rect, ::WGPUTexture dst_texture,
-                     u32 dst_w, u32 dst_h, bool linear_filter);
+                     u32 dst_w, u32 dst_h, bool linear_filter, bool is_intensity = false,
+                     int dst_format = 6 /*RGBA8*/, float gamma = 1.0f);
 
   // [render-gaps R2 PM38] EFB DEPTH -> RGBA8 copy (textureLoad, reversed-Z undone,
   // depth replicated to RGB). Used by WGPUTextureCache for is_depth_copy entries.

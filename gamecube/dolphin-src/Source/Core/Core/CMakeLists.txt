@@ -675,7 +675,6 @@ PUBLIC
   videonull
   videoogl
   videosoftware
-  videowgpu
 
 PRIVATE
   FatFs
@@ -684,6 +683,11 @@ PRIVATE
   LZ4::LZ4
   ZLIB::ZLIB
 )
+
+# WGPU backend is Emscripten-only (see VideoBackends/CMakeLists.txt gate).
+if(EMSCRIPTEN)
+  target_link_libraries(core PUBLIC videowgpu)
+endif()
 
 if(LIBUDEV_FOUND)
   target_include_directories(core PRIVATE ${LIBUDEV_INCLUDE_DIR})

@@ -436,6 +436,7 @@ struct UtilParams {
   uv_off_scale : vec4<f32>,
   clear_color : vec4<f32>,
   clear_depth : vec4<f32>,
+  copy_conv : vec4<f32>,   // EFB copy encode: (is_intensity, dst_format, apply_gamma, gamma_rcp)
 };
 @group(0) @binding(0) var<uniform> uparams : UtilParams;
 @group(0) @binding(1) var utex : texture_2d<f32>;
@@ -454,8 +455,51 @@ struct UtilVSOut {
   return o;
 }
 
+// EFB->texture copy encode, ported EXACTLY from VideoCommon/TextureConverterShaderGen.cpp
+// (gamma -> intensity/YUV -> dst_format channel select). Gated by copy_conv so a plain straight
+// blit is copy_conv=(0, 6=RGBA8, 0, 1). Native applies this on the EFB copy; the old straight
+// sample dropped alpha + skipped intensity/quantization (e.g. 0x792cc0 I8 copy -> alpha=0 not =Y).
 @fragment fn util_fs_blit(in : UtilVSOut) -> @location(0) vec4<f32> {
-  return textureSampleLevel(utex, usamp, in.uv, 0.0);
+  let c = clamp(textureSampleLevel(utex, usamp, in.uv, 0.0), vec4<f32>(0.0), vec4<f32>(1.0));
+  let is_int = uparams.copy_conv.x > 0.5;
+  let dfmt = i32(uparams.copy_conv.y + 0.5);
+  let do_gamma = uparams.copy_conv.z > 0.5;
+  let grcp = uparams.copy_conv.w;
+  var t = vec4<i32>(round(c * 255.0));                          // texcol_raw (0..255 ints)
+  if (do_gamma) {
+    t = vec4<i32>(round(pow(vec4<f32>(t) / 255.0, vec4<f32>(grcp, grcp, grcp, 1.0)) * 255.0));
+  }
+  if (is_int) {
+    let r = t.r; let g = t.g; let b = t.b;
+    var Y = 66 * r + 129 * g + 25 * b + 16 * 256;
+    var U = -38 * r - 74 * g + 112 * b + 128 * 256;
+    var V = 112 * r - 94 * g - 18 * b + 128 * 256;
+    Y = (Y >> 8u) + ((Y >> 7u) & 1);                            // /256, round .5 up
+    U = (U >> 8u) + ((U >> 7u) & 1);
+    V = (V >> 8u) + ((V >> 7u) & 1);
+    t = vec4<i32>(Y, U, V, t.a);
+  }
+  var o : vec4<f32>;
+  switch (dfmt) {
+    case 0: { let red = f32(t.r & 0xF0) / 240.0; o = vec4<f32>(red, red, red, red); }               // R4
+    case 1, 8: { o = vec4<f32>(f32(t.r)) / 255.0; }                                                  // R8_0x1 / R8
+    case 2: { let rr = f32(t.r & 0xF0) / 240.0; let aa = f32(t.a & 0xF0) / 240.0;
+              o = vec4<f32>(rr, rr, rr, aa); }                                                       // RA4
+    case 3: { o = vec4<f32>(f32(t.r), f32(t.r), f32(t.r), f32(t.a)) / 255.0; }                        // RA8
+    case 4: { let rr = f32(t.r & 0xF8) / 248.0; let bb = f32(t.b & 0xF8) / 248.0;
+              let gg = f32(t.g & 0xFC) / 252.0; o = vec4<f32>(rr, gg, bb, 1.0); }                     // RGB565
+    case 5: { let cr = f32(t.r & 0xF8) / 248.0; let cg = f32(t.g & 0xF8) / 248.0;
+              let cb = f32(t.b & 0xF8) / 248.0; let aa = f32(t.a & 0xE0) / 224.0;
+              o = vec4<f32>(cr, cg, cb, aa); }                                                        // RGB5A3
+    case 7: { o = vec4<f32>(f32(t.a)) / 255.0; }                                                     // A8
+    case 9: { o = vec4<f32>(f32(t.g)) / 255.0; }                                                     // G8
+    case 10: { o = vec4<f32>(f32(t.b)) / 255.0; }                                                    // B8
+    case 11: { o = vec4<f32>(f32(t.r), f32(t.r), f32(t.r), f32(t.g)) / 255.0; }                       // RG8
+    case 12: { o = vec4<f32>(f32(t.g), f32(t.g), f32(t.g), f32(t.b)) / 255.0; }                       // GB8
+    case 15: { o = vec4<f32>(f32(t.r), f32(t.g), f32(t.b), 255.0) / 255.0; }                          // XFB
+    default: { o = vec4<f32>(t) / 255.0; }                                                           // RGBA8 (6)
+  }
+  return o;
 }
 
 struct UtilClearOut {
@@ -495,6 +539,7 @@ struct UtilParamsCPU
   float uv_off_scale[4];
   float clear_color[4];
   float clear_depth[4];
+  float copy_conv[4];  // (is_intensity, dst_format, apply_gamma, gamma_rcp) — EFB copy encode
 };
 }  // namespace
 
@@ -870,7 +915,8 @@ void WGPUGfx::ClearRegion(const MathUtil::Rectangle<int>& target_rc, bool colorE
 
 bool WGPUGfx::BlitToTexture(::WGPUTexture src_texture, u32 src_width, u32 src_height,
                             const MathUtil::Rectangle<int>& src_rect, ::WGPUTexture dst_texture,
-                            u32 dst_w, u32 dst_h, bool linear_filter)
+                            u32 dst_w, u32 dst_h, bool linear_filter, bool is_intensity,
+                            int dst_format, float gamma)
 {
   if (!m_device || !src_texture || !dst_texture || !EnsureUtilPipelines() ||
       !m_util_blit_pipeline || src_width == 0 || src_height == 0 || dst_w == 0 || dst_h == 0)
@@ -882,6 +928,11 @@ bool WGPUGfx::BlitToTexture(::WGPUTexture src_texture, u32 src_width, u32 src_he
   params.uv_off_scale[2] = static_cast<float>(src_rect.GetWidth()) / static_cast<float>(src_width);
   params.uv_off_scale[3] =
       static_cast<float>(src_rect.GetHeight()) / static_cast<float>(src_height);
+  // EFB copy encode (matches VideoCommon/TextureConverterShaderGen): intensity + dst_format + gamma.
+  params.copy_conv[0] = is_intensity ? 1.0f : 0.0f;
+  params.copy_conv[1] = static_cast<float>(dst_format);
+  params.copy_conv[2] = (gamma != 1.0f) ? 1.0f : 0.0f;
+  params.copy_conv[3] = (gamma != 0.0f) ? (1.0f / gamma) : 1.0f;
   const u32 uoff = AllocUtilUniformSlot(&params, sizeof(params));
   if (uoff == UINT32_MAX)
     return false;
@@ -2089,13 +2140,21 @@ std::unique_ptr<AbstractPipeline> WGPUGfx::CreatePipeline(const AbstractPipeline
       WGPUPrimitiveTopology_TriangleList, WGPUPrimitiveTopology_TriangleStrip};
   WGPUPrimitiveState primitive = {};
   primitive.topology = kTopo[(u32)config.rasterization_state.primitive.Value()];
-  primitive.frontFace = WGPUFrontFace_CW;
+  // [winding fix 2026-08-19] Vulkan uses a SINGLE Y-flip (VertexShaderGen.cpp:876) into its
+  // +Y-DOWN NDC and frontFace=CW (VKPipeline.cpp:57). This WGPU port instead does a NET-ZERO
+  // Y-flip (WGPUUberShaders.h:1150 flip + :1172-1173 re-flip) because WebGPU NDC is +Y-UP —
+  // which gives correct image orientation but leaves geometry in the OPPOSITE winding from
+  // Vulkan's flipped geometry. Copying frontFace=CW verbatim therefore inverts front/back:
+  // every cull=Front triangle (MP4's card fan + envelope) was culled to zero fragments while
+  // the cull=None background survived. CCW matches the net-zero-flip winding. Do NOT "fix" this
+  // by removing a Y-negate instead — that flips the whole image upside down.
+  primitive.frontFace = WGPUFrontFace_CCW;
   // [cull-none EXPERIMENT PM32 - evaluate] the vertex WGSL double-negates Y
   // (WGPUUberShaders.h:1150 then :1172) — if the net orientation is wrong for
   // frontFace=CW, Back-culling discards EVERY triangle: zero fragments, zero
   // errors, clears unaffected (the exact observed signature; also explains the
   // depth-Always and forced-magenta no-ops — culling precedes both).
-#define BEM_CULL_NONE 0  // [PM36 re-test with top-magenta: still black -> cull validly eliminated]
+#define BEM_CULL_NONE 0  // [2026-08-19 re-tested post winding-fix: cull=None LOSES the envelope + no cards -> cards not culled]
 #if BEM_CULL_NONE
   primitive.cullMode = WGPUCullMode_None;
 #else
@@ -2126,7 +2185,7 @@ std::unique_ptr<AbstractPipeline> WGPUGfx::CreatePipeline(const AbstractPipeline
                            : WGPUCompareFunction_Always;
   // [depth-always EXPERIMENT PM31 - REVERT] content appears => depth test was
   // rejecting all fragments (reversed-Z compare/clear pairing bug).
-#define BEM_DEPTH_ALWAYS 0  // [PM36 re-test with top-magenta: still black -> depth validly eliminated]
+#define BEM_DEPTH_ALWAYS 0  // [2026-08-19 re-tested post winding-fix: NO-OP (cards not depth-rejected)]
 #if BEM_DEPTH_ALWAYS
   depth.depthCompare = WGPUCompareFunction_Always;
 #endif
