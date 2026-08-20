@@ -143,7 +143,13 @@ uint32_t      g_rd_nogen = 0u;   // [region-debug] sealed dispatch: no gens seal
 // [region-merged 2026-07-15] ON: counter-driven promotion into MERGED
 // powerpc-next gens entered via the GLOBAL dispatch table (fn_k wrappers).
 // A/B OFF arm = flip this back to 0 (the verified per-block baseline).
-unsigned char g_bem_promote_enabled = 1;  // [PM54c A/B 2026-08-04] ON: N-fn shape
+// [2026-08-20 DISABLED — MEASURED NET-NEGATIVE] N-fn promotion is a board REGRESSION: page-fps
+// A/B on the real board (MarioParty4 (10) savestate) = OFF +36% vs ON (proxy: peFrames 1814 vs
+// 1337; confirmed up in Casey's real Chrome). Root = the documented coverage-wall (~5% region hit
+// -> per-miss membrane tax) + the promote-ring prologue + N-fn dispatch overhead (dispatch self-time
+// 18.7% ON -> 8.8% OFF). =0 is the verified per-block baseline (cold-boots + renders all 3 games).
+// Re-enable only after the coverage redesign that makes promotion win in PAGE-FPS (not gc-rate).
+unsigned char g_bem_promote_enabled = 0;  // N-fn shape
 // with the audited fix set (gen-packed rslot + own-gen checks by construction,
 // pending cap == seal_batch, seal-success-gated commit/populate, seal-time
 // compaction). Acceptance: all sealed-gen n_funcs<=256, zero FAILED, zero
