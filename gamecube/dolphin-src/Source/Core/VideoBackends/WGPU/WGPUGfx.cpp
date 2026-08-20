@@ -2140,15 +2140,16 @@ std::unique_ptr<AbstractPipeline> WGPUGfx::CreatePipeline(const AbstractPipeline
       WGPUPrimitiveTopology_TriangleList, WGPUPrimitiveTopology_TriangleStrip};
   WGPUPrimitiveState primitive = {};
   primitive.topology = kTopo[(u32)config.rasterization_state.primitive.Value()];
-  // [winding fix 2026-08-19] Vulkan uses a SINGLE Y-flip (VertexShaderGen.cpp:876) into its
-  // +Y-DOWN NDC and frontFace=CW (VKPipeline.cpp:57). This WGPU port instead does a NET-ZERO
-  // Y-flip (WGPUUberShaders.h:1150 flip + :1172-1173 re-flip) because WebGPU NDC is +Y-UP —
-  // which gives correct image orientation but leaves geometry in the OPPOSITE winding from
-  // Vulkan's flipped geometry. Copying frontFace=CW verbatim therefore inverts front/back:
-  // every cull=Front triangle (MP4's card fan + envelope) was culled to zero fragments while
-  // the cull=None background survived. CCW matches the net-zero-flip winding. Do NOT "fix" this
-  // by removing a Y-negate instead — that flips the whole image upside down.
-  primitive.frontFace = WGPUFrontFace_CCW;
+  // [winding 2026-08-19] GameCube front faces are CW; frontFace=CW is correct for the port.
+  // A brief experiment set this to CCW to un-cull MP4's "Pick a card" envelope (a cull=Front
+  // model) — but that was a REGRESSION: CCW inverts front/back for ALL geometry, so it CULLED
+  // the cull=Back scenes (e.g. the "Welcome to Party Mode" stage backdrop: curtains, PARTY MODE
+  // banner, stars → rendered as a black void with only the characters/garlands). Verified by
+  // A/B on savestate `MarioParty4 (9).gcs.gz`@55s: CW renders the full stage, CCW blacks it out.
+  // So CW is right; the envelope not rendering under CW is a SEPARATE, unsolved issue (the fan
+  // cards likewise produce zero fragments for a GPU-level reason — see the render memo), NOT a
+  // winding problem, and must NOT be "fixed" by flipping frontFace (that breaks the rest of the game).
+  primitive.frontFace = WGPUFrontFace_CW;
   // [cull-none EXPERIMENT PM32 - evaluate] the vertex WGSL double-negates Y
   // (WGPUUberShaders.h:1150 then :1172) — if the net orientation is wrong for
   // frontFace=CW, Back-culling discards EVERY triangle: zero fragments, zero
