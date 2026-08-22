@@ -58,6 +58,9 @@ gamecube/aot/**/*.bin filter= diff= merge= -text
 # ONLY remaining LFS objects are dreamcast/discs/pso2/Track3.bin.parta* —
 # 12x100MB, DC not yet shipping; converting would bloat every clone by 1.2GB.
 gamecube/IPL.bin filter= diff= merge= -text
+# recomp test/build wasm: fetched directly by recomp_render_test.html (Pages can't
+# serve LFS pointers) + LFS budget exceeded. Ship as a real blob like the others.
+gamecube/recomp/*.wasm filter= diff= merge= -text
 gba/gbaWasm/dist/*.wasm filter= diff= merge= -text
 snes/snesWasm/*.wasm filter= diff= merge= -text
 snes/snesWasm/roms/*.smc filter= diff= merge= -text

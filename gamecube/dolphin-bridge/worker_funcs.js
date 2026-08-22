@@ -151,6 +151,44 @@ var bootLoopRunning = false;
 var __bootBatches = 0;
 var __ticks = 0;
 
+// [recomp-seam DIAG 2026-08-21 — strip per gate #8] Prove the recomp_render_fifo seam:
+// build one big-endian GP-FIFO colored-triangle stream (byte-identical to what the
+// decomp→wasm recomp emits) and hand it to Dolphin's LIVE WGPU renderer. Fully
+// self-contained render state (VCD/VAT/XF/BP/GX_PASSCLR TEV) so it does not depend on
+// MP4's live state. All encodings cited to Dolphin source (CPMemory.h/XFMemory.h/BPMemory.h).
+var __recompFrame = 0, __recompPtr = 0, __recompBytes = null;
+function buildRecompTriangleFifo() {
+  var b = [];
+  function u8(v){ b.push(v & 0xff); }
+  function u16(v){ u8(v>>>8); u8(v); }
+  function u32(v){ v>>>=0; u8(v>>>24); u8(v>>>16); u8(v>>>8); u8(v); }
+  var _fb = new ArrayBuffer(4), _f = new Float32Array(_fb), _u = new Uint32Array(_fb);
+  function f32(v){ _f[0]=v; u32(_u[0]); }                       // IEEE-754 big-endian
+  function cp(addr,val){ u8(0x08); u8(addr & 0xff); u32(val); } // LOAD_CP_REG
+  function xf(base, words){ u8(0x10); u32((((words.length-1)&0xf)<<16)|(base&0xffff)); for(var k=0;k<words.length;k++){ var w=words[k]; if(w&&w.f!==undefined) f32(w.f); else u32(w>>>0); } }
+  var F=function(x){return {f:x};};
+  function bp(reg,val24){ u8(0x61); u32(((reg&0xff)<<24)|(val24&0xffffff)); } // LOAD_BP_REG
+  // CP: VCD + VAT (pos DIRECT xyz-float, color0 DIRECT RGBA8888)
+  cp(0x50, 0x00002200); cp(0x60, 0x00000000);
+  cp(0x70, 0x40016009); cp(0x80, 0x80000000); cp(0x90, 0x00000000);
+  // XF: identity posmtx0, 1 color chan (vertex/unlit), 0 texgens, viewport, ortho proj
+  xf(0x0000, [F(1),F(0),F(0),F(0),  F(0),F(1),F(0),F(0),  F(0),F(0),F(1),F(0)]);
+  xf(0x1009, [1]);                      // SETNUMCHAN=1
+  xf(0x100e, [0x00000001]);             // SETCHAN0_COLOR: matsource=Vertex, unlit
+  xf(0x103f, [0]);                      // SETNUMTEXGENS=0
+  xf(0x101a, [F(320),F(-240),F(16777215),F(662),F(582),F(16777215)]);  // VIEWPORT 640x480
+  xf(0x1020, [F(1),F(0),F(1),F(0),F(-1),F(0), 1]);                      // PROJECTION ortho identity
+  // BP: genmode/zmode/blend/alpha + TEV stage0 GX_PASSCLR (pass vertex color)
+  bp(0x00, 0x000010); bp(0x40, 0x00001F); bp(0x41, 0x000018); bp(0xF3, 0x000000);
+  bp(0xC0, 0x08FFFA); bp(0xC1, 0x08FFD0);
+  // PRIMITIVE: GX_DRAW_TRIANGLES vat0 = 0x90, 3 verts, 16B each (3 f32 pos + RGBA8)
+  u8(0x90); u16(3);
+  f32(0.0);  f32(0.6);  f32(0.5);  u8(255); u8(0);   u8(0);   u8(255);   // top red
+  f32(-0.6); f32(-0.5); f32(0.5);  u8(0);   u8(255); u8(0);   u8(255);   // left green
+  f32(0.6);  f32(-0.5); f32(0.5);  u8(0);   u8(0);   u8(255); u8(255);   // right blue
+  return new Uint8Array(b);
+}
+
 // 2026-06-12 EVENT-LOOP STARVATION FIX: the old batch sizes (100000 boot /
 // 10000 tick) date from when one iter was a cheap dispatch slice. Today one
 // iter = one full retro_run frame-quantum (measured via the SAB counter at
@@ -191,6 +229,21 @@ function pumpBatch() {
   }
   if (Module && Module._run_iter_batch) {
     for (var i = 0; i < PUMP_BATCH_ITERS; i++) Module._run_iter_batch(1);
+    // [recomp-seam] To visibly demo the recomp GP-FIFO -> Dolphin WGPU renderer seam,
+    // set self.__RECOMP_DEMO = 1 (default OFF, prod-safe — leaves MP4 untouched). When on,
+    // after boot it draws one colored triangle through _recomp_render_fifo every pump
+    // (composites over MP4's frame; MP4's own state re-uploads each of its draws).
+    if (self.__RECOMP_DEMO && Module._recomp_render_fifo) {
+      __recompFrame++;
+      if (__recompFrame > 400) {
+        if (!__recompPtr) {
+          __recompBytes = buildRecompTriangleFifo();
+          __recompPtr = Module._malloc(__recompBytes.length);
+          Module.HEAPU8.set(__recompBytes, __recompPtr);
+        }
+        Module._recomp_render_fifo(__recompPtr, __recompBytes.length);
+      }
+    }
   } else if (Module && Module._run_iter) {
     for (var j = 0; j < PUMP_BATCH_ITERS; j++) Module._run_iter();
   }

@@ -42,6 +42,10 @@
 #include "VideoCommon/AsyncRequests.h"     // [savestate-fix PM61] drain routed video DoState
 #include "VideoCommon/CommandProcessor.h"  // [gpu-pump]
 #include "VideoCommon/PixelEngine.h"          // [PE-finish flush]
+#include "VideoCommon/OpcodeDecoding.h"       // [recomp-render] RunFifo<false> — reuse Dolphin's GP-FIFO decoder
+#include "VideoCommon/DataReader.h"           // [recomp-render] DataReader(begin,end) byte range
+#include "VideoCommon/VertexManagerBase.h"    // [recomp-render] g_vertex_manager->Flush()
+#include "VideoCommon/FramebufferManager.h"   // [recomp-render] g_framebuffer_manager->RefreshPeekCache()
 #include "Core/HW/ProcessorInterface.h"     // [msr-zero watch cause/mask]
 #include "Core/HW/DSP.h"                    // [msr-zero watch dspctl]
 #include "Core/HW/CPU.h"                    // [savestate-fix PM61] resume CPU m_state after load
@@ -496,6 +500,26 @@ extern "C" {
 
 extern "C" void dolphin_gp_seal();    // [dual-core FIFO splice fix] (dolphin_jit_wimports.cpp)
 extern "C" void dolphin_gp_unseal();  // [dual-core FIFO splice fix] (dolphin_jit_wimports.cpp)
+
+// [recomp-render 2026-08-21] Render one GP-FIFO frame emitted by the decomp→wasm recomp
+// through Dolphin's EXISTING WGPU backend — no new renderer. `ptr`/`len` point at a
+// Dolphin-side host buffer holding the recomp's byte-identical GP-FIFO stream (copied in
+// from the recomp module's own linear memory by the JS glue). This is the deterministic
+// branch of RunGpuLoopSlice (Fifo.cpp:367-379) minus the CP-ring/guest-RAM round-trip:
+// RunFifo<false> self-constructs RunCallback<false>, whose OnCP/OnXF/OnBP/OnPrimitiveCommand
+// drive g_main_cp_state + VertexLoaderManager → VertexManagerBase::Flush →
+// WGPUVertexManager::DrawCurrentBatch (the live WebGPU draw). Must run on the device thread
+// (proxied-main pump) — off it, OnPrimitiveCommand size-skips the draws (OpcodeDecoding.cpp:176).
+extern "C" EMSCRIPTEN_KEEPALIVE void recomp_render_fifo(uint32_t ptr, uint32_t len)
+{
+  if (len == 0 || !g_vertex_manager)
+    return;
+  u8* p = reinterpret_cast<u8*>(static_cast<uintptr_t>(ptr));
+  OpcodeDecoder::RunFifo<false>(DataReader(p, p + len), nullptr);
+  g_vertex_manager->Flush();
+  if (g_framebuffer_manager)
+    g_framebuffer_manager->RefreshPeekCache();
+}
 // [gp-ring STEP 3 2026-07-09 — PERMANENT] Consumer of the worker's WPAR-only Atomics ring
 // (producer: ppc_worker.js installWriteEnv gpPush; layout @0x026C0000: +0 head/+4 tail
 // monotonic, +8 producer-wait flag, +0xC fallbacks, +0x10 applied, +0x40 data 8192x{width,val}).
