@@ -118,6 +118,12 @@ fi
 if [ -n "${RECOMP_MODESEL:-}" ]; then
 perl -0pi -e 's{(if\(overlay == OVL_BOOT\)\{.*?return dll;\}\n)}{$1\tif(overlay == OVL_MODESEL){extern s32 modesel_prolog(void); dll->module = 0; dll->bss = 0; if(flag==1){OSReport("objdll> AOT modesel_prolog\\n"); dll->ret = modesel_prolog();} return dll;}\n}s' "$BUILD/src/game/objdll.c" 2>/dev/null || true
 fi
+#     [AOT-overlay] OVL_MENT (Party-Mode entry/setup, the overlay the mode carousel calls into)
+#     — same static dispatch; ment_prolog (gc_ovl_dispatch.c) runs fn_mt1_144, mentDll's real
+#     init (its own _prolog minus the empty ctor walk). Gated with the ment compile below.
+if [ -n "${RECOMP_MENT:-}" ]; then
+perl -0pi -e 's{(if\(overlay == OVL_MODESEL\)\{.*?return dll;\}\n)}{$1\tif(overlay == OVL_MENT){extern s32 ment_prolog(void); dll->module = 0; dll->bss = 0; if(flag==1){OSReport("objdll> AOT ment_prolog\\n"); dll->ret = ment_prolog();} return dll;}\n}s' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+fi
 if [ -n "${RECOMP_MSDIAG:-}" ]; then
 perl -0pi -e 's/(void BootExec\(void\)\s*\n\{)/$1\n    OSReport("MK-OMOVL evt=%d init=%d\\n", omovlevtno, SystemInitF);/' "$BUILD/src/REL/bootDll/main.c" 2>/dev/null || true
 fi
@@ -482,6 +488,29 @@ if [ -n "${RECOMP_MODESEL:-}" ]; then
     else fail=$((fail+1)); echo "  modeseldll/$u.c: $(grep -m1 'error:' /tmp/ce_ms.txt | sed 's|.*error: ||')"; fi
   done
   echo "[recomp] modesel overlay AOT-compiled (namespaced)"
+fi
+# [AOT-overlay] Compile OVL_MENT (mentDll: common.c + main.c) INTO the module, namespaced
+# fn_1_->fn_mt1_ / lbl_1_->lbl_mt1_ (module-1 auto names collide with bootDll AND modesel's
+# pre-rename names; the shared extern decls live in include/REL/mentDll.h — namespaced with
+# them, the modeseldll.h lesson). mentDll ships its OWN _prolog/_epilog (common.c) walking
+# _ctors/_dtors link-time arrays that do not exist under emcc — neutralize them; entry is
+# gc_ovl_dispatch.c ment_prolog -> fn_mt1_144 (the real init behind the empty ctor walk).
+if [ -n "${RECOMP_MENT:-}" ]; then
+  MTNS="-D__OSBusClock=__mt_busclk -D__OSCoreClock=__mt_coreclk"
+  # main.c implicit-declares the HuAud* family + Hu3D3Dto2D (missing #includes) -> 11
+  # int-return sig mismatches against the real void definitions. Add the declaring headers.
+  perl -0pi -e 's{\A}{#include "game/audio.h"\n#include "game/hsfex.h"\n}' "$BUILD/src/REL/mentDll/main.c" 2>/dev/null || true
+  for u in common main; do
+    perl -0pi -e 's/\bfn_1_/fn_mt1_/g; s/\blbl_1_/lbl_mt1_/g' "$BUILD/src/REL/mentDll/$u.c" 2>/dev/null || true
+  done
+  perl -0pi -e 's/\bfn_1_/fn_mt1_/g; s/\blbl_1_/lbl_mt1_/g' "$BUILD/include/REL/mentDll.h" 2>/dev/null || true
+  perl -0pi -e 's/\bs32 _prolog\(void\)\s*\{.*?\n\}/static s32 ment_prolog_unused(void){return 0;}/s; s/\bvoid _epilog\(void\)\s*\{.*?\n\}/static void ment_epilog_unused(void){}/s' "$BUILD/src/REL/mentDll/common.c" 2>/dev/null || true
+  for u in common main; do
+    o="$BUILD/obj/$(printf '%s' "src/REL/mentDll/$u.c" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
+    if emcc "${CFLAGS[@]}" $MTNS "$BUILD/src/REL/mentDll/$u.c" -o "$o" 2>/tmp/ce_mt.txt; then ok=$((ok+1));
+    else fail=$((fail+1)); echo "  mentDll/$u.c: $(grep -m1 'error:' /tmp/ce_mt.txt | sed 's|.*error: ||')"; fi
+  done
+  echo "[recomp] ment overlay AOT-compiled (namespaced)"
 fi
 echo "[recomp] wasm objects: $ok built, $fail failed"
 echo "[recomp] object bytes: $(cat "$BUILD"/obj/*.o 2>/dev/null | wc -c)"

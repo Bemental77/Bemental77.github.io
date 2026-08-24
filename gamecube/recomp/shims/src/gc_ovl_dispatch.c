@@ -10,3 +10,10 @@
 // is never dispatched, so it stays a harmless no-op stub target.
 extern void modesel_ObjectSetup(void);
 int modesel_prolog(void) { modesel_ObjectSetup(); return 0; }
+
+// OVL_MENT (Party-Mode entry/setup). mentDll ships its OWN _prolog (common.c) whose only real
+// work after the (empty) ctor loop is fn_1_144() — namespaced fn_mt1_144 by build_wasm.sh's
+// RECOMP_MENT block; the staged _prolog/_epilog are neutralized (their _ctors/_dtors link
+// symbols do not exist under emcc).
+extern void fn_mt1_144(void);
+int ment_prolog(void) { fn_mt1_144(); return 0; }
