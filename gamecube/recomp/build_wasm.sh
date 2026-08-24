@@ -178,7 +178,9 @@ perl -0pi -e 's/(static void THPViewSprFunc\(HuSprite \*arg0\)\s*\n\{)/$1\n    r
 #     [input inject] the recomp has no VI-retrace interrupt firing PadReadVSync, so HuPadBtnDown
 #     never gets real input. Deliver host buttons: OR __recomp_inject_btn (set by the harness via
 #     ___recomp_set_inject_btn) into HuPadBtnDown[0] at HuPadRead's end (shims/src/gc_input.c).
-perl -0pi -e 's/(_PadBtnDown\[i\] = 0;\s*\n\s*\})\n\}/$1\n    { extern int __recomp_inject_btn; HuPadBtnDown[0] |= (unsigned short)__recomp_inject_btn; }\n}/' "$BUILD/src/game/pad.c" 2>/dev/null || true
+#     ONE-SHOT: consume the injected value on delivery — HuPadRead can run more than once per
+#     retrace, and a double-delivered UP moves a 2-choice dialog cursor up then wraps it back.
+perl -0pi -e 's/(_PadBtnDown\[i\] = 0;\s*\n\s*\})\n\}/$1\n    { extern int __recomp_inject_btn; extern int __recomp_inject_dstk; HuPadBtnDown[0] |= (unsigned short)__recomp_inject_btn; __recomp_inject_btn = 0; HuPadDStkRep[0] |= (unsigned char)__recomp_inject_dstk; __recomp_inject_dstk = 0; }\n}/' "$BUILD/src/game/pad.c" 2>/dev/null || true
 #     [system clocks] __OSBusClock/__OSCoreClock (os.h, AT_ADDRESS 0x800000F8/FC) are written by the
 #     bootrom + OSInit on real HW; here AT_ADDRESS is stripped -> plain BSS globals, and OSInit is a
 #     no-op import, so they stay 0 -> the OSTicksToMilliseconds macro (ticks/(__OSBusClock/4000))
@@ -217,6 +219,16 @@ fi
 if [ -n "${RECOMP_WINDIAG:-}" ]; then
   perl -0pi -e 's/(bmp_data = bg->bmp->data = HuMemDirectMallocNum\(HEAP_SYSTEM, block_w \* block_h, MEMORY_DEFAULT_NUM\);)/$1\n    OSReport("winBGMake w=%d h=%d bw=%d bh=%d buf=%x\\n", w, h, block_w, block_h, (u32)bmp_data);/' "$BUILD/src/game/window.c" 2>/dev/null || true
   perl -0pi -e 's/(mess_data = mess_start = MessData_MesPtrGet\(messDataPtr, mess\);)/$1\n        OSReport("MesMax id=%x mdp=%x ptr=%x b=[%x %x %x %x %x %x %x %x %x %x %x %x]\\n", (u32)mess, (u32)messDataPtr, (u32)mess_data, mess_data[0],mess_data[1],mess_data[2],mess_data[3],mess_data[4],mess_data[5],mess_data[6],mess_data[7],mess_data[8],mess_data[9],mess_data[10],mess_data[11]);/' "$BUILD/src/game/window.c" 2>/dev/null || true
+fi
+#     [DIAG, gated] modesel navigation waypoints: carousel A-break, filesel entry/result, mode
+#     dispatch — localizes where an injected A press is consumed on the way to OVL_MENT.
+if [ -n "${RECOMP_NAVDIAG:-}" ]; then
+  perl -0pi -e 's/(if \(HuPadBtnDown\[0\] & PAD_BUTTON_A\) \{\n(\s+)HuAudFXPlay\(2\);)/$1 OSReport("NAV: A-break\\n");/g' "$BUILD/src/REL/modeseldll/modesel.c" 2>/dev/null || true
+  perl -0pi -e 's/(s16 result = fn_(?:ms)?1_2490\(\);)/OSReport("NAV: enter filesel\\n"); $1 OSReport("NAV: filesel result=%d\\n", result);/' "$BUILD/src/REL/modeseldll/main.c" 2>/dev/null || true
+  # every window message set: id + resolved text (control bytes print as-is; words readable)
+  perl -0pi -e 's/(window_ptr->mess = MessData_MesPtrGet\(messDataPtr, mess\);)/$1\n        OSReport("NAV: MesSet win=%d id=%x txt=%s\\n", window, mess, window_ptr->mess ? (char*)window_ptr->mess : "(null)");/' "$BUILD/src/game/window.c" 2>/dev/null || true
+  # choice-state key trace: which key bits reach the cursor + the cursor move it causes
+  perl -0pi -e 's/(key = HuWinActivePadGet\(window\);)/$1\n    if (key) OSReport("NAV: choice win=%x key=%x curr=%d nch=%d\\n", (u32)window, key, choice_curr, window->num_choices);/' "$BUILD/src/game/window.c" 2>/dev/null || true
 fi
 #     [DIAG, gated] insert OSReport markers before each main() boot call so a pure-wasm spin
 #     (which can't be node-profiled) can be localized by the last marker printed.
@@ -310,6 +322,13 @@ perl -0777 -pi -e 's/\bgcsetjmp\(&process->jump\);\s*\n\s*process->jump\.lr\s*=\
 perl -0777 -pi -e 's/\bgclongjmp\(&process->jump,\s*1\);/ret = gclongjmp(&process->jump, 1);/s' "$PROC" 2>/dev/null || true
 #   (C) File-scope prototype for the fabricate hook (idempotent).
 perl -0777 -pi -e 's/\A(?!extern void __gc_fiber_fabricate)/extern void __gc_fiber_fabricate(void*, void(*)(void), unsigned);\n/' "$PROC" 2>/dev/null || true
+#   (D) HuPrcKill retargeting — the scheduler kills a process by RAW-rewriting its saved
+#       resume PC to HuPrcEnd (process.c:277 `process->jump.lr = (u32)HuPrcEnd;`), invisible
+#       to the address-bound fiber model: the killed process resumed its BODY instead and
+#       ticked once per HuPrcCall forever (the zombie HuWinProc that double-processed every
+#       window/choice after the modesel overlay switch). Rebind the buffer to a fresh fiber
+#       entering HuPrcEnd (gc_fiber_coro.c __gc_fiber_retarget; frees the dead body fiber).
+perl -0777 -pi -e 's/process->jump\.lr = \(u32\)HuPrcEnd;/{ extern void __gc_fiber_retarget(void*, void(*)(void)); __gc_fiber_retarget(&process->jump, HuPrcEnd); }/s' "$PROC" 2>/dev/null || true
 
 # 3b. Signature reconciliation: inject each decl!=def function's CANONICAL prototype
 #     (from its definition = byte-identical to native Dolphin's main.elf) into the
@@ -488,7 +507,7 @@ if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.js" \
      -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=33554432 \
      -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=32768 ${RECOMP_PROFILING_FUNCS:+--profiling-funcs} \
      -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web -sINVOKE_RUN=0 \
-     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,_HuMemHeapPtrGet \
+     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,_HuMemHeapPtrGet \
      -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAP32,HEAPU32,wasmMemory,wasmExports \
      -Wl,--no-entry -Wl,--no-gc-sections -Wl,--allow-undefined -Wl,--allow-multiple-definition -O2 2>"$BUILD/link.txt"; then
   echo "[recomp] LINKED: $BUILD/mp4_game.js + $BUILD/mp4_game.wasm ($(stat -f%z "$BUILD/mp4_game.wasm" 2>/dev/null) bytes)"

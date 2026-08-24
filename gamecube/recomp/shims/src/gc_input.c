@@ -8,3 +8,9 @@
 int __recomp_inject_btn = 0;
 void __recomp_set_inject_btn(int v) { __recomp_inject_btn = v; }
 int __recomp_get_inject_btn(void) { return __recomp_inject_btn; }
+
+// Directional input: menus/choice dialogs (HuWinChoice, the modesel carousel) navigate on the
+// ANALOG-STICK digital repeat HuPadDStkRep, not HuPadBtnDown — baked as a second OR at
+// HuPadRead's end. Same pulse discipline as the buttons.
+int __recomp_inject_dstk = 0;
+void __recomp_set_inject_dstk(int v) { __recomp_inject_dstk = v; }

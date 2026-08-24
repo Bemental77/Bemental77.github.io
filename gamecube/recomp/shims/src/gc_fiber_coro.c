@@ -95,6 +95,20 @@ static int     g_root_inited = 0;
 static gc_ctx *g_current = NULL;       // fiber running right now
 static int g_pending_status = 0;   // status a resumed gclongjmp returns
 
+// Deferred reap: a fiber that terminates (status 2 / body fell off the end) cannot
+// free the stack it is standing on; park it here and free it on the next swap,
+// when execution is provably off that stack.
+extern void free(void *);
+static gc_ctx *g_dead = NULL;
+static void reap_dead(void) {
+    if (g_dead && g_dead != g_current) {
+        if (g_dead->c_stack) free(g_dead->c_stack);
+        if (g_dead->asyncify_stack) free(g_dead->asyncify_stack);
+        free(g_dead);
+        g_dead = NULL;
+    }
+}
+
 // --- Instrumentation (exported so the harness can PROVE process bodies ran) ------
 // These are hard evidence the fiber scheduler is live: fabricate = #processes created,
 // enter = #times a fresh process body actually STARTED on its own fiber stack,
@@ -129,6 +143,7 @@ static void gc_fiber_trampoline(void *arg) {
     g_pending_status = 2;
     gc_ctx *from = c;
     g_current = &g_root;
+    g_dead = from;              // reaped on the next swap (we are still on its stack)
     emscripten_fiber_swap(&from->fiber, &g_root.fiber);
     __builtin_trap();           // never resumed
 }
@@ -153,6 +168,35 @@ void __gc_fiber_fabricate(void *jmpbuf, void (*func)(void), unsigned game_stack_
     bind_set(jmpbuf, c);        // scheduler's gclongjmp(&process->jump,1) starts func
 }
 
+// ---- HuPrcKill retargeting (replaces process.c:277's raw `jump.lr = HuPrcEnd`) --
+// The mwcc jump-buffer model kills a process by REWRITING its saved resume PC to
+// HuPrcEnd, so the next dispatch "resumes" into the cleanup path. The fiber model
+// binds by buffer ADDRESS, so a raw field write is invisible: the killed process
+// resumed its BODY instead — a ZOMBIE ticking once per HuPrcCall forever (found as
+// TWO live HuWinProc fibers after the modesel overlay switch: every window/choice
+// processed twice per frame, so a one-frame UP pulse moved the dialog cursor up
+// and then wrap-around back down). Rebind the buffer to a fresh fiber that enters
+// `func` (HuPrcEnd needs only processcur, which the scheduler sets before the
+// dispatch); the suspended body fiber is never resumable again, so free its stacks.
+extern void free(void *);
+void __gc_fiber_retarget(void *jmpbuf, void (*func)(void)) {
+    ensure_root();
+    gc_ctx *old = bind_lookup(jmpbuf);
+    if (old && old != &g_root && old != g_current) {
+        if (old->c_stack) free(old->c_stack);
+        if (old->asyncify_stack) free(old->asyncify_stack);
+        free(old);
+    }
+    gc_ctx *c = (gc_ctx *)calloc(1, sizeof(gc_ctx));
+    c->entry = func;
+    c->c_stack        = malloc(65536u);
+    c->asyncify_stack = malloc(GC_FIBER_ASYNCIFY_STACK);
+    emscripten_fiber_init(&c->fiber, gc_fiber_trampoline, c,
+                          c->c_stack, 65536u,
+                          c->asyncify_stack, GC_FIBER_ASYNCIFY_STACK);
+    bind_set(jmpbuf, c);
+}
+
 // ---- gcsetjmp: SAVE only (bind buffer -> current fiber, return 0) ----------
 int gcsetjmp(void *jmpbuf) {
     ensure_root();
@@ -174,9 +218,11 @@ int gclongjmp(void *jmpbuf, int status) {
     if (target == from) return status;  // longjmp to self: immediate return
 
     g_pending_status = status;
+    if (status == 2 && !from->is_root) g_dead = from;  // terminating: reap after the swap
     g_current = target;
     g_stat_swap++;
     emscripten_fiber_swap(&from->fiber, &target->fiber);
+    reap_dead();
     // Resumed later by a gclongjmp targeting `from`; deliver that resume's status.
     return g_pending_status;
 }

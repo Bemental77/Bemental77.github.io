@@ -33,10 +33,16 @@ const TRACE_DVD = !!process.env.TRACE_DVD, QUIET = !!process.env.QUIET;
 // GC pad bits (include/dolphin/pad.h)
 const BTN = { left:0x0001, right:0x0002, down:0x0004, up:0x0008, z:0x0010, r:0x0020, l:0x0040,
               a:0x0100, b:0x0200, x:0x0400, y:0x0800, start:0x1000 };
-const inputSchedule = new Map();   // frame -> button mask
+const inputSchedule = new Map();   // frame -> button mask (HuPadBtnDown)
+const dstkSchedule  = new Map();   // frame -> stick-direction mask (HuPadDStkRep: menus/choice
+                                   // dialogs navigate on the analog-stick repeat, NOT the D-pad
+                                   // buttons — use dleft/dright/ddown/dup tokens for those)
+const DSTK = { dleft: 0x01, dright: 0x02, ddown: 0x04, dup: 0x08 };
 for (const tok of (process.env.INPUT || '').split(',').filter(Boolean)) {
   const [f, b] = tok.split(':');
-  const mask = BTN[b?.toLowerCase()] ?? parseInt(b, 16);
+  const key = b?.toLowerCase();
+  if (key in DSTK) { dstkSchedule.set(parseInt(f, 10), DSTK[key]); continue; }
+  const mask = BTN[key] ?? parseInt(b, 16);
   if (Number.isFinite(mask)) inputSchedule.set(parseInt(f, 10), mask);
 }
 
@@ -192,6 +198,8 @@ function makeStub(n) {
         // input pulses: deliver this frame's scheduled mask, clear it the frame after
         const inj = Module.___recomp_set_inject_btn;
         if (inj) inj(inputSchedule.get(viRetrace + 1) ?? 0);   // set for the NEXT game frame
+        const injD = Module.___recomp_set_inject_dstk;
+        if (injD) injD(dstkSchedule.get(viRetrace + 1) ?? 0);
         viRetrace++;
         if (viRetrace >= PUMP_MAX) throw { __pumpDone: true };
         return 0;
