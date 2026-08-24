@@ -130,6 +130,16 @@ fi
 perl -0pi -e 's/(read_stat->file = PTR_OFFSET\(read_stat->dir, )\*temp_ptr(\);)/${1}__builtin_bswap32(*temp_ptr)${2}/;
               s/(read_stat->raw_len = )\*temp_ptr\+\+;/${1}__builtin_bswap32(*temp_ptr); temp_ptr++;/;
               s/(read_stat->comp_type = )\*temp_ptr\+\+;/${1}__builtin_bswap32(*temp_ptr); temp_ptr++;/;' "$BUILD/src/game/data.c" 2>/dev/null || true
+#     [ARAM-archive endianness] HuAR_ARAMtoMRAMFileRead (armem.c) is the ARAM twin of GetFileInfo:
+#     it walks the ARAM-staged archive's BIG-ENDIAN offset table (preLoadBuf entry pair) and the
+#     sub-file's raw_len/comp_type header with native reads -> size 0x2c030020 alloc error at
+#     HuWinCreate (window graphics live in an ARAM-staged dir) -> NULL win -> HuMemMemoryAlloc
+#     free-list spin on the dead window. Swap all five reads (verified the only such walk in armem.c).
+perl -0pi -e 's/count = dir_data\[0\];/count = (s32)__builtin_bswap32((u32)dir_data[0]);/;
+              s/if \(dir_data\[1\] - count < 0\) \{/if ((s32)__builtin_bswap32((u32)dir_data[1]) - count < 0) {/;
+              s/size = \(dir_data\[1\] - count \+ 0x3F\)/size = ((s32)__builtin_bswap32((u32)dir_data[1]) - count + 0x3F)/;
+              s/dst = HuMemDirectMallocNum\(heap, \(dir_data\[0\] \+ 1\) & ~1, num\);/dst = HuMemDirectMallocNum(heap, ((s32)__builtin_bswap32((u32)dir_data[0]) + 1) & ~1, num);/;
+              s/HuDecodeData\(&dir_data\[2\], dst, dir_data\[0\], dir_data\[1\]\);/HuDecodeData(\&dir_data[2], dst, (s32)__builtin_bswap32((u32)dir_data[0]), (s32)__builtin_bswap32((u32)dir_data[1]));/;' "$BUILD/src/game/armem.c" 2>/dev/null || true
 #     [HSF model endianness] LoadHSF (hsfload.c) interprets a big-endian .hsf 3D-model file (title
 #     screen, board, characters) with native LE loads -> garbage counts/offsets -> OOB. Swap the
 #     whole file BE->LE once at LoadHSF entry, before FileLoad reads the header. Covers all 21 HSF
@@ -140,8 +150,19 @@ perl -0pi -e 's{(data = HuDvdDataReadWait\(&file, HEAP_DVD, 0, 0, HuDVDReadAsync
 fi
 #     [message-data endianness] HuWinMesRead loads a BE message .bin; messdata.c walks it native-LE
 #     -> garbage offsets -> MessData_MesPtrGet wild pointer -> GetMesMaxSizeSub OOB (the demo/movie
-#     subtitle window; LATENT in the default build too, ~frame 610). Swap the blob after the memcpy.
-perl -0pi -e 's/(messDataPtr = HuMemDirectMalloc\(HEAP_SYSTEM, DirDataSize\);\s*\n\s*memcpy\(messDataPtr, dvd_mess, DirDataSize\);)/$1\n    { extern void __recomp_bswap_messdata(void*, int); __recomp_bswap_messdata(messDataPtr, (int)DirDataSize); }/' "$BUILD/src/game/window.c" 2>/dev/null || true
+#     subtitle window; LATENT in the default build too, ~frame 610).
+#     v2 (2026-08-24): swap AT THE ACCESSORS (messdata.c reads), NOT the whole blob at load —
+#     the load-time tree swap (gc_messdata_bswap.c) mis-walked the modesel messfile and 32-bit-
+#     scrambled its TEXT bytes ("Sel"/"ect" reversed in 4-byte groups) -> GetMesMaxSizeSub summed
+#     a garbage 31328px width -> winBGMake overflow -> HEAP_SYSTEM MCB clobber. Read-site swaps
+#     never touch text and are format-agnostic (the GetFileInfo pattern). The blob stays BE.
+perl -0pi -e 's/(\s+)max_bank = \*data;/$1max_bank = (s32)__builtin_bswap32((u32)*data);/;
+              s/banks = \(u16 \*\)\(\(\(u8 \*\)messdata\)\+\(\*data\)\);/banks = (u16 *)(((u8 *)messdata)+__builtin_bswap32((u32)*data));/;
+              s/if\(\*banks == bank\) \{/if((u16)__builtin_bswap16(*banks) == bank) {/;
+              s/data \+= banks\[1\];/data += (u16)__builtin_bswap16(banks[1]);/;
+              s/return \(\(\(u8 \*\)messdata\)\+\(\*data\)\);/return (((u8 *)messdata)+__builtin_bswap32((u32)*data));/;
+              s/(\s+)max_index = \*data;/$1max_index = (s32)__builtin_bswap32((u32)*data);/;
+              s/return \(\(\(u8 \*\)messbank\)\+\(\*data\)\);/return (((u8 *)messbank)+__builtin_bswap32((u32)*data));/;' "$BUILD/src/game/messdata.c" 2>/dev/null || true
 #     [THP movie skip] The Truemotion (.thp) movie subsystem isn't implemented in the recomp (audio/
 #     DSP neutralized, no THP decode/present) -> THPSimpleOpen always fails and THPTestProc spins its
 #     open/preload retry `while(...==0)` loops forever ("THPSimpleOpen fail" repeats), and HuTHPEndCheck
@@ -172,6 +193,31 @@ perl -0pi -e 's/(void main\(void\)\s*\n\{)/$1\n    __OSBusClock = 162000000u; __
 #     Fixes ALL disc sprites (title bg/copyright/press-start, game sprites); the bootDll logo doesn't
 #     use this macro so it is unaffected (no double-swap).
 perl -0pi -e 's/#define HuSprAnimReadFile\(data_id\) \(HuSprAnimRead\((HuDataSelHeapReadNum\(\(data_id\), MEMORY_DEFAULT_NUM, HEAP_DATA\))\)\)/extern void *__recomp_bswap_animtree_ret(void *);\n#define HuSprAnimReadFile(data_id) (HuSprAnimRead(__recomp_bswap_animtree_ret($1)))/' "$BUILD/include/game/sprite.h" 2>/dev/null || true
+#     esprite.c espEntry reads the SAME fresh disc AnimData but calls HuSprAnimRead directly
+#     (not via the macro) -> BE blob parsed natively -> garbage-size mallocs (0x2c030020) +
+#     HuMemMemoryAlloc free-list spin when the modesel menu creates its sprites. Wrap it too.
+perl -0pi -e 's/(var_r30->unk08 = HuSprAnimRead\()(temp_r26)(\);)/{ extern void *__recomp_bswap_animtree_ret(void *); $1__recomp_bswap_animtree_ret($2)$3 }/' "$BUILD/src/game/esprite.c" 2>/dev/null || true
+#     [general, replaces per-site whack-a-mole] The game has 300+ DIRECT HuSprAnimRead call
+#     sites (window.c frame tree, chrman, hsfman .inc statics, every overlay/minigame), each
+#     handing a fresh BE blob. The missed window.c site corrupted the HEAP_SYSTEM MCB ring
+#     under the modesel menu (winBGMake palette scan walked a BE offset as a pointer ->
+#     HuMemMemoryAlloc ring spin). Hook HuSprAnimRead's ENTRY with the auto-detecting swap
+#     (BE/LE plausibility vote, gc_anim_bswap.c) — pre-swapped/relocated trees vote LE and
+#     pass through, so the older per-site swaps stay harmless.
+perl -0pi -e 's/(AnimData \*HuSprAnimRead\(void \*data\)\n\{)/$1\n    { extern void *__recomp_bswap_animtree_auto(void *); data = __recomp_bswap_animtree_auto(data); }/' "$BUILD/src/game/sprman.c" 2>/dev/null || true
+#     [DIAG, gated] on the allocator's error path, call a host import so the probe's JS stub can
+#     print the wasm caller chain (retaddr tags are all zeroed by the malloc.c mflr bake, so the
+#     in-game "Call" tag is useless). Error-path only — no hot-path cost; gated to keep the
+#     canonical build clean.
+if [ -n "${RECOMP_ALLOCDIAG:-}" ]; then
+  perl -0pi -e 's/(OSReport\("HuMem>memory alloc error %08x\(%08X\): Call %08x\\n", size, num, retaddr\);)/{ extern void __recomp_alloc_trap(unsigned); __recomp_alloc_trap(size); }\n    $1/' "$BUILD/src/game/memory.c" 2>/dev/null || true
+fi
+#     [DIAG, gated] winBGMake writes its 0x70/0x80 border fill past the block_w*block_h alloc
+#     under the modesel styled window (MCB 0x8027c8e0 clobber) — print its actual geometry.
+if [ -n "${RECOMP_WINDIAG:-}" ]; then
+  perl -0pi -e 's/(bmp_data = bg->bmp->data = HuMemDirectMallocNum\(HEAP_SYSTEM, block_w \* block_h, MEMORY_DEFAULT_NUM\);)/$1\n    OSReport("winBGMake w=%d h=%d bw=%d bh=%d buf=%x\\n", w, h, block_w, block_h, (u32)bmp_data);/' "$BUILD/src/game/window.c" 2>/dev/null || true
+  perl -0pi -e 's/(mess_data = mess_start = MessData_MesPtrGet\(messDataPtr, mess\);)/$1\n        OSReport("MesMax id=%x mdp=%x ptr=%x b=[%x %x %x %x %x %x %x %x %x %x %x %x]\\n", (u32)mess, (u32)messDataPtr, (u32)mess_data, mess_data[0],mess_data[1],mess_data[2],mess_data[3],mess_data[4],mess_data[5],mess_data[6],mess_data[7],mess_data[8],mess_data[9],mess_data[10],mess_data[11]);/' "$BUILD/src/game/window.c" 2>/dev/null || true
+fi
 #     [DIAG, gated] insert OSReport markers before each main() boot call so a pure-wasm spin
 #     (which can't be node-profiled) can be localized by the last marker printed.
 if [ -n "${RECOMP_MARKERS:-}" ]; then
@@ -404,6 +450,13 @@ if [ -n "${RECOMP_MODESEL:-}" ]; then
     #     DOL calls use real names like Hu*/om*/esp*, so this only renames modesel's own symbols).
     perl -0pi -e 's/\bfn_1_/fn_ms1_/g; s/\blbl_1_/lbl_ms1_/g' "$BUILD/src/REL/modeseldll/$u.c" 2>/dev/null || true
   done
+  # (b2) the shared extern decls live in include/REL/modeseldll.h (included ONLY by these 4
+  #      units — verified) and must be namespaced with them, or the renamed uses go undeclared.
+  perl -0pi -e 's/\bfn_1_/fn_ms1_/g; s/\blbl_1_/lbl_ms1_/g' "$BUILD/include/REL/modeseldll.h" 2>/dev/null || true
+  # (b3) fn_1_1EC0's prototype is commented out in the header, so modesel.c/filesel.c
+  #      implicit-declare it int(int) vs the real void(s16) def (main.c) -> sig mismatch.
+  #      Un-comment it (real-type prototype from the definition, the sig_fixes pattern).
+  perl -0pi -e 's{^// (void fn_ms1_1EC0\(s16 view\);)}{$1}m' "$BUILD/include/REL/modeseldll.h" 2>/dev/null || true
   for u in modesel main datalist filesel; do
     o="$BUILD/obj/$(printf '%s' "src/REL/modeseldll/$u.c" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
     if emcc "${CFLAGS[@]}" $MSNS "$BUILD/src/REL/modeseldll/$u.c" -o "$o" 2>/tmp/ce_ms.txt; then ok=$((ok+1));
@@ -435,7 +488,7 @@ if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.js" \
      -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=33554432 \
      -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=32768 ${RECOMP_PROFILING_FUNCS:+--profiling-funcs} \
      -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web -sINVOKE_RUN=0 \
-     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn \
+     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,_HuMemHeapPtrGet \
      -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAP32,HEAPU32,wasmMemory,wasmExports \
      -Wl,--no-entry -Wl,--no-gc-sections -Wl,--allow-undefined -Wl,--allow-multiple-definition -O2 2>"$BUILD/link.txt"; then
   echo "[recomp] LINKED: $BUILD/mp4_game.js + $BUILD/mp4_game.wasm ($(stat -f%z "$BUILD/mp4_game.wasm" 2>/dev/null) bytes)"

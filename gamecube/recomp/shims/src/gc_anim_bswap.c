@@ -105,3 +105,31 @@ void *__recomp_bswap_animtree_ret(void *datav) {
     if (datav) __recomp_bswap_animtree(datav);
     return datav;
 }
+
+// AUTO-DETECTING entry-point swap, baked into HuSprAnimRead itself (sprman.c). The game has
+// 300+ DIRECT HuSprAnimRead call sites (windows, minigames, every overlay) each handing it a
+// fresh BE disc/ARAM/static-.inc blob — per-site wrapping does not scale (the missed
+// window.c frame-tree corrupted the HEAP_SYSTEM MCB ring under the modesel menu: winBGMake's
+// palette scan walked a BE offset as a pointer). Decide BE vs LE by a plausibility vote over
+// six header fields; a pre-swapped or already-relocated tree votes LE and is left alone, so
+// the older per-site swaps (bootDll, sprite.h macro, esprite.c) stay harmless.
+static unsigned plaus16(unsigned short v) { return v >= 1 && v <= 1000; }        /* sane count */
+static unsigned plaus32(unsigned v)       { return v >= 0x14 && v < 0x01000000; } /* sane file offset */
+void *__recomp_bswap_animtree_auto(void *datav) {
+    if (!datav) return datav;
+    AnimData *a = (AnimData *)datav;
+    unsigned be = 0, le = 0;
+    unsigned short cn[3]; unsigned off[3];
+    cn[0] = (unsigned short)a->bankNum; cn[1] = (unsigned short)a->patNum; cn[2] = (unsigned short)a->bmpNum;
+    off[0] = (unsigned)a->bank; off[1] = (unsigned)a->pat; off[2] = (unsigned)a->bmp;
+    for (int i = 0; i < 3; i++) {
+        if (plaus16(bsw16(cn[i]))) be++;
+        if (plaus16(cn[i])) le++;
+        if (plaus32(bsw32(off[i]))) be++;
+        /* LE evidence: already-relocated pointer (guest heap 0x80xxxxxx or low wasm static)
+           or an already-swapped small offset */
+        if ((off[i] >= 0x80000000u && off[i] < 0x82000000u) || plaus32(off[i]) || off[i] < 0x08000000u) le++;
+    }
+    if (be > le) __recomp_bswap_animtree(datav);
+    return datav;
+}
