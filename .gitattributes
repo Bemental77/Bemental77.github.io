@@ -71,3 +71,6 @@ dreamcast/flycast_libretro/*.wasm filter= diff= merge= -text
 dreamcast/discs/pso2/Track1.bin filter= diff= merge= -text
 dreamcast/discs/pso2/Track2.bin filter= diff= merge= -text
 dreamcast/discs/pso2/*.cue filter= diff= merge= -text
+# recomp FST (mp4_fst.bin) for recomp_live.html — un-LFS like the recomp *.wasm (Pages can't serve
+# LFS pointers + LFS budget exceeded). Ship as a real blob.
+gamecube/recomp/*.bin filter= diff= merge= -text

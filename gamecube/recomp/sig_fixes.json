@@ -138,6 +138,12 @@
   "arity": 3
  },
  {
+  "symbol": "HuMemInitAll",
+  "proto": "void HuMemInitAll(void);",
+  "header": "game/memory.h",
+  "arity": 0
+ },
+ {
   "symbol": "HuWinAllKill",
   "proto": "void HuWinAllKill(void);",
   "header": "game/window.h",

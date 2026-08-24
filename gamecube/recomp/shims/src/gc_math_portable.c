@@ -8,7 +8,7 @@
 // Mtx44 = f32[4][4], Vec = {x,y,z}). Projection matrices follow the documented GC
 // convention and may need calibration against the live render.
 #include <dolphin/mtx.h>
-#include <dolphin/vec.h>
+// dolphin/vec.h does not exist in the decomp — Vec comes from mtx.h -> GeoTypes.h.
 #include <math.h>
 
 #ifndef M_PI

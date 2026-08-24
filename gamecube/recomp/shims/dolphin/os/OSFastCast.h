@@ -17,6 +17,15 @@ static inline void OSf32tos16(f32 *f, s16 *out) { *out = (s16)*f; }
 static inline void OSf32tou16(f32 *f, u16 *out) { *out = (u16)*f; }
 static inline void OSf32tos8 (f32 *f, s8  *out) { *out = (s8)*f;  }
 static inline void OSf32tou8 (f32 *f, u8  *out) { *out = (u8)*f;  }
+// int->f32 casts (the reverse direction; same portable-cast principle).
+static inline f32 __OSs8tof32 (const s8*  p) { return (f32)*p; }
+static inline f32 __OSu8tof32 (const u8*  p) { return (f32)*p; }
+static inline f32 __OSs16tof32(const s16* p) { return (f32)*p; }
+static inline f32 __OSu16tof32(const u16* p) { return (f32)*p; }
+static inline void OSs8tof32 (const s8*  in, f32 *out) { *out = (f32)*in; }
+static inline void OSu8tof32 (const u8*  in, f32 *out) { *out = (f32)*in; }
+static inline void OSs16tof32(const s16* in, f32 *out) { *out = (f32)*in; }
+static inline void OSu16tof32(const u16* in, f32 *out) { *out = (f32)*in; }
 #ifdef __cplusplus
 }
 #endif

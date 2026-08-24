@@ -14,18 +14,42 @@ const PRIM = {
 };
 
 // Attribute component type codes in the VCD: 0=NONE, 1=DIRECT, 2=INDEX8, 3=INDEX16.
-const idxBytes = (t) => (t === 3 ? 2 : t === 2 ? 1 : 0); // DIRECT handled separately
+const idxBytes = (t) => (t === 3 ? 2 : t === 2 ? 1 : 0);
+const FMT_SZ = [1, 1, 2, 2, 4];                 // U8, S8, U16, S16, F32
+const COL_SZ = [2, 3, 4, 2, 3, 4];              // RGB565, RGB8, RGBX8, RGBA4, RGBA6, RGBA8
+function readAttr(dv, off, fmt, shift) {         // read one position/texcoord element (big-endian)
+  let v;
+  if (fmt === 4) return dv.getFloat32(off, false);        // F32 (no shift)
+  else if (fmt === 3) v = dv.getInt16(off, false);        // S16
+  else if (fmt === 2) v = dv.getUint16(off, false);       // U16
+  else if (fmt === 1) v = dv.getInt8(off);                // S8
+  else v = dv.getUint8(off);                              // U8
+  return v / (1 << (shift || 0));                          // fixed-point -> float
+}
 
-// Decode the per-vertex byte size from the current VCD (CP 0x50 lo, 0x60 hi). Handles the
-// indexed attributes MP4 uses; DIRECT attributes would need the VAT (flagged, not sized).
-function vertexSize(vcdLo, vcdHi) {
-  let bytes = 0, direct = false;
-  if (vcdLo & 0x1) bytes += 1;                 // PNMTXIDX (position/normal matrix index)
-  for (let i = 0; i < 8; i++) if (vcdLo & (1 << (1 + i))) bytes += 1; // TEXnMTXIDX
-  const pos = (vcdLo >> 9) & 3, nrm = (vcdLo >> 11) & 3, c0 = (vcdLo >> 13) & 3, c1 = (vcdLo >> 15) & 3;
-  for (const t of [pos, nrm, c0, c1]) { if (t === 1) direct = true; else bytes += idxBytes(t); }
-  for (let i = 0; i < 8; i++) { const t = (vcdHi >> (2 * i)) & 3; if (t === 1) direct = true; else bytes += idxBytes(t); }
-  return { bytes, direct };
+// Decode the full per-vertex layout from the VCD (CP 0x50/0x60) + VAT_A (CP 0x70). Sizes BOTH
+// indexed and DIRECT attributes, and returns where the position lives within each vertex so the
+// draw handler can extract it. Attribute order per the GX vertex format: PNMTXIDX, TEXnMTXIDX,
+// POS, NRM, COL0, COL1, TEX0..7.
+function vertexLayout(vcdLo, vcdHi, vat) {
+  let off = 0, direct = false, posOff = -1, posComps = 0, posFmt = 4, posShift = 0;
+  const posT = (vcdLo >> 9) & 3, nrmT = (vcdLo >> 11) & 3, c0T = (vcdLo >> 13) & 3, c1T = (vcdLo >> 15) & 3;
+  if (vcdLo & 0x1) off += 1;                                              // PNMTXIDX
+  for (let i = 0; i < 8; i++) if (vcdLo & (1 << (1 + i))) off += 1;       // TEXnMTXIDX
+  if (posT === 1) { direct = true; posComps = ((vat & 1) ? 3 : 2); posFmt = (vat >> 1) & 7; posShift = (vat >> 4) & 0x1F; posOff = off; off += posComps * FMT_SZ[posFmt]; }
+  else if (posT) off += idxBytes(posT);
+  if (nrmT === 1) { direct = true; const nc = ((vat >> 9) & 1) ? 9 : 3; off += nc * FMT_SZ[(vat >> 10) & 7]; }
+  else if (nrmT) off += idxBytes(nrmT);
+  if (c0T === 1) { direct = true; off += COL_SZ[(vat >> 14) & 7]; }
+  else if (c0T) off += idxBytes(c0T);
+  if (c1T === 1) { direct = true; off += COL_SZ[(vat >> 18) & 7]; }
+  else if (c1T) off += idxBytes(c1T);
+  for (let i = 0; i < 8; i++) {
+    const tT = (vcdHi >> (2 * i)) & 3;
+    if (tT === 1) { direct = true; if (i === 0) { const tc = ((vat >> 21) & 1) ? 2 : 1; off += tc * FMT_SZ[(vat >> 22) & 7]; } else off += 2 * 4; }
+    else if (tT) off += idxBytes(tT);
+  }
+  return { perVert: off, direct, posOff, posComps, posFmt, posShift, posElem: FMT_SZ[posFmt] };
 }
 
 export function decodeFifo(buf, len, fmt) {
@@ -33,7 +57,7 @@ export function decodeFifo(buf, len, fmt) {
   const end = len ?? dv.byteLength;
   let p = 0;
   const cmds = [];
-  let vcdLo = 0, vcdHi = 0;
+  let vcdLo = 0, vcdHi = 0, vat0 = 0;
   const u8 = () => dv.getUint8(p++);
   const u16 = () => { const v = dv.getUint16(p, false); p += 2; return v; };   // big-endian
   const u32 = () => { const v = dv.getUint32(p, false); p += 4; return v; };
@@ -44,7 +68,7 @@ export function decodeFifo(buf, len, fmt) {
     if (op === 0x00) { continue; }                                            // NOP
     if (op === 0x08) {                                                        // LOAD_CP_REG
       const addr = u8(), val = u32();
-      if (addr === 0x50) vcdLo = val; else if (addr === 0x60) vcdHi = val;
+      if (addr === 0x50) vcdLo = val; else if (addr === 0x60) vcdHi = val; else if (addr === 0x70) vat0 = val;
       cmds.push({ t: 'cp', addr, val });
     } else if (op === 0x10) {                                                 // LOAD_XF_REG
       const hdr = u32(), count = (hdr >>> 16) + 1, xfAddr = hdr & 0xFFFF;
@@ -56,24 +80,27 @@ export function decodeFifo(buf, len, fmt) {
       const idx = u16(), info = u16(); cmds.push({ t: 'indx', op, index: idx, len: (info >> 12) + 1, xfAddr: info & 0xFFF });
     } else if (PRIM[op & 0xF8]) {                                             // DRAW (prim|vat)
       const prim = PRIM[op & 0xF8], vat = op & 7, nverts = u16();
-      const { bytes, direct } = vertexSize(vcdLo, vcdHi);
+      const lay = vertexLayout(vcdLo, vcdHi, vat0);
       const vstart = p;
-      const draw = { t: 'draw', prim, vat, nverts, vbytes: bytes, direct, vstart };
-      // DIRECT decode when a fixed layout is supplied (positions [+ colors] inline).
-      // fmt = { posDirect:true, posComps, clrDirect:bool } — pos = posComps x f32, clr = rgba8.
-      if (direct && fmt && fmt.posDirect) {
-        const positions = [], colors = [];
-        const stride = fmt.posComps * 4 + (fmt.clrDirect ? 4 : 0);
-        for (let v = 0; v < nverts; v++) {
-          const pv = []; for (let c = 0; c < fmt.posComps; c++) pv.push(f32()); positions.push(pv);
-          if (fmt.clrDirect) { colors.push([u8(), u8(), u8(), u8()]); }
+      const draw = { t: 'draw', prim, vat, nverts, vbytes: lay.perVert, direct: lay.direct, vstart };
+      if (lay.perVert > 0) {
+        if (lay.posOff >= 0 && lay.posComps > 0) {                            // extract inline positions
+          const positions = [];
+          for (let v = 0; v < nverts; v++) {
+            const vb = p + v * lay.perVert, pv = [];
+            for (let c = 0; c < lay.posComps; c++) pv.push(readAttr(dv, vb + lay.posOff + c * lay.posElem, lay.posFmt, lay.posShift));
+            positions.push(pv);
+          }
+          draw.positions = positions;
         }
-        draw.positions = positions; draw.colors = colors; draw.vbytes = stride;
-      } else if (!direct && bytes > 0) {
-        p += nverts * bytes;                                                  // skip indexed vertex block
+        p += nverts * lay.perVert;                                            // consume the vertex block
       }
       draw.vend = p;
       cmds.push(draw);
+    } else if (op === 0x48) {                                                 // INVL_VC (invalidate vtx cache, 1 byte)
+      cmds.push({ t: 'invl' });
+    } else if (op === 0x40) {                                                 // CALL_DL (addr u32 + size u32)
+      const addr = u32(), size = u32(); cmds.push({ t: 'calldl', addr, size });
     } else {
       cmds.push({ t: 'UNKNOWN', op, at: p - 1 }); break;                      // stop on unrecognized op
     }

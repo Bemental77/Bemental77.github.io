@@ -78,6 +78,192 @@ perl -0pi -e 's/asm BOOL IsWriteGatherBufferEmpty\(void\)\s*\{.*?\n\}/BOOL IsWri
 perl -0pi -e 's/\(u8 \*\)(card->buffer)\s*\+=/*(u8 **)&$1 +=/g' "$BUILD/src/dolphin/card/CARDRdwr.c" 2>/dev/null || true
 perl -0pi -e 's/\Qfor (ptr = (char *)buf; ptr - buf < len; ptr++) {\E/for (ptr = (char *)buf; ptr - (char *)buf < len; ptr++) {/' "$BUILD/src/dolphin/exi/EXIUart.c" 2>/dev/null || true
 perl -0pi -e 's/\Q(u8 *)buf += xLen;\E/buf = (u8 *)buf + xLen;/' "$BUILD/src/dolphin/exi/EXIUart.c" 2>/dev/null || true
+#     malloc.c: the game allocator (HuMemDirectMalloc/HuMemInitAll/…) is portable C but fails
+#     ONLY on `asm { mflr <var> }` blocks that capture a debug return-address. Replace each
+#     with `<var> = 0;` so the whole allocator compiles IN (removes ~8 HuMem* host imports).
+#     Behavior-preserving: retaddr is only a heap-debug tag passed to HuMemMemoryAlloc.
+perl -0pi -e 's/asm\s*\{\s*mflr\s+(\w+)\s*\}/$1 = 0;/gs' "$BUILD/src/game/malloc.c" 2>/dev/null || true
+#     dvdfs.c: enable long filenames. OSInit (OS.c:249) normally sets __DVDLongFileNameFlag=1
+#     ("made it through debug"); OSInit is a no-op host import here, so the flag stays 0 and
+#     DVDConvertPathToEntrynum OSPanics on any datadir name >8 chars (e.g. bkoopasuit.bin) via
+#     the legacy 8.3-format check. Set it in __DVDFSInit (host DVD-layer init) instead.
+perl -0pi -e 's/(void __DVDFSInit\(\) \{)/$1\n\t__DVDLongFileNameFlag = 1;/' "$BUILD/src/dolphin/dvd/dvdfs.c" 2>/dev/null || true
+#     GXMisc.c GXWaitDrawDone: on real HW this blocks on FinishQueue until the PE draw-done
+#     interrupt sets DrawDone. There's no PE interrupt in the recomp (the GP-FIFO is emitted
+#     synchronously to the software ring, consumed later by Dolphin), so the draw is "done" as
+#     soon as it is emitted -> skip the wait (else it spins forever on OSSleepThread).
+perl -0pi -e 's/while \(!DrawDone\) \{\s*OSSleepThread\(&FinishQueue\);\s*\}/DrawDone = 1;/s' "$BUILD/src/dolphin/gx/GXMisc.c" 2>/dev/null || true
+#     [AOT-overlay, REL_ENDIANNESS_PLAN.md step 3] objdll.c omDLLLink: dispatch OVL_BOOT to the
+#     statically-compiled bootDll _prolog (executor.c) instead of HuDvdDataReadDirect(.rel from
+#     disc) + OSLink (no-op import) + calling the big-endian garbage module->prolog pointer (the
+#     current spin). bootDll is compiled into the wasm by step 1. Gated with the step-1 compile.
+if [ -z "${RECOMP_NO_BOOTDLL:-}" ]; then
+perl -0pi -e 's{(dll->name = dllFile->name;\n)}{$1\tif(overlay == OVL_BOOT){extern s32 _prolog(void); dll->module = 0; dll->bss = 0; if(flag==1){OSReport("objdll> AOT bootDll _prolog\\n"); dll->ret = _prolog();} return dll;}\n}' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+#     AOT overlays have dll->module==0, so omDLLUnlink's epilog call + OSUnlink + module free would
+#     null-deref when the overlay is killed (title -> OVL_MODESEL switch). Guard the module accesses.
+perl -0pi -e 's/(\(\(DLLEpilog\)dll_ptr->module->epilog\)\(\);)/if(dll_ptr->module) $1/' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+perl -0pi -e 's/(if\(OSUnlink\(&dll_ptr->module->info\) != TRUE\))/if(dll_ptr->module \&\& OSUnlink(&dll_ptr->module->info) != TRUE)/' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+perl -0pi -e 's/(HuMemDirectFree\(dll_ptr->module\);)/if(dll_ptr->module) $1/' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+#     [step 4] bootDll NintendoDataDecode: the compiled-in nintendoData.inc is BIG-ENDIAN; the
+#     size + decode_type header u32s are read natively (LE-wrong). Byte-swap them (HuDecodeData
+#     reads the compressed body byte-by-byte per data.c:587, so only the 2 header reads need it).
+perl -0pi -e 's/(u32 size = )\*src\+\+;/${1}__builtin_bswap32(*src++);/; s/(int decode_type = )\*src\+\+;/${1}(int)__builtin_bswap32(*src++);/' "$BUILD/src/REL/bootDll/main.c" 2>/dev/null || true
+#     [step 5] byte-swap the decoded BE AnimData sprite tree to LE once at decode time, so
+#     HuSprAnimRead + the sprite render path read correct offsets/counts (shims/src/gc_anim_bswap.c).
+perl -0pi -e 's/(HuDecodeData\(src, dst, size, decode_type\);)/$1\n\t\t{ extern void __recomp_bswap_animtree(void*); __recomp_bswap_animtree(dst); }/' "$BUILD/src/REL/bootDll/main.c" 2>/dev/null || true
+fi
+#     [AOT-overlay, generalized] dispatch OVL_MODESEL to the statically-compiled, symbol-namespaced
+#     modesel_prolog (shims/src/gc_ovl_dispatch.c -> modesel_ObjectSetup), same trick as OVL_BOOT.
+#     Inserted after the OVL_BOOT case. Gated with the modesel compile below.
+if [ -n "${RECOMP_MODESEL:-}" ]; then
+perl -0pi -e 's{(if\(overlay == OVL_BOOT\)\{.*?return dll;\}\n)}{$1\tif(overlay == OVL_MODESEL){extern s32 modesel_prolog(void); dll->module = 0; dll->bss = 0; if(flag==1){OSReport("objdll> AOT modesel_prolog\\n"); dll->ret = modesel_prolog();} return dll;}\n}s' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+fi
+if [ -n "${RECOMP_MSDIAG:-}" ]; then
+perl -0pi -e 's/(void BootExec\(void\)\s*\n\{)/$1\n    OSReport("MK-OMOVL evt=%d init=%d\\n", omovlevtno, SystemInitF);/' "$BUILD/src/REL/bootDll/main.c" 2>/dev/null || true
+fi
+#     [general asset endianness] GetFileInfo (data.c) walks a DATADIR archive's BIG-ENDIAN header:
+#     it reads offsets[file_num], then the sub-file's raw_len + comp_type — all as native (LE-wrong)
+#     u32s. Unswapped, offsets[0]=0x24 reads as 0x24000000 -> dir+0x24000000 -> OOB (the frame-41
+#     trap on effect.bin). Byte-swap all three reads. This is the GENERAL seam: fixes every DATADIR
+#     archive (effect, sprites, models, ...), not just effect.bin. Sub-file DATA still needs its own
+#     format swap (AnimData/HSF), handled per-consumer.
+perl -0pi -e 's/(read_stat->file = PTR_OFFSET\(read_stat->dir, )\*temp_ptr(\);)/${1}__builtin_bswap32(*temp_ptr)${2}/;
+              s/(read_stat->raw_len = )\*temp_ptr\+\+;/${1}__builtin_bswap32(*temp_ptr); temp_ptr++;/;
+              s/(read_stat->comp_type = )\*temp_ptr\+\+;/${1}__builtin_bswap32(*temp_ptr); temp_ptr++;/;' "$BUILD/src/game/data.c" 2>/dev/null || true
+#     [HSF model endianness] LoadHSF (hsfload.c) interprets a big-endian .hsf 3D-model file (title
+#     screen, board, characters) with native LE loads -> garbage counts/offsets -> OOB. Swap the
+#     whole file BE->LE once at LoadHSF entry, before FileLoad reads the header. Covers all 21 HSF
+#     sections + nested cenv/motion/strip data (shims/src/gc_hsf_bswap.c, built by wf_a2d55c6d).
+perl -0pi -e 's/(HsfData \*LoadHSF\(void \*data\)\s*\{)/$1\n    { extern void __recomp_bswap_hsf(void*); __recomp_bswap_hsf(data); }/' "$BUILD/src/game/hsfload.c" 2>/dev/null || true
+if [ -n "${RECOMP_MSGDIAG:-}" ]; then
+perl -0pi -e 's{(data = HuDvdDataReadWait\(&file, HEAP_DVD, 0, 0, HuDVDReadAsyncCallBack, FALSE\);)}{OSReport("HDDR start=%d len=%d dir=%d\\n", (int)file.startAddr, (int)file.length, (int)DirDataSize); $1}' "$BUILD/src/game/dvd.c" 2>/dev/null || true
+fi
+#     [message-data endianness] HuWinMesRead loads a BE message .bin; messdata.c walks it native-LE
+#     -> garbage offsets -> MessData_MesPtrGet wild pointer -> GetMesMaxSizeSub OOB (the demo/movie
+#     subtitle window; LATENT in the default build too, ~frame 610). Swap the blob after the memcpy.
+perl -0pi -e 's/(messDataPtr = HuMemDirectMalloc\(HEAP_SYSTEM, DirDataSize\);\s*\n\s*memcpy\(messDataPtr, dvd_mess, DirDataSize\);)/$1\n    { extern void __recomp_bswap_messdata(void*, int); __recomp_bswap_messdata(messDataPtr, (int)DirDataSize); }/' "$BUILD/src/game/window.c" 2>/dev/null || true
+#     [THP movie skip] The Truemotion (.thp) movie subsystem isn't implemented in the recomp (audio/
+#     DSP neutralized, no THP decode/present) -> THPSimpleOpen always fails and THPTestProc spins its
+#     open/preload retry `while(...==0)` loops forever ("THPSimpleOpen fail" repeats), and HuTHPEndCheck
+#     returns FALSE (no movie) so the demo's `while(!HuTHPEndCheck())` never exits. Skip the movie: bail
+#     out of THPTestProc before its spin loops, and report the movie as ended so the demo advances to
+#     the title -> OVL_MODESEL. (Skippable intro; general fix until THP playback is implemented.)
+perl -0pi -e 's/(\n\s*while \(THPSimpleOpen\(THPFileName\) == 0\) \{)/\n    for(;;) HuPrcVSleep();  \/* movie unsupported: idle this process (do NOT return -> trampoline trap) *\/$1/' "$BUILD/src/game/thpmain.c" 2>/dev/null || true
+perl -0pi -e 's/(BOOL HuTHPEndCheck\(void\)\s*\n\{)/$1\n    return 1;/' "$BUILD/src/game/thpmain.c" 2>/dev/null || true
+#     THPViewSprFunc is the per-frame sprite draw fn for the video (HuSprFuncCreate) — with the movie
+#     skipped it reads a non-existent decoded frame -> the `unreachable` fiber trap. No-op it (the THP
+#     sprite stays valid but draws nothing) so the demo can advance.
+perl -0pi -e 's/(static void THPViewSprFunc\(HuSprite \*arg0\)\s*\n\{)/$1\n    return;/' "$BUILD/src/game/thpmain.c" 2>/dev/null || true
+#     [input inject] the recomp has no VI-retrace interrupt firing PadReadVSync, so HuPadBtnDown
+#     never gets real input. Deliver host buttons: OR __recomp_inject_btn (set by the harness via
+#     ___recomp_set_inject_btn) into HuPadBtnDown[0] at HuPadRead's end (shims/src/gc_input.c).
+perl -0pi -e 's/(_PadBtnDown\[i\] = 0;\s*\n\s*\})\n\}/$1\n    { extern int __recomp_inject_btn; HuPadBtnDown[0] |= (unsigned short)__recomp_inject_btn; }\n}/' "$BUILD/src/game/pad.c" 2>/dev/null || true
+#     [system clocks] __OSBusClock/__OSCoreClock (os.h, AT_ADDRESS 0x800000F8/FC) are written by the
+#     bootrom + OSInit on real HW; here AT_ADDRESS is stripped -> plain BSS globals, and OSInit is a
+#     no-op import, so they stay 0 -> the OSTicksToMilliseconds macro (ticks/(__OSBusClock/4000))
+#     divides by zero in the first timer loop (BootTitleExec). A strong initialized def is ignored
+#     under -Wl,--allow-multiple-definition (first/tentative def wins), so ASSIGN them at runtime at
+#     the very start of main() instead (before any timer loop runs).
+perl -0pi -e 's/(void main\(void\)\s*\n\{)/$1\n    __OSBusClock = 162000000u; __OSCoreClock = 486000000u;/' "$BUILD/src/game/main.c" 2>/dev/null || true
+#     [general sprite endianness] HuSprAnimReadFile(id) = HuSprAnimRead(HuDataSelHeapReadNum(...)).
+#     The BE disc AnimData is read natively by HuSprAnimRead, whose sentinel (anim->bank&0xFFFF0000)
+#     mis-fires on a BE offset -> the sprite is silently dropped (garbage/no texture). Wrap the inner
+#     read so the fresh blob is byte-swapped ONCE (shims/src/gc_anim_bswap.c) before HuSprAnimRead.
+#     Fixes ALL disc sprites (title bg/copyright/press-start, game sprites); the bootDll logo doesn't
+#     use this macro so it is unaffected (no double-swap).
+perl -0pi -e 's/#define HuSprAnimReadFile\(data_id\) \(HuSprAnimRead\((HuDataSelHeapReadNum\(\(data_id\), MEMORY_DEFAULT_NUM, HEAP_DATA\))\)\)/extern void *__recomp_bswap_animtree_ret(void *);\n#define HuSprAnimReadFile(data_id) (HuSprAnimRead(__recomp_bswap_animtree_ret($1)))/' "$BUILD/include/game/sprite.h" 2>/dev/null || true
+#     [DIAG, gated] insert OSReport markers before each main() boot call so a pure-wasm spin
+#     (which can't be node-profiled) can be localized by the last marker printed.
+if [ -n "${RECOMP_MARKERS:-}" ]; then
+  perl -0pi -e 'for my $fn (qw(GWInit pfInit HuSprInit Hu3DInit HuDataInit HuPerfInit WipeInit omMasterInit)) { s/^(\s*)(\Q$fn\E\s*\()/${1}OSReport("MK:$fn\\n");\n${1}${2}/m; }' "$BUILD/src/game/main.c" 2>/dev/null || true
+  # per-call marker on the FST path resolver + a spin marker inside its inner walk loop
+  perl -0pi -e 's/(s32 DVDConvertPathToEntrynum\(char\* pathPtr\) \{)/$1\n\tstatic int __dcpe=0; OSReport("MK:DCPE\\n");/;
+                s/(for \(i = dirLookAt \+ 1; i < nextDir\(dirLookAt\); i = entryIsDir\(i\) \? nextDir\(i\) : \(i \+ 1\)\) \{)/$1\n\t\t\tif(++__dcpe<24)OSReport("SPIN dla=%d i=%d ndla=%d ndi=%d edi=%d\\n", dirLookAt, i, nextDir(dirLookAt), nextDir(i), entryIsDir(i));/;' "$BUILD/src/dolphin/dvd/dvdfs.c" 2>/dev/null || true
+fi
+#     GXInit.c: redirect the GX register-block bases from the uncached MMIO window
+#     (OSPhysicalToUncached(0xC00xxxx) = 0xCC00xxxx, past the wasm memory ceiling -> the
+#     GXSetCPUFifo out-of-bounds trap) to an in-range host scratch buffer. The FIFO seam
+#     (gx_wgpipe -> recomp_render_fifo -> Dolphin OpcodeDecoder) does the real rendering, so
+#     these register writes only need a valid target. Prototype prepended; see
+#     gamecube/recomp/shims/src/gc_mmio_scratch.c. Behavior-preserving for frame emission.
+perl -0pi -e 's/\A/extern void *__recomp_reg_base(unsigned);\n/; s/(__\w+Reg\s*=\s*)OSPhysicalToUncached(\(0xC00[0-9A-Fa-f]+\))/${1}__recomp_reg_base$2/g' "$BUILD/src/dolphin/gx/GXInit.c" 2>/dev/null || true
+
+# 3d. AUDIO / ARAM-DSP NEUTRALIZATION. The compiled-in SDK ARAM driver (ar.c) dereferences
+#     __DSPRegs, a hardcoded pointer macro `((vu16*)0xCC005000)` (hw_regs.h:226, the
+#     non-__MWERKS__ branch active under emcc — the AT_ADDRESS array form is __MWERKS__-only).
+#     0xCC005000 (3.42GB) is above every reachable wasm memory bound, so the FIRST deref
+#     (ar.c:124 `refresh = __DSPRegs[13]`) faults out-of-bounds 4 retraces into the render
+#     loop — the current PUMP-mode blocker. Mapping the memory would instead convert the
+#     fault into an infinite spin (ar.c:244 `while(!(__DSPRegs[11]&1))`, ar.c:188
+#     `while(__DSPRegs[5]&0x0200)`) that can never exit without a real DSP. So NEUTRALIZE the
+#     blocking/faulting constructs at the SOURCE while PRESERVING the data outputs (ARInfo
+#     size statics), so HuARInit still completes with a sane ARAM table. No __DSPRegs address
+#     is ever dereferenced. Behavior-preserving for the Nintendo-logo frame (audio = 0 pixels;
+#     the MusyX engine src/msm/ is already a host-import no-op, not compiled in).
+ARC="$BUILD/src/dolphin/ar/ar.c"
+#   (1) Replace the whole __ARChecksize body: kills the ar.c:244 __DSPRegs[11] spin, the
+#       246-338 ARAM-size DMA probe, __DSPRegs[9] writes, and the OSPhysicalToUncached store.
+#       Set the size statics to the 16MB base ar.c:248 already assumes so ARGetSize()>0x808000.
+perl -0777 -pi -e 's/void __ARChecksize\(void\)\s*\{.*?__AR_Size = ARAM_size;\s*\n\}/void __ARChecksize(void){__AR_InternalSize=0x1000000;__AR_ExpansionSize=0;__AR_Size=0x1000000;}/s' "$ARC" 2>/dev/null || true
+#   (2) Delete the ar.c:124-126 __DSPRegs[13] refresh RMW — the ACTUAL current fault site
+#       (0xCC00501A), reached before __ARChecksize.
+perl -0777 -pi -e 's/\s*refresh = \(u16\)\(__DSPRegs\[13\] & 0x000000ff\);\s*\n\s*__DSPRegs\[13\] = \(u16\)\(\(__DSPRegs\[13\] & ~0x000000ff\) \| \(refresh & 0x000000ff\)\);/\n    (void)refresh;/s' "$ARC" 2>/dev/null || true
+#   (3) Empty the __ARWaitForDMA body (ar.c:188 __DSPRegs[5] DMA-done spin) — defense-in-depth
+#       so any residual ARStartDMA/__ARWriteDMA/__ARReadDMA can't spin (unreachable after (1)).
+perl -0777 -pi -e 's/static void __ARWaitForDMA\(void\)\s*\{\s*\n\s*\n\s*while \(__DSPRegs\[5\] & 0x0200\) \{ \}\s*\n\}/static void __ARWaitForDMA(void){}/s' "$ARC" 2>/dev/null || true
+#   (4) EMULATED ARAM DMA (supersedes the old "HuARDMACheck -> return 0" neutralization). ARStartDMA
+#       programs the out-of-bounds __DSPRegs MMIO (0xCC005000) -> the frame-41 OOB now that BootExec's
+#       HuAR_DVDtoARAM (DVD->ARAM staging) path is reached. ARAM is a real data store (staged, then
+#       ARAM->MRAM'd back), so the transfer must MOVE bytes. Route ARStartDMA to a memcpy over a 16MB
+#       emulated-ARAM buffer (shims/src/gc_aram.c). Args arrive already ordered (arg1=main-mem,
+#       arg2=ARAM) by __ARQPopTaskQueueHi/__ARQServiceQueueLo.
+perl -0777 -pi -e 's/void ARStartDMA\(u32 type, u32 mainmem_addr, u32 aram_addr, u32 length\)\s*\{.*?\n\}/void ARStartDMA(u32 type, u32 mainmem_addr, u32 aram_addr, u32 length){extern void __recomp_ar_dma(unsigned,unsigned,unsigned,unsigned); __recomp_ar_dma(type, mainmem_addr, aram_addr, length);}/s' "$ARC" 2>/dev/null || true
+#       Make every ARQ request a SINGLE chunk (default 4096-byte chunking needs a per-chunk interrupt
+#       to advance; we have none) so one memcpy completes the whole transfer and __ARQCallbackLo is set.
+perl -0777 -pi -e 's/__ARQChunkSize = ARQ_CHUNK_SIZE_DEFAULT;/__ARQChunkSize = 0x2000000;/' "$BUILD/src/dolphin/ar/arq.c" 2>/dev/null || true
+#       Drive the ARQ completion synchronously: real HW fires __ARQInterruptServiceRoutine (callback +
+#       clear-pending + service-next) on the DMA-done interrupt, which never fires under wasm. So pump
+#       it from HuARDMACheck (called in the game's `while(HuARDMACheck())` drain loops). Bounded guard +
+#       always-return-0 so the drain loop terminates even if arqCnt were ever left unbalanced.
+perl -0777 -pi -e 's/s32 HuARDMACheck\(void\) \{\s*\n\s*return arqCnt;\s*\n\}/s32 HuARDMACheck(void) {\n    extern void __ARQInterruptServiceRoutine(void);\n    int guard = 256;\n    while (arqCnt > 0 \&\& guard-- > 0) __ARQInterruptServiceRoutine();\n    return 0;\n}/s' "$BUILD/src/game/armem.c" 2>/dev/null || true
+
+# 3e. VI / SI register-MMIO redirect. hw_regs.h defines the register-block pointer macros
+#     `__VIRegs = (vu16*)0xCC002000`, `__SIRegs = (vu32*)0xCC006400` (the non-__MWERKS__ #else
+#     branch, active under emcc). Those physical addresses are past the wasm memory ceiling,
+#     so any deref faults out-of-bounds — the CURRENT blocker is SISamplingRate.c:51 reading
+#     `__VIRegs[54]` (= 0xCC00206C) on the HuPadInit->SISetSamplingRate path, verified via the
+#     faulting-const disassembly (wasm-function[879] <main> @0x646b2 loads 0xCC00206C). Redirect
+#     __VIRegs and __SIRegs to the same in-range host scratch the GX register bases already use
+#     (gc_mmio_scratch __recomp_reg_base, keyed by paddr&0xFFFF -> distinct pages 0x2000/0x6400).
+#     Reads return last-written (0 at boot); the two `while(__SIRegs[13]&1)` spins (SIBios.c:311,
+#     374) are wait-for-CLEAR, so 0-scratch exits them immediately. We deliberately do NOT
+#     redirect __DSPRegs/__AIRegs: OSAudioSystem.c has wait-for-SET spins (`while(!(r3&0x20))`,
+#     etc.) that 0-scratch would HANG — and that audio path is off the logo-frame boot (only
+#     reached from __OSInitAudioSystem in the host-no-op OSInit). The ar.c __DSPRegs faults are
+#     already neutralized at the source in 3d above.
+perl -0777 -pi -e 's/\#define __VIRegs \(\(vu16\*\)0xCC002000\)/#define __VIRegs ((vu16*)__recomp_reg_base(0xCC002000))/; s/\#define __SIRegs \(\(vu32\*\)0xCC006400\)/#define __SIRegs ((vu32*)__recomp_reg_base(0xCC006400))/; s/\A/extern void *__recomp_reg_base(unsigned);\n/' "$BUILD/include/dolphin/hw_regs.h" 2>/dev/null || true
+
+# 3f. FIBER (stackful-coroutine) scheduler hooks. src/game/jmp.c's gcsetjmp/gclongjmp are
+#     mwcc PPC `asm{}` bodies that DO NOT compile under clang -> they were left as no-op
+#     host imports, so gclongjmp never transferred control and the Hu cooperative scheduler
+#     (process.c) spun forever emitting 0 draws. The portable replacement lives in
+#     gamecube/recomp/shims/src/gc_fiber_coro.c (real gcsetjmp/gclongjmp over
+#     emscripten_fiber_*). Two source transforms make process.c drive it:
+PROC="$BUILD/src/game/process.c"
+#   (A) Fabricate hook — HuPrcCreate writes jump.lr=func / jump.sp=base_sp as RAW fields
+#       (process.c:81-83), which a gcsetjmp/gclongjmp shim cannot observe. Replace the
+#       gcsetjmp + two raw stores with a single fiber-init that carries func + stack_size
+#       (both in scope in HuPrcCreate). base_sp is a guest-PPC sp, meaningless for the wasm
+#       shadow stack, so it is dropped (the fiber owns its own c-stack).
+perl -0777 -pi -e 's/\bgcsetjmp\(&process->jump\);\s*\n\s*process->jump\.lr\s*=\s*\(u32\)func;\s*\n\s*process->jump\.sp\s*=\s*process->base_sp;/__gc_fiber_fabricate(&process->jump, func, stack_size);/s' "$PROC" 2>/dev/null || true
+#   (B) Scheduler status routing — the PPC dispatch is `ret = gcsetjmp(&processjmpbuf)`;
+#       its nonzero "resume" arrives via the process's gclongjmp(&processjmpbuf,status).
+#       Under fibers, THAT status is the return value of the scheduler's own
+#       gclongjmp(&process->jump,1) swap. Capture it into `ret` so switch(ret) frees/advances
+#       exactly as native (process.c:280). Without this, switch(ret) reads a stale ret.
+perl -0777 -pi -e 's/\bgclongjmp\(&process->jump,\s*1\);/ret = gclongjmp(&process->jump, 1);/s' "$PROC" 2>/dev/null || true
+#   (C) File-scope prototype for the fabricate hook (idempotent).
+perl -0777 -pi -e 's/\A(?!extern void __gc_fiber_fabricate)/extern void __gc_fiber_fabricate(void*, void(*)(void), unsigned);\n/' "$PROC" 2>/dev/null || true
 
 # 3b. Signature reconciliation: inject each decl!=def function's CANONICAL prototype
 #     (from its definition = byte-identical to native Dolphin's main.elf) into the
@@ -194,6 +380,37 @@ for f in "$RECOMP"/shims/src/*.c; do compile_one "$f"; done
 compile_dir "$BUILD/src/game"
 compile_dir "$BUILD/src/dolphin"
 compile_dir "$BUILD/src/libhu"
+# [AOT-overlay, REL_ENDIANNESS_PLAN.md step 1] Compile the bootDll boot-logo overlay INTO the
+# DOL module (only its 3 units: executor.c shared prolog + bootDll/main.c + language.c). All 78
+# of bootDll's DOL calls bind by plain symbol name to functions already in the wasm, so this
+# sidesteps runtime OSLink + the disc read + the big-endian relocation/prolog-ptr spin. The
+# other ~92 RELs stay skipped (they share auto-named fn_* symbols that collide when flat-linked).
+if [ -z "${RECOMP_NO_BOOTDLL:-}" ]; then
+  compile_one "$BUILD/src/REL/executor.c"
+  compile_one "$BUILD/src/REL/bootDll/main.c"
+  compile_one "$BUILD/src/REL/bootDll/language.c"
+fi
+# [AOT-overlay, generalized] Compile the mode-select overlay INTO the module with its entry symbols
+# NAMESPACED (only ObjectSetup + lbl_1_bss_4 collide with the DOL/bootDll — measured via llvm-nm).
+# modesel_prolog (gc_ovl_dispatch.c) calls modesel_ObjectSetup. Toward gameplay: title->OVL_MODESEL.
+if [ -n "${RECOMP_MODESEL:-}" ]; then
+  MSNS="-DObjectSetup=modesel_ObjectSetup -D__OSBusClock=__ms_busclk -D__OSCoreClock=__ms_coreclk"
+  for u in modesel main datalist filesel; do
+    # (a) modesel implicit-declares esp*/HuTHP*/msm*/BoardStatusKill/Hu3D*2Dto3D (missing #includes)
+    #     -> wrong signatures -> 14 sig-mismatches that regress the title. Add the declaring headers.
+    perl -0pi -e 's{\A}{#include "game/esprite.h"\n#include "game/thpmain.h"\n#include "msm/msmsys.h"\n#include "game/board/ui.h"\n#include "game/hsfex.h"\n}' "$BUILD/src/REL/modeseldll/$u.c" 2>/dev/null || true
+    # (b) the decomp's auto-named module-1 symbols (fn_1_*/lbl_1_*) collide with bootDll (also a
+    #     "module 1" REL). Namespace ALL of modesel's to fn_ms1_*/lbl_ms1_* (these are REL-internal;
+    #     DOL calls use real names like Hu*/om*/esp*, so this only renames modesel's own symbols).
+    perl -0pi -e 's/\bfn_1_/fn_ms1_/g; s/\blbl_1_/lbl_ms1_/g' "$BUILD/src/REL/modeseldll/$u.c" 2>/dev/null || true
+  done
+  for u in modesel main datalist filesel; do
+    o="$BUILD/obj/$(printf '%s' "src/REL/modeseldll/$u.c" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
+    if emcc "${CFLAGS[@]}" $MSNS "$BUILD/src/REL/modeseldll/$u.c" -o "$o" 2>/tmp/ce_ms.txt; then ok=$((ok+1));
+    else fail=$((fail+1)); echo "  modeseldll/$u.c: $(grep -m1 'error:' /tmp/ce_ms.txt | sed 's|.*error: ||')"; fi
+  done
+  echo "[recomp] modesel overlay AOT-compiled (namespaced)"
+fi
 echo "[recomp] wasm objects: $ok built, $fail failed"
 echo "[recomp] object bytes: $(cat "$BUILD"/obj/*.o 2>/dev/null | wc -c)"
 echo "[recomp] top remaining blockers:"
@@ -208,12 +425,22 @@ echo "[recomp] linking $(ls "$BUILD"/obj/*.o 2>/dev/null | wc -l) objects -> was
 #    Binaryen -O2 proves gx_fifo_buf is write-only-never-read and dead-strips the entire
 #    write-gather-pipe chain (the game's whole render output). The host reads the FIFO
 #    via [gx_fifo_base(), gx_fifo_base()+gx_fifo_pos()) and calls gx_fifo_reset() per frame.
-if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.wasm" \
-     -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sSTANDALONE_WASM=1 \
-     -Wl,--export=gx_fifo_base -Wl,--export=gx_fifo_pos -Wl,--export=gx_fifo_reset \
+#    FIBER SWITCH: drop -sSTANDALONE_WASM (emscripten_fiber_swap is JS-runtime Asyncify code,
+#    incompatible with a raw-instantiate standalone module — see gc_fiber_coro.c). Emit an ES6
+#    module factory (.js glue) + the wasm alongside; recomp_run.mjs loads via the factory and
+#    supplies the 126 host-import stubs through instantiateWasm. -sASYNCIFY=1 enables the
+#    Binaryen asyncify pass + the fiber runtime. main is in DEFAULT_ASYNCIFY_EXPORTS so it is
+#    Promise-wrapped. EXPORTED_FUNCTIONS drives the glue export table (leading underscore).
+if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.js" \
+     -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=33554432 \
+     -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=32768 ${RECOMP_PROFILING_FUNCS:+--profiling-funcs} \
+     -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web -sINVOKE_RUN=0 \
+     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn \
+     -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAP32,HEAPU32,wasmMemory,wasmExports \
      -Wl,--no-entry -Wl,--no-gc-sections -Wl,--allow-undefined -Wl,--allow-multiple-definition -O2 2>"$BUILD/link.txt"; then
-  echo "[recomp] LINKED: $BUILD/mp4_game.wasm ($(stat -f%z "$BUILD/mp4_game.wasm" 2>/dev/null) bytes)"
+  echo "[recomp] LINKED: $BUILD/mp4_game.js + $BUILD/mp4_game.wasm ($(stat -f%z "$BUILD/mp4_game.wasm" 2>/dev/null) bytes)"
   echo "[recomp] file: $(file "$BUILD/mp4_game.wasm" 2>/dev/null | sed 's|.*: ||')"
+  echo "[recomp] asyncify present: $(grep -c -a 'asyncify' "$BUILD/mp4_game.wasm" 2>/dev/null) | fiber_swap import: $(wasm-objdump -j Import -x "$BUILD/mp4_game.wasm" 2>/dev/null | grep -c emscripten_fiber_swap)"
   echo "[recomp] wasm signature mismatches: $(grep -c 'signature mismatch' "$BUILD/link.txt")"
 else
   echo "[recomp] link errors (top):"; grep -m8 -iE "error|duplicate|undefined" "$BUILD/link.txt" | sed -E "s/'[^']*'/X/g" | sort -u | head -8
