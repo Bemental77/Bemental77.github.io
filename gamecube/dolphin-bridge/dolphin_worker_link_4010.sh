@@ -25,7 +25,7 @@ if [ -f "$OUT/dolphin_worker_emcc.wasm" ]; then
   echo "[4010] backed up live worker -> dolphin_worker_emcc.prev.{js,wasm}"
 fi
 
-EXPORTED_FUNCS='["_main","_malloc","_free","_load_iso","_load_state","_save_state","_state_size","_run_iter","_run_iter_batch","_get_pad_ptr","_dolphin_read8","_dolphin_read16","_dolphin_read32","_dolphin_write8","_dolphin_write16","_dolphin_write32","_dolphin_check_exc","_dolphin_break_block","_dolphin_hle_check","_dolphin_hle_fire","_dolphin_interp","_dolphin_msr_updated","_dolphin_gather_drain","_dolphin_get_ram_addr","_dolphin_get_ram_size","_dolphin_get_cp_state","_bem_chain_loop_c","_recomp_render_fifo"]'
+EXPORTED_FUNCS='["_main","_malloc","_free","_load_iso","_load_state","_save_state","_state_size","_run_iter","_run_iter_batch","_get_pad_ptr","_dolphin_read8","_dolphin_read16","_dolphin_read32","_dolphin_write8","_dolphin_write16","_dolphin_write32","_dolphin_check_exc","_dolphin_break_block","_dolphin_hle_check","_dolphin_hle_fire","_dolphin_interp","_dolphin_msr_updated","_dolphin_gather_drain","_dolphin_get_ram_addr","_dolphin_get_ram_size","_dolphin_get_cp_state","_bem_chain_loop_c","_recomp_render_fifo","_recomp_pause_cpu","_recomp_present"]'
 
 EXPORTED_RUNTIME='["ccall","cwrap","getValue","setValue","addFunction","removeFunction","addRunDependency","removeRunDependency","FS","FS_createDataFile","FS_createPath","FS_createDevice","FS_createLazyFile","FS_createPreloadedFile","FS_unlink","callMain","ENV","stringToNewUTF8","HEAP8","HEAPU8","HEAP16","HEAPU16","HEAP32","HEAPU32","HEAPF32","HEAPF64"]'
 

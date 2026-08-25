@@ -72,8 +72,9 @@ export function decodeFifo(buf, len, fmt) {
       cmds.push({ t: 'cp', addr, val });
     } else if (op === 0x10) {                                                 // LOAD_XF_REG
       const hdr = u32(), count = (hdr >>> 16) + 1, xfAddr = hdr & 0xFFFF;
-      const data = []; for (let i = 0; i < count; i++) data.push(f32());
-      cmds.push({ t: 'xf', addr: xfAddr, count, data });
+      const data = [], raw = [];
+      for (let i = 0; i < count; i++) { const at = p; data.push(f32()); raw.push(dv.getUint32(at, false)); }
+      cmds.push({ t: 'xf', addr: xfAddr, count, data, raw });
     } else if (op === 0x61) {                                                 // LOAD_BP_REG
       const v = u32(); cmds.push({ t: 'bp', reg: v >>> 24, val: v & 0xFFFFFF });
     } else if (op >= 0x20 && op <= 0x38 && (op & 7) === 0) {                  // LOAD_INDX_A..D

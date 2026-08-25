@@ -29,6 +29,10 @@ const ISO  = process.env.ISO  || path.join(process.env.HOME, 'Downloads/Mario Pa
 const FST  = process.env.FST  || path.join(HERE, 'mp4_fst.bin');
 const PUMP_MAX = parseInt(process.env.PUMP_MAX || '3000', 10);
 const TRACE_DVD = !!process.env.TRACE_DVD, QUIET = !!process.env.QUIET;
+const PERF = !!process.env.PERF; let perfLast = 0;   // PERF=1: wall-clock game-fps per 200-frame segment
+const DUMPDL = parseInt(process.env.DUMPDL || '0', 10);
+const DUMPFIX = parseInt(process.env.DUMPFIX || '0', 10);
+const gxShadow = { cp: new Map(), xf: new Map(), bp: new Map() };   // DUMPFIX: last-write-wins GX register shadow
 
 // GC pad bits (include/dolphin/pad.h)
 const BTN = { left:0x0001, right:0x0002, down:0x0004, up:0x0008, z:0x0010, r:0x0020, l:0x0040,
@@ -38,10 +42,13 @@ const dstkSchedule  = new Map();   // frame -> stick-direction mask (HuPadDStkRe
                                    // dialogs navigate on the analog-stick repeat, NOT the D-pad
                                    // buttons — use dleft/dright/ddown/dup tokens for those)
 const DSTK = { dleft: 0x01, dright: 0x02, ddown: 0x04, dup: 0x08 };
+const STK  = { sxl: [-80, 0], sxr: [80, 0], syu: [0, 80], syd: [0, -80] };  // raw analog (mentDll UIs)
+const stkSchedule = new Map();
 for (const tok of (process.env.INPUT || '').split(',').filter(Boolean)) {
   const [f, b] = tok.split(':');
   const key = b?.toLowerCase();
   if (key in DSTK) { dstkSchedule.set(parseInt(f, 10), DSTK[key]); continue; }
+  if (key in STK) { stkSchedule.set(parseInt(f, 10), STK[key]); continue; }
   const mask = BTN[key] ?? parseInt(b, 16);
   if (Number.isFinite(mask)) inputSchedule.set(parseInt(f, 10), mask);
 }
@@ -184,15 +191,107 @@ function makeStub(n) {
       case 'VIWaitForRetrace': {
         const pos = Module._gx_fifo_pos ? Module._gx_fifo_pos() : 0;
         let draws = 0;
-        if (pos > 0) {
+        if (pos > 0 && !PERF) {   // PERF=1: skip probe-side per-frame decode — measure the GAME's cost only
           const buf = Buffer.from(mem().buffer.slice(Module._gx_fifo_base(), Module._gx_fifo_base() + pos));
           try { const { cmds } = decodeFifo(new DataView(buf.buffer, buf.byteOffset, buf.length), buf.length);
                 for (const c of cmds) if (c.t === 'draw') draws++; } catch { draws = -1; }
           fs.writeFileSync('/tmp/recomp_probe_last.fifo', buf);   // last non-empty frame, for offline decode
         }
         frames.push({ bytes: pos, draws });
+        // DUMPDL=<frame>: at that frame, follow every CALL_DL into guest memory and census the
+        // DISPLAY-LIST bodies (the 3D-model geometry lives there, not in the top-level FIFO):
+        // are they clean BE GX streams, and do their draws use direct or indexed attributes?
+        if (DUMPDL && viRetrace === DUMPDL && pos > 0) {
+          const top = Buffer.from(mem().buffer.slice(Module._gx_fifo_base(), Module._gx_fifo_base() + pos));
+          const { cmds } = decodeFifo(new DataView(top.buffer, top.byteOffset, top.length), top.length);
+          const dls = cmds.filter(c => c.t === 'calldl');
+          const uniq = new Map();
+          for (const d of dls) if (!uniq.has(d.addr)) uniq.set(d.addr, d.size);
+          console.log(`[dumpdl f${viRetrace}] top-level: ${cmds.length} cmds, ${dls.length} calldl (${uniq.size} unique)`);
+          let i = 0;
+          for (const [addr, size] of [...uniq.entries()].slice(0, 12)) {
+            const body = Buffer.from(mem().buffer.slice(addr >>> 0, (addr >>> 0) + Math.min(size, 65536)));
+            let rep;
+            try {
+              const r = decodeFifo(new DataView(body.buffer, body.byteOffset, body.length), body.length);
+              const k = {}; for (const c of r.cmds) k[c.t] = (k[c.t] || 0) + 1;
+              const drs = r.cmds.filter(c => c.t === 'draw');
+              const direct = drs.filter(d => d.direct).length;
+              const cpAB = r.cmds.filter(c => c.t === 'cp' && c.reg >= 0xA0 && c.reg <= 0xBF).length;
+              rep = `clean=${r.clean} ${JSON.stringify(k)} draws=${drs.length} direct=${direct} cpArrayBase=${cpAB}`;
+            } catch (e) { rep = 'DECODE THROW: ' + e.message; }
+            console.log(`[dumpdl] DL#${i} @0x${(addr >>> 0).toString(16)} size=${size}: ${rep}`);
+            fs.writeFileSync(`/tmp/recomp_dl_${i}.bin`, body);
+            i++;
+          }
+        }
+        // DUMPFIX=<frame>: write the render fixture for the Dolphin-WGPU seam — the frame's
+        // FIFO bytes, a raw MEM1 image (guest 0x80000000..0x81800000), and a region manifest
+        // (CP array base/stride pairs with byte extents + unique CALL_DL spans). The browser
+        // bridge replays these into dolphin_worker: RAM image + f32-array byte-swaps + fifo.
+        // Persistent GX state (VAT/VCD slots, array bases, BP/XF configs) is set across MANY
+        // frames (boot, scene loads) and never fully re-emitted per frame — a lone frame
+        // desyncs Dolphin's stateful decoder mid-display-list. Track a last-write-wins
+        // REGISTER SHADOW (CP, XF regs 0x1000+, BP) over every frame's stream, and at
+        // DUMPFIX synthesize a compact state prologue (~4KB) before the target frame.
+        if (DUMPFIX && pos > 0) {
+          const b0 = Module._gx_fifo_base();
+          const fb = Buffer.from(mem().buffer.slice(b0, b0 + pos));
+          try {
+            const { cmds } = decodeFifo(new DataView(fb.buffer, fb.byteOffset, fb.length), fb.length);
+            for (const c of cmds) {
+              if (c.t === 'cp') gxShadow.cp.set(c.addr & 0xff, c.val >>> 0);
+              else if (c.t === 'bp') gxShadow.bp.set(c.reg & 0xff, c.val & 0xffffff);
+              else if (c.t === 'xf' && c.addr >= 0x1000 && c.raw) {
+                for (let k = 0; k < c.raw.length; k++) gxShadow.xf.set(c.addr + k, c.raw[k] >>> 0);
+              }
+            }
+          } catch {}
+        }
+        if (DUMPFIX && viRetrace === DUMPFIX && pos > 0) {
+          const base = Module._gx_fifo_base();
+          const frameOnly = Buffer.from(mem().buffer.slice(base, base + pos));
+          const pro = [];
+          const pu8 = (v) => pro.push(v & 0xff);
+          const pu32 = (v) => { pu8(v >>> 24); pu8(v >>> 16); pu8(v >>> 8); pu8(v); };
+          for (const [a, v] of gxShadow.cp) { pu8(0x08); pu8(a); pu32(v); }
+          for (const [a, v] of gxShadow.xf) { pu8(0x10); pu32(a & 0xffff); pu32(v >>> 0); }
+          for (const [r, v] of gxShadow.bp) { pu8(0x61); pu32(((r & 0xff) << 24) | (v & 0xffffff)); }
+          const fifo = Buffer.concat([Buffer.from(pro), frameOnly]);
+          console.log(`[dumpfix] state prologue: cp=${gxShadow.cp.size} xf=${gxShadow.xf.size} bp=${gxShadow.bp.size} (${pro.length}B) + ${frameOnly.length}B frame`);
+          fs.writeFileSync('/tmp/recomp_fix_frame.bin', fifo);
+          fs.writeFileSync('/tmp/recomp_fix_mem1.bin', Buffer.from(mem().buffer.slice(0x80000000, 0x81800000)));
+          const { cmds } = decodeFifo(new DataView(fifo.buffer, fifo.byteOffset, fifo.length), fifo.length);
+          const pend = {}, pairs = new Map(), dls = new Map();
+          for (const c of cmds) {
+            if (c.t === 'cp' && c.addr >= 0xA0 && c.addr <= 0xA7) pend[c.addr - 0xA0] = c.val >>> 0;
+            if (c.t === 'cp' && c.addr >= 0xB0 && c.addr <= 0xB7) {
+              const at = c.addr - 0xB0, b2 = pend[at];
+              if (b2 !== undefined) pairs.set(`${b2}|${c.val}`, { attr: at, base: b2, stride: c.val >>> 0 });
+            }
+            if (c.t === 'calldl') dls.set(c.addr >>> 0, Math.max(dls.get(c.addr >>> 0) || 0, c.size >>> 0));
+          }
+          // extent per array: clip at the nearest FOLLOWING array base OR display-list start
+          // (cap 256KB) — arrays and DLs interleave per model, and an over-greedy extent
+          // byte-swaps DL bytes (the 0x0f-at-DL+1 desync: swap trampled 0x80a038a0).
+          const clipPts = [...new Set([...[...pairs.values()].map(p => p.base),
+                                       ...[...dls.keys()].map(a => a & 0x01FFFFFF)])].sort((x, y) => x - y);
+          const arr = [...pairs.values()].map(p => {
+            const next = clipPts.find(b2 => b2 > p.base);
+            const cap = next ? Math.min(next - p.base, 0x40000) : 0x40000;
+            return { ...p, count: cap };
+          });
+          fs.writeFileSync('/tmp/recomp_fix_regions.json',
+            JSON.stringify({ arrays: arr, dls: [...dls.entries()].map(([a, s]) => ({ addr: a, size: s })) }));
+          console.log(`[dumpfix f${viRetrace}] fifo=${fifo.length}B arrays=${arr.length} dls=${dls.size} -> /tmp/recomp_fix_*.bin/json`);
+        }
+        if (PERF && (viRetrace % 200) === 0) {
+          const now = performance.now();
+          if (perfLast) console.log(`[perf] frames ${viRetrace - 200}-${viRetrace}: ${(200000 / (now - perfLast)).toFixed(1)} game-fps (wall)`);
+          perfLast = now;
+        }
         const prev = frames[frames.length - 2];
-        if (!QUIET && (!prev || prev.draws !== draws || Math.abs(prev.bytes - pos) > 256))
+        if (!QUIET && !PERF && (!prev || prev.draws !== draws || Math.abs(prev.bytes - pos) > 256))
           console.log(`[frame ${viRetrace}] fifo=${pos}B draws=${draws}`);
         if (Module._gx_fifo_reset) Module._gx_fifo_reset();
         // input pulses: deliver this frame's scheduled mask, clear it the frame after
@@ -200,6 +299,8 @@ function makeStub(n) {
         if (inj) inj(inputSchedule.get(viRetrace + 1) ?? 0);   // set for the NEXT game frame
         const injD = Module.___recomp_set_inject_dstk;
         if (injD) injD(dstkSchedule.get(viRetrace + 1) ?? 0);
+        const stk = stkSchedule.get(viRetrace + 1);
+        if (stk && Module.___recomp_set_inject_stkx) { Module.___recomp_set_inject_stkx(stk[0]); Module.___recomp_set_inject_stky(stk[1]); }
         viRetrace++;
         if (viRetrace >= PUMP_MAX) throw { __pumpDone: true };
         return 0;

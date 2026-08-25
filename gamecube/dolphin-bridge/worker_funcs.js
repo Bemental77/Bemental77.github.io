@@ -157,6 +157,82 @@ var __ticks = 0;
 // self-contained render state (VCD/VAT/XF/BP/GX_PASSCLR TEV) so it does not depend on
 // MP4's live state. All encodings cited to Dolphin source (CPMemory.h/XFMemory.h/BPMemory.h).
 var __recompFrame = 0, __recompPtr = 0, __recompBytes = null;
+// [recomp-bridge] armed by the 'recompFix' message (see its case below)
+var __recompFix = null, __recompFixApplied = false, __recompFixPtr = 0, __recompFixLen = 0,
+    __recompFixPumps = 0, __recompPauseCpu = false, __recompXfbAddr = 0;
+function recompFixApply() {
+  // park the emulated CPU FIRST (CPUManager::Break -> JitWasm::Run exits) so the RAM image
+  // overwrite below cannot race the live JIT guest; retro_run keeps pumping GPU slice/present.
+  if (__recompFix.pauseCpu && Module._recomp_pause_cpu) Module._recomp_pause_cpu();
+  var ram = Module._dolphin_get_ram_addr();
+  if (__recompFix.mem1) {
+    Module.HEAPU8.set(new Uint8Array(__recompFix.mem1), ram);
+    var regs = __recompFix.regions;
+    if (regs && regs.arrays) {
+      var h = Module.HEAPU8;
+      for (var ai = 0; ai < regs.arrays.length; ai++) {
+        var A = regs.arrays[ai];
+        if (A.stride !== 8 && A.stride !== 12) continue;      // f32-based arrays only
+        var off = ram + (A.base & 0x01FFFFFF), n = A.count & ~3;
+        for (var k = 0; k < n; k += 4) {
+          var t0 = h[off + k]; h[off + k] = h[off + k + 3]; h[off + k + 3] = t0;
+          var t1 = h[off + k + 1]; h[off + k + 1] = h[off + k + 2]; h[off + k + 2] = t1;
+        }
+      }
+    }
+  }
+  // Presentation: our stream's EFB->XFB copy targets the RECOMP's framebuffer address, but
+  // VI scans out the JIT game's XFB. Read the live XFB base from the VI TFBL MMIO register
+  // (0xCC00201C; FBB field = phys>>5 with the page-offset convention) and patch every BP
+  // 0x4B (EFB copy dest) write in our stream to it, so our copies land where VI is looking.
+  var fifoBytes = new Uint8Array(__recompFix.fifo);
+  var tfbl = 0;
+  try { tfbl = Module._dolphin_read32(0xCC00201C) >>> 0; } catch (e) {}
+  // UVIFBInfoRegister: FBB bits 0-23, POFF bit 28. addr = POFF ? FBB<<5 : FBB (byte address).
+  var xfbAddrBytes = tfbl & 0x00FFFFFF;
+  if (tfbl & 0x10000000) xfbAddrBytes = (xfbAddrBytes << 5) >>> 0;
+  var bp4B = (xfbAddrBytes >>> 5) & 0x00FFFFFF;   // BP 0x4B copy-dest holds addr>>5
+  // Patch ONLY the DISPLAY copy's destination — the frame also contains EFB->texture copies
+  // (menu blur) whose 0x4B dests must stay put. The final 0x4B write in the stream is the
+  // display copy (GXCopyDisp at frame end); retarget every 0x4B carrying that same value.
+  var patched = 0;
+  if (xfbAddrBytes) {
+    var sites = [];
+    for (var pi = 0; pi + 4 < fifoBytes.length; pi++)
+      if (fifoBytes[pi] === 0x61 && fifoBytes[pi + 1] === 0x4B)
+        sites.push({ at: pi, val: (fifoBytes[pi + 2] << 16) | (fifoBytes[pi + 3] << 8) | fifoBytes[pi + 4] });
+    if (sites.length) {
+      var dispVal = sites[sites.length - 1].val;
+      for (var si = 0; si < sites.length; si++) {
+        if (sites[si].val !== dispVal) continue;
+        var at = sites[si].at;
+        fifoBytes[at + 2] = (bp4B >>> 16) & 0xff;
+        fifoBytes[at + 3] = (bp4B >>> 8) & 0xff;
+        fifoBytes[at + 4] = bp4B & 0xff;
+        patched++;
+      }
+    }
+  }
+  // skipDL bisect: NOP out CALL_DL commands (9 bytes each) so only the self-contained
+  // top-level (2D sprite/window) layer renders.
+  var nopped = 0;
+  if (__recompFix.skipDL) {
+    for (var qi = 0; qi + 9 <= fifoBytes.length; qi++) {
+      if (fifoBytes[qi] === 0x40 && fifoBytes[qi + 1] === 0x80) {
+        for (var z = 0; z < 9; z++) fifoBytes[qi + z] = 0x00;
+        nopped++; qi += 8;
+      }
+    }
+  }
+  __recompFixPtr = Module._malloc(fifoBytes.length);
+  Module.HEAPU8.set(fifoBytes, __recompFixPtr);
+  __recompFixLen = fifoBytes.length;
+  __recompFixApplied = true;
+  __recompXfbAddr = xfbAddrBytes >>> 0;
+  postMessage({ cmd: 'print', txt: '[recompFix] ram=0x' + (Module._dolphin_get_ram_addr() >>> 0).toString(16)
+    + ' tfbl=0x' + tfbl.toString(16) + ' xfbAddr=0x' + xfbAddrBytes.toString(16) + ' bp4B=0x' + bp4B.toString(16) + ' patched=' + patched + ' dlNopped=' + nopped });
+  postMessage({ cmd: 'recompFix-applied', fifoLen: __recompFixLen });
+}
 function buildRecompTriangleFifo() {
   var b = [];
   function u8(v){ b.push(v & 0xff); }
@@ -229,6 +305,20 @@ function pumpBatch() {
   }
   if (Module && Module._run_iter_batch) {
     for (var i = 0; i < PUMP_BATCH_ITERS; i++) Module._run_iter_batch(1);
+    // [recomp-bridge] armed fixture: apply once (RAM image + f32-array swaps + fifo upload),
+    // then re-render each pump until the pump budget runs out.
+    if (__recompFix && Module._recomp_render_fifo && __recompFixPumps > 0) {
+      if (!__recompFixApplied) recompFixApply();
+      var dN0 = Module.HEAPU32[0x026B289C >> 2] >>> 0;   // prim-draws-decoded SAB counter
+      Module._recomp_render_fifo(__recompFixPtr, __recompFixLen);
+      var dN1 = Module.HEAPU32[0x026B289C >> 2] >>> 0;
+      // explicit present: the parked CPU means VI never fires OutputField; show the XFB our
+      // stream's (patched) EFB copies just wrote.
+      if (Module._recomp_present && __recompXfbAddr) Module._recomp_present(__recompXfbAddr, 640, 480);
+      if ((__recompFixPumps % 200) === 0)
+        postMessage({ cmd: 'print', txt: '[recompFix] pump ' + __recompFixPumps + ': draws/frame=' + (dN1 - dN0) });
+      __recompFixPumps--;
+    }
     // [recomp-seam] To visibly demo the recomp GP-FIFO -> Dolphin WGPU renderer seam,
     // set self.__RECOMP_DEMO = 1 (default OFF, prod-safe — leaves MP4 untouched). When on,
     // after boot it draws one colored triangle through _recomp_render_fifo every pump
@@ -628,6 +718,22 @@ self.onmessage = function (e) {
           txt: '[worker] ct-phase-set: Module._dolphin_ct_set_phase_flags missing' });
       }
       break;
+    // [recomp-bridge 2026-08-25] Render a decomp->wasm recomp frame through the live WGPU
+    // backend. e.data: { fifo: ArrayBuffer (BE GP-FIFO), mem1: ArrayBuffer|null (raw 24MB
+    // guest image), regions: {arrays:[{base,stride,count}],dls:[...]}|null, pauseCpu: bool,
+    // pumps: how many pump cycles to re-render (state re-upload each pump) }.
+    // With mem1: the image is written into Dolphin's emulated RAM (dolphin_get_ram_addr) and
+    // the f32-based arrays (stride 8/12) are byte-swapped LE->BE in place — Dolphin's vertex
+    // loader reads guest arrays big-endian, while the recomp's linear memory is little-endian.
+    // pauseCpu skips _run_iter_batch from then on (the JIT game stops advancing; only safe
+    // combined with mem1 overwrite, which destroys the running guest).
+    case 'recompFix': {
+      __recompFix = e.data;
+      __recompFixApplied = false;
+      __recompFixPumps = e.data.pumps || 600;
+      postMessage({ cmd: 'recompFix-armed' });
+      break;
+    }
     case 'pause-for-cutover':
     case 'resume-from-cutover':
       // 2d.9 reverted — see memory:2d9_real_cutover_blocked.md.

@@ -46,6 +46,7 @@
 #include "VideoCommon/DataReader.h"           // [recomp-render] DataReader(begin,end) byte range
 #include "VideoCommon/VertexManagerBase.h"    // [recomp-render] g_vertex_manager->Flush()
 #include "VideoCommon/FramebufferManager.h"   // [recomp-render] g_framebuffer_manager->RefreshPeekCache()
+#include "VideoCommon/VideoBackendBase.h"     // [recomp-bridge] g_video_backend->Video_OutputXFB (explicit present)
 #include "Core/HW/ProcessorInterface.h"     // [msr-zero watch cause/mask]
 #include "Core/HW/DSP.h"                    // [msr-zero watch dspctl]
 #include "Core/HW/CPU.h"                    // [savestate-fix PM61] resume CPU m_state after load
@@ -510,6 +511,33 @@ extern "C" void dolphin_gp_unseal();  // [dual-core FIFO splice fix] (dolphin_ji
 // drive g_main_cp_state + VertexLoaderManager → VertexManagerBase::Flush →
 // WGPUVertexManager::DrawCurrentBatch (the live WebGPU draw). Must run on the device thread
 // (proxied-main pump) — off it, OnPrimitiveCommand size-skips the draws (OpcodeDecoding.cpp:176).
+// [recomp-bridge 2026-08-25] Park the emulated CPU (EmuThread) so the decomp->wasm recomp can
+// take over guest RAM + the frame stream. JitWasm::Run's outer loop is gated on
+// CPU::State::Running (JitWasm.cpp:557,712,951), so CPUManager::Break() (-> Stepping) stops it
+// cleanly at the next block boundary while retro_run keeps pumping the GPU slice + present.
+extern "C" EMSCRIPTEN_KEEPALIVE void recomp_pause_cpu(void)
+{
+  Core::System::GetInstance().GetCPU().Break();
+}
+
+// [recomp-bridge 2026-08-25] Explicit present: with the CPU parked, VideoInterface emulation
+// (the CoreTiming OutputField events that normally call Video_OutputXFB -> ViSwap -> Present)
+// never fires, so recomp EFB->XFB copies pile up unseen. Drive the same call VI would
+// (VideoInterface.cpp:914) with the XFB the recomp stream just copied to. 640x480 NTSC frame.
+extern "C" EMSCRIPTEN_KEEPALIVE void recomp_present(uint32_t xfb_addr, uint32_t width, uint32_t height)
+{
+  if (!g_video_backend)
+    return;
+  static u64 s_fake_ticks = 0;
+  s_fake_ticks += 100000;   // strictly-increasing tick for the presenter's frame pacing
+  const u32 w = width ? width : 640;
+  const u32 h = height ? height : 480;
+  // fbStride is in XFB pixels-per-line units like VideoInterface passes (STD*16): for the
+  // 640x480 double-strided NTSC field layout that is 2*WPL*16 = 1280 — with 640 the virtual-
+  // XFB lookup misses and the presenter falls back to decoding raw RAM (uniform garbage).
+  g_video_backend->Video_OutputXFB(xfb_addr, w, 2 * w, h, s_fake_ticks);
+}
+
 extern "C" EMSCRIPTEN_KEEPALIVE void recomp_render_fifo(uint32_t ptr, uint32_t len)
 {
   if (len == 0 || !g_vertex_manager)
