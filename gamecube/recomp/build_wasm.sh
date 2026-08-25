@@ -74,6 +74,14 @@ perl -0pi -e 's/static void WriteMTXPS4x3\([^{]*\)\s*\{.*?\n\}/static void Write
 perl -0pi -e 's/static void WriteMTXPS3x3from3x4\([^{]*\)\s*\{.*?\n\}/static void WriteMTXPS3x3from3x4(f32 mtx[3][4], volatile f32 *dest){int i,j;(void)dest;for(i=0;i<3;i++)for(j=0;j<3;j++)gx_wgpipe_f32(mtx[i][j]);}/s' "$GXT" 2>/dev/null || true
 perl -0pi -e 's/static void WriteMTXPS4x2\([^{]*\)\s*\{.*?\n\}/static void WriteMTXPS4x2(const f32 mtx[2][4], volatile f32 *dest){int i,j;(void)dest;for(i=0;i<2;i++)for(j=0;j<4;j++)gx_wgpipe_f32(mtx[i][j]);}/s' "$GXT" 2>/dev/null || true
 perl -0pi -e 's/asm BOOL IsWriteGatherBufferEmpty\(void\)\s*\{.*?\n\}/BOOL IsWriteGatherBufferEmpty(void){return 1;}/s' "$BUILD/src/dolphin/gx/GXInit.c" 2>/dev/null || true
+#     DISPLAY-LIST CAPTURE: the SDK builds DLs by swapping the CPU-fifo object and counting
+#     via PI regs — both invisible/zero under the software wgpipe, so every runtime-built
+#     model DL (hsfdraw MakeDL) measured 0 bytes and GXCallDisplayList emitted size=0: NO 3D
+#     geometry ever reached the stream. Rewrite both bodies to drive the shim redirect
+#     (gx_wgpipe.c gx_wgpipe_dl_begin/_end); dirty state flushes to the MAIN fifo before the
+#     redirect and into the DL before restore, matching real hardware ordering.
+perl -0pi -e 's/void GXBeginDisplayList\(void \*list, u32 size\)\n\{.*?\n\}/void GXBeginDisplayList(void *list, u32 size)\n{\n    extern void gx_wgpipe_dl_begin(void *, u32);\n    if (gx->dirtyState != 0) { __GXSetDirtyState(); }\n    if (gx->dlSaveContext != 0) { memcpy(\&__savedGXdata, gx, sizeof(__savedGXdata)); }\n    gx->inDispList = 1;\n    gx_wgpipe_dl_begin(list, size);\n}/s' "$BUILD/src/dolphin/gx/GXDisplayList.c" 2>/dev/null || true
+perl -0pi -e 's/unsigned long GXEndDisplayList\(void\)\n\{.*?\n\}/unsigned long GXEndDisplayList(void)\n{\n    extern u32 gx_wgpipe_dl_end(void);\n    u32 n;\n    if (gx->dirtyState != 0) { __GXSetDirtyState(); }\n    n = gx_wgpipe_dl_end();\n    if (gx->dlSaveContext != 0) { u32 cpenable = gx->cpEnable; memcpy(gx, \&__savedGXdata, sizeof(*gx)); gx->cpEnable = cpenable; }\n    gx->inDispList = 0;\n    return n;\n}/s' "$BUILD/src/dolphin/gx/GXDisplayList.c" 2>/dev/null || true
 #     mwcc lvalue-cast / incompatible-pointer rewrites (source-compatible, behavior-preserving):
 perl -0pi -e 's/\(u8 \*\)(card->buffer)\s*\+=/*(u8 **)&$1 +=/g' "$BUILD/src/dolphin/card/CARDRdwr.c" 2>/dev/null || true
 perl -0pi -e 's/\Qfor (ptr = (char *)buf; ptr - buf < len; ptr++) {\E/for (ptr = (char *)buf; ptr - (char *)buf < len; ptr++) {/' "$BUILD/src/dolphin/exi/EXIUart.c" 2>/dev/null || true
@@ -186,7 +194,7 @@ perl -0pi -e 's/(static void THPViewSprFunc\(HuSprite \*arg0\)\s*\n\{)/$1\n    r
 #     ___recomp_set_inject_btn) into HuPadBtnDown[0] at HuPadRead's end (shims/src/gc_input.c).
 #     ONE-SHOT: consume the injected value on delivery — HuPadRead can run more than once per
 #     retrace, and a double-delivered UP moves a 2-choice dialog cursor up then wraps it back.
-perl -0pi -e 's/(_PadBtnDown\[i\] = 0;\s*\n\s*\})\n\}/$1\n    { extern int __recomp_inject_btn; extern int __recomp_inject_dstk; HuPadBtnDown[0] |= (unsigned short)__recomp_inject_btn; __recomp_inject_btn = 0; HuPadDStkRep[0] |= (unsigned char)__recomp_inject_dstk; __recomp_inject_dstk = 0; }\n}/' "$BUILD/src/game/pad.c" 2>/dev/null || true
+perl -0pi -e 's/(_PadBtnDown\[i\] = 0;\s*\n\s*\})\n\}/$1\n    { extern int __recomp_inject_btn; extern int __recomp_inject_dstk; extern int __recomp_inject_stkx; extern int __recomp_inject_stky; HuPadBtnDown[0] |= (unsigned short)__recomp_inject_btn; __recomp_inject_btn = 0; HuPadDStkRep[0] |= (unsigned char)__recomp_inject_dstk; __recomp_inject_dstk = 0; if (__recomp_inject_stkx) { HuPadStkX[0] = (s8)__recomp_inject_stkx; __recomp_inject_stkx = 0; } if (__recomp_inject_stky) { HuPadStkY[0] = (s8)__recomp_inject_stky; __recomp_inject_stky = 0; } }\n}/' "$BUILD/src/game/pad.c" 2>/dev/null || true
 #     [system clocks] __OSBusClock/__OSCoreClock (os.h, AT_ADDRESS 0x800000F8/FC) are written by the
 #     bootrom + OSInit on real HW; here AT_ADDRESS is stripped -> plain BSS globals, and OSInit is a
 #     no-op import, so they stay 0 -> the OSTicksToMilliseconds macro (ticks/(__OSBusClock/4000))
@@ -536,7 +544,7 @@ if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.js" \
      -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=33554432 \
      -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=32768 ${RECOMP_PROFILING_FUNCS:+--profiling-funcs} \
      -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web -sINVOKE_RUN=0 \
-     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,_HuMemHeapPtrGet \
+     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet \
      -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAP32,HEAPU32,wasmMemory,wasmExports \
      -Wl,--no-entry -Wl,--no-gc-sections -Wl,--allow-undefined -Wl,--allow-multiple-definition -O2 2>"$BUILD/link.txt"; then
   echo "[recomp] LINKED: $BUILD/mp4_game.js + $BUILD/mp4_game.wasm ($(stat -f%z "$BUILD/mp4_game.wasm" 2>/dev/null) bytes)"

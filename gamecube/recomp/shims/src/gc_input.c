@@ -14,3 +14,11 @@ int __recomp_get_inject_btn(void) { return __recomp_inject_btn; }
 // HuPadRead's end. Same pulse discipline as the buttons.
 int __recomp_inject_dstk = 0;
 void __recomp_set_inject_dstk(int v) { __recomp_inject_dstk = v; }
+
+// Raw analog stick: mentDll's own UIs (player-count, character grid) navigate on
+// HuPadStkX/HuPadStkY thresholds (>=50 / <=-50, and >=5 rows), NOT the D-stick repeat —
+// HuPadBtn's d-pad bits are masked out at HuPadRead (pad.c:134) so the stick is the only
+// live navigation surface there. One-shot like the other channels.
+int __recomp_inject_stkx = 0, __recomp_inject_stky = 0;
+void __recomp_set_inject_stkx(int v) { __recomp_inject_stkx = v; }
+void __recomp_set_inject_stky(int v) { __recomp_inject_stky = v; }
