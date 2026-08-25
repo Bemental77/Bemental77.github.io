@@ -159,7 +159,8 @@ var __ticks = 0;
 var __recompFrame = 0, __recompPtr = 0, __recompBytes = null;
 // [recomp-bridge] armed by the 'recompFix' message (see its case below)
 var __recompFix = null, __recompFixApplied = false, __recompFixPtr = 0, __recompFixLen = 0,
-    __recompFixPumps = 0, __recompPauseCpu = false, __recompXfbAddr = 0;
+    __recompFixPumps = 0, __recompPauseCpu = false, __recompXfbAddr = 0,
+    __recompLive = false, __recompLiveXfb = 0, __recompLivePtr = 0, __recompLiveCap = 0, __recompLiveFrames = 0;
 function recompFixApply() {
   // park the emulated CPU FIRST (CPUManager::Break -> JitWasm::Run exits) so the RAM image
   // overwrite below cannot race the live JIT guest; retro_run keeps pumping GPU slice/present.
@@ -732,6 +733,68 @@ self.onmessage = function (e) {
       __recompFixApplied = false;
       __recompFixPumps = e.data.pumps || 600;
       postMessage({ cmd: 'recompFix-armed' });
+      break;
+    }
+    // [recomp-live 2026-08-25] Live recomp stream: 'recompStart' parks the JIT CPU and
+    // latches the VI scanout target; each 'recompFrame' writes the frame's new RAM regions
+    // (pre-swapped by recomp_worker.js), retargets the display copy, renders through
+    // recomp_render_fifo, and presents. Counters exposed via 'recompStats' polls.
+    case 'recompStart': {
+      if (Module._recomp_pause_cpu) Module._recomp_pause_cpu();
+      var t2 = 0;
+      try { t2 = Module._dolphin_read32(0xCC00201C) >>> 0; } catch (er) {}
+      __recompLiveXfb = t2 & 0x00FFFFFF;
+      if (t2 & 0x10000000) __recompLiveXfb = (__recompLiveXfb << 5) >>> 0;
+      __recompLive = true;
+      postMessage({ cmd: 'print', txt: '[recompLive] started; xfb=0x' + __recompLiveXfb.toString(16) });
+      break;
+    }
+    case 'recompFrame': {
+      if (!__recompLive || !Module || !Module._recomp_render_fifo) break;
+      var ram2 = Module._dolphin_get_ram_addr();
+      if (e.data.mem1) Module.HEAPU8.set(new Uint8Array(e.data.mem1), ram2);   // one-time full image
+      var regs2 = e.data.regions || [];
+      for (var ri = 0; ri < regs2.length; ri++) {
+        var R2 = regs2[ri];
+        if (R2.addr + R2.bytes.byteLength <= 0x01800000)
+          Module.HEAPU8.set(new Uint8Array(R2.bytes), ram2 + R2.addr);
+      }
+      var fb2 = new Uint8Array(e.data.fifo);
+      // retarget the display copy (last 0x4B value) to the live scanout XFB
+      if (__recompLiveXfb) {
+        var sites2 = [];
+        for (var p2 = 0; p2 + 4 < fb2.length; p2++)
+          if (fb2[p2] === 0x61 && fb2[p2 + 1] === 0x4B)
+            sites2.push({ at: p2, val: (fb2[p2 + 2] << 16) | (fb2[p2 + 3] << 8) | fb2[p2 + 4] });
+        if (sites2.length) {
+          var dv2 = sites2[sites2.length - 1].val, b4 = (__recompLiveXfb >>> 5) & 0xFFFFFF;
+          for (var s2 = 0; s2 < sites2.length; s2++) {
+            if (sites2[s2].val !== dv2) continue;
+            var a3 = sites2[s2].at;
+            fb2[a3 + 2] = (b4 >>> 16) & 0xff; fb2[a3 + 3] = (b4 >>> 8) & 0xff; fb2[a3 + 4] = b4 & 0xff;
+          }
+        }
+      }
+      if (!__recompLivePtr || __recompLiveCap < fb2.length) {
+        if (__recompLivePtr) Module._free(__recompLivePtr);
+        __recompLiveCap = fb2.length + 65536;
+        __recompLivePtr = Module._malloc(__recompLiveCap);
+      }
+      Module.HEAPU8.set(fb2, __recompLivePtr);
+      var dq0 = Module.HEAPU32[0x026B289C >> 2] >>> 0;
+      Module._recomp_render_fifo(__recompLivePtr, fb2.length);
+      var dq1 = Module.HEAPU32[0x026B289C >> 2] >>> 0;
+      if (Module._recomp_present && __recompLiveXfb) Module._recomp_present(__recompLiveXfb, 640, 480);
+      __recompLiveFrames++;
+      postMessage({ cmd: 'recompAck', n: e.data.n });
+      if ((__recompLiveFrames % 240) === 1)
+        postMessage({ cmd: 'print', txt: '[recompLive] f' + __recompLiveFrames + ' fifo=' + fb2.length
+          + 'B draws=' + (dq1 - dq0) + ' 0x4Bsites=' + (typeof sites2 !== 'undefined' ? sites2.length : -1)
+          + ' regions=' + regs2.length });
+      break;
+    }
+    case 'recompStats': {
+      postMessage({ cmd: 'recompStats', frames: __recompLiveFrames });
       break;
     }
     case 'pause-for-cutover':

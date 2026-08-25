@@ -125,8 +125,14 @@ void __recomp_bswap_hsf(void *data)
         u32 swapped = bsw32(as_is);                 // what it would become if we swapped
         const u32 PLAUSIBLE = 0x400000u;            // 4 MB: an .hsf file is well under this
         if (as_is != 0 && as_is < PLAUSIBLE && swapped >= PLAUSIBLE) {
+#ifdef RECOMP_HSFDIAG
+            { extern void OSReport(const char*, ...); OSReport("HSF: SKIP(already-LE) %x\n", (unsigned)data); }
+#endif
             return;   // already little-endian; do not double-swap
         }
+#ifdef RECOMP_HSFDIAG
+        { extern void OSReport(const char*, ...); OSReport("HSF: SWAP %x scene.ofs_asis=%x\n", (unsigned)data, as_is); }
+#endif
         // (If as_is is 0 we still proceed: scene.ofs==0 is legitimately possible and harmless.)
     }
 
@@ -238,6 +244,10 @@ void __recomp_bswap_hsf(void *data)
             if (!S->count) continue;
             HsfBuffer *b = (HsfBuffer *)(base + S->ofs);
             unsigned char *data_base = (unsigned char *)&b[S->count];
+#ifdef RECOMP_HSFDIAG
+            { extern void OSReport(const char*, ...);
+              OSReport("HSF: sec%d file=%x nbuf=%d data_base=%x\n", (int)k, (unsigned)base, (int)S->count, (unsigned)data_base); }
+#endif
             for (i = 0; i < S->count; i++) {
                 sw32f(&b[i].name);
                 b[i].count = (s32)bsw32((u32)b[i].count);
@@ -245,6 +255,10 @@ void __recomp_bswap_hsf(void *data)
                 TV(b[i].count); TV((int)dofs);
                 if (!comps) continue;               // normal: packed s8, nothing to byte-swap
                 f32 *elem = (f32 *)(data_base + dofs);
+#ifdef RECOMP_HSFDIAG
+                if (i < 2) { extern void OSReport(const char*, ...);
+                  OSReport("HSF:   buf%d elem=%x n=%d\n", (int)i, (unsigned)elem, (int)b[i].count); }
+#endif
                 for (j = 0; j < b[i].count * comps; j++) {
                     bswf32(&elem[j]);
                 }

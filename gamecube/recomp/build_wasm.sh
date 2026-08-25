@@ -63,6 +63,7 @@ perl -0pi -e 'BEGIN{undef $/;} s/\A(?!void __GXAbortWaitPECopyDone)/void __GXAbo
 #     hardware write-gather-buffer is always "empty" for a synchronous software pipe. This
 #     compiles the real GX SDK IN so GXLoadPosMtxImm/GXSetProjection/GXSetViewport/... emit
 #     the complete GP-FIFO stream (XF/BP/CP register loads) instead of being host imports.
+if [ -n "${RECOMP_HSFDIAG:-}" ]; then CFLAGS_EXTRA_HSF="-DRECOMP_HSFDIAG"; else CFLAGS_EXTRA_HSF=""; fi
 GXP="$BUILD/include/dolphin/gx/GXPriv.h"
 # GXPriv.h already includes GXVert.h (via dolphin/gx.h) before these macros, so the
 # gx_wgpipe_* prototypes are visible — do NOT re-declare them (a mismatched forward decl
@@ -418,7 +419,7 @@ CFLAGS=( -c -std=gnu89 -O2 -w -Wno-error -Wno-implicit-function-declaration
         -Wno-return-mismatch -Wno-int-conversion
         -Wno-incompatible-function-pointer-types -Wno-incompatible-pointer-types
         -Wno-builtin-requires-header -fno-builtin
-        -DVERSION=0 -fdeclspec
+        -DVERSION=0 -fdeclspec ${RECOMP_HSFDIAG:+-DRECOMP_HSFDIAG}
         -I "$BUILD/include" -I "$BUILD/gen" -I "$BUILD/extern/musyx/include" -I "$BUILD/src" )
 # NOTE: implicit-declaration signature mismatches (a bounded finite set surfaced at
 # link) are resolved in port-completion by adding the missing per-unit includes; the
@@ -543,7 +544,7 @@ echo "[recomp] linking $(ls "$BUILD"/obj/*.o 2>/dev/null | wc -l) objects -> was
 if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.js" \
      -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=33554432 \
      -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=32768 ${RECOMP_PROFILING_FUNCS:+--profiling-funcs} \
-     -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web -sINVOKE_RUN=0 \
+     -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web,worker -sINVOKE_RUN=0 \
      -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet \
      -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAP32,HEAPU32,wasmMemory,wasmExports \
      -Wl,--no-entry -Wl,--no-gc-sections -Wl,--allow-undefined -Wl,--allow-multiple-definition -O2 2>"$BUILD/link.txt"; then
