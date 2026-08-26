@@ -23,11 +23,22 @@ static unsigned char __recomp_aram[RECOMP_ARAM_SIZE];
 // address and arg2 the ARAM address, regardless of direction (they swap source/dest for reads).
 //   type 0 = ARAM_DIR_MRAM_TO_ARAM (write to ARAM)
 //   type 1 = ARAM_DIR_ARAM_TO_MRAM (read from ARAM)
+extern void __recomp_dirty_note(void *addr, unsigned nBytes);   /* gc_dirty_ring.c */
+
 void __recomp_ar_dma(unsigned type, unsigned mainmem_addr, unsigned aram_addr, unsigned length) {
     if (!length) return;
     if (aram_addr >= RECOMP_ARAM_SIZE || length > RECOMP_ARAM_SIZE ||
         aram_addr + length > RECOMP_ARAM_SIZE) return;         /* ARAM-side bounds guard */
     unsigned char *mram = (unsigned char *)(uintptr_t)mainmem_addr;
     if (type == 0) memcpy(__recomp_aram + aram_addr, mram, length);   /* MRAM -> ARAM */
-    else           memcpy(mram, __recomp_aram + aram_addr, length);   /* ARAM -> MRAM */
+    else {
+        memcpy(mram, __recomp_aram + aram_addr, length);   /* ARAM -> MRAM */
+        /* ARAM->MRAM restage rewrites main RAM with NO DVD read and NO DCStoreRange —
+         * invisible to both cacheDirty and the flush ring. The render bridge's
+         * address-keyed caches (walked DLs, synced arrays, textures) go stale and
+         * poison every scene reached through an ARAM restage (found 2026-08-26: the
+         * live world rendered garbage triangles that a full-mem1-per-frame test
+         * cleared). Note the range so the bridge re-syncs + invalidates. */
+        __recomp_dirty_note(mram, length);
+    }
 }

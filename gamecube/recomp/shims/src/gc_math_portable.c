@@ -204,3 +204,31 @@ f32 C_VECSquareDistance(const Vec* a, const Vec* b){ f32 x=a->x-b->x,y=a->y-b->y
 f32 PSVECSquareDistance(const Vec* a, const Vec* b){ f32 x=a->x-b->x,y=a->y-b->y,z=a->z-b->z; return x*x+y*y+z*z; }
 void C_VECHalfAngle(const Vec* a, const Vec* b, Vec* h){ Vec na,nb,s; na.x=-a->x;na.y=-a->y;na.z=-a->z; nb.x=-b->x;nb.y=-b->y;nb.z=-b->z; vec_norm(&na,&na); vec_norm(&nb,&nb); s.x=na.x+nb.x;s.y=na.y+nb.y;s.z=na.z+nb.z; if(C_VECSquareMag(&s)<=0.0f){h->x=h->y=h->z=0;} else vec_norm(&s,h); }
 void C_VECReflect(const Vec* s, const Vec* n, Vec* o){ Vec u; f32 d; vec_norm(n,&u); d=2.0f*(s->x*u.x+s->y*u.y+s->z*u.z); o->x=s->x-d*u.x; o->y=s->y-d*u.y; o->z=s->z-d*u.z; }
+
+/* ---------------- PPC compiler intrinsics (2026-08-25) ----------------
+ * Referenced by compiled SDK units (GXLight sqrtf, GXTexture reg-field insert,
+ * vi.c/THPDec bit scans). These were silently resolving to return-0 host stubs:
+ * __frsqrte=0 made GXLight's file-local sqrtf return 0, and that definition
+ * SHADOWED libc sqrtf binary-wide under -Wl,--allow-multiple-definition, which
+ * no-op'd every VECNormalize/VECMag (board lookat garbage, world culled).
+ * GXLight's sqrtf is also neutered by a build_wasm.sh bake so libc's f32.sqrt
+ * serves the binary. */
+double __frsqrte(double x){ return 1.0 / sqrt(x); }
+u32 __cntlzw(u32 x){ return x ? (u32)__builtin_clz(x) : 32u; }
+/* rlwinm: rotate left by sh, AND with the PPC MASK(mb,me) (bit 0 = MSB; wraps
+ * when mb > me) — matches the MWerks intrinsic used as __rlwinm(v, sh, mb, me). */
+u32 __rlwinm(u32 x, int sh, int mb, int me){
+  u32 r = (sh & 31) ? ((x << (sh & 31)) | (x >> (32 - (sh & 31)))) : x;
+  u32 m; int i;
+  if (mb <= me) { m = 0; for (i = mb; i <= me; i++) m |= 1u << (31 - i); }
+  else { m = 0xFFFFFFFFu; for (i = me + 1; i < mb; i++) m &= ~(1u << (31 - i)); }
+  return r & m;
+}
+/* Aliasing-safe 3x4 transpose of the rotation block, translation zeroed —
+ * C_MTXTranspose semantics (mtx.c:354). */
+void PSMTXTranspose(const Mtx s, Mtx d){
+  Mtx t; int i, j;
+  for (i = 0; i < 3; i++) for (j = 0; j < 3; j++) t[i][j] = s[j][i];
+  t[0][3] = t[1][3] = t[2][3] = 0.0f;
+  for (i = 0; i < 3; i++) for (j = 0; j < 4; j++) d[i][j] = t[i][j];
+}

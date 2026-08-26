@@ -161,6 +161,7 @@ var __recompFrame = 0, __recompPtr = 0, __recompBytes = null;
 var __recompFix = null, __recompFixApplied = false, __recompFixPtr = 0, __recompFixLen = 0,
     __recompFixPumps = 0, __recompPauseCpu = false, __recompXfbAddr = 0,
     __recompLive = false, __recompLiveXfb = 0, __recompLivePtr = 0, __recompLiveCap = 0, __recompLiveFrames = 0;
+var __recompT = { prep: 0, fifo: 0, present: 0, n: 0, regB: 0, fifoB: 0, skip: 0 };
 function recompFixApply() {
   // park the emulated CPU FIRST (CPUManager::Break -> JitWasm::Run exits) so the RAM image
   // overwrite below cannot race the live JIT guest; retro_run keeps pumping GPU slice/present.
@@ -751,15 +752,19 @@ self.onmessage = function (e) {
     }
     case 'recompFrame': {
       if (!__recompLive || !Module || !Module._recomp_render_fifo) break;
+      var tA = performance.now();
       var ram2 = Module._dolphin_get_ram_addr();
       if (e.data.mem1) Module.HEAPU8.set(new Uint8Array(e.data.mem1), ram2);   // one-time full image
       var regs2 = e.data.regions || [];
+      var regBytes2 = 0;
       for (var ri = 0; ri < regs2.length; ri++) {
         var R2 = regs2[ri];
-        if (R2.addr + R2.bytes.byteLength <= 0x01800000)
+        if (R2.addr + R2.bytes.byteLength <= 0x01800000) {
           Module.HEAPU8.set(new Uint8Array(R2.bytes), ram2 + R2.addr);
+          regBytes2 += R2.bytes.byteLength;
+        }
       }
-      if (e.data.skipRender) break;   // backlogged: state applied above, draw skipped
+      if (e.data.skipRender) { __recompT.skip++; break; }   // backlogged: state applied, draw skipped
       var fb2 = new Uint8Array(e.data.fifo);
       // retarget the display copy (last 0x4B value) to the live scanout XFB
       if (__recompLiveXfb) {
@@ -782,20 +787,41 @@ self.onmessage = function (e) {
         __recompLivePtr = Module._malloc(__recompLiveCap);
       }
       Module.HEAPU8.set(fb2, __recompLivePtr);
+      var tB = performance.now();
       var dq0 = Module.HEAPU32[0x026B289C >> 2] >>> 0;
       Module._recomp_render_fifo(__recompLivePtr, fb2.length);
       var dq1 = Module.HEAPU32[0x026B289C >> 2] >>> 0;
+      var tC = performance.now();
       if (Module._recomp_present && __recompLiveXfb) Module._recomp_present(__recompLiveXfb, 640, 480);
+      var tD = performance.now();
+      __recompT.prep += tB - tA; __recompT.fifo += tC - tB; __recompT.present += tD - tC;
+      __recompT.n++; __recompT.regB += regBytes2; __recompT.fifoB += fb2.length;
       __recompLiveFrames++;
       postMessage({ cmd: 'recompAck', n: e.data.n });
-      if ((__recompLiveFrames % 240) === 1)
+      if ((__recompLiveFrames % 240) === 1) {
+        var _n = Math.max(1, __recompT.n);
         postMessage({ cmd: 'print', txt: '[recompLive] f' + __recompLiveFrames + ' fifo=' + fb2.length
-          + 'B draws=' + (dq1 - dq0) + ' 0x4Bsites=' + (typeof sites2 !== 'undefined' ? sites2.length : -1)
-          + ' regions=' + regs2.length });
+          + 'B draws=' + (dq1 - dq0) + ' regions=' + regs2.length
+          + ' | ms/f prep=' + (__recompT.prep / _n).toFixed(2) + ' fifo=' + (__recompT.fifo / _n).toFixed(2)
+          + ' present=' + (__recompT.present / _n).toFixed(2) + ' | regKB/f=' + (__recompT.regB / _n / 1024).toFixed(1)
+          + ' fifoKB/f=' + (__recompT.fifoB / _n / 1024).toFixed(1) + ' skipped=' + __recompT.skip });
+        __recompT = { prep: 0, fifo: 0, present: 0, n: 0, regB: 0, fifoB: 0, skip: __recompT.skip };
+      }
       break;
     }
     case 'recompStats': {
       postMessage({ cmd: 'recompStats', frames: __recompLiveFrames });
+      break;
+    }
+    // debug: dump a window of Dolphin-side emulated RAM as hex (diff against the
+    // recomp guest's intent when chasing live-sync corruption)
+    case 'recompPeek': {
+      var pk = '';
+      try {
+        var ramP = Module._dolphin_get_ram_addr() + (e.data.addr >>> 0);
+        for (var pi = 0; pi < (e.data.len >>> 0); pi++) pk += Module.HEAPU8[ramP + pi].toString(16).padStart(2, '0');
+      } catch (er) { pk = 'ERR ' + er; }
+      postMessage({ cmd: 'recompPeek', addr: e.data.addr, hex: pk });
       break;
     }
     case 'pause-for-cutover':

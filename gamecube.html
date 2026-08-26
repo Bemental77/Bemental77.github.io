@@ -3693,6 +3693,9 @@
         }
         break;
       }
+      case 'recompPeek':
+        console.log('[recompPeek] 0x' + (data.addr >>> 0).toString(16) + ' = ' + data.hex);
+        break;
       default: pageLog('unknown worker cmd: ' + data.cmd);
     }
   }
@@ -3912,6 +3915,8 @@
     rw.postMessage({ cmd: 'boot', parts: parts, fst: fst, pace: pace,
                      autoboard: q.get('board') === '1',
                      inputScript: boardScript,
+                     peekAddrs: (q.get('peek') || '').split(',').filter(Boolean).map(function (s) { return parseInt(s, 16); }),
+                     testFullMem: q.get('fullmem') === '1',
                      glueUrl: '/gamecube/recomp/mp4_game.js',
                      wasmUrl: '/gamecube/recomp/mp4_game.wasm' }, parts.concat([fst]));
     requestAnimationFrame(grantLoop);

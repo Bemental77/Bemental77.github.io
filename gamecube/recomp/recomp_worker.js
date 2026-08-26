@@ -18,6 +18,8 @@
 let Module = null, viRetrace = 0;
 let paceI32 = null;
 let inputScript = null;   // frame -> [btn, dstk, stkx, stky] canned choreography (?board=1)
+let peekAddrs = null;      // debug: guest offsets to hex-dump every 1200 frames (boot msg)
+let testFullMem = false;   // debug: ship full mem1 every frame (fixture-equivalence bisect)
 let parts = [], fstBuf = null;
 const PART_SIZE = 104857600;   // 100MiB fixed part boundaries (gamecube.html chunkRange)
 
@@ -27,7 +29,7 @@ const log = (txt) => postMessage({ cmd: 'log', txt: '[recomp-worker] ' + txt });
 let vcdLo = 0, vcdHi = 0;
 const vatA = new Array(8).fill(0);
 const arrayBase = new Array(16).fill(0), arrayStride = new Array(16).fill(0);
-const knownDLs = new Set();          // guest addr -> already walked+synced
+const knownDLs = new Map();          // guest addr -> size (walked+synced)
 const knownArrays = new Map();       // "base|stride" -> synced byte count so far
 // BP texture state: SETIMAGE0 (0x88-0x8B tex0-3, 0xA8-0xAB tex4-7) w/h/fmt per slot;
 // SETIMAGE3 (0x94-0x97, 0xB4-0xB7) base>>5 per slot. TLUT loads: 0x64 src>>5, 0x65 tmem+count.
@@ -88,7 +90,11 @@ function walkStream(mem, buf, start, end, depth, newDLs, touched) {
     else if (op === 0x10) {
       const hdr = rdU32(p); p += 4;
       const count = (hdr >>> 16) + 1, xfAddr = hdr & 0xFFFF;
-      if (xfAddr >= 0x1000) for (let k = 0; k < count; k++) gxShadow.xf.set(xfAddr + k, rdU32(p + 4 * k));
+      // Shadow ALL XF writes — including matrix memory (< 0x1000). Matrix slots the game
+      // loads once per scene (UI ortho, static camera) live only in the frame that set
+      // them; a skipRender'd frame dropped them forever (skips>0 corrupted every scene,
+      // skips=0 was pixel-perfect — 2026-08-26 bisect).
+      for (let k = 0; k < count; k++) gxShadow.xf.set(xfAddr + k, rdU32(p + 4 * k));
       p += 4 * count;
     }
     else if (op === 0x61) {
@@ -123,7 +129,7 @@ function walkStream(mem, buf, start, end, depth, newDLs, touched) {
       const addr = rdU32(p), size = rdU32(p + 4); p += 8;
       if (depth > 0) continue;
       if (!knownDLs.has(addr) && size > 0) {
-        knownDLs.add(addr); newDLs.push({ addr, size });
+        knownDLs.set(addr, size); newDLs.push({ addr, size });
         // walk it ONCE, now, while the binding state is current (arrays are static per model;
         // re-walking 1600+ DLs every frame was the 28fps worker-side throttle)
         const ofs = addr & 0x01FFFFFF;
@@ -160,8 +166,29 @@ function buildPrologue() {
   const pu8 = (v) => pro.push(v & 0xff);
   const pu32 = (v) => { pu8(v >>> 24); pu8(v >>> 16); pu8(v >>> 8); pu8(v); };
   for (const [a, v] of gxShadow.cp) { pu8(0x08); pu8(a); pu32(v); }
-  for (const [a, v] of gxShadow.xf) { pu8(0x10); pu32(a & 0xffff); pu32(v); }
+  // XF entries: coalesce consecutive addresses into multi-word LOAD_XF_REG runs — matrix
+  // memory arrives as 12-word bursts, and one-word-per-command would triple the prologue.
+  {
+    const keys = [...gxShadow.xf.keys()].sort((x, y) => x - y);
+    for (let i = 0; i < keys.length; ) {
+      let j = i + 1;
+      while (j < keys.length && keys[j] === keys[j - 1] + 1 && j - i < 16) j++;   // XF count field is 4 bits
+      pu8(0x10); pu32(((j - i - 1) << 16) | keys[i]);
+      for (let k = i; k < j; k++) pu32(gxShadow.xf.get(keys[k]));
+      i = j;
+    }
+  }
   for (const [r, v] of gxShadow.bp) { pu8(0x61); pu32(((r & 0xff) << 24) | (v & 0xffffff)); }
+  // GXInit-era XF matrix-memory defaults the game writes ONCE at boot — outside every
+  // captured frame, so the shadow never sees them. The sprite/glyph texgens reference
+  // GX_IDENTITY (slot 60 = XF addr 0xF0) and GX_PTIDENTITY (post-transform 0x5F4); stale
+  // decoder memory there collapsed the glyph T coordinate into full-height bars.
+  const ONE = 0x3f800000;
+  const ident = [ONE, 0, 0, 0, 0, ONE, 0, 0, 0, 0, ONE, 0];
+  for (const base of [0xF0, 0x5F4]) {
+    pu8(0x10); pu32(((ident.length - 1) << 16) | base);
+    for (const w of ident) pu32(w);
+  }
   return new Uint8Array(pro);
 }
 
@@ -280,10 +307,34 @@ async function boot(msg) {
                 const dbase = Module.___recomp_dirty_base() >>> 0;
                 const dvw = new DataView(mem().buffer, dbase, dn * 8);
                 for (let di = 0; di < dn; di++) {
-                  const da = dvw.getUint32(di * 8, true), ds = dvw.getUint32(di * 8 + 4, true);
+                  const da = dvw.getUint32(di * 8, true), dsRaw = dvw.getUint32(di * 8 + 4, true);
+                  const restage = !!(dsRaw & 0x80000000), ds = dsRaw & 0x7FFFFFFF;
                   if (da < 0x80000000 || da + ds > 0x81800000) continue;   // stack/out-of-RAM: drop
                   if (ds > 0x100000) { cacheDirty = true; continue; }      // jumbo: full resync instead
                   const ofs = da - 0x80000000;
+                  // A walked DL's identity IS its content (the walk extracted its array
+                  // bindings) — any write over it, DC flush or restage, invalidates it.
+                  for (const [ka, ksz] of knownDLs) {
+                    const kOfs = ka & 0x01FFFFFF;
+                    if (kOfs < ofs + ds && kOfs + ksz > ofs) knownDLs.delete(ka);
+                  }
+                  if (restage) {
+                    // ARAM->MRAM restage: the range now holds a DIFFERENT asset (heap
+                    // reuse) — every address-keyed cache entry overlapping it is stale
+                    // (walk-once DLs poisoned whole scenes before this). Drop them so
+                    // next frame's walk re-discovers + re-syncs. A DC flush (restage=
+                    // false) is a content update to the SAME data — arrays/tex stay.
+                    for (const [k, kn] of knownArrays) {
+                      const kOfs = parseInt(k, 10) & 0x01FFFFFF;
+                      if (kOfs < ofs + ds && kOfs + kn > ofs) knownArrays.delete(k);
+                    }
+                    for (const [tb, tv] of knownTex) {
+                      const kOfs = tb & 0x01FFFFFF;
+                      if (kOfs < ofs + ds && kOfs + tv.size > ofs) knownTex.delete(tb);
+                    }
+                    for (let fi = f32Arrays.length - 1; fi >= 0; fi--)
+                      if (f32Arrays[fi].b < ofs + ds && f32Arrays[fi].e > ofs) f32Arrays.splice(fi, 1);
+                  }
                   const by = new Uint8Array(mem().buffer.slice(da, da + ds));
                   // dirty range inside a known f32 vertex/texcoord array (skinning/morph
                   // writes are LE floats) -> swap for Dolphin; anything else (glyph
@@ -296,7 +347,7 @@ async function boot(msg) {
               if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
             }
             let mem1Snap = null;
-            if (cacheDirty) {
+            if (cacheDirty || testFullMem) {
               cacheDirty = false;
               knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0;
               mem1Snap = mem().buffer.slice(0x80000000, 0x81800000);
@@ -323,6 +374,15 @@ async function boot(msg) {
           if (Module.___recomp_set_inject_stkx) Module.___recomp_set_inject_stkx(Atomics.exchange(paceI32, 3, 0) || (scripted ? scripted[2] : 0));
           if (Module.___recomp_set_inject_stky) Module.___recomp_set_inject_stky(Atomics.exchange(paceI32, 4, 0) || (scripted ? scripted[3] : 0));
           viRetrace++;
+          // debug: periodic guest-side hex of watched addresses (boot msg peekAddrs;
+          // diff against the dolphin worker's recompPeek of the same guest offsets)
+          if (peekAddrs && (viRetrace % 1200) === 0) {
+            for (const pa of peekAddrs) {
+              const u8p = new Uint8Array(mem().buffer, 0x80000000 + pa, 48);
+              log('guestPeek f' + viRetrace + ' 0x' + pa.toString(16) + ' = ' +
+                  [...u8p].map((b) => b.toString(16).padStart(2, '0')).join(''));
+            }
+          }
           // pacing: consume one frame credit; block until the page grants more (uncapped=freerun)
           if (!Atomics.load(paceI32, 5)) {
             while (Atomics.load(paceI32, 0) <= 0) Atomics.wait(paceI32, 0, 0, 500);
@@ -346,6 +406,8 @@ async function boot(msg) {
   if (Module.wasmMemory.buffer.byteLength < 0x82000000) Module._emscripten_resize_heap(0x82000000);
   if (msg.autoboard && Module.___recomp_autoboard_arm) { Module.___recomp_autoboard_arm(1); log('AUTOBOARD armed'); }
   if (msg.inputScript) { inputScript = msg.inputScript; log('input script: ' + Object.keys(inputScript).length + ' entries'); }
+  if (msg.peekAddrs) peekAddrs = msg.peekAddrs;
+  if (msg.testFullMem) { testFullMem = true; log('TESTFULLMEM: full mem1 every frame'); }
 
   // stage BootInfo (LE) + FST (BE->LE entry table) + FSTLocation
   const d = new DataView(Module.wasmMemory.buffer);

@@ -47,8 +47,8 @@ const browser = await puppeteer.launch({
          '--disk-cache-size=1', '--disable-application-cache', '--disable-back-forward-cache'],
 });
 const page = await browser.newPage();
-page.on('console', (m) => { const t = m.text(); if (/recomp|Unknown Opcode/i.test(t)) console.log('[page]', t.slice(0, 200)); });
-await page.goto(`http://127.0.0.1:${PORT}/gamecube.html?recomp=1&fps=${FPS}&bootms=${BOOT_MS}${process.env.BOARD === '1' ? '&board=1' : ''}&v=${Date.now()}`,
+page.on('console', (m) => { const t = m.text(); if (/recomp|guestPeek|Unknown Opcode/i.test(t)) console.log('[page]', t.slice(0, 260)); });
+await page.goto(`http://127.0.0.1:${PORT}/gamecube.html?recomp=1&fps=${FPS}&bootms=${BOOT_MS}${process.env.BOARD === '1' ? '&board=1' : ''}${process.env.GPEEK ? '&peek=' + process.env.GPEEK : ''}${process.env.FULLMEM === '1' ? '&fullmem=1' : ''}&v=${Date.now()}`,
                 { waitUntil: 'load', timeout: 60000 });
 await new Promise((r) => setTimeout(r, 1000));
 await page.evaluate(() => {
@@ -69,13 +69,31 @@ for (const tok of keys) {
 
 const t0 = Date.now();
 const fpsLog = [];
+const shotEvery = parseInt(process.env.SHOTS_MS || '0', 10);   // 0 = no periodic shots
+let shotN = 0, lastShot = 0;
 while (Date.now() - t0 < RUN_MS) {
   await new Promise((r) => setTimeout(r, 2000));
-  const hudTxt = await page.evaluate(() => document.getElementById('recompFps')?.textContent || '');
-  fpsLog.push(hudTxt);
-  console.log('[live]', hudTxt);
+  try {
+    const hudTxt = await page.evaluate(() => document.getElementById('recompFps')?.textContent || '');
+    fpsLog.push(hudTxt);
+    console.log('[live]', hudTxt);
+    if (shotEvery && Date.now() - lastShot >= shotEvery) {
+      lastShot = Date.now();
+      await page.screenshot({ path: `/tmp/live_shot_${String(shotN++).padStart(2, '0')}.png` });
+    }
+  } catch (e) { console.log('[live] page gone:', String(e).slice(0, 120)); break; }
 }
 await page.screenshot({ path: '/tmp/recomp_live_run.png' });
 console.log('[live] screenshot -> /tmp/recomp_live_run.png');
+// PEEK="addr:len,addr:len" (hex addr): dump dolphin-side RAM windows for sync-corruption diffs
+if (process.env.PEEK) {
+  await page.evaluate((peeks) => {
+    for (const tok of peeks.split(',')) {
+      const [a, l] = tok.split(':');
+      dolphin_worker.postMessage({ cmd: 'recompPeek', addr: parseInt(a, 16), len: parseInt(l, 10) || 96 });
+    }
+  }, process.env.PEEK);
+  await new Promise((r) => setTimeout(r, 1500));
+}
 await browser.close();
 srv.close();

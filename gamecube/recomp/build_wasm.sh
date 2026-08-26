@@ -227,6 +227,28 @@ perl -0pi -e 's/(var_r30->unk08 = HuSprAnimRead\()(temp_r26)(\);)/{ extern void 
 #     pointers, and bmp->dataSize feeds an OOB memcpy (the first w01 BoardCreate trap).
 #     Wrap those fresh reads with the auto-detecting swapper.
 perl -0pi -e 's/\A/extern void *__recomp_bswap_animtree_auto(void *);\n/; s/(data = data_base = )(HuDataSelHeapReadNum\([^;]*\));/$1__recomp_bswap_animtree_auto($2);/g' "$BUILD/src/game/board/space.c" 2>/dev/null || true
+#     [DIAG, gated] board 3D-view forensics: camera LookAt inputs at matrix-build time +
+#     first parsed board-space record — localizes whether the garbage XF matrices come from
+#     the space file parse or the camera state feeding C_MTXLookAt.
+if [ -n "${RECOMP_CAMDIAG:-}" ]; then
+  perl -0pi -e 's/(    C_MTXLookAt\(arg1, &temp_r31->pos, &temp_r31->up, &temp_r31->target\);)/{ static int __cd; if ((++__cd % 120) == 1) OSReport("CAM: pos=%f %f %f up=%f %f %f tgt=%f %f %f\\n", temp_r31->pos.x, temp_r31->pos.y, temp_r31->pos.z, temp_r31->up.x, temp_r31->up.y, temp_r31->up.z, temp_r31->target.x, temp_r31->target.y, temp_r31->target.z); }\n$1/' "$BUILD/src/game/hsfman.c" 2>/dev/null || true
+  perl -0pi -e 's/(    HuDataClose\(data_base\);\n    return 0;\n\})/    OSReport("SPACE: cnt=%d s1 pos=%f %f %f rot=%f %f %f scale=%f %f %f type=%d links=%d\\n", spaceCnt[layer], spaceData[layer][1].pos.x, spaceData[layer][1].pos.y, spaceData[layer][1].pos.z, spaceData[layer][1].rot.x, spaceData[layer][1].rot.y, spaceData[layer][1].rot.z, spaceData[layer][1].scale.x, spaceData[layer][1].scale.y, spaceData[layer][1].scale.z, spaceData[layer][1].type, spaceData[layer][1].link_cnt);\n$1/' "$BUILD/src/game/board/space.c" 2>/dev/null || true
+  # DrawSpaces state: boardCamera fields + the lookat matrix it just built
+  perl -0pi -e 's/(    GXSetViewport\(camera->viewport_x, camera->viewport_y, camera->viewport_w, camera->viewport_h, camera->viewport_near, camera->viewport_far\);)/{ static int __ds; if ((++__ds % 60) == 1) { OSReport("DSPC: cam pos=%f %f %f tgt=%f %f %f up=%f %f %f fov=%f asp=%f near=%f far=%f vp=%f %f %f %f\\n", pos.x, pos.y, pos.z, target.x, target.y, target.z, camera->up.x, camera->up.y, camera->up.z, camera->fov, camera->aspect, camera->near, camera->far, camera->viewport_x, camera->viewport_y, camera->viewport_w, camera->viewport_h); OSReport("DSPC: lk0=%f %f %f %f lk1=%f %f %f %f lk2=%f %f %f %f\\n", lookat[0][0], lookat[0][1], lookat[0][2], lookat[0][3], lookat[1][0], lookat[1][1], lookat[1][2], lookat[1][3], lookat[2][0], lookat[2][1], lookat[2][2], lookat[2][3]); } }\n$1/' "$BUILD/src/game/board/space.c" 2>/dev/null || true
+fi
+#     GXLight.c defines a file-local Newton-iteration sqrtf built on the __frsqrte PPC
+#     intrinsic. Under emcc that definition is emitted as a GLOBAL symbol and SHADOWS libc
+#     sqrtf binary-wide via -Wl,--allow-multiple-definition — and with __frsqrte stubbed it
+#     returned 0 for every input, silently no-op'ing every VECNormalize/VECMag in the game
+#     (the board's garbage lookat matrices / culled world, found 2026-08-25). Rename it so
+#     every caller (GXLight included) gets libc's native f32.sqrt.
+perl -0pi -e 's/\A/#include <math.h>\n/; s/inline float sqrtf\(float x\)/static inline float __gx_msl_sqrtf_unused(float x) __attribute__((unused));\nstatic inline float __gx_msl_sqrtf_unused(float x)/' "$BUILD/src/dolphin/gx/GXLight.c" 2>/dev/null || true
+#     Gekko integer divide-by-zero is silent (divw returns undefined, no exception); wasm
+#     i32.rem_u TRAPS. The game genuinely does x%0 (e.g. ParManFunc's dice-roll effect:
+#     diceEffParam.unk08=0.0f -> frandmod(0) at board turn start). Guard the two modulo
+#     helpers once — covers every caller, matches hardware's "garbage but no crash".
+perl -0pi -e 's/(u32 frandmod\(u32 arg0\) \{)/$1\n    if (arg0 == 0) return 0;/' "$BUILD/src/game/frand.c" 2>/dev/null || true
+perl -0pi -e 's/(u32 BoardRandMod\(u32 value\)\n\{)/$1\n    if (value == 0) return 0;/' "$BUILD/src/game/board/main.c" 2>/dev/null || true
 #     BoardSpaceRead (board/space.c:939) parses the BE board-layout file natively: u32 count
 #     (truncated into an s16 -> 0 -> BoardRandMod %0 trap), 9 f32 per space (pos/rot/scale),
 #     u32 flag, u16 type/link_cnt/links. Swap at read (the GetFileInfo pattern).
@@ -262,11 +284,11 @@ fi
 if [ -n "${RECOMP_NAVDIAG:-}" ]; then
   perl -0pi -e 's/(if \(HuPadBtnDown\[0\] & PAD_BUTTON_A\) \{\n(\s+)HuAudFXPlay\(2\);)/$1 OSReport("NAV: A-break\\n");/g' "$BUILD/src/REL/modeseldll/modesel.c" 2>/dev/null || true
   perl -0pi -e 's/(s16 result = fn_(?:ms)?1_2490\(\);)/OSReport("NAV: enter filesel\\n"); $1 OSReport("NAV: filesel result=%d\\n", result);/' "$BUILD/src/REL/modeseldll/main.c" 2>/dev/null || true
-  # char-select WAIT-LOOP heartbeat: the loop's own view of every player's (unk_60, unk_70[0]);
-  # anchored on the loop's UNIQUE A-latch scan line (verified 1 occurrence).
-  # NOTE: this bake runs BEFORE the fn_1_/lbl_1_ -> _mt1_ rename, so it matches and emits the
-  # PRE-rename names; the later rename converts the inserted code too.
-  perl -0pi -e 's/\(lbl_1_bss_3114\[var_r31\]\.unk_60 == 0\) && \(HuPadBtnDown/(({ static int __wb; if ((++__wb % 2400) == 1) OSReport("NAV: 8FB8wait 60s=%d%d%d%d 70s=%d%d%d%d base=%x\\n", lbl_1_bss_3114[0].unk_60, lbl_1_bss_3114[1].unk_60, lbl_1_bss_3114[2].unk_60, lbl_1_bss_3114[3].unk_60, lbl_1_bss_3114[0].unk_70[0], lbl_1_bss_3114[1].unk_70[0], lbl_1_bss_3114[2].unk_70[0], lbl_1_bss_3114[3].unk_70[0], (unsigned)&lbl_1_bss_3114[0]); { extern int __recomp_autoboard_armed; extern void __recomp_autoboard(void); static int __ab; if (__recomp_autoboard_armed && ++__ab == 480) { OSReport("NAV: AUTOBOARD firing\\n"); __recomp_autoboard(); } } lbl_1_bss_3114[var_r31].unk_60 == 0; })) && (HuPadBtnDown/' "$BUILD/src/REL/mentDll/main.c" 2>/dev/null || true
+  # char-select WAIT-LOOP heartbeat: the loop's own view of every player's (unk_60, unk_70[0]).
+  # Anchors INSIDE the always-on autoboard statement-expression (baked below, AFTER this
+  # block) — matched here on the pre-bake source? No: this NAVDIAG bake must run AFTER the
+  # autoboard bake to find its anchor, so it is deferred via NAVDIAG_WAITHB below.
+  NAVDIAG_WAITHB=1
   # player-proc body-entry counter: a fiber resume landing at the TOP re-runs the preamble
   perl -0pi -e 's/(var_r26 = lbl_1_bss_D4;)/{ static int __pe; if ((++__pe % 500) == 1) OSReport("NAV: 13970 entry n=%d cnt=%d\\n", __pe, lbl_1_bss_D4); } $1/' "$BUILD/src/REL/mentDll/main.c" 2>/dev/null || true
   # char-select pick-handler heartbeat: proves the handler runs, which pad it reads, what it sees
@@ -275,6 +297,19 @@ if [ -n "${RECOMP_NAVDIAG:-}" ]; then
   perl -0pi -e 's/(window_ptr->mess = MessData_MesPtrGet\(messDataPtr, mess\);)/$1\n        OSReport("NAV: MesSet win=%d id=%x txt=%s\\n", window, mess, window_ptr->mess ? (char*)window_ptr->mess : "(null)");/' "$BUILD/src/game/window.c" 2>/dev/null || true
   # choice-state key trace: which key bits reach the cursor + the cursor move it causes
   perl -0pi -e 's/(key = HuWinActivePadGet\(window\);)/$1\n    if (key) OSReport("NAV: choice win=%x key=%x curr=%d nch=%d\\n", (u32)window, key, choice_curr, window->num_choices);/' "$BUILD/src/game/window.c" 2>/dev/null || true
+fi
+#     AUTOBOARD firing point (ALWAYS ON — inert unless the host arms it at runtime via
+#     __recomp_autoboard_arm): the char-select wait loop evaluates once per player per frame;
+#     after 480 evals armed, gc_autoboard.c commits the default party config and enters the
+#     board (OVL_W01). Anchored on the loop's UNIQUE A-latch scan line (verified 1 occurrence;
+#     pre-rename lbl_1_ names — the later _mt1_ rename converts inserted code too).
+#     HISTORY 2026-08-25: this bake originally sat inside the RECOMP_NAVDIAG gate, so the
+#     final clean build shipped an armable-but-never-firing autoboard (?board=1 dead on
+#     prod). It must stay ungated; only the heartbeat below is diag.
+perl -0pi -e 's/\(lbl_1_bss_3114\[var_r31\]\.unk_60 == 0\) && \(HuPadBtnDown/(({ { extern int __recomp_autoboard_armed; extern void __recomp_autoboard(void); static int __ab; if (__recomp_autoboard_armed && ++__ab == 480) { OSReport("NAV: AUTOBOARD firing\\n"); __recomp_autoboard(); } } lbl_1_bss_3114[var_r31].unk_60 == 0; })) && (HuPadBtnDown/' "$BUILD/src/REL/mentDll/main.c" 2>/dev/null || true
+if [ -n "${NAVDIAG_WAITHB:-}" ]; then
+  # deferred from the RECOMP_NAVDIAG block above: anchors inside the autoboard bake's text
+  perl -0pi -e 's/(\{ extern int __recomp_autoboard_armed;)/{ static int __wb; if ((++__wb % 2400) == 1) OSReport("NAV: 8FB8wait 60s=%d%d%d%d 70s=%d%d%d%d base=%x\\n", lbl_1_bss_3114[0].unk_60, lbl_1_bss_3114[1].unk_60, lbl_1_bss_3114[2].unk_60, lbl_1_bss_3114[3].unk_60, lbl_1_bss_3114[0].unk_70[0], lbl_1_bss_3114[1].unk_70[0], lbl_1_bss_3114[2].unk_70[0], lbl_1_bss_3114[3].unk_70[0], (unsigned)&lbl_1_bss_3114[0]); } $1/' "$BUILD/src/REL/mentDll/main.c" 2>/dev/null || true
 fi
 #     [DIAG, gated] insert OSReport markers before each main() boot call so a pure-wasm spin
 #     (which can't be node-profiled) can be localized by the last marker printed.

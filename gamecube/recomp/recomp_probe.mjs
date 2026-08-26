@@ -32,6 +32,7 @@ const TRACE_DVD = !!process.env.TRACE_DVD, QUIET = !!process.env.QUIET;
 const PERF = !!process.env.PERF; let perfLast = 0;   // PERF=1: wall-clock game-fps per 200-frame segment
 const DUMPDL = parseInt(process.env.DUMPDL || '0', 10);
 const DUMPFIX = parseInt(process.env.DUMPFIX || '0', 10);
+const DUMPANIM = parseInt(process.env.DUMPANIM || '0', 10);
 const AUTOBOARD = !!process.env.AUTOBOARD;   // arm the direct-to-board shortcut
 const gxShadow = { cp: new Map(), xf: new Map(), bp: new Map() };   // DUMPFIX: last-write-wins GX register shadow
 
@@ -226,6 +227,28 @@ function makeStub(n) {
             i++;
           }
         }
+        // DUMPANIM=<frame>: walk the swapped-AnimData registry (gc_anim_bswap.c) and report
+        // each tree's bmp[0] header; dump the message-font sheet (sizeX==320) raw to
+        // /tmp/font_sheet.bin for offline texture decode (glyph-barcode forensics).
+        if (DUMPANIM && viRetrace === DUMPANIM) {
+          const n = Module.___recomp_get_anim_count ? Module.___recomp_get_anim_count() : 0;
+          console.log(`[dumpanim f${viRetrace}] ${n} swapped AnimData trees`);
+          for (let ai = 0; ai < n; ai++) {
+            const ad = Module.___recomp_get_anim_at(ai) >>> 0;
+            const d2 = dv();
+            const bmpNum = d2.getInt16(ad + 4, true), bmpOfs = d2.getUint32(ad + 0x10, true);
+            const bmpP = bmpOfs < 0x14 || bmpOfs >= 0x01000000 ? bmpOfs : ad + bmpOfs;  // relocated ptr vs offset
+            const pixSize = d2.getUint8(bmpP), fmt = d2.getUint8(bmpP + 1);
+            const palNum = d2.getInt16(bmpP + 2, true), w = d2.getInt16(bmpP + 4, true), h = d2.getInt16(bmpP + 6, true);
+            const dataSize = d2.getUint32(bmpP + 8, true);
+            let dataP = d2.getUint32(bmpP + 0x10, true); if (dataP < 0x01000000) dataP = ad + dataP;
+            console.log(`  anim#${ai} @0x${(ad - 0x80000000 >>> 0).toString(16)} bmpNum=${bmpNum} bmp0: fmt=${fmt} pix=${pixSize} pal=${palNum} ${w}x${h} dataSize=${dataSize}`);
+            if (w === 320) {
+              fs.writeFileSync('/tmp/font_sheet.bin', Buffer.from(mem().buffer.slice(dataP, dataP + dataSize)));
+              console.log(`  -> font sheet dumped: /tmp/font_sheet.bin (${dataSize}B, fmt=${fmt})`);
+            }
+          }
+        }
         // DUMPFIX=<frame>: write the render fixture for the Dolphin-WGPU seam — the frame's
         // FIFO bytes, a raw MEM1 image (guest 0x80000000..0x81800000), and a region manifest
         // (CP array base/stride pairs with byte extents + unique CALL_DL spans). The browser
@@ -258,6 +281,10 @@ function makeStub(n) {
           for (const [a, v] of gxShadow.cp) { pu8(0x08); pu8(a); pu32(v); }
           for (const [a, v] of gxShadow.xf) { pu8(0x10); pu32(a & 0xffff); pu32(v >>> 0); }
           for (const [r, v] of gxShadow.bp) { pu8(0x61); pu32(((r & 0xff) << 24) | (v & 0xffffff)); }
+          // GXInit-era XF defaults (written once at boot, never re-emitted): identity into
+          // GX_IDENTITY (0xF0) + GX_PTIDENTITY (0x5F4) — sprite/glyph texgens reference them.
+          { const ONE = 0x3f800000, ident = [ONE, 0, 0, 0, 0, ONE, 0, 0, 0, 0, ONE, 0];
+            for (const mb of [0xF0, 0x5F4]) { pu8(0x10); pu32(((ident.length - 1) << 16) | mb); for (const w of ident) pu32(w); } }
           const fifo = Buffer.concat([Buffer.from(pro), frameOnly]);
           console.log(`[dumpfix] state prologue: cp=${gxShadow.cp.size} xf=${gxShadow.xf.size} bp=${gxShadow.bp.size} (${pro.length}B) + ${frameOnly.length}B frame`);
           fs.writeFileSync('/tmp/recomp_fix_frame.bin', fifo);

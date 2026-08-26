@@ -30,6 +30,17 @@ void DCStoreRange(void *a, unsigned n)       { __recomp_dirty_push(a, n); }
 void DCStoreRangeNoSync(void *a, unsigned n) { __recomp_dirty_push(a, n); }
 void DCFlushRange(void *a, unsigned n)       { __recomp_dirty_push(a, n); }
 void DCFlushRangeNoSync(void *a, unsigned n) { __recomp_dirty_push(a, n); }
+/* Non-DC entry for host shims that rewrite main RAM outside the game's flush discipline
+ * (gc_aram.c ARAM->MRAM restage). Tagged with bit31 of size: a RESTAGE means the address
+ * range now holds a DIFFERENT asset (heap reuse), so the render bridge must invalidate
+ * every address-keyed cache entry it overlaps — unlike a DC flush, which is a content
+ * update to data whose identity is unchanged. */
+void __recomp_dirty_note(void *a, unsigned n) {
+    unsigned before = __recomp_dirty_n;
+    __recomp_dirty_push(a, n);
+    if (__recomp_dirty_n > before)
+        __recomp_dirty_ring[__recomp_dirty_n - 1].size |= 0x80000000u;
+}
 
 unsigned __recomp_dirty_base(void)     { return (unsigned)&__recomp_dirty_ring[0]; }
 unsigned __recomp_dirty_count(void)    { return __recomp_dirty_n; }
