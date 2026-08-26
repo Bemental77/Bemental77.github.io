@@ -548,6 +548,15 @@ extern "C" EMSCRIPTEN_KEEPALIVE void recomp_render_fifo(uint32_t ptr, uint32_t l
   if (g_framebuffer_manager)
     g_framebuffer_manager->RefreshPeekCache();
 }
+
+// [recomp-debug 2026-08-26] Direct EFB pixel read — settles "did the 3D draws leave
+// fragments in the EFB" independent of the XFB copy/present path.
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t recomp_efb_peek(uint32_t x, uint32_t y)
+{
+  if (!g_framebuffer_manager)
+    return 0xDEADDEAD;
+  return g_framebuffer_manager->PeekEFBColor(x, y);
+}
 // [gp-ring STEP 3 2026-07-09 — PERMANENT] Consumer of the worker's WPAR-only Atomics ring
 // (producer: ppc_worker.js installWriteEnv gpPush; layout @0x026C0000: +0 head/+4 tail
 // monotonic, +8 producer-wait flag, +0xC fallbacks, +0x10 applied, +0x40 data 8192x{width,val}).

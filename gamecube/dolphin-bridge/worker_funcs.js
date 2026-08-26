@@ -813,6 +813,30 @@ self.onmessage = function (e) {
       postMessage({ cmd: 'recompStats', frames: __recompLiveFrames });
       break;
     }
+    // debug: sample the EFB on a grid — did draws leave fragments, independent of XFB/present
+    case 'recompEfbPeek': {
+      var grid = [];
+      try {
+        for (var gy = 40; gy < 480; gy += 80) {
+          var row = [];
+          for (var gx = 40; gx < 640; gx += 80) row.push((Module._recomp_efb_peek(gx, gy) >>> 0).toString(16).padStart(8, '0'));
+          grid.push('y' + gy + ': ' + row.join(' '));
+        }
+      } catch (er) { grid = ['ERR ' + er]; }
+      // counter deltas across ONE synchronous frame render: decoder-level draws (0x026B289C)
+      // vs real GPU DrawCurrentBatch submissions (0x026B352C)
+      try {
+        if (__recompFix && Module._recomp_render_fifo && __recompFixPtr) {
+          var c0 = Module.HEAPU32[0x026B289C >> 2] >>> 0, g0 = Module.HEAPU32[0x026B352C >> 2] >>> 0;
+          Module._recomp_render_fifo(__recompFixPtr, __recompFixLen);
+          var c1 = Module.HEAPU32[0x026B289C >> 2] >>> 0, g1 = Module.HEAPU32[0x026B352C >> 2] >>> 0;
+          grid.push('one-frame: decoderDraws=' + (c1 - c0) + ' gpuSubmits=' + (g1 - g0));
+        }
+      } catch (er2) { grid.push('CNT-ERR ' + er2); }
+      postMessage({ cmd: 'print', txt: '[recompEfbPeek] ' + grid[grid.length - 1] });
+      postMessage({ cmd: 'print', txt: '[recompEfbPeek] ' + grid.slice(0, 3).join(' | ') });
+      break;
+    }
     // debug: dump a window of Dolphin-side emulated RAM as hex (diff against the
     // recomp guest's intent when chasing live-sync corruption)
     case 'recompPeek': {

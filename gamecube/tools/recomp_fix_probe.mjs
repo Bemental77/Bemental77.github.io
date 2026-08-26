@@ -56,7 +56,7 @@ const browser = await puppeteer.launch({
          '--disk-cache-size=1', '--disable-application-cache', '--disable-back-forward-cache'],
 });
 const page = await browser.newPage();
-page.on('console', (m) => { const t = m.text(); if (/recompFix|recomp|error|Error/i.test(t)) console.log('[page]', t.slice(0, 220)); });
+page.on('console', (m) => { const t = m.text(); if (process.env.ALLCON) console.log('[page]', t.slice(0, 300)); else if (/recomp|Unknown Opcode/i.test(t)) console.log('[page]', t.slice(0, 200)); });
 await page.goto(`http://127.0.0.1:${PORT}/gamecube.html?v=${Date.now()}${process.env.SKIP_DL === '1' ? '#skipdl' : ''}`, { waitUntil: 'load', timeout: 60000 });
 await new Promise((r) => setTimeout(r, 1000));
 await page.evaluate(() => {
@@ -85,5 +85,8 @@ console.log('[fix] inject:', armed);
 await new Promise((r) => setTimeout(r, POST_MS));
 await page.screenshot({ path: '/tmp/recomp_fix_post.png' });
 console.log('[fix] post-injection screenshot -> /tmp/recomp_fix_post.png');
+// EFB grid peek: fragments in the EFB vs XFB/present losses
+await page.evaluate(() => dolphin_worker.postMessage({ cmd: 'recompEfbPeek' }));
+await new Promise((r) => setTimeout(r, 1500));
 await browser.close();
 srv.close();

@@ -48,7 +48,7 @@ const browser = await puppeteer.launch({
 });
 const page = await browser.newPage();
 page.on('console', (m) => { const t = m.text(); if (/recomp|guestPeek|Unknown Opcode/i.test(t)) console.log('[page]', t.slice(0, 260)); });
-await page.goto(`http://127.0.0.1:${PORT}/gamecube.html?recomp=1&fps=${FPS}&bootms=${BOOT_MS}${process.env.BOARD === '1' ? '&board=1' : ''}${process.env.GPEEK ? '&peek=' + process.env.GPEEK : ''}${process.env.FULLMEM === '1' ? '&fullmem=1' : ''}&v=${Date.now()}`,
+await page.goto(`http://127.0.0.1:${PORT}/gamecube.html?recomp=1&fps=${FPS}&bootms=${BOOT_MS}${process.env.BOARD === '1' ? '&board=1' : ''}${process.env.GPEEK ? '&peek=' + process.env.GPEEK : ''}${process.env.FULLMEM === '1' ? '&fullmem=1' : ''}${process.env.XFREGONLY === '1' ? '&xfregonly=1' : ''}&v=${Date.now()}`,
                 { waitUntil: 'load', timeout: 60000 });
 await new Promise((r) => setTimeout(r, 1000));
 await page.evaluate(() => {

@@ -3863,7 +3863,7 @@
   setInterval(function () {
     var d = framesSeen - lastN, dr = rendered - lastRendered;
     lastN = framesSeen; lastRendered = rendered;
-    hud('recomp ' + d + ' game-fps / ' + dr + ' render-fps' + (TARGET === 0 ? ' (uncapped)' : ' / target ' + TARGET));
+    hud('recomp f' + framesSeen + ' ' + d + ' game-fps / ' + dr + ' render-fps' + (TARGET === 0 ? ' (uncapped)' : ' / target ' + TARGET));
   }, 1000);
 
   async function startRecomp() {
@@ -3917,6 +3917,7 @@
                      inputScript: boardScript,
                      peekAddrs: (q.get('peek') || '').split(',').filter(Boolean).map(function (s) { return parseInt(s, 16); }),
                      testFullMem: q.get('fullmem') === '1',
+                     xfShadowAll: q.get('xfregonly') === '1' ? false : true,
                      glueUrl: '/gamecube/recomp/mp4_game.js',
                      wasmUrl: '/gamecube/recomp/mp4_game.wasm' }, parts.concat([fst]));
     requestAnimationFrame(grantLoop);

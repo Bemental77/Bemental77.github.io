@@ -20,6 +20,7 @@ let paceI32 = null;
 let inputScript = null;   // frame -> [btn, dstk, stkx, stky] canned choreography (?board=1)
 let peekAddrs = null;      // debug: guest offsets to hex-dump every 1200 frames (boot msg)
 let testFullMem = false;   // debug: ship full mem1 every frame (fixture-equivalence bisect)
+let XF_SHADOW_ALL = false; // matrix-memory shadow BROKE glyph texgen state (2026-08-26 bisect); registers-only
 let parts = [], fstBuf = null;
 const PART_SIZE = 104857600;   // 100MiB fixed part boundaries (gamecube.html chunkRange)
 
@@ -29,8 +30,9 @@ const log = (txt) => postMessage({ cmd: 'log', txt: '[recomp-worker] ' + txt });
 let vcdLo = 0, vcdHi = 0;
 const vatA = new Array(8).fill(0);
 const arrayBase = new Array(16).fill(0), arrayStride = new Array(16).fill(0);
-const knownDLs = new Map();          // guest addr -> size (walked+synced)
+const knownDLs = new Map();          // guest addr -> {size, keys:Set} (walked+synced)
 const knownArrays = new Map();       // "base|stride" -> synced byte count so far
+const pairSeen = new Map();          // per-frame: "base|stride" -> {base, stride} from B0 writes
 // BP texture state: SETIMAGE0 (0x88-0x8B tex0-3, 0xA8-0xAB tex4-7) w/h/fmt per slot;
 // SETIMAGE3 (0x94-0x97, 0xB4-0xB7) base>>5 per slot. TLUT loads: 0x64 src>>5, 0x65 tmem+count.
 const texImg0 = new Array(8).fill(0);
@@ -85,7 +87,15 @@ function walkStream(mem, buf, start, end, depth, newDLs, touched) {
       if (a === 0x50) vcdLo = v; else if (a === 0x60) vcdHi = v;
       else if (a >= 0x70 && a <= 0x77) vatA[a - 0x70] = v;
       else if (a >= 0xA0 && a <= 0xAF) arrayBase[a - 0xA0] = v;
-      else if (a >= 0xB0 && a <= 0xBF) arrayStride[a - 0xB0] = v;
+      else if (a >= 0xB0 && a <= 0xBF) {
+        arrayStride[a - 0xB0] = v;
+        // FIXTURE-PARITY array discovery: every stride write pairs with its slot's current
+        // base — collect the pair regardless of DLs. (Index-walk extents missed every
+        // re-bound DL invocation; the fixture's linear pair scan + clip extents renders
+        // everything correctly and is now the live policy too.)
+        const b0 = arrayBase[a - 0xB0];
+        if (b0 && v) pairSeen.set((b0 >>> 0) + '|' + (v >>> 0), { base: b0 >>> 0, stride: v >>> 0 });
+      }
     }
     else if (op === 0x10) {
       const hdr = rdU32(p); p += 4;
@@ -94,7 +104,8 @@ function walkStream(mem, buf, start, end, depth, newDLs, touched) {
       // loads once per scene (UI ortho, static camera) live only in the frame that set
       // them; a skipRender'd frame dropped them forever (skips>0 corrupted every scene,
       // skips=0 was pixel-perfect — 2026-08-26 bisect).
-      for (let k = 0; k < count; k++) gxShadow.xf.set(xfAddr + k, rdU32(p + 4 * k));
+      if (XF_SHADOW_ALL || xfAddr >= 0x1000)
+        for (let k = 0; k < count; k++) gxShadow.xf.set(xfAddr + k, rdU32(p + 4 * k));
       p += 4 * count;
     }
     else if (op === 0x61) {
@@ -117,9 +128,14 @@ function walkStream(mem, buf, start, end, depth, newDLs, touched) {
         const i0 = texImg0[slot];
         const w = ((i0 & 0x3FF) + 1), h = (((i0 >>> 10) & 0x3FF) + 1), fmt = (i0 >>> 20) & 0xF;
         const bpp = TEX_BPP[fmt] || 32;
-        // tile-pad dims to 8 and add 33% mip headroom
+        // EXACT base-level size, tile-padded — no mip fudge. The old +34% "mip headroom"
+        // made the RAW texture sync overrun into whatever follows the texture in the heap,
+        // stomping the head of just-swapped f32 vertex arrays with LE bytes (the live-only
+        // persistent world garbage; the fixture never syncs textures and was immune).
+        // Mip chains beyond level 0 may sync stale — refine with SETIMAGE1's TMEM size if
+        // mip shimmer shows up.
         const wp = (w + 7) & ~7, hp = (h + 7) & ~7;
-        const size = Math.ceil((wp * hp * bpp) / 8 * 1.34);
+        const size = (wp * hp * bpp) >> 3;
         if (base) texBound.set(base, Math.max(texBound.get(base) || 0, size));
       }
     }
@@ -128,33 +144,31 @@ function walkStream(mem, buf, start, end, depth, newDLs, touched) {
     else if (op === 0x40) {
       const addr = rdU32(p), size = rdU32(p + 4); p += 8;
       if (depth > 0) continue;
-      if (!knownDLs.has(addr) && size > 0) {
-        knownDLs.set(addr, size); newDLs.push({ addr, size });
-        // walk it ONCE, now, while the binding state is current (arrays are static per model;
-        // re-walking 1600+ DLs every frame was the 28fps worker-side throttle)
-        const ofs = addr & 0x01FFFFFF;
-        const gm = new Uint8Array(mem.buffer, 0x80000000 + ofs, size);
-        walkStream(mem, gm, 0, size, depth + 1, newDLs, touched);
+      if (size > 0) {
+        // Walk once PER (DL, binding signature) — NOT once per DL. Hu3D re-calls the same
+        // DL with different CP array bindings per model piece; walk-once-per-address left
+        // every re-bound invocation's arrays untouched and unswapped (the worker only ever
+        // discovered ~270 of the frame's 726 arrays — the live world's raw-LE ribbons).
+        // Key on the attribute bases indexed draws actually use (pos/nrm/clr0/tex0).
+        const bk = arrayBase[0] + '|' + arrayBase[1] + '|' + arrayBase[2] + '|' + arrayBase[4];
+        let ent = knownDLs.get(addr);
+        if (!ent) { ent = { size, keys: new Set() }; knownDLs.set(addr, ent); }
+        if (!ent.keys.has(bk)) {
+          ent.keys.add(bk);
+          if (ent.keys.size === 1) newDLs.push({ addr, size });   // sync DL bytes once
+          const ofs = addr & 0x01FFFFFF;
+          const gm = new Uint8Array(mem.buffer, 0x80000000 + ofs, size);
+          walkStream(mem, gm, 0, size, depth + 1, newDLs, touched);
+        }
       }
     }
     else if ((op & 0x80) && [0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8].includes(op & 0xF8)) {
       const vat = op & 7, n = rdU16(p); p += 2;
+      // array extents come from the clip heuristic now (fixture parity) — draws just skip
       const attrs = attrList(vat);
-      for (let v = 0; v < n; v++) {
-        for (const a2 of attrs) {
-          if (a2.idx !== undefined) {
-            const iv = a2.sz === 2 ? rdU16(p) : buf[p];
-            const b2 = arrayBase[a2.idx], st = arrayStride[a2.idx];
-            if (b2 && st) {
-              const k = b2 + '|' + st;
-              const need = (iv + 1) * st;
-              const have = touched.get(k) || knownArrays.get(k) || 0;
-              if (need > have) touched.set(k, need);
-            }
-          }
-          p += a2.sz;
-        }
-      }
+      let perVert = 0;
+      for (const a2 of attrs) perVert += a2.sz;
+      p += n * perVert;
       if (p > end) { log('DRAW OVERRUN in walk'); return; }
     }
     else { log('walk: unknown op 0x' + op.toString(16) + ' at +0x' + (p - 1).toString(16)); return; }
@@ -279,13 +293,11 @@ async function boot(msg) {
               regions.push({ addr: d.addr & 0x01FFFFFF,
                              bytes: new Uint8Array(mem().buffer.slice(0x80000000 + (d.addr & 0x01FFFFFF),
                                                                       0x80000000 + (d.addr & 0x01FFFFFF) + d.size)) });
-            for (const [k, need] of touched) {
-              const [b2, st] = k.split('|').map(Number);
-              knownArrays.set(k, need);
-              regions.push({ addr: b2 & 0x01FFFFFF, bytes: regionBytes(mem(), b2, st, need) });
-            }
-            // texture regions: sync on FIRST sight only (per-frame dynamic updates now flow
-            // through the dirty-range ring below — the game's own DCStoreRange calls)
+            // texture regions BEFORE arrays: both are raw guest slices except arrays are
+            // byte-swapped — on any residual overlap the swapped array copy must win
+            // (apply order is list order on the dolphin side).
+            // Sync on FIRST sight only (per-frame dynamic updates flow through the
+            // dirty-range ring below — the game's own DCStoreRange calls).
             for (const [base, size] of texBound) {
               const ofs = base & 0x01FFFFFF;
               if (ofs + size > 0x01800000) continue;
@@ -296,6 +308,40 @@ async function boot(msg) {
               }
             }
             texBound.clear();
+            // Arrays: fixture-parity clip extents. pairSeen = every (base,stride) bound
+            // this frame (top-level + walked-DL bodies) + the CP shadow's current 16 slots
+            // (bindings persisting from earlier frames). Extent = clip at the nearest
+            // FOLLOWING clip point (any pair base, DL addr, or texture base), cap 256KB —
+            // exactly the DUMPFIX heuristic every clean fixture render used. Sync on first
+            // sight; content updates flow via the dirty ring; restages invalidate.
+            for (let si = 0; si < 16; si++) {
+              const sb = arrayBase[si], ss = arrayStride[si];
+              if (sb && ss) pairSeen.set((sb >>> 0) + '|' + (ss >>> 0), { base: sb >>> 0, stride: ss >>> 0 });
+            }
+            {
+              const newPairs = [...pairSeen.values()].filter((pr) => !knownArrays.has((pr.base >>> 0) + '|' + (pr.stride >>> 0)));
+              if (newPairs.length) {
+                const clipPts = [...new Set([
+                  ...[...pairSeen.values()].map((pr) => pr.base & 0x01FFFFFF),
+                  ...[...knownArrays.keys()].map((k) => parseInt(k, 10) & 0x01FFFFFF),
+                  ...[...knownDLs.keys()].map((a2) => a2 & 0x01FFFFFF),
+                  ...[...knownTex.keys()].map((t2) => t2 & 0x01FFFFFF),
+                ])].sort((x, y) => x - y);
+                for (const pr of newPairs) {
+                  const b2 = pr.base & 0x01FFFFFF;
+                  if (b2 >= 0x01800000) continue;
+                  let next = 0x01800000;
+                  for (const cpt of clipPts) if (cpt > b2) { next = cpt; break; }
+                  const ext = Math.min(next - b2, 0x40000, 0x01800000 - b2);
+                  if (ext <= 0) continue;
+                  knownArrays.set((pr.base >>> 0) + '|' + (pr.stride >>> 0), ext);
+                  regions.push({ addr: b2, bytes: regionBytes(mem(), pr.base, pr.stride, ext) });
+                  if (peekAddrs && peekAddrs.some((pa) => Math.abs(pa - b2) < 0x2000))
+                    log('pairSync f' + viRetrace + ' base=0x' + b2.toString(16) + ' stride=' + pr.stride + ' ext=' + ext);
+                }
+              }
+              pairSeen.clear();
+            }
             // dirty-range ring (gc_dirty_ring.c): the game's DCStoreRange/DCFlushRange calls
             // mark exactly the CPU-written GPU-visible bytes this frame (skinning vertex
             // writes, glyph textures, minigame arrays). Drain, filter to guest RAM, forward.
@@ -314,9 +360,9 @@ async function boot(msg) {
                   const ofs = da - 0x80000000;
                   // A walked DL's identity IS its content (the walk extracted its array
                   // bindings) — any write over it, DC flush or restage, invalidates it.
-                  for (const [ka, ksz] of knownDLs) {
+                  for (const [ka, ent2] of knownDLs) {
                     const kOfs = ka & 0x01FFFFFF;
-                    if (kOfs < ofs + ds && kOfs + ksz > ofs) knownDLs.delete(ka);
+                    if (kOfs < ofs + ds && kOfs + ent2.size > ofs) knownDLs.delete(ka);
                   }
                   if (restage) {
                     // ARAM->MRAM restage: the range now holds a DIFFERENT asset (heap
@@ -324,6 +370,10 @@ async function boot(msg) {
                     // (walk-once DLs poisoned whole scenes before this). Drop them so
                     // next frame's walk re-discovers + re-syncs. A DC flush (restage=
                     // false) is a content update to the SAME data — arrays/tex stay.
+                    // ALSO clear every DL's walk memory: array bindings live inside DL
+                    // bodies, and an invalidated array re-syncs only when a body walk
+                    // re-emits its pair (0x955000 stayed raw-LE forever without this).
+                    for (const ent3 of knownDLs.values()) ent3.keys.clear();
                     for (const [k, kn] of knownArrays) {
                       const kOfs = parseInt(k, 10) & 0x01FFFFFF;
                       if (kOfs < ofs + ds && kOfs + kn > ofs) knownArrays.delete(k);
@@ -381,6 +431,10 @@ async function boot(msg) {
               const u8p = new Uint8Array(mem().buffer, 0x80000000 + pa, 48);
               log('guestPeek f' + viRetrace + ' 0x' + pa.toString(16) + ' = ' +
                   [...u8p].map((b) => b.toString(16).padStart(2, '0')).join(''));
+              const inF32 = f32Arrays.some((iv) => pa >= iv.b && pa < iv.e);
+              const nearArr = [...knownArrays.keys()].filter((k) => Math.abs((parseInt(k, 10) & 0x01FFFFFF) - pa) < 0x2000);
+              log('class 0x' + pa.toString(16) + ': inF32=' + inF32 + ' nearKnownArrays=' + JSON.stringify(nearArr)
+                  + ' knownArrTotal=' + knownArrays.size + ' knownDLs=' + knownDLs.size + ' f32ivs=' + f32Arrays.length);
             }
           }
           // pacing: consume one frame credit; block until the page grants more (uncapped=freerun)
@@ -408,6 +462,7 @@ async function boot(msg) {
   if (msg.inputScript) { inputScript = msg.inputScript; log('input script: ' + Object.keys(inputScript).length + ' entries'); }
   if (msg.peekAddrs) peekAddrs = msg.peekAddrs;
   if (msg.testFullMem) { testFullMem = true; log('TESTFULLMEM: full mem1 every frame'); }
+  if (msg.xfShadowAll === false) { XF_SHADOW_ALL = false; log('XF shadow: registers only'); }
 
   // stage BootInfo (LE) + FST (BE->LE entry table) + FSTLocation
   const d = new DataView(Module.wasmMemory.buffer);
