@@ -17,3 +17,13 @@ int modesel_prolog(void) { modesel_ObjectSetup(); return 0; }
 // symbols do not exist under emcc).
 extern void fn_mt1_144(void);
 int ment_prolog(void) { fn_mt1_144(); return 0; }
+
+// OVL_W01 (Toad's Midway Madness — the first board). board_executor.c's _prolog is just the
+// (empty) ctor walk + ObjectSetup() = BoardObjectSetup(BoardCreate, BoardDestroy); BoardCreate/
+// BoardDestroy are w01Dll main.c globals, BoardObjectSetup is DOL board/main.c:104. Call it
+// directly (the RECOMP_W01 build compiles w01's 3 units, namespaced fn_1_->fn_w1_).
+typedef void (*gc_board_func)(void);
+extern void BoardObjectSetup(gc_board_func, gc_board_func);
+extern void BoardCreate(void);
+extern void BoardDestroy(void);
+int w01_prolog(void) { BoardObjectSetup(BoardCreate, BoardDestroy); return 0; }

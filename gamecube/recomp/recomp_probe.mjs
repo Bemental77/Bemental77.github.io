@@ -32,6 +32,7 @@ const TRACE_DVD = !!process.env.TRACE_DVD, QUIET = !!process.env.QUIET;
 const PERF = !!process.env.PERF; let perfLast = 0;   // PERF=1: wall-clock game-fps per 200-frame segment
 const DUMPDL = parseInt(process.env.DUMPDL || '0', 10);
 const DUMPFIX = parseInt(process.env.DUMPFIX || '0', 10);
+const AUTOBOARD = !!process.env.AUTOBOARD;   // arm the direct-to-board shortcut
 const gxShadow = { cp: new Map(), xf: new Map(), bp: new Map() };   // DUMPFIX: last-write-wins GX register shadow
 
 // GC pad bits (include/dolphin/pad.h)
@@ -299,8 +300,8 @@ function makeStub(n) {
         if (inj) inj(inputSchedule.get(viRetrace + 1) ?? 0);   // set for the NEXT game frame
         const injD = Module.___recomp_set_inject_dstk;
         if (injD) injD(dstkSchedule.get(viRetrace + 1) ?? 0);
-        const stk = stkSchedule.get(viRetrace + 1);
-        if (stk && Module.___recomp_set_inject_stkx) { Module.___recomp_set_inject_stkx(stk[0]); Module.___recomp_set_inject_stky(stk[1]); }
+        const stk = stkSchedule.get(viRetrace + 1) ?? [0, 0];
+        if (Module.___recomp_set_inject_stkx) { Module.___recomp_set_inject_stkx(stk[0]); Module.___recomp_set_inject_stky(stk[1]); }
         viRetrace++;
         if (viRetrace >= PUMP_MAX) throw { __pumpDone: true };
         return 0;
@@ -322,6 +323,7 @@ Module = await createModule({ instantiateWasm, noInitialRun: true });
 // grow via emscripten's resize (keeps HEAP views fresh — raw grow detaches them under Asyncify)
 const needBytes = 0x82000000;
 if (mem().buffer.byteLength < needBytes) Module._emscripten_resize_heap(needBytes);
+if (AUTOBOARD && Module.___recomp_autoboard_arm) { Module.___recomp_autoboard_arm(1); console.log('[probe] AUTOBOARD armed'); }
 console.log('[probe] memory:', (mem().buffer.byteLength / 1048576) | 0, 'MB | host stubs:', hostImportNames.length,
             '| ISO:', isoFd >= 0 ? ISO : 'MISSING', '| input:', inputSchedule.size, 'pulses');
 

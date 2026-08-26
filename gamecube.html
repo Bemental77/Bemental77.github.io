@@ -3884,18 +3884,34 @@
     rw.onmessage = function (e) {
       if (e.data.cmd === 'frame') {
         framesSeen = e.data.n;
-        // backpressure: render the freshest frame only — if the renderer is behind, DROP.
-        // The game keeps running full speed; presented frames sample the newest state
-        // (mem1/region frames are never dropped: they carry one-time state).
-        if (outstanding >= 2 && !e.data.mem1 && (!e.data.regions || e.data.regions.length === 0)) { dropped++; return; }
-        outstanding++;
+        // backpressure: every frame's RAM state (regions/mem1) must land, but when the
+        // renderer is behind, mark the frame skipRender — the dolphin side applies state
+        // and skips the draw, so presents always sample the freshest game state.
+        var skipRender = outstanding >= 2;
+        if (skipRender) dropped++; else outstanding++;
         var tr = [e.data.fifo].concat(e.data.regions.map(function (r) { return r.bytes; }));
         if (e.data.mem1) tr.push(e.data.mem1);
         dolphin_worker.postMessage({ cmd: 'recompFrame', n: e.data.n, fifo: e.data.fifo,
-                                     mem1: e.data.mem1, regions: e.data.regions }, tr);
+                                     mem1: e.data.mem1, regions: e.data.regions,
+                                     skipRender: skipRender }, tr);
       } else if (e.data.cmd === 'log') console.log(e.data.txt);
     };
+    // ?board=1: the canned frame-exact chain that drives boot -> title -> save dialogs ->
+    // mode carousel -> Party Mode -> 1-human count -> char select, where the armed
+    // autoboard shortcut commits the default config and enters the board (OVL_W01).
+    var boardScript = null;
+    if (q.get('board') === '1') {
+      boardScript = {};
+      var chain = [[1000, [0x1000,0,0,0]], [1300, [0x100,0,0,0]], [1600, [0,8,0,0]],
+                   [1700, [0x100,0,0,0]], [2100, [0x100,0,0,0]], [2500, [0x100,0,0,0]],
+                   [3400, [0x100,0,0,0]], [3800, [0x100,0,0,0]], [4300, [0x100,0,0,0]],
+                   [4400, [0,0,-80,0]], [4450, [0,0,-80,0]], [4500, [0,0,-80,0]],
+                   [4650, [0x100,0,0,0]]];
+      for (var ci = 0; ci < chain.length; ci++) boardScript[chain[ci][0]] = chain[ci][1];
+    }
     rw.postMessage({ cmd: 'boot', parts: parts, fst: fst, pace: pace,
+                     autoboard: q.get('board') === '1',
+                     inputScript: boardScript,
                      glueUrl: '/gamecube/recomp/mp4_game.js',
                      wasmUrl: '/gamecube/recomp/mp4_game.wasm' }, parts.concat([fst]));
     requestAnimationFrame(grantLoop);

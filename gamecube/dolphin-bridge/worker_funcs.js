@@ -759,6 +759,7 @@ self.onmessage = function (e) {
         if (R2.addr + R2.bytes.byteLength <= 0x01800000)
           Module.HEAPU8.set(new Uint8Array(R2.bytes), ram2 + R2.addr);
       }
+      if (e.data.skipRender) break;   // backlogged: state applied above, draw skipped
       var fb2 = new Uint8Array(e.data.fifo);
       // retarget the display copy (last 0x4B value) to the live scanout XFB
       if (__recompLiveXfb) {

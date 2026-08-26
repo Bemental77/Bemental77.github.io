@@ -133,6 +133,10 @@ fi
 if [ -n "${RECOMP_MENT:-}" ]; then
 perl -0pi -e 's{(if\(overlay == OVL_MODESEL\)\{.*?return dll;\}\n)}{$1\tif(overlay == OVL_MENT){extern s32 ment_prolog(void); dll->module = 0; dll->bss = 0; if(flag==1){OSReport("objdll> AOT ment_prolog\\n"); dll->ret = ment_prolog();} return dll;}\n}s' "$BUILD/src/game/objdll.c" 2>/dev/null || true
 fi
+#     [AOT-overlay] OVL_W01 — the first BOARD (Toad's Midway Madness), the 120fps target scene.
+if [ -n "${RECOMP_W01:-}" ]; then
+perl -0pi -e 's{(if\(overlay == OVL_MENT\)\{.*?return dll;\}\n)}{$1\tif(overlay == OVL_W01){extern s32 w01_prolog(void); dll->module = 0; dll->bss = 0; if(flag==1){OSReport("objdll> AOT w01_prolog\\n"); dll->ret = w01_prolog();} return dll;}\n}s' "$BUILD/src/game/objdll.c" 2>/dev/null || true
+fi
 if [ -n "${RECOMP_MSDIAG:-}" ]; then
 perl -0pi -e 's/(void BootExec\(void\)\s*\n\{)/$1\n    OSReport("MK-OMOVL evt=%d init=%d\\n", omovlevtno, SystemInitF);/' "$BUILD/src/REL/bootDll/main.c" 2>/dev/null || true
 fi
@@ -193,9 +197,13 @@ perl -0pi -e 's/(static void THPViewSprFunc\(HuSprite \*arg0\)\s*\n\{)/$1\n    r
 #     [input inject] the recomp has no VI-retrace interrupt firing PadReadVSync, so HuPadBtnDown
 #     never gets real input. Deliver host buttons: OR __recomp_inject_btn (set by the harness via
 #     ___recomp_set_inject_btn) into HuPadBtnDown[0] at HuPadRead's end (shims/src/gc_input.c).
-#     ONE-SHOT: consume the injected value on delivery — HuPadRead can run more than once per
-#     retrace, and a double-delivered UP moves a 2-choice dialog cursor up then wraps it back.
-perl -0pi -e 's/(_PadBtnDown\[i\] = 0;\s*\n\s*\})\n\}/$1\n    { extern int __recomp_inject_btn; extern int __recomp_inject_dstk; extern int __recomp_inject_stkx; extern int __recomp_inject_stky; HuPadBtnDown[0] |= (unsigned short)__recomp_inject_btn; __recomp_inject_btn = 0; HuPadDStkRep[0] |= (unsigned char)__recomp_inject_dstk; __recomp_inject_dstk = 0; if (__recomp_inject_stkx) { HuPadStkX[0] = (s8)__recomp_inject_stkx; __recomp_inject_stkx = 0; } if (__recomp_inject_stky) { HuPadStkY[0] = (s8)__recomp_inject_stky; __recomp_inject_stky = 0; } }\n}/' "$BUILD/src/game/pad.c" 2>/dev/null || true
+#     FRAME-SCOPED (not one-shot): HuPadRead runs MORE THAN ONCE per retrace in some overlays
+#     (mentDll char-select), and a consume-on-first-delivery let the second call recompute
+#     HuPadBtnDown from _Pad state and WIPE the injected bit before the game logic saw it (the
+#     eaten-A stall). The pacing side sets the cells for exactly one frame and clears them at
+#     the next retrace, and the HuPrcKill zombie fix removed the double-processing that the
+#     one-shot was protecting against.
+perl -0pi -e 's/(_PadBtnDown\[i\] = 0;\s*\n\s*\})\n\}/$1\n    { extern int __recomp_inject_btn; extern int __recomp_inject_dstk; extern int __recomp_inject_stkx; extern int __recomp_inject_stky; HuPadBtnDown[0] |= (unsigned short)__recomp_inject_btn; HuPadDStkRep[0] |= (unsigned char)__recomp_inject_dstk; if (__recomp_inject_stkx) HuPadStkX[0] = (s8)__recomp_inject_stkx; if (__recomp_inject_stky) HuPadStkY[0] = (s8)__recomp_inject_stky; }\n}/' "$BUILD/src/game/pad.c" 2>/dev/null || true
 #     [system clocks] __OSBusClock/__OSCoreClock (os.h, AT_ADDRESS 0x800000F8/FC) are written by the
 #     bootrom + OSInit on real HW; here AT_ADDRESS is stripped -> plain BSS globals, and OSInit is a
 #     no-op import, so they stay 0 -> the OSTicksToMilliseconds macro (ticks/(__OSBusClock/4000))
@@ -214,6 +222,20 @@ perl -0pi -e 's/#define HuSprAnimReadFile\(data_id\) \(HuSprAnimRead\((HuDataSel
 #     (not via the macro) -> BE blob parsed natively -> garbage-size mallocs (0x2c030020) +
 #     HuMemMemoryAlloc free-list spin when the modesel menu creates its sprites. Wrap it too.
 perl -0pi -e 's/(var_r30->unk08 = HuSprAnimRead\()(temp_r26)(\);)/{ extern void *__recomp_bswap_animtree_ret(void *); $1__recomp_bswap_animtree_ret($2)$3 }/' "$BUILD/src/game/esprite.c" 2>/dev/null || true
+#     board/space.c manually relocates AnimData blobs (data->bmp = base + ofs) WITHOUT going
+#     through HuSprAnimRead — the auto-swap hook never runs, the BE offsets produce wild
+#     pointers, and bmp->dataSize feeds an OOB memcpy (the first w01 BoardCreate trap).
+#     Wrap those fresh reads with the auto-detecting swapper.
+perl -0pi -e 's/\A/extern void *__recomp_bswap_animtree_auto(void *);\n/; s/(data = data_base = )(HuDataSelHeapReadNum\([^;]*\));/$1__recomp_bswap_animtree_auto($2);/g' "$BUILD/src/game/board/space.c" 2>/dev/null || true
+#     BoardSpaceRead (board/space.c:939) parses the BE board-layout file natively: u32 count
+#     (truncated into an s16 -> 0 -> BoardRandMod %0 trap), 9 f32 per space (pos/rot/scale),
+#     u32 flag, u16 type/link_cnt/links. Swap at read (the GetFileInfo pattern).
+perl -0pi -e 's/spaceCnt\[layer\] = \*\(u32 \*\)data;/spaceCnt[layer] = __builtin_bswap32(*(u32 *)data);/;
+              s/(memcpy\(&space->scale, data, sizeof\(Vec\)\);\n        data \+= sizeof\(Vec\);)/$1\n        { u32 *__v = (u32 *)&space->pos; int __k; for (__k = 0; __k < 9; __k++) __v[__k] = __builtin_bswap32(__v[__k]); }/;
+              s/space->flag = \*\(u32 \*\)data;/space->flag = __builtin_bswap32(*(u32 *)data);/;
+              s/space->type = \*\(u16 \*\)data;/space->type = __builtin_bswap16(*(u16 *)data);/;
+              s/space->link_cnt = \*\(u16 \*\)data;/space->link_cnt = __builtin_bswap16(*(u16 *)data);/;
+              s/space->link\[j\] = \(\*\(u16 \*\)data\) \+ 1;/space->link[j] = __builtin_bswap16(*(u16 *)data) + 1;/;' "$BUILD/src/game/board/space.c" 2>/dev/null || true
 #     [general, replaces per-site whack-a-mole] The game has 300+ DIRECT HuSprAnimRead call
 #     sites (window.c frame tree, chrman, hsfman .inc statics, every overlay/minigame), each
 #     handing a fresh BE blob. The missed window.c site corrupted the HEAP_SYSTEM MCB ring
@@ -240,6 +262,15 @@ fi
 if [ -n "${RECOMP_NAVDIAG:-}" ]; then
   perl -0pi -e 's/(if \(HuPadBtnDown\[0\] & PAD_BUTTON_A\) \{\n(\s+)HuAudFXPlay\(2\);)/$1 OSReport("NAV: A-break\\n");/g' "$BUILD/src/REL/modeseldll/modesel.c" 2>/dev/null || true
   perl -0pi -e 's/(s16 result = fn_(?:ms)?1_2490\(\);)/OSReport("NAV: enter filesel\\n"); $1 OSReport("NAV: filesel result=%d\\n", result);/' "$BUILD/src/REL/modeseldll/main.c" 2>/dev/null || true
+  # char-select WAIT-LOOP heartbeat: the loop's own view of every player's (unk_60, unk_70[0]);
+  # anchored on the loop's UNIQUE A-latch scan line (verified 1 occurrence).
+  # NOTE: this bake runs BEFORE the fn_1_/lbl_1_ -> _mt1_ rename, so it matches and emits the
+  # PRE-rename names; the later rename converts the inserted code too.
+  perl -0pi -e 's/\(lbl_1_bss_3114\[var_r31\]\.unk_60 == 0\) && \(HuPadBtnDown/(({ static int __wb; if ((++__wb % 2400) == 1) OSReport("NAV: 8FB8wait 60s=%d%d%d%d 70s=%d%d%d%d base=%x\\n", lbl_1_bss_3114[0].unk_60, lbl_1_bss_3114[1].unk_60, lbl_1_bss_3114[2].unk_60, lbl_1_bss_3114[3].unk_60, lbl_1_bss_3114[0].unk_70[0], lbl_1_bss_3114[1].unk_70[0], lbl_1_bss_3114[2].unk_70[0], lbl_1_bss_3114[3].unk_70[0], (unsigned)&lbl_1_bss_3114[0]); { extern int __recomp_autoboard_armed; extern void __recomp_autoboard(void); static int __ab; if (__recomp_autoboard_armed && ++__ab == 480) { OSReport("NAV: AUTOBOARD firing\\n"); __recomp_autoboard(); } } lbl_1_bss_3114[var_r31].unk_60 == 0; })) && (HuPadBtnDown/' "$BUILD/src/REL/mentDll/main.c" 2>/dev/null || true
+  # player-proc body-entry counter: a fiber resume landing at the TOP re-runs the preamble
+  perl -0pi -e 's/(var_r26 = lbl_1_bss_D4;)/{ static int __pe; if ((++__pe % 500) == 1) OSReport("NAV: 13970 entry n=%d cnt=%d\\n", __pe, lbl_1_bss_D4); } $1/' "$BUILD/src/REL/mentDll/main.c" 2>/dev/null || true
+  # char-select pick-handler heartbeat: proves the handler runs, which pad it reads, what it sees
+  perl -0pi -e 's/(    if \(arg1->unk_70\[0\] == 0\) \{\n        if \(\(HuPadBtnDown\[arg1->unk_6C\] & PAD_BUTTON_A\) != 0\) \{)/    { static int __hb; if ((++__hb % 600) == 1) OSReport("NAV: 15CB4 hb pad=%d unk70=%d btn=%x arg1=%x base=%x\\n", arg1->unk_6C, arg1->unk_70[0], HuPadBtnDown[arg1->unk_6C], (unsigned)arg1, (unsigned)&lbl_1_bss_3114[0]); }\n$1/' "$BUILD/src/REL/mentDll/main.c" 2>/dev/null || true
   # every window message set: id + resolved text (control bytes print as-is; words readable)
   perl -0pi -e 's/(window_ptr->mess = MessData_MesPtrGet\(messDataPtr, mess\);)/$1\n        OSReport("NAV: MesSet win=%d id=%x txt=%s\\n", window, mess, window_ptr->mess ? (char*)window_ptr->mess : "(null)");/' "$BUILD/src/game/window.c" 2>/dev/null || true
   # choice-state key trace: which key bits reach the cursor + the cursor move it causes
@@ -521,6 +552,32 @@ if [ -n "${RECOMP_MENT:-}" ]; then
   done
   echo "[recomp] ment overlay AOT-compiled (namespaced)"
 fi
+# [AOT-overlay] Compile OVL_W01 (w01Dll: main.c + mg_coin.c + mg_item.c) INTO the module,
+# namespaced fn_1_->fn_w1_ / lbl_1_->lbl_w1_ (units + include/REL/w01Dll.h). Entry is
+# gc_ovl_dispatch.c w01_prolog -> BoardObjectSetup(BoardCreate, BoardDestroy) — the whole
+# board engine (src/game/board/*) is already compiled into the DOL; the overlay only carries
+# the board-specific create/destroy + its two minigames.
+if [ -n "${RECOMP_W01:-}" ]; then
+  W1NS="-D__OSBusClock=__w1_busclk -D__OSCoreClock=__w1_coreclk"
+  # main.c declares CoasterHostComKeySet extern at :160 but defines it static at :2645 (mwcc
+  # tolerated; clang errors) — align the early declaration with the file-local definition.
+  perl -0pi -e 's/^extern (void CoasterHostComKeySet\(s32 playerNo\);)/static $1/m' "$BUILD/src/REL/w01Dll/main.c" 2>/dev/null || true
+  # main.c implicit-declares Hu3DMtxRotGet/Hu3DMtxTransGet (hsfex.h) + BoardPlayerMoveBetween /
+  # BoardCameraPosCalcFuncSet (no header declares them) -> 4 int-return sig mismatches. Prepend
+  # the header + real-type prototypes (from the definitions; func-ptr param as void(*)(void*),
+  # ABI-identical on wasm32 and typedef-independent since this lands before the includes).
+  perl -0pi -e 's{\A}{#include "game/hsfex.h"\nextern void BoardPlayerMoveBetween(s32, s32, s32);\nextern void BoardCameraPosCalcFuncSet(void (*)(void *));\n}' "$BUILD/src/REL/w01Dll/main.c" 2>/dev/null || true
+  for u in main mg_coin mg_item; do
+    perl -0pi -e 's/\bfn_1_/fn_w1_/g; s/\blbl_1_/lbl_w1_/g' "$BUILD/src/REL/w01Dll/$u.c" 2>/dev/null || true
+  done
+  perl -0pi -e 's/\bfn_1_/fn_w1_/g; s/\blbl_1_/lbl_w1_/g' "$BUILD/include/REL/w01Dll.h" 2>/dev/null || true
+  for u in main mg_coin mg_item; do
+    o="$BUILD/obj/$(printf '%s' "src/REL/w01Dll/$u.c" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
+    if emcc "${CFLAGS[@]}" $W1NS "$BUILD/src/REL/w01Dll/$u.c" -o "$o" 2>/tmp/ce_w1.txt; then ok=$((ok+1));
+    else fail=$((fail+1)); echo "  w01Dll/$u.c: $(grep -m1 'error:' /tmp/ce_w1.txt | sed 's|.*error: ||')"; fi
+  done
+  echo "[recomp] w01 overlay AOT-compiled (namespaced)"
+fi
 echo "[recomp] wasm objects: $ok built, $fail failed"
 echo "[recomp] object bytes: $(cat "$BUILD"/obj/*.o 2>/dev/null | wc -c)"
 echo "[recomp] top remaining blockers:"
@@ -545,7 +602,7 @@ if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.js" \
      -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=33554432 \
      -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=32768 ${RECOMP_PROFILING_FUNCS:+--profiling-funcs} \
      -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web,worker -sINVOKE_RUN=0 \
-     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet \
+     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm \
      -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAP32,HEAPU32,wasmMemory,wasmExports \
      -Wl,--no-entry -Wl,--no-gc-sections -Wl,--allow-undefined -Wl,--allow-multiple-definition -O2 2>"$BUILD/link.txt"; then
   echo "[recomp] LINKED: $BUILD/mp4_game.js + $BUILD/mp4_game.wasm ($(stat -f%z "$BUILD/mp4_game.wasm" 2>/dev/null) bytes)"

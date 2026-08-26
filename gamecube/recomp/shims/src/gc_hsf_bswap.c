@@ -105,12 +105,27 @@ static void swTrackKeyframes(unsigned char *track_data, u16 curveType, u16 numKe
     }
 }
 
+// [Fix A support] swap n_f32 floats at base+ofs, once — dedup against a small seen list so
+// two mesh objects sharing one pristine-copy region cannot double-swap it.
+#define HSF_COPYSEEN_MAX 128
+static u32 hsf_copyseen[HSF_COPYSEEN_MAX];
+static s32 hsf_copyseen_n;
+static void hsf_swap_copy_region(unsigned char *base, u32 ofs, u32 n_f32)
+{
+    s32 m;
+    f32 *e = (f32 *)(base + ofs);
+    for (m = 0; m < hsf_copyseen_n; m++) if (hsf_copyseen[m] == ofs) return;
+    if (hsf_copyseen_n < HSF_COPYSEEN_MAX) hsf_copyseen[hsf_copyseen_n++] = ofs;
+    { u32 q; for (q = 0; q < n_f32; q++) { u32 v = *(u32 *)&e[q]; v = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24); *(u32 *)&e[q] = v; } }
+}
+
 void __recomp_bswap_hsf(void *data)
 {
     unsigned char *base = (unsigned char *)data;
     HsfHeader *h = (HsfHeader *)data;
     HsfSection *sec;
     s32 i, j, k;
+    hsf_copyseen_n = 0;   // per-file dedup list for the pristine-copy regions (Fix A)
 
     // --- Double-swap plausibility guard -------------------------------------------------------
     // The scene section is the very first section entry in the header (right after magic[8]).
@@ -124,6 +139,11 @@ void __recomp_bswap_hsf(void *data)
         u32 as_is = (u32)h->scene.ofs;              // native (little-endian) read of the raw bytes
         u32 swapped = bsw32(as_is);                 // what it would become if we swapped
         const u32 PLAUSIBLE = 0x400000u;            // 4 MB: an .hsf file is well under this
+        // Fix D: hard idempotence — stamped on first swap (below). The plausibility guard can
+        // fail OPEN on a header the loader has rewritten with live pointers (SetHsfModel), and
+        // is inert when scene.ofs==0; the stamp is absolute. Real files end "...037\0" and
+        // hsfload never re-reads magic as a string.
+        if (h->magic[7] == 1) return;
         if (as_is != 0 && as_is < PLAUSIBLE && swapped >= PLAUSIBLE) {
 #ifdef RECOMP_HSFDIAG
             { extern void OSReport(const char*, ...); OSReport("HSF: SKIP(already-LE) %x\n", (unsigned)data); }
@@ -135,6 +155,8 @@ void __recomp_bswap_hsf(void *data)
 #endif
         // (If as_is is 0 we still proceed: scene.ofs==0 is legitimately possible and harmless.)
     }
+
+    h->magic[7] = 1;   // Fix D stamp — see the guard above
 
     // --- 1. Header: magic[8] stays; swap all 42 section s32 (21 sections x {ofs,count}) --------
     // NOTE: char magic[8] is ASCII ("Hsfv" style) -> DO NOT SWAP.
@@ -235,7 +257,10 @@ void __recomp_bswap_hsf(void *data)
     {
         struct { HsfSection *s; int comps; } vbufs[3];
         vbufs[0].s = &h->vertex; vbufs[0].comps = 3; // HsfVector3f
-        vbufs[1].s = &h->normal; vbufs[1].comps = 0; // 3x s8 packed bytes -> no element swap
+        // normals: per-FILE dichotomy (hsfdraw.c:503-508): cenv-less files pack s8 triples
+        // (no swap); SKINNED files (cenv.count != 0) use f32 triples stride 12 — leaving
+        // those BE broke every skinned model's normals (Fix B).
+        vbufs[1].s = &h->normal; vbufs[1].comps = h->cenv.count ? 3 : 0;
         HT(6); vbufs[2].s = &h->st;     vbufs[2].comps = 2; // HsfVector2f
         for (k = 0; k < 3; k++) {
             HsfSection *S = vbufs[k].s;
@@ -360,8 +385,31 @@ void __recomp_bswap_hsf(void *data)
                 sw32f(&d->cluster);
                 d->cenvCnt = bsw32(d->cenvCnt);
                 sw32f(&d->cenv);
-                sw32f(&d->file[0]);
-                sw32f(&d->file[1]);
+                // file[0]/file[1]: ABSOLUTE byte offsets (from file base — unlike the section-
+                // relative pools) to PRISTINE COPIES of this mesh's vertex/normal arrays, used
+                // by the skinning/morph paths as per-frame restore sources (ClusterExec.c:125,
+                // EnvelopeExec.c:176/179). The section sweeps never reach them, so the per-frame
+                // restore was copying BE floats over the swapped draw buffers (the measured
+                // "arrays revert to BE" / streak-geometry bug). Swap their elements here — only
+                // for the mesh arm with skinning data (type==2 && cenvCnt, matching every deref
+                // gate), with the count from the (already-swapped) vertex/normal buffer headers,
+                // deduped in case two objects share one copy region.
+                {
+                    u32 f0 = sw32f(&d->file[0]);
+                    u32 f1 = sw32f(&d->file[1]);
+                    if (type == 2 && d->cenvCnt != 0) {
+                        s32 vidx = (s32)(u32)d->vertex;
+                        s32 nidx = (s32)(u32)d->normal;
+                        if (f0 && vidx >= 0 && vidx < h->vertex.count) {
+                            HsfBuffer *vb = (HsfBuffer *)(base + h->vertex.ofs);
+                            hsf_swap_copy_region(base, f0, (u32)vb[vidx].count * 3u);
+                        }
+                        if (f1 && nidx >= 0 && nidx < h->normal.count) {
+                            HsfBuffer *nb = (HsfBuffer *)(base + h->normal.ofs);
+                            hsf_swap_copy_region(base, f1, (u32)nb[nidx].count * 3u);
+                        }
+                    }
+                }
             }
         }
     }
@@ -573,6 +621,10 @@ void __recomp_bswap_hsf(void *data)
             /* unk18[124] u8 ; adjusted u8 ; unk95 u8 -> no swap */
             cl[i].type      = bsw16(cl[i].type);
             cl[i].vertexCnt = bsw32(cl[i].vertexCnt);
+            // Fix C: the weight array REALLY extends past unk14[0] into the unk18[124] bytes
+            // (read up to vertexCnt floats per frame, ClusterExec.c:56/67) — swap the rest.
+            { s32 wn = (s32)cl[i].vertexCnt; if (wn > 32) wn = 32;
+              for (j = 1; j < wn; j++) bswf32(&cl[i].unk14[j]); }
             sw32f(&cl[i].vertex);           // symbol-index array base
         }
     }

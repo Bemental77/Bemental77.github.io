@@ -17,6 +17,7 @@
 
 let Module = null, viRetrace = 0;
 let paceI32 = null;
+let inputScript = null;   // frame -> [btn, dstk, stkx, stky] canned choreography (?board=1)
 let parts = [], fstBuf = null;
 const PART_SIZE = 104857600;   // 100MiB fixed part boundaries (gamecube.html chunkRange)
 
@@ -164,14 +165,27 @@ function buildPrologue() {
   return new Uint8Array(pro);
 }
 
-// Copy an array region RAW: measured (fixture mem1 @0x9ce5a0 etc.) the vertex payloads sit
-// in guest memory ALREADY BIG-ENDIAN — the HSF loaders leave the GPU-consumed arrays in disc
-// byte order (the CPU only walks them in a few NBT/bounds paths) — which is exactly what
-// Dolphin's vertex loader wants. The earlier LE->BE "fix" was corrupting them (the streaks).
+// Copy an array region, swapping f32-based strides (8/12) LE->BE for Dolphin's vertex loader.
+// HISTORY: mid-session the pools measured BE only because the HSF swapper's pristine-copy
+// restore hole (ClusterProc <- unswapped data.file[0]) was re-BE-ing them per frame; with
+// swapper Fixes A-D every GPU-visible pool is LE in guest memory (LE-everywhere), so the
+// bridge owns the LE->BE conversion at the sync boundary. s8/rgba8 strides copy raw.
+function swap4InPlace(out) {
+  for (let k = 0; k + 4 <= out.length; k += 4) {
+    const t0 = out[k]; out[k] = out[k + 3]; out[k + 3] = t0;
+    const t1 = out[k + 1]; out[k + 1] = out[k + 2]; out[k + 2] = t1;
+  }
+}
+const f32Arrays = [];   // [{b, e}] guest-phys intervals of known f32 (stride 8/12) arrays
 function regionBytes(mem, base, stride, count) {
   const src = new Uint8Array(mem.buffer, 0x80000000 + (base & 0x01FFFFFF), count);
   const out = new Uint8Array(count);
   out.set(src);
+  if (stride === 8 || stride === 12) {
+    swap4InPlace(out);
+    const b = base & 0x01FFFFFF;
+    f32Arrays.push({ b, e: b + count });
+  }
   return out;
 }
 
@@ -243,31 +257,59 @@ async function boot(msg) {
               knownArrays.set(k, need);
               regions.push({ addr: b2 & 0x01FFFFFF, bytes: regionBytes(mem(), b2, st, need) });
             }
-            // texture regions: sync on first sight; re-sync bound ones every 30 frames
-            // (message-window glyphs are CPU-drawn into RAM textures — they change)
+            // texture regions: sync on FIRST sight only (per-frame dynamic updates now flow
+            // through the dirty-range ring below — the game's own DCStoreRange calls)
             for (const [base, size] of texBound) {
               const ofs = base & 0x01FFFFFF;
               if (ofs + size > 0x01800000) continue;
               const kt = knownTex.get(base);
-              if (!kt || size > kt.size || viRetrace - kt.lastSync >= 30) {
+              if (!kt || size > kt.size) {
                 knownTex.set(base, { size, lastSync: viRetrace });
                 regions.push({ addr: ofs, bytes: new Uint8Array(mem().buffer.slice(0x80000000 + ofs, 0x80000000 + ofs + size)) });
               }
             }
             texBound.clear();
-            let fifo = fb, mem1Snap = null;
+            // dirty-range ring (gc_dirty_ring.c): the game's DCStoreRange/DCFlushRange calls
+            // mark exactly the CPU-written GPU-visible bytes this frame (skinning vertex
+            // writes, glyph textures, minigame arrays). Drain, filter to guest RAM, forward.
+            if (Module.___recomp_dirty_count) {
+              const dn = Module.___recomp_dirty_count();
+              if (Module.___recomp_dirty_overflow && Module.___recomp_dirty_overflow()) {
+                cacheDirty = true;   // pathological burst (whole-heap flush): full resnapshot next frame
+              } else if (dn > 0) {
+                const dbase = Module.___recomp_dirty_base() >>> 0;
+                const dvw = new DataView(mem().buffer, dbase, dn * 8);
+                for (let di = 0; di < dn; di++) {
+                  const da = dvw.getUint32(di * 8, true), ds = dvw.getUint32(di * 8 + 4, true);
+                  if (da < 0x80000000 || da + ds > 0x81800000) continue;   // stack/out-of-RAM: drop
+                  if (ds > 0x100000) { cacheDirty = true; continue; }      // jumbo: full resync instead
+                  const ofs = da - 0x80000000;
+                  const by = new Uint8Array(mem().buffer.slice(da, da + ds));
+                  // dirty range inside a known f32 vertex/texcoord array (skinning/morph
+                  // writes are LE floats) -> swap for Dolphin; anything else (glyph
+                  // textures, DLs, misc buffers) is byte-exact -> raw
+                  for (const iv of f32Arrays)
+                    if (ofs >= iv.b && ofs + ds <= iv.e) { swap4InPlace(by); break; }
+                  regions.push({ addr: ofs, bytes: by });
+                }
+              }
+              if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
+            }
+            let mem1Snap = null;
             if (cacheDirty) {
               cacheDirty = false;
-              knownDLs.clear(); knownArrays.clear(); knownTex.clear();
+              knownDLs.clear(); knownArrays.clear(); knownTex.clear(); f32Arrays.length = 0;
               mem1Snap = mem().buffer.slice(0x80000000, 0x81800000);
             }
             if (!sentPrologue) { sentPrologue = true;
-              const pro = buildPrologue();
-              const joined = new Uint8Array(pro.length + fb.length);
-              joined.set(pro, 0); joined.set(fb, pro.length);
-              fifo = joined;
               if (!mem1Snap) mem1Snap = mem().buffer.slice(0x80000000, 0x81800000);
             }
+            // Prepend the rolling register shadow to EVERY frame (~1.5KB): each frame is then
+            // fully self-contained, so the renderer may skip backlogged frames without the
+            // decoder losing persistent CP/XF/BP state carried only by a skipped frame.
+            const pro = buildPrologue();
+            const fifo = new Uint8Array(pro.length + fb.length);
+            fifo.set(pro, 0); fifo.set(fb, pro.length);
             const transfers = [fifo.buffer, ...regions.map((r) => r.bytes.buffer)];
             if (mem1Snap) transfers.push(mem1Snap);
             postMessage({ cmd: 'frame', n: viRetrace, fifo: fifo.buffer, mem1: mem1Snap,
@@ -275,10 +317,11 @@ async function boot(msg) {
           }
           if (Module._gx_fifo_reset) Module._gx_fifo_reset();
           // input from the pace SAB (page keyboard); one-shot semantics live in the bake
-          if (Module.___recomp_set_inject_btn) Module.___recomp_set_inject_btn(Atomics.exchange(paceI32, 1, 0));
-          if (Module.___recomp_set_inject_dstk) Module.___recomp_set_inject_dstk(Atomics.exchange(paceI32, 2, 0));
-          if (Module.___recomp_set_inject_stkx) Module.___recomp_set_inject_stkx(Atomics.exchange(paceI32, 3, 0));
-          if (Module.___recomp_set_inject_stky) Module.___recomp_set_inject_stky(Atomics.exchange(paceI32, 4, 0));
+          const scripted = inputScript ? inputScript[viRetrace + 1] : null;
+          if (Module.___recomp_set_inject_btn) Module.___recomp_set_inject_btn(Atomics.exchange(paceI32, 1, 0) | (scripted ? scripted[0] : 0));
+          if (Module.___recomp_set_inject_dstk) Module.___recomp_set_inject_dstk(Atomics.exchange(paceI32, 2, 0) | (scripted ? scripted[1] : 0));
+          if (Module.___recomp_set_inject_stkx) Module.___recomp_set_inject_stkx(Atomics.exchange(paceI32, 3, 0) || (scripted ? scripted[2] : 0));
+          if (Module.___recomp_set_inject_stky) Module.___recomp_set_inject_stky(Atomics.exchange(paceI32, 4, 0) || (scripted ? scripted[3] : 0));
           viRetrace++;
           // pacing: consume one frame credit; block until the page grants more (uncapped=freerun)
           if (!Atomics.load(paceI32, 5)) {
@@ -301,6 +344,8 @@ async function boot(msg) {
   const createModule = (await import(msg.glueUrl)).default;
   Module = await createModule({ instantiateWasm, noInitialRun: true });
   if (Module.wasmMemory.buffer.byteLength < 0x82000000) Module._emscripten_resize_heap(0x82000000);
+  if (msg.autoboard && Module.___recomp_autoboard_arm) { Module.___recomp_autoboard_arm(1); log('AUTOBOARD armed'); }
+  if (msg.inputScript) { inputScript = msg.inputScript; log('input script: ' + Object.keys(inputScript).length + ' entries'); }
 
   // stage BootInfo (LE) + FST (BE->LE entry table) + FSTLocation
   const d = new DataView(Module.wasmMemory.buffer);
