@@ -3754,7 +3754,7 @@
         ? '[webgpu] adapter/device UNAVAILABLE — falling back to OGL/WebGL2 backend (WGPU would freeze boot)'
         : '[webgpu] adapter+device OK — using WGPU backend');
     }
-    var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; window.__romExt = pick.ext || '.iso'; SAVE_KEY = ROM_NAME + '.gcs'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /gamecube/dolphin_libretro/dolphin_libretro.js ...'); setStatus('Loading Dolphin libretro core...'); var s = document.createElement('script'); s.src = '/gamecube/dolphin_libretro/dolphin_libretro.js?v=' + Date.now(); document.body.appendChild(s); }
+    var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; window.__romBase = pick.base; window.__romExt = pick.ext || '.iso'; SAVE_KEY = ROM_NAME + '.gcs'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /gamecube/dolphin_libretro/dolphin_libretro.js ...'); setStatus('Loading Dolphin libretro core...'); var s = document.createElement('script'); s.src = '/gamecube/dolphin_libretro/dolphin_libretro.js?v=' + Date.now(); document.body.appendChild(s); }
   $('btnStart').addEventListener('click', startEmulator);
   const DB_NAME = 'GCWASMDB', STORE = 'GCWASMSTATES'; var SAVE_KEY = ROM_NAME + '.gcs';
   function openDB() { return new Promise((resolve, reject) => { var req = indexedDB.open(DB_NAME); req.onupgradeneeded = e => e.target.result.createObjectStore(STORE); req.onsuccess = e => resolve(e.target.result); req.onerror = () => reject(req.error); }); }
@@ -3819,6 +3819,20 @@
 (function () {
   var q = new URLSearchParams(location.search);
   if (q.get('recomp') !== '1') return;
+  // The recomp IS the Mario Party 4 native port — with any other ROM selected (persisted
+  // gcwasm_romIdx, e.g. PSO) the takeover parked THAT game's CPU and streamed MP4 frames
+  // over its renderer: frozen title screen + garbled output on desktop AND mobile
+  // (user report 2026-08-27). Pin this boot's selection to MP4 by option label (ROMS is
+  // scoped inside the main IIFE — referencing it here threw and killed this whole block).
+  // Setting .value fires no 'change' event, so the user's saved pick for normal JIT
+  // visits stays untouched; lock the selects so it can't be switched mid-recomp.
+  [document.getElementById('romSelect'), document.getElementById('mobileRomSelect')].forEach(function (s) {
+    if (!s) return;
+    for (var oi = 0; oi < s.options.length; oi++)
+      if (/^Mario Party 4/.test(s.options[oi].textContent)) { s.value = s.options[oi].value; break; }
+    s.disabled = true;
+  });
+  console.log('[recomp-live] recomp mode: ROM pinned to Mario Party 4');
   // Default = NATIVE speed: each pumped frame advances game time 1/60s (the recomp's
   // frame-driven clock), so 120 credits/s ran the GAME at 2x fast-forward while the
   // screen painted far fewer frames (user 2026-08-27: "just because you increase the
@@ -4003,6 +4017,13 @@
   var armed = false, tries = 0;
   function tryStart(why) {
     if (armed) return;
+    // Belt-and-braces on the ROM pin above: never park a non-MP4 game under MP4 frames.
+    if (window.__romBase && window.__romBase !== 'MarioParty4') {
+      hudStatus = 'recomp is the MP4 native port — booted ROM is ' + window.__romBase + '; not taking over';
+      console.log('[recomp-live] REFUSING takeover: booted ROM ' + window.__romBase + ' is not MarioParty4');
+      armed = true;
+      return;
+    }
     armed = true;
     console.log('[recomp-live] taking over (' + why + ')');
     hudStatus = 'recomp: taking over (loading disc)...';

@@ -189,6 +189,17 @@ function makeStub(n) {
         console.log(`[alloc-err f${viRetrace}] size=0x${(a[0] >>> 0).toString(16)}\n` +
                     new Error().stack.split('\n').filter(l => l.includes('wasm')).slice(0, 12).join('\n'));
         return 0;
+      case '__recomp_texobj_trap':  // RECOMP_TEXDIAG build: junk-texture bind (image ptr outside MEM1)
+        console.log(`[texobj-trap f${viRetrace}] ptr=0x${(a[0] >>> 0).toString(16)} w=${(a[1] >>> 16) & 0xffff} h=${a[1] & 0xffff} fmt=${a[2] >>> 0}\n` +
+                    new Error().stack.split('\n').filter(l => l.includes('wasm')).slice(0, 14).join('\n'));
+        return 0;
+      case '__recomp_sprtex_trap': { // RECOMP_TEXDIAG build: junk sprite-tex bind — dump the AnimData tree head
+        const t = a[0] >>> 0, bmpPtr = a[2] >>> 0, d = dv();
+        const hx = (p, n) => { let s = ''; for (let k = 0; k < n; k += 4) s += d.getUint32(p + k, true).toString(16).padStart(8, '0') + ' '; return s; };
+        console.log(`[sprtex-trap f${viRetrace}] anim=0x${t.toString(16)} bmpNo=${a[1] >>> 0} bmpPtr=0x${bmpPtr.toString(16)}\n` +
+                    `  animHead: ${hx(t, 20)}\n  bmpRec:   ${hx(bmpPtr, 20)}`);
+        return 0;
+      }
       case 'DVDInit': { const f = Module.___DVDFSInit || Module.__DVDFSInit; if (f) f(); return 0; }
       case 'DVDReadAbsAsyncPrio': return serveDvdRead(a[0], a[1], a[2], a[3], a[4]);
       case 'DVDReadAbsAsyncForBS': return serveDvdRead(a[0], a[1], a[2], a[3], a[4]);

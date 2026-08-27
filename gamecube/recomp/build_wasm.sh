@@ -277,12 +277,25 @@ perl -0pi -e 's/spaceCnt\[layer\] = \*\(u32 \*\)data;/spaceCnt[layer] = __builti
 #     (BE/LE plausibility vote, gc_anim_bswap.c) — pre-swapped/relocated trees vote LE and
 #     pass through, so the older per-site swaps stay harmless.
 perl -0pi -e 's/(AnimData \*HuSprAnimRead\(void \*data\)\n\{)/$1\n    { extern void *__recomp_bswap_animtree_auto(void *); data = __recomp_bswap_animtree_auto(data); }/' "$BUILD/src/game/sprman.c" 2>/dev/null || true
+#     [static-anim double-relocation] The already-relocated sentinel (anim->bank & 0xFFFF0000)
+#     never trips for a STATIC .inc tree at a low wasm address (base+bankOfs < 0x10000), so a
+#     shared asset's second HuSprAnimRead relocated it TWICE (bank = ofs + 2*base — the
+#     title/board noise-texture bind at masked 0x173cbd20). Statics relocate once per address
+#     via the shim registry; heap trees keep the retail sentinel (sound at 0x80xxxxxx).
+perl -0pi -e 's/(    AnimData \*anim = \(AnimData \*\)data;\n)(    if\(\(u32\)anim->bank & 0xFFFF0000\) \{)/$1    if ((u32)data < 0x80000000u) { extern int __recomp_animreloc_once(void*); if (!__recomp_animreloc_once(data)) { anim->useNum++; return anim; } }\n$2/' "$BUILD/src/game/sprman.c" 2>/dev/null || true
 #     [DIAG, gated] on the allocator's error path, call a host import so the probe's JS stub can
 #     print the wasm caller chain (retaddr tags are all zeroed by the malloc.c mflr bake, so the
 #     in-game "Call" tag is useless). Error-path only — no hot-path cost; gated to keep the
 #     canonical build clean.
 if [ -n "${RECOMP_ALLOCDIAG:-}" ]; then
   perl -0pi -e 's/(OSReport\("HuMem>memory alloc error %08x\(%08X\): Call %08x\\n", size, num, retaddr\);)/{ extern void __recomp_alloc_trap(unsigned); __recomp_alloc_trap(size); }\n    $1/' "$BUILD/src/game/memory.c" 2>/dev/null || true
+fi
+#     [DIAG, gated] trap texture binds whose image pointer masks outside MEM1 (the board's
+#     garbled cliff/waterfall = a 14x1024-RGBA8 bind at masked 0x173cbd20) — the probe stub
+#     prints the wasm caller chain, naming the code path that built the junk GXTexObj.
+if [ -n "${RECOMP_TEXDIAG:-}" ]; then
+  perl -0pi -e 's/(    __GXTexObjInt \*t = \(__GXTexObjInt \*\)obj;\n\n    ASSERTMSGLINE\(0x235, obj, "Texture Object Pointer is null"\);)/$1\n    { extern void __recomp_texobj_trap(unsigned, unsigned, unsigned); unsigned __ip = (unsigned)image_ptr \& 0x3FFFFFFFu; if (__ip >= 0x01800000u) __recomp_texobj_trap((unsigned)image_ptr, ((unsigned)width << 16) | height, (unsigned)format); }/' "$BUILD/src/dolphin/gx/GXTexture.c" 2>/dev/null || true
+  perl -0pi -e 's/(    AnimBmpData \*bmp_ptr = &anim->bmp\[bmp\];)/$1\n    { extern void __recomp_sprtex_trap(unsigned, unsigned, unsigned); unsigned __d = (unsigned)bmp_ptr->data \& 0x3FFFFFFFu; if (__d >= 0x01800000u) __recomp_sprtex_trap((unsigned)anim, (unsigned)bmp, (unsigned)bmp_ptr); }/' "$BUILD/src/game/sprput.c" 2>/dev/null || true
 fi
 #     [DIAG, gated] winBGMake writes its 0x70/0x80 border fill past the block_w*block_h alloc
 #     under the modesel styled window (MCB 0x8027c8e0 clobber) — print its actual geometry.
@@ -648,7 +661,7 @@ if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.js" \
      -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=33554432 \
      -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=32768 ${RECOMP_PROFILING_FUNCS:+--profiling-funcs} \
      -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web,worker -sINVOKE_RUN=0 \
-     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm,___recomp_aram_base \
+     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm,___recomp_aram_base,___recomp_static_top \
      -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAP32,HEAPU32,wasmMemory,wasmExports \
      -Wl,--no-entry -Wl,--no-gc-sections -Wl,--allow-undefined -Wl,--allow-multiple-definition -O2 2>"$BUILD/link.txt"; then
   echo "[recomp] LINKED: $BUILD/mp4_game.js + $BUILD/mp4_game.wasm ($(stat -f%z "$BUILD/mp4_game.wasm" 2>/dev/null) bytes)"

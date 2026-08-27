@@ -133,3 +133,30 @@ void *__recomp_bswap_animtree_auto(void *datav) {
     if (be > le) __recomp_bswap_animtree(datav);
     return datav;
 }
+
+// [2026-08-27] HuSprAnimRead's already-relocated sentinel ((u32)anim->bank & 0xFFFF0000)
+// assumes relocated pointers are guest-heap (0x80xxxxxx) — true on retail. A STATIC .inc
+// AnimData tree lives at a LOW wasm address in the recomp (e.g. 0xcc60): base+bankOfs stays
+// under 0x10000, the sentinel never trips, and the second HuSprAnimRead on the shared asset
+// (each Hu3DAnimCreate calls it) relocates AGAIN — bank/pat/bmp = ofs + 2*base (proven:
+// 0x44/0x14/0x58 + 2*0xcc60 = the observed 0x19904/0x198d4/0x19918) — so anim->bmp reads
+// unrelated static bytes and every scene using the shared animated texture binds noise
+// (title-era binds from f1067 + the board cliff/waterfall/tent garble). Exact fix for
+// statics: relocate once per address — static addresses never move and are never heap-reused;
+// heap trees (>= 0x80000000) keep the retail sentinel, which is sound there.
+#define RECOMP_ANIMRELOC_MAX 256
+static void *__recomp_animreloc_seen[RECOMP_ANIMRELOC_MAX];
+static int __recomp_animreloc_n = 0;
+int __recomp_animreloc_once(void *p) {
+    int i;
+    for (i = 0; i < __recomp_animreloc_n; i++) if (__recomp_animreloc_seen[i] == p) return 0;
+    if (__recomp_animreloc_n < RECOMP_ANIMRELOC_MAX) __recomp_animreloc_seen[__recomp_animreloc_n++] = p;
+    return 1;
+}
+
+// [2026-08-27] wasm-ld's __data_end — NOTE this is data + BSS end (~0x14ab390: the 16MB ARAM
+// static array is BSS), NOT the static-texture boundary. The live bridge needs the end of the
+// INITIALIZED data segments (~0x25204, below the lowest guest texture 0x2bf800) to route
+// static .inc texture binds to low wasm memory; recomp_worker.js parses that from the wasm's
+// data section itself. Kept only as a debugging aid — nothing consumes it.
+unsigned __recomp_static_top(void) { extern char __data_end; return (unsigned)&__data_end; }

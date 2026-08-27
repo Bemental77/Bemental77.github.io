@@ -39,6 +39,8 @@ const texImg0 = new Array(8).fill(0);
 const texBound = new Map();          // phys base -> byte size (bound this frame)
 let tlutSrc = 0;
 const knownTex = new Map();          // phys base -> {size, lastSync}
+let staticTop = 0;                   // wasm data-segment end (__recomp_static_top): binds below
+                                     // it are compiled-in .inc assets, sourced from low memory
 // GX texture format -> bits per texel (tile-padded dims give the safe overestimate)
 const TEX_BPP = { 0: 4, 1: 8, 2: 8, 3: 16, 4: 16, 5: 16, 6: 32, 8: 4, 9: 8, 10: 16, 14: 4 };
 const gxShadow = { cp: new Map(), xf: new Map(), bp: new Map() };  // for the takeover prologue
@@ -257,6 +259,33 @@ async function boot(msg) {
   paceI32 = new Int32Array(msg.pace);
 
   const wasmBinary = await (await fetch(msg.wasmUrl)).arrayBuffer();
+  // Static-texture boundary = end of the wasm's INITIALIZED data segments (~0x25204): every
+  // compiled-in .inc texture/TLUT lives below it, every real guest-RAM texture above it
+  // (lowest observed 0x2bf800). NOT __data_end/__heap_base — those include BSS (the 16MB
+  // ARAM array), land at ~21.7MB, and misroute nearly every guest texture to wasm-low
+  // (all-black board, 2026-08-27 regression during this fix's bring-up).
+  staticTop = (function (u8) {
+    let p = 8;
+    const leb = () => { let r = 0, s = 0, b; do { b = u8[p++]; r |= (b & 0x7f) << s; s += 7; } while (b & 0x80); return r >>> 0; };
+    const sleb = () => { let r = 0, s = 0, b; do { b = u8[p++]; r |= (b & 0x7f) << s; s += 7; } while (b & 0x80); if (s < 32 && (b & 0x40)) r |= (-1 << s); return r >>> 0; };
+    let maxEnd = 0;
+    while (p < u8.length) {
+      const id = u8[p++], len = leb(), end = p + len;
+      if (id === 11) {
+        const cnt = leb();
+        for (let i = 0; i < cnt; i++) {
+          const flags = leb();
+          let ofs = 0;
+          if (flags === 0 || flags === 2) { if (flags === 2) leb(); p++; ofs = sleb(); p++; }   // skip i32.const opcode + end
+          const sz = leb(); p += sz;
+          if (flags !== 1 && ofs + sz > maxEnd) maxEnd = ofs + sz;
+        }
+      }
+      p = end;
+    }
+    return maxEnd;
+  })(new Uint8Array(wasmBinary));
+  log('static data end: 0x' + staticTop.toString(16));
   const wasmModule = await WebAssembly.compile(wasmBinary);
   const isEmscriptenProvided = (name) =>
     name.startsWith('emscripten_') || name.startsWith('__asyncify') || name.startsWith('asyncify_') ||
@@ -298,13 +327,19 @@ async function boot(msg) {
             // (apply order is list order on the dolphin side).
             // Sync on FIRST sight only (per-frame dynamic updates flow through the
             // dirty-range ring below — the game's own DCStoreRange calls).
+            // STATIC ASSETS: a bind whose masked base falls below the wasm data-segment end
+            // (__recomp_static_top ~0x25204; lowest real guest texture 0x2bf800) is a
+            // compiled-in .inc asset living in LOW wasm memory — the guest window at that
+            // offset is zeros. Source those bytes from the static, shipped to the same
+            // guest-physical offset (unused low MEM1) so Dolphin's decoder finds them.
             for (const [base, size] of texBound) {
               const ofs = base & 0x01FFFFFF;
               if (ofs + size > 0x01800000) continue;
               const kt = knownTex.get(base);
               if (!kt || size > kt.size) {
                 knownTex.set(base, { size, lastSync: viRetrace });
-                regions.push({ addr: ofs, bytes: new Uint8Array(mem().buffer.slice(0x80000000 + ofs, 0x80000000 + ofs + size)) });
+                const src = (staticTop && ofs + size <= staticTop) ? ofs : 0x80000000 + ofs;
+                regions.push({ addr: ofs, bytes: new Uint8Array(mem().buffer.slice(src, src + size)) });
               }
             }
             texBound.clear();
