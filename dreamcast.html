@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <title>Dreamcast (Bemental77)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <link rel="icon" href=",">
+  <link rel="icon" href="data:,">
   <script src="/coi-serviceworker.js"></script>
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd;
@@ -15,7 +15,7 @@
     #controlBar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: center; }
     #controlBar button, #controlBar select {
       padding: 8px 14px; border: 1px solid #444; background: #222; color: #eee;
-      border-radius: 4px; font-size: 14px; min-height: 36px; cursor: pointer;
+      border-radius: 4px; font-size: 14px; min-width: 44px; min-height: 36px; cursor: pointer;
     }
     #controlBar button:hover:not(:disabled), #controlBar select:hover { background: #333; }
     #controlBar button:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -24,6 +24,13 @@
                   flex: 1; width: 100%; max-width: 100vw; }
     #dc-canvas { background: #000; image-rendering: pixelated; width: 640px; height: 480px;
                  max-width: 100%; max-height: 100%; }
+    /* Fullscreen: 4:3 letterbox, same treatment as gamecube.html */
+    #canvasWrap:fullscreen, #canvasWrap:-webkit-full-screen { width: 100vw; height: 100vh; max-width: none; max-height: none; display: flex; align-items: center; justify-content: center; }
+    #canvasWrap:fullscreen #dc-canvas, #canvasWrap:-webkit-full-screen #dc-canvas { width: auto; height: 100vh; max-width: 100vw; max-height: 100vh; }
+    @media (min-aspect-ratio: 4/3) { #canvasWrap:fullscreen #dc-canvas, #canvasWrap:-webkit-full-screen #dc-canvas { width: calc(100vh * 4 / 3); } }
+    @media (max-aspect-ratio: 4/3) { #canvasWrap:fullscreen #dc-canvas, #canvasWrap:-webkit-full-screen #dc-canvas { width: 100vw; height: calc(100vw * 3 / 4); } }
+    #fpsBar { font-size: 13px; color: #8f8; min-height: 16px; text-align: center;
+              font-family: ui-monospace, Menlo, monospace; }
     #log { display: none; width: 100%; max-width: 820px; height: 140px; overflow: auto;
            background: #0a0a0a; border: 1px solid #333; padding: 4px; font-size: 11px;
            color: #bbb; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; }
@@ -41,10 +48,32 @@
     <button id="btnReset" disabled>Reset</button>
     <button id="btnSave"  disabled>Save State</button>
     <button id="btnLoad"  disabled>Load State</button>
-    <button id="btnLog"   type="button">Log</button>
+    <button id="btnExport" type="button">⬇ Export State</button>
+    <button id="btnImport" type="button">⬆ Import State</button>
+    <input  id="importFile" type="file" accept=".bin,application/octet-stream" style="display:none">
+    <button id="btnMute" disabled>🔊 Mute</button>
+    <button id="btnResetAudio" disabled>↻ Reset Audio</button>
+    <button id="btnFull" disabled>⛶ Fullscreen</button>
+    <button id="btnLog"   type="button">Toggle Log</button>
+    <button id="btnControls" type="button">🎮 Controls</button>
+    <div id="controlsOverlay" style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.72);align-items:center;justify-content:center;">
+      <div style="background:#1b1b1f;color:#eee;border:1px solid #444;border-radius:10px;padding:20px 26px;max-width:460px;font:14px/1.7 system-ui,sans-serif;box-shadow:0 8px 40px rgba(0,0,0,.6);">
+        <div style="font-size:18px;font-weight:600;margin-bottom:12px;">🎮 Keyboard Controls</div>
+        <table style="border-collapse:collapse;width:100%;">
+          <tr><td style="padding:3px 0;color:#8bd;">Move&nbsp;(stick + d-pad)</td><td style="text-align:right;"><b>W&nbsp; A&nbsp; S&nbsp; D</b></td></tr>
+          <tr><td style="padding:3px 0;color:#8bd;">Analog Stick</td><td style="text-align:right;"><b>Arrow Keys</b></td></tr>
+          <tr><td style="padding:3px 0;color:#8bd;">A&nbsp;(confirm) / B&nbsp;(cancel)</td><td style="text-align:right;"><b>M / K</b></td></tr>
+          <tr><td style="padding:3px 0;color:#8bd;">X / Y</td><td style="text-align:right;"><b>J / N</b></td></tr>
+          <tr><td style="padding:3px 0;color:#8bd;">L / R Triggers</td><td style="text-align:right;"><b>Q / E</b></td></tr>
+          <tr><td style="padding:3px 0;color:#8bd;">Start / Select</td><td style="text-align:right;"><b>Enter / Shift</b></td></tr>
+        </table>
+        <div style="text-align:right;margin-top:16px;"><button id="controlsClose" type="button">Close</button></div>
+      </div>
+    </div>
   </div>
   <div id="status"></div>
   <div id="canvasWrap"><canvas id="dc-canvas" width="640" height="480"></canvas></div>
+  <div id="fpsBar">fps: — | iters/s: —</div>
   <pre id="log"></pre>
 </div>
 <script>
@@ -63,6 +92,19 @@
   function setStatus(t) { if (statusEl) statusEl.textContent = t; }
 
   $('btnLog').addEventListener('click', () => logEl.classList.toggle('visible'));
+
+  // Controls overlay + fullscreen — same UX as gamecube.html.
+  $('btnControls').addEventListener('click', () => { $('controlsOverlay').style.display = 'flex'; });
+  $('controlsClose').addEventListener('click', () => { $('controlsOverlay').style.display = 'none'; });
+  $('controlsOverlay').addEventListener('click', (e) => { if (e.target === $('controlsOverlay')) $('controlsOverlay').style.display = 'none'; });
+  $('btnFull').addEventListener('click', () => {
+    const w = $('canvasWrap');
+    if (document.fullscreenElement || document.webkitFullscreenElement) {
+      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    } else {
+      (w.requestFullscreen || w.webkitRequestFullscreen).call(w);
+    }
+  });
 
   // ---------------------------------------------------------------------------
   // Cross-origin isolation gate. SharedArrayBuffer requires this; the COI
@@ -136,9 +178,123 @@
           worker.postMessage({ cmd: 'interp', on: 1 });
         }
         {
+          // interpAt=N  — switch to full interpreter N seconds after boot (mid-session
+          // oracle: reach a screen under the JIT, then re-render it interpreted).
+          const ia = new URLSearchParams(location.search).get('interpAt');
+          if (ia) setTimeout(() => worker.postMessage({ cmd: 'interp', on: 1 }), parseInt(ia, 10) * 1000);
+        }
+        {
+          // Lever-6 cert: shard install is DEFAULT ON in the wasm; ?noshard=1
+          // is the escape hatch (?shard=1 kept as an explicit-on for older
+          // builds). Sent before any compiles either way.
+          const qs = new URLSearchParams(location.search);
+          if (qs.has('noshard'))    worker.postMessage({ cmd: 'shard', on: 0 });
+          else if (qs.has('shard')) worker.postMessage({ cmd: 'shard', on: 1 });
+          // Lever-7: ARM7 wasm rec is default ON; ?noarm7jit=1 pins the v0
+          // interpret-runner (parity/perf baseline arm).
+          if (qs.has('noarm7jit')) worker.postMessage({ cmd: 'arm7jit', on: 0 });
+          // Render-oracle bisect toggles (black-world investigation):
+          // re-sent after boot too — a config override sent pre-load can be
+          // clobbered by loadGameSpecificSettings (the UseReios lesson).
+          if (qs.has('nofog'))     worker.postMessage({ cmd: 'fog', on: 0 });
+          if (qs.has('nomodvol'))  worker.postMessage({ cmd: 'modvol', on: 0 });
+          // ?uncap=1: disable the real-time governor (perf/throughput probes
+          // measure max guest MHz; interactive play must run at 1x hardware).
+          if (qs.has('uncap'))     worker.postMessage({ cmd: 'uncap', on: 1 });
+          if (qs.has('arm7selftest')) worker.postMessage({ cmd: 'arm7selftest', on: 1 });
+        }
+        if (new URLSearchParams(location.search).has('nofastmem')) {
+          worker.postMessage({ cmd: 'memfast', on: 0 });
+        }
+        if (new URLSearchParams(location.search).has('noregcache')) {
+          worker.postMessage({ cmd: 'regcache', on: 0 });
+        }
+        if (new URLSearchParams(location.search).has('noimmfast')) {
+          worker.postMessage({ cmd: 'immfast', on: 0 });
+        }
+        {
+          const ir = new URLSearchParams(location.search).get('interprange');
+          if (ir) {
+            const [lo, hi] = ir.split('-').map((x) => parseInt(x, 16) >>> 0);
+            worker.postMessage({ cmd: 'interpRange', lo: lo, hi: hi });
+          }
+        }
+        {
           const pct = new URLSearchParams(location.search).get('pctrace');
           if (pct !== null) {
             worker.postMessage({ cmd: 'pctrace', n: parseInt(pct, 10) >>> 0 });
+          }
+        }
+        {
+          // peek=hexaddr:count;hexaddr:count  (count optional, default 1)
+          // peekms=N  — poll period (ms); watches guest RAM evolve over time.
+          const pk = new URLSearchParams(location.search).get('peek');
+          if (pk) {
+            const groups = pk.split(';').filter(Boolean).map((s) => {
+              const [a, c] = s.split(':');
+              return { addr: parseInt(a, 16) >>> 0, count: parseInt(c || '1', 10) >>> 0 };
+            });
+            const ms = parseInt(new URLSearchParams(location.search).get('peekms') || '5000', 10);
+            setInterval(() => worker.postMessage({ cmd: 'peek', groups: groups }), ms);
+          }
+        }
+        {
+          // ctxsnap=1 — poll the live SH4/scheduler/interrupt state every ctxms.
+          if (new URLSearchParams(location.search).has('ctxsnap')) {
+            const ms = parseInt(new URLSearchParams(location.search).get('ctxms') || '3000', 10);
+            setInterval(() => worker.postMessage({ cmd: 'ctxsnap' }), ms);
+          }
+          // nochain=1 — ORDER 21b matched-pair A/B: disable the Lever-1/2 global
+          // tail-link at runtime (g_chain_enabled=0) so blocks round-trip to C.
+          if (new URLSearchParams(location.search).has('nochain')) {
+            worker.postMessage({ cmd: 'setchain', on: 0 });
+          }
+          // rteintc=1 — ORDER 21b storm-fix A/B: restore the OLD immediate per-block
+          // RTE UpdateINTC (the storm livelock). Must be set before blocks compile.
+          if (new URLSearchParams(location.search).has('rteintc')) {
+            worker.postMessage({ cmd: 'setrteintc', on: 1 });
+          }
+          // Monomorphic inline-cache: COLD-ARM at boot (lever-4 task 5). The
+          // per-write SMC map makes arming safe through the SMC-heavy boot —
+          // loader writes to code words bump the generation event-driven, and
+          // first-time registrations don't (only re-registrations churn), so
+          // boot compile cost stays flat. The old 55s post-title timer is
+          // retired. ?noic keeps it disarmed (matched-pair baseline).
+          if (!new URLSearchParams(location.search).has('noic')) {
+            worker.postMessage({ cmd: 'setic', on: 1 });
+          }
+          // Lever-4 task 6: ?parity=N[&parityms=T] — run the in-process IC
+          // parity gate (N frames x 4 arms) T ms after ready (default 70s,
+          // past the title so the window covers armed-hot game code).
+          // Probe fast-path (savestate jump): ?autosave=<ms> captures a state
+          // at T; ?autoload=1 fetches /state.bin once the game is running and
+          // restores it — skipping the multi-minute boot for measurements.
+          {
+            const q2 = new URLSearchParams(location.search);
+            if (q2.has('autosave')) {
+              const t = parseInt(q2.get('autosave'), 10) || 60000;
+              setTimeout(() => worker.postMessage({ cmd: 'saveState' }), t);
+            }
+            if (q2.has('autoload')) {
+              setTimeout(() => {
+                fetch('/state.bin').then(r => r.arrayBuffer()).then(buf => {
+                  pageLog('[page] autoload: fetched ' + buf.byteLength + ' B, restoring');
+                  worker.postMessage({ cmd: 'loadState', data: buf }, [buf]);
+                }).catch(e => pageLog('[page] autoload failed: ' + e));
+              }, 12000);
+            }
+          }
+          {
+            const q = new URLSearchParams(location.search);
+            if (q.has('parity')) {
+              const n = parseInt(q.get('parity'), 10) || 60;
+              const t = parseInt(q.get('parityms') || '70000', 10);
+              // Lever-6 cert: &parityfrom=load replays the autoloaded
+              // /state.bin bytes instead of a live capture, making hashes
+              // comparable ACROSS processes (shard vs per-block gate).
+              const fromload = q.get('parityfrom') === 'load' ? 1 : 0;
+              setTimeout(() => worker.postMessage({ cmd: 'parity', n, fromload }), t);
+            }
           }
         }
         workerReadyResolve();
@@ -155,8 +311,35 @@
       case 'render':
         paintTransferable(d);
         break;
-      case 'stateSaved':  pageLog('[page] save state ' + (d.data ? d.data.byteLength : 0) + ' B'); break;
-      case 'stateLoaded': pageLog('[page] state loaded'); break;
+      case 'fps':
+        lastFps = d.fps; lastHw = d.hw; lastCalls = d.calls;
+        lastClk = d.kcyc; lastPc = d.pc >>> 0;
+        lastIstnrm = d.istnrm >>> 0; lastIstext = d.istext >>> 0;
+        paintFpsBar();
+        break;
+      case 'ips':
+        lastIps = d.ips;
+        paintFpsBar();
+        break;
+      case 'stateSaved':
+        if (d.data && d.data.byteLength > 0) {
+          savedState = new Uint8Array(d.data);
+          pageLog('[page] state saved ' + savedState.byteLength + ' B');
+          // Probe fast-path: ?autosave=<ms> runs push the bytes back to the
+          // probe's HTTP server so later runs can jump straight to the scene.
+          if (new URLSearchParams(location.search).has('autosave')) {
+            fetch('/state.bin', { method: 'PUT', body: savedState })
+              .then(r => pageLog('[page] autosave upload ' + (r.ok ? 'OK' : ('HTTP ' + r.status))))
+              .catch(e => pageLog('[page] autosave upload failed: ' + e));
+          }
+          idbPut(STATE_KEY, savedState)
+            .then(() => pageLog('[page] state persisted (survives reload)'))
+            .catch((e) => pageLog('[page] persist failed: ' + e));
+        } else {
+          pageLog('[page] Save State returned empty — not saved (is the game running?)');
+        }
+        break;
+      case 'stateLoaded': pageLog('[page] state ' + (d.success ? 'loaded OK' : 'load FAILED')); break;
       default:
         pageLog('[page] unknown worker cmd: ' + d.cmd);
     }
@@ -199,6 +382,24 @@
       pageLog('[page] audio init failed: ' + (err && err.message ? err.message : String(err)));
     }
   }
+
+  // Mute / Reset Audio — gamecube.html parity. Mute suspends the AudioContext
+  // (the worklet keeps draining nothing; the ring just backs up harmlessly);
+  // Reset Audio tears the context down and rebuilds it (stuck/glitched output).
+  let muted = false;
+  $('btnMute').addEventListener('click', async () => {
+    if (!audioContext) return;
+    muted = !muted;
+    try { if (muted) await audioContext.suspend(); else await audioContext.resume(); } catch (_) {}
+    $('btnMute').textContent = muted ? '🔇 Unmute' : '🔊 Mute';
+  });
+  $('btnResetAudio').addEventListener('click', async () => {
+    try { if (audioContext) await audioContext.close(); } catch (_) {}
+    audioContext = null; muted = false;
+    $('btnMute').textContent = '🔊 Mute';
+    await initAudio();
+    pageLog('[page] audio context reset');
+  });
 
   // ---------------------------------------------------------------------------
   // Disc fetcher. Streams files (and chunked .partXX sets) from the project,
@@ -264,11 +465,20 @@
         worker.postMessage({ cmd: 'discReady', cuePath: '/discs/' + game.cue });
       });
       if (!ok) throw new Error('disc load returned 0');
-      // 4. Audio + frame loop.
+      // 4. Audio + run loop. The WORKER owns the run loop (free-run pump,
+      //    charter Phase 2.2) so guest progress is decoupled from page vsync
+      //    and survives tab backgrounding; the rAF loop below only ships input.
       await initAudio();
       booted = true;
-      [$('btnReset'), $('btnSave'), $('btnLoad')].forEach((b) => b.disabled = false);
+      [$('btnReset'), $('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull')]
+        .forEach((b) => b.disabled = false);
+      {
+        const qs = new URLSearchParams(location.search);
+        if (qs.has('nofog'))    worker.postMessage({ cmd: 'fog', on: 0 });
+        if (qs.has('nomodvol')) worker.postMessage({ cmd: 'modvol', on: 0 });
+      }
       setStatus('Running.');
+      worker.postMessage({ cmd: 'freerun', on: 1 });
       requestAnimationFrame(frameLoop);
     } catch (err) {
       pageLog('[page] start failed: ' + (err && err.message ? err.message : String(err)));
@@ -277,9 +487,95 @@
     }
   });
 
+  // ---------------------------------------------------------------------------
+  // Save/Load State. The worker serializes via emscripten_save_state (the full
+  // emulator state — SH4, RAM, VRAM, VMU contents), the page keeps the blob and
+  // persists it to IndexedDB so it survives a reload (savestates are ~27 MB, too
+  // large for localStorage). This doubles as the game-save workaround until the
+  // Maple VMU is wired.
+  // ---------------------------------------------------------------------------
+  let savedState = null;
+  const STATE_KEY = 'pso2';
+  function idbOpen() {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open('dc-savestates', 1);
+      r.onupgradeneeded = () => r.result.createObjectStore('states');
+      r.onsuccess = () => res(r.result);
+      r.onerror   = () => rej(r.error);
+    });
+  }
+  async function idbPut(key, data) {
+    const db = await idbOpen();
+    await new Promise((res, rej) => {
+      const tx = db.transaction('states', 'readwrite');
+      tx.objectStore('states').put(data, key);
+      tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+    });
+    db.close();
+  }
+  async function idbGet(key) {
+    const db = await idbOpen();
+    const v = await new Promise((res, rej) => {
+      const tx = db.transaction('states', 'readonly');
+      const rq = tx.objectStore('states').get(key);
+      rq.onsuccess = () => res(rq.result || null); rq.onerror = () => rej(rq.error);
+    });
+    db.close();
+    return v;
+  }
+  // Restore any previously-persisted state so Load State works after a reload.
+  idbGet(STATE_KEY)
+    .then((v) => { if (v) { savedState = new Uint8Array(v); pageLog('[page] found saved state ' + savedState.byteLength + ' B — Start, then Load State to restore'); } })
+    .catch(() => {});
+
   $('btnReset').addEventListener('click', () => worker.postMessage({ cmd: 'reset' }));
-  $('btnSave').addEventListener('click', () => worker.postMessage({ cmd: 'saveState' }));
-  $('btnLoad').addEventListener('click', () => pageLog('[page] loadState UI is a stub'));
+  $('btnSave').addEventListener('click', () => {
+    if (!booted) { pageLog('[page] Start the game before saving'); return; }
+    pageLog('[page] saving state…');
+    worker.postMessage({ cmd: 'saveState' });
+  });
+  // Export: download the current state as a file (falls back to the
+  // IndexedDB-persisted copy, so it works right after a reload, before
+  // Start). Pairs with Import for moving states between machines/builds
+  // and feeding the native-flycast oracle.
+  $('btnExport').addEventListener('click', async () => {
+    let bytes = savedState;
+    if (!bytes) {
+      try { const v = await idbGet(STATE_KEY); if (v) bytes = new Uint8Array(v); }
+      catch (e) { /* fall through to the empty check */ }
+    }
+    if (!bytes || !bytes.byteLength) {
+      pageLog('[page] nothing to export — click Save State first');
+      return;
+    }
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = 'dcx-pso2-state.bin';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    pageLog('[page] exported state ' + bytes.byteLength + ' B -> dcx-pso2-state.bin');
+  });
+  // Import: pick a state file; it becomes the pending state (and persists),
+  // then the existing Load State button applies it.
+  $('btnImport').addEventListener('click', () => $('importFile').click());
+  $('importFile').addEventListener('change', async (ev) => {
+    const f = ev.target.files && ev.target.files[0];
+    if (!f) return;
+    const buf = await f.arrayBuffer();
+    savedState = new Uint8Array(buf);
+    pageLog('[page] imported state ' + savedState.byteLength + ' B from ' + f.name +
+            (booted ? ' — click Load State to restore' : ' — Start, then Load State to restore'));
+    idbPut(STATE_KEY, savedState)
+      .then(() => pageLog('[page] state persisted (survives reload)'))
+      .catch((e) => pageLog('[page] persist failed: ' + e));
+    ev.target.value = '';
+  });
+  $('btnLoad').addEventListener('click', () => {
+    if (!booted) { pageLog('[page] Start the game before loading'); return; }
+    if (!savedState) { pageLog('[page] no saved state yet — click Save State first'); return; }
+    pageLog('[page] loading state ' + savedState.byteLength + ' B…');
+    worker.postMessage({ cmd: 'loadState', data: savedState });  // structured-clone copy; savedState kept
+  });
 
   // ---------------------------------------------------------------------------
   // Canvas paint — the OffscreenCanvas is now owned by the worker (transferred
@@ -292,18 +588,75 @@
   function paintTransferable(_d) {}
 
   // ---------------------------------------------------------------------------
+  // fps bar (charter Phase 2.1). fps/hw/calls come from the worker's video_cb
+  // telemetry once per second (presents/s; dupe sentinels excluded, so a
+  // stuck emu reads 0). iters/s comes from the shim's free-run pump.
+  // ---------------------------------------------------------------------------
+  let lastFps = 0, lastHw = 0, lastCalls = 0, lastIps = 0;
+  let lastClk = 0, lastPc = 0, lastIstnrm = 0, lastIstext = 0;
+  const fpsEl = $('fpsBar');
+  function guestMHz() { return (lastClk * 1024 / 1e6).toFixed(2); }
+  function paintFpsBar() {
+    if (fpsEl) {
+      fpsEl.textContent =
+        'fps: ' + lastFps + ' (hw ' + lastHw + '/s, video_cb ' + lastCalls +
+        '/s) | iters/s: ' + lastIps + ' | guest ' + guestMHz() + ' MHz' +
+        ' | pc 0x' + lastPc.toString(16);
+    }
+  }
+  // Heartbeat: RELEASE builds print nothing once boot telemetry caps out,
+  // which idle-kills probes and leaves the Log panel blind. One line / 10s.
+  setInterval(() => {
+    if (booted) {
+      pageLog('[page] heartbeat fps=' + lastFps + ' hw=' + lastHw +
+              ' video_cb=' + lastCalls + '/s iters=' + lastIps +
+              '/s clk=' + guestMHz() + 'MHz pc=0x' + lastPc.toString(16) +
+              ' istnrm=0x' + lastIstnrm.toString(16) +
+              ' istext=0x' + lastIstext.toString(16));
+    }
+  }, 2000);
+
+  // ---------------------------------------------------------------------------
   // Input. Keyboard maps to RETRO_DEVICE_ID_JOYPAD_*; gamepads passthrough.
   // ---------------------------------------------------------------------------
   const RB = { B:0, Y:1, SELECT:2, START:3, UP:4, DOWN:5, LEFT:6, RIGHT:7,
-               A:8, X:9, L:10, R:11 };
+               A:8, X:9, L:10, R:11, L2:12, R2:13 };
+  // Keyboard controls (2026-08-23, per user): WASD = D-pad, Q/E = L/R triggers,
+  // M/K/J/N = face buttons, Enter = Start, Shift = Select. In-game the Dreamcast
+  // CONFIRM is DC_A, which this libretro core maps to RETRO_B -> the 'm' key, so
+  // 'm' confirms menus and 'k' cancels. All keys are matched case-insensitively so
+  // holding Shift (Select) doesn't break the letter keys.
+  // 2026-08-27 (gameplay): ARROW KEYS = the DC ANALOG STICK (PSO walking is
+  // analog-only; all-digital input meant "unable to move"), and Q/E now press
+  // L2/R2 — the ids flycast maps the DC triggers to (10/11 were unused).
   const KEYMAP = {
-    [RB.UP]: 'ArrowUp', [RB.DOWN]: 'ArrowDown', [RB.LEFT]: 'ArrowLeft', [RB.RIGHT]: 'ArrowRight',
-    [RB.A]: 'x', [RB.B]: 'z', [RB.X]: 's', [RB.Y]: 'd',
-    [RB.START]: 'Enter', [RB.L]: 'q', [RB.R]: 'e',
+    [RB.UP]: 'w', [RB.DOWN]: 's', [RB.LEFT]: 'a', [RB.RIGHT]: 'd',
+    [RB.B]: 'm',   // DC_A  = menu CONFIRM
+    [RB.A]: 'k',   // DC_B  = menu CANCEL
+    [RB.X]: 'j',
+    [RB.Y]: 'n',
+    [RB.L2]: 'q', [RB.R2]: 'e',   // DC L/R triggers (digital full-pull)
+    [RB.START]: 'enter', [RB.SELECT]: 'shift',
   };
   const heldKeys = new Set();
-  window.addEventListener('keydown', (e) => { heldKeys.add(e.key); });
-  window.addEventListener('keyup',   (e) => { heldKeys.delete(e.key); });
+  const normKey = (e) => e.key.toLowerCase();  // 'W'->'w','Enter'->'enter','Shift'->'shift'
+  const ANALOG_KEYS = new Set(['arrowup', 'arrowdown', 'arrowleft', 'arrowright']);
+  const MAPPED  = new Set([...Object.values(KEYMAP), ...ANALOG_KEYS]);
+  window.addEventListener('keydown', (e) => { const k = normKey(e); if (MAPPED.has(k)) e.preventDefault(); heldKeys.add(k); });
+  window.addEventListener('keyup',   (e) => { heldKeys.delete(normKey(e)); });
+
+  // Per-port pad layout (bytes; input_state_cb in EmscriptenWorker.cpp reads
+  // this — keep in sync): 0..7 digital bitmap, 8..9 s16LE LX, 10..11 s16LE LY
+  // (+ = down), 12..15 right stick, 16..17 s16 L2 (0..32767), 18..19 s16 R2.
+  const putS16 = (bytes, off, v) => {
+    v = Math.max(-32767, Math.min(32767, Math.round(v))) | 0;
+    bytes[off] = v & 0xff; bytes[off + 1] = (v >> 8) & 0xff;
+  };
+  // Standard-mapping gamepad button index -> RETRO id. The old passthrough
+  // used the raw index (html B=1 -> RETRO_Y etc.) — only A landed right.
+  const GP_BTN_TO_RETRO = [RB.B, RB.A, RB.Y, RB.X, RB.L, RB.R, RB.L2, RB.R2,
+                           RB.SELECT, RB.START, /*L3*/14, /*R3*/15,
+                           RB.UP, RB.DOWN, RB.LEFT, RB.RIGHT];
 
   function packPad() {
     const bytes = new Uint8Array(256);
@@ -313,27 +666,54 @@
         bytes[(id >> 3) | 0] |= (1 << (id & 7));
       }
     }
+    // Keyboard analog stick (port 0): arrows AND WASD = full deflection
+    // (WASD also sets the d-pad bits above — menus read the d-pad, gameplay
+    // reads the stick, so driving both kills the "WASD doesn't walk" trap).
+    // Diagonals scaled to the circular gate (DC sticks report a circle).
+    {
+      let ax = ((heldKeys.has('arrowright') || heldKeys.has('d')) ? 1 : 0)
+             - ((heldKeys.has('arrowleft')  || heldKeys.has('a')) ? 1 : 0);
+      let ay = ((heldKeys.has('arrowdown')  || heldKeys.has('s')) ? 1 : 0)
+             - ((heldKeys.has('arrowup')    || heldKeys.has('w')) ? 1 : 0);
+      if (ax !== 0 || ay !== 0) {
+        const s = (ax !== 0 && ay !== 0) ? 23170 : 32767;
+        putS16(bytes, 8, ax * s);
+        putS16(bytes, 10, ay * s);
+        if (!packPad._analogLogged) {   // one-shot: proves key->analog packing
+          packPad._analogLogged = true;
+          pageLog('[input] analog engaged x=' + (ax * s) + ' y=' + (ay * s));
+        }
+      }
+    }
     const pads = (navigator.getGamepads && navigator.getGamepads()) || [];
     for (let p = 0; p < Math.min(pads.length, 4); p++) {
       const gp = pads[p]; if (!gp) continue;
       const base = p * 64;
-      for (let bi = 0; bi < (gp.buttons || []).length && bi < 16; bi++) {
-        if (gp.buttons[bi].pressed) bytes[base + (bi >> 3)] |= (1 << (bi & 7));
+      const btns = gp.buttons || [];
+      for (let bi = 0; bi < btns.length && bi < GP_BTN_TO_RETRO.length; bi++) {
+        if (btns[bi].pressed) {
+          const id = GP_BTN_TO_RETRO[bi];
+          bytes[base + (id >> 3)] |= (1 << (id & 7));
+        }
       }
+      const ax = gp.axes || [];
+      const dz = 0.08;   // raw hardware deadzone; the core applies its own too
+      const axv = (i) => (i < ax.length && Math.abs(ax[i]) > dz) ? ax[i] * 32767 : 0;
+      if (axv(0) || axv(1)) { putS16(bytes, base + 8, axv(0)); putS16(bytes, base + 10, axv(1)); }
+      if (axv(2) || axv(3)) { putS16(bytes, base + 12, axv(2)); putS16(bytes, base + 14, axv(3)); }
+      // Analog triggers (standard mapping: buttons 6/7 carry a 0..1 value).
+      if (btns[6] && btns[6].value > 0) putS16(bytes, base + 16, btns[6].value * 32767);
+      if (btns[7] && btns[7].value > 0) putS16(bytes, base + 18, btns[7].value * 32767);
     }
     return bytes;
   }
 
-  let _frameTick = 0;
+  // Input-only rAF loop — emulation is paced by the worker's free-run pump,
+  // not by this loop (rAF throttles to zero in background tabs).
   function frameLoop() {
     if (booted) {
-      _frameTick++;
-      if (_frameTick < 5 || _frameTick % 600 === 0) {
-        pageLog('[page] frameLoop tick=' + _frameTick);
-      }
       const pad = packPad();
       worker.postMessage({ cmd: 'input', states: pad }, [pad.buffer]);
-      worker.postMessage({ cmd: 'runFrame' });
     }
     requestAnimationFrame(frameLoop);
   }
