@@ -143,7 +143,12 @@ void C_MTXPerspective(Mtx44 m, f32 fovY, f32 aspect, f32 n, f32 f){
   f32 cot=1.0f/tanf((f32)(fovY*0.5*M_PI/180.0));
   m[0][0]=cot/aspect;m[0][1]=0;m[0][2]=0;m[0][3]=0;
   m[1][0]=0;m[1][1]=cot;m[1][2]=0;m[1][3]=0;
-  m[2][0]=0;m[2][1]=0;m[2][2]=f/(n-f);m[2][3]=(f*n)/(n-f);
+  /* GC XF convention (dolsdk2001 mtx44.c:61): A = -n/(f-n), NOT the D3D-style
+     -f/(f-n). The D3D A is exactly A_gc - 1.0, which pushed every perspective
+     vertex's clip z outside [-w,0] -> o.pos.z<0 after Dolphin's reverse-Z remap
+     -> ALL 3D-world draws rasterized ZERO fragments (2026-08-26 wgpuCap probe:
+     board+title persp draws frag=0 while B matched, A off by exactly -1). */
+  m[2][0]=0;m[2][1]=0;m[2][2]=n/(n-f);m[2][3]=(f*n)/(n-f);
   m[3][0]=0;m[3][1]=0;m[3][2]=-1.0f;m[3][3]=0;
 }
 void C_MTXFrustum(Mtx44 m, f32 t, f32 b, f32 l, f32 r, f32 n, f32 f){

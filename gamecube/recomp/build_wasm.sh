@@ -8,6 +8,12 @@
 #
 # Env: DECOMP (decomp root), BUILD (staging dir). Not the emulator build — this is
 # the recomp toolchain, so the canonical dolphin build-flow gate does not apply.
+#
+# CANONICAL FULL-BOOT BUILD (what gamecube/recomp/mp4_game.{js,wasm} is built from —
+# a bare invocation omits the AOT overlays and the live path WEDGES at the first
+# overlay switch, ~f1033 after Start; cost a debug detour 2026-08-26):
+#   RECOMP_MODESEL=1 RECOMP_MENT=1 RECOMP_W01=1 bash gamecube/recomp/build_wasm.sh
+# (bootDll is on by default; RECOMP_*DIAG vars are temporary diagnostics, keep OFF.)
 set -u
 DECOMP="${DECOMP:-$HOME/gc_refs/marioparty4}"
 RECOMP="$(cd "$(dirname "$0")" && pwd)"
