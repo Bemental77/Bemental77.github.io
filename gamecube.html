@@ -3860,9 +3860,11 @@
     requestAnimationFrame(grantLoop);
   }
 
+  var hudStatus = '';   // transient state (taking over / failed) shown until frames flow
   setInterval(function () {
     var d = framesSeen - lastN, dr = rendered - lastRendered;
     lastN = framesSeen; lastRendered = rendered;
+    if (framesSeen === 0 && hudStatus) { hud(hudStatus); return; }
     hud('recomp f' + framesSeen + ' ' + d + ' game-fps / ' + dr + ' render-fps' + (TARGET === 0 ? ' (uncapped)' : ' / target ' + TARGET));
   }, 1000);
 
@@ -3934,12 +3936,34 @@
     requestAnimationFrame(grantLoop);
   }
 
-  // arm after the JIT boot has the renderer up
+  // Arm after the JIT boot has the renderer up. The old flow waited a blind BOOT_MS (50s)
+  // during which the page shows the JIT path — 12-38fps with its known rendering gaps —
+  // which reads as "the product is broken" (user report 2026-08-27). Take over as soon as
+  // the renderer's FIRST FRAME lands (+ margin for the backend to settle); BOOT_MS stays
+  // as the fallback ceiling for ?bootms= tuning. Failures now surface in the HUD and retry
+  // — the old flow's only failure signal was a console.log, so a failed disc-part fetch
+  // left the JIT playing forever with the HUD parked at "recomp f0".
+  var armed = false, tries = 0;
+  function tryStart(why) {
+    if (armed) return;
+    armed = true;
+    console.log('[recomp-live] taking over (' + why + ')');
+    hudStatus = 'recomp: taking over (loading disc)...';
+    startRecomp().catch(function (e) {
+      console.log('[recomp-live] failed: ' + e);
+      hudStatus = 'recomp FAILED: ' + String(e).slice(0, 80) + (tries < 3 ? ' — retrying' : '');
+      if (tries++ < 3) { armed = false; setTimeout(function () { tryStart('retry ' + tries); }, 5000); }
+    });
+  }
+  var armT0 = Date.now();
   var armTimer = setInterval(function () {
-    if (typeof dolphin_worker !== 'undefined' && dolphin_worker) {
-      clearInterval(armTimer);
-      console.log('[recomp-live] waiting ' + BOOT_MS + 'ms for renderer init, then taking over');
-      setTimeout(function () { startRecomp().catch(function (e) { console.log('[recomp-live] failed: ' + e); }); }, BOOT_MS);
+    if (typeof dolphin_worker === 'undefined' || !dolphin_worker) return;
+    var up = Date.now() - armT0;
+    if (window._firstFrame && !window._recompFirstFrameAt) window._recompFirstFrameAt = Date.now();
+    if (window._recompFirstFrameAt && Date.now() - window._recompFirstFrameAt >= 10000) {
+      clearInterval(armTimer); tryStart('renderer up ' + ((Date.now() - window._recompFirstFrameAt) / 1000 | 0) + 's');
+    } else if (up >= BOOT_MS) {
+      clearInterval(armTimer); tryStart('bootms ceiling');
     }
   }, 500);
 })();
