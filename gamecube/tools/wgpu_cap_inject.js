@@ -73,6 +73,9 @@
           label: d.label || '',
           vsm: d.vertex && d.vertex.module ? idOf(d.vertex.module, 's') : null,
           fsm: d.fragment && d.fragment.module ? idOf(d.fragment.module, 's') : null,
+          vbl: ((d.vertex && d.vertex.buffers) || []).map(function (b) {
+            return b ? { stride: b.arrayStride,
+                         attrs: (b.attributes || []).map(function (at) { return [at.shaderLocation, at.format, at.offset]; }) } : null; }),
           topo: d.primitive && d.primitive.topology, cull: d.primitive && d.primitive.cullMode,
           ff: d.primitive && d.primitive.frontFace,
           ds: d.depthStencil ? { fmt: d.depthStencil.format, cmp: d.depthStencil.depthCompare,
@@ -97,6 +100,20 @@
       } catch (e) {}
       return g;
     };
+    var _writeTexture = GPUQueue.prototype.writeTexture;
+    GPUQueue.prototype.writeTexture = function (dst, data, layout, size) {
+      try {
+        var tid = dst && dst.texture ? idOf(dst.texture, 't') : null;
+        if (tid) {
+          var ti = texInfo[tid] || (texInfo[tid] = {});
+          ti.upN = (ti.upN || 0) + 1; ti.upSeq = ++seq;
+          var u8v = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+          var hx = ''; for (var i = 0; i < Math.min(64, u8v.length); i++) hx += ('0' + u8v[i].toString(16)).slice(-2);
+          ti.upBytes = u8v.byteLength; ti.upHead = hx;
+        }
+      } catch (e) {}
+      return _writeTexture.apply(this, arguments);
+    };
     var _writeBuffer = GPUQueue.prototype.writeBuffer;
     GPUQueue.prototype.writeBuffer = function (buf, off, data, dataOff, size) {
       try {
@@ -108,8 +125,8 @@
         var srcOff = dataOff !== undefined ? dataOff * elem : 0;
         var len = size !== undefined ? size * elem : u8v.byteLength - srcOff;
         var e = { off: off >>> 0, size: len >>> 0, seq: ++seq };
-        if (len <= 8192) e.bytes = u8v.slice(srcOff, srcOff + len);
-        ring.push(e); if (ring.length > 256) ring.shift();
+        if (len <= 32768) e.bytes = u8v.slice(srcOff, srcOff + len);
+        ring.push(e); if (ring.length > 96) ring.shift();
       } catch (err) {}
       return _writeBuffer.apply(this, arguments);
     };
@@ -166,7 +183,7 @@
     });
     wrapPE('setVertexBuffer', function (pe, a) { var s = passState.get(pe); if (s) s.vb[a[0]] = { buf: idOf(a[1], 'b'), off: a[2] || 0 }; });
     wrapPE('setIndexBuffer', function (pe, a) { var s = passState.get(pe); if (s) s.ib = { buf: idOf(a[0], 'b'), fmt: a[1], off: a[2] || 0 }; });
-    function uniSnap(s) {
+    function uniSnap(s, rich) {
       var out = {};
       function decode(w) {
         var d = new DataView(w.bytes.buffer, w.bytes.byteOffset, w.bytes.byteLength);
@@ -178,6 +195,13 @@
           for (i = 0; i < 16; i++) vs.proj.push(rf(d.getFloat32(128 + 4 * i, true)));
           for (i = 0; i < 4; i++) vs.cpc.push(rf(d.getFloat32(3840 + 4 * i, true)));   // pixelcentercorrection
           for (i = 0; i < 2; i++) vs.vpc.push(rf(d.getFloat32(3856 + 4 * i, true)));   // viewport .xy
+          if (rich) {   // texgen forensics: full texmatrices + posttransform + materials + uber texgen config
+            vs.texm = []; vs.ptm = []; vs.mat = []; vs.xfp = [];
+            for (i = 0; i < 96; i++) vs.texm.push(rf(d.getFloat32(896 + 4 * i, true)));    // texmatrices[24]
+            for (i = 0; i < 64; i++) vs.ptm.push(rf(d.getFloat32(2816 + 4 * i, true)));    // posttransformmatrices[0..15]
+            for (i = 0; i < 16; i++) vs.mat.push(d.getInt32(192 + 4 * i, true));           // materials[4] int4
+            for (i = 0; i < 32; i++) vs.xfp.push(d.getUint32(3872 + 4 * i, true));         // xfmem_pack1[8] (.x texMtxInfo .y postMtxInfo)
+          }
           out.vs = vs;
         } else if (w.size >= 1500 && w.size <= 1600 && !out.ps) {  // PixelShaderConstants
           var ps = { sz: w.size, seq: w.seq, m: w.m,
@@ -186,6 +210,12 @@
           for (var j = 0; j < 32; j++) ps.cols.push(d.getInt32(4 * j, true));   // colors[4]+kcolors[4] int4s
           for (j = 0; j < 10; j++) ps.ctl.push(d.getUint32(552 + 4 * j, true));
           for (j = 0; j < 9; j++) ps.blend.push(d.getUint32(1488 + 4 * j, true));
+          if (rich) {   // uber TEV program: pack1[16] (.xy combiners .z tevind .w iref) + pack2[8] (.x tevorder .y tevksel)
+            ps.pack1 = []; ps.pack2 = []; ps.konst = [];
+            for (j = 0; j < 64; j++) ps.pack1.push(d.getUint32(592 + 4 * j, true));
+            for (j = 0; j < 32; j++) ps.pack2.push(d.getUint32(848 + 4 * j, true));
+            for (j = 0; j < 16; j++) ps.konst.push(d.getInt32(976 + 4 * j, true));   // konst[0..3]
+          }
           out.ps = ps;
         }
       }
@@ -238,11 +268,39 @@
       var s = passState.get(pe) || { bgs: [], vb: [] };
       var pass = cap.passes[cap.passes.length - 1];
       if (pass) pass.draws++;
+      var texs = texListOf(s);
+      var font = texs.some(function (t) { return t.indexOf(':320x312:') >= 0; });
       var rec = { n: cap.draws.length, pass: cap.passes.length - 1, k: kind,
         args: Array.prototype.slice.call(a, 0, 5),
         pipe: s.pipe, vp: s.vp, sc: s.sc,
         bgs: s.bgs.map(function (b) { return b ? { g: b.g, dyn: b.dyn } : null; }),
-        ib: s.ib, vb: s.vb, tex: texListOf(s), uni: uniSnap(s) };
+        ib: s.ib, vb: s.vb, tex: texs, font: font ? 1 : undefined, uni: uniSnap(s, font) };
+      if (font) {
+        // raw vertex bytes for the glyph quads: locate the stream-buffer write covering
+        // baseVertex*stride and dump up to 96 verts (base64), so S/T decode offline.
+        try {
+          var pi = s.pipe && pipeInfo[s.pipe];
+          var stride = pi && pi.vbl && pi.vbl[0] ? pi.vbl[0].stride : 0;
+          var vb0 = s.vb && s.vb[0];
+          var baseVertex = kind === 'di' ? (a[3] || 0) : (a[2] || 0);
+          if (stride && vb0) {
+            var target = (vb0.off || 0) + baseVertex * stride;
+            var ringv = bufWrites[vb0.buf] || [];
+            for (var rv = ringv.length - 1; rv >= 0; rv--) {
+              var wv = ringv[rv];
+              if (!wv.bytes || target < wv.off || target >= wv.off + wv.size) continue;
+              var rel = target - wv.off;
+              var nb = Math.min(96 * stride, wv.size - rel);
+              var bin = '', sl = wv.bytes.subarray(rel, rel + nb);
+              for (var bi = 0; bi < sl.length; bi++) bin += String.fromCharCode(sl[bi]);
+              rec.vbytes = btoa(bin); rec.vstride = stride; rec.vwoff = wv.off; rec.vseq = wv.seq;
+              break;
+            }
+            if (!rec.vbytes) rec.vmiss = { target: target, stride: stride,
+              ring: ringv.slice(-6).map(function (w2) { return [w2.off, w2.size, w2.bytes ? 1 : 0]; }) };
+          }
+        } catch (e) {}
+      }
       cap.draws.push(rec);
       return rec;
     }
@@ -289,6 +347,10 @@
       // shader sources: fragment shaders of pipelines used by PERSP-ish draws first, cap 12 modules
       var shOut = {}, shN = 0;
       function wantShader(sid) { if (sid && shN < 12 && !shOut[sid] && shaders[sid]) { shOut[sid] = shaders[sid]; shN++; } }
+      c.draws.forEach(function (dd) {
+        var p = dd.pipe && pipeInfo[dd.pipe];
+        if (p && dd.font) { wantShader(p.vsm); wantShader(p.fsm); }
+      });
       c.draws.forEach(function (dd) {
         var p = dd.pipe && pipeInfo[dd.pipe];
         if (p && dd.uni && dd.uni.vs && Math.abs(dd.uni.vs.proj[14] + 1) < 1e-3) { wantShader(p.fsm); wantShader(p.vsm); }

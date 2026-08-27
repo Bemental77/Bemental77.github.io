@@ -42,3 +42,8 @@ void __recomp_ar_dma(unsigned type, unsigned mainmem_addr, unsigned aram_addr, u
         __recomp_dirty_note(mram, length);
     }
 }
+
+/* Diagnostic: expose the emulated-ARAM buffer's wasm address so probes can test whether a
+ * game pointer (e.g. a texture base that reached the GX FIFO) aliases INTO __recomp_aram —
+ * the "anim consumed straight out of ARAM" class (board font barcode forensics 2026-08-27). */
+void *__recomp_aram_base(void) { return __recomp_aram; }

@@ -78,6 +78,9 @@ const armed = await page.evaluate(async (pauseCpu) => {
     fetch('/__fix_regions').then((r) => r.json()),
   ]);
   if (typeof dolphin_worker === 'undefined' || !dolphin_worker) return 'NO dolphin_worker handle';
+  // stop the JIT guest for real — the ppc-worker thread keeps running (and writing guest RAM)
+  // after recomp_pause_cpu; it stomped the injected image every frame (board-font 01FE stomp).
+  if (window.ppc_worker) { try { window.ppc_worker.terminate(); } catch (e) {} window.ppc_worker = null; }
   dolphin_worker.postMessage({ cmd: 'recompFix', fifo, mem1, regions, pauseCpu, skipDL: location.hash.includes('skipdl'), pumps: 100000 }, [fifo, mem1]);
   return 'posted fifo=' + fifo.byteLength + ' mem1=' + mem1.byteLength + ' arrays=' + regions.arrays.length;
 }, PAUSE_CPU);

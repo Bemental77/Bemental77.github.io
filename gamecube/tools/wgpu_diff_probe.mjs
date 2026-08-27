@@ -92,16 +92,29 @@ const armed = await page.evaluate(async (pauseCpu) => {
     fetch('/__fix_regions').then((r) => r.json()),
   ]);
   if (typeof dolphin_worker === 'undefined' || !dolphin_worker) return 'NO dolphin_worker handle';
+  // stop the JIT guest for real — the ppc-worker thread keeps running (and writing guest RAM)
+  // after recomp_pause_cpu; it stomped the injected image every frame (board-font 01FE stomp).
+  if (window.ppc_worker) { try { window.ppc_worker.terminate(); } catch (e) {} window.ppc_worker = null; }
   dolphin_worker.postMessage({ cmd: 'recompFix', fifo, mem1, regions, pauseCpu, pumps: 100000 }, [fifo, mem1]);
   return 'posted fifo=' + fifo.byteLength + ' mem1=' + mem1.byteLength + ' arrays=' + regions.arrays.length;
 }, true);
 console.log('[diff] inject:', armed);
 await new Promise((r) => setTimeout(r, POST_MS));
+// PEEKADDR=hex[,hex...]: print guest bytes post-injection (stomp forensics)
+if (process.env.PEEKADDR) {
+  await page.evaluate((addrs) => {
+    dolphin_worker.onmessage = (function (orig) { return function (e) {
+      if (e.data && e.data.cmd === 'recompPeek') { console.log('recompPeek 0x' + e.data.addr.toString(16) + ': ' + e.data.hex); return; }
+      if (orig) orig(e); }; })(dolphin_worker.onmessage);
+    for (const a of addrs) dolphin_worker.postMessage({ cmd: 'recompPeek', addr: a, len: 32 });
+  }, process.env.PEEKADDR.split(',').map((s) => parseInt(s, 16)));
+  await new Promise((r) => setTimeout(r, 1500));
+}
 await page.screenshot({ path: `/tmp/wgpu_cap_${TAG}.png` });
 console.log(`[diff] screenshot -> /tmp/wgpu_cap_${TAG}.png`);
 
 console.log('[diff] arming wgpuCap tag=' + TAG);
-await page.evaluate((tag) => dolphin_worker.postMessage({ cmd: 'wgpuCap', tag, submits: 2 }), TAG);
+await page.evaluate((tag, submits) => dolphin_worker.postMessage({ cmd: 'wgpuCap', tag, submits }), TAG, parseInt(process.env.SUBMITS || '2', 10));
 const t0 = Date.now();
 while (!endSeen && Date.now() - t0 < 60000) await new Promise((r) => setTimeout(r, 250));
 // chunks arrive via console events; give the tail a moment

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>GameCube Wasm — Sonic Adventure 2 Battle</title>
+  <title>GameCube Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <link rel="icon" href="data:,">
   <script src="/coi-serviceworker.js"></script>
@@ -3878,6 +3878,17 @@
     var fst = await fetch('/gamecube/recomp/mp4_fst_trimmed.bin').then(function (r) { return r.arrayBuffer(); });
     console.log('[recomp-live] parts loaded (' + parts.reduce(function (a, b) { return a + b.byteLength; }, 0) + 'B); taking over');
     dolphin_worker.postMessage({ cmd: 'recompStart' });
+    // [recomp-live 2026-08-27] STOP the JIT guest for real. recomp_pause_cpu only breaks the
+    // dolphin-side CPU manager — the JIT loop lives in the ppc-worker THREAD and kept executing
+    // the title-screen game against the SHARED guest RAM after takeover, continuously stomping
+    // recomp memory (proven: the board font at 0x8025c220 read 01FE01FE... = the JIT game's own
+    // buffer at that address — the "barcode text"; clean the instant the worker is terminated).
+    // recomp mode never returns to the JIT, so terminate() is the honest stop.
+    if (window.ppc_worker) {
+      try { window.ppc_worker.terminate(); } catch (e) {}
+      window.ppc_worker = null; ppc_worker = null; window._bdLoopRunning = false;
+      console.log('[recomp-live] ppc_worker terminated (JIT guest stopped)');
+    }
     rw = new Worker('/gamecube/recomp/recomp_worker.js?v=' + Date.now());
     var origOnWorkerMsg = dolphin_worker.onmessage;
     dolphin_worker.onmessage = function (e) {

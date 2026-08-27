@@ -183,38 +183,25 @@ function recompFixApply() {
       }
     }
   }
-  // Presentation: our stream's EFB->XFB copy targets the RECOMP's framebuffer address, but
-  // VI scans out the JIT game's XFB. Read the live XFB base from the VI TFBL MMIO register
-  // (0xCC00201C; FBB field = phys>>5 with the page-offset convention) and patch every BP
-  // 0x4B (EFB copy dest) write in our stream to it, so our copies land where VI is looking.
+  // Presentation: present the RECOMP's OWN display-copy destination. The old approach —
+  // retargeting every display-copy BP 0x4B to the JIT game's VI XFB (TFBL) — made the 614KB
+  // XFB write land at the JIT-era address INSIDE the recomp guest's live heap: at the board
+  // it overwrote 0x1e6c00..0x27cc00 every pump, right across the window font at 0x25c220
+  // ("barcode text" = the font sheet re-decoded from XFB YUV bytes; proven 2026-08-27 by
+  // recompPeek 01FE01FE at 0x25c220 + the empty-fifo control run staying clean).
+  // recomp_present(xfb_addr) presents an explicit address, so no retarget is needed: the
+  // final 0x4B in the stream is the display copy (GXCopyDisp at frame end) — its dest is the
+  // recomp game's own XFB allocation, safe by the game's own memory layout.
   var fifoBytes = new Uint8Array(__recompFix.fifo);
-  var tfbl = 0;
-  try { tfbl = Module._dolphin_read32(0xCC00201C) >>> 0; } catch (e) {}
-  // UVIFBInfoRegister: FBB bits 0-23, POFF bit 28. addr = POFF ? FBB<<5 : FBB (byte address).
-  var xfbAddrBytes = tfbl & 0x00FFFFFF;
-  if (tfbl & 0x10000000) xfbAddrBytes = (xfbAddrBytes << 5) >>> 0;
-  var bp4B = (xfbAddrBytes >>> 5) & 0x00FFFFFF;   // BP 0x4B copy-dest holds addr>>5
-  // Patch ONLY the DISPLAY copy's destination — the frame also contains EFB->texture copies
-  // (menu blur) whose 0x4B dests must stay put. The final 0x4B write in the stream is the
-  // display copy (GXCopyDisp at frame end); retarget every 0x4B carrying that same value.
-  var patched = 0;
-  if (xfbAddrBytes) {
-    var sites = [];
+  var xfbAddrBytes = 0, patched = 0;
+  {
+    var lastVal = 0;
     for (var pi = 0; pi + 4 < fifoBytes.length; pi++)
       if (fifoBytes[pi] === 0x61 && fifoBytes[pi + 1] === 0x4B)
-        sites.push({ at: pi, val: (fifoBytes[pi + 2] << 16) | (fifoBytes[pi + 3] << 8) | fifoBytes[pi + 4] });
-    if (sites.length) {
-      var dispVal = sites[sites.length - 1].val;
-      for (var si = 0; si < sites.length; si++) {
-        if (sites[si].val !== dispVal) continue;
-        var at = sites[si].at;
-        fifoBytes[at + 2] = (bp4B >>> 16) & 0xff;
-        fifoBytes[at + 3] = (bp4B >>> 8) & 0xff;
-        fifoBytes[at + 4] = bp4B & 0xff;
-        patched++;
-      }
-    }
+        lastVal = (fifoBytes[pi + 2] << 16) | (fifoBytes[pi + 3] << 8) | fifoBytes[pi + 4];
+    xfbAddrBytes = (lastVal << 5) >>> 0;
   }
+  var tfbl = 0, bp4B = (xfbAddrBytes >>> 5) & 0x00FFFFFF;
   // skipDL bisect: NOP out CALL_DL commands (9 bytes each) so only the self-contained
   // top-level (2D sprite/window) layer renders.
   var nopped = 0;
@@ -766,20 +753,16 @@ self.onmessage = function (e) {
       }
       if (e.data.skipRender) { __recompT.skip++; break; }   // backlogged: state applied, draw skipped
       var fb2 = new Uint8Array(e.data.fifo);
-      // retarget the display copy (last 0x4B value) to the live scanout XFB
-      if (__recompLiveXfb) {
-        var sites2 = [];
+      // Present the recomp's OWN display-copy dest (last 0x4B value in the stream). The old
+      // retarget-to-JIT-XFB made the 614KB XFB write land inside the recomp guest's live heap
+      // (at the board: 0x1e6c00..0x27cc00, overwriting the window font at 0x25c220 every frame
+      // = the "barcode text"). recomp_present takes an explicit address — no retarget needed.
+      {
+        var lv2 = 0;
         for (var p2 = 0; p2 + 4 < fb2.length; p2++)
           if (fb2[p2] === 0x61 && fb2[p2 + 1] === 0x4B)
-            sites2.push({ at: p2, val: (fb2[p2 + 2] << 16) | (fb2[p2 + 3] << 8) | fb2[p2 + 4] });
-        if (sites2.length) {
-          var dv2 = sites2[sites2.length - 1].val, b4 = (__recompLiveXfb >>> 5) & 0xFFFFFF;
-          for (var s2 = 0; s2 < sites2.length; s2++) {
-            if (sites2[s2].val !== dv2) continue;
-            var a3 = sites2[s2].at;
-            fb2[a3 + 2] = (b4 >>> 16) & 0xff; fb2[a3 + 3] = (b4 >>> 8) & 0xff; fb2[a3 + 4] = b4 & 0xff;
-          }
-        }
+            lv2 = (fb2[p2 + 2] << 16) | (fb2[p2 + 3] << 8) | fb2[p2 + 4];
+        if (lv2) __recompLiveXfb = (lv2 << 5) >>> 0;
       }
       if (!__recompLivePtr || __recompLiveCap < fb2.length) {
         if (__recompLivePtr) Module._free(__recompLivePtr);

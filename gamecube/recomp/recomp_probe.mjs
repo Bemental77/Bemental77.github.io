@@ -181,6 +181,10 @@ function makeStub(n) {
         return 0;
       }
       case 'PPCHalt': throw { __halt: true };
+      case '__recomp_aramanim_note':   // aramanim diag: anim tree swapped INSIDE the emulated-ARAM buffer
+        console.log(`[aramanim f${viRetrace}] tree=0x${(a[0] >>> 0).toString(16)} (aram+0x${((a[0] - a[1]) >>> 0).toString(16)})\n` +
+                    new Error().stack.split('\n').filter(l => l.includes('wasm')).slice(0, 12).join('\n'));
+        return 0;
       case '__recomp_alloc_trap':   // RECOMP_ALLOCDIAG build: print the failing alloc's wasm caller chain
         console.log(`[alloc-err f${viRetrace}] size=0x${(a[0] >>> 0).toString(16)}\n` +
                     new Error().stack.split('\n').filter(l => l.includes('wasm')).slice(0, 12).join('\n'));
@@ -232,20 +236,27 @@ function makeStub(n) {
         // /tmp/font_sheet.bin for offline texture decode (glyph-barcode forensics).
         if (DUMPANIM && viRetrace === DUMPANIM) {
           const n = Module.___recomp_get_anim_count ? Module.___recomp_get_anim_count() : 0;
-          console.log(`[dumpanim f${viRetrace}] ${n} swapped AnimData trees`);
+          const aramB = Module.___recomp_aram_base ? (Module.___recomp_aram_base() >>> 0) : 0;
+          console.log(`[dumpanim f${viRetrace}] ${n} swapped AnimData trees | __recomp_aram=[0x${aramB.toString(16)},0x${(aramB + 0x1000000).toString(16)})`);
+          const memLen = mem().buffer.byteLength;
           for (let ai = 0; ai < n; ai++) {
             const ad = Module.___recomp_get_anim_at(ai) >>> 0;
             const d2 = dv();
+            // registry keeps every tree ever swapped; freed entries get reused/zeroed —
+            // range-guard all derived reads so one corpse can't kill the walk.
+            if (ad < 0x80000000 || ad + 0x20 > memLen) { console.log(`  anim#${ai} @0x${ad.toString(16)} (out-of-window — freed/masked)`); continue; }
             const bmpNum = d2.getInt16(ad + 4, true), bmpOfs = d2.getUint32(ad + 0x10, true);
             const bmpP = bmpOfs < 0x14 || bmpOfs >= 0x01000000 ? bmpOfs : ad + bmpOfs;  // relocated ptr vs offset
+            if (bmpP < 0x80000000 || bmpP + 0x14 > memLen) { console.log(`  anim#${ai} @0x${(ad - 0x80000000 >>> 0).toString(16)} bmpP=0x${(bmpP >>> 0).toString(16)} (bmp out-of-window)`); continue; }
             const pixSize = d2.getUint8(bmpP), fmt = d2.getUint8(bmpP + 1);
             const palNum = d2.getInt16(bmpP + 2, true), w = d2.getInt16(bmpP + 4, true), h = d2.getInt16(bmpP + 6, true);
             const dataSize = d2.getUint32(bmpP + 8, true);
             let dataP = d2.getUint32(bmpP + 0x10, true); if (dataP < 0x01000000) dataP = ad + dataP;
-            console.log(`  anim#${ai} @0x${(ad - 0x80000000 >>> 0).toString(16)} bmpNum=${bmpNum} bmp0: fmt=${fmt} pix=${pixSize} pal=${palNum} ${w}x${h} dataSize=${dataSize}`);
-            if (w === 320) {
+            console.log(`  anim#${ai} @0x${(ad - 0x80000000 >>> 0).toString(16)} bmpNum=${bmpNum} bmp0: fmt=${fmt} pix=${pixSize} pal=${palNum} ${w}x${h} dataSize=${dataSize}` +
+                        (w > 0 && w <= 1024 && h > 0 && h <= 1024 ? ` dataP=0x${(dataP >>> 0).toString(16)}` : ''));
+            if (w === 320 && dataP >= 0x80000000 && dataP + dataSize <= memLen && dataSize > 0 && dataSize < 0x100000) {
               fs.writeFileSync('/tmp/font_sheet.bin', Buffer.from(mem().buffer.slice(dataP, dataP + dataSize)));
-              console.log(`  -> font sheet dumped: /tmp/font_sheet.bin (${dataSize}B, fmt=${fmt})`);
+              console.log(`  -> font sheet dumped: /tmp/font_sheet.bin (${dataSize}B, fmt=${fmt}, dataP=0x${(dataP >>> 0).toString(16)})`);
             }
           }
         }

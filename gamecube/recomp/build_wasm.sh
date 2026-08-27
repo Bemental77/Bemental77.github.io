@@ -165,6 +165,11 @@ perl -0pi -e 's/count = dir_data\[0\];/count = (s32)__builtin_bswap32((u32)dir_d
               s/size = \(dir_data\[1\] - count \+ 0x3F\)/size = ((s32)__builtin_bswap32((u32)dir_data[1]) - count + 0x3F)/;
               s/dst = HuMemDirectMallocNum\(heap, \(dir_data\[0\] \+ 1\) & ~1, num\);/dst = HuMemDirectMallocNum(heap, ((s32)__builtin_bswap32((u32)dir_data[0]) + 1) & ~1, num);/;
               s/HuDecodeData\(&dir_data\[2\], dst, dir_data\[0\], dir_data\[1\]\);/HuDecodeData(\&dir_data[2], dst, (s32)__builtin_bswap32((u32)dir_data[0]), (s32)__builtin_bswap32((u32)dir_data[1]));/;' "$BUILD/src/game/armem.c" 2>/dev/null || true
+#     [DIAG, gated] FONTDIAG: print every 320-wide HuSprTexLoad (anim/bmp/data ptrs) — the
+#     board-font barcode forensics (FIFO SETIMAGE base diverges from the only header in RAM).
+if [ -n "${RECOMP_FONTDIAG:-}" ]; then
+perl -0pi -e 's/(short sizeY = bmp_ptr->sizeY;)/$1\n    { extern void OSReport(const char*, ...); if (bmp_ptr->sizeX == 320) OSReport("FONTTEX anim=%08x bmpp=%08x data=%08x palp=%08x fmt=%d szY=%d\\n", (u32)anim, (u32)bmp_ptr, (u32)bmp_ptr->data, (u32)bmp_ptr->palData, bmp_ptr->dataFmt, sizeY); }/' "$BUILD/src/game/sprput.c" 2>/dev/null || true
+fi
 #     [HSF model endianness] LoadHSF (hsfload.c) interprets a big-endian .hsf 3D-model file (title
 #     screen, board, characters) with native LE loads -> garbage counts/offsets -> OOB. Swap the
 #     whole file BE->LE once at LoadHSF entry, before FileLoad reads the header. Covers all 21 HSF
@@ -643,7 +648,7 @@ if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.js" \
      -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=33554432 \
      -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=32768 ${RECOMP_PROFILING_FUNCS:+--profiling-funcs} \
      -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web,worker -sINVOKE_RUN=0 \
-     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm \
+     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm,___recomp_aram_base \
      -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAP32,HEAPU32,wasmMemory,wasmExports \
      -Wl,--no-entry -Wl,--no-gc-sections -Wl,--allow-undefined -Wl,--allow-multiple-definition -O2 2>"$BUILD/link.txt"; then
   echo "[recomp] LINKED: $BUILD/mp4_game.js + $BUILD/mp4_game.wasm ($(stat -f%z "$BUILD/mp4_game.wasm" 2>/dev/null) bytes)"

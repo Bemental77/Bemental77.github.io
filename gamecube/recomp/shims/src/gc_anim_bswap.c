@@ -28,7 +28,7 @@ void *__recomp_bg_animtree_ptr = 0;
 static unsigned __recomp_bg_area = 0;
 void *__recomp_get_bg_animtree(void) { return __recomp_bg_animtree_ptr; }
 // Record EVERY swapped sprite AnimData so the harness can extract each and composite a full title.
-#define RECOMP_ANIM_MAX 64
+#define RECOMP_ANIM_MAX 512
 void *__recomp_anim_list[RECOMP_ANIM_MAX];
 int __recomp_anim_count = 0;
 void *__recomp_get_anim_at(int i) { return (i >= 0 && i < __recomp_anim_count) ? __recomp_anim_list[i] : 0; }
