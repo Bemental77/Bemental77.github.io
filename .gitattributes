@@ -74,3 +74,8 @@ dreamcast/discs/pso2/*.cue filter= diff= merge= -text
 # recomp FST (mp4_fst.bin) for recomp_live.html — un-LFS like the recomp *.wasm (Pages can't serve
 # LFS pointers + LFS budget exceeded). Ship as a real blob.
 gamecube/recomp/*.bin filter= diff= merge= -text
+# 2026-08-27 dreamcast SHIPS: the Track3 parts were the last LFS objects, and
+# GitHub Pages served their 133-byte pointers -> the page assembled a 1.6KB
+# Track3, the disc was garbage, and the game crashed on run_iter #1 (the
+# "pump stopped sh4_pc=0xa0000002" break). Same fix as PS1/N64/GC: real blobs.
+dreamcast/discs/pso2/*.bin.parta* filter= diff= merge= -text
