@@ -294,7 +294,8 @@ fi
 #     garbled cliff/waterfall = a 14x1024-RGBA8 bind at masked 0x173cbd20) — the probe stub
 #     prints the wasm caller chain, naming the code path that built the junk GXTexObj.
 if [ -n "${RECOMP_TEXDIAG:-}" ]; then
-  perl -0pi -e 's/(    __GXTexObjInt \*t = \(__GXTexObjInt \*\)obj;\n\n    ASSERTMSGLINE\(0x235, obj, "Texture Object Pointer is null"\);)/$1\n    { extern void __recomp_texobj_trap(unsigned, unsigned, unsigned); unsigned __ip = (unsigned)image_ptr \& 0x3FFFFFFFu; if (__ip >= 0x01800000u) __recomp_texobj_trap((unsigned)image_ptr, ((unsigned)width << 16) | height, (unsigned)format); }/' "$BUILD/src/dolphin/gx/GXTexture.c" 2>/dev/null || true
+  perl -0pi -e 's/(    __GXTexObjInt \*t = \(__GXTexObjInt \*\)obj;\n\n    ASSERTMSGLINE\(0x235, obj, "Texture Object Pointer is null"\);)/$1\n    { extern void __recomp_texobj_trap(unsigned, unsigned, unsigned); unsigned __ip = (unsigned)image_ptr \& 0x3FFFFFFFu; if (__ip >= 0x01800000u || (RECOMP_TEXDIAG_WATCH \&\& __ip == RECOMP_TEXDIAG_WATCH)) __recomp_texobj_trap((unsigned)image_ptr, ((unsigned)width << 16) | height, (unsigned)format); }/' "$BUILD/src/dolphin/gx/GXTexture.c" 2>/dev/null || true
+  perl -0pi -e 's/\A/#define RECOMP_TEXDIAG_WATCH '"${RECOMP_TEXDIAG_WATCH:-0}"'u\n/' "$BUILD/src/dolphin/gx/GXTexture.c" 2>/dev/null || true
   perl -0pi -e 's/(    AnimBmpData \*bmp_ptr = &anim->bmp\[bmp\];)/$1\n    { extern void __recomp_sprtex_trap(unsigned, unsigned, unsigned); unsigned __d = (unsigned)bmp_ptr->data \& 0x3FFFFFFFu; if (__d >= 0x01800000u) __recomp_sprtex_trap((unsigned)anim, (unsigned)bmp, (unsigned)bmp_ptr); }/' "$BUILD/src/game/sprput.c" 2>/dev/null || true
 fi
 #     [DIAG, gated] winBGMake writes its 0x70/0x80 border fill past the block_w*block_h alloc

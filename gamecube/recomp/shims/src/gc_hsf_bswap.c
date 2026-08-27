@@ -436,18 +436,22 @@ void __recomp_bswap_hsf(void *data)
     // --- 12. palette section : HsfPalette[count] + appended u16 palette entries ----------------
     // { char *name; s32 unk; u32 palSize; u16 *data(BYTE offset) }. PaletteLoad (hsfload.c:961,969)
     // resolves data as `(u32)data_base + (u32)palette->data` -> a genuine BYTE offset (NOT a u16
-    // element index like part/mapAttr), so `data_base + dofs` is correct here. The appended
-    // palette entries are 16-bit color words -> swap each as u16.
+    // element index like part/mapAttr), so `data_base + dofs` is correct here.
+    // ★2026-08-27: the appended u16 COLOR ENTRIES stay RAW BE — like texel data. NO game code
+    // ever reads palette words CPU-side (grepped src/game: only GXInitTlutObj takes the pointer),
+    // and the GX/Dolphin TLUT loader consumes BE. The old per-word LE swap made every HSF
+    // C8/C4-textured surface decode through a garbage palette on the Dolphin side: the board
+    // sky's TLUT (0xa34160) read LE -> the full-screen speckle "cliff garble" (the sky quad,
+    // 24 verts, tiling its C8 texture 8x8 — capture draw #22, 292K frags), plus the teacup-rim
+    // and ferris-wheel noise. Sprite AnimData palettes were always left BE and rendered fine —
+    // that asymmetry was the tell.
     if (h->palette.count) { HT(10);
         HsfPalette *p = (HsfPalette *)(base + h->palette.ofs);
-        unsigned char *data_base = (unsigned char *)&p[h->palette.count];
         for (i = 0; i < h->palette.count; i++) {
             sw32f(&p[i].name);
             p[i].unk     = (s32)bsw32((u32)p[i].unk);
             p[i].palSize = bsw32(p[i].palSize);
-            u32 dofs = sw32f(&p[i].data);              // BYTE offset (hsfload.c:961)
-            u16 *pal = (u16 *)(data_base + dofs);
-            for (j = 0; j < (s32)p[i].palSize; j++) pal[j] = bsw16(pal[j]);
+            sw32f(&p[i].data);                         // BYTE offset (hsfload.c:961)
         }
     }
 
