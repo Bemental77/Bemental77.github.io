@@ -417,12 +417,18 @@ async function boot(msg) {
                           regions: regions.map((r) => ({ addr: r.addr, bytes: r.bytes.buffer })) }, transfers);
           }
           if (Module._gx_fifo_reset) Module._gx_fifo_reset();
-          // input from the pace SAB (page keyboard); one-shot semantics live in the bake
+          // input from the pace SAB (page keyboard/gamepad): buttons/d-pad (cells 1-2) are
+          // one-shot edges (exchange-cleared — they feed the game's EDGE-triggered
+          // HuPadBtnDown/HuPadDStkRep); the analog stick merges the HELD state the page
+          // maintains in cells 8/9 via keydown/keyup (HuPadStkX/Y are LEVEL thresholds —
+          // a single-frame blip can't drive held-analog UIs like character select).
           const scripted = inputScript ? inputScript[viRetrace + 1] : null;
+          const os3 = Atomics.exchange(paceI32, 3, 0), os4 = Atomics.exchange(paceI32, 4, 0);
+          const h3 = Atomics.load(paceI32, 8), h4 = Atomics.load(paceI32, 9);
           if (Module.___recomp_set_inject_btn) Module.___recomp_set_inject_btn(Atomics.exchange(paceI32, 1, 0) | (scripted ? scripted[0] : 0));
           if (Module.___recomp_set_inject_dstk) Module.___recomp_set_inject_dstk(Atomics.exchange(paceI32, 2, 0) | (scripted ? scripted[1] : 0));
-          if (Module.___recomp_set_inject_stkx) Module.___recomp_set_inject_stkx(Atomics.exchange(paceI32, 3, 0) || (scripted ? scripted[2] : 0));
-          if (Module.___recomp_set_inject_stky) Module.___recomp_set_inject_stky(Atomics.exchange(paceI32, 4, 0) || (scripted ? scripted[3] : 0));
+          if (Module.___recomp_set_inject_stkx) Module.___recomp_set_inject_stkx(os3 || h3 || (scripted ? scripted[2] : 0));
+          if (Module.___recomp_set_inject_stky) Module.___recomp_set_inject_stky(os4 || h4 || (scripted ? scripted[3] : 0));
           viRetrace++;
           // debug: periodic guest-side hex of watched addresses (boot msg peekAddrs;
           // diff against the dolphin worker's recompPeek of the same guest offsets)

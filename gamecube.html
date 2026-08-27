@@ -3819,7 +3819,13 @@
 (function () {
   var q = new URLSearchParams(location.search);
   if (q.get('recomp') !== '1') return;
-  var TARGET = q.has('fps') ? parseInt(q.get('fps'), 10) : 120;
+  // Default = NATIVE speed: each pumped frame advances game time 1/60s (the recomp's
+  // frame-driven clock), so 120 credits/s ran the GAME at 2x fast-forward while the
+  // screen painted far fewer frames (user 2026-08-27: "just because you increase the
+  // game play speed does not make it 120 fps"). 60 credits/s = real-time, and every
+  // frame is renderable+presentable = an actual smooth 60. ?fps= overrides for
+  // speed experiments; ?fps=0 = uncapped.
+  var TARGET = q.has('fps') ? parseInt(q.get('fps'), 10) : 60;
   var BOOT_MS = parseInt(q.get('bootms') || '50000', 10);
   var pace = new SharedArrayBuffer(64);
   var paceI32 = new Int32Array(pace);
@@ -3847,11 +3853,38 @@
                KeyW: 0x40, KeyR: 0x20, KeyV: 0x1000, Enter: 0x1000, Space: 0x100 };
   var KEYD = { ArrowLeft: 1, ArrowRight: 2, ArrowDown: 4, ArrowUp: 8 };
   var KEYS = { ArrowLeft: [3, -80], ArrowRight: [3, 80], ArrowUp: [4, 80], ArrowDown: [4, -80] };
+  // Input semantics (2026-08-27), matched to what each injection feeds in the game:
+  //  - buttons (cell 1)  -> HuPadBtnDown  = EDGE-triggered: one-shot per physical press,
+  //    auto-repeat ignored (held-merge would fire A 60x/s).
+  //  - d-pad  (cell 2)   -> HuPadDStkRep  = repeat events: one-shot per press, OS key
+  //    auto-repeat allowed through so holding an arrow scrolls menus naturally.
+  //  - stick  (cells 8/9)-> HuPadStkX/Y   = LEVEL thresholds: HELD state via keydown/keyup
+  //    (a 1-frame blip is invisible to held-analog UIs like the character-select cursor —
+  //    that was the "controls quit working" report). Gamepads synthesize keydown/keyup,
+  //    so pads inherit all three behaviors.
+  var heldKeys = {};
   window.addEventListener('keydown', function (ev) {
-    if (KEYB[ev.code]) Atomics.or(paceI32, 1, KEYB[ev.code]);
-    if (KEYD[ev.code]) Atomics.or(paceI32, 2, KEYD[ev.code]);
-    if (KEYS[ev.code]) Atomics.store(paceI32, KEYS[ev.code][0], KEYS[ev.code][1]);
-    if (KEYB[ev.code] || KEYD[ev.code] || KEYS[ev.code]) ev.preventDefault();
+    if (!KEYB[ev.code] && !KEYD[ev.code] && !KEYS[ev.code]) return;
+    if (KEYD[ev.code]) Atomics.or(paceI32, 2, KEYD[ev.code]);          // incl. auto-repeat
+    if (!heldKeys[ev.code]) {
+      heldKeys[ev.code] = true;
+      if (KEYB[ev.code]) Atomics.or(paceI32, 1, KEYB[ev.code]);        // first press only
+      if (KEYS[ev.code]) { Atomics.store(paceI32, KEYS[ev.code][0], KEYS[ev.code][1]); Atomics.store(paceI32, KEYS[ev.code][0] + 5, KEYS[ev.code][1]); }
+    }
+    ev.preventDefault();
+  });
+  window.addEventListener('keyup', function (ev) {
+    if (!heldKeys[ev.code]) return;
+    heldKeys[ev.code] = false;
+    if (KEYS[ev.code]) {
+      // clear held stick only if this key owns the current direction (opposing key may have taken it)
+      var cell = KEYS[ev.code][0] + 5;
+      if (Atomics.load(paceI32, cell) === KEYS[ev.code][1]) Atomics.store(paceI32, cell, 0);
+    }
+  });
+  window.addEventListener('blur', function () {   // focus loss must not leave the stick stuck held
+    heldKeys = {};
+    Atomics.store(paceI32, 8, 0); Atomics.store(paceI32, 9, 0);
   });
 
   function grantLoop(t) {
