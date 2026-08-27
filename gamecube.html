@@ -3838,8 +3838,13 @@
     hudEl.textContent = txt;
   }
 
-  // keyboard -> pace SAB (one-shot injections consumed by HuPadRead's bake)
-  var KEYB = { Enter: 0x1000, KeyZ: 0x100, KeyX: 0x200, Space: 0x100 };
+  // keyboard -> pace SAB (one-shot injections consumed by HuPadRead's bake).
+  // Codes ALIGNED with the site KEYMAP (x=A z=B s=X d=Y w=L r=R e=Z v=Start) so the
+  // Web Gamepad polling — which synthesizes those same key events — works identically
+  // in recomp mode (it used to hit the old Z/X/Enter-only map: A/B swapped, Start dead).
+  // GC pad bits: a=0x100 b=0x200 x=0x400 y=0x800 z=0x10 l=0x40 r=0x20 start=0x1000.
+  var KEYB = { KeyX: 0x100, KeyZ: 0x200, KeyS: 0x400, KeyD: 0x800, KeyE: 0x10,
+               KeyW: 0x40, KeyR: 0x20, KeyV: 0x1000, Enter: 0x1000, Space: 0x100 };
   var KEYD = { ArrowLeft: 1, ArrowRight: 2, ArrowDown: 4, ArrowUp: 8 };
   var KEYS = { ArrowLeft: [3, -80], ArrowRight: [3, 80], ArrowUp: [4, 80], ArrowDown: [4, -80] };
   window.addEventListener('keydown', function (ev) {
@@ -3860,6 +3865,31 @@
     requestAnimationFrame(grantLoop);
   }
 
+  // Prefetch the disc IMMEDIATELY (overlapped with the dolphin boot) so the takeover can
+  // fire the moment the renderer is up — the JIT scaffolding boot should never be visible
+  // as gameplay (user 2026-08-27: "why is there a takeover? I do not want that").
+  var discP = null;
+  function prefetchDisc() {
+    if (discP) return discP;
+    console.log('[recomp-live] prefetching disc parts + fst...');
+    var suffixes = ['aa', 'ab', 'ac', 'ad', 'ae', 'af'];
+    discP = Promise.all([
+      Promise.all(suffixes.map(function (sx) {
+        return fetch('/gamecube/roms/MarioParty4.bin.part' + sx).then(function (r) {
+          if (!r.ok) throw new Error('part' + sx + ' ' + r.status);
+          return r.arrayBuffer();
+        });
+      })),
+      fetch('/gamecube/recomp/mp4_fst_trimmed.bin').then(function (r) {
+        if (!r.ok) throw new Error('fst ' + r.status);
+        return r.arrayBuffer();
+      })
+    ]);
+    discP.catch(function () { discP = null; });   // failed prefetch: next call refetches
+    return discP;
+  }
+  prefetchDisc();
+
   var hudStatus = '';   // transient state (taking over / failed) shown until frames flow
   setInterval(function () {
     var d = framesSeen - lastN, dr = rendered - lastRendered;
@@ -3869,15 +3899,9 @@
   }, 1000);
 
   async function startRecomp() {
-    console.log('[recomp-live] fetching disc parts + fst...');
-    var suffixes = ['aa', 'ab', 'ac', 'ad', 'ae', 'af'];
-    var parts = await Promise.all(suffixes.map(function (sx) {
-      return fetch('/gamecube/roms/MarioParty4.bin.part' + sx).then(function (r) {
-        if (!r.ok) throw new Error('part' + sx + ' ' + r.status);
-        return r.arrayBuffer();
-      });
-    }));
-    var fst = await fetch('/gamecube/recomp/mp4_fst_trimmed.bin').then(function (r) { return r.arrayBuffer(); });
+    var pf = await prefetchDisc();
+    var parts = pf[0], fst = pf[1];
+    discP = null;   // buffers get transferred below — a retry must refetch
     console.log('[recomp-live] parts loaded (' + parts.reduce(function (a, b) { return a + b.byteLength; }, 0) + 'B); taking over');
     dolphin_worker.postMessage({ cmd: 'recompStart' });
     // [recomp-live 2026-08-27] STOP the JIT guest for real. recomp_pause_cpu only breaks the
@@ -3960,7 +3984,7 @@
     if (typeof dolphin_worker === 'undefined' || !dolphin_worker) return;
     var up = Date.now() - armT0;
     if (window._firstFrame && !window._recompFirstFrameAt) window._recompFirstFrameAt = Date.now();
-    if (window._recompFirstFrameAt && Date.now() - window._recompFirstFrameAt >= 10000) {
+    if (window._recompFirstFrameAt && Date.now() - window._recompFirstFrameAt >= 2000) {
       clearInterval(armTimer); tryStart('renderer up ' + ((Date.now() - window._recompFirstFrameAt) / 1000 | 0) + 's');
     } else if (up >= BOOT_MS) {
       clearInterval(armTimer); tryStart('bootms ceiling');
