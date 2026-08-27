@@ -555,6 +555,14 @@
       setStatus('Fetching ' + file.name);
       buf = await fetchDiscBlob(base + file.name);
     }
+    // Post only once the worker runtime is up. The old flow posted while the
+    // worker was still importScripts-ing its 423KB glue; on the deployed site
+    // (network-speed worker load vs disk-speed locally) the FIRST chunk could
+    // land in the gap before the worker's early queue exists and was silently
+    // dropped — Track1.bin never wrote, and retro_load_game failed with
+    // "CUE file: cannot open track /discs//Track1.bin". The fetches above still
+    // overlap worker init; only the post waits.
+    await workerReadyPromise;
     worker.postMessage({ cmd: 'discChunk', name: file.name, bytes: buf }, [buf]);
   }
 
