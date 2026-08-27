@@ -511,6 +511,30 @@
   // Disc fetcher. Streams files (and chunked .partXX sets) from the project,
   // postMessages them to the worker. No file picker; no waiting.
   // ---------------------------------------------------------------------------
+  // A fetched blob can be a STALE Git-LFS POINTER (133 bytes of "version
+  // https://git-lfs...") instead of disc content: the Track3 parts shipped as
+  // LFS pointers until 2026-08-27, and browser/CDN caches served the pointer
+  // era for a while after the fix — mixed real+pointer parts assemble a
+  // wrong-size Track3 and retro_load_game returns 0. Detect it and refetch
+  // with a cache-busting query (new URL = new cache key at every layer).
+  function looksLikeLfsPointer(ab) {
+    if (ab.byteLength > 512) return false;
+    const head = new TextDecoder().decode(new Uint8Array(ab, 0, Math.min(24, ab.byteLength)));
+    return head.startsWith('version https://git-lfs');
+  }
+  async function fetchDiscBlob(url) {
+    let r = await fetch(url);
+    if (!r.ok) throw new Error('fetch ' + url + ' -> ' + r.status);
+    let ab = await r.arrayBuffer();
+    if (looksLikeLfsPointer(ab)) {
+      pageLog('[page] ' + url + ' came back as a stale LFS pointer (' + ab.byteLength + ' B) — refetching past the cache');
+      r = await fetch(url + '?cb=' + Date.now(), { cache: 'reload' });
+      if (!r.ok) throw new Error('refetch ' + url + ' -> ' + r.status);
+      ab = await r.arrayBuffer();
+      if (looksLikeLfsPointer(ab)) throw new Error(url + ' serves an LFS pointer even uncached — deploy is broken');
+    }
+    return ab;
+  }
   async function fetchAndPostFile(file, base, cuePath) {
     let buf;
     if (file.parts) {
@@ -519,9 +543,7 @@
       let total = 0;
       for (let i = 0; i < parts.length; i++) {
         setStatus(file.name + ' part ' + (i + 1) + '/' + parts.length);
-        const r = await fetch(parts[i]);
-        if (!r.ok) throw new Error('fetch ' + parts[i] + ' -> ' + r.status);
-        const ab = await r.arrayBuffer();
+        const ab = await fetchDiscBlob(parts[i]);
         bufs.push(new Uint8Array(ab));
         total += ab.byteLength;
       }
@@ -531,9 +553,7 @@
       buf = out.buffer;
     } else {
       setStatus('Fetching ' + file.name);
-      const r = await fetch(base + file.name);
-      if (!r.ok) throw new Error('fetch ' + base + file.name + ' -> ' + r.status);
-      buf = await r.arrayBuffer();
+      buf = await fetchDiscBlob(base + file.name);
     }
     worker.postMessage({ cmd: 'discChunk', name: file.name, bytes: buf }, [buf]);
   }
