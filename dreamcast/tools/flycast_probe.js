@@ -47,6 +47,9 @@ let IDLE_MS = parseInt(process.env.PROBE_IDLE_MS || '20000', 10);
 let KEEP_NOISE = false;
 let LOG_PATH = process.env.PROBE_LOG || '';
 let INTERP_ONLY = false;
+let SEED = false;          // --seed: allow the page's fresh-boot seed state
+                           // (default OFF so every probe measures a cold boot)
+const PRESSES = [];        // --press <ms>:<Key>:<holdMs>: scripted key input
 let PC_TRACE_UNTIL = 0;
 let SCREENSHOT_PATH = '';
 for (let i = 2; i < process.argv.length; i++) {
@@ -57,6 +60,12 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === '--keep-noise') KEEP_NOISE = true;
   else if (a === '--log')   LOG_PATH = process.argv[++i];
   else if (a === '--interp') INTERP_ONLY = true;
+  else if (a === '--seed') SEED = true;
+  else if (a === '--press') {            // --press <ms>:<Key>:<holdMs>, repeatable
+    const m = /^(\d+):([^:]+):(\d+)$/.exec(process.argv[++i] || '');
+    if (m) PRESSES.push({ at: +m[1], key: m[2], hold: +m[3], fired: false });
+    else console.error('bad --press spec (want <ms>:<Key>:<holdMs>)');
+  }
   else if (a === '--pctrace') PC_TRACE_UNTIL = parseInt(process.argv[++i], 10) >>> 0;
   else if (a === '--screenshot') SCREENSHOT_PATH = process.argv[++i];
   else if (a === '-h' || a === '--help') {
@@ -178,7 +187,12 @@ function classify(text) {
   });
 
   const start = Date.now();
+  // Probes boot COLD by default: the page ships a fresh-boot seed savestate
+  // (dreamcast/states/pso2_boot.state) that would otherwise jump every run
+  // past boot and silently change what a measurement means. Pass --seed to
+  // exercise that path deliberately.
   const probeUrl = `http://127.0.0.1:${PORT}/dreamcast.html?diag=1`
+    + (SEED ? '' : '&noseed=1')
     + (INTERP_ONLY ? '&interp=1' : '')
     + (PC_TRACE_UNTIL ? `&pctrace=${PC_TRACE_UNTIL}` : '');
   await page.goto(probeUrl, { waitUntil: 'domcontentloaded' });
@@ -197,6 +211,18 @@ function classify(text) {
       } catch (e) {
         process.stdout.write('[probe] Start click failed: ' + e.message + '\n');
       }
+    }
+    // Scripted key input (--press). Times are measured from probe start so a
+    // spec lines up with the boot milestones in the log.
+    for (const p of PRESSES) {
+      if (p.fired || Date.now() - start < p.at) continue;
+      p.fired = true;
+      process.stdout.write('[probe] press ' + p.key + ' for ' + p.hold + 'ms\n');
+      page.keyboard.down(p.key)
+        .then(() => new Promise(r => setTimeout(r, p.hold)))
+        .then(() => page.keyboard.up(p.key))
+        .catch((e) => process.stdout.write('[probe] press failed: ' + e.message + '\n'));
+      lastSignalTime = Date.now();
     }
     if (Date.now() - lastSignalTime > IDLE_MS) {
       stopReason = 'idle (' + IDLE_MS + 'ms no new signal)';

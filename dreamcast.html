@@ -96,9 +96,20 @@
     #mobileSplash button#mobileSplashStart { background: #2a6b4a; border-color: #2a6b4a; cursor: pointer; z-index: 3000; position: relative; }
     #mobileSplash .rotateTip { font-size: 12px; opacity: 0.55; margin-top: 8px; }
     #mobileStatus { position: absolute; top: 10px; width: 100%; text-align: center; color: #888; z-index: 900; font-size: 12px; pointer-events: none; }
+    /* Toast: save/load-state feedback. z-index above the mobile shell (1000),
+       menu (2000) and rotateHint (3000) so it reads on every surface. */
+    #toast { position: fixed; top: max(14px, env(safe-area-inset-top, 0px)); left: 50%;
+      transform: translate(-50%, -12px); background: #1b1b1f; color: #eee;
+      border: 1px solid #2a6b4a; border-left: 4px solid #2a6b4a; border-radius: 8px;
+      padding: 10px 18px; font: 14px/1.4 system-ui, sans-serif; z-index: 5000;
+      opacity: 0; pointer-events: none; transition: opacity .25s ease, transform .25s ease;
+      box-shadow: 0 4px 24px rgba(0,0,0,.5); max-width: 80vw; }
+    #toast.show { opacity: 1; transform: translate(-50%, 0); }
+    #toast.err { border-color: #8a2f2f; border-left-color: #8a2f2f; }
   </style>
 </head>
 <body>
+<div id="toast"></div>
 <div id="wrap">
   <h3>Dreamcast Wasm</h3>
   <div id="controlBar">
@@ -196,6 +207,18 @@
     console.log(s);
   }
   function setStatus(t) { if (statusEl) statusEl.textContent = t; }
+  // Transient toast (save/load-state feedback). ok=false renders the error
+  // accent. Re-showing restarts the timer; auto-hides after 2.5s.
+  let toastTimer = 0;
+  function showToast(msg, ok = true) {
+    const el = document.getElementById('toast');
+    if (!el) return;
+    el.textContent = msg;
+    el.classList.toggle('err', !ok);
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('show'), 2500);
+  }
 
   $('btnLog').addEventListener('click', () => logEl.classList.toggle('visible'));
 
@@ -360,6 +383,11 @@
           if (new URLSearchParams(location.search).has('rteintc')) {
             worker.postMessage({ cmd: 'setrteintc', on: 1 });
           }
+          // idleskip=1 — lever-11: burn the slice remainder at PSO's frame-wait
+          // spin PCs instead of executing spin iterations (Dev repo 428c42b).
+          if (new URLSearchParams(location.search).has('idleskip')) {
+            worker.postMessage({ cmd: 'setidleskip', on: 1 });
+          }
           // Monomorphic inline-cache: COLD-ARM at boot (lever-4 task 5). The
           // per-write SMC map makes arming safe through the SMC-heavy boot —
           // loader writes to code words bump the generation event-driven, and
@@ -422,6 +450,18 @@
         lastClk = d.kcyc; lastPc = d.pc >>> 0;
         lastIstnrm = d.istnrm >>> 0; lastIstext = d.istext >>> 0;
         paintFpsBar();
+        // First heartbeat with frames actually flowing = the core is live and
+        // safe to unserialize into. Apply the fresh-boot seed here rather than
+        // on a fixed timer so slow devices wait as long as they need to.
+        if (seedArmed && d.calls > 0) {
+          seedArmed = false;
+          seedPromise.then((buf) => {
+            if (!buf) return;
+            seedLabel = '✓ Ready — serial + access key already entered';
+            pageLog('[page] applying boot seed ' + buf.byteLength + ' B');
+            worker.postMessage({ cmd: 'loadState', data: buf }, [buf]);
+          });
+        }
         break;
       case 'ips':
         lastIps = d.ips;
@@ -430,6 +470,7 @@
       case 'stateSaved':
         if (d.data && d.data.byteLength > 0) {
           savedState = new Uint8Array(d.data);
+          showToast('✓ State saved (' + (savedState.byteLength / 1048576).toFixed(1) + ' MB)');
           pageLog('[page] state saved ' + savedState.byteLength + ' B');
           // Probe fast-path: ?autosave=<ms> runs push the bytes back to the
           // probe's HTTP server so later runs can jump straight to the scene.
@@ -442,10 +483,29 @@
             .then(() => pageLog('[page] state persisted (survives reload)'))
             .catch((e) => pageLog('[page] persist failed: ' + e));
         } else {
+          showToast('Save failed — is the game running?', false);
           pageLog('[page] Save State returned empty — not saved (is the game running?)');
         }
         break;
-      case 'stateLoaded': pageLog('[page] state ' + (d.success ? 'loaded OK' : 'load FAILED')); break;
+      case 'vmuChanged':
+        // Guest wrote the card — persist it so saves survive a reload.
+        idbPut(VMU_KEY, new Uint8Array(d.data))
+          .then(() => pageLog('[page] VMU persisted (gen ' + d.gen + ')'))
+          .catch((e) => pageLog('[page] VMU persist failed: ' + e));
+        break;
+      case 'vmuSeeded':
+        pageLog('[page] VMU seed ' + (d.ok ? 'applied' : 'FAILED'));
+        break;
+      case 'stateLoaded': {
+        const lbl = seedLabel; seedLabel = null;
+        showToast(d.success ? (lbl || '✓ State loaded') : 'State load failed', !!d.success);
+        pageLog('[page] state ' + (d.success ? 'loaded OK' : 'load FAILED'));
+        // A savestate carries its own VMU image, so restoring one overwrites
+        // the card — including a returning player's characters. Re-apply the
+        // stored card afterwards so a state load never eats a save.
+        if (d.success && vmuSeeded) seedVmu();
+        break;
+      }
       default:
         pageLog('[page] unknown worker cmd: ' + d.cmd);
     }
@@ -584,6 +644,9 @@
     $('btnStart').disabled = true;
     setStatus('Loading ' + game.name + '...');
     try {
+      // Pull the boot seed alongside the disc stream so it is in hand by the
+      // time the first frame lands (it is ~0.8% of the disc's bytes).
+      if (seedAllowed()) seedPromise = fetchSeedState();
       // 1. Stream every file. The worker queues writes until runtime-ready
       //    (the post-js drains queued messages on init).
       for (const f of game.files) {
@@ -599,6 +662,9 @@
         worker.postMessage({ cmd: 'discReady', cuePath: '/discs/' + game.cue });
       });
       if (!ok) throw new Error('disc load returned 0');
+      // The card exists once the disc is up ([maple] vmuDev=1) and the guest
+      // has not read it yet — the one window where a seed is invisible.
+      await seedVmu();
       // 4. Audio + run loop. The WORKER owns the run loop (free-run pump,
       //    charter Phase 2.2) so guest progress is decoupled from page vsync
       //    and survives tab backgrounding; the rAF loop below only ships input.
@@ -614,6 +680,12 @@
       setStatus('Running.');
       worker.postMessage({ cmd: 'freerun', on: 1 });
       requestAnimationFrame(frameLoop);
+      // The browser's own state always wins — only seed a genuinely fresh one.
+      await savedStateReady;
+      if (seedPromise) {
+        if (savedState) pageLog('[page] own saved state present — boot seed skipped');
+        else seedArmed = true;
+      }
     } catch (err) {
       pageLog('[page] start failed: ' + (err && err.message ? err.message : String(err)));
       setStatus('Failed: ' + (err && err.message ? err.message : String(err)));
@@ -658,9 +730,82 @@
     return v;
   }
   // Restore any previously-persisted state so Load State works after a reload.
-  idbGet(STATE_KEY)
+  const savedStateReady = idbGet(STATE_KEY)
     .then((v) => { if (v) { savedState = new Uint8Array(v); pageLog('[page] found saved state ' + savedState.byteLength + ' B — Start, then Load State to restore'); } })
     .catch(() => {});
+
+  // ---------------------------------------------------------------------------
+  // Fresh-boot seed state. A cold PSO boot asks for a Serial Number + Access
+  // Key, and the game keeps them in main RAM only — searching a full savestate
+  // (2026-08-28) found the pair exactly once, at guest 0x8c4f3c20/0x8c4f3c28,
+  // with no copy in the serialized VMU/flash regions — so there is nothing
+  // smaller to pre-seed. Shipping a savestate taken just past that screen is
+  // the reliable way to spare every visitor the entry (and it skips the cold
+  // boot entirely). The file may be raw or gzipped: the magic bytes are
+  // sniffed, so an exported state drops in as-is and can be gzipped later for
+  // bandwidth (26.4 MB -> 9.0 MB measured).
+  // ---------------------------------------------------------------------------
+  // VMU card: seed + persistence. PSO writes its settings to the memory card
+  // (a card pulled from a post-entry savestate holds PSO______SYS + the
+  // character file), but the wasm VMU is in-memory only, so every load starts
+  // on a blank card. We ship a default card and hand it to the worker before
+  // the guest reads it, then persist guest writes to IndexedDB so characters
+  // survive a reload too.
+  const VMU_URL = 'dreamcast/states/pso2_vmu.bin';
+  const VMU_KEY = 'pso2_vmu';
+  let vmuSeeded = false;
+
+  async function seedVmu() {
+    let bytes = null;
+    try {
+      const stored = await idbGet(VMU_KEY);          // this browser's card wins
+      if (stored) { bytes = new Uint8Array(stored); pageLog('[page] VMU: using stored card ' + bytes.byteLength + ' B'); }
+    } catch (_) {}
+    if (!bytes) {
+      try {
+        const r = await fetch(VMU_URL);
+        if (r.ok) { bytes = new Uint8Array(await r.arrayBuffer()); pageLog('[page] VMU: using shipped default card ' + bytes.byteLength + ' B'); }
+        else pageLog('[page] VMU: no default card shipped (HTTP ' + r.status + ') — blank card');
+      } catch (e) { pageLog('[page] VMU: default card fetch failed: ' + e); }
+    }
+    if (bytes) worker.postMessage({ cmd: 'vmuLoad', data: bytes }, [bytes.buffer]);
+    else worker.postMessage({ cmd: 'vmuWatch', on: 1 });
+    vmuSeeded = true;
+  }
+
+  const SEED_URL = 'dreamcast/states/pso2_boot.state';
+  let seedPromise = null;   // fetch started alongside the disc stream
+  let seedArmed = false;    // applied on the first frame-producing heartbeat
+  let seedLabel = null;     // custom toast for the seed's stateLoaded ack
+
+  function seedAllowed() {
+    // Probe / measurement runs boot cold on purpose; ?noseed=1 forces that.
+    const q = new URLSearchParams(location.search);
+    return !(q.has('noseed') || q.has('autoload') || q.has('autosave') || q.has('parity'));
+  }
+
+  async function fetchSeedState() {
+    try {
+      const r = await fetch(SEED_URL);
+      if (!r.ok) { pageLog('[page] no boot seed shipped (HTTP ' + r.status + ') — cold boot'); return null; }
+      let buf = await r.arrayBuffer();
+      const head = new Uint8Array(buf.slice(0, 2));
+      if (head[0] === 0x1f && head[1] === 0x8b) {
+        if (typeof DecompressionStream !== 'function') {
+          pageLog('[page] boot seed is gzipped, no DecompressionStream here — cold boot');
+          return null;
+        }
+        buf = await new Response(
+          new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))
+        ).arrayBuffer();
+      }
+      pageLog('[page] boot seed ready ' + buf.byteLength + ' B');
+      return buf;
+    } catch (e) {
+      pageLog('[page] boot seed fetch failed: ' + e);
+      return null;
+    }
+  }
 
   $('btnReset').addEventListener('click', () => worker.postMessage({ cmd: 'reset' }));
   $('btnSave').addEventListener('click', () => {
