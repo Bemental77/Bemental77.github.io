@@ -273,8 +273,13 @@
   const AUDIO_OFFSET = 0x1F200000;
   const AUDIO_FRAMES = 16384;
 
+  // Heap: start small and grow. This used to commit 512 MB up front purely to
+  // contain the framebuffer + audio ring parked at ~496 MB; those are now
+  // heap-allocated by the worker, so the initial reservation can track what
+  // the emulator actually needs (RAM 16 + VRAM 8 + ARAM 2 + textures/JIT).
+  // Must match -sINITIAL_MEMORY in flycast_worker_link.sh.
   const sharedMemory = new WebAssembly.Memory({
-    initial: 536870912 / 65536,
+    initial: 134217728 / 65536,
     maximum: 4294967296 / 65536,
     shared: true,
   });
@@ -383,9 +388,21 @@
           if (new URLSearchParams(location.search).has('rteintc')) {
             worker.postMessage({ cmd: 'setrteintc', on: 1 });
           }
-          // idleskip=1 — lever-11: burn the slice remainder at PSO's frame-wait
-          // spin PCs instead of executing spin iterations (Dev repo 428c42b).
-          if (new URLSearchParams(location.search).has('idleskip')) {
+          // Lever-11 idle skip: DEFAULT ON, now that it survives a cold boot.
+          // PSO's frame-wait spin is ~30% of host time and guest-unobservable,
+          // so skipping it buys ~35% CPU per guest second (uncapped 397 -> 616
+          // MHz, matched pairs). At the shipped 1x cap that surplus becomes
+          // worker idle — the headroom a weak device needs to hold 30fps.
+          //
+          // It took three cuts to get here, and the first two were shipped as
+          // "verified" on a savestate rig that loads PAST boot. Both hung a
+          // cold boot with the guest pinned at the spin. The fix that mattered
+          // was a progress bound (rec_wasm.cpp): skipping EVERY visit means the
+          // guest never executes the compare that lets it leave the loop, so
+          // the exit condition can be satisfied and never observed. Any change
+          // here gets re-validated on a COLD boot, not from a state.
+          // ?noidleskip=1 is the escape hatch / A-B arm.
+          if (!new URLSearchParams(location.search).has('noidleskip')) {
             worker.postMessage({ cmd: 'setidleskip', on: 1 });
           }
           // Monomorphic inline-cache: COLD-ARM at boot (lever-4 task 5). The
@@ -487,6 +504,11 @@
           pageLog('[page] Save State returned empty — not saved (is the game running?)');
         }
         break;
+      case 'sabLayout':
+        sabLayout = d;
+        pageLog('[page] SAB layout from worker: fb=' + d.fbOffset + ' audio=' + d.audioOffset);
+        sabLayoutResolve(d);
+        break;
       case 'vmuChanged':
         // Guest wrote the card — persist it so saves survive a reload.
         idbPut(VMU_KEY, new Uint8Array(d.data))
@@ -516,6 +538,10 @@
   // directly into it. transferControlToOffscreen() can only be called once
   // per canvas, and the page-side can no longer call getContext after — so
   // the legacy SAB-blit paintFrame paths below become no-ops.
+  // The worker reports where it allocated the framebuffer + audio ring.
+  let sabLayout = null, sabLayoutResolve = null;
+  const sabLayoutPromise = new Promise((res) => { sabLayoutResolve = res; });
+
   const offscreen = $('dc-canvas').transferControlToOffscreen();
   worker.postMessage({ cmd: 'mem-init', memory: sharedMemory,
                        fbOffset: FB_OFFSET, fbW: FB_W, fbH: FB_H,
@@ -536,11 +562,17 @@
   async function initAudio() {
     if (audioContext) return;
     try {
+      // The worker allocates the audio ring from its heap and reports the
+      // address (see 'sabLayout'); the old fixed 498 MB offset is why the SAB
+      // had to be half a gigabyte. Wait for the real address before wiring the
+      // worklet, or it would read whatever happens to sit at the old constant.
+      const layout = await sabLayoutPromise;
       audioContext = new (self.AudioContext || self.webkitAudioContext)({ sampleRate: 44100 });
       await audioContext.audioWorklet.addModule('/dreamcast/audio-worklet.js');
       const node = new AudioWorkletNode(audioContext, 'dc-audio-processor', {
         numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
-        processorOptions: { sab: sharedMemory.buffer, ringOffset: AUDIO_OFFSET, ringCapacity: AUDIO_FRAMES },
+        processorOptions: { sab: sharedMemory.buffer, ringOffset: layout.audioOffset,
+                            ringCapacity: layout.audioFrames },
       });
       node.connect(audioContext.destination);
       if (audioContext.state === 'suspended') { try { await audioContext.resume(); } catch (_) {} }
@@ -595,8 +627,73 @@
     }
     return ab;
   }
+  // ---------------------------------------------------------------------------
+  // Disc feed policy — decided per device, at run time.
+  //
+  // Streaming the track is what makes a weak device viable (a cold boot to the
+  // PSO title reads 32 MB of the 1.18 GB, measured), but it is only cheap when
+  // the server does byte serving; without Range every read drags a whole ~95 MB
+  // part, which is worse than downloading once. So: probe the actual server and
+  // the actual device, then take the fastest option that device can sustain.
+  //
+  // Capable machines are not punished for being capable — they stream too (so
+  // play starts without waiting for 1.1 GB) and get a bigger cache plus
+  // readahead, which converges on eager behaviour without the up-front cost.
+  //
+  // ?disc=lazy|eager forces an arm for A/B and for reproducing a report.
+  function discPolicy(rangeOK) {
+    const q = (new URLSearchParams(location.search).get('disc') || '').toLowerCase();
+    // navigator.deviceMemory is Chromium-only and rounded/capped; absent on
+    // Safari and Firefox, so treat unknown as mid-range rather than assuming
+    // either extreme.
+    const memGB = navigator.deviceMemory || 4;
+    const cores = navigator.hardwareConcurrency || 4;
+    const conn = navigator.connection || {};
+    const slowNet = conn.saveData === true ||
+                    /^(slow-)?2g$/.test(conn.effectiveType || '');
+    if (q === 'eager') return { mode: 'eager', why: 'forced' };
+    if (q === 'lazy')  return { mode: 'lazy', cacheMB: 96, readahead: 4, why: 'forced' };
+    if (!rangeOK)      return { mode: 'eager', why: 'server has no byte serving' };
+    // Cache is JS heap on top of the ~150 MB wasm heap: scale it to the device
+    // and keep it well under what the tab can hold.
+    const cacheMB = Math.max(48, Math.min(384, Math.round(memGB * 32)));
+    // Readahead costs bandwidth to buy latency. Skip it when the user or the
+    // network says not to, and keep it shallow on few cores.
+    const readahead = slowNet ? 0 : (memGB >= 8 && cores >= 8 ? 8 : (memGB >= 4 ? 4 : 2));
+    return { mode: 'lazy', cacheMB, readahead,
+             why: 'deviceMemory=' + memGB + 'GB cores=' + cores +
+                  (slowNet ? ' saveData/slow-net' : '') };
+  }
+
   async function fetchAndPostFile(file, base, cuePath) {
     let buf;
+    // Big multi-part track: HEAD every part anyway (sizes + byte-serving
+    // check), then decide. Nothing large is downloaded on the lazy arm.
+    if (file.parts) {
+      setStatus('Checking ' + file.name);
+      const parts = [];
+      let rangeOK = true;
+      for (const p of file.parts) {
+        const url = base + p;
+        const r = await fetch(url, { method: 'HEAD' });
+        if (!r.ok) throw new Error('HEAD ' + url + ' -> ' + r.status);
+        if ((r.headers.get('Accept-Ranges') || '').toLowerCase() !== 'bytes') rangeOK = false;
+        parts.push({ url, size: Number(r.headers.get('Content-Length')) });
+      }
+      const policy = discPolicy(rangeOK);
+      pageLog('[page] disc feed: ' + policy.mode + ' (' + policy.why +
+              (policy.mode === 'lazy' ? ', cache ' + policy.cacheMB + 'MB, readahead ' +
+               policy.readahead : '') + ')');
+      if (policy.mode === 'lazy') {
+        setStatus('Streaming ' + file.name);
+        await workerReadyPromise;
+        worker.postMessage({ cmd: 'discLazy', name: file.name, parts,
+                             cacheMB: policy.cacheMB, readahead: policy.readahead });
+        pageLog('[page] lazy disc mapped ' + file.name + ' (' +
+                parts.reduce((a, p) => a + p.size, 0) + ' B, no download)');
+        return;
+      }
+    }
     if (file.parts) {
       const parts = file.parts.map(p => base + p);
       const bufs = [];
@@ -655,6 +752,10 @@
       // 2. Wait for worker if it isn't ready yet (usually instant on warm load).
       setStatus('Waiting for emulator runtime...');
       await workerReadyPromise;
+      // Seed the console flash BEFORE the disc loads: reios reads flash during
+      // retro_load_game, so a later write lands after the guest has already
+      // consumed it (observed: seeding post-discReady boots to a black screen).
+      await seedFlash();
       // 3. Tell the worker to load the disc and wait for ack.
       setStatus('Loading disc image...');
       const ok = await new Promise((resolve) => {
@@ -680,12 +781,15 @@
       setStatus('Running.');
       worker.postMessage({ cmd: 'freerun', on: 1 });
       requestAnimationFrame(frameLoop);
-      // The browser's own state always wins — only seed a genuinely fresh one.
-      await savedStateReady;
-      if (seedPromise) {
-        if (savedState) pageLog('[page] own saved state present — boot seed skipped');
-        else seedArmed = true;
-      }
+      // Seed every fresh boot. An earlier version skipped this whenever the
+      // browser had a state in IndexedDB, reasoning that "the user's own state
+      // wins" — but that is not what a stored state means. It is offered via
+      // Load State; it does not say anything about where a fresh Start should
+      // begin. The result was that anyone who had ever saved got a cold boot
+      // and had to type the PSO serial + access key again, which is the exact
+      // thing the seed exists to prevent. Seeding does not touch the stored
+      // state, and the stored VMU is re-applied afterwards.
+      if (seedPromise) seedArmed = true;
     } catch (err) {
       pageLog('[page] start failed: ' + (err && err.message ? err.message : String(err)));
       setStatus('Failed: ' + (err && err.message ? err.message : String(err)));
@@ -771,6 +875,22 @@
     if (bytes) worker.postMessage({ cmd: 'vmuLoad', data: bytes }, [bytes.buffer]);
     else worker.postMessage({ cmd: 'vmuWatch', on: 1 });
     vmuSeeded = true;
+  }
+
+  // Console flash. PSO ties the Serial Number + Access Key to the console
+  // ("you must play on the same Dreamcast", its own words) rather than to the
+  // memory card, so shipping a flash image from a console that has already
+  // registered is what lets a NORMAL boot skip the registration screen — no
+  // savestate jump required.
+  const FLASH_URL = 'dreamcast/states/pso2_flash.bin';
+  async function seedFlash() {
+    try {
+      const r = await fetch(FLASH_URL);
+      if (!r.ok) { pageLog('[page] flash: none shipped (HTTP ' + r.status + ')'); return; }
+      const bytes = new Uint8Array(await r.arrayBuffer());
+      worker.postMessage({ cmd: 'flashLoad', data: bytes }, [bytes.buffer]);
+      pageLog('[page] flash: seeded ' + bytes.byteLength + ' B (registered console)');
+    } catch (e) { pageLog('[page] flash seed failed: ' + e); }
   }
 
   const SEED_URL = 'dreamcast/states/pso2_boot.state';

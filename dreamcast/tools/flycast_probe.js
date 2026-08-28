@@ -50,6 +50,7 @@ let INTERP_ONLY = false;
 let SEED = false;          // --seed: allow the page's fresh-boot seed state
                            // (default OFF so every probe measures a cold boot)
 const PRESSES = [];        // --press <ms>:<Key>:<holdMs>: scripted key input
+let EXTRA_QUERY = '';      // --q "a=1&b=2": extra page query params, verbatim
 let PC_TRACE_UNTIL = 0;
 let SCREENSHOT_PATH = '';
 for (let i = 2; i < process.argv.length; i++) {
@@ -61,6 +62,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === '--log')   LOG_PATH = process.argv[++i];
   else if (a === '--interp') INTERP_ONLY = true;
   else if (a === '--seed') SEED = true;
+  else if (a === '--q') EXTRA_QUERY = process.argv[++i];
   else if (a === '--press') {            // --press <ms>:<Key>:<holdMs>, repeatable
     const m = /^(\d+):([^:]+):(\d+)$/.exec(process.argv[++i] || '');
     if (m) PRESSES.push({ at: +m[1], key: m[2], hold: +m[3], fired: false });
@@ -95,7 +97,33 @@ function startServer() {
         if (err || !stat.isFile()) { res.statusCode = 404; res.end('404'); return; }
         const ext = path.extname(filePath).toLowerCase();
         res.setHeader('Content-Type', MIME[ext] || 'application/octet-stream');
+        // Byte serving. GitHub Pages supports Range; `python3 -m http.server`
+        // does NOT, so without this the lazy-disc path would silently fall
+        // back to whole-part downloads here and only exercise the real code
+        // in production — exactly the local/prod split that has bitten the
+        // disc loader before.
+        res.setHeader('Accept-Ranges', 'bytes');
+        const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+        if (range) {
+          let start = range[1] === '' ? NaN : parseInt(range[1], 10);
+          let end   = range[2] === '' ? NaN : parseInt(range[2], 10);
+          if (Number.isNaN(start)) { start = stat.size - end; end = stat.size - 1; }  // suffix range
+          if (Number.isNaN(end)) end = stat.size - 1;
+          if (!(start >= 0) || start > end || start >= stat.size) {
+            res.statusCode = 416;
+            res.setHeader('Content-Range', 'bytes */' + stat.size);
+            res.end();
+            return;
+          }
+          end = Math.min(end, stat.size - 1);
+          res.statusCode = 206;
+          res.setHeader('Content-Range', 'bytes ' + start + '-' + end + '/' + stat.size);
+          res.setHeader('Content-Length', end - start + 1);
+          fs.createReadStream(filePath, { start, end }).pipe(res);
+          return;
+        }
         res.setHeader('Content-Length', stat.size);
+        if (req.method === 'HEAD') { res.end(); return; }
         fs.createReadStream(filePath).pipe(res);
       });
     });
@@ -193,6 +221,7 @@ function classify(text) {
   // exercise that path deliberately.
   const probeUrl = `http://127.0.0.1:${PORT}/dreamcast.html?diag=1`
     + (SEED ? '' : '&noseed=1')
+    + (EXTRA_QUERY ? '&' + EXTRA_QUERY : '')
     + (INTERP_ONLY ? '&interp=1' : '')
     + (PC_TRACE_UNTIL ? `&pctrace=${PC_TRACE_UNTIL}` : '');
   await page.goto(probeUrl, { waitUntil: 'domcontentloaded' });
