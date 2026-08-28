@@ -862,6 +862,16 @@ static void dolphin_publish_mmio_mirrors(void) {
     __atomic_store_n(const_cast<uint32_t*>(&mir[10]), s + 1u, __ATOMIC_RELEASE);
 }
 
+// [recomp perf 2026-08-28] JS-callable wrapper. In recomp mode the recomp worker
+// owns the game and dolphin is only the renderer, so driving run_iter_batch there
+// is redundant emulation on the thread that must decode the FIFO. Skipping the
+// pump outright STALLS BOOT (verified: renders the Nintendo logo, then 1 video_cb
+// and no further presents) because the per-iter servicing below is load-bearing.
+// Export it so the pump can service without emulating.
+extern "C" EMSCRIPTEN_KEEPALIVE void dolphin_service_iter_js(void);
+void dolphin_service_iter(void);
+extern "C" EMSCRIPTEN_KEEPALIVE void dolphin_service_iter_js(void) { dolphin_service_iter(); }
+
 void dolphin_service_iter(void) {
     if (!g_loaded) return;
     dolphin_publish_mmio_mirrors();

@@ -76,10 +76,15 @@ function attrList(vat) {
 // Walk one GX stream (frame or DL body): update reg shadows, collect new DLs, and for
 // indexed draws track max index per bound array. buf = Uint8Array, guest = whether offsets
 // are guest addresses (DL bodies) — used only for labels.
+function rdU16b(buf, o) { return (buf[o] << 8) | buf[o + 1]; }
+function rdU32b(buf, o) { return ((buf[o] << 24) | (buf[o + 1] << 16) | (buf[o + 2] << 8) | buf[o + 3]) >>> 0; }
 function walkStream(mem, buf, start, end, depth, newDLs, touched) {
   let p = start;
-  const rdU16 = (o) => (buf[o] << 8) | buf[o + 1];
-  const rdU32 = (o) => ((buf[o] << 24) | (buf[o + 1] << 16) | (buf[o + 2] << 8) | buf[o + 3]) >>> 0;
+  // [perf 2026-08-28] these were closures over `buf`, rebuilt on EVERY call —
+  // and walkStream recurses once per display list. Module-scope helpers taking
+  // buf explicitly let V8 inline them instead.
+  const rdU16 = (o) => rdU16b(buf, o);
+  const rdU32 = (o) => rdU32b(buf, o);
   while (p < end) {
     const op = buf[p++];
     if (op === 0x00) continue;
@@ -164,7 +169,11 @@ function walkStream(mem, buf, start, end, depth, newDLs, touched) {
         }
       }
     }
-    else if ((op & 0x80) && [0x80, 0x88, 0x90, 0x98, 0xA0, 0xA8, 0xB0, 0xB8].includes(op & 0xF8)) {
+    // [perf 2026-08-28] was: [0x80,0x88,...,0xB8].includes(op & 0xF8) — an array
+    // literal ALLOCATED and linearly scanned on every draw opcode (1300 draws/frame).
+    // Those eight values are the multiples of 8 in [0x80,0xB8] and (op & 0xF8) is
+    // already a multiple of 8, so the test is exactly this range check.
+    else if (op >= 0x80 && op <= 0xBF) {
       const vat = op & 7, n = rdU16(p); p += 2;
       // array extents come from the clip heuristic now (fixture parity) — draws just skip
       const attrs = attrList(vat);

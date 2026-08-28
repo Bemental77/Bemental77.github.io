@@ -293,6 +293,28 @@ function pumpBatch() {
     return;
   }
   if (Module && Module._run_iter_batch) {
+    // [recomp perf 2026-08-28] Once the recomp worker is driving the game, dolphin
+    // is ONLY the renderer — its own emulation loop is redundant work on the very
+    // thread that has to decode the FIFO. The profile shows that overhead plainly:
+    // Libretro::Options::IsUpdated 3.8% and _emscripten_get_now 4.2% of this
+    // worker, neither of which belongs in a render path. Skip the core pump while
+    // recomp is live; frames arrive as messages and render through
+    // _recomp_render_fifo, not through this pump.
+    // KILL CRITERION: if rendering stops, dolphin's per-iter servicing (MMIO
+    // mirrors / mailbox drain, i.e. dolphin_service_iter) was load-bearing here —
+    // export that and call it instead of skipping outright.
+    // ?nopumpskip=1 restores the old behaviour for an A/B.
+    // BOTH alternatives to the plain pump were MEASURED and are worse — do not
+    // re-try either without new evidence:
+    //   skip the pump entirely while recomp is live -> STALLS BOOT (renders the
+    //     Nintendo logo, then one video_cb and no further presents; the per-iter
+    //     MMIO-mirror / mailbox servicing is load-bearing for the recomp path).
+    //   service-only (_dolphin_service_iter_js, exported for the attempt) ->
+    //     boots and renders, but capped fps 48.1/47.7 against a 50.4 baseline.
+    // The premise was that dolphin's own emulation competes with the FIFO decode
+    // on this thread. It does not pay: the recomp worker produces ~16 frames per
+    // rendered frame uncapped (skipped=112293), so the renderer is the limiter
+    // and the pump is not what is holding it back.
     for (var i = 0; i < PUMP_BATCH_ITERS; i++) Module._run_iter_batch(1);
     // [recomp-bridge] armed fixture: apply once (RAM image + f32-array swaps + fifo upload),
     // then re-render each pump until the pump budget runs out.
