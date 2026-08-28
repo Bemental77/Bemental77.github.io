@@ -3158,7 +3158,15 @@
   // active, the video_cb 'render' messages (the SW buffer — zeros under WGPU)
   // are ignored so they can't paint black over real frames.
   var _sabPresentSeq = 0, _sabPresentActive = false, _sabFrames = 0, _sabFpsT = 0;
-  setInterval(function () {
+  // [present-cadence 2026-08-28] was setInterval(..., 16). A 16ms timer clamps
+  // presents to ~62/s in theory and ~50/s in practice, which WAS the measured
+  // fps ceiling: cutting render work (sampled texture hashing took the decode
+  // 8.5 -> 7.43) moved fifo time but not fps, because paints were timer-bound,
+  // not CPU-bound. rAF is display-synced, so this tracks the panel — 120/s on a
+  // 120Hz display, a locked 60 on 60Hz — instead of a fixed timer. Gameplay
+  // speed is unaffected: the guest is paced by the credit grant (TARGET), this
+  // only governs how often a finished frame is painted.
+  function _sabPresentTick() {
     try {
       if (!sharedMemory) return;
       var A = new Uint32Array(sharedMemory.buffer);
@@ -3209,7 +3217,9 @@
         _sabFrames = 0; _sabFpsT = now;
       }
     } catch (e) { /* transient during boot */ }
-  }, 16);
+    finally { requestAnimationFrame(_sabPresentTick); }
+  }
+  requestAnimationFrame(_sabPresentTick);
   function paintFrame2D(pixels, w, h, pitch) {
     var c = $('canvas');
     if (!canvasCtx2D) canvasCtx2D = c.getContext('2d');
