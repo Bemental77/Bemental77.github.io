@@ -160,7 +160,7 @@ var __recompFrame = 0, __recompPtr = 0, __recompBytes = null;
 // [recomp-bridge] armed by the 'recompFix' message (see its case below)
 var __recompFix = null, __recompFixApplied = false, __recompFixPtr = 0, __recompFixLen = 0,
     __recompFixPumps = 0, __recompPauseCpu = false, __recompXfbAddr = 0,
-    __recompLive = false, __recompLiveXfb = 0, __recompLivePtr = 0, __recompLiveCap = 0, __recompLiveFrames = 0;
+    __recompLive = false, __recompLiveXfb = 0, __recompLivePtr = 0, __recompLiveCap = 0, __recompLiveFrames = 0, __vtxCensusPtr = 0;
 var __recompT = { prep: 0, fifo: 0, present: 0, n: 0, regB: 0, fifoB: 0, skip: 0 };
 function recompFixApply() {
   // park the emulated CPU FIRST (CPUManager::Break -> JitWasm::Run exits) so the RAM image
@@ -803,6 +803,30 @@ self.onmessage = function (e) {
       __recompT.n++; __recompT.regB += regBytes2; __recompT.fifoB += fb2.length;
       __recompLiveFrames++;
       postMessage({ cmd: 'recompAck', n: e.data.n });
+      // [vtx-census 2026-08-28] Rank vertex-loader formats by vertices actually
+      // loaded. Under emscripten the SOFTWARE VertexLoader is used (no
+      // VertexLoaderX64/ARM64), and its per-vertex indirect-call pipeline is
+      // ~43% of this worker — so a wasm loader has to target whichever formats
+      // dominate. Cheap: runs once per 240 rendered frames.
+      if ((__recompLiveFrames % 240) === 1 && Module._bem_vtx_census) {
+        if (!__vtxCensusPtr) __vtxCensusPtr = Module._malloc(256 * 6 * 4);
+        var _vn = Module._bem_vtx_census(__vtxCensusPtr, 256);
+        var _rows = [], _tot = 0;
+        for (var _i = 0; _i < _vn; _i++) {
+          var _b = (__vtxCensusPtr >> 2) + _i * 6;
+          var _d = [Module.HEAPU32[_b] >>> 0, Module.HEAPU32[_b + 1] >>> 0, Module.HEAPU32[_b + 2] >>> 0,
+                    Module.HEAPU32[_b + 3] >>> 0, Module.HEAPU32[_b + 4] >>> 0];
+          var _c = Module.HEAPU32[_b + 5] >>> 0;
+          _rows.push([_d, _c]); _tot += _c;
+        }
+        _rows.sort(function (a, b) { return b[1] - a[1]; });
+        var _top = _rows.slice(0, 4).map(function (r) {
+          return 'desc=' + r[0][0].toString(16) + '/' + r[0][1].toString(16) +
+                 ' vat=' + r[0][2].toString(16) + '/' + r[0][3].toString(16) + '/' + r[0][4].toString(16) +
+                 ' ' + (_tot ? (100 * r[1] / _tot).toFixed(1) : '0') + '%';
+        }).join('  |  ');
+        postMessage({ cmd: 'print', txt: '[vtxcensus] loaders=' + _vn + ' verts=' + _tot + ' top=' + _top });
+      }
       if ((__recompLiveFrames % 240) === 1) {
         var _n = Math.max(1, __recompT.n);
         postMessage({ cmd: 'print', txt: '[recompLive] f' + __recompLiveFrames + ' fifo=' + fb2.length

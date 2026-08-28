@@ -50,6 +50,38 @@ u32 g_current_components;
 typedef std::unordered_map<VertexLoaderUID, std::unique_ptr<VertexLoaderBase>> VertexLoaderMap;
 static std::mutex s_vertex_loader_map_lock;
 static VertexLoaderMap s_vertex_loader_map;
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+// [vtx-census 2026-08-28] OBSERVATION ONLY. Under emscripten neither _M_X86_64
+// nor _M_ARM_64 is defined, so VertexLoaderBase::CreateVertexLoader falls back
+// to the SOFTWARE VertexLoader, whose inner loop makes one indirect call per
+// pipeline stage PER VERTEX (VertexLoader.cpp:264-269). That path profiles at
+// ~43% of the render worker. Before emitting a wasm loader for any format, rank
+// the formats by vertices actually loaded so the emitter targets the hot ones.
+// Writes {desc.low, desc.high, vat.g0, vat.g1, vat.g2, numLoadedVertices}
+// per loader (6 u32 each); returns count.
+extern "C" EMSCRIPTEN_KEEPALIVE unsigned bem_vtx_census(unsigned* out, unsigned max_loaders)
+{
+  std::lock_guard<std::mutex> lk(s_vertex_loader_map_lock);
+  unsigned n = 0;
+  for (const auto& [uid, loader] : s_vertex_loader_map)
+  {
+    if (n >= max_loaders)
+      break;
+    // m_VtxDesc/m_VtxAttr are protected on VertexLoaderBase; the map KEY carries
+    // the same identity, and ranking by (uid, vertices) is what the census needs.
+    // The emitter gets the real format straight from CreateVertexLoader's args.
+    unsigned* r = out + n * 6;
+    const auto& vid = uid.GetVID();
+    r[0] = vid[0]; r[1] = vid[1]; r[2] = vid[2]; r[3] = vid[3]; r[4] = vid[4];
+    r[5] = static_cast<unsigned>(loader->m_numLoadedVertices);
+    ++n;
+  }
+  return n;
+}
+#endif
+
 // TODO - change into array of pointers. Keep a map of all seen so far.
 
 Common::EnumMap<u8*, CPArray::TexCoord7> cached_arraybases;

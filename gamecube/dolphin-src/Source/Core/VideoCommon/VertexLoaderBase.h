@@ -31,6 +31,9 @@ public:
 
   bool operator==(const VertexLoaderUID& rh) const { return vid == rh.vid; }
   size_t GetHash() const { return hash; }
+  // [vtx-census 2026-08-28] the five descriptor words {desc.low, desc.high,
+  // vat.g0, vat.g1, vat.g2} — read-only, so the census can name a format.
+  const std::array<u32, 5>& GetVID() const { return vid; }
 
 private:
   size_t CalculateHash() const
