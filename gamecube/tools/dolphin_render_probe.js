@@ -343,7 +343,15 @@ function startServer() {
   // M/N/J/K=A/B/Y/X, q/r/e/v/c=L/R/Z/Start/Select (gamecube.html:2961-2965).
   // The old map (a:'x' etc.) was the NON-trusted dispatchKey map and silently
   // no-op'd on this path (and l:'w' pressed UP). Match the physical map:
-  const PRESS_KEY = { start: 'v', select: 'c', a: 'm', b: 'n', x: 'k', y: 'j', l: 'q', r: 'r', z: 'e', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight' };
+  // The RECOMP path does not share that map. It installs its own listeners with
+  // a different binding (gamecube.html:3867): A=KeyX B=KeyZ X=KeyS Y=KeyD Z=KeyE
+  // L=KeyW R=KeyR Start=KeyV/Enter. Sending the dolphin map at a recomp build
+  // silently no-ops every face button (Start happens to coincide on 'v'), which
+  // looks exactly like "input is broken" when it is the probe that is wrong.
+  const RECOMP = /(^|&)recomp=1(&|$)/.test(process.env.PROBE_QUERY || '');
+  const PRESS_KEY = RECOMP
+    ? { start: 'v', select: 'c', a: 'x', b: 'z', x: 's', y: 'd', l: 'w', r: 'r', z: 'e', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight' }
+    : { start: 'v', select: 'c', a: 'm', b: 'n', x: 'k', y: 'j', l: 'q', r: 'r', z: 'e', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight' };
   (process.env.PROBE_PRESS || '').split(',').filter(Boolean).forEach((spec) => {
     const m = spec.trim().match(/^(\w+)@(\d+)$/);
     if (!m || !PRESS_KEY[m[1]]) { console.log('[probe] PROBE_PRESS spec ignored: ' + spec); return; }
