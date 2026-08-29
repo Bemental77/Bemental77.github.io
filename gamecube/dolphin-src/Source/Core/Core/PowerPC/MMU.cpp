@@ -311,12 +311,30 @@ T MMU::ReadFromHardware(u32 em_address)
   return 0;
 }
 
-template <XCheckTLBFlag flag, bool never_translate>
-void MMU::WriteToHardware(u32 em_address, const u32 data, const u32 size)
+// [wasm size-specialize 2026-08-29] `size` used to be a runtime argument all the way down.
+// On x86-64 that is nearly free; under wasm it is not, and this function is the single
+// hottest guest-store path in the browser build. Evidence, from the SHIPPED artifact rather
+// than from reasoning: the name section of gamecube/dolphin_libretro/dolphin_worker_emcc.wasm
+// carries `MMU::WriteToHardware<(XCheckTLBFlag)2, false>(unsigned int, unsigned int,
+// unsigned int)` as its own function, func[1474] — so it is NOT inlined into MMU::Write<T>
+// and the constant `sizeof(T)` its callers pass is thrown away at the call boundary. In that
+// function body the RAM store below lowers to `memory.copy 0 0` with a runtime length, the
+// two `switch (size)` dispatches survive as branch tables, and `std::rotr(data, size * 8)`
+// stays a variable rotate. The read side never had this problem: ReadFromHardware is
+// templated on T, and `ReadFromHardware<(XCheckTLBFlag)1, unsigned int, false>` does not
+// appear in that name section at all — it was inlined into MMU::Read<unsigned int>, where the
+// width is constant. Making the width a template parameter here folds all of it: the RAM
+// store becomes a single i32.store/i32.store16/i32.store8, both switches collapse to the one
+// live arm, and the page-cross precheck becomes constant arithmetic.
+//
+// Behaviour is unchanged by construction — this is the same body with one runtime value
+// promoted to a template argument, and WriteToHardware below preserves the old signature for
+// the callers whose width really is dynamic.
+template <XCheckTLBFlag flag, u32 size, bool never_translate>
+void MMU::WriteToHardwareSized(u32 em_address, const u32 data)
 {
   static_assert(flag == XCheckTLBFlag::NoException || flag == XCheckTLBFlag::Write);
-
-  DEBUG_ASSERT(size <= 4);
+  static_assert(size >= 1 && size <= 4);
 
   const u32 em_address_start_page = em_address & ~HW_PAGE_MASK;
   const u32 em_address_end_page = (em_address + size - 1) & ~HW_PAGE_MASK;
@@ -443,8 +461,8 @@ void MMU::WriteToHardware(u32 em_address, const u32 data, const u32 size)
     const u32 end_addr = Common::AlignUp(em_address + size, 8);
     for (u32 addr = start_addr; addr != end_addr; addr += 8)
     {
-      WriteToHardware<flag, true>(addr, rotated_data, 4);
-      WriteToHardware<flag, true>(addr + 4, rotated_data, 4);
+      WriteToHardwareSized<flag, 4, true>(addr, rotated_data);
+      WriteToHardwareSized<flag, 4, true>(addr + 4, rotated_data);
     }
 
     return;
@@ -497,6 +515,32 @@ void MMU::WriteToHardware(u32 em_address, const u32 data, const u32 size)
   {
     m_system.GetCPU().Break();
     m_ppc_state.Exceptions |= EXCEPTION_DSI | EXCEPTION_FAKE_MEMCHECK_HIT;
+  }
+}
+
+// Runtime-width entry point. Only two callers actually need it: the page-crossing split
+// above (whose halves are computed at run time) and HostTryWrite. Everything on the guest
+// store path passes a compile-time width and calls WriteToHardwareSized directly.
+template <XCheckTLBFlag flag, bool never_translate>
+void MMU::WriteToHardware(u32 em_address, const u32 data, const u32 size)
+{
+  switch (size)
+  {
+  case 1:
+    WriteToHardwareSized<flag, 1, never_translate>(em_address, data);
+    return;
+  case 2:
+    WriteToHardwareSized<flag, 2, never_translate>(em_address, data);
+    return;
+  case 3:
+    WriteToHardwareSized<flag, 3, never_translate>(em_address, data);
+    return;
+  case 4:
+    WriteToHardwareSized<flag, 4, never_translate>(em_address, data);
+    return;
+  default:
+    DEBUG_ASSERT(false);
+    return;
   }
 }
 // =====================
@@ -683,7 +727,7 @@ template <std::unsigned_integral T>
 void MMU::Write(const Common::MakeAtLeastU32<T> var, const u32 address)
 {
   Memcheck(address, var, true, sizeof(T));
-  WriteToHardware<XCheckTLBFlag::Write>(address, var, sizeof(T));
+  WriteToHardwareSized<XCheckTLBFlag::Write, static_cast<u32>(sizeof(T))>(address, var);
 }
 template void MMU::Write<u8>(const u32 var, const u32 address);
 template void MMU::Write<u16>(const u32 var, const u32 address);
@@ -692,8 +736,8 @@ template <>
 void MMU::Write<u64>(const u64 var, const u32 address)
 {
   Memcheck(address, var, true, 8);
-  WriteToHardware<XCheckTLBFlag::Write>(address, static_cast<u32>(var >> 32), 4);
-  WriteToHardware<XCheckTLBFlag::Write>(address + sizeof(u32), static_cast<u32>(var), 4);
+  WriteToHardwareSized<XCheckTLBFlag::Write, 4>(address, static_cast<u32>(var >> 32));
+  WriteToHardwareSized<XCheckTLBFlag::Write, 4>(address + sizeof(u32), static_cast<u32>(var));
 }
 
 void MMU::Write_U16_Swap(const u32 var, const u32 address)
@@ -725,7 +769,7 @@ void MMU::HostWrite(const Core::CPUThreadGuard& guard, const Common::MakeAtLeast
                     const u32 address)
 {
   auto& mmu = guard.GetSystem().GetMMU();
-  mmu.WriteToHardware<XCheckTLBFlag::NoException>(address, var, sizeof(T));
+  mmu.WriteToHardwareSized<XCheckTLBFlag::NoException, static_cast<u32>(sizeof(T))>(address, var);
 }
 template void MMU::HostWrite<u8>(const Core::CPUThreadGuard& guard, const u32 var,
                                  const u32 address);
@@ -737,8 +781,8 @@ template <>
 void MMU::HostWrite<u64>(const Core::CPUThreadGuard& guard, const u64 var, const u32 address)
 {
   auto& mmu = guard.GetSystem().GetMMU();
-  mmu.WriteToHardware<XCheckTLBFlag::NoException>(address, static_cast<u32>(var >> 32), 4);
-  mmu.WriteToHardware<XCheckTLBFlag::NoException>(address + sizeof(u32), static_cast<u32>(var), 4);
+  mmu.WriteToHardwareSized<XCheckTLBFlag::NoException, 4>(address, static_cast<u32>(var >> 32));
+  mmu.WriteToHardwareSized<XCheckTLBFlag::NoException, 4>(address + sizeof(u32), static_cast<u32>(var));
 }
 
 template <std::unsigned_integral T>
@@ -1039,7 +1083,7 @@ void MMU::ClearDCacheLine(u32 address)
   // TODO: This isn't precisely correct for non-RAM regions, but the difference
   // is unlikely to matter.
   for (u32 i = 0; i < 32; i += 4)
-    WriteToHardware<XCheckTLBFlag::Write, true>(address + i, 0, 4);
+    WriteToHardwareSized<XCheckTLBFlag::Write, 4, true>(address + i, 0);
 }
 
 void MMU::StoreDCacheLine(u32 address)

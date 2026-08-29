@@ -344,6 +344,15 @@ private:
 
   template <XCheckTLBFlag flag, std::unsigned_integral T, bool never_translate = false>
   T ReadFromHardware(u32 em_address);
+  // [wasm size-specialize 2026-08-29] WriteToHardwareSized carries the store width as a
+  // TEMPLATE parameter; WriteToHardware is the runtime-width dispatcher onto it, kept for
+  // the two callers that genuinely have a runtime width (the page-crossing split and
+  // HostTryWrite). Every other caller passes a compile-time constant, and under wasm that
+  // distinction is expensive rather than cosmetic — see the note above the definition in
+  // MMU.cpp. The read side already gets this for free: ReadFromHardware is templated on T,
+  // so its store/load widths were always constant.
+  template <XCheckTLBFlag flag, u32 size, bool never_translate = false>
+  void WriteToHardwareSized(u32 em_address, const u32 data);
   template <XCheckTLBFlag flag, bool never_translate = false>
   void WriteToHardware(u32 em_address, const u32 data, const u32 size);
   template <XCheckTLBFlag flag>

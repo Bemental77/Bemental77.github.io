@@ -88,10 +88,50 @@ extern "C" {
 // The flag therefore can never miss a GP write and starve the FIFO.
 extern "C" int g_bem_gp_dirty;   // defined in bementalJIT src/block_cache.cpp
 extern "C" int g_dc_handover_done;  // defined in ProcessorInterface.cpp (sticky post-handover)
-static inline void gp_dirty_check(uint32_t addr) {
-    if ((addr & 0x0FFFFFFFu) == 0x0C008000u) {
-        g_bem_gp_dirty = 1;
-    }
+
+// [gp-page 2026-08-29] WPAR region test — 4 KB PAGE match, so this predicate now says the
+// same thing as Dolphin's own WriteToHardware (MMU.cpp:361-362,
+// `(em_address & 0xFFFFF000) == GPFifo::GATHER_PIPE_PHYSICAL_ADDRESS`). It used to be an
+// EXACT match on 0x0C008000, and that disagreement with the reference implementation was
+// the entire reason multi-word WPAR stores were expensive here.
+//
+// The shape that hits it: any store the emitter lowers to a pair of imports at EA and
+// EA+4 with EA == WPAR. Lane 0 matched the exact test and went straight to GPFifo; lane 0
+// + 4 did not, fell through stateless_write_w, and entered MMU::Write<u32> ->
+// WriteToHardware — a 1691-instruction, Asyncify-instrumented wasm function (counted in
+// the shipped dolphin_worker_emcc.wasm, func[1474] of the name section) — which then
+// applied its OWN 4 KB page mask and called GPFifo::Write32 after all. Lane 1 was never
+// mis-routed: same destination, same order, same bytes. It was paying the whole generic
+// BAT/TLB/MMIO decode to arrive at the identical call.
+//
+// The dominant producer of that shape was psq_st with GQR type FLOAT, which is how the SDK
+// loads matrices (dolsdk2001/src/gx/GXTransform.c:111-125 `WriteMTXPS4x3` = 6x
+// `psq_st fN, 0(dest), 0, qr0`, called from GXLoadPosMtxImm :202, GXLoadNrmMtxImm :254,
+// GXLoadTexMtxImm, GXSetProjection; dest = &GXWGFifo.f32 = GXFIFO_ADDR 0xCC008000, per
+// dolsdk2001/include/dolphin/gx/GXVert.h:10). That specific traffic was measured at
+// psqFloatWPAR=32965 on the PSO census run (/tmp/gp-C1.log:21) and is now handled inside
+// the JIT block by emit_fp_words_gp_or_import (jit_load_store.cpp:671+, 2026-08-29), so it
+// no longer reaches this file at all on the default build.
+//
+// This predicate still matters, for three reasons, and none of them is speculative:
+//   - stfd/stfdu/stfdx keep an unguarded import pair at EA and EA+4
+//     (jit_load_store.cpp:1152-1164) with no in-wasm WPAR arm.
+//   - emit_gp_region_test (jit_load_store.cpp:522-532) deliberately tests LANE 0 ONLY and
+//     documents (:630-648) that everything else "falls to the untouched import pair, which
+//     reaches the pipe via the same page match it always did". That is this predicate. The
+//     in-wasm arm's correctness argument rests on it; making it cheap is the point.
+//   - flipping BEM_GP_INWASM_ARM to false (jit_load_store.cpp:487) for a controlled A/B
+//     puts every WPAR word back on this path. With the exact match, that A/B measured the
+//     predicate gap as well as the arm.
+//
+// Widening cannot splice the GX stream: the destination function is identical
+// (GPFifoManager::Write{8,16,32} — the same one MMU.cpp:367-373 calls, including its
+// gpfifo_redirect_excursion_to_ring takeover handling), the calls stay synchronous, and
+// program order across a pair is unchanged. It is also not newly permissive about the top
+// nibble: the old mask ignored bits 31..28 too, so 0x0C008000 / 0x8C008000 / 0xCC008000
+// all matched before and all match now.
+static inline bool is_gather_pipe(uint32_t addr) {
+    return (addr & 0x0FFFF000u) == 0x0C008000u;
 }
 
 // [stateless-xlate 2026-07-21 — the dropped-VI-write root] Post-takeover, the WORKER owns guest
@@ -239,8 +279,8 @@ uint32_t dolphin_read32(uint32_t addr) {
 
 EMSCRIPTEN_KEEPALIVE
 void dolphin_write8(uint32_t addr, uint32_t val) {
-    gp_dirty_check(addr);
-    if ((addr & 0x0FFFFFFFu) == 0x0C008000u) {
+    if (is_gather_pipe(addr)) {
+        g_bem_gp_dirty = 1;   // [perf gather-gate] arm the epilogue drain
         Core::System::GetInstance().GetGPFifo().Write8(static_cast<u8>(val));
         return;
     }
@@ -250,8 +290,8 @@ void dolphin_write8(uint32_t addr, uint32_t val) {
 
 EMSCRIPTEN_KEEPALIVE
 void dolphin_write16(uint32_t addr, uint32_t val) {
-    gp_dirty_check(addr);
-    if ((addr & 0x0FFFFFFFu) == 0x0C008000u) {
+    if (is_gather_pipe(addr)) {
+        g_bem_gp_dirty = 1;   // [perf gather-gate] arm the epilogue drain
         Core::System::GetInstance().GetGPFifo().Write16(static_cast<u16>(val));
         return;
     }
@@ -261,12 +301,13 @@ void dolphin_write16(uint32_t addr, uint32_t val) {
 
 EMSCRIPTEN_KEEPALIVE
 void dolphin_write32(uint32_t addr, uint32_t val) {
-    gp_dirty_check(addr);
     // [gp-direct 2026-07-07] GP writes bypass the MMU route: measured 85% loss between
     // MMU.Write and GPFifo::Write32 (gpW=374,733 vs gpFifoW=57,119) with the surviving
     // fragments never completing a 32B chunk — zero bursts, FIFO empty, GXDrawDone slept
     // forever. Direct routing guarantees ordered, lossless gather-pipe delivery.
-    if ((addr & 0x0FFFFFFFu) == 0x0C008000u) {
+    // [gp-page 2026-08-29] page-wide now — see is_gather_pipe (psq_st lane 1 @ EA+4).
+    if (is_gather_pipe(addr)) {
+        g_bem_gp_dirty = 1;   // [perf gather-gate] arm the epilogue drain
         Core::System::GetInstance().GetGPFifo().Write32(val);
         return;
     }
