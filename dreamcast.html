@@ -36,6 +36,15 @@
            background: #0a0a0a; border: 1px solid #333; padding: 4px; font-size: 11px;
            color: #bbb; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; }
     #log.visible { display: block; }
+    /* Toast: save/load-state feedback. Layered above the mobile shell. */
+    #toast { position: fixed; top: max(14px, env(safe-area-inset-top, 0px)); left: 50%;
+      transform: translate(-50%, -12px); background: #1b1b1f; color: #eee;
+      border: 1px solid #2a6b4a; border-left: 4px solid #2a6b4a; border-radius: 8px;
+      padding: 10px 18px; font: 14px/1.4 system-ui, sans-serif; z-index: 5000;
+      opacity: 0; pointer-events: none; transition: opacity .25s ease, transform .25s ease;
+      box-shadow: 0 4px 24px rgba(0,0,0,.5); max-width: 80vw; }
+    #toast.show { opacity: 1; transform: translate(-50%, 0); }
+    #toast.err { border-color: #8a2f2f; border-left-color: #8a2f2f; }
     /* ---- Mobile shell (ported from gamecube.html) ---- */
     #mobileShell { display: none; position: fixed; inset: 0; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); z-index: 1000; user-select: none; -webkit-user-select: none; touch-action: none; overflow: hidden; }
     #mobileShell:fullscreen, #mobileShell:-webkit-full-screen { width: 100vw; height: 100vh; }
@@ -96,9 +105,25 @@
     #mobileSplash button#mobileSplashStart { background: #2a6b4a; border-color: #2a6b4a; cursor: pointer; z-index: 3000; position: relative; }
     #mobileSplash .rotateTip { font-size: 12px; opacity: 0.55; margin-top: 8px; }
     #mobileStatus { position: absolute; top: 10px; width: 100%; text-align: center; color: #888; z-index: 900; font-size: 12px; pointer-events: none; }
+    /* Mobile console tail. The shell hides #wrap (and with it #log), so a phone
+       used to show NO diagnostic output at all — nobody could report what
+       actually happened on the device. This is a screenshot-able tail of the
+       same pageLog() stream, toggled from the mobile menu and force-shown on a
+       start failure. z-index sits above #mobileSplash (2000) so it is readable
+       even when a boot never got past the splash; #mobileMenu is lifted above
+       it so the menu still wins when open. */
+    #mobileLog { display: none; position: absolute; left: 0; right: 0; bottom: 0;
+      max-height: 45%; overflow-y: auto; -webkit-overflow-scrolling: touch;
+      touch-action: pan-y; margin: 0; padding: 6px 8px 10px; box-sizing: border-box;
+      background: rgba(0,0,0,0.88); color: #9f9; border-top: 1px solid #2a6b4a;
+      font: 10px/1.35 ui-monospace, Menlo, monospace; white-space: pre-wrap;
+      word-break: break-word; z-index: 2500; }
+    #mobileShell.log-on #mobileLog { display: block; }
+    #mobileMenu { z-index: 2600; }
   </style>
 </head>
 <body>
+<div id="toast"></div>
 <div id="wrap">
   <h3>Dreamcast Wasm</h3>
   <div id="controlBar">
@@ -170,6 +195,7 @@
     <div class="sysBtn" id="mobileStart">Start</div>
   </div>
   <div id="mobileHideHint" title="Show controls">≡</div>
+  <pre id="mobileLog"></pre>
   <div id="mobileMenu">
     <div id="mobileMenuBox">
       <h6>Menu</h6>
@@ -177,6 +203,7 @@
       <button id="mMute">Mute</button><button id="mResetAudio">Reset Audio</button>
       <button id="mGhost">Transparent Controls: Off</button>
       <button id="mHide">Hide Controls: Off</button>
+      <button id="mLog">Show Log: Off</button><button id="mCopyLog">Copy Log</button>
       <button id="mFull">Fullscreen</button><button id="mClose">Close</button>
     </div>
   </div>
@@ -188,14 +215,55 @@
   const $ = (id) => document.getElementById(id);
   const statusEl = $('status'), logEl = $('log');
 
+  // Rolling tail of every pageLog line. On mobile the shell hides #wrap (and
+  // #log with it), so without this a phone shows NO console output whatsoever
+  // and a user cannot report what the device actually did. Bounded so a long
+  // session (or ?diag=1) cannot grow the page without limit.
+  const LOG_TAIL_MAX = 300;
+  const logTail = [];
+  let mobileLogOn = false;
+  function renderMobileLog() {
+    const m = document.getElementById('mobileLog');
+    if (!m) return;
+    m.textContent = logTail.join('\n');
+    m.scrollTop = m.scrollHeight;
+  }
   function pageLog(s) {
     if (logEl) {
       logEl.textContent += s + '\n';
       logEl.scrollTop = logEl.scrollHeight;
     }
+    logTail.push(s);
+    if (logTail.length > LOG_TAIL_MAX) logTail.splice(0, logTail.length - LOG_TAIL_MAX);
+    // Only re-render when actually visible — rewriting textContent per line is
+    // O(tail) and ?diag=1 logs fast enough to matter.
+    if (mobileLogOn) renderMobileLog();
     console.log(s);
   }
   function setStatus(t) { if (statusEl) statusEl.textContent = t; }
+  // Force the mobile log open (boot failures, so the error is on screen and
+  // screenshot-able without the user hunting through a menu).
+  function showMobileLog() {
+    const shell = document.getElementById('mobileShell');
+    if (!shell) return;
+    mobileLogOn = true;
+    shell.classList.add('log-on');
+    const b = document.getElementById('mLog');
+    if (b) b.textContent = 'Show Log: On';
+    renderMobileLog();
+  }
+  // Transient toast (save/load-state feedback). ok=false renders the error
+  // accent. Re-showing restarts the timer; auto-hides after 2.5s.
+  let toastTimer = 0;
+  function showToast(msg, ok = true) {
+    const el = document.getElementById('toast');
+    if (!el) return;
+    el.textContent = msg;
+    el.classList.toggle('err', !ok);
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => el.classList.remove('show'), 2500);
+  }
 
   $('btnLog').addEventListener('click', () => logEl.classList.toggle('visible'));
 
@@ -234,36 +302,142 @@
       files: [
         { name: 'Track1.bin' },
         { name: 'Track2.bin' },
-        { name: 'Track3.bin', parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
-                                       .map(s => 'Track3.bin.part' + s) },
+        // `bytes` is the authoritative assembled size — 11 x 99,614,720 +
+        // 89,998,880, measured against dreamcast/discs/pso2/. Both the eager
+        // and the lazy path assert against it: the 2026-08-27 prod break was a
+        // set of parts that fetched HTTP-200-OK but were 133-byte Git-LFS
+        // pointers, assembled into a wrong-size Track3, and only showed up as
+        // an SH4 crash at boot. A length check turns that into a clear error.
+        { name: 'Track3.bin', bytes: 1185760800,
+          parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
+                   .map(s => 'Track3.bin.part' + s) },
         { name: 'PSO.cue' },
       ],
     },
   };
 
+  const QS = new URLSearchParams(location.search);
+
   // ---------------------------------------------------------------------------
-  // SAB layout (matches flycast_worker.js).
+  // Worker capability handshake.
+  //
+  // The page and the worker shim ship from two different repos and are NOT
+  // always in lockstep (verified 2026-08-28: flycast_worker_emcc.{js,wasm} were
+  // byte-identical across Dev/dreamcastHtml and Bemental77.github.io, but
+  // flycast_worker.js — the shim — was NOT). Two page-side decisions depend on
+  // which shim is actually deployed, and both corrupt memory or break boot if
+  // guessed wrong, so neither is guessed: the shim source is fetched and
+  // inspected before anything commits to a layout.
+  //
+  //   heapAlloc — the shim mallocs the framebuffer + audio ring and reports the
+  //     real addresses back via a 'sabLayout' message. The OLD shim instead
+  //     honours the page's FIXED offsets near 496 MB, which is the ONLY reason
+  //     the heap had to be committed at 512 MB.
+  //   lazyDisc  — the shim implements 'discLazy' (HTTP-Range streaming disc).
+  //     Absent in the deployed shim as of this edit; sending it there would
+  //     land in the default case and the disc would never be created.
+  //
+  // The probe fetches the same cache-busted URL the Worker will load, so the
+  // worker script itself is normally served from the HTTP cache (49 KB shim).
   // ---------------------------------------------------------------------------
-  const FB_OFFSET    = 0x1F000000;
+  const WORKER_URL = '/dreamcast/flycast_libretro/flycast_worker.js?v=' + Date.now();
+  const caps = { heapAlloc: false, lazyDisc: false, probed: false };
+  const capsPromise = fetch(WORKER_URL).then((r) => {
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return r.text();
+  }).then((src) => {
+    caps.heapAlloc = src.indexOf("cmd: 'sabLayout'") !== -1;
+    caps.lazyDisc  = src.indexOf("case 'discLazy'") !== -1;
+    caps.probed = true;
+    pageLog('[caps] worker shim: heapAlloc=' + caps.heapAlloc + ' lazyDisc=' + caps.lazyDisc);
+  }).catch((e) => {
+    // Unreadable shim -> assume the conservative OLD profile. That is exactly
+    // today's shipped behaviour (0e7ee26), so a probe failure can only ever
+    // degrade to the known-good path, never to an untested one.
+    pageLog('[caps] shim probe failed (' + e + ') — assuming legacy fixed-offset shim');
+  });
+
+  // ---------------------------------------------------------------------------
+  // SAB layout. With a heapAlloc shim these are only REQUESTS — the worker
+  // mallocs instead and the real addresses arrive via 'sabLayout' (handled
+  // below). With a legacy shim they are the literal addresses the wasm writes
+  // to, and the heap must be large enough to contain them.
+  // ---------------------------------------------------------------------------
   const FB_W = 640, FB_H = 480;
   const FB_BYTES     = FB_W * FB_H * 4;
-  const AUDIO_OFFSET = 0x1F200000;
   const AUDIO_FRAMES = 16384;
+  const AUDIO_BYTES  = AUDIO_FRAMES * 2 * 4 + 64;   // stereo f32 + header
+  let FB_OFFSET      = 0x1F000000;                  // ~496 MB (legacy fixed)
+  let AUDIO_OFFSET   = 0x1F200000;                  // ~498 MB (legacy fixed)
 
-  const sharedMemory = new WebAssembly.Memory({
-    initial: 536870912 / 65536,
-    maximum: 4294967296 / 65536,
-    shared: true,
-  });
-  pageLog('[page] sharedMemory allocated (' + (sharedMemory.buffer.byteLength >>> 20) + ' MB)');
+  // The module's own declared memory import, read out of
+  // flycast_worker_emcc.wasm: initial=2048 pages (128 MB), maximum=65536 pages
+  // (4096 MB), shared. Import matching requires provided.initial >= 128 MB and
+  // provided.maximum <= 4096 MB; both bounds below are inside that, so NOTHING
+  // here needs a relink.
+  const MODULE_MIN_MB = 128;
+  const MODULE_MAX_MB = 4096;
+
+  let sharedMemory = null;
+
+  // Small helper for the numeric URL overrides. Absent/garbage -> default;
+  // anything else is clamped into [lo,hi] (0 is a legal value, e.g. readahead).
+  function clampMB(v, lo, hi, dflt) {
+    if (v === null || v === undefined || v === '') return dflt;
+    const n = parseInt(v, 10);
+    if (!isFinite(n)) return dflt;
+    return Math.min(hi, Math.max(lo, n));
+  }
+
+  function createSharedMemory() {
+    // A shared memory reserves its MAXIMUM as address space up front and
+    // commits its INITIAL immediately. The old 512 MB / 4096 MB pair asked a
+    // phone for half a gig of committed RAM plus a 4 GB VA reservation for a
+    // module that declares it only needs 128 MB. Desktop grants both silently;
+    // iOS has refused large shared maxima (emscripten#19144).
+    //
+    // initial: 128 MB is only safe when the shim mallocs the fb/audio ring. On
+    // a legacy shim the wasm writes at ~496-498 MB and a 128 MB heap would put
+    // those stores out of bounds, so that path keeps 512 MB.
+    const needFixed = !caps.heapAlloc;
+    const defInit = needFixed ? 512 : MODULE_MIN_MB;
+    let initMB = clampMB(QS.get('initmem'), MODULE_MIN_MB, MODULE_MAX_MB, defInit);
+    let maxMB  = clampMB(QS.get('maxmem'),  MODULE_MIN_MB, MODULE_MAX_MB, 2048);
+    if (needFixed) {
+      // Hard floor: the fixed ring must fit, whatever ?initmem= asked for.
+      const floorMB = Math.ceil((AUDIO_OFFSET + AUDIO_BYTES) / 1048576);
+      if (initMB < floorMB) {
+        pageLog('[page] legacy shim needs the fixed ring at ' + floorMB +
+                ' MB — raising initial from ' + initMB + ' MB');
+        initMB = floorMB;
+      }
+    }
+    if (maxMB < initMB) maxMB = initMB;
+    sharedMemory = new WebAssembly.Memory({
+      initial: (initMB * 1048576) / 65536,
+      maximum: (maxMB * 1048576) / 65536,
+      shared: true,
+    });
+    pageLog('[page] sharedMemory allocated (initial ' + initMB + ' MB, maximum ' +
+            maxMB + ' MB, ' + (caps.heapAlloc ? 'heap-allocated fb/audio' : 'legacy fixed offsets') + ')');
+  }
 
   // ---------------------------------------------------------------------------
-  // Worker bootstrap. Runs silently in the background while the user picks a game.
+  // Worker bootstrap. Runs silently in the background while the user picks a
+  // game. The Worker is constructed immediately (its script download overlaps
+  // the capability probe); only 'mem-init' waits, because the memory's size
+  // depends on what the probe finds. The shim ignores every message until
+  // 'mem-init' arrives, so delaying it costs nothing but the probe round-trip.
   // ---------------------------------------------------------------------------
-  const worker = new Worker('/dreamcast/flycast_libretro/flycast_worker.js?v=' + Date.now());
+  const worker = new Worker(WORKER_URL);
   let workerReady = false;
   let workerReadyResolve;
   const workerReadyPromise = new Promise((r) => { workerReadyResolve = r; });
+  // Resolves once the worker has reported its real fb/audio addresses. On a
+  // legacy shim no 'sabLayout' ever arrives, so this is resolved eagerly there
+  // and the page keeps the fixed offsets it asked for.
+  let sabLayoutResolve;
+  const sabLayoutPromise = new Promise((r) => { sabLayoutResolve = r; });
 
   let booted = false;
   let pendingDiscLoad = null;  // resolver for discReady -> discLoaded
@@ -272,8 +446,25 @@
     const d = e.data || {};
     switch (d.cmd) {
       case 'print':       pageLog(d.txt); break;
+      // The heapAlloc shim mallocs the framebuffer + audio ring and reports the
+      // real addresses here. Adopting them is NOT optional: the shim already
+      // pointed the wasm at those addresses via _emscripten_set_audio_ring, so
+      // a page still reading the old fixed 0x1F200000 reads a ring nothing ever
+      // writes — silent audio — and, once the heap is sized to 128 MB, an
+      // out-of-bounds view. This arrives strictly before 'ready' (the shim only
+      // posts 'ready' once videoAudioWired is set, immediately after this).
+      case 'sabLayout':
+        FB_OFFSET = d.fbOffset >>> 0;
+        AUDIO_OFFSET = d.audioOffset >>> 0;
+        pageLog('[page] worker-reported SAB layout: fb=' + FB_OFFSET +
+                ' audio=' + AUDIO_OFFSET + ' frames=' + (d.audioFrames | 0));
+        sabLayoutResolve(true);
+        break;
       case 'ready':
         workerReady = true;
+        // Legacy shim: no 'sabLayout' will ever come, so release anything
+        // waiting on it and keep the fixed offsets the page requested.
+        sabLayoutResolve(false);
         pageLog('[page] worker ready');
         // Send diag toggle AFTER worker is up — the early-queue path may
         // drop pre-runtime messages depending on shim version.
@@ -359,6 +550,19 @@
           // RTE UpdateINTC (the storm livelock). Must be set before blocks compile.
           if (new URLSearchParams(location.search).has('rteintc')) {
             worker.postMessage({ cmd: 'setrteintc', on: 1 });
+          }
+          // idleskip — burn the slice remainder at PSO's frame-wait spin PCs instead
+          // of executing spin iterations. NOW DEFAULTS ON in the worker
+          // (rec_wasm.cpp g_idleskip = 1), so ?idleskip=1 is a no-op kept for
+          // symmetry and ?noidleskip=1 is the OFF switch. Without the OFF switch
+          // there is no way to A/B it or to recover on a device where the bounded
+          // skip misbehaves, which is why it exists. The bound is ISK_RUN=32: at
+          // most 32 consecutive skipped visits, then one real execution, so the
+          // guest can always leave the loop.
+          {
+            const _isk = new URLSearchParams(location.search);
+            if (_isk.has('noidleskip')) worker.postMessage({ cmd: 'setidleskip', on: 0 });
+            else if (_isk.has('idleskip')) worker.postMessage({ cmd: 'setidleskip', on: 1 });
           }
           // Monomorphic inline-cache: COLD-ARM at boot (lever-4 task 5). The
           // per-write SMC map makes arming safe through the SMC-heavy boot —
@@ -447,6 +651,7 @@
         if (d.data && d.data.byteLength > 0) {
           savedState = new Uint8Array(d.data);
           pageLog('[page] state saved ' + savedState.byteLength + ' B');
+          showToast('✓ State saved (' + (savedState.byteLength / 1048576).toFixed(1) + ' MB)');
           // Probe fast-path: ?autosave=<ms> runs push the bytes back to the
           // probe's HTTP server so later runs can jump straight to the scene.
           if (new URLSearchParams(location.search).has('autosave')) {
@@ -459,6 +664,7 @@
             .catch((e) => pageLog('[page] persist failed: ' + e));
         } else {
           pageLog('[page] Save State returned empty — not saved (is the game running?)');
+          showToast('Save failed — is the game running?', false);
         }
         break;
       case 'stateLoaded': {
@@ -484,11 +690,41 @@
   // per canvas, and the page-side can no longer call getContext after — so
   // the legacy SAB-blit paintFrame paths below become no-ops.
   const offscreen = $('dc-canvas').transferControlToOffscreen();
-  worker.postMessage({ cmd: 'mem-init', memory: sharedMemory,
-                       fbOffset: FB_OFFSET, fbW: FB_W, fbH: FB_H,
-                       audioOffset: AUDIO_OFFSET, audioFrames: AUDIO_FRAMES,
-                       offscreen: offscreen },
-                     [offscreen]);
+  // mem-init waits on the capability probe: the memory cannot be sized until we
+  // know whether the shim mallocs the fb/audio ring or writes to the page's
+  // fixed ~496 MB offsets. The shim discards every message until it receives
+  // mem-init, so this delay only postpones its importScripts, and the disc
+  // fetch (the actual long pole) is unaffected — it already awaits worker ready.
+  capsPromise.then(() => {
+    createSharedMemory();
+    worker.postMessage({ cmd: 'mem-init', memory: sharedMemory,
+                         fbOffset: FB_OFFSET, fbW: FB_W, fbH: FB_H,
+                         audioOffset: AUDIO_OFFSET, audioFrames: AUDIO_FRAMES,
+                         offscreen: offscreen },
+                       [offscreen]);
+    // Boot watchdog. If the wasm cannot instantiate — the classic cause being a
+    // page-provided memory smaller than the module's declared minimum, i.e.
+    // MODULE_MIN_MB above having drifted from -sINITIAL_MEMORY in
+    // flycast-bridge/flycast_worker_link.sh — the shim reports it as
+    // "factory rejected: ..." and the page otherwise just sits on
+    // "Waiting for emulator runtime..." forever. On a phone that is a silent
+    // hang with no visible console, which is exactly the state this whole
+    // change set exists to make reportable. Surface it.
+    setTimeout(() => {
+      if (workerReady) return;
+      pageLog('[page] WATCHDOG: worker still not ready. memory=' +
+              (sharedMemory ? (sharedMemory.buffer.byteLength >>> 20) + ' MB' : 'none') +
+              ' caps.heapAlloc=' + caps.heapAlloc + ' caps.lazyDisc=' + caps.lazyDisc +
+              ' capsProbed=' + caps.probed +
+              ' — check for a "factory rejected" line above; if it names the memory ' +
+              'import, MODULE_MIN_MB no longer matches the linked -sINITIAL_MEMORY.');
+      showMobileLog();
+    }, 45000);
+  }).catch((e) => {
+    pageLog('[page] FATAL: mem-init failed: ' + (e && e.message ? e.message : String(e)));
+    setStatus('Failed to initialize emulator memory: ' + (e && e.message ? e.message : String(e)));
+    showMobileLog();
+  });
 
   // Optional ?diag=1 URL param enables the SH4 per-1000-dispatch sampler +
   // SPG/MMIO/exception trace. Toggle is sent in the 'ready' handler below
@@ -503,6 +739,21 @@
   async function initAudio() {
     if (audioContext) return;
     try {
+      // AUDIO_OFFSET is only final once the worker has reported (or declined to
+      // report) its layout. Callers already run after workerReadyPromise, and
+      // 'sabLayout' precedes 'ready', so this is normally already settled — the
+      // await just makes the ordering a guarantee rather than a coincidence.
+      await sabLayoutPromise;
+      const heapBytes = sharedMemory.buffer.byteLength;
+      if (AUDIO_OFFSET + AUDIO_BYTES > heapBytes) {
+        // Refuse rather than throw a RangeError deep inside the worklet: audio
+        // is not worth taking the boot down for, and a silent wrong-address
+        // ring is exactly the failure this whole handshake exists to prevent.
+        pageLog('[page] audio ring at ' + AUDIO_OFFSET + ' + ' + AUDIO_BYTES +
+                ' B exceeds the ' + heapBytes + ' B heap — audio DISABLED ' +
+                '(worker/page SAB layout mismatch)');
+        return;
+      }
       audioContext = new (self.AudioContext || self.webkitAudioContext)({ sampleRate: 44100 });
       await audioContext.audioWorklet.addModule('/dreamcast/audio-worklet.js');
       const node = new AudioWorkletNode(audioContext, 'dc-audio-processor', {
@@ -562,21 +813,121 @@
     }
     return ab;
   }
+  // ---------------------------------------------------------------------------
+  // Lazy disc (?lazydisc=1) — OPT-IN, eager stays the default.
+  //
+  // The eager path below fetches all 1,185,760,800 B of Track3 into bufs[],
+  // then allocates a SECOND full-size buffer and copies into it while bufs[] is
+  // still reachable (~2.21 GiB transient), and Module.FS.writeFile then retains
+  // a third copy in the worker's JS heap for the whole session. No phone holds
+  // that. The worker's 'discLazy' handler replaces it with an HTTP-Range
+  // streaming FS node (1 MB chunks, bounded LRU, readahead).
+  //
+  // It is opt-in on purpose. Lazy disc previously shipped as a DEFAULT
+  // alongside two other unverified changes and the game crashed at boot; that
+  // was reverted in e6707b6 and 0e7ee26 is the confirmed-good runtime. So:
+  //   * default off — ?lazydisc=1 to arm it;
+  //   * gated on the capability probe, because the deployed shim has no
+  //     'discLazy' case at all (verified 2026-08-28) and would silently create
+  //     no disc node;
+  //   * every part is preflighted below. The worker's own range reader does NOT
+  //     validate length — on a non-206 short response it returns the short
+  //     buffer and the caller zero-fills the remainder, which is silent disc
+  //     corruption and is precisely the shape of the last break (an HTTP 200
+  //     accepted without a length check).
+  // ---------------------------------------------------------------------------
+  async function preflightRanges(file, base) {
+    const urls = file.parts.map((p) => base + p);
+    const parts = [];
+    let total = 0;
+    for (let i = 0; i < urls.length; i++) {
+      setStatus('Checking disc part ' + (i + 1) + '/' + urls.length);
+      const r = await fetch(urls[i], { headers: { Range: 'bytes=0-0' } });
+      // 206 is mandatory. A 200 means the server ignored Range and would stream
+      // the whole 100 MB part per chunk read; anything else is an outright fail.
+      if (r.status !== 206) throw new Error(urls[i] + ' Range unsupported (HTTP ' + r.status + ')');
+      const cr = r.headers.get('Content-Range') || '';
+      const m = /^bytes\s+\d+-\d+\/(\d+)$/i.exec(cr.trim());
+      if (!m) throw new Error(urls[i] + ' bad Content-Range: "' + cr + '"');
+      const size = parseInt(m[1], 10);
+      // A Git-LFS pointer is 133 B and would sail through a naive size sum.
+      if (!isFinite(size) || size < 1048576) throw new Error(urls[i] + ' implausible size ' + size + ' B');
+      parts.push({ url: urls[i], size: size });
+      total += size;
+    }
+    if (file.bytes && total !== file.bytes) {
+      throw new Error('disc parts total ' + total + ' B, expected ' + file.bytes + ' B');
+    }
+    return { parts: parts, total: total };
+  }
+
+  // Returns true if the file was handed to the worker lazily.
+  async function tryPostLazy(file, base) {
+    if (!file.parts || !QS.has('lazydisc')) return false;
+    if (!caps.lazyDisc) {
+      pageLog('[lazydisc] requested, but this worker shim has no discLazy handler — using the eager path');
+      return false;
+    }
+    let pre;
+    try {
+      pre = await preflightRanges(file, base);
+    } catch (e) {
+      // Any doubt at all -> eager. A half-working lazy disc is worse than a
+      // slow one: it boots and then corrupts.
+      pageLog('[lazydisc] preflight FAILED (' + (e && e.message ? e.message : String(e)) +
+              ') — falling back to the eager path');
+      return false;
+    }
+    const cacheMB = clampMB(QS.get('disccache'), 16, 512, 96);
+    const readahead = clampMB(QS.get('discreadahead'), 0, 32, 4);
+    await workerReadyPromise;
+    worker.postMessage({ cmd: 'discLazy', name: file.name, parts: pre.parts,
+                         cacheMB: cacheMB, readahead: readahead });
+    pageLog('[lazydisc] streaming ' + file.name + ' (' + pre.total + ' B over ' +
+            pre.parts.length + ' verified parts, ' + cacheMB + ' MB cache, readahead ' + readahead + ')');
+    return true;
+  }
+
   async function fetchAndPostFile(file, base, cuePath) {
+    if (await tryPostLazy(file, base)) return;
     let buf;
     if (file.parts) {
       const parts = file.parts.map(p => base + p);
-      const bufs = [];
-      let total = 0;
-      for (let i = 0; i < parts.length; i++) {
-        setStatus(file.name + ' part ' + (i + 1) + '/' + parts.length);
-        const ab = await fetchDiscBlob(parts[i]);
-        bufs.push(new Uint8Array(ab));
-        total += ab.byteLength;
+      // Write each part straight into the destination as it lands. The old
+      // bufs[] + second full-size `out` copy held ~2.21 GiB at once for a
+      // 1.13 GiB file; one preallocated buffer holds 1.13 GiB. The total has to
+      // be known up front, which is what file.bytes is for — and when it is
+      // absent we fall back to the two-pass form.
+      let out, off = 0;
+      if (file.bytes) {
+        out = new Uint8Array(file.bytes);
+        for (let i = 0; i < parts.length; i++) {
+          setStatus(file.name + ' part ' + (i + 1) + '/' + parts.length);
+          const ab = await fetchDiscBlob(parts[i]);
+          if (off + ab.byteLength > file.bytes) {
+            throw new Error(file.name + ' overruns its declared size at part ' + (i + 1) +
+                            ' (' + (off + ab.byteLength) + ' > ' + file.bytes + ')');
+          }
+          out.set(new Uint8Array(ab), off);
+          off += ab.byteLength;
+        }
+      } else {
+        const bufs = [];
+        for (let i = 0; i < parts.length; i++) {
+          setStatus(file.name + ' part ' + (i + 1) + '/' + parts.length);
+          const ab = await fetchDiscBlob(parts[i]);
+          bufs.push(new Uint8Array(ab));
+          off += ab.byteLength;
+        }
+        out = new Uint8Array(off);
+        let w = 0;
+        for (const b of bufs) { out.set(b, w); w += b.byteLength; }
       }
-      const out = new Uint8Array(total);
-      let off = 0;
-      for (const b of bufs) { out.set(b, off); off += b.byteLength; }
+      // The 2026-08-27 break assembled a wrong-size Track3 from parts that all
+      // returned HTTP 200 and only surfaced as an SH4 crash at boot. Fail loud.
+      if (file.bytes && off !== file.bytes) {
+        throw new Error(file.name + ' assembled to ' + off + ' B, expected ' + file.bytes + ' B');
+      }
       buf = out.buffer;
     } else {
       setStatus('Fetching ' + file.name);
@@ -655,6 +1006,9 @@
     } catch (err) {
       pageLog('[page] start failed: ' + (err && err.message ? err.message : String(err)));
       setStatus('Failed: ' + (err && err.message ? err.message : String(err)));
+      // Put the console on screen. On a phone the shell hides #wrap, so this
+      // is the ONLY way the user ever sees why the boot died.
+      showMobileLog();
       $('btnStart').disabled = false;
     }
   });
@@ -1031,6 +1385,27 @@
     $('mResetAudio').addEventListener('click', () => $('btnResetAudio').click());
     $('mGhost').addEventListener('click', () => { ghost = !ghost; shell.classList.toggle('ghost', ghost); $('mGhost').textContent = 'Transparent Controls: ' + (ghost ? 'On' : 'Off'); });
     $('mHide').addEventListener('click', () => { hidden = !hidden; shell.classList.toggle('hide-controls', hidden); $('mHide').textContent = 'Hide Controls: ' + (hidden ? 'On' : 'Off'); $('mobileMenu').classList.remove('open'); });
+    // Console tail. The shell hides #wrap (and #log with it), so this is the
+    // only console a phone has — without it a device failure is unreportable.
+    $('mLog').addEventListener('click', () => {
+      mobileLogOn = !mobileLogOn;
+      shell.classList.toggle('log-on', mobileLogOn);
+      $('mLog').textContent = 'Show Log: ' + (mobileLogOn ? 'On' : 'Off');
+      if (mobileLogOn) renderMobileLog();
+      $('mobileMenu').classList.remove('open');
+    });
+    $('mCopyLog').addEventListener('click', async () => {
+      const txt = logTail.join('\n');
+      try {
+        await navigator.clipboard.writeText(txt);
+        showToast('✓ Log copied (' + logTail.length + ' lines)');
+      } catch (_) {
+        // Clipboard is gated on a secure context + permission on some phones;
+        // fall back to showing it so the user can screenshot instead.
+        showMobileLog();
+        showToast('Copy blocked — log shown, screenshot it', false);
+      }
+    });
     $('mobileHideHint').addEventListener('pointerdown', (e) => { e.preventDefault(); hidden = false; shell.classList.remove('hide-controls'); });
     $('mFull').addEventListener('click', () => {
       $('mobileMenu').classList.remove('open');

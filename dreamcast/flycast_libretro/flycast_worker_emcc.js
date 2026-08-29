@@ -41,6 +41,40 @@ var ENVIRONMENT_IS_NODE = globalThis.process?.versions?.node && globalThis.proce
 var ENVIRONMENT_IS_PTHREAD = ENVIRONMENT_IS_WORKER && globalThis.name == "em-pthread";
 
 (function() {
+  // -------------------------------------------------------------------------
+  // __flycastBridgeLog — the ONE way worker-side JS in this bridge reaches the
+  // user's screen. Exported on globalThis so gl_override.js (--js-library,
+  // merged into the same factory scope) can use it without duplicating the
+  // realm logic.
+  // Route, each hop read: postMessage({cmd:'print'})
+  //   -> dreamcast.html:155 `case 'print': pageLog(d.txt)` -> the #log element.
+  // A bare console.log does NOT reach the page — it only lands in DevTools,
+  // and on a phone nobody has DevTools. console.log is still emitted as a
+  // second channel for a desktop human and for flycast_probe.js.
+  // Guarded on globalThis.name !== 'em-pthread' for the same reason
+  // flycast_worker_link.sh:449-451 and flycast_worker.js:29-32 are: pthread
+  // children load this same factory, and a child's postMessage goes to the
+  // emcc parent pthread protocol, which swallows unknown commands. From a
+  // child we fall back to console.error, which flycast_worker.js:29-31
+  // records as reaching the probe from BOTH realms.
+  // No PROXY_TO_PTHREAD in flycast_worker_link.sh (only -pthread /
+  // -sPTHREAD_POOL_SIZE=8), so the WebGL2 context and every call made through
+  // it live on the main-runtime thread (EmscriptenWorker.cpp:529, :573) —
+  // i.e. the postMessage arm is the one that actually runs for GL callbacks.
+  // -------------------------------------------------------------------------
+  var isPthread = (typeof globalThis !== "undefined" && globalThis.name === "em-pthread");
+  function bridgeLog(txt) {
+    try {
+      if (typeof console !== "undefined" && console.log) console.log(txt);
+    } catch (_) {}
+    try {
+      if (!isPthread && typeof postMessage === "function") postMessage({
+        cmd: "print",
+        txt
+      }); else if (typeof console !== "undefined" && console.error) console.error(txt);
+    } catch (_) {}
+  }
+  if (typeof globalThis !== "undefined") globalThis.__flycastBridgeLog = bridgeLog;
   if (typeof console !== "undefined" && console.warn) {
     var origWarn = console.warn;
     console.warn = function() {
@@ -52,6 +86,68 @@ var ENVIRONMENT_IS_PTHREAD = ENVIRONMENT_IS_WORKER && globalThis.name == "em-pth
       return origWarn.apply(console, arguments);
     };
   }
+  // -------------------------------------------------------------------------
+  // Flood caps. Every number here is small on purpose.
+  // Unbounded per-event logging is a PROVEN failure mode in this project, not
+  // a hypothetical: the per-memory-access [gdrom] trace emitted 51,867 of
+  // 53,319 console lines in one 60-second run and throttled the very poll loop
+  // it was observing, so the guest never left the disc bootstrap and the run
+  // read as a boot wedge (flycast_worker_link.sh:160-192). A GL error inside a
+  // draw path repeats on every draw call — exactly the same shape. So: log the
+  // first few in full, then only on a power-of-two ladder, then stop entirely
+  // with one closing line.
+  // -------------------------------------------------------------------------
+  var GLERR_VERBOSE_FIRST = 3;
+  // first N of each class get a full report
+  var GLERR_MAX_LINES = 12;
+  // hard ceiling per class, ladder included
+  var GLERR_MAX_DRAIN = 64;
+  // bound the 0x500 drain loop (was unbounded)
+  // Milliseconds since this file was evaluated, stamped on every error line.
+  // Without it a screenshot cannot tell an init-time error (the GL-version /
+  // vendor probes at core/wsi/gl_context.cpp:31-36 and
+  // core/rend/gles/gles.cpp:601-609 legitimately generate and drain errors on
+  // every platform, desktop included) from a steady-state one — and only the
+  // steady-state ones are the mobile signal.
+  var _now = (typeof performance !== "undefined" && performance.now) ? function() {
+    return performance.now();
+  } : function() {
+    return Date.now();
+  };
+  var _t0 = _now();
+  function since() {
+    return " t=+" + Math.round(_now() - _t0) + "ms";
+  }
+  // extraFn is a thunk, not a string: it is only invoked for the first
+  // GLERR_VERBOSE_FIRST occurrences that actually get logged, so building an
+  // Error stack costs nothing on the silenced path.
+  function makeErrReporter(tag) {
+    var count = 0, lines = 0, nextLadder = 4, done = false;
+    return function(extraFn) {
+      count++;
+      if (done) return count;
+      var verbose = count <= GLERR_VERBOSE_FIRST;
+      var ladder = count >= nextLadder;
+      if (!verbose && !ladder) return count;
+      if (ladder) nextLadder *= 2;
+      if (lines >= GLERR_MAX_LINES) {
+        done = true;
+        bridgeLog("[glcompat] " + tag + ": log cap reached at " + count + " — further occurrences are counted but SILENCED");
+        return count;
+      }
+      lines++;
+      var extra = "";
+      if (verbose && typeof extraFn === "function") {
+        try {
+          extra = " " + extraFn();
+        } catch (_) {}
+      } else if (typeof extraFn === "string" && extraFn) {
+        extra = " " + extraFn;
+      }
+      bridgeLog("[glcompat] " + tag + " #" + count + since() + extra);
+      return count;
+    };
+  }
   function patchCtx(ctx) {
     if (!ctx || ctx.__flycastPatched) return ctx;
     ctx.__flycastPatched = true;
@@ -61,10 +157,61 @@ var ENVIRONMENT_IS_PTHREAD = ENVIRONMENT_IS_WORKER && globalThis.name == "em-pth
       if (pname === 35724 || pname === ctx.SHADING_LANGUAGE_VERSION) return "OpenGL ES GLSL ES 3.00";
       return origGetParam(pname);
     };
+    // -----------------------------------------------------------------------
+    // getError: keep swallowing GL_INVALID_ENUM, but COUNT and REPORT it.
+    // Why the swallow must stay: GLGraphicsContext::findGLVersion()
+    // (core/wsi/gl_context.cpp:31-36) calls glGetIntegerv(GL_MAJOR_VERSION)
+    // and treats a following GL_INVALID_ENUM as "this context is GLES2",
+    // forcing majorVersion=2. That downgrades the entire renderer (GLES2
+    // shader subset, u16 indices, GL_ALPHA single-channel — gles.cpp:526-531).
+    // Letting 0x500 through here would regress every platform, so it stays.
+    // Why it must be reported: 0x500 is PRECISELY the error a mobile driver
+    // raises for a format / filter / enum that the desktop driver accepts, and
+    // this drain is the reason no such error has ever been visible from a
+    // device. Nothing downstream can see it — dreamcast/flycast-src/core/rend/gles/gles.h
+    // glCheck() reads glGetError() and therefore can never observe a 0x500
+    // either. This counter is the only place it exists.
+    // Always on, and effectively free: glGetError is not called per-frame in
+    // this build (core/rend/gles/gles.cpp:608 and core/wsi/gl_context.cpp:31-33
+    // drain at init; glCheck() is compiled out by default), so this is a
+    // branch and an increment on an init-time path.
+    // -----------------------------------------------------------------------
+    var reportInvalidEnum = makeErrReporter("swallowed GL_INVALID_ENUM (0x0500)");
+    var reportRealError = makeErrReporter("GL error reached the core");
     var origGetError = ctx.getError.bind(ctx);
     ctx.getError = function() {
       var err = origGetError();
-      while (err === 1280) err = origGetError();
+      var drained = 0;
+      while (err === 1280) {
+        // A stack for the first few only: under emcc the frames name the wasm
+        // function that made the offending call, which is the whole point.
+        // new Error().stack is not cheap — the thunk is invoked only when the
+        // reporter has decided this occurrence is one of the verbose ones.
+        reportInvalidEnum(function() {
+          return "stack=" + String((new Error).stack || "").split("\n").slice(1, 8).join(" | ");
+        });
+        if (++drained >= GLERR_MAX_DRAIN) {
+          // Previously unbounded. A driver that keeps reporting 0x500 would
+          // hang the worker here with no message at all.
+          bridgeLog("[glcompat] getError: " + GLERR_MAX_DRAIN + " consecutive GL_INVALID_ENUM — giving up the drain, returning 0x500 to the core");
+          return 1280;
+        }
+        err = origGetError();
+      }
+      // Everything that is NOT 0x500 does reach the C side, but the C side
+      // discards it unless the build has -DFLYCAST_GL_CHECKS (gles.h). Report
+      // it here so a stock production build on a phone still says something.
+      if (err !== 0) {
+        var name = ({
+          1281: "GL_INVALID_VALUE",
+          1282: "GL_INVALID_OPERATION",
+          1285: "GL_OUT_OF_MEMORY",
+          1286: "GL_INVALID_FRAMEBUFFER_OPERATION",
+          1287: "GL_CONTEXT_LOST",
+          37442: "GL_CONTEXT_LOST_WEBGL"
+        })[err] || "GL_<unknown>";
+        reportRealError(name + " (0x" + err.toString(16) + ")");
+      }
       return err;
     };
     var texBindings = {};
@@ -84,17 +231,104 @@ var ENVIRONMENT_IS_PTHREAD = ENVIRONMENT_IS_WORKER && globalThis.name == "em-pth
       if (b && !origGetParam(b)) return;
       return origTexParameterf(target, pname, param);
     };
-    if (typeof console !== "undefined" && console.log) {
-      console.log("[flycast-wasm] patched WebGL2 context");
-    }
+    reportContext(ctx, origGetParam);
     return ctx;
+  }
+  // -------------------------------------------------------------------------
+  // One-shot device report, emitted once per context at creation.
+  // This is the single highest-value thing a phone can send back: it names the
+  // actual GPU (WebGL masks the vendor as "WebKit"/"Mozilla" unless
+  // WEBGL_debug_renderer_info is asked for), states which context attributes
+  // the driver actually GRANTED (a phone can silently refuse stencil, which
+  // breaks modifier volumes), and lists the limits the renderer sizes itself
+  // against. Bounded output — a fixed number of lines, no per-frame component.
+  // NOTE: this only READS. It deliberately does not feed the unmasked vendor
+  // back into glGetString(GL_VENDOR), because gles.cpp:605 derives
+  // `gl.mali = !stricmp(vendor, "arm")` from it and gl4/gldraw.cpp:474 changes
+  // the depth-stencil format on that flag. Turning a diagnostic into a
+  // behavior change is exactly what we are trying not to do here.
+  // -------------------------------------------------------------------------
+  function reportContext(ctx, getParam) {
+    try {
+      var vendor = String(getParam(7936));
+      // GL_VENDOR (masked)
+      var rend = String(getParam(7937));
+      // GL_RENDERER (masked)
+      var uv = "?", ur = "?";
+      try {
+        var dbg = ctx.getExtension("WEBGL_debug_renderer_info");
+        if (dbg) {
+          uv = String(getParam(dbg.UNMASKED_VENDOR_WEBGL));
+          ur = String(getParam(dbg.UNMASKED_RENDERER_WEBGL));
+        }
+      } catch (_) {}
+      bridgeLog('[glinfo] gpu masked="' + vendor + '" / "' + rend + '" unmasked="' + uv + '" / "' + ur + '"');
+      var a = {};
+      try {
+        a = ctx.getContextAttributes() || {};
+      } catch (_) {}
+      bridgeLog("[glinfo] granted attrs depth=" + a.depth + " stencil=" + a.stencil + " alpha=" + a.alpha + " antialias=" + a.antialias + " preserveDrawingBuffer=" + a.preserveDrawingBuffer + " powerPreference=" + a.powerPreference + " failIfMajorPerformanceCaveat=" + a.failIfMajorPerformanceCaveat);
+      bridgeLog("[glinfo] limits maxTex=" + getParam(3379) + // MAX_TEXTURE_SIZE
+      " maxRB=" + getParam(34024) + // MAX_RENDERBUFFER_SIZE
+      " maxVaryingVec=" + getParam(36348) + // MAX_VARYING_VECTORS
+      " maxVertUniformVec=" + getParam(36347) + // MAX_VERTEX_UNIFORM_VECTORS
+      " maxFragUniformVec=" + getParam(36349) + // MAX_FRAGMENT_UNIFORM_VECTORS
+      " maxTexUnits=" + getParam(34930) + // MAX_TEXTURE_IMAGE_UNITS
+      " maxSamples=" + getParam(36183) + // MAX_SAMPLES
+      " maxDrawBuf=" + getParam(34852));
+      // MAX_DRAW_BUFFERS
+      bridgeLog("[glinfo] drawingBuffer=" + ctx.drawingBufferWidth + "x" + ctx.drawingBufferHeight);
+      var exts = [];
+      try {
+        exts = ctx.getSupportedExtensions() || [];
+      } catch (_) {}
+      // The full list matters on mobile — a missing EXT_color_buffer_float or
+      // a missing compressed-texture family is a concrete, fixable cause.
+      bridgeLog("[glinfo] " + exts.length + " extensions: " + exts.join(" "));
+      // Context loss is the classic mobile failure (GPU process OOM / app
+      // backgrounded). Without this the page just goes black and says nothing.
+      // OffscreenCanvas fires contextlost/contextrestored; the HTMLCanvas path
+      // uses the webgl-prefixed names. Register both, ignore what does not exist.
+      try {
+        var target = ctx.canvas;
+        if (target && typeof target.addEventListener === "function") {
+          [ "webglcontextlost", "contextlost" ].forEach(function(n) {
+            target.addEventListener(n, function() {
+              bridgeLog("[glinfo] *** WEBGL CONTEXT LOST (" + n + ") *** — the GPU process dropped " + "this context. Everything after this line is meaningless; the canvas will stay black.");
+            }, false);
+          });
+          [ "webglcontextrestored", "contextrestored" ].forEach(function(n) {
+            target.addEventListener(n, function() {
+              bridgeLog("[glinfo] webgl context restored (" + n + ") — Flycast does NOT rebuild its " + "GL objects on restore, so the renderer is still dead.");
+            }, false);
+          });
+        }
+      } catch (_) {}
+    } catch (e) {
+      bridgeLog("[glinfo] context report failed: " + (e && e.message ? e.message : e));
+    }
+    bridgeLog("[flycast-wasm] patched WebGL2 context");
   }
   function wrapPrototype(proto) {
     if (!proto || !proto.getContext) return;
     var orig = proto.getContext;
     proto.getContext = function(type, attrs) {
       var ctx = orig.call(this, type, attrs);
-      if (type === "webgl2" || type === "experimental-webgl2") patchCtx(ctx);
+      if (type === "webgl2" || type === "experimental-webgl2") {
+        if (!ctx) {
+          // A phone that refuses the attribute set (or has no WebGL2 at all)
+          // used to produce exactly nothing here.
+          bridgeLog('[glinfo] *** getContext("' + type + '") returned NULL *** — no WebGL2 context ' + "on this device/browser for attrs=" + (function() {
+            try {
+              return JSON.stringify(attrs);
+            } catch (_) {
+              return "?";
+            }
+          })() + ". Nothing downstream can run.");
+        } else {
+          patchCtx(ctx);
+        }
+      }
       return ctx;
     };
   }
@@ -10288,121 +10522,121 @@ Module["GL"] = GL;
 var proxiedFunctionTable = [ _proc_exit, exitOnMainThread, pthreadCreateProxied, ___syscall_accept4, ___syscall_bind, ___syscall_connect, ___syscall_faccessat, ___syscall_fcntl64, ___syscall_fstat64, ___syscall_getdents64, ___syscall_getpeername, ___syscall_getsockname, ___syscall_getsockopt, ___syscall_ioctl, ___syscall_listen, ___syscall_lstat64, ___syscall_mkdirat, ___syscall_newfstatat, ___syscall_openat, ___syscall_pipe2, ___syscall_poll, ___syscall_poll_nonblocking, ___syscall_recvfrom, ___syscall_recvmsg, ___syscall_rmdir, ___syscall_sendmsg, ___syscall_sendto, ___syscall_setsockopt, ___syscall_shutdown, ___syscall_socket, ___syscall_stat64, ___syscall_unlinkat, __mmap_js, __munmap_js, _environ_get, _environ_sizes_get, _fd_close, _fd_read, _fd_seek, _fd_write, _getaddrinfo ];
 
 var ASM_CONSTS = {
-  6639688: $0 => {
+  6641128: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] gl ctx already created, handle=" + $0
     });
   },
-  6639783: $0 => {
+  6641223: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] FATAL: emscripten_webgl_create_context failed (handle=" + $0 + ")"
     });
   },
-  6639907: ($0, $1) => {
+  6641347: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] WebGL2 ctx created on main-runtime thread, handle=" + $0 + ", make_current=" + $1
     });
   },
-  6640046: () => {
+  6641486: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] worker_init: retro_init done"
     });
   },
-  6640133: $0 => {
+  6641573: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] run_iter enter #" + $0
     });
   },
-  6640213: $0 => {
+  6641653: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] run_iter exit  #" + $0
     });
   },
-  6640293: () => {
+  6641733: () => {
     postMessage({
       cmd: "print",
       txt: "[parity] from_load requested but no state was loaded"
     });
   },
-  6640385: () => {
+  6641825: () => {
     postMessage({
       cmd: "print",
       txt: "[parity] save_state FAILED"
     });
   },
-  6640451: ($0, $1) => {
+  6641891: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[parity] source=" + (($1 | 0) ? "loaded-state" : "live-capture") + " " + ($0 >>> 0) + " bytes"
     });
   },
-  6640576: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
+  6642016: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
     postMessage({
       cmd: "print",
       txt: "[parity] frames=" + ($0 >>> 0) + " disA=" + ($1 >>> 0).toString(16) + "/" + ($2 >>> 0) + " disB=" + ($3 >>> 0).toString(16) + "/" + ($4 >>> 0) + " armC=" + ($5 >>> 0).toString(16) + "/" + ($6 >>> 0) + " sound=" + ($7 | 0) + " verdict=" + (($7 | 0) ? (($8 | 0) ? "PASS" : "DIVERGED") : "UNSOUND-WINDOW")
     });
   },
-  6640897: ($0, $1, $2) => {
+  6642337: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] video target set buf=" + $0 + " w=" + $1 + " h=" + $2
     });
   },
-  6641008: ($0, $1) => {
+  6642448: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] audio ring addr=" + $0 + " capacity=" + $1 + " frames"
     });
   },
-  6641120: ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10) => {
+  6642560: ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10) => {
     postMessage({
       cmd: "print",
       txt: "[reios-sc] pc=0x" + ($0 >>> 0).toString(16) + " r4=0x" + ($1 >>> 0).toString(16) + " r5=0x" + ($2 >>> 0).toString(16) + " r6=0x" + ($3 >>> 0).toString(16) + " r7=0x" + ($4 >>> 0).toString(16) + " r0=0x" + ($5 >>> 0).toString(16) + ($6 ? (" (prev x" + ($6 >>> 0) + ")") : "") + ($7 ? (" READ sector=" + ($8 >>> 0) + " n=" + ($9 >>> 0) + " dst=0x" + ($10 >>> 0).toString(16)) : "")
     });
   },
-  6641518: ($0, $1, $2) => {
+  6642958: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[ifb-pc] #" + ($0 | 0) + " pc=0x" + ($1 >>> 0).toString(16) + " op=0x" + (($2 | 0) & 65535).toString(16) + " major=" + ((($2 | 0) >> 12) & 15)
     });
   },
-  6641697: ($0, $1, $2, $3) => {
+  6643137: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[sh4-throw] #" + $0 + " pc=" + ($1 >>> 0).toString(16) + " op=" + ($2 & 65535).toString(16) + " sr=" + ($3 >>> 0).toString(16) + " BL=" + (($3 >>> 28) & 1) + " MD=" + (($3 >>> 30) & 1)
     });
   },
-  6641923: ($0, $1, $2, $3, $4, $5) => {
+  6643363: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[gd-check] id=" + ($0 >>> 0) + " ret=" + ($1 >>> 0) + " err=0x" + ($2 >>> 0).toString(16) + " size=0x" + ($3 >>> 0).toString(16) + " wait=0x" + ($4 >>> 0).toString(16) + ($5 ? (" (prev x" + ($5 >>> 0) + ")") : "")
     });
   },
-  6642163: () => {
+  6643603: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] main pthread entered (idle)"
     });
   },
-  6642249: ($0, $1, $2) => {
+  6643689: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] SET_HW_RENDER captured (ctx_type=" + $0 + ", ver=" + $1 + "." + $2 + ")"
     });
   },
-  6642379: $0 => {
+  6643819: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast.log] " + UTF8ToString($0)
     });
   },
-  6642454: ($0, $1, $2, $3, $4, $5, $6) => {
+  6643894: ($0, $1, $2, $3, $4, $5, $6) => {
     postMessage({
       cmd: "fps",
       fps: $0,
@@ -10414,55 +10648,55 @@ var ASM_CONSTS = {
       istext: $6
     });
   },
-  6642555: $0 => {
+  6643995: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6642610: $0 => {
+  6644050: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6642665: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
+  6644105: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
     postMessage({
       cmd: "print",
       txt: "[stuck-pc] pc=0x" + ($0 >>> 0).toString(16) + " sr=0x" + ($1 >>> 0).toString(16) + " imask=" + (($1 >> 4) & 15) + " pend=0x" + ($2 >>> 0).toString(16) + " istnrm=0x" + ($3 >>> 0).toString(16) + " istext=0x" + ($4 >>> 0).toString(16) + " iml2=0x" + ($5 >>> 0).toString(16) + " iml4=0x" + ($6 >>> 0).toString(16) + " iml6=0x" + ($7 >>> 0).toString(16) + " pr=0x" + ($8 >>> 0).toString(16)
     });
   },
-  6643069: $0 => {
+  6644509: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6643124: $0 => {
+  6644564: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6643179: $0 => {
+  6644619: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6643234: ($0, $1, $2, $3, $4) => {
+  6644674: ($0, $1, $2, $3, $4) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] video_cb #" + $0 + " HW_FRAME_VALID #" + $1 + " commit_frame=" + $2 + " w=" + $3 + " h=" + $4
     });
   },
-  6643385: ($0, $1, $2, $3, $4, $5) => {
+  6644825: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] video_cb #" + $0 + " data=" + $1 + " w=" + $2 + " h=" + $3 + " pitch=" + $4 + " real_frames=" + $5
     });
   },
-  6643541: ($0, $1, $2, $3) => {
+  6644981: ($0, $1, $2, $3) => {
     var bytes = $2 * $3;
     var src = $0;
     var view = (growMemViews(), HEAPU8).subarray(src >>> 0, src + bytes >>> 0);
@@ -10477,103 +10711,103 @@ var ASM_CONSTS = {
       pitch: $3
     }, [ copy.buffer ]);
   },
-  6643760: $0 => {
+  6645200: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: " + UTF8ToString($0)
     });
   },
-  6643849: () => {
+  6645289: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: unknown exception during retro_load_game"
     });
   },
-  6643959: $0 => {
+  6645399: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: C-string exception during retro_load_game: " + UTF8ToString($0)
     });
   },
-  6644091: $0 => {
+  6645531: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: std::exception during retro_load_game: " + UTF8ToString($0)
     });
   },
-  6644219: $0 => {
+  6645659: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: retro_load_game returned " + ($0 ? "true" : "false")
     });
   },
-  6644340: ($0, $1) => {
+  6645780: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[maple] vmuDev=" + $0 + " type=" + $1 + " (MDT_SegaVMU=1)"
     });
   },
-  6644439: $0 => {
+  6645879: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] disc_type=" + ($0 >>> 0) + " (0=CdRom 1=CdRom_XA 4=GdRom 16=NoDisk)"
     });
   },
-  6644565: ($0, $1, $2, $3, $4) => {
+  6646005: ($0, $1, $2, $3, $4) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] av_info base=" + $0 + "x" + $1 + " max=" + $2 + "x" + $3 + " fps=" + $4
     });
   },
-  6644694: () => {
+  6646134: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] invoking hw_render.context_reset"
     });
   },
-  6644785: () => {
+  6646225: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] hw_render.context_reset returned"
     });
   },
-  6644876: () => {
+  6646316: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] WARNING: hw_render.context_reset not registered"
     });
   },
-  6644982: $0 => {
+  6646422: $0 => {
     postMessage({
       cmd: "print",
       txt: "[parity] arm " + ($0 | 0) + ": restoring..."
     });
   },
-  6645063: ($0, $1, $2) => {
+  6646503: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[parity] arm " + ($0 | 0) + ": restore " + (($1 | 0) ? "ok" : "FAILED") + ", ic=" + ($2 | 0)
     });
   },
-  6645184: $0 => {
+  6646624: $0 => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm-shard] jit_register probe-limit vaddr=0x" + ($0 >>> 0).toString(16)
     });
   },
-  6645301: ($0, $1, $2) => {
+  6646741: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm-shard] sealed count=" + ($0 | 0) + " base_idx=" + ($1 | 0) + " bytes=" + ($2 | 0)
     });
   },
-  6645426: ($0, $1, $2) => {
+  6646866: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[shardmap] base=" + ($0 | 0) + " i0=" + ($1 | 0) + " v=" + UTF8ToString($2)
     });
   },
-  6645537: ($0, $1, $2, $3) => {
+  6646977: ($0, $1, $2, $3) => {
     var errPtr = $0;
     var errStr = "";
     var i = 0;
@@ -10586,7 +10820,7 @@ var ASM_CONSTS = {
       txt: "[rec_wasm-shard] install_shard FAILED #" + ($1 | 0) + " count=" + ($2 | 0) + " bytes=" + ($3 | 0) + ' err="' + errStr + '" — falling back to per-block installs'
     });
   },
-  6645878: ($0, $1) => {
+  6647318: ($0, $1) => {
     var p = $1 >>> 0;
     var s = "";
     while ((growMemViews(), HEAPU8)[p >>> 0] !== 0 && s.length < 256) {
@@ -10598,7 +10832,7 @@ var ASM_CONSTS = {
       txt: "[rec_wasm-shard] BAD BLOCK vaddr=0x" + ($0 >>> 0).toString(16) + ' err="' + s + '"'
     });
   },
-  6646116: ($0, $1, $2) => {
+  6647556: ($0, $1, $2) => {
     var p = $0 >>> 0;
     var n = $1 | 0;
     var va = $2 >>> 0;
@@ -10618,158 +10852,158 @@ var ASM_CONSTS = {
       txt: "[wasm-dump] END"
     });
   },
-  6646529: ($0, $1) => {
+  6647969: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm-shard] per-block fallback: installed=" + ($0 | 0) + " hard-failed=" + ($1 | 0) + " (hard failures span-interp permanently)"
     });
   },
-  6646697: $0 => {
+  6648137: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6646752: $0 => {
+  6648192: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6646807: ($0, $1, $2) => {
+  6648247: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[vec-ring now] idx=" + ($0 >>> 0) + " spc=0x" + ($1 >>> 0).toString(16) + " vbr=0x" + ($2 >>> 0).toString(16)
     });
   },
-  6646949: ($0, $1, $2) => {
+  6648389: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[keystream #" + ($0 | 0) + "] r0(ks)=0x" + ($1 >>> 0).toString(16) + " r13(i)=" + ($2 >>> 0) + " (INTERP)"
     });
   },
-  6647088: $0 => {
+  6648528: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6647143: $0 => {
+  6648583: $0 => {
     postMessage({
       cmd: "print",
       txt: "[pool INT] state=0x" + ($0 >>> 0).toString(16)
     });
   },
-  6647224: $0 => {
+  6648664: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6647279: ($0, $1, $2, $3) => {
+  6648719: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[interp-escape] pc=0x" + ($0 >>> 0).toString(16) + " spc=0x" + ($1 >>> 0).toString(16) + " sr=0x" + ($2 >>> 0).toString(16) + " pr=0x" + ($3 >>> 0).toString(16)
     });
   },
-  6647470: ($0, $1, $2, $3) => {
+  6648910: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[mem-map] ram=0x" + ($0 >>> 0).toString(16) + " &mem_b[0]=0x" + ($1 >>> 0).toString(16) + " &vram[0]=0x" + ($2 >>> 0).toString(16) + " &aica_ram[0]=0x" + ($3 >>> 0).toString(16)
     });
   },
-  6647679: $0 => {
+  6649119: $0 => {
     postMessage({
       cmd: "print",
       txt: "[decbug entry] pc=0x" + ($0 >>> 0).toString(16)
     });
   },
-  6647761: $0 => {
+  6649201: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6647816: $0 => {
+  6649256: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6647871: $0 => {
+  6649311: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6647926: $0 => {
+  6649366: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6647981: $0 => {
+  6649421: $0 => {
     postMessage({
       cmd: "print",
       txt: "[pool JIT] state=0x" + ($0 >>> 0).toString(16)
     });
   },
-  6648062: $0 => {
+  6649502: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6648117: ($0, $1, $2, $3, $4, $5) => {
+  6649557: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[keystream #" + ($0 | 0) + "] r0(ks)=0x" + ($1 >>> 0).toString(16) + " r2(word)=0x" + ($2 >>> 0).toString(16) + " r13(i)=" + ($3 >>> 0) + " r12(n)=" + ($4 >>> 0) + " r14=0x" + ($5 >>> 0).toString(16)
     });
   },
-  6648343: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
+  6649783: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
     postMessage({
       cmd: "print",
       txt: "[escape-edge] prev_pc=0x" + ($0 >>> 0).toString(16) + " -> wild_pc=0x" + ($1 >>> 0).toString(16) + " spc=0x" + ($2 >>> 0).toString(16) + " ssr=0x" + ($3 >>> 0).toString(16) + " sr=0x" + ($4 >>> 0).toString(16) + " vbr=0x" + ($5 >>> 0).toString(16) + " pend=0x" + ($6 >>> 0).toString(16) + " pr=0x" + ($7 >>> 0).toString(16) + " r15=0x" + ($8 >>> 0).toString(16)
     });
   },
-  6648725: $0 => {
+  6650165: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6648780: $0 => {
+  6650220: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6648835: $0 => {
+  6650275: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6648890: $0 => {
+  6650330: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6648945: ($0, $1, $2) => {
+  6650385: ($0, $1, $2) => {
     var s = "[blockdump] vaddr=0x" + ($0 >>> 0).toString(16) + " size=" + ($1 | 0) + " hex=" + UTF8ToString($2);
     postMessage({
       cmd: "print",
       txt: s
     });
   },
-  6649090: ($0, $1) => {
+  6650530: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm] jit_register probe-limit at vaddr=0x" + ($0 >>> 0).toString(16) + " (probe #" + ($1 | 0) + ")"
     });
   },
-  6649233: ($0, $1, $2, $3, $4, $5) => {
+  6650673: ($0, $1, $2, $3, $4, $5) => {
     var addr = $0;
     var n = $1;
     var hex = "";
@@ -10789,31 +11023,31 @@ var ASM_CONSTS = {
       txt: "[rec_wasm] install_block FAILED #" + ($3 | 0) + " vaddr=0x" + ($4 >>> 0).toString(16) + " bytes=" + ($5 | 0) + ' err="' + errStr + '"' + " first" + n + "=" + hex
     });
   },
-  6649730: ($0, $1, $2, $3, $4, $5) => {
+  6651170: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] compile RAM-block #" + ($0 | 0) + " vaddr=0x" + ($1 >>> 0).toString(16) + " ops=" + ($2 | 0) + " BlockType=0x" + ($3 >>> 0).toString(16) + " Branch=0x" + ($4 >>> 0).toString(16) + " Next=0x" + ($5 >>> 0).toString(16)
     });
   },
-  665e4: ($0, $1, $2, $3, $4, $5, $6, $7) => {
+  6651440: ($0, $1, $2, $3, $4, $5, $6, $7) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker]   words: " + ($0 >>> 0).toString(16).padStart(4, "0") + " " + ($1 >>> 0).toString(16).padStart(4, "0") + " " + ($2 >>> 0).toString(16).padStart(4, "0") + " " + ($3 >>> 0).toString(16).padStart(4, "0") + " " + ($4 >>> 0).toString(16).padStart(4, "0") + " " + ($5 >>> 0).toString(16).padStart(4, "0") + " " + ($6 >>> 0).toString(16).padStart(4, "0") + " " + ($7 >>> 0).toString(16).padStart(4, "0")
     });
   },
-  6650446: ($0, $1, $2, $3, $4, $5, $6) => {
+  6651886: ($0, $1, $2, $3, $4, $5, $6) => {
     postMessage({
       cmd: "print",
       txt: "[watchdog #" + ($0 | 0) + "] stuck pc=0x" + ($1 >>> 0).toString(16) + " istnrm=0x" + ($2 >>> 0).toString(16) + " istext=0x" + ($3 >>> 0).toString(16) + " pend=0x" + ($4 >>> 0).toString(16) + " sr=0x" + ($5 >>> 0).toString(16) + " pr=0x" + ($6 >>> 0).toString(16)
     });
   },
-  6650710: ($0, $1, $2) => {
+  6652150: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[arm7rec] emitter engaged, first block pc=0x" + ($0 >>> 0).toString(16) + " ops=" + ($1 | 0) + " bytes=" + ($2 | 0)
     });
   },
-  6650858: ($0, $1) => {
+  6652298: ($0, $1) => {
     var p = $1 >>> 0;
     var s = "";
     while ((growMemViews(), HEAPU8)[p >>> 0] !== 0 && s.length < 256) {
@@ -10825,13 +11059,13 @@ var ASM_CONSTS = {
       txt: "[arm7rec] install FAILED pc=0x" + ($0 >>> 0).toString(16) + ' err="' + s + '" — v0 fallback'
     });
   },
-  6651107: ($0, $1, $2, $3) => {
+  6652547: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[arm7st] MISMATCH pc=0x" + ($0 >>> 0).toString(16) + " reg=" + ($1 | 0) + " jit=0x" + ($2 >>> 0).toString(16) + " interp=0x" + ($3 >>> 0).toString(16)
     });
   },
-  6651288: ($0, $1) => {
+  6652728: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[arm7st] blocks=" + ($0 | 0) + " mismatches=" + ($1 | 0)
@@ -11042,7 +11276,7 @@ function assignWasmImports() {
     /** @export */ Vf: ___syscall_getpeername,
     /** @export */ Uf: ___syscall_getsockname,
     /** @export */ Tf: ___syscall_getsockopt,
-    /** @export */ F: ___syscall_ioctl,
+    /** @export */ D: ___syscall_ioctl,
     /** @export */ Sf: ___syscall_listen,
     /** @export */ Rf: ___syscall_mkdirat,
     /** @export */ W: ___syscall_openat,
@@ -11371,7 +11605,7 @@ function assignWasmImports() {
     /** @export */ U: _fd_read,
     /** @export */ Df: _fd_seek,
     /** @export */ G: _fd_write,
-    /** @export */ A: _getaddrinfo,
+    /** @export */ y: _getaddrinfo,
     /** @export */ $: _getnameinfo,
     /** @export */ N: invoke_d,
     /** @export */ M: invoke_diii,
@@ -11384,18 +11618,18 @@ function assignWasmImports() {
     /** @export */ K: invoke_iiiiii,
     /** @export */ t: invoke_iiiiiii,
     /** @export */ J: invoke_iiiiiiii,
-    /** @export */ E: invoke_iiiiiiiiiiii,
-    /** @export */ D: invoke_jiiii,
+    /** @export */ C: invoke_iiiiiiiiiiii,
+    /** @export */ B: invoke_jiiii,
     /** @export */ l: invoke_v,
     /** @export */ n: invoke_vi,
     /** @export */ g: invoke_vii,
     /** @export */ q: invoke_viii,
-    /** @export */ z: invoke_viiii,
-    /** @export */ C: invoke_viiiii,
-    /** @export */ y: invoke_viiiiii,
+    /** @export */ F: invoke_viiii,
+    /** @export */ A: invoke_viiiii,
+    /** @export */ E: invoke_viiiiii,
     /** @export */ r: invoke_viiiiiii,
     /** @export */ x: invoke_viiiiiiiiii,
-    /** @export */ B: invoke_viiiiiiiiiiiiiii,
+    /** @export */ z: invoke_viiiiiiiiiiiiiii,
     /** @export */ v: _llvm_eh_typeid_for,
     /** @export */ a: wasmMemory,
     /** @export */ Cf: _proc_exit,
@@ -11493,17 +11727,6 @@ function invoke_iiii(index, a1, a2, a3) {
   }
 }
 
-function invoke_viiii(index, a1, a2, a3, a4) {
-  var sp = stackSave();
-  try {
-    dynCall_viiii(index, a1, a2, a3, a4);
-  } catch (e) {
-    stackRestore(sp);
-    if (!(e instanceof EmscriptenEH)) throw e;
-    _setThrew(1, 0);
-  }
-}
-
 function invoke_d(index) {
   var sp = stackSave();
   try {
@@ -11530,6 +11753,17 @@ function invoke_viii(index, a1, a2, a3) {
   var sp = stackSave();
   try {
     dynCall_viii(index, a1, a2, a3);
+  } catch (e) {
+    stackRestore(sp);
+    if (!(e instanceof EmscriptenEH)) throw e;
+    _setThrew(1, 0);
+  }
+}
+
+function invoke_viiii(index, a1, a2, a3, a4) {
+  var sp = stackSave();
+  try {
+    dynCall_viiii(index, a1, a2, a3, a4);
   } catch (e) {
     stackRestore(sp);
     if (!(e instanceof EmscriptenEH)) throw e;
@@ -11895,6 +12129,13 @@ var flycast_worker_funcs_bind_logged = false;
 var flycast_table_slots = [];
 
 // index → Instance (GC root)
+// Count of live WebAssembly.Instances this worker has created and pinned. Only
+// read when an install throws — the per-block path (flycast_install_block)
+// creates one Module+Instance per block and never releases them, so this is
+// the number that identifies an engine module/instance-cap failure (the mobile
+// arm) versus a codegen failure. Shard installs add ONE instance for N blocks.
+var flycast_live_instances = 0;
+
 function flycast_install_block(bytesPtr, len, vaddr) {
   bytesPtr = bytesPtr >>> 0;
   len = len >>> 0;
@@ -11916,9 +12157,18 @@ function flycast_install_block(bytesPtr, len, vaddr) {
     wasmTable.grow(1);
     wasmTable.set(idx, fn);
     flycast_table_slots[idx] = inst;
+    flycast_live_instances++;
     return idx;
   } catch (e) {
-    flycast_last_register_error = (e && e.message) ? e.message : String(e);
+    // This path is one Module + one Instance PER COMPILED BLOCK, every one
+    // pinned in flycast_table_slots for the life of the worker (~12K live at
+    // PSO boot scale). A mobile engine's per-agent module/instance cap is the
+    // first thing that bites here, and the throw is indistinguishable from a
+    // codegen error in the log without the count — so record it. The C caller
+    // PARKS this vaddr for span-interp on a 0 return (rec_wasm.cpp compile(),
+    // the `idx <= 0` arm): FPCA is already claimed by then, so it must never
+    // be recompiled.
+    flycast_last_register_error = ((e && e.message) ? e.message : String(e)) + " [live_instances=" + flycast_live_instances + " table_len=" + ((typeof wasmTable !== "undefined" && wasmTable) ? wasmTable.length : -1) + "]";
     return 0;
   }
 }
@@ -11965,9 +12215,10 @@ function flycast_install_shard(bytesPtr, len, vaddrsPtr, count) {
       // accidentally let V8 GC the entire shard.
       flycast_table_slots[base_idx + i] = inst;
     }
+    flycast_live_instances++;
     return base_idx;
   } catch (e) {
-    flycast_last_register_error = (e && e.message) ? e.message : String(e);
+    flycast_last_register_error = ((e && e.message) ? e.message : String(e)) + " [live_instances=" + flycast_live_instances + " table_len=" + ((typeof wasmTable !== "undefined" && wasmTable) ? wasmTable.length : -1) + "]";
     return 0;
   }
 }
@@ -12072,3 +12323,10 @@ var isPthread = globalThis.name == 'em-pthread';
 
 isPthread && flycastWorkerModule();
 
+
+// --- build-flavor marker — INJECTED by flycast_worker_link.sh, do not hand-edit ---
+if (typeof globalThis !== 'undefined' && globalThis.name !== 'em-pthread') {
+  var __flycastBuildMarker = '[build] flavor=RELEASE defines=none linked=2026-08-29T03:25:23Z (clean — perf, boot depth and wedge behavior are valid)';
+  try { console.log(__flycastBuildMarker); } catch (e) {}
+  try { postMessage({ cmd: 'print', txt: __flycastBuildMarker }); } catch (e) {}
+}
