@@ -7,7 +7,7 @@
 #include <cstring>
 
 #ifdef __EMSCRIPTEN__
-#include <emscripten.h>  // [perf-split 2026-07-22 TEMP] emscripten_get_now
+#include <emscripten.h>  // emscripten_get_now — only used under BEMENTAL_WGPU_PROF (see RunGpuLoopSlice)
 #endif
 
 #include "Common/Assert.h"
@@ -421,16 +421,26 @@ void FifoManager::RunGpuLoopSlice()
                        "instability in the game. Please report it.",
                        distance);
 
-#ifdef __EMSCRIPTEN__
             // [turnaround trace 2026-08-11] STAGE 2 decode-start: stamp the FIRST decode
             // of this frame (armed=0 set at pe_finish). emscripten_date_now = system
             // wall clock, cross-thread comparable with the EmuThread/pe_finish stamps.
+            // [WGPU-PROF — gated 2026-08-28] This pair sits INSIDE the per-32-byte FIFO
+            // chunk loop (loop head above, one iteration per GPFifo::GATHER_PIPE_SIZE),
+            // so it cost 2 wasm->JS clock crossings per 32 FIFO bytes: a CPU profile
+            // measured emscripten_get_now at 16.22% of the render worker. Gated behind
+            // BEMENTAL_WGPU_PROF exactly like the per-draw/per-Advance timers in
+            // VideoBackends/WGPU/WGPUGfx.cpp and Core/PowerPC/JitWasm/JitWasm.cpp
+            // (undefined by default = zero cost). Rebuild with -DBEMENTAL_WGPU_PROF to
+            // restore the 0x026B3450 device-busy sum the probe's decode/present split
+            // reads (PixelEngine.cpp snapshots it into 0x026B3458 at pe_finish; with the
+            // macro off that snapshot is a constant 0.0).
+#if defined(__EMSCRIPTEN__) && defined(BEMENTAL_WGPU_PROF)
             const double bem_dec_t0 = emscripten_get_now();  // device-busy timing
 #endif
             u8* write_ptr = m_video_buffer_write_ptr;
             m_video_buffer_read_ptr = OpcodeDecoder::RunFifo(
                 DataReader(m_video_buffer_read_ptr, write_ptr), &cyclesExecuted);
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) && defined(BEMENTAL_WGPU_PROF)
             // [turnaround trace] accumulate this decode chunk's WALL duration into the
             // per-frame device-busy sum (0x026B3450 f64). Decode is chunked across pumps,
             // so busy-time (not span) is what separates GPU-throughput from guest-wait.
@@ -486,12 +496,14 @@ void FifoManager::RunGpuLoopSlice()
           // device-independent and still run. Re-enables under Option A automatically.
           if (Core::WGPUDeviceLiveOnThisThread())
           {
-#ifdef __EMSCRIPTEN__
+            // [WGPU-PROF — gated 2026-08-28] 2 more get_now crossings per
+            // RunGpuLoopSlice; same BEMENTAL_WGPU_PROF gate as the decode pair above.
+#if defined(__EMSCRIPTEN__) && defined(BEMENTAL_WGPU_PROF)
             const double bem_fl_t0 = emscripten_get_now();
 #endif
             g_vertex_manager->Flush();
             g_framebuffer_manager->RefreshPeekCache();
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) && defined(BEMENTAL_WGPU_PROF)
             // [turnaround trace] add flush/render wall duration to the device-busy sum.
             *reinterpret_cast<volatile double*>(static_cast<uintptr_t>(0x026B3450u)) +=
                 emscripten_get_now() - bem_fl_t0;

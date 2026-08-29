@@ -244,15 +244,38 @@ static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
     (void)h;
 }
 
+// [audio-block FIX 2026-08-28] This was MAIN_THREAD_EM_ASM — the SYNCHRONOUS main-thread
+// proxy. MEASURED cost on the PSO JIT path (/tmp/worker_4.cpuprofile, ROM_IDX=2): the chain
+//   __pthread_cond_timedwait <- _emscripten_run_on_main_thread_js <- proxyToMainThread
+//   <- _emscripten_asm_const_int_sync_on_main_thread <- audio_sample_batch_cb
+// was 38.62% of the CPU/EmuThread worker, and it was 100% of __timedwait_cp's self time
+// (93,317 of 93,317 hits) — 18.6s of hard blocking in a 48.25s window. The JIT thread was
+// stopping dead on the main thread's event loop once per audio batch. Native Dolphin's audio
+// callback writes the mixer ring on its own thread and never blocks the CPU thread.
+//
+// The old code took its copy INSIDE the main-thread block, which is why it had to be
+// synchronous — `data` is core-owned and reused as soon as we return. So: take ownership on
+// THIS thread (malloc+memcpy, ~384 B for a 96-frame batch), then hand the owned pointer to an
+// ASYNC block that copies it out, frees it, and posts. Nothing waits on the main thread.
+// emscripten's allocator is threadsafe under -pthread, so the main-thread free is fine, and
+// _malloc/_free are both in EXPORTED_FUNCTIONS (dolphin_worker_link_4010.sh).
 static size_t audio_sample_batch_cb(const int16_t* data, size_t frames) {
     if (!data || !frames) return frames;
     size_t bytes = frames * 4;
-    MAIN_THREAD_EM_ASM({
+    void* owned = malloc(bytes);
+    if (!owned) return frames;   // drop this batch rather than block or crash
+    memcpy(owned, data, bytes);
+    // NOTE: one `var` per statement. EM_ASM passes its body through the C preprocessor, which
+    // balances parens but NOT braces — so a top-level comma inside the {} (e.g.
+    // `var src = $0, n = $1;`) is read as a macro argument separator and the build breaks.
+    // The commas inside postMessage(...) are safe because parens DO group.
+    MAIN_THREAD_ASYNC_EM_ASM({
         var src = $0;
-        var view = HEAPU8.subarray(src, src + $1);
-        var copy = new Uint8Array(view);
-        postMessage({cmd: 'audio', buf: copy, len: $1}, [copy.buffer]);
-    }, data, bytes);
+        var n = $1;
+        var copy = new Uint8Array(HEAPU8.subarray(src, src + n));
+        _free(src);
+        postMessage({cmd: 'audio', buf: copy, len: n}, [copy.buffer]);
+    }, owned, bytes);
     return frames;
 }
 

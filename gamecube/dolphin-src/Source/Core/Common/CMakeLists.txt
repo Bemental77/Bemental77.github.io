@@ -200,6 +200,7 @@ PRIVATE
   FatFs
   spng::spng
   $<$<NOT:$<BOOL:${IOS}>>:watcher>
+  xxhash::xxhash
   ${VTUNE_LIBRARIES}
 )
 

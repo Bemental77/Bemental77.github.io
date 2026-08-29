@@ -73,3 +73,7 @@ gamecube/dolphin-src.bak/
 gamecube/roms/Sonic Adventure 2 - Battle (USA).iso
 dreamcast/discs/pso2/Track3.bin
 ps1/ps1Wasm/roms/MonsterRancher2.bin
+
+# 27MB PSO savestate: local probe/autoload asset. *.bin is an LFS rule here (.gitattributes),
+# so a stray `git add -A` would push it into an already-blown LFS budget.
+/state.bin

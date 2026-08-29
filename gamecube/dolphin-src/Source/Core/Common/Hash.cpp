@@ -9,6 +9,14 @@
 
 #include <zlib.h>
 
+// XXH_INLINE_ALL compiles xxHash (XXH3 included) straight into this translation unit as
+// static functions, so GetHash64_XXH3 stays inlinable at -O3 and no new external symbol is
+// emitted - it cannot collide with the separately linked libxxhash.a that VideoCommon uses.
+// Externals/xxhash/xxHash/xxh3.h:54-55 does exactly this, and VideoCommon/PipelineUtils.h:6
+// already pulls xxHash in that way in this tree.
+#define XXH_INLINE_ALL
+#include <xxhash.h>
+
 #include "Common/CPUDetect.h"
 #include "Common/Intrinsics.h"
 
@@ -43,6 +51,10 @@ u32 HashEctor(const u8* data, size_t len)
   return crc;
 }
 
+// [texhash A/B 2026-08-28] Dolphin's original sampling MurmurHash3, kept VERBATIM so the
+// runtime toggle below is a true matched pair: this is byte-for-byte the code that was
+// measured at 15.6-16.1% of the render worker. Do not "clean up" - its value is that it is
+// unchanged. Reached only when the ?bjit_xxh3_texhash=0 SAB cell is set; XXH3 is the default.
 #ifdef _ARCH_64
 
 //-----------------------------------------------------------------------------
@@ -316,6 +328,78 @@ static u64 GetMurmurHash3(const u8* src, u32 len, u32 samples)
 
 #endif
 
+// XXH3 texture cache hash - the default software path, and the A/B partner of the
+// MurmurHash3 above. Both are compiled into every binary; GetHash64_Software picks between
+// them per call off a SAB scratch cell (see below).
+//
+// The software path is what every Emscripten build runs: the wasm configuration is built
+// with ENABLE_GENERIC (build-wasm-4010/CMakeCache.txt:631 -> -D_M_GENERIC=1), so neither
+// _M_X86_64 nor _M_ARM_64 is defined, and CPUInfo::bCRC32 stays false there because
+// GenericCPUDetect.cpp's constructor is empty and the member defaults to false
+// (CPUDetect.h:45).
+//
+// SAMPLING SEMANTICS ARE IDENTICAL TO MurmurHash3's, BY CONSTRUCTION. This function changes
+// only the mixing function; it does NOT change which bytes are read. That is a hard
+// constraint, not an optimisation opportunity: DolphinLibretro/Boot.cpp:408 pins
+// GFX_SAFE_TEXTURE_CACHE_COLOR_SAMPLES to 0 (full hashing) precisely because sampled hashing
+// left stale THP plane textures and a TEV green band. Hashing fewer bytes would reopen that.
+// The hash is a pure function of the sampled bytes plus len - nothing else feeds it.
+//
+// The returned VALUE differs from MurmurHash3's. That is safe: no GetHash64 result is
+// persisted across runs (the texture cache is rebuilt every session), and XXH3 is
+// deterministic, so values are stable for a fixed toggle setting.
+static u64 GetHash64_XXH3(const u8* src, u32 len, u32 samples)
+{
+  // Selection arithmetic, carried over verbatim from the _ARCH_32 GetMurmurHash3 above.
+  const u32 nblocks = len / 8;
+  u32 Step = (len / 4);
+  if (samples == 0)
+    samples = std::max(Step, 1u);
+  Step = Step / samples;
+  if (Step < 1)
+    Step = 1;
+
+  // Step == 1 - which is what samples == 0 always yields - selects every 8-byte block plus
+  // the len & 7 tail, i.e. exactly [src, src + len) with no gaps. Hash it in one shot.
+  if (Step == 1)
+    return XXH3_64bits(src, len);
+
+  // Sampled: feed XXH3 exactly the bytes MurmurHash3 would have consumed - the 8-byte block
+  // at src + i * 8 for i = 0, Step, 2 * Step, ... < nblocks, then the len & 7 tail bytes at
+  // src + nblocks * 8.
+  XXH3_state_t state;
+  XXH3_INITSTATE(&state);
+  XXH3_64bits_reset(&state);
+
+  // MurmurHash3 folded the length in explicitly ("h2 ^= len"), and both CRC32 paths below
+  // seed h[0] with it. The sampled byte stream alone does not determine len, so fold it in
+  // here too. This reads no additional bytes of src.
+  XXH3_64bits_update(&state, &len, sizeof(len));
+
+  // Stage the strided blocks contiguously so XXH3 sees long runs instead of one 8-byte
+  // update per block.
+  alignas(8) u8 gathered[1024];
+  u32 filled = 0;
+  for (u32 i = 0; i < nblocks; i += Step)
+  {
+    std::memcpy(gathered + filled, src + static_cast<size_t>(i) * 8, 8);
+    filled += 8;
+    if (filled == sizeof(gathered))
+    {
+      XXH3_64bits_update(&state, gathered, filled);
+      filled = 0;
+    }
+  }
+  if (filled != 0)
+    XXH3_64bits_update(&state, gathered, filled);
+
+  const u32 tail_len = len & 7;
+  if (tail_len != 0)
+    XXH3_64bits_update(&state, src + static_cast<size_t>(nblocks) * 8, tail_len);
+
+  return XXH3_64bits_digest(&state);
+}
+
 #if defined(_M_X86_64)
 
 FUNCTION_TARGET_SSE42
@@ -399,31 +483,93 @@ static u64 GetHash64_ARMv8_CRC32(const u8* src, u32 len, u32 samples)
 
 #endif
 
+// [texhash A/B 2026-08-28] Runtime toggle between the two software hashes. Compile-time
+// selection would force a rebuild between the two arms of the measurement, and a rebuild
+// destroys attribution - CLAUDE.md gate #8 wants a matched pair on ONE binary: same page,
+// same ROM, same scene, flip the flag, read the fps delta.
+//
+// getenv is dead in the worker (cross-thread Module.ENV never reaches the C environ - see
+// JitWasm.cpp:509-512), so the toggle rides a SAB scratch cell exactly like
+// ?bjit_fp_resident_loop does at 0x026B3408 (gamecube.html:534-540 writes it,
+// ppc_emit.cpp:1180 reads it). This one is the next free cell, 0x026B340C:
+//
+//   cell == 0 (browser-zeroed default) -> XXH3          <- default, what ships
+//   cell != 0                          -> MurmurHash3   <- ?bjit_xxh3_texhash=0
+//
+// Read per call rather than cached, so the flag can also be flipped live from DevTools on a
+// running instance for a same-process pair. One u32 load against a hash that reads at least
+// hundreds of bytes is not measurable. Flipping live changes the hash function under a
+// populated texture cache: every stored hash then mismatches, so entries are re-decoded and
+// re-uploaded once. That is the conservative direction (false "changed", never false
+// "unchanged" - a Murmur value colliding with an XXH3 value is not a real risk), so it costs
+// a brief re-upload storm, not a stale texture. Let it settle before reading fps.
+static bool TextureHashForceMurmur()
+{
+#ifdef __EMSCRIPTEN__
+  return *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B340Cu)) != 0u;
+#else
+  // Native builds have no page and no SAB scratch region; 0x026B340C is not a valid address
+  // there. The toggle is a wasm-page A/B only - native always takes the default.
+  return false;
+#endif
+}
+
+static u64 GetHash64_Software(const u8* src, u32 len, u32 samples)
+{
+  if (TextureHashForceMurmur())
+    return GetMurmurHash3(src, len, samples);
+
+  return GetHash64_XXH3(src, len, samples);
+}
+
+#if defined(_M_X86_64) || defined(_M_ARM_64)
+
+// Only these targets compile more than one implementation, so only they need the runtime
+// dispatch. The first call resolves the pointer; later calls go straight to the winner.
 using TextureHashFunction = u64 (*)(const u8* src, u32 len, u32 samples);
 static u64 SetHash64Function(const u8* src, u32 len, u32 samples);
 static TextureHashFunction s_texture_hash_func = SetHash64Function;
 
 static u64 SetHash64Function(const u8* src, u32 len, u32 samples)
 {
+  // Resolve into a local and assign unconditionally. The previous version assigned inside
+  // "#if defined(_M_X86_64) / #elif defined(_M_ARM_64)" with no #else, so on any other
+  // target both arms preprocessed away: a true cpu_info.bCRC32 would leave
+  // s_texture_hash_func still pointing at SetHash64Function and the call below would recurse
+  // forever. Guarded structurally - there is no path out of here that does not set the
+  // pointer to a real implementation.
+  TextureHashFunction func = &GetHash64_Software;
   if (cpu_info.bCRC32)
   {
 #if defined(_M_X86_64)
-    s_texture_hash_func = &GetHash64_SSE42_CRC32;
-#elif defined(_M_ARM_64)
-    s_texture_hash_func = &GetHash64_ARMv8_CRC32;
+    func = &GetHash64_SSE42_CRC32;
+#else
+    func = &GetHash64_ARMv8_CRC32;
 #endif
   }
-  else
-  {
-    s_texture_hash_func = &GetMurmurHash3;
-  }
-  return s_texture_hash_func(src, len, samples);
+
+  s_texture_hash_func = func;
+  return func(src, len, samples);
 }
 
 u64 GetHash64(const u8* src, u32 len, u32 samples)
 {
   return s_texture_hash_func(src, len, samples);
 }
+
+#else
+
+// No hardware CRC32 implementation exists for this target, so the function pointer would
+// only ever hold one value - GetHash64_Software, which does its own runtime selection off
+// the SAB cell. Call it directly: under Emscripten this turns the per-texture-hash indirect
+// call (a call_indirect plus its runtime signature check) into a direct call, and it removes
+// the latent recursion above entirely, since SetHash64Function no longer exists here.
+u64 GetHash64(const u8* src, u32 len, u32 samples)
+{
+  return GetHash64_Software(src, len, samples);
+}
+
+#endif
 
 u32 StartCRC32()
 {

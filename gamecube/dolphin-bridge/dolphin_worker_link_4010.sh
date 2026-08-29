@@ -6,6 +6,15 @@
 #   (2) emsdk  -> ~/emsdk-upstream  (4.0.10; the vendored emsdk/ is 3.1.67)
 #   (3) +libvideowgpu.a             (after the Vulkan .a)
 #   (4) +--use-port=emdawnwebgpu    (after -pthread/-matomics; CANNOT go in the 3.1.67 script)
+# [simd 2026-08-28] -msimd128 was tried and DEFERRED, not adopted. Three reasons, recorded so
+# it isn't re-litigated: (a) a global compile-flag change invalidates every object in
+# build-wasm-4010, forcing a from-scratch rebuild; (b) any v128 opcode makes the WHOLE module
+# fail validation on a browser without wasm SIMD — a hard CompileError, not a per-function
+# fallback — and wasm SIMD is Safari 16.4+ (iOS 16.4, Mar 2023) vs the 14.5 that -matomics
+# already needs, so it raises the Apple mobile floor; (c) the flag alone only permits LLVM
+# autovectorization, so the expected win is small next to the measured levers (vertex loader
+# ~43%, texture hashing ~16%). Revisit as its own matched-pair A/B, adding it HERE and in
+# build-wasm-4010/CMakeCache.txt CMAKE_C_FLAGS + CMAKE_CXX_FLAGS together.
 # Output overwrites the live gamecube/dolphin_libretro/dolphin_worker_emcc.{js,wasm}. A backup
 # of whatever is live is saved to *.prev.{js,wasm} first so the SW build can be restored.
 set -e

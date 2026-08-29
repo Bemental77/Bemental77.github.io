@@ -538,6 +538,38 @@
       if (_fpr !== null)
         new Uint32Array(sharedMemory.buffer)[0x026B3408 >> 2] = (parseInt(_fpr, 10) !== 0) ? 0 : 1;
     } catch (e) { pageLog('[fp-resident] toggle write failed: ' + (e && e.message)); }
+    // [texhash A/B 2026-08-28] Common::GetHash64 (texture cache hash) picks XXH3 vs the old
+    // MurmurHash3 at the call off SAB scratch cell 0x026B340C — same plumbing as the
+    // fp_resident_loop toggle above, next free cell. Browser-zeroed = XXH3 (default, ships).
+    // ?bjit_xxh3_texhash=0 -> write 1 = force the old MurmurHash3 path, so the A/B is a
+    // matched pair on ONE binary. Both hashes read the SAME bytes; only the mixing differs.
+    // Read per call, so it can also be flipped live: Uint32Array(sharedMemory.buffer)
+    // [0x026B340C>>2] = 1 from DevTools. A live flip re-hashes the populated texture cache
+    // once (conservative: re-upload, never a stale texture) — let it settle before reading fps.
+    try {
+      var _txh = new URLSearchParams(location.search).get('bjit_xxh3_texhash');
+      if (_txh !== null)
+        new Uint32Array(sharedMemory.buffer)[0x026B340C >> 2] = (parseInt(_txh, 10) !== 0) ? 0 : 1;
+    } catch (e) { pageLog('[texhash] toggle write failed: ' + (e && e.message)); }
+    // [vtxloader A/B 2026-08-28] VertexLoaderBase::CreateVertexLoader picks the emitted wasm
+    // vertex loader vs Dolphin's scalar software VertexLoader off SAB scratch cell 0x026B3900.
+    // Same plumbing as the two toggles above. Browser-zeroed = wasm loader (default, ships).
+    // ?bjit_vtx_software=1 -> write 1 = force the stock software loader, which is the arm the
+    // ~43%-of-render-worker profile was taken on. Why this exists: VertexLoaderX64/ARM64 are
+    // gated on _M_X86_64/_M_ARM_64, neither of which emscripten defines, so this build fell
+    // through to the software loader that makes one call_indirect per vertex attribute stage.
+    // The cell is re-read per RunVertices (one aligned u32 load per DRAW, not per vertex), so
+    // it also flips live from DevTools without a reload — a same-process matched pair.
+    // 0x026B3904 nonzero additionally forces VertexLoaderType::Compare, which runs BOTH loaders
+    // and diffs them; then 0x026B3908=mismatch count, 0x026B390C=kind bits, 0x026B3910=runs.
+    // PASS is runs > 0 AND mismatches == 0 — a zero run count means the gate never ran.
+    try {
+      var _vtxsw = new URLSearchParams(location.search).get('bjit_vtx_software');
+      var _vtxcmp = new URLSearchParams(location.search).get('bjit_vtx_compare');
+      var _vtxA = new Uint32Array(sharedMemory.buffer);
+      if (_vtxsw !== null) _vtxA[0x026B3900 >> 2] = (parseInt(_vtxsw, 10) !== 0) ? 1 : 0;
+      if (_vtxcmp !== null) _vtxA[0x026B3904 >> 2] = (parseInt(_vtxcmp, 10) !== 0) ? 1 : 0;
+    } catch (e) { pageLog('[vtxloader] toggle write failed: ' + (e && e.message)); }
     dolphin_worker.postMessage({
       cmd: 'mem-init', memory: sharedMemory, offscreen: _hwOff,
       gcRenderWorker: !!window.__gcRenderWorker, wgpu: _wgpu, bjitEnv: _bjitEnv,
@@ -3773,29 +3805,95 @@
   async function idbGet(key) { var db = await openDB(); return new Promise((resolve, reject) => { var t = db.transaction(STORE, 'readonly').objectStore(STORE).get(key); t.onsuccess = () => resolve(t.result); t.onerror = () => reject(t.error); }); }
   async function gzip(u8) { var cs = new CompressionStream('gzip'); var w = cs.writable.getWriter(); w.write(u8); w.close(); return new Uint8Array(await new Response(cs.readable).arrayBuffer()); }
   async function gunzip(u8) { var ds = new DecompressionStream('gzip'); var w = ds.writable.getWriter(); w.write(u8); w.close(); return new Uint8Array(await new Response(ds.readable).arrayBuffer()); }
-  async function saveState() { if (!dolphin_worker) return toast('Emulator not ready', true); toast('Saving state…'); try { var data = await new Promise(res => { pendingSaveResolve = res; dolphin_worker.postMessage({ cmd: 'saveState' }); }); var compressed = await gzip(data); await idbPut(SAVE_KEY, compressed); toast('Saved (' + (compressed.byteLength / 1048576).toFixed(1) + ' MB)'); } catch (e) { toast('Save failed: ' + e.message, true); } }
-  async function loadState() { if (!dolphin_worker) return toast('Emulator not ready', true); try { var stored = await idbGet(SAVE_KEY); if (!stored) return toast('No save state found', true); toast('Restoring…'); var data = await gunzip(stored instanceof Uint8Array ? stored : new Uint8Array(stored)); await new Promise(res => { pendingLoadResolve = res; dolphin_worker.postMessage({ cmd: 'loadState', data: data }, [data.buffer]); }); toast('State restored'); } catch (e) { toast('Load failed: ' + (e.message || e), true); } }
+  // [savestate 2026-08-28] STATE-OWNER ROUTING.
+  // dolphin_worker owns the game only in JIT mode. Under ?recomp=1 the game is the native
+  // port running in gamecube/recomp/recomp_worker.js and dolphin is just the WGPU renderer —
+  // but saveState/loadState posted to dolphin unconditionally, so Save/Load/Export captured
+  // and restored the RENDERER and the game never moved. (Three exports of 15.2 / 21.2 /
+  // 21.4 MB each reported PROBE_LOAD_STATE -> loaded N bytes and each left the emulator on
+  // the title screen with an identical fifo=70938B draws=1300 signature.)
+  // The recomp block registers window.__gcRecompState and reports engaged() true only once
+  // its worker actually has the game — so ?recomp=1 with a refused takeover (non-MP4 ROM)
+  // correctly stays on the dolphin path.
+  function stateOwner() { try { var b = window.__gcRecompState; if (b && b.engaged()) return b; } catch (e) {} return null; }
+  // A .gcs.gz is raw dolphin DoState bytes; a recomp state starts with the 'GCRECOMP' magic.
+  // Each loader must name the other's file rather than restore it — a silent no-op is exactly
+  // the failure the user already hit.
+  function isRecompContainer(u8) { if (!u8 || u8.length < 8) return false; var m = ''; for (var i = 0; i < 8; i++) m += String.fromCharCode(u8[i]); return m === 'GCRECOMP'; }
+  async function saveState() {
+    var own = stateOwner();
+    if (own) { toast('Saving state…'); var r = await own.save(); return toast(r.ok ? r.msg : 'Save failed: ' + r.msg, !r.ok); }
+    if (!dolphin_worker) return toast('Emulator not ready', true);
+    toast('Saving state…');
+    try {
+      var data = await new Promise(res => { pendingSaveResolve = res; dolphin_worker.postMessage({ cmd: 'saveState' }); });
+      // truth check: an empty DoState is not a save, and must not report one
+      var n = (data && (data.byteLength || data.length)) || 0;
+      if (!n) throw new Error('the core returned an empty state');
+      var compressed = await gzip(data);
+      await idbPut(SAVE_KEY, compressed);
+      toast('Saved (' + (compressed.byteLength / 1048576).toFixed(1) + ' MB)');
+    } catch (e) { toast('Save failed: ' + (e.message || e), true); }
+  }
+  async function loadState() {
+    var own = stateOwner();
+    if (own) { toast('Restoring…'); var r = await own.load(); return toast(r.ok ? r.msg : 'Load failed: ' + r.msg, !r.ok); }
+    if (!dolphin_worker) return toast('Emulator not ready', true);
+    try {
+      var stored = await idbGet(SAVE_KEY);
+      if (!stored) return toast('No save state found', true);
+      toast('Restoring…');
+      var data = await gunzip(stored instanceof Uint8Array ? stored : new Uint8Array(stored));
+      if (isRecompContainer(data)) return toast('That state was made in recomp mode (?recomp=1) — the JIT core cannot load it', true);
+      await new Promise(res => { pendingLoadResolve = res; dolphin_worker.postMessage({ cmd: 'loadState', data: data }, [data.buffer]); });
+      toast('State restored');
+    } catch (e) { toast('Load failed: ' + (e.message || e), true); }
+  }
   // Export the gzipped save-state from IndexedDB to a downloadable file so it
   // can be loaded headlessly by the render probe (PROBE_LOAD_STATE). Save first.
-  async function exportState() { try { var stored = await idbGet(SAVE_KEY); if (!stored) return toast('No save state — click Save State first', true); var u8 = stored instanceof Uint8Array ? stored : new Uint8Array(stored); var blob = new Blob([u8], { type: 'application/octet-stream' }); var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = SAVE_KEY + '.gz'; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000); toast('Exported ' + a.download + ' (' + (u8.byteLength / 1048576).toFixed(1) + ' MB)'); } catch (e) { toast('Export failed: ' + (e.message || e), true); } }
-  async function importState(file) { try { if (!file) return; var buf = new Uint8Array(await file.arrayBuffer()); await idbPut(SAVE_KEY, buf); toast('Imported ' + (buf.byteLength / 1048576).toFixed(1) + ' MB — click Load State'); } catch (e) { toast('Import failed: ' + (e.message || e), true); } }
+  async function exportState() {
+    var own = stateOwner();
+    if (own) { var r = await own.exportFile(); return toast(r.ok ? r.msg : 'Export failed: ' + r.msg, !r.ok); }
+    try { var stored = await idbGet(SAVE_KEY); if (!stored) return toast('No save state — click Save State first', true); var u8 = stored instanceof Uint8Array ? stored : new Uint8Array(stored); var blob = new Blob([u8], { type: 'application/octet-stream' }); var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = SAVE_KEY + '.gz'; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000); toast('Exported ' + a.download + ' (' + (u8.byteLength / 1048576).toFixed(1) + ' MB)'); } catch (e) { toast('Export failed: ' + (e.message || e), true); }
+  }
+  async function importState(file) {
+    var own = stateOwner();
+    if (own) { var r = await own.importFile(file); return toast(r.ok ? r.msg : 'Import failed: ' + r.msg, !r.ok); }
+    try {
+      if (!file) return;
+      var buf = new Uint8Array(await file.arrayBuffer());
+      // Reject a recomp container here rather than store it and no-op at load time.
+      try { var probe = await gunzip(buf); if (isRecompContainer(probe)) return toast('That is a recomp save state — open the page with ?recomp=1 to use it', true); } catch (e) {}
+      await idbPut(SAVE_KEY, buf);
+      toast('Imported ' + (buf.byteLength / 1048576).toFixed(1) + ' MB — click Load State');
+    } catch (e) { toast('Import failed: ' + (e.message || e), true); }
+  }
   // Headless-probe hook: accept gzipped state bytes, gunzip, and restore.
   // Returns a promise that resolves once the worker confirms the load.
-  window.__probeLoadStateFromGz = async function (gzBytes) { if (!dolphin_worker) throw new Error('worker not ready'); var data = await gunzip(gzBytes instanceof Uint8Array ? gzBytes : new Uint8Array(gzBytes)); await new Promise(res => { pendingLoadResolve = res; dolphin_worker.postMessage({ cmd: 'loadState', data: data }, [data.buffer]); }); return true; };
+  window.__probeLoadStateFromGz = async function (gzBytes) {
+    var own = stateOwner();
+    if (own) { var r = await own.loadFromGz(gzBytes); if (!r.ok) throw new Error(r.msg); return true; }
+    if (!dolphin_worker) throw new Error('worker not ready');
+    var data = await gunzip(gzBytes instanceof Uint8Array ? gzBytes : new Uint8Array(gzBytes));
+    if (isRecompContainer(data)) throw new Error('recomp save state handed to the JIT core');
+    await new Promise(res => { pendingLoadResolve = res; dolphin_worker.postMessage({ cmd: 'loadState', data: data }, [data.buffer]); });
+    return true;
+  };
   // Headless-probe hook: report the WASM build's own raw DoState size (bytes),
   // for comparing against a native .s01's uncompressed_size (format compat check).
-  window.__probeStateSize = function () { if (!dolphin_worker) throw new Error('worker not ready'); return new Promise(res => { pendingSaveResolve = function (d) { res(d.byteLength || (d.length||0)); }; dolphin_worker.postMessage({ cmd: 'saveState' }); }); };
+  // Dolphin-specific by definition — it must not silently measure the renderer in recomp mode.
+  window.__probeStateSize = function () { if (stateOwner()) throw new Error('__probeStateSize measures the dolphin DoState; the game is in the recomp worker'); if (!dolphin_worker) throw new Error('worker not ready'); return new Promise(res => { pendingSaveResolve = function (d) { res(d.byteLength || (d.length||0)); }; dolphin_worker.postMessage({ cmd: 'saveState' }); }); };
   // Headless-probe checkpoint hooks: save/load to IndexedDB (SAVE_KEY) so a
   // persistent-profile probe can resume the slow boot across runs.
   window.__probeSaveState = async function () { await saveState(); return true; };
   window.__probeLoadState = async function () { await loadState(); return true; };
-  window.__probeHasState = async function () { try { var s = await idbGet(SAVE_KEY); return !!s; } catch (e) { return false; } };
+  window.__probeHasState = async function () { var own = stateOwner(); if (own) { try { return await own.has(); } catch (e) { return false; } } try { var s = await idbGet(SAVE_KEY); return !!s; } catch (e) { return false; } };
   // Headless-probe hook: return the gzipped save-state bytes (from IndexedDB) as a
   // plain Array so node can persist them to a portable .gz for PROBE_LOAD_STATE.
-  window.__probeGetStateGz = async function () { var s = await idbGet(SAVE_KEY); if (!s) return null; var u8 = s instanceof Uint8Array ? s : new Uint8Array(s); return Array.from(u8); };
+  window.__probeGetStateGz = async function () { var own = stateOwner(); var s = own ? await own.getGz() : await idbGet(SAVE_KEY); if (!s) return null; var u8 = s instanceof Uint8Array ? s : new Uint8Array(s); return Array.from(u8); };
   // Headless-driver export: return the gzipped IndexedDB state blob as base64
   // (so the node harness can write it to a file via exposeFunction). Save first.
-  window.__probeExportGzB64 = async function () { try { var stored = await idbGet(SAVE_KEY); if (!stored) return ''; var u8 = stored instanceof Uint8Array ? stored : new Uint8Array(stored); var bin = ''; for (var i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]); return btoa(bin); } catch (e) { return ''; } };
+  window.__probeExportGzB64 = async function () { try { var own = stateOwner(); var stored = own ? await own.getGz() : await idbGet(SAVE_KEY); if (!stored) return ''; var u8 = stored instanceof Uint8Array ? stored : new Uint8Array(stored); var bin = ''; for (var i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]); return btoa(bin); } catch (e) { return ''; } };
   function toggleMute() { audioMuted = !audioMuted; var ctx = getAudioCtx(); if (ctx) { audioMuted ? ctx.suspend() : ctx.resume(); } $('btnMute').textContent = audioMuted ? '🔇 Unmute' : '🔊 Mute'; $('mMute').textContent = audioMuted ? 'Unmute' : 'Mute'; }
   async function resetAudio() { var ctx = getAudioCtx(); if (!ctx) { toast('Audio not ready', true); return; } toast('Resetting audio…'); try { await ctx.suspend(); } catch (e) {} await new Promise(r => setTimeout(r, 150)); if (!audioMuted) { try { await ctx.resume(); } catch (e) {} } toast('Audio reset'); }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasWrap'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
@@ -3868,6 +3966,371 @@
     }
     hudEl.textContent = txt;
   }
+
+  // --- memory card persistence ---------------------------------------------------------
+  // The recomp's memory card is a real 2 MiB .raw GameCube card living inside the wasm module
+  // (gamecube/recomp/shims/src/gc_card.c) — the emulated CARD SDK writes into it, and the
+  // worker seeds it before main() / snapshots it back when the shim's dirty counter goes quiet.
+  // NOTE: this is a SEPARATE <script> from the main emulator IIFE, so that block's
+  // openDB/idbGet/idbPut/gzip/toast are NOT in scope here. Hence the private helpers below,
+  // on their own database so the two blocks can never collide over a schema version.
+  // No gzip: 2 MiB of mostly-0xff compresses well but a memory card is written rarely and read
+  // once at boot, and keeping the stored bytes byte-identical to the exported .raw means the
+  // Export button and the IndexedDB copy are literally the same artifact.
+  var CARD_DB = 'GCRECOMPCARD', CARD_STORE = 'card', CARD_KEY = 'MarioParty4.raw';
+  var CARD_BYTES = 2097152;              // 256 blocks x 8192 = 16 Mbit "Memory Card 251"
+  var cardStatusEl = null, pendingExport = null;
+
+  function cardSay(txt) {
+    console.log('[recomp-live] memcard: ' + txt);
+    if (cardStatusEl) cardStatusEl.textContent = 'card: ' + txt;
+  }
+  function cardDB() {
+    return new Promise(function (res, rej) {
+      var rq = indexedDB.open(CARD_DB, 1);
+      rq.onupgradeneeded = function (e) { e.target.result.createObjectStore(CARD_STORE); };
+      rq.onsuccess = function (e) { res(e.target.result); };
+      rq.onerror = function () { rej(rq.error); };
+    });
+  }
+  function cardIdbGet() {
+    return cardDB().then(function (db) {
+      return new Promise(function (res, rej) {
+        var rq = db.transaction(CARD_STORE, 'readonly').objectStore(CARD_STORE).get(CARD_KEY);
+        rq.onsuccess = function () {
+          var v = rq.result;
+          if (!v) return res(null);
+          // stored as an ArrayBuffer, but normalise in case a view was ever written
+          res(v instanceof ArrayBuffer ? v : v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength));
+        };
+        rq.onerror = function () { rej(rq.error); };
+      });
+    }).catch(function (e) { cardSay('load failed: ' + (e.message || e)); return null; });
+  }
+  function cardIdbPut(buf) {
+    return cardDB().then(function (db) {
+      return new Promise(function (res, rej) {
+        var rq = db.transaction(CARD_STORE, 'readwrite').objectStore(CARD_STORE).put(buf, CARD_KEY);
+        rq.onsuccess = function () { res(); };
+        rq.onerror = function () { rej(rq.error); };
+      });
+    }).catch(function (e) { cardSay('save failed: ' + (e.message || e)); });
+  }
+  function cardDownload(u8) {
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([u8], { type: 'application/octet-stream' }));
+    a.download = 'MarioParty4-memcard.raw';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  }
+  // Export the LIVE card (ask the worker for a snapshot) so you never ship a stale image;
+  // fall back to the last persisted copy if the worker isn't up or doesn't answer.
+  function cardExport() {
+    cardSay('reading live card...');
+    new Promise(function (res) {
+      if (!rw) return res(null);
+      pendingExport = res;
+      rw.postMessage({ cmd: 'cardDump' });
+      setTimeout(function () { if (pendingExport === res) { pendingExport = null; res(null); } }, 3000);
+    }).then(function (u8) {
+      if (u8) return u8;
+      return cardIdbGet().then(function (b) { return b ? new Uint8Array(b) : null; });
+    }).then(function (u8) {
+      if (!u8) { cardSay('nothing to export yet'); return; }
+      cardDownload(u8);
+      cardSay('exported ' + (u8.length / 1048576).toFixed(1) + ' MB');
+    });
+  }
+  function cardImport(file) {
+    file.arrayBuffer().then(function (buf) {
+      if (buf.byteLength !== CARD_BYTES) {
+        cardSay('rejected: ' + buf.byteLength + ' bytes — a 251-block .raw is exactly ' + CARD_BYTES);
+        return;
+      }
+      return cardIdbPut(buf.slice(0)).then(function () {
+        if (rw) {
+          var live = buf.slice(0);
+          rw.postMessage({ cmd: 'cardLoad', img: live }, [live]);
+          cardSay('imported (applied live — takes effect at the next save/load)');
+        } else {
+          cardSay('imported — starts on the next boot');
+        }
+      });
+    }).catch(function (e) { cardSay('import failed: ' + (e.message || e)); });
+  }
+  function cardUI() {
+    var bar = document.getElementById('statusBar');
+    if (!bar || document.getElementById('recompCardUI')) return;
+    var wrap = document.createElement('span');
+    wrap.id = 'recompCardUI';
+    var fileIn = document.createElement('input');
+    fileIn.type = 'file';
+    fileIn.accept = '.raw,.gcp,application/octet-stream';
+    fileIn.style.display = 'none';
+    fileIn.addEventListener('change', function () {
+      if (fileIn.files && fileIn.files[0]) cardImport(fileIn.files[0]);
+      fileIn.value = '';
+    });
+    var mk = function (label, fn) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.style.cssText = 'margin-right:6px;font-size:11px;font-family:inherit;padding:1px 6px;cursor:pointer';
+      b.addEventListener('click', fn);
+      wrap.appendChild(b);
+    };
+    mk('Export Card', cardExport);
+    mk('Import Card', function () { fileIn.click(); });
+    cardStatusEl = document.createElement('span');
+    cardStatusEl.style.cssText = 'color:#7f7';
+    wrap.appendChild(cardStatusEl);
+    wrap.appendChild(fileIn);
+    bar.appendChild(wrap);
+  }
+  cardUI();
+
+  // --- save states ---------------------------------------------------------------------
+  // THE BUG THIS FIXES: gamecube.html's saveState/loadState posted to dolphin_worker
+  // unconditionally. In recomp mode dolphin is only the WGPU renderer — the GAME is the
+  // native port in recomp_worker.js — so Save/Load/Export captured and restored the
+  // renderer and the game never moved (three exports of 15.2 / 21.2 / 21.4 MB each
+  // reported "loaded N bytes" and each left the emulator on the title screen with an
+  // identical fifo=70938B draws=1300 signature). The main IIFE now looks up
+  // window.__gcRecompState (registered at the bottom of this block) and delegates whenever
+  // engaged() is true — i.e. only once THIS worker actually owns the game.
+  //
+  // TRANSPORT: the worker cannot receive messages once the game is running (its event loop
+  // never turns — see the SAVE STATES block in recomp_worker.js), so requests travel through
+  // the pace SAB's spare cells and the state bytes stream through a staging SAB. Snapshots
+  // come back out by postMessage, which is unaffected.
+  //
+  // FORMAT: 'GCRECOMP' + u32 version + u32 jsonLen + header JSON + u32 page indices + 64 KiB
+  // pages, gzipped, in its own IndexedDB database under its own file extension. The JIT
+  // format (raw dolphin DoState bytes, gzipped, GCWASMDB/GCWASMSTATES, .gcs.gz) is untouched
+  // and keeps working in JIT mode; each loader rejects the other's file by name.
+  var ST_CMD = 10, ST_TOTAL = 11, ST_LEN = 12, ST_SEQ = 13, ST_CONSUMED = 14, ST_STATUS = 15;
+  var STATE_DB = 'GCRECOMPSTATE', STATE_STORE = 'state', STATE_KEY = 'MarioParty4.gcrs';
+  var STAGE_BYTES = 8 * 1024 * 1024;
+  var stageSab = new SharedArrayBuffer(STAGE_BYTES);
+  var stageU8 = new Uint8Array(stageSab);
+  var bootSent = false;
+  var pendingStateSave = null, pendingStateLoad = null, pendingLoadReady = null;
+
+  function stEngaged() { return !!(rw && bootSent); }
+  function stSay(txt) { console.log('[recomp-live] state: ' + txt); }
+
+  // Private IDB/gzip helpers: this is a SEPARATE <script> from the main emulator IIFE, so its
+  // openDB/idbGet/idbPut/gzip/toast are not in scope here (same reason the card block has its
+  // own). Separate database => the two save formats can never collide over a schema version.
+  function stDB() {
+    return new Promise(function (res, rej) {
+      var rq = indexedDB.open(STATE_DB, 1);
+      rq.onupgradeneeded = function (e) { e.target.result.createObjectStore(STATE_STORE); };
+      rq.onsuccess = function (e) { res(e.target.result); };
+      rq.onerror = function () { rej(rq.error); };
+    });
+  }
+  function stIdbGet() {
+    return stDB().then(function (db) {
+      return new Promise(function (res, rej) {
+        var rq = db.transaction(STATE_STORE, 'readonly').objectStore(STATE_STORE).get(STATE_KEY);
+        rq.onsuccess = function () {
+          var v = rq.result;
+          if (!v) return res(null);
+          res(v instanceof Uint8Array ? v : new Uint8Array(v));
+        };
+        rq.onerror = function () { rej(rq.error); };
+      });
+    });
+  }
+  function stIdbPut(u8) {
+    return stDB().then(function (db) {
+      return new Promise(function (res, rej) {
+        var rq = db.transaction(STATE_STORE, 'readwrite').objectStore(STATE_STORE).put(u8, STATE_KEY);
+        rq.onsuccess = function () { res(); };
+        rq.onerror = function () { rej(rq.error); };
+      });
+    });
+  }
+  function stGzip(u8) {
+    var cs = new CompressionStream('gzip'); var w = cs.writable.getWriter();
+    w.write(u8); w.close();
+    return new Response(cs.readable).arrayBuffer().then(function (b) { return new Uint8Array(b); });
+  }
+  function stGunzip(u8) {
+    var ds = new DecompressionStream('gzip'); var w = ds.writable.getWriter();
+    w.write(u8); w.close();
+    return new Response(ds.readable).arrayBuffer().then(function (b) { return new Uint8Array(b); });
+  }
+
+  // Reject a foreign/!v1 container BEFORE anything is stored or streamed. The user has 11
+  // .gcs.gz exports that are dolphin/renderer states; those must say so, not silently no-op.
+  function stCheckContainer(u8) {
+    if (!u8 || u8.length < 16) return { ok: false, msg: 'save file is truncated' };
+    var magic = '';
+    for (var i = 0; i < 8; i++) magic += String.fromCharCode(u8[i]);
+    if (magic !== 'GCRECOMP')
+      return { ok: false, msg: 'that file is a JIT/renderer save state (.gcs.gz), not a recomp '
+                            + 'state — it cannot restore the native-port game' };
+    var v = new DataView(u8.buffer, u8.byteOffset, u8.byteLength).getUint32(8, true);
+    if (v !== 1)
+      return { ok: false, msg: 'recomp save state version ' + v + ' — this page reads version 1' };
+    return { ok: true };
+  }
+
+  function stPoke(cmd) {
+    Atomics.store(paceI32, ST_STATUS, 0);
+    Atomics.store(paceI32, ST_CMD, cmd);
+    // the worker services the cell inside its per-frame VI stub, which may be parked in
+    // Atomics.wait for pacing credits — grant a few so the pump is guaranteed to run.
+    Atomics.add(paceI32, 0, 8); Atomics.notify(paceI32, 0);
+  }
+
+  function stSave() {
+    if (!stEngaged()) return Promise.resolve({ ok: false, msg: 'the recomp game worker is not running yet' });
+    if (pendingStateSave) return Promise.resolve({ ok: false, msg: 'a save is already in flight' });
+    return new Promise(function (res) {
+      var done = false;
+      var to = setTimeout(function () {
+        if (done) return; done = true; pendingStateSave = null;
+        res({ ok: false, msg: 'the recomp worker did not answer the save request' });
+      }, 60000);
+      pendingStateSave = function (r) {
+        if (done) return; done = true; clearTimeout(to); pendingStateSave = null;
+        if (!r.ok) return res(r);
+        var raw = new Uint8Array(r.buf);
+        stGzip(raw).then(function (gz) {
+          return stIdbPut(gz).then(function () {
+            stSay('saved f' + r.n + ' — ' + (raw.length / 1048576).toFixed(1) + ' MB raw, '
+                  + (gz.byteLength / 1048576).toFixed(1) + ' MB stored');
+            res({ ok: true, msg: 'Saved recomp state at frame ' + r.n + ' ('
+                                 + (gz.byteLength / 1048576).toFixed(1) + ' MB)' });
+          });
+        }).catch(function (e) { res({ ok: false, msg: 'could not store the state: ' + (e.message || e) }); });
+      };
+      stPoke(1);
+    });
+  }
+
+  // Main thread cannot Atomics.wait, so the page publishes a chunk and polls the worker's
+  // consumed counter; the worker blocks on ST_SEQ and copies. ST_LEN = -1 ends the stream.
+  function stAwaitConsumed(seq) {
+    return new Promise(function (res, rej) {
+      var t0 = Date.now();
+      (function poll() {
+        if (Atomics.load(paceI32, ST_CONSUMED) >= seq) return res();
+        if (Date.now() - t0 > 60000) return rej(new Error('the recomp worker stopped consuming state chunks'));
+        setTimeout(poll, 2);
+      })();
+    });
+  }
+  function stPumpChunks(bytes) {
+    var off = 0, seq = 0;
+    function step() {
+      if (off >= bytes.length) {
+        seq++;
+        Atomics.store(paceI32, ST_LEN, -1);
+        Atomics.store(paceI32, ST_SEQ, seq);
+        Atomics.notify(paceI32, ST_SEQ);
+        return Promise.resolve();
+      }
+      var n = Math.min(STAGE_BYTES, bytes.length - off);
+      stageU8.set(bytes.subarray(off, off + n), 0);
+      off += n; seq++;
+      Atomics.store(paceI32, ST_LEN, n);
+      Atomics.store(paceI32, ST_SEQ, seq);
+      Atomics.notify(paceI32, ST_SEQ);
+      return stAwaitConsumed(seq).then(step);
+    }
+    return step();
+  }
+
+  function stSendState(bytes) {
+    var chk = stCheckContainer(bytes);
+    if (!chk.ok) return Promise.resolve(chk);
+    return new Promise(function (res) {
+      var done = false;
+      var to = setTimeout(function () {
+        if (done) return; done = true; pendingLoadReady = null; pendingStateLoad = null;
+        res({ ok: false, msg: 'the recomp worker did not answer the load request' });
+      }, 120000);
+      pendingStateLoad = function (r) {
+        if (done) return; done = true; clearTimeout(to); pendingStateLoad = null; pendingLoadReady = null;
+        res(r);
+      };
+      pendingLoadReady = function () {
+        pendingLoadReady = null;
+        stPumpChunks(bytes).catch(function (e) {
+          if (pendingStateLoad) pendingStateLoad({ ok: false, msg: e.message || String(e) });
+        });
+      };
+      Atomics.store(paceI32, ST_TOTAL, bytes.length);
+      Atomics.store(paceI32, ST_LEN, 0);
+      Atomics.store(paceI32, ST_SEQ, 0);
+      Atomics.store(paceI32, ST_CONSUMED, 0);
+      stPoke(2);
+    });
+  }
+
+  function stLoad() {
+    if (!stEngaged()) return Promise.resolve({ ok: false, msg: 'the recomp game worker is not running yet' });
+    if (pendingStateLoad) return Promise.resolve({ ok: false, msg: 'a load is already in flight' });
+    return stIdbGet().then(function (gz) {
+      if (!gz) return { ok: false, msg: 'no recomp save state stored yet — click Save State first' };
+      return stGunzip(gz).then(stSendState);
+    }).catch(function (e) { return { ok: false, msg: (e && e.message) || String(e) }; });
+  }
+
+  function stExport() {
+    return stIdbGet().then(function (gz) {
+      if (!gz) return { ok: false, msg: 'no recomp save state — click Save State first' };
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([gz], { type: 'application/octet-stream' }));
+      a.download = STATE_KEY + '.gz';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+      return { ok: true, msg: 'Exported ' + a.download + ' (' + (gz.byteLength / 1048576).toFixed(1) + ' MB)' };
+    }).catch(function (e) { return { ok: false, msg: (e && e.message) || String(e) }; });
+  }
+
+  function stImport(file) {
+    if (!file) return Promise.resolve({ ok: false, msg: 'no file chosen' });
+    return file.arrayBuffer().then(function (buf) {
+      var u8 = new Uint8Array(buf);
+      var gzipped = u8.length > 2 && u8[0] === 0x1f && u8[1] === 0x8b;
+      return (gzipped ? stGunzip(u8) : Promise.resolve(u8)).then(function (raw) {
+        // Validate the CONTAINER before storing: an old .gcs.gz must be rejected here rather
+        // than sit in IndexedDB waiting to fail (or worse, no-op) at load time.
+        var chk = stCheckContainer(raw);
+        if (!chk.ok) return chk;
+        return (gzipped ? Promise.resolve(u8) : stGzip(raw)).then(function (gz) {
+          return stIdbPut(gz).then(function () {
+            return { ok: true, msg: 'Imported ' + (gz.byteLength / 1048576).toFixed(1)
+                                    + ' MB recomp state — click Load State' };
+          });
+        });
+      });
+    }).catch(function (e) { return { ok: false, msg: (e && e.message) || String(e) }; });
+  }
+
+  window.__gcRecompState = {
+    label: 'recomp',
+    engaged: stEngaged,
+    save: stSave,
+    load: stLoad,
+    exportFile: stExport,
+    importFile: stImport,
+    has: function () { return stIdbGet().then(function (v) { return !!v; }).catch(function () { return false; }); },
+    getGz: function () { return stIdbGet(); },
+    loadFromGz: function (gz) {
+      if (!stEngaged()) return Promise.resolve({ ok: false, msg: 'the recomp game worker is not running yet' });
+      var u8 = gz instanceof Uint8Array ? gz : new Uint8Array(gz);
+      return stGunzip(u8).then(stSendState)
+        .catch(function (e) { return { ok: false, msg: (e && e.message) || String(e) }; });
+    }
+  };
 
   // keyboard -> pace SAB (one-shot injections consumed by HuPadRead's bake).
   // Codes ALIGNED with the site KEYMAP (x=A z=B s=X d=Y w=L r=R e=Z v=Start) so the
@@ -3974,6 +4437,7 @@
       console.log('[recomp-live] ppc_worker terminated (JIT guest stopped)');
     }
     rw = new Worker('/gamecube/recomp/recomp_worker.js?v=' + Date.now());
+    bootSent = false;   // savestate routing stays off until this worker has the game
     var origOnWorkerMsg = dolphin_worker.onmessage;
     dolphin_worker.onmessage = function (e) {
       if (e.data && e.data.cmd === 'recompAck') { rendered++; outstanding--; return; }
@@ -3992,6 +4456,30 @@
         dolphin_worker.postMessage({ cmd: 'recompFrame', n: e.data.n, fifo: e.data.fifo,
                                      mem1: e.data.mem1, regions: e.data.regions,
                                      skipRender: skipRender }, tr);
+      } else if (e.data.cmd === 'card') {
+        // 2 MiB .raw snapshot: the shim's dirty counter went quiet (or Export asked for one).
+        var img = e.data.img;
+        cardIdbPut(img);
+        cardSay('saved ' + (img.byteLength / 1048576).toFixed(1) + ' MB');
+        if (pendingExport) { var p = pendingExport; pendingExport = null; p(new Uint8Array(img)); }
+      } else if (e.data.cmd === 'stateSaved') {
+        if (pendingStateSave) pendingStateSave({ ok: true, buf: e.data.buf, n: e.data.n });
+      } else if (e.data.cmd === 'stateLoadReady') {
+        if (pendingLoadReady) pendingLoadReady();
+      } else if (e.data.cmd === 'stateRestored') {
+        // The restored timeline is a different frame index and dolphin's guest-RAM mirror is
+        // stale; the worker forces a full mem1 + prologue resend, and the page's in-flight
+        // bookkeeping must be cleared too — otherwise `outstanding` stays >= 2 (its recompAcks
+        // belonged to the discarded timeline) and EVERY later frame is marked skipRender: the
+        // "state loads but the picture never changes" failure, from the page side.
+        outstanding = 0; dropped = 0; credAcc = 0; lastT = 0;
+        framesSeen = e.data.n; lastN = e.data.n; lastRendered = rendered;
+        stSay('worker restored at frame ' + e.data.n + '; renderer resync forced');
+        if (pendingStateLoad) pendingStateLoad({ ok: true, n: e.data.n });
+      } else if (e.data.cmd === 'stateError') {
+        stSay(e.data.op + ' failed: ' + e.data.txt);
+        if (e.data.op === 'save' && pendingStateSave) pendingStateSave({ ok: false, msg: e.data.txt });
+        else if (pendingStateLoad) pendingStateLoad({ ok: false, msg: e.data.txt });
       } else if (e.data.cmd === 'log') console.log(e.data.txt);
     };
     // ?board=1: the canned frame-exact chain that drives boot -> title -> save dialogs ->
@@ -4007,14 +4495,26 @@
                    [4650, [0x100,0,0,0]]];
       for (var ci = 0; ci < chain.length; ci++) boardScript[chain[ci][0]] = chain[ci][1];
     }
-    rw.postMessage({ cmd: 'boot', parts: parts, fst: fst, pace: pace,
+    // Persisted memory card, if any. It MUST ride the boot message: the worker writes it into
+    // the shim's image buffer before Module._main(), and CARDInit adopts it from inside main.
+    var card = await cardIdbGet();
+    if (card && card.byteLength !== CARD_BYTES) {
+      cardSay('stored image is ' + card.byteLength + ' bytes, not ' + CARD_BYTES + ' — ignoring');
+      card = null;
+    }
+    cardSay(card ? 'restoring ' + (card.byteLength / 1048576).toFixed(1) + ' MB' : 'none saved yet');
+    var bootTransfer = parts.concat([fst]);
+    if (card) bootTransfer.push(card);
+    rw.postMessage({ cmd: 'boot', parts: parts, fst: fst, pace: pace, card: card,
+                     stage: stageSab,
                      autoboard: q.get('board') === '1',
                      inputScript: boardScript,
                      peekAddrs: (q.get('peek') || '').split(',').filter(Boolean).map(function (s) { return parseInt(s, 16); }),
                      testFullMem: q.get('fullmem') === '1',
                      xfShadowAll: q.get('xfregonly') === '1' ? false : true,
                      glueUrl: '/gamecube/recomp/mp4_game.js',
-                     wasmUrl: '/gamecube/recomp/mp4_game.wasm' }, parts.concat([fst]));
+                     wasmUrl: '/gamecube/recomp/mp4_game.wasm' }, bootTransfer);
+    bootSent = true;    // from here on, Save/Load/Export belong to THIS worker, not dolphin
     requestAnimationFrame(grantLoop);
   }
 

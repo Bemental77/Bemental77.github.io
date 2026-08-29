@@ -29,6 +29,79 @@
 #include "VideoCommon/VertexLoaderARM64.h"
 #endif
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+
+#include "VideoCommon/VertexLoaderWasm.h"
+#endif
+
+// [vtx-wasm 2026-08-28] Probe-readable outcome of the VertexLoaderType::Compare
+// gate below. ASSERT_MSG routes through PanicYesNoFmtAssert (Common/Assert.h:11-23),
+// which in a non-interactive build can LOG and return true rather than Crash() —
+// so a mismatch would otherwise be invisible to a headless probe. These counters
+// are bumped next to every assertion; they are the actual pass/fail signal.
+//
+// Read them either as exports (Module._bem_vtx_mismatch_count()) or straight out
+// of the SAB scratch cells they mirror (VertexLoaderWasm.h kMismatch*Cell).
+// PASS == compare_runs > 0 && mismatch_count == 0. A zero run count means the
+// gate never ran (Compare was not enabled), which is NOT a pass.
+extern "C" {
+u32 g_bem_vtx_compare_runs = 0;
+u32 g_bem_vtx_mismatches = 0;
+u32 g_bem_vtx_mismatch_kinds = 0;
+}
+
+enum : u32
+{
+  VTX_MISMATCH_COUNT = 1u << 0,
+  VTX_MISMATCH_DATA = 1u << 1,
+  VTX_MISMATCH_POSMTX_CACHE = 1u << 2,
+  VTX_MISMATCH_POSITION_CACHE = 1u << 3,
+  VTX_MISMATCH_NORMAL_CACHE = 1u << 4,
+  VTX_MISMATCH_TANGENT_CACHE = 1u << 5,
+  VTX_MISMATCH_BINORMAL_CACHE = 1u << 6,
+};
+
+static void RecordVertexLoaderMismatch(u32 kind)
+{
+  g_bem_vtx_mismatches++;
+  g_bem_vtx_mismatch_kinds |= kind;
+#ifdef __EMSCRIPTEN__
+  VertexLoaderWasmFlags::WriteCell(VertexLoaderWasmFlags::kMismatchCountCell,
+                                   g_bem_vtx_mismatches);
+  VertexLoaderWasmFlags::WriteCell(VertexLoaderWasmFlags::kMismatchKindsCell,
+                                   g_bem_vtx_mismatch_kinds);
+#endif
+}
+
+#ifdef __EMSCRIPTEN__
+extern "C" {
+EMSCRIPTEN_KEEPALIVE u32 bem_vtx_mismatch_count()
+{
+  return g_bem_vtx_mismatches;
+}
+EMSCRIPTEN_KEEPALIVE u32 bem_vtx_mismatch_kinds()
+{
+  return g_bem_vtx_mismatch_kinds;
+}
+EMSCRIPTEN_KEEPALIVE u32 bem_vtx_compare_runs()
+{
+  return g_bem_vtx_compare_runs;
+}
+// Convenience setters for the two SAB toggles, so a probe that has the Module
+// but not `sharedMemory` can still drive the A/B. Equivalent to writing the
+// cells directly; see VertexLoaderWasm.h.
+EMSCRIPTEN_KEEPALIVE void bem_vtx_set_force_software(u32 on)
+{
+  VertexLoaderWasmFlags::WriteCell(VertexLoaderWasmFlags::kForceSoftwareCell, on);
+}
+EMSCRIPTEN_KEEPALIVE void bem_vtx_set_compare(u32 on)
+{
+  VertexLoaderWasmFlags::WriteCell(VertexLoaderWasmFlags::kForceCompareCell, on);
+}
+}
+#endif
+
 // a hacky implementation to compare two vertex loaders
 class VertexLoaderTester : public VertexLoaderBase
 {
@@ -96,17 +169,33 @@ public:
     const std::array<float, 4> b_tangent_cache = VertexLoaderManager::tangent_cache;
     const std::array<float, 4> b_binormal_cache = VertexLoaderManager::binormal_cache;
 
+    // [vtx-wasm 2026-08-28] Every check below feeds RecordVertexLoaderMismatch as
+    // well as ASSERT_MSG: ASSERT_MSG may only log in this build (Common/Assert.h:11-23
+    // -> PanicYesNoFmtAssert), and a wrong vertex stream shows up as garbled
+    // geometry rather than a crash, so the probe needs a hard counter.
+    g_bem_vtx_compare_runs++;
+#ifdef __EMSCRIPTEN__
+    VertexLoaderWasmFlags::WriteCell(VertexLoaderWasmFlags::kCompareRunsCell,
+                                     g_bem_vtx_compare_runs);
+#endif
+
+    if (count_a != count_b)
+      RecordVertexLoaderMismatch(VTX_MISMATCH_COUNT);
     ASSERT_MSG(VIDEO, count_a == count_b,
                "The two vertex loaders have loaded a different amount of vertices (a: {}, b: {}).",
                count_a, count_b);
 
-    ASSERT_MSG(VIDEO,
-               memcmp(buffer_a.data(), buffer_b.data(),
-                      std::min(count_a, count_b) * m_native_vtx_decl.stride) == 0,
+    const bool data_matches = memcmp(buffer_a.data(), buffer_b.data(),
+                                     std::min(count_a, count_b) * m_native_vtx_decl.stride) == 0;
+    if (!data_matches)
+      RecordVertexLoaderMismatch(VTX_MISMATCH_DATA);
+    ASSERT_MSG(VIDEO, data_matches,
                "The two vertex loaders have loaded different data.  Configuration:"
                "\nVertex desc:\n{}\n\nVertex attr:\n{}",
                m_VtxDesc, m_VtxAttr);
 
+    if (a_position_matrix_index_cache != b_position_matrix_index_cache)
+      RecordVertexLoaderMismatch(VTX_MISMATCH_POSMTX_CACHE);
     ASSERT_MSG(VIDEO, a_position_matrix_index_cache == b_position_matrix_index_cache,
                "Expected matching position matrix caches after loading (a: {}; b: {})",
                fmt::join(a_position_matrix_index_cache, ", "),
@@ -134,6 +223,8 @@ public:
       return true;
     }();
 
+    if (!positions_match)
+      RecordVertexLoaderMismatch(VTX_MISMATCH_POSITION_CACHE);
     ASSERT_MSG(VIDEO, positions_match,
                "Expected matching position caches after loading (a: {} / {} / {}; b: {} / {} / {})",
                fmt::join(a_position_cache[0], ", "), fmt::join(a_position_cache[1], ", "),
@@ -141,21 +232,29 @@ public:
                fmt::join(b_position_cache[1], ", "), fmt::join(b_position_cache[2], ", "));
 
     // The last element is allowed to be garbage for SIMD overwrites
-    ASSERT_MSG(VIDEO,
-               std::equal(a_normal_cache.begin(), a_normal_cache.begin() + 3,
-                          b_normal_cache.begin(), b_normal_cache.begin() + 3, bit_equal),
-               "Expected matching normal caches after loading (a: {}; b: {})",
+    const bool normals_match = std::equal(a_normal_cache.begin(), a_normal_cache.begin() + 3,
+                                          b_normal_cache.begin(), b_normal_cache.begin() + 3,
+                                          bit_equal);
+    if (!normals_match)
+      RecordVertexLoaderMismatch(VTX_MISMATCH_NORMAL_CACHE);
+    ASSERT_MSG(VIDEO, normals_match, "Expected matching normal caches after loading (a: {}; b: {})",
                fmt::join(a_normal_cache, ", "), fmt::join(b_normal_cache, ", "));
 
-    ASSERT_MSG(VIDEO,
-               std::equal(a_tangent_cache.begin(), a_tangent_cache.begin() + 3,
-                          b_tangent_cache.begin(), b_tangent_cache.begin() + 3, bit_equal),
+    const bool tangents_match = std::equal(a_tangent_cache.begin(), a_tangent_cache.begin() + 3,
+                                           b_tangent_cache.begin(), b_tangent_cache.begin() + 3,
+                                           bit_equal);
+    if (!tangents_match)
+      RecordVertexLoaderMismatch(VTX_MISMATCH_TANGENT_CACHE);
+    ASSERT_MSG(VIDEO, tangents_match,
                "Expected matching tangent caches after loading (a: {}; b: {})",
                fmt::join(a_tangent_cache, ", "), fmt::join(b_tangent_cache, ", "));
 
-    ASSERT_MSG(VIDEO,
-               std::equal(a_binormal_cache.begin(), a_binormal_cache.begin() + 3,
-                          b_binormal_cache.begin(), b_binormal_cache.begin() + 3, bit_equal),
+    const bool binormals_match = std::equal(a_binormal_cache.begin(), a_binormal_cache.begin() + 3,
+                                            b_binormal_cache.begin(), b_binormal_cache.begin() + 3,
+                                            bit_equal);
+    if (!binormals_match)
+      RecordVertexLoaderMismatch(VTX_MISMATCH_BINORMAL_CACHE);
+    ASSERT_MSG(VIDEO, binormals_match,
                "Expected matching binormal caches after loading (a: {}; b: {})",
                fmt::join(a_binormal_cache, ", "), fmt::join(b_binormal_cache, ", "));
 
@@ -235,7 +334,20 @@ u32 VertexLoaderBase::GetVertexComponents(const TVtxDesc& vtx_desc, const VAT& v
 std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVtxDesc& vtx_desc,
                                                                        const VAT& vtx_attr)
 {
-  const VertexLoaderType loader_type = g_ActiveConfig.vertex_loader_type;
+  VertexLoaderType loader_type = g_ActiveConfig.vertex_loader_type;
+
+#ifdef __EMSCRIPTEN__
+  // [vtx-wasm 2026-08-28] Runtime A/B on ONE binary — no rebuild between arms.
+  // SAB scratch cell 0x026B3900 nonzero == arm B (stock software loader);
+  // 0x026B3904 nonzero == run the Compare gate. See VertexLoaderWasm.h.
+  // Loaders are cached in VertexLoaderManager's map, so the Compare cell must be
+  // set before the first draw; the force-software cell is ALSO re-read per
+  // RunVertices (VertexLoaderWasm::RunVertices) so it can be flipped mid-scene.
+  if (VertexLoaderWasmFlags::ForceSoftware())
+    return std::make_unique<VertexLoader>(vtx_desc, vtx_attr);
+  if (VertexLoaderWasmFlags::ForceCompare() && loader_type != VertexLoaderType::Software)
+    loader_type = VertexLoaderType::Compare;
+#endif
 
   if (loader_type == VertexLoaderType::Software)
   {
@@ -248,12 +360,18 @@ std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVt
   native_loader = std::make_unique<VertexLoaderX64>(vtx_desc, vtx_attr);
 #elif defined(_M_ARM_64)
   native_loader = std::make_unique<VertexLoaderARM64>(vtx_desc, vtx_attr);
+#elif defined(__EMSCRIPTEN__)
+  // Only the formats VertexLoaderWasm can reproduce bit-exactly get the JIT
+  // loader; everything else leaves native_loader null and drops into the
+  // software fallback right below, exactly as before.
+  if (VertexLoaderWasm::IsSupported(vtx_desc, vtx_attr))
+    native_loader = std::make_unique<VertexLoaderWasm>(vtx_desc, vtx_attr);
 #endif
 
   // Use the software loader as a fallback
-  // (not currently applicable, as both VertexLoaderX64 and VertexLoaderARM64
-  // are always usable, but if a loader that only works on some CPUs is created
-  // then this fallback would be used)
+  // (VertexLoaderX64 and VertexLoaderARM64 are always usable, so on those
+  // targets this never triggers; under Emscripten it is the live path for every
+  // vertex format VertexLoaderWasm::IsSupported rejects)
   if (!native_loader)
   {
     return std::make_unique<VertexLoader>(vtx_desc, vtx_attr);

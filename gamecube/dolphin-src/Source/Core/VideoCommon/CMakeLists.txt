@@ -274,6 +274,21 @@ else()
   target_sources(videocommon PRIVATE
     TextureDecoder_Generic.cpp
   )
+  if(EMSCRIPTEN)
+    # [vtx-wasm 2026-08-28] The generic branch supplies no vertex loader, so
+    # VertexLoaderBase::CreateVertexLoader falls back to the software
+    # VertexLoader and its per-stage indirect call per vertex. VertexLoaderWasm
+    # emits a flat wasm function per hot vertex format instead. It needs
+    # bementalJIT for WasmModuleBuilder + compile_raw; `core` already links that
+    # PUBLIC under EMSCRIPTEN (Core/CMakeLists.txt:758-765), but name it here
+    # too so videocommon does not depend on the core<->videocommon link cycle to
+    # propagate the include dir.
+    target_sources(videocommon PRIVATE
+      VertexLoaderWasm.cpp
+      VertexLoaderWasm.h
+    )
+    target_link_libraries(videocommon PRIVATE bementalJIT)
+  endif()
 endif()
 
 if(FFmpeg_FOUND)

@@ -1787,6 +1787,16 @@ function startServer() {
             // [dc-diag 2026-07-21 TEMP] localize the PE_FINISH break in the gpu_thread RunGpuLoop chain
             bw.rglEntry = A[0x026B1AD0 >> 2] >>> 0;        // RunGpuLoop callback ticks (gpu_thread alive?)
             bw.rglDrain = A[0x026B1AD4 >> 2] >>> 0;        // RunGpuLoop while-loop drain iterations
+            // [vtxloader A/B 2026-08-28] emitted wasm vertex loader vs the scalar software one.
+            // vtxSw is the live arm (1 = forced software); vtxCmp/vtxMis/vtxKinds are the
+            // correctness gate under ?bjit_vtx_compare=1, which runs BOTH loaders and diffs
+            // them. PASS = vtxCmp > 0 AND vtxMis == 0 — vtxCmp == 0 means the gate never ran,
+            // which is NOT a pass. Reported here rather than via ASSERT because ASSERT_MSG
+            // routes through PanicYesNoFmtAssert and can log-and-continue instead of failing.
+            bw.vtxSw = A[0x026B3900 >> 2] >>> 0;           // 1 = software loader forced
+            bw.vtxCmp = A[0x026B3910 >> 2] >>> 0;          // compare runs (0 = gate never ran)
+            bw.vtxMis = A[0x026B3908 >> 2] >>> 0;          // mismatches (must be 0)
+            bw.vtxKinds = (A[0x026B390C >> 2] >>> 0).toString(16);  // which checks differed
             bw.cpDistLive = A[0x026B1AD8 >> 2] >>> 0;      // last CPReadWriteDistance seen by RunGpuLoop
             bw.gpReadEn = A[0x026B1AE4 >> 2] >>> 0;        // bFF_GPReadEnable seen by RunGpuLoop
             bw.gpfWrite32 = A[0x026B1AE8 >> 2] >>> 0;      // GPFifo::Write32 entries (WPAR reaching dolphin GPFifo?)

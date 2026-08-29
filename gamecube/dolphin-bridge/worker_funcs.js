@@ -348,6 +348,10 @@ function pumpBatch() {
   } else if (Module && Module._run_iter) {
     for (var j = 0; j < PUMP_BATCH_ITERS; j++) Module._run_iter();
   }
+  // Three samples then permanently inert; see its definition. Called here rather than inside
+  // the _run_iter arm because _run_iter_batch is the arm the live build actually takes, and
+  // the census must sample the JIT path — which is the whole point of it existing.
+  emitVtxCensusJit();
 }
 
 async function bootLoop() {
@@ -418,6 +422,40 @@ function startTickLoop() {
   };
   tickInterval = 1;   // marker: loop armed (no timer id under zeroYield)
   zeroYield(pump);
+}
+
+// [vtx-census JIT PATH 2026-08-28] The census above lives inside the RECOMP frame
+// handler and is gated on __recompLiveFrames, so it has ONLY ever sampled ?recomp=1
+// — i.e. Mario Party 4's native C port. The wasm vertex loader's supported-format
+// list was specified entirely from that data ("top four = 97.6%"), and then the
+// compare gate reported vtxCmp=0 on PSO: the loader never engaged, because PSO's
+// formats are not MP4's. Every game other than MP4 runs the JIT path, which is what
+// the user actually plays. This emits the same table there so the emitter can be
+// aimed at real data. Three samples then it stops forever, so it cannot accumulate
+// into a perf measurement.
+var __vtxJitPumps = 0, __vtxJitPtr = 0, __vtxJitDone = 0;
+function emitVtxCensusJit() {
+  if (__vtxJitDone >= 3 || !Module._bem_vtx_census) return;
+  __vtxJitPumps++;
+  if (__vtxJitPumps !== 600 && __vtxJitPumps !== 1800 && __vtxJitPumps !== 3600) return;
+  __vtxJitDone++;
+  if (!__vtxJitPtr) __vtxJitPtr = Module._malloc(256 * 6 * 4);
+  var n = Module._bem_vtx_census(__vtxJitPtr, 256);
+  var rows = [], tot = 0;
+  for (var i = 0; i < n; i++) {
+    var b = (__vtxJitPtr >> 2) + i * 6, c = Module.HEAPU32[b + 5] >>> 0;
+    rows.push([[Module.HEAPU32[b] >>> 0, Module.HEAPU32[b + 1] >>> 0, Module.HEAPU32[b + 2] >>> 0,
+                Module.HEAPU32[b + 3] >>> 0, Module.HEAPU32[b + 4] >>> 0], c]);
+    tot += c;
+  }
+  rows.sort(function (a, b) { return b[1] - a[1]; });
+  var top = rows.slice(0, 6).map(function (r) {
+    return 'desc=' + r[0][0].toString(16) + '/' + r[0][1].toString(16) +
+           ' vat=' + r[0][2].toString(16) + '/' + r[0][3].toString(16) + '/' + r[0][4].toString(16) +
+           ' ' + (tot ? (100 * r[1] / tot).toFixed(1) : '0') + '%';
+  }).join('  |  ');
+  postMessage({ cmd: 'print', txt: '[vtxcensus-jit] sample=' + __vtxJitDone + ' loaders=' + n +
+                                   ' verts=' + tot + ' top=' + top });
 }
 
 // Called once we know rendering has begun (set by video_cb in
