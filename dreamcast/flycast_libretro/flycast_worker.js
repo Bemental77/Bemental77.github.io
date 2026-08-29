@@ -182,25 +182,8 @@
     const Module = self.Module;
     try {
       // SAB-pointer wiring — trivial global stores, safe from this thread.
-      // The framebuffer and audio ring used to sit at page-chosen FIXED
-      // addresses near 496 MB, which is the ONLY reason the heap had to be
-      // 512 MB up front — a commit that alone can kill a low-RAM phone.
-      // Allocate them from the heap instead and report the addresses back:
-      // malloc'd pointers are stable across memory growth, so the heap can now
-      // start small and grow to whatever the emulator actually needs.
-      const fbBytes = (fbCfg.w | 0) * (fbCfg.h | 0) * 4;
-      const audioBytes = (audioCfg.frames | 0) * 2 * 4 + 64;   // stereo f32 + header
-      const fbAddr = Module._malloc(fbBytes);
-      const audioAddr = Module._malloc(audioBytes);
-      if (!fbAddr || !audioAddr) throw new Error('framebuffer/audio alloc failed');
-      Module.HEAPU8.fill(0, audioAddr, audioAddr + audioBytes);
-      Module._emscripten_set_video_target(fbAddr >>> 0, fbCfg.w | 0, fbCfg.h | 0);
-      Module._emscripten_set_audio_ring(audioAddr >>> 0, audioCfg.frames | 0);
-      postMessage({ cmd: 'sabLayout', fbOffset: fbAddr >>> 0, fbW: fbCfg.w | 0,
-                    fbH: fbCfg.h | 0, audioOffset: audioAddr >>> 0,
-                    audioFrames: audioCfg.frames | 0 });
-      postMessage({ cmd: 'print', txt: '[flycast-shim] fb=' + (fbAddr >>> 0) +
-                    ' audio=' + (audioAddr >>> 0) + ' (heap-allocated)' });
+      Module._emscripten_set_video_target(fbCfg.offset >>> 0, fbCfg.w | 0, fbCfg.h | 0);
+      Module._emscripten_set_audio_ring(audioCfg.offset >>> 0, audioCfg.frames | 0);
       videoAudioWired = true;
       // Register offscreen canvas into Module.GL — now safe (runtime up).
       try {
@@ -282,19 +265,6 @@
   let freerun = false;
   let freerunIters = 0;
   let freerunStatsTimer = 0;
-  // Lazy-disc telemetry: how much of the 1.18GB a session actually touches —
-  // the number that decides whether streaming is viable on a phone.
-  const lazyStats = { hits: 0, misses: 0, bytes: 0, evicted: 0, ahead: 0 };
-  let lazyReported = -1;
-  function lazyPoll() {
-    if (lazyStats.misses === lazyReported) return;
-    lazyReported = lazyStats.misses;
-    postMessage({ cmd: 'print', txt: '[lazydisc] fetched=' +
-      ((lazyStats.bytes / 1048576) | 0) + 'MB chunks=' + lazyStats.misses +
-      ' cachehits=' + lazyStats.hits + ' readahead=' + lazyStats.ahead +
-      ' evicted=' + lazyStats.evicted });
-  }
-
   // VMU change-watch (see the vmuLoad/vmuWatch handlers).
   let vmuWatch = false;
   let vmuGenSeen = -1;
@@ -426,7 +396,6 @@
         postMessage({ cmd: 'ips', ips: freerunIters });
         freerunIters = 0;
         vmuPoll();   // card snapshots ride the existing 1 Hz tick
-        lazyPoll();
       }, 1000);
       postMessage({ cmd: 'print', txt: '[flycast-shim] freerun ON (worker-owned run loop, 60 iter/s cap)' });
       pumpChannel.port2.postMessage(0);
@@ -453,149 +422,6 @@
         // Already bootstrapped — ignore late re-sends.
         return;
 
-      // Lazy disc. The eager path writes the whole 1.18 GB Track3 into MEMFS
-      // (JS heap) after the page has already assembled it — ~1.7 GB resident
-      // plus a transient double copy, which no phone can hold, and it makes
-      // the user wait for a 1.1 GB download before the first frame. Here the
-      // file is a virtual node: reads pull 1 MB chunks over HTTP Range from
-      // the split parts and keep a bounded LRU, so footprint is flat and
-      // startup fetches only what the game actually touches.
-      case 'discLazy': {
-        try {
-          const FS = Module.FS;
-          try { FS.mkdir('/discs'); } catch (_) {}
-          const CHUNK = 1 << 20;
-          // Budget + readahead come from the page's per-device policy.
-          const BUDGET = ((data.cacheMB | 0) || 96) << 20;
-          const READAHEAD = data.readahead === undefined ? 4 : (data.readahead | 0);
-          const parts = data.parts;         // [{url, size}]
-          let total = 0;
-          for (const p of parts) { p.start = total; total += p.size; }
-
-          const chunkCache = new Map();     // chunkIdx -> Uint8Array (insertion order = LRU)
-          const wholeParts = new Map();     // partIdx -> Uint8Array (server ignored Range)
-
-          function httpRange(url, from, to) {
-            const xhr = new XMLHttpRequest();
-            xhr.open('GET', url, false);    // sync XHR is legal in a worker
-            xhr.setRequestHeader('Range', 'bytes=' + from + '-' + to);
-            xhr.responseType = 'arraybuffer';
-            xhr.send(null);
-            if (!(xhr.status >= 200 && xhr.status < 300 || xhr.status === 304))
-              throw new Error('disc range fetch failed: ' + url + ' ' + xhr.status);
-            return { bytes: new Uint8Array(xhr.response), partial: xhr.status === 206 };
-          }
-
-          // Bytes [from,to] within one part, honouring a Range-less server by
-          // caching that part whole (python3 -m http.server does this).
-          function partBytes(pi, from, to) {
-            const whole = wholeParts.get(pi);
-            if (whole) return whole.subarray(from, to + 1);
-            const r = httpRange(parts[pi].url, from, to);
-            if (!r.partial && r.bytes.length === parts[pi].size) {
-              wholeParts.set(pi, r.bytes);
-              return r.bytes.subarray(from, to + 1);
-            }
-            return r.bytes;
-          }
-
-          function evict() {
-            while (chunkCache.size * CHUNK > BUDGET) {
-              chunkCache.delete(chunkCache.keys().next().value);
-              lazyStats.evicted++;
-            }
-          }
-
-          // Readahead. Disc reads run forward, so pull the next chunks while
-          // the guest chews on this one. ASYNC fetch on purpose: a sync XHR
-          // here would stall the emulator thread, which is the opposite of the
-          // point. Misses simply fall back to the sync path.
-          const inFlight = new Set();
-          function readAhead(ci) {
-            if (READAHEAD <= 0) return;
-            const nChunks = Math.ceil(total / CHUNK);
-            for (let k = 1; k <= READAHEAD; k++) {
-              const n = ci + k;
-              if (n >= nChunks || chunkCache.has(n) || inFlight.has(n)) continue;
-              inFlight.add(n);
-              const start = n * CHUNK, end = Math.min(total, start + CHUNK) - 1;
-              // A chunk can straddle two parts; only prefetch the simple
-              // single-part case and let the sync path handle the seam.
-              let pi = -1;
-              for (let i = 0; i < parts.length; i++) {
-                if (start >= parts[i].start && end <= parts[i].start + parts[i].size - 1) { pi = i; break; }
-              }
-              if (pi < 0) { inFlight.delete(n); continue; }
-              const p = parts[pi];
-              fetch(p.url, { headers: { Range: 'bytes=' + (start - p.start) + '-' + (end - p.start) } })
-                .then((r) => (r.ok ? r.arrayBuffer() : null))
-                .then((ab) => {
-                  inFlight.delete(n);
-                  if (!ab || chunkCache.has(n)) return;
-                  chunkCache.set(n, new Uint8Array(ab));
-                  lazyStats.ahead++;
-                  lazyStats.bytes += ab.byteLength;
-                  evict();
-                })
-                .catch(() => { inFlight.delete(n); });
-            }
-          }
-
-          function getChunk(ci) {
-            const hit = chunkCache.get(ci);
-            if (hit) {
-              chunkCache.delete(ci); chunkCache.set(ci, hit); lazyStats.hits++;
-              readAhead(ci);
-              return hit;
-            }
-            lazyStats.misses++;
-            const start = ci * CHUNK;
-            const end = Math.min(total, start + CHUNK) - 1;
-            const out = new Uint8Array(end - start + 1);
-            for (let pi = 0; pi < parts.length; pi++) {
-              const p = parts[pi], pStart = p.start, pEnd = p.start + p.size - 1;
-              if (end < pStart || start > pEnd) continue;
-              const gFrom = Math.max(start, pStart), gTo = Math.min(end, pEnd);
-              out.set(partBytes(pi, gFrom - pStart, gTo - pStart), gFrom - start);
-            }
-            chunkCache.set(ci, out);
-            lazyStats.bytes += out.length;
-            evict();
-            readAhead(ci);
-            return out;
-          }
-
-          const node = FS.createFile('/discs', data.name, {}, true, false);
-          Object.defineProperty(node, 'usedBytes', { get: () => total, configurable: true });
-          node.contents = null;
-          const ops = Object.assign({}, node.stream_ops);
-          ops.read = (stream, buffer, offset, length, position) => {
-            if (position >= total) return 0;
-            const size = Math.min(total - position, length);
-            let done = 0;
-            while (done < size) {
-              const pos = position + done;
-              const ci = (pos / CHUNK) | 0;
-              const inChunk = pos - ci * CHUNK;
-              const chunk = getChunk(ci);
-              const n = Math.min(chunk.length - inChunk, size - done);
-              buffer.set(chunk.subarray(inChunk, inChunk + n), offset + done);
-              done += n;
-            }
-            return size;
-          };
-          ops.write = () => { throw new FS.ErrnoError(1); };   // read-only medium
-          node.stream_ops = ops;
-
-          postMessage({ cmd: 'print', txt: '[flycast-shim] lazy disc /discs/' + data.name +
-                        ' (' + total + ' B over ' + parts.length + ' parts, ' +
-                        (BUDGET >> 20) + 'MB cache, readahead ' + READAHEAD + ')' });
-        } catch (err) {
-          postMessage({ cmd: 'print', txt: '[flycast-shim] lazy disc failed: ' + (err && err.message ? err.message : String(err)) });
-        }
-        break;
-      }
-
       case 'discChunk': {
         // Stream the disc into MEMFS at /discs/<name>. .cue references its
         // .bin tracks by relative filename, so we mkdir /discs once and
@@ -604,16 +430,7 @@
         const u8 = new Uint8Array(data.bytes);
         const path = '/discs/' + data.name;
         Module.FS.writeFile(path, u8);
-        // MEM DIAG (mobile-footprint campaign): MEMFS keeps contents in the JS
-        // heap, so track both sides — wasm linear memory and the worker heap.
-        let mem = '';
-        try {
-          const wasmMB = (Module.HEAPU8.length / 1048576) | 0;
-          mem = ' wasm=' + wasmMB + 'MB';
-          if (typeof performance !== 'undefined' && performance.memory)
-            mem += ' jsheap=' + ((performance.memory.usedJSHeapSize / 1048576) | 0) + 'MB';
-        } catch (_) {}
-        postMessage({ cmd: 'print', txt: '[flycast-shim] wrote ' + path + ' (' + u8.byteLength + ' B)' + mem });
+        postMessage({ cmd: 'print', txt: '[flycast-shim] wrote ' + path + ' (' + u8.byteLength + ' B)' });
         break;
       }
 
@@ -924,24 +741,6 @@
         }
         break;
       }
-      // Console flash. PSO scopes the Serial Number + Access Key to the
-      // console, so seeding this — not the memory card — is what lets a normal
-      // boot skip registration.
-      case 'flashLoad': {
-        try {
-          const M = self.Module;
-          const ptr = M._flycast_flash_ptr() >>> 0, size = M._flycast_flash_size() >>> 0;
-          const src = new Uint8Array(data.data);
-          if (!ptr || !size) { postMessage({ cmd: 'print', txt: '[flash] no chip yet — seed skipped' }); break; }
-          if (src.length !== size) { postMessage({ cmd: 'print', txt: '[flash] seed is ' + src.length + ' B, chip is ' + size + ' B — seed skipped' }); break; }
-          M.HEAPU8.set(src, ptr);
-          postMessage({ cmd: 'print', txt: '[flash] seeded ' + size + ' B into console flash' });
-        } catch (err) {
-          postMessage({ cmd: 'print', txt: '[flash] seed threw: ' + (err && err.message ? err.message : String(err)) });
-        }
-        break;
-      }
-
       case 'vmuWatch': {
         try {
           const M = self.Module;
