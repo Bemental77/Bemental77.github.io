@@ -54,7 +54,7 @@
       pointer-events: none; }
     #armBanner.on { display: block; }
     body.armed #wrap { padding-top: 30px; }
-    body.armed #mobileStatus { top: 34px; }   /* clear the banner on the phone shell */
+    body.armed #mobileShell { --dc-banner: 34px; }   /* clear the banner on the phone shell */
     #log { display: none; width: 100%; max-width: 820px; height: 140px; overflow: auto;
            background: #0a0a0a; border: 1px solid #333; padding: 4px; font-size: 11px;
            color: #bbb; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; }
@@ -69,9 +69,24 @@
     #toast.show { opacity: 1; transform: translate(-50%, 0); }
     #toast.err { border-color: #8a2f2f; border-left-color: #8a2f2f; }
     /* ---- Mobile shell (ported from gamecube.html) ---- */
-    #mobileShell { display: none; position: fixed; inset: 0; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); z-index: 1000; user-select: none; -webkit-user-select: none; touch-action: none; overflow: hidden; }
+    /* LAYOUT CONTRACT (2026-08-29): the shell is a VERTICAL STACK — status
+       strip, picture, control strip — and nothing is painted on top of the
+       game. The shipped layout overlaid both HUD elements on a canvas that
+       filled the whole shell: #mobileStatus at `top:10px` and #mobileBottom
+       (the menu + START pills) at bottom-centre, which is why the ≡/START
+       controls sit squarely on the picture in every landscape screenshot.
+       Moving them "somewhere free" is not a fix — a 4:3 panel (iPad in
+       landscape) letterboxes a 4:3 canvas to zero gutter, so there is no free
+       area to move to. Reserving the two strips is the only placement that
+       holds on every device and orientation, and "Hide Controls" gives the
+       space straight back (both strips collapse to 0). */
+    #mobileShell { display: none; position: fixed; inset: 0; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); z-index: 1000; user-select: none; -webkit-user-select: none; touch-action: none; overflow: hidden;
+      --dc-banner: 0px;                                  /* raised to 34px by body.armed */
+      --dc-status-h: 18px;                               /* the status/rate line */
+      --dc-top-strip: calc(var(--dc-banner) + var(--dc-status-h));
+      --dc-bottom-strip: calc(44px + env(safe-area-inset-bottom, 0px)); }
     #mobileShell:fullscreen, #mobileShell:-webkit-full-screen { width: 100vw; height: 100vh; }
-    #mobileScreen { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: #000; }
+    #mobileScreen { position: absolute; top: var(--dc-top-strip); left: 0; right: 0; bottom: var(--dc-bottom-strip); display: flex; align-items: center; justify-content: center; background: #000; }
     #mobileScreen canvas { image-rendering: pixelated; max-width: 100%; max-height: 100%; width: auto; height: 100%; }
     .mobileSide { position: absolute; top: 0; bottom: 0; width: 34vw; max-width: 220px; display: flex; flex-direction: column; padding: 12px 10px; box-sizing: border-box; pointer-events: none; }
     .mobileSide > * { pointer-events: auto; }
@@ -100,7 +115,12 @@
     #mobileShell.ghost .shoulderBtn.held, #mobileShell.ghost .faceBtn.held, #mobileShell.ghost .sysBtn.held { opacity: 0.7; }
     #mobileShell.hide-controls .mobileSide, #mobileShell.hide-controls #mobileBottom { display: none; }
     #mobileShell.hide-controls #mobileHideHint { display: flex; }
-    #mobileHideHint { display: none; position: absolute; top: 10px; right: 10px; width: 40px; height: 40px; border-radius: 20px; background: rgba(0,0,0,0.55); color: #fff; align-items: center; justify-content: center; font-size: 22px; font-weight: 700; z-index: 20; -webkit-tap-highlight-color: transparent; }
+    /* Hide Controls = give the reserved strips back to the picture. The status
+       line collapses with them (height 0 + overflow hidden), so "hide" really
+       means the game and nothing else. The arm banner's reserve is kept — that
+       banner is fixed-position and would otherwise sit on the picture. */
+    #mobileShell.hide-controls { --dc-status-h: 0px; --dc-bottom-strip: 0px; }
+    #mobileHideHint { display: none; position: absolute; top: calc(10px + var(--dc-banner, 0px)); right: 10px; width: 40px; height: 40px; border-radius: 20px; background: rgba(0,0,0,0.55); color: #fff; align-items: center; justify-content: center; font-size: 22px; font-weight: 700; z-index: 20; -webkit-tap-highlight-color: transparent; }
     .faceWrap { flex: 1; display: flex; align-items: center; justify-content: center; }
     .faceDiamond { width: min(32vh, 180px); height: min(32vh, 180px); position: relative; }
     .faceBtn { position: absolute; width: min(12vh, 64px); height: min(12vh, 64px); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; color: rgba(255,255,255,0.9); border: 2px solid rgba(0,0,0,0.3); box-shadow: 0 4px 0 rgba(0,0,0,0.5), inset 0 2px 4px rgba(255,255,255,0.25); -webkit-tap-highlight-color: transparent; }
@@ -110,7 +130,9 @@
     .btn-b { background: radial-gradient(circle at 38% 32%, #5588ee, #1133aa); top: 50%; right: 0;  transform: translateY(-50%); }
     .btn-x { background: radial-gradient(circle at 38% 32%, #ddbb33, #997711); top: 50%; left: 0;   transform: translateY(-50%); }
     .btn-a { background: radial-gradient(circle at 38% 32%, #ee5555, #991111); bottom: 0; left: 50%; transform: translateX(-50%); }
-    #mobileBottom { position: absolute; bottom: max(30px, calc(env(safe-area-inset-bottom, 0px) + 20px)); left: 50%; transform: translateX(-50%); display: flex; gap: 10px; align-items: center; z-index: 10; }
+    /* Lives INSIDE the reserved bottom strip (44px + safe area), never over the
+       canvas. 3px + the 38px menu button = 41px, which fits the 44px reserve. */
+    #mobileBottom { position: absolute; bottom: calc(3px + env(safe-area-inset-bottom, 0px)); left: 50%; transform: translateX(-50%); display: flex; gap: 10px; align-items: center; z-index: 10; }
     .sysBtn { height: 26px; padding: 0 14px; border-radius: 13px; background: linear-gradient(180deg, #555 0%, #333 100%); border: 1px solid #222; color: #ccc; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
     .sysBtn.held { filter: brightness(0.6); }
     .menuBtn { width: 34px; height: 34px; border-radius: 17px; background: linear-gradient(180deg, #777 0%, #444 100%); border: 2px solid #222; color: #fff; font-size: 18px; font-weight: 700; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
@@ -127,7 +149,14 @@
     #mobileSplash select, #mobileSplash button { font-size: 16px; padding: 12px 20px; min-width: 240px; border-radius: 8px; border: 1px solid #444; background: #222; color: #fff; -webkit-appearance: none; }
     #mobileSplash button#mobileSplashStart { background: #2a6b4a; border-color: #2a6b4a; cursor: pointer; z-index: 3000; position: relative; }
     #mobileSplash .rotateTip { font-size: 12px; opacity: 0.55; margin-top: 8px; }
-    #mobileStatus { position: absolute; top: 10px; width: 100%; text-align: center; color: #888; z-index: 900; font-size: 12px; pointer-events: none; }
+    /* The reserved top strip — a ROW, not an overlay (see the layout contract).
+       One line, clipped with an ellipsis: the mirrored status + rate text is
+       unbounded and used to wrap across the picture. */
+    #mobileStatus { position: absolute; top: var(--dc-banner); left: 0; right: 0;
+      height: var(--dc-status-h); line-height: var(--dc-status-h); text-align: center;
+      color: #888; z-index: 900; font-size: 12px; pointer-events: none;
+      overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+      padding: 0 6px; box-sizing: border-box; }
     /* Mobile console tail. The shell hides #wrap (and with it #log), so a phone
        used to show NO diagnostic output at all — nobody could report what
        actually happened on the device. This is a screenshot-able tail of the
@@ -135,7 +164,11 @@
        start failure. z-index sits above #mobileSplash (2000) so it is readable
        even when a boot never got past the splash; #mobileMenu is lifted above
        it so the menu still wins when open. */
-    #mobileLog { display: none; position: absolute; left: 0; right: 0; bottom: 0;
+    /* Sits ON TOP of the reserved bottom strip, not over it: at `bottom: 0` the
+       log (z 2500) covered #mobileBottom (z 10), so once the log was force-shown
+       on a failure the ≡ button that turns it off was unreachable — the same
+       "an overlay hides working UI" shape as the stuck #rotateHint. */
+    #mobileLog { display: none; position: absolute; left: 0; right: 0; bottom: var(--dc-bottom-strip);
       max-height: 45%; overflow-y: auto; -webkit-overflow-scrolling: touch;
       touch-action: pan-y; margin: 0; padding: 6px 8px 10px; box-sizing: border-box;
       background: rgba(0,0,0,0.88); color: #9f9; border-top: 1px solid #2a6b4a;
@@ -143,11 +176,32 @@
       word-break: break-word; z-index: 2500; }
     #mobileShell.log-on #mobileLog { display: block; }
     #mobileMenu { z-index: 2600; }
+    /* Hard-stop panel. A phone user has no DevTools, so "this browser can't run
+       it" / "the memory allocation was refused" has to be a PAGE, not a
+       console line. Deliberately independent of #mobileShell: the shell is not
+       wired up until the very end of the script, so anything that bails early
+       (a missing capability, a refused WebAssembly.Memory) never reaches it and
+       would otherwise leave a phone staring at the dead desktop layout. */
+    #fatal { display: none; position: fixed; inset: 0; z-index: 6000; overflow: auto;
+      background: #150e0e; color: #eee; -webkit-overflow-scrolling: touch;
+      padding: max(20px, env(safe-area-inset-top, 0px)) 18px calc(24px + env(safe-area-inset-bottom, 0px));
+      font: 14px/1.55 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+    #fatal.on { display: block; }
+    #fatal h4 { margin: 0 0 10px; font-size: 17px; color: #ff8f8f; }
+    #fatal ul { margin: 0 0 14px; padding-left: 20px; }
+    #fatal li { margin-bottom: 8px; }
+    #fatal .hint { color: #9aa; font-size: 13px; margin-bottom: 14px; }
+    #fatal button { margin: 0 8px 10px 0; padding: 10px 16px; border: 1px solid #444;
+      background: #2c2c2c; color: #eee; border-radius: 6px; font-size: 14px; }
+    #fatal pre { background: #0a0a0a; border: 1px solid #333; border-radius: 6px; padding: 8px;
+      max-height: 45vh; overflow: auto; margin: 0; color: #9f9;
+      font: 10px/1.35 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-word; }
   </style>
 </head>
 <body>
 <div id="toast"></div>
 <div id="armBanner"></div>
+<div id="fatal"></div>
 <div id="wrap">
   <h3>Dreamcast Wasm</h3>
   <div id="controlBar">
@@ -265,9 +319,12 @@
     console.log(s);
   }
   function setStatus(t) { if (statusEl) statusEl.textContent = t; }
-  // Force the mobile log open (boot failures, so the error is on screen and
-  // screenshot-able without the user hunting through a menu).
+  // Force the log open (boot failures, so the error is on screen and
+  // screenshot-able without the user hunting through a menu). Opens BOTH
+  // surfaces: #log is collapsed by default on the desktop layout, so a desktop
+  // failure used to be just as invisible as a phone one.
   function showMobileLog() {
+    if (logEl) logEl.classList.add('visible');
     const shell = document.getElementById('mobileShell');
     if (!shell) return;
     mobileLogOn = true;
@@ -289,6 +346,77 @@
     toastTimer = setTimeout(() => el.classList.remove('show'), 2500);
   }
 
+  // ---------------------------------------------------------------------------
+  // Device/capability line. Logged on every load and appended to the hard-stop
+  // panel. The ONLY diagnostic channel a phone user has is a screenshot, so the
+  // facts that decide whether this page can work at all have to be IN it.
+  // ---------------------------------------------------------------------------
+  const HAS_OFFSCREEN = (typeof OffscreenCanvas === 'function' &&
+    typeof HTMLCanvasElement !== 'undefined' && HTMLCanvasElement.prototype &&
+    typeof HTMLCanvasElement.prototype.transferControlToOffscreen === 'function');
+  const HAS_GUNZIP = (typeof DecompressionStream === 'function');
+  function diagLine() {
+    const n = navigator, yn = (v) => (v ? 'yes' : 'NO');
+    return '[env] ' + n.userAgent +
+      '\n[env] crossOriginIsolated=' + yn(self.crossOriginIsolated) +
+      ' SharedArrayBuffer=' + yn(typeof SharedArrayBuffer === 'function') +
+      ' OffscreenCanvas+transfer=' + yn(HAS_OFFSCREEN) +
+      ' DecompressionStream=' + yn(HAS_GUNZIP) +
+      ' AudioWorklet=' + yn(typeof AudioWorklet === 'function') +
+      '\n[env] window=' + window.innerWidth + 'x' + window.innerHeight +
+      ' screen=' + screen.width + 'x' + screen.height +
+      ' dpr=' + (window.devicePixelRatio || 1) +
+      ' cores=' + (n.hardwareConcurrency || '?') +
+      ' deviceMemory=' + (n.deviceMemory === undefined ? '?' : n.deviceMemory + 'GB');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Hard stop. Renders a full-page, readable explanation with the log tail
+  // attached. Used for every condition that makes the emulator impossible
+  // rather than merely degraded — an unsupported browser, a canvas that cannot
+  // be handed to the worker, a refused memory allocation. Independent of the
+  // mobile shell on purpose (see the #fatal CSS note).
+  // ---------------------------------------------------------------------------
+  let fatalShown = false;
+  function showFatal(title, reasons, hint) {
+    const el = document.getElementById('fatal');
+    if (!el || fatalShown) return;
+    fatalShown = true;
+    pageLog('[fatal] ' + title + (reasons && reasons.length ? ' :: ' + reasons.join(' | ') : ''));
+    el.textContent = '';
+    const h = document.createElement('h4'); h.textContent = title; el.appendChild(h);
+    if (reasons && reasons.length) {
+      const ul = document.createElement('ul');
+      reasons.forEach((r) => { const li = document.createElement('li'); li.textContent = r; ul.appendChild(li); });
+      el.appendChild(ul);
+    }
+    if (hint) { const d = document.createElement('div'); d.className = 'hint'; d.textContent = hint; el.appendChild(d); }
+    const pre = document.createElement('pre');
+    pre.textContent = logTail.join('\n') + '\n' + diagLine();
+    const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = 'Copy diagnostics';
+    btn.addEventListener('click', () => {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(pre.textContent).then(
+          () => { btn.textContent = '✓ Copied'; },
+          () => { btn.textContent = 'Copy blocked — screenshot the text below'; });
+      } else {
+        btn.textContent = 'Copy unavailable — screenshot the text below';
+      }
+    });
+    const rl = document.createElement('button'); rl.type = 'button'; rl.textContent = 'Reload';
+    rl.addEventListener('click', () => location.reload());
+    el.appendChild(btn); el.appendChild(rl); el.appendChild(pre);
+    el.classList.add('on');
+  }
+  // Soft failure: keep the page, but put it where a phone user can see and
+  // screenshot it. Never silent, never console-only.
+  function pageFail(msg) {
+    pageLog('[page] ' + msg);
+    setStatus(msg);
+    showToast(msg.length > 96 ? msg.slice(0, 96) + '…' : msg, false);
+    showMobileLog();
+  }
+
   $('btnLog').addEventListener('click', () => logEl.classList.toggle('visible'));
 
   // Controls overlay + fullscreen — same UX as gamecube.html.
@@ -307,11 +435,72 @@
   // ---------------------------------------------------------------------------
   // Cross-origin isolation gate. SharedArrayBuffer requires this; the COI
   // service worker installs on first hit but doesn't take effect until reload.
+  //
+  // BOUNDED (2026-08-29). This was an unbounded reload loop: anywhere the
+  // service worker cannot install — a private/incognito window, a content
+  // blocker, service workers disabled — the page reloaded itself every 800 ms
+  // forever, which on a phone looks exactly like "it flashes and never loads".
+  // Three tries, then say so.
   // ---------------------------------------------------------------------------
+  const COI_KEY = 'dc-coi-reloads';
+  function ssGet(k) { try { return sessionStorage.getItem(k); } catch (_) { return null; } }
+  function ssSet(k, v) { try { sessionStorage.setItem(k, v); } catch (_) {} }
   if (!self.crossOriginIsolated) {
+    const tries = (parseInt(ssGet(COI_KEY) || '0', 10) || 0) + 1;
+    ssSet(COI_KEY, String(tries));
+    if (tries > 3) {
+      setStatus('Cross-origin isolation could not be enabled.');
+      showFatal('This page could not become cross-origin isolated', [
+        'The emulator needs SharedArrayBuffer, which requires COOP/COEP headers. /coi-serviceworker.js installs them on first load — after ' + (tries - 1) + ' reloads it still has not taken effect.',
+        'Usual causes: a private / incognito window (service workers are blocked there), a content blocker or extension, or service workers turned off in settings.',
+      ], 'Open the page in a normal window, or reload once more.');
+      return;
+    }
     setStatus('Initializing... (page will reload once)');
     setTimeout(() => location.reload(), 800);
     return;
+  }
+  ssSet(COI_KEY, '0');
+
+  // ---------------------------------------------------------------------------
+  // Hard capability gate.
+  //
+  // Everything below assumes these exist. Without the gate the first missing
+  // one throws mid-script and takes the REST of the script with it — including
+  // the mobile-shell setup, which is the last thing in this file. A phone on an
+  // unsupported browser was therefore left on the DESKTOP layout with a dead
+  // Start button, no shell, no touch controls and no explanation, which is
+  // indistinguishable from "the Dreamcast does not render on mobile".
+  //
+  // transferControlToOffscreen is the one that actually bites: Safari 16.4
+  // shipped OffscreenCanvas with a 2D context ONLY, and WebGL/WebGL2 inside an
+  // OffscreenCanvas did not land until Safari 17 (verified against
+  // mdn/browser-compat-data#21127, which records webgl2 in a worker working in
+  // Safari 17 / iOS 17). This page renders WebGL2 from the worker, so iOS 16 is
+  // out — and on iOS every browser is Safari's engine, so there is no other app
+  // to try.
+  // ---------------------------------------------------------------------------
+  {
+    const missing = [];
+    if (typeof SharedArrayBuffer !== 'function')
+      missing.push('SharedArrayBuffer — the page and the emulator core share one memory.');
+    if (typeof WebAssembly !== 'object' || typeof WebAssembly.Memory !== 'function')
+      missing.push('WebAssembly.Memory — required to host the emulator.');
+    if (typeof Worker !== 'function')
+      missing.push('Web Workers — the emulator runs off the main thread.');
+    if (!HAS_OFFSCREEN)
+      missing.push('OffscreenCanvas + canvas.transferControlToOffscreen — the emulator draws WebGL2 straight into this page’s canvas from its worker. On iPhone/iPad this needs iOS 17 or newer (iOS 16.4 shipped OffscreenCanvas with a 2D context only).');
+    if (missing.length) {
+      setStatus('This browser cannot run the emulator.');
+      showFatal('This browser is missing what the Dreamcast emulator needs', missing,
+        'On iPhone and iPad every browser uses Safari’s engine, so switching apps will not help — iOS 17 or newer is the requirement. On desktop, current Chrome, Edge, Firefox and Safari all work.');
+      return;
+    }
+  }
+  pageLog(diagLine());
+  if (!HAS_GUNZIP) {
+    pageLog('[caps] no DecompressionStream (Safari before 16.4 / iOS before 16.4) — ' +
+            'the boot seed will be inflated by this page’s own decoder');
   }
 
   // ---------------------------------------------------------------------------
@@ -399,6 +588,19 @@
   // (4096 MB), shared. Import matching requires provided.initial >= 128 MB and
   // provided.maximum <= 4096 MB; both bounds below are inside that, so NOTHING
   // here needs a relink.
+  //
+  // RE-VERIFIED 2026-08-29 by parsing the import section of the deployed
+  // dreamcast/flycast_libretro/flycast_worker_emcc.wasm:
+  //   IMPORT memory a.a flags=0x3 shared=true initial=2048 pages (128 MB)
+  //                                          maximum=65536 pages (4096 MB)
+  // so both constants below still match the binary the page actually loads.
+  // NOTE for whoever relinks next: flycast-bridge/flycast_worker_link.sh
+  // currently reads -sINITIAL_MEMORY=536870912 (512 MB = 8192 pages), which
+  // does NOT match the 128 MB the shipped wasm declares. Relinking with the
+  // script as it stands would raise the module's declared minimum to 512 MB,
+  // MODULE_MIN_MB would be stale, the 128 MB memory this page provides would
+  // fail import matching, and the shim would report "factory rejected" — the
+  // silent-hang case the boot watchdog below exists to name.
   const MODULE_MIN_MB = 128;
   const MODULE_MAX_MB = 4096;
 
@@ -437,13 +639,58 @@
       }
     }
     if (maxMB < initMB) maxMB = initMB;
-    sharedMemory = new WebAssembly.Memory({
-      initial: (initMB * 1048576) / 65536,
-      maximum: (maxMB * 1048576) / 65536,
-      shared: true,
+    // ---- Maximum ladder (2026-08-29) ----------------------------------------
+    // The 4096 -> 2048 MB reduction landed ON the value iOS is known to refuse:
+    // emscripten-core/emscripten#19144 reports mobile Safari rejecting
+    // `new WebAssembly.Memory({..., maximum: 2147483648/65536, shared: true})`
+    // with "RangeError: out of memory" — i.e. a 2 GiB maximum, which is exactly
+    // this page's default. A shared memory reserves its maximum as ADDRESS
+    // SPACE up front, so the fix is to ask for less; but the maximum is also
+    // the growth ceiling, so we only walk down as far as we have to.
+    //
+    // Desktop takes the first rung and behaves exactly as it does today. A
+    // device that refuses it now gets a smaller heap instead of a dead page —
+    // previously this throw was the end of the boot. The disc does NOT live in
+    // here (the shim writes it to MEMFS, which is the worker's JS heap — see
+    // flycast_worker.js 'discChunk'), so the lower rungs are not as tight as
+    // they look.
+    const rungs = [];
+    [maxMB, 2048, 1024, 512, 256].forEach((m) => {
+      m = Math.min(MODULE_MAX_MB, Math.max(initMB, m));
+      if (m <= maxMB && rungs.indexOf(m) < 0) rungs.push(m);
     });
-    pageLog('[page] sharedMemory allocated (initial ' + initMB + ' MB, maximum ' +
-            maxMB + ' MB, ' + (caps.heapAlloc ? 'heap-allocated fb/audio' : 'legacy fixed offsets') + ')');
+    if (!rungs.length) rungs.push(maxMB);   // unreachable (maxMB >= initMB above), but never leave the ladder empty
+    let lastErr = null;
+    for (let i = 0; i < rungs.length; i++) {
+      try {
+        sharedMemory = new WebAssembly.Memory({
+          initial: (initMB * 1048576) / 65536,
+          maximum: (rungs[i] * 1048576) / 65536,
+          shared: true,
+        });
+      } catch (e) {
+        lastErr = e;
+        continue;
+      }
+      if (i > 0) {
+        // Loud on purpose: a silently-shrunk heap that later aborts on growth
+        // is the hardest kind of failure to report from a phone.
+        pageLog('[page] WebAssembly.Memory REFUSED maximum ' + rungs[i - 1] + ' MB (' +
+                (lastErr && lastErr.message ? lastErr.message : String(lastErr)) +
+                ') — granted at ' + rungs[i] + ' MB instead');
+        showToast('Emulator memory reduced to ' + rungs[i] + ' MB by this browser', false);
+        showMobileLog();
+      }
+      pageLog('[page] sharedMemory allocated (initial ' + initMB + ' MB, maximum ' + rungs[i] +
+              ' MB, granted ' + (sharedMemory.buffer.byteLength >>> 20) + ' MB now, ' +
+              (caps.heapAlloc ? 'heap-allocated fb/audio' : 'legacy fixed offsets') +
+              '; the module import declares initial ' + MODULE_MIN_MB + ' MB / maximum ' +
+              MODULE_MAX_MB + ' MB)');
+      return;
+    }
+    throw new Error('this browser refused a shared WebAssembly.Memory at every maximum from ' +
+                    rungs[0] + ' MB down to ' + rungs[rungs.length - 1] + ' MB (initial ' +
+                    initMB + ' MB): ' + (lastErr && lastErr.message ? lastErr.message : String(lastErr)));
   }
 
   // ---------------------------------------------------------------------------
@@ -469,7 +716,20 @@
   worker.onmessage = (e) => {
     const d = e.data || {};
     switch (d.cmd) {
-      case 'print':       pageLog(d.txt); break;
+      case 'print':
+        pageLog(d.txt);
+        // The shim reports an instantiation / abort failure as an ordinary
+        // print line and then simply never posts 'ready'. On a phone that was a
+        // silent hang on "Waiting for emulator runtime..." with the reason
+        // sitting in a console nobody can open. Promote it to the visible
+        // surfaces the moment it appears, instead of 45 s later via the
+        // watchdog.
+        if (/factory rejected|ABORT:|importScripts failed|global missing after importScripts|runtime-init threw/.test(d.txt)) {
+          setStatus('Emulator failed to start — see the log.');
+          showToast('Emulator failed to start', false);
+          showMobileLog();
+        }
+        break;
       // The heapAlloc shim mallocs the framebuffer + audio ring and reports the
       // real addresses here. Adopting them is NOT optional: the shim already
       // pointed the wasm at those addresses via _emscripten_set_audio_ring, so
@@ -746,12 +1006,40 @@
     }
   };
 
+  // A worker whose script fails to parse/load fires `error` and NOTHING else —
+  // no 'ready', no 'print'. Unhandled, that is a permanent "Waiting for
+  // emulator runtime..." with no cause anywhere the user can reach.
+  worker.onerror = (e) => {
+    pageFail('emulator worker error: ' + ((e && e.message) || 'worker script failed to load') +
+             (e && e.filename ? ' @ ' + e.filename + ':' + (e.lineno | 0) : ''));
+  };
+  worker.onmessageerror = () => {
+    pageFail('a message from the emulator worker could not be deserialized (structured clone failed)');
+  };
+
   // Transfer canvas control to the worker. The pthread that runs Flycast's
   // main() creates its own WebGL2 context on this OffscreenCanvas and paints
   // directly into it. transferControlToOffscreen() can only be called once
   // per canvas, and the page-side can no longer call getContext after — so
   // the legacy SAB-blit paintFrame paths below become no-ops.
-  const offscreen = $('dc-canvas').transferControlToOffscreen();
+  //
+  // Guarded even though the capability gate above already proved the method
+  // exists: it ALSO throws when something has already taken a drawing context
+  // on the canvas (an extension, a double-run of this script). Unguarded, that
+  // throw escapes the IIFE and kills every line below it — including the entire
+  // mobile shell.
+  let offscreen;
+  try {
+    offscreen = $('dc-canvas').transferControlToOffscreen();
+  } catch (e) {
+    const why = (e && e.message) ? e.message : String(e);
+    setStatus('Could not hand the canvas to the emulator: ' + why);
+    showFatal('The page could not hand its canvas to the emulator', [
+      'canvas.transferControlToOffscreen() threw: ' + why,
+      'This happens when something else has already claimed a drawing context on the canvas.',
+    ], 'Reload the page. If it keeps happening, disable extensions for this site.');
+    return;
+  }
   // mem-init waits on the capability probe: the memory cannot be sized until we
   // know whether the shim mallocs the fb/audio ring or writes to the page's
   // fixed ~496 MB offsets. The shim discards every message until it receives
@@ -780,12 +1068,17 @@
               ' capsProbed=' + caps.probed +
               ' — check for a "factory rejected" line above; if it names the memory ' +
               'import, MODULE_MIN_MB no longer matches the linked -sINITIAL_MEMORY.');
+      setStatus('The emulator runtime has not started. See the log.');
+      showToast('Emulator runtime did not start — log shown', false);
       showMobileLog();
     }, 45000);
   }).catch((e) => {
-    pageLog('[page] FATAL: mem-init failed: ' + (e && e.message ? e.message : String(e)));
-    setStatus('Failed to initialize emulator memory: ' + (e && e.message ? e.message : String(e)));
+    const why = (e && e.message) ? e.message : String(e);
+    pageLog('[page] FATAL: mem-init failed: ' + why);
+    setStatus('Failed to initialize emulator memory: ' + why);
     showMobileLog();
+    showFatal('The emulator could not reserve its memory', [why],
+      'A shared WebAssembly memory reserves its whole maximum as address space up front, and iOS refuses large ones (emscripten#19144). Close other tabs and reload, or add ?maxmem=256 to the end of the address to ask for the smallest heap.');
   });
 
   // Optional ?diag=1 URL param enables the SH4 per-1000-dispatch sampler +
@@ -814,6 +1107,7 @@
         pageLog('[page] audio ring at ' + AUDIO_OFFSET + ' + ' + AUDIO_BYTES +
                 ' B exceeds the ' + heapBytes + ' B heap — audio DISABLED ' +
                 '(worker/page SAB layout mismatch)');
+        showToast('No sound: the emulator and the page disagree on the audio buffer', false);
         return;
       }
       audioContext = new (self.AudioContext || self.webkitAudioContext)({ sampleRate: 44100 });
@@ -1066,11 +1360,10 @@
         else seedArmed = true;
       }
     } catch (err) {
-      pageLog('[page] start failed: ' + (err && err.message ? err.message : String(err)));
-      setStatus('Failed: ' + (err && err.message ? err.message : String(err)));
-      // Put the console on screen. On a phone the shell hides #wrap, so this
-      // is the ONLY way the user ever sees why the boot died.
-      showMobileLog();
+      // pageFail = log + status + error toast + force the log on screen. On a
+      // phone the shell hides #wrap, so the log tail is the ONLY way the user
+      // ever sees why the boot died — and the toast is what tells them to look.
+      pageFail('start failed: ' + (err && err.message ? err.message : String(err)));
       $('btnStart').disabled = false;
     }
   });
@@ -1160,10 +1453,193 @@
     return !(q.has('noseed') || q.has('autoload') || q.has('autosave') || q.has('parity'));
   }
 
+  // ---------------------------------------------------------------------------
+  // Fallback gzip inflate — for browsers with no DecompressionStream.
+  //
+  // WHY THIS EXISTS. The seed above is the ONLY thing that carries PSO Ver.2's
+  // Serial Number / Access Key. Without it the game boots cold and stops on the
+  // credential screen — no character, ever. That is precisely the reported
+  // symptom, and the old code produced it from a single console line
+  // ("gzipped, but this browser has no DecompressionStream — cold boot") that
+  // no phone user can read. DecompressionStream is Safari/iOS 16.4+ (March
+  // 2023), so anything older — an iPad or iPhone that stopped at iOS 15/16.3 —
+  // hit that branch. Rather than degrade, inflate it here.
+  //
+  // puff-style canonical-Huffman DEFLATE. VERIFIED 2026-08-29 in Node against
+  // the shipped dreamcast/states/pso2_boot.state: 8,595,603 B -> 27,652,485 B,
+  // SHA-256 identical to zlib.gunzipSync, 633 ms; plus stored/fixed/dynamic
+  // block coverage at levels 0/1/6/9, and corrupt-CRC and truncated inputs both
+  // rejected rather than silently returning short data.
+  // ---------------------------------------------------------------------------
+  const INF_LBASE = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258];
+  const INF_LEXT  = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0];
+  const INF_DBASE = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577];
+  const INF_DEXT  = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13];
+  const INF_ORDER = [16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15];
+  function huffBuild(lengths, n) {
+    const count = new Int32Array(16);
+    for (let i = 0; i < n; i++) count[lengths[i]]++;
+    count[0] = 0;
+    const offs = new Int32Array(16);
+    for (let i = 1; i < 16; i++) offs[i] = offs[i - 1] + count[i - 1];
+    const symbol = new Int32Array(n);
+    for (let i = 0; i < n; i++) if (lengths[i]) symbol[offs[lengths[i]]++] = i;
+    return { count: count, symbol: symbol };
+  }
+  let INF_FIXED = null;
+  function fixedTables() {
+    if (INF_FIXED) return INF_FIXED;
+    const l = new Uint8Array(288);
+    for (let i = 0; i < 144; i++) l[i] = 8;
+    for (let i = 144; i < 256; i++) l[i] = 9;
+    for (let i = 256; i < 280; i++) l[i] = 7;
+    for (let i = 280; i < 288; i++) l[i] = 8;
+    const d = new Uint8Array(30);
+    for (let i = 0; i < 30; i++) d[i] = 5;
+    INF_FIXED = { lc: huffBuild(l, 288), dc: huffBuild(d, 30) };
+    return INF_FIXED;
+  }
+  let INF_CRCT = null;
+  function crc32(buf) {
+    if (!INF_CRCT) {
+      INF_CRCT = new Int32Array(256);
+      for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        INF_CRCT[n] = c;
+      }
+    }
+    let c = -1;
+    for (let i = 0; i < buf.length; i++) c = INF_CRCT[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ -1) >>> 0;
+  }
+  function inflateRaw(src, pos, hint) {
+    let out = new Uint8Array(hint > 0 ? hint : 1 << 20);
+    let o = 0, p = pos, bitbuf = 0, bitcnt = 0;
+    function bits(need) {
+      let val = bitbuf;
+      while (bitcnt < need) {
+        if (p >= src.length) throw new Error('inflate: out of input');
+        val |= src[p++] << bitcnt;
+        bitcnt += 8;
+      }
+      bitbuf = val >>> need;
+      bitcnt -= need;
+      return val & ((1 << need) - 1);
+    }
+    function ensure(extra) {
+      if (o + extra <= out.length) return;
+      let cap = out.length || 1;
+      while (cap < o + extra) cap *= 2;
+      const nb = new Uint8Array(cap);
+      nb.set(out.subarray(0, o));
+      out = nb;
+    }
+    function decode(h) {
+      let code = 0, first = 0, index = 0;
+      for (let len = 1; len <= 15; len++) {
+        code |= bits(1);
+        const count = h.count[len];
+        if (code - count < first) return h.symbol[index + (code - first)];
+        index += count; first += count; first <<= 1; code <<= 1;
+      }
+      throw new Error('inflate: invalid code');
+    }
+    function codes(lc, dc) {
+      for (;;) {
+        let sym = decode(lc);
+        if (sym < 256) { ensure(1); out[o++] = sym; continue; }
+        if (sym === 256) return;
+        sym -= 257;
+        if (sym >= 29) throw new Error('inflate: invalid length code');
+        const len = INF_LBASE[sym] + bits(INF_LEXT[sym]);
+        const ds = decode(dc);
+        if (ds >= 30) throw new Error('inflate: invalid distance code');
+        const dist = INF_DBASE[ds] + bits(INF_DEXT[ds]);
+        if (dist > o) throw new Error('inflate: distance too far back');
+        ensure(len);
+        let from = o - dist;
+        for (let i = 0; i < len; i++) out[o++] = out[from++];
+      }
+    }
+    let last = 0;
+    do {
+      last = bits(1);
+      const type = bits(2);
+      if (type === 0) {
+        bitbuf = 0; bitcnt = 0;                       // stored: byte-align
+        if (p + 4 > src.length) throw new Error('inflate: stored block truncated');
+        const len = src[p] | (src[p + 1] << 8);
+        const nl = src[p + 2] | (src[p + 3] << 8);
+        if ((len ^ 0xffff) !== nl) throw new Error('inflate: stored length mismatch');
+        p += 4;
+        if (p + len > src.length) throw new Error('inflate: stored block truncated');
+        ensure(len);
+        out.set(src.subarray(p, p + len), o);
+        o += len; p += len;
+      } else if (type === 1) {
+        const f = fixedTables();
+        codes(f.lc, f.dc);
+      } else if (type === 2) {
+        const nlen = bits(5) + 257, ndist = bits(5) + 1, ncode = bits(4) + 4;
+        if (nlen > 286 || ndist > 30) throw new Error('inflate: too many codes');
+        const lengths = new Uint8Array(320);
+        for (let i = 0; i < ncode; i++) lengths[INF_ORDER[i]] = bits(3);
+        for (let i = ncode; i < 19; i++) lengths[INF_ORDER[i]] = 0;
+        const clc = huffBuild(lengths, 19);
+        let idx = 0;
+        while (idx < nlen + ndist) {
+          const sym = decode(clc);
+          if (sym < 16) { lengths[idx++] = sym; continue; }
+          let val = 0, rep;
+          if (sym === 16) {
+            if (idx === 0) throw new Error('inflate: repeat with no previous length');
+            val = lengths[idx - 1]; rep = 3 + bits(2);
+          } else if (sym === 17) rep = 3 + bits(3);
+          else rep = 11 + bits(7);
+          if (idx + rep > nlen + ndist) throw new Error('inflate: too many lengths');
+          while (rep--) lengths[idx++] = val;
+        }
+        if (lengths[256] === 0) throw new Error('inflate: no end-of-block code');
+        codes(huffBuild(lengths, nlen), huffBuild(lengths.subarray(nlen, nlen + ndist), ndist));
+      } else {
+        throw new Error('inflate: invalid block type');
+      }
+    } while (!last);
+    return out.subarray(0, o);
+  }
+  function gunzipBytes(u8) {
+    if (u8.length < 18 || u8[0] !== 0x1f || u8[1] !== 0x8b) throw new Error('gunzip: not a gzip stream');
+    if (u8[2] !== 8) throw new Error('gunzip: unsupported method ' + u8[2]);
+    const flg = u8[3];
+    let p = 10;
+    if (flg & 4) p += 2 + (u8[p] | (u8[p + 1] << 8));            // FEXTRA
+    if (flg & 8) { while (p < u8.length && u8[p]) p++; p++; }     // FNAME
+    if (flg & 16) { while (p < u8.length && u8[p]) p++; p++; }    // FCOMMENT
+    if (flg & 2) p += 2;                                          // FHCRC
+    const n = u8.length;
+    const crc   = (u8[n - 8] | (u8[n - 7] << 8) | (u8[n - 6] << 16) | (u8[n - 5] << 24)) >>> 0;
+    const isize = (u8[n - 4] | (u8[n - 3] << 8) | (u8[n - 2] << 16) | (u8[n - 1] << 24)) >>> 0;
+    const out = inflateRaw(u8, p, isize);
+    if (out.length !== isize) throw new Error('gunzip: inflated ' + out.length + ' B, ISIZE says ' + isize);
+    if (crc32(out) !== crc) throw new Error('gunzip: CRC32 mismatch');
+    return out;
+  }
+
+  // A seed that never arrives is not fatal — the game still boots and plays —
+  // but it IS the difference between "a character is waiting for you" and "type
+  // in a Serial Number you do not have". Say so on screen; a console line is
+  // invisible on a phone.
+  function seedUnavailable(why) {
+    pageLog('[seed] ' + why + ' — cold boot');
+    showToast('Boot seed unavailable — PSO will ask for its Serial Number and Access Key', false);
+    return null;
+  }
+
   async function fetchSeedState() {
     try {
       const r = await fetch(SEED_URL);
-      if (!r.ok) { pageLog('[seed] not shipped (HTTP ' + r.status + ') — cold boot'); return null; }
+      if (!r.ok) return seedUnavailable('not shipped (HTTP ' + r.status + ')');
       let buf = await r.arrayBuffer();
       // A deploy can hand back a 133-byte Git-LFS pointer instead of content:
       // that exact break shipped the Track3 disc parts as pointers and crashed
@@ -1172,29 +1648,33 @@
       if (buf.byteLength <= 512) {
         const head = new TextDecoder().decode(new Uint8Array(buf, 0, Math.min(24, buf.byteLength)));
         if (head.startsWith('version https://git-lfs')) {
-          pageLog('[seed] served as a Git-LFS pointer — deploy is broken; cold boot');
-          return null;
+          return seedUnavailable('served as a Git-LFS pointer — deploy is broken');
         }
       }
       const m = new Uint8Array(buf, 0, Math.min(2, buf.byteLength));
       if (m[0] === 0x1f && m[1] === 0x8b) {
-        if (typeof DecompressionStream !== 'function') {
-          pageLog('[seed] gzipped, but this browser has no DecompressionStream — cold boot');
-          return null;
+        if (HAS_GUNZIP) {
+          buf = await new Response(
+            new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))
+          ).arrayBuffer();
+        } else {
+          // No DecompressionStream. This used to give up here, which cold-boots
+          // PSO to the Serial Number / Access Key screen — no character.
+          const t0 = Date.now();
+          const u8 = gunzipBytes(new Uint8Array(buf));
+          buf = (u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength)
+            ? u8.buffer : u8.slice().buffer;
+          pageLog('[seed] no DecompressionStream — page decoder inflated ' +
+                  buf.byteLength + ' B in ' + (Date.now() - t0) + ' ms');
         }
-        buf = await new Response(
-          new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))
-        ).arrayBuffer();
       }
       if (buf.byteLength < SEED_MIN) {
-        pageLog('[seed] implausibly small (' + buf.byteLength + ' B) — cold boot');
-        return null;
+        return seedUnavailable('implausibly small (' + buf.byteLength + ' B)');
       }
       pageLog('[seed] ready ' + buf.byteLength + ' B');
       return buf;
     } catch (e) {
-      pageLog('[seed] fetch/inflate failed: ' + e + ' — cold boot');
-      return null;
+      return seedUnavailable('fetch/inflate failed: ' + (e && e.message ? e.message : String(e)));
     }
   }
 
