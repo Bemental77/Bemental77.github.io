@@ -12,7 +12,12 @@
 #include "Common/Flag.h"
 #include "Common/Logging/Log.h"
 #include "Common/MsgHandler.h"
+#include "Core/Core.h"
 #include "Core/CoreTiming.h"
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#include <emscripten/threading.h>
+#endif
 #include "Core/HW/GPFifo.h"
 #include "Core/HW/MMIO.h"
 #include "Core/HW/ProcessorInterface.h"
@@ -366,6 +371,113 @@ void CommandProcessorManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
   mmio->Register(base | FIFO_READ_POINTER_HI, fifo_read_hi_r, fifo_read_hi_w);
 }
 
+#if defined(__EMSCRIPTEN__)
+// [fifo-backpressure 2026-08-29] HOST-SIDE GXOverflowHandler.
+//
+// WHY: on real hardware the guest's ONLY brake on the CP FIFO is the overflow
+// interrupt. GXSetCPUFifo arms it (~/gc_refs/dolsdk2001/src/gx/GXFifo.c:169
+// __GXWriteFifoIntEnable(1,0)), GXCPInterruptHandler (:84-94) dispatches
+// GXOverflowHandler, and that handler is literally
+// OSSuspendThread(__GXCurrentThread) (:31-51) — the CPU STOPS WRITING until the
+// GP drains past the low watermark. GXInitFifoBase leaves only
+// hiWatermark = size - 0x4000 (:112), i.e. 16 KB / 512 bursts, of slack.
+//
+// THIS BUILD HIDES CP FROM THE GUEST: the guest's read of PI cause 0xCC003000
+// masks out 0x800 (dolphin_jit_wimports.cpp:338-341) and dolphin_check_exc
+// deasserts it host-side and never defers on it (:530-535). So
+// GXOverflowHandler NEVER RUNS. There is also no host-side substitute:
+// MAIN_SYNC_GPU defaults false (Core/Config/MainSettings.cpp:220) and
+// Boot.cpp:445-452 records it as measured and deliberately OFF. Dolphin's own
+// overflow check is the ASSERT_MSG below — a message, not a brake.
+// Result: the guest can write past the read pointer, the decoder picks the
+// stream up mid-command ("GFX FIFO: Unknown Opcode"), and once the spliced
+// command is a SETDRAWDONE the PE FINISH never fires, so GXWaitDrawDone
+// (GXMisc.c, DrawDone at r13-0x3530) spins forever at xpc=0x80375364.
+//
+// THIS IS NOT MAIN_SYNC_GPU: there is no per-pump tick throttle and no cost at
+// all while the FIFO is healthy — it engages only past the guest's own high
+// watermark, which is where hardware suspends the thread.
+//
+// WE CANNOT DRAIN INLINE HERE. The decoder's consumer is the proxied-main pump
+// (Main.cpp:463 RunGpuLoopSlice) because that thread owns the WebGPU device;
+// Core.cpp:548-549 records that wgpu calls on a device-less thread NEVER RETURN.
+// So this parks the producer and lets the real consumer catch up, which is the
+// same observable as OSSuspendThread.
+//
+// DEADLOCK HAZARD, handled: the consumer's drain loop refuses to run while a CP
+// interrupt is waiting (Fifo.cpp:397 `while (!IsInterruptWaiting() && ...)`),
+// and crossing the high watermark is exactly what raises it
+// (SetCPStatusFromGPU, this file: ovfInt -> m_interrupt_waiting.Set()). The
+// CoreTiming event that CLEARS m_interrupt_waiting runs on the CPU thread — the
+// thread we are about to park. So parking without servicing it deadlocks both
+// sides. We service it inline; we ARE the CPU thread, which is where
+// UpdateInterrupts is meant to run, and the still-scheduled event repeating it
+// later is idempotent.
+//
+// BOUNDED: on timeout we give up and let the burst through, so the worst case
+// degrades to today's behaviour rather than to a new hang.
+//
+// Witness cells (0x026B3B10..0x026B3B20 — repo-wide grep shows no other use;
+// 0x026B3B00/04/08 are the draw-ablation arms):
+//   0x026B3B10 engage count   0x026B3B14 timeout-bail count
+//   0x026B3B18 cumulative ms parked      0x026B3B1C max distance seen at engage
+//   0x026B3B20 KILL SWITCH (nonzero = brake DISABLED, for a matched-pair control
+//              on ONE wasm)
+void CommandProcessorManager::BemFifoBackpressure()
+{
+  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3B20u)) != 0u)
+    return;  // control arm: brake off
+
+  const u32 hi = m_fifo.CPHiWatermark;
+  if (hi == 0u)
+    return;  // guest has not programmed a watermark yet
+
+  const u32 dist = m_fifo.CPReadWriteDistance.load(std::memory_order_seq_cst);
+  if (dist <= hi)
+    return;  // FIFO healthy — this is the whole cost in the common case
+
+  // Only the CPU thread may park here. GatherPipeBursted is also reachable from
+  // the pump/state paths, and parking the device thread would stop the very
+  // consumer we are waiting on.
+  if (!IsOnThread(m_system) || m_system.GetFifo().UseDeterministicGPUThread() ||
+      !Core::IsCPUThread())
+    return;
+
+  volatile u32* const c_engage = reinterpret_cast<volatile u32*>(uintptr_t(0x026B3B10u));
+  volatile u32* const c_bail = reinterpret_cast<volatile u32*>(uintptr_t(0x026B3B14u));
+  volatile u32* const c_ms = reinterpret_cast<volatile u32*>(uintptr_t(0x026B3B18u));
+  volatile u32* const c_max = reinterpret_cast<volatile u32*>(uintptr_t(0x026B3B1Cu));
+  *c_engage = *c_engage + 1u;
+  if (dist > *c_max)
+    *c_max = dist;
+
+  // Drain target: the guest's own low watermark when it set one (that is what
+  // GXOverflowHandler waits for via the underflow interrupt), else back under
+  // the high watermark.
+  const u32 lo = m_fifo.CPLoWatermark;
+  const u32 target = (lo != 0u && lo < hi) ? lo : hi;
+
+  const double t0 = emscripten_get_now();
+  while (m_fifo.CPReadWriteDistance.load(std::memory_order_seq_cst) > target &&
+         m_fifo.bFF_GPReadEnable.load(std::memory_order_relaxed) != 0)
+  {
+    if (m_interrupt_waiting.IsSet())
+    {
+      // Reopen the consumer's gate (see DEADLOCK HAZARD above).
+      UpdateInterrupts(m_fifo.bFF_HiWatermark.load(std::memory_order_relaxed) ? 1 : 0);
+    }
+    m_system.GetFifo().RunGpu();
+    if ((emscripten_get_now() - t0) > 500.0)
+    {
+      *c_bail = *c_bail + 1u;
+      break;
+    }
+    emscripten_thread_sleep(0.2);
+  }
+  *c_ms = *c_ms + static_cast<u32>(emscripten_get_now() - t0);
+}
+#endif
+
 void CommandProcessorManager::GatherPipeBursted()
 {
   SetCPStatusFromCPU();
@@ -419,6 +531,10 @@ void CommandProcessorManager::GatherPipeBursted()
   // [dist/seq-diag STRIPPED 2026-07-22 — served PM11/PM12; per-burst publish cost removed.]
 
   m_system.GetFifo().RunGpu();
+
+#if defined(__EMSCRIPTEN__)
+  BemFifoBackpressure();
+#endif
 
   ASSERT_MSG(COMMANDPROCESSOR,
              m_fifo.CPReadWriteDistance.load(std::memory_order_relaxed) <=

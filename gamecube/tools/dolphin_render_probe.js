@@ -765,6 +765,23 @@ function startServer() {
               o.pub  = A[0x026B3518 >> 2] >>> 0;
               o.fctr = A[0x026B3448 >> 2] >>> 0;
               o.busy = F[0x026B3458 >> 3];
+              // [D1 2026-08-29] FIFO-backpressure discriminator (78372b6 D1).
+              // rgl = RunGpuLoop drain-loop body iterations, written at
+              // Fifo.cpp:402 INSIDE the `while (!IsInterruptWaiting() && ...)`
+              // loop. Climbing while `drawn` (PE SetFinish) is frozen => the
+              // decoder is consuming a desynced stream. Frozen => the
+              // Fifo.cpp:397 guard is false, i.e. a watermark stall.
+              // NOTE its nine sibling cells (0x026B1AD0/1AD8/1AE4../1B10) have
+              // no writer left in the source and read dead zeros — not evidence.
+              o.rgl  = A[0x026B1AD4 >> 2] >>> 0;
+              // [fifo-backpressure 2026-08-29] host-side GXOverflowHandler witness
+              // (CommandProcessor.cpp BemFifoBackpressure): engages/bails/ms/maxdist.
+              o.bpN  = A[0x026B3B10 >> 2] >>> 0;
+              o.bpBail = A[0x026B3B14 >> 2] >>> 0;
+              o.bpMs = A[0x026B3B18 >> 2] >>> 0;
+              o.bpMax = A[0x026B3B1C >> 2] >>> 0;
+              o.xpc  = (() => { const c = A[0x0250002C >> 2] >>> 0;
+                return c ? (A[c >> 2] >>> 0).toString(16) : '0'; })();
               const m1 = A[0x02500020 >> 2] >>> 0;
               if (m1) {
                 const u8 = new Uint8Array(window.sharedMemory.buffer);
@@ -776,7 +793,10 @@ function startServer() {
           try {
             const R = window.__gcRate;
             if (R) o.rate = { path: R.path, speed: R.speed, cap: R.capFps,
-                              pub: R.published, shown: R.shown, starved: R.starved };
+                              pub: R.published, shown: R.shown, starved: R.starved,
+                              nativeHz: R.nativeHz, uncapped: R.uncapped };
+            const _f = document.getElementById('fps');
+            if (_f) o.head = _f.textContent;
           } catch (_e) {}
           return o;
         });
@@ -788,6 +808,7 @@ function startServer() {
             let dexec = (s.exec >>> 0) - (_srPrev.exec >>> 0); if (dexec < 0) dexec += 4294967296;
             const dpe  = (s.pe || 0)  - (_srPrev.pe || 0);
             const dpub = ((s.pub || 0) - (_srPrev.pub || 0)) / 2;
+            let drgl = (s.rgl >>> 0) - (_srPrev.rgl >>> 0); if (drgl < 0) drgl += 4294967296;
             let dgc = (s.gc != null && _srPrev.gc != null) ? (s.gc - _srPrev.gc) : null;
             const speed = dcred / 486e6 / dw;
             const row = { tsec: +(s.t / 1000).toFixed(1), dw: +dw.toFixed(2),
@@ -795,11 +816,19 @@ function startServer() {
               credMHz: +(dcred / dw / 1e6).toFixed(1),
               drawn: +(dpe / dw).toFixed(1), pub: +(dpub / dw).toFixed(1),
               gcps: dgc == null ? null : +(dgc / dw).toFixed(1),
+              rgl: +(drgl / dw).toFixed(0), xpc: s.xpc || null,
+              bpN: s.bpN || 0, bpBail: s.bpBail || 0, bpMs: s.bpMs || 0, bpMax: s.bpMax || 0,
+              bpDn: (s.bpN || 0) - (_srPrev.bpN || 0), bpDms: (s.bpMs || 0) - (_srPrev.bpMs || 0),
               rate: s.rate || null };
+            row.head = s.head || null;
             _srRows.push(row);
+            if (s.head) console.log('[page-headline] t=' + row.tsec + 's  "' + s.head + '"');
             console.log('[scene-rate] t=' + row.tsec + 's  speed=' + row.speed.toFixed(3)
               + 'x  cred=' + row.credMHz + 'MHz exec=' + row.execMHz + 'MHz'
               + '  drawn=' + row.drawn + '/s  published=' + row.pub + '/s'
+              + '  rglDrain=' + row.rgl + '/s  xpc=0x' + (row.xpc || '?')
+              + '  brake=' + row.bpDn + '/w(' + row.bpN + ' tot, ' + row.bpDms + 'ms/w, bail '
+              + row.bpBail + ', maxDist ' + row.bpMax + ')'
               + (row.gcps == null ? '' : '  guestGC=' + row.gcps + '/s')
               + (s.rate ? ('  [page ' + s.rate.path + ' speed='
                   + (s.rate.speed == null ? '--' : (+s.rate.speed).toFixed(3) + 'x')

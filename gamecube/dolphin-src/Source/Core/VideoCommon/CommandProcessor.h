@@ -172,6 +172,12 @@ public:
   void SetCPStatusFromGPU();
   void SetCPStatusFromCPU();
   void GatherPipeBursted();
+#if defined(__EMSCRIPTEN__)
+  // [fifo-backpressure 2026-08-29] host-side GXOverflowHandler — see the long
+  // comment on the definition in CommandProcessor.cpp. Kill switch: SAB cell
+  // 0x026B3B20 nonzero = brake off.
+  void BemFifoBackpressure();
+#endif
   void UpdateInterrupts(u64 userdata);
   void UpdateInterruptsFromVideoBackend(u64 userdata);
 
