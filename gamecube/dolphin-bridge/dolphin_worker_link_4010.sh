@@ -240,6 +240,33 @@ fi
 #     ControllerInterface::PlatformPopulateDevices / *__thread_proxy*. All of these
 #     require a real HID/USB device to exist, which a browser worker without
 #     WebUSB cannot supply. If a future build gains WebUSB, re-audit this branch.
+#
+# ⚠ DO NOT SHIP THIS ON UNTIL THE FIFO BACKPRESSURE ITEM IS RESOLVED (78372b6).
+# That commit establishes, from the SDK oracle, that this build has NO working GX
+# FIFO backpressure: the guest's only brake is the CP overflow interrupt
+# (GXOverflowHandler = OSSuspendThread, GXFifo.c:31-51), and this build masks CP
+# out of the guest's PI cause read (dolphin_jit_wimports.cpp:338-341), with no
+# host-side substitute (MAIN_SYNC_GPU is deliberately OFF). The margin between
+# GXInitFifoBase's hiWatermark and real overflow is 16 KB. Under that mechanism ANY
+# speedup of the CPU thread is a co-factor for the PSO wedge ("decoder desync ->
+# SETDRAWDONE never decoded -> peFrames frozen"), which is how the +34.7%
+# import-unwrap fix (e14f728) ended up gated OFF.
+#
+# ASYNCIFY_NARROW is a CPU-thread speedup, so it is in that class — 78372b6 lists it
+# as "untested as a CO-FACTOR". I have NOT measured its effect on the wedge and the
+# direction is genuinely unclear from code alone: it speeds up the PRODUCER
+# (JitWasm::Run, MMU::WriteToHardware, bem_chain_loop_c) but ALSO the CONSUMER
+# (OpcodeDecoder::RunFifo, VertexManagerBase::Flush), and the consumer is the side
+# that drains the FIFO. Net effect on the 16 KB margin is unknown. Sequence the work:
+# land 78372b6's D3 (host-side watermark drain in GatherPipeBursted) first, then
+# re-run this gate's A/B. Until then treat ASYNCIFY_NARROW as a measurement arm.
+#
+# What 78372b6 does INDEPENDENTLY CONFIRM: it names the same three unwind producers
+# this block is built around — _emscripten_sleep, __syscall_fsync's syncfs branch,
+# __asyncjs__em_libusb_wait_async — and notes none is reachable at PSO
+# character-select. Its refutation of "Asyncify" is about the JS-side export-wrapper
+# SEMANTICS (Asyncify.instrumentWasmExports), a different thing from the in-wasm
+# instrumentation this flag removes; the two findings do not conflict.
 if [ "${ASYNCIFY_NARROW:-0}" = "1" ]; then
   ASYNCIFY_ADD_FILE=${ASYNCIFY_ADD_FILE:-$BRIDGE/asyncify_add.txt}
   ASYNCIFY_FLAGS+=( -sASYNCIFY_IGNORE_INDIRECT=1 -sASYNCIFY_ADD=@"$ASYNCIFY_ADD_FILE" )
