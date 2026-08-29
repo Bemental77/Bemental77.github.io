@@ -321,7 +321,35 @@
   const SH4_HZ = 200000000;
   let uncap = false;
   let paceBaseWall = 0, paceBaseCyc = 0;
-  function resetPace() { paceBaseWall = 0; paceBaseCyc = 0; }
+  // ---------------------------------------------------------------------------
+  // Duty-cycle telemetry (2026-08-28). THE TWO KNOBS ARE SEPARATE:
+  //
+  //   GUEST RATE      — set here, by the governor below. Target 1.000x = the
+  //                     real SH4 clock. Nothing else in the page may move it.
+  //   PRESENTED RATE  — set by the GAME. One present = one
+  //                     emscripten_webgl_commit_frame() from video_cb in
+  //                     EmscriptenWorker.cpp, i.e. one DISTINCT guest frame.
+  //                     PSO Ver.2 renders every other DC VBlank, so at 1.000x
+  //                     it is 30/s by design (native flycast: R: 29.72).
+  //
+  // Headroom ("how far ahead of the hardware are we?") is only knowable HERE,
+  // because the surplus is the wall time this governor GIVES BACK — it never
+  // shows up in either rate. So partition each wall second:
+  //     busy  = time inside _emscripten_run_iter()
+  //     paced = the delay we deliberately inserted to stay at 1.000x
+  //     (remainder: scheduler latency + asyncify-suspend waits — charged to
+  //      NEITHER, which makes the reported headroom a floor, never a boast)
+  // The page turns (busy, paced, wall) into duty, cost-per-produced-frame and
+  // headroom. Cost: two performance.now() reads per iteration, one of which
+  // replaces the governor's own read.
+  // ---------------------------------------------------------------------------
+  let paceBusyMs = 0, pacePacedMs = 0, paceWindowStart = 0;
+  function resetPace() {
+    paceBaseWall = 0; paceBaseCyc = 0;
+    // A rebase (uncap toggle, reset, savestate load) starts a fresh duty
+    // window too — a duty number straddling two arms describes neither.
+    paceBusyMs = 0; pacePacedMs = 0; paceWindowStart = performance.now();
+  }
   const pumpChannel = new MessageChannel();
   pumpChannel.port1.onmessage = pumpTick;
 
@@ -366,13 +394,17 @@
       postMessage({ cmd: 'print', txt: '[flycast-shim] freerun run_iter threw (pump stopped): ' + (err && err.message ? err.message : String(err)) + pcTxt + stk });
       return;
     }
+    // Wall time actually spent emulating. Taken once, and reused as the
+    // governor's "now" below (it was calling performance.now() here anyway).
+    const t1 = performance.now();
+    paceBusyMs += t1 - t0;
     let delay = 0;
     if (!uncap && typeof Module._flycast_guest_cycles === 'function') {
       // Governor: schedule the next iteration so guest time never leads wall
       // time. A large desync in either direction (background tab, level load,
       // state jump — the cycle counter jumps on unserialize) rebases instead
       // of sprinting or stalling to catch up.
-      const nowW = performance.now();
+      const nowW = t1;
       const cyc = Module._flycast_guest_cycles();
       if (!paceBaseWall) { paceBaseWall = nowW; paceBaseCyc = cyc; }
       const lead = (cyc - paceBaseCyc) / SH4_HZ * 1000 - (nowW - paceBaseWall);
@@ -388,7 +420,9 @@
       // pinned at 59/s in both). Perf probes must see the CPU, not the rig.
       delay = 0;
     }
-    if (delay > 1) setTimeout(() => pumpChannel.port2.postMessage(0), delay);
+    // Only the delay we ASKED for counts as given-back time. setTimeout
+    // overshoot lands in the unattributed remainder, so headroom stays a floor.
+    if (delay > 1) { pacePacedMs += delay; setTimeout(() => pumpChannel.port2.postMessage(0), delay); }
     else pumpChannel.port2.postMessage(0);
   }
 
@@ -422,13 +456,24 @@
     if (on && !freerun) {
       freerun = true;
       freerunIters = 0;
+      paceBusyMs = 0; pacePacedMs = 0; paceWindowStart = performance.now();
       freerunStatsTimer = setInterval(() => {
-        postMessage({ cmd: 'ips', ips: freerunIters });
+        // ips is unchanged (probes parse it). busy/paced/wall are additive —
+        // an older page that ignores them still reads iters/s exactly as before.
+        const nowW = performance.now();
+        const wallMs = paceWindowStart ? (nowW - paceWindowStart) : 0;
+        postMessage({ cmd: 'ips', ips: freerunIters,
+                      busyMs: Math.round(paceBusyMs),
+                      pacedMs: Math.round(pacePacedMs),
+                      wallMs: Math.round(wallMs),
+                      governed: uncap ? 0 : 1 });
+        paceWindowStart = nowW; paceBusyMs = 0; pacePacedMs = 0;
         freerunIters = 0;
         vmuPoll();   // card snapshots ride the existing 1 Hz tick
         lazyPoll();
       }, 1000);
-      postMessage({ cmd: 'print', txt: '[flycast-shim] freerun ON (worker-owned run loop, 60 iter/s cap)' });
+      postMessage({ cmd: 'print', txt: '[flycast-shim] freerun ON (worker-owned run loop, real-time governor ' +
+                                       (uncap ? 'OFF — ?uncap arm, guest UNGOVERNED' : 'ON — guest paced to 1.000x') + ')' });
       pumpChannel.port2.postMessage(0);
     } else if (!on && freerun) {
       freerun = false;
@@ -444,10 +489,15 @@
       case 'freerun':
         setFreerun(!!data.on);
         break;
-      case 'uncap':   // perf probes (?uncap=1): historical free-run pump
+      // ?uncap=1 is a MEASUREMENT ARM, never a shipping configuration: it
+      // removes the governor, so the GUEST runs fast (the games are sped up).
+      // It is not, and must never become, the way the page reaches a higher
+      // presented rate — see the two-knobs comment above resetPace().
+      case 'uncap':
         uncap = !!data.on;
         resetPace();
-        postMessage({ cmd: 'print', txt: '[pump] uncap=' + (uncap ? 1 : 0) + ' (real-time governor ' + (uncap ? 'OFF' : 'ON') + ')' });
+        postMessage({ cmd: 'print', txt: '[pump] uncap=' + (uncap ? 1 : 0) + ' (real-time governor ' +
+                     (uncap ? 'OFF — MEASUREMENT ARM, guest is NOT at 1.000x' : 'ON — guest paced to 1.000x') + ')' });
         break;
       case 'mem-init':
         // Already bootstrapped — ignore late re-sends.

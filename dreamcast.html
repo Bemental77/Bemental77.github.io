@@ -32,6 +32,29 @@
     @media (max-aspect-ratio: 4/3) { #canvasWrap:fullscreen #dc-canvas, #canvasWrap:-webkit-full-screen #dc-canvas { width: 100vw; height: calc(100vw * 3 / 4); } }
     #fpsBar { font-size: 13px; color: #8f8; min-height: 16px; text-align: center;
               font-family: ui-monospace, Menlo, monospace; }
+    /* Two independent numbers, never merged into one "FPS": the GUEST rate
+       (governed to 1.000x hardware) and the PRESENTED rate (distinct guest
+       frames committed to the canvas). Headroom is the third, derived from
+       the pump's duty cycle. */
+    #fpsBar .k { color: #667; }                    /* label */
+    #fpsBar .guest { color: #8f8; font-weight: 700; }
+    #fpsBar .guest.off { color: #fb4; }            /* not within +/-2% of 1.000x */
+    #fpsBar .pres  { color: #9cf; font-weight: 700; }
+    #fpsBar .head  { color: #fc6; font-weight: 700; }
+    #fpsBar .sep   { color: #444; padding: 0 6px; }
+    #fpsBar .sub   { color: #778; }
+    #fpsBar .arm   { color: #f66; font-weight: 700; }
+    /* Measurement-arm banner. Fixed and loud on purpose: a screenshot of a
+       non-shipping configuration must never read as the shipping one. Sits
+       above the mobile shell (1000) / mobile menu (2600), below the toast. */
+    #armBanner { display: none; position: fixed; top: 0; left: 0; right: 0; z-index: 4000;
+      background: repeating-linear-gradient(45deg, #6b1b1b, #6b1b1b 12px, #571515 12px, #571515 24px);
+      color: #ffe; border-bottom: 2px solid #f66; padding: 4px 10px; text-align: center;
+      font: 700 12px/1.5 ui-monospace, Menlo, monospace; letter-spacing: 0.5px;
+      pointer-events: none; }
+    #armBanner.on { display: block; }
+    body.armed #wrap { padding-top: 30px; }
+    body.armed #mobileStatus { top: 34px; }   /* clear the banner on the phone shell */
     #log { display: none; width: 100%; max-width: 820px; height: 140px; overflow: auto;
            background: #0a0a0a; border: 1px solid #333; padding: 4px; font-size: 11px;
            color: #bbb; white-space: pre-wrap; font-family: ui-monospace, Menlo, monospace; }
@@ -124,6 +147,7 @@
 </head>
 <body>
 <div id="toast"></div>
+<div id="armBanner"></div>
 <div id="wrap">
   <h3>Dreamcast Wasm</h3>
   <div id="controlBar">
@@ -159,7 +183,7 @@
   </div>
   <div id="status"></div>
   <div id="canvasWrap"><canvas id="dc-canvas" width="640" height="480"></canvas></div>
-  <div id="fpsBar">fps: — | iters/s: —</div>
+  <div id="fpsBar"><span class="k">guest</span> — <span class="sep">|</span> <span class="k">presented</span> — <span class="sep">|</span> <span class="k">headroom</span> —</div>
   <pre id="log"></pre>
 </div>
 <div id="mobileShell">
@@ -497,6 +521,9 @@
           if (qs.has('nomodvol'))  worker.postMessage({ cmd: 'modvol', on: 0 });
           // ?uncap=1: disable the real-time governor (perf/throughput probes
           // measure max guest MHz; interactive play must run at 1x hardware).
+          // MEASUREMENT ARM ONLY — it speeds the GAME up, it is not and must
+          // never become the route to a higher presented rate. The page raises
+          // the #armBanner and prefixes the rate bar whenever it is set.
           if (qs.has('uncap'))     worker.postMessage({ cmd: 'uncap', on: 1 });
           if (qs.has('arm7selftest')) worker.postMessage({ cmd: 'arm7selftest', on: 1 });
         }
@@ -644,7 +671,15 @@
         }
         break;
       case 'ips':
+        // iters/s plus the pump's duty-cycle partition (busy / paced / wall,
+        // ms per 1 s window — added by the shim 2026-08-28). Older shims send
+        // only `ips`; the undefined-guard below keeps headroom blank instead of
+        // inventing one.
         lastIps = d.ips;
+        if (d.wallMs !== undefined) {
+          lastBusyMs = d.busyMs | 0; lastPacedMs = d.pacedMs | 0; lastWallMs = d.wallMs | 0;
+          lastGoverned = d.governed === undefined ? 1 : (d.governed | 0);
+        }
         paintFpsBar();
         break;
       case 'stateSaved':
@@ -1189,36 +1224,195 @@
   // context renders directly to the visible canvas. paintFrame /
   // paintTransferable are kept as no-ops so the message dispatcher doesn't
   // throw on legacy 'frame' / 'render' messages.
+  //
+  // THE PRESENTATION PATH, since the number on screen depends on it:
+  //   video_cb (EmscriptenWorker.cpp) calls emscripten_webgl_commit_frame()
+  //   once per HW frame the core produces, on the worker's GL-owning thread
+  //   with explicitSwapControl. So presents are driven by GUEST FRAME
+  //   PRODUCTION, not by this page's requestAnimationFrame and not by the
+  //   display's vblank — the rAF loop below ships input only. Consequences:
+  //     * The presented counter is not capped at 60 by a 60 Hz panel. It is
+  //       capped by the game: PSO Ver.2 produces 30 distinct frames/s at
+  //       1.000x, so it reads 30 on a 60 Hz and on a 120 Hz display alike.
+  //       The compositor repeats the last committed frame to fill the panel's
+  //       refresh; those repeats are the display's, and we do not count them.
+  //     * The ONLY way this counter reaches 120 is 120 distinct guest frames
+  //       per second, which for a 30 fps title means running the guest at 4x
+  //       — the exact thing the governor exists to prevent. So the "120" this
+  //       page reports is FRAMES PRODUCIBLE (headroom x distinct frames), and
+  //       it is labelled as such: "producible", never "presented".
   // ---------------------------------------------------------------------------
   function paintFrame() {}
   function paintTransferable(_d) {}
 
   // ---------------------------------------------------------------------------
-  // fps bar (charter Phase 2.1). fps/hw/calls come from the worker's video_cb
-  // telemetry once per second (presents/s; dupe sentinels excluded, so a
-  // stuck emu reads 0). iters/s comes from the shim's free-run pump.
+  // Rate readout — THREE numbers, kept separate on purpose. A single "FPS"
+  // that means guest speed on one path and presents on another is the exact
+  // confusion this section exists to end.
+  //
+  //   GUEST RATE      how fast the simulated Dreamcast runs, as a multiple of
+  //                   real hardware. Derived from the core's guest-clock
+  //                   telemetry (kcyc * 1024 cycles/s / 200 MHz). The shim's
+  //                   real-time governor holds this at 1.000x: the games are
+  //                   NOT sped up, and this is the number that proves it.
+  //   PRESENTED RATE  distinct guest frames committed to the canvas per second
+  //                   (`fps` from video_cb — one emscripten_webgl_commit_frame
+  //                   per produced frame; libretro's duplicate-frame sentinel
+  //                   is excluded, so a stuck emulator reads 0). PSO Ver.2
+  //                   renders every other DC VBlank, so 30/s IS the hardware
+  //                   behaviour — native flycast reports R: 29.72 on this
+  //                   disc. `calls` counts every video_cb including dupes
+  //                   (~the 60 Hz DC field rate), which is why "30 presents /
+  //                   60 fields" is the correct signature and not a ceiling.
+  //   HEADROOM        how far ahead of hardware the machine actually is:
+  //                   guestRate / duty, duty = fraction of wall time the pump
+  //                   spent inside run_iter (from the shim's busy/paced/wall
+  //                   report). The governor hands the surplus back as idle, so
+  //                   it appears in NEITHER rate above — this is the only
+  //                   place it can be seen.
+  //
+  // Deliberately NOT done: re-presenting the same guest frame to inflate the
+  // presented number. At 1.000x a 30 fps title produces 30 distinct frames per
+  // second and no honest counter reads higher. The surplus is reported as
+  // headroom + measured per-frame cost instead, which is what "we are ahead of
+  // the hardware" actually means.
   // ---------------------------------------------------------------------------
+  const HW_SH4_HZ = 200e6;   // must match SH4_HZ in dreamcast/flycast_libretro/flycast_worker.js
   let lastFps = 0, lastHw = 0, lastCalls = 0, lastIps = 0;
   let lastClk = 0, lastPc = 0, lastIstnrm = 0, lastIstext = 0;
+  // Pump duty-cycle window (ms per ~1 s), from the shim's 'ips' message.
+  let lastBusyMs = 0, lastPacedMs = 0, lastWallMs = 0, lastGoverned = 1;
   const fpsEl = $('fpsBar');
-  function guestMHz() { return (lastClk * 1024 / 1e6).toFixed(2); }
+  function guestMHz()   { return lastClk * 1024 / 1e6; }
+  function guestRateX() { return (lastClk * 1024) / HW_SH4_HZ; }   // 1.000 = exactly hardware
+  function dutyFrac()   { return lastWallMs > 0 ? Math.min(1, lastBusyMs / lastWallMs) : 0; }
+  function headroomX()  { const d = dutyFrac(); return d > 0 ? guestRateX() / d : 0; }
+  // Measured emulation cost of ONE PRODUCED FRAME: busy ms per wall second
+  // divided by frames produced in that second. Window-independent (both sides
+  // are per-second rates). 1000 / cost = frames/s this machine could produce
+  // at the cost it is currently paying — the honest "capacity" figure.
+  function frameCostMs(){ const d = dutyFrac(); return (lastFps > 0 && d > 0) ? d * 1000 / lastFps : 0; }
+  function capacityFps(){ const c = frameCostMs(); return c > 0 ? 1000 / c : 0; }
+
+  // ---------------------------------------------------------------------------
+  // Measurement arms — any query param that stops this page from being the
+  // shipping configuration. Rendered as a fixed, loud banner so a screenshot
+  // of a probe run can never be mistaken for a shipping run.
+  // ---------------------------------------------------------------------------
+  const ARM_DESC = {
+    uncap:       'GUEST UNGOVERNED — the game runs FASTER than hardware',
+    noidleskip:  'idle-skip OFF',
+    idleskip:    'idle-skip forced ON',
+    interp:      'SH4 interpreter',
+    interpAt:    'SH4 interpreter after N s',
+    interprange: 'PC range interpreted',
+    nochain:     'block chaining OFF',
+    rteintc:     'legacy per-block RTE UpdateINTC',
+    noshard:     'shard dispatch OFF',
+    shard:       'shard dispatch forced ON',
+    noarm7jit:   'ARM7 JIT OFF',
+    noic:        'inline caches OFF',
+    nofastmem:   'fastmem OFF',
+    noregcache:  'register cache OFF',
+    noimmfast:   'imm fast path OFF',
+    nofog:       'fog OFF',
+    nomodvol:    'modifier volumes OFF',
+    diag:        'diagnostic tracing (perturbs timing)',
+    pctrace:     'PC tracing',
+    peek:        'RAM polling',
+    ctxsnap:     'context snapshots',
+    parity:      'in-process parity gate',
+    autosave:    'timed auto savestate',
+    autoload:    'auto-restore /state.bin',
+    noseed:      'boot seed disabled',
+    arm7selftest:'ARM7 self-test',
+  };
+  const activeArms = (() => {
+    const q = new URLSearchParams(location.search);
+    return Object.keys(ARM_DESC).filter((k) => q.has(k));
+  })();
+  // Governed = the shim says so AND ?uncap is absent. The second clause is not
+  // redundant: an older shim sends no `governed` field, and defaulting a silent
+  // shim to "governed" while ?uncap is on the URL would put a lie on screen.
+  // (Note the page enables uncap on mere PRESENCE of the param, so ?uncap=0
+  // still means ungoverned.)
+  const guestIsGoverned = () => lastGoverned === 1 && activeArms.indexOf('uncap') < 0;
+  (function paintArmBanner() {
+    const el = document.getElementById('armBanner');
+    if (!el) return;
+    if (!activeArms.length) return;               // shipping config: banner stays hidden
+    el.textContent = '⚠ MEASUREMENT ARM' + (activeArms.length > 1 ? 'S' : '') +
+      ' ACTIVE — NOT THE SHIPPING CONFIGURATION: ' +
+      activeArms.map((a) => '?' + a + ' (' + ARM_DESC[a] + ')').join('   ·   ');
+    el.classList.add('on');
+    document.body.classList.add('armed');
+  })();
+
+  const f1 = (x) => (Math.round(x * 10) / 10).toFixed(1);
   function paintFpsBar() {
-    if (fpsEl) {
-      fpsEl.textContent =
-        'fps: ' + lastFps + ' (hw ' + lastHw + '/s, video_cb ' + lastCalls +
-        '/s) | iters/s: ' + lastIps + ' | guest ' + guestMHz() + ' MHz' +
-        ' | pc 0x' + lastPc.toString(16);
-    }
+    if (!fpsEl) return;
+    const gx = guestRateX(), hx = headroomX(), cost = frameCostMs(), cap = capacityFps();
+    const governed = guestIsGoverned();
+    // Green only when the governor is on AND the guest is inside +/-2% of
+    // hardware. Amber = governed but drifting (we could not keep up, or a
+    // rebase is in flight). Red = ungoverned, i.e. the ?uncap measurement arm.
+    const gCls = !governed ? 'arm' : (Math.abs(gx - 1) <= 0.02 ? 'guest' : 'guest off');
+    const sep = '<span class="sep">|</span>';
+    const guestTxt = lastClk
+      ? '<span class="' + gCls + '">' + gx.toFixed(3) + 'x</span>' +
+        '<span class="sub"> (' + guestMHz().toFixed(1) + ' MHz' +
+        (governed ? ', hardware = 1.000x' : ', UNGOVERNED') + ')</span>'
+      : '<span class="sub">—</span>';
+    const presTxt = lastCalls || lastFps
+      ? '<span class="pres">' + lastFps + ' fps</span>' +
+        '<span class="sub"> (distinct frames/s; ' + lastCalls + ' video fields/s)</span>'
+      : '<span class="sub">—</span>';
+    // hx < 1 means we are BEHIND hardware (no surplus to report) — flag it in
+    // the arm colour rather than dressing it up as headroom.
+    const headTxt = hx > 0
+      ? '<span class="' + (hx >= 1 ? 'head' : 'arm') + '">' + f1(hx) + 'x</span>' +
+        (lastFps > 0
+          ? '<span class="sub"> (' + f1(cost) + ' ms/frame → ' + Math.round(cap) +
+            ' fps producible)</span>'
+          : '<span class="sub"> (no frames produced yet)</span>')
+      : '<span class="sub">—</span>';
+    fpsEl.innerHTML =
+      (activeArms.length ? '<span class="arm">⚠ ' + activeArms.join(' ') + '</span> ' + sep + ' ' : '') +
+      '<span class="k">guest</span> ' + guestTxt + ' ' + sep +
+      ' <span class="k">presented</span> ' + presTxt + ' ' + sep +
+      ' <span class="k">headroom</span> ' + headTxt + ' ' + sep +
+      ' <span class="sub">pump ' + lastIps + ' it/s, busy ' +
+      Math.round(dutyFrac() * 100) + '%, paced ' +
+      (lastWallMs > 0 ? Math.round(lastPacedMs / lastWallMs * 100) : 0) + '%</span>' +
+      ' <span class="sub">pc 0x' + lastPc.toString(16) + '</span>';
+  }
+  // One-line version for the mobile shell's status strip (plain text — the
+  // shell mirrors textContent, and the desktop bar is markup).
+  function fpsBarCompact() {
+    if (!lastClk) return '';
+    return (activeArms.length ? '⚠ ' : '') +
+      'guest ' + guestRateX().toFixed(3) + 'x · ' + lastFps + ' fps · ' +
+      (headroomX() > 0 ? f1(headroomX()) + 'x headroom' : '');
   }
   // Heartbeat: RELEASE builds print nothing once boot telemetry caps out,
-  // which idle-kills probes and leaves the Log panel blind. One line / 10s.
+  // which idle-kills probes and leaves the Log panel blind. One line / 2s.
+  // The original fps=/hw=/video_cb=/iters=/clk= tokens are kept verbatim so
+  // existing probe parsers keep working; the rate split is appended.
   setInterval(() => {
     if (booted) {
       pageLog('[page] heartbeat fps=' + lastFps + ' hw=' + lastHw +
               ' video_cb=' + lastCalls + '/s iters=' + lastIps +
-              '/s clk=' + guestMHz() + 'MHz pc=0x' + lastPc.toString(16) +
+              '/s clk=' + guestMHz().toFixed(2) + 'MHz pc=0x' + lastPc.toString(16) +
               ' istnrm=0x' + lastIstnrm.toString(16) +
-              ' istext=0x' + lastIstext.toString(16));
+              ' istext=0x' + lastIstext.toString(16) +
+              ' | guest=' + guestRateX().toFixed(3) + 'x' +
+              ' governed=' + (guestIsGoverned() ? 1 : 0) +
+              ' presented=' + lastFps + '/s' +
+              ' duty=' + Math.round(dutyFrac() * 100) + '%' +
+              ' cost=' + f1(frameCostMs()) + 'ms/f' +
+              ' headroom=' + f1(headroomX()) + 'x' +
+              ' capacity=' + Math.round(capacityFps()) + 'fps' +
+              ' arms=' + (activeArms.join(',') || 'none'));
     }
   }, 2000);
 
@@ -1314,8 +1508,11 @@
     return bytes;
   }
 
-  // Input-only rAF loop — emulation is paced by the worker's free-run pump,
-  // not by this loop (rAF throttles to zero in background tabs).
+  // Input-only rAF loop — emulation is paced by the worker's free-run pump and
+  // presentation is driven by the worker's commit_frame (see the presentation
+  // path note above), not by this loop. rAF is bounded by the panel refresh
+  // (and throttles to zero in a background tab), which is exactly why neither
+  // the guest rate nor the presented rate is allowed to depend on it.
   function frameLoop() {
     if (booted) {
       const pad = packPad();
@@ -1372,8 +1569,10 @@
       $('btnStart').click();
       checkOrientation();
     });
-    // Mirror status + fps into the shell's top line.
-    setInterval(() => { $('mobileStatus').textContent = (statusEl.textContent || '') + (booted ? ('  ' + $('fpsBar').textContent) : ''); }, 1000);
+    // Mirror status + the compact rate line into the shell's top line. The
+    // desktop bar is markup now, so use the plain-text compact form (guest
+    // rate · presented fps · headroom, with the arm marker if one is set).
+    setInterval(() => { $('mobileStatus').textContent = (statusEl.textContent || '') + (booted ? ('  ' + fpsBarCompact()) : ''); }, 1000);
     // Menu wiring — reuse the desktop handlers.
     let ghost = false, hidden = false;
     $('mobileMenuBtn').addEventListener('pointerdown', (e) => { e.preventDefault(); $('mobileMenu').classList.add('open'); });
