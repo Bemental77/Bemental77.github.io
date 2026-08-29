@@ -7,12 +7,12 @@
 # clean summary of the milestones the boot hit (or the fatal it died on).
 #
 # Usage:
-#   build_and_probe.sh                       # relink + probe → /tmp/probe-dc.log
+#   build_and_probe.sh                       # relink + probe → /tmp/probe-dcx.log
 #   build_and_probe.sh --skip-link           # JS-only iteration
 #   build_and_probe.sh --duration 60000      # 60s probe
 #   build_and_probe.sh --idle 12000          # tolerate longer quiet periods
 #   build_and_probe.sh --keep-noise          # show emcc DEBUG/ASSERTIONS too
-#   build_and_probe.sh --name baseline       # archive to /tmp/dc-probes/baseline.log
+#   build_and_probe.sh --name baseline       # archive to /tmp/probe-dcx-baseline.log
 #   build_and_probe.sh --js-flags "--trace-deopt --print-wasm-code"
 #                                            # forwarded to V8 (puppeteer Chrome
 #                                            # via FLYCAST_V8_FLAGS env var)
@@ -29,6 +29,9 @@ PCTRACE=""
 NAME=""
 PROBE_LOG=""
 JS_FLAGS=""
+QUERY=""
+PRESSES=""
+LOADSTATE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --skip-link|--skip-build) SKIP_LINK=1; shift ;;
@@ -40,21 +43,33 @@ while [ $# -gt 0 ]; do
     --name)                   NAME="$2"; shift 2 ;;
     --log)                    PROBE_LOG="$2"; shift 2 ;;
     --js-flags)               JS_FLAGS="$2"; shift 2 ;;
+    # [2026-08-28] passthrough to flycast_probe.js so the canonical loop can drive
+    # a SCENE, not just a boot. --q appends raw page query params (e.g. autoload=1,
+    # which makes dreamcast.html:270 fetch /state.bin and restore past PSO's
+    # serial-number gate); --press is repeatable and schedules timed key holds.
+    # Without these the only reachable scene was "it booted", which is why a
+    # character-select/creation regression went unreproduced for a whole session.
+    --q)                      QUERY="$2"; shift 2 ;;
+    --press)                  PRESSES="$PRESSES --press $2"; shift 2 ;;
+    # [2026-08-29] --loadstate <file>: the probe's HTTP server serves THIS file at
+    # GET /state.bin, so --q autoload=1 restores the named scene instead of
+    # whatever stale state.bin happens to sit in the repo root. flycast_probe.js
+    # already had the flag (:201); the canonical loop could not reach it.
+    --loadstate)              LOADSTATE="$2"; shift 2 ;;
     -h|--help)                sed -n '2,/^set -e/p' "$0" | sed 's/^# //;/^set -e/d'; exit 0 ;;
     *)                        echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 # ---- archive paths ----
+# DC probe logs are /tmp/probe-dcx-* (own logs; the GC campaign owns /tmp/probe-*.log)
 if [ -n "$NAME" ]; then
-  ARCHIVE_DIR="/tmp/dc-probes"
-  mkdir -p "$ARCHIVE_DIR"
-  PROBE_LOG="${PROBE_LOG:-$ARCHIVE_DIR/${NAME}.log}"
+  PROBE_LOG="${PROBE_LOG:-/tmp/probe-dcx-${NAME}.log}"
 else
-  PROBE_LOG="${PROBE_LOG:-/tmp/probe-dc.log}"
+  PROBE_LOG="${PROBE_LOG:-/tmp/probe-dcx.log}"
 fi
 
-ROOT=/Users/caseybement/Bemental77.github.io
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"  # repo root, derived — no hardcode
 LINK_SCRIPT=$ROOT/dreamcast/flycast-bridge/flycast_worker_link.sh
 PROBE_JS=$ROOT/dreamcast/tools/flycast_probe.js
 
@@ -76,14 +91,13 @@ PROBE_JS=$ROOT/dreamcast/tools/flycast_probe.js
 # returns 0. Same class as the GameCube build-dir/BUILD= mismatch in CLAUDE.md.
 if [ "$SKIP_LINK" = 0 ]; then
   echo "=== archive build (bementalJIT + flycast core) ==="
-  cd /Users/caseybement/Bemental77.github.io/dreamcast/flycast-src/build-wasm
+  cd "$ROOT/dreamcast/flycast-src/build-wasm"
   # shellcheck disable=SC1091
-  source /Users/caseybement/Bemental77.github.io/emsdk/emsdk_env.sh > /dev/null 2>&1
+  source "$ROOT/emsdk/emsdk_env.sh" > /dev/null 2>&1
   emmake make bementalJIT bementalJITSh4 flycast_libretro -j4 2>&1 | grep -E "error:|Built target" | tail -8
   # The `| grep | tail` above means `set -e` sees grep/tail's exit, NOT make's.
-  # Without this PIPESTATUS guard a FAILED build would silently fall through to
-  # the probe, which then runs against a STALE wasm — a false "it still works"
-  # result. The basis of testing is a fresh build every run; abort if it broke.
+  # Without this PIPESTATUS guard a FAILED build silently falls through to the
+  # probe, which then runs against a STALE wasm — a false "it still works".
   if [ "${PIPESTATUS[0]}" -ne 0 ]; then echo "FATAL: archive build failed (bementalJIT / flycast core)"; exit 1; fi
 
   echo "=== link ==="
@@ -99,6 +113,12 @@ echo "=== probe (log → $PROBE_LOG${DURATION:+, duration=$DURATION ms}${IDLE:+,
 CMD="node $PROBE_JS --log $PROBE_LOG $KEEP_NOISE $INTERP $PCTRACE"
 [ -n "$DURATION" ] && CMD="$CMD --duration $DURATION"
 [ -n "$IDLE" ]     && CMD="$CMD --idle $IDLE"
+[ -n "$QUERY" ]    && CMD="$CMD --q $QUERY"
+[ -n "$PRESSES" ]  && CMD="$CMD$PRESSES"
+if [ -n "$LOADSTATE" ]; then
+  [ -f "$LOADSTATE" ] || { echo "FATAL: --loadstate file not found: $LOADSTATE" >&2; exit 2; }
+  CMD="$CMD --loadstate $LOADSTATE"
+fi
 
 # V8 flags pass through to puppeteer's Chrome via FLYCAST_V8_FLAGS — the probe
 # forwards the string to chromium as `--js-flags=...`. Empty string = leave V8
@@ -116,4 +136,4 @@ WALL_S=$SECONDS
 
 echo ""
 echo "[done] wall=${WALL_S}s log=$PROBE_LOG"
-[ -n "$NAME" ] && echo "[archive] $ARCHIVE_DIR/${NAME}.log"
+[ -n "$NAME" ] && echo "[archive] $PROBE_LOG"
