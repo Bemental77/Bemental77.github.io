@@ -186,6 +186,51 @@ def main():
         print("could not connect to oracle GDB stub", file=sys.stderr); sys.exit(1)
     send(s, "?"); recv(s)
 
+    # ---- PASSIVE_SIMPLE: inputs-only harvest, no protocol recovery needed --------
+    # Used by the two-run flow: this run only records the GAME's inputs (and is then
+    # killed), so it can free-run with just the two function breakpoints -- nothing else
+    # armed, so the guest is not slowed by anchor round trips.
+    if os.environ.get("PASSIVE_SIMPLE") == "1":
+        pf = os.environ["PASSIVE_FN"]
+        entry, blr, ins, out, ret = FNS[pf]
+        budget = float(os.environ.get("PASSIVE_BUDGET", "300"))
+        send(s, f"Z0,{entry:x},4"); print("Z0 entry:", recv(s), file=sys.stderr)
+        send(s, f"Z0,{blr:x},4"); print("Z0 blr  :", recv(s), file=sys.stderr)
+        recs, pend, t0 = [], None, time.time()
+        while len(recs) < MAX_PASSIVE and time.time() - t0 < budget:
+            s.settimeout(max(5.0, budget - (time.time() - t0)))
+            send(s, "c")
+            try:
+                stop = recv(s)
+            except socket.timeout:
+                print("passive: no call inside the budget", file=sys.stderr); break
+            if not stop or stop[0] != "T":
+                break
+            pc = stop_pc(stop)
+            if pc == entry:
+                regs = {g: rreg(s, g) for g, _ in ins}
+                og = rreg(s, out[0])
+                def okp(a): return a is not None and 0x80000000 <= a < 0x81800000
+                if not all(okp(v) for v in regs.values()) or not okp(og):
+                    pend = None; continue
+                try:
+                    pend = {"in": [(g, rmem(s, regs[g], n).hex()) for g, n in ins],
+                            "outaddr": og, "alias": any(regs[g] == og for g, _ in ins)}
+                except RuntimeError:
+                    pend = None
+            elif pc == blr and pend is not None:
+                try:
+                    pend["dst"] = rmem(s, pend["outaddr"], out[1]).hex(); recs.append(pend)
+                except RuntimeError:
+                    pass
+                pend = None
+            else:
+                pend = None
+        json.dump({pf: recs}, open(os.environ["PASSIVE_DUMP"], "w"))
+        print(f"PASSIVE_SIMPLE: {len(recs)} in-game calls -> {os.environ['PASSIVE_DUMP']}",
+              file=sys.stderr)
+        s.close(); return
+
     # ---- park on the CPU thread at a PC the game demonstrably executes ----
     send(s, f"Z0,{ANCHOR:x},4"); print("Z0 anchor:", recv(s), file=sys.stderr)
     halted = False

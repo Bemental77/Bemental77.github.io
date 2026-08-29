@@ -209,6 +209,28 @@ window.GcRate = (function () {
 
   var DEF = { guestHz: 60, maxDtMs: 100, maxBacklog: 8 };
 
+  // ---- the evidence floor under `cap` ----------------------------------------------------
+  // [cap-sliver 2026-08-29] Every capacity number here is `observations / observed busy time`.
+  // Both terms are reset per 1s window, and NOTHING used to require that a window had actually
+  // observed anything: a window whose only event was a frame arriving 1.5ms before the sample
+  // divided by that 1.5ms and reported 667 fps of capacity for a second in which the pipeline
+  // delivered ZERO frames. That is not a small error, it is a number invented out of noise, and
+  // it is where the live recomp series' 683 came from (683 = 1000/1.46). Three distinct shapes
+  // produce it, all reproduced against this model:
+  //   - render busy 1.5ms with zero acks     -> the "starved stage" bound 1000/rBusy   = 667
+  //   - guest: one frame, 1.5ms after its gate -> 1000/(t - lastFrameAt)                = 667
+  //   - six frames posted 0.1ms apart          -> 1000/(guestBusyMs/guestBusyN)         = 10000
+  // The fix is not to special-case any of them. A rate needs a sample, so a stage that was
+  // observed for less than MIN_BUSY_MS this window reports null — "--" — instead of dividing by
+  // a sliver. `--` for one second is a true statement; 683 is not. This is the ONLY thing
+  // standing between the headline and a fabricated capacity, so ?ratetest=1 test 19 asserts
+  // each of the three shapes reads "--" AND that a healthy window is untouched.
+  //
+  // 50ms is ~5% of the window: three frames of guest work at 60Hz, six at the 120 the number is
+  // being compared against. Below that the ratio is dominated by where the 1s boundary happened
+  // to fall, not by how fast the stage runs.
+  var MIN_BUSY_MS = 50;
+
   // ---- seqlock -> published frames -----------------------------------------------------
   // 0x026B3518 is a SEQLOCK, not a frame counter: WGPUGfx.cpp:1242 bumps it to ODD before the
   // pixel memcpy and :1264 to EVEN after => exactly +2 per PUBLISHED frame. A reader that
@@ -608,22 +630,31 @@ window.GcRate = (function () {
       var reqX = (target === 0) ? Infinity : target / guestHz;
 
       // ---- capability: measured busy time, both stages, no duplicated frames ----
+      // Both branches are gated on MIN_BUSY_MS of ACTUALLY OBSERVED busy time (see the note at
+      // the top of GcRate). A window that watched a stage for a sliver has no opinion about how
+      // fast it runs, and must say so.
       var guestCap = null;
-      if (m.guestBusyN > 0) guestCap = 1000 / (m.guestBusyMs / m.guestBusyN);
-      else if (m.lastFrameAt && (target <= 0 || poolNow() > 0)) {
+      if (m.guestBusyN > 0) {
+        if (m.guestBusyMs >= MIN_BUSY_MS) guestCap = 1000 / (m.guestBusyMs / m.guestBusyN);
+      } else if (m.lastFrameAt && (target <= 0 || poolNow() > 0)) {
         // STARVED, not idle: no frame completed in this whole window. A standing credit (or
         // uncapped freerun) proves the worker cannot be parked, so it has been computing the
         // entire time and its rate is at MOST 1000/busy. Reporting `--` here would hand `cap`
         // to the other stage alone and OVERSTATE the pipeline by an unbounded factor.
+        // But the bound is only worth quoting once the stage has been watched long enough to
+        // BE a bound: at 1.5ms it reads 667 and is pure noise (test 19a).
         var gBusy = t - m.lastFrameAt;
-        if (gBusy > 1) guestCap = 1000 / gBusy;
+        if (gBusy >= MIN_BUSY_MS) guestCap = 1000 / gBusy;
       }
       var rNow = renderBusyAt(t), rBusy = rNow - m.renderBusyMark;
       m.renderBusyMark = rNow;
       // Same rule on the render side: busy with ZERO completions is a starved stage worth
-      // 1000/busy at most, not an unknown. (Idle reads rBusy ~ 0 and stays unknown.)
+      // 1000/busy at most, not an unknown. (Idle reads rBusy ~ 0 and stays unknown.) And the
+      // same evidence floor — the acks in this window are paired against a busy span that the
+      // 1s boundary may have cut in half, so a sliver of busy with a burst of acks reads
+      // thousands of fps (test 19c).
       var renderCap = null;
-      if (rBusy > 1) renderCap = (m.renderedWin > 0) ? m.renderedWin * 1000 / rBusy : 1000 / rBusy;
+      if (rBusy >= MIN_BUSY_MS) renderCap = (m.renderedWin > 0) ? m.renderedWin * 1000 / rBusy : 1000 / rBusy;
       var renderedWin = m.renderedWin;
       m.renderedWin = 0; m.guestBusyMs = 0; m.guestBusyN = 0;
       var cap = (guestCap === null) ? renderCap : (renderCap === null ? guestCap : Math.min(guestCap, renderCap));
@@ -1172,6 +1203,111 @@ window.GcRate = (function () {
     ck('18p after a stateLoaded relatch the settled rate is re-earned, not carried across scenes',
        r18p.out.nativeHz === null, 'nativeHz=' + String(r18p.out.nativeHz));
 
+    // ===== 19. `cap` MAY NOT BE INVENTED OUT OF A SLIVER ====================================
+    // [cap-sliver 2026-08-29] A live ?recomp=1 series read min 13 / p50 95 / p90 457 / max 683
+    // for a pipeline whose two stages never changed speed, and 683 was quoted at the user. The
+    // cause was NOT the gate attribution test 12 pins — it is that every capacity here is
+    // observations/observed-busy-ms with both terms reset per 1s window, and a window that
+    // observed a sliver still divided by it. These drive makeModel DIRECTLY (not through
+    // simulate) so the exact one-second shape that produced each number is in the test.
+    function win(o) {
+      var v = 0;
+      var pool = { load: function () { return v; }, add: function (n) { v += n; },
+                   reset: function () { v = 0; } };
+      var mm = makeModel({ guestHz: 60, target: (o.target === undefined ? 60 : o.target), pool: pool });
+      mm.sample(0);                                    // latch the window mark at t=0
+      for (var t = 0; t < 1000; t += 16) mm.grant(t);  // rAF keeps the credit pool fed
+      if (o.drive) o.drive(mm);
+      return mm.sample(1000);
+    }
+    // 19a — THE 683. One frame lands 1.5ms before the sample; nothing is acked all second. Both
+    // stages then divide by that 1.5ms (1000/1.464 = 683) and the bar announces 667 fps of
+    // capacity for a second in which the pipeline delivered NOTHING.
+    var w19a = win({ drive: function (mm) { mm.frame(1, 998.5); } });
+    ck('19a a window that delivered NOTHING reports cap "--", not 1000/(1.5ms) = 667',
+       w19a.capFps === null,
+       'cap=' + fx(w19a.capFps, 1) + ' guest=' + fx(w19a.guestCap, 1) + ' render=' + fx(w19a.renderCap, 1));
+    // 19b — the guest half on its own: six frames posted 0.1ms apart is 10,000 fps by the
+    // arithmetic and 0.6ms of evidence in fact.
+    var w19b = win({ drive: function (mm) {
+      for (var i = 1; i <= 6; i++) mm.frame(i, 995 + i * 0.1);
+    } });
+    ck('19b six frames 0.1ms apart is not a 10,000 fps guest — it is no measurement at all',
+       w19b.guestCap === null, 'guestCap=' + fx(w19b.guestCap, 1) + ' cap=' + fx(w19b.capFps, 1));
+    // 19c — the render half: acks are charged to the window they LAND in, but their busy span
+    // may have been charged to the previous one. A burst of completions against a sliver of
+    // this window's render-busy time reads in the thousands.
+    var w19c = win({ drive: function (mm) {
+      mm.frame(1, 500); mm.frame(2, 501);              // open the segment mid-window
+      mm.ack(502); mm.ack(502.4);                      // ...and close it 2.4ms later
+    } });
+    ck('19c a 2.4ms render sample with 2 acks is not an 833 fps renderer',
+       w19c.renderCap === null, 'renderCap=' + fx(w19c.renderCap, 1) + ' cap=' + fx(w19c.capFps, 1));
+    // 19d — THE CONTROL THAT KEEPS THE FIX HONEST. "Return null more often" would pass 19a-c and
+    // destroy the meter. A window with real evidence must still report both stages. (Test 1d
+    // covers the same ground through simulate; this one pins that the FLOOR is what changed.)
+    var w19d = win({ drive: function (mm) {
+      var t = 0;
+      for (var i = 1; i <= 60; i++) { mm.frame(i, t + 8); mm.ack(t + 11); t += 16.667; }
+    } });
+    ck('19d control: a window with 60 frames of evidence still reports a cap',
+       w19d.capFps !== null && w19d.guestCap !== null && w19d.renderCap !== null,
+       'cap=' + fx(w19d.capFps, 1) + ' guest=' + fx(w19d.guestCap, 1) + ' render=' + fx(w19d.renderCap, 1));
+    // 19e — and the STARVED bound survives: a stage busy the whole window with zero completions
+    // is worth 1000/busy, which is the ~1/s that test 6a depends on. The floor must cut off the
+    // sliver case WITHOUT deleting the bound (that mutation goes red here and at 6a/13a).
+    var w19e = win({ drive: function (mm) { mm.frame(1, 5); } });
+    ck('19e but a stage watched for the WHOLE window with no completion still reports its bound',
+       w19e.capFps !== null && w19e.capFps < 2,
+       'cap=' + fx(w19e.capFps, 2) + ' guest=' + fx(w19e.guestCap, 2) + ' render=' + fx(w19e.renderCap, 2));
+
+    // ===== 20. THE ARMS CONTROL — what ?fps=0 is and is not evidence for ====================
+    // [cap-arms 2026-08-29] A cross-check compared `cap` at 1.000x against `cap` under ?fps=0
+    // and called a difference a defect. Whether that is a control at all depends on WHICH STAGE
+    // binds in each arm, and nothing published that. It does now (rate.guestCap/renderCap, and
+    // the probe prints "cap=N (g=.. r=..)"). These pin the property the cross-check assumes.
+    function arm20(target, guestMs, renderMs) {
+      var r = simulate({ target: target, guestHz: 60, guestMs: guestMs, renderMs: renderMs, durMs: 12000 });
+      var S = r.samples.slice(1), c = [], b = { G: 0, R: 0 };
+      for (var i = 0; i < S.length; i++) {
+        if (S[i].capFps === null) continue;
+        c.push(S[i].capFps);
+        b[(S[i].guestCap !== null && (S[i].renderCap === null || S[i].guestCap <= S[i].renderCap)) ? 'G' : 'R']++;
+      }
+      c.sort(function (x, y) { return x - y; });
+      return { p50: c[(c.length - 1) >> 1], binds: (b.G > b.R ? 'guest' : 'render'), n: c.length };
+    }
+    // The live recomp shape: a guest that could run ~12x hardware feeding a ~43/s renderer.
+    var a20cap = arm20(60, 1.4, 23), a20free = arm20(0, 1.4, 23);
+    ck('20a at the live recomp shape BOTH arms are render-bound — the cross-check compares like with like',
+       a20cap.binds === 'render' && a20free.binds === 'render',
+       'capped binds ' + a20cap.binds + ', freerun binds ' + a20free.binds);
+    ck('20b and so they MUST agree: a capped-arm cap that ?fps=0 contradicts is a real defect, not two bottlenecks',
+       a20cap.p50 !== undefined && a20free.p50 !== undefined &&
+       Math.abs(a20cap.p50 - a20free.p50) / a20free.p50 < 0.10,
+       'capped p50=' + fx(a20cap.p50, 1) + '  freerun p50=' + fx(a20free.p50, 1));
+    // 20c — the discriminator for "they always agree, so the test is vacuous": make the GUEST
+    // the slow stage and the arms genuinely diverge, because ?fps=0 removes the very throttle
+    // that was holding the guest to 60. A cap comparison across the arms is only a control when
+    // 20a holds, and this is the case where it does not.
+    var a20g = arm20(60, 8, 3), a20gf = arm20(0, 8, 3);
+    ck('20c control: when the GUEST is the slow stage both arms are guest-bound and still agree',
+       a20g.binds === 'guest' && a20gf.binds === 'guest' &&
+       Math.abs(a20g.p50 - a20gf.p50) / a20gf.p50 < 0.10,
+       'capped p50=' + fx(a20g.p50, 1) + ' (' + a20g.binds + ')  freerun p50=' +
+       fx(a20gf.p50, 1) + ' (' + a20gf.binds + ')');
+    // 20d — GATE #9, restated as an assertion: ?fps=0 moves the GUEST (11.9x hardware here). It
+    // is a measurement arm, and format() must stamp it so its cap can never be quoted as
+    // shipped headroom. The 1.000x arm's cap is the one that describes the product.
+    var s20 = simulate({ target: 0, guestHz: 60, guestMs: 1.4, renderMs: 23, durMs: 6000 });
+    var L20 = s20.samples[s20.samples.length - 1];
+    ck('20d ?fps=0 runs the guest far past hardware, so its readout is stamped a measurement arm',
+       L20.speed > 5 && format({ speed: L20.speed, speedReq: L20.speedReq, starved: L20.starved,
+                                 capFps: L20.capFps, guestHz: 60, nativeHz: 60,
+                                 shown: 0, published: 0 }).indexOf('[fast-fwd arm]') > 0,
+       'speed=' + fx(L20.speed, 2) + 'x  ' + format({ speed: L20.speed, speedReq: L20.speedReq,
+         starved: L20.starved, capFps: L20.capFps, guestHz: 60, nativeHz: 60, shown: 0, published: 0 }));
+
     var summary = 'RATETEST ' + (fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + pass + ' passed, ' + fail + ' failed';
     log(summary);
     return { pass: pass, fail: fail, lines: lines, summary: summary };
@@ -1180,7 +1316,7 @@ window.GcRate = (function () {
   return { makeModel: makeModel, seqDelta: seqDelta, format: format, num: num,
            simulate: simulate, selfTest: selfTest, DEF: DEF,
            makeJitRate: makeJitRate, jitCycles: jitCycles, applyJit: applyJit,
-           gapText: gapText, TARGET_FPS: TARGET_FPS,
+           gapText: gapText, TARGET_FPS: TARGET_FPS, MIN_BUSY_MS: MIN_BUSY_MS,
            GEKKO_HZ: GEKKO_HZ, CELLS: CELLS };
 })();
 </script>
@@ -6109,6 +6245,12 @@ window.GcRate = (function () {
       // guest to (?hz=, default 60), so the 120 verdict has a real per-game target on recomp too.
       path: 'recomp', guestHz: GUEST_HZ, nativeHz: GUEST_HZ,
       speed: r.speed, speedReq: r.speedReq, capFps: r.capFps,
+      // [cap-terms 2026-08-29] The two stage capacities are published as NUMBERS, not only
+      // inside the capNote prose, because `cap` is a min() and the only way to read a cap
+      // number honestly is to know WHICH stage produced it. A cross-check that compares a
+      // guest-bound cap in one arm to a render-bound cap in another is comparing two
+      // different quantities and is not a control at all — see ?ratetest=1 test 19.
+      guestCap: r.guestCap, renderCap: r.renderCap,
       starved: r.starved,
       capNote: 'recomp: min(guest ' + GcRate.num(r.guestCap) + '/s, render ' +
                GcRate.num(r.renderCap) + '/s) from measured busy time',
