@@ -592,8 +592,32 @@ TimePoint CoreTimingManager::CalculateTargetHostTimeInternal(s64 target_cycle)
          Clock::duration{std::chrono::seconds{elapsed_cycles}} / m_throttle_adj_clock_per_sec;
 }
 
+#if defined(__EMSCRIPTEN__)
+// [uncap-probe 2026-08-28] Runtime uncap switch, DEFAULT-OFF, by SAB scratch cell
+// (never getenv — dead cross-thread; see gc_runtime_flags_via_sab_cell_not_env).
+//
+// WHY THIS EXISTS: the only two routes to an unlimited core are
+// Config::MAIN_EMULATION_SPEED (Boot.cpp:313 reads the libretro option
+// `dolphin_emulation_speed`) and Core::SetIsThrottlerTempDisabled (Boot.cpp:592,
+// pinned false under Emscripten). But EmscriptenWorker.cpp's environment_cb
+// (:137) handles NO RETRO_ENVIRONMENT_GET_VARIABLE case at all, so every
+// GetOption call falls back to its table default — "1.0". The throttle is
+// therefore UNCONDITIONAL in this build and the "uncapped ceiling" cannot be
+// observed without this cell.
+//
+// Cell 0 (the default) makes IsSpeedUnlimited byte-identical to before.
+// Boot.cpp:305-311 documents why unlimited must NOT be on during boot (the
+// freed EmuThread races emulated time -> MusyX DSP/AID service storm, MP4 init
+// starves at gc=0), so the page/probe must set this only in steady state.
+static constexpr uintptr_t kBemUncapCell = 0x026B3D10u;  // 0 = throttled (default)
+#endif
+
 bool CoreTimingManager::IsSpeedUnlimited() const
 {
+#if defined(__EMSCRIPTEN__)
+  if (*reinterpret_cast<volatile u32*>(kBemUncapCell) != 0u)
+    return true;
+#endif
   return m_throttle_adj_clock_per_sec == 0 || Core::GetIsThrottlerTempDisabled();
 }
 

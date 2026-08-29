@@ -1731,8 +1731,16 @@ error:
   }
 }
 
+// [opt-poll 2026-08-28] Did the frontend serve ANY variable at RegisterCache
+// time? Set once, immediately after SetVariables() has published the core's
+// option table (Init() at :1548), which is the exact moment the existing code
+// already queries every key — so this observes the same answer the old code did,
+// at the same time, without changing any query.
+static bool s_frontend_served_a_variable = false;
+
 void RegisterCache()
 {
+  s_frontend_served_a_variable = false;
   for (const retro_core_option_v2_definition* def = option_defs;
        def && def->key;
        ++def)
@@ -1740,7 +1748,10 @@ void RegisterCache()
     std::string val = def->default_value ? def->default_value : "";
     retro_variable var{ def->key, nullptr };
     if (::Libretro::environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+    {
       val = var.value;
+      s_frontend_served_a_variable = true;
+    }
     optionCache[def->key] = val;
   }
 }
@@ -1748,7 +1759,22 @@ void RegisterCache()
 void CheckForUpdatedVariables()
 {
   bool updated = false;
-  if (::Libretro::environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && !updated)
+  const bool supports_update_query =
+      ::Libretro::environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated);
+  if (supports_update_query && !updated)
+    return;
+
+  // [opt-poll 2026-08-28] Fast-out when the frontend implements NEITHER
+  // GET_VARIABLE_UPDATE nor GET_VARIABLE. That is this build's case: the wasm
+  // frontend's environment_cb (gamecube/dolphin-bridge/EmscriptenWorker.cpp:137)
+  // handles neither command, so the query below misses for every key and the
+  // scan can never mark anything dirty — yet the unsupported GET_VARIABLE_UPDATE
+  // returning false fell THROUGH the guard above and ran a full optionCache walk
+  // (a std::string temporary + an environ_cb call per key) on every call.
+  // Measured 4.4% of the render worker's self-time in /tmp/gp-UP1.log.
+  // A frontend that serves variables (RetroArch) takes neither branch and
+  // behaves exactly as before.
+  if (!supports_update_query && !s_frontend_served_a_variable)
     return;
 
   for (auto& [key, oldVal] : optionCache)
@@ -1768,6 +1794,16 @@ void CheckForUpdatedVariables()
 
 bool IsUpdated(const char* key)
 {
+  // [opt-poll 2026-08-28] optionDirty is written ONLY by CheckForUpdatedVariables
+  // (:1763). While it is empty no key can be dirty, so the lookup below is a
+  // guaranteed miss that still costs a std::string temporary (malloc + copy +
+  // hash) per call — optionDirty is keyed by std::string with no heterogeneous
+  // lookup. Measured 6.2% IsUpdated + 2.9% __hash_table::find + a share of the
+  // 6.7% malloc/free on the render worker in /tmp/gp-UP1.log. Semantics-identical
+  // on every frontend: an empty map cannot contain `key`.
+  if (optionDirty.empty())
+    return false;
+
   auto it = optionDirty.find(key);
   if (it != optionDirty.end() && it->second) {
     it->second = false; // consume the dirty flag
