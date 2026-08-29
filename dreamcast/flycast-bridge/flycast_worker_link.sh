@@ -11,7 +11,7 @@
 
 set -euo pipefail
 
-ROOT=/Users/caseybement/Bemental77.github.io
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"  # repo root, derived — no hardcode
 SRC=$ROOT/dreamcast/flycast-src
 BUILD=$SRC/build-wasm
 BRIDGE=$ROOT/dreamcast/flycast-bridge
@@ -59,12 +59,28 @@ EXPORTED_FUNCS='[
   "_sh4_mem_write32",
   "_sh4_interp_ifb",
   "_sh4_interp_shil_fb",
+  "_sh4_jit_lookup_idx",
+  "_flycast_set_chain",
+  "_flycast_set_ic",
+  "_flycast_set_self_loop",
+  "_flycast_set_rte_intc",
+  "_flycast_ctx_snapshot",
   "_flycast_diag_set",
   "_flycast_diag_ifb",
   "_flycast_set_interp_only",
+  "_flycast_set_mem_fastpaths",
+  "_flycast_set_regcache",
+  "_flycast_set_imm_fastpath",
+  "_flycast_set_interp_range",
+  "_flycast_run_iter_flag_ptr",
   "_flycast_interp_step_count",
   "_flycast_set_pc_trace_until",
-  "_flycast_get_sh4_pc"
+  "_flycast_get_sh4_pc",
+  "_sh4_import_fnptrs",
+  "_flycast_set_shard",
+  "_flycast_set_fog",
+  "_flycast_set_modvol",
+  "_flycast_guest_cycles"
 ]'
 
 EXPORTED_RUNTIME='[
@@ -136,28 +152,68 @@ ARCHIVES=(
 )
 
 # ---------------------------------------------------------------------------
-# Diagnostic gate. Two flags share the same env-var toggle:
-#   -DFLYCAST_BRIDGE_DIAG compiles in the per-memory-access [gdrom]/[lsb-trip]
-#     tracing in EmscriptenWorker.cpp. Drop the flag for release-style builds
-#     to collapse sh4_mem_read*/write* into zero-cost ReadMem*/WriteMem*
-#     wrappers (kills the runtime g_diag_enabled branch on every guest memory
-#     access).
-#   -DDEBUG_DISPATCH compiles in the per-dispatch instrumentation in
-#     rec_wasm.cpp::mainloop() (per-1000 PC sampler, PC ring buffer, region
-#     trap, one-shot instruction dumps, SPG diag counters, 5s [stats] flush,
-#     exception ring dump). Strips ~6 [stats]+sampler hot-path branches per
-#     dispatch when undefined.
+# BUILD FLAVOR GATE.  DEFAULT = RELEASE (clean).  Inverted 2026-08-28.
 #
-#   FLYCAST_RELEASE=1 bash flycast_worker_link.sh   # no DIAG/DEBUG_DISPATCH, faster
-#   bash flycast_worker_link.sh                     # both ON (probe-friendly)
+#   bash flycast_worker_link.sh                    # RELEASE (default) — clean;
+#                                                  #   the only flavor whose fps,
+#                                                  #   boot depth and wedge
+#                                                  #   behavior mean anything
+#   FLYCAST_DIAG=1       bash flycast_worker_link.sh   # DIAG — tracing, NOT measurable
+#   FLYCAST_MICROBENCH=1 bash flycast_worker_link.sh   # one batch timer / 10k dispatches
+#   FLYCAST_RELEASE=1    bash flycast_worker_link.sh   # no-op alias for the default
+#
+# WHY THE DEFAULT IS RELEASE — do not re-flip.  DIAG used to be the default and
+# it silently destroyed BOTH the perf numbers and the boot behavior.  Measured
+# 2026-08-28 on ONE unmodified tree, two links:
+#   DIAG    → /tmp/probe-dcx-load.log : 67,601 of 69,074 lines are the per-access
+#             [gdrom] trace (`grep -c '\[gdrom\]'` vs `wc -l`; the probe's own
+#             console-line accounting reported 51,867 of 53,319).  The guest never
+#             left the disc bootstrap (stuck at pc=0x8c00909a), ZERO frames
+#             rendered, 4 milestones — it read exactly like a boot wedge
+#             regressed in by unrelated code.
+#   RELEASE → /tmp/probe-dcx-dcrel.log: 604 lines, ZERO [gdrom], PSO booted,
+#             steady "fps=30 hw=30 video_cb=30/s clk=200MHz", 1940+ video_cb.
+# The trace is not merely noisy, it is an OBSERVER EFFECT — EmscriptenWorker.cpp:233-235
+# records that the DIAG [gdrom] trace "throttled a poll loop ~1000x and starved
+# the clock it was watching".  Nothing about timing, throughput, boot progress
+# or "it wedged" can be concluded from a DIAG log, ever.
+#
+# What each flag compiles in:
+#   -DFLYCAST_BRIDGE_DIAG — the per-memory-access [gdrom]/[lsb-trip] trace in
+#     EmscriptenWorker.cpp (gdrom_log_r / gdrom_log_w, guarded at :1200-1365 and
+#     called from the sh4_mem_read*/write* wrappers at :1369+).  Without it those
+#     wrappers collapse to plain ReadMem*/WriteMem* — no per-access branch.
+#   -DDEBUG_DISPATCH — per-dispatch instrumentation in rec_wasm.cpp::mainloop()
+#     (per-1000 PC sampler, PC ring buffer at :497-501, region trap, one-shot
+#     instruction dumps, SPG diag counters, 5s [stats] flush, exception ring).
+#
+# Both flags reach ONLY the four bridge TUs compiled on the emcc line below;
+# the static archives are flavor-independent, so switching flavors needs no
+# `emmake make` — a re-link is sufficient.
 # ---------------------------------------------------------------------------
-DIAG_FLAGS="-DFLYCAST_BRIDGE_DIAG -DDEBUG_DISPATCH"
-if [ -n "${FLYCAST_RELEASE:-}" ]; then
-  DIAG_FLAGS=""
-  echo "link: FLYCAST_RELEASE=1 — diagnostic trace OFF (no -DFLYCAST_BRIDGE_DIAG / -DDEBUG_DISPATCH)"
-else
-  echo "link: diagnostic trace ON (-DFLYCAST_BRIDGE_DIAG -DDEBUG_DISPATCH)"
+DIAG_FLAGS=""
+BUILD_FLAVOR="RELEASE"
+
+if [ -n "${FLYCAST_DIAG:-}" ]; then
+  DIAG_FLAGS="-DFLYCAST_BRIDGE_DIAG -DDEBUG_DISPATCH"
+  BUILD_FLAVOR="DIAG"
 fi
+
+# FLYCAST_RELEASE=1 — kept working as a NO-OP alias for the new default so the
+# existing docs and muscle memory don't break (CLAUDE.md:65, README.md:54,
+# DREAMCAST-60FPS-PROGRAM.md:85-86, dreamcast/docs/lever-3-inline-cache.md:199,
+# dreamcast/docs/option2-direct-dispatch/phase7-cleanup.md:289).  If BOTH vars
+# are set, RELEASE wins: per the incident above, an accidental DIAG build is the
+# expensive direction to be wrong in.
+if [ -n "${FLYCAST_RELEASE:-}" ]; then
+  if [ "$BUILD_FLAVOR" = "DIAG" ]; then
+    echo "link: WARNING — FLYCAST_RELEASE=1 and FLYCAST_DIAG=1 both set; RELEASE wins." >&2
+    echo "link:           Unset FLYCAST_RELEASE if you really want the diag trace." >&2
+    DIAG_FLAGS=""
+  fi
+  BUILD_FLAVOR="RELEASE"
+fi
+
 # FLYCAST_MICROBENCH=1 — clean per-dispatch cost measurement (phase6 §2).
 # Forces the release/clean dispatch path (NO DEBUG_DISPATCH per-dispatch
 # timing, NO diag samplers) and compiles in exactly ONE batch timer per 10k
@@ -165,9 +221,75 @@ fi
 # point is to measure dispatch cost WITHOUT the ~11 emscripten_get_now()/
 # dispatch + ring-write samplers the diag path adds (which dominate the diag
 # build's own "[cost-breakdown]"). Emits "[mbench] per_dispatch_us=...".
+# Deliberately evaluated LAST so it overrides both vars above.
 if [ -n "${FLYCAST_MICROBENCH:-}" ]; then
   DIAG_FLAGS="-DDISPATCH_MICROBENCH"
-  echo "link: FLYCAST_MICROBENCH=1 — clean per-dispatch microbench ON (DEBUG_DISPATCH OFF)"
+  BUILD_FLAVOR="MICROBENCH"
+fi
+
+# ---------------------------------------------------------------------------
+# Flavor banner. Printed TWICE on purpose: once here (full link transcript) and
+# again as the LAST lines the script emits.
+#
+# The repeat is load-bearing, not decoration: the canonical loop runs this
+# script as `bash "$LINK_SCRIPT" 2>&1 | tail -3` (build_and_probe.sh:98), so
+# only the final THREE lines of output ever reach the terminal.  A warning
+# printed at the top is invisible exactly where the decision gets made — which
+# is why the pre-existing one-line `echo` did not prevent the 2026-08-28
+# incident.  The DIAG banner therefore ends with three self-contained warning
+# lines and NO closing rule, so `tail -3` shows warning text and nothing else.
+# ---------------------------------------------------------------------------
+banner_flavor() {
+  case "$BUILD_FLAVOR" in
+    DIAG)
+      echo "################################################################################"
+      echo "###                                                                          ###"
+      echo "###   D I A G   B U I L D   —   T H I S   B I N A R Y   C A N N O T   B E    ###"
+      echo "###                    M E A S U R E D   O R   T R U S T E D                 ###"
+      echo "###                                                                          ###"
+      echo "###   defines: -DFLYCAST_BRIDGE_DIAG -DDEBUG_DISPATCH   (FLYCAST_DIAG=1)     ###"
+      echo "###                                                                          ###"
+      echo "###   Measured 2026-08-28, same tree, DIAG vs RELEASE:                       ###"
+      echo "###     DIAG    67,601 / 69,074 log lines were the per-access [gdrom] trace, ###"
+      echo "###             guest stuck in the disc bootstrap at pc=0x8c00909a,          ###"
+      echo "###             ZERO frames, 4 milestones — looked like a boot wedge.        ###"
+      echo "###     RELEASE 604 log lines, PSO booted, fps=30 hw=30 video_cb=30/s.       ###"
+      echo "###                                                                          ###"
+      echo "###   From a DIAG run you may NOT conclude: an fps / MHz / disp-per-second   ###"
+      echo "###   number, 'it regressed', 'it wedged', 'no frames', or a boot depth.     ###"
+      echo "###   The trace throttles the very poll loop it observes                     ###"
+      echo "###   (EmscriptenWorker.cpp:232-235).                                        ###"
+      echo "###                                                                          ###"
+      echo "################################################################################"
+      echo "!!! DIAG BUILD: per-access [gdrom] tracing is ON — it floods the console,     !!!"
+      echo "!!! stalls the guest in the disc bootstrap (zero frames), and INVALIDATES     !!!"
+      echo "!!! every timing number. Re-link with NO env var before measuring anything.   !!!"
+      ;;
+    MICROBENCH)
+      echo "link: flavor=MICROBENCH (-DDISPATCH_MICROBENCH; DIAG + DEBUG_DISPATCH OFF)"
+      echo "link: the ONLY valid output is '[mbench] per_dispatch_us=…'; fps from this"
+      echo "link: build is still clean, but the batch timer is the measurement of record."
+      ;;
+    *)
+      echo "link: flavor=RELEASE — clean (no -DFLYCAST_BRIDGE_DIAG / -DDEBUG_DISPATCH)."
+      echo "link: perf, boot depth and wedge behavior from this binary are valid."
+      echo "link: set FLYCAST_DIAG=1 for the [gdrom]/dispatch trace (not measurable)."
+      ;;
+  esac
+}
+banner_flavor
+
+# FLYCAST_NO_ASYNCIFY=1 — lever-8 experimental arm: link WITHOUT asyncify.
+# The charter (Phase-3 #3) prescribes measuring the whole-module asyncify
+# instrumentation tax on an A/B link; nasomers banked +37% from
+# ASYNCIFY_REMOVE alone. Our only remaining async import is __syscall_poll's
+# proxied-pthread arm; the shim's suspension guards no-op when nothing
+# suspends. If boot/runtime needs a real suspension, the probe will show
+# exactly where — restructure that site instead (charter instruction).
+ASYNCIFY_FLAGS=(-sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=131072 -sASYNCIFY_REMOVE='["sh4_mem_read8","sh4_mem_read16","sh4_mem_read32","sh4_mem_write8","sh4_mem_write16","sh4_mem_write32","sh4_interp_ifb","sh4_interp_shil_fb","sh4_jit_lookup_idx","flycast_ctx_snapshot"]')
+if [ -n "${FLYCAST_NO_ASYNCIFY:-}" ]; then
+  ASYNCIFY_FLAGS=(-sASYNCIFY=0)
+  echo "link: FLYCAST_NO_ASYNCIFY=1 — lever-8 experimental arm (no asyncify instrumentation)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -189,7 +311,12 @@ emcc \
   $BRIDGE/EmscriptenWorker.cpp \
   $BRIDGE/flycast_stubs.cpp \
   $BRIDGE/rec_wasm.cpp \
+  $BRIDGE/arm7_rec_wasm.cpp \
   $DIAG_FLAGS \
+  `# Flavor string as a preprocessor define, so the bridge can print the` \
+  `# flavor from C++ (see the one-line emscripten_worker_init patch in the` \
+  `# runtime-marker block at the bottom of this script). Unused TUs ignore it.` \
+  -DFLYCAST_BUILD_FLAVOR=\"$BUILD_FLAVOR\" \
   -I $SRC/core \
   -I $SRC/core/deps \
   -I $SRC/core/deps/nowide/include \
@@ -228,13 +355,16 @@ emcc \
   `# blocks emit their own return_call bytes via WasmModuleBuilder.` \
   -matomics -mbulk-memory \
   -sIMPORTED_MEMORY=1 \
-  -sINITIAL_MEMORY=536870912 \
+  `# 128MB not 512MB: the framebuffer + audio ring are heap-allocated by the` \
+  `# worker (onRuntimeInitialized) instead of parked at ~496MB, so the` \
+  `# up-front commit need not span them. MUST match the WebAssembly.Memory` \
+  `# initial= in dreamcast.html.` \
+  -sINITIAL_MEMORY=134217728 \
   -sMAXIMUM_MEMORY=4294967296 \
   -sALLOW_MEMORY_GROWTH=1 \
   -sALLOW_TABLE_GROWTH=1 \
   -sPTHREAD_POOL_SIZE=8 \
-  -sASYNCIFY=1 \
-  -sASYNCIFY_REMOVE='["sh4_mem_read8","sh4_mem_read16","sh4_mem_read32","sh4_mem_write8","sh4_mem_write16","sh4_mem_write32","sh4_interp_ifb","sh4_interp_shil_fb"]' \
+  "${ASYNCIFY_FLAGS[@]}" \
   -sUSE_WEBGL2=1 \
   -sFULL_ES3=1 \
   -sMIN_WEBGL_VERSION=2 \
@@ -273,3 +403,83 @@ echo "linked: $OUT/flycast_worker_emcc.{js,wasm}"
 sed -i '' 's|// Note that transferredCanvasNames might be null (so we cannot do a for-of loop)\.$|// Note that transferredCanvasNames might be null (so we cannot do a for-of loop).\
   if (!transferredCanvasNames) transferredCanvasNames = [];  // PATCH: Emscripten 3.1.67 missing null guard|' "$OUT/flycast_worker_emcc.js"
 echo "patched: transferredCanvasNames null-guard"
+
+# ---------------------------------------------------------------------------
+# Post-build patch: WebGL2 bufferSubData rejects a source view backed by a
+# RESIZABLE ArrayBuffer ("The provided ArrayBuffer value must not be
+# resizable"). Under -sALLOW_MEMORY_GROWTH the emscripten heap (HEAPU8) is
+# exactly that, so flycast's OpenGLRenderer::Render() vertex upload threw a
+# TypeError that unwound out of run_iter and PERMANENTLY STOPPED the emulation
+# pump — the guest free-ran to the PSO title render, then wedged (frozen
+# credit/sched, which read as an SR-mask livelock but was a corpse). Copy the
+# range into a fresh non-resizable buffer via .slice() before the upload.
+# ROOT FIX BELONGS UPSTREAM (emscripten glue / a memory-growth-aware GL path);
+# this sed is the port-local durable fix. No-op if the glue shape changes.
+# ---------------------------------------------------------------------------
+sed -i '' 's|GLctx.bufferSubData(target, offset, src.subarray(data, data + size));|GLctx.bufferSubData(target, offset, src.slice(data, data + size));  /* PATCH: growable-heap ArrayBuffer is resizable; WebGL2 needs a non-resizable copy */|' "$OUT/flycast_worker_emcc.js"
+echo "patched: bufferSubData resizable-ArrayBuffer copy"
+
+# Same resizable-ArrayBuffer trap on TEXTURE uploads: emscriptenWebGLGetTexPixelData
+# returns HEAP.subarray(...) (a view on the growable heap) which texImage2D/
+# texSubImage2D reject once the heap has grown. Copy to a non-resizable buffer via
+# .slice(). Hardening (matches the bufferSubData fix); fixes any post-growth texture
+# upload that would otherwise silently fail. No-op if the glue shape changes.
+sed -i '' 's|return heap.subarray(toTypedArrayIndex(pixels, heap) >>> 0, toTypedArrayIndex(pixels + bytes, heap) >>> 0);|return heap.slice(toTypedArrayIndex(pixels, heap) >>> 0, toTypedArrayIndex(pixels + bytes, heap) >>> 0);  /* PATCH: growable-heap view is resizable; WebGL2 texImage needs a non-resizable copy */|' "$OUT/flycast_worker_emcc.js"
+echo "patched: texImage2D resizable-ArrayBuffer copy"
+
+# ---------------------------------------------------------------------------
+# Post-build patch: RUNTIME BUILD-FLAVOR MARKER.
+#
+# A probe log has to be judgeable on its OWN evidence. /tmp/probe-dcx-*.log
+# carries no record of how the binary was linked, so a DIAG log and a RELEASE
+# log are indistinguishable artifacts of "the same experiment" — that is how the
+# 2026-08-28 DIAG log got read as a boot regression. Every run now prints
+# exactly one line before the runtime comes up:
+#
+#   [build] flavor=RELEASE defines=none linked=… (clean — perf and boot valid)
+#   [build] flavor=DIAG defines=-DFLYCAST_BRIDGE_DIAG -DDEBUG_DISPATCH linked=… *** … ***
+#
+# Route (verified by reading each hop): worker postMessage({cmd:'print'}) →
+# dreamcast.html:155 `case 'print': pageLog(d.txt)` → pageLog's console.log
+# (dreamcast.html:78) → flycast_probe.js:260 `page.on('console')` → probe log.
+# A bare console.log from the worker would NOT do: the probe subscribes to the
+# PAGE's console only, so the postMessage hop is the one that matters; the
+# console.log is kept for a human with DevTools open on the worker.
+#
+# Guarded on globalThis.name !== 'em-pthread': pthread children load this same
+# file (flycast_worker.js:54-57) and their postMessage goes to the emcc parent
+# protocol, which swallows unknown commands.
+#
+# The text is deliberately free of /RuntimeError|Uncaught|ABORT:/ and of
+# "video_cb", so flycast_probe.js:198-207 classify() neither flags it as a
+# fatal nor counts it as a frame, and isNoise() (:183-195) does not drop it.
+#
+# Post-hoc artifact check, no rebuild needed:
+#   grep -c -a "flavor=DIAG" dreamcast/flycast_libretro/flycast_worker_emcc.js
+# (Independent tell, since EM_ASM bodies are extracted into the glue: a DIAG
+#  build's glue also contains the literal "[gdrom] R". On the RELEASE artifact
+#  currently on disk both greps return 0 — verified 2026-08-28.)
+# ---------------------------------------------------------------------------
+MARKER_NOTE=" (clean — perf, boot depth and wedge behavior are valid)"
+if [ "$BUILD_FLAVOR" = "DIAG" ]; then
+  MARKER_NOTE=" *** DIAG BUILD: per-access [gdrom] trace ON — this log CANNOT support any fps / timing / boot-depth / wedge claim ***"
+elif [ "$BUILD_FLAVOR" = "MICROBENCH" ]; then
+  MARKER_NOTE=" (microbench — [mbench] per_dispatch_us is the measurement of record)"
+fi
+cat >> "$OUT/flycast_worker_emcc.js" <<MARKER_EOF
+
+// --- build-flavor marker — INJECTED by flycast_worker_link.sh, do not hand-edit ---
+if (typeof globalThis !== 'undefined' && globalThis.name !== 'em-pthread') {
+  var __flycastBuildMarker = '[build] flavor=$BUILD_FLAVOR defines=${DIAG_FLAGS:-none} linked=$(date -u '+%Y-%m-%dT%H:%M:%SZ')$MARKER_NOTE';
+  try { console.log(__flycastBuildMarker); } catch (e) {}
+  try { postMessage({ cmd: 'print', txt: __flycastBuildMarker }); } catch (e) {}
+}
+MARKER_EOF
+echo "patched: runtime [build] flavor marker — every probe log now self-identifies"
+
+# ---------------------------------------------------------------------------
+# Final flavor banner. This repeat is the one that survives
+# `bash "$LINK_SCRIPT" 2>&1 | tail -3` in build_and_probe.sh:98 — see the
+# banner_flavor definition above for why that matters.
+# ---------------------------------------------------------------------------
+banner_flavor

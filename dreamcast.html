@@ -149,6 +149,8 @@
     #mobileSplash select, #mobileSplash button { font-size: 16px; padding: 12px 20px; min-width: 240px; border-radius: 8px; border: 1px solid #444; background: #222; color: #fff; -webkit-appearance: none; }
     #mobileSplash button#mobileSplashStart { background: #2a6b4a; border-color: #2a6b4a; cursor: pointer; z-index: 3000; position: relative; }
     #mobileSplash .rotateTip { font-size: 12px; opacity: 0.55; margin-top: 8px; }
+    #mobileSplash button.linkBtn { background: none; border: none; color: #7aa7d8; font-size: 13px;
+      min-width: 0; padding: 10px 16px; text-decoration: underline; }
     /* The reserved top strip — a ROW, not an overlay (see the layout contract).
        One line, clipped with an ellipsis: the mirrored status + rate text is
        unbounded and used to wrap across the picture. */
@@ -168,14 +170,73 @@
        log (z 2500) covered #mobileBottom (z 10), so once the log was force-shown
        on a failure the ≡ button that turns it off was unreachable — the same
        "an overlay hides working UI" shape as the stuck #rotateHint. */
+    /* A column, not a plain <pre>: the top row is a PINNED verdict block that
+       never scrolls (see #mobileLogHead / .vd below) and the tail scrolls
+       underneath it. A screenshot of the force-shown log therefore always
+       carries the fields that decide the diagnosis, instead of whatever 15
+       heartbeat lines happened to be at the bottom. */
     #mobileLog { display: none; position: absolute; left: 0; right: 0; bottom: var(--dc-bottom-strip);
-      max-height: 45%; overflow-y: auto; -webkit-overflow-scrolling: touch;
+      max-height: 55%; flex-direction: column; overflow: hidden;
       touch-action: pan-y; margin: 0; padding: 6px 8px 10px; box-sizing: border-box;
       background: rgba(0,0,0,0.88); color: #9f9; border-top: 1px solid #2a6b4a;
       font: 10px/1.35 ui-monospace, Menlo, monospace; white-space: pre-wrap;
       word-break: break-word; z-index: 2500; }
-    #mobileShell.log-on #mobileLog { display: block; }
+    #mobileShell.log-on #mobileLog { display: flex; }
+    #mobileLogHead { flex: 0 0 auto; border-bottom: 1px solid #2a6b4a;
+      padding-bottom: 5px; margin-bottom: 5px; }
+    /* The scroller moved from #mobileLog to this inner element, so the
+       touch-action that made it pannable has to move with it — #mobileShell
+       sets `touch-action: none` for the game controls. */
+    #mobileLogBody { flex: 1 1 auto; overflow-y: auto; -webkit-overflow-scrolling: touch;
+      touch-action: pan-y; margin: 0; font: inherit; color: inherit;
+      white-space: pre-wrap; word-break: break-word; }
     #mobileMenu { z-index: 2600; }
+    /* Persistent alert strip. A toast auto-hides after 2.5 s, which is fine for
+       "state saved" and useless for a condition that is permanent: WebGL
+       context loss is unrecoverable here (Flycast does not rebuild its GL
+       objects on restore — the worker's own [glinfo] line says so), so the
+       canvas stays black forever while the page still looks alive. That is
+       indistinguishable from the reported "freezes with a black screen", so it
+       gets a strip that stays up and opens the diagnostics on tap. */
+    #alertBar { display: none; position: fixed; left: 0; right: 0; z-index: 4500;
+      top: max(0px, env(safe-area-inset-top, 0px));
+      background: #7a1d1d; color: #ffe9e9; border-bottom: 2px solid #ff7b72;
+      padding: 7px 12px; text-align: center;
+      font: 700 12px/1.4 ui-monospace, Menlo, monospace; }
+    #alertBar.on { display: block; }
+    /* ---- Diagnostic export panel -------------------------------------------
+       The ONE artifact a phone user can send back. Full-screen and independent
+       of the mobile shell for the same reason #fatal is: it has to work when
+       the shell was never wired up. The VERDICT block is pinned at the top and
+       never scrolls — the fields that decide the diagnosis (WebGL2, granted
+       stencil, the depth-stencil FBO, the memory rung, how far the boot got)
+       must be in the FIRST screenful, not buried in a tail. */
+    #diag { display: none; position: fixed; inset: 0; z-index: 5500; flex-direction: column;
+      background: #0d1117; color: #e6edf3;
+      padding: max(10px, env(safe-area-inset-top, 0px)) 10px calc(10px + env(safe-area-inset-bottom, 0px));
+      font: 13px/1.45 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; }
+    #diag.on { display: flex; }
+    #diag h4 { margin: 0 0 6px; font-size: 15px; color: #9cf; }
+    #diagScroll { flex: 1 1 auto; min-height: 0; overflow: auto; -webkit-overflow-scrolling: touch; }
+    #diagHow { margin: 8px 0 0; font-size: 12px; line-height: 1.5; color: #9aa6b2; }
+    #diagHow b { color: #e6edf3; }
+    /* Pinned outside the scroller, so Share is reachable at any viewport height. */
+    #diagActions { flex: 0 0 auto; display: flex; gap: 8px; flex-wrap: wrap; margin: 9px 0 0; }
+    #diagActions button { flex: 1 1 auto; min-width: 92px; min-height: 44px; padding: 11px 10px;
+      border: 1px solid #30363d; background: #21262d; color: #e6edf3; border-radius: 7px; font-size: 14px; }
+    #diagActions button.primary { background: #2a6b4a; border-color: #3fa06e; }
+    #diagBody { margin: 8px 0 0;
+      background: #010409; border: 1px solid #30363d; border-radius: 6px; padding: 8px;
+      font: 10px/1.35 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-word;
+      -webkit-user-select: text; user-select: text; }
+    /* Verdict grid — shared by #diag, #fatal and the mobile log's pinned head. */
+    .vd { display: grid; grid-template-columns: auto 1fr; gap: 1px 8px; align-items: baseline;
+      font: 11px/1.5 ui-monospace, Menlo, monospace; }
+    .vd .n { color: #7d8590; white-space: nowrap; }
+    .vd .v { color: #e6edf3; word-break: break-word; }
+    .vd .v.bad  { color: #ff7b72; font-weight: 700; }
+    .vd .v.warn { color: #ffa657; font-weight: 700; }
+    .vd .v.good { color: #7ee787; }
     /* Hard-stop panel. A phone user has no DevTools, so "this browser can't run
        it" / "the memory allocation was refused" has to be a PAGE, not a
        console line. Deliberately independent of #mobileShell: the shell is not
@@ -201,7 +262,27 @@
 <body>
 <div id="toast"></div>
 <div id="armBanner"></div>
+<div id="alertBar"></div>
 <div id="fatal"></div>
+<div id="diag">
+  <!-- One scrolling column with the buttons pinned OUTSIDE it. A phone in
+       landscape is ~390 px tall; a fixed header tall enough to hold the verdict
+       would push the Share button off the bottom, which would make the export
+       unreachable on exactly the device this exists for. -->
+  <div id="diagScroll">
+    <h4>Dreamcast diagnostics</h4>
+    <div class="vd" id="diagVerdict"></div>
+    <p id="diagHow">Tap <b>Share report</b> and send it to Casey. If sharing is blocked, tap
+      <b>Copy</b> and paste it into a message — or screenshot this screen, starting at the top.</p>
+    <pre id="diagBody"></pre>
+  </div>
+  <div id="diagActions">
+    <button type="button" id="diagShare" class="primary">Share report</button>
+    <button type="button" id="diagCopy">Copy</button>
+    <button type="button" id="diagCopyAll">Copy full log</button>
+    <button type="button" id="diagClose">Close</button>
+  </div>
+</div>
 <div id="wrap">
   <h3>Dreamcast Wasm</h3>
   <div id="controlBar">
@@ -219,6 +300,7 @@
     <button id="btnResetAudio" disabled>↻ Reset Audio</button>
     <button id="btnFull" disabled>⛶ Fullscreen</button>
     <button id="btnLog"   type="button">Toggle Log</button>
+    <button id="btnDiag"  type="button">🩺 Diagnostics</button>
     <button id="btnControls" type="button">🎮 Controls</button>
     <div id="controlsOverlay" style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.72);align-items:center;justify-content:center;">
       <div style="background:#1b1b1f;color:#eee;border:1px solid #444;border-radius:10px;padding:20px 26px;max-width:460px;font:14px/1.7 system-ui,sans-serif;box-shadow:0 8px 40px rgba(0,0,0,.6);">
@@ -248,6 +330,10 @@
     <select id="mobileRomSelect"><option value="pso2">Phantasy Star Online Ver. 2 (USA)</option></select>
     <button id="mobileSplashStart" type="button">Start</button>
     <p class="rotateTip">Rotate to landscape for the best view.</p>
+    <!-- The splash covers #mobileBottom, so before Start the ≡ menu (and with
+         it the Diagnostics entry) is unreachable. A boot that dies here would
+         otherwise be reportable only by whatever auto-opens. -->
+    <button id="mobileSplashDiag" type="button" class="linkBtn">🩺 Diagnostics</button>
   </div>
   <div id="mobileScreen"></div>
   <div class="mobileSide left">
@@ -273,7 +359,7 @@
     <div class="sysBtn" id="mobileStart">Start</div>
   </div>
   <div id="mobileHideHint" title="Show controls">≡</div>
-  <pre id="mobileLog"></pre>
+  <div id="mobileLog"><div class="vd" id="mobileLogHead"></div><pre id="mobileLogBody"></pre></div>
   <div id="mobileMenu">
     <div id="mobileMenuBox">
       <h6>Menu</h6>
@@ -281,7 +367,7 @@
       <button id="mMute">Mute</button><button id="mResetAudio">Reset Audio</button>
       <button id="mGhost">Transparent Controls: Off</button>
       <button id="mHide">Hide Controls: Off</button>
-      <button id="mLog">Show Log: Off</button><button id="mCopyLog">Copy Log</button>
+      <button id="mLog">Show Log: Off</button><button id="mDiag">🩺 Diagnostics</button>
       <button id="mFull">Fullscreen</button><button id="mClose">Close</button>
     </div>
   </div>
@@ -300,13 +386,93 @@
   const LOG_TAIL_MAX = 300;
   const logTail = [];
   let mobileLogOn = false;
+
+  // Never throws, never returns undefined. Used everywhere the report reads a
+  // value that may not exist yet: the report can be built from the global error
+  // handler on line 1 of the boot, long before most of this file's `let`s have
+  // been evaluated (touching one in its temporal dead zone throws a
+  // ReferenceError). A diagnostic that dies while diagnosing is worthless.
+  function safe(fn, dflt) {
+    try { const v = fn(); return (v === undefined || v === null) ? dflt : v; }
+    catch (_) { return dflt; }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Boot milestones + pinned facts.
+  //
+  // Two things the 300-line rolling tail structurally cannot carry, and both of
+  // them decide the diagnosis:
+  //
+  //  1. THE HIGHEST-SIGNAL LINES ARE EMITTED EARLIEST AND SCROLL OUT.
+  //     `[glinfo] granted attrs ... stencil=` is printed once, by the worker, at
+  //     GL-context creation. The heartbeat then writes a line every 2 s, so any
+  //     session that fails a few minutes in — and every ?diag=1 run, which logs
+  //     orders of magnitude faster — evicts it. The report would then arrive
+  //     without the single field it exists to carry. So: sniff the stream as it
+  //     goes past and pin the interesting lines in a store nothing evicts.
+  //     Sniffing the log rather than asking the worker is deliberate — worker
+  //     'print' lines land here already, so this needs no worker change and
+  //     cannot go out of sync with one.
+  //  2. "HOW FAR DID IT GET" IS NOT IN THE TAIL AT ALL. A freeze before the
+  //     first frame and a freeze after the character look identical in a
+  //     screenshot of the last 15 lines. Stamp the stages.
+  // ---------------------------------------------------------------------------
+  const T0 = Date.now();
+  const marks = [];
+  function mark(name) {
+    marks.push({ t: Date.now() - T0, name: name });
+    if (marks.length > 64) marks.splice(1, 1);   // keep the first; drop from the middle
+  }
+  mark('page-script-start');
+
+  const facts = Object.create(null);      // last-value-wins strings
+  const counters = Object.create(null);   // tallies
+  function bump(k) { counters[k] = (counters[k] | 0) + 1; }
+  function sniff(s) {
+    if (typeof s !== 'string') return;
+    if (s.indexOf('[glinfo]') >= 0) {
+      if (s.indexOf('granted attrs') >= 0)         facts.glAttrs   = s;
+      else if (s.indexOf('gpu masked') >= 0)       facts.glGpu     = s;
+      else if (s.indexOf('limits ') >= 0)          facts.glLimits  = s;
+      else if (s.indexOf('drawingBuffer') >= 0)    facts.glDrawBuf = s;
+      else if (s.indexOf('extensions:') >= 0)      facts.glExts    = s.slice(0, 500);
+      else if (s.indexOf('returned NULL') >= 0)  { facts.glNull = s; bump('glContextNull'); }
+      else if (s.indexOf('CONTEXT LOST') >= 0)   { facts.glLost = s; bump('glContextLost'); }
+      else if (s.indexOf('context restored') >= 0) bump('glContextRestored');
+      else if (s.indexOf('context report failed') >= 0) facts.glReportFailed = s;
+    }
+    if (s.indexOf('[glcompat]') >= 0) {
+      bump('glcompatLines');
+      if (s.indexOf('GL_INVALID_ENUM') >= 0) facts.glInvalidEnum = s;
+      else facts.glcompat = s;
+    }
+    if (s.indexOf('INCOMPLETE framebuffer') >= 0) {
+      bump('incompleteFBO');
+      if (!facts.fboIncomplete) facts.fboIncomplete = s;
+    }
+    if (/factory rejected|ABORT:|importScripts failed|global missing after importScripts|runtime-init threw/.test(s)) {
+      bump('coreStartupError');
+      if (!facts.coreError) facts.coreError = s;
+    }
+    // Memory pressure has many spellings across engines; catch the family.
+    if (/out of memory|Array buffer allocation failed|allocation size overflow|RangeError/i.test(s)) {
+      bump('memoryPressureLines');
+      if (!facts.memoryPressure) facts.memoryPressure = s;
+    }
+  }
+
   function renderMobileLog() {
-    const m = document.getElementById('mobileLog');
-    if (!m) return;
-    m.textContent = logTail.join('\n');
-    m.scrollTop = m.scrollHeight;
+    const body = document.getElementById('mobileLogBody');
+    if (body) {
+      body.textContent = logTail.join('\n');
+      body.scrollTop = body.scrollHeight;
+    }
+    // The pinned verdict above the tail. Cheap enough to redraw with the tail,
+    // and it must not go stale — a screenshot of it is the deliverable.
+    paintVerdict(document.getElementById('mobileLogHead'));
   }
   function pageLog(s) {
+    sniff(s);
     if (logEl) {
       logEl.textContent += s + '\n';
       logEl.scrollTop = logEl.scrollHeight;
@@ -367,7 +533,426 @@
       ' screen=' + screen.width + 'x' + screen.height +
       ' dpr=' + (window.devicePixelRatio || 1) +
       ' cores=' + (n.hardwareConcurrency || '?') +
-      ' deviceMemory=' + (n.deviceMemory === undefined ? '?' : n.deviceMemory + 'GB');
+      ' deviceMemory=' + (n.deviceMemory === undefined ? '?' : n.deviceMemory + 'GB') +
+      ' orientation=' + safe(() => screen.orientation.type, '?') +
+      ' jsHeapLimit=' + safe(() => (performance.memory.jsHeapSizeLimit >>> 20) + 'MB', '?') +
+      ' standalone=' + safe(() => String(!!navigator.standalone), '?') +
+      ' lang=' + safe(() => n.language, '?');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Page-side WebGL2 probe. Runs on EVERY load, before anything can fail.
+  //
+  // Why the page does this itself instead of relying on the worker's [glinfo]:
+  // the worker's report only exists if the worker got as far as creating its
+  // context. Every failure BEFORE that point — a refused memory, a rejected
+  // instantiation, a worker that never loaded — produces a report with no GPU
+  // facts in it at all, which is precisely the case we most need to diagnose.
+  // This answers "does this device have WebGL2, and on what GPU" unconditionally.
+  //
+  // It also settles the PRIME SUSPECT directly. Flycast drives modifier volumes
+  // entirely through the stencil buffer, and the black-out quad in
+  // core/rend/gl4/gldraw.cpp paints the whole frame when the stencil plane is
+  // not doing its job — a frame that goes black after geometry has been drawn.
+  // `stencil: true` being GRANTED is necessary but not sufficient: the driver
+  // must also complete a depth-stencil FBO, and gles.cpp picks the format from
+  // the vendor string (GL_DEPTH24_STENCIL8 on Mali, GL_DEPTH32F_STENCIL8
+  // elsewhere), so BOTH are tested here rather than assumed.
+  //
+  // Costs a 1x1 context that is explicitly lost again straight away, and the
+  // whole thing is wrapped so a driver that dislikes any of it cannot take the
+  // boot down with it.
+  // ---------------------------------------------------------------------------
+  function probeWebGL2() {
+    const out = { ok: false };
+    let gl = null;
+    try {
+      const c = document.createElement('canvas');
+      c.width = c.height = 1;
+      // Same attribute set the renderer cares about. If a device refuses the
+      // context for THESE attrs but grants it for a plainer set, that is itself
+      // the finding — so record both.
+      gl = c.getContext('webgl2', { alpha: false, depth: true, stencil: true,
+                                    antialias: false, preserveDrawingBuffer: false });
+      if (!gl) {
+        out.err = 'getContext("webgl2", {depth,stencil}) returned null';
+        try {
+          out.plainWebgl2 = !!c.getContext('webgl2');
+          out.webgl1 = !!(c.getContext('webgl') || c.getContext('experimental-webgl'));
+        } catch (_) {}
+        return out;
+      }
+      out.ok = true;
+      const a = safe(() => gl.getContextAttributes(), {}) || {};
+      out.stencil = !!a.stencil; out.depth = !!a.depth; out.antialias = !!a.antialias;
+      out.maxTex     = safe(() => gl.getParameter(gl.MAX_TEXTURE_SIZE), '?');
+      out.maxRB      = safe(() => gl.getParameter(gl.MAX_RENDERBUFFER_SIZE), '?');
+      out.maxSamples = safe(() => gl.getParameter(gl.MAX_SAMPLES), '?');
+      out.maxVarying = safe(() => gl.getParameter(gl.MAX_VARYING_VECTORS), '?');
+      out.maxFragUni = safe(() => gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS), '?');
+      const dbg = safe(() => gl.getExtension('WEBGL_debug_renderer_info'), null);
+      out.vendor   = String(dbg ? safe(() => gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL), '?')
+                                : safe(() => gl.getParameter(gl.VENDOR), '?'));
+      out.renderer = String(dbg ? safe(() => gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL), '?')
+                                : safe(() => gl.getParameter(gl.RENDERER), '?'));
+      out.masked   = !dbg;
+      const exts = safe(() => gl.getSupportedExtensions(), []) || [];
+      out.extCount = exts.length;
+      out.colorBufferFloat = exts.indexOf('EXT_color_buffer_float') >= 0;
+      out.floatBlend       = exts.indexOf('EXT_float_blend') >= 0;
+      // Does a depth-stencil FBO actually COMPLETE on this driver? Granting the
+      // stencil attribute on the default framebuffer does not imply it.
+      function fboStatus(fmt) {
+        const fb = gl.createFramebuffer(), tex = gl.createTexture(), rb = gl.createRenderbuffer();
+        try {
+          gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 64, 64, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+          gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+          gl.renderbufferStorage(gl.RENDERBUFFER, fmt, 64, 64);
+          gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_STENCIL_ATTACHMENT, gl.RENDERBUFFER, rb);
+          const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+          return st === gl.FRAMEBUFFER_COMPLETE ? 'COMPLETE' : ('0x' + st.toString(16));
+        } catch (e) {
+          return 'threw: ' + (e && e.message ? e.message : String(e));
+        } finally {
+          try { gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                gl.deleteFramebuffer(fb); gl.deleteTexture(tex); gl.deleteRenderbuffer(rb); } catch (_) {}
+        }
+      }
+      out.fboD24S8  = fboStatus(gl.DEPTH24_STENCIL8);    // gles.cpp uses this when gl.mali
+      out.fboD32FS8 = fboStatus(gl.DEPTH32F_STENCIL8);   // ...and this everywhere else
+      out.glError = safe(() => '0x' + gl.getError().toString(16), '?');
+    } catch (e) {
+      out.err = (out.err || '') + 'probe threw: ' + (e && e.message ? e.message : String(e));
+    } finally {
+      // Hand the context straight back — the emulator gets the only one that
+      // matters, and on a phone contexts are a scarce resource.
+      try { const l = gl && gl.getExtension('WEBGL_lose_context'); if (l) l.loseContext(); } catch (_) {}
+    }
+    return out;
+  }
+  // ?noglprobe=1 skips it. The probe takes a real GL context on the same GPU
+  // the emulator is about to use, and iOS keeps a small pool of them; it is
+  // handed straight back via WEBGL_lose_context, but if the probe itself ever
+  // turns out to be the thing that breaks a device, there has to be a way to
+  // take it out without a deploy.
+  const GLPROBE = new URLSearchParams(location.search).has('noglprobe')
+    ? { ok: false, err: 'skipped by ?noglprobe=1' }
+    : safe(probeWebGL2, { ok: false, err: 'probe threw before returning' });
+
+  // The memory-ladder outcome, recorded structurally rather than only as prose
+  // in the log, so the report can state the rung without parsing English.
+  const memInfo = { initMB: 0, wantMaxMB: 0, gotMaxMB: 0, rung: 0, rungs: 0,
+                    reduced: false, err: null, text: '' };
+
+  // ---------------------------------------------------------------------------
+  // VERDICT — the fields that decide the diagnosis, in the first screenful.
+  // Rendered identically into the diagnostics panel, the hard-stop panel and
+  // the pinned head of the mobile log, so any screenshot of any of the three
+  // carries them.
+  // ---------------------------------------------------------------------------
+  function frameSummary() {
+    const parts = [];
+    parts.push(safe(() => booted, false) ? 'started' : 'not started');
+    const fps = safe(() => lastFps, null), calls = safe(() => lastCalls, null);
+    if (fps !== null) parts.push(fps + ' distinct fps / ' + calls + ' fields per s');
+    const gx = safe(() => guestRateX(), 0);
+    if (gx) parts.push('guest ' + gx.toFixed(3) + 'x');
+    const pc = safe(() => lastPc, 0);
+    if (pc) parts.push('pc 0x' + pc.toString(16));
+    return parts.join(', ');
+  }
+  // THE PRIME SUSPECT, resolved from whichever source actually reported it.
+  // It must never be absent from the verdict just because one of the two
+  // sources was not reached — a report whose headline field is missing is the
+  // failure this whole change set exists to prevent.
+  function stencilVerdict() {
+    const g = GLPROBE || {};
+    if (g.ok && g.stencil !== undefined) return { known: true, on: !!g.stencil, src: 'page probe' };
+    const m = facts.glAttrs && /stencil=(true|false)/.exec(facts.glAttrs);
+    if (m) return { known: true, on: m[1] === 'true', src: 'emulator worker' };
+    return { known: false, on: false, src: 'neither the page nor the worker reported it' };
+  }
+  // One sentence naming the most likely cause, so a report can be acted on
+  // without reading the rest of it. Ordered by how conclusive each signal is.
+  function headline() {
+    const g = GLPROBE || {};
+    const st = stencilVerdict();
+    if (facts.coreError)  return 'THE EMULATOR CORE NEVER STARTED — ' + facts.coreError;
+    if (facts.glNull)     return 'THE WORKER COULD NOT GET A WEBGL2 CONTEXT — nothing can render.';
+    if (counters.glContextLost) return 'THE GPU DROPPED THE GRAPHICS CONTEXT — Flycast does not rebuild its GL objects, so the picture cannot come back without a reload.';
+    if (!g.ok && !/skipped/.test(g.err || '')) return 'THIS DEVICE HAS NO USABLE WEBGL2 — ' + (g.err || 'unknown');
+    if (st.known && !st.on) return 'STENCIL WAS NOT GRANTED (per the ' + st.src + '). Flycast drives modifier volumes entirely through the stencil buffer and the black-out quad paints the WHOLE FRAME when the plane is missing. This is the prime suspect for a black picture with correct-looking telemetry.';
+    if (g.ok && g.fboD24S8 !== 'COMPLETE' && g.fboD32FS8 !== 'COMPLETE')
+      return 'THIS GPU COMPLETES NEITHER DEPTH-STENCIL FORMAT (depth24_stencil8=' + g.fboD24S8 +
+             ', depth32f_stencil8=' + g.fboD32FS8 + ') — the renderer has no valid render target.';
+    // Only ONE of those two formats is the one this driver will actually be
+    // handed: core/rend/gles/gles.cpp sets `gl.mali = !stricmp(GL_VENDOR,
+    // "arm")` and core/rend/gl4/gldraw.cpp then picks GL_DEPTH24_STENCIL8 on
+    // mali and GL_DEPTH32F_STENCIL8 everywhere else. Naming the applicable one
+    // turns a curiosity into a finding.
+    if (g.ok && dsFormat().status !== 'COMPLETE')
+      return 'THE DEPTH-STENCIL FORMAT THIS DRIVER WOULD ACTUALLY BE GIVEN IS NOT COMPLETE (' +
+             dsFormat().name + ' = ' + dsFormat().status + ').';
+    if (counters.incompleteFBO) return 'THE RENDERER WAS HANDED AN INCOMPLETE FRAMEBUFFER ' + counters.incompleteFBO + ' time(s) — it is drawing into nothing.';
+    if (facts.memoryPressure) return 'THIS DEVICE RAN OUT OF MEMORY — ' + facts.memoryPressure;
+    if (facts.stall) return 'THE EMULATOR STALLED — ' + facts.stall;
+    if (counters.pageError) return 'THE PAGE THREW — ' + facts.pageError;
+    if (memInfo.reduced) return 'THE BROWSER REFUSED THE REQUESTED HEAP AND GAVE A SMALLER ONE — ' + memInfo.text;
+    // Frames flowing outranks every "did it finish booting" heuristic — if the
+    // picture is moving, the boot demonstrably finished.
+    if (safe(() => lastCalls, 0) > 0)
+      return 'Nothing anomalous detected — the emulator is running and producing frames.';
+    if (!safe(() => booted, false))
+      return 'The boot did not finish. Last stage reached: ' + ((marks[marks.length - 1] || {}).name || '?');
+    return 'The emulator started but has never produced a frame.';
+  }
+  // Which depth-stencil format Flycast will select on THIS device — see the
+  // gl.mali note in headline(). GL_VENDOR is the masked string, which is what
+  // gles.cpp compares, so the worker's own line is preferred over the probe's
+  // unmasked one.
+  function dsFormat() {
+    const g = GLPROBE || {};
+    const m = /masked="([^"]*)"/.exec(facts.glGpu || '');
+    const vendor = m ? m[1] : (g.vendor || '');
+    const mali = /^\s*arm\s*$/i.test(vendor) || /\bmali\b/i.test(vendor);
+    return mali ? { name: 'depth24_stencil8 (vendor reads Mali/ARM)', status: g.fboD24S8 || '?' }
+                : { name: 'depth32f_stencil8 (vendor is not Mali/ARM)', status: g.fboD32FS8 || '?' };
+  }
+  function verdictRows() {
+    const rows = [];
+    const g = GLPROBE || {};
+    const push = (n, v, c) => rows.push([n, String(v), c || '']);
+
+    push('LIKELY CAUSE', headline(),
+         /^Nothing anomalous/.test(headline()) ? 'good' : 'bad');
+    // Always present, from whichever source has it — see stencilVerdict().
+    const st = stencilVerdict();
+    push('stencil granted', st.known
+           ? (st.on ? 'YES (' + st.src + ')'
+                    : 'NO  <-- modifier volumes black the whole frame without it (' + st.src + ')')
+           : 'UNKNOWN — ' + st.src,
+         st.known ? (st.on ? 'good' : 'bad') : 'warn');
+    push('WebGL2 (page)', g.ok ? 'yes' : ('NO — ' + (g.err || 'unavailable') +
+         (g.plainWebgl2 ? ' (plain webgl2 DOES work — the attribute set is what was refused)' : '') +
+         (g.webgl1 !== undefined ? ' webgl1=' + g.webgl1 : '')), g.ok ? 'good' : 'bad');
+    if (g.ok) {
+      const ds = dsFormat();
+      push('depth-stencil in use', ds.name + ' = ' + ds.status, ds.status === 'COMPLETE' ? 'good' : 'bad');
+      push('both DS formats', 'depth24_stencil8=' + g.fboD24S8 + '  depth32f_stencil8=' + g.fboD32FS8,
+           (g.fboD24S8 === 'COMPLETE' && g.fboD32FS8 === 'COMPLETE') ? 'good' : 'warn');
+      push('GPU', g.renderer + (g.masked ? '  (masked — no debug_renderer_info)' : ''));
+    }
+    // The worker's own context is the one that renders. It is created with its
+    // own attribute set on its own thread, so it can disagree with the probe
+    // above — and when it does, that disagreement IS the finding.
+    push('worker GL attrs',
+         facts.glAttrs ? facts.glAttrs.replace('[glinfo] granted attrs ', '') : '(worker has not reported yet)',
+         facts.glAttrs ? (/stencil=true/.test(facts.glAttrs) ? 'good' : 'bad') : 'warn');
+    if (facts.glNull) push('worker GL context', 'NULL — nothing can render', 'bad');
+    if (facts.glLost) push('worker GL context', 'LOST — permanently black from here', 'bad');
+
+    push('heap', memInfo.text || '(not allocated yet)', memInfo.reduced ? 'warn' : '');
+    push('isolation', 'crossOriginIsolated=' + !!self.crossOriginIsolated +
+                      ' SAB=' + (typeof SharedArrayBuffer === 'function'),
+         self.crossOriginIsolated ? 'good' : 'bad');
+    const last = marks[marks.length - 1] || { name: '?', t: 0 };
+    push('boot reached', last.name + ' at +' + (last.t / 1000).toFixed(1) + 's  (' + marks.length + ' stages)');
+    push('frames', frameSummary(), safe(() => lastCalls, 0) > 0 ? 'good' : 'warn');
+    if (facts.coreError) push('core startup', facts.coreError, 'bad');
+    if (facts.memoryPressure) push('memory pressure', facts.memoryPressure, 'bad');
+    const c = counters;
+    push('counters',
+         'incompleteFBO=' + (c.incompleteFBO | 0) +
+         ' glcompat=' + (c.glcompatLines | 0) +
+         ' ctxLost=' + (c.glContextLost | 0) +
+         ' pageError=' + (c.pageError | 0) +
+         ' stall=' + (c.stall | 0),
+         ((c.incompleteFBO | 0) || (c.glContextLost | 0) || (c.pageError | 0) || (c.stall | 0)) ? 'bad'
+           : ((c.glcompatLines | 0) ? 'warn' : 'good'));
+    return rows;
+  }
+  function paintVerdict(el) {
+    if (!el) return;
+    try {
+      el.textContent = '';
+      verdictRows().forEach(([n, v, c]) => {
+        const dn = document.createElement('div'); dn.className = 'n'; dn.textContent = n;
+        const dv = document.createElement('div'); dv.className = 'v' + (c ? ' ' + c : ''); dv.textContent = v;
+        el.appendChild(dn); el.appendChild(dv);
+      });
+    } catch (_) { /* a broken verdict must never break the page it is diagnosing */ }
+  }
+
+  // ---------------------------------------------------------------------------
+  // The report. Plain text, no markup, bounded — it has to survive being pasted
+  // into a message, which rules out anything a chat client will reflow, strip or
+  // truncate. Everything is read through safe(), so this can be built from the
+  // global error handler at any point in the boot.
+  // ---------------------------------------------------------------------------
+  const DIAG_VERSION = 'dc-diag/2';
+  function buildReport(tailLines) {
+    const L = [];
+    const nTail = tailLines || 60;
+    try {
+      L.push('=== DREAMCAST DIAGNOSTIC (' + DIAG_VERSION + ') ===');
+      L.push('when   ' + new Date().toISOString() + '   +' + ((Date.now() - T0) / 1000).toFixed(1) + 's since load');
+      L.push('url    ' + safe(() => location.pathname + location.search, '?'));
+      L.push('');
+      L.push('>> ' + safe(headline, '(headline unavailable)'));
+      L.push('');
+      L.push('--- VERDICT ---');
+      verdictRows().forEach(([n, v]) => L.push(pad(n) + v));
+      L.push('');
+      L.push('--- ENV ---');
+      L.push(safe(diagLine, '(env unavailable)'));
+      L.push('');
+      L.push('--- GL (measured by the page itself) ---');
+      const g = GLPROBE || {};
+      if (!g.ok) {
+        L.push('NO WEBGL2: ' + (g.err || 'unknown') +
+               (g.plainWebgl2 !== undefined ? '  plainWebgl2=' + g.plainWebgl2 : '') +
+               (g.webgl1 !== undefined ? '  webgl1=' + g.webgl1 : ''));
+      } else {
+        L.push('vendor   ' + g.vendor);
+        L.push('renderer ' + g.renderer + (g.masked ? '   (masked)' : ''));
+        L.push('attrs    stencil=' + g.stencil + ' depth=' + g.depth + ' antialias=' + g.antialias);
+        L.push('fbo      depth24_stencil8=' + g.fboD24S8 + '  depth32f_stencil8=' + g.fboD32FS8);
+        L.push('limits   maxTex=' + g.maxTex + ' maxRB=' + g.maxRB + ' maxSamples=' + g.maxSamples +
+               ' maxVarying=' + g.maxVarying + ' maxFragUniform=' + g.maxFragUni);
+        L.push('exts     ' + g.extCount + ' total, EXT_color_buffer_float=' + g.colorBufferFloat +
+               ' EXT_float_blend=' + g.floatBlend);
+        L.push('glError  ' + g.glError);
+      }
+      L.push('');
+      L.push('--- GL (reported by the emulator worker) ---');
+      const gk = ['glGpu', 'glAttrs', 'glLimits', 'glDrawBuf', 'glExts', 'glNull', 'glLost',
+                  'glReportFailed', 'fboIncomplete', 'glInvalidEnum', 'glcompat'];
+      let any = false;
+      gk.forEach((k) => { if (facts[k]) { L.push(facts[k]); any = true; } });
+      if (!any) L.push('(the worker never reported a GL context — it did not get that far)');
+      L.push('');
+      L.push('--- MEMORY ---');
+      L.push(memInfo.text || '(WebAssembly.Memory was never allocated)');
+      if (memInfo.err) L.push('last refusal: ' + memInfo.err);
+      L.push('');
+      L.push('--- BOOT MILESTONES ---');
+      marks.forEach((m) => L.push('+' + (m.t / 1000).toFixed(1).padStart(7) + 's  ' + m.name));
+      L.push('');
+      L.push('--- COUNTERS ---');
+      const ck = Object.keys(counters);
+      L.push(ck.length ? ck.map((k) => k + '=' + counters[k]).join('  ') : '(none — nothing anomalous was counted)');
+      L.push('');
+      L.push('--- LAST ' + Math.min(nTail, logTail.length) + ' OF ' + logTail.length + ' LOG LINES ---');
+      L.push.apply(L, logTail.slice(-nTail));
+      L.push('=== END DIAGNOSTIC ===');
+    } catch (e) {
+      L.push('!! report builder threw: ' + (e && e.message ? e.message : String(e)));
+    }
+    return L.join('\n');
+    function pad(s) { return (s + '                       ').slice(0, 23) + ' '; }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Diagnostics panel. Share first: on a phone the only reliable way to get text
+  // OFF the device and into a message is the system share sheet. Clipboard is
+  // the fallback (it is permission-gated and silently refused in some contexts),
+  // and a selectable, screenshot-able <pre> is the fallback to that.
+  // ---------------------------------------------------------------------------
+  let diagWired = false;
+  function showDiag(why) {
+    const el = document.getElementById('diag');
+    if (!el) return;
+    if (why) pageLog('[diag] opened: ' + why);
+    const report = buildReport(60);
+    paintVerdict(document.getElementById('diagVerdict'));
+    const body = document.getElementById('diagBody');
+    if (body) body.textContent = report;
+    if (!diagWired) {
+      diagWired = true;
+      const share = document.getElementById('diagShare');
+      const copy  = document.getElementById('diagCopy');
+      const all   = document.getElementById('diagCopyAll');
+      const close = document.getElementById('diagClose');
+      const flash = (b, t) => { const o = b.textContent; b.textContent = t; setTimeout(() => { b.textContent = o; }, 2200); };
+      const toClipboard = (b, text) => {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(
+            () => flash(b, '✓ Copied'),
+            () => flash(b, 'Blocked — screenshot instead'));
+        } else {
+          flash(b, 'No clipboard — screenshot instead');
+        }
+      };
+      if (share) share.addEventListener('click', () => {
+        const text = buildReport(60);
+        if (navigator.share) {
+          navigator.share({ title: 'Dreamcast diagnostic', text: text })
+            .then(() => flash(share, '✓ Shared'))
+            .catch(() => toClipboard(share, text));   // includes the user simply cancelling
+        } else {
+          toClipboard(share, text);
+        }
+      });
+      if (copy) copy.addEventListener('click', () => toClipboard(copy, buildReport(60)));
+      if (all)  all.addEventListener('click',  () => toClipboard(all,  buildReport(LOG_TAIL_MAX)));
+      if (close) close.addEventListener('click', () => el.classList.remove('on'));
+    }
+    el.classList.add('on');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Global error nets, registered before anything else can run.
+  //
+  // Everything past this point is either inside a try/catch or it is not. The
+  // ones that are not used to vanish into a console no phone user can open —
+  // which is the exact shape of every failure mode this page has had: the
+  // symptom reaches the user, the cause reaches nobody. These two catch the
+  // class by construction, including whatever the next one turns out to be.
+  // ---------------------------------------------------------------------------
+  // An error that repeats every frame must not turn into a log flood and a
+  // panel that reopens on top of itself. Report the first few in full, keep
+  // counting the rest, and only ever raise the panel once.
+  let errShown = 0, diagAutoOpened = false;
+  function reportUncaught(kind, msg, detail) {
+    bump('pageError');
+    if (!facts.pageError) facts.pageError = kind + ': ' + msg;
+    if (++errShown <= 5) {
+      pageLog('[error] ' + kind + ': ' + msg + (detail ? '  ' + detail : ''));
+    } else if (errShown === 6) {
+      pageLog('[error] further errors are counted but not logged (see counters.pageError)');
+    }
+    if (diagAutoOpened) return;
+    diagAutoOpened = true;
+    setStatus('Something went wrong: ' + msg);
+    showToast('Page error — see diagnostics', false);
+    showDiag(kind + ': ' + msg);
+  }
+  window.addEventListener('error', (e) => {
+    try {
+      const where = e && e.filename ? ' @ ' + e.filename + ':' + (e.lineno | 0) + ':' + (e.colno | 0) : '';
+      const msg = ((e && e.message) || (e && e.error && e.error.message) || 'unknown error') + where;
+      reportUncaught('uncaught', msg, safe(() => String(e.error.stack).split('\n').slice(0, 6).join(' | '), ''));
+    } catch (_) {}
+  });
+  window.addEventListener('unhandledrejection', (e) => {
+    try {
+      const r = e && e.reason;
+      reportUncaught('unhandled promise rejection', (r && r.message) ? r.message : String(r),
+                     safe(() => String(r.stack).split('\n').slice(1, 5).join(' | '), ''));
+    } catch (_) {}
+  });
+
+  // A permanent condition needs a permanent notice — see the #alertBar comment.
+  function showAlert(text) {
+    const el = document.getElementById('alertBar');
+    if (!el) return;
+    el.textContent = text + '  ·  tap for diagnostics';
+    el.classList.add('on');
+    el.onclick = () => showDiag('alert bar tapped');
   }
 
   // ---------------------------------------------------------------------------
@@ -391,44 +976,79 @@
       el.appendChild(ul);
     }
     if (hint) { const d = document.createElement('div'); d.className = 'hint'; d.textContent = hint; el.appendChild(d); }
+    // Same pinned verdict as the diagnostics panel: the reader should not have
+    // to scroll a hard-stop page to find out whether the device has WebGL2.
+    const vd = document.createElement('div'); vd.className = 'vd';
+    paintVerdict(vd); el.appendChild(vd);
     const pre = document.createElement('pre');
-    pre.textContent = logTail.join('\n') + '\n' + diagLine();
-    const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = 'Copy diagnostics';
-    btn.addEventListener('click', () => {
+    pre.textContent = buildReport(60);
+    const share = document.createElement('button'); share.type = 'button'; share.textContent = 'Share report';
+    const copyTo = (b, text) => {
       if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(pre.textContent).then(
-          () => { btn.textContent = '✓ Copied'; },
-          () => { btn.textContent = 'Copy blocked — screenshot the text below'; });
+        navigator.clipboard.writeText(text).then(
+          () => { b.textContent = '✓ Copied'; },
+          () => { b.textContent = 'Copy blocked — screenshot the text below'; });
       } else {
-        btn.textContent = 'Copy unavailable — screenshot the text below';
+        b.textContent = 'Copy unavailable — screenshot the text below';
       }
+    };
+    share.addEventListener('click', () => {
+      const text = buildReport(60);
+      if (navigator.share) {
+        navigator.share({ title: 'Dreamcast diagnostic', text: text })
+          .then(() => { share.textContent = '✓ Shared'; })
+          .catch(() => copyTo(share, text));
+      } else { copyTo(share, text); }
     });
+    const btn = document.createElement('button'); btn.type = 'button'; btn.textContent = 'Copy diagnostics';
+    btn.addEventListener('click', () => copyTo(btn, buildReport(LOG_TAIL_MAX)));
     const rl = document.createElement('button'); rl.type = 'button'; rl.textContent = 'Reload';
     rl.addEventListener('click', () => location.reload());
-    el.appendChild(btn); el.appendChild(rl); el.appendChild(pre);
+    el.appendChild(share); el.appendChild(btn); el.appendChild(rl); el.appendChild(pre);
     el.classList.add('on');
   }
   // Soft failure: keep the page, but put it where a phone user can see and
-  // screenshot it. Never silent, never console-only.
+  // screenshot it. Never silent, never console-only. The diagnostics panel goes
+  // up too — the log tail alone answers "it broke", the report answers "why".
   function pageFail(msg) {
     pageLog('[page] ' + msg);
     setStatus(msg);
     showToast(msg.length > 96 ? msg.slice(0, 96) + '…' : msg, false);
     showMobileLog();
+    showDiag('pageFail: ' + msg);
   }
 
   $('btnLog').addEventListener('click', () => logEl.classList.toggle('visible'));
+  $('btnDiag').addEventListener('click', () => showDiag('desktop button'));
+  // ?diag2=1 opens the diagnostics panel on load. Not a measurement arm — it
+  // changes nothing about the run, it just puts the report on screen without
+  // the user having to find a menu. (?diag is the SH4 tracer; different thing.)
+  if (new URLSearchParams(location.search).has('diag2')) {
+    setTimeout(() => showDiag('?diag2'), 0);
+  }
 
   // Controls overlay + fullscreen — same UX as gamecube.html.
   $('btnControls').addEventListener('click', () => { $('controlsOverlay').style.display = 'flex'; });
   $('controlsClose').addEventListener('click', () => { $('controlsOverlay').style.display = 'none'; });
   $('controlsOverlay').addEventListener('click', (e) => { if (e.target === $('controlsOverlay')) $('controlsOverlay').style.display = 'none'; });
   $('btnFull').addEventListener('click', () => {
+    // Guarded: iOS Safari on iPhone has NO Element.requestFullscreen at all, so
+    // the old unguarded `.call()` threw a TypeError on the exact devices this
+    // page has been failing on. Say it instead of throwing.
     const w = $('canvasWrap');
-    if (document.fullscreenElement || document.webkitFullscreenElement) {
-      (document.exitFullscreen || document.webkitExitFullscreen).call(document);
-    } else {
-      (w.requestFullscreen || w.webkitRequestFullscreen).call(w);
+    const inFs = document.fullscreenElement || document.webkitFullscreenElement;
+    const fn = inFs ? (document.exitFullscreen || document.webkitExitFullscreen)
+                    : (w.requestFullscreen || w.webkitRequestFullscreen);
+    if (!fn) {
+      pageLog('[page] this browser has no Fullscreen API for elements (iPhone Safari does not)');
+      showToast('Fullscreen is not available in this browser', false);
+      return;
+    }
+    try {
+      const p = fn.call(inFs ? document : w);
+      if (p && p.catch) p.catch((e) => pageLog('[page] fullscreen refused: ' + e));
+    } catch (e) {
+      pageLog('[page] fullscreen threw: ' + (e && e.message ? e.message : String(e)));
     }
   });
 
@@ -442,12 +1062,36 @@
   // forever, which on a phone looks exactly like "it flashes and never loads".
   // Three tries, then say so.
   // ---------------------------------------------------------------------------
+  // THE COUNTER MUST SURVIVE WHERE THE SERVICE WORKER DOES NOT. Both readers
+  // swallowed their exception and returned null, so on any browser that throws
+  // from sessionStorage — a content blocker, "block all cookies", storage
+  // disabled, some private modes — the count was ALWAYS 0, the bound never
+  // tripped, and the unbounded 800 ms reload loop came straight back. And those
+  // are the same configurations that stop the service worker installing in the
+  // first place, so the bound was missing in exactly the case it exists for.
+  //
+  // window.name is the fallback: it is not storage, it survives a same-tab
+  // reload, and nothing can turn it off. Third line of defence is the URL, for
+  // anything that clears window.name across navigations.
   const COI_KEY = 'dc-coi-reloads';
-  function ssGet(k) { try { return sessionStorage.getItem(k); } catch (_) { return null; } }
-  function ssSet(k, v) { try { sessionStorage.setItem(k, v); } catch (_) {} }
+  const COI_NAME_PREFIX = 'dc-coi:';
+  function ssGet(k) {
+    try { const v = sessionStorage.getItem(k); if (v !== null) return v; } catch (_) {}
+    try {
+      if (String(window.name || '').indexOf(COI_NAME_PREFIX) === 0)
+        return String(window.name).slice(COI_NAME_PREFIX.length);
+    } catch (_) {}
+    try { return new URLSearchParams(location.search).get('coitry'); } catch (_) {}
+    return null;
+  }
+  function ssSet(k, v) {
+    try { sessionStorage.setItem(k, v); } catch (_) {}
+    try { window.name = COI_NAME_PREFIX + v; } catch (_) {}
+  }
   if (!self.crossOriginIsolated) {
     const tries = (parseInt(ssGet(COI_KEY) || '0', 10) || 0) + 1;
     ssSet(COI_KEY, String(tries));
+    pageLog('[coi] not cross-origin isolated — reload attempt ' + tries + ' of 3');
     if (tries > 3) {
       setStatus('Cross-origin isolation could not be enabled.');
       showFatal('This page could not become cross-origin isolated', [
@@ -457,10 +1101,28 @@
       return;
     }
     setStatus('Initializing... (page will reload once)');
-    setTimeout(() => location.reload(), 800);
+    setTimeout(() => {
+      // replace(), not reload(): a loop that stacks history entries traps the
+      // back button too. The ?coitry= carries the count for the third fallback.
+      try {
+        const u = new URL(location.href);
+        u.searchParams.set('coitry', String(tries));
+        location.replace(u.href);
+      } catch (_) { location.reload(); }
+    }, 800);
     return;
   }
   ssSet(COI_KEY, '0');
+  // Isolated: drop the bookkeeping so it cannot be mistaken for a real param
+  // and cannot leak into a shared link.
+  try {
+    if (new URLSearchParams(location.search).has('coitry')) {
+      const u = new URL(location.href);
+      u.searchParams.delete('coitry');
+      history.replaceState(null, '', u.pathname + (u.search || '') + u.hash);
+    }
+    if (String(window.name || '').indexOf(COI_NAME_PREFIX) === 0) window.name = '';
+  } catch (_) {}
 
   // ---------------------------------------------------------------------------
   // Hard capability gate.
@@ -498,6 +1160,15 @@
     }
   }
   pageLog(diagLine());
+  // Into the tail as well as the pinned facts: a run that only ever produces a
+  // console screenshot still shows the GPU and, above all, `stencil=`.
+  pageLog('[glprobe] ' + (GLPROBE.ok
+    ? ('webgl2=yes stencil=' + GLPROBE.stencil + ' depth=' + GLPROBE.depth +
+       ' fboD24S8=' + GLPROBE.fboD24S8 + ' fboD32FS8=' + GLPROBE.fboD32FS8 +
+       ' gpu="' + GLPROBE.renderer + '" maxTex=' + GLPROBE.maxTex +
+       ' exts=' + GLPROBE.extCount)
+    : ('webgl2=NO ' + GLPROBE.err)));
+  mark('glprobe=' + (GLPROBE.ok ? ('stencil:' + GLPROBE.stencil) : 'no-webgl2'));
   if (!HAS_GUNZIP) {
     pageLog('[caps] no DecompressionStream (Safari before 16.4 / iOS before 16.4) — ' +
             'the boot seed will be inflated by this page’s own decoder');
@@ -594,13 +1265,34 @@
   //   IMPORT memory a.a flags=0x3 shared=true initial=2048 pages (128 MB)
   //                                          maximum=65536 pages (4096 MB)
   // so both constants below still match the binary the page actually loads.
-  // NOTE for whoever relinks next: flycast-bridge/flycast_worker_link.sh
-  // currently reads -sINITIAL_MEMORY=536870912 (512 MB = 8192 pages), which
-  // does NOT match the 128 MB the shipped wasm declares. Relinking with the
-  // script as it stands would raise the module's declared minimum to 512 MB,
-  // MODULE_MIN_MB would be stale, the 128 MB memory this page provides would
-  // fail import matching, and the shim would report "factory rejected" — the
-  // silent-hang case the boot watchdog below exists to name.
+  // ###########################################################################
+  // # NOTE FOR WHOEVER RELINKS NEXT — the two repos' link scripts DISAGREE.   #
+  // #                                                                         #
+  // # Verified 2026-08-29 by reading both files and by parsing the memory     #
+  // # import out of both shipped .wasm files:                                 #
+  // #                                                                         #
+  // #   Dev/dreamcastHtml/dreamcast/flycast-bridge/flycast_worker_link.sh:362 #
+  // #     -sINITIAL_MEMORY=134217728   (128 MB) -- CORRECT, matches the wasm  #
+  // #   Bemental77.github.io/dreamcast/flycast-bridge/                        #
+  // #                        flycast_worker_link.sh:231                       #
+  // #     -sINITIAL_MEMORY=536870912   (512 MB) -- STALE, does NOT match      #
+  // #                                                                         #
+  // #   Both shipped flycast_worker_emcc.wasm files declare                   #
+  // #     IMPORT memory a.a shared=true initial=2048 pages (128 MB)           #
+  // #                                    maximum=65536 pages (4096 MB)        #
+  // #   (the two .wasm files are otherwise different builds: 8,670,412 B in   #
+  // #    Bemental77 vs 8,680,869 B in Dev.)                                   #
+  // #                                                                         #
+  // # The Bemental77 copy is an older revision of the script entirely (275    #
+  // # lines vs 485, and it still hardcodes ROOT=/Users/caseybement/...).       #
+  // # Relinking from THAT copy raises the module's declared minimum to 512 MB #
+  // # while MODULE_MIN_MB above stays 128, so the 128 MB memory this page     #
+  // # provides fails import matching and the shim reports "factory rejected"  #
+  // # -- every boot dies, and on a phone it dies as a silent hang on          #
+  // # "Waiting for emulator runtime...". Link from the Dev copy, or fix the   #
+  // # Bemental77 copy first. If the declared minimum ever does change,        #
+  // # MODULE_MIN_MB here must change with it.                                 #
+  // ###########################################################################
   const MODULE_MIN_MB = 128;
   const MODULE_MAX_MB = 4096;
 
@@ -660,6 +1352,7 @@
       if (m <= maxMB && rungs.indexOf(m) < 0) rungs.push(m);
     });
     if (!rungs.length) rungs.push(maxMB);   // unreachable (maxMB >= initMB above), but never leave the ladder empty
+    memInfo.initMB = initMB; memInfo.wantMaxMB = rungs[0]; memInfo.rungs = rungs.length;
     let lastErr = null;
     for (let i = 0; i < rungs.length; i++) {
       try {
@@ -672,6 +1365,18 @@
         lastErr = e;
         continue;
       }
+      // Structured, not just prose in the log: the report has to be able to
+      // state the rung without parsing English out of a line that may already
+      // have scrolled off the tail.
+      memInfo.gotMaxMB = rungs[i]; memInfo.rung = i + 1;
+      memInfo.reduced = i > 0;
+      memInfo.err = lastErr ? (lastErr.message || String(lastErr)) : null;
+      memInfo.text = 'initial ' + initMB + ' MB, maximum ' + rungs[i] + ' MB' +
+        (i > 0 ? '  (REDUCED — rung ' + (i + 1) + ' of ' + rungs.length +
+                 '; this browser refused ' + rungs.slice(0, i).join('/') + ' MB)'
+               : '  (first rung of ' + rungs.length + ', no reduction)') +
+        '; module import declares min ' + MODULE_MIN_MB + ' / max ' + MODULE_MAX_MB + ' MB';
+      mark('memory-' + rungs[i] + 'MB' + (i > 0 ? '-reduced' : ''));
       if (i > 0) {
         // Loud on purpose: a silently-shrunk heap that later aborts on growth
         // is the hardest kind of failure to report from a phone.
@@ -688,6 +1393,8 @@
               MODULE_MAX_MB + ' MB)');
       return;
     }
+    memInfo.err = lastErr && lastErr.message ? lastErr.message : String(lastErr);
+    memInfo.text = 'REFUSED at every rung: ' + rungs.join('/') + ' MB (initial ' + initMB + ' MB)';
     throw new Error('this browser refused a shared WebAssembly.Memory at every maximum from ' +
                     rungs[0] + ' MB down to ' + rungs[rungs.length - 1] + ' MB (initial ' +
                     initMB + ' MB): ' + (lastErr && lastErr.message ? lastErr.message : String(lastErr)));
@@ -728,6 +1435,23 @@
           setStatus('Emulator failed to start — see the log.');
           showToast('Emulator failed to start', false);
           showMobileLog();
+          showDiag('core startup error: ' + d.txt);
+        }
+        // WebGL context loss is PERMANENT here — the worker's own [glinfo] line
+        // says Flycast does not rebuild its GL objects on restore. The emulator
+        // keeps running, the rate bar keeps reading 1.000x, and the picture is
+        // black from this instant on. That combination is exactly "it freezes
+        // with a black screen while everything else looks fine", so it gets a
+        // banner that does not auto-hide.
+        if (d.txt && d.txt.indexOf('CONTEXT LOST') >= 0) {
+          setStatus('The GPU dropped this page’s graphics context — the picture cannot come back.');
+          showAlert('GPU CONTEXT LOST — the picture is gone until you reload');
+          showToast('GPU context lost — reload the page', false);
+        }
+        // A framebuffer the driver refuses to complete is a renderer that draws
+        // into nothing. Count is pinned; say it once, loudly, on the first one.
+        if (d.txt && d.txt.indexOf('INCOMPLETE framebuffer') >= 0 && (counters.incompleteFBO | 0) === 1) {
+          showAlert('GPU REFUSED A RENDER TARGET (incomplete framebuffer)');
         }
         break;
       // The heapAlloc shim mallocs the framebuffer + audio ring and reports the
@@ -746,6 +1470,7 @@
         break;
       case 'ready':
         workerReady = true;
+        mark('worker-ready');
         // Legacy shim: no 'sabLayout' will ever come, so release anything
         // waiting on it and keep the fixed offsets the page requested.
         sabLayoutResolve(false);
@@ -917,6 +1642,7 @@
         // post-js heartbeat — already covered by 'ready' from the shim.
         break;
       case 'discLoaded':
+        mark('disc-loaded=' + (d.success ? 'ok' : 'FAILED'));
         if (pendingDiscLoad) { pendingDiscLoad(d.success); pendingDiscLoad = null; }
         break;
       case 'frame':
@@ -930,6 +1656,19 @@
         lastClk = d.kcyc; lastPc = d.pc >>> 0;
         lastIstnrm = d.istnrm >>> 0; lastIstext = d.istext >>> 0;
         paintFpsBar();
+        // Liveness bookkeeping for the stall detector (see checkStall). `calls`
+        // is video_cb per second INCLUDING duplicate-frame sentinels, so a core
+        // that is running but producing nothing still reads > 0 — which is why
+        // the detector below watches BOTH this and `fps`.
+        lastTelemetryAt = Date.now();
+        if (d.calls > 0) {
+          if (!framesEverFlowed) { framesEverFlowed = true; mark('first-video-callback'); }
+          lastCallsAt = Date.now();
+        }
+        if (d.fps > 0) {
+          if (!distinctEverFlowed) { distinctEverFlowed = true; mark('first-distinct-frame'); }
+          lastDistinctAt = Date.now();
+        }
         // Apply the fresh-boot seed on the first heartbeat that reports frames
         // ACTUALLY FLOWING (calls = video_cb presents/s with dupe sentinels
         // excluded, so a stuck emu reads 0 — see the fps-bar comment below).
@@ -1046,7 +1785,9 @@
   // mem-init, so this delay only postpones its importScripts, and the disc
   // fetch (the actual long pole) is unaffected — it already awaits worker ready.
   capsPromise.then(() => {
+    mark('caps-probed');
     createSharedMemory();
+    mark('mem-init-sent');
     worker.postMessage({ cmd: 'mem-init', memory: sharedMemory,
                          fbOffset: FB_OFFSET, fbW: FB_W, fbH: FB_H,
                          audioOffset: AUDIO_OFFSET, audioFrames: AUDIO_FRAMES,
@@ -1071,6 +1812,7 @@
       setStatus('The emulator runtime has not started. See the log.');
       showToast('Emulator runtime did not start — log shown', false);
       showMobileLog();
+      showDiag('boot watchdog: worker never became ready');
     }, 45000);
   }).catch((e) => {
     const why = (e && e.message) ? e.message : String(e);
@@ -1118,8 +1860,21 @@
       });
       node.connect(audioContext.destination);
       if (audioContext.state === 'suspended') { try { await audioContext.resume(); } catch (_) {} }
+      mark('audio-' + audioContext.state);
+      // A context stuck 'suspended' after resume() is silent audio with no
+      // error anywhere — iOS does this when the gesture was not accepted.
+      if (audioContext.state !== 'running') {
+        pageLog('[page] AudioContext is "' + audioContext.state + '" after resume() — no sound. ' +
+                'Use Reset Audio from the menu after touching the screen.');
+        showToast('No sound yet — tap Reset Audio in the menu', false);
+      }
     } catch (err) {
-      pageLog('[page] audio init failed: ' + (err && err.message ? err.message : String(err)));
+      const why = (err && err.message) ? err.message : String(err);
+      mark('audio-failed');
+      // Was console+tail only, i.e. invisible on a phone (the shell hides #log).
+      // Audio is not worth failing the boot for, but it IS worth saying.
+      pageLog('[page] audio init failed: ' + why);
+      showToast('No sound: ' + (why.length > 60 ? why.slice(0, 60) + '…' : why), false);
     }
   }
 
@@ -1256,7 +2011,23 @@
       // absent we fall back to the two-pass form.
       let out, off = 0;
       if (file.bytes) {
-        out = new Uint8Array(file.bytes);
+        // 1,185,760,800 B in ONE contiguous allocation. Desktop shrugs; a phone
+        // is a coin flip, and when it loses, the engine's message ("Array buffer
+        // allocation failed" / "out of memory") is thrown from a line that says
+        // nothing about discs. Name it here, with the escape hatch, because this
+        // is the single most likely place a 4 GB iPhone dies on this page.
+        try {
+          out = new Uint8Array(file.bytes);
+        } catch (e) {
+          const why = (e && e.message) ? e.message : String(e);
+          bump('memoryPressureLines');
+          facts.memoryPressure = 'disc buffer ' + file.bytes + ' B refused: ' + why;
+          throw new Error('this device refused a ' + (file.bytes / 1048576).toFixed(0) +
+            ' MB buffer for ' + file.name + ' (' + why + '). The whole disc is loaded into ' +
+            'memory by default. Add ?lazydisc=1 to the end of the address to stream it ' +
+            'instead — the worker shim on this deploy supports it (caps.lazyDisc=' +
+            caps.lazyDisc + ').');
+        }
         for (let i = 0; i < parts.length; i++) {
           setStatus(file.name + ' part ' + (i + 1) + '/' + parts.length);
           const ab = await fetchDiscBlob(parts[i]);
@@ -1317,6 +2088,7 @@
 
     $('btnStart').disabled = true;
     setStatus('Loading ' + game.name + '...');
+    mark('start-pressed');
     try {
       // Kick the boot seed off alongside the disc stream so it is in hand by
       // the time the first frame lands. Nothing awaits it here — the boot is
@@ -1326,22 +2098,40 @@
       //    (the post-js drains queued messages on init).
       for (const f of game.files) {
         await fetchAndPostFile(f, game.base, game.cue);
+        mark('disc-file-sent:' + f.name);
       }
       // 2. Wait for worker if it isn't ready yet (usually instant on warm load).
       setStatus('Waiting for emulator runtime...');
       await workerReadyPromise;
       // 3. Tell the worker to load the disc and wait for ack.
       setStatus('Loading disc image...');
+      mark('discReady-sent');
+      // BOUNDED. This promise had no timeout: if the worker never posted
+      // 'discLoaded' — it trapped inside retro_load_game, it was killed by the
+      // OS, the message was dropped — Start hung on "Loading disc image..."
+      // forever with nothing logged and nothing shown. Another silent stop, on
+      // a screen with no console. 120 s is far past a real load.
       const ok = await new Promise((resolve) => {
-        pendingDiscLoad = resolve;
+        const t = setTimeout(() => {
+          if (!pendingDiscLoad) return;   // already answered
+          pendingDiscLoad = null;
+          resolve('timeout');
+        }, 120000);
+        pendingDiscLoad = (v) => { clearTimeout(t); resolve(v); };
         worker.postMessage({ cmd: 'discReady', cuePath: '/discs/' + game.cue });
       });
-      if (!ok) throw new Error('disc load returned 0');
+      if (ok === 'timeout') {
+        throw new Error('the emulator never acknowledged the disc after 120 s — it did not answer ' +
+                        'discReady at all, so retro_load_game either never returned or the worker died');
+      }
+      if (!ok) throw new Error('disc load returned 0 — the core rejected the disc image');
       // 4. Audio + run loop. The WORKER owns the run loop (free-run pump,
       //    charter Phase 2.2) so guest progress is decoupled from page vsync
       //    and survives tab backgrounding; the rAF loop below only ships input.
       await initAudio();
       booted = true;
+      mark('booted');
+      rebaseStallClocks();   // arm the stall detector from here, not from page load
       [$('btnReset'), $('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull')]
         .forEach((b) => b.disabled = false);
       {
@@ -1789,6 +2579,9 @@
   const HW_SH4_HZ = 200e6;   // must match SH4_HZ in dreamcast/flycast_libretro/flycast_worker.js
   let lastFps = 0, lastHw = 0, lastCalls = 0, lastIps = 0;
   let lastClk = 0, lastPc = 0, lastIstnrm = 0, lastIstext = 0;
+  // Liveness, for the stall detector. Written by the 'fps' handler above.
+  let framesEverFlowed = false, distinctEverFlowed = false;
+  let lastTelemetryAt = 0, lastCallsAt = 0, lastDistinctAt = 0;
   // Pump duty-cycle window (ms per ~1 s), from the shim's 'ips' message.
   let lastBusyMs = 0, lastPacedMs = 0, lastWallMs = 0, lastGoverned = 1;
   const fpsEl = $('fpsBar');
@@ -1903,6 +2696,77 @@
       'guest ' + guestRateX().toFixed(3) + 'x · ' + lastFps + ' fps · ' +
       (headroomX() > 0 ? f1(headroomX()) + 'x headroom' : '');
   }
+  // ---------------------------------------------------------------------------
+  // STALL DETECTOR — "…it then freezes".
+  //
+  // The 45 s boot watchdog covers a runtime that never starts. NOTHING covered
+  // the case the user actually reported: it started, it drew a character, and
+  // then it stopped. From the page's point of view that is silent — the worker
+  // owns the run loop, the canvas is the worker's OffscreenCanvas, and a frozen
+  // picture and a correctly-rendering one are byte-identical to this thread.
+  // So watch the telemetry the worker already sends and say so when it stops.
+  //
+  // Three distinct stalls, deliberately separated, because they mean different
+  // things and point at different code:
+  //   * telemetry silence   — the worker's whole pump is gone (the wasm trapped,
+  //                           the thread died, the tab was frozen by the OS).
+  //   * video_cb silence    — the pump runs, the core produces no fields at all.
+  //   * distinct-frame       — fields still arrive but every one is a duplicate
+  //     silence               sentinel: the guest is wedged, not the renderer.
+  // Backgrounding legitimately pauses everything on iOS, so a hidden document
+  // does not count and the clocks are rebased on return.
+  // ---------------------------------------------------------------------------
+  const STALL_MS = 12000;         // generous: a savestate restore can pause frames
+  const NEVER_STARTED_MS = 60000; // booted, disc loaded, and still no frame ever
+  let stallState = '';
+  function rebaseStallClocks() {
+    const now = Date.now();
+    lastTelemetryAt = lastCallsAt = lastDistinctAt = now;
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) rebaseStallClocks();
+  });
+  function checkStall() {
+    if (!booted || document.hidden) return;
+    const now = Date.now();
+    let state = '';
+    let why = '';
+    if (!framesEverFlowed) {
+      if (lastTelemetryAt && now - lastTelemetryAt > STALL_MS) {
+        state = 'telemetry'; why = 'the emulator worker stopped reporting entirely';
+      } else if (now - T0 > NEVER_STARTED_MS) {
+        state = 'no-first-frame'; why = 'the disc loaded but the emulator has never produced a single frame';
+      }
+    } else if (lastTelemetryAt && now - lastTelemetryAt > STALL_MS) {
+      state = 'telemetry'; why = 'the emulator worker stopped reporting entirely (it was running)';
+    } else if (now - lastCallsAt > STALL_MS) {
+      state = 'no-video'; why = 'the emulator is running but has produced no video for ' +
+        Math.round((now - lastCallsAt) / 1000) + 's';
+    } else if (distinctEverFlowed && now - lastDistinctAt > STALL_MS) {
+      state = 'duplicate-frames'; why = 'the emulator is still presenting, but every frame for ' +
+        Math.round((now - lastDistinctAt) / 1000) + 's has been identical — the game is wedged, not the renderer';
+    }
+    if (state === stallState) return;   // edge-triggered: report transitions only
+    if (state) {
+      stallState = state;
+      bump('stall');
+      facts.stall = state + ' at +' + ((now - T0) / 1000).toFixed(1) + 's, ' +
+                    'pc=0x' + safe(() => lastPc.toString(16), '?') +
+                    ' fps=' + lastFps + ' fields=' + lastCalls + ' iters=' + lastIps;
+      pageLog('[stall] ' + why + ' — ' + facts.stall);
+      setStatus('The emulator has stopped: ' + why);
+      showAlert('EMULATOR STALLED (' + state + ')');
+      showToast('The emulator stopped — tap the banner for diagnostics', false);
+    } else if (stallState) {
+      pageLog('[stall] recovered from "' + stallState + '" at +' + ((now - T0) / 1000).toFixed(1) + 's');
+      stallState = '';
+      const bar = document.getElementById('alertBar');
+      // Only clear the banner if a stall is what put it there — a lost GPU
+      // context does not recover and its notice must not be wiped by this.
+      if (bar && /STALLED/.test(bar.textContent)) bar.classList.remove('on');
+    }
+  }
+
   // Heartbeat: RELEASE builds print nothing once boot telemetry caps out,
   // which idle-kills probes and leaves the Log panel blind. One line / 2s.
   // The original fps=/hw=/video_cb=/iters=/clk= tokens are kept verbatim so
@@ -1923,6 +2787,10 @@
               ' capacity=' + Math.round(capacityFps()) + 'fps' +
               ' arms=' + (activeArms.join(',') || 'none'));
     }
+    checkStall();
+    // Keep a force-shown log's pinned verdict current — the counters and the
+    // "boot reached" row move, and a stale screenshot is a wrong diagnosis.
+    if (mobileLogOn) paintVerdict(document.getElementById('mobileLogHead'));
   }, 2000);
 
   // ---------------------------------------------------------------------------
@@ -2038,6 +2906,29 @@
   // the d-pad disc holds w/a/s/d (drives the d-pad AND the analog stick).
   // ---------------------------------------------------------------------------
   const isMobile = (() => { const ua = navigator.userAgent.toLowerCase(); return /iphone|ipad|ipod|android|mobile|xbox/.test(ua) || ('ontouchstart' in window) || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile'); })();
+  // Tap binding that does not depend on PointerEvent existing.
+  //
+  // The shell's own controls (Start on the splash, the ≡ menu, the show-controls
+  // hint) were bound to `pointerdown` ALONE. On anything without PointerEvent
+  // that is not a degraded button, it is a DEAD one — and a dead Start button on
+  // the mobile splash is, from the user's side, exactly "the Dreamcast does not
+  // render on mobile". The gameplay controls below keep their own pointer +
+  // touch + mouse triple binding (they need press/release, not a tap), so this
+  // covers the ones that were single-bound. The 400 ms guard swallows the
+  // synthetic click that follows a pointerdown.
+  function tapBind(el, fn) {
+    if (!el) return;
+    let last = 0;
+    const h = (e) => {
+      const now = Date.now();
+      if (now - last < 400) return;
+      last = now;
+      if (e && e.preventDefault) e.preventDefault();
+      fn(e);
+    };
+    if (window.PointerEvent) el.addEventListener('pointerdown', h);
+    el.addEventListener('click', h);
+  }
   function holdBtn(id, key) {
     const el = $(id); if (!el) return;
     const press = (e) => { if (e && e.preventDefault) e.preventDefault(); heldKeys.add(key); el.classList.add('held'); };
@@ -2099,11 +2990,12 @@
     holdBtn('mobileA', 'm'); holdBtn('mobileB', 'k'); holdBtn('mobileX', 'j'); holdBtn('mobileY', 'n');
     holdBtn('mobileL', 'q'); holdBtn('mobileR', 'e'); holdBtn('mobileStart', 'enter');
     wireDpadDisc();
-    $('mobileSplashStart').addEventListener('pointerdown', (e) => {
-      e.preventDefault();
+    tapBind($('mobileSplashDiag'), () => showDiag('mobile splash'));
+    tapBind($('mobileSplashStart'), () => {
       const m = $('mobileRomSelect'), d = $('romSelect');
       if (m && d) d.value = m.value;
       $('mobileSplash').style.display = 'none';
+      mark('mobile-splash-start');
       $('btnStart').click();
       checkOrientation();
     });
@@ -2113,9 +3005,11 @@
     setInterval(() => { $('mobileStatus').textContent = (statusEl.textContent || '') + (booted ? ('  ' + fpsBarCompact()) : ''); }, 1000);
     // Menu wiring — reuse the desktop handlers.
     let ghost = false, hidden = false;
-    $('mobileMenuBtn').addEventListener('pointerdown', (e) => { e.preventDefault(); $('mobileMenu').classList.add('open'); });
+    tapBind($('mobileMenuBtn'), () => $('mobileMenu').classList.add('open'));
     $('mClose').addEventListener('click', () => $('mobileMenu').classList.remove('open'));
-    $('mobileMenu').addEventListener('pointerdown', (e) => { if (e.target === $('mobileMenu')) $('mobileMenu').classList.remove('open'); });
+    ['pointerdown', 'click'].forEach((ev) => $('mobileMenu').addEventListener(ev, (e) => {
+      if (e.target === $('mobileMenu')) $('mobileMenu').classList.remove('open');
+    }));
     $('mSave').addEventListener('click', () => { $('btnSave').click(); $('mobileMenu').classList.remove('open'); });
     $('mLoad').addEventListener('click', () => { $('btnLoad').click(); $('mobileMenu').classList.remove('open'); });
     $('mMute').addEventListener('click', () => { $('btnMute').click(); $('mMute').textContent = $('btnMute').textContent.replace(/^\S+ /, ''); });
@@ -2131,19 +3025,17 @@
       if (mobileLogOn) renderMobileLog();
       $('mobileMenu').classList.remove('open');
     });
-    $('mCopyLog').addEventListener('click', async () => {
-      const txt = logTail.join('\n');
-      try {
-        await navigator.clipboard.writeText(txt);
-        showToast('✓ Log copied (' + logTail.length + ' lines)');
-      } catch (_) {
-        // Clipboard is gated on a secure context + permission on some phones;
-        // fall back to showing it so the user can screenshot instead.
-        showMobileLog();
-        showToast('Copy blocked — log shown, screenshot it', false);
-      }
+    // Replaces the old "Copy Log". Copying a bare 300-line tail put the burden
+    // of knowing which lines matter on the person least able to judge it, and
+    // dropped everything that had already scrolled out. The panel carries the
+    // verdict, the milestones, the pinned facts and the tail, and offers the
+    // share sheet — which is the only route off an iPhone that reliably lands
+    // in a message.
+    $('mDiag').addEventListener('click', () => {
+      $('mobileMenu').classList.remove('open');
+      showDiag('mobile menu');
     });
-    $('mobileHideHint').addEventListener('pointerdown', (e) => { e.preventDefault(); hidden = false; shell.classList.remove('hide-controls'); });
+    tapBind($('mobileHideHint'), () => { hidden = false; shell.classList.remove('hide-controls'); });
     $('mFull').addEventListener('click', () => {
       $('mobileMenu').classList.remove('open');
       if (document.fullscreenElement || document.webkitFullscreenElement) (document.exitFullscreen || document.webkitExitFullscreen).call(document);
