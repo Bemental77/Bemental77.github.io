@@ -265,21 +265,6 @@
   let freerun = false;
   let freerunIters = 0;
   let freerunStatsTimer = 0;
-  // VMU change-watch (see the vmuLoad/vmuWatch handlers).
-  let vmuWatch = false;
-  let vmuGenSeen = -1;
-  function vmuPoll() {
-    if (!vmuWatch) return;
-    const M = self.Module;
-    if (!M || typeof M._flycast_vmu_gen !== 'function') return;
-    const gen = M._flycast_vmu_gen() >>> 0;
-    if (gen === vmuGenSeen) return;
-    vmuGenSeen = gen;
-    const ptr = M._flycast_vmu_ptr() >>> 0, size = M._flycast_vmu_size() >>> 0;
-    if (!ptr || !size) return;
-    const copy = new Uint8Array(M.HEAPU8.subarray(ptr, ptr + size));  // detached copy
-    postMessage({ cmd: 'vmuChanged', data: copy, gen: gen }, [copy.buffer]);
-  }
   let pendingSave = false;   // Save State, deferred to a clean asyncify boundary (pumpTick)
   const FRAME_MS = 1000 / 60;
   // Real-time governor (2026-08-27): pace WALL time against GUEST time at the
@@ -349,14 +334,9 @@
       if (lead < -250 || lead > 250) { paceBaseWall = nowW; paceBaseCyc = cyc; }
       else delay = Math.max(0, Math.min(50, lead));
     } else {
-      // uncap: TRUE free-run (lever-11 rig fix, 2026-08-28). The historical
-      // `FRAME_MS - elapsed` limiter here silently capped "uncapped" probes
-      // at 60 iters/s — clk saturated at ~59 x 6.6M ≈ 390-400MHz for ANY
-      // sufficiently fast build, which is exactly where the lever ladder
-      // plateaued (lever-8/9C/9D nulls measured against this rig ceiling,
-      // 2.4% idle at baseline vs 34% idle under lever-11 idleskip, iters
-      // pinned at 59/s in both). Perf probes must see the CPU, not the rig.
-      delay = 0;
+      // uncap / no export: historical free-run frame limiter (perf baselines).
+      const elapsed = performance.now() - t0;
+      delay = FRAME_MS - elapsed;
     }
     if (delay > 1) setTimeout(() => pumpChannel.port2.postMessage(0), delay);
     else pumpChannel.port2.postMessage(0);
@@ -395,7 +375,6 @@
       freerunStatsTimer = setInterval(() => {
         postMessage({ cmd: 'ips', ips: freerunIters });
         freerunIters = 0;
-        vmuPoll();   // card snapshots ride the existing 1 Hz tick
       }, 1000);
       postMessage({ cmd: 'print', txt: '[flycast-shim] freerun ON (worker-owned run loop, 60 iter/s cap)' });
       pumpChannel.port2.postMessage(0);
@@ -718,49 +697,6 @@
         break;
       }
 
-      // VMU seed + persistence. The wasm VMU is in-memory only, so the page
-      // owns the card: it writes one in before the guest reads it (seed) and
-      // saves snapshots back. Watching stays OFF until the page has decided
-      // what to seed, so a blank power-on card can never overwrite a good
-      // stored one.
-      case 'vmuLoad': {
-        try {
-          const M = self.Module;
-          const ptr = M._flycast_vmu_ptr() >>> 0, size = M._flycast_vmu_size() >>> 0;
-          const src = new Uint8Array(data.data);
-          if (!ptr || !size) { postMessage({ cmd: 'print', txt: '[vmu] no card attached yet — seed skipped' }); break; }
-          if (src.length !== size) { postMessage({ cmd: 'print', txt: '[vmu] seed is ' + src.length + ' B, card is ' + size + ' B — seed skipped' }); break; }
-          M.HEAPU8.set(src, ptr);
-          vmuGenSeen = M._flycast_vmu_gen() >>> 0;   // don't echo our own write back
-          vmuWatch = true;
-          postMessage({ cmd: 'print', txt: '[vmu] seeded ' + size + ' B into the card' });
-          postMessage({ cmd: 'vmuSeeded', ok: true });
-        } catch (err) {
-          postMessage({ cmd: 'print', txt: '[vmu] seed threw: ' + (err && err.message ? err.message : String(err)) });
-          postMessage({ cmd: 'vmuSeeded', ok: false });
-        }
-        break;
-      }
-      case 'vmuWatch': {
-        try {
-          const M = self.Module;
-          vmuGenSeen = M._flycast_vmu_gen ? (M._flycast_vmu_gen() >>> 0) : 0;
-          vmuWatch = !!data.on;
-          postMessage({ cmd: 'print', txt: '[vmu] watch=' + (vmuWatch ? 1 : 0) });
-        } catch (_) {}
-        break;
-      }
-
-      case 'setidleskip': {
-        try {
-          if (Module._flycast_set_idleskip) Module._flycast_set_idleskip((data.on | 0));
-          postMessage({ cmd: 'print', txt: '[setidleskip] g_idleskip=' + (data.on | 0) });
-        } catch (err) {
-          postMessage({ cmd: 'print', txt: '[setidleskip] threw: ' + (err && err.message ? err.message : String(err)) });
-        }
-        break;
-      }
-
       case 'setrteintc': {
         try {
           if (Module._flycast_set_rte_intc) Module._flycast_set_rte_intc((data.on | 0));
@@ -800,7 +736,7 @@
             // Lever-4 [smc]: icgen delta/s = total IC-invalidation rate; smcS/B/R
             // split it by writer (slow store / block-DMA / re-register); cpg =
             // marked code pages.
-            ' icgen=' + (f(74)>>>0) + ' smcS=' + (f(75)>>>0) + ' smcB=' + (f(76)>>>0) + ' smcR=' + (f(77)>>>0) + ' cpg=' + (f(78)>>>0) + ' smcT=' + (f(79)>>>0) + ' smcA=0x' + h(f(80)) + ' syncsr=' + (f(81)>>>0) + ' shms=' + (f(82)>>>0) + ' rrms=' + (f(83)>>>0) + ' ftrv=' + (f(84)>>>0) + ' fipr=' + (f(85)>>>0) + ' fsca=' + (f(86)>>>0) + ' ifbo=' + (f(87)>>>0) + ' icn=' + (f(88)>>>0) + ' syncfp=' + (f(89)>>>0) + ' isk=' + (f(90)>>>0) });
+            ' icgen=' + (f(74)>>>0) + ' smcS=' + (f(75)>>>0) + ' smcB=' + (f(76)>>>0) + ' smcR=' + (f(77)>>>0) + ' cpg=' + (f(78)>>>0) + ' smcT=' + (f(79)>>>0) + ' smcA=0x' + h(f(80)) + ' syncsr=' + (f(81)>>>0) + ' shms=' + (f(82)>>>0) + ' rrms=' + (f(83)>>>0) + ' ftrv=' + (f(84)>>>0) + ' fipr=' + (f(85)>>>0) + ' fsca=' + (f(86)>>>0) + ' ifbo=' + (f(87)>>>0) + ' icn=' + (f(88)>>>0) });
         } catch (err) {
           postMessage({ cmd: 'print', txt: '[ctxsnap] threw: ' + (err && err.message ? err.message : String(err)) });
         }
