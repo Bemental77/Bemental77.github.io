@@ -35,6 +35,172 @@ namespace bemental::sh4 {
 // dreamcast/flycast-bridge/rec_wasm.cpp). 0 = "not yet initialized,
 // fall back to sh4_write32/read32 imports for area-4/5".
 u32 g_vram_lin_base = 0;
+u32 g_ocram_lin_base = 0;      // lever-9D: OnChipRAM linear base (set by rec_wasm init)
+u32 g_ccr_addr = 0;            // lever-9D: &CCN_CCR
+bool g_emit_ocram_fp = true;   // lever-9D bisect switch
+// Runtime kill-switch for every emitted memory fastpath (immediate-EA bake,
+// area-3 RAM store/load, area-1 swizzle, area-4/5 linear, memset pattern).
+// OFF forces every guest memory access through the sh4_mem_* imports —
+// flycast's canonical paths — which is the JIT-arm memory-corruption
+// differential (boot-title-wedge): interp arm boots clean, JIT arm corrupts
+// RAM; if OFF also boots clean, the emitted fastpaths are the culprit.
+// Toggled via _flycast_set_mem_fastpaths BEFORE blocks compile.
+bool g_emit_mem_fastpaths = true;
+bool g_emit_imm_fastpath = true;   // immediate-EA fastpath only (bisect switch)
+bool g_emit_memset = true;         // memset self-loop fastpath only (bisect switch)
+bool g_emit_writem_fp = true;
+
+// Lever-4 / Build 2 (dreamcast/docs/lever-4-smc-bitmap): SMC code-page map +
+// IC generation, C linkage (map DEFINED in rec_wasm.cpp, populated by
+// jit_register while armed; generation DEFINED at the g_ic block below). The
+// store-side fastpaths emit a branchless `g_ic_generation += g_code_pages[page]`
+// so an in-wasm store to a page holding compiled code invalidates every IC
+// entry — the event-driven SMC net that makes cond/static IC safe. Computed
+// addressing is legal HERE (the area-3 store fastpath already indexes RAM);
+// the DISPATCH path stays const-addr scalar only (#18 landmine).
+extern "C" {
+    extern uint8_t g_code_map[(1u << 22) + 16];   // 4-BYTE word chunks + guard tail (granularity ladder: 4KB thrashed on mixed pages; 16B thrashed on the ISR frame-counter word beside code)
+    extern uint32_t g_smc_last_addr;       // DIAG (strip after verdict): last marked phys addr
+    extern volatile uint32_t g_ic_generation;
+}
+// Emits `map word-chunk of addr_local` on the stack, then loads the map byte.
+// SH4 stores are naturally aligned (unaligned faults on real HW), so a w<=4
+// store touches EXACTLY one 4-byte chunk — one load8 is width-exact. A span
+// pad or blanket next-chunk read false-positives data adjacent to code (the
+// task-3b/3c storms); neither exists here.
+static void emitSmcChunkLoad(WasmModuleBuilder& b, u32 addr_local, u32 byte_off = 0) {
+    b.op_local_get(addr_local);
+    if (byte_off != 0) { b.op_i32_const((s32)byte_off); b.op_i32_add(); }
+    b.op_i32_const(0x00FFFFFC);
+    b.op_i32_and();
+    b.op_i32_const(2);
+    b.op_i32_shr_u();                    // word-chunk index (bits 2-23)
+    // g_code_map's base folds into the load's memarg offset instead of an
+    // `i32.const base; i32.add` pair — identical addressing (the memarg offset
+    // is an unsigned addend on the dynamic address; chunk < 2^22 and the base
+    // is a live heap address, so neither form can wrap or leave bounds where
+    // the other would not). 2 fewer wasm instructions on EVERY register-EA
+    // area-3 store, 4 fewer on the size-8 fmov.d pair, 2 fewer per iteration
+    // of the memset fastpath's mark loop.
+    b.op_i32_load8_u((u32)(uintptr_t)g_code_map);   // map[chunk] (0|1)
+}
+static void emitSmcMarkLocal(WasmModuleBuilder& b, u32 addr_local, u32 width) {
+    // `addr_local` holds the MASKED physical EA (addr & 0x1FFFFFFF), area==3.
+    // gen += map[c(phys)] — adds 0 for non-code chunks; the map is all-zero
+    // while disarmed, so this cannot move the generation off 0. Any nonzero
+    // add invalidates (equality compare). width <= 4 and aligned -> single
+    // chunk; the 8-byte fmov.d pair (aligned) -> chunks c and c+1.
+    const u32 gen = (u32)(uintptr_t)&g_ic_generation;
+    b.op_i32_const((s32)gen);            // store addr
+    b.op_i32_const((s32)gen);            // load addr
+    b.op_i32_load(0);                    // gen
+    emitSmcChunkLoad(b, addr_local);
+    if (width > 4) {
+        emitSmcChunkLoad(b, addr_local, 4);
+        b.op_i32_add();
+    }
+    b.op_i32_add();
+    b.op_i32_store(0);                   // gen += touched-chunk map bytes
+    // (The K2-attribution last-addr diag emitted here was STRIPPED after its
+    // verdict — it named the 16B-granularity false positives: the pre-block
+    // data word 0x0c37ea68, then the ISR frame counter 0x0c379b80. See
+    // docs/lever-4-smc-bitmap. g_smc_last_addr stays defined, reads 0.)
+}
+// Lever-5B: inline-sync_sr support. The TU-static interrupt-decode state
+// addresses (sh4_interrupts.cpp, WASM-gated accessor) are cached on first
+// sync_sr emission; g_emit_syncsr_fast is the bisect kill-switch
+// (FLYCAST_SYNCSR=0 forces the old always-C emission).
+extern "C" void sh4_intr_state_ptrs(uint32_t* out4);
+bool g_emit_syncsr_fast = []{
+    const char* e = std::getenv("FLYCAST_SYNCSR");
+    return !(e && e[0] == '0');
+}();
+static u32 g_sr_vpend_addr = 0, g_sr_vmask_addr = 0,
+           g_sr_decoded_addr = 0, g_sr_ilb_addr = 0;
+static bool sr_ptrs_ready() {
+    static bool init = false;
+    if (!init) {
+        uint32_t p[4] = {0, 0, 0, 0};
+        sh4_intr_state_ptrs(p);
+        g_sr_vpend_addr = p[0]; g_sr_vmask_addr = p[1];
+        g_sr_decoded_addr = p[2]; g_sr_ilb_addr = p[3];
+        init = true;
+    }
+    return g_sr_vpend_addr != 0;
+}
+
+// Compile-time-constant variant for the immediate-EA store fastpath: the
+// touched word-chunks are known at emit time, so the whole mark is const-addr.
+// Aligned w<=4 -> one chunk; the 8-byte pair (w=8) -> two.
+static void emitSmcMarkConstPage(WasmModuleBuilder& b, u32 phys_addr, u32 width) {
+    const u32 map = (u32)(uintptr_t)g_code_map;
+    const u32 c1 = (phys_addr & 0x00FFFFFFu) >> 2;
+    const u32 c2 = ((phys_addr & 0x00FFFFFFu) + (width ? width - 1 : 0)) >> 2;
+    const u32 gen = (u32)(uintptr_t)&g_ic_generation;
+    b.op_i32_const((s32)gen);
+    b.op_i32_const((s32)gen);
+    b.op_i32_load(0);
+    b.op_i32_const((s32)(map + c1));
+    b.op_i32_load8_u(0);
+    if (c2 != c1) {
+        b.op_i32_const((s32)(map + c2));
+        b.op_i32_load8_u(0);
+        b.op_i32_add();
+    }
+    b.op_i32_add();
+    b.op_i32_store(0);
+}
+bool g_emit_regcache = true;  // see scanBlock gate (boot-title-wedge kill-switch)
+
+// ---------------------------------------------------------------------------
+// PROLOGUE / HOP TRIM (2026-08-29 codegen audit). Three levers, each with its
+// own bisect switch, all measured ONLY by instruction count so far — the
+// wall-clock value is UNMEASURED until a matched pair runs.
+//
+// Evidence (offline emitter dump + wasm2wat, /tmp/dc-emit): an EMPTY
+// BET_StaticJump block emits 69 wasm instructions before any guest work; a
+// 1-guest-op block emits 84. On the hot path (IC hit, slice in budget) a block
+// executes ~30 fixed instructions + 8 linear-memory accesses per hop, plus
+// 3 instructions and 1 load per cached register in the eager prologue.
+//
+//   g_emit_preload_elide  — skip the prologue load for a register whose FIRST
+//                           top-level access in the block is a full definition
+//                           (the local is written before anything can read it).
+//                           Universal on cmp+branch blocks (sr.T is always
+//                           def-first) and on any block that loads/immediates
+//                           into a fresh GPR. Semantics-identical.
+//   g_emit_prologue_trim  — hoist the slice-yield precheck to the top of the
+//                           block (so no guest work — memset fastpath, cache
+//                           reload — runs on a spent slice) and reuse its
+//                           cycle_counter load for the per-block drain via
+//                           LOCAL_CC. Semantics-identical.
+//   g_emit_hop_guard      — DEFAULT ON (unchanged behaviour). When OFF, the
+//                           caller-side `cycle_counter > 0` vector guard is
+//                           dropped from emit_tail_to / the const-target probe
+//                           / the global probe / the RAS check, because with
+//                           the precheck hoisted to the top of EVERY block the
+//                           callee already enforces the same invariant one
+//                           instruction later. Saves 5 executed instructions
+//                           and 1 load per block hop. NOT semantics-identical:
+//                           a spent slice now costs one extra block entry (and
+//                           one extra sh4_jit_lookup_idx on the probe paths)
+//                           per timeslice, and the g_exit_* round-trip
+//                           counters stop counting guard-blocks (they then
+//                           count lookup misses only). Default OFF until a
+//                           matched pair certifies it.
+// ---------------------------------------------------------------------------
+bool g_emit_preload_elide = []{
+    const char* e = std::getenv("FLYCAST_PRELOAD_ELIDE");
+    return !(e && e[0] == '0');
+}();
+bool g_emit_prologue_trim = []{
+    const char* e = std::getenv("FLYCAST_PROLOGUE_TRIM");
+    return !(e && e[0] == '0');
+}();
+bool g_emit_hop_guard = []{
+    const char* e = std::getenv("FLYCAST_HOP_GUARD");
+    return !(e && e[0] == '0');
+}();
 
 // ---------------------------------------------------------------------------
 // Env-var gates (module-scope, read once at first emit). Both default OFF —
@@ -64,15 +230,100 @@ u32 g_vram_lin_base = 0;
 //   A/B perf evaluation; do not flip the default until coherence is fixed.
 // ---------------------------------------------------------------------------
 static bool s_self_loop_enabled = []{
-    // TEMP: default ON for verification. getenv() doesn't reach the wasm
-    // pthread worker, so env-var gating is non-functional. Revert to env-read
-    // once gates are rewired via URL params or Module.preRun.
+    // DEFAULT OFF (boot-title-wedge differential, 2026-08-20): the DP
+    // decompressor loop (dt + bf/s with a T-writing shlr in the delay slot,
+    // no fallback ops — so the fallback exclusion doesn't catch it) produces
+    // garbage output under the in-wasm self-loop emission while the interp
+    // arm is correct. Loop-less emission is dispatcher-paced and always
+    // correct; re-enable only after the self-loop passes the emitter unit
+    // test with T-writing delay slots (test_sh4_dispatch fixture).
     const char* e = std::getenv("FLYCAST_SELF_LOOP");
     if (e) return e[0] != '0';
+    // DEFAULT ON (2026-08-21): re-enabled with the T-writing-delay-slot gate
+    // below (self_loop requires <=1 SR_T write). The DP-decompressor loop that
+    // forced this off (dt + bf/s with a T-writing shlr in the delay slot) has
+    // TWO SR_T writes so it is now excluded and runs dispatcher-paced; simple
+    // copy/fill loops (memset at 0x8c12bc6e: one setae T-write, add delay slot)
+    // self-loop in-block — the SEGA-boot memset was ~7500 B/s via the dispatcher,
+    // starving the guest and triggering a level-4 interrupt storm (~66K/s).
+    //
+    // DEFAULT ON (2026-08-21, ORDER 21b) — WITH the cycle-counter loop bound
+    // added to the exit below. The interp-narrow verdict showed the UNBOUNDED
+    // self-loop mis-behaved: it ran all N iterations of the 0x8c12bc6e memset
+    // with NO interrupt servicing (cycle_counter drained hugely negative), then
+    // a deferred IRQ burst pinned the main thread at the rts (0x8c12bc78) and the
+    // storm never collapsed. The fix bounds the loop by cycle_counter (native
+    // slice_loop) so interrupts are serviced every timeslice. Runtime toggle
+    // bemental_sh4_set_self_loop / flycast_set_self_loop for A/B.
     return true;
 }();
+// Settable override (the const-init above is the compile-time default). The
+// use-site (build block) reads g_emit_self_loop so the toggle takes effect.
+bool g_emit_self_loop = s_self_loop_enabled;
+
+// Lever #2 (cross-block register residency) — 2-block region inlining. When ON,
+// a loop {A(BET_Cond, taken->B) -> B(BET_StaticJump -> A) -> A} is emitted as ONE
+// wasm loop that inlines B's body, keeping the SH4 register working-set resident
+// in wasm locals across A->B->A (reloadAll once at entry, flushAll once per exit)
+// instead of the per-block flushAll+reloadAll+return_call_indirect+C-probe on each
+// A<->B edge. Generalizes the single-block self-loop below. DEFAULT OFF (matched-
+// pair A/B lever). Toggle: bemental_sh4_set_region / flycast_set_region.
+// DEFAULT OFF: validated CORRECT (title renders with it ON) but the first-increment
+// shape (2-block A-cond -> B-staticjump -> A, INTRA-BATCH) does not reduce the title's
+// dominant probe cost (chit/schedtick unchanged ~528 ON vs OFF) because the title's hot
+// loops are CROSS-SHARD (that is why they fire emit_global_probe) and vaddr_to_block is a
+// single batch/shard. Next: cross-shard reach (shard-pack loop blocks or cross-shard
+// regions) + a region-fire counter + a cooled-rig matched pair. See task #26.
+bool g_emit_region = false;
+
+// ORDER 21b: emit the immediate post-RTE UpdateINTC? DEFAULT OFF (the fix — RTE
+// defers IRQ delivery to the slice-boundary crediting loop so the RTE target runs
+// first, breaking the Maple bit12 storm livelock). ON = legacy per-block delivery.
+bool g_emit_rte_intc = false;
+
+// ORDER 21b: bound the in-block self-loop by cycle_counter (break every timeslice
+// to service interrupts, native slice_loop)? The bound was added for the 384KB
+// memset's deferred-IRQ burst, but it adds a per-timeslice round-trip that makes
+// pure fixed-count busy-wait DELAY loops (e.g. the SEGA-screen timer at 0x8c0084f0,
+// ~40M iters) ~30x slower than native. With the RTE-INTC + SRdecode interrupt-gate
+// fixes now in, IRQ delivery is correct even when a self-loop defers a burst.
+// DEFAULT ON (bounded, native slice_loop): unbounded collapses the fixed-count
+// DELAY loops (advanced the boot to game code 0x8c411054 / the 0x8c3c2xxx event
+// dispatcher) BUT defers IRQs in interrupt-DEPENDENT game loops, reintroducing the
+// istnrm=0x1010 state there. The clean answer is a HYBRID (unbound pure busy-waits,
+// keep bounded for polls) or a runtime idle-loop detector — until then bounded is
+// the correct/safe default. Toggle to false for the delay-speedup experiment.
+// VERDICT (2026-08-21 oracle-diff): unbounded self-loops let the scheduler bunch
+// and defer IRQs unboundedly; bounded-per-timeslice is correct but pays a C
+// round-trip every ~64 iters, making the boot's ~40M-iter busy-wait DELAY loops
+// ~30x slower than native. FIX: batch by cycle_counter — run a big slice of
+// iterations in-block (cheap), break to service IRQs, re-enter. SELF_LOOP_CYCLE_
+// SLICE sets the batch: 0 = per-timeslice (old bounded); larger = fewer
+// round-trips (faster delays) but coarser IRQ servicing. 65536 cycles (~0.3ms
+// guest) is ~100x fewer breaks than per-timeslice yet services IRQs far finer
+// than a VBlank (16ms) — collapses the boot delays without a storm.
+bool g_self_loop_cycle_bound = true;
+// Must stay BELOW the HBlank period (~12700 SH4 cycles) so the crediting loop
+// delivers faster than level-6 (VBlank-In/HBlank) re-fires — otherwise level-6
+// is always pending at each delivery and level-4 (Maple bit12) is STARVED, so
+// bit12 never clears -> the game-phase istnrm=0x1010 wait (verified: main thread
+// at 0x8c411054 with IMASK=0, so it is delivery-rate not masking). 8192 gives
+// ~19x fewer round-trips than per-timeslice (fast delays) yet delivers finer
+// than HBlank (level-4 gets its turn). Oracle-diff verdict, 2026-08-21.
+constexpr s32 SELF_LOOP_CYCLE_SLICE = 8192;
 
 static bool s_lazy_regcache_enabled = []{
+    // Lever-6A: DEFAULT ON. The B11-class coherence hazard (lazy bookkeeping
+    // inside conditional arms) is closed structurally: every lazy helper
+    // consults WasmModuleBuilder::ifDepth() and BYPASSES the cache (direct
+    // ctx access, no loaded/dirty mutation) inside if/else arms. loop/block
+    // bodies execute unconditionally on entry and do not count.
+    // 6A VERDICT (2026-08-26): REVERTED to OFF. With the ifDepth gate the
+    // run went garbage-fast (clk p50 552MHz, fps=0 for 83 heartbeats — the
+    // guest spun without presenting frames): at least one coherence class
+    // remains uncovered. Do-not-retry without a full structural EmitIf
+    // wrapper (the powerpc-next RegCache::EmitIf pattern) + an emitter unit
+    // test. Eager stays the default.
     const char* e = std::getenv("FLYCAST_LAZY_REGCACHE");
     return e && e[0] != '0';
 }();
@@ -87,7 +338,14 @@ static bool s_lazy_regcache_enabled = []{
 static bool s_intc_pend_check = []{
     const char* e = std::getenv("FLYCAST_INTC_PROLOGUE");
     if (e) return e[0] != '0';
-    return true;
+    // DEFAULT OFF (2026-08-21): the per-block check delivered interrupt_pend on
+    // EVERY block entry, so while a Holly level-4 (Maple bit12) interrupt was
+    // pending the main thread re-vectored to the ISR on every block and made
+    // zero forward progress -> a ~66K/s delivery STORM starving the boot. Native
+    // x64 delivers only at timeslice boundaries (rec_wasm.cpp:2203-2206 does the
+    // same, every 448 cyc), which lets the main thread run between interrupts and
+    // clear the source. The 2026 IRL4-wait-loop concern predates honest crediting.
+    return false;
 }();
 
 // ---------------------------------------------------------------------------
@@ -119,6 +377,108 @@ static inline void emitStoreRdF32(WasmModuleBuilder& b, const shil_param& rd) {
     b.op_f32_store(rd.reg_offset());
 }
 
+// ---------------------------------------------------------------------------
+// Lever-5G: FPU f32 register cache. The CPU profile put 59.9% of heavy-phase
+// wall in emitted block code, with every FPU op doing raw ctx
+// load/load/op/store — geometry code was pure memory traffic. fr offsets
+// whose every in-block access goes through these f32 helpers get f32 locals
+// (candidates minus a conservative exclusion set built by scanBlockF32;
+// mixed-path offsets stay memory-direct, so no cross-type staleness can
+// exist). Kill-switch: FLYCAST_FPU_CACHE=0.
+// ---------------------------------------------------------------------------
+bool g_emit_fpu_cache = []{
+    const char* e = std::getenv("FLYCAST_FPU_CACHE");
+    return !(e && e[0] == '0');
+}();
+
+static inline void emitLoadParamF32C(WasmModuleBuilder& b, const shil_param& p,
+                                     const RegCache& cache) {
+    if (p.is_imm()) {
+        float val;
+        u32 bits = p._imm;
+        std::memcpy(&val, &bits, 4);
+        b.op_f32_const(val);
+        return;
+    }
+    s32 local = cache.getLocalF32(p.reg_offset());
+    if (local >= 0) {
+        if (s_lazy_regcache_enabled && !cache.isLoaded(p.reg_offset())) {
+            if (b.ifDepth() > 0) {               // 6A bypass
+                b.op_local_get(LOCAL_CTX);
+                b.op_f32_load(p.reg_offset());
+                return;
+            }
+            b.op_local_get(LOCAL_CTX);
+            b.op_f32_load(p.reg_offset());
+            b.op_local_set((u32)local);
+            const_cast<RegCache&>(cache).markLoaded(p.reg_offset());
+        }
+        b.op_local_get((u32)local);
+        return;
+    }
+    b.op_local_get(LOCAL_CTX);
+    b.op_f32_load(p.reg_offset());
+}
+static inline void emitPreStoreF32(WasmModuleBuilder& b, const shil_param& rd,
+                                   const RegCache& cache) {
+    if (!rd.is_imm() && cache.getLocalF32(rd.reg_offset()) >= 0) {
+        if (!(s_lazy_regcache_enabled && !cache.isLoaded(rd.reg_offset()) && b.ifDepth() > 0))
+            return;                              // 6A bypass otherwise
+    }
+    b.op_local_get(LOCAL_CTX);
+}
+static inline void emitPostStoreF32(WasmModuleBuilder& b, const shil_param& rd,
+                                    RegCache& cache) {
+    s32 local = cache.getLocalF32(rd.reg_offset());
+    if (local >= 0 &&
+        !(s_lazy_regcache_enabled && !cache.isLoaded(rd.reg_offset()) && b.ifDepth() > 0)) {
+        b.op_local_set((u32)local);
+        cache.markDirty(rd.reg_offset());
+        cache.markLoaded(rd.reg_offset());
+        return;
+    }
+    b.op_f32_store(rd.reg_offset());
+}
+
+// Lever-5G v2: offset-keyed variants for the raw-bank natives (fipr/ftrv)
+// whose operand offsets are compile-time constants.
+static inline void emitF32OffLoad(WasmModuleBuilder& b, const RegCache& cache, u32 off) {
+    s32 local = cache.getLocalF32(off);
+    if (local >= 0) {
+        if (s_lazy_regcache_enabled && !cache.isLoaded(off)) {
+            if (b.ifDepth() > 0) {               // 6A bypass
+                b.op_local_get(LOCAL_CTX);
+                b.op_f32_load(off);
+                return;
+            }
+            b.op_local_get(LOCAL_CTX);
+            b.op_f32_load(off);
+            b.op_local_set((u32)local);
+            const_cast<RegCache&>(cache).markLoaded(off);
+        }
+        b.op_local_get((u32)local);
+        return;
+    }
+    b.op_local_get(LOCAL_CTX);
+    b.op_f32_load(off);
+}
+static inline void emitF32OffStorePre(WasmModuleBuilder& b, const RegCache& cache, u32 off) {
+    if (cache.getLocalF32(off) >= 0 &&
+        !(s_lazy_regcache_enabled && !cache.isLoaded(off) && b.ifDepth() > 0)) return;
+    b.op_local_get(LOCAL_CTX);
+}
+static inline void emitF32OffStorePost(WasmModuleBuilder& b, RegCache& cache, u32 off) {
+    s32 local = cache.getLocalF32(off);
+    if (local >= 0 &&
+        !(s_lazy_regcache_enabled && !cache.isLoaded(off) && b.ifDepth() > 0)) {
+        b.op_local_set((u32)local);
+        cache.markDirty(off);
+        cache.markLoaded(off);
+        return;
+    }
+    b.op_f32_store(off);
+}
+
 // Cache-aware load: push the register's value onto the stack.
 // F9 lazy mode: if the cache local hasn't been loaded yet, emit a one-shot
 // `local.get ctx; i32.load <off>; local.set <local>` before the local.get.
@@ -136,6 +496,11 @@ static inline void emitLoadParamCached(WasmModuleBuilder& b, const shil_param& p
         s32 local = cache.getLocal(p.reg_offset());
         if (local >= 0) {
             if (s_lazy_regcache_enabled && !cache.isLoaded(p.reg_offset())) {
+                if (b.ifDepth() > 0) {           // 6A: conditional arm — bypass
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_i32_load(p.reg_offset());
+                    return;
+                }
                 b.op_local_get(LOCAL_CTX);
                 b.op_i32_load(p.reg_offset());
                 b.op_local_set((u32)local);
@@ -152,7 +517,13 @@ static inline void emitLoadParamCached(WasmModuleBuilder& b, const shil_param& p
 // emitPreStore: push ctx_ptr ONLY if rd is not cached (paired with emitPostStore).
 static inline void emitPreStore(WasmModuleBuilder& b, const shil_param& rd,
                                 const RegCache& cache) {
-    if (rd.is_r32i() && cache.getLocal(rd.reg_offset()) >= 0) return;
+    if (rd.is_r32i() && cache.getLocal(rd.reg_offset()) >= 0) {
+        // 6A: an UNLOADED reg stored inside a conditional arm must go to ctx
+        // (a local.set there would leave the other arm's path reading a
+        // zero-initialized local via the merged compile-time state).
+        if (!(s_lazy_regcache_enabled && !cache.isLoaded(rd.reg_offset()) && b.ifDepth() > 0))
+            return;
+    }
     b.op_local_get(LOCAL_CTX);
 }
 
@@ -163,7 +534,8 @@ static inline void emitPostStore(WasmModuleBuilder& b, const shil_param& rd,
                                  RegCache& cache) {
     if (rd.is_r32i()) {
         s32 local = cache.getLocal(rd.reg_offset());
-        if (local >= 0) {
+        if (local >= 0 &&
+            !(s_lazy_regcache_enabled && !cache.isLoaded(rd.reg_offset()) && b.ifDepth() > 0)) {
             b.op_local_set((u32)local);
             cache.markDirty(rd.reg_offset());
             if (s_lazy_regcache_enabled) cache.markLoaded(rd.reg_offset());
@@ -199,6 +571,14 @@ static inline void reloadOrInvalidate(WasmModuleBuilder& b, RegCache& cache) {
     else                         cache.reloadAll(b);
 }
 
+// Block-prologue flavour: honours the per-entry `preload` bit computed by
+// computeNoPreload. NEVER use this after a fallback call — there ctx memory is
+// authoritative for every entry and reloadAll is the only correct reload.
+static inline void reloadPrologueOrInvalidate(WasmModuleBuilder& b, RegCache& cache) {
+    if (s_lazy_regcache_enabled) cache.invalidateAll();
+    else                         cache.reloadPrologue(b);
+}
+
 // F9 helper for exit-path readers (jdyn / sr.T). emitBlockExit takes
 // `const RegCache&`, so we const_cast to mutate the loaded flag. Same
 // rationale as emitLoadParamCached's const_cast — only bookkeeping bits
@@ -207,6 +587,11 @@ static inline void emitCachedLocalGet(WasmModuleBuilder& b,
                                       const RegCache& cache,
                                       u32 ctxOffset, u32 wasmLocal) {
     if (s_lazy_regcache_enabled && !cache.isLoaded(ctxOffset)) {
+        if (b.ifDepth() > 0) {                   // 6A: conditional arm — bypass
+            b.op_local_get(LOCAL_CTX);
+            b.op_i32_load(ctxOffset);
+            return;
+        }
         b.op_local_get(LOCAL_CTX);
         b.op_i32_load(ctxOffset);
         b.op_local_set(wasmLocal);
@@ -315,8 +700,16 @@ static bool tryEmitReadmImmediate(WasmModuleBuilder& b, const shil_opcode& op,
         // rec_x64.cpp:941-964.
         b.op_i32_const((s32)physAddr);
         switch (op.size) {
-        case 1: b.op_call(WIMPORT_READ8);  break;
-        case 2: b.op_call(WIMPORT_READ16); break;
+        // Sign-extend 8/16-bit import reads: SH4 mov.b/mov.w sign-extend at
+        // the CPU regardless of source; the sh4_mem_read8/16 imports return
+        // zero-extended u32 (audit finding #2 — the area-3 arm already uses
+        // i32.load8_s/16_s; the import arms diverged from the interpreter).
+        case 1: b.op_call(WIMPORT_READ8);
+                b.op_i32_const(24); b.op_i32_shl();
+                b.op_i32_const(24); b.op_i32_shr_s(); break;
+        case 2: b.op_call(WIMPORT_READ16);
+                b.op_i32_const(16); b.op_i32_shl();
+                b.op_i32_const(16); b.op_i32_shr_s(); break;
         default: b.op_call(WIMPORT_READ32); break;
         }
     }
@@ -351,6 +744,12 @@ static bool tryEmitWriteMemImmediate(WasmModuleBuilder& b, const shil_opcode& op
             b.op_local_get(LOCAL_CTX);
             b.op_i32_load(op.rs2.reg_offset() + 4);
             b.op_i32_store(4);
+
+            // Lever-4: area-3 only (isRam also covers VRAM immediates, which
+            // hold no SH4 code). Width 8 covers the pair's touched chunks.
+            const u32 phys = addr & 0x1FFFFFFFu;
+            if ((phys >> 26) == 3)
+                emitSmcMarkConstPage(b, phys, 8);
         } else {
             // MMIO 64-bit: two write32 import calls.
             b.op_i32_const((s32)physAddr);
@@ -377,6 +776,9 @@ static bool tryEmitWriteMemImmediate(WasmModuleBuilder& b, const shil_opcode& op
         case 2: b.op_i32_store16(0); break;
         default: b.op_i32_store(0); break;
         }
+        // Lever-4: area-3 only (isRam also covers VRAM immediates).
+        if (((addr & 0x1FFFFFFFu) >> 26) == 3)
+            emitSmcMarkConstPage(b, addr & 0x1FFFFFFFu, op.size);
     } else {
         // PORTED FROM rec_x64.cpp:1046-1049: MMIO write through the import.
         b.op_i32_const((s32)physAddr);
@@ -391,6 +793,18 @@ static bool tryEmitWriteMemImmediate(WasmModuleBuilder& b, const shil_opcode& op
     return true;
 }
 
+// SHIL_FB ops are dispatched host-side (sh4_interp_shil_fb) from a pointer baked
+// into the emitted block. The RuntimeBlockInfo oplist that `op` lives in is FREED
+// after compile() (bementalJIT blocks aren't retained in flycast's bm), so baking
+// &op directly DANGLES — at run time sh4_interp_shil_fb then reads freed memory
+// whose op.op is often a shil_recimp (mov32/writem/jdyn/...) and die()s "requires
+// native dynarec implementation" (fatal). Persist a leaked copy (bounded by the
+// number of SHIL_FB ops compiled — a boot's worth is a few thousand * ~sizeof) so
+// the baked pointer stays valid for the life of the emitted block. ORDER 21b.
+static u32 persist_shil_op(const shil_opcode& op) {
+    return (u32)(uintptr_t)(new shil_opcode(op));
+}
+
 // ---------------------------------------------------------------------------
 // Per-op emit. Returns true if natively handled, false to fall back to IFB.
 // ---------------------------------------------------------------------------
@@ -401,6 +815,18 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
     // ---- Integer ALU ----
     // PORTED FROM xbyak_base.h:133-141 (shil_param_to_host_reg ==> mov rd,rs1)
     case shop_mov32:
+        // Lever-5G: fmov fr,fr routes through the f32 cache when either side
+        // holds an f32 entry (bit-preserving through f32 locals — wasm
+        // local/load/store moves never canonicalize NaNs; only arithmetic
+        // may). Uncached sides fall to ctx f32 load/store, same bits.
+        if (g_emit_fpu_cache && op.rd.is_r32f() && op.rs1.is_r32f() &&
+            (cache.getLocalF32(op.rd.reg_offset()) >= 0 ||
+             cache.getLocalF32(op.rs1.reg_offset()) >= 0)) {
+            emitPreStoreF32(b, op.rd, cache);
+            emitLoadParamF32C(b, op.rs1, cache);
+            emitPostStoreF32(b, op.rd, cache);
+            return true;
+        }
         emitPreStore(b, op.rd, cache);
         emitLoadParamCached(b, op.rs1, cache);
         emitPostStore(b, op.rd, cache);
@@ -743,7 +1169,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         // (!GenReadMemImmediate(op, block))`). When the EA is constant at
         // emit time the resolver returns a host pointer (RAM) or a known
         // physical address (MMIO) and we skip the runtime area dispatch.
-        if (tryEmitReadmImmediate(b, op, block, cache))
+        if (g_emit_imm_fastpath && tryEmitReadmImmediate(b, op, block, cache))
             return true;
 
         emitLoadParamCached(b, op.rs1, cache);
@@ -754,7 +1180,59 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         b.op_local_set(LOCAL_TMP);
 
         if (op.size == 8) {
-            // 64-bit read (float pair): two 32-bit reads via import.
+            // 64-bit read (float pair). Lever-5A area-3 fastpath: without it
+            // every fmov.d @Rm+ pays TWO C imports — the heavy-phase memcpy
+            // and geometry loops' dominant per-iteration cost (bulk moves use
+            // fmov.d under FPSCR.SZ=1). Same two-i32 shape as the proven
+            // imm-EA variant; MMIO falls through to the import pair.
+            if (g_emit_mem_fastpaths) {
+                b.op_local_get(LOCAL_TMP);
+                b.op_i32_const(0x1FFFFFFF);
+                b.op_i32_and();
+                b.op_local_tee(LOCAL_TMP);       // masked phys (raw EA recomputed in else)
+                b.op_i32_const(26);
+                b.op_i32_shr_u();
+                b.op_i32_const(3);
+                b.op_i32_eq();
+                b.op_if(0x40);
+                    b.op_local_get(LOCAL_CTX);   // for the lo-word store
+                    b.op_local_get(LOCAL_RAM);
+                    b.op_local_get(LOCAL_TMP);
+                    b.op_i32_const(0x00FFFFFF);
+                    b.op_i32_and();
+                    b.op_i32_add();
+                    b.op_local_tee(LOCAL_TMP2);  // linear addr
+                    b.op_i32_load(0);
+                    b.op_i32_store(op.rd.reg_offset());
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_local_get(LOCAL_TMP2);
+                    b.op_i32_load(4);
+                    b.op_i32_store(op.rd.reg_offset() + 4);
+                b.op_else();
+                    // Non-RAM: recompute the RAW EA (TMP now holds the masked
+                    // value) and take the import pair.
+                    emitLoadParamCached(b, op.rs1, cache);
+                    if (!op.rs3.is_null()) {
+                        emitLoadParamCached(b, op.rs3, cache);
+                        b.op_i32_add();
+                    }
+                    b.op_local_tee(LOCAL_TMP);
+                    b.op_call(WIMPORT_READ32);
+                    b.op_local_set(LOCAL_TMP2);
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_local_get(LOCAL_TMP2);
+                    b.op_i32_store(op.rd.reg_offset());
+                    b.op_local_get(LOCAL_TMP);
+                    b.op_i32_const(4);
+                    b.op_i32_add();
+                    b.op_call(WIMPORT_READ32);
+                    b.op_local_set(LOCAL_TMP2);
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_local_get(LOCAL_TMP2);
+                    b.op_i32_store(op.rd.reg_offset() + 4);
+                b.op_end();
+                return true;
+            }
             b.op_local_get(LOCAL_TMP);
             b.op_call(WIMPORT_READ32);
             b.op_local_set(LOCAL_TMP2);
@@ -773,7 +1251,26 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
             return true;
         }
 
+        if (!g_emit_mem_fastpaths) {
+            // Slow-only arm: original (unmasked) EA through the import.
+            emitPreStore(b, op.rd, cache);
+            b.op_local_get(LOCAL_TMP);
+            switch (op.size) {
+            // Sign-extend (see audit finding #2 note above).
+            case 1: b.op_call(WIMPORT_READ8);
+                    b.op_i32_const(24); b.op_i32_shl();
+                    b.op_i32_const(24); b.op_i32_shr_s(); break;
+            case 2: b.op_call(WIMPORT_READ16);
+                    b.op_i32_const(16); b.op_i32_shl();
+                    b.op_i32_const(16); b.op_i32_shr_s(); break;
+            default: b.op_call(WIMPORT_READ32); break;
+            }
+            emitPostStore(b, op.rd, cache);
+            return true;
+        }
+
         emitPreStore(b, op.rd, cache);
+
 
         b.op_local_get(LOCAL_TMP);
         b.op_i32_const(0x1FFFFFFF);
@@ -808,10 +1305,76 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
             emitLoadParamCached(b, op.rs3, cache);
             b.op_i32_add();
         }
+        // Lever-9D v2: OC-RAM arm ON THE IMPORT-FALLBACK PATH ONLY. v1 tested
+        // every access up front and lost 5.2% (the guard + CCR load ran on
+        // tens of millions of RAM accesses/s to save ~340K imports/s). Here
+        // the area-3 arm has already filtered the common case for free; this
+        // path runs only for non-RAM EAs, where the measured traffic is 100%
+        // OC-RAM (raw bucket b31 — PSO keeps its stack at 0x7Exxxxxx).
+        // Mapping = onChipRamOffset (sh4_mmr.cpp): ((raw>>(OIX?13:1))&0x1000)
+        // | (raw&0xfff), gated on CCR.ORA; P4 MMRs (0xFF...) fail the raw
+        // range test and keep the import.
+        const bool ocfp_r = g_emit_ocram_fp && g_ocram_lin_base != 0 && g_ccr_addr != 0;
+        if (ocfp_r) {
+            b.op_local_set(LOCAL_TMP);           // consume raw EA (both arms re-read TMP)
+            b.op_local_get(LOCAL_TMP);           // raw EA
+            b.op_i32_const((s32)0xFC000000);
+            b.op_i32_and();
+            b.op_i32_const((s32)0x7C000000);
+            b.op_i32_eq();
+            b.op_i32_const((s32)g_ccr_addr);
+            b.op_i32_load(0);
+            b.op_i32_const(0x20);                // CCR.ORA
+            b.op_i32_and();
+            b.op_i32_const(0);
+            b.op_i32_ne();
+            b.op_i32_and();
+            b.op_if(WASM_TYPE_I32);
+            b.op_i32_const((s32)g_ccr_addr);
+            b.op_i32_load(0);
+            b.op_i32_const(0x80);                // CCR.OIX index-mode select
+            b.op_i32_and();
+            b.op_if(WASM_TYPE_I32);
+              b.op_local_get(LOCAL_TMP); b.op_i32_const(13); b.op_i32_shr_u();
+            b.op_else();
+              b.op_local_get(LOCAL_TMP); b.op_i32_const(1); b.op_i32_shr_u();
+            b.op_end();
+            b.op_i32_const(0x1000); b.op_i32_and();
+            b.op_local_get(LOCAL_TMP); b.op_i32_const(0xfff); b.op_i32_and();
+            b.op_i32_or();
+            b.op_i32_const((s32)g_ocram_lin_base);
+            b.op_i32_add();
+            switch (op.size) {
+            case 1: b.op_i32_load8_s(0); break;
+            case 2: b.op_i32_load16_s(0); break;
+            default: b.op_i32_load(0); break;
+            }
+            b.op_else();
+            b.op_local_get(LOCAL_TMP);
+            switch (op.size) {
+            case 1: b.op_call(WIMPORT_READ8);
+                    b.op_i32_const(24); b.op_i32_shl();
+                    b.op_i32_const(24); b.op_i32_shr_s(); break;
+            case 2: b.op_call(WIMPORT_READ16);
+                    b.op_i32_const(16); b.op_i32_shl();
+                    b.op_i32_const(16); b.op_i32_shr_s(); break;
+            default: b.op_call(WIMPORT_READ32); break;
+            }
+            b.op_end();
+        } else {
         switch (op.size) {
-        case 1: b.op_call(WIMPORT_READ8);  break;
-        case 2: b.op_call(WIMPORT_READ16); break;
+        // Sign-extend 8/16-bit import reads: SH4 mov.b/mov.w sign-extend at
+        // the CPU regardless of source; the sh4_mem_read8/16 imports return
+        // zero-extended u32 (audit finding #2 — the area-3 arm already uses
+        // i32.load8_s/16_s; the import arms diverged from the interpreter).
+        case 1: b.op_call(WIMPORT_READ8);
+                b.op_i32_const(24); b.op_i32_shl();
+                b.op_i32_const(24); b.op_i32_shr_s(); break;
+        case 2: b.op_call(WIMPORT_READ16);
+                b.op_i32_const(16); b.op_i32_shl();
+                b.op_i32_const(16); b.op_i32_shr_s(); break;
         default: b.op_call(WIMPORT_READ32); break;
+        }
         }
         b.op_end();
 
@@ -829,10 +1392,60 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         // offset, so this naturally subsumes the area-4/5 g_vram_lin_base
         // path below for the immediate case while keeping the runtime
         // VRAM fastpath for register-based addresses.
-        if (tryEmitWriteMemImmediate(b, op, block, cache))
+        if (g_emit_imm_fastpath && tryEmitWriteMemImmediate(b, op, block, cache))
             return true;
 
         if (op.size == 8) {
+            // Lever-5A area-3 fastpath for the fmov.d store pair (was two
+            // unconditional C imports). RAM arm: two in-wasm i32 stores + the
+            // width-8 SMC mark; non-RAM recomputes the raw EA for the imports.
+            if (g_emit_mem_fastpaths && g_emit_writem_fp) {
+                emitLoadParamCached(b, op.rs1, cache);
+                if (!op.rs3.is_null()) {
+                    emitLoadParamCached(b, op.rs3, cache);
+                    b.op_i32_add();
+                }
+                b.op_i32_const(0x1FFFFFFF);
+                b.op_i32_and();
+                b.op_local_tee(LOCAL_TMP);       // masked phys
+                b.op_i32_const(26);
+                b.op_i32_shr_u();
+                b.op_i32_const(3);
+                b.op_i32_eq();
+                b.op_if(0x40);
+                    b.op_local_get(LOCAL_RAM);
+                    b.op_local_get(LOCAL_TMP);
+                    b.op_i32_const(0x00FFFFFF);
+                    b.op_i32_and();
+                    b.op_i32_add();
+                    b.op_local_tee(LOCAL_TMP2);  // linear addr
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_i32_load(op.rs2.reg_offset());
+                    b.op_i32_store(0);
+                    b.op_local_get(LOCAL_TMP2);
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_i32_load(op.rs2.reg_offset() + 4);
+                    b.op_i32_store(4);
+                    emitSmcMarkLocal(b, LOCAL_TMP, 8);
+                b.op_else();
+                    emitLoadParamCached(b, op.rs1, cache);
+                    if (!op.rs3.is_null()) {
+                        emitLoadParamCached(b, op.rs3, cache);
+                        b.op_i32_add();
+                    }
+                    b.op_local_tee(LOCAL_TMP);
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_i32_load(op.rs2.reg_offset());
+                    b.op_call(WIMPORT_WRITE32);
+                    b.op_local_get(LOCAL_TMP);
+                    b.op_i32_const(4);
+                    b.op_i32_add();
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_i32_load(op.rs2.reg_offset() + 4);
+                    b.op_call(WIMPORT_WRITE32);
+                b.op_end();
+                return true;
+            }
             emitLoadParamCached(b, op.rs1, cache);
             if (!op.rs3.is_null()) {
                 emitLoadParamCached(b, op.rs3, cache);
@@ -862,6 +1475,19 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         }
         b.op_local_set(LOCAL_TMP);
 
+        if (!g_emit_mem_fastpaths || !g_emit_writem_fp) {
+            // Slow-only arm: original (unmasked) EA through the import.
+            b.op_local_get(LOCAL_TMP);
+            emitLoadParamCached(b, op.rs2, cache);
+            switch (op.size) {
+            case 1: b.op_call(WIMPORT_WRITE8);  break;
+            case 2: b.op_call(WIMPORT_WRITE16); break;
+            default: b.op_call(WIMPORT_WRITE32); break;
+            }
+            return true;
+        }
+
+
         b.op_local_get(LOCAL_TMP);
         b.op_i32_const(0x1FFFFFFF);
         b.op_i32_and();
@@ -884,34 +1510,59 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         case 2: b.op_i32_store16(0); break;
         default: b.op_i32_store(0); break;
         }
+        // Lever-4: this is the one store the C hooks can't see — mark it.
+        emitSmcMarkLocal(b, LOCAL_TMP, op.size);
         b.op_else();
-        // Area-4/5 (VRAM) fastpath. Bake the linear-mem base + 0x7FFFFF
-        // (8 MiB) mask as constants. g_vram_lin_base is set by the bridge
-        // at first SH4 dispatch; emitting 0 here means the bake is stale
-        // and the runtime branch will still write the correct location
-        // since `i32.const 0 + vram_offset` is a valid linear-mem address.
-        // Cited blocker: 0x8c02ab4c PSO VRAM-fill loop hammered sh4_write32
-        // 0x200000× per pass via the slow path; this collapses each word
-        // write to a single i32.store. Emitter falls back to slow path if
-        // vram base is uninitialized OR address is outside areas 3/4/5.
-        if (g_vram_lin_base != 0) {
-            // (masked >> 26) == 4  OR  (masked >> 26) == 5
-            b.op_local_get(LOCAL_TMP);
-            b.op_i32_const(26);
-            b.op_i32_shr_u();
-            b.op_local_tee(LOCAL_TMP2);
-            b.op_i32_const(4);
-            b.op_i32_eq();
-            b.op_local_get(LOCAL_TMP2);
-            b.op_i32_const(5);
-            b.op_i32_eq();
-            b.op_i32_or();
-            b.op_if();
-            // dst = g_vram_lin_base + (masked & 0x7FFFFF)
-            b.op_i32_const((s32)g_vram_lin_base);
-            b.op_local_get(LOCAL_TMP);
-            b.op_i32_const(0x7FFFFF);
+        // NON-area-3 stores → canonical flycast import (sh4_mem_write* ->
+        // WriteMem -> pvr_write32p / etc). The former in-wasm area-1 VRAM
+        // swizzle store is REMOVED (boot-title-wedge 2026-08-20, bisected
+        // as the boot-blocking bug): its offset math matched pvr_map32
+        // exactly, but a raw i32.store into vram[] SKIPS flycast's
+        // pvr_write32p side effects (fb_dirty framebuffer-watch), so the
+        // boot's direct-VRAM framebuffer write never marked the frame dirty
+        // and boot wedged. The VRAM-clear that motivated the swizzle now
+        // completes anyway (honest sh4_sched cycle crediting fixed the real
+        // stall — it was scheduler starvation, not write speed). Perf can be
+        // revisited with a swizzle that ALSO sets fb_dirty; correctness
+        // first. (audit finding: the memory-fastpath boot bug.)
+        emitLoadParamCached(b, op.rs1, cache);
+        if (!op.rs3.is_null()) {
+            emitLoadParamCached(b, op.rs3, cache);
+            b.op_i32_add();
+        }
+        // Lever-9D v2: OC-RAM store arm on the import-fallback path only (see
+        // the readm twin for the v1 -5.2% lesson). No smc_mark: OC-RAM is not
+        // JIT-source space (blocks compile from RAM/ROM vaddrs only).
+        {
+        const bool ocfp_w = g_emit_ocram_fp && g_ocram_lin_base != 0 && g_ccr_addr != 0;
+        if (ocfp_w) {
+            b.op_local_set(LOCAL_TMP);           // consume raw EA (both arms re-read TMP)
+            b.op_local_get(LOCAL_TMP);           // raw EA
+            b.op_i32_const((s32)0xFC000000);
             b.op_i32_and();
+            b.op_i32_const((s32)0x7C000000);
+            b.op_i32_eq();
+            b.op_i32_const((s32)g_ccr_addr);
+            b.op_i32_load(0);
+            b.op_i32_const(0x20);                // CCR.ORA
+            b.op_i32_and();
+            b.op_i32_const(0);
+            b.op_i32_ne();
+            b.op_i32_and();
+            b.op_if(0x40);
+            b.op_i32_const((s32)g_ccr_addr);
+            b.op_i32_load(0);
+            b.op_i32_const(0x80);                // CCR.OIX index-mode select
+            b.op_i32_and();
+            b.op_if(WASM_TYPE_I32);
+              b.op_local_get(LOCAL_TMP); b.op_i32_const(13); b.op_i32_shr_u();
+            b.op_else();
+              b.op_local_get(LOCAL_TMP); b.op_i32_const(1); b.op_i32_shr_u();
+            b.op_end();
+            b.op_i32_const(0x1000); b.op_i32_and();
+            b.op_local_get(LOCAL_TMP); b.op_i32_const(0xfff); b.op_i32_and();
+            b.op_i32_or();
+            b.op_i32_const((s32)g_ocram_lin_base);
             b.op_i32_add();
             emitLoadParamCached(b, op.rs2, cache);
             switch (op.size) {
@@ -920,21 +1571,23 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
             default: b.op_i32_store(0); break;
             }
             b.op_else();
-        }
-        // Slow path: recompute the ORIGINAL virtual address. Same masking
-        // bug as shop_readm above — must NOT use LOCAL_TMP (masked) here.
-        emitLoadParamCached(b, op.rs1, cache);
-        if (!op.rs3.is_null()) {
-            emitLoadParamCached(b, op.rs3, cache);
-            b.op_i32_add();
-        }
+            b.op_local_get(LOCAL_TMP);
+            emitLoadParamCached(b, op.rs2, cache);
+            switch (op.size) {
+            case 1: b.op_call(WIMPORT_WRITE8);  break;
+            case 2: b.op_call(WIMPORT_WRITE16); break;
+            default: b.op_call(WIMPORT_WRITE32); break;
+            }
+            b.op_end();
+        } else {
         emitLoadParamCached(b, op.rs2, cache);
         switch (op.size) {
         case 1: b.op_call(WIMPORT_WRITE8);  break;
         case 2: b.op_call(WIMPORT_WRITE16); break;
         default: b.op_call(WIMPORT_WRITE32); break;
         }
-        if (g_vram_lin_base != 0) b.op_end();   // close inner area-4/5 if
+        }
+        }
         b.op_end();                              // close outer area-3 if
         return true;
     }
@@ -1033,90 +1686,90 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
 
     // ---- FPU scalar ----
     case shop_fadd:
-        b.op_local_get(LOCAL_CTX);
-        emitLoadParamF32(b, op.rs1);
-        emitLoadParamF32(b, op.rs2);
+        emitPreStoreF32(b, op.rd, cache);
+        emitLoadParamF32C(b, op.rs1, cache);
+        emitLoadParamF32C(b, op.rs2, cache);
         b.op_f32_add();
-        emitStoreRdF32(b, op.rd);
+        emitPostStoreF32(b, op.rd, cache);
         return true;
 
     case shop_fsub:
-        b.op_local_get(LOCAL_CTX);
-        emitLoadParamF32(b, op.rs1);
-        emitLoadParamF32(b, op.rs2);
+        emitPreStoreF32(b, op.rd, cache);
+        emitLoadParamF32C(b, op.rs1, cache);
+        emitLoadParamF32C(b, op.rs2, cache);
         b.op_f32_sub();
-        emitStoreRdF32(b, op.rd);
+        emitPostStoreF32(b, op.rd, cache);
         return true;
 
     case shop_fmul:
-        b.op_local_get(LOCAL_CTX);
-        emitLoadParamF32(b, op.rs1);
-        emitLoadParamF32(b, op.rs2);
+        emitPreStoreF32(b, op.rd, cache);
+        emitLoadParamF32C(b, op.rs1, cache);
+        emitLoadParamF32C(b, op.rs2, cache);
         b.op_f32_mul();
-        emitStoreRdF32(b, op.rd);
+        emitPostStoreF32(b, op.rd, cache);
         return true;
 
     case shop_fdiv:
-        b.op_local_get(LOCAL_CTX);
-        emitLoadParamF32(b, op.rs1);
-        emitLoadParamF32(b, op.rs2);
+        emitPreStoreF32(b, op.rd, cache);
+        emitLoadParamF32C(b, op.rs1, cache);
+        emitLoadParamF32C(b, op.rs2, cache);
         b.op_f32_div();
-        emitStoreRdF32(b, op.rd);
+        emitPostStoreF32(b, op.rd, cache);
         return true;
 
     case shop_fabs:
-        b.op_local_get(LOCAL_CTX);
-        emitLoadParamF32(b, op.rs1);
+        emitPreStoreF32(b, op.rd, cache);
+        emitLoadParamF32C(b, op.rs1, cache);
         b.op_f32_abs();
-        emitStoreRdF32(b, op.rd);
+        emitPostStoreF32(b, op.rd, cache);
         return true;
 
     case shop_fneg:
-        b.op_local_get(LOCAL_CTX);
-        emitLoadParamF32(b, op.rs1);
+        emitPreStoreF32(b, op.rd, cache);
+        emitLoadParamF32C(b, op.rs1, cache);
         b.op_f32_neg();
-        emitStoreRdF32(b, op.rd);
+        emitPostStoreF32(b, op.rd, cache);
         return true;
 
     case shop_fsqrt:
-        b.op_local_get(LOCAL_CTX);
-        emitLoadParamF32(b, op.rs1);
+        emitPreStoreF32(b, op.rd, cache);
+        emitLoadParamF32C(b, op.rs1, cache);
         b.op_f32_sqrt();
-        emitStoreRdF32(b, op.rd);
+        emitPostStoreF32(b, op.rd, cache);
         return true;
 
     case shop_fseteq:
         emitPreStore(b, op.rd, cache);
-        emitLoadParamF32(b, op.rs1);
-        emitLoadParamF32(b, op.rs2);
+        emitLoadParamF32C(b, op.rs1, cache);
+        emitLoadParamF32C(b, op.rs2, cache);
         b.op_f32_eq();
         emitPostStore(b, op.rd, cache);
         return true;
 
     case shop_fsetgt:
         emitPreStore(b, op.rd, cache);
-        emitLoadParamF32(b, op.rs1);
-        emitLoadParamF32(b, op.rs2);
+        emitLoadParamF32C(b, op.rs1, cache);
+        emitLoadParamF32C(b, op.rs2, cache);
         b.op_f32_gt();
         emitPostStore(b, op.rd, cache);
         return true;
 
     case shop_cvt_i2f_n:
     case shop_cvt_i2f_z:
-        b.op_local_get(LOCAL_CTX);
+        emitPreStoreF32(b, op.rd, cache);
         emitLoadParamCached(b, op.rs1, cache);
         b.op_f32_convert_i32_s();
-        emitStoreRdF32(b, op.rd);
+        emitPostStoreF32(b, op.rd, cache);
         return true;
 
     case shop_cvt_f2i_t:
         // NaN → 0x80000000 per SH4 spec (wasm i32.trunc_sat_f32_s returns 0).
         emitPreStore(b, op.rd, cache);
-        emitLoadParamF32(b, op.rs1);
-        emitLoadParamF32(b, op.rs1);
+        emitLoadParamF32C(b, op.rs1, cache);
+        emitLoadParamF32C(b, op.rs1, cache);
         b.op_f32_eq();
         b.op_if(WASM_TYPE_I32);
-        emitLoadParamF32(b, op.rs1);
+        emitLoadParamF32C(b, op.rs1, cache);
         b.op_i32_trunc_sat_f32_s();
         b.op_else();
         b.op_i32_const((s32)0x80000000);
@@ -1126,40 +1779,38 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
 
     // ---- FPU vector / fused (f64 accumulation to match reference) ----
     case shop_fmac:
-        b.op_local_get(LOCAL_CTX);
-        emitLoadParamF32(b, op.rs1);
-        emitLoadParamF32(b, op.rs2);
-        emitLoadParamF32(b, op.rs3);
+        emitPreStoreF32(b, op.rd, cache);
+        emitLoadParamF32C(b, op.rs1, cache);
+        emitLoadParamF32C(b, op.rs2, cache);
+        emitLoadParamF32C(b, op.rs3, cache);
         b.op_f32_mul();
         b.op_f32_add();
-        emitStoreRdF32(b, op.rd);
+        emitPostStoreF32(b, op.rd, cache);
         return true;
 
     case shop_fsrra:
-        b.op_local_get(LOCAL_CTX);
+        emitPreStoreF32(b, op.rd, cache);
         b.op_f32_const(1.0f);
-        emitLoadParamF32(b, op.rs1);
+        emitLoadParamF32C(b, op.rs1, cache);
         b.op_f32_sqrt();
         b.op_f32_div();
-        emitStoreRdF32(b, op.rd);
+        emitPostStoreF32(b, op.rd, cache);
         return true;
 
     case shop_fipr: {
         u32 off1 = op.rs1.reg_offset();
         u32 off2 = op.rs2.reg_offset();
-        b.op_local_get(LOCAL_CTX);
+        emitPreStoreF32(b, op.rd, cache);   // lever-5G v2: cache-aware
         for (int i = 0; i < 4; ++i) {
-            b.op_local_get(LOCAL_CTX);
-            b.op_f32_load(off1 + i * 4);
+            emitF32OffLoad(b, cache, off1 + i * 4);
             b.op_f64_promote_f32();
-            b.op_local_get(LOCAL_CTX);
-            b.op_f32_load(off2 + i * 4);
+            emitF32OffLoad(b, cache, off2 + i * 4);
             b.op_f64_promote_f32();
             b.op_f64_mul();
             if (i > 0) b.op_f64_add();
         }
         b.op_f32_demote_f64();
-        emitStoreRdF32(b, op.rd);
+        emitPostStoreF32(b, op.rd, cache);
         return true;
     }
 
@@ -1167,29 +1818,28 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         u32 voff = op.rs1.reg_offset();
         u32 moff = op.rs2.reg_offset();
 
-        b.op_local_get(LOCAL_CTX);
-        b.op_f32_load(voff);
+        // Lever-5G v2: source the vector via the f32 cache (compile-time
+        // offsets). Values still snapshot into the INT scratch locals so the
+        // column stores cannot alias the row reads.
+        emitF32OffLoad(b, cache, voff);
         b.op_i32_reinterpret_f32();
         b.op_local_set(LOCAL_TMP2);
 
-        b.op_local_get(LOCAL_CTX);
-        b.op_f32_load(voff + 4);
+        emitF32OffLoad(b, cache, voff + 4);
         b.op_i32_reinterpret_f32();
         b.op_local_set(LOCAL_TMP3);
 
-        b.op_local_get(LOCAL_CTX);
-        b.op_f32_load(voff + 8);
+        emitF32OffLoad(b, cache, voff + 8);
         b.op_i32_reinterpret_f32();
         b.op_local_set(LOCAL_TMP4);
 
-        b.op_local_get(LOCAL_CTX);
-        b.op_f32_load(voff + 12);
+        emitF32OffLoad(b, cache, voff + 12);
         b.op_i32_reinterpret_f32();
         b.op_local_set(LOCAL_TMP5);
 
         const u32 tmps[4] = { LOCAL_TMP2, LOCAL_TMP3, LOCAL_TMP4, LOCAL_TMP5 };
         for (int col = 0; col < 4; ++col) {
-            b.op_local_get(LOCAL_CTX);
+            emitF32OffStorePre(b, cache, voff + col * 4);
             for (int row = 0; row < 4; ++row) {
                 b.op_local_get(tmps[row]);
                 b.op_f32_reinterpret_i32();
@@ -1201,7 +1851,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
                 if (row > 0) b.op_f64_add();
             }
             b.op_f32_demote_f64();
-            b.op_f32_store(voff + col * 4);
+            emitF32OffStorePost(b, cache, voff + col * 4);
         }
         return true;
     }
@@ -1496,22 +2146,95 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
     }
 
     // ---- System ops that need flush+reload around a fallback call ----
-    case shop_sync_sr:
-    case shop_sync_fpscr:
-        // PORTED FROM rec_x64.cpp:295-301
-        // x64 directly emits GenCall(UpdateSR) or GenCall(Sh4Context::UpdateFPSCR).
-        // wasm has no direct function-pointer call — instead route through
-        // WIMPORT_SHIL_FB which looks up block->oplist[opIndex] on the host side
-        // and dispatches to UpdateSR / Sh4Context::UpdateFPSCR. See
-        // EmscriptenWorker.cpp:1095 (sh4_interp_shil_fb). This is one extra
-        // host-side switch vs. rec_x64's direct call, but semantically identical.
-        //
-        // OPTIMIZATION OPPORTUNITY: a dedicated pair of imports
-        // WIMPORT_SYNC_SR / WIMPORT_SYNC_FPSCR (no block_vaddr lookup, just
-        // direct call) would shave the bm_GetBlock + oplist[op_idx] dispatch
-        // per fire. See "Notes on missing imports" in the audit deliverable.
+    case shop_sync_sr: {
+        // Lever-5B: inline the COMMON case of UpdateSR (no register-bank
+        // change) — the game's imask set/restore leaf primitives fire this
+        // ~400K/s in gameplay-class code, and every fire previously paid the
+        // full flushAll + C import + host switch + UpdateSR + reload. The
+        // inline mirrors sh4_core_regs.cpp UpdateSR + sh4_interrupts.cpp
+        // SRdecode/recalc_pending_itrs exactly:
+        //   need_swap = (MD ? old^new : old) & RB   -> C fallback (rare)
+        //   else: old_sr.status = new & (MD ? ~0 : ~RB)
+        //         decoded_srimask = BL ? 0 : ~InterruptLevelBit[IMASK]
+        //         interrupt_pend  = vpend & vmask & decoded_srimask
+        // The TU-static addresses come from sh4_intr_state_ptrs (WASM-gated
+        // accessor). Computed loads here are block-BODY emission — the legal
+        // shape class (area-3 fastpath precedent), not the #18 dispatch-path
+        // landmine. Delivery semantics unchanged: pend is consumed by the
+        // per-block prologue check + the crediting loop, same as the C path.
         cache.flushAll(b);
-        b.op_i32_const((s32)block->vaddr);
+        if (g_emit_syncsr_fast && sr_ptrs_ready()) {
+            constexpr s32 RB_BIT = 1 << 29;
+            // TMP := new = ctx->sr.status (stack keeps a copy)
+            b.op_local_get(LOCAL_CTX);
+            b.op_i32_load(ctx_off::SR_STATUS);
+            b.op_local_tee(LOCAL_TMP);
+            // TMP2 := old
+            b.op_local_get(LOCAL_CTX);
+            b.op_i32_load(ctx_off::OLD_SR_STATUS);
+            b.op_local_set(LOCAL_TMP2);
+            // need_swap = (old ^ (new & mdmask)) & RB, mdmask = -((new>>30)&1)
+            b.op_i32_const(30); b.op_i32_shr_u();
+            b.op_i32_const(1);  b.op_i32_and();
+            b.op_i32_const(-1); b.op_i32_mul();       // mdmask
+            b.op_local_get(LOCAL_TMP); b.op_i32_and();
+            b.op_local_get(LOCAL_TMP2); b.op_i32_xor();
+            b.op_i32_const(RB_BIT); b.op_i32_and();
+            b.op_if(0x40);                            // bank change -> full C UpdateSR
+                b.op_i32_const((s32)persist_shil_op(op));
+                b.op_i32_const((s32)opIndex);
+                b.op_call(WIMPORT_SHIL_FB);
+            b.op_else();                              // FAST inline
+                // old_sr.status = new & (~RB | (md ? RB : 0))
+                b.op_local_get(LOCAL_CTX);
+                b.op_local_get(LOCAL_TMP);
+                b.op_local_get(LOCAL_TMP);
+                b.op_i32_const(30); b.op_i32_shr_u();
+                b.op_i32_const(1);  b.op_i32_and();
+                b.op_i32_const(29); b.op_i32_shl();   // md ? RB : 0
+                b.op_i32_const((s32)~RB_BIT); b.op_i32_or();
+                b.op_i32_and();
+                b.op_i32_store(ctx_off::OLD_SR_STATUS);
+                // d = ~ILB[(new>>4)&0xF] & ((bl)-1); decoded_srimask = d
+                b.op_i32_const((s32)g_sr_decoded_addr);
+                b.op_local_get(LOCAL_TMP);
+                b.op_i32_const(4);   b.op_i32_shr_u();
+                b.op_i32_const(0xF); b.op_i32_and();
+                b.op_i32_const(2);   b.op_i32_shl();  // u32 index -> byte offset
+                b.op_i32_const((s32)g_sr_ilb_addr);
+                b.op_i32_add();
+                b.op_i32_load(0);                     // ILB[IMASK]
+                b.op_i32_const(-1); b.op_i32_xor();   // ~ILB
+                b.op_local_get(LOCAL_TMP);
+                b.op_i32_const(28); b.op_i32_shr_u();
+                b.op_i32_const(1);  b.op_i32_and();
+                b.op_i32_const(1);  b.op_i32_sub();   // bl-1: 0 if BL, ~0 if not
+                b.op_i32_and();
+                b.op_local_tee(LOCAL_TMP2);
+                b.op_i32_store(0);
+                // ctx->interrupt_pend = vpend & vmask & d
+                b.op_local_get(LOCAL_CTX);
+                b.op_i32_const((s32)g_sr_vpend_addr); b.op_i32_load(0);
+                b.op_i32_const((s32)g_sr_vmask_addr); b.op_i32_load(0);
+                b.op_i32_and();
+                b.op_local_get(LOCAL_TMP2);
+                b.op_i32_and();
+                b.op_i32_store(ctx_off::INTERRUPT_PEND);
+            b.op_end();
+        } else {
+            b.op_i32_const((s32)persist_shil_op(op));
+            b.op_i32_const((s32)opIndex);
+            b.op_call(WIMPORT_SHIL_FB);
+        }
+        reloadOrInvalidate(b, cache);
+        return true;
+    }
+
+    case shop_sync_fpscr:
+        // PORTED FROM rec_x64.cpp:295-301 — route through WIMPORT_SHIL_FB,
+        // which dispatches to Sh4Context::UpdateFPSCR host-side.
+        cache.flushAll(b);
+        b.op_i32_const((s32)persist_shil_op(op));
         b.op_i32_const((s32)opIndex);
         b.op_call(WIMPORT_SHIL_FB);
         reloadOrInvalidate(b, cache);
@@ -1542,9 +2265,10 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
             if (!kv.second.dirty) continue;
             b.op_local_get(LOCAL_CTX);
             b.op_local_get(kv.second.wasmLocal);
-            b.op_i32_store(kv.first);
+            if (kv.second.isF32) b.op_f32_store(kv.first);   // lever-5G typed spill
+            else                 b.op_i32_store(kv.first);
         }
-        b.op_i32_const((s32)block->vaddr);
+        b.op_i32_const((s32)persist_shil_op(op));
         b.op_i32_const((s32)opIndex);
         b.op_call(WIMPORT_SHIL_FB);
         if (s_lazy_regcache_enabled) {
@@ -1555,7 +2279,14 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         } else {
             for (auto& kv : cache.entries) {
                 b.op_local_get(LOCAL_CTX);
-                b.op_i32_load(kv.first);
+                // Typed reload — an f32 entry fed by i32.load is a V8
+                // validation error that takes the whole module down (the
+                // 2026-08-27 552-block shard kill: pref + f32-cached fr in
+                // one block). The spill twin above was typed by lever-5G;
+                // this half was missed because pref has no fr params, so
+                // scanBlockF32's exclusion never protects these blocks.
+                if (kv.second.isF32) b.op_f32_load(kv.first);
+                else                 b.op_i32_load(kv.first);
                 b.op_local_set(kv.second.wasmLocal);
             }
         }
@@ -1578,7 +2309,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
     case shop_debug_1:
     case shop_debug_3:
         cache.flushAll(b);
-        b.op_i32_const((s32)block->vaddr);
+        b.op_i32_const((s32)persist_shil_op(op));
         b.op_i32_const((s32)opIndex);
         b.op_call(WIMPORT_SHIL_FB);
         reloadOrInvalidate(b, cache);
@@ -1600,8 +2331,55 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
 // vaddr is in the map, (c) target != this block's own vaddr (no self-link —
 // trivial infinite tail-call chains add no value vs the C++ dispatcher's loop
 // and confuse profilers).
+bool g_emit_tail_link = true;   // block-to-block return_call tail-linking (bisect switch)
+
+// ORDER 21b Lever-1 PREDICTION instrumentation: runtime exit-to-C round-trip
+// classification. Each compiled block whose exit CANNOT tail-link emits a bump
+// of one of these on its exit path, so the totals are execution-weighted counts
+// of the round-trips each lever could remove. Read via flycast_ctx_snapshot
+// 15/16/17. Strip after the prediction verdict (instruments strip after verdict).
+// extern "C" -> unmangled global symbol so the bridge TU (rec_wasm.cpp) can
+// read them without namespace-mangling mismatch across translation units.
+extern "C" {
+uint32_t g_exit_dyn         = 0;  // BET_CLS_Dynamic (jmp/jsr @Rn, rts, RTE) -> Lever 1
+uint32_t g_exit_static_xshd = 0;  // BET_CLS_Static cross-shard / StaticIntr -> Lever 2
+uint32_t g_exit_cond_xshd   = 0;  // BET_CLS_COND with a cross-shard arm      -> Lever 1/2
+
+// Monomorphic INLINE CACHE for dynamic exits (jsr/jmp @Rn, rts) — native flycast's
+// fpcb/rdv_LinkBlock monomorphic guard, reshaped for immutable WASM. Per-call-site
+// scalar triple {ic_pc, ic_slot, ic_gen} at COMPILE-TIME-CONSTANT addresses — ONLY
+// the emit_rt_bump-proven `i32.const A; i32.load/store` shape (NO shared array, NO
+// computed index) so the runtime module still instantiates. g_ic_generation: 0 =
+// DISARMED (fills gated off -> boot byte-identical to today); 1 = armed (parent
+// flips post-title); ++ on stale/clear invalidates every cached entry.
+static constexpr uint32_t IC_SITES = 1u << 16;   // 1.5MB BSS (zero-init); recompiles leak a slot, bounded
+// Lever-6C: TWO ways per site (dynamic jsr sites are polymorphic; one way
+// thrashed like pre-5E2 conds, ~1.4M C-probes/s heavy). [6s+0..2]=way0
+// {pc,slot,gen}; [6s+3..5]=way1. Fill demotes way0->way1. Const-target
+// (5E2) sites use way0 {slot,gen} only.
+uint32_t g_ic[6 * IC_SITES];
+uint32_t g_ic_next = 0;                            // compile-time site allocator
+volatile uint32_t g_ic_generation = 0;             // 0=disarmed, 1=armed, ++ = invalidate epoch
+// TEST (2026-08-23): extend the IC to cond/static exits. UNSAFE alone — those exits
+// carry the ram_code_sum SMC-verify coverage (jit_lookup); moving them onto the IC
+// drops SMC detection. Paired with a periodic g_ic_generation flush in the crediting
+// loop (rec_wasm.cpp) that bounds staleness by forcing periodic re-verify. Emission
+// always includes the ops (inert until armed); this just gates cond/static sites.
+// Lever-5E3: depth-1 return-address prediction. A BET_DynamicCall exit
+// PRIMES g_ras_pc with the block's NextBlock (the decoder's own "ret hint"),
+// invalidating the cached slot when the call site changes; the C resolver
+// (sh4_jit_lookup_idx) fills slot+gen when it resolves that pc while armed;
+// a BET_DynamicRet exit checks the triple before its per-site IC. Leaf
+// jsr/rts pairs hit ~always where the per-site rts IC was megamorphic.
+uint32_t g_ras_pc = 0, g_ras_slot = 0;
+uint32_t g_ras_gen = 0xFFFFFFFFu;   // never-matching until first armed fill
+
+static bool g_ic_cs = true;    // cond/static IC: ~1.8x native. SAFE as of lever-4 Build 2 — every write path into RAM (emitted fastpath stores incl. memset, C slowpath imports, WriteMemBlock/DMA chokepoints) bumps g_ic_generation on a code-word hit (4-byte-granular map, zero false positives at the title: icgen=1 flat, task-3e probe). The old corruption class (loader SMC out-racing periodic flushes) is closed event-driven; jit_register re-registration bumps cover slot-churn.
+}
+
 static s32 sibling_func_idx(u32 target_vaddr, u32 self_vaddr,
                             const std::unordered_map<u32, u32>* vaddr_to_idx) {
+    if (!g_emit_tail_link) return -1;
     if (vaddr_to_idx == nullptr) return -1;
     if (target_vaddr == self_vaddr) return -1;
     auto it = vaddr_to_idx->find(target_vaddr);
@@ -1615,13 +2393,213 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
     u32 bcls = BET_GET_CLS(block->BlockType);
     const u32 self_vaddr = block != nullptr ? block->vaddr : 0u;
 
-    // Intra-link helper: emit `local.get ctx; local.get ram; return_call idx`.
-    // return_call is the wasm tail-call opcode — replaces the current stack
-    // frame, so unbounded chains of linked blocks run in O(1) stack.
+    // Intra-link helper: tail-call the sibling block — BUT vector-guarded, exactly
+    // like emit_global_probe. ORDER 21b (PSO title frame-wait livelock): the old
+    // form was an UNCONDITIONAL `return_call`, so an all-intra-shard hot loop
+    // (whose blocks all resolve via sibling_func_idx, never the cross-shard probe)
+    // return_call-chained FOREVER and never re-entered the C trampoline. But
+    // sh4_sched_tick (guest timebase -> SPG scanline -> VBlank raise) AND UpdateINTC
+    // (interrupt delivery) live ONLY in the trampoline's `cycle_counter <= 0` branch
+    // (rec_wasm.cpp). So the guest's VBlank ISR never ran, the game's "wait N
+    // VBlanks" frame-sync loops never advanced, and the boot livelocked at varying
+    // PCs (0x8c3c53f8 / 0x8c37bxxx) with interrupts pending-but-undelivered. Native
+    // rec-x64 links blocks only WITHIN a timeslice and falls back to intc_sched at
+    // cycle_counter<=0 — match that. This helper now ALWAYS ends the frame: it
+    // return_calls the sibling while the slice has budget (cycle_counter > 0), else
+    // returns the (already-stored) PC to the trampoline so sched+interrupts run.
+    // Both callers still `return` after it (the frame is always ended here).
     auto emit_tail_to = [&](u32 func_idx) {
+        if (!g_emit_hop_guard) {
+            // Guard elided: the callee's OWN slice-yield precheck is now the
+            // first instruction of its body (prologue-trim hoist) and stores
+            // exactly the PC this arm already wrote, so the observable result
+            // is identical — one extra function entry per spent slice.
+            b.op_local_get(LOCAL_CTX);
+            b.op_local_get(LOCAL_RAM);
+            b.op_return_call(func_idx);
+            return;
+        }
         b.op_local_get(LOCAL_CTX);
-        b.op_local_get(LOCAL_RAM);
-        b.op_return_call(func_idx);
+        b.op_i32_load(ctx_off::CYCLE_COUNTER);
+        b.op_i32_const(0);
+        b.op_i32_gt_s();
+        b.op_if(0x40);                          // void — vector-guard
+          b.op_local_get(LOCAL_CTX);
+          b.op_local_get(LOCAL_RAM);
+          b.op_return_call(func_idx);           // in-budget: chain, ends frame
+        b.op_end();
+        // slice spent (cycle_counter <= 0): return PC to C so the dispatcher's
+        // cycle_counter<=0 branch runs sh4_sched_tick + UpdateINTC, then re-dispatches.
+        b.op_local_get(LOCAL_CTX);
+        b.op_i32_load(ctx_off::PC);
+        b.op_return();
+    };
+
+    // ORDER 21b prediction: emit `*(u32*)ctr += 1` into the block's exit path.
+    // Only the non-tail-linked (return-to-C) paths call this, so the runtime
+    // total is the execution-weighted round-trip count for that class. The
+    // counters (g_exit_dyn / g_exit_static_xshd / g_exit_cond_xshd) are defined
+    // at namespace scope above. Strip with them after the verdict.
+    auto emit_rt_bump = [&](uint32_t* ctr) {
+        u32 a = (u32)(uintptr_t)ctr;
+        b.op_i32_const((s32)a);   // addr (for store)
+        b.op_i32_const((s32)a);   // addr (for load)
+        b.op_i32_load(0);         // -> *ctr
+        b.op_i32_const(1);
+        b.op_i32_add();           // -> *ctr + 1
+        b.op_i32_store(0);        // *ctr = *ctr + 1
+    };
+
+    // ORDER 21b Lever 1/2 — GLOBAL cross-shard / dynamic tail-link probe.
+    // Precondition: PC already holds the target vaddr and the RegCache is
+    // flushed (emitBlockFuncBody flushAll's before emitBlockExit). Emits, with
+    // GC scar #1 (the vector-guard) FIRST so a chain never outruns a due
+    // timeslice/interrupt (else a poll chain waiting on an interrupt-set flag
+    // livelocks — the storm class):
+    //   if (cycle_counter > 0) {
+    //     idx = sh4_lookup_idx(PC);                 ;; -1 on miss OR SMC-stale
+    //     if (idx != -1) return_call_indirect(idx); ;; chain in-wasm; ends frame
+    //   }
+    // On guard-block or miss it falls through to the caller's rt_bump (scar #2
+    // miss telemetry) + return-to-C. NOT emitted for BET_*Intr blocks — those
+    // must reach the UpdateINTC tail-call below.
+    // emit_ic = true only for BET_CLS_Dynamic (jsr/jmp @Rn, rts) — confines the IC
+    // byte-growth to the class that fires the title's dominant cost, halving the
+    // module-scale replication that is the residual instantiation risk.
+    // Lever-5E2: const-target probe for cond/static exits. The target pc is a
+    // COMPILE-TIME constant, so the site needs no pc tag — just {slot, gen}
+    // (the same proven scalar shape; ic_pc is stamped with the target for
+    // forensics only). Per-ARM sites mean an alternating conditional keeps
+    // BOTH targets cached — the monomorphic single-site thrash (a 50/50
+    // branch never hit) was driving ~2M C-probe lookups/s. Precondition:
+    // ctx->pc already stores `target`.
+    auto emit_const_target_probe = [&](u32 target) {
+        const bool have_ic = g_ic_cs && (g_ic_next < IC_SITES);
+        const uint32_t site = have_ic ? g_ic_next++ : 0;
+        uint32_t* icpc = &g_ic[6*site+0];
+        uint32_t* icsl = &g_ic[6*site+1];
+        uint32_t* icgn = &g_ic[6*site+2];
+        if (have_ic) {
+            g_ic[6*site+0] = target;        // forensics stamp (not compared)
+            // Sentinel: with no pc tag, gen-match alone must never validate an
+            // UNFILLED site (icgn=0 would match the disarmed gen=0 and fire
+            // table slot 0). 0xFFFFFFFF is unreachable (fills stamp live gens).
+            g_ic[6*site+2] = 0xFFFFFFFFu;
+        }
+
+        if (g_emit_hop_guard) {
+        b.op_local_get(LOCAL_CTX);
+        b.op_i32_load(ctx_off::CYCLE_COUNTER);
+        b.op_i32_const(0);
+        b.op_i32_gt_s();
+        b.op_if(0x40);                          // vector-guard (Maple-storm scar, KEEP)
+        }
+          if (have_ic) {
+            b.op_i32_const((s32)(u32)(uintptr_t)icgn); b.op_i32_load(0);
+            b.op_i32_const((s32)(u32)(uintptr_t)&g_ic_generation); b.op_i32_load(0);
+            b.op_i32_eq();                      // gen match == entry valid (no tag needed)
+            b.op_if(0x40);
+              b.op_local_get(LOCAL_CTX);
+              b.op_local_get(LOCAL_RAM);
+              b.op_i32_const((s32)(u32)(uintptr_t)icsl); b.op_i32_load(0);
+              b.op_return_call_indirect(0, 0);
+            b.op_end();
+          }
+          b.op_i32_const((s32)target);
+          b.op_call(WIMPORT_LOOKUP_IDX);
+          b.op_local_tee(LOCAL_TMP2);
+          b.op_i32_const(-1);
+          b.op_i32_ne();
+          b.op_if(0x40);
+            if (have_ic) {
+              b.op_i32_const((s32)(u32)(uintptr_t)&g_ic_generation); b.op_i32_load(0);
+              b.op_if(0x40);                    // fills gated on armed
+                b.op_i32_const((s32)(u32)(uintptr_t)icsl); b.op_local_get(LOCAL_TMP2); b.op_i32_store(0);
+                b.op_i32_const((s32)(u32)(uintptr_t)icgn); b.op_i32_const((s32)(u32)(uintptr_t)&g_ic_generation); b.op_i32_load(0); b.op_i32_store(0);
+              b.op_end();
+            }
+            b.op_local_get(LOCAL_CTX);
+            b.op_local_get(LOCAL_RAM);
+            b.op_local_get(LOCAL_TMP2);
+            b.op_return_call_indirect(0, 0);
+          b.op_end();
+        if (g_emit_hop_guard) b.op_end();        // close the vector-guard if
+        (void)icpc;
+    };
+
+    auto emit_global_probe = [&](bool emit_ic) {
+        const bool have_ic = emit_ic && (g_ic_next < IC_SITES);
+        const uint32_t site = have_ic ? g_ic_next++ : 0;
+        uint32_t* icpc = &g_ic[6*site+0];
+        uint32_t* icsl = &g_ic[6*site+1];
+        uint32_t* icgn = &g_ic[6*site+2];
+        uint32_t* icpc1 = &g_ic[6*site+3];
+        uint32_t* icsl1 = &g_ic[6*site+4];
+        uint32_t* icgn1 = &g_ic[6*site+5];
+
+        if (g_emit_hop_guard) {
+        b.op_local_get(LOCAL_CTX);
+        b.op_i32_load(ctx_off::CYCLE_COUNTER);
+        b.op_i32_const(0);
+        b.op_i32_gt_s();
+        b.op_if(0x40);                          // void — vector-guard (Maple-storm scar, KEEP)
+        }
+
+          if (have_ic) {                        // ---- IC HIT: constant-addr scalar loads only ----
+            b.op_i32_const((s32)(u32)(uintptr_t)icpc); b.op_i32_load(0);
+            b.op_local_get(LOCAL_CTX); b.op_i32_load(ctx_off::PC);
+            b.op_i32_eq();
+            b.op_i32_const((s32)(u32)(uintptr_t)icgn); b.op_i32_load(0);
+            b.op_i32_const((s32)(u32)(uintptr_t)&g_ic_generation); b.op_i32_load(0);
+            b.op_i32_eq();
+            b.op_i32_and();                     // ic_pc==pc && ic_gen==g_ic_generation
+            b.op_if(0x40);                      // hit
+              b.op_local_get(LOCAL_CTX);
+              b.op_local_get(LOCAL_RAM);
+              b.op_i32_const((s32)(u32)(uintptr_t)icsl); b.op_i32_load(0);   // cached table idx
+              b.op_return_call_indirect(0, 0);  // way0 hit — no wasm->C boundary
+            b.op_end();
+            // Lever-6C way1 (polymorphic call sites)
+            b.op_i32_const((s32)(u32)(uintptr_t)icpc1); b.op_i32_load(0);
+            b.op_local_get(LOCAL_CTX); b.op_i32_load(ctx_off::PC);
+            b.op_i32_eq();
+            b.op_i32_const((s32)(u32)(uintptr_t)icgn1); b.op_i32_load(0);
+            b.op_i32_const((s32)(u32)(uintptr_t)&g_ic_generation); b.op_i32_load(0);
+            b.op_i32_eq();
+            b.op_i32_and();
+            b.op_if(0x40);
+              b.op_local_get(LOCAL_CTX);
+              b.op_local_get(LOCAL_RAM);
+              b.op_i32_const((s32)(u32)(uintptr_t)icsl1); b.op_i32_load(0);
+              b.op_return_call_indirect(0, 0);
+            b.op_end();
+          }
+
+          b.op_local_get(LOCAL_CTX);
+          b.op_i32_load(ctx_off::PC);           // target vaddr
+          b.op_call(WIMPORT_LOOKUP_IDX);        // MISS: existing C resolver (unchanged)
+          b.op_local_tee(LOCAL_TMP2);
+          b.op_i32_const(-1);
+          b.op_i32_ne();
+          b.op_if(0x40);                        // void — hit
+            if (have_ic) {                      // ---- FILL, gated on generation != 0 (= armed) ----
+              b.op_i32_const((s32)(u32)(uintptr_t)&g_ic_generation); b.op_i32_load(0);
+              b.op_if(0x40);
+                // 6C: demote way0 -> way1 before refilling way0
+                b.op_i32_const((s32)(u32)(uintptr_t)icpc1); b.op_i32_const((s32)(u32)(uintptr_t)icpc); b.op_i32_load(0); b.op_i32_store(0);
+                b.op_i32_const((s32)(u32)(uintptr_t)icsl1); b.op_i32_const((s32)(u32)(uintptr_t)icsl); b.op_i32_load(0); b.op_i32_store(0);
+                b.op_i32_const((s32)(u32)(uintptr_t)icgn1); b.op_i32_const((s32)(u32)(uintptr_t)icgn); b.op_i32_load(0); b.op_i32_store(0);
+                b.op_i32_const((s32)(u32)(uintptr_t)icpc); b.op_local_get(LOCAL_CTX); b.op_i32_load(ctx_off::PC); b.op_i32_store(0);
+                b.op_i32_const((s32)(u32)(uintptr_t)icsl); b.op_local_get(LOCAL_TMP2); b.op_i32_store(0);
+                b.op_i32_const((s32)(u32)(uintptr_t)icgn); b.op_i32_const((s32)(u32)(uintptr_t)&g_ic_generation); b.op_i32_load(0); b.op_i32_store(0);
+              b.op_end();
+            }
+            b.op_local_get(LOCAL_CTX);
+            b.op_local_get(LOCAL_RAM);
+            b.op_local_get(LOCAL_TMP2);         // wasmTable index
+            b.op_return_call_indirect(0, 0);    // type 0 (i32,i32)->i32, table 0
+          b.op_end();
+        if (g_emit_hop_guard) b.op_end();        // close the vector-guard if
     };
 
     // Whether emitBlockExit's caller still needs to push the PC for the
@@ -1641,16 +2619,41 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         b.op_i32_const((s32)target);
         b.op_i32_store(ctx_off::PC);
 
-        // Intra-link for plain StaticJump (skip StaticIntr — UpdateINTC tail
-        // call below must run first; skip StaticCall — semantics expect the
-        // dispatcher to honor BSR's pr-save by going through the trampoline).
-        if (block != nullptr && block->BlockType == BET_StaticJump) {
+        // Intra-link StaticJump AND StaticCall (BSR) — both have a compile-time
+        // constant target (BranchBlock). BSR's pr-save is NOT the dispatcher's
+        // job: the decoder emits `shop_mov32 reg_pr = retaddr` INSIDE the block
+        // (decoder.cpp:106-109,165), so PR is already stored when we tail-call
+        // the callee; the callee's RTS reads the correct return address.
+        // (Still skip StaticIntr — the UpdateINTC tail-call below must run.)
+        // Profile (2026-08-21): rts/call round-trips are the #1 dispatcher cost.
+        if (block != nullptr &&
+            (block->BlockType == BET_StaticJump || block->BlockType == BET_StaticCall)) {
             s32 fidx = sibling_func_idx(target, self_vaddr, vaddr_to_idx);
             if (fidx >= 0) {
                 emit_tail_to((u32)fidx);
                 return;  // tail-call replaces frame; below is unreachable
             }
         }
+        if (block != nullptr && block->BlockType != BET_StaticIntr)
+            emit_const_target_probe(target);    // lever-5E2: const-target, no pc tag, per-site slot+gen
+        else if (block != nullptr && block->BlockType == BET_StaticIntr) {
+            // Lever-5C: an ldc-SR block's sync_sr (5B inline or C fallback)
+            // has ALREADY recomputed ctx->interrupt_pend by this point. The
+            // unconditional return-to-C + UpdateINTC here made EVERY imask
+            // set/restore call a C round-trip (~430K/s in the heavy phase,
+            // the rtstat mystery). pend==0 — the overwhelming case — can
+            // chain like any static exit; pend!=0 falls through to the
+            // UpdateINTC tail exactly as before (immediate delivery), and
+            // the per-block prologue pend check backstops the chained path
+            // one block later (finer than the shipped deferred-RTE choice).
+            b.op_local_get(LOCAL_CTX);
+            b.op_i32_load(ctx_off::INTERRUPT_PEND);
+            b.op_i32_eqz();
+            b.op_if(0x40);
+                emit_const_target_probe(target);   // lever-5E2 const-target form
+            b.op_end();
+        }
+        emit_rt_bump(&g_exit_static_xshd);  // reached only on guard-block/miss (scar #2)
         break;
     }
 
@@ -1664,6 +2667,56 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
             b.op_i32_load(ctx_off::JDYN);
         }
         b.op_i32_store(ctx_off::PC);
+        // Lever-5E3 prime: a dynamic CALL's return lands at NextBlock — record
+        // it, invalidating the cached slot only when the call site changes so
+        // hot same-site loops keep their valid prediction.
+        if (block != nullptr && block->BlockType == BET_DynamicCall) {
+            b.op_i32_const((s32)(u32)(uintptr_t)&g_ras_pc);
+            b.op_i32_load(0);
+            b.op_i32_const((s32)block->NextBlock);
+            b.op_i32_ne();
+            b.op_if(0x40);
+                b.op_i32_const((s32)(u32)(uintptr_t)&g_ras_pc);
+                b.op_i32_const((s32)block->NextBlock);
+                b.op_i32_store(0);
+                b.op_i32_const((s32)(u32)(uintptr_t)&g_ras_gen);
+                b.op_i32_const(-1);
+                b.op_i32_store(0);
+            b.op_end();
+        }
+        // Lever-5E3 check: on a RETURN, if the resolved pc matches the
+        // prediction and its fill is current-generation, chain directly.
+        if (block != nullptr && block->BlockType == BET_DynamicRet) {
+            if (g_emit_hop_guard) {
+            b.op_local_get(LOCAL_CTX);
+            b.op_i32_load(ctx_off::CYCLE_COUNTER);
+            b.op_i32_const(0);
+            b.op_i32_gt_s();
+            b.op_if(0x40);                      // vector-guard (storm scar, KEEP)
+            }
+                b.op_local_get(LOCAL_CTX);
+                b.op_i32_load(ctx_off::PC);
+                b.op_i32_const((s32)(u32)(uintptr_t)&g_ras_pc);
+                b.op_i32_load(0);
+                b.op_i32_eq();
+                b.op_i32_const((s32)(u32)(uintptr_t)&g_ras_gen);
+                b.op_i32_load(0);
+                b.op_i32_const((s32)(u32)(uintptr_t)&g_ic_generation);
+                b.op_i32_load(0);
+                b.op_i32_eq();
+                b.op_i32_and();
+                b.op_if(0x40);
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_local_get(LOCAL_RAM);
+                    b.op_i32_const((s32)(u32)(uintptr_t)&g_ras_slot);
+                    b.op_i32_load(0);
+                    b.op_return_call_indirect(0, 0);
+                b.op_end();
+            if (g_emit_hop_guard) b.op_end();   // close the vector-guard if
+        }
+        if (block != nullptr && block->BlockType != BET_DynamicIntr)
+            emit_global_probe(true);        // chain jmp/jsr @Rn, rts; skip RTE — IC on the DYNAMIC class
+        emit_rt_bump(&g_exit_dyn);          // reached only on guard-block/miss (scar #2)
         break;
     }
 
@@ -1747,6 +2800,40 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
                 return;
             }
         }
+        // Lever-5E2 arm-split: re-derive the condition (same pattern as the
+        // sibling-link path) and probe the matching CONST target — each arm
+        // owns its own {slot,gen} site, so alternating branches keep both
+        // targets cached instead of thrashing one monomorphic entry.
+        if (block != nullptr) {
+            if (block->has_jcond) {
+                s32 jdynLocal = cache.getLocal(ctx_off::JDYN);
+                if (jdynLocal >= 0) {
+                    emitCachedLocalGet(b, cache, ctx_off::JDYN, (u32)jdynLocal);
+                } else {
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_i32_load(ctx_off::JDYN);
+                }
+            } else {
+                s32 srTLocal = cache.getLocal(ctx_off::SR_T);
+                if (srTLocal >= 0) {
+                    emitCachedLocalGet(b, cache, ctx_off::SR_T, (u32)srTLocal);
+                } else {
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_i32_load(ctx_off::SR_T);
+                }
+            }
+            if (cond == 1) {
+                b.op_if(0x40);
+            } else {
+                b.op_i32_eqz();
+                b.op_if(0x40);
+            }
+            emit_const_target_probe(block->BranchBlock);
+            b.op_else();
+            emit_const_target_probe(block->NextBlock);
+            b.op_end();
+        }
+        emit_rt_bump(&g_exit_cond_xshd);     // reached only on guard-block/miss (scar #2)
         break;
     }
     }
@@ -1760,9 +2847,22 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
     // first BL-clearing LDC clears BL in ctx but no IRQ is ever delivered,
     // so the IRQ-driven init sequence wedges. Sentinel block_vaddr=0xFF..F
     // routes the SHIL_FB import to UpdateINTC via sh4_interp_shil_fb.
-    if (block != nullptr &&
+    // ORDER 21b — DO NOT emit the immediate UpdateINTC for RTE (BET_DynamicIntr)
+    // by default: it re-vectored a still-pending IRQ the instant RTE restored PC,
+    // BEFORE the RTE-target instruction ran — a per-block delivery far more
+    // aggressive than native (rec_x64 delivers at timeslice boundaries only). With
+    // the Maple bit12 storm still pending after every ISR, that livelocked the main
+    // thread (spc pinned, memset frontier frozen at 124 MHz). RTE's IRQ is still
+    // delivered by the crediting-loop UpdateINTC at the next slice boundary — AFTER
+    // the target runs (native's order; the SH4 "one instruction after RTE"
+    // behaviour). Keep it for BET_StaticIntr (LDC SR / BL-clear) — the BIOS init
+    // path documented above needs that immediate delivery. g_emit_rte_intc restores
+    // the old behaviour for A/B.
+    const bool intr_intc =
+        block != nullptr &&
         (block->BlockType == BET_StaticIntr ||
-         block->BlockType == BET_DynamicIntr)) {
+         (block->BlockType == BET_DynamicIntr && g_emit_rte_intc));
+    if (intr_intc) {
         b.op_i32_const((s32)0xFFFFFFFFu);   // sentinel
         b.op_i32_const(0);
         b.op_call(WIMPORT_SHIL_FB);
@@ -1911,10 +3011,18 @@ static void emitMemsetFastPath(WasmModuleBuilder& b, RuntimeBlockInfo* block,
     b.op_i32_const(3); b.op_i32_eq();
     b.op_i32_and();
 
-    // end_val >= dst (unsigned)
+    // end_val > dst (unsigned, STRICT). The SH4 loop is a do-while: writem is
+    // oplist[0], so it stores one byte BEFORE the bottom cmp/hs+bf. Hence even
+    // when end_val == dst the hardware writes ONE byte at dst and advances
+    // R_dst to dst+1. A `>=` guard let the fastpath fire on end_val==dst,
+    // filling ZERO bytes and leaving R_dst==dst — a dropped byte AND an
+    // off-by-one pointer that corrupts all downstream pointer math (the
+    // deterministic 2nd-stage decrypt corruption). `>` restricts the fastpath
+    // to fills of >=1 byte (exact do-while equivalence); end_val<=dst falls
+    // through to the real per-op loop, which handles the single-byte case.
     b.op_local_get(LOCAL_TMP3);
     b.op_local_get(LOCAL_TMP);
-    b.op_i32_ge_u();
+    b.op_i32_gt_u();
     b.op_i32_and();
 
     // (dst_masked + (end_val - dst)) <= MEM1_BYTES — guards mirror-region
@@ -1979,6 +3087,42 @@ static void emitMemsetFastPath(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         b.op_i32_sub();
         b.op_i32_store(ctx_off::CYCLE_COUNTER);
 
+        // Lever-4 SMC mark over the filled range: gen += map[c] for every 4B
+        // word-chunk in [dst, dst+len). A memset over compiled code (loader
+        // zeroing a stage) must invalidate the IC like any other store.
+        // len >= 1 is guaranteed (the strict `>` guard above), and the MEM1
+        // guard bounds hi < 2^22. TMP (dst) and TMP4 (len) are dead after
+        // this; TMP2 is free. TMP2 = lo chunk, TMP = hi chunk.
+        b.op_local_get(LOCAL_TMP);
+        b.op_i32_const(SH4_LO24_MASK); b.op_i32_and();
+        b.op_local_tee(LOCAL_TMP2);                    // masked dst
+        b.op_local_get(LOCAL_TMP4);
+        b.op_i32_add();
+        b.op_i32_const(1); b.op_i32_sub();
+        b.op_i32_const(2); b.op_i32_shr_u();
+        b.op_local_set(LOCAL_TMP);                     // hi = (mdst+len-1)>>2
+        b.op_local_get(LOCAL_TMP2);
+        b.op_i32_const(2); b.op_i32_shr_u();
+        b.op_local_set(LOCAL_TMP2);                    // lo = mdst>>2
+        b.op_loop(0x40);
+            {
+                const u32 gen = (u32)(uintptr_t)&g_ic_generation;
+                b.op_i32_const((s32)gen);
+                b.op_i32_const((s32)gen);
+                b.op_i32_load(0);
+                b.op_local_get(LOCAL_TMP2);
+                b.op_i32_load8_u((u32)(uintptr_t)g_code_map);   // base in the memarg
+                b.op_i32_add();
+                b.op_i32_store(0);                     // gen += map[c]
+            }
+            b.op_local_get(LOCAL_TMP2);
+            b.op_i32_const(1); b.op_i32_add();
+            b.op_local_tee(LOCAL_TMP2);
+            b.op_local_get(LOCAL_TMP);
+            b.op_i32_le_u();
+            b.op_br_if(0);                             // while (c <= hi)
+        b.op_end();
+
         // return ctx.pc
         b.op_local_get(LOCAL_CTX);
         b.op_i32_load(ctx_off::PC);
@@ -2006,19 +3150,259 @@ static void emitMemsetFastPath(WasmModuleBuilder& b, RuntimeBlockInfo* block,
 // _tmp64LocalIdx (otherwise local.tee(t64) writes i64 into an i32 slot, V8
 // rejects entire module). See the original build_block comment for details.
 // ---------------------------------------------------------------------------
+// Lever-5G: allocate f32 cache entries. Candidates = fr offsets accessed by
+// the f32-helper op set (+ fmov fr,fr). Exclusions = ANY other op touching
+// the offset through a non-f32 path — readm into fr, writem from fr, mov64
+// pairs, and the raw-bank natives fipr/ftrv/frswap (v2 can make those
+// cache-aware; v1 keeps them memory-direct and airtight). An excluded offset
+// gets NO entry, so both paths stay ctx-direct and can never desync.
+static bool fpu_f32_helper_op(u32 opnum) {
+    switch (opnum) {
+    case shop_fadd: case shop_fsub: case shop_fmul: case shop_fdiv:
+    case shop_fabs: case shop_fneg: case shop_fsqrt: case shop_fmac:
+    case shop_fsrra: case shop_fseteq: case shop_fsetgt:
+    case shop_cvt_i2f_n: case shop_cvt_i2f_z: case shop_cvt_f2i_t:
+        return true;
+    default: return false;
+    }
+}
+static void scanBlockF32(RuntimeBlockInfo* blk, RegCache& cache) {
+    if (!g_emit_fpu_cache || blk == nullptr) return;
+    std::vector<u32> cand, excl;
+    auto addTo = [](std::vector<u32>& v, u32 off) {
+        for (u32 o : v) if (o == off) return;
+        v.push_back(off);
+    };
+    auto span = [&](std::vector<u32>& v, u32 base, u32 words) {
+        for (u32 i = 0; i < words; i++) addTo(v, base + i * 4);
+    };
+    for (size_t i = 0; i < blk->oplist.size(); ++i) {
+        const shil_opcode& op = blk->oplist[i];
+        const shil_param* ps[5] = { &op.rs1, &op.rs2, &op.rs3, &op.rd, &op.rd2 };
+        if (fpu_f32_helper_op(op.op)) {
+            for (auto* p : ps)
+                if (p->is_r32f()) addTo(cand, p->reg_offset());
+            continue;
+        }
+        if (op.op == shop_mov32 && op.rd.is_r32f() && op.rs1.is_r32f()) {
+            addTo(cand, op.rd.reg_offset());
+            addTo(cand, op.rs1.reg_offset());
+            continue;
+        }
+        switch (op.op) {
+        case shop_fipr:
+            // 5G v2: cache-aware emission — vectors + rd are candidates.
+            span(cand, op.rs1.reg_offset(), 4);
+            span(cand, op.rs2.reg_offset(), 4);
+            if (!op.rd.is_null()) addTo(cand, op.rd.reg_offset());
+            break;
+        case shop_ftrv:
+            // 5G v2: the v vector is a candidate; the xf matrix stays
+            // ctx-direct (read-only here, and nothing else caches xf, so no
+            // mixed-path hazard — caching 16 once-read values would cost
+            // more in prologue reloads than it saves).
+            span(cand, op.rs1.reg_offset(), 4);
+            break;
+        case shop_frswap:
+            span(excl, op.rs1.reg_offset(), 16);
+            span(excl, op.rd.reg_offset(), 16);
+            break;
+        default:
+            // Generic rule: any f32/f64-typed param on a non-helper op
+            // (readm rd, writem rs2, mov64 pairs, fsca rd, IFB'd FPU ops)
+            // excludes its offset(s).
+            for (auto* p : ps) {
+                if (p->is_r32f()) addTo(excl, p->reg_offset());
+                else if (p->is_r64f()) { addTo(excl, p->reg_offset()); addTo(excl, p->reg_offset() + 4); }
+            }
+            break;
+        }
+    }
+    for (u32 off : cand) {
+        bool ex = false;
+        for (u32 e : excl) if (e == off) { ex = true; break; }
+        if (!ex) cache.addOffsetF32(off);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Preload elision (prologue-trim lever). The eager RegCache prologue emits
+// `local.get ctx; load off; local.set L` for EVERY offset scanBlock/scanBlockF32
+// assigned — including offsets the block only ever WRITES. On a cmp+branch block
+// that is a guaranteed dead load of sr.T every single execution; on a 12-op block
+// with 14 live offsets the measured dump showed 9 of 14 dead (see the gate
+// comment at g_emit_preload_elide).
+//
+// This walks the oplist in program order and marks an offset "no preload" iff
+// its FIRST access is a full, unconditional, top-level DEFINITION emitted
+// through emitPostStore / emitPostStoreOffset / emitPostStoreF32 (`local.set L`).
+// Anything else — a read, a vector/64-bit op that writes ctx memory directly, or
+// any op that flushes+reloads the cache — leaves the offset preloaded.
+//
+// Correctness rests on three properties, each checked against the emitters:
+//   1. every whitelisted op's rd/rd2 store is emitted at ifDepth 0 (readm/shld/
+//      shad/cvt_f2i_t open an `if` for the VALUE and store after its `end`), so
+//      the local.set always executes when the op executes;
+//   2. the scan stops at the first barrier op (ifb/sync_*/pref/div*/fsca/
+//      mov64/frswap/unknown), so no decision is made past a flushAll+reloadAll;
+//   3. reads inside one op are marked before that op's defs, so an in-place
+//      update (rd == rs1) is correctly classified read-first.
+// Not applied to lever-2 regions (two oplists, union'd cache) — see call site.
+// ---------------------------------------------------------------------------
+static bool preload_barrier_op(u32 opnum) {
+    switch (opnum) {
+    case shop_ifb: case shop_sync_sr: case shop_sync_fpscr: case shop_pref:
+    case shop_div1: case shop_div32u: case shop_div32s: case shop_div32p2:
+    case shop_fsca: case shop_illegal: case shop_debug_1: case shop_debug_3:
+    case shop_mov64: case shop_frswap:
+        return true;
+    default:
+        return false;
+    }
+}
+static bool preload_toplevel_def_op(const shil_opcode& op) {
+    switch (op.op) {
+    case shop_mov32: case shop_add: case shop_sub: case shop_and: case shop_or:
+    case shop_xor:   case shop_not: case shop_neg: case shop_shl: case shop_shr:
+    case shop_sar:   case shop_ror: case shop_ext_s8: case shop_ext_s16:
+    case shop_mul_u16: case shop_mul_s16: case shop_mul_i32:
+    case shop_swaplb:  case shop_xtrct:
+    case shop_test:  case shop_seteq: case shop_setge: case shop_setgt:
+    case shop_setae: case shop_setab: case shop_setpeq:
+    case shop_jdyn:  case shop_jcond:
+    case shop_fadd:  case shop_fsub: case shop_fmul: case shop_fdiv:
+    case shop_fabs:  case shop_fneg: case shop_fsqrt:
+    case shop_fseteq: case shop_fsetgt:
+    case shop_cvt_i2f_n: case shop_cvt_i2f_z: case shop_cvt_f2i_t:
+    case shop_fmac:  case shop_fsrra:
+    case shop_shld:  case shop_shad:
+    case shop_adc:   case shop_sbc:  case shop_negc:
+    case shop_rocl:  case shop_rocr:
+    case shop_mul_u64: case shop_mul_s64:
+        return true;
+    // 1/2/4-byte readm stores rd through emitPostStore after the area-3 if's
+    // `end`. The size-8 pair writes ctx memory directly (r64f, never cached) —
+    // classify it as a read so nothing downstream can be elided on its account.
+    case shop_readm:
+        return op.size != 8;
+    default:
+        return false;
+    }
+}
+static void appendParamOffsets(const shil_param& p, std::vector<u32>& out) {
+    if (!p.is_reg()) return;                 // null / imm contribute nothing
+    const u32 base = p.reg_offset();
+    const u32 n    = p.count();              // 1 r32, 2 r64f, 4/16 vector views
+    for (u32 i = 0; i < n; ++i) out.push_back(base + i * 4);
+}
+static void computeNoPreload(RuntimeBlockInfo* blk, RegCache& cache)
+{
+    if (blk == nullptr) return;
+    // 0 = untouched, 1 = read first, 2 = defined first
+    std::unordered_map<u32, int> state;
+    std::vector<u32> offs;
+    auto mark = [&](const shil_param& p, int kind) {
+        offs.clear();
+        appendParamOffsets(p, offs);
+        for (u32 o : offs) state.emplace(o, kind);
+    };
+    for (size_t i = 0; i < blk->oplist.size(); ++i) {
+        const shil_opcode& op = blk->oplist[i];
+        if (preload_barrier_op(op.op)) break;
+        // Sources first — an in-place update (rd == rs1) must read-classify.
+        mark(op.rs1, 1); mark(op.rs2, 1); mark(op.rs3, 1);
+        if (preload_toplevel_def_op(op)) {
+            mark(op.rd, 2); mark(op.rd2, 2);
+        } else {
+            // Op continues (writem / fipr / ftrv / size-8 readm) but its
+            // destinations do not qualify as elidable defs.
+            mark(op.rd, 1); mark(op.rd2, 1);
+        }
+    }
+    for (const auto& kv : state)
+        if (kv.second == 2) cache.setNoPreload(kv.first);
+}
+
 static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
-                              const std::unordered_map<u32, u32>* vaddr_to_idx = nullptr)
+                              const std::unordered_map<u32, u32>* vaddr_to_idx = nullptr,
+                              const std::unordered_map<u32, RuntimeBlockInfo*>* vaddr_to_block = nullptr)
 {
     b.beginFuncBody();
 
     RegCache cache;
-    if (block != nullptr) cache.scanBlock(block);
+
+    // Lever #2 (register residency) — 2-block region detection. Must run BEFORE
+    // scanBlock so the union of A's + B's reg working-set is allocated locals.
+    // Region shape: A = `block` is BET_Cond whose TAKEN arm (BranchBlock) targets
+    // B, and B is a plain BET_StaticJump back to A (BranchBlock == A->vaddr). We
+    // then emit A's fn as one wasm loop that inlines B, resident regs across
+    // A->B->A. EXCLUDE fallback-op blocks (IFB/div*/sync_*/pref/fsca) and, for A,
+    // >1 SR_T writer without has_jcond (predicate re-derivation hazard, same as
+    // the self-loop). Helpers mirror the self-loop's fallback/T scans.
+    RuntimeBlockInfo* region_B = nullptr;
+    auto block_has_fallback = [](RuntimeBlockInfo* blk) -> bool {
+        for (size_t i = 0; i < blk->oplist.size(); ++i) {
+            switch (blk->oplist[i].op) {
+            case shop_ifb: case shop_sync_sr: case shop_sync_fpscr:
+            case shop_pref: case shop_div1: case shop_div32u:
+            case shop_div32s: case shop_div32p2: case shop_fsca:
+                return true;
+            default: break;
+            }
+        }
+        return false;
+    };
+    if (block != nullptr && g_emit_regcache && g_emit_region && vaddr_to_block != nullptr
+        && BET_GET_CLS(block->BlockType) == BET_CLS_COND
+        && block->BranchBlock != block->vaddr           // not a self-loop
+        && block->oplist.size() < 20
+        && !detectMemsetByteLoop(block).detected)
+    {
+        auto it = vaddr_to_block->find(block->BranchBlock);
+        if (it != vaddr_to_block->end() && it->second != nullptr) {
+            RuntimeBlockInfo* B = it->second;
+            const bool same_page = (B->vaddr >> 12) == (block->vaddr >> 12);
+            if (B != block
+                && B->BlockType == BET_StaticJump
+                && B->BranchBlock == block->vaddr        // B unconditionally -> A
+                && B->oplist.size() < 20
+                && same_page
+                && !block_has_fallback(block)
+                && !block_has_fallback(B))
+            {
+                // A's predicate is re-derived after A's body (before B) via
+                // push_cont; a >1 T-writer without has_jcond would mis-derive it.
+                int t_writes_A = 0;
+                for (size_t i = 0; i < block->oplist.size(); ++i) {
+                    const shil_opcode& op = block->oplist[i];
+                    if (op.rd.is_reg()  && op.rd.reg_offset()  == (u32)ctx_off::SR_T) ++t_writes_A;
+                    if (op.rd2.is_reg() && op.rd2.reg_offset() == (u32)ctx_off::SR_T) ++t_writes_A;
+                }
+                if (block->has_jcond || t_writes_A <= 1)
+                    region_B = B;
+            }
+        }
+    }
+
+    // Reg-cache kill-switch (boot-title-wedge differential): when disabled,
+    // no wasm locals are assigned, so every getLocal() returns -1 and all
+    // reads/writes go straight to ctx memory (reloadAll/flushAll become
+    // no-ops over an empty entry set). If this makes the DP-decrypt PRNG
+    // pool correct, the reg-cache across the deep call nest is convicted.
+    if (block != nullptr && g_emit_regcache) cache.scanBlock(block);
+    if (region_B != nullptr) cache.scanBlock(region_B);   // union B's working set
+    // Lever-5G: f32 entries (fr bank) — after the int scan so mixed offsets
+    // keep their int entries and addOffsetF32's already-present check holds.
+    if (block != nullptr && g_emit_regcache) scanBlockF32(block, cache);
+    if (region_B != nullptr && g_emit_regcache) scanBlockF32(region_B, cache);
     const u32 i32Count = LOCAL_FIXED_I32_COUNT + cache.localCount();
     cache._tmp64LocalIdx = 2 + i32Count;
+    // f32 locals occupy the third typed group, after the i64 scratch.
+    cache.finalizeF32Locals(2 + i32Count + 1);
     {
-        const u32 counts[] = { i32Count, 1 };
-        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I64 };
-        b.emitLocals(2, counts, types);
+        const u32 counts[] = { i32Count, 1, cache.f32Count() };
+        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I64, WASM_TYPE_F32 };
+        b.emitLocals(3, counts, types);
     }
 
     if (block != nullptr) {
@@ -2036,38 +3420,113 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         // guest_cycles into CYCLE_COUNTER just as the dispatcher would.
         const u32 bcls = BET_GET_CLS(block->BlockType);
         bool self_loop = false;
-        if (s_self_loop_enabled
+        if (g_emit_self_loop
             && bcls == BET_CLS_COND
             && block->BranchBlock == block->vaddr
             && block->oplist.size() < 20)
         {
+            // Loop-marker scan + FALLBACK EXCLUSION (boot-title-wedge audit
+            // finding #1, 2026-08-20): the reg-cache dirty-set is tracked
+            // linearly at COMPILE time, but an emitted wasm `loop` re-enters
+            // at RUNTIME — any in-body fallback op (ifb / div* / sync_sr /
+            // pref / fsca) flushes only the compile-time-dirty set, so regs
+            // dirtied later in the body are silently dropped on iteration
+            // N+1 and the post-call reload clobbers live locals with stale
+            // ctx memory. dt-terminated copy/checksum loops with mac.l-class
+            // ops computed garbage — the DP-launcher staging corruption.
+            // Such blocks now run loop-less (dispatcher-paced): always
+            // correct, and only fallback-containing loops pay the cost.
+            bool has_loop_marker = false;
+            bool has_fallback_op = false;
+            // Count ops that write SR.T (rd/rd2 offset == the T reg). A block
+            // WITHOUT has_jcond re-derives the branch predicate from LIVE SR_T
+            // at the loop bottom; the SH4 evaluates a bf/s|bt/s branch on the T
+            // value BEFORE its delay slot, so if the delay slot writes T (>1
+            // T-write in the block) the bottom re-derivation reads the wrong T.
+            // This is EXACTLY the DP-decompressor garbage (dt sets T, shlr in the
+            // delay slot overwrites it). One T-write (the loop's own cmp/setae)
+            // is safe; >1 is excluded. has_jcond loops read the captured JDYN and
+            // are safe regardless, but we keep the simple <=1 gate conservatively.
+            int t_writes = 0;
             for (size_t i = 0; i < block->oplist.size(); ++i) {
                 const shil_opcode& op = block->oplist[i];
-                if (op.op == shop_sub && op.rs2.is_imm() && op.rs2._imm == 1) {
-                    self_loop = true;
+                switch (op.op) {
+                case shop_ifb:
+                case shop_sync_sr:
+                case shop_sync_fpscr:
+                case shop_pref:
+                case shop_div1:
+                case shop_div32u:
+                case shop_div32s:
+                case shop_div32p2:
+                case shop_fsca:
+                    has_fallback_op = true;
+                    break;
+                default:
                     break;
                 }
-                if (op.op == shop_seteq) {
-                    self_loop = true;
-                    break;
-                }
+                if (op.rd.is_reg()  && op.rd.reg_offset()  == (u32)ctx_off::SR_T) ++t_writes;
+                if (op.rd2.is_reg() && op.rd2.reg_offset() == (u32)ctx_off::SR_T) ++t_writes;
+                if (op.op == shop_sub && op.rs2.is_imm() && op.rs2._imm == 1)
+                    has_loop_marker = true;
+                if (op.op == shop_seteq)
+                    has_loop_marker = true;
+                if (op.op == shop_setae)
+                    has_loop_marker = true;
             }
+            self_loop = has_loop_marker && !has_fallback_op
+                        && (block->has_jcond || t_writes <= 1);
+        }
+
+        // ORDER 21b slice-yield precheck — HOISTED to the top of the block by
+        // the prologue-trim lever. Rationale for the hoist (the original order
+        // ran memset-fastpath + reloadAll first): (a) a spent slice returns
+        // without paying the eager cache prologue (N loads) or the memset
+        // endpoint probe; (b) it restores the invariant "no guest work executes
+        // with cycle_counter <= 0", which the memset fastpath could otherwise
+        // violate for a chained entry; (c) it makes the precheck the FIRST
+        // instruction of every block, which is the property g_emit_hop_guard=0
+        // relies on to drop the redundant caller-side guard. The precheck's
+        // cycle_counter load is tee'd into LOCAL_CC and reused by the drain
+        // below (one load instead of two). Nothing between the tee and the
+        // drain writes cycle_counter on a fall-through path: the memset
+        // fastpath debits and RETURNS, the intc check calls out and RETURNS,
+        // and the cache reload only touches locals.
+        const bool ptrim = g_emit_prologue_trim && (block != nullptr);
+        if (ptrim) {
+            b.op_local_get(LOCAL_CTX);
+            b.op_i32_load(ctx_off::CYCLE_COUNTER);
+            b.op_local_tee(LOCAL_CC);
+            b.op_i32_const(0);
+            b.op_i32_le_s();
+            b.op_if(0x40);
+              b.op_local_get(LOCAL_CTX);
+              b.op_i32_const((s32)block->vaddr);
+              b.op_i32_store(ctx_off::PC);
+              b.op_local_get(LOCAL_CTX);
+              b.op_i32_load(ctx_off::PC);
+              b.op_return();
+            b.op_end();
         }
 
         // Memset byte-loop fast path. Detected BEFORE reloadOrInvalidate so
         // a successful early-return skips the cache prologue entirely. On
         // fall-through (runtime endpoint/length checks failed) cache state
         // is untouched — the regular emit path that follows runs unchanged.
-        const MemsetPattern mp = detectMemsetByteLoop(block);
+        const MemsetPattern mp = (g_emit_mem_fastpaths && g_emit_memset)
+                                     ? detectMemsetByteLoop(block) : MemsetPattern{};
         if (mp.detected) {
             emitMemsetFastPath(b, block, mp);
         }
 
         // Lazy mode: prologue is a no-op; first use lazy-loads from memory.
-        // Eager mode: emit reloadAll up-front (current default).
+        // Eager mode: emit reloadAll up-front (current default), minus the
+        // entries computeNoPreload proved are defined before they are read.
         // Both flavors run BEFORE the loop header so cached locals persist
         // across iterations rather than being re-fetched every time.
-        reloadOrInvalidate(b, cache);
+        if (g_emit_preload_elide && g_emit_regcache && region_B == nullptr)
+            computeNoPreload(block, cache);
+        reloadPrologueOrInvalidate(b, cache);
 
         // Per-block interrupt-pend check (Fix A — redream-style). If a peripheral
         // raise (asic_RaiseInterrupt) has set ctx->interrupt_pend AND the SR.IMASK
@@ -2088,6 +3547,118 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
             b.op_end();
         }
 
+        // ORDER 21b — NATIVE SLICE-LOOP YIELD (interrupt-starvation general fix).
+        // If this timeslice is already spent (cycle_counter <= 0), return to the C
+        // trampoline BEFORE running the block so the crediting loop runs
+        // sh4_sched_tick (SPG scanline -> VBlank raise) + UpdateINTC (delivery,
+        // gated by SRdecode). The exit-path guards (emit_global_probe / emit_tail_to /
+        // self-loop bound) only cover *taken* exits, so an in-wasm loop could run past
+        // many timeslices with NO VBlank -> the game's frame-sync waits livelock
+        // (0x8c3c53f8 / divide loops / etc.). This mirrors rec-x64's per-block mainloop
+        // check and guarantees interrupt service regardless of chain/self-loop shape.
+        // Cheap: one in-wasm compare per block; a C round-trip only at the ~448-cycle
+        // timeslice boundary (chaining still runs ~64 blocks/slice). Re-dispatch after
+        // the crediting refill finds cycle_counter>0 and runs the block — no live-loop.
+        // (Emitted HERE only when the prologue-trim lever is off; with it on the
+        // same check runs at the very top of the block — see `ptrim` above.)
+        if (block != nullptr && !ptrim) {
+            b.op_local_get(LOCAL_CTX);
+            b.op_i32_load(ctx_off::CYCLE_COUNTER);
+            b.op_i32_const(0);
+            b.op_i32_le_s();
+            b.op_if(0x40);
+              b.op_local_get(LOCAL_CTX);
+              b.op_i32_const((s32)block->vaddr);
+              b.op_i32_store(ctx_off::PC);
+              b.op_local_get(LOCAL_CTX);
+              b.op_i32_load(ctx_off::PC);
+              b.op_return();
+            b.op_end();
+        }
+
+        // Lever #2 (register residency): A=block (BET_Cond, taken->B), B=region_B
+        // (BET_StaticJump -> A). Emit A's fn as ONE wasm loop that inlines B's
+        // body, keeping the union reg working-set resident in locals across
+        // A->B->A. reloadAll already ran (reloadOrInvalidate above); flushAll runs
+        // once per exit only. Structure: block $exit { loop $L { drainA; A-body;
+        // if !A_taken { flush; PC=A.Next; br $exit }; drainB; B-body; if budget-
+        // spent { flush; PC=A.vaddr; br $exit }; br $L } }.
+        if (region_B != nullptr) {
+            const u32 cond_taken_A = (block->BlockType == BET_Cond_1) ? 1 : 0;
+            auto push_A_taken = [&]() {
+                if (block->has_jcond) {
+                    s32 j = cache.getLocal(ctx_off::JDYN);
+                    if (j >= 0) emitCachedLocalGet(b, cache, ctx_off::JDYN, (u32)j);
+                    else { b.op_local_get(LOCAL_CTX); b.op_i32_load(ctx_off::JDYN); }
+                } else {
+                    s32 t = cache.getLocal(ctx_off::SR_T);
+                    if (t >= 0) emitCachedLocalGet(b, cache, ctx_off::SR_T, (u32)t);
+                    else { b.op_local_get(LOCAL_CTX); b.op_i32_load(ctx_off::SR_T); }
+                }
+                if (cond_taken_A == 0) b.op_i32_eqz();   // Cond_0 (bf): taken == !T
+            };
+            auto emit_drain = [&](RuntimeBlockInfo* blk) {
+                if (blk->guest_cycles > 0) {
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_i32_load(ctx_off::CYCLE_COUNTER);
+                    b.op_i32_const((s32)blk->guest_cycles);
+                    b.op_i32_sub();
+                    b.op_i32_store(ctx_off::CYCLE_COUNTER);
+                }
+            };
+            auto emit_body = [&](RuntimeBlockInfo* blk) {
+                for (size_t i = 0; i < blk->oplist.size(); ++i) {
+                    const shil_opcode& op = blk->oplist[i];
+                    if (emitShilOp(b, op, blk, (u32)i, cache)) continue;
+                    // region excludes fallback ops (block_has_fallback), so this
+                    // is unreachable; keep a correct IFB fallback for safety.
+                    cache.flushAll(b);
+                    const u32 op_addr = blk->vaddr + op.guest_offs;
+                    const u32 pcx     = op_addr + 2;
+                    const u32 opc     = (u32)ReadMem16(op_addr);
+                    b.op_i32_const((s32)opc);
+                    b.op_i32_const((s32)pcx);
+                    b.op_call(WIMPORT_IFB);
+                    reloadOrInvalidate(b, cache);
+                }
+            };
+
+            b.op_block(0x40);                          // $exit (depth 2 from inner if)
+              b.op_loop(0x40);                         //   $L (depth 1 from inner if)
+                emit_drain(block);                     //   drain A
+                emit_body(block);                      //   A body
+                push_A_taken();
+                b.op_i32_eqz();                        //   !A_taken
+                b.op_if(0x40);                         //     A NOT taken -> A.NextBlock
+                  cache.flushAll(b);
+                  b.op_local_get(LOCAL_CTX);
+                  b.op_i32_const((s32)block->NextBlock);
+                  b.op_i32_store(ctx_off::PC);
+                  b.op_br(2);                          //     -> $exit
+                b.op_end();
+                emit_drain(region_B);                  //   drain B
+                emit_body(region_B);                   //   B body (B->A = loop back-edge)
+                if (g_self_loop_cycle_bound) {
+                    b.op_local_get(LOCAL_CTX);
+                    b.op_i32_load(ctx_off::CYCLE_COUNTER);
+                    b.op_i32_const((s32)-SELF_LOOP_CYCLE_SLICE);
+                    b.op_i32_le_s();                   //   cycle_counter <= -SLICE?
+                    b.op_if(0x40);                     //     budget spent -> re-enter A
+                      cache.flushAll(b);
+                      b.op_local_get(LOCAL_CTX);
+                      b.op_i32_const((s32)block->vaddr);
+                      b.op_i32_store(ctx_off::PC);
+                      b.op_br(2);                      //     -> $exit
+                    b.op_end();
+                }
+                b.op_br(0);                            //   continue -> loop top ($L)
+              b.op_end();                              //   close loop
+            b.op_end();                                // close block $exit
+            b.op_local_get(LOCAL_CTX);                 // PC stored inside; load it
+            b.op_i32_load(ctx_off::PC);
+        } else {
+
         if (self_loop) {
             b.op_loop();   // 0x40 / void blocktype — loop body produces no value
         }
@@ -2096,10 +3667,17 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         // decoder (sum of cpu_cycles for each guest op + base block cost) and
         // is what rec-x64/rec-arm decrement per-block. The mainloop's coarse
         // flat 32-cycle subtract is removed; this is the only cycle accounting.
+        // Prologue-trim: outside a self-loop the precheck's tee'd LOCAL_CC still
+        // holds this block's cycle_counter, so the reload is redundant. Inside a
+        // self-loop the drain re-runs per iteration and MUST re-read memory.
         if (block->guest_cycles > 0) {
             b.op_local_get(LOCAL_CTX);
-            b.op_local_get(LOCAL_CTX);
-            b.op_i32_load(ctx_off::CYCLE_COUNTER);
+            if (ptrim && !self_loop) {
+                b.op_local_get(LOCAL_CC);
+            } else {
+                b.op_local_get(LOCAL_CTX);
+                b.op_i32_load(ctx_off::CYCLE_COUNTER);
+            }
             b.op_i32_const((s32)block->guest_cycles);
             b.op_i32_sub();
             b.op_i32_store(ctx_off::CYCLE_COUNTER);
@@ -2121,39 +3699,57 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         }
 
         if (self_loop) {
-            // Re-derive the taken-arm predicate, br_if 0 if the loop should
-            // continue. Mirrors the cond-deriving block in emitBlockExit's
-            // BET_CLS_COND branch — we don't call emitBlockExit because (a)
-            // it writes the i32 PC value on stack vs. our void blocktype,
-            // and (b) we need the inverse fall-through to PC = NextBlock.
             const u32 cond_taken = (block->BlockType == BET_Cond_1) ? 1 : 0;
-            if (block->has_jcond) {
-                s32 jdynLocal = cache.getLocal(ctx_off::JDYN);
-                if (jdynLocal >= 0) {
-                    emitCachedLocalGet(b, cache, ctx_off::JDYN, (u32)jdynLocal);
+            // Push CONT — the loop-continue (branch-taken) predicate. For Cond_0
+            // (bf) that is !cond; for Cond_1 (bt) it is cond.
+            auto push_cont = [&]() {
+                if (block->has_jcond) {
+                    s32 jdynLocal = cache.getLocal(ctx_off::JDYN);
+                    if (jdynLocal >= 0) emitCachedLocalGet(b, cache, ctx_off::JDYN, (u32)jdynLocal);
+                    else { b.op_local_get(LOCAL_CTX); b.op_i32_load(ctx_off::JDYN); }
                 } else {
-                    b.op_local_get(LOCAL_CTX);
-                    b.op_i32_load(ctx_off::JDYN);
+                    s32 srTLocal = cache.getLocal(ctx_off::SR_T);
+                    if (srTLocal >= 0) emitCachedLocalGet(b, cache, ctx_off::SR_T, (u32)srTLocal);
+                    else { b.op_local_get(LOCAL_CTX); b.op_i32_load(ctx_off::SR_T); }
                 }
-            } else {
-                s32 srTLocal = cache.getLocal(ctx_off::SR_T);
-                if (srTLocal >= 0) {
-                    emitCachedLocalGet(b, cache, ctx_off::SR_T, (u32)srTLocal);
-                } else {
-                    b.op_local_get(LOCAL_CTX);
-                    b.op_i32_load(ctx_off::SR_T);
-                }
+                if (cond_taken == 0) b.op_i32_eqz();
+            };
+
+            // Loop again only while CONT *and the timeslice still has budget*.
+            // Bounding by cycle_counter services interrupts every timeslice, like
+            // native's slice_loop (rec_x64.cpp:698). WITHOUT it, an N-iteration
+            // fill (the 384KB boot memset at 0x8c12bc6e) drained cycle_counter to
+            // a huge negative with NO interrupt servicing, then the crediting loop
+            // delivered one giant deferred IRQ burst that pinned the main thread at
+            // the rts (0x8c12bc78) — the boot never reached the bit12 clearer and
+            // the storm never collapsed (ORDER 21b interp-narrow verdict).
+            push_cont();
+            if (g_self_loop_cycle_bound) {
+                b.op_local_get(LOCAL_CTX);
+                b.op_i32_load(ctx_off::CYCLE_COUNTER);
+                b.op_i32_const((s32)-SELF_LOOP_CYCLE_SLICE);
+                b.op_i32_gt_s();                    // cycle_counter > -SLICE (batch)
+                b.op_i32_and();                     // CONT && budget-in-batch
             }
-            if (cond_taken == 0) b.op_i32_eqz();   // br_if when (!cond) for Cond_0
             b.op_br_if(0);                          // depth 0 = top of `loop`
             b.op_end();                             // close `loop`
 
-            // Fell out of loop = not-taken arm fired this iteration. Write
-            // PC = NextBlock (the cond-fail target). flushAll first so any
-            // dirty cache locals reach memory before exit.
+            // Fell out: loop DONE (!CONT) or, when bounded, timeslice EXPIRED. Flush
+            // the loop-carried regs, then pick PC.
             cache.flushAll(b);
-            b.op_local_get(LOCAL_CTX);
-            b.op_i32_const((s32)block->NextBlock);
+            b.op_local_get(LOCAL_CTX);              // addr for the PC store
+            if (g_self_loop_cycle_bound) {
+                // re-enter loop head on a timeslice break (CONT still true), else NextBlock
+                push_cont();
+                b.op_if(WASM_TYPE_I32);
+                  b.op_i32_const((s32)block->vaddr);
+                b.op_else();
+                  b.op_i32_const((s32)block->NextBlock);
+                b.op_end();
+            } else {
+                // unbounded: fell out only because the loop finished (!CONT) -> NextBlock
+                b.op_i32_const((s32)block->NextBlock);
+            }
             b.op_i32_store(ctx_off::PC);
             b.op_local_get(LOCAL_CTX);
             b.op_i32_load(ctx_off::PC);
@@ -2165,6 +3761,7 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
             b.op_local_get(LOCAL_CTX);
             b.op_i32_load(ctx_off::PC);
         }
+        }   // close Lever #2 region-else (non-region self_loop/normal path)
     } else {
         b.op_i32_const(0);
     }
@@ -2189,7 +3786,8 @@ static void emitTypeImportSection(WasmModuleBuilder& b)
     }
     b.endSection();
 
-    b.emitImportSection(1 + WIMPORT_COUNT);
+    // memory + WIMPORT_COUNT funcs + 1 table (__indirect_function_table).
+    b.emitImportSection(1 + WIMPORT_COUNT + 1);
     b.emitImportMemory("env", "memory", 1);
     b.emitImportFunc("env", "sh4_read8",   1);
     b.emitImportFunc("env", "sh4_read16",  1);
@@ -2199,6 +3797,12 @@ static void emitTypeImportSection(WasmModuleBuilder& b)
     b.emitImportFunc("env", "sh4_write32", 2);
     b.emitImportFunc("env", "sh4_ifb",     2);
     b.emitImportFunc("env", "sh4_shil_fb", 2);
+    b.emitImportFunc("env", "sh4_lookup_idx", 1);   // WIMPORT_LOOKUP_IDX, (i32)->i32
+    // Import Emscripten's shared __indirect_function_table as this module's
+    // table 0 so emit_global_probe's return_call_indirect can target sibling
+    // blocks' wasmTable slots. initialSize 0 / no-max is a permissive lower
+    // bound — the real table is always larger by instantiation time.
+    b.emitImportTable("env", "__indirect_function_table", 0);
     b.endSection();
 }
 
@@ -2253,9 +3857,14 @@ std::vector<u8> build_blocks(const std::vector<RuntimeBlockInfo*>& blocks) {
     // backward refs both resolve).
     std::unordered_map<u32, u32> vaddr_to_idx;
     vaddr_to_idx.reserve(n);
+    // Lever #2: vaddr -> RuntimeBlockInfo* so emitBlockFuncBody can INLINE a
+    // sibling block's body into a region (register residency).
+    std::unordered_map<u32, RuntimeBlockInfo*> vaddr_to_block;
+    vaddr_to_block.reserve(n);
     for (u32 i = 0; i < n; ++i) {
         if (blocks[i] != nullptr) {
             vaddr_to_idx[blocks[i]->vaddr] = i;
+            vaddr_to_block[blocks[i]->vaddr] = blocks[i];
         }
     }
 
@@ -2289,10 +3898,44 @@ std::vector<u8> build_blocks(const std::vector<RuntimeBlockInfo*>& blocks) {
     // beginFuncBody/endFuncBody pair so we just sequence them.
     b.beginCodeSection(n);
     for (u32 i = 0; i < n; ++i) {
-        emitBlockFuncBody(b, blocks[i], &vaddr_to_idx);
+        emitBlockFuncBody(b, blocks[i], &vaddr_to_idx, &vaddr_to_block);
     }
     b.endSection();
     return b.getBytes();
 }
 
 } // namespace bemental::sh4
+
+// C-linkage bridge for the mem-fastpath kill-switch — the emitter global is
+// namespaced; the bridge (rec_wasm.cpp _flycast_set_mem_fastpaths) links
+// against this unmangled setter.
+extern "C" void bemental_sh4_set_mem_fastpaths(int on) {
+    bemental::sh4::g_emit_mem_fastpaths = !!on;
+}
+extern "C" void bemental_sh4_set_regcache(int on) {
+    bemental::sh4::g_emit_regcache = !!on;
+}
+extern "C" void bemental_sh4_set_imm_fastpath(int on) {
+    bemental::sh4::g_emit_imm_fastpath = !!on;
+}
+extern "C" void bemental_sh4_set_self_loop(int on) {
+    bemental::sh4::g_emit_self_loop = !!on;
+}
+extern "C" void bemental_sh4_set_rte_intc(int on) {
+    bemental::sh4::g_emit_rte_intc = !!on;
+}
+extern "C" void bemental_sh4_set_region(int on) {
+    bemental::sh4::g_emit_region = !!on;
+}
+// Codegen-audit trim levers (2026-08-29). All three take effect at COMPILE
+// time, so they must be set before blocks are built (env var, or a setter call
+// from init) — flipping them mid-run only affects blocks compiled afterwards.
+extern "C" void bemental_sh4_set_preload_elide(int on) {
+    bemental::sh4::g_emit_preload_elide = !!on;
+}
+extern "C" void bemental_sh4_set_prologue_trim(int on) {
+    bemental::sh4::g_emit_prologue_trim = !!on;
+}
+extern "C" void bemental_sh4_set_hop_guard(int on) {
+    bemental::sh4::g_emit_hop_guard = !!on;
+}

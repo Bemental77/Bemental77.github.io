@@ -29,6 +29,9 @@ namespace bemental::sh4 {
 // "not yet initialized" — emitter falls back to the sh4_write32/read32
 // callback in that case.
 extern u32 g_vram_lin_base;
+extern u32 g_ocram_lin_base;   // lever-9D: OnChipRAM (8KB) linear base; 0 = arm off
+extern u32 g_ccr_addr;         // lever-9D: &CCN_CCR (ORA bit5 / OIX bit7 gate+select)
+extern bool g_emit_ocram_fp;
 
 // ---------------------------------------------------------------------------
 // Imports the JIT host MUST provide when instantiating a compiled block.
@@ -43,7 +46,9 @@ enum WasmImportFunc : u32 {
     WIMPORT_WRITE32 = 5,
     WIMPORT_IFB     = 6,    // (opcode_imm, pc) -> void
     WIMPORT_SHIL_FB = 7,    // (block_vaddr, op_idx) -> void
-    WIMPORT_COUNT   = 8
+    WIMPORT_LOOKUP_IDX = 8, // (vaddr) -> i32 wasmTable index, -1 = miss/stale
+                            // (ORDER 21b Lever 1/2 global tail-link resolver)
+    WIMPORT_COUNT   = 9
 };
 
 // ---------------------------------------------------------------------------
@@ -64,6 +69,7 @@ namespace ctx_off {
     constexpr u32 JDYN           = 0x14C;
     constexpr u32 SR_STATUS      = 0x150;
     constexpr u32 SR_T           = 0x154;
+    constexpr u32 OLD_SR_STATUS  = 0x15C;  // sr_status_t old_sr (after fpscr@0x158; verified against INTERRUPT_PEND)
     constexpr u32 INTERRUPT_PEND = 0x16C;
     constexpr u32 CYCLE_COUNTER  = 0x174;
 }
@@ -81,7 +87,11 @@ constexpr u32 LOCAL_TMP2 = 3;
 constexpr u32 LOCAL_TMP3 = 4;
 constexpr u32 LOCAL_TMP4 = 5;
 constexpr u32 LOCAL_TMP5 = 6;
-constexpr u32 LOCAL_FIXED_I32_COUNT = 5;   // TMP..TMP5
+// Block-scoped copy of ctx->cycle_counter, loaded once by the slice-yield
+// precheck and reused by the per-block cycle drain (prologue-trim lever).
+// Live only between the precheck and the drain — no op may clobber it there.
+constexpr u32 LOCAL_CC   = 7;
+constexpr u32 LOCAL_FIXED_I32_COUNT = 6;   // TMP..TMP5, CC
 
 // ---------------------------------------------------------------------------
 // RegCache — maps Sh4Context byte-offset to a WASM local.
@@ -96,6 +106,12 @@ struct RegCacheEntry {
     u32  wasmLocal;
     bool dirty;
     bool loaded;   // F9 lazy mode: false until first use loads the local
+    bool isF32;    // lever-5G: entry lives in an f32 local (fr/xf bank)
+    // Preload-elision (prologue-trim lever): false when the block's FIRST
+    // top-level access to this offset is a full DEFINITION, so the eager
+    // prologue's `local.get ctx; load off; local.set L` is dead work — the
+    // local is written before anything can read it. Set by computeNoPreload().
+    bool preload;
 };
 
 struct RegCache {
@@ -109,7 +125,58 @@ struct RegCache {
         e.wasmLocal = nextLocal++;
         e.dirty     = false;
         e.loaded    = false;
+        e.isF32     = false;
+        e.preload   = true;
         entries[ctxOffset] = e;
+    }
+
+    // Lever-5G: f32 entries get PROVISIONAL sequence numbers at scan time;
+    // finalizeF32Locals() rebases them after the i32 count (and the i64
+    // scratch) is known, because wasm locals are declared in typed groups.
+    u32 nextF32Seq = 0;
+    void addOffsetF32(u32 ctxOffset) {
+        if (entries.find(ctxOffset) != entries.end()) return;   // int entry wins (mixed use)
+        RegCacheEntry e;
+        e.wasmLocal = nextF32Seq++;   // provisional; rebased by finalizeF32Locals
+        e.dirty     = false;
+        e.loaded    = false;
+        e.isF32     = true;
+        e.preload   = true;
+        entries[ctxOffset] = e;
+    }
+    u32 f32Count() const { return nextF32Seq; }
+    void finalizeF32Locals(u32 f32Base) {
+        for (auto& kv : entries)
+            if (kv.second.isF32) kv.second.wasmLocal += f32Base;
+    }
+    s32 getLocalF32(u32 ctxOffset) const {
+        auto it = entries.find(ctxOffset);
+        return (it != entries.end() && it->second.isF32) ? (s32)it->second.wasmLocal : -1;
+    }
+    // Mixed-access guards: an op that touches a cached fr through a NON-f32
+    // path (readm into fr, writem from fr, mov64 pairs) must flush the local
+    // before reading ctx and drop the local's authority after writing ctx.
+    void flushOne(WasmModuleBuilder& b, u32 ctxOffset) {
+        auto it = entries.find(ctxOffset);
+        if (it == entries.end() || !it->second.dirty) return;
+        b.op_local_get(LOCAL_CTX);
+        b.op_local_get(it->second.wasmLocal);
+        if (it->second.isF32) b.op_f32_store(ctxOffset);
+        else                  b.op_i32_store(ctxOffset);
+        it->second.dirty = false;
+    }
+    // After a NON-cached path wrote this offset in ctx, the local (if any)
+    // is stale. Eager mode never consults `loaded` (reads are bare
+    // local.get), so the only correct guard is an immediate re-load.
+    void reloadOne(WasmModuleBuilder& b, u32 ctxOffset) {
+        auto it = entries.find(ctxOffset);
+        if (it == entries.end()) return;
+        b.op_local_get(LOCAL_CTX);
+        if (it->second.isF32) b.op_f32_load(ctxOffset);
+        else                  b.op_i32_load(ctxOffset);
+        b.op_local_set(it->second.wasmLocal);
+        it->second.dirty  = false;
+        it->second.loaded = true;
     }
 
     // Alias used by scanBlock and pre-emit register discovery.
@@ -179,7 +246,8 @@ struct RegCache {
             if (!kv.second.dirty) continue;
             b.op_local_get(LOCAL_CTX);
             b.op_local_get(kv.second.wasmLocal);
-            b.op_i32_store(kv.first);
+            if (kv.second.isF32) b.op_f32_store(kv.first);
+            else                 b.op_i32_store(kv.first);
             kv.second.dirty = false;
         }
     }
@@ -187,10 +255,31 @@ struct RegCache {
     void reloadAll(WasmModuleBuilder& b) {
         for (auto& kv : entries) {
             b.op_local_get(LOCAL_CTX);
-            b.op_i32_load(kv.first);
+            if (kv.second.isF32) b.op_f32_load(kv.first);
+            else                 b.op_i32_load(kv.first);
             b.op_local_set(kv.second.wasmLocal);
             kv.second.dirty = false;
         }
+    }
+
+    // Block-PROLOGUE variant: identical to reloadAll except it skips entries
+    // marked !preload (first top-level access is a definition). Only legal at
+    // the block prologue — the post-fallback reload must stay reloadAll, where
+    // ctx memory is authoritative for EVERY entry.
+    void reloadPrologue(WasmModuleBuilder& b) {
+        for (auto& kv : entries) {
+            if (!kv.second.preload) { kv.second.dirty = false; continue; }
+            b.op_local_get(LOCAL_CTX);
+            if (kv.second.isF32) b.op_f32_load(kv.first);
+            else                 b.op_i32_load(kv.first);
+            b.op_local_set(kv.second.wasmLocal);
+            kv.second.dirty = false;
+        }
+    }
+
+    void setNoPreload(u32 ctxOffset) {
+        auto it = entries.find(ctxOffset);
+        if (it != entries.end()) it->second.preload = false;
     }
 };
 
