@@ -193,6 +193,44 @@ bool g_emit_preload_elide = []{
     const char* e = std::getenv("FLYCAST_PRELOAD_ELIDE");
     return !(e && e[0] == '0');
 }();
+
+// ---------------------------------------------------------------------------
+// AREA-3 DISCRIMINATOR (2026-08-29). The register-EA load/store fastpaths ask
+// "is this EA in area 3 (system RAM)?". The legacy form spends 8 wasm ops:
+//
+//     local.get TMP; i32.const 0x1FFFFFFF; i32.and; local.tee TMP;
+//     i32.const 26; i32.shr_u; i32.const 3; i32.eq
+//
+// and, because the tee CLOBBERS LOCAL_TMP with the masked value, the non-RAM
+// arm has to recompute the raw EA from rs1(+rs3) — 1-4 more ops and up to two
+// extra loads. The fast form is 5 ops and leaves LOCAL_TMP holding the RAW EA:
+//
+//     local.get TMP; i32.const 0x1C000000; i32.and; i32.const 0x0C000000; i32.eq
+//
+// BIT-IDENTITY (exhaustive, not argued): ((ea & 0x1FFFFFFF) >> 26) == 3 selects
+// exactly ea[28:26] == 0b011 — the 0x1FFFFFFF mask clears bits 31..29, the >>26
+// keeps bits 28..26, and == 3 demands 011. (ea & 0x1C000000) == 0x0C000000 is
+// the same three-bit test written in place. Verified by enumerating all 2^32
+// values in the offline harness (area3_proof): 0 mismatches. The RAM index in
+// the taken arm is `x & 0x00FFFFFF`, and the SMC mark's chunk index is
+// `x & 0x00FFFFFC` — both sit strictly inside the 0x1FFFFFFF mask, so feeding
+// them the RAW EA instead of the masked one is also bit-identical WHENEVER the
+// arm is taken (which is exactly when ea[31:29] contributes nothing).
+// Kill-switch: FLYCAST_AREA3_FAST=0 / bemental_sh4_set_area3_fast(0) restores
+// the legacy 8-op form byte-for-byte (the historical boot-title-wedge sites are
+// these four, so the bisect switch is non-negotiable).
+// ---------------------------------------------------------------------------
+// Matched-pair knob: emcc's getenv() does NOT see the host environment in the
+// worker (rec_wasm.cpp says the same about FLYCAST_SHARD), and the bridge has no
+// flycast_set_area3_fast wrapper yet, so the A/B arm for a browser build is this
+// literal. 1 = fast form (default), 0 = the legacy 8-op form, byte-for-byte.
+#ifndef FLYCAST_AREA3_FAST_DEFAULT
+#define FLYCAST_AREA3_FAST_DEFAULT 1
+#endif
+bool g_emit_area3_fast = []{
+    const char* e = std::getenv("FLYCAST_AREA3_FAST");
+    return e ? (e[0] != '0') : (bool)FLYCAST_AREA3_FAST_DEFAULT;
+}();
 bool g_emit_prologue_trim = []{
     const char* e = std::getenv("FLYCAST_PROLOGUE_TRIM");
     return !(e && e[0] == '0');
@@ -274,7 +312,95 @@ bool g_emit_self_loop = s_self_loop_enabled;
 // loops are CROSS-SHARD (that is why they fire emit_global_probe) and vaddr_to_block is a
 // single batch/shard. Next: cross-shard reach (shard-pack loop blocks or cross-shard
 // regions) + a region-fire counter + a cooled-rig matched pair. See task #26.
-bool g_emit_region = false;
+bool g_emit_region = []{
+    // Env gate added 2026-08-29 so the region path can be A/B'd from the
+    // offline emitter harness the same way every other lever can. Default OFF,
+    // unchanged. (The dirty-model fix in its loop body — save/restore around
+    // the flushing arms + markAllDirty at the header — landed with LEVER-12.)
+    const char* e = std::getenv("FLYCAST_REGION");
+    return e && e[0] != '0';
+}();
+
+// ---------------------------------------------------------------------------
+// LEVER-12 — TRACE / SUPERBLOCK FORMATION (2026-08-29). Generalizes lever-2's
+// hard-coded 2-block region into an N-block trace: starting at `block`, follow
+// the successor chain through the shard batch and INLINE each member's body
+// into the head's function, so the per-block-boundary tax is paid once per
+// TRACE instead of once per basic block.
+//
+// What a boundary costs today, on the cheapest possible hop (both blocks in the
+// same shard, so it is a direct `return_call`, IC not involved), counted off the
+// offline emitter dump: caller-side cycle guard (5 instrs, 1 load) + the tail
+// call (3) + callee slice precheck (6, 1 load) + callee reloadPrologue (3 instrs
+// + 1 load per cached register) + callee drain (5, 1 store) + caller flushAll
+// (3 instrs + 1 store per dirty register) + the PC store. With 4 live registers
+// that is ~45 executed instructions and ~7 linear-memory accesses BEFORE any
+// guest work. A trace boundary keeps only the slice precheck (5 instrs, 1 load)
+// — everything else is structurally gone, because the registers never leave
+// their wasm locals and there is no call.
+//
+// WHY NOW: the lever-2 card (docs/lever-2-region-residency.md, 2026-08-22)
+// shelved regions because "vaddr_to_block is a SINGLE batch and the hot loops
+// are cross-shard". That blocker was written when shard install was default
+// OFF — the per-block path calls build_block(), which passes vaddr_to_block =
+// nullptr, so NO region could ever form in the shipped configuration. Shard
+// install is default ON since 2026-08-27 (lever-6D certification), batches are
+// SHARD_BLOCK_CAP = 4096 blocks and only seal at that cap or after 100K
+// dispatches (rec_wasm.cpp), so a hot loop's blocks — discovered within a few
+// dispatches of each other — land in the SAME batch and resolve through the
+// same map that already makes intra-shard `return_call` tail-links fire (the
+// mechanism lever-6D measured at +27-30% on heavy scenes).
+//
+// SEMANTICS. Each inlined member keeps its OWN slice-yield precheck (flush +
+// PC = that member's vaddr + return), so interrupt-service cadence is unchanged
+// at block granularity — the trace never runs a block on a spent slice. Each
+// member keeps its own cycle drain, so guest-cycle accounting is unchanged.
+// What changes: (1) ctx->pc is not written at interior boundaries (it lags to
+// the trace head, exactly as it already lags inside any multi-op block);
+// (2) an interior member's code is executed from the head's inlined copy, so
+// its OWN ram_code_sum is not re-verified on entry — the same staleness class
+// as the default-ON intra-shard tail-link, which also calls a sibling's
+// function body with no lookup (rec_wasm jit_lookup verify is per-lookup);
+// (3) the block-cache-visible exit counters attribute to the head.
+//
+// DEFAULT OFF. Emission is deliberately NOT bit-identical (that is the point),
+// so this needs a matched pair + a parity gate before any default flip.
+//   FLYCAST_TRACE=0  off (default)
+//   FLYCAST_TRACE=1  LOOP traces only (a member's successor returns to the head)
+//   FLYCAST_TRACE=2  loop traces + straight-line traces
+//   FLYCAST_TRACE_BLOCKS=<n>  max members (default 4, clamped 2..16)
+//   FLYCAST_TRACE_OPS=<n>     max total SHIL ops (default 48, clamped 4..256)
+//   FLYCAST_TRACE_XPAGE=1     allow members on a different 4KB page than the head
+// Runtime setters: bemental_sh4_set_trace / _trace_limits (compile-time levers —
+// they only affect blocks built AFTER the call).
+// ---------------------------------------------------------------------------
+// Matched-pair knob for browser builds — see the FLYCAST_AREA3_FAST_DEFAULT note
+// on why the env var alone cannot flip a worker build.
+// 0 = off, 1 = loop traces, 2 = loop + straight-line traces.
+#ifndef FLYCAST_TRACE_DEFAULT
+#define FLYCAST_TRACE_DEFAULT 0
+#endif
+int g_emit_trace = []{
+    const char* e = std::getenv("FLYCAST_TRACE");
+    return e ? std::atoi(e) : FLYCAST_TRACE_DEFAULT;
+}();
+u32 g_trace_max_blocks = []{
+    const char* e = std::getenv("FLYCAST_TRACE_BLOCKS");
+    u32 v = e ? (u32)std::atoi(e) : 4u;
+    return v < 2 ? 2u : (v > 16 ? 16u : v);
+}();
+u32 g_trace_max_ops = []{
+    const char* e = std::getenv("FLYCAST_TRACE_OPS");
+    u32 v = e ? (u32)std::atoi(e) : 48u;
+    return v < 4 ? 4u : (v > 256 ? 256u : v);
+}();
+bool g_trace_cross_page = []{
+    const char* e = std::getenv("FLYCAST_TRACE_XPAGE");
+    return e && e[0] != '0';
+}();
+// Emit-time counters (read by a future ctxsnap case, like g_exit_*): how many
+// traces formed and how many member blocks were inlined.
+extern "C" { uint32_t g_trace_formed = 0; uint32_t g_trace_members = 0; uint32_t g_trace_loops = 0; }
 
 // ORDER 21b: emit the immediate post-RTE UpdateINTC? DEFAULT OFF (the fix — RTE
 // defers IRQ delivery to the slice-boundary crediting loop so the RTE target runs
@@ -598,6 +724,74 @@ static inline void emitCachedLocalGet(WasmModuleBuilder& b,
         const_cast<RegCache&>(cache).markLoaded(ctxOffset);
     }
     b.op_local_get(wasmLocal);
+}
+
+// ---------------------------------------------------------------------------
+// Area-3 discriminator (see the g_emit_area3_fast comment for the bit-identity
+// proof). CONTRACT, both flavours: consumes the raw EA from the stack, pushes
+// the area-3 predicate, and leaves LOCAL_TMP holding
+//   fast   -> the RAW EA          (nothing was masked)
+//   legacy -> the MASKED phys EA  (addr & 0x1FFFFFFF)
+// The taken arm reads LOCAL_TMP only through `& 0x00FFFFFF` (RAM index) and
+// `& 0x00FFFFFC` (SMC chunk), which are invariant under the difference.
+// ---------------------------------------------------------------------------
+static void emitArea3Test(WasmModuleBuilder& b) {
+    if (g_emit_area3_fast) {
+        b.op_i32_const((s32)0x1C000000);
+        b.op_i32_and();
+        b.op_i32_const((s32)0x0C000000);
+        b.op_i32_eq();
+    } else {
+        b.op_i32_const(0x1FFFFFFF);
+        b.op_i32_and();
+        b.op_local_tee(LOCAL_TMP);
+        b.op_i32_const(26);
+        b.op_i32_shr_u();
+        b.op_i32_const(3);
+        b.op_i32_eq();
+    }
+}
+// Same, for call sites where the raw EA is on the stack but NOT yet in
+// LOCAL_TMP (the legacy form's tee did double duty there).
+static void emitArea3TestTee(WasmModuleBuilder& b) {
+    if (g_emit_area3_fast) b.op_local_tee(LOCAL_TMP);
+    emitArea3Test(b);
+}
+// Non-area-3 arm: push the RAW (unmasked) EA. Under the fast discriminator
+// LOCAL_TMP still holds it, so the rs1(+rs3) recompute — and the extra cached
+// loads it costs — disappears. Under the legacy form LOCAL_TMP was clobbered
+// with the masked value, so the recompute is emitted exactly as before.
+static void emitRawEaSlowArm(WasmModuleBuilder& b, const shil_opcode& op, RegCache& cache) {
+    if (g_emit_area3_fast) { b.op_local_get(LOCAL_TMP); return; }
+    emitLoadParamCached(b, op.rs1, cache);
+    if (!op.rs3.is_null()) {
+        emitLoadParamCached(b, op.rs3, cache);
+        b.op_i32_add();
+    }
+}
+// Variant for the arms that also need the raw EA IN LOCAL_TMP afterwards: the
+// legacy form tees it, the fast form already has it there (so the tee, and the
+// local.get feeding it, both vanish).
+static void emitRawEaSlowArmTee(WasmModuleBuilder& b, const shil_opcode& op, RegCache& cache) {
+    if (g_emit_area3_fast) { b.op_local_get(LOCAL_TMP); return; }
+    emitLoadParamCached(b, op.rs1, cache);
+    if (!op.rs3.is_null()) {
+        emitLoadParamCached(b, op.rs3, cache);
+        b.op_i32_add();
+    }
+    b.op_local_tee(LOCAL_TMP);
+}
+// Variant for the OC-RAM fallback arms, which consumed the recomputed EA into
+// LOCAL_TMP with a local.set before re-reading it. Under the fast form the raw
+// EA is already in LOCAL_TMP, so the whole recompute+set disappears.
+static void emitRawEaSlowArmSet(WasmModuleBuilder& b, const shil_opcode& op, RegCache& cache) {
+    if (g_emit_area3_fast) return;
+    emitLoadParamCached(b, op.rs1, cache);
+    if (!op.rs3.is_null()) {
+        emitLoadParamCached(b, op.rs3, cache);
+        b.op_i32_add();
+    }
+    b.op_local_set(LOCAL_TMP);
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,13 +1381,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
             // imm-EA variant; MMIO falls through to the import pair.
             if (g_emit_mem_fastpaths) {
                 b.op_local_get(LOCAL_TMP);
-                b.op_i32_const(0x1FFFFFFF);
-                b.op_i32_and();
-                b.op_local_tee(LOCAL_TMP);       // masked phys (raw EA recomputed in else)
-                b.op_i32_const(26);
-                b.op_i32_shr_u();
-                b.op_i32_const(3);
-                b.op_i32_eq();
+                emitArea3Test(b);                // TMP: raw (fast) / masked (legacy)
                 b.op_if(0x40);
                     b.op_local_get(LOCAL_CTX);   // for the lo-word store
                     b.op_local_get(LOCAL_RAM);
@@ -1209,14 +1397,10 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
                     b.op_i32_load(4);
                     b.op_i32_store(op.rd.reg_offset() + 4);
                 b.op_else();
-                    // Non-RAM: recompute the RAW EA (TMP now holds the masked
-                    // value) and take the import pair.
-                    emitLoadParamCached(b, op.rs1, cache);
-                    if (!op.rs3.is_null()) {
-                        emitLoadParamCached(b, op.rs3, cache);
-                        b.op_i32_add();
-                    }
-                    b.op_local_tee(LOCAL_TMP);
+                    // Non-RAM: the RAW EA. Under the legacy discriminator TMP
+                    // holds the MASKED value here, so it is recomputed from
+                    // rs1(+rs3); under the fast one TMP is already raw.
+                    emitRawEaSlowArmTee(b, op, cache);
                     b.op_call(WIMPORT_READ32);
                     b.op_local_set(LOCAL_TMP2);
                     b.op_local_get(LOCAL_CTX);
@@ -1273,14 +1457,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
 
 
         b.op_local_get(LOCAL_TMP);
-        b.op_i32_const(0x1FFFFFFF);
-        b.op_i32_and();
-        b.op_local_tee(LOCAL_TMP);
-
-        b.op_i32_const(26);
-        b.op_i32_shr_u();
-        b.op_i32_const(3);
-        b.op_i32_eq();
+        emitArea3Test(b);                        // TMP: raw (fast) / masked (legacy)
 
         b.op_if(WASM_TYPE_I32);
         b.op_local_get(LOCAL_RAM);
@@ -1300,11 +1477,8 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         // down to P0 mirrors that hit unmapped space in Flycast's memmap.
         // Bug discovered 2026-05-14: BIOS at 0x800000A2 reads RFCR
         // (0xFF800028), got back 0 instead of 0x11, polled loop never exited.
-        emitLoadParamCached(b, op.rs1, cache);
-        if (!op.rs3.is_null()) {
-            emitLoadParamCached(b, op.rs3, cache);
-            b.op_i32_add();
-        }
+        // (Under the FAST discriminator nothing was masked, so LOCAL_TMP still
+        // holds the original virtual address and the recompute is elided.)
         // Lever-9D v2: OC-RAM arm ON THE IMPORT-FALLBACK PATH ONLY. v1 tested
         // every access up front and lost 5.2% (the guard + CCR load ran on
         // tens of millions of RAM accesses/s to save ~340K imports/s). Here
@@ -1316,7 +1490,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         // range test and keep the import.
         const bool ocfp_r = g_emit_ocram_fp && g_ocram_lin_base != 0 && g_ccr_addr != 0;
         if (ocfp_r) {
-            b.op_local_set(LOCAL_TMP);           // consume raw EA (both arms re-read TMP)
+            emitRawEaSlowArmSet(b, op, cache);   // legacy: recompute + set; fast: no-op
             b.op_local_get(LOCAL_TMP);           // raw EA
             b.op_i32_const((s32)0xFC000000);
             b.op_i32_and();
@@ -1362,6 +1536,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
             }
             b.op_end();
         } else {
+        emitRawEaSlowArm(b, op, cache);          // raw EA for the import
         switch (op.size) {
         // Sign-extend 8/16-bit import reads: SH4 mov.b/mov.w sign-extend at
         // the CPU regardless of source; the sh4_mem_read8/16 imports return
@@ -1405,13 +1580,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
                     emitLoadParamCached(b, op.rs3, cache);
                     b.op_i32_add();
                 }
-                b.op_i32_const(0x1FFFFFFF);
-                b.op_i32_and();
-                b.op_local_tee(LOCAL_TMP);       // masked phys
-                b.op_i32_const(26);
-                b.op_i32_shr_u();
-                b.op_i32_const(3);
-                b.op_i32_eq();
+                emitArea3TestTee(b);             // TMP: raw (fast) / masked (legacy)
                 b.op_if(0x40);
                     b.op_local_get(LOCAL_RAM);
                     b.op_local_get(LOCAL_TMP);
@@ -1428,12 +1597,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
                     b.op_i32_store(4);
                     emitSmcMarkLocal(b, LOCAL_TMP, 8);
                 b.op_else();
-                    emitLoadParamCached(b, op.rs1, cache);
-                    if (!op.rs3.is_null()) {
-                        emitLoadParamCached(b, op.rs3, cache);
-                        b.op_i32_add();
-                    }
-                    b.op_local_tee(LOCAL_TMP);
+                    emitRawEaSlowArmTee(b, op, cache);
                     b.op_local_get(LOCAL_CTX);
                     b.op_i32_load(op.rs2.reg_offset());
                     b.op_call(WIMPORT_WRITE32);
@@ -1489,14 +1653,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
 
 
         b.op_local_get(LOCAL_TMP);
-        b.op_i32_const(0x1FFFFFFF);
-        b.op_i32_and();
-        b.op_local_tee(LOCAL_TMP);
-
-        b.op_i32_const(26);
-        b.op_i32_shr_u();
-        b.op_i32_const(3);
-        b.op_i32_eq();
+        emitArea3Test(b);                        // TMP: raw (fast) / masked (legacy)
 
         b.op_if();
         b.op_local_get(LOCAL_RAM);
@@ -1525,18 +1682,15 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
         // stall — it was scheduler starvation, not write speed). Perf can be
         // revisited with a swizzle that ALSO sets fb_dirty; correctness
         // first. (audit finding: the memory-fastpath boot bug.)
-        emitLoadParamCached(b, op.rs1, cache);
-        if (!op.rs3.is_null()) {
-            emitLoadParamCached(b, op.rs3, cache);
-            b.op_i32_add();
-        }
+        // (Under the FAST discriminator LOCAL_TMP still holds the raw EA, so
+        // the rs1(+rs3) recompute below is elided — see emitRawEaSlowArm*.)
         // Lever-9D v2: OC-RAM store arm on the import-fallback path only (see
         // the readm twin for the v1 -5.2% lesson). No smc_mark: OC-RAM is not
         // JIT-source space (blocks compile from RAM/ROM vaddrs only).
         {
         const bool ocfp_w = g_emit_ocram_fp && g_ocram_lin_base != 0 && g_ccr_addr != 0;
         if (ocfp_w) {
-            b.op_local_set(LOCAL_TMP);           // consume raw EA (both arms re-read TMP)
+            emitRawEaSlowArmSet(b, op, cache);   // legacy: recompute + set; fast: no-op
             b.op_local_get(LOCAL_TMP);           // raw EA
             b.op_i32_const((s32)0xFC000000);
             b.op_i32_and();
@@ -1580,6 +1734,7 @@ bool emitShilOp(WasmModuleBuilder& b, const shil_opcode& op,
             }
             b.op_end();
         } else {
+        emitRawEaSlowArm(b, op, cache);          // raw EA for the import
         emitLoadParamCached(b, op.rs2, cache);
         switch (op.size) {
         case 1: b.op_call(WIMPORT_WRITE8);  break;
@@ -2387,28 +2542,14 @@ static s32 sibling_func_idx(u32 target_vaddr, u32 self_vaddr,
     return (s32)(WIMPORT_COUNT + it->second);
 }
 
-void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
-                   const RegCache& cache,
-                   const std::unordered_map<u32, u32>* vaddr_to_idx) {
-    u32 bcls = BET_GET_CLS(block->BlockType);
-    const u32 self_vaddr = block != nullptr ? block->vaddr : 0u;
-
-    // Intra-link helper: tail-call the sibling block — BUT vector-guarded, exactly
-    // like emit_global_probe. ORDER 21b (PSO title frame-wait livelock): the old
-    // form was an UNCONDITIONAL `return_call`, so an all-intra-shard hot loop
-    // (whose blocks all resolve via sibling_func_idx, never the cross-shard probe)
-    // return_call-chained FOREVER and never re-entered the C trampoline. But
-    // sh4_sched_tick (guest timebase -> SPG scanline -> VBlank raise) AND UpdateINTC
-    // (interrupt delivery) live ONLY in the trampoline's `cycle_counter <= 0` branch
-    // (rec_wasm.cpp). So the guest's VBlank ISR never ran, the game's "wait N
-    // VBlanks" frame-sync loops never advanced, and the boot livelocked at varying
-    // PCs (0x8c3c53f8 / 0x8c37bxxx) with interrupts pending-but-undelivered. Native
-    // rec-x64 links blocks only WITHIN a timeslice and falls back to intc_sched at
-    // cycle_counter<=0 — match that. This helper now ALWAYS ends the frame: it
-    // return_calls the sibling while the slice has budget (cycle_counter > 0), else
-    // returns the (already-stored) PC to the trampoline so sched+interrupts run.
-    // Both callers still `return` after it (the frame is always ended here).
-    auto emit_tail_to = [&](u32 func_idx) {
+// ---------------------------------------------------------------------------
+// Exit-tail primitives. Hoisted out of emitBlockExit (2026-08-29) UNCHANGED so
+// the trace emitter can reuse the exact same tail-call / const-target-probe
+// shapes for its side exits. emitBlockExit keeps thin lambdas that forward
+// here, so its emission is byte-identical to before the hoist (verified by a
+// fixture-level diff over the offline emitter dump).
+// ---------------------------------------------------------------------------
+static void emitTailTo(WasmModuleBuilder& b, u32 func_idx) {
         if (!g_emit_hop_guard) {
             // Guard elided: the callee's OWN slice-yield precheck is now the
             // first instruction of its body (prologue-trim hoist) and stores
@@ -2433,14 +2574,9 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         b.op_local_get(LOCAL_CTX);
         b.op_i32_load(ctx_off::PC);
         b.op_return();
-    };
+}
 
-    // ORDER 21b prediction: emit `*(u32*)ctr += 1` into the block's exit path.
-    // Only the non-tail-linked (return-to-C) paths call this, so the runtime
-    // total is the execution-weighted round-trip count for that class. The
-    // counters (g_exit_dyn / g_exit_static_xshd / g_exit_cond_xshd) are defined
-    // at namespace scope above. Strip with them after the verdict.
-    auto emit_rt_bump = [&](uint32_t* ctr) {
+static void emitRtBump(WasmModuleBuilder& b, uint32_t* ctr) {
         u32 a = (u32)(uintptr_t)ctr;
         b.op_i32_const((s32)a);   // addr (for store)
         b.op_i32_const((s32)a);   // addr (for load)
@@ -2448,32 +2584,9 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         b.op_i32_const(1);
         b.op_i32_add();           // -> *ctr + 1
         b.op_i32_store(0);        // *ctr = *ctr + 1
-    };
+}
 
-    // ORDER 21b Lever 1/2 — GLOBAL cross-shard / dynamic tail-link probe.
-    // Precondition: PC already holds the target vaddr and the RegCache is
-    // flushed (emitBlockFuncBody flushAll's before emitBlockExit). Emits, with
-    // GC scar #1 (the vector-guard) FIRST so a chain never outruns a due
-    // timeslice/interrupt (else a poll chain waiting on an interrupt-set flag
-    // livelocks — the storm class):
-    //   if (cycle_counter > 0) {
-    //     idx = sh4_lookup_idx(PC);                 ;; -1 on miss OR SMC-stale
-    //     if (idx != -1) return_call_indirect(idx); ;; chain in-wasm; ends frame
-    //   }
-    // On guard-block or miss it falls through to the caller's rt_bump (scar #2
-    // miss telemetry) + return-to-C. NOT emitted for BET_*Intr blocks — those
-    // must reach the UpdateINTC tail-call below.
-    // emit_ic = true only for BET_CLS_Dynamic (jsr/jmp @Rn, rts) — confines the IC
-    // byte-growth to the class that fires the title's dominant cost, halving the
-    // module-scale replication that is the residual instantiation risk.
-    // Lever-5E2: const-target probe for cond/static exits. The target pc is a
-    // COMPILE-TIME constant, so the site needs no pc tag — just {slot, gen}
-    // (the same proven scalar shape; ic_pc is stamped with the target for
-    // forensics only). Per-ARM sites mean an alternating conditional keeps
-    // BOTH targets cached — the monomorphic single-site thrash (a 50/50
-    // branch never hit) was driving ~2M C-probe lookups/s. Precondition:
-    // ctx->pc already stores `target`.
-    auto emit_const_target_probe = [&](u32 target) {
+static void emitConstTargetProbe(WasmModuleBuilder& b, u32 target) {
         const bool have_ic = g_ic_cs && (g_ic_next < IC_SITES);
         const uint32_t site = have_ic ? g_ic_next++ : 0;
         uint32_t* icpc = &g_ic[6*site+0];
@@ -2525,7 +2638,62 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
           b.op_end();
         if (g_emit_hop_guard) b.op_end();        // close the vector-guard if
         (void)icpc;
-    };
+}
+
+void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
+                   const RegCache& cache,
+                   const std::unordered_map<u32, u32>* vaddr_to_idx) {
+    u32 bcls = BET_GET_CLS(block->BlockType);
+    const u32 self_vaddr = block != nullptr ? block->vaddr : 0u;
+
+    // Intra-link helper: tail-call the sibling block — BUT vector-guarded, exactly
+    // like emit_global_probe. ORDER 21b (PSO title frame-wait livelock): the old
+    // form was an UNCONDITIONAL `return_call`, so an all-intra-shard hot loop
+    // (whose blocks all resolve via sibling_func_idx, never the cross-shard probe)
+    // return_call-chained FOREVER and never re-entered the C trampoline. But
+    // sh4_sched_tick (guest timebase -> SPG scanline -> VBlank raise) AND UpdateINTC
+    // (interrupt delivery) live ONLY in the trampoline's `cycle_counter <= 0` branch
+    // (rec_wasm.cpp). So the guest's VBlank ISR never ran, the game's "wait N
+    // VBlanks" frame-sync loops never advanced, and the boot livelocked at varying
+    // PCs (0x8c3c53f8 / 0x8c37bxxx) with interrupts pending-but-undelivered. Native
+    // rec-x64 links blocks only WITHIN a timeslice and falls back to intc_sched at
+    // cycle_counter<=0 — match that. This helper now ALWAYS ends the frame: it
+    // return_calls the sibling while the slice has budget (cycle_counter > 0), else
+    // returns the (already-stored) PC to the trampoline so sched+interrupts run.
+    // Both callers still `return` after it (the frame is always ended here).
+    auto emit_tail_to = [&](u32 func_idx) { emitTailTo(b, func_idx); };
+
+    // ORDER 21b prediction: emit `*(u32*)ctr += 1` into the block's exit path.
+    // Only the non-tail-linked (return-to-C) paths call this, so the runtime
+    // total is the execution-weighted round-trip count for that class. The
+    // counters (g_exit_dyn / g_exit_static_xshd / g_exit_cond_xshd) are defined
+    // at namespace scope above. Strip with them after the verdict.
+    auto emit_rt_bump = [&](uint32_t* ctr) { emitRtBump(b, ctr); };
+
+    // ORDER 21b Lever 1/2 — GLOBAL cross-shard / dynamic tail-link probe.
+    // Precondition: PC already holds the target vaddr and the RegCache is
+    // flushed (emitBlockFuncBody flushAll's before emitBlockExit). Emits, with
+    // GC scar #1 (the vector-guard) FIRST so a chain never outruns a due
+    // timeslice/interrupt (else a poll chain waiting on an interrupt-set flag
+    // livelocks — the storm class):
+    //   if (cycle_counter > 0) {
+    //     idx = sh4_lookup_idx(PC);                 ;; -1 on miss OR SMC-stale
+    //     if (idx != -1) return_call_indirect(idx); ;; chain in-wasm; ends frame
+    //   }
+    // On guard-block or miss it falls through to the caller's rt_bump (scar #2
+    // miss telemetry) + return-to-C. NOT emitted for BET_*Intr blocks — those
+    // must reach the UpdateINTC tail-call below.
+    // emit_ic = true only for BET_CLS_Dynamic (jsr/jmp @Rn, rts) — confines the IC
+    // byte-growth to the class that fires the title's dominant cost, halving the
+    // module-scale replication that is the residual instantiation risk.
+    // Lever-5E2: const-target probe for cond/static exits. The target pc is a
+    // COMPILE-TIME constant, so the site needs no pc tag — just {slot, gen}
+    // (the same proven scalar shape; ic_pc is stamped with the target for
+    // forensics only). Per-ARM sites mean an alternating conditional keeps
+    // BOTH targets cached — the monomorphic single-site thrash (a 50/50
+    // branch never hit) was driving ~2M C-probe lookups/s. Precondition:
+    // ctx->pc already stores `target`.
+    auto emit_const_target_probe = [&](u32 target) { emitConstTargetProbe(b, target); };
 
     auto emit_global_probe = [&](bool emit_ic) {
         const bool have_ic = emit_ic && (g_ic_next < IC_SITES);
@@ -3166,8 +3334,17 @@ static bool fpu_f32_helper_op(u32 opnum) {
     default: return false;
     }
 }
-static void scanBlockF32(RuntimeBlockInfo* blk, RegCache& cache) {
-    if (!g_emit_fpu_cache || blk == nullptr) return;
+// Multi-block variant. The candidate/exclusion sets MUST be unioned across every
+// oplist that will be emitted into one function body: calling the single-block
+// scan once per member is UNSOUND, because addOffsetF32 is idempotent and an
+// exclusion discovered in member 2 cannot retract a candidate member 1 already
+// installed. Concretely — member 1 does `fadd fr2` (candidate) and member 2 does
+// `fmov.d @rn, fr2` (a size-8 writem, which reads fr2 straight out of ctx) — the
+// sequential scan leaves fr2 in an f32 local, so member 2 stores the STALE ctx
+// copy. Caught by the T6_fpu_loop fixture in the runtime differential; it applies
+// to the lever-2 region path too, which is why both go through this function.
+static void scanBlocksF32(RuntimeBlockInfo* const* blks, size_t nblk, RegCache& cache) {
+    if (!g_emit_fpu_cache || blks == nullptr || nblk == 0) return;
     std::vector<u32> cand, excl;
     auto addTo = [](std::vector<u32>& v, u32 off) {
         for (u32 o : v) if (o == off) return;
@@ -3176,6 +3353,9 @@ static void scanBlockF32(RuntimeBlockInfo* blk, RegCache& cache) {
     auto span = [&](std::vector<u32>& v, u32 base, u32 words) {
         for (u32 i = 0; i < words; i++) addTo(v, base + i * 4);
     };
+    for (size_t bi = 0; bi < nblk; ++bi) {
+    RuntimeBlockInfo* blk = blks[bi];
+    if (blk == nullptr) continue;
     for (size_t i = 0; i < blk->oplist.size(); ++i) {
         const shil_opcode& op = blk->oplist[i];
         const shil_param* ps[5] = { &op.rs1, &op.rs2, &op.rs3, &op.rd, &op.rd2 };
@@ -3207,22 +3387,42 @@ static void scanBlockF32(RuntimeBlockInfo* blk, RegCache& cache) {
             span(excl, op.rs1.reg_offset(), 16);
             span(excl, op.rd.reg_offset(), 16);
             break;
-        default:
+        default: {
             // Generic rule: any f32/f64-typed param on a non-helper op
             // (readm rd, writem rs2, mov64 pairs, fsca rd, IFB'd FPU ops)
             // excludes its offset(s).
+            //
+            // The exclusion is driven by the WIDTH THE EMITTER ACTUALLY TOUCHES,
+            // not only by the param's declared type: the size-8 readm/writem and
+            // mov64 paths read/write BOTH words (reg_offset and reg_offset + 4)
+            // straight out of ctx, whatever the param claims. A scalar-typed
+            // param on such an op used to leave the SECOND word cacheable, and
+            // an f32 local holding it then shadowed the ctx copy the emitted
+            // pair-store reads (T6_fpu_loop caught exactly this: fr3 stayed in a
+            // local while `fmov.d fr2, @rn` stored the stale ctx word).
+            const bool pair = ((op.op == shop_readm || op.op == shop_writem) && op.size == 8)
+                              || op.op == shop_mov64;
             for (auto* p : ps) {
-                if (p->is_r32f()) addTo(excl, p->reg_offset());
-                else if (p->is_r64f()) { addTo(excl, p->reg_offset()); addTo(excl, p->reg_offset() + 4); }
+                if (p->is_r32f()) {
+                    addTo(excl, p->reg_offset());
+                    if (pair) addTo(excl, p->reg_offset() + 4);
+                } else if (p->is_r64f()) {
+                    addTo(excl, p->reg_offset()); addTo(excl, p->reg_offset() + 4);
+                }
             }
             break;
         }
+        }
+    }
     }
     for (u32 off : cand) {
         bool ex = false;
         for (u32 e : excl) if (e == off) { ex = true; break; }
         if (!ex) cache.addOffsetF32(off);
     }
+}
+static void scanBlockF32(RuntimeBlockInfo* blk, RegCache& cache) {
+    scanBlocksF32(&blk, 1, cache);
 }
 
 // ---------------------------------------------------------------------------
@@ -3323,6 +3523,140 @@ static void computeNoPreload(RuntimeBlockInfo* blk, RegCache& cache)
         if (kv.second == 2) cache.setNoPreload(kv.first);
 }
 
+// ---------------------------------------------------------------------------
+// LEVER-12 trace formation — planning half (see the g_emit_trace comment).
+// ---------------------------------------------------------------------------
+
+// Any op whose emission flushes+reloads the whole cache or drops into the
+// interpreter. Excluded from traces for the same reason the self-loop excludes
+// them (boot-title-wedge finding #1): they make the compile-time dirty model
+// and the runtime state diverge in ways this first increment does not model.
+static bool traceBlockHasFallback(RuntimeBlockInfo* blk) {
+    for (size_t i = 0; i < blk->oplist.size(); ++i) {
+        switch (blk->oplist[i].op) {
+        case shop_ifb: case shop_sync_sr: case shop_sync_fpscr:
+        case shop_pref: case shop_div1: case shop_div32u:
+        case shop_div32s: case shop_div32p2: case shop_fsca:
+            return true;
+        default: break;
+        }
+    }
+    return false;
+}
+static int traceTWrites(RuntimeBlockInfo* blk) {
+    int n = 0;
+    for (size_t i = 0; i < blk->oplist.size(); ++i) {
+        const shil_opcode& op = blk->oplist[i];
+        if (op.rd.is_reg()  && op.rd.reg_offset()  == (u32)ctx_off::SR_T) ++n;
+        if (op.rd2.is_reg() && op.rd2.reg_offset() == (u32)ctx_off::SR_T) ++n;
+    }
+    return n;
+}
+// A block this emitter is willing to inline into somebody else's function.
+// The HEAD is checked separately (it also has to lose to the self-loop and
+// memset fastpaths, which are proven and strictly better for their shapes).
+static bool traceBlockEligible(RuntimeBlockInfo* blk, RuntimeBlockInfo* head) {
+    if (blk == nullptr) return false;
+    if (blk->oplist.size() >= 20) return false;
+    if (traceBlockHasFallback(blk)) return false;
+    if (detectMemsetByteLoop(blk).detected) return false;
+    const u32 cls = BET_GET_CLS(blk->BlockType);
+    // A self-branching block is the self-loop lever's shape — leave it to run
+    // as its own function (the trace would inline a body whose back edge we do
+    // not model here).
+    if (cls == BET_CLS_COND && blk->BranchBlock == blk->vaddr) return false;
+    // Cond members re-derive the branch predicate from live SR_T at the block
+    // bottom, exactly as emitBlockExit does; keep the self-loop's conservative
+    // >1-T-write exclusion (a T-writing delay slot without has_jcond).
+    if (cls == BET_CLS_COND && !blk->has_jcond && traceTWrites(blk) > 1) return false;
+    if (!g_trace_cross_page && head != nullptr
+        && (blk->vaddr >> 12) != (head->vaddr >> 12)) return false;
+    return true;
+}
+
+// The successor a trace follows out of `blk`.
+//   BET_StaticJump           -> its one target, no side exit.
+//   BET_CLS_COND             -> normally the FALL-THROUGH (NextBlock), with the
+//                               taken arm as the side exit; but if the TAKEN arm
+//                               closes the loop back to the head (directly, or
+//                               through one BET_StaticJump), follow it instead.
+//   everything else          -> no continuation (the trace ends here and the
+//                               member's own emitBlockExit closes it).
+// Returns false when there is no trace continuation.
+static bool traceChooseSucc(RuntimeBlockInfo* blk, RuntimeBlockInfo* head,
+                            const std::unordered_map<u32, RuntimeBlockInfo*>* v2b,
+                            u32* out_succ, bool* out_taken_is_cont, u32* out_side)
+{
+    if (blk == nullptr) return false;
+    if (blk->BlockType == BET_StaticJump) {
+        *out_succ = blk->BranchBlock; *out_taken_is_cont = true; *out_side = 0;
+        return true;
+    }
+    if (BET_GET_CLS(blk->BlockType) != BET_CLS_COND) return false;
+    const u32 taken = blk->BranchBlock, fall = blk->NextBlock;
+    auto closes = [&](u32 target) -> bool {
+        if (target == head->vaddr) return true;
+        auto it = v2b->find(target);                     // one-block lookahead
+        if (it == v2b->end() || it->second == nullptr) return false;
+        RuntimeBlockInfo* n = it->second;
+        return n->BlockType == BET_StaticJump && n->BranchBlock == head->vaddr
+               && traceBlockEligible(n, head);
+    };
+    const bool taken_closes = closes(taken);
+    const bool fall_closes  = closes(fall);
+    if (taken_closes && !fall_closes) {
+        *out_succ = taken; *out_taken_is_cont = true; *out_side = fall;
+    } else {
+        *out_succ = fall;  *out_taken_is_cont = false; *out_side = taken;
+    }
+    return true;
+}
+
+struct TracePlan {
+    std::vector<RuntimeBlockInfo*> blocks;   // blocks[0] == head
+    bool is_loop = false;                    // last member's successor == head
+};
+
+static TracePlan planTrace(RuntimeBlockInfo* head,
+                           const std::unordered_map<u32, RuntimeBlockInfo*>* v2b)
+{
+    TracePlan plan;
+    if (g_emit_trace <= 0 || head == nullptr || v2b == nullptr) return plan;
+    if (!g_emit_regcache || s_lazy_regcache_enabled) return plan;  // eager cache only
+    // The head must not be a shape a proven in-block fastpath already owns.
+    if (detectMemsetByteLoop(head).detected) return plan;
+    if (BET_GET_CLS(head->BlockType) == BET_CLS_COND && head->BranchBlock == head->vaddr)
+        return plan;
+    if (!traceBlockEligible(head, nullptr)) return plan;
+
+    plan.blocks.push_back(head);
+    u32 ops = (u32)head->oplist.size();
+    RuntimeBlockInfo* cur = head;
+    for (;;) {
+        u32 succ = 0, side = 0; bool taken_is_cont = false;
+        if (!traceChooseSucc(cur, head, v2b, &succ, &taken_is_cont, &side)) break;
+        if (succ == head->vaddr) { plan.is_loop = true; break; }   // loop closes
+        if (plan.blocks.size() >= g_trace_max_blocks) break;
+        auto it = v2b->find(succ);
+        if (it == v2b->end() || it->second == nullptr) break;       // out of shard
+        RuntimeBlockInfo* nxt = it->second;
+        if (nxt == cur) break;
+        bool already = false;
+        for (auto* m : plan.blocks) if (m == nxt || m->vaddr == nxt->vaddr) already = true;
+        if (already) break;                    // only head-closing cycles are modelled
+        if (!traceBlockEligible(nxt, head)) break;
+        if (ops + (u32)nxt->oplist.size() > g_trace_max_ops) break;
+        plan.blocks.push_back(nxt);
+        ops += (u32)nxt->oplist.size();
+        cur = nxt;
+    }
+    // A 1-block "trace" is just the normal path; a loop trace needs >= 2 members
+    // (the 1-block self-loop is the self-loop lever's job).
+    if (plan.blocks.size() < 2) { plan.blocks.clear(); plan.is_loop = false; }
+    if (!plan.is_loop && g_emit_trace < 2) { plan.blocks.clear(); }
+    return plan;
+}
+
 static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
                               const std::unordered_map<u32, u32>* vaddr_to_idx = nullptr,
                               const std::unordered_map<u32, RuntimeBlockInfo*>* vaddr_to_block = nullptr)
@@ -3389,12 +3723,31 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
     // reads/writes go straight to ctx memory (reloadAll/flushAll become
     // no-ops over an empty entry set). If this makes the DP-decrypt PRNG
     // pool correct, the reg-cache across the deep call nest is convicted.
+    // LEVER-12 trace formation. Mutually exclusive with the lever-2 region (the
+    // trace subsumes its shape); like the region it must be planned BEFORE
+    // scanBlock so every member's working set gets a local.
+    TracePlan trace;
+    if (region_B == nullptr) trace = planTrace(block, vaddr_to_block);
+    const bool have_trace = !trace.blocks.empty();
+
     if (block != nullptr && g_emit_regcache) cache.scanBlock(block);
     if (region_B != nullptr) cache.scanBlock(region_B);   // union B's working set
+    if (have_trace)
+        for (size_t i = 1; i < trace.blocks.size(); ++i) cache.scanBlock(trace.blocks[i]);
     // Lever-5G: f32 entries (fr bank) — after the int scan so mixed offsets
     // keep their int entries and addOffsetF32's already-present check holds.
-    if (block != nullptr && g_emit_regcache) scanBlockF32(block, cache);
-    if (region_B != nullptr && g_emit_regcache) scanBlockF32(region_B, cache);
+    if (g_emit_regcache) {
+        // One scan over ALL the oplists that land in this function body — see
+        // scanBlocksF32 on why a per-member scan is unsound.
+        if (have_trace) {
+            scanBlocksF32(trace.blocks.data(), trace.blocks.size(), cache);
+        } else if (region_B != nullptr) {
+            RuntimeBlockInfo* pair[2] = { block, region_B };
+            scanBlocksF32(pair, 2, cache);
+        } else if (block != nullptr) {
+            scanBlockF32(block, cache);
+        }
+    }
     const u32 i32Count = LOCAL_FIXED_I32_COUNT + cache.localCount();
     cache._tmp64LocalIdx = 2 + i32Count;
     // f32 locals occupy the third typed group, after the i64 scratch.
@@ -3524,7 +3877,11 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         // entries computeNoPreload proved are defined before they are read.
         // Both flavors run BEFORE the loop header so cached locals persist
         // across iterations rather than being re-fetched every time.
-        if (g_emit_preload_elide && g_emit_regcache && region_B == nullptr)
+        // Preload elision analyses ONE oplist; a trace/region has several, and a
+        // register defined-before-read in the head may be read-first by a later
+        // member (and, in a loop trace, by the head itself on iteration 2).
+        // Elision is therefore off whenever a multi-block body is emitted.
+        if (g_emit_preload_elide && g_emit_regcache && region_B == nullptr && !have_trace)
             computeNoPreload(block, cache);
         reloadPrologueOrInvalidate(b, cache);
 
@@ -3576,6 +3933,180 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
             b.op_end();
         }
 
+        // -------------------------------------------------------------------
+        // LEVER-12 — TRACE / SUPERBLOCK BODY.
+        //
+        //   [loop $L]                              ; loop traces only
+        //     for each member M:
+        //       if (cycle_counter <= 0) { flush; PC = M.vaddr; return PC }
+        //       cycle_counter -= M.guest_cycles
+        //       <M's SHIL ops, registers staying in locals>
+        //       interior cond member: if (side arm) { flush; PC = side;
+        //                                            tail/probe; return PC }
+        //       last member, loop:    if (continue arm) br $L
+        //                             then the other arm's exit as above
+        //       last member, line:    flushAll; emitBlockExit(M)
+        //   [end]
+        //
+        // The registers never round-trip through ctx across an interior
+        // boundary, there is no call, and no PC is written — that is the whole
+        // lever. Correctness rests on three bookkeeping rules:
+        //  1. every exit arm FLUSHES before it leaves, and the compile-time
+        //     dirty model is saved/restored around it (saveDirty/restoreDirty)
+        //     so the fall-through path still knows those registers are dirty;
+        //  2. a loop trace marks the whole cache dirty at the loop header, so
+        //     every in-loop flush is a superset of the true dirty set on
+        //     iteration 2+ (the linear model is not a fixpoint otherwise —
+        //     this is the boot-title-wedge finding-#1 class);
+        //  3. members with fallback ops are excluded, so no flushAll+reloadAll
+        //     sandwich can appear inside the traced body.
+        // -------------------------------------------------------------------
+        if (have_trace) {
+            ++g_trace_formed;
+            g_trace_members += (uint32_t)trace.blocks.size();
+            if (trace.is_loop) ++g_trace_loops;
+
+            // Rule 2: loop-carried registers are conservatively dirty.
+            if (trace.is_loop) cache.markAllDirty();
+
+            // Push 1 iff blk's conditional branch is TAKEN (mirrors the
+            // predicate emitBlockExit re-derives for the same block).
+            auto push_taken = [&](RuntimeBlockInfo* blk) {
+                if (blk->has_jcond) {
+                    s32 j = cache.getLocal(ctx_off::JDYN);
+                    if (j >= 0) emitCachedLocalGet(b, cache, ctx_off::JDYN, (u32)j);
+                    else { b.op_local_get(LOCAL_CTX); b.op_i32_load(ctx_off::JDYN); }
+                } else {
+                    s32 t = cache.getLocal(ctx_off::SR_T);
+                    if (t >= 0) emitCachedLocalGet(b, cache, ctx_off::SR_T, (u32)t);
+                    else { b.op_local_get(LOCAL_CTX); b.op_i32_load(ctx_off::SR_T); }
+                }
+                if (blk->BlockType != BET_Cond_1) b.op_i32_eqz();  // Cond_0: taken == !T
+            };
+            // Leave the function for `target`, from inside a conditional arm.
+            // Same shape the per-block exit would have taken for a constant
+            // target: sibling tail-call when the target is in this shard, else
+            // the const-target IC probe, else return the PC to the dispatcher.
+            auto emit_exit_to = [&](RuntimeBlockInfo* from, u32 target) {
+                cache.flushAll(b);
+                b.op_local_get(LOCAL_CTX);
+                b.op_i32_const((s32)target);
+                b.op_i32_store(ctx_off::PC);
+                s32 fidx = sibling_func_idx(target, from->vaddr, vaddr_to_idx);
+                if (fidx >= 0) {
+                    emitTailTo(b, (u32)fidx);       // ends the frame itself
+                    return;
+                }
+                emitConstTargetProbe(b, target);
+                emitRtBump(b, &g_exit_static_xshd);
+                b.op_local_get(LOCAL_CTX);
+                b.op_i32_load(ctx_off::PC);
+                b.op_return();
+            };
+            // Per-member slice-yield precheck (same test, same PC, same return
+            // value as the per-block one — only the flush is new, because a
+            // trace can reach it with registers live in locals).
+            auto emit_member_precheck = [&](RuntimeBlockInfo* blk) {
+                b.op_local_get(LOCAL_CTX);
+                b.op_i32_load(ctx_off::CYCLE_COUNTER);
+                b.op_i32_const(0);
+                b.op_i32_le_s();
+                b.op_if(0x40);
+                  auto snap = cache.saveDirty();
+                  cache.flushAll(b);
+                  b.op_local_get(LOCAL_CTX);
+                  b.op_i32_const((s32)blk->vaddr);
+                  b.op_i32_store(ctx_off::PC);
+                  b.op_local_get(LOCAL_CTX);
+                  b.op_i32_load(ctx_off::PC);
+                  b.op_return();
+                  cache.restoreDirty(snap);
+                b.op_end();
+            };
+
+            if (trace.is_loop) b.op_loop(0x40);
+
+            const size_t last = trace.blocks.size() - 1;
+            for (size_t i = 0; i <= last; ++i) {
+                RuntimeBlockInfo* m = trace.blocks[i];
+                // The head's first entry is already covered by the block's own
+                // slice check (hoisted by prologue-trim, or emitted just above
+                // when that lever is off) — but a loop trace re-enters the head
+                // every iteration, so it needs one INSIDE the loop.
+                if (i > 0 || trace.is_loop) emit_member_precheck(m);
+
+                if (m->guest_cycles > 0) {
+                    b.op_local_get(LOCAL_CTX);
+                    if (i == 0 && !trace.is_loop && ptrim) {
+                        b.op_local_get(LOCAL_CC);   // tee'd by the top precheck
+                    } else {
+                        b.op_local_get(LOCAL_CTX);
+                        b.op_i32_load(ctx_off::CYCLE_COUNTER);
+                    }
+                    b.op_i32_const((s32)m->guest_cycles);
+                    b.op_i32_sub();
+                    b.op_i32_store(ctx_off::CYCLE_COUNTER);
+                }
+
+                for (size_t k = 0; k < m->oplist.size(); ++k) {
+                    const shil_opcode& op = m->oplist[k];
+                    if (emitShilOp(b, op, m, (u32)k, cache)) continue;
+                    // Unreachable: traceBlockEligible rejects every op that
+                    // cannot emit natively. Keep the correct fallback anyway.
+                    cache.flushAll(b);
+                    const u32 op_addr = m->vaddr + op.guest_offs;
+                    b.op_i32_const((s32)(u32)ReadMem16(op_addr));
+                    b.op_i32_const((s32)(op_addr + 2));
+                    b.op_call(WIMPORT_IFB);
+                    reloadOrInvalidate(b, cache);
+                }
+
+                u32 succ = 0, side = 0; bool taken_is_cont = false;
+                const bool has_succ =
+                    traceChooseSucc(m, block, vaddr_to_block, &succ, &taken_is_cont, &side);
+                const bool is_cond = BET_GET_CLS(m->BlockType) == BET_CLS_COND;
+
+                if (i < last) {
+                    // Interior member: the trace continues on the chosen arm;
+                    // the other arm (cond only) leaves here.
+                    if (is_cond) {
+                        push_taken(m);
+                        if (taken_is_cont) b.op_i32_eqz();   // side arm = NOT taken
+                        b.op_if(0x40);
+                          auto snap = cache.saveDirty();
+                          emit_exit_to(m, side);
+                          cache.restoreDirty(snap);
+                        b.op_end();
+                    }
+                    (void)has_succ;
+                    continue;
+                }
+
+                // Last member.
+                if (trace.is_loop) {
+                    if (is_cond) {
+                        push_taken(m);
+                        if (!taken_is_cont) b.op_i32_eqz();  // continue arm
+                        b.op_if(0x40);
+                          b.op_br(1);                        // -> loop header
+                        b.op_end();
+                        auto snap = cache.saveDirty();
+                        emit_exit_to(m, side);               // ends the frame
+                        cache.restoreDirty(snap);
+                    } else {
+                        b.op_br(0);                          // -> loop header
+                    }
+                } else {
+                    cache.flushAll(b);
+                    emitBlockExit(b, m, cache, vaddr_to_idx);
+                }
+            }
+
+            if (trace.is_loop) b.op_end();                   // close $L
+            b.op_local_get(LOCAL_CTX);                       // function result
+            b.op_i32_load(ctx_off::PC);
+        } else
+
         // Lever #2 (register residency): A=block (BET_Cond, taken->B), B=region_B
         // (BET_StaticJump -> A). Emit A's fn as ONE wasm loop that inlines B's
         // body, keeping the union reg working-set resident in locals across
@@ -3624,6 +4155,13 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
                 }
             };
 
+            // Loop-carried dirty conservatism + per-arm save/restore: WITHOUT
+            // these the linear dirty model is wrong inside a wasm `loop`. The
+            // arm below flushes and LEAVES, so on the fall-through path (and on
+            // iteration 2+) those registers are still dirty in locals; a model
+            // that believed the flush ran would skip them at the NEXT flush and
+            // leave ctx memory stale. Same class as boot-title-wedge finding #1.
+            cache.markAllDirty();
             b.op_block(0x40);                          // $exit (depth 2 from inner if)
               b.op_loop(0x40);                         //   $L (depth 1 from inner if)
                 emit_drain(block);                     //   drain A
@@ -3631,11 +4169,13 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
                 push_A_taken();
                 b.op_i32_eqz();                        //   !A_taken
                 b.op_if(0x40);                         //     A NOT taken -> A.NextBlock
+                  { auto snap = cache.saveDirty();
                   cache.flushAll(b);
                   b.op_local_get(LOCAL_CTX);
                   b.op_i32_const((s32)block->NextBlock);
                   b.op_i32_store(ctx_off::PC);
                   b.op_br(2);                          //     -> $exit
+                  cache.restoreDirty(snap); }
                 b.op_end();
                 emit_drain(region_B);                  //   drain B
                 emit_body(region_B);                   //   B body (B->A = loop back-edge)
@@ -3645,11 +4185,13 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
                     b.op_i32_const((s32)-SELF_LOOP_CYCLE_SLICE);
                     b.op_i32_le_s();                   //   cycle_counter <= -SLICE?
                     b.op_if(0x40);                     //     budget spent -> re-enter A
+                      { auto snap = cache.saveDirty();
                       cache.flushAll(b);
                       b.op_local_get(LOCAL_CTX);
                       b.op_i32_const((s32)block->vaddr);
                       b.op_i32_store(ctx_off::PC);
                       b.op_br(2);                      //     -> $exit
+                      cache.restoreDirty(snap); }
                     b.op_end();
                 }
                 b.op_br(0);                            //   continue -> loop top ($L)
@@ -3938,4 +4480,24 @@ extern "C" void bemental_sh4_set_prologue_trim(int on) {
 }
 extern "C" void bemental_sh4_set_hop_guard(int on) {
     bemental::sh4::g_emit_hop_guard = !!on;
+}
+// Area-3 discriminator rewrite (2026-08-29). DEFAULT ON — the predicate is
+// bit-identical over the whole 32-bit address space (enumerated) and the
+// runtime differential over the emitter fixtures is architecturally identical.
+// This is the kill-switch for the four historical boot-title-wedge sites.
+extern "C" void bemental_sh4_set_area3_fast(int on) {
+    bemental::sh4::g_emit_area3_fast = !!on;
+}
+// LEVER-12 trace formation (2026-08-29). Compile-time lever: only blocks built
+// after the call are affected. mode 0 = off, 1 = loop traces, 2 = + straight
+// line. Limits: max member blocks, max total SHIL ops, allow cross-page members.
+extern "C" void bemental_sh4_set_trace(int mode) {
+    bemental::sh4::g_emit_trace = mode;
+}
+extern "C" void bemental_sh4_set_trace_limits(int max_blocks, int max_ops, int cross_page) {
+    if (max_blocks > 0)
+        bemental::sh4::g_trace_max_blocks = (u32)(max_blocks < 2 ? 2 : (max_blocks > 16 ? 16 : max_blocks));
+    if (max_ops > 0)
+        bemental::sh4::g_trace_max_ops = (u32)(max_ops < 4 ? 4 : (max_ops > 256 ? 256 : max_ops));
+    bemental::sh4::g_trace_cross_page = !!cross_page;
 }

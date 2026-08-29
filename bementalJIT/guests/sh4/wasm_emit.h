@@ -18,6 +18,7 @@
 
 #include <cstring>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace bemental::sh4 {
@@ -280,6 +281,41 @@ struct RegCache {
     void setNoPreload(u32 ctxOffset) {
         auto it = entries.find(ctxOffset);
         if (it != entries.end()) it->second.preload = false;
+    }
+
+    // -----------------------------------------------------------------------
+    // Dirty-model save/restore. flushAll() clears every dirty bit, which is
+    // only sound when the stores it emits are on the SAME path as the code
+    // that follows. Emit a flushAll INSIDE a conditional arm that then leaves
+    // (br / return / return_call) and the model is wrong on the fall-through
+    // path — the arm's stores did not execute there, so a later flushAll skips
+    // a genuinely dirty register and ctx memory goes stale. Callers that emit
+    // a flushing side exit must bracket it:
+    //     auto snap = cache.saveDirty();
+    //     ... op_if(); cache.flushAll(b); ...exit...; op_end();
+    //     cache.restoreDirty(snap);
+    // (The lever-2 region and the trace emitter both do this.)
+    // -----------------------------------------------------------------------
+    std::vector<std::pair<u32, bool>> saveDirty() const {
+        std::vector<std::pair<u32, bool>> s;
+        s.reserve(entries.size());
+        for (const auto& kv : entries) s.push_back({ kv.first, kv.second.dirty });
+        return s;
+    }
+    void restoreDirty(const std::vector<std::pair<u32, bool>>& s) {
+        for (const auto& kv : s) {
+            auto it = entries.find(kv.first);
+            if (it != entries.end()) it->second.dirty = kv.second;
+        }
+    }
+    // Loop-carried conservatism: inside an emitted wasm `loop`, iteration N+1
+    // re-enters the top with locals the compile-time linear model believes are
+    // clean (they were dirtied later in iteration N's body). Marking every
+    // entry dirty at the loop header makes every in-loop flush a superset of
+    // the true dirty set — the fix for the "regs dirtied later in the body are
+    // silently dropped on iteration N+1" class (boot-title-wedge finding #1).
+    void markAllDirty() {
+        for (auto& kv : entries) kv.second.dirty = true;
     }
 };
 
