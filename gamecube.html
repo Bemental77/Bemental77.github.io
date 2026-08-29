@@ -105,7 +105,19 @@
     <button id="btnResetAudio" disabled>↻ Reset Audio</button>
     <button id="btnFull" disabled>⛶ Fullscreen</button>
     <button id="btnLog" type="button">Toggle Log</button>
+    <button id="btnDiag" type="button">🩺 Diagnostics</button>
     <button id="btnControls" type="button">🎮 Controls</button>
+    <div id="diagOverlay" style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.78);align-items:center;justify-content:center;">
+      <div style="background:#1b1b1f;color:#eee;border:1px solid #444;border-radius:10px;padding:18px 20px;max-width:760px;width:92%;font:13px/1.6 system-ui,sans-serif;box-shadow:0 8px 40px rgba(0,0,0,.6);">
+        <div style="font-size:17px;font-weight:600;margin-bottom:4px;">🩺 Render-path diagnostics</div>
+        <div style="color:#999;margin-bottom:10px;">These facts are captured at page load and never evicted, so this is complete even if the emulator never started.</div>
+        <textarea id="diagText" readonly spellcheck="false" style="width:100%;height:300px;background:#0a0a0a;color:#bbb;border:1px solid #333;border-radius:6px;padding:8px;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre;overflow:auto;resize:vertical;"></textarea>
+        <div style="text-align:right;margin-top:12px;">
+          <button id="diagCopy" type="button">Copy</button>
+          <button id="diagClose" type="button">Close</button>
+        </div>
+      </div>
+    </div>
     <div id="controlsOverlay" style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.72);align-items:center;justify-content:center;">
       <div style="background:#1b1b1f;color:#eee;border:1px solid #444;border-radius:10px;padding:20px 26px;max-width:460px;font:14px/1.7 system-ui,sans-serif;box-shadow:0 8px 40px rgba(0,0,0,.6);">
         <div style="font-size:18px;font-weight:600;margin-bottom:12px;">🎮 Keyboard Controls</div>
@@ -122,7 +134,11 @@
     </div>
   </div>
   <div id="canvasWrap"><canvas id="canvas" width="640" height="528"></canvas></div>
-  <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
+  <!-- #gpuPath is a SEPARATE span from #fps on purpose. _rateRender blanks #fps
+       whenever published, shown and speed are all falsy — which is exactly the
+       state the no-WebGPU path sits in — so a render-path warning parked inside
+       #fps would be erased by the one failure it exists to announce. -->
+  <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span><span id="gpuPath"></span></div>
   <pre id="log" tabindex="0"></pre>
 </div>
 <div id="mobileShell">
@@ -220,6 +236,115 @@ window.GcRate = (function () {
         : num(r.capFps) + ' fps cap (' + num(r.capFps / r.guestHz, 1) + 'x hw)',
       num(r.shown) + ' shown / ' + num(r.published) + ' published'
     ].join('  ·  ');
+  }
+
+  // ---- the JIT path's rate meter: emulated cycles, straight out of CoreTiming ------------
+  // [jit-rate 2026-08-29] The shipping path read "speed --  ·  cap --" forever, so the user
+  // could not see his own rate on the ONLY path gamecube.html actually boots. That was never a
+  // measurement problem — the core publishes its own emulated clock every Advance:
+  // CoreTiming.cpp:406-409 mirrors global_timer to 0x026B3424 (lo) / 0x026B3428 (hi), in CPU
+  // core-clock ticks, and that clock is 486 MHz on GameCube (SystemTimers.cpp:241-243, 729 MHz
+  // being the Wii arm). Emulated-time / wall-time is therefore a subtraction, and it is the
+  // SAME quantity gamecube/tools/dolphin_render_probe.js:792 has been printing as `speed` from
+  // outside the page the whole time. The page just never read the cells.
+  //
+  // `cap` needs no new instrumentation either, and this is why:
+  // CoreTimingManager::Throttle() converts the target emulated cycle into a target HOST time
+  // and SleepUntil()s it (CoreTiming.cpp:710, :762). When the core is running slower than real
+  // time that target is already in the PAST — and :715-724 additionally relaxes the reference
+  // forward ("Core can not keep up with timings") — so the sleep is zero. Below 1.000x the
+  // pipeline is therefore at 100% duty BY CONSTRUCTION, and the rate it is producing IS its
+  // sustainable rate. AT 1.000x the throttle is sleeping an amount the page cannot observe, so
+  // headroom is genuinely not visible from here and `cap` stays "--"; arming the uncap cell
+  // (0x026B392C, CoreTiming.cpp:624/630 -> IsSpeedUnlimited) is the measurement arm.
+  var GEKKO_HZ = 486000000;
+  var CELLS = { credLo: 0x026B3424, credHi: 0x026B3428, uncap: 0x026B392C };
+
+  // The lo/hi mirror is TWO separate stores, not one atomic 64-bit store, so a reader can catch
+  // lo after it wrapped and hi before it was bumped — a phantom 2^32-cycle (8.8 s of emulated
+  // time) jump. Read hi, lo, hi again; retry while hi moved. Returns null if it never settles.
+  function jitCycles(A, cells) {
+    if (!A) return null;
+    cells = cells || CELLS;
+    for (var i = 0; i < 4; i++) {
+      var h1 = A[cells.credHi >> 2] >>> 0;
+      var lo = A[cells.credLo >> 2] >>> 0;
+      var h2 = A[cells.credHi >> 2] >>> 0;
+      if (h1 === h2) return h1 * 4294967296 + lo;
+    }
+    return null;
+  }
+
+  function makeJitRate(cfg) {
+    cfg = cfg || {};
+    var cpuHz    = cfg.cpuHz || GEKKO_HZ;
+    // Above this a window is a SEAM, not a speed. Two things produce one: a savestate restore
+    // (global_timer is replaced by the saved run's clock — measured 32.016x in one real 5 s
+    // window, /tmp/probe-userscene.log t=66.5s) and a torn lo/hi read (>= 8.8x per second).
+    var maxSpeed = cfg.maxSpeed || 8;
+    var hwEps    = (cfg.hwEps === undefined) ? 0.995 : cfg.hwEps;
+    var m = { cpuHz: cpuHz, mark: null, markT: 0, started: false,
+              nativeHz: null, seams: 0, windows: 0 };
+    // The page KNOWS when the timeline was replaced ('stateLoaded'), so re-latch on the event
+    // instead of relying on the threshold to catch every seam.
+    m.relatch = function () { m.mark = null; m.markT = 0; };
+    // cycles = total credited emulated cycles; t = wall ms; o.published = distinct frames/s
+    // this window; o.uncapped = the throttle is disabled.
+    m.sample = function (cycles, t, o) {
+      o = o || {};
+      var out = { speed: null, capFps: null, guestHz: m.nativeHz, starved: false,
+                  seam: false, uncapped: !!o.uncapped };
+      if (cycles === null || cycles === undefined || !isFinite(cycles)) return out;
+      if (m.mark === null) { m.mark = cycles; m.markT = t; return out; }
+      var dw = (t - m.markT) / 1000;
+      if (!(dw > 0)) return out;
+      var dc = cycles - m.mark, speed = dc / cpuHz / dw;
+      if (!(speed >= 0) || speed > maxSpeed) {
+        m.seams++; m.mark = cycles; m.markT = t; out.seam = true; return out;
+      }
+      m.mark = cycles; m.markT = t;
+      // Nothing has advanced and nothing ever has: the core is still loading the disc. "--" is
+      // the honest readout there; "0.00x" would report a rate on an emulator that has not been
+      // asked to run yet.
+      if (dc === 0 && !m.started) return out;
+      m.started = true; m.windows++;
+      out.speed = speed;
+      out.starved = speed < 0.98 && !o.uncapped;
+      // The game's own frame rate is MEASURED, never assumed. PSO Ep I&II runs at 30, Mario
+      // Party 4 at 60; quoting "x hw" against a hardcoded 60 understates a 30 fps game by 2x.
+      // published/speed IS that rate whenever the pipeline is saturated, and on the real PSO
+      // capture it recovers 29.6-30.3 from six consecutive windows (?ratetest=1 test 16).
+      if (speed > 0.05 && o.published > 0) {
+        var est = o.published / speed;
+        if (est >= 1 && est <= 240) m.nativeHz = (m.nativeHz === null) ? est : (m.nativeHz * 0.7 + est * 0.3);
+      }
+      out.guestHz = m.nativeHz;
+      if (o.uncapped) {
+        out.capFps = (o.published > 0) ? o.published : null;   // throttle off: it IS the capability
+      } else if (speed < hwEps) {
+        out.capFps = (m.nativeHz === null) ? null : speed * m.nativeHz;
+      } else {
+        out.capFps = null;   // throttle sleeping by an unknown amount; headroom not observable
+      }
+      return out;
+    };
+    return m;
+  }
+
+  // Assign a jit sample onto the live rate object. Kept out of the page so the WIRING is under
+  // test too, not just the arithmetic — the old bug was never in the maths, it was that nothing
+  // ever wrote speed/capFps on this path at all.
+  function applyJit(rate, out) {
+    rate.speed = out.speed;
+    rate.capFps = out.capFps;
+    rate.starved = !!out.starved;
+    if (out.guestHz) rate.guestHz = out.guestHz;
+    rate.capNote = (out.speed === null)
+      ? 'JIT path: no emulated clock yet — CoreTiming mirrors it to SAB once the core runs'
+      : (out.capFps === null
+          ? 'JIT path: at hardware rate the throttle sleeps by an amount the page cannot see, so headroom is not measurable from here'
+          : 'JIT path: below 1.000x the throttle never sleeps (CoreTiming.cpp:710/762), so the pipeline is already at 100% duty and this IS the sustainable rate');
+    return rate;
   }
 
   // ---- the model -----------------------------------------------------------------------
@@ -628,10 +753,14 @@ window.GcRate = (function () {
     var d8c = seqDelta(4, (0xFFFFFFFE >>> 0));
     ck('8d unsigned wrap does not explode', d8c.published === 3, 'published=' + d8c.published);
 
-    // 9. The JIT path has no credit protocol and must say so rather than borrow recomp numbers.
+    // 9. Before the core has an emulated clock there is nothing to report, and the readout must
+    // say so rather than borrow a recomp-shaped number or invent a 0.00x.
+    // [jit-rate 2026-08-29] This USED to be the whole story for the JIT path — it asserted the
+    // permanent "speed --  ·  cap --" the user was actually looking at on caseybement.com. The
+    // "--" is now only correct BEFORE the clock moves; tests 15/16 cover the live case.
     var jit = { path: 'jit', guestHz: 60, speed: null, speedReq: 1, capFps: null,
                 published: 120, shown: 60, starved: false };
-    ck('9a JIT headline is "speed --  ·  cap --", never a recomp-shaped number',
+    ck('9a a JIT readout with no clock yet is "speed --  ·  cap --", not a fabricated number',
        format(jit) === 'speed --  ·  cap --  ·  60 shown / 120 published', format(jit));
 
     // 10. A FIFO-silent stretch is not a speed collapse.
@@ -688,13 +817,147 @@ window.GcRate = (function () {
        L14.speed !== null && L14.speed <= 1.0, 'post-restore speed=' + fx(L14.speed) +
        ' (guest is 25ms/frame, so ~0.67x is the honest answer)');
 
+    // ===== 15/16/17. THE JIT PATH REPORTS ITS RATE =========================================
+    // [jit-rate 2026-08-29] The user's screenshot of caseybement.com/gamecube.html read
+    // "Running  speed --  ·  cap --  ·  17 shown / 18 published" — every number that says how
+    // FAST it is running was missing on the path that ships. These pin the replacement. They
+    // are written to FAIL if makeJitRate goes back to returning nulls: 15a/15c/16a/16d/17b all
+    // assert a non-null number, and 15b asserts the headline no longer contains "speed --".
+    var GHZ = 486000000;
+    // Drive N one-second windows at a fixed emulated rate. cycles accumulate exactly as
+    // CoreTiming's global_timer mirror does.
+    function jitRun(o) {
+      var jr = makeJitRate(o.cfg);
+      var cyc = o.startCycles || 0, t = 0, last = null;
+      for (var i = 0; i < o.windows.length; i++) {
+        var w = o.windows[i];
+        t += (w.dwMs === undefined ? 1000 : w.dwMs);
+        cyc += (w.jump !== undefined) ? w.jump : (w.speed * GHZ * (w.dwMs === undefined ? 1000 : w.dwMs) / 1000);
+        last = jr.sample(w.cycles !== undefined ? w.cycles : cyc, t,
+                         { published: w.published, uncapped: !!w.uncapped });
+        if (w.relatch) jr.relatch();
+      }
+      return { jr: jr, out: last };
+    }
+
+    // 15. The core is slower than hardware — the user's actual case.
+    var r15 = jitRun({ windows: [
+      { speed: 0.44, published: 13.2 }, { speed: 0.44, published: 13.2 },
+      { speed: 0.44, published: 13.2 }, { speed: 0.44, published: 13.2 }] });
+    ck('15a JIT path reports a REAL speed from the credited-cycle mirror, not "--"',
+       near(r15.out.speed, 0.44, 0.01), 'speed=' + fx(r15.out.speed));
+    ck('15b and the headline no longer contains "speed --" (the string in the bug report)',
+       format({ speed: r15.out.speed, speedReq: 1, starved: r15.out.starved, capFps: r15.out.capFps,
+                guestHz: r15.out.guestHz, shown: 13, published: 13 }).indexOf('speed --') === -1,
+       format({ speed: r15.out.speed, speedReq: 1, starved: r15.out.starved, capFps: r15.out.capFps,
+                guestHz: r15.out.guestHz, shown: 13, published: 13 }));
+    ck('15c below hardware the throttle never sleeps, so cap is measurable: cap = speed x nativeHz',
+       near(r15.out.capFps, 13.2, 0.3), 'cap=' + fx(r15.out.capFps, 2) +
+       ' speed=' + fx(r15.out.speed) + ' nativeHz=' + fx(r15.out.guestHz, 1));
+    ck('15d a sub-hardware guest is flagged STARVED — it is a defect, not a preference',
+       r15.out.starved === true &&
+       format({ speed: r15.out.speed, speedReq: 1, starved: true, capFps: r15.out.capFps,
+                guestHz: r15.out.guestHz, shown: 13, published: 13 }).indexOf('STARVED') > 0,
+       'starved=' + r15.out.starved);
+    // 15e control: cap is NOT observable at hardware rate, because there the throttle IS
+    // sleeping and the page cannot see by how much. Reporting speed x 60 = 60 there would be a
+    // fabricated "we are exactly at capacity" claim.
+    var r15e = jitRun({ windows: [
+      { speed: 1.0, published: 30 }, { speed: 1.0, published: 30 }, { speed: 1.0, published: 30 }] });
+    ck('15e AT hardware rate cap goes back to "--" (throttle sleep is invisible from the page)',
+       r15e.out.speed !== null && r15e.out.capFps === null,
+       'speed=' + fx(r15e.out.speed) + ' cap=' + String(r15e.out.capFps));
+    // 15f: with the uncap cell armed the throttle is gone, so what it produces IS capability.
+    var r15f = jitRun({ windows: [
+      { speed: 2.4, published: 72, uncapped: true }, { speed: 2.4, published: 72, uncapped: true }] });
+    ck('15f uncapped: speed may exceed 1.000x and cap becomes the produced rate',
+       near(r15f.out.speed, 2.4, 0.02) && near(r15f.out.capFps, 72, 0.5) && r15f.out.starved === false,
+       'speed=' + fx(r15f.out.speed) + ' cap=' + fx(r15f.out.capFps, 1));
+
+    // 16. Seams and cold start — the ways this meter could lie.
+    var r16a = jitRun({ windows: [{ speed: 0, published: 0 }, { speed: 0, published: 0 }] });
+    ck('16a before the core runs, speed stays "--" instead of reporting 0.00x',
+       r16a.out.speed === null && r16a.jr.started === false, 'speed=' + String(r16a.out.speed));
+    // A savestate restore replaces global_timer wholesale. Measured 32.016x for one 5s window
+    // on the user's own state (/tmp/probe-userscene.log:38). It must publish NOTHING.
+    var r16b = jitRun({ windows: [
+      { speed: 0.6, published: 18 }, { speed: 0.6, published: 18 },
+      { jump: 32.016 * GHZ, published: 2.4 },
+      { speed: 0.44, published: 13.2 }, { speed: 0.44, published: 13.2 }] });
+    ck('16b a savestate seam (real 32.016x jump) is rejected, and the meter re-latches after it',
+       r16b.jr.seams === 1 && near(r16b.out.speed, 0.44, 0.01),
+       'seams=' + r16b.jr.seams + ' post-seam speed=' + fx(r16b.out.speed));
+    // A torn lo/hi read of the non-atomic 64-bit mirror is a 2^32-cycle phantom = 8.84x/s.
+    var r16c = jitRun({ windows: [
+      { speed: 0.6, published: 18 }, { jump: 4294967296, published: 18 }, { speed: 0.6, published: 18 }] });
+    ck('16c a torn lo/hi read (2^32 phantom cycles = 8.84x) is rejected the same way',
+       r16c.jr.seams === 1 && near(r16c.out.speed, 0.6, 0.01),
+       'seams=' + r16c.jr.seams + ' speed=' + fx(r16c.out.speed));
+    ck('16d explicit relatch (the "stateLoaded" hook) drops exactly one window, not the meter',
+       (function () {
+         var rr = jitRun({ windows: [
+           { speed: 0.5, published: 15 }, { speed: 0.5, published: 15, relatch: true },
+           { speed: 0.5, published: 15 }, { speed: 0.5, published: 15 }] });
+         return rr.out.speed !== null && near(rr.out.speed, 0.5, 0.01);
+       })(), 'speed after an explicit relatch is still measured');
+    // jitCycles must reassemble the 64-bit clock and survive the tear it is there to catch.
+    // (Small stand-in cells so the test does not allocate the 40 MB the real addresses imply;
+    // the live page passes the default CELLS, asserted separately in 16g.)
+    var TCELL = { credLo: 4, credHi: 8 };
+    var fakeA = new Uint32Array(4);
+    fakeA[1] = 0x00000005; fakeA[2] = 0x00000003;
+    ck('16e jitCycles reassembles lo/hi into the full 64-bit emulated clock',
+       jitCycles(fakeA, TCELL) === 3 * 4294967296 + 5, 'got=' + jitCycles(fakeA, TCELL));
+    ck('16f jitCycles returns null (no reading) rather than a torn number when hi keeps moving',
+       (function () {
+         var n = 0, torn = {};
+         Object.defineProperty(torn, 2, { get: function () { return n++; } });   // credHi >> 2
+         Object.defineProperty(torn, 1, { get: function () { return 7; } });     // credLo >> 2
+         return jitCycles(torn, TCELL) === null;
+       })(), 'hi never settles => null');
+    ck('16g the default cells are the ones CoreTiming.cpp:406-409 / :624 actually write',
+       CELLS.credLo === 0x026B3424 && CELLS.credHi === 0x026B3428 && CELLS.uncap === 0x026B392C,
+       JSON.stringify(CELLS));
+
+    // 17. END TO END against the REAL capture. These six (creditedMHz, published) pairs are the
+    // measured windows from the user's own savestate restored into the canonical probe
+    // (/tmp/userscene-rate.json, t=71.5..96.5s, PSO Ep I&II Plus standing in the Hunter's
+    // Guild). Nothing here is synthetic: if the model reproduces these, it reproduces what he
+    // is looking at. published/speed lands on 29.6-30.3 in all six, which is how the model
+    // learns PSO is a 30 fps game without being told.
+    var REAL = [[73.9, 4.6], [232.5, 14.2], [187.2, 11.5], [166.5, 10.3], [272.3, 16.6], [282.5, 17.4]];
+    var r17 = jitRun({ windows: REAL.map(function (p) {
+      return { jump: p[0] * 1e6, published: p[1] };   // credited MHz over a 1.000 s window
+    }) });
+    ck('17a the real PSO capture reproduces the logged speed (0.581x at t=96.5s)',
+       near(r17.out.speed, 0.581, 0.005), 'speed=' + fx(r17.out.speed) + ' (probe logged 0.581x)');
+    ck('17b the MEASURED native rate comes out ~30, so "x hw" is not quoted against a wrong 60',
+       near(r17.out.guestHz, 30, 1.5), 'nativeHz=' + fx(r17.out.guestHz, 2));
+    ck('17c cap equals the frames it is actually producing (~17/s), not the 30 it should be',
+       near(r17.out.capFps, 17.4, 0.8), 'cap=' + fx(r17.out.capFps, 2));
+    var head17 = format({ speed: r17.out.speed, speedReq: 1, starved: r17.out.starved,
+                          capFps: r17.out.capFps, guestHz: r17.out.guestHz, shown: 17, published: 17 });
+    ck('17d the headline he WOULD have seen names the deficit instead of printing "--"',
+       head17.indexOf('speed 0.58x STARVED') === 0 && head17.indexOf('17 fps cap') > 0
+         && head17.indexOf('--') === -1, head17);
+    // 17e is the discriminator for the WIRING, not the arithmetic: the original bug was that
+    // nothing ever wrote speed/capFps onto the live rate object on this path.
+    var live17 = { path: 'jit', guestHz: 60, speed: null, capFps: null, starved: false, capNote: '' };
+    applyJit(live17, r17.out);
+    ck('17e applyJit actually writes speed/cap/guestHz onto the LIVE rate object',
+       live17.speed !== null && live17.capFps !== null && near(live17.guestHz, 30, 1.5)
+         && live17.starved === true,
+       'speed=' + fx(live17.speed) + ' cap=' + fx(live17.capFps, 1) + ' guestHz=' + fx(live17.guestHz, 1));
+
     var summary = 'RATETEST ' + (fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + pass + ' passed, ' + fail + ' failed';
     log(summary);
     return { pass: pass, fail: fail, lines: lines, summary: summary };
   }
 
   return { makeModel: makeModel, seqDelta: seqDelta, format: format, num: num,
-           simulate: simulate, selfTest: selfTest, DEF: DEF };
+           simulate: simulate, selfTest: selfTest, DEF: DEF,
+           makeJitRate: makeJitRate, jitCycles: jitCycles, applyJit: applyJit,
+           GEKKO_HZ: GEKKO_HZ, CELLS: CELLS };
 })();
 </script>
 <script>
@@ -733,6 +996,200 @@ window.GcRate = (function () {
     console.log(s);
   }
   function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
+
+  // ===========================================================================
+  // RENDER-PATH DISCLOSURE — [2026-08-29]
+  //
+  // THE HOLE THIS FILLS. When WebGPU is unavailable this page does NOT degrade
+  // gracefully — it degrades SILENTLY. Video.cpp:126-147 picks the backend from
+  // two shared-heap flags: 'WGPU' at 0x07FF0100 (written at :1210 below, only
+  // when _wgpu is true) selects WGPUGfx; the 'GLRD' descriptor at 0x07FF0000
+  // selects OGL; and with NEITHER set the core force-selects "Software
+  // Renderer". The default page never writes GLRD (__gcRenderWorker is false
+  // whenever __gcSoftwareRender is true, which is the default), so losing
+  // WebGPU does not fall back to WebGL2 the way the 2026-07-11 comment at
+  // var_setup still claims — it falls all the way to Dolphin's CPU rasterizer,
+  // whose output on this build is a SOLID GREEN FRAME.
+  //
+  // MEASURED, same savestate, same .wasm (md5 d2124e3f…), back-to-back:
+  //   --disable-features=WebGPU : solid green, publish seqlock 0x026B3518 never
+  //                               moves, the page's own meter reads 0 shown /
+  //                               0 published for every steady-state sample.
+  //   vanilla Chrome            : the actual game, seqlock advancing, meter
+  //                               tracking it.
+  // So the user has NO WAY to tell "my GPU dropped out" from "the emulator is
+  // slow": in the first case the meter reads zero and the picture is a flat
+  // colour, and nothing anywhere names WebGPU as the reason.
+  //
+  // WHY THE PROBE RUNS HERE AND NOT IN startEmulator. The pre-existing adapter
+  // probe fires on the Start click, so every failure BEFORE that — and every
+  // session where Start is never pressed — produced a page with no GPU facts in
+  // it at all. This one runs on load, unconditionally, so the facts exist even
+  // when the worker never starts. startEmulator now awaits THIS promise instead
+  // of issuing a second requestAdapter, so the GPU is asked exactly once.
+  //
+  // WHY IT IS PINNED AND NOT LOGGED. pageLog caps its buffer and slices the
+  // OLDEST half away (see above, _logBufLen > 200000). The capability line
+  // prints once, earliest, and a rolling tail therefore structurally cannot
+  // carry it — by the time anything is worth reporting it has been evicted.
+  // The badge and the diagnostics report read this store, which nothing evicts.
+  // (Same lesson as dreamcast.html's pinned [glinfo] facts.)
+  // ===========================================================================
+  function gcSafe(fn, d) { try { var v = fn(); return (v === undefined || v === null) ? d : v; } catch (e) { return d; } }
+  window.__gcGpu = {
+    probed: false,
+    webgpu: null,        // capability probe result
+    webgl2: null,        // GPU identity even when WebGPU is absent
+    backend: null,       // 'WGPU' | 'Software Renderer' | 'OGL/WebGL2' — what var_setup selected
+    present: null,       // 'sab-present (WGPU)' | 'postMessage 2D (Software)' — what actually painted
+    startedAt: Date.now()
+  };
+  // A device is not the same as a presentable context: Chrome's "Failed to
+  // create WebGPU Context Provider" is a CONTEXT failure that can happen with a
+  // live adapter and device, so all three steps are recorded separately.
+  async function gcProbeWebGPU() {
+    var o = { supported: !!navigator.gpu, adapter: false, device: false, canvasCtx: false,
+              vendor: '?', architecture: '?', device_: '?', description: '', format: '?', err: null };
+    if (!o.supported) { o.err = 'navigator.gpu is undefined — this browser exposes no WebGPU at all'; return o; }
+    try {
+      var ad = await navigator.gpu.requestAdapter();
+      if (!ad) {
+        o.err = 'navigator.gpu.requestAdapter() resolved null — no adapter (GPU blocklisted for this driver, '
+              + 'WebGPU disabled by flag/enterprise policy, or a headless/software profile that refuses one)';
+        return o;
+      }
+      o.adapter = true;
+      var info = gcSafe(function () { return ad.info; }, null);
+      if (!info && ad.requestAdapterInfo) { try { info = await ad.requestAdapterInfo(); } catch (e) {} }
+      if (info) {
+        o.vendor = String(info.vendor || '?'); o.architecture = String(info.architecture || '?');
+        o.device_ = String(info.device || '?'); o.description = String(info.description || '');
+      }
+      var dev = await ad.requestDevice();
+      if (!dev) { o.err = 'adapter.requestDevice() resolved null — adapter present but no device'; return o; }
+      o.device = true;
+      window.__gcWgpuDevice = dev;   // held, exactly as the old Start-click probe held it
+      o.format = gcSafe(function () { return navigator.gpu.getPreferredCanvasFormat(); }, '?');
+      var c = document.createElement('canvas'); c.width = c.height = 1;
+      o.canvasCtx = !!gcSafe(function () { return c.getContext('webgpu'); }, null);
+      if (!o.canvasCtx) o.err = 'canvas.getContext("webgpu") returned null — device is live but no presentable context';
+    } catch (e) { o.err = 'threw: ' + (e && e.message ? e.message : String(e)); }
+    return o;
+  }
+  // Cheap, synchronous, and the only thing that still names the GPU when WebGPU
+  // is gone. Context handed straight back — the emulator gets the one that counts.
+  function gcProbeWebGL2() {
+    var o = { ok: false, vendor: '?', renderer: '?', masked: true, maxTex: '?', webgl1: false, err: null };
+    var gl = null;
+    try {
+      var c = document.createElement('canvas'); c.width = c.height = 1;
+      gl = c.getContext('webgl2', { alpha: false, depth: true, stencil: true, antialias: false });
+      if (!gl) {
+        o.err = 'getContext("webgl2") returned null';
+        o.webgl1 = !!gcSafe(function () { return c.getContext('webgl'); }, null);
+        return o;
+      }
+      o.ok = true;
+      var dbg = gcSafe(function () { return gl.getExtension('WEBGL_debug_renderer_info'); }, null);
+      o.masked = !dbg;
+      o.vendor = String(dbg ? gcSafe(function () { return gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL); }, '?')
+                            : gcSafe(function () { return gl.getParameter(gl.VENDOR); }, '?'));
+      o.renderer = String(dbg ? gcSafe(function () { return gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL); }, '?')
+                              : gcSafe(function () { return gl.getParameter(gl.RENDERER); }, '?'));
+      o.maxTex = gcSafe(function () { return gl.getParameter(gl.MAX_TEXTURE_SIZE); }, '?');
+    } catch (e) { o.err = 'threw: ' + (e && e.message ? e.message : String(e)); }
+    finally { gcSafe(function () { var l = gl && gl.getExtension('WEBGL_lose_context'); if (l) l.loseContext(); }); }
+    return o;
+  }
+  // True only when the fast path is fully available. requestAdapter+requestDevice
+  // is the same pair WGPUGfx makes on the proxied pthread, and the page and the
+  // worker share one GPU process, so this predicts the worker's outcome.
+  function gcWgpuOk() { var w = window.__gcGpu.webgpu; return !!(w && w.adapter && w.device); }
+  // ?wgpu=0 is a deliberate A/B, not a degradation — say which one it is.
+  function gcRenderVerdict() {
+    var G = window.__gcGpu, w = G.webgpu;
+    if (!G.probed) return { level: 'wait', short: 'render: probing…', why: 'GPU capability probe has not resolved yet' };
+    if (/[?&]wgpu=0/.test(location.search))
+      return { level: 'warn', short: 'render: SOFTWARE (?wgpu=0)',
+               why: 'You opened this page with ?wgpu=0, which disables the WebGPU backend on purpose. '
+                  + 'Dolphin falls back to its CPU rasterizer. Remove ?wgpu=0 for the normal path.' };
+    if (gcWgpuOk())
+      return { level: 'ok', short: 'render: WebGPU ✓',
+               why: 'WebGPU adapter + device acquired. Dolphin runs the WGPU backend and publishes frames '
+                  + 'through the shared-heap present path — the fast path, and the one every performance '
+                  + 'number for this page was measured on.' };
+    return { level: 'bad', short: 'render: SOFTWARE — NO WebGPU ⚠',
+             why: 'WebGPU could not be acquired, so Dolphin force-selects its CPU Software Renderer '
+                + '(Video.cpp:147). On this build that path does not produce a usable picture — expect a '
+                + 'flat green frame and a frame counter stuck at 0. This is a GPU/browser problem on this '
+                + 'machine, NOT the emulator running slowly. Reason: ' + ((w && w.err) || 'unknown') };
+  }
+  function gcRenderBadge() {
+    var el = $('gpuPath'); if (!el) return;
+    var v = gcRenderVerdict();
+    el.textContent = v.short;
+    el.style.color = v.level === 'ok' ? '#7f7' : v.level === 'bad' ? '#f77' : v.level === 'warn' ? '#fd7' : '#888';
+    el.style.fontWeight = (v.level === 'bad') ? '700' : '';
+    el.title = v.why + '\n\nClick 🩺 Diagnostics for the full report.';
+  }
+  // The whole pinned store as one copyable block. Everything a bug report needs
+  // and nothing that has to survive a rolling tail to get here.
+  function gcDiagText() {
+    var G = window.__gcGpu, w = G.webgpu || {}, g = G.webgl2 || {}, v = gcRenderVerdict();
+    var R = window.__gcRate || {};
+    var L = [];
+    L.push('gamecube.html render-path report — ' + new Date().toISOString());
+    L.push('url        : ' + location.href);
+    L.push('verdict    : ' + v.short);
+    L.push('             ' + v.why);
+    L.push('');
+    L.push('WebGPU     : navigator.gpu=' + (w.supported ? 'yes' : 'NO')
+                       + '  adapter=' + (w.adapter ? 'yes' : 'NO')
+                       + '  device=' + (w.device ? 'yes' : 'NO')
+                       + '  canvasContext=' + (w.canvasCtx ? 'yes' : 'NO'));
+    L.push('             adapter: vendor=' + w.vendor + ' arch=' + w.architecture + ' device=' + w.device_
+                       + (w.description ? ' desc=' + w.description : ''));
+    L.push('             preferredCanvasFormat=' + w.format);
+    if (w.err) L.push('             ERROR: ' + w.err);
+    L.push('WebGL2     : ok=' + (g.ok ? 'yes' : 'NO') + '  vendor=' + g.vendor + '  renderer=' + g.renderer
+                       + (g.masked ? '  (masked — WEBGL_debug_renderer_info unavailable)' : '')
+                       + '  maxTexture=' + g.maxTex + (g.err ? '  ERROR: ' + g.err : ''));
+    L.push('');
+    L.push('backend    : ' + (G.backend || '(not selected yet — Start not pressed)'));
+    L.push('present    : ' + (G.present || '(no frame painted yet)'));
+    L.push('meter      : ' + (typeof GcRate !== 'undefined' && GcRate.format ? GcRate.format(R) : '(unavailable)'));
+    L.push('crossOriginIsolated=' + (typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : '?')
+           + '  SharedArrayBuffer=' + (typeof SharedArrayBuffer !== 'undefined')
+           + '  hardwareConcurrency=' + gcSafe(function () { return navigator.hardwareConcurrency; }, '?')
+           + '  deviceMemory=' + gcSafe(function () { return navigator.deviceMemory; }, '?') + 'GB');
+    L.push('ua         : ' + gcSafe(function () { return navigator.userAgent; }, '?'));
+    L.push('uptime     : ' + ((Date.now() - G.startedAt) / 1000).toFixed(0) + 's since page load');
+    return L.join('\n');
+  }
+  function gcShowDiag() {
+    var ov = $('diagOverlay'), ta = $('diagText');
+    if (!ov || !ta) return;
+    ta.value = gcDiagText();
+    ov.style.display = 'flex';
+    try { ta.focus(); ta.select(); } catch (e) {}
+  }
+  // Fire the probe immediately; render the badge the moment either half lands.
+  window.__gcGpu.webgl2 = gcSafe(gcProbeWebGL2, { ok: false, err: 'probe threw before returning' });
+  window.__gcGpuProbe = (async function () {
+    try { window.__gcGpu.webgpu = await gcProbeWebGPU(); }
+    catch (e) { window.__gcGpu.webgpu = { supported: !!navigator.gpu, adapter: false, device: false,
+                                          canvasCtx: false, err: 'probe rejected: ' + (e && e.message) }; }
+    window.__gcGpu.probed = true;
+    // Legacy name kept: var_setup's backend choice keys off it (see _wgpu below).
+    if (!gcWgpuOk()) window.__gcWebGPUUnavailable = true;
+    gcRenderBadge();
+    var v = gcRenderVerdict();
+    pageLog('[gpu] ' + v.short + ' — ' + v.why);
+    pageLog('[gpu] webgl2 renderer=' + (window.__gcGpu.webgl2 || {}).renderer);
+    if (v.level === 'bad') setStatus('No WebGPU on this machine — the emulator cannot render here. See 🩺 Diagnostics.');
+    return window.__gcGpu.webgpu;
+  })();
+  gcRenderBadge();
   // #toast is a body-level element (it used to be the last child of #mobileShell, which is
   // display:none on desktop — so every Save/Load/Export/Import/audio toast was silently
   // invisible there). While a fullscreen element is open only ITS subtree renders, so the
@@ -3822,6 +4279,10 @@ window.GcRate = (function () {
   // headline string all come from GcRate, so the suite asserts the EXACT text drawn here.
   var _rateNum = GcRate.num;
   var _shownCount = 0, _rateSeqMark = -1, _rateT0 = 0, _rateDropped = 0;
+  // [jit-rate 2026-08-29] The JIT path's speed/cap meter. See GcRate.makeJitRate for why both
+  // numbers are measurable from the page and why they used to read "--". Exercised end-to-end
+  // against the real PSO capture by ?ratetest=1 tests 15-17.
+  var _jitRate = GcRate.makeJitRate({});
   // published/s needs NO fast polling loop. The seqlock counter is monotonic, so a DELTA of it
   // is exact at ANY sampling rate — sampling once a second measures a 500/s producer just as
   // exactly as sampling 10,000 times a second would. This is the answer to "what must the
@@ -3849,6 +4310,16 @@ window.GcRate = (function () {
       _rateDropped = Math.max(0, pub - _shownCount);
     }
     _shownCount = 0;
+    // The JIT path's speed and cap. Read AFTER published is refreshed — the native frame rate
+    // (and therefore cap's "x hw") is derived from published/speed, so it needs this window's
+    // value, not the previous one. The recomp path publishes its own model at :5309 and must
+    // not be overwritten here.
+    if (Rate.path === 'jit') {
+      var _unc = false;
+      if (A) { try { _unc = (Atomics.load(A, GcRate.CELLS.uncap >> 2) >>> 0) !== 0; } catch (e) {} }
+      GcRate.applyJit(Rate, _jitRate.sample(GcRate.jitCycles(A), now,
+                                            { uncapped: _unc, published: Rate.published }));
+    }
     _rateRender();
   }
   function _rateRender() {
@@ -3929,7 +4400,10 @@ window.GcRate = (function () {
       // handler set — dead since the sab-present migration (PM28), leaving
       // READY=false forever (the standing [gate-diag] console signal). The
       // sab-present path IS the first-frame source now.
-      if (!window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame (sab-present) ' + w + 'x' + h); }
+      if (!window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame (sab-present) ' + w + 'x' + h);
+        // Ground truth for the diagnostics report: this path only runs when WGPUGfx is
+        // bumping the publish seqlock, so reaching it PROVES the fast path is live.
+        try { window.__gcGpu.present = 'sab-present / WGPU shared-heap (fast path) ' + w + 'x' + h; gcRenderBadge(); } catch (e) {} }
       // Force opaque alpha (readback alpha is undefined for the EFB).
       var d = canvasImg2D.data;
       for (var i = 3; i < d.length; i += 4) d[i] = 255;
@@ -4226,7 +4700,10 @@ window.GcRate = (function () {
     switch (data.cmd) {
       case 'print': pageLog('> ' + data.txt); break;
       case 'setStatus': setStatus(data.txt); break;
-      case 'render': { if (data.pixels && !_sabPresentActive) paintFrame(data.pixels, data.w, data.h, data.pitch); if (data.h > 0 && !window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame received w:' + data.w + ' h:' + data.h); } renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { var _fps = (renderFrames * 1000 / (now - lastFpsLog)); /* [rate-model] legacy SW-present path: each 'render' message IS one distinct finished frame, painted immediately — so here published == shown. Fed to the shared rate model instead of a bare "FPS:" string. */ if (!_sabPresentActive) { Rate.set({ published: _fps, shown: _fps, extra: 'legacy postMessage SW-present path\n' }); _rateRender(); } console.log('[rate] published=' + _fps.toFixed(2) + '/s @t=' + (now / 1000).toFixed(0) + 's totalFrames=' + (window._totalRenderFrames = (window._totalRenderFrames || 0) + renderFrames)); renderFrames = 0; lastFpsLog = now; } break; }
+      case 'render': { if (data.pixels && !_sabPresentActive) paintFrame(data.pixels, data.w, data.h, data.pitch); if (data.h > 0 && !window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame received w:' + data.w + ' h:' + data.h);
+      // Reaching the LEGACY video_cb path means the core is on the Software Renderer,
+      // whatever the capability probe said — record it as the authoritative present path.
+      try { window.__gcGpu.present = 'postMessage 2D / libretro video_cb (Software Renderer — degraded) ' + data.w + 'x' + data.h; gcRenderBadge(); } catch (e) {} } renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { var _fps = (renderFrames * 1000 / (now - lastFpsLog)); /* [rate-model] legacy SW-present path: each 'render' message IS one distinct finished frame, painted immediately — so here published == shown. Fed to the shared rate model instead of a bare "FPS:" string. */ if (!_sabPresentActive) { Rate.set({ published: _fps, shown: _fps, extra: 'legacy postMessage SW-present path\n' }); _rateRender(); } console.log('[rate] published=' + _fps.toFixed(2) + '/s @t=' + (now / 1000).toFixed(0) + 's totalFrames=' + (window._totalRenderFrames = (window._totalRenderFrames || 0) + renderFrames)); renderFrames = 0; lastFpsLog = now; } break; }
       case 'audioRate': {
         // [audio rate 2026-07-17] The worker reports the core's real output sample rate (retro
         // av_info). Record it and init the worklet NOW — the Start-button click already gave the
@@ -4308,7 +4785,12 @@ window.GcRate = (function () {
         break;
       }
       case 'stateSaved': if (pendingSaveResolve) { pendingSaveResolve(data.data); pendingSaveResolve = null; } break;
-      case 'stateLoaded': if (pendingLoadResolve) { pendingLoadResolve(); pendingLoadResolve = null; } break;
+      // [jit-rate 2026-08-29] A restore replaces CoreTiming's global_timer with the SAVED run's
+      // clock, so the window straddling the seam is a difference between two timelines, not a
+      // speed — a real restore of the user's PSO state measured 32.016x for one 5s window
+      // (/tmp/probe-userscene.log:38). The threshold in makeJitRate would catch it, but the
+      // page KNOWS the seam happened, so re-latch on the event and never publish that window.
+      case 'stateLoaded': _jitRate.relatch(); if (pendingLoadResolve) { pendingLoadResolve(); pendingLoadResolve = null; } break;
       case 'runtime-ready':
         // 4f-6: dolphin's wasm runtime is up. Set the flag so the
         // page-mediated mailbox consumer starts routing real MMIO cmds
@@ -4557,16 +5039,28 @@ window.GcRate = (function () {
     // independent and boots fine. Probe adapter+device here (same requests WGPUGfx makes on the
     // proxied pthread; the page + worker share one GPU process, so this predicts the worker's
     // outcome) BEFORE the backend is chosen in var_setup. On failure, force the OGL fallback.
+    // [render-path disclosure 2026-08-29] This used to issue its OWN
+    // requestAdapter/requestDevice pair here. It now awaits the page-load probe
+    // (see gcProbeWebGPU): identical requests, made exactly once, but the answer
+    // also exists for sessions that never reach this point — which was the whole
+    // problem, since a WebGPU failure is invisible until something asks.
+    // __gcWebGPUUnavailable is still set by that probe, so _wgpu below is unchanged.
     if (!/[?&]wgpu=0/.test(location.search)) {
-      try {
-        var _wgAd = navigator.gpu ? await navigator.gpu.requestAdapter() : null;
-        var _wgDev = _wgAd ? await _wgAd.requestDevice() : null;
-        if (!_wgDev) window.__gcWebGPUUnavailable = true;
-      } catch (e) { window.__gcWebGPUUnavailable = true; }
+      try { await window.__gcGpuProbe; } catch (e) { window.__gcWebGPUUnavailable = true; }
       pageLog(window.__gcWebGPUUnavailable
-        ? '[webgpu] adapter/device UNAVAILABLE — falling back to OGL/WebGL2 backend (WGPU would freeze boot)'
+        // CORRECTION to the 2026-07-11 note above: there is no OGL/WebGL2 fallback on the
+        // default page. Video.cpp:139-147 only selects OGL when the 'GLRD' descriptor at
+        // 0x07FF0000 is present, and __gcWriteGlDesc runs solely under __gcRenderWorker,
+        // which is false whenever __gcSoftwareRender is true (the default). So the real
+        // fallback is the CPU Software Renderer, and on this build it renders a flat green
+        // frame. Measured 2026-08-29 with --disable-features=WebGPU on the PSO savestate.
+        ? '[webgpu] adapter/device UNAVAILABLE — Dolphin will force-select the CPU Software Renderer '
+          + '(NOT OGL/WebGL2: the GLRD descriptor is never written on this path). Expect no usable picture.'
         : '[webgpu] adapter+device OK — using WGPU backend');
     }
+    window.__gcGpu.backend = /[?&]wgpu=0/.test(location.search) ? 'Software Renderer (?wgpu=0)'
+      : window.__gcWebGPUUnavailable ? 'Software Renderer (no WebGPU)' : 'WGPU';
+    gcRenderBadge();
     var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; window.__romBase = pick.base; window.__romExt = pick.ext || '.iso'; SAVE_KEY = ROM_NAME + '.gcs'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true;
     // [audio fix 2026-08-28] Start is the one activation that ALWAYS happens, so record the
     // gesture here directly rather than relying only on the window-level listeners (a synthetic
@@ -4690,6 +5184,17 @@ window.GcRate = (function () {
   }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasWrap'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
   $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', () => $('importFile').click()); $('importFile').addEventListener('change', (e) => { if (e.target.files && e.target.files[0]) importState(e.target.files[0]); e.target.value = ''; }); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
+  $('btnDiag').addEventListener('click', gcShowDiag);
+  $('diagClose').addEventListener('click', () => { $('diagOverlay').style.display = 'none'; });
+  $('diagOverlay').addEventListener('click', (e) => { if (e.target === $('diagOverlay')) $('diagOverlay').style.display = 'none'; });
+  // Clipboard can be refused (insecure context, permission, older Safari) — fall
+  // back to the selection the textarea already carries rather than reporting a
+  // copy that did not happen.
+  $('diagCopy').addEventListener('click', async () => {
+    var ta = $('diagText');
+    try { await navigator.clipboard.writeText(ta.value); toast('Diagnostics copied'); }
+    catch (e) { try { ta.focus(); ta.select(); } catch (_) {} toast('Copy blocked — text is selected, press ⌘C / Ctrl+C', true); }
+  });
   (function () { var o = $('controlsOverlay'), b = $('btnControls'), c = $('controlsClose'); if (!o || !b) return; b.addEventListener('click', function () { o.style.display = (o.style.display === 'flex') ? 'none' : 'flex'; }); if (c) c.addEventListener('click', function () { o.style.display = 'none'; }); o.addEventListener('click', function (e) { if (e.target === o) o.style.display = 'none'; }); })();
   function openMobileMenu() { $('mobileMenu').classList.add('open'); } function closeMobileMenu() { $('mobileMenu').classList.remove('open'); }
   function applyGhost(on) { $('mobileShell').classList.toggle('ghost', on); if ($('mGhost')) $('mGhost').textContent = 'Transparent Controls: ' + (on ? 'On' : 'Off'); }
