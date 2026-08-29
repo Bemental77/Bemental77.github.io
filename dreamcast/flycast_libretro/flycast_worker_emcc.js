@@ -47,20 +47,24 @@ var ENVIRONMENT_IS_PTHREAD = ENVIRONMENT_IS_WORKER && globalThis.name == "em-pth
   // merged into the same factory scope) can use it without duplicating the
   // realm logic.
   // Route, each hop read: postMessage({cmd:'print'})
-  //   -> dreamcast.html:155 `case 'print': pageLog(d.txt)` -> the #log element.
+  //   -> dreamcast.html's worker onmessage `case 'print': pageLog(d.txt)`
+  //   -> the page's #log element.
   // A bare console.log does NOT reach the page — it only lands in DevTools,
   // and on a phone nobody has DevTools. console.log is still emitted as a
   // second channel for a desktop human and for flycast_probe.js.
-  // Guarded on globalThis.name !== 'em-pthread' for the same reason
-  // flycast_worker_link.sh:449-451 and flycast_worker.js:29-32 are: pthread
-  // children load this same factory, and a child's postMessage goes to the
-  // emcc parent pthread protocol, which swallows unknown commands. From a
-  // child we fall back to console.error, which flycast_worker.js:29-31
-  // records as reaching the probe from BOTH realms.
-  // No PROXY_TO_PTHREAD in flycast_worker_link.sh (only -pthread /
-  // -sPTHREAD_POOL_SIZE=8), so the WebGL2 context and every call made through
-  // it live on the main-runtime thread (EmscriptenWorker.cpp:529, :573) —
-  // i.e. the postMessage arm is the one that actually runs for GL callbacks.
+  // Guarded on globalThis.name !== 'em-pthread' for the same reason the
+  // MARKER block in flycast_worker_link.sh and the werrLog helper in
+  // flycast_libretro/flycast_worker.js are: pthread children load this same
+  // factory, and a child's postMessage goes to the emcc parent pthread
+  // protocol, which swallows unknown commands. From a child we fall back to
+  // console.error, which flycast_worker.js records as reaching the probe from
+  // BOTH realms.
+  // There is no -sPROXY_TO_PTHREAD in flycast_worker_link.sh (only -pthread
+  // and -sPTHREAD_POOL_SIZE=8), so the emscripten "main runtime thread" IS
+  // this shim worker, and the WebGL2 context plus every call made through it
+  // lives there (EmscriptenWorker.cpp :: emscripten_create_gl_context, whose
+  // own log says "WebGL2 ctx created on main-runtime thread"). So the
+  // postMessage arm is the one that actually runs for GL callbacks.
   // -------------------------------------------------------------------------
   var isPthread = (typeof globalThis !== "undefined" && globalThis.name === "em-pthread");
   function bridgeLog(txt) {
@@ -92,7 +96,8 @@ var ENVIRONMENT_IS_PTHREAD = ENVIRONMENT_IS_WORKER && globalThis.name == "em-pth
   // a hypothetical: the per-memory-access [gdrom] trace emitted 51,867 of
   // 53,319 console lines in one 60-second run and throttled the very poll loop
   // it was observing, so the guest never left the disc bootstrap and the run
-  // read as a boot wedge (flycast_worker_link.sh:160-192). A GL error inside a
+  // read as a boot wedge (recorded in the DIAG-flavor banner in
+  // flycast_worker_link.sh). A GL error inside a
   // draw path repeats on every draw call — exactly the same shape. So: log the
   // first few in full, then only on a power-of-two ladder, then stop entirely
   // with one closing line.
@@ -105,10 +110,15 @@ var ENVIRONMENT_IS_PTHREAD = ENVIRONMENT_IS_WORKER && globalThis.name == "em-pth
   // bound the 0x500 drain loop (was unbounded)
   // Milliseconds since this file was evaluated, stamped on every error line.
   // Without it a screenshot cannot tell an init-time error (the GL-version /
-  // vendor probes at core/wsi/gl_context.cpp:31-36 and
-  // core/rend/gles/gles.cpp:601-609 legitimately generate and drain errors on
+  // vendor probes in GLGraphicsContext::findGLVersion (core/wsi/gl_context.cpp)
+  // and findGLVersion (core/rend/gles/gles.cpp) legitimately generate and drain errors on
   // every platform, desktop included) from a steady-state one — and only the
-  // steady-state ones are the mobile signal.
+  // steady-state ones are the mobile signal. (Symbol anchors, not line
+  // numbers: core/rend/gles/ is under active edit by another owner.)
+  // Anchors: GLGraphicsContext::findGLVersion() in core/wsi/gl_context.cpp
+  // (`glGetIntegerv(GL_MAJOR_VERSION)` then `if (glGetError() == GL_INVALID_ENUM)`),
+  // and findGLVersion() in core/rend/gles/gles.cpp
+  // (`while (glGetError() != GL_NO_ERROR) ;` right after the vendor NOTICE_LOG).
   var _now = (typeof performance !== "undefined" && performance.now) ? function() {
     return performance.now();
   } : function() {
@@ -159,22 +169,25 @@ var ENVIRONMENT_IS_PTHREAD = ENVIRONMENT_IS_WORKER && globalThis.name == "em-pth
     };
     // -----------------------------------------------------------------------
     // getError: keep swallowing GL_INVALID_ENUM, but COUNT and REPORT it.
-    // Why the swallow must stay: GLGraphicsContext::findGLVersion()
-    // (core/wsi/gl_context.cpp:31-36) calls glGetIntegerv(GL_MAJOR_VERSION)
-    // and treats a following GL_INVALID_ENUM as "this context is GLES2",
-    // forcing majorVersion=2. That downgrades the entire renderer (GLES2
-    // shader subset, u16 indices, GL_ALPHA single-channel — gles.cpp:526-531).
-    // Letting 0x500 through here would regress every platform, so it stays.
-    // Why it must be reported: 0x500 is PRECISELY the error a mobile driver
+    // Why the swallow must stay: GLGraphicsContext::findGLVersion() in
+    // core/wsi/gl_context.cpp calls glGetIntegerv(GL_MAJOR_VERSION) and treats
+    // a following GL_INVALID_ENUM as "this context is GLES2", forcing
+    // majorVersion=2. That downgrades the entire renderer — the `else` arm of
+    // findGLVersion()'s `if (gl.gl_major >= 3)` in core/rend/gles/gles.cpp
+    // selects the GLES2 shader subset, u16 indices and GL_ALPHA as the
+    // single-channel format. Letting 0x500 through here would regress every
+    // platform, so it stays.
+    // Why it must be REPORTED: 0x500 is PRECISELY the error a mobile driver
     // raises for a format / filter / enum that the desktop driver accepts, and
     // this drain is the reason no such error has ever been visible from a
-    // device. Nothing downstream can see it — dreamcast/flycast-src/core/rend/gles/gles.h
-    // glCheck() reads glGetError() and therefore can never observe a 0x500
-    // either. This counter is the only place it exists.
+    // device. Nothing downstream can see it either — glCheck() in
+    // core/rend/gles/gles.h reads glGetError(), so it can never observe a
+    // 0x500 that we consumed first. This counter is the only place 0x500
+    // exists in the entire system.
     // Always on, and effectively free: glGetError is not called per-frame in
-    // this build (core/rend/gles/gles.cpp:608 and core/wsi/gl_context.cpp:31-33
-    // drain at init; glCheck() is compiled out by default), so this is a
-    // branch and an increment on an init-time path.
+    // this build (the drains in GLGraphicsContext::findGLVersion and in
+    // gles.cpp's findGLVersion are init-time; glCheck() is compiled out by
+    // default), so this is a branch and an increment on an init-time path.
     // -----------------------------------------------------------------------
     var reportInvalidEnum = makeErrReporter("swallowed GL_INVALID_ENUM (0x0500)");
     var reportRealError = makeErrReporter("GL error reached the core");
@@ -243,10 +256,11 @@ var ENVIRONMENT_IS_PTHREAD = ENVIRONMENT_IS_WORKER && globalThis.name == "em-pth
   // breaks modifier volumes), and lists the limits the renderer sizes itself
   // against. Bounded output — a fixed number of lines, no per-frame component.
   // NOTE: this only READS. It deliberately does not feed the unmasked vendor
-  // back into glGetString(GL_VENDOR), because gles.cpp:605 derives
-  // `gl.mali = !stricmp(vendor, "arm")` from it and gl4/gldraw.cpp:474 changes
-  // the depth-stencil format on that flag. Turning a diagnostic into a
-  // behavior change is exactly what we are trying not to do here.
+  // back into glGetString(GL_VENDOR), because findGLVersion() in
+  // core/rend/gles/gles.cpp derives `gl.mali = !stricmp(vendor, "arm")` from it
+  // and core/rend/gl4/gldraw.cpp switches the depth-stencil format on that flag
+  // (`gl.mali ? GL_DEPTH24_STENCIL8 : GL_DEPTH32F_STENCIL8`). Turning a
+  // diagnostic into a behavior change is exactly what we are trying not to do.
   // -------------------------------------------------------------------------
   function reportContext(ctx, getParam) {
     try {
@@ -12326,7 +12340,7 @@ isPthread && flycastWorkerModule();
 
 // --- build-flavor marker — INJECTED by flycast_worker_link.sh, do not hand-edit ---
 if (typeof globalThis !== 'undefined' && globalThis.name !== 'em-pthread') {
-  var __flycastBuildMarker = '[build] flavor=RELEASE defines=none linked=2026-08-29T03:25:23Z (clean — perf, boot depth and wedge behavior are valid)';
+  var __flycastBuildMarker = '[build] flavor=RELEASE defines=none linked=2026-08-29T03:31:01Z (clean — perf, boot depth and wedge behavior are valid)';
   try { console.log(__flycastBuildMarker); } catch (e) {}
   try { postMessage({ cmd: 'print', txt: __flycastBuildMarker }); } catch (e) {}
 }
