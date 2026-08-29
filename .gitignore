@@ -77,3 +77,9 @@ ps1/ps1Wasm/roms/MonsterRancher2.bin
 # 27MB PSO savestate: local probe/autoload asset. *.bin is an LFS rule here (.gitattributes),
 # so a stray `git add -A` would push it into an already-blown LFS budget.
 /state.bin
+
+# SM64 native port (decomp -> wasm) build output. The .wasm has ROM-derived
+# copyrighted assets baked in at compile time (extract_assets.py -> C data ->
+# linked in; there is no --preload-file separation). This repo publishes to
+# GitHub Pages -- do NOT commit or publish this directory.
+n64/sm64-native/
