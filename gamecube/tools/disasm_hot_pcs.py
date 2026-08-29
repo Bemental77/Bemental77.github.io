@@ -7,12 +7,49 @@ _ROM = int(os.environ.get("ROM_IDX", "1"))
 _CFG = {
     0: ("/Users/caseybement/gc_refs/marioparty4/build/GMPE01_01/main.dol", 0x0,
         "/Users/caseybement/Bemental77.github.io/tools/gmpe01_full.map"),
-    1: ("/Users/caseybement/Bemental77.github.io/gamecube/roms/Sonic Adventure 2 - Battle (USA).iso", 0x1e700,
+    1: ("/Users/caseybement/Bemental77.github.io/gamecube/roms/Sonic Adventure 2 - Battle (USA).iso", None,
         "/Users/caseybement/Bemental77.github.io/tools/gsne8p.map"),
-    2: ("/Users/caseybement/Downloads/Phantasy Star Online Episode I & II Plus (USA).iso", 0x1e700,
+    2: ("/Users/caseybement/Downloads/Phantasy Star Online Episode I & II Plus (USA).iso", None,
         "/Users/caseybement/Bemental77.github.io/tools/gpoe8p_full.map"),
 }
 ISO, DOL_OFF, MAP = _CFG.get(_ROM, _CFG[1])
+
+
+# [DOL-OFFSET BUG FIX 2026-08-29] PSO was hardcoded to 0x1e700 — SAB's offset,
+# copy-pasted. VERIFIED EMPIRICALLY: PSO's own disc header at 0x420 says 0x1e000,
+# and reading its DOL at 0x1e700 yields text0_addr=0x0 size=0x0 entry=0x0, i.e.
+# all zeros, so every PSO disassembly through this tool was of nothing.
+#   PSO @0x1e000: text0_addr=0x8000c000 size=0x2520 entry=0x8000c040   <- correct
+#   PSO @0x1e700: text0_addr=0x00000000 size=0x0    entry=0x00000000   <- the bug
+#   SAB @0x1e700: text0_addr=0x80003100 size=0x2400 entry=0x80003140   <- was right
+# Every GameCube disc stores the DOL offset in its header at 0x420 (big-endian),
+# so read it rather than hardcoding per game. A raw .dol (MP4's decomp build) has
+# no disc header and keeps offset 0.
+def _dol_offset(path, declared):
+    if declared is not None:
+        return declared
+    if not path.lower().endswith(".iso"):
+        return 0x0
+    with open(path, "rb") as f:
+        f.seek(0x420)
+        off = struct.unpack(">I", f.read(4))[0]
+        # Sanity-check the header we are about to trust: text section 0 must load
+        # into MEM1 with a non-absurd size. A bad offset reads as zeros and would
+        # otherwise disassemble an empty buffer without complaining.
+        f.seek(off)
+        hdr = f.read(0x100)
+        addr = struct.unpack(">I", hdr[0x48:0x4c])[0]
+        size = struct.unpack(">I", hdr[0x90:0x94])[0]
+        if not (0x80000000 <= addr < 0x81800000 and 0 < size < 0x400000):
+            raise SystemExit(
+                f"{path}: disc header 0x420 gives DOL offset 0x{off:x}, but the DOL "
+                f"there is implausible (text0 addr=0x{addr:08x} size=0x{size:x}). "
+                f"Refusing to disassemble an empty buffer."
+            )
+        return off
+
+
+DOL_OFF = _dol_offset(ISO, DOL_OFF)
 
 HOT_PCS = [
     0x800e4e3c, 0x800e4e6c,
