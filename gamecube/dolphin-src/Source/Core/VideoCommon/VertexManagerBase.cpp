@@ -48,6 +48,330 @@ std::unique_ptr<VertexManagerBase> g_vertex_manager;
 
 using OpcodeDecoder::Primitive;
 
+// ===========================================================================
+// [flush-census TEMP 2026-08-29] WHY DOES Flush() FIRE?
+//
+// PSO character-select navigation submits 16-22x more GPU draw batches per
+// frame than idle (~7,500 vs ~370, drawPath[0] @0x026B3560 vs peFrames
+// @0x026B0930) at a CONSTANT 4 verts/draw. So the batch SIZE never changed,
+// only the COUNT. This census answers whether those 7,500 one-quad draws are
+// irreducible guest geometry or a batching failure on our side.
+//
+// HOW IT ATTRIBUTES. The flush REASON is not visible inside Flush() — it lives
+// at the call site, and every call site except two is in a file this change
+// does not own (BPStructs.cpp:103 via BPFunctions::FlushPipeline, XFStructs.cpp
+// :27/:65..:166, XFStateManager.cpp:176/:193, Fifo.cpp:504, AbstractGfx.cpp:31,
+// AsyncRequests.cpp:24, Present.cpp:917, VertexLoaderManager.cpp:456). So
+// instead of the call site we record the STATE DELTA between consecutive drawn
+// batches: hash 12 categories of GX state at the moment each batch is drawn and
+// diff against the previous drawn batch. The set of categories that differ IS
+// the set of reasons the two batches could not be merged, and it is strictly
+// more informative than the call site (a BP write to bpmem[0x47] and one to
+// bpmem[0xC3] are the same call site but opposite conclusions).
+//
+//   mask == 0  -> byte-identical GX state on both sides of the split. Nothing
+//                 about the draw changed; the flush was pure waste. These are
+//                 fixable WITHOUT touching the guest: BPStructs.cpp:91-101 lets
+//                 TRIGGER_EFB_COPY / CLEARBBOX1 / CLEARBBOX2 / SETDRAWDONE /
+//                 PE_TOKEN_ID / PE_TOKEN_INT_ID / LOADTLUT0 / LOADTLUT1 /
+//                 TEXINVALIDATE / PRELOAD_MODE / CLEAR_PIXEL_PERF flush even
+//                 when the written value is UNCHANGED, and XFStructs.cpp:25-29
+//                 (XFMemWritten) flushes on ANY xf-memory write, value-equal or
+//                 not.
+//   mask == {PECOPY} or {MISC} -> the split was forced by a register that has
+//                 no effect on the pixels of the pending batch (PE tokens, copy
+//                 setup, TMEM config, counters). Also fixable on our side.
+//   mask == {TEVREG} / {TEX} / {BLEND} -> real per-strip material change; a
+//                 dissolve really is submitting distinct draws. Reducible only
+//                 by a real batching layer (atlas / instancing / uniform array).
+//   mask == {POSMTX} alone -> per-object transform only; the GC vertex format
+//                 already carries a posmtx index attribute, so this class is
+//                 mergeable in principle.
+//
+// COST. One category-hash pass per DRAWN batch (~520 u32 mixes), nothing
+// per-vertex and nothing per-draw beyond that. Runtime-disable without a
+// rebuild: set cell 0x026B3A00 nonzero (SAB is browser-zeroed, so 0 = census
+// ACTIVE is the cold-boot default; the page and the probe need no edit to arm
+// it). That cell also makes the A/B "is the census itself perturbing the
+// measurement" possible in ONE session.
+//
+// CELLS 0x026B3A00..0x026B3AF4 (64 u32). Proven free by a repo-wide grep on
+// 2026-08-29 for 0x026B39[3-9]/0x026B3A/0x026B3B: the only hits anywhere are
+// VertexLoaderWasm.h:51 and TextureCacheBase.cpp:1267, both of which only
+// NAME the window bound 0x026B3BFC in a comment, plus a historical mention of
+// 0x026B3B00 in gamecube/docs/render/card_texture_confirm_kill_2026_08_14.md:91
+// for instrumentation that no longer exists. Occupied neighbours are below us
+// (0x026B3900..0x026B3910 vertex loader A/B, 0x026B3914 texcache samples,
+// 0x026B3918..0x026B3928 DSP guest-clock witness, 0x026B392C uncap) and above
+// us (0x026B3C00+ = the powerpc-next FPR spill window, fpr_reg_cache.cpp:335).
+//
+// TO REMOVE (CLAUDE.md gate #8 — this must not accumulate): delete this whole
+// `#if` block, plus the seven `#ifdef BEM_FLUSH_CENSUS` hook sites, which are the
+// ONLY other edits in this file — two in PrepareForAdditionalData(), one at the
+// top of Flush(), three in the body of Flush() (cull-all, zero-index, and the
+// census point), one in OnEndFrame(). VertexManagerBase.h is NOT touched. Or
+// build with -DBEMENTAL_NO_FLUSH_CENSUS to compile it out with no edit at all
+// (verified 2026-08-29: the TU is 73,383 bytes with the census and 63,430 with
+// -DBEMENTAL_NO_FLUSH_CENSUS, both warning-clean at the project's own flags).
+// ===========================================================================
+#if defined(__EMSCRIPTEN__) && !defined(BEMENTAL_NO_FLUSH_CENSUS)
+#define BEM_FLUSH_CENSUS 1
+
+#include "VideoCommon/CPMemory.h"
+
+namespace BemFlushCensus
+{
+// --- cell map --------------------------------------------------------------
+constexpr std::uintptr_t kCtl = 0x026B3A00u;        // nonzero = census OFF
+constexpr std::uintptr_t kFluCalls = 0x026B3A04u;   // every Flush() entry
+constexpr std::uintptr_t kFluNoop = 0x026B3A08u;    // ...that hit `if (m_is_flushed) return`
+constexpr std::uintptr_t kFluReal = 0x026B3A0Cu;    // ...that did not
+constexpr std::uintptr_t kFluDrawn = 0x026B3A10u;   // ...that reached the draw (== drawPath[0])
+constexpr std::uintptr_t kFluCullAll = 0x026B3A14u; // real flush, m_cull_all
+constexpr std::uintptr_t kFluZeroIdx = 0x026B3A18u; // real flush, 0 indices
+constexpr std::uintptr_t kSitePrim = 0x026B3A1Cu;   // drawn flush from the prim-type-change site
+constexpr std::uintptr_t kSiteBuf = 0x026B3A20u;    // drawn flush from the buffer-full site
+constexpr std::uintptr_t kSiteExt = 0x026B3A24u;    // drawn flush from outside this file
+constexpr std::uintptr_t kCat0 = 0x026B3A28u;       // 12 marginal counters, kCat0 + cat*4
+constexpr std::uintptr_t kMaskNone = 0x026B3A58u;   // drawn flush, mask == 0
+constexpr std::uintptr_t kMaskOne = 0x026B3A5Cu;    // drawn flush, exactly one category
+constexpr std::uintptr_t kBitsSum = 0x026B3A60u;    // sum of popcount(mask)
+constexpr std::uintptr_t kIdxSum = 0x026B3A64u;     // sum of num_indices (cross-check vs nverts)
+constexpr std::uintptr_t kSlots = 0x026B3A68u;      // 16 x (key, count)
+constexpr u32 kNumSlots = 16;
+constexpr std::uintptr_t kSlotOvf = 0x026B3AE8u;    // masks that found no free slot
+constexpr std::uintptr_t kFrames = 0x026B3AECu;     // OnEndFrame() count
+constexpr std::uintptr_t kDrawnAtF = 0x026B3AF0u;   // kFluDrawn at the last OnEndFrame
+constexpr std::uintptr_t kDrawnDelta = 0x026B3AF4u; // drawn batches in the LAST frame
+
+// Category bit assignment. The bpmem half is an exact PARTITION of all 256 BP
+// registers, so "mask == 0" really does mean "no BP register changed".
+enum Cat : u32
+{
+  CAT_TEX = 0,    // bp 0x30-0x3f (SU tex size), 0x80-0xbf (tex image/tlut/mode)
+  CAT_TEV,        // bp 0x00, 0x06-0x1f, 0x25-0x2f, 0xc0-0xdf, 0xf4-0xfd
+  CAT_BLEND,      // bp 0x40-0x44, 0xe8-0xf3 (zmode/blend/dstalpha/zctl/fog/alphatest)
+  CAT_TEVREG,     // bp 0xe0-0xe7 (TEV color / konst registers)
+  CAT_SCISSOR,    // bp 0x20-0x22, 0x59; xf 0x101a-0x101f (viewport)
+  CAT_PECOPY,     // bp 0x45-0x58, 0x60-0x68 (PE tokens, EFB copy setup, TMEM cfg)
+  CAT_MISC,       // every remaining bp reg + the non-draw xf registers
+  CAT_PROJ,       // xf 0x1020-0x1026
+  CAT_POSMTX,     // CP matrix indices + the pos/normal/tex/post matrices they select
+  CAT_LIGHT,      // xf 0x1009-0x1011 + lights 0x0600-0x067f
+  CAT_TEXGEN,     // xf 0x1012, 0x103f, 0x1040-0x1047, 0x1050-0x1057
+  CAT_VTXFMT,     // NativeVertexFormat identity + primitive type
+  NUM_CATS
+};
+
+inline u32 Load(std::uintptr_t c)
+{
+  return *reinterpret_cast<volatile u32*>(c);
+}
+inline void Store(std::uintptr_t c, u32 v)
+{
+  *reinterpret_cast<volatile u32*>(c) = v;
+}
+inline void Bump(std::uintptr_t c)
+{
+  Store(c, Load(c) + 1u);
+}
+inline void Add(std::uintptr_t c, u32 v)
+{
+  Store(c, Load(c) + v);
+}
+// SAB is browser-zeroed, so 0 (the cold-boot default) means ACTIVE.
+inline bool Enabled()
+{
+  return Load(kCtl) == 0u;
+}
+
+// 0 = flushed from outside this file, 1 = primitive-type change, 2 = buffer full.
+// Set just before the two in-file Flush() calls, consumed at Flush() entry so
+// that a bail-out path cannot leave it stale.
+static u32 s_pending_site = 0;
+static u32 s_site_this_flush = 0;
+static u32 s_prev[NUM_CATS] = {};
+static bool s_have_prev = false;
+
+inline u32 Mix(u32 h, u32 w)
+{
+  return (h ^ w) * 16777619u;  // FNV-1a
+}
+inline u32 MixRange(u32 h, const u32* base, u32 first, u32 count)
+{
+  for (u32 i = 0; i < count; ++i)
+    h = Mix(h, base[first + i]);
+  return h;
+}
+
+// bpmem / xfmem are both flat u32 register files (BPMemory is exactly 256 regs,
+// XFMemory static_asserts sizeof == 4*XFMEM_REGISTERS_END). Raw u32 indexing is
+// the established access pattern here — BPStructs.cpp:90 does `((s32*)&bpmem)
+// [bp.address]` and XFStructs.cpp indexes xfmem the same way.
+static void Sample(u32* out, PrimitiveType prim)
+{
+  const u32* bp = reinterpret_cast<const u32*>(&bpmem);
+  const u32* xf = reinterpret_cast<const u32*>(&xfmem);
+
+  u32 h;
+
+  h = MixRange(0x811c9dc5u, bp, 0x30, 16);
+  out[CAT_TEX] = MixRange(h, bp, 0x80, 64);
+
+  h = Mix(0x811c9dc5u, bp[0x00]);
+  h = MixRange(h, bp, 0x06, 26);
+  h = MixRange(h, bp, 0x25, 11);
+  h = MixRange(h, bp, 0xC0, 32);
+  out[CAT_TEV] = MixRange(h, bp, 0xF4, 10);
+
+  h = MixRange(0x811c9dc5u, bp, 0x40, 5);
+  out[CAT_BLEND] = MixRange(h, bp, 0xE8, 12);
+
+  out[CAT_TEVREG] = MixRange(0x811c9dc5u, bp, 0xE0, 8);
+
+  h = MixRange(0x811c9dc5u, bp, 0x20, 3);
+  h = Mix(h, bp[0x59]);
+  out[CAT_SCISSOR] = MixRange(h, xf, 0x101A, 6);
+
+  h = MixRange(0x811c9dc5u, bp, 0x45, 20);
+  out[CAT_PECOPY] = MixRange(h, bp, 0x60, 9);
+
+  h = MixRange(0x811c9dc5u, bp, 0x01, 5);
+  h = MixRange(h, bp, 0x23, 2);
+  h = MixRange(h, bp, 0x5A, 6);
+  h = MixRange(h, bp, 0x69, 23);
+  h = MixRange(h, bp, 0xFE, 2);
+  h = MixRange(h, xf, 0x1000, 9);
+  h = MixRange(h, xf, 0x1013, 7);
+  h = MixRange(h, xf, 0x1027, 24);
+  out[CAT_MISC] = MixRange(h, xf, 0x1048, 8);
+
+  out[CAT_PROJ] = MixRange(0x811c9dc5u, xf, 0x1020, 7);
+
+  // Matrix indices live in CP state, not xfmem (XFStateManager.cpp:172-198
+  // writes g_main_cp_state.matrix_index_a/b). The selected rows are read the
+  // same way VertexShaderManager.cpp:292-330 reads them, so the bounds match
+  // Dolphin's own and every index stays inside the xfmem object.
+  const u32 num_texgens = xfmem.numTexGen.numTexGens;
+  const u32 mia = g_main_cp_state.matrix_index_a.Hex;
+  const u32 mib = g_main_cp_state.matrix_index_b.Hex;
+  const u32 pn = g_main_cp_state.matrix_index_a.PosNormalMtxIdx;
+  h = Mix(Mix(0x811c9dc5u, mia), mib);
+  h = MixRange(h, xf, pn * 4, 12);              // posMatrices
+  h = MixRange(h, xf, 0x400 + 3 * (pn & 31), 9);  // normalMatrices
+  for (u32 i = 0; i < num_texgens && i < 8; ++i)
+  {
+    const u32 idx = (i < 4) ? ((mia >> (6 + 6 * i)) & 0x3F) : ((mib >> (6 * (i - 4))) & 0x3F);
+    h = MixRange(h, xf, idx * 4, 12);
+  }
+  if (xfmem.dualTexTrans.enabled)
+  {
+    for (u32 i = 0; i < num_texgens && i < 8; ++i)
+      h = MixRange(h, xf, 0x500 + xfmem.postMtxInfo[i].index * 4, 12);
+  }
+  out[CAT_POSMTX] = h;
+
+  h = MixRange(0x811c9dc5u, xf, 0x1009, 9);
+  if (xfmem.numChan.numColorChans != 0)
+    h = MixRange(h, xf, 0x600, 128);  // lights[8]; skipped when nothing is lit
+  out[CAT_LIGHT] = h;
+
+  h = Mix(Mix(0x811c9dc5u, xf[0x1012]), xf[0x103F]);
+  h = MixRange(h, xf, 0x1040, 8);
+  out[CAT_TEXGEN] = MixRange(h, xf, 0x1050, 8);
+
+  h = Mix(0x811c9dc5u, static_cast<u32>(reinterpret_cast<std::uintptr_t>(
+                           VertexLoaderManager::GetCurrentVertexFormat())));
+  out[CAT_VTXFMT] = Mix(h, static_cast<u32>(prim));
+}
+
+// Called at every Flush() entry, BEFORE the m_is_flushed early-out.
+inline void OnFlushEntry(bool is_noop)
+{
+  s_site_this_flush = s_pending_site;
+  s_pending_site = 0;
+  if (!Enabled())
+    return;
+  Bump(kFluCalls);
+  Bump(is_noop ? kFluNoop : kFluReal);
+}
+
+// Called once per batch that actually reaches the draw.
+static void RecordDrawn(u32 num_indices, PrimitiveType prim)
+{
+  if (!Enabled())
+    return;
+  Bump(kFluDrawn);
+  Add(kIdxSum, num_indices);
+
+  const u32 site = s_site_this_flush;
+  Bump(site == 1u ? kSitePrim : (site == 2u ? kSiteBuf : kSiteExt));
+
+  u32 h[NUM_CATS];
+  Sample(h, prim);
+  if (!s_have_prev)
+  {
+    for (u32 i = 0; i < NUM_CATS; ++i)
+      s_prev[i] = h[i];
+    s_have_prev = true;
+    return;
+  }
+
+  u32 mask = 0;
+  u32 bits = 0;
+  for (u32 i = 0; i < NUM_CATS; ++i)
+  {
+    if (h[i] != s_prev[i])
+    {
+      mask |= (1u << i);
+      ++bits;
+      Bump(kCat0 + i * 4);
+    }
+    s_prev[i] = h[i];
+  }
+  Add(kBitsSum, bits);
+  if (mask == 0)
+    Bump(kMaskNone);
+  else if (bits == 1)
+    Bump(kMaskOne);
+
+  // Slot key = category mask | site<<16, so "buffer full" and "prim changed"
+  // stay distinguishable from a state-driven split. key 0 (no state change,
+  // external flush) is already counted by kMaskNone and needs no slot.
+  const u32 key = mask | (site << 16);
+  if (key == 0)
+    return;
+  for (u32 s = 0; s < kNumSlots; ++s)
+  {
+    const std::uintptr_t mcell = kSlots + s * 8;
+    const u32 m = Load(mcell);
+    if (m == key)
+    {
+      Bump(mcell + 4);
+      return;
+    }
+    if (m == 0)
+    {
+      Store(mcell, key);
+      Store(mcell + 4, 1u);
+      return;
+    }
+  }
+  Bump(kSlotOvf);
+}
+
+inline void OnEndFrame()
+{
+  if (!Enabled())
+    return;
+  Bump(kFrames);
+  const u32 drawn = Load(kFluDrawn);
+  Store(kDrawnDelta, drawn - Load(kDrawnAtF));
+  Store(kDrawnAtF, drawn);
+}
+}  // namespace BemFlushCensus
+#endif  // __EMSCRIPTEN__ && !BEMENTAL_NO_FLUSH_CENSUS
+
 // GX primitive -> RenderState primitive, no primitive restart
 constexpr Common::EnumMap<PrimitiveType, Primitive::GX_DRAW_POINTS> primitive_from_gx{
     PrimitiveType::Triangles,  // GX_DRAW_QUADS
@@ -161,6 +485,9 @@ DataReader VertexManagerBase::PrepareForAdditionalData(OpcodeDecoder::Primitive 
                                          primitive_from_gx[primitive];
   if (m_current_primitive_type != new_primitive_type) [[unlikely]]
   {
+#ifdef BEM_FLUSH_CENSUS
+    BemFlushCensus::s_pending_site = 1;  // primitive type changed
+#endif
     Flush();
 
     // Have to update the rasterization state for point/line cull modes.
@@ -175,6 +502,9 @@ DataReader VertexManagerBase::PrepareForAdditionalData(OpcodeDecoder::Primitive 
   if (!m_is_flushed && (count > remaining_index_generator_indices || count > remaining_indices ||
                         needed_vertex_bytes > GetRemainingSize())) [[unlikely]]
   {
+#ifdef BEM_FLUSH_CENSUS
+    BemFlushCensus::s_pending_site = 2;  // vertex/index buffer exhausted
+#endif
     Flush();
   }
 
@@ -432,8 +762,12 @@ BitSet32 VertexManagerBase::UsedTextures() const
   return usedtextures;
 }
 
+
 void VertexManagerBase::Flush()
 {
+#ifdef BEM_FLUSH_CENSUS
+  BemFlushCensus::OnFlushEntry(m_is_flushed);
+#endif
   if (m_is_flushed)
     return;
 
@@ -608,6 +942,11 @@ void VertexManagerBase::Flush()
     m_zslope.dirty = false;
   }
 
+#ifdef BEM_FLUSH_CENSUS
+  if (m_cull_all)
+    BemFlushCensus::Bump(BemFlushCensus::kFluCullAll);
+#endif
+
   if (!m_cull_all)
   {
     CustomPixelShaderContents custom_pixel_shader_contents;
@@ -635,7 +974,19 @@ void VertexManagerBase::Flush()
     // must be careful to not upload any utility vertices, as the binding will be lost otherwise.
     const u32 num_indices = m_index_generator.GetIndexLen();
     if (num_indices == 0)
+    {
+#ifdef BEM_FLUSH_CENSUS
+      BemFlushCensus::Bump(BemFlushCensus::kFluZeroIdx);
+#endif
       return;
+    }
+
+#ifdef BEM_FLUSH_CENSUS
+    // The census point: bpmem/xfmem/CP here are EXACTLY the state this batch
+    // draws with, so the delta against the previous batch is the reason the two
+    // could not be merged.
+    BemFlushCensus::RecordDrawn(num_indices, m_current_primitive_type);
+#endif
 
     // Texture loading can cause palettes to be applied (-> uniforms -> draws).
     // Palette application does not use vertices, only a full-screen quad, so this is okay.
@@ -996,6 +1347,9 @@ void VertexManagerBase::OnEFBCopyToRAM()
 
 void VertexManagerBase::OnEndFrame()
 {
+#ifdef BEM_FLUSH_CENSUS
+  BemFlushCensus::OnEndFrame();
+#endif
   m_draw_counter = 0;
   m_last_efb_copy_draw_counter = 0;
   m_scheduled_command_buffer_kicks.clear();

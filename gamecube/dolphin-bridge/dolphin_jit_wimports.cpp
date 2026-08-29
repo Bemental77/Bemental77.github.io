@@ -151,6 +151,62 @@ static inline bool is_gather_pipe(uint32_t addr) {
 static inline bool worker_owns_cpu(void) {
     return *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(0x026A0000u)) == 1u;
 }
+
+// [mmio-ref-route 2026-08-29] The shipping config never takes the shape route above.
+// gamecube.html:383 sets __dolphinDualCore = true and :2274-2276 returns BEFORE the only
+// Atomics.store to 0x026A0000 (:2317), so worker_owns_cpu() is permanently false and every
+// non-gather slow-path import falls through to the generic MMU decode. Measured on the CPU
+// thread in /tmp/probe-pso-prof2.log:156,160,162 — WriteToHardware 5.2%, MMU::Read<u32>
+// 3.5%, MMU::Memcheck 1.4%.
+//
+// This is deliberately NOT "open the gate". The shape route (phys = addr & 0x3FFFFFFF, no
+// MSR consult) is sound only while the WORKER owns the CPU and dolphin's mirrored MSR is
+// stale — that is the whole premise of the [stateless-xlate] note above. With dolphin's own
+// CPU thread executing the guest, ppc_state.msr is LIVE and MSR.DR=0 windows are real:
+// PowerPC.cpp:537,557,576,596,619,639,762,805,846 all do `msr.Hex &= ~0x04EF36` (bit 4 = DR)
+// on exception entry. At DR=0, MMU treats the EA as already-physical, so an EA of 0xCC003004
+// matches none of its arms and it PanicAlerts and DROPS the access (MMU.cpp:513-518 write,
+// :305-311 read). Shape routing would instead deliver it to ProcessorInterface. That is a
+// device seeing bytes it does not see today, so the gate stays exactly as it is.
+//
+// What IS safe is the reference implementation's OWN bypass predicate:
+// MMU::IsOptimizableMMIOAccess (declared public at MMU.h:262, body MMU.cpp:1183-1207) — the
+// same call Jit64 (Jit64Common/EmuCodeBlock.cpp:454) and JitArm64
+// (JitArm64_LoadStore.cpp:138,285) make before routing straight to MMIO::Mapping. It returns
+// non-zero only when ALL of:
+//   - no memcheck is armed          (MMU.cpp:1185-1186 — so MMU's Memcheck at :633-636 is a no-op)
+//   - MSR.DR == 1                   (MMU.cpp:1188-1189 — excludes the DR=0 divergence above)
+//   - dcache emulation is off       (MMU.cpp:1191-1192 — MAIN_ACCURATE_CPU_CACHE, default false
+//                                    per MainSettings.cpp:50 and DolphinLibretro/Boot.cpp:266-267)
+//   - TranslateBatAddress SUCCEEDS  (MMU.cpp:1198 — TLB/page-table hits decline and fall back)
+//   - the access is naturally aligned on the TRANSLATED address (MMU.cpp:1202; BAT translation
+//     preserves the low 17 bits per MMU.cpp:1056, so this also rules out the 4 KB page cross
+//     that MMU splits at :201-215 / :339-352)
+//   - MMIO::IsMMIOAddress(pa)       (MMU.cpp:1203)
+// and the value it returns is the EXACT physical address MMU's own TranslateAddress produces.
+//
+// Byte-identity argument: on a non-zero return, MMU would have reached its MMIO arm
+// (ReadFromHardware :233-244 / WriteToHardwareSized :405-433) with that same pa and called
+// `GetMMIOMapping()->Read<T>/Write<T>(system, pa)` — the identical call made below, same
+// width, same value truncation, synchronous, in program order. Every MMU arm after that
+// point (locked-L1 :438, the wi 64-bit duplication + INT_CAUSE_PI at :445-469, RAM, EXRAM,
+// FakeVMEM, the panic) is unreachable once the MMIO arm fires. This is a route shortcut,
+// not a route change; anything the predicate declines keeps today's MMU path unchanged.
+//
+// One gap the predicate does not cover: MMIO::IsMMIOAddress (MMIO.h:60-74) excludes only the
+// EXACT gather-pipe word 0x0C008000, while MMU.cpp:379-380 routes the whole 4 KB GP PAGE to
+// GPFifo on WRITES. stateless_write_w re-applies MMU's page test on the translated pa below.
+// Reads carry no GP exclusion because MMU has none (:379 is `flag == XCheckTLBFlag::Write`).
+//
+// The leading shape test is a pure narrowing filter, never authoritative: it keeps RAM-bound
+// slow-path traffic (emit_lmw/emit_stmw/emit_stfiwx emit UNGUARDED imports —
+// jit_load_store.cpp:2365, 2404, 2429 — so plain RAM EAs do reach here) from paying for the
+// predicate call. Anything it rejects simply keeps the unchanged MMU route.
+static inline uint32_t ref_mmio_pa(Core::System& system, uint32_t addr, uint32_t width) {
+    if ((addr & 0x0FFF0000u) != 0x0C000000u) return 0u;
+    // access_size is in BITS (MMU.cpp:905, :1202; Jit64 passes 8/16/32/64).
+    return system.GetMMU().IsOptimizableMMIOAccess(addr, width * 8u);
+}
 // (width-parameterized plain functions — this file's trampolines sit in an extern "C"
 // block, where templates are not allowed.)
 static bool stateless_read_w(uint32_t addr, uint32_t width, uint32_t* out) {
@@ -170,9 +226,22 @@ static bool stateless_read_w(uint32_t addr, uint32_t width, uint32_t* out) {
             return true;
         }
     }
-    // Everything below is the post-takeover shape-routed path — pre-takeover
-    // MUST keep exact MMU semantics (see the 2026-06-04 note above).
-    if (!worker_owns_cpu()) return false;
+    // Two disjoint routes below. worker_owns_cpu() == true keeps the post-takeover
+    // SHAPE route unchanged (dolphin's mirrored MSR is stale there, so MMU cannot be
+    // trusted — the 2026-07-21 note above). worker_owns_cpu() == false is the shipping
+    // config, where dolphin's CPU thread owns translation and MUST keep exact MMU
+    // semantics (the 2026-06-04 note above): no shape routing, only the reference
+    // predicate.
+    if (!worker_owns_cpu()) {
+        // [mmio-ref-route] See the note above ref_mmio_pa.
+        const uint32_t pa = ref_mmio_pa(system, addr, width);
+        if (pa == 0u) return false;
+        MMIO::Mapping* const mmio = system.GetMemory().GetMMIOMapping();
+        if (width == 1u) *out = mmio->Read<u8>(system, pa);
+        else if (width == 2u) *out = mmio->Read<u16>(system, pa);
+        else *out = mmio->Read<u32>(system, pa);
+        return true;
+    }
     const uint32_t phys = addr & 0x3FFFFFFFu;
     if ((phys & 0x0FFF0000u) == 0x0C000000u) {
         MMIO::Mapping* const mmio = system.GetMemory().GetMMIOMapping();
@@ -205,7 +274,21 @@ static bool stateless_write_w(uint32_t addr, uint32_t width, uint32_t val) {
             return true;
         }
     }
-    if (!worker_owns_cpu()) return false;
+    if (!worker_owns_cpu()) {
+        // [mmio-ref-route] dolphin's CPU thread owns translation: no shape routing, only
+        // the reference predicate. See the note above ref_mmio_pa.
+        const uint32_t pa = ref_mmio_pa(system, addr, width);
+        if (pa == 0u) return false;
+        // MMU.cpp:379-380 routes the whole 4 KB gather-pipe PAGE to GPFifo on writes, but
+        // MMIO::IsMMIOAddress (MMIO.h:62) only excludes the exact word 0x0C008000. Re-apply
+        // MMU's page test on the translated pa so a GP-page write keeps its GPFifo route.
+        if ((pa & 0xFFFFF000u) == GPFifo::GATHER_PIPE_PHYSICAL_ADDRESS) return false;
+        MMIO::Mapping* const mmio = system.GetMemory().GetMMIOMapping();
+        if (width == 1u) mmio->Write<u8>(system, pa, (u8)val);
+        else if (width == 2u) mmio->Write<u16>(system, pa, (u16)val);
+        else mmio->Write<u32>(system, pa, val);
+        return true;
+    }
     const uint32_t phys = addr & 0x3FFFFFFFu;
     if ((phys & 0x0FFF0000u) == 0x0C000000u) {
         MMIO::Mapping* const mmio = system.GetMemory().GetMMIOMapping();
