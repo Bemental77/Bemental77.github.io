@@ -422,6 +422,22 @@
         lastClk = d.kcyc; lastPc = d.pc >>> 0;
         lastIstnrm = d.istnrm >>> 0; lastIstext = d.istext >>> 0;
         paintFpsBar();
+        // Apply the fresh-boot seed on the first heartbeat that reports frames
+        // ACTUALLY FLOWING (calls = video_cb presents/s with dupe sentinels
+        // excluded, so a stuck emu reads 0 — see the fps-bar comment below).
+        // Event-driven on purpose: the old fixed 12 s timer either fires
+        // before a slow phone's core can accept a deserialize, or burns
+        // seconds a fast desktop didn't need. If telemetry never reports a
+        // frame the seed simply never applies and the normal boot stands.
+        if (seedArmed && d.calls > 0) {
+          seedArmed = false;
+          seedPromise.then((buf) => {
+            if (!buf) return;   // fetchSeedState already logged why; cold boot stands
+            seedLabel = '✓ Ready — serial and access key already entered';
+            pageLog('[seed] applying ' + buf.byteLength + ' B');
+            worker.postMessage({ cmd: 'loadState', data: buf }, [buf]);
+          });
+        }
         break;
       case 'ips':
         lastIps = d.ips;
@@ -445,7 +461,18 @@
           pageLog('[page] Save State returned empty — not saved (is the game running?)');
         }
         break;
-      case 'stateLoaded': pageLog('[page] state ' + (d.success ? 'loaded OK' : 'load FAILED')); break;
+      case 'stateLoaded': {
+        const lbl = seedLabel; seedLabel = null;
+        // A seed the core rejects is NOT fatal: nothing was restored, the
+        // guest carries on with its own cold boot, and the player types the
+        // credentials by hand exactly as before. Never a black screen.
+        if (lbl && !d.success) pageLog('[seed] core rejected the state — normal boot continues');
+        if (typeof showToast === 'function') {
+          showToast(d.success ? (lbl || '✓ State loaded') : 'State load failed', !!d.success);
+        }
+        pageLog('[page] state ' + (d.success ? 'loaded OK' : 'load FAILED'));
+        break;
+      }
       default:
         pageLog('[page] unknown worker cmd: ' + d.cmd);
     }
@@ -584,6 +611,10 @@
     $('btnStart').disabled = true;
     setStatus('Loading ' + game.name + '...');
     try {
+      // Kick the boot seed off alongside the disc stream so it is in hand by
+      // the time the first frame lands. Nothing awaits it here — the boot is
+      // never blocked on the seed, and it is 0.75% of the disc's bytes.
+      if (seedAllowed()) seedPromise = fetchSeedState();
       // 1. Stream every file. The worker queues writes until runtime-ready
       //    (the post-js drains queued messages on init).
       for (const f of game.files) {
@@ -614,6 +645,13 @@
       setStatus('Running.');
       worker.postMessage({ cmd: 'freerun', on: 1 });
       requestAnimationFrame(frameLoop);
+      // A returning player always wins. If this browser already holds its own
+      // savestate, never seed over it — that would eat their progress.
+      await savedStateReady;
+      if (seedPromise) {
+        if (savedState) pageLog('[seed] this browser has its own saved state — seed skipped');
+        else seedArmed = true;
+      }
     } catch (err) {
       pageLog('[page] start failed: ' + (err && err.message ? err.message : String(err)));
       setStatus('Failed: ' + (err && err.message ? err.message : String(err)));
@@ -658,9 +696,89 @@
     return v;
   }
   // Restore any previously-persisted state so Load State works after a reload.
-  idbGet(STATE_KEY)
+  // Kept as a promise: the boot seed must not race it (a returning player's
+  // own state wins over the shipped one).
+  const savedStateReady = idbGet(STATE_KEY)
     .then((v) => { if (v) { savedState = new Uint8Array(v); pageLog('[page] found saved state ' + savedState.byteLength + ' B — Start, then Load State to restore'); } })
     .catch(() => {});
+
+  // ---------------------------------------------------------------------------
+  // Fresh-boot seed state — PSO Ver.2 Serial Number / Access Key.
+  //
+  // A cold PSO Ver.2 boot demands a Serial Number + Access Key before a new
+  // game, and the game keeps them in main RAM ONLY. Verified three ways
+  // against a post-entry savestate (2026-08-28): the pair appears exactly
+  // once, at guest 0x8c4f3c20 / 0x8c4f3c28; the serialized VMU holds only
+  // PSO______SYS + the character file (seeding either, or both, still lands
+  // on the entry screen); and the DC flash GAME partition is empty (17
+  // non-blank bytes, just its header). So there is nothing small to pre-seed
+  // — no VMU file, no flash block, no 16-byte poke. A savestate captured just
+  // past that screen is the only mechanism that carries the credentials, and
+  // it skips the cold boot as a bonus.
+  //
+  // Size: the raw state is 27,652,485 B. The shipped file is gzip -9 at
+  // 8,595,603 B (3.22x, 31.1% of raw), inflated here with DecompressionStream.
+  // Magic bytes are sniffed, so a raw export drops in unmodified. 8.2 MB is
+  // far under GitHub's 100 MB limit, so it needs no .partXX splitting, and it
+  // is 0.75% of the 1.1 GB disc this page already streams every load — which
+  // is why it is not worth caching in IndexedDB while the disc is not.
+  //
+  // EVERY failure path falls through to a normal, playable cold boot: file
+  // missing, a deploy that serves a Git-LFS pointer, a truncated blob, no
+  // DecompressionStream, or a state the core rejects. The page never blocks
+  // on the seed, so it can never produce a black screen.
+  // ---------------------------------------------------------------------------
+  const SEED_URL = 'dreamcast/states/pso2_boot.state';
+  const SEED_MIN = 1 << 20;   // a real state is ~27 MB; under 1 MB means a broken deploy
+  let seedPromise = null;     // fetch started alongside the disc stream
+  let seedArmed   = false;    // applied on the first frame-producing heartbeat
+  let seedLabel   = null;     // custom toast/log for the seed's stateLoaded ack
+
+  function seedAllowed() {
+    // Measurement runs must boot cold on purpose — an auto-seeding probe would
+    // silently change what a number means. ?noseed=1 forces it; the probe-only
+    // params imply it.
+    const q = new URLSearchParams(location.search);
+    return !(q.has('noseed') || q.has('autoload') || q.has('autosave') || q.has('parity'));
+  }
+
+  async function fetchSeedState() {
+    try {
+      const r = await fetch(SEED_URL);
+      if (!r.ok) { pageLog('[seed] not shipped (HTTP ' + r.status + ') — cold boot'); return null; }
+      let buf = await r.arrayBuffer();
+      // A deploy can hand back a 133-byte Git-LFS pointer instead of content:
+      // that exact break shipped the Track3 disc parts as pointers and crashed
+      // the game on day one. Catch it by magic rather than letting 133 bytes
+      // reach the deserializer.
+      if (buf.byteLength <= 512) {
+        const head = new TextDecoder().decode(new Uint8Array(buf, 0, Math.min(24, buf.byteLength)));
+        if (head.startsWith('version https://git-lfs')) {
+          pageLog('[seed] served as a Git-LFS pointer — deploy is broken; cold boot');
+          return null;
+        }
+      }
+      const m = new Uint8Array(buf, 0, Math.min(2, buf.byteLength));
+      if (m[0] === 0x1f && m[1] === 0x8b) {
+        if (typeof DecompressionStream !== 'function') {
+          pageLog('[seed] gzipped, but this browser has no DecompressionStream — cold boot');
+          return null;
+        }
+        buf = await new Response(
+          new Blob([buf]).stream().pipeThrough(new DecompressionStream('gzip'))
+        ).arrayBuffer();
+      }
+      if (buf.byteLength < SEED_MIN) {
+        pageLog('[seed] implausibly small (' + buf.byteLength + ' B) — cold boot');
+        return null;
+      }
+      pageLog('[seed] ready ' + buf.byteLength + ' B');
+      return buf;
+    } catch (e) {
+      pageLog('[seed] fetch/inflate failed: ' + e + ' — cold boot');
+      return null;
+    }
+  }
 
   $('btnReset').addEventListener('click', () => worker.postMessage({ cmd: 'reset' }));
   $('btnSave').addEventListener('click', () => {

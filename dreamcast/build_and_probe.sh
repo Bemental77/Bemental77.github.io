@@ -58,22 +58,33 @@ ROOT=/Users/caseybement/Bemental77.github.io
 LINK_SCRIPT=$ROOT/dreamcast/flycast-bridge/flycast_worker_link.sh
 PROBE_JS=$ROOT/dreamcast/tools/flycast_probe.js
 
-# ---- rebuild bementalJIT (and its SH4 guest) if its sources changed ----
-# The link script only re-compiles the bridge TUs (EmscriptenWorker.cpp, etc).
-# bementalJIT lives in libbementalJIT*.a built by `emmake make`. Without this
-# step, edits to bementalJIT/guests/sh4/wasm_emit.cpp silently never take
-# effect — the link script picks up a stale archive from build-wasm/.
+# ---- rebuild the static archives the link consumes ----
+# The link script (flycast_worker_link.sh:218-221) only re-compiles the BRIDGE TUs
+# — EmscriptenWorker.cpp, flycast_stubs.cpp, rec_wasm.cpp, arm7_rec_wasm.cpp.
+# Everything else it takes as prebuilt .a files, so any source that lands in an
+# archive is invisible to a link-only iteration:
+#   - bementalJIT/**              -> libbementalJIT.a, libbementalJITSh4.a
+#   - flycast-src/core/**         -> libflycast_libretro.a   (MAIN_AR, link:26)
+#
+# [stale-archive trap 2026-08-28] flycast_libretro was NOT in this make line, so
+# every edit under flycast-src/core silently never reached the binary while the
+# script still printed a successful link. Caught on core/rend/gles/gles.cpp:221
+# (the lowp->highp mobile precision fix): the fix was committed, the tree was
+# "rebuilt", and the shipped .wasm still contained the OLD string. Tell:
+#   grep -o -a -F "<a string you just edited>" \
+#     dreamcast/flycast_libretro/flycast_worker_emcc.wasm | wc -l
+# returns 0. Same class as the GameCube build-dir/BUILD= mismatch in CLAUDE.md.
 if [ "$SKIP_LINK" = 0 ]; then
-  echo "=== bementalJIT build ==="
+  echo "=== archive build (bementalJIT + flycast core) ==="
   cd /Users/caseybement/Bemental77.github.io/dreamcast/flycast-src/build-wasm
   # shellcheck disable=SC1091
   source /Users/caseybement/Bemental77.github.io/emsdk/emsdk_env.sh > /dev/null 2>&1
-  emmake make bementalJIT bementalJITSh4 -j4 2>&1 | grep -E "error:|Built target" | tail -5
+  emmake make bementalJIT bementalJITSh4 flycast_libretro -j4 2>&1 | grep -E "error:|Built target" | tail -8
   # The `| grep | tail` above means `set -e` sees grep/tail's exit, NOT make's.
   # Without this PIPESTATUS guard a FAILED build would silently fall through to
   # the probe, which then runs against a STALE wasm — a false "it still works"
   # result. The basis of testing is a fresh build every run; abort if it broke.
-  if [ "${PIPESTATUS[0]}" -ne 0 ]; then echo "FATAL: bementalJIT build failed"; exit 1; fi
+  if [ "${PIPESTATUS[0]}" -ne 0 ]; then echo "FATAL: archive build failed (bementalJIT / flycast core)"; exit 1; fi
 
   echo "=== link ==="
   bash "$LINK_SCRIPT" 2>&1 | tail -3
