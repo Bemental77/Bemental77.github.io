@@ -3219,7 +3219,121 @@
   // (w<<16)|h, 0x026B3518 = frame seq. A 16ms poll paints on seq change; once
   // active, the video_cb 'render' messages (the SW buffer — zeros under WGPU)
   // are ignored so they can't paint black over real frames.
-  var _sabPresentSeq = 0, _sabPresentActive = false, _sabFrames = 0, _sabFpsT = 0;
+  var _sabPresentSeq = 0, _sabPresentActive = false;
+
+  // ============================ RATE MODEL ==================================================
+  // [rate-model 2026-08-28] ONE vocabulary for every rate this page reports. A single "FPS:"
+  // number that meant a different thing on each path is exactly how the guest clock and the
+  // present clock got welded together — raising "fps" used to mean fast-forwarding the game.
+  // Four DISTINCT quantities, never mixed, all four always on screen:
+  //
+  //   speed      emulated time / wall time. 1.00x IS the product ("ran precisely as the
+  //              hardware intended"). MEASURED, never asserted: if the pipeline can only
+  //              deliver 45 of the 60 frames the guest clock is owed, this reads 0.75x and
+  //              goes amber. It is NEVER adjusted to make some other number look better.
+  //   published  distinct frames the renderer FINISHED and put on the shared heap, per second.
+  //              Read straight off the seqlock counter, which WGPUGfx.cpp bumps +1 at write
+  //              begin and +1 at write end (WGPUGfx.cpp:1241 / :1264) => exactly +2 per
+  //              published frame. Never counts a frame twice.
+  //   shown      distinct frames that actually reached the canvas, per second. HARD-capped by
+  //              the display refresh — the compositor samples the canvas once per vsync, so on
+  //              a 60Hz panel this physically cannot exceed 60 no matter what loop we use. A
+  //              rAF tick with no new frame paints nothing and counts nothing, so no duplicate
+  //              can ever inflate it.
+  //   cap        MEASURED sustainable production rate: frames/s the pipeline WOULD deliver at
+  //              100% duty, derived from real busy-time accounting (see the recomp block).
+  //              This is the "we are ahead of the hardware" number: cap 120 at speed 1.00x
+  //              means each 16.67ms frame's work finished in 8.3ms => 2.0x headroom. It is a
+  //              CAPABILITY, not pixels, and it is labelled "cap" everywhere so it can never
+  //              be misread as presents.
+  //
+  // Why the headline 120 is `cap` and not `shown`: with the guest pinned at 1.00x there are
+  // only 60 distinct frames per second IN EXISTENCE. Painting one of them twice to make a
+  // counter read 120 would be a lie about headroom, so it is not done anywhere in this file.
+  // 120 `shown` is reachable only by running the guest at 2x (?fps=120) — the one thing we
+  // were told not to do. `cap` is the honest measurement of the same claim.
+  var Rate = window.__gcRate = {
+    path: 'jit',
+    guestHz: 60,          // the game's native frame rate; what 1.00x is measured against
+    speed: null,          // measured emulated/wall. null = not observable on this path
+    speedReq: 1,          // requested multiplier (?fps= / GUEST_HZ)
+    published: 0,         // distinct renderer outputs per second
+    shown: 0,             // distinct frames painted to the canvas per second
+    capFps: null,         // measured sustainable production rate. null = not observable
+    capNote: 'JIT path: the page cannot see the core\'s internal busy time, so headroom is not measurable from here',
+    extra: '',            // path-specific tooltip detail
+    starved: false,       // delivering less than what was asked for
+    set: function (o) { for (var k in o) this[k] = o[k]; }
+  };
+  var _rateBuf = null, _rateU32 = null;
+  function _rateView() {
+    if (!sharedMemory) return null;
+    // memory growth swaps the buffer out from under cached views — rebind on change.
+    if (_rateBuf !== sharedMemory.buffer) { _rateBuf = sharedMemory.buffer; _rateU32 = new Uint32Array(_rateBuf); }
+    return _rateU32;
+  }
+  function _rateNum(n, d) { return (n === null || n === undefined || !isFinite(n)) ? '--' : n.toFixed(d || 0); }
+  var _shownCount = 0, _rateSeqMark = -1, _rateT0 = 0, _rateDropped = 0;
+  // published/s needs NO fast polling loop. The seqlock counter is monotonic, so a DELTA of it
+  // is exact at ANY sampling rate — sampling once a second measures a 500/s producer just as
+  // exactly as sampling 10,000 times a second would. This is the answer to "what must the
+  // presentation path use instead of rAF to see past the display refresh": for MEASUREMENT,
+  // nothing — read the producer's own counter. For PIXELS, nothing exists: no browser API can
+  // land more than `refresh` distinct images on the panel, so painting faster than rAF would
+  // only burn the 1.2MB/frame copy on frames the compositor throws away, LOWERING real
+  // capability to inflate a counter. rAF stays the paint clock; the counter is the meter.
+  function _rateTick() {
+    var now = performance.now();
+    var A = _rateView(), pub = 0;
+    if (A) {
+      try {
+        var s = Atomics.load(A, 0x026B3518 >> 2) >>> 0;
+        if (s & 1) s--;                     // mid-publish: snap back to the last complete frame
+        if (_rateSeqMark < 0) _rateSeqMark = s;
+        pub = (s - _rateSeqMark) >> 1; _rateSeqMark = s;
+      } catch (e) {}
+    }
+    var dt = _rateT0 ? (now - _rateT0) / 1000 : 0;
+    _rateT0 = now;
+    if (dt > 0) {
+      Rate.published = pub / dt;
+      Rate.shown = _shownCount / dt;
+      _rateDropped = Math.max(0, pub - _shownCount);
+    }
+    _shownCount = 0;
+    _rateRender();
+  }
+  function _rateRender() {
+    if (!fpsEl) return;
+    // nothing has run yet — keep the status bar clean rather than advertising a row of "--".
+    if (!Rate.published && !Rate.shown && Rate.speed === null) { fpsEl.textContent = ''; return; }
+    var offHwRate = Rate.speed !== null && Math.abs(Rate.speed - 1) > 0.02;
+    var parts = [
+      'speed ' + (Rate.speed === null ? '--' : _rateNum(Rate.speed, 2) + 'x')
+        + (Rate.speedReq !== 1 ? ' (req ' + (Rate.speedReq === Infinity ? 'max' : _rateNum(Rate.speedReq, 2) + 'x') + ')' : '')
+        + (Rate.starved ? ' STARVED' : ''),
+      Rate.capFps === null ? 'cap --'
+        : _rateNum(Rate.capFps) + ' fps cap (' + _rateNum(Rate.capFps / Rate.guestHz, 1) + 'x hw)',
+      _rateNum(Rate.shown) + ' shown / ' + _rateNum(Rate.published) + ' published'
+    ];
+    fpsEl.textContent = parts.join('  ·  ');
+    fpsEl.title =
+      'speed     = emulated time / wall time. 1.00x = exactly hardware rate (the target).\n' +
+      'cap       = MEASURED frames/s this pipeline could sustain at 100% duty. Headroom, not\n' +
+      '            pixels. "' + _rateNum(Rate.capFps) + ' fps cap" at 1.00x = we are ' +
+      _rateNum(Rate.capFps === null ? null : Rate.capFps / Rate.guestHz, 1) + 'x ahead of the hardware.\n' +
+      (Rate.capNote ? '            ' + Rate.capNote + '\n' : '') +
+      'published = distinct frames the renderer finished this second (seqlock delta; no dupes).\n' +
+      'shown     = distinct frames painted to the canvas. Capped by the DISPLAY REFRESH — a\n' +
+      '            60Hz panel cannot show more than 60/s, so this never reads 120 there even\n' +
+      '            when cap does. ' + _rateDropped.toFixed(0) + ' frame(s) published-but-not-shown this second.\n' +
+      'guest Hz  = ' + Rate.guestHz + ' (native rate this game is pinned to)\n' +
+      (Rate.extra || '');
+    // Green ONLY while the guest is within +-2% of hardware rate. ?fps=120 goes amber on
+    // purpose: it is a deliberate speed experiment, not the product.
+    fpsEl.style.color = Rate.speed === null ? '' : (offHwRate ? '#fd7' : '#7f7');
+  }
+  setInterval(_rateTick, 1000);
   // [present-cadence 2026-08-28] was setInterval(..., 16). A 16ms timer clamps
   // presents to ~62/s in theory and ~50/s in practice, which WAS the measured
   // fps ceiling: cutting render work (sampled texture hashing took the decode
@@ -3227,7 +3341,10 @@
   // not CPU-bound. rAF is display-synced, so this tracks the panel — 120/s on a
   // 120Hz display, a locked 60 on 60Hz — instead of a fixed timer. Gameplay
   // speed is unaffected: the guest is paced by the credit grant (TARGET), this
-  // only governs how often a finished frame is painted.
+  // only governs how often a finished frame is painted. It is also NOT the fps
+  // meter any more (see the rate model above): `published` is metered off the
+  // producer's own counter, so a rAF that is refresh-bound no longer clamps the
+  // measurement — only the pixels.
   function _sabPresentTick() {
     try {
       if (!sharedMemory) return;
@@ -3268,16 +3385,10 @@
         _sabPresentActive = true;
         pageLog('[sab-present] WGPU shared-heap present ACTIVE ' + w + 'x' + h);
       }
-      _sabFrames++;
-      var now = performance.now();
-      if (now - _sabFpsT > 1000) {
-        if (_sabFpsT > 0) {
-          var f = _sabFrames * 1000 / (now - _sabFpsT);
-          fpsEl.textContent = 'FPS: ' + f.toFixed(1);
-          console.log('[fps] ' + f.toFixed(2) + ' @t=' + (now / 1000).toFixed(0) + 's (sab-present)');
-        }
-        _sabFrames = 0; _sabFpsT = now;
-      }
+      // `shown` counts ONLY frames that got here — i.e. a seq we had not painted before. A
+      // rAF tick that finds no new frame returns above and counts nothing, so this can never
+      // be inflated by re-presenting the same guest frame.
+      _shownCount++;
     } catch (e) { /* transient during boot */ }
     finally { requestAnimationFrame(_sabPresentTick); }
   }
@@ -3380,9 +3491,14 @@
             pageLog('[render] GPU worker init failed: ' + d.reason);
             // Canvas is gone (transferred); accept the failure.
           } else if (d.cmd === 'stats') {
-            // Optional: log stats to FPS counter.
-            if (d.framesPainted > 0 && fpsEl) {
-              fpsEl.textContent = 'FPS: ' + d.framesPainted + ' (paint ' + d.lastPaintMs.toFixed(1) + 'ms)';
+            // gpu-worker owns the canvas in this mode, so IT is the thing painting: its
+            // framesPainted is `shown`. Routed through the shared rate model rather than
+            // stamping a bare "FPS:" string, so this path cannot silently report a different
+            // quantity than the sab-present path does (see RATE MODEL above).
+            if (d.framesPainted > 0) {
+              Rate.set({ shown: d.framesPainted, published: d.framesPainted,
+                         extra: 'gpu-worker present: paint ' + d.lastPaintMs.toFixed(1) + 'ms/frame\n' });
+              _rateRender();
             }
           }
         };
@@ -3557,7 +3673,7 @@
     switch (data.cmd) {
       case 'print': pageLog('> ' + data.txt); break;
       case 'setStatus': setStatus(data.txt); break;
-      case 'render': { if (data.pixels && !_sabPresentActive) paintFrame(data.pixels, data.w, data.h, data.pitch); if (data.h > 0 && !window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame received w:' + data.w + ' h:' + data.h); } renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { var _fps = (renderFrames * 1000 / (now - lastFpsLog)); fpsEl.textContent = 'FPS: ' + _fps.toFixed(1); console.log('[fps] ' + _fps.toFixed(2) + ' @t=' + (now / 1000).toFixed(0) + 's totalFrames=' + (window._totalRenderFrames = (window._totalRenderFrames || 0) + renderFrames)); renderFrames = 0; lastFpsLog = now; } break; }
+      case 'render': { if (data.pixels && !_sabPresentActive) paintFrame(data.pixels, data.w, data.h, data.pitch); if (data.h > 0 && !window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame received w:' + data.w + ' h:' + data.h); } renderFrames++; var now = performance.now(); if (now - lastFpsLog > 1000) { var _fps = (renderFrames * 1000 / (now - lastFpsLog)); /* [rate-model] legacy SW-present path: each 'render' message IS one distinct finished frame, painted immediately — so here published == shown. Fed to the shared rate model instead of a bare "FPS:" string. */ if (!_sabPresentActive) { Rate.set({ published: _fps, shown: _fps, extra: 'legacy postMessage SW-present path\n' }); _rateRender(); } console.log('[rate] published=' + _fps.toFixed(2) + '/s @t=' + (now / 1000).toFixed(0) + 's totalFrames=' + (window._totalRenderFrames = (window._totalRenderFrames || 0) + renderFrames)); renderFrames = 0; lastFpsLog = now; } break; }
       case 'audioRate': {
         // [audio rate 2026-07-17] The worker reports the core's real output sample rate (retro
         // av_info). Record it and init the worklet NOW — the Start-button click already gave the
@@ -4046,8 +4162,11 @@
 // the JIT as usual (initializing the WGPU renderer + guest RAM), then parks the emulated
 // CPU and hands the frame stream to gamecube/recomp/recomp_worker.js: the recompiled game
 // itself runs at native-wasm speed and its GP-FIFO frames render through Dolphin's backend.
-// Pacing: TARGET game-fps granted as frame credits per rAF (default 120; &fps=N to change;
-// &fps=0 = uncapped freerun). HUD shows real delivered game-fps.
+// Pacing: the credit grant IS the guest clock. It is pinned to GUEST_HZ (the game's native
+// rate, 60 for this NTSC title) so simulation advances at EXACTLY 1.000x hardware; &fps=N and
+// &fps=0 (uncapped freerun) remain as deliberate speed-experiment arms and the readout says
+// "speed 2.00x" out loud when used. The frame rate we advertise is a SEPARATE, measured
+// quantity — see the RATE MODEL comment in the main script block.
 (function () {
   var q = new URLSearchParams(location.search);
   if (q.get('recomp') !== '1') return;
@@ -4065,19 +4184,79 @@
     s.disabled = true;
   });
   console.log('[recomp-live] recomp mode: ROM pinned to Mario Party 4');
-  // Default = NATIVE speed: each pumped frame advances game time 1/60s (the recomp's
-  // frame-driven clock), so 120 credits/s ran the GAME at 2x fast-forward while the
-  // screen painted far fewer frames (user 2026-08-27: "just because you increase the
-  // game play speed does not make it 120 fps"). 60 credits/s = real-time, and every
-  // frame is renderable+presentable = an actual smooth 60. ?fps= overrides for
-  // speed experiments; ?fps=0 = uncapped.
-  var TARGET = q.has('fps') ? parseInt(q.get('fps'), 10) : 60;
+  // [rate-split 2026-08-28] THE GUEST CLOCK AND THE REPORTED RATE ARE TWO KNOBS. They used to
+  // be one, which is the bug: the credit grant IS emulated time (each pumped frame advances
+  // the recomp's frame-driven clock by exactly 1/GUEST_HZ), so "raise the fps" literally meant
+  // "fast-forward the game" (user 2026-08-27: "just because you increase the game play speed
+  // does not make it 120 fps"; 2026-08-28: "WE DO NOT WANT THE GAMES SPED UP, WE WANT THEM RAN
+  // PRECISELY AS THE HARDWARE INTENDED").
+  //
+  //   GUEST_HZ  the game's native frame rate. MP4 is NTSC => 60. This is what 1.00x means and
+  //             it is the ONLY thing that sets emulated-time-per-frame. ?hz= exists for a
+  //             non-NTSC title; it is not a performance knob.
+  //   TARGET    credits granted per wall-clock second. Defaults to GUEST_HZ => 1.000x, exactly
+  //             hardware rate. ?fps=N still overrides it for deliberate speed experiments and
+  //             ?fps=0 is still uncapped freerun (both are the existing measurement arms), but
+  //             the readout now says "speed 2.00x" out loud when you do that instead of
+  //             quietly presenting a fast-forwarded game as a higher frame rate.
+  //
+  // The number that is supposed to reach 120 is `cap` — the MEASURED rate this pipeline could
+  // sustain — computed below from real busy time. See the RATE MODEL comment in the main
+  // script block.
+  var GUEST_HZ = Math.max(1, parseInt(q.get('hz') || '60', 10));
+  var TARGET = q.has('fps') ? parseInt(q.get('fps'), 10) : GUEST_HZ;
   var BOOT_MS = parseInt(q.get('bootms') || '50000', 10);
   var pace = new SharedArrayBuffer(64);
   var paceI32 = new Int32Array(pace);
   if (TARGET === 0) Atomics.store(paceI32, 5, 1);   // uncapped
   var rw = null, framesSeen = 0, lastN = 0, lastT = 0, credAcc = 0;
   var rendered = 0, lastRendered = 0, outstanding = 0, dropped = 0;
+
+  // --- 1.000x integrity ---------------------------------------------------------------------
+  // Credits are wall-clock integrated, so a stalled rAF (backgrounded tab, a long GC, a hitch)
+  // used to bank the whole gap and hand it over at once — after 10s hidden the guest got 600
+  // credits and SPRINTED through 10s of game time as fast as the pipeline allowed. That is a
+  // 1.000x violation just as much as ?fps=120 is, so both the per-tick integration window and
+  // the standing credit backlog are clamped. MAX_BACKLOG is >1 so ordinary frame-time jitter
+  // is still absorbed (a 20ms frame borrows from the next budget) without ever accumulating a
+  // debt the guest can pay off by fast-forwarding.
+  //
+  // The two bounds are a deliberate tradeoff, not arbitrary:
+  //   MAX_DT_MS   caps what ONE tick may accrue. 100ms => at most 6 credits from a single
+  //               gap, so a 60s hidden tab drops ~60s of owed time instead of sprinting
+  //               through it. Emulated time therefore tracks wall time while the tab is
+  //               VISIBLE, and a long hide is a pause, not a fast-forward.
+  //   MAX_BACKLOG caps the standing debt = how much catch-up is permitted at all. Some
+  //               catch-up is REQUIRED for 1.000x: with zero backlog every stutter would
+  //               permanently lose game time and the game would settle below hardware rate
+  //               forever. 8 frames = 133ms is the most the guest may ever run ahead of the
+  //               grant clock. It must also stay comfortably above the credits one rAF tick
+  //               needs (1 at 60Hz rAF, 2 at 30Hz, 3 at 20Hz) or a merely SLOW rAF would
+  //               throttle the guest below hardware rate — which is why this is 8 and not 2.
+  var MAX_DT_MS = 100;     // a stall longer than this is dropped, not repaid
+  var MAX_BACKLOG = 8;     // credits allowed to stand unconsumed (~133ms of catch-up)
+
+  // --- capability accounting ----------------------------------------------------------------
+  // `cap` must be a MEASUREMENT, never an extrapolation from a duplicated counter. Everything
+  // it needs is already visible from this page, given the worker's verified credit protocol
+  // (gamecube/recomp/recomp_worker.js:784-787): the worker produces a frame, posts it, and only
+  // THEN blocks for the credit that gates the NEXT frame. So between two 'frame' messages the
+  // worker is idle from the moment it posted until the moment a credit was available, and busy
+  // from there to the next post:
+  //
+  //   guestBusy(n+1) = T_frame(n+1) - max( T_frame(n), T_gateOpen(n+1) )
+  //
+  // The render stage is measured the same way on this side of the mailbox: wall time during
+  // which at least one frame is in flight to dolphin_worker (outstanding > 0).
+  // Guest and renderer are separate threads running as a pipeline, so the sustainable rate is
+  // 1/max(stage time) = min(stage rates).
+  var _gateOpenAt = 0, _lastFrameAt = 0;
+  var _guestBusyMs = 0, _guestBusyN = 0;
+  var _renderBusyMs = 0, _renderBusyFrom = 0, _renderedWin = 0, _renderBusyMsMark = 0;
+  // cumulative speed: emulated frames vs. wall seconds since the guest started. This is the
+  // literal definition of "running at hardware rate" and, unlike a 1s window, it has no
+  // quantisation floor — 0.99x over a minute is a real 0.6s of lost game time.
+  var _spanFrame0 = -1, _spanT0 = 0;
 
   var hudEl = null;
   function hud(txt) {
@@ -4498,16 +4677,35 @@
     Atomics.store(paceI32, 8, 0); Atomics.store(paceI32, 9, 0);
   });
 
+  // Credit grant = THE GUEST CLOCK. TARGET credits per wall-clock second, and nothing else in
+  // this file is allowed to touch emulated time. rAF only decides how often we top the pool up;
+  // the amount is integrated against wall time, so an irregular rAF cadence does not change the
+  // speed — but an unbounded one would (see the 1.000x integrity note above), hence the clamps.
   function grantLoop(t) {
     if (TARGET > 0 && rw) {
       if (!lastT) lastT = t;
-      credAcc += (t - lastT) * TARGET / 1000;
+      var dt = t - lastT;
       lastT = t;
+      if (dt > MAX_DT_MS) dt = MAX_DT_MS;          // a stall is dropped, never repaid as a sprint
+      credAcc += dt * TARGET / 1000;
       var grant = Math.floor(credAcc);
-      if (grant > 0) { credAcc -= grant; Atomics.add(paceI32, 0, grant); Atomics.notify(paceI32, 0); }
+      if (grant > 0) {
+        credAcc -= grant;
+        var pool = Atomics.load(paceI32, 0);
+        var room = MAX_BACKLOG - pool;             // never let the guest bank a fast-forward
+        if (grant > room) grant = room;
+        if (grant > 0) {
+          // The gate for the frame the worker is waiting on opens NOW iff the pool was empty.
+          // If it was already non-empty the worker never parked, so there is no idle to credit.
+          if (pool <= 0) _gateOpenAt = t;
+          Atomics.add(paceI32, 0, grant);
+          Atomics.notify(paceI32, 0);
+        }
+      }
     }
     requestAnimationFrame(grantLoop);
   }
+  function renderBusyAt(now) { return _renderBusyMs + (_renderBusyFrom ? now - _renderBusyFrom : 0); }
 
   // Prefetch the disc IMMEDIATELY (overlapped with the dolphin boot) so the takeover can
   // fire the moment the renderer is up — the JIT scaffolding boot should never be visible
@@ -4535,11 +4733,49 @@
   prefetchDisc();
 
   var hudStatus = '';   // transient state (taking over / failed) shown until frames flow
+  var _hudT = 0;
   setInterval(function () {
+    var now = performance.now();
+    var win = _hudT ? (now - _hudT) / 1000 : 0;
+    _hudT = now;
     var d = framesSeen - lastN, dr = rendered - lastRendered;
     lastN = framesSeen; lastRendered = rendered;
     if (framesSeen === 0 && hudStatus) { hud(hudStatus); return; }
-    hud('recomp f' + framesSeen + ' ' + d + ' game-fps / ' + dr + ' render-fps' + (TARGET === 0 ? ' (uncapped)' : ' / target ' + TARGET));
+
+    // ---- knob 1: GUEST SPEED. Measured, not asserted. -------------------------------------
+    // Under the recomp the clock is frame-driven — one pumped frame is exactly 1/GUEST_HZ of
+    // emulated time — so delivered frames / wall seconds IS the speed multiplier. Cumulative
+    // (not the 1s window) because that is the actual definition of keeping pace with hardware.
+    if (_spanFrame0 < 0 && framesSeen > 0) { _spanFrame0 = framesSeen; _spanT0 = now; }
+    var span = (now - _spanT0) / 1000;
+    var speed = (_spanFrame0 >= 0 && span > 1) ? (framesSeen - _spanFrame0) / span / GUEST_HZ : null;
+    var reqX = TARGET === 0 ? Infinity : TARGET / GUEST_HZ;
+
+    // ---- knob 2: CAPABILITY. Measured busy time, no duplicated frames anywhere. ------------
+    var guestCap = _guestBusyN > 0 ? 1000 / (_guestBusyMs / _guestBusyN) : null;
+    var rBusy = renderBusyAt(now) - _renderBusyMsMark;
+    var renderCap = (_renderedWin > 0 && rBusy > 1) ? _renderedWin * 1000 / rBusy : null;
+    _renderBusyMsMark = renderBusyAt(now); _renderedWin = 0;
+    _guestBusyMs = 0; _guestBusyN = 0;
+    var cap = (guestCap === null) ? renderCap : (renderCap === null ? guestCap : Math.min(guestCap, renderCap));
+
+    // separate <script> from the main IIFE — if that block ever fails to evaluate, the HUD
+    // below must still work rather than taking the whole pacing interval down with it.
+    if (window.__gcRate) window.__gcRate.set({
+      path: 'recomp', guestHz: GUEST_HZ, speed: speed, speedReq: reqX, capFps: cap,
+      starved: speed !== null && reqX !== Infinity && speed < reqX * 0.98,
+      capNote: 'recomp: min(guest ' + (guestCap === null ? '--' : guestCap.toFixed(0)) +
+               '/s, render ' + (renderCap === null ? '--' : renderCap.toFixed(0)) + '/s) from measured busy time',
+      extra: 'guest     = ' + (d / (win || 1)).toFixed(1) + ' frames/s produced by the recomp (emulated VI rate)\n' +
+             'render    = ' + (dr / (win || 1)).toFixed(1) + ' frames/s acked by the renderer; ' + dropped + ' skipped for backpressure\n' +
+             'credits   = ' + TARGET + '/s granted, backlog ' + Atomics.load(paceI32, 0) + '/' + MAX_BACKLOG + '\n' +
+             'NOTE: cap covers the guest + render stages. The page\'s own relay/copy is not in it,\n' +
+             '      so ?fps=0 (uncapped freerun) is the ground-truth cross-check for this figure.\n'
+    });
+    // #recompFps carries only recomp-SPECIFIC state now. The rates live in one place (#fps) so
+    // there is exactly one FPS-shaped number on screen and it means exactly one thing.
+    hud('recomp f' + framesSeen + '  ·  guest ' + (d / (win || 1)).toFixed(0) + '/s  ·  render ' +
+        (dr / (win || 1)).toFixed(0) + '/s' + (TARGET === 0 ? '  ·  UNCAPPED (speed test)' : ''));
   }, 1000);
 
   async function startRecomp() {
@@ -4563,17 +4799,31 @@
     bootSent = false;   // savestate routing stays off until this worker has the game
     var origOnWorkerMsg = dolphin_worker.onmessage;
     dolphin_worker.onmessage = function (e) {
-      if (e.data && e.data.cmd === 'recompAck') { rendered++; outstanding--; return; }
+      if (e.data && e.data.cmd === 'recompAck') {
+        rendered++; outstanding--; _renderedWin++;
+        // render stage went idle: close the busy segment (see capability accounting above).
+        if (outstanding <= 0 && _renderBusyFrom) { _renderBusyMs += performance.now() - _renderBusyFrom; _renderBusyFrom = 0; }
+        return;
+      }
       if (origOnWorkerMsg) origOnWorkerMsg(e);
     };
     rw.onmessage = function (e) {
       if (e.data.cmd === 'frame') {
         framesSeen = e.data.n;
+        // [capability accounting] This message marks the END of the guest's production of this
+        // frame. The worker was parked from its previous post until its gating credit existed,
+        // so subtract that deliberate idle: what remains is real guest CPU time for one frame.
+        var _fnow = performance.now();
+        if (_lastFrameAt) {
+          var _start = _gateOpenAt > _lastFrameAt ? _gateOpenAt : _lastFrameAt;
+          _guestBusyMs += _fnow - _start; _guestBusyN++;
+        }
+        _lastFrameAt = _fnow; _gateOpenAt = 0;
         // backpressure: every frame's RAM state (regions/mem1) must land, but when the
         // renderer is behind, mark the frame skipRender — the dolphin side applies state
         // and skips the draw, so presents always sample the freshest game state.
         var skipRender = outstanding >= 2;
-        if (skipRender) dropped++; else outstanding++;
+        if (skipRender) dropped++; else { if (outstanding === 0) _renderBusyFrom = _fnow; outstanding++; }
         var tr = [e.data.fifo].concat(e.data.regions.map(function (r) { return r.bytes; }));
         if (e.data.mem1) tr.push(e.data.mem1);
         dolphin_worker.postMessage({ cmd: 'recompFrame', n: e.data.n, fifo: e.data.fifo,
@@ -4597,6 +4847,12 @@
         // "state loads but the picture never changes" failure, from the page side.
         outstanding = 0; dropped = 0; credAcc = 0; lastT = 0;
         framesSeen = e.data.n; lastN = e.data.n; lastRendered = rendered;
+        // [rate-model] the restored timeline jumps the frame index, so every rate/capability
+        // accumulator that spans frames is meaningless across the seam — restart them here or
+        // the cumulative speed reads a huge bogus multiplier for the rest of the session.
+        _spanFrame0 = -1; _spanT0 = 0; _lastFrameAt = 0; _gateOpenAt = 0;
+        _guestBusyMs = 0; _guestBusyN = 0; _renderedWin = 0;
+        _renderBusyFrom = 0; _renderBusyMs = 0; _renderBusyMsMark = 0;
         stSay('worker restored at frame ' + e.data.n + '; renderer resync forced');
         if (pendingStateLoad) pendingStateLoad({ ok: true, n: e.data.n });
       } else if (e.data.cmd === 'stateError') {
