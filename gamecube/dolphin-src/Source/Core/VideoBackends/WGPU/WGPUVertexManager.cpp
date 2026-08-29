@@ -220,6 +220,11 @@ bool WGPUVertexManager::Initialize()
     (int)(m_vertex_buffer != nullptr), (int)(m_index_buffer != nullptr),
     (int)(m_uniform_buffer != nullptr));
 
+  // Seed both constant blocks once so the dirty-gated UploadUniforms can never let the first draw
+  // sample an unwritten uniform buffer / stale dynamic offsets. Mirrors VKVertexManager::Initialize
+  // (VKVertexManager.cpp:119, "Bind the buffers to all the known spots even if it's not used").
+  UploadAllConstants();
+
   return true;
 }
 
@@ -294,35 +299,33 @@ void WGPUVertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 nu
   s_last_vtx_byte = static_cast<u32>(m_vertex_offset);
   s_last_idx_byte = static_cast<u32>(m_index_offset);
 
-  // [sab-diag PM31 TEMP] vertex-content probe: vertex0 dword0 @0x026B3580,
-  // XOR of first 16 dwords @0x026B3584, (num_vertices<<16)|stride @0x026B3588.
+  // [sab-diag PM31] vertex-content probe (probe field `vtx`): vertex0 dword0 @0x026B3580,
+  // (num_vertices<<16)|stride @0x026B3588. Two plain stores — kept unconditional.
+  // The 16-dword XOR checksum @0x026B3584 is a per-batch LOOP, so it is gated behind
+  // BEMENTAL_WGPU_PROF (CLAUDE.md gate #8: diagnostics must not accumulate). Rebuild with
+  // -DBEMENTAL_WGPU_PROF to restore the middle field of `vtx`.
+  // [sab-diag PM33] the vertex0 xyz mirror @0x026B35B4/B8/BC was REMOVED: no reader anywhere in
+  // the tree (grep 2026-08-28: only a historical mention in gamecube/docs/native-exact-dualcore/
+  // TASKS.md:1283), and 0x35B4 duplicated 0x3580 verbatim.
   if (vertex_data_size >= 4)
   {
     const u32* vw = reinterpret_cast<const u32*>(m_vertex_cpu.data());
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3580u)) = vw[0];
+#ifdef BEMENTAL_WGPU_PROF
     u32 ck = 0;
     const u32 nw = vertex_data_size >= 64 ? 16u : (u32)(vertex_data_size / 4);
     for (u32 i = 0; i < nw; i++) ck ^= vw[i] + i;
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3584u)) = ck;
+#endif
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3588u)) =
         (num_vertices << 16) | (vertex_stride & 0xFFFFu);
-    // [sab-diag PM33 TEMP] vertex0 raw position xyz (pos is at offset 0 of the
-    // vertex per the decl) @0x026B35B4/B8/BC.
-    if (vertex_data_size >= 12)
-    {
-      const float* vf = reinterpret_cast<const float*>(m_vertex_cpu.data());
-      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35B4u)) = vw[0];
-      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35B8u)) = vw[1];
-      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35BCu)) = vw[2];
-      (void)vf;
-    }
   }
   if (queue && m_vertex_buffer && vertex_data_size > 0)
     wgpuQueueWriteBuffer(queue, m_vertex_buffer, m_vertex_offset, m_vertex_cpu.data(),
                          static_cast<size_t>(vertex_write_size));
-  // [sab-diag PM35 TEMP] first 4 indices (two u16 pairs) @0x026B35E8/EC +
-  // num_indices @0x35F0 — all-zero indices = degenerate triangles = the
-  // zero-fragment mechanism the vertex probe couldn't see.
+  // [sab-diag PM35] first 4 indices (two u16 pairs) @0x026B35E8/EC + num_indices @0x35F0 —
+  // all-zero indices = degenerate triangles = the zero-fragment mechanism the vertex probe
+  // couldn't see. Three plain stores, no loop; read by dolphin_render_probe.js:717 (`idx`).
   if (index_data_size >= 8)
   {
     const u32* iw = reinterpret_cast<const u32*>(m_index_cpu.data());
@@ -340,8 +343,35 @@ void WGPUVertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 nu
 
 void WGPUVertexManager::UploadUniforms()
 {
-  // B2: always re-upload both VS + PS constant blocks (simple, correctness-first). A dirty-only
-  // fast path can come later; for now feed fresh constants every batch.
+  // Dirty-only upload, matching the Vulkan backend
+  // (VKVertexManager.cpp:206 `if (!vertex_shader_manager.dirty || !ReserveConstantStorage()) return;`).
+  // Both blocks share ONE 256-aligned rolling allocation here, so upload BOTH whenever EITHER is
+  // dirty: conservative, and it can never hand a draw a stale block.
+  //
+  // Skipping is safe: m_vs_uniform_offset / m_ps_uniform_offset keep pointing at the previous
+  // upload's bytes, and the uniform ring only advances inside UploadAllConstants — a skipped batch
+  // therefore cannot overwrite them. DrawIndexed re-passes both as dynamic offsets on every draw
+  // (WGPUGfx.cpp:2008), and utility draws stream through a SEPARATE buffer (m_util_uniforms,
+  // WGPUGfx.cpp:751), so nothing else writes into m_uniform_buffer behind our back.
+  //
+  // Flag provenance (all verified against the live tree):
+  //   VertexShaderManager::Init sets dirty=true (VertexShaderManager.cpp:38); DoState sets it on
+  //   read (VertexShaderManager.cpp:490); SetConstants sets it on every mutating branch
+  //   (:176,187,201,212,273,285,300,317,334,390,429,441,454); SetVertexFormat mutates via
+  //   UpdateValue/UpdateOffset(&dirty,...) (VertexShaderManager.h:42-78).
+  //   PixelShaderManager::Init -> Dirty() sets dirty=true (PixelShaderManager.cpp:81); DoState
+  //   calls Dirty() on read (:543); every Set*/SetConstants mutation sets it (48 sites).
+  //   External writers: VertexManagerBase::CalculateNormals sets vertex_shader_manager.dirty=true
+  //   after each cached_tangent/binormal/normal write (VertexManagerBase.cpp:779,784,794).
+  // KNOWN HOLE (upstream, shared with Vulkan/D3D12/Metal): VertexManagerBase.cpp:556 writes
+  // pixel_shader_manager.constants.time_ms WITHOUT setting dirty. It is gated on
+  // g_ActiveConfig.bGraphicMods (VideoConfig.h:277 defaults false, VideoConfig.cpp:194 =
+  // GFX_MODS_ENABLE), so it is inert unless graphics mods are turned on — and when they are, the
+  // native Vulkan path is stale in exactly the same way.
+  auto& system = Core::System::GetInstance();
+  if (!system.GetVertexShaderManager().dirty && !system.GetPixelShaderManager().dirty)
+    return;
+
   UploadAllConstants();
 }
 
@@ -379,22 +409,28 @@ void WGPUVertexManager::UploadAllConstants()
                        static_cast<size_t>(ps_size));
   wgpuQueueWriteBuffer(queue, m_uniform_buffer, vs_off, &vertex_shader_manager.constants,
                        static_cast<size_t>(vs_size));
-  // [sab-diag PM30 TEMP] uniform-content checksums: XOR-fold the blocks so the
-  // probe can tell zeros from real TEV/XF state. ps @0x026B3558, vs @0x026B355C.
   {
-    const u32* pw = reinterpret_cast<const u32*>(&pixel_shader_manager.constants);
     const u32* vw = reinterpret_cast<const u32*>(&vertex_shader_manager.constants);
+    // [sab-diag PM30] uniform-content checksums (probe field `uniCk`): ps @0x026B3558,
+    // vs @0x026B355C. GATED behind BEMENTAL_WGPU_PROF — these two XOR folds walked
+    // (ps_size + vs_size) / 4 words on EVERY batch (~1400 at the block sizes declared in
+    // VideoCommon/ConstantManager.h) and were the bulk of the 2.56% self time attributed to
+    // UploadUniforms in the PSO render-worker profile (/tmp/worker_2.cpuprofile, ROM_IDX=2).
+    // Rebuild with -DBEMENTAL_WGPU_PROF to restore `uniCk`.
+#ifdef BEMENTAL_WGPU_PROF
+    const u32* pw = reinterpret_cast<const u32*>(&pixel_shader_manager.constants);
     u32 pcs = 0, vcs = 0;
     for (size_t i = 0; i < ps_size / 4; i++) pcs ^= pw[i] + (u32)i;
     for (size_t i = 0; i < vs_size / 4; i++) vcs ^= vw[i] + (u32)i;
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3558u)) = pcs;
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B355Cu)) = vcs;
-    // [sab-diag PM32 TEMP] cproj row0[0] and row0[3] (byte offsets 128, 140):
-    // a zeroed projection -> o.pos = 0 for every vertex -> zero fragments.
+#endif
+    // [sab-diag PM32] cproj row0[0] and row0[3] (byte offsets 128, 140): a zeroed projection
+    // -> o.pos = 0 for every vertex -> zero fragments. Plus cpnmtx row0[0] (offset 32) + row0
+    // XOR — the position matrix applied BEFORE projection. Four loads / four stores, no loop:
+    // kept unconditional (read by dolphin_render_probe.js:701-703 as `proj` / `pn`).
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B358Cu)) = vw[128 / 4];
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3590u)) = vw[140 / 4];
-    // [sab-diag PM32 TEMP] cpnmtx row0[0] (offset 32) + row0 XOR — the position
-    // matrix applied BEFORE projection; zeros here collapse every vertex.
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3594u)) = vw[32 / 4];
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3598u)) =
         vw[8] ^ vw[9] ^ vw[10] ^ vw[11];

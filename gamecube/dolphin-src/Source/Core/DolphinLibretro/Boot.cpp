@@ -404,8 +404,42 @@ bool retro_load_game(const struct retro_game_info* game)
       )
     )
   );
-  // [xfb-band FIX PM45e 2026-07-31] def 128 -> 0 (Safe/full hash) = native Dolphin's
-  // default; sampled hashing left stale THP plane textures -> TEV green band.
+  // [xfb-band FIX PM45e 2026-07-31] def 128 -> 0 (Safe/full hash). Sampled hashing left
+  // stale THP plane textures -> TEV green band. The 0 is load-bearing and STAYS.
+  //
+  // [texcache-samples CORRECTION 2026-08-28] The original comment here also claimed 0 was
+  // "native Dolphin's default". That is FALSE and the same false claim is repeated at
+  // DolphinLibretro/Common/Options.cpp:819-820 (not edited - not owned by this change).
+  // Native Dolphin's default is 128:
+  //   Core/Config/GraphicsSettings.cpp:37-38
+  //     const Info<int> GFX_SAFE_TEXTURE_CACHE_COLOR_SAMPLES{
+  //         {System::GFX, "Settings", "SafeTextureCacheColorSamples"}, 128};
+  // So this line is a deliberate DEVIATION from native (Safe/full hash), not a match to it.
+  // Correcting the record matters because the justification for eating the cost was partly
+  // "native does it too", and native does not.
+  //
+  // What it costs: on a PSO JIT-path CPU profile (/tmp/worker_2.cpuprofile, ROM_IDX=2,
+  // 240,000 samples = 48s of render-worker CPU) the texture hash is 39.45% self time, of
+  // which 36.69% arrives via TextureCacheBase::LoadImpl <- Load <- VertexManagerBase::Flush
+  // <- LoadBPReg <- RunFifo. Same profile: TexDecoder_Decode = 0.001% (2 samples). The build
+  // spends ~38.5% of its render worker hashing textures to avoid a decode costing 0.001%.
+  //
+  // Why the fix is NOT to just set 128 here: verified 2026-08-28 that the THP scar is real
+  // and is NOT covered by the existing escape hatch. TCacheEntry::should_force_safe_hashing
+  // (TextureCacheBase.h:136) is assigned ONLY at TextureCacheBase.cpp:2330, and only for
+  // is_xfb_copy EFB->XFB copies. MP4's movie planes are not XFB copies - they are ordinary
+  // main-RAM textures bound to TEV stages: ~/gc_refs/marioparty4/src/game/THPDraw.c:90-98,
+  // THPGXYuv2RgbDraw() does GXInitTexObj(&sp54, yImage, w, h, GX_TF_I8, ...) +
+  // GXLoadTexObj(&sp54, GX_TEXMAP0) for Y, and the same for U/V at TEXMAP1/TEXMAP2. So they
+  // enter through the LoadImpl -> GetTexture(iSafeTextureCache_ColorSamples, ...) path at
+  // TextureCacheBase.cpp:1291 with force-safe FALSE, and a sampled hash that misses the
+  // changed rows really can hand the game a stale chroma plane. The green band is that stale
+  // U/V plane run through the game's own 5-stage TEV YUV->RGB matrix (THPDraw.c:42-83).
+  //
+  // The sample count is therefore runtime-overridable instead of changed: see
+  // TextureCacheSafetySamples() in VideoCommon/TextureCacheBase.cpp (SAB scratch cell
+  // 0x026B3914, ?bjit_texcache_samples). Cell 0 = browser-zeroed = fall through to this
+  // config value = full hash = exactly today's behavior. Nothing below changes by default.
   Config::SetBase(Config::GFX_SAFE_TEXTURE_CACHE_COLOR_SAMPLES,
                  Libretro::GetOption<int>(gfx_settings::TEXTURE_CACHE_ACCURACY, 0));
   // [xfb-band PM45g 2026-07-31 — MEASURED, CADENCE-INCOMPATIBLE, OFF] MAIN_SYNC_GPU

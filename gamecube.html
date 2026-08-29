@@ -294,9 +294,39 @@
       + ' ctrl @0x' + d.ctrlOff.toString(16) + ' desc @0x' + d.descOff.toString(16));
   };
   var padStatus1, vram_ptr; var dolphin_worker = null; var ppc_worker = null; var states_arrs = []; var audioMuted = false; var pendingSaveResolve = null; var pendingLoadResolve = null;
-  function getAudioCtx() { try { return (Module && Module.preCreatedAudioContext) || (Module && Module.SDL && Module.SDL.audioContext) || null; } catch (e) { return null; } }
-  function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } }
+  // [audio fix 2026-08-28] getAudioCtx() MUST return the context that actually plays sound:
+  // GcAudio.ctx, the one initGcAudio() creates at the core's reported rate and connects the
+  // AudioWorklet + destination to. It used to return Module.preCreatedAudioContext — a bare
+  // `new AudioContext()` created inside the Start click with no worklet and no source node.
+  // Consequence: resumeAudio(), resetAudio(), the "Reset Audio" button and the [audio-diag]
+  // `ctx=` field all operated on a context wired to nothing, which is exactly how the diag could
+  // print "ctx=running" while the page was completely silent. GcAudio is `var`-hoisted from
+  // further down this same <script>, so the reference is safe even before that line executes.
+  function getAudioCtx() { try { return (typeof GcAudio !== 'undefined' && GcAudio && GcAudio.ctx) || (Module && Module.preCreatedAudioContext) || (Module && Module.SDL && Module.SDL.audioContext) || null; } catch (e) { return null; } }
+  // [audio fix 2026-08-28] Autoplay unlock. An AudioContext created outside a user gesture starts
+  // 'suspended', and resume() only counts when it is called SYNCHRONOUSLY from inside a real
+  // gesture handler — a resume() issued from a worker postMessage handler does not unlock on iOS
+  // and is not guaranteed on Chrome. This handler is that path, so it must be attached to the
+  // gesture types the page actually produces: the mobile shell drives everything off
+  // pointerdown + preventDefault() (see mobileSplashStart / wireMobileControls), which suppresses
+  // the follow-up 'click' entirely — so a click-only listener never fired on mobile at all.
+  // iOS also parks contexts in the Safari-only 'interrupted' state, hence `!== 'running'`.
+  function resumeAudio(ev) {
+    var isGesture = !ev || ev.type !== 'visibilitychange';
+    if (isGesture) {
+      // This IS a real gesture. Record sticky activation and, if the core has already reported its
+      // rate but the worklet never came up, retry init from here — the best possible moment.
+      try {
+        window._gcAudioGestured = true;
+        if (window._gcAudioRate && typeof GcAudio !== 'undefined' && GcAudio && !GcAudio.inited && !GcAudio.initing) initGcAudio();
+      } catch (e) {}
+    }
+    if (audioMuted) return;
+    var ctx = getAudioCtx();
+    if (ctx && ctx.state !== 'running' && ctx.resume) { ctx.resume().catch(() => {}); }
+  }
   document.addEventListener('click', resumeAudio); document.addEventListener('keydown', resumeAudio); document.addEventListener('visibilitychange', resumeAudio);
+  document.addEventListener('pointerdown', resumeAudio, true); document.addEventListener('touchend', resumeAudio, true);
   window.var_setup = function () {
     // Guard against re-entry — Emscripten may call var_setup more than
     // once during Module init under PROXY_TO_PTHREAD; without the guard
@@ -3434,8 +3464,29 @@
       var _AC = window.AudioContext || window.webkitAudioContext;
       var _rate = (window._gcAudioRate | 0) || 48000;
       var ctx;
-      try { ctx = new _AC({ sampleRate: _rate }); } catch (e) { ctx = new _AC(); }
-      if (ctx.state === 'suspended' && ctx.resume) ctx.resume().catch(function () {});
+      // [audio fix 2026-08-28] This catch used to silently fall back to a default-rate context
+      // while the worklet kept reading the ring 1:1 — which plays ~1.5x fast (48000/32029) AND
+      // starves the ring permanently, because the sink drains 48000 samples/s from a source that
+      // only produces 32029. Never fail silently here: shout, and hand the real rates to the
+      // worklet so it can resample instead of running the ring at the wrong speed.
+      try {
+        ctx = new _AC({ sampleRate: _rate });
+      } catch (e0) {
+        ctx = new _AC();
+        console.error('[audio] FATAL-ish: AudioContext rejected sampleRate=' + _rate + ' (' + e0
+          + '). Falling back to the browser default rate ' + ctx.sampleRate
+          + ' — the worklet will resample ' + _rate + '->' + ctx.sampleRate + '.');
+        pageLog('[audio] WARNING: browser refused sampleRate=' + _rate + ' Hz, using '
+          + ctx.sampleRate + ' Hz + resampling');
+        try { toast('Audio: browser refused ' + _rate + ' Hz, resampling', true); } catch (e1) {}
+      }
+      if (ctx.sampleRate !== _rate) {
+        // Also fires when the ctor "succeeded" but the browser clamped/ignored the requested rate.
+        console.error('[audio] rate mismatch: core=' + _rate + ' Hz, AudioContext=' + ctx.sampleRate
+          + ' Hz — worklet will resample (ratio ' + (_rate / ctx.sampleRate).toFixed(4) + ')');
+        pageLog('[audio] rate mismatch core=' + _rate + ' ctx=' + ctx.sampleRate + ' -> resampling');
+      }
+      if (ctx.state !== 'running' && ctx.resume) ctx.resume().catch(function () {});
       // Ring buffer SAB: 4 i32 header + 4096 i16 samples.
       var RING_SAMPLES = 4096 * 2;  // 4096 frames * 2 channels
       var sab = new SharedArrayBuffer(16 + RING_SAMPLES * 2);
@@ -3446,7 +3497,10 @@
       await ctx.audioWorklet.addModule('/gamecube/audio-worklet.js');
       var node = new AudioWorkletNode(ctx, 'gc-audio-processor', {
         outputChannelCount: [2],
-        processorOptions: { sab: sab, byteOffset: 0 },
+        // [audio fix 2026-08-28] srcRate/dstRate let the worklet resample when the browser would
+        // not give us the core's exact rate. When they match (the normal case) the worklet takes
+        // its original 1:1 fast path, byte for byte.
+        processorOptions: { sab: sab, byteOffset: 0, srcRate: _rate, dstRate: ctx.sampleRate },
       });
       node.port.onmessage = function (e) {
         if (e.data && e.data.cmd === 'stats') {
@@ -3462,9 +3516,18 @@
       GcAudio.ringCap = RING_SAMPLES;
       GcAudio.inited = true;
       window._gcAudioPushSamples = pushAudioSamples;
-      pageLog('[audio] AudioWorklet ready (sampleRate=' + ctx.sampleRate + ')');
+      pageLog('[audio] AudioWorklet ready (sampleRate=' + ctx.sampleRate + ', state=' + ctx.state + ')');
+      if (ctx.state !== 'running') {
+        pageLog('[audio] AudioContext is ' + ctx.state + ' — click/tap the page to start sound');
+      }
     } catch (e) {
-      pageLog('[audio] AudioWorklet init failed: ' + e + ' — using legacy Module._feedAudio');
+      // [audio fix 2026-08-28] There is NO working fallback. Module._feedAudio is a no-op stub
+      // (EmscriptenMain.cpp: `void feedAudio(int,int) { (void)buf; (void)len; }`) that discards
+      // every sample and returns cleanly. If we land here the page is silent, full stop — say so.
+      console.error('[audio] AudioWorklet init FAILED — THE PAGE WILL BE SILENT. There is no'
+        + ' fallback sink (Module._feedAudio is a no-op stub that discards samples). Cause: ' + e);
+      pageLog('[audio] ERROR: AudioWorklet init failed (' + e + ') — NO SOUND, no fallback exists');
+      try { toast('Audio failed to start — no sound', true); } catch (e2) {}
     } finally {
       GcAudio.initing = false;
     }
@@ -3473,17 +3536,21 @@
   // AudioContext is created later at the core's reported rate (the 'audioRate' worker message), because
   // the rate isn't known until retro_load_game runs — a few seconds after the Start click. Creating it
   // on the raw gesture used the wrong default rate (48000/44100 vs the game's 32029) -> pitch/speed off.
+  // [audio fix 2026-08-28] 'click' and 'touchend' added to the list. The old list
+  // (pointerdown/keydown/touchstart) misses any activation that produces only a click — notably
+  // HTMLElement.click(), which is what gamecube/tools/dolphin_render_probe.js:306 does
+  // (`const b = document.getElementById('btnStart'); if (b) b.click();`). A synthetic .click()
+  // dispatches ONLY a click event, so _gcAudioGestured stayed false, initGcAudio() never ran,
+  // _gcAudioPushSamples was never set, and every probe reported `sink=legacy` — i.e. every sample
+  // routed to the no-op discard stub. startEmulator() now also sets the flag directly.
   (function () {
+    var TYPES = ['pointerdown', 'keydown', 'touchstart', 'touchend', 'click'];
     function once() {
-      window.removeEventListener('pointerdown', once, true);
-      window.removeEventListener('keydown', once, true);
-      window.removeEventListener('touchstart', once, true);
+      for (var i = 0; i < TYPES.length; ++i) window.removeEventListener(TYPES[i], once, true);
       window._gcAudioGestured = true;              // sticky activation recorded
       if (window._gcAudioRate) initGcAudio();      // rate already known -> safe to create the ctx now
     }
-    window.addEventListener('pointerdown', once, true);
-    window.addEventListener('keydown', once, true);
-    window.addEventListener('touchstart', once, true);
+    for (var i = 0; i < TYPES.length; ++i) window.addEventListener(TYPES[i], once, true);
   })();
   function onWorkerMsg(e) {
     var data = e.data;
@@ -3501,7 +3568,20 @@
         // The Start-button click already recorded a gesture (sticky activation), so the AudioContext
         // can be created + resumed here at the now-known correct rate. This fires before the first
         // 'audio' message, so the ctx has the right rate the first time (no re-create needed).
-        if (window._gcAudioGestured && !GcAudio.inited && !GcAudio.initing) initGcAudio();
+        // [audio fix 2026-08-28] Also accept the UA's own sticky-activation record. If the page has
+        // ever been activated, navigator.userActivation.hasBeenActive is true even when our own
+        // listeners missed the event — this is the belt to _gcAudioGestured's braces. And if there
+        // genuinely was no activation yet, say so loudly instead of silently going quiet forever:
+        // the next real gesture will re-enter via resumeAudio().
+        var _hasAct = !!(navigator.userActivation && navigator.userActivation.hasBeenActive);
+        if ((window._gcAudioGestured || _hasAct) && !GcAudio.inited && !GcAudio.initing) {
+          initGcAudio();
+        } else if (!GcAudio.inited && !GcAudio.initing) {
+          console.warn('[audio] core reported its rate but no user gesture is on record'
+            + ' (_gcAudioGestured=' + !!window._gcAudioGestured + ' hasBeenActive=' + _hasAct + ')'
+            + ' — AudioWorklet NOT started; the next click/tap will start it.');
+          pageLog('[audio] waiting for a click/tap to start sound');
+        }
         break;
       }
       case 'audio': {
@@ -3512,28 +3592,49 @@
         // EmscriptenWorker.cpp audio_sample_batch_cb) — the old accumulator counted
         // bytes as samples, printing a phantom "69121 samples/s vs 32000" (4x
         // inflated). Count FRAMES and compare against the ~48kHz output rate.
+        // [audio-diag reference FIX 2026-08-28] The printed reference used to read
+        // "output ~48000", which is simply wrong: the core reports its rate via 'audioRate' and
+        // for these games it is 32029 Hz. A sustained ~29.6K frames/s was therefore triaged as
+        // "core at 62% of real time" when it is ~93-100% of the CORRECT 32029 target. Compare
+        // against the rate the core actually reported.
         window._audN = (window._audN | 0) + ((data.len | 0) >> 2);
         var _anow = performance.now();
+        // [audio fix 2026-08-28] 'legacy' was a lie. Module._feedAudio is
+        // `void feedAudio(int buf, int len) { (void)buf; (void)len; }` (EmscriptenMain.cpp) — it
+        // discards every sample and returns cleanly, and it was being handed a Uint8Array where
+        // the signature wants an int heap pointer. Label the state for what it is: DISCARDING.
+        var _sink = window._gcAudioPushSamples ? 'worklet' : 'DISCARDING(no-sink)';
         if (!window._audT0) { window._audT0 = _anow;
           console.log('[audio-diag] FIRST audio msg: bytes=' + data.len + ' muted=' + audioMuted
-            + ' sink=' + (window._gcAudioPushSamples ? 'worklet' : (Module._feedAudio ? 'legacy' : 'NONE')));
+            + ' sink=' + _sink + ' coreRate=' + (window._gcAudioRate | 0));
         }
         if (_anow - (window._audLog || 0) > 5000) {
           window._audLog = _anow;
           var _actx = getAudioCtx();
+          var _target = (window._gcAudioRate | 0) || 0;
           console.log('[audio-diag] ' + ((window._audN * 1000) / (_anow - window._audT0)).toFixed(0)
-            + ' frames/s (output ~48000; <48000 = core below real-time) muted=' + audioMuted
-            + ' sink=' + (window._gcAudioPushSamples ? 'worklet' : (Module._feedAudio ? 'legacy' : 'NONE'))
-            + ' ctx=' + (_actx ? _actx.state : 'null'));
+            + ' frames/s (core rate ' + (_target || '?')
+            + '; below that = core below real-time) muted=' + audioMuted
+            + ' sink=' + _sink
+            + ' ctx=' + (_actx ? _actx.state + '@' + _actx.sampleRate : 'null')
+            + (window._audDropped ? ' DROPPED=' + window._audDropped + ' frames' : ''));
         }
         if (audioMuted) break;
-        // Prefer AudioWorklet path (lock-free SAB ring buffer); fall back
-        // to legacy Module._feedAudio if the worklet hasn't been initialized
-        // yet (e.g., user hasn't gestured to start AudioContext).
+        // The AudioWorklet (lock-free SAB ring) is the ONLY real sink. There is no fallback:
+        // the old `else if (Module._feedAudio)` branch threw the samples away and the diag
+        // labelled that 'legacy' as though it had worked. Count and report the loss instead.
         if (window._gcAudioPushSamples) {
           window._gcAudioPushSamples(data.buf, data.len);
-        } else if (Module._feedAudio) {
-          Module._feedAudio(data.buf, data.len);
+        } else {
+          window._audDropped = (window._audDropped | 0) + ((data.len | 0) >> 2);
+          if (!window._audDropWarned) {
+            window._audDropWarned = true;
+            console.error('[audio] NO SINK — audio samples are being DISCARDED. The AudioWorklet'
+              + ' never initialized (gestured=' + !!window._gcAudioGestured
+              + ' rate=' + (window._gcAudioRate | 0) + ' inited=' + GcAudio.inited
+              + ' initing=' + GcAudio.initing + '). Click or tap the page to start it.');
+            pageLog('[audio] NO SOUND: samples are being discarded — click/tap the page');
+          }
         }
         break;
       }
@@ -3797,7 +3898,16 @@
         ? '[webgpu] adapter/device UNAVAILABLE — falling back to OGL/WebGL2 backend (WGPU would freeze boot)'
         : '[webgpu] adapter+device OK — using WGPU backend');
     }
-    var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; window.__romBase = pick.base; window.__romExt = pick.ext || '.iso'; SAVE_KEY = ROM_NAME + '.gcs'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /gamecube/dolphin_libretro/dolphin_libretro.js ...'); setStatus('Loading Dolphin libretro core...'); var s = document.createElement('script'); s.src = '/gamecube/dolphin_libretro/dolphin_libretro.js?v=' + Date.now(); document.body.appendChild(s); }
+    var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; window.__romBase = pick.base; window.__romExt = pick.ext || '.iso'; SAVE_KEY = ROM_NAME + '.gcs'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true;
+    // [audio fix 2026-08-28] Start is the one activation that ALWAYS happens, so record the
+    // gesture here directly rather than relying only on the window-level listeners (a synthetic
+    // HTMLElement.click(), e.g. the render probe, fires no pointerdown at all). If the core has
+    // somehow already reported its rate, start the real sink now. Module.preCreatedAudioContext
+    // is kept ONLY for Emscripten's SDL glue — it is NOT the context that plays game audio (that
+    // is GcAudio.ctx, built in initGcAudio at the core's rate with the worklet attached), and
+    // getAudioCtx() no longer returns it.
+    try { window._gcAudioGestured = true; if (window._gcAudioRate) initGcAudio(); } catch (e) {}
+    try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /gamecube/dolphin_libretro/dolphin_libretro.js ...'); setStatus('Loading Dolphin libretro core...'); var s = document.createElement('script'); s.src = '/gamecube/dolphin_libretro/dolphin_libretro.js?v=' + Date.now(); document.body.appendChild(s); }
   $('btnStart').addEventListener('click', startEmulator);
   const DB_NAME = 'GCWASMDB', STORE = 'GCWASMSTATES'; var SAVE_KEY = ROM_NAME + '.gcs';
   function openDB() { return new Promise((resolve, reject) => { var req = indexedDB.open(DB_NAME); req.onupgradeneeded = e => e.target.result.createObjectStore(STORE); req.onsuccess = e => resolve(e.target.result); req.onerror = () => reject(req.error); }); }
@@ -3895,7 +4005,20 @@
   // (so the node harness can write it to a file via exposeFunction). Save first.
   window.__probeExportGzB64 = async function () { try { var own = stateOwner(); var stored = own ? await own.getGz() : await idbGet(SAVE_KEY); if (!stored) return ''; var u8 = stored instanceof Uint8Array ? stored : new Uint8Array(stored); var bin = ''; for (var i = 0; i < u8.length; i++) bin += String.fromCharCode(u8[i]); return btoa(bin); } catch (e) { return ''; } };
   function toggleMute() { audioMuted = !audioMuted; var ctx = getAudioCtx(); if (ctx) { audioMuted ? ctx.suspend() : ctx.resume(); } $('btnMute').textContent = audioMuted ? '🔇 Unmute' : '🔊 Mute'; $('mMute').textContent = audioMuted ? 'Unmute' : 'Mute'; }
-  async function resetAudio() { var ctx = getAudioCtx(); if (!ctx) { toast('Audio not ready', true); return; } toast('Resetting audio…'); try { await ctx.suspend(); } catch (e) {} await new Promise(r => setTimeout(r, 150)); if (!audioMuted) { try { await ctx.resume(); } catch (e) {} } toast('Audio reset'); }
+  // [audio fix 2026-08-28] getAudioCtx() now returns the real GcAudio.ctx, so this finally does
+  // something. Also flush the SAB ring — a stalled/underrun ring keeps replaying stale PCM after
+  // the resume, which is what "Reset Audio" is for. If the worklet never came up, this click is
+  // itself a gesture, so try to bring it up rather than just toasting "not ready".
+  async function resetAudio() {
+    if (!GcAudio.inited && !GcAudio.initing && window._gcAudioRate) { window._gcAudioGestured = true; initGcAudio(); toast('Starting audio…'); return; }
+    var ctx = getAudioCtx(); if (!ctx) { toast('Audio not ready', true); return; }
+    toast('Resetting audio…');
+    try { await ctx.suspend(); } catch (e) {}
+    try { if (GcAudio.node) GcAudio.node.port.postMessage({ cmd: 'reset' }); } catch (e) {}
+    await new Promise(r => setTimeout(r, 150));
+    if (!audioMuted) { try { await ctx.resume(); } catch (e) {} }
+    toast('Audio reset');
+  }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasWrap'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
   $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnExport').addEventListener('click', exportState); $('btnImport').addEventListener('click', () => $('importFile').click()); $('importFile').addEventListener('change', (e) => { if (e.target.files && e.target.files[0]) importState(e.target.files[0]); e.target.value = ''; }); $('btnMute').addEventListener('click', toggleMute); $('btnResetAudio').addEventListener('click', resetAudio); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
   (function () { var o = $('controlsOverlay'), b = $('btnControls'), c = $('controlsClose'); if (!o || !b) return; b.addEventListener('click', function () { o.style.display = (o.style.display === 'flex') ? 'none' : 'flex'; }); if (c) c.addEventListener('click', function () { o.style.display = 'none'; }); o.addEventListener('click', function (e) { if (e.target === o) o.style.display = 'none'; }); })();

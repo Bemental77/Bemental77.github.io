@@ -129,7 +129,35 @@ if (typeof Module !== 'undefined') {
   };
 }
 
-var romChunks = [];
+// [rom-residency 2026-08-28] ROM staging. The old shape made THREE live full-size
+// copies of the disc image and peaked at ~2x ROM in the JS heap TWICE:
+//   (1) romChunks[] accumulated every chunk and was only released AFTER the whole
+//       concat loop finished  -> romChunks + total both live = 2x ROM,
+//   (2) FS.writeFile(path, total) with no opts took MEMFS's NON-owning branch
+//       (verified in the shipped glue: `else if(node.usedBytes===0&&position===0)
+//       {node.contents=buffer.slice(offset,offset+length)}`) -> total + slice both
+//       live = 2x ROM again.
+// Real sizes (gamecube/roms/): Mario Party 4 = 598,382,592 B (the DEFAULT ROM),
+// Sonic Adventure 2 Battle / PSO = 1,459,978,240 B each. So the old peak was
+// ~1.14 GiB for MP4 and ~2.72 GiB for SAB/PSO, ON TOP of the 512 MB wasm heap —
+// far past where mobile Safari kills the tab.
+//
+// Three changes below, in increasing order of how much they save:
+//   a) each chunk is released AS IT IS CONSUMED inside the concat loop, so the
+//      loop's live set is (bytes already copied) + (bytes not yet copied) ~= 1x
+//      ROM instead of a hard 2x,
+//   b) writeFile takes { canOwn: true } so MEMFS adopts the buffer via
+//      `buffer.subarray(...)` (zero copy) instead of `.slice(...)`,
+//   c) STREAMING path (romTotal): if the page pre-declares the size with a
+//      'romBegin' message, each chunk is copied straight into the single
+//      destination buffer on ARRIVAL and dropped immediately — chunks never
+//      accumulate at all, and each drop happens in its own task turn so the GC
+//      gets a real chance to reclaim between chunks. Peak = ROM + one chunk.
+// (c) is OPTIONAL and fully backward compatible: with no 'romBegin' the code
+// takes the (a)+(b) accumulate path exactly as before, just without the spikes.
+var romChunks = [];      // fallback accumulation (no 'romBegin' size hint)
+var romTotal = null;     // streaming destination allocated by 'romBegin'
+var romOff = 0;          // bytes streamed into romTotal so far
 var totalSize = 0;
 var bootStarted = false;
 var tickInterval = null;
@@ -469,20 +497,49 @@ function markFirstFrame() {
 async function bootIso(name, size) {
   if (bootStarted) return;
   bootStarted = true;
-  var total = new Uint8Array(size);
-  var off = 0;
-  for (var i = 0; i < romChunks.length; i++) {
-    var c = romChunks[i];
-    total.set(c, off);
-    off += c.byteLength;
+  var total;
+  if (romTotal && romChunks.length === 0 && romOff === size) {
+    // (c) streamed straight in — nothing to concat, nothing to release.
+    total = (romTotal.length === size) ? romTotal : romTotal.subarray(0, size);
+    romTotal = null;
+  } else {
+    total = new Uint8Array(size);
+    var off = 0;
+    if (romTotal) {
+      // 'romBegin' hint was short/long vs the authoritative romEnd size (the HEAD
+      // undercount case gamecube.html's romEnd comment describes) — fold what was
+      // streamed in as the first block, then finish from romChunks.
+      total.set(romTotal.subarray(0, Math.min(romOff, size)), 0);
+      off = Math.min(romOff, size);
+      romTotal = null;
+    }
+    for (var i = 0; i < romChunks.length; i++) {
+      var c = romChunks[i];
+      if (!c) continue;
+      if (off + c.byteLength > size) {
+        // romEnd's size is authoritative; the old code threw "RangeError: offset is
+        // out of bounds" here and killed boot. Log loudly instead of crashing.
+        postMessage({ cmd: 'print', txt: '[worker] ROM overrun at chunk ' + i + ': ' + (off + c.byteLength) + ' > ' + size + ' — truncating' });
+        break;
+      }
+      total.set(c, off);
+      off += c.byteLength;
+      romChunks[i] = null;   // (a) release each chunk AS IT IS CONSUMED, not after the loop
+    }
   }
   romChunks = null;
+  romOff = 0;
   try {
-    Module.FS.writeFile('/' + name, total);
+    // (b) canOwn:true -> MEMFS adopts this buffer via subarray(); without it the
+    // shipped glue takes the `node.contents=buffer.slice(...)` branch and briefly
+    // holds a SECOND full-size copy of the disc image.
+    Module.FS.writeFile('/' + name, total, { canOwn: true });
   } catch (e) {
     postMessage({ cmd: 'print', txt: '[worker] FS.writeFile failed: ' + e });
     return;
   }
+  // MEMFS now owns the buffer (node.contents is a view over it); dropping our own
+  // reference does NOT free it, it just stops us pinning a second root.
   total = null;
   // Force MMU emulation on via Dolphin.ini in MEMFS. Without translation, the
   // WASM JIT trampolines pass raw guest virtual addresses to the memory system,
@@ -662,10 +719,45 @@ self.onmessage = function (e) {
   // BOTH MP4 and PSO dumps while print/audio replies flow). Logs every
   // non-romChunk command arrival. Strip with the other diags per gate #8.
   switch (data.cmd) {
+    case 'romBegin':
+      // [rom-residency] OPTIONAL page->worker hint: the total ROM byte count, sent
+      // BEFORE the first romChunk. Lets each chunk be copied into its final home on
+      // arrival and dropped immediately, instead of piling up in romChunks[] until
+      // romEnd. Absent this message everything below falls back to the old
+      // accumulate-then-concat path (with the per-chunk release + canOwn fixes), so
+      // an un-patched page still works.
+      try {
+        var _rbSize = data.size >>> 0;
+        if (_rbSize > 0 && !romTotal && romChunks.length === 0) {
+          romTotal = new Uint8Array(_rbSize);
+          romOff = 0;
+          postMessage({ cmd: 'print', txt: '[worker] romBegin: streaming ' + _rbSize + ' bytes into one buffer' });
+        }
+      } catch (rbe) {
+        // OOM on the single allocation -> stay on the accumulate path.
+        romTotal = null;
+        postMessage({ cmd: 'print', txt: '[worker] romBegin alloc failed, falling back: ' + rbe });
+      }
+      break;
     case 'romChunk':
       if (data.buf && data.buf.byteLength) {
-        romChunks.push(new Uint8Array(data.buf));
-        totalSize += data.buf.byteLength;
+        var _rc = new Uint8Array(data.buf);
+        if (romTotal && romOff + _rc.length <= romTotal.length) {
+          romTotal.set(_rc, romOff);
+          romOff += _rc.length;
+          // _rc (and the transferred ArrayBuffer behind it) is unreachable at the end
+          // of this turn — the chunk never joins a long-lived array.
+        } else {
+          if (romTotal) {
+            // hint was too small (a HEAD 404 during CDN propagation undercounts it);
+            // abandon streaming and keep what we have as the first accumulated block.
+            romChunks.push(romTotal.subarray(0, romOff));
+            romTotal = null;
+          }
+          romChunks.push(_rc);
+        }
+        totalSize += _rc.length;
+        _rc = null;
       }
       break;
     case 'romEnd':

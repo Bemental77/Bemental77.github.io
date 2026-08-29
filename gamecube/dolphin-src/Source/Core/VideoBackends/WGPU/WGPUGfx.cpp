@@ -375,14 +375,10 @@ void WGPUGfx::SetAndClearFramebuffer(AbstractFramebuffer* framebuffer,
   att.loadOp = WGPULoadOp_Clear;
   att.storeOp = WGPUStoreOp_Store;
   att.clearValue = {color_value[0], color_value[1], color_value[2], color_value[3]};
-  // [red-clear EXPERIMENT PM29 — REVERT] force red + count clears @0x026B3554:
-  // canvas red => attachment writes land (bug = game pipelines: depth/blend/
-  // uniforms); still black => the written framebuffer isn't the read texture.
-#define BEM_RED_CLEAR 0
-#if BEM_RED_CLEAR
-  att.clearValue = {1.0, 0.0, 0.0, 1.0};
-#endif
-  ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3554u));
+  // [red-clear EXPERIMENT PM29] REMOVED 2026-08-28: the dead `#define BEM_RED_CLEAR 0` force-red
+  // override and its clear counter @0x026B3554. Nothing reads 0x3554 — grep across the tree found
+  // it only in gamecube/docs/native-exact-dualcore/TASKS.md:1424 (a historical note), not in
+  // dolphin_render_probe.js or gamecube.html.
 
   WGPURenderPassDescriptor rp = {};
   rp.colorAttachmentCount = 1;
@@ -1871,12 +1867,22 @@ void WGPUGfx::DrawIndexed(WGPUBuffer vertex_buffer, WGPUBuffer index_buffer,
                           WGPUBuffer uniform_buffer, u32 vs_uniform_offset, u32 ps_uniform_offset,
                           u32 num_indices, u32 base_index, u32 base_vertex)
 {
-  // [sab-diag PM30 TEMP] DrawIndexed entries @0x026B3560, null-pipeline bails
-  // @0x026B3564, other bails @0x026B3568, encoder draws executed @0x026B356C.
+  // [sab-diag PM30] DrawIndexed entries @0x026B3560, null-pipeline bails @0x026B3564,
+  // other bails @0x026B3568, encoder draws executed @0x026B356C. Plain increments; read by
+  // dolphin_render_probe.js:692 (`drawPath`) — kept unconditional.
   ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3560u));
-  // [thread-id PM33 TEMP] draw thread @0x026B35A4.
-  *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35A4u)) =
-      static_cast<u32>(reinterpret_cast<uintptr_t>(pthread_self()));
+  // [thread-id PM33] draw thread @0x026B35A4, read by dolphin_render_probe.js:704 (`gfxThreads`).
+  // Was a pthread_self() call on EVERY draw; the identity never changes after the first draw, so
+  // publish it ONCE. Cell stays live — the probe reads the same value it read before.
+  {
+    static bool s_draw_tid_published = false;
+    if (!s_draw_tid_published)
+    {
+      s_draw_tid_published = true;
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35A4u)) =
+          static_cast<u32>(reinterpret_cast<uintptr_t>(pthread_self()));
+    }
+  }
   if (!m_current_pipeline)
   {
     ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3564u));
@@ -2033,12 +2039,23 @@ void WGPUGfx::DrawIndexed(WGPUBuffer vertex_buffer, WGPUBuffer index_buffer,
         static_cast<u32>(reinterpret_cast<uintptr_t>(m_pass));
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35E4u)) =
         static_cast<u32>(reinterpret_cast<uintptr_t>(m_current_pipeline));
-    // [oob-arith PM36 TEMP] draw-time fetch arithmetic (latest-wins):
-    // base_vertex @0x026B3680, vertex-buffer size @0x3684, num_indices|base_index
-    // @0x3688 (hi16|lo16). OOB is provable as (base_vertex+max_idx)*stride > size.
+    // [oob-arith PM36] draw-time fetch arithmetic (latest-wins): base_vertex @0x026B3680,
+    // vertex-buffer size @0x3684, num_indices|base_index @0x3688 (hi16|lo16). OOB is provable as
+    // (base_vertex+max_idx)*stride > size. Read by dolphin_render_probe.js:728 (`oob`).
+    // The size lookup used to call wgpuBufferGetSize() on EVERY draw — a wasm->JS boundary call
+    // for a value that is fixed for the lifetime of the buffer (WGPUVertexManager creates it once
+    // at VERTEX_BUFFER_SIZE). Memoize it per handle so the cell stays live at no per-draw cost.
+    {
+      static WGPUBuffer s_vbuf_handle = nullptr;
+      static u32 s_vbuf_size = 0;
+      if (s_vbuf_handle != vertex_buffer)
+      {
+        s_vbuf_handle = vertex_buffer;
+        s_vbuf_size = static_cast<u32>(wgpuBufferGetSize(vertex_buffer));
+      }
+      *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3684u)) = s_vbuf_size;
+    }
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3680u)) = base_vertex;
-    *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3684u)) =
-        static_cast<u32>(wgpuBufferGetSize(vertex_buffer));
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3688u)) =
         (num_indices << 16) | (base_index & 0xFFFFu);
     wgpuRenderPassEncoderDrawIndexed(m_pass, num_indices, 1, base_index,

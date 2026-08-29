@@ -24,6 +24,7 @@
 
 #include "jit_load_store.h"
 
+#include "bementalJIT/region_desc.h"   // [AOT v4 reloc] BemRelocSym + sentinel
 #include "bementalJIT/types.h"
 #include "bementalJIT/wasm_module_builder.h"
 #include "code_op.h"
@@ -36,6 +37,10 @@
 // [psq-gqr-spec PM48] "big SAB present" gate + emit-time live-GQR read.
 // Defined in block_cache.cpp; same pattern as jit_paired.cpp / fpr_reg_cache.cpp.
 extern "C" { extern uint32_t g_bem_lc_base; }
+// [gp-inwasm] runtime "a write-gather-pipe store is pending" flag (block_cache.cpp)
+// + the offline-AOT reloc mode selector (a native tool's &g_bem_gp_dirty is a wild
+// pointer in the worker). Same pair jit_branch.cpp externs for its exit drains.
+extern "C" { extern int g_bem_gp_dirty; extern int g_bem_aot_reloc_mode; }
 
 namespace bemental::powerpc {
 
@@ -408,9 +413,216 @@ static void emit_fastmem_store(WasmModuleBuilder& wb, LoadStoreParams params,
     }
 }
 
+// ---------------------------------------------------------------------------
+// [gp-inwasm 2026-08-28] Write-gather-pipe (WPAR) in-wasm arm — the same shape
+// as the [lc-window PM23] arm above, applied to the OTHER fixed, well-known
+// guest range that leaves the JIT's wasm instance on every access.
+//
+// WHAT IT REPLACES, EXACTLY. The bridge's dolphin_write32 (dolphin-bridge/
+// dolphin_jit_wimports.cpp:263-275) already short-circuits a WPAR store before
+// the MMU:
+//     void dolphin_write32(uint32_t addr, uint32_t val) {
+//         gp_dirty_check(addr);
+//         if ((addr & 0x0FFFFFFFu) == 0x0C008000u) {
+//             Core::System::GetInstance().GetGPFifo().Write32(val);
+//             return;
+//         }
+//         ...
+//     }
+// so the host side of a gather write is exactly: g_bem_gp_dirty = 1;
+// GPFifo::Write32(val) = redirect-check -> FastWrite32 -> CheckGatherPipe.
+// FastWrite32 (Core/HW/GPFifo.cpp:295-301) is `swap32(v); memcpy(ppc_state
+// .gather_pipe_ptr, &v, 4); gather_pipe_ptr += 4;` — byte-for-byte the store
+// this emitter already emits for fastmem RAM. CheckGatherPipe (GPFifo.cpp:179)
+// is `if (gather_pipe_ptr - gather_pipe_base_ptr >= 32) { UpdateGatherPipe();
+// CompileExceptionCheck(FIFOWrite); }`. We reproduce all of it in wasm except
+// UpdateGatherPipe itself, which stays a host call through WIMPORT_GATHER_DRAIN
+// (dolphin_gather_drain -> GPFifo::UpdateGatherPipe + clear g_bem_gp_dirty).
+//
+// ORDERING — [xf-word-loss FIX PM37] IS NOT AFFECTED. That pairing is between
+// UpdateGatherPipe's `memcpy -> atomic_thread_fence(release) -> accounting`
+// (GPFifo.cpp:150-163) and the decoder's acquire load of CPReadWriteDistance
+// (VideoCommon/Fifo.cpp:399). BOTH halves stay exactly where they are: the
+// bytes this arm writes go into the CPU-private 512-byte staging buffer
+// m_gather_pipe, which no other thread ever reads (GPFifo.cpp:150 is the only
+// reader, on this thread). Nothing publishes a +32 credit except
+// UpdateGatherPipe, and it is still reached only through the host import — a
+// wasm `call` to an import that the engine may not reorder guest stores across.
+// So a consumer can still never observe the credit before the bytes.
+//
+// DRAIN CADENCE IS UNCHANGED. Today every WPAR store crosses and its
+// CheckGatherPipe drains at each 32-byte boundary. This arm drains at the
+// same boundary, from the same instruction position, so the FIFO burst
+// sequence is identical — only 7 of every 8 module crossings disappear. The
+// existing deferred drains (block epilogue ppc_emit.cpp:1670-1685, fused-loop
+// back-edge jit_branch.cpp:476-487, coalesced taken exit jit_branch.cpp:82-88)
+// are all gated on g_bem_gp_dirty, which this arm sets, so the sub-32-byte
+// residual is still flushed on every exit exactly as before.
+//
+// TAKEOVER SAFETY. GPFifo::Write32 first calls gpfifo_redirect_excursion_to_ring
+// (GPFifo.cpp:214-235), which diverts the word into the ppc-worker's ordered
+// ring when cpu_owner (SAB 0x026A0000) == 1 && !g_in_drain. That path must not
+// be bypassed, so the arm's predicate carries a runtime `cpu_owner == 0` term
+// and falls back to the import whenever the worker owns the CPU. (In the
+// shipping config cpu_owner stays 0 — gamecube.html:2274-2277 returns before
+// the takeover store — but the guard makes the arm correct either way.)
+// The other early-out in that function, g_gp_discard, is only ever assigned 0:
+// GPFifo.cpp:23 initialises it to 0, dolphin_gp_seal/unseal are retired inert
+// stubs (dolphin_jit_wimports.cpp:283-291), and EmscriptenWorker.cpp:734-749
+// only clears and restores it. It cannot be 1 while a JIT block runs.
+//
+// NOT REPRODUCED: JitInterface::CompileExceptionCheck(FIFOWrite). It records
+// ppc_state.pc in Jit64's js.fifoWriteAddresses and invalidates the INHERITED
+// JitBaseBlockCache — which JitWasm.cpp:461-464 documents as not knowing about
+// m_wasm_cache — so it steers no codegen of ours. It measured 1.695% of this
+// worker's working time in /tmp/worker_4.cpuprofile.
+//
+// GATED on params.lc_base (the established "real dolphin build / big SAB
+// present" gate, jit_load_store.cpp:38): with lc_base == 0 — the standalone
+// test links and any offline emit without a live ctx — ppc_state.gather_pipe_ptr
+// is not a valid linear-memory pointer, so the arm must stay unemitted and the
+// import path must remain byte-identical. Flip BEM_GP_INWASM_ARM to false for a
+// clean A/B against the all-import baseline.
+// ---------------------------------------------------------------------------
+static constexpr bool BEM_GP_INWASM_ARM = true;
+
+// SAB dual-core ownership cell (0 = dolphin EmuThread owns the guest CPU,
+// 1 = ppc-worker takeover). Same literal the bridge reads at
+// dolphin_jit_wimports.cpp:112 and GPFifo.cpp:217.
+static constexpr u32 GP_CPU_OWNER_CELL = 0x026A0000u;
+// The bridge's own WPAR predicate (dolphin_jit_wimports.cpp:269 and the
+// gp_dirty_check at :91). Matches phys 0x0C008000 and its 0x8C/0xCC BAT
+// mirrors — the only forms a GameCube title issues.
+static constexpr u32 GP_EA_MASK  = 0x0FFFFFFFu;
+static constexpr u32 GP_EA_MATCH = 0x0C008000u;
+// GPFifo::GATHER_PIPE_SIZE (Core/HW/GPFifo.h:21).
+static constexpr u32 GP_PIPE_SIZE = 32u;
+// PowerPCState offsets. PowerPC.h:123-133 lays out pc(4) npc(4)
+// stored_stack_pointer(4) gather_pipe_ptr(4) gather_pipe_base_ptr(4) gpr[32],
+// and ppc_offsets.h pins GPR_BASE at 0x014 — which forces these two.
+static constexpr u32 PPCSTATE_GATHER_PIPE_PTR      = 0x00Cu;
+static constexpr u32 PPCSTATE_GATHER_PIPE_BASE_PTR = 0x010u;
+// ppc_gather_drain — block-module import idx 12 (hle_prologue.h:30-34); the
+// same import jit_branch.cpp calls from its exit drains.
+static constexpr u32 WIMPORT_GATHER_DRAIN = 12;
+
+// &g_bem_gp_dirty as an emitted const — sentinel + reloc record under the
+// offline AOT builder, plain const otherwise. Mirrors jit_branch.cpp's
+// emit_gp_dirty_addr (jit_branch.cpp:56-64).
+static inline void emit_gp_dirty_addr_ls(WasmModuleBuilder& wb) {
+    if (g_bem_aot_reloc_mode)
+        wb.op_i32_const_reloc((u16)BEM_RSYM_GP_DIRTY, 0u,
+                              bem_reloc_sentinel((u16)BEM_RSYM_GP_DIRTY, 0u));
+    else
+        wb.op_i32_const((s32)(uintptr_t)&g_bem_gp_dirty);
+}
+
+// Push 1 iff this EA is a write-gather-pipe store AND dolphin's own CPU thread
+// still owns the guest (so the excursion-to-ring redirect is not in play).
+static void emit_gp_region_test(WasmModuleBuilder& wb) {
+    wb.op_local_get(LOCAL_TMP_EA);
+    wb.op_i32_const((s32)GP_EA_MASK);
+    wb.op_i32_and();
+    wb.op_i32_const((s32)GP_EA_MATCH);
+    wb.op_i32_eq();
+    wb.op_i32_const((s32)GP_CPU_OWNER_CELL);
+    wb.op_i32_load(0);
+    wb.op_i32_eqz();
+    wb.op_i32_and();
+}
+
+// GPFifo::FastWrite{8,16,32} + CheckGatherPipe, emitted inline. Stack-neutral.
+//
+// LOCAL FOOTPRINT — deliberately IDENTICAL to the LC arm directly below it: it
+// reads LOCAL_TMP_EA (through the caller's region test) and clobbers only
+// LOCAL_TMP_VAL, and only via emit_bswap_i{16,32}, which the LC arm already
+// calls on the same values. The pipe cursor is re-loaded from PowerPCState for
+// the boundary test rather than parked in a local, so this arm introduces NO
+// new liveness constraint on any caller (psq_st in particular keeps its GQR in
+// LOCAL_TMP_VAL, and its existing contract — see emit_slowmem_load_value's
+// header — already treats that slot as dead across a slow store).
+static void emit_gp_append(WasmModuleBuilder& wb, LoadStoreParams params,
+                           StoreWidth width, u32 src_local) {
+    const u32 ctx   = params.ctx_ptr;
+    const u32 bytes = store_width_bytes(width);
+
+    // *gather_pipe_ptr = swap(value)   [FastWrite32: swap32 then 4-byte memcpy —
+    // hence align 0 on the u32 store; the pipe pointer can be byte-advanced by a
+    // preceding stb, exactly as FastWrite8 leaves it.]
+    wb.op_i32_const((s32)ctx);
+    wb.op_i32_load(PPCSTATE_GATHER_PIPE_PTR);
+    wb.op_local_get(src_local);
+    switch (width) {
+    case StoreWidth::U8:
+        wb.op_i32_store8(0);
+        break;
+    case StoreWidth::U16:
+        emit_bswap_i16(wb);
+        wb.op_i32_store16(0);
+        break;
+    case StoreWidth::U32:
+        emit_bswap_i32(wb);
+        wb.op_i32_store(0, 0);
+        break;
+    }
+
+    // gather_pipe_ptr += width
+    wb.op_i32_const((s32)ctx);
+    wb.op_i32_const((s32)ctx);
+    wb.op_i32_load(PPCSTATE_GATHER_PIPE_PTR);
+    wb.op_i32_const((s32)bytes);
+    wb.op_i32_add();
+    wb.op_i32_store(PPCSTATE_GATHER_PIPE_PTR);
+
+    // g_bem_gp_dirty = 1 — the host used to set this in gp_dirty_check; every
+    // deferred exit drain is gated on it, so the arm must keep setting it or a
+    // sub-32-byte residual would sit in the pipe past block exit.
+    emit_gp_dirty_addr_ls(wb);
+    wb.op_i32_const(1);
+    wb.op_i32_store(0);
+
+    // CheckGatherPipe: if (ptr - base) >= 32 -> host UpdateGatherPipe. This is
+    // also what bounds m_gather_pipe (512 bytes, GPFifo.h:22): without it a
+    // long straight-line or in-wasm-looping run of WPAR stores would overrun
+    // the staging buffer, since this emitter's back-edges do not always reach
+    // the block epilogue.
+    wb.op_i32_const((s32)ctx);
+    wb.op_i32_load(PPCSTATE_GATHER_PIPE_PTR);
+    wb.op_i32_const((s32)ctx);
+    wb.op_i32_load(PPCSTATE_GATHER_PIPE_BASE_PTR);
+    wb.op_i32_sub();
+    wb.op_i32_const((s32)GP_PIPE_SIZE);
+    wb.op_i32_ge_u();
+    wb.op_if(BLOCK_TYPE_VOID);
+        wb.op_i32_const(0);
+        wb.op_i32_const(0);
+        wb.op_call(WIMPORT_GATHER_DRAIN);
+    wb.op_end();
+}
+
+// The non-LC tail of the slow store arm: WPAR in-wasm append, else the import.
+static void emit_gp_or_import_store(WasmModuleBuilder& wb, LoadStoreParams params,
+                                    StoreWidth width, u32 src_local) {
+    if (BEM_GP_INWASM_ARM && params.lc_base) {
+        emit_gp_region_test(wb);
+        wb.op_if(BLOCK_TYPE_VOID);
+            emit_gp_append(wb, params, width, src_local);
+        wb.op_else();
+            wb.op_local_get(LOCAL_TMP_EA);
+            wb.op_local_get(src_local);
+            wb.op_call(write_import_for_width(width));
+        wb.op_end();
+        return;
+    }
+    wb.op_local_get(LOCAL_TMP_EA);
+    wb.op_local_get(src_local);
+    wb.op_call(write_import_for_width(width));
+}
+
 // Slow-path store. Stack-neutral. [lc-window PM23] locked-L1 EAs get a raw
 // in-wasm store (bswap + store, matching MMU.cpp's swapped memcpy) when
-// lc_base is configured — see emit_slowmem_load_value.
+// lc_base is configured — see emit_slowmem_load_value. [gp-inwasm] everything
+// else first tries the write-gather-pipe arm above before the import.
 static void emit_slowmem_store(WasmModuleBuilder& wb, LoadStoreParams params,
                                StoreWidth width, u32 src_local) {
     if (params.lc_base) {
@@ -432,9 +644,7 @@ static void emit_slowmem_store(WasmModuleBuilder& wb, LoadStoreParams params,
                 break;
             }
         wb.op_else();
-            wb.op_local_get(LOCAL_TMP_EA);
-            wb.op_local_get(src_local);
-            wb.op_call(write_import_for_width(width));
+            emit_gp_or_import_store(wb, params, width, src_local);
         wb.op_end();
         return;
     }

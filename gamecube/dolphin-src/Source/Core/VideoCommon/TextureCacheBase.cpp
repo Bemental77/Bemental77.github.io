@@ -1243,6 +1243,60 @@ private:
   std::vector<Level> levels;
 };
 
+// [texcache-samples A/B 2026-08-28] Runtime override for the texture-cache hash sample count.
+//
+// Measured cost of the current setting: on a PSO JIT-path CPU profile
+// (/tmp/worker_2.cpuprofile, ROM_IDX=2, 240,000 samples = 48s of render-worker CPU) the
+// software texture hash is 39.45% self time, 36.69% of it reached through
+// LoadImpl <- Load <- VertexManagerBase::Flush <- LoadBPReg <- RunFifo (i.e. the
+// GetTexture(iSafeTextureCache_ColorSamples, ...) call at line 1291 below, whose result is
+// consumed at line 1354). TexDecoder_Decode in the same profile is 0.001% (2 samples).
+//
+// Why this is a runtime cell and not a config edit: DolphinLibretro/Boot.cpp pins the config
+// to 0 (full-texture hash) to fix a SHIPPED regression - sampled hashing let MP4's THP movie
+// planes go stale and the game's own TEV YUV->RGB matrix rendered the stale chroma as a green
+// band. That regression is real and is NOT covered by should_force_safe_hashing (see the
+// determination in Boot.cpp's comment: THP planes are ordinary GX_TF_I8 main-RAM textures per
+// ~/gc_refs/marioparty4/src/game/THPDraw.c:90-98, not XFB copies, and line 2330 below is the
+// only assignment of that flag). So the 128 arm is UNPROVEN, must not be the default, and has
+// to be accepted or rejected by a visual A/B on the MP4 movie - not by a fps number alone.
+//
+// getenv is dead in the worker (cross-thread Module.ENV never reaches the C environ - see
+// JitWasm.cpp:509-512), so the toggle rides a SAB scratch cell exactly like
+// ?bjit_fp_resident_loop (0x026B3408) and ?bjit_xxh3_texhash (0x026B340C). This one is
+// 0x026B3914, the next free cell in the 0x026B3900..0x026B3BFC window that
+// VideoCommon/VertexLoaderWasm.h:51-52 documents as unoccupied (0x026B3900..0x026B3910 are
+// that file's; 0x026B3C00+ is the FPR scratch window in
+// gamecube/bementalJIT/guests/powerpc-next/fpr_reg_cache.cpp:335). Repo-wide grep for
+// 0x026B3914 on 2026-08-28 found no other user.
+//
+//   cell == 0 (browser-zeroed default) -> g_ActiveConfig value = 0 = FULL HASH  <- ships
+//   cell == 128                        -> 128 sampled 8-byte blocks   <- ?bjit_texcache_samples=128
+//   cell == 512                        -> 512 sampled 8-byte blocks   <- the "Middle" arm
+//
+// Read per call rather than cached, so it can also be flipped live from DevTools for a
+// same-process matched pair. One aligned u32 load against a hash that reads at minimum
+// hundreds of bytes (and, in the arm that matters, the whole texture) is not measurable.
+//
+// Flipping live is safe in the conservative direction: changing the sample count changes the
+// hash VALUE of identical bytes, so every stored entry hash mismatches once, the entries are
+// re-decoded from RAM and re-uploaded, and the cache repopulates. That is a one-time upload
+// storm, never a stale texture - let it settle before reading fps. Note this deliberately
+// bypasses the m_backup_config.color_samples change-detect at lines 163/252, which would
+// otherwise Invalidate() the whole cache; the mismatch-driven refill above makes that
+// unnecessary, and going through OnConfigChanged would make the flip non-live.
+static int TextureCacheSafetySamples()
+{
+#ifdef __EMSCRIPTEN__
+  const u32 cell = *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3914u));
+  if (cell != 0u)
+    return static_cast<int>(cell);
+#endif
+  // Native builds have no page and no SAB scratch region; 0x026B3914 is not a valid address
+  // there. The override is a wasm-page A/B only - native always takes the configured value.
+  return g_ActiveConfig.iSafeTextureCache_ColorSamples;
+}
+
 TCacheEntry* TextureCacheBase::Load(u32 stage)
 {
   if (auto entry = LoadImpl(stage, false))
@@ -1288,7 +1342,10 @@ TCacheEntry* TextureCacheBase::LoadImpl(u32 stage, bool force_reload)
   }
 
   const TextureInfo texture_info = TextureInfo::FromStage(stage);
-  auto entry = GetTexture(g_ActiveConfig.iSafeTextureCache_ColorSamples, texture_info);
+  // [texcache-samples 2026-08-28] was g_ActiveConfig.iSafeTextureCache_ColorSamples directly.
+  // This is the 36.69%-of-render-worker call site; TextureCacheSafetySamples() returns that
+  // same config value unless the 0x026B3914 SAB cell overrides it.
+  auto entry = GetTexture(TextureCacheSafetySamples(), texture_info);
 
   if (!entry)
     return nullptr;
@@ -3112,7 +3169,11 @@ int TCacheEntry::HashSampleSize() const
     return 0;
   }
 
-  return g_ActiveConfig.iSafeTextureCache_ColorSamples;
+  // [texcache-samples 2026-08-28] was g_ActiveConfig.iSafeTextureCache_ColorSamples directly.
+  // The force-safe early-out above is untouched, so XFB copies keep full hashing in every arm
+  // of the A/B. This path covers the re-validation hash at line 1284 (bound-texture fast path)
+  // and Presenter::FetchXFB (0.22% in the profile).
+  return TextureCacheSafetySamples();
 }
 
 u64 TCacheEntry::CalculateHash() const
