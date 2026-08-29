@@ -1,0 +1,326 @@
+diff --git a/core/rend/gles/gles.cpp b/core/rend/gles/gles.cpp
+index 0b85e8c..2eb8c4f 100644
+--- a/core/rend/gles/gles.cpp
++++ b/core/rend/gles/gles.cpp
+@@ -132,7 +132,12 @@ const char* PixelPipelineShader = R"(
+ /* Shader program params*/
+ /* gles has no alpha test stage, so its emulated on the shader */
+ uniform highp float cp_AlphaTestValue;
+-uniform lowp vec4 pp_ClipTest;
++// pp_ClipTest was lowp: it carries SCREEN PIXEL coordinates (fed from
++// clip_rect.origin / clip_rect.bottomRight() in gldraw.cpp, up to 2048x1024) and
++// is compared against gl_FragCoord below. ESSL only guarantees lowp float over
++// (-2,2), so these saturate on a GPU that implements lowp natively; desktop
++// drivers promote lowp to fp32, hiding it. Same class of bug as texSize.
++uniform highp vec4 pp_ClipTest;
+ uniform lowp vec3 sp_FOG_COL_RAM,sp_FOG_COL_VERT;
+ uniform highp float sp_FOG_DENSITY;
+ uniform sampler2D tex,fog_table;
+@@ -141,13 +146,21 @@ uniform lowp vec4 fog_clamp_min;
+ uniform lowp vec4 fog_clamp_max;
+ #if pp_Palette != 0
+ uniform sampler2D palette;
+-uniform mediump int palette_index;
++// palette_index was mediump int: gldraw.cpp feeds it (tcw.PalSelect << 4), which
++// reaches 1008 for a 6-bit PalSelect, against mediump int's guaranteed
++// (-1024,1024) -- legal but with zero headroom, and getPaletteEntry() below
++// already accumulates it into a highp int. This path is live.
++uniform highp int palette_index;
+ #if TARGET_GL == GLES2 || TARGET_GL == GL2
+-uniform lowp vec2 texSize;
++uniform highp vec2 texSize;   // was lowp — same precision bug as the GLES3 local at palettePixelBilinear: this carries a texture DIMENSION (512/1024), which lowp cannot represent. Inert on our WebGL2/GLES3 path (that branch takes the local instead), fixed for correctness.
+ #endif
+ #endif
+ #if DITHERING == 1
+-uniform lowp vec4 ditherDivisor;
++// ditherDivisor was lowp: renderFrame() writes 1.0, 2.0 and 4.0 into it, and 4.0
++// does not fit in lowp's guaranteed (-2,2) range at all. Currently unreachable
++// (DITHERING is gated on config::EmulateFramebuffer, which defaults false in
++// cfg/option.cpp) but wrong as written. mediump matches the `dv` local below.
++uniform mediump vec4 ditherDivisor;
+ #endif
+ 
+ /* Vertex input*/
+@@ -166,9 +179,14 @@ lowp float fog_mode2(highp float w)
+ 						  sp_FOG_DENSITY * w
+ #endif
+ 											, 1.0, 255.9999);
+-	mediump float exp = floor(log2(z));
++	// `idx` was mediump: it reaches 127.5 and is used directly as a texture
++	// coordinate (idx / 128.0) into the 128-wide fog LUT, so mediump's guaranteed
++	// relative precision allows up to ~1/8 texel of shift. `exp` widened with it
++	// so the exp * 16.0 term is not narrowed on the way into idx. Cosmetic
++	// (fog banding), not a correctness cliff.
++	highp float exp = floor(log2(z));
+ 	highp float m = z * 16.0 / pow(2.0, exp) - 16.0;
+-	mediump float idx = floor(m) + exp * 16.0 + 0.5;
++	highp float idx = floor(m) + exp * 16.0 + 0.5;
+ 	highp vec4 fog_coef = texture(fog_table, vec2(idx / 128.0, 0.75 - (m - floor(m)) / 2.0));
+ 	return fog_coef.FOG_CHANNEL;
+ }
+@@ -218,7 +236,7 @@ lowp vec4 palettePixelBilinear(highp vec3 coords)
+ 	coords.xy /= coords.z;
+ #endif
+ #if TARGET_GL != GLES2 && TARGET_GL != GL2
+-	lowp vec2 texSize = vec2(textureSize(tex, 0));
++	highp vec2 texSize = vec2(textureSize(tex, 0));   // was lowp: ESSL only guarantees lowp float over (-2,2), so a 512/1024 texture dimension SATURATES on GPUs that implement lowp natively (Adreno/Mali/Apple). Desktop drivers promote lowp to fp32, which is why this was invisible on desktop and wrong on a phone. texSize feeds pixCoord/sampleUV below.
+ #endif
+ 	highp vec2 pixCoord = coords.xy * texSize - 0.5;		// coordinates of top left pixel
+ 	highp vec2 originPixCoord = floor(pixCoord);
+diff --git a/core/rend/gles/gles.h b/core/rend/gles/gles.h
+index d855ac3..5013722 100755
+--- a/core/rend/gles/gles.h
++++ b/core/rend/gles/gles.h
+@@ -30,7 +30,151 @@
+ #define GL_R8 0x8229
+ #endif
+ 
++// ---------------------------------------------------------------------------
++// glCheck() — GL error check at a renderer call site.
++//
++// Upstream this is `verify(glGetError()==GL_NO_ERROR)` gated on
++// config::OpenGlChecks.  In THIS build that gate is DEAD, so all 44 call sites
++// under core/rend/gles/ and core/rend/gl4/ are runtime no-ops:
++//   * core/cfg/option.cpp has `Option<bool> OpenGlChecks("OpenGlChecks", false, "validate")`,
++//     but the libretro shell overrides that TU with
++//     shell/libretro/option.cpp `Option<bool> OpenGlChecks("", false)` —
++//     default false AND an EMPTY core-option name, so it is not user-settable.
++//   * Nothing in dreamcast/flycast-bridge/ sets it.
++// On a phone that means a GL error only the mobile driver raises is discarded
++// silently and the session produces no evidence at all.
++//
++// Under Emscripten we therefore make glCheck() LOG instead of trap:
++//
++//   * LOG, never verify()/abort.  An abort on a device tells us strictly less
++//     than a message: we would get one failure with no context instead of the
++//     whole sequence of errors leading to it, and the page would die before
++//     the log could be read off the screen.
++//
++//   * WARN_LOG(RENDERER, ...) is the transport ON PURPOSE — it is the only one
++//     that reaches the phone's screen.  Route, each hop read:
++//       WARN_LOG (core/log/Log.h) -> GenericLog
++//         -> LogManager::LogWithFullPath (shell/libretro/LogManager.cpp)
++//         -> retro_printf, i.e. flycast_log_cb
++//            (dreamcast/flycast-bridge/EmscriptenWorker.cpp, registered from
++//             environment_cb's RETRO_ENVIRONMENT_GET_LOG_INTERFACE case)
++//         -> MAIN_THREAD_EM_ASM postMessage({cmd:'print', txt:'[flycast.log] '...})
++//         -> dreamcast.html's worker onmessage `case 'print': pageLog(d.txt)`
++//         -> the page's #log element.
++//     A bare printf/console.log from the worker does NOT reach the page.
++//     WARN_LOG also survives the NDEBUG log-level cut: MAX_LOGLEVEL is
++//     LWARNING there (core/log/Log.h, the `#if !defined(NDEBUG)` block), so
++//     INFO_LOG/DEBUG_LOG would be compiled out of this build entirely.
++//
++// KNOWN BLIND SPOT: GL_INVALID_ENUM (0x0500) can never appear here.  The
++// worker-side JS shim drains it before it reaches C —
++// dreamcast/flycast-bridge/webgl2-compat.js drains 0x500 in its ctx.getError
++// wrapper, deliberately, because GLGraphicsContext::findGLVersion()
++// (core/wsi/gl_context.cpp) reads a 0x500 following glGetIntegerv(GL_MAJOR_VERSION)
++// as "this is GLES2" and would downgrade the whole renderer.  That shim now
++// COUNTS and WARNs what it swallows ("[glcompat] swallowed GL_INVALID_ENUM"),
++// so look there for 0x500, not here.
++//
++// ***** OFF BY DEFAULT — AND MUST BE OFF FOR ANY PERF MEASUREMENT. *****
++// glGetError() under WebGL is a SYNCHRONOUS round-trip: it flushes the pending
++// command buffer and blocks until the GL side answers.  Several call sites sit
++// directly on per-draw paths — the glDrawElements lines in
++// core/rend/gles/gldraw.cpp and core/rend/gl4/gldraw.cpp, and the per-param
++// SetCull/glDrawArrays lines in core/rend/gl4/abuffer.cpp all end in
++// `; glCheck();` — so enabling this serializes the renderer against every
++// draw.  An fps / MHz / frame-count / "it wedged" reading taken from a build
++// with FLYCAST_GL_CHECKS on is not a measurement of anything — same rule and
++// the same reason as -DFLYCAST_BRIDGE_DIAG (see the DIAG-flavor block in
++// dreamcast/flycast-bridge/flycast_worker_link.sh, where the per-access trace
++// stalled the guest badly enough to look like a boot wedge).  The one-shot
++// banner below exists so a screenshot from a device can never be mistaken for
++// a clean run.
++//
++// Opt in the same way the bridge diag flavors do — a compile define, absent by
++// default:   -DFLYCAST_GL_CHECKS
++//
++// NOTE, and this differs from the bridge diag flags: FLYCAST_BRIDGE_DIAG and
++// DEBUG_DISPATCH reach ONLY the bridge TUs on the emcc link line, so those are
++// re-link-only.  gles.h is compiled into the flycast_libretro STATIC ARCHIVE,
++// so toggling FLYCAST_GL_CHECKS requires rebuilding the archive
++// (`emmake make`), not just re-running the link script.
++// ---------------------------------------------------------------------------
++#if defined(__EMSCRIPTEN__) && defined(FLYCAST_GL_CHECKS)
++
++// Flood budget.  A GL error raised inside a per-draw path repeats on every
++// single draw call, and an unbounded per-event log is a proven hazard in this
++// project: the per-access [gdrom] trace emitted 51,867 of 53,319 console lines
++// in one 60s run and starved the very loop it was watching (the DIAG-flavor
++// banner in flycast_worker_link.sh records it).  The first errors identify the failure;
++// the rest are the same line.  Budget is intentionally small, and exhaustion
++// prints exactly one trailing line so a truncated log is never misread as a
++// clean one.
++inline int& glCheckLogBudget() { static int budget = 128; return budget; }
++
++inline const char *glCheckErrorName(GLenum err)
++{
++	switch (err)
++	{
++	case 0x0500: return "GL_INVALID_ENUM";
++	case 0x0501: return "GL_INVALID_VALUE";
++	case 0x0502: return "GL_INVALID_OPERATION";
++	case 0x0503: return "GL_STACK_OVERFLOW";
++	case 0x0504: return "GL_STACK_UNDERFLOW";
++	case 0x0505: return "GL_OUT_OF_MEMORY";
++	case 0x0506: return "GL_INVALID_FRAMEBUFFER_OPERATION";
++	case 0x0507: return "GL_CONTEXT_LOST";
++	case 0x9242: return "GL_CONTEXT_LOST_WEBGL";
++	default:     return "GL_<unknown>";
++	}
++}
++
++inline void glCheckImpl(const char *file, int line)
++{
++	static bool banner = false;
++	if (!banner)
++	{
++		banner = true;
++		WARN_LOG(RENDERER, "[glcheck] ENABLED (-DFLYCAST_GL_CHECKS). Every GL call site now does a "
++				"synchronous glGetError() round-trip. NO fps / MHz / frame-count / wedge claim "
++				"may be made from this build.");
++	}
++	// glGetError() reports and clears ONE error per call, so drain: otherwise
++	// the next site reports this site's error and every attribution is off by
++	// one call.  Bounded — a lost context returns GL_CONTEXT_LOST_WEBGL
++	// forever and an unbounded drain would spin here.
++	GLenum err;
++	int drained = 0;
++	while ((err = glGetError()) != 0 /* GL_NO_ERROR */ && ++drained <= 8)
++	{
++		int &budget = glCheckLogBudget();
++		if (budget < 0)
++			continue;
++		if (budget-- == 0)
++		{
++			WARN_LOG(RENDERER, "[glcheck] log budget exhausted — further GL errors are SILENCED "
++					"(checks still run). Earlier [glcheck] lines are the complete evidence.");
++			continue;
++		}
++		WARN_LOG(RENDERER, "[glcheck] %s (0x%04x) at %s:%d", glCheckErrorName(err), (unsigned)err, file, line);
++	}
++	// One-shot: if the queue will not drain, it will not drain on every
++	// subsequent site either, and this line must not become the flood.
++	static bool undrainable = false;
++	if (drained > 8 && !undrainable)
++	{
++		undrainable = true;
++		WARN_LOG(RENDERER, "[glcheck] error queue did not drain in 8 reads at %s:%d — context likely LOST", file, line);
++	}
++}
++
++#define glCheck() glCheckImpl(__FILE__, __LINE__)
++
++#else
++// Unchanged upstream behavior for native builds, and the zero-cost default for
++// the shipping wasm build (config::OpenGlChecks is false and unsettable, so
++// this compiles to a predictable never-taken branch).
+ #define glCheck() do { if (unlikely(config::OpenGlChecks)) { verify(glGetError()==GL_NO_ERROR); } } while(0)
++#endif
+ 
+ #define VERTEX_POS_ARRAY 0
+ #define VERTEX_COL_BASE_ARRAY 1
+diff --git a/core/rend/gles/gltex.cpp b/core/rend/gles/gltex.cpp
+index cedf3c5..461be10 100644
+--- a/core/rend/gles/gltex.cpp
++++ b/core/rend/gles/gltex.cpp
+@@ -4,6 +4,12 @@
+ 
+ #include <memory>
+ 
++// Present in the emsdk GLES3 headers (GLES3/gl3.h:831) but not in ES2-only
++// header sets. Guarded the same way gles.h guards GL_RGBA8 / GL_R8.
++#ifndef GL_DEPTH_STENCIL_ATTACHMENT
++#define GL_DEPTH_STENCIL_ATTACHMENT       0x821A
++#endif
++
+ GlTextureCache TexCache;
+ void (TextureCacheData::*TextureCacheData::uploadToGpu)(int, int, const u8 *, bool, bool) = &TextureCacheData::UploadToGPUGl2;
+ 
+@@ -159,8 +165,20 @@ GLuint BindRTT(bool withDepthBuffer)
+ 		break;
+ 
+ 	case 1: //0x1   565 RGB 16 bit
+-		channels = GL_RGB;
+-		format = GL_UNSIGNED_SHORT_5_6_5;
++		// Was GL_RGB / GL_UNSIGNED_SHORT_5_6_5, the only non-RGBA8 attachment in
++		// the build. Emscripten's glTexImage2D only rewrites internalFormat for
++		// DEPTH_COMPONENT+UNSIGNED_INT, RGBA+half-float, DEPTH_STENCIL and
++		// RGBA+FLOAT -- RGB+5_6_5 is not among them, so it reaches the driver as
++		// unsized GL_RGB 5:6:5 and resolves to a real no-alpha 16-bit attachment
++		// on mobile. Desktop drivers promote it to RGBA8, which is why this is
++		// invisible here. With no destination alpha the GL_DST_ALPHA /
++		// GL_ONE_MINUS_DST_ALPHA blend modes and the alpha-0 clear are wrong.
++		// Widening costs no fidelity: when config::RenderToTextureBuffer is set,
++		// ReadRTTBuffer() re-quantizes to 565 in software via WriteTextureToVRam()
++		// anyway; when it is not (the default), the texture is handed straight to
++		// the texture cache, where RGBA8 is strictly better than 565.
++		channels = GL_RGBA;
++		format = GL_UNSIGNED_BYTE;
+ 		break;
+ 
+ 	case 2: //0x2   4444 ARGB 16 bit
+@@ -417,10 +435,31 @@ void GlFramebuffer::makeFramebuffer(bool withDepth)
+ #endif
+ 
+ 		// Attach the depth buffer we just created to our FBO.
+-		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthBuffer);
+-
+-		if (!gl.is_gles || gl.gl_major >= 3 || gl.GL_OES_packed_depth_stencil_supported)
+-			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depthBuffer);
++		// The storage allocated above is a *packed* DEPTH24_STENCIL8 image on
++		// GL 3+ / GLES 3+, so attach it once through GL_DEPTH_STENCIL_ATTACHMENT
++		// rather than binding the same renderbuffer separately to
++		// GL_DEPTH_ATTACHMENT and GL_STENCIL_ATTACHMENT. ES 3.0 permits the split
++		// form when both points name the same image, but GL_DEPTH_STENCIL_ATTACHMENT
++		// is the combination WebGL 2 documents as guaranteed framebuffer-complete.
++		// Getting this wrong costs the stencil plane silently, and Flycast drives
++		// modifier volumes purely through stencil: with no stencil buffer the
++		// stencil test always passes, so the "black out any stencil == 1"
++		// full-screen quad in DrawModVols() paints over the whole frame.
++		if (!gl.is_gles || gl.gl_major >= 3)
++		{
++			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depthBuffer);
++		}
++		else
++		{
++			// GLES2: GL_DEPTH_STENCIL_ATTACHMENT does not exist, so the
++			// OES_packed_depth_stencil idiom is to attach the same renderbuffer to
++			// both attachment points. Unchanged from the original behavior, incl.
++			// the depth-only case (DEPTH_COMPONENT24_OES / DEPTH_COMPONENT16),
++			// which has no stencil to attach.
++			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthBuffer);
++			if (gl.GL_OES_packed_depth_stencil_supported)
++				glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depthBuffer);
++		}
+ 	}
+ 
+ 	// Attach the texture/renderbuffer to the FBO
+@@ -428,6 +467,24 @@ void GlFramebuffer::makeFramebuffer(bool withDepth)
+ 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+ 	else
+ 		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, colorBuffer);
++
++	// Validate. Every FBO in this build is built here, and until now nothing
++	// checked one for completeness: glCheckFramebufferStatus was only called on
++	// the throwaway 32x32 FBOs in testBlitFramebuffer() -- which pass
++	// withDepth == false, so the depth/stencil configuration above was never
++	// validated anywhere -- and in the non-default OIT path. The two guards in
++	// the render path (`if (BindRTT() == 0)` and
++	// `if (init_output_framebuffer(...) == 0)`) only test a name returned by
++	// glGenFramebuffers, which is never 0, so they cannot catch this.
++	// An incomplete FBO is otherwise entirely silent: every draw becomes
++	// GL_INVALID_FRAMEBUFFER_OPERATION and every glClear a no-op, i.e. a black
++	// screen with no error reported anywhere.
++	// Log only -- deliberately no control-flow change, since altering behavior
++	// mid-session on a device we cannot test against is worse than a log line.
++	GLenum fbStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++	if (fbStatus != GL_FRAMEBUFFER_COMPLETE)
++		ERROR_LOG(RENDERER, "GlFramebuffer: INCOMPLETE framebuffer %u (%dx%d withDepth=%d texture=%u colorBuffer=%u): status 0x%x",
++				framebuffer, width, height, (int)withDepth, texture, colorBuffer, (unsigned)fbStatus);
+ }
+ 
+ GlFramebuffer::GlFramebuffer(int width, int height, bool withDepth, bool withTexture)

@@ -1,0 +1,40 @@
+diff --git a/core/hw/arm7/arm7_rec.cpp b/core/hw/arm7/arm7_rec.cpp
+index a3b17bb..94caa35 100644
+--- a/core/hw/arm7/arm7_rec.cpp
++++ b/core/hw/arm7/arm7_rec.cpp
+@@ -48,6 +48,9 @@ namespace recompiler {
+ u8* icPtr;
+ u8* ICache;
+ void (*EntryPoints[ARAM_SIZE_MAX / 4])();
++// End of the current block's source span (exclusive), for backends that
++// need to replay the block's source ops (wasm backend self-test).
++u32 block_end_pc;
+ 
+ DECLARE_CODE_CACHE(ARM7_TCB, ICacheSize)
+ 
+@@ -647,6 +650,7 @@ void compile()
+ 
+ 	block_ssa_pass();
+ 
++	block_end_pc = pc;
+ 	arm7backend_compile(block_ops, cycles);
+ 
+ 	arm_printf("arm7rec_compile done: %p,%p", rv, icPtr);
+diff --git a/core/hw/sh4/sh4_mmr.cpp b/core/hw/sh4/sh4_mmr.cpp
+index 69c7b00..27d7469 100644
+--- a/core/hw/sh4/sh4_mmr.cpp
++++ b/core/hw/sh4/sh4_mmr.cpp
+@@ -580,6 +580,13 @@ void DYNACALL WriteMem_area7_OCR(u32 addr, T data)
+ 		INFO_LOG(SH4, "On Chip Ram Write, but OCR is disabled. addr %x", addr);
+ }
+ 
++// [bementalJIT lever-9D] OC-RAM fastpath plumbing: the wasm SH4 emitter bakes an
++// in-block arm for P0 on-chip RAM (0x7C000000-0x7FFFFFFF); it needs the linear
++// addresses of the 8KB array and CCN_CCR (ORA/OIX gate the mapping, mirroring
++// onChipRamOffset above). Under emcc these pointers ARE linear-memory offsets.
++extern "C" uintptr_t sh4_ocram_base() { return (uintptr_t)OnChipRAM.data(); }
++extern "C" uintptr_t sh4_ccr_addr()  { return (uintptr_t)&CCN_CCR; }
++
+ //Init/Res/Term
+ void sh4_mmr_init()
+ {
