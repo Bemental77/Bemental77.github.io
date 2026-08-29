@@ -395,22 +395,58 @@ int compile_raw(const u8* bytes, std::size_t size) {
                         Module.bemental_imports = { env: {} };
                     if (!Module.bemental_imports.env)
                         Module.bemental_imports.env = {};
+                    // [asyncify-unwrap 2026-08-28] Module._dolphin_* is NOT the
+                    // raw wasm export. emscripten 4.0.10's receiveInstance does
+                    //   wasmExports = instance.exports;
+                    //   wasmExports = Asyncify.instrumentWasmExports(wasmExports);
+                    //   ... assignWasmExports(wasmExports)   // _dolphin_read32 = wasmExports["qg"]
+                    // and instrumentFunction produces a JS closure:
+                    //   (...args)=>{ Asyncify.exportCallStack.push(original);
+                    //                try{return original(...args)}
+                    //                finally{ pop(); Asyncify.maybeStopUnwind() } }
+                    // Binding THAT as a block-module import makes every slow
+                    // guest access a wasm->JS->wasm round trip: rest-args array
+                    // alloc + spread call + try/finally + array push/pop, plus
+                    // V8's wasm-to-js and js-to-wasm entry stubs. Measured on
+                    // the uncapped CPU-bound profile /tmp/gp-OP-1.log worker[4]:
+                    //   5.8% wasm-to-js + 2.9% wrapper + 1.6% js-to-wasm:ii:
+                    //   = 11.1%, vs 5.4% for the MMU handlers it delivers to.
+                    // The wrapper buys NOTHING here: an asyncify unwind through
+                    // a JIT block is already unrecoverable (block modules are
+                    // not instrumented), and the only emscripten_sleep in the
+                    // tree is WGPUGfx.cpp:100 (backend init), unreachable from
+                    // any of these 13. Asyncify.funcWrappers maps
+                    // original -> wrapper, so the reverse map recovers the raw
+                    // WebAssembly export; V8 then binds import->export as a
+                    // direct cross-instance wasm call with no JS frame.
+                    // Falls back to the wrapper if the map is unavailable.
+                    if (!Module._bem_rawmap) {
+                        Module._bem_rawmap = new Map();
+                        try {
+                            if (typeof Asyncify !== 'undefined' && Asyncify.funcWrappers) {
+                                Asyncify.funcWrappers.forEach(function(w, o) { Module._bem_rawmap.set(w, o); });
+                            }
+                        } catch (er) { }
+                    }
+                    const bemraw = function(f) {
+                        return (typeof f === 'function' && Module._bem_rawmap.get(f)) || f;
+                    };
                     if (Module.bemental_imports && Module.bemental_imports.env) {
                         const e = Module.bemental_imports.env;
-                        e.ppc_read8       = Module._dolphin_read8;
-                        e.ppc_read16      = Module._dolphin_read16;
-                        e.ppc_read32      = Module._dolphin_read32;
-                        e.ppc_write8      = Module._dolphin_write8;
-                        e.ppc_write16     = Module._dolphin_write16;
-                        e.ppc_write32     = Module._dolphin_write32;
-                        e.ppc_check_exc   = Module._dolphin_check_exc;
-                        e.ppc_break_block = Module._dolphin_break_block;
-                        e.ppc_hle_check   = Module._dolphin_hle_check;
+                        e.ppc_read8       = bemraw(Module._dolphin_read8);
+                        e.ppc_read16      = bemraw(Module._dolphin_read16);
+                        e.ppc_read32      = bemraw(Module._dolphin_read32);
+                        e.ppc_write8      = bemraw(Module._dolphin_write8);
+                        e.ppc_write16     = bemraw(Module._dolphin_write16);
+                        e.ppc_write32     = bemraw(Module._dolphin_write32);
+                        e.ppc_check_exc   = bemraw(Module._dolphin_check_exc);
+                        e.ppc_break_block = bemraw(Module._dolphin_break_block);
+                        e.ppc_hle_check   = bemraw(Module._dolphin_hle_check);
                         // Item 5: direct-bind hle_fire for dolphin's own
                         // path (called when emit_hle_check_native is
                         // unused — module still declares the import).
                         if (Module._dolphin_hle_fire)
-                            e.ppc_hle_fire = Module._dolphin_hle_fire;
+                            e.ppc_hle_fire = bemraw(Module._dolphin_hle_fire);
                         // Researcher B's stack-corrupt diagnostic. Direct-bind
                         // if the export exists; without this, the env object
                         // built on the pthread-side bootstrap drops the import
@@ -419,7 +455,7 @@ int compile_raw(const u8* bytes, std::size_t size) {
                         // This is the root-cause class for any "I added a new
                         // WIMPORT and nothing fires" failure.
                         if (Module._dolphin_stack_corrupt)
-                            e.ppc_stack_corrupt = Module._dolphin_stack_corrupt;
+                            e.ppc_stack_corrupt = bemraw(Module._dolphin_stack_corrupt);
                         // Direct-bind ppc_interp now that dolphin_interp is
                         // exported by dolphin-bridge/dolphin_jit_wimports.cpp
                         // (2026-05-30). The previous "JS wrapper" comment
@@ -428,13 +464,13 @@ int compile_raw(const u8* bytes, std::size_t size) {
                         // (u32 unused, u32 pc) → void which matches the
                         // emitter's type-2 import signature.
                         if (Module._dolphin_interp)
-                            e.ppc_interp = Module._dolphin_interp;
+                            e.ppc_interp = bemraw(Module._dolphin_interp);
                         // ppc_msr_updated (WIMPORT idx 11) — added to fix the
                         // SAB DBException wedge. emit_mtmsr calls this after
                         // the MSR store so feature_flags/membase get
                         // recomputed (Jit64 parity via EmitUpdateMembase).
                         if (Module._dolphin_msr_updated)
-                            e.ppc_msr_updated = Module._dolphin_msr_updated;
+                            e.ppc_msr_updated = bemraw(Module._dolphin_msr_updated);
                         // ppc_gather_drain (WIMPORT idx 12) — block epilogue
                         // calls this to drain the GPU gather-pipe so CP-IRQ
                         // / PE_TOKEN / PE_FINISH fences fire (Jit64 parity
@@ -442,12 +478,19 @@ int compile_raw(const u8* bytes, std::size_t size) {
                         // this binding the emitted import resolves to
                         // undefined and EVERY block compile throws LinkError.
                         if (Module._dolphin_gather_drain)
-                            e.ppc_gather_drain = Module._dolphin_gather_drain;
+                            e.ppc_gather_drain = bemraw(Module._dolphin_gather_drain);
                     }
-                    const isWasm = (typeof WebAssembly.Function !== 'undefined')
-                        ? Module._dolphin_read32 instanceof WebAssembly.Function
-                        : true;
-                    console.log('[bemental] direct-binding upgrade complete (raw WASM funcs: ' + isWasm + ')');
+                    // The old `instanceof WebAssembly.Function` probe was a FALSE
+                    // PASS: WebAssembly.Function is undefined in Chrome without
+                    // --experimental-wasm-type-reflection, so the ternary printed
+                    // the literal `true` every run and nobody caught that the
+                    // "direct" bindings were asyncify JS closures the whole time.
+                    // Report the unwrap directly instead — it is the fact we care
+                    // about and it cannot silently degrade to true.
+                    console.log('[bemental] direct-binding upgrade complete'
+                        + ' (asyncify rawmap=' + Module._bem_rawmap.size
+                        + ' unwrapped=' + (bemraw(Module._dolphin_read32) !== Module._dolphin_read32)
+                        + ' read32_native=' + (/\[native code\]/.test(String(bemraw(Module._dolphin_read32)))) + ')');
                 } catch (e) {
                     console.error('[bemental] direct-binding upgrade failed:', e && e.message);
                 }
@@ -2602,19 +2645,35 @@ bool BlockCache::aot_seal_merged(const u8* bytes, std::size_t len,
             // Direct-bind the 13 ppc_* imports from the exported C fns (compile_raw
             // parity) — do NOT depend on Module.bemental_imports being bootstrapped
             // at seal time (it may not be; the merged Instance() needs all callable).
-            env.ppc_read8       = Module._dolphin_read8;
-            env.ppc_read16      = Module._dolphin_read16;
-            env.ppc_read32      = Module._dolphin_read32;
-            env.ppc_write8      = Module._dolphin_write8;
-            env.ppc_write16     = Module._dolphin_write16;
-            env.ppc_write32     = Module._dolphin_write32;
-            env.ppc_interp      = Module._dolphin_interp;
-            env.ppc_check_exc   = Module._dolphin_check_exc;
-            env.ppc_break_block = Module._dolphin_break_block;
-            env.ppc_hle_check   = Module._dolphin_hle_check;
-            env.ppc_hle_fire    = Module._dolphin_hle_fire;
-            env.ppc_msr_updated = Module._dolphin_msr_updated;
-            env.ppc_gather_drain= Module._dolphin_gather_drain;
+            // [asyncify-unwrap 2026-08-28] Same reverse-map as compile_raw's
+            // bootstrap: Module._dolphin_* is the Asyncify export closure, not the
+            // raw wasm export. See the long comment there for the measurement and
+            // the safety argument. Duplicated (not shared) because seal order vs
+            // compile_raw is not guaranteed — either may build the map first.
+            if (!Module._bem_rawmap) {
+                Module._bem_rawmap = new Map();
+                try {
+                    if (typeof Asyncify !== 'undefined' && Asyncify.funcWrappers) {
+                        Asyncify.funcWrappers.forEach(function(w, o) { Module._bem_rawmap.set(w, o); });
+                    }
+                } catch (er) { }
+            }
+            const bemraw = function(f) {
+                return (typeof f === 'function' && Module._bem_rawmap.get(f)) || f;
+            };
+            env.ppc_read8       = bemraw(Module._dolphin_read8);
+            env.ppc_read16      = bemraw(Module._dolphin_read16);
+            env.ppc_read32      = bemraw(Module._dolphin_read32);
+            env.ppc_write8      = bemraw(Module._dolphin_write8);
+            env.ppc_write16     = bemraw(Module._dolphin_write16);
+            env.ppc_write32     = bemraw(Module._dolphin_write32);
+            env.ppc_interp      = bemraw(Module._dolphin_interp);
+            env.ppc_check_exc   = bemraw(Module._dolphin_check_exc);
+            env.ppc_break_block = bemraw(Module._dolphin_break_block);
+            env.ppc_hle_check   = bemraw(Module._dolphin_hle_check);
+            env.ppc_hle_fire    = bemraw(Module._dolphin_hle_fire);
+            env.ppc_msr_updated = bemraw(Module._dolphin_msr_updated);
+            env.ppc_gather_drain= bemraw(Module._dolphin_gather_drain);
             if (Module.bemental_imports && Module.bemental_imports.env) {
                 const be = Module.bemental_imports.env;
                 for (const k in be) if (typeof env[k] === 'undefined') env[k] = be[k];

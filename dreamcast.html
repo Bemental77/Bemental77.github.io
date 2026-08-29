@@ -1551,7 +1551,36 @@
     disc.addEventListener('touchmove', (e) => { if (e.preventDefault) e.preventDefault(); const t = e.touches[0]; if (t) apply(compute(t.clientX, t.clientY)); }, { passive: false });
     disc.addEventListener('touchend', reset); disc.addEventListener('touchcancel', reset);
   }
-  function checkOrientation() { if (!isMobile) return; const landscape = window.innerWidth > window.innerHeight; const show = booted && !landscape; $('rotateHint').style.display = show ? 'flex' : 'none'; }
+  // [mobile black-screen FIX 2026-08-29] #rotateHint is `position:fixed; inset:0;
+  // background:#111; z-index:3000` — it covers the CANVAS AND THE TOUCH CONTROLS. So a
+  // stuck hint is indistinguishable from "the emulator does not render on mobile": the
+  // emulator runs fine underneath and the status line still reads `guest 1.000x . 30 fps`,
+  // but the screen is black. This was reproduced under device emulation.
+  //
+  // It could get stuck because the ONLY trigger was `resize` (see the listener block
+  // below). There was no `orientationchange` and no `screen.orientation` listener, and on
+  // iOS in particular `resize` on rotation is unreliable AND innerWidth/innerHeight are
+  // frequently STALE at the instant it fires — so the hint could be shown (or left up)
+  // against dimensions that no longer describe the device. Three defenses:
+  //   1. listen on every orientation signal, not just resize (wired below);
+  //   2. re-check on a deferred schedule, because the first read after a rotation lies;
+  //   3. make the hint DISMISSIBLE — a mis-detection must never be able to lock a user
+  //      out of a running emulator. This is the load-bearing one: it converts a hard
+  //      failure into a tap.
+  let _rotDismissed = false;
+  function checkOrientation() {
+    if (!isMobile) return;
+    const landscape = window.innerWidth > window.innerHeight;
+    if (landscape) _rotDismissed = false;   // re-arm once genuinely landscape again
+    const show = booted && !landscape && !_rotDismissed;
+    $('rotateHint').style.display = show ? 'flex' : 'none';
+  }
+  // iOS reports pre-rotation dimensions on the first tick, so sample again as it settles.
+  function checkOrientationSoon() {
+    checkOrientation();
+    requestAnimationFrame(checkOrientation);
+    [60, 180, 400, 800].forEach(function (d) { setTimeout(checkOrientation, d); });
+  }
   if (isMobile) {
     $('wrap').style.display = 'none';
     const shell = $('mobileShell');
@@ -1611,7 +1640,25 @@
       if (document.fullscreenElement || document.webkitFullscreenElement) (document.exitFullscreen || document.webkitExitFullscreen).call(document);
       else { const fn = shell.requestFullscreen || shell.webkitRequestFullscreen; if (fn) fn.call(shell).catch(() => {}); }
     });
-    window.addEventListener('resize', checkOrientation);
+    // Every orientation signal, not just resize — see checkOrientation's comment. iOS
+    // Safari fires these inconsistently, so subscribing to all of them is belt-and-braces
+    // rather than redundant, and each one goes through the deferred re-sample because the
+    // first dimension read after a rotation is routinely stale.
+    window.addEventListener('resize', checkOrientationSoon);
+    window.addEventListener('orientationchange', checkOrientationSoon);
+    if (screen.orientation && screen.orientation.addEventListener)
+      screen.orientation.addEventListener('change', checkOrientationSoon);
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) checkOrientationSoon();   // returning from lock/app-switch
+    });
+    // The escape hatch. A stuck full-screen #111 overlay reads as "the emulator is black
+    // and frozen" even though it is running underneath, which is exactly the report we got.
+    // One tap always clears it.
+    $('rotateHint').addEventListener('click', function () {
+      _rotDismissed = true;
+      $('rotateHint').style.display = 'none';
+      pageLog('[mobile] rotate hint dismissed by tap (' + window.innerWidth + 'x' + window.innerHeight + ')');
+    });
     setStatus('Pick a game and tap Start.');
   }
 })();
