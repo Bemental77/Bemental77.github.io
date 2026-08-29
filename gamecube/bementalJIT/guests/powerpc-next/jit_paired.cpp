@@ -466,7 +466,28 @@ void emit_ps_fma(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
     // [simd-paired FMA] All inputs single -> one f32x4.relaxed_madd (fused f32
     // FMA on FMA hardware — exactly JitArm64's singles-path FMLA). Keeps the
     // Single chain alive through the IDCT butterflies. Diverges from the f64
-    // interpreter by 1 ulp on ties (the same divergence native itself has).
+    // interpreter by 1 ulp on ties.
+    // *** THE JUSTIFICATION THAT USED TO BE HERE — "the same divergence native
+    // itself has" — IS FALSE. Corrected 2026-08-29 from a source audit of Jit64.
+    // Native does NOT accept that divergence; it spends ~7 extra instructions
+    // and a helper call SPECIFICALLY to avoid it. MAIN_ACCURATE_FMADDS defaults
+    // TRUE (Core/Config/MainSettings.cpp:231), so error_free_transformation is
+    // on and Jit64 emits the Ole Moller 2Sum EFT sequence
+    // (Jit_FloatingPoint.cpp:604-802 + the asm helper at
+    // Jit64AsmCommon.cpp:334-361, a direct transcription of the interpreter's
+    // NI_madd_msub at Interpreter_FPUtils.h:285-489). The motivating case is in
+    // Dolphin's own source: Mario Strikers Charged, a=0x42480000 c=0xbc88cc38
+    // b=0x1b1c72a0 — naive gives 0xbf55bf18, correct is 0xbf55bf17
+    // (Interpreter_FPUtils.h:356-370).
+    // SO THIS ARM IS PLAUSIBLY LESS ACCURATE THAN NATIVE, which cuts directly
+    // against the project's standing bar (exactness to native, not throughput).
+    // Left in place pending an EXPLICIT DECISION rather than silently reverted —
+    // but it must be a decision, not an inherited assumption.
+    // The port is cheap and lands AT native's accuracy rather than below it:
+    // Jit64's EFT is built from exactly two FMA primitives, VFMADD132SD
+    // (Jit_FloatingPoint.cpp:628) and VFMSUB231SD (:787), which map one-to-one
+    // onto wasm f64x2.relaxed_madd (263) and f64x2.relaxed_nmadd (264) — a
+    // line-by-line transcription, not a numerics redesign.
     // Force25Bit on frC is a no-op in the single domain. madd: a*c+b; msub:
     // a*c-b (negate b addend); nmadd/nmsub negate the whole result.
     if (frc.IsSingle(fa) && frc.IsSingle(fb) && frc.IsSingle(fc)) {
