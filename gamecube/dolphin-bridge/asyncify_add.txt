@@ -1,0 +1,12 @@
+Libretro::Video::ContextReset*
+Config::Save*
+*__thread_proxy*
+LibusbUtils::Context::GetDeviceList*
+ControllerInterface::UpdateInput*
+ControllerInterface::PlatformPopulateDevices*
+WiimoteReal::*
+IOS::HLE::USBHost::*
+IOS::HLE::USBScanner::*
+IOS::HLE::USBV5ResourceManager::*
+IOS::HLE::USB_HIDv5::*
+IOS::HLE::USB_VEN::*

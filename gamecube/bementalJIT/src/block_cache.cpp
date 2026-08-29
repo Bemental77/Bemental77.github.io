@@ -420,10 +420,39 @@ int compile_raw(const u8* bytes, std::size_t size) {
                     // WebAssembly export; V8 then binds import->export as a
                     // direct cross-instance wasm call with no JS frame.
                     // Falls back to the wrapper if the map is unavailable.
+                    // *** GATED OFF BY DEFAULT 2026-08-29 — THIS HANGS PSO. ***
+                    // The speedup is real and large: matched pair on ONE wasm
+                    // (md5 4409108798f4ca13e75a1eb5b26242cf, 14 runs, 0 torn),
+                    // boundary self-time 14.15% -> 0.59%, and in the collapsed
+                    // PSO character-select scene exec 99.07 -> 133.48 MHz
+                    // (+34.7%) with speed 0.3140 -> 0.4708 (+49.9%). Ranges do
+                    // not overlap, n=5/4, exact p~0.016. Idle-uncapped +20.6%.
+                    // Idle-THROTTLED is an exact null (x1.0002) — the governor
+                    // absorbs all of it, so this buys 0 fps in the shipping
+                    // config at idle and only pays under real load.
+                    // BUT: the treatment arm HARD-WEDGES PSO 5/7 vs baseline
+                    // 0/6, Fisher exact two-tailed p ~ 0.021. Identical
+                    // signature every time: guest parks at xpc=0x80375364
+                    // (PSO's frame-wait spin), peFrames frozen, drawn=0/s
+                    // permanently while it idle-spins at exec=64.3MHz. Control
+                    // against "the fast arm just travels further": baseline
+                    // survived a 51-press continuous train across 30s of
+                    // unbroken navigation; treatment wedges after FOUR presses.
+                    // Causation NOT proven — the likely route is a timing race
+                    // that the extra CPU-thread headroom exposes. dvdIntN=0 in
+                    // both arms, so it is not DVD-ISR delivery.
+                    // A 5/7 hang rate is not shippable for any speedup, so the
+                    // default is OFF until the race is found. Set SAB cell
+                    // 0x026B3930 nonzero BEFORE the first block compiles to
+                    // re-arm it for measurement (cell chosen above the DSP
+                    // guest-clock block at 0x026B3918-3928 and below the flush
+                    // census at 0x026B3A00; repo-wide grep shows no other use).
+                    const bem_unwrap_on =
+                        (HEAPU32[0x026B3930 >> 2] >>> 0) !== 0;
                     if (!Module._bem_rawmap) {
                         Module._bem_rawmap = new Map();
                         try {
-                            if (typeof Asyncify !== 'undefined' && Asyncify.funcWrappers) {
+                            if (bem_unwrap_on && typeof Asyncify !== 'undefined' && Asyncify.funcWrappers) {
                                 Asyncify.funcWrappers.forEach(function(w, o) { Module._bem_rawmap.set(w, o); });
                             }
                         } catch (er) { }

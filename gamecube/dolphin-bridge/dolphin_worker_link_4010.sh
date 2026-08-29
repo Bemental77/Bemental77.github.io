@@ -100,17 +100,153 @@ PTHREAD_POOL=${PTHREAD_POOL_SIZE:-8}
 # PASS/FAIL for that run: if `VertexManagerBase::Flush`, `OpcodeDecoder::RunFifo`,
 # `bem_chain_loop_c` and `JitWasm::Run` are NOT in the advised list, this item is
 # dead — Asyncify already costs nothing on the hot paths and nothing is owed.
-# If they ARE listed, feed a narrowed list back in with
-#   ASYNCIFY_ONLY='@/path/to/list.txt'  (or a JSON array)
+#
+# RESULT of that run, 2026-08-29 (log /tmp/asyncify-advise/advise.log, 28707 lines;
+# the wasm it emitted is byte-identical to the shipped dolphin_worker_emcc.wasm,
+# md5 8ed3e5e38e9ac553f7264b881cf788a1, so it IS a matched baseline): all four are
+# present — VertexManagerBase::Flush 44 hits, OpcodeDecoder::RunFifo 20,
+# bem_chain_loop_c 8, JitWasm::Run 50. The item is NOT dead. See ASYNCIFY_NARROW
+# below for the narrowing that came out of it; the reasons the advise log gives are
+# all indirect-call over-approximation ("bem_chain_loop_c ... due to initial", i.e.
+# it merely CONTAINS a call_indirect), which is exactly what IGNORE_INDIRECT fixes.
+#
+# ASYNCIFY_ONLY='@/path/to/list.txt' (or a JSON array) is still wired up below, but
+# prefer ASYNCIFY_NARROW: an only-list requires you to enumerate EVERY frame,
+# including the direct ones, while IGNORE_INDIRECT + an add-list lets binaryen
+# enumerate the direct frames for you and leaves only the indirect entries to name.
 ASYNCIFY_FLAGS=( -sASYNCIFY=1 )
 OUT_JS=$OUT/dolphin_worker_emcc.js
 ADVISE_MODE=0
+SCRATCH_MODE=0
 if [ "${ASYNCIFY_ADVISE:-0}" = "1" ]; then
   ADVISE_MODE=1
+  SCRATCH_MODE=1
   ASYNCIFY_FLAGS+=( -sASYNCIFY_ADVISE=1 )
   OUT_JS=${ASYNCIFY_ADVISE_OUT:-/tmp/asyncify-advise/dolphin_worker_emcc.js}
   mkdir -p "$(dirname "$OUT_JS")"
   echo "[4010] ASYNCIFY_ADVISE=1 — scratch output $OUT_JS, live worker untouched"
+fi
+# LINK_OUT_JS — link a full (non-advise) worker to a scratch path instead of the
+# live one. For A/B measuring a link-flag change (e.g. ASYNCIFY_NARROW below)
+# while somebody else is probing the live worker. Nothing in $OUT is read or
+# written in this mode: no .prev backup, and the post-build patches below are
+# applied to $OUT_JS, not to the live file.
+if [ "$ADVISE_MODE" = "0" ] && [ -n "${LINK_OUT_JS:-}" ]; then
+  SCRATCH_MODE=1
+  OUT_JS=$LINK_OUT_JS
+  mkdir -p "$(dirname "$OUT_JS")"
+  echo "[4010] LINK_OUT_JS set — scratch output $OUT_JS, live worker untouched"
+fi
+
+# ── ASYNCIFY_NARROW — env-gated, DEFAULT OFF, revert by dropping the env var ──
+# The advise run above shows the shipped default instruments essentially the whole
+# module: `-sASYNCIFY=1` with ASYNCIFY_IGNORE_INDIRECT unset makes binaryen treat
+# EVERY call_indirect as able to unwind, so every function that transitively
+# reaches one gets the two-global state machine woven through it. It roughly DOUBLES
+# the hot slow-path store function — confirmed 2026-08-29 by a matched pair (same
+# build-wasm-4010 objects, no rebuild in between; the ONLY delta is the two flags
+# this block adds), measured with `wasm-objdump -d` and `wasm-opt --func-metrics`:
+#
+#   void PowerPC::MMU::WriteToHardware<(XCheckTLBFlag)2 /*Write*/,false>(u32,u32,u32)
+#                          OFF (shipped)   ON (ASYNCIFY_NARROW=1)
+#     instructions              1690             866     -48.8%
+#     `global.get 10`            120               0     (global[10] = asyncify state)
+#     binary-bytes              3218            1799     -44.1%
+#     IR [total]                1656             845     -49.0%
+#
+#   866 IS the uninstrumented body: an independent build of this same source with
+#   Asyncify off measures 865 instructions. The narrowing removes ~100% of the
+#   Asyncify cost here, not merely some of it.
+#
+#   Other hot functions, `global.get 10` OFF -> ON: JitWasm::Run 1309 -> 0
+#   (24867 -> 16002 instrs), bem_chain_loop_c 52 -> 0; and by IR GlobalGet,
+#   VertexManagerBase::Flush 687 -> 15, OpcodeDecoder::RunFifo<false> 119 -> 2,
+#   CachedInterpreter::Run 46 -> 1.
+#   The boot chain STAYS instrumented, which is the whole point: load_iso
+#   6696 -> 76, Libretro::Video::ContextReset 185 -> 39,
+#   WGPU::VideoBackend::Initialize 133 -> 17 — they keep exactly the checks that
+#   follow calls to other still-instrumented callees.
+#   Instrumented set 11911 -> 168 functions (1.4%). Module 20,030,106 -> 14,265,162 B.
+#
+# ASYNCIFY_NARROW=1 flips on ASYNCIFY_IGNORE_INDIRECT and hands binaryen the
+# add-list in asyncify_add.txt. That list is NOT "the hot paths"; it is the set of
+# frames that are entered through an INDIRECT call while an unwind can be in
+# flight. Everything reachable from them by DIRECT calls is added automatically by
+# ASYNCIFY_PROPAGATE_ADD (default 1), so a frame can only be missed if it is
+# reached indirectly AND is not matched by a pattern in that file.
+#
+# The module has exactly three imports that can change the asyncify state (from
+# the advise output): emscripten_sleep, __wasi_fd_sync, em_libusb_wait_async.
+# Their direct-call ancestor sets, from `wasm-opt --print-call-graph` on the
+# shipped wasm, are 2 / 16 / 22 functions — and the indirect entries into those
+# sets are what asyncify_add.txt names:
+#   emscripten_sleep      <- WGPU::VideoBackend::Initialize (WGPUGfx.cpp:100 pump)
+#                            <- [virtual] Libretro::Video::ContextReset  <- load_iso
+#   __wasi_fd_sync        <- fsync <- Common::IniFile::Save
+#                            <- [virtual] ConfigLoaders::*LayerLoader::Save
+#                            <- Config::Save  (Config.cpp:132, Layer::Save inlined)
+#                            + CPU::CPUManager::StartTimePlayedTimer (thread body)
+#   em_libusb_wait_async  <- libusb_handle_events_timeout_completed
+#                            <- LibusbUtils::Context::Impl::EventThread (thread body)
+#                            + hidapi/Wiimote/IOS-USB/SteamDeck entries, whose
+#                              indirect callers are the WiimoteReal / IOS::HLE::USB* /
+#                              ControllerInterface / GetDeviceList patterns
+#
+# ⚠ DO NOT WIDEN THESE PATTERNS "to be safe" — it does the opposite. PROPAGATE_ADD
+# walks UPWARD from every match, so a pattern that happens to match a function the
+# HOT path calls drags the entire emulator back in. Two measured examples from the
+# first draft of this list: `*LibusbUtils::*` matched LibusbUtils::Context::Context(),
+# which Core::System::System() calls directly -> bem_chain_loop_c/JitWasm::Run/MMU
+# all re-instrumented; `*IOS::HLE::*` matched an ICF-folded
+# std::shared_ptr<IOS::HLE::ESDevice>::~shared_ptr() that TextureCacheBase::LoadImpl
+# calls -> VertexManagerBase::Flush + OpcodeDecoder::RunFifo re-instrumented. Both
+# produced a list that was bigger AND useless. Validate any edit with
+#   python3 gamecube/dolphin-bridge/check_asyncify_addlist.py \
+#           gamecube/dolphin-bridge/asyncify_add.txt
+# BEFORE spending a link — it reproduces binaryen's propagation offline and exits
+# nonzero on hot-path leakage. Its two inputs are regenerated by the two wasm-opt
+# commands in that script's docstring.
+#
+# ⚠ FAILURE SIGNATURE if the add-list is incomplete: this does NOT degrade
+# gracefully and does NOT show up as a perf regression. An uninstrumented frame
+# does not return early when the unwind passes through it — it keeps executing
+# with the callee's result undefined — so it fails AT BOOT, hard and immediately:
+# the WGPU adapter/device request is the first thing load_iso does, so you get no
+# '[wgpu] adapter=OK' line, then either a wasm trap / "RuntimeError: memory access
+# out of bounds" / "null function or function signature mismatch" out of load_iso,
+# or an `abort("invalid state: N")` from Asyncify.handleSleep in the glue. A page
+# that reaches the title screen has already proven the WGPU chain is complete.
+# Revert = unset ASYNCIFY_NARROW and re-link. No source file changes are involved.
+#
+# RESIDUAL RISK, stated honestly. Two of the three unwind sources are closed by
+# construction — their whole ancestor set is 2 and 16 functions and every root of
+# each is either a wasm export (JS entry, nothing above it) or named in the list:
+#   * emscripten_sleep : CLOSED. load_iso -> ContextReset -> Initialize -> sleep.
+#     hw_render.context_reset is only ASSIGNED (Video.cpp:213), never invoked
+#     in-tree; EmscriptenWorker.cpp:476 calls ContextReset directly.
+#   * __wasi_fd_sync    : CLOSED. Note _fd_sync in the glue proxies to the main
+#     thread on a pthread and, on MEMFS (no mount.type.syncfs), calls wakeUp()
+#     synchronously — handleSleep then returns WITHOUT unwinding. So this one very
+#     likely never actually unwinds; it is covered anyway because it is cheap.
+#   * em_libusb_wait_async : NOT fully closed, and this is the one to watch. It is
+#     a REAL unwind (__asyncjs__em_libusb_wait_async -> Asyncify.handleAsync ->
+#     await Atomics.waitAsync). The autonomous path is closed —
+#     __thread_proxy -> LibusbUtils::Context::Impl::EventThread ->
+#     libusb_handle_events_completed -> ... -> the import. The SYNCHRONOUS paths
+#     (WiimoteReal hidapi IO, IOS::HLE USB transfers, ciface::SteamDeck HID) are
+#     covered by naming their virtual-dispatch callers, but two of those callers
+#     (ControllerInterface::RefreshDevices, WiimoteScanner::ThreadFunc) were
+#     inlined away and could not be pinned by name — they are assumed covered by
+#     ControllerInterface::PlatformPopulateDevices / *__thread_proxy*. All of these
+#     require a real HID/USB device to exist, which a browser worker without
+#     WebUSB cannot supply. If a future build gains WebUSB, re-audit this branch.
+if [ "${ASYNCIFY_NARROW:-0}" = "1" ]; then
+  ASYNCIFY_ADD_FILE=${ASYNCIFY_ADD_FILE:-$BRIDGE/asyncify_add.txt}
+  ASYNCIFY_FLAGS+=( -sASYNCIFY_IGNORE_INDIRECT=1 -sASYNCIFY_ADD=@"$ASYNCIFY_ADD_FILE" )
+  echo "[4010] ASYNCIFY_NARROW=1 — IGNORE_INDIRECT + add-list $ASYNCIFY_ADD_FILE"
+  echo "[4010]   VERIFY: emcc must print NO 'Asyncify addlist contained a"
+  echo "[4010]   non-existing function name' warning. Any such warning means that"
+  echo "[4010]   pattern matched nothing and its frame is UNINSTRUMENTED."
 fi
 if [ -n "${ASYNCIFY_ONLY:-}" ]; then
   ASYNCIFY_FLAGS+=( -sASYNCIFY_ONLY="$ASYNCIFY_ONLY" )
@@ -119,7 +255,7 @@ fi
 echo "[4010] mem: INITIAL=$INITIAL_MEMORY MAXIMUM=$MAXIMUM_MEMORY pool=$PTHREAD_POOL"
 
 # Preserve the currently-live worker (e.g. the SW build) before overwriting.
-if [ "$ADVISE_MODE" = "0" ] && [ -f "$OUT/dolphin_worker_emcc.wasm" ]; then
+if [ "$SCRATCH_MODE" = "0" ] && [ -f "$OUT/dolphin_worker_emcc.wasm" ]; then
   cp -f "$OUT/dolphin_worker_emcc.wasm" "$OUT/dolphin_worker_emcc.prev.wasm"
   cp -f "$OUT/dolphin_worker_emcc.js"   "$OUT/dolphin_worker_emcc.prev.js"
   echo "[4010] backed up live worker -> dolphin_worker_emcc.prev.{js,wasm}"
@@ -238,12 +374,14 @@ if [ "$ADVISE_MODE" = "1" ]; then
 fi
 
 # Post-build patches (same as canonical; no-op if the target string is absent under WGPU).
-sed -i '' 's|for(var name of transferredCanvasNames)|if(!transferredCanvasNames)transferredCanvasNames=[];for(var name of transferredCanvasNames)|' "$OUT/dolphin_worker_emcc.js" || true
-node "$BRIDGE/patch_blit_getparameter.mjs" "$OUT/dolphin_worker_emcc.js" || true
+# NOTE: these MUST target "$OUT_JS", not the hardcoded live path — under
+# LINK_OUT_JS the emitted file is in scratch and the live worker must not be touched.
+sed -i '' 's|for(var name of transferredCanvasNames)|if(!transferredCanvasNames)transferredCanvasNames=[];for(var name of transferredCanvasNames)|' "$OUT_JS" || true
+node "$BRIDGE/patch_blit_getparameter.mjs" "$OUT_JS" || true
 # [2026-07-13] emdawnwebgpu's blend-factor enum table uses Dawn's names 'src1alpha' /
 # 'one-minus-src1alpha', but Chrome implements the WebGPU-spec strings 'src1-alpha' /
 # 'one-minus-src1-alpha' — createRenderPipeline rejects the Dawn spelling (TypeError, dual-source
 # pipelines fail). One global replace fixes both (the long name contains the short one).
-sed -i '' 's|src1alpha|src1-alpha|g' "$OUT/dolphin_worker_emcc.js" || true
+sed -i '' 's|src1alpha|src1-alpha|g' "$OUT_JS" || true
 
-echo "linked (WebGPU 4010): $OUT/dolphin_worker_emcc.js"
+echo "linked (WebGPU 4010): $OUT_JS"
