@@ -822,6 +822,224 @@ function startServer() {
     console.log('[probe] scene-rate: per-' + _srPer + 'ms rate series installed');
   }
 
+  // ---- [flush-census 2026-08-29] read the VertexManagerBase census cells ----
+  // PROBE_FLUSH_CENSUS="<ms>,<ms>" (offsets from the Start click, same frame as
+  // PROBE_LOAD_STATE_MS) dumps cells 0x026B3A00..0x026B3AF4, which
+  // VertexManagerBase.cpp's BemFlushCensus namespace publishes. Counters are
+  // CUMULATIVE FROM BOOT, so two samples are required and the DELTA is the
+  // answer; a single sample is dominated by the boot/attract traffic.
+  //
+  // PROBE_CENSUS_OFF_MS=<ms> writes 1 to the control cell 0x026B3A00 at that
+  // offset (nonzero = census OFF, BemFlushCensus::Enabled()), which is the
+  // is-the-census-itself-perturbing arm — compare drawPath[0] / peFrames rates
+  // either side of the flip inside ONE process.
+  const CENSUS_BASE = 0x026B3A00;
+  const CENSUS_WORDS = 62;  // 0x026B3A00..0x026B3AF4 inclusive
+  const CAT_NAMES = ['TEX', 'TEV', 'BLEND', 'TEVREG', 'SCISSOR', 'PECOPY',
+                     'MISC', 'PROJ', 'POSMTX', 'LIGHT', 'TEXGEN', 'VTXFMT'];
+  const censusSnap = async (tag) => {
+    const s = await page.evaluate((base, words) => {
+      if (!window.sharedMemory) return null;
+      const A = new Uint32Array(window.sharedMemory.buffer);
+      const o = { wall: performance.now(), c: [] };
+      for (let i = 0; i < words; i++) o.c.push(A[(base >> 2) + i] >>> 0);
+      // co-sampled so the census delta can be normalised against the same
+      // window's real work: drawPath[0] = DrawIndexed entries, peFrames = PE
+      // SetFinish (guest frames).
+      o.drawPath0 = A[0x026B3560 >> 2] >>> 0;
+      o.peFrames = A[0x026B0930 >> 2] >>> 0;
+      return o;
+    }, CENSUS_BASE, CENSUS_WORDS);
+    if (!s) { console.log('[census] ' + tag + ': no sharedMemory'); return null; }
+    const c = s.c;
+    const F = {
+      ctl: c[0], calls: c[1], noop: c[2], real: c[3], drawn: c[4],
+      cullAll: c[5], zeroIdx: c[6], sitePrim: c[7], siteBuf: c[8], siteExt: c[9],
+      cats: c.slice(10, 22),
+      maskNone: c[22], maskOne: c[23], bitsSum: c[24], idxSum: c[25],
+      slots: [], slotOvf: c[58], frames: c[59], drawnAtF: c[60], drawnDelta: c[61],
+      drawPath0: s.drawPath0, peFrames: s.peFrames, wall: s.wall,
+    };
+    for (let i = 0; i < 16; i++) F.slots.push({ key: c[26 + i * 2], count: c[27 + i * 2] });
+    console.log('[census] ' + tag + ' t=' + (s.wall / 1000).toFixed(1) + 's'
+      + ' ctl=' + F.ctl + ' calls=' + F.calls + ' noop=' + F.noop + ' real=' + F.real
+      + ' drawn=' + F.drawn + ' cullAll=' + F.cullAll + ' zeroIdx=' + F.zeroIdx
+      + ' | site prim=' + F.sitePrim + ' buf=' + F.siteBuf + ' ext=' + F.siteExt
+      + ' | maskNone=' + F.maskNone + ' maskOne=' + F.maskOne + ' bitsSum=' + F.bitsSum
+      + ' idxSum=' + F.idxSum + ' slotOvf=' + F.slotOvf
+      + ' | frames=' + F.frames + ' drawnDelta=' + F.drawnDelta
+      + ' | drawPath0=' + F.drawPath0 + ' peFrames=' + F.peFrames);
+    console.log('[census] ' + tag + ' cats ' + F.cats.map((v, i) => CAT_NAMES[i] + '=' + v).join(' '));
+    return F;
+  };
+  const maskStr = (m) => {
+    if (m === 0) return 'none';
+    const out = [];
+    for (let i = 0; i < 12; i++) if (m & (1 << i)) out.push(CAT_NAMES[i]);
+    return out.join('|');
+  };
+  const SITE_NAME = { 0: 'ext', 1: 'prim', 2: 'buf' };
+  const censusDelta = (a, b) => {
+    if (!a || !b) { console.log('[census-delta] missing a sample — nothing to subtract'); return; }
+    const dw = (b.wall - a.wall) / 1000;
+    const d = (k) => (b[k] >>> 0) - (a[k] >>> 0);
+    const dDrawn = d('drawn'), dCalls = d('calls'), dReal = d('real'), dNoop = d('noop');
+    const dBits = d('bitsSum'), dIdx = d('idxSum');
+    const dCats = b.cats.map((v, i) => (v >>> 0) - (a.cats[i] >>> 0));
+    const catTotal = dCats.reduce((x, y) => x + y, 0);
+    console.log('[census-delta] window=' + dw.toFixed(2) + 's'
+      + '  calls=' + dCalls + ' (' + (dCalls / dw).toFixed(0) + '/s)'
+      + '  noop=' + dNoop + '  real=' + dReal + '  drawn=' + dDrawn
+      + ' (' + (dDrawn / dw).toFixed(0) + '/s)'
+      + '  cullAll=' + d('cullAll') + '  zeroIdx=' + d('zeroIdx'));
+    console.log('[census-delta] sites  prim=' + d('sitePrim') + '  buf=' + d('siteBuf')
+      + '  ext=' + d('siteExt')
+      + '   | drawPath0 +' + d('drawPath0') + '   peFrames +' + d('peFrames')
+      + '   frames +' + d('frames')
+      + '   drawn/peFrame=' + (d('peFrames') ? (dDrawn / d('peFrames')).toFixed(1) : 'n/a'));
+    console.log('[census-delta] maskNone=' + d('maskNone')
+      + ' (' + (dDrawn ? (100 * d('maskNone') / dDrawn).toFixed(1) : '0') + '% of drawn)'
+      + '  maskOne=' + d('maskOne')
+      + ' (' + (dDrawn ? (100 * d('maskOne') / dDrawn).toFixed(1) : '0') + '%)'
+      + '  bits/flush=' + (dDrawn ? (dBits / dDrawn).toFixed(3) : 'n/a')
+      + '  indices/drawn=' + (dDrawn ? (dIdx / dDrawn).toFixed(2) : 'n/a'));
+    const ranked = dCats.map((v, i) => ({ n: CAT_NAMES[i], v }))
+      .sort((x, y) => y.v - x.v);
+    console.log('[census-delta] cats (marginal, sum=' + catTotal + '): '
+      + ranked.map(r => r.n + '=' + r.v
+          + '(' + (dDrawn ? (100 * r.v / dDrawn).toFixed(1) : '0') + '%)').join(' '));
+    // slots are matched BY KEY, not by index: a key can be assigned to a slot
+    // between the two samples, in which case its `a` count is 0.
+    const aByKey = new Map();
+    a.slots.forEach(s => { if (s.key) aByKey.set(s.key, s.count >>> 0); });
+    const rows = [];
+    b.slots.forEach(s => {
+      if (!s.key) return;
+      const prev = aByKey.has(s.key) ? aByKey.get(s.key) : 0;
+      const dc = (s.count >>> 0) - prev;
+      if (dc !== 0) rows.push({ key: s.key, dc });
+    });
+    rows.sort((x, y) => y.dc - x.dc);
+    console.log('[census-delta] top slots (' + rows.length + ' active, slotOvf +' + d('slotOvf') + '):');
+    rows.forEach(r => {
+      const site = (r.key >>> 16) & 0xffff, mask = r.key & 0xffff;
+      console.log('[census-delta]   site=' + (SITE_NAME[site] || site)
+        + ' mask=0x' + mask.toString(16).padStart(4, '0')
+        + ' [' + maskStr(mask) + ']  count=' + r.dc
+        + ' (' + (dDrawn ? (100 * r.dc / dDrawn).toFixed(1) : '0') + '% of drawn)');
+    });
+  };
+  if (process.env.PROBE_FLUSH_CENSUS) {
+    // "<ms>,<ms>[,<ms>...]" — N sample points. Each sample after the first
+    // prints the delta against the PREVIOUS one, so an N-arm ablation gets one
+    // census window per arm out of a single process (same machine load, same
+    // scene, which an across-run A/B cannot give on this box).
+    const _cts = process.env.PROBE_FLUSH_CENSUS.split(',').map(x => parseInt(x.trim(), 10));
+    if (_cts.length < 2 || _cts.some(isNaN)) {
+      console.log('[census] PROBE_FLUSH_CENSUS must be "<ms>,<ms>[,...]" — got ' + process.env.PROBE_FLUSH_CENSUS);
+    } else {
+      let _cPrev = null;
+      _cts.forEach((at, i) => {
+        const tag = String.fromCharCode(65 + i);
+        setTimeout(async () => {
+          try {
+            const s = await censusSnap(tag);
+            if (_cPrev && s) { console.log('[census-delta] === window ' + _cPrev.tag + '->' + tag + ' ==='); censusDelta(_cPrev, s); }
+            if (s) { s.tag = tag; _cPrev = s; }
+          } catch (e) { console.log('[census] ' + tag + ' failed: ' + e.message); }
+        }, at);
+      });
+      console.log('[probe] flush-census: ' + _cts.length + ' samples at ' + _cts.join('/') + 'ms');
+    }
+  }
+  const CENSUS_OFF_MS = parseInt(process.env.PROBE_CENSUS_OFF_MS || '0', 10);
+  if (CENSUS_OFF_MS > 0) {
+    setTimeout(async () => {
+      try {
+        const r = await page.evaluate((base) => {
+          if (!window.sharedMemory) return 'no sharedMemory';
+          const A = new Uint32Array(window.sharedMemory.buffer);
+          const before = A[base >> 2] >>> 0;
+          A[base >> 2] = 1;
+          return 'ctl ' + before + ' -> ' + (A[base >> 2] >>> 0);
+        }, CENSUS_BASE);
+        console.log('[census-off] armed at ' + CENSUS_OFF_MS + 'ms: ' + r);
+      } catch (e) { console.log('[census-off] arm failed: ' + e.message); }
+    }, CENSUS_OFF_MS);
+  }
+
+  // ---- [poke 2026-08-29] generic SAB control-cell writer ------------------
+  // PROBE_POKE="0x026B3B00=1@70000,0x026B3B04=1@90000" — write <val> to <cell>
+  // at <ms> from the Start click. The established runtime-flag pattern is a SAB
+  // scratch cell, not an env var (the worker never sees the probe's env), and
+  // every such cell so far needed its own bespoke block. This is the generic
+  // one. Cells currently honoured by the core:
+  //   0x026B3A00 flush-census OFF        0x026B392C CoreTiming uncap
+  //   0x026B3B00 draw-ablation ARM A     (WGPUGfx::DrawIndexed early-return)
+  //   0x026B3B04 draw-ablation ARM B     (VertexManagerBase::Flush early-return)
+  //   0x026B3B08 draw-ablation ARM A'    (VertexManagerBase::RenderDrawCall)
+  if (process.env.PROBE_POKE) {
+    process.env.PROBE_POKE.split(',').filter(Boolean).forEach((spec) => {
+      const m = spec.trim().match(/^(0[xX][0-9a-fA-F]+|\d+)=(\d+)@(\d+)$/);
+      if (!m) { console.log('[poke] spec ignored: ' + spec); return; }
+      const cell = Number(m[1]), val = Number(m[2]), at = Number(m[3]);
+      setTimeout(async () => {
+        try {
+          const r = await page.evaluate((c, v) => {
+            if (!window.sharedMemory) return 'no sharedMemory';
+            const A = new Uint32Array(window.sharedMemory.buffer);
+            const before = A[c >> 2] >>> 0;
+            A[c >> 2] = v;
+            return before + ' -> ' + (A[c >> 2] >>> 0);
+          }, cell, val);
+          console.log('[poke] 0x' + cell.toString(16) + ' @' + at + 'ms: ' + r);
+        } catch (e) { console.log('[poke] 0x' + cell.toString(16) + ' failed: ' + e.message); }
+      }, at);
+    });
+    console.log('[probe] poke: ' + process.env.PROBE_POKE);
+  }
+
+  // ---- [nav-cycle 2026-08-29] repeated d-pad up/down, the user's exact case --
+  // PROBE_NAV="<startMs>,<endMs>,<halfPeriodMs>" alternates ArrowDown / ArrowUp
+  // holds for the whole window. PROBE_PRESS only fires one 500ms hold per spec,
+  // which cannot reproduce "moving up and down between these" for 20+ seconds.
+  // Arrows are the d-pad on the TRUSTED physical path (gamecube.html:3024-3025),
+  // the same route page.keyboard already uses for PROBE_PRESS.
+  if (process.env.PROBE_NAV) {
+    const _nv = process.env.PROBE_NAV.split(',').map(x => parseInt(x.trim(), 10));
+    if (_nv.length !== 3 || _nv.some(isNaN)) {
+      console.log('[nav] PROBE_NAV must be "<startMs>,<endMs>,<halfPeriodMs>" — got ' + process.env.PROBE_NAV);
+    } else {
+      const [nStart, nEnd, nHalf] = _nv;
+      const NAV_KEYS = (process.env.PROBE_NAV_KEYS || 'ArrowDown,ArrowUp').split(',');
+      // fraction of each half-period the key is HELD. The gap has to be nonzero
+      // (up and down held together is neutral), but it should be small — the
+      // reported case is a hold, not a tap.
+      const NAV_DUTY = parseFloat(process.env.PROBE_NAV_DUTY || '0.85');
+      let nI = 0, nPresses = 0, nTimer = null;
+      setTimeout(() => {
+        console.log('[nav] start: alternating ' + NAV_KEYS.join('/') + ' every ' + nHalf + 'ms until ' + nEnd + 'ms');
+        const step = async () => {
+          const k = NAV_KEYS[nI++ % NAV_KEYS.length];
+          try {
+            await page.keyboard.down(k);
+            await new Promise(r => setTimeout(r, Math.max(30, Math.floor(nHalf * NAV_DUTY))));
+            await page.keyboard.up(k);
+            nPresses++;
+          } catch (e) { /* page may be closing */ }
+        };
+        nTimer = setInterval(step, nHalf);
+        nTimer.unref && nTimer.unref();
+        setTimeout(() => {
+          clearInterval(nTimer);
+          NAV_KEYS.forEach(k => page.keyboard.up(k).catch(() => {}));
+          console.log('[nav] stop: ' + nPresses + ' presses delivered');
+        }, Math.max(0, nEnd - nStart));
+      }, nStart);
+      console.log('[probe] nav-cycle: ' + nStart + 'ms..' + nEnd + 'ms, half-period ' + nHalf + 'ms');
+    }
+  }
+
   const phaseTimer = setInterval(async () => {
     try {
       const s = await page.evaluate(() => {

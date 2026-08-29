@@ -1871,6 +1871,17 @@ void WGPUGfx::DrawIndexed(WGPUBuffer vertex_buffer, WGPUBuffer index_buffer,
   // other bails @0x026B3568, encoder draws executed @0x026B356C. Plain increments; read by
   // dolphin_render_probe.js:692 (`drawPath`) — kept unconditional.
   ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3560u));
+  // [draw-ablation TEMP 2026-08-29] ARM A: cell 0x026B3B00 nonzero => return
+  // here, after the counter bump so drawPath[0] still measures how many draws
+  // the frame WOULD have submitted. Drops bind-group build/cache, SetPipeline,
+  // SetVertexBuffer/SetIndexBuffer, SetBindGroup and the DrawIndexed encode.
+  // It does NOT drop the vertex/index/uniform uploads — those are
+  // wgpuQueueWriteBuffer calls in WGPUVertexManager.cpp:324/337/408/410, which
+  // run BEFORE this function. Use cell 0x026B3B08 (VertexManagerBase::
+  // RenderDrawCall) for the arm that also removes those.
+  // SAB is browser-zeroed, so 0 (cold boot) = NOT ablated.
+  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3B00u)) != 0u)
+    return;
   // [thread-id PM33] draw thread @0x026B35A4, read by dolphin_render_probe.js:704 (`gfxThreads`).
   // Was a pthread_self() call on EVERY draw; the identity never changes after the first draw, so
   // publish it ONCE. Cell stays live — the probe reads the same value it read before.

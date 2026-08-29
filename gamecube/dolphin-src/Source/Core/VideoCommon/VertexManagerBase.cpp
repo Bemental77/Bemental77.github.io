@@ -773,6 +773,22 @@ void VertexManagerBase::Flush()
 
   m_is_flushed = true;
 
+  // [draw-ablation TEMP 2026-08-29] ARM B: cell 0x026B3B04 nonzero => return
+  // here. Keeps FIFO decode + vertex loading (PrepareForAdditionalData already
+  // ran); drops texture cache Load/BindTextures, VertexShaderManager::
+  // SetConstants, pipeline config/compile, uniform upload, CommitBuffer and the
+  // draw. Safe as an early-out for exactly the reason the num_indices==0 path
+  // below it is: PrepareForAdditionalData (line ~514) re-arms the buffer on the
+  // next batch because m_is_flushed is already true. OnDraw() is still called so
+  // the command-buffer kick schedule is unchanged between arms.
+  // SAB is browser-zeroed, so 0 (cold boot) = NOT ablated. Read by
+  // dolphin_render_probe.js PROBE_POKE.
+  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3B04u)) != 0u)
+  {
+    OnDraw();
+    return;
+  }
+
   if (m_draw_counter == 0)
   {
     // This is more or less the start of the Frame
@@ -1414,6 +1430,18 @@ void VertexManagerBase::RenderDrawCall(
     std::span<u8> custom_pixel_shader_uniforms, PrimitiveType primitive_type,
     const AbstractPipeline* current_pipeline)
 {
+  // [draw-ablation TEMP 2026-08-29] ARM A': cell 0x026B3B08 nonzero => return
+  // here. Drops the uniform upload (WGPUVertexManager.cpp:408/410), the pipeline
+  // bind, CommitBuffer's vertex+index wgpuQueueWriteBuffer (WGPUVertexManager
+  // .cpp:324/337) and the draw — but KEEPS texture-cache Load/BindTextures,
+  // VertexShaderManager::SetConstants and pipeline config/compile, all of which
+  // ran before this call. This is the arm that matches "remove all GPU
+  // submission AND all uniform/vertex upload"; the 0x026B3B00 arm inside
+  // WGPUGfx::DrawIndexed does NOT, because every wgpuQueueWriteBuffer happens
+  // upstream of it.
+  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3B08u)) != 0u)
+    return;
+
   // Now we can upload uniforms, as nothing else will override them.
   geometry_shader_manager.SetConstants(primitive_type);
   pixel_shader_manager.SetConstants();
