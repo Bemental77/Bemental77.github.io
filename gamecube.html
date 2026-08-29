@@ -170,8 +170,533 @@
     </div>
   </div>
   <div id="rotateHint">Rotate your device to landscape to play.</div>
-  <div id="toast"></div>
 </div>
+<!-- #toast lives at BODY level, not inside #mobileShell: that div is display:none on
+     desktop, so every toast the page raised (Save/Load/Export/Import, audio errors)
+     was invisible there. toast() re-parents it into document.fullscreenElement when
+     one is open, because only the fullscreen element's subtree renders. -->
+<div id="toast"></div>
+<script>
+// ======================== GcRate — the page's rate model, in ONE testable place ==============
+// [rate-model-selftest 2026-08-29] The pacing + rate accounting used to be loose variables
+// inside the ?recomp=1 IIFE, so the only way to ask whether it told the truth was to boot the
+// emulator and squint. It is now a factory with an INJECTED clock and an INJECTED credit pool,
+// so the live page and the ?ratetest=1 self-test drive the SAME code — a simulation OF a
+// protocol can diverge from the protocol; a simulation that CALLS the protocol cannot.
+//
+//   http://localhost:8080/gamecube.html?ratetest=1
+//
+// runs the suite with no emulator, no worker and no probe, printing RATETEST PASS/FAIL lines
+// to the on-page log and the console.
+window.GcRate = (function () {
+  'use strict';
+
+  var DEF = { guestHz: 60, maxDtMs: 100, maxBacklog: 8 };
+
+  // ---- seqlock -> published frames -----------------------------------------------------
+  // 0x026B3518 is a SEQLOCK, not a frame counter: WGPUGfx.cpp:1242 bumps it to ODD before the
+  // pixel memcpy and :1264 to EVEN after => exactly +2 per PUBLISHED frame. A reader that
+  // forgot the /2 reported 2.003x the real rate. Snap an odd sample back to the last COMPLETE
+  // frame, then halve. Unsigned-wrap safe.
+  function seqDelta(seq, mark) {
+    var s = seq >>> 0;
+    if (s & 1) s = (s - 1) >>> 0;
+    if (mark === null || mark === undefined || mark < 0) return { published: 0, mark: s };
+    return { published: ((s - mark) >>> 0) >>> 1, mark: s };
+  }
+
+  function num(n, d) {
+    return (n === null || n === undefined || !isFinite(n)) ? '--' : n.toFixed(d || 0);
+  }
+
+  // The status-bar headline, as a PURE function of the rate object, so the self-test can assert
+  // the exact text the user reads instead of a number that only resembles it.
+  function format(r) {
+    return [
+      'speed ' + (r.speed === null || r.speed === undefined ? '--' : num(r.speed, 2) + 'x')
+        + (r.speedReq !== 1 ? ' (req ' + (r.speedReq === Infinity ? 'max' : num(r.speedReq, 2) + 'x') + ')' : '')
+        + (r.starved ? ' STARVED' : ''),
+      (r.capFps === null || r.capFps === undefined) ? 'cap --'
+        : num(r.capFps) + ' fps cap (' + num(r.capFps / r.guestHz, 1) + 'x hw)',
+      num(r.shown) + ' shown / ' + num(r.published) + ' published'
+    ].join('  ·  ');
+  }
+
+  // ---- the model -----------------------------------------------------------------------
+  // cfg.pool is the credit pool: { load(), add(n), reset() }. In the page that is Atomics over
+  // the pace SAB cell 0; in the self-test it is a plain counter. Nothing else in the model
+  // touches shared state, and it never reads a clock — every entry point takes `t`.
+  function makeModel(cfg) {
+    cfg = cfg || {};
+    var guestHz = Math.max(1, cfg.guestHz || DEF.guestHz);
+    var target  = (cfg.target === 0) ? 0 : (cfg.target || guestHz);
+    var MAX_DT_MS   = cfg.maxDtMs   || DEF.maxDtMs;
+    var MAX_BACKLOG = cfg.maxBacklog || DEF.maxBacklog;
+    var pool = cfg.pool;
+
+    var m = {
+      guestHz: guestHz, target: target, maxDtMs: MAX_DT_MS, maxBacklog: MAX_BACKLOG,
+      // credit clock
+      granted: 0, credAcc: 0, lastT: 0, stallMs: 0, hiddenAt: 0, lostCredits: 0,
+      // stream bookkeeping
+      framesSeen: 0, rendered: 0, outstanding: 0, dropped: 0, staleAcks: 0,
+      // cumulative-speed span
+      spanOn: false, spanT0: 0, spanConsumed0: 0, spanFrames0: 0, spanStall0: 0,
+      // guest busy accounting
+      lastFrameAt: 0, guestBusyMs: 0, guestBusyN: 0, credCount: 0, credBase: 0,
+      // render busy accounting
+      renderBusyMs: 0, renderBusyFrom: 0, renderedWin: 0, renderBusyMark: 0,
+      // 1s window marks
+      sampT: 0, sampFrames: 0, sampRendered: 0
+    };
+
+    // Emulated time, exactly: every VIWaitForRetrace consumes one credit and advances the
+    // guest clock by 1/guestHz (recomp_worker.js:608 OSGetTime = viRetrace*675000 at the
+    // 40.5MHz timebase = 1/60 s; :768 viRetrace++; :784-787 consume).
+    function poolNow() { var p = pool.load(); return p > 0 ? p : 0; }
+    function consumed() { return m.granted - poolNow(); }
+    function renderBusyAt(t) { return m.renderBusyMs + (m.renderBusyFrom ? t - m.renderBusyFrom : 0); }
+    function stallAt(t) { return m.stallMs + (m.hiddenAt ? t - m.hiddenAt : 0); }
+    m.consumed = consumed;
+    m.renderBusyAt = renderBusyAt;
+
+    // ---- exact gate attribution ----------------------------------------------------------
+    // The guest's per-frame CPU cost is the inter-frame interval MINUS the time it sat parked
+    // in Atomics.wait for its gating credit. Subtracting "the last time the pool went 0 ->
+    // non-empty" is NOT that time: an empty pool also happens every time the worker consumed
+    // its credit and is mid-compute, so a later grant gets mistaken for the gate the worker
+    // waited on and the busy window is truncated. That is not a corner case — with the guest
+    // at a true 60/s (16.6ms/frame) the phase beat between rAF and the guest walks that error
+    // upward until `cap` reads 426 fps for a 60 fps guest (7x), which is exactly the kind of
+    // lie this model exists to prevent.
+    //
+    // So attribute credits INDIVIDUALLY. The worker consumes exactly one credit per
+    // VIWaitForRetrace call (recomp_worker.js:784-787) and posts at most one frame per call
+    // with n = the call index (:752 posts viRetrace, :768 increments it), so the credit that
+    // gates frame n is credit n-1. Queue each granted credit's availability time; the pool
+    // level tells us how many have been consumed; the ring records when each consumed credit
+    // BECAME AVAILABLE. Then
+    //     guestBusy(n) = T_frame(n) - max( T_frame(n-1), avail(credit n-1) )
+    // is exact whether the worker parked (avail > T_frame(n-1)) or never parked (avail older).
+    var CRING = 1024;                    // ~17s of history at 60Hz; older frames fall back
+    var credAvail = new Float64Array(CRING);
+    var creditQ = [];                    // availability times of granted, not-yet-consumed credits
+    function drainCredits() {
+      var n = creditQ.length - poolNow();
+      while (n-- > 0 && creditQ.length) { credAvail[m.credCount % CRING] = creditQ.shift(); m.credCount++; }
+    }
+    function gateFor(n) {
+      var idx = n - 1 - m.credBase;      // credit index that gated frame n
+      if (idx < 0 || idx >= m.credCount || m.credCount - idx > CRING) return 0;
+      return credAvail[idx % CRING];
+    }
+    m.drainCredits = drainCredits;
+    m.gateFor = gateFor;
+
+    // rAF: integrate wall time into credits. THE GUEST CLOCK. Returns credits granted.
+    m.grant = function (t) {
+      if (target <= 0) return 0;
+      if (!m.lastT) { m.lastT = t; return 0; }
+      var dt = t - m.lastT;
+      m.lastT = t;
+      if (dt < 0) dt = 0;
+      // A stall longer than MAX_DT_MS is DROPPED, never repaid as a sprint. The dropped wall
+      // time is remembered so the cumulative speed denominator can exclude it: we were not
+      // running, so it is not time the guest failed to keep up with.
+      if (dt > MAX_DT_MS) { m.stallMs += dt - MAX_DT_MS; dt = MAX_DT_MS; }
+      m.credAcc += dt * target / 1000;
+      var grant = Math.floor(m.credAcc);
+      if (grant <= 0) return 0;
+      m.credAcc -= grant;                       // clamped-away credits are LOST, not banked
+      var p = poolNow();
+      var room = MAX_BACKLOG - p;
+      if (grant > room) { m.lostCredits += grant - room; grant = room; }
+      if (grant <= 0) return 0;
+      drainCredits();
+      pool.add(grant); m.granted += grant;
+      for (var i = 0; i < grant; i++) creditQ.push(t);   // each credit remembers when it opened
+      return grant;
+    };
+
+    // Out-of-band credits (stPoke unblocks a parked worker so it can service a savestate
+    // command). Routed through the model so `granted` — and therefore emulated time — stays
+    // consistent; it deliberately ignores MAX_BACKLOG because its whole job is to unstick.
+    m.pokeCredits = function (n, t) {
+      drainCredits();
+      pool.add(n); m.granted += n;
+      for (var i = 0; i < n; i++) creditQ.push(t || 0);
+    };
+
+    // A 'frame' message from recomp_worker. Returns whether the renderer should skip the draw.
+    m.frame = function (n, t) {
+      drainCredits();
+      m.framesSeen = n;
+      if (m.lastFrameAt) {
+        var gate = target > 0 ? gateFor(n) : 0;
+        var start = gate > m.lastFrameAt ? gate : m.lastFrameAt;
+        m.guestBusyMs += t - start; m.guestBusyN++;
+      }
+      m.lastFrameAt = t;
+      var skipRender = m.outstanding >= 2;
+      if (skipRender) m.dropped++;
+      else { if (m.outstanding === 0) m.renderBusyFrom = t; m.outstanding++; }
+      return skipRender;
+    };
+
+    // A 'recompAck' from dolphin_worker. Skipped frames are never acked
+    // (dolphin-bridge/worker_funcs.js:906 breaks before the :935 ack), so this pairs 1:1 with
+    // the non-skipped frames — EXCEPT across a savestate restore, whose in-flight acks belong
+    // to a discarded timeline. Those must not drive `outstanding` negative: a negative
+    // outstanding disables backpressure entirely AND stops the render-busy segment from ever
+    // reopening, which silently kills the render half of `cap`.
+    m.ack = function (t) {
+      m.rendered++; m.renderedWin++;
+      if (m.outstanding > 0) m.outstanding--; else m.staleAcks++;
+      if (m.outstanding <= 0 && m.renderBusyFrom) { m.renderBusyMs += t - m.renderBusyFrom; m.renderBusyFrom = 0; }
+    };
+
+    // Tab visibility. A hidden tab gets no rAF, so no credits are granted and no emulated time
+    // passes — that is the "a long hide is a pause, not a fast-forward" rule. It must not also
+    // read as the guest falling behind, so the hidden span leaves the speed denominator.
+    m.setHidden = function (hidden, t) {
+      if (hidden) { if (!m.hiddenAt) m.hiddenAt = t; }
+      else if (m.hiddenAt) {
+        m.stallMs += t - m.hiddenAt; m.hiddenAt = 0;
+        m.lastT = 0;   // re-latch instead of letting grant() clamp (and double-count) the gap
+      }
+    };
+
+    // The 1s HUD tick. Returns everything the readout needs; mutates only window marks.
+    m.sample = function (t) {
+      var win = m.sampT ? (t - m.sampT) / 1000 : 0;
+      m.sampT = t;
+      var producedPerS = win > 0 ? (m.framesSeen - m.sampFrames) / win : 0;
+      var ackedPerS    = win > 0 ? (m.rendered   - m.sampRendered) / win : 0;
+      m.sampFrames = m.framesSeen; m.sampRendered = m.rendered;
+
+      var cons = consumed();
+      if (!m.spanOn && (cons > 0 || m.framesSeen > 0)) {
+        m.spanOn = true; m.spanT0 = t; m.spanConsumed0 = cons;
+        m.spanFrames0 = m.framesSeen; m.spanStall0 = stallAt(t);
+      }
+      var span = m.spanOn ? ((t - m.spanT0) - (stallAt(t) - m.spanStall0)) / 1000 : 0;
+      var speed = null, speedFrames = null;
+      if (m.spanOn && span > 1) {
+        speedFrames = (m.framesSeen - m.spanFrames0) / span / guestHz;
+        // Emulated time is credits CONSUMED, not 'frame' messages. recomp_worker.js posts a
+        // frame only when the GP-FIFO produced something (:615-616) but bumps viRetrace and
+        // eats a credit on EVERY VIWaitForRetrace (:768, :784-787) — so a FIFO-silent stretch
+        // (a load, a fade, a paused scene) freezes framesSeen while emulated time keeps
+        // running, and a frame-counted speed would cry STARVED at exactly 1.000x. Uncapped
+        // freerun grants no credits, so there it falls back to the frame index.
+        speed = (target > 0) ? (cons - m.spanConsumed0) / span / guestHz : speedFrames;
+      }
+      var reqX = (target === 0) ? Infinity : target / guestHz;
+
+      // ---- capability: measured busy time, both stages, no duplicated frames ----
+      var guestCap = null;
+      if (m.guestBusyN > 0) guestCap = 1000 / (m.guestBusyMs / m.guestBusyN);
+      else if (m.lastFrameAt && (target <= 0 || poolNow() > 0)) {
+        // STARVED, not idle: no frame completed in this whole window. A standing credit (or
+        // uncapped freerun) proves the worker cannot be parked, so it has been computing the
+        // entire time and its rate is at MOST 1000/busy. Reporting `--` here would hand `cap`
+        // to the other stage alone and OVERSTATE the pipeline by an unbounded factor.
+        var gBusy = t - m.lastFrameAt;
+        if (gBusy > 1) guestCap = 1000 / gBusy;
+      }
+      var rNow = renderBusyAt(t), rBusy = rNow - m.renderBusyMark;
+      m.renderBusyMark = rNow;
+      // Same rule on the render side: busy with ZERO completions is a starved stage worth
+      // 1000/busy at most, not an unknown. (Idle reads rBusy ~ 0 and stays unknown.)
+      var renderCap = null;
+      if (rBusy > 1) renderCap = (m.renderedWin > 0) ? m.renderedWin * 1000 / rBusy : 1000 / rBusy;
+      var renderedWin = m.renderedWin;
+      m.renderedWin = 0; m.guestBusyMs = 0; m.guestBusyN = 0;
+      var cap = (guestCap === null) ? renderCap : (renderCap === null ? guestCap : Math.min(guestCap, renderCap));
+
+      return {
+        path: 'recomp', guestHz: guestHz, target: target, maxBacklog: MAX_BACKLOG,
+        speed: speed, speedFrames: speedFrames, speedReq: reqX,
+        starved: speed !== null && reqX !== Infinity && speed < reqX * 0.98,
+        capFps: cap, guestCap: guestCap, renderCap: renderCap,
+        producedPerS: producedPerS, ackedPerS: ackedPerS, renderedWin: renderedWin,
+        dropped: m.dropped, staleAcks: m.staleAcks, outstanding: m.outstanding,
+        backlog: pool.load(), consumed: cons, framesSeen: m.framesSeen, span: span
+      };
+    };
+
+    // Savestate restore: the timeline changed. Every accumulator that spans frames is
+    // meaningless across the seam, `outstanding` still counts frames whose acks belong to the
+    // discarded timeline (leave it and every later frame is marked skipRender — the "state
+    // loads but the picture never changes" bug), and the standing credit pool is emulated time
+    // owed to a run that no longer exists.
+    m.restore = function (n, t) {
+      m.outstanding = 0; m.dropped = 0; m.staleAcks = 0; m.credAcc = 0; m.lastT = 0;
+      m.framesSeen = n; m.sampFrames = n; m.sampRendered = m.rendered;
+      m.spanOn = false; m.spanT0 = 0; m.spanConsumed0 = 0; m.spanFrames0 = 0; m.spanStall0 = stallAt(t);
+      m.lastFrameAt = 0; m.guestBusyMs = 0; m.guestBusyN = 0;
+      m.renderedWin = 0; m.renderBusyMs = 0; m.renderBusyFrom = 0; m.renderBusyMark = 0;
+      // Standing credits are emulated time owed to a run that no longer exists: paying them to
+      // the restored timeline is a MAX_BACKLOG-sized fast-forward the moment the state loads.
+      pool.reset(); creditQ.length = 0; m.granted = 0; m.credCount = 0; m.credBase = n;
+    };
+
+    return m;
+  }
+
+  // ---- self-test rig -------------------------------------------------------------------
+  // A deterministic event-driven stand-in for the three real actors, driving the REAL model:
+  //   worker  — recomp_worker.js VIWaitForRetrace: post the frame (only when the FIFO produced
+  //             something), viRetrace++, then consume the gating credit, parking if there is
+  //             none. Messages are delivered to the model after a latency, exactly as
+  //             postMessage does, so the post/consume/deliver ordering is reproduced.
+  //   page    — rAF grant loop + the 1s sample, both calling into the model.
+  //   dolphin — one serial render job per non-skipped frame, acking on completion.
+  function simulate(o) {
+    o = o || {};
+    var guestHz  = o.guestHz || 60;
+    var target   = (o.target === undefined) ? guestHz : o.target;
+    var guestMs  = (o.guestMs === undefined) ? 8 : o.guestMs;
+    var renderMs = (o.renderMs === undefined) ? 3 : o.renderMs;
+    var rafMs    = o.rafMs || (1000 / 60);
+    var durMs    = o.durMs || 6000;
+    var deliver  = (o.deliverMs === undefined) ? 0.05 : o.deliverMs;
+    var stopAckAt = (o.stopAckAt === undefined) ? Infinity : o.stopAckAt;
+
+    var poolV = 0, poolMax = 0;
+    var pool = {
+      load: function () { return poolV; },
+      add: function (n) { poolV += n; if (poolV > poolMax) poolMax = poolV; },
+      reset: function () { poolV = 0; }
+    };
+    var m = makeModel({ guestHz: guestHz, target: target, pool: pool,
+                        maxDtMs: o.maxDtMs, maxBacklog: o.maxBacklog });
+
+    var now = 0, nextRaf = 0, nextSample = 1000;
+    var vi = 0, wState = 'post', wAt = 0;
+    var msgQ = [], ackQ = [], rQ = [], rBusyUntil = -1;
+    var samples = [], guard = 0, restored = false, hiddenSet = 0, restoreBacklog = -1;
+    var minOutstanding = 0, acksDelivered = 0;
+
+    function silentNow(v) { return !!(o.silent && v >= o.silent[0] && v < o.silent[1]); }
+    function hiddenNow(t) { return !!(o.hidden && t >= o.hidden[0] && t < o.hidden[1]); }
+
+    while (guard++ < 4000000) {
+      var tRaf = nextRaf;
+      if (hiddenNow(tRaf)) tRaf = o.hidden[1];
+      var tW = (wState === 'parked') ? Infinity : wAt;
+      var tMsg = msgQ.length ? msgQ[0].t : Infinity;
+      var tAck = ackQ.length ? ackQ[0].t : Infinity;
+      var tR = (rBusyUntil >= 0) ? rBusyUntil : Infinity;
+      var tRes = (o.restoreAt && !restored) ? o.restoreAt : Infinity;
+      var tHid = o.hidden ? (hiddenSet === 0 ? o.hidden[0] : (hiddenSet === 1 ? o.hidden[1] : Infinity)) : Infinity;
+      var t = Math.min(tRaf, tW, tMsg, tAck, tR, nextSample, tRes, tHid);
+      if (!isFinite(t) || t > durMs) break;
+      now = t;
+
+      if (tHid <= now)               { m.setHidden(hiddenSet === 0, now); hiddenSet++; }
+      else if (tMsg <= now)          { var mm = msgQ.shift(); if (!m.frame(mm.n, now)) rQ.push(now); }
+      else if (tAck <= now)          { ackQ.shift(); m.ack(now); acksDelivered++;
+                                       if (m.outstanding < minOutstanding) minOutstanding = m.outstanding; }
+      else if (tR <= now)            { rBusyUntil = -1; if (now < stopAckAt) ackQ.push({ t: now + deliver }); }
+      else if (tRes <= now)          { restored = true; m.restore(vi, now); restoreBacklog = pool.load(); }
+      else if (tW <= now) {
+        if (wState === 'compute') { wState = 'post'; }
+        else {
+          if (!silentNow(vi)) msgQ.push({ t: now + deliver, n: vi });
+          vi++;
+          if (target === 0)      { wState = 'compute'; wAt = now + guestMs; }
+          else if (poolV > 0)    { poolV--; wState = 'compute'; wAt = now + guestMs; }
+          else                     wState = 'parked';
+        }
+      }
+      else if (tRaf <= now) {
+        nextRaf = tRaf + rafMs;
+        m.grant(now);
+        if (wState === 'parked' && poolV > 0) { poolV--; wState = 'compute'; wAt = now + guestMs; }
+      }
+      else if (nextSample <= now)    { samples.push(m.sample(now)); nextSample += 1000; }
+      else break;
+
+      if (rBusyUntil < 0 && rQ.length) { rQ.shift(); rBusyUntil = now + renderMs; }
+    }
+    return { m: m, samples: samples, poolMax: poolMax, vi: vi, minOutstanding: minOutstanding,
+             acksDelivered: acksDelivered, now: now, restoreBacklog: restoreBacklog };
+  }
+
+  function selfTest(logFn) {
+    var lines = [], pass = 0, fail = 0;
+    function log(s) {
+      lines.push(s);
+      if (logFn) { try { logFn(s); } catch (e) {} }
+      try { console.log(s); } catch (e) {}
+    }
+    function ck(name, ok, detail) {
+      if (ok) { pass++; log('RATETEST PASS  ' + name + (detail ? '   ' + detail : '')); }
+      else    { fail++; log('RATETEST FAIL  ' + name + '   ' + detail); }
+    }
+    function near(a, b, tol) { return a !== null && a !== undefined && isFinite(a) && Math.abs(a - b) <= tol; }
+    function last(r) { return r.samples[r.samples.length - 1]; }
+    function fx(v, d) { return (v === null || v === undefined || !isFinite(v)) ? String(v) : v.toFixed(d === undefined ? 3 : d); }
+
+    log('RATETEST ---- gamecube.html rate model self-test (?ratetest=1) ----');
+
+    // 1. Shipped default: TARGET == GUEST_HZ, guest comfortably faster than 16.67ms/frame.
+    var s1 = simulate({ target: 60, guestMs: 8, renderMs: 3, durMs: 8000 });
+    var L1 = last(s1);
+    ck('1a default arm reads speed 1.000x', near(L1.speed, 1, 0.02), 'speed=' + fx(L1.speed));
+    ck('1b default arm is not STARVED', L1.starved === false, 'starved=' + L1.starved);
+    ck('1c headline says "speed 1.00x" with no (req)',
+       format({ speed: L1.speed, speedReq: L1.speedReq, starved: L1.starved, capFps: L1.capFps,
+                guestHz: 60, shown: 60, published: 60 }).indexOf('speed 1.00x  ') === 0,
+       format({ speed: L1.speed, speedReq: L1.speedReq, starved: L1.starved, capFps: L1.capFps,
+                guestHz: 60, shown: 60, published: 60 }));
+    // guest 8ms/frame => 125/s; render 3ms/frame => 333/s; cap = min = ~125
+    ck('1d cap measures the SLOWER stage (guest 8ms => ~125)', near(L1.capFps, 125, 12),
+       'cap=' + fx(L1.capFps, 1) + ' guest=' + fx(L1.guestCap, 1) + ' render=' + fx(L1.renderCap, 1));
+
+    // 2. ?fps=120 speed-experiment arm must say 2.00x out loud.
+    var s2 = simulate({ target: 120, guestHz: 60, guestMs: 4, renderMs: 2, durMs: 8000 });
+    var L2 = last(s2);
+    ck('2a ?fps=120 reads speed 2.00x', near(L2.speed, 2, 0.05), 'speed=' + fx(L2.speed));
+    ck('2b ?fps=120 headline says "(req 2.00x)"',
+       format({ speed: L2.speed, speedReq: L2.speedReq, starved: L2.starved, capFps: L2.capFps,
+                guestHz: 60, shown: 0, published: 0 }).indexOf('speed 2.00x (req 2.00x)') === 0,
+       format({ speed: L2.speed, speedReq: L2.speedReq, starved: L2.starved, capFps: L2.capFps,
+                guestHz: 60, shown: 0, published: 0 }));
+
+    // 3. 1.000x integrity: a 10s hidden tab must be a PAUSE, not a banked fast-forward.
+    var s3 = simulate({ target: 60, guestMs: 8, durMs: 16000, hidden: [2000, 12000] });
+    var L3 = last(s3);
+    var freeRun = 60 * 16, expect3 = 60 * 6;
+    ck('3a hidden tab is dropped, not repaid (emulated frames ~ visible seconds only)',
+       s3.m.consumed() < expect3 + 40 && s3.m.consumed() > expect3 - 60,
+       'consumed=' + s3.m.consumed() + ' expect~' + expect3 + ' (uncapped-repay would be ~' + freeRun + ')');
+    ck('3b credit backlog never exceeds MAX_BACKLOG', s3.poolMax <= 8, 'poolMax=' + s3.poolMax);
+    ck('3c speed still reads 1.000x after the hide (hidden time leaves the denominator)',
+       near(L3.speed, 1, 0.03), 'speed=' + fx(L3.speed) + ' span=' + fx(L3.span, 1) + 's');
+
+    // 4. Starved guest: 33ms/frame under a 60/s grant.
+    var s4 = simulate({ target: 60, guestMs: 33, renderMs: 3, durMs: 8000 });
+    var L4 = last(s4);
+    ck('4a slow guest reads ~0.5x, not 1.000x', near(L4.speed, 1000 / 33 / 60, 0.05), 'speed=' + fx(L4.speed));
+    ck('4b slow guest is flagged STARVED', L4.starved === true, 'starved=' + L4.starved);
+    ck('4c cap reports the real 30/s, not the 60/s that was asked for',
+       near(L4.capFps, 1000 / 33, 4), 'cap=' + fx(L4.capFps, 1));
+    ck('4d backlog saturates at MAX_BACKLOG and stops there', L4.backlog <= 8, 'backlog=' + L4.backlog);
+
+    // 5. MAX_BACKLOG = 8, not 2: a merely SLOW rAF must not throttle the guest below hardware.
+    var s5 = simulate({ target: 60, guestMs: 8, rafMs: 50, durMs: 8000 });
+    var L5 = last(s5);
+    ck('5a 20Hz rAF still delivers 1.000x with MAX_BACKLOG=8', near(L5.speed, 1, 0.03), 'speed=' + fx(L5.speed));
+    var s5b = simulate({ target: 60, guestMs: 8, rafMs: 50, durMs: 8000, maxBacklog: 1 });
+    var L5b = last(s5b);
+    ck('5b control: MAX_BACKLOG=1 DOES throttle it (the 8 is load-bearing)',
+       L5b.speed !== null && L5b.speed < 0.8, 'speed=' + fx(L5b.speed));
+
+    // 6. Render starvation: acks stop. cap must not keep quoting the guest number.
+    var s6 = simulate({ target: 60, guestMs: 8, renderMs: 3, durMs: 8000, stopAckAt: 2000 });
+    var L6 = last(s6);
+    ck('6a render starvation drags cap down (not the guest-only ~125)',
+       L6.capFps !== null && L6.capFps < 10, 'cap=' + fx(L6.capFps, 2) + ' guest=' + fx(L6.guestCap, 1) +
+       ' render=' + fx(L6.renderCap, 2));
+    ck('6b backpressure holds: outstanding stays <= 2 and frames are dropped',
+       L6.outstanding <= 2 && L6.dropped > 0, 'outstanding=' + L6.outstanding + ' dropped=' + L6.dropped);
+    ck('6c a render-starved guest still reports its own 1.000x',
+       near(L6.speed, 1, 0.03), 'speed=' + fx(L6.speed));
+
+    // 7. Savestate restore: stale acks must not drive outstanding negative.
+    var s7 = simulate({ target: 60, guestMs: 8, renderMs: 14, durMs: 8000, restoreAt: 4000 });
+    var L7 = last(s7);
+    ck('7a stale acks from the discarded timeline are absorbed, not subtracted',
+       s7.minOutstanding >= 0, 'minOutstanding=' + s7.minOutstanding + ' staleAcks=' + s7.m.staleAcks);
+    ck('7b restore did not wedge every later frame into skipRender',
+       L7.ackedPerS > 30, 'ackedPerS=' + fx(L7.ackedPerS, 1) + ' outstanding=' + L7.outstanding);
+    ck('7c speed re-latches after the seam instead of reading a bogus multiplier',
+       near(L7.speed, 1, 0.05), 'speed=' + fx(L7.speed));
+
+    // 8. The seqlock is not a frame counter.
+    var mk = seqDelta(1000, -1);
+    ck('8a first sample latches the mark and publishes nothing', mk.published === 0 && mk.mark === 1000,
+       JSON.stringify(mk));
+    var d8 = seqDelta(1000 + 2 * 37, mk.mark);
+    ck('8b 37 published frames read as 37, not 74 (the old 2.003x bug)', d8.published === 37,
+       'published=' + d8.published);
+    var d8b = seqDelta(1000 + 2 * 37 + 1, mk.mark);
+    ck('8c a mid-publish (odd) sample snaps back to the last complete frame', d8b.published === 37,
+       'published=' + d8b.published);
+    var d8c = seqDelta(4, (0xFFFFFFFE >>> 0));
+    ck('8d unsigned wrap does not explode', d8c.published === 3, 'published=' + d8c.published);
+
+    // 9. The JIT path has no credit protocol and must say so rather than borrow recomp numbers.
+    var jit = { path: 'jit', guestHz: 60, speed: null, speedReq: 1, capFps: null,
+                published: 120, shown: 60, starved: false };
+    ck('9a JIT headline is "speed --  ·  cap --", never a recomp-shaped number',
+       format(jit) === 'speed --  ·  cap --  ·  60 shown / 120 published', format(jit));
+
+    // 10. A FIFO-silent stretch is not a speed collapse.
+    var s10 = simulate({ target: 60, guestMs: 8, durMs: 9000, silent: [120, 300] });
+    var L10 = last(s10);
+    var mid = s10.samples[4] || L10;   // ~t=5s, inside/just after the silent window
+    ck('10a credit-derived speed ignores a FIFO-silent stretch', near(L10.speed, 1, 0.03),
+       'speed=' + fx(L10.speed));
+    ck('10b the frame-counted speed it replaced DOES collapse there (why it was replaced)',
+       mid.speedFrames !== null && mid.speedFrames < mid.speed - 0.1,
+       'speedFrames=' + fx(mid.speedFrames) + ' vs speed=' + fx(mid.speed));
+
+    // 11. Uncapped freerun still reports a speed, from the frame index.
+    var s11 = simulate({ target: 0, guestMs: 4, renderMs: 2, durMs: 8000 });
+    var L11 = last(s11);
+    ck('11a ?fps=0 freerun reports speed from frames and req=max',
+       L11.speedReq === Infinity && L11.speed !== null && L11.speed > 1.5,
+       'speed=' + fx(L11.speed) + ' req=' + L11.speedReq);
+    ck('11b ?fps=0 headline says "(req max)"',
+       format({ speed: L11.speed, speedReq: L11.speedReq, starved: L11.starved, capFps: L11.capFps,
+                guestHz: 60, shown: 0, published: 0 }).indexOf('(req max)') > 0,
+       format({ speed: L11.speed, speedReq: L11.speedReq, starved: L11.starved, capFps: L11.capFps,
+                guestHz: 60, shown: 0, published: 0 }));
+
+    // 12. THE BOUNDARY CASE. A guest at a true 60/s (16.6ms/frame) sits right on the credit
+    // budget, parks for a sliver every frame, and beats slowly against the rAF cadence. The
+    // "subtract the last gate-open" accounting walks its error upward here: 61, 64, 67, 70,
+    // 97, 157, 426 fps for a guest that never changed speed. Per-credit attribution pins it.
+    var s12 = simulate({ target: 60, guestMs: 16.6, renderMs: 3, durMs: 9000 });
+    var caps12 = s12.samples.map(function (x) { return x.guestCap; }).filter(function (v) { return v !== null; });
+    var worst12 = Math.max.apply(null, caps12);
+    ck('12a a true-60fps guest reads ~60 cap, not a phase-beat artefact',
+       near(last(s12).capFps, 1000 / 16.6, 6), 'cap=' + fx(last(s12).capFps, 1));
+    ck('12b and it never drifts across the whole run', worst12 < 1000 / 16.6 + 15,
+       'worst guestCap over 9 windows=' + fx(worst12, 1) + '  [' + caps12.map(function (v) { return v.toFixed(0); }).join(',') + ']');
+
+    // 13. A frame that takes longer than an entire sample window: `cap` must still be a number.
+    var s13 = simulate({ target: 60, guestMs: 2500, renderMs: 3, durMs: 9000 });
+    var L13 = last(s13);
+    ck('13a a guest slower than the whole window still reports a cap, not "--"',
+       L13.capFps !== null && L13.capFps < 5,
+       'cap=' + fx(L13.capFps, 2) + ' guest=' + fx(L13.guestCap, 2) + ' render=' + fx(L13.renderCap, 2));
+
+    // 14. The restore must not hand the new timeline a pool of credits owed to the old one:
+    // a saturated backlog paid to the restored state is a MAX_BACKLOG-frame fast-forward the
+    // instant the save loads. Run it against a SLOW guest, which is the case that has credits
+    // standing at the seam at all.
+    var s14 = simulate({ target: 60, guestMs: 25, renderMs: 3, durMs: 8000, restoreAt: 4000 });
+    ck('14a savestate restore drains the standing credit backlog',
+       s14.restoreBacklog === 0, 'backlog right after restore=' + s14.restoreBacklog +
+       ' (backlog just before was up to ' + s14.poolMax + ')');
+    var L14 = last(s14);
+    ck('14b and the restored timeline never exceeds 1.000x afterwards',
+       L14.speed !== null && L14.speed <= 1.0, 'post-restore speed=' + fx(L14.speed) +
+       ' (guest is 25ms/frame, so ~0.67x is the honest answer)');
+
+    var summary = 'RATETEST ' + (fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + pass + ' passed, ' + fail + ' failed';
+    log(summary);
+    return { pass: pass, fail: fail, lines: lines, summary: summary };
+  }
+
+  return { makeModel: makeModel, seqDelta: seqDelta, format: format, num: num,
+           simulate: simulate, selfTest: selfTest, DEF: DEF };
+})();
+</script>
 <script>
 (function () {
   'use strict';
@@ -208,7 +733,16 @@
     console.log(s);
   }
   function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
-  function toast(msg, isErr) { toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200); }
+  // #toast is a body-level element (it used to be the last child of #mobileShell, which is
+  // display:none on desktop — so every Save/Load/Export/Import/audio toast was silently
+  // invisible there). While a fullscreen element is open only ITS subtree renders, so the
+  // toast has to move inside it: mobile fullscreens #mobileShell, desktop #canvasWrap.
+  function toast(msg, isErr) {
+    var host = document.fullscreenElement || document.webkitFullscreenElement || document.body;
+    if (toastEl.parentNode !== host) host.appendChild(toastEl);
+    toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show');
+    clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200);
+  }
   const isMobile = (() => { const ua = navigator.userAgent.toLowerCase(); return /iphone|ipad|ipod|android|mobile|xbox/.test(ua) || ('ontouchstart' in window) || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile'); })();
   // Module uses a hidden dummy canvas. The real display canvas (#canvas)
   // is transferred to the GPU worker via transferControlToOffscreen and
@@ -3231,10 +3765,14 @@
   //              hardware intended"). MEASURED, never asserted: if the pipeline can only
   //              deliver 45 of the 60 frames the guest clock is owed, this reads 0.75x and
   //              goes amber. It is NEVER adjusted to make some other number look better.
+  //              On the recomp path emulated time is credits CONSUMED, which is exact; on the
+  //              JIT path the page cannot see the core's clock at all, so it stays null and
+  //              the readout says "speed --" rather than borrowing a recomp-shaped number.
   //   published  distinct frames the renderer FINISHED and put on the shared heap, per second.
   //              Read straight off the seqlock counter, which WGPUGfx.cpp bumps +1 at write
-  //              begin and +1 at write end (WGPUGfx.cpp:1241 / :1264) => exactly +2 per
-  //              published frame. Never counts a frame twice.
+  //              begin and +1 at write end (WGPUGfx.cpp:1242 / :1264) => exactly +2 per
+  //              published frame. Never counts a frame twice — GcRate.seqDelta owns the
+  //              odd-snap and the /2, and ?ratetest=1 test 8 asserts it.
   //   shown      distinct frames that actually reached the canvas, per second. HARD-capped by
   //              the display refresh — the compositor samples the canvas once per vsync, so on
   //              a 60Hz panel this physically cannot exceed 60 no matter what loop we use. A
@@ -3252,6 +3790,14 @@
   // counter read 120 would be a lie about headroom, so it is not done anywhere in this file.
   // 120 `shown` is reachable only by running the guest at 2x (?fps=120) — the one thing we
   // were told not to do. `cap` is the honest measurement of the same claim.
+  //
+  // NONE OF THIS IS TAKEN ON FAITH: open the page with ?ratetest=1 and the model runs itself
+  // against synthetic timings with no emulator, no worker and no probe, printing PASS/FAIL for
+  // each claim (1.000x default, 2.00x under ?fps=120, hidden-tab is a pause not a sprint, cap
+  // under a starved renderer, the savestate seam, the seqlock /2). The suite drives the SAME
+  // GcRate.makeModel / format / seqDelta this page runs on, so it cannot pass against a
+  // model that diverges from the shipped one. It caught two live bugs on its first run — see
+  // the "exact gate attribution" note in GcRate.
   var Rate = window.__gcRate = {
     path: 'jit',
     guestHz: 60,          // the game's native frame rate; what 1.00x is measured against
@@ -3272,7 +3818,9 @@
     if (_rateBuf !== sharedMemory.buffer) { _rateBuf = sharedMemory.buffer; _rateU32 = new Uint32Array(_rateBuf); }
     return _rateU32;
   }
-  function _rateNum(n, d) { return (n === null || n === undefined || !isFinite(n)) ? '--' : n.toFixed(d || 0); }
+  // Shared with the ?ratetest=1 self-test: the number formatting, the seqlock delta and the
+  // headline string all come from GcRate, so the suite asserts the EXACT text drawn here.
+  var _rateNum = GcRate.num;
   var _shownCount = 0, _rateSeqMark = -1, _rateT0 = 0, _rateDropped = 0;
   // published/s needs NO fast polling loop. The seqlock counter is monotonic, so a DELTA of it
   // is exact at ANY sampling rate — sampling once a second measures a 500/s producer just as
@@ -3287,10 +3835,10 @@
     var A = _rateView(), pub = 0;
     if (A) {
       try {
-        var s = Atomics.load(A, 0x026B3518 >> 2) >>> 0;
-        if (s & 1) s--;                     // mid-publish: snap back to the last complete frame
-        if (_rateSeqMark < 0) _rateSeqMark = s;
-        pub = (s - _rateSeqMark) >> 1; _rateSeqMark = s;
+        // 0x026B3518 is a SEQLOCK, not a frame counter (+2 per published frame). GcRate.seqDelta
+        // owns the odd-snap and the /2; ?ratetest=1 test 8 asserts 37 publishes read as 37.
+        var d = GcRate.seqDelta(Atomics.load(A, 0x026B3518 >> 2), _rateSeqMark);
+        pub = d.published; _rateSeqMark = d.mark;
       } catch (e) {}
     }
     var dt = _rateT0 ? (now - _rateT0) / 1000 : 0;
@@ -3305,18 +3853,12 @@
   }
   function _rateRender() {
     if (!fpsEl) return;
+    // ?ratetest=1 parks its PASS/FAIL summary in this slot; the 1s tick must not wipe it.
+    if (window.__gcRateTest) return;
     // nothing has run yet — keep the status bar clean rather than advertising a row of "--".
     if (!Rate.published && !Rate.shown && Rate.speed === null) { fpsEl.textContent = ''; return; }
     var offHwRate = Rate.speed !== null && Math.abs(Rate.speed - 1) > 0.02;
-    var parts = [
-      'speed ' + (Rate.speed === null ? '--' : _rateNum(Rate.speed, 2) + 'x')
-        + (Rate.speedReq !== 1 ? ' (req ' + (Rate.speedReq === Infinity ? 'max' : _rateNum(Rate.speedReq, 2) + 'x') + ')' : '')
-        + (Rate.starved ? ' STARVED' : ''),
-      Rate.capFps === null ? 'cap --'
-        : _rateNum(Rate.capFps) + ' fps cap (' + _rateNum(Rate.capFps / Rate.guestHz, 1) + 'x hw)',
-      _rateNum(Rate.shown) + ' shown / ' + _rateNum(Rate.published) + ' published'
-    ];
-    fpsEl.textContent = parts.join('  ·  ');
+    fpsEl.textContent = GcRate.format(Rate);
     fpsEl.title =
       'speed     = emulated time / wall time. 1.00x = exactly hardware rate (the target).\n' +
       'cap       = MEASURED frames/s this pipeline could sustain at 100% duty. Headroom, not\n' +
@@ -3334,6 +3876,17 @@
     fpsEl.style.color = Rate.speed === null ? '' : (offHwRate ? '#fd7' : '#7f7');
   }
   setInterval(_rateTick, 1000);
+  // ?ratetest=1 — run the rate model against synthetic timings and print PASS/FAIL, with no
+  // emulator, no worker and no probe. This exists because the model had never been checked
+  // against anything: "a simulation showed it" is not reproducible, an in-page suite is. The
+  // suite drives the SAME GcRate.makeModel/format/seqDelta the live page uses.
+  if (new URLSearchParams(location.search).get('ratetest') === '1') {
+    setTimeout(function () {
+      var r = GcRate.selfTest(pageLog);
+      window.__gcRateTest = r;    // also pins the summary in #fps (see _rateRender)
+      if (fpsEl) { fpsEl.textContent = r.summary; fpsEl.style.color = r.fail ? '#f77' : '#7f7'; }
+    }, 0);
+  }
   // [present-cadence 2026-08-28] was setInterval(..., 16). A 16ms timer clamps
   // presents to ~62/s in theory and ~50/s in practice, which WAS the measured
   // fps ceiling: cutting render work (sampled texture hashing took the decode
@@ -4203,14 +4756,32 @@
   // The number that is supposed to reach 120 is `cap` — the MEASURED rate this pipeline could
   // sustain — computed below from real busy time. See the RATE MODEL comment in the main
   // script block.
+  // CAVEAT on ?hz=, verified 2026-08-29: GUEST_HZ is NOT the only thing that sets
+  // emulated-time-per-frame. The guest clock itself is hard-coded in the worker —
+  // recomp_worker.js:608 returns OSGetTime = viRetrace * 675000, and 675000 ticks of the
+  // 40.5MHz GC timebase is exactly 1/60s — so one pumped frame is 1/60 of a second of game
+  // time no matter what ?hz= says. For MP4 (NTSC, 60) the two agree and the shipped default is
+  // consistent; any other ?hz= would only change what this page DIVIDES by, reporting e.g.
+  // 1.20x for a guest that is in fact at 1.000x. Changing the guest rate for a PAL title means
+  // changing that constant in the worker too, so ?hz= warns instead of pretending.
   var GUEST_HZ = Math.max(1, parseInt(q.get('hz') || '60', 10));
-  var TARGET = q.has('fps') ? parseInt(q.get('fps'), 10) : GUEST_HZ;
+  if (GUEST_HZ !== 60)
+    console.warn('[recomp-live] ?hz=' + GUEST_HZ + ' changes only this page\'s divisor; the guest ' +
+                 'clock is pinned to 60Hz by recomp_worker.js:608 (OSGetTime = viRetrace*675000). ' +
+                 'speed will read ' + (60 / GUEST_HZ).toFixed(3) + 'x for a guest running at 1.000x.');
+  // A malformed ?fps= must not become NaN credits/s (NaN is not 0, so it would not even take
+  // the uncapped path — it would silently grant nothing and read as a wedge).
+  var TARGET = GUEST_HZ;
+  if (q.has('fps')) {
+    var _fpsArg = parseInt(q.get('fps'), 10);
+    if (isFinite(_fpsArg) && _fpsArg >= 0) TARGET = _fpsArg;
+    else console.warn('[recomp-live] ignoring malformed ?fps=' + q.get('fps') + '; staying at ' + GUEST_HZ + '/s');
+  }
   var BOOT_MS = parseInt(q.get('bootms') || '50000', 10);
   var pace = new SharedArrayBuffer(64);
   var paceI32 = new Int32Array(pace);
   if (TARGET === 0) Atomics.store(paceI32, 5, 1);   // uncapped
-  var rw = null, framesSeen = 0, lastN = 0, lastT = 0, credAcc = 0;
-  var rendered = 0, lastRendered = 0, outstanding = 0, dropped = 0;
+  var rw = null;
 
   // --- 1.000x integrity ---------------------------------------------------------------------
   // Credits are wall-clock integrated, so a stalled rAF (backgrounded tab, a long GC, a hitch)
@@ -4237,26 +4808,38 @@
   var MAX_BACKLOG = 8;     // credits allowed to stand unconsumed (~133ms of catch-up)
 
   // --- capability accounting ----------------------------------------------------------------
-  // `cap` must be a MEASUREMENT, never an extrapolation from a duplicated counter. Everything
-  // it needs is already visible from this page, given the worker's verified credit protocol
-  // (gamecube/recomp/recomp_worker.js:784-787): the worker produces a frame, posts it, and only
-  // THEN blocks for the credit that gates the NEXT frame. So between two 'frame' messages the
-  // worker is idle from the moment it posted until the moment a credit was available, and busy
-  // from there to the next post:
+  // `cap` must be a MEASUREMENT, never an extrapolation from a duplicated counter, and the
+  // accounting that produces it now lives in GcRate.makeModel (top of this file) rather than as
+  // loose vars in here — so the page and the ?ratetest=1 suite exercise the same code. What the
+  // model does with the worker's verified credit protocol (recomp_worker.js:752 post -> :768
+  // viRetrace++ -> :784-787 consume, i.e. the credit consumed in call n gates the frame posted
+  // in call n+1):
   //
-  //   guestBusy(n+1) = T_frame(n+1) - max( T_frame(n), T_gateOpen(n+1) )
+  //   guestBusy(n) = T_frame(n) - max( T_frame(n-1), availability(credit n-1) )
   //
-  // The render stage is measured the same way on this side of the mailbox: wall time during
-  // which at least one frame is in flight to dolphin_worker (outstanding > 0).
-  // Guest and renderer are separate threads running as a pipeline, so the sustainable rate is
-  // 1/max(stage time) = min(stage rates).
-  var _gateOpenAt = 0, _lastFrameAt = 0;
-  var _guestBusyMs = 0, _guestBusyN = 0;
-  var _renderBusyMs = 0, _renderBusyFrom = 0, _renderedWin = 0, _renderBusyMsMark = 0;
-  // cumulative speed: emulated frames vs. wall seconds since the guest started. This is the
-  // literal definition of "running at hardware rate" and, unlike a 1s window, it has no
-  // quantisation floor — 0.99x over a minute is a real 0.6s of lost game time.
-  var _spanFrame0 = -1, _spanT0 = 0;
+  // Attributing credits INDIVIDUALLY is what makes that exact. Using "the last time the pool
+  // went empty -> non-empty" instead looks equivalent and is not: an empty pool also happens
+  // whenever the worker consumed its credit and is mid-compute, so a later grant gets mistaken
+  // for the gate the worker actually waited on. ?ratetest=1 test 12 pins that down — with the
+  // old rule a guest at a true 60/s reported cap 61, 64, 67, 70, 97, 157, 426 over nine windows
+  // without ever changing speed.
+  //
+  // The render stage is measured on this side of the mailbox: wall time during which at least
+  // one frame is in flight to dolphin_worker (outstanding > 0). Guest and renderer are separate
+  // threads running as a pipeline, so the sustainable rate is 1/max(stage time) = min(rates).
+  var rate = GcRate.makeModel({
+    guestHz: GUEST_HZ, target: TARGET, maxDtMs: MAX_DT_MS, maxBacklog: MAX_BACKLOG,
+    pool: {
+      load:  function () { return Atomics.load(paceI32, 0); },
+      add:   function (n) { Atomics.add(paceI32, 0, n); Atomics.notify(paceI32, 0); },
+      reset: function () { Atomics.store(paceI32, 0, 0); }
+    }
+  });
+  // A hidden tab gets no rAF, so no credits and no emulated time: that is the "a long hide is a
+  // pause, not a fast-forward" rule working. It must not ALSO read as the guest falling behind.
+  document.addEventListener('visibilitychange', function () {
+    rate.setHidden(document.hidden, performance.now());
+  });
 
   var hudEl = null;
   function hud(txt) {
@@ -4485,8 +5068,10 @@
     Atomics.store(paceI32, ST_STATUS, 0);
     Atomics.store(paceI32, ST_CMD, cmd);
     // the worker services the cell inside its per-frame VI stub, which may be parked in
-    // Atomics.wait for pacing credits — grant a few so the pump is guaranteed to run.
-    Atomics.add(paceI32, 0, 8); Atomics.notify(paceI32, 0);
+    // Atomics.wait for pacing credits — grant a few so the pump is guaranteed to run. Routed
+    // through the model so these count as the emulated time they are: a raw Atomics.add here
+    // was 8 frames of guest clock that the speed accounting never saw.
+    rate.pokeCredits(8, performance.now());
   }
 
   function stSave() {
@@ -4682,30 +5267,9 @@
   // the amount is integrated against wall time, so an irregular rAF cadence does not change the
   // speed — but an unbounded one would (see the 1.000x integrity note above), hence the clamps.
   function grantLoop(t) {
-    if (TARGET > 0 && rw) {
-      if (!lastT) lastT = t;
-      var dt = t - lastT;
-      lastT = t;
-      if (dt > MAX_DT_MS) dt = MAX_DT_MS;          // a stall is dropped, never repaid as a sprint
-      credAcc += dt * TARGET / 1000;
-      var grant = Math.floor(credAcc);
-      if (grant > 0) {
-        credAcc -= grant;
-        var pool = Atomics.load(paceI32, 0);
-        var room = MAX_BACKLOG - pool;             // never let the guest bank a fast-forward
-        if (grant > room) grant = room;
-        if (grant > 0) {
-          // The gate for the frame the worker is waiting on opens NOW iff the pool was empty.
-          // If it was already non-empty the worker never parked, so there is no idle to credit.
-          if (pool <= 0) _gateOpenAt = t;
-          Atomics.add(paceI32, 0, grant);
-          Atomics.notify(paceI32, 0);
-        }
-      }
-    }
+    if (rw) rate.grant(t);
     requestAnimationFrame(grantLoop);
   }
-  function renderBusyAt(now) { return _renderBusyMs + (_renderBusyFrom ? now - _renderBusyFrom : 0); }
 
   // Prefetch the disc IMMEDIATELY (overlapped with the dolphin boot) so the takeover can
   // fire the moment the renderer is up — the JIT scaffolding boot should never be visible
@@ -4733,49 +5297,34 @@
   prefetchDisc();
 
   var hudStatus = '';   // transient state (taking over / failed) shown until frames flow
-  var _hudT = 0;
   setInterval(function () {
-    var now = performance.now();
-    var win = _hudT ? (now - _hudT) / 1000 : 0;
-    _hudT = now;
-    var d = framesSeen - lastN, dr = rendered - lastRendered;
-    lastN = framesSeen; lastRendered = rendered;
-    if (framesSeen === 0 && hudStatus) { hud(hudStatus); return; }
-
-    // ---- knob 1: GUEST SPEED. Measured, not asserted. -------------------------------------
-    // Under the recomp the clock is frame-driven — one pumped frame is exactly 1/GUEST_HZ of
-    // emulated time — so delivered frames / wall seconds IS the speed multiplier. Cumulative
-    // (not the 1s window) because that is the actual definition of keeping pace with hardware.
-    if (_spanFrame0 < 0 && framesSeen > 0) { _spanFrame0 = framesSeen; _spanT0 = now; }
-    var span = (now - _spanT0) / 1000;
-    var speed = (_spanFrame0 >= 0 && span > 1) ? (framesSeen - _spanFrame0) / span / GUEST_HZ : null;
-    var reqX = TARGET === 0 ? Infinity : TARGET / GUEST_HZ;
-
-    // ---- knob 2: CAPABILITY. Measured busy time, no duplicated frames anywhere. ------------
-    var guestCap = _guestBusyN > 0 ? 1000 / (_guestBusyMs / _guestBusyN) : null;
-    var rBusy = renderBusyAt(now) - _renderBusyMsMark;
-    var renderCap = (_renderedWin > 0 && rBusy > 1) ? _renderedWin * 1000 / rBusy : null;
-    _renderBusyMsMark = renderBusyAt(now); _renderedWin = 0;
-    _guestBusyMs = 0; _guestBusyN = 0;
-    var cap = (guestCap === null) ? renderCap : (renderCap === null ? guestCap : Math.min(guestCap, renderCap));
-
+    if (rate.framesSeen === 0 && hudStatus) { hud(hudStatus); return; }
+    // One call does both knobs: knob 1 SPEED (emulated time / wall time, cumulative, measured
+    // off credits consumed) and knob 2 CAP (measured busy time per stage). Both are asserted by
+    // ?ratetest=1 against synthetic timings, so this line is not the only thing standing
+    // between the readout and a number nobody has ever checked.
+    var r = rate.sample(performance.now());
     // separate <script> from the main IIFE — if that block ever fails to evaluate, the HUD
     // below must still work rather than taking the whole pacing interval down with it.
     if (window.__gcRate) window.__gcRate.set({
-      path: 'recomp', guestHz: GUEST_HZ, speed: speed, speedReq: reqX, capFps: cap,
-      starved: speed !== null && reqX !== Infinity && speed < reqX * 0.98,
-      capNote: 'recomp: min(guest ' + (guestCap === null ? '--' : guestCap.toFixed(0)) +
-               '/s, render ' + (renderCap === null ? '--' : renderCap.toFixed(0)) + '/s) from measured busy time',
-      extra: 'guest     = ' + (d / (win || 1)).toFixed(1) + ' frames/s produced by the recomp (emulated VI rate)\n' +
-             'render    = ' + (dr / (win || 1)).toFixed(1) + ' frames/s acked by the renderer; ' + dropped + ' skipped for backpressure\n' +
-             'credits   = ' + TARGET + '/s granted, backlog ' + Atomics.load(paceI32, 0) + '/' + MAX_BACKLOG + '\n' +
+      path: 'recomp', guestHz: GUEST_HZ, speed: r.speed, speedReq: r.speedReq, capFps: r.capFps,
+      starved: r.starved,
+      capNote: 'recomp: min(guest ' + GcRate.num(r.guestCap) + '/s, render ' +
+               GcRate.num(r.renderCap) + '/s) from measured busy time',
+      extra: 'guest     = ' + r.producedPerS.toFixed(1) + ' frames/s produced by the recomp (emulated VI rate)\n' +
+             'render    = ' + r.ackedPerS.toFixed(1) + ' frames/s acked by the renderer; ' + r.dropped + ' skipped for backpressure\n' +
+             'credits   = ' + TARGET + '/s granted, backlog ' + r.backlog + '/' + MAX_BACKLOG +
+             ', ' + r.consumed + ' consumed = ' + (r.consumed / GUEST_HZ).toFixed(1) + 's of emulated time\n' +
+             'speed     = from credits CONSUMED (exact emulated time). Frame-counted it would\n' +
+             '            read ' + GcRate.num(r.speedFrames, 2) + 'x — those differ only while the game emits no GP-FIFO.\n' +
              'NOTE: cap covers the guest + render stages. The page\'s own relay/copy is not in it,\n' +
-             '      so ?fps=0 (uncapped freerun) is the ground-truth cross-check for this figure.\n'
+             '      so ?fps=0 (uncapped freerun) is the ground-truth cross-check for this figure.\n' +
+             '      ?ratetest=1 runs this model\'s self-test — no emulator needed.\n'
     });
     // #recompFps carries only recomp-SPECIFIC state now. The rates live in one place (#fps) so
     // there is exactly one FPS-shaped number on screen and it means exactly one thing.
-    hud('recomp f' + framesSeen + '  ·  guest ' + (d / (win || 1)).toFixed(0) + '/s  ·  render ' +
-        (dr / (win || 1)).toFixed(0) + '/s' + (TARGET === 0 ? '  ·  UNCAPPED (speed test)' : ''));
+    hud('recomp f' + r.framesSeen + '  ·  guest ' + r.producedPerS.toFixed(0) + '/s  ·  render ' +
+        r.ackedPerS.toFixed(0) + '/s' + (TARGET === 0 ? '  ·  UNCAPPED (speed test)' : ''));
   }, 1000);
 
   async function startRecomp() {
@@ -4800,30 +5349,25 @@
     var origOnWorkerMsg = dolphin_worker.onmessage;
     dolphin_worker.onmessage = function (e) {
       if (e.data && e.data.cmd === 'recompAck') {
-        rendered++; outstanding--; _renderedWin++;
-        // render stage went idle: close the busy segment (see capability accounting above).
-        if (outstanding <= 0 && _renderBusyFrom) { _renderBusyMs += performance.now() - _renderBusyFrom; _renderBusyFrom = 0; }
+        // Skipped frames are never acked (dolphin-bridge/worker_funcs.js:906 breaks before the
+        // :935 ack), so acks pair 1:1 with sent frames — except across a savestate restore,
+        // whose in-flight acks belong to the discarded timeline. rate.ack() absorbs those
+        // instead of driving `outstanding` negative, which would disable backpressure outright
+        // and stop the render-busy segment ever reopening (?ratetest=1 test 7a).
+        rate.ack(performance.now());
         return;
       }
       if (origOnWorkerMsg) origOnWorkerMsg(e);
     };
     rw.onmessage = function (e) {
       if (e.data.cmd === 'frame') {
-        framesSeen = e.data.n;
-        // [capability accounting] This message marks the END of the guest's production of this
-        // frame. The worker was parked from its previous post until its gating credit existed,
-        // so subtract that deliberate idle: what remains is real guest CPU time for one frame.
-        var _fnow = performance.now();
-        if (_lastFrameAt) {
-          var _start = _gateOpenAt > _lastFrameAt ? _gateOpenAt : _lastFrameAt;
-          _guestBusyMs += _fnow - _start; _guestBusyN++;
-        }
-        _lastFrameAt = _fnow; _gateOpenAt = 0;
-        // backpressure: every frame's RAM state (regions/mem1) must land, but when the
-        // renderer is behind, mark the frame skipRender — the dolphin side applies state
-        // and skips the draw, so presents always sample the freshest game state.
-        var skipRender = outstanding >= 2;
-        if (skipRender) dropped++; else { if (outstanding === 0) _renderBusyFrom = _fnow; outstanding++; }
+        // This message marks the END of the guest's production of frame n. rate.frame() does
+        // the capability accounting (subtracting the time the worker sat parked on the credit
+        // that gated THIS frame — see the note above the model) and returns the backpressure
+        // decision: every frame's RAM state (regions/mem1) must land, but when the renderer is
+        // behind the frame is marked skipRender, so the dolphin side applies state and skips
+        // the draw and presents always sample the freshest game state.
+        var skipRender = rate.frame(e.data.n, performance.now());
         var tr = [e.data.fifo].concat(e.data.regions.map(function (r) { return r.bytes; }));
         if (e.data.mem1) tr.push(e.data.mem1);
         dolphin_worker.postMessage({ cmd: 'recompFrame', n: e.data.n, fifo: e.data.fifo,
@@ -4844,15 +5388,12 @@
         // stale; the worker forces a full mem1 + prologue resend, and the page's in-flight
         // bookkeeping must be cleared too — otherwise `outstanding` stays >= 2 (its recompAcks
         // belonged to the discarded timeline) and EVERY later frame is marked skipRender: the
-        // "state loads but the picture never changes" failure, from the page side.
-        outstanding = 0; dropped = 0; credAcc = 0; lastT = 0;
-        framesSeen = e.data.n; lastN = e.data.n; lastRendered = rendered;
-        // [rate-model] the restored timeline jumps the frame index, so every rate/capability
-        // accumulator that spans frames is meaningless across the seam — restart them here or
-        // the cumulative speed reads a huge bogus multiplier for the rest of the session.
-        _spanFrame0 = -1; _spanT0 = 0; _lastFrameAt = 0; _gateOpenAt = 0;
-        _guestBusyMs = 0; _guestBusyN = 0; _renderedWin = 0;
-        _renderBusyFrom = 0; _renderBusyMs = 0; _renderBusyMsMark = 0;
+        // "state loads but the picture never changes" failure, from the page side. rate.restore
+        // clears ALL of it in one place — in-flight count, every rate/capability accumulator
+        // that spans frames (a jumped frame index otherwise reads as a huge bogus multiplier
+        // for the rest of the session), AND the standing credit pool, which is emulated time
+        // owed to a run that no longer exists (?ratetest=1 tests 7 and 14).
+        rate.restore(e.data.n, performance.now());
         stSay('worker restored at frame ' + e.data.n + '; renderer resync forced');
         if (pendingStateLoad) pendingStateLoad({ ok: true, n: e.data.n });
       } else if (e.data.cmd === 'stateError') {
