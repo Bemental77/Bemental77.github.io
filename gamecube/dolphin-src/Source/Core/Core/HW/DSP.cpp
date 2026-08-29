@@ -23,9 +23,11 @@
 
 #include "Core/HW/DSP.h"
 
+#include <cstdint>
 #include <memory>
 
 #include "AudioCommon/AudioCommon.h"
+#include "AudioCommon/Mixer.h"
 
 #include "Common/ChunkFile.h"
 #include "Common/CommonTypes.h"
@@ -33,10 +35,12 @@
 
 #include "Core/CoreTiming.h"
 #include "Core/DSPEmulator.h"
+#include "Core/HW/AudioInterface.h"
 #include "Core/HW/HSP/HSP.h"
 #include "Core/HW/MMIO.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/ProcessorInterface.h"
+#include "Core/HW/SystemTimers.h"
 #include "Core/PowerPC/PowerPC.h"
 #include "Core/System.h"
 
@@ -548,10 +552,71 @@ void DSPManager::UpdateDSPSlice(int cycles)
   }
 }
 
+// [guest-clock witness 2026-08-28] --------------------------------------------
+// The GameCube analogue of the Dreamcast AICA witness. THIS callback is a pure
+// function of CoreTiming's global_timer: SystemTimers::AudioDMACallback (
+// Core/HW/SystemTimers.cpp:80-95) reschedules itself every
+//   GetAudioDMACallbackPeriod() = cpu_core_clock * aid_divisor
+//                                 / (Mixer::FIXED_SAMPLE_RATE_DIVIDEND*4/32)
+//                               = 486e6 * 3375 / 13.5e6 = 121,500 ticks
+// (FIXED_SAMPLE_RATE_DIVIDEND = 54000000*2 per AudioCommon/Mixer.h:57-58).
+// Nothing in that path consults wall time, host audio, the GPU or the frontend
+// — it is driven ONLY by emulated CPU ticks. So
+//   callbacks_per_wall_second / (ticks_per_second / callback_period)
+// IS the guest clock multiple, with no dependence on the JIT's cycle-charging
+// (which is what [mips] measures, and what has been unstable across runs).
+//
+// Cells live in the 0x026B3918..0x026B39FC hole. Repo-wide grep for 0x026B39xx
+// on 2026-08-28 found only VertexLoaderWasm.h (0x026B3900..0x026B3910) and
+// TextureCacheBase.cpp (0x026B3914) below us, and nothing at all until the
+// powerpc-next FPR scratch window at 0x026B3C00 (+preg*16). Deliberately NOT in
+// 0x026B3D00+ — that overlaps the FPR scratch window.
+namespace
+{
+[[maybe_unused]] constexpr std::uintptr_t kGuestClockAidFireCell = 0x026B3918u;  // AID events (DMA block wraps)
+[[maybe_unused]] constexpr std::uintptr_t kGuestClockAiDmaCell = 0x026B391Cu;    // raw AI-DMA callback entries
+[[maybe_unused]] constexpr std::uintptr_t kGuestClockPeriodCell = 0x026B3920u;   // ticks between callbacks
+[[maybe_unused]] constexpr std::uintptr_t kGuestClockTicksHzCell = 0x026B3924u;  // CoreTiming ticks/sec
+[[maybe_unused]] constexpr std::uintptr_t kGuestClockNumBlocksCell = 0x026B3928u;  // AudioDMAControl.NumBlocks
+
+// Native builds have no SAB scratch region — these addresses are not mapped
+// there, so the accesses compile out entirely off-Emscripten.
+inline void GuestClockBump([[maybe_unused]] std::uintptr_t cell)
+{
+#ifdef __EMSCRIPTEN__
+  volatile u32* p = reinterpret_cast<volatile u32*>(cell);
+  *p = *p + 1u;
+#endif
+}
+inline void GuestClockSet([[maybe_unused]] std::uintptr_t cell, [[maybe_unused]] u32 v)
+{
+#ifdef __EMSCRIPTEN__
+  *reinterpret_cast<volatile u32*>(cell) = v;
+#endif
+}
+}  // namespace
+
 // This happens at 4 khz, since 32 bytes at 4khz = 4 bytes at 32 khz (16bit stereo pcm)
 void DSPManager::UpdateAudioDMA()
 {
   static short zero_samples[8 * 2] = {0};
+
+  // [guest-clock witness] Raw callback count FIRST, before any Enable gate — this
+  // is the tick-driven event itself, and it fires whether or not the guest has
+  // armed the DMA. Republish the descriptors so the reader never has to assume
+  // 486 MHz / divisor 3375.
+  GuestClockBump(kGuestClockAiDmaCell);
+  {
+    const u32 divisor = m_system.GetAudioInterface().GetAIDSampleRateDivisor();
+    const u32 ticks_hz = m_system.GetSystemTimers().GetTicksPerSecond();
+    // Same expression as SystemTimers::GetAudioDMACallbackPeriod.
+    const u32 period = static_cast<u32>(static_cast<u64>(ticks_hz) * divisor /
+                                        (::Mixer::FIXED_SAMPLE_RATE_DIVIDEND * 4 / 32));
+    GuestClockSet(kGuestClockPeriodCell, period);
+    GuestClockSet(kGuestClockTicksHzCell, ticks_hz);
+    GuestClockSet(kGuestClockNumBlocksCell, m_audio_dma.AudioDMAControl.NumBlocks);
+  }
+
   if (m_audio_dma.AudioDMAControl.Enable)
   {
     auto& memory = m_system.GetMemory();
@@ -568,6 +633,13 @@ void DSPManager::UpdateAudioDMA()
     {
       m_audio_dma.current_source_address = m_audio_dma.SourceAddress;
       m_audio_dma.remaining_blocks_count = m_audio_dma.AudioDMAControl.NumBlocks;
+
+      // [guest-clock witness] The AID event itself — counted here, BEFORE the
+      // takeover branch, so it is identical on every arm (it counts the DMA block
+      // wrap, not whether GenerateDSPInterrupt was called). Rate at hardware speed
+      // = (ticks_per_second / callback_period) / NumBlocks = 4000/20 = 200 per
+      // second. Distinct from 0x026B2798, which only counts the takeover branch.
+      GuestClockBump(kGuestClockAidFireCell);
 
       // [aid-selfack 2026-07-16 — ACK-ROUTING correct-mechanism fix] Post-takeover (cpu_owner==1)
       // the AID audio-DMA interrupt fires from this 4kHz CoreTiming callback (dolphin device thread),

@@ -609,7 +609,19 @@ TimePoint CoreTimingManager::CalculateTargetHostTimeInternal(s64 target_cycle)
 // Boot.cpp:305-311 documents why unlimited must NOT be on during boot (the
 // freed EmuThread races emulated time -> MusyX DSP/AID service storm, MP4 init
 // starves at gc=0), so the page/probe must set this only in steady state.
-static constexpr uintptr_t kBemUncapCell = 0x026B3D10u;  // 0 = throttled (default)
+// [CELL MOVED 2026-08-29 — 0x026B3D10 WAS INSIDE THE FPR SPILL WINDOW.]
+// powerpc-next's FPR register cache spills v128s to `0x026B3C00 + preg*16` for 32
+// pregs (fpr_reg_cache.cpp:335,367,385; ppc_emit.cpp:1149), i.e. the window
+// 0x026B3C00..0x026B3DFF. 0x026B3D10 == 0x026B3C00 + 272 == preg 17's slot, and
+// JitWasm.cpp:62 includes powerpc-next's ppc_emit.h, so that emitter is the LIVE
+// path in the dolphin worker. Since ANY nonzero value uncaps (see below), a float
+// spill of f17 carrying nonzero bits would silently uncap the emulator — running
+// the GUEST fast, which is the one thing we are forbidden to do, with no log and
+// no visible cause. Observed `before=0` at the flip in 3/3 uncap arms so it did
+// not fire in that workload, but the overlap is arithmetic, not opinion.
+// 0x026B392C is above the witness cells (0x026B3918..0x026B3928) and below the
+// FPR window; a repo-wide grep for it returns zero hits.
+static constexpr uintptr_t kBemUncapCell = 0x026B392Cu;  // 0 = throttled (default)
 #endif
 
 bool CoreTimingManager::IsSpeedUnlimited() const

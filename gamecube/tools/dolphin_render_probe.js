@@ -6,8 +6,20 @@ const fs = require('fs');
 const path = require('path');
 const puppeteer = require('puppeteer');
 
-const ROOT = '/Users/caseybement/Bemental77.github.io';
-const PORT = 8788;
+// PROBE_ROOT overrides the served document root. Point it at a snapshot tree
+// (symlink farm + real copies of gamecube/dolphin_libretro + gamecube/recomp) so a
+// CONCURRENT relink in the live repo cannot swap the .wasm out from under a running
+// measurement. That tear is not hypothetical: it produced
+// "WebAssembly.instantiate(): Import #0 \"env\": module is not an object or function"
+// (torn .js/.wasm pair) and voided a full run on 2026-08-29.
+const ROOT = process.env.PROBE_ROOT || '/Users/caseybement/Bemental77.github.io';
+// [concurrent-probe fix 2026-08-28] PORT was hardcoded to 8788, so two probes
+// running at once killed each other with EADDRINUSE (and, worse, the second
+// could silently attach to the FIRST one's server and measure the wrong tree).
+// Default is now an OS-assigned ephemeral port; PROBE_PORT=<n> pins it if you
+// need a stable URL. Resolved value lands in PORT after startServer().
+const PORT_REQUESTED = parseInt(process.env.PROBE_PORT || '0', 10);
+let PORT = PORT_REQUESTED;
 const TEST_DURATION_MS = parseInt(process.env.PROBE_DURATION_MS || '60000', 10);
 const CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 // Set to truthy (any non-empty value) to capture chrome://tracing JSON +
@@ -88,13 +100,16 @@ function startServer() {
         stream.on('error', () => { res.statusCode = 500; res.end('err'); });
       });
     });
-    srv.listen(PORT, '127.0.0.1', () => resolve(srv));
+    // PORT_REQUESTED 0 => OS picks a free ephemeral port; read it back off the
+    // listening socket so every later URL uses the port we actually got.
+    srv.listen(PORT_REQUESTED, '127.0.0.1', () => { PORT = srv.address().port; resolve(srv); });
   });
 }
 
 (async () => {
   const srv = await startServer();
-  console.log('[probe] server up on :' + PORT);
+  console.log('[probe] server up on :' + PORT
+    + (PORT_REQUESTED ? ' (pinned via PROBE_PORT)' : ' (ephemeral — set PROBE_PORT to pin)'));
   const browser = await puppeteer.launch({
     executablePath: CHROME,
     headless: process.env.PROBE_HEADLESS === '0' ? false : 'new',
@@ -263,6 +278,31 @@ function startServer() {
   const _extra = process.env.PROBE_QUERY ? ('&' + process.env.PROBE_QUERY) : '';
   await page.goto(`http://127.0.0.1:${PORT}/gamecube.html?v=${Date.now()}${_extra}`, { waitUntil: 'load', timeout: 60000 });
   await new Promise((r) => setTimeout(r, 1000));
+  // [coi-reload settle 2026-08-28] coi-serviceworker.js reloads the page the
+  // FIRST time an origin is seen, to install COOP/COEP. With the port now
+  // ephemeral, every run is a fresh origin, so that reload happens on EVERY run
+  // (with the old hardcoded :8788 the worker was already registered from a
+  // previous run, which is why this never showed up before). The reload tears
+  // down the execution context and the next page.evaluate throws
+  // "Execution context was destroyed" — observed killing a run outright at
+  // load average 32. Wait for crossOriginIsolated, tolerating the teardown.
+  // NOTE: crossOriginIsolated is NOT the settle signal here — the probe launches
+  // Chrome with --disable-web-security, under which it reads false while SAB
+  // still works. The signal is simply that the execution context stops being
+  // torn down: two consecutive successful evaluates on the same document.
+  {
+    let ok = 0, tries = 0, lastHref = '';
+    while (ok < 2 && tries < 60) {
+      tries++;
+      try {
+        const href = await page.evaluate(() => location.href);
+        if (href === lastHref) ok++; else { ok = 1; lastHref = href; }
+      } catch (e) { ok = 0; }
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    console.log('[probe] document settled after ' + tries + ' polls'
+      + (ok < 2 ? ' (NOT SETTLED — coi reload may still fire)' : ''));
+  }
   // ROM_IDX selects gamecube.html ROMS[] by index (verified live 2026-06-14):
   //   0 = Mario Party 4, 1 = Sonic Adventure 2 Battle,
   //   2 = Phantasy Star Online Ep I&II Plus (PSO), 3 = 240pSuite (homebrew).
@@ -524,7 +564,7 @@ function startServer() {
   // makes phantom (idle-skip) credit a visible number. Steady window default 35s.
   try {
     await page.evaluate((winMs) => {
-      window.__mips = { t0: performance.now(), execAccum: 0, execPrev: 0, winStart: null, last: null,
+      window.__mips = { t0: performance.now(), winMs: winMs, execAccum: 0, execPrev: 0, winStart: null, last: null,
         traceN: 0, tracePrevCtr: 0, tracePrevFin: null, tracePeriod: 0, traceGap: 0, traceDecode: 0, tracePresent: 0 };
       setInterval(() => {
         try {
@@ -538,7 +578,7 @@ function startServer() {
           const now = performance.now();
           const snap = { execAccum: st.execAccum, cred: cred, wall: now };
           st.last = snap;
-          if (!st.winStart && (now - st.t0) >= winMs) st.winStart = snap;
+          if (!st.winStart && (now - st.t0) >= st.winMs) st.winStart = snap;
           // [turnaround trace] on frame-counter (0x026B3448) advance: period = pe_finish
           // (0x026B3440 f64) delta; device_busy = summed RunFifo+Flush wall-time this
           // frame (0x026B3458 f64); idle = period - busy. Splits GPU-throughput vs guest-wait.
@@ -562,6 +602,226 @@ function startServer() {
     console.log('[probe] mips-meter: executed/credited sampler installed (window '
       + (+process.env.MIPS_WINDOW_MS || 35000) + 'ms)');
   } catch (e) { console.error('[probe] mips-meter install failed: ' + e.message); }
+
+  // ---- [guestclock] AI-DMA guest-clock witness + delivered-fps -------------
+  // The GameCube analogue of the Dreamcast AICA witness. Cells published by
+  // Core/HW/DSP.cpp::UpdateAudioDMA (see the [guest-clock witness] block there):
+  //   0x026B3918 AID fires (DMA block wraps)     0x026B391C raw AI-DMA callbacks
+  //   0x026B3920 callback period (ticks)         0x026B3924 CoreTiming ticks/sec
+  //   0x026B3928 AudioDMAControl.NumBlocks
+  // The callback is scheduled purely off global_timer, so callbacks/wall-second
+  // divided by (ticks_hz / period) is the guest clock multiple — independent of
+  // the JIT's cycle-charging, which is what [mips] measures.
+  //
+  // Piggy-backed here because it needs the same steady-state window: the live
+  // SAB-present delivered-fps counters. 0x026B3518 is the SAB present frame
+  // sequence (gamecube.html:3290 polls it to paint); its delta is frames
+  // PUBLISHED, and counting distinct values seen from rAF is frames SHOWN.
+  // 0x026B0930 is g_pe_setfinish_count (VideoCommon/PixelEngine.cpp:268) =
+  // frames the GUEST finished. Restores a delivered-fps number on the live
+  // path — the page's own '[rate] published=' only fires on the legacy
+  // postMessage path (gamecube.html:3676, inside `case 'render':`).
+  try {
+    await page.evaluate((winMs) => {
+      const st = window.__gclk = {
+        t0: performance.now(), winMs: winMs, winStart: null, last: null,
+        rafSeen: 0, rafPrevSeq: -1, rafWinSeen: null, err: null,
+      };
+      const snap = () => {
+        const A = new Uint32Array(window.sharedMemory.buffer);
+        const m1 = A[0x02500020 >> 2] >>> 0;
+        // Guest big-endian u32 read through the MEM1 base, same helper the
+        // phase sampler uses.
+        const rd32 = (va) => {
+          if (!m1) return 0;
+          const u8 = new Uint8Array(window.sharedMemory.buffer);
+          const o = m1 + (va & 0x01FFFFFF);
+          return ((u8[o] << 24 | u8[o + 1] << 16 | u8[o + 2] << 8 | u8[o + 3]) >>> 0);
+        };
+        return {
+          wall: performance.now(),
+          aid: A[0x026B3918 >> 2] >>> 0,
+          aidma: A[0x026B391C >> 2] >>> 0,
+          period: A[0x026B3920 >> 2] >>> 0,
+          ticksHz: A[0x026B3924 >> 2] >>> 0,
+          numBlocks: A[0x026B3928 >> 2] >>> 0,
+          presentSeq: Atomics.load(A, 0x026B3518 >> 2) >>> 0,
+          peFrames: A[0x026B0930 >> 2] >>> 0,
+          rafSeen: st.rafSeen,
+          // MP4-only guest witnesses. GlobalCounter @0x801D3A54 is bumped once
+          // per main-loop iteration (~/gc_refs/marioparty4/src/game/main.c:115);
+          // retraceCount @0x801D4428 is VIGetRetraceCount's source, which ticks
+          // once per VI field (~59.94/s on NTSC) regardless of the game's
+          // minimumVcount gate (main.c:120-122). The RATIO of the two IS the
+          // scene's vcount, so we never have to assume 60 vs 30 fps.
+          globalCounter: rd32(0x801D3A54) >>> 0,
+          retraceCount: rd32(0x801D4428) >>> 0,
+        };
+      };
+      // rAF-side: count DISTINCT present sequence values = frames actually
+      // presentable at display cadence (the "shown" half of delivered fps).
+      const raf = () => {
+        try {
+          if (window.sharedMemory) {
+            const A = new Uint32Array(window.sharedMemory.buffer);
+            const s = Atomics.load(A, 0x026B3518 >> 2) >>> 0;
+            // 0x026B3518 is a SEQLOCK, not a frame counter: WGPUGfx.cpp:1241-1263
+            // bumps it to ODD before the pixel memcpy and to EVEN after. Only
+            // even values are complete frames; odd means a write is in flight.
+            if ((s & 1) === 0 && s !== st.rafPrevSeq) { st.rafPrevSeq = s; st.rafSeen++; }
+          }
+        } catch (_e) {}
+        requestAnimationFrame(raf);
+      };
+      requestAnimationFrame(raf);
+      setInterval(() => {
+        try {
+          if (!window.sharedMemory) return;
+          const s = snap();
+          st.last = s;
+          if (!st.winStart && (s.wall - st.t0) >= st.winMs) st.winStart = s;
+        } catch (e) { st.err = String(e && e.message || e); }
+      }, 100);
+    }, (+process.env.MIPS_WINDOW_MS || 35000));
+    console.log('[probe] guestclock: AI-DMA witness + delivered-fps sampler installed (window '
+      + (+process.env.MIPS_WINDOW_MS || 35000) + 'ms)');
+  } catch (e) { console.error('[probe] guestclock install failed: ' + e.message); }
+
+  // ---- uncapped arm --------------------------------------------------------
+  // PROBE_UNCAP_MS=<ms> arms CoreTiming's uncap cell 0x026B392C at that elapsed
+  // time (CoreTiming.cpp:612-620: nonzero => IsSpeedUnlimited() returns true).
+  // It must NOT be set during boot — Boot.cpp:305-311 / CoreTiming.cpp:609-611
+  // record that a freed EmuThread during init starves MP4 at gc=0 — hence the
+  // delay. Both meters are re-windowed at the flip so the measured window lies
+  // entirely inside the uncapped regime, settling for PROBE_UNCAP_SETTLE_MS.
+  const UNCAP_MS = parseInt(process.env.PROBE_UNCAP_MS || '0', 10);
+  if (UNCAP_MS > 0) {
+    const settleMs = parseInt(process.env.PROBE_UNCAP_SETTLE_MS || '8000', 10);
+    setTimeout(async () => {
+      try {
+        const r = await page.evaluate((settle) => {
+          if (!window.sharedMemory) return 'no sharedMemory';
+          const A = new Uint32Array(window.sharedMemory.buffer);
+          const before = A[0x026B392C >> 2] >>> 0;
+          A[0x026B392C >> 2] = 1;
+          const after = A[0x026B392C >> 2] >>> 0;
+          const now = performance.now();
+          for (const st of [window.__mips, window.__gclk]) {
+            if (!st) continue;
+            // Preserve the pre-flip window so ONE process yields BOTH arms under
+            // the SAME machine load — an A/B across separate runs is worthless
+            // here, the box drifts 0.51x..0.99x with other agents' load alone.
+            st.preUncap = st.winStart ? { start: st.winStart, end: st.last } : null;
+            st.t0 = now; st.winMs = settle; st.winStart = null;
+            if ('execAccum' in st) st.execAccum = 0;   // mips accumulator restart
+          }
+          return 'cell 0x026B392C ' + before + ' -> ' + after
+            + '; pre-uncap window ' + (window.__gclk && window.__gclk.preUncap ? 'CAPTURED' : 'absent');
+        }, settleMs);
+        console.log('[uncap] armed at t=' + (UNCAP_MS / 1000).toFixed(1) + 's: ' + r
+          + '; meters re-windowed (settle ' + settleMs + 'ms)');
+      } catch (e) { console.error('[uncap] arm failed: ' + e.message); }
+    }, UNCAP_MS);
+  } else {
+    console.log('[uncap] not armed (default THROTTLED arm; set PROBE_UNCAP_MS to arm)');
+  }
+
+  // ---- [scene-rate 2026-08-28] PER-WINDOW rate time series -----------------
+  // PROBE_SCENE_RATE=<periodMs> prints ONE line per window so a rate can be
+  // attributed to the SCENE that was on screen for that window, instead of a
+  // single whole-run average that blends boot + title + menu + gameplay into a
+  // number that describes none of them. Read-only: samples cells other code
+  // already publishes.
+  //
+  //   speed   = Δcredited-cycles / 486e6 / Δwall. CoreTiming's global_timer is
+  //             emulated time (CoreTiming.cpp:406 mirrors it to 0x026B3424/28),
+  //             so this is literally emulated-time/wall-time. 1.00x = hardware.
+  //   exec    = Δ0x026B3420 (cycles the JIT actually EXECUTED). credited-exec =
+  //             idle-skip phantom credit.
+  //   drawn   = Δ PE SetFinish (0x026B0930) — frames the GPU finished DRAWING,
+  //             i.e. the game's own frame rate under emulation.
+  //   pub     = Δ WGPU publish seq (0x026B3518) / 2 (WGPUGfx bumps +1 at write
+  //             begin and +1 at write end) — frames handed to the page.
+  //   gc      = MP4's guest GlobalCounter at 0x801D3A54 — a GUEST-VISIBLE clock,
+  //             used to cross-check `speed` on MP4 (the [mips] meter has never
+  //             been validated; see commit 50fb213).
+  //   rate.*  = the page's own rate model (window.__gcRate), which is the only
+  //             speed witness on the recomp path.
+  if (process.env.PROBE_SCENE_RATE) {
+    const _srPer = parseInt(process.env.PROBE_SCENE_RATE, 10) || 5000;
+    let _srPrev = null;
+    const _srRows = [];
+    const _srTimer = setInterval(async () => {
+      try {
+        const s = await page.evaluate(() => {
+          const o = { t: performance.now() };
+          try {
+            if (window.sharedMemory) {
+              const A = new Uint32Array(window.sharedMemory.buffer);
+              const F = new Float64Array(window.sharedMemory.buffer);
+              o.cred = (A[0x026B3424 >> 2] >>> 0) + (A[0x026B3428 >> 2] >>> 0) * 4294967296;
+              o.exec = A[0x026B3420 >> 2] >>> 0;
+              o.pe   = A[0x026B0930 >> 2] >>> 0;
+              o.pub  = A[0x026B3518 >> 2] >>> 0;
+              o.fctr = A[0x026B3448 >> 2] >>> 0;
+              o.busy = F[0x026B3458 >> 3];
+              const m1 = A[0x02500020 >> 2] >>> 0;
+              if (m1) {
+                const u8 = new Uint8Array(window.sharedMemory.buffer);
+                const g = m1 + 0x1D3A54;
+                o.gc = ((u8[g] << 24 | u8[g + 1] << 16 | u8[g + 2] << 8 | u8[g + 3]) >>> 0);
+              }
+            }
+          } catch (_e) {}
+          try {
+            const R = window.__gcRate;
+            if (R) o.rate = { path: R.path, speed: R.speed, cap: R.capFps,
+                              pub: R.published, shown: R.shown, starved: R.starved };
+          } catch (_e) {}
+          return o;
+        });
+        if (!s) return;
+        if (_srPrev) {
+          const dw = (s.t - _srPrev.t) / 1000;
+          if (dw > 0) {
+            const dcred = (s.cred || 0) - (_srPrev.cred || 0);
+            let dexec = (s.exec >>> 0) - (_srPrev.exec >>> 0); if (dexec < 0) dexec += 4294967296;
+            const dpe  = (s.pe || 0)  - (_srPrev.pe || 0);
+            const dpub = ((s.pub || 0) - (_srPrev.pub || 0)) / 2;
+            let dgc = (s.gc != null && _srPrev.gc != null) ? (s.gc - _srPrev.gc) : null;
+            const speed = dcred / 486e6 / dw;
+            const row = { tsec: +(s.t / 1000).toFixed(1), dw: +dw.toFixed(2),
+              speed: +speed.toFixed(3), execMHz: +(dexec / dw / 1e6).toFixed(1),
+              credMHz: +(dcred / dw / 1e6).toFixed(1),
+              drawn: +(dpe / dw).toFixed(1), pub: +(dpub / dw).toFixed(1),
+              gcps: dgc == null ? null : +(dgc / dw).toFixed(1),
+              rate: s.rate || null };
+            _srRows.push(row);
+            console.log('[scene-rate] t=' + row.tsec + 's  speed=' + row.speed.toFixed(3)
+              + 'x  cred=' + row.credMHz + 'MHz exec=' + row.execMHz + 'MHz'
+              + '  drawn=' + row.drawn + '/s  published=' + row.pub + '/s'
+              + (row.gcps == null ? '' : '  guestGC=' + row.gcps + '/s')
+              + (s.rate ? ('  [page ' + s.rate.path + ' speed='
+                  + (s.rate.speed == null ? '--' : (+s.rate.speed).toFixed(3) + 'x')
+                  + ' cap=' + (s.rate.cap == null ? '--' : (+s.rate.cap).toFixed(0))
+                  + ' shown=' + (+(s.rate.shown || 0)).toFixed(0)
+                  + '/pub=' + (+(s.rate.pub || 0)).toFixed(0) + ']') : ''));
+          }
+        }
+        _srPrev = s;
+      } catch (_e) {}
+    }, _srPer);
+    _srTimer.unref && _srTimer.unref();
+    global.__srRows = _srRows;
+    if (process.env.PROBE_SCENE_RATE_JSON) {
+      process.on('exit', () => {
+        try { fs.writeFileSync(process.env.PROBE_SCENE_RATE_JSON, JSON.stringify(_srRows, null, 1)); }
+        catch (_e) {}
+      });
+    }
+    console.log('[probe] scene-rate: per-' + _srPer + 'ms rate series installed');
+  }
+
   const phaseTimer = setInterval(async () => {
     try {
       const s = await page.evaluate(() => {
@@ -1329,6 +1589,75 @@ function startServer() {
         + 'ms  pe_finish=' + (m.lastFin || 0).toFixed(1) + ' (epoch ms)');
     }
   } catch (e) { console.error('[mips] readout failed: ' + e.message); }
+
+  // ---- [guestclock] + [fps] readout ---------------------------------------
+  try {
+    const g = await page.evaluate(() => window.__gclk || null);
+    if (!g) {
+      console.log('[guestclock] sampler absent');
+    } else if (!g.winStart || !g.last) {
+      console.log('[guestclock] no steady-window sample (run shorter than MIPS_WINDOW_MS)'
+        + (g.last ? '  last: aidma=' + g.last.aidma + ' aid=' + g.last.aid
+                  + ' period=' + g.last.period + ' ticksHz=' + g.last.ticksHz : '')
+        + (g.err ? '  err=' + g.err : ''));
+    } else {
+      const emitArm = (tag, a, b) => {
+        const wallS = (b.wall - a.wall) / 1000;
+        const dAidma = b.aidma - a.aidma;
+        const dAid = b.aid - a.aid;
+        // Expected hardware rates come from the cells the EMULATOR published, so
+        // no 486MHz/divisor assumption is baked into the probe. (Measured live:
+        // ticksHz=486000000, period=121392 => divisor 3372, not the 3375 the
+        // 121,500-tick estimate assumed; hw callback rate is 4003.56/s.)
+        const expAidma = (b.ticksHz > 0 && b.period > 0) ? (b.ticksHz / b.period) : 0;
+        const expAid = (expAidma > 0 && b.numBlocks > 0) ? (expAidma / b.numBlocks) : 0;
+        const rAidma = wallS > 0 ? dAidma / wallS : 0;
+        const rAid = wallS > 0 ? dAid / wallS : 0;
+        console.log('[guestclock:' + tag + '] RAW  ticksHz=' + b.ticksHz + ' period=' + b.period
+          + ' NumBlocks=' + b.numBlocks + '  window=' + wallS.toFixed(2) + 's'
+          + '  d(ai_dma_cb)=' + dAidma + '  d(aid_fire)=' + dAid);
+        console.log('[guestclock:' + tag + '] ai_dma_cb=' + rAidma.toFixed(2) + '/s (hw '
+          + expAidma.toFixed(2) + '/s) => guest='
+          + (expAidma > 0 ? (rAidma / expAidma).toFixed(4) : 'n/a') + 'x'
+          + '   aid_fire=' + rAid.toFixed(2) + '/s (hw ' + expAid.toFixed(2)
+          + '/s) => guest=' + (expAid > 0 ? (rAid / expAid).toFixed(4) : 'n/a') + 'x');
+        // Delivered fps on the live SAB-present path. /2 because 0x026B3518 is a
+        // seqlock bumped twice per frame (WGPUGfx.cpp:1241 begin -> odd,
+        // :1263 end -> even), NOT a plain frame counter.
+        const dPub = (b.presentSeq - a.presentSeq) / 2;
+        const dShown = b.rafSeen - a.rafSeen;
+        const dPe = b.peFrames - a.peFrames;
+        console.log('[fps:' + tag + '] delivered published=' + (wallS > 0 ? (dPub / wallS).toFixed(2) : '0')
+          + '/s  shown(rAF-distinct)=' + (wallS > 0 ? (dShown / wallS).toFixed(2) : '0')
+          + '/s  guest_pe_finish=' + (wallS > 0 ? (dPe / wallS).toFixed(2) : '0')
+          + '/s  (SAB present seqlock @0x026B3518 /2; steady ' + wallS.toFixed(2) + 's)');
+        // MP4 guest-side cross-check. retraceCount is the VI field counter, so
+        // d(retrace)/59.94 is a GUEST-VISIBLE guest-clock estimate (it passes
+        // through interrupt delivery and guest ISR execution, unlike the AI-DMA
+        // counter which is host-side); d(retrace)/d(globalCounter) is the
+        // scene's actual minimumVcount, which is what turns a frame count into
+        // a multiple (main.c:83,115,120-122).
+        const dGc = b.globalCounter - a.globalCounter;
+        const dRt = b.retraceCount - a.retraceCount;
+        if (dRt > 0 || dGc > 0) {
+          const vcount = dGc > 0 ? (dRt / dGc) : 0;
+          console.log('[guestclock-mp4:' + tag + '] d(GlobalCounter)=' + dGc + ' ('
+            + (dGc / wallS).toFixed(2) + '/s)  d(retraceCount)=' + dRt + ' ('
+            + (dRt / wallS).toFixed(2) + '/s)'
+            + '  measured vcount=' + (vcount ? vcount.toFixed(3) : 'n/a')
+            + '  retrace-derived guest=' + ((dRt / wallS) / 59.94).toFixed(4) + 'x'
+            + '  (NTSC VI field rate 59.94/s)');
+        } else {
+          console.log('[guestclock-mp4:' + tag + '] GlobalCounter/retraceCount did not advance'
+            + ' (gc=' + b.globalCounter + ' rt=' + b.retraceCount + ') — not MP4, or wedged');
+        }
+      };
+      if (g.preUncap && g.preUncap.start && g.preUncap.end) {
+        emitArm('throttled', g.preUncap.start, g.preUncap.end);
+      }
+      emitArm(g.preUncap ? 'uncapped' : 'throttled', g.winStart, g.last);
+    }
+  } catch (e) { console.error('[guestclock] readout failed: ' + e.message); }
 
   // ---- dump pc-sample histogram ------------------------------------------
   if (PC_SAMPLE) {
