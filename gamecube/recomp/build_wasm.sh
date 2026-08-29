@@ -45,7 +45,9 @@ perl -0pi -e 's/(\bvoid\s+HuSetVecF\s*\([^;{]*\))\s*\n(\s*#endif)/$1;\n$2/g' \
 #     static-decl reconciliations (definition is file-local; align the header prototype):
 perl -0pi -e 's/^(DataReadStat \*HuDataDirReadNum\(s32 data_num, s32 num\);)/static $1/m' "$BUILD/include/game/data.h" 2>/dev/null || true
 perl -0pi -e 's{^(?=(?:BOOL CheckBallCoinDone|void TakeBallStar|void ExecTakeBallStar|BOOL CheckTakeBallStarDone)\b)}{static }mg' "$BUILD/include/game/board/boo.h" 2>/dev/null || true
-perl -0pi -e 's/^static (s32 __CARDStart\(s32 chan, CARDCallback txCallback, CARDCallback exiCallback\)\n\{)/$1/m' "$BUILD/src/dolphin/card/CARDBios.c" 2>/dev/null || true
+#     (a __CARDStart un-static transform used to live here; deleted 2026-08-28 as DEAD — skip_unit
+#      below excludes the whole src/dolphin/card/ tree, so CARDBios.c is never compiled. The card
+#      SDK is replaced wholesale by shims/src/gc_card.c.)
 #     omAddObjEx: canonicalize the header prototype's 6th param to the definition's fn-ptr type:
 perl -0pi -e 's/(omObjData \*omAddObjEx\(Process \*objman_process, s16 prio, u16 mdlcnt, u16 mtncnt, s16 group, )omObjFunc func(\);)/${1}void (*func)(omObjData *)${2}/' "$BUILD/include/game/object.h" 2>/dev/null || true
 #     HuSetVecF: mapspace.c carries a WRONG local prototype (double args); the definition
@@ -532,6 +534,10 @@ ok=0; fail=0; : > "$BUILD/fails.txt"
 # Also skip dolphin/card/* — the memory-card SDK driver is a HOST subsystem (talks to
 # card hardware -> browser storage), like GX/VI/DVD. It also carries a bounded 3-arg
 # strcat(dst,src,max) that name-collides with libc's 2-arg strcat at link.
+# Its 17 entry points are REPLACED by shims/src/gc_card.c (compiled first, below): a RAM-backed
+# 2 MiB .raw card. Skipping the dir without that shim left all 17 as wasm imports answered by
+# recomp_worker.js's generic `default: return 0` stub — CARD_RESULT_READY with no out-param
+# written — which is why the file-select screen reported "No valid Memory Card is inserted".
 skip_unit() { case "$1" in */dolphin/mtx/*|*/game/kerent.c|*/src/REL/*|*/dolphin/card/*) return 0;; esac; return 1; }
 compile_one() {
   local f="$1" o
@@ -652,6 +658,10 @@ echo "[recomp] linking $(ls "$BUILD"/obj/*.o 2>/dev/null | wc -l) objects -> was
 #    Binaryen -O2 proves gx_fifo_buf is write-only-never-read and dead-strips the entire
 #    write-gather-pipe chain (the game's whole render output). The host reads the FIFO
 #    via [gx_fifo_base(), gx_fifo_base()+gx_fifo_pos()) and calls gx_fifo_reset() per frame.
+#    SAME TRAP, MEMORY CARD: ___recomp_card_base/_size/_seq/_adopt/_slots/_time must be exported
+#    or Binaryen proves gc_card.c's 2 MiB gcc_img image buffer is module-private and strips it,
+#    taking every save with it. The host seeds a persisted image into [base, base+size) BEFORE
+#    _main() (CARDInit adopts it from inside main) and snapshots it back when _seq() goes quiet.
 #    FIBER SWITCH: drop -sSTANDALONE_WASM (emscripten_fiber_swap is JS-runtime Asyncify code,
 #    incompatible with a raw-instantiate standalone module — see gc_fiber_coro.c). Emit an ES6
 #    module factory (.js glue) + the wasm alongside; recomp_run.mjs loads via the factory and
@@ -662,7 +672,7 @@ if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.js" \
      -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=33554432 \
      -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=32768 ${RECOMP_PROFILING_FUNCS:+--profiling-funcs} \
      -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web,worker -sINVOKE_RUN=0 \
-     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm,___recomp_aram_base,___recomp_static_top \
+     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm,___recomp_aram_base,___recomp_static_top,___recomp_card_base,___recomp_card_size,___recomp_card_seq,___recomp_card_adopt,___recomp_card_slots,___recomp_card_time \
      -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAP32,HEAPU32,wasmMemory,wasmExports \
      -Wl,--no-entry -Wl,--no-gc-sections -Wl,--allow-undefined -Wl,--allow-multiple-definition -O2 2>"$BUILD/link.txt"; then
   echo "[recomp] LINKED: $BUILD/mp4_game.js + $BUILD/mp4_game.wasm ($(stat -f%z "$BUILD/mp4_game.wasm" 2>/dev/null) bytes)"

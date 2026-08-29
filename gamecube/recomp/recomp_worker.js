@@ -11,9 +11,19 @@
 //   - reads pad input from a SAB the page's keyboard handlers write,
 //   - paces via Atomics.wait on the SAB until the page grants the next frame budget.
 // Message in: {cmd:'boot', parts:[ArrayBuffer x6], fst:ArrayBuffer, glueUrl, wasmUrl,
-//              pace:SharedArrayBuffer}  pace i32[0]=frame-credits i32[1]=btn i32[2]=dstk
-//              i32[3]=stkx i32[4]=stky i32[5]=uncapped
+//              pace:SharedArrayBuffer, stage:SharedArrayBuffer?, card:ArrayBuffer?}
+//              pace i32[0]=frame-credits i32[1]=btn i32[2]=dstk i32[3]=stkx i32[4]=stky
+//              i32[5]=uncapped i32[8]=held-stkx i32[9]=held-stky, and the savestate channel
+//              i32[10]=cmd i32[11]=total i32[12]=chunkLen i32[13]=seq i32[14]=consumed
+//              i32[15]=status (see the SAVE STATES block).
+//            | {cmd:'cardLoad', img:ArrayBuffer}  swap the live memory-card image (import)
+//            | {cmd:'cardDump'}                   snapshot the live card out right now
+//            NOTE: inbound messages are only serviced BEFORE Module._main() is called — after
+//            that this worker never returns to its event loop (see SAVE STATES).
 // Message out: {cmd:'frame', fifo, regions:[{addr,bytes}], n} | {cmd:'log', txt}
+//            | {cmd:'card', seq, img:ArrayBuffer}  2 MiB .raw memory-card image to persist
+//            | {cmd:'stateSaved', n, buf} | {cmd:'stateLoadReady'} | {cmd:'stateRestored', n}
+//            | {cmd:'stateError', op, txt}
 
 let Module = null, viRetrace = 0;
 let paceI32 = null;
@@ -25,6 +35,51 @@ let parts = [], fstBuf = null;
 const PART_SIZE = 104857600;   // 100MiB fixed part boundaries (gamecube.html chunkRange)
 
 const log = (txt) => postMessage({ cmd: 'log', txt: '[recomp-worker] ' + txt });
+
+// ---- memory card (gamecube/recomp/shims/src/gc_card.c) ----------------------------------
+// gc_card.c owns a 2 MiB RAM image that IS a real .raw GameCube memory card. The host's two
+// jobs: (1) seed the persisted image into [base, base+size) BEFORE Module._main(), because
+// CARDInit runs INSIDE main (via HuCardInit) and adopts whatever is there — after main starts
+// it is too late; (2) snapshot it back out once the shim's dirty counter goes quiet, so a
+// save lands in IndexedDB without writing 2 MiB to the page on every frame of a save.
+// ALLOW_MEMORY_GROWTH is on, so wasmMemory.buffer is DETACHED and replaced by every heap
+// growth: never cache it, always re-read Module.wasmMemory.buffer, and copy out with .slice()
+// (which also yields a fresh transferable ArrayBuffer, since the wasm memory itself is not).
+let cardBase = 0, cardSize = 0, cardSeq = 0;
+let cardQuiet = -1;                    // -1 = nothing pending; >=0 = frames since last change
+const CARD_QUIET_FRAMES = 45;          // ~0.75s at 60fps: past the end of a multi-write save
+
+function cardSnapshot() {
+  if (!Module || !cardBase) return false;
+  const img = Module.wasmMemory.buffer.slice(cardBase, cardBase + cardSize);
+  postMessage({ cmd: 'card', seq: cardSeq, img }, [img]);
+  return true;
+}
+
+function cardPoll() {
+  if (!cardBase || !Module.___recomp_card_seq) return;
+  const s = Module.___recomp_card_seq() >>> 0;
+  if (s !== cardSeq) { cardSeq = s; cardQuiet = 0; return; }   // still writing
+  if (cardQuiet < 0 || ++cardQuiet < CARD_QUIET_FRAMES) return;
+  cardQuiet = -1;
+  if (cardSnapshot()) log('memcard: snapshot at seq ' + cardSeq);
+}
+
+// Live image swap (page "Import Card"). Re-runs the shim's adopt so the new directory/FAT are
+// picked up; the game re-mounts before every save/load operation, so this takes effect at the
+// next SLCardMount without a reload.
+function cardLoad(buf) {
+  if (!Module || !cardBase) { log('memcard: import ignored (not booted yet)'); return; }
+  const u8 = new Uint8Array(buf);
+  if (u8.length !== cardSize) {
+    log('memcard: import rejected — ' + u8.length + 'B, want ' + cardSize + 'B'); return;
+  }
+  new Uint8Array(Module.wasmMemory.buffer, cardBase, cardSize).set(u8);
+  const ok = Module.___recomp_card_adopt ? Module.___recomp_card_adopt() : 0;
+  cardSeq = Module.___recomp_card_seq ? Module.___recomp_card_seq() >>> 0 : cardSeq;
+  cardQuiet = -1;                      // the page already holds these bytes; nothing to persist
+  log('memcard: imported ' + cardSize + 'B, adopt=' + ok);
+}
 
 // ---- GX state tracking for incremental region sync --------------------------------------
 let vcdLo = 0, vcdHi = 0;
@@ -241,6 +296,242 @@ function regionBytes(mem, base, stride, count) {
   return out;
 }
 
+// ---- SAVE STATES ------------------------------------------------------------------------
+// The page's Save/Load buttons used to post to dolphin_worker unconditionally. In recomp mode
+// dolphin is ONLY the WGPU renderer — the game is here — so those buttons captured and
+// restored the renderer and the game never moved. gamecube.html now routes them to this
+// worker; this section is the worker half.
+//
+// WHY A SAB COMMAND CELL AND NOT postMessage: once boot() calls Module._main() this worker
+// NEVER returns to its event loop, so inbound messages are never serviced. The Hu scheduler's
+// context switches are Emscripten Asyncify fibers and mp4_game.js drives them from a
+// SYNCHRONOUS trampoline — `Fibers.trampoline(){...do{ Fibers.finishContextSwitch(fiber)
+// }while(Fibers.nextFiber)}`, reached from `Asyncify.maybeStopUnwind()` — so the whole game
+// runs inside one JS task, and the frame pacer then blocks the thread outright
+// (`Atomics.wait(paceI32, 0, 0, 500)` in the VIWaitForRetrace stub below). postMessage OUT is
+// unaffected (that is how frames ship). So the page pokes a command cell in the pace SAB and
+// this worker services it at the one place its JS still runs: the per-frame VI stub.
+//
+// WHY THE SNAPSHOT IS TAKEN AND RESTORED AT THE VI PUMP POINT, IN PLACE:
+//   * The wasm CALL STACK (frame locals) is not in linear memory and cannot be read from JS.
+//     At the pump point the live chain is main -> HuSysDoneRender -> SwapBuffers ->
+//     VIWaitForRetrace (decomp src/game/main.c:109 `HuSysDoneRender(retrace)` inside main's
+//     while(1); src/game/init.c:192 HuSysDoneRender -> :215 SwapBuffers -> :226
+//     VIWaitForRetrace — the ROOT context, not a Hu process fiber) and
+//     NO live local carries state across that call: main's met0/met1/i are scratch reassigned
+//     before their next use, and `retrace` was already consumed by the HuSysDoneRender call
+//     that is on the stack. So overwriting linear memory under those three frames is sound
+//     AT THIS POINT — and only at this point.
+//   * Restoring in the SAME instance (rather than a fresh worker) is required, not just
+//     cheaper: the suspended fibers' rewind-function ids live in linear memory
+//     (`asyncifyData+8`, set by Asyncify.setDataRewindFunc) and are indices into the GLUE's
+//     Asyncify.callStackIdToFunc map, which is per-instance JS state we cannot restore.
+//     Same instance => the ids stay meaningful. It also means the disc parts and the module
+//     never have to be re-fetched.
+//
+// INCLUDED in a state: every touched 64 KiB page of wasm linear memory (that is the guest
+// MEM1 window at 0x80000000, the FST at 0x81C00000, the recomp's own .data/.bss incl. the
+// ARAM array and the 2 MiB card image, the C heap, every fiber's C stack and Asyncify spill
+// stack); the shadow-stack pointer (`emscripten_stack_get_current`, a wasm global, NOT in
+// linear memory); viRetrace (the game's whole clock — OSGetTime/OSGetTick/VIGetRetraceCount
+// are all derived from it); and the JS-side GX decoder state that the next frame's FIFO walk
+// cannot re-derive on its own (vcdLo/vcdHi, vatA, arrayBase/arrayStride, texImg0, tlutSrc,
+// staticTop, and the gxShadow cp/xf/bp register shadow that buildPrologue() emits).
+//
+// DELIBERATELY EXCLUDED:
+//   * knownDLs / knownArrays / knownTex / texBound / pairSeen / f32Arrays — the incremental
+//     region-sync caches. They describe what DOLPHIN has already been sent, and after a
+//     restore dolphin's mirror is a different timeline. Carrying them over is exactly the
+//     "the state loads but the picture never changes" failure, so the restore CLEARS them and
+//     sets cacheDirty + sentPrologue=false, forcing a full mem1 + prologue resend next frame.
+//   * The disc parts and the FST buffer — same worker, still loaded, byte-identical.
+//   * The pace SAB cells — credits/buttons/stick are live input plumbing owned by the page,
+//     not game state; the page resets its own in-flight bookkeeping on stateRestored.
+//   * Memory-card JS state (cardSeq/cardQuiet, gamecube.html's GCRECOMPCARD store). The card
+//     IMAGE is inside linear memory and so is restored; the card shim's own dirty counter is
+//     restored with it, and the existing cardPoll() re-syncs IndexedDB on its own terms.
+//   * Wasm mutable globals other than __stack_pointer — notably the stack-limit globals set
+//     by emscripten_stack_set_limits. There is no getter export, so they cannot be read. They
+//     are unchanged across the operation because save and restore both happen on the ROOT
+//     context at the same call depth, and Fibers.finishContextSwitch resets them from the
+//     (restored) fiber struct at the next context switch.
+//   * Anything in the dolphin worker. It is the renderer; the forced full resync re-seeds it.
+const ST_CMD = 10, ST_TOTAL = 11, ST_LEN = 12, ST_SEQ = 13, ST_CONSUMED = 14, ST_STATUS = 15;
+const ST_PAGE = 65536;            // wasm page granularity; memory size is always a multiple
+const ST_MAGIC = 'GCRECOMP';
+const ST_VERSION = 1;
+let stageSab = null;              // page-allocated staging SAB (inbound transport for load)
+
+function stateWasmApi() {
+  const w = Module && Module.wasmExports;
+  if (!w || typeof w.emscripten_stack_get_current !== 'function'
+         || typeof w._emscripten_stack_restore !== 'function')
+    throw new Error('mp4_game.wasm does not export emscripten_stack_get_current/_restore — '
+                  + 'this build cannot save or restore state');
+  return w;
+}
+
+// Sparse page image of the whole linear memory. Exact (no layout heuristics): every 64 KiB
+// page is tested for all-zero and only non-zero pages are stored, so untouched address space
+// (the ~2 GiB hole between the C heap and the guest window) costs nothing but the scan.
+function stateSnapshot() {
+  const w = stateWasmApi();
+  const buf = Module.wasmMemory.buffer;          // never cache: ALLOW_MEMORY_GROWTH detaches
+  const memSize = buf.byteLength;
+  const u32 = new Uint32Array(buf);
+  const perPage = ST_PAGE >>> 2;
+  const nPages = Math.ceil(memSize / ST_PAGE);
+  const idx = [];
+  for (let p = 0; p < nPages; p++) {
+    const s = p * perPage, e = Math.min(s + perPage, u32.length);
+    for (let i = s; i < e; i++) if (u32[i] !== 0) { idx.push(p); break; }
+  }
+  const hdr = {
+    v: ST_VERSION, game: 'MarioParty4',
+    memSize, page: ST_PAGE, pages: idx.length,
+    sp: w.emscripten_stack_get_current() >>> 0,
+    viRetrace, staticTop, vcdLo, vcdHi, tlutSrc,
+    vatA: vatA.slice(), arrayBase: arrayBase.slice(), arrayStride: arrayStride.slice(),
+    texImg0: texImg0.slice(),
+    gxCp: [...gxShadow.cp], gxXf: [...gxShadow.xf], gxBp: [...gxShadow.bp],
+  };
+  const json = new TextEncoder().encode(JSON.stringify(hdr));
+  const out = new Uint8Array(16 + json.length + 4 * idx.length + idx.length * ST_PAGE);
+  const dvw = new DataView(out.buffer);
+  for (let i = 0; i < 8; i++) out[i] = ST_MAGIC.charCodeAt(i);
+  dvw.setUint32(8, ST_VERSION, true);
+  dvw.setUint32(12, json.length, true);
+  out.set(json, 16);
+  let o = 16 + json.length;
+  for (let i = 0; i < idx.length; i++) dvw.setUint32(o + 4 * i, idx[i], true);
+  o += 4 * idx.length;
+  const src = new Uint8Array(buf);
+  for (let i = 0; i < idx.length; i++)
+    out.set(src.subarray(idx[i] * ST_PAGE, idx[i] * ST_PAGE + ST_PAGE), o + i * ST_PAGE);
+  log('state: snapshot f' + viRetrace + ' — ' + idx.length + '/' + nPages + ' pages ('
+      + (out.length / 1048576).toFixed(1) + ' MB raw), sp=0x' + hdr.sp.toString(16));
+  return out;
+}
+
+function stateApply(u8) {
+  const w = stateWasmApi();
+  if (!u8 || u8.length < 16) throw new Error('save state is truncated');
+  let magic = '';
+  for (let i = 0; i < 8; i++) magic += String.fromCharCode(u8[i]);
+  if (magic !== ST_MAGIC)
+    throw new Error('not a recomp save state (header "' + magic.replace(/[^\x20-\x7e]/g, '?') + '")');
+  const dvw = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const ver = dvw.getUint32(8, true);
+  if (ver !== ST_VERSION)
+    throw new Error('save state version ' + ver + ', this build reads version ' + ST_VERSION);
+  const jlen = dvw.getUint32(12, true);
+  const hdr = JSON.parse(new TextDecoder().decode(u8.subarray(16, 16 + jlen)));
+  if (hdr.page !== ST_PAGE) throw new Error('save state page size ' + hdr.page + ' != ' + ST_PAGE);
+  // INTEGRITY GATE, before anything destructive. The shadow-stack pointer at the VI pump point
+  // is deterministic for a given build (main's address-taken met0/met1 frame + the two callee
+  // frames). A mismatch means the state was captured at a DIFFERENT call context, and
+  // restoring linear memory under the live frames would be silent corruption — refuse instead.
+  const curSp = w.emscripten_stack_get_current() >>> 0;
+  if ((hdr.sp >>> 0) !== curSp)
+    throw new Error('shadow-stack pointer mismatch (state 0x' + (hdr.sp >>> 0).toString(16)
+                  + ', live 0x' + curSp.toString(16) + ') — refusing to restore');
+  if (hdr.memSize > Module.wasmMemory.buffer.byteLength) Module._emscripten_resize_heap(hdr.memSize);
+  const buf = Module.wasmMemory.buffer;
+  if (buf.byteLength < hdr.memSize)
+    throw new Error('cannot grow wasm memory to ' + hdr.memSize + 'B');
+  const need = 16 + jlen + 4 * hdr.pages + hdr.pages * ST_PAGE;
+  if (u8.length < need) throw new Error('save state truncated: ' + u8.length + 'B, need ' + need + 'B');
+  // Pages absent from the index were all-zero at save time and must be zero again, so zero
+  // everything first — the restored image is then byte-exact, not a merge with this timeline.
+  const dst = new Uint8Array(buf);
+  dst.fill(0);
+  let o = 16 + jlen;
+  const pidx = new Uint32Array(hdr.pages);
+  for (let i = 0; i < hdr.pages; i++) pidx[i] = dvw.getUint32(o + 4 * i, true);
+  o += 4 * hdr.pages;
+  for (let i = 0; i < hdr.pages; i++)
+    dst.set(u8.subarray(o + i * ST_PAGE, o + (i + 1) * ST_PAGE), pidx[i] * ST_PAGE);
+  w._emscripten_stack_restore(hdr.sp >>> 0);
+  // JS-side decoder/clock state
+  viRetrace = hdr.viRetrace >>> 0;
+  staticTop = hdr.staticTop >>> 0;
+  vcdLo = hdr.vcdLo >>> 0; vcdHi = hdr.vcdHi >>> 0; tlutSrc = hdr.tlutSrc >>> 0;
+  for (let i = 0; i < 8; i++) { vatA[i] = hdr.vatA[i] >>> 0; texImg0[i] = hdr.texImg0[i] >>> 0; }
+  for (let i = 0; i < 16; i++) { arrayBase[i] = hdr.arrayBase[i] >>> 0; arrayStride[i] = hdr.arrayStride[i] >>> 0; }
+  gxShadow.cp.clear(); for (const [k, v] of hdr.gxCp) gxShadow.cp.set(k >>> 0, v >>> 0);
+  gxShadow.xf.clear(); for (const [k, v] of hdr.gxXf) gxShadow.xf.set(k >>> 0, v >>> 0);
+  gxShadow.bp.clear(); for (const [k, v] of hdr.gxBp) gxShadow.bp.set(k >>> 0, v >>> 0);
+  // RENDERER HANDSHAKE — see the EXCLUDED note above. Everything dolphin has been told about
+  // guest RAM is now wrong, so drop every address-keyed cache and force a full mem1 + prologue
+  // resend on the very next frame.
+  knownDLs.clear(); knownArrays.clear(); knownTex.clear(); texBound.clear(); pairSeen.clear();
+  f32Arrays.length = 0;
+  cacheDirty = true; sentPrologue = false;
+  if (Module.___recomp_dirty_reset) Module.___recomp_dirty_reset();
+  log('state: restored f' + viRetrace + ' (' + hdr.pages + ' pages, sp=0x' + (hdr.sp >>> 0).toString(16) + ')');
+}
+
+// Blocking chunk receiver. The page cannot Atomics.wait (main thread) and this worker cannot
+// receive messages (see above), so the page fills the staging SAB and bumps ST_SEQ, we copy
+// and bump ST_CONSUMED, and the page polls that. ST_LEN < 0 marks end of stream.
+function stateReceive() {
+  if (!stageSab) throw new Error('no staging buffer — the page did not pass one at boot');
+  const stage = new Uint8Array(stageSab);
+  Atomics.store(paceI32, ST_STATUS, 1);
+  postMessage({ cmd: 'stateLoadReady' });
+  let seq = Atomics.load(paceI32, ST_SEQ);
+  let out = null, off = 0;
+  const deadline = Date.now() + 120000;
+  for (;;) {
+    while (Atomics.load(paceI32, ST_SEQ) === seq) {
+      if (Date.now() > deadline) throw new Error('timed out waiting for state bytes from the page');
+      Atomics.wait(paceI32, ST_SEQ, seq, 200);
+    }
+    seq = Atomics.load(paceI32, ST_SEQ);
+    const len = Atomics.load(paceI32, ST_LEN) | 0;
+    if (len < 0) { Atomics.store(paceI32, ST_CONSUMED, seq); Atomics.notify(paceI32, ST_CONSUMED); break; }
+    if (!out) {
+      const total = Atomics.load(paceI32, ST_TOTAL) >>> 0;
+      if (!total) throw new Error('page published a zero-length state');
+      out = new Uint8Array(total);
+    }
+    if (off + len > out.length) throw new Error('state overrun: ' + (off + len) + ' > ' + out.length);
+    out.set(stage.subarray(0, len), off);
+    off += len;
+    Atomics.store(paceI32, ST_CONSUMED, seq);
+    Atomics.notify(paceI32, ST_CONSUMED);
+  }
+  if (!out || off !== out.length)
+    throw new Error('state transfer short: ' + off + '/' + (out ? out.length : 0) + 'B');
+  return out;
+}
+
+// Serviced once per frame from the VIWaitForRetrace stub, after the frame has been fully
+// shipped/reset/paced — so the game is at a clean frame boundary in both directions.
+function stateServiceCmd() {
+  const cmd = Atomics.exchange(paceI32, ST_CMD, 0);
+  if (!cmd) return;
+  if (cmd === 1) {
+    try {
+      const blob = stateSnapshot();
+      Atomics.store(paceI32, ST_STATUS, 2);
+      postMessage({ cmd: 'stateSaved', n: viRetrace, buf: blob.buffer }, [blob.buffer]);
+    } catch (err) {
+      Atomics.store(paceI32, ST_STATUS, 3);
+      postMessage({ cmd: 'stateError', op: 'save', txt: String((err && err.message) || err) });
+    }
+  } else if (cmd === 2) {
+    try {
+      stateApply(stateReceive());
+      Atomics.store(paceI32, ST_STATUS, 2);
+      postMessage({ cmd: 'stateRestored', n: viRetrace });
+    } catch (err) {
+      Atomics.store(paceI32, ST_STATUS, 3);
+      postMessage({ cmd: 'stateError', op: 'load', txt: String((err && err.message) || err) });
+    }
+  }
+}
+
 function serveDvdRead(mem, dv, block, addr, length, offset, cbIdx) {
   block >>>= 0; addr >>>= 0; length >>>= 0; offset >>>= 0;
   cacheDirty = true;
@@ -266,6 +557,7 @@ async function boot(msg) {
   parts = msg.parts;
   fstBuf = new Uint8Array(msg.fst);
   paceI32 = new Int32Array(msg.pace);
+  if (msg.stage) stageSab = msg.stage;   // savestate load transport (see the SAVE STATES block)
 
   const wasmBinary = await (await fetch(msg.wasmUrl)).arrayBuffer();
   // Static-texture boundary = end of the wasm's INITIALIZED data segments (~0x25204): every
@@ -474,6 +766,7 @@ async function boot(msg) {
           if (Module.___recomp_set_inject_stkx) Module.___recomp_set_inject_stkx(os3 || h3 || (scripted ? scripted[2] : 0));
           if (Module.___recomp_set_inject_stky) Module.___recomp_set_inject_stky(os4 || h4 || (scripted ? scripted[3] : 0));
           viRetrace++;
+          cardPoll();
           // debug: periodic guest-side hex of watched addresses (boot msg peekAddrs;
           // diff against the dolphin worker's recompPeek of the same guest offsets)
           if (peekAddrs && (viRetrace % 1200) === 0) {
@@ -492,6 +785,9 @@ async function boot(msg) {
             while (Atomics.load(paceI32, 0) <= 0) Atomics.wait(paceI32, 0, 0, 500);
             Atomics.sub(paceI32, 0, 1);
           }
+          // savestate command cell — LAST, so the frame is fully shipped, the FIFO reset and
+          // the pacing credit consumed before a snapshot is taken or memory is overwritten.
+          stateServiceCmd();
           return 0;
         }
         default: return 0;
@@ -508,6 +804,24 @@ async function boot(msg) {
   const createModule = (await import(msg.glueUrl)).default;
   Module = await createModule({ instantiateWasm, noInitialRun: true });
   if (Module.wasmMemory.buffer.byteLength < 0x82000000) Module._emscripten_resize_heap(0x82000000);
+  // MEMORY CARD — must happen BEFORE _main(): CARDInit (inside main, via HuCardInit) adopts
+  // whatever bytes sit in the image buffer, and formats a blank card if they don't validate.
+  if (Module.___recomp_card_base && Module.___recomp_card_size) {
+    cardBase = Module.___recomp_card_base() >>> 0;
+    cardSize = Module.___recomp_card_size() >>> 0;
+    if (Module.___recomp_card_time)
+      Module.___recomp_card_time(Math.max(0, Math.floor(Date.now() / 1000) - 946684800) >>> 0);
+    if (msg.card && msg.card.byteLength === cardSize) {
+      new Uint8Array(Module.wasmMemory.buffer, cardBase, cardSize).set(new Uint8Array(msg.card));
+      log('memcard: seeded persisted image (' + cardSize + 'B) at 0x' + cardBase.toString(16));
+    } else {
+      log('memcard: no persisted image (' + (msg.card ? msg.card.byteLength + 'B, wrong size' : 'none')
+          + ') — the shim will format a blank card');
+    }
+    cardSeq = Module.___recomp_card_seq ? Module.___recomp_card_seq() >>> 0 : 0;
+  } else {
+    log('memcard: shim exports missing — build_wasm.sh EXPORTED_FUNCTIONS is stale, saves are OFF');
+  }
   if (msg.autoboard && Module.___recomp_autoboard_arm) { Module.___recomp_autoboard_arm(1); log('AUTOBOARD armed'); }
   if (msg.inputScript) { inputScript = msg.inputScript; log('input script: ' + Object.keys(inputScript).length + ' entries'); }
   if (msg.peekAddrs) peekAddrs = msg.peekAddrs;
@@ -532,4 +846,6 @@ async function boot(msg) {
 
 onmessage = (e) => {
   if (e.data.cmd === 'boot') boot(e.data).catch((err) => log('boot failed: ' + (err.stack || err)));
+  else if (e.data.cmd === 'cardLoad') cardLoad(e.data.img);
+  else if (e.data.cmd === 'cardDump') { if (!cardSnapshot()) log('memcard: dump ignored (not booted yet)'); }
 };
