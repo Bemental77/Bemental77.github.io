@@ -774,7 +774,7 @@
 773:WasmModuleBuilder::emitImportFunc(char const*, char const*, unsigned int)
 774:Sh4Interpreter::ExecuteDelayslot()
 775:SetInterruptMask(InterruptID)
-776:SetBaseClipping()_5235
+776:SetBaseClipping()_5236
 777:ResetInterruptMask(InterruptID)
 778:OpenGl4Source::OpenGl4Source()
 779:HIST_countFast_wksp
@@ -845,7 +845,7 @@
 844:void setN2Uniforms<gl4PipelineShader>(PolyParam const*, gl4PipelineShader*, rend_context const&)
 845:void addrspace::writet<unsigned long long>(unsigned int, unsigned long long)
 846:ungetc
-847:strtox_7052
+847:strtox_7053
 848:strdup
 849:std::__2::locale::operator=(std::__2::locale const&)
 850:std::__2::default_delete<asio::io_context>::operator()[abi:ne210108](asio::io_context*) const
@@ -1124,7 +1124,7 @@
 1123:tactx_Find(unsigned int, bool)
 1124:strtoul
 1125:std::runtime_error::~runtime_error()
-1126:std::logic_error::~logic_error()_8130
+1126:std::logic_error::~logic_error()_8131
 1127:std::__throw_bad_alloc()
 1128:std::__2::vector<aica::arm::ArmOp, std::__2::allocator<aica::arm::ArmOp>>::insert(std::__2::__wrap_iter<aica::arm::ArmOp const*>, aica::arm::ArmOp const&)
 1129:std::__2::vector<N2Matrix, std::__2::allocator<N2Matrix>>::push_back[abi:ne210108](N2Matrix const&)
@@ -1331,7 +1331,7 @@
 1330:std::__2::vector<Vertex, std::__2::allocator<Vertex>>::__append(unsigned long)
 1331:std::__2::unique_ptr<jvs_837_13551, std::__2::default_delete<jvs_837_13551>> std::__2::make_unique[abi:ne210108]<jvs_837_13551, int, MIEImpl*, int, 0>(int&&, MIEImpl*&&, int&&)
 1332:std::__2::unique_ptr<jvs_837_13551, std::__2::default_delete<jvs_837_13551>> std::__2::make_unique[abi:ne210108]<jvs_837_13551, int, MIEImpl*, 0>(int&&, MIEImpl*&&)
-1333:std::__2::time_put<char, std::__2::ostreambuf_iterator<char, std::__2::char_traits<char>>>::~time_put()_7897
+1333:std::__2::time_put<char, std::__2::ostreambuf_iterator<char, std::__2::char_traits<char>>>::~time_put()_7898
 1334:std::__2::thread::join()
 1335:std::__2::system_error::system_error(std::__2::error_code, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
 1336:std::__2::stream_data<std::__2::basic_ostream<wchar_t, std::__2::char_traits<wchar_t>>, std::__2::__stdoutbuf<wchar_t>>::init(_IO_FILE*)
@@ -1350,10 +1350,10 @@
 1349:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> std::__2::operator+[abi:ne210108]<char, std::__2::char_traits<char>, std::__2::allocator<char>>(char const*, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>&&)
 1350:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>::__grow_by_without_replace[abi:ne210108](unsigned long, unsigned long, unsigned long, unsigned long, unsigned long, unsigned long)
 1351:std::__2::basic_ostringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_ostringstream()
-1352:std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()_7250
+1352:std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()_7251
 1353:std::__2::basic_istringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_istringstream()
-1354:std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()_7232
-1355:std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7266
+1354:std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()_7233
+1355:std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7267
 1356:std::__2::__tree<std::__2::__value_type<unsigned int, void (*)()>, std::__2::__map_value_compare<unsigned int, std::__2::pair<unsigned int const, void (*)()>, std::__2::less<unsigned int>, true>, std::__2::allocator<std::__2::pair<unsigned int const, void (*)()>>>::destroy(std::__2::__tree_node<std::__2::__value_type<unsigned int, void (*)()>, void*>*)
 1357:std::__2::__tree<std::__2::__value_type<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, cmrc::detail::file_or_directory const*>, std::__2::__map_value_compare<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, cmrc::detail::file_or_directory const*>, std::__2::less<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>, true>, std::__2::allocator<std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, cmrc::detail::file_or_directory const*>>>::destroy(std::__2::__tree_node<std::__2::__value_type<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, cmrc::detail::file_or_directory const*>, void*>*)
 1358:std::__2::__tree<std::__2::__value_type<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, cmrc::detail::file_or_directory>, std::__2::__map_value_compare<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, cmrc::detail::file_or_directory>, std::__2::less<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>>, true>, std::__2::allocator<std::__2::pair<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const, cmrc::detail::file_or_directory>>>::destroy(std::__2::__tree_node<std::__2::__value_type<std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>, cmrc::detail::file_or_directory>, void*>*)
@@ -1779,9 +1779,9 @@
 1778:void WriteMem_area0<unsigned char, 2u, false>(unsigned int, unsigned char)
 1779:void SetGPState<2u, true>(PolyParam const*, unsigned int)
 1780:void DrawList<0u, false>(std::__2::vector<PolyParam, std::__2::allocator<PolyParam>> const&, int, int)
-1781:virtual thunk to std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()_7251
+1781:virtual thunk to std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()_7252
 1782:virtual thunk to std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()
-1783:virtual thunk to std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()_7233
+1783:virtual thunk to std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()_7234
 1784:virtual thunk to std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()
 1785:virtmem::prepare_jit_block(void*, unsigned long, void**)
 1786:updateRxFifoStatus()
@@ -1838,7 +1838,7 @@
 1837:strlcpy_retro__
 1838:strerror_r
 1839:store_int
-1840:std::runtime_error::~runtime_error()_8133
+1840:std::runtime_error::~runtime_error()_8134
 1841:std::rethrow_exception(std::exception_ptr)
 1842:std::__2::vector<std::__2::pair<std::__2::condition_variable*, std::__2::mutex*>, std::__2::__hidden_allocator<std::__2::pair<std::__2::condition_variable*, std::__2::mutex*>>>::~vector[abi:ne210108]()
 1843:std::__2::vector<std::__2::locale::facet*, std::__2::__sso_allocator<std::__2::locale::facet*, 30ul>>::~vector[abi:ne210108]()
@@ -1913,13 +1913,13 @@
 1912:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::seekpos(std::__2::fpos<__mbstate_t>, unsigned int)
 1913:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::seekoff(long long, std::__2::ios_base::seekdir, unsigned int)
 1914:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::basic_streambuf()
-1915:std::__2::basic_ostringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_ostringstream()_7318
+1915:std::__2::basic_ostringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_ostringstream()_7319
 1916:std::__2::basic_ostream<wchar_t, std::__2::char_traits<wchar_t>>::flush()
-1917:std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()_7248
+1917:std::__2::basic_ostream<char, std::__2::char_traits<char>>::~basic_ostream()_7249
 1918:std::__2::basic_ostream<char, std::__2::char_traits<char>>& std::__2::basic_ostream<char, std::__2::char_traits<char>>::__put_num_integer_promote[abi:ne210108]<unsigned int>(unsigned int)
 1919:std::__2::basic_ostream<char, std::__2::char_traits<char>>& std::__2::basic_ostream<char, std::__2::char_traits<char>>::__put_num_integer_promote[abi:ne210108]<int>(int)
-1920:std::__2::basic_istringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_istringstream()_7323
-1921:std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()_7230
+1920:std::__2::basic_istringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_istringstream()_7324
+1921:std::__2::basic_istream<char, std::__2::char_traits<char>>::~basic_istream()_7231
 1922:std::__2::basic_ios<char, std::__2::char_traits<char>>::init[abi:ne210108](std::__2::basic_streambuf<char, std::__2::char_traits<char>>*)
 1923:std::__2::__time_put::__do_put(char*, char*&, tm const*, char, char) const
 1924:std::__2::__throw_out_of_range[abi:ne210108](char const*)
@@ -2272,7 +2272,7 @@
 2271:asio::detail::select_reactor::cancel_ops_unlocked(int, std::__2::error_code const&)
 2272:asio::detail::scheduler::~scheduler()
 2273:asio::detail::scheduler::do_run_one(asio::detail::conditionally_enabled_mutex::scoped_lock&, asio::detail::scheduler_thread_info&, std::__2::error_code const&)
-2274:asio::detail::resolver_service<asio::ip::tcp>::~resolver_service()_4074
+2274:asio::detail::resolver_service<asio::ip::tcp>::~resolver_service()_4075
 2275:asio::detail::resolver_service<asio::ip::tcp>::~resolver_service()
 2276:asio::detail::resolver_service<asio::ip::tcp>::shutdown()
 2277:asio::detail::resolver_service<asio::ip::tcp>::notify_fork(asio::execution_context::fork_event)
@@ -2944,16 +2944,16 @@
 2943:void MMRegister<&BSC.<unsigned int at offset 0>, 255u, 0u>::writeModule<528482304u, unsigned int, 54460413u, 0u>(unsigned int, unsigned int)
 2944:void* std::__2::__thread_proxy[abi:ne210108]<std::__2::tuple<std::__2::unique_ptr<std::__2::__thread_struct, std::__2::default_delete<std::__2::__thread_struct>>, WorkerThread::start()::'lambda'()>>(void*)
 2945:void* std::__2::__thread_proxy[abi:ne210108]<std::__2::tuple<std::__2::unique_ptr<std::__2::__thread_struct, std::__2::default_delete<std::__2::__thread_struct>>, PicoThread::run()::$_2>>(void*)
-2946:virtual thunk to std::__2::basic_ostringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_ostringstream()_7320
+2946:virtual thunk to std::__2::basic_ostringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_ostringstream()_7321
 2947:virtual thunk to std::__2::basic_ostringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_ostringstream()
-2948:virtual thunk to std::__2::basic_istringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_istringstream()_7325
+2948:virtual thunk to std::__2::basic_istringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_istringstream()_7326
 2949:virtual thunk to std::__2::basic_istringstream<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_istringstream()
-2950:virtual thunk to std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7268
+2950:virtual thunk to std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7269
 2951:virtual thunk to std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()
-2952:virtual thunk to asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()_3920
+2952:virtual thunk to asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()_3921
 2953:virtual thunk to asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()
 2954:video_cb(void const*, unsigned int, unsigned int, unsigned long)
-2955:vblankCallback(Event, void*)_5263
+2955:vblankCallback(Event, void*)_5264
 2956:vblankCallback(Event, void*)
 2957:vasprintf
 2958:update_max_arp_reqs
@@ -3342,12 +3342,12 @@
 3341:std::__2::time_get<char, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>>::do_get_date(std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, std::__2::ios_base&, unsigned int&, tm*) const
 3342:std::__2::time_get<char, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>>::do_get(std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, std::__2::ios_base&, unsigned int&, tm*, char, char) const
 3343:std::__2::numpunct<wchar_t> const& std::__2::use_facet[abi:ne210108]<std::__2::numpunct<wchar_t>>(std::__2::locale const&)
-3344:std::__2::numpunct<wchar_t>::~numpunct()_7845
+3344:std::__2::numpunct<wchar_t>::~numpunct()_7846
 3345:std::__2::numpunct<wchar_t>::do_truename() const
 3346:std::__2::numpunct<wchar_t>::do_grouping() const
 3347:std::__2::numpunct<wchar_t>::do_falsename() const
 3348:std::__2::numpunct<char> const& std::__2::use_facet[abi:ne210108]<std::__2::numpunct<char>>(std::__2::locale const&)
-3349:std::__2::numpunct<char>::~numpunct()_7843
+3349:std::__2::numpunct<char>::~numpunct()_7844
 3350:std::__2::numpunct<char>::do_truename() const
 3351:std::__2::numpunct<char>::do_thousands_sep() const
 3352:std::__2::numpunct<char>::do_grouping() const
@@ -3405,12 +3405,12 @@
 3404:std::__2::money_get<char, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>>::__do_get(std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>&, std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>, bool, std::__2::locale const&, unsigned int, unsigned int&, bool&, std::__2::ctype<char> const&, std::__2::unique_ptr<char, void (*)(void*)>&, char*&, char*)
 3405:std::__2::messages<wchar_t>::do_get(long, int, int, std::__2::basic_string<wchar_t, std::__2::char_traits<wchar_t>, std::__2::allocator<wchar_t>> const&) const
 3406:std::__2::messages<char>::do_get(long, int, int, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&) const
-3407:std::__2::locale::__imp::~__imp()_7747
+3407:std::__2::locale::__imp::~__imp()_7748
 3408:std::__2::locale::__imp::__imp(unsigned long)
 3409:std::__2::locale::__global()
 3410:std::__2::istreambuf_iterator<wchar_t, std::__2::char_traits<wchar_t>>::operator*[abi:ne210108]() const
 3411:std::__2::istreambuf_iterator<char, std::__2::char_traits<char>>::operator*[abi:ne210108]() const
-3412:std::__2::ios_base::~ios_base()_7341
+3412:std::__2::ios_base::~ios_base()_7342
 3413:std::__2::ios_base::getloc() const
 3414:std::__2::ios_base::failure::failure(char const*, std::__2::error_code const&)
 3415:std::__2::ios_base::__set_badbit_and_consider_rethrow()
@@ -3432,7 +3432,7 @@
 3431:std::__2::ctype<wchar_t>::do_is(wchar_t const*, wchar_t const*, unsigned long*) const
 3432:std::__2::ctype<wchar_t>::do_is(unsigned long, wchar_t) const
 3433:std::__2::ctype<char> const& std::__2::use_facet[abi:ne210108]<std::__2::ctype<char>>(std::__2::locale const&)
-3434:std::__2::ctype<char>::~ctype()_7772
+3434:std::__2::ctype<char>::~ctype()_7773
 3435:std::__2::ctype<char>::do_widen(char const*, char const*, char*) const
 3436:std::__2::ctype<char>::do_toupper(char) const
 3437:std::__2::ctype<char>::do_toupper(char*, char const*) const
@@ -3447,7 +3447,7 @@
 3446:std::__2::collate<char>::do_hash(char const*, char const*) const
 3447:std::__2::collate<char>::do_compare(char const*, char const*, char const*, char const*) const
 3448:std::__2::codecvt<wchar_t, char, __mbstate_t> const& std::__2::use_facet[abi:ne210108]<std::__2::codecvt<wchar_t, char, __mbstate_t>>(std::__2::locale const&)
-3449:std::__2::codecvt<wchar_t, char, __mbstate_t>::~codecvt()_7789
+3449:std::__2::codecvt<wchar_t, char, __mbstate_t>::~codecvt()_7790
 3450:std::__2::codecvt<wchar_t, char, __mbstate_t>::do_unshift(__mbstate_t&, char*, char*, char*&) const
 3451:std::__2::codecvt<wchar_t, char, __mbstate_t>::do_out(__mbstate_t&, wchar_t const*, wchar_t const*, wchar_t const*&, char*, char*, char*&) const
 3452:std::__2::codecvt<wchar_t, char, __mbstate_t>::do_max_length() const
@@ -3457,7 +3457,7 @@
 3456:std::__2::codecvt<wchar_t, char, __mbstate_t>::codecvt(unsigned long)
 3457:std::__2::codecvt<char, char, __mbstate_t> const& std::__2::use_facet[abi:ne210108]<std::__2::codecvt<char, char, __mbstate_t>>(std::__2::locale const&)
 3458:std::__2::codecvt<char, char, __mbstate_t>::do_length(__mbstate_t&, char const*, char const*, unsigned long) const
-3459:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_stringbuf()_7314
+3459:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::~basic_stringbuf()_7315
 3460:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::underflow()
 3461:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::seekpos(std::__2::fpos<__mbstate_t>, unsigned int)
 3462:std::__2::basic_stringbuf<char, std::__2::char_traits<char>, std::__2::allocator<char>>::seekoff(long long, std::__2::ios_base::seekdir, unsigned int)
@@ -3471,19 +3471,19 @@
 3470:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>::assign(char const*)
 3471:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>::append[abi:ne210108](std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
 3472:std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>& std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>>::append[abi:ne210108]<char*, 0>(char*, char*)
-3473:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::~basic_streambuf()_7271
+3473:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::~basic_streambuf()_7272
 3474:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::xsputn(wchar_t const*, long)
 3475:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::xsgetn(wchar_t*, long)
 3476:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::uflow()
 3477:std::__2::basic_streambuf<wchar_t, std::__2::char_traits<wchar_t>>::sgetc[abi:ne210108]()
-3478:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::~basic_streambuf()_7214
+3478:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::~basic_streambuf()_7215
 3479:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::xsputn(char const*, long)
 3480:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::xsgetn(char*, long)
 3481:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::uflow()
 3482:std::__2::basic_streambuf<char, std::__2::char_traits<char>>::sgetc[abi:ne210108]()
 3483:std::__2::basic_ostream<wchar_t, std::__2::char_traits<wchar_t>>::sentry::sentry(std::__2::basic_ostream<wchar_t, std::__2::char_traits<wchar_t>>&)
-3484:std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7263
-3485:std::__2::basic_ios<char, std::__2::char_traits<char>>::~basic_ios()_7212
+3484:std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7264
+3485:std::__2::basic_ios<char, std::__2::char_traits<char>>::~basic_ios()_7213
 3486:std::__2::basic_ios<char, std::__2::char_traits<char>>::~basic_ios()
 3487:std::__2::basic_ios<char, std::__2::char_traits<char>>::fill[abi:ne210108]() const
 3488:std::__2::bad_weak_ptr::what() const
@@ -3568,14 +3568,14 @@
 3567:std::__2::__shared_ptr_emplace<maple_atomiswave_controller, std::__2::allocator<maple_atomiswave_controller>>::~__shared_ptr_emplace()
 3568:std::__2::__shared_ptr_emplace<maple_ascii_stick, std::__2::allocator<maple_ascii_stick>>::~__shared_ptr_emplace()_1597
 3569:std::__2::__shared_ptr_emplace<maple_ascii_stick, std::__2::allocator<maple_ascii_stick>>::~__shared_ptr_emplace()
-3570:std::__2::__shared_ptr_emplace<dreampotato::DreamPotato, std::__2::allocator<dreampotato::DreamPotato>>::~__shared_ptr_emplace()_4099
+3570:std::__2::__shared_ptr_emplace<dreampotato::DreamPotato, std::__2::allocator<dreampotato::DreamPotato>>::~__shared_ptr_emplace()_4100
 3571:std::__2::__shared_ptr_emplace<dreampotato::DreamPotato, std::__2::allocator<dreampotato::DreamPotato>>::~__shared_ptr_emplace()
 3572:std::__2::__shared_ptr_emplace<dreampotato::DreamPotato, std::__2::allocator<dreampotato::DreamPotato>>::__on_zero_shared()
 3573:std::__2::__shared_ptr_emplace<atomiswave_lightgun, std::__2::allocator<atomiswave_lightgun>>::~__shared_ptr_emplace()_1580
 3574:std::__2::__shared_ptr_emplace<atomiswave_lightgun, std::__2::allocator<atomiswave_lightgun>>::~__shared_ptr_emplace()
 3575:std::__2::__shared_ptr_emplace<RFIDReaderWriterImpl, std::__2::allocator<RFIDReaderWriterImpl>>::~__shared_ptr_emplace()_1841
 3576:std::__2::__shared_ptr_emplace<RFIDReaderWriterImpl, std::__2::allocator<RFIDReaderWriterImpl>>::~__shared_ptr_emplace()
-3577:std::__2::__shared_ptr_emplace<MiniUPnP, std::__2::allocator<MiniUPnP>>::~__shared_ptr_emplace()_4798
+3577:std::__2::__shared_ptr_emplace<MiniUPnP, std::__2::allocator<MiniUPnP>>::~__shared_ptr_emplace()_4799
 3578:std::__2::__shared_ptr_emplace<MiniUPnP, std::__2::allocator<MiniUPnP>>::~__shared_ptr_emplace()
 3579:std::__2::__shared_ptr_emplace<MiniUPnP, std::__2::allocator<MiniUPnP>>::__on_zero_shared()
 3580:std::__2::__shared_ptr_emplace<MapleLinkVmu, std::__2::allocator<MapleLinkVmu>>::~__shared_ptr_emplace()_1681
@@ -3634,7 +3634,7 @@
 3633:std::__2::__async_assoc_state<void, std::__2::__async_func<Emulator::start()::$_0>>::__execute()
 3634:std::__2::__async_assoc_state<void, std::__2::__async_func<DirectPlayImpl::forwardPorts(unsigned short, bool)::'lambda'()>>::__execute()
 3635:std::__2::__async_assoc_state<bool, std::__2::__async_func<NaomiNetwork::startNetworkAsync()::'lambda'()>>::__execute()
-3636:std::__2::__assoc_sub_state::~__assoc_sub_state()_7202
+3636:std::__2::__assoc_sub_state::~__assoc_sub_state()_7203
 3637:std::__2::__assoc_sub_state::__sub_wait(std::__2::unique_lock<std::__2::mutex>&)
 3638:std::__2::__assoc_sub_state::__make_ready()
 3639:std::__2::__assoc_sub_state::__execute()
@@ -3648,7 +3648,7 @@
 3647:stbi__resample_row_generic(unsigned char*, unsigned char*, unsigned char*, int, int)
 3648:stbi__idct_block(unsigned char*, int, short*)
 3649:stbi__YCbCr_to_RGB_row(unsigned char*, unsigned char const*, unsigned char const*, unsigned char const*, int, int)
-3650:start_5995
+3650:start_5996
 3651:start
 3652:sqWrite_nommu_area_3_nonvmem(unsigned int, Sh4Context*)
 3653:sqWrite_nommu_area_3(unsigned int, Sh4Context*)
@@ -3818,7 +3818,7 @@
 3817:read_BSC_PDTRA(unsigned int)
 3818:pthread_cond_wait
 3819:proto_deinit_cb
-3820:process_6000
+3820:process_6001
 3821:process
 3822:ppp_modem_send_reset
 3823:ppp_modem_send_echo
@@ -3861,7 +3861,7 @@
 3860:norend::Render()
 3861:norend::RenderFramebuffer(FramebufferInfo const&)
 3862:norend::Process(TA_context*)
-3863:non-virtual thunk to std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7267
+3863:non-virtual thunk to std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()_7268
 3864:non-virtual thunk to std::__2::basic_iostream<char, std::__2::char_traits<char>>::~basic_iostream()
 3865:non-virtual thunk to modem::v42b::Decompressor::~Decompressor()_2033
 3866:non-virtual thunk to modem::v42b::Decompressor::~Decompressor()
@@ -3884,7 +3884,7 @@
 3883:non-virtual thunk to card_reader::ClubKartCardReader::write(unsigned char)
 3884:non-virtual thunk to asio::detail::select_reactor::run(long, asio::detail::op_queue<asio::detail::scheduler_operation>&)
 3885:non-virtual thunk to asio::detail::select_reactor::interrupt()
-3886:non-virtual thunk to asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()_3919
+3886:non-virtual thunk to asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()_3920
 3887:non-virtual thunk to asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()
 3888:non-virtual thunk to MIEImpl::~MIEImpl()_1769
 3889:non-virtual thunk to MIEImpl::~MIEImpl()
@@ -3944,7 +3944,7 @@
 3943:mcast_so_addsrcm
 3944:mcast_so_addm
 3945:mcast_listen_cmp
-3946:maximum_compressed_size_5991
+3946:maximum_compressed_size_5992
 3947:maximum_compressed_size
 3948:maple_sega_vmu::~maple_sega_vmu()_1685
 3949:maple_sega_vmu::serialize(Serializer&) const
@@ -4086,7 +4086,7 @@
 4085:ipcp_bring_up
 4086:input_state_cb(unsigned int, unsigned int, unsigned int, unsigned int)
 4087:input_segment_compare
-4088:input_5998
+4088:input_5999
 4089:input
 4090:initconn_retry
 4091:iNotImplemented(Sh4Context*, unsigned int)
@@ -4307,7 +4307,7 @@
 4306:htonl
 4307:hostfs::StdStorage::openFile(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&, std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
 4308:hostfs::StdStorage::exists(std::__2::basic_string<char, std::__2::char_traits<char>, std::__2::allocator<char>> const&)
-4309:hostfs::StdFile::~StdFile()_5003
+4309:hostfs::StdFile::~StdFile()_5004
 4310:hostfs::StdFile::~StdFile()
 4311:hostfs::StdFile::write(void const*, unsigned long, unsigned long)
 4312:hostfs::StdFile::tell()
@@ -4393,9 +4393,9 @@
 4392:flac_codec_free
 4393:flac_codec_decompress
 4394:fault_handler(int, siginfo_t*, void*)
-4395:end_of_input_5999
+4395:end_of_input_6000
 4396:end_of_input
-4397:end_5997
+4397:end_5998
 4398:end
 4399:emscripten_worker_init
 4400:emscripten_stack_set_limits
@@ -4486,7 +4486,7 @@
 4485:drflac__realloc_default
 4486:drflac__on_seek_ogg
 4487:drflac__on_read_ogg
-4488:dreampotato::DreamPotato::~DreamPotato()_3880
+4488:dreampotato::DreamPotato::~DreamPotato()_3881
 4489:dreampotato::DreamPotato::~DreamPotato()
 4490:dreampotato::DreamPotato::send(MapleMsg const&)
 4491:dreampotato::DreamPotato::sendReceive(MapleMsg const&, MapleMsg&)
@@ -4498,7 +4498,7 @@
 4497:deinit_cb
 4498:deflate_slow
 4499:deflate_fast
-4500:decompress_allocate_6001
+4500:decompress_allocate_6002
 4501:decompress_allocate
 4502:decltype(auto) std::__2::__variant_detail::__visitation::__base::__dispatcher<1ul>::__dispatch[abi:ne210108]<void std::__2::__variant_detail::__ctor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>>::__generic_construct[abi:ne210108]<std::__2::__variant_detail::__move_constructor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>>(std::__2::__variant_detail::__ctor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>>&, std::__2::__variant_detail::__move_constructor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>&&)::'lambda'(std::__2::__variant_detail::__move_constructor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>&&)&&, std::__2::__variant_detail::__base<(std::__2::__variant_detail::_Trait)1, std::__2::monostate, std::__2::function<void ()>>&&>(std::__2::__variant_detail::__move_constructor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>, std::__2::__variant_detail::__base<(std::__2::__variant_detail::_Trait)1, std::__2::monostate, std::__2::function<void ()>>&&)
 4503:decltype(auto) std::__2::__variant_detail::__visitation::__base::__dispatcher<1ul>::__dispatch[abi:ne210108]<std::__2::__variant_detail::__dtor<std::__2::__variant_detail::__traits<std::__2::monostate, std::__2::function<void ()>>, (std::__2::__variant_detail::_Trait)1>::__destroy[abi:ne210108]()::'lambda'(auto&)&&, std::__2::__variant_detail::__base<(std::__2::__variant_detail::_Trait)1, std::__2::monostate, std::__2::function<void ()>>&>(auto, std::__2::__variant_detail::__base<(std::__2::__variant_detail::_Trait)1, std::__2::monostate, std::__2::function<void ()>>&)
@@ -4555,7 +4555,7 @@
 4554:config::Option<MapleDeviceType, true>::~Option()
 4555:config::IntOption::load()
 4556:compress_callback
-4557:compress_allocate_5992
+4557:compress_allocate_5993
 4558:compress_allocate
 4559:cdzs_codec_init
 4560:cdzs_codec_free
@@ -4620,7 +4620,7 @@
 4619:asio::detail::wait_handler<void net::modbba::AccessPointFinder::find<net::modbba::DCNetThread::run()::$_0>(net::modbba::DCNetThread::run()::$_0 const&)::'lambda'(std::__2::error_code const&), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
 4620:asio::detail::wait_handler<void net::modbba::AccessPointFinder::find<net::modbba::DCNetThread::run()::$_0>(net::modbba::DCNetThread::run()::$_0 const&)::'lambda'(std::__2::error_code const&)::operator()(std::__2::error_code const&) const::'lambda'(std::__2::error_code const&), asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
 4621:asio::detail::wait_handler<std::__2::__bind<void (&)(std::__2::error_code const&, asio::basic_waitable_timer<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>, asio::any_io_executor>*), std::__2::placeholders::__ph<1> const&, asio::basic_waitable_timer<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>, asio::any_io_executor>*&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4622:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~timer_queue()_4828
+4622:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~timer_queue()_4829
 4623:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~timer_queue()
 4624:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::wait_duration_usec(long) const
 4625:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::wait_duration_msec(long) const
@@ -4629,11 +4629,11 @@
 4628:asio::detail::timer_queue<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::empty() const
 4629:asio::detail::system_category::name() const
 4630:asio::detail::system_category::message(int) const
-4631:asio::detail::select_reactor::~select_reactor()_3959
+4631:asio::detail::select_reactor::~select_reactor()_3960
 4632:asio::detail::select_reactor::~select_reactor()
 4633:asio::detail::select_reactor::notify_fork(asio::execution_context::fork_event)
 4634:asio::detail::select_reactor::interrupt()
-4635:asio::detail::scheduler::~scheduler()_3969
+4635:asio::detail::scheduler::~scheduler()_3970
 4636:asio::detail::scheduler::shutdown()
 4637:asio::detail::scheduler::get_default_task(asio::execution_context&)
 4638:asio::detail::reactive_socket_sendto_op_base<asio::mutable_buffers_1, asio::ip::basic_endpoint<asio::ip::udp>>::do_perform(asio::detail::reactor_op*)
@@ -4657,7 +4657,7 @@
 4656:asio::detail::reactive_socket_accept_op<asio::basic_socket<asio::ip::tcp, asio::any_io_executor>, asio::ip::tcp, std::__2::__bind<void (TcpAcceptor::*)(std::__2::shared_ptr<TcpSocket>, std::__2::error_code const&), std::__2::shared_ptr<TcpAcceptor>, std::__2::shared_ptr<TcpSocket>&, std::__2::placeholders::__ph<1> const&>, asio::any_io_executor>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
 4657:asio::detail::posix_thread::func<asio::detail::scheduler::thread_function>::run()
 4658:asio::detail::executor_op<asio::detail::executor_function, std::__2::allocator<void>, asio::detail::scheduler_operation>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
-4659:asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~deadline_timer_service()_4825
+4659:asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~deadline_timer_service()_4826
 4660:asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::~deadline_timer_service()
 4661:asio::detail::completion_handler<net::modbba::DCNetThread::sendModem(unsigned char)::'lambda'(), asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
 4662:asio::detail::completion_handler<net::modbba::DCNetThread::sendEthFrame(unsigned char const*, unsigned int)::'lambda'(), asio::io_context::basic_executor_type<std::__2::allocator<void>, 0ul>>::do_complete(void*, asio::detail::scheduler_operation*, std::__2::error_code const&, unsigned long)
@@ -4665,11 +4665,11 @@
 4664:asio::detail::cancellation_handler<asio::detail::reactive_socket_service_base::reactor_op_cancellation>::call(asio::cancellation_type)
 4665:asio::detail::cancellation_handler<asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::op_cancellation>::destroy()
 4666:asio::detail::cancellation_handler<asio::detail::deadline_timer_service<asio::detail::chrono_time_traits<std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>>::op_cancellation>::call(asio::cancellation_type)
-4667:asio::basic_socket_streambuf<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_streambuf()_3923
+4667:asio::basic_socket_streambuf<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_streambuf()_3924
 4668:asio::basic_socket_streambuf<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::underflow()
 4669:asio::basic_socket_streambuf<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::sync()
 4670:asio::basic_socket_streambuf<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::setbuf(char*, long)
-4671:asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()_3918
+4671:asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()_3919
 4672:asio::basic_socket_iostream<asio::ip::tcp, std::__2::chrono::steady_clock, asio::wait_traits<std::__2::chrono::steady_clock>>::~basic_socket_iostream()
 4673:arp_expire
 4674:arp_compare
@@ -4723,42 +4723,42 @@
 4722:__cxxabiv1::__aligned_free_with_fallback(void*)
 4723:__cxx_global_array_dtor_979
 4724:__cxx_global_array_dtor_801
-4725:__cxx_global_array_dtor_7872
+4725:__cxx_global_array_dtor_7873
 4726:__cxx_global_array_dtor_737
-4727:__cxx_global_array_dtor_6075
-4728:__cxx_global_array_dtor_6044
+4727:__cxx_global_array_dtor_6076
+4728:__cxx_global_array_dtor_6045
 4729:__cxx_global_array_dtor_595
-4730:__cxx_global_array_dtor_5654
-4731:__cxx_global_array_dtor_5561
-4732:__cxx_global_array_dtor_5469
+4730:__cxx_global_array_dtor_5655
+4731:__cxx_global_array_dtor_5562
+4732:__cxx_global_array_dtor_5470
 4733:__cxx_global_array_dtor_546
-4734:__cxx_global_array_dtor_5346
-4735:__cxx_global_array_dtor_5310
-4736:__cxx_global_array_dtor_5258
-4737:__cxx_global_array_dtor_5241
-4738:__cxx_global_array_dtor_5213
-4739:__cxx_global_array_dtor_5201
-4740:__cxx_global_array_dtor_5172
-4741:__cxx_global_array_dtor_5113
-4742:__cxx_global_array_dtor_5056
-4743:__cxx_global_array_dtor_5047
-4744:__cxx_global_array_dtor_4979
-4745:__cxx_global_array_dtor_4962
-4746:__cxx_global_array_dtor_4841
-4747:__cxx_global_array_dtor_4568
-4748:__cxx_global_array_dtor_4566
-4749:__cxx_global_array_dtor_4519
-4750:__cxx_global_array_dtor_4172
-4751:__cxx_global_array_dtor_4132
-4752:__cxx_global_array_dtor_4103
-4753:__cxx_global_array_dtor_3864
-4754:__cxx_global_array_dtor_3791
-4755:__cxx_global_array_dtor_3542
-4756:__cxx_global_array_dtor_3218
-4757:__cxx_global_array_dtor_2960
-4758:__cxx_global_array_dtor_2890
-4759:__cxx_global_array_dtor_2744
-4760:__cxx_global_array_dtor_2725
+4734:__cxx_global_array_dtor_5347
+4735:__cxx_global_array_dtor_5311
+4736:__cxx_global_array_dtor_5259
+4737:__cxx_global_array_dtor_5242
+4738:__cxx_global_array_dtor_5214
+4739:__cxx_global_array_dtor_5202
+4740:__cxx_global_array_dtor_5173
+4741:__cxx_global_array_dtor_5114
+4742:__cxx_global_array_dtor_5057
+4743:__cxx_global_array_dtor_5048
+4744:__cxx_global_array_dtor_4980
+4745:__cxx_global_array_dtor_4963
+4746:__cxx_global_array_dtor_4842
+4747:__cxx_global_array_dtor_4569
+4748:__cxx_global_array_dtor_4567
+4749:__cxx_global_array_dtor_4520
+4750:__cxx_global_array_dtor_4173
+4751:__cxx_global_array_dtor_4133
+4752:__cxx_global_array_dtor_4104
+4753:__cxx_global_array_dtor_3865
+4754:__cxx_global_array_dtor_3792
+4755:__cxx_global_array_dtor_3543
+4756:__cxx_global_array_dtor_3219
+4757:__cxx_global_array_dtor_2961
+4758:__cxx_global_array_dtor_2891
+4759:__cxx_global_array_dtor_2745
+4760:__cxx_global_array_dtor_2726
 4761:__cxx_global_array_dtor_2667
 4762:__cxx_global_array_dtor_2654
 4763:__cxx_global_array_dtor_2399
@@ -4777,7 +4777,7 @@
 4776:__cxx_global_array_dtor.90
 4777:__cxx_global_array_dtor.9
 4778:__cxx_global_array_dtor.8_806
-4779:__cxx_global_array_dtor.8_5314
+4779:__cxx_global_array_dtor.8_5315
 4780:__cxx_global_array_dtor.8_1896
 4781:__cxx_global_array_dtor.89
 4782:__cxx_global_array_dtor.88
@@ -4786,15 +4786,15 @@
 4785:__cxx_global_array_dtor.83
 4786:__cxx_global_array_dtor.81
 4787:__cxx_global_array_dtor.8
-4788:__cxx_global_array_dtor.7_2731
+4788:__cxx_global_array_dtor.7_2732
 4789:__cxx_global_array_dtor.79
 4790:__cxx_global_array_dtor.76
 4791:__cxx_global_array_dtor.73
 4792:__cxx_global_array_dtor.70
-4793:__cxx_global_array_dtor.6_5313
-4794:__cxx_global_array_dtor.6_5115
-4795:__cxx_global_array_dtor.6_4842
-4796:__cxx_global_array_dtor.6_4569
+4793:__cxx_global_array_dtor.6_5314
+4794:__cxx_global_array_dtor.6_5116
+4795:__cxx_global_array_dtor.6_4843
+4796:__cxx_global_array_dtor.6_4570
 4797:__cxx_global_array_dtor.6_2674
 4798:__cxx_global_array_dtor.6_1892
 4799:__cxx_global_array_dtor.6_1883
@@ -4811,42 +4811,42 @@
 4810:__cxx_global_array_dtor.5578
 4811:__cxx_global_array_dtor.5576
 4812:__cxx_global_array_dtor.5574
-4813:__cxx_global_array_dtor.53_7859
+4813:__cxx_global_array_dtor.53_7860
 4814:__cxx_global_array_dtor.53
 4815:__cxx_global_array_dtor.51
 4816:__cxx_global_array_dtor.5
-4817:__cxx_global_array_dtor.4_5312
-4818:__cxx_global_array_dtor.4_2893
+4817:__cxx_global_array_dtor.4_5313
+4818:__cxx_global_array_dtor.4_2894
 4819:__cxx_global_array_dtor.4_2669
 4820:__cxx_global_array_dtor.4_1882
 4821:__cxx_global_array_dtor.48
 4822:__cxx_global_array_dtor.46
 4823:__cxx_global_array_dtor.44
 4824:__cxx_global_array_dtor.41
-4825:__cxx_global_array_dtor.40_7886
+4825:__cxx_global_array_dtor.40_7887
 4826:__cxx_global_array_dtor.4
-4827:__cxx_global_array_dtor.38_7884
+4827:__cxx_global_array_dtor.38_7885
 4828:__cxx_global_array_dtor.38
-4829:__cxx_global_array_dtor.36_7882
+4829:__cxx_global_array_dtor.36_7883
 4830:__cxx_global_array_dtor.36
-4831:__cxx_global_array_dtor.34_7880
+4831:__cxx_global_array_dtor.34_7881
 4832:__cxx_global_array_dtor.33
 4833:__cxx_global_array_dtor.32
 4834:__cxx_global_array_dtor.31
-4835:__cxx_global_array_dtor.30_7876
+4835:__cxx_global_array_dtor.30_7877
 4836:__cxx_global_array_dtor.30
 4837:__cxx_global_array_dtor.3
 4838:__cxx_global_array_dtor.2_596
-4839:__cxx_global_array_dtor.2_5311
-4840:__cxx_global_array_dtor.2_5214
-4841:__cxx_global_array_dtor.2_4980
-4842:__cxx_global_array_dtor.2_4105
-4843:__cxx_global_array_dtor.2_2892
+4839:__cxx_global_array_dtor.2_5312
+4840:__cxx_global_array_dtor.2_5215
+4841:__cxx_global_array_dtor.2_4981
+4842:__cxx_global_array_dtor.2_4106
+4843:__cxx_global_array_dtor.2_2893
 4844:__cxx_global_array_dtor.2_2668
 4845:__cxx_global_array_dtor.2_2325
 4846:__cxx_global_array_dtor.2_1881
 4847:__cxx_global_array_dtor.2_1695
-4848:__cxx_global_array_dtor.29_7874
+4848:__cxx_global_array_dtor.29_7875
 4849:__cxx_global_array_dtor.29
 4850:__cxx_global_array_dtor.28
 4851:__cxx_global_array_dtor.27
@@ -4859,7 +4859,7 @@
 4858:__cxx_global_array_dtor.201
 4859:__cxx_global_array_dtor.20
 4860:__cxx_global_array_dtor.2
-4861:__cxx_global_array_dtor.1_7378
+4861:__cxx_global_array_dtor.1_7379
 4862:__cxx_global_array_dtor.199
 4863:__cxx_global_array_dtor.197
 4864:__cxx_global_array_dtor.195
@@ -4892,15 +4892,15 @@
 4891:__cxx_global_array_dtor.14
 4892:__cxx_global_array_dtor.139
 4893:__cxx_global_array_dtor.137
-4894:__cxx_global_array_dtor.134_7870
+4894:__cxx_global_array_dtor.134_7871
 4895:__cxx_global_array_dtor.134
-4896:__cxx_global_array_dtor.131_7868
+4896:__cxx_global_array_dtor.131_7869
 4897:__cxx_global_array_dtor.131
 4898:__cxx_global_array_dtor.128
 4899:__cxx_global_array_dtor.126
 4900:__cxx_global_array_dtor.123
 4901:__cxx_global_array_dtor.120
-4902:__cxx_global_array_dtor.11_2733
+4902:__cxx_global_array_dtor.11_2734
 4903:__cxx_global_array_dtor.117
 4904:__cxx_global_array_dtor.114
 4905:__cxx_global_array_dtor.112
@@ -5077,7 +5077,7 @@
 5076:SzArchive::ArchiveStream::Read(ISeekInStream const*, void*, unsigned long*)
 5077:SzAlloc
 5078:SwapIntervalDetector::eventHandler(Event, void*)
-5079:Sh4Recompiler::~Sh4Recompiler()_2974
+5079:Sh4Recompiler::~Sh4Recompiler()_2975
 5080:Sh4Recompiler::~Sh4Recompiler()
 5081:Sh4Recompiler::Term()
 5082:Sh4Recompiler::Run()
@@ -5100,7 +5100,7 @@
 5099:SRamChip::Deserialize(Deserializer&)
 5100:SCSPTR2_read(unsigned int)
 5101:SCSCR2_read(unsigned int)
-5102:SCIFSerialPort::~SCIFSerialPort()_3266
+5102:SCIFSerialPort::~SCIFSerialPort()_3267
 5103:SCIFSerialPort::~SCIFSerialPort()
 5104:SCIFSerialPort::setPipe(SerialPort::Pipe*)
 5105:SCIFSerialPort::schedCallback(int, int, int, void*)
@@ -5108,12 +5108,12 @@
 5107:SCIFSerialPort::SCSMR2_write(unsigned int, unsigned short)
 5108:SCIFSerialPort::SCFCR2_read(unsigned int)
 5109:SCIFSerialPort::SCBRR2_write(unsigned int, unsigned char)
-5110:RuntimeBlockInfo::~RuntimeBlockInfo()_2914
+5110:RuntimeBlockInfo::~RuntimeBlockInfo()_2915
 5111:Renderer::onEvent(Event, void*)
 5112:RegWrite_SB_SDST(unsigned int, unsigned int)
 5113:RegWrite_SB_PDST(unsigned int, unsigned int)
 5114:RegWrite_SB_C2DST(unsigned int, unsigned int)
-5115:RawTrackFile::~RawTrackFile()_3835
+5115:RawTrackFile::~RawTrackFile()_3836
 5116:RawTrackFile::~RawTrackFile()
 5117:RawTrackFile::Read(unsigned int, unsigned char*, SectorFormat*, unsigned char*, SubcodeFormat*)
 5118:RFIDReaderWriterImpl::~RFIDReaderWriterImpl()
@@ -5145,7 +5145,7 @@
 5144:OpenGL4Renderer::Term()
 5145:OpenGL4Renderer::Render()
 5146:OpenGL4Renderer::Init()
-5147:NullModemPipe::~NullModemPipe()_4556
+5147:NullModemPipe::~NullModemPipe()_4557
 5148:NullModemPipe::write(unsigned char)
 5149:NullModemPipe::sendBreak()
 5150:NullModemPipe::read()
@@ -5174,7 +5174,7 @@
 5173:NameValueParserGetData
 5174:NameValueParserEndElt
 5175:ModvolVertexArray::defineVtxAttribs()
-5176:ModemEmu::~ModemEmu()_4143
+5176:ModemEmu::~ModemEmu()_4144
 5177:ModemEmu::~ModemEmu()
 5178:ModemEmu::write(unsigned char)
 5179:ModemEmu::schedCallback(int, int, int, void*)
@@ -5226,7 +5226,7 @@
 5225:LibretroGraphicsContext::term()
 5226:IsoFs::File::~File()
 5227:IsoFs::Entry::~Entry()
-5228:IsoFs::Directory::~Directory()_5034
+5228:IsoFs::Directory::~Directory()_5035
 5229:IsoFs::Directory::~Directory()
 5230:IGDstartelt
 5231:IGDendelt
@@ -5265,15 +5265,15 @@
 5264:Emulator::loadstate(Deserializer&)
 5265:DnsResolver::responseReceived(pico_ip4*, std::__2::error_code const&, unsigned long)
 5266:DnsResolver::querySent(pico_ip4*, std::__2::error_code const&, unsigned long)
-5267:Disc::~Disc()_3825
-5268:DirectPlayImpl::~DirectPlayImpl()_4806
+5267:Disc::~Disc()_3826
+5268:DirectPlayImpl::~DirectPlayImpl()_4807
 5269:DirectPlayImpl::processOutPacket(unsigned char const*, int)
 5270:DCFlashChip::Write(unsigned int, unsigned int, unsigned int)
 5271:DCFlashChip::Serialize(Serializer&) const
 5272:DCFlashChip::Reset()
 5273:DCFlashChip::Read8(unsigned int)
 5274:DCFlashChip::Deserialize(Deserializer&)
-5275:CustomTextureSource::~CustomTextureSource()_5376
+5275:CustomTextureSource::~CustomTextureSource()_5377
 5276:CustomTextureSource::~CustomTextureSource()
 5277:CustomTextureSource::shouldReplace() const
 5278:CustomTextureSource::shouldPreload() const
@@ -5287,7 +5287,7 @@
 5286:Cartridge::GetPtr(unsigned int, unsigned int&)
 5287:CPU_VERSION_read(unsigned int)
 5288:CHDTrack::Read(unsigned int, unsigned char*, SectorFormat*, unsigned char*, SubcodeFormat*)
-5289:CHDDisc::~CHDDisc()_3824
+5289:CHDDisc::~CHDDisc()_3825
 5290:CHDDisc::~CHDDisc()
 5291:CHD::Callbacks::fsize(chd_core_file*)
 5292:CHD::Callbacks::fseek(chd_core_file*, long long, int)
@@ -5296,7 +5296,7 @@
 5295:CCN_PTEH_write(unsigned int, unsigned int)
 5296:CCN_MMUCR_write(unsigned int, unsigned int)
 5297:CCN_CCR_write(unsigned int, unsigned int)
-5298:BattleCableHandshake::~BattleCableHandshake()_4543
+5298:BattleCableHandshake::~BattleCableHandshake()_4544
 5299:BattleCableHandshake::~BattleCableHandshake()
 5300:BattleCableHandshake::stop()
 5301:BattleCableHandshake::start()
