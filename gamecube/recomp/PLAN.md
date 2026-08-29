@@ -102,6 +102,25 @@ layer below. The CPU-compile-and-link half is **complete**; the host layer is ne
 
 ## Honest scope / caveats
 
+> **[MEASURED CORRECTION 2026-08-29 — the numbers above are stale.]**
+> `wasm-objdump -j Import -x` on the shipped `mp4_game.wasm` reports **139**
+> imports (138 `env` + 1 `wasi…fd_write`), not 228. `grep -c 'perl -0pi -e'
+> build_wasm.sh` = **83** transforms, not 8. `sig_fixes.json` holds **75**
+> entries, not 61. And only **NINE** of 136 stub-bound imports have a real body
+> (`recomp_worker.js:604-798` has 8 `case` labels) — **127 fall to
+> `default: return 0`, so this path has NO AUDIO AT ALL** and `gc_card.c` is
+> written but still not compiled in (`grep -o -a -F "__recomp_card_base"
+> mp4_game.wasm | wc -l` = 0).
+> **73% of the imports (99/136) are GameCube PLATFORM services**, 95 resolving
+> to `~/gc_refs/dolsdk2001`; the only per-game block is the 37 `msm*` MusyX
+> symbols. All 75 sig_fixes and ~1/3 of the transforms are mwcc-vs-clang
+> C-dialect artifacts that a BINARY static recomp inherits none of.
+> **"Whether SAB / PSO have complete decomps is not verified" is now verified
+> NEGATIVE for SAB**: `~/gc_refs/sadx` is Sonic Adventure *DX*, a different
+> game, with 5-6 Metrowerks runtime files and zero game code.
+> See memory `gc_recomp_host_layer_is_73pct_platform_2026_08_29`.
+
+
 - **Per-game:** this needs a decomp. MP4 has a near-complete one (verified).
   Whether SAB / PSO have complete decomps is **not verified** — decomps are
   per-game and only MP4's is present here.
