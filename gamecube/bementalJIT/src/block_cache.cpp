@@ -2679,10 +2679,22 @@ bool BlockCache::aot_seal_merged(const u8* bytes, std::size_t len,
             // raw wasm export. See the long comment there for the measurement and
             // the safety argument. Duplicated (not shared) because seal order vs
             // compile_raw is not guaranteed — either may build the map first.
+            // *** THIS SITE WAS MISSING THE GATE — fixed 2026-08-29. ***
+            // compile_raw's bootstrap checks SAB cell 0x026B3930 before populating
+            // the map (the unwrap HANGS PSO 5/7, so it is deliberately default-OFF).
+            // This duplicate did NOT, so if the seal ever built the map first the
+            // shipped default-OFF gate would silently become ON — the worst kind of
+            // failure, since the symptom is an intermittent hang with no log and the
+            // flag would read 0 the whole time.
+            // Benign only by accident today: compile_raw's bootstrap runs first and
+            // installs an EMPTY map, and region promotion is held off 5B ticks
+            // (dolphin_jit_wimports.cpp:690-706). Both are timing, not invariants.
+            const bem_unwrap_on_seal =
+                (HEAPU32[0x026B3930 >> 2] >>> 0) !== 0;   // 0x026B392C is the UNCAP cell — not this
             if (!Module._bem_rawmap) {
                 Module._bem_rawmap = new Map();
                 try {
-                    if (typeof Asyncify !== 'undefined' && Asyncify.funcWrappers) {
+                    if (bem_unwrap_on_seal && typeof Asyncify !== 'undefined' && Asyncify.funcWrappers) {
                         Asyncify.funcWrappers.forEach(function(w, o) { Module._bem_rawmap.set(w, o); });
                     }
                 } catch (er) { }
