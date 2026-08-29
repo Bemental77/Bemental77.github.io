@@ -612,13 +612,30 @@
               const t = parseInt(q2.get('autosave'), 10) || 60000;
               setTimeout(() => worker.postMessage({ cmd: 'saveState' }), t);
             }
+            // [autoload race FIX 2026-08-29] This was a FIXED 12000 ms timer, which
+            // races the core's readiness to accept a deserialize and failed roughly
+            // HALF the time — proven by two back-to-back identical runs on the same
+            // file and the same binary: r1 "state load FAILED", r2 "state loaded OK".
+            // On failure the page SILENTLY COLD-BOOTS, landing on the SEGA license
+            // screen while still reporting a plausible MHz. That single bug produced
+            // two separate phantom "findings": a savestate believed dead, and
+            // "confirming at character select resets the game" — neither was real.
+            //
+            // Worse, it poisons measurement: ANY run not grepped for a load-OK line
+            // may be a cold boot at the title, and a title screen is a CHEAP scene
+            // (duty 18-20% vs 34-49% in-game), so a silently-failed run reports
+            // INFLATED headroom.
+            //
+            // Fixed the way the seed path below already does it (see `seedArmed &&
+            // d.calls > 0`): fetch immediately, then apply on the first heartbeat
+            // that reports actual frame production. A slow phone waits as long as it
+            // needs; a fast desktop does not burn 12 seconds. If frames never come
+            // the state simply never applies and the normal boot stands.
             if (q2.has('autoload')) {
-              setTimeout(() => {
-                fetch('/state.bin').then(r => r.arrayBuffer()).then(buf => {
-                  pageLog('[page] autoload: fetched ' + buf.byteLength + ' B, restoring');
-                  worker.postMessage({ cmd: 'loadState', data: buf }, [buf]);
-                }).catch(e => pageLog('[page] autoload failed: ' + e));
-              }, 12000);
+              autoloadPromise = fetch('/state.bin')
+                .then(r => r.ok ? r.arrayBuffer() : Promise.reject(new Error('HTTP ' + r.status)))
+                .catch(e => { pageLog('[page] autoload fetch failed: ' + e); return null; });
+              autoloadArmed = true;
             }
           }
           {
@@ -660,6 +677,16 @@
         // before a slow phone's core can accept a deserialize, or burns
         // seconds a fast desktop didn't need. If telemetry never reports a
         // frame the seed simply never applies and the normal boot stands.
+        // Same liveness gate as the seed below — see the autoload comment for why
+        // the old fixed timer failed ~50% of the time and silently cold-booted.
+        if (autoloadArmed && d.calls > 0) {
+          autoloadArmed = false;
+          autoloadPromise.then((buf) => {
+            if (!buf) return;   // already logged; normal boot stands
+            pageLog('[page] autoload: fetched ' + buf.byteLength + ' B, restoring');
+            worker.postMessage({ cmd: 'loadState', data: buf }, [buf]);
+          });
+        }
         if (seedArmed && d.calls > 0) {
           seedArmed = false;
           seedPromise.then((buf) => {
@@ -1120,6 +1147,8 @@
   const SEED_URL = 'dreamcast/states/pso2_boot.state';
   const SEED_MIN = 1 << 20;   // a real state is ~27 MB; under 1 MB means a broken deploy
   let seedPromise = null;     // fetch started alongside the disc stream
+  let autoloadArmed   = false;  // ?autoload=1 — applied on the first frame-producing
+  let autoloadPromise = null;   // heartbeat, NOT a fixed timer (see the fix comment)
   let seedArmed   = false;    // applied on the first frame-producing heartbeat
   let seedLabel   = null;     // custom toast/log for the seed's stateLoaded ack
 
