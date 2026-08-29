@@ -151,6 +151,17 @@ void GPFifoManager::UpdateGatherPipe()
                      GATHER_PIPE_SIZE);
     // [wp-invariant] bytes land BEFORE any accounting advances (release pairs with the
     // decoder's acquire loads in Fifo.cpp RunGpuOnCpu/ReadDataFromFifo).
+    //
+    // [gp-inwasm 2026-08-29 — re-verified] The JIT's in-wasm WPAR arm
+    // (bementalJIT guests/powerpc-next/jit_load_store.cpp emit_gp_append, now
+    // including psq_st's FLOAT pair) does NOT weaken this pairing. It writes only
+    // into m_gather_pipe through ppc_state.gather_pipe_ptr — the CPU-private
+    // 512-byte staging buffer whose sole reader is the CopyToEmu directly above,
+    // on this same thread — and it publishes NOTHING: the only +32 credit is the
+    // GatherPipeBursted below, still reached exclusively through this function via
+    // the ppc_gather_drain import. The arm's 32-byte boundary test sits at the same
+    // instruction position CheckGatherPipe occupies for an imported write, so the
+    // burst sequence a decoder observes is byte-identical.
     std::atomic_thread_fence(std::memory_order_release);
     pipe_count -= GATHER_PIPE_SIZE;
 

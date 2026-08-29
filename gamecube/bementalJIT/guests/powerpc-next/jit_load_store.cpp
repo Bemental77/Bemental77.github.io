@@ -619,6 +619,87 @@ static void emit_gp_or_import_store(WasmModuleBuilder& wb, LoadStoreParams param
     wb.op_call(write_import_for_width(width));
 }
 
+// ---------------------------------------------------------------------------
+// [gp-inwasm FP-words 2026-08-29] The same WPAR arm for an FP store that writes
+// ONE or TWO consecutive 32-bit words starting at LOCAL_TMP_EA. psq_st's FLOAT
+// (GQR type 0) branch hand-rolls its own WIMPORT_WRITE32 pair instead of going
+// through emit_slowmem_store, so it was the one store class the [gp-inwasm] arm
+// never covered — measured live at psqFloatWPAR=32965 events on the PSO census
+// run (/tmp/gp-C1.log:21).
+//
+// WHY ONE REGION TEST COVERS BOTH LANES. The predicate here is the bridge's own
+// exact match on LANE 0's EA (dolphin_jit_wimports.cpp:269). Lane 1 lands at
+// EA+4, which that exact match REJECTS — the host then falls through
+// stateless_write_w (dolphin_jit_wimports.cpp:166-171, `if (!worker_owns_cpu())
+// return false` — so it declines while dolphin owns the CPU, which is exactly
+// the state this arm's cpu_owner==0 term requires) into MMU::Write<u32>, whose
+// gather-pipe check is a 4KB PAGE match (MMU.cpp:362,
+// `(em_address & 0xFFFFF000) == GPFifo::GATHER_PIPE_PHYSICAL_ADDRESS`) and
+// therefore routes lane 1 to GPFifo::Write32 after all. So the host's net effect
+// for a WPAR-based pair is Write32(lane0) then Write32(lane1) — which is what
+// this arm emits, minus the full MMU translate on lane 1. Testing lane 0 only is
+// not an approximation: it is the host's own decision point, and the page match
+// makes EA+4 unconditionally follow lane 0 into the pipe.
+//
+// The arm is therefore NEVER more permissive than the host: it appends only when
+// lane 0 exactly matches WPAR (the case where the host provably routes BOTH lanes
+// to the pipe), and any other EA — including a pair that starts mid-page at
+// EA=...C008004 — falls to the untouched import pair, which reaches the pipe via
+// the same page match it always did.
+//
+// LOCALS. emit_gp_append reads `ctx` + `src_local` and clobbers only
+// LOCAL_TMP_VAL (via emit_bswap_i32:232, an op_local_tee). It never writes
+// LOCAL_TMP_EA — only emit_gp_region_test READS it — so the caller's EA survives
+// for psq_stu/stfdu's RA writeback. `scratch_local` is caller-chosen for the same
+// reason: psq_st's FLOAT arm passes LOCAL_PSQ_T1 (99), which is the host-base
+// scratch of the co-located FASTMEM arm (jit_load_store.cpp:2067) and hence dead
+// on this mutually-exclusive slow arm, and which none of emit_store_bits /
+// emit_ftz_f32_bits / emit_convert_to_single_ftz touches.
+//
+// LOCAL_TMP_VAL is dead here: emit_fastmem_guard (called immediately before this
+// arm's enclosing if/else) already tees its region selector into it — the reason
+// LOCAL_TMP_FPVAL exists at all (see the note at :61-66).
+//
+// ORDERING. Each word is appended and then boundary-checked at the SAME
+// instruction position GPFifo::Write32 checks (FastWrite32 -> CheckGatherPipe,
+// GPFifo.cpp:251-258), so the 32-byte burst sequence is unchanged. The bytes go
+// into m_gather_pipe, the CPU-private staging buffer whose only reader is the
+// same-thread memcpy at GPFifo.cpp:150; the release fence at :154 and the
+// decoder's acquire load (VideoCommon/Fifo.cpp:387-396) are both untouched, so a
+// +32 credit still cannot be observed before the bytes land.
+// ---------------------------------------------------------------------------
+template <typename EmitWord>
+static void emit_fp_words_gp_or_import(WasmModuleBuilder& wb, LoadStoreParams params,
+                                       u32 nwords, u32 scratch_local,
+                                       EmitWord emit_word) {
+    // The byte-identical pre-existing behaviour: write32(EA + 4i, word_i).
+    auto emit_imports = [&]() {
+        for (u32 i = 0; i < nwords; ++i) {
+            wb.op_local_get(LOCAL_TMP_EA);
+            if (i != 0) {
+                wb.op_i32_const((s32)(i * 4u));
+                wb.op_i32_add();
+            }
+            emit_word(i);
+            wb.op_call(WIMPORT_WRITE32);
+        }
+    };
+    if (BEM_GP_INWASM_ARM && params.lc_base) {
+        emit_gp_region_test(wb);
+        wb.op_if(BLOCK_TYPE_VOID);
+            for (u32 i = 0; i < nwords; ++i) {
+                emit_word(i);
+                wb.op_local_set(scratch_local);
+                emit_gp_append(wb, params, StoreWidth::U32, scratch_local);
+            }
+        wb.op_else();
+            emit_imports();
+        wb.op_end();
+        return;
+    }
+    emit_imports();
+}
+
 // Slow-path store. Stack-neutral. [lc-window PM23] locked-L1 EAs get a raw
 // in-wasm store (bswap + store, matching MMU.cpp's swapped memcpy) when
 // lc_base is configured — see emit_slowmem_load_value. [gp-inwasm] everything
@@ -2040,6 +2121,12 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         // classifier -> slow import arm, so gp_dirty_check / FIFO ordering is
         // preserved for direct GX vertex submission. The fast arm parks the
         // host base in LOCAL_PSQ_T1 and bswap+i32.store's at +0/+4.
+        // [gp-inwasm FP-words 2026-08-29] the slow arm now tries the WPAR
+        // in-wasm append first — see emit_fp_words_gp_or_import. This was the
+        // one store class the [gp-inwasm] arm never covered, because this
+        // branch hand-rolls its WIMPORT_WRITE32s instead of calling
+        // emit_slowmem_store. Scratch = LOCAL_PSQ_T1 (dead on this arm; it is
+        // the FASTMEM arm's host-base slot, and the two arms are exclusive).
         if (W) {
             emit_fastmem_guard(wb, params, 4);
             wb.op_if(BLOCK_TYPE_VOID);
@@ -2052,9 +2139,9 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                 emit_bswap_i32(wb);
                 wb.op_i32_store(0);
             wb.op_else();
-                wb.op_local_get(LOCAL_TMP_EA);
-                emit_store_bits(rs_pair.ps0_idx, 0);
-                wb.op_call(WIMPORT_WRITE32);
+                emit_fp_words_gp_or_import(
+                    wb, params, /*nwords=*/1u, /*scratch_local=*/LOCAL_PSQ_T1,
+                    [&](u32) { emit_store_bits(rs_pair.ps0_idx, 0); });
             wb.op_end();
         } else {
             emit_fastmem_guard(wb, params, 8);
@@ -2074,14 +2161,12 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                 emit_bswap_i32(wb);
                 wb.op_i32_store(4);
             wb.op_else();
-                wb.op_local_get(LOCAL_TMP_EA);
-                emit_store_bits(rs_pair.ps0_idx, 0);
-                wb.op_call(WIMPORT_WRITE32);
-                wb.op_local_get(LOCAL_TMP_EA);
-                wb.op_i32_const(4);
-                wb.op_i32_add();
-                emit_store_bits(rs_pair.ps1_idx, 1);
-                wb.op_call(WIMPORT_WRITE32);
+                emit_fp_words_gp_or_import(
+                    wb, params, /*nwords=*/2u, /*scratch_local=*/LOCAL_PSQ_T1,
+                    [&](u32 lane) {
+                        emit_store_bits(lane == 0u ? rs_pair.ps0_idx : rs_pair.ps1_idx,
+                                        lane);
+                    });
             wb.op_end();
         }
     }
