@@ -388,10 +388,25 @@ function startServer() {
   // L=KeyW R=KeyR Start=KeyV/Enter. Sending the dolphin map at a recomp build
   // silently no-ops every face button (Start happens to coincide on 'v'), which
   // looks exactly like "input is broken" when it is the probe that is wrong.
+  // [KEYMAP BUG FIX 2026-08-29] The non-recomp (JIT) branch mapped
+  //   a:'m'  b:'n'  x:'k'  y:'j'  l:'q'
+  // and NONE of those keys exist in the page. gamecube.html has exactly ONE keymap,
+  // at :1199 — { a:'x', b:'z', x:'s', y:'d', l:'w', r:'r', z:'e', start:'v', select:'c' } —
+  // and KEY_CODES at :4233 can only synthesise `x z s d w r e v c` plus the arrows.
+  // So on the JIT path ONLY the arrows (and r/e/v/c, which happened to coincide) ever
+  // reached the guest: every `a`/`b`/`x`/`y`/`l` press was a SILENT NO-OP that the probe
+  // still reported as delivered. That is the exact failure the comment above this line
+  // warns about — "looks exactly like 'input is broken' when it is the probe that is
+  // wrong" — and it was live on the JIT branch while the recomp branch was correct.
+  // It invalidates the INPUT half of any JIT-path campaign that pressed a face button:
+  // scenes behind an A-to-dismiss modal were never dismissed, and "could not reproduce
+  // under input" is not a safe conclusion from any such run.
+  // Both branches now use the page's single keymap verbatim; they are identical by
+  // construction rather than by coincidence, so they cannot drift apart again.
   const RECOMP = /(^|&)recomp=1(&|$)/.test(process.env.PROBE_QUERY || '');
-  const PRESS_KEY = RECOMP
-    ? { start: 'v', select: 'c', a: 'x', b: 'z', x: 's', y: 'd', l: 'w', r: 'r', z: 'e', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight' }
-    : { start: 'v', select: 'c', a: 'm', b: 'n', x: 'k', y: 'j', l: 'q', r: 'r', z: 'e', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight' };
+  const PAGE_KEYMAP = { start: 'v', select: 'c', a: 'x', b: 'z', x: 's', y: 'd', l: 'w', r: 'r', z: 'e', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight' };
+  const PRESS_KEY = PAGE_KEYMAP;
+  void RECOMP;  // kept: the two paths install different listeners, so the split may return
   (process.env.PROBE_PRESS || '').split(',').filter(Boolean).forEach((spec) => {
     const m = spec.trim().match(/^(\w+)@(\d+)$/);
     if (!m || !PRESS_KEY[m[1]]) { console.log('[probe] PROBE_PRESS spec ignored: ' + spec); return; }
@@ -793,6 +808,11 @@ function startServer() {
           try {
             const R = window.__gcRate;
             if (R) o.rate = { path: R.path, speed: R.speed, cap: R.capFps,
+                              // cap is min(guestCap, renderCap) on the recomp path. Capture
+                              // BOTH terms: a cap number without its binding stage cannot be
+                              // compared across arms (a freerun arm is render-bound, a
+                              // hardware-rate arm is usually guest-bound).
+                              gcap: R.guestCap, rcap: R.renderCap,
                               pub: R.published, shown: R.shown, starved: R.starved,
                               nativeHz: R.nativeHz, uncapped: R.uncapped };
             const _f = document.getElementById('fps');
@@ -833,6 +853,8 @@ function startServer() {
               + (s.rate ? ('  [page ' + s.rate.path + ' speed='
                   + (s.rate.speed == null ? '--' : (+s.rate.speed).toFixed(3) + 'x')
                   + ' cap=' + (s.rate.cap == null ? '--' : (+s.rate.cap).toFixed(0))
+                  + ' (g=' + (s.rate.gcap == null ? '--' : (+s.rate.gcap).toFixed(0))
+                  + ' r=' + (s.rate.rcap == null ? '--' : (+s.rate.rcap).toFixed(0)) + ')'
                   + ' shown=' + (+(s.rate.shown || 0)).toFixed(0)
                   + '/pub=' + (+(s.rate.pub || 0)).toFixed(0) + ']') : ''));
           }

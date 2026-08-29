@@ -7,8 +7,89 @@
 #include <cstdlib>
 #include <algorithm>     // [top-k window] partial_sort for the promotion ranking
 #include <unordered_map>
+#include <unordered_set>  // [cache-cap census 2026-08-29] ever-compiled PC set
 #include <utility>
 #include <vector>
+
+// ---- [cache-cap census 2026-08-29] SAB telemetry + runtime cap/policy -------
+// THE LEAD: the user's live SAB (City Escape) console shows
+// "[bemental] cache evicted at cap ( 16384 )" — the block cache is hitting its
+// ceiling and clear()ing EVERYTHING (block_cache.cpp compile()). A flush-all at
+// cap on a guest whose working set EXCEEDS the cap is pathological: it throws
+// away hot blocks, the merged hot region, every sealed generation and the AOT
+// seal, then re-pays every compile. Nothing in this project's measurement
+// history has accounted for that cost (every prior campaign profiled PSO/MP4).
+//
+// Cells 0x026B3940..0x026B397C. Verified free 2026-08-29 by grepping every
+// .cpp/.h/.js/.html/.mjs in-tree for 026B394/395/396/397: only 0x026B3900-3930
+// (vertex-loader switch, AI-DMA witness, uncap, compile bootstrap) and
+// 0x026B3A00+ (flush census) were taken. 0x026B3C00+ is the powerpc-next FPR
+// spill window — deliberately below it.
+//
+// R = written by this file, read by the probe. W = written by the probe/page.
+//   0x026B3940 R evictAtCapN     cap policy fired
+//   0x026B3944 R mapSize         live m_map.size()
+//   0x026B3948 R mapPeak         high-water m_map.size()
+//   0x026B394C R compileN        BlockCache::compile() calls
+//   0x026B3950 R compileMs       cumulative ms inside compile_raw
+//   0x026B3954 R clearN          BlockCache::clear() calls (ALL reasons)
+//   0x026B3958 R clearMs         cumulative ms inside clear()
+//   0x026B395C R distinctPcN     distinct start PCs ever compiled (working set)
+//   0x026B3960 R recompileN      compiles of a PC compiled before (thrash)
+//   0x026B3964 R evictedBlocksN  blocks released by the cap policy
+//   0x026B3968 R sealedPcN       m_sealed_pcs.size() (hot-set witness)
+//   0x026B396C W POLICY bitmask  bit0 = partial evict, bit1 = O(1) release_raw
+//   0x026B3970 W CAP override    0 = the legacy 16384
+//   0x026B3974 R capEcho         the cap actually in force
+//   0x026B3978 R evictCapMs      cumulative ms in the cap-eviction path
+//   0x026B397C R policyEcho      the policy actually in force
+//
+// The census bumps are PER-COMPILE and PER-CLEAR only — never per dispatch — so
+// they cost nothing against a compile that already crosses the JS membrane to
+// build a WebAssembly.Module. Both arms of any matched pair carry them
+// identically; the arms differ ONLY by the two W cells, on ONE binary.
+#define BEM_CC_EVICT_N      0x026B3940u
+#define BEM_CC_MAP_SIZE     0x026B3944u
+#define BEM_CC_MAP_PEAK     0x026B3948u
+#define BEM_CC_COMPILE_N    0x026B394Cu
+#define BEM_CC_COMPILE_MS   0x026B3950u
+#define BEM_CC_CLEAR_N      0x026B3954u
+#define BEM_CC_CLEAR_MS     0x026B3958u
+#define BEM_CC_DISTINCT_N   0x026B395Cu
+#define BEM_CC_RECOMPILE_N  0x026B3960u
+#define BEM_CC_EVICTED_N    0x026B3964u
+#define BEM_CC_SEALED_N     0x026B3968u
+#define BEM_CC_POLICY       0x026B396Cu
+#define BEM_CC_CAP          0x026B3970u
+#define BEM_CC_CAP_ECHO     0x026B3974u
+#define BEM_CC_EVICT_MS     0x026B3978u
+#define BEM_CC_POLICY_ECHO  0x026B397Cu
+
+// Policy bits (read from BEM_CC_POLICY on every compile — a live knob, so one
+// process can measure both arms).
+#define BEM_CC_POL_PARTIAL  0x1u   // evict the cold subset instead of clear()ing all
+// bit 1 SELECTS THE OLD BEHAVIOUR. release_raw's O(1) handle->pc lookup is the
+// DEFAULT (measured 551ms -> 14ms of clear() stall, matched pair on one binary,
+// 0 traps); set this bit to force the legacy O(N) JS Map scan back on as a
+// control arm.
+#define BEM_CC_POL_LEGACYFREE 0x2u
+
+#ifdef __EMSCRIPTEN__
+static inline volatile uint32_t* bem_cc(uint32_t addr) {
+  return reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(addr));
+}
+static inline void bem_cc_set(uint32_t addr, uint32_t v) { *bem_cc(addr) = v; }
+static inline void bem_cc_add(uint32_t addr, uint32_t v) { *bem_cc(addr) += v; }
+static inline uint32_t bem_cc_get(uint32_t addr) { return *bem_cc(addr); }
+#else
+static inline void bem_cc_set(uint32_t, uint32_t) {}
+static inline void bem_cc_add(uint32_t, uint32_t) {}
+static inline uint32_t bem_cc_get(uint32_t) { return 0u; }
+#endif
+
+// Live policy, refreshed from the SAB cell at each compile. Read by release_raw
+// (which has no other way to see it).
+static uint32_t g_bem_cc_policy = 0u;
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -645,7 +726,14 @@ static u32 seal_batch() {
 // the hot merged region REGION_REL_0). Counts reset on cache clear (handles
 // are reused). The JS literal 2048 in chain_dispatch_raw MUST match this.
 static constexpr u32 HOT_THRESHOLD = 4u;
-u32 g_disp_count[16384] = {0};   // indexed by cache handle (< MAX_CACHE_BLOCKS)
+// [cache-cap 2026-08-29] Sized to BEM_DISP_COUNT_N, not to the cap, so raising
+// MAX_CACHE_BLOCKS cannot silently alias the promotion counter. The three sites
+// that MUST move together are all keyed off these two macros: the array below,
+// the clear() reset loop, and the `& mask` in the JS chain loop (which now takes
+// the mask as an EM_ASM argument instead of a hardcoded 16383).
+#define BEM_DISP_COUNT_N    65536u
+#define BEM_DISP_COUNT_MASK (BEM_DISP_COUNT_N - 1u)
+u32 g_disp_count[BEM_DISP_COUNT_N] = {0};   // indexed by (handle - table_base) & mask
 u32 g_promote_ring[256];
 u32 g_promote_n = 0;
 
@@ -754,24 +842,48 @@ void release_raw(int handle) {
             Module.bemental_cache[$0] = null;
         }
         if (Module.bemental_pc_to_handle) {
-            for (const [k, v] of Module.bemental_pc_to_handle) {
-                if (v === $0) {
-                    Module.bemental_pc_to_handle.delete(k);
-                    // Invalidate this PC's in-WASM chaining dispatch-cache bucket
-                    // so no sibling tail-calls the now-null slot (the source of
-                    // the "null function" chain traps). $1=tag base, $2=slot
-                    // base, $3=mask.
-                    const bkt = (k >>> 2) & $3;
-                    if ((HEAP32[($1 >> 2) + bkt] >>> 0) === (k >>> 0)) {
-                        HEAP32[($1 >> 2) + bkt] = -1;  // tag = 0xFFFFFFFF
-                        HEAP32[($2 >> 2) + bkt] = -1;  // slot = -1
-                    }
-                    break;
+            // [cache-cap 2026-08-29] $4 = fast path on (the DEFAULT; cleared
+            // only by BEM_CC_POL_LEGACYFREE). The legacy path
+            // below LINEARLY SCANS Module.bemental_pc_to_handle for the entry
+            // whose value is this handle. release_raw is called once per freed
+            // block, so a clear() at a 16384-entry cap runs ~16384 scans of a
+            // map that starts at 16384 entries: O(N^2), ~134M Map-iterator steps
+            // for ONE cap eviction, on the CPU thread, inside the guest's
+            // execution path. The fast path is an O(1) lookup in
+            // Module.bemental_handle_to_pc, the inverse map register_pc_handle
+            // has ALREADY been populating (see below in this file) — same PC,
+            // same delete, same bucket-tag guard, no scan.
+            let k = null;
+            if ($4) {
+                const hp = Module.bemental_handle_to_pc;
+                const c = hp ? hp[$0] : undefined;
+                // handle_to_pc is never pruned, so a stale handle can name a PC
+                // that has since been re-registered to a NEWER handle. Confirm
+                // the forward mapping still points back at THIS handle — that
+                // is exactly the legacy scan's `v === $0` test, done in O(1).
+                if (c !== undefined && Module.bemental_pc_to_handle.get(c >>> 0) === ($0 | 0)) {
+                    k = c >>> 0;
+                }
+            } else {
+                for (const [kk, v] of Module.bemental_pc_to_handle) {
+                    if (v === $0) { k = kk; break; }
+                }
+            }
+            if (k !== null) {
+                Module.bemental_pc_to_handle.delete(k);
+                // Invalidate this PC's in-WASM chaining dispatch-cache bucket
+                // so no sibling tail-calls the now-null slot (the source of
+                // the "null function" chain traps). $1=tag base, $2=slot
+                // base, $3=mask.
+                const bkt = (k >>> 2) & $3;
+                if ((HEAP32[($1 >> 2) + bkt] >>> 0) === (k >>> 0)) {
+                    HEAP32[($1 >> 2) + bkt] = -1;  // tag = 0xFFFFFFFF
+                    HEAP32[($2 >> 2) + bkt] = -1;  // slot = -1
                 }
             }
         }
     }, handle, (int)(uintptr_t)g_bem_disp_tag, (int)(uintptr_t)g_bem_disp_slot,
-       (int)BEM_DISP_MASK);
+       (int)BEM_DISP_MASK, (int)((g_bem_cc_policy & BEM_CC_POL_LEGACYFREE) ? 0 : 1));
 #else
     (void)handle;
 #endif
@@ -1077,7 +1189,9 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
             // begins after 16384 distinct JIT blocks (vs the old bug excluding
             // everything past table_base+16384).
             {
-                const slot = ((handle - (Module._bemental_table_base | 0)) & 16383);
+                // [cache-cap 2026-08-29] mask arrives as $12 (BEM_DISP_COUNT_MASK)
+                // so it can never desync from g_disp_count's declared size.
+                const slot = ((handle - (Module._bemental_table_base | 0)) & $12);
                 const di = ($9 >> 2) + slot;
                 const dc = (HEAP32[di] + 1) | 0;
                 HEAP32[di] = dc;
@@ -1117,7 +1231,7 @@ s32 chain_dispatch_raw(u32 initial_pc, u32 max_iters, u32* final_pc, u32* trap_p
         return count;
     }, initial_pc, max_iters, final_pc, trap_pc, g_pc_census_ring, &g_pc_census_n,
        exceptions_addr, downcount_addr, &g_chain_iters,
-       g_disp_count, g_promote_ring, &g_promote_n);
+       g_disp_count, g_promote_ring, &g_promote_n, (int)BEM_DISP_COUNT_MASK);
 #else
     (void)initial_pc; (void)max_iters; (void)exceptions_addr; (void)downcount_addr;
     if (final_pc) *final_pc = initial_pc;
@@ -1135,16 +1249,52 @@ int BlockCache::compile(u64 key, const u8* bytes, std::size_t size) {
     // Each entry pins a WebAssembly.Instance plus its compiled code object, so
     // 4096 was already pushing the tab. 1024 gives much earlier pressure
     // relief; hot inner loops still fit and recompile cheaply on miss.
-    static constexpr std::size_t MAX_CACHE_BLOCKS = 16384;
-    if (m_map.size() >= MAX_CACHE_BLOCKS) {
-#ifdef __EMSCRIPTEN__
-        EM_ASM({
-            console.log('[bemental] cache evicted at cap (', $0, ')');
-        }, (int)m_map.size());
-#endif
-        clear();
+    // [cache-cap 2026-08-29] The cap is now a RUNTIME knob (SAB BEM_CC_CAP, 0 =
+    // the legacy 16384) and so is the overflow policy (SAB BEM_CC_POLICY). One
+    // binary can therefore serve both arms of a matched pair, which is the only
+    // way to compare policies honestly while ten agents relink the shared tree.
+    static constexpr std::size_t MAX_CACHE_BLOCKS = 16384;   // legacy default
+    const uint32_t cap_cell = bem_cc_get(BEM_CC_CAP);
+    const std::size_t cap = cap_cell ? static_cast<std::size_t>(cap_cell)
+                                     : MAX_CACHE_BLOCKS;
+    g_bem_cc_policy = bem_cc_get(BEM_CC_POLICY);
+    bem_cc_set(BEM_CC_CAP_ECHO, static_cast<uint32_t>(cap));
+    bem_cc_set(BEM_CC_POLICY_ECHO, g_bem_cc_policy);
+
+    // Working-set census: distinct start PCs ever compiled, and how many
+    // compiles are RE-compiles of a PC we already had (the thrash witness).
+    {
+        static std::unordered_set<u32> s_ever;
+        const u32 pc32 = static_cast<u32>(key);
+        if (s_ever.insert(pc32).second) bem_cc_set(BEM_CC_DISTINCT_N, (u32)s_ever.size());
+        else                            bem_cc_add(BEM_CC_RECOMPILE_N, 1u);
     }
+    bem_cc_add(BEM_CC_COMPILE_N, 1u);
+
+    if (m_map.size() >= cap) {
+#ifdef __EMSCRIPTEN__
+        const double t0 = emscripten_get_now();
+#endif
+        bem_cc_add(BEM_CC_EVICT_N, 1u);
+        const std::size_t before = m_map.size();
+        if (g_bem_cc_policy & BEM_CC_POL_PARTIAL) {
+            evict_cold(cap);
+        } else {
+            // Legacy: wipe EVERYTHING. Kept verbatim as the control arm.
+            clear();
+        }
+        bem_cc_add(BEM_CC_EVICTED_N, (u32)(before - m_map.size()));
+#ifdef __EMSCRIPTEN__
+        bem_cc_add(BEM_CC_EVICT_MS, (u32)(emscripten_get_now() - t0));
+#endif
+    }
+#ifdef __EMSCRIPTEN__
+    const double tc0 = emscripten_get_now();
+#endif
     int handle = compile_raw(bytes, size);
+#ifdef __EMSCRIPTEN__
+    bem_cc_add(BEM_CC_COMPILE_MS, (u32)(emscripten_get_now() - tc0));
+#endif
     if (handle < 0) return -1;
 
     auto it = m_map.find(key);
@@ -1155,7 +1305,68 @@ int BlockCache::compile(u64 key, const u8* bytes, std::size_t size) {
         m_map.emplace(key, handle);
     }
     register_pc_handle(key, handle);
+    bem_cc_set(BEM_CC_MAP_SIZE, (u32)m_map.size());
+    if (m_map.size() > bem_cc_get(BEM_CC_MAP_PEAK))
+        bem_cc_set(BEM_CC_MAP_PEAK, (u32)m_map.size());
+    bem_cc_set(BEM_CC_SEALED_N, (u32)m_sealed_pcs.size());
     return handle;
+}
+
+// [cache-cap 2026-08-29] Partial eviction — the alternative to clear()ing all
+// 16384 blocks the instant the cap is touched.
+//
+// WHY NOT AN LRU: there is no live per-block dispatch counter to rank by.
+// g_disp_count is bumped ONLY by the legacy JS chain loop; the default path is
+// bem_chain_loop_c (gated on g_bem_cdispatch_enabled), which deliberately does
+// NOT bump it, and the hottest blocks tail-chain in-WASM and pass through
+// neither loop. Ranking by a counter that is dead on the live path would evict
+// the hot set, i.e. exactly the bug being fixed.
+//
+// WHAT IS AVAILABLE is a structural hotness signal that costs nothing: a PC in
+// m_sealed_pcs or g_bem_aot_pc_slot was promoted into a merged/sealed
+// generation, which only happens to blocks that ran enough to be worth merging.
+// Those are kept. Everything else is evicted, newest-compiled LAST (m_map
+// iteration order is unordered, so this is a set difference, not a recency
+// order) until the map is back under the low-water mark.
+//
+// Each removal goes through evict(), the SAME per-PC teardown the SMC/icbi path
+// uses, so every coherency invariant clear() maintains en masse is maintained
+// per PC: sealed-gen unseal, merged probe-bucket tag clear, AOT slot drop,
+// pending-emit drop, and fused-predecessor eviction. What is NOT torn down is
+// the merged hot region, the sealed generations and the AOT seal — which is the
+// whole point: the flush-all threw those away and forced a full re-promotion and
+// re-link on every cap hit.
+void BlockCache::evict_cold(std::size_t cap) {
+    // Low-water: drop to 75% of cap so the next eviction is ~cap/4 compiles
+    // away rather than one compile away (a cap-1 map would otherwise evict on
+    // every single compile — the worst possible thrash).
+    const std::size_t target = (cap * 3u) / 4u;
+    if (m_map.size() <= target) return;
+
+    std::vector<u32> victims;
+    victims.reserve(m_map.size() - target);
+    // Pass 1: never-promoted blocks only.
+    for (const auto& kv : m_map) {
+        if (m_map.size() - victims.size() <= target) break;
+        const u32 pc = static_cast<u32>(kv.first);
+        if (m_sealed_pcs.count(pc)) continue;
+        if (g_bem_aot_pc_slot.count(pc)) continue;
+        victims.push_back(pc);
+    }
+    // Pass 2 (rare): the cache is entirely promoted blocks. Take the remainder
+    // in map order rather than falling back to a full flush.
+    if (m_map.size() - victims.size() > target) {
+        std::unordered_set<u32> chosen(victims.begin(), victims.end());
+        for (const auto& kv : m_map) {
+            if (m_map.size() - victims.size() <= target) break;
+            const u32 pc = static_cast<u32>(kv.first);
+            if (chosen.count(pc)) continue;
+            victims.push_back(pc);
+        }
+    }
+    // evict() mutates m_map (and may recurse into fused predecessors), so the
+    // PCs are collected FIRST and the map is only touched after the scan.
+    for (u32 pc : victims) evict(static_cast<u64>(pc));
 }
 
 int BlockCache::lookup(u64 key) const {
@@ -1280,8 +1491,14 @@ void BlockCache::evict(u64 key) {
 }
 
 void BlockCache::clear() {
+#ifdef __EMSCRIPTEN__
+    const double __clr_t0 = emscripten_get_now();
+#endif
+    bem_cc_add(BEM_CC_CLEAR_N, 1u);
     // Hot-only merge: reset per-handle dispatch counts (handles get reused).
-    for (std::size_t i = 0; i < 16384; ++i) g_disp_count[i] = 0;
+    // [cache-cap 2026-08-29] bound is BEM_DISP_COUNT_N, not a second literal
+    // 16384 that could drift from the array's declared size.
+    for (std::size_t i = 0; i < BEM_DISP_COUNT_N; ++i) g_disp_count[i] = 0;
     g_promote_n = 0;
     g_blr_ras_sp = 0u;   // [return-linking] handles/slots reused after clear
     g_blr_chain  = 0u;
@@ -1363,6 +1580,11 @@ void BlockCache::clear() {
         if (Module.bemental_pc2gen) Module.bemental_pc2gen.clear();
     });
 #endif
+#ifdef __EMSCRIPTEN__
+    bem_cc_add(BEM_CC_CLEAR_MS, (u32)(emscripten_get_now() - __clr_t0));
+#endif
+    bem_cc_set(BEM_CC_MAP_SIZE, (u32)m_map.size());
+    bem_cc_set(BEM_CC_SEALED_N, (u32)m_sealed_pcs.size());
 }
 
 void BlockCache::invalidate_overlap(u32 addr, u32 max_block_bytes) {
@@ -1960,12 +2182,79 @@ void BlockCache::region_seal(u32 mem_pages) {
         //      the b is DELETED (inline adjacency IS the branch), the
         //      successor continues at its OWN pcs (non-contiguous stream via
         //      AnalyzeOps). Successors KEEP their standalone functions.
-        auto rec_is_fp_free = [](const BlockEmitInputs& r) -> bool {
+        // [FP-FUSION 2026-08-29 — RESEARCH.md §6.2] Run-fusion used to accept
+        // FP-FREE records only (`opcd==4 || 48<=opcd<=63` => refuse), which is
+        // EXACTLY the surface the board's hot Hu3D code is not: the MP4 board
+        // profile puts 68% of CPU-thread self-time in emitted block bodies and
+        // that code is FP, so the hottest blocks got no fusion at all.
+        //
+        // WHAT THE FP-FREE RESTRICTION WAS PROTECTING — named before removing:
+        // it is a blanket proxy for the PM44-v9 SINGLE-VALUED SPECULATION
+        // machinery, which is keyed on `has_ps` = "any opcd==4 op anywhere in
+        // the stream" (ppc_emit.cpp:1126-1131). When has_ps fires, the emitter
+        //   (a) builds `assumed` from block.m_fpr_inputs — the live-in set of
+        //       the WHOLE stream (ppc_analyst.cpp:362-400) — so fusing a
+        //       THP/IDCT-side predecessor with a MusyX-side successor UNIONS
+        //       their live-ins, widening the entry guard (ppc_emit.cpp:
+        //       1805-1875) until the whole fused body takes the Double arm on
+        //       every entry. That is step-0's measured pessimization
+        //       (IDCT 7.3x -> 15.4x, this file :156-166) recreated dynamically;
+        //   (b) emits the body TWICE, one arm per side of that guard
+        //       (ppc_emit.cpp:1876-1880, "~2x emit size for ps blocks only") —
+        //       on a run-fused body of up to 96 instructions that is the exact
+        //       gen blowup the kSealFusionCutoff below exists to bound;
+        //   (c) enables the PM47 fast_loop and the WS-1 fp_resident_loop
+        //       protocols, which are gated on `assumed.m_val != 0u`
+        //       (ppc_emit.cpp:1183, :1189). Their `!block.m_noncontiguous` term
+        //       does NOT exclude fused bodies — a k==2 backward-cond fusion
+        //       splices the successor at last_pc+4, so the fused pc stream is
+        //       CONTIGUOUS and m_noncontiguous stays false. Those protocols are
+        //       per-block by construction (the `[FUSION v2] fused: off (new
+        //       surface)` note at ppc_emit.cpp:1190 assumed the FP-free rule
+        //       kept assumed==0, which is what actually excluded them).
+        //
+        // So the load-bearing predicate is NOT "FP-free", it is "assumed == 0".
+        // Classify instead:
+        //   0 = FP-free       (integer only)
+        //   1 = scalar FP     (lfs/lfd/stfs/stfd + psq_* + opcd 59/63 arith) —
+        //                     NO opcd==4, therefore has_ps==false, therefore
+        //                     assumed==0: hazards (a) (b) (c) are all
+        //                     structurally absent, and the MSR.FP bailout stays
+        //                     correct across a seam because it is only elided
+        //                     after the first FL_USE_FPU op in the SAME stream
+        //                     (ppc_emit.cpp:1319-1328/1430-1471) and MSR cannot
+        //                     change over a fusion seam: mtmsr/rfi are
+        //                     FL_ENDBLOCK, so seam_kind() below (which accepts
+        //                     only b/bl/blr/bc terminators) can never splice
+        //                     past one.
+        //   2 = paired-single (opcd==4 present) — still refused; lifting it
+        //                     needs the per-segment guard of §6.2 precondition
+        //                     (2), which the whole-body if/else arm structure
+        //                     cannot express today.
+        // Precondition (3) — fused-extent SMC invalidation — is already landed
+        // (invalidate_overlap's direct fusion-map window scan, this file
+        // :1405-1429, written for exactly this change).
+        //
+        // Gated: SAB scratch cell 0x026B342C (page writes it from
+        // ?bjit_fp_fusion=1; getenv is dead in the worker — see
+        // gc_runtime_flags_via_sab_cell_not_env). Browser-zeroed 0 = OFF =
+        // byte-identical to the pre-change tree, so A and B are a matched pair
+        // on ONE binary. lc_base-gated like every emit-time SAB read (test
+        // heaps are small and must not take an absolute load).
+        auto rec_fp_class = [](const BlockEmitInputs& r) -> int {
+            int cls = 0;
             for (u32 w : r.insts) {
                 const u32 opcd = w >> 26;
-                if (opcd == 4u || (opcd >= 48u && opcd <= 63u)) return false;
+                if (opcd == 4u) return 2;                       // ps_* -> has_ps
+                if (opcd >= 48u && opcd <= 63u) cls = 1;        // scalar FP / psq_*
             }
-            return true;
+            return cls;
+        };
+        const bool fp_fusion_on = g_bem_lc_base &&
+            (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B342Cu)) != 0u);
+        const int max_fuse_class = fp_fusion_on ? 1 : 0;
+        auto rec_is_fusable = [&](const BlockEmitInputs& r) -> bool {
+            return rec_fp_class(r) <= max_fuse_class;
         };
         auto pcs_of = [](const BlockEmitInputs& r) -> std::vector<u32> {
             if (r.instr_pcs.size() == r.insts.size()) return r.instr_pcs;
@@ -2027,6 +2316,11 @@ void BlockCache::region_seal(u32 mem_pages) {
         // batch pc, so a mid-batch cut would dangle those edges.
         constexpr size_t kSealFusionCutoff = 192u * 1024u;
         u32 unfused_by_cap = 0u;
+        // [FP-FUSION census] per-seal record counts by rec_fp_class. Seal-time
+        // only (one EM_ASM per gen, never on the executed path), so it does not
+        // perturb a timed run — it sizes the remaining lever: cls[2] is the
+        // ps-block residue this increment still refuses.
+        u32 cls_census[3] = {0u, 0u, 0u};
         for (u32 i = 0; i < rs.n_funcs; ++i) {
             const BlockEmitInputs& rec = rs.block_records[i];
             std::vector<u32> fused = rec.insts;
@@ -2034,7 +2328,8 @@ void BlockCache::region_seal(u32 mem_pages) {
             u32 depth = 1u;
             const bool fusion_ok = rs.fn_bodies_concat.size() < kSealFusionCutoff;
             if (!fusion_ok) ++unfused_by_cap;
-            if (rec_is_fp_free(rec) && fusion_ok) {
+            cls_census[(u32)rec_fp_class(rec)] += 1u;
+            if (rec_is_fusable(rec) && fusion_ok) {
                 u32 visited[8]; u32 n_vis = 0u; visited[n_vis++] = rec.start_pc;
                 u32 pending_ret = 0u;            // [FUSION v3] one bl deep, no nesting
                 for (;;) {
@@ -2061,7 +2356,7 @@ void BlockCache::region_seal(u32 mem_pages) {
                     if (seen) break;             // no cycle unrolling
                     const BlockEmitInputs& nxt = rs.block_records[sit->second];
                     if (nxt.insts.empty() || nxt.start_pc != succ) break;
-                    if (!rec_is_fp_free(nxt)) break;
+                    if (!rec_is_fusable(nxt)) break;
                     if (k == 4 && !rec_no_lr_writers(nxt)) break;   // callee must keep LR
                     if (nxt.ctx_ptr_const != rec.ctx_ptr_const ||
                         nxt.mem1_base != rec.mem1_base ||
@@ -2129,6 +2424,27 @@ void BlockCache::region_seal(u32 mem_pages) {
                 (int)rs.fn_bodies_concat.size(), (int)kSealFusionCutoff);
         }
 #endif
+        // [FP-FUSION census 2026-08-29] The seal runs on the EmuThread PTHREAD,
+        // whose console is NOT forwarded to puppeteer's page.on('console') — the
+        // pre-existing `run-fusion:` EM_ASM above has therefore never appeared in
+        // a probe log either (verified: /tmp/fpfuse-scout.log shows region=2, i.e.
+        // two seals, and zero `run-fusion:` lines). So publish the census to SAB
+        // scratch cells instead, the established cross-thread channel here
+        // (gc_runtime_flags_via_sab_cell_not_env). Cumulative across gens; read
+        // from the page or DevTools. Cells 0x026B3430..0x026B343C verified free
+        // 2026-08-29 by enumerating every 0x026B3xxx literal in-tree.
+        //   0x026B3430  mode (1 = FP fusion ON) — proves the toggle reached the emitter
+        //   0x026B3434  fused_runs   (cumulative)
+        //   0x026B3438  fused_blocks (cumulative)
+        //   0x026B343C  class-1 (scalar-FP) records seen (cumulative) — the surface
+        // Seal-time only: zero cost on the executed path.
+        if (g_bem_lc_base) {
+            auto cell = [](uintptr_t a) { return reinterpret_cast<volatile u32*>(a); };
+            *cell(0x026B3430u) = fp_fusion_on ? 1u : 0u;
+            *cell(0x026B3434u) = *cell(0x026B3434u) + fused_runs;
+            *cell(0x026B3438u) = *cell(0x026B3438u) + fused_blocks;
+            *cell(0x026B343Cu) = *cell(0x026B343Cu) + cls_census[1];
+        }
     }
 
     std::vector<u8> bytes;

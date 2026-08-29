@@ -139,6 +139,15 @@ public:
     // Drop everything. Detaches all JS-side instances.
     void clear();
 
+    // [cache-cap 2026-08-29] Partial overflow eviction: drop the cache to 75% of
+    // `cap` by removing never-promoted blocks first (PCs absent from
+    // m_sealed_pcs / the AOT slot map), via the same per-PC evict() teardown the
+    // SMC path uses. The alternative to clear()ing all 16384 entries — and the
+    // merged region, every sealed generation and the AOT seal with them — the
+    // instant the cap is touched. Selected at runtime by SAB cell 0x026B396C
+    // bit 0; see the census block at the top of block_cache.cpp.
+    void evict_cold(std::size_t cap);
+
     // SMC (self-modifying code) invalidation. Removes any cached block whose
     // [start_pc, start_pc + max_block_bytes) range covers `addr`. Called from
     // host write trampolines when a guest write targets memory that may be
