@@ -11,6 +11,37 @@
 // classify black/static screens. Emits one JSON line on stdout.
 import puppeteer from 'puppeteer';
 import { execSync } from 'node:child_process';
+import { readFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+
+// Region is a STATIC property of the ROM: country code at header offset 0x3E.
+// Codes per the core's own table (N64Wasm/code/.../rom.c:76-99). Handles the
+// three byte orders an N64 dump ships in — .z64 big-endian (0x80371240),
+// .n64 little-endian (0x40123780), .v64 byte-swapped (0x37804012) — because
+// reading offset 0x3E blind gets the wrong byte in two of the three.
+function regionFpsFromRom(romName) {
+  const roots = ['n64/N64Wasm/roms', 'n64/roms'];
+  const path = roots.map((r) => join(r, romName)).find((p) => existsSync(p));
+  if (!path) return null;
+  let b;
+  try { b = readFileSync(path).subarray(0, 0x40); } catch { return null; }
+  if (b.length < 0x40) return null;
+  const magic = b.readUInt32BE(0);
+  if (magic === 0x40123780) {                       // .n64 little-endian
+    const w = b.subarray(0x3C, 0x40); b.set([w[3], w[2], w[1], w[0]], 0x3C);
+  } else if (magic === 0x37804012) {                // .v64 byte-swapped
+    for (let i = 0x3C; i < 0x40; i += 2) { const t = b[i]; b[i] = b[i + 1]; b[i + 1] = t; }
+  } else if (magic !== 0x80371240) {
+    return null;                                     // not a recognised N64 image
+  }
+  const cc = b[0x3E];
+  // PAL-region codes: D(Germany) F(France) H(Netherlands) I(Italy) P(Europe)
+  // S(Spain) U(Australia) W(Scandinavia) X/Y(Europe variants).
+  if ('DFHIPSUWXY'.includes(String.fromCharCode(cc))) return 50;
+  // NTSC: E(USA) J(Japan) 7(Beta) A(Asia) C(China) K(Korea) N(Canada)
+  if ('EJACKN7'.includes(String.fromCharCode(cc))) return 60;
+  return null;
+}
 
 // Total CPU seconds burned by THIS browser's process tree (walked from the
 // launched pid -- name-matching "Google Chrome" would also catch sibling
@@ -136,8 +167,25 @@ try {
     // achieved retro_run (VI) rate -- ~60 NTSC / ~50 PAL when keeping up;
     // an independent cross-check on the audio-derived speedPct
     result.viRatePerSec = Math.round((fc.n / fc.el) * 10) / 10;
-    result.regionFps = result.viRatePerSec > 55 ? 60 : (result.viRatePerSec > 45 ? 50 : null);
-    const budget = 1000 / (result.regionFps || 60);
+    // [REGION FIX 2026-08-29] This used to derive regionFps FROM viRatePerSec —
+    // circular: it inferred the region from the very rate it was about to judge
+    // against that region, so a guest running slow was scored against the wrong
+    // divisor and a PAL guest at exactly 1.000x could never be distinguished from
+    // an NTSC guest at 0.833x. It then fell back to 60.
+    // MEASURED: n64/N64Wasm/roms/mariokart.z64 has country code 0x50 at header
+    // offset 0x3E = PAL. Against its real 50 Hz it reads 1.000x; against a
+    // hardcoded 60 it reads 0.833x on a guest running at exactly hardware speed.
+    // The region is a static property of the ROM, so read it from the header —
+    // the same table the core itself uses (N64Wasm/code/.../rom.c:76-99).
+    result.regionFps = regionFpsFromRom(rom) ?? null;
+    result.regionSource = result.regionFps ? 'rom-header' : 'unknown';
+    if (result.regionFps === null) {
+      // No header => say so and score against 60, but LABEL it, so a headroom
+      // number can never silently inherit a guessed divisor again.
+      result.regionFps = 60;
+      result.regionSource = 'DEFAULTED-60-UNVERIFIED';
+    }
+    const budget = 1000 / result.regionFps;
     result.headroomX = Math.round((budget / result.frameCostMs) * 100) / 100;
     if (cpu0 !== null && cpu1 !== null && cpu1 > cpu0) {
       // CPU ms of real work per emulated VI frame -- the load-robust

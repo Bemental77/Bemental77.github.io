@@ -648,11 +648,85 @@ u32 PPCAnalyzer::AnalyzeCore(u32 address, CodeBlock* block, CodeBuffer* buffer,
 
     // Idle-loop classification — only valid for a fully-decoded short block
     // whose terminator branches back to start.
-    if (reached_endblock && block->m_num_instructions > 0 &&
-        !block->m_noncontiguous) {
-        // [FUSION v2] fused streams skip idle classification (conservative:
-        // a fused multi-block poll loop loses idle-skip — perf-only).
-        if (IsBusyWaitLoop(block, buffer->data(), block->m_num_instructions)) {
+    if (reached_endblock && block->m_num_instructions > 0) {
+        // [FUSION v2] fused (noncontiguous) streams used to skip idle
+        // classification outright.
+        //
+        // [LEAF-IDLE 2026-08-29] That blanket skip is now narrowed to
+        // "unrecognised seam shapes" so ONE LEVEL OF LEAF-CALL INLINING is
+        // eligible for idle-skip. Rationale, and why this is the whole fix:
+        //
+        //   Dolphin's own IsBusyWaitLoop comment (dolphin-src
+        //   Source/Core/Core/PowerPC/PPCAnalyst.cpp:743-748) documents the gap
+        //   we inherited verbatim: "a lot of the most used busy loops are
+        //   bl/cmp/bne (with the bl target a pure function that follows the
+        //   above rules). We don't detect these at the moment."
+        //
+        //   In a NON-fused decode the `bl` is FL_ENDBLOCK, so such a loop is
+        //   cut into 3 blocks and can never be self-referential — nothing to
+        //   detect. But the FUSION v3 driver (block_cache.cpp seam_kind k==4
+        //   `bl` / k==5 `blr`) already SPLICES the callee body inline, so the
+        //   fused stream literally IS the leaf-inlined loop:
+        //       bl <leaf> ; lwz rD,d(rB) ; blr ; lwz ; lwz ; addi ; add ;
+        //       cmplw ; b<cond> <stream start>
+        //   IsBusyWaitLoop's existing dataflow test already accepts that shape
+        //   (a non-terminal OpType::Branch falls through the Branch arm; the
+        //   loads/integers are checked normally) — the ONLY thing that
+        //   suppressed it was the `!m_noncontiguous` guard here. Fusion was
+        //   therefore RACING idle-skip: it made the loop tail-chain in-WASM, so
+        //   neither this classifier nor block_cache.cpp's C-loop recurring-PC
+        //   idle-collapse (:1082) could ever fire on it. They now cooperate.
+        //
+        // Eligibility for a noncontiguous stream is deliberately tight: every
+        // NON-terminAL branch must be a seam that provably falls through to the
+        // next listed op, in matched call/return order at depth 1 —
+        //   * IsSeamInlineBl : `bl` whose static target IS the next listed op
+        //                      (the driver placed the callee inline); emits
+        //                      LR:=pc+4 only.
+        //   * IsPlainBlr     : the matching `blr`; mid-list it emits the
+        //                      software-RAS check and otherwise continues.
+        // Anything else mid-stream (forward/backward conditional seams, bcctr,
+        // an unmatched or nested blr) is a real conditional exit whose outcome
+        // this classifier does not model — those keep the old conservative
+        // skip. Contiguous blocks are unaffected (eligible stays true).
+        //
+        // PRODUCT-DEFINITION NOTE (guest must stay at exactly 1.000x): this
+        // flag does NOT skip execution and does NOT fast-forward the guest. Its
+        // only effect is ppc_emit.cpp:1002-1005, which stores downcount = 0 in
+        // the block PROLOGUE — the block body still executes, so architectural
+        // state stays exact. Zeroing downcount ends the CoreTiming slice, and
+        // CoreTiming::Advance credits global_timer by
+        // `slice_length - DowncountToCycles(downcount)` (CoreTiming.cpp) where
+        // slice_length was already clamped to `next_event.time - global_timer`.
+        // So emulated time advances to the NEXT SCHEDULED EVENT and never past
+        // it: the guest still observes exactly one VI retrace per 1/60 emulated
+        // second. Identical mechanism, identical accounting, to the idle-skip
+        // that already ships for the contiguous `lwz; cmp; b<cond> self` polls.
+        bool eligible = true;
+        if (block->m_noncontiguous) {
+            const std::size_t n = block->m_num_instructions;
+            u32 pending_ret = 0u;   // 0 = not inside an inlined leaf call
+            for (std::size_t i = 0; i + 1 < n; ++i) {
+                const CodeOp& op = (*buffer)[i];
+                if (!op.opinfo || op.opinfo->type != OpType::Branch) continue;
+                const u32 next_pc = (*buffer)[i + 1].address;
+                if (pending_ret == 0u &&
+                    IsSeamInlineBl(op.inst, op.address, next_pc)) {
+                    pending_ret = op.address + 4u;   // expected return site
+                    continue;
+                }
+                if (pending_ret != 0u && IsPlainBlr(op.inst) &&
+                    next_pc == pending_ret) {
+                    pending_ret = 0u;                // leaf returned inline
+                    continue;
+                }
+                eligible = false;
+                break;
+            }
+            if (pending_ret != 0u) eligible = false; // unterminated leaf call
+        }
+        if (eligible &&
+            IsBusyWaitLoop(block, buffer->data(), block->m_num_instructions)) {
             (*buffer)[block->m_num_instructions - 1].branchIsIdleLoop = true;
         }
     }
