@@ -225,17 +225,65 @@ window.GcRate = (function () {
     return (n === null || n === undefined || !isFinite(n)) ? '--' : n.toFixed(d || 0);
   }
 
+  // ---- the 120 verdict: how far THIS GAME is from 120 producible frames/s ----------------
+  // [gap-120 2026-08-29] "speed 0.13x · cap 8" is two true numbers and neither answers the
+  // question actually being asked, which is "how far am I from 120?". Worse, the answer is NOT
+  // the same for every game: 120 producible on a 60 fps title (Sonic Adventure 2 Battle, Mario
+  // Party 4) is 2.0x hardware, but on a 30 fps title (PSO Ep I&II) it is 4.0x. Quoting one
+  // target for both understates a 30 fps game by exactly 2x — that is how "about 2x short" came
+  // to be said about a PSO scene that was ~9x short. So the target is per-game and it is
+  // computed from `nativeHz`, which is MEASURED (makeJitRate learns it from published/speed;
+  // ?ratetest=1 test 17b recovers 29.8 from the real PSO capture) or explicitly declared
+  // (recomp passes GUEST_HZ). It is never a default: with no native rate established this whole
+  // segment is OMITTED rather than quoting a target derived from an assumed 60.
+  //
+  // GATE #9 IS ENFORCED HERE, not just documented. `cap` is producible CAPACITY, never presents:
+  // at 1.000x only nativeHz distinct frames per second EXIST, so "120 shown" is not a thing to
+  // reach and re-presenting a frame to make a counter read 120 is a fabricated number. And a cap
+  // measured while the guest was ALLOWED to outrun hardware (the uncap cell, ?fps=, ?hz=) is a
+  // measurement arm, not the product — those readings are stamped "[fast-fwd arm]" so a
+  // fast-forwarded guest can never be quoted as shipped headroom.
+  var TARGET_FPS = 120;
+  function gapText(r) {
+    // No rate measured yet => no verdict. (Also keeps the pre-boot readout at a clean
+    // "speed -- · cap --" instead of announcing a target for an emulator that has not run.)
+    if (r.speed === null || r.speed === undefined) return null;
+    var arm = (r.uncapped || (r.speedReq !== undefined && r.speedReq !== 1)) ? ' [fast-fwd arm]' : '';
+    var cap = r.capFps;
+    var hz = r.nativeHz;
+    // THE TWO HALVES HAVE DIFFERENT REQUIREMENTS, and conflating them cost a wrong headline.
+    // The GAP to 120 needs only `cap`, the measured sustainable production rate — it is sound
+    // whether or not the game's own frame rate was ever pinned down. The "(needs Nx hw)"
+    // ANNOTATION is the per-game hardware target and needs a SETTLED nativeHz; without one it is
+    // simply left off, rather than quoting a multiple off an estimate that has not converged.
+    var okHz = (hz !== null && hz !== undefined && isFinite(hz) && hz > 0);
+    var needs = okHz ? ' (needs ' + num(TARGET_FPS / hz, 1) + 'x hw)' : '';
+    // Throttled AT hardware rate: the sleep is invisible from the page, so capacity is not
+    // observable. The per-game TARGET still is (when settled), and saying it beats a bare "--".
+    if (cap === null || cap === undefined || !isFinite(cap) || cap <= 0)
+      return okHz ? '120 needs ' + num(TARGET_FPS / hz, 1) + 'x hw (uncap to measure)' : null;
+    if (cap >= TARGET_FPS)
+      return '120 REACHED (' + num(cap / TARGET_FPS, 2) + 'x)' + arm;
+    return num(TARGET_FPS / cap, 1) + 'x short of 120' + needs + arm;
+  }
+
   // The status-bar headline, as a PURE function of the rate object, so the self-test can assert
   // the exact text the user reads instead of a number that only resembles it.
   function format(r) {
-    return [
+    var parts = [
       'speed ' + (r.speed === null || r.speed === undefined ? '--' : num(r.speed, 2) + 'x')
         + (r.speedReq !== 1 ? ' (req ' + (r.speedReq === Infinity ? 'max' : num(r.speedReq, 2) + 'x') + ')' : '')
+        // The uncap cell moves the GUEST. Without this stamp a 2.40x readout looks like
+        // headroom we shipped rather than the measurement arm it is (gate #9).
+        + (r.uncapped ? ' UNCAPPED' : '')
         + (r.starved ? ' STARVED' : ''),
       (r.capFps === null || r.capFps === undefined) ? 'cap --'
-        : num(r.capFps) + ' fps cap (' + num(r.capFps / r.guestHz, 1) + 'x hw)',
-      num(r.shown) + ' shown / ' + num(r.published) + ' published'
-    ].join('  ·  ');
+        : num(r.capFps) + ' fps cap (' + num(r.capFps / r.guestHz, 1) + 'x hw)'
+    ];
+    var g = gapText(r);
+    if (g) parts.push(g);
+    parts.push(num(r.shown) + ' shown / ' + num(r.published) + ' published');
+    return parts.join('  ·  ');
   }
 
   // ---- the JIT path's rate meter: emulated cycles, straight out of CoreTiming ------------
@@ -284,16 +332,43 @@ window.GcRate = (function () {
     var maxSpeed = cfg.maxSpeed || 8;
     var hwEps    = (cfg.hwEps === undefined) ? 0.995 : cfg.hwEps;
     var m = { cpuHz: cpuHz, mark: null, markT: 0, started: false,
-              nativeHz: null, seams: 0, windows: 0 };
+              nativeHz: null, seams: 0, windows: 0, ests: [] };
+    // ---- is the native-rate estimate TRUSTWORTHY? -----------------------------------------
+    // [gap-120 2026-08-29] published/speed recovers the game's own frame rate ONLY while the
+    // renderer is publishing every frame the game emits. On the real PSO capture it does:
+    // 29.6-30.3 across six consecutive windows. MEASURED ON SAB IT DOES NOT — a live run of the
+    // user's Sonic Adventure 2 Battle savestate (/tmp/probe-sab-ship.log, t=122-132s) produced
+    // estimates of 34 and 23 on a title that is natively 60, because the pipeline was publishing
+    // 2-3 frames/s while the guest ran at 0.05x. An EMA over that quietly yields a confident
+    // wrong number, and the headline was about to print "needs 3.5x hw" for a 60 fps game.
+    // So the per-game hardware target is named ONLY when the estimate has actually settled:
+    // the last NATIVE_WINDOW estimates must all sit within NATIVE_TOL of their median. PSO's six
+    // windows pass; the SAB-under-load swing does not, and the headline then states the gap to
+    // 120 (which needs only `cap`, and is sound regardless) while declining to name the multiple.
+    // The EMA `m.nativeHz` is untouched and still drives capFps — this adds a gate, it does not
+    // change what was already shipping.
+    var NATIVE_WINDOW = 5, NATIVE_TOL = 0.10;
+    m.stableNativeHz = function () {
+      if (m.ests.length < NATIVE_WINDOW) return null;
+      var s = m.ests.slice().sort(function (a, b) { return a - b; });
+      var med = s[(s.length - 1) >> 1];
+      if (!(med > 0)) return null;
+      for (var i = 0; i < s.length; i++) if (Math.abs(s[i] - med) / med > NATIVE_TOL) return null;
+      return med;
+    };
     // The page KNOWS when the timeline was replaced ('stateLoaded'), so re-latch on the event
-    // instead of relying on the threshold to catch every seam.
-    m.relatch = function () { m.mark = null; m.markT = 0; };
+    // instead of relying on the threshold to catch every seam. A restore is a different scene,
+    // so the settled native rate must be re-earned rather than carried across.
+    m.relatch = function () { m.mark = null; m.markT = 0; m.ests = []; };
     // cycles = total credited emulated cycles; t = wall ms; o.published = distinct frames/s
     // this window; o.uncapped = the throttle is disabled.
     m.sample = function (cycles, t, o) {
       o = o || {};
-      var out = { speed: null, capFps: null, guestHz: m.nativeHz, starved: false,
-                  seam: false, uncapped: !!o.uncapped };
+      // nativeHz is seeded on EVERY exit path, including the early returns: a relatch makes the
+      // next sample return here, and an `undefined` would read as "not measured by this model"
+      // rather than the honest "not settled" (18p).
+      var out = { speed: null, capFps: null, guestHz: m.nativeHz, nativeHz: m.stableNativeHz(),
+                  starved: false, seam: false, uncapped: !!o.uncapped };
       if (cycles === null || cycles === undefined || !isFinite(cycles)) return out;
       if (m.mark === null) { m.mark = cycles; m.markT = t; return out; }
       var dw = (t - m.markT) / 1000;
@@ -316,9 +391,17 @@ window.GcRate = (function () {
       // capture it recovers 29.6-30.3 from six consecutive windows (?ratetest=1 test 16).
       if (speed > 0.05 && o.published > 0) {
         var est = o.published / speed;
-        if (est >= 1 && est <= 240) m.nativeHz = (m.nativeHz === null) ? est : (m.nativeHz * 0.7 + est * 0.3);
+        if (est >= 1 && est <= 240) {
+          m.nativeHz = (m.nativeHz === null) ? est : (m.nativeHz * 0.7 + est * 0.3);
+          m.ests.push(est);
+          if (m.ests.length > NATIVE_WINDOW) m.ests.shift();
+        }
       }
       out.guestHz = m.nativeHz;
+      // Only the SETTLED estimate is allowed to name a per-game hardware target (see the
+      // NATIVE_WINDOW note above). null here means "the game's own rate is not pinned down yet",
+      // and the headline says less rather than saying something wrong.
+      out.nativeHz = m.stableNativeHz();
       if (o.uncapped) {
         out.capFps = (o.published > 0) ? o.published : null;   // throttle off: it IS the capability
       } else if (speed < hwEps) {
@@ -338,6 +421,12 @@ window.GcRate = (function () {
     rate.speed = out.speed;
     rate.capFps = out.capFps;
     rate.starved = !!out.starved;
+    // `nativeHz` is the SETTLED game rate and stays null until makeJitRate's estimate has held
+    // steady for NATIVE_WINDOW windows. `guestHz` keeps its 60 default because it is only the
+    // "x hw" divisor; the 120 verdict reads nativeHz precisely so it can neither quote a
+    // per-game target off that default nor off an estimate that has not converged.
+    rate.nativeHz = (out.nativeHz === undefined) ? null : out.nativeHz;
+    rate.uncapped = !!out.uncapped;
     if (out.guestHz) rate.guestHz = out.guestHz;
     rate.capNote = (out.speed === null)
       ? 'JIT path: no emulated clock yet — CoreTiming mirrors it to SAB once the core runs'
@@ -949,6 +1038,140 @@ window.GcRate = (function () {
          && live17.starved === true,
        'speed=' + fx(live17.speed) + ' cap=' + fx(live17.capFps, 1) + ' guestHz=' + fx(live17.guestHz, 1));
 
+    // ===== 18. THE 120 VERDICT — "how far am I from 120?", per game ==========================
+    // [gap-120 2026-08-29] The bar reported speed and cap and still left the user doing the
+    // arithmetic against a target that is DIFFERENT PER GAME. These pin the answer AND the two
+    // ways stating it could lie: quoting a 60 fps target at a 30 fps game (halves the gap), and
+    // quoting capacity measured off a fast-forwarded guest as if it were shipped headroom.
+    // Each assertion below is a DISCRIMINATOR, proven by reverting the thing it guards and
+    // checking a NAMED test goes red — 9 mutations, all caught, listed in this change's commit
+    // message (M9 hardcode the target to 60 -> 18b/18j; M10 drop [fast-fwd arm] -> 18f/18g;
+    // M11 drop UNCAPPED -> 18f; M12 fall back to the guestHz default -> 18h; M13 drop "uncap to
+    // measure" -> 18e; M14 applyJit stops carrying the fields -> 18j/18k; M15 verdict before a
+    // measured speed -> 18i; M16 target != 120 -> 7 tests; M17 gap as a difference not a
+    // multiple -> 18a/18b/18d/18j).
+    function head18(o) {
+      return format({ speed: o.speed, speedReq: (o.speedReq === undefined ? 1 : o.speedReq),
+                      starved: !!o.starved, capFps: (o.cap === undefined ? null : o.cap),
+                      guestHz: o.hz, nativeHz: (o.nativeHz === undefined ? o.hz : o.nativeHz),
+                      uncapped: !!o.uncapped,
+                      shown: o.shown || 0, published: o.published || 0 });
+    }
+    // 18a — a 60 fps title (SAB / Mario Party 4). 120 producible = 2.0x hardware.
+    var h18a = head18({ speed: 0.5, cap: 30, hz: 60, starved: true, shown: 30, published: 30 });
+    ck('18a a 60 fps game at cap 30 reads "4.0x short of 120 (needs 2.0x hw)"',
+       h18a.indexOf('4.0x short of 120 (needs 2.0x hw)') > 0, h18a);
+    // 18b — THE DISCRIMINATOR against a hardcoded 60. Same speed, same 0.5x, but a 30 fps game:
+    // it produces HALF the frames, so it is TWICE as far from 120. If the target were pinned at
+    // 60 this would print the same "4.0x short" as 18a and understate PSO by exactly 2x.
+    var h18b = head18({ speed: 0.5, cap: 15, hz: 30, starved: true, shown: 15, published: 15 });
+    ck('18b the SAME 0.5x on a 30 fps game (PSO) is TWICE as far: "8.0x short of 120 (needs 4.0x hw)"',
+       h18b.indexOf('8.0x short of 120 (needs 4.0x hw)') > 0, h18b);
+    ck('18c 18a and 18b must NOT print the same gap — a per-game target is the whole point',
+       h18a.slice(h18a.indexOf('short of 120') - 6) !== h18b.slice(h18b.indexOf('short of 120') - 6),
+       '60fps: "' + h18a + '"   |   30fps: "' + h18b + '"');
+    // 18d — the user's live SAB bar, the exact scene that prompted this. cap 8 on a 60 fps game.
+    var h18d = head18({ speed: 0.133, cap: 8, hz: 60, starved: true, shown: 8, published: 8 });
+    ck('18d his actual bar ("8 shown / 8 published") now states the gap instead of implying it',
+       h18d === 'speed 0.13x STARVED  ·  8 fps cap (0.1x hw)  ·  15.0x short of 120 (needs 2.0x hw)  ·  8 shown / 8 published',
+       h18d);
+    // 18e — throttled AT hardware rate: capacity is genuinely unobservable (the throttle sleeps
+    // by an amount the page cannot see), so the verdict must say so rather than invent one. The
+    // per-game TARGET is still known and still worth printing.
+    var h18e = head18({ speed: 1.0, cap: null, hz: 60, shown: 60, published: 60 });
+    ck('18e at 1.000x, capacity is unobservable: "120 needs 2.0x hw (uncap to measure)", not a number',
+       h18e.indexOf('120 needs 2.0x hw (uncap to measure)') > 0
+         && h18e.indexOf('short of 120') === -1, h18e);
+    // 18f — GATE #9. A cap read while the guest was ALLOWED to outrun hardware is a measurement
+    // arm. It must be stamped in BOTH places: UNCAPPED on the speed, [fast-fwd arm] on the
+    // verdict. Unstamped, "1.7x short of 120" off a 2.4x guest reads as shipped headroom.
+    var h18f = head18({ speed: 2.4, cap: 72, hz: 30, uncapped: true, shown: 0, published: 72 });
+    ck('18f an uncapped (fast-forwarded) guest is stamped UNCAPPED and its verdict [fast-fwd arm]',
+       h18f.indexOf('speed 2.40x UNCAPPED') === 0 && h18f.indexOf('[fast-fwd arm]') > 0, h18f);
+    // 18g — same stamp via the OTHER guest knob, ?fps= / ?hz= on the recomp path (speedReq != 1).
+    var h18g = head18({ speed: 2.0, speedReq: 2, cap: 240, hz: 60, shown: 0, published: 120 });
+    ck('18g ?fps= (speedReq != 1) reaching 120 is also stamped an arm, never shipped headroom',
+       h18g.indexOf('120 REACHED (2.00x)') > 0 && h18g.indexOf('[fast-fwd arm]') > 0, h18g);
+    // 18h — no measured native rate => NO verdict. The guestHz default is 60 and using it here
+    // would print "needs 2.0x hw" for PSO before anything about PSO had been measured.
+    var h18h = head18({ speed: 0.5, cap: null, hz: 60, nativeHz: null, shown: 0, published: 0 });
+    ck('18h with no native rate measured yet the verdict is OMITTED, not guessed off the 60 default',
+       h18h.indexOf('120') === -1, h18h);
+    // 18i — and the pre-boot readout is untouched: no speed, no verdict (this is test 9a's string).
+    ck('18i before the core runs there is still no verdict at all',
+       head18({ speed: null, cap: null, hz: 60, shown: 60, published: 120 })
+         === 'speed --  ·  cap --  ·  60 shown / 120 published',
+       head18({ speed: null, cap: null, hz: 60, shown: 60, published: 120 }));
+    // 18j — END TO END through the real PSO capture, so the verdict is fed by the MEASURED
+    // native rate rather than a literal handed to format(). r17 is the six windows from the
+    // user's own savestate; nativeHz comes out ~29.8 and cap ~17.3, so 120/17.3 = ~6.9x short.
+    var live18 = { path: 'jit', guestHz: 60, nativeHz: null, speed: null, capFps: null,
+                   speedReq: 1, starved: false, uncapped: false, capNote: '' };
+    applyJit(live18, r17.out);
+    var h18j = format({ speed: live18.speed, speedReq: 1, starved: live18.starved,
+                        capFps: live18.capFps, guestHz: live18.guestHz, nativeHz: live18.nativeHz,
+                        uncapped: live18.uncapped, shown: 17, published: 17 });
+    ck('18j the real PSO capture yields a verdict off the MEASURED 30, not the 60 default',
+       near(live18.nativeHz, 30, 1.5) && h18j.indexOf('6.9x short of 120 (needs 4.0x hw)') > 0,
+       'nativeHz=' + fx(live18.nativeHz, 2) + '  ' + h18j);
+    // 18k — and the wiring: applyJit must actually carry nativeHz/uncapped onto the live object,
+    // or the verdict silently vanishes on the shipping path (the original class of bug).
+    ck('18k applyJit writes nativeHz and uncapped onto the LIVE rate object',
+       live18.nativeHz !== null && live18.uncapped === false
+         && Object.prototype.hasOwnProperty.call(live18, 'uncapped'),
+       'nativeHz=' + fx(live18.nativeHz, 2) + ' uncapped=' + live18.uncapped);
+    // 18l — control on the constant itself. 120 is the product target; if it is edited the tests
+    // above stop meaning what their names say.
+    ck('18l the capacity target this whole block is written against is 120',
+       TARGET_FPS === 120, 'TARGET_FPS=' + TARGET_FPS);
+
+    // ----- 18m/18n/18o: the per-game target is named only once it has SETTLED ----------------
+    // These exist because the first live SAB run of this very change printed "needs 3.5x hw" for
+    // a 60 fps game. published/speed is the game's ACHIEVED rate, and it equals the native rate
+    // only while the renderer publishes everything the game emits. PSO's capture satisfies that;
+    // the user's SAB scene at 0.05x, publishing 2-3 frames/s, does not.
+    // 18m — PSO's real six windows: the estimate holds steady, so the multiple IS named.
+    ck('18m a settled estimate (PSO, six windows within 2%) does name the hardware target',
+       r17.out.nativeHz !== null && near(r17.out.nativeHz, 30, 1.5),
+       'nativeHz=' + fx(r17.out.nativeHz, 2));
+    // 18n — THE DISCRIMINATOR, replaying the swing MEASURED on the user's own SAB savestate.
+    // These six (speed, published) pairs are the page meter's OWN readings from
+    // /tmp/sab-scene-rate.json (the canonical probe, ROM_IDX=1, his .gcs.gz restored, City
+    // Escape). published/speed over them is 56.6, 5.8, 5.3, 6.7, 4.1, 4.6 — a 14x swing on a
+    // title that is natively 60. An estimate like that must publish NOTHING; the shipped EMA
+    // over the same data says ~6, and the first build of this change printed "needs 3.5x hw".
+    // Every window here clears the speed > 0.05 sampling guard, so the SPREAD is what is being
+    // tested, not the sample count (18q covers the count).
+    var r18n = jitRun({ windows: [
+      { speed: 0.318, published: 18 }, { speed: 1.036, published: 6 }, { speed: 0.565, published: 3 },
+      { speed: 0.450, published: 3 },  { speed: 0.492, published: 2 }, { speed: 0.648, published: 3 }] });
+    ck('18n an UNSETTLED estimate (the live SAB swing, 6 real windows) names no hardware target',
+       r18n.out.nativeHz === null && r18n.jr.ests.length >= 5,
+       'nativeHz=' + String(r18n.out.nativeHz) + '  ests=[' +
+       r18n.jr.ests.map(function (e) { return fx(e, 1); }).join(', ') +
+       ']  (the EMA would have said ' + fx(r18n.out.guestHz, 1) + ')');
+    // 18q — and a rate is not "settled" because ONE window happened to look clean. Without a
+    // minimum sample count the very first published/speed reading would be quoted as the game's
+    // native rate.
+    // (Two windows, because the first sample only latches the mark — it yields no estimate.)
+    var r18q = jitRun({ windows: [{ speed: 0.5, published: 15 }, { speed: 0.5, published: 15 }] });
+    ck('18q one clean-looking estimate is not a settled rate',
+       r18q.out.nativeHz === null && r18q.jr.ests.length === 1,
+       'nativeHz=' + String(r18q.out.nativeHz) + ' after ' + r18q.jr.ests.length + ' estimate(s)');
+    // ...and the headline still answers the question, because the gap to 120 needs only `cap`.
+    var h18n = format({ speed: r18n.out.speed, speedReq: 1, starved: r18n.out.starved,
+                        capFps: r18n.out.capFps, guestHz: r18n.out.guestHz,
+                        nativeHz: r18n.out.nativeHz, uncapped: false, shown: 3, published: 3 });
+    ck('18o and it STILL states the gap to 120 — that number needs only cap, never nativeHz',
+       h18n.indexOf('short of 120') > 0 && h18n.indexOf('needs') === -1, h18n);
+    // 18p — a restore is a different scene, so a settled rate must be re-earned, not carried.
+    var r18p = jitRun({ windows: [
+      { speed: 0.5, published: 15 }, { speed: 0.5, published: 15 }, { speed: 0.5, published: 15 },
+      { speed: 0.5, published: 15 }, { speed: 0.5, published: 15 },
+      { speed: 0.5, published: 15, relatch: true }, { speed: 0.5, published: 15 }] });
+    ck('18p after a stateLoaded relatch the settled rate is re-earned, not carried across scenes',
+       r18p.out.nativeHz === null, 'nativeHz=' + String(r18p.out.nativeHz));
+
     var summary = 'RATETEST ' + (fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + pass + ' passed, ' + fail + ' failed';
     log(summary);
     return { pass: pass, fail: fail, lines: lines, summary: summary };
@@ -957,6 +1180,7 @@ window.GcRate = (function () {
   return { makeModel: makeModel, seqDelta: seqDelta, format: format, num: num,
            simulate: simulate, selfTest: selfTest, DEF: DEF,
            makeJitRate: makeJitRate, jitCycles: jitCycles, applyJit: applyJit,
+           gapText: gapText, TARGET_FPS: TARGET_FPS,
            GEKKO_HZ: GEKKO_HZ, CELLS: CELLS };
 })();
 </script>
@@ -1559,6 +1783,18 @@ window.GcRate = (function () {
       if (_fpr !== null)
         new Uint32Array(sharedMemory.buffer)[0x026B3408 >> 2] = (parseInt(_fpr, 10) !== 0) ? 0 : 1;
     } catch (e) { pageLog('[fp-resident] toggle write failed: ' + (e && e.message)); }
+    // [fp-fusion A/B 2026-08-29] Seal-time run-fusion accepts FP records off SAB scratch cell
+    // 0x026B342C — same plumbing as the fp_resident_loop toggle above, next free cell (0x3420
+    // = MIPS meter, 0x3424/0x3428 = credited-cycle mirror, 0x3440 = pe_finish). Browser-zeroed
+    // = OFF = byte-identical to the pre-change tree, so ?bjit_fp_fusion=1 vs default is a
+    // matched pair on ONE binary. Read once per gen SEAL (block_cache.cpp region_seal), never
+    // on the executed path, so it must be set before the hot gens seal — i.e. at page load,
+    // which is what this does. Not live-flippable (already-sealed gens keep their shape).
+    try {
+      var _fpfuse = new URLSearchParams(location.search).get('bjit_fp_fusion');
+      if (_fpfuse !== null)
+        new Uint32Array(sharedMemory.buffer)[0x026B342C >> 2] = (parseInt(_fpfuse, 10) !== 0) ? 1 : 0;
+    } catch (e) { pageLog('[fp-fusion] toggle write failed: ' + (e && e.message)); }
     // [texhash A/B 2026-08-28] Common::GetHash64 (texture cache hash) picks XXH3 vs the old
     // MurmurHash3 at the call off SAB scratch cell 0x026B340C — same plumbing as the
     // fp_resident_loop toggle above, next free cell. Browser-zeroed = XXH3 (default, ships).
@@ -4257,7 +4493,11 @@ window.GcRate = (function () {
   // the "exact gate attribution" note in GcRate.
   var Rate = window.__gcRate = {
     path: 'jit',
-    guestHz: 60,          // the game's native frame rate; what 1.00x is measured against
+    guestHz: 60,          // the "x hw" divisor. 60 is a DEFAULT, not a measurement
+    nativeHz: null,       // the game's real frame rate, MEASURED (or declared by recomp). The
+                          // 120 verdict reads only this, so it never quotes a per-game target
+                          // off the guestHz default — PSO is 30, and 60 would halve its gap.
+    uncapped: false,      // the throttle is disarmed: a MEASUREMENT ARM, stamped in the headline
     speed: null,          // measured emulated/wall. null = not observable on this path
     speedReq: 1,          // requested multiplier (?fps= / GUEST_HZ)
     published: 0,         // distinct renderer outputs per second
@@ -4336,6 +4576,22 @@ window.GcRate = (function () {
       '            pixels. "' + _rateNum(Rate.capFps) + ' fps cap" at 1.00x = we are ' +
       _rateNum(Rate.capFps === null ? null : Rate.capFps / Rate.guestHz, 1) + 'x ahead of the hardware.\n' +
       (Rate.capNote ? '            ' + Rate.capNote + '\n' : '') +
+      // The 120 verdict, spelled out. The bar has room for the conclusion; the arithmetic and
+      // the per-game target belong here.
+      '120       = the CAPACITY target, in this game\'s own terms. This title\'s measured native\n' +
+      '            rate is ' + _rateNum(Rate.nativeHz, 1) + ' fps, so 120 producible = ' +
+      _rateNum(Rate.nativeHz === null ? null : 120 / Rate.nativeHz, 1) + 'x hardware' +
+      (Rate.nativeHz === null ? '' : ' (60 fps titles need 2.0x,\n            30 fps titles like PSO need 4.0x — quoting one target for both is a 2x error)') + '.\n' +
+      '            ' + (Rate.capFps === null
+        ? 'Capacity is not observable while the throttle is sleeping; arm the uncap cell to measure it.'
+        : 'At cap ' + _rateNum(Rate.capFps) + '/s that is ' +
+          _rateNum(Rate.capFps >= 120 ? Rate.capFps / 120 : 120 / Rate.capFps, 1) +
+          'x ' + (Rate.capFps >= 120 ? 'PAST' : 'SHORT OF') + ' 120.') + '\n' +
+      '            120 is PRODUCIBLE frames, never presents: at 1.000x only ' +
+      _rateNum(Rate.nativeHz, 0) + ' distinct frames per\n' +
+      '            second exist, and re-showing one to make a counter read 120 is a fabricated\n' +
+      '            number. Readings taken with the guest running FASTER than hardware are\n' +
+      '            measurement arms and are stamped "[fast-fwd arm]" — they are not headroom.\n' +
       'published = distinct frames the renderer finished this second (seqlock delta; no dupes).\n' +
       'shown     = distinct frames painted to the canvas. Capped by the DISPLAY REFRESH — a\n' +
       '            60Hz panel cannot show more than 60/s, so this never reads 120 there even\n' +
@@ -4755,11 +5011,48 @@ window.GcRate = (function () {
             + ' sink=' + _sink + ' coreRate=' + (window._gcAudioRate | 0));
         }
         if (_anow - (window._audLog || 0) > 5000) {
+          // [audio-diag WINDOWED FIX 2026-08-29] This printed a LIFETIME MEAN, not a rate.
+          // _audN is a lifetime accumulator that is never reset and the divisor was the whole
+          // elapsed run, so the number lagged reality by however long the page had been open
+          // and could never recover. MEASURED against a windowed ground truth in the same run:
+          // printed 16106/16339/16316/16300 while the true windowed rates were
+          // 31774/26992/15219/15564 — it reported 0.46x during a window that was actually
+          // 0.99x, and 0.51x during one that was 0.475x. The user's falling
+          // 14746->11813 series was therefore a lifetime mean sagging toward a low
+          // instantaneous rate, and the real current value was NOT recoverable from it.
+          // Keep the lifetime figure (it is the honest all-run average) but lead with the
+          // window, because the window is what answers "how is it doing right now".
+          //
+          // WHY 32029 IS THE RIGHT DENOMINATOR, derived from source with no free parameters:
+          // AudioDMACallback is a CoreTiming event rescheduled every
+          // GetAudioDMACallbackPeriod(cpu_core_clock, aid_divisor) GUEST ticks
+          // (SystemTimers.cpp:80-87) -> UpdateAudioDMA (DSP.cpp:600) -> SendAIBuffer(..., 8)
+          // (DSP.cpp:624), and the else-branch at DSP.cpp:718 pushes 8 zero samples
+          // UNCONDITIONALLY, armed DMA or not. With m_cpu_core_clock = 486000000
+          // (SystemTimers.h:103) and the GC AID-32kHz divisor 1124*2*3/2 = 3372
+          // (AudioInterface.cpp:350,355-356) the period is 121392 ticks
+          // => 4003.5587 fires/emulated-second => 8x that = 32028.47 frames/EMULATED second.
+          // So frames/s / 32029 IS the guest multiple — the GameCube analogue of Dreamcast's
+          // production-rate / 44101.43. There is zero wall-clock input to the producer.
+          // CAVEAT, stated because it bounds what this number can prove: the AI-DMA event is
+          // scheduled on global_timer, so this witness is NOT independent of CoreTiming's
+          // credited-cycle `speed` — measured |aidmaX - speedCred|/speedCred = 0.106% mean,
+          // 0.43% max. It inherits idle-skip credit (windows reading ~1.00x here executed only
+          // 91.9 MHz of a 486 MHz Gekko = 18.9%). It can therefore only UNDER-report the
+          // deficit, never over-report it. It IS independent of the unvalidated [mips] meter.
           window._audLog = _anow;
           var _actx = getAudioCtx();
           var _target = (window._gcAudioRate | 0) || 0;
-          console.log('[audio-diag] ' + ((window._audN * 1000) / (_anow - window._audT0)).toFixed(0)
-            + ' frames/s (core rate ' + (_target || '?')
+          var _wN = window._audN - (window._audNPrev | 0);
+          var _wMs = _anow - (window._audTPrev || window._audT0);
+          var _wRate = _wMs > 0 ? (_wN * 1000) / _wMs : 0;
+          var _lifeRate = (window._audN * 1000) / (_anow - window._audT0);
+          window._audNPrev = window._audN;
+          window._audTPrev = _anow;
+          console.log('[audio-diag] ' + _wRate.toFixed(0)
+            + ' frames/s NOW (lifetime ' + _lifeRate.toFixed(0) + ')'
+            + (_target ? '  guest=' + (_wRate / _target).toFixed(3) + 'x' : '')
+            + ' (core rate ' + (_target || '?')
             + '; below that = core below real-time) muted=' + audioMuted
             + ' sink=' + _sink
             + ' ctx=' + (_actx ? _actx.state + '@' + _actx.sampleRate : 'null')
@@ -5812,7 +6105,10 @@ window.GcRate = (function () {
     // separate <script> from the main IIFE — if that block ever fails to evaluate, the HUD
     // below must still work rather than taking the whole pacing interval down with it.
     if (window.__gcRate) window.__gcRate.set({
-      path: 'recomp', guestHz: GUEST_HZ, speed: r.speed, speedReq: r.speedReq, capFps: r.capFps,
+      // nativeHz is DECLARED here rather than measured: GUEST_HZ is the rate this path pins the
+      // guest to (?hz=, default 60), so the 120 verdict has a real per-game target on recomp too.
+      path: 'recomp', guestHz: GUEST_HZ, nativeHz: GUEST_HZ,
+      speed: r.speed, speedReq: r.speedReq, capFps: r.capFps,
       starved: r.starved,
       capNote: 'recomp: min(guest ' + GcRate.num(r.guestCap) + '/s, render ' +
                GcRate.num(r.renderCap) + '/s) from measured busy time',
