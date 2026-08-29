@@ -46,7 +46,7 @@
 
   var OP = {
     block: 0x02, loop: 0x03, if_: 0x04, else_: 0x05, end: 0x0B,
-    br: 0x0C, br_if: 0x0D, call_indirect: 0x11,
+    br: 0x0C, br_if: 0x0D, call: 0x10, call_indirect: 0x11,
     local_get: 0x20, local_set: 0x21,
     i32_load: 0x28, i64_load: 0x29, i32_load8_u: 0x2D, i32_store: 0x36, i64_store: 0x37, i32_store8: 0x3A,
     i32_const: 0x41, i64_const: 0x42,
@@ -65,7 +65,7 @@
   };
 
   // locals: 0,1 = i32 scratch (addr, word); 2..33 = i64 guest r0..r31
-  var L_ADDR = 0, L_WORD = 1, L_REG0 = 2, L_I64S = 34, L_JT = 35; // i64 scratch (mult), i32 jump target
+  var L_ADDR = 0, L_WORD = 1, L_REG0 = 2, L_I64S = 34, L_JT = 35, L_COND = 36; // i64 scratch (mult), i32 jump target, i32 branch condition
 
   function loadI64(addr) { return [OP.i32_const, 0x00, OP.i64_load, 0x03].concat(leb(addr)); }
   function loadI32(addr) { return [OP.i32_const, 0x00, OP.i32_load, 0x02].concat(leb(addr)); }
@@ -74,6 +74,88 @@
   function storeI32Const(addr, value) { return storeI32(addr, [OP.i32_const].concat(sleb(value))); }
 
   function sext16(v) { return (v << 16) >> 16; }
+
+  // ---- MIPS mnemonic decode (census labelling only; not used for codegen) ----
+  var M_OP = {
+    0x02: 'J', 0x03: 'JAL', 0x04: 'BEQ', 0x05: 'BNE', 0x06: 'BLEZ', 0x07: 'BGTZ',
+    0x08: 'ADDI', 0x09: 'ADDIU', 0x0A: 'SLTI', 0x0B: 'SLTIU', 0x0C: 'ANDI', 0x0D: 'ORI', 0x0E: 'XORI', 0x0F: 'LUI',
+    0x12: 'COP2', 0x13: 'COP3',
+    0x14: 'BEQL', 0x15: 'BNEL', 0x16: 'BLEZL', 0x17: 'BGTZL',
+    0x18: 'DADDI', 0x19: 'DADDIU', 0x1A: 'LDL', 0x1B: 'LDR',
+    0x20: 'LB', 0x21: 'LH', 0x22: 'LWL', 0x23: 'LW', 0x24: 'LBU', 0x25: 'LHU', 0x26: 'LWR', 0x27: 'LWU',
+    0x28: 'SB', 0x29: 'SH', 0x2A: 'SWL', 0x2B: 'SW', 0x2C: 'SDL', 0x2D: 'SDR', 0x2E: 'SWR', 0x2F: 'CACHE',
+    0x30: 'LL', 0x31: 'LWC1', 0x34: 'LLD', 0x35: 'LDC1', 0x37: 'LD',
+    0x38: 'SC', 0x39: 'SWC1', 0x3C: 'SCD', 0x3D: 'SDC1', 0x3F: 'SD',
+  };
+  var M_SPECIAL = {
+    0x00: 'SLL', 0x02: 'SRL', 0x03: 'SRA', 0x04: 'SLLV', 0x06: 'SRLV', 0x07: 'SRAV',
+    0x08: 'JR', 0x09: 'JALR', 0x0C: 'SYSCALL', 0x0D: 'BREAK', 0x0F: 'SYNC',
+    0x10: 'MFHI', 0x11: 'MTHI', 0x12: 'MFLO', 0x13: 'MTLO', 0x14: 'DSLLV', 0x16: 'DSRLV', 0x17: 'DSRAV',
+    0x18: 'MULT', 0x19: 'MULTU', 0x1A: 'DIV', 0x1B: 'DIVU', 0x1C: 'DMULT', 0x1D: 'DMULTU', 0x1E: 'DDIV', 0x1F: 'DDIVU',
+    0x20: 'ADD', 0x21: 'ADDU', 0x22: 'SUB', 0x23: 'SUBU', 0x24: 'AND', 0x25: 'OR', 0x26: 'XOR', 0x27: 'NOR',
+    0x2A: 'SLT', 0x2B: 'SLTU', 0x2C: 'DADD', 0x2D: 'DADDU', 0x2E: 'DSUB', 0x2F: 'DSUBU',
+    0x30: 'TGE', 0x31: 'TGEU', 0x32: 'TLT', 0x33: 'TLTU', 0x34: 'TEQ', 0x36: 'TNE',
+    0x38: 'DSLL', 0x3A: 'DSRL', 0x3B: 'DSRA', 0x3C: 'DSLL32', 0x3E: 'DSRL32', 0x3F: 'DSRA32',
+  };
+  var M_REGIMM = {
+    0x00: 'BLTZ', 0x01: 'BGEZ', 0x02: 'BLTZL', 0x03: 'BGEZL', 0x08: 'TGEI', 0x09: 'TGEIU',
+    0x0A: 'TLTI', 0x0B: 'TLTIU', 0x0C: 'TEQI', 0x0E: 'TNEI',
+    0x10: 'BLTZAL', 0x11: 'BGEZAL', 0x12: 'BLTZALL', 0x13: 'BGEZALL',
+  };
+  var M_CP0 = { 0x00: 'MFC0', 0x01: 'DMFC0', 0x04: 'MTC0', 0x05: 'DMTC0' };
+  var M_TLB = { 0x01: 'TLBR', 0x02: 'TLBWI', 0x06: 'TLBWR', 0x08: 'TLBP', 0x18: 'ERET' };
+  var M_CP1_SUB = { 0x00: 'MFC1', 0x01: 'DMFC1', 0x02: 'CFC1', 0x04: 'MTC1', 0x05: 'DMTC1', 0x06: 'CTC1' };
+  var M_FMT = { 0x10: 'S', 0x11: 'D', 0x14: 'W', 0x15: 'L' };
+  var M_CP1_FN = {
+    0x00: 'ADD', 0x01: 'SUB', 0x02: 'MUL', 0x03: 'DIV', 0x04: 'SQRT', 0x05: 'ABS', 0x06: 'MOV', 0x07: 'NEG',
+    0x08: 'ROUND.L', 0x09: 'TRUNC.L', 0x0A: 'CEIL.L', 0x0B: 'FLOOR.L',
+    0x0C: 'ROUND.W', 0x0D: 'TRUNC.W', 0x0E: 'CEIL.W', 0x0F: 'FLOOR.W',
+    0x20: 'CVT.S', 0x21: 'CVT.D', 0x24: 'CVT.W', 0x25: 'CVT.L',
+  };
+  function mnem(word) {
+    if (word === 0) return 'NOP';
+    var op = (word >>> 26) & 0x3F, rs = (word >>> 21) & 0x1F, rt = (word >>> 16) & 0x1F, fn = word & 0x3F;
+    if (op === 0x00) return M_SPECIAL[fn] || ('SPECIAL.' + fn.toString(16));
+    if (op === 0x01) return M_REGIMM[rt] || ('REGIMM.' + rt.toString(16));
+    if (op === 0x10) return (rs & 0x10) ? (M_TLB[fn] || ('COP0.' + fn.toString(16))) : (M_CP0[rs] || ('COP0.rs' + rs.toString(16)));
+    if (op === 0x11) {
+      if (rs === 0x08) return ['BC1F', 'BC1T', 'BC1FL', 'BC1TL'][rt & 3];
+      if (M_CP1_SUB[rs] !== undefined) return M_CP1_SUB[rs];
+      var f = M_FMT[rs];
+      if (f === undefined) return 'COP1.rs' + rs.toString(16);
+      if (fn >= 0x30) return 'C.cond.' + f;
+      return (M_CP1_FN[fn] || ('FN' + fn.toString(16))) + '.' + f;
+    }
+    return M_OP[op] || ('OP.' + op.toString(16));
+  }
+
+  // ---- runtime execution census (wave 5b, ?jit=census) ----
+  // Ranks the REMAINING emitter work by measured execution frequency rather
+  // than by compile-time site counts (gate #6: measured, not guessed).
+  //
+  // Counters live in JS and are bumped through an imported host function
+  // ("e"."c") that census-mode blocks call. Linear-memory counters would be
+  // cheaper, but this build exports no _malloc (verified 2026-08-29: a page
+  // eval reported `typeof Module._malloc === "undefined"`), so there is no
+  // guest-invisible scratch region to put them in. Census is a COUNTING arm,
+  // never a timing arm — the import call cost cannot change the counts, and
+  // ?jit / ?jit=nofp emit byte-identical code to before (bump() returns []).
+  var CENSUS_MAX = 512;
+  var census = { on: null, keys: Object.create(null), names: [], counts: new Uint32Array(CENSUS_MAX), over: 0 };
+  function censusBump(i) { census.counts[i]++; }
+  function censusIdx(key) {
+    var i = census.keys[key];
+    if (i === undefined) {
+      if (census.names.length >= CENSUS_MAX) { census.over++; return CENSUS_MAX - 1; }
+      i = census.names.length; census.keys[key] = i; census.names.push(key);
+    }
+    return i;
+  }
+  // bytes that bump one census bucket; empty (and free) when census is off
+  function bump(key) {
+    if (!census.on) return [];
+    return [OP.i32_const].concat(sleb(censusIdx(key)), [OP.call, 0x00]);
+  }
 
   // ---- block-local register cache ----
   function RegCache(regBase) {
@@ -259,6 +341,7 @@
     return storeI32Const(p.lastAddr, finalAddr | 0).concat(
       loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
       [OP.if_, OP.void_],
+      bump('#gen_interrupt'),
       C.flush(),                          // compile-state: dirty cleared on BOTH arms (flush emits stores only here, but the arm not taken loses nothing: dirty was already current)
       storeI32Const(p.pcGlobal, finalPtr),
       [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00],
@@ -278,10 +361,41 @@
       storeI32(p.lastAddr, loadI32(p.pcGlobal).concat([OP.i32_load, 0x02], leb(p.addrOff))),
       loadI32(p.nextInt), loadI32(p.count), [OP.i32_le_u],
       [OP.if_, OP.void_],
+        bump('#gen_interrupt'),
         [OP.i32_const], sleb(p.genInt), [OP.call_indirect, 0x00, 0x00],
       [OP.end],
+      bump('#exit:jump_to'),
       [OP.br].concat(leb(exitDepth))
     );
+  }
+
+  // The slow (non-RDRAM / CU1-clear) arm of a native memory or FP op.
+  //
+  // Normally it runs THIS instruction's interpreter op and CONTINUES in-block,
+  // exiting only if the op diverged PC. When the op sits in a branch DELAY
+  // SLOT (`slow` supplied) it must instead hand the WHOLE BRANCH back to the
+  // interpreter and exit unconditionally: only the interpreter sets
+  // g_dev.r4300.delay_slot around the slot (cached_interp.c:73-96), and
+  // without that flag a faulting slot records EPC/BD wrong and never sets
+  // skip_jump (exception.c:143-145), so the cancelled jump would still be
+  // taken. Re-running the branch from its own first instruction is EXACT:
+  // the only guest state the block has written by then is the link register,
+  // and DECLARE_JUMP writes it the identical value (SE32(addr+8)) again.
+  function slowArm(p, C, instrPtr, opsIdx, brDepth, slow, refreshReg) {
+    if (slow) {
+      return [].concat(
+        C.flushSnapshot(),
+        storeI32Const(p.pcGlobal, slow.ptr),
+        [OP.i32_const], sleb(slow.opsIdx), [OP.call_indirect, 0x00, 0x00],
+        [OP.br].concat(leb(brDepth)));
+    }
+    return [].concat(
+      C.flushSnapshot(),
+      storeI32Const(p.pcGlobal, instrPtr),
+      [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
+      refreshReg >= 0 ? loadI64(p.regBase + refreshReg * 8).concat([OP.local_set], leb(L_REG0 + refreshReg)) : [],
+      loadI32(p.pcGlobal), [OP.i32_const], sleb(instrPtr + p.stride), [OP.i32_ne],
+      [OP.br_if].concat(leb(brDepth)));
   }
 
   // ---- native loads & stores ----
@@ -292,7 +406,7 @@
   // traffic; only genuinely slow accesses (TLB/MMIO/fb-protected) pay an
   // exit. Compile-state mutations inside the fast arm are sound because the
   // fast arm is the only continuing path.
-  function emitLoad(word, instrPtr, p, C, opsIdx, exitDepth) {
+  function emitLoad(word, instrPtr, p, C, opsIdx, exitDepth, slow) {
     var op = (word >>> 26) & 0x3F;
     if (op !== 0x20 && op !== 0x21 && op !== 0x23 && op !== 0x24 && op !== 0x25 && op !== 0x27) return null;
     var rs = (word >>> 21) & 0x1F, rt = (word >>> 16) & 0x1F;
@@ -322,17 +436,13 @@
         [OP.i32_load, 0x02], leb(p.dramBase), [OP.local_set, L_WORD],
         val, C.writeFromStack(rt), // join: rt loaded+dirty (slow arm refreshes the local; its redundant flush is benign)
       [OP.else_],
+        bump((slow ? 'SLOTSLOW:' : 'SLOW:') + mnem(word)),
         // continue-after-fallback: snapshot-flush (compile-state untouched —
         // the redundant later flush rewrites identical values), run the
         // interp op, then refresh ONLY the op's write-set (rt) into its
         // local so both arms join in the same compile-state (rt loaded).
         // PC divergence (TLB exception) still exits.
-        C.flushSnapshot(),
-        storeI32Const(p.pcGlobal, instrPtr),
-        [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
-        loadI64(p.regBase + rt * 8), [OP.local_set], leb(L_REG0 + rt),
-        loadI32(p.pcGlobal), [OP.i32_const], sleb(instrPtr + p.stride), [OP.i32_ne],
-        [OP.br_if].concat(leb(exitDepth + 1)),
+        slowArm(p, C, instrPtr, opsIdx, exitDepth + 1, slow, rt),
       [OP.end]
     );
   }
@@ -365,7 +475,7 @@
   // the page block instr at (a&0xFFF)/4 has ops != NOTCOMPILED, mark the
   // page invalid. blocks[x] is only dereferenced when invalid_code[x]==0,
   // exactly like the interpreter (a page with no block has invalid_code 1).
-  function emitStore(word, instrPtr, p, C, opsIdx, exitDepth) {
+  function emitStore(word, instrPtr, p, C, opsIdx, exitDepth, slow) {
     var op = (word >>> 26) & 0x3F;
     if (op !== 0x28 && op !== 0x29 && op !== 0x2B) return null;
     var rs = (word >>> 21) & 0x1F, rt = (word >>> 16) & 0x1F;
@@ -408,14 +518,11 @@
         storeBytes,
         checkMemory,
       [OP.else_],
+        bump((slow ? 'SLOTSLOW:' : 'SLOW:') + mnem(word)),
         // continue-after-fallback: store ops write no guest registers, so
         // both arms join with the cache untouched; snapshot-flush keeps
         // memory current for the interp op (it reads rs/rt from reg[])
-        C.flushSnapshot(),
-        storeI32Const(p.pcGlobal, instrPtr),
-        [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
-        loadI32(p.pcGlobal), [OP.i32_const], sleb(instrPtr + p.stride), [OP.i32_ne],
-        [OP.br_if].concat(leb(exitDepth + 1)),
+        slowArm(p, C, instrPtr, opsIdx, exitDepth + 1, slow, -1),
       [OP.end]
     );
   }
@@ -427,15 +534,18 @@
   // arm is snapshot-flush + interp call + unconditional exit. Pointer-bank
   // indirection is performed at RUNTIME (reg_cop1_simple/double[i] loads),
   // which makes Status.FR bank flips automatically correct.
-  function cuGuard(p, C, nativeBytes, instrPtr, opsIdx, exitDepth) {
+  function cuGuard(p, C, nativeBytes, instrPtr, opsIdx, exitDepth, word, slow) {
     return [].concat(
       loadI32(p.cp0Status), [OP.i32_const], sleb(0x20000000), [OP.i32_and],
       [OP.if_, OP.void_],
         nativeBytes,
       [OP.else_],
+        bump((slow ? 'SLOTCU1MISS:' : 'CU1MISS:') + mnem(word)),
         C.flushSnapshot(),
-        storeI32Const(p.pcGlobal, instrPtr),
-        [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
+        // in a delay slot the coprocessor-unusable exception needs delay_slot
+        // set, which only the interpreter does — hand back the whole branch
+        storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
+        [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00],
         [OP.br].concat(leb(exitDepth + 1)),
       [OP.end]
     );
@@ -443,7 +553,7 @@
   // push the float*/double* for FPR index i from the live bank
   function fprPtr(bank, i) { return [OP.i32_const, 0x00, OP.i32_load, 0x02].concat(leb(bank + i * 4)); }
 
-  function emitCop1(word, instrPtr, p, C, opsIdx, exitDepth) {
+  function emitCop1(word, instrPtr, p, C, opsIdx, exitDepth, slow) {
     var op = (word >>> 26) & 0x3F;
     if (op !== 0x11) return null;
     var sub = (word >>> 21) & 0x1F;       // rs field: move/bc/fmt
@@ -490,12 +600,12 @@
     } else {
       return null; // BC1 branches, fmt W/L: fallback
     }
-    return cuGuard(p, C, nat, instrPtr, opsIdx, exitDepth);
+    return cuGuard(p, C, nat, instrPtr, opsIdx, exitDepth, word, slow);
   }
 
   // LWC1/LDC1/SWC1/SDC1: CU1 guard outside, then the same live-dispatch-table
   // fast path as integer loads/stores; FPR access through the runtime banks.
-  function emitCop1Mem(word, instrPtr, p, C, opsIdx, exitDepth) {
+  function emitCop1Mem(word, instrPtr, p, C, opsIdx, exitDepth, slow) {
     var op = (word >>> 26) & 0x3F;
     if (op !== 0x31 && op !== 0x35 && op !== 0x39 && op !== 0x3D) return null;
     var base = (word >>> 21) & 0x1F, ft = (word >>> 16) & 0x1F;
@@ -532,18 +642,41 @@
       [OP.if_, OP.void_],
         fast,
       [OP.else_],
-        C.flushSnapshot(),
-        storeI32Const(p.pcGlobal, instrPtr),
-        [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
-        loadI32(p.pcGlobal), [OP.i32_const], sleb(instrPtr + p.stride), [OP.i32_ne],
-        [OP.br_if].concat(leb(exitDepth + 2)), // inside cu-if + this if
+        bump((slow ? 'SLOTSLOW:' : 'SLOW:') + mnem(word)),
+        slowArm(p, C, instrPtr, opsIdx, exitDepth + 2, slow, -1), // inside cu-if + this if
       [OP.end]
     );
-    return cuGuard(p, C, nat, instrPtr, opsIdx, exitDepth);
+    return cuGuard(p, C, nat, instrPtr, opsIdx, exitDepth, word, slow);
+  }
+
+  // ---- delay-slot codegen (wave 8) ----
+  // Wave 2 accepted a branch only when its delay slot was a pure ALU op,
+  // because a faulting slot needs g_dev.r4300.delay_slot set for EPC/BD and
+  // skip_jump, and only the interpreter sets it. The wave-5b runtime census
+  // showed what that costs: on mariokart 74% of ALL fallback executions were
+  // branches rejected for exactly this reason (BNEL@slot:SB 26.0%,
+  // BNE@slot:LHU 22.7%, BEQL@slot:LW 11.5%, JR@slot:SW 5.1%, ...), and each
+  // one exits the block into the dispatcher. Not one was @span-end or @idle.
+  //
+  // The fix keeps exactness without touching the core: a memory/FP slot is
+  // emitted natively, and its RDRAM fast arm CANNOT fault (readmem*[a>>16]
+  // == read_rdram* means a direct RDRAM access — no TLB walk, no MMIO), so
+  // delay_slot is never observed there. Every other arm (off-RDRAM, CU1
+  // clear) hands the WHOLE BRANCH back to the interpreter and exits, which
+  // re-runs branch+slot with the flag set. See slowArm().
+  function emitSlotNative(word, slotPtr, p, Cx, opsIdx, exitD, slow) {
+    var r = emitLoad(word, slotPtr, p, Cx, opsIdx, exitD, slow);
+    if (r) return r;
+    r = emitStore(word, slotPtr, p, Cx, opsIdx, exitD, slow);
+    if (r) return r;
+    if (typeof window !== 'undefined' && window.__jitNoFP) return null;
+    r = emitCop1(word, slotPtr, p, Cx, opsIdx, exitD, slow);
+    if (r) return r;
+    return emitCop1Mem(word, slotPtr, p, Cx, opsIdx, exitD, slow);
   }
 
   // ---- block compiler ----
-  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeLoads: 0, nativeStores: 0, nativeFP: 0, fallbackOps: 0, fails: 0, slotReuses: 0, distinctSlots: 0 };
+  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeMemSlots: 0, nativeLoads: 0, nativeStores: 0, nativeFP: 0, fallbackOps: 0, fails: 0, slotReuses: 0, distinctSlots: 0 };
   // table slot per guest entry address: a recompile REUSES its slot via
   // wasmTable.set, unrooting the previous instance for GC — the table is
   // bounded by distinct block entries, not by recompile churn (vaddr keys
@@ -551,6 +684,10 @@
   var slotByVaddr = Object.create(null);
 
   function compileSpan(p, Module) {
+    // resolved once, on the first compile — the page sets window.__jitCensus
+    // before loading this script, and it must stay constant for the session
+    // (it decides each module's import/type shape)
+    if (census.on === null) census.on = !!(typeof window !== 'undefined' && window.__jitCensus);
     var HEAPU32 = Module.HEAPU32;
     var C = new RegCache(p.reg);
     p.regBase = p.reg;
@@ -565,9 +702,12 @@
       var nextPtr = instrPtr + p.stride;
 
       // (b) native branch?
-      var br = null, brOut = false;
+      var br = null, brOut = false, slotMem = false;
+      var brReason = null;   // census: why a decodable branch was NOT emitted
       var dec = decodeBranch(word, addr);
-      if (dec && i + 1 < p.span) {
+      if (dec && i + 1 >= p.span) {
+        brReason = 'span-end';
+      } else if (dec) {
         var slotWord = HEAPU32[(p.srcPtr >> 2) + i + 1];
         var isIdle = dec.target !== null && (dec.target === addr) && (slotWord === 0);
         // _OUT mirror: runtime targets (JR/JALR) are ALWAYS the OUT path
@@ -578,7 +718,14 @@
         // must leave no compile-state behind
         var probeC = new RegCache(p.reg);
         probeC.loaded = C.loaded.slice(); probeC.dirty = C.dirty.slice();
-        if (!isIdle && emitAlu(slotWord, probeC) !== null) { br = dec; brOut = isOut; }
+        if (isIdle) brReason = 'idle';
+        else if (emitAlu(slotWord, probeC) !== null) { br = dec; brOut = isOut; }
+        else if (emitSlotNative(slotWord, p.entryPtr + (i + 1) * p.stride, p, probeC,
+                                HEAPU32[(p.entryPtr + (i + 1) * p.stride) >> 2], 0,
+                                { ptr: instrPtr, opsIdx: HEAPU32[instrPtr >> 2] }) !== null) {
+          br = dec; brOut = isOut; slotMem = true;   // probe only — bytes discarded, probeC dies with it
+        }
+        else brReason = 'slot:' + mnem(slotWord);
       }
       if (br) {
         var slotWord2 = HEAPU32[(p.srcPtr >> 2) + i + 1];
@@ -606,8 +753,19 @@
           }
           return emitTailPoll(p, Cx, br.target, targetPtr, exitD).concat(
             targetIdx === 0
-              ? [OP.br].concat(leb(topD))
-              : storeI32Const(p.pcGlobal, targetPtr).concat([OP.br], leb(exitD)));
+              ? bump('#backedge').concat([OP.br], leb(topD))
+              : bump('#exit:branch').concat(storeI32Const(p.pcGlobal, targetPtr), [OP.br], leb(exitD)));
+        }
+        // delay-slot bytes at a given $exit depth. ALU slots emit inline as
+        // before; memory/FP slots emit their native fast arm and bail the
+        // WHOLE branch to the interpreter on any arm that could fault.
+        var slotPtr = p.entryPtr + (i + 1) * p.stride;
+        var slotOpsIdx = HEAPU32[slotPtr >> 2];
+        var slowSpec = { ptr: instrPtr, opsIdx: HEAPU32[instrPtr >> 2] };
+        function emitSlot(Cx, exitD) {
+          return slotMem
+            ? emitSlotNative(slotWord2, slotPtr, p, Cx, slotOpsIdx, exitD, slowSpec)
+            : emitAlu(slotWord2, Cx);
         }
         function skipJumpSplit(Cx, exitD, topD) {
           // if (skip_jump == 0) take else behave-as-not-taken-and-exit
@@ -615,6 +773,7 @@
             takenTail(Cx, exitD + 1, topD + 1),
             [OP.else_],
               emitTailPoll(p, Cx, fallAddr, fallPtr, exitD + 1),
+              bump('#exit:skip_jump'),
               storeI32Const(p.pcGlobal, fallPtr),
               [OP.br].concat(leb(exitD + 1)),
             [OP.end]);
@@ -624,19 +783,24 @@
           body = body.concat(
             captureBytes,
             linkBytes,
-            emitAlu(slotWord2, C),
+            emitSlot(C, EXIT),
             emitCountBatch(p, addr),
             C.flush(),
             skipJumpSplit(C, EXIT, TOP)
           );
           C.invalidate();
         } else if (!br.likely) {
+          // the condition is parked in a LOCAL rather than left on the wasm
+          // stack across the slot: a memory delay slot emits its own
+          // if/else and can br out of the block, and stack residue across
+          // those is needless risk
           body = body.concat(
-            br.cond(C),
+            br.cond(C), [OP.local_set], leb(L_COND),
             linkBytes,
-            emitAlu(slotWord2, C),
+            emitSlot(C, EXIT),
             emitCountBatch(p, addr),
             C.flush(),
+            [OP.local_get], leb(L_COND),
             [OP.if_, OP.void_],
               skipJumpSplit(C, EXIT + 1, TOP + 1),
             [OP.else_],
@@ -654,7 +818,7 @@
           var Ct = new RegCache(p.reg);
           Ct.loaded = C.loaded.slice(); Ct.dirty = C.dirty.slice();
           body = body.concat(
-            emitAlu(slotWord2, Ct),
+            emitSlot(Ct, EXIT + 1),
             emitCountBatch(p, addr),
             Ct.flush(),
             skipJumpSplit(Ct, EXIT + 1, TOP + 1),
@@ -666,6 +830,7 @@
           C.invalidate();
         }
         stats.nativeBranches++;
+        if (slotMem) stats.nativeMemSlots++;
         i += 2;
         continue;
       }
@@ -708,6 +873,7 @@
       // (d) fallback: flush, call interp op, invalidate
       var opsIdx = HEAPU32[instrPtr >> 2];
       body = body.concat(
+        bump(mnem(word) + (brReason ? '@' + brReason : '')),
         C.flushAndInvalidate(),
         storeI32Const(p.pcGlobal, instrPtr),
         [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
@@ -719,27 +885,34 @@
     }
     body = body.concat(
       C.flush(),
+      bump('#exit:fallthrough'),
       storeI32Const(p.pcGlobal, p.entryPtr + p.span * p.stride)
     );
 
-    var full = [0x04, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F,  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target
+    var full = [0x05, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7F,  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target, i32 branch-cond
       OP.block, OP.void_,
       OP.loop, OP.void_]
-      .concat(body,
+      .concat(bump('#block-iter'), body,
       [OP.end, OP.end, OP.end]);
 
-    var typeSec = section(1, [].concat(leb(1), [0x60, 0x00, 0x00]));
-    var importSec = section(2, [].concat(leb(2),
+    // census adds one imported host func "e"."c" (type 1: (i32)->()), which
+    // takes function index 0 and pushes the defined block function to 1
+    var cen = !!census.on;
+    var typeSec = section(1, cen
+      ? [].concat(leb(2), [0x60, 0x00, 0x00], [0x60, 0x01, 0x7F, 0x00])
+      : [].concat(leb(1), [0x60, 0x00, 0x00]));
+    var importSec = section(2, [].concat(leb(cen ? 3 : 2),
       [1, 0x65, 1, 0x74, 0x01, 0x70, 0x00, 0x00],
-      [1, 0x65, 1, 0x6D, 0x02, 0x00, 0x00]));
+      [1, 0x65, 1, 0x6D, 0x02, 0x00, 0x00],
+      cen ? [1, 0x65, 1, 0x63, 0x00, 0x01] : []));
     var funcSec = section(3, [].concat(leb(1), leb(0)));
-    var exportSec = section(7, [].concat(leb(1), [1, 0x66, 0x00], leb(0)));
+    var exportSec = section(7, [].concat(leb(1), [1, 0x66, 0x00], leb(cen ? 1 : 0)));
     var codeSec = section(10, [].concat(leb(1), leb(full.length), full));
     var bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]
       .concat(typeSec, importSec, funcSec, exportSec, codeSec));
     try {
       var mod = new WebAssembly.Module(bytes);
-      var inst = new WebAssembly.Instance(mod, { e: { t: Module.wasmTable, m: Module.wasmMemory } });
+      var inst = new WebAssembly.Instance(mod, { e: { t: Module.wasmTable, m: Module.wasmMemory, c: censusBump } });
       var key = p.vaddr >>> 0;
       var idx = slotByVaddr[key];
       if (idx !== undefined) {
@@ -761,5 +934,13 @@
     }
   }
 
-  window.bementalMips = { compileSpan: compileSpan, stats: stats };
+  // census(): [[key, executions], ...] sorted by executions desc. Empty when
+  // the session was not started in census mode.
+  function censusDump() {
+    var out = [];
+    for (var i = 0; i < census.names.length; i++) out.push([census.names[i], census.counts[i] >>> 0]);
+    out.sort(function (a, b) { return b[1] - a[1]; });
+    return out;
+  }
+  window.bementalMips = { compileSpan: compileSpan, stats: stats, census: censusDump, censusOn: function () { return !!census.on; } };
 })();

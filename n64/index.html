@@ -110,6 +110,19 @@
     #mobileSplash button#mobileSplashStart { background: #2a6b4a; border-color: #2a6b4a; cursor: pointer; z-index: 3000; position: relative; }
     #mobileSplash .rotateTip { font-size: 12px; opacity: 0.55; margin-top: 8px; }
     #mobileStatus { position: absolute; top: 10px; width: 100%; text-align: center; color: #888; z-index: 3000; font-size: 12px; }
+    /* Diagnostics. The buttons are pinned OUTSIDE the scroller and the VERDICT block is pinned
+       above it, so a screenshot taken at the top of the panel carries the decisive line even
+       when the tail below it has scrolled — that eviction is what made the sister pages'
+       reports useless. */
+    #diagPanel { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.88); z-index: 4000; align-items: center; justify-content: center; padding: 12px; box-sizing: border-box; }
+    #diagPanel.open { display: flex; }
+    #diagBox { background: #151515; color: #ddd; border: 1px solid #333; border-radius: 10px; width: min(760px, 96vw); max-height: 92vh; display: flex; flex-direction: column; padding: 14px; box-sizing: border-box; }
+    #diagBox h6 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: 2px; color: #888; text-align: center; }
+    #diagVerdict { flex: 0 0 auto; background: #241f10; border: 1px solid #5a4a1a; color: #f2d98a; border-radius: 6px; padding: 8px 10px; font-size: 12px; font-family: monospace; white-space: pre-wrap; margin-bottom: 8px; user-select: text; -webkit-user-select: text; }
+    #diagText { flex: 1 1 auto; overflow: auto; margin: 0; font-size: 10.5px; line-height: 1.35; font-family: monospace; white-space: pre-wrap; background: #0a0a0a; border: 1px solid #2a2a2a; border-radius: 6px; padding: 8px; color: #bbb; user-select: text; -webkit-user-select: text; }
+    #diagActions { flex: 0 0 auto; display: flex; gap: 8px; margin-top: 10px; }
+    #diagActions button { flex: 1; padding: 10px; border: 1px solid #444; background: #2c2c2c; color: #eee; border-radius: 6px; font-size: 13px; cursor: pointer; }
+    #diagActions #diagShare { background: #2a6b4a; border-color: #2a6b4a; }
     #n64Stubs { display: none !important; }
   </style>
 </head>
@@ -126,6 +139,7 @@
     <button id="btnFull" disabled>⛶ Fullscreen</button>
     <button id="btnRemap" type="button">⌨ Remap</button>
     <button id="btnLog" type="button">Toggle Log</button>
+    <button id="btnDiag" type="button">🩺 Diagnostics</button>
   </div>
   <div id="canvasDiv"><canvas id="canvas" width="640" height="480"></canvas></div>
   <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
@@ -148,6 +162,7 @@
     <label for="mobileRomSelect">Choose a game</label>
     <select id="mobileRomSelect"></select>
     <button id="mobileSplashStart" type="button">Start</button>
+    <button id="mobileSplashDiag" type="button" style="min-width:0;padding:8px 14px;font-size:13px;background:#1d1d1d;border-color:#333;color:#aaa">🩺 Diagnostics</button>
     <p class="rotateTip">Rotate to landscape for the best view.</p>
   </div>
   <div id="mobileScreen"></div>
@@ -183,6 +198,7 @@
       <button id="mGhost">Transparent Controls: Off</button>
       <button id="mHide">Hide Controls: Off</button>
       <button id="mRemap">Remap Controls</button>
+      <button id="mDiag">🩺 Diagnostics</button>
       <button id="mFull" disabled>Fullscreen</button><button id="mClose">Close</button>
     </div>
   </div>
@@ -201,6 +217,678 @@
     </div>
   </div>
 </div>
+<div id="diagPanel">
+  <div id="diagBox">
+    <h6>N64 diagnostics</h6>
+    <div id="diagVerdict"></div>
+    <pre id="diagText"></pre>
+    <div id="diagActions">
+      <button id="diagShare" type="button">Share report</button>
+      <button id="diagCopy" type="button">Copy</button>
+      <button id="diagClose" type="button">Close</button>
+    </div>
+  </div>
+</div>
+<script>
+// ======================== N64Rate — the page's rate model, in ONE testable place ============
+// [rate-meter 2026-08-29] The status bar used to read "FPS: 52" and nothing else. That number
+// is the wrapped-requestAnimationFrame callback rate — the HOST refresh — so it answered a
+// question nobody was asking, and it could not distinguish "the emulator is slow", "this game
+// renders 25 frames a second on purpose" and "the tab has wedged". Every one of those looks
+// like a smaller number.
+//
+// This file is the whole rate model, as a factory with an INJECTED clock and injected counter
+// readings, so the live page and the ?ratetest=1 self-test drive the SAME code:
+//
+//   http://localhost:8080/n64/?ratetest=1
+//
+// runs the suite against synthetic timings AND against two REAL captures taken off this page
+// (a PAL title and an NTSC one), with no emulator, no ROM and no GPU. A simulation OF a
+// protocol drifts from the protocol; one that CALLS it cannot.
+window.N64Rate = (function () {
+  'use strict';
+
+  // ---- PRODUCER 1: the audio ring == the guest clock -------------------------------------
+  // The core resamples the game's AI output to a FIXED 44100 Hz — audio_backend_libretro.c:157,
+  // `ratio = 44100.0 / GameFreq` — and writes stereo int16 into a 64000-entry ring
+  // (:184-192, `neilAudioWritePosition`), read out by `neilGetAudioWritePosition()` (:235).
+  // 44100 Hz x 2 channels = 88200 entries per EMULATED second, so entries-per-WALL-second
+  // divided by 88200 IS emulated-time over wall-time. Nothing about it depends on the host
+  // refresh, the frame limiter, or how many frames got painted.
+  var AUDIO_ENTRIES_PER_GUEST_SEC = 88200;
+  var AUDIO_RING = 64000;
+  // 64000 / 88200 = 725.6 ms. THE RING WRAPS IN LESS THAN A SECOND AT 1.000x. A reader that
+  // samples once a second and takes (cur - prev + 64000) % 64000 silently loses a whole wrap
+  // and turns 88200 into 24200 — it reports "0.27x" on a perfectly healthy emulator running at
+  // exactly hardware speed. tools/n64_boot_test.mjs:76-82 samples at 100 ms for precisely this
+  // reason. So a gap longer than this is not a slow window, it is an UNRESOLVABLE one, and it
+  // is dropped rather than integrated. (?ratetest=1 test A4 feeds the real 1.000x capture at
+  // 1 s spacing and asserts the model refuses it instead of reporting 0.27x.)
+  var AUDIO_MAX_GAP_MS = 300;
+  // Below this much accumulated span, dividing is noise amplification, not measurement.
+  var AUDIO_MIN_SPAN_MS = 400;
+
+  // ---- PRODUCER 2: VI interrupts == emulated video fields ---------------------------------
+  // `_neil_vi_total()` (libretronew.c:453) counts non-flip retro_return calls, and
+  // libretronew.c:480 bumps it exactly once per VI interrupt. One retro_run is one VI frame
+  // (n64/docs/jit/README.md:66), which the captures confirm outright: `_neil_frame_cost_n`
+  // and `_neil_vi_total` are EQUAL in all 243 sampled rows of both captures below.
+  //
+  // The VI field rate is NOT 60. It is 50 on a PAL cartridge, and mariokart.z64 in this page's
+  // own ROMS[] is country code 0x50 ('P') — PAL. Measured against a hardcoded 60 it reads
+  // 0.833x while the audio witness reads 1.002x on the same window; against its real 50 it
+  // reads 1.000x and the two agree. The region therefore comes from the ROM HEADER, using the
+  // core's own table (rom.c:76-99, destination_code at header 0x3E per m64p_types.h:190), and
+  // there is NO default: with no header read, viHz is null and every VI-derived number is
+  // omitted rather than guessed.
+  var PAL_CODES = { 0x44: 1, 0x46: 1, 0x49: 1, 0x50: 1, 0x53: 1, 0x55: 1, 0x58: 1, 0x59: 1 };
+
+  // ---- PRODUCER 3: the core's own frame counters, read out of its heap --------------------
+  // `limitFPS()` (mymain.cpp:1371-1394) sprintf()s "FPS: %d GameFPS: %d" into the static
+  // `fps_text` buffer once per WALL second, unconditionally — `showFPS` only gates whether the
+  // string gets drawn on the canvas (mymain.cpp:1205), not whether it is written. `FPS` is the
+  // retro_run/VI rate; `GameFPS` is `swapCount`, the count of DISTINCT frames the game
+  // produced (mymain.cpp:1220, bumped once per ready-to-swap).
+  //
+  // The page finds the buffer by scanning the heap for the FORMATTED text, because the core
+  // exports no accessor for it (a two-line `neil_swap_total` export would remove this scan
+  // entirely, but the toolchain that built the shipped dist — emsdk 3.1.67 — is no longer
+  // installed; see the report). The pair is read as a RATIO, gameFps/hostFps, so it is immune
+  // to the page's own sampling: both halves come from the same 1-second window inside the core.
+  var CORE_FPS_RE = /^FPS: (\d+) GameFPS: (\d+)/;
+
+  // ---- THE TARGET -------------------------------------------------------------------------
+  // 120 producible frames a second. NOT 120 presented: at 1.000x only `gameHz` distinct frames
+  // per second EXIST, so re-presenting one to make a counter read 120 is a fabricated number.
+  // And the hardware multiple 120 costs is PER TITLE: Super Mario 64 renders ~0.47 frames per
+  // NTSC field (measured below: "FPS: 60 GameFPS: 28") = ~28 fps, needing 4.3x; PAL Mario Kart
+  // renders 26 per 52 fields = 25 fps, needing 4.8x. A 60 fps title needs 2.0x. Quoting one
+  // target for all of them understates a 30 fps game by exactly 2x, so `gameHz` is MEASURED
+  // and the verdict is OMITTED when it has not been measured yet.
+  var TARGET_FPS = 120;
+  var GAME_RATE_WARMUP = 3;   // windows of real frame production before any per-title verdict
+  var DISAGREE_RUN = 3;       // consecutive disagreeing windows before the witnesses are called out
+
+  function num(n, d) {
+    return (n === null || n === undefined || !isFinite(n)) ? '--' : n.toFixed(d || 0);
+  }
+
+  // Region straight out of the ROM header, mirroring rom.c:76-110 including the .v64/.n64
+  // byte orders (all 27 ROMs in this page's list are .z64, but a dropped file need not be).
+  function regionFromRom(bytes) {
+    if (!bytes || bytes.length < 0x40) return null;
+    var b = bytes, sig = (b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]) >>> 0, off;
+    if (sig === 0x80371240) off = 0x3E;        // .z64 native big-endian
+    else if (sig === 0x37804012) off = 0x3F;   // .v64 byte-swapped
+    else if (sig === 0x40123780) off = 0x3C;   // .n64 word-swapped
+    else return null;
+    var code = b[off];
+    return { code: code, pal: !!PAL_CODES[code], viHz: PAL_CODES[code] ? 50 : 60 };
+  }
+
+  // Wrapped ring delta. Only ever called on gaps the caller has already bounded.
+  function ringDelta(cur, prev) {
+    var d = (cur | 0) - (prev | 0);
+    if (d < 0) d += AUDIO_RING;
+    return d;
+  }
+
+  // u32 monotonic counter delta, wrap-safe.
+  function u32Delta(cur, prev) { return ((cur >>> 0) - (prev >>> 0)) >>> 0; }
+
+  function parseCoreFps(text) {
+    if (typeof text !== 'string') return null;
+    var m = CORE_FPS_RE.exec(text);
+    if (!m) return null;
+    return { hostFps: +m[1], gameFps: +m[2] };
+  }
+
+  // ---- the model --------------------------------------------------------------------------
+  function makeRate(cfg) {
+    cfg = cfg || {};
+    var s = {
+      viHz: (cfg.viHz > 0) ? cfg.viHz : null,
+      // Overridable ONLY so ?ratetest=1 can build a deliberately-broken twin and show what the
+      // guard is worth on real data (test A4b). The page never passes them.
+      maxGapMs: (cfg.maxGapMs > 0) ? cfg.maxGapMs : AUDIO_MAX_GAP_MS,
+      minSpanMs: (cfg.minSpanMs > 0) ? cfg.minSpanMs : AUDIO_MIN_SPAN_MS,
+      // audio integrator
+      aPos: null, aT: 0, aEntries: 0, aSpanMs: 0, aGaps: 0, aDrops: 0,
+      // window marks
+      mT: null, mVi: null, mCostMs: null, mCostN: null,
+      gameFrac: null, gameFracN: 0, windows: 0, seams: 0, started: false, disagreeRun: 0
+    };
+
+    s.setViHz = function (hz) { s.viHz = (hz > 0) ? hz : null; };
+    s.relatch = function () {
+      s.aPos = null; s.aEntries = 0; s.aSpanMs = 0;
+      s.mT = null; s.mVi = null; s.mCostMs = null; s.mCostN = null;
+    };
+
+    // Fast path, called every ~200 ms: integrate the audio ring. Returns true when the
+    // interval was usable, false when it was dropped (see AUDIO_MAX_GAP_MS).
+    s.audioSample = function (pos, t) {
+      if (pos === null || pos === undefined || !isFinite(pos) || pos < 0 || pos >= AUDIO_RING) return false;
+      if (s.aPos === null) { s.aPos = pos | 0; s.aT = t; return true; }
+      var dt = t - s.aT;
+      if (!(dt >= 0) || dt > s.maxGapMs) {
+        // Unresolvable: at least one whole ring wrap could hide in here. Drop the INTERVAL —
+        // both its entries and its time — so the running average stays honest.
+        s.aGaps++; s.aDrops += 1; s.aPos = pos | 0; s.aT = t; return false;
+      }
+      s.aEntries += ringDelta(pos, s.aPos);
+      s.aSpanMs += dt;
+      s.aPos = pos | 0; s.aT = t;
+      return true;
+    };
+
+    // Slow path, called every ~1 s. `o` carries the raw counter readings.
+    //   o.vi       _neil_vi_total()
+    //   o.costMs   _neil_frame_cost_ms()   (monotonic accumulator)
+    //   o.costN    _neil_frame_cost_n()    (monotonic accumulator)
+    //   o.coreFps  parseCoreFps(<fps_text from the heap>) or null
+    //   o.shown    host presents this window (wrapped-RAF count)
+    //   o.arm      name of an active measurement arm, or null/'' for the shipped path
+    s.window = function (t, o) {
+      o = o || {};
+      var r = {
+        speed: null, speedFrom: null, audioSpeed: null, viSpeed: null, disagree: false,
+        viHz: s.viHz, gameHz: null, gameFrac: s.gameFrac, gameFracN: s.gameFracN,
+        costMs: null, capVi: null, hwX: null, capFps: null,
+        shown: (o.shown === undefined ? null : o.shown),
+        made: (o.coreFps ? o.coreFps.gameFps : null),
+        arm: o.arm || null, starved: false, ahead: false, seam: false, silent: false,
+        audioGaps: s.aGaps, windows: s.windows
+      };
+
+      // ---- audio witness (region-independent) ----
+      // The accumulator is reset on EVERY window, not just on the windows that published, so
+      // the audio span always sits INSIDE the same interval the VI delta covers. Letting a
+      // short span roll forward made the two witnesses measure overlapping-but-different
+      // intervals, and a single stalled second then read as a 7.6% "disagreement" on a healthy
+      // run. A window whose usable span is too short simply has no audio reading; VI carries it.
+      if (s.aSpanMs >= s.minSpanMs) {
+        r.audioSpeed = (s.aEntries / (s.aSpanMs / 1000)) / AUDIO_ENTRIES_PER_GUEST_SEC;
+        r.silent = (s.aEntries === 0);
+      }
+      r.audioSpanMs = s.aSpanMs;
+      s.aEntries = 0; s.aSpanMs = 0;
+
+      // ---- VI witness (needs the region) ----
+      var first = (s.mT === null);
+      var dtSec = first ? 0 : (t - s.mT) / 1000;
+      if (!first && !(dtSec > 0)) { r.seam = true; s.relatch(); return r; }
+      if (!first && s.viHz && o.vi !== undefined && o.vi !== null) {
+        r.viSpeed = (u32Delta(o.vi, s.mVi) / dtSec) / s.viHz;
+      }
+      // ---- CPU-side capacity, straight from the core's own retro_run timer ----
+      // `timed_retro_run` (mymain.cpp:903-909) accumulates the wall ms spent INSIDE retro_run.
+      // One retro_run is one VI frame, so 1000/mean-cost is the rate at which this machine
+      // could produce guest frames back to back — real headroom, and it stays measurable even
+      // while the governor is sleeping (which is exactly when a throttle-inference method goes
+      // blind). It excludes GPU and compositor time, so it is an UPPER bound on CPU-side
+      // production; the ?turbo=2 arm is what cross-checks it.
+      if (!first && o.costN !== undefined && o.costN !== null && o.costMs !== undefined) {
+        var dn = u32Delta(o.costN, s.mCostN), dms = o.costMs - s.mCostMs;
+        if (dn > 0 && dms >= 0) {
+          r.costMs = dms / dn;
+          if (r.costMs > 0) {
+            r.capVi = 1000 / r.costMs;
+            if (s.viHz) r.hwX = r.capVi / s.viHz;
+          }
+        }
+      }
+
+      s.mT = t; s.mVi = o.vi; s.mCostMs = o.costMs; s.mCostN = o.costN;
+      if (first) return r;
+
+      // ---- pick a witness. Audio first, because it needs no region; VI when the game is
+      // silent (loading screens, muted title cards) so the meter does not read "0.00x" on an
+      // emulator that is running perfectly. ----
+      if (r.audioSpeed !== null && r.audioSpeed > 0.01) { r.speed = r.audioSpeed; r.speedFrom = 'audio'; }
+      else if (r.viSpeed !== null) { r.speed = r.viSpeed; r.speedFrom = 'vi'; }
+
+      // A savestate load replaces the timeline and a torn read invents one; either way this is
+      // a seam, not a speed.
+      if (r.speed !== null && r.speed > 8) { s.seams++; r.seam = true; r.speed = null; r.speedFrom = null; s.relatch(); return r; }
+
+      if (r.speed === null) return r;
+      if (r.speed === 0 && !s.started) return r;   // core hasn't been asked to run yet
+      s.started = true; s.windows++;
+
+      // Integrity check: the two witnesses measure the SAME quantity by different routes, so a
+      // persistent disagreement means one input is wrong (almost always: the wrong region).
+      // It has to PERSIST. A wrong region is a standing ~20% error on every window; one noisy
+      // window is scheduler jitter, and flagging that would train the reader to ignore the flag.
+      if (r.audioSpeed !== null && r.viSpeed !== null && r.audioSpeed > 0.05) {
+        var hi = Math.max(r.audioSpeed, r.viSpeed);
+        s.disagreeRun = (hi > 0 && Math.abs(r.audioSpeed - r.viSpeed) / hi > 0.05) ? (s.disagreeRun + 1) : 0;
+      } else s.disagreeRun = 0;
+      r.disagreeRun = s.disagreeRun;
+      r.disagree = s.disagreeRun >= DISAGREE_RUN;
+
+      // ---- the game's OWN frame rate, measured, never assumed ----
+      // gameFps/hostFps is the fraction of VI fields on which this title draws a new picture
+      // (0.5 for Mario Kart, ~0.47 falling to ~0.33 in heavy Super Mario 64 scenes). Both come
+      // from the same 1-second window inside the core, so the ratio survives any sampling skew
+      // on this side. gameHz is that fraction at hardware field rate.
+      if (o.coreFps && o.coreFps.hostFps > 0) {
+        var frac = o.coreFps.gameFps / o.coreFps.hostFps;
+        if (frac > 0 && frac <= 1.5) {
+          s.gameFrac = (s.gameFrac === null) ? frac : (s.gameFrac * 0.7 + frac * 0.3);
+          s.gameFracN++;
+        }
+      }
+      r.gameFrac = s.gameFrac; r.gameFracN = s.gameFracN;
+      // WARM-UP. In the first seconds a title is on a logo or a black screen and genuinely draws
+      // almost nothing: one such window measured 3 fps and the bar announced "needs 38.7x hw",
+      // which is true of that second and useless as a verdict. Nothing per-title is published
+      // until the game has been producing frames for a few windows. This gates gameHz itself, so
+      // every number derived from it (capFps, the whole 120 verdict) is gated with it.
+      if (s.gameFrac !== null && s.viHz && s.gameFracN >= GAME_RATE_WARMUP) r.gameHz = s.gameFrac * s.viHz;
+      if (r.gameHz !== null && r.hwX !== null) r.capFps = r.gameHz * r.hwX;
+
+      r.starved = !r.arm && r.speed < 0.98;
+      // GATE #9: the shipped path must run the guest at EXACTLY 1.000x. Running it FASTER is
+      // not a win, it is a bug, and it has to be visible as one rather than read as headroom.
+      r.ahead = !r.arm && r.speed > 1.02;
+      return r;
+    };
+    return s;
+  }
+
+  // ---- the 120 verdict, per title ---------------------------------------------------------
+  function gapText(r) {
+    if (!r || r.speed === null || r.speed === undefined) return null;
+    var hz = r.gameHz;
+    if (hz === null || hz === undefined || !isFinite(hz) || hz <= 0) return null;
+    var needHw = TARGET_FPS / hz;
+    var arm = r.arm ? ' [' + r.arm + ' arm]' : '';
+    var cap = r.capFps;
+    if (cap === null || cap === undefined || !isFinite(cap) || cap <= 0)
+      return '120 needs ' + num(needHw, 1) + 'x hw (capacity not measured)';
+    if (cap >= TARGET_FPS) return '120 REACHED (' + num(cap / TARGET_FPS, 2) + 'x)' + arm;
+    return num(TARGET_FPS / cap, 1) + 'x short of 120 (needs ' + num(needHw, 1) + 'x hw)' + arm;
+  }
+
+  // The status-bar headline, as a PURE function of the rate object, so the self-test asserts
+  // the exact text the user reads rather than a number that merely resembles it.
+  function format(r) {
+    if (!r) return 'speed --  ·  cap --';
+    var parts = [
+      'speed ' + (r.speed === null || r.speed === undefined ? '--' : num(r.speed, 2) + 'x')
+        + (r.speedFrom ? ' ' + r.speedFrom : '')
+        + (r.arm ? ' ' + r.arm.toUpperCase() : '')
+        + (r.starved ? ' SLOW' : '')
+        + (r.ahead ? ' AHEAD OF HW' : ''),
+      (r.capFps === null || r.capFps === undefined)
+        ? ((r.hwX === null || r.hwX === undefined) ? 'cap --' : 'cap ' + num(r.hwX, 2) + 'x hw')
+        : num(r.capFps) + ' fps cap (' + num(r.hwX, 2) + 'x hw)'
+    ];
+    var g = gapText(r);
+    if (g) parts.push(g);
+    parts.push(num(r.shown) + ' shown / ' + num(r.made) + ' made');
+    if (r.disagree) parts.push('WITNESSES DISAGREE');
+    return parts.join('  ·  ');
+  }
+
+  return {
+    AUDIO_ENTRIES_PER_GUEST_SEC: AUDIO_ENTRIES_PER_GUEST_SEC,
+    AUDIO_RING: AUDIO_RING, AUDIO_MAX_GAP_MS: AUDIO_MAX_GAP_MS,
+    AUDIO_MIN_SPAN_MS: AUDIO_MIN_SPAN_MS, TARGET_FPS: TARGET_FPS,
+    regionFromRom: regionFromRom, ringDelta: ringDelta, u32Delta: u32Delta,
+    parseCoreFps: parseCoreFps, makeRate: makeRate, format: format, gapText: gapText, num: num
+  };
+})();
+</script>
+<script>
+// ======================== ?ratetest=1 — assertions that can actually fail ====================
+// Every test here drives the SAME makeRate/format/gapText the live status bar drives. Two
+// kinds:
+//   S* synthetic — exact arithmetic against generated counter rows.
+//   A* real capture — 200 ms counter rows recorded off THIS page on 2026-08-29 (PAL Mario
+//      Kart and NTSC Super Mario 64, /tmp/n64-cap-*.json). A synthetic suite can only prove
+//      the model is self-consistent; these prove it recovers the right answer from what the
+//      core actually emitted, wraps and jitter included.
+//
+// The load-bearing ones are the discriminators, each of which fails if a specific guard is
+// removed: S2/A4 (ring-wrap gap guard), S3/A2 (region from the ROM header, not 60),
+// S7/S9 (per-title 120 target, never a default), S4 (silent-game fallback), S10 (gate #9).
+N64Rate.selfTest = function (logFn) {
+  var pass = 0, fail = 0, lines = [];
+  function log(s) {
+    lines.push(s);
+    if (logFn) { try { logFn(s); } catch (e) {} }
+    try { console.log(s); } catch (e) {}
+  }
+  function ck(name, ok, detail) {
+    if (ok) { pass++; log('RATETEST PASS  ' + name + (detail ? '   ' + detail : '')); }
+    else { fail++; log('RATETEST FAIL  ' + name + '   ' + detail); }
+  }
+  function near(a, b, tol) { return a !== null && a !== undefined && isFinite(a) && Math.abs(a - b) <= tol; }
+  function fx(v, d) { return (v === null || v === undefined || !isFinite(v)) ? String(v) : v.toFixed(d === undefined ? 3 : d); }
+  function last(a) { return a[a.length - 1]; }
+
+  // Counter rows in the capture's own shape: [t, audioPos, vi, costMsTotal, costN, fps_text]
+  function synth(o) {
+    o = o || {};
+    var speed = (o.speed === undefined) ? 1 : o.speed;
+    var viHz = o.viHz || 60, step = o.stepMs || 200, dur = (o.durMs === undefined) ? 6000 : o.durMs;
+    var frac = (o.gameFrac === undefined) ? 0.5 : o.gameFrac;
+    var costMs = (o.costMs === undefined) ? 8 : o.costMs;
+    var vi0 = o.vi0 || 0, rows = [];
+    for (var t = 0; t <= dur; t += step) {
+      var gsec = (t / 1000) * speed;
+      var vi = o.frozen ? vi0 : vi0 + Math.round(gsec * viHz);
+      var aud = o.silent ? 1234 : (Math.round(gsec * N64Rate.AUDIO_ENTRIES_PER_GUEST_SEC) % N64Rate.AUDIO_RING);
+      var cn = o.freezeCost ? vi0 : vi;
+      var cms = o.freezeCost ? 0 : (vi - vi0) * costMs;
+      var hostFps = Math.round(viHz * speed), gameFps = Math.round(hostFps * frac);
+      rows.push([t, aud, vi >>> 0, cms, cn >>> 0,
+                 o.noFpsText ? null : ('FPS: ' + hostFps + ' GameFPS: ' + gameFps)]);
+    }
+    return rows;
+  }
+
+  // Drives rows through the real model exactly the way the page does: audioSample() on every
+  // row, window() once per winMs.
+  function drive(rows, cfg, winMs) {
+    cfg = cfg || {};
+    var m = N64Rate.makeRate(cfg), out = [], lastWin = null;
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i], t = r[0];
+      m.audioSample(r[1], t);
+      if (lastWin === null || (t - lastWin) >= (winMs || 1000)) {
+        out.push(m.window(t, { vi: r[2], costMs: r[3], costN: r[4],
+                               coreFps: N64Rate.parseCoreFps(r[5]),
+                               shown: cfg.shown === undefined ? 60 : cfg.shown, arm: cfg.arm || null }));
+        lastWin = t;
+      }
+    }
+    out.model = m;
+    return out;
+  }
+
+  log('RATETEST ---- n64/index.html rate model self-test (?ratetest=1) ----');
+
+  // ===== S1. The shipped case: guest at exactly hardware speed, sampled inside the ring =====
+  var s1 = drive(synth({ speed: 1, viHz: 60, costMs: 8 }), { viHz: 60 });
+  var L1 = last(s1);
+  ck('S1a 1.000x guest reads 1.00x', near(L1.speed, 1, 0.02), 'speed=' + fx(L1.speed));
+  ck('S1b the witness used is the audio ring (region-independent)', L1.speedFrom === 'audio', 'from=' + L1.speedFrom);
+  ck('S1c both witnesses agree, so no disagreement flag', L1.disagree === false && near(L1.viSpeed, 1, 0.02),
+     'audio=' + fx(L1.audioSpeed) + ' vi=' + fx(L1.viSpeed));
+  ck('S1d at hardware speed the page is NOT flagged slow and NOT flagged ahead',
+     L1.starved === false && L1.ahead === false, 'starved=' + L1.starved + ' ahead=' + L1.ahead);
+  ck('S1e headline opens "speed 1.00x audio"',
+     N64Rate.format(L1).indexOf('speed 1.00x audio') === 0, N64Rate.format(L1));
+
+  // ===== S2. THE RING-WRAP TRAP =============================================================
+  // 64000 entries / 88200 per guest second = 725.6 ms. Sample once a second at 1.000x and the
+  // naive wrapped delta reports 24200 instead of 88200. Both arms below are fed IDENTICAL
+  // 1.000x data; only the guard differs.
+  var s2rows = synth({ speed: 1, viHz: 60, stepMs: 1000, durMs: 8000 });
+  var s2good = last(drive(s2rows, { viHz: 60 }));
+  var s2bad = last(drive(s2rows, { viHz: 60, maxGapMs: 60000 }));   // guard defeated
+  ck('S2a with the guard, 1 s sampling is REFUSED by the audio witness (not integrated)',
+     s2good.audioSpeed === null, 'audioSpeed=' + fx(s2good.audioSpeed));
+  ck('S2b ...and the meter still reports 1.00x, via the VI witness',
+     near(s2good.speed, 1, 0.03) && s2good.speedFrom === 'vi',
+     'speed=' + fx(s2good.speed) + ' from=' + s2good.speedFrom);
+  ck('S2c WITHOUT the guard the same 1.000x data reads ~0.27x — this is what the guard buys',
+     near(s2bad.audioSpeed, 0.274, 0.05), 'unguarded audioSpeed=' + fx(s2bad.audioSpeed));
+
+  // ===== S3. Region comes from the cartridge, never from a 60 default ========================
+  var s3rows = synth({ speed: 1, viHz: 50, gameFrac: 0.5 });     // a PAL title at 1.000x
+  var s3pal = last(drive(s3rows, { viHz: 50 }));
+  var s3ntsc = last(drive(s3rows, { viHz: 60 }));                // the hardcoded-60 bug
+  ck('S3a PAL title measured against its own 50 Hz reads 1.00x',
+     near(s3pal.viSpeed, 1, 0.02) && s3pal.disagree === false, 'vi=' + fx(s3pal.viSpeed));
+  ck('S3b the SAME title measured against 60 reads 0.83x — the bug the header read prevents',
+     near(s3ntsc.viSpeed, 0.833, 0.03), 'vi=' + fx(s3ntsc.viSpeed));
+  ck('S3c ...and the model FLAGS the two witnesses disagreeing rather than picking one',
+     s3ntsc.disagree === true, 'disagree=' + s3ntsc.disagree + ' audio=' + fx(s3ntsc.audioSpeed) + ' vi=' + fx(s3ntsc.viSpeed));
+  ck('S3d PAL 25 fps title needs 4.8x hw for 120, NOT the 2.0x a 60 fps title needs',
+     (N64Rate.gapText(s3pal) || '').indexOf('needs 4.8x hw') >= 0, N64Rate.gapText(s3pal));
+
+  // ===== S4. A silent game must not read 0.00x ==============================================
+  var s4 = last(drive(synth({ speed: 1, viHz: 60, silent: true }), { viHz: 60 }));
+  ck('S4a audio ring frozen => the audio witness reports 0 and is marked silent',
+     s4.silent === true && near(s4.audioSpeed, 0, 0.001), 'audio=' + fx(s4.audioSpeed) + ' silent=' + s4.silent);
+  ck('S4b ...and the meter falls back to VI instead of publishing "0.00x"',
+     near(s4.speed, 1, 0.02) && s4.speedFrom === 'vi', 'speed=' + fx(s4.speed) + ' from=' + s4.speedFrom);
+
+  // ===== S5/S6. Capacity from the core's own retro_run timer =================================
+  var s5 = last(drive(synth({ speed: 1, viHz: 60, costMs: 8 }), { viHz: 60 }));
+  ck('S5a 8 ms per VI frame => 125 producible VI frames/s', near(s5.capVi, 125, 2), 'capVi=' + fx(s5.capVi, 1));
+  ck('S5b ...which is 2.08x hardware at 60 Hz fields', near(s5.hwX, 125 / 60, 0.05), 'hwX=' + fx(s5.hwX, 2));
+  ck('S5c a 30 fps title with 2.08x hw can produce ~62 fps, not 125',
+     near(s5.capFps, 30 * 125 / 60, 3), 'gameHz=' + fx(s5.gameHz, 1) + ' capFps=' + fx(s5.capFps, 1));
+  var s6 = last(drive(synth({ speed: 1, viHz: 60, freezeCost: true }), { viHz: 60 }));
+  ck('S6 with the cost timer not advancing, cap is "--" — never 0 and never Infinity',
+     s6.capVi === null && N64Rate.format(s6).indexOf('cap --') >= 0, 'capVi=' + fx(s6.capVi) + ' | ' + N64Rate.format(s6));
+
+  // ===== S7. The 120 target is per title ====================================================
+  function verdict(gameHz, capFps) {
+    return N64Rate.gapText({ speed: 1, gameHz: gameHz, capFps: capFps, arm: null }) || '';
+  }
+  ck('S7a a 60 fps title needs 2.0x hw for 120', verdict(60, 30).indexOf('needs 2.0x hw') >= 0, verdict(60, 30));
+  ck('S7b a 30 fps title needs 4.0x hw for 120 (2x more than the 60 fps title)',
+     verdict(30, 30).indexOf('needs 4.0x hw') >= 0, verdict(30, 30));
+  ck('S7c a 20 fps title needs 6.0x hw for 120', verdict(20, 30).indexOf('needs 6.0x hw') >= 0, verdict(20, 30));
+  ck('S7d the shortfall is quoted against producible frames, not against the target',
+     verdict(30, 30).indexOf('4.0x short of 120') === 0, verdict(30, 30));
+  ck('S8 capacity at or past 120 reads REACHED with the multiple',
+     verdict(60, 132).indexOf('120 REACHED (1.10x)') === 0, verdict(60, 132));
+  // ===== S9. No measured game rate => NO verdict (never one derived from an assumed 60) =====
+  var s9 = last(drive(synth({ speed: 1, viHz: 60, noFpsText: true }), { viHz: 60 }));
+  ck('S9a with no GameFPS reading, gameHz stays null', s9.gameHz === null, 'gameHz=' + fx(s9.gameHz));
+  ck('S9b ...so the 120 verdict is OMITTED rather than computed against a default',
+     N64Rate.gapText(s9) === null && N64Rate.format(s9).indexOf('120') < 0, String(N64Rate.gapText(s9)));
+
+  // ===== S10/S11/S12. Gate #9: the guest runs at 1.000x, and arms are stamped ================
+  var s10 = last(drive(synth({ speed: 1.2, viHz: 60 }), { viHz: 60 }));
+  ck('S10a guest running FASTER than hardware with no arm is flagged as a bug',
+     s10.ahead === true, 'speed=' + fx(s10.speed) + ' ahead=' + s10.ahead);
+  ck('S10b ...and says so in the headline', N64Rate.format(s10).indexOf('AHEAD OF HW') >= 0, N64Rate.format(s10));
+  var s11 = last(drive(synth({ speed: 2, viHz: 60, costMs: 4 }), { viHz: 60, arm: 'turbo2' }));
+  ck('S11a a declared measurement arm at 2.00x is NOT flagged as a bug',
+     s11.ahead === false && near(s11.speed, 2, 0.05), 'speed=' + fx(s11.speed) + ' ahead=' + s11.ahead);
+  ck('S11b ...but the headline stamps it so it can never be read as shipped headroom',
+     N64Rate.format(s11).indexOf('TURBO2') >= 0, N64Rate.format(s11));
+  ck('S11c ...and the 120 verdict carries the stamp too',
+     (N64Rate.gapText(s11) || '').indexOf('[turbo2 arm]') >= 0, String(N64Rate.gapText(s11)));
+  var s12 = last(drive(synth({ speed: 0.5, viHz: 60, costMs: 33 }), { viHz: 60 }));
+  ck('S12a a half-speed guest is flagged SLOW', s12.starved === true && near(s12.speed, 0.5, 0.03),
+     'speed=' + fx(s12.speed) + ' starved=' + s12.starved);
+  ck('S12b ...and capacity reports the ~30/s the machine can actually do',
+     near(s12.capVi, 1000 / 33, 3), 'capVi=' + fx(s12.capVi, 1));
+
+  // ===== S21. The disagreement flag must not cry wolf =======================================
+  // Caught by the LIVE meter pass, not by this suite's first cut: one stalled second on a
+  // healthy PAL run read audio=0.967 vs vi=1.047 and the bar announced WITNESSES DISAGREE.
+  // The cause was the two witnesses integrating over different spans; the guard is that the
+  // disagreement must PERSIST, because a wrong region is a standing error, not a blip.
+  var m21 = N64Rate.makeRate({ viHz: 60 });
+  var s21rows = synth({ speed: 1, viHz: 60 });
+  var s21 = drive(s21rows, { viHz: 60 });
+  ck('S21a a clean 1.000x run never flags a disagreement',
+     s21.every(function (w) { return w.disagree === false; }), 'runs=' + s21.map(function (w) { return w.disagreeRun; }).join(','));
+  // One injected bad window, then healthy again.
+  var m21b = N64Rate.makeRate({ viHz: 60 });
+  m21b.window(0, { vi: 0, costMs: 0, costN: 0 });
+  var blip = [];
+  for (var k21 = 1; k21 <= 4; k21++) {
+    for (var j21 = 0; j21 < 5; j21++) m21b.audioSample((Math.round((k21 - 1 + j21 / 5) * 88200) % 64000), (k21 - 1) * 1000 + j21 * 200);
+    // window 2 gets a VI count 20% short — one bad second
+    var viN = (k21 === 2) ? Math.round(60 * k21 * 0.85) : 60 * k21;
+    blip.push(m21b.window(k21 * 1000, { vi: viN, costMs: 8 * 60 * k21, costN: 60 * k21, coreFps: { hostFps: 60, gameFps: 30 } }));
+  }
+  ck('S21b a single bad window does NOT raise the flag',
+     blip.every(function (w) { return w.disagree === false; }),
+     'runs=' + blip.map(function (w) { return w.disagreeRun; }).join(','));
+  // ...but the sustained wrong-region error still does (A2b, on real data, is the other half).
+  ck('S21c a SUSTAINED wrong region still raises it',
+     last(drive(synth({ speed: 1, viHz: 50 }), { viHz: 60 })).disagree === true, '');
+
+  // S21d: THE SPAN BOUND. Found by mutation: the synthetic rows above are perfectly regular, so
+  // nothing exercised a window whose usable audio span is SHORT. Under a stalling main thread
+  // (intervals longer than the ring guard get dropped) an accumulator that only resets on
+  // publish keeps rolling, and eventually divides entries collected over five windows by one
+  // window's VI delta. The audio span must always sit inside the interval it is compared to.
+  (function () {
+    var rows = [], t21 = 0, steps = [200, 200, 400, 400], vi21 = 0;
+    for (var i = 0; i < 60; i++) {
+      var gsec = t21 / 1000;
+      rows.push([t21, Math.round(gsec * N64Rate.AUDIO_ENTRIES_PER_GUEST_SEC) % N64Rate.AUDIO_RING,
+                 Math.round(gsec * 60), Math.round(gsec * 60) * 8, Math.round(gsec * 60), 'FPS: 60 GameFPS: 30']);
+      t21 += steps[i % 4];
+    }
+    var jit = drive(rows, { viHz: 60 });
+    var worst = Math.max.apply(null, jit.map(function (w) { return w.audioSpanMs || 0; }));
+    ck('S21d under a stalling main thread the audio span never outgrows the window it is compared to',
+       worst <= 1000 + N64Rate.AUDIO_MAX_GAP_MS,
+       'worst audioSpanMs=' + worst + ' (bound ' + (1000 + N64Rate.AUDIO_MAX_GAP_MS) + ')');
+  })();
+
+  // ===== S20. Warm-up: no per-title verdict off a boot-logo second ==========================
+  // A title on its logo genuinely draws ~3 frames a second. One such window made the bar
+  // announce "needs 38.7x hw" — true of that second, useless as a verdict.
+  var s20rows = synth({ speed: 1, viHz: 60, gameFrac: 0.5, durMs: 6000 });
+  var s20 = drive(s20rows, { viHz: 60 });
+  ck('S20a the FIRST reporting window publishes no game rate and no 120 verdict',
+     s20[0].gameHz === null && N64Rate.gapText(s20[0]) === null,
+     'gameFracN=' + s20[0].gameFracN + ' gameHz=' + fx(s20[0].gameHz));
+  var firstPub = -1;
+  for (var i20 = 0; i20 < s20.length; i20++) if (s20[i20].gameHz !== null) { firstPub = i20; break; }
+  ck('S20b nothing per-title is published until several windows of real frame production',
+     firstPub > 0 && s20[firstPub].gameFracN >= 3 &&
+     s20.slice(0, firstPub).every(function (w) { return w.gameHz === null && N64Rate.gapText(w) === null; }),
+     'first published at window ' + firstPub + ', gameFracN=' + (firstPub >= 0 ? s20[firstPub].gameFracN : '-'));
+  ck('S20c ...and what is then published is the measured rate, 30 fps',
+     firstPub >= 0 && near(s20[firstPub].gameHz, 30, 1), 'gameHz=' + fx(firstPub >= 0 ? s20[firstPub].gameHz : null, 1));
+
+  // ===== S13/S14/S15. Seams, wraps, and the first window ====================================
+  var m13 = N64Rate.makeRate({ viHz: 60 });
+  m13.window(0, { vi: 0, costMs: 0, costN: 0 });
+  var w13 = m13.window(1000, { vi: 60 * 20, costMs: 100, costN: 60 * 20 });   // 20x in one second
+  ck('S13 a savestate-sized jump is a SEAM, not a speed', w13.seam === true && w13.speed === null,
+     'seam=' + w13.seam + ' speed=' + fx(w13.speed));
+  var m14 = N64Rate.makeRate({ viHz: 60 });
+  m14.window(0, { vi: 0xFFFFFFF0, costMs: 0, costN: 0xFFFFFFF0 });
+  var w14 = m14.window(1000, { vi: 0x0000002C, costMs: 8 * 60, costN: 0x0000002C });  // +60 across the wrap
+  ck('S14 a u32 counter wrap reads as +60, not as a 4-billion-frame jump',
+     near(w14.viSpeed, 1, 0.02), 'viSpeed=' + fx(w14.viSpeed));
+  var m15 = N64Rate.makeRate({ viHz: 60 });
+  var w15 = m15.window(0, { vi: 100, costMs: 5, costN: 100 });
+  ck('S15 the first window latches the marks and publishes nothing',
+     w15.speed === null && w15.capVi === null && N64Rate.format(w15).indexOf('speed --') === 0, N64Rate.format(w15));
+  var m19 = N64Rate.makeRate({ viHz: 60 });
+  m19.window(1000, { vi: 0, costMs: 0, costN: 0 });
+  var w19 = m19.window(500, { vi: 60, costMs: 8, costN: 60 });
+  ck('S19 a clock that went backwards is a seam, not a negative rate', w19.seam === true, 'seam=' + w19.seam);
+
+  // ===== S16. Region straight out of the ROM header (the core's own table) ===================
+  function hdr(sig, off, code) {
+    var b = new Uint8Array(64);
+    b[0] = (sig >>> 24) & 255; b[1] = (sig >>> 16) & 255; b[2] = (sig >>> 8) & 255; b[3] = sig & 255;
+    b[off] = code; return b;
+  }
+  ck('S16a z64 country 0x50 (P) => PAL 50 Hz',
+     (N64Rate.regionFromRom(hdr(0x80371240, 0x3E, 0x50)) || {}).viHz === 50, 'mariokart.z64 is this one');
+  ck('S16b z64 country 0x45 (E) => NTSC 60 Hz',
+     (N64Rate.regionFromRom(hdr(0x80371240, 0x3E, 0x45)) || {}).viHz === 60, '');
+  ck('S16c z64 country 0x44 (D, German) => PAL, per rom.c:81',
+     (N64Rate.regionFromRom(hdr(0x80371240, 0x3E, 0x44)) || {}).viHz === 50, '');
+  ck('S16d .v64 byte-swapped image reads the code at 0x3F',
+     (N64Rate.regionFromRom(hdr(0x37804012, 0x3F, 0x50)) || {}).viHz === 50, '');
+  ck('S16e .n64 word-swapped image reads the code at 0x3C',
+     (N64Rate.regionFromRom(hdr(0x40123780, 0x3C, 0x50)) || {}).viHz === 50, '');
+  ck('S16f a file that is not a ROM yields null, so nothing downstream gets a guessed region',
+     N64Rate.regionFromRom(hdr(0x12345678, 0x3E, 0x45)) === null &&
+     N64Rate.regionFromRom(new Uint8Array(8)) === null, '');
+
+  // ===== S17. Reading the core's counters out of its heap ===================================
+  ck('S17a the FORMAT STRING in rodata must NOT parse as a reading',
+     N64Rate.parseCoreFps('FPS: %d GameFPS: %d') === null &&
+     N64Rate.parseCoreFps('FPS: %d GameFPS: %d VBO') === null,
+     'both live in the heap alongside the real buffer — the scan hit them first');
+  ck('S17b the formatted buffer parses', (N64Rate.parseCoreFps('FPS: 52 GameFPS: 26') || {}).gameFps === 26, '');
+  ck('S17c the VBO variant parses too (mymain.cpp:1392)',
+     (N64Rate.parseCoreFps('FPS: 52 GameFPS: 26 VBO') || {}).gameFps === 26, '');
+  ck('S17d the angrylion variant has no GameFPS and must not half-parse',
+     N64Rate.parseCoreFps('FPS: 52') === null, '');
+
+  // ===== A. REAL CAPTURES ===================================================================
+  // 200 ms rows recorded off this page 2026-08-29 under load ~100-160.
+  // MK64_PAL: mariokart.z64, country 0x50 => 50 Hz fields, "FPS: 52 GameFPS: 26" => renders on
+  // every other field => 25 fps. SM64_NTSC: sm64.z64, country 0x45 => 60 Hz, "FPS: 60
+  // GameFPS: 28" => ~28 fps.
+  var MK64_PAL = [[11405,60358,846,12447.6,846,"FPS: 53 GameFPS: 26"],[11602,12314,855,12570.5,855,"FPS: 53 GameFPS: 26"],[11803,31748,866,12685.4,866,"FPS: 53 GameFPS: 26"],[12002,49442,876,12799.1,876,"FPS: 53 GameFPS: 26"],[12202,3032,886,12912.4,886,"FPS: 53 GameFPS: 26"],[12402,20568,896,13039.0,896,"FPS: 51 GameFPS: 26"],[12603,38210,906,13153.2,906,"FPS: 51 GameFPS: 26"],[12820,57642,917,13289.8,917,"FPS: 51 GameFPS: 26"],[13022,13076,928,13412.2,928,"FPS: 51 GameFPS: 26"],[13221,30770,938,13528.7,938,"FPS: 51 GameFPS: 26"],[13421,48464,948,13645.2,948,"FPS: 52 GameFPS: 26"],[13620,2054,958,13761.5,958,"FPS: 52 GameFPS: 26"],[13821,19590,968,13877.2,968,"FPS: 52 GameFPS: 26"],[14016,35494,977,13986.3,977,"FPS: 52 GameFPS: 26"],[14202,53190,987,14099.1,987,"FPS: 52 GameFPS: 26"],[14402,6884,997,14214.6,997,"FPS: 52 GameFPS: 26"],[14603,24526,1007,14326.4,1007,"FPS: 52 GameFPS: 26"],[14803,43906,1018,14448.4,1018,"FPS: 52 GameFPS: 26"]];
+  var SM64_NTSC = [[2409,24418,667,4724.0,667,"FPS: 57 GameFPS: 28"],[2614,42100,679,4870.0,679,"FPS: 57 GameFPS: 28"],[2808,59868,691,4989.4,691,"FPS: 60 GameFPS: 28"],[3009,13506,703,5144.7,703,"FPS: 60 GameFPS: 28"],[3208,31186,715,5277.1,715,"FPS: 60 GameFPS: 28"],[3414,48822,727,5422.2,727,"FPS: 60 GameFPS: 28"],[3608,1048,738,5560.5,738,"FPS: 60 GameFPS: 28"],[3808,18686,750,5715.2,750,"FPS: 59 GameFPS: 28"],[4009,36366,762,5866.6,762,"FPS: 59 GameFPS: 28"],[4213,52548,773,5987.0,773,"FPS: 59 GameFPS: 28"],[4414,6228,785,6137.9,785,"FPS: 59 GameFPS: 28"],[4608,23864,797,6282.5,797,"FPS: 59 GameFPS: 28"],[4809,41546,809,6427.9,809,"FPS: 60 GameFPS: 28"],[5015,59270,821,6573.6,821,"FPS: 60 GameFPS: 28"],[5213,12952,833,6725.7,833,"FPS: 60 GameFPS: 28"],[5408,30720,845,6865.4,845,"FPS: 60 GameFPS: 28"],[5608,46858,856,6995.7,856,"FPS: 60 GameFPS: 28"],[5843,582,868,7200.2,868,"FPS: 59 GameFPS: 28"]];
+
+  // A0: the invariant the whole capacity calculation rests on — one retro_run is one VI frame.
+  var a0 = MK64_PAL.concat(SM64_NTSC).every(function (r) { return r[2] === r[4]; });
+  ck('A0 in 36 captured rows, _neil_frame_cost_n == _neil_vi_total exactly (one retro_run == one VI)',
+     a0 === true, 'so 1000/mean-retro_run-cost IS producible VI frames/s');
+
+  var a1 = drive(MK64_PAL, { viHz: 50 });
+  var A1 = last(a1);
+  ck('A1a real PAL capture measured against its own 50 Hz reads 1.00x',
+     near(A1.speed, 1.01, 0.05) && A1.speedFrom === 'audio', 'speed=' + fx(A1.speed) + ' from=' + A1.speedFrom);
+  ck('A1b the audio and VI witnesses agree on real data (independent routes, same answer)',
+     A1.disagree === false && near(A1.audioSpeed - A1.viSpeed, 0, 0.01),
+     'audio=' + fx(A1.audioSpeed) + ' vi=' + fx(A1.viSpeed));
+  ck('A1c the ring wrapped 5 times inside this capture and the integrator survived it',
+     near(A1.audioSpeed, 1.01, 0.05), 'audio=' + fx(A1.audioSpeed));
+
+  // A2: the same real rows, region taken as 60 — what a hardcoded default would have shipped.
+  var A2 = last(drive(MK64_PAL, { viHz: 60 }));
+  ck('A2a assuming 60 Hz on this real PAL capture reports 0.85x for a guest at 1.00x',
+     near(A2.viSpeed, 0.845, 0.03), 'vi=' + fx(A2.viSpeed) + ' (audio still ' + fx(A2.audioSpeed) + ')');
+  ck('A2b the disagreement flag fires on the real data, not just on synthetic data',
+     A2.disagree === true, 'disagree=' + A2.disagree);
+
+  ck('A3a the real capture recovers the game\'s own rate: 26 frames per 52 fields at 50 Hz => 25 fps',
+     near(A1.gameHz, 25.3, 1), 'gameHz=' + fx(A1.gameHz, 1) + ' frac=' + fx(A1.gameFrac));
+  ck('A3b ...so this title needs 4.8x hardware for 120, not the 2.0x a 60 fps title needs',
+     (N64Rate.gapText(A1) || '').indexOf('needs 4.8x hw') >= 0, N64Rate.gapText(A1));
+  ck('A3c capacity on the captured machine: ~1.7x hw => ~43 producible fps',
+     near(A1.hwX, 1.72, 0.15) && near(A1.capFps, 43.5, 4),
+     'costMs=' + fx(A1.costMs, 2) + ' hwX=' + fx(A1.hwX, 2) + ' capFps=' + fx(A1.capFps, 1));
+
+  // A4: the real 1.000x capture, sampled once a second — the exact shape of the ring bug.
+  var mk1s = MK64_PAL.filter(function (_, i) { return i % 5 === 0; });
+  var A4 = last(drive(mk1s, { viHz: 50 }));
+  var A4bad = last(drive(mk1s, { viHz: 50, maxGapMs: 60000 }));
+  ck('A4a on REAL 1.000x rows sampled at 1 s, the guard refuses the audio witness and VI carries it',
+     A4.audioSpeed === null && near(A4.speed, 1.01, 0.05) && A4.speedFrom === 'vi',
+     'speed=' + fx(A4.speed) + ' from=' + A4.speedFrom);
+  ck('A4b the same real rows WITHOUT the guard read ~0.29x — a 3.4x under-report of a healthy emulator',
+     near(A4bad.audioSpeed, 0.29, 0.06), 'unguarded audioSpeed=' + fx(A4bad.audioSpeed));
+
+  var A5 = last(drive(SM64_NTSC, { viHz: 60 }));
+  ck('A5a real NTSC capture reads ~0.99x', near(A5.speed, 0.99, 0.05), 'speed=' + fx(A5.speed));
+  ck('A5b witnesses agree to better than 1% on real NTSC data',
+     A5.disagree === false && near(A5.audioSpeed - A5.viSpeed, 0, 0.01),
+     'audio=' + fx(A5.audioSpeed) + ' vi=' + fx(A5.viSpeed));
+  ck('A5c Super Mario 64 renders 28 of every 60 fields => ~28 fps, a DIFFERENT target from Mario Kart',
+     near(A5.gameHz, 28, 1.5) && Math.abs(A5.gameHz - A1.gameHz) > 2,
+     'sm64 gameHz=' + fx(A5.gameHz, 1) + ' vs mk64 gameHz=' + fx(A1.gameHz, 1));
+  ck('A5d ...needing 4.3x hardware for 120', (N64Rate.gapText(A5) || '').indexOf('needs 4.3x hw') >= 0,
+     N64Rate.gapText(A5));
+
+  // A6: the headline the user actually reads, built from real captured numbers.
+  var head = N64Rate.format(A1);
+  ck('A6 the real-capture headline carries speed, capacity, the per-title 120 gap and the counts',
+     head.indexOf('speed 1.0') === 0 && head.indexOf('fps cap') > 0 &&
+     head.indexOf('short of 120') > 0 && head.indexOf('shown /') > 0, head);
+
+  var summary = 'RATETEST ' + (fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + pass + ' passed, ' + fail + ' failed';
+  log(summary);
+  return { pass: pass, fail: fail, lines: lines, summary: summary };
+};
+</script>
 <script>
 (function () {
   'use strict';
@@ -246,17 +934,329 @@
     selects.forEach(function (sel) { sel.addEventListener('change', function () { localStorage.setItem('n64wasm_romIdx', sel.value); selects.forEach(function (s) { if (s !== sel) s.value = sel.value; }); }); });
   })();
   const logEl = $('log'), statusEl = $('status'), mobileStatusEl = $('mobileStatus'), fpsEl = $('fps'), toastEl = $('toast');
-  function pageLog(s) { if (logEl) { logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; } console.log(s); }
+
+  // ---- diagnostics store ------------------------------------------------------------------
+  // A rolling log tail structurally CANNOT carry the crux, and both sister pages were bitten by
+  // it: the line that decides the diagnosis (here, "is there a WebGL2 context and on what GPU")
+  // is printed once, earliest, and is the first thing evicted. So the interesting lines are
+  // SNIFFED as they go past and pinned in a store nothing evicts, and "how far did it get" is
+  // stamped as milestones — a freeze before the first frame and a freeze in-game look identical
+  // in a screenshot of the last 15 lines.
+  var T0 = Date.now();
+  var marks = [], facts = Object.create(null), counters = Object.create(null);
+  function mark(name) { marks.push({ t: Date.now() - T0, name: name }); if (marks.length > 64) marks.splice(1, 1); }
+  function bump(k) { counters[k] = (counters[k] | 0) + 1; }
+  function sniff(s) {
+    if (typeof s !== 'string') return;
+    if (s.indexOf('[gl]') === 0) facts[s.slice(0, 12)] = s;
+    if (s.indexOf('[rate]') === 0 && s.indexOf('heap 0x') >= 0) facts.rateCounters = s;
+    if (s.indexOf('[jit]') === 0 && s.indexOf('canary') >= 0) facts.jitCanary = s;
+    if (s.indexOf('[abort]') === 0) { bump('abort'); if (!facts.abort) facts.abort = s; }
+    // printErr is the core's ORDINARY stderr, not an error channel: a healthy Mario Kart boot
+    // sends three "ReadSpecialSettings: ..." lines through it. Only failure-shaped lines are
+    // promoted to a fact, or the verdict headlines a scary non-problem on every clean run.
+    if (s.indexOf('[core-err]') === 0 && /abort|assert|exception|failed|cannot|unable|invalid|out of memory/i.test(s)) {
+      bump('coreErr'); if (!facts.coreErr) facts.coreErr = s;
+    }
+    if (s.indexOf('[err]') === 0) { bump('pageErr'); if (!facts.pageErr) facts.pageErr = s; }
+    if (/CONTEXT_LOST|context lost/i.test(s)) { bump('glContextLost'); facts.glLost = s; }
+    if (/out of memory|Array buffer allocation failed|allocation size overflow|RangeError/i.test(s)) {
+      bump('memoryPressure'); if (!facts.memoryPressure) facts.memoryPressure = s;
+    }
+    if (/Starting R4300 emulator/.test(s)) mark('r4300-started');
+  }
+  var logTail = [], LOG_TAIL_MAX = 300;
+  function pageLog(s) {
+    sniff(s);
+    if (logEl) { logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; }
+    logTail.push(s); if (logTail.length > LOG_TAIL_MAX) logTail.splice(0, logTail.length - LOG_TAIL_MAX);
+    console.log(s);
+  }
   function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
   function toast(msg, isErr) { toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200); }
   const isMobile = (() => { const ua = navigator.userAgent.toLowerCase(); return /iphone|ipad|ipod|android|mobile|xbox/.test(ua) || ('ontouchstart' in window) || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile'); })();
 
-  // Host-loop FPS: the core runs one mainLoop per requestAnimationFrame tick
-  // (emscripten_set_main_loop in mymain.cpp), so wrapped-RAF callback rate ==
-  // effective emulator speed. Installed before any emulator script loads.
+  // ---- capability probe, run on EVERY load before anything can fail -----------------------
+  // The N64 core is linked -s MIN_WEBGL_VERSION=2 -s FULL_ES3=1 (N64Wasm/code/Makefile:187-188)
+  // and asks for ONE 512 MB WebAssembly.Memory (-s TOTAL_MEMORY=536870912, Makefile:185). If
+  // either is unavailable the page dies with nothing on screen, and console-only logging is
+  // invisible to somebody holding a phone. So the page measures both itself, up front, and pins
+  // the result where a screenshot of the top of the panel carries it.
+  function safe(fn, dflt) { try { var v = fn(); return (v === undefined || v === null) ? dflt : v; } catch (_) { return dflt; } }
+  var glFacts = { webgl2: false };
+  (function glProbe() {
+    if (new URLSearchParams(location.search).has('noglprobe')) { glFacts.skipped = true; return; }
+    try {
+      var c = document.createElement('canvas'); c.width = c.height = 1;
+      var gl = c.getContext('webgl2', { alpha: false, antialias: false, depth: true, stencil: false });
+      glFacts.webgl2 = !!gl;
+      if (!gl) {
+        glFacts.webgl1 = !!(c.getContext('webgl') || c.getContext('experimental-webgl'));
+        return;
+      }
+      var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      glFacts.vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+      glFacts.renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+      glFacts.version = gl.getParameter(gl.VERSION);
+      glFacts.glsl = gl.getParameter(gl.SHADING_LANGUAGE_VERSION);
+      glFacts.maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+      glFacts.maxRb = gl.getParameter(gl.MAX_RENDERBUFFER_SIZE);
+      glFacts.maxTexUnits = gl.getParameter(gl.MAX_COMBINED_TEXTURE_IMAGE_UNITS);
+      glFacts.maxViewport = (gl.getParameter(gl.MAX_VIEWPORT_DIMS) || []).join('x');
+      // glide2gl renders through a colour+depth FBO; a driver can advertise WebGL2 and still
+      // refuse to complete one. Measure it rather than assuming.
+      var fb = gl.createFramebuffer(), tx = gl.createTexture(), rb = gl.createRenderbuffer();
+      gl.bindTexture(gl.TEXTURE_2D, tx);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 320, 240, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.bindRenderbuffer(gl.RENDERBUFFER, rb);
+      gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, 320, 240);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tx, 0);
+      gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb);
+      glFacts.fboComplete = (gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE);
+      glFacts.glError = gl.getError();
+      var lose = gl.getExtension('WEBGL_lose_context'); if (lose) lose.loseContext();
+    } catch (e) { glFacts.error = String(e).slice(0, 200); }
+  })();
+  // 512 MB heap probe. Deliberately LAZY — allocating half a gigabyte on every page view could
+  // itself be the thing that makes the real allocation fail on a tight device, which is the
+  // "the probe is the bug" trap. It runs only when a report is built and the core has not
+  // started, i.e. exactly the pre-Start baseline report the bug protocol asks for.
+  var memProbe = null;
+  function probeHeap() {
+    if (memProbe !== null) return memProbe;
+    if (started) { memProbe = 'not run (core already started)'; return memProbe; }
+    try {
+      var m = new WebAssembly.Memory({ initial: 8192, maximum: 8192 });  // 8192 x 64 KB = 512 MB
+      memProbe = m ? 'granted 512 MB' : 'REFUSED';
+      m = null;
+    } catch (e) { memProbe = 'REFUSED: ' + String(e).slice(0, 120); }
+    return memProbe;
+  }
+  var VENDOR_DEPS = { jQuery: () => !!window.jQuery, rivets: () => !!window.rivets, toastr: () => !!window.toastr, FileSaver: () => !!window.saveAs };
+  function glLine() {
+    if (glFacts.skipped) return '[gl] probe skipped (?noglprobe)';
+    if (!glFacts.webgl2) return '[gl] WebGL2 = NO' + (glFacts.webgl1 ? ' (WebGL1 present)' : ' (no WebGL at all)')
+      + (glFacts.error ? ' err=' + glFacts.error : '');
+    return '[gl] WebGL2 = yes  gpu=' + glFacts.vendor + ' / ' + glFacts.renderer
+      + '\n[gl] limits maxTex=' + glFacts.maxTex + ' maxRb=' + glFacts.maxRb + ' texUnits=' + glFacts.maxTexUnits
+      + ' maxViewport=' + glFacts.maxViewport
+      + '\n[gl] colour+depth FBO completes = ' + (glFacts.fboComplete ? 'yes' : 'NO')
+      + '  glError=' + glFacts.glError + '  ' + glFacts.version;
+  }
+  function envLine() {
+    var n = navigator, yn = (v) => (v ? 'yes' : 'NO');
+    return '[env] ' + n.userAgent
+      + '\n[env] AudioWorklet=' + yn(typeof AudioWorklet === 'function')
+      + ' IndexedDB=' + yn(typeof indexedDB !== 'undefined')
+      + ' WebAssembly=' + yn(typeof WebAssembly === 'object')
+      + ' crossOriginIsolated=' + yn(self.crossOriginIsolated) + ' (this page does NOT need it)'
+      + '\n[env] window=' + window.innerWidth + 'x' + window.innerHeight
+      + ' screen=' + screen.width + 'x' + screen.height + ' dpr=' + (window.devicePixelRatio || 1)
+      + ' cores=' + (n.hardwareConcurrency || '?')
+      + ' deviceMemory=' + (n.deviceMemory === undefined ? '?' : n.deviceMemory + 'GB')
+      + ' jsHeapLimit=' + safe(() => (performance.memory.jsHeapSizeLimit >>> 20) + 'MB', '?')
+      + ' orientation=' + safe(() => screen.orientation.type, '?')
+      + '\n[env] self-hosted UI deps present: '
+      + Object.keys(VENDOR_DEPS).map((k) => k + '=' + yn(VENDOR_DEPS[k]())).join(' ');
+  }
+  // The pinned verdict. It names the most likely cause FIRST, because the top of the panel is
+  // the part that survives a screenshot.
+  function verdictLine() {
+    if (glFacts.skipped) return '>> GPU PROBE SKIPPED (?noglprobe) — no GPU evidence in this report.';
+    if (!glFacts.webgl2) return '>> NO WEBGL2 ON THIS DEVICE. The N64 core is linked MIN_WEBGL_VERSION=2 '
+      + '(N64Wasm/code/Makefile:187) and cannot start without it. This is almost certainly the whole story.';
+    if (glFacts.fboComplete === false) return '>> WEBGL2 PRESENT BUT A COLOUR+DEPTH FRAMEBUFFER DOES NOT COMPLETE. '
+      + 'glide2gl renders through exactly that; expect a black or garbage picture.';
+    if (counters.glContextLost) return '>> WEBGL CONTEXT WAS LOST (' + counters.glContextLost + 'x). '
+      + 'The picture freezes or goes black and the emulator keeps running underneath.';
+    if (facts.abort) return '>> THE CORE ABORTED. ' + facts.abort;
+    if (counters.memoryPressure) return '>> MEMORY PRESSURE OBSERVED. The core asks for one 512 MB heap; '
+      + 'a device that cannot give it fails with no picture. ' + facts.memoryPressure;
+    if (facts.coreErr && !running) return '>> THE CORE PRINTED AN ERROR. ' + facts.coreErr;
+    if (memProbe && memProbe.indexOf('REFUSED') >= 0) return '>> THIS DEVICE REFUSED A 512 MB WEBASSEMBLY HEAP, '
+      + 'which is what the core asks for at start. ' + memProbe;
+    if (!started) return '>> NOTHING STARTED YET — this is a clean baseline report (send it anyway).';
+    if (!running) return '>> STARTED BUT NOT RUNNING YET — still downloading the ROM or booting the core.';
+    if (lastRate && lastRate.ahead) return '>> THE GUEST IS RUNNING FASTER THAN HARDWARE with no measurement arm '
+      + 'active. That is a bug, not headroom.';
+    if (lastRate && lastRate.disagree) return '>> THE TWO SPEED WITNESSES DISAGREE (audio vs VI). Usually the '
+      + 'cartridge region was misread; check the [rate] country line below.';
+    if (lastRate && lastRate.starved) return '>> RUNNING BELOW HARDWARE SPEED: ' + window.N64Rate.format(lastRate);
+    if (lastRate && lastRate.speed !== null) return '>> RUNNING AT HARDWARE SPEED: ' + window.N64Rate.format(lastRate)
+      + (facts.coreErr ? '  (the core also printed: ' + facts.coreErr + ')' : '');
+    return '>> RUNNING, no rate measured yet.';
+  }
+  function diagText() {
+    probeHeap();
+    var L = [];
+    L.push('--- VERDICT ---');
+    L.push(verdictLine());
+    L.push('');
+    L.push('--- CAPABILITY (measured by the page itself, on load) ---');
+    L.push(glLine());
+    L.push('[mem] 512 MB WebAssembly.Memory: ' + memProbe);
+    L.push(envLine());
+    L.push('');
+    L.push('--- RATE ---');
+    L.push('[rate] ' + (lastRate ? window.N64Rate.format(lastRate) : 'not measured'));
+    if (lastRate) {
+      L.push('[rate] witnesses audio=' + window.N64Rate.num(lastRate.audioSpeed, 3)
+        + ' vi=' + window.N64Rate.num(lastRate.viSpeed, 3)
+        + ' viHz=' + window.N64Rate.num(lastRate.viHz)
+        + ' gameHz=' + window.N64Rate.num(lastRate.gameHz, 1)
+        + ' costMs/frame=' + window.N64Rate.num(lastRate.costMs, 2)
+        + ' capVI/s=' + window.N64Rate.num(lastRate.capVi, 1)
+        + ' audioGaps=' + lastRate.audioGaps + ' windows=' + lastRate.windows);
+    }
+    L.push('');
+    L.push('--- PINNED FACTS (these print once and would be evicted from the tail) ---');
+    var keys = Object.keys(facts); if (!keys.length) L.push('(none)');
+    keys.forEach(function (k) { L.push(facts[k]); });
+    if (Object.keys(counters).length) L.push('[counts] ' + JSON.stringify(counters));
+    L.push('');
+    L.push('--- HOW FAR IT GOT ---');
+    L.push(marks.map(function (m) { return '+' + (m.t / 1000).toFixed(1) + 's ' + m.name; }).join('\n') || '(no milestones)');
+    L.push('');
+    L.push('--- LAST ' + logTail.length + ' LOG LINES ---');
+    L.push(logTail.join('\n'));
+    return L.join('\n');
+  }
+  function openDiag() {
+    var t = diagText();
+    $('diagVerdict').textContent = verdictLine();
+    $('diagText').textContent = t;
+    $('diagPanel').classList.add('open');
+  }
+  function closeDiag() { $('diagPanel').classList.remove('open'); }
+  function flashBtn(b, msg) { var o = b.textContent; b.textContent = msg; setTimeout(function () { b.textContent = o; }, 1600); }
+  function copyDiag(b) {
+    var t = diagText();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(t).then(function () { flashBtn(b, '✓ Copied'); },
+        function () { flashBtn(b, 'No clipboard — screenshot instead'); });
+    } else flashBtn(b, 'No clipboard — screenshot instead');
+  }
+  mark('page-script-start');
+
+  // ---- the rate meter ---------------------------------------------------------------------
+  // Presents. The core runs one mainLoop per requestAnimationFrame tick
+  // (emscripten_set_main_loop(mainLoop, 0, 0), mymain.cpp:741, reached because this page forces
+  // disableAudioSync at :383 below), and mainLoopInner returns early unless IsFrameReady()
+  // allows it (mymain.cpp:914). So this counter is bounded by the DISPLAY REFRESH and can never
+  // show headroom — which is why it used to be the whole readout and told the user nothing.
+  // It is kept as "shown", one term of four.
   var rafTicks = 0;
   (function wrapRaf() { var o = window.requestAnimationFrame.bind(window); window.requestAnimationFrame = function (cb) { return o(function (t) { rafTicks++; cb(t); }); }; })();
-  setInterval(function () { if (running) { fpsEl.textContent = 'FPS: ' + rafTicks; } rafTicks = 0; }, 1000);
+
+  var rate = window.N64Rate.makeRate({});
+  var lastRate = null;
+  var romRegion = null;           // set from the ROM header in loadRom()
+  var activeArm = null;           // set by ?turbo=2 etc; null on the shipped path
+  // Address of the core's `fps_text` buffer in its heap, found by scanning (see N64Rate
+  // PRODUCER 3). Not hardcoded: it is above 158 MB in a 512 MB heap and there is no guarantee
+  // it lands there in every build.
+  var fpsTextAt = null, fpsMiss = 0, lastScanAt = 0;
+
+  function scanForFpsText() {
+    try {
+      if (!window.Module || !Module.HEAPU8) return null;
+      var H = Module.HEAPU8, dec = new TextDecoder('latin1');
+      var CH = 1 << 22, RE = /^FPS: \d+ GameFPS: \d+/;
+      for (var base = 0; base < H.length; base += CH) {
+        var s = dec.decode(H.subarray(base, Math.min(base + CH + 64, H.length)));
+        var i = -1;
+        while ((i = s.indexOf('FPS: ', i + 1)) !== -1) {
+          // The rodata format strings "FPS: %d GameFPS: %d" live in this heap too and the scan
+          // reaches them FIRST (they sit near offset 21 K). The digit requirement is what makes
+          // this land on the formatted buffer instead — ?ratetest=1 S17a pins that down.
+          if (RE.test(s.slice(i, i + 40))) return base + i;
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+  function readCoreFps() {
+    if (!window.Module || !Module.HEAPU8) return null;
+    var now = Date.now();
+    if (fpsTextAt === null) {
+      if (now - lastScanAt < 4000) return null;
+      lastScanAt = now;
+      fpsTextAt = scanForFpsText();
+      if (fpsTextAt !== null) pageLog('[rate] core frame counters found at heap 0x' + fpsTextAt.toString(16));
+      else return null;
+    }
+    var H = Module.HEAPU8, e = fpsTextAt;
+    while (e < fpsTextAt + 48 && H[e] !== 0) e++;
+    var parsed = window.N64Rate.parseCoreFps(new TextDecoder('latin1').decode(H.subarray(fpsTextAt, e)));
+    // The buffer could move across a reload or a different core build; re-scan rather than
+    // silently reporting a stale game rate forever.
+    if (!parsed) { if (++fpsMiss > 5) { fpsTextAt = null; fpsMiss = 0; } return null; }
+    fpsMiss = 0;
+    return parsed;
+  }
+
+  // Fast sampler. The audio ring holds 64000 entries and wraps in 725 ms at 1.000x, so this
+  // MUST run several times a second — see N64Rate.AUDIO_MAX_GAP_MS.
+  setInterval(function () {
+    if (!running || !window.Module || !Module._neilGetAudioWritePosition) return;
+    try { rate.audioSample(Module._neilGetAudioWritePosition(), performance.now()); } catch (e) {}
+  }, 200);
+
+  function paintRate() {
+    var shown = rafTicks; rafTicks = 0;
+    if (!running || !window.Module || !Module._neil_vi_total) { if (fpsEl) fpsEl.textContent = ''; return; }
+    var r;
+    try {
+      r = rate.window(performance.now(), {
+        vi: Module._neil_vi_total(), costMs: Module._neil_frame_cost_ms(), costN: Module._neil_frame_cost_n(),
+        coreFps: readCoreFps(), shown: shown, arm: activeArm
+      });
+    } catch (e) { return; }
+    lastRate = r;
+    if (fpsEl) {
+      fpsEl.textContent = window.N64Rate.format(r);
+      fpsEl.title =
+        'speed  = emulated time / wall time. Witness: the core resamples game audio to a fixed '
+        + '44100 Hz, so 88200 int16/s IS 1.000x (audio_backend_libretro.c:157). Cross-checked '
+        + 'against VI interrupts at this cartridge\'s field rate.\n'
+        + 'cap    = producible capacity: 1000 / mean wall-ms inside retro_run '
+        + '(mymain.cpp:903-909). One retro_run is one VI frame. CPU-side only — it excludes GPU '
+        + 'and compositor time.\n'
+        + '120    = 120 PRODUCIBLE frames/s, per title. This cartridge: '
+        + (r.viHz ? r.viHz + ' Hz fields' : 'region unknown')
+        + (r.gameHz ? ', game renders ' + window.N64Rate.num(r.gameHz, 1) + ' fps' : '') + '.\n'
+        + 'shown  = host presents (requestAnimationFrame). Bounded by the display refresh; it is '
+        + 'not capacity.\nmade   = distinct frames the game actually produced this second.';
+    }
+    window.__n64Rate = r;
+  }
+  setInterval(paintRate, 1000);
+
+  // ?ratetest=1 — run the rate model against synthetic timings AND two real captures, with no
+  // emulator, no ROM and no GPU. Results go to the on-page log (forced open so a phone can
+  // screenshot them), to the console, and to window.__n64RateTest for the harness.
+  var RATETEST = new URLSearchParams(location.search).has('ratetest');
+  if (RATETEST) {
+    logEl.style.display = 'block';
+    setStatus('Rate-model self-test — no emulator started.');
+    window.__n64RateTest = window.N64Rate.selfTest(pageLog);
+    if (fpsEl) fpsEl.textContent = window.__n64RateTest.summary;
+  }
+
+  // ?turbo=2 — THE CAPACITY CROSS-CHECK, and a measurement arm only (CLAUDE.md gate #9).
+  // `_neil_set_double_speed(1)` makes mainLoop call mainLoopInner TWICE and skips the
+  // IsFrameReady governor entirely (mymain.cpp:894-901 and the `!doubleSpeed` term at :914), so
+  // the GUEST runs at up to 2x hardware. That is forbidden on the shipped path and is never the
+  // default here; its only job is to confirm that the `cap` number derived from retro_run cost
+  // is real — if cap says >= 2.0x hw and this arm does not hold 2.00x, cap is over-reporting.
+  var TURBO = +(new URLSearchParams(location.search).get('turbo') || 0);
+  function applyTurbo() {
+    if (TURBO !== 2 || !window.Module || !Module._neil_set_double_speed) return;
+    Module._neil_set_double_speed(1);
+    activeArm = 'turbo2';
+    pageLog('[rate] MEASUREMENT ARM turbo=2: guest allowed to run at 2x hardware. Not the shipped path.');
+  }
 
   // N64 pad state owned by the page (touch overlay + anything routed through dispatchKey).
   // Delivery is core-pulled: in mobile mode the wasm calls
@@ -364,6 +1364,7 @@
       pageLog('> ' + text);
       if (String(text).indexOf('Starting R4300 emulator') !== -1) {
         running = true;
+        mark('running');
         setStatus('Running.');
       }
     };
@@ -461,6 +1462,7 @@
       Module._neil_diff_enable(1);
       pageLog('[jit] diff trace enabled');
     }
+    applyTurbo();
     if (pendingRom) { var r = pendingRom; pendingRom = null; loadRom(r); }
   }
 
@@ -508,9 +1510,13 @@
     }
     // modes: 'emit' (default — bementalJIT native MIPS emitter),
     //        'v05' (per-block module, call_indirect to entry op only),
-    //        'wrap' (v0 JS call-through)
+    //        'wrap' (v0 JS call-through),
+    //        'nofp' (emit, FP emission disabled — perf attribution arm),
+    //        'census' (emit + runtime execution census — COUNTING arm only,
+    //                  never a timing arm: it adds a host-call per fallback)
     var mode = qs.get('jit') || 'emit';
     if (mode === 'nofp') { window.__jitNoFP = true; mode = 'emit'; }
+    if (mode === 'census') { window.__jitCensus = true; mode = 'emit'; }
     if (mode !== 'wrap' && mode !== 'v05') mode = 'emit';
     var wrapped = 0, calls = 0, canaryFired = 0, instantiateFail = 0;
     function ping() { canaryFired++; if (canaryFired === 1) pageLog('[jit] canary: native block module EXECUTED'); }
@@ -562,8 +1568,15 @@
     };
     window.__jitStats = function () {
       var s = { mode: mode, wrapped: wrapped, calls: calls, canaryFired: canaryFired, instantiateFail: instantiateFail };
-      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; s.distinctSlots = e.distinctSlots; s.slotReuses = e.slotReuses; }
+      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeMemSlots = e.nativeMemSlots; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; s.distinctSlots = e.distinctSlots; s.slotReuses = e.slotReuses; }
       return s;
+    };
+    // ?jit=census dump: [[bucket, executions], ...] ranked. Buckets are
+    // mnemonics for generic interpreter fallbacks, SLOW:<mnem> for native
+    // memory ops that took the off-RDRAM arm, CU1MISS:<mnem>, and #-prefixed
+    // structural counters (#block-iter, #backedge, #exit:*, #gen_interrupt).
+    window.__jitCensusDump = function () {
+      return (window.bementalMips && window.bementalMips.censusOn()) ? window.bementalMips.census() : null;
     };
     // sync-compile size-limit probe (M1 open question): padded empty modules
     window.__jitProbeSyncLimit = function () {
@@ -609,6 +1622,7 @@
   }
 
   async function loadRom(rom) {
+    mark('rom-fetch');
     setStatus('Downloading ' + rom.label + '…');
     try {
       var resp = await fetch('../roms/' + rom.file);
@@ -625,6 +1639,18 @@
       var bytes = new Uint8Array(got), off = 0;
       for (var i = 0; i < chunks.length; i++) { bytes.set(chunks[i], off); off += chunks[i].length; }
       chunks = null;
+      // The cartridge's own field rate, read out of the ROM header with the core's table
+      // (rom.c:76-99; destination_code at 0x3E, m64p_types.h:190). mariokart.z64 in the list
+      // above is country 0x50 ('P') = PAL = 50 Hz, and measuring it against an assumed 60
+      // reports 0.83x for a guest running at exactly 1.000x. There is no default: if the header
+      // does not parse, viHz stays null and every VI-derived figure is withheld.
+      mark('rom-downloaded');
+      romRegion = window.N64Rate.regionFromRom(bytes);
+      rate.setViHz(romRegion ? romRegion.viHz : 0);
+      rate.relatch();
+      facts.region = '[rate] ' + rom.file + ' country=0x' + (romRegion ? romRegion.code.toString(16).toUpperCase() : '??')
+        + ' -> ' + (romRegion ? (romRegion.pal ? 'PAL' : 'NTSC') + ' ' + romRegion.viHz + ' Hz fields' : 'UNKNOWN (VI-derived figures withheld)');
+      pageLog(facts.region);
       setStatus('Starting ' + rom.label + '…');
       // rom_name keys all saves in script.js's IndexedDB (only loadRom() sets it
       // normally, and we bypass loadRom's #romselect read). The old page's
@@ -632,6 +1658,7 @@
       // exactly or saves made on the old page would orphan.
       window.myApp.rom_name = rom.file;
       await window.myApp.LoadEmulator(bytes);
+      mark('LoadEmulator-returned');
       [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnReset'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mReset'), $('mFull')].forEach(b => b && (b.disabled = false));
     } catch (e) {
       pageLog('[rom] load failed: ' + e);
@@ -642,6 +1669,7 @@
 
   function startEmulator() {
     if (started) return; started = true;
+    mark('start-pressed');
     var sel = $('romSelect');
     var pick = ROMS[+sel.value] || ROMS[0];
     sel.disabled = true; $('btnStart').disabled = true;
@@ -677,6 +1705,7 @@
       }
       if (window.myApp && window.myApp.rivetsData && window.myApp.rivetsData.moduleInitializing === false) {
         clearInterval(poll);
+        mark('module-ready');
         onModuleReady();
         return;
       }
@@ -709,6 +1738,27 @@
   function resetGame() { if (!running) return toast('Emulator not running', true); window.Module._neil_reset(); toast('Reset'); }
   function toggleFullscreen() { var el = isMobile ? $('mobileShell') : $('canvasDiv'); if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); } else { var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.webkitRequestFullScreen; if (fn) fn.call(el).catch(() => {}); } }
   $('btnSave').addEventListener('click', saveState); $('btnLoad').addEventListener('click', loadState); $('btnMute').addEventListener('click', toggleMute); $('btnReset').addEventListener('click', resetGame); $('btnFull').addEventListener('click', toggleFullscreen); $('btnLog').addEventListener('click', () => { logEl.style.display = (logEl.style.display === 'block') ? 'none' : 'block'; });
+
+  // ---- diagnostics wiring -----------------------------------------------------------------
+  // Three entry points, because the report is worthless if it is only reachable from a state
+  // the failure prevents you from getting to: the desktop bar, the in-game mobile menu, and the
+  // mobile splash BEFORE Start (that pre-Start one is the clean baseline).
+  ['btnDiag', 'mDiag', 'mobileSplashDiag'].forEach(function (id) {
+    var b = $(id); if (!b) return;
+    b.addEventListener('click', function (e) { if (e && e.preventDefault) e.preventDefault(); closeMobileMenu(); openDiag(); });
+  });
+  $('diagClose').addEventListener('click', closeDiag);
+  $('diagCopy').addEventListener('click', function () { copyDiag(this); });
+  // The only way to get text OFF a phone and into a message is the system share sheet;
+  // clipboard is the fallback, and a screenshot of the pinned verdict is the fallback to that.
+  $('diagShare').addEventListener('click', function () {
+    var self = this, t = diagText();
+    if (navigator.share) {
+      navigator.share({ title: 'N64 diagnostic', text: t })
+        .then(function () { flashBtn(self, '✓ Shared'); })
+        .catch(function () { copyDiag(self); });
+    } else copyDiag(self);
+  });
 
   function openMobileMenu() { $('mobileMenu').classList.add('open'); } function closeMobileMenu() { $('mobileMenu').classList.remove('open'); }
   function applyGhost(on) { $('mobileShell').classList.toggle('ghost', on); if ($('mGhost')) $('mGhost').textContent = 'Transparent Controls: ' + (on ? 'On' : 'Off'); }
@@ -863,8 +1913,15 @@
       if (idx < 0 && /^\d+$/.test(g) && +g < ROMS.length) idx = +g;
       if (idx >= 0) { ['romSelect', 'mobileRomSelect'].forEach(function (id) { var s = $(id); if (s) s.value = String(idx); }); }
     }
-    if (qs.has('autostart')) { if (isMobile) $('mobileSplash').style.display = 'none'; startEmulator(); }
+    // ?ratetest=1 runs the model with NO emulator; autostart would defeat that.
+    if (qs.has('autostart') && !RATETEST) { if (isMobile) $('mobileSplash').style.display = 'none'; startEmulator(); }
   })();
+
+  // The capability facts go into the log on EVERY load, so they are in the tail as well as
+  // pinned, and so a run that never gets far enough to fail still carries them.
+  pageLog(glLine());
+  pageLog(envLine());
+  mark('page-ready');
 })();
 </script>
 </body>

@@ -10,6 +10,39 @@
 // counted too in case the config enables it. Screenshots the canvas twice to
 // classify black/static screens. Emits one JSON line on stdout.
 import puppeteer from 'puppeteer';
+import { execSync } from 'node:child_process';
+
+// Total CPU seconds burned by THIS browser's process tree (walked from the
+// launched pid -- name-matching "Google Chrome" would also catch sibling
+// agents' puppeteer probes). CPU time measures WORK, so unlike wall time it
+// survives a heavily oversubscribed box; it is still scaled by the CPU's
+// clock (see `pmset -g therm` CPU_Speed_Limit).
+function treeCpuSeconds(rootPid) {
+  try {
+    const rows = execSync('ps -Ao pid=,ppid=,time=', { encoding: 'utf8' }).trim().split('\n');
+    const kids = new Map(), cpu = new Map();
+    for (const line of rows) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)$/);
+      if (!m) continue;
+      const [, pid, ppid, t] = m;
+      const p = t.split(/[:]/).map(Number);
+      const secs = p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2] : p[0] * 60 + p[1];
+      cpu.set(+pid, secs);
+      if (!kids.has(+ppid)) kids.set(+ppid, []);
+      kids.get(+ppid).push(+pid);
+    }
+    let total = 0, stack = [rootPid];
+    const seen = new Set();
+    while (stack.length) {
+      const p = stack.pop();
+      if (seen.has(p)) continue;
+      seen.add(p);
+      total += cpu.get(p) || 0;
+      for (const k of kids.get(p) || []) stack.push(k);
+    }
+    return total;
+  } catch { return null; }
+}
 
 const rom = process.argv[2];
 const pageUrl = process.argv[3] || 'http://localhost:8080/n64/N64Wasm/dist/n64.html';
@@ -26,6 +59,13 @@ const result = {
   blackScreen: null, staticScreen: null, luminance: null,
   consoleErrors: [], coreLog: [], failedRequests: [], pageErrors: [],
   screenshot: null,
+  // Producible CAPACITY, not presented rate. speedPct cannot answer this:
+  // IsFrameReady() (mymain.cpp:818-840) pins retro_run to exactly the region
+  // rate (60 NTSC / 50 PAL) of WALL CLOCK, so a cheap title screen and
+  // saturated gameplay both read ~100%. frameCostMs is the mean wall cost of
+  // one retro_run (timed_retro_run, mymain.cpp:903-909) -- immune to the
+  // limiter. headroomX = frameBudgetMs / frameCostMs is the real multiple.
+  frameCostMs: null, frameCostN: null, headroomX: null, regionFps: null,
 };
 
 const browser = await puppeteer.launch({
@@ -80,9 +120,36 @@ try {
   });
   const r0 = await page.evaluate(() => window.__rafN);
   const a0 = await page.evaluate(() => window.__audioFrames);
+  await page.evaluate(() => { Module._neil_frame_cost_reset(); window.__fcT0 = performance.now(); });
+  const cpu0 = treeCpuSeconds(browser.process()?.pid);
   const canvas = await page.$('#canvas');
   const shot1 = canvas ? await canvas.screenshot().catch(() => null) : null;
   await new Promise((r) => setTimeout(r, MEASURE_MS));
+  const cpu1 = treeCpuSeconds(browser.process()?.pid);
+  const fc = await page.evaluate(() => ({
+    ms: Module._neil_frame_cost_ms(), n: Module._neil_frame_cost_n(),
+    el: (performance.now() - window.__fcT0) / 1000,
+  }));
+  if (fc.n > 0) {
+    result.frameCostMs = Math.round((fc.ms / fc.n) * 1000) / 1000;
+    result.frameCostN = fc.n;
+    // achieved retro_run (VI) rate -- ~60 NTSC / ~50 PAL when keeping up;
+    // an independent cross-check on the audio-derived speedPct
+    result.viRatePerSec = Math.round((fc.n / fc.el) * 10) / 10;
+    result.regionFps = result.viRatePerSec > 55 ? 60 : (result.viRatePerSec > 45 ? 50 : null);
+    const budget = 1000 / (result.regionFps || 60);
+    result.headroomX = Math.round((budget / result.frameCostMs) * 100) / 100;
+    if (cpu0 !== null && cpu1 !== null && cpu1 > cpu0) {
+      // CPU ms of real work per emulated VI frame -- the load-robust
+      // throughput number. headroomCpuX is the capacity multiple this
+      // machine WOULD deliver if the emulator got a full core.
+      result.cpuMsPerFrame = Math.round(((cpu1 - cpu0) * 1000 / fc.n) * 100) / 100;
+      result.headroomCpuX = Math.round((budget / result.cpuMsPerFrame) * 100) / 100;
+    }
+  }
+  result.cpuSpeedLimit = (() => {
+    try { return +execSync('pmset -g therm', { encoding: 'utf8' }).match(/CPU_Speed_Limit\s*=\s*(\d+)/)[1]; } catch { return null; }
+  })();
   const r1 = await page.evaluate(() => window.__rafN);
   const a1 = await page.evaluate(() => window.__audioFrames);
   result.hostFps = Math.round(((r1 - r0) / (MEASURE_MS / 1000)) * 10) / 10;

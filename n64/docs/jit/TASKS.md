@@ -11,7 +11,9 @@ build, baseline first, one change at a time.
 - [x] Vendored core rebuilds under repo emsdk 3.1.67 (two implicit-int fixes)
 - [x] Rebuilt binary boots Mario Kart headless: 98% speed, 0 page errors
 - [x] Decision: dist stays vendored until the JIT build picks flags
-      deliberately (Makefile TOTAL_MEMORY=1GB vs vendored 512MB)
+      deliberately. (Resolved: Makefile:185 is now `TOTAL_MEMORY=536870912`
+      = 512MB, matching the vendored dist — the old "Makefile is 1GB"
+      mismatch is no longer a live trap. Verified 2026-08-29.)
 
 ## M1 — funcref plumbing: one JIT block executes in-browser
 The decisive spike: prove a JS-built wasm function can be installed as a
@@ -66,13 +68,13 @@ up in measurements.
       interrupt/Count contract preserved by construction. Differential
       gate PASS ×3: mariokart 47% native ops, sm64 42%, oot 38%; zero
       emit failures; page e2e green
-- [ ] Wave 2 — branches/jumps with delay slots (biggest win: every taken
+- [x] Wave 2 (2026-06-12, 739cb17) — branches/jumps with delay slots (biggest win: every taken
       branch currently exits the block through a fallback): native
       BEQ/BNE/BLEZ/BGTZ + REGIMM, J/JAL/JR/JALR, in-block back-edges for
       hot loops, Count batch + next_interrupt<=Count poll at block tails
       (the contract decision: keep interpreter Count derivation, batch at
       tails exactly like cached_interp's DECLARE_JUMP)
-- [ ] Wave 3 — loads/stores (TLB-aware: KSEG0/KSEG1 fast path via direct
+- [x] Wave 3 (2026-06-12, db6f249) — loads/stores (TLB-aware: KSEG0/KSEG1 fast path via direct
       RDRAM offset, mapped/MMIO via fallback), LW/SW/LBU/LB/LH/LHU/SB/SH,
       then LD/SD/unaligned pairs
 - [x] Wave 4 (2026-06-12, f1d2f84): BLOCK-LOCAL REGISTER CACHE — guest
@@ -81,38 +83,156 @@ up in measurements.
       Differential green x3; speedup ratio 1.10x (from 1.01x). Design
       traps documented in the commit (deferred cond emission, throwaway
       probe clones, conservative joins)
-- [ ] Wave 5 — native stores SW/SB/SH (writemem-table runtime check +
+- [x] Wave 5 (2026-06-12, a2688cd) — native stores SW/SB/SH (writemem-table runtime check +
       CHECK_MEMORY invalid_code mirror): stores are the most frequent
       remaining fallback and each one invalidates the whole cache —
       this is the lever that lets cached registers live
-- [ ] Wave 5b — runtime per-opcode fallback census (?jitcensus) to rank
-      remaining work by EXECUTION frequency (gate #6: measured, not
-      compile-time counts)
-- [ ] Wave 6 — MULT/MULTU/DIV/DIVU + MFHI/MFLO/MTHI/MTLO (hi/lo addresses
+- [x] Wave 5b DONE 2026-08-29 — runtime per-opcode fallback census.
+      `?jit=census` + `node tools/n64_jit_census.mjs <rom> [warmupVI]
+      [windowVI] [--noinput]`. Counters are bumped through an imported host
+      func ("e"."c") because this build exports no `_malloc` (verified: a
+      page eval returned `typeof Module._malloc === "undefined"`), so there
+      is no guest-invisible scratch region for linear-memory counters. It is
+      a COUNTING arm, never a timing arm. Buckets: `<MNEM>` generic
+      fallback, `SLOW:<MNEM>` native memory op that took the off-RDRAM arm,
+      `CU1MISS:<MNEM>`, and structural `#block-iter` / `#backedge` /
+      `#exit:*` / `#gen_interrupt`. The tool snapshots the census after
+      `warmupVI`, DRIVES CONTROLLER INPUT for `windowVI` frames, and reports
+      the DELTA — so the ranking is gameplay, not boot logos (mariokart
+      reaches an actual race; screenshot /tmp/n64-census/mariokart.png).
+      Census arm is bit-identical to the interpreter (differential PASS),
+      and `?jit` / `?jit=nofp` emit byte-identical code to before.
+- [x] Wave 6 (2026-06-12, 43eb990; see the wave-6 entry below) — MULT/MULTU/DIV/DIVU + MFHI/MFLO/MTHI/MTLO (hi/lo addresses
       already in the param block); JR/JALR (dynamic targets via jump_to
       fallback exit, native condition-free form)
 - [ ] Delay-slot exception semantics: red tests for EPC/BD around lw/sw in
-      delay slots, branch-likely skip, ERET (required before Wave 2 ships)
+      delay slots, branch-likely skip, ERET. Wave 8 made this sharper, not
+      moot: its correctness rests on "an RDRAM-table hit cannot fault", so
+      the red test that matters is a TLB-mapped lw/sw IN a delay slot —
+      it must take wave 8's slow arm and hand the whole branch back. The
+      600-frame differential on 3 titles does not prove that path was
+      even reached; a targeted repro should.
 - [ ] Per-instruction conformance runner (port gamecube/tools/conformance
       shape; oracle = cached interpreter in the same binary)
-- [ ] Fallback census tooling: per-opcode counts from real gameplay to
-      drive wave priorities by measured weight (gate #6: no guessing)
+- [x] Fallback census tooling — same deliverable as wave 5b above
+      (`tools/n64_jit_census.mjs`), driven-input gameplay window.
 
-## Campaign state (2026-06-12, end of first push)
-M0-M2 COMPLETE through wave 7. The JIT is correctness-proven (every wave
+## Wave 8 (2026-08-29) — delay slots stop ending blocks
+
+The wave-5b census answered the question the campaign had been guessing at.
+Ranked by MEASURED execution frequency in a driven gameplay window (warmup
+600 VI, window 900 VI), the top fallbacks were branches, and the annotated
+buckets said exactly why — every one was `@slot:<load/store>`, not one was
+`@span-end` or `@idle`:
+
+    mariokart  BNEL@slot:SB 26.0% | BNE@slot:LHU 22.7% | BEQL@slot:LW 11.5%
+               JR@slot:SW 5.1% | BNE@slot:LW 3.5% | JR@slot:LWC1 2.4% ...
+    sm64       JAL@slot:SW 8.8% | JR@slot:SW 6.0% | BEQL@slot:LW 5.7% ...
+    oot        JR@slot:SW 14.3% | JAL@slot:SW 5.4% | BNE@slot:SW 2.2% ...
+
+Cause: wave 2 accepted a branch only when its delay slot was a pure ALU op,
+because a FAULTING slot needs `g_dev.r4300.delay_slot` set for EPC/BD and
+`skip_jump` (cached_interp.c:73-96, exception.c:143-145) and only the
+interpreter sets it. Every rejected branch fell back AND exited the block.
+
+Fix (JS-only — no core rebuild, no dist change): a memory/FP delay slot is
+emitted natively, and its RDRAM fast arm CANNOT fault (`readmem*[a>>16] ==
+read_rdram*` is a direct RDRAM access — no TLB walk, no MMIO), so
+`delay_slot` is never observed there. Every arm that COULD fault (off-RDRAM,
+CU1 clear) hands the WHOLE BRANCH back to the interpreter and exits, which
+re-runs branch+slot with the flag set. That is exact: the only guest state
+the block has written by then is the link register, and DECLARE_JUMP writes
+it the identical `SE32(addr+8)` again. See `slowArm()` in mips_emit.js.
+The branch condition also moved from the wasm stack into a local (L_COND),
+verified separately as a no-op before the slot work landed.
+
+- [x] Correctness: differential PASS x3 at 600 VI frames (mariokart, sm64,
+      oot; determinism control PASS on all three), census-arm differential
+      PASS, page e2e PASS, 0 emit failures.
+- [x] The risky arm IS covered, measured not assumed. Census buckets
+      `SLOTSLOW:<MNEM>` / `SLOTCU1MISS:<MNEM>` count specifically the
+      delay-slot bail (off-RDRAM inside a delay slot -> whole branch back to
+      the interpreter). Run over the differential's OWN window (no input,
+      VI 0-600): mariokart SLOTSLOW:SW 1,612 + SLOTSLOW:LW 567; oot 2,967 +
+      536. So the bit-identical differential exercised that path thousands
+      of times per ROM — it is not a fast-arm-only PASS. In a driven
+      gameplay window it fires at a similar rate (mariokart 2,504 + 904).
+- [x] Measured effect — fallback EXECUTIONS per block iteration, same drive
+      script, before -> after:
+        mariokart  0.849 -> 0.148   (total 4,911,185 -> 595,365, -87.9%)
+        sm64       0.614 -> 0.296   (total   776,125 -> 371,955, -52.1%)
+        oot        1.082 -> 0.742   (total 2,762,083 -> 1,838,715, -33.4%)
+      Blocks now LOOP: mariokart `#backedge` 8 -> 656,397, and block
+      iterations for the same 900-VI window fell 5,785,236 -> 4,021,195
+      (fewer dispatcher round trips). Static, near-identical corpus
+      (508 vs 509 blocks): fallback SITES 2,366 -> 648.
+      gauntletLegends is unaffected (-1.8%): its window is dominated by a
+      periodic SD/LD loop, not by branches.
+- [ ] THROUGHPUT VERDICT FOR WAVE 8 IS UNMEASURED. The A/B was attempted
+      order-alternating on 2026-08-29 and must be DISCARDED per the
+      measurement rules below: the same arm's absolute per-frame cost moved
+      ~60% between rounds (mariokart interp 15.381 vs 23.809 ms) and the
+      paired ratios contradict (mariokart 1.059 / 0.991; sm64 2.339 /
+      1.239), with load averages 15-84 and `CPU_Speed_Limit` 58-70
+      throughout. Re-run on an idle, unthrottled machine.
+
+## Next by MEASURED weight (post-wave-8 census, driven gameplay window)
+
+    mariokart  SD 32.1% | MFC0 16.4% | MTC0 14.3% | C.cond.S 12.7%
+               BC1FL 12.4% | LD 4.6% | SLOW:LW 1.9% | TRUNC.W.S 1.7%
+    sm64       MFC0 27.0% | TRUNC.W.S 23.7% | MTC0 22.1% | SD 5.7%
+               CVT.D.S 4.4% | SLOW:LW 3.0% | CVT.S.D 2.8% | CVT.S.W 2.8%
+    oot        SD 34.5% | MFC0 14.5% | MTC0 12.9% | TRUNC.W.S 8.3%
+               CVT.S.W 7.3% | C.cond.S 6.1% | BC1FL 5.1% | LD 4.9%
+    gauntlet   SD 75.0% | LD 10.4% | SLOW:SW 4.2% | SLOW:LW 4.2% | MFC0 4.2%
+
+Three classes, in measured order:
+- [ ] Wave 9 — **SD/LD (64-bit store/load)**: the single largest remaining
+      bucket on 3 of 4 titles (gauntlet 85% of all fallbacks). The dword
+      dispatch tables are already in the param block (`readmemD`/`writememD`
+      /`rdRdramD`/`wrRdramD`, used by LDC1/SDC1) — this is the same fast-arm
+      shape against the GPR file.
+- [ ] Wave 10 — **MFC0/MTC0**: 27-49% of what remains on sm64/oot/mariokart.
+      MFC0 is a plain `g_cp0_regs[rd]` read for most rd; MTC0 is NOT (Count/
+      Compare/Status/Cause have side effects and an interrupt poll), so emit
+      MFC0 native + MTC0 only for the inert registers, else fall back.
+- [ ] Wave 11 — **FP converts/compares/branches**: TRUNC.W.S, CVT.*,
+      C.cond.*, BC1F/BC1FL. Explicit rounding modes and FCR31 condition
+      bits; the GC lfs/stfs lesson applies — bit-exactness tests first.
+
+## Campaign state (2026-08-29)
+M0-M2 COMPLETE through wave 8. The JIT is correctness-proven (every wave
 600-1200 VI frames bit-identical vs the interpreter on mariokart/sm64/oot
 with GPR+CP0+FPR+FCR31 in the checksum; savestates; invalidation; zero
-emit failures ever shipped) at ~90%+ native instruction coverage. The
-acceptance bar (>=100% native sustained in-game on heavy titles ON
-DEVICE) is UNVERIFIED: every speed measurement in the campaign window ran
-under thermal throttle (this i9 MBP pins CPU_Speed_Limit low under
-build+probe load). Last valid reading: 1.10x at wave 4; post-wave-6
-0.89x-under-throttle is suspect (see open question above). FIRST ACTION
-NEXT SESSION: cool machine -> order-alternating A/B (full vs ?jit=nofp vs
-interp) -> attribute -> then either FP-emit fixes (hoisted CU1/bank-ptr
-caching) or page-batched modules (V8 tier-up budget), THEN the on-device
-bar. The ?jit flag remains opt-in; the shipped default is unchanged
-interpreter behavior.
+emit failures ever shipped). The ?jit flag remains opt-in; the shipped
+default is unchanged interpreter behavior.
+
+Perf history, most recent first:
+- wave 8 (2026-08-29): fallback executions per block iteration cut
+  87.9% / 52.1% / 33.4% (mariokart / sm64 / oot) and blocks now loop
+  natively — but the THROUGHPUT ratio is UNMEASURED, see wave 8 above.
+  Machine was at load 15-84 with CPU_Speed_Limit 58-70 all session
+  (~11 concurrent sibling agent probes); every A/B pair failed the
+  measurement rules below and was discarded rather than quoted.
+- 2026-06-12 (a5efb66), the one valid window so far: machine off throttle
+  (CPU_Speed_Limit = 100 verified before AND after each run),
+  order-alternating frame-cost A/B — sm64 interp 6.98 vs jit 5.69/5.51 =
+  1.23x / 1.27x; gauntlet interp 11.74 vs jit 5.88/6.06 = 2.0x / 1.94x.
+  The post-wave-6 "0.89x regression" was thermal-regime distortion.
+- The acceptance bar (>=100% native sustained IN-GAME on heavy titles, ON
+  DEVICE) remains UNVERIFIED.
+
+NEXT ACTIONS, in order:
+1. On an IDLE, UNTHROTTLED machine: order-alternating A/B to price wave 8.
+   Note the pinned rig (tools/_jit_speed_ab.mjs) measures an ATTRACT scene,
+   not gameplay — an idle-dominated scene reads meaninglessly close to 1.0x.
+   Prefer adding the census tool's input drive to it before believing a
+   headline number.
+2. Waves 9/10/11 by measured weight (SD/LD, MFC0/MTC0, FP converts) — see
+   "Next by MEASURED weight" above. Do NOT reorder these by intuition; they
+   are ranked by runtime execution counts, not by static site counts.
+3. Full-library differential sweep (all 27 ROMs bit-identical per VI) — the
+   gate a5efb66 named before the ?jit default can flip.
 
 ## M3 — FPU (COP1) + the long tail
 - [ ] COP1 moves/arith/converts/compares native (the GC lfs/stfs lesson:

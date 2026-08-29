@@ -1,6 +1,9 @@
 // N64 JIT differential harness (n64/docs/jit/TASKS.md M1).
 //
-//   node tools/n64_jit_diff_test.mjs [rom.z64] [frames]
+//   node tools/n64_jit_diff_test.mjs [rom.z64] [frames] [jitMode]
+//
+// jitMode selects the ?jit= arm under test (default 'emit'); 'census' gates
+// the wave-5b instrumentation, 'nofp' the FP-attribution arm.
 //
 // Runs the same ROM with no input three times — interpreter (twice: the
 // determinism control) and ?jit — collecting the core's per-VI architectural
@@ -12,6 +15,7 @@ import puppeteer from 'puppeteer';
 
 const rom = process.argv[2] || 'mariokart.z64';
 const FRAMES = +(process.argv[3] || 600);
+const JIT_MODE = process.argv[4] || 'emit';
 const browser = await puppeteer.launch({ headless: 'new', executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox'] });
 
 async function run(label, jit) {
@@ -25,7 +29,7 @@ async function run(label, jit) {
   // &difftrace makes the PAGE enable capture at module-ready — always before
   // the ROM download/callMain, so every run starts capture at VI frame 0
   // (harness-side enabling raced the boot and misaligned streams by ~2 VIs)
-  await page.goto(`http://localhost:8080/n64/?game=${rom}&autostart&difftrace${jit ? '&jit' : ''}`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`http://localhost:8080/n64/?game=${rom}&autostart&difftrace${jit ? '&jit=' + JIT_MODE : ''}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction('window.myApp && myApp.rivetsData.beforeEmulatorStarted === false', { timeout: 120000 });
   await page.waitForFunction(`Module._neil_diff_count() >= ${FRAMES}`, { timeout: 180000, polling: 500 });
   const sums = await page.evaluate((n) => { const a = []; for (let i = 0; i < n; i++) a.push(Module._neil_diff_get(i) >>> 0); return a; }, FRAMES);
@@ -44,7 +48,7 @@ await browser.close();
 const detDiff = firstDiff(interpA.sums, interpB.sums);
 const jitDiff = firstDiff(interpA.sums, jit.sums);
 const out = {
-  rom, frames: FRAMES,
+  rom, frames: FRAMES, jitMode: JIT_MODE,
   determinismControl: detDiff === -1 ? 'PASS' : `INVALID METHOD: interp runs diverge at frame ${detDiff}`,
   jitVsInterp: detDiff !== -1 ? 'SKIPPED (method invalid)' : (jitDiff === -1 ? 'PASS' : `DIVERGED at frame ${jitDiff}`),
   jitStats: jit.stats,

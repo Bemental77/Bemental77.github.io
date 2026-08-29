@@ -23,9 +23,10 @@ build). Paths are relative to `n64/N64Wasm/code/` unless noted.
 - **Build reproducibility: PROVEN 2026-06-12** (commit on dev). Two
   implicit-int fixes; `source emsdk/emsdk_env.sh && cd n64/N64Wasm/code &&
   make -j8` links clean under emsdk 3.1.67 and the rebuilt wasm boots
-  Mario Kart at 98% speed headless. NOTE: Makefile TOTAL_MEMORY=1GB
-  (Makefile:185) vs vendored dist 512MB — dist predates the Makefile; the
-  JIT build must choose flags deliberately before shipping dist.
+  Mario Kart at 98% speed headless. NOTE (corrected 2026-08-29): the
+  Makefile now reads `TOTAL_MEMORY=536870912` (Makefile:185) — 512MB,
+  matching the vendored dist. The old "Makefile is 1GB, dist is 512MB"
+  warning was resolved by the M1 re-link and is no longer a live trap.
 
 ## The seam (why this port is CHEAPER than GC's)
 
