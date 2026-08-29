@@ -472,10 +472,24 @@ void emit_ps_fma(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc, const Co
     // Native does NOT accept that divergence; it spends ~7 extra instructions
     // and a helper call SPECIFICALLY to avoid it. MAIN_ACCURATE_FMADDS defaults
     // TRUE (Core/Config/MainSettings.cpp:231), so error_free_transformation is
-    // on and Jit64 emits the Ole Moller 2Sum EFT sequence
-    // (Jit_FloatingPoint.cpp:604-802 + the asm helper at
-    // Jit64AsmCommon.cpp:334-361, a direct transcription of the interpreter's
-    // NI_madd_msub at Interpreter_FPUtils.h:285-489). The motivating case is in
+    // on and Jit64 emits an Ole Moller 2Sum EFT, backed by the asm helper at
+    // Jit64AsmCommon.cpp:334-361 — itself a direct transcription of the
+    // interpreter's NI_madd_msub (Interpreter_FPUtils.h:285-489).
+    //
+    // *** AND IT IS THE PACKED PATH, NOT JUST THE SCALAR ONE — i.e. exactly the
+    // instruction THIS arm implements. Jit64's ps_madd branch runs the same EFT
+    // with packed-double variants: VADDPD/VSUBPD :696/:698/:701,
+    // VFMSUB231PD :743, VSUBPD :748, VADDPD/VSUBPD :754/:756, then
+    // CALL ps_madd_eft :758. So there is no "native cuts this corner for paired
+    // singles" escape — native pays for accuracy on precisely our path.
+    //
+    // (The scalar fmadds path, for reference: MOVAPD :609, VFMADD132SD :628,
+    // VSUBSD :766, VSUBSD :769, VFMSUB231PD/SD :787, SUBSD :800,
+    // CALL fmadds_eft :802. Line numbers verified by reading each back; prefer
+    // the section comments "a' := s - b" :762, "b' := s - a'" :768,
+    // "da := a - a'" :771, "db := b - b'" :795 as edit-durable anchors — but
+    // note :703/:751 carry the SAME comment text in the packed branch.)
+    // The motivating case is in
     // Dolphin's own source: Mario Strikers Charged, a=0x42480000 c=0xbc88cc38
     // b=0x1b1c72a0 — naive gives 0xbf55bf18, correct is 0xbf55bf17
     // (Interpreter_FPUtils.h:356-370).
