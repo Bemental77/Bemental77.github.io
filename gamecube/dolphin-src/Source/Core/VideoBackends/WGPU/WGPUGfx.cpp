@@ -21,6 +21,7 @@
 #include "VideoBackends/WGPU/WGPUVertexManager.h"  // WGPUVertexFormat (vertex buffer layout)
 
 #include "VideoCommon/AbstractPipeline.h"
+#include "VideoCommon/BemStageTimer.h"  // [render-stage split 2026-08-29 TEMP]
 #include "VideoCommon/AbstractShader.h"
 #include "VideoCommon/ConstantManager.h"  // PixelShaderConstants / VertexShaderConstants sizes
 #include "VideoCommon/FramebufferManager.h"
@@ -312,8 +313,45 @@ void WGPUGfx::BeginRenderPassIfNeeded()
   ApplyViewportAndScissor();
 }
 
+// [LEVER 2: redundant render-pass state elimination 2026-08-29] Last state
+// ACTUALLY encoded into the currently-open pass. Render-pass encoder state is
+// per-pass, so every field is keyed on s_rs_pass and the whole cache is dropped
+// when the pass ends. Skipping a Set* whose arguments are byte-identical is a
+// no-op by the WebGPU spec; the risk is only staleness, which the pass key and
+// the explicit reset below close.
+namespace
+{
+::WGPURenderPassEncoder s_rs_pass = nullptr;
+::WGPURenderPipeline s_rs_pipeline = nullptr;
+::WGPUBuffer s_rs_vbuf = nullptr;
+u64 s_rs_voff = ~0ull;
+::WGPUBuffer s_rs_ibuf = nullptr;
+u64 s_rs_ioff = ~0ull;
+::WGPUBindGroup s_rs_grp0 = nullptr;
+u32 s_rs_dyn0 = ~0u, s_rs_dyn1 = ~0u;
+::WGPUBindGroup s_rs_grp1 = nullptr;
+inline void BemResetRedundantState()
+{
+  s_rs_pass = nullptr;
+  s_rs_pipeline = nullptr;
+  s_rs_vbuf = nullptr;
+  s_rs_voff = ~0ull;
+  s_rs_ibuf = nullptr;
+  s_rs_ioff = ~0ull;
+  s_rs_grp0 = nullptr;
+  s_rs_dyn0 = ~0u;
+  s_rs_dyn1 = ~0u;
+  s_rs_grp1 = nullptr;
+}
+inline void BemRsSkipped()
+{
+  ++*reinterpret_cast<volatile u32*>(BemStage::kRedundantStateHitCell);
+}
+}  // namespace
+
 void WGPUGfx::EndRenderPass()
 {
+  BemResetRedundantState();
   if (m_pass)
   {
     wgpuRenderPassEncoderEnd(m_pass);
@@ -322,8 +360,15 @@ void WGPUGfx::EndRenderPass()
   }
 }
 
+// [LEVER: upload coalescing 2026-08-29] defined in WGPUVertexManager.cpp; a no-op
+// unless cell 0x026B3930 is set. Must run BEFORE the encoder is finished so every
+// draw recorded into it sees its own vertex/index bytes.
+extern "C" void bem_wgpu_flush_pending_uploads();
+
 void WGPUGfx::SubmitFrame()
 {
+  ++*reinterpret_cast<volatile u32*>(BemStage::kSubmitCountCell);  // [census 2026-08-29]
+  bem_wgpu_flush_pending_uploads();
   EndRenderPass();
   if (m_encoder)
   {
@@ -893,6 +938,11 @@ void WGPUGfx::ClearRegion(const MathUtil::Rectangle<int>& target_rc, bool colorE
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35DCu)) =
         ((u32)sw << 16) | ((u32)sh & 0xFFFFu);
     wgpuRenderPassEncoderDraw(m_pass, 3, 1, 0, 0);
+    // [LEVER 2 2026-08-29] This util-clear draw sets pipeline + group0 on THE SAME
+    // m_pass that DrawIndexed encodes into, so DrawIndexed's "already bound" cache
+    // is stale the moment this runs. Drop it. (The blit/depth-blit util draws at
+    // :1037 and :1136 use their OWN local pass and cannot alias.)
+    BemResetRedundantState();
   }
   wgpuBindGroupRelease(grp);
 
@@ -1881,7 +1931,12 @@ void WGPUGfx::DrawIndexed(WGPUBuffer vertex_buffer, WGPUBuffer index_buffer,
   // RenderDrawCall) for the arm that also removes those.
   // SAB is browser-zeroed, so 0 (cold boot) = NOT ablated.
   if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3B00u)) != 0u)
+  {
+    // [render-stage split 2026-08-29 TEMP] validity gate: only the ABLATED arm can
+    // advance this. A matched pair that does not move it ran the same code twice.
+    ++*reinterpret_cast<volatile u32*>(BemStage::kAblAHitCell);
     return;
+  }
   // [thread-id PM33] draw thread @0x026B35A4, read by dolphin_render_probe.js:704 (`gfxThreads`).
   // Was a pthread_self() call on EVERY draw; the identity never changes after the first draw, so
   // publish it ONCE. Cell stays live — the probe reads the same value it read before.
@@ -1993,24 +2048,59 @@ void WGPUGfx::DrawIndexed(WGPUBuffer vertex_buffer, WGPUBuffer index_buffer,
       s_scope_n++;
       wgpuDevicePushErrorScope(m_device, WGPUErrorFilter_Validation);
     }
-    wgpuRenderPassEncoderSetPipeline(m_pass, m_current_pipeline);
-    // [basevertex-fold EXPERIMENT PM34] high bit of base_index marks folded
-    // byte offsets: bind buffers AT the offsets, draw with bases 0.
-    const bool fold = (base_index & 0x80000000u) != 0;
-    if (fold)
+    // [LEVER 2 2026-08-29] cell 0x026B3940 => skip a Set* that would re-encode
+    // state already bound in THIS pass. A changed pipeline drops the bind-group
+    // half of the cache: the WebGPU spec only keeps bind groups across
+    // setPipeline when the layouts are group-equivalent, and rather than rely on
+    // every pipeline here sharing the uber layout, re-set them. Buffer binds are
+    // NOT invalidated by setPipeline in any case.
+    const bool _bem_rs = *reinterpret_cast<volatile u32*>(BemStage::kRedundantStateCell) != 0u;
+    if (!_bem_rs || s_rs_pass != m_pass)
     {
-      wgpuRenderPassEncoderSetVertexBuffer(m_pass, 0, vertex_buffer, base_vertex,
-                                           WGPU_WHOLE_SIZE);
-      wgpuRenderPassEncoderSetIndexBuffer(m_pass, index_buffer, WGPUIndexFormat_Uint16,
-                                          base_index & 0x7FFFFFFFu, WGPU_WHOLE_SIZE);
-      base_index = 0;
-      base_vertex = 0;
+      BemResetRedundantState();
+      s_rs_pass = m_pass;
+    }
+    if (!_bem_rs || s_rs_pipeline != m_current_pipeline)
+    {
+      wgpuRenderPassEncoderSetPipeline(m_pass, m_current_pipeline);
+      s_rs_pipeline = m_current_pipeline;
+      s_rs_grp0 = nullptr;  // conservative: re-bind groups after a pipeline change
+      s_rs_grp1 = nullptr;
     }
     else
     {
-      wgpuRenderPassEncoderSetVertexBuffer(m_pass, 0, vertex_buffer, 0, WGPU_WHOLE_SIZE);
-      wgpuRenderPassEncoderSetIndexBuffer(m_pass, index_buffer, WGPUIndexFormat_Uint16, 0,
+      BemRsSkipped();
+    }
+    // [basevertex-fold EXPERIMENT PM34] high bit of base_index marks folded
+    // byte offsets: bind buffers AT the offsets, draw with bases 0.
+    const bool fold = (base_index & 0x80000000u) != 0;
+    const u64 _bem_voff = fold ? static_cast<u64>(base_vertex) : 0ull;
+    const u64 _bem_ioff = fold ? static_cast<u64>(base_index & 0x7FFFFFFFu) : 0ull;
+    if (!_bem_rs || s_rs_vbuf != vertex_buffer || s_rs_voff != _bem_voff)
+    {
+      wgpuRenderPassEncoderSetVertexBuffer(m_pass, 0, vertex_buffer, _bem_voff, WGPU_WHOLE_SIZE);
+      s_rs_vbuf = vertex_buffer;
+      s_rs_voff = _bem_voff;
+    }
+    else
+    {
+      BemRsSkipped();
+    }
+    if (!_bem_rs || s_rs_ibuf != index_buffer || s_rs_ioff != _bem_ioff)
+    {
+      wgpuRenderPassEncoderSetIndexBuffer(m_pass, index_buffer, WGPUIndexFormat_Uint16, _bem_ioff,
                                           WGPU_WHOLE_SIZE);
+      s_rs_ibuf = index_buffer;
+      s_rs_ioff = _bem_ioff;
+    }
+    else
+    {
+      BemRsSkipped();
+    }
+    if (fold)
+    {
+      base_index = 0;
+      base_vertex = 0;
     }
     // Dynamic offsets ordered by ascending binding: [PS@0, VS@1].
     // [dynoff-swap EXPERIMENT PM32 - evaluate] if Dawn applies these in the
@@ -2022,8 +2112,27 @@ void WGPUGfx::DrawIndexed(WGPUBuffer vertex_buffer, WGPUBuffer index_buffer,
 #else
     const uint32_t dyn_offsets[2] = {ps_uniform_offset, vs_uniform_offset};
 #endif
-    wgpuRenderPassEncoderSetBindGroup(m_pass, 0, grp0, 2, dyn_offsets);
-    wgpuRenderPassEncoderSetBindGroup(m_pass, 1, grp1, 0, nullptr);
+    if (!_bem_rs || s_rs_grp0 != grp0 || s_rs_dyn0 != dyn_offsets[0] ||
+        s_rs_dyn1 != dyn_offsets[1])
+    {
+      wgpuRenderPassEncoderSetBindGroup(m_pass, 0, grp0, 2, dyn_offsets);
+      s_rs_grp0 = grp0;
+      s_rs_dyn0 = dyn_offsets[0];
+      s_rs_dyn1 = dyn_offsets[1];
+    }
+    else
+    {
+      BemRsSkipped();
+    }
+    if (!_bem_rs || s_rs_grp1 != grp1)
+    {
+      wgpuRenderPassEncoderSetBindGroup(m_pass, 1, grp1, 0, nullptr);
+      s_rs_grp1 = grp1;
+    }
+    else
+    {
+      BemRsSkipped();
+    }
     ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B356Cu));
     if (scope_this)
     {

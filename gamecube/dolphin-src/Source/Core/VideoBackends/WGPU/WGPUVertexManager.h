@@ -65,6 +65,26 @@ private:
   // index generator writing into m_index_cpu.
   std::vector<u8> m_vertex_cpu;
   std::vector<u16> m_index_cpu;
+  // [LEVER: upload coalescing 2026-08-29] Ring MIRRORS. m_vertex_cpu is a
+  // PER-BATCH arena (ResetBuffer resets m_cur_buffer_pointer to its base every
+  // batch), so its bytes cannot be coalesced in place — batch N+1 overwrites
+  // batch N. These mirror the GPU rings 1:1 at ring offsets, so one contiguous
+  // [lo,hi) writeBuffer per ring per submit replaces the 208 per-batch calls.
+  // Gaps inside [lo,hi) are alignment padding no draw samples.
+  std::vector<u8> m_vertex_stage;
+  std::vector<u8> m_index_stage;
+  u64 m_pend_v_lo = ~0ull, m_pend_v_hi = 0;
+  u64 m_pend_i_lo = ~0ull, m_pend_i_hi = 0;
+
+public:
+  // Called from WGPUGfx::SubmitFrame — the ONLY place m_encoder is submitted
+  // (wgpuQueueSubmit sites: WGPUGfx.cpp:333 here, :1203 + WGPUTextureCache.h:261
+  // + WGPUTexture.cpp:169 are separate texture-copy encoders that never read
+  // these rings). Every wrap path already calls SubmitFrame before resetting an
+  // offset, so a wrap can never strand a pending range.
+  void FlushPendingUploads();
+
+private:
 
   // Rolling byte offsets into the GPU buffers (wrap when near capacity).
   u64 m_vertex_offset = 0;

@@ -21,6 +21,7 @@
 
 #include "VideoCommon/AbstractGfx.h"
 #include "VideoCommon/BPMemory.h"
+#include "VideoCommon/BemStageTimer.h"  // [render-stage split 2026-08-29 TEMP]
 #include "VideoCommon/BoundingBox.h"
 #include "VideoCommon/DataReader.h"
 #include "VideoCommon/FramebufferManager.h"
@@ -773,6 +774,10 @@ void VertexManagerBase::Flush()
 
   m_is_flushed = true;
 
+  // [render-stage split 2026-08-29 TEMP] whole-Flush region. Placed AFTER the
+  // m_is_flushed early-out so a no-op Flush is not counted as a call.
+  BemStage::Scope _bs_flush(BemStage::kFlush);
+
   // [draw-ablation TEMP 2026-08-29] ARM B: cell 0x026B3B04 nonzero => return
   // here. Keeps FIFO decode + vertex loading (PrepareForAdditionalData already
   // ran); drops texture cache Load/BindTextures, VertexShaderManager::
@@ -785,6 +790,9 @@ void VertexManagerBase::Flush()
   // dolphin_render_probe.js PROBE_POKE.
   if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3B04u)) != 0u)
   {
+    // [render-stage split 2026-08-29 TEMP] validity gate: only the ABLATED arm can
+    // advance this. A matched pair that does not move it ran the same code twice.
+    ++*reinterpret_cast<volatile u32*>(BemStage::kAblBHitCell);
     OnDraw();
     return;
   }
@@ -906,7 +914,10 @@ void VertexManagerBase::Flush()
     pixel_shader_manager.constants.time_ms = seconds_elapsed * 1000;
   }
 
-  CalculateNormals(VertexLoaderManager::GetCurrentVertexFormat());
+  {
+    BemStage::Scope _bs(BemStage::kConstants);  // [render-stage split 2026-08-29 TEMP]
+    CalculateNormals(VertexLoaderManager::GetCurrentVertexFormat());
+  }
   // Calculate ZSlope for zfreeze
   const auto used_textures = UsedTextures();
   std::vector<std::string> texture_names;
@@ -914,6 +925,7 @@ void VertexManagerBase::Flush()
   std::array<SamplerState, 8> samplers;
   if (!m_cull_all)
   {
+    BemStage::Scope _bs(BemStage::kTexCache);  // [render-stage split 2026-08-29 TEMP]
     if (!g_ActiveConfig.bGraphicMods)
     {
       for (const u32 i : used_textures)
@@ -946,16 +958,19 @@ void VertexManagerBase::Flush()
       }
     }
   }
-  vertex_shader_manager.SetConstants(texture_names, xf_state_manager);
-  if (!bpmem.genMode.zfreeze)
   {
-    // Must be done after VertexShaderManager::SetConstants()
-    CalculateZSlope(VertexLoaderManager::GetCurrentVertexFormat());
-  }
-  else if (m_zslope.dirty && !m_cull_all)  // or apply any dirty ZSlopes
-  {
-    pixel_shader_manager.SetZSlope(m_zslope.dfdx, m_zslope.dfdy, m_zslope.f0);
-    m_zslope.dirty = false;
+    BemStage::Scope _bs(BemStage::kConstants);  // [render-stage split 2026-08-29 TEMP]
+    vertex_shader_manager.SetConstants(texture_names, xf_state_manager);
+    if (!bpmem.genMode.zfreeze)
+    {
+      // Must be done after VertexShaderManager::SetConstants()
+      CalculateZSlope(VertexLoaderManager::GetCurrentVertexFormat());
+    }
+    else if (m_zslope.dirty && !m_cull_all)  // or apply any dirty ZSlopes
+    {
+      pixel_shader_manager.SetZSlope(m_zslope.dfdx, m_zslope.dfdy, m_zslope.f0);
+      m_zslope.dirty = false;
+    }
   }
 
 #ifdef BEM_FLUSH_CENSUS
@@ -1007,12 +1022,18 @@ void VertexManagerBase::Flush()
     // Texture loading can cause palettes to be applied (-> uniforms -> draws).
     // Palette application does not use vertices, only a full-screen quad, so this is okay.
     // Same with GPU texture decoding, which uses compute shaders.
-    g_texture_cache->BindTextures(used_textures, samplers);
+    {
+      BemStage::Scope _bs(BemStage::kTexCache);  // [render-stage split 2026-08-29 TEMP]
+      g_texture_cache->BindTextures(used_textures, samplers);
+    }
 
     if (!skip)
     {
-      UpdatePipelineConfig();
-      UpdatePipelineObject();
+      {
+        BemStage::Scope _bs(BemStage::kPipeline);  // [render-stage split 2026-08-29 TEMP]
+        UpdatePipelineConfig();
+        UpdatePipelineObject();
+      }
       if (m_current_pipeline_object)
       {
         const AbstractPipeline* pipeline_object = m_current_pipeline_object;
@@ -1025,6 +1046,7 @@ void VertexManagerBase::Flush()
             pipeline_object = custom_pipeline;
           }
         }
+        BemStage::Scope _bs(BemStage::kDrawCall);  // [render-stage split 2026-08-29 TEMP]
         RenderDrawCall(pixel_shader_manager, geometry_shader_manager, custom_pixel_shader_contents,
                        custom_pixel_shader_uniforms, m_current_primitive_type, pipeline_object);
       }
@@ -1440,7 +1462,11 @@ void VertexManagerBase::RenderDrawCall(
   // WGPUGfx::DrawIndexed does NOT, because every wgpuQueueWriteBuffer happens
   // upstream of it.
   if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3B08u)) != 0u)
+  {
+    // [render-stage split 2026-08-29 TEMP] validity gate — see kAblBHitCell.
+    ++*reinterpret_cast<volatile u32*>(BemStage::kAblApHitCell);
     return;
+  }
 
   // Now we can upload uniforms, as nothing else will override them.
   geometry_shader_manager.SetConstants(primitive_type);

@@ -857,26 +857,30 @@ function startServer() {
   // PROBE_STAGE_SPLIT=<periodMs> turns on the BemStageTimer regions
   // (VideoCommon/BemStageTimer.h, enable cell 0x026B3B20) and prints ONE line per
   // window with the DELTA of every stage accumulator, so _recomp_render_fifo is
-  // attributed to opcode decode / vertex load / texture cache / constants /
-  // pipeline / WGPU submission instead of being a single 15 ms bar.
+  // attributed to opcode decode / BP+XF register writes / vertex load / texture
+  // cache / constants / pipeline / WGPU submission instead of one 15 ms bar.
   //
-  // The stages are published by the C++ into 0x026B3B40 (8 x f64 ms) and
-  // 0x026B3B80 (8 x u32 call counts), refreshed once per _recomp_render_fifo.
-  // kFlush is a SUPERSET of kTexCache..kDrawCall; kFifoTotal is a superset of
-  // everything. `other` = kFifoTotal - kFlush - kVtxLoad = the opcode walk plus
-  // the CP/XF/BP register writes plus RefreshPeekCache.
+  // Layout published by the C++ once per _recomp_render_fifo:
+  //   0x026B3B40  11 x f64 accumulated ms  (indices 0..10 below)
+  //   0x026B3B98  17 x u32 call counts     (0..10 timed, 11..16 census)
+  //     0 vtx  1 tex  2 const  3 pipe  4 draw  5 flush  6 fifo  7 tpair
+  //     8 peek  9 bp  10 xf | 11 nBP 12 nXF 13 nCP 14 nIdx 15 nDL 16 FRAMES
+  // kFlush is a SUPERSET of tex/const/pipe/draw; kFifoTotal is a superset of all.
+  // decode/other = fifo - flush - vtx - peek - bp - xf = the opcode WALK itself
+  // (Run()'s dispatch, CP reg writes, RefreshLoader/GetVertexSize, DL recursion).
   //
-  // Timer cost is MEASURED, not assumed: kTimerPair is one back-to-back pair of
-  // emscripten_get_now() reads per _recomp_render_fifo call, so `tcall` below is
-  // the per-call cost in-situ and `ovh` is (total calls x tcall) — the bound on
-  // how much of the reported total is the instrument itself.
+  // TIMER COST IS MEASURED. kTimerPair times 64 back-to-back clock reads once per
+  // frame, so `tcall` is the per-read cost in-situ. `cor:` is the same split with
+  // (reads-inside-region x tcall) subtracted from every region — a Scope costs 2
+  // reads and the enclosing region absorbs both. The corrected column is the one
+  // to quote for SHARES; the ablation matched pair (PROBE_AB, below) is the
+  // arbiter for magnitude because it carries no timer cost at all.
   //
-  // PROBE_STAGE_SPLIT_START_MS delays arming (default 30000) so the window that
-  // turns it on is not the one being read.
+  // PROBE_STAGE_SPLIT_START_MS delays arming (default 30000). Slot 16 (frames) is
+  // always live, so the census works with the timers still off.
   if (process.env.PROBE_STAGE_SPLIT) {
     const _ssPer = parseInt(process.env.PROBE_STAGE_SPLIT, 10) || 5000;
     const _ssStart = parseInt(process.env.PROBE_STAGE_SPLIT_START_MS || '30000', 10);
-    const _ssNames = ['vtx', 'tex', 'const', 'pipe', 'draw', 'flush', 'fifo', 'tpair'];
     const _ssRows = [];
     let _ssPrev = null;
     setTimeout(async () => {
@@ -894,46 +898,75 @@ function startServer() {
           const F = new Float64Array(window.sharedMemory.buffer);
           const A = new Uint32Array(window.sharedMemory.buffer);
           const o = { t: performance.now(), ms: [], n: [] };
-          for (let i = 0; i < 8; i++) {
-            o.ms.push(F[(0x026B3B40 >> 3) + i]);
-            o.n.push(A[(0x026B3B80 >> 2) + i] >>> 0);
-          }
+          for (let i = 0; i < 11; i++) o.ms.push(F[(0x026B3B40 >> 3) + i]);
+          for (let i = 0; i < 17; i++) o.n.push(A[(0x026B3B98 >> 2) + i] >>> 0);
+          o.submits = A[0x026B3938 >> 2] >>> 0;   // [census 2026-08-29] WGPUGfx::SubmitFrame
+          o.upbytes = A[0x026B393C >> 2] >>> 0;   // [census] vtx+idx bytes to writeBuffer
+          o.rate = window.__gcRate
+            ? { rcap: window.__gcRate.renderCap, gcap: window.__gcRate.guestCap,
+                speed: window.__gcRate.speed } : null;
           return o;
         });
         if (!s) return;
-        if (_ssPrev && s.n[6] > _ssPrev.n[6]) {
-          const frames = s.n[6] - _ssPrev.n[6];
-          const d = (i) => (s.ms[i] - _ssPrev.ms[i]) / frames;      // ms per rendered frame
-          const c = (i) => (s.n[i] - _ssPrev.n[i]) / frames;        // calls per rendered frame
-          // Each Scope makes 2 clock reads; kTimerPair measures exactly one read.
-          const tcall = (s.n[7] - _ssPrev.n[7]) > 0
-            ? (s.ms[7] - _ssPrev.ms[7]) / (s.n[7] - _ssPrev.n[7]) : 0;
-          let calls = 0;
-          for (let i = 0; i <= 6; i++) calls += 2 * (s.n[i] - _ssPrev.n[i]);
-          calls += 2 * (s.n[7] - _ssPrev.n[7]);
-          const ovh = tcall * calls / frames;
-          const other = d(6) - d(5) - d(0);
-          const flushOther = d(5) - d(1) - d(2) - d(3) - d(4);
-          const row = { tsec: +(s.t / 1000).toFixed(1), frames,
-            fifo: +d(6).toFixed(3), vtx: +d(0).toFixed(3), tex: +d(1).toFixed(3),
-            konst: +d(2).toFixed(3), pipe: +d(3).toFixed(3), draw: +d(4).toFixed(3),
-            flush: +d(5).toFixed(3), flushOther: +flushOther.toFixed(3),
-            other: +other.toFixed(3), tcallUs: +(tcall * 1000).toFixed(4),
-            ovhMs: +ovh.toFixed(3), nFlush: +c(5).toFixed(1), nVtx: +c(0).toFixed(1),
-            nDraw: +c(4).toFixed(1) };
+        if (_ssPrev && s.n[16] > _ssPrev.n[16] && s.n[6] > _ssPrev.n[6]) {
+          const F = s.n[6] - _ssPrev.n[6];                       // TIMED frames
+          const dn = (i) => s.n[i] - _ssPrev.n[i];
+          const d = (i) => (s.ms[i] - _ssPrev.ms[i]) / F;        // ms per timed frame
+          const cpf = (i) => dn(i) / F;                          // calls per timed frame
+          // per-read cost: Calibrate() already divides by (kCalReads-1)
+          const tcall = dn(7) > 0 ? (s.ms[7] - _ssPrev.ms[7]) / dn(7) : 0;
+          // Reads charged INSIDE each region. Every Scope = 2 reads; the enclosing
+          // region absorbs both, the region itself absorbs only its own closing read.
+          const leaf = [0, 1, 2, 3, 4, 8, 9, 10];
+          const inside = {};
+          leaf.forEach((i) => { inside[i] = dn(i); });
+          inside[5] = dn(5) + 2 * (dn(1) + dn(2) + dn(3) + dn(4));
+          inside[6] = dn(6) + 2 * (dn(0) + dn(1) + dn(2) + dn(3) + dn(4) + dn(5)
+                                   + dn(8) + dn(9) + dn(10)) + 64 * dn(7);
+          const cor = (i) => d(i) - tcall * inside[i] / F;
+          const rawOther = d(6) - d(5) - d(0) - d(8) - d(9) - d(10);
+          const corOther = cor(6) - cor(5) - cor(0) - cor(8) - cor(9) - cor(10);
+          const corFlushOther = cor(5) - cor(1) - cor(2) - cor(3) - cor(4);
+          const ovh = tcall * inside[6] / F;
+          const row = { tsec: +(s.t / 1000).toFixed(1), frames: F,
+            drawsPerFrame: +(cpf(4)).toFixed(1), vtxPerFrame: +(cpf(0)).toFixed(1),
+            nBP: +(dn(11) / F).toFixed(0), nXF: +(dn(12) / F).toFixed(0),
+            nCP: +(dn(13) / F).toFixed(0), nIdx: +(dn(14) / F).toFixed(0),
+            nDL: +(dn(15) / F).toFixed(0),
+            raw: { fifo: +d(6).toFixed(3), vtx: +d(0).toFixed(3), tex: +d(1).toFixed(3),
+                   konst: +d(2).toFixed(3), pipe: +d(3).toFixed(3), draw: +d(4).toFixed(3),
+                   flush: +d(5).toFixed(3), peek: +d(8).toFixed(3), bp: +d(9).toFixed(3),
+                   xf: +d(10).toFixed(3), other: +rawOther.toFixed(3) },
+            cor: { fifo: +cor(6).toFixed(3), vtx: +cor(0).toFixed(3), tex: +cor(1).toFixed(3),
+                   konst: +cor(2).toFixed(3), pipe: +cor(3).toFixed(3), draw: +cor(4).toFixed(3),
+                   flush: +cor(5).toFixed(3), peek: +cor(8).toFixed(3), bp: +cor(9).toFixed(3),
+                   xf: +cor(10).toFixed(3), other: +corOther.toFixed(3),
+                   flushOther: +corFlushOther.toFixed(3) },
+            tcallUs: +(tcall * 1000).toFixed(4), ovhMs: +ovh.toFixed(3),
+            rate: s.rate || null };
           _ssRows.push(row);
-          const pct = (v) => d(6) > 0 ? (100 * v / d(6)).toFixed(1) + '%' : '--';
-          console.log('[stage-split] t=' + row.tsec + 's f=' + frames
-            + '  fifo=' + row.fifo + 'ms'
-            + ' | vtx=' + row.vtx + '(' + pct(d(0)) + ')'
-            + ' tex=' + row.tex + '(' + pct(d(1)) + ')'
-            + ' const=' + row.konst + '(' + pct(d(2)) + ')'
-            + ' pipe=' + row.pipe + '(' + pct(d(3)) + ')'
-            + ' draw=' + row.draw + '(' + pct(d(4)) + ')'
-            + ' flushOther=' + row.flushOther + '(' + pct(flushOther) + ')'
-            + ' decode/other=' + row.other + '(' + pct(other) + ')'
-            + ' | flush=' + row.flush + ' n/f: flush=' + row.nFlush + ' vtx=' + row.nVtx
-            + ' draw=' + row.nDraw + ' | tcall=' + row.tcallUs + 'us ovh=' + row.ovhMs + 'ms');
+          const T = cor(6);
+          const pct = (v) => T > 0 ? (100 * v / T).toFixed(1) + '%' : '--';
+          console.log('[stage-split] t=' + row.tsec + 's f=' + F
+            + ' draws/f=' + row.drawsPerFrame + ' vtx/f=' + row.vtxPerFrame
+            + '  RAW fifo=' + row.raw.fifo + 'ms  tcall=' + row.tcallUs + 'us ovh=' + row.ovhMs + 'ms'
+            + '  ||  COR fifo=' + row.cor.fifo + 'ms'
+            + ' | draw=' + row.cor.draw + '(' + pct(cor(4)) + ')'
+            + ' walk=' + row.cor.other + '(' + pct(corOther) + ')'
+            + ' vtx=' + row.cor.vtx + '(' + pct(cor(0)) + ')'
+            + ' tex=' + row.cor.tex + '(' + pct(cor(1)) + ')'
+            + ' bp=' + row.cor.bp + '(' + pct(cor(9)) + ')'
+            + ' xf=' + row.cor.xf + '(' + pct(cor(10)) + ')'
+            + ' const=' + row.cor.konst + '(' + pct(cor(2)) + ')'
+            + ' pipe=' + row.cor.pipe + '(' + pct(cor(3)) + ')'
+            + ' peek=' + row.cor.peek + '(' + pct(cor(8)) + ')'
+            + ' flushOther=' + row.cor.flushOther + '(' + pct(corFlushOther) + ')'
+            + ' | opc/f: BP=' + row.nBP + ' XF=' + row.nXF + ' CP=' + row.nCP
+            + ' IDX=' + row.nIdx + ' DL=' + row.nDL
+            + ' | submits/f=' + (((s.submits - _ssPrev.submits) / F) || 0).toFixed(1)
+            + ' upKB/f=' + ((((s.upbytes >>> 0) - (_ssPrev.upbytes >>> 0)) / F) / 1024).toFixed(1)
+            + (s.rate ? ('  [rcap=' + (s.rate.rcap == null ? '--' : (+s.rate.rcap).toFixed(1))
+                        + ' gcap=' + (s.rate.gcap == null ? '--' : (+s.rate.gcap).toFixed(1)) + ']') : ''));
         }
         _ssPrev = s;
       } catch (_e) {}
@@ -947,6 +980,112 @@ function startServer() {
       });
     }
     console.log('[probe] stage-split: per-' + _ssPer + 'ms render-stage series installed');
+  }
+
+  // ---- [generic ablation A/B 2026-08-29] ----------------------------------
+  // PROBE_AB=<cell hex> alternates ONE SAB cell between 0 and 1 every
+  // PROBE_AB_MS, in ONE process, so both arms see the same load, the same scene
+  // and the same warmed pipeline/texture cache. That is what made the vertex
+  // loader ratio reproducible to 0.2% while a naive two-run A/B on this box
+  // (load 25-98, five sibling Chromes) produced a false 0.993x null.
+  //
+  // Three rules this rig enforces, each paid for with a wrong answer today:
+  //   1. A NULL IS NOT A RESULT UNTIL THE ARMS ARE PROVEN TO DIFFER.
+  //      PROBE_AB_HITCELL names a counter that ONLY the ablated arm can advance.
+  //      If arm 1 does not advance it, or arm 0 does, the ratio is REFUSED.
+  //      (VertexLoaderManager caches loaders and stops honouring its cell; and a
+  //      whole fusion campaign A/B'd two identical configs because the path was
+  //      dead code at block_cache.cpp:233.)
+  //   2. THE SCENE MUST MATCH. MP4's attract loop alternates a 1300-draw board
+  //      frame with 1-2 draw frames; blending them makes any ratio meaningless.
+  //      PROBE_AB_DRAWS_MIN/MAX gate each window on measured draws-per-frame
+  //      (BemStageTimer slot 4 vs slot 16 — both live with timers off).
+  //   3. renderCap AND guestCap ARE REPORTED SEPARATELY. `cap` is min() of the
+  //      two, so a single number cannot be compared across arms.
+  // The window straddling a flip is discarded: the page's cap model is a 1 s
+  // window (gamecube.html:606), so it belongs to neither arm.
+  if (process.env.PROBE_AB) {
+    const _abCell = parseInt(process.env.PROBE_AB, 16) || parseInt(process.env.PROBE_AB, 10);
+    const _abHit = process.env.PROBE_AB_HITCELL
+      ? (parseInt(process.env.PROBE_AB_HITCELL, 16) || parseInt(process.env.PROBE_AB_HITCELL, 10)) : 0;
+    const _abMs = parseInt(process.env.PROBE_AB_MS || '6000', 10);
+    const _abStart = parseInt(process.env.PROBE_AB_START_MS || '45000', 10);
+    const _abMin = parseFloat(process.env.PROBE_AB_DRAWS_MIN || '0');
+    const _abMax = parseFloat(process.env.PROBE_AB_DRAWS_MAX || '1e9');
+    const _abName = process.env.PROBE_AB_NAME || ('cell' + process.env.PROBE_AB);
+    setTimeout(async () => {
+      try {
+        await page.evaluate((cell, hit, periodMs) => {
+          if (!window.sharedMemory) return;
+          const A = new Uint32Array(window.sharedMemory.buffer);
+          const st = { rows: [], arm: 0, flippedAt: performance.now(), prev: null };
+          window.__abRig = st;
+          A[cell >> 2] = 0;
+          setInterval(() => { st.arm ^= 1; A[cell >> 2] = st.arm; st.flippedAt = performance.now(); },
+                      periodMs);
+          setInterval(() => {
+            try {
+              const now = performance.now();
+              const cur = { t: now, frames: A[(0x026B3B98 >> 2) + 16] >>> 0,
+                            draws: A[0x026B289C >> 2] >>> 0,
+                            hit: hit ? (A[hit >> 2] >>> 0) : 0 };
+              const p = st.prev; st.prev = cur;
+              if (!p || now - st.flippedAt < 1100) return;
+              const df = cur.frames - p.frames;
+              if (df <= 0) return;
+              const R = window.__gcRate; if (!R) return;
+              st.rows.push({ arm: A[cell >> 2] >>> 0, rcap: R.renderCap, gcap: R.guestCap,
+                             cap: R.capFps, speed: R.speed,
+                             dpf: (cur.draws - p.draws) / df, frames: df,
+                             dhit: cur.hit - p.hit });
+            } catch (_e) {}
+          }, 1000);
+        }, _abCell, _abHit, _abMs);
+        console.log('[ab:' + _abName + '] interleaving cell 0x' + _abCell.toString(16)
+          + ' every ' + _abMs + 'ms from t=' + _abStart + 'ms'
+          + (_abHit ? ('; validity counter 0x' + _abHit.toString(16)) : '; NO validity counter'));
+      } catch (e) { console.error('[ab:' + _abName + '] arm failed: ' + e.message); }
+    }, _abStart);
+    global.__abReport = async () => {
+      try {
+        const rows = await page.evaluate(() => (window.__abRig ? window.__abRig.rows : []));
+        const kept = rows.filter((r) => r.dpf >= _abMin && r.dpf <= _abMax && r.rcap != null);
+        const med = (a) => { if (!a.length) return null; const b = a.slice().sort((x, y) => x - y);
+          return b.length % 2 ? b[(b.length - 1) / 2] : (b[b.length / 2 - 1] + b[b.length / 2]) / 2; };
+        const out = {};
+        [0, 1].forEach((arm) => {
+          const A = kept.filter((r) => r.arm === arm);
+          out[arm] = { n: A.length, rcap: med(A.map((r) => r.rcap)),
+                       gcap: med(A.map((r) => r.gcap).filter((v) => v != null)),
+                       speed: med(A.map((r) => r.speed).filter((v) => v != null)),
+                       dpf: med(A.map((r) => r.dpf)),
+                       hit: A.reduce((s, r) => s + r.dhit, 0) };
+        });
+        console.log('[ab:' + _abName + '] rows=' + rows.length + ' kept=' + kept.length
+          + ' (draws/frame gate ' + _abMin + '..' + _abMax + ')');
+        [0, 1].forEach((arm) => {
+          const o = out[arm];
+          console.log('[ab:' + _abName + '] arm' + arm + (arm ? ' (ABLATED)' : ' (baseline)')
+            + ' n=' + o.n + ' renderCap=' + (o.rcap == null ? '--' : o.rcap.toFixed(2))
+            + ' guestCap=' + (o.gcap == null ? '--' : o.gcap.toFixed(2))
+            + ' speed=' + (o.speed == null ? '--' : o.speed.toFixed(3))
+            + ' draws/f=' + (o.dpf == null ? '--' : o.dpf.toFixed(0))
+            + ' hitDelta=' + o.hit);
+        });
+        const valid = !_abHit ? false : (out[1].hit > 0 && out[0].hit === 0);
+        console.log('[ab:' + _abName + '] VALIDITY: ' + (valid ? 'PASS — only the ablated arm advanced 0x'
+          + _abHit.toString(16) : 'FAIL — arms NOT proven to differ (arm0 hit=' + out[0].hit
+          + ', arm1 hit=' + out[1].hit + '); ratio SUPPRESSED'));
+        if (valid && out[0].rcap && out[1].rcap && out[0].n >= 3 && out[1].n >= 3) {
+          const msA = 1000 / out[0].rcap, msB = 1000 / out[1].rcap;
+          console.log('[ab:' + _abName + '] renderCap ablated/baseline = '
+            + (out[1].rcap / out[0].rcap).toFixed(3) + 'x   =>  removed component ~ '
+            + (msA - msB).toFixed(2) + ' ms/frame of ' + msA.toFixed(2)
+            + ' ms  (' + (100 * (msA - msB) / msA).toFixed(1) + '% of the render stage)');
+        }
+        return out;
+      } catch (e) { console.log('[ab:' + _abName + '] report failed: ' + e.message); return null; }
+    };
   }
 
   // ---- [scene-rate 2026-08-28] PER-WINDOW rate time series -----------------
@@ -2885,6 +3024,9 @@ function startServer() {
       }
     } catch (e) { console.log('[vtxAB] dump failed: ' + e.message); }
   }
+
+  // [generic ablation A/B 2026-08-29] per-arm medians + the validity gate.
+  if (typeof global.__abReport === 'function') { try { await global.__abReport(); } catch (_e) {} }
 
   try { await browser.close(); } catch (_e) {}
   srv.close();

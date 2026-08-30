@@ -14,6 +14,7 @@
 
 #include "VideoBackends/WGPU/WGPUGfx.h"
 
+#include "VideoCommon/BemStageTimer.h"  // [render-stage split 2026-08-29 TEMP]
 #include "VideoCommon/CPMemory.h"   // [xf-diag PM36 TEMP] g_main_cp_state.matrix_index_a
 #include "VideoCommon/IndexGenerator.h"
 #include "VideoCommon/PixelShaderManager.h"
@@ -168,6 +169,10 @@ namespace
 // Sizes (a few MB each, generously). These wrap with a rolling offset; no fences (WebGPU's
 // queueWriteBuffer serializes into the queue, so a wrap reuses bytes the GPU already consumed for
 // earlier-submitted frames — acceptable for B2's correctness-first milestone).
+// [LEVER: upload coalescing 2026-08-29] live instance for the extern "C" hook
+// bem_wgpu_flush_pending_uploads(), called from WGPUGfx::SubmitFrame.
+static WGPUVertexManager* s_bem_wgpu_vm = nullptr;
+
 constexpr u64 VERTEX_BUFFER_SIZE = 16 * 1024 * 1024;
 constexpr u64 INDEX_BUFFER_SIZE = 4 * 1024 * 1024;
 constexpr u64 UNIFORM_BUFFER_SIZE = 8 * 1024 * 1024;
@@ -213,6 +218,11 @@ bool WGPUVertexManager::Initialize()
   // CPU staging arenas (the base class points m_cur_buffer_pointer at m_vertex_cpu in ResetBuffer).
   m_vertex_cpu.resize(VERTEX_BUFFER_SIZE);
   m_index_cpu.resize(INDEX_BUFFER_SIZE / sizeof(u16));
+  // [LEVER: upload coalescing 2026-08-29] ring mirrors, +20 MB of wasm heap
+  // against INITIAL_MEMORY=512 MB. Only touched when cell 0x026B3930 is set.
+  m_vertex_stage.resize(VERTEX_BUFFER_SIZE);
+  m_index_stage.resize(INDEX_BUFFER_SIZE);
+  s_bem_wgpu_vm = this;  // [LEVER: upload coalescing] arm the SubmitFrame hook
 
   MAIN_THREAD_EM_ASM({ postMessage({cmd: 'print', txt:
     '[wgpu] vertex manager init vbuf=' + ($0 ? 'OK' : 'NULL') + ' ibuf=' + ($1 ? 'OK' : 'NULL')
@@ -320,9 +330,39 @@ void WGPUVertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 nu
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3588u)) =
         (num_vertices << 16) | (vertex_stride & 0xFFFFu);
   }
-  if (queue && m_vertex_buffer && vertex_data_size > 0)
-    wgpuQueueWriteBuffer(queue, m_vertex_buffer, m_vertex_offset, m_vertex_cpu.data(),
-                         static_cast<size_t>(vertex_write_size));
+  // [draw-ablation TEMP 2026-08-29] ARM C: cell 0x026B3B38 nonzero => skip BOTH
+  // per-batch wgpuQueueWriteBuffer calls (vertex here, index below). MEASUREMENT
+  // ARM ONLY (the GPU then draws whatever bytes the ring last held). It splits the
+  // 35.5% that ARM A' removes into UPLOAD vs ENCODE: ARM A (WGPUGfx::DrawIndexed)
+  // removes the encode but leaves these writes, so ARM C is the complement.
+  // SAB is browser-zeroed => cold boot = NOT ablated.
+  const bool _bem_skip_upload =
+      *reinterpret_cast<volatile u32*>(BemStage::kAblUploadCell) != 0u;
+  if (_bem_skip_upload)
+    ++*reinterpret_cast<volatile u32*>(BemStage::kAblUploadHitCell);
+  // [LEVER: upload coalescing 2026-08-29] read the arm ONCE per batch so the
+  // vertex and index halves can never disagree inside one CommitBuffer.
+  const bool _bem_coalesce = *reinterpret_cast<volatile u32*>(BemStage::kCoalesceCell) != 0u;
+  if (!_bem_skip_upload && m_vertex_buffer && vertex_data_size > 0)
+  {
+    if (_bem_coalesce)
+    {
+      std::memcpy(m_vertex_stage.data() + m_vertex_offset, m_vertex_cpu.data(),
+                  static_cast<size_t>(vertex_write_size));
+      if (m_vertex_offset < m_pend_v_lo)
+        m_pend_v_lo = m_vertex_offset;
+      if (m_vertex_offset + vertex_write_size > m_pend_v_hi)
+        m_pend_v_hi = m_vertex_offset + vertex_write_size;
+      ++*reinterpret_cast<volatile u32*>(BemStage::kCoalesceHitCell);
+    }
+    else if (queue)
+    {
+      *reinterpret_cast<volatile u32*>(BemStage::kUploadBytesCell) +=
+          static_cast<u32>(vertex_write_size);  // [census 2026-08-29]
+      wgpuQueueWriteBuffer(queue, m_vertex_buffer, m_vertex_offset, m_vertex_cpu.data(),
+                           static_cast<size_t>(vertex_write_size));
+    }
+  }
   // [sab-diag PM35] first 4 indices (two u16 pairs) @0x026B35E8/EC + num_indices @0x35F0 —
   // all-zero indices = degenerate triangles = the zero-fragment mechanism the vertex probe
   // couldn't see. Three plain stores, no loop; read by dolphin_render_probe.js:717 (`idx`).
@@ -333,12 +373,66 @@ void WGPUVertexManager::CommitBuffer(u32 num_vertices, u32 vertex_stride, u32 nu
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35ECu)) = iw[1];
     *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B35F0u)) = num_indices;
   }
-  if (queue && m_index_buffer && index_data_size > 0)
-    wgpuQueueWriteBuffer(queue, m_index_buffer, m_index_offset, m_index_cpu.data(),
-                         static_cast<size_t>(index_write_size));
+  if (!_bem_skip_upload && m_index_buffer && index_data_size > 0)
+  {
+    if (_bem_coalesce)
+    {
+      std::memcpy(m_index_stage.data() + m_index_offset, m_index_cpu.data(),
+                  static_cast<size_t>(index_write_size));
+      if (m_index_offset < m_pend_i_lo)
+        m_pend_i_lo = m_index_offset;
+      if (m_index_offset + index_write_size > m_pend_i_hi)
+        m_pend_i_hi = m_index_offset + index_write_size;
+    }
+    else if (queue)
+    {
+      *reinterpret_cast<volatile u32*>(BemStage::kUploadBytesCell) +=
+          static_cast<u32>(index_write_size);  // [census 2026-08-29]
+      wgpuQueueWriteBuffer(queue, m_index_buffer, m_index_offset, m_index_cpu.data(),
+                           static_cast<size_t>(index_write_size));
+    }
+  }
 
   m_vertex_offset += vertex_write_size;
   m_index_offset += index_write_size;
+}
+
+// [LEVER: upload coalescing 2026-08-29] One writeBuffer per ring per submit.
+// Correctness: queue.writeBuffer is ordered ahead of every command buffer
+// submitted AFTER it, and the ONLY command buffer that reads these rings is
+// m_encoder, submitted at WGPUGfx.cpp:333 immediately below this call. So every
+// draw recorded since the last submit sees its own bytes. Ring wrap is safe for
+// the same reason it already was: the wrap paths in CommitBuffer /
+// UploadAllConstants call SubmitFrame BEFORE zeroing an offset, and SubmitFrame
+// calls this first, so a wrap can never strand a pending range or overwrite
+// bytes a recorded-but-unsubmitted draw still references.
+void WGPUVertexManager::FlushPendingUploads()
+{
+  WGPUGfx* gfx = WGPUGfx::GetInstance();
+  WGPUQueue queue = gfx ? gfx->GetQueue() : nullptr;
+  if (queue)
+  {
+    if (m_pend_v_hi > m_pend_v_lo && m_vertex_buffer)
+      wgpuQueueWriteBuffer(queue, m_vertex_buffer, m_pend_v_lo,
+                           m_vertex_stage.data() + m_pend_v_lo,
+                           static_cast<size_t>(m_pend_v_hi - m_pend_v_lo));
+    if (m_pend_i_hi > m_pend_i_lo && m_index_buffer)
+      wgpuQueueWriteBuffer(queue, m_index_buffer, m_pend_i_lo,
+                           m_index_stage.data() + m_pend_i_lo,
+                           static_cast<size_t>(m_pend_i_hi - m_pend_i_lo));
+  }
+  m_pend_v_lo = ~0ull;
+  m_pend_v_hi = 0;
+  m_pend_i_lo = ~0ull;
+  m_pend_i_hi = 0;
+}
+
+// C hook so WGPUGfx does not need the WGPUVertexManager type or the
+// g_vertex_manager downcast.
+extern "C" void bem_wgpu_flush_pending_uploads()
+{
+  if (s_bem_wgpu_vm)
+    s_bem_wgpu_vm->FlushPendingUploads();
 }
 
 void WGPUVertexManager::UploadUniforms()

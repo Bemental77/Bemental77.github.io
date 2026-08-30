@@ -47,6 +47,7 @@
 #include "VideoCommon/VertexManagerBase.h"    // [recomp-render] g_vertex_manager->Flush()
 #include "VideoCommon/FramebufferManager.h"   // [recomp-render] g_framebuffer_manager->RefreshPeekCache()
 #include "VideoCommon/VideoBackendBase.h"     // [recomp-bridge] g_video_backend->Video_OutputXFB (explicit present)
+#include "VideoCommon/BemStageTimer.h"        // [render-stage split 2026-08-29 TEMP]
 #include "Core/HW/ProcessorInterface.h"     // [msr-zero watch cause/mask]
 #include "Core/HW/DSP.h"                    // [msr-zero watch dspctl]
 #include "Core/HW/CPU.h"                    // [savestate-fix PM61] resume CPU m_state after load
@@ -565,11 +566,22 @@ extern "C" EMSCRIPTEN_KEEPALIVE void recomp_render_fifo(uint32_t ptr, uint32_t l
 {
   if (len == 0 || !g_vertex_manager)
     return;
-  u8* p = reinterpret_cast<u8*>(static_cast<uintptr_t>(ptr));
-  OpcodeDecoder::RunFifo<false>(DataReader(p, p + len), nullptr);
-  g_vertex_manager->Flush();
-  if (g_framebuffer_manager)
-    g_framebuffer_manager->RefreshPeekCache();
+  // [render-stage split 2026-08-29 TEMP] whole-stage region + in-situ timer-cost
+  // calibration, so the reported split can be corrected by (calls x cost).
+  BemStage::Bump(BemStage::kFrames);
+  {
+    BemStage::Scope _bs(BemStage::kFifoTotal);
+    BemStage::Calibrate();
+    u8* p = reinterpret_cast<u8*>(static_cast<uintptr_t>(ptr));
+    OpcodeDecoder::RunFifo<false>(DataReader(p, p + len), nullptr);
+    g_vertex_manager->Flush();
+    if (g_framebuffer_manager)
+    {
+      BemStage::Scope _bs2(BemStage::kPeekCache);
+      g_framebuffer_manager->RefreshPeekCache();
+    }
+  }
+  BemStage::Publish();
 }
 
 // [recomp-debug 2026-08-26] Direct EFB pixel read — settles "did the 3D draws leave

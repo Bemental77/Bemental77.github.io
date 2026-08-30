@@ -22,6 +22,7 @@
 #include "Core/System.h"
 
 #include "VideoCommon/AbstractGfx.h"
+#include "VideoCommon/BemStageTimer.h"  // [render-stage split 2026-08-29 TEMP]
 #include "VideoCommon/BPMemory.h"
 #include "VideoCommon/CPMemory.h"
 #include "VideoCommon/DataReader.h"
@@ -484,7 +485,11 @@ int RunVertices(int vtx_attr_group, OpcodeDecoder::Primitive primitive, int coun
       DataReader dst = g_vertex_manager->PrepareForAdditionalData(primitive, run, stride,
                                                                   cullall || can_cpu_cull);
 
-      const int num_loaded = loader->RunVertices(src, dst.GetPointer(), run);
+      int num_loaded;
+      {
+        BemStage::Scope _bs(BemStage::kVtxLoad);  // [render-stage split 2026-08-29 TEMP]
+        num_loaded = loader->RunVertices(src, dst.GetPointer(), run);
+      }
       src += loader->m_vertex_size * max_vertices;
 
       if (can_cpu_cull && !cullall)

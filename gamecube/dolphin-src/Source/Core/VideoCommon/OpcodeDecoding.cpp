@@ -20,6 +20,7 @@
 #include "Core/FifoPlayer/FifoRecorder.h"
 #include "Core/HW/Memmap.h"
 #include "Core/System.h"
+#include "VideoCommon/BemStageTimer.h"  // [render-stage split 2026-08-29 TEMP]
 #include "VideoCommon/BPMemory.h"
 #include "VideoCommon/CPMemory.h"
 #include "VideoCommon/CommandProcessor.h"
@@ -46,6 +47,12 @@ public:
 
     if constexpr (!is_preprocess)
     {
+      // [render-stage split 2026-08-29 TEMP] COUNTER ONLY. A Scope here was tried
+      // and REVERTED: at 1514 XF + 5840 BP commands per frame the two clock reads
+      // per scope came to 18,323 reads/frame, which drove RAW fifo from ~15 ms to
+      // 31-55 ms and pushed the corrected walk NEGATIVE. The instrument was larger
+      // than the signal; BP/XF cost is settled by ablation, not by timing.
+      BemStage::Bump(BemStage::kNXF);
       LoadXFReg(address, count, data);
 
       INCSTAT(g_stats.this_frame.num_xf_loads);
@@ -86,6 +93,7 @@ public:
         VertexLoaderManager::g_bases_dirty = true;
       }
 
+      BemStage::Bump(BemStage::kNCP);  // [render-stage split 2026-08-29 TEMP]
       INCSTAT(g_stats.this_frame.num_cp_loads);
     }
     else if constexpr (is_preprocess)
@@ -112,7 +120,19 @@ public:
     }
     else
     {
-      LoadBPReg(command, value, m_cycles);
+      BemStage::Bump(BemStage::kNBP);  // [render-stage split 2026-08-29 TEMP] counter only, see OnXF
+      // [draw-ablation TEMP 2026-08-29] ARM D: cell 0x026B3B34 nonzero => skip the
+      // BP register write. MEASUREMENT ARM ONLY — it deliberately breaks rendering
+      // state; it exists because BP is 5840 calls/frame and cannot be timed without
+      // the instrument dwarfing the signal. SAB is browser-zeroed => cold boot = OFF.
+      if (*reinterpret_cast<volatile u32*>(BemStage::kAblBPCell) != 0u)
+      {
+        ++*reinterpret_cast<volatile u32*>(BemStage::kAblBPHitCell);
+      }
+      else
+      {
+        LoadBPReg(command, value, m_cycles);
+      }
       INCSTAT(g_stats.this_frame.num_bp_loads);
     }
   }
@@ -123,7 +143,10 @@ public:
     if constexpr (is_preprocess)
       PreprocessIndexedXF(array, index, address, size);
     else
+    {
+      BemStage::Bump(BemStage::kNIdx);  // [render-stage split 2026-08-29 TEMP]
       LoadIndexedXF(array, index, address, size);
+    }
   }
   OPCODE_CALLBACK(void OnPrimitiveCommand(OpcodeDecoder::Primitive primitive, u8 vat,
                                           u32 vertex_size, u16 num_vertices, const u8* vertex_data))
@@ -204,6 +227,7 @@ public:
       *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B28A8u)) = address;
       *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B28ACu)) = size;
     }
+    BemStage::Bump(BemStage::kNDL);  // [render-stage split 2026-08-29 TEMP]
     m_cycles += 6;
 
     if (m_in_display_list)
