@@ -16,6 +16,9 @@
 // user reads is the four-term one and not the old bare "FPS: n".
 // Diag pass: opens the diagnostics panel and requires the GPU capability line
 // to sit ABOVE the rolling tail (the crux cannot be allowed to scroll away).
+// Pace pass: asserts the pace governor is WIRED to the real core (_runMainLoop resolved,
+// cartridge region reached its schedule, decisions actually made) and that ?pace=0 is a real
+// control arm; gate #9 re-checked live on both arms.
 // Invariants pass: /n64/ must NOT pull coi-serviceworker.js and must load every
 // UI dependency from its own origin.
 // Emits one JSON line.
@@ -23,7 +26,7 @@ import puppeteer from 'puppeteer';
 
 const rom = process.argv[2] || 'mariokart.z64';
 const base = process.env.N64_PAGE_URL || 'http://localhost:8080/n64/';
-const result = { rom, desktop: {}, mobile: {}, ratetest: {}, meter: {}, diag: {}, invariants: {} };
+const result = { rom, desktop: {}, mobile: {}, ratetest: {}, meter: {}, diag: {}, pace: {}, invariants: {} };
 
 const browser = await puppeteer.launch({
   headless: 'new',
@@ -261,6 +264,110 @@ try {
               t.heapProbeRan && t.baselineVerdict && t.runningVerdictOk);
   }
 
+  // ---------- pace governor: the LIVE wiring ?ratetest=1 structurally cannot reach ----------
+  // ?ratetest drives makePacer against a fake core, so it proves the governor's logic and
+  // nothing about whether it is connected to a real one. This pass asserts the connection:
+  // that _runMainLoop resolved out of the shipped dist, that the cartridge region reached the
+  // governor's schedule, that it actually made decisions, and — the load-bearing one — that
+  // ?pace=0 is a real control arm rather than a label. Gate #9 is re-checked on BOTH arms.
+  {
+    const t = result.pace;
+    const settle = +(process.env.N64_PACE_MS || 12000);
+    const arm = async (query) => {
+      const page = await newPage(t);
+      await page.goto(`${base}?game=${rom}&autostart${query}`, { waitUntil: 'domcontentloaded' });
+      await waitRunning(page);
+      await page.waitForFunction('window.__n64Rate && window.__n64Rate.speed !== null', { timeout: 60000 }).catch(() => {});
+      // THE LOAD-IMMUNE DISCRIMINATOR. Under the shipped rAF-coupled loop the guest advances at
+      // most once per animation frame (mymain.cpp:741 -> the rAF scheduler -> the early return
+      // at :914), so VI fields per second can NEVER exceed host presents per second. It is an
+      // arithmetic ceiling, not a performance one, which is what makes it worth measuring on a
+      // machine far too loaded to compare costs on. Every window is sampled and the largest
+      // excess kept: > 0 is only reachable if production came off the presentation clock.
+      const windows = [];
+      for (let i = 0; i < Math.max(1, Math.round(settle / 1000)); i++) {
+        await new Promise((r2) => setTimeout(r2, 1000));
+        const w = await page.evaluate(() => {
+          const x = window.__n64Rate;
+          if (!x || x.viSpeed === null || x.viHz === null || x.shown === null || !(x.windowMs > 0)) return null;
+          // BOTH SIDES AS RATES. `shown` is a COUNT of presents over a window whose length is
+          // set by a drifting setInterval, while viSpeed*viHz is already per-second. Comparing
+          // them directly made the CONTROL arm read a 1.8-field "excess" out of nothing but a
+          // 0.9 s window. Normalise the count by the window the model actually measured.
+          return { shownPerSec: x.shown / (x.windowMs / 1000), viPerSec: x.viSpeed * x.viHz,
+                   speed: x.speed, ahead: x.ahead, repaying: x.repaying, aheadBy: x.aheadBy,
+                   decoupled: x.decoupled, windowMs: x.windowMs };
+        });
+        if (w) windows.push(w);
+      }
+      const out = await page.evaluate(() => ({
+        pace: window.__n64Pace ? window.__n64Pace() : null,
+        rate: window.__n64Rate || null,
+      }));
+      out.windows = windows;
+      out.maxExcess = windows.length ? Math.max(...windows.map((w) => w.viPerSec - w.shownPerSec)) : null;
+      out.everAhead = windows.some((w) => w.ahead === true);
+      // Gate #9's real statement: the AVERAGE guest rate. Individual windows may sit above
+      // hardware while the governor repays a bounded debt (see N64Rate `repaying`), but every
+      // repaid field was one the wall clock had already been short, so the mean cannot exceed
+      // 1.000x. This is the number that would catch a fast-forward hiding inside "repayment".
+      const sp = windows.map((w) => w.speed).filter((v) => typeof v === 'number' && isFinite(v));
+      out.meanSpeed = sp.length ? sp.reduce((a, b) => a + b, 0) / sp.length : null;
+      out.maxSpeed = sp.length ? Math.max(...sp) : null;
+      out.maxAheadBy = windows.length ? Math.max(...windows.map((w) => w.aheadBy || 0)) : null;
+      await page.close();
+      return out;
+    };
+    const on = await arm('');
+    const off = await arm('&pace=0');
+    t.on = on.pace; t.off = off.pace;
+    t.onSpeed = on.rate && on.rate.speed; t.offSpeed = off.rate && off.rate.speed;
+    // Wired to the real core: both exports resolved out of the shipped dist/n64wasm.js.
+    t.wired = !!(on.pace && on.pace.wired && on.pace.runMainLoop && on.pace.viTotal);
+    // The cartridge region reached the SCHEDULE, not just the meter. mariokart.z64 is PAL.
+    t.regionOk = !!(on.pace && on.pace.viHz === (rom === 'mariokart.z64' ? 50 : 60));
+    // It ran, and it made decisions — a governor that never evaluates is not under test.
+    t.active = !!(on.pace && on.pace.ticks > 0 &&
+                  (on.pace.paced + on.pace.denied + on.pace.notOwed + on.pace.idle) > 0);
+    // THE CONTROL ARM. ?pace=0 must make ZERO calls into the core while still ticking, or every
+    // A/B run against it is meaningless.
+    t.controlArmInert = !!(off.pace && off.pace.off === true && off.pace.enabled === false &&
+                           off.pace.paced === 0 && off.pace.ticks > 0);
+    // ---- the decoupling itself, measured ----
+    t.onMaxExcess = on.maxExcess; t.offMaxExcess = off.maxExcess;
+    t.onWindows = on.windows.length; t.offWindows = off.windows.length;
+    // CONTROL: with the governor off, VI/s can never outrun presents/s. If this ever goes
+    // positive the control arm is not a control and every claim below is void.
+    t.controlNeverExceeds = off.windows.length > 0 && off.maxExcess !== null && off.maxExcess <= 1.0;
+    // RESULT: with it on, production came off the presentation clock in at least one window.
+    // On a machine with no spare capacity the governor correctly refuses to act, so this is
+    // reported but only GATES the run when the machine actually had capacity to prove it with.
+    t.decoupledObserved = on.maxExcess !== null && on.maxExcess > 1.0;
+    t.hadCapacity = !!(on.rate && on.rate.hwX !== null && on.rate.hwX > 1.05);
+    // ---- GATE #9, live, on both arms ----
+    // Stated as the AVERAGE, because that is what the gate is about, and separately as a bound
+    // on the instantaneous overshoot. A window above hardware while a bounded debt is repaid is
+    // legitimate (N64Rate `repaying`); a run whose MEAN is above hardware is a fast-forward,
+    // and an overshoot larger than the debt clamp is one hiding inside repayment.
+    t.onMeanSpeed = on.meanSpeed; t.offMeanSpeed = off.meanSpeed;
+    t.onMaxAheadBy = on.maxAheadBy; t.offMaxAheadBy = off.maxAheadBy;
+    t.meanNotAheadOn = on.meanSpeed !== null && on.meanSpeed <= 1.005;
+    t.meanNotAheadOff = off.meanSpeed !== null && off.meanSpeed <= 1.005;
+    // Overshoot never exceeds the debt the governor is allowed to carry (+1 sampling slack).
+    const budget = (on.pace && on.pace.maxOwed ? on.pace.maxOwed : 4) + 1;
+    t.overshootBounded = on.maxAheadBy !== null && on.maxAheadBy <= budget;
+    // The bug flag itself must stay clear: nothing was ahead by more than repayment explains.
+    t.notAheadOn = !on.everAhead;
+    t.notAheadOff = !off.everAhead;
+    // ...and the pacer's own schedule must agree it is not owed a negative eternity: `owed` is
+    // clamped, so an unclamped value here means the clamp was removed.
+    t.owedClamped = !!(on.pace && Math.abs(on.pace.owed) <= 8.001);
+    t.ok = !!(t.wired && t.regionOk && t.active && t.controlArmInert && t.controlNeverExceeds &&
+              t.notAheadOn && t.notAheadOff && t.meanNotAheadOn && t.meanNotAheadOff &&
+              t.overshootBounded && t.owedClamped &&
+              (t.decoupledObserved || !t.hadCapacity));
+  }
+
   // ---------- standing invariants of this page ----------
   {
     const t = result.invariants;
@@ -275,7 +382,8 @@ try {
     // Nothing loaded off-origin in any of the passes above (eruda is behind ?eruda and unused).
     const off = []
       .concat(result.desktop.offOrigin || [], result.mobile.offOrigin || [],
-              result.ratetest.offOrigin || [], result.meter.offOrigin || [], result.diag.offOrigin || []);
+              result.ratetest.offOrigin || [], result.meter.offOrigin || [], result.diag.offOrigin || [],
+              result.pace.offOrigin || []);
     t.offOriginRequests = [...new Set(off)].slice(0, 8);
     t.noOffOrigin = t.offOriginRequests.length === 0;
     t.ok = !!(t.noCoiServiceWorker && t.vendorSelfHosted && t.noOffOrigin);
@@ -285,10 +393,10 @@ try {
 } finally {
   await browser.close();
 }
-for (const k of ['desktop', 'mobile', 'ratetest', 'meter', 'diag']) {
+for (const k of ['desktop', 'mobile', 'ratetest', 'meter', 'diag', 'pace']) {
   result[k].consoleErrors = (result[k].consoleErrors || []).slice(0, 6);
   result[k].failedRequests = (result[k].failedRequests || []).slice(0, 6);
   delete result[k].offOrigin;   // rolled up into result.invariants
 }
-result.ok = ['desktop', 'mobile', 'ratetest', 'meter', 'diag', 'invariants'].every((k) => result[k].ok === true);
+result.ok = ['desktop', 'mobile', 'ratetest', 'meter', 'diag', 'pace', 'invariants'].every((k) => result[k].ok === true);
 console.log(JSON.stringify(result, null, 1));

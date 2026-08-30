@@ -112,18 +112,31 @@
     0x0C: 'ROUND.W', 0x0D: 'TRUNC.W', 0x0E: 'CEIL.W', 0x0F: 'FLOOR.W',
     0x20: 'CVT.S', 0x21: 'CVT.D', 0x24: 'CVT.W', 0x25: 'CVT.L',
   };
+  var M_CP1_COND = ['F', 'UN', 'EQ', 'UEQ', 'OLT', 'ULT', 'OLE', 'ULE',
+                    'SF', 'NGLE', 'SEQ', 'NGL', 'LT', 'NGE', 'LE', 'NGT'];
   function mnem(word) {
     if (word === 0) return 'NOP';
     var op = (word >>> 26) & 0x3F, rs = (word >>> 21) & 0x1F, rt = (word >>> 16) & 0x1F, fn = word & 0x3F;
     if (op === 0x00) return M_SPECIAL[fn] || ('SPECIAL.' + fn.toString(16));
     if (op === 0x01) return M_REGIMM[rt] || ('REGIMM.' + rt.toString(16));
-    if (op === 0x10) return (rs & 0x10) ? (M_TLB[fn] || ('COP0.' + fn.toString(16))) : (M_CP0[rs] || ('COP0.rs' + rs.toString(16)));
+    if (op === 0x10) {
+      if (rs & 0x10) return M_TLB[fn] || ('COP0.' + fn.toString(16));
+      var c0 = M_CP0[rs];
+      // MFC0/MTC0 carry the CP0 register number: which rd it is decides
+      // whether the op is inert (emittable) or has side effects (Count/
+      // Compare/Status — mips_instructions.def:620-735). A bare "MTC0"
+      // bucket cannot rank that, and ranking it is the whole point.
+      if (c0 === 'MFC0' || c0 === 'MTC0') return c0 + '.' + ((word >>> 11) & 0x1F);
+      return c0 || ('COP0.rs' + rs.toString(16));
+    }
     if (op === 0x11) {
       if (rs === 0x08) return ['BC1F', 'BC1T', 'BC1FL', 'BC1TL'][rt & 3];
       if (M_CP1_SUB[rs] !== undefined) return M_CP1_SUB[rs];
       var f = M_FMT[rs];
       if (f === undefined) return 'COP1.rs' + rs.toString(16);
-      if (fn >= 0x30) return 'C.cond.' + f;
+      // the FP condition selects one of 16 predicates with DIFFERENT NaN
+      // handling (fpu.h:222-300); "C.cond.S" hides which, so name it
+      if (fn >= 0x30) return 'C.' + (M_CP1_COND[fn & 0x0F] || (fn & 0x0F)) + '.' + f;
       return (M_CP1_FN[fn] || ('FN' + fn.toString(16))) + '.' + f;
     }
     return M_OP[op] || ('OP.' + op.toString(16));
@@ -140,7 +153,10 @@
   // guest-invisible scratch region to put them in. Census is a COUNTING arm,
   // never a timing arm — the import call cost cannot change the counts, and
   // ?jit / ?jit=nofp emit byte-identical code to before (bump() returns []).
-  var CENSUS_MAX = 512;
+  // raised from 512 when MFC0/MTC0 gained a per-CP0-register suffix and the
+  // FP compares gained a per-predicate one — the bucket space multiplies
+  // (each also appears as a `<BRANCH>@slot:<MNEM>` variant)
+  var CENSUS_MAX = 4096;
   var census = { on: null, keys: Object.create(null), names: [], counts: new Uint32Array(CENSUS_MAX), over: 0 };
   function censusBump(i) { census.counts[i]++; }
   function censusIdx(key) {
@@ -196,6 +212,15 @@
       if (this.dirty[r]) out = out.concat(storeI64(this.regBase + r * 8, [OP.local_get].concat(leb(L_REG0 + r))));
     }
     return out;
+  };
+  // Emit ONLY the load prologue for reg r (leaves NOTHING on the stack) and
+  // mark it loaded. Needed wherever a later `read` would otherwise emit that
+  // prologue INSIDE a conditional arm while the compile-state claims the
+  // local is live on both arms — see the join note above emitStore.
+  RegCache.prototype.ensure = function (r) {
+    if (this.loaded[r]) return [];
+    this.loaded[r] = true;
+    return loadI64(this.regBase + r * 8).concat([OP.local_set], leb(L_REG0 + r));
   };
   RegCache.prototype.invalidate = function () {
     this.loaded.fill(false);
@@ -408,11 +433,12 @@
   // fast arm is the only continuing path.
   function emitLoad(word, instrPtr, p, C, opsIdx, exitDepth, slow) {
     var op = (word >>> 26) & 0x3F;
-    if (op !== 0x20 && op !== 0x21 && op !== 0x23 && op !== 0x24 && op !== 0x25 && op !== 0x27) return null;
+    if (op !== 0x20 && op !== 0x21 && op !== 0x23 && op !== 0x24 && op !== 0x25 && op !== 0x27 && op !== 0x37) return null;
     var rs = (word >>> 21) & 0x1F, rt = (word >>> 16) & 0x1F;
     var imm = sext16(word & 0xFFFF);
     var tableBase, cmpVal;
-    if (op === 0x23 || op === 0x27) { tableBase = p.readmemW; cmpVal = p.rdRdram; }
+    if (op === 0x37) { tableBase = p.readmemD; cmpVal = p.rdRdramD; }   // LD (wave 9)
+    else if (op === 0x23 || op === 0x27) { tableBase = p.readmemW; cmpVal = p.rdRdram; }
     else if (op === 0x20 || op === 0x24) { tableBase = p.readmemB; cmpVal = p.rdRdramB; }
     else { tableBase = p.readmemH; cmpVal = p.rdRdramH; }
     var shiftB = [OP.local_get, L_ADDR, OP.i32_const, 0x03, OP.i32_and, OP.i32_const, 0x03, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
@@ -426,15 +452,37 @@
       case 0x25: val = [OP.local_get, L_WORD].concat(shiftH, [OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i64_extend_i32_u]); break;
       case 0x21: val = [OP.local_get, L_WORD].concat(shiftH, [OP.i32_shr_u, OP.i32_const], sleb(0xFFFF), [OP.i32_and, OP.i32_extend16_s, OP.i64_extend_i32_s]); break;
     }
+    // ORDER MATTERS — the same emit-call-order trap documented on emitStore.
+    // fastBytes calls C.writeFromStack(rt), which marks rt loaded; if the
+    // address read ran AFTER that and rs == rt (`lw $8, off($8)` — a
+    // ubiquitous pointer chase) the read would collapse to a bare local.get
+    // of a local that is only assigned INSIDE the fast arm, computing the
+    // effective address from wasm's zero-init. Read rs FIRST, always.
+    var addrBytes = C.read(rs).concat([OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR]);
+    // LD (wave 9): readd() reads the word at `a` as the HIGH half and the word
+    // at `a+4` as the LOW half (m64p_memory.c:127-133,
+    // *value = ((uint64_t)w[0] << 32) | w[1]) — the identical shape LDC1
+    // already uses below, just against the GPR file. CHECK_MEMORY is a
+    // load-side no-op, so nothing else changes.
+    var fastBytes = (op === 0x37)
+      ? [].concat(
+          [OP.local_get, L_ADDR, OP.i32_const], sleb(0xFFFFFC), [OP.i32_and],
+          [OP.i32_load, 0x02], leb(p.dramBase), [OP.i64_extend_i32_u, OP.i64_const], sleb(32), [OP.i64_shl],
+          [OP.local_get, L_ADDR, OP.i32_const, 0x04, OP.i32_add, OP.i32_const], sleb(0xFFFFFC), [OP.i32_and],
+          [OP.i32_load, 0x02], leb(p.dramBase), [OP.i64_extend_i32_u],
+          [OP.i64_or],
+          C.writeFromStack(rt))
+      : [].concat(
+          [OP.local_get, L_ADDR, OP.i32_const], sleb(0xFFFFFC), [OP.i32_and],
+          [OP.i32_load, 0x02], leb(p.dramBase), [OP.local_set, L_WORD],
+          val, C.writeFromStack(rt)); // join: rt loaded+dirty (slow arm refreshes the local; its redundant flush is benign)
     return [].concat(
-      C.read(rs), [OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR],
+      addrBytes,
       [OP.local_get, L_ADDR, OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
       [OP.i32_load, 0x02], leb(tableBase),
       [OP.i32_const], sleb(cmpVal), [OP.i32_eq],
       [OP.if_, OP.void_],
-        [OP.local_get, L_ADDR, OP.i32_const], sleb(0xFFFFFC), [OP.i32_and],
-        [OP.i32_load, 0x02], leb(p.dramBase), [OP.local_set, L_WORD],
-        val, C.writeFromStack(rt), // join: rt loaded+dirty (slow arm refreshes the local; its redundant flush is benign)
+        fastBytes,
       [OP.else_],
         bump((slow ? 'SLOTSLOW:' : 'SLOW:') + mnem(word)),
         // continue-after-fallback: snapshot-flush (compile-state untouched —
@@ -477,21 +525,47 @@
   // exactly like the interpreter (a page with no block has invalid_code 1).
   function emitStore(word, instrPtr, p, C, opsIdx, exitDepth, slow) {
     var op = (word >>> 26) & 0x3F;
-    if (op !== 0x28 && op !== 0x29 && op !== 0x2B) return null;
+    if (op !== 0x28 && op !== 0x29 && op !== 0x2B && op !== 0x3F) return null;
     var rs = (word >>> 21) & 0x1F, rt = (word >>> 16) & 0x1F;
     var imm = sext16(word & 0xFFFF);
     var tableBase, cmpVal;
     if (op === 0x2B) { tableBase = p.writememW; cmpVal = p.wrRdram; }
     else if (op === 0x28) { tableBase = p.writememB; cmpVal = p.wrRdramB; }
-    else { tableBase = p.writememH; cmpVal = p.wrRdramH; }
+    else if (op === 0x29) { tableBase = p.writememH; cmpVal = p.wrRdramH; }
+    else { tableBase = p.writememD; cmpVal = p.wrRdramD; }                 // SD (wave 9)
+    // JOIN CONTRACT (fixed 2026-08-29 — this was a latent divergence).
+    // Unlike the CU1 guard, a store's slow arm CONTINUES in-block (it exits
+    // only if the interp op diverged PC), so the two arms JOIN. The address
+    // read (rs) and the value read (rt) must therefore both be emitted
+    // OUTSIDE the if/else: previously `C.read(rt)` was called while building
+    // the fast-arm bytes, which (a) marked rt loaded in the compile-state
+    // while emitting its load prologue only on the fast path — so on the SLOW
+    // path local L_REG0+rt stayed at wasm's zero-init and a later in-block
+    // read of rt saw 0 — and (b) for the rs==rt case made `C.read(rs)` at the
+    // top a bare local.get of that same not-yet-initialised local, computing
+    // the effective address from 0. `ensure(rt)` hoists the load to the top,
+    // and rs is now read BEFORE rt in emit-call order so it owns the prologue.
+    var addrBytes = C.read(rs).concat([OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR]);
+    var rtPre = C.ensure(rt);
     var shiftB = [OP.local_get, L_ADDR, OP.i32_const, 0x03, OP.i32_and, OP.i32_const, 0x03, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
     var shiftH = [OP.local_get, L_ADDR, OP.i32_const, 0x02, OP.i32_and, OP.i32_const, 0x02, OP.i32_xor, OP.i32_const, 0x03, OP.i32_shl];
     // dram word address bytes (push i32 address of the containing word)
     var wordAddr = [OP.local_get, L_ADDR, OP.i32_const].concat(sleb(0xFFFFFC), [OP.i32_and]);
+    var word4Addr = [OP.local_get, L_ADDR, OP.i32_const, 0x04, OP.i32_add, OP.i32_const].concat(sleb(0xFFFFFC), [OP.i32_and]);
     var storeBytes;
     if (op === 0x2B) {
       // SW: dram[word] = (u32)reg[rt]
       storeBytes = wordAddr.concat(C.read(rt), [OP.i32_wrap_i64], [OP.i32_store, 0x02], leb(p.dramBase));
+    } else if (op === 0x3F) {
+      // SD (wave 9): writed() splits the doubleword HIGH-word-first —
+      // write_word(a+0, (u32)(v>>32)); write_word(a+4, (u32)v) — each with
+      // mask ~0, so no read-modify-write (m64p_memory.c:170-181). Identical
+      // shape to SDC1 below. CHECK_MEMORY still tests only the page of `a`:
+      // the interpreter's CHECK_MEMORY() reads the GLOBAL `address`, which
+      // writed()'s own parameter shadows, so it is never advanced to a+4.
+      storeBytes = [].concat(
+        wordAddr, C.read(rt), [OP.i64_const], sleb(32), [OP.i64_shr_u, OP.i32_wrap_i64], [OP.i32_store, 0x02], leb(p.dramBase),
+        word4Addr, C.read(rt), [OP.i32_wrap_i64], [OP.i32_store, 0x02], leb(p.dramBase));
     } else {
       var isByte = (op === 0x28);
       var maskC = isByte ? 0xFF : 0xFFFF;
@@ -510,7 +584,7 @@
     }
     var checkMemory = checkMemoryBytes(p);
     return [].concat(
-      C.read(rs), [OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR],
+      addrBytes, rtPre,
       [OP.local_get, L_ADDR, OP.i32_const, 0x10, OP.i32_shr_u, OP.i32_const, 0x02, OP.i32_shl],
       [OP.i32_load, 0x02], leb(tableBase),
       [OP.i32_const], sleb(cmpVal), [OP.i32_eq],
@@ -534,14 +608,21 @@
   // arm is snapshot-flush + interp call + unconditional exit. Pointer-bank
   // indirection is performed at RUNTIME (reg_cop1_simple/double[i] loads),
   // which makes Status.FR bank flips automatically correct.
-  function cuGuard(p, C, nativeBytes, instrPtr, opsIdx, exitDepth, word, slow) {
+  // `preFlush` MUST be the caller's C.flushSnapshot() captured BEFORE it built
+  // nativeBytes (fixed 2026-08-29). MFC1/DMFC1 end their native arm with
+  // C.writeFromStack(rt), which marks rt DIRTY; calling flushSnapshot() here
+  // would then emit, on the CU1-CLEAR arm, a store of a wasm local that is
+  // only assigned on the CU1-SET arm — writing zero over the guest register
+  // and only then handing control to the interpreter. flushSnapshot() does not
+  // mutate compile-state, so capturing it early is free and always safe.
+  function cuGuard(p, C, nativeBytes, instrPtr, opsIdx, exitDepth, word, slow, preFlush) {
     return [].concat(
       loadI32(p.cp0Status), [OP.i32_const], sleb(0x20000000), [OP.i32_and],
       [OP.if_, OP.void_],
         nativeBytes,
       [OP.else_],
         bump((slow ? 'SLOTCU1MISS:' : 'CU1MISS:') + mnem(word)),
-        C.flushSnapshot(),
+        preFlush,
         // in a delay slot the coprocessor-unusable exception needs delay_slot
         // set, which only the interpreter does — hand back the whole branch
         storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
@@ -556,6 +637,8 @@
   function emitCop1(word, instrPtr, p, C, opsIdx, exitDepth, slow) {
     var op = (word >>> 26) & 0x3F;
     if (op !== 0x11) return null;
+    // captured BEFORE `nat` is built — see the note on cuGuard
+    var preFlush = C.flushSnapshot();
     var sub = (word >>> 21) & 0x1F;       // rs field: move/bc/fmt
     var rt = (word >>> 16) & 0x1F;        // GPR for moves; ft for arith
     var fs = (word >>> 11) & 0x1F;
@@ -600,7 +683,7 @@
     } else {
       return null; // BC1 branches, fmt W/L: fallback
     }
-    return cuGuard(p, C, nat, instrPtr, opsIdx, exitDepth, word, slow);
+    return cuGuard(p, C, nat, instrPtr, opsIdx, exitDepth, word, slow, preFlush);
   }
 
   // LWC1/LDC1/SWC1/SDC1: CU1 guard outside, then the same live-dispatch-table
@@ -608,6 +691,8 @@
   function emitCop1Mem(word, instrPtr, p, C, opsIdx, exitDepth, slow) {
     var op = (word >>> 26) & 0x3F;
     if (op !== 0x31 && op !== 0x35 && op !== 0x39 && op !== 0x3D) return null;
+    // captured BEFORE `nat` is built — see the note on cuGuard
+    var preFlush = C.flushSnapshot();
     var base = (word >>> 21) & 0x1F, ft = (word >>> 16) & 0x1F;
     var imm = sext16(word & 0xFFFF);
     var ea = C.read(base).concat([OP.i32_wrap_i64, OP.i32_const], sleb(imm), [OP.i32_add, OP.local_set, L_ADDR]);
@@ -646,7 +731,37 @@
         slowArm(p, C, instrPtr, opsIdx, exitDepth + 2, slow, -1), // inside cu-if + this if
       [OP.end]
     );
-    return cuGuard(p, C, nat, instrPtr, opsIdx, exitDepth, word, slow);
+    return cuGuard(p, C, nat, instrPtr, opsIdx, exitDepth, word, slow, preFlush);
+  }
+
+  // ---- COP0 (wave 10a) ----
+  // MFC0 is exactly `rrt = SE32(g_cp0_regs[rd])` for every rd EXCEPT RANDOM
+  // (1) and COUNT (9), which call cp0_update_count() first
+  // (mips_instructions.def:618-634). There is no coprocessor-usable check on
+  // this path, so MFC0 cannot fault and needs no delay-slot bail arm.
+  //
+  // MTC0 is deliberately NOT emitted. It is not the symmetric write: Count,
+  // Compare and Status run event-queue surgery, an FR-bit FPR shuffle and an
+  // inline interrupt poll (:636-735). The runtime census says that is exactly
+  // where the traffic is -- MTC0.12 (Status) is 22-28% of all remaining
+  // fallbacks on pkmnsnap/flyingDragon -- so a native "inert registers only"
+  // MTC0 would buy nearly nothing while adding a side-effect surface.
+  //
+  // g_cp0_regs' base is not in the param block, but two of its elements are:
+  // p.count is &g_cp0_regs[CP0_COUNT_REG] (index 9) and p.cp0Status is
+  // &g_cp0_regs[CP0_STATUS_REG] (index 12), both uint32_t (cp0_private.h:27,
+  // cp0.h:104-132; recomp.c:2514,2536). Their byte difference is therefore
+  // exactly 12, and that identity is ASSERTED at emit time -- if the core's
+  // layout ever changes, this returns null and the op falls back rather than
+  // computing an address from a stale assumption.
+  function emitCop0(word, p, C) {
+    if (((word >>> 26) & 0x3F) !== 0x10) return null;
+    if (((word >>> 21) & 0x1F) !== 0x00) return null;      // MFC0 only (rs field)
+    var rt = (word >>> 16) & 0x1F, rd = (word >>> 11) & 0x1F;
+    if (rd === 1 || rd === 9) return null;                 // RANDOM / COUNT: cp0_update_count() first
+    if ((p.cp0Status - p.count) !== 12) return null;       // layout guard (see above)
+    return loadI32((p.count - 9 * 4) + rd * 4)
+      .concat([OP.i64_extend_i32_s], C.writeFromStack(rt));
   }
 
   // ---- delay-slot codegen (wave 8) ----
@@ -665,7 +780,12 @@
   // clear) hands the WHOLE BRANCH back to the interpreter and exits, which
   // re-runs branch+slot with the flag set. See slowArm().
   function emitSlotNative(word, slotPtr, p, Cx, opsIdx, exitD, slow) {
-    var r = emitLoad(word, slotPtr, p, Cx, opsIdx, exitD, slow);
+    // MFC0 is fault-free (no coprocessor-usable check, no memory access), so
+    // it is safe in a delay slot with no bail arm: g_dev.r4300.delay_slot can
+    // never be observed by it.
+    var r = emitCop0(word, p, Cx);
+    if (r) return r;
+    r = emitLoad(word, slotPtr, p, Cx, opsIdx, exitD, slow);
     if (r) return r;
     r = emitStore(word, slotPtr, p, Cx, opsIdx, exitD, slow);
     if (r) return r;
@@ -676,7 +796,7 @@
   }
 
   // ---- block compiler ----
-  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeMemSlots: 0, nativeLoads: 0, nativeStores: 0, nativeFP: 0, fallbackOps: 0, fails: 0, slotReuses: 0, distinctSlots: 0 };
+  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeMemSlots: 0, nativeLoads: 0, nativeStores: 0, nativeFP: 0, nativeCop0: 0, fallbackOps: 0, fails: 0, slotReuses: 0, distinctSlots: 0 };
   // table slot per guest entry address: a recompile REUSES its slot via
   // wasmTable.set, unrooting the previous instance for GC — the table is
   // bounded by distinct block entries, not by recompile churn (vaddr keys
@@ -857,6 +977,15 @@
       if (fp) {
         body = body.concat(fp);
         stats.nativeFP++;
+        i++;
+        continue;
+      }
+
+      // (f) native COP0 (MFC0)?
+      var c0 = emitCop0(word, p, C);
+      if (c0) {
+        body = body.concat(c0);
+        stats.nativeCop0++;
         i++;
         continue;
       }

@@ -128,3 +128,21 @@ compile error under the wasm flags).
   tools/n64_page_test.mjs (shell e2e). Audio truth: speed = audio write rate
   vs 88200 i16/s; the core's GameFPS overlay is the game's internal
   framerate, NOT emulator speed.
+- **JIT harnesses**, cheapest first — use them in this order:
+  - `tools/n64_emit_unit_test.mjs [emitter.js]` — no browser, no ROM, ~1s.
+    Executes emitted blocks against a synthetic guest and checks the guest
+    register file. Takes the emitter path as an argument so a suspect
+    revision can be tested directly. Run this BEFORE burning a probe.
+  - `tools/n64_jit_diff_test.mjs <rom> [frames] [jitMode]` — the oracle:
+    per-VI architectural checksum, interpreter vs ?jit, with a mandatory
+    two-interpreter determinism control.
+  - `tools/n64_jit_census.mjs <rom> [warmupVI] [windowVI]` — runtime
+    fallback ranking in a driven gameplay window. A COUNTING arm, so its
+    numbers survive a loaded machine when no timing number does.
+  - `tools/n64_gameplay_ab.mjs <rom> [ab|ba] [warmupVI] [windowVI]` —
+    interpreter vs ?jit over the SAME guest window. Unlike
+    `tools/_jit_speed_ab.mjs` it counts the window in VI FRAMES rather than
+    wall seconds (a wall settle lands a fast arm and a slow arm in different
+    scenes) and paces input on VI thresholds rather than wall time. Reports
+    wall ms/frame AND process-tree CPU ms/frame, with load and
+    CPU_Speed_Limit sampled before and after every arm.

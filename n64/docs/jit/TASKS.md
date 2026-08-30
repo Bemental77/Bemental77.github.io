@@ -187,27 +187,312 @@ verified separately as a no-op before the slot work landed.
     gauntlet   SD 75.0% | LD 10.4% | SLOW:SW 4.2% | SLOW:LW 4.2% | MFC0 4.2%
 
 Three classes, in measured order:
-- [ ] Wave 9 — **SD/LD (64-bit store/load)**: the single largest remaining
-      bucket on 3 of 4 titles (gauntlet 85% of all fallbacks). The dword
-      dispatch tables are already in the param block (`readmemD`/`writememD`
-      /`rdRdramD`/`wrRdramD`, used by LDC1/SDC1) — this is the same fast-arm
-      shape against the GPR file.
-- [ ] Wave 10 — **MFC0/MTC0**: 27-49% of what remains on sm64/oot/mariokart.
-      MFC0 is a plain `g_cp0_regs[rd]` read for most rd; MTC0 is NOT (Count/
-      Compare/Status/Cause have side effects and an interrupt poll), so emit
-      MFC0 native + MTC0 only for the inert registers, else fall back.
+- [x] Wave 9 — **SD/LD (64-bit store/load)** — DONE 2026-08-29, see below.
+- [x] Wave 10a — **MFC0** — DONE 2026-08-29, see below. MTC0 is deliberately
+      NOT emitted; the census below shows why.
 - [ ] Wave 11 — **FP converts/compares/branches**: TRUNC.W.S, CVT.*,
       C.cond.*, BC1F/BC1FL. Explicit rounding modes and FCR31 condition
       bits; the GC lfs/stfs lesson applies — bit-exactness tests first.
+      **This is now the #1 remaining class on 4 of the 8 heavy titles** —
+      see "Re-ranked against the heavy set" below.
+
+## Re-ranked against the HEAVY SET, not the reference trio (2026-08-29)
+
+The ranking above was measured on mariokart/sm64/oot/gauntlet. Re-running
+`tools/n64_jit_census.mjs <rom> 600 900` against the eight titles that are
+actually below 80% of hardware gives a MATERIALLY DIFFERENT order — this is
+the wave-5b lesson again, one level up: a ranking measured on the wrong ROMs
+points at the wrong opcode. Percentages are shares of all fallback
+EXECUTIONS in a driven gameplay window (the census is a counting arm, so
+these numbers are immune to the machine load that invalidates every timing
+number in this session).
+
+BEFORE wave 9, by class:
+
+    rom                fb/iter  SD/LD  MFC0+MTC0  FPcvt  FPcmp+BC1
+    flyingDragon        0.181   52.8      31.1      3.7      1.5
+    pkmnsnap            0.527   33.5      33.6     20.1      4.8
+    dk64                0.366   24.2       8.2     32.2     14.8
+    bk-jiggiesoftime    0.772   10.3      10.9     41.7     29.1
+    Banjo-Dreamie       0.738   10.3      10.9     41.4     28.9
+    banjoChristmas      0.711    8.8       9.6     43.0     30.5
+    clayFighter         0.559    3.1      56.5     20.1     19.5
+    thewheel               --   census could not complete, see below
+
+So SD/LD leads on only 2 of 7; MFC0/MTC0 leads on clayFighter (56.5%); and
+the FP class (converts + compares + BC1) is the largest on 4 of 7 — 70.9-73.5%
+combined on the three Banjo titles and 47.0% on dk64.
+
+## Wave 9 (2026-08-29) — SD/LD native
+
+`emitLoad`/`emitStore` gained op 0x37 (LD) and 0x3F (SD), using the dword
+dispatch tables already in the param block (`readmemD`/`writememD`/
+`rdRdramD`/`wrRdramD`, recomp.c:2540-2543) — the same live-table fast-arm
+shape LDC1/SDC1 already used, just against the GPR file. `readd`/`writed`
+split the doubleword HIGH word first (m64p_memory.c:127-133, :170-181), and
+`CHECK_MEMORY()` still tests only the page of `a`, because it reads the
+GLOBAL `address` which `writed()`'s own parameter shadows.
+
+- [x] Differential PASS x6 at 600 VI frames with determinism control PASS on
+      every one: mariokart, sm64, oot, flyingDragon, pkmnsnap, dk64.
+      0 emit failures.
+- [x] MEASURED EFFECT — fallback executions per block iteration, same census
+      window, before -> after. The drop tracks the ROM's prior SD/LD share
+      almost exactly, which is the strongest available evidence that wave 9
+      removed that class and nothing else:
+
+        rom             SD/LD share before   fb/iter before -> after   drop
+        flyingDragon         54.1%              0.181 -> 0.087        51.9%
+        pkmnsnap             34.4%              0.527 -> 0.351        33.4%
+        dk64                 24.6%              0.366 -> 0.278        24.0%
+        bk-jiggiesoftime     10.3%              0.772 -> 0.697         9.7%
+        clayFighter           3.1%              0.559 -> 0.642       -14.8%
+
+      SD and LD buckets are now absent from every post-run ranking.
+      Block-iteration counts drifted only -4.1%/+4.0%/+5.6%/+1.4%, so the
+      ratio is meaningful. **clayFighter went the WRONG WAY and that is
+      reported, not hidden**: its SD/LD share was only 3.1%, and the census
+      drive is wall-paced, so run-to-run the window lands in a different
+      scene. For a ROM where the target class is a few percent, that scene
+      variance is larger than the effect — such a pair proves nothing either
+      way and should not be quoted as a regression.
+
+## Wave 10a (2026-08-29) — MFC0 native; MTC0 deliberately NOT
+
+MFC0 is exactly `rrt = SE32(g_cp0_regs[rd])` for every rd except RANDOM (1)
+and COUNT (9), which call `cp0_update_count()` first
+(mips_instructions.def:618-634). There is no coprocessor-usable check on the
+path, so MFC0 cannot fault and is emitted in delay slots with no bail arm.
+
+`g_cp0_regs`' base is not in the param block. It is DERIVED from the two
+elements that are — `p.count` = `&g_cp0_regs[CP0_COUNT_REG]` (index 9) and
+`p.cp0Status` = `&g_cp0_regs[CP0_STATUS_REG]` (index 12), both `uint32_t`
+(cp0_private.h:27, cp0.h:104-132) — so their byte difference must be 12.
+That identity is ASSERTED at emit time; if it ever fails the op falls back
+rather than reading a wrong address. `tools/n64_emit_unit_test.mjs` has a
+case that deliberately breaks the layout and requires the fallback.
+
+**MTC0 is not emitted, and the census is the reason.** Adding the CP0
+register number to the census bucket label turned "MTC0 14-28%" into a
+usable fact: essentially all of it is register 12 (Status) —
+`MTC0.12` is 28.4% of remaining fallbacks on flyingDragon, 28.4% on
+clayFighter, 22.7% on pkmnsnap. MTC0 to Status runs an FR-bit FPR shuffle,
+`cp0_update_count()`, `check_interrupt()` and an inline `gen_interrupt()`
+poll (:687-698). So a native "inert registers only" MTC0 — which is what the
+old wave-10 plan proposed — would have bought approximately nothing while
+adding a side-effect surface. The paired `MFC0.12` reads ARE inert and are
+what wave 10a captures.
+
+Share of post-wave-9 fallback executions that wave 10a addresses:
+flyingDragon 38.0%, clayFighter 28.7%, pkmnsnap 27.4%, dk64 6.3%,
+Banjo titles 5.9-7.3%.
+
+- [x] Differential PASS x5 at 600 VI frames with determinism control PASS on
+      every one: mariokart, sm64, oot, flyingDragon, pkmnsnap. 0 emit
+      failures. The derived-base guard is confirmed LIVE, not just in the
+      unit harness: `__jitStats().nativeCop0` is nonzero in every run
+      (mariokart 16, sm64 18, oot 19, pkmnsnap 13, flyingDragon 12), which is
+      the only proof that `p.cp0Status - p.count === 12` actually holds in
+      the shipped core. Had it not, MFC0 would have silently kept falling
+      back and wave 10a would have been a no-op that still passed every
+      correctness gate. `n64/index.html` now surfaces `nativeCop0` in
+      `__jitStats()` specifically so that can never go unnoticed.
+
+## thewheel.z64 WEDGES UNDER ?jit AT VI 245 — open, pre-existing (2026-08-29)
+
+**This is the first known ?jit LIVENESS failure on a shipped ROM, and it
+blocks the "flip ?jit to default" gate.**
+
+An earlier draft of this section called it "not a JIT problem" on the
+strength of a single interpreter-arm timeout. That was wrong and is corrected
+here; the full evidence:
+
+- `tools/n64_jit_census.mjs thewheel.z64 600 900` (`?jit=census`) aborted:
+  **VI stalled at 245**. This run was on the PRE-wave-9 emitter.
+- `tools/n64_gameplay_ab.mjs thewheel.z64` (wave 9 + 10a emitter):
+  - interpreter arm **COMPLETED** — 885 frames measured, 22.380 ms/frame,
+    36.3 VI/s, luminance 39.4, canvas verifiably changing during the window.
+  - `?jit=emit` arm **stalled at VI 245**, luminance 8.5 (near-black).
+- `tools/n64_jit_diff_test.mjs thewheel.z64 600` timed out at 180s, but the
+  stack puts that in `interpA` — that one is a harness timeout on a slow ROM
+  under load, a DIFFERENT failure mode, and it is what misled the first
+  classification. It says nothing about the JIT either way.
+
+Two independent `?jit` runs stall at the SAME VI (245) while the interpreter
+arm of the same tool, on the same machine, in the same minutes, runs to
+completion. It reproduces on both the pre-wave-9 and the wave-9+10a emitter,
+so it is PRE-EXISTING — not introduced by either wave.
+
+This is the shape README.md's contract item #1 warns about: a block that
+reaches a state where the interrupt poll is never satisfied wedges the tab,
+because the core is single-threaded and one retro_run must end on a VI
+interrupt. Suggested first move: run the differential with a small frame
+count (e.g. `thewheel.z64 260 emit`) to see whether the checksums diverge
+BEFORE the stall, which separates "wrong code, then wedge" from "correct
+code, but a block that stops polling".
+
+## Next by measured weight, AFTER waves 9 + 10a
+
+    rom                fb/iter  MTC0  FPcvt  FPcmp+BC1  offRDRAM  other
+    dk64                0.278    4.8   42.3     19.1       2.8     15.7
+    bk-jiggiesoftime    0.697    5.7   46.1     31.3       2.9      2.1
+    banjoChristmas      0.658    4.6   47.1     33.4       2.6      1.5
+    Banjo-Dreamie       0.670    5.5   45.8     32.1       2.8      1.7
+    clayFighter         0.642   28.4   17.8     24.2       0.6      0.2
+    pkmnsnap            0.351   22.7   29.0      7.0       7.9      3.1
+    flyingDragon        0.087   28.4    7.0      2.9      16.0      4.5
+
+- [ ] **Wave 11 (FP) is now the top lever on the heavy set**: converts plus
+      compares/BC1 are 61.4% (dk64), 77.4-80.5% (the three Banjo titles) and
+      42.0% (clayFighter) of everything still falling back. Two sub-levers,
+      and they are NOT equally risky:
+      - **compares + BC1 are exactly emittable with plain wasm** and should
+        go first. Read fpu.h:222-300: `c_lt_s`/`c_le_s`/`c_seq_s`/`c_ngl_s`/
+        `c_nge_s`/`c_ngt_s` have NO isnan special case at all, and
+        `c_eq_s`/`c_olt_s`/`c_ole_s` clear the bit on NaN — which is exactly
+        what wasm `f32.eq/lt/le` already return for NaN. The `u`-prefixed
+        forms (`c_ueq/ult/ule`) SET the bit on NaN, so they need an explicit
+        `(s != s) | (t != t) |` term. BC1F/BC1T/BC1FL/BC1TL are just a branch
+        on FCR31 bit 23 (0x800000) — and today each one ALSO ends the block,
+        so the wave-8 argument applies: they cost more than their share.
+      - **converts are the risky half.** `trunc_w_s` is `(int32_t)truncf(f)`
+        (fpu.h:126-129) — C undefined behaviour out of range, so its wasm
+        lowering in the SHIPPED dist binary decides the answer, and
+        `cvt_w_s`/`cvt_s_w` route through `set_rounding()`/FCR31&3
+        (fpu.h:64-93, :178-200). Determine what the vendored .wasm actually
+        emitted BEFORE writing an emitter, or the bit-exactness gate will
+        fail on out-of-range and non-default-rounding inputs.
+- [ ] **dk64 has a cheap 64-bit-integer cluster** the reference trio does not:
+      DMULT 3.2% + DADD 3.2% + DSLL32 2.8% + DSRA32 2.8% + DMULTU 2.8%
+      = ~14.7% of its remaining fallbacks, and every one of them is an exact
+      wasm i64 op. Small, low-risk, dk64-specific.
+- [ ] flyingDragon's remaining profile is 16.0% `SLOW:*` — genuinely
+      off-RDRAM accesses taking the interpreter arm, not an unported opcode.
+      That is a different problem class from every wave so far.
+
+## Two join-contract bugs found and fixed (2026-08-29)
+
+Both are the same class, and it is the class this emitter is most exposed to.
+A natively-emitted memory op compiles to `if (table[a>>16] == *_rdram)
+{ fast } else { interp }` and **the slow arm CONTINUES in-block**, so the two
+arms JOIN. The register cache is compile-time state shared across both arms,
+so any `C.read`/`C.writeFromStack` whose BYTES land inside one arm while its
+COMPILE-STATE escapes to both is a latent divergence — the wasm local is
+assigned on only one path, and locals are zero-initialised. Critically this
+depends on emit-CALL order, not byte order: `[].concat(C.read(rs), ...)`
+evaluates left to right, but hoisting the fast-arm bytes into a variable
+first silently inverts that.
+
+1. **`emitStore` (pre-existing, shipped since wave 5).** `C.read(rt)` was
+   called while building the fast-arm bytes. On the SLOW arm the value
+   register's local was never assigned, so a later in-block read of rt saw 0;
+   and for `sw $8, off($8)` the effective address itself was computed from
+   that unassigned local. Fixed by `RegCache.ensure(rt)` hoisting the load
+   above the branch, and by reading rs before rt in emit-call order.
+2. **`cuGuard` (pre-existing, shipped since wave 6).** MFC1/DMFC1 end their
+   native arm with `C.writeFromStack(rt)`, marking rt dirty; `cuGuard` then
+   called `C.flushSnapshot()` for its else arm, which emitted — on the
+   CU1-CLEAR path — a store of a local only assigned on the CU1-SET path,
+   writing zero over the guest register and only then calling the
+   interpreter. Fixed by capturing the snapshot BEFORE building the native
+   bytes (`preFlush` parameter).
+   HONESTY NOTE ON REACH: the CU1-clear arm fires at all (SDC1, 1 and 7
+   executions across two of seven census runs), but the specific
+   MFC1/DMFC1-with-CU1-clear combination was NOT observed in any census
+   window. This is a real bug proven by an executing test; it is not a
+   demonstrated cause of any observed misbehaviour.
+
+A third, self-inflicted instance of the same class was introduced and caught
+DURING wave 9: hoisting `emitLoad`'s fast arm into a `fastBytes` variable
+moved `C.writeFromStack(rt)` ahead of `C.read(rs)`, breaking `lw $8, off($8)`
+— the ubiquitous pointer chase. It diverged oot at frame 74. It was found by
+bisecting against a clean baseline, which is the gate-#8 step that had been
+skipped: the emitter was edited BEFORE the pre-change differential was run.
+Run the baseline first.
+
+## `tools/n64_emit_unit_test.mjs` — the M2 unit corpus (NEW 2026-08-29)
+
+    node tools/n64_emit_unit_test.mjs [path-to-mips_emit.js]
+
+Runs `mips_emit.js` outside the browser (stubbed window/Module, a real
+`WebAssembly.Memory` as the guest address space), EXECUTES the block it
+emits, and reads the guest register file back out of linear memory. ~1
+second, no ROM, no browser. The stub "interpreter op" advances PC by one
+precomp_instr stride, so the slow arm's divergence check passes and the block
+continues exactly as in the core; the slow arm is forced by pointing the
+dispatch table at something that is not `*_rdram`.
+
+22 cases, and every one was RED on some real revision of the emitter — the
+pre-wave-9 emitter fails 16 of them. It takes the file path as an argument
+specifically so a suspect revision can be tested against it directly. This is
+the "unit corpus with red-test discipline" M2 asks for; it does not replace
+the differential, it makes the differential's failures cheap to localise.
+
+## Gameplay baseline attempt on the 8 heavy titles (2026-08-29) — VOID
+
+`tools/n64_gameplay_ab.mjs <rom> <ab|ba> 600 900`, arm order alternated
+across the set. All eight interpreter arms and seven of eight `?jit` arms
+completed with the canvas verifiably changing during the measured window.
+
+    rom                interp ms/f  cpu ms/f  VI/s   load during interp   wallX  cpuX
+    Banjo-Dreamie          9.835     13.25    59.3     129.35 -> 89.14    0.908  0.912
+    pkmnsnap              13.481     18.54    60.5      42.93 -> 35.96    1.143  1.157
+    bk-jiggiesoftime      15.263     18.94    51.4      34.92 -> 39.20    0.498  0.877
+    banjoChristmas        15.512     20.62    56.6     158.96 -> 129.35   0.794  0.869
+    flyingDragon          16.594     35.30    36.8      90.69 -> 103.34   1.147  1.048
+    dk64                  19.622     25.56    44.2      36.49 -> 46.80    0.956  1.014
+    thewheel              22.380     35.91    36.3      76.56 -> 87.10     --     --
+    clayFighter           23.438     34.21    39.3     175.76 -> 131.37   0.623  0.858
+
+**NONE OF THIS IS QUOTABLE, AS EITHER A BASELINE OR A SPEEDUP.** It is
+recorded so the next session does not repeat it, not to be cited. Every one
+of the campaign's own measurement rules is violated by this data:
+
+- Load ran 34.9 to 175.8 DURING measurement (~11 concurrent sibling agent
+  probes plus an emsdk `wasm-metadce` build). `CPU_Speed_Limit` was 52-58
+  throughout and moved mid-round on 5 of 8 ROMs.
+- The paired ratios contradict. dk64's two metrics have OPPOSITE SIGNS
+  (wall 0.956 vs cpu 1.014). bk-jiggiesoftime's `?jit` arm ran while load
+  went 39.2 -> 140.8, and its two metrics are 76% apart (0.498 vs 0.877).
+  A pair that disagrees with itself measures the machine, not the code.
+- Cross-ROM comparison fails its own sanity check: Banjo-Dreamie reads
+  9.835 ms/f at load ~129 while the near-identical bk-jiggiesoftime reads
+  15.263 ms/f at load ~35. The two arms also landed at luminance 9.8 vs
+  42.1 — i.e. different scenes — so even the interpreter column is not
+  measuring comparable work across ROMs.
+
+The one thing worth carrying forward: 5 of the 7 completed pairs read
+`?jit` SLOWER than the interpreter. Under these conditions that is NOT
+evidence of a regression and must not be reported as one — but it is a
+reason to make the FIRST measurement on a quiet machine a wave-8/9/10a
+throughput A/B rather than another emitter wave. Note also that the `?jit`
+arm pays block-compilation cost inside the window whenever the driven scene
+reaches new code, which a 600 VI warmup does not fully absorb.
 
 ## Campaign state (2026-08-29)
-M0-M2 COMPLETE through wave 8. The JIT is correctness-proven (every wave
-600-1200 VI frames bit-identical vs the interpreter on mariokart/sm64/oot
-with GPR+CP0+FPR+FCR31 in the checksum; savestates; invalidation; zero
-emit failures ever shipped). The ?jit flag remains opt-in; the shipped
-default is unchanged interpreter behavior.
+M0-M2 COMPLETE through wave 10a. The JIT is correctness-proven on the ROMs
+it has been gated against (every wave 600-1200 VI frames bit-identical vs the
+interpreter with GPR+CP0+FPR+FCR31 in the checksum; savestates; invalidation;
+zero emit failures ever shipped). The ?jit flag remains opt-in; the shipped
+default is unchanged interpreter behavior — `mips_emit.js` is not even
+fetched without `?jit` (index.html:2254-2259).
+
+Two things that were previously believed and are now known to be false:
+- "correctness-proven" did NOT mean bug-free. Two latent join-contract
+  divergences had been shipped since waves 5 and 6 and survived every
+  differential gate, because reaching them needs a store's off-RDRAM arm (or
+  a CU1-clear MFC1) to coincide with a specific register-liveness pattern.
+  The 600-frame differential is necessary and not sufficient; the new unit
+  corpus exists to cover what it structurally cannot.
+- "all 27 ROMs boot and render" did NOT mean all 27 run under `?jit`.
+  `thewheel.z64` wedges at VI 245 with the JIT on and runs fine without it.
 
 Perf history, most recent first:
+- waves 9 + 10a (2026-08-29): SD/LD and MFC0 native. Fallback executions
+  per block iteration cut 51.9% (flyingDragon), 33.4% (pkmnsnap), 24.0%
+  (dk64) by wave 9 alone; wave 10a addresses a further 38.0/28.7/27.4% of
+  what remained. THROUGHPUT UNMEASURED for both — see the VOID gameplay
+  sweep above.
 - wave 8 (2026-08-29): fallback executions per block iteration cut
   87.9% / 52.1% / 33.4% (mariokart / sm64 / oot) and blocks now loop
   natively — but the THROUGHPUT ratio is UNMEASURED, see wave 8 above.
@@ -223,16 +508,27 @@ Perf history, most recent first:
   DEVICE) remains UNVERIFIED.
 
 NEXT ACTIONS, in order:
-1. On an IDLE, UNTHROTTLED machine: order-alternating A/B to price wave 8.
-   Note the pinned rig (tools/_jit_speed_ab.mjs) measures an ATTRACT scene,
-   not gameplay — an idle-dominated scene reads meaninglessly close to 1.0x.
-   Prefer adding the census tool's input drive to it before believing a
-   headline number.
-2. Waves 9/10/11 by measured weight (SD/LD, MFC0/MTC0, FP converts) — see
-   "Next by MEASURED weight" above. Do NOT reorder these by intuition; they
-   are ranked by runtime execution counts, not by static site counts.
-3. Full-library differential sweep (all 27 ROMs bit-identical per VI) — the
-   gate a5efb66 named before the ?jit default can flip.
+1. **On an IDLE, UNTHROTTLED machine, measure THROUGHPUT before writing any
+   more emitter waves.** `tools/n64_gameplay_ab.mjs <rom> ab|ba 600 900` now
+   exists for exactly this: VI-counted windows and VI-paced input, so both
+   arms traverse the same guest work (the pinned `tools/_jit_speed_ab.mjs`
+   settles by wall clock on an ATTRACT scene and cannot). Waves 8, 9 and 10a
+   are ALL still unpriced. 5 of 7 pairs in the 2026-08-29 sweep read `?jit`
+   slower than the interpreter — discarded as machine noise at load 35-176,
+   but it is the reason this is now action #1 rather than #2.
+2. **Fix the `thewheel.z64` `?jit` wedge at VI 245** — see its section above.
+   It is a shipped ROM and a hard blocker on flipping `?jit` to default.
+3. Wave 11 (FP), now the top measured lever on the heavy set — compares and
+   BC1 first (exactly emittable), converts second (rounding/UB risk). See
+   "Next by measured weight, AFTER waves 9 + 10a".
+4. Full-library differential sweep (all 27 ROMs bit-identical per VI) — the
+   gate a5efb66 named before the ?jit default can flip. `thewheel` already
+   proves this sweep is not a formality.
+
+Standing note for whoever measures next: run
+`node tools/n64_emit_unit_test.mjs` first. It is ~1 second, needs no browser,
+and the wave-9 session lost a full differential cycle to a bug it catches
+instantly.
 
 ## M3 — FPU (COP1) + the long tail
 - [ ] COP1 moves/arith/converts/compares native (the GC lfs/stfs lesson:

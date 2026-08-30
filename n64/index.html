@@ -343,6 +343,153 @@ window.N64Rate = (function () {
     return { hostFps: +m[1], gameFps: +m[2] };
   }
 
+  // ---- THE PACE GOVERNOR — production decoupled from presentation -------------------------
+  // [pace 2026-08-29] THE STRUCTURAL BLOCKER this exists to remove, cited end to end:
+  //
+  //   mymain.cpp:741   emscripten_set_main_loop(mainLoop, 0, 0)      -- fps argument = 0
+  //   dist/n64wasm.js  fps<=0 -> _emscripten_set_main_loop_timing(1,1) -> the rAF scheduler
+  //   mymain.cpp:914   if (disableAudioSync && !doubleSpeed && !IsFrameReady()) return;
+  //
+  // So the guest advances EXACTLY ONCE PER requestAnimationFrame TICK, and never more. That
+  // makes `IsFrameReady()` (mymain.cpp:818-842, a wall-clock budget of FPS frames per second)
+  // a CEILING with no FLOOR underneath it: the moment the host delivers fewer rAF ticks than
+  // the cartridge's field rate, the guest runs BELOW hardware and there is no mechanism
+  // anywhere in the loop that can make the deficit up. Measured on this page, sm64.z64, 12
+  // consecutive 1 s windows: viSpeed tracked shown/60 to within a few percent every window
+  // (shown 60 -> 0.994x, 56 -> 0.937x, 51 -> 0.850x) while `cap` said the CPU could produce
+  // 0.91x-1.44x hardware in the same seconds. That gap is capacity being discarded by an
+  // early return.
+  //
+  // The fix is to call `_runMainLoop()` (mymain.cpp:1403, exported and present in the shipped
+  // dist/n64wasm.js) again after the core's own rAF tick, while the wall clock says frames are
+  // owed. It is EXACTLY the requested decoupling: presentation stays on rAF, guest advance
+  // moves onto the wall clock.
+  //
+  // WHY THIS CANNOT SPEED THE GUEST UP (CLAUDE.md gate #9, by construction rather than by
+  // argument): `_runMainLoop` -> `mainLoop` -> `mainLoopInner`, whose FIRST statement is the
+  // unmodified `IsFrameReady()` gate at mymain.cpp:914. The page forces `disableAudioSync`
+  // (index.html, postLoad) and `doubleSpeed` is false on the shipped path, so every extra call
+  // is arbitrated by the SAME budget that enforces 1.000x today. An extra call with nothing
+  // owed returns having done nothing. There is no path by which this produces a frame the
+  // wall clock did not already owe. The pacer additionally goes inert whenever a measurement
+  // arm owns the guest clock (?turbo=2 sets doubleSpeed, which BYPASSES IsFrameReady —
+  // mymain.cpp:897-900 — so pacing it would be a real gate #9 violation).
+  //
+  // WHY IT CANNOT SPIRAL: catch-up is paid for out of a leaky-bucket duty budget. The bucket
+  // refills at PACE_DUTY ms per ms of wall time and is charged the measured cost of every run,
+  // including the core's own tick. A machine with no spare capacity therefore never gets a
+  // catch-up run at all -- the budget IS the capacity test -- and the per-tick cap bounds the
+  // worst case even when the budget is full.
+  //
+  // ...AND THE BELT, because "by construction" was not enough. Test P7 was written to assert
+  // that a governor deliberately configured to abuse IsFrameReady still could not exceed
+  // 1.000x. IT FAILED, at 1.011x. The cause is the once-a-second re-anchor at the bottom of
+  // IsFrameReady (mymain.cpp:836-840): `if (elapsed > 1000) { fpsThen = fpsNow;
+  // fpsFrameCounter = 0; }` throws away the overshoot and restarts the budget, and the first
+  // call after a reset is always granted (counter 0 > shouldBe 0 is false), so the gate's true
+  // ceiling is ~viHz+1 per second, not viHz. Today that slack is unreachable because rAF only
+  // ever offers one call per tick. Adding calls makes it reachable — which is precisely the
+  // class of mistake gate #9 exists to stop. So the governor ALSO carries its own wall-clock
+  // schedule (`observe`/`owed`) and will only ever run a frame the schedule says is already
+  // OWED. Production is therefore gated by BOTH budgets and can never exceed the tighter one.
+  var PACE_DUTY = 0.85;          // ceiling on the fraction of wall time spent inside the core
+  var PACE_MAX_PER_TICK = 4;     // hard cap on catch-up runs in one animation frame
+  var PACE_CREDIT_MAX_MS = 48;   // ~3 frame periods of burst; also the debt floor
+  var PACE_MAX_OWED = 4;         // frames of debt the schedule will remember; older debt is
+                                 // forgiven rather than sprinted for (this absorbs dropped
+                                 // presents; it is not a mechanism for replaying history)
+
+  // Injected clock AND injected core, so ?ratetest=1 drives the real governor with no
+  // emulator: `io.now()` ms clock, `io.vi()` = _neil_vi_total(), `io.run()` = _runMainLoop().
+  function makePacer(cfg) {
+    cfg = cfg || {};
+    var p = {
+      duty: (cfg.duty > 0) ? cfg.duty : PACE_DUTY,
+      maxPerTick: (cfg.maxPerTick >= 0) ? cfg.maxPerTick : PACE_MAX_PER_TICK,
+      creditMaxMs: (cfg.creditMaxMs > 0) ? cfg.creditMaxMs : PACE_CREDIT_MAX_MS,
+      maxOwed: (cfg.maxOwed > 0) ? cfg.maxOwed : PACE_MAX_OWED,
+      enabled: cfg.enabled !== false,
+      // The cartridge's field rate, from the ROM header. There is NO DEFAULT: with no region
+      // the schedule below cannot be built, and a governor that cannot bound itself must not
+      // run at all. Same discipline the VI witness already applies.
+      viHz: (cfg.viHz > 0) ? cfg.viHz : null,
+      credit: 0, last: null, runMs: 0,
+      owed: 0, oT: null, oVi: null,
+      // per-window counters, drained by the meter
+      paced: 0, denied: 0, idle: 0, notOwed: 0, busyMs: 0, ticks: 0
+    };
+
+    // THE SCHEDULE. `owed` is guest frames the wall clock says should already have happened
+    // and have not: expected minus actual, accumulated, clamped both ways. Positive means the
+    // guest is behind and catch-up is legitimate; zero or negative means it is level or ahead
+    // and catch-up would be a fast-forward. Clamped at +maxOwed so a long slow stretch cannot
+    // be "made up" in a sprint, and at -maxOwed so a run that got ahead does not buy the
+    // governor a permanent lockout.
+    p.observe = function (now, vi) {
+      if (!(p.viHz > 0)) return;
+      if (p.oT === null || p.oVi === null) { p.oT = now; p.oVi = vi >>> 0; return; }
+      var dt = now - p.oT;
+      if (!(dt >= 0)) { p.oT = now; p.oVi = vi >>> 0; return; }
+      p.owed += (dt / 1000) * p.viHz - (((vi >>> 0) - p.oVi) >>> 0);
+      if (p.owed > p.maxOwed) p.owed = p.maxOwed;
+      if (p.owed < -p.maxOwed) p.owed = -p.maxOwed;
+      p.oT = now; p.oVi = vi >>> 0;
+    };
+
+    // Once per host animation frame, AFTER the core's own main-loop callback has run.
+    //   cbMs  wall ms that callback consumed (charged to the budget like any other run)
+    //   armed true when a measurement arm owns the guest clock -> pacer does nothing
+    // Returns the number of guest frames recovered on this tick.
+    p.tick = function (io, cbMs, armed) {
+      var now = io.now();
+      if (p.last === null) p.last = now;
+      var dt = now - p.last; p.last = now;
+      if (dt > 0) p.credit = Math.min(p.creditMaxMs, p.credit + dt * p.duty);
+      if (!(cbMs >= 0)) cbMs = 0;
+      p.ticks++; p.busyMs += cbMs; p.credit -= cbMs;
+      // One bad stall must not lock the governor out forever.
+      if (p.credit < -p.creditMaxMs) p.credit = -p.creditMaxMs;
+      p.observe(now, io.vi());
+      if (!p.enabled || armed || !(p.viHz > 0)) return 0;
+      var got = 0;
+      for (var i = 0; i < p.maxPerTick; i++) {
+        // Price the next run at what the last one cost. Before any catch-up run has been
+        // measured, the core's own tick is the only estimate available and it is the right
+        // one: it is the same call.
+        var est = (p.runMs > 0) ? p.runMs : cbMs;
+        if (!(est > 0)) est = 1;
+        if (p.credit < est) { p.denied++; break; }
+        // GATE #9's belt: only ever produce a frame the schedule already owes.
+        if (p.owed < 1) { p.notOwed++; break; }
+        var vi0 = io.vi() >>> 0;
+        var t0 = io.now();
+        io.run();
+        var spent = io.now() - t0;
+        if (!(spent >= 0)) spent = 0;
+        p.credit -= spent; p.busyMs += spent;
+        p.observe(t0 + spent, io.vi());
+        // THE AUTHORITY IS THE CORE, NOT THIS FILE. If _neil_vi_total did not advance, the
+        // call fell straight out of IsFrameReady (nothing owed) or out of the audio
+        // backpressure branch (mymain.cpp:1176-1183, already ahead). Either way there is no
+        // work to take and pushing further would only burn calls.
+        if ((io.vi() >>> 0) === vi0) { p.idle++; break; }
+        p.runMs = (p.runMs > 0) ? (p.runMs * 0.75 + spent * 0.25) : spent;
+        got++; p.paced++;
+      }
+      return got;
+    };
+
+    // Read-and-clear, called once per meter window.
+    p.drain = function () {
+      var r = { paced: p.paced, denied: p.denied, idle: p.idle, notOwed: p.notOwed,
+                busyMs: p.busyMs, ticks: p.ticks, owed: p.owed, maxOwed: p.maxOwed,
+                enabled: p.enabled && p.viHz > 0 };
+      p.paced = 0; p.denied = 0; p.idle = 0; p.notOwed = 0; p.busyMs = 0; p.ticks = 0;
+      return r;
+    };
+    return p;
+  }
+
   // ---- the model --------------------------------------------------------------------------
   function makeRate(cfg) {
     cfg = cfg || {};
@@ -395,6 +542,8 @@ window.N64Rate = (function () {
         speed: null, speedFrom: null, audioSpeed: null, viSpeed: null, disagree: false,
         viHz: s.viHz, gameHz: null, gameFrac: s.gameFrac, gameFracN: s.gameFracN,
         costMs: null, capVi: null, hwX: null, capFps: null,
+        duty: null, e2eVi: null, e2eHwX: null, paced: null, pacedDenied: null, lost: null,
+        windowMs: null, paceMaxOwed: null, aheadBy: null, repaying: false, decoupled: false,
         shown: (o.shown === undefined ? null : o.shown),
         made: (o.coreFps ? o.coreFps.gameFps : null),
         arm: o.arm || null, starved: false, ahead: false, seam: false, silent: false,
@@ -437,6 +586,31 @@ window.N64Rate = (function () {
             if (s.viHz) r.hwX = r.capVi / s.viHz;
           }
         }
+      }
+
+      // ---- END-TO-END capacity, and what the presentation path costs ------------------------
+      // `o.pace` is the governor's drained window (see makePacer): `busyMs` is wall time spent
+      // inside the core's animation-frame callback AND inside every catch-up run, measured on
+      // this side, so unlike `costMs` it includes the whole presentation path -- overlay draw,
+      // GL submission, the emscripten main-loop wrapper -- not just retro_run.
+      //
+      //   duty     = busyMs / windowMs           the fraction of wall time spent producing
+      //   e2eHwX   = speed / duty                producible hardware multiple, END TO END
+      //
+      // The identity is exact: producing `speed x viHz` fields per second while busy `duty` of
+      // the time means `speed/duty x viHz` fields per second if busy all of it. Where the two
+      // numbers differ, e2e is the smaller and THE GAP IS THE PRESENTATION PATH; where they
+      // coincide, that path costs the CPU nothing. MEASURED on sm64.z64, 12 windows: they
+      // coincide to two decimals in every settled window (cost 9.44 ms -> cap 1.77x, duty 0.57
+      // at 0.999x -> e2e 1.76x). glide2gl issues its GL from inside retro_run and the browser's
+      // own GPU work is off-thread, so there is almost nothing outside the timer to pay for --
+      // which is the answer to "is the shortfall work or delivery": it is DELIVERY.
+      if (!first && dtSec > 0) r.windowMs = dtSec * 1000;
+      if (o.pace && !first && dtSec > 0 && o.pace.busyMs >= 0) {
+        r.paced = o.pace.paced; r.pacedDenied = o.pace.denied;
+        r.paceMaxOwed = (o.pace.maxOwed > 0) ? o.pace.maxOwed : null;
+        var duty = (o.pace.busyMs / 1000) / dtSec;
+        if (duty > 0 && duty <= 1.5) r.duty = duty;
       }
 
       s.mT = t; s.mVi = o.vi; s.mCostMs = o.costMs; s.mCostN = o.costN;
@@ -488,10 +662,52 @@ window.N64Rate = (function () {
       if (s.gameFrac !== null && s.viHz && s.gameFracN >= GAME_RATE_WARMUP) r.gameHz = s.gameFrac * s.viHz;
       if (r.gameHz !== null && r.hwX !== null) r.capFps = r.gameHz * r.hwX;
 
+      // End-to-end multiple and the deficit, both derived from the measured guest rate.
+      if (r.duty !== null && r.duty > 0 && r.speed !== null) {
+        r.e2eHwX = r.speed / r.duty;
+        if (s.viHz) r.e2eVi = r.e2eHwX * s.viHz;
+      }
+      // `lost` = the guest frames this second SHOULD have contained and did not. It is the
+      // headline cost of the coupling: at 0.90x on a 60 Hz cartridge, six fields never
+      // happened. The pacer's job is to drive this to zero out of measured spare capacity, so
+      // reporting `paced` without it would only ever flatter the change.
+      if (s.viHz && r.speed !== null && !r.arm) r.lost = Math.max(0, Math.round(s.viHz * (1 - r.speed)));
+      // THE ATTRIBUTABLE ONE. `paced` is NOT a rescue count -- once the governor takes over the
+      // rhythm the core's own tick starts arriving early and getting refused, so a catch-up
+      // call produces the frame instead and the counter climbs on a run with nothing wrong
+      // (?ratetest P6c measures exactly that: 66 catch-up frames for a gain of 16). What CANNOT
+      // be faked is the guest holding hardware rate on fewer host presents than the cartridge
+      // has fields -- under the rAF-coupled loop that is arithmetically impossible, because the
+      // guest advanced at most once per present. So this is the flag that says the two rates
+      // came apart, and it is stated in the units of both.
+      //
+      // It is scored on the VI WITNESS, not on the audio one, because it is a claim about
+      // FIELDS against PRESENTS and both of those counters come from the same window. The
+      // first live window of a boot proved why: audio read 1.075x on a window where VI read
+      // 0.729x, and scored on audio the flag fired on a run that was nowhere near hardware
+      // rate. It is also bounded ABOVE -- a guest running fast is a bug (r.ahead), never a
+      // decoupling result -- and needs two presents of margin, because `shown` is counted on
+      // this side by a timer that is not frame-aligned and is good to about +/-1.
+      r.decoupled = !r.arm && !!s.viHz && r.viSpeed !== null && r.viSpeed >= 0.99 && r.viSpeed <= 1.02 &&
+                    r.shown !== null && r.shown !== undefined && r.shown < s.viHz - 1;
+
       r.starved = !r.arm && r.speed < 0.98;
       // GATE #9: the shipped path must run the guest at EXACTLY 1.000x. Running it FASTER is
       // not a win, it is a bug, and it has to be visible as one rather than read as headroom.
-      r.ahead = !r.arm && r.speed > 1.02;
+      //
+      // REPAYMENT IS THE ONE EXCEPTION, AND IT IS BOUNDED. A governor that makes up a frame
+      // dropped a moment ago necessarily puts MORE than viHz fields into the second it repays
+      // in — that is what recovery is. What keeps it from being a fast-forward is that the debt
+      // it may repay is clamped (makePacer maxOwed, 4 fields), so the instantaneous overshoot
+      // has a hard ceiling and the AVERAGE cannot exceed 1.000x: every repaid field was one the
+      // wall clock had already been short. So a window is only ahead by an amount the debt
+      // budget could account for, it is REPAYING; anything larger is the bug the flag is for.
+      // Live measurement on sm64 at load 95 is what forced this distinction: the run averaged
+      // 0.966x while individual windows crossed 1.02x.
+      r.aheadBy = (s.viHz && dtSec > 0) ? (r.speed - 1) * s.viHz * dtSec : null;
+      r.repaying = !r.arm && r.speed > 1.02 && r.paceMaxOwed !== null && r.paceMaxOwed !== undefined &&
+                   r.aheadBy !== null && r.aheadBy <= r.paceMaxOwed + 1;
+      r.ahead = !r.arm && r.speed > 1.02 && !r.repaying;
       return r;
     };
     return s;
@@ -511,6 +727,14 @@ window.N64Rate = (function () {
     return num(TARGET_FPS / cap, 1) + 'x short of 120 (needs ' + num(needHw, 1) + 'x hw)' + arm;
   }
 
+  // The END-TO-END multiple, shown beside the retro_run-only one. `cap` excludes the overlay
+  // draw, GL submission and the main-loop wrapper; this includes all of them, so the two
+  // together say how much of the machine's capacity actually survives the presentation path.
+  function e2eText(r) {
+    if (!r || r.e2eHwX === null || r.e2eHwX === undefined || !isFinite(r.e2eHwX)) return '';
+    return ' · ' + num(r.e2eHwX, 2) + 'x e2e';
+  }
+
   // The status-bar headline, as a PURE function of the rate object, so the self-test asserts
   // the exact text the user reads rather than a number that merely resembles it.
   function format(r) {
@@ -520,14 +744,22 @@ window.N64Rate = (function () {
         + (r.speedFrom ? ' ' + r.speedFrom : '')
         + (r.arm ? ' ' + r.arm.toUpperCase() : '')
         + (r.starved ? ' SLOW' : '')
-        + (r.ahead ? ' AHEAD OF HW' : ''),
+        + (r.ahead ? ' AHEAD OF HW' : '')
+        + (r.repaying ? ' REPAYING' : ''),
       (r.capFps === null || r.capFps === undefined)
-        ? ((r.hwX === null || r.hwX === undefined) ? 'cap --' : 'cap ' + num(r.hwX, 2) + 'x hw')
-        : num(r.capFps) + ' fps cap (' + num(r.hwX, 2) + 'x hw)'
+        ? ((r.hwX === null || r.hwX === undefined) ? 'cap --' : 'cap ' + num(r.hwX, 2) + 'x hw' + e2eText(r))
+        : num(r.capFps) + ' fps cap (' + num(r.hwX, 2) + 'x hw' + e2eText(r) + ')'
     ];
     var g = gapText(r);
     if (g) parts.push(g);
     parts.push(num(r.shown) + ' shown / ' + num(r.made) + ' made');
+    // The governor's two honest terms. `lost` is what the coupling still costs -- guest fields
+    // this second never contained -- and driving it to zero is the whole job. `decoupled` is
+    // the proof it was done without touching the guest clock: hardware rate held on fewer host
+    // presents than the cartridge has fields. The raw catch-up count is deliberately NOT here;
+    // it is not an attribution and would read as one (see r.decoupled, ?ratetest P6c).
+    if (r.lost) parts.push(num(r.lost) + ' lost');
+    if (r.decoupled) parts.push('decoupled (' + num(r.viHz) + ' fields on ' + num(r.shown) + ' presents)');
     if (r.disagree) parts.push('WITNESSES DISAGREE');
     return parts.join('  ·  ');
   }
@@ -537,7 +769,9 @@ window.N64Rate = (function () {
     AUDIO_RING: AUDIO_RING, AUDIO_MAX_GAP_MS: AUDIO_MAX_GAP_MS,
     AUDIO_MIN_SPAN_MS: AUDIO_MIN_SPAN_MS, TARGET_FPS: TARGET_FPS,
     regionFromRom: regionFromRom, ringDelta: ringDelta, u32Delta: u32Delta,
-    parseCoreFps: parseCoreFps, makeRate: makeRate, format: format, gapText: gapText, num: num
+    PACE_DUTY: PACE_DUTY, PACE_MAX_PER_TICK: PACE_MAX_PER_TICK, PACE_CREDIT_MAX_MS: PACE_CREDIT_MAX_MS,
+    parseCoreFps: parseCoreFps, makeRate: makeRate, makePacer: makePacer,
+    format: format, gapText: gapText, e2eText: e2eText, num: num
   };
 })();
 </script>
@@ -884,6 +1118,333 @@ N64Rate.selfTest = function (logFn) {
      head.indexOf('speed 1.0') === 0 && head.indexOf('fps cap') > 0 &&
      head.indexOf('short of 120') > 0 && head.indexOf('shown /') > 0, head);
 
+  // ===== P*. THE PACE GOVERNOR ==============================================================
+  // These drive the REAL N64Rate.makePacer against a fake host that mirrors the two pieces of
+  // the core the governor actually depends on: `IsFrameReady` (mymain.cpp:818-842) and the
+  // early return that consumes it (mymain.cpp:914). Nothing here is a model OF the governor —
+  // a model would drift from it; every P test calls it.
+  //
+  // The load-bearing discriminators, each of which turns red if one specific guard is deleted:
+  //   P2  the vi-advance break        (delete it -> every tick burns maxPerTick calls)
+  //   P3  the per-tick cap            (delete it -> one tick can run hundreds of frames)
+  //   P4  the duty budget             (delete it -> catch-up on a machine with no capacity)
+  //   P5  the measurement-arm guard   (delete it -> gate #9 violation: guest past 1.000x)
+  //   P6  the whole feature           (delete it -> dropped presents cost guest frames)
+  //   P7  the `owed` schedule         (delete it -> 1.011x, MEASURED, see makePacer's note)
+  //   P12 no region => no governor    (delete it -> the schedule is built on a guessed 60)
+  function fakeHost(o) {
+    o = o || {};
+    var h = {
+      t: 0, viHz: o.viHz || 60,
+      costMs: (o.costMs === undefined) ? 4 : o.costMs,  // wall cost of producing one VI frame
+      noopMs: (o.noopMs === undefined) ? 0.05 : o.noopMs, // cost of a call the gate rejects
+      refreshHz: o.refreshHz || 60,
+      dropEvery: o.dropEvery || 0,                      // 1 host frame in N never arrives
+      vi: 0, fpsThen: 0, counter: 0, calls: 0
+    };
+    // mymain.cpp:818-842, in shape: a WALL-CLOCK budget of viHz frames per second, with the
+    // once-a-second re-anchor. This is the piece that makes 1.000x a ceiling.
+    h.isFrameReady = function () {
+      var interval = 1000 / h.viHz, elapsed = h.t - h.fpsThen, ready = true;
+      if (h.counter > Math.floor(elapsed / interval)) ready = false;
+      if (ready) h.counter++;
+      if (elapsed > 1000) { h.fpsThen = h.t; h.counter = 0; }
+      return ready;
+    };
+    // mymain.cpp:914 and the retro_run under it.
+    h.mainLoop = function () {
+      h.calls++;
+      if (!h.isFrameReady()) { h.t += h.noopMs; return; }
+      h.t += h.costMs; h.vi++;
+    };
+    h.io = { now: function () { return h.t; }, vi: function () { return h.vi; }, run: function () { h.mainLoop(); } };
+    return h;
+  }
+  // One second of host animation frames. `pacer` may be null (the shipped-today control arm).
+  function runHost(h, pacer, seconds) {
+    var period = 1000 / h.refreshHz, frames = Math.round(h.refreshHz * seconds);
+    for (var i = 0; i < frames; i++) {
+      if (!(h.dropEvery > 0 && (i % h.dropEvery) === (h.dropEvery - 1))) {
+        var t0 = h.t;
+        h.mainLoop();                                   // emscripten's own rAF callback
+        if (pacer) pacer.tick(h.io, h.t - t0, false);
+      }
+      var next = (i + 1) * period;
+      if (h.t < next) h.t = next;                       // idle until the next vsync
+    }
+    return h.vi / seconds;                              // VI frames per wall second
+  }
+
+  // ----- P1/P6. THE HEADLINE BEHAVIOUR: dropped presents must stop costing guest frames -----
+  // 10% of host animation frames never arrive (a loaded machine, a compositor hiccup, a
+  // display that is not exactly 60.000 Hz — the measured case: sm64 showed 51-60 rAF ticks a
+  // second across 12 consecutive windows). Capacity is ample: 4 ms to produce a 16.67 ms frame.
+  var pBase = runHost(fakeHost({ dropEvery: 10, costMs: 4 }), null, 3);
+  var pPacer = N64Rate.makePacer({ viHz: 60 });
+  var pFixed = runHost(fakeHost({ dropEvery: 10, costMs: 4 }), pPacer, 3);
+  ck('P1 WITHOUT the governor, 10% dropped presents cost 10% of the GUEST — 0.90x, unrecoverable',
+     Math.abs(pBase / 60 - 0.9) < 0.03, 'VI/s=' + fx(pBase, 1) + ' speed=' + fx(pBase / 60));
+  ck('P6a WITH it, the same dropped presents are absorbed and the guest holds 1.000x',
+     pFixed / 60 > 0.985, 'VI/s=' + fx(pFixed, 1) + ' speed=' + fx(pFixed / 60));
+  // Not all of it: the recovery runs cost wall time of their own and the schedule's anchor is
+  // only established on the second tick, so ~89% of the deficit comes back and the guest lands
+  // at 0.989x rather than a clean 1.000x. Measured, stated, and pinned — deleting the governor
+  // recovers 0% of it, so the bar still discriminates.
+  ck('P6b ...recovering the large majority of what the drops cost (measured ~89%, bar 85%)',
+     (pFixed - pBase) >= (60 - pBase) * 0.85, 'gained=' + fx(pFixed - pBase, 1)
+     + ' VI/s of the ' + fx(60 - pBase, 1) + ' the drops cost = '
+     + fx(100 * (pFixed - pBase) / (60 - pBase), 0) + '%');
+  // P6c: THE COUNTER THAT MUST NOT REACH THE HEADLINE. Once the governor takes over the
+  // rhythm, the core's own rAF tick starts arriving fractionally early, IsFrameReady refuses
+  // it, and the catch-up call a few ms later produces the frame instead. So the catch-up count
+  // climbs on a perfectly healthy run and is roughly FOUR TIMES the frames actually gained. It
+  // is a diagnostic, not an attribution, and the headline carries `lost` + `decoupled` instead.
+  ck('P6c the raw catch-up count is NOT the rescue count — it is several times larger, which '
+     + 'is why the headline does not quote it',
+     pPacer.paced > (pFixed - pBase) * 3 * 1.5,
+     'catch-up frames=' + pPacer.paced + ' vs VI actually gained=' + fx((pFixed - pBase) * 3, 1));
+
+  // ----- P7. GATE #9, THE ONE THAT FAILED FIRST ---------------------------------------------
+  // Set up to ABUSE the core gate: no dropped frames (nothing is ever legitimately owed), 60
+  // catch-up runs allowed per tick, and a duty budget of 1.0 so the credit never says no.
+  // Written expecting IsFrameReady alone to hold the line. IT DID NOT — 1.011x, because of the
+  // once-a-second re-anchor at mymain.cpp:836-840 (see makePacer). The `owed` schedule is what
+  // holds it now, and this test is what will notice if the schedule is ever removed.
+  var pGreedy = N64Rate.makePacer({ maxPerTick: 60, duty: 1.0, creditMaxMs: 10000, viHz: 60 });
+  var pRate = runHost(fakeHost({ costMs: 2 }), pGreedy, 3);
+  ck('P7a a governor set to abuse the core gate STILL cannot push the guest past 1.000x',
+     pRate / 60 <= 1.002, 'speed=' + fx(pRate / 60) + ' VI/s=' + fx(pRate, 1));
+  ck('P7b ...and it is the wall-clock schedule that refuses, not the credit budget',
+     pGreedy.notOwed > 0 && pGreedy.paced < 5,
+     'paced=' + pGreedy.paced + ' schedule-refusals=' + pGreedy.notOwed + ' denied=' + pGreedy.denied);
+  ck('P7c the same abuse against the UNPACED host is the reference: no faster, no slower',
+     Math.abs(pRate - runHost(fakeHost({ costMs: 2 }), null, 3)) < 0.5,
+     'paced VI/s=' + fx(pRate, 1) + ' unpaced VI/s=' + fx(runHost(fakeHost({ costMs: 2 }), null, 3), 1));
+
+  // ----- P2. The vi-advance break ------------------------------------------------------------
+  // A core that refuses the frame (nothing owed, or the audio-backpressure branch at
+  // mymain.cpp:1176-1183) must stop the pass at ONE probe call, not maxPerTick of them.
+  (function () {
+    var t = 0, calls = 0;
+    var io = { now: function () { return t; }, vi: function () { return 7; }, run: function () { calls++; t += 0.1; } };
+    var p = N64Rate.makePacer({ viHz: 60 });
+    p.credit = 100; p.owed = 4;
+    var got = p.tick(io, 1, false);
+    ck('P2 a core that advances no VI stops the pass after ONE probe call',
+       got === 0 && calls === 1 && p.idle === 1, 'got=' + got + ' calls=' + calls + ' idle=' + p.idle);
+  })();
+
+  // ----- P3. The per-tick cap ---------------------------------------------------------------
+  (function () {
+    var t = 0, vi = 0;
+    var io = { now: function () { return t; }, vi: function () { return vi; }, run: function () { vi++; t += 0.1; } };
+    var p = N64Rate.makePacer({ maxPerTick: 3, viHz: 60 });
+    p.credit = 10000; p.owed = 4;
+    var got = p.tick(io, 1, false);
+    ck('P3 an always-willing core is still capped at maxPerTick runs in one animation frame',
+       got === 3 && vi === 3, 'got=' + got + ' vi=' + vi + ' cap=' + p.maxPerTick);
+  })();
+
+  // ----- P4. THE DUTY BUDGET IS THE CAPACITY TEST --------------------------------------------
+  // 20 ms to produce a 16.67 ms frame: this machine has NO spare capacity. Catch-up must be
+  // refused outright — running it would take wall time the guest has not got and turn a
+  // shortfall into a spiral. The comparison is against the same host with no governor.
+  var pNoCapBase = runHost(fakeHost({ costMs: 20 }), null, 3);
+  var pNoCapP = N64Rate.makePacer({ viHz: 60 });
+  var pNoCap = runHost(fakeHost({ costMs: 20 }), pNoCapP, 3);
+  ck('P4a with no spare capacity the budget refuses every catch-up run',
+     pNoCapP.paced === 0 && pNoCapP.denied > 0,
+     'paced=' + pNoCapP.paced + ' denied=' + pNoCapP.denied);
+  ck('P4b ...and the guest rate is left exactly where it was, not made worse',
+     Math.abs(pNoCap - pNoCapBase) < 1, 'without=' + fx(pNoCapBase, 1) + ' with=' + fx(pNoCap, 1) + ' VI/s');
+
+  // ----- P5. Measurement arms own the guest clock; the governor must go inert ---------------
+  // ?turbo=2 sets doubleSpeed, which BYPASSES IsFrameReady entirely (mymain.cpp:897-900 and
+  // the !doubleSpeed term at :914). Pacing that arm would be a real gate #9 violation, because
+  // the ceiling the whole design leans on is not there.
+  (function () {
+    var t = 0, vi = 0, calls = 0;
+    var io = { now: function () { return t; }, vi: function () { return vi; }, run: function () { calls++; vi++; t += 0.1; } };
+    var p = N64Rate.makePacer({ viHz: 60 });
+    p.credit = 10000; p.owed = 4;
+    var got = p.tick(io, 1, true);   // armed
+    ck('P5 with a measurement arm active the governor makes NO calls at all',
+       got === 0 && calls === 0 && p.paced === 0, 'got=' + got + ' calls=' + calls);
+  })();
+
+  // ----- P8. ?pace=0 is a real control arm, not a label -------------------------------------
+  (function () {
+    var t = 0, vi = 0, calls = 0;
+    var io = { now: function () { return t; }, vi: function () { return vi; }, run: function () { calls++; vi++; t += 0.1; } };
+    var p = N64Rate.makePacer({ enabled: false, viHz: 60 });
+    p.credit = 10000; p.owed = 4;
+    ck('P8 a disabled governor makes no calls, so ?pace=0 is a valid A/B control arm',
+       p.tick(io, 1, false) === 0 && calls === 0, 'calls=' + calls);
+  })();
+
+  // ----- P9/P10. What the meter reports, and the identity behind it -------------------------
+  // e2e = speed / duty. 60 frames a second at 10 ms of END-TO-END wall cost each is 60% duty,
+  // so the machine could do 1/0.6 = 1.67x hardware all-in — while `cap`, which times only
+  // retro_run (8 ms), reads 2.08x. e2e must always be the smaller of the two: the difference
+  // IS the presentation path, and reporting only `cap` is what hid it.
+  (function () {
+    var m = N64Rate.makeRate({ viHz: 60 });
+    var mkPace = function (busyMs) { return { paced: 3, denied: 1, idle: 5, busyMs: busyMs, ticks: 60 }; };
+    m.window(0, { vi: 0, costMs: 0, costN: 0, pace: mkPace(0), shown: 54 });
+    var w = null;
+    for (var k = 1; k <= 5; k++) {
+      for (var j = 0; j < 5; j++) m.audioSample(Math.round((k - 1 + j / 5) * 88200) % 64000, (k - 1) * 1000 + j * 200);
+      // 60 guest fields a second on 54 host presents — the shape the governor produces.
+      w = m.window(k * 1000, { vi: 60 * k, costMs: 8 * 60 * k, costN: 60 * k,
+                               coreFps: { hostFps: 60, gameFps: 30 }, pace: mkPace(600), shown: 54 });
+    }
+    ck('P9a duty is measured end to end from the governor, not from the retro_run timer',
+       near(w.duty, 0.6, 0.02), 'duty=' + fx(w.duty));
+    ck('P9b e2e capacity = speed / duty', near(w.e2eHwX, w.speed / w.duty, 0.01) && near(w.e2eHwX, 1.667, 0.05),
+       'e2eHwX=' + fx(w.e2eHwX, 2) + ' speed=' + fx(w.speed) + ' duty=' + fx(w.duty));
+    ck('P9c e2e can never beat cap — the gap is what the presentation path costs',
+       w.e2eHwX < w.hwX && near(w.hwX, 2.083, 0.05), 'e2e=' + fx(w.e2eHwX, 2) + ' cap=' + fx(w.hwX, 2));
+    ck('P9d the headline shows BOTH multiples, so cap can never be read as end-to-end capacity',
+       N64Rate.format(w).indexOf('2.08x hw · 1.67x e2e') > 0, N64Rate.format(w));
+    ck('P10a at 1.000x nothing is reported lost, and the raw catch-up count stays OUT of the '
+       + 'headline where it would read as a rescue count',
+       w.lost === 0 && w.paced === 3 && N64Rate.format(w).indexOf('paced') < 0, N64Rate.format(w));
+    // P13: THE ATTRIBUTABLE CLAIM. 60 guest fields produced on 54 host presents is arithmetically
+    // impossible under the rAF-coupled loop — one mainLoopInner per present, mymain.cpp:741/914 —
+    // so this flag is the one statement about the change that cannot be manufactured.
+    ck('P13a hardware rate held on FEWER presents than fields is flagged as decoupled',
+       w.decoupled === true && N64Rate.format(w).indexOf('decoupled (60 fields on 54 presents)') > 0,
+       N64Rate.format(w));
+  })();
+  // P13b/c: the flag must not fire on the two cases it would flatter.
+  (function () {
+    var mk = function (o) {
+      var m = N64Rate.makeRate({ viHz: 60 }), w = null;
+      var pc = { paced: 3, denied: 0, idle: 0, notOwed: 0, busyMs: 600, ticks: 60 };
+      m.window(0, { vi: 0, costMs: 0, costN: 0, pace: pc, shown: o.shown });
+      for (var k = 1; k <= 5; k++) {
+        for (var j = 0; j < 5; j++) m.audioSample(Math.round((k - 1 + j / 5) * o.speed * 88200) % 64000, (k - 1) * 1000 + j * 200);
+        w = m.window(k * 1000, { vi: Math.round(60 * o.speed * k), costMs: 8 * 60 * k, costN: 60 * k,
+                                 coreFps: { hostFps: 60, gameFps: 30 }, pace: pc, shown: o.shown, arm: o.arm || null });
+      }
+      return w;
+    };
+    ck('P13b a guest that is NOT at hardware rate is never called decoupled, however few presents',
+       mk({ shown: 40, speed: 0.8 }).decoupled === false, 'speed=0.8 shown=40');
+    // THE LIVE FALSE POSITIVE, pinned. sm64's first boot window really did read audio 1.075x
+    // while VI read 0.729x; scored on the audio witness the flag fired on a window that was
+    // nowhere near hardware rate. It is scored on VI, and bounded above.
+    (function () {
+      var m = N64Rate.makeRate({ viHz: 60 }), w = null;
+      var pc = { paced: 5, denied: 0, idle: 0, notOwed: 0, busyMs: 810, ticks: 35 };
+      m.window(0, { vi: 0, costMs: 0, costN: 0, pace: pc, shown: 35 });
+      for (var k = 1; k <= 5; k++) {
+        // audio says 1.075x; VI says 0.729x — the real disagreeing boot window.
+        for (var j = 0; j < 5; j++) m.audioSample(Math.round((k - 1 + j / 5) * 1.075 * 88200) % 64000, (k - 1) * 1000 + j * 200);
+        w = m.window(k * 1000, { vi: Math.round(60 * 0.729 * k), costMs: 18 * 44 * k, costN: 44 * k,
+                                 coreFps: { hostFps: 44, gameFps: 3 }, pace: pc, shown: 35 });
+      }
+      ck('P13e the boot window where the witnesses disagree is NOT called decoupled',
+         w.decoupled === false && w.speed > 1.0 && w.viSpeed < 0.8,
+         'audio=' + fx(w.audioSpeed) + ' vi=' + fx(w.viSpeed) + ' shown=35 decoupled=' + w.decoupled);
+    })();
+    ck('P13f a guest running FAST is a bug, never a decoupling result',
+       mk({ shown: 40, speed: 1.2 }).decoupled === false && mk({ shown: 40, speed: 1.2 }).ahead === true,
+       'speed=1.2 shown=40');
+    ck('P13c a run with presents to spare is not decoupled either — there is nothing to decouple',
+       mk({ shown: 60, speed: 1 }).decoupled === false, 'speed=1.0 shown=60');
+    ck('P13d a measurement arm can never raise it (gate #9: arms move the GUEST)',
+       mk({ shown: 40, speed: 1, arm: 'turbo2' }).decoupled === false, 'arm=turbo2');
+  })();
+  // ...and the other half: a deficit the governor could NOT absorb must be shown as lost, so
+  // "+N paced" can never be quoted on its own as if the coupling had been solved.
+  (function () {
+    var m = N64Rate.makeRate({ viHz: 60 });
+    var pc = { paced: 0, denied: 40, idle: 0, busyMs: 950, ticks: 54 };
+    m.window(0, { vi: 0, costMs: 0, costN: 0, pace: pc });
+    var w = null;
+    for (var k = 1; k <= 5; k++) {
+      for (var j = 0; j < 5; j++) m.audioSample(Math.round((k - 1 + j / 5) * 0.9 * 88200) % 64000, (k - 1) * 1000 + j * 200);
+      w = m.window(k * 1000, { vi: Math.round(54 * k), costMs: 17 * 54 * k, costN: 54 * k,
+                               coreFps: { hostFps: 54, gameFps: 27 }, pace: pc, shown: 54 });
+    }
+    ck('P10b a 0.90x guest reports the SIX fields a second that never happened',
+       near(w.speed, 0.9, 0.03) && w.lost === 6 && N64Rate.format(w).indexOf('6 lost') > 0,
+       'speed=' + fx(w.speed) + ' lost=' + w.lost);
+    ck('P10c ...and with the machine saturated it is honest that nothing was recoverable, and '
+       + 'the run is NOT dressed up as decoupled',
+       w.paced === 0 && w.decoupled === false && near(w.duty, 0.95, 0.03),
+       'paced=' + w.paced + ' decoupled=' + w.decoupled + ' duty=' + fx(w.duty));
+  })();
+  // ----- P12. No region, no governor --------------------------------------------------------
+  // The schedule is `viHz x elapsed`. With no cartridge region there is no viHz, and the page
+  // has ONE rule about that (PRODUCER 2): never guess 60. A guessed 60 on a PAL cartridge
+  // would make the schedule believe 10 frames a second were owed that are not — a standing
+  // 1.2x fast-forward, on exactly the one ROM in this page's list that is PAL.
+  (function () {
+    var t = 0, vi = 0, calls = 0;
+    var io = { now: function () { return t; }, vi: function () { return vi; }, run: function () { calls++; vi++; t += 0.1; } };
+    var p = N64Rate.makePacer({});           // no viHz
+    p.credit = 10000; p.owed = 10;
+    ck('P12a with no cartridge region the governor is inert rather than guessing 60 Hz',
+       p.viHz === null && p.tick(io, 1, false) === 0 && calls === 0, 'viHz=' + String(p.viHz) + ' calls=' + calls);
+    var pal = N64Rate.makePacer({ viHz: 50, maxOwed: 100 });
+    pal.observe(0, 0); pal.observe(1000, 50);
+    var ntsc = N64Rate.makePacer({ viHz: 60, maxOwed: 100 });
+    ntsc.observe(0, 0); ntsc.observe(1000, 50);
+    ck('P12b a PAL cartridge at its own 50 Hz is owed nothing; scored against 60 it looks 10 behind',
+       Math.abs(pal.owed) < 0.01 && Math.abs(ntsc.owed - 10) < 0.01,
+       'PAL owed=' + fx(pal.owed, 2) + ' vs wrong-region owed=' + fx(ntsc.owed, 2));
+    // ...and the debt clamp: a long stall must be FORGIVEN, not sprinted for. Ten seconds
+    // frozen owes 600 frames; the governor will remember at most maxOwed of them.
+    var stalled = N64Rate.makePacer({ viHz: 60 });
+    stalled.observe(0, 0); stalled.observe(10000, 0);
+    ck('P12c a 10 s stall owes 600 frames and the governor forgives all but maxOwed',
+       Math.abs(stalled.owed - stalled.maxOwed) < 0.01 && stalled.maxOwed <= 8,
+       'owed=' + fx(stalled.owed, 2) + ' maxOwed=' + stalled.maxOwed);
+  })();
+
+  // ----- P14. REPAYMENT vs FAST-FORWARD. The distinction gate #9 turns on ------------------
+  // A governor that makes up a dropped frame necessarily overshoots the second it repays in.
+  // What separates that from a fast-forward is the CLAMP on how much debt may be repaid, so
+  // this is where that clamp is priced: 4 fields of overshoot is repayment, 20 is the bug.
+  (function () {
+    var mk = function (o) {
+      var m = N64Rate.makeRate({ viHz: 60 }), w = null;
+      var pc = { paced: 4, denied: 0, idle: 0, notOwed: 0, busyMs: 500, ticks: 60,
+                 maxOwed: o.maxOwed === undefined ? 4 : o.maxOwed, enabled: true };
+      m.window(0, { vi: 0, costMs: 0, costN: 0, pace: o.noPace ? undefined : pc, shown: 60 });
+      for (var k = 1; k <= 5; k++) {
+        for (var j = 0; j < 5; j++) m.audioSample(Math.round((k - 1 + j / 5) * o.speed * 88200) % 64000, (k - 1) * 1000 + j * 200);
+        w = m.window(k * 1000, { vi: Math.round(60 * o.speed * k), costMs: 8 * 60 * k, costN: 60 * k,
+                                 coreFps: { hostFps: 60, gameFps: 30 }, pace: o.noPace ? undefined : pc, shown: 60 });
+      }
+      return w;
+    };
+    var repay = mk({ speed: 1 + 4 / 60 });      // exactly the debt budget, 4 fields
+    var runaway = mk({ speed: 1 + 20 / 60 });   // five times it
+    ck('P14a a window ahead by no more than the clamped debt is REPAYMENT, not a bug',
+       repay.repaying === true && repay.ahead === false && near(repay.aheadBy, 4, 0.5),
+       'aheadBy=' + fx(repay.aheadBy, 1) + ' fields, budget=' + repay.paceMaxOwed);
+    ck('P14b ...and it says REPAYING in the headline, never nothing',
+       N64Rate.format(repay).indexOf('REPAYING') > 0, N64Rate.format(repay));
+    ck('P14c a window ahead by FIVE TIMES the debt budget is still flagged AHEAD OF HW',
+       runaway.ahead === true && runaway.repaying === false,
+       'aheadBy=' + fx(runaway.aheadBy, 1) + ' fields, budget=' + runaway.paceMaxOwed);
+    ck('P14d with no governor running, ANY overshoot is the bug — repayment cannot be claimed '
+       + 'by something that never took on debt',
+       mk({ speed: 1 + 4 / 60, noPace: true }).ahead === true &&
+       mk({ speed: 1 + 4 / 60, noPace: true }).repaying === false, '');
+    ck('P14e the excuse scales with the CLAMP, so shrinking the clamp shrinks what it excuses',
+       mk({ speed: 1 + 4 / 60, maxOwed: 1 }).ahead === true,
+       'same 4-field overshoot against a 1-field budget');
+  })();
+
+  ck('P11 no pace data at all => no duty, no e2e, and the headline is unchanged from before',
+     L1.duty === null && L1.e2eHwX === null && N64Rate.format(L1).indexOf('e2e') < 0 &&
+     N64Rate.format(L1).indexOf('paced') < 0 && N64Rate.format(L1).indexOf('decoupled') < 0,
+     N64Rate.format(L1));
+
   var summary = 'RATETEST ' + (fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + pass + ' passed, ' + fail + ' failed';
   log(summary);
   return { pass: pass, fail: fail, lines: lines, summary: summary };
@@ -1108,7 +1669,13 @@ N64Rate.selfTest = function (logFn) {
         + ' costMs/frame=' + window.N64Rate.num(lastRate.costMs, 2)
         + ' capVI/s=' + window.N64Rate.num(lastRate.capVi, 1)
         + ' audioGaps=' + lastRate.audioGaps + ' windows=' + lastRate.windows);
+      L.push('[rate] end-to-end duty=' + window.N64Rate.num(lastRate.duty, 3)
+        + ' e2eHwX=' + window.N64Rate.num(lastRate.e2eHwX, 2)
+        + ' e2eVI/s=' + window.N64Rate.num(lastRate.e2eVi, 1)
+        + ' paced=' + window.N64Rate.num(lastRate.paced)
+        + ' lost=' + window.N64Rate.num(lastRate.lost));
     }
+    if (window.__n64Pace) L.push('[pace] ' + JSON.stringify(window.__n64Pace()));
     L.push('');
     L.push('--- PINNED FACTS (these print once and would be evicted from the tail) ---');
     var keys = Object.keys(facts); if (!keys.length) L.push('(none)');
@@ -1147,7 +1714,50 @@ N64Rate.selfTest = function (logFn) {
   // show headroom — which is why it used to be the whole readout and told the user nothing.
   // It is kept as "shown", one term of four.
   var rafTicks = 0;
-  (function wrapRaf() { var o = window.requestAnimationFrame.bind(window); window.requestAnimationFrame = function (cb) { return o(function (t) { rafTicks++; cb(t); }); }; })();
+
+  // ---- the pace governor, live wiring (see N64Rate.makePacer for the whole argument) -------
+  // ?pace=0 turns it off — the control arm for any A/B. ?pace=<n> sets the per-tick cap.
+  var PACE_Q = new URLSearchParams(location.search).get('pace');
+  var PACE_OFF = (PACE_Q === '0' || PACE_Q === 'off');
+  var pacer = window.N64Rate.makePacer({
+    enabled: !PACE_OFF,
+    maxPerTick: (PACE_Q && +PACE_Q > 0) ? +PACE_Q : undefined
+  });
+  var paceTotals = { paced: 0, denied: 0, idle: 0, notOwed: 0, ticks: 0 };
+  var paceIo = {
+    now: function () { return performance.now(); },
+    vi: function () { return window.Module._neil_vi_total(); },
+    run: function () { window.Module._runMainLoop(); }
+  };
+  var paceWired = false, lastPaceT = null;
+  function paceTick(cbMs) {
+    var M = window.Module;
+    // `running` is set when the core prints "Starting R4300 emulator" (postLoad, below).
+    // Before that there is no guest clock to pace and _runMainLoop would run the boot path.
+    if (!running || !M || !M._runMainLoop || !M._neil_vi_total) return;
+    if (!paceWired) {
+      paceWired = true;
+      pageLog('[pace] governor ' + (PACE_OFF ? 'DISABLED (?pace=0)' : 'armed')
+        + ' — duty<=' + window.N64Rate.PACE_DUTY + ', max ' + pacer.maxPerTick + '/tick'
+        + '; guest ceiling stays IsFrameReady (mymain.cpp:914), untouched');
+    }
+    try { pacer.tick(paceIo, cbMs, !!activeArm); } catch (e) { }
+  }
+
+  (function wrapRaf() {
+    var o = window.requestAnimationFrame.bind(window);
+    window.requestAnimationFrame = function (cb) {
+      return o(function (t) {
+        rafTicks++;
+        var t0 = performance.now();
+        cb(t);
+        // Once per animation frame, whichever callback got here first. jQuery and the touch
+        // overlay also use rAF; the timestamp dedupe keeps this to one catch-up pass per frame
+        // rather than one per registered callback.
+        if (t !== lastPaceT) { lastPaceT = t; paceTick(performance.now() - t0); }
+      });
+    };
+  })();
 
   var rate = window.N64Rate.makeRate({});
   var lastRate = null;
@@ -1205,12 +1815,15 @@ N64Rate.selfTest = function (logFn) {
 
   function paintRate() {
     var shown = rafTicks; rafTicks = 0;
+    var pace = pacer.drain();
+    paceTotals.paced += pace.paced; paceTotals.denied += pace.denied;
+    paceTotals.idle += pace.idle; paceTotals.notOwed += pace.notOwed; paceTotals.ticks += pace.ticks;
     if (!running || !window.Module || !Module._neil_vi_total) { if (fpsEl) fpsEl.textContent = ''; return; }
     var r;
     try {
       r = rate.window(performance.now(), {
         vi: Module._neil_vi_total(), costMs: Module._neil_frame_cost_ms(), costN: Module._neil_frame_cost_n(),
-        coreFps: readCoreFps(), shown: shown, arm: activeArm
+        coreFps: readCoreFps(), shown: shown, arm: activeArm, pace: pace
       });
     } catch (e) { return; }
     lastRate = r;
@@ -1227,11 +1840,39 @@ N64Rate.selfTest = function (logFn) {
         + (r.viHz ? r.viHz + ' Hz fields' : 'region unknown')
         + (r.gameHz ? ', game renders ' + window.N64Rate.num(r.gameHz, 1) + ' fps' : '') + '.\n'
         + 'shown  = host presents (requestAnimationFrame). Bounded by the display refresh; it is '
-        + 'not capacity.\nmade   = distinct frames the game actually produced this second.';
+        + 'not capacity.\nmade   = distinct frames the game actually produced this second.\n'
+        + 'e2e    = the same capacity measured END TO END (core callback + catch-up runs), so '
+        + 'unlike cap it pays for the overlay, GL submission and the main-loop wrapper. '
+        + 'e2e = speed / duty; duty this second was '
+        + (r.duty === null ? '--' : window.N64Rate.num(r.duty * 100, 0) + '%') + '.\n'
+        + 'lost   = guest fields this second never contained, because there was no capacity to '
+        + 'recover them with. The pace governor exists to drive this to zero, and it does that '
+        + 'by re-running the core’s own main loop while the wall clock says a frame is owed '
+        + '(mymain.cpp:1403 through the unmodified IsFrameReady gate at :914). This second: '
+        + (r.paced === null ? '--' : r.paced) + ' fields came from a catch-up call.\n'
+        + 'decoupled = hardware rate held on FEWER host presents than the cartridge has fields. '
+        + 'Under the rAF-coupled loop that is arithmetically impossible (one guest frame per '
+        + 'present), so it is the one claim here that cannot be manufactured.\n'
+        + 'At 1.000x only "made" distinct pictures per second EXIST. Presenting one twice to '
+        + 'make a counter read 120 would be a fabricated number; 120 here means 120 PRODUCIBLE.';
     }
     window.__n64Rate = r;
   }
   setInterval(paintRate, 1000);
+
+  // Harness surface for tools/n64_page_test.mjs: the LIVE wiring ?ratetest=1 cannot reach.
+  window.__n64Pace = function () {
+    return {
+      enabled: pacer.enabled, off: PACE_OFF, wired: paceWired,
+      maxPerTick: pacer.maxPerTick, duty: pacer.duty,
+      runMainLoop: !!(window.Module && window.Module._runMainLoop),
+      viTotal: !!(window.Module && window.Module._neil_vi_total),
+      arm: activeArm || null,
+      paced: paceTotals.paced, denied: paceTotals.denied,
+      idle: paceTotals.idle, notOwed: paceTotals.notOwed, ticks: paceTotals.ticks,
+      owed: pacer.owed, viHz: pacer.viHz
+    };
+  };
 
   // ?ratetest=1 — run the rate model against synthetic timings AND two real captures, with no
   // emulator, no ROM and no GPU. Results go to the on-page log (forced open so a phone can
@@ -1568,7 +2209,7 @@ N64Rate.selfTest = function (logFn) {
     };
     window.__jitStats = function () {
       var s = { mode: mode, wrapped: wrapped, calls: calls, canaryFired: canaryFired, instantiateFail: instantiateFail };
-      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeMemSlots = e.nativeMemSlots; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; s.distinctSlots = e.distinctSlots; s.slotReuses = e.slotReuses; }
+      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeMemSlots = e.nativeMemSlots; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.nativeCop0 = e.nativeCop0; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; s.distinctSlots = e.distinctSlots; s.slotReuses = e.slotReuses; }
       return s;
     };
     // ?jit=census dump: [[bucket, executions], ...] ranked. Buckets are
@@ -1648,6 +2289,11 @@ N64Rate.selfTest = function (logFn) {
       romRegion = window.N64Rate.regionFromRom(bytes);
       rate.setViHz(romRegion ? romRegion.viHz : 0);
       rate.relatch();
+      // The governor's wall-clock schedule is `viHz x elapsed`, so it needs the SAME region
+      // read and gets no default either: with an unreadable header it stays inert and the page
+      // keeps today's rAF-coupled behaviour rather than pacing to a guessed 60 (?ratetest P12).
+      pacer.viHz = (romRegion && romRegion.viHz > 0) ? romRegion.viHz : null;
+      pacer.owed = 0; pacer.oT = null; pacer.oVi = null;
       facts.region = '[rate] ' + rom.file + ' country=0x' + (romRegion ? romRegion.code.toString(16).toUpperCase() : '??')
         + ' -> ' + (romRegion ? (romRegion.pal ? 'PAL' : 'NTSC') + ' ' + romRegion.viHz + ' Hz fields' : 'UNKNOWN (VI-derived figures withheld)');
       pageLog(facts.region);
