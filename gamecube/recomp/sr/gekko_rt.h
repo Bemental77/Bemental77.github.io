@@ -53,19 +53,67 @@ static inline int gk_ok(uint32_t p, uint32_t n) {
     return 1;
 }
 
+// ------------------------------------------------- differential-verify hooks
+// Compiled in ONLY under -DSR_VERIFY (the fixture harness); the shipping runtime
+// gets identical code to before.  Two checks, both of which have to hold for a
+// fixture replay to mean anything:
+//   READ  — every guest byte read must have been STAGED from the oracle capture.
+//           An unstaged read means this translation looked at memory the hardware
+//           never looked at, which would otherwise silently read zero and produce
+//           a plausible wrong answer.
+//   WRITE — every guest byte whose value CHANGES is appended to an ordered log,
+//           so the log can be diffed against Dolphin's ordered store log
+//           independent of store granularity (native `stmw` is one 72-byte record;
+//           this emits 18 stores — per-byte change events make them comparable).
+#ifdef SR_VERIFY
+extern uint8_t *g_staged;          // 1 byte per guest byte, 1 = staged
+extern uint32_t g_unstaged;        // first unstaged read (| 0x80000000), 0 = none
+extern uint32_t *g_wlog;           // change events, 2 words each: [phys addr][new byte]
+extern uint32_t  g_wlog_n, g_wlog_cap;   // _n = events recorded, _cap = events allocated
+static uint8_t   gk_wpre[64];
+static inline void gk_rd_chk(uint32_t p, uint32_t n){
+    if (!g_staged) return;
+    for (uint32_t i = 0; i < n; i++)
+        if (!g_staged[p + i]) { if (!g_unstaged) g_unstaged = (p + i) | 0x80000000u; return; }
+}
+static inline void gk_w_pre(uint32_t p, uint32_t n){
+    if (n <= sizeof gk_wpre) for (uint32_t i = 0; i < n; i++) gk_wpre[i] = g_ram[p + i];
+}
+static inline void gk_w_post(uint32_t p, uint32_t n){
+    if (!g_wlog || n > sizeof gk_wpre) return;
+    // Two words per event: a 24 MB MEM1 needs 25 address bits, so packing the byte
+    // into the same word would overflow. Keep them separate.
+    for (uint32_t i = 0; i < n; i++)
+        if (gk_wpre[i] != g_ram[p + i] && g_wlog_n < g_wlog_cap) {
+            g_wlog[2 * g_wlog_n] = p + i;
+            g_wlog[2 * g_wlog_n + 1] = g_ram[p + i];
+            g_wlog_n++;
+        }
+}
+#define GK_RD(p, n)  gk_rd_chk((p), (n))
+#define GK_WPRE(p, n)  gk_w_pre((p), (n))
+#define GK_WPOST(p, n) gk_w_post((p), (n))
+#else
+#define GK_RD(p, n)    ((void)0)
+#define GK_WPRE(p, n)  ((void)0)
+#define GK_WPOST(p, n) ((void)0)
+#endif
+
 // ------------------------------------------------------- big-endian guest memory
-static inline uint8_t  gk_r8 (uint32_t ea){ uint32_t p=gk_phys(ea); if(!gk_ok(p,1)) return 0; return g_ram[p]; }
-static inline uint16_t gk_r16(uint32_t ea){ uint32_t p=gk_phys(ea); if(!gk_ok(p,2)) return 0;
+static inline uint8_t  gk_r8 (uint32_t ea){ uint32_t p=gk_phys(ea); if(!gk_ok(p,1)) return 0; GK_RD(p,1); return g_ram[p]; }
+static inline uint16_t gk_r16(uint32_t ea){ uint32_t p=gk_phys(ea); if(!gk_ok(p,2)) return 0; GK_RD(p,2);
     return (uint16_t)((g_ram[p]<<8)|g_ram[p+1]); }
-static inline uint32_t gk_r32(uint32_t ea){ uint32_t p=gk_phys(ea); if(!gk_ok(p,4)) return 0;
+static inline uint32_t gk_r32(uint32_t ea){ uint32_t p=gk_phys(ea); if(!gk_ok(p,4)) return 0; GK_RD(p,4);
     return ((uint32_t)g_ram[p]<<24)|((uint32_t)g_ram[p+1]<<16)|((uint32_t)g_ram[p+2]<<8)|g_ram[p+3]; }
 static inline uint64_t gk_r64(uint32_t ea){ return ((uint64_t)gk_r32(ea)<<32) | gk_r32(ea+4); }
 
-static inline void gk_w8 (uint32_t ea,uint8_t v){ uint32_t p=gk_phys(ea); if(!gk_ok(p,1))return; g_ram[p]=v; }
-static inline void gk_w16(uint32_t ea,uint16_t v){ uint32_t p=gk_phys(ea); if(!gk_ok(p,2))return;
-    g_ram[p]=(uint8_t)(v>>8); g_ram[p+1]=(uint8_t)v; }
-static inline void gk_w32(uint32_t ea,uint32_t v){ uint32_t p=gk_phys(ea); if(!gk_ok(p,4))return;
-    g_ram[p]=(uint8_t)(v>>24); g_ram[p+1]=(uint8_t)(v>>16); g_ram[p+2]=(uint8_t)(v>>8); g_ram[p+3]=(uint8_t)v; }
+static inline void gk_w8 (uint32_t ea,uint8_t v){ uint32_t p=gk_phys(ea); if(!gk_ok(p,1))return;
+    GK_WPRE(p,1); g_ram[p]=v; GK_WPOST(p,1); }
+static inline void gk_w16(uint32_t ea,uint16_t v){ uint32_t p=gk_phys(ea); if(!gk_ok(p,2))return; GK_WPRE(p,2);
+    g_ram[p]=(uint8_t)(v>>8); g_ram[p+1]=(uint8_t)v; GK_WPOST(p,2); }
+static inline void gk_w32(uint32_t ea,uint32_t v){ uint32_t p=gk_phys(ea); if(!gk_ok(p,4))return; GK_WPRE(p,4);
+    g_ram[p]=(uint8_t)(v>>24); g_ram[p+1]=(uint8_t)(v>>16); g_ram[p+2]=(uint8_t)(v>>8); g_ram[p+3]=(uint8_t)v;
+    GK_WPOST(p,4); }
 static inline void gk_w64(uint32_t ea,uint64_t v){ gk_w32(ea,(uint32_t)(v>>32)); gk_w32(ea+4,(uint32_t)v); }
 
 // ------------------------------------------------------------------ bit casts
@@ -293,7 +341,9 @@ static inline double gk_fres(double val){
 static inline void gk_dcbz(uint32_t ea){
     uint32_t p = gk_phys(ea) & ~31u;
     if (!gk_ok(p, 32)) return;
+    GK_WPRE(p, 32);
     for (int i = 0; i < 32; i++) g_ram[p + i] = 0;
+    GK_WPOST(p, 32);
 }
 
 // ------------------------------------------------------------- CR / XER helpers

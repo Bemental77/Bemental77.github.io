@@ -445,6 +445,200 @@ def decode_store(word: int, gpr):
     return None
 
 
+_D_LOADS = {  # opcode -> size (0 = variable, decoded specially)
+    32: 4, 33: 4,      # lwz,  lwzu
+    34: 1, 35: 1,      # lbz,  lbzu
+    40: 2, 41: 2,      # lhz,  lhzu
+    42: 2, 43: 2,      # lha,  lhau
+    48: 4, 49: 4,      # lfs,  lfsu
+    50: 8, 51: 8,      # lfd,  lfdu
+}
+_X_LOADS = {
+    23: 4, 55: 4,      # lwzx,  lwzux
+    87: 1, 119: 1,     # lbzx,  lbzux
+    279: 2, 311: 2,    # lhzx,  lhzux
+    343: 2, 375: 2,    # lhax,  lhaux
+    535: 4, 567: 4,    # lfsx,  lfsux
+    599: 8, 631: 8,    # lfdx,  lfdux
+    534: 4, 790: 2,    # lwbrx, lhbrx
+    20: 4,             # lwarx
+    597: 0, 533: 0,    # lswi, lswx -- variable length, reported as unknown
+}
+
+
+def decode_load(word: int, gpr):
+    """-> (ea, size) | ('unknown', descr) | None if not a load.
+
+    The MIRROR of decode_store.  A replayable fixture needs the INITIAL value of
+    every location the function reads, so a load form this does not know must be
+    surfaced loudly, exactly like an unknown store."""
+    op = (word >> 26) & 0x3F
+    ra = (word >> 16) & 0x1F
+    rb = (word >> 11) & 0x1F
+    simm = word & 0xFFFF
+    if simm & 0x8000:
+        simm -= 0x10000
+    base = gpr[ra] if ra else 0
+    if op in _D_LOADS:
+        return ((base + simm) & 0xFFFFFFFF, _D_LOADS[op])
+    if op == 46:  # lmw: rD..r31 from consecutive words
+        rd = (word >> 21) & 0x1F
+        return ((base + simm) & 0xFFFFFFFF, 4 * (32 - rd))
+    if op in (56, 57):  # psq_l / psq_lu
+        d = word & 0xFFF
+        if d & 0x800:
+            d -= 0x1000
+        w = (word >> 15) & 1
+        return ((base + d) & 0xFFFFFFFF, 4 if w else 8)
+    if op == 4:
+        xo = (word >> 1) & 0x3FF
+        if xo in (6, 38, 7, 39):        # psq_lx / psq_lux / psq_stx / psq_stux
+            return ("unknown", f"x-form quantized paired op4 xo={xo}")
+        return None
+    if op == 31:
+        xo = (word >> 1) & 0x3FF
+        if xo in _X_LOADS:
+            size = _X_LOADS[xo]
+            ea = (base + gpr[rb]) & 0xFFFFFFFF
+            if size == 0:
+                return ("unknown", f"string load xo={xo} at ea={ea:#x}")
+            return (ea, size)
+    return None
+
+
+MEM1_LO, MEM1_HI = 0x80000000, 0x81800000
+
+
+def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000,
+                               progress=None):
+    """capture_fixture + everything needed to RE-RUN the invocation elsewhere.
+
+    capture_fixture records what changed.  To replay a function in the recompiled
+    wasm you also need what it READ, and reading the whole 24 MB MEM1 over the RSP
+    is not practical.  So this records, for every load, the bytes AS THEY WERE AT
+    THE START OF THE INVOCATION -- i.e. the first read of each byte, skipped if this
+    invocation already wrote that byte (a read-after-own-write must observe the
+    write, not a staged initial value).
+
+    Also returns the executed instruction stream, which the caller needs to decide
+    whether the fixture depends on incoming PS1 lanes (the GDB stub cannot read
+    PS1, so a fixture that does is NOT replayable and must be rejected, not fudged).
+    """
+    g.add_bp(entry)
+    for _ in range(4000):
+        rep = g.cont(timeout=120.0)
+        if GDB.stop_pc(rep) == entry:
+            break
+    else:
+        raise RSPError(f"never reached {entry:#010x}")
+    g.del_bp(entry)
+    g.resync()
+
+    st_in = g.arch_state()
+    ret_addr = st_in["lr"]
+    sp_in = st_in["gpr"][1]
+
+    body = {}
+    if syms:
+        s = symbolize(syms, entry)
+        if s:
+            blob = g.read_range(s["start"], s["end"])
+            for i in range(0, len(blob), 4):
+                body[s["start"] + i] = int.from_bytes(blob[i:i + 4], "big")
+
+    writes, unknown, stream = [], [], []
+    initial = {}          # guest addr -> byte, as of entry
+    written = set()       # bytes this invocation has already written
+    outside = set()       # non-MEM1 addresses touched
+    steps, pc = 0, entry
+    while steps < max_steps:
+        word = body.get(pc)
+        if word is None:
+            word = int.from_bytes(g.mem(pc, 4), "big")
+            body[pc] = word
+        gpr = g.gprs()
+        stream.append((pc, word))
+
+        ld = decode_load(word, gpr)
+        if ld and ld[0] == "unknown":
+            unknown.append({"pc": pc, "why": ld[1], "kind": "load"})
+        elif ld:
+            ea, size = ld
+            need = [a for a in range(ea, ea + size)
+                    if a not in written and a not in initial]
+            if need:
+                if MEM1_LO <= ea and ea + size <= MEM1_HI:
+                    try:
+                        blob = g.mem(ea, size)
+                        for i, a in enumerate(range(ea, ea + size)):
+                            if a in need:
+                                initial[a] = blob[i]
+                    except RSPError:
+                        unknown.append({"pc": pc, "why": f"load read failed at {ea:#x}",
+                                        "kind": "load"})
+                else:
+                    outside.add(ea)
+
+        pend = decode_store(word, gpr)
+        if pend and pend[0] == "unknown":
+            unknown.append({"pc": pc, "why": pend[1], "kind": "store"})
+            pend = None
+        pre = None
+        if pend:
+            ea, size = pend
+            if not (MEM1_LO <= ea and ea + size <= MEM1_HI):
+                outside.add(ea)
+            try:
+                pre = g.mem(ea, size)
+            except RSPError:
+                pre = None
+                unknown.append({"pc": pc, "why": f"store pre-read failed at {ea:#x}",
+                                "kind": "store"})
+
+        rep = g.step()
+        steps += 1
+        npc = GDB.stop_pc(rep)
+        if pend and pre is not None:
+            ea, size = pend
+            try:
+                post = g.mem(ea, size)
+                # Record EVERY store, including value-preserving ones: the replay
+                # comparator filters by per-byte change, so both sides must agree
+                # on what was attempted, not on what happened to differ.
+                writes.append({"pc": pc, "ea": ea, "size": size,
+                               "before": pre.hex(), "after": post.hex()})
+                for i, a in enumerate(range(ea, ea + size)):
+                    if a not in initial and a not in written:
+                        initial[a] = pre[i]     # the pre-image IS the initial value
+                    written.add(a)
+            except RSPError:
+                unknown.append({"pc": pc, "why": f"store post-read failed at {ea:#x}",
+                                "kind": "store"})
+        pc = npc
+        if progress and steps % progress == 0:
+            print(f"    ...{steps} steps, pc={pc:#010x}", flush=True)
+        if pc == ret_addr and g.gprs()[1] >= sp_in:
+            break
+
+    st_out = g.arch_state()
+    delta = {}
+    for i in range(32):
+        if st_in["gpr"][i] != st_out["gpr"][i]:
+            delta[f"r{i}"] = [st_in["gpr"][i], st_out["gpr"][i]]
+    for i in range(32):
+        if st_in["fpr"][i] != st_out["fpr"][i]:
+            delta[f"f{i}"] = [st_in["fpr"][i], st_out["fpr"][i]]
+    for k in ("cr", "xer", "lr", "ctr", "fpscr", "msr"):
+        if st_in[k] != st_out[k]:
+            delta[k] = [st_in[k], st_out[k]]
+    return {"entry": entry, "ret_addr": ret_addr, "steps": steps,
+            "returned": pc == ret_addr, "state_in": st_in, "state_out": st_out,
+            "delta": delta, "writes": writes, "unknown_stores": unknown,
+            "initial_mem": {f"{a:08x}": b for a, b in sorted(initial.items())},
+            "outside_mem1": sorted(outside),
+            "stream": [[p, w] for p, w in stream]}
+
+
 def capture_fixture(g: "GDB", entry: int, syms=None, max_steps=200000,
                     watch_memory=True):
     """THE DIFFERENTIAL FIXTURE.

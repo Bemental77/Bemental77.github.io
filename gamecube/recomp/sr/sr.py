@@ -17,6 +17,32 @@ Usage:
   python3 sr.py --image sab_main.dol --map dolphin_captures/sab.map \
                 --fn 0x800ed368 --out psmtxconcat.c
   python3 sr.py --image ... --map ... --coverage      # translate every mapped fn, report
+  python3 sr.py --image ... --map ... --fn 0x... --closure --out f.c   # + every callee
+
+NON-LEAF MODEL (--closure), and how it deviates from N64Recomp on purpose
+  N64Recomp's CGenerator::emit_function_call (cgenerator.cpp:423) emits only
+  `name(rdram, ctx);` and NEVER materialises $ra, so a callee's own `sw $ra,N($sp)`
+  prologue stores a stale value.  That is safe there because nothing compares guest
+  memory against hardware.  It is NOT safe here: this project's acceptance test is a
+  byte-for-byte diff of the ORDERED MEMORY-WRITE LOG against native Dolphin
+  (gamecube/tools/native_oracle_gdb.py capture_fixture), and a PowerPC callee's
+  standard Metrowerks prologue is `mflr r0 ; stw r0, 0x??(r1)` -- i.e. the link
+  register is WRITTEN TO GUEST MEMORY on essentially every non-leaf call.  A stale LR
+  therefore shows up as a mismatched store, not as a harmless unused value.
+  DECISION: this translator materialises `st->lr = <return address>` before every
+  linking branch (bl / bcl), which it already did for the leaf work, and keeps doing.
+  The cost is one store per call; the benefit is that the stack frame is bit-exact.
+
+  Control flow: `blr` is a C `return`, so LR is never used as a jump target; it is
+  modelled purely as architectural state.  A tail branch out of the function is a
+  plain call followed by `return`, with LR left alone -- which is what the hardware
+  does, since a non-linking `b` does not touch LR.
+
+  Call targets are VALIDATED: with --closure, a linking or tail branch to an address
+  that is not a known function start is Untranslatable rather than silently dispatched
+  into the middle of another function.  A call to a function outside the translated
+  set becomes `sr_extern()`, which FAULTS -- an untranslated callee can never be
+  silently skipped.
 """
 import argparse, re, struct, sys, collections
 
@@ -123,15 +149,44 @@ def ea_x(f):
 
 
 class Translator:
-    def __init__(self, img, fn_lo, fn_hi, resolve_call=None):
+    def __init__(self, img, fn_lo, fn_hi, resolve_call=None, starts=None, emitted=None,
+                 branch_reloc=None):
         self.img, self.lo, self.hi = img, fn_lo, fn_hi
         self.resolve_call = resolve_call
+        # REL OVERLAYS: a branch at a REL24 relocation site is a PLACEHOLDER in the
+        # shipped bytes (typically `48000001`, i.e. `bl .`).  Decoding it as written
+        # produces a self-call.  `branch_reloc` maps such a pc to the target the
+        # relocation names, which for a reference into the static DOL is an absolute
+        # address and therefore fully known ahead of time (OSLink.c:139-142 sets
+        # offset = 0 for imp->id == 0, so x = addend).
+        self.branch_reloc = branch_reloc or {}
+        # `starts`  : every known function entry (None = permissive; used by --coverage
+        #             so its historical numbers stay comparable).
+        # `emitted` : the subset actually being translated into this C file.  A call to
+        #             a start outside `emitted` becomes sr_extern() = a hard fault.
+        self.starts = starts
+        self.emitted = emitted
         self.labels = set()
         self.calls = set()
 
     # --- helpers -----------------------------------------------------------
     def gp(self, r):
         return f"st->gpr[{r}]"
+
+    def callexpr(self, tgt, pc, w):
+        """C text for transferring control to another function.
+
+        With `starts` supplied this REFUSES a target that is not a function entry:
+        dispatching into the middle of a function would produce plausible-looking
+        output with the callee's prologue skipped."""
+        self.calls.add(tgt)
+        if self.starts is not None and tgt not in self.starts:
+            raise Untranslatable(f"branch target {tgt:#010x} is not a function start", pc, w)
+        if self.emitted is not None and tgt not in self.emitted:
+            return f"sr_extern(st, {tgt:#010x}u);"
+        if self.emitted is None:
+            return f"CALL({tgt:#010x}u);"
+        return f"fn_{tgt:08x}(st);"
 
     def branch_cond(self, f):
         """BO/BI -> (C condition expr, list of setup lines).  Models the CTR side too."""
@@ -159,33 +214,40 @@ class Translator:
         if op == 18:                                     # b / bl / ba / bla
             if f['AA']:
                 raise Untranslatable("absolute branch (ba/bla)", pc, w)
+            if pc in self.branch_reloc:                  # relocated cross-module branch
+                tgt = self.branch_reloc[pc]
+                if f['LK']:
+                    o.append(f"st->lr = {pc + 4:#010x}u;")
+                    o.append(self.callexpr(tgt, pc, w))
+                else:
+                    o.append(self.callexpr(tgt, pc, w) + " return;")
+                return o
             tgt = (pc + f['LI']) & 0xFFFFFFFF
             if f['LK']:
-                self.calls.add(tgt)
+                # LR is materialised BEFORE the call: the callee's `mflr r0; stw r0,N(r1)`
+                # prologue writes it to guest memory, and that store is diffed.
                 o.append(f"st->lr = {pc + 4:#010x}u;")
-                o.append(f"CALL({tgt:#010x}u);")
+                o.append(self.callexpr(tgt, pc, w))
             elif self.lo <= tgt < self.hi:
                 self.labels.add(tgt)
                 o.append(f"goto L_{tgt:08x};")
-            else:                                        # tail call
-                self.calls.add(tgt)
-                o.append(f"CALL({tgt:#010x}u); return;")
+            else:                                        # tail call: LR untouched by `b`
+                o.append(self.callexpr(tgt, pc, w) + " return;")
             return o
         if op == 16:                                     # bc
             if f['AA']:
                 raise Untranslatable("absolute conditional branch", pc, w)
-            tgt = (pc + f['BD']) & 0xFFFFFFFF
+            tgt = self.branch_reloc.get(pc, (pc + f['BD']) & 0xFFFFFFFF)
             cond, pre = self.branch_cond(f)
             o += pre
             if f['LK']:
-                self.calls.add(tgt)
-                o.append(f"if ({cond}) {{ st->lr = {pc + 4:#010x}u; CALL({tgt:#010x}u); }}")
+                o.append(f"if ({cond}) {{ st->lr = {pc + 4:#010x}u; "
+                         f"{self.callexpr(tgt, pc, w)} }}")
             elif self.lo <= tgt < self.hi:
                 self.labels.add(tgt)
                 o.append(f"if ({cond}) goto L_{tgt:08x};")
             else:
-                self.calls.add(tgt)
-                o.append(f"if ({cond}) {{ CALL({tgt:#010x}u); return; }}")
+                o.append(f"if ({cond}) {{ {self.callexpr(tgt, pc, w)} return; }}")
             return o
         if op == 19 and f['xo'] == 16:                   # bclr / blr / blrl
             if f['LK']:
@@ -669,6 +731,17 @@ class Translator:
 
         raise Untranslatable(f"opcode {op}", pc, w)
 
+    @staticmethod
+    def terminates(w):
+        """True if this instruction cannot fall through to the next address."""
+        op = w >> 26
+        if op == 18 and not (w & 1):                 # b / ba (not bl)
+            return True
+        if op == 19 and ((w >> 1) & 0x3FF) == 16 and not (w & 1):
+            bo = (w >> 21) & 31                      # blr, unconditional form only
+            return (bo & 20) == 20
+        return False
+
     # --- whole-function translation ---------------------------------------
     def translate(self):
         body, insts = [], []
@@ -677,10 +750,21 @@ class Translator:
             if w is None:
                 raise Untranslatable("address not in image", pc, None)
             insts.append((pc, w, self.inst(pc, w)))
+        # FALL-THROUGH.  A function whose last instruction can fall through continues
+        # into the next one; in C that would instead `return`.  Emitting an explicit
+        # tail call to the next entry fixes it AND makes function boundaries robust:
+        # splitting one guest function into two is then semantically neutral, which
+        # matters enormously for REL overlays, where there is no symbol map and the
+        # boundaries are inferred.
+        if insts and not self.terminates(insts[-1][1]):
+            last_pc, last_w, _ = insts[-1]
+            insts.append((self.hi, None,
+                          [self.callexpr(self.hi, last_pc, last_w) + " return;"]))
         for pc, w, lines in insts:
             if pc in self.labels:
                 body.append(f"L_{pc:08x}:;")
-            body.append(f"    /* {pc:08x}: {w:08x} */")
+            body.append(f"    /* {pc:08x}: {w:08x} */" if w is not None
+                        else f"    /* {pc:08x}: fall-through to the next entry */")
             for l in lines:
                 body.append("    " + l)
         return body
@@ -693,13 +777,62 @@ HEADER = """// GENERATED by gamecube/recomp/sr/sr.py — STATIC RECOMPILATION of
 #ifndef CALL
 #define CALL(a) do { g_fault = 0xC0DE0000u | ((a) & 0xFFFFu); } while (0)
 #endif
+
+// A call to a function that was NOT translated into this file. It faults — an
+// untranslated callee must never be silently skipped (that would leave the caller's
+// output "nearly right" and hide the hole).
+void sr_extern(GekkoState *st, uint32_t addr);
 """
 
 
-def emit_c(img, fns):
+def index_functions(img, syms):
+    """map entries present in THIS image, deduped by address -> (size, name)."""
+    out = {}
+    for lo, size, name in syms:
+        if lo in out or size == 0 or size % 4:
+            continue
+        if img.word(lo) is None:
+            continue                          # REL-overlay symbol, not in the DOL
+        out[lo] = (size, name)
+    return out
+
+
+def closure_of(img, byaddr, roots):
+    """Transitive callee closure. -> (set of function starts, [(addr, why), ...]).
+
+    A non-empty problem list means the closure CANNOT be translated end-to-end; the
+    caller must not emit a partial closure and call it done."""
+    starts = set(byaddr)
+    seen, work, probs = set(), list(roots), []
+    while work:
+        a = work.pop()
+        if a in seen:
+            continue
+        seen.add(a)
+        if a not in byaddr:
+            probs.append((a, "not a mapped function in this image"))
+            continue
+        size, _ = byaddr[a]
+        t = Translator(img, a, a + size, starts=starts)
+        try:
+            t.translate()
+        except Untranslatable as e:
+            probs.append((a, e.why))
+            continue
+        work += list(t.calls)
+    return seen, probs
+
+
+def emit_c(img, fns, starts=None, branch_reloc=None):
+    emitted = {lo for lo, _, _ in fns}
     out = [HEADER]
+    if len(fns) > 1:
+        out.append("\n// forward declarations (calls may be forward or mutually recursive)")
+        for lo, _, name in fns:
+            out.append(f"void fn_{lo:08x}(GekkoState *st);   /* {name} */")
     for lo, size, name in fns:
-        t = Translator(img, lo, lo + size)
+        t = Translator(img, lo, lo + size, starts=starts, emitted=emitted,
+                       branch_reloc=branch_reloc)
         body = t.translate()
         out.append(f"\n// {name}  @ {lo:#010x}  ({size} bytes, {size // 4} instructions)")
         out.append(f"void fn_{lo:08x}(GekkoState *st) {{")
@@ -723,6 +856,10 @@ def main():
     ap.add_argument('--fn', action='append', default=[])
     ap.add_argument('--out')
     ap.add_argument('--coverage', action='store_true')
+    ap.add_argument('--closure', action='store_true',
+                    help='also translate the transitive callee closure of each --fn')
+    ap.add_argument('--closure-report', action='store_true',
+                    help='list every mapped non-leaf whose whole closure translates clean')
     a = ap.parse_args()
 
     img = Image.from_dol(a.image)
@@ -756,13 +893,49 @@ def main():
             print(f"  {c:6d}  {r}")
         return
 
+    byaddr = index_functions(img, syms)
+    starts = set(byaddr)
+
+    if a.closure_report:
+        rows = []
+        for lo, (size, name) in byaddr.items():
+            t = Translator(img, lo, lo + size)
+            try:
+                t.translate()
+            except Untranslatable:
+                continue
+            if not t.calls:
+                continue                                     # leaf
+            cl, probs = closure_of(img, byaddr, [lo])
+            if probs:
+                continue
+            rows.append((len(cl), sum(byaddr[x][0] // 4 for x in cl), lo, name, cl))
+        rows.sort()
+        print(f"mapped functions in image                : {len(byaddr)}")
+        print(f"non-leaf with a FULLY CLEAN callee closure: {len(rows)}")
+        for n, ins, lo, name, cl in rows:
+            kids = ",".join(byaddr[x][1] for x in sorted(cl) if x != lo)
+            print(f"{lo:#010x} {n:3d} fns {ins:6d} insts  {name[:40]:40s} {kids[:70]}")
+        return
+
     want = [int(x, 16) for x in a.fn]
-    fns = [(lo, sz, nm) for lo, sz, nm in syms if lo in want]
-    missing = set(want) - {lo for lo, _, _ in fns}
+    missing = set(want) - starts
     if missing:
         print("not in map: " + ", ".join(f"{m:#x}" for m in missing), file=sys.stderr)
         sys.exit(1)
-    src = emit_c(img, fns)
+
+    if a.closure:
+        sel, probs = closure_of(img, byaddr, want)
+        if probs:
+            for addr, why in sorted(set(probs)):
+                print(f"CLOSURE BLOCKED at {addr:#010x}: {why}", file=sys.stderr)
+            sys.exit(2)
+        print(f"closure: {len(sel)} functions, "
+              f"{sum(byaddr[x][0] // 4 for x in sel)} instructions", file=sys.stderr)
+    else:
+        sel = set(want)
+    fns = sorted((lo, byaddr[lo][0], byaddr[lo][1]) for lo in sel)
+    src = emit_c(img, fns, starts=starts)
     if a.out:
         open(a.out, 'w').write(src)
         print(f"wrote {a.out} ({len(src)} bytes, {len(fns)} functions)", file=sys.stderr)
