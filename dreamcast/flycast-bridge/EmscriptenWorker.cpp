@@ -211,6 +211,10 @@ extern "C" {
 extern double   g_attr_mainloop_ms, g_attr_retro_ms;
 extern double   g_attr_sched_ms;
 extern uint32_t g_attr_sched_n;
+// 1 = the sched bucket is timed; 0 = counts only (LEVER13_SCHED_TIMER, defined
+// in rec_wasm.cpp beside g_attr_sched_ms). Read at print time so this TU can
+// never disagree with the TU that owns the timer.
+extern uint32_t g_attr_sched_timed;
 extern double   g_attr_schedfat_ms;
 extern uint32_t g_attr_schedfat_n;
 }
@@ -595,7 +599,21 @@ static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
             //   (f) `jit` is a RESIDUAL, so every unhooked path and all timer
             //       overhead accumulate into it. It is an upper bound on JIT
             //       execution, not a measurement of it. At the default it also
-            //       absorbs pvr+sq, and prints as `jit*` to say so.
+            //       absorbs sch+pvr+sq, and prints as `jit*` to say so.
+            //   (g) [2026-08-29] AND `jit*` IS NOT "THE JIT". A CDP profile of
+            //       the worker on PSO gameplay (/tmp/dcx-worker.cpuprofile, 25 s
+            //       of samples) splits the residual by MODULE: 43.97% of worker
+            //       self time is in emitted SH4 shard functions and 37.56% is in
+            //       the static C++ core. Of BUSY time (92.6%, idle excluded):
+            //       emitted SH4 47.5%, dispatch+jit_lookup 12.0%, guest-memory
+            //       slowpath 10.0%, AICA+ARM7 8.4%, render+GL 6.7%, clock reads
+            //       5.0%, interp fallback 2.0%, TA parse 1.5%, sched 1.5%,
+            //       compile/emit 1.4%. Anyone reading `jit*=84%` as "the SH4
+            //       emitter owns 84%" is wrong by a factor of ~1.8, and that
+            //       misreading is what made per-block codegen look like the
+            //       whole program. That profile ran at machine load ~45 with a
+            //       0.859x guest ratio -- the SHARES are the durable part of it,
+            //       the wall numbers are void.
             static char split_line[448];
             static double s_p_rr = 0, s_p_ml = 0, s_p_sch = 0, s_p_fat = 0,
                           s_p_rnd = 0, s_p_pvr = 0, s_p_sq = 0;
@@ -648,6 +666,14 @@ static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
             // reads as "108,814 events cost zero time", which is the exact shape
             // of a number that gets quoted later as a finding. The residual is
             // printed as `jit*` because it now absorbs those two buckets.
+            //
+            // [2026-08-29] `sch` joins them at LEVER13_SCHED_TIMER=0 (rec_wasm.cpp):
+            // its per-tick get_now pair was 3.91% of worker self time in the CDP
+            // profile. Same `-` treatment, same reason, and the fat-tick split
+            // goes with it because fat needs a per-tick duration. The branch is
+            // on g_attr_sched_timed, the timer TU's own flag -- not on w_sch==0,
+            // which a quantized window can produce with the timer ON.
+            if (g_attr_sched_timed) {
             snprintf(split_line, sizeof(split_line),
                      "[split] rr=%.1f ml=%.1f (%.1f%% of rr) | "
                      "jit*=%.1f (%.1f%%, incl pvr+sq) sch=%.1f (%.1f%%, n=%u fat=%.1f/%u) "
@@ -660,6 +686,19 @@ static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
                      w_pvrn,
                      w_sqn, w_sqta,
                      w_rnd * pc_of);
+            } else {
+            snprintf(split_line, sizeof(split_line),
+                     "[split] rr=%.1f ml=%.1f (%.1f%% of rr) | "
+                     "jit*=%.1f (%.1f%%, incl sch+pvr+sq) sch=- (untimed, n=%u) "
+                     "rnd=%.1f (%.1f%%, n=%u) pvr=- (untimed, n=%u) "
+                     "sq=- (untimed, n=%u ta=%u) | render_total>=%.1f%%",
+                     w_rr, w_ml, w_rr > 0.0 ? w_ml * 100.0 / w_rr : 0.0,
+                     w_jit, w_jit * pc_of, w_schn,
+                     w_rnd, w_rnd * pc_of, w_rndn,
+                     w_pvrn,
+                     w_sqn, w_sqta,
+                     w_rnd * pc_of);
+            }
 #endif
             MAIN_THREAD_EM_ASM({
                 postMessage({cmd: 'fps', fps: $0, hw: $1, calls: $2,

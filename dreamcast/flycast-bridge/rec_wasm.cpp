@@ -239,7 +239,38 @@ uint32_t g_smc_last_addr;
 // [smc] telemetry (ctxsnap 75-77,79): [0]=C slowpath single store, [1]=block/DMA
 // chokepoint (WriteMemBlock_nommu_*), [2]=jit_register slot-churn re-register,
 // [3]=jit_lookup clean->stale transitions (post-dedupe).
-volatile uint32_t g_smc_mark_counts[4];
+//
+// [2026-08-29] LEDGER CLOSURE. These four were used to argue "no SMC occurred"
+// over 75 s of shipping-binary gameplay (smcS=smcB=smcR=smcT=0 across all 59
+// samples, cpg=10552) -- and that argument DID NOT HOLD, because icgen still
+// advanced 2 -> 5 with all four reading 0. A source audit of every site that
+// mutates g_ic_generation found FIVE further paths, none of which touched a
+// counter:
+//   [4] flycast_ic_invalidate()  -- savestate load replaces guest RAM wholesale
+//   [5] jit_clear()              -- block-cache flush
+//   [6] reset()                  -- flycast block-manager reset (code buffer)
+//   [7] g_ic_flush_mask periodic -- inert at the shipped default 0
+//   (E) THE EMITTED IN-WASM STORE MARK -- bementalJIT/guests/sh4/wasm_emit.cpp
+//       emitSmcMarkLocal():87 and emitSmcMarkConstPage():135 do
+//       `g_ic_generation += g_code_map[chunk]` BRANCHLESSLY, on the hot guest
+//       store path, with no counter. This is the one that matters and the one
+//       that cannot be counted inline: adding a counter there taxes EVERY
+//       area-3 guest store, which is the same trade LEVER12/13 just retired.
+// [4]-[7] are now counted. (E) is DERIVED instead, exactly and for free:
+//   g_smc_gen_accounted accumulates the generation units added by every C-side
+//   path and is rezeroed at each arm, so while armed
+//       emitted_units = (g_ic_generation - 1) - g_smc_gen_accounted
+//   is the number of generation units contributed by emitted stores. It is a
+//   count of UNITS, not events (the 8-byte fmov.d pair marks two chunks and can
+//   add 2 in one store), so it bounds events from above -- which is the correct
+//   direction for a safety claim.
+// PROVABILITY, which is the whole point: "no SMC occurred over this window" is
+// now exactly `icgen delta == 0`, and the four/five/derived counters say WHICH
+// path moved it when it is not 0. The old four could never support that claim.
+volatile uint32_t g_smc_mark_counts[8];
+// Generation units added by C-side paths since the last arm. Rezeroed by
+// flycast_set_ic(1). See the ledger note above.
+volatile uint32_t g_smc_gen_accounted;
 }
 // Lever-4 F1 (task-1 probe, 2026-08-24): a permanently-stale block (SMC'd once,
 // interp-routed, never re-registered) re-bumped the generation on EVERY lookup
@@ -278,7 +309,7 @@ extern "C" void smc_mark(uint32_t addr, uint32_t len, uint32_t tag) {
     u32 off = addr & 0x00FFFFFFu;
     // Width-exact: only the word-chunks the store touches.
     if (g_code_map[off >> 2] | g_code_map[(off + len - 1) >> 2]) {
-        if (g_ic_generation) ++g_ic_generation;
+        if (g_ic_generation) { ++g_ic_generation; ++g_smc_gen_accounted; }
         ++g_smc_mark_counts[tag < 3 ? tag : 2];
     }
 }
@@ -289,7 +320,7 @@ extern "C" void smc_mark_range(uint32_t addr, uint32_t len, uint32_t tag) {
     if (hi >= SMC_CHUNKS) hi = SMC_CHUNKS - 1;
     for (u32 c = lo; c <= hi; c++) {
         if (g_code_map[c]) {
-            if (g_ic_generation) ++g_ic_generation;
+            if (g_ic_generation) { ++g_ic_generation; ++g_smc_gen_accounted; }
             ++g_smc_mark_counts[tag < 3 ? tag : 2];
             return;
         }
@@ -326,7 +357,7 @@ static BlockFn jit_lookup(u32 vaddr) {
                     // write to a code page.
                     if (!s_block_stale[slot]) {
                         s_block_stale[slot] = 1;
-                        if (g_ic_generation) ++g_ic_generation;
+                        if (g_ic_generation) { ++g_ic_generation; ++g_smc_gen_accounted; }
                         ++g_smc_mark_counts[3];
                     }
                     return nullptr;
@@ -365,7 +396,7 @@ static bool jit_register(u32 vaddr, BlockFn fn, u32 code_bytes) {
             // the per-write hooks see them as code.
             if (g_ic_generation) {
                 code_pages_mark_block(vaddr, verify ? code_bytes : 0);
-                if (!fresh) { ++g_ic_generation; ++g_smc_mark_counts[2]; }
+                if (!fresh) { ++g_ic_generation; ++g_smc_gen_accounted; ++g_smc_mark_counts[2]; }
             }
             return true;
         }
@@ -412,6 +443,12 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_ic(int on) {
     if (on) {
         if (g_ic_generation == 0) {
             g_ic_generation = 1;
+            // Ledger rebase: the derived emitted-mark count is
+            // (g_ic_generation - 1) - g_smc_gen_accounted, which is only valid
+            // measured from the arm that set the generation to 1. Rezero here
+            // so an arm/disarm/re-arm cycle cannot make the residual go
+            // negative and read as a huge unsigned number.
+            g_smc_gen_accounted = 0;
             // Build 2 (lever-4): retroactively mark the pages of every block
             // compiled while disarmed, so the per-write SMC hooks see them.
             for (u32 slot = 0; slot < JIT_TABLE_SIZE; slot++)
@@ -431,7 +468,9 @@ extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_chain(int on) {
 // load replaces guest RAM wholesale; cached {ic_pc,ic_slot} pairs may point
 // at code that changed while their tags still match).
 extern "C" EMSCRIPTEN_KEEPALIVE void flycast_ic_invalidate(void) {
-    if (g_ic_generation) ++g_ic_generation;
+    // Ledger [4] -- see the g_smc_mark_counts note. Counted so a savestate load
+    // cannot be mistaken for guest self-modifying code in the [smc] line.
+    if (g_ic_generation) { ++g_ic_generation; ++g_smc_gen_accounted; ++g_smc_mark_counts[4]; }
 }
 // Lever-4 task 6 — parity gate: while g_parity_hashing, the crediting-loop
 // delivery gate folds the architectural state (pc, r0-r15, sr, pr, gbr, vbr,
@@ -553,9 +592,53 @@ double g_attr_retro_ms = 0.0;
 // through the guest store imports; rend_start_render only ARMS the
 // render-done event via sh4_sched_request, it does not tick the scheduler).
 //
-// Cost: one emscripten_get_now() pair per sched tick (~44K/s) -- two orders
-// of magnitude below the ~0.5-1M/s dispatch rate that forced the DEBUG_DISPATCH
-// g_cb_*_ns counters to stay debug-only. Always-on, RELEASE-safe.
+// ---------------------------------------------------------------------------
+// LEVER13_SCHED_TIMER -- DEFAULT 0 SINCE 2026-08-29. The `sch` bucket is RETIRED
+// as a measurement; only its EVENT COUNT survives. Same species, same evidence
+// and same remedy as LEVER12_HOT_TIMERS (EmscriptenWorker.cpp) -- that audit
+// retired `pvr`/`sq` and KEPT `sch` on the grounds that its per-event reading
+// (2645 ns) sat 6.0x above the emscripten_get_now() quantum, i.e. that the
+// bucket RESOLVES. It does. That was the wrong question: a bucket can resolve
+// and still cost more than it is worth.
+//
+// MEASURED, not argued. A CDP CPU profile of the emu worker (25.07 s of samples,
+// PSO gameplay from /tmp/dcx-state-user2.bin, /tmp/dcx-worker.cpuprofile) puts
+// 3.91% of ALL worker self time in
+//     _emscripten_get_now <- wasm-to-js <- WasmDynarec::dispatch_slice
+// and dispatch_slice's only get_now callers in a RELEASE build are (a) the
+// frame watchdog at `(s_dispatch_count & 0x3FFFF) == 0`, which fires 2-4x/s and
+// cannot be it, and (b) THIS PAIR, which fires twice per sh4_sched_tick. The
+// [split] line reads n=10,689 ticks/s, so 21,378 calls/s. Whole clock-read
+// bucket incl. the boundary trampoline: 4.67% of worker self time.
+//
+// The arithmetic closes against the shipped LEVER-12 verdict independently:
+// that pair measured ~738 ns per get_now() call at machine load 23-41, so
+// 21,378 x 738 ns = 15.8 ms/s of pure observer on a ~330 ms/s mainloop = 4.8%.
+// Against the bucket's OWN reading (32.8 ms/s over 10,689 ticks = 3.07 us/tick)
+// the observer is 1.48 us of the 3.07 -- the instrument is ~48% of what it
+// reports, and true sched work is ~1.6 us/tick.
+//
+// WHY NOT SAMPLED (time 1 tick in N, as `sq` does). It would cost ~0 and still
+// give a mean. Not taken here because sched ticks are DRIVEN BY SH4_TIMESLICE
+// and the devices on the list have their own fixed periods (AICA every
+// AICA_TICK=4535 cycles, SPG per line, VBlank per field), so a power-of-two
+// stride can alias onto one device's period and sample a biased subset. A
+// sampled `sch` would be cheap and WRONG, which is worse than absent. If it is
+// ever wanted, sample on a counter that is not a multiple of the timeslice.
+//
+// CONSEQUENCE FOR THE SPLIT: with the timer off, sched cost lands in the `jit`
+// residual, which note (f) already documents as an upper bound. The [split]
+// line prints `sch=-` with its count, and the fat-tick split (which needs
+// per-tick durations) is unavailable and prints as such. g_attr_sched_timed is
+// the single source of truth the printer reads -- EmscriptenWorker.cpp does NOT
+// carry a second copy of this #define, because two defines that must agree is
+// exactly how a build ships a line that lies about its own units.
+//
+// Set to 1 to restore per-tick timing (measurement arm only).
+#ifndef LEVER13_SCHED_TIMER
+#define LEVER13_SCHED_TIMER 0
+#endif
+uint32_t g_attr_sched_timed = LEVER13_SCHED_TIMER ? 1u : 0u;
 double   g_attr_sched_ms    = 0.0;   // total wall inside sh4_sched_tick()
 uint32_t g_attr_sched_n     = 0;     // sh4_sched_tick() calls
 // Fat-tick subset. An AicaUpdate tick is 512 ARM7 cycles + a 64-channel
@@ -589,7 +672,9 @@ static void jit_clear() {
     memset(s_block_fn, 0, sizeof(s_block_fn));
     memset(s_block_pc, 0, sizeof(s_block_pc));
     s_block_count = 0;
-    if (g_ic_generation) ++g_ic_generation;   // cache flush -> invalidate all IC entries
+    // Ledger [5] -- cache flush invalidates every IC entry. Counted (see the
+    // g_smc_mark_counts note): this is administrative, NOT guest SMC.
+    if (g_ic_generation) { ++g_ic_generation; ++g_smc_gen_accounted; ++g_smc_mark_counts[5]; }
     // Build 2 (lever-4): cleared blocks no longer occupy their pages; armed
     // re-registration re-marks them as compiles come back.
     memset((void*)g_code_map, 0, sizeof(g_code_map));
@@ -1055,6 +1140,21 @@ EMSCRIPTEN_KEEPALIVE uint32_t flycast_ctx_snapshot(uint32_t which) {
         case 78: { u32 n = 0; for (u32 c = 0; c < SMC_CHUNKS; c++) n += g_code_map[c]; return n; }  // marked 16B code chunks
         case 79: return g_smc_mark_counts[3];     // jit_lookup clean->stale transitions (F1 dedupe)
         case 80: return g_smc_last_addr;          // DIAG: last phys addr whose chunk was marked (emitted reg-EA path)
+        // [2026-08-29] LEDGER CLOSURE (see the g_smc_mark_counts note). Cases
+        // 75/76/77/79 alone could never support "no SMC occurred" -- icgen moved
+        // while all four read 0. These are the remaining paths.
+        case 103: return g_smc_mark_counts[4];    // flycast_ic_invalidate (savestate load) -- administrative
+        case 104: return g_smc_mark_counts[5];    // jit_clear (cache flush)               -- administrative
+        case 105: return g_smc_mark_counts[6];    // block-manager reset                   -- administrative
+        case 106: return g_smc_mark_counts[7];    // g_ic_flush_mask periodic (inert at default 0)
+        case 107: return g_smc_gen_accounted;     // generation units added by ALL C paths since the last arm
+        // DERIVED: generation units contributed by the EMITTED in-wasm store
+        // mark (wasm_emit.cpp emitSmcMarkLocal/emitSmcMarkConstPage), which is
+        // branchless on the hot guest-store path and deliberately uncounted
+        // there. Units, not events -- an 8-byte fmov.d pair can add 2 -- so it
+        // is an UPPER bound on emitted-mark events, the safe direction. Reads 0
+        // while disarmed (nothing can move the generation off 0).
+        case 108: return g_ic_generation ? (g_ic_generation - 1u - g_smc_gen_accounted) : 0u;
         case 81: return g_syncsr_count;           // lever-5B sizing: shop_sync_sr C-fallback fires
         case 89: return g_syncfpscr_count;        // lever-10 sizing: shop_sync_fpscr C-fallback fires
         case 90: return g_idleskip_burns;         // lever-11 v0: frame-wait-spin slice burns
@@ -2280,7 +2380,8 @@ public:
 		// Lever-4: the block table survives (above), but flycast just reset
 		// its code buffer — conservatively invalidate every IC entry; the
 		// C-probe path refills them against the relinked state.
-		if (g_ic_generation) ++g_ic_generation;
+		// Ledger [6] -- administrative, NOT guest SMC. See g_smc_mark_counts.
+		if (g_ic_generation) { ++g_ic_generation; ++g_smc_gen_accounted; ++g_smc_mark_counts[6]; }
 	}
 
 	// Lever-6B: the dispatch loop lives OUTSIDE any lexical try/catch so its
@@ -2296,8 +2397,11 @@ public:
 				++s_dispatch_count;
 				// TEST: periodic IC flush — bounds SMC-staleness when cond/static
 				// exits use the IC (which skips jit_lookup's ram_code_sum verify).
+				// Ledger [7] -- inert at the shipped default (g_ic_flush_mask == 0).
 				if (g_ic_flush_mask && g_ic_generation &&
-				    (s_dispatch_count % g_ic_flush_mask) == 0) ++g_ic_generation;
+				    (s_dispatch_count % g_ic_flush_mask) == 0) {
+					++g_ic_generation; ++g_smc_gen_accounted; ++g_smc_mark_counts[7];
+				}
 				// Frame watchdog (boot-title-wedge, RELEASE-safe): a single
 				// run_iter that never completes a frame freezes the worker
 				// (no vblank → CpuRunning never clears). Every 262144
@@ -3014,15 +3118,26 @@ public:
 								// the top of this file for what this covers and
 								// what it deliberately does not (the renderer is
 								// NOT here -- it is on the guest store path).
+								// [2026-08-29] LEVER13_SCHED_TIMER: this pair fired
+								// 21,378 times/s and was 3.91% of ALL worker self
+								// time in the CDP profile. Default 0 keeps the
+								// COUNT (which is load-robust and is what the
+								// scene-identity controls are read from) and
+								// drops only the clock reads. See the
+								// LEVER13_SCHED_TIMER block by g_attr_sched_ms.
+#if LEVER13_SCHED_TIMER
 								const double t_sched = emscripten_get_now();
 								sh4_sched_tick(SH4_TIMESLICE);
 								const double d_sched = emscripten_get_now() - t_sched;
 								g_attr_sched_ms += d_sched;
-								++g_attr_sched_n;
 								if (d_sched >= SCHED_FAT_MS) {
 									g_attr_schedfat_ms += d_sched;
 									++g_attr_schedfat_n;
 								}
+#else
+								sh4_sched_tick(SH4_TIMESLICE);
+#endif
+								++g_attr_sched_n;
 								++g_dbg_sched_ticks;
 							}
 							// ORDER 21b — recompute the SR interrupt gate against LIVE

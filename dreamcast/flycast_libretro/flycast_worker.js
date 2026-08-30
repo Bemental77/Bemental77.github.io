@@ -1033,7 +1033,22 @@
             // Lever-4 [smc]: icgen delta/s = total IC-invalidation rate; smcS/B/R
             // split it by writer (slow store / block-DMA / re-register); cpg =
             // marked code pages.
-            ' icgen=' + (f(74)>>>0) + ' smcS=' + (f(75)>>>0) + ' smcB=' + (f(76)>>>0) + ' smcR=' + (f(77)>>>0) + ' cpg=' + (f(78)>>>0) + ' smcT=' + (f(79)>>>0) + ' smcA=0x' + h(f(80)) + ' syncsr=' + (f(81)>>>0) + ' shms=' + (f(82)>>>0) + ' rrms=' + (f(83)>>>0) + ' ftrv=' + (f(84)>>>0) + ' fipr=' + (f(85)>>>0) + ' fsca=' + (f(86)>>>0) + ' ifbo=' + (f(87)>>>0) + ' icn=' + (f(88)>>>0) + ' syncfp=' + (f(89)>>>0) + ' isk=' + (f(90)>>>0) });
+            //
+            // [2026-08-29] The four writer counters DO NOT ACCOUNT FOR icgen on
+            // their own -- a 75 s campaign read smcS=smcB=smcR=smcT=0 while
+            // icgen still advanced 2 -> 5, so "no SMC occurred" was NOT provable
+            // from them. The ledger is now closed (rec_wasm.cpp, see the
+            // g_smc_mark_counts note): smcI/smcC/smcX/smcP are the four
+            // administrative paths (savestate invalidate / jit_clear / bm reset
+            // / periodic flush) and smcE is the DERIVED count of generation
+            // units contributed by the emitted in-wasm store mark, which is
+            // branchless on the hot store path and cannot be counted inline.
+            // IDENTITY, and the thing to check: over any window,
+            //     d(icgen) == d(smcS+smcB+smcR+smcT+smcI+smcC+smcX+smcP+smcE)
+            // exactly, by construction. "No SMC occurred" == d(icgen) is 0.
+            ' icgen=' + (f(74)>>>0) + ' smcS=' + (f(75)>>>0) + ' smcB=' + (f(76)>>>0) + ' smcR=' + (f(77)>>>0) + ' cpg=' + (f(78)>>>0) + ' smcT=' + (f(79)>>>0) +
+            ' smcI=' + (f(103)>>>0) + ' smcC=' + (f(104)>>>0) + ' smcX=' + (f(105)>>>0) + ' smcP=' + (f(106)>>>0) + ' smcAcc=' + (f(107)>>>0) + ' smcE=' + (f(108)>>>0) +
+            ' smcA=0x' + h(f(80)) + ' syncsr=' + (f(81)>>>0) + ' shms=' + (f(82)>>>0) + ' rrms=' + (f(83)>>>0) + ' ftrv=' + (f(84)>>>0) + ' fipr=' + (f(85)>>>0) + ' fsca=' + (f(86)>>>0) + ' ifbo=' + (f(87)>>>0) + ' icn=' + (f(88)>>>0) + ' syncfp=' + (f(89)>>>0) + ' isk=' + (f(90)>>>0) });
         } catch (err) {
           postMessage({ cmd: 'print', txt: '[ctxsnap] threw: ' + (err && err.message ? err.message : String(err)) });
         }

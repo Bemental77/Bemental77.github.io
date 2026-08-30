@@ -33,6 +33,8 @@ QUERY=""
 PRESSES=""
 LOADSTATE=""
 CTXMS=""
+PROFAT=""
+PROFDUR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --skip-link|--skip-build) SKIP_LINK=1; shift ;;
@@ -68,6 +70,15 @@ while [ $# -gt 0 ]; do
     # &ctxsnap=1 and &ctxms=N as independent query params), so --ctxms alone is
     # inert. This passthrough therefore implies --ctxsnap.
     --ctxms)                  CTXMS="$2"; shift 2 ;;
+    # [2026-08-29] --profat <ms> [--profdur <ms>]: CDP CPU profile of the EMU
+    # WORKER (flycast_probe.js:654, writes /tmp/dcx-worker.cpuprofile). Same gap
+    # as --loadstate/--ctxms: the flag existed in the probe, the canonical loop
+    # could not reach it, so every attribution run so far was an improvised
+    # `node flycast_probe.js ...` outside the loop. MEASUREMENT ARM ONLY — gate
+    # #10 forbids comparing a profiled run's wall time to an unprofiled one;
+    # a profile is for SHARES (who owns the time), never for sizing a win.
+    --profat)                 PROFAT="$2"; shift 2 ;;
+    --profdur)                PROFDUR="$2"; shift 2 ;;
     -h|--help)                sed -n '2,/^set -e/p' "$0" | sed 's/^# //;/^set -e/d'; exit 0 ;;
     *)                        echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -128,6 +139,8 @@ CMD="node $PROBE_JS --log $PROBE_LOG $KEEP_NOISE $INTERP $PCTRACE"
 [ -n "$QUERY" ]    && CMD="$CMD --q $QUERY"
 [ -n "$PRESSES" ]  && CMD="$CMD$PRESSES"
 [ -n "$CTXMS" ]    && CMD="$CMD --ctxsnap --ctxms $CTXMS"
+[ -n "$PROFAT" ]   && CMD="$CMD --profat $PROFAT"
+[ -n "$PROFDUR" ]  && CMD="$CMD --profdur $PROFDUR"
 if [ -n "$LOADSTATE" ]; then
   [ -f "$LOADSTATE" ] || { echo "FATAL: --loadstate file not found: $LOADSTATE" >&2; exit 2; }
   CMD="$CMD --loadstate $LOADSTATE"
