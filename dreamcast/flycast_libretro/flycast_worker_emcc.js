@@ -10536,121 +10536,121 @@ Module["GL"] = GL;
 var proxiedFunctionTable = [ _proc_exit, exitOnMainThread, pthreadCreateProxied, ___syscall_accept4, ___syscall_bind, ___syscall_connect, ___syscall_faccessat, ___syscall_fcntl64, ___syscall_fstat64, ___syscall_getdents64, ___syscall_getpeername, ___syscall_getsockname, ___syscall_getsockopt, ___syscall_ioctl, ___syscall_listen, ___syscall_lstat64, ___syscall_mkdirat, ___syscall_newfstatat, ___syscall_openat, ___syscall_pipe2, ___syscall_poll, ___syscall_poll_nonblocking, ___syscall_recvfrom, ___syscall_recvmsg, ___syscall_rmdir, ___syscall_sendmsg, ___syscall_sendto, ___syscall_setsockopt, ___syscall_shutdown, ___syscall_socket, ___syscall_stat64, ___syscall_unlinkat, __mmap_js, __munmap_js, _environ_get, _environ_sizes_get, _fd_close, _fd_read, _fd_seek, _fd_write, _getaddrinfo ];
 
 var ASM_CONSTS = {
-  6642104: $0 => {
+  6642504: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] gl ctx already created, handle=" + $0
     });
   },
-  6642199: $0 => {
+  6642599: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] FATAL: emscripten_webgl_create_context failed (handle=" + $0 + ")"
     });
   },
-  6642323: ($0, $1) => {
+  6642723: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] WebGL2 ctx created on main-runtime thread, handle=" + $0 + ", make_current=" + $1
     });
   },
-  6642462: () => {
+  6642862: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] worker_init: retro_init done"
     });
   },
-  6642549: $0 => {
+  6642949: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] run_iter enter #" + $0
     });
   },
-  6642629: $0 => {
+  6643029: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] run_iter exit  #" + $0
     });
   },
-  6642709: () => {
+  6643109: () => {
     postMessage({
       cmd: "print",
       txt: "[parity] from_load requested but no state was loaded"
     });
   },
-  6642801: () => {
+  6643201: () => {
     postMessage({
       cmd: "print",
       txt: "[parity] save_state FAILED"
     });
   },
-  6642867: ($0, $1) => {
+  6643267: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[parity] source=" + (($1 | 0) ? "loaded-state" : "live-capture") + " " + ($0 >>> 0) + " bytes"
     });
   },
-  6642992: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
+  6643392: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
     postMessage({
       cmd: "print",
       txt: "[parity] frames=" + ($0 >>> 0) + " disA=" + ($1 >>> 0).toString(16) + "/" + ($2 >>> 0) + " disB=" + ($3 >>> 0).toString(16) + "/" + ($4 >>> 0) + " armC=" + ($5 >>> 0).toString(16) + "/" + ($6 >>> 0) + " sound=" + ($7 | 0) + " verdict=" + (($7 | 0) ? (($8 | 0) ? "PASS" : "DIVERGED") : "UNSOUND-WINDOW")
     });
   },
-  6643313: ($0, $1, $2) => {
+  6643713: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] video target set buf=" + $0 + " w=" + $1 + " h=" + $2
     });
   },
-  6643424: ($0, $1) => {
+  6643824: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] audio ring addr=" + $0 + " capacity=" + $1 + " frames"
     });
   },
-  6643536: ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10) => {
+  6643936: ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10) => {
     postMessage({
       cmd: "print",
       txt: "[reios-sc] pc=0x" + ($0 >>> 0).toString(16) + " r4=0x" + ($1 >>> 0).toString(16) + " r5=0x" + ($2 >>> 0).toString(16) + " r6=0x" + ($3 >>> 0).toString(16) + " r7=0x" + ($4 >>> 0).toString(16) + " r0=0x" + ($5 >>> 0).toString(16) + ($6 ? (" (prev x" + ($6 >>> 0) + ")") : "") + ($7 ? (" READ sector=" + ($8 >>> 0) + " n=" + ($9 >>> 0) + " dst=0x" + ($10 >>> 0).toString(16)) : "")
     });
   },
-  6643934: ($0, $1, $2) => {
+  6644334: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[ifb-pc] #" + ($0 | 0) + " pc=0x" + ($1 >>> 0).toString(16) + " op=0x" + (($2 | 0) & 65535).toString(16) + " major=" + ((($2 | 0) >> 12) & 15)
     });
   },
-  6644113: ($0, $1, $2, $3) => {
+  6644513: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[sh4-throw] #" + $0 + " pc=" + ($1 >>> 0).toString(16) + " op=" + ($2 & 65535).toString(16) + " sr=" + ($3 >>> 0).toString(16) + " BL=" + (($3 >>> 28) & 1) + " MD=" + (($3 >>> 30) & 1)
     });
   },
-  6644339: ($0, $1, $2, $3, $4, $5) => {
+  6644739: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[gd-check] id=" + ($0 >>> 0) + " ret=" + ($1 >>> 0) + " err=0x" + ($2 >>> 0).toString(16) + " size=0x" + ($3 >>> 0).toString(16) + " wait=0x" + ($4 >>> 0).toString(16) + ($5 ? (" (prev x" + ($5 >>> 0) + ")") : "")
     });
   },
-  6644579: () => {
+  6644979: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] main pthread entered (idle)"
     });
   },
-  6644665: ($0, $1, $2) => {
+  6645065: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] SET_HW_RENDER captured (ctx_type=" + $0 + ", ver=" + $1 + "." + $2 + ")"
     });
   },
-  6644795: $0 => {
+  6645195: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast.log] " + UTF8ToString($0)
     });
   },
-  6644870: ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) => {
+  6645270: ($0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) => {
     postMessage({
       cmd: "fps",
       fps: $0,
@@ -10664,68 +10664,73 @@ var ASM_CONSTS = {
       adrop: $8,
       vbl: $9,
       vbi: $10,
-      fcyc: $11
+      fcyc: $11,
+      split: UTF8ToString($13)
     });
     postMessage({
       cmd: "print",
       txt: UTF8ToString($12)
     });
+    postMessage({
+      cmd: "print",
+      txt: UTF8ToString($13)
+    });
   },
-  6645074: $0 => {
+  6645553: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6645129: $0 => {
+  6645608: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6645184: $0 => {
+  6645663: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6645239: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
+  6645718: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
     postMessage({
       cmd: "print",
       txt: "[stuck-pc] pc=0x" + ($0 >>> 0).toString(16) + " sr=0x" + ($1 >>> 0).toString(16) + " imask=" + (($1 >> 4) & 15) + " pend=0x" + ($2 >>> 0).toString(16) + " istnrm=0x" + ($3 >>> 0).toString(16) + " istext=0x" + ($4 >>> 0).toString(16) + " iml2=0x" + ($5 >>> 0).toString(16) + " iml4=0x" + ($6 >>> 0).toString(16) + " iml6=0x" + ($7 >>> 0).toString(16) + " pr=0x" + ($8 >>> 0).toString(16)
     });
   },
-  6645643: $0 => {
+  6646122: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6645698: $0 => {
+  6646177: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6645753: $0 => {
+  6646232: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6645808: ($0, $1, $2, $3, $4) => {
+  6646287: ($0, $1, $2, $3, $4) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] video_cb #" + $0 + " HW_FRAME_VALID #" + $1 + " commit_frame=" + $2 + " w=" + $3 + " h=" + $4
     });
   },
-  6645959: ($0, $1, $2, $3, $4, $5) => {
+  6646438: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] video_cb #" + $0 + " data=" + $1 + " w=" + $2 + " h=" + $3 + " pitch=" + $4 + " real_frames=" + $5
     });
   },
-  6646115: ($0, $1, $2, $3) => {
+  6646594: ($0, $1, $2, $3) => {
     var bytes = $2 * $3;
     var src = $0;
     var view = (growMemViews(), HEAPU8).subarray(src >>> 0, src + bytes >>> 0);
@@ -10740,103 +10745,103 @@ var ASM_CONSTS = {
       pitch: $3
     }, [ copy.buffer ]);
   },
-  6646334: $0 => {
+  6646813: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: " + UTF8ToString($0)
     });
   },
-  6646423: () => {
+  6646902: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: unknown exception during retro_load_game"
     });
   },
-  6646533: $0 => {
+  6647012: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: C-string exception during retro_load_game: " + UTF8ToString($0)
     });
   },
-  6646665: $0 => {
+  6647144: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: std::exception during retro_load_game: " + UTF8ToString($0)
     });
   },
-  6646793: $0 => {
+  6647272: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] load_disc: retro_load_game returned " + ($0 ? "true" : "false")
     });
   },
-  6646914: ($0, $1) => {
+  6647393: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[maple] vmuDev=" + $0 + " type=" + $1 + " (MDT_SegaVMU=1)"
     });
   },
-  6647013: $0 => {
+  6647492: $0 => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] disc_type=" + ($0 >>> 0) + " (0=CdRom 1=CdRom_XA 4=GdRom 16=NoDisk)"
     });
   },
-  6647139: ($0, $1, $2, $3, $4) => {
+  6647618: ($0, $1, $2, $3, $4) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] av_info base=" + $0 + "x" + $1 + " max=" + $2 + "x" + $3 + " fps=" + $4
     });
   },
-  6647268: () => {
+  6647747: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] invoking hw_render.context_reset"
     });
   },
-  6647359: () => {
+  6647838: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] hw_render.context_reset returned"
     });
   },
-  6647450: () => {
+  6647929: () => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] WARNING: hw_render.context_reset not registered"
     });
   },
-  6647556: $0 => {
+  6648035: $0 => {
     postMessage({
       cmd: "print",
       txt: "[parity] arm " + ($0 | 0) + ": restoring..."
     });
   },
-  6647637: ($0, $1, $2) => {
+  6648116: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[parity] arm " + ($0 | 0) + ": restore " + (($1 | 0) ? "ok" : "FAILED") + ", ic=" + ($2 | 0)
     });
   },
-  6647758: $0 => {
+  6648237: $0 => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm-shard] jit_register probe-limit vaddr=0x" + ($0 >>> 0).toString(16)
     });
   },
-  6647875: ($0, $1, $2) => {
+  6648354: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm-shard] sealed count=" + ($0 | 0) + " base_idx=" + ($1 | 0) + " bytes=" + ($2 | 0)
     });
   },
-  6648e3: ($0, $1, $2) => {
+  6648479: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[shardmap] base=" + ($0 | 0) + " i0=" + ($1 | 0) + " v=" + UTF8ToString($2)
     });
   },
-  6648111: ($0, $1, $2, $3) => {
+  6648590: ($0, $1, $2, $3) => {
     var errPtr = $0;
     var errStr = "";
     var i = 0;
@@ -10849,7 +10854,7 @@ var ASM_CONSTS = {
       txt: "[rec_wasm-shard] install_shard FAILED #" + ($1 | 0) + " count=" + ($2 | 0) + " bytes=" + ($3 | 0) + ' err="' + errStr + '" — falling back to per-block installs'
     });
   },
-  6648452: ($0, $1) => {
+  6648931: ($0, $1) => {
     var p = $1 >>> 0;
     var s = "";
     while ((growMemViews(), HEAPU8)[p >>> 0] !== 0 && s.length < 256) {
@@ -10861,7 +10866,7 @@ var ASM_CONSTS = {
       txt: "[rec_wasm-shard] BAD BLOCK vaddr=0x" + ($0 >>> 0).toString(16) + ' err="' + s + '"'
     });
   },
-  6648690: ($0, $1, $2) => {
+  6649169: ($0, $1, $2) => {
     var p = $0 >>> 0;
     var n = $1 | 0;
     var va = $2 >>> 0;
@@ -10881,158 +10886,158 @@ var ASM_CONSTS = {
       txt: "[wasm-dump] END"
     });
   },
-  6649103: ($0, $1) => {
+  6649582: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm-shard] per-block fallback: installed=" + ($0 | 0) + " hard-failed=" + ($1 | 0) + " (hard failures span-interp permanently)"
     });
   },
-  6649271: $0 => {
+  6649750: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6649326: $0 => {
+  6649805: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6649381: ($0, $1, $2) => {
+  6649860: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[vec-ring now] idx=" + ($0 >>> 0) + " spc=0x" + ($1 >>> 0).toString(16) + " vbr=0x" + ($2 >>> 0).toString(16)
     });
   },
-  6649523: ($0, $1, $2) => {
+  6650002: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[keystream #" + ($0 | 0) + "] r0(ks)=0x" + ($1 >>> 0).toString(16) + " r13(i)=" + ($2 >>> 0) + " (INTERP)"
     });
   },
-  6649662: $0 => {
+  6650141: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6649717: $0 => {
+  6650196: $0 => {
     postMessage({
       cmd: "print",
       txt: "[pool INT] state=0x" + ($0 >>> 0).toString(16)
     });
   },
-  6649798: $0 => {
+  6650277: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6649853: ($0, $1, $2, $3) => {
+  6650332: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[interp-escape] pc=0x" + ($0 >>> 0).toString(16) + " spc=0x" + ($1 >>> 0).toString(16) + " sr=0x" + ($2 >>> 0).toString(16) + " pr=0x" + ($3 >>> 0).toString(16)
     });
   },
-  6650044: ($0, $1, $2, $3) => {
+  6650523: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[mem-map] ram=0x" + ($0 >>> 0).toString(16) + " &mem_b[0]=0x" + ($1 >>> 0).toString(16) + " &vram[0]=0x" + ($2 >>> 0).toString(16) + " &aica_ram[0]=0x" + ($3 >>> 0).toString(16)
     });
   },
-  6650253: $0 => {
+  6650732: $0 => {
     postMessage({
       cmd: "print",
       txt: "[decbug entry] pc=0x" + ($0 >>> 0).toString(16)
     });
   },
-  6650335: $0 => {
+  6650814: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6650390: $0 => {
+  6650869: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6650445: $0 => {
+  6650924: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6650500: $0 => {
+  6650979: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6650555: $0 => {
+  6651034: $0 => {
     postMessage({
       cmd: "print",
       txt: "[pool JIT] state=0x" + ($0 >>> 0).toString(16)
     });
   },
-  6650636: $0 => {
+  6651115: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6650691: ($0, $1, $2, $3, $4, $5) => {
+  6651170: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[keystream #" + ($0 | 0) + "] r0(ks)=0x" + ($1 >>> 0).toString(16) + " r2(word)=0x" + ($2 >>> 0).toString(16) + " r13(i)=" + ($3 >>> 0) + " r12(n)=" + ($4 >>> 0) + " r14=0x" + ($5 >>> 0).toString(16)
     });
   },
-  6650917: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
+  6651396: ($0, $1, $2, $3, $4, $5, $6, $7, $8) => {
     postMessage({
       cmd: "print",
       txt: "[escape-edge] prev_pc=0x" + ($0 >>> 0).toString(16) + " -> wild_pc=0x" + ($1 >>> 0).toString(16) + " spc=0x" + ($2 >>> 0).toString(16) + " ssr=0x" + ($3 >>> 0).toString(16) + " sr=0x" + ($4 >>> 0).toString(16) + " vbr=0x" + ($5 >>> 0).toString(16) + " pend=0x" + ($6 >>> 0).toString(16) + " pr=0x" + ($7 >>> 0).toString(16) + " r15=0x" + ($8 >>> 0).toString(16)
     });
   },
-  6651299: $0 => {
+  6651778: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6651354: $0 => {
+  6651833: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6651409: $0 => {
+  6651888: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6651464: $0 => {
+  6651943: $0 => {
     postMessage({
       cmd: "print",
       txt: UTF8ToString($0)
     });
   },
-  6651519: ($0, $1, $2) => {
+  6651998: ($0, $1, $2) => {
     var s = "[blockdump] vaddr=0x" + ($0 >>> 0).toString(16) + " size=" + ($1 | 0) + " hex=" + UTF8ToString($2);
     postMessage({
       cmd: "print",
       txt: s
     });
   },
-  6651664: ($0, $1) => {
+  6652143: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[rec_wasm] jit_register probe-limit at vaddr=0x" + ($0 >>> 0).toString(16) + " (probe #" + ($1 | 0) + ")"
     });
   },
-  6651807: ($0, $1, $2, $3, $4, $5) => {
+  6652286: ($0, $1, $2, $3, $4, $5) => {
     var addr = $0;
     var n = $1;
     var hex = "";
@@ -11052,31 +11057,31 @@ var ASM_CONSTS = {
       txt: "[rec_wasm] install_block FAILED #" + ($3 | 0) + " vaddr=0x" + ($4 >>> 0).toString(16) + " bytes=" + ($5 | 0) + ' err="' + errStr + '"' + " first" + n + "=" + hex
     });
   },
-  6652304: ($0, $1, $2, $3, $4, $5) => {
+  6652783: ($0, $1, $2, $3, $4, $5) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker] compile RAM-block #" + ($0 | 0) + " vaddr=0x" + ($1 >>> 0).toString(16) + " ops=" + ($2 | 0) + " BlockType=0x" + ($3 >>> 0).toString(16) + " Branch=0x" + ($4 >>> 0).toString(16) + " Next=0x" + ($5 >>> 0).toString(16)
     });
   },
-  6652574: ($0, $1, $2, $3, $4, $5, $6, $7) => {
+  6653053: ($0, $1, $2, $3, $4, $5, $6, $7) => {
     postMessage({
       cmd: "print",
       txt: "[flycast-worker]   words: " + ($0 >>> 0).toString(16).padStart(4, "0") + " " + ($1 >>> 0).toString(16).padStart(4, "0") + " " + ($2 >>> 0).toString(16).padStart(4, "0") + " " + ($3 >>> 0).toString(16).padStart(4, "0") + " " + ($4 >>> 0).toString(16).padStart(4, "0") + " " + ($5 >>> 0).toString(16).padStart(4, "0") + " " + ($6 >>> 0).toString(16).padStart(4, "0") + " " + ($7 >>> 0).toString(16).padStart(4, "0")
     });
   },
-  6653020: ($0, $1, $2, $3, $4, $5, $6) => {
+  6653499: ($0, $1, $2, $3, $4, $5, $6) => {
     postMessage({
       cmd: "print",
       txt: "[watchdog #" + ($0 | 0) + "] stuck pc=0x" + ($1 >>> 0).toString(16) + " istnrm=0x" + ($2 >>> 0).toString(16) + " istext=0x" + ($3 >>> 0).toString(16) + " pend=0x" + ($4 >>> 0).toString(16) + " sr=0x" + ($5 >>> 0).toString(16) + " pr=0x" + ($6 >>> 0).toString(16)
     });
   },
-  6653284: ($0, $1, $2) => {
+  6653763: ($0, $1, $2) => {
     postMessage({
       cmd: "print",
       txt: "[arm7rec] emitter engaged, first block pc=0x" + ($0 >>> 0).toString(16) + " ops=" + ($1 | 0) + " bytes=" + ($2 | 0)
     });
   },
-  6653432: ($0, $1) => {
+  6653911: ($0, $1) => {
     var p = $1 >>> 0;
     var s = "";
     while ((growMemViews(), HEAPU8)[p >>> 0] !== 0 && s.length < 256) {
@@ -11088,13 +11093,13 @@ var ASM_CONSTS = {
       txt: "[arm7rec] install FAILED pc=0x" + ($0 >>> 0).toString(16) + ' err="' + s + '" — v0 fallback'
     });
   },
-  6653681: ($0, $1, $2, $3) => {
+  6654160: ($0, $1, $2, $3) => {
     postMessage({
       cmd: "print",
       txt: "[arm7st] MISMATCH pc=0x" + ($0 >>> 0).toString(16) + " reg=" + ($1 | 0) + " jit=0x" + ($2 >>> 0).toString(16) + " interp=0x" + ($3 >>> 0).toString(16)
     });
   },
-  6653862: ($0, $1) => {
+  6654341: ($0, $1) => {
     postMessage({
       cmd: "print",
       txt: "[arm7st] blocks=" + ($0 | 0) + " mismatches=" + ($1 | 0)
@@ -11300,7 +11305,7 @@ function assignWasmImports() {
     /** @export */ Zf: ___syscall_bind,
     /** @export */ Yf: ___syscall_connect,
     /** @export */ Xf: ___syscall_faccessat,
-    /** @export */ s: ___syscall_fcntl64,
+    /** @export */ t: ___syscall_fcntl64,
     /** @export */ Wf: ___syscall_getdents64,
     /** @export */ Vf: ___syscall_getpeername,
     /** @export */ Uf: ___syscall_getsockname,
@@ -11344,7 +11349,7 @@ function assignWasmImports() {
     /** @export */ Q: _emscripten_check_blocking_allowed,
     /** @export */ P: _emscripten_date_now,
     /** @export */ O: _emscripten_exit_with_live_runtime,
-    /** @export */ u: _emscripten_get_now,
+    /** @export */ r: _emscripten_get_now,
     /** @export */ nf: _emscripten_glActiveTexture,
     /** @export */ mf: _emscripten_glAttachShader,
     /** @export */ lf: _emscripten_glBeginQuery,
@@ -11645,7 +11650,7 @@ function assignWasmImports() {
     /** @export */ p: invoke_iiii,
     /** @export */ m: invoke_iiiii,
     /** @export */ K: invoke_iiiiii,
-    /** @export */ t: invoke_iiiiiii,
+    /** @export */ u: invoke_iiiiiii,
     /** @export */ J: invoke_iiiiiiii,
     /** @export */ C: invoke_iiiiiiiiiiii,
     /** @export */ B: invoke_jiiii,
@@ -11656,7 +11661,7 @@ function assignWasmImports() {
     /** @export */ F: invoke_viiii,
     /** @export */ A: invoke_viiiii,
     /** @export */ E: invoke_viiiiii,
-    /** @export */ r: invoke_viiiiiii,
+    /** @export */ s: invoke_viiiiiii,
     /** @export */ x: invoke_viiiiiiiiii,
     /** @export */ z: invoke_viiiiiiiiiiiiiii,
     /** @export */ v: _llvm_eh_typeid_for,
@@ -12355,7 +12360,7 @@ isPthread && flycastWorkerModule();
 
 // --- build-flavor marker — INJECTED by flycast_worker_link.sh, do not hand-edit ---
 if (typeof globalThis !== 'undefined' && globalThis.name !== 'em-pthread') {
-  var __flycastBuildMarker = '[build] flavor=RELEASE defines=none linked=2026-08-29T05:26:42Z (clean — perf, boot depth and wedge behavior are valid)';
+  var __flycastBuildMarker = '[build] flavor=RELEASE defines=none linked=2026-08-30T00:46:37Z (clean — perf, boot depth and wedge behavior are valid)';
   try { console.log(__flycastBuildMarker); } catch (e) {}
   try { postMessage({ cmd: 'print', txt: __flycastBuildMarker }); } catch (e) {}
 }

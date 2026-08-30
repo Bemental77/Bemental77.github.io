@@ -32,6 +32,7 @@ JS_FLAGS=""
 QUERY=""
 PRESSES=""
 LOADSTATE=""
+CTXMS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --skip-link|--skip-build) SKIP_LINK=1; shift ;;
@@ -56,6 +57,17 @@ while [ $# -gt 0 ]; do
     # whatever stale state.bin happens to sit in the repo root. flycast_probe.js
     # already had the flag (:201); the canonical loop could not reach it.
     --loadstate)              LOADSTATE="$2"; shift 2 ;;
+    # [2026-08-29] --ctxms <ms>: enable the periodic flycast_ctx_snapshot dump.
+    # This is the ONLY way to reach the lever-4 [smc] line (icgen / smcS / smcB /
+    # smcR / cpg / smcT / smcA, flycast_worker.js:1036) plus icn/isk/syncfp.
+    # Those are COUNTS, so they stay valid on a loaded box where every wall-time
+    # number is void — which is exactly when they are worth the most. Same gap as
+    # --loadstate above: flycast_probe.js already had the flag, the canonical
+    # loop could not reach it. NOTE --ctxms only sets the INTERVAL; the dump is
+    # enabled by the separate --ctxsnap flag (flycast_probe.js:209/213 emit
+    # &ctxsnap=1 and &ctxms=N as independent query params), so --ctxms alone is
+    # inert. This passthrough therefore implies --ctxsnap.
+    --ctxms)                  CTXMS="$2"; shift 2 ;;
     -h|--help)                sed -n '2,/^set -e/p' "$0" | sed 's/^# //;/^set -e/d'; exit 0 ;;
     *)                        echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -115,6 +127,7 @@ CMD="node $PROBE_JS --log $PROBE_LOG $KEEP_NOISE $INTERP $PCTRACE"
 [ -n "$IDLE" ]     && CMD="$CMD --idle $IDLE"
 [ -n "$QUERY" ]    && CMD="$CMD --q $QUERY"
 [ -n "$PRESSES" ]  && CMD="$CMD$PRESSES"
+[ -n "$CTXMS" ]    && CMD="$CMD --ctxsnap --ctxms $CTXMS"
 if [ -n "$LOADSTATE" ]; then
   [ -f "$LOADSTATE" ] || { echo "FATAL: --loadstate file not found: $LOADSTATE" >&2; exit 2; }
   CMD="$CMD --loadstate $LOADSTATE"

@@ -299,27 +299,45 @@ static bool s_self_loop_enabled = []{
 // use-site (build block) reads g_emit_self_loop so the toggle takes effect.
 bool g_emit_self_loop = s_self_loop_enabled;
 
-// Lever #2 (cross-block register residency) — 2-block region inlining. When ON,
-// a loop {A(BET_Cond, taken->B) -> B(BET_StaticJump -> A) -> A} is emitted as ONE
-// wasm loop that inlines B's body, keeping the SH4 register working-set resident
-// in wasm locals across A->B->A (reloadAll once at entry, flushAll once per exit)
-// instead of the per-block flushAll+reloadAll+return_call_indirect+C-probe on each
-// A<->B edge. Generalizes the single-block self-loop below. DEFAULT OFF (matched-
-// pair A/B lever). Toggle: bemental_sh4_set_region / flycast_set_region.
-// DEFAULT OFF: validated CORRECT (title renders with it ON) but the first-increment
-// shape (2-block A-cond -> B-staticjump -> A, INTRA-BATCH) does not reduce the title's
-// dominant probe cost (chit/schedtick unchanged ~528 ON vs OFF) because the title's hot
-// loops are CROSS-SHARD (that is why they fire emit_global_probe) and vaddr_to_block is a
-// single batch/shard. Next: cross-shard reach (shard-pack loop blocks or cross-shard
-// regions) + a region-fire counter + a cooled-rig matched pair. See task #26.
-bool g_emit_region = []{
-    // Env gate added 2026-08-29 so the region path can be A/B'd from the
-    // offline emitter harness the same way every other lever can. Default OFF,
-    // unchanged. (The dirty-model fix in its loop body — save/restore around
-    // the flushing arms + markAllDirty at the header — landed with LEVER-12.)
-    const char* e = std::getenv("FLYCAST_REGION");
-    return e && e[0] != '0';
-}();
+// Lever #2 (cross-block register residency) — 2-block region inlining. DELETED
+// 2026-08-29 by the LEVER-12 audit. Kept as a note because the reasoning is the
+// argument for not writing it again:
+//
+//   Shape: {A(BET_Cond, taken->B) -> B(BET_StaticJump -> A) -> A} emitted as ONE
+//   wasm loop with B's body inlined, so the SH4 working set stays in locals
+//   across A->B->A. LEVER-12's trace formation is a strict generalization of
+//   exactly this shape (a 2-member loop trace), so nothing is lost.
+//
+//   Why deleted rather than left gated OFF:
+//   1. It did NOT preserve slice cadence. Its inner loop yielded at
+//      SELF_LOOP_CYCLE_SLICE (8192 guest cycles ~= 18 timeslices) instead of at
+//      the timeslice boundary, so it ran ~455 iterations of arbitrary guest work
+//      — including shop_writem stores — before the crediting loop could run
+//      sh4_sched_tick/UpdateINTC. The offline runtime differential measured the
+//      overshoot directly: fixture T2 ran 480 iterations under the region vs 174
+//      per-block on the same credit budget, with the guest bytes byte-identical
+//      over the shared prefix (deferral, not corruption). That is the same
+//      deferral class as the unbounded self-loop that produced the Maple bit12
+//      storm; the 8192 bound is the shipped self-loop's bound, but the shipped
+//      self-loop defers ONE self-branching block's countdown, not a two-block
+//      body with stores. LEVER-12 does not do this: every trace member keeps its
+//      own slice-yield precheck, so a trace never runs a block on a spent slice.
+//   2. It was unreachable in the shipped build: not in flycast_worker_link.sh's
+//      EXPORTED_FUNCTIONS, no flycast_set_region wrapper in rec_wasm.cpp (the old
+//      comment here claimed one existed — it never did), and a worker has no env
+//      to read FLYCAST_REGION from. Dead weight that an A/B could still switch on
+//      by hand and reintroduce (1).
+//   3. It carried a second, independent copy of the RegCache dirty-model
+//      reasoning inside a wasm `loop`. The audit found a real bug there (flushAll
+//      inside a conditional arm that then left, with no saveDirty/restoreDirty),
+//      which is exactly the maintenance cost of keeping two implementations of
+//      one shape.
+//
+//   Its original shelving verdict is still the useful measurement: the title's
+//   hot loops are CROSS-shard, and vaddr_to_block is a single batch, so an
+//   intra-batch-only region never reached them (chit/schedtick unchanged ~528 ON
+//   vs OFF). That constraint applies to LEVER-12 too — it is the reason the
+//   trace lever has to be measured on shard-resident loops, not asserted.
 
 // ---------------------------------------------------------------------------
 // LEVER-12 — TRACE / SUPERBLOCK FORMATION (2026-08-29). Generalizes lever-2's
@@ -397,6 +415,34 @@ u32 g_trace_max_ops = []{
 bool g_trace_cross_page = []{
     const char* e = std::getenv("FLYCAST_TRACE_XPAGE");
     return e && e[0] != '0';
+}();
+// Risk-1 closure (see the g_trace_gen block for the full argument): guard every
+// INTERIOR trace edge with an SMC generation compare, so a traced member can
+// never run code the generation says has been overwritten. DEFAULT OFF, and
+// deliberately so: the audit established that an unguarded trace edge is exactly
+// as protected as the default-ON intra-shard tail-link it replaces (same map,
+// same re-verify points, same unverified-entry count per unit of guest work), so
+// this is an UPGRADE past shipping behaviour rather than a fix for a regression.
+// It costs ~5 instructions + 2 loads per interior boundary on a lever whose whole
+// value is boundary cost, so leaving it off keeps a matched pair measuring the
+// lever instead of the lever plus a tax. Flip it ON for shipping once the raw
+// win is measured. Inert while the IC is disarmed (?noic).
+#ifndef FLYCAST_TRACE_SMCGUARD_DEFAULT
+#define FLYCAST_TRACE_SMCGUARD_DEFAULT 0
+#endif
+bool g_trace_smc_guard = []{
+    const char* e = std::getenv("FLYCAST_TRACE_SMCGUARD");
+    return e ? (e[0] != '0') : (bool)FLYCAST_TRACE_SMCGUARD_DEFAULT;
+}();
+
+// Codegen-audit trim: derive a BET_CLS_COND exit's branch predicate ONCE
+// instead of twice (see the BET_CLS_COND case in emitBlockExit). DEFAULT ON —
+// it is a strict instruction reduction with identical observable semantics,
+// carried by the offline runtime differential (ctx + all 16MB of guest RAM +
+// ordered import log + cycles + credits + final PC). Kill-switch for a bisect.
+bool g_emit_cond_merge = []{
+    const char* e = std::getenv("FLYCAST_COND_MERGE");
+    return e ? (e[0] != '0') : true;
 }();
 // Emit-time counters (read by a future ctxsnap case, like g_exit_*): how many
 // traces formed and how many member blocks were inlined.
@@ -2529,6 +2575,78 @@ volatile uint32_t g_ic_generation = 0;             // 0=disarmed, 1=armed, ++ = 
 uint32_t g_ras_pc = 0, g_ras_slot = 0;
 uint32_t g_ras_gen = 0xFFFFFFFFu;   // never-matching until first armed fill
 
+// ---------------------------------------------------------------------------
+// LEVER-12 risk-1 closure — per-trace-edge SMC generation guard.
+//
+// THE HOLE, stated exactly. jit_lookup (rec_wasm.cpp) is the ONLY dispatch-path
+// caller of ram_code_sum, so any edge that reaches compiled guest code WITHOUT a
+// lookup runs unverified. Two such edges exist:
+//   (a) the default-ON intra-shard tail-link: sibling_func_idx resolves a target
+//       to a shard-local function index at COMPILE time and emitTailTo emits a
+//       bare `return_call <idx>`;
+//   (b) a LEVER-12 trace's interior member, whose body is inlined straight into
+//       the head's function.
+// These are EQUIVALENT, not merely comparable: both resolve through maps that
+// build_blocks derives from the SAME `blocks` vector (vaddr_to_idx and
+// vaddr_to_block, so a trace can only inline what a tail-link could already have
+// called); both re-verify at exactly the same points (a spent slice returns
+// PC = that block's own vaddr to the trampoline, which then does a verified
+// jit_lookup — emitTailTo's spent-slice arm and emit_member_precheck are the
+// same shape); and both execute the same NUMBER of unverified guest-code entries
+// per unit of guest work (an N-block loop costs N unverified entries per
+// iteration either way). So LEVER-12 does not open a new staleness class and
+// does not widen the existing one. It is genuinely no worse.
+//
+// It can, however, be made BETTER, and cheaply, which is what this is. Since
+// 2026-08-27 dreamcast.html COLD-ARMS the IC at boot (`setic on:1` at ready —
+// the old post-title timer is retired), so the lever-4 per-write SMC hooks are
+// live through PSO's SMC-heavy boot: any store into a marked code word bumps
+// g_ic_generation. That makes a generation compare a valid staleness proof for a
+// trace edge, exactly as lever-5E1 already uses it to collapse jit_lookup's
+// O(len) sum ("an unchanged generation proves the block's bytes unchanged").
+//
+// SHAPE, per interior member (i >= 1) of a trace:
+//     if (*tgen != g_ic_generation) { *tgen = g_ic_generation;
+//                                     flush; PC = member.vaddr; return PC; }
+// 5 instructions + 2 constant-address loads on the fast path.
+//
+// WHY IT CANNOT LIVELOCK, and why the de-opt target is the MEMBER and never the
+// head: bailing to the head's own vaddr would re-enter this same function, which
+// would re-check and bail again forever (jit_lookup finds the head's own bytes
+// clean and hands back this very function). Bailing to member[i]'s vaddr enters
+// member[i]'s OWN function after a verified lookup, and that function executes
+// member[i]'s body before it can reach any guard of its own — so every bail
+// makes at least one block of forward progress.
+//
+// The loop back-edge into the head is deliberately NOT guarded. On iteration 2+
+// the head's own bytes have not been re-verified since function entry — but that
+// is EXACTLY the shipped property of both the intra-shard tail-link (B's
+// return_call back into A re-runs A unverified) and the default-ON self-loop
+// (one lookup, N iterations of the body), so leaving it unguarded holds parity
+// rather than opening anything. It could be closed the same way if wanted: the
+// restamp below means a head guard would de-opt at most once per bump — the
+// trampoline's verified jit_lookup(head) hands back this same function and the
+// now-restamped guard does not re-fire — so it terminates. It is left out only
+// because it would double the guard tax on the 2-block loop, which is the shape
+// the lever exists for.
+//
+// WHY IT SELF-HEALS: the guard restamps *tgen before leaving, so one generation
+// bump costs ONE de-opt per guarded edge, not permanent de-optimization. Measured
+// churn is tiny — over the three real PSO runs with icgen telemetry in
+// /tmp/dc-probes, g_ic_generation moved 21 / 2 / 7 times across an entire run
+// (R-CAPX 2->23, R-UNCX 2->4, isk-diag 7903->7910).
+//
+// LIMIT (do not oversell this): while the IC is DISARMED (?noic, or before the
+// page's setic) g_ic_generation is pinned at 0 and never moves, so the guard is
+// inert and the trace edge is exactly as (un)protected as the shipped tail-link.
+// The guard raises the traced path above the tail-link when armed; it does not
+// fix the tail-link, which remains the wider exposure and is not this file's to
+// change unilaterally.
+static constexpr uint32_t TRACE_GEN_SITES = 1u << 16;   // 256KB BSS, zero-init
+uint32_t g_trace_gen[TRACE_GEN_SITES];
+uint32_t g_trace_gen_next = 0;    // compile-time site allocator; exhaustion just
+                                  // drops the guard (= shipped tail-link semantics)
+
 static bool g_ic_cs = true;    // cond/static IC: ~1.8x native. SAFE as of lever-4 Build 2 — every write path into RAM (emitted fastpath stores incl. memset, C slowpath imports, WriteMemBlock/DMA chokepoints) bumps g_ic_generation on a code-word hit (4-byte-granular map, zero false positives at the title: icgen=1 flat, task-3e probe). The old corruption class (loader SMC out-racing periodic flushes) is closed event-driven; jit_register re-registration bumps cover slot-churn.
 }
 
@@ -2890,6 +3008,62 @@ void emitBlockExit(WasmModuleBuilder& b, RuntimeBlockInfo* block,
 
     case BET_CLS_COND: {
         u32 cond = (block->BlockType == BET_Cond_1) ? 1 : 0;
+
+        // ---- Single-predicate form (FLYCAST_COND_MERGE, DEFAULT ON) --------
+        // The legacy shape below derives the branch predicate TWICE: once to
+        // select the PC constant through an i32-typed if/else, then again to
+        // split into the per-arm tail-call / const-target probe. The second
+        // derivation is redundant — nothing between them writes SR_T or jdyn
+        // (the only emitted code is `local.get ctx; i32.const target;
+        // i32.store PC`) — so the two arms can own the PC store directly and
+        // the predicate can be derived once. Saves the second derivation plus
+        // its `local.get ctx` and typed-if scaffolding, ~3-4 executed
+        // instructions on EVERY conditional exit that does not tail-link.
+        // Semantics are unchanged: PC is still stored before any probe or
+        // tail-call runs on that path (emitConstTargetProbe uses a compile-time
+        // constant target and never reads ctx->PC; emitTailTo reads it only on
+        // its spent-slice return, after the store).
+        // NOTE for later: this also removes the stated obstacle to PARTIAL
+        // sibling linking ("we'd need to undo the i32_store and re-branch") —
+        // each arm is now its own control-flow region, so one arm could
+        // tail-link while the other probes. Not done here; it changes chaining
+        // behaviour and IC-site accounting and wants its own matched pair.
+        auto push_pred = [&]() {
+            if (block->has_jcond) {
+                s32 jdynLocal = cache.getLocal(ctx_off::JDYN);
+                if (jdynLocal >= 0) emitCachedLocalGet(b, cache, ctx_off::JDYN, (u32)jdynLocal);
+                else { b.op_local_get(LOCAL_CTX); b.op_i32_load(ctx_off::JDYN); }
+            } else {
+                s32 srTLocal = cache.getLocal(ctx_off::SR_T);
+                if (srTLocal >= 0) emitCachedLocalGet(b, cache, ctx_off::SR_T, (u32)srTLocal);
+                else { b.op_local_get(LOCAL_CTX); b.op_i32_load(ctx_off::SR_T); }
+            }
+            if (cond != 1) b.op_i32_eqz();   // Cond_0 (bf): taken == !T
+        };
+        auto store_pc = [&](u32 target) {
+            b.op_local_get(LOCAL_CTX);
+            b.op_i32_const((s32)target);
+            b.op_i32_store(ctx_off::PC);
+        };
+        if (g_emit_cond_merge && block != nullptr) {
+            const s32 br_idx   = sibling_func_idx(block->BranchBlock, self_vaddr, vaddr_to_idx);
+            const s32 next_idx = sibling_func_idx(block->NextBlock,   self_vaddr, vaddr_to_idx);
+            const bool both_siblings = (br_idx >= 0 && next_idx >= 0);
+            push_pred();
+            b.op_if(0x40);                                  // void
+              store_pc(block->BranchBlock);
+              if (both_siblings) emit_tail_to((u32)br_idx); // ends the frame
+              else               emit_const_target_probe(block->BranchBlock);
+            b.op_else();
+              store_pc(block->NextBlock);
+              if (both_siblings) emit_tail_to((u32)next_idx);
+              else               emit_const_target_probe(block->NextBlock);
+            b.op_end();
+            if (both_siblings) return;   // both arms tail-called; below unreachable
+            emit_rt_bump(&g_exit_cond_xshd);   // guard-block/miss only (scar #2)
+            break;
+        }
+        // ---- Legacy two-derivation form (kill-switch: FLYCAST_COND_MERGE=0) --
         b.op_local_get(LOCAL_CTX);
 
         if (block->has_jcond) {
@@ -3623,6 +3797,27 @@ static TracePlan planTrace(RuntimeBlockInfo* head,
     TracePlan plan;
     if (g_emit_trace <= 0 || head == nullptr || v2b == nullptr) return plan;
     if (!g_emit_regcache || s_lazy_regcache_enabled) return plan;  // eager cache only
+    // ---- risk-3 valve: never let trace formation be what exhausts the IC ----
+    // A trace's side exits allocate g_ic sites, and a straight-line trace
+    // duplicates its TAIL member's whole exit into every prefix that reaches it,
+    // so per-block site consumption can multiply. Measured offline (emit_dump
+    // `sizes`, 256-block single-page shards): the FLYCAST_TRACE=1 loop shape is
+    // EXACTLY neutral (1.00 sites/block on and off), but the FLYCAST_TRACE=2
+    // 4-block-static-chain shape goes 0.50 -> 2.00 sites/block, a 4x multiplier
+    // — the worst case the default limits permit. Real-run anchor: PSO's longest
+    // run with icn telemetry (/tmp/dc-probes/R-CAPX.log) compiled 11767 blocks
+    // and reached g_ic_next = 12220, i.e. 1.04 sites/block, so the table (65536)
+    // exhausts near 63K blocks today but near 15.8K blocks under a worst-case
+    // TRACE=2 workload — only 1.34x the observed high-water.
+    // Why that matters beyond capacity: have_ic degrades GRACEFULLY per site, so
+    // exhaustion is silent, and in a matched pair the TRACED arm would exhaust
+    // FIRST — every block compiled after the crossover loses its IC in the ON arm
+    // while the same block still has one in the OFF arm. That reads as a trace
+    // regression and is not one. Stopping trace formation at 3/4 of the table
+    // makes trace-attributable exhaustion impossible: the remaining quarter is
+    // reserved for the plain per-block exits, which is what the arm without
+    // traces would have spent anyway. Nothing observed comes near this bound.
+    if (g_ic_next >= IC_SITES - (IC_SITES / 4)) return plan;
     // The head must not be a shape a proven in-block fastpath already owns.
     if (detectMemsetByteLoop(head).detected) return plan;
     if (BET_GET_CLS(head->BlockType) == BET_CLS_COND && head->BranchBlock == head->vaddr)
@@ -3665,73 +3860,18 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
 
     RegCache cache;
 
-    // Lever #2 (register residency) — 2-block region detection. Must run BEFORE
-    // scanBlock so the union of A's + B's reg working-set is allocated locals.
-    // Region shape: A = `block` is BET_Cond whose TAKEN arm (BranchBlock) targets
-    // B, and B is a plain BET_StaticJump back to A (BranchBlock == A->vaddr). We
-    // then emit A's fn as one wasm loop that inlines B, resident regs across
-    // A->B->A. EXCLUDE fallback-op blocks (IFB/div*/sync_*/pref/fsca) and, for A,
-    // >1 SR_T writer without has_jcond (predicate re-derivation hazard, same as
-    // the self-loop). Helpers mirror the self-loop's fallback/T scans.
-    RuntimeBlockInfo* region_B = nullptr;
-    auto block_has_fallback = [](RuntimeBlockInfo* blk) -> bool {
-        for (size_t i = 0; i < blk->oplist.size(); ++i) {
-            switch (blk->oplist[i].op) {
-            case shop_ifb: case shop_sync_sr: case shop_sync_fpscr:
-            case shop_pref: case shop_div1: case shop_div32u:
-            case shop_div32s: case shop_div32p2: case shop_fsca:
-                return true;
-            default: break;
-            }
-        }
-        return false;
-    };
-    if (block != nullptr && g_emit_regcache && g_emit_region && vaddr_to_block != nullptr
-        && BET_GET_CLS(block->BlockType) == BET_CLS_COND
-        && block->BranchBlock != block->vaddr           // not a self-loop
-        && block->oplist.size() < 20
-        && !detectMemsetByteLoop(block).detected)
-    {
-        auto it = vaddr_to_block->find(block->BranchBlock);
-        if (it != vaddr_to_block->end() && it->second != nullptr) {
-            RuntimeBlockInfo* B = it->second;
-            const bool same_page = (B->vaddr >> 12) == (block->vaddr >> 12);
-            if (B != block
-                && B->BlockType == BET_StaticJump
-                && B->BranchBlock == block->vaddr        // B unconditionally -> A
-                && B->oplist.size() < 20
-                && same_page
-                && !block_has_fallback(block)
-                && !block_has_fallback(B))
-            {
-                // A's predicate is re-derived after A's body (before B) via
-                // push_cont; a >1 T-writer without has_jcond would mis-derive it.
-                int t_writes_A = 0;
-                for (size_t i = 0; i < block->oplist.size(); ++i) {
-                    const shil_opcode& op = block->oplist[i];
-                    if (op.rd.is_reg()  && op.rd.reg_offset()  == (u32)ctx_off::SR_T) ++t_writes_A;
-                    if (op.rd2.is_reg() && op.rd2.reg_offset() == (u32)ctx_off::SR_T) ++t_writes_A;
-                }
-                if (block->has_jcond || t_writes_A <= 1)
-                    region_B = B;
-            }
-        }
-    }
-
     // Reg-cache kill-switch (boot-title-wedge differential): when disabled,
     // no wasm locals are assigned, so every getLocal() returns -1 and all
     // reads/writes go straight to ctx memory (reloadAll/flushAll become
     // no-ops over an empty entry set). If this makes the DP-decrypt PRNG
     // pool correct, the reg-cache across the deep call nest is convicted.
-    // LEVER-12 trace formation. Mutually exclusive with the lever-2 region (the
-    // trace subsumes its shape); like the region it must be planned BEFORE
-    // scanBlock so every member's working set gets a local.
-    TracePlan trace;
-    if (region_B == nullptr) trace = planTrace(block, vaddr_to_block);
+    // LEVER-12 trace formation. Must be planned BEFORE scanBlock so every
+    // member's working set gets a local. (This replaced the lever-2 2-block
+    // region, deleted 2026-08-29 — see the note at the top of this file.)
+    TracePlan trace = planTrace(block, vaddr_to_block);
     const bool have_trace = !trace.blocks.empty();
 
     if (block != nullptr && g_emit_regcache) cache.scanBlock(block);
-    if (region_B != nullptr) cache.scanBlock(region_B);   // union B's working set
     if (have_trace)
         for (size_t i = 1; i < trace.blocks.size(); ++i) cache.scanBlock(trace.blocks[i]);
     // Lever-5G: f32 entries (fr bank) — after the int scan so mixed offsets
@@ -3741,9 +3881,6 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         // scanBlocksF32 on why a per-member scan is unsound.
         if (have_trace) {
             scanBlocksF32(trace.blocks.data(), trace.blocks.size(), cache);
-        } else if (region_B != nullptr) {
-            RuntimeBlockInfo* pair[2] = { block, region_B };
-            scanBlocksF32(pair, 2, cache);
         } else if (block != nullptr) {
             scanBlockF32(block, cache);
         }
@@ -3877,11 +4014,11 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
         // entries computeNoPreload proved are defined before they are read.
         // Both flavors run BEFORE the loop header so cached locals persist
         // across iterations rather than being re-fetched every time.
-        // Preload elision analyses ONE oplist; a trace/region has several, and a
+        // Preload elision analyses ONE oplist; a trace has several, and a
         // register defined-before-read in the head may be read-first by a later
         // member (and, in a loop trace, by the head itself on iteration 2).
         // Elision is therefore off whenever a multi-block body is emitted.
-        if (g_emit_preload_elide && g_emit_regcache && region_B == nullptr && !have_trace)
+        if (g_emit_preload_elide && g_emit_regcache && !have_trace)
             computeNoPreload(block, cache);
         reloadPrologueOrInvalidate(b, cache);
 
@@ -4023,6 +4160,34 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
                   cache.restoreDirty(snap);
                 b.op_end();
             };
+            // Risk-1 SMC generation guard for an INTERIOR member (never the
+            // head — see the g_trace_gen block on why bailing to the head
+            // livelocks and bailing to the member cannot). One de-opt per site
+            // per generation bump; the restamp is what makes it self-healing.
+            auto emit_member_smc_guard = [&](RuntimeBlockInfo* blk) {
+                if (!g_trace_smc_guard) return;
+                if (g_trace_gen_next >= TRACE_GEN_SITES) return;   // graceful: no guard
+                uint32_t* tgen = &g_trace_gen[g_trace_gen_next++];
+                *tgen = g_ic_generation;    // stamp at compile time
+                b.op_i32_const((s32)(u32)(uintptr_t)tgen); b.op_i32_load(0);
+                b.op_i32_const((s32)(u32)(uintptr_t)&g_ic_generation); b.op_i32_load(0);
+                b.op_i32_ne();
+                b.op_if(0x40);
+                  b.op_i32_const((s32)(u32)(uintptr_t)tgen);
+                  b.op_i32_const((s32)(u32)(uintptr_t)&g_ic_generation);
+                  b.op_i32_load(0);
+                  b.op_i32_store(0);        // restamp: one de-opt per bump, not forever
+                  auto snap = cache.saveDirty();
+                  cache.flushAll(b);
+                  b.op_local_get(LOCAL_CTX);
+                  b.op_i32_const((s32)blk->vaddr);
+                  b.op_i32_store(ctx_off::PC);
+                  b.op_local_get(LOCAL_CTX);
+                  b.op_i32_load(ctx_off::PC);
+                  b.op_return();            // -> trampoline -> VERIFIED jit_lookup(blk)
+                  cache.restoreDirty(snap);
+                b.op_end();
+            };
 
             if (trace.is_loop) b.op_loop(0x40);
 
@@ -4034,6 +4199,10 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
                 // when that lever is off) — but a loop trace re-enters the head
                 // every iteration, so it needs one INSIDE the loop.
                 if (i > 0 || trace.is_loop) emit_member_precheck(m);
+                // i == 0 is the head's own code — it was verified by the lookup
+                // that entered this function, and guarding it would bail into
+                // itself. Only inlined members need the generation proof.
+                if (i > 0) emit_member_smc_guard(m);
 
                 if (m->guest_cycles > 0) {
                     b.op_local_get(LOCAL_CTX);
@@ -4104,100 +4273,6 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
 
             if (trace.is_loop) b.op_end();                   // close $L
             b.op_local_get(LOCAL_CTX);                       // function result
-            b.op_i32_load(ctx_off::PC);
-        } else
-
-        // Lever #2 (register residency): A=block (BET_Cond, taken->B), B=region_B
-        // (BET_StaticJump -> A). Emit A's fn as ONE wasm loop that inlines B's
-        // body, keeping the union reg working-set resident in locals across
-        // A->B->A. reloadAll already ran (reloadOrInvalidate above); flushAll runs
-        // once per exit only. Structure: block $exit { loop $L { drainA; A-body;
-        // if !A_taken { flush; PC=A.Next; br $exit }; drainB; B-body; if budget-
-        // spent { flush; PC=A.vaddr; br $exit }; br $L } }.
-        if (region_B != nullptr) {
-            const u32 cond_taken_A = (block->BlockType == BET_Cond_1) ? 1 : 0;
-            auto push_A_taken = [&]() {
-                if (block->has_jcond) {
-                    s32 j = cache.getLocal(ctx_off::JDYN);
-                    if (j >= 0) emitCachedLocalGet(b, cache, ctx_off::JDYN, (u32)j);
-                    else { b.op_local_get(LOCAL_CTX); b.op_i32_load(ctx_off::JDYN); }
-                } else {
-                    s32 t = cache.getLocal(ctx_off::SR_T);
-                    if (t >= 0) emitCachedLocalGet(b, cache, ctx_off::SR_T, (u32)t);
-                    else { b.op_local_get(LOCAL_CTX); b.op_i32_load(ctx_off::SR_T); }
-                }
-                if (cond_taken_A == 0) b.op_i32_eqz();   // Cond_0 (bf): taken == !T
-            };
-            auto emit_drain = [&](RuntimeBlockInfo* blk) {
-                if (blk->guest_cycles > 0) {
-                    b.op_local_get(LOCAL_CTX);
-                    b.op_local_get(LOCAL_CTX);
-                    b.op_i32_load(ctx_off::CYCLE_COUNTER);
-                    b.op_i32_const((s32)blk->guest_cycles);
-                    b.op_i32_sub();
-                    b.op_i32_store(ctx_off::CYCLE_COUNTER);
-                }
-            };
-            auto emit_body = [&](RuntimeBlockInfo* blk) {
-                for (size_t i = 0; i < blk->oplist.size(); ++i) {
-                    const shil_opcode& op = blk->oplist[i];
-                    if (emitShilOp(b, op, blk, (u32)i, cache)) continue;
-                    // region excludes fallback ops (block_has_fallback), so this
-                    // is unreachable; keep a correct IFB fallback for safety.
-                    cache.flushAll(b);
-                    const u32 op_addr = blk->vaddr + op.guest_offs;
-                    const u32 pcx     = op_addr + 2;
-                    const u32 opc     = (u32)ReadMem16(op_addr);
-                    b.op_i32_const((s32)opc);
-                    b.op_i32_const((s32)pcx);
-                    b.op_call(WIMPORT_IFB);
-                    reloadOrInvalidate(b, cache);
-                }
-            };
-
-            // Loop-carried dirty conservatism + per-arm save/restore: WITHOUT
-            // these the linear dirty model is wrong inside a wasm `loop`. The
-            // arm below flushes and LEAVES, so on the fall-through path (and on
-            // iteration 2+) those registers are still dirty in locals; a model
-            // that believed the flush ran would skip them at the NEXT flush and
-            // leave ctx memory stale. Same class as boot-title-wedge finding #1.
-            cache.markAllDirty();
-            b.op_block(0x40);                          // $exit (depth 2 from inner if)
-              b.op_loop(0x40);                         //   $L (depth 1 from inner if)
-                emit_drain(block);                     //   drain A
-                emit_body(block);                      //   A body
-                push_A_taken();
-                b.op_i32_eqz();                        //   !A_taken
-                b.op_if(0x40);                         //     A NOT taken -> A.NextBlock
-                  { auto snap = cache.saveDirty();
-                  cache.flushAll(b);
-                  b.op_local_get(LOCAL_CTX);
-                  b.op_i32_const((s32)block->NextBlock);
-                  b.op_i32_store(ctx_off::PC);
-                  b.op_br(2);                          //     -> $exit
-                  cache.restoreDirty(snap); }
-                b.op_end();
-                emit_drain(region_B);                  //   drain B
-                emit_body(region_B);                   //   B body (B->A = loop back-edge)
-                if (g_self_loop_cycle_bound) {
-                    b.op_local_get(LOCAL_CTX);
-                    b.op_i32_load(ctx_off::CYCLE_COUNTER);
-                    b.op_i32_const((s32)-SELF_LOOP_CYCLE_SLICE);
-                    b.op_i32_le_s();                   //   cycle_counter <= -SLICE?
-                    b.op_if(0x40);                     //     budget spent -> re-enter A
-                      { auto snap = cache.saveDirty();
-                      cache.flushAll(b);
-                      b.op_local_get(LOCAL_CTX);
-                      b.op_i32_const((s32)block->vaddr);
-                      b.op_i32_store(ctx_off::PC);
-                      b.op_br(2);                      //     -> $exit
-                      cache.restoreDirty(snap); }
-                    b.op_end();
-                }
-                b.op_br(0);                            //   continue -> loop top ($L)
-              b.op_end();                              //   close loop
-            b.op_end();                                // close block $exit
-            b.op_local_get(LOCAL_CTX);                 // PC stored inside; load it
             b.op_i32_load(ctx_off::PC);
         } else {
 
@@ -4303,7 +4378,7 @@ static void emitBlockFuncBody(WasmModuleBuilder& b, RuntimeBlockInfo* block,
             b.op_local_get(LOCAL_CTX);
             b.op_i32_load(ctx_off::PC);
         }
-        }   // close Lever #2 region-else (non-region self_loop/normal path)
+        }   // close the trace-else (self_loop / normal per-block path)
     } else {
         b.op_i32_const(0);
     }
@@ -4466,9 +4541,6 @@ extern "C" void bemental_sh4_set_self_loop(int on) {
 extern "C" void bemental_sh4_set_rte_intc(int on) {
     bemental::sh4::g_emit_rte_intc = !!on;
 }
-extern "C" void bemental_sh4_set_region(int on) {
-    bemental::sh4::g_emit_region = !!on;
-}
 // Codegen-audit trim levers (2026-08-29). All three take effect at COMPILE
 // time, so they must be set before blocks are built (env var, or a setter call
 // from init) — flipping them mid-run only affects blocks compiled afterwards.
@@ -4480,6 +4552,17 @@ extern "C" void bemental_sh4_set_prologue_trim(int on) {
 }
 extern "C" void bemental_sh4_set_hop_guard(int on) {
     bemental::sh4::g_emit_hop_guard = !!on;
+}
+// Single-predicate BET_CLS_COND exit (2026-08-29). DEFAULT ON; bisect switch.
+extern "C" void bemental_sh4_set_cond_merge(int on) {
+    bemental::sh4::g_emit_cond_merge = !!on;
+}
+// LEVER-12 interior-edge SMC generation guard (2026-08-29). DEFAULT OFF — see
+// the g_trace_gen block: the unguarded trace edge already matches the shipped
+// intra-shard tail-link, so this is an upgrade past shipping behaviour, not a
+// fix. Flip ON for shipping once the raw trace win has been measured.
+extern "C" void bemental_sh4_set_trace_smc_guard(int on) {
+    bemental::sh4::g_trace_smc_guard = !!on;
 }
 // Area-3 discriminator rewrite (2026-08-29). DEFAULT ON — the predicate is
 // bit-identical over the whole 32-bit address space (enumerated) and the

@@ -57,21 +57,74 @@ function flycast_build_imports() {
     if (typeof wasmMemory !== 'undefined') mem = wasmMemory;
   }
 
-  // Direct Module._sh4_* references rather than cwrap. The C exports are
-  // already plain (i32...) -> i32/void wasm functions; cwrap would just
-  // wrap them with type-coercion shims we don't need. Skipping cwrap also
-  // avoids any runtime-method-availability concerns on pthread workers.
+  // Lever-5F: bind the RAW wasm exports, not the Module._ JS wrappers. The
+  // CPU profile showed ~13% of heavy-phase wall in wasm->JS->wasm glue:
+  // Module._X is emscripten's createExportWrapper (a JS function), so every
+  // import call from a runtime block paid a double boundary with a JS frame
+  // in the middle. A WebAssembly exported function passed directly as an
+  // import lets V8 make the call wasm->wasm with no JS hop. All of these are
+  // ASYNCIFY_REMOVE'd (cannot suspend), so the wrapper added nothing but
+  // cost. Fallbacks keep older layouts working.
+  var raw = (typeof wasmExports !== 'undefined' && wasmExports)
+         || (Module && Module['wasmExports'])
+         || (Module && Module['asm'])
+         || Module;
+  var pick = function (name) { return (raw && raw[name]) || Module['_' + name]; };
+  // Lever-5F v2: RELEASE minifies wasmExports keys (dg/eg/...), so name-based
+  // raw lookup silently fell back to the JS wrappers. Instead the C side
+  // hands us the wasmTable INDEXES of the 9 import targets and we bind the
+  // table-resolved raw wasm function objects — wasm->wasm calls, no JS hop.
+  var viaTable = null;
+  try {
+    if (Module._sh4_import_fnptrs && typeof wasmTable !== 'undefined' && wasmTable) {
+      var buf = Module._malloc(36);
+      Module._sh4_import_fnptrs(buf);
+      var idx = [];
+      for (var i = 0; i < 9; i++) idx.push(Module.HEAPU32[(buf >> 2) + i]);
+      Module._free(buf);
+      var fns = [];
+      for (var j = 0; j < 9; j++) fns.push(wasmTable.get(idx[j]));
+      var allFns = true;
+      for (var k = 0; k < 9; k++) if (typeof fns[k] !== 'function') { allFns = false; break; }
+      if (allFns) {
+        viaTable = { r8: fns[0], r16: fns[1], r32: fns[2],
+                     w8: fns[3], w16: fns[4], w32: fns[5],
+                     ifb: fns[6], shil: fns[7], lk: fns[8] };
+      }
+    }
+  } catch (e) { viaTable = null; }
+  // One-shot binding audit (lever-5F verification): which source actually won?
+  if (!flycast_worker_funcs_bind_logged) {
+    flycast_worker_funcs_bind_logged = true;
+    try {
+      var probe = raw && raw['sh4_mem_write32'];
+      var keys = [];
+      try { keys = Object.keys(raw).filter(function (k) { return k.indexOf('sh4') >= 0 || k.indexOf('write32') >= 0; }).slice(0, 6); } catch (_) {}
+      var all = [];
+      try { all = Object.keys(raw).slice(0, 12); } catch (_) {}
+      postMessage({ cmd: 'print', txt: '[5f-bind] viaTable=' + (viaTable ? 'YES(wasm-direct)' : 'no') + ' raw=' +
+        (raw === Module ? 'Module(!)' : (typeof wasmExports !== 'undefined' && raw === wasmExports) ? 'wasmExports' : 'Module-prop') +
+        ' write32=' + (probe ? 'raw-export' : 'JS-wrapper-fallback') +
+        ' sh4keys=[' + keys.join(',') + '] first12=[' + all.join(',') + ']' });
+    } catch (e) { postMessage({ cmd: 'print', txt: '[5f-bind] audit threw: ' + e.message }); }
+  }
   return {
     env: {
       memory:      mem,
-      sh4_read8:   Module._sh4_mem_read8,
-      sh4_read16:  Module._sh4_mem_read16,
-      sh4_read32:  Module._sh4_mem_read32,
-      sh4_write8:  Module._sh4_mem_write8,
-      sh4_write16: Module._sh4_mem_write16,
-      sh4_write32: Module._sh4_mem_write32,
-      sh4_ifb:     Module._sh4_interp_ifb,
-      sh4_shil_fb: Module._sh4_interp_shil_fb,
+      sh4_read8:   (viaTable && viaTable.r8)  || pick('sh4_mem_read8'),
+      sh4_read16:  (viaTable && viaTable.r16) || pick('sh4_mem_read16'),
+      sh4_read32:  (viaTable && viaTable.r32) || pick('sh4_mem_read32'),
+      sh4_write8:  (viaTable && viaTable.w8)  || pick('sh4_mem_write8'),
+      sh4_write16: (viaTable && viaTable.w16) || pick('sh4_mem_write16'),
+      sh4_write32: (viaTable && viaTable.w32) || pick('sh4_mem_write32'),
+      sh4_ifb:     (viaTable && viaTable.ifb)  || pick('sh4_interp_ifb'),
+      sh4_shil_fb: (viaTable && viaTable.shil) || pick('sh4_interp_shil_fb'),
+      // ORDER 21b Lever 1/2: global tail-link resolver + the shared table it
+      // chains through. __indirect_function_table IS the wasmTable that
+      // flycast_install_block grows/populates, so an emitted block's
+      // return_call_indirect targets sibling blocks' slots directly.
+      sh4_lookup_idx: (viaTable && viaTable.lk) || pick('sh4_jit_lookup_idx'),
+      __indirect_function_table: wasmTable,
     },
   };
 }
@@ -81,6 +134,7 @@ function flycast_build_imports() {
 // reach the page (goes to pthread's own message channel) — so we stash
 // the error and let the C side log it via MAIN_THREAD_EM_ASM.
 var flycast_last_register_error = '';
+var flycast_worker_funcs_bind_logged = false;   // lever-5F binding audit one-shot
 
 // nasomers-pattern install: compile block, instantiate, grow shared wasmTable,
 // return new table index. C dispatcher in rec_wasm.cpp calls via fn pointer →
@@ -88,6 +142,12 @@ var flycast_last_register_error = '';
 // Keep instance refs alive so V8 doesn't GC the wasm code while the slot is in
 // use. Returns 0 on failure (sentinel — slot 0 is unused/null fn).
 var flycast_table_slots = [];   // index → Instance (GC root)
+// Count of live WebAssembly.Instances this worker has created and pinned. Only
+// read when an install throws — the per-block path (flycast_install_block)
+// creates one Module+Instance per block and never releases them, so this is
+// the number that identifies an engine module/instance-cap failure (the mobile
+// arm) versus a codegen failure. Shard installs add ONE instance for N blocks.
+var flycast_live_instances = 0;
 
 function flycast_install_block(bytesPtr, len, vaddr) {
   bytesPtr = bytesPtr >>> 0;
@@ -110,9 +170,21 @@ function flycast_install_block(bytesPtr, len, vaddr) {
     wasmTable.grow(1);
     wasmTable.set(idx, fn);
     flycast_table_slots[idx] = inst;
+    flycast_live_instances++;
     return idx;
   } catch (e) {
-    flycast_last_register_error = (e && e.message) ? e.message : String(e);
+    // This path is one Module + one Instance PER COMPILED BLOCK, every one
+    // pinned in flycast_table_slots for the life of the worker (~12K live at
+    // PSO boot scale). A mobile engine's per-agent module/instance cap is the
+    // first thing that bites here, and the throw is indistinguishable from a
+    // codegen error in the log without the count — so record it. The C caller
+    // PARKS this vaddr for span-interp on a 0 return (rec_wasm.cpp compile(),
+    // the `idx <= 0` arm): FPCA is already claimed by then, so it must never
+    // be recompiled.
+    flycast_last_register_error =
+      ((e && e.message) ? e.message : String(e)) +
+      ' [live_instances=' + flycast_live_instances +
+      ' table_len=' + ((typeof wasmTable !== 'undefined' && wasmTable) ? wasmTable.length : -1) + ']';
     return 0;
   }
 }
@@ -161,9 +233,13 @@ function flycast_install_shard(bytesPtr, len, vaddrsPtr, count) {
       // accidentally let V8 GC the entire shard.
       flycast_table_slots[base_idx + i] = inst;
     }
+    flycast_live_instances++;
     return base_idx;
   } catch (e) {
-    flycast_last_register_error = (e && e.message) ? e.message : String(e);
+    flycast_last_register_error =
+      ((e && e.message) ? e.message : String(e)) +
+      ' [live_instances=' + flycast_live_instances +
+      ' table_len=' + ((typeof wasmTable !== 'undefined' && wasmTable) ? wasmTable.length : -1) + ']';
     return 0;
   }
 }

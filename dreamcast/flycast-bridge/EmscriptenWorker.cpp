@@ -222,6 +222,48 @@ static constexpr uint32_t HOLLY_REG_HI  = 0x005F9FFFu;
 static constexpr uint32_t STARTRENDER_PADDR = 0x005F8014u;  // pvr_regs.h STARTRENDER_addr 0x14
 static constexpr uint32_t SQ_SAMPLE_MASK = 63u;             // time 1 burst in 64
 
+// ---------------------------------------------------------------------------
+// LEVER12_HOT_TIMERS -- DEFAULT 0 SINCE 2026-08-29. The pvr and sq buckets are
+// RETIRED as measurements; only their EVENT COUNTS survive.
+//
+// Two independent findings retired them, both from the lever-12 audit:
+//
+//  1. THEY WERE MEASURING THE CLOCK, NOT THE WORK. emscripten_get_now() is
+//     `performance.timeOrigin + performance.now()`. Measured on that exact
+//     expression in this build's context (Chrome, cross-origin-isolated, in a
+//     worker): minimum positive delta 4882.8 ns, and 91.2% of back-to-back
+//     reads return EXACTLY 0. A control operation whose true cost is 14.35 ns
+//     (batch-timed) reads 438.5 ns when timed with one get_now pair -- a 30.6x
+//     overestimate. Per-event, pvr read 477 ns (1.09x that floor) and sq 440 ns
+//     (1.00x). The tell that settles it: both stayed PINNED at the floor while
+//     the burst count swung 3.3x (274K -> 919K per window). Real work moves.
+//
+//  2. THE INSTRUMENT WAS A TAX. Compiling out these two clock reads removed
+//     119,474 timed events/s and cut mainloop 535.8 -> 499.8 ms/s (-6.7%) with
+//     the EVENT RATES UNCHANGED -- 36.0 ms/s of real injected time in exchange
+//     for 315.3 ms/s of reported quantization noise.
+//
+// WHY NOT REBUILT ON BATCH TIMING. Batch timing (one clock pair around N
+// events) needs the N events to run back-to-back. These two hooks are
+// SCATTERED -- arbitrary guest execution runs between consecutive Holly stores
+// and between consecutive SQ bursts -- so a batch pair would time the guest,
+// not the bucket. And neither operation can be replayed off-line for a
+// controlled calibration: WriteMem32 to a Holly register and doSqWrite are both
+// side-effecting (DMA arming, TA FIFO submission). There is no honest cheap
+// timing for them, so they are reported as UNMEASURED, not as zero.
+//
+// CONSEQUENCE FOR THE SPLIT: with timers off, pvr and sq cost lands in the
+// `jit` residual. The [split] line therefore prints them as `-` with their
+// counts, and prints the residual as `jit*` to say so. `jit` was already
+// documented as an upper bound on JIT execution (note (f) below); it is now a
+// slightly looser one, by the two buckets last estimated at 4.3 and 0.6 ms/s.
+//
+// Set to 1 to restore the old per-event timing (measurement arm only -- it
+// costs ~6.7% of mainloop and returns quantization noise).
+#ifndef LEVER12_HOT_TIMERS
+#define LEVER12_HOT_TIMERS 0
+#endif
+
 static bool g_loaded = false;
 
 // Libretro hardware-render callback registered by Flycast/glsm via
@@ -505,11 +547,18 @@ static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
             //       in `jit`. Only 32-bit stores are hooked here.
             //   (d) texture-cache work pulled in lazily during Render() is
             //       inside `rnd`; a palette_update outside it is not.
-            //   (e) `sq` is a 1-in-64 extrapolation, valid only if burst cost is
-            //       uncorrelated with position in the stream.
+            //   (e) [2026-08-29] `pvr` and `sq` are RETIRED at the default
+            //       LEVER12_HOT_TIMERS=0 -- counts only, cost prints as `-`.
+            //       Both read AT the get_now floor and stayed pinned there while
+            //       the burst count swung 3.3x, and timing them cost 6.7% of
+            //       mainloop. See the LEVER12_HOT_TIMERS block near
+            //       SQ_SAMPLE_MASK. When enabled, `sq` is additionally a 1-in-64
+            //       extrapolation, valid only if burst cost is uncorrelated with
+            //       position in the stream.
             //   (f) `jit` is a RESIDUAL, so every unhooked path and all timer
             //       overhead accumulate into it. It is an upper bound on JIT
-            //       execution, not a measurement of it.
+            //       execution, not a measurement of it. At the default it also
+            //       absorbs pvr+sq, and prints as `jit*` to say so.
             static char split_line[448];
             static double s_p_rr = 0, s_p_ml = 0, s_p_sch = 0, s_p_fat = 0,
                           s_p_rnd = 0, s_p_pvr = 0, s_p_sq = 0;
@@ -543,6 +592,7 @@ static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
             const double w_sq  = w_sqs ? w_sqm * ((double)w_sqn / (double)w_sqs) : 0.0;
             const double w_jit = w_ml - w_sch - w_rnd - w_pvr - w_sq;
             const double pc_of = w_ml > 0.0 ? 100.0 / w_ml : 0.0;
+#if LEVER12_HOT_TIMERS
             snprintf(split_line, sizeof(split_line),
                      "[split] rr=%.1f ml=%.1f (%.1f%% of rr) | "
                      "jit=%.1f (%.1f%%) sch=%.1f (%.1f%%, n=%u fat=%.1f/%u) "
@@ -555,6 +605,25 @@ static void video_cb(const void* data, unsigned w, unsigned h, size_t pitch) {
                      w_pvr, w_pvr * pc_of, w_pvrn,
                      w_sq,  w_sq  * pc_of, w_sqn, w_sqta, w_sqs,
                      (w_rnd + w_pvr + w_sq) * pc_of);
+#else
+            // Timers retired (the default). pvr/sq print their EVENT COUNTS and
+            // an explicit `-` for cost: printing "0.0 (0.0%)" next to n=108814
+            // reads as "108,814 events cost zero time", which is the exact shape
+            // of a number that gets quoted later as a finding. The residual is
+            // printed as `jit*` because it now absorbs those two buckets.
+            snprintf(split_line, sizeof(split_line),
+                     "[split] rr=%.1f ml=%.1f (%.1f%% of rr) | "
+                     "jit*=%.1f (%.1f%%, incl pvr+sq) sch=%.1f (%.1f%%, n=%u fat=%.1f/%u) "
+                     "rnd=%.1f (%.1f%%, n=%u) pvr=- (untimed, n=%u) "
+                     "sq=- (untimed, n=%u ta=%u) | render_total>=%.1f%%",
+                     w_rr, w_ml, w_rr > 0.0 ? w_ml * 100.0 / w_rr : 0.0,
+                     w_jit, w_jit * pc_of,
+                     w_sch, w_sch * pc_of, w_schn, w_fat, w_fatn,
+                     w_rnd, w_rnd * pc_of, w_rndn,
+                     w_pvrn,
+                     w_sqn, w_sqta,
+                     w_rnd * pc_of);
+#endif
             MAIN_THREAD_EM_ASM({
                 postMessage({cmd: 'fps', fps: $0, hw: $1, calls: $2,
                              kcyc: $3, pc: $4, istnrm: $5, istext: $6,
@@ -2106,11 +2175,35 @@ void sh4_mem_write32(uint32_t addr, uint32_t val) {
     {
         const uint32_t p29 = addr & 0x1FFFFFFFu;
         if (p29 >= HOLLY_REG_LO && p29 <= HOLLY_REG_HI) {
+            // [2026-08-29] LEVER12_HOT_TIMERS: the pvr branch fires ~110K/s and
+            // the sq branch ~600K/s, and emscripten_get_now() is
+            // `performance.timeOrigin + performance.now()` whose smallest
+            // observable step in this build's context (Chrome, COI, worker) is
+            // 4882.8 ns. Timing ONE register store with it costs ~424 ns of
+            // observer per event and cannot resolve the store itself. Set to 0
+            // for the control arm: keep the exact same branch and counters,
+            // drop only the clock reads. STARTRENDER stays timed either way --
+            // at ~30/s and ~3.1 ms per event it is 637 clock quanta and is the
+            // one bucket this instrument actually resolves.
+            // [2026-08-29, verdict] DEFAULT IS NOW 0. See the LEVER12_HOT_TIMERS
+            // block next to SQ_SAMPLE_MASK at the top of this file for why.
+            const bool is_sr = (p29 == STARTRENDER_PADDR);
+#if LEVER12_HOT_TIMERS
             const double t0 = emscripten_get_now();
             WriteMem32(addr, val);
             const double d = emscripten_get_now() - t0;
-            if (p29 == STARTRENDER_PADDR) { g_attr_render_ms += d; ++g_attr_render_n; }
-            else                          { g_attr_pvrreg_ms += d; ++g_attr_pvrreg_n; }
+#else
+            double d = 0.0;
+            if (is_sr) {
+                const double t0 = emscripten_get_now();
+                WriteMem32(addr, val);
+                d = emscripten_get_now() - t0;
+            } else {
+                WriteMem32(addr, val);
+            }
+#endif
+            if (is_sr) { g_attr_render_ms += d; ++g_attr_render_n; }
+            else       { g_attr_pvrreg_ms += d; ++g_attr_pvrreg_n; }
             smc_mark(addr, 4, 0);
 #ifdef FLYCAST_BRIDGE_DIAG
             gdrom_log_w(addr, val, 32, pend);
@@ -2463,6 +2556,7 @@ void sh4_interp_shil_fb(uint32_t block_vaddr, uint32_t op_idx) {
                 // CCN_MMUCR.AT is set the handler is sqWrite<true> and this
                 // classification does not apply (PSO runs MMU-off).
                 if (CCN_QACR0.Area == 4) ++g_attr_sq_ta_n;
+#if LEVER12_HOT_TIMERS
                 if ((g_attr_sq_n++ & SQ_SAMPLE_MASK) == 0) {
                     const double t0 = emscripten_get_now();
                     Sh4cntx.doSqWrite(rn, &Sh4cntx);
@@ -2471,6 +2565,12 @@ void sh4_interp_shil_fb(uint32_t block_vaddr, uint32_t op_idx) {
                 } else {
                     Sh4cntx.doSqWrite(rn, &Sh4cntx);
                 }
+#else
+                // Control arm: same counting, no clock reads. See the
+                // LEVER12_HOT_TIMERS note on the Holly register hook.
+                ++g_attr_sq_n;
+                Sh4cntx.doSqWrite(rn, &Sh4cntx);
+#endif
             }
             return;
         }
