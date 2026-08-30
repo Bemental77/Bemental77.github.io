@@ -258,8 +258,45 @@ static constexpr uint32_t SQ_SAMPLE_MASK = 63u;             // time 1 burst in 6
 // documented as an upper bound on JIT execution (note (f) below); it is now a
 // slightly looser one, by the two buckets last estimated at 4.3 and 0.6 ms/s.
 //
+// MEASURED VERDICT (2026-08-29, 4 interleaved arms B7/S7/S8/B8, pre-built
+// byte-identical snapshots swapped per arm, hash-guarded pre+post, machine load
+// 23-41). Savestate-restored PSO gameplay, each arm contributing the SAME 60 s
+// span of the guest trajectory (anchored at guest cycle ~25.6e9 -- see below):
+//     metric        ON (B)    OFF (S)    delta
+//     cost/frame    15.50     10.30      -33.5%   ms of busy per presented frame
+//     mainloop      470.9     309.6      -34.3%   ms/s
+//     duty          46.5%     31.0%      -33.3%
+//     headroom      2.15x     3.23x      +50%     (= 1/duty at guest 1.000x)
+// SENTINEL VALID: B7 and B8 both read cost 15.50 (ml 473.9 vs 467.9, +1.3%).
+// CONTROLS, all clean: rnd (real render work, timed identically in both arms and
+// only ~30 clock reads/s) 19.1 -> 18.4, i.e. unchanged, so the machine was NOT
+// faster during S; pvr event rate 108,814/s and sch 10,690/s IDENTICAL in all
+// four arms, so the scene and the emulated work are the same; guest ratio
+// 1.00000 / 0.99997 / 1.00005 / 0.97594 with COUNTED vs COMPUTED +-0.0000%.
+// PRESENTS ARE UNCHANGED AT 30/s IN ALL FOUR ARMS -- PSO is a 30 fps title, so
+// this buys HEADROOM (2.15x -> 3.23x), not speed. Do not restate it as fps.
+//
+// Per timed event that works out to ~738 ns per emscripten_get_now() call
+// (161.3 ms/s over 109,283 timed events/s x 2 calls). The previous session's
+// low-load pair measured only -5.8% (ml 599.4 -> 564.7) on this same change,
+// implying ~219 ns/call. The two disagree ~3.4x and the likeliest cause is
+// MACHINE LOAD changing the cost of a wasm->JS boundary call (theirs ~8, mine
+// 23-41) -- NOT PROVEN, but if it holds, the tax is worst on exactly the loaded
+// or slow user machines that were measured at 152-170 MHz (0.76-0.85x) in real
+// Chrome, and this retirement helps them most.
+//
+// TWO RIG TRAPS, both of which faked a much LARGER result before the anchoring
+// above was applied -- do not measure this without them:
+//  - WALL-ALIGNED WINDOWS COMPARE DIFFERENT SCENES. The trajectory is
+//    deterministic, but a fixed 90 s wall window covers a different span of it
+//    depending on load, so rnd ranged 18.4..75.0 ms/s across replicates of ONE
+//    binary. Key every sample to the guest cycle counter from the [vbl] line.
+//  - "SETTLED" MUST BE GATED ON THE GUEST RATIO, NOT ON THROUGHPUT. Arms reading
+//    guest 0.811 / 0.781 / 0.957 are STARVED, not slow-but-valid; including them
+//    produced an apparent clean 1.9x separation that does not exist.
+//
 // Set to 1 to restore the old per-event timing (measurement arm only -- it
-// costs ~6.7% of mainloop and returns quantization noise).
+// costs a third of mainloop under load and returns quantization noise).
 #ifndef LEVER12_HOT_TIMERS
 #define LEVER12_HOT_TIMERS 0
 #endif
