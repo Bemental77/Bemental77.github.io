@@ -641,6 +641,12 @@ public:
 	void op_f32x4_replace_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x20u); emitByte(l); }  // (v128,f32) -> v128
 	void op_i32x4_extract_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x1Bu); emitByte(l); }  // -> i32
 	void op_i32x4_replace_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x1Cu); emitByte(l); }  // (v128,i32) -> v128
+	// [simd-bswap 2026-08-29] i64 lane moves for the lfd/stfd SIMD byte-swap.
+	// Subopcodes 0x12 / 0x1D verified against V8 by hand-assembled module (a
+	// wrong byte fails WebAssembly.validate; these round-trip an i64 through a
+	// v128 lane bit-exactly).
+	void op_i64x2_splat()            { emitByte(V128_PREFIX); emitLEB128(0x12u); }               // i64 -> v128
+	void op_i64x2_extract_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x1Du); emitByte(l); }  // -> i64
 	void op_f64x2_extract_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x21u); emitByte(l); }  // -> f64
 	void op_f64x2_replace_lane(u8 l) { emitByte(V128_PREFIX); emitLEB128(0x22u); emitByte(l); }  // (v128,f64) -> v128
 	void op_v128_and()           { emitByte(V128_PREFIX); emitLEB128(0x4Eu); }

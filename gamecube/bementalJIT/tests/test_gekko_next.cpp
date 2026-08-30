@@ -252,6 +252,13 @@ struct TestEnv {
 
     u32& gpr(u32 i) { return *(u32*)((u8*)ctx_raw + ppc_off::gpr(i)); }
     u32& spr(u32 i) { return *(u32*)((u8*)ctx_raw + ppc_off::spr(i)); }
+    // [FP-FUSION 2026-08-29] raw FPR lane bits + MSR/FPSCR/Exceptions, for the
+    // fused-vs-unfused bit-identity differential below.
+    u64& ps0(u32 i) { return *(u64*)((u8*)ctx_raw + ppc_off::ps0(i)); }
+    u64& ps1(u32 i) { return *(u64*)((u8*)ctx_raw + ppc_off::ps1(i)); }
+    u32& msr()      { return *(u32*)((u8*)ctx_raw + ppc_off::MSR); }
+    u32& fpscr()    { return *(u32*)((u8*)ctx_raw + ppc_off::FPSCR); }
+    u32& exceptions() { return *(u32*)((u8*)ctx_raw + ppc_off::EXCEPTIONS); }
     u32& cr_field0_low()  { return *(u32*)((u8*)ctx_raw + ppc_off::cr(0)); }
     u32& cr_field0_high() { return *(u32*)((u8*)ctx_raw + ppc_off::cr(0) + 4); }
 
@@ -3153,6 +3160,242 @@ static bool test_fused_bl_inline_ras_miss() {
     return env.gpr(5) == 0u && (u32)next_pc == 0x80777700u;
 }
 
+// ---------------------------------------------------------------------------
+// [FP-FUSION 2026-08-29 — RESEARCH.md §6.2] Fused-vs-unfused BIT-IDENTITY.
+//
+// Seal-time run-fusion used to refuse any record containing FP (block_cache.cpp
+// rec_fp_class, formerly rec_is_fp_free). Lifting that to scalar FP (class 1 —
+// everything except opcd==4, which is what turns on the PM44-v9 dual-arm) is
+// only a lever if it changes NOTHING about the results. These tests dispatch
+// the same guest instruction stream two ways —
+//   arm A: two independent blocks, P then S, each with its own prologue loads,
+//          epilogue FPR flush and Single->Double promote round-trip through
+//          ps[];
+//   arm B: one run-fused block with the `b` elided and S spliced inline, so
+//          f5/f6/f7 cross the seam in wasm LOCALS and never touch ps[] —
+// and assert every FPR lane, FPSCR, CR, GPR and next_pc matches BIT-EXACTLY.
+// The Single/Double repr round-trip at the seam is exactly the class of bug a
+// fused FP body could introduce, so this is the load-bearing evidence for any
+// speed number quoted off this change.
+// ---------------------------------------------------------------------------
+// opcode-63 (double) A-form / X-form encoders — ppc_encode.h only carries the
+// opcd-59 singles + fctiwx.
+static u32 enc_fmul_d (u32 d, u32 a, u32 c)  { return ppc::a_form(63, d, a, 0,  c, 25); }
+static u32 enc_fadd_d (u32 d, u32 a, u32 b)  { return ppc::a_form(63, d, a, b,  0, 21); }
+static u32 enc_fsub_d (u32 d, u32 a, u32 b)  { return ppc::a_form(63, d, a, b,  0, 20); }
+static u32 enc_fsel   (u32 d, u32 a, u32 c, u32 b) { return ppc::a_form(63, d, a, b, c, 23); }
+static u32 enc_frsqrte(u32 d, u32 b)         { return ppc::a_form(63, d, 0, b,  0, 26); }
+static u32 enc_fneg   (u32 d, u32 b)         { return ppc::x_form(63, d, 0, b,  40); }
+static u32 enc_fabs   (u32 d, u32 b)         { return ppc::x_form(63, d, 0, b, 264); }
+static u32 enc_frsp   (u32 d, u32 b)         { return ppc::x_form(63, d, 0, b,  12); }
+static u32 enc_fcmpu  (u32 crfd, u32 a, u32 b) {
+    return (63u << 26) | ((crfd & 7u) << 23) | ((a & 0x1F) << 16) | ((b & 0x1F) << 11);
+}
+
+// Full architectural snapshot of everything a scalar-FP block can touch.
+struct FpSnap {
+    u64 ps0[32], ps1[32];
+    u64 cr[8];
+    u32 gpr[32];
+    u32 fpscr, msr, exc;
+    s32 next_pc;
+};
+static void fp_snapshot(TestEnv& env, s32 next_pc, FpSnap* s) {
+    for (u32 i = 0; i < 32; ++i) { s->ps0[i] = env.ps0(i); s->ps1[i] = env.ps1(i); }
+    for (u32 i = 0; i < 8;  ++i) s->cr[i]  = *(u64*)((u8*)env.ctx_raw + ppc_off::cr(i));
+    for (u32 i = 0; i < 32; ++i) s->gpr[i] = env.gpr(i);
+    s->fpscr = env.fpscr(); s->msr = env.msr(); s->exc = env.exceptions();
+    s->next_pc = next_pc;
+}
+static bool fp_snap_eq(const FpSnap& a, const FpSnap& b, const char* tag) {
+    bool ok = true;
+    for (u32 i = 0; i < 32; ++i) {
+        if (a.ps0[i] != b.ps0[i] || a.ps1[i] != b.ps1[i]) {
+            std::printf("[%s] MISMATCH f%u: unfused ps0=%016llx ps1=%016llx | "
+                        "fused ps0=%016llx ps1=%016llx\n", tag, i,
+                        (unsigned long long)a.ps0[i], (unsigned long long)a.ps1[i],
+                        (unsigned long long)b.ps0[i], (unsigned long long)b.ps1[i]);
+            ok = false;
+        }
+    }
+    for (u32 i = 0; i < 8; ++i) if (a.cr[i] != b.cr[i]) {
+        std::printf("[%s] MISMATCH cr%u: %016llx vs %016llx\n", tag, i,
+                    (unsigned long long)a.cr[i], (unsigned long long)b.cr[i]);
+        ok = false;
+    }
+    for (u32 i = 0; i < 32; ++i) if (a.gpr[i] != b.gpr[i]) {
+        std::printf("[%s] MISMATCH r%u: %08x vs %08x\n", tag, i, a.gpr[i], b.gpr[i]);
+        ok = false;
+    }
+    if (a.fpscr != b.fpscr) {
+        std::printf("[%s] MISMATCH fpscr: %08x vs %08x\n", tag, a.fpscr, b.fpscr); ok = false; }
+    if (a.exc != b.exc) {
+        std::printf("[%s] MISMATCH exceptions: %08x vs %08x\n", tag, a.exc, b.exc); ok = false; }
+    if (a.next_pc != b.next_pc) {
+        std::printf("[%s] MISMATCH next_pc: 0x%08x vs 0x%08x\n", tag,
+                    (u32)a.next_pc, (u32)b.next_pc); ok = false; }
+    return ok;
+}
+// (`dbits` — double -> raw bits — already exists at :1536, reused here.)
+
+// Seed a fresh env: MSR.FP on, f1-f4 as live-in operands, f5-f14 as distinct
+// sentinels so a stream that silently no-op'd (every op interp-fallback, whose
+// harness stub does nothing) cannot pass by leaving both arms untouched.
+static void fp_seed(TestEnv& env) {
+    env.msr()   = 0x2000u;                     // MSR.FP (ppc_emit.cpp:1438)
+    env.fpscr() = 0u;
+    const double in[4] = { 1.5, -3.25, 0.125, 7.0 };
+    for (u32 i = 0; i < 4; ++i) { env.ps0(1 + i) = dbits(in[i]); env.ps1(1 + i) = dbits(in[i]); }
+    for (u32 i = 5; i <= 14; ++i) {
+        env.ps0(i) = dbits(-1000.0 - (double)i);
+        env.ps1(i) = dbits(-2000.0 - (double)i);
+    }
+}
+static bool fp_did_work(TestEnv& env, const char* tag) {
+    u32 changed = 0;
+    for (u32 i = 5; i <= 14; ++i)
+        if (env.ps0(i) != dbits(-1000.0 - (double)i)) ++changed;
+    std::printf("[%s] destination FPRs changed: %u/10\n", tag, changed);
+    return changed >= 5u;   // guards against an all-fallback no-op false PASS
+}
+
+// The two guest segments, shared by the b-seam and bwd-seam tests.
+//   P: opcd-59 singles chain producing f5,f6,f7 from live-ins f1..f4
+//   S: opcd-63 doubles chain consuming f5,f6,f7 (the SEAM-CROSSING values)
+static const u32 kFpSegP[] = {
+    ppc::fmuls(5, 1, 2),          // f5 = f1 * f2         (single)
+    ppc::fadds(6, 5, 3),          // f6 = f5 + f3         (single, reads f5)
+    ppc::fmadds(7, 1, 4, 6),      // f7 = (f1*f4) + f6    (single, reads f6)
+};
+static const u32 kFpSegS[] = {
+    enc_fmul_d(8, 5, 6),          // f8  = f5 * f6        (double, reads the seam values)
+    enc_fneg(9, 7),               // f9  = -f7
+    enc_fabs(10, 8),              // f10 = |f8|
+    enc_frsp(11, 8),              // f11 = frsp(f8)
+    enc_fsel(12, 9, 10, 11),      // f12 = f9>=0 ? f10 : f11
+    enc_frsqrte(13, 10),          // f13 = frsqrte(f10)
+    enc_fcmpu(1, 5, 6),           // cr1 = f5 <=> f6
+    enc_fsub_d(14, 12, 13),       // f14 = f12 - f13      (non-branch terminator)
+};
+
+// b-seam (fuser kind 3): P ends with an unconditional b to S; the fuser DELETES
+// the b and splices S at its OWN pcs (non-contiguous stream via AnalyzeOps).
+static bool test_fp_fusion_b_seam_bit_identical() {
+    const u32 P = 0x80100000u, S = 0x80200000u;
+    const u32 P_B_PC = P + 3u * 4u;
+    FpSnap unfused{}, fused{};
+
+    {   // arm A — two independent blocks (the pre-change shape)
+        TestEnv env;
+        if (!env.init()) return false;
+        fp_seed(env);
+        u32 p_insts[4];
+        std::memcpy(p_insts, kFpSegP, sizeof(kFpSegP));
+        p_insts[3] = ppc::b((s32)(S - P_B_PC), false, false);
+        s32 npc = -1;
+        if (!env.dispatch_block(P, p_insts, 4, &npc)) return false;
+        if ((u32)npc != S) {
+            std::printf("[fp-fusion b-seam] arm A: P exited to 0x%08x, expected 0x%08x\n",
+                        (u32)npc, S);
+            return false;
+        }
+        if (!env.dispatch_block(S, kFpSegS, 8, &npc)) return false;
+        if (!fp_did_work(env, "fp-fusion b-seam unfused")) return false;
+        fp_snapshot(env, npc, &unfused);
+    }
+    {   // arm B — one run-fused block: b elided, S spliced at its own pcs
+        TestEnv env;
+        if (!env.init()) return false;
+        fp_seed(env);
+        u32 insts[3 + 8]; u32 pcs[3 + 8];
+        for (u32 i = 0; i < 3; ++i) { insts[i] = kFpSegP[i]; pcs[i] = P + i * 4u; }
+        for (u32 i = 0; i < 8; ++i) { insts[3 + i] = kFpSegS[i]; pcs[3 + i] = S + i * 4u; }
+        s32 npc = -1;
+        if (!env.dispatch_fused(P, insts, pcs, 11, &npc)) return false;
+        fp_snapshot(env, npc, &fused);
+    }
+    return fp_snap_eq(unfused, fused, "fp-fusion b-seam");
+}
+
+// bwd-seam (fuser kind 2): P ends with a BACKWARD conditional; the bcx stays in
+// the stream as a coalesced mid-block exit and the NOT-TAKEN successor at
+// last_pc+4 is spliced inline. Note the fused pc stream here is CONTIGUOUS —
+// which is why m_noncontiguous cannot be used to detect a fused body.
+static bool test_fp_fusion_bwd_seam_bit_identical() {
+    const u32 P = 0x80300000u;
+    const u32 P_BC_PC = P + 3u * 4u;
+    const u32 S = P_BC_PC + 4u;
+    FpSnap unfused{}, fused{};
+
+    {   // arm A
+        TestEnv env;
+        if (!env.init()) return false;
+        fp_seed(env);
+        env.spr(9) = 1u;                       // CTR=1 -> bdnz falls through
+        u32 p_insts[4];
+        std::memcpy(p_insts, kFpSegP, sizeof(kFpSegP));
+        p_insts[3] = ppc::bdnz(-0x100);        // backward, NOT taken at CTR=1
+        s32 npc = -1;
+        if (!env.dispatch_block(P, p_insts, 4, &npc)) return false;
+        if ((u32)npc != S) {
+            std::printf("[fp-fusion bwd-seam] arm A: P exited to 0x%08x, expected 0x%08x\n",
+                        (u32)npc, S);
+            return false;
+        }
+        if (!env.dispatch_block(S, kFpSegS, 8, &npc)) return false;
+        if (!fp_did_work(env, "fp-fusion bwd-seam unfused")) return false;
+        fp_snapshot(env, npc, &unfused);
+    }
+    {   // arm B — fused: the bdnz stays in-stream, S follows contiguously
+        TestEnv env;
+        if (!env.init()) return false;
+        fp_seed(env);
+        env.spr(9) = 1u;
+        u32 insts[4 + 8]; u32 pcs[4 + 8];
+        for (u32 i = 0; i < 3; ++i) { insts[i] = kFpSegP[i]; pcs[i] = P + i * 4u; }
+        insts[3] = ppc::bdnz(-0x100); pcs[3] = P_BC_PC;
+        for (u32 i = 0; i < 8; ++i) { insts[4 + i] = kFpSegS[i]; pcs[4 + i] = S + i * 4u; }
+        s32 npc = -1;
+        if (!env.dispatch_fused(P, insts, pcs, 12, &npc)) return false;
+        fp_snapshot(env, npc, &fused);
+    }
+    return fp_snap_eq(unfused, fused, "fp-fusion bwd-seam");
+}
+
+// The MSR.FP bailout is emitted ONCE, at the first FL_USE_FPU op of a stream
+// (ppc_emit.cpp:1319-1328, :1430-1471) on the reasoning "FP can't be disabled
+// mid-block — mtmsr ends the block". A fused body extends that elision ACROSS a
+// branch seam, so assert the bailout still fires there: MSR.FP=0, integer
+// predecessor, FP successor spliced in -> EXCEPTION_FPU_UNAVAILABLE (0x40) and
+// NO destination FPR written. (The seam can never carry an mtmsr: mtmsr/rfi are
+// FL_ENDBLOCK, so seam_kind() — which accepts only b/bl/blr/bc terminators —
+// cannot splice past one.)
+static bool test_fp_fusion_msr_fp_off_still_bails() {
+    const u32 P = 0x80400000u, S = 0x80480000u;
+    TestEnv env;
+    if (!env.init()) return false;
+    fp_seed(env);
+    env.msr() = 0u;                             // MSR.FP OFF
+    const u32 insts[] = {
+        ppc::addi(3, 0, 11),                    // P: integer, no FP
+        ppc::addi(4, 3, 1),
+        enc_fmul_d(8, 5, 6),                    // S: FIRST FP op of the fused stream
+        enc_fadd_d(9, 8, 7),
+    };
+    const u32 pcs[] = { P, P + 4u, S, S + 4u }; // b elided at P+8
+    const u64 f8_before = env.ps0(8), f9_before = env.ps0(9);
+    s32 npc = -1;
+    if (!env.dispatch_fused(P, insts, pcs, 4, &npc)) return false;
+    const bool raised   = (env.exceptions() & 0x40u) != 0u;
+    const bool no_write = env.ps0(8) == f8_before && env.ps0(9) == f9_before;
+    std::printf("[fp-fusion msr-off] exceptions=0x%08x raised=%d f8/f9 untouched=%d "
+                "r3=%u r4=%u next=0x%08x\n",
+                env.exceptions(), (int)raised, (int)no_write,
+                env.gpr(3), env.gpr(4), (u32)npc);
+    // The integer predecessor DID run (it precedes the bailout), the FP did not.
+    return raised && no_write && env.gpr(3) == 11u && env.gpr(4) == 12u;
+}
+
 // [PM55 int-quality] Dump the SAB scheduler hot block (0x800ebe00, 17.9% of
 // our SAB time vs native 1.28%): rlwinm/add/stw/lwz/lwz/cmplwi/bne(coalesced)/
 // stw/b — the integer working set (queue unlink). Fastmem armed, production
@@ -3911,6 +4154,9 @@ static const TestCase k_tests[] = {
     {"fused_terminator_fixup",           &test_fused_terminator_fixup},
     {"fused_bl_inline_ras_hit",          &test_fused_bl_inline_ras_hit},
     {"fused_bl_inline_ras_miss",         &test_fused_bl_inline_ras_miss},
+    {"fp_fusion_b_seam_bit_identical",   &test_fp_fusion_b_seam_bit_identical},
+    {"fp_fusion_bwd_seam_bit_identical", &test_fp_fusion_bwd_seam_bit_identical},
+    {"fp_fusion_msr_fp_off_still_bails", &test_fp_fusion_msr_fp_off_still_bails},
     {"sab_sched_wasm_dump",              &test_sab_sched_wasm_dump},
     {"ea_cse_stw_then_lwz_same_slot",    &test_ea_cse_stw_then_lwz_same_slot},
     {"reloc_standalone_add_rt_eq_rb",    &test_reloc_standalone_add_rt_eq_rb},

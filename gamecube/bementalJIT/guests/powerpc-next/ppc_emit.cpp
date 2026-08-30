@@ -2000,9 +2000,12 @@ std::vector<u8> build_block_next(u32 start_pc,
         // tie-correction) in jit_fp_helpers.h LOCAL_FMA_* (C2).
         // Group 8 [simd-paired 2026-07-12]: 32 v128 (locals 120..151) — the
         // single-precision f32x2 form of each FPR (FPRRegCache v128_local_idx).
-        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u, 17u, 32u };
-        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64, WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64, WASM_TYPE_F64, WASM_TYPE_V128 };
-        b.emitLocals(8u, counts, types);
+        // Group 9 [simd-bswap 2026-08-29]: 1 v128 scratch (local 152) —
+        // jit_load_store LOCAL_PSQ_V, the shuffle stage for the paired-single /
+        // f64 SIMD byte-swap. APPENDED, so no existing local index moves.
+        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u, 17u, 32u, 1u };
+        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64, WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64, WASM_TYPE_F64, WASM_TYPE_V128, WASM_TYPE_V128 };
+        b.emitLocals(9u, counts, types);
     }
 
     emit_block_body_into(b, block, buffer, stats, count, start_pc, ctx_ptr,
@@ -2067,11 +2070,11 @@ std::vector<u8> emit_block_body_next(u32 start_pc, const u32* insts, u32 count,
         // build_block_next declaration above (region path shares emitters).
         // Group 8 [simd-paired 2026-07-12]: 32 v128 (120..151). MUST match the
         // build_block_next declaration above (region path shares emitters).
-        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u, 17u, 32u };
+        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u, 17u, 32u, 1u };
         const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64,
                                WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64,
-                               WASM_TYPE_F64, WASM_TYPE_V128 };
-        b.emitLocals(8u, counts, types);
+                               WASM_TYPE_F64, WASM_TYPE_V128, WASM_TYPE_V128 };
+        b.emitLocals(9u, counts, types);
     }
     const u32 rtag  = (u32)(uintptr_t)&g_bem_rtag[0];
     const u32 rslot = (u32)(uintptr_t)&g_bem_rslot[0];
@@ -2279,11 +2282,11 @@ std::vector<u8> build_region_function_next_merged(const RegionBlockDesc* blocks,
     {
         // Identical 8-group local layout to build_block_next — the spliced
         // bodies hardcode these indices.
-        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u, 17u, 32u };
+        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u, 17u, 32u, 1u };
         const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64,
                                WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64,
-                               WASM_TYPE_F64, WASM_TYPE_V128 };
-        b.emitLocals(8u, counts, types);
+                               WASM_TYPE_F64, WASM_TYPE_V128, WASM_TYPE_V128 };
+        b.emitLocals(9u, counts, types);
     }
     // [region-resident 2026-07-15] Activation pad: load ALL 32 GPRs into their
     // identity locals (preg n -> local 2+n, RegCache::OnBlockEntry layout) ONCE

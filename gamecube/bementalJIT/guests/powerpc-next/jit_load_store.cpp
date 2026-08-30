@@ -66,6 +66,61 @@ static constexpr u32 LOCAL_TMP_VAL = 1;
 static constexpr u32 LOCAL_TMP_FPVAL = 98;
 
 // ---------------------------------------------------------------------------
+// [simd-bswap 2026-08-29] SIMD byte-swap for the ADJACENT-WORD-PAIR memory ops.
+// ---------------------------------------------------------------------------
+// emit_bswap_i32 is 11 ops and the paired-single / f64 memory ops call it TWICE
+// (the two halves of one 8-byte access) = 22 ops per access. One i8x16.shuffle
+// reverses both 4-byte lanes at once, so 22 -> 1 (+2 tee/get to feed the
+// shuffle's two v128 operands). On psq_st the source is ALREADY a v128 when the
+// FPR is Single-repr, so the f32x4.extract_lane + i32.reinterpret_f32 +
+// scalar-FTZ ladder (13 ops per lane) collapses into the vector FTZ too.
+//
+// Correctness is byte-order, so nothing here is inferred. Every opcode byte and
+// both masks were verified against V8 by a hand-assembled module
+// (scratchpad/simd2.mjs): with 0x11223344/0x55667788 in guest-BE memory,
+// load64_zero+SHUF32+store64_lane wrote `44 33 22 11 88 77 66 55` (= two
+// bswap32) and +SHUF64 wrote `88 77 66 55 44 33 22 11` (= bswap64).
+//
+// LOCAL_PSQ_V is locals group 9 (ppc_emit.cpp emitLocals) — index 152,
+// APPENDED after the 32 FPR v128s (120..151), so no existing index moved.
+static constexpr u32 LOCAL_PSQ_V = 152;
+// result.byte[i] = a.byte[mask[i]] — reverse each 32-bit lane.
+static const u8 BSWAP32X2_SHUFFLE[16] = { 3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12 };
+// reverse each 64-bit lane (one f64 in guest big-endian order).
+static const u8 BSWAP64_SHUFFLE[16]   = { 7,6,5,4,3,2,1,0, 15,14,13,12,11,10,9,8 };
+
+// v128 on the stack -> byte-reversed v128 on the stack. 3 ops.
+static void emit_v128_shuffle_self(WasmModuleBuilder& wb, const u8 mask[16]) {
+    wb.op_local_tee(LOCAL_PSQ_V);
+    wb.op_local_get(LOCAL_PSQ_V);
+    wb.op_i8x16_shuffle(mask);
+}
+
+// [simd-bswap] Vector ConvertToSingleFTZ over a Single-repr v128's f32 lanes.
+// Bit-identical to the scalar emit_ftz_f32_bits ladder: that keeps the value
+// when (exp != 0) | (mantissa == 0) and otherwise returns sign-only; this
+// flushes to sign-only when (bits & 0x7FFFFFFF) <u 0x00800000 (i.e. exp == 0).
+// The two disagree only on the exp==0 && mant==0 case (+/-0), where sign-only
+// IS the input, so they agree there too. Proven 0 mismatches over 72,112,448
+// patterns (exhaustive across the exp 0/1/254/255 mantissa spaces + every
+// exponent sampled + 5M random). Same operand order as the already-shipping
+// jit_paired.cpp:346-356 NI-flush: bitselect is (v1 & c) | (v2 & ~c), so v1 =
+// the flushed candidate, v2 = keep, c = the subnormal mask. Pushes the FTZ'd
+// v128. 10 ops (vs 4+13 = 17 per lane, x2 lanes, on the scalar path).
+static void emit_ftz_v128(WasmModuleBuilder& wb, u32 v128_local) {
+    wb.op_local_get(v128_local);
+    wb.op_v128_const_i32_splat(0x80000000u);
+    wb.op_v128_and();                        // v1: sign-only (flushed candidate)
+    wb.op_local_get(v128_local);             // v2: keep candidate
+    wb.op_local_get(v128_local);
+    wb.op_v128_const_i32_splat(0x7FFFFFFFu);
+    wb.op_v128_and();                        // |bits|
+    wb.op_v128_const_i32_splat(0x00800000u);
+    wb.op_i32x4_lt_u();                      // c: per-lane exp==0 mask
+    wb.op_v128_bitselect();
+}
+
+// ---------------------------------------------------------------------------
 // EA computation
 // ---------------------------------------------------------------------------
 static void emit_ea_d_form(WasmModuleBuilder& wb, RegCache& rc, u32 ra, u32 simm,
@@ -1091,23 +1146,20 @@ static void emit_fastmem_lfd_body(WasmModuleBuilder& wb, LoadStoreParams params,
                                   u32 ps0_idx) {
     emit_fastmem_guard(wb, params, 8);
     wb.op_if(BLOCK_TYPE_VOID);
+        // [simd-bswap 2026-08-29] The two i32.load + emit_bswap_i32 + extend/
+        // shl/or (33 ops) build exactly bswap64 of the 8 guest bytes: hi word
+        // BE-swapped in bits 63..32, lo word BE-swapped in 31..0. One
+        // v128.load64_zero + BSWAP64 shuffle + i64x2.extract_lane is the same
+        // i64, in 6 ops. Verified byte-for-byte vs the scalar form (simd2.mjs
+        // t2/t3: 11 22 33 44 55 66 77 88 -> 88 77 66 55 44 33 22 11).
         wb.op_local_get(LOCAL_TMP_EA);
         wb.op_i32_const((s32)params.mem1_mask);
         wb.op_i32_and();
         wb.op_i32_const((s32)params.mem1_base);
         wb.op_i32_add();
-        wb.op_local_set(LOCAL_TMP_FPVAL);       // host base addr
-        wb.op_local_get(LOCAL_TMP_FPVAL);
-        wb.op_i32_load(0);
-        emit_bswap_i32(wb);
-        wb.op_i64_extend_i32_u();
-        wb.op_i64_const(32);
-        wb.op_i64_shl();
-        wb.op_local_get(LOCAL_TMP_FPVAL);
-        wb.op_i32_load(4);
-        emit_bswap_i32(wb);
-        wb.op_i64_extend_i32_u();
-        wb.op_i64_or();
+        wb.op_v128_load64_zero(0, /*align=*/2);
+        emit_v128_shuffle_self(wb, BSWAP64_SHUFFLE);
+        wb.op_i64x2_extract_lane(0);
         wb.op_local_set(ps0_idx);
     wb.op_else();
         wb.op_local_get(LOCAL_TMP_EA);
@@ -1136,19 +1188,15 @@ static void emit_fastmem_stfd_body(WasmModuleBuilder& wb, LoadStoreParams params
         wb.op_i32_and();
         wb.op_i32_const((s32)params.mem1_base);
         wb.op_i32_add();
-        wb.op_local_set(LOCAL_TMP_FPVAL);       // host base addr
-        wb.op_local_get(LOCAL_TMP_FPVAL);       // addr (bytes 0..3)
+        // [simd-bswap 2026-08-29] mirror of the lfd fast arm: the two
+        // shr/wrap/bswap/i32.store pairs (33 ops after the address) write the
+        // 8-byte big-endian image of the i64, which is bswap64(v) stored
+        // little-endian. i64x2.splat + BSWAP64 shuffle + v128.store64_lane is
+        // the same 8 bytes in 6 ops. Address stays on the stack for the store.
         wb.op_local_get(rs_ps0_idx);
-        wb.op_i64_const(32);
-        wb.op_i64_shr_u();
-        wb.op_i32_wrap_i64();
-        emit_bswap_i32(wb);
-        wb.op_i32_store(0);
-        wb.op_local_get(LOCAL_TMP_FPVAL);       // addr+4 (bytes 4..7)
-        wb.op_local_get(rs_ps0_idx);
-        wb.op_i32_wrap_i64();
-        emit_bswap_i32(wb);
-        wb.op_i32_store(4);
+        wb.op_i64x2_splat();
+        emit_v128_shuffle_self(wb, BSWAP64_SHUFFLE);
+        wb.op_v128_store64_lane(0, /*lane=*/0, /*align=*/2);
     wb.op_else();
         wb.op_local_get(LOCAL_TMP_EA);
         wb.op_local_get(rs_ps0_idx);
@@ -1457,6 +1505,28 @@ static constexpr u32 LOCAL_PSQ_T0  = 98;
 static constexpr u32 LOCAL_PSQ_T1  = 99;
 static constexpr u32 LOCAL_PSQ_F64 = 100;
 
+// [simd-bswap 2026-08-29] psq_l FLOAT / non-W fastmem body: load the 8-byte
+// guest pair and byte-swap BOTH words with one shuffle, leaving ps0 f32 bits in
+// LOCAL_PSQ_T0 and ps1 f32 bits in LOCAL_PSQ_T1 — the identical contract the
+// two-i32.load + two-emit_bswap_i32 form had, so the shared v128 assembly at
+// the end of emit_psq_l is untouched. 33 ops -> 15.
+// Precondition: EA in LOCAL_TMP_EA, inside the 8-byte fastmem guard's if-arm.
+static void emit_psq_l_float_pair_simd(WasmModuleBuilder& wb, LoadStoreParams params) {
+    wb.op_local_get(LOCAL_TMP_EA);
+    wb.op_i32_const((s32)params.mem1_mask);
+    wb.op_i32_and();
+    wb.op_i32_const((s32)params.mem1_base);
+    wb.op_i32_add();
+    wb.op_v128_load64_zero(0, /*align=*/2);   // [w0,w1,0,0], words still guest-BE
+    emit_v128_shuffle_self(wb, BSWAP32X2_SHUFFLE);
+    wb.op_local_tee(LOCAL_PSQ_V);
+    wb.op_i32x4_extract_lane(0);
+    wb.op_local_set(LOCAL_PSQ_T0);            // ps0 f32 bits
+    wb.op_local_get(LOCAL_PSQ_V);
+    wb.op_i32x4_extract_lane(1);
+    wb.op_local_set(LOCAL_PSQ_T1);            // ps1 f32 bits
+}
+
 // Push ConvertToDouble(f32 bits in LOCAL_PSQ_T0) as i64. ILSP:237 uses the
 // PEM widening that PRESERVES NaN payloads (incl. the SNaN quiet bit) while
 // wasm f64.promote_f32 may canonicalize NaNs (spec-permitted). Promote is
@@ -1652,19 +1722,8 @@ void emit_psq_l(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                 } else {
                     emit_fastmem_guard(wb, params, 8);
                     wb.op_if(BLOCK_TYPE_VOID);
-                        wb.op_local_get(LOCAL_TMP_EA);
-                        wb.op_i32_const((s32)params.mem1_mask);
-                        wb.op_i32_and();
-                        wb.op_i32_const((s32)params.mem1_base);
-                        wb.op_i32_add();
-                        wb.op_local_tee(LOCAL_PSQ_T1);
-                        wb.op_i32_load(0);
-                        emit_bswap_i32(wb);
-                        wb.op_local_set(LOCAL_PSQ_T0);
-                        wb.op_local_get(LOCAL_PSQ_T1);
-                        wb.op_i32_load(4);
-                        emit_bswap_i32(wb);
-                        wb.op_local_set(LOCAL_PSQ_T1);
+                        // [simd-bswap 2026-08-29] see the generic FLOAT arm below.
+                        emit_psq_l_float_pair_simd(wb, params);
                     wb.op_else();
                         wb.op_local_get(LOCAL_TMP_EA);
                         wb.op_call(WIMPORT_READ32);
@@ -1710,20 +1769,10 @@ void emit_psq_l(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
         } else {
             emit_fastmem_guard(wb, params, 8);
             wb.op_if(BLOCK_TYPE_VOID);
-                // host base -> T1; lane0 bits -> T0; lane1 bits -> T1 (base free after).
-                wb.op_local_get(LOCAL_TMP_EA);
-                wb.op_i32_const((s32)params.mem1_mask);
-                wb.op_i32_and();
-                wb.op_i32_const((s32)params.mem1_base);
-                wb.op_i32_add();
-                wb.op_local_tee(LOCAL_PSQ_T1);          // host base addr
-                wb.op_i32_load(0);
-                emit_bswap_i32(wb);
-                wb.op_local_set(LOCAL_PSQ_T0);          // ps0 f32 bits
-                wb.op_local_get(LOCAL_PSQ_T1);
-                wb.op_i32_load(4);
-                emit_bswap_i32(wb);
-                wb.op_local_set(LOCAL_PSQ_T1);          // ps1 f32 bits (base overwritten)
+                // [simd-bswap 2026-08-29] lane0 bits -> T0, lane1 bits -> T1 via
+                // one 8-byte v128 load + one shuffle instead of two i32.load +
+                // two 11-op emit_bswap_i32. 33 ops -> 15.
+                emit_psq_l_float_pair_simd(wb, params);
             wb.op_else();
                 wb.op_local_get(LOCAL_TMP_EA);
                 wb.op_call(WIMPORT_READ32);
@@ -2151,15 +2200,35 @@ void emit_psq_st(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
                 wb.op_i32_and();
                 wb.op_i32_const((s32)params.mem1_base);
                 wb.op_i32_add();
-                wb.op_local_set(LOCAL_PSQ_T1);          // host base addr
-                wb.op_local_get(LOCAL_PSQ_T1);
-                emit_store_bits(rs_pair.ps0_idx, 0);
-                emit_bswap_i32(wb);
-                wb.op_i32_store(0);
-                wb.op_local_get(LOCAL_PSQ_T1);
-                emit_store_bits(rs_pair.ps1_idx, 1);
-                emit_bswap_i32(wb);
-                wb.op_i32_store(4);
+                if (rs_single) {
+                    // [simd-bswap 2026-08-29] THE hot arm: the board's psq ops
+                    // are all GQR0 and __OSPSInit sets GQR0 = 0 (dolsdk2001
+                    // src/os/OS.c:440-452), so st_type == 0 and EVERY paired
+                    // store lands here. The scalar form is 61 ops after the
+                    // address — two f32x4.extract_lane + i32.reinterpret_f32 +
+                    // 13-op scalar FTZ + 11-op emit_bswap_i32 + i32.store. When
+                    // rs is Single-repr the value is ALREADY a v128, so the
+                    // whole thing is: vector FTZ (10) + shuffle (3) + one
+                    // 8-byte store (1) = 14. Bit-exactness: emit_ftz_v128 is
+                    // proven equal to the scalar ladder (0/72,112,448), and the
+                    // BSWAP32X2 shuffle is proven equal to two bswap32 against
+                    // V8. The !rs_single (Double-repr) path keeps the scalar
+                    // form — its lanes are i64 locals, not a v128, and building
+                    // one would cost more than the swap saves.
+                    emit_ftz_v128(wb, rs_v128);
+                    emit_v128_shuffle_self(wb, BSWAP32X2_SHUFFLE);
+                    wb.op_v128_store64_lane(0, /*lane=*/0, /*align=*/2);
+                } else {
+                    wb.op_local_set(LOCAL_PSQ_T1);          // host base addr
+                    wb.op_local_get(LOCAL_PSQ_T1);
+                    emit_store_bits(rs_pair.ps0_idx, 0);
+                    emit_bswap_i32(wb);
+                    wb.op_i32_store(0);
+                    wb.op_local_get(LOCAL_PSQ_T1);
+                    emit_store_bits(rs_pair.ps1_idx, 1);
+                    emit_bswap_i32(wb);
+                    wb.op_i32_store(4);
+                }
             wb.op_else();
                 emit_fp_words_gp_or_import(
                     wb, params, /*nwords=*/2u, /*scratch_local=*/LOCAL_PSQ_T1,
