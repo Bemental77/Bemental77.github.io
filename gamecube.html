@@ -1931,6 +1931,33 @@ window.GcRate = (function () {
       if (_fpfuse !== null)
         new Uint32Array(sharedMemory.buffer)[0x026B342C >> 2] = (parseInt(_fpfuse, 10) !== 0) ? 1 : 0;
     } catch (e) { pageLog('[fp-fusion] toggle write failed: ' + (e && e.message)); }
+    // [fifo-brake ESCAPE HATCH 2026-08-29] The host-side GX FIFO backpressure brake
+    // (CommandProcessorManager::BemFifoBackpressure, CommandProcessor.cpp:426) ships DEFAULT ON
+    // and reads kill-switch cell 0x026B3B20 (nonzero = brake DISABLED). Until now NOTHING in
+    // this page wrote that cell, so a default-ON behaviour change had no user-reachable off
+    // switch — if it misbehaved on a real machine the only recovery was a rebuild. It ships on
+    // 0/16-vs-5/19 evidence whose PRE-SPECIFIED protocol alone is p = 0.103 (under-powered;
+    // only the pooled comparison clears 0.05), which is exactly the confidence level that
+    // warrants an escape hatch rather than a silent default.
+    //   ?nobrake=1  -> write 1 = brake OFF (the pre-brake behaviour, and the A/B control arm)
+    // WHAT THE BRAKE DOES: the guest's only FIFO backpressure is the CP overflow interrupt, and
+    // this build masks CP out of the guest's PI cause read (dolphin_jit_wimports.cpp:338-341),
+    // so GXOverflowHandler (= OSSuspendThread, GXFifo.c:31-51) NEVER RUNS and the guest never
+    // stops writing — with only 16 KB of slack past GXInitFifoBase's hiWatermark. The brake
+    // parks the producer past that watermark, which is the same observable. It found the
+    // guest's own watermark independently: maxDist was 245,792 in EVERY one of 16 runs =
+    // 245,760 + one 32-byte burst, and 245,760 = 262,144 - 0x4000.
+    // WITHOUT IT, the documented terminal state is a permanent wedge: drawn -> 0/s, peFrames
+    // frozen, xpc parked at 0x80375364 in GXWaitDrawDone. NOTE it reads speed=1.000x while
+    // wedged, because the guest spins in its frame-wait loop and idle-skip credits it fully —
+    // so `?nobrake=1` plus a stuck picture is the pre-brake bug, not a new one.
+    // Read per GatherPipeBursted, so it can also be flipped live from DevTools:
+    //   new Uint32Array(sharedMemory.buffer)[0x026B3B20>>2] = 1
+    try {
+      var _nobrake = new URLSearchParams(location.search).get('nobrake');
+      if (_nobrake !== null)
+        new Uint32Array(sharedMemory.buffer)[0x026B3B20 >> 2] = (parseInt(_nobrake, 10) !== 0) ? 1 : 0;
+    } catch (e) { pageLog('[fifo-brake] toggle write failed: ' + (e && e.message)); }
     // [texhash A/B 2026-08-28] Common::GetHash64 (texture cache hash) picks XXH3 vs the old
     // MurmurHash3 at the call off SAB scratch cell 0x026B340C — same plumbing as the
     // fp_resident_loop toggle above, next free cell. Browser-zeroed = XXH3 (default, ships).
@@ -1962,6 +1989,14 @@ window.GcRate = (function () {
       var _vtxA = new Uint32Array(sharedMemory.buffer);
       if (_vtxsw !== null) _vtxA[0x026B3900 >> 2] = (parseInt(_vtxsw, 10) !== 0) ? 1 : 0;
       if (_vtxcmp !== null) _vtxA[0x026B3904 >> 2] = (parseInt(_vtxcmp, 10) !== 0) ? 1 : 0;
+      // [positive control 2026-08-29] ?bjit_vtx_poison=1 makes the emitter DROP the
+      // byte-swap on the last position component. Purely a test fault: it proves the
+      // Compare differ actually catches a wrong byte order, so that a clean
+      // ?bjit_vtx_compare=1 run means something. Never set this outside a gate run.
+      // 0x026B3980 = draws run by emitted wasm, 0x026B3984 = draws that fell back to
+      // software. PASS is emitted > 0 AND fallback == 0 AND mismatches == 0.
+      var _vtxpois = new URLSearchParams(location.search).get('bjit_vtx_poison');
+      if (_vtxpois !== null) _vtxA[0x026B3988 >> 2] = (parseInt(_vtxpois, 10) !== 0) ? 1 : 0;
     } catch (e) { pageLog('[vtxloader] toggle write failed: ' + (e && e.message)); }
     dolphin_worker.postMessage({
       cmd: 'mem-init', memory: sharedMemory, offscreen: _hwOff,
