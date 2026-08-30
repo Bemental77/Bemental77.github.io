@@ -377,7 +377,9 @@ function startServer() {
   // click), hold the named GC button for PRESS_HOLD_MS via the page's own
   // dispatchKey path (same route the touch controls use), so the press
   // flows pad-buffer → 10ms input pump → worker g_pad → input_state_cb.
-  const PRESS_HOLD_MS = 500;
+  // 500ms is ~1.5 guest frames when the scene draws at 3fps, which is marginal for a
+  // game that latches on a press EDGE. PROBE_PRESS_HOLD_MS widens it.
+  const PRESS_HOLD_MS = parseInt(process.env.PROBE_PRESS_HOLD_MS || '500', 10);
   // page.keyboard emits TRUSTED events → gamecube.html's PHYSICAL-keyboard path
   // (onKey, `if (!e.isTrusted) return`), whose keyToPad is: WASD=analog stick,
   // M/N/J/K=A/B/Y/X, q/r/e/v/c=L/R/Z/Start/Select (gamecube.html:2961-2965).
@@ -407,10 +409,23 @@ function startServer() {
   const PAGE_KEYMAP = { start: 'v', select: 'c', a: 'x', b: 'z', x: 's', y: 'd', l: 'w', r: 'r', z: 'e', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight' };
   const PRESS_KEY = PAGE_KEYMAP;
   void RECOMP;  // kept: the two paths install different listeners, so the split may return
+  // [raw-key escape hatch 2026-08-29] `key_<char>@<ms>` presses the LITERAL key,
+  // bypassing PAGE_KEYMAP. Needed because which map is correct is an EMPIRICAL
+  // question about which listener page.keyboard's TRUSTED events reach, and the
+  // repo has now shipped two mutually exclusive answers. gamecube.html has THREE
+  // keydown listeners, not one:
+  //   :4370 dispatchKey's keyToPad  (x=A z=B s=X d=Y w=L) — the TOUCH/synthetic path,
+  //         applied directly by dispatchKey; its dispatched events are isTrusted=false.
+  //   :4403 onKey -> keyToPad       (m=A n=B j=Y k=X q=L, w/a/s/d = ANALOG STICK) —
+  //         gated `if (!e.isTrusted) return`, so this is the ONLY listener a
+  //         page.keyboard press can reach on the JIT path.
+  //   :6175 the recomp paceI32 map  (KeyX=A KeyZ=B ...) — only live under ?recomp=1.
+  // Use key_ to settle it by observation instead of by reading.
   (process.env.PROBE_PRESS || '').split(',').filter(Boolean).forEach((spec) => {
     const m = spec.trim().match(/^(\w+)@(\d+)$/);
-    if (!m || !PRESS_KEY[m[1]]) { console.log('[probe] PROBE_PRESS spec ignored: ' + spec); return; }
-    const key = PRESS_KEY[m[1]];
+    const raw = m && /^key_(.+)$/.exec(m[1]);
+    if (!m || (!raw && !PRESS_KEY[m[1]])) { console.log('[probe] PROBE_PRESS spec ignored: ' + spec); return; }
+    const key = raw ? raw[1] : PRESS_KEY[m[1]];
     // page.keyboard emits TRUSTED events — exercises the real
     // physical-keyboard path in gamecube.html (keydown/keyup listeners
     // → mobilePadState → updatePadState → 10ms input pump).
@@ -741,6 +756,78 @@ function startServer() {
     console.log('[uncap] not armed (default THROTTLED arm; set PROBE_UNCAP_MS to arm)');
   }
 
+  // ---- [vtx A/B 2026-08-29] SAME-PROCESS interleaved vertex-loader pair -----
+  // PROBE_VTX_AB_MS=<ms> alternates SAB cell 0x026B3900 (0 = emitted wasm vertex
+  // loader, 1 = stock scalar software loader) every <ms>, sampling the page's own
+  // rate model once a second and tagging each sample with the arm that was live.
+  //
+  // Why interleave in ONE process instead of running two probes: this box sits at
+  // load 28-97 with other agents' probes on it, and gate #10 voids any pair taken
+  // above ~25. Two 90s runs straddle minutes of drifting load and are worthless.
+  // Alternating every few seconds puts both arms under the SAME load, the SAME
+  // scene, and the SAME warmed pipeline cache, so the RATIO survives what the
+  // absolute numbers cannot. VertexLoaderWasm::RunVertices re-reads the cell per
+  // DRAW, so the flip takes effect immediately with no reload and no re-boot.
+  //
+  // The sample straddling each flip is discarded: the page's cap model is a 1s
+  // window (gamecube.html:606 m.sample), so the window containing a flip contains
+  // both arms and belongs to neither.
+  const VTX_AB_MS = parseInt(process.env.PROBE_VTX_AB_MS || '0', 10);
+  if (VTX_AB_MS > 0) {
+    const startMs = parseInt(process.env.PROBE_VTX_AB_START_MS || '30000', 10);
+    setTimeout(async () => {
+      try {
+        await page.evaluate((periodMs) => {
+          if (!window.sharedMemory) return;
+          const A = new Uint32Array(window.sharedMemory.buffer);
+          const st = { rows: [], arm: 0, flippedAt: 0, armed: false, builtAtArm: 0 };
+          window.__vtxAB = st;
+          // MUST hold arm A (cell 0) until every vertex format has been created.
+          // VertexLoaderManager CACHES loaders, and CreateVertexLoader returns a
+          // plain VertexLoader immediately when the force-software cell is set —
+          // so a format first drawn while the cell is 1 is stuck as a software
+          // loader for the whole run and stops honouring the cell entirely.
+          // Flipping too early produced a bogus 0.993x "no speedup" with
+          // vtxBuilt=0/vtxUnsup=0, i.e. BOTH arms running the same software code.
+          A[0x026B3900 >> 2] = 0;
+          const built = () => A[0x026B3994 >> 2] >>> 0;
+          const creates = () => A[0x026B3990 >> 2] >>> 0;
+          let stableFor = 0, lastCreates = -1;
+          const warm = setInterval(() => {
+            const c = creates();
+            stableFor = (c === lastCreates && c > 0) ? stableFor + 1 : 0;
+            lastCreates = c;
+            // Formats stop appearing and at least one wasm loader exists.
+            if (!(stableFor >= 5 && built() > 0)) return;
+            clearInterval(warm);
+            st.armed = true;
+            st.builtAtArm = built();
+            st.flippedAt = performance.now();
+            setInterval(() => {
+              st.arm ^= 1;
+              A[0x026B3900 >> 2] = st.arm;
+              st.flippedAt = performance.now();
+            }, periodMs);
+          }, 1000);
+          setInterval(() => {
+            try {
+              const R = window.__gcRate;
+              if (!R || !st.armed) return;
+              const now = performance.now();
+              // Drop the window containing a flip — it saw both arms.
+              if (now - st.flippedAt < 1100) return;
+              st.rows.push({ arm: A[0x026B3900 >> 2] >>> 0, rcap: R.renderCap,
+                             gcap: R.guestCap, cap: R.capFps, speed: R.speed,
+                             emit: A[0x026B3980 >> 2] >>> 0, fall: A[0x026B3984 >> 2] >>> 0,
+                             built: built() });
+            } catch (_e) {}
+          }, 1000);
+        }, VTX_AB_MS);
+        console.log('[vtxAB] interleaving every ' + VTX_AB_MS + 'ms from t=' + startMs + 'ms');
+      } catch (e) { console.error('[vtxAB] arm failed: ' + e.message); }
+    }, startMs);
+  }
+
   // ---- [scene-rate 2026-08-28] PER-WINDOW rate time series -----------------
   // PROBE_SCENE_RATE=<periodMs> prints ONE line per window so a rate can be
   // attributed to the SCENE that was on screen for that window, instead of a
@@ -1017,6 +1104,55 @@ function startServer() {
         console.log('[census-off] armed at ' + CENSUS_OFF_MS + 'ms: ' + r);
       } catch (e) { console.log('[census-off] arm failed: ' + e.message); }
     }, CENSUS_OFF_MS);
+  }
+
+  // ---- [pad-watch 2026-08-29] DID THE PRESS REACH THE PAD BUFFER? ---------
+  // PROBE_PAD_WATCH=<periodMs> samples the three libretro joypad bytes the page
+  // writes at gamecube.html:4375 (`Module.HEAPU8[padStatus1..+2]`, base
+  // `padStatus1 = Module._get_ptr(0)` at :1692) and prints every CHANGE.
+  //
+  // This exists because "the modal did not dismiss" has two completely different
+  // causes that look identical from a screenshot: the probe pressed a key the page
+  // does not bind (nothing ever reaches the pad buffer), or the pad buffer changed
+  // correctly and the GUEST ignored it. A whole campaign's worth of "input is
+  // broken" conclusions rests on telling those apart, and until now nothing in the
+  // rig measured the boundary between them. Bit layout, from :4364-4366:
+  //   b0: 1=B 2=Y 4=Select 8=Start 16=Up 32=Down 64=Left 128=Right
+  //   b1: 1=A 2=X 8=Z 16=L 32=R
+  if (process.env.PROBE_PAD_WATCH) {
+    const perMs = parseInt(process.env.PROBE_PAD_WATCH, 10) || 100;
+    const padT0 = Date.now();   // Start-click epoch, so [pad] t= matches PROBE_PRESS offsets
+    let padPrev = null;
+    const padTimer = setInterval(async () => {
+      try {
+        const v = await page.evaluate(() => {
+          try {
+            if (!window.Module || !Module._get_ptr) return null;
+            const p = Module._get_ptr(0);
+            if (!p) return null;
+            return [Module.HEAPU8[p], Module.HEAPU8[p + 1], Module.HEAPU8[p + 2]];
+          } catch (_e) { return null; }
+        });
+        if (!v) return;
+        const key = v.join(',');
+        if (key !== padPrev) {
+          const names = [];
+          if (v[0] & 1) names.push('B'); if (v[0] & 2) names.push('Y');
+          if (v[0] & 4) names.push('Select'); if (v[0] & 8) names.push('Start');
+          if (v[0] & 16) names.push('Up'); if (v[0] & 32) names.push('Down');
+          if (v[0] & 64) names.push('Left'); if (v[0] & 128) names.push('Right');
+          if (v[1] & 1) names.push('A'); if (v[1] & 2) names.push('X');
+          if (v[1] & 8) names.push('Z'); if (v[1] & 16) names.push('L');
+          if (v[1] & 32) names.push('R');
+          console.log('[pad] t=' + ((Date.now() - padT0) / 1000).toFixed(1) + 's  b0=0x'
+            + v[0].toString(16) + ' b1=0x' + v[1].toString(16) + ' b2=0x' + v[2].toString(16)
+            + '  [' + (names.join(' ') || 'none') + ']');
+          padPrev = key;
+        }
+      } catch (_e) {}
+    }, perMs);
+    padTimer.unref && padTimer.unref();
+    console.log('[probe] pad-watch: sampling padStatus1 every ' + perMs + 'ms');
   }
 
   // ---- [poke 2026-08-29] generic SAB control-cell writer ------------------
@@ -2395,6 +2531,18 @@ function startServer() {
             bw.vtxCmp = A[0x026B3910 >> 2] >>> 0;          // compare runs (0 = gate never ran)
             bw.vtxMis = A[0x026B3908 >> 2] >>> 0;          // mismatches (must be 0)
             bw.vtxKinds = (A[0x026B390C >> 2] >>> 0).toString(16);  // which checks differed
+            // [positive control 2026-08-29] mismatches==0 proves nothing on its own:
+            // RunVertices silently falls back to the software loader when codegen
+            // fails, which makes Compare diff software against ITSELF and pass. A
+            // real PASS is vtxEmit > 0 AND vtxFall == 0 AND vtxMis == 0.
+            bw.vtxEmit = A[0x026B3980 >> 2] >>> 0;         // draws run by emitted wasm
+            bw.vtxFall = A[0x026B3984 >> 2] >>> 0;         // draws that fell back to software
+            bw.vtxPois = A[0x026B3988 >> 2] >>> 0;         // 1 = fault injected (teeth check)
+            // [selection trace] 1=Native 2=Software 3=Compare (0 = never called)
+            bw.vtxType = A[0x026B398C >> 2] >>> 0;
+            bw.vtxCreate = A[0x026B3990 >> 2] >>> 0;       // CreateVertexLoader calls
+            bw.vtxBuilt = A[0x026B3994 >> 2] >>> 0;        // VertexLoaderWasm constructed
+            bw.vtxUnsup = A[0x026B3998 >> 2] >>> 0;        // IsSupported() rejections
             bw.cpDistLive = A[0x026B1AD8 >> 2] >>> 0;      // last CPReadWriteDistance seen by RunGpuLoop
             bw.gpReadEn = A[0x026B1AE4 >> 2] >>> 0;        // bFF_GPReadEnable seen by RunGpuLoop
             bw.gpfWrite32 = A[0x026B1AE8 >> 2] >>> 0;      // GPFifo::Write32 entries (WPAR reaching dolphin GPFifo?)
@@ -2563,6 +2711,59 @@ function startServer() {
     ]);
     console.log('[si-final] ' + JSON.stringify(siFinal));
   } catch (_e) { console.log('[si-final] {"err":"evaluate failed"}'); }
+
+  // [vtx A/B 2026-08-29] Per-arm medians of the interleaved pair. Median, not
+  // mean: one GC pause or one scheduler steal from a co-tenant probe skews a mean
+  // of ~30 samples badly, and the arms are compared to each other, not to an
+  // absolute. renderCap and guestCap are reported SEPARATELY because `cap` is
+  // min() of the two and hides which stage actually bound the window.
+  if (process.env.PROBE_VTX_AB_MS) {
+    try {
+      const ab = await page.evaluate(() => (window.__vtxAB ? window.__vtxAB.rows : null));
+      if (!ab || !ab.length) {
+        console.log('[vtxAB] NO SAMPLES — arm never ran (check PROBE_VTX_AB_START_MS vs duration)');
+      } else {
+        const med = (a) => { const v = a.filter((x) => x !== null && x !== undefined).sort((p, q) => p - q);
+          return v.length ? (v.length % 2 ? v[(v.length - 1) / 2] : (v[v.length / 2 - 1] + v[v.length / 2]) / 2) : null; };
+        const fmt = (v) => (v === null ? 'null' : v.toFixed(2));
+        const out = { samples: ab.length };
+        for (const arm of [0, 1]) {
+          const rows = ab.filter((r) => r.arm === arm);
+          const name = arm === 0 ? 'A_wasm' : 'B_software';
+          out[name] = { n: rows.length,
+            renderCap: med(rows.map((r) => r.rcap)), guestCap: med(rows.map((r) => r.gcap)),
+            cap: med(rows.map((r) => r.cap)), speed: med(rows.map((r) => r.speed)) };
+          console.log('[vtxAB] ' + name + ' n=' + rows.length
+            + ' renderCap=' + fmt(out[name].renderCap) + ' guestCap=' + fmt(out[name].guestCap)
+            + ' cap=' + fmt(out[name].cap) + ' speed=' + fmt(out[name].speed));
+        }
+        // VALIDITY GATE. Each arm must actually be served by the path it names:
+        // arm A must ADVANCE the emitted-draw counter and not the fallback one,
+        // arm B the reverse. A pair that fails this is comparing software to
+        // software (the loader-cache trap) and its ratio means nothing — this
+        // exact failure produced a plausible-looking 0.993x before the counters
+        // existed to catch it.
+        const dA = { emit: 0, fall: 0 }, dB = { emit: 0, fall: 0 };
+        for (let i = 1; i < ab.length; i++) {
+          const d = ab[i].arm === 0 ? dA : dB;
+          if (ab[i].arm !== ab[i - 1].arm) continue;   // only within-arm deltas
+          d.emit += ab[i].emit - ab[i - 1].emit;
+          d.fall += ab[i].fall - ab[i - 1].fall;
+        }
+        console.log('[vtxAB] within-arm draw deltas: A_wasm emit=' + dA.emit + ' fall=' + dA.fall
+          + ' | B_software emit=' + dB.emit + ' fall=' + dB.fall);
+        const valid = dA.emit > 0 && dA.fall === 0 && dB.fall > 0 && dB.emit === 0;
+        console.log('[vtxAB] VALIDITY: ' + (valid ? 'PASS — each arm ran its own code path'
+          : 'FAIL — arms did not run distinct code paths; ratio is MEANINGLESS'));
+        const a = out.A_wasm.renderCap, b = out.B_software.renderCap;
+        if (a && b && valid) console.log('[vtxAB] renderCap A_wasm/B_software = ' + (a / b).toFixed(3) + 'x');
+        const last = ab[ab.length - 1];
+        console.log('[vtxAB] cumulative emitted-draws=' + last.emit + ' fallback-draws=' + last.fall
+          + ' wasmLoadersBuilt=' + last.built);
+        console.log('[vtxAB] rows=' + JSON.stringify(ab));
+      }
+    } catch (e) { console.log('[vtxAB] dump failed: ' + e.message); }
+  }
 
   try { await browser.close(); } catch (_e) {}
   srv.close();

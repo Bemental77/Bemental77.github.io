@@ -337,6 +337,13 @@ std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVt
   VertexLoaderType loader_type = g_ActiveConfig.vertex_loader_type;
 
 #ifdef __EMSCRIPTEN__
+  // [selection trace 2026-08-29] Publish what this function actually sees.
+  VertexLoaderWasmFlags::WriteCell(VertexLoaderWasmFlags::kLoaderTypeCell,
+                                   static_cast<u32>(loader_type) + 1u);
+  VertexLoaderWasmFlags::BumpCell(VertexLoaderWasmFlags::kCreateCallsCell);
+#endif
+
+#ifdef __EMSCRIPTEN__
   // [vtx-wasm 2026-08-28] Runtime A/B on ONE binary — no rebuild between arms.
   // SAB scratch cell 0x026B3900 nonzero == arm B (stock software loader);
   // 0x026B3904 nonzero == run the Compare gate. See VertexLoaderWasm.h.
@@ -365,7 +372,14 @@ std::unique_ptr<VertexLoaderBase> VertexLoaderBase::CreateVertexLoader(const TVt
   // loader; everything else leaves native_loader null and drops into the
   // software fallback right below, exactly as before.
   if (VertexLoaderWasm::IsSupported(vtx_desc, vtx_attr))
+  {
+    VertexLoaderWasmFlags::BumpCell(VertexLoaderWasmFlags::kWasmBuiltCell);
     native_loader = std::make_unique<VertexLoaderWasm>(vtx_desc, vtx_attr);
+  }
+  else
+  {
+    VertexLoaderWasmFlags::BumpCell(VertexLoaderWasmFlags::kUnsupportedCell);
+  }
 #endif
 
   // Use the software loader as a fallback

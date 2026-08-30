@@ -76,6 +76,44 @@ constexpr std::uintptr_t kMismatchCountCell = 0x026B3908u;
 constexpr std::uintptr_t kMismatchKindsCell = 0x026B390Cu;
 constexpr std::uintptr_t kCompareRunsCell = 0x026B3910u;
 
+// ---------------------------------------------------------------------------
+// [vtx-wasm positive control 2026-08-29] "0 mismatches" is NOT evidence on its
+// own. RunVertices falls back to m_software whenever EnsureCompiled() fails, so
+// a compile failure makes the Compare gate diff the SOFTWARE loader against
+// ITSELF and report a clean pass. There is no log witness either: this build
+// routes no VIDEO-category logs at all (a 90s probe emitted zero), so the
+// INFO/WARN lines in EnsureCompiled are invisible.
+//
+// These three cells close that hole, on ONE binary with no rebuild between arms:
+//   kEmittedRunsCell   bumped ONLY on the emitted-wasm path
+//   kFallbackRunsCell  bumped ONLY on the software-fallback path
+// A pass now requires emitted > 0 AND fallback == 0 alongside mismatches == 0.
+//
+// kPoisonCell is the teeth-check for the differ itself. Nonzero makes EmitModule
+// drop the byte-swap on the LAST position component, which is exactly the class
+// of bug this whole exercise risks (guest data is big-endian). Expect the
+// Compare gate to light up VTX_MISMATCH_DATA; if it does not, the gate is blind
+// and its clean runs mean nothing. Read per compile, so it must be set before
+// the first draw. Cells verified free 2026-08-29: a repo-wide grep for
+// 026B39xx returns nothing in 0x026B3980..0x026B39F8.
+constexpr std::uintptr_t kEmittedRunsCell = 0x026B3980u;
+constexpr std::uintptr_t kFallbackRunsCell = 0x026B3984u;
+constexpr std::uintptr_t kPoisonCell = 0x026B3988u;
+
+// [selection trace 2026-08-29] Which branch CreateVertexLoader actually took.
+// Added because emitted-draws was 3,046,711 WITH the Compare gate on and exactly
+// 0 with it off, on the SAME binary and the SAME scene (127M vertices loaded) —
+// a contradiction that no reading of the selection code explained.
+//   kLoaderTypeCell   g_ActiveConfig.vertex_loader_type + 1 (0 = never called)
+//                     1 = Native, 2 = Software, 3 = Compare (VideoConfig.h:103)
+//   kCreateCallsCell  CreateVertexLoader calls
+//   kWasmBuiltCell    VertexLoaderWasm objects constructed
+//   kUnsupportedCell  formats IsSupported() rejected
+constexpr std::uintptr_t kLoaderTypeCell = 0x026B398Cu;
+constexpr std::uintptr_t kCreateCallsCell = 0x026B3990u;
+constexpr std::uintptr_t kWasmBuiltCell = 0x026B3994u;
+constexpr std::uintptr_t kUnsupportedCell = 0x026B3998u;
+
 inline u32 ReadCell(std::uintptr_t cell)
 {
   return *reinterpret_cast<volatile u32*>(cell);
@@ -91,6 +129,14 @@ inline bool ForceSoftware()
 inline bool ForceCompare()
 {
   return ReadCell(kForceCompareCell) != 0u;
+}
+inline bool Poison()
+{
+  return ReadCell(kPoisonCell) != 0u;
+}
+inline void BumpCell(std::uintptr_t cell)
+{
+  WriteCell(cell, ReadCell(cell) + 1u);
 }
 }  // namespace VertexLoaderWasmFlags
 

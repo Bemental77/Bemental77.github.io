@@ -59,6 +59,11 @@ struct VtxWasmLayout
   bool has_color0;
   bool has_tex0;
   bool normal_is_float;  // else ComponentFormat::Byte (s8)
+  // [positive control] Drop the byte-swap on the LAST position component. Not a
+  // feature — a deliberate injected fault, off unless kPoisonCell is set, used to
+  // prove the Compare differ actually detects a wrong byte order. See
+  // VertexLoaderWasm.h kPoisonCell.
+  bool poison_skip_last_pos_swap;
 };
 
 // ---------------------------------------------------------------------------
@@ -226,7 +231,18 @@ std::vector<u8> EmitVertexLoaderModule(const VtxWasmLayout& L)
   // byte reversal (VertexLoader_Position.cpp:26-30, :64). The element is read
   // even when the vertex is skipped — Pos_ReadIndex does the same (:62-68).
   for (u32 i = 0; i < 3; i++)
+  {
+    if (L.poison_skip_last_pos_swap && i == 2u)
+    {
+      // Injected fault: copy the big-endian word straight through, unswapped.
+      b.op_local_get(L_DST);
+      b.op_local_get(L_ADDR);
+      b.op_i32_load(4u * i, /*align*/ 0);
+      b.op_i32_store(L.pos_offset + 4u * i, /*align*/ 0);
+      continue;
+    }
     EmitSwappedCopy(b, 4u * i, L.pos_offset + 4u * i);
+  }
 
   // if (m_remaining < 3 && !m_vertexSkip)
   //   position_cache[m_remaining][i] = value            (:65-66)
@@ -517,6 +533,7 @@ std::vector<u8> VertexLoaderWasm::EmitModule() const
   layout.has_color0 = m_has_color0;
   layout.has_tex0 = m_has_tex0;
   layout.normal_is_float = m_normal_is_float;
+  layout.poison_skip_last_pos_swap = VertexLoaderWasmFlags::Poison();
   return EmitVertexLoaderModule(layout);
 }
 
@@ -614,11 +631,19 @@ int VertexLoaderWasm::RunVertices(const u8* src, u8* dst, int count)
   // not per vertex — so arm A is not measurably taxed by the toggle's presence.
   if (VertexLoaderWasmFlags::ForceSoftware() || !EnsureCompiled())
   {
+    // Counted so a silent codegen failure cannot masquerade as a clean Compare
+    // run: fallback > 0 with the force-software cell clear means EnsureCompiled
+    // failed and every "match" was the software loader diffed against itself.
+    VertexLoaderWasmFlags::BumpCell(VertexLoaderWasmFlags::kFallbackRunsCell);
     const int loaded = m_software->RunVertices(src, dst, count);
     m_numLoadedVertices += count;
     return loaded;
   }
 
+  // The positive witness that emitted wasm — not the fallback — produced this
+  // draw's vertices. One non-atomic u32 bump per RunVertices (per DRAW, not per
+  // vertex), on the same cache line the toggle above already loaded.
+  VertexLoaderWasmFlags::BumpCell(VertexLoaderWasmFlags::kEmittedRunsCell);
   m_numLoadedVertices += count;  // VertexLoader.cpp:261
   return m_fn(src, dst, count);
 }
