@@ -405,8 +405,33 @@ function startServer() {
   // under input" is not a safe conclusion from any such run.
   // Both branches now use the page's single keymap verbatim; they are identical by
   // construction rather than by coincidence, so they cannot drift apart again.
+  // [KEYMAP RE-FIX 2026-08-29 — MEASURED, not read] The 2026-08-29 "fix" above
+  // INVERTED the bug it describes. It swapped the working map for gamecube.html's
+  // dispatchKey map (a:'x' b:'z' x:'s' y:'d' l:'w'), but dispatchKey is the
+  // TOUCH/synthetic path: it applies pad state itself and its events carry
+  // isTrusted=false. page.keyboard emits TRUSTED events, which reach ONLY the
+  // physical listener at gamecube.html:4403 -> onKey (`if (!e.isTrusted) return`),
+  // whose map is m/n/j/k = A/B/Y/X, q/r/e/v/c = L/R/Z/Start/Select, and
+  // w/a/s/d = ANALOG STICK.
+  //
+  // Settled with a direct pad-buffer witness (PROBE_PAD_WATCH, /tmp/keymap.log),
+  // ten presses, reading `Module.HEAPU8[Module._get_ptr(0) + 0..2]`:
+  //   key_x -> NO pad change      key_z -> NO pad change     (silent no-ops)
+  //   key_s -> Down   key_d -> Right   key_w -> Up           (ANALOG STICK, not X/Y/L)
+  //   key_m -> A   key_n -> B   key_j -> Y   key_k -> X   key_q -> L   (correct)
+  // So the "fixed" map made 2 of 5 face buttons silent and the other 3 press the
+  // stick — strictly worse than what it replaced, and harder to catch, because
+  // s/d/w DO move the pad and so look like delivered input.
+  //
+  // WASD vs the arrows: NOT two different sticks. onKey maps both to the same four
+  // pad entries ('up'/'down'/'left'/'right'), so updatePadState sets the same bits
+  // (gamecube.html:4364 b0 16/32/64/128) either way — measured: `stickdown` (s) and
+  // `down` (ArrowDown) both produced b0=0x20. The analog stick is synthesized
+  // worker-side FROM those bits (EmscriptenWorker input_state_cb), so there is no
+  // separate stick key to press. The stick* names below are aliases kept only
+  // because WASD is what a human would reach for.
   const RECOMP = /(^|&)recomp=1(&|$)/.test(process.env.PROBE_QUERY || '');
-  const PAGE_KEYMAP = { start: 'v', select: 'c', a: 'x', b: 'z', x: 's', y: 'd', l: 'w', r: 'r', z: 'e', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight' };
+  const PAGE_KEYMAP = { start: 'v', select: 'c', a: 'm', b: 'n', x: 'k', y: 'j', l: 'q', r: 'r', z: 'e', up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', stickup: 'w', stickdown: 's', stickleft: 'a', stickright: 'd' };
   const PRESS_KEY = PAGE_KEYMAP;
   void RECOMP;  // kept: the two paths install different listeners, so the split may return
   // [raw-key escape hatch 2026-08-29] `key_<char>@<ms>` presses the LITERAL key,
@@ -826,6 +851,102 @@ function startServer() {
         console.log('[vtxAB] interleaving every ' + VTX_AB_MS + 'ms from t=' + startMs + 'ms');
       } catch (e) { console.error('[vtxAB] arm failed: ' + e.message); }
     }, startMs);
+  }
+
+  // ---- [render-stage split 2026-08-29] ------------------------------------
+  // PROBE_STAGE_SPLIT=<periodMs> turns on the BemStageTimer regions
+  // (VideoCommon/BemStageTimer.h, enable cell 0x026B3B20) and prints ONE line per
+  // window with the DELTA of every stage accumulator, so _recomp_render_fifo is
+  // attributed to opcode decode / vertex load / texture cache / constants /
+  // pipeline / WGPU submission instead of being a single 15 ms bar.
+  //
+  // The stages are published by the C++ into 0x026B3B40 (8 x f64 ms) and
+  // 0x026B3B80 (8 x u32 call counts), refreshed once per _recomp_render_fifo.
+  // kFlush is a SUPERSET of kTexCache..kDrawCall; kFifoTotal is a superset of
+  // everything. `other` = kFifoTotal - kFlush - kVtxLoad = the opcode walk plus
+  // the CP/XF/BP register writes plus RefreshPeekCache.
+  //
+  // Timer cost is MEASURED, not assumed: kTimerPair is one back-to-back pair of
+  // emscripten_get_now() reads per _recomp_render_fifo call, so `tcall` below is
+  // the per-call cost in-situ and `ovh` is (total calls x tcall) — the bound on
+  // how much of the reported total is the instrument itself.
+  //
+  // PROBE_STAGE_SPLIT_START_MS delays arming (default 30000) so the window that
+  // turns it on is not the one being read.
+  if (process.env.PROBE_STAGE_SPLIT) {
+    const _ssPer = parseInt(process.env.PROBE_STAGE_SPLIT, 10) || 5000;
+    const _ssStart = parseInt(process.env.PROBE_STAGE_SPLIT_START_MS || '30000', 10);
+    const _ssNames = ['vtx', 'tex', 'const', 'pipe', 'draw', 'flush', 'fifo', 'tpair'];
+    const _ssRows = [];
+    let _ssPrev = null;
+    setTimeout(async () => {
+      try {
+        await page.evaluate(() => {
+          if (window.sharedMemory) new Uint32Array(window.sharedMemory.buffer)[0x026B3B20 >> 2] = 1;
+        });
+        console.log('[stage-split] timers ARMED (cell 0x026B3B20=1) at t=' + _ssStart + 'ms');
+      } catch (e) { console.log('[stage-split] arm failed: ' + e.message); }
+    }, _ssStart);
+    const _ssTimer = setInterval(async () => {
+      try {
+        const s = await page.evaluate(() => {
+          if (!window.sharedMemory) return null;
+          const F = new Float64Array(window.sharedMemory.buffer);
+          const A = new Uint32Array(window.sharedMemory.buffer);
+          const o = { t: performance.now(), ms: [], n: [] };
+          for (let i = 0; i < 8; i++) {
+            o.ms.push(F[(0x026B3B40 >> 3) + i]);
+            o.n.push(A[(0x026B3B80 >> 2) + i] >>> 0);
+          }
+          return o;
+        });
+        if (!s) return;
+        if (_ssPrev && s.n[6] > _ssPrev.n[6]) {
+          const frames = s.n[6] - _ssPrev.n[6];
+          const d = (i) => (s.ms[i] - _ssPrev.ms[i]) / frames;      // ms per rendered frame
+          const c = (i) => (s.n[i] - _ssPrev.n[i]) / frames;        // calls per rendered frame
+          // Each Scope makes 2 clock reads; kTimerPair measures exactly one read.
+          const tcall = (s.n[7] - _ssPrev.n[7]) > 0
+            ? (s.ms[7] - _ssPrev.ms[7]) / (s.n[7] - _ssPrev.n[7]) : 0;
+          let calls = 0;
+          for (let i = 0; i <= 6; i++) calls += 2 * (s.n[i] - _ssPrev.n[i]);
+          calls += 2 * (s.n[7] - _ssPrev.n[7]);
+          const ovh = tcall * calls / frames;
+          const other = d(6) - d(5) - d(0);
+          const flushOther = d(5) - d(1) - d(2) - d(3) - d(4);
+          const row = { tsec: +(s.t / 1000).toFixed(1), frames,
+            fifo: +d(6).toFixed(3), vtx: +d(0).toFixed(3), tex: +d(1).toFixed(3),
+            konst: +d(2).toFixed(3), pipe: +d(3).toFixed(3), draw: +d(4).toFixed(3),
+            flush: +d(5).toFixed(3), flushOther: +flushOther.toFixed(3),
+            other: +other.toFixed(3), tcallUs: +(tcall * 1000).toFixed(4),
+            ovhMs: +ovh.toFixed(3), nFlush: +c(5).toFixed(1), nVtx: +c(0).toFixed(1),
+            nDraw: +c(4).toFixed(1) };
+          _ssRows.push(row);
+          const pct = (v) => d(6) > 0 ? (100 * v / d(6)).toFixed(1) + '%' : '--';
+          console.log('[stage-split] t=' + row.tsec + 's f=' + frames
+            + '  fifo=' + row.fifo + 'ms'
+            + ' | vtx=' + row.vtx + '(' + pct(d(0)) + ')'
+            + ' tex=' + row.tex + '(' + pct(d(1)) + ')'
+            + ' const=' + row.konst + '(' + pct(d(2)) + ')'
+            + ' pipe=' + row.pipe + '(' + pct(d(3)) + ')'
+            + ' draw=' + row.draw + '(' + pct(d(4)) + ')'
+            + ' flushOther=' + row.flushOther + '(' + pct(flushOther) + ')'
+            + ' decode/other=' + row.other + '(' + pct(other) + ')'
+            + ' | flush=' + row.flush + ' n/f: flush=' + row.nFlush + ' vtx=' + row.nVtx
+            + ' draw=' + row.nDraw + ' | tcall=' + row.tcallUs + 'us ovh=' + row.ovhMs + 'ms');
+        }
+        _ssPrev = s;
+      } catch (_e) {}
+    }, _ssPer);
+    _ssTimer.unref && _ssTimer.unref();
+    global.__ssRows = _ssRows;
+    if (process.env.PROBE_STAGE_SPLIT_JSON) {
+      process.on('exit', () => {
+        try { fs.writeFileSync(process.env.PROBE_STAGE_SPLIT_JSON, JSON.stringify(_ssRows, null, 1)); }
+        catch (_e) {}
+      });
+    }
+    console.log('[probe] stage-split: per-' + _ssPer + 'ms render-stage series installed');
   }
 
   // ---- [scene-rate 2026-08-28] PER-WINDOW rate time series -----------------
