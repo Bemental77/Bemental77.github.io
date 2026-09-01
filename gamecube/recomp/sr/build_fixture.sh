@@ -35,9 +35,20 @@ esac
 
 source "$HOME/emsdk-upstream/emsdk_env.sh" >/dev/null 2>&1
 
-ARGS=(); for f in "${FNS[@]}"; do ARGS+=(--fn "$f"); done
-python3 "$SR/sr.py" --image "$DOL" --map "$REPO/dolphin_captures/sab.map" \
-        "${ARGS[@]}" --closure --out "$OUT/sr_gen.c"
+# SR_EXTRA_ARGS: extra sr.py flags (e.g. "--indirect --boundaries outer+calls").
+# Empty by default so the recorded reproduction of this script is unchanged.
+read -r -a EXTRA <<< "${SR_EXTRA_ARGS:-}"
+# SR_GEN: link a PRE-GENERATED C file instead of running sr.py.  This is how an
+# OVERLAY fixture is built -- rel_emit.py --base emits the overlay function together
+# with its DOL callee closure at REAL runtime addresses, which sr.py (DOL-only) cannot.
+if [ -n "${SR_GEN:-}" ]; then
+  cp "$SR_GEN" "$OUT/sr_gen.c"
+  echo "[sr] linking pre-generated $SR_GEN"
+else
+  ARGS=(); for f in "${FNS[@]}"; do ARGS+=(--fn "$f"); done
+  python3 "$SR/sr.py" --image "$DOL" --map "$REPO/dolphin_captures/sab.map" \
+          "${ARGS[@]}" "${EXTRA[@]}" --closure --out "$OUT/sr_gen.c"
+fi
 
 emcc -O2 -DSR_VERIFY -I"$SR" "$OUT/sr_gen.c" "$SR/sr_driver.c" -o "$OUT/sr_fixture.js" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \

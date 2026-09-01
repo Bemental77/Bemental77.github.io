@@ -10,6 +10,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SR="$REPO/gamecube/recomp/sr"
 DOL="${1:?usage: build_slice.sh <main.dol> [fn_hex ...]}"; shift || true
 FNS=("$@"); [ ${#FNS[@]} -eq 0 ] && FNS=(0x800ed368)
+# "ALL" translates every function in the boundary set (whole-image build) instead
+# of a named list.  Pair it with SR_EXTRA_ARGS="--indirect --boundaries outer+calls".
+ALL_MODE=0; [ "${FNS[0]}" = "ALL" ] && { ALL_MODE=1; FNS=(); }
 OUT="${SR_OUT:-/tmp/sr_slice}"
 mkdir -p "$OUT"
 
@@ -33,11 +36,20 @@ esac
 
 source "$HOME/emsdk-upstream/emsdk_env.sh" >/dev/null 2>&1
 
-ARGS=(); for f in "${FNS[@]}"; do ARGS+=(--fn "$f"); done
-python3 "$SR/sr.py" --image "$DOL" --map "$REPO/dolphin_captures/sab.map" \
-        "${ARGS[@]}" --out "$OUT/sr_gen.c"
+# SR_EXTRA_ARGS: extra sr.py flags (e.g. "--indirect --boundaries outer+calls").
+# Empty by default so the recorded reproduction of this script is unchanged.
+read -r -a EXTRA <<< "${SR_EXTRA_ARGS:-}"
+# SR_GEN: link a PRE-GENERATED C file instead of running sr.py (see build_fixture.sh).
+if [ -n "${SR_GEN:-}" ]; then
+  cp "$SR_GEN" "$OUT/sr_gen.c"
+  echo "[sr] linking pre-generated $SR_GEN ($(stat -f%z "$SR_GEN") bytes)"
+else
+  ARGS=(); if [ "$ALL_MODE" = 1 ]; then ARGS=(--all); else for f in "${FNS[@]}"; do ARGS+=(--fn "$f"); done; fi
+  python3 "$SR/sr.py" --image "$DOL" --map "$REPO/dolphin_captures/sab.map" \
+          "${ARGS[@]}" "${EXTRA[@]}" --out "$OUT/sr_gen.c"
+fi
 
-emcc -O2 -I"$SR" "$OUT/sr_gen.c" "$SR/sr_driver.c" -o "$OUT/sr_slice.js" \
+emcc ${SR_OPT:--O2} -I"$SR" "$OUT/sr_gen.c" "$SR/sr_driver.c" -o "$OUT/sr_slice.js" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \
   -sALLOW_MEMORY_GROWTH=1 \
   -sEXPORTED_FUNCTIONS=_sr_init,_sr_ram,_sr_ram_size,_sr_state,_sr_state_size,_sr_call,_malloc \

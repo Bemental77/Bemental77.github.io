@@ -32,7 +32,8 @@ Usage:
 import argparse, collections, json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sr import Image, Translator, Untranslatable, load_map  # noqa: E402
+from sr import (Image, Translator, Untranslatable, load_map,  # noqa: E402
+                recover_boundaries)
 
 PRIV_PREFIXES = ('mfspr', 'mtspr', 'mfmsr', 'mtmsr', 'rfi', 'sc',
                  'cache/sync/trap', 'eciwx', 'ecowx', 'tlb')
@@ -104,82 +105,18 @@ def main():
     ap.add_argument('--json')
     ap.add_argument('--boundaries', default='asis',
                     choices=['asis', 'clip', 'outer', 'outer+calls'],
-                    help="function-boundary recovery policy.  Dolphin's BLR-scan map ends "
-                         "every entry at the next `blr`, so a function with an early-exit "
-                         "blr yields several NESTED entries sharing one end -- measured on "
-                         "sab.map, 100 overlapping pairs / 163,236 bytes = 9.82%% of the "
-                         "summed sizes counted twice.  asis: the raw map.  clip: end := next "
-                         "start (TRUNCATES the real outer function -- included to show it is "
-                         "the wrong fix).  outer: drop any entry starting strictly inside a "
-                         "kept entry.  outer+calls: `outer`, then force-split at every "
-                         "direct `bl` target so no call lands mid-function.")
+                    help='function-boundary recovery policy; see sr.recover_boundaries')
+    ap.add_argument('--indirect', action='store_true',
+                    help='translate blrl/bctr/bctrl through sr_indirect() -- turns the '
+                         'P1 row from a modelled policy into what the emitter really does')
     a = ap.parse_args()
 
     img = Image.from_dol(a.image)
     syms = load_map(a.map)
 
-    # Pass 1 — the function-start set, which the Translator needs in order to
-    # decide whether a bl/b target is a legal entry (the TARGET class).
-    units, seen = [], set()
-    for lo, size, name in syms:
-        if lo in seen or size == 0 or size % 4:
-            continue
-        seen.add(lo)
-        if img.word(lo) is None:
-            continue                       # symbol belongs to a REL overlay
-        units.append((lo, size, name))
-    units.sort()
-    if a.boundaries == 'clip':
-        fixed, clipped = [], 0
-        for i, (lo, size, name) in enumerate(units):
-            end = lo + size
-            if i + 1 < len(units) and end > units[i + 1][0]:
-                clipped += end - units[i + 1][0]
-                end = units[i + 1][0]
-            if end > lo:
-                fixed.append((lo, end - lo, name))
-        print(f"[boundaries=clip] clipped {clipped} overlapping bytes")
-        units = fixed
-    elif a.boundaries in ('outer', 'outer+calls'):
-        kept, dropped = [], 0
-        for lo, size, name in units:                 # sorted by lo
-            if kept and lo < kept[-1][0] + kept[-1][1]:
-                dropped += 1                          # starts inside a kept entry
-                continue
-            kept.append((lo, size, name))
-        print(f"[boundaries={a.boundaries}] dropped {dropped} nested entries "
-              f"({len(units)} -> {len(kept)})")
-        units = kept
-        if a.boundaries == 'outer+calls':
-            # Every direct `bl` target must be a function start, or a call lands
-            # mid-function.  Split the containing entry at each such target.
-            tg = set()
-            for lo, size, _ in units:
-                for pc in range(lo, lo + size, 4):
-                    w = img.word(pc)
-                    if w is None or (w >> 26) != 18 or not (w & 1) or ((w >> 1) & 1):
-                        continue                       # not a relative `bl`
-                    li = (w & 0x03FFFFFC) - (0x04000000 if w & 0x02000000 else 0)
-                    tg.add((pc + li) & 0xFFFFFFFF)
-            cuts = collections.defaultdict(list)
-            starts0 = {lo for lo, _, _ in units}
-            for lo, size, _ in units:
-                for t in tg:
-                    if lo < t < lo + size and t not in starts0:
-                        cuts[lo].append(t)
-            split = []
-            for lo, size, name in units:
-                if lo not in cuts:
-                    split.append((lo, size, name)); continue
-                pts = sorted(set(cuts[lo])) + [lo + size]
-                prev = lo
-                for p in pts:
-                    split.append((prev, p - prev, name if prev == lo else f"split_{prev:08x}"))
-                    prev = p
-            print(f"[boundaries=outer+calls] split {len(cuts)} entries at "
-                  f"{sum(len(v) for v in cuts.values())} interior call targets "
-                  f"({len(units)} -> {len(split)})")
-            units = sorted(split)
+    # Boundary recovery lives in sr.recover_boundaries() so the census and the
+    # EMITTER cannot drift apart -- they must agree on what a function is.
+    units = recover_boundaries(img, syms, a.boundaries, log=print)
     starts = {lo for lo, _, _ in units}
 
     # Pass 2 — walk every instruction, recording EVERY blocker.
@@ -187,7 +124,7 @@ def main():
     why_counter = collections.Counter()
     class_instr = collections.Counter()
     for lo, size, name in units:
-        t = Translator(img, lo, lo + size, starts=starts)
+        t = Translator(img, lo, lo + size, starts=starts, indirect=a.indirect)
         cls = collections.Counter()
         for pc in range(lo, lo + size, 4):
             w = img.word(pc)

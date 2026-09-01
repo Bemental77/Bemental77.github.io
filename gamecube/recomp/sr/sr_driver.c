@@ -32,6 +32,15 @@ void sr_extern(GekkoState *st, uint32_t addr) {
     if (!g_fault) g_fault = 0xE0000000u | (addr & 0x00FFFFFFu);
 }
 
+// Indirect dispatch for blrl / bctr / bctrl.  A distinct fault prefix from sr_extern
+// so a differential can tell "unresolved INDIRECT target" (0xE1) apart from "direct
+// call outside the emitted set" (0xE0) — the two need different fixes.
+void sr_indirect(GekkoState *st, uint32_t addr) {
+    if (!sr_dispatch(addr, st)) {
+        if (!g_fault) g_fault = 0xE1000000u | (addr & 0x00FFFFFFu);
+    }
+}
+
 // Dispatch by guest address — the same table a full build would generate.
 EMSCRIPTEN_KEEPALIVE uint32_t sr_call(uint32_t addr) {
     g_fault = 0;

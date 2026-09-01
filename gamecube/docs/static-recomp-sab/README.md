@@ -157,6 +157,103 @@ Regression evidence:
 > new forms are **correct** — the 1,056-vector suite never reaches them. They need
 > their own differential (see §7).
 
+## 5b. Indirect dispatch is BUILT, and P1 is now a measurement
+
+The first version of this document reported P1 (+ indirect dispatch) as a **policy
+assumption** — "if `blrl`/`bctr` were dispatched, this many functions would clear."
+It is now emitted code, and the number is measured rather than modelled.
+
+`sr.py --indirect` translates `blrl` / `bctr` / `bctrl` into a runtime guest-address →
+translated-function lookup, `sr_indirect()` (`sr_driver.c`), which is the shape
+N64Recomp calls `LOOKUP_FUNC` (`~/gc_refs/N64Recomp/include/recomp.h:450`). Three
+decisions are deliberate and worth stating:
+
+- **`blrl` reads the OLD LR before overwriting it.** The target is LR-at-entry; LR then
+  becomes CIA+4. Capturing it after the write would call the return address.
+- **PowerPC masks the low two bits** of an indirect branch target (`& ~3`).
+- **An unknown target FAULTS (`0xE1......`), it does not fall through.** A `bctr` into a
+  *switch table* targets a point INSIDE a function, which is not a dispatchable entry,
+  so jump tables fault loudly until static table recovery exists
+  (N64Recomp `analysis.cpp:229-334`). `sr_extern()` keeps its own distinct prefix
+  (`0xE0......`) so "unresolved indirect" and "callee outside the emitted set" are
+  never confused — they need different fixes.
+
+Measured with `sr.py --coverage`, same image, same boundary policy, one flag apart:
+
+| | functions | instructions |
+|---|---|---|
+| `--boundaries outer+calls` | 4207 / 4741 (88.74%) | 279,369 (74.54%) |
+| `--boundaries outer+calls --indirect` | **4674 / 4741 (98.59%)** | **372,769 (99.46%)** |
+
+Every one of the 67 functions still blocked is privileged/host-boundary
+(`mfmsr`/`mtmsr`/`mfspr`/`mtspr`/`sc`/cache/`mftb`/`mfsr`) plus one absolute branch.
+That agrees with the static census's P1 prediction (4671 / 372,753) to within 3
+functions — the difference is the 3 functions with a mid-function branch target, which
+the census counts as INDIRECT-only but the emitter refuses under strict target
+validation.
+
+**Whole-image emission works.** `sr.py --all --indirect --boundaries outer+calls`
+writes a 33,942,640-byte C file: **4,671 function bodies, 4,671 `sr_dispatch` cases,
+812 `sr_indirect()` sites, 721 `sr_extern()` sites**, and it **skips 70 functions /
+2,054 instructions**. That skip list is not a failure — it is written out with
+`--skiplist` and **it is the host-binding worklist**, the same function-granular
+exclusion N64Recomp's toml provides (`~/gc_refs/N64Recomp/README.md:32`) and the
+mechanism by which a *binary* recomp gets MP4's "never compiled `OSThread.c` in"
+escape without having source to omit.
+
+### Regression: both differentials re-run with indirect dispatch on
+
+| suite | result | wasm md5 | matches |
+|---|---|---|---|
+| 1,056 leaf vectors | **1056 bit-exact / 0 mismatched** | `f14b813694fc243b74c9c85f8fc009fb` | md5 recorded in `e597dfa6` |
+| 7 non-leaf fixtures | **7 PASS / 0 FAIL** (3 SKIP = the fixtures `b401f282` already rejected) | `823eaf6b7a25339fa8f660da74f06f5a` | md5 recorded in `b401f282` |
+
+> **These prove NO REGRESSION, not that indirect dispatch is CORRECT.** None of the
+> four leaf functions and none of the seven non-leaf fixtures executes a `blrl` or a
+> `bctr` — that is *why* they translated cleanly before the flag existed. Correctness
+> of the dispatch itself needs a fixture whose trace actually takes an indirect branch.
+
+## 5c. First performance signal for this path — and its limits
+
+No performance number of any kind had ever been measured for SAB static recomp.
+`perf_fixture.mjs` replays a captured fixture in a matched-pair loop
+(`min` of 7 trials, identical rep counts for run and control) and reports guest
+instructions retired per second.
+
+**The first attempt was wrong and is worth recording.** It restored guest memory with
+one contiguous `[min,max]` copy — but the staged bytes are *sparse*: `0x801113d4`
+stages 84 bytes spread across a **2,401,704-byte span**, so the restore copied 2.4 MB
+per iteration, cost *more* than the run itself, and the subtraction went negative
+(`NaN` corrected figures). The fix is to restore only the bytes the function *writes*,
+to their pre-invocation values — 30–6,316 bytes instead of megabytes.
+
+Corrected, over two independent runs at machine load 11–20:
+
+| fixture | steps | restore control | guest instr/s (corrected), run 1 → run 2 |
+|---|---|---|---|
+| `0x801113d4` | 66 | 26% of run | 410 M → 323 M |
+| `0x801113f4` | 70 | 36% | 435 M → 368 M |
+| `0x80111414` | 58 | 30% | 353 M → 319 M |
+| `0x801115a8` | 62 | 31% | 390 M → 341 M |
+| `0x8012d800` | 1269 | **73%** | 540 M → 561 M |
+| `0x80131010` | 2094 | **69%** | 402 M → 604 M |
+| `0x8013b170` | 63 | **59%** | 974 M → 1268 M |
+
+**Read only the top four.** Where the restore control is a majority of the measured
+time, the corrected figure is a small difference of two large numbers and swings
+50% run-to-run — those rows are reported so the instability is visible, not so they
+can be quoted. The four low-overhead functions land in a **320–440 M guest
+instructions/second** band across both runs.
+
+What that is worth, stated carefully: a 486 MHz Gekko cannot retire more than 486 M
+instructions/second and in practice retires fewer, so **translated SAB code executes
+in the same order of magnitude as the console's own instruction retire rate, on one
+function, in Node, with no system around it.** It is a signal that the *translated
+code* is not obviously the bottleneck. It is **not** a whole-game speed, it is not
+comparable to the JIT's 0.4115x wall-clock figure (that is a whole-system rate on a
+real scene), and it says nothing about interrupts, DMA, the GPU, audio, OS scheduling,
+or cache pressure from the rest of the game. Do not restate it as "Nx the console".
+
 ## 6. The OS-thread / context-switch problem, measured
 
 The brief warned that a binary recomp cannot use MP4's escape (never compiling

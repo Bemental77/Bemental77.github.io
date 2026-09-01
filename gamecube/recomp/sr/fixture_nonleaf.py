@@ -212,6 +212,7 @@ def main():
                       open("/tmp/sr_discover.json", "w"), indent=1)
             return
 
+        fstarts = {lo for lo, _, _ in sr.recover_boundaries(img, syms, 'outer+calls')}
         out = {"game": "GSNE8P", "oracle": "native Dolphin interpreter (CPUCore=0)",
                "gqr": gqr, "fixtures": []}
         for hx in a.capture:
@@ -231,6 +232,13 @@ def main():
                                     for p, w, why in ps1_dependency(fx["stream"])]
             fx["n_calls"] = sum(1 for _, w in fx["stream"]
                                 if ((w >> 26) & 0x3F) == 18 and (w & 1))
+            # WHICH FUNCTIONS THE INVOCATION ACTUALLY ENTERED.  Needed for an INDIRECT
+            # call (blrl / bctr): the callee is chosen at run time, so the static callee
+            # closure does not contain it and an emit set built from the closure alone
+            # would fault in sr_indirect().  The executed PC trace states the answer, so
+            # record the function starts it touched before the trace is discarded.
+            fx["entered"] = sorted({f"{pc:#010x}" for pc, _ in fx["stream"]
+                                    if pc in fstarts})
             del fx["stream"]
             print(f"    steps={fx['steps']} returned={fx['returned']} "
                   f"bl={fx['n_calls']} writes={len(fx['writes'])} "
