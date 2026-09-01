@@ -338,7 +338,25 @@ window.GcRate = (function () {
     ];
     var g = gapText(r);
     if (g) parts.push(g);
-    parts.push(num(r.shown) + ' shown / ' + num(r.published) + ' published');
+    // ★ DROPPED FRAMES BELONG IN THE HEADLINE, NOT IN A TOOLTIP.
+    // A pacing measurement caught this bar reading "60 shown / 60 published ·
+    // 120 REACHED" during a window whose true present rate was 45.2/s. Two things
+    // conspired: the meter samples ONE second, and that second happened to be a
+    // good one (the real per-second series was 46 46 50 49 47 51 51 51 51 49 54
+    // 57 49 50 48 57 60 60 60 60 60 60 59 60 60 60 60 60 45 46 49 46); and
+    // `_rateDropped` — already computed at the tick — was rendered ONLY inside
+    // the hover tooltip. A number that says how well we are doing must not hide
+    // the number that says how badly.
+    // Measured mechanism, so this is a real signal and not noise: over 1499
+    // refreshes the published-per-refresh histogram was {0:93, 1:1321, 2:82,
+    // 3:3} while rAF itself was metronomic (p50 16.68, p99 18.59 ms). The
+    // producer is not phase-locked to vsync and the present tick polls a
+    // SINGLE-SLOT seqlock once per rAF, so 93 refreshes got nothing and 85 got
+    // 2-3 frames of which only one can ever be shown. That is structural loss,
+    // and the user is entitled to see it.
+    var dropped = (typeof r.dropped === 'number' && isFinite(r.dropped)) ? r.dropped : 0;
+    parts.push(num(r.shown) + ' shown / ' + num(r.published) + ' published'
+               + (dropped > 0 ? ' (' + num(dropped) + ' dropped)' : ''));
     return parts.join('  ·  ');
   }
 
@@ -1541,6 +1559,29 @@ window.GcRate = (function () {
     ck('22e a producer faster than the display still cannot paint more than the display refresh',
        fastN.painted <= fastN.rafTicks && fastN.qMaxSeen <= 3 && fastN.qDrops > 0,
        'painted ' + fastN.painted + '/' + fastN.rafTicks + ' rAF, queue drops ' + fastN.qDrops);
+
+    // ── DROPPED FRAMES MUST REACH THE HEADLINE ────────────────────────────────
+    // Pinned because the bar read "60 shown / 60 published · 120 REACHED" during a
+    // window whose real present rate was 45.2/s: `_rateDropped` was computed and
+    // then rendered only in a hover tooltip. Both directions are asserted, because
+    // a field that always shows is as wrong as one that never does.
+    (function () {
+      var withDrops = { speed: 1.0, speedReq: 1, capFps: 60, guestHz: 60, nativeHz: 60,
+                        shown: 45, published: 60, dropped: 15 };
+      var s1 = format(withDrops);
+      ck('22a dropped frames appear in the HEADLINE, not only on hover',
+         s1.indexOf('(15 dropped)') !== -1, s1);
+      var clean = { speed: 1.0, speedReq: 1, capFps: 60, guestHz: 60, nativeHz: 60,
+                    shown: 60, published: 60, dropped: 0 };
+      var s2 = format(clean);
+      ck('22b a clean second says nothing about drops (no permanent scare text)',
+         s2.indexOf('dropped') === -1, s2);
+      var missing = { speed: 1.0, speedReq: 1, capFps: 60, guestHz: 60, nativeHz: 60,
+                      shown: 60, published: 60 };
+      ck('22c an absent dropped field is treated as zero, never as NaN',
+         format(missing).indexOf('NaN') === -1 && format(missing).indexOf('dropped') === -1,
+         format(missing));
+    })();
 
     var summary = 'RATETEST ' + (fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + pass + ' passed, ' + fail + ' failed';
     log(summary);
@@ -5131,6 +5172,10 @@ window.GcRate = (function () {
       Rate.published = pub / dt;
       Rate.shown = _shownCount / dt;
       _rateDropped = Math.max(0, pub - _shownCount);
+      // Publish it so format() can put it in the HEADLINE. It was already computed
+      // here and then shown only on hover, which let the bar claim '120 REACHED'
+      // during a second that dropped frames.
+      Rate.dropped = _rateDropped;
     }
     _shownCount = 0;
     // The JIT path's speed and cap. Read AFTER published is refreshed — the native frame rate
