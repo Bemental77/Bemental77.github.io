@@ -106,8 +106,32 @@ inline constexpr std::uintptr_t kAblBPHitCell = 0x026B3B24u;
 // by ARM C: 208 writeBuffer calls per board frame cost 3.97 ms = 18.9% of the
 // render stage, i.e. ~19 us per call for ~500 bytes — pure call overhead.
 // DEFAULT OFF (SAB is browser-zeroed), so it is an A/B arm, not a behaviour change.
-inline constexpr std::uintptr_t kCoalesceCell = 0x026B3930u;
-inline constexpr std::uintptr_t kCoalesceHitCell = 0x026B3934u;
+// [CELL COLLISION FIX 2026-09-01 — the second one in this header] This was
+// 0x026B3930, which bementalJIT/src/block_cache.cpp already owned as
+// `bem_unwrap_on`, the IMPORT-UNWRAP GATE (e14f728, 19.5h earlier). That gate is
+// DEFAULT OFF for a specific reason: e14f728 measured the unwrap HARD-WEDGING PSO
+// 5/7 ("treatment wedges after FOUR presses") and gated it off until the race is
+// found. So arming this coalescing A/B ALSO armed the known PSO wedge cause — and
+// re-arming the unwrap for measurement silently turned coalescing on, voiding that
+// A/B in both directions. Both commits' comments claim "repo-wide grep shows no
+// other use"; both were wrong about the other. Moved to the free tail.
+inline constexpr std::uintptr_t kCoalesceCell = 0x026B3BE0u;
+inline constexpr std::uintptr_t kCoalesceHitCell = 0x026B3934u;  // uncontested; left in place
+
+// ---- externally-owned cells this header must never reuse --------------------
+// Compile-time guard for the collision class above: these addresses belong to
+// other subsystems, and reusing one silently changes THEIR behaviour.
+inline constexpr std::uintptr_t kForeign_FifoBrakeKill = 0x026B3B20u;  // CommandProcessor.cpp
+inline constexpr std::uintptr_t kForeign_ImportUnwrap  = 0x026B3930u;  // block_cache.cpp
+static_assert(kEnableCell != kForeign_FifoBrakeKill &&
+              kEnableCell != kForeign_ImportUnwrap,
+              "BemStage::kEnableCell collides with a foreign gate");
+static_assert(kCoalesceCell != kForeign_FifoBrakeKill &&
+              kCoalesceCell != kForeign_ImportUnwrap,
+              "BemStage::kCoalesceCell collides with a foreign gate");
+static_assert(kCoalesceHitCell != kForeign_FifoBrakeKill &&
+              kCoalesceHitCell != kForeign_ImportUnwrap,
+              "BemStage::kCoalesceHitCell collides with a foreign gate");
 // [why the coalescing lever nulled] Always-on census: WGPUGfx::SubmitFrame calls
 // (0x026B3938) and total bytes handed to wgpuQueueWriteBuffer for the vertex+index
 // rings (0x026B393C). If submits/frame is ~= batches/frame, coalescing collapses
