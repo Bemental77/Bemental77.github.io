@@ -198,6 +198,8 @@ def main():
                     help='bytes per GDB read during the scan; the stub rejects a single '
                          'read of 0x2000, so this stays below that')
     ap.add_argument('--scan-lo', help='override the scan window start (hex)')
+    ap.add_argument('--anchor', type=lambda x: int(x, 0),
+                    help='hot DOL PC to advance the boot on (default OSDisableInterrupts)')
     a = ap.parse_args()
 
     disc = R.Disc(a.iso)
@@ -310,17 +312,32 @@ def main():
         t0 = time.time()
         tries = 0
         boot = a.boot_advance
-        print(f"[base] advancing the boot for {boot:.0f}s with {len(probes)} probes "
-              f"armed and NO scanning ...", flush=True)
+        # ADVANCING THE BOOT IS ALL ABOUT NOT LEAVING THE CPU HALTED.
+        # GDB.cont() "blocks until a breakpoint hits (no async break exists)" and
+        # GDB.resync() ends by calling pc(), which needs a HALTED cpu.  Pairing a long
+        # cont timeout with a resync therefore stalls: a probe fires, Dolphin halts the
+        # CPU and waits for the client, and the client is sitting in a 30 s timeout.
+        # Measured cost of that shape: 1.5 s of emulated time in 600 s = 0.0025x,
+        # against 0.0328x for a loop that answers each stop immediately.
+        # So: arm ONE hot anchor, keep the timeout short, and re-continue at once.
+        for tgt, _ in probes:
+            g.del_bp(tgt)
+        anchor = a.anchor if a.anchor else 0x800e78ac   # OSDisableInterrupts, 212 callers
+        g.add_bp(anchor)
+        print(f"[base] advancing the boot for {boot:.0f}s on a single hot anchor "
+              f"{anchor:#010x} (stops are answered immediately) ...", flush=True)
+        last = t0
         while time.time() - t0 < boot:
             try:
-                g.cont(timeout=max(5.0, min(30.0, boot - (time.time() - t0))))
-                g.resync()
+                g.cont(timeout=8.0)
                 tries += 1
             except Exception:
                 g.resync()
-        for tgt, _ in probes:
-            g.del_bp(tgt)
+            if time.time() - last >= 120.0:
+                last = time.time()
+                print(f"[base]   t+{time.time() - t0:.0f}s  {tries} stops", flush=True)
+        g.del_bp(anchor)
+        g.resync()
         print(f"[base] boot advanced: {tries} stops in {time.time() - t0:.0f}s")
 
         # The arena RELs are allocated from starts above the DOL's BSS end, so there is
