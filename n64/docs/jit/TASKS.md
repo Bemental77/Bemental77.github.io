@@ -604,10 +604,26 @@ same wasm type and join immediately.
         dk64         1216     10223         1788          0
 
 - [x] `n64/index.html`'s `__jitStats()` copies fields EXPLICITLY, so it did not
-      surface `nativeFPCvt` and the first differential round could not prove
+      surface `nativeFPCvt` and the differential round above could not prove
       the new path had fired at all — the exact wave-10a trap, caught here by
       looking for the counter rather than trusting the PASS. `nativeFPCvt` is
-      now surfaced and the liveness figure re-measured.
+      now surfaced (index.html:2265).
+- [ ] **LIVENESS COUNTER NOT YET CAPTURED — the one gate wave 11a is missing.**
+      The re-run to read `nativeFPCvt` off a live ROM was queued through
+      `probe_lock.sh` and **timed out after 2400 s without ever acquiring the
+      lock** (11-12 sibling agents queued; the lock is an unfair `mkdir` spin,
+      so a waiter can starve indefinitely). It correctly refused to steal a
+      live lock. What stands in its place is an INFERENCE, not a measurement:
+      this file's own census already records these exact opcodes EXECUTING in
+      these ROMs (sm64 TRUNC.W.S 23.7%, oot CVT.S.W 7.3%, dk64 FPcvt 42.3% of
+      fallbacks), and the unit corpus proves the emitter emits them — so they
+      should now be native. **That is a two-step argument, not the single
+      direct observation wave 10a insisted on. Re-run
+      `node tools/n64_jit_diff_test.mjs dk64.z64 600` and read `nativeFPCvt`
+      before treating wave 11a as fully gated.**
+      Worth fixing at the rig level too: the lock has no queue fairness, and a
+      waiter that loses ~12 races in a row starves while the box sits at load
+      0.5-1.0.
 
 ## Action #1 EXECUTED — waves 8/9/10a priced on a quiet box (2026-09-01)
 
@@ -673,6 +689,34 @@ only a dead owner's lock, releases on every exit path, and — the part the bare
 `mkdir` lock lacked — **waits for 1-minute load to fall below 12 before
 returning**, because sibling BUILDS never took the lock and holding it does not
 by itself make the box quiet.
+
+## `n64_page_test.mjs` rafdedupe — NOT SETTLED (2026-09-01)
+
+Raised because a loaded box read the `rafdedupe` section RED: `shown` moved
+**58.86/s -> 42.58/s (0.723x)** when only the number of rAF CALLBACKS changed,
+against a 0.9-1.1 band, while an earlier run on the same box read 0.958.
+
+**Not settled empirically** — the re-run was queued through `probe_lock.sh` and
+never got lock time (see the liveness note above; 11-12 agents queued).
+
+What CAN be said without a run, from the test's own construction
+(`tools/n64_page_test.mjs:393-447`): **the direction is wrong for the bug this
+test exists to catch.** That bug INFLATES `shown` — `rafTicks++` sat above the
+`t !== lastPaceT` dedupe, so it counted callbacks and every extra rAF loop
+MULTIPLIED the number (measured 60 -> 180 with three loops before the fix). A
+reading of **0.723x is a DECREASE**, which the dedupe bug cannot produce. The
+arm adds two self-perpetuating rAF loops, which is real per-frame work, so a
+decrease is what contention on a busy box would look like: the compositor
+misses frames and `shown`, which is bounded by actual animation frames, falls.
+
+So the hypothesis "contention, not a regression" is mechanically consistent —
+but it is an argument, not a measurement, and the band is two-sided (0.9-1.1),
+so a genuine drop would also fail it. **Re-run `node tools/n64_page_test.mjs`
+on a quiet box and read `rafdedupe.inflation`.** If it lands in 0.9-1.1 it was
+contention; if it reproduces near 0.72 with load < 2, it is a real pacing bug.
+Consider also making the assertion tolerate a downward move under load, or
+recording load alongside `inflation`, so this question does not have to be
+re-litigated every time the box is busy.
 
 ## Campaign state (2026-08-29)
 M0-M2 COMPLETE through wave 10a. The JIT is correctness-proven on the ROMs
