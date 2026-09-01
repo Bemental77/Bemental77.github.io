@@ -285,6 +285,68 @@ comparable to the JIT's 0.4115x wall-clock figure (that is a whole-system rate o
 real scene), and it says nothing about interrupts, DMA, the GPU, audio, OS scheduling,
 or cache pressure from the rest of the game. Do not restate it as "Nx the console".
 
+## 5d. The overlay differential, and a savestate blocker worth recording
+
+`fixture_rel.py` recovers an overlay's **runtime** base without scanning memory and
+without a symbol. The overlay calls into the static DOL through `R_PPC_REL24`
+relocations with `imp->id == 0`, and `OSLink.c:139-142` sets `offset = 0` for those, so
+the addend is an **absolute DOL address known from the file**. Breakpoint one; on the
+hit, LR is one instruction past the calling `bl`, i.e. a live address *inside* the
+overlay; the relocation table names which `(section, offset)` sites call that target,
+so `base = (LR - 4) - site_off`, confirmed by byte-comparing live memory at offsets
+that carry **no** relocation. stg13D offers 400 distinct DOL targets, many with exactly
+one call site, so the candidate is unambiguous.
+
+Two defects the first run surfaced, both now fixed and both worth knowing:
+
+1. **A breakpointed DOL function is called from the DOL far more often than from an
+   overlay.** The first hit was `0x800c3cd8` with `lr=0x800d2d28` — a DOL-internal
+   caller — and `(LR-4) − site_off` from it is nonsense. The LR must be filtered
+   against the DOL's own TEXT extents (read from the header, `0x80003100..0x80005500`
+   and `0x80005500..0x80173140`).
+2. **`~/Library/.../StateSaves/GSNE8P.s01` COLD-BOOTS.** The oracle connected at
+   `pc=0x80003140`, which is the DOL's entry point straight out of the header. This
+   is not new — `b401f282:105` already recorded "the one at
+   `~/Library/.../StateSaves/GSNE8P.s01` resumes at PC 0x80003140" — and this run
+   reproduced it. `fixture_rel.py` now warns explicitly when the connect PC is the
+   entry point, because a state that fails to restore leaves everything downstream
+   looking plausible.
+
+### ⛔ The in-tree City Escape savestate cannot be used with this oracle
+
+`gamecube/states/sab-citye-gameplay.gcs.gz` is the *port's* raw `State::DoState` buffer
+and `gamecube/tools/gcs_to_dolphin_sav.py` wraps it in Dolphin's on-disk header. It
+cannot be loaded by the native oracle, for a reason no amount of retrying fixes:
+
+| | STATE_VERSION | source |
+|---|---|---|
+| the port (`gamecube/dolphin-src`) | **177** | `Source/Core/Core/State.cpp:98` |
+| the oracle (`~/gc_refs/dolphin-upstream`) | **189** | `Source/Core/Core/State.cpp:98` |
+
+`State.cpp:723` rejects a mismatched version outright, and forging the cookie would
+only make it deserialize a different binary layout. The converter's own header also
+records that a native **dolphin-src** build SIGSEGVs on the restored state because the
+port hardcodes wasm SAB absolute addresses across ~13 HW/video files not gated on
+`__EMSCRIPTEN__`. So both routes to a City-Escape-specific oracle are blocked today.
+
+**This does not block the overlay differential.** The claim to close is "no `.rel`
+overlay function has ever been differentially verified" — *any* overlay closes it, and
+`titleD.rel` (id=1, 24,148 bytes / 6,037 instructions) and `advertiseD.rel` (id=91)
+are reached from a cold boot with no savestate at all.
+
+### Relocations are applied by reading the machine, not by re-implementing OSLink
+
+The shipped REL bytes are **not** what executes: `Relocate()`
+(`~/gc_refs/dolsdk2001/src/os/OSLink.c:146-200`) patches the image in place — `ADDR32`
+writes a word, `ADDR16_HA/LO/HI` rewrite the low half of a `lis`/`addi` pair, `REL24`
+rewrites a branch displacement. `rel.py:147 section_bytes()` returns the raw file
+bytes, so translating them would bake **placeholder constants** into every address
+materialisation. Rather than re-implement `Relocate()` — which would then require
+discovering the runtime base of every *data* section it references — `fixture_rel.py`
+reads the relocated section back out of the live machine and reports how many words
+differ from the file. The base confirmation has already proved it is the right image,
+so those bytes are ground truth.
+
 ## 6. The OS-thread / context-switch problem, measured
 
 The brief warned that a binary recomp cannot use MP4's escape (never compiling

@@ -33,7 +33,7 @@ import argparse, json, os, struct, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    '..', '..'))
+                                    '..', '..', '..'))
 sys.path.insert(0, os.path.join(REPO, 'gamecube', 'tools'))
 import rel as R                       # noqa: E402
 import sr                             # noqa: E402
@@ -43,6 +43,23 @@ from fixture_nonleaf import read_gqrs, ps1_dependency, ORACLE_BIN   # noqa: E402
 PORT = int(os.environ.get("GDB_PORT", "9133"))
 OUT = os.environ.get("OUT", "/tmp/sr_rel_fixtures.json")
 MEM1_LO, MEM1_HI = 0x80000000, 0x81800000
+
+
+def dol_text_ranges(iso_path):
+    """[(lo, hi)] of the DOL's TEXT sections, read from the header at ISO 0x420.
+
+    Needed because a breakpointed DOL function is called from the DOL far more often
+    than from an overlay: without this filter the first hits are DOL-internal callers
+    whose LR is a DOL address, and (LR-4)-site_off is then nonsense."""
+    f = open(iso_path, 'rb')
+    f.seek(0x420)
+    dol_off = struct.unpack('>I', f.read(4))[0]
+    f.seek(dol_off)
+    dh = f.read(0x100)
+    tad = struct.unpack('>7I', dh[0x48:0x64])
+    tsz = struct.unpack('>7I', dh[0x90:0xac])
+    f.close()
+    return [(tad[i], tad[i] + tsz[i]) for i in range(7) if tsz[i]]
 
 
 def dol_call_sites(rel):
@@ -116,6 +133,9 @@ def main():
           f"{len(blob)} bytes ({len(blob)//4} instructions)")
     print(f"[rel] {len(sites)} distinct DOL call targets, "
           f"{sum(len(v) for v in sites.values())} REL24 sites")
+    textr = dol_text_ranges(a.iso)
+    print("[rel] DOL text (LR in these ranges = a DOL-internal caller, skipped): "
+          + ", ".join(f"{lo:#x}..{hi:#x}" for lo, hi in textr))
 
     # Probe targets: fewest call sites first, so (LR-4)-off has the fewest candidates.
     probes = sorted(sites.items(), key=lambda kv: len(kv[1]))[:a.probe_targets]
@@ -130,7 +150,14 @@ def main():
     base = None
     try:
         g = dol.connect()
-        print(f"[oracle] connected; pc={g.pc():#010x}")
+        pc0 = g.pc()
+        print(f"[oracle] connected; pc={pc0:#010x}")
+        # A savestate that fails to restore SILENTLY COLD-BOOTS and everything
+        # downstream still looks plausible.  The DOL entry point is the tell.
+        if pc0 == 0x80003140:
+            print("[oracle] WARNING: pc is the DOL ENTRY POINT — this is a COLD BOOT, "
+                  "not a restored scene.  Overlays load only once the game reaches "
+                  "the point that OSLinks them.")
 
         # ---------------------------------------------------------- base recovery
         for tgt, _ in probes:
@@ -148,9 +175,11 @@ def main():
             tries += 1
             if pc not in sites:
                 continue
-            lr = g.reg(67)
+            lr = g.reg(67)                       # native_oracle_gdb.py:41 -> 67 = LR
             if not (MEM1_LO <= lr < MEM1_HI):
                 continue
+            if any(lo <= lr < hi for lo, hi in textr):
+                continue                          # DOL-internal caller, not the overlay
             call_pc = (lr - 4) & 0xFFFFFFFF
             for (ssec, soff) in sites[pc]:
                 if ssec != sec:
@@ -176,6 +205,29 @@ def main():
                       open(OUT, "w"), indent=1)
             print(f"[base] wrote {OUT}")
             return
+
+        # ------------------------------------------ LIVE, RELOCATED SECTION BYTES
+        # The shipped REL bytes are NOT what executes.  OSLink's Relocate()
+        # (~/gc_refs/dolsdk2001/src/os/OSLink.c:146-200) PATCHES the image in place:
+        # ADDR32 writes a word, ADDR16_HA/LO/HI rewrite the low half of a lis/addi
+        # pair, REL24 rewrites a branch displacement.  Translating the file bytes
+        # would therefore bake PLACEHOLDER constants into every address
+        # materialisation.  Rather than re-implement Relocate() and then have to
+        # discover the runtime base of every DATA section it references, read the
+        # relocated section back out of the machine: that is ground truth, and the
+        # base confirmation above already proved we are looking at the right image.
+        print(f"[live] reading {len(blob)} relocated bytes from {base:#010x} ...",
+              flush=True)
+        live = g.read_range(base, base + len(blob))
+        if len(live) != len(blob):
+            print(f"[live] short read: {len(live)} of {len(blob)}", file=sys.stderr)
+            sys.exit(5)
+        live_path = os.path.splitext(OUT)[0] + f".{a.rel}.sec{sec}.bin"
+        open(live_path, "wb").write(live)
+        diff = sum(1 for i in range(0, len(blob), 4)
+                   if live[i:i + 4] != blob[i:i + 4])
+        print(f"[live] wrote {live_path}  ({diff} of {len(blob)//4} words differ from "
+              f"the shipped file = the OSLink patches)")
 
         # ------------------------------------------------- which entries execute
         res = R.translate_module_reach(rel)
@@ -214,6 +266,7 @@ def main():
         out = {"game": "GSNE8P",
                "oracle": "native Dolphin interpreter (CPUCore=0)",
                "rel": a.rel, "rel_sec": sec, "rel_base": base,
+               "live_section": live_path, "live_words_patched": diff,
                "capture": "gamecube/recomp/sr/fixture_rel.py",
                "fixtures": []}
         taken = 0
