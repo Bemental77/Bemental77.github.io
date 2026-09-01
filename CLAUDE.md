@@ -185,6 +185,16 @@ node tools/jsearch.js <file> --extract <name>  # extract a named function/var bl
 - GameCube changes commit to the `dev` branch (current active branch). The standalone `gamecube` branch is stale (pre-emulator era) — do not use it.
 - Do not commit `node_modules`, `.env`, `config.js`, `send.email.ts`, `*.jsdos`, `*.zip`, ROM `.iso` files, or `emsdk` artifacts beyond what is already tracked. (`.gitignore` covers `.iso` per-directory, e.g. `dreamcast/roms/` — there is no root `*.iso` pattern, so check before staging.)
 - Large generated files (vendored emulator binaries, split ROM parts) are tracked intentionally — don't "clean them up."
+- **CHECK THE TRACKED-FILE COUNT BEFORE EVERY COMMIT: `git ls-files | wc -l` is 7852.** Paid for 2026-09-01: a commit went out whose tree contained ONE file — the index had silently collapsed to a single entry — recording 7,851 tracked files as deleted, and it was pushed. `git status` showed only `M gamecube.html`, so nothing warned. No data was lost (all 219,579 files stayed on disk; the damage was index-only), but the recovery is expensive for a reason worth knowing:
+  - **A near-empty commit at a branch tip POISONS every subsequent push to the WHOLE REPO.** git's object exclusion walks from the tips the server advertises; when a tip's tree holds one file, excluding it excludes almost nothing. Measured: `rev-list --objects <new> --not <prod>` = 8 objects, but adding the one-file tip to the exclusion set = 8,253 objects / **6.35 GiB**, which GitHub rejects with `HTTP 400`. Reproduced on git 2.24 AND 2.55, so it is not a version bug. Pushes to `prod` are blocked too, not just `dev` — i.e. **deployment stops until that ref is moved**, and moving it requires a force-push.
+  - Repair forward if you can (`git reset --soft <bad>` then commit the good tree) — but note the forward commit is exactly the 6.35 GiB push described above, so in practice the branch ref has to move.
+  - Concurrent agents share this working tree and have committed each other's uncommitted work before. Treat the index as shared state.
+
+### Before any measured run (not optional)
+```bash
+node tools/browser_leak_guard.js reap && uptime
+```
+Orphaned Chromes from SIGKILLed harnesses — two with 832 and 815 CPU-MINUTES accumulated, together **230.3% of CPU** — were resident for days and were the largest single source of the "machine load" that voided whole campaigns of matched pairs. A SIGKILLed parent ORPHANS its browser and no in-process handler can prevent it, which is why this accumulated silently. Every `puppeteer.launch` site in every harness is now registered; `reap` kills only browsers whose OWNER process is gone, so it never touches a live sibling run or the user's own browser. **When several agents share the box, serialize probes with a lock** (`mkdir /tmp/bemental-probe.lock`, release in all paths) — a parallel campaign previously drove this machine to load 83.93, at which point every number in flight is uninterpretable.
 
 ## Claude harness enforcement (`.claude/`)
 
