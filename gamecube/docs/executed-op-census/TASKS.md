@@ -91,9 +91,10 @@ TEST_TIMEOUT_MS=2400000 node gamecube/bementalJIT/tests/run_browser_test.mjs \
   test_gekko_next gamecube/bementalJIT/build-emcc-test
 ```
 
-Measured 2026-09-01: the 90 s default yielded **3** `[PASS]` lines; 900 s yielded
-**134** `[PASS]`, 0 `[FAIL]`, 10,859 console lines, and still timed out inside
-`[wasmdump IDCT_nospec]`.
+Measured 2026-09-01, one workload, three budgets: the 90 s default yielded **3**
+`[PASS]` lines; 900 s yielded **134** `[PASS]`, 0 `[FAIL]`, 10,859 console lines,
+and still timed out inside `[wasmdump IDCT_nospec]`; **2400 s completed with
+`TOTAL: 169 passed, 0 failed`** in 11,124 lines. Only the third is a result.
 
 **The trap, and its fix.** `run_browser_test.mjs` used to decide the verdict as
 "FAIL if any `[FAIL]`, else **PASS if any `[PASS]`**, else INCONCLUSIVE" — it
@@ -348,16 +349,14 @@ being decided.
   neither has a measured fps/speed delta. The probe lock was held by a sibling
   for the entire session and the box ran at load 6.8-38.6, above the ~25 at which
   gate #10 voids a pair anyway.
-- The emitter suite is only PARTIALLY run. `test_simd_bswap` completed honestly:
-  **`TOTAL: 8 passed, 0 failed`** — and it is the suite that most directly covers
-  the store paths Lever 2 touches (psq_l/psq_st/lfd/stfd fastmem arms).
-  `test_gekko_next` reached **134 `[PASS]`, 0 `[FAIL]` of its 171 registered
-  cases** before timing out inside the wasm hex dump at a 900 s budget; a 2400 s
-  re-run is the way to close it (see the timeout note above). ZERO failures in
-  anything that ran. Also verified: all 276 emitted modules validate under
-  `wasm-validate --enable-all` on both arms, and a differential disassembly of
-  0x80117e0c confirms the diet's terminal is exactly the intended transformation.
-  None of that is a substitute for a complete 171/171.
+- (RESOLVED) The emitter suite now passes COMPLETE, on a quiet box at a 2400 s
+  budget: `test_gekko_next` **`TOTAL: 169 passed, 0 failed`** and
+  `test_simd_bswap` **`TOTAL: 8 passed, 0 failed`**. The 169/0 figure is
+  identical to the pre-change baseline commit `dd6759fb` recorded, so both
+  levers land on an unchanged suite result. Also verified: all 276 emitted
+  modules validate under `wasm-validate --enable-all` on both arms, and a
+  differential disassembly of 0x80117e0c confirms the diet's terminal is exactly
+  the intended transformation.
 - No attempt at the internal-table / region re-enable — see correction (c). It is
   not a flag flip and the box could not support the matched pair it needs.
 - No change to the `[a]` downcount predicate, the vector guard's semantics, the
