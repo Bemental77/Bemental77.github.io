@@ -29,7 +29,7 @@ BASE RECOVERY, without scanning and without a symbol:
   relocation and byte-comparing against the shipped section.  Nothing is guessed: the
   arithmetic comes from the file and the confirmation comes from the machine.
 """
-import argparse, json, os, struct, sys, time
+import argparse, collections, json, os, struct, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -160,6 +160,11 @@ def main():
     ap.add_argument('--dol', default='/tmp/sr_sab/main.dol',
                     help='extracted main.dol, for the DOL-internal call graph')
     ap.add_argument('--locate-only', action='store_true')
+    ap.add_argument('--selftest', action='store_true',
+                    help='exercise every offline step (REL parse, DOL call graph, probe '
+                         'scoring, signature choice) WITHOUT launching Dolphin. Run this '
+                         'before taking the probe lock: two locked runs have already been '
+                         'lost to a bad import path and a missing module import.')
     ap.add_argument('--capture-n', type=int, default=3)
     ap.add_argument('--budget', type=float, default=120.0,
                     help='seconds for BASE RECOVERY.  Size it in EMULATED time: the '
@@ -231,6 +236,21 @@ def main():
         print(f"       {t_:#010x}  overlay sites={len(v_):4d}  DOL callers="
               f"{dol_callers.get(t_, 0):4d}  score="
               f"{len(v_) / (1.0 + dol_callers.get(t_, 0)):.1f}")
+
+    if a.selftest:
+        print(f"[selftest] probes ranked, top 3:")
+        for t_, v_ in probes[:3]:
+            print(f"    {t_:#010x} overlay={len(v_)} dol={dol_callers.get(t_, 0)}")
+        so_, sg_ = pick_signature(blob, reloc_offs)
+        assert sg_ is not None, "no relocation-free signature"
+        assert blob.count(sg_) == 1, f"signature not unique ({blob.count(sg_)} hits)"
+        print(f"[selftest] signature +{so_:#x} {len(sg_)}B, unique in section")
+        print(f"[selftest] DOL text ranges: {[(hex(a_), hex(b_)) for a_, b_ in textr]}")
+        res_ = R.translate_module_reach(rel)
+        n_ = len({off for (s_, off) in res_['entries'] if s_ == sec})
+        print(f"[selftest] {n_} overlay entries discovered")
+        print("[selftest] OK — every offline path runs; safe to take the lock")
+        return
 
     osyms = O.load_map(a.map)
     dol = O.Dolphin(iso=a.iso, state=a.state, port=PORT,
