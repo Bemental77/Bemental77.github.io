@@ -153,6 +153,8 @@ delta.
 
 276/276 modules `wasm-validate --enable-all` clean on both arms.
 
+**Speed effect: UNMEASURED, with a null prior — see correction (b) below.**
+
 ### 2. Write-gather-pipe const-EA carve-out (`jit_load_store.cpp`)
 
 WPAR (`0xCC008000`) sits inside the `0xCC000000..0xCC03FFFF` const-MMIO window,
@@ -227,10 +229,78 @@ win is the crossing, not the ops. Its runtime effect is **UNMEASURED**.
   says why it matters: SAB's frame-governor loop is three blocks of 1, 2 and 6
   guest instructions, paying three full terminals per iteration.
 
+## Corrections received 2026-09-01, and what they do to the two levers
+
+**(a) The "[13] is 68% of CPU" premise is retracted.** Splitting `[13]` nodes by
+`callFrame.url` across four existing `.cpuprofile` files measured 38.04 / 47.07 /
+48.89 / 51.51% self-time, and the 68%/49-50% figures could not be reproduced.
+Nothing in this topic rests on it — every number here is a share *within* emitted
+code, which is unaffected — but it does bound the whole-thread payoff: a 20%
+cut to the terminal is 20% of the fixed slice of a 38-52% bucket, not of the
+thread.
+
+**(b) OP-COUNT LEVERS HAVE A NULL PRIOR IN THIS TREE, AND THE EDGE DIET IS ONE.**
+Stripping the byte-swap entirely measured FLAT in the cycle ledger, and the SIMD
+replacement — a proven −887 emitted ops — matched-paired at **0.994x, i.e. no
+measurable speed difference**. That is the strongest available prior on exactly
+the class of change Lever 1 is. So: **Lever 1's −8 ops/edge is a proven code-size
+and executed-op reduction and an UNMEASURED speed change, against a prior that
+says such changes have not moved speed here.** Do not quote it as a speedup. The
+one structural difference from the bswap case — it deletes a memory load
+(`ctx.MSR`) and shortens the per-edge dependency chain, rather than swapping ALU
+for ALU — is a hypothesis, not evidence.
+
+**Lever 2 is NOT in that class** and should not inherit the null prior: it
+removes 43 cross-instance host-call sites, and the same profile split puts the
+JS/wasm boundary at 13.5-22.7% — larger than `bem_chain_loop_c` (5.1-14.5%) in
+all four profiles. It is still unmeasured, but it attacks a bigger and different
+bucket.
+
+**(c) The imported-table lever — real, but entangled, and NOT a flag flip.**
+`block_cache.h:17-20` states the rule verbatim: "V8's speculative inlining
+requires the call_indirect target to live in the same instance's table, so the
+table MUST NOT be imported." The shipping per-block path violates it at
+`ppc_emit.cpp:2001` (`emitImportTable("env","__indirect_function_table")`).
+
+But an internal table can only hold functions from its own module, and the
+shipping shape is **one block per module** (`block_cache.cpp:422`, `:623`) — so
+an internal table would contain only the block itself and could serve nothing but
+self-edges, which already use a DIRECT `return_call` and need no table. **The
+compliant shape is therefore inseparable from multi-block modules, i.e. from
+region promotion** — and that is gated at `block_cache.cpp:233` by
+`g_bem_promote_enabled = 0`, which carries THREE recorded net-negative
+measurements in the comment block at `:205-232`:
+
+- 2026-06-21: OFF — region hit ~5%, per-miss membrane tax (coverage wall).
+- 2026-07-13: Party-Mode lobby A/B — ON 13.3fps vs OFF 14.5fps, **~−8%**.
+- 2026-08-20: board page-fps A/B — **OFF +36% vs ON** (peFrames 1814 vs 1337),
+  confirmed in the user's real Chrome. Dispatch self-time 18.7% ON → 8.8% OFF.
+
+So the inlining argument explains *why the region shape ought to win*; it does
+not overturn three measurements showing it loses **as currently selected**. The
+in-tree verdict names the blocker as promotion SELECTION, not locality — and the
+2026-07-15 census (`:219-226`: board top-512 = 77.8%, top-2048 = 97.9%)
+independently reproduced by the profile split (top-512 = 76.7-96.2% of `[13]`
+self-time) says the locality to exploit is genuinely there. **The unblocking work
+is a coverage/selection redesign — promote by measured execution count rather
+than chain-head arrival — not flipping `:233`.** Note the circularity to break
+first: the per-PC execution counters that would drive a better selection
+(`g_bem_pc_exec`, `ppc_emit.cpp:1035`) are themselves gated behind the very flag
+being decided.
+
 ## What this topic did NOT do
 
 - No runtime matched pair. Both levers are sized in OPS and in HOST CALLS only;
-  neither has a measured fps/speed delta. The box was at load 6.8-17 with the
-  probe lock held by a sibling for the whole session.
+  neither has a measured fps/speed delta. The probe lock was held by a sibling
+  for the entire session and the box ran at load 6.8-38.6, above the ~25 at which
+  gate #10 voids a pair anyway.
+- The emitter test suite (`bash gamecube/bementalJIT/run_tests.sh test_gekko_next
+  test_simd_bswap`) was queued behind the lock and did NOT run. Structural
+  verification that DID run: all 276 emitted modules validate under
+  `wasm-validate --enable-all` on both arms, and a differential disassembly of
+  0x80117e0c confirms the diet's emitted terminal is exactly the intended
+  transformation. That is not a substitute for the 169-case suite.
+- No attempt at the internal-table / region re-enable — see correction (c). It is
+  not a flag flip and the box could not support the matched pair it needs.
 - No change to the `[a]` downcount predicate, the vector guard's semantics, the
   `slot >= 0` check, or anything in `ppc_analyst.cpp`.
