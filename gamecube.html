@@ -7571,6 +7571,10 @@ window.GcRate = (function () {
     cardSay(card ? 'restoring ' + (card.byteLength / 1048576).toFixed(1) + ' MB' : 'none saved yet');
     var bootTransfer = parts.concat([fst]);
     if (card) bootTransfer.push(card);
+    var rbRaw = q.get('recompbuild') || '';
+    var recompBuildDir = /^[A-Za-z0-9_-]+$/.test(rbRaw) ? rbRaw + '/' : '';
+    if (rbRaw && !recompBuildDir) console.log('[recomp] ignoring malformed ?recompbuild= (letters, digits, _ and - only)');
+    else if (recompBuildDir) console.log('[recomp] CANDIDATE build /gamecube/recomp/' + recompBuildDir + ' — NOT the shipped pair');
     rw.postMessage({ cmd: 'boot', parts: parts, fst: fst, pace: pace, card: card,
                      stage: stageSab,
                      autoboard: q.get('board') === '1',
@@ -7583,8 +7587,14 @@ window.GcRate = (function () {
                      // without the parameter; see the AUDIO note in recomp_worker.js.
                      audioTest: q.get('audiotest') === '1',
                      xfShadowAll: q.get('xfregonly') === '1' ? false : true,
-                     glueUrl: '/gamecube/recomp/mp4_game.js',
-                     wasmUrl: '/gamecube/recomp/mp4_game.wasm' }, bootTransfer);
+                     // ?recompbuild=<dir> — boot a CANDIDATE recomp build out of
+                     // /gamecube/recomp/<dir>/ instead of the shipped pair. This exists so a
+                     // new mp4_game.wasm can be measured on the real page BEFORE it replaces
+                     // the shipped one (the recomp link is not byte-reproducible, so "just
+                     // swap it back" is not a clean undo). Restricted to [A-Za-z0-9_-] so the
+                     // parameter cannot walk out of the recomp directory.
+                     glueUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.js',
+                     wasmUrl: '/gamecube/recomp/' + recompBuildDir + 'mp4_game.wasm' }, bootTransfer);
     bootSent = true;    // from here on, Save/Load/Export belong to THIS worker, not dolphin
     requestAnimationFrame(grantLoop);
   }

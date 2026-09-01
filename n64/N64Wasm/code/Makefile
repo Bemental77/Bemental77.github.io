@@ -177,6 +177,18 @@ MYFLAGS   := \
 
 all: n64wasm.js
 
+# EXPORTED_RUNTIME_METHODS below: FS and every HEAP view MUST be listed
+# explicitly. Emscripten <= 3.1.x attached them to Module unconditionally;
+# 6.0.2 attaches a heap view only when it is exported (maybeExportHeap,
+# emsdk/upstream/emscripten/src/runtime_common.js:164-171), and the same for FS.
+# Omit them and the pages die with "Cannot read properties of undefined
+# (reading 'buffer')" -- n64/index.html:2102 reads Module.HEAP16.buffer, and
+# dist/script.js:618,679,907,927,981 call FS.readFile/FS.writeFile.
+# The list is a SUPERSET of what the shipped 3.1.67 n64wasm.js exposed (diffed
+# property-by-property), so nothing that worked before can regress.
+# calledRun is NOT recoverable this way: 6.0.2 guards it behind #if ASSERTIONS
+# and never assigns it to Module (src/postamble.js:117-120). Anything gating on
+# Module.calledRun must be changed instead -- see tools/n64_boot_test.mjs.
 n64wasm.js: $(FILES)
 	emcc -o $@ $(FILES) -s USE_SDL=2 -s USE_SDL_TTF=2 \
     -s USE_ZLIB=1 \
@@ -190,7 +202,7 @@ n64wasm.js: $(FILES)
 	-O3 \
 	-s EXIT_RUNTIME=0 \
 	-s ALLOW_TABLE_GROWTH=1 \
-	-s EXPORTED_RUNTIME_METHODS="['callMain','cwrap','addFunction','removeFunction','wasmTable','wasmMemory']" \
+	-s EXPORTED_RUNTIME_METHODS="['callMain','cwrap','addFunction','removeFunction','wasmTable','wasmMemory','FS','HEAP8','HEAP16','HEAPU8','HEAPU16','HEAP32','HEAPU32','HEAPF32','HEAPF64']" \
     -s EXPORTED_FUNCTIONS="['_main','_runMainLoop','_neilGetSoundBufferResampledAddress', \
     '_neilGetAudioWritePosition','_neil_serialize','_neil_unserialize','_neil_toast_message', \
     '_neil_export_eep','_neil_export_sra','_neil_export_fla','_neil_reset','_toggleFPS', '_neil_send_mobile_controls', \
