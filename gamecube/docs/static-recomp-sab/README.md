@@ -192,10 +192,29 @@ functions — the difference is the 3 functions with a mid-function branch targe
 the census counts as INDIRECT-only but the emitter refuses under strict target
 validation.
 
-**Whole-image emission works.** `sr.py --all --indirect --boundaries outer+calls`
-writes a 33,942,640-byte C file: **4,671 function bodies, 4,671 `sr_dispatch` cases,
-812 `sr_indirect()` sites, 721 `sr_extern()` sites**, and it **skips 70 functions /
-2,054 instructions**. That skip list is not a failure — it is written out with
+**Whole-image emission works, and it LINKS.** `sr.py --all --indirect --boundaries
+outer+calls` writes a 33,942,640-byte C file: **4,671 function bodies, 4,671
+`sr_dispatch` cases, 812 `sr_indirect()` sites, 721 `sr_extern()` sites**, and it
+**skips 70 functions / 2,054 instructions**. That C compiles and links to a real
+**21,538,982-byte WebAssembly module, md5 `c5b33b99aad50163b488b647ece420df`** (3
+compiler warnings, no errors) — so the whole-DOL static recompilation of SAB is not a
+paper exercise, it is a module.
+
+**And the whole-image build is bit-exact.** Running the 1,056 leaf golden vectors
+against that 4,671-function binary rather than the 4-function slice:
+
+```
+  PSMTXConcat            264 bit-exact / 0 mismatched
+  PSMTXInverse           264 bit-exact / 0 mismatched
+  PSMTXMultVec           264 bit-exact / 0 mismatched
+  PSVECCrossProduct      264 bit-exact / 0 mismatched
+  RESULT    : 1056 bit-exact / 0 mismatched  of 1056
+```
+
+md5 `c5b33b99aad50163b488b647ece420df` identical before and after the run. This is a
+materially stronger statement than the slice result: the vectors now execute inside a
+module that also contains 812 indirect-dispatch sites and every other translated
+function in the image, so nothing about the surrounding 4,667 functions perturbs them. That skip list is not a failure — it is written out with
 `--skiplist` and **it is the host-binding worklist**, the same function-granular
 exclusion N64Recomp's toml provides (`~/gc_refs/N64Recomp/README.md:32`) and the
 mechanism by which a *binary* recomp gets MP4's "never compiled `OSThread.c` in"

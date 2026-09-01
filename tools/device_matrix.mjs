@@ -953,7 +953,7 @@ async function main() {
   }
 
   console.log('\n--- MATRIX ---');
-  console.log(`  ${pad('arm', 14)} ${pad('page', 10)} ${pad('verdict', 18)} ${pad('start', 14)} ${pad('tap', 22)} blockers`);
+  console.log(`  ${pad('arm', 14)} ${pad('page', 10)} ${pad('verdict', 18)} ${pad('start', 14)} ${pad('tap', 28)} blockers`);
   for (const x of result.verdicts) {
     const st = x.verdict === null ? '' : (x.startEnabled || []).map((e) => (e ? 'enabled' : 'DISABLED')).join(',');
     // The tap column is the one that would have caught the shipped bug: an
@@ -963,7 +963,7 @@ async function main() {
       : x.tapStartedAnyway ? `STARTED via ${x.tapTarget}`
       : `inert (${x.tapTarget})`;
     console.log(`  ${pad(x.arm, 14)} ${pad(x.page, 10)} ${pad(x.verdict === null ? 'VOID (no verdict)' : x.verdict, 18)}`
-      + ` ${pad(st, 14)} ${pad(tap, 22)} ${(x.blockers || []).join(',')}`);
+      + ` ${pad(st, 14)} ${pad(tap, 28)} ${(x.blockers || []).join(',')}`);
     if (x.verdict === null) console.log(`      ${x.void}`);
     else if (x.verdict === 'FAILS-SILENTLY') console.log(`      !! ${x.why}`);
   }
