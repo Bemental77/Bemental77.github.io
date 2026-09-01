@@ -347,6 +347,56 @@ reads the relocated section back out of the live machine and reports how many wo
 differ from the file. The base confirmation has already proved it is the right image,
 so those bytes are ground truth.
 
+## 5e. Closing the x-form gap: reachability is not available, so inject
+
+The `lwzux`/`lfdux` addition (§5) was proven **additive** — the wasm came out
+byte-identical — but never proven **correct**, because the 1,056-vector suite does not
+reach those forms. The obvious fix is to capture a fixture from the four SAB functions
+that contain them. **That was tried and it does not work:**
+
+```
+[capture] 0x8014c580 ...   SKIPPED: TimeoutError: timed out
+[capture] 0x8014c5f8 ...   SKIPPED: TimeoutError: timed out
+[capture] 0x8014c748 ...   SKIPPED: TimeoutError: timed out
+[capture] 0x8014c878 ...   SKIPPED: TimeoutError: timed out
+```
+
+Zero of four fired, and a static check says why: **all four have ZERO DIRECT
+CALLERS.** Of the 22,878 relative `bl` sites in the DOL, not one targets them — they
+are reachable only through an indirect branch. The prediction and the experiment agree,
+which is the useful part: the reachability route is *closed*, not merely unlucky.
+
+`DolphinPPCTests` does not help either — it is `Integer.cpp` / `FloatingPoint.cpp` /
+`ConditionRegister.cpp`, i.e. arithmetic, with no load/store coverage at all.
+
+So `xform_vectors.py` brings the instruction to the oracle instead of waiting for the
+oracle to reach the instruction: write `<insn> ; blr` into a scratch page of the
+running game's MEM1, set the architectural inputs over the GDB stub, set LR to a
+sentinel, run, read the results back, and restore the scratch and data pages. The
+oracle is still Dolphin's reference interpreter executing a real Gekko instruction, so
+the semantics are the hardware's. It is the same injection mechanism that produced the
+existing leaf goldens (`gamecube/tools/golden_invoke_sab_psmtx.py`).
+
+66 vectors across all 11 forms. **Half use a NEGATIVE index**, deliberately: the update
+forms write the effective address back to `rA`, so an unsigned-`rB` bug would load the
+correct value and corrupt the base — a test that only checked the loaded value would
+pass. `verify_xform.mjs` therefore compares the updated `rA` first, then `rD`/`frD`
+(the latter as raw 64-bit bits, never as doubles), then a 32-byte memory window.
+
+## 5f. What the first overlay attempt cost, and the bug in my own heuristic
+
+The first `titleD.rel` run reported `[base] NOT RECOVERED after 367 breakpoint hits`.
+The base-recovery design is sound but the *ranking* was backwards: probe targets were
+sorted by **fewest** call sites, to minimise the number of base candidates per hit.
+Fewest call sites means the **rarest call**, so the run armed precisely the breakpoints
+least likely to fire. Ambiguity is cheap to resolve — every candidate is byte-confirmed
+against live memory — but rarity is not. Now ranked by most call sites.
+
+The three hits that did pass the DOL-TEXT filter had `lr` = `0x811fff58`, `0x811ffff4`,
+`0x811ffff8` — the top of MEM1, i.e. **stack**, not overlay code. Combined with
+`pc=0x80003140` at connect, the reading is that the interpreter had not yet booted far
+enough to OSLink any overlay at all.
+
 ## 6. The OS-thread / context-switch problem, measured
 
 The brief warned that a binary recomp cannot use MP4's escape (never compiling

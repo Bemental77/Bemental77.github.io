@@ -137,10 +137,15 @@ def main():
     print("[rel] DOL text (LR in these ranges = a DOL-internal caller, skipped): "
           + ", ".join(f"{lo:#x}..{hi:#x}" for lo, hi in textr))
 
-    # Probe targets: fewest call sites first, so (LR-4)-off has the fewest candidates.
-    probes = sorted(sites.items(), key=lambda kv: len(kv[1]))[:a.probe_targets]
+    # Probe targets: MOST call sites first.  The first version of this ranked by
+    # FEWEST -- which minimises the number of base candidates per hit, and is exactly
+    # backwards: fewest call sites means the RAREST call, so the breakpoints that fire
+    # least often were the ones armed.  A titleD run took 367 breakpoint hits without
+    # ever seeing a call FROM the overlay.  Ambiguity is cheap to resolve (every
+    # candidate is byte-confirmed against live memory below), rarity is not.
+    probes = sorted(sites.items(), key=lambda kv: -len(kv[1]))[:a.probe_targets]
     print(f"[rel] arming {len(probes)} DOL targets for base recovery "
-          f"(min {len(probes[0][1])} site(s), max {len(probes[-1][1])})")
+          f"(max {len(probes[0][1])} site(s), min {len(probes[-1][1])})")
 
     osyms = O.load_map(a.map)
     dol = O.Dolphin(iso=a.iso, state=a.state, port=PORT,
