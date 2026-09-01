@@ -40,10 +40,23 @@ async function run(label, jit) {
 
 function firstDiff(a, b) { for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return i; return -1; }
 
-const interpA = await run('interp-A', false);
-const interpB = await run('interp-B', false);
-const jit = await run('jit', true);
-await browser.close();
+// try/finally is load-bearing, not tidiness. The waitForFunction calls above
+// have 120-180 s timeouts and THROW on expiry; with the close outside a finally
+// the Chrome survives the throw as an orphan still running the emulator page.
+// Seven such orphans from the 2026-08-29 session were found still resident on
+// 2026-09-01 -- 2 days 17 hours later -- two of them burning ~107% of a core
+// EACH (832 and 815 CPU-minutes accumulated), for 230% of leaked CPU in total.
+// That silently taxed every measurement taken in between, and this file's own
+// documented timeout on thewheel.z64 (TASKS.md:315) is one of the ways it
+// happened.
+let interpA, interpB, jit;
+try {
+  interpA = await run('interp-A', false);
+  interpB = await run('interp-B', false);
+  jit = await run('jit', true);
+} finally {
+  await browser.close().catch(() => {});
+}
 
 const detDiff = firstDiff(interpA.sums, interpB.sums);
 const jitDiff = firstDiff(interpA.sums, jit.sums);

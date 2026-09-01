@@ -1773,13 +1773,23 @@ N64Rate.selfTest = function (logFn) {
     var o = window.requestAnimationFrame.bind(window);
     window.requestAnimationFrame = function (cb) {
       return o(function (t) {
-        rafTicks++;
         var t0 = performance.now();
         cb(t);
         // Once per animation frame, whichever callback got here first. jQuery and the touch
         // overlay also use rAF; the timestamp dedupe keeps this to one catch-up pass per frame
         // rather than one per registered callback.
-        if (t !== lastPaceT) { lastPaceT = t; paceTick(performance.now() - t0); }
+        //
+        // [raf-dedupe 2026-09-01] `rafTicks++` USED TO SIT ABOVE `cb(t)`, OUTSIDE THIS DEDUPE.
+        // It therefore counted CALLBACKS, not animation frames — so `shown` scaled with the
+        // number of registered rAF loops instead of with the display. MEASURED on the live page
+        // (sm64.z64, 60 Hz): with the shipped single loop `shown` read 60; with two extra loops
+        // registered — which is exactly what the mobile touch overlay and jQuery do — it read
+        // 180, a 3.00x inflation of a quantity the page's own comment above calls "bounded by
+        // the DISPLAY REFRESH and can never show headroom". A headline reading "180 shown" on a
+        // 60 Hz panel is the same class of fabricated number gate #9 exists to forbid, and it
+        // also silently breaks `r.decoupled` (:716-717), whose whole test is `shown < viHz - 1`.
+        // Counting inside the dedupe makes `shown` mean animation frames on every path.
+        if (t !== lastPaceT) { lastPaceT = t; rafTicks++; paceTick(performance.now() - t0); }
       });
     };
   })();
@@ -2234,7 +2244,7 @@ N64Rate.selfTest = function (logFn) {
     };
     window.__jitStats = function () {
       var s = { mode: mode, wrapped: wrapped, calls: calls, canaryFired: canaryFired, instantiateFail: instantiateFail };
-      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeMemSlots = e.nativeMemSlots; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.nativeCop0 = e.nativeCop0; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; s.distinctSlots = e.distinctSlots; s.slotReuses = e.slotReuses; }
+      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeMemSlots = e.nativeMemSlots; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.nativeCop0 = e.nativeCop0; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; s.distinctSlots = e.distinctSlots; s.slotReuses = e.slotReuses; s.nullOpsRejects = e.nullOpsRejects || 0; }
       return s;
     };
     // ?jit=census dump: [[bucket, executions], ...] ranked. Buckets are

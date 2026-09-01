@@ -621,6 +621,13 @@ function classify(text) {
     userDataDir: PROFILE_DIR,
     dumpio: !!process.env.FLYCAST_DUMPIO,  // tee Chrome stderr (V8 --print-wasm-code) into our stdout
   });
+  // [leak-guard 2026-09-01] A SIGKILLed parent ORPHANS this browser — verified by
+  // test, and uncatchable in-process. Seven such orphans from one run were still
+  // burning 230.3% of CPU 2 days later, which is what made 'the box is quiet'
+  // false for a long run of matched pairs. Registering the PID lets
+  // `node tools/browser_leak_guard.js reap` kill it once this process is gone.
+  try { require('../../tools/browser_leak_guard.js').guard(browser, __filename); } catch (_e) {}
+
   const page = await browser.newPage();
   if (ALLOC_FAIL_MB) {
     console.log('[probe] MEMORY-CEILING ARM: typed-array allocations >= ' + ALLOC_FAIL_MB +

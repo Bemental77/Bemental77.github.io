@@ -160,8 +160,16 @@ async function run(jit) {
 }
 
 const res = {};
-for (const a of order) res[a] = await run(a === 'jit');
-await browser.close();
+// See the note in tools/n64_jit_diff_test.mjs: an unguarded browser.close() is
+// how the 2026-08-29 session leaked seven headless Chromes, two of which were
+// still burning ~107% of a core each 2 days 17 hours later. run() can throw
+// (the waitForFunction at the top of it has a 180 s timeout), so the close has
+// to be in a finally.
+try {
+  for (const a of order) res[a] = await run(a === 'jit');
+} finally {
+  await browser.close().catch(() => {});
+}
 const out = {
   rom, order: order.join(','), warmupVI: WARMUP_VI, windowVI: WINDOW_VI, jitMode: JIT_MODE,
   interp: res.interp, jit: res.jit,

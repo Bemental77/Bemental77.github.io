@@ -815,6 +815,37 @@
     var body = [];
     var EXIT = 1, TOP = 0;
     var i = 0;
+    // ---- NULL-OPS GUARD (thewheel.z64 wedge, n64/docs/jit/TASKS.md:301) ----
+    // Every interpreter-fallback path bakes a table index read at COMPILE time
+    // (`HEAPU32[instrPtr >> 2]`) straight into a `call_indirect` -- slowArm:414
+    // and :420, cuGuard:629, and the generic fallback at the bottom of this
+    // loop. Nothing ever checked that index for 0. A `precomp_instr` whose
+    // `ops` is still null when the bridge runs therefore compiles to
+    // `call_indirect 0`, and index 0 of the wasm table is the null entry, so
+    // the block TRAPS the first time that path is reached.
+    //
+    // That is what thewheel.z64 does: it stalls at VI 245 under ?jit with
+    // "RuntimeError: null function", and the mode ladder puts the fault in
+    // native emission (?jit=wrap and ?jit=v05 both reach VI 401 on the same
+    // ROM, and ?jit=nofp stalls identically with nativeFP=0, so it is neither
+    // the plumbing nor FP). It is a TRAP, not the poll-starvation wedge the
+    // task list hypothesised.
+    //
+    // Refusing the whole span is the conservative repair: the block simply
+    // stays on the cached interpreter, exactly as it did before wave 1, and it
+    // is retried on the next recompile when ops may be populated. span+1 is
+    // scanned because delay-slot emission reads one instruction past the span.
+    var scanEnd = p.span + 1;
+    for (var g = 0; g < scanEnd; g++) {
+      if (HEAPU32[(p.entryPtr + g * p.stride) >> 2] === 0) {
+        stats.nullOpsRejects = (stats.nullOpsRejects || 0) + 1;
+        if (stats.nullOpsRejects === 1 && typeof console !== 'undefined') {
+          console.warn('[jit] span rejected: precomp_instr.ops == 0 at index ' + g +
+                       ' of ' + p.span + ' (vaddr 0x' + (p.vaddr >>> 0).toString(16) + ')');
+        }
+        return 0;
+      }
+    }
     while (i < p.span) {
       var word = HEAPU32[(p.srcPtr >> 2) + i];
       var addr = (p.vaddr + i * 4) >>> 0;

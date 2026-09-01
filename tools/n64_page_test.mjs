@@ -19,6 +19,8 @@
 // Pace pass: asserts the pace governor is WIRED to the real core (_runMainLoop resolved,
 // cartridge region reached its schedule, decisions actually made) and that ?pace=0 is a real
 // control arm; gate #9 re-checked live on both arms.
+// Rafdedupe pass: registers two extra rAF loops on the live page and requires `shown` not to
+// move — it counts ANIMATION FRAMES, never rAF callbacks (3.00x inflation before the fix).
 // Invariants pass: /n64/ must NOT pull coi-serviceworker.js and must load every
 // UI dependency from its own origin.
 // Emits one JSON line.
@@ -26,7 +28,7 @@ import puppeteer from 'puppeteer';
 
 const rom = process.argv[2] || 'mariokart.z64';
 const base = process.env.N64_PAGE_URL || 'http://localhost:8080/n64/';
-const result = { rom, desktop: {}, mobile: {}, ratetest: {}, meter: {}, diag: {}, pace: {}, invariants: {} };
+const result = { rom, desktop: {}, mobile: {}, ratetest: {}, meter: {}, diag: {}, pace: {}, rafdedupe: {}, invariants: {} };
 
 const browser = await puppeteer.launch({
   headless: 'new',
@@ -368,6 +370,61 @@ try {
               (t.decoupledObserved || !t.hadCapacity));
   }
 
+  // ---------- raf-dedupe: `shown` must count ANIMATION FRAMES, not callbacks ----------
+  // THE BUG THIS EXISTS TO CATCH (n64/index.html, wrapRaf): `rafTicks++` sat ABOVE `cb(t)`,
+  // outside the `t !== lastPaceT` dedupe, so it counted rAF CALLBACKS. Every extra rAF loop on
+  // the page — jQuery's animations, and the MOBILE TOUCH OVERLAY, both named in that function's
+  // own comment — multiplied `shown`. Measured on the live page before the fix: one loop -> 60,
+  // three loops -> 180 on the same 60 Hz display, a 3.00x inflation of a number the page
+  // describes as "bounded by the DISPLAY REFRESH". After the fix the same pair reads 60 -> 60.
+  //
+  // This is a PACING assertion, not a cosmetic one: `shown` is one of the four headline terms,
+  // and `r.decoupled` (n64/index.html, makeRate) is literally `shown < viHz - 1`, so an inflated
+  // `shown` silently disables the decoupling verdict the pace governor exists to earn.
+  //
+  // It is DISCRIMINATING: it registers the extra loops itself and compares against a control arm
+  // on the same page, so it fails if and only if the dedupe is absent. Revert the fix and this
+  // pass goes red; nothing else in this file does.
+  {
+    const t = result.rafdedupe;
+    const page = await newPage(t);
+    await page.goto(`${base}?game=${rom}&autostart`, { waitUntil: 'domcontentloaded' });
+    await waitRunning(page);
+    await page.waitForFunction('window.__n64Rate && window.__n64Rate.shown > 0', { timeout: 60000 }).catch(() => {});
+    const sample = async () => {
+      const v = [];
+      for (let i = 0; i < 4; i++) {
+        await new Promise((r2) => setTimeout(r2, 1100));
+        const x = await page.evaluate(() => {
+          const r2 = window.__n64Rate;
+          return (r2 && typeof r2.shown === 'number' && r2.windowMs > 0)
+            ? r2.shown / (r2.windowMs / 1000) : null;
+        });
+        if (typeof x === 'number') v.push(x);
+      }
+      v.sort((a, b) => a - b);
+      return v.length ? v[v.length >> 1] : null;
+    };
+    t.controlShownPerSec = await sample();
+    // Two extra self-perpetuating rAF loops — exactly the shape jQuery.fx and the touch overlay
+    // install. The DISPLAY did not change, so `shown` must not either.
+    await page.evaluate(() => { for (let i = 0; i < 2; i++) (function L() { requestAnimationFrame(L); })(); });
+    t.extraLoops = 2;
+    t.withExtraShownPerSec = await sample();
+    t.inflation = (t.controlShownPerSec > 0 && t.withExtraShownPerSec !== null)
+      ? +(t.withExtraShownPerSec / t.controlShownPerSec).toFixed(3) : null;
+    // The arm has to have TAKEN: if the extra loops did not actually run, this proves nothing.
+    t.armTook = await page.evaluate(() => new Promise((res) => {
+      let n = 0, last = -1;
+      const t0 = performance.now();
+      (function C(ts) { if (ts !== last) { last = ts; n++; } if (performance.now() - t0 < 500) requestAnimationFrame(C); else res(n > 4); })(performance.now() - 1);
+    })).catch(() => false);
+    t.ok = !!(t.armTook && t.inflation !== null && t.inflation >= 0.9 && t.inflation <= 1.1);
+    t.why = t.ok ? `shown held at ${t.controlShownPerSec?.toFixed(1)}/s -> ${t.withExtraShownPerSec?.toFixed(1)}/s with 2 extra rAF loops`
+                 : `shown moved ${t.controlShownPerSec} -> ${t.withExtraShownPerSec} (${t.inflation}x) when only the number of rAF CALLBACKS changed`;
+    await page.close();
+  }
+
   // ---------- standing invariants of this page ----------
   {
     const t = result.invariants;
@@ -383,7 +440,7 @@ try {
     const off = []
       .concat(result.desktop.offOrigin || [], result.mobile.offOrigin || [],
               result.ratetest.offOrigin || [], result.meter.offOrigin || [], result.diag.offOrigin || [],
-              result.pace.offOrigin || []);
+              result.pace.offOrigin || [], result.rafdedupe.offOrigin || []);
     t.offOriginRequests = [...new Set(off)].slice(0, 8);
     t.noOffOrigin = t.offOriginRequests.length === 0;
     t.ok = !!(t.noCoiServiceWorker && t.vendorSelfHosted && t.noOffOrigin);
@@ -393,10 +450,10 @@ try {
 } finally {
   await browser.close();
 }
-for (const k of ['desktop', 'mobile', 'ratetest', 'meter', 'diag', 'pace']) {
+for (const k of ['desktop', 'mobile', 'ratetest', 'meter', 'diag', 'pace', 'rafdedupe']) {
   result[k].consoleErrors = (result[k].consoleErrors || []).slice(0, 6);
   result[k].failedRequests = (result[k].failedRequests || []).slice(0, 6);
   delete result[k].offOrigin;   // rolled up into result.invariants
 }
-result.ok = ['desktop', 'mobile', 'ratetest', 'meter', 'diag', 'pace', 'invariants'].every((k) => result[k].ok === true);
+result.ok = ['desktop', 'mobile', 'ratetest', 'meter', 'diag', 'pace', 'rafdedupe', 'invariants'].every((k) => result[k].ok === true);
 console.log(JSON.stringify(result, null, 1));

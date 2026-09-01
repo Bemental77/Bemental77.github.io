@@ -803,6 +803,128 @@ window.GcRate = (function () {
              acksDelivered: acksDelivered, now: now, restoreBacklog: restoreBacklog };
   }
 
+  // ======== PRESENT POLICY — how a published frame reaches the canvas =======================
+  // [present-queue 2026-09-01] MEASURED DEFECT this models. On the recomp path the pipeline
+  // publishes 60.0 distinct frames/s and rAF fires at a locked 59.99/s (p99 16.67ms), yet only
+  // 51.98-55.47 of those frames per second ever reached the canvas across four runs — 409 of
+  // 3606 rAF ticks found nothing new while 414 published frames were never painted. The two
+  // numbers matching is the whole diagnosis: the publish target is a SINGLE SLOT (one pixels
+  // pointer + one seqlock, gamecube.html:5222-5224), the only reader ran once per rAF, and
+  // whenever two publishes landed inside one 16.67ms rAF interval the first was overwritten
+  // before anyone read it. Producer and consumer both at 60/s does NOT mean no loss: it takes
+  // only a few ms of publish jitter for ~10% of intervals to hold two frames and ~10% to hold
+  // none. The viewer sees that as a doubled frame period — p99 present interval measured 33.7-
+  // 35.4ms against a 16.67ms nominal, i.e. a visible skip 1-7 times a second.
+  //
+  // THE FIX IS NOT "PAINT MORE OFTEN". No browser API lands more than `refresh` distinct images
+  // on the panel, so painting twice between two rAF ticks throws the first one away — it would
+  // move the counter and not the pixels, which is the fabricated-number failure gate #9 exists
+  // to prevent. What is needed is to stop LOSING frames: CAPTURE out of the single slot far
+  // more often than rAF (a cheap seqlock read; the 1.2MB copy still happens exactly once per
+  // published frame), hold the captured frames in a short queue, and PAINT one per rAF. Then
+  // every published frame gets painted and the paint rate is still bounded by the display.
+  //
+  // qMax is deliberately small. Some queue is REQUIRED (with zero, a frame captured between
+  // two rAF ticks has nowhere to wait and is lost exactly as before); much queue is latency and
+  // a licence for the producer to run ahead. 2 absorbs the measured jitter and bounds added
+  // latency at ~1 frame. If the producer genuinely outruns the display — ?fps=0 freerun
+  // published 82.93/s — the queue drops its OLDEST entry, which degrades to exactly the old
+  // behaviour and keeps the newest frame on screen.
+  //
+  // presentSim is the pure model of that policy so ?ratetest=1 can assert it against the shape
+  // measured on the live page, with the old policy expressible as (captureEveryMs 0, qMax 1) —
+  // capture only at rAF, no queue — so the two are compared inside one harness rather than one
+  // being described in prose.
+  function presentSim(o) {
+    var pubs = o.publishTimes, rafs = o.rafTimes;
+    var capEvery = o.captureEveryMs || 0, qMax = (o.qMax === undefined) ? 2 : o.qMax;
+    var ev = [], i;
+    for (i = 0; i < rafs.length; i++) ev.push({ t: rafs[i], raf: 1 });
+    if (capEvery > 0) for (var t = 0; t <= rafs[rafs.length - 1]; t += capEvery) ev.push({ t: t, raf: 0 });
+    // At an identical instant a capture must run BEFORE the paint — the live rAF tick captures
+    // first for exactly this reason (a frame published just before the tick must not wait a
+    // whole extra refresh).
+    ev.sort(function (a, b) { return (a.t - b.t) || (a.raf - b.raf); });
+    var pi = 0, lastCap = -1, q = 0, painted = 0, lost = 0, qDrops = 0, qMaxSeen = 0;
+    function capture(now) {
+      var newest = -1;
+      while (pi < pubs.length && pubs[pi] <= now) { newest = pi; pi++; }
+      if (newest < 0) return;
+      // The slot holds only the newest publish. Anything published since the last capture and
+      // not read is gone — this is the term the queue exists to drive to zero.
+      lost += (newest - lastCap - 1);
+      lastCap = newest;
+      q++;
+      if (q > qMax) { q--; qDrops++; }
+      if (q > qMaxSeen) qMaxSeen = q;
+    }
+    for (i = 0; i < ev.length; i++) {
+      capture(ev[i].t);
+      if (ev[i].raf && q > 0) { q--; painted++; }
+    }
+    return { published: pubs.length, painted: painted, lost: lost, qDrops: qDrops,
+             qMaxSeen: qMaxSeen, rafTicks: rafs.length };
+  }
+  // Deterministic jittered series — a seeded LCG, so a failing assertion is reproducible.
+  function jitterSeries(n, periodMs, jitterMs, seed, phase) {
+    var s = seed >>> 0, out = [];
+    for (var i = 0; i < n; i++) {
+      s = (s * 1664525 + 1013904223) >>> 0;
+      out.push((phase || 0) + i * periodMs + ((s / 4294967296) - 0.5) * 2 * jitterMs);
+    }
+    out.sort(function (a, b) { return a - b; });
+    return out;
+  }
+
+  // ======== ENGINE ROUTING — which of the two engines runs THIS title ======================
+  // [engine-routing 2026-09-01] Two engines ship on this page and they are NOT interchangeable:
+  //
+  //   JIT     Dolphin + the PowerPC dynarec. Runs every disc, and is the only thing that can
+  //           run SAB / PSO / 240pSuite at all. Its measured guest rate on MP4's board is
+  //           0.68-0.76x hardware (AI-DMA witness) and 0.1545x on SAB City Escape, so it does
+  //           not meet "runs at the title's native rate".
+  //   recomp  the Mario Party 4 DECOMP compiled straight to wasm (gamecube/recomp/mp4_game.js
+  //           + .wasm). Measured on the live board: speed 1.000x, ~60 distinct frames
+  //           published/s. It IS Mario Party 4 — there is no decomp for SAB or PSO, and
+  //           240pSuite is a .dol homebrew — so it can never be a fallback for another disc.
+  //
+  // The engine is therefore a property of the TITLE, not a debug flag, and this page routes on
+  // the booted ROM: MP4 gets the engine that meets the bar, everything else keeps the JIT. A
+  // visitor who lands on gamecube.html and picks Mario Party 4 gets 1.000x/60 without knowing
+  // a query parameter exists.
+  //
+  // The two overrides stay, because a routing decision nobody can turn off is a routing
+  // decision nobody can measure:
+  //   ?recomp=1  force the recomp AND pin the ROM select to MP4. Forcing it under another disc
+  //              parked THAT game's CPU and streamed MP4 frames over its renderer (frozen
+  //              title + garble, user report 2026-08-27), which is why forcing implies pinning.
+  //   ?recomp=0  force the JIT for every title, MP4 included. This is the A/B arm: it is the
+  //              only way to measure what the routing change actually bought.
+  //
+  // Anything else in ?recomp= is malformed and must not silently pick an engine — it falls
+  // through to auto and says so, rather than being coerced to a truthy "yes".
+  //
+  // decide() is a PURE function of (param, romBase) so ?ratetest=1 can assert the whole table
+  // without an emulator; the live block at the bottom of the page calls THIS function and
+  // publishes its answer as window.__gcRecompRouting, so a call-site regression (an early
+  // return that skips routing entirely) is visible to the suite too.
+  var RECOMP_TITLES = { MarioParty4: 1 };
+  function route(param, romBase) {
+    if (param === '0') return { mode: 'off', engage: false, pin: false, warn: null,
+                                reason: '?recomp=0 — JIT forced for every title (A/B arm)' };
+    if (param === '1') return { mode: 'forced', engage: true, pin: true, warn: null,
+                                reason: '?recomp=1 — recomp forced; ROM pinned to Mario Party 4' };
+    var warn = (param === null || param === undefined || param === '') ? null
+             : 'ignoring malformed ?recomp=' + param + ' (only 1 and 0 are meaningful); routing on the ROM';
+    if (romBase === null || romBase === undefined || romBase === '')
+      return { mode: 'auto', engage: null, pin: false, warn: warn,
+               reason: 'auto: waiting for the ROM selection' };
+    if (RECOMP_TITLES[romBase]) return { mode: 'auto', engage: true, pin: false, warn: warn,
+                                         reason: 'auto: ' + romBase + ' ships on the recomp engine' };
+    return { mode: 'auto', engage: false, pin: false, warn: warn,
+             reason: 'auto: ' + romBase + ' has no recomp build — JIT path' };
+  }
+
   function selfTest(logFn) {
     var lines = [], pass = 0, fail = 0;
     function log(s) {
@@ -1342,12 +1464,92 @@ window.GcRate = (function () {
        'speed=' + fx(L20.speed, 2) + 'x  ' + format({ speed: L20.speed, speedReq: L20.speedReq,
          starved: L20.starved, capFps: L20.capFps, guestHz: 60, nativeHz: 60, shown: 0, published: 0 }));
 
+    // ---- 21. ENGINE ROUTING ---------------------------------------------------------------
+    // The claim under test: a visitor who lands on gamecube.html and picks Mario Party 4 gets
+    // the engine that runs it at 1.000x, and NOBODY ELSE'S TITLE MOVES. Both halves matter —
+    // routing MP4 onto recomp is worthless if it also parks SAB's CPU under MP4 frames.
+    var r21a = route(null, 'MarioParty4');
+    ck('21a a plain visit with Mario Party 4 selected routes to the recomp — no query parameter',
+       r21a.engage === true && r21a.mode === 'auto' && r21a.pin === false, JSON.stringify(r21a));
+    ck('21b SAB stays on the JIT (no decomp exists for it)',
+       route(null, 'SonicAdventure2Battle').engage === false, JSON.stringify(route(null, 'SonicAdventure2Battle')));
+    ck('21c PSO stays on the JIT',
+       route(null, 'PhantasyStarOnline1And2Plus').engage === false, JSON.stringify(route(null, 'PhantasyStarOnline1And2Plus')));
+    ck('21d 240pSuite stays on the JIT',
+       route(null, '240pSuite-1.10b').engage === false, JSON.stringify(route(null, '240pSuite-1.10b')));
+    // UNDECIDED is a third state, not false: the ROM is not known until Start is pressed, and
+    // collapsing "not yet known" into "no" would boot MP4 on the JIT every time.
+    var r21e = route(null, null);
+    ck('21e before Start the ROM is unknown, so the decision is UNDECIDED (null), never false',
+       r21e.engage === null && r21e.mode === 'auto', JSON.stringify(r21e));
+    var r21f = route('1', 'PhantasyStarOnline1And2Plus');
+    ck('21f ?recomp=1 forces the recomp and PINS the ROM — forcing it under another disc parks that game',
+       r21f.engage === true && r21f.pin === true && r21f.mode === 'forced', JSON.stringify(r21f));
+    ck('21g ?recomp=0 forces the JIT for MP4 too — this is the A/B arm the routing is measured against',
+       route('0', 'MarioParty4').engage === false && route('0', 'MarioParty4').mode === 'off',
+       JSON.stringify(route('0', 'MarioParty4')));
+    var r21h = route('yes', 'MarioParty4');
+    ck('21h a malformed ?recomp= does not silently pick an engine: it falls through to auto and warns',
+       r21h.mode === 'auto' && r21h.warn !== null, JSON.stringify(r21h));
+    // 21i is the CALL-SITE test, and it is the one that catches a revert of the routing change
+    // rather than a revert of the table above. The live block publishes its decision; if that
+    // block goes back to `if (recomp !== '1') return;` it never runs on a plain visit and this
+    // object is undefined. ?ratetest=1 is itself a plain visit, so the state it must be in is
+    // auto/undecided.
+    var live = (typeof window !== 'undefined') ? window.__gcRecompRouting : null;
+    ck('21i the LIVE routing block ran on this plain visit and is in auto/undecided (call-site check)',
+       !!live && live.mode === 'auto' && live.engage === null,
+       live ? JSON.stringify(live) : 'window.__gcRecompRouting is undefined — the routing block '
+              + 'did not run on a plain visit, so every title boots on the JIT');
+
+    // ---- 22. PRESENT POLICY -----------------------------------------------------------------
+    // Reproduces the shape MEASURED on the live recomp path: publishes at 60/s with a few ms of
+    // jitter, rAF a locked 60/s. 22d is the control that keeps 22a honest.
+    // The jitter half-width is not a free parameter: 10ms is the value at which this model
+    // reproduces the LIVE measurement (old policy paints 87.0% of publishes here; the live
+    // recomp path measured 53.10 shown against 60.00 published = 88.5%). Below ~8.3ms — half a
+    // frame period — two publishes can never share one rAF interval and the old policy is
+    // lossless, which is what 22d pins.
+    var RAFS = [];
+    for (var i22 = 0; i22 < 600; i22++) RAFS.push(i22 * 16.6667);
+    var PUB_JIT = jitterSeries(600, 16.6667, 10, 12345, 8.0);
+    var oldJ = presentSim({ publishTimes: PUB_JIT, rafTimes: RAFS, captureEveryMs: 0, qMax: 1 });
+    var newJ = presentSim({ publishTimes: PUB_JIT, rafTimes: RAFS, captureEveryMs: 4, qMax: 3 });
+    ck('22a the OLD policy (read the single slot once per rAF, no queue) LOSES published frames',
+       oldJ.lost > 0.05 * oldJ.published,
+       'lost ' + oldJ.lost + '/' + oldJ.published + ' = ' + fx(100 * oldJ.lost / oldJ.published, 1) +
+       '%, painted ' + fx(100 * oldJ.painted / oldJ.published, 1) + '%');
+    ck('22b capture-off-rAF (4ms) + a 3-deep queue recovers most of them and overflows never',
+       newJ.painted >= 0.95 * newJ.published && newJ.lost < 0.4 * oldJ.lost && newJ.qDrops === 0,
+       'lost ' + newJ.lost + ' (was ' + oldJ.lost + '), painted ' + fx(100 * newJ.painted / newJ.published, 1) +
+       '%, queue overflows ' + newJ.qDrops);
+    ck('22c and it never paints more than the display can show — no fabricated presents',
+       newJ.painted <= newJ.rafTicks && newJ.qMaxSeen <= 3,
+       'painted ' + newJ.painted + ' rAF ticks ' + newJ.rafTicks + ' qMax seen ' + newJ.qMaxSeen);
+    // 22d — CONTROL. A publisher with NO jitter, comfortably inside the rAF interval, loses
+    // nothing under EITHER policy. Without this, 22a could be an artifact of the harness
+    // rather than of the jitter, and 22b would be measuring nothing.
+    var PUB_CLEAN = jitterSeries(600, 16.6667, 0, 1, 8.0);
+    var oldC = presentSim({ publishTimes: PUB_CLEAN, rafTimes: RAFS, captureEveryMs: 0, qMax: 1 });
+    ck('22d control: with a jitter-free publisher the OLD policy loses nothing either — 22a is about jitter, not the harness',
+       oldC.lost === 0, 'lost ' + oldC.lost + '/' + oldC.published);
+    // 22e — the ?fps=0 shape (measured 82.93 published/s against a 60Hz panel). More frames
+    // exist than the display can show, so frames MUST be dropped; the requirement is that the
+    // queue stays bounded and the counter still cannot exceed the refresh.
+    var PUB_FAST = jitterSeries(800, 12.06, 3, 777, 8.0);
+    var fastN = presentSim({ publishTimes: PUB_FAST, rafTimes: RAFS, captureEveryMs: 4, qMax: 3 });
+    ck('22e a producer faster than the display still cannot paint more than the display refresh',
+       fastN.painted <= fastN.rafTicks && fastN.qMaxSeen <= 3 && fastN.qDrops > 0,
+       'painted ' + fastN.painted + '/' + fastN.rafTicks + ' rAF, queue drops ' + fastN.qDrops);
+
     var summary = 'RATETEST ' + (fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + pass + ' passed, ' + fail + ' failed';
     log(summary);
     return { pass: pass, fail: fail, lines: lines, summary: summary };
   }
 
   return { makeModel: makeModel, seqDelta: seqDelta, format: format, num: num,
+           route: route, RECOMP_TITLES: RECOMP_TITLES,
+           presentSim: presentSim, jitterSeries: jitterSeries,
            simulate: simulate, selfTest: selfTest, DEF: DEF,
            makeJitRate: makeJitRate, jitCycles: jitCycles, applyJit: applyJit,
            gapText: gapText, TARGET_FPS: TARGET_FPS, MIN_BUSY_MS: MIN_BUSY_MS,
@@ -4808,6 +5010,10 @@ window.GcRate = (function () {
     pass.end();
     GPU.device.queue.submit([enc.finish()]);
   }
+  // canvasImg2D/canvasImg32 belong to the LEGACY postMessage software path (paintFrame2D) ONLY.
+  // The WGPU sab-present path stopped sharing them on 2026-09-01 — it owns a small pool of
+  // ImageData buffers instead (see _sabPresentCapture), because a single shared buffer cannot
+  // hold a captured frame while a different one is being painted.
   // canvasImg32 is a u32 alias of canvasImg2D.data — INVALIDATE IT WHEREVER canvasImg2D IS
   // REASSIGNED or it aliases a freed/undersized backing store (the size guard below is the
   // only thing that reassigns it, and it clears this on the same line).
@@ -4819,7 +5025,8 @@ window.GcRate = (function () {
   // (MAIN_THREAD_EM_ASM from the gpu_thread never delivers — its proxy queue
   // starves; forensic counters showed the full readback chain running with zero
   // frames reaching the page). Cells: 0x026B3510 = pixels ptr, 0x026B3514 =
-  // (w<<16)|h, 0x026B3518 = frame seq. A 16ms poll paints on seq change; once
+  // (w<<16)|h, 0x026B3518 = frame seq. A 4ms poll CAPTURES on seq change and rAF
+  // paints one captured frame per tick (see the present-queue note below); once
   // active, the video_cb 'render' messages (the SW buffer — zeros under WGPU)
   // are ignored so they can't paint black over real frames.
   var _sabPresentSeq = 0, _sabPresentActive = false;
@@ -5089,16 +5296,27 @@ window.GcRate = (function () {
     return { pass: pass, fail: fail, lines: lines };
   }
   if (new URLSearchParams(location.search).get('ratetest') === '1') {
-    setTimeout(function () {
-      var r = GcRate.selfTest(pageLog);
-      var rr = gcRenderSelfTest(pageLog);
-      // ONE gate: merge so `RATETEST FAIL` in __gcRateTest.lines still catches everything.
-      r.pass += rr.pass; r.fail += rr.fail; r.lines = r.lines.concat(rr.lines);
-      r.summary = 'RATETEST ' + (r.fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + r.pass + ' passed, ' + r.fail + ' failed';
-      pageLog(r.summary);
-      window.__gcRateTest = r;    // also pins the summary in #fps (see _rateRender)
-      if (fpsEl) { fpsEl.textContent = r.summary; fpsEl.style.color = r.fail ? '#f77' : '#7f7'; }
-    }, 0);
+    // [ratetest-trigger 2026-09-01] This was setTimeout(0), which is NOT "after the page is
+    // built". gamecube.html is streamed, the parser yields between chunks, and the 0ms timer
+    // fired while the last <script> in the document (the engine-routing block) was still
+    // unparsed — so test 21i read window.__gcRecompRouting as undefined and reported that
+    // routing had been reverted, on a page where it was working. Any assertion about LIVE page
+    // state has that hazard; DOMContentLoaded is the event that actually means "every inline
+    // script has run". Waiting is free — the suite drives synthetic timings, not the emulator.
+    var runRateTest = function () {
+      setTimeout(function () {
+        var r = GcRate.selfTest(pageLog);
+        var rr = gcRenderSelfTest(pageLog);
+        // ONE gate: merge so `RATETEST FAIL` in __gcRateTest.lines still catches everything.
+        r.pass += rr.pass; r.fail += rr.fail; r.lines = r.lines.concat(rr.lines);
+        r.summary = 'RATETEST ' + (r.fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + r.pass + ' passed, ' + r.fail + ' failed';
+        pageLog(r.summary);
+        window.__gcRateTest = r;    // also pins the summary in #fps (see _rateRender)
+        if (fpsEl) { fpsEl.textContent = r.summary; fpsEl.style.color = r.fail ? '#f77' : '#7f7'; }
+      }, 0);
+    };
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', runRateTest);
+    else runRateTest();
   }
   // [present-cadence 2026-08-28] was setInterval(..., 16). A 16ms timer clamps
   // presents to ~62/s in theory and ~50/s in practice, which WAS the measured
@@ -5111,7 +5329,30 @@ window.GcRate = (function () {
   // meter any more (see the rate model above): `published` is metered off the
   // producer's own counter, so a rAF that is refresh-bound no longer clamps the
   // measurement — only the pixels.
-  function _sabPresentTick() {
+  //
+  // [present-queue 2026-09-01] CAPTURE IS NO LONGER TIED TO PAINT. Reading the single-slot
+  // publish buffer only once per rAF LOST frames: measured on the shipped recomp path, 60.00
+  // distinct frames/s were published, rAF fired a locked 59.99/s, and only 51.98-55.47/s
+  // reached the canvas — 409 of 3606 rAF ticks found nothing new while 414 published frames
+  // were overwritten before anyone read them. See the PRESENT POLICY block in GcRate for the
+  // full diagnosis and ?ratetest=1 tests 22a-22e, which assert this policy against the shape
+  // measured here (22d is the control that proves the loss comes from publish jitter and not
+  // from the harness).
+  //
+  // Capture runs on a 4ms timer (the foreground setInterval floor) and does the 1.2MB copy
+  // exactly once per PUBLISHED frame — the same number of copies as before, just at the right
+  // moment. Paint stays on rAF and takes one frame per tick, so the paint rate is still bounded
+  // by the display refresh: this recovers lost frames, it does NOT present more images than
+  // exist, which would be the fabricated number gate #9 forbids.
+  var PRESENT_QMAX = 3;          // 3 clears every queue overflow at the measured jitter; 4 adds
+                                 // nothing but latency (?ratetest=1 22b/22c pin both ends).
+  var PRESENT_CAPTURE_MS = 4;
+  var _capQ = [], _capPool = [], _capW = 0, _capH = 0, _capQDrops = 0, _capQDepthMax = 0, _capN = 0;
+  window.__gcPresentStats = function () {
+    return { captured: _capN, queued: _capQ.length, queueDrops: _capQDrops,
+             queueDepthMax: _capQDepthMax, qMax: PRESENT_QMAX, captureMs: PRESENT_CAPTURE_MS };
+  };
+  function _sabPresentCapture() {
     try {
       if (!sharedMemory) return;
       var A = new Uint32Array(sharedMemory.buffer);
@@ -5124,57 +5365,78 @@ window.GcRate = (function () {
       var dims = A[0x026B3514 >> 2] >>> 0;
       var w = dims >>> 16, h = dims & 0xFFFF;
       if (!ptr || !w || !h) return;
-      var c = $('canvas');
-      if (c.width !== w) c.width = w;
-      if (c.height !== h) c.height = h;
-      if (!canvasCtx2D) canvasCtx2D = c.getContext('2d');
-      if (!canvasImg2D || canvasImg2D.width !== w || canvasImg2D.height !== h) {
-        canvasImg2D = canvasCtx2D.createImageData(w, h);
-        canvasImg32 = null;   // MUST clear: the old alias points at the previous backing store
-      }
+      if (!canvasCtx2D) canvasCtx2D = $('canvas').getContext('2d');
+      // A resolution change invalidates every buffered frame AND every pooled buffer — a
+      // stale-sized ImageData painted after the canvas resized is the classic garbage frame.
+      if (w !== _capW || h !== _capH) { _capQ.length = 0; _capPool.length = 0; _capW = w; _capH = h; }
+      var img = _capPool.pop();
+      if (!img) { img = canvasCtx2D.createImageData(w, h); img._u32 = new Uint32Array(img.data.buffer); }
       // ImageData rejects SharedArrayBuffer views — copy into its backing store.
-      canvasImg2D.data.set(new Uint8Array(sharedMemory.buffer, ptr, w * h * 4));
+      img.data.set(new Uint8Array(sharedMemory.buffer, ptr, w * h * 4));
       // [present-seqlock 2026-08-07] Re-check: if the worker bumped seq during the copy, the
-      // frame tore — discard it (don't paint, don't advance _sabPresentSeq; retry next tick).
-      if ((Atomics.load(A, 0x026B3518 >> 2) >>> 0) !== seq0) return;
+      // frame tore — discard it (don't queue it, don't advance _sabPresentSeq; retry next poll).
+      if ((Atomics.load(A, 0x026B3518 >> 2) >>> 0) !== seq0) { _capPool.push(img); return; }
       _sabPresentSeq = seq0;
-      // [takeover-unblock PM49 2026-08-03] the takeover gate's `rendered` input
-      // reads window._firstFrame, which only the LEGACY postMessage 'render'
-      // handler set — dead since the sab-present migration (PM28), leaving
-      // READY=false forever (the standing [gate-diag] console signal). The
-      // sab-present path IS the first-frame source now.
-      if (!window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame (sab-present) ' + w + 'x' + h);
-        // Ground truth for the diagnostics report: this path only runs when WGPUGfx is
-        // bumping the publish seqlock, so reaching it PROVES the fast path is live.
-        try { window.__gcGpu.present = 'sab-present / WGPU shared-heap (fast path) ' + w + 'x' + h; gcRenderBadge(); } catch (e) {} }
       // Force opaque alpha (readback alpha is undefined for the EFB). A u32 view ORs the
       // alpha byte of 4 pixels' worth of lanes per iteration instead of 1 — measured
       // 0.21ms/frame as a per-byte loop (present-diag 2026-09-01), the largest single
       // item in a 0.52ms present. Endianness-safe: alpha is the high byte on LE, and the
       // canvas ImageData buffer is only ever read back through the same view family.
-      var d32 = canvasImg32 || (canvasImg32 = new Uint32Array(canvasImg2D.data.buffer));
+      // Doing it HERE keeps the rAF tick down to one putImageData.
+      var d32 = img._u32;
       for (var i = 0; i < d32.length; i++) d32[i] |= 0xFF000000;
-      canvasCtx2D.putImageData(canvasImg2D, 0, 0);
-      // [present-watchdog] the ONE authoritative "the WebGPU path is alive right now" stamp.
-      _presentLastMs = performance.now();
-      if (!_sabPresentActive) {
-        _sabPresentActive = true;
-        pageLog('[sab-present] WGPU shared-heap present ACTIVE ' + w + 'x' + h);
+      _capQ.push(img); _capN++;
+      // Overflow: the producer is outrunning the display (?fps=0 freerun published 82.93/s
+      // against a 60Hz panel). Drop the OLDEST — that degrades to exactly the pre-queue
+      // behaviour and keeps the newest frame on screen, rather than showing stale ones.
+      if (_capQ.length > PRESENT_QMAX) { _capPool.push(_capQ.shift()); _capQDrops++; }
+      if (_capQ.length > _capQDepthMax) _capQDepthMax = _capQ.length;
+    } catch (e) { /* transient during boot */ }
+  }
+  function _sabPresentTick() {
+    try {
+      // Capture first: a frame published between the last 4ms poll and this tick must not have
+      // to wait a whole extra refresh (?ratetest=1 22's event ordering models this).
+      _sabPresentCapture();
+      if (_capQ.length) {
+        var img = _capQ.shift();
+        var c = $('canvas');
+        if (c.width !== img.width) c.width = img.width;
+        if (c.height !== img.height) c.height = img.height;
+        if (!canvasCtx2D) canvasCtx2D = c.getContext('2d');
+        // [takeover-unblock PM49 2026-08-03] the takeover gate's `rendered` input
+        // reads window._firstFrame, which only the LEGACY postMessage 'render'
+        // handler set — dead since the sab-present migration (PM28), leaving
+        // READY=false forever (the standing [gate-diag] console signal). The
+        // sab-present path IS the first-frame source now.
+        if (!window._firstFrame) { window._firstFrame = true; pageLog('[render] first frame (sab-present) ' + img.width + 'x' + img.height);
+          // Ground truth for the diagnostics report: this path only runs when WGPUGfx is
+          // bumping the publish seqlock, so reaching it PROVES the fast path is live.
+          try { window.__gcGpu.present = 'sab-present / WGPU shared-heap (fast path) ' + img.width + 'x' + img.height; gcRenderBadge(); } catch (e) {} }
+        canvasCtx2D.putImageData(img, 0, 0);
+        if (img.width === _capW && img.height === _capH && _capPool.length <= PRESENT_QMAX) _capPool.push(img);
+        // [present-watchdog] the ONE authoritative "the WebGPU path is alive right now" stamp.
+        _presentLastMs = performance.now();
+        if (!_sabPresentActive) {
+          _sabPresentActive = true;
+          pageLog('[sab-present] WGPU shared-heap present ACTIVE ' + img.width + 'x' + img.height);
+        }
+        // `shown` counts ONLY frames that got here — i.e. a seq we had not painted before. A
+        // rAF tick that finds an empty queue counts nothing, so this can never be inflated by
+        // re-presenting the same guest frame.
+        _shownCount++;
       }
-      // `shown` counts ONLY frames that got here — i.e. a seq we had not painted before. A
-      // rAF tick that finds no new frame returns above and counts nothing, so this can never
-      // be inflated by re-presenting the same guest frame.
-      _shownCount++;
     } catch (e) { /* transient during boot */ }
     finally { requestAnimationFrame(_sabPresentTick); }
   }
   requestAnimationFrame(_sabPresentTick);
+  setInterval(_sabPresentCapture, PRESENT_CAPTURE_MS);
   function paintFrame2D(pixels, w, h, pitch) {
     var c = $('canvas');
     if (!canvasCtx2D) canvasCtx2D = c.getContext('2d');
     if (!canvasImg2D || canvasImg2D.width !== w || canvasImg2D.height !== h) {
       canvasImg2D = canvasCtx2D.createImageData(w, h);
-      canvasImg32 = null;   // MUST clear: shared with the sab-present path's u32 alpha alias
+      canvasImg32 = null;   // MUST clear: the old alias points at the previous backing store
     }
     var dst = canvasImg2D.data;
     var stride = pitch || w * 4;
@@ -6007,7 +6269,7 @@ window.GcRate = (function () {
 })();
 </script>
 <script>
-// [recomp-live 2026-08-25] ?recomp=1 — the decomp->wasm NATIVE PORT mode. Boots MP4 under
+// [recomp-live 2026-08-25] the decomp->wasm NATIVE PORT mode. Boots MP4 under
 // the JIT as usual (initializing the WGPU renderer + guest RAM), then parks the emulated
 // CPU and hands the frame stream to gamecube/recomp/recomp_worker.js: the recompiled game
 // itself runs at native-wasm speed and its GP-FIFO frames render through Dolphin's backend.
@@ -6016,23 +6278,70 @@ window.GcRate = (function () {
 // &fps=0 (uncapped freerun) remain as deliberate speed-experiment arms and the readout says
 // "speed 2.00x" out loud when used. The frame rate we advertise is a SEPARATE, measured
 // quantity — see the RATE MODEL comment in the main script block.
+//
+// [engine-routing 2026-09-01] THIS IS NO LONGER OPT-IN. It used to require ?recomp=1, so every
+// visitor who landed on the page got the JIT — 0.68-0.76x hardware on MP4's board — while the
+// engine that runs the same title at 1.000x/60 sat behind an undocumented query parameter. The
+// engine is now chosen by GcRate.route() from the BOOTED ROM (see the ENGINE ROUTING block in
+// GcRate for the whole rationale and the ?recomp=1 / ?recomp=0 overrides).
+//
+// Consequence for this block's structure: with ?recomp=1 the answer was known at parse time, so
+// everything below ran at page load. Under routing the answer is not known until Start is
+// pressed (window.__romBase, gamecube.html:5905), so the body is now a function and NOTHING in
+// it — no 8 MiB staging SAB, no memory-card buttons, no keyboard listeners writing the pace
+// SAB, no 600 MB disc prefetch, and above all no window.__gcRate.set({path:'recomp'}) — happens
+// on a boot that is going to be a JIT boot. That last one was a live bug in the old block:
+// ?recomp=1 with PSO selected refused the takeover but still overwrote the JIT's rate readout
+// with a recomp-shaped model every second.
 (function () {
   var q = new URLSearchParams(location.search);
-  if (q.get('recomp') !== '1') return;
-  // The recomp IS the Mario Party 4 native port — with any other ROM selected (persisted
-  // gcwasm_romIdx, e.g. PSO) the takeover parked THAT game's CPU and streamed MP4 frames
-  // over its renderer: frozen title screen + garbled output on desktop AND mobile
-  // (user report 2026-08-27). Pin this boot's selection to MP4 by option label (ROMS is
-  // scoped inside the main IIFE — referencing it here threw and killed this whole block).
-  // Setting .value fires no 'change' event, so the user's saved pick for normal JIT
-  // visits stays untouched; lock the selects so it can't be switched mid-recomp.
-  [document.getElementById('romSelect'), document.getElementById('mobileRomSelect')].forEach(function (s) {
-    if (!s) return;
-    for (var oi = 0; oi < s.options.length; oi++)
-      if (/^Mario Party 4/.test(s.options[oi].textContent)) { s.value = s.options[oi].value; break; }
-    s.disabled = true;
-  });
-  console.log('[recomp-live] recomp mode: ROM pinned to Mario Party 4');
+  var param = q.has('recomp') ? q.get('recomp') : null;
+  var decided = GcRate.route(param, null);
+  // Published for ?ratetest=1 test 21i: the suite's own page load is a plain visit, so this
+  // object being absent means the routing block never ran and every title boots on the JIT.
+  window.__gcRecompRouting = { param: param, mode: decided.mode, engage: decided.engage,
+                               reason: decided.reason, romBase: null };
+  if (decided.warn) console.warn('[gcroute] ' + decided.warn);
+  if (decided.mode === 'off') { console.log('[gcroute] ' + decided.reason); return; }
+
+  if (decided.pin) {
+    // The recomp IS the Mario Party 4 native port — with any other ROM selected (persisted
+    // gcwasm_romIdx, e.g. PSO) the takeover parked THAT game's CPU and streamed MP4 frames
+    // over its renderer: frozen title screen + garbled output on desktop AND mobile
+    // (user report 2026-08-27). Pin this boot's selection to MP4 by option label (ROMS is
+    // scoped inside the main IIFE — referencing it here threw and killed this whole block).
+    // Setting .value fires no 'change' event, so the user's saved pick for normal JIT
+    // visits stays untouched; lock the selects so it can't be switched mid-recomp.
+    // ONLY under ?recomp=1: in auto mode the visitor's choice IS the routing input, so
+    // overwriting it would make the page pick MP4 for someone who asked for PSO.
+    [document.getElementById('romSelect'), document.getElementById('mobileRomSelect')].forEach(function (s) {
+      if (!s) return;
+      for (var oi = 0; oi < s.options.length; oi++)
+        if (/^Mario Party 4/.test(s.options[oi].textContent)) { s.value = s.options[oi].value; break; }
+      s.disabled = true;
+    });
+  }
+  console.log('[gcroute] ' + decided.reason);
+
+  if (decided.engage === true) { engine(); }
+  else {
+    // AUTO, undecided. __romBase is set synchronously inside startEmulator (gamecube.html:5905)
+    // from whichever select the visitor used — desktop button or mobile splash — so polling it
+    // covers both entry points without reaching into that IIFE's scope. Nothing above has any
+    // side effect, so a visit that never presses Start just leaves this poll running.
+    var romPoll = setInterval(function () {
+      var base = window.__romBase;
+      if (!base) return;
+      clearInterval(romPoll);
+      var d2 = GcRate.route(param, base);
+      window.__gcRecompRouting = { param: param, mode: d2.mode, engage: d2.engage,
+                                   reason: d2.reason, romBase: base };
+      console.log('[gcroute] ' + d2.reason);
+      if (d2.engage) engine();
+    }, 50);
+  }
+
+  function engine() {
   // [rate-split 2026-08-28] THE GUEST CLOCK AND THE REPORTED RATE ARE TWO KNOBS. They used to
   // be one, which is the bug: the credit grant IS emulated time (each pumped frame advances
   // the recomp's frame-driven clock by exactly 1/GUEST_HZ), so "raise the fps" literally meant
@@ -6780,6 +7089,7 @@ window.GcRate = (function () {
       clearInterval(armTimer); tryStart('bootms ceiling');
     }
   }, 500);
+  }   // end engine()
 })();
 </script>
 </body>
