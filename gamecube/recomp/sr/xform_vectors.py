@@ -40,6 +40,7 @@ import sr                             # noqa: E402
 SCRATCH = 0x81700000        # code goes here; 8 bytes per case
 DATA = 0x81720000           # the memory the load/store touches
 SENTINEL = 0x81740000       # LR target: execution must halt exactly here
+PAGE = 0x400                # staged data window; keep GDB packets small
 BLR = 0x4E800020
 
 # (mnemonic, xo, kind)  kind: 'ld'=GPR load, 'st'=GPR store, 'fld'=FPR load, 'fst'=FPR store
@@ -76,7 +77,7 @@ def cases():
             pay = payloads[i % len(payloads)]
             fb = fbits[i % len(fbits)]
             # DATA is the midpoint so a negative index stays inside the staged page
-            base = DATA + 0x1000
+            base = DATA + 0x200
             out.append(dict(name=f"{name}[{i}]", mnemonic=name, word=w, kind=kind,
                             width=width, r3=base, r5=off,
                             data=(pay * 2).hex(), fpr=fb))
@@ -96,13 +97,21 @@ def gdb_capture(a):
         g = dol.connect()
         print(f"[oracle] connected; pc={g.pc():#010x}")
 
+        # The GDB stub has a bounded packet size: a single `m` for 0x2000 bytes came
+        # back malformed ("fromhex() arg must contain an even number of hexadecimal
+        # digits" -- i.e. an error reply, not data).  Chunk both directions, and use
+        # native_oracle_gdb's own read_range for reads, which already does.
+        CHUNK = 0x200
+
         def wmem(addr, data):
-            r = g.cmd(f"M{addr:x},{len(data):x}:" + data.hex())
-            if r != "OK":
-                raise RuntimeError(f"M{addr:#x} -> {r!r}")
+            for o in range(0, len(data), CHUNK):
+                part = data[o:o + CHUNK]
+                r = g.cmd(f"M{addr + o:x},{len(part):x}:" + part.hex())
+                if r != "OK":
+                    raise RuntimeError(f"M{addr + o:#x},{len(part):#x} -> {r!r}")
 
         def rmem(addr, n):
-            return bytes.fromhex(g.cmd(f"m{addr:x},{n:x}"))
+            return g.read_range(addr, addr + n, chunk=CHUNK)
 
         def wreg(rid, val, width=8):
             r = g.cmd(f"P{rid:x}=" + f"{val:0{width*2}x}")
@@ -110,7 +119,7 @@ def gdb_capture(a):
                 raise RuntimeError(f"P{rid:#x} -> {r!r}")
 
         saved = rmem(SCRATCH, 8 * len(cases()) + 8)
-        savedd = rmem(DATA, 0x2000)
+        savedd = rmem(DATA, PAGE)
         print(f"[oracle] saved {len(saved)} scratch + {len(savedd)} data bytes")
         g.add_bp(SENTINEL)
         try:
@@ -118,7 +127,7 @@ def gdb_capture(a):
                 entry = SCRATCH + i * 8
                 wmem(entry, struct.pack('>II', c['word'], BLR))
                 # stage the data page around the effective address
-                wmem(DATA, b'\xa5' * 0x2000)
+                wmem(DATA, b'\xa5' * PAGE)
                 ea = (c['r3'] + c['r5']) & 0xFFFFFFFF
                 wmem(ea, bytes.fromhex(c['data']))
                 for r in range(32):
@@ -141,7 +150,7 @@ def gdb_capture(a):
                 rec['out_r3'] = g.reg(RA)
                 rec['out_r4'] = g.reg(RD)
                 rec['out_f4'] = g.reg(32 + RD)
-                rec['out_mem'] = rmem(DATA, 0x2000)[
+                rec['out_mem'] = rmem(DATA, PAGE)[
                     (ea - DATA) - 16:(ea - DATA) + 16].hex()
                 rec['mem_lo'] = ea - 16
                 recs.append(rec)
