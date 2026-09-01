@@ -426,6 +426,40 @@ correct value and corrupt the base — a test that only checked the loaded value
 pass. `verify_xform.mjs` therefore compares the updated `rA` first, then `rD`/`frD`
 (the latter as raw 64-bit bits, never as doubles), then a 32-byte memory window.
 
+### RESULT: 66 bit-exact / 0 mismatched of 66
+
+```
+  lwzux   6 / 0     lbzux   6 / 0     lhzux   6 / 0     lhaux   6 / 0
+  stwux   6 / 0     stbux   6 / 0     sthux   6 / 0
+  lfsux   6 / 0     lfdux   6 / 0     stfsux  6 / 0     stfdux  6 / 0
+  RESULT : 66 bit-exact / 0 mismatched  of 66
+```
+
+Goldens committed at `gamecube/recomp/sr/sab_xform_goldens.json`. **The x-form update
+forms are now verified by EXECUTION against the reference interpreter, not by
+inspection** — the gap §5 opened is closed.
+
+#### The first run said 60/6, and all six were my harness
+
+Before trusting a translator diagnosis, the shape of the failures was checked: `stfdux`
+stored `7ff0000000000000` when handed `7fefffffffffffff`, and `lfdux` lost exactly one
+low bit. That is not how a translation bug looks — it is how **JSON number precision**
+looks:
+
+```
+python wrote 0x7FEFFFFFFFFFFFFF = 9218868437227405311
+JS JSON.parse gives  9218868437227405000 = 0x7ff0000000000000
+```
+
+A JS `Number` cannot hold a 64-bit pattern, so `JSON.parse` silently rewrote `DBL_MAX`
+as `+Inf` — on both the *input* the wasm was given and the *expected* value it was
+compared against. The goldens file itself was always exact (Python writes integers at
+full precision); only the JavaScript read was lossy. 64-bit values are now serialised
+as hex strings and parsed with `BigInt`, and the same 66 vectors pass. **No translator
+change was made — the translator was right the first time**, and reporting those six as
+translator bugs would have been a false accusation with a plausible-looking diff table
+attached.
+
 ## 5f. What the first overlay attempt cost, and the bug in my own heuristic
 
 The first `titleD.rel` run reported `[base] NOT RECOVERED after 367 breakpoint hits`.

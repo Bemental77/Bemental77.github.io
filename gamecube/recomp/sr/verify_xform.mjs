@@ -58,7 +58,9 @@ const main = async () => {
     dv.setUint32(st + O_GPR + RB * 4, v.r5 >>> 0, true);
     if (v.kind === 'st')
       dv.setUint32(st + O_GPR + RD * 4, payload.readUInt32BE(0) >>> 0, true);
-    if (v.kind === 'fst') dv.setBigUint64(st + O_PS0 + RD * 8, BigInt(v.fpr), true);
+    // 64-bit values arrive as HEX STRINGS: a JSON number cannot hold
+    // 0x7FEFFFFFFFFFFFFF and JSON.parse silently rewrites it as +Inf.
+    if (v.kind === 'fst') dv.setBigUint64(st + O_PS0 + RD * 8, BigInt('0x' + v.fpr), true);
     dv.setUint32(st + O_PC, entry, true);
 
     const fault = M._sr_call(entry) >>> 0;
@@ -75,8 +77,8 @@ const main = async () => {
       diffs.push(`rA(updated base) want ${(v.out_r3 >>> 0).toString(16)} got ${gotR3.toString(16)}`);
     if (v.kind === 'ld' && gotR4 !== (v.out_r4 >>> 0))
       diffs.push(`rD want ${(v.out_r4 >>> 0).toString(16)} got ${gotR4.toString(16)}`);
-    if (v.kind === 'fld' && gotF4 !== BigInt(v.out_f4))
-      diffs.push(`frD want ${BigInt(v.out_f4).toString(16)} got ${gotF4.toString(16)}`);
+    if (v.kind === 'fld' && gotF4 !== BigInt('0x' + v.out_f4))
+      diffs.push(`frD want ${v.out_f4} got ${gotF4.toString(16).padStart(16, '0')}`);
     if ((v.kind === 'st' || v.kind === 'fst') && gotMem !== v.out_mem)
       diffs.push(`mem@${(v.mem_lo >>> 0).toString(16)}\n      want ${v.out_mem}\n      got  ${gotMem}`);
 

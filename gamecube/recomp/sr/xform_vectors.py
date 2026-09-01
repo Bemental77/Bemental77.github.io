@@ -80,7 +80,7 @@ def cases():
             base = DATA + 0x200
             out.append(dict(name=f"{name}[{i}]", mnemonic=name, word=w, kind=kind,
                             width=width, r3=base, r5=off,
-                            data=(pay * 2).hex(), fpr=fb))
+                            data=(pay * 2).hex(), fpr=f"{fb:016x}"))
     return out
 
 
@@ -137,7 +137,7 @@ def gdb_capture(a):
                 if c['kind'] == 'st':
                     wreg(RD, struct.unpack('>I', bytes.fromhex(c['data'])[:4])[0], 4)
                 if c['kind'] == 'fst':
-                    wreg(32 + RD, c['fpr'], 8)
+                    wreg(32 + RD, int(c['fpr'], 16), 8)
                 wreg(0x43, SENTINEL, 4)          # LR  (native_oracle_gdb.py:41)
                 wreg(0x40, entry, 4)             # PC
                 rep = g.cont(timeout=20.0)
@@ -149,7 +149,11 @@ def gdb_capture(a):
                 rec = dict(c)
                 rec['out_r3'] = g.reg(RA)
                 rec['out_r4'] = g.reg(RD)
-                rec['out_f4'] = g.reg(32 + RD)
+                # 64-BIT VALUES ARE SERIALISED AS HEX STRINGS, never as JSON numbers.
+                # JS JSON.parse turns 0x7FEFFFFFFFFFFFFF into 0x7FF0000000000000 (a
+                # double cannot hold it), so a raw number here silently rewrites
+                # DBL_MAX as +Inf and the diff blames the translator.
+                rec['out_f4'] = f"{g.reg(32 + RD):016x}"
                 rec['out_mem'] = rmem(DATA, PAGE)[
                     (ea - DATA) - 16:(ea - DATA) + 16].hex()
                 rec['mem_lo'] = ea - 16
