@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+  <script src="/lib/capability.js"></script>
   <meta charset="UTF-8" />
   <title>SNES Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -577,5 +578,20 @@
   document.body.appendChild(s);
 })();
 </script>
+  <script>
+    // [gate 2026-09-01] This page shipped with NO capability gate: a visitor
+    // whose browser could not run it got a broken page and no explanation.
+    // Spec lives in ONE place (Capability.SPECS.snes) so the page, the
+    // self-test and tools/device_matrix.mjs cannot drift apart. ?nogate=1
+    // overrides and is recorded on the report.
+    (function () {
+      if (!window.Capability) return;                 // never break the page
+      Capability.ready.then(function () {
+        function go() { Capability.autoGate(Capability.SPECS.snes); }
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', go);
+        else go();
+      });
+    })();
+  </script>
 </body>
 </html>
