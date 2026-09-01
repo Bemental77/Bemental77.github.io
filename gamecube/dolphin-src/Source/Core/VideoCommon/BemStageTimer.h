@@ -24,9 +24,12 @@
 // ARBITER is still the ablation matched pair, which has zero timer cost.
 //
 // Cells, all below the 0x026B3C00 powerpc-next FPR spill window
-// (fpr_reg_cache.cpp:335) and above the 0x026B3B1C top of the FIFO-brake block:
-//   0x026B3B20  enable (0 = timers off)
-//   0x026B3B24  spare
+// (fpr_reg_cache.cpp:335). NOTE: the FIFO-brake block does NOT end at
+// 0x026B3B1C — 425039fd also owns 0x026B3B20 as the brake KILL SWITCH. That
+// off-by-one-cell reading is what put `enable` on top of the kill switch; see
+// the kEnableCell definition below.
+//   0x026B3BDC  enable (0 = timers off)   [was 0x026B3B20 — collided; fixed]
+//   0x026B3B24  ablation-hit counter, ARM D (kAblBPHitCell — NOT spare)
 //   0x026B3B28  ablation-hit counter, ARM A  (WGPUGfx::DrawIndexed)
 //   0x026B3B2C  ablation-hit counter, ARM B  (VertexManagerBase::Flush)
 //   0x026B3B30  ablation-hit counter, ARM A' (VertexManagerBase::RenderDrawCall)
@@ -70,7 +73,19 @@ enum : int
 
 inline constexpr int kCalReads = 64;  // calibration reads per frame
 
-inline constexpr std::uintptr_t kEnableCell = 0x026B3B20u;
+// [CELL COLLISION FIX 2026-09-01] This was 0x026B3B20 — which is the FIFO
+// backpressure brake's KILL SWITCH (CommandProcessor.cpp BemFifoBackpressure,
+// landed 4h41m EARLIER in 425039fd, "nonzero = brake DISABLED"). The comment
+// above reads the brake block as ending at 0x026B3B1C, its last COUNTER, and
+// missed that 425039fd also claimed 0x026B3B20. The semantics compose in the
+// worst possible way: nonzero means "timers ON" here and "brake OFF" there, so
+// ARMING THE STAGE TIMERS SILENTLY DISABLED THE PSO FIFO WEDGE BRAKE — including
+// via the probe's PROBE_STAGE_SPLIT, which writes this cell
+// (dolphin_render_probe.js). Moved to the first free cell above the u32 counts
+// (0x026B3B98 + 17*4 = 0x026B3BDC), still inside the documented
+// 0x026B3900..0x026B3BFC window and below the 0x026B3C00 FPR spill.
+// CommandProcessor.cpp static_asserts these two differ, so this cannot recur.
+inline constexpr std::uintptr_t kEnableCell = 0x026B3BDCu;
 inline constexpr std::uintptr_t kAblAHitCell = 0x026B3B28u;
 inline constexpr std::uintptr_t kAblBHitCell = 0x026B3B2Cu;
 inline constexpr std::uintptr_t kAblApHitCell = 0x026B3B30u;

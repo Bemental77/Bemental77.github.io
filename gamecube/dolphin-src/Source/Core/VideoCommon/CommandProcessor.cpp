@@ -17,6 +17,9 @@
 #if defined(__EMSCRIPTEN__)
 #include <emscripten.h>
 #include <emscripten/threading.h>
+// For the kEnableCell static_assert next to BemFifoBackpressure — the stage
+// timers' enable cell must never land on this brake's kill switch again.
+#include "VideoCommon/BemStageTimer.h"
 #endif
 #include "Core/HW/GPFifo.h"
 #include "Core/HW/MMIO.h"
@@ -417,15 +420,28 @@ void CommandProcessorManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
 // BOUNDED: on timeout we give up and let the burst through, so the worst case
 // degrades to today's behaviour rather than to a new hang.
 //
-// Witness cells (0x026B3B10..0x026B3B20 — repo-wide grep shows no other use;
+// Witness cells (0x026B3B10..0x026B3B20 — the "no other use" claim below WAS
+// FALSE from 2026-08-29 to 2026-09-01: BemStageTimer::kEnableCell was placed on
+// 0x026B3B20 and silently disabled this brake; the static_assert below now
+// enforces it;
 // 0x026B3B00/04/08 are the draw-ablation arms):
 //   0x026B3B10 engage count   0x026B3B14 timeout-bail count
 //   0x026B3B18 cumulative ms parked      0x026B3B1C max distance seen at engage
 //   0x026B3B20 KILL SWITCH (nonzero = brake DISABLED, for a matched-pair control
 //              on ONE wasm)
+// [CELL COLLISION GUARD 2026-09-01] BemStageTimer's `enable` cell was placed on
+// 0x026B3B20 — this brake's KILL SWITCH — so arming the render-stage timers
+// (probe: PROBE_STAGE_SPLIT) silently DISABLED the wedge brake. Naming the
+// address and asserting it against the timer's cell makes a repeat a build
+// error instead of a silent loss of the only backpressure the guest has.
+inline constexpr uintptr_t kBemFifoBrakeKillCell = 0x026B3B20u;
+static_assert(kBemFifoBrakeKillCell != BemStage::kEnableCell,
+              "FIFO-brake kill switch collides with BemStageTimer::kEnableCell — "
+              "arming the stage timers would disable the PSO FIFO wedge brake");
+
 void CommandProcessorManager::BemFifoBackpressure()
 {
-  if (*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3B20u)) != 0u)
+  if (*reinterpret_cast<volatile u32*>(kBemFifoBrakeKillCell) != 0u)
     return;  // control arm: brake off
 
   const u32 hi = m_fifo.CPHiWatermark;

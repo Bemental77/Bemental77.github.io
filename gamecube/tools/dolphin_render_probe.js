@@ -862,7 +862,13 @@ function startServer() {
 
   // ---- [render-stage split 2026-08-29] ------------------------------------
   // PROBE_STAGE_SPLIT=<periodMs> turns on the BemStageTimer regions
-  // (VideoCommon/BemStageTimer.h, enable cell 0x026B3B20) and prints ONE line per
+  // (VideoCommon/BemStageTimer.h, enable cell 0x026B3BDC) and prints ONE line per
+  // [CELL COLLISION FIX 2026-09-01] This cell was 0x026B3B20, which is the FIFO
+  // backpressure brake's KILL SWITCH (CommandProcessor.cpp BemFifoBackpressure,
+  // "nonzero = brake DISABLED"). So every PROBE_STAGE_SPLIT run silently
+  // DISABLED the PSO FIFO wedge brake while measuring — the wedge the brake
+  // exists to prevent was re-armed by the act of profiling. Any stage-split
+  // result taken before this date ran with the brake OFF.
   // window with the DELTA of every stage accumulator, so _recomp_render_fifo is
   // attributed to opcode decode / BP+XF register writes / vertex load / texture
   // cache / constants / pipeline / WGPU submission instead of one 15 ms bar.
@@ -893,9 +899,9 @@ function startServer() {
     setTimeout(async () => {
       try {
         await page.evaluate(() => {
-          if (window.sharedMemory) new Uint32Array(window.sharedMemory.buffer)[0x026B3B20 >> 2] = 1;
+          if (window.sharedMemory) new Uint32Array(window.sharedMemory.buffer)[0x026B3BDC >> 2] = 1;
         });
-        console.log('[stage-split] timers ARMED (cell 0x026B3B20=1) at t=' + _ssStart + 'ms');
+        console.log('[stage-split] timers ARMED (cell 0x026B3BDC=1) at t=' + _ssStart + 'ms');
       } catch (e) { console.log('[stage-split] arm failed: ' + e.message); }
     }, _ssStart);
     const _ssTimer = setInterval(async () => {
