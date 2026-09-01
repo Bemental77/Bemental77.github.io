@@ -1520,28 +1520,28 @@ window.GcRate = (function () {
        live ? JSON.stringify(live) : 'window.__gcRecompRouting is undefined — the routing block '
               + 'did not run on a plain visit, so every title boots on the JIT');
 
-    // ---- 22. PRESENT POLICY -----------------------------------------------------------------
+    // ---- 23. PRESENT POLICY -----------------------------------------------------------------
     // Reproduces the shape MEASURED on the live recomp path: publishes at 60/s with a few ms of
-    // jitter, rAF a locked 60/s. 22d is the control that keeps 22a honest.
+    // jitter, rAF a locked 60/s. 23d is the control that keeps 23a honest.
     // The jitter half-width is not a free parameter: 10ms is the value at which this model
     // reproduces the LIVE measurement (old policy paints 87.0% of publishes here; the live
     // recomp path measured 53.10 shown against 60.00 published = 88.5%). Below ~8.3ms — half a
     // frame period — two publishes can never share one rAF interval and the old policy is
-    // lossless, which is what 22d pins.
+    // lossless, which is what 23d pins.
     var RAFS = [];
     for (var i22 = 0; i22 < 600; i22++) RAFS.push(i22 * 16.6667);
     var PUB_JIT = jitterSeries(600, 16.6667, 10, 12345, 8.0);
     var oldJ = presentSim({ publishTimes: PUB_JIT, rafTimes: RAFS, captureEveryMs: 0, qMax: 1 });
     var newJ = presentSim({ publishTimes: PUB_JIT, rafTimes: RAFS, captureEveryMs: 4, qMax: 3 });
-    ck('22a the OLD policy (read the single slot once per rAF, no queue) LOSES published frames',
+    ck('23a the OLD policy (read the single slot once per rAF, no queue) LOSES published frames',
        oldJ.lost > 0.05 * oldJ.published,
        'lost ' + oldJ.lost + '/' + oldJ.published + ' = ' + fx(100 * oldJ.lost / oldJ.published, 1) +
        '%, painted ' + fx(100 * oldJ.painted / oldJ.published, 1) + '%');
-    ck('22b capture-off-rAF (4ms) + a 3-deep queue recovers most of them and overflows never',
+    ck('23b capture-off-rAF (4ms) + a 3-deep queue recovers most of them and overflows never',
        newJ.painted >= 0.95 * newJ.published && newJ.lost < 0.4 * oldJ.lost && newJ.qDrops === 0,
        'lost ' + newJ.lost + ' (was ' + oldJ.lost + '), painted ' + fx(100 * newJ.painted / newJ.published, 1) +
        '%, queue overflows ' + newJ.qDrops);
-    ck('22c and it never paints more than the display can show — no fabricated presents',
+    ck('23c and it never paints more than the display can show — no fabricated presents',
        newJ.painted <= newJ.rafTicks && newJ.qMaxSeen <= 3,
        'painted ' + newJ.painted + ' rAF ticks ' + newJ.rafTicks + ' qMax seen ' + newJ.qMaxSeen);
     // 22d — CONTROL. A publisher with NO jitter, comfortably inside the rAF interval, loses
@@ -1549,14 +1549,14 @@ window.GcRate = (function () {
     // rather than of the jitter, and 22b would be measuring nothing.
     var PUB_CLEAN = jitterSeries(600, 16.6667, 0, 1, 8.0);
     var oldC = presentSim({ publishTimes: PUB_CLEAN, rafTimes: RAFS, captureEveryMs: 0, qMax: 1 });
-    ck('22d control: with a jitter-free publisher the OLD policy loses nothing either — 22a is about jitter, not the harness',
+    ck('23d control: with a jitter-free publisher the OLD policy loses nothing either — 23a is about jitter, not the harness',
        oldC.lost === 0, 'lost ' + oldC.lost + '/' + oldC.published);
     // 22e — the ?fps=0 shape (measured 82.93 published/s against a 60Hz panel). More frames
     // exist than the display can show, so frames MUST be dropped; the requirement is that the
     // queue stays bounded and the counter still cannot exceed the refresh.
     var PUB_FAST = jitterSeries(800, 12.06, 3, 777, 8.0);
     var fastN = presentSim({ publishTimes: PUB_FAST, rafTimes: RAFS, captureEveryMs: 4, qMax: 3 });
-    ck('22e a producer faster than the display still cannot paint more than the display refresh',
+    ck('23e a producer faster than the display still cannot paint more than the display refresh',
        fastN.painted <= fastN.rafTicks && fastN.qMaxSeen <= 3 && fastN.qDrops > 0,
        'painted ' + fastN.painted + '/' + fastN.rafTicks + ' rAF, queue drops ' + fastN.qDrops);
 
@@ -5380,8 +5380,8 @@ window.GcRate = (function () {
   // distinct frames/s were published, rAF fired a locked 59.99/s, and only 51.98-55.47/s
   // reached the canvas — 409 of 3606 rAF ticks found nothing new while 414 published frames
   // were overwritten before anyone read them. See the PRESENT POLICY block in GcRate for the
-  // full diagnosis and ?ratetest=1 tests 22a-22e, which assert this policy against the shape
-  // measured here (22d is the control that proves the loss comes from publish jitter and not
+  // full diagnosis and ?ratetest=1 tests 23a-23e, which assert this policy against the shape
+  // measured here (23d is the control that proves the loss comes from publish jitter and not
   // from the harness).
   //
   // Capture runs on a 4ms timer (the foreground setInterval floor) and does the 1.2MB copy
@@ -5390,15 +5390,21 @@ window.GcRate = (function () {
   // by the display refresh: this recovers lost frames, it does NOT present more images than
   // exist, which would be the fabricated number gate #9 forbids.
   var PRESENT_QMAX = 3;          // 3 clears every queue overflow at the measured jitter; 4 adds
-                                 // nothing but latency (?ratetest=1 22b/22c pin both ends).
+                                 // nothing but latency (?ratetest=1 23b/23c pin both ends).
   var PRESENT_CAPTURE_MS = 4;
   var _capQ = [], _capPool = [], _capW = 0, _capH = 0, _capQDrops = 0, _capQDepthMax = 0, _capN = 0;
+  var _capPolls = 0;
+  // captured vs polls is the diagnosis when frames still go missing: `captured` short of
+  // `published` with `polls` at ~1000/s means the publisher put two frames in the slot inside
+  // one poll interval (only a multi-slot publish buffer can fix that); `polls` itself down at
+  // ~60/s means the capture CLOCK is being starved and the fix is on this side.
   window.__gcPresentStats = function () {
-    return { captured: _capN, queued: _capQ.length, queueDrops: _capQDrops,
+    return { captured: _capN, polls: _capPolls, queued: _capQ.length, queueDrops: _capQDrops,
              queueDepthMax: _capQDepthMax, qMax: PRESENT_QMAX, captureMs: PRESENT_CAPTURE_MS };
   };
   function _sabPresentCapture() {
     try {
+      _capPolls++;
       if (!sharedMemory) return;
       var A = new Uint32Array(sharedMemory.buffer);
       // [present-seqlock 2026-08-07] Read seq with an acquire; skip if unchanged, or ODD
@@ -5441,7 +5447,7 @@ window.GcRate = (function () {
   function _sabPresentTick() {
     try {
       // Capture first: a frame published between the last 4ms poll and this tick must not have
-      // to wait a whole extra refresh (?ratetest=1 22's event ordering models this).
+      // to wait a whole extra refresh (?ratetest=1 23's event ordering models this).
       _sabPresentCapture();
       if (_capQ.length) {
         var img = _capQ.shift();
