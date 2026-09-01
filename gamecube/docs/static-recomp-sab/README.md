@@ -562,6 +562,39 @@ values pointed, with `--scan-chunk` raised to `0x1000` (the stub rejects a singl
 boot the game has not reached the point where it `OSLink`s anything. The signature was
 not missed — the overlay was not there yet.
 
+### Fourth bottleneck: the client was leaving the CPU halted
+
+With the scan moved after the boot, the boot itself still crawled — **1.5 s of emulated
+time in 600 s = 0.0025x**, against the 0.0328x measured earlier. The mechanism is in
+`native_oracle_gdb`'s own docstrings: `GDB.cont()` *"blocks until a breakpoint hits (no
+async break exists)"*, and `GDB.resync()` finishes by calling `pc()`, which requires a
+**halted** CPU. Pairing a 30 s `cont` timeout with a `resync` therefore stalls the
+guest — a probe fires, Dolphin halts the CPU and waits for the client, and the client is
+sitting inside a 30 s timeout doing nothing.
+
+Boot advance now arms **one** hot anchor (`OSDisableInterrupts` `0x800e78ac`, 212 direct
+callers), uses an 8 s timeout, and re-continues immediately on every stop with no
+per-stop work, printing progress every 120 s so the rate is visible during the run
+rather than reconstructed afterwards.
+
+### Four bottlenecks, each measured, none of them the same thing
+
+This is the part worth carrying forward: every attempt failed for a *different* reason,
+so no single fix would have worked, and each cause was found by measuring rather than
+guessing.
+
+| # | cause | evidence | fix |
+|---|---|---|---|
+| 1 | probe rarity | 367 breakpoint hits, none from the overlay | rank by overlay-calls ÷ DOL-callers |
+| 2 | breakpoint storm | 40 armed → 0.010x (3.0 s emulated / 300 s wall) | 12 DOL-quiet probes |
+| 3 | scan cost | 960 of 981 s scanning, guest at 1.4 s emulated | boot first, scan once, narrowed window |
+| 4 | CPU left halted | 1.5 s emulated / 600 s = 0.0025x vs 0.0328x | one hot anchor, stops answered at once |
+
+Two further defects were structural rather than tuning: the **LR trick is unsound for
+tail-called helpers** (§ above), and `rel_emit.py --base` was translating **raw file
+bytes** instead of the live relocated section, which would have produced a
+register/memory diff that looked like a translator bug and was not one.
+
 ### Probe selection, three revisions, two of them wrong
 
 | rev | ranked by | why it failed |
