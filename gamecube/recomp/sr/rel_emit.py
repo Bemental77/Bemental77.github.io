@@ -48,7 +48,26 @@ def emit_at_real_base(a, m, ent, res, dimg, dol_by, base):
     if len(execs) != 1:
         raise SystemExit(f"--base assumes one executable section, got {len(execs)}")
     sec = execs[0]["idx"]
+    # THE SHIPPED BYTES ARE NOT WHAT EXECUTES.  OSLink's Relocate()
+    # (~/gc_refs/dolsdk2001/src/os/OSLink.c:146-200) patches the image IN PLACE:
+    # ADDR32 writes a word, ADDR16_HA/LO/HI rewrite the low half of a lis/addi pair,
+    # REL24 rewrites a branch displacement.  rel.py:147 section_bytes() returns the raw
+    # FILE bytes, so translating them bakes PLACEHOLDER constants into every address
+    # materialisation -- silently, and only an address-materialising function shows it.
+    # fixture_rel.py dumps the LIVE relocated section next to its fixtures; use it.
     blob = m.section_bytes(sec)
+    if a.live_section:
+        live = open(a.live_section, 'rb').read()
+        if len(live) != len(blob):
+            raise SystemExit(f"--live-section is {len(live)} bytes, section is {len(blob)}")
+        diff = sum(1 for i in range(0, len(blob), 4) if live[i:i+4] != blob[i:i+4])
+        print(f"[rel_emit] using LIVE relocated section: {diff} of {len(blob)//4} words "
+              f"differ from the shipped file (= the OSLink patches)")
+        blob = live
+    else:
+        print("[rel_emit] WARNING: translating RAW FILE BYTES -- every ADDR32/ADDR16_HA "
+              "site still holds its unrelocated placeholder.  Pass --live-section for a "
+              "differential.", file=sys.stderr)
     va = lambda off: (base + off) & 0xFFFFFFFF                       # noqa: E731
     # Other modules keep a synthetic base; only THIS module is placed for real.
     mod_vbase = lambda mid, s: (base if (mid == m.id and s == sec)
@@ -125,6 +144,11 @@ def main():
     ap.add_argument('--entry', action='append', default=[],
                     help='with --base: emit only these RUNTIME addresses and their '
                          'transitive callee closure (overlay AND DOL)')
+    ap.add_argument('--live-section',
+                    help='binary dump of the RELOCATED executable section, as written by '
+                         'fixture_rel.py alongside its fixtures. Required for a '
+                         'differential: without it every address materialisation is a '
+                         'placeholder.')
     ap.add_argument('--indirect', action='store_true',
                     help='route blrl/bctr/bctrl through sr_indirect()')
     ap.add_argument('--boundaries', default='outer+calls',
