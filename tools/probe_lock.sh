@@ -107,6 +107,24 @@ acquire() {
   done
 }
 
+# Native Dolphin oracle runs orphan exactly like browsers do, and
+# browser_leak_guard.js deliberately only touches Chromes it registered — so
+# nothing reaped these. Observed live: a `dolphin-emu-nogui` reparented to
+# launchd with 18:44 elapsed, left behind by an agent whose run was killed.
+#
+# THE ORPHAN TEST IS PPID == 1, and it is exact: a Dolphin belonging to a LIVE
+# run has a live parent (measured alongside the orphan above: pid 78097 with
+# ppid 78095). So this can never kill a sibling's running oracle, which is the
+# same guarantee browser_leak_guard gives via its owner-PID registry.
+reap_orphan_oracles() {
+  local killed=0 pid
+  for pid in $(ps -eo pid,ppid,comm | awk '$2==1 && $3 ~ /dolphin-emu/ {print $1}'); do
+    kill -9 "$pid" 2>/dev/null && killed=$((killed+1))
+  done
+  [ "$killed" -gt 0 ] && echo "[probe-lock] reaped ${killed} ORPHANED dolphin oracle process(es) (ppid==1)"
+  return 0
+}
+
 release() {
   # Only the owner may release, so a crashed sibling cannot drop someone
   # else's lock and let two measurements overlap.
@@ -123,6 +141,7 @@ case "${1:-status}" in
     acquire || exit 7
     trap release EXIT INT TERM
     node "$(dirname "$0")/browser_leak_guard.js" reap || true
+    reap_orphan_oracles
     "$@"; rc=$?
     echo "[probe-lock] command exit=${rc} load=$(load1)"
     exit "$rc"
