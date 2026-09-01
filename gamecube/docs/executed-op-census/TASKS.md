@@ -152,7 +152,16 @@ compare-and-branch tail:
 **316 executed unconditional wasm ops for 9 guest instructions = 35.1 ops per
 guest instruction, of which 162 (51.3%) is per-block fixed overhead and 117
 (37%) is the terminal alone, paid three times because the loop is cut into three
-blocks.** With the edge diet the terminal drops to 31/block and the iteration to
+blocks.**
+
+> ⚠ **This example's WEIGHT is now stale, though its op counts are not.** Commit
+> `8a4342e5` ("idle-skip SAB's frame governor — guest 0.4311x -> 0.4726x") landed
+> after this census was taken, and it skips this loop. The per-block op counts
+> above are properties of the emitter and still hold for any block of that shape,
+> but the governor's 23.2% share of the PC census is gone, so the SAB weighting
+> in this document predates it. **Re-capture the histogram before quoting any
+> weighted number here as current** — the by-length table is the part that
+> generalizes. With the edge diet the terminal drops to 31/block and the iteration to
 **292 ops (−7.6%)**. Merging the three blocks into one would remove two entire
 terminals and two prologues — which is why the concurrent leaf-inline work and
 this diet compose rather than compete.
