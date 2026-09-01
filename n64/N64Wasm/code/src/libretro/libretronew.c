@@ -1436,10 +1436,10 @@ int savestates_save_m64p(unsigned char *data, size_t size);
 bool neil_serialize()
 {
     printf("save state\n");
-    if (savestates_save_m64p(&savestate_buffer, sizeof(savestate_buffer)))
+    if (savestates_save_m64p(savestate_buffer, sizeof(savestate_buffer)))
     {
-        gzFile* fi = (gzFile*)gzopen("savestate.gz", "wb");
-        gzwrite(fi, &savestate_buffer, sizeof(savestate_buffer));
+        gzFile fi = gzopen("savestate.gz", "wb");
+        gzwrite(fi, savestate_buffer, sizeof(savestate_buffer));
         gzclose(fi);
 
 #ifdef __EMSCRIPTEN__
@@ -1535,11 +1535,11 @@ bool neil_export_fla()
 bool neil_unserialize()
 {
     printf("load state\n");
-    gzFile* fi = (gzFile*)gzopen("savestate.gz", "rb");
-    gzread(fi, &savestate_buffer, sizeof(savestate_buffer));
+    gzFile fi = gzopen("savestate.gz", "rb");
+    gzread(fi, savestate_buffer, sizeof(savestate_buffer));
     gzclose(fi);
 
-    if (savestates_load_m64p(&savestate_buffer, sizeof(savestate_buffer)))
+    if (savestates_load_m64p(savestate_buffer, sizeof(savestate_buffer)))
         return true;
 
     return false;
@@ -1578,5 +1578,5 @@ uint32_t* get_video_buffer()
             buffer[(i * 640) + j].r = temp;
         }
     }
-    return buffer;
+    return (uint32_t*)buffer;
 }
