@@ -136,19 +136,59 @@ class MyClass {
     }
 
     writeAudio(ptr, frames) {
-        // Called by WASM systemOnWriteDataToSoundBuffer with a pointer into HEAPU8
-        if (this.gameSpeed > 1) return; // mute audio during fast-forward
-        if (!this.wasmAudioBuf) {
-            this.wasmAudioBuf = new Int16Array(Module.HEAPU8.buffer).subarray(ptr >> 1, (ptr >> 1) + 2048);
+        // Called by WASM systemOnWriteDataToSoundBuffer with a pointer into HEAPU8.
+        const d = window.__audioDiag;
+        if (this.gameSpeed > 1) return; // mute audio during fast-forward (deliberate)
+
+        // HEAP VIEW: re-derive whenever the pointer moves OR the backing buffer
+        // is replaced. The old code cached this view exactly once, forever, with
+        // a hardcoded 2048-entry length. Two ways that goes wrong, and both are
+        // silent:
+        //   * Emscripten memory growth ALLOCATES A NEW ArrayBuffer and detaches
+        //     the old one. A cached Int16Array over the detached buffer reads as
+        //     length 0, so every subsequent batch would copy nothing — audio just
+        //     stops, with no error anywhere.
+        //   * The view was 2048 int16 entries = 1024 STEREO FRAMES, but the loop
+        //     below indexes up to `frames*2`. Any batch above 1024 frames read
+        //     past the end of the view and yielded `undefined`, which stores as 0
+        //     — i.e. a burst of silence in the middle of the batch.
+        // Re-deriving costs one subarray() per batch (~a few dozen per second).
+        const need = frames * 2;
+        if (!this.wasmAudioBuf
+            || this.wasmAudioBuf.buffer !== Module.HEAPU8.buffer
+            || this.wasmAudioPtr !== ptr
+            || this.wasmAudioBuf.length < need) {
+            this.wasmAudioBuf = new Int16Array(Module.HEAPU8.buffer).subarray(ptr >> 1, (ptr >> 1) + need);
+            this.wasmAudioPtr = ptr;
         }
-        if (this.audioFifoCnt + frames >= AUDIO_FIFO_MAXLEN) return;
+
+        // Accept as much as fits instead of discarding the whole batch. The old
+        // `if (cnt + frames >= MAXLEN) return;` threw away an ENTIRE batch the
+        // moment the FIFO was within one batch of full, so a steady mild
+        // overproduction produced periodic whole-batch dropouts rather than a
+        // gradual trim. Partial acceptance keeps the FIFO topped up and drops
+        // strictly less audio.
+        //
+        // NOTE (gate #9): dropping here can never slow the guest. _emuLoop is
+        // driven solely by rAF and never consults the FIFO, so this path has no
+        // back-edge into emulation timing.
+        const room = AUDIO_FIFO_MAXLEN - 1 - this.audioFifoCnt;
+        const n = Math.min(frames, room < 0 ? 0 : room);
         let tail = (this.audioFifoHead + this.audioFifoCnt) % AUDIO_FIFO_MAXLEN;
-        for (let i = 0; i < frames; i++) {
+        for (let i = 0; i < n; i++) {
             this.audioFifo0[tail] = this.wasmAudioBuf[i * 2];
             this.audioFifo1[tail] = this.wasmAudioBuf[i * 2 + 1];
             tail = (tail + 1) % AUDIO_FIFO_MAXLEN;
         }
-        this.audioFifoCnt += frames;
+        this.audioFifoCnt += n;
+
+        if (d) {
+            d.framesProduced += frames;
+            d.batchesFed++;
+            d.lastFeedMs = performance.now();
+            if (n < frames) { d.droppedFrames = (d.droppedFrames || 0) + (frames - n); d.batchesDropped++; }
+            d.fill = this.audioFifoCnt;
+        }
     }
 
     // ── AUDIO ─────────────────────────────────────────────────────────────────
@@ -163,10 +203,15 @@ class MyClass {
             // This is better for games than the near-zero latencyHint which caused
             // the ScriptProcessor to compete with touch events on mobile.
             this.audioContext = new AudioContext({ latencyHint: 'playback', sampleRate: 48000 });
+            if (window.AudioDiag) {
+                window.AudioDiag.install('gba', { capacity: AUDIO_FIFO_MAXLEN, ctxRate: this.audioContext.sampleRate });
+                window.AudioDiag.observeContext(this.audioContext);
+            }
             const sp = this.audioContext.createScriptProcessor(AUDIO_BLOCK_SIZE, 0, 2);
             sp.onaudioprocess = (ev) => {
                 const o0 = ev.outputBuffer.getChannelData(0);
                 const o1 = ev.outputBuffer.getChannelData(1);
+                const d = window.__audioDiag;
                 if (!this.isRunning) { o0.fill(0); o1.fill(0); return; }
                 // Drain the FIFO. If it runs dry, output silence — rAF is the sole
                 // frame driver; running catch-up frames here caused double-speed
@@ -180,6 +225,21 @@ class MyClass {
                 }
                 // Fill any remainder with silence
                 for (let i = n; i < AUDIO_BLOCK_SIZE; i++) { o0[i] = 0; o1[i] = 0; }
+                // COUNT THE ZERO-FILL. This sink used to starve completely
+                // silently: no counter, no log, nothing on the page observed it.
+                // A writer-side counter cannot see this — only the sink knows it
+                // ran dry — so without this the page could report healthy
+                // production while emitting gaps.
+                if (d) {
+                    d.framesConsumed = (d.framesConsumed || 0) + AUDIO_BLOCK_SIZE;
+                    if (n < AUDIO_BLOCK_SIZE) {
+                        d.underrunFrames = (d.underrunFrames || 0) + (AUDIO_BLOCK_SIZE - n);
+                        d.underruns = (d.underruns || 0) + 1;
+                    } else if (d.underrunFrames === null) {
+                        d.underrunFrames = 0;   // observed, and none so far
+                    }
+                    d.fill = this.audioFifoCnt;
+                }
             };
             sp.connect(this.audioContext.destination);
             this.audioContext.resume();

@@ -1,0 +1,98 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>audio tap self-test</title>
+<!--
+  Arm-difference proof for tools/audio_tap.js.
+
+  A "the page produced no audio" verdict is only worth anything if the
+  instrument can be shown to report differently when audio IS produced. This
+  fixture drives the tap through four arms with known-different ground truth:
+
+    ?arm=tone     oscillator -> destination            => audible
+    ?arm=silent   oscillator -> gain(0) -> destination => rendered, all zeros
+    ?arm=nograph  oscillator built, never connected    => rendered, all zeros
+    ?arm=gaps     tone chopped with 200ms silences     => audible + gaps
+    ?arm=click    tone with injected discontinuities   => audible + discontinuities
+
+  The harness (tools/audio_tap_selftest.mjs) asserts the arms DIFFER. If they
+  do not, the tap is a placebo and every verdict taken with it is void.
+-->
+<body style="font:14px system-ui;padding:2rem">
+<h1>audio tap self-test</h1>
+<p id="status">idle</p>
+<button id="go">start</button>
+<script>
+const q = new URLSearchParams(location.search);
+const arm = q.get('arm') || 'tone';
+const status = document.getElementById('status');
+
+async function start() {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+  if (ctx.state === 'suspended') { try { await ctx.resume(); } catch (e) {} }
+  window.__selftestCtx = ctx;
+
+  if (arm === 'nograph') {
+    const osc = ctx.createOscillator();
+    osc.frequency.value = 440;
+    osc.start();                      // never connected to anything
+    status.textContent = 'arm=nograph (oscillator running, not connected)';
+    return;
+  }
+
+  if (arm === 'silent') {
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    g.gain.value = 0;                 // real graph, zero output
+    osc.connect(g); g.connect(ctx.destination);
+    osc.start();
+    status.textContent = 'arm=silent (gain 0)';
+    return;
+  }
+
+  if (arm === 'gaps') {
+    // 300 ms tone / 200 ms silence, repeating: a deliberate dropout pattern.
+    const g = ctx.createGain();
+    g.gain.value = 0;
+    g.connect(ctx.destination);
+    const osc = ctx.createOscillator();
+    osc.frequency.value = 440;
+    osc.connect(g);
+    osc.start();
+    let on = false;
+    setInterval(() => {
+      on = !on;
+      g.gain.setValueAtTime(on ? 0.25 : 0, ctx.currentTime);
+    }, on ? 300 : 200);
+    status.textContent = 'arm=gaps';
+    return;
+  }
+
+  if (arm === 'click') {
+    // A square wave at a low frequency is full of maximal sample-to-sample
+    // steps — exactly the signal shape a crackle detector must catch.
+    const osc = ctx.createOscillator();
+    osc.type = 'square';
+    osc.frequency.value = 1000;
+    const g = ctx.createGain();
+    g.gain.value = 0.5;
+    osc.connect(g); g.connect(ctx.destination);
+    osc.start();
+    status.textContent = 'arm=click (square wave)';
+    return;
+  }
+
+  // arm=tone (default)
+  const osc = ctx.createOscillator();
+  osc.frequency.value = 440;
+  const g = ctx.createGain();
+  g.gain.value = 0.3;
+  osc.connect(g); g.connect(ctx.destination);
+  osc.start();
+  status.textContent = 'arm=tone';
+}
+
+document.getElementById('go').addEventListener('click', start);
+// Autostart too, for runs with --autoplay-policy=no-user-gesture-required.
+window.addEventListener('load', () => { start().catch(e => status.textContent = 'err ' + e); });
+</script>
+</body>

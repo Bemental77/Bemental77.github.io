@@ -7,6 +7,7 @@
   <link rel="icon" href="data:,">
   <script src="/coi-serviceworker.js"></script>
   <script src="/lib/wakelock.js"></script>
+  <script src="/lib/audiodiag.js"></script>
   <script>if (new URLSearchParams(location.search).has('eruda')) { var s=document.createElement('script'); s.src='https://cdn.jsdelivr.net/npm/eruda'; s.onload=function(){eruda.init();}; document.head.appendChild(s); }</script>
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -199,7 +200,22 @@
   var padStatus1, padStatus2, vram_ptr; window.cout_print = t => pageLog(String(t)); var pcsx_worker = null; var SoundFeedStreamData; var states_arrs = []; var audioMuted = false; var audioDraining = false; var pendingSaveResolve = null; var pendingLoadResolve = null;
   function getAudioCtx() { try { return (Module && Module.preCreatedAudioContext) || (Module && Module.SDL && Module.SDL.audioContext) || null; } catch (e) { return null; } }
   function resumeAudio() { if (audioMuted) return; var ctx = getAudioCtx(); if (ctx && ctx.state === 'suspended') { ctx.resume().catch(() => {}); } }
+  // Uniform audio telemetry (lib/audiodiag.js). PS1's sink is stock emscripten
+  // SDL1 — a main-thread setTimeout chain we do not own — so the fields this
+  // page can honestly fill are the PRODUCER counters and the context lifecycle.
+  // The sink-side fields stay null, which reports as "not observed" rather than
+  // as zero underruns; a rig reads the real output with tools/audio_tap.js.
+  if (window.AudioDiag) { window.AudioDiag.install('ps1'); }
+  function bindAudioDiagCtx() { try { var c = getAudioCtx(); if (c && window.AudioDiag && !window.__audioDiagBound) { window.__audioDiagBound = true; window.AudioDiag.observeContext(c); } } catch (e) {} }
   document.addEventListener('click', resumeAudio); document.addEventListener('keydown', resumeAudio); document.addEventListener('visibilitychange', resumeAudio);
+  // pointerdown/touchend in the CAPTURE phase, matching gamecube.html:2400.
+  // On a touch-only device the on-screen pad handlers call preventDefault, so a
+  // synthesized 'click' may never arrive and the bubble-phase listeners above
+  // can miss every gesture the visitor makes — leaving an autoplay-suspended
+  // context suspended for the whole session. Capture runs before the pad can
+  // swallow the event. This set was already fixed on gamecube.html and had not
+  // been back-ported here.
+  document.addEventListener('pointerdown', resumeAudio, true); document.addEventListener('touchend', resumeAudio, true);
   var VRAM_SAB_HDR_BYTES = 64, VRAM_SAB_PAYLOAD_BYTES = 1024 * 2048;
   var vramSAB = null, vramSabI32 = null, vramSabBytes = null;
   function tryAllocVramSab() {
@@ -446,7 +462,12 @@
       //     already does this with `return_vram`; this now matches it.
       case 'SoundFeedStreamData': {
         var ps = data.pSound;
-        var lb = data.lBytes | 0;
+        // Clamp to what the transfer buffer actually holds. dfsound/worker.c:82
+        // clamps lBytes to 4800, but SendSound copies into a 4096-byte
+        // Uint8Array, so a batch in 4097..4800 would arrive short. subarray()
+        // clamps silently, and feeding the un-clamped count would then make the
+        // core read bytes that were never copied — noise, not a gap.
+        var lb = Math.min(data.lBytes | 0, ps ? ps.length : 0);
         var ad = window.__audioDiag;
         if (audioMuted || audioDraining) {
           if (pcsx_worker) pcsx_worker.postMessage({ cmd: 'soundBytes', lBytes: lb });
@@ -621,7 +642,7 @@
     }
     return fetchRomStreamAndBoot();
   }
-  var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; ROM_SIZE = pick.size || 0; ROM_CHUNK_SIZES = pick.chunkSizes || null; SAVE_KEY = ROM_NAME + '.ps1state'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); } } catch (e) {} pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...'); setStatus('Loading LLVM runtime...'); var s = document.createElement('script'); s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now(); document.body.appendChild(s); }
+  var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; ROM_SIZE = pick.size || 0; ROM_CHUNK_SIZES = pick.chunkSizes || null; SAVE_KEY = ROM_NAME + '.ps1state'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); bindAudioDiagCtx(); } } catch (e) {} pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...'); setStatus('Loading LLVM runtime...'); var s = document.createElement('script'); s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now(); document.body.appendChild(s); }
   $('btnStart').addEventListener('click', startEmulator);
   const DB_NAME = 'PS1WASMDB', STORE = 'PS1WASMSTATES'; var SAVE_KEY = ROM_NAME + '.ps1state';
   function openDB() { return new Promise((resolve, reject) => { var req = indexedDB.open(DB_NAME); req.onupgradeneeded = e => e.target.result.createObjectStore(STORE); req.onsuccess = e => resolve(e.target.result); req.onerror = () => reject(req.error); }); }
