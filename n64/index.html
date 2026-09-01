@@ -2262,7 +2262,7 @@ N64Rate.selfTest = function (logFn) {
     };
     window.__jitStats = function () {
       var s = { mode: mode, wrapped: wrapped, calls: calls, canaryFired: canaryFired, instantiateFail: instantiateFail };
-      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeMemSlots = e.nativeMemSlots; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.nativeCop0 = e.nativeCop0; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; s.distinctSlots = e.distinctSlots; s.slotReuses = e.slotReuses; s.nullOpsRejects = e.nullOpsRejects || 0; }
+      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeMemSlots = e.nativeMemSlots; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.nativeFPCvt = e.nativeFPCvt || 0; s.nativeCop0 = e.nativeCop0; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; s.distinctSlots = e.distinctSlots; s.slotReuses = e.slotReuses; s.nullOpsRejects = e.nullOpsRejects || 0; }
       return s;
     };
     // ?jit=census dump: [[bucket, executions], ...] ranked. Buckets are

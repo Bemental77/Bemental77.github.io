@@ -34,7 +34,18 @@ import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 
 const rom = process.argv[2] || 'mariokart.z64';
-const order = process.argv[3] === 'ba' ? ['jit', 'interp'] : ['interp', 'jit'];
+// Validate the order argument instead of defaulting silently. On 2026-09-01 a
+// shell word-splitting bug meant `ba` never reached this script; it fell
+// through to the 'ab' default and produced two same-order rounds that LOOKED
+// like an alternated pair. Arm-order alternation is the campaign's control for
+// monotonic thermal drift, so silently losing it corrupts the result rather
+// than failing it. Anything but ab|ba is now fatal.
+const orderArg = process.argv[3] ?? 'ab';
+if (orderArg !== 'ab' && orderArg !== 'ba') {
+  console.error(`arm order must be "ab" or "ba", got ${JSON.stringify(orderArg)}`);
+  process.exit(2);
+}
+const order = orderArg === 'ba' ? ['jit', 'interp'] : ['interp', 'jit'];
 const WARMUP_VI = +(process.argv[4] || 600);
 const WINDOW_VI = +(process.argv[5] || 900);
 const JIT_MODE = process.env.JIT_MODE || 'emit';

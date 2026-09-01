@@ -61,11 +61,21 @@
     f32_load: 0x2A, f32_store: 0x38, f64_load: 0x2B, f64_store: 0x39,
     f32_abs: 0x8B, f32_neg: 0x8C, f32_sqrt: 0x91, f32_add: 0x92, f32_sub: 0x93, f32_mul: 0x94, f32_div: 0x95,
     f64_abs: 0x99, f64_neg: 0x9A, f64_sqrt: 0x9F, f64_add: 0xA0, f64_sub: 0xA1, f64_mul: 0xA2, f64_div: 0xA3,
+    // wave 11a (FP converts)
+    local_tee: 0x22, f32_const: 0x43, f64_const: 0x44,
+    f32_lt: 0x5D, f64_lt: 0x63,
+    f32_ceil: 0x8D, f32_floor: 0x8E, f32_trunc: 0x8F,
+    f64_ceil: 0x9B, f64_floor: 0x9C, f64_trunc: 0x9D,
+    i32_trunc_f32_s: 0xA8, i32_trunc_f64_s: 0xAA, i64_trunc_f32_s: 0xAE, i64_trunc_f64_s: 0xB0,
+    f32_convert_i32_s: 0xB2, f32_convert_i64_s: 0xB4, f32_demote_f64: 0xB6,
+    f64_convert_i32_s: 0xB7, f64_convert_i64_s: 0xB9, f64_promote_f32: 0xBB,
     void_: 0x40,
   };
+  var VT = { i32: 0x7F, i64: 0x7E, f32: 0x7D, f64: 0x7C };
 
   // locals: 0,1 = i32 scratch (addr, word); 2..33 = i64 guest r0..r31
   var L_ADDR = 0, L_WORD = 1, L_REG0 = 2, L_I64S = 34, L_JT = 35, L_COND = 36; // i64 scratch (mult), i32 jump target, i32 branch condition
+  var L_F32 = 37, L_F64 = 38;   // wave 11a: rounded-value scratch for the convert guard
 
   function loadI64(addr) { return [OP.i32_const, 0x00, OP.i64_load, 0x03].concat(leb(addr)); }
   function loadI32(addr) { return [OP.i32_const, 0x00, OP.i32_load, 0x02].concat(leb(addr)); }
@@ -74,6 +84,22 @@
   function storeI32Const(addr, value) { return storeI32(addr, [OP.i32_const].concat(sleb(value))); }
 
   function sext16(v) { return (v << 16) >> 16; }
+
+  // SLEB128 over a full 64-bit value. The existing sleb() coerces with `n |= 0`
+  // and so cannot encode i64.const INT64_MIN, which the .L convert guard needs.
+  function sleb64(v) {
+    var o = [], more = true;
+    while (more) {
+      var b = Number(v & 0x7Fn);
+      v >>= 7n;
+      if ((v === 0n && !(b & 0x40)) || (v === -1n && (b & 0x40))) more = false; else b |= 0x80;
+      o.push(b);
+    }
+    return o;
+  }
+  // IEEE-754 little-endian immediate bytes for f32.const / f64.const
+  function f32Bytes(v) { var b = new Uint8Array(4); new DataView(b.buffer).setFloat32(0, v, true); return Array.prototype.slice.call(b); }
+  function f64Bytes(v) { var b = new Uint8Array(8); new DataView(b.buffer).setFloat64(0, v, true); return Array.prototype.slice.call(b); }
 
   // ---- MIPS mnemonic decode (census labelling only; not used for codegen) ----
   var M_OP = {
@@ -634,6 +660,112 @@
   // push the float*/double* for FPR index i from the live bank
   function fprPtr(bank, i) { return [OP.i32_const, 0x00, OP.i32_load, 0x02].concat(leb(bank + i * 4)); }
 
+  // ---- COP1 converts (wave 11a) ----
+  //
+  // These are emitted from the SHIPPED dist binary's own lowering, not from a
+  // reading of the C. That distinction matters because fpu.h's casts are C
+  // UNDEFINED BEHAVIOUR out of range, so only the compiled artifact defines
+  // the answer (n64/docs/jit/TASKS.md asked for exactly this determination
+  // before any convert emitter was written).
+  //
+  // Ground truth, by disassembling n64/N64Wasm/dist/n64wasm.wasm (wasm2wat):
+  //
+  //  * The build has NO nontrapping-fptoint: `i32.trunc_sat_*` / `i64.trunc_sat_*`
+  //    occur ZERO times in the whole 2.6 MB module, while the trapping
+  //    `i32.trunc_f32_s` occurs 128 times. So every float->int cast is the
+  //    TRAPPING opcode, and LLVM must guard it.
+  //  * The guard LLVM emitted is identical in every one of these ops
+  //    (func 2548 = TRUNC.W.S, 2539 = FLOOR.W.S, 2544 = CEIL.W.S,
+  //     2547 = TRUNC.W.D, 2545 = TRUNC.L.D, 2546 = TRUNC.L.S):
+  //        r = <round>(x); if (|r| < 2^31)  dest = (i32)r;  else dest = INT32_MIN
+  //    (2^63 / INT64_MIN for the .L forms). NaN takes the else arm, because
+  //    abs(NaN) < k is false — so NaN converts to INT_MIN here, NOT to 0 as
+  //    a saturating conversion would give. Reproduced EXACTLY below.
+  //  * `set_rounding()` (fpu.h:63-83) IS INERT in this build. In CVT.S.W
+  //    (func 2563), CVT.S.L (2561), CVT.D.L (2558) and CVT.S.D (2564) it
+  //    compiles to a load of FCR31, a table index, and then a literal `drop`
+  //    — wasm has no dynamic rounding mode, so fesetround() cannot affect the
+  //    result. Every int->float / float->float convert is therefore plain
+  //    round-to-nearest-even and needs no FCR31 access at all.
+  //
+  // DELIBERATELY NOT EMITTED HERE, and each for a specific reason:
+  //  * ROUND.W/L.* — lowers to `call 700` (roundf). C round() is half-AWAY-
+  //    from-zero; wasm f32.nearest is half-to-EVEN. They differ at .5, so
+  //    f32.nearest would NOT be bit-exact.
+  //  * CVT.W.* / CVT.L.* — dispatch on FCR31&3 (funcs 2554-2557).
+  //  * C.cond.* and BC1* — read/write FCR31 bit 23 (0x800000).
+  //    All three need FCR31's ADDRESS, which is not in the jit_params block
+  //    (recomp.c:2500-2542 ends at index 42) and is not derivable from any
+  //    param that is: FCR31 lives at 63865504 in the shipped binary while
+  //    reg_cop1_simple is at 70682880 — different sections, ~6.8 MB apart,
+  //    so there is no wave-10a-style layout identity to assert. Adding
+  //    jit_params[43] = &FCR31 is a ONE-LINE core change, but the core cannot
+  //    currently be rebuilt (the vendored emsdk now reports 6.0.2 and
+  //    CLAUDE.md records that libretronew.c no longer compiles under it), and
+  //    guessing the address would silently corrupt FCR31 rather than fall
+  //    back. So this half of wave 11 is BLOCKED ON THE TOOLCHAIN, not on the
+  //    emitter, and is left falling back.
+  //
+  // banks: 'W' results are int32 written through reg_cop1_simple[fd]; 'L'
+  // results are int64 written through reg_cop1_double[fd] (verified in the
+  // disassembly above — TRUNC.W.D stores via 70682880 and loads via 70683008).
+  var CVT_ROUND = {  // fn -> [wasm round op for S, for D], dest is 32-bit?
+    0x09: ['trunc', false], 0x0A: ['ceil', false], 0x0B: ['floor', false],  // TRUNC/CEIL/FLOOR .L
+    0x0D: ['trunc', true],  0x0E: ['ceil', true],  0x0F: ['floor', true],   // TRUNC/CEIL/FLOOR .W
+  };
+  function roundToIntNat(p, srcIsS, dstIsW, roundName, fs, fd) {
+    var srcBank = srcIsS ? p.cp1Simple : p.cp1Double;
+    var dstBank = dstIsW ? p.cp1Simple : p.cp1Double;
+    var ld = srcIsS ? [OP.f32_load, 0x02, 0x00] : [OP.f64_load, 0x03, 0x00];
+    var tee = srcIsS ? L_F32 : L_F64;
+    var roundOp = OP[(srcIsS ? 'f32_' : 'f64_') + roundName];
+    var absOp = srcIsS ? OP.f32_abs : OP.f64_abs;
+    var ltOp = srcIsS ? OP.f32_lt : OP.f64_lt;
+    var bound = dstIsW ? 2147483648 : 9223372036854775808;
+    var boundBytes = srcIsS ? [OP.f32_const].concat(f32Bytes(bound)) : [OP.f64_const].concat(f64Bytes(bound));
+    var cvtOp = srcIsS ? (dstIsW ? OP.i32_trunc_f32_s : OP.i64_trunc_f32_s)
+                       : (dstIsW ? OP.i32_trunc_f64_s : OP.i64_trunc_f64_s);
+    var minBytes = dstIsW ? [OP.i32_const].concat(sleb(-2147483648))
+                          : [OP.i64_const].concat(sleb64(-9223372036854775808n));
+    var st = dstIsW ? [OP.i32_store, 0x02, 0x00] : [OP.i64_store, 0x03, 0x00];
+    return [].concat(
+      fprPtr(dstBank, fd),
+      fprPtr(srcBank, fs), ld,
+      [roundOp, OP.local_tee], leb(tee),
+      [absOp], boundBytes, [ltOp],
+      [OP.if_, dstIsW ? VT.i32 : VT.i64],
+        [OP.local_get].concat(leb(tee), [cvtOp]),
+      [OP.else_],
+        minBytes,
+      [OP.end],
+      st);
+  }
+  // plain converts: no rounding mode is observable (see the set_rounding note)
+  function plainCvtNat(p, sub, fn, fs, fd) {
+    var S = 0x10, D = 0x11, W = 0x14, L = 0x15;
+    var srcBank, ld, conv, dstBank, st;
+    if (sub === S && fn === 0x21) {        // CVT.D.S  (func 2560)
+      srcBank = p.cp1Simple; ld = [OP.f32_load, 0x02, 0x00]; conv = OP.f64_promote_f32;
+      dstBank = p.cp1Double; st = [OP.f64_store, 0x03, 0x00];
+    } else if (sub === D && fn === 0x20) { // CVT.S.D  (func 2564)
+      srcBank = p.cp1Double; ld = [OP.f64_load, 0x03, 0x00]; conv = OP.f32_demote_f64;
+      dstBank = p.cp1Simple; st = [OP.f32_store, 0x02, 0x00];
+    } else if (sub === W && fn === 0x20) { // CVT.S.W  (func 2563)
+      srcBank = p.cp1Simple; ld = [OP.i32_load, 0x02, 0x00]; conv = OP.f32_convert_i32_s;
+      dstBank = p.cp1Simple; st = [OP.f32_store, 0x02, 0x00];
+    } else if (sub === W && fn === 0x21) { // CVT.D.W  (func 2559)
+      srcBank = p.cp1Simple; ld = [OP.i32_load, 0x02, 0x00]; conv = OP.f64_convert_i32_s;
+      dstBank = p.cp1Double; st = [OP.f64_store, 0x03, 0x00];
+    } else if (sub === L && fn === 0x20) { // CVT.S.L  (func 2561)
+      srcBank = p.cp1Double; ld = [OP.i64_load, 0x03, 0x00]; conv = OP.f32_convert_i64_s;
+      dstBank = p.cp1Simple; st = [OP.f32_store, 0x02, 0x00];
+    } else if (sub === L && fn === 0x21) { // CVT.D.L  (func 2558)
+      srcBank = p.cp1Double; ld = [OP.i64_load, 0x03, 0x00]; conv = OP.f64_convert_i64_s;
+      dstBank = p.cp1Double; st = [OP.f64_store, 0x03, 0x00];
+    } else return null;
+    return [].concat(fprPtr(dstBank, fd), fprPtr(srcBank, fs), ld, [conv], st);
+  }
+
   function emitCop1(word, instrPtr, p, C, opsIdx, exitDepth, slow) {
     var op = (word >>> 26) & 0x3F;
     if (op !== 0x11) return null;
@@ -645,6 +777,10 @@
     var fd = (word >>> 6) & 0x1F;
     var fn = word & 0x3F;
     var nat = null;
+    // set when this op was emitted by the wave-11a convert path. Counted
+    // separately in stats so a wave that silently emitted NOTHING new cannot
+    // pass the gates looking green — the wave-10a `nativeCop0` lesson.
+    var fpCvt = false;
     if (sub === 0x00) {        // MFC1: rt = SE32(*(i32*)simple[fs])
       nat = fprPtr(p.cp1Simple, fs).concat([OP.i32_load, 0x02, 0x00], [OP.i64_extend_i32_s], C.writeFromStack(rt));
     } else if (sub === 0x04) { // MTC1: *(i32*)simple[fs] = rt32
@@ -668,21 +804,38 @@
         case 0x05: unop = S ? OP.f32_abs : OP.f64_abs; break;
         case 0x06: unop = -1; break; // MOV: pure copy
         case 0x07: unop = S ? OP.f32_neg : OP.f64_neg; break;
-        default: return null; // CVT/ROUND/TRUNC/compares: explicit rounding/flags — fallback
+        default:
+          // wave 11a: TRUNC/CEIL/FLOOR .W/.L and CVT.D.S / CVT.S.D.
+          // ROUND.* (0x08/0x0C), CVT.W/L.* (0x24/0x25) and the compares
+          // (0x30-0x3F) still fall back — see the wave-11a note above.
+          var rc = CVT_ROUND[fn];
+          if (rc) { fpCvt = true; nat = roundToIntNat(p, S, rc[1], rc[0], fs, fd); break; }
+          var pc1 = plainCvtNat(p, sub, fn, fs, fd);
+          if (pc1) { fpCvt = true; nat = pc1; break; }
+          return null;
       }
-      // store sig: push fd ptr, compute value, store
-      var valBytes;
-      if (binop !== null) {
-        valBytes = fprPtr(bank, fs).concat(ldop, fprPtr(bank, rt), ldop, [binop]);
-      } else if (unop === -1) {
-        valBytes = fprPtr(bank, fs).concat(ldop);
-      } else {
-        valBytes = fprPtr(bank, fs).concat(ldop, [unop]);
+      if (nat === null) {
+        // store sig: push fd ptr, compute value, store
+        var valBytes;
+        if (binop !== null) {
+          valBytes = fprPtr(bank, fs).concat(ldop, fprPtr(bank, rt), ldop, [binop]);
+        } else if (unop === -1) {
+          valBytes = fprPtr(bank, fs).concat(ldop);
+        } else {
+          valBytes = fprPtr(bank, fs).concat(ldop, [unop]);
+        }
+        nat = fprPtr(bank, fd).concat(valBytes, stop);
       }
-      nat = fprPtr(bank, fd).concat(valBytes, stop);
+    } else if (sub === 0x14 || sub === 0x15) {
+      // wave 11a: fmt W / L — CVT.S.W, CVT.D.W, CVT.S.L, CVT.D.L only
+      // (every other W/L function code is RESERVED, pure_interp.c:601-621)
+      nat = plainCvtNat(p, sub, fn, fs, fd);
+      if (nat === null) return null;
+      fpCvt = true;
     } else {
-      return null; // BC1 branches, fmt W/L: fallback
+      return null; // BC1 branches, COP1 control moves (CFC1/CTC1): fallback
     }
+    if (fpCvt) stats.nativeFPCvt++;
     return cuGuard(p, C, nat, instrPtr, opsIdx, exitDepth, word, slow, preFlush);
   }
 
@@ -796,7 +949,7 @@
   }
 
   // ---- block compiler ----
-  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeMemSlots: 0, nativeLoads: 0, nativeStores: 0, nativeFP: 0, nativeCop0: 0, fallbackOps: 0, fails: 0, slotReuses: 0, distinctSlots: 0 };
+  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeMemSlots: 0, nativeLoads: 0, nativeStores: 0, nativeFP: 0, nativeFPCvt: 0, nativeCop0: 0, fallbackOps: 0, fails: 0, slotReuses: 0, distinctSlots: 0 };
   // table slot per guest entry address: a recompile REUSES its slot via
   // wasmTable.set, unrooting the previous instance for GC — the table is
   // bounded by distinct block entries, not by recompile churn (vaddr keys
@@ -1049,7 +1202,7 @@
       storeI32Const(p.pcGlobal, p.entryPtr + p.span * p.stride)
     );
 
-    var full = [0x05, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7F,  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target, i32 branch-cond
+    var full = [0x07, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7F, 0x01, 0x7D, 0x01, 0x7C,  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target, i32 branch-cond, f32+f64 convert scratch (wave 11a)
       OP.block, OP.void_,
       OP.loop, OP.void_]
       .concat(bump('#block-iter'), body,

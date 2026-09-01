@@ -499,6 +499,181 @@ throughput A/B rather than another emitter wave. Note also that the `?jit`
 arm pays block-compilation cost inside the window whenever the driven scene
 reaches new code, which a 600 VI warmup does not fully absorb.
 
+## Wave 11a (2026-09-01) — FP converts native; compares/BC1 BLOCKED, and why
+
+TASKS.md required, before any convert emitter was written, that someone
+**determine what the SHIPPED dist wasm actually emitted for `trunc_w_s`**,
+because `(int32_t)truncf(f)` is C UNDEFINED BEHAVIOUR out of range and fpu.h
+therefore does not define the answer. That determination was made by
+disassembling the vendored binary (`wasm2wat n64/N64Wasm/dist/n64wasm.wasm`),
+and it changed the plan: **the converts are the SAFE half, not the risky half.**
+
+Four facts, each read off the shipped artifact rather than the C:
+
+1. **There is no saturating conversion in the build.** `i32.trunc_sat_*` and
+   `i64.trunc_sat_*` occur **0 times** in the whole 2.6 MB module, while the
+   trapping `i32.trunc_f32_s` occurs 128 times. The toolchain was built without
+   nontrapping-fptoint, so every float->int cast is the TRAPPING opcode and
+   LLVM had to guard it.
+2. **The guard LLVM emitted is simple, uniform, and exactly reproducible**
+   (func 2548 = TRUNC.W.S, 2539 = FLOOR.W.S, 2544 = CEIL.W.S, 2547 = TRUNC.W.D,
+   2545 = TRUNC.L.D, 2546 = TRUNC.L.S):
+
+        r = <round>(x);  if (|r| < 2^31) dest = (i32)r;  else dest = INT32_MIN
+
+   with 2^63 / INT64_MIN for the `.L` forms. **NaN takes the else arm**, since
+   `abs(NaN) < k` is false — so on this build NaN converts to **INT_MIN**, and
+   a "sensible" saturating emitter would have been WRONG on both NaN (0) and
+   positive overflow (INT32_MAX). This is exactly the trap the task warned of,
+   and it was resolved by reading the binary rather than reasoning about C.
+3. **`set_rounding()` is INERT here.** In CVT.S.W (2563), CVT.S.L (2561),
+   CVT.D.L (2558) and CVT.S.D (2564) it compiles to a load of FCR31, a table
+   index, and then a literal **`drop`** — wasm has no dynamic rounding mode, so
+   `fesetround()` cannot affect a result. Every int->float and float->float
+   convert is therefore plain round-to-nearest-even, needs no FCR31 access, and
+   is a single wasm opcode.
+4. FCR31 lives at **63865504** in the shipped binary; `reg_cop1_simple` is at
+   70682880 and `reg_cop1_double` at 70683008.
+
+**Emitted (16 opcodes), each verified against its shipped counterpart:**
+TRUNC/CEIL/FLOOR `.W.S .L.S .W.D .L.D`, and CVT `.S.W .D.W .S.L .D.L .D.S .S.D`.
+The emitted block was dumped and disassembled: it is instruction-for-instruction
+the shipped sequence (`f32.load; f32.trunc; local.tee; f32.abs; f32.const 2^31;
+f32.lt; if(i32) ... i32.trunc_f32_s else i32.const -2147483648; i32.store`),
+inside the existing CU1 guard. `stats.nativeFPCvt` counts it, so a wave that
+silently emitted nothing cannot pass the gates looking green (the wave-10a
+`nativeCop0` lesson).
+
+**NOT emitted, and these are refusals with reasons, not omissions:**
+- **ROUND.W/L.\*** lowers to a `roundf()` CALL (`call 700`, func 2553). C
+  `round()` is half-AWAY-from-zero; wasm `f32.nearest` is half-to-EVEN. They
+  differ at exactly .5, so `f32.nearest` would NOT be bit-exact. Red test
+  pins this.
+- **CVT.W.\* / CVT.L.\*** dispatch on `FCR31&3` (funcs 2554-2557).
+- **C.cond.\* and BC1\*** read/write FCR31 bit 23 (0x800000). The compare
+  shape was confirmed too (func 2513 = C.UEQ.S: `FCR31 = (FCR31 & ~0x800000) |
+  (cmp << 23)`, with the `u`-forms setting the bit on NaN exactly as fpu.h
+  says) — so these are *semantically* ready to emit.
+
+  **They are blocked on ONE LINE OF CORE CODE, not on the emitter.** All three
+  need FCR31's ADDRESS, which is not in the `jit_params` block (recomp.c:2500-
+  2542 ends at index 42) and is NOT derivable from any param that is: FCR31 is
+  ~6.8 MB away from `reg_cop1_simple`, in a different section, so there is no
+  wave-10a-style layout identity to assert, and a guessed address would
+  silently corrupt FCR31 rather than fall back. The fix is
+  `jit_params[43] = (uint32_t)(uintptr_t)&FCR31;` — but the core **cannot
+  currently be rebuilt**: the vendored emsdk now reports `6.0.2`
+  (`emsdk/upstream/emscripten/emscripten-version.txt`) and CLAUDE.md records
+  that `libretronew.c` no longer compiles under it. **So the largest remaining
+  FP lever on the heavy set — compares + BC1, 19-33% of what still falls back
+  on dk64/banjo — is gated on restoring the N64 build toolchain, and that is
+  now the highest-value non-emitter task in this campaign.**
+
+**Why wave 11a is structurally OUTSIDE the join-contract bug class** that
+produced the two latent divergences below: `roundToIntNat` and `plainCvtNat`
+take the param block only — they never call `C.read`, `C.ensure` or
+`C.writeFromStack`. A convert reads and writes FPR memory through the live
+bank pointers and touches the GPR register cache not at all, so there is no
+compile-time cache state that can escape one arm of a branch. The only
+conditional it introduces is the value-guard, and both of its arms produce the
+same wasm type and join immediately.
+
+- [x] Unit corpus extended 22 -> 47 cases, all green, and **red-test discipline
+      verified**: run against `git show HEAD:...mips_emit.js`, the 17 new
+      behavioural convert cases all FAIL and the 23 pre-existing ones still
+      pass. The corpus now models both FPR banks (it previously filled only
+      `reg_cop1_simple[0]`, so any convert test would have read a null bank
+      pointer).
+- [x] **Emitted bytes verified against the shipped lowering directly.** The
+      emitter's own output for TRUNC.W.S was dumped and disassembled, and it is
+      the shipped func-2548 sequence instruction for instruction
+      (`f32.load; f32.trunc; local.tee; f32.abs; f32.const 0x1p+31; f32.lt;
+      if(i32) local.get/i32.trunc_f32_s else i32.const -2147483648; i32.store`)
+      inside the CU1 guard. This is stronger than an input/output test: it
+      compares the generated code to the reference code.
+- [x] **Differential PASS x4 at 600 VI frames with the determinism control
+      PASS on every one** (2026-09-01, `CPU_Speed_Limit` 100 before and after,
+      load 3.71-5.11): mariokart, sm64, oot, and dk64 — dk64 included
+      deliberately because converts are 42.3% of its remaining fallbacks. 0
+      emit failures, 0 page errors on any arm.
+
+        rom        blocks  nativeFP  fallbackOps  emitFails
+        mariokart     475      1374          321          0
+        sm64          851      5152          719          0
+        oot          1487      9632         1820          0
+        dk64         1216     10223         1788          0
+
+- [x] `n64/index.html`'s `__jitStats()` copies fields EXPLICITLY, so it did not
+      surface `nativeFPCvt` and the first differential round could not prove
+      the new path had fired at all — the exact wave-10a trap, caught here by
+      looking for the counter rather than trusting the PASS. `nativeFPCvt` is
+      now surfaced and the liveness figure re-measured.
+
+## Action #1 EXECUTED — waves 8/9/10a priced on a quiet box (2026-09-01)
+
+The first throughput numbers in this campaign that pass its own measurement
+rules. `CPU_Speed_Limit` was **100 before AND after every arm** (contrast the
+52-70 of every prior attempt) and 1-minute load stayed **2.49-7.25**, versus
+the 15-176 that voided the sweep above.
+
+**What this prices.** Waves 8, 9 and 10a are all in HEAD, so an
+interpreter-vs-`?jit` A/B prices the STACK, not any single wave. There is no
+build in which wave 8 is present and wave 9 is not, so per-wave throughput
+attribution is not available from this rig and is not claimed here.
+
+    rom        round  order        interp   jit    wallX  cpuX   load        limit
+    mariokart  ab     interp,jit    8.661   7.592  1.141  1.030  4.29->7.25  100/100
+    mariokart  ba     jit,interp    9.477   9.084  1.043  0.995  3.16->6.37  100/100
+    sm64       r1     interp,jit    7.785   6.457  1.206  1.073  2.49->6.20  100/100
+    sm64       r2     interp,jit    8.312   7.672  1.083  1.017  2.74->3.05  100/100
+
+(ms per VI frame, `_neil_frame_cost_*`. mariokart is a correctly alternated
+pair. **The two sm64 rounds are NOT an alternated pair** — a zsh word-splitting
+bug meant the `ba` argument never reached the tool, and both ran interp-first.
+Reported as what they actually are.)
+
+**So: roughly 1.04-1.21x on retro_run cost, and ~1.00-1.07x on whole-process
+CPU. The acceptance bar (>=100% of hardware in-game) is NOT cleared by this
+and is not addressed by it — see the scene caveat below.**
+
+Three things this run establishes that matter more than the ratios:
+
+1. **RIG RESOLUTION, measured for the first time.** The two sm64 rounds are the
+   same ROM, same order, same window, back to back on a quiet box — an exact
+   repeatability pair. They read **1.206 vs 1.083** (wall) and 1.073 vs 1.017
+   (cpu). So a single pair resolves roughly **+/-6%**, and NO effect smaller
+   than about 15% is resolvable from one round even at load 2.5-6. Most of
+   this campaign's per-wave hopes are below that floor.
+2. **THE TWO METRICS DISAGREE SYSTEMATICALLY, and the direction is explicable.**
+   `wallX` (1.04-1.21) exceeds `cpuX` (1.00-1.07) in all four rounds.
+   `perFrameMs` times `retro_run` ONLY, while `cpuMsPerFrame` charges the whole
+   browser process tree — renderer, compositor, GPU process — which the JIT
+   does not touch and which therefore DILUTES the ratio. On that reading
+   `cpuX` is a lower bound and `wallX` is the guest-work measure. That is a
+   hypothesis consistent with all four rounds, not a proven decomposition;
+   it has not been tested by ablating the renderer.
+3. **THE MEASURED WINDOW IS A MENU ON BOTH ROMS, which the screenshots prove.**
+   At the documented `600 900`, mariokart's window is the **PLAYER SELECT**
+   screen (`/tmp/n64-ab/mariokart-jit.png`) and sm64's is the **spinning Mario
+   head** on the title screen (`/tmp/n64-ab/sm64.z64 ab-interp.png`) — not
+   gameplay. This is the tool's own documented failure mode (its header warns
+   an idle-dominated scene "reads meaninglessly close to 1.0x", the GameCube
+   lesson). **These ratios therefore describe menu scenes and must not be
+   quoted as in-game speedups.** Both arms saw the same scene, so the ratios
+   are internally valid; they are just not measuring the workload the
+   acceptance bar is about. The next A/B must raise the warmup until the
+   screenshot shows a race / a level, and verify that from the PNG.
+
+`uptime` and `pmset -g therm` are recorded per arm in
+`/tmp/n64-ab-rounds/*.json`.
+
+**Lock protocol (2026-09-01):** measurement now serializes through
+`bash tools/probe_lock.sh run -- <cmd>`, which records the owner PID, reclaims
+only a dead owner's lock, releases on every exit path, and — the part the bare
+`mkdir` lock lacked — **waits for 1-minute load to fall below 12 before
+returning**, because sibling BUILDS never took the lock and holding it does not
+by itself make the box quiet.
+
 ## Campaign state (2026-08-29)
 M0-M2 COMPLETE through wave 10a. The JIT is correctness-proven on the ROMs
 it has been gated against (every wave 600-1200 VI frames bit-identical vs the
@@ -541,22 +716,32 @@ Perf history, most recent first:
   DEVICE) remains UNVERIFIED.
 
 NEXT ACTIONS, in order:
-1. **On an IDLE, UNTHROTTLED machine, measure THROUGHPUT before writing any
-   more emitter waves.** `tools/n64_gameplay_ab.mjs <rom> ab|ba 600 900` now
-   exists for exactly this: VI-counted windows and VI-paced input, so both
-   arms traverse the same guest work (the pinned `tools/_jit_speed_ab.mjs`
-   settles by wall clock on an ATTRACT scene and cannot). Waves 8, 9 and 10a
-   are ALL still unpriced. 5 of 7 pairs in the 2026-08-29 sweep read `?jit`
-   slower than the interpreter — discarded as machine noise at load 35-176,
-   but it is the reason this is now action #1 rather than #2.
+1. ~~Measure THROUGHPUT on an idle, unthrottled machine~~ — ✅ DONE 2026-09-01,
+   see "Action #1 EXECUTED" above. Waves 8/9/10a as a STACK read 1.04-1.21x on
+   retro_run cost, at `CPU_Speed_Limit` 100 and load 2.5-7.3. **Two follow-ups
+   it generated, both real:** (a) the measured window is a MENU on both ROMs
+   (screenshot-proven), so the in-game acceptance bar is still unmeasured — the
+   next A/B must raise the warmup until the PNG shows gameplay; (b) single-pair
+   resolution is only ~+/-6%, so per-wave attribution below ~15% is not
+   available from this rig at all.
 2. ~~Fix the `thewheel.z64` `?jit` wedge~~ — ✅ DONE 2026-09-01 (607b3b1),
    a vendored-core null-ops bug, not an emitter bug. See its section above.
-3. Wave 11 (FP), now the top measured lever on the heavy set — compares and
-   BC1 first (exactly emittable), converts second (rounding/UB risk). See
-   "Next by measured weight, AFTER waves 9 + 10a".
-4. Full-library differential sweep (all 27 ROMs bit-identical per VI) — the
+3. Wave 11 — **11a (converts) DONE 2026-09-01**, see its section above.
+   **11b (compares + BC1) is BLOCKED on the N64 build toolchain**, not on the
+   emitter: it needs `jit_params[43] = &FCR31`, a one-line core change, and the
+   vendored emsdk is now 6.0.2 where `libretronew.c` does not compile.
+4. **RESTORE THE N64 CORE BUILD.** This was a background annoyance and is now
+   the critical path: it gates wave 11b (the largest remaining FP lever,
+   19-33% of heavy-set fallbacks), and CLAUDE.md notes the shipped
+   `n64/N64Wasm/dist/` is currently un-reproducible on this machine at all.
+   Either fix the 7 `-Wincompatible-pointer-types` in `libretronew.c` under
+   6.0.2, or pin a working emsdk deliberately.
+5. Full-library differential sweep (all 27 ROMs bit-identical per VI) — the
    gate a5efb66 named before the ?jit default can flip. `thewheel` already
-   proves this sweep is not a formality.
+   proves this sweep is not a formality. NOT attempted 2026-09-01: it is a
+   ~40-minute exclusive lock hold and the box ran at load 12-41 with several
+   sibling agents measuring; queueing it would have starved them. It should be
+   run as a single `probe_lock.sh run` batch on a quiet box.
 
 ### On measuring action #1 — the load source was OURS (2026-09-01)
 Every discarded A/B in this file blames "machine load". The largest single

@@ -63,6 +63,13 @@ const OPC = { LB: 0x20, LH: 0x21, LW: 0x23, LBU: 0x24, LHU: 0x25, LWU: 0x27, LD:
 const MFC1 = (rt, fs) => ((0x11 << 26) | (0x00 << 21) | (rt << 16) | (fs << 11)) >>> 0;
 const MFC0 = (rt, rd) => ((0x10 << 26) | (0x00 << 21) | (rt << 16) | (rd << 11)) >>> 0;
 const MTC0 = (rt, rd) => ((0x10 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11)) >>> 0;
+// COP1 fmt ops: fmt in the rs field, ft unused for converts
+const C1 = (fmt, fs, fd, fn) => ((0x11 << 26) | (fmt << 21) | (fs << 11) | (fd << 6) | fn) >>> 0;
+const FMT = { S: 0x10, D: 0x11, W: 0x14, L: 0x15 };
+// function codes, per pure_interp.c:517-556 (S-format) and :560-621 (D/W/L)
+const FN = { ROUND_L: 0x08, TRUNC_L: 0x09, CEIL_L: 0x0a, FLOOR_L: 0x0b,
+             ROUND_W: 0x0c, TRUNC_W: 0x0d, CEIL_W: 0x0e, FLOOR_W: 0x0f,
+             CVT_S: 0x20, CVT_D: 0x21, CVT_W: 0x24, CVT_L: 0x25 };
 
 function makeWorld(words, opts = {}) {
   const mem = new WebAssembly.Memory({ initial: 1024 });          // 64 MB
@@ -88,7 +95,15 @@ function makeWorld(words, opts = {}) {
   HEAPU32[COUNT >> 2] = 0;
   HEAPU32[SKIPJ >> 2] = 0;
   HEAPU32[LASTADDR >> 2] = 0x80100000;
-  HEAPU32[CP1S >> 2] = FPRSTORE;
+  // Both FPR banks, 32 entries each, modelled the way the core lays them out
+  // in FR=1 mode: reg_cop1_simple[i] and reg_cop1_double[i] both point at the
+  // SAME 8-byte reg_cop1_fgr_64[i] slot (cp1.c:120-165), the float using its
+  // low 4 bytes. Filling only entry 0 (as this harness used to) would make
+  // every convert test read a null bank pointer.
+  for (let i = 0; i < 32; i++) {
+    HEAPU32[(CP1S >> 2) + i] = FPRSTORE + i * 8;
+    HEAPU32[(CP1D >> 2) + i] = FPRSTORE + i * 8;
+  }
   HEAPU32[CP0ST >> 2] = opts.cu1 === false ? 0 : 0x20000000;      // CP0 Status CU1
   for (const [i, v] of Object.entries(opts.cp0 || {})) HEAPU32[(CP0REGS >> 2) + (+i)] = v >>> 0;
 
@@ -126,9 +141,17 @@ function loadEmitter() {
 }
 
 // run one case: seed regs/dram, emit, execute, compare
-function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}, expectStats = null, opts = {} }) {
+function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}, expectStats = null, opts = {},
+                          fprF32 = {}, fprF64 = {}, fprI32 = {}, fprI64 = {},
+                          expectFprI32 = {}, expectFprI64 = {}, expectFprF32 = {}, expectFprF64 = {} }) {
   const bm = loadEmitter();
   const { mem, table, HEAPU32, REG64, p } = makeWorld(words, opts);
+  const DV = new DataView(mem.buffer);
+  const fprAt = (i) => FPRSTORE + (+i) * 8;
+  for (const [i, v] of Object.entries(fprF32)) DV.setFloat32(fprAt(i), v, true);
+  for (const [i, v] of Object.entries(fprF64)) DV.setFloat64(fprAt(i), v, true);
+  for (const [i, v] of Object.entries(fprI32)) DV.setInt32(fprAt(i), v | 0, true);
+  for (const [i, v] of Object.entries(fprI64)) DV.setBigInt64(fprAt(i), BigInt.asIntN(64, BigInt(v)), true);
   for (const [r, v] of Object.entries(regs)) REG64[(REG >> 3) + (+r)] = BigInt.asUintN(64, BigInt(v));
   for (const [a, v] of Object.entries(dram)) HEAPU32[(DRAM + (+a)) >> 2] = v >>> 0;
   const idx = bm.compileSpan(p, { HEAPU32, wasmTable: table, wasmMemory: mem });
@@ -143,6 +166,22 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
   for (const [a, want] of Object.entries(expectDram)) {
     const got = '0x' + (HEAPU32[(DRAM + (+a)) >> 2] >>> 0).toString(16);
     if (got !== want) bad.push(`dram[0x${(+a).toString(16)}]=${got} want ${want}`);
+  }
+  for (const [i, want] of Object.entries(expectFprI32)) {
+    const got = '0x' + (DV.getUint32(fprAt(i), true) >>> 0).toString(16);
+    if (got !== want) bad.push(`fpr32[${i}]=${got} want ${want}`);
+  }
+  for (const [i, want] of Object.entries(expectFprI64)) {
+    const got = '0x' + DV.getBigUint64(fprAt(i), true).toString(16);
+    if (got !== want) bad.push(`fpr64[${i}]=${got} want ${want}`);
+  }
+  for (const [i, want] of Object.entries(expectFprF32)) {
+    const got = DV.getFloat32(fprAt(i), true);
+    if (!Object.is(got, want)) bad.push(`fprF32[${i}]=${got} want ${want}`);
+  }
+  for (const [i, want] of Object.entries(expectFprF64)) {
+    const got = DV.getFloat64(fprAt(i), true);
+    if (!Object.is(got, want)) bad.push(`fprF64[${i}]=${got} want ${want}`);
   }
   if (threw) bad.push('trapped: ' + threw);
   if (expectStats) for (const [k, want] of Object.entries(expectStats)) {
@@ -239,6 +278,99 @@ const tests = [
     { regs: { 4: '0x1', 5: '0x1' }, opts: { cp0: { 12: 0x12345678 } },
       expectRegs: { 8: '0x12345678' },
       expectStats: { nativeCop0: 0, nativeMemSlots: 1, fallbackOps: 0 } }),
+
+  // ---- wave 11a: FP converts ----
+  // The expectations below are NOT read off fpu.h -- fpu.h's casts are C
+  // undefined behaviour out of range, so they say nothing about the shipped
+  // answer. They are read off the SHIPPED dist binary's own lowering
+  // (n64/N64Wasm/dist/n64wasm.wasm disassembled with wasm2wat; func 2548 =
+  // TRUNC.W.S etc). See the wave-11a block comment in mips_emit.js.
+  T('TRUNC.W.S positive truncates toward zero', [C1(FMT.S, 1, 2, FN.TRUNC_W)],
+    { fprF32: { 1: 3.75 }, expectFprI32: { 2: '0x3' },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
+  T('TRUNC.W.S negative truncates toward zero', [C1(FMT.S, 1, 2, FN.TRUNC_W)],
+    { fprF32: { 1: -3.75 }, expectFprI32: { 2: '0xfffffffd' },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
+  // THE UB CASE. A saturating conversion would give 0x7fffffff here; the
+  // shipped binary gives INT32_MIN, because LLVM guarded the trapping
+  // i32.trunc_f32_s with |r| < 2^31 and yields INT32_MIN on the else arm.
+  T('TRUNC.W.S out of range is INT32_MIN, not saturation', [C1(FMT.S, 1, 2, FN.TRUNC_W)],
+    { fprF32: { 1: 1e30 }, expectFprI32: { 2: '0x80000000' },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
+  T('TRUNC.W.S -inf is INT32_MIN', [C1(FMT.S, 1, 2, FN.TRUNC_W)],
+    { fprF32: { 1: -Infinity }, expectFprI32: { 2: '0x80000000' } }),
+  // NaN: abs(NaN) < 2^31 is false, so NaN also takes the else arm. A
+  // saturating conversion would give 0.
+  T('TRUNC.W.S NaN is INT32_MIN, not 0', [C1(FMT.S, 1, 2, FN.TRUNC_W)],
+    { fprF32: { 1: NaN }, expectFprI32: { 2: '0x80000000' } }),
+  T('FLOOR.W.S rounds toward -inf', [C1(FMT.S, 1, 2, FN.FLOOR_W)],
+    { fprF32: { 1: -3.25 }, expectFprI32: { 2: '0xfffffffc' },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
+  T('CEIL.W.S rounds toward +inf', [C1(FMT.S, 1, 2, FN.CEIL_W)],
+    { fprF32: { 1: 3.25 }, expectFprI32: { 2: '0x4' },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
+  // .L forms write the DOUBLE bank as int64 and guard against 2^63
+  T('TRUNC.L.S writes the 64-bit result', [C1(FMT.S, 1, 2, FN.TRUNC_L)],
+    { fprF32: { 1: -5.9 }, expectFprI64: { 2: '0xfffffffffffffffb' },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
+  T('TRUNC.L.S out of range is INT64_MIN', [C1(FMT.S, 1, 2, FN.TRUNC_L)],
+    { fprF32: { 1: 1e30 }, expectFprI64: { 2: '0x8000000000000000' } }),
+  T('TRUNC.W.D truncates a double into the SIMPLE bank', [C1(FMT.D, 1, 2, FN.TRUNC_W)],
+    { fprF64: { 1: 9.99 }, expectFprI32: { 2: '0x9' },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
+  T('TRUNC.W.D out of range is INT32_MIN', [C1(FMT.D, 1, 2, FN.TRUNC_W)],
+    { fprF64: { 1: 1e30 }, expectFprI32: { 2: '0x80000000' } }),
+  // plain converts: set_rounding() is INERT in this build (it compiles to a
+  // load and a `drop`), so these are always round-to-nearest-even
+  T('CVT.S.W int32 -> float', [C1(FMT.W, 1, 2, FN.CVT_S)],
+    { fprI32: { 1: -7 }, expectFprF32: { 2: -7 },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
+  T('CVT.D.W int32 -> double', [C1(FMT.W, 1, 2, FN.CVT_D)],
+    { fprI32: { 1: 123456 }, expectFprF64: { 2: 123456 },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
+  T('CVT.S.L int64 -> float', [C1(FMT.L, 1, 2, FN.CVT_S)],
+    { fprI64: { 1: -1048576 }, expectFprF32: { 2: -1048576 },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
+  T('CVT.D.L int64 -> double', [C1(FMT.L, 1, 2, FN.CVT_D)],
+    { fprI64: { 1: 1234567890 }, expectFprF64: { 2: 1234567890 },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
+  T('CVT.D.S float -> double', [C1(FMT.S, 1, 2, FN.CVT_D)],
+    { fprF32: { 1: 0.5 }, expectFprF64: { 2: 0.5 },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
+  T('CVT.S.D double -> float (demote)', [C1(FMT.D, 1, 2, FN.CVT_S)],
+    { fprF64: { 1: 0.25 }, expectFprF32: { 2: 0.25 },
+      expectStats: { nativeFPCvt: 1, fallbackOps: 0 } }),
+
+  // ---- wave 11a: what must STILL fall back, and why ----
+  // ROUND.* lowers to a roundf() CALL in the shipped binary (func 2553 =
+  // `call 700`). C round() is half-AWAY-from-zero; wasm f32.nearest is
+  // half-to-EVEN. Emitting f32.nearest would be wrong at exactly .5, so this
+  // must keep falling back until roundf is open-coded.
+  T('ROUND.W.S must FALL BACK (roundf != f32.nearest at .5)', [C1(FMT.S, 1, 2, FN.ROUND_W)],
+    { expectStats: { nativeFPCvt: 0, fallbackOps: 1 } }),
+  T('ROUND.L.S must FALL BACK', [C1(FMT.S, 1, 2, FN.ROUND_L)],
+    { expectStats: { nativeFPCvt: 0, fallbackOps: 1 } }),
+  // CVT.W.* / CVT.L.* dispatch on FCR31&3 (funcs 2554-2557) and FCR31's
+  // address is not in the jit_params block
+  T('CVT.W.S must FALL BACK (FCR31 rounding-mode dispatch)', [C1(FMT.S, 1, 2, FN.CVT_W)],
+    { expectStats: { nativeFPCvt: 0, fallbackOps: 1 } }),
+  T('CVT.L.D must FALL BACK (FCR31 rounding-mode dispatch)', [C1(FMT.D, 1, 2, FN.CVT_L)],
+    { expectStats: { nativeFPCvt: 0, fallbackOps: 1 } }),
+  // compares write FCR31 bit 23; BC1* read it. Both need FCR31's address.
+  T('C.LT.S must FALL BACK (writes FCR31 bit 23)', [C1(FMT.S, 1, 2, 0x3C)],
+    { expectStats: { nativeFPCvt: 0, fallbackOps: 1 } }),
+  T('BC1F must FALL BACK (reads FCR31 bit 23)', [((0x11 << 26) | (0x08 << 21) | 2) >>> 0, 0],
+    { expectStats: { nativeFPCvt: 0 } }),
+
+  // ---- wave 11a: guard arms ----
+  // CU1 clear must hand the op to the interpreter, not convert anyway
+  T('TRUNC.W.S with CU1 clear does not write the destination', [C1(FMT.S, 1, 2, FN.TRUNC_W)],
+    { fprF32: { 1: 3.75 }, fprI32: { 2: 0x5a5a5a5a }, expectFprI32: { 2: '0x5a5a5a5a' },
+      opts: { cu1: false } }),
+  // fault-free, so it is legal in a delay slot (routed via emitSlotNative)
+  T('TRUNC.W.S in a branch delay slot', [I(OPC.BEQ, 4, 5, 2), C1(FMT.S, 1, 2, FN.TRUNC_W), OR(10, 8, 0), 0],
+    { regs: { 4: '0x1', 5: '0x1' }, fprF32: { 1: -2.5 },
+      expectFprI32: { 2: '0xfffffffe' }, expectStats: { fallbackOps: 0 } }),
 ];
 
 let fail = 0;
