@@ -17,6 +17,11 @@ const rom = process.argv[2] || 'mariokart.z64';
 const FRAMES = +(process.argv[3] || 600);
 const JIT_MODE = process.argv[4] || 'emit';
 const browser = await puppeteer.launch({ headless: 'new', executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox'] });
+  // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
+  // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
+  // this process is gone; a live run is never touched.
+  try { (await import('./browser_leak_guard.js')).default.guard(browser, __filename); } catch (_e) {}
+
 
 async function run(label, jit) {
   // fresh storage per run: the game writes its SRAM/EEPROM into IndexedDB

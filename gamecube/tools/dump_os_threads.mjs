@@ -186,6 +186,11 @@ function startServer() {
            '--disable-dev-shm-usage'],
     protocolTimeout: 600000,
   });
+  // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
+  // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
+  // this process is gone; a live run is never touched.
+  try { (await import('../../tools/browser_leak_guard.js')).default.guard(browser, import.meta.url); } catch (_e) {}
+
   const page = await browser.newPage();
 
   let wedgeSamples = 0;

@@ -77,6 +77,11 @@ const log = (m) => { const line = '[drive] ' + m; console.log(line); try { fs.ap
       '--disable-dev-shm-usage'],
     protocolTimeout: 600000,
   });
+  // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
+  // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
+  // this process is gone; a live run is never touched.
+  try { require('../../tools/browser_leak_guard.js').guard(browser, __filename); } catch (_e) {}
+
   const page = await browser.newPage();
   await page.setViewport({ width: 820, height: 620 });
 

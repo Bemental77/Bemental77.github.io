@@ -25,6 +25,11 @@ srv.listen(PORT, '127.0.0.1', async () => {
     executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
     args: ['--no-sandbox', '--enable-features=SharedArrayBuffer'],
   });
+  // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
+  // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
+  // this process is gone; a live run is never touched.
+  try { (await import('../../tools/browser_leak_guard.js')).default.guard(browser, __filename); } catch (_e) {}
+
   const page = await browser.newPage();
   page.on('console', (m) => {
     if (m.type() === 'error' || m.type() === 'warning')

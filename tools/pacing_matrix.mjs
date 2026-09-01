@@ -506,6 +506,9 @@ async function runCell(pg, scene, opts = {}) {
       args: ['--no-sandbox', '--disable-dev-shm-usage', '--autoplay-policy=no-user-gesture-required',
              '--enable-unsafe-webgpu', '--mute-audio'],
     });
+    // [leak-guard] a SIGKILLed parent ORPHANS this browser (uncatchable in-process);
+    // `node tools/browser_leak_guard.js reap` kills it once this process is gone.
+    try { (await import('./browser_leak_guard.js')).default.guard(browser, import.meta.url); } catch (_e) {}
     const page = await browser.newPage();
     page.setDefaultTimeout(180000);
     page.on('console', (m) => { if (m.type() === 'error' && out.consoleErrors.length < 40) out.consoleErrors.push(m.text().slice(0, 160)); });

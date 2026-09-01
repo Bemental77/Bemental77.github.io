@@ -35,6 +35,11 @@ const browser = await puppeteer.launch({
   executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
   args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox', '--disable-dev-shm-usage'],
 });
+  // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
+  // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
+  // this process is gone; a live run is never touched.
+  try { (await import('./browser_leak_guard.js')).default.guard(browser, __filename); } catch (_e) {}
+
 
 async function newPage(r) {
   const page = await browser.newPage();

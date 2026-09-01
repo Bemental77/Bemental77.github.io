@@ -117,6 +117,11 @@ const browser = await puppeteer.launch({
     '--autoplay-policy=no-user-gesture-required',
   ],
 });
+  // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
+  // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
+  // this process is gone; a live run is never touched.
+  try { (await import('./browser_leak_guard.js')).default.guard(browser, __filename); } catch (_e) {}
+
 try {
   const page = await browser.newPage();
   await page.setViewport({ width: +(process.env.SM64_W||320), height: +(process.env.SM64_H||240) });

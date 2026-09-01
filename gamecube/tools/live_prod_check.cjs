@@ -35,6 +35,9 @@ const puppeteer = require('puppeteer');
            '--disable-dev-shm-usage'],
     protocolTimeout: 600000,
   });
+  // [leak-guard] a SIGKILLed parent ORPHANS this browser (uncatchable in-process);
+  // `node tools/browser_leak_guard.js reap` kills it once this process is gone.
+  try { require('../../tools/browser_leak_guard.js').guard(browser, __filename); } catch (_e) {}
   const page = await browser.newPage();
   await page.setViewport({ width: 800, height: 600 });
   page.on('console', (m) => note(m.text()));

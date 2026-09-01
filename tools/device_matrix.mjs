@@ -244,6 +244,9 @@ async function runCell(arm, pg) {
       headless: 'new', executablePath: CHROME, userDataDir: dir,
       args: ['--no-sandbox', '--disable-dev-shm-usage', ...(arm.args || [])],
     });
+    // [leak-guard] a SIGKILLed parent ORPHANS this browser (uncatchable in-process);
+    // `node tools/browser_leak_guard.js reap` kills it once this process is gone.
+    try { (await import('./browser_leak_guard.js')).default.guard(browser, import.meta.url); } catch (_e) {}
     const page = await browser.newPage();
     page.setDefaultTimeout(60000);
     page.on('console', (m) => { if (m.type() === 'error') out.consoleErrors.push(m.text().slice(0, 180)); });
@@ -454,6 +457,11 @@ async function rigSelfTest() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dmx-self-a-'));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
       args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
+  // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
+  // this process is gone; a live run is never touched.
+  try { (await import('./browser_leak_guard.js')).default.guard(b, import.meta.url); } catch (_e) {}
+
     const p = await b.newPage();
     t.freshN64Coi = await coiOf(p, '/n64/');
     await b.close(); fs.rmSync(dir, { recursive: true, force: true });
@@ -465,6 +473,9 @@ async function rigSelfTest() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dmx-self-b-'));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
       args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+    // [leak-guard] a SIGKILLed parent ORPHANS this browser (uncatchable in-process);
+    // `node tools/browser_leak_guard.js reap` kills it once this process is gone.
+    try { (await import('./browser_leak_guard.js')).default.guard(b, import.meta.url); } catch (_e) {}
     const p = await b.newPage();
     t.gcCoi = await coiOf(p, '/gamecube.html');
     await sleep(600);
@@ -496,6 +507,9 @@ async function redirectTest() {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dmx-rd-${label}-`));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
       args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+    // [leak-guard] a SIGKILLed parent ORPHANS this browser (uncatchable in-process);
+    // `node tools/browser_leak_guard.js reap` kills it once this process is gone.
+    try { (await import('./browser_leak_guard.js')).default.guard(b, import.meta.url); } catch (_e) {}
     const p = await b.newPage();
     if (opts.noJs) await p.setJavaScriptEnabled(false);
     if (opts.slow) {

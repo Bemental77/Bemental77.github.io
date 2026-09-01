@@ -44,6 +44,11 @@ const browser = await puppeteer.launch({
   args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox', '--disable-dev-shm-usage'],
   protocolTimeout: 240000,
 });
+  // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
+  // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
+  // this process is gone; a live run is never touched.
+  try { (await import('./browser_leak_guard.js')).default.guard(browser, __filename); } catch (_e) {}
+
 try {
   const page = await browser.newPage();
   page.setDefaultTimeout(120000);

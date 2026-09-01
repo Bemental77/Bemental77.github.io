@@ -11,6 +11,11 @@ const browser = await puppeteer.launch({
   headless: 'new',
   args: ['--no-sandbox', '--enable-features=SharedArrayBuffer'],
 });
+  // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
+  // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
+  // this process is gone; a live run is never touched.
+  try { (await import('./browser_leak_guard.js')).default.guard(browser, __filename); } catch (_e) {}
+
 const page = await browser.newPage();
 await page.setViewport({ width: 844, height: 390, isMobile: true, hasTouch: true });
 page.on('requestfailed', (r) => console.log('[reqfail]', r.url().slice(-80), r.failure()?.errorText));

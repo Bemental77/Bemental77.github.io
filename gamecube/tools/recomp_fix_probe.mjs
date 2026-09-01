@@ -55,6 +55,11 @@ const browser = await puppeteer.launch({
          '--js-flags=--max-old-space-size=4096',
          '--disk-cache-size=1', '--disable-application-cache', '--disable-back-forward-cache'],
 });
+  // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
+  // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
+  // this process is gone; a live run is never touched.
+  try { (await import('../../tools/browser_leak_guard.js')).default.guard(browser, __filename); } catch (_e) {}
+
 const page = await browser.newPage();
 page.on('console', (m) => { const t = m.text(); if (process.env.ALLCON) console.log('[page]', t.slice(0, 300)); else if (/recomp|Unknown Opcode/i.test(t)) console.log('[page]', t.slice(0, 200)); });
 await page.goto(`http://127.0.0.1:${PORT}/gamecube.html?v=${Date.now()}${process.env.SKIP_DL === '1' ? '#skipdl' : ''}`, { waitUntil: 'load', timeout: 60000 });

@@ -80,6 +80,9 @@ const HARD_FAIL_RE = /\bLinkError\b|\bRuntimeError\b|\babort\(|\bAborted\b|uncau
     let browser;
     try {
         browser = await puppeteer.launch(launchOpts);
+        // [leak-guard] a SIGKILLed parent ORPHANS this browser (uncatchable in-process);
+        // `node tools/browser_leak_guard.js reap` kills it once this process is gone.
+        try { (await import('../../../tools/browser_leak_guard.js')).default.guard(browser, import.meta.url); } catch (_e) {}
     } catch (e) {
         console.error(`[conformance] puppeteer launch failed: ${e.message}`);
         srv.close(); process.exit(2);

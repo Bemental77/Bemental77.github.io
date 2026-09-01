@@ -64,6 +64,11 @@ const browser = await puppeteer.launch({
   args: ['--autoplay-policy=no-user-gesture-required', '--no-sandbox', '--disable-dev-shm-usage'],
   protocolTimeout: 600000,
 });
+  // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
+  // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
+  // this process is gone; a live run is never touched.
+  try { (await import('./browser_leak_guard.js')).default.guard(browser, __filename); } catch (_e) {}
+
 
 // The shipped keyboard map (input_controller.js:333-352): Enter=Start, m=A,
 // n=B, w/a/s/d=analog, arrows=d-pad.

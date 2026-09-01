@@ -127,6 +127,11 @@ async function pickDisc(page, cuePathAbs) {
            `--js-flags=--max-old-space-size=4096 ${process.env.PROBE_JS_FLAGS || ''}`],
     protocolTimeout: 600000,
   });
+  // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
+  // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
+  // this process is gone; a live run is never touched.
+  try { require('../../tools/browser_leak_guard.js').guard(browser, __filename); } catch (_e) {}
+
   const page = await browser.newPage();
 
   const buckets = {
