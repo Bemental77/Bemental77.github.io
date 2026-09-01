@@ -282,10 +282,40 @@ jump-table code addresses. But until it is built, quote 82.0%, not 99.45%.
 | 1,056 leaf vectors | **1056 bit-exact / 0 mismatched** | `f14b813694fc243b74c9c85f8fc009fb` | md5 recorded in `e597dfa6` |
 | 7 non-leaf fixtures | **7 PASS / 0 FAIL** (3 SKIP = the fixtures `b401f282` already rejected) | `823eaf6b7a25339fa8f660da74f06f5a` | md5 recorded in `b401f282` |
 
-> **These prove NO REGRESSION, not that indirect dispatch is CORRECT.** None of the
-> four leaf functions and none of the seven non-leaf fixtures executes a `blrl` or a
-> `bctr` — that is *why* they translated cleanly before the flag existed. Correctness
-> of the dispatch itself needs a fixture whose trace actually takes an indirect branch.
+> Those two suites prove NO REGRESSION, not that indirect dispatch is CORRECT: none of
+> the four leaf functions and none of the seven non-leaf fixtures executes a `blrl` or a
+> `bctr` — that is *why* they translated cleanly before the flag existed.
+
+### `blrl` dispatch, proven by execution — 3 PASS / 0 FAIL
+
+Three SAB functions whose traces really take an indirect branch, captured from the
+reference interpreter and replayed against the **whole-image** build
+(md5 `51092aa5272349e1d8a1ed7aa25aead3`, unchanged across the run):
+
+```
+PASS  0x80119828  steps=77   bl=2  stores=15  write-events=42  ps1-indep=true  fpscr:match
+PASS  0x801197d0  steps=63   bl=1  stores=13  write-events=27  ps1-indep=true  fpscr:match
+PASS  0x801197fc  steps=157  bl=4  stores=43  write-events=69  ps1-indep=true  fpscr:match
+```
+
+**That the `blrl` was actually taken is not assumed, it is shown.** Each of the three
+entry functions contains **exactly one `blrl` and ZERO direct `bl` targets**, yet the
+captured traces entered other functions anyway:
+
+| entry | direct `bl` targets | entered | reachable only via `blrl` |
+|---|---|---|---|
+| `0x80119828` | *(none)* | 4 functions | `0x800e44a8`, `0x800e4650`, `0x801198c4` |
+| `0x801197d0` | *(none)* | 3 functions | `0x800e4554`, `0x8011989c` |
+| `0x801197fc` | *(none)* | 6 functions | `0x8000532c`, `0x8000535c`, `0x800e4554`, `0x80119778`, `0x801198ec` |
+
+Control cannot have reached those addresses any other way, so `sr_indirect()` resolved
+a real function pointer and the result is bit-exact on exit registers, the ordered
+memory-write log, final memory, and zero reads of unstaged memory. Fixtures committed
+at `gamecube/recomp/sr/sab_blrl_fixtures.json`.
+
+**`bctr` is still unproven and still faults** — see the jump-table section above; that
+is the remaining half of the indirect story and the reason the runtime-complete figure
+is 82.0%.
 
 ## 5c. First performance signal for this path — and its limits
 
