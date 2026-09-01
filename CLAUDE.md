@@ -190,6 +190,20 @@ node tools/jsearch.js <file> --extract <name>  # extract a named function/var bl
   - Repair forward if you can (`git reset --soft <bad>` then commit the good tree) — but note the forward commit is exactly the 6.35 GiB push described above, so in practice the branch ref has to move.
   - Concurrent agents share this working tree and have committed each other's uncommitted work before. Treat the index as shared state.
 
+### Concurrent agents share ONE index — commit with a pathspec, never bare
+**`git add <paths>` + `git commit` commits the ENTIRE INDEX, including every file a sibling agent staged while you were working.** This happened TWICE on 2026-09-01 and mis-attributed two agents' work:
+- a commit intended as 5 test files landed 21, sweeping in another agent's whole PS1/GBA/SNES/snes.html body of work;
+- a commit intended as a capability-gate fix also took another agent's in-progress Dreamcast audio edits (`srcRate`/`dstRate`/`underrun` hunks) under a message that never mentions them.
+
+Nothing is lost when this happens — the code is committed — but the history lies about who changed what and why, and the commit message documents only part of its own diff. Use a pathspec, which commits ONLY those paths regardless of what else is staged:
+
+```bash
+git commit -- <path> [<path>...]        # pathspec-limited; ignores the rest of the index
+git diff --cached --name-only           # ALWAYS read this before committing
+git show --stat --format="" HEAD | tail -25   # and verify AFTER: did it take only what you meant?
+```
+Checking `git status` is NOT sufficient — it shows the sibling's staged files as ordinary staged entries, indistinguishable from your own. When a file you need is being edited by a sibling (e.g. `gamecube.html` carrying both a present-ring change and a capability fix), either leave it entirely to that agent or stage only your own hunks; do not commit the file wholesale.
+
 ### Before any measured run (not optional)
 ```bash
 node tools/browser_leak_guard.js reap && uptime
