@@ -116,6 +116,53 @@ try {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Wait for a start control to be ENABLED before clicking it.
+ *
+ * WHY THIS EXISTS — it produced a false defect report and was caught only by
+ * chasing a "no audio" verdict that had no error behind it. gba.html:466 binds
+ * `rv-disabled="data.moduleInitializing"`, so #btnPlayGame stays disabled until
+ * the core finishes initialising, while #romselect is populated immediately
+ * from ROMLIST. Clicking on the ROM list being ready therefore clicked a
+ * DISABLED button: puppeteer reports no error, the inline onclick never fires,
+ * the emulator never starts, and the page constructs no AudioContext — which
+ * reads exactly like "this page has no audio", with zero pageErrors and zero
+ * console errors to contradict it.
+ *
+ * Also treats aria-disabled as authoritative: per CLAUDE.md, lib/capability.js
+ * is the sole writer of aria-disabled/data-cap-blocked on start controls, and a
+ * control it is holding down must not be clicked or force-enabled — if the
+ * capability layer is blocking, that is a real finding, not something to
+ * bulldoze.
+ */
+async function waitEnabled(page, sel, timeoutMs = 90000) {
+  const t0 = Date.now();
+  for (;;) {
+    const st = await page.evaluate((s) => {
+      const el = document.querySelector(s);
+      if (!el) return { present: false };
+      return {
+        present: true,
+        disabled: !!el.disabled,
+        ariaDisabled: el.getAttribute('aria-disabled') === 'true',
+        capBlocked: el.hasAttribute('data-cap-blocked'),
+      };
+    }, sel).catch(() => ({ present: false }));
+    if (st.present && !st.disabled && !st.ariaDisabled) return st;
+    if (st.present && (st.ariaDisabled || st.capBlocked)) {
+      // Capability layer is deliberately holding it down. Record and stop
+      // waiting — this is a verdict, not a race.
+      result.startBlockedByCapability = true;
+      return st;
+    }
+    if (Date.now() - t0 > timeoutMs) {
+      result.startEnableTimedOut = sel;
+      return st;
+    }
+    await sleep(500);
+  }
+}
+
 try {
   const page = await browser.newPage();
   page.setDefaultTimeout(120000);
@@ -162,6 +209,7 @@ try {
         sel.dispatchEvent(new Event('change', { bubbles: true }));
         return sel.options[sel.selectedIndex]?.textContent?.trim() ?? null;
       }, romIdx, ROM_NAME);
+      await waitEnabled(page, '#btnPlayGame');
       await page.click('#btnPlayGame');
     } else {
       await page.waitForSelector('#romSelect option', { timeout: 60000 });
@@ -178,6 +226,7 @@ try {
       }, romIdx, ROM_NAME);
       // real click => a real user gesture, so autoplay unblocking is exercised
       // exactly as a visitor would exercise it.
+      await waitEnabled(page, '#btnStart');
       await page.click('#btnStart');
     }
     result.started = true;
@@ -196,26 +245,29 @@ try {
   // above dfsound's TESTSIZE and left it there — after which SPUasync bailed
   // on every call and sound never returned for the rest of the session.
   if (process.env.AUDIO_MUTE_CYCLE === '1') {
-    const before = await page.evaluate(() => {
-      const c = window.__audioTap?.summary()?.contexts?.[0];
-      return c ? { frames: c.frames, audibleFrames: c.audibleFrames } : null;
-    }).catch(() => null);
+    // Pick the context that is actually playing, exactly as the verdict does.
+    // Reading contexts[0] here measured ps1.html's vestigial
+    // Module.preCreatedAudioContext (destConnects 0, permanently 0 audible) and
+    // reported "did not recover" on a page whose real context was playing.
+    const pick = () => {
+      const cs = window.__audioTap?.summary()?.contexts || [];
+      if (!cs.length) return null;
+      const c = cs.slice().sort((a, b) =>
+        (b.audibleFrames - a.audibleFrames) || (b.frames - a.frames))[0];
+      return { id: c.id, sampleRate: c.sampleRate, frames: c.frames,
+               audibleFrames: c.audibleFrames, state: c.state };
+    };
+    const before = await page.evaluate(pick).catch(() => null);
     const clicked = await page.evaluate(() => {
       const b = document.getElementById('btnMute');
       if (!b) return 'no-btnMute';
       b.click(); return 'muted';
     }).catch((e) => 'err:' + e);
     await sleep(4000);
-    const during = await page.evaluate(() => {
-      const c = window.__audioTap?.summary()?.contexts?.[0];
-      return c ? { frames: c.frames, audibleFrames: c.audibleFrames, state: c.state } : null;
-    }).catch(() => null);
+    const during = await page.evaluate(pick).catch(() => null);
     await page.evaluate(() => { const b = document.getElementById('btnMute'); if (b) b.click(); }).catch(() => {});
     await sleep(6000);
-    const after = await page.evaluate(() => {
-      const c = window.__audioTap?.summary()?.contexts?.[0];
-      return c ? { frames: c.frames, audibleFrames: c.audibleFrames, state: c.state } : null;
-    }).catch(() => null);
+    const after = await page.evaluate(pick).catch(() => null);
     result.muteCycle = {
       clicked, before, during, after,
       audibleGainedDuringMute: (during && before) ? during.audibleFrames - before.audibleFrames : null,
