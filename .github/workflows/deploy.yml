@@ -48,15 +48,17 @@ jobs:
             --exclude='*.tsbuildinfo' \
             --exclude='ps1/ps1Wasm/pcsx-wasm-src' \
             --exclude='ps1/ps1Wasm/wasmpsx-repo' \
-            --exclude='bementalJIT' \
+            --exclude='/bementalJIT' \
+            --exclude='/gamecube/bementalJIT' \
             --exclude='gamecube/dolphin-src' \
             --exclude='gamecube/build-*' \
             --exclude='gamecube/ppc-worker/build-*' \
             --exclude='gamecube/tools' \
-            --exclude='dolphin_captures' \
+            --exclude='dolphin_captures/*.log' \
+            --exclude='dolphin_captures/*.txt' \
             --exclude='research_findings.md' \
-            --exclude='tools' \
-            --exclude='build-*' \
+            --exclude='/tools' \
+            --exclude='/build-*' \
             --exclude='*.iso' \
             --exclude='*.bin.bak' \
             --exclude='*.o' \
@@ -75,6 +77,20 @@ jobs:
           echo "::group::Deploy file count"
           find _deploy -type f | wc -l
           echo "::endgroup::"
+
+      - name: Verify runtime assets survived the exclude list
+        # Two shipped features were silently dead in production because the rsync
+        # excludes above stripped assets that runtime code fetches:
+        #   dolphin_captures/sab.map      -> SAB booted with ~258 symbols, HLE
+        #                                    patches did not install, OSPanic
+        #                                    reached PPCHalt
+        #   n64/bementalJIT/mips_emit.js  -> the N64 JIT could never load; an
+        #                                    rsync pattern with no leading slash
+        #                                    matches ANY path component
+        # Both were present in git and on prod and returned 404 live, which no
+        # repo-side check can see. This asserts against the STAGED ARTIFACT,
+        # which is the only place the deletion is observable.
+        run: node tools/verify_deploy_assets.mjs _deploy
 
       - name: Configure Pages
         uses: actions/configure-pages@v4
