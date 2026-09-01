@@ -109,6 +109,102 @@ bool IsSeamBackwardConditional(u32 inst) {
     return (bo == 0b10000u || bo == 0b10010u || (bo & 0b10100u) == 0b00100u);
 }
 
+// ---------------------------------------------------------------------------
+// [LEAF-INLINE 2026-09-01] see ppc_analyst.h for the full rationale + the
+// product-definition (1.000x) argument. These are pure static decode helpers;
+// they change no state and are called at COMPILE time only.
+
+bool IsInlinableBl(u32 inst) {
+    if (GekkoOperands::OPCD(inst) != 18u) return false;
+    return GekkoOperands::LK(inst) && !GekkoOperands::AA(inst);
+}
+
+u32 BlTarget(u32 inst, u32 pc) {
+    return pc + GekkoOperands::LI(inst);
+}
+
+std::size_t DecodePureLeaf(u32 target, LeafFetchFn fetch, void* user,
+                           u32* out_insts, u32* out_pcs, std::size_t cap) {
+    if (!fetch || !out_insts || !out_pcs || cap == 0u) return 0u;
+    if ((target & 3u) != 0u) return 0u;
+    // Only fetch inside the MEM1 cached-code window (0x80000000..0x817FFFFF,
+    // the 24 MB main RAM aperture). A `bl` out of it is never a candidate —
+    // we will not chase a pointer into MMIO/uncached/L2-locked space.
+    if (target < 0x80000000u || target >= 0x81800000u) return 0u;
+
+    const std::size_t budget =
+        cap < kLeafInlineMaxOps ? cap : kLeafInlineMaxOps;
+    u32 pc = target;
+    for (std::size_t n = 0; n < budget; ++n) {
+        const u32 inst = fetch(pc, user);
+        const GekkoOPInfo* opinfo = lookup_op_info(inst, pc);
+        if (!opinfo) return 0u;                     // unknown encoding
+        out_insts[n] = inst;
+        out_pcs[n]   = pc;
+        // A plain `blr` (bclr BO=20, LK=0) is the ONLY accepted terminator.
+        // Checked first: blr is OpType::Branch, which the body filter rejects.
+        if (IsPlainBlr(inst)) return n + 1u;
+        // Body: Integer / Load ONLY. That single test already excludes every
+        // Store, Branch, CR, SPR, System, SystemFP, LoadFP/StoreFP, PS and
+        // cache op, i.e. everything IsBusyWaitLoop would reject anyway plus
+        // everything that could write LR/CTR/MSR or take a non-DSI trap.
+        if (opinfo->type != OpType::Integer && opinfo->type != OpType::Load)
+            return 0u;
+        // Belt-and-suspenders: no block terminator, no SPR traffic in the
+        // body (mfspr/mtspr are OpType::SPR/System in the table, but the
+        // analyst's own mtspr filter shows how easily that drifts).
+        if (opinfo->flags & FL_ENDBLOCK)   return 0u;
+        if (IsMfspr(inst) || IsMtspr(inst)) return 0u;
+        pc += 4u;
+    }
+    return 0u;   // budget exhausted without reaching a blr — not a leaf.
+}
+
+std::size_t DecodeBlockLeafInlined(u32 start_pc, LeafFetchFn fetch, void* user,
+                                   u32* out_insts, u32* out_pcs,
+                                   std::size_t cap, bool* out_spliced,
+                                   u32* out_guest_end) {
+    if (out_spliced)    *out_spliced = false;
+    if (out_guest_end)  *out_guest_end = start_pc;
+    if (!fetch || !out_insts || !out_pcs || cap == 0u) return 0u;
+
+    // Window the caller's own contiguous decode can reach. A candidate leaf
+    // must be entirely OUTSIDE it, so a spliced stream can never contain two
+    // ops with the same guest pc (the seam matcher and the emitter's
+    // software-RAS both key on addresses).
+    const u32 win_lo = start_pc;
+    const u32 win_hi = start_pc + 4u * (u32)cap;
+
+    std::size_t n = 0u;
+    u32 pc = start_pc;
+    while (n < cap) {
+        const u32 inst = fetch(pc, user);
+        out_insts[n] = inst;
+        out_pcs[n]   = pc;
+        ++n;
+        if (out_guest_end && pc + 4u > *out_guest_end) *out_guest_end = pc + 4u;
+
+        if (IsBlockTerminator(inst) && !IsForwardConditionalBranch(inst, pc)) {
+            if (IsInlinableBl(inst) && n < cap) {
+                const u32 target = BlTarget(inst, pc);
+                const std::size_t nleaf = DecodePureLeaf(
+                    target, fetch, user, out_insts + n, out_pcs + n, cap - n);
+                const u32 leaf_hi = target + 4u * (u32)nleaf;
+                const bool disjoint = (leaf_hi <= win_lo) || (target >= win_hi);
+                if (nleaf > 0u && disjoint) {
+                    n += nleaf;
+                    if (out_spliced) *out_spliced = true;
+                    pc += 4u;          // resume at the `bl`'s return site
+                    continue;
+                }
+            }
+            break;
+        }
+        pc += 4u;
+    }
+    return n;
+}
+
 // EvaluateBranchTarget — return the absolute target PC for any branch
 // instruction at `pc`, or INVALID_BRANCH_TARGET if not a branch. The host
 // supplies the instruction word indirectly via the inst parameter.

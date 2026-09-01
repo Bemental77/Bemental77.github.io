@@ -148,6 +148,20 @@ inline bool IsBlockTerminator(u32 inst)
 //   0x026B3484  u32  last live ctx_ptr at a matching compile (bake target)
 //   0x026B3488  u32  asset baked_ctx echo
 //   0x026B348C  u32  load status: 1 ok, 0x8000000x = parse error code
+//
+// [LEAF-INLINE 2026-09-01] census cells (0x026B3B44..0x026B3B94 verified free
+// 2026-09-01 by an exhaustive grep of every 0x026B3xxx literal in the tree):
+//   0x026B3B60  u32  candidate blocks (contiguous decode ended in a pc-rel bl)
+//   0x026B3B64  u32  blocks whose emit stream had a pure leaf spliced in
+//   0x026B3B68  u32  spliced blocks the analyst then classified branchIsIdleLoop
+//   0x026B3B6C  u32  start_pc of the most recent such idle-classified block
+//   0x026B3B70  u32  spliced streams the emitter declined (fell back to contiguous)
+constexpr u32 kLeafInlineCandCell    = 0x026B3B60u;
+constexpr u32 kLeafInlineSplicedCell = 0x026B3B64u;
+constexpr u32 kLeafInlineIdleCell    = 0x026B3B68u;
+constexpr u32 kLeafInlineLastPcCell  = 0x026B3B6Cu;
+constexpr u32 kLeafInlineBailCell    = 0x026B3B70u;
+
 struct AotEntry { std::vector<u8> wasm; std::vector<u32> gwords; u32 gspan = 0; u32 ghash = 0; u32 cycles = 0; };
 std::unordered_map<u32, AotEntry> g_aot_blocks;
 u32  g_aot_baked_ctx = 0;
@@ -1045,11 +1059,92 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
     }
   }
 
+  // [LEAF-INLINE 2026-09-01] Emit stream actually handed to the emitter. By
+  // default this IS the contiguous decode above (li_count==0 => unchanged
+  // path, bit-identical to before this change).
+  u32 li_insts[kMaxBlockInsts];
+  u32 li_pcs[kMaxBlockInsts];
+  u32 li_count = 0;
+  u32 li_guest_end = start_pc + count * 4u;
+  bool li_is_idle = false;
+
   if (!used_aot)
   {
-    bytes = bemental::powerpc::build_block_next(
-        start_pc, insts.data(), count, ctx_ptr, mem1_base, mem1_mask, ram_size,
-        &block_cycles);
+    // A `bl` is FL_ENDBLOCK and is never a coalescable forward conditional, so
+    // it can only ever be the LAST word of a contiguous block. That makes the
+    // candidate gate free: unless this block ENDS in a pc-relative `bl`, the
+    // splice pass cannot possibly fire and we do not run it. Every non-`bl`
+    // block therefore takes the exact same path it took before.
+    if (bemental::powerpc::IsInlinableBl(insts.back()))
+    {
+      AotBump(kLeafInlineCandCell);
+      struct LeafFetchCtx { Memory::MemoryManager* mem; };
+      LeafFetchCtx lfc{&mem};
+      auto leaf_fetch = +[](u32 fpc, void* user) -> u32 {
+        return static_cast<LeafFetchCtx*>(user)->mem->Read_U32(fpc);
+      };
+      bool spliced = false;
+      u32 guest_end = start_pc;
+      const u32 n = static_cast<u32>(bemental::powerpc::DecodeBlockLeafInlined(
+          start_pc, leaf_fetch, &lfc, li_insts, li_pcs, kMaxBlockInsts,
+          &spliced, &guest_end));
+      // Only take the new path when a leaf was ACTUALLY inlined. A pass that
+      // spliced nothing produces the identical contiguous stream, and routing
+      // it through AnalyzeOps instead of Analyze would be a gratuitous
+      // behavior change on every `bl`-terminated block in the game.
+      if (spliced && n > 0)
+      {
+        li_count = n;
+        li_guest_end = guest_end;
+      }
+    }
+
+    if (li_count > 0)
+    {
+      // Non-contiguous stream => the emitter needs the explicit per-op pcs.
+      // AnalyzeOps sets m_noncontiguous, which routes the mid-list `bl` to
+      // ppc_emit's `LR := pc+4` seam arm and the mid-list `blr` to its
+      // software-RAS arm, and enables the analyst's LEAF-IDLE eligibility
+      // check ahead of IsBusyWaitLoop.
+      bytes = bemental::powerpc::build_block_next(
+          start_pc, li_insts, li_count, ctx_ptr, mem1_base, mem1_mask, ram_size,
+          &block_cycles, &li_is_idle, li_pcs);
+      // [LEAF-INLINE idle-only gate 2026-09-01] KEEP the spliced block ONLY if
+      // the analyst actually classified it a busy-wait. MEASURED on SAB: the
+      // ungated version spliced 201 blocks of which only 15 classified idle, and
+      // the hermetic A/B read 0.4250x -> 0.4102x guest (published 16.94 -> 15.86
+      // /s) — i.e. a REGRESSION. The 186 non-idle splices are pure cost: a longer
+      // block, plus a mid-list `blr` that emits the software-RAS compare (and a
+      // register flush on mispredict) where the contiguous form emitted a plain
+      // block exit, plus a per-call-site duplicate of a leaf that used to be ONE
+      // shared block in the cache. Inlining is not free, so pay for it only where
+      // it buys the downcount=0 idle skip. The discarded emit costs one wasted
+      // build_block_next per candidate at COMPILE time only.
+      if (!bytes.empty() && li_is_idle)
+      {
+        AotBump(kLeafInlineSplicedCell);
+        AotBump(kLeafInlineIdleCell);
+        *AotCell(kLeafInlineLastPcCell) = start_pc;
+      }
+      else
+      {
+        // Not idle, or the emitter declined the spliced stream — fall back to
+        // the untouched contiguous path rather than paying for an inline that
+        // buys nothing.
+        AotBump(kLeafInlineBailCell);
+        bytes.clear();
+        li_count = 0;
+        li_guest_end = start_pc + count * 4u;
+        block_cycles = 0;
+      }
+    }
+
+    if (li_count == 0)
+    {
+      bytes = bemental::powerpc::build_block_next(
+          start_pc, insts.data(), count, ctx_ptr, mem1_base, mem1_mask, ram_size,
+          &block_cycles);
+    }
   }
 
   if (bytes.empty())
@@ -1067,7 +1162,16 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
   // exhaustive Jit64 parity audit (docs/jit-correctness-rulebook/).
   m_block_inst_counts[start_pc] = block_cycles ? block_cycles : count;
   // Guest span for icbi range-eviction (InvalidateICacheRange).
-  m_block_guest_end[start_pc] = start_pc + count * 4u;
+  // [LEAF-INLINE] li_guest_end is the CONTIGUOUS caller-stream extent, which
+  // for a spliced block runs PAST the `bl` (decoding resumed at the return
+  // site) — so it must be used instead of start_pc + count*4. KNOWN GAP: the
+  // inlined callee's own address range is not covered by this single
+  // [start, end) record, so a guest that rewrites the leaf body would not
+  // evict this block. GameCube titles do not self-modify text in practice
+  // (no SMC has been observed in this project's traces) and the exposure is
+  // bounded to <= kLeafInlineMaxOps words per spliced block; it is recorded
+  // here rather than left implicit.
+  m_block_guest_end[start_pc] = li_count > 0 ? li_guest_end : start_pc + count * 4u;
 
   // STEP 2 (region wiring, side-channel — NO dispatch change yet): accumulate
   // this block's bare BODY (no module wrapper) into its region so a later
@@ -1089,10 +1193,24 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
     rec.mem1_mask     = mem1_mask;
     rec.ram_size      = ram_size;
     rec.block_cycles  = block_cycles ? block_cycles : count;
-    rec.insts         = insts;
-    rec.instr_pcs.resize(count);
-    for (u32 i = 0; i < count; ++i)
-      rec.instr_pcs[i] = start_pc + i * 4u;
+    // [LEAF-INLINE] stash the stream that was ACTUALLY compiled. For a spliced
+    // block that is the non-contiguous leaf-inlined list with its real per-op
+    // pcs — the same shape block_cache.cpp's own FUSION v2/v3 driver produces
+    // and emit_block_body_next already consumes. Stashing the pre-splice
+    // contiguous words instead would let a later region re-emit silently
+    // disagree with the block that is running.
+    if (li_count > 0)
+    {
+      rec.insts.assign(li_insts, li_insts + li_count);
+      rec.instr_pcs.assign(li_pcs, li_pcs + li_count);
+    }
+    else
+    {
+      rec.insts         = insts;
+      rec.instr_pcs.resize(count);
+      for (u32 i = 0; i < count; ++i)
+        rec.instr_pcs[i] = start_pc + i * 4u;
+    }
     m_wasm_cache.stash_block(start_pc, rec);
   }
   return true;
