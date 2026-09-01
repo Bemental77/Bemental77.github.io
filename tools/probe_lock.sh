@@ -54,13 +54,26 @@ reclaim_if_dead() {
     echo "[probe-lock] owner $p is GONE — reclaiming stale lock (held by:$(owner_who))"
     rm -rf "$LOCK"; return 0
   fi
-  # A lock with no owner file at all is from the old bare-mkdir protocol; it has
-  # no way to prove liveness, so treat it as stale only after it goes untouched.
+  # A lock with no owner file is from the old bare-mkdir protocol and cannot
+  # prove liveness, so it is reclaimed only after going untouched for
+  # PROBE_LOCK_ORPHAN_MIN.
+  #
+  # WHY 10 AND NOT 20: an ownerless lock STARVES EVERY WAITER for the whole
+  # window — observed with 18 agents queued behind an empty lock dir. The
+  # window only has to exceed the longest single measurement, and nothing here
+  # runs anywhere near that long: the GameCube probe's longest configured run
+  # in this tree is PROBE_DURATION_MS=118000, and the directory's mtime is set
+  # at creation and does not advance during a run, so a legitimate holder's
+  # lock reads roughly its own runtime. 10 leaves a wide margin over ~2 while
+  # halving the starvation window. Raise it with PROBE_LOCK_ORPHAN_MIN if a
+  # genuinely longer measurement is ever added.
   if [ -d "$LOCK" ] && [ -z "$p" ]; then
-    if [ -z "$(find "$LOCK" -maxdepth 0 -newermt '-20 minutes' 2>/dev/null)" ]; then
-      echo "[probe-lock] ownerless lock older than 20 minutes — reclaiming"
+    local om="${PROBE_LOCK_ORPHAN_MIN:-10}"
+    if [ -z "$(find "$LOCK" -maxdepth 0 -newermt "-${om} minutes" 2>/dev/null)" ]; then
+      echo "[probe-lock] ownerless lock untouched for >${om} min — reclaiming (bare-mkdir holder is gone)"
       rm -rf "$LOCK"; return 0
     fi
+    echo "[probe-lock] waiting on an OWNERLESS lock (old bare-mkdir protocol) — cannot verify liveness; reclaim at ${om} min"
   fi
   return 1
 }
