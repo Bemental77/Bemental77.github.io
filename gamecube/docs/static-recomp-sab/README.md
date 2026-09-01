@@ -440,6 +440,34 @@ The three hits that did pass the DOL-TEXT filter had `lr` = `0x811fff58`, `0x811
 `pc=0x80003140` at connect, the reading is that the interpreter had not yet booted far
 enough to OSLink any overlay at all.
 
+### The real reason, measured: the interpreter runs SAB at 0.0328x real time
+
+That last sentence was a reading, so I measured it. Dolphin's reference interpreter
+emits one AI DMA callback per fixed slice of *emulated* time — 200.18/s on hardware
+(`CLAUDE.md:44`; `SystemTimers.cpp:78-83` derives the period from the core clock). The
+oracle log from the x-form run reached `AID-fire n=2996` in about 456 s of wall clock:
+
+```
+2996 AID fires / 200.18 per s  = 14.97 s EMULATED
+14.97 s emulated / 456 s wall  = 0.0328x real time  (~1/30)
+```
+
+So the budgets were never close:
+
+| budget | emulated boot reached |
+|---|---|
+| 240 s (my titleD run) | **~7.9 s** |
+| 300 s (my stg13D run) | ~9.8 s |
+| 900 s | ~29.5 s |
+
+A GameCube title screen is tens of seconds of emulated boot away, so a 240 s budget
+cannot reach one no matter how the probe targets are ranked. **The ranking bug was
+real and the budget was also wrong** — two independent causes, and fixing only the
+first would have failed again identically. `fixture_rel.py` now sizes `--budget` for
+base recovery separately from `--discover-budget` (the machine is already booted by
+then), and documents the conversion so the next person picks a number in emulated
+time rather than wall time.
+
 ## 6. The OS-thread / context-switch problem, measured
 
 The brief warned that a binary recomp cannot use MP4's escape (never compiling

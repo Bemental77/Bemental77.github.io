@@ -110,7 +110,17 @@ def main():
     ap.add_argument('--map', default=os.path.join(REPO, 'dolphin_captures/sab.map'))
     ap.add_argument('--locate-only', action='store_true')
     ap.add_argument('--capture-n', type=int, default=3)
-    ap.add_argument('--budget', type=float, default=120.0)
+    ap.add_argument('--budget', type=float, default=120.0,
+                    help='seconds for BASE RECOVERY.  Size it in EMULATED time: the '
+                         'reference interpreter runs SAB at ~0.0328x real time '
+                         '(measured: 2,996 AID fires = 14.97 s emulated in ~456 s wall, '
+                         'AID rate 200.18/s per CLAUDE.md:44), so 240 s of wall clock '
+                         'buys only ~7.9 s of emulated boot -- nowhere near the point '
+                         'where the game OSLinks an overlay.  Both earlier overlay '
+                         'attempts failed for exactly this reason.')
+    ap.add_argument('--discover-budget', type=float, default=None,
+                    help='seconds for the entry-discovery phase (default: budget/3). '
+                         'The machine is already booted by then, so it needs far less.')
     ap.add_argument('--max-arm', type=int, default=300)
     ap.add_argument('--max-steps', type=int, default=40000)
     ap.add_argument('--probe-targets', type=int, default=24)
@@ -242,13 +252,14 @@ def main():
         arm = [e for e in entries if e in bodies]
         arm.sort(key=lambda e: bodies[e]["hi"] - bodies[e]["lo"])
         arm = arm[:a.max_arm]
-        print(f"[discover] arming {len(arm)} overlay entries for {a.budget:.0f}s")
+        dbudget = a.discover_budget if a.discover_budget else a.budget / 3.0
+        print(f"[discover] arming {len(arm)} overlay entries for {dbudget:.0f}s")
         for off in arm:
             g.add_bp(base + off)
         hits, t0 = {}, time.time()
-        while time.time() - t0 < a.budget:
+        while time.time() - t0 < dbudget:
             try:
-                rep = g.cont(timeout=max(5.0, a.budget - (time.time() - t0)))
+                rep = g.cont(timeout=max(5.0, dbudget - (time.time() - t0)))
             except Exception:
                 break
             pc = O.GDB.stop_pc(rep)
