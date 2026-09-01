@@ -697,7 +697,15 @@ Raised because a loaded box read the `rafdedupe` section RED: `shown` moved
 against a 0.9-1.1 band, while an earlier run on the same box read 0.958.
 
 **Not settled empirically** — the re-run was queued through `probe_lock.sh` and
-never got lock time (see the liveness note above; 11-12 agents queued).
+never got lock time. Verbatim, from `/tmp/n64-raf.log`:
+
+    [probe-lock] TIMEOUT after 2400s — held by pid 84630 (: probe_lock.sh
+    17:28:32). NOT stealing a live lock.
+
+i.e. it waited 40 minutes, lost every race, and exited 7 WITHOUT RUNNING — the
+identical outcome to the wave-11a liveness re-run (see above). Two independent
+40-minute waits starving on the same lock, while the box sat at load 0.5-4, is
+the datum: **this is a rig problem, not a scheduling accident.**
 
 What CAN be said without a run, from the test's own construction
 (`tools/n64_page_test.mjs:393-447`): **the direction is wrong for the bug this
