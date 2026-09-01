@@ -186,6 +186,42 @@ const ARMS = [
     },
   },
   {
+    // ── THE CELL THAT WAS MISSING, AND THE BUG IT WAS MISSING ────────────────
+    // Every arm that BLOCKS a page (no-webgpu, no-gpu, no-coi) ran at a DESKTOP
+    // viewport, where `isMobile` is false and #mobileSplash is never shown; and
+    // the one arm at phone size (mobile-ios) blocks nothing on this machine. So
+    // no cell in the 21 ever put a GATED page in front of a TOUCH device, and
+    // the gate's mobile behaviour went unmeasured for its whole existence.
+    //
+    // What lived in that hole: a `disabled` <button> still receives `pointerdown`
+    // in Chrome (measured — click and mousedown are suppressed, pointerdown and
+    // touchstart are not), and both mobile splash Start handlers are bound to
+    // pointerdown and call their starter directly. One tap on the greyed-out
+    // "Cannot run here" button started the emulator on gamecube.html and
+    // n64/index.html and hid the splash carrying the explanation. The matrix
+    // scored those same pages BLOCKED-HONESTLY, because judge() read `.disabled`
+    // and nothing ever tapped anything.
+    id: 'mobile-no-gpu',
+    what: 'A PHONE with no GPU path: iPhone viewport + touch + iOS UA, and --disable-gpu. The only arm '
+        + 'that puts a BLOCKED page in front of a TOUCH device, which is where the gate is weakest.',
+    args: ['--disable-gpu'],
+    enginesDiffer: true,
+    viewport: { width: 390, height: 844, deviceScaleFactor: 3, isMobile: true, hasTouch: true },
+    ua: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 '
+      + '(KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+    // Compound proof: BOTH halves must take, or this is one of the other two
+    // arms wearing this one's name and the cell proves nothing about phones.
+    proof: (b, a) => {
+      const touch = b.cap?.env?.touch === false && a.cap?.env?.touch === true;
+      const ua = b.cap?.env?.iosUA === false && a.cap?.env?.iosUA === true;
+      const gl = b.cap?.webgl2?.ok === true && a.cap?.webgl2?.ok === false;
+      return { ok: touch && ua && gl,
+               detail: `touch ${b.cap?.env?.touch}->${a.cap?.env?.touch}, iosUA ${b.cap?.env?.iosUA}->`
+                     + `${a.cap?.env?.iosUA}, webgl2.ok ${b.cap?.webgl2?.ok}->${a.cap?.webgl2?.ok} `
+                     + `(the device emulation AND the GPU removal must BOTH take)` };
+    },
+  },
+  {
     id: 'low-memory',
     what: 'A constrained V8 heap. Also runs the 512 MB WebAssembly.Memory probe, which is the '
         + 'allocation the N64 core actually asks for at start.',
@@ -391,6 +427,41 @@ async function runCell(arm, pg) {
       return { desktop: pick('btnStart'), mobile: pick('mobileSplashStart') };
     }).catch(() => null);
 
+    // ---- THE ON-SCREEN CONTROLS, AT PHONE SIZE ------------------------------
+    // All three shells share one class vocabulary (.faceBtn / .shoulderBtn /
+    // .dpadDisc / .sysBtn / .menuBtn), so one selector asks every page the same
+    // question — the same reason window.__cap has one shape. The controls are
+    // laid out behind the splash rather than absent, so they are measurable
+    // before Start and this costs no emulator boot.
+    //
+    // Two of these are unambiguous breakage and one is a judgement call, and
+    // they are kept apart on purpose: a control OFF THE SCREEN or a page that
+    // scrolls sideways is unreachable, full stop. A control smaller than the
+    // 44x44 CSS-px comfortable minimum is a quality warning, and folding a
+    // warning into the pass/fail gate is how a gate stops being believed.
+    out.touchTargets = null;
+    if (arm.viewport && arm.viewport.hasTouch) {
+      out.touchTargets = await page.evaluate(() => {
+        const SEL = '.faceBtn, .shoulderBtn, .dpadDisc, .sysBtn, .menuBtn, #mobileSplashStart, #mobileSplashDiag';
+        const MIN = 44;
+        const vw = window.innerWidth, vh = window.innerHeight;
+        const all = [...document.querySelectorAll(SEL)].map((e) => {
+          const r = e.getBoundingClientRect();
+          return { id: e.id || String(e.className), w: Math.round(r.width), h: Math.round(r.height),
+                   l: Math.round(r.left), t: Math.round(r.top), r: Math.round(r.right), b: Math.round(r.bottom) };
+        });
+        const laidOut = all.filter((x) => x.w > 0 && x.h > 0);
+        return {
+          viewport: vw + 'x' + vh,
+          count: laidOut.length,
+          smallerThan44: laidOut.filter((x) => x.w < MIN || x.h < MIN).map((x) => `${x.id} ${x.w}x${x.h}`),
+          offscreen: laidOut.filter((x) => x.r <= 0 || x.b <= 0 || x.l >= vw || x.t >= vh).map((x) => x.id),
+          horizontalScroll: document.documentElement.scrollWidth > vw + 1,
+          scrollWidth: document.documentElement.scrollWidth,
+        };
+      }).catch(() => null);
+    }
+
     // SPEC-DRIFT CROSS-CHECK. The rig keeps its own copy of each page's
     // requirement spec (it needs one before a browser exists), and the module
     // ships the authoritative one. Two copies of a config that are ASSUMED equal
@@ -423,6 +494,72 @@ async function runCell(arm, pg) {
                // whatever prints earliest, and the capability line prints once.
                capLineIdx: t.indexOf('[cap] WebGPU'), noUndefined: t.indexOf('undefined') < 0 };
     }).catch(() => null);
+
+    // ---- DOES THE GATE SURVIVE BEING TAPPED? --------------------------------
+    // Reading `.disabled` is not the property that matters; NOT STARTING is. The
+    // two are not the same thing, and the gap between them was a shipped bug:
+    // Chrome does not dispatch `click`/`mousedown` on a disabled form control
+    // but DOES dispatch `pointerdown`/`touchstart`, and both mobile splash Start
+    // handlers are bound to `pointerdown`. So this presses the button for real —
+    // a touch tap where the arm has touch, a mouse click otherwise — and asks
+    // the page what happened, instead of asking an attribute what it thinks.
+    //
+    // Only on cells that are BLOCKED: on a healthy page a tap would (correctly)
+    // start an emulator and pull a large ROM, which is not this rig's business.
+    out.tap = null;
+    if (out.verdict && out.verdict.blockers && out.verdict.blockers.length > 0) {
+      out.tap = await (async () => {
+        const t = { blockers: out.verdict.blockers };
+        // Prefer the mobile splash Start: it is the one a phone visitor sees,
+        // and the one whose handler goes through pointerdown.
+        const target = await page.evaluate(() => {
+          const pick = (id) => {
+            const e = document.getElementById(id);
+            if (!e) return null;
+            const r = e.getBoundingClientRect();
+            const cs = getComputedStyle(e);
+            if (cs.display === 'none' || cs.visibility === 'hidden' || r.height <= 0) return null;
+            return { id, x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height };
+          };
+          return pick('mobileSplashStart') || pick('btnStart');
+        }).catch(() => null);
+        if (!target) { t.skipped = 'no visible Start control to press'; return t; }
+        t.target = target.id;
+        // THE VISITOR-FACING WITNESS, uniform across all three pages: every one
+        // of them hides #mobileSplash as the first act of starting, and that
+        // splash is where the explanation lives. Plus the page-specific witness
+        // where one exists.
+        const snap = () => page.evaluate(() => {
+          const sp = document.getElementById('mobileSplash');
+          const ban = document.getElementById('capBanner');
+          return {
+            splash: sp ? getComputedStyle(sp).display : null,
+            banner: ban ? getComputedStyle(ban).display !== 'none' : false,
+            gcStarted: !!window.__gcStartedAtMs,
+            // Any worker the page spawned to run a core is a start it should not
+            // have made. Cheap, page-agnostic, and observable from here.
+            status: ((document.getElementById('mobileStatus') || document.getElementById('status') || {})
+                      .textContent || '').slice(0, 120),
+          };
+        }).catch(() => null);
+        t.before = await snap();
+        if (arm.viewport && arm.viewport.hasTouch) await page.touchscreen.tap(target.x, target.y).catch((e) => { t.tapErr = String(e).slice(0, 90); });
+        else await page.mouse.click(target.x, target.y).catch((e) => { t.tapErr = String(e).slice(0, 90); });
+        await sleep(2500);
+        t.after = await snap();
+        // "It started" = the splash that held the explanation is gone, or a
+        // page-specific start witness fired.
+        t.splashHidden = !!(t.before && t.after && t.before.splash === 'flex' && t.after.splash === 'none');
+        t.startWitness = !!(t.after && t.after.gcStarted && !(t.before && t.before.gcStarted));
+        t.started = t.splashHidden || t.startWitness;
+        // A blocked page must still be EXPLAINING itself after the tap. Losing
+        // the splash is only harmful because it takes the explanation with it,
+        // so the banner surviving is the thing that decides how bad it is.
+        t.stillExplains = !!(t.after && (t.after.banner || t.after.splash === 'flex'
+                             || /cannot|missing|not support|unavailable|would not/i.test(t.after.status || '')));
+        return t;
+      })();
+    }
 
     await page.close();
   } catch (e) {
@@ -556,6 +693,121 @@ async function redirectTest() {
 }
 
 // ---------------------------------------------------------------------------
+// lib/capability.test.js, run in each page under ?captest=1.
+//
+// The matrix already fails on SPEC drift. This closes the other half: the specs
+// can agree perfectly while the code that turns a report into a verdict is
+// broken, and the suite is the only thing that exercises the guards against
+// synthetic broken devices this rig cannot manufacture. Gating on `.done` and
+// not on the object's existence is deliberate — the suite is asynchronous, and a
+// rig that polled for `window.__capTest` once latched a 1-assertion result and
+// called it clean.
+// ---------------------------------------------------------------------------
+async function captestRun() {
+  const out = { pages: {}, ok: true };
+  for (const pg of PAGES) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dmx-ct-${pg.id}-`));
+    const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
+      args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+    try { (await import('./browser_leak_guard.js')).default.guard(b, import.meta.url); } catch (_e) {}
+    const p = await b.newPage();
+    const r = { };
+    try {
+      await p.goto(`${BASE}${pg.url}${pg.url.includes('?') ? '&' : '?'}captest=1`, { waitUntil: 'domcontentloaded' });
+      r.done = await p.waitForFunction('window.__capTest && window.__capTest.done === true', { timeout: 90000 })
+        .then(() => true).catch(() => false);
+      Object.assign(r, await p.evaluate(() => (window.__capTest ? {
+        pass: window.__capTest.pass, fail: window.__capTest.fail, expect: window.__capTest.expect,
+        failures: window.__capTest.lines.filter((l) => l.indexOf('CAPTEST FAIL') === 0).slice(0, 12),
+      } : { }))
+        .catch(() => ({ })));
+    } catch (e) { r.error = String(e).slice(0, 200); }
+    await b.close().catch(() => {}); fs.rmSync(dir, { recursive: true, force: true });
+    // `expect` is a FLOOR, not an equality: a suite that silently stopped running
+    // most of itself reports 0 failures too.
+    r.ok = r.done === true && r.fail === 0 && typeof r.pass === 'number' && r.pass >= (r.expect || 100);
+    out.pages[pg.id] = r;
+    if (!r.ok) out.ok = false;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// JAVASCRIPT OFF. The floor case, and the only one no amount of runtime gating
+// can reach: with scripting disabled the capability layer never runs, so
+// whatever the raw markup says IS the whole experience. Measured 2026-09-01:
+// none of the three pages had a <noscript>, so the visitor got the full shell —
+// an enabled-looking Start button that does nothing when pressed, which is the
+// same dead button the runtime gate exists to prevent.
+// ---------------------------------------------------------------------------
+async function noJsTest() {
+  const out = { pages: {}, ok: true };
+  for (const pg of PAGES) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dmx-nojs-${pg.id}-`));
+    const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
+      args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+    try { (await import('./browser_leak_guard.js')).default.guard(b, import.meta.url); } catch (_e) {}
+    const p = await b.newPage();
+    await p.setJavaScriptEnabled(false);
+    const r = { };
+    try {
+      await p.goto(BASE + pg.url, { waitUntil: 'domcontentloaded' });
+      // ⚠ page.evaluate() CANNOT BE USED HERE. `setJavaScriptEnabled(false)` is
+      // `Emulation.setScriptExecutionDisabled`, which disables script execution
+      // for the frame — including the Runtime.evaluate that page.evaluate() is
+      // built on. (redirectTest above sidesteps the same problem by skipping its
+      // `pageWorks` evaluate on the noJs arm and reading the source over HTTP
+      // instead.) Reading the SOURCE would only prove the markup is present,
+      // which is a presence check — and this file exists because presence checks
+      // lie. So the measurement goes through the CDP DOM/CSS domains, which do
+      // not run page script: the browser's own computed style for the element it
+      // actually laid out, with scripting genuinely off.
+      const cdp = await p.target().createCDPSession();
+      await cdp.send('DOM.enable'); await cdp.send('CSS.enable');
+      const { root } = await cdp.send('DOM.getDocument', { depth: -1 });
+      const styleOf = async (nodeId) => {
+        const { computedStyle } = await cdp.send('CSS.getComputedStyleForNode', { nodeId });
+        const m = {};
+        for (const kv of computedStyle) m[kv.name] = kv.value;
+        return m;
+      };
+      const findOne = async (sel) => {
+        const { nodeId } = await cdp.send('DOM.querySelector', { nodeId: root.nodeId, selector: sel });
+        return nodeId || null;
+      };
+      // Rendered, per the browser: a box with real height and no display:none /
+      // visibility:hidden anywhere in the chain (getBoxModel throws when the
+      // element is not rendered at all, which is exactly the signal wanted).
+      const rendered = async (nodeId) => {
+        if (!nodeId) return false;
+        const cs = await styleOf(nodeId);
+        if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+        try {
+          const { model } = await cdp.send('DOM.getBoxModel', { nodeId });
+          return !!(model && model.height > 0);
+        } catch (e) { return false; }
+      };
+      const msgId = await findOne('#nojs');
+      r.explains = await rendered(msgId);
+      if (msgId) {
+        const { outerHTML } = await cdp.send('DOM.getOuterHTML', { nodeId: msgId });
+        r.says = outerHTML.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 90);
+      } else { r.says = null; }
+      r.startShown = [];
+      for (const sel of ['#btnStart', '#mobileSplashStart']) {
+        if (await rendered(await findOne(sel))) r.startShown.push(sel.slice(1));
+      }
+      await cdp.detach().catch(() => {});
+    } catch (e) { r.error = String(e).slice(0, 200); }
+    await b.close().catch(() => {}); fs.rmSync(dir, { recursive: true, force: true });
+    r.ok = r.explains === true && Array.isArray(r.startShown) && r.startShown.length === 0;
+    out.pages[pg.id] = r;
+    if (!r.ok) out.ok = false;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Verdicts. A cell only gets one if its arm's proof held.
 // ---------------------------------------------------------------------------
 function judge(arm, pg, cell, baselineCell) {
@@ -589,15 +841,34 @@ function judge(arm, pg, cell, baselineCell) {
   // exactly the reported bug.
   const enabledAndBlocked = bl.length > 0 && startShown.some((x) => !x.disabled);
   v.startEnabled = startShown.map((x) => !x.disabled);
-  v.honestGate = !enabledAndBlocked;
+  // ...AND THE SAME PROPERTY MEASURED BY PRESSING IT, which is not the same
+  // question. `.disabled` was true on gamecube.html and n64/index.html in the
+  // cells below and the emulator started anyway, because their splash handlers
+  // listen on `pointerdown` and Chrome does not suppress that on a disabled
+  // control. An attribute is a claim; the tap is the evidence.
+  v.tapStartedAnyway = !!(cell.tap && cell.tap.started);
+  v.tapStillExplains = cell.tap ? cell.tap.stillExplains : null;
+  v.tapTarget = cell.tap ? (cell.tap.target || cell.tap.skipped) : null;
+  v.honestGate = !enabledAndBlocked && !v.tapStartedAnyway;
   v.reportUsable = !!(cell.report && cell.report.hasHeader && cell.report.noUndefined && cell.report.len > 200);
   v.enginesDiffer = !!arm.enginesDiffer;
+  // Unreachable controls fail the cell; small ones are reported, not gated.
+  if (cell.touchTargets) {
+    v.touch = { count: cell.touchTargets.count, small: cell.touchTargets.smallerThan44,
+                offscreen: cell.touchTargets.offscreen, hScroll: cell.touchTargets.horizontalScroll };
+    v.touchReachable = cell.touchTargets.offscreen.length === 0 && !cell.touchTargets.horizontalScroll;
+  }
 
   if (bl.length === 0) v.verdict = 'RUNS';
   else if (v.honestGate) v.verdict = 'BLOCKED-HONESTLY';
   else v.verdict = 'FAILS-SILENTLY';
   v.why = bl.length === 0 ? 'all required capabilities present'
         : (cell.verdict && cell.verdict.short) || ('missing: ' + bl.join(','));
+  if (v.tapStartedAnyway) {
+    v.why = `Start reads disabled but PRESSING IT started the emulator anyway (target=${v.tapTarget}); `
+          + (v.tapStillExplains ? 'the explanation is at least still on screen. ' : 'and the explanation is GONE. ')
+          + v.why;
+  }
   return v;
 }
 
@@ -606,10 +877,12 @@ async function main() {
   const arms = ARMS.filter((a) => !ONLY_ARM || a.id === ONLY_ARM || a.baseline);
   const pages = PAGES.filter((p) => !ONLY_PAGE || p.id === ONLY_PAGE);
   const result = { base: BASE, startedAt: new Date().toISOString(), load: os.loadavg().map((n) => +n.toFixed(2)),
-                   cells: [], verdicts: [], rig: null, redirect: null };
+                   cells: [], verdicts: [], rig: null, redirect: null, captest: null, nojs: null };
 
   result.rig = await rigSelfTest();
   result.redirect = await redirectTest();
+  result.captest = await captestRun();
+  result.nojs = await noJsTest();
 
   // Cells run SERIALLY. Concurrent Chrome instances contend for CPU, and this
   // project has measured matched-pair noise at +-25% under load (CLAUDE.md gate
@@ -637,9 +910,13 @@ async function main() {
   };
   // THE GATE. A silent failure is the bug this whole exercise is about. A voided
   // arm is not a pass either: it means the rig did not create the condition.
-  result.ok = result.summary.failsSilently === 0 && result.summary.errors === 0
+  result.summary.tapStartedAnyway = v.filter((x) => x.tapStartedAnyway).length;
+  result.summary.controlsUnreachable = v.filter((x) => x.touchReachable === false).length;
+  result.ok = result.summary.controlsUnreachable === 0
+           && result.summary.failsSilently === 0 && result.summary.errors === 0
            && result.summary.voided === 0 && result.redirect.ok === true
-           && result.rig.isolationHolds === true;
+           && result.rig.isolationHolds === true
+           && result.captest.ok === true && result.nojs.ok === true;
 
   if (JSON_ONLY) { console.log(JSON.stringify(result, null, 1)); return; }
 
@@ -661,20 +938,50 @@ async function main() {
   console.log(`  meta-refresh works with JS disabled = ${result.redirect.metaRefreshWorksWithoutJs}`);
   console.log(`  redirect ok = ${result.redirect.ok}`);
 
+  console.log('\n--- ?captest=1  (lib/capability.test.js, in the page) ---');
+  for (const [id, r] of Object.entries(result.captest.pages)) {
+    console.log(`  ${pad(id, 10)} ${r.ok ? 'PASS' : 'FAIL'}  pass=${r.pass} fail=${r.fail} `
+      + `(floor ${r.expect}) done=${r.done}${r.error ? '  ' + r.error : ''}`);
+    (r.failures || []).forEach((l) => console.log(`      ${l}`));
+  }
+
+  console.log('\n--- JAVASCRIPT DISABLED (the floor no runtime gate can reach) ---');
+  for (const [id, r] of Object.entries(result.nojs.pages)) {
+    console.log(`  ${pad(id, 10)} ${r.ok ? 'PASS' : 'FAIL'}  explains=${r.explains} `
+      + `startControlsShown=[${(r.startShown || []).join(',')}]${r.error ? '  ' + r.error : ''}`);
+    if (r.says) console.log(`      "${r.says}"`);
+  }
+
   console.log('\n--- MATRIX ---');
-  console.log(`  ${pad('arm', 12)} ${pad('page', 10)} ${pad('verdict', 18)} ${pad('start', 14)} blockers`);
+  console.log(`  ${pad('arm', 14)} ${pad('page', 10)} ${pad('verdict', 18)} ${pad('start', 14)} ${pad('tap', 22)} blockers`);
   for (const x of result.verdicts) {
     const st = x.verdict === null ? '' : (x.startEnabled || []).map((e) => (e ? 'enabled' : 'DISABLED')).join(',');
-    console.log(`  ${pad(x.arm, 12)} ${pad(x.page, 10)} ${pad(x.verdict === null ? 'VOID (no verdict)' : x.verdict, 18)}`
-      + ` ${pad(st, 14)} ${(x.blockers || []).join(',')}`);
+    // The tap column is the one that would have caught the shipped bug: an
+    // attribute says DISABLED, the press says otherwise.
+    const tap = x.verdict === null ? ''
+      : x.tapTarget === null || x.tapTarget === undefined ? '-'
+      : x.tapStartedAnyway ? `STARTED via ${x.tapTarget}`
+      : `inert (${x.tapTarget})`;
+    console.log(`  ${pad(x.arm, 14)} ${pad(x.page, 10)} ${pad(x.verdict === null ? 'VOID (no verdict)' : x.verdict, 18)}`
+      + ` ${pad(st, 14)} ${pad(tap, 22)} ${(x.blockers || []).join(',')}`);
     if (x.verdict === null) console.log(`      ${x.void}`);
-    else if (x.verdict === 'FAILS-SILENTLY') console.log(`      !! Start is ENABLED but ${x.why}`);
+    else if (x.verdict === 'FAILS-SILENTLY') console.log(`      !! ${x.why}`);
   }
 
   console.log('\n--- ARM-DIFFERENCE PROOFS (an arm without one measured nothing) ---');
   for (const x of result.verdicts) {
     if (x.page !== pages[0].id) continue;   // one line per arm
-    console.log(`  ${pad(x.arm, 12)} ${x.proofHeld ? 'HELD' : 'DID NOT HOLD'} — ${x.proof}`);
+    console.log(`  ${pad(x.arm, 14)} ${x.proofHeld ? 'HELD' : 'DID NOT HOLD'} — ${x.proof}`);
+  }
+
+  const tt = result.verdicts.filter((x) => x.touch);
+  if (tt.length) {
+    console.log('\n--- ON-SCREEN CONTROLS AT PHONE SIZE (measured, not assumed) ---');
+    for (const x of tt) {
+      console.log(`  ${pad(x.arm, 14)} ${pad(x.page, 10)} ${x.touch.count} controls · reachable=${x.touchReachable}`
+        + ` · offscreen=[${x.touch.offscreen.join(',')}] · horizontalScroll=${x.touch.hScroll}`);
+      if (x.touch.small.length) console.log(`      under 44x44 CSS px (advisory): ${x.touch.small.join(' · ')}`);
+    }
   }
 
   const ed = result.verdicts.filter((x) => x.enginesDiffer);

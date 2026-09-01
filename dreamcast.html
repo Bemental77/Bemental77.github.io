@@ -282,8 +282,26 @@
       max-height: 45vh; overflow: auto; margin: 0; color: #9f9;
       font: 10px/1.35 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-word; }
   </style>
+  <!-- JAVASCRIPT OFF. Measured 2026-09-01: none of the three emulator pages had a
+       <noscript> at all, so a visitor with JS disabled (blocked by an extension, or on
+       a browser where the first script threw) got the full page shell — including an
+       enabled-looking Start button that does nothing when pressed. That is the same
+       "dead Start button" this page's capability layer exists to prevent, reached
+       before any JS can run to prevent it. So the shell is hidden by CSS the browser
+       applies on its own, and one plain message is shown in its place. -->
+  <noscript><style>
+    #wrap, #mobileShell, #diag, #toast, #armBanner, #alertBar, #fatal { display: none !important; }
+    #nojs { display: block !important; }
+  </style></noscript>
 </head>
 <body>
+<!-- Shown ONLY by the <noscript> stylesheet in <head>; invisible whenever JS runs. -->
+<div id="nojs" style="display:none;max-width:640px;margin:14vh auto;padding:0 22px;font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#ddd;">
+  <h1 style="font-size:20px;margin:0 0 10px;color:#fff;">JavaScript is turned off</h1>
+  <p style="margin:0 0 12px;">This page is an emulator: it compiles and runs a console's own code in your browser, so it cannot work without JavaScript and WebAssembly. There is no reduced version to fall back to.</p>
+  <p style="margin:0 0 12px;">Turn JavaScript on for this site — or allow it in your content blocker — and reload. If you are in a private window with scripting restricted, a normal window will work.</p>
+  <p style="margin:0;"><a href="/" style="color:#7ab7ff;">Back to the rest of the site</a></p>
+</div>
 <div id="toast"></div>
 <div id="armBanner"></div>
 <div id="alertBar"></div>
@@ -619,6 +637,10 @@
       stencil: safe(() => stencilVerdict(), { known: false }),
       heap: { init: memInfo.initMB, max: memInfo.gotMaxMB, reduced: memInfo.reduced, err: memInfo.err },
       counters: Object.assign({}, counters),
+      // Sink-side audio health, straight off the worklet's own stats message.
+      // `seen:false` means no stats arrived — either audio never initialised
+      // (no user gesture yet) or the worklet died; it is NOT a pass.
+      audio: safe(() => Object.assign({}, audioHealth), { seen: false }),
       fatal: safe(() => fatalShown, false),
       headline: safe(() => headline(), '(headline threw)'),
       marks: marks.map((m) => m.t + 'ms ' + m.name),
@@ -1457,6 +1479,14 @@
   // ---------------------------------------------------------------------------
   const FB_W = 640, FB_H = 480;
   const FB_BYTES     = FB_W * FB_H * 4;
+  // The rate the CORE fills the ring at. AICA emits one stereo frame per
+  // AICA_TICK = 4535 SH4 cycles at 200 MHz = 44101.43 Hz; the libretro core
+  // reports 44100 and the worker's own [audio] line calls 44101/s "nominal"
+  // (EmscriptenWorker.cpp:765). The 32 ppm residual is inaudible — see
+  // dreamcast/audio-worklet.js:19-24, which explicitly says NOT to correct it.
+  // This is the value handed to the worklet as `srcRate`, so it must stay the
+  // rate the ring is FILLED at, not the rate the sink happens to run at.
+  const AUDIO_SRC_RATE = 44100;
   const AUDIO_FRAMES = 16384;
   const AUDIO_BYTES  = AUDIO_FRAMES * 2 * 4 + 64;   // stereo f32 + header
   let FB_OFFSET      = 0x1F000000;                  // ~496 MB (legacy fixed)
@@ -2064,6 +2094,37 @@
   // Audio worklet. Created on first user gesture (browser autoplay policy).
   // ---------------------------------------------------------------------------
   let audioContext = null;
+  // ---------------------------------------------------------------------------
+  // AUDIO HEALTH — the SINK side, which this page had never observed.
+  //
+  // dreamcast/audio-worklet.js:153-175 has posted a `stats` message once per
+  // second since 2026-08-28, and its own comment at :141-144 says the page is
+  // expected to listen. Nothing on THIS page ever assigned node.port.onmessage
+  // (verified by grep: zero matches for port.onmessage / underrunFrames /
+  // ctxRate / resampling before this change), so every one of those messages
+  // went into a port with no listener and was garbage-collected.
+  //
+  // The consequence is not cosmetic. The WRITER side is instrumented — the
+  // worker prints `[audio] wrote=.../s dropped=.../s` (EmscriptenWorker.cpp:765)
+  // and read HEALTHY on the clean baseline — but the writer cannot see the sink.
+  // A sink draining faster than AICA fills is silent-to-the-writer and audible
+  // to a person: the ring empties and every quantum after that is padded with
+  // zeros. That is the one class of audio defect this page could not report,
+  // on a desktop or on a phone.
+  //
+  // Fields are a straight copy of the worklet's message plus two derived rates,
+  // so `consumedRate` ~= srcRate and `outputRate` == the context's REAL rate.
+  // ---------------------------------------------------------------------------
+  const audioHealth = {
+    seen: false,          // has a single stats message arrived?
+    ctxRate: 0,           // the worklet's `sampleRate` global = the context's REAL rate
+    srcRate: 0, dstRate: 0, resampling: false,
+    underrunFrames: 0,    // this second
+    underrunTotal: 0,     // since the context was created
+    consumedRate: 0,      // source frames/s drained out of the ring
+    outputRate: 0,        // output frames/s the graph asked for
+    fill: 0, capacity: 0,
+  };
   async function initAudio() {
     if (audioContext) return;
     try {
@@ -2083,12 +2144,57 @@
         showToast('No sound: the emulator and the page disagree on the audio buffer', false);
         return;
       }
-      audioContext = new (self.AudioContext || self.webkitAudioContext)({ sampleRate: 44100 });
+      audioContext = new (self.AudioContext || self.webkitAudioContext)({ sampleRate: AUDIO_SRC_RATE });
       await audioContext.audioWorklet.addModule('/dreamcast/audio-worklet.js');
+      // srcRate/dstRate ARM THE WORKLET'S RESAMPLER. Until 2026-09-01 this page
+      // passed neither, so dreamcast/audio-worklet.js:50-54 defaulted BOTH to
+      // its own `sampleRate` global — making the ratio exactly 1 and
+      // `this.resampling` false NO MATTER WHAT the context's real rate was. The
+      // resampler at :100-134 was therefore unreachable code on this page, and
+      // the exact failure its header comment (:26-35) says it exists to survive
+      // was live:
+      //
+      //   MEASURED, --audioclamp 48000, 60 s, before this line existed:
+      //     resampling=false  output=48000/s  consumed=43960/s  (-8.42%)
+      //     242,230 underrun frames = 5.04 s of silence in ~54 s of audio,
+      //     52 of 54 seconds affected, ring fill repeatedly 0/16384,
+      //   and the audio that DID play ran 48000/44100 = 1.088x sharp.
+      //
+      // A device whose audio hardware rate the browser will not change is the
+      // normal case on iOS and on much of Android, and desktop Chrome honours
+      // 44100 — which is why this survived every desktop run ever made here.
+      //
+      // WHEN THE CONTEXT DOES HONOUR 44100 THIS CHANGES NOTHING: srcRate ===
+      // dstRate makes the ratio exactly 1, `resampling` false, and the original
+      // byte-for-byte 1:1 path is taken. It is armour, not a new code path.
       const node = new AudioWorkletNode(audioContext, 'dc-audio-processor', {
         numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2],
-        processorOptions: { sab: sharedMemory.buffer, ringOffset: AUDIO_OFFSET, ringCapacity: AUDIO_FRAMES },
+        processorOptions: {
+          sab: sharedMemory.buffer, ringOffset: AUDIO_OFFSET, ringCapacity: AUDIO_FRAMES,
+          srcRate: AUDIO_SRC_RATE, dstRate: audioContext.sampleRate,
+        },
       });
+      // The listener the worklet has been posting to since 2026-08-28. Two
+      // stores and a counter bump — it must not be able to cost a frame.
+      node.port.onmessage = function (e) {
+        const d = e && e.data;
+        if (!d || d.cmd !== 'stats') return;
+        const dt = d.dt > 0 ? d.dt : 1;
+        audioHealth.seen = true;
+        audioHealth.ctxRate = d.ctxRate | 0;
+        audioHealth.srcRate = d.srcRate | 0;
+        audioHealth.dstRate = d.dstRate | 0;
+        audioHealth.resampling = !!d.resampling;
+        audioHealth.underrunFrames = d.underrunFrames | 0;
+        audioHealth.underrunTotal += (d.underrunFrames | 0);
+        audioHealth.consumedRate = Math.round(d.consumedFrames / dt);
+        audioHealth.outputRate = Math.round(d.outputFrames / dt);
+        audioHealth.fill = d.fill | 0;
+        audioHealth.capacity = d.capacity | 0;
+        // Edge-triggered, so a permanently starving sink is one counter, not a
+        // per-second flood, and a clean run leaves no scare text behind.
+        if (d.underrunFrames > 0) bump('audioUnderrunSeconds');
+      };
       node.connect(audioContext.destination);
       if (audioContext.state === 'suspended') { try { await audioContext.resume(); } catch (_) {} }
       mark('audio-' + audioContext.state);
@@ -3380,7 +3486,23 @@
     holdBtn('mobileL', 'q'); holdBtn('mobileR', 'e'); holdBtn('mobileStart', 'enter');
     wireDpadDisc();
     tapBind($('mobileSplashDiag'), () => showDiag('mobile splash'));
-    tapBind($('mobileSplashStart'), () => {
+    // A DISABLED BUTTON STILL RECEIVES pointerdown, and tapBind binds pointerdown.
+    // MEASURED 2026-09-01, Chrome 140, one real touch tap on a <button disabled>:
+    //   pointerdown 2 · touchstart 1 · click 0 · mousedown 0
+    // This page survived that by ACCIDENT — it starts through `btnStart.click()`,
+    // and `click` IS suppressed on a disabled control, so the tap was inert.
+    // (The sibling pages call their starter directly and did start; see
+    // gamecube.html and n64/index.html.) But "inert" here still meant the splash
+    // was hidden first and the visitor got nothing, so the gate is now consulted
+    // BEFORE anything is hidden, and the reason is put on the status line.
+    tapBind($('mobileSplashStart'), (e) => {
+      const el = (e && e.currentTarget) || $('mobileSplashStart');
+      if (el && (el.disabled || el.getAttribute('aria-disabled') === 'true')) {
+        const why = el.title || (el.textContent || '').trim();
+        setStatus(why || 'This device cannot run the emulator — see the banner at the top of the page.');
+        pageLog('[gate] Start tap ignored: ' + (el.getAttribute('data-cap-blocked') || 'gated') + ' — ' + why);
+        return;
+      }
       const m = $('mobileRomSelect'), d = $('romSelect');
       if (m && d) d.value = m.value;
       $('mobileSplash').style.display = 'none';
