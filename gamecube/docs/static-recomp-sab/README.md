@@ -201,6 +201,37 @@ exclusion N64Recomp's toml provides (`~/gc_refs/N64Recomp/README.md:32`) and the
 mechanism by which a *binary* recomp gets MP4's "never compiled `OSThread.c` in"
 escape without having source to omit.
 
+### ⚠ P1 is a TRANSLATION figure, and every `bctr` in SAB is a jump table
+
+Classifying all 147 `bctr` sites in the DOL by how CTR was loaded (walk back for
+`mtctr rS`, then find where `rS` came from):
+
+```
+  147  bctr   JUMP TABLE (lwzx -> mtctr)
+  total 147
+```
+
+**100% jump tables, and there is not a single `bctrl` in the image.** The two indirect
+forms are cleanly split by role: `blrl` (665 sites, 354 functions) is the Metrowerks
+*function-pointer* idiom and its targets ARE function starts, so dispatch resolves
+them; `bctr` (147 sites, 123 functions) aims at *mid-function switch labels*, which
+are not dispatchable entries, so `sr_indirect()` faults on every one.
+
+So the honest reading of the table above:
+
+| | functions | instructions |
+|---|---|---|
+| translate under `--indirect` | 4674 (98.59%) | 372,769 (99.45%) |
+| …of those, contain a jump-table `bctr` and will **fault at run time** if that path executes | 123 | 65,401 |
+| **translated AND runtime-complete** | **4551 (96.0%)** | **307,368 (82.0%)** |
+
+That is not a new unknown — it is the one designed-but-unbuilt piece left on the DOL
+side, and the pattern is mechanically recoverable (`lwzx` off a `lis`/`addi` table base
+behind a `cmplwi` bound), which is exactly what N64Recomp's static table recovery does
+(`analysis.cpp:229-334`). On the overlays it is easier still: `b401f282` established
+that ADDR32 self-relocations pointing into the executable section *enumerate* the
+jump-table code addresses. But until it is built, quote 82.0%, not 99.45%.
+
 ### Regression: both differentials re-run with indirect dispatch on
 
 | suite | result | wasm md5 | matches |
