@@ -265,7 +265,23 @@ private:
   // to the pool from the map callback (unmapped => reusable); pool flushes on size change.
   std::vector<WGPUBuffer> m_readback_pool;
   size_t m_readback_pool_buf_size = 0;
-  std::vector<uint8_t> m_pixels;  // de-padded RGBA8, width*4 * height
+  // [present-ring 2026-09-01] The publish target is a RING of buffers, not one.
+  // A single m_pixels lost every frame that was published inside one reader poll
+  // interval: the readback map callback fires spontaneously (WGPUGfx.cpp, cb.mode
+  // = AllowSpontaneous) and the in-flight cap is 3, so up to three callbacks can
+  // run back-to-back with nothing between them -- and each one overwrote the
+  // previous frame's pixels before any reader could exist. Measured page-side
+  // after the capture queue landed: 57.55 and 54.08 shown against ~60 published,
+  // with the page's capture clock healthy at ~310 polls/s in BOTH the good and the
+  // bad runs, which localises the residual loss to THIS side.
+  //
+  // 4 slots => the reader may safely read the 3 most recently COMPLETED frames
+  // while the producer writes the 4th. Each slot carries its own seqlock, so a
+  // lapped reader discards a torn frame instead of painting it. Cost is 3 extra
+  // frame buffers (~1.2 MB each at 640x480) in a 512 MB heap.
+  static constexpr u32 kPresentRingSlots = 4;
+  // de-padded RGBA8, width*4 * height -- one per ring slot
+  std::vector<uint8_t> m_pixels_ring[kPresentRingSlots];
   u32 m_width = 640;
   u32 m_height = 480;
 };

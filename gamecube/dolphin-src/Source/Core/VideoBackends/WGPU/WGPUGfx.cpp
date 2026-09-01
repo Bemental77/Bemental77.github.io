@@ -1283,18 +1283,72 @@ void WGPUGfx::ReadbackAndPresent(::WGPUTexture src_texture, u32 origin_x, u32 or
           static_cast<const uint8_t*>(wgpuBufferGetConstMappedRange(c->buffer, 0, c->buf_size));
       if (mapped)
       {
-        // [present-seqlock 2026-08-07] Seqlocked publish so the page never paints a torn
-        // or stale frame (the "flashing" render race). resize (NOT assign(...,0)) skips the
-        // whole-buffer zero-fill — the memcpy overwrites every row, so a residual tear
-        // degrades from a BLACK flash to an ordinary 2-frame tear. Begin the seqlock write
-        // (seq -> odd) BEFORE touching the shared buffer.
-        u32* const seq = reinterpret_cast<u32*>(static_cast<uintptr_t>(0x026B3518u));
-        __atomic_add_fetch(seq, 1u, __ATOMIC_RELEASE);   // seqlock begin: -> odd
-        gfx->m_pixels.resize((size_t)c->width * 4 * c->height);
+        // [present-ring 2026-09-01] MULTI-SLOT PUBLISH. This used to be ONE pixel buffer
+        // behind ONE seqlock, so any two frames published inside a single reader poll
+        // interval collapsed into one: the reader saw only the newer and the older was
+        // gone before anybody could read it. That is the residual frame loss left after
+        // the page-side capture queue landed -- MP4 measured 57.55 and 54.08 shown against
+        // ~60 published while the page's own capture clock was healthy (~310 polls/s in
+        // BOTH the good and the bad runs), which localises the loss to THIS side. No
+        // amount of reader speed fixes it; only a second slot does.
+        //
+        // A monotonically increasing publish index plus per-slot buffers means a burst
+        // cannot clobber an unread frame. The reader consumes OLDEST-FIRST and only loses
+        // a frame if it falls more than (slots-1) behind, which it then COUNTS as a skip.
+        //
+        // SAB LAYOUT -- 0x026E0000, 4 KB reserved. Address checked free against the whole
+        // scratch map below GLOBAL_BASE=0x10000000: the GP ring at 0x026C0000 ends at
+        // 0x026D0040 (GPFifo.cpp:219-231, 8192 x 8 B at +0x40), the AOT chain index starts
+        // at 0x02700000 (gekko_emit.cpp:85), and a repo-wide grep for 0x026Dxxxx /
+        // 0x026Exxxx / 0x026Fxxxx finds nothing else. Deliberately NOT registered in
+        // ppc-worker/sab_layout.h: that header is included by both workers and a comment
+        // there forces a wide rebuild; this cell is dolphin-private, like every other
+        // 0x026Bxxxx present cell.
+        //   +0x00 u32 magic 'PRG1'  -- rewritten every publish. 0 means "this worker has
+        //                              no ring", which is how the page keeps working
+        //                              against an older/deployed binary.
+        //   +0x04 u32 slots         -- capacity, power of two
+        //   +0x08 u32 pub           -- monotonic publish count, RELEASE-stored LAST
+        //   +0x0C u32 slot_bytes    -- 16
+        //   +0x10 slot[i] = { u32 ptr, u32 dims=(w<<16)|h, u32 lock, u32 pubidx }
+        // Each slot keeps the SAME seqlock discipline the legacy cell had: lock -> odd
+        // BEFORE the pixel buffer is touched (resize can reallocate, so the pointer the
+        // reader holds may be freed), -> even after ptr/dims/pubidx are stored.
+        constexpr uintptr_t kRingBase = 0x026E0000u;
+        constexpr u32 kRingMagic = 0x31475250u;  // 'PRG1' little-endian
+        constexpr u32 kSlots = WGPUGfx::kPresentRingSlots;
+        u32* const ring = reinterpret_cast<u32*>(kRingBase);
+        const u32 pub = ring[2];                    // producer-owned; nothing else writes it
+        const u32 slot_idx = pub & (kSlots - 1u);
+        u32* const slot = ring + 4u + slot_idx * 4u;
+
+        __atomic_add_fetch(&slot[2], 1u, __ATOMIC_RELEASE);   // slot seqlock begin: -> odd
+        std::vector<uint8_t>& dstbuf = gfx->m_pixels_ring[slot_idx];
+        // resize (NOT assign(...,0)) skips the whole-buffer zero-fill -- the memcpy
+        // overwrites every row, so a residual tear degrades from a BLACK flash to an
+        // ordinary 2-frame tear.
+        dstbuf.resize((size_t)c->width * 4 * c->height);
         const size_t row_bytes = (size_t)c->width * 4;
         for (u32 y = 0; y < c->height; y++)
-          std::memcpy(&gfx->m_pixels[(size_t)y * row_bytes],
+          std::memcpy(&dstbuf[(size_t)y * row_bytes],
                       mapped + (size_t)y * c->padded_bytes_per_row, row_bytes);
+        const u32 px_ptr = static_cast<u32>(reinterpret_cast<uintptr_t>(dstbuf.data()));
+        const u32 px_dims = (c->width << 16) | (c->height & 0xFFFFu);
+        slot[0] = px_ptr;
+        slot[1] = px_dims;
+        slot[3] = pub;
+        __atomic_add_fetch(&slot[2], 1u, __ATOMIC_RELEASE);   // slot seqlock end: -> even
+        ring[0] = kRingMagic;
+        ring[1] = kSlots;
+        ring[3] = 16u;
+        __atomic_store_n(&ring[2], pub + 1u, __ATOMIC_RELEASE);   // publish index LAST
+        static bool s_ring_logged = false;
+        if (!s_ring_logged)
+        {
+          s_ring_logged = true;
+          MAIN_THREAD_EM_ASM({ postMessage({cmd: 'print', txt:
+            '[present-ring] multi-slot publish ACTIVE slots=' + $0}); }, (int)kSlots);
+        }
         // (unmap moved below — unconditional on Success, so a null mapped-range edge can't
         // leave a mapped buffer in the staging pool)
 
@@ -1302,15 +1356,22 @@ void WGPUGfx::ReadbackAndPresent(::WGPUTexture src_texture, u32 origin_x, u32 or
         // thread (runtime-main's proxy queue starves in steady state — counters proved the
         // whole chain ran 1030/1030/1030/1030 with zero frames reaching the page; every [wgpu]
         // one-shot print was lost the same way, which is why this bug looked like "ShowImage
-        // never runs"). Publish through the SHARED HEAP instead: m_pixels lives in the wasm
-        // heap == the page-visible SharedArrayBuffer, so the page can paint directly from it.
-        // Cells: 0x026B3510 = pixels ptr, 0x026B3514 = (w<<16)|h, 0x026B3518 = frame seq
+        // never runs"). Publish through the SHARED HEAP instead: the pixel buffers live in the
+        // wasm heap == the page-visible SharedArrayBuffer, so the page paints directly from
+        // them. Cells: 0x026B3510 = pixels ptr, 0x026B3514 = (w<<16)|h, 0x026B3518 = frame seq
         // (bumped LAST). Tearing on a mid-write read is acceptable (video frames).
+        //
+        // THESE CELLS ARE NOT DEAD CODE now that the ring exists. `published` (gamecube.html
+        // _rateTick), the present watchdog (gcPresentHealth) and dolphin_render_probe.js all
+        // meter off this seqlock at exactly +2 per published frame, and a page running against
+        // a ring-less worker still PAINTS from them. They now point at the slot just
+        // published, and no pixel copy happens inside the odd window any more -- the copy
+        // moved into the slot above -- so the window is two stores wide instead of 1.2 MB.
         ++*reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B350Cu));  // [present-diag TEMP] frames published
-        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3510u)) =
-            static_cast<u32>(reinterpret_cast<uintptr_t>(gfx->m_pixels.data()));
-        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3514u)) =
-            (c->width << 16) | (c->height & 0xFFFFu);
+        u32* const seq = reinterpret_cast<u32*>(static_cast<uintptr_t>(0x026B3518u));
+        __atomic_add_fetch(seq, 1u, __ATOMIC_RELEASE);   // seqlock begin: -> odd
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3510u)) = px_ptr;
+        *reinterpret_cast<volatile u32*>(static_cast<uintptr_t>(0x026B3514u)) = px_dims;
         __atomic_add_fetch(seq, 1u, __ATOMIC_RELEASE);   // seqlock end: -> even
       }
     }

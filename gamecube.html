@@ -295,6 +295,64 @@ window.GcRate = (function () {
     return { published: ((s - mark) >>> 0) >>> 1, mark: s };
   }
 
+  // ---- present ring: which published frames THIS poll should copy ------------------------
+  // [present-ring 2026-09-01] The WORKER now publishes into a RING of N slot buffers with a
+  // monotonic publish index (WGPUGfx.cpp, SAB 0x026E0000) instead of one buffer behind one
+  // seqlock. This is the pure decision half of the reader, so ?ratetest=1 drives the SAME
+  // function the live capture calls -- a simulation OF a protocol can diverge from it; a
+  // simulation that CALLS it cannot.
+  //
+  // WHY A RING WAS NEEDED AT ALL. The page-side capture queue (see PRESENT POLICY below) took
+  // MP4 from 273-475 dropped frames per 60 s to 6, but two runs still read 57.55 and 54.08
+  // shown against ~60 published. `polls` was ~310/s in BOTH the good and the bad runs, so the
+  // capture CLOCK was healthy -- what remained was the producer putting two frames into the
+  // single slot inside one poll interval, where the first is overwritten before any reader can
+  // exist. No amount of reader speed fixes that; only a second slot does.
+  //
+  // READABLE WINDOW. The producer is writing slot (pub % N), so the reader may read
+  // pub-1 .. pub-(N-1): N-1 COMPLETED frames, oldest-first. Falling further behind means the
+  // producer lapped the reader. The honest response is to skip to the oldest still-intact
+  // frame and COUNT the skip -- not to read a slot that is being overwritten, which the
+  // per-slot seqlock would reject as a tear and turn a counted loss into a silent stall.
+  //
+  // qMax CLAMP. The capture queue keeps its NEWEST qMax entries, so of `behind` frames only
+  // the newest min(behind, qMax) can survive being pushed. Copying the rest is a 1.2 MB
+  // main-thread memcpy per frame spent on an image dropped microseconds later -- the
+  // "the instrument is the hitch" failure mode. Those are skipped and counted instead.
+  //
+  // GATE #9. This decides what to CAPTURE, never what to PAINT. Capturing K frames in one poll
+  // recovers K frames that ALREADY EXIST; paint stays one-per-rAF, so nothing here can make a
+  // counter exceed the number of distinct frames the guest produced. `take` never contains an
+  // index twice and never contains `pub` itself (the slot being written).
+  //
+  // CONSERVATION is what makes the residual loss reportable rather than invisible:
+  // take.length + skipped is exactly the number of frames published since the reader last
+  // looked, so a frame can never go missing without landing in a counter. ?ratetest=1 test 25f
+  // asserts that over a randomized sweep and 25i over a whole synthetic run.
+  // `qLen` is ACCEPTED AND DELIBERATELY IGNORED, and that is not an oversight. The queue keeps
+  // its NEWEST qMax entries, so of the frames pushed in one poll exactly min(pushed, qMax)
+  // survive REGARDLESS of how full the queue already was — the ones already in it are the ones
+  // shifted out. Making the plan depend on qLen would make it capture FEWER frames when the
+  // queue happens to be full, which is precisely the frame loss this whole change removes.
+  // Test 25l pins the independence so a later "optimisation" cannot reintroduce it.
+  function ringPlan(o) {
+    var pub = o.pub >>> 0, next = o.next >>> 0;
+    var slots = (o.slots >>> 0) || 1;
+    var qMax = o.qMax > 0 ? o.qMax : 1;
+    var readable = slots > 1 ? (slots - 1) : 1;
+    var behind = (pub - next) >>> 0;
+    var skipped = 0;
+    // A reader AHEAD of the producer -- a fresh page against a live worker, or a worker whose
+    // `pub` was re-zeroed -- must RESYNC, not compute a four-billion-frame backlog.
+    if (behind > 0x80000000) behind = 0;
+    if (behind > readable) { skipped += behind - readable; behind = readable; }
+    var copies = behind < qMax ? behind : qMax;
+    skipped += behind - copies;
+    var take = [], start = (pub - copies) >>> 0;
+    for (var k = 0; k < copies; k++) take.push((start + k) >>> 0);
+    return { take: take, skipped: skipped, behind: behind, readable: readable, pub: pub };
+  }
+
   function num(n, d) {
     return (n === null || n === undefined || !isFinite(n)) ? '--' : n.toFixed(d || 0);
   }
@@ -1697,12 +1755,133 @@ window.GcRate = (function () {
          format(missing));
     })();
 
+    // ---- 25. THE PRESENT RING (worker-side multi-slot publish) --------------------------------
+    // WHAT 23 COULD NOT FIX. After the capture queue landed, MP4 went from 273-475 dropped
+    // frames per 60 s to 6 -- but two runs still read 57.55 and 54.08 shown against ~60
+    // published, with `polls` ~310/s in BOTH the good and the bad runs. A healthy capture clock
+    // that still misses frames localises the loss to the PRODUCER: two publishes into one slot
+    // inside one poll interval, first one gone before a reader can exist. These assert the
+    // reader half of the ring that fixes it, against GcRate.ringPlan -- the same function the
+    // live capture calls, not a restatement of it.
+    var RP = ringPlan;
+    var rp = function (pub, next, slots, qLen, qMax) {
+      return RP({ pub: pub, next: next, slots: slots, qLen: qLen, qMax: qMax });
+    };
+    ck('25a a burst of two publishes inside one poll is FULLY RECOVERED — both taken, oldest first',
+       (function () { var p = rp(10, 8, 4, 0, 3);
+         return p.take.length === 2 && p.take[0] === 8 && p.take[1] === 9 && p.skipped === 0; })(),
+       JSON.stringify(rp(10, 8, 4, 0, 3)));
+    // 25b — CONTROL. The SAME burst against a ONE-slot ring is arithmetically identical to the
+    // shipped single-slot publisher, and it must LOSE the older frame. Without this, 25a is a
+    // statement about the harness rather than about the ring.
+    ck('25b control: the same burst on a ONE-slot ring loses the older frame — that IS the bug',
+       (function () { var p = rp(10, 8, 1, 0, 3);
+         return p.take.length === 1 && p.take[0] === 9 && p.skipped === 1; })(),
+       JSON.stringify(rp(10, 8, 1, 0, 3)));
+    ck('25c bounded depth: the readable window is exactly slots-1 — the slot being WRITTEN is never read',
+       (function () {
+         for (var s = 2; s <= 16; s++) {
+           var p = rp(1000, 0, s, 0, 99);
+           if (p.take.length !== s - 1) return false;
+           if (p.take[p.take.length - 1] !== 999) return false;      // newest readable is pub-1
+           if (p.take[0] !== 1000 - (s - 1)) return false;           // oldest readable is pub-(N-1)
+         }
+         return true;
+       })(), 'take = [pub-(N-1) .. pub-1] for N = 2..16');
+    ck('25d overflow degrades to NEWEST-WINS and the loss is COUNTED, never hidden',
+       (function () { var p = rp(1000, 0, 4, 0, 3);
+         return p.skipped === 997 && p.take.length === 3 && p.take[0] === 997 && p.take[2] === 999; })(),
+       JSON.stringify(rp(1000, 0, 4, 0, 3)));
+    ck('25e frames the queue would drop anyway are skipped, not copied — a 1.2MB memcpy per '
+       + 'doomed frame on the poll timer is how an instrument becomes the hitch',
+       (function () { var p = rp(10, 4, 8, 0, 3);   // 6 behind, 7 readable, queue keeps 3
+         return p.take.length === 3 && p.take[0] === 7 && p.skipped === 3; })(),
+       JSON.stringify(rp(10, 4, 8, 0, 3)));
+    ck('25f randomized sweep: oldest-first, contiguous, never the write slot, bounded by BOTH '
+       + 'slots-1 and qMax — and CONSERVING (taken + skipped == published since last look)',
+       (function () {
+         var s = 987654321 >>> 0;
+         var rnd = function () { s = (s * 1664525 + 1013904223) >>> 0; return s; };
+         for (var i = 0; i < 4000; i++) {
+           var slots = [2, 4, 8, 16][rnd() % 4];
+           var qMax = 1 + (rnd() % 5);
+           var pub = rnd() % 100000;
+           var back = rnd() % 40;
+           var p = rp(pub, (pub - back) >>> 0, slots, rnd() % 4, qMax);
+           if (p.take.length > slots - 1 || p.take.length > qMax) return false;
+           if (p.take.length + p.skipped !== back) return false;      // conservation
+           for (var k = 0; k < p.take.length; k++) {
+             var age = (pub - p.take[k]) >>> 0;
+             if (age === 0 || age > slots - 1) return false;          // never the write slot
+             if (k && p.take[k] !== ((p.take[k - 1] + 1) >>> 0)) return false;   // contiguous
+           }
+         }
+         return true;
+       })(), '4000 randomized (slots, qMax, pub, backlog) tuples');
+    ck('25g unsigned wrap: a publish index rolling past 2^32 does not read as a 4-billion backlog',
+       (function () { var p = rp(3, 0xFFFFFFFE, 4, 0, 3);   // 5 published across the wrap
+         return p.skipped === 2 && p.take.length === 3 &&
+                p.take[0] === 0 && p.take[1] === 1 && p.take[2] === 2; })(),
+       JSON.stringify(rp(3, 0xFFFFFFFE, 4, 0, 3)));
+    ck('25h a reader AHEAD of the producer (fresh page, or a worker that re-zeroed pub) resyncs',
+       (function () { var p = rp(5, 9, 4, 0, 3);
+         return p.take.length === 0 && p.skipped === 0 && p.behind === 0; })(),
+       JSON.stringify(rp(5, 9, 4, 0, 3)));
+    ck('25i a bursty producer (2 frames every 3rd poll) loses NOTHING through a 4-slot ring, and '
+       + 'no frame is ever captured twice — so the ring cannot inflate `shown`',
+       (function () {
+         var next = 0, taken = 0, skipped = 0, pub = 0, seen = {};
+         for (var poll = 0; poll < 3000; poll++) {
+           if (poll % 3 === 0) pub += 2;
+           var p = rp(pub, next, 4, 0, 3);
+           for (var k = 0; k < p.take.length; k++) { if (seen[p.take[k]]) return false; seen[p.take[k]] = 1; }
+           taken += p.take.length; skipped += p.skipped; next = pub;
+         }
+         return taken === pub && skipped === 0;
+       })(), 'bursty producer through a 4-slot ring');
+    // 25j — CONTROL for 25i, and the size of the defect. The identical producer against the
+    // single-slot publish loses exactly half of every burst. 30 published/s out of 60 is the
+    // upper bound of this failure mode; the live page measured the milder version of it
+    // (57.55 and 54.08 of ~60) because only SOME intervals carried two publishes.
+    ck('25j control: the SAME bursty producer against the OLD single-slot publish loses half',
+       (function () {
+         var next = 0, taken = 0, skipped = 0, pub = 0;
+         for (var poll = 0; poll < 3000; poll++) {
+           if (poll % 3 === 0) pub += 2;
+           var p = rp(pub, next, 1, 0, 3);
+           taken += p.take.length; skipped += p.skipped; next = pub;
+         }
+         return taken === pub / 2 && skipped === pub / 2;
+       })(), 'single-slot: half of every burst is lost');
+    // 25k — GATE #9. The ring recovers LOST frames; it must not become a way to paint more
+    // images than exist. Feed a ring-recovered stream (every publish reaches the queue) through
+    // the SAME presentSim paint policy and the paint count still clamps at the display refresh
+    // AND at the number of frames published.
+    ck('25k GATE #9: recovering every published frame still cannot paint more than the display '
+       + 'shows, nor more frames than the guest produced',
+       (function () {
+         var r = presentSim({ publishTimes: PUB_JIT, rafTimes: RAFS, captureEveryMs: 4, qMax: 3 });
+         var f = presentSim({ publishTimes: PUB_FAST, rafTimes: RAFS, captureEveryMs: 4, qMax: 3 });
+         return r.painted <= r.rafTicks && r.painted <= r.published
+             && f.painted <= f.rafTicks && f.painted <= f.published;
+       })(), 'jittered 60/s and freerun 82.9/s producers, one paint per rAF');
+
+    ck('25l the plan does NOT depend on how full the capture queue already is — the queue drops '
+       + 'its OLDEST, so a full queue must not make the reader capture fewer frames',
+       (function () {
+         for (var qLen = 0; qLen <= 6; qLen++) {
+           var p = rp(10, 4, 8, qLen, 3);
+           if (JSON.stringify(p) !== JSON.stringify(rp(10, 4, 8, 0, 3))) return false;
+         }
+         return true;
+       })(), 'identical plan for qLen 0..6');
+
     var summary = 'RATETEST ' + (fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + pass + ' passed, ' + fail + ' failed';
     log(summary);
     return { pass: pass, fail: fail, lines: lines, summary: summary };
   }
 
-  return { makeModel: makeModel, seqDelta: seqDelta, format: format, num: num,
+  return { makeModel: makeModel, seqDelta: seqDelta, ringPlan: ringPlan, format: format, num: num,
            route: route, RECOMP_TITLES: RECOMP_TITLES,
            capMedian: capMedian, capForVerdict: capForVerdict, CAP_HIST_N: CAP_HIST_N,
            presentSim: presentSim, jitterSeries: jitterSeries,
@@ -5530,54 +5709,141 @@ window.GcRate = (function () {
   var PRESENT_CAPTURE_MS = 4;
   var _capQ = [], _capPool = [], _capW = 0, _capH = 0, _capQDrops = 0, _capQDepthMax = 0, _capN = 0;
   var _capPolls = 0;
+  // [present-ring 2026-09-01] THE PRODUCER-SIDE HALF. The queue above fixed the reader; it did
+  // not fix the publisher. Two runs after it landed still read 57.55 and 54.08 shown against
+  // ~60 published, with `polls` ~310/s in BOTH the good and the bad runs — a healthy capture
+  // clock that still misses frames, which is the single-slot publish overwriting a frame before
+  // any reader can see it. WGPUGfx.cpp now publishes into a RING at 0x026E0000 (4 slots, each
+  // with its own buffer and its own seqlock, plus a monotonic publish index); this side consumes
+  // it OLDEST-FIRST and still paints exactly one frame per rAF. See GcRate.ringPlan for the
+  // decision rules and ?ratetest=1 tests 25a-25k for their assertions.
+  //
+  // The legacy single-slot cells (0x026B3510/14/18) are still read when the ring magic is
+  // absent, so this page keeps working against a worker built before the ring — including the
+  // binary currently deployed to production.
+  var PRESENT_RING = 0x026E0000;         // must match WGPUGfx.cpp kRingBase
+  var PRESENT_RING_MAGIC = 0x31475250;   // 'PRG1' little-endian, WGPUGfx.cpp kRingMagic
+  var _ringOn = false, _ringNext = 0, _ringSlots = 0;
+  var _ringSkipped = 0, _ringTears = 0, _ringBehindMax = 0;
   // captured vs polls is the diagnosis when frames still go missing: `captured` short of
-  // `published` with `polls` at ~1000/s means the publisher put two frames in the slot inside
-  // one poll interval (only a multi-slot publish buffer can fix that); `polls` itself down at
-  // ~60/s means the capture CLOCK is being starved and the fix is on this side.
+  // `published` while `polls` is healthy (~250/s at a 4ms timer) means the PUBLISHER lost them;
+  // `polls` itself down at ~60/s means the capture CLOCK is being starved and the fix is on
+  // this side. `source` says which publisher this page actually found: 'slot' against a worker
+  // that was supposed to have the ring means the rebuild did not land in the binary being run.
+  // ringSkipped is the producer-side loss that REMAINS — it is a counted number, never a gap.
   window.__gcPresentStats = function () {
+    // publishedTotal is the ONLY exact denominator for "did every published frame get
+    // captured". Rate.published is a 1 Hz SAMPLE — one second's reading, which swung 59.75
+    // to 61.63 across a single 60 s window here — so sizing a 3% loss against it is sizing
+    // it against sampling noise. The seqlock is MONOTONIC (WGPUGfx bumps it +2 per published
+    // frame), so a delta of it is exact at any sampling rate, and captured/publishedTotal
+    // deltas over the same window ARE the producer-side loss, with no rate estimate involved.
+    var pubTotal = null;
+    try {
+      if (sharedMemory) {
+        var A = new Uint32Array(sharedMemory.buffer);
+        var s = Atomics.load(A, 0x026B3518 >> 2) >>> 0;
+        if (s & 1) s = (s - 1) >>> 0;           // snap an in-progress write back to the last complete frame
+        pubTotal = s >>> 1;
+      }
+    } catch (e) {}
     return { captured: _capN, polls: _capPolls, queued: _capQ.length, queueDrops: _capQDrops,
-             queueDepthMax: _capQDepthMax, qMax: PRESENT_QMAX, captureMs: PRESENT_CAPTURE_MS };
+             queueDepthMax: _capQDepthMax, qMax: PRESENT_QMAX, captureMs: PRESENT_CAPTURE_MS,
+             publishedTotal: pubTotal,
+             source: _ringOn ? 'ring' : 'slot', ringSlots: _ringSlots, ringNext: _ringNext,
+             ringSkipped: _ringSkipped, ringTears: _ringTears, ringBehindMax: _ringBehindMax };
   };
+  // Copy one published frame out of shared memory into a pooled ImageData. The CALLER owns the
+  // seqlock acquire/re-check pair, because the ring and the legacy slot lock different words.
+  function _capCopyFrame(ptr, w, h) {
+    if (!ptr || !w || !h) return null;
+    if (!canvasCtx2D) canvasCtx2D = $('canvas').getContext('2d');
+    // A resolution change invalidates every buffered frame AND every pooled buffer — a
+    // stale-sized ImageData painted after the canvas resized is the classic garbage frame.
+    if (w !== _capW || h !== _capH) { _capQ.length = 0; _capPool.length = 0; _capW = w; _capH = h; }
+    var img = _capPool.pop();
+    if (!img) { img = canvasCtx2D.createImageData(w, h); img._u32 = new Uint32Array(img.data.buffer); }
+    // ImageData rejects SharedArrayBuffer views — copy into its backing store.
+    img.data.set(new Uint8Array(sharedMemory.buffer, ptr, w * h * 4));
+    return img;
+  }
+  function _capEnqueue(img) {
+    // Force opaque alpha (readback alpha is undefined for the EFB). A u32 view ORs the
+    // alpha byte of 4 pixels' worth of lanes per iteration instead of 1 — measured
+    // 0.21ms/frame as a per-byte loop (present-diag 2026-09-01), the largest single
+    // item in a 0.52ms present. Endianness-safe: alpha is the high byte on LE, and the
+    // canvas ImageData buffer is only ever read back through the same view family.
+    // Doing it HERE keeps the rAF tick down to one putImageData.
+    var d32 = img._u32;
+    for (var i = 0; i < d32.length; i++) d32[i] |= 0xFF000000;
+    _capQ.push(img); _capN++;
+    // Overflow: the producer is outrunning the display (?fps=0 freerun published 82.93/s
+    // against a 60Hz panel). Drop the OLDEST — that degrades to exactly the pre-queue
+    // behaviour and keeps the newest frame on screen, rather than showing stale ones.
+    // ringPlan already declines to COPY frames destined for this drop, so on the ring path
+    // this is a backstop rather than the working path.
+    if (_capQ.length > PRESENT_QMAX) { _capPool.push(_capQ.shift()); _capQDrops++; }
+    if (_capQ.length > _capQDepthMax) _capQDepthMax = _capQ.length;
+  }
+  // ---- ring path: take every unread completed frame, oldest first ----------------------
+  function _capFromRing(A) {
+    var base = PRESENT_RING >> 2;
+    var slots = A[base + 1] >>> 0;
+    if (!slots || (slots & (slots - 1))) return;      // capacity must be a power of two
+    var pub = Atomics.load(A, base + 2) >>> 0;
+    if (!_ringOn) {
+      // Start from the newest COMPLETED frame rather than replaying a stale backlog: the
+      // reader's first paint should be what the emulator is showing now.
+      _ringOn = true; _ringSlots = slots; _ringNext = (pub > 0 ? (pub - 1) >>> 0 : 0);
+    }
+    var plan = GcRate.ringPlan({ pub: pub, next: _ringNext, slots: slots,
+                                 qLen: _capQ.length, qMax: PRESENT_QMAX });
+    _ringSkipped += plan.skipped;
+    if (plan.behind > _ringBehindMax) _ringBehindMax = plan.behind;
+    for (var k = 0; k < plan.take.length; k++) {
+      var pi = plan.take[k] >>> 0;
+      var s = base + 4 + (pi & (slots - 1)) * 4;
+      // Per-slot seqlock, the SAME acquire / odd-skip / post-copy re-check the single slot
+      // used: the producer bumps it ODD before it touches the slot's pixel buffer (resize can
+      // reallocate, so the pointer a reader holds may be freed) and EVEN after ptr/dims/pubidx
+      // are stored. A slot caught mid-write or already lapped is DISCARDED, never painted, and
+      // _ringNext is left ON that index so the next poll retries it.
+      var l0 = Atomics.load(A, s + 2) >>> 0;
+      if (l0 & 1) { _ringNext = pi; return; }
+      if ((A[s + 3] >>> 0) !== pi) { _ringNext = pi; _ringTears++; return; }   // producer lapped us
+      var dims = A[s + 1] >>> 0;
+      var img = _capCopyFrame(A[s] >>> 0, dims >>> 16, dims & 0xFFFF);
+      if (!img) { _ringNext = (pi + 1) >>> 0; continue; }
+      if ((Atomics.load(A, s + 2) >>> 0) !== l0) { _capPool.push(img); _ringTears++; _ringNext = pi; return; }
+      _ringNext = (pi + 1) >>> 0;
+      _capEnqueue(img);
+    }
+    // Everything up to `pub` is now either captured or counted in plan.skipped.
+    _ringNext = pub;
+  }
+  // ---- legacy path: one pixels pointer behind one seqlock (pre-ring workers) ------------
+  function _capFromSlot(A) {
+    // [present-seqlock 2026-08-07] Read seq with an acquire; skip if unchanged, or ODD
+    // (the worker is mid-write). Commit _sabPresentSeq only AFTER the post-copy re-check
+    // passes — so a torn read is discarded instead of painted (fixes the flashing).
+    var seq0 = Atomics.load(A, 0x026B3518 >> 2) >>> 0;
+    if (seq0 === _sabPresentSeq || (seq0 & 1)) return;
+    var dims = A[0x026B3514 >> 2] >>> 0;
+    var img = _capCopyFrame(A[0x026B3510 >> 2] >>> 0, dims >>> 16, dims & 0xFFFF);
+    if (!img) return;
+    // [present-seqlock 2026-08-07] Re-check: if the worker bumped seq during the copy, the
+    // frame tore — discard it (don't queue it, don't advance _sabPresentSeq; retry next poll).
+    if ((Atomics.load(A, 0x026B3518 >> 2) >>> 0) !== seq0) { _capPool.push(img); return; }
+    _sabPresentSeq = seq0;
+    _capEnqueue(img);
+  }
   function _sabPresentCapture() {
     try {
       _capPolls++;
       if (!sharedMemory) return;
       var A = new Uint32Array(sharedMemory.buffer);
-      // [present-seqlock 2026-08-07] Read seq with an acquire; skip if unchanged, or ODD
-      // (the worker is mid-write). Commit _sabPresentSeq only AFTER the post-copy re-check
-      // passes — so a torn read is discarded instead of painted (fixes the flashing).
-      var seq0 = Atomics.load(A, 0x026B3518 >> 2) >>> 0;
-      if (seq0 === _sabPresentSeq || (seq0 & 1)) return;
-      var ptr = A[0x026B3510 >> 2] >>> 0;
-      var dims = A[0x026B3514 >> 2] >>> 0;
-      var w = dims >>> 16, h = dims & 0xFFFF;
-      if (!ptr || !w || !h) return;
-      if (!canvasCtx2D) canvasCtx2D = $('canvas').getContext('2d');
-      // A resolution change invalidates every buffered frame AND every pooled buffer — a
-      // stale-sized ImageData painted after the canvas resized is the classic garbage frame.
-      if (w !== _capW || h !== _capH) { _capQ.length = 0; _capPool.length = 0; _capW = w; _capH = h; }
-      var img = _capPool.pop();
-      if (!img) { img = canvasCtx2D.createImageData(w, h); img._u32 = new Uint32Array(img.data.buffer); }
-      // ImageData rejects SharedArrayBuffer views — copy into its backing store.
-      img.data.set(new Uint8Array(sharedMemory.buffer, ptr, w * h * 4));
-      // [present-seqlock 2026-08-07] Re-check: if the worker bumped seq during the copy, the
-      // frame tore — discard it (don't queue it, don't advance _sabPresentSeq; retry next poll).
-      if ((Atomics.load(A, 0x026B3518 >> 2) >>> 0) !== seq0) { _capPool.push(img); return; }
-      _sabPresentSeq = seq0;
-      // Force opaque alpha (readback alpha is undefined for the EFB). A u32 view ORs the
-      // alpha byte of 4 pixels' worth of lanes per iteration instead of 1 — measured
-      // 0.21ms/frame as a per-byte loop (present-diag 2026-09-01), the largest single
-      // item in a 0.52ms present. Endianness-safe: alpha is the high byte on LE, and the
-      // canvas ImageData buffer is only ever read back through the same view family.
-      // Doing it HERE keeps the rAF tick down to one putImageData.
-      var d32 = img._u32;
-      for (var i = 0; i < d32.length; i++) d32[i] |= 0xFF000000;
-      _capQ.push(img); _capN++;
-      // Overflow: the producer is outrunning the display (?fps=0 freerun published 82.93/s
-      // against a 60Hz panel). Drop the OLDEST — that degrades to exactly the pre-queue
-      // behaviour and keeps the newest frame on screen, rather than showing stale ones.
-      if (_capQ.length > PRESENT_QMAX) { _capPool.push(_capQ.shift()); _capQDrops++; }
-      if (_capQ.length > _capQDepthMax) _capQDepthMax = _capQ.length;
+      if ((A[PRESENT_RING >> 2] >>> 0) === PRESENT_RING_MAGIC) _capFromRing(A);
+      else _capFromSlot(A);
     } catch (e) { /* transient during boot */ }
   }
   function _sabPresentTick() {
@@ -5874,6 +6140,13 @@ window.GcRate = (function () {
       GcAudio.initing = false;
     }
   }
+  // Published for the recomp block further down (a separate <script>, so it cannot see this
+  // closure): the recomp worker owns the game under ?recomp / MP4-by-default, reports its OWN
+  // sample rate and pushes its OWN PCM, and needs the same ctx-creation entry point the
+  // dolphin 'audioRate' handler uses. Assigned here, not inside initGcAudio, because the
+  // caller needs it BEFORE the first init — inside, it would only appear after one succeeded.
+  window._gcAudioInit = initGcAudio;
+  window._gcAudioCtx = function () { return getAudioCtx(); };
   // Wire user-gesture init. [audio rate 2026-07-17] The gesture only RECORDS activation; the actual
   // AudioContext is created later at the core's reported rate (the 'audioRate' worker message), because
   // the rate isn't known until retro_load_game runs — a few seconds after the Start click. Creating it
@@ -6026,7 +6299,14 @@ window.GcRate = (function () {
       // speed — a real restore of the user's PSO state measured 32.016x for one 5s window
       // (/tmp/probe-userscene.log:38). The threshold in makeJitRate would catch it, but the
       // page KNOWS the seam happened, so re-latch on the event and never publish that window.
-      case 'stateLoaded': _jitRate.relatch(); if (pendingLoadResolve) { pendingLoadResolve(); pendingLoadResolve = null; } break;
+      // [honest-restore-reporting 2026-09-01] The worker now reports a tri-state
+      // (see worker_funcs.js 'loadState'): data.ok===false means the restore did
+      // NOT happen and the emulator is still running whatever it was running
+      // before — historically indistinguishable from success here, which is how a
+      // cold boot got measured and reported as a gameplay scene. Pass the message
+      // through so callers can fail loudly. Older workers send no `ok` field at
+      // all; treat that as "unknown", not as success.
+      case 'stateLoaded': _jitRate.relatch(); if (pendingLoadResolve) { pendingLoadResolve(data); pendingLoadResolve = null; } break;
       case 'runtime-ready':
         // 4f-6: dolphin's wasm runtime is up. Set the flag so the
         // page-mediated mailbox consumer starts routing real MMIO cmds
@@ -6358,7 +6638,8 @@ window.GcRate = (function () {
       toast('Restoring…');
       var data = await gunzip(stored instanceof Uint8Array ? stored : new Uint8Array(stored));
       if (isRecompContainer(data)) return toast('That state was made in recomp mode (?recomp=1) — the JIT core cannot load it', true);
-      await new Promise(res => { pendingLoadResolve = res; dolphin_worker.postMessage({ cmd: 'loadState', data: data }, [data.buffer]); });
+      var ack = await new Promise(res => { pendingLoadResolve = res; dolphin_worker.postMessage({ cmd: 'loadState', data: data }, [data.buffer]); });
+      if (ack && ack.ok === false) return toast('Restore FAILED: ' + (ack.reason || 'unknown'), true);
       toast('State restored');
     } catch (e) { toast('Load failed: ' + (e.message || e), true); }
   }
@@ -6389,8 +6670,13 @@ window.GcRate = (function () {
     if (!dolphin_worker) throw new Error('worker not ready');
     var data = await gunzip(gzBytes instanceof Uint8Array ? gzBytes : new Uint8Array(gzBytes));
     if (isRecompContainer(data)) throw new Error('recomp save state handed to the JIT core');
-    await new Promise(res => { pendingLoadResolve = res; dolphin_worker.postMessage({ cmd: 'loadState', data: data }, [data.buffer]); });
-    return true;
+    var ack = await new Promise(res => { pendingLoadResolve = res; dolphin_worker.postMessage({ cmd: 'loadState', data: data }, [data.buffer]); });
+    // Throw on a reported failure so the headless probe's
+    // "[probe] PROBE_LOAD_STATE ... -> loaded N bytes" line can never be printed
+    // for a restore that did not happen (CLAUDE.md gate #10). `ok === undefined`
+    // means an older worker build that cannot tell us — say so rather than lie.
+    if (ack && ack.ok === false) throw new Error('restore failed: ' + (ack.reason || 'unknown'));
+    return (ack && ack.ok === true) ? { ok: true, bytes: ack.bytes } : { ok: 'unknown' };
   };
   // Headless-probe hook: report the WASM build's own raw DoState size (bytes),
   // for comparing against a native .s01's uncompressed_size (format compat check).
@@ -7202,6 +7488,37 @@ window.GcRate = (function () {
         dolphin_worker.postMessage({ cmd: 'recompFrame', n: e.data.n, fifo: e.data.fifo,
                                      mem1: e.data.mem1, regions: e.data.regions,
                                      skipRender: skipRender }, tr);
+      } else if (e.data.cmd === 'audioRate') {
+        // [recomp audio 2026-09-01] The recomp path had NO audio wiring at all: recomp_worker.js
+        // posted seven message types and none of them was sound, so MP4 — which routes to the
+        // recomp BY DEFAULT (RECOMP_TITLES above) — shipped silent while ?recomp=0 played.
+        // Measured on the wired context: default arm 1,474,560 frames rendered / 0 audible,
+        // ?recomp=0 arm 961,563 audible. This is the same contract dolphin_worker's 'audioRate'
+        // has: the rate arrives once, before any PCM, so the AudioContext is built at the
+        // core's real rate instead of a resampled guess.
+        // MEASURED 2026-09-01: on a normal boot the JIT core has already reported 32029 Hz and
+        // built the context before the recomp takes the game over, so this arrives with the
+        // worklet already up at 32029 while MusyX's own rate is 32000 (hw_pc.c:76). initGcAudio
+        // early-returns on an inited context, so the ctx keeps 32029 and the worklet's resample
+        // ratio — fixed at construction — stays 1:1. That is a 0.09% producer/consumer drift,
+        // about one ring's worth every two minutes. Say so rather than let it look exact.
+        var _prevRate = window._gcAudioRate | 0;
+        window._gcAudioRate = e.data.rate | 0;
+        var _hasAct = !!(navigator.userActivation && navigator.userActivation.hasBeenActive);
+        if ((window._gcAudioGestured || _hasAct) && window._gcAudioInit) window._gcAudioInit();
+        else console.warn('[audio] recomp reported ' + (e.data.rate | 0) + ' Hz but no user'
+          + ' gesture is on record — the next click/tap starts the worklet.');
+        var _c = window._gcAudioCtx && window._gcAudioCtx();
+        var _ctxNow = _c && _c.sampleRate;
+        if (_ctxNow && _ctxNow !== (e.data.rate | 0))
+          console.warn('[audio] recomp produces ' + (e.data.rate | 0) + ' Hz but the AudioContext'
+            + ' was already built at ' + _ctxNow + ' Hz (from the JIT core\'s ' + _prevRate
+            + ' Hz report, before takeover) — expect a '
+            + (Math.abs(_ctxNow - (e.data.rate | 0)) / (e.data.rate | 0) * 100).toFixed(2)
+            + '% producer/consumer drift, not a pitch error.');
+      } else if (e.data.cmd === 'audio') {
+        // int16 stereo PCM; e.data.len is BYTES (frames*4), matching pushAudioSamples' contract.
+        if (window._gcAudioPushSamples) window._gcAudioPushSamples(new Uint8Array(e.data.buf), e.data.len);
       } else if (e.data.cmd === 'card') {
         // 2 MiB .raw snapshot: the shim's dirty counter went quiet (or Export asked for one).
         var img = e.data.img;
@@ -7260,6 +7577,11 @@ window.GcRate = (function () {
                      inputScript: boardScript,
                      peekAddrs: (q.get('peek') || '').split(',').filter(Boolean).map(function (s) { return parseInt(s, 16); }),
                      testFullMem: q.get('fullmem') === '1',
+                     // ?audiotest=1 — feed the audio transport a synthetic 440 Hz tone so the
+                     // worker -> page -> SAB ring -> AudioWorklet -> destination chain can be
+                     // PROVEN with tools/audio_probe.mjs. It is not game audio and never runs
+                     // without the parameter; see the AUDIO note in recomp_worker.js.
+                     audioTest: q.get('audiotest') === '1',
                      xfShadowAll: q.get('xfregonly') === '1' ? false : true,
                      glueUrl: '/gamecube/recomp/mp4_game.js',
                      wasmUrl: '/gamecube/recomp/mp4_game.wasm' }, bootTransfer);
