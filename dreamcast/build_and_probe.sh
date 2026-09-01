@@ -45,6 +45,7 @@ ROTATE=""
 NOCOI=""
 NOSWA=""
 PROGMS=""
+AUDIOCLAMP=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --skip-link|--skip-build) SKIP_LINK=1; shift ;;
@@ -110,6 +111,12 @@ while [ $# -gt 0 ]; do
     --nocoiheaders)           NOCOI="--nocoiheaders"; shift ;;
     --noswa)                  NOSWA="--noswa"; shift ;;
     --progms)                 PROGMS="$2"; shift 2 ;;
+    # [2026-09-01] --audioclamp <hz>: force the page's AudioContext to run at
+    # <hz> regardless of what it asks for. dreamcast/audio-worklet.js:26-35
+    # documents this as the failure its resampler exists to survive, and desktop
+    # Chrome honours 44100 — so without this arm the defect is unreachable from
+    # this box. Same gap as --loadstate/--ctxms/--profat before it.
+    --audioclamp)             AUDIOCLAMP="$2"; shift 2 ;;
     -h|--help)                sed -n '2,/^set -e/p' "$0" | sed 's/^# //;/^set -e/d'; exit 0 ;;
     *)                        echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -191,6 +198,7 @@ EXTRA=()
 [ -n "$NOCOI" ]       && EXTRA+=(--nocoiheaders)
 [ -n "$NOSWA" ]       && EXTRA+=(--noswa)
 [ -n "$PROGMS" ]      && EXTRA+=(--progms "$PROGMS")
+[ -n "$AUDIOCLAMP" ]  && EXTRA+=(--audioclamp "$AUDIOCLAMP")
 
 # V8 flags pass through to puppeteer's Chrome via FLYCAST_V8_FLAGS — the probe
 # forwards the string to chromium as `--js-flags=...`. Empty string = leave V8

@@ -983,6 +983,32 @@
              PROG.discTotal && PROG.discBytes >= PROG.discTotal ? 'good' : 'warn');
     }
     push('frames', frameSummary(), safe(() => lastCalls, 0) > 0 ? 'good' : 'warn');
+    // SINK-SIDE AUDIO. The worker's own [audio] line only sees the WRITER, so
+    // until 2026-09-01 a sink draining faster than AICA fills — silence, or
+    // silence plus wrong pitch — reached the reporter as nothing at all. The
+    // discriminating field is `drain vs core`: the ring is filled at ~44100/s,
+    // so a drain materially above that is the sink outrunning the core, which
+    // is what an AudioContext the browser refused to run at 44100 does.
+    {
+      // safe(): audioHealth is declared later in this same block, so a report
+      // built from the global error handler during script execution would hit
+      // its temporal dead zone. This whole function is contracted to survive
+      // being called "at any point in the boot" (see buildReport below).
+      const a = safe(() => audioHealth, { seen: false });
+      if (!a.seen) {
+        push('audio', 'no report yet (press Start, and audio needs one tap)', 'warn');
+      } else {
+        const drift = a.srcRate ? (a.consumedRate / a.srcRate - 1) * 100 : 0;
+        const off = Math.abs(drift) > 1;
+        push('audio',
+             'ctx ' + a.ctxRate + 'Hz, core ' + a.srcRate + 'Hz' +
+             (a.resampling ? ' (resampling)' : '') +
+             ' · drain ' + a.consumedRate + '/s (' + (drift >= 0 ? '+' : '') + drift.toFixed(1) + '%)' +
+             ' · buffer ' + a.fill + '/' + a.capacity +
+             ' · ' + a.underrunTotal + ' dropout frames',
+             off ? 'bad' : (a.underrunFrames > 0 ? 'warn' : 'good'));
+      }
+    }
     if (facts.coreError) push('core startup', facts.coreError, 'bad');
     if (facts.memoryPressure) push('memory pressure', facts.memoryPressure, 'bad');
     const c = counters;

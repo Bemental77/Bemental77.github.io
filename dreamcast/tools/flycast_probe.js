@@ -217,6 +217,18 @@ let NO_GL = false;
 // left the page probe reporting no-WebGL2 while the worker rendered at 30 fps.
 // Without this, the page's terminal "no graphics context" stop is unprovable.
 let NO_WORKER_GL = false;
+// --audioclamp <hz>: make `new AudioContext({sampleRate: N})` IGNORE the
+// requested rate and hand back a context running at <hz>. This is not a
+// hypothetical — dreamcast/audio-worklet.js:26-35 documents it as the failure
+// the resampler was ported to survive: "`new AudioContext({sampleRate})` may
+// throw, or be silently clamped to the device rate — and a page that then falls
+// back to a default-rate context while this processor keeps reading 1:1 plays
+// FAST (48000/44100 = 1.088x) AND starves the ring forever".
+//
+// Desktop Chrome honours 44100, so on this rig the defect is INVISIBLE without
+// this arm; that is precisely why it survived. The arm is the only instrument
+// here that can put a number on a device-dependent audio bug from a desktop.
+let AUDIO_CLAMP = 0;
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
   if (a === '--duration')   DURATION_MS = parseInt(process.argv[++i], 10);
@@ -278,6 +290,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === '--allocfail') ALLOC_FAIL_MB = parseInt(process.argv[++i], 10) >>> 0;
   else if (a === '--noglctx') NO_GL = true;
   else if (a === '--noworkergl') NO_WORKER_GL = true;
+  else if (a === '--audioclamp') AUDIO_CLAMP = parseInt(process.argv[++i], 10) >>> 0;
   else if (a === '-h' || a === '--help') {
     console.log('flycast_probe [--duration MS] [--idle MS] [--no-start] [--keep-noise] [--log PATH] [--interp] [--pctrace N]');
     console.log('  mobile arm: [--mobile] [--device "<KnownDevices name>"] [--mobileforce] [--swgl] [--shotdir DIR]');
@@ -646,6 +659,31 @@ function classify(text) {
       try { window.ArrayBuffer = wrap(ArrayBuffer); } catch (_) {}
     }, ALLOC_FAIL_MB);
   }
+  if (AUDIO_CLAMP) {
+    console.log('[probe] AUDIO-CLAMP ARM: AudioContext will run at ' + AUDIO_CLAMP +
+      ' Hz no matter what the page asks for (a stand-in for a device whose audio ' +
+      'hardware rate the browser refuses to change; iOS and many Android devices ' +
+      'are 48000). The page must survive this WITHOUT playing fast and WITHOUT ' +
+      'starving the ring.');
+    await page.evaluateOnNewDocument((hz) => {
+      // Wrap rather than replace, so everything except the requested sampleRate
+      // behaves exactly as the real constructor does. This mirrors a browser
+      // that accepts the option object and quietly ignores one field — which is
+      // the documented behaviour, not an invented one.
+      const wrap = (Ctor) => {
+        if (typeof Ctor !== 'function') return Ctor;
+        return new Proxy(Ctor, {
+          construct(t, args, nt) {
+            const opts = Object.assign({}, args[0] || {});
+            opts.sampleRate = hz;
+            return Reflect.construct(t, [opts], nt);
+          },
+        });
+      };
+      try { window.AudioContext = wrap(window.AudioContext); } catch (_) {}
+      try { window.webkitAudioContext = wrap(window.webkitAudioContext); } catch (_) {}
+    }, AUDIO_CLAMP);
+  }
   if (NO_SW) {
     // Before ANY page script. The page's COI gate reads self.crossOriginIsolated
     // and its reload bound must survive here; this is the configuration where
@@ -1001,7 +1039,15 @@ function classify(text) {
         (p.discTotal ? ' disc=' + (p.discBytes / 1048576).toFixed(0) + '/' +
                        (p.discTotal / 1048576).toFixed(0) + 'MB' : '') +
         ' fields=' + p.fields + ' fps=' + p.fps +
-        ' idle=' + (p.idleMs / 1000).toFixed(1) + 's\n');
+        ' idle=' + (p.idleMs / 1000).toFixed(1) + 's' +
+        // Sink-side audio, per sample. A TOTAL cannot tell a one-off boot
+        // transient from a permanent starve, and those two want opposite fixes,
+        // so the series is printed rather than only the sum.
+        (p.audio && p.audio.seen
+          ? ' | au ctx=' + p.audio.ctxRate + ' drain=' + p.audio.consumedRate +
+            ' ur=' + p.audio.underrunFrames + ' urTot=' + p.audio.underrunTotal +
+            ' fill=' + p.audio.fill
+          : '') + '\n');
     } catch (_) { /* navigation or a closed page: not a liveness fact */ }
   }
 
@@ -1158,6 +1204,53 @@ function classify(text) {
                                 ? (last.stencil.on ? 'granted' : 'REFUSED') : 'unknown'));
     console.log('    heap:          init=' + last.heap.init + 'MB max=' + last.heap.max +
                 'MB reduced=' + last.heap.reduced + (last.heap.err ? ' err=' + last.heap.err : ''));
+    // --- SINK-SIDE AUDIO -----------------------------------------------------
+    // The worker's own [audio] line covers the WRITER (wrote/s, dropped/s). It
+    // cannot see the sink. This block is the reader: the AudioWorklet's stats,
+    // relayed through __dcProbe().audio (dreamcast.html). `consumed` is the rate
+    // the ring is actually drained at, so `consumed` materially above srcRate is
+    // a sink outrunning AICA — the ring empties and every later quantum is
+    // zero-padded, which is audible and which nothing on this page could see
+    // before 2026-09-01.
+    const au = last.audio;
+    if (!au || !au.seen) {
+      console.log('    audio:         NO STATS — the worklet never reported (audio may never ' +
+                  'have initialised, or the page has no port listener)');
+    } else {
+      const drift = au.srcRate ? (au.consumedRate / au.srcRate - 1) * 100 : NaN;
+      const driftTxt = isNaN(drift) ? '?' : (drift >= 0 ? '+' : '') + drift.toFixed(2) + '%';
+      console.log('    audio:         ctx=' + au.ctxRate + 'Hz src=' + au.srcRate +
+                  ' dst=' + au.dstRate + ' resampling=' + au.resampling);
+      console.log('    audio drain:   consumed=' + au.consumedRate + '/s output=' + au.outputRate +
+                  '/s  (drain vs src ' + driftTxt + ')   fill=' + au.fill + '/' + au.capacity);
+      // A TOTAL is the wrong verdict. The ring necessarily starts EMPTY, so the
+      // boot ramp always contributes underrun frames and always will — scoring
+      // on the total marks a healthy run as starving. What matters is whether
+      // the sink is STILL starving once the guest has settled, because that is
+      // the difference between one stutter at startup and permanently broken
+      // audio. Split at the same +15 s the vblank SETTLED window uses.
+      const AU_SETTLE_MS = 15000;
+      const settleSample = progSamples.find(s => s.wall >= AU_SETTLE_MS && s.audio && s.audio.seen);
+      const urBoot = settleSample ? (settleSample.audio.underrunTotal | 0) : null;
+      const urPost = (urBoot === null) ? null : (au.underrunTotal | 0) - urBoot;
+      const urSecs = last.counters ? (last.counters.audioUnderrunSeconds | 0) : 0;
+      console.log('    audio underrun: ' + au.underrunTotal + ' frames total (' +
+                  (urBoot === null ? '?' : urBoot) + ' by +' + (AU_SETTLE_MS / 1000) + 's boot ramp, ' +
+                  (urPost === null ? '?' : urPost) + ' AFTER), ' + urSecs +
+                  ' second(s) with any underrun');
+      if (urPost === null) {
+        console.log('    => audio: NO VERDICT — run too short to form a post-settle window');
+      } else if (urPost === 0) {
+        console.log('    => audio: HEALTHY — zero underrun after the boot ramp' +
+                    (au.resampling ? ' (resampler engaged: ' + au.srcRate + ' -> ' + au.dstRate + ')' : ''));
+      } else {
+        console.log('    => audio: *** SINK STARVING AFTER SETTLE *** ' + urPost + ' frames = ' +
+                    (urPost / (au.srcRate || 44100)).toFixed(2) + ' s of zero-padding' +
+                    (au.consumedRate && au.srcRate && Math.abs(au.consumedRate / au.srcRate - 1) > 0.01
+                      ? '  — drain is ' + driftTxt + ' off source rate, so the sink is outrunning the core'
+                      : ''));
+      }
+    }
     const verdict =
       last.live === 'running' ? 'RUNNING — frames are flowing'
       : last.live === 'stopped' ? 'BROKEN — ' + last.why
