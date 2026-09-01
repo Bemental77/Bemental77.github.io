@@ -814,11 +814,35 @@ self.onmessage = function (e) {
     case 'loadState':
       // [savestate-deadlock-fix PM61] same CPU-thread routing as saveState:
       // alloc + fill the buffer, commit, then the JIT loop runs load_state inline.
+      //
+      // [honest-restore-reporting 2026-09-01] This handler used to post a bare
+      // { cmd:'stateLoaded' } on EVERY path — including "the core isn't running",
+      // "malloc failed", "retro_unserialize returned false" and "the CPU thread
+      // never serviced the request in 20s". A failed restore therefore looked
+      // EXACTLY like a successful one to the page and to the probe, and the
+      // emulator silently kept running the COLD BOOT while a measurement was
+      // attributed to a gameplay scene. That has invalidated savestate work here
+      // before (CLAUDE.md gate #10: "A savestate that fails to restore SILENTLY
+      // COLD-BOOTS and still produces a plausible-looking number").
+      //
+      // The success/failure signal already existed in C and was simply thrown
+      // away: bem_state_poll() (EmscriptenWorker.cpp:1453) returns
+      // g_bem_state_done ? g_bem_state_len : -1, and bem_service_pending_state
+      // (:1491-1492) zeroes g_bem_state_len when load_state() != 0. So:
+      //     poll  >  0  -> retro_unserialize succeeded, value == bytes consumed
+      //     poll ===  0  -> retro_unserialize FAILED
+      //     poll === -1  -> never serviced (CPU thread wedged / not dispatching)
+      // Report that tri-state verbatim, and emit one greppable restore-OK line.
       (async function () {
-        if (!Module || !Module.calledRun) { postMessage({ cmd: 'stateLoaded' }); return; }
+        var fail = function (reason) {
+          postMessage({ cmd: 'print', txt: '[worker] loadState FAILED: ' + reason });
+          postMessage({ cmd: 'stateLoaded', ok: false, reason: reason });
+        };
+        if (!Module || !Module.calledRun) { fail('core not running (calledRun false)'); return; }
         try {
           var src = data.data || new Uint8Array(0);
-          if (Module._bem_load_request(src.length) !== 0) { postMessage({ cmd: 'stateLoaded' }); return; }
+          if (!src.length) { fail('empty state buffer'); return; }
+          if (Module._bem_load_request(src.length) !== 0) { fail('bem_load_request malloc failed for ' + src.length + ' bytes'); return; }
           Module.HEAPU8.set(src, Module._bem_state_buf_ptr());
           Module._bem_load_commit();   // sets op=2 AFTER the buffer is filled
           var done = -1, tries = 0;
@@ -828,10 +852,12 @@ self.onmessage = function (e) {
             tries++;
           }
           Module._bem_state_release();
-          postMessage({ cmd: 'stateLoaded' });
+          if (done < 0) { fail('timeout after ' + tries + ' polls — CPU thread never serviced the load'); return; }
+          if (done === 0) { fail('retro_unserialize rejected the state (' + src.length + ' bytes)'); return; }
+          postMessage({ cmd: 'print', txt: '[worker] loadState RESTORE-OK bytes=' + done + ' polls=' + tries });
+          postMessage({ cmd: 'stateLoaded', ok: true, bytes: done, polls: tries });
         } catch (e) {
-          postMessage({ cmd: 'print', txt: '[worker] loadState failed: ' + e });
-          postMessage({ cmd: 'stateLoaded' });
+          fail('exception: ' + e);
         }
       })();
       break;

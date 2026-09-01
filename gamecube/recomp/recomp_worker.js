@@ -21,6 +21,8 @@
 //            NOTE: inbound messages are only serviced BEFORE Module._main() is called — after
 //            that this worker never returns to its event loop (see SAVE STATES).
 // Message out: {cmd:'frame', fifo, regions:[{addr,bytes}], n} | {cmd:'log', txt}
+//            | {cmd:'audioRate', rate}                 output sample rate, sent once at boot
+//            | {cmd:'audio', buf:ArrayBuffer, len}     int16 stereo PCM, `len` in BYTES
 //            | {cmd:'card', seq, img:ArrayBuffer}  2 MiB .raw memory-card image to persist
 //            | {cmd:'stateSaved', n, buf} | {cmd:'stateLoadReady'} | {cmd:'stateRestored', n}
 //            | {cmd:'stateError', op, txt}
@@ -34,7 +36,71 @@ let XF_SHADOW_ALL = false; // matrix-memory shadow BROKE glyph texgen state (202
 let parts = [], fstBuf = null;
 const PART_SIZE = 104857600;   // 100MiB fixed part boundaries (gamecube.html chunkRange)
 
+// ---- AUDIO transport (page AudioWorklet ring) -------------------------------------------
+// THE STATE OF THIS PATH, so nobody reads sound out of it that isn't there: the recomp is
+// SILENT and this carries no game audio yet. MP4's engine is MusyX (extern/musyx, 34 .c) plus
+// the 6 src/msm wrappers, and neither is compiled into mp4_game.wasm — every one of its 36
+// msm* entry points is a host import answered by `default: return 0` at the bottom of stub().
+// gamecube/recomp/build_wasm.sh RECOMP_MUSYX=1 compiles them (verified 2026-09-01: 39/39 TUs,
+// 0 signature mismatches, the 36 msm* imports go away) but that STILL yields no samples,
+// because on real hardware MusyX mixes on the DSP: hw_dolphin.c hands salBuildCommandList's
+// output to the `dspSlave` microcode (dsp_import.c:4, 0x19E0 bytes of GC-DSP code), and the
+// MUSY_TARGET_PC backend is a stub, not a software renderer (hw_pc.c:89 salAiGetDest returns
+// NULL). What is still missing upstream of here: (1) a software AX-style mixer over the _PB
+// voice blocks, (2) a big-endian byte swapper for /sound/mpgcsnd.msm.
+//
+// What IS here is the transport those samples will ride, wired and measurable end to end:
+// this worker -> {cmd:'audio'} -> gamecube.html -> window._gcAudioPushSamples -> the SAB ring
+// -> /gamecube/audio-worklet.js -> ctx.destination. `?audiotest=1` feeds it a synthetic tone
+// so the wiring can be PROVEN with tools/audio_probe.mjs rather than assumed.
+//
+// GATE #9: the sample count is derived from viRetrace — EMULATED time — never from
+// performance.now(). Audio therefore cannot pull, push or stretch the guest clock, and
+// frames/s divided by 32000 is an independent witness of the guest rate (the GameCube
+// analogue of Dreamcast's AICA witness).
+const AUDIO_RATE = 32000;      // MusyX's own output rate: hw_pc.c:76 / hw_dolphin.c:77 *outFreq
+let audioTest = false;         // ?audiotest=1 — synthetic tone, transport self-test only
+let audioAcc = 0;              // fractional carry so 60 frames emit exactly AUDIO_RATE samples
+let audioPhase = 0;
+
 const log = (txt) => postMessage({ cmd: 'log', txt: '[recomp-worker] ' + txt });
+
+// One emulated video frame's worth of audio, posted to the page's worklet ring. Called from
+// VIWaitForRetrace, right after viRetrace++, so the sample count is a function of EMULATED
+// time alone (gate #9). The carry keeps 60 consecutive retraces at exactly AUDIO_RATE
+// samples (533,533,534,... ) instead of truncating 533.33 and drifting 20 samples/second flat.
+function pumpAudio() {
+  audioAcc += AUDIO_RATE;
+  const n = (audioAcc / 60) | 0;
+  audioAcc -= n * 60;
+  if (n <= 0) return;
+  let pcm = null;
+  // ENGINE PATH (not yet built — see the AUDIO transport note at the top of this file). When a
+  // software mixer exists it stages int16 stereo frames inside the wasm heap and returns how
+  // many it actually produced; copy them out because the heap can move on a memory growth.
+  if (Module && Module.___recomp_audio_pump && Module.___recomp_audio_base) {
+    const got = Module.___recomp_audio_pump(n) | 0;
+    if (got > 0) {
+      const base = Module.___recomp_audio_base() >>> 0;
+      pcm = new Int16Array(Module.wasmMemory.buffer.slice(base, base + got * 4));
+    }
+  }
+  // TRANSPORT SELF-TEST (?audiotest=1). A 440 Hz sine at 0.15 full scale, phase-continuous
+  // across frames so tools/audio_probe.mjs reads 0 discontinuities and 0 gaps when the whole
+  // chain is healthy. This is NOT game audio and never runs without the query parameter.
+  if (!pcm && audioTest) {
+    pcm = new Int16Array(n * 2);
+    const step = (2 * Math.PI * 440) / AUDIO_RATE;
+    for (let i = 0; i < n; i++) {
+      const s = (Math.sin(audioPhase) * 4915) | 0;
+      pcm[i * 2] = s; pcm[i * 2 + 1] = s;
+      audioPhase += step;
+      if (audioPhase > 2 * Math.PI) audioPhase -= 2 * Math.PI;
+    }
+  }
+  if (!pcm) return;
+  postMessage({ cmd: 'audio', buf: pcm.buffer, len: pcm.byteLength }, [pcm.buffer]);
+}
 
 // ---- memory card (gamecube/recomp/shims/src/gc_card.c) ----------------------------------
 // gc_card.c owns a 2 MiB RAM image that IS a real .raw GameCube memory card. The host's two
@@ -766,6 +832,7 @@ async function boot(msg) {
           if (Module.___recomp_set_inject_stkx) Module.___recomp_set_inject_stkx(os3 || h3 || (scripted ? scripted[2] : 0));
           if (Module.___recomp_set_inject_stky) Module.___recomp_set_inject_stky(os4 || h4 || (scripted ? scripted[3] : 0));
           viRetrace++;
+          pumpAudio();
           cardPoll();
           // debug: periodic guest-side hex of watched addresses (boot msg peekAddrs;
           // diff against the dolphin worker's recompPeek of the same guest offsets)
@@ -826,6 +893,13 @@ async function boot(msg) {
   if (msg.inputScript) { inputScript = msg.inputScript; log('input script: ' + Object.keys(inputScript).length + ' entries'); }
   if (msg.peekAddrs) peekAddrs = msg.peekAddrs;
   if (msg.testFullMem) { testFullMem = true; log('TESTFULLMEM: full mem1 every frame'); }
+  // Tell the page the output rate BEFORE any 'audio' message, so it builds the AudioContext at
+  // the right rate the first time (the same contract dolphin_worker's 'audioRate' has).
+  audioTest = !!msg.audioTest;
+  postMessage({ cmd: 'audioRate', rate: AUDIO_RATE });
+  log('audio: rate ' + AUDIO_RATE + ' Hz, source = ' +
+      (Module.___recomp_audio_pump ? 'engine' : (audioTest ? '?audiotest=1 SYNTHETIC TONE (transport self-test, not game audio)'
+        : 'NONE — MusyX is not compiled in, this path is silent')));
   if (msg.xfShadowAll === false) { XF_SHADOW_ALL = false; log('XF shadow: registers only'); }
 
   // stage BootInfo (LE) + FST (BE->LE entry table) + FSTLocation

@@ -384,11 +384,19 @@ const PAGES = {
       }, rom);
     },
     // window.__gcRate (gamecube.html:4870), refreshed 1 Hz by _rateTick (:4910).
+    // `present` is window.__gcPresentStats() — the CAPTURE-side census, which is what
+    // separates "the reader was starved" from "the publisher overwrote the frame":
+    // `captured` short of `published` while `polls` is healthy means the loss is on the
+    // PRODUCER side, and `source` names which publish protocol the page actually found
+    // ('ring' = the multi-slot buffer, 'slot' = the old single-slot one).
     async meter(page) {
       return page.evaluate(() => {
         const r = window.__gcRate || {};
+        let present = null;
+        try { present = window.__gcPresentStats ? window.__gcPresentStats() : null; } catch (e) {}
         return { nativeHz: r.nativeHz || null, guestHz: r.guestHz || null, speed: r.speed,
-                 published: r.published, shown: r.shown, path: r.path,
+                 published: r.published, shown: r.shown, path: r.path, dropped: r.dropped,
+                 present,
                  text: (document.getElementById('fps') || {}).textContent || '' };
       }).catch(() => ({}));
     },

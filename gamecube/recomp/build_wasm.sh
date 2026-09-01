@@ -33,8 +33,68 @@ rsync -a --delete "$DECOMP/src" "$DECOMP/include" "$BUILD/" 2>/dev/null || {
 mkdir -p "$BUILD/extern/musyx"
 rsync -a "$DECOMP/extern/musyx/include" "$BUILD/extern/musyx/" 2>/dev/null || cp -R "$DECOMP/extern/musyx/include" "$BUILD/extern/musyx/include"
 rsync -a --delete "$DECOMP/build/GMPE01_01/include/" "$BUILD/gen/" 2>/dev/null || { mkdir -p "$BUILD/gen"; cp -R "$DECOMP/build/GMPE01_01/include/." "$BUILD/gen/"; }
+# [audio, RECOMP_MUSYX=1 — OPT-IN, OFF by default] Stage the MusyX SOURCE too, not just its
+# headers. MP4's whole audio engine is `extern/musyx` (33 library .c files per its own
+# CMakeLists) + the 6 `src/msm/*.c` wrappers; with neither compiled, all 36 msm* entry points
+# are host imports answered by recomp_worker.js's `default: return 0` and the game ships SILENT.
+#
+# THIS FLAG ONLY ANSWERS "DOES IT COMPILE" — it is NOT a working audio path. Compiling MusyX
+# in gets you the sequencer + voice manager + DSP-COMMAND-LIST BUILDER, and nothing that
+# produces a PCM sample: on real hardware every sample is mixed by the DSP running the
+# `dspSlave` microcode (extern/musyx/src/musyx/runtime/dsp_import.c:4, 0x19E0 bytes of GC-DSP
+# machine code, gated `#if MUSY_TARGET == MUSY_TARGET_DOLPHIN`). The MUSY_TARGET_PC backend is
+# NOT a software renderer — hw_pc.c:89 `salAiGetDest()` returns NULL, :82 `salStartAi()` has no
+# body and :99 `salStartDsp()` is empty (byte-identical to ~/gc_refs/ttyd/libs/musyx's copy, so
+# this is the library's stub target, not an MP4 quirk). A software AX-style mixer over the _PB
+# voice blocks + a big-endian->little-endian swapper for /sound/mpgcsnd.msm (its first 16 bytes
+# read 00 00 00 38 00 10 7a c0 00 00 04 10 = big-endian u32s, and MusyX parses them with native
+# loads) are BOTH still missing. Do not enable this on a shipped build.
+if [ -n "${RECOMP_MUSYX:-}" ]; then
+  rsync -a --delete "$DECOMP/extern/musyx/src" "$BUILD/extern/musyx/" 2>/dev/null || { rm -rf "$BUILD/extern/musyx/src"; cp -R "$DECOMP/extern/musyx/src" "$BUILD/extern/musyx/src"; }
+fi
 # 2. overlay portable shims (portable OSFastCast replaces the inline-asm header, etc.)
 cp -R "$RECOMP/shims/." "$BUILD/include/" 2>/dev/null || true
+# [audio, RECOMP_MUSYX=1] The source fixes MusyX + the msm layer need under emcc -std=gnu89.
+# Verified 2026-09-01: with these + the existing shims/dolphin/os/OSFastCast.h overlay, ALL 33
+# library TUs from extern/musyx/CMakeLists.txt AND all 6 src/msm/*.c wrappers compile
+# clean (39 built / 0 failed, and the link's `signature mismatch` count stays at the
+# default build's 0). profile.c is skipped by name and txwin.c by directory: neither is in
+# MusyX's own CMakeLists, and both fail (missing musyx_priv.h / dolphin/types.h).
+if [ -n "${RECOMP_MUSYX:-}" ]; then
+  #  (a) assert.h:24 uses C23's one-argument va_start(list); gnu89 requires the 2-arg form.
+  perl -0pi -e 's/va_start\(list\);/va_start(list, msg);/' "$BUILD/extern/musyx/include/musyx/assert.h" 2>/dev/null || true
+  #  (b) musyx.h's MUSY_TARGET_PC branch typedefs s32/u32 as int/unsigned int, which collides
+  #      with the decomp's dolphin/types.h (signed long / unsigned long) in every TU that
+  #      includes both — hw_dspctrl.c does, via dolphin/os/OSCache.h. `long` is 32-bit on
+  #      wasm32 so aligning the PC branch to the decomp's spelling is ABI-identical.
+  perl -0pi -e 's/typedef signed int s32;\ntypedef unsigned int u32;/typedef signed long s32;\ntypedef unsigned long u32;/' "$BUILD/extern/musyx/include/musyx/musyx.h" 2>/dev/null || true
+  #  (c) signature reconciliation. Compiling the msm layer IN turns nine previously-harmless
+  #      implicit declarations into wasm-ld `function signature mismatch` warnings (measured:
+  #      0 -> 9 on the first RECOMP_MUSYX link). Same mwcc decl!=def class as sig_fixes.json:
+  #      the caller implicit-declares `int f()` against a `void` definition. Add the declaring
+  #      header to each outlier caller.
+  perl -0pi -e 's{\A(?!\#include "msm/msmmus.h")}{#include "msm/msmmus.h"\n}' "$BUILD/src/game/main.c" 2>/dev/null || true
+  perl -0pi -e 's{\A(?!\#include "msm/msmsys.h")}{#include "msm/msmsys.h"\n}' "$BUILD/src/game/pad.c" 2>/dev/null || true
+  perl -0pi -e 's{\A(?!\#include "msm/msmmus.h")}{#include "msm/msmmus.h"\n#include "msm/msmsys.h"\n#include "msm/msmse.h"\n#include "msm/msmstream.h"\n}' "$BUILD/src/game/sreset.c" 2>/dev/null || true
+  #      msmSysLoadGroup is DEFINED with two parameters (src/msm/msmsys.c:728) and no header
+  #      declares it, so all three callers implicit-declare it and pass a third argument that
+  #      PPC silently ignored. Drop the extra arg and give them the real prototype.
+  for f in "$BUILD/src/game/audio.c" "$BUILD/src/REL/bootDll/main.c" "$BUILD/src/REL/bootDll/language.c"; do
+    perl -0pi -e 's/msmSysLoadGroup\(([^(),]*),([^(),]*),[^(),]*\)/msmSysLoadGroup($1,$2)/g;
+                  s{\A(?!extern long msmSysLoadGroup)}{extern long msmSysLoadGroup(long, void *);\n}' "$f" 2>/dev/null || true
+  done
+  #      msmSysCheckInit is DEFINED `void` (src/msm/msmsys.c:773) with a bare `sndIsInstalled();`
+  #      as its last statement — on PPC that value stays in r3 and sreset.c reads it as the
+  #      condition of three `if`s. Make the C say what the PPC did (return it) so the callers
+  #      compile AND behave identically; a plain void prototype makes sreset.c fail to compile.
+  perl -0pi -e 's/void msmSysCheckInit\(void\)\s*\{\s*\n\s*sndIsInstalled\(\);\s*\n\}/s32 msmSysCheckInit(void)\n{\n    return sndIsInstalled();\n}/s' "$BUILD/src/msm/msmsys.c" 2>/dev/null || true
+  perl -0pi -e 's/void msmSysCheckInit\(void\);/s32 msmSysCheckInit(void);/' "$BUILD/include/msm/msmsys.h" 2>/dev/null || true
+  #      MusyX's own two: synthdata.c:672 calls free() with no prototype in scope (the decomp's
+  #      own include/stdlib.h shadows the sysroot's and declares no free -> implicit int), and
+  #      reverb_fx.c:20 declares ReverbHIModify void against reverb.c:82's bool definition.
+  perl -0pi -e 's{\A(?!extern void free)}{extern void free(void *);\n}' "$BUILD/extern/musyx/src/musyx/runtime/synthdata.c" 2>/dev/null || true
+  perl -0pi -e 's/extern void ReverbHIModify\(/extern bool ReverbHIModify(/' "$BUILD/extern/musyx/src/musyx/runtime/StdReverb/reverb_fx.c" 2>/dev/null || true
+fi
 # 3. programmatic fixes for non-mwcc-path decomp bugs (transform staged copy only).
 #    ext_math.h: forward decl missing ';' inside the #ifndef __MWERKS__ branch.
 perl -0pi -e 's/(\bvoid\s+HuSetVecF\s*\([^;{]*\))\s*\n(\s*#endif)/$1;\n$2/g' \
@@ -557,6 +617,28 @@ for f in "$RECOMP"/shims/src/*.c; do compile_one "$f"; done
 compile_dir "$BUILD/src/game"
 compile_dir "$BUILD/src/dolphin"
 compile_dir "$BUILD/src/libhu"
+# [audio, RECOMP_MUSYX=1 — OPT-IN] the MusyX library + the game's msm wrappers. MUSY_TARGET=0
+# (=MUSY_TARGET_PC) is passed ONLY to these units, so the default build is bit-unaffected: it
+# selects hw_pc.c over hw_dolphin.c (which would otherwise drag in DSPInit/DSPAddTask and a
+# `while (!salDspInitIsDone)` spin that no interrupt can ever clear here) and drops the
+# dspSlave microcode blob. The unit list is extern/musyx/CMakeLists.txt's verbatim.
+if [ -n "${RECOMP_MUSYX:-}" ]; then
+  MUSYCF=(-DMUSY_TARGET=0)
+  musyx_ok=0
+  for f in $(find "$BUILD/extern/musyx/src/musyx/runtime" -name '*.c' 2>/dev/null); do
+    case "$f" in */profile.c) continue;; esac      # not in MusyX's CMakeLists (needs musyx_priv.h)
+    o="$BUILD/obj/$(printf '%s' "${f#$BUILD/}" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
+    if emcc "${CFLAGS[@]}" "${MUSYCF[@]}" "$f" -o "$o" 2>/tmp/ce_mx.txt; then ok=$((ok+1)); musyx_ok=$((musyx_ok+1));
+    else fail=$((fail+1)); echo "  musyx/$(basename "$f"): $(grep -m1 'error:' /tmp/ce_mx.txt | sed 's|.*error: ||')" >> "$BUILD/fails.txt"; fi
+  done
+  for f in "$BUILD"/src/msm/*.c; do
+    o="$BUILD/obj/$(printf '%s' "${f#$BUILD/}" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
+    if emcc "${CFLAGS[@]}" "${MUSYCF[@]}" "$f" -o "$o" 2>/tmp/ce_mx.txt; then ok=$((ok+1)); musyx_ok=$((musyx_ok+1));
+    else fail=$((fail+1)); echo "  msm/$(basename "$f"): $(grep -m1 'error:' /tmp/ce_mx.txt | sed 's|.*error: ||')" >> "$BUILD/fails.txt"; fi
+  done
+  echo "[recomp] RECOMP_MUSYX: $musyx_ok MusyX/msm objects built (COMPILE-ONLY — there is still"
+  echo "[recomp]   no PCM source: the DSP microcode mixer and the .msm endian swap are missing)"
+fi
 # [AOT-overlay, REL_ENDIANNESS_PLAN.md step 1] Compile the bootDll boot-logo overlay INTO the
 # DOL module (only its 3 units: executor.c shared prolog + bootDll/main.c + language.c). All 78
 # of bootDll's DOL calls bind by plain symbol name to functions already in the wasm, so this

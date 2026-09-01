@@ -478,6 +478,16 @@ function startServer() {
   // After PROBE_LOAD_STATE_MS (default 25000ms post-Start, enough for the core
   // to finish retro_load_game), fetch /__probe_state and restore it so the
   // probe measures GAMEPLAY rather than the boot decompressor.
+  //
+  // [restore proof 2026-09-01] "loaded N bytes" PROVED NOTHING: it only said the
+  // page handed the bytes to the worker, and the worker's ack fired on every
+  // failure path too, so a restore that never happened printed an identical line
+  // and the run silently measured the COLD BOOT (CLAUDE.md gate #10). Two
+  // independent proofs are wired up now:
+  //   1. the worker's own tri-state ack (needs the relinked worker_funcs.js —
+  //      absent on an older binary, in which case ok is 'unknown', never 'true')
+  //   2. PROBE_RESTORE_WITNESS=1, below: a page-side CoreTiming/guest-RAM
+  //      discontinuity witness that needs no worker cooperation at all.
   if (process.env.PROBE_LOAD_STATE) {
     const loadAt = parseInt(process.env.PROBE_LOAD_STATE_MS || '25000', 10);
     setTimeout(async () => {
@@ -487,12 +497,54 @@ function startServer() {
           const resp = await fetch('/__probe_state', { cache: 'no-store' });
           if (!resp.ok) return 'fetch-' + resp.status;
           const buf = new Uint8Array(await resp.arrayBuffer());
-          await window.__probeLoadStateFromGz(buf);
-          return 'loaded ' + buf.byteLength + ' bytes';
+          const ack = await window.__probeLoadStateFromGz(buf);
+          const ok = (ack && ack.ok !== undefined) ? String(ack.ok) : 'unknown(old worker build)';
+          window.__restoreAt = performance.now();
+          return 'handed ' + buf.byteLength + ' gz bytes to the worker; worker ack ok=' + ok;
         });
         console.log('[probe] PROBE_LOAD_STATE @' + loadAt + 'ms -> ' + r);
-      } catch (e) { console.log('[probe] PROBE_LOAD_STATE failed: ' + e.message); }
+      } catch (e) { console.log('[probe] PROBE_LOAD_STATE failed (restore did NOT happen): ' + e.message); }
     }, loadAt);
+  }
+
+  // ---- [restore witness] worker-independent proof that DoState really ran ---
+  // PROBE_RESTORE_WITNESS=1 samples, every 200ms:
+  //   * CoreTiming global_timer (SAB mirror 0x026B3424 lo / 0x026B3428 hi — the
+  //     same cell the [mips] meter calls "credited"). gamecube.html:6006-6010
+  //     records that a restore REPLACES this with the saved run's clock, so a
+  //     restore is a step discontinuity here, while normal execution is a smooth
+  //     monotone advance.
+  //   * a 512-word fingerprint spread across guest MEM1 (base @0x02500020) —
+  //     a restore rewrites the whole 24MB, so the changed-word fraction spikes.
+  // Neither reads a worker message, so this cannot be fooled by an ack that lies.
+  if (process.env.PROBE_RESTORE_WITNESS === '1') {
+    try {
+      await page.evaluate(() => {
+        window.__rw = { s: [], err: null };
+        let prevFp = null;
+        setInterval(() => {
+          try {
+            if (!window.sharedMemory) return;
+            const A = new Uint32Array(window.sharedMemory.buffer);
+            const m1 = A[0x02500020 >> 2] >>> 0;
+            const cred = (A[0x026B3424 >> 2] >>> 0) + (A[0x026B3428 >> 2] >>> 0) * 4294967296;
+            let changed = -1;
+            if (m1) {
+              // 512 words spread over the 24MB MEM1 image.
+              const fp = new Uint32Array(512);
+              const stride = (24 * 1024 * 1024 / 512) >>> 2;
+              for (let i = 0; i < 512; i++) fp[i] = A[((m1 >>> 2) + i * stride) >>> 0] >>> 0;
+              if (prevFp) { changed = 0; for (let i = 0; i < 512; i++) if (fp[i] !== prevFp[i]) changed++; }
+              prevFp = fp;
+            }
+            window.__rw.s.push({ t: performance.now(), cred: cred, ch: changed,
+                                 pe: A[0x026B0930 >> 2] >>> 0 });
+            if (window.__rw.s.length > 4000) window.__rw.s.shift();
+          } catch (e) { window.__rw.err = String(e && e.message || e); }
+        }, 200);
+      });
+      console.log('[probe] restore-witness: CoreTiming + MEM1-fingerprint sampler installed');
+    } catch (e) { console.error('[probe] restore-witness install failed: ' + e.message); }
   }
 
   // ---- save-state CREATION (make a menu checkpoint) -----------------------
@@ -1724,6 +1776,12 @@ function startServer() {
               }
               return dlN + '/' + dlA.toString(16) + '/' + dlS + '/[' + found.join(',') + ']';
             })(),
+            // [LEAF-INLINE 2026-09-01] pure-leaf `bl` splice census, written by
+            // JitWasm::TryCompileBlock: candidates / spliced / idle-classified /
+            // emitter-bailed, then the last idle-classified block's start_pc.
+            leafInline: (A[0x026B3B60 >> 2] >>> 0) + '/' + (A[0x026B3B64 >> 2] >>> 0)
+              + '/' + (A[0x026B3B68 >> 2] >>> 0) + '/' + (A[0x026B3B70 >> 2] >>> 0)
+              + ' lastIdlePc=' + (A[0x026B3B6C >> 2] >>> 0).toString(16),
             // [xf-word-loss PM37] producer first-word split: n(1.0) / n(0) / n(other) / lastOther
             // [m00-hunt PM37] runtime lanes at 0x800bb8f4: fbps1 / faps0 / result / hits
             xfi: (A[0x026B37B4 >> 2] >>> 0).toString(16) + '/'
@@ -2336,6 +2394,43 @@ function startServer() {
       emitArm(g.preUncap ? 'uncapped' : 'throttled', g.winStart, g.last);
     }
   } catch (e) { console.error('[guestclock] readout failed: ' + e.message); }
+
+  // ---- [restore witness] readout ------------------------------------------
+  if (process.env.PROBE_RESTORE_WITNESS === '1') {
+    try {
+      const rw = await page.evaluate(() => (window.__rw
+        ? { s: window.__rw.s, err: window.__rw.err, at: window.__restoreAt || null } : null));
+      if (!rw || !rw.s || rw.s.length < 3) {
+        console.log('[restore-witness] no samples' + (rw && rw.err ? ' err=' + rw.err : ''));
+      } else {
+        const s = rw.s;
+        let biggest = null, maxCh = null;
+        for (let i = 1; i < s.length; i++) {
+          const dc = s[i].cred - s[i - 1].cred;
+          // A restore is a step; normal execution advances ~4.86e8*dt cycles/s.
+          if (!biggest || Math.abs(dc) > Math.abs(biggest.dc)) biggest = { dc: dc, t: s[i].t, i: i };
+          if (s[i].ch >= 0 && (!maxCh || s[i].ch > maxCh.ch)) maxCh = { ch: s[i].ch, t: s[i].t };
+        }
+        // Typical per-200ms advance over the run, for scale.
+        const deltas = [];
+        for (let i = 1; i < s.length; i++) deltas.push(s[i].cred - s[i - 1].cred);
+        deltas.sort((a, b) => a - b);
+        const med = deltas[deltas.length >> 1];
+        console.log('[restore-witness] samples=' + s.length
+          + '  median d(global_timer)/200ms=' + med.toLocaleString()
+          + '  LARGEST step=' + (biggest ? biggest.dc.toLocaleString() : 'n/a')
+          + ' at t=' + (biggest ? (biggest.t / 1000).toFixed(2) : 'n/a') + 's'
+          + '  (=' + (biggest && med ? (biggest.dc / med).toFixed(1) : 'n/a') + 'x the median)');
+        console.log('[restore-witness] MEM1 fingerprint: max changed words in one 200ms tick = '
+          + (maxCh ? maxCh.ch : 'n/a') + '/512 at t=' + (maxCh ? (maxCh.t / 1000).toFixed(2) : 'n/a') + 's'
+          + (rw.at ? '   (page handed the state to the worker at t=' + (rw.at / 1000).toFixed(2) + 's)' : ''));
+        console.log('[restore-witness] VERDICT: '
+          + (biggest && med && Math.abs(biggest.dc) > 20 * Math.abs(med)
+             ? 'DISCONTINUITY PRESENT — CoreTiming was replaced, i.e. DoState ran'
+             : 'NO DISCONTINUITY — nothing replaced CoreTiming; treat any scene claim as UNPROVEN'));
+      }
+    } catch (e) { console.error('[restore-witness] readout failed: ' + e.message); }
+  }
 
   // ---- dump pc-sample histogram ------------------------------------------
   if (PC_SAMPLE) {
