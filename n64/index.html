@@ -6,6 +6,31 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <link rel="icon" href="data:,">
   <script src="/lib/wakelock.js"></script>
+  <!-- Shared capability layer. Same-origin (like /lib/wakelock.js above), so it does NOT
+       violate this page's self-hosting invariant: the rule is that nothing comes from a
+       CDN that a cross-origin-isolated origin would then block, and /lib/ is this origin.
+       Publishes window.__cap in the SAME shape on all three emulator pages, which is what
+       lets tools/device_matrix.mjs ask every page the same questions. Loaded before <base>
+       so its own absolute paths are unambiguous. -->
+  <script src="/lib/capability.js"></script>
+  <script>
+    // Same honest-failure contract as the sibling pages, with the spec that makes
+    // this the PORTABILITY REFERENCE: Capability.SPECS.n64 requires only
+    // WebAssembly and WebGL2 — no WebGPU, no SharedArrayBuffer, no cross-origin
+    // isolation, no worker. lib/capability.test.js asserts that it stays that
+    // way, so a later "helpful" addition of SAB to this spec fails the suite.
+    // In practice this page is gated only by a device with no WebGL2 at all,
+    // which is exactly the case its own diagnostics call "almost certainly the
+    // whole story". ?nogate=1 runs it anyway.
+    (function () {
+      if (!window.Capability) return;                       // never break the page
+      Capability.ready.then(function () {
+        function go() { Capability.autoGate(Capability.SPECS.n64); }
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', go);
+        else go();
+      });
+    })();
+  </script>
   <!-- All relative URLs (script.js -> input_controller.js -> n64wasm.js/.wasm chain,
        assets.zip XHR, ../roms/ ROM fetches) must resolve into the N64Wasm dist tree,
        so the document base points there. Every page-local reference below is absolute. -->
@@ -1864,7 +1889,7 @@ N64Rate.selfTest = function (logFn) {
   window.__n64Pace = function () {
     return {
       enabled: pacer.enabled, off: PACE_OFF, wired: paceWired,
-      maxPerTick: pacer.maxPerTick, duty: pacer.duty,
+      maxPerTick: pacer.maxPerTick, duty: pacer.duty, maxOwed: pacer.maxOwed,
       runMainLoop: !!(window.Module && window.Module._runMainLoop),
       viTotal: !!(window.Module && window.Module._neil_vi_total),
       arm: activeArm || null,

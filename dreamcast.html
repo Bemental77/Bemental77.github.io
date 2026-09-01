@@ -7,6 +7,30 @@
   <link rel="icon" href="data:,">
   <script src="/coi-serviceworker.js"></script>
   <script src="/lib/wakelock.js"></script>
+  <!-- Shared capability layer: publishes window.__cap in the same shape on all three
+       emulator pages so one rig (tools/device_matrix.mjs) can ask each of them the same
+       questions. The pinned-facts and share-sheet patterns in this file are what the
+       module generalises; it does not replace this page's own probeWebGL2 or its
+       [glinfo] pinning, which remain the authority on what the WORKER's context got. -->
+  <script src="/lib/capability.js"></script>
+  <script>
+    // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH. Gates BOTH Start
+    // controls (#btnStart and the mobile splash's #mobileSplashStart — the phone
+    // is where the original report came from) and raises a banner naming the
+    // missing capability and what the visitor can do about it.
+    // Spec: Capability.SPECS.dreamcast (lib/capability.js) — one place, shared
+    // with the self-test and tools/device_matrix.mjs so they cannot drift.
+    // This page needs WebGL2 rather than WebGPU, plus cross-origin isolation for
+    // the shared heap. ?nogate=1 runs it anyway.
+    (function () {
+      if (!window.Capability) return;                       // never break the page
+      Capability.ready.then(function () {
+        function go() { Capability.autoGate(Capability.SPECS.dreamcast); }
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', go);
+        else go();
+      });
+    })();
+  </script>
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd;
                  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
@@ -461,6 +485,146 @@
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // PROGRESS — "still working" vs "stopped", as a number instead of a guess.
+  //
+  // The reported symptom is a black screen. A black screen during a 1.13 GB
+  // download and a black screen from a wedged core are THE SAME PICTURE, and
+  // until now the page could not tell them apart either: `checkStall()` returns
+  // early while `!booted` (see the stall detector), so the whole window from
+  // Start to first frame — which is where the download lives — had no liveness
+  // signal at all. The only bounds in it were the 45 s worker-ready watchdog
+  // and the 120 s discReady ack; a download that simply stops delivering bytes
+  // hangs under both of them forever, with the status text frozen on
+  // "Track3.bin part 3/12" and nothing else on screen.
+  //
+  // So: one monotonic counter per phase, and a rule that it MUST advance.
+  //   * `seq` increases on every observed unit of progress, whatever the phase.
+  //     Flat `seq` + a phase that is supposed to be moving = stopped. That is
+  //     the whole booting-vs-broken test, and it is the same test on a phone,
+  //     in the diagnostics report and in the Node probe.
+  //   * `discBytes` is bytes actually delivered by the network, not parts
+  //     completed. At 100 MB per part the old granularity meant a phone showed
+  //     no motion for minutes at a time even when everything was fine.
+  // A canvas screenshot cannot distinguish these; a counter can, which is why
+  // the verdict is derived from the counter and never from the picture.
+  // ---------------------------------------------------------------------------
+  const PHASE_RULES = {
+    // phase           : [human label,                          ms of zero progress before it is called stopped]
+    'page-load':        ['loading the page',                     0],
+    'disc-fetch':       ['downloading the disc',                 45000],
+    'worker-wait':      ['waiting for the emulator runtime',     0],   // 45 s boot watchdog owns this
+    'disc-load':        ['opening the disc image',               0],   // 120 s discReady ack owns this
+    'audio-init':       ['starting audio',                       0],
+    // 12 s matches STALL_MS below. checkStall() owns the RUNNING banner and its
+    // three-way split (telemetry / video / distinct-frame); this budget only
+    // makes `liveness()` — which the diagnostics panel and the Node probe both
+    // read — agree with it instead of reporting "still working" over a corpse.
+    'running':          ['running',                              12000],
+  };
+  const PROG = {
+    phase: 'page-load',
+    phaseAt: T0,
+    seq: 0,                 // monotonic; any progress of any kind bumps it
+    lastAdvanceAt: T0,
+    discBytes: 0,           // monotonic across the whole disc, in bytes
+    discTotal: 0,           // 0 until the sizes are known
+    discFile: '',
+    discPart: 0, discParts: 0,
+    bps: 0,                 // bytes/s over the last sample window
+    _bpsAt: T0, _bpsBytes: 0,
+    stopped: '',            // set once, when a phase's no-progress budget is blown
+  };
+  function setPhase(name) {
+    if (PROG.phase === name) return;
+    PROG.phase = name;
+    PROG.phaseAt = Date.now();
+    PROG.lastAdvanceAt = Date.now();
+    PROG.seq++;
+    mark('phase:' + name);
+  }
+  function progress(bytes) {
+    const now = Date.now();
+    PROG.seq++;
+    PROG.lastAdvanceAt = now;
+    if (bytes) {
+      PROG.discBytes += bytes;
+      const dt = now - PROG._bpsAt;
+      if (dt >= 1000) {
+        PROG.bps = (PROG.discBytes - PROG._bpsBytes) * 1000 / dt;
+        PROG._bpsAt = now; PROG._bpsBytes = PROG.discBytes;
+      }
+    }
+  }
+  function mb(n) { return (n / 1048576).toFixed(0); }
+  function progressText() {
+    if (PROG.phase !== 'disc-fetch') return '';
+    const pct = PROG.discTotal ? ((PROG.discBytes / PROG.discTotal) * 100).toFixed(1) + '% · ' : '';
+    const rate = PROG.bps ? ' · ' + (PROG.bps / 1048576).toFixed(1) + ' MB/s' : '';
+    return pct + mb(PROG.discBytes) + (PROG.discTotal ? '/' + mb(PROG.discTotal) : '') + ' MB' + rate;
+  }
+  // The single question this file exists to answer, answered from the counter.
+  // 'booting' is a POSITIVE statement — something advanced recently — not the
+  // absence of an error.
+  function liveness() {
+    const now = Date.now();
+    const idle = now - PROG.lastAdvanceAt;
+    const rule = PHASE_RULES[PROG.phase] || ['(unknown phase)', 0];
+    if (PROG.stopped) return { state: 'stopped', idle: idle, why: PROG.stopped };
+    // A hard-stop panel on screen is a stop, full stop. Without this the
+    // --noswa arm produced a page showing "This page could not become
+    // cross-origin isolated" while its own report headline read "STILL WORKING,
+    // not stuck" — a direct contradiction on the screenshot the user is asked
+    // to send, and the exact class of wrong-optimistic verdict this counter
+    // exists to eliminate.
+    if (safe(() => fatalShown, false))
+      return { state: 'stopped', idle: idle,
+               why: 'the page stopped with an error panel — read the panel title' };
+    // "running" requires RECENT progress, not a stale high-water mark. lastCalls
+    // keeps its last value forever once telemetry stops, so testing it alone
+    // reports a wedged emulator as healthy — which is the exact failure this
+    // whole instrument exists to catch.
+    if (safe(() => booted, false) && safe(() => lastCalls, 0) > 0 && idle <= (rule[1] || 12000))
+      return { state: 'running', idle: idle, why: 'frames are flowing (' +
+               safe(() => lastFps, 0) + ' fps, ' + safe(() => lastCalls, 0) + ' fields/s)' };
+    if (rule[1] && idle > rule[1])
+      return { state: 'stopped', idle: idle,
+               why: 'no progress for ' + Math.round(idle / 1000) + 's while ' + rule[0] };
+    return { state: 'booting', idle: idle,
+             why: rule[0] + (progressText() ? ' — ' + progressText() : '') +
+                  ' (last progress ' + (idle / 1000).toFixed(1) + 's ago)' };
+  }
+  // Machine-readable snapshot. The Node probe polls this instead of screenshotting
+  // the canvas: a wedged run still screenshots a plausible frame, and a booting
+  // run screenshots black — the picture is not evidence either way, the counter is.
+  window.__dcProbe = function () {
+    const L = liveness();
+    return {
+      t: Date.now() - T0,
+      phase: PROG.phase, phaseMs: Date.now() - PROG.phaseAt,
+      seq: PROG.seq, idleMs: L.idle, live: L.state, why: L.why,
+      discBytes: PROG.discBytes, discTotal: PROG.discTotal,
+      discFile: PROG.discFile, discPart: PROG.discPart, discParts: PROG.discParts,
+      bps: Math.round(PROG.bps),
+      booted: safe(() => booted, false),
+      fps: safe(() => lastFps, 0), fields: safe(() => lastCalls, 0),
+      iters: safe(() => lastIps, 0), pc: safe(() => lastPc, 0),
+      guestX: safe(() => guestRateX(), 0),
+      framesEver: safe(() => framesEverFlowed, false),
+      distinctEver: safe(() => distinctEverFlowed, false),
+      coi: !!self.crossOriginIsolated,
+      sab: (typeof SharedArrayBuffer === 'function'),
+      offscreen: HAS_OFFSCREEN,
+      webgl2: !!(GLPROBE && GLPROBE.ok),
+      stencil: safe(() => stencilVerdict(), { known: false }),
+      heap: { init: memInfo.initMB, max: memInfo.gotMaxMB, reduced: memInfo.reduced, err: memInfo.err },
+      counters: Object.assign({}, counters),
+      fatal: safe(() => fatalShown, false),
+      headline: safe(() => headline(), '(headline threw)'),
+      marks: marks.map((m) => m.t + 'ms ' + m.name),
+    };
+  };
+
   function renderMobileLog() {
     const body = document.getElementById('mobileLogBody');
     if (body) {
@@ -684,7 +848,17 @@
     if (facts.coreError)  return 'THE EMULATOR CORE NEVER STARTED — ' + facts.coreError;
     if (facts.glNull)     return 'THE WORKER COULD NOT GET A WEBGL2 CONTEXT — nothing can render.';
     if (counters.glContextLost) return 'THE GPU DROPPED THE GRAPHICS CONTEXT — Flycast does not rebuild its GL objects, so the picture cannot come back without a reload.';
-    if (!g.ok && !/skipped/.test(g.err || '')) return 'THIS DEVICE HAS NO USABLE WEBGL2 — ' + (g.err || 'unknown');
+    // NOTE the ordering. facts.glNull / glContextLost / incompleteFBO above are
+    // reports from the WORKER'S context — the one that actually renders — and
+    // they outrank everything, because a lost context keeps `calls` ticking
+    // while the picture is black. This next one is the PAGE'S probe, a
+    // different context in a different realm, and it can be wrong: measured
+    // 2026-09-01 under Chrome's --disable-3d-apis, the page probe returned null
+    // while the worker rendered PSO at 30 fps, and this line still announced
+    // "THIS DEVICE HAS NO USABLE WEBGL2" over a working picture. So it yields
+    // to demonstrated frames.
+    if (!g.ok && !/skipped/.test(g.err || '') && !(safe(() => lastCalls, 0) > 0))
+      return 'THIS DEVICE HAS NO USABLE WEBGL2 — ' + (g.err || 'unknown');
     if (st.known && !st.on) return 'STENCIL WAS NOT GRANTED (per the ' + st.src + '). Flycast drives modifier volumes entirely through the stencil buffer and the black-out quad paints the WHOLE FRAME when the plane is missing. This is the prime suspect for a black picture with correct-looking telemetry.';
     if (g.ok && g.fboD24S8 !== 'COMPLETE' && g.fboD32FS8 !== 'COMPLETE')
       return 'THIS GPU COMPLETES NEITHER DEPTH-STENCIL FORMAT (depth24_stencil8=' + g.fboD24S8 +
@@ -706,8 +880,16 @@
     // picture is moving, the boot demonstrably finished.
     if (safe(() => lastCalls, 0) > 0)
       return 'Nothing anomalous detected — the emulator is running and producing frames.';
-    if (!safe(() => booted, false))
-      return 'The boot did not finish. Last stage reached: ' + ((marks[marks.length - 1] || {}).name || '?');
+    if (!safe(() => booted, false)) {
+      // "did not finish" used to be the end of it, which reads as a failure even
+      // when the page is simply mid-download. Say which one, from the counter.
+      const L = safe(() => liveness(), { state: '?', why: '' });
+      const stage = ((marks[marks.length - 1] || {}).name || '?');
+      if (L.state === 'stopped')
+        return 'THE BOOT STOPPED — ' + L.why + '. Last stage reached: ' + stage + '.';
+      return 'STILL WORKING, not stuck — ' + L.why + '. Last stage reached: ' + stage +
+             '. Nothing has failed; it has not finished yet.';
+    }
     return 'The emulator started but has never produced a frame.';
   }
   // Which depth-stencil format Flycast will select on THIS device — see the
@@ -727,8 +909,10 @@
     const g = GLPROBE || {};
     const push = (n, v, c) => rows.push([n, String(v), c || '']);
 
+    // "still working" is not a fault; painting it red made every screenshot
+    // taken mid-download look like a crash report.
     push('LIKELY CAUSE', headline(),
-         /^Nothing anomalous/.test(headline()) ? 'good' : 'bad');
+         /^(Nothing anomalous|STILL WORKING)/.test(headline()) ? 'good' : 'bad');
     // Always present, from whichever source has it — see stencilVerdict().
     const st = stencilVerdict();
     push('stencil granted', st.known
@@ -761,6 +945,21 @@
          self.crossOriginIsolated ? 'good' : 'bad');
     const last = marks[marks.length - 1] || { name: '?', t: 0 };
     push('boot reached', last.name + ' at +' + (last.t / 1000).toFixed(1) + 's  (' + marks.length + ' stages)');
+    // STILL WORKING vs STOPPED. "boot reached" above says where it got to; it
+    // cannot say whether it is still getting anywhere, and that is the whole
+    // difference between a slow phone and a broken one. Derived from the
+    // monotonic counter, never from the picture.
+    {
+      const L = safe(() => liveness(), { state: '?', why: 'liveness() threw', idle: 0 });
+      push('still working?',
+           (L.state === 'stopped' ? 'NO — ' : L.state === 'running' ? 'yes — ' : 'yes, still working — ') + L.why +
+           '   [seq=' + PROG.seq + ' phase=' + PROG.phase + ']',
+           L.state === 'stopped' ? 'bad' : 'good');
+      if (PROG.discTotal || PROG.discBytes)
+        push('disc downloaded', progressText() ||
+             (mb(PROG.discBytes) + '/' + mb(PROG.discTotal) + ' MB'),
+             PROG.discTotal && PROG.discBytes >= PROG.discTotal ? 'good' : 'warn');
+    }
     push('frames', frameSummary(), safe(() => lastCalls, 0) > 0 ? 'good' : 'warn');
     if (facts.coreError) push('core startup', facts.coreError, 'bad');
     if (facts.memoryPressure) push('memory pressure', facts.memoryPressure, 'bad');
@@ -1089,17 +1288,26 @@
     try { window.name = COI_NAME_PREFIX + v; } catch (_) {}
   }
   if (!self.crossOriginIsolated) {
+    const MAX_COI_RELOADS = 3;
+    // `tries` counts NON-ISOLATED LOADS, so the give-up load is the 4th and the
+    // old line printed "reload attempt 4 of 3" on the very panel the user is
+    // asked to screenshot. Measured 2026-09-01 in the --noswa arm.
     const tries = (parseInt(ssGet(COI_KEY) || '0', 10) || 0) + 1;
     ssSet(COI_KEY, String(tries));
-    pageLog('[coi] not cross-origin isolated — reload attempt ' + tries + ' of 3');
-    if (tries > 3) {
+    if (tries > MAX_COI_RELOADS) {
+      pageLog('[coi] not cross-origin isolated after ' + MAX_COI_RELOADS + ' reloads — giving up');
       setStatus('Cross-origin isolation could not be enabled.');
+      // Also record it structurally: the pre-boot liveness check and the report
+      // headline both have to know this is a HARD STOP, not a slow start.
+      PROG.stopped = 'this page never became cross-origin isolated, so SharedArrayBuffer ' +
+                     'is unavailable and the emulator cannot start';
       showFatal('This page could not become cross-origin isolated', [
-        'The emulator needs SharedArrayBuffer, which requires COOP/COEP headers. /coi-serviceworker.js installs them on first load — after ' + (tries - 1) + ' reloads it still has not taken effect.',
+        'The emulator needs SharedArrayBuffer, which requires COOP/COEP headers. /coi-serviceworker.js installs them on first load — after ' + MAX_COI_RELOADS + ' reloads it still has not taken effect.',
         'Usual causes: a private / incognito window (service workers are blocked there), a content blocker or extension, or service workers turned off in settings.',
       ], 'Open the page in a normal window, or reload once more.');
       return;
     }
+    pageLog('[coi] not cross-origin isolated — reload ' + tries + ' of ' + MAX_COI_RELOADS);
     setStatus('Initializing... (page will reload once)');
     setTimeout(() => {
       // replace(), not reload(): a loop that stacks history entries traps the
@@ -1448,6 +1656,23 @@
           showAlert('GPU CONTEXT LOST — the picture is gone until you reload');
           showToast('GPU context lost — reload the page', false);
         }
+        // A NULL context is the terminal case: the worker asked for WebGL2 and
+        // the device said no, so there is no renderer and there never will be.
+        // It was SNIFFED into facts.glNull and reached the headline — but only
+        // for someone who thinks to open the diagnostics panel. On screen it
+        // was a black canvas behind a UI that still looked alive, which is the
+        // exact failure this page is not allowed to have. Hard stop, named.
+        if (d.txt && d.txt.indexOf('returned NULL') >= 0) {
+          PROG.stopped = 'the emulator could not get a WebGL2 context from this device — ' +
+                         'there is no renderer, so nothing can ever appear';
+          setStatus('This device would not give the emulator a WebGL2 context.');
+          showFatal('This device would not give the emulator a graphics context', [
+            d.txt,
+            'The emulator renders WebGL2 from its worker thread. Without a context there is ' +
+            'nothing to draw into, so the picture would stay black no matter how long it runs.',
+          ], 'On iPhone and iPad this needs iOS 17 or newer. If hardware acceleration is turned ' +
+             'off in the browser’s settings, turning it back on may fix it.');
+        }
         // A framebuffer the driver refuses to complete is a renderer that draws
         // into nothing. Count is pinned; say it once, loudly, on the first one.
         if (d.txt && d.txt.indexOf('INCOMPLETE framebuffer') >= 0 && (counters.incompleteFBO | 0) === 1) {
@@ -1661,6 +1886,12 @@
         // that is running but producing nothing still reads > 0 — which is why
         // the detector below watches BOTH this and `fps`.
         lastTelemetryAt = Date.now();
+        // Same event feeds the monotonic progress counter, so `seq` means the
+        // SAME THING in every phase: "something advanced". Without this the
+        // counter went flat the instant the download finished and a running
+        // emulator was indistinguishable from a dead one by the one instrument
+        // that exists to tell them apart.
+        progress(0);
         if (d.calls > 0) {
           if (!framesEverFlowed) { framesEverFlowed = true; mark('first-video-callback'); }
           lastCallsAt = Date.now();
@@ -1911,18 +2142,110 @@
     const head = new TextDecoder().decode(new Uint8Array(ab, 0, Math.min(24, ab.byteLength)));
     return head.startsWith('version https://git-lfs');
   }
-  async function fetchDiscBlob(url) {
+  // Read one response body, counting bytes as they land.
+  //
+  // `await response.arrayBuffer()` was one opaque await per 100 MB part: no
+  // byte counter, no rate, and — the part that matters — NO WAY TO TELL A SLOW
+  // DOWNLOAD FROM A DEAD ONE. A phone whose connection drops mid-part sits on
+  // that await forever; there is no fetch timeout in the platform, the promise
+  // simply never settles. That is one of the two shapes of "it freezes on a
+  // black screen", and it was completely unreported.
+  //
+  // Streaming the body gives both: `progress(n)` advances the monotonic counter
+  // on every chunk (so `liveness()` can say "booting" with evidence), and a
+  // watchdog fires when NO chunk has arrived for NO_CHUNK_MS. The watchdog is
+  // on inter-chunk silence, not on total time: a genuinely slow phone that is
+  // still receiving must never be killed.
+  //
+  // `r.body` is a ReadableStream everywhere this page can run at all (the
+  // OffscreenCanvas+WebGL2 gate above already requires iOS 17+), but the
+  // non-streaming fallback is kept because losing the byte counter is much
+  // better than losing the download.
+  // Inter-chunk silence budget. ?netgrace=<seconds> (10..300) widens it for a
+  // genuinely awful connection — and lets the failure path itself be tested,
+  // which is the only reason it is reachable from the URL: an untested error
+  // handler is not a safety net.
+  const NO_CHUNK_MS = clampMB(QS.get('netgrace'), 10, 300, 45) * 1000;
+  async function readBody(r, url, sink) {
+    if (!r.body || typeof r.body.getReader !== 'function') {
+      const ab = await r.arrayBuffer();
+      progress(ab.byteLength);
+      if (sink) { sink(new Uint8Array(ab)); return ab.byteLength; }
+      return ab;
+    }
+    const reader = r.body.getReader();
+    const chunks = sink ? null : [];
+    let got = 0;
+    for (;;) {
+      let res;
+      // Race the read against silence. On timeout the reader is cancelled so
+      // the connection is not left dangling behind a rejected promise.
+      let timer = 0;
+      const silence = new Promise((_, rej) => {
+        timer = setTimeout(() => rej(new Error(
+          'the download of ' + url + ' delivered nothing for ' + (NO_CHUNK_MS / 1000) +
+          's (' + mb(got) + ' MB of this part had arrived). The connection stopped ' +
+          'responding — this is a network failure, not an emulator failure.')), NO_CHUNK_MS);
+      });
+      try {
+        res = await Promise.race([reader.read(), silence]);
+      } catch (e) {
+        try { await reader.cancel(); } catch (_) {}
+        PROG.stopped = 'disc download stalled: ' + (e && e.message ? e.message : String(e));
+        throw e;
+      } finally { clearTimeout(timer); }
+      if (res.done) break;
+      const v = res.value;
+      got += v.byteLength;
+      progress(v.byteLength);
+      if (sink) sink(v); else chunks.push(v);
+      if (PROG.discTotal) setStatus(PROG.discFile + ' ' + progressText());
+    }
+    if (sink) return got;
+    const out = new Uint8Array(got);
+    let w = 0;
+    for (const c of chunks) { out.set(c, w); w += c.byteLength; }
+    return out.buffer;
+  }
+  async function fetchDiscBlob(url, countTotal) {
     let r = await fetch(url);
     if (!r.ok) throw new Error('fetch ' + url + ' -> ' + r.status);
-    let ab = await r.arrayBuffer();
+    if (countTotal) {
+      const cl = parseInt(r.headers.get('content-length') || '0', 10);
+      if (cl > 0) PROG.discTotal += cl;
+    }
+    let ab = await readBody(r, url, null);
     if (looksLikeLfsPointer(ab)) {
       pageLog('[page] ' + url + ' came back as a stale LFS pointer (' + ab.byteLength + ' B) — refetching past the cache');
       r = await fetch(url + '?cb=' + Date.now(), { cache: 'reload' });
       if (!r.ok) throw new Error('refetch ' + url + ' -> ' + r.status);
-      ab = await r.arrayBuffer();
+      ab = await readBody(r, url, null);
       if (looksLikeLfsPointer(ab)) throw new Error(url + ' serves an LFS pointer even uncached — deploy is broken');
     }
     return ab;
+  }
+  // Stream one part STRAIGHT INTO the destination buffer at `off`. Saves the
+  // transient per-part 100 MB ArrayBuffer on top of the 1.13 GB destination —
+  // which on a memory-constrained device is the difference between fitting and
+  // not. Returns bytes written. Overrun is checked per chunk, not per part, so
+  // a server that hands back more than it declared cannot scribble past the end.
+  async function fetchDiscInto(url, out, off, limit) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('fetch ' + url + ' -> ' + r.status);
+    // A 133 B LFS pointer would stream in as a 133 B part. The assembled-size
+    // check downstream catches it, but naming it here keeps the old diagnosis.
+    let w = off;
+    const n = await readBody(r, url, (chunk) => {
+      if (w + chunk.byteLength > limit)
+        throw new Error(url + ' overruns the declared disc size at byte ' + w);
+      out.set(chunk, w); w += chunk.byteLength;
+    });
+    if (n < 512) {
+      const head = new TextDecoder().decode(out.subarray(off, off + Math.min(24, n)));
+      if (head.startsWith('version https://git-lfs'))
+        throw new Error(url + ' is a Git-LFS pointer (' + n + ' B), not disc content — the deploy is broken');
+    }
+    return n;
   }
   // ---------------------------------------------------------------------------
   // Lazy disc (?lazydisc=1) — OPT-IN, eager stays the default.
@@ -1973,10 +2296,14 @@
   }
 
   // Returns true if the file was handed to the worker lazily.
-  async function tryPostLazy(file, base) {
-    if (!file.parts || !QS.has('lazydisc')) return false;
+  // `why` is 'requested' for ?lazydisc=1, or 'fallback' when the eager buffer
+  // was refused outright — in the fallback case there is nothing to lose by
+  // trying, because the alternative is a hard stop.
+  async function tryPostLazy(file, base, why) {
+    if (!file.parts) return false;
+    if (why !== 'fallback' && !QS.has('lazydisc')) return false;
     if (!caps.lazyDisc) {
-      pageLog('[lazydisc] requested, but this worker shim has no discLazy handler — using the eager path');
+      pageLog('[lazydisc] ' + (why || 'requested') + ', but this worker shim has no discLazy handler — using the eager path');
       return false;
     }
     let pre;
@@ -1996,11 +2323,16 @@
                          cacheMB: cacheMB, readahead: readahead });
     pageLog('[lazydisc] streaming ' + file.name + ' (' + pre.total + ' B over ' +
             pre.parts.length + ' verified parts, ' + cacheMB + ' MB cache, readahead ' + readahead + ')');
+    // This file will NOT be downloaded up front, so it must leave the progress
+    // denominator — otherwise a lazy boot reads "16/1147 MB" forever and looks
+    // like a download that died at 1%.
+    if (file.bytes) PROG.discTotal = Math.max(0, PROG.discTotal - file.bytes);
     return true;
   }
 
   async function fetchAndPostFile(file, base, cuePath) {
-    if (await tryPostLazy(file, base)) return;
+    if (await tryPostLazy(file, base, 'requested')) return;
+    PROG.discFile = file.name;
     let buf;
     if (file.parts) {
       const parts = file.parts.map(p => base + p);
@@ -2022,25 +2354,39 @@
           const why = (e && e.message) ? e.message : String(e);
           bump('memoryPressureLines');
           facts.memoryPressure = 'disc buffer ' + file.bytes + ' B refused: ' + why;
+          mark('disc-alloc-refused');
+          // DEGRADE, DO NOT DIE. Telling a phone user to retype the address
+          // with ?lazydisc=1 is not a fallback — it is a dead end with a
+          // footnote, and this is the single most likely place a 4 GB iPhone
+          // loses. The streaming path needs ~16 MB instead of 1,131 MB and is
+          // verified to boot PSO to 30 fps on this rig, so take it
+          // automatically when the eager buffer is refused outright.
+          //
+          // This does NOT make lazy the default (see the opt-in note above and
+          // the do-not-retry registry): it is reached only after the eager path
+          // has already failed, where the alternative is a hard stop.
+          pageLog('[lazydisc] the eager ' + (file.bytes / 1048576).toFixed(0) +
+                  ' MB buffer was REFUSED (' + why + ') — falling back to streaming');
+          setStatus('Not enough memory for the whole disc — switching to streaming...');
+          if (await tryPostLazy(file, base, 'fallback')) {
+            pageLog('[lazydisc] fallback succeeded — the disc will stream instead');
+            return;
+          }
           throw new Error('this device refused a ' + (file.bytes / 1048576).toFixed(0) +
-            ' MB buffer for ' + file.name + ' (' + why + '). The whole disc is loaded into ' +
-            'memory by default. Add ?lazydisc=1 to the end of the address to stream it ' +
-            'instead — the worker shim on this deploy supports it (caps.lazyDisc=' +
-            caps.lazyDisc + ').');
+            ' MB buffer for ' + file.name + ' (' + why + '), and the streaming fallback ' +
+            'could not be used either (worker supports it: ' + caps.lazyDisc + '). ' +
+            'The whole disc is loaded into memory by default; streaming needs the server ' +
+            'to answer HTTP Range requests with 206.');
         }
         for (let i = 0; i < parts.length; i++) {
-          setStatus(file.name + ' part ' + (i + 1) + '/' + parts.length);
-          const ab = await fetchDiscBlob(parts[i]);
-          if (off + ab.byteLength > file.bytes) {
-            throw new Error(file.name + ' overruns its declared size at part ' + (i + 1) +
-                            ' (' + (off + ab.byteLength) + ' > ' + file.bytes + ')');
-          }
-          out.set(new Uint8Array(ab), off);
-          off += ab.byteLength;
+          PROG.discPart = i + 1; PROG.discParts = parts.length;
+          setStatus(file.name + ' ' + progressText());
+          off += await fetchDiscInto(parts[i], out, off, file.bytes);
         }
       } else {
         const bufs = [];
         for (let i = 0; i < parts.length; i++) {
+          PROG.discPart = i + 1; PROG.discParts = parts.length;
           setStatus(file.name + ' part ' + (i + 1) + '/' + parts.length);
           const ab = await fetchDiscBlob(parts[i]);
           bufs.push(new Uint8Array(ab));
@@ -2058,7 +2404,12 @@
       buf = out.buffer;
     } else {
       setStatus('Fetching ' + file.name);
-      buf = await fetchDiscBlob(base + file.name);
+      // Un-split files (Track1/Track2/the cue) have no declared `bytes`, so they
+      // are not in the denominator PROG.discTotal was seeded with — but their
+      // bytes DO land in the numerator, which read 1147/1131 MB = 101.5% on the
+      // first run of this instrument. Learn the size from the response and add
+      // it, so the percentage is of what will actually be downloaded.
+      buf = await fetchDiscBlob(base + file.name, true);
     }
     // Post only once the worker runtime is up. The old flow posted while the
     // worker was still importScripts-ing its 423KB glue; on the deployed site
@@ -2089,6 +2440,11 @@
     $('btnStart').disabled = true;
     setStatus('Loading ' + game.name + '...');
     mark('start-pressed');
+    // The denominator for every progress readout from here on. `bytes` is the
+    // authoritative assembled size for a split file; un-split files are small
+    // enough that their absence from the total does not move the percentage.
+    PROG.discTotal = game.files.reduce((n, f) => n + (f.bytes || 0), 0);
+    setPhase('disc-fetch');
     try {
       // Kick the boot seed off alongside the disc stream so it is in hand by
       // the time the first frame lands. Nothing awaits it here — the boot is
@@ -2101,9 +2457,11 @@
         mark('disc-file-sent:' + f.name);
       }
       // 2. Wait for worker if it isn't ready yet (usually instant on warm load).
+      setPhase('worker-wait');
       setStatus('Waiting for emulator runtime...');
       await workerReadyPromise;
       // 3. Tell the worker to load the disc and wait for ack.
+      setPhase('disc-load');
       setStatus('Loading disc image...');
       mark('discReady-sent');
       // BOUNDED. This promise had no timeout: if the worker never posted
@@ -2128,8 +2486,10 @@
       // 4. Audio + run loop. The WORKER owns the run loop (free-run pump,
       //    charter Phase 2.2) so guest progress is decoupled from page vsync
       //    and survives tab backgrounding; the rAF loop below only ships input.
+      setPhase('audio-init');
       await initAudio();
       booted = true;
+      setPhase('running');
       mark('booted');
       rebaseStallClocks();   // arm the stall detector from here, not from page load
       [$('btnReset'), $('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull')]
@@ -2722,11 +3082,40 @@
   function rebaseStallClocks() {
     const now = Date.now();
     lastTelemetryAt = lastCallsAt = lastDistinctAt = now;
+    // The pre-boot watchdog measures the same kind of silence and is fooled the
+    // same way: iOS suspends a backgrounded tab's fetches, so time spent hidden
+    // must not count as a stalled download.
+    PROG.lastAdvanceAt = now;
   }
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) rebaseStallClocks();
   });
+  // Pre-boot half of the stall detector. Everything below this covers a RUNNING
+  // emulator; the window from Start to first frame — which is where a 1.13 GB
+  // download lives — had no liveness check at all, so a dead download was
+  // indistinguishable from a slow one and both looked like "it froze on black".
+  // Reported once, from the counter, naming the phase and what to do.
+  let preBootStopReported = false;
+  function checkPreBootStall() {
+    if (booted || document.hidden || preBootStopReported) return;
+    if (PROG.phase === 'page-load') return;   // nothing has been asked for yet
+    const L = liveness();
+    if (L.state !== 'stopped') return;
+    preBootStopReported = true;
+    bump('stall');
+    facts.stall = 'pre-boot ' + PROG.phase + ': ' + L.why;
+    pageLog('[stall] ' + L.why);
+    setStatus('Stopped while ' + (PHASE_RULES[PROG.phase] || ['?'])[0] + '.');
+    showFatal('The download stopped', [
+      L.why,
+      'The disc is ' + mb(PROG.discTotal) + ' MB and is downloaded in full before the game ' +
+      'starts. ' + mb(PROG.discBytes) + ' MB had arrived when it stopped.',
+    ], 'Check the connection and reload. On a slow or metered connection, add ?lazydisc=1 to ' +
+       'the end of the address — it streams the disc instead of downloading all of it first.');
+  }
+
   function checkStall() {
+    checkPreBootStall();
     if (!booted || document.hidden) return;
     const now = Date.now();
     let state = '';

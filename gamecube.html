@@ -7,6 +7,40 @@
   <link rel="icon" href="data:,">
   <script src="/coi-serviceworker.js"></script>
   <script src="/lib/wakelock.js"></script>
+  <!-- Shared capability layer: publishes window.__cap in the same shape on all three
+       emulator pages so one rig (tools/device_matrix.mjs) can ask each of them the same
+       questions. Every field is the RESULT OF DOING THE THING — this page's own probe at
+       :1409 already learned that lesson for WebGPU; the module generalises it and adds
+       the functional SAB/worker test. Does not replace __gcGpu, which stays the page's
+       own render-path authority. -->
+  <script src="/lib/capability.js"></script>
+  <script>
+    // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH.
+    // Measured on a desktop profile with no WebGPU adapter: this page logged
+    // `[gpu] render: SOFTWARE — NO WebGPU ⚠` correctly and then left Start
+    // ENABLED; clicking it produced `canvas pixels: 0,0,0 (1 distinct)` — a
+    // solid black screen with no explanation. The badge was right and the button
+    // disagreed with it. autoGate makes the button follow the badge: it disables
+    // BOTH Start controls (#btnStart and the mobile splash's #mobileSplashStart)
+    // and raises a banner naming the missing capability and what to do about it.
+    //
+    // THE SPEC LIVES IN ONE PLACE: Capability.SPECS.gamecube (lib/capability.js).
+    // `webgpu: 'required'` is the honest description of this build TODAY, because
+    // Dolphin's software fallback does not produce a picture here. If the
+    // software-render path is made to work, change that ONE word to 'degraded'
+    // and the page downgrades from "blocked" to "expect reduced quality" —
+    // banner, gate, report and the device matrix all follow automatically.
+    //
+    // ?nogate=1 runs it anyway (and the banner's "Try anyway" button sets it).
+    (function () {
+      if (!window.Capability) return;                       // never break the page
+      Capability.ready.then(function () {
+        function go() { Capability.autoGate(Capability.SPECS.gamecube); }
+        if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', go);
+        else go();
+      });
+    })();
+  </script>
   <style>
     html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { overflow: hidden; }
@@ -1402,6 +1436,8 @@ window.GcRate = (function () {
     webgl2: null,        // GPU identity even when WebGPU is absent
     backend: null,       // 'WGPU' | 'Software Renderer' | 'OGL/WebGL2' — what var_setup selected
     present: null,       // 'sab-present (WGPU)' | 'postMessage 2D (Software)' — what actually painted
+    deviceLost: null,    // {reason, message} once GPUDevice.lost resolves — see PRESENT-PATH LIVENESS
+    gpuErrors: 0,        // count of uncaptured WebGPU errors on the page's device
     startedAt: Date.now()
   };
   // A device is not the same as a presentable context: Chrome's "Failed to
@@ -1429,6 +1465,28 @@ window.GcRate = (function () {
       if (!dev) { o.err = 'adapter.requestDevice() resolved null — adapter present but no device'; return o; }
       o.device = true;
       window.__gcWgpuDevice = dev;   // held, exactly as the old Start-click probe held it
+      // A GPUDevice can die at any moment (GPU process crash, driver reset/TDR, sleep-wake).
+      // Nothing in this page used to observe that, so the badge kept vouching for "WebGPU ✓"
+      // over a frozen picture. This device is the PAGE's, not the worker's — see the
+      // PRESENT-PATH LIVENESS block for why that makes it necessary but not sufficient —
+      // but when it fires it is a definite, nameable cause, so it wins over the seqlock
+      // watchdog's more generic "something upstream stopped".
+      try {
+        dev.lost.then(function (info) {
+          window.__gcGpu.deviceLost = { reason: (info && info.reason) || 'unknown',
+                                        message: (info && info.message) || '' };
+          pageLog('[gpu] WebGPU DEVICE LOST: ' + window.__gcGpu.deviceLost.reason
+                  + ' — ' + window.__gcGpu.deviceLost.message);
+          gcRenderBadge();
+        });
+      } catch (e) {}
+      // Validation/OOM errors on this device were silently swallowed. Surface them; they are
+      // the breadcrumb that explains a subsequent loss.
+      try { dev.onuncapturederror = function (ev) {
+        var m = (ev && ev.error && ev.error.message) || String(ev);
+        window.__gcGpu.gpuErrors = (window.__gcGpu.gpuErrors || 0) + 1;
+        if (window.__gcGpu.gpuErrors <= 5) pageLog('[gpu] uncaptured WebGPU error: ' + m);
+      }; } catch (e) {}
       o.format = gcSafe(function () { return navigator.gpu.getPreferredCanvasFormat(); }, '?');
       var c = document.createElement('canvas'); c.width = c.height = 1;
       o.canvasCtx = !!gcSafe(function () { return c.getContext('webgpu'); }, null);
@@ -1465,6 +1523,82 @@ window.GcRate = (function () {
   // is the same pair WGPUGfx makes on the proxied pthread, and the page and the
   // worker share one GPU process, so this predicts the worker's outcome.
   function gcWgpuOk() { var w = window.__gcGpu.webgpu; return !!(w && w.adapter && w.device); }
+  // ===========================================================================
+  // PRESENT-PATH LIVENESS — [2026-09-01]
+  //
+  // THE HOLE THIS FILLS. gcRenderVerdict answered exactly one question — "could
+  // this browser acquire a WebGPU device AT PAGE LOAD?" — and gcRenderBadge was
+  // called only from one-shot events (probe resolve, page load, first frame).
+  // Nothing ever re-evaluated it. So a device that dies at t=90s (GPU process
+  // crash, driver reset, sleep/wake, TDR) left the badge reading "render:
+  // WebGPU ✓" over a frozen picture, forever. That is the page ASSERTING a fast
+  // path that is no longer running — the same failure the no-WebGPU black
+  // rectangle has, except worse, because here the page actively vouches for it.
+  //
+  // WHY THE SEQLOCK IS THE WITNESS AND THE DEVICE IS NOT. The page's probe holds
+  // its own GPUDevice (__gcWgpuDevice, above) but the WGPU backend runs in the
+  // worker and requests a SEPARATE device. They die together only when the whole
+  // GPU process goes; a worker-side wedge, a WGPUGfx stall or a dead CPU thread
+  // kills publishing while the page's spare device stays perfectly healthy. So
+  // device.lost is necessary but NOT sufficient. The authoritative "is the WebGPU
+  // path alive RIGHT NOW" signal is the one thing that is true only when frames
+  // are really arriving: the publish seqlock at 0x026B3518 advancing, stamped by
+  // _sabPresentTick into _presentLastMs on every frame it actually paints.
+  // Both are wired: device.lost names the cause when it IS a device loss;
+  // the seqlock stamp catches every other way the picture can stop.
+  //
+  // WHY IT IS A PURE FUNCTION. gcPresentHealth takes a plain state object and
+  // returns a verdict, so ?ratetest=1 can drive every branch — stall, boot
+  // timeout, device loss, hidden-tab suppression — with no GPU, no worker and
+  // no emulator. See tests 80-88 in gcRenderTests().
+  // ===========================================================================
+  var GC_PRESENT_BOOT_MS  = 60000;  // Start -> first frame. PSO's cold boot is genuinely long.
+  var GC_PRESENT_STALL_MS = 5000;   // frames were arriving, then stopped. At 30-60fps this is unambiguous.
+  // Pure. `s` = { started, wgpuOk, deviceLost, everPainted, msSinceStart, msSincePaint, hidden }
+  function gcPresentHealth(s) {
+    // A lost device is a definite, nameable cause — report it even before Start,
+    // and even if something else would also be true.
+    if (s.deviceLost)
+      return { level: 'bad', short: 'render: WebGPU DEVICE LOST ⚠',
+               why: 'The WebGPU device this page acquired was LOST at runtime ('
+                  + (s.deviceLost.reason || 'unknown') + ': ' + (s.deviceLost.message || 'no message')
+                  + '). That usually means the GPU process crashed or the driver reset. The picture is '
+                  + 'frozen at the last frame that arrived. Reload the page to acquire a new device.' };
+    // Nothing to say about a present path that was never asked to run.
+    if (!s.started || !s.wgpuOk) return null;
+    // Hidden tabs stop rAF, so the paint stamp legitimately goes stale. Not a fault.
+    if (s.hidden) return null;
+    if (!s.everPainted) {
+      if (s.msSinceStart > GC_PRESENT_BOOT_MS)
+        return { level: 'bad', short: 'render: NO FIRST FRAME ⚠',
+                 why: 'WebGPU was acquired and the emulator was started ' + Math.round(s.msSinceStart / 1000)
+                    + 's ago, but not one frame has ever reached the canvas. The WGPU backend is not '
+                    + 'publishing to the shared-heap present seqlock (0x026B3518). This is an emulator '
+                    + 'fault, not a GPU-capability one — the browser CAN do WebGPU here.' };
+      return null;   // still within the honest boot window
+    }
+    if (s.msSincePaint > GC_PRESENT_STALL_MS)
+      return { level: 'bad', short: 'render: PRESENT STALLED ⚠',
+               why: 'Frames were arriving and then stopped ' + Math.round(s.msSincePaint / 1000)
+                  + 's ago: the WGPU publish seqlock (0x026B3518) is no longer advancing. The picture on '
+                  + 'screen is the last frame that made it, not a live one. The WebGPU device itself is '
+                  + 'still alive, so the stall is upstream of present — the emulator worker.' };
+    return null;
+  }
+  // Live inputs for the pure function above. Kept separate so the tests can bypass it.
+  function gcPresentHealthNow() {
+    var G = window.__gcGpu;
+    return gcPresentHealth({
+      started:      !!window.__gcStartedAtMs,
+      wgpuOk:       gcWgpuOk(),
+      deviceLost:   G.deviceLost || null,
+      everPainted:  !!_presentLastMs,
+      msSinceStart: window.__gcStartedAtMs ? (Date.now() - window.__gcStartedAtMs) : 0,
+      // performance.now() and _presentLastMs share a time origin; Date.now() does not.
+      msSincePaint: _presentLastMs ? (performance.now() - _presentLastMs) : 0,
+      hidden:       (typeof document !== 'undefined' && document.hidden) || _presentHiddenGraceUntil > performance.now(),
+    });
+  }
   // ?wgpu=0 is a deliberate A/B, not a degradation — say which one it is.
   function gcRenderVerdict() {
     var G = window.__gcGpu, w = G.webgpu;
@@ -1473,24 +1607,78 @@ window.GcRate = (function () {
       return { level: 'warn', short: 'render: SOFTWARE (?wgpu=0)',
                why: 'You opened this page with ?wgpu=0, which disables the WebGPU backend on purpose. '
                   + 'Dolphin falls back to its CPU rasterizer. Remove ?wgpu=0 for the normal path.' };
-    if (gcWgpuOk())
+    if (gcWgpuOk()) {
+      // A capability that WAS true at load is not evidence the path is running now.
+      var h = gcPresentHealthNow();
+      if (h) return h;
       return { level: 'ok', short: 'render: WebGPU ✓',
                why: 'WebGPU adapter + device acquired. Dolphin runs the WGPU backend and publishes frames '
                   + 'through the shared-heap present path — the fast path, and the one every performance '
                   + 'number for this page was measured on.' };
+    }
     return { level: 'bad', short: 'render: SOFTWARE — NO WebGPU ⚠',
              why: 'WebGPU could not be acquired, so Dolphin force-selects its CPU Software Renderer '
                 + '(Video.cpp:147). On this build that path does not produce a usable picture — expect a '
                 + 'flat green frame and a frame counter stuck at 0. This is a GPU/browser problem on this '
                 + 'machine, NOT the emulator running slowly. Reason: ' + ((w && w.err) || 'unknown') };
   }
+  // Returning from a hidden tab, rAF has been parked and _presentLastMs is stale by however
+  // long the tab was away. Without this grace the watchdog would fire a PRESENT STALLED on
+  // every tab-back. Set generously past the stall threshold; the first painted frame clears it.
+  var _presentHiddenGraceUntil = 0;
+  try {
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) _presentHiddenGraceUntil = performance.now() + GC_PRESENT_STALL_MS + 2000;
+      gcRenderBadge();
+    }, false);
+  } catch (e) {}
   function gcRenderBadge() {
     var el = $('gpuPath'); if (!el) return;
     var v = gcRenderVerdict();
+    // Announce a transition INTO or OUT OF a bad state exactly once, so the page log and the
+    // status line carry it too — the badge alone is a small span nobody is watching at t=90s.
+    // Only bad-involving transitions: this runs at 1 Hz, and the routine probing…->✓ settle on
+    // every normal load is not news.
+    if (v.short !== _lastBadgeShort) {
+      if (_lastBadgeShort !== null && (v.level === 'bad' || _lastBadgeLevel === 'bad')) {
+        pageLog('[gpu] render path changed: ' + _lastBadgeShort + ' -> ' + v.short + ' — ' + v.why);
+        if (v.level === 'bad') setStatus(v.short + ' — see 🩺 Diagnostics');
+      }
+      _lastBadgeShort = v.short; _lastBadgeLevel = v.level;
+    }
     el.textContent = v.short;
     el.style.color = v.level === 'ok' ? '#7f7' : v.level === 'bad' ? '#f77' : v.level === 'warn' ? '#fd7' : '#888';
     el.style.fontWeight = (v.level === 'bad') ? '700' : '';
     el.title = v.why + '\n\nClick 🩺 Diagnostics for the full report.';
+    gcApplyStartGuard(v);
+  }
+  var _lastBadgeShort = null, _lastBadgeLevel = null;
+  // A black canvas behind an ENABLED Start button reads as "broken", not "unsupported".
+  // #btnStart shipped with no disabled state and the only assignment to it was inside
+  // startEmulator (i.e. after the click), so a no-WebGPU visitor could start the emulator
+  // and get nothing. Refuse up front and say what is missing. Deliberately NOT applied to
+  // 'warn' (?wgpu=0 is an opt-in A/B by someone who knows what they asked for), and never
+  // re-enables a Start that startEmulator itself disabled.
+  var _startGuardOn = false;
+  function gcApplyStartGuard(v) {
+    var bad = (v.level === 'bad') && !window.__gcStartedAtMs;
+    if (bad === _startGuardOn) return;
+    _startGuardOn = bad;
+    ['btnStart', 'mobileSplashStart'].forEach(function (id) {
+      var b = $(id); if (!b) return;
+      // TWO LAYERS GATE THIS BUTTON: this render-path guard and Capability.autoGate
+      // (lib/capability.js), which blocks on SAB/worker/wasm as well. Disabling is
+      // idempotent, but ENABLING is not — clearing our own gate must never re-enable a
+      // button the capability layer is holding down for a reason we know nothing about.
+      // autoGate marks its own gating with aria-disabled; defer to it.
+      if (!bad && b.getAttribute('aria-disabled') === 'true') return;
+      b.disabled = bad;
+      b.title = bad ? (v.short + ' — ' + v.why) : '';
+    });
+    if (bad) {
+      setStatus(v.short + ' — this device cannot run the emulator. Tap 🩺 Diagnostics for details.');
+      pageLog('[gpu] Start DISABLED: ' + v.short);
+    }
   }
   // The whole pinned store as one copyable block. Everything a bug report needs
   // and nothing that has to survive a rolling tail to get here.
@@ -1517,6 +1705,11 @@ window.GcRate = (function () {
     L.push('');
     L.push('backend    : ' + (G.backend || '(not selected yet — Start not pressed)'));
     L.push('present    : ' + (G.present || '(no frame painted yet)'));
+    L.push('deviceLost : ' + (G.deviceLost ? (G.deviceLost.reason + ' — ' + G.deviceLost.message) : 'no')
+                       + '   uncapturedGpuErrors=' + (G.gpuErrors || 0));
+    L.push('liveness   : started=' + (window.__gcStartedAtMs ? Math.round((Date.now() - window.__gcStartedAtMs) / 1000) + 's ago' : 'no')
+                       + '  lastPaint=' + (_presentLastMs ? ((performance.now() - _presentLastMs) / 1000).toFixed(1) + 's ago' : 'never')
+                       + '  hidden=' + (typeof document !== 'undefined' ? !!document.hidden : '?'));
     L.push('meter      : ' + (typeof GcRate !== 'undefined' && GcRate.format ? GcRate.format(R) : '(unavailable)'));
     L.push('crossOriginIsolated=' + (typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : '?')
            + '  SharedArrayBuffer=' + (typeof SharedArrayBuffer !== 'undefined')
@@ -1550,6 +1743,12 @@ window.GcRate = (function () {
     return window.__gcGpu.webgpu;
   })();
   gcRenderBadge();
+  // The verdict is now a function of RUNTIME state (device loss, present stall), not just the
+  // load-time capability probe, so it has to be re-evaluated. Nothing re-evaluated it before:
+  // gcRenderBadge was called only from one-shot events, which is how a dead device could keep
+  // reading "WebGPU ✓" indefinitely. 1 Hz — the stall threshold is 5 s, so this is 5x oversampled,
+  // and the body is one comparison plus a DOM write only when the text actually changes.
+  setInterval(gcRenderBadge, 1000);
   // #toast is a body-level element (it used to be the last child of #mobileShell, which is
   // display:none on desktop — so every Save/Load/Export/Import/audio toast was silently
   // invisible there). While a fullscreen element is open only ITS subtree renders, so the
@@ -1855,7 +2054,7 @@ window.GcRate = (function () {
             ev.preventDefault();
             pageLog('[mtgl] WebGL2 context LOST — routing to software present');
             window.__gcSoftwareRender = true; window.__gcRenderWorker = false;
-            canvasCtx2D = null; canvasImg2D = null; // re-init 2D ctx on next paintFrame2D
+            canvasCtx2D = null; canvasImg2D = null; canvasImg32 = null; // re-init 2D ctx on next paintFrame2D
           }, false);
           // Load render-worker.js as a MAIN-THREAD script (NOT a Worker) and run
           // its replay loop here. The dolphin worker won't emit GL frames until
@@ -4609,7 +4808,13 @@ window.GcRate = (function () {
     pass.end();
     GPU.device.queue.submit([enc.finish()]);
   }
-  var canvasCtx2D = null, canvasImg2D = null;
+  // canvasImg32 is a u32 alias of canvasImg2D.data — INVALIDATE IT WHEREVER canvasImg2D IS
+  // REASSIGNED or it aliases a freed/undersized backing store (the size guard below is the
+  // only thing that reassigns it, and it clears this on the same line).
+  var canvasCtx2D = null, canvasImg2D = null, canvasImg32 = null;
+  // Wall-clock stamp of the last frame actually painted from the WGPU publish seqlock.
+  // 0 = nothing has ever been painted. Read by the present watchdog (gcPresentHealth).
+  var _presentLastMs = 0;
   // [sab-present PM28] WGPU frames arrive via the SHARED HEAP, not postMessage
   // (MAIN_THREAD_EM_ASM from the gpu_thread never delivers — its proxy queue
   // starves; forensic counters showed the full readback chain running with zero
@@ -4778,9 +4983,119 @@ window.GcRate = (function () {
   // emulator, no worker and no probe. This exists because the model had never been checked
   // against anything: "a simulation showed it" is not reproducible, an in-page suite is. The
   // suite drives the SAME GcRate.makeModel/format/seqDelta the live page uses.
+  //
+  // [render-health 2026-09-01] gcRenderSelfTest appends to the SAME result object. The present
+  // watchdog is a claim about when the page is allowed to say "WebGPU ✓", and an unverified
+  // watchdog is worse than none — it converts a visible freeze into a silent one. gcPresentHealth
+  // is a pure function precisely so every branch is reachable here with no GPU and no emulator.
+  function gcRenderSelfTest(log) {
+    var pass = 0, fail = 0, lines = [];
+    function ck(name, ok, detail) {
+      var s = (ok ? 'RATETEST PASS  ' : 'RATETEST FAIL  ') + name + (detail ? '   ' + detail : '');
+      if (ok) pass++; else fail++;
+      lines.push(s); if (log) { try { log(s); } catch (e) {} }
+      try { console.log(s); } catch (e) {}
+    }
+    // A healthy live path: started, WebGPU ok, painting now.
+    var healthy = { started: true, wgpuOk: true, deviceLost: null, everPainted: true,
+                    msSinceStart: 120000, msSincePaint: 30, hidden: false };
+    function withH(o) { var c = {}, k; for (k in healthy) c[k] = healthy[k]; for (k in o) c[k] = o[k]; return c; }
+
+    ck('80 healthy present reports no problem', gcPresentHealth(healthy) === null,
+       JSON.stringify(gcPresentHealth(healthy)));
+    // THE REGRESSION THIS SUITE EXISTS FOR: publishing stops, badge must stop saying ✓.
+    var stalled = gcPresentHealth(withH({ msSincePaint: GC_PRESENT_STALL_MS + 1 }));
+    ck('81 present stall past threshold is level=bad', !!stalled && stalled.level === 'bad',
+       stalled ? stalled.short : 'null (NO STALL DETECTED)');
+    ck('81b stall verdict names the seqlock', !!stalled && stalled.why.indexOf('0x026B3518') >= 0,
+       stalled ? stalled.why.slice(0, 80) : 'null');
+    ck('82 present just under the threshold is still healthy',
+       gcPresentHealth(withH({ msSincePaint: GC_PRESENT_STALL_MS - 1 })) === null,
+       String(GC_PRESENT_STALL_MS - 1) + 'ms');
+    // A hidden tab parks rAF; a stale paint stamp there is not a fault.
+    ck('83 hidden tab suppresses the stall (rAF is parked, not broken)',
+       gcPresentHealth(withH({ msSincePaint: 60000, hidden: true })) === null,
+       'hidden + 60s stale');
+    // Device loss must win over everything and must name the reason.
+    var lost = gcPresentHealth(withH({ deviceLost: { reason: 'destroyed', message: 'gpu process exited' } }));
+    ck('84 device loss is level=bad even while frames look fresh', !!lost && lost.level === 'bad',
+       lost ? lost.short : 'null');
+    ck('84b device-loss verdict carries the reason', !!lost && lost.why.indexOf('destroyed') >= 0,
+       lost ? lost.why.slice(0, 80) : 'null');
+    ck('84c device loss is reported even before Start',
+       (function () { var r = gcPresentHealth(withH({ started: false, deviceLost: { reason: 'x', message: 'y' } }));
+                      return !!r && r.level === 'bad'; })(), 'started=false');
+    // Boot window: silence during boot is normal; silence past it is not.
+    ck('85 no first frame INSIDE the boot window is not yet a fault',
+       gcPresentHealth(withH({ everPainted: false, msSinceStart: GC_PRESENT_BOOT_MS - 1, msSincePaint: 0 })) === null,
+       String(GC_PRESENT_BOOT_MS - 1) + 'ms since Start');
+    var noframe = gcPresentHealth(withH({ everPainted: false, msSinceStart: GC_PRESENT_BOOT_MS + 1, msSincePaint: 0 }));
+    ck('86 no first frame PAST the boot window is level=bad', !!noframe && noframe.level === 'bad',
+       noframe ? noframe.short : 'null (BLACK CANVAS WOULD GO UNREPORTED)');
+    // Before Start there is no present path to have an opinion about.
+    ck('87 nothing is claimed about present before Start',
+       gcPresentHealth(withH({ started: false, everPainted: false, msSinceStart: 0 })) === null, 'started=false');
+    // The no-WebGPU case is owned by the capability verdict, not duplicated here.
+    ck('88 no-WebGPU is left to the capability verdict, not double-reported',
+       gcPresentHealth(withH({ wgpuOk: false, everPainted: false, msSinceStart: 999999 })) === null, 'wgpuOk=false');
+    // The Start guard is the "black canvas behind an enabled Start" fix. Assert the decision,
+    // not the DOM, so it holds on the mobile shell too.
+    // gcApplyStartGuard writes the visible status line, so these two drive real DOM. Snapshot
+    // and restore everything they touch — a suite that leaves the page claiming "this device
+    // cannot run the emulator" has itself become the lie it is here to prevent.
+    function guardProbe(level) {
+      var b = $('btnStart'); if (!b) return null;
+      var wasStart = window.__gcStartedAtMs, wasStatus = statusEl ? statusEl.textContent : null;
+      var wasGuard = _startGuardOn, wasDisabled = b.disabled;
+      window.__gcStartedAtMs = 0; _startGuardOn = !(level === 'bad');
+      gcApplyStartGuard({ level: level, short: 'selftest', why: 'selftest' });
+      var got = b.disabled;
+      window.__gcStartedAtMs = wasStart; _startGuardOn = wasGuard; b.disabled = wasDisabled;
+      b.title = ''; if (wasStatus !== null) setStatus(wasStatus);
+      return got;
+    }
+    ck('89 Start guard arms on a bad verdict before Start', guardProbe('bad') === true,
+       'btnStart.disabled after a bad verdict = ' + guardProbe('bad'));
+    ck('90 Start guard does NOT arm for the deliberate ?wgpu=0 A/B', guardProbe('warn') === false,
+       'level=warn leaves Start enabled');
+    ck('91 self-test restored the status line',
+       !statusEl || statusEl.textContent.indexOf('selftest') < 0,
+       statusEl ? statusEl.textContent : '(no status element)');
+    // The present blit forces opaque alpha through a u32 alias (4 pixels' lanes per
+    // iteration instead of 1). That is only correct if alpha really is the HIGH byte of a
+    // little-endian u32 view of RGBA bytes — get it wrong and every frame's RED channel is
+    // pinned to 255 instead, which a screenshot of a mostly-bright scene can easily hide.
+    // Assert the idiom against the real runtime rather than trusting the reasoning.
+    ck('92 u32 opaque-alpha alias hits alpha, not red', (function () {
+      var img = new Uint8ClampedArray([1, 2, 3, 0,  250, 251, 252, 7]);
+      var v32 = new Uint32Array(img.buffer);
+      for (var i = 0; i < v32.length; i++) v32[i] |= 0xFF000000;
+      return img[0] === 1 && img[1] === 2 && img[2] === 3 && img[3] === 255
+          && img[4] === 250 && img[5] === 251 && img[6] === 252 && img[7] === 255;
+    })(), 'RGB preserved, A forced to 255');
+    // Guard cooperation: the capability layer marks its own gating with aria-disabled, and
+    // clearing OUR gate must not re-enable a button it is holding down.
+    ck('93 clearing the render guard does not stomp the capability layer\'s gate', (function () {
+      var b = $('btnStart'); if (!b) return false;
+      var wasStart = window.__gcStartedAtMs, wasDis = b.disabled, wasAria = b.getAttribute('aria-disabled');
+      window.__gcStartedAtMs = 0; b.disabled = true; b.setAttribute('aria-disabled', 'true');
+      _startGuardOn = true; gcApplyStartGuard({ level: 'ok', short: 'selftest', why: 'selftest' });
+      var stillHeld = b.disabled === true;
+      window.__gcStartedAtMs = wasStart; b.disabled = wasDis;
+      if (wasAria === null) b.removeAttribute('aria-disabled'); else b.setAttribute('aria-disabled', wasAria);
+      _startGuardOn = false;
+      return stillHeld;
+    })(), 'aria-disabled button stays disabled');
+    return { pass: pass, fail: fail, lines: lines };
+  }
   if (new URLSearchParams(location.search).get('ratetest') === '1') {
     setTimeout(function () {
       var r = GcRate.selfTest(pageLog);
+      var rr = gcRenderSelfTest(pageLog);
+      // ONE gate: merge so `RATETEST FAIL` in __gcRateTest.lines still catches everything.
+      r.pass += rr.pass; r.fail += rr.fail; r.lines = r.lines.concat(rr.lines);
+      r.summary = 'RATETEST ' + (r.fail === 0 ? 'ALL PASS' : 'FAILURES') + ' — ' + r.pass + ' passed, ' + r.fail + ' failed';
+      pageLog(r.summary);
       window.__gcRateTest = r;    // also pins the summary in #fps (see _rateRender)
       if (fpsEl) { fpsEl.textContent = r.summary; fpsEl.style.color = r.fail ? '#f77' : '#7f7'; }
     }, 0);
@@ -4815,6 +5130,7 @@ window.GcRate = (function () {
       if (!canvasCtx2D) canvasCtx2D = c.getContext('2d');
       if (!canvasImg2D || canvasImg2D.width !== w || canvasImg2D.height !== h) {
         canvasImg2D = canvasCtx2D.createImageData(w, h);
+        canvasImg32 = null;   // MUST clear: the old alias points at the previous backing store
       }
       // ImageData rejects SharedArrayBuffer views — copy into its backing store.
       canvasImg2D.data.set(new Uint8Array(sharedMemory.buffer, ptr, w * h * 4));
@@ -4831,10 +5147,16 @@ window.GcRate = (function () {
         // Ground truth for the diagnostics report: this path only runs when WGPUGfx is
         // bumping the publish seqlock, so reaching it PROVES the fast path is live.
         try { window.__gcGpu.present = 'sab-present / WGPU shared-heap (fast path) ' + w + 'x' + h; gcRenderBadge(); } catch (e) {} }
-      // Force opaque alpha (readback alpha is undefined for the EFB).
-      var d = canvasImg2D.data;
-      for (var i = 3; i < d.length; i += 4) d[i] = 255;
+      // Force opaque alpha (readback alpha is undefined for the EFB). A u32 view ORs the
+      // alpha byte of 4 pixels' worth of lanes per iteration instead of 1 — measured
+      // 0.21ms/frame as a per-byte loop (present-diag 2026-09-01), the largest single
+      // item in a 0.52ms present. Endianness-safe: alpha is the high byte on LE, and the
+      // canvas ImageData buffer is only ever read back through the same view family.
+      var d32 = canvasImg32 || (canvasImg32 = new Uint32Array(canvasImg2D.data.buffer));
+      for (var i = 0; i < d32.length; i++) d32[i] |= 0xFF000000;
       canvasCtx2D.putImageData(canvasImg2D, 0, 0);
+      // [present-watchdog] the ONE authoritative "the WebGPU path is alive right now" stamp.
+      _presentLastMs = performance.now();
       if (!_sabPresentActive) {
         _sabPresentActive = true;
         pageLog('[sab-present] WGPU shared-heap present ACTIVE ' + w + 'x' + h);
@@ -4852,6 +5174,7 @@ window.GcRate = (function () {
     if (!canvasCtx2D) canvasCtx2D = c.getContext('2d');
     if (!canvasImg2D || canvasImg2D.width !== w || canvasImg2D.height !== h) {
       canvasImg2D = canvasCtx2D.createImageData(w, h);
+      canvasImg32 = null;   // MUST clear: shared with the sab-present path's u32 alpha alias
     }
     var dst = canvasImg2D.data;
     var stride = pitch || w * 4;
@@ -5495,6 +5818,10 @@ window.GcRate = (function () {
     [$('btnSave'), $('btnLoad'), $('btnExport'), $('btnImport'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
   }
   var started = false; async function startEmulator() { if (started) return; started = true;
+    // Baseline for the present watchdog's boot window (gcPresentHealth): "no first frame after
+    // GC_PRESENT_BOOT_MS" is only meaningful relative to when the emulator was actually asked
+    // to run. Also latches the Start guard off — startEmulator owns the button from here.
+    window.__gcStartedAtMs = Date.now();
     // [webgpu fallback 2026-07-11] The WGPU video backend HARD-FREEZES the boot when WebGPU is
     // unavailable: the worker's WGPUGfx gets a null device, and the null-device path wedges the
     // dolphin worker right after DSP-AX ucode init (CoreTiming stops, guest idles in SelectThread
