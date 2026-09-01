@@ -298,10 +298,37 @@ Banjo titles 5.9-7.3%.
       correctness gate. `n64/index.html` now surfaces `nativeCop0` in
       `__jitStats()` specifically so that can never go unnoticed.
 
-## thewheel.z64 WEDGES UNDER ?jit AT VI 245 — open, pre-existing (2026-08-29)
+## thewheel.z64 ?jit wedge at VI 245 — ✅ FIXED 2026-09-01 (607b3b1)
 
-**This is the first known ?jit LIVENESS failure on a shipped ROM, and it
-blocks the "flip ?jit to default" gate.**
+**RESOLVED, and the hypothesis recorded below was WRONG — read the fix first.**
+It was NOT poll-starvation. It is **a hard wasm trap**, localised by a mode
+ladder:
+
+    interpreter                       VI 400 OK
+    ?jit=wrap (13,062,207 dispatches) VI 401 OK   -> plumbing fine
+    ?jit=v05 (per-block module)       VI 401 OK   -> instantiation fine
+    ?jit=nofp (nativeFP: 0)           245, RuntimeError: null function
+    ?jit=emit                         245, same
+
+So: native emission, NOT plumbing, NOT FP.
+
+**ROOT CAUSE, IN THE VENDORED CORE (not the emitter):** `get_block_memsize`
+(`recomp.c:2164-2168`) allocates `(length+1)+(length>>2)` entries and
+`init_block` memsets all of it to 0 (`:2207`), but the NOTCOMPILED init loop
+only covers `i<length` (`:2244-2255`). **The overflow entries stay null.** The
+cached interpreter never falls into them; the JIT's fall-through exit sets
+`PC = entryPtr + span*stride` and the dispatcher then calls `PC->ops()` on a
+null entry.
+
+Fix is JS-only, no core rebuild: a null-ops guard that refuses such spans
+(`n64/bementalJIT/mips_emit.js:841`, counted as `stats.nullOpsRejects`).
+Gates: unit corpus 22/22; thewheel differential @400 VI det=PASS jit=PASS.
+
+The lesson worth carrying: a liveness failure under `?jit` is not evidence the
+EMITTER is wrong. The mode ladder (wrap -> v05 -> nofp -> emit) costs four runs
+and separates plumbing / instantiation / FP / emission before any hypothesis.
+
+<details><summary>Original 2026-08-29 evidence, kept for the record</summary>
 
 An earlier draft of this section called it "not a JIT problem" on the
 strength of a single interpreter-arm timeout. That was wrong and is corrected
@@ -330,6 +357,9 @@ interrupt. Suggested first move: run the differential with a small frame
 count (e.g. `thewheel.z64 260 emit`) to see whether the checksums diverge
 BEFORE the stall, which separates "wrong code, then wedge" from "correct
 code, but a block that stops polling".
+
+^ That hypothesis (poll-starvation) was WRONG. See the fix above.
+</details>
 
 ## Next by measured weight, AFTER waves 9 + 10a
 
@@ -485,7 +515,10 @@ Two things that were previously believed and are now known to be false:
   The 600-frame differential is necessary and not sufficient; the new unit
   corpus exists to cover what it structurally cannot.
 - "all 27 ROMs boot and render" did NOT mean all 27 run under `?jit`.
-  `thewheel.z64` wedges at VI 245 with the JIT on and runs fine without it.
+  `thewheel.z64` wedged at VI 245 with the JIT on and ran fine without it —
+  FIXED 2026-09-01 (607b3b1), and the cause was in the VENDORED CORE, not the
+  emitter. A `?jit` liveness failure is not by itself evidence against the
+  emitter; run the mode ladder (wrap/v05/nofp/emit) before hypothesising.
 
 Perf history, most recent first:
 - waves 9 + 10a (2026-08-29): SD/LD and MFC0 native. Fallback executions
@@ -516,14 +549,31 @@ NEXT ACTIONS, in order:
    are ALL still unpriced. 5 of 7 pairs in the 2026-08-29 sweep read `?jit`
    slower than the interpreter — discarded as machine noise at load 35-176,
    but it is the reason this is now action #1 rather than #2.
-2. **Fix the `thewheel.z64` `?jit` wedge at VI 245** — see its section above.
-   It is a shipped ROM and a hard blocker on flipping `?jit` to default.
+2. ~~Fix the `thewheel.z64` `?jit` wedge~~ — ✅ DONE 2026-09-01 (607b3b1),
+   a vendored-core null-ops bug, not an emitter bug. See its section above.
 3. Wave 11 (FP), now the top measured lever on the heavy set — compares and
    BC1 first (exactly emittable), converts second (rounding/UB risk). See
    "Next by measured weight, AFTER waves 9 + 10a".
 4. Full-library differential sweep (all 27 ROMs bit-identical per VI) — the
    gate a5efb66 named before the ?jit default can flip. `thewheel` already
    proves this sweep is not a formality.
+
+### On measuring action #1 — the load source was OURS (2026-09-01)
+Every discarded A/B in this file blames "machine load". The largest single
+source was this repo's own harnesses: seven orphaned Chromes from a run 2 days
+17 hours earlier were still resident, two spinning an emulator page with 832
+and 815 CPU-MINUTES accumulated, together burning 230.3% of CPU. A SIGKILLed
+parent ORPHANS its browser and no in-process handler can prevent it, so this
+accumulated silently across days.
+
+**Before any throughput measurement, run:**
+
+    node tools/browser_leak_guard.js reap   # kills orphans; never touches a live run
+    uptime                                  # record the load WITH the result
+
+Every `puppeteer.launch` site in every harness is now registered with the
+guard (1caa1ad). A guarded run is reaped only once its owner process is gone,
+so this is safe to run while sibling agents are working.
 
 Standing note for whoever measures next: run
 `node tools/n64_emit_unit_test.mjs` first. It is ~1 second, needs no browser,
