@@ -350,7 +350,22 @@ try {
     // On a machine with no spare capacity the governor correctly refuses to act, so this is
     // reported but only GATES the run when the machine actually had capacity to prove it with.
     t.decoupledObserved = on.maxExcess !== null && on.maxExcess > 1.0;
-    t.hadCapacity = !!(on.rate && on.rate.hwX !== null && on.rate.hwX > 1.05);
+    // CAPACITY MUST BE THE END-TO-END NUMBER, NOT `hwX`. Measured 2026-09-01: this gate failed
+    // on a contended box while the guest was running at 0.920x and 0.925x of hardware — i.e.
+    // with no spare capacity at all — because `hwX` said there was some. `hwX` is `capVi/viHz`
+    // where `capVi = 1000/costMs` over retro_run ONLY, and n64/index.html:601-604 states plainly
+    // that it "excludes GPU and compositor time, so it is an UPPER bound on CPU-side
+    // production". The governor cannot decouple on capacity the presentation path has already
+    // spent. `e2eHwX = speed/duty` (n64/index.html:623,692) is the producible multiple END TO
+    // END, and the page itself asserts e2eHwX < hwX (P9b/:1331) — so gating on `hwX` demands
+    // decoupling in exactly the band between the two, which is where a loaded machine sits.
+    // Falls back to hwX only when duty was never sampled, so the gate cannot silently vanish.
+    var capX = (on.rate && on.rate.e2eHwX !== null && on.rate.e2eHwX !== undefined &&
+                isFinite(on.rate.e2eHwX)) ? on.rate.e2eHwX
+             : (on.rate && isFinite(on.rate.hwX) ? on.rate.hwX : null);
+    t.capX = capX; t.capXFrom = (on.rate && isFinite(on.rate.e2eHwX)) ? 'e2e' : 'cpu-only';
+    t.hwXCpuOnly = on.rate && on.rate.hwX;
+    t.hadCapacity = capX !== null && capX > 1.05;
     // ---- GATE #9, live, on both arms ----
     // Stated as the AVERAGE, because that is what the gate is about, and separately as a bound
     // on the instantaneous overshoot. A window above hardware while a bounded debt is repaid is
