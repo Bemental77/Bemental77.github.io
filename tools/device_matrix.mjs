@@ -225,7 +225,18 @@ async function runCell(arm, pg) {
   // FRESH PROFILE PER CELL. Not per arm — per cell. Cross-origin isolation is
   // installed by whichever page ran first, so even two pages inside one arm
   // would contaminate each other. This directory is removed in the finally.
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dmx-${arm.id}-${pg.id}-`));
+  //
+  // A failure to create it must degrade THIS CELL, not kill the run: a full disk
+  // once took down a 21-cell sweep at cell 13 and the 12 completed rows went
+  // with it. An ERROR row is recoverable information; a dead process is not.
+  let dir;
+  try {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), `dmx-${arm.id}-${pg.id}-`));
+  } catch (e) {
+    return { arm: arm.id, page: pg.id, consoleErrors: [], pageErrors: [], failedRequests: [],
+             error: `could not create a browser profile: ${String(e).slice(0, 160)}`
+                  + (String(e).includes('ENOSPC') ? ' — the disk is full; free space and re-run' : '') };
+  }
   const out = { arm: arm.id, page: pg.id, profile: dir, consoleErrors: [], pageErrors: [], failedRequests: [] };
   let browser = null;
   try {

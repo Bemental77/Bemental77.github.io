@@ -83,6 +83,19 @@ All emulators follow the same pattern and share a critical constraint:
 
 When editing the PS1 emulator specifically, the current JS-side patches (performance.now shims, diag logs) live in `ps1/ps1Wasm/dist/wasmpsx_worker.js`, and `ps1/ps1Wasm/dist/pcsx_ww.js` is the main-thread controller (loaded at `ps1.html:516`). `wasmpsx.min.js` exists only under `wasmpsx-repo/`, not `dist/`.
 
+### Device portability: the shared capability layer + the device matrix
+
+`lib/capability.js` is loaded by all three emulator pages (`gamecube.html`, `dreamcast.html`, `n64/index.html`) and publishes **`window.__cap`** — one report shape, so one rig can ask every page the same questions. **Every field is the result of DOING the thing, never of reading a property.** Measured 2026-09-01, Chrome 140: under `--disable-gpu` and under `--disable-features=WebGPUService,Dawn`, `navigator.gpu` is still **truthy** while `requestAdapter()` resolves **null** — and `--disable-features=WebGPU` / `--disable-blink-features=WebGPU` are **no-ops** that disable nothing. A presence check is not a capability check.
+
+- **`npm run matrix`** (= `node tools/device_matrix.mjs`) — the standing portability gate. Arms: `desktop`, `no-webgpu`, `no-gpu`, `no-coi`, `mobile-ios`, `low-memory`, `slow-net` × 3 pages. Needs `npm run web` first. Full JSON at `/tmp/device-matrix.json`.
+  - **Every arm carries an arm-difference proof.** If the flag/condition did not demonstrably change a measured value versus the baseline arm, the cell is **VOID and prints no verdict** — a placebo arm reports nothing rather than a false pass. This caught the `slow-net` arm silently not working: page-scoped CDP throttling does **not** reach a `coi-serviceworker`-controlled `fetch()` (the SW is a separate CDP target), so the two SW pages measured 1.1–1.2x while n64 measured 214x. The rig now throttles every target.
+  - **Fresh `userDataDir` per cell**, deleted after. Cross-origin isolation is **origin-scoped and persists**: the rig's own self-test reproduces the leak (visit `gamecube.html`, then `/n64/` in the same profile reports `crossOriginIsolated=true`). A shared-profile matrix returns identical rows and no signal.
+  - Device emulation gets viewport/touch/UA right but **runs Chrome's engine, not WebKit**. Rows tagged `enginesDiffer` cannot clear the pages on real iOS Safari; that needs hardware.
+- **`?captest=1`** on any of the three pages runs `lib/capability.test.js` — 186 assertions incl. an 8-guard mutation matrix, published at `window.__capTest` (gate on `.done`, not existence).
+- `Capability.SPECS` holds each page's requirement spec in **one** place; the pages, the suite and the matrix all read it, and the matrix fails on spec drift. `Capability.autoGate(spec)` is what keeps a page from **presenting an enabled Start behind a broken path** — it disables both `#btnStart` and `#mobileSplashStart` and raises a banner saying what is missing and what the visitor can do. `?nogate=1` overrides (and is recorded on the report).
+- **Ownership protocol for the Start button:** `aria-disabled="true"` means the capability layer is holding it down; `gamecube.html:1674` defers to that and never re-enables such a button. `lib/capability.js` is therefore the sole writer of `aria-disabled`/`data-cap-blocked` on those controls and must **release** them when it stops blocking.
+- **`coi` is not a presence check.** Cross-origin isolation is a *means* to `SharedArrayBuffer`; `crossOriginIsolated=false` with a functional SAB (e.g. Chrome under `--disable-web-security`) must **not** block. This regressed once and gated Start on a browser where the emulator rendered perfectly; the named test `coi/functional-sab-overrides-false-flag` catches the revert.
+
 ## GameCube / Dolphin WASM build
 
 This is an active R&D effort — not yet shipping. Four pieces interact:

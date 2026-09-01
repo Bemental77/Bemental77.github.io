@@ -35,6 +35,16 @@ LOADSTATE=""
 CTXMS=""
 PROFAT=""
 PROFDUR=""
+MOBILE=""
+DEVICE=""
+MOBILEFORCE=""
+SWGL=""
+SHOTDIR=""
+SCREENSHOT=""
+ROTATE=""
+NOCOI=""
+NOSWA=""
+PROGMS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --skip-link|--skip-build) SKIP_LINK=1; shift ;;
@@ -79,6 +89,27 @@ while [ $# -gt 0 ]; do
     # a profile is for SHARES (who owns the time), never for sizing a win.
     --profat)                 PROFAT="$2"; shift 2 ;;
     --profdur)                PROFDUR="$2"; shift 2 ;;
+    # [2026-09-01] mobile + isolation arms. Same gap as --loadstate/--ctxms/
+    # --profat before them: flycast_probe.js has had --mobile/--device/--swgl/
+    # --shotdir since 2026-08-28 and --nocoiheaders/--noswa/--progms since
+    # today, but the CANONICAL LOOP could not reach any of them, so every
+    # mobile run so far was an improvised `node flycast_probe.js ...` outside
+    # gate #1. The device matrix runs through here now.
+    #   --mobile / --device N  puppeteer device emulation (viewport/DPR/touch/UA
+    #                          ONLY — not a phone GPU, not a phone memory ceiling)
+    #   --nocoiheaders         serve with NO COOP/COEP, as GitHub Pages does, so
+    #                          /coi-serviceworker.js is what produces isolation
+    #   --noswa                also hide navigator.serviceWorker (private window)
+    --mobile)                 MOBILE="1"; shift ;;
+    --device)                 MOBILE="1"; DEVICE="$2"; shift 2 ;;
+    --mobileforce)            MOBILEFORCE="--mobileforce"; shift ;;
+    --swgl)                   SWGL="--swgl"; shift ;;
+    --shotdir)                SHOTDIR="$2"; shift 2 ;;
+    --screenshot)             SCREENSHOT="$2"; shift 2 ;;
+    --rotate)                 ROTATE="$2"; shift 2 ;;
+    --nocoiheaders)           NOCOI="--nocoiheaders"; shift ;;
+    --noswa)                  NOSWA="--noswa"; shift ;;
+    --progms)                 PROGMS="$2"; shift 2 ;;
     -h|--help)                sed -n '2,/^set -e/p' "$0" | sed 's/^# //;/^set -e/d'; exit 0 ;;
     *)                        echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -146,6 +177,21 @@ if [ -n "$LOADSTATE" ]; then
   CMD="$CMD --loadstate $LOADSTATE"
 fi
 
+# Args that can legally contain spaces ("iPhone 13 Pro landscape") cannot ride
+# in $CMD — it is expanded unquoted, so a device name would word-split into
+# three bogus flags. Array, appended quoted.
+EXTRA=()
+[ -n "$MOBILE" ] && [ -z "$DEVICE" ] && EXTRA+=(--mobile)
+[ -n "$DEVICE" ]      && EXTRA+=(--device "$DEVICE")
+[ -n "$MOBILEFORCE" ] && EXTRA+=(--mobileforce)
+[ -n "$SWGL" ]        && EXTRA+=(--swgl)
+[ -n "$SHOTDIR" ]     && EXTRA+=(--shotdir "$SHOTDIR")
+[ -n "$SCREENSHOT" ]  && EXTRA+=(--screenshot "$SCREENSHOT")
+[ -n "$ROTATE" ]      && EXTRA+=(--rotate "$ROTATE")
+[ -n "$NOCOI" ]       && EXTRA+=(--nocoiheaders)
+[ -n "$NOSWA" ]       && EXTRA+=(--noswa)
+[ -n "$PROGMS" ]      && EXTRA+=(--progms "$PROGMS")
+
 # V8 flags pass through to puppeteer's Chrome via FLYCAST_V8_FLAGS — the probe
 # forwards the string to chromium as `--js-flags=...`. Empty string = leave V8
 # defaults alone.
@@ -157,7 +203,7 @@ fi
 # Tee probe output so the summary lands both on screen and in the log file's
 # tail (handy for `grep` later).
 SECONDS=0
-$CMD
+$CMD "${EXTRA[@]}"
 WALL_S=$SECONDS
 
 echo ""

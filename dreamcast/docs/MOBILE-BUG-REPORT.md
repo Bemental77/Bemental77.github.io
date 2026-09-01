@@ -50,7 +50,8 @@ Each of these changes one thing. Send a report for each you try, and say which o
 
 | Add to the end of the address | What it tests |
 |---|---|
-| `?lazydisc=1` | Streams the 1.13 GB disc instead of loading it into RAM. **Try this first if it dies during loading** — the default path asks the phone for one contiguous 1,131 MB buffer. |
+| `?lazydisc=1` | Streams the 1.13 GB disc instead of loading it into RAM. Since 2026-09-01 the page does this **by itself** when the phone refuses the 1,131 MB buffer, so this is now only for forcing it early. |
+| `?netgrace=90` | Waits longer before calling a stalled download dead (default 45 s, range 10–300). For a very slow or flaky connection. |
 | `?maxmem=512` | Asks for a much smaller emulator heap. |
 | `?nomodvol=1` | Turns modifier volumes off. **If this fixes a black picture, the stencil path is the bug.** |
 | `?nofog=1` | Turns fog off. |
@@ -62,6 +63,21 @@ Each of these changes one thing. Send a report for each you try, and say which o
 
 The report is plain text and starts with a `>>` headline naming the most likely cause. Read the
 `--- VERDICT ---` block first; everything below it is supporting evidence.
+
+### Read `still working?` before anything else (added 2026-09-01)
+
+A black screen while a 1.13 GB disc downloads and a black screen from a wedged core **are the
+same picture**, and until this row existed the page could not tell them apart either. It is
+derived from `PROG.seq`, a counter that advances on every unit of progress in every phase —
+bytes delivered, then worker telemetry — never from the canvas.
+
+- `still working? yes` + a moving `disc downloaded` row ⇒ **nothing is wrong yet**, it has not
+  finished. The most likely explanation for "it sat on black for 25 seconds" is simply this.
+- `still working? NO` ⇒ the counter stopped, and the row says which phase it stopped in.
+
+The Node probe reports the same thing as `--- liveness (booting vs broken) ---`, ending in one
+of `RUNNING` / `BOOTING` / `BROKEN`. A flat `seq` across consecutive samples is the finding;
+screenshots are not evidence in either direction.
 
 **Highest-signal fields, in order:**
 
@@ -147,6 +163,67 @@ Each of these independently produced the reported symptom, and each is gone:
    very configurations that block the service worker; it now falls back to `window.name` and
    then to the URL.)*
 7. `#rotateHint` covering a running emulator with no `orientationchange` listener.
+
+---
+
+## Failure modes, and what each one was measured to do (2026-09-01)
+
+Every row was produced by an arm of the canonical loop, on a **fresh browser profile** —
+`flycast_probe.js` now creates and names its own `userDataDir` per run, because cross-origin
+isolation is origin-scoped and sticky and a shared profile silently measures the first arm
+over and over.
+
+| Arm | Command | Measured outcome |
+|---|---|---|
+| Baseline, desktop | `--skip-link --duration 60000` | boots, 30 fps, `guest 1.00010x`, `COUNTED vs COMPUTED +0.0000%` |
+| **Real service-worker isolation** | `--nocoiheaders` | `[coi] reload 1 of 3` → `crossOriginIsolated=true` in ~260 ms, then boots |
+| **No service worker** (private window) | `--noswa` | exactly 3 reloads, then the hard-stop panel; probe reads `BROKEN` |
+| Emulated iPhone 13 Pro, landscape + portrait | `--device "iPhone 13 Pro…" --nocoiheaders` | shell active, 8/8 touch buttons, real touch tap starts it, reaches **character select**, `guest 1.001x` |
+| Rotation | `--rotate 30000` | 390x844 → 844x390, `#rotateHint` stays hidden, render intact |
+| Weak driver | `--swgl` | SwiftShader: `stencil=true`, both DS formats COMPLETE, 30 fps |
+| **Download stalls mid-part** | `--stallpart 3 --q netgrace=10` | detected at the grace period, named panel: *"…delivered nothing for 10s… this is a network failure, not an emulator failure"* |
+| **1,131 MB allocation refused** | `--allocfail 1024` | **falls back to streaming automatically and boots to 30 fps on 16 MB** |
+| Lazy disc + small heap | `--q "lazydisc=1&maxmem=256"` | boots, 30 fps, 16 MB fetched instead of 1147 MB |
+| Page has no WebGL2 | `--noglctx` | page probe says no; **the worker rendered anyway at 30 fps** — see below |
+| **Worker gets no WebGL2** | `--noworkergl` | hard-stop panel naming the context failure; probe reads `BROKEN` |
+
+Three of these were regressions or gaps found by the arms themselves:
+
+1. `[coi] not cross-origin isolated — reload attempt **4 of 3**` was printed on the very panel
+   the reporter is asked to screenshot. The counter counts non-isolated *loads*, not reloads.
+2. The page showed *"This page could not become cross-origin isolated"* while its own report
+   headline read *"STILL WORKING, not stuck"* — a direct contradiction on the same screenshot.
+   A visible hard-stop panel is now a stop, unconditionally.
+3. **The page-side WebGL2 probe can be wrong.** Under `--disable-3d-apis` it returned null while
+   the worker rendered PSO at 30 fps, and the headline announced "THIS DEVICE HAS NO USABLE
+   WEBGL2" over a working picture. It is a different context in a different realm from the one
+   that renders, so it now yields to demonstrated frames — and it is deliberately **not** a hard
+   stop, since making it one would have blocked a device that works. Only the *worker's* NULL
+   context is terminal.
+
+## What the rig still cannot see — and what needs the phone
+
+`--mobile` emulates **viewport, DPR, touch and user agent**. It runs Chrome's engine on a
+desktop GPU. It does not emulate:
+
+- **iOS Safari's engine.** Every browser on iOS is Safari, so a WebKit-only bug is invisible here
+  and always will be. The OffscreenCanvas-WebGL2-in-a-worker requirement (iOS 17+) is enforced by
+  the capability gate on faith, not by measurement.
+- **The real GPU driver.** `stencil=true` and both depth-stencil formats COMPLETE on this Intel
+  UHD 630 and on SwiftShader. That says nothing about a mobile tiler, and the stencil path is
+  still the prime suspect for a black picture with healthy telemetry.
+- **The real memory ceiling.** `--allocfail <MB>` proves *what the page does* at a ceiling; it
+  cannot say *where an iPhone's ceiling is*, or whether the streaming fallback's own footprint
+  fits under it.
+- **Thermal behaviour**, and a real cellular link. The disc downloads from local disk here in
+  ~10 s; on a phone that is minutes, which is exactly why the byte counter had to exist.
+- The probe launches Chrome with `--enable-features=SharedArrayBuffer`, so `SharedArrayBuffer`
+  is defined even in the un-isolated arm. The capability gate's "SharedArrayBuffer missing"
+  branch therefore **cannot** be exercised on this rig.
+
+**Still unresolved:** the original report itself. Nothing here reproduces it, and no data has
+come back from the device. What is different now is that the same run on his phone would say
+which of these it is, on screen, without a console.
 
 ## Honest scope
 

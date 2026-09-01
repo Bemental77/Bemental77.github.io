@@ -31,6 +31,7 @@
 
 const http = require('http');
 const fs = require('fs');
+const os = require('os');
 const crypto = require('crypto');
 const path = require('path');
 const puppeteer = require('puppeteer');
@@ -164,6 +165,58 @@ let SHOTDIR = '';          // --shotdir <dir>: write the mobile shot series here
 // is no orientationchange / screen.orientation listener. So "does the overlay
 // clear when you turn the phone" is a real, testable question.
 let ROTATE_MS = 0;
+// --- isolation arms (2026-09-01) -----------------------------------------
+// THE DEPLOYED ISOLATION MECHANISM WAS NEVER ONCE EXERCISED LOCALLY.
+// startServer() sets COOP/COEP itself (see below), so `crossOriginIsolated`
+// is true on this rig before /coi-serviceworker.js does anything at all. On
+// GitHub Pages there are no such headers — the service worker IS the whole
+// mechanism, and every configuration that blocks it (private window, blocked
+// storage, an extension) is a configuration this probe could not reach.
+//
+//   --nocoiheaders  serve WITHOUT COOP/COEP, exactly like GitHub Pages, so
+//                   the real service-worker path runs and its reload round
+//                   trip is measured rather than assumed.
+//   --noswa         additionally delete navigator.serviceWorker before any
+//                   page script runs, which is what a private window looks
+//                   like from inside the page. Exercises the bounded reload
+//                   and the hard-stop panel that must follow it.
+let NO_COI_HEADERS = false;
+let NO_SW = false;
+// --- progress sampling ---------------------------------------------------
+// Polls window.__dcProbe() (dreamcast.html) so the summary can say BOOTING or
+// BROKEN from a counter instead of from a screenshot. A wedged run screenshots
+// a plausible frame; a healthy mid-download run screenshots black. The picture
+// is not evidence in either direction — `seq` is.
+let PROG_MS = parseInt(process.env.PROBE_PROG_MS || '2000', 10);
+// --stallpart <n>: the Nth disc-part request sends its headers and ~1 MB and
+// then goes silent forever, without closing the socket. That is what a phone
+// losing its connection mid-download actually looks like to fetch(), and it is
+// the ONLY way to exercise the page's inter-chunk watchdog and its "the
+// download stopped" panel. An error handler nobody has ever fired is not a
+// safety net; this is how that one gets fired. Pair with --q netgrace=10 so
+// the run does not have to sit through the 45 s production budget.
+let STALL_PART = 0;
+let stallPartSeen = 0;
+// --allocfail <MB>: make any typed-array allocation of at least <MB> throw, in
+// the page realm, before any page script runs. This is a stand-in for the iOS
+// per-tab memory ceiling — the one hard constraint device emulation does NOT
+// reproduce. It cannot tell us WHERE a real iPhone's ceiling is; it can only
+// prove what this page does when it hits one, which was previously unknown and
+// unknowable without the phone.
+let ALLOC_FAIL_MB = 0;
+// --noglctx: Chrome's --disable-3d-apis, which removes WebGL from the PAGE AND
+// THE WORKER (a page-realm override cannot reach the worker's context, and the
+// worker's is the one that renders). Proves what the page does on a device with
+// no usable WebGL2 — previously that produced a black canvas behind a UI that
+// still looked alive, with the explanation only in the diagnostics panel.
+let NO_GL = false;
+// --noworkergl: the ONLY way to reach the worker's GL realm from here. The
+// worker script is served by this process, so a prelude is prepended to it that
+// makes OffscreenCanvas.getContext('webgl2') return null INSIDE THE WORKER.
+// Chrome's --disable-3d-apis does not reach it: measured 2026-09-01, that arm
+// left the page probe reporting no-WebGL2 while the worker rendered at 30 fps.
+// Without this, the page's terminal "no graphics context" stop is unprovable.
+let NO_WORKER_GL = false;
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i];
   if (a === '--duration')   DURATION_MS = parseInt(process.argv[++i], 10);
@@ -218,11 +271,22 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === '--swgl') SWGL = true;
   else if (a === '--shotdir') SHOTDIR = process.argv[++i];
   else if (a === '--rotate') { MOBILE = true; ROTATE_MS = parseInt(process.argv[++i], 10) >>> 0; }
+  else if (a === '--nocoiheaders') NO_COI_HEADERS = true;
+  else if (a === '--noswa') { NO_SW = true; NO_COI_HEADERS = true; }
+  else if (a === '--progms') PROG_MS = parseInt(process.argv[++i], 10) >>> 0;
+  else if (a === '--stallpart') STALL_PART = parseInt(process.argv[++i], 10) >>> 0;
+  else if (a === '--allocfail') ALLOC_FAIL_MB = parseInt(process.argv[++i], 10) >>> 0;
+  else if (a === '--noglctx') NO_GL = true;
+  else if (a === '--noworkergl') NO_WORKER_GL = true;
   else if (a === '-h' || a === '--help') {
     console.log('flycast_probe [--duration MS] [--idle MS] [--no-start] [--keep-noise] [--log PATH] [--interp] [--pctrace N]');
     console.log('  mobile arm: [--mobile] [--device "<KnownDevices name>"] [--mobileforce] [--swgl] [--shotdir DIR]');
     console.log('  --mobile emulates viewport/DPR/touch/UA only. It does NOT emulate a phone GPU driver,');
     console.log('  a phone memory ceiling, or thermal throttling. "mobile probe passed" != "works on a phone".');
+    console.log('  isolation:  [--nocoiheaders]  serve without COOP/COEP (as GitHub Pages does) so the');
+    console.log('                               real /coi-serviceworker.js path is what gets tested');
+    console.log('              [--noswa]         also hide navigator.serviceWorker (a private window)');
+    console.log('  liveness:   [--progms MS]     poll window.__dcProbe() (default 2000)');
     process.exit(0);
   }
 }
@@ -240,8 +304,17 @@ function startServer() {
   return new Promise((resolve) => {
     const srv = http.createServer((req, res) => {
       // COOP/COEP — required for SharedArrayBuffer.
-      res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-      res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+      //
+      // Sending these makes the rig UNLIKE the deploy: GitHub Pages sends no
+      // such headers, so on caseybement.com /coi-serviceworker.js is the only
+      // thing that produces isolation. --nocoiheaders drops them so the real
+      // mechanism is what runs. (The service worker still needs its own
+      // Service-Worker-Allowed scope-free registration at the root, which this
+      // server satisfies because it serves /coi-serviceworker.js from ROOT.)
+      if (!NO_COI_HEADERS) {
+        res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+        res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+      }
       res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
       let urlPath = decodeURIComponent(req.url.split('?')[0]);
       // Savestate fast-path (lever-6 tooling): the page PUTs a captured state
@@ -272,11 +345,66 @@ function startServer() {
         return;
       }
       if (urlPath === '/') urlPath = '/dreamcast.html';
+      // --stallpart: hang the Nth disc-part response mid-body. Headers and a
+      // first slice go out, then nothing, and the socket is deliberately left
+      // open — a closed socket would reject the fetch() promise, which the page
+      // already handles. The untested case is the one that never settles.
+      if (STALL_PART && /Track\d\.bin\.part/.test(urlPath) && ++stallPartSeen === STALL_PART) {
+        console.log('[probe] STALL INJECTED on disc part #' + stallPartSeen + ' (' + urlPath +
+          ') — headers + 1 MB, then permanent silence with the socket held open');
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Length', 99614720);   // claim the full part
+        res.write(Buffer.alloc(1048576));            // 1 MB, then never again
+        return;                                      // no res.end(), ever
+      }
+      // --noworkergl: rewrite the worker script on the way out. Prepending is
+      // safe for the page's capability probe, which fetches this same URL and
+      // greps it for 'heapAlloc' / 'discLazy' — the prelude adds text, removes
+      // none.
+      if (NO_WORKER_GL && /flycast_worker\.js$/.test(urlPath)) {
+        const src = fs.readFileSync(path.join(ROOT, urlPath), 'utf8');
+        const prelude = ';(function(){try{var P=self.OffscreenCanvas&&self.OffscreenCanvas.prototype;' +
+          'if(P){var g=P.getContext;P.getContext=function(t){' +
+          'if(String(t).indexOf("webgl")===0){return null;}' +
+          'return g.apply(this,arguments);};}}catch(e){}})();\n';
+        const body = Buffer.from(prelude + src, 'utf8');
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'application/javascript');
+        res.setHeader('Content-Length', body.length);
+        res.end(body);
+        return;
+      }
       const filePath = path.join(ROOT, urlPath);
       fs.stat(filePath, (err, stat) => {
         if (err || !stat.isFile()) { res.statusCode = 404; res.end('404'); return; }
         const ext = path.extname(filePath).toLowerCase();
         res.setHeader('Content-Type', MIME[ext] || 'application/octet-stream');
+        // Byte ranges. GitHub Pages serves them; this server did not, so
+        // preflightRanges() (dreamcast.html) got a 200 where it demands a 206
+        // and ?lazydisc=1 ALWAYS fell back to the eager path here — the one
+        // documented escape hatch for the memory failure mode could not be
+        // tested on this rig at all. Single-range only, which is all the page
+        // and the worker's range reader ever ask for.
+        const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || '').trim());
+        if (range) {
+          let s = range[1] === '' ? NaN : parseInt(range[1], 10);
+          let e = range[2] === '' ? NaN : parseInt(range[2], 10);
+          if (isNaN(s)) { s = stat.size - (isNaN(e) ? stat.size : e); e = stat.size - 1; }
+          if (isNaN(e) || e >= stat.size) e = stat.size - 1;
+          if (!(s >= 0) || s > e) {
+            res.statusCode = 416;
+            res.setHeader('Content-Range', 'bytes */' + stat.size);
+            res.end(); return;
+          }
+          res.statusCode = 206;
+          res.setHeader('Content-Range', 'bytes ' + s + '-' + e + '/' + stat.size);
+          res.setHeader('Content-Length', e - s + 1);
+          res.setHeader('Accept-Ranges', 'bytes');
+          fs.createReadStream(filePath, { start: s, end: e }).pipe(res);
+          return;
+        }
+        res.setHeader('Accept-Ranges', 'bytes');
         res.setHeader('Content-Length', stat.size);
         fs.createReadStream(filePath).pipe(res);
       });
@@ -442,11 +570,22 @@ function classify(text) {
     '--disable-background-timer-throttling',
     '--disable-backgrounding-occluded-windows',
     '--disable-renderer-backgrounding',
+    // BOUND THE DISK CACHE. Every run downloads a 1.13 GB disc, and Chrome will
+    // happily write all of it into the throwaway profile — one arm per gigabyte,
+    // in a temp directory that only gets removed on a CLEAN exit. A matrix of a
+    // dozen arms with any interrupted run among them fills the volume, which is
+    // how this rig hit ENOSPC on 2026-09-01. The server is local; a cache miss
+    // costs nothing here.
+    '--disk-cache-size=33554432',
   ];
   const V8_FLAGS = (process.env.FLYCAST_V8_FLAGS || '').trim();
   if (V8_FLAGS) {
     chromeArgs.push('--js-flags=' + V8_FLAGS);
     console.log('[probe] V8 flags: ' + V8_FLAGS);
+  }
+  if (NO_GL) {
+    chromeArgs.push('--disable-3d-apis');
+    console.log('[probe] NO-WEBGL ARM: --disable-3d-apis (page AND worker have no WebGL at all)');
   }
   if (SWGL) {
     // Software rasteriser arm. This is a DIFFERENT GL implementation, not a
@@ -455,13 +594,64 @@ function classify(text) {
     chromeArgs.push('--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader');
     console.log('[probe] GL: SwiftShader (software) — a weak-driver proxy, NOT a phone GPU');
   }
+  // FRESH PROFILE, EXPLICITLY, AND SAID OUT LOUD.
+  //
+  // Cross-origin isolation is ORIGIN-SCOPED and STICKY: once /coi-serviceworker.js
+  // is registered for 127.0.0.1:<port>, every later page on that origin is
+  // isolated from the service worker's cache before it runs a line of its own
+  // code. A matrix run on one profile therefore measures the FIRST arm twelve
+  // times and returns twelve identical rows — which is exactly what happened on
+  // the live-site matrix that preceded this change. Puppeteer's default is
+  // already a throwaway directory, but "already" is not a guarantee anybody can
+  // read off a log, so the directory is created here, named in the log, and
+  // deleted at exit. The isolation arms below are meaningless without it.
+  const PROFILE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'dcx-profile-'));
+  console.log('[probe] fresh browser profile: ' + PROFILE_DIR +
+    ' (no service worker, cache or storage carries in from any earlier arm)');
+  if (NO_COI_HEADERS)
+    console.log('[probe] ISOLATION ARM: server sends NO COOP/COEP — /coi-serviceworker.js ' +
+      'must produce cross-origin isolation on its own, as it does on GitHub Pages');
+  if (NO_SW)
+    console.log('[probe] ISOLATION ARM: navigator.serviceWorker hidden from the page ' +
+      '(what a private window / blocked-storage configuration looks like from inside)');
   const browser = await puppeteer.launch({
     executablePath: CHROME,
     headless: 'new',
     args: chromeArgs,
+    userDataDir: PROFILE_DIR,
     dumpio: !!process.env.FLYCAST_DUMPIO,  // tee Chrome stderr (V8 --print-wasm-code) into our stdout
   });
   const page = await browser.newPage();
+  if (ALLOC_FAIL_MB) {
+    console.log('[probe] MEMORY-CEILING ARM: typed-array allocations >= ' + ALLOC_FAIL_MB +
+      ' MB will throw in the page realm (a stand-in for the iOS per-tab ceiling; ' +
+      'it proves the page\'s BEHAVIOUR at a ceiling, not where a real iPhone\'s ceiling is)');
+    await page.evaluateOnNewDocument((limitMB) => {
+      const limit = limitMB * 1048576;
+      const wrap = (Ctor) => new Proxy(Ctor, {
+        construct(t, args, nt) {
+          if (typeof args[0] === 'number' && args[0] * (t.BYTES_PER_ELEMENT || 1) >= limit)
+            throw new RangeError('Array buffer allocation failed');
+          return Reflect.construct(t, args, nt);
+        },
+      });
+      try { window.Uint8Array = wrap(Uint8Array); } catch (_) {}
+      try { window.ArrayBuffer = wrap(ArrayBuffer); } catch (_) {}
+    }, ALLOC_FAIL_MB);
+  }
+  if (NO_SW) {
+    // Before ANY page script. The page's COI gate reads self.crossOriginIsolated
+    // and its reload bound must survive here; this is the configuration where
+    // the bound's old sessionStorage backing also throws, so this arm is the
+    // regression test for both at once.
+    await page.evaluateOnNewDocument(() => {
+      try {
+        Object.defineProperty(navigator, 'serviceWorker', {
+          configurable: true, get() { return undefined; },
+        });
+      } catch (_) {}
+    });
+  }
 
   // --- mobile device emulation ---
   // Sets viewport + DPR + hasTouch + mobile UA. The page's isMobile sniff
@@ -560,6 +750,56 @@ function classify(text) {
     + (EXTRA_QUERY ? '&' + EXTRA_QUERY : '');
   await page.goto(probeUrl, { waitUntil: 'domcontentloaded' });
 
+  // --- settle the isolation handshake ---------------------------------------
+  // Without COOP/COEP headers the page's FIRST load is not isolated: the COI
+  // service worker installs and the page reloads itself into isolation
+  // (location.replace, so no history is stacked). Everything below — the shell
+  // read, the Start tap — must happen on the settled load, not on the one that
+  // is about to be replaced. Bounded, and the outcome is REPORTED either way:
+  // "never became isolated" is a result, not an error to hide.
+  let coiSettled = { isolated: false, tries: 0, fatal: false, ms: 0 };
+  {
+    const t0 = Date.now();
+    const budget = 20000;
+    for (;;) {
+      let s = null;
+      try {
+        s = await page.evaluate(() => ({
+          isolated: !!self.crossOriginIsolated,
+          // ISOLATED IS NOT ENOUGH. crossOriginIsolated is true on the reloaded
+          // document from its first byte, while the page script has not yet
+          // run — and the mobile-shell block is the LAST thing in that script.
+          // Breaking on isolation alone read the shell mid-load and reported
+          // "*** MOBILE SHELL DID NOT ACTIVATE ***" on a page whose shell was
+          // up 250 ms later. Measured 2026-09-01; a false negative here is
+          // worse than no check, because this is the detector for "the phone
+          // got the desktop layout".
+          ready: document.readyState === 'complete',
+          fatal: !!(document.getElementById('fatal') &&
+                    getComputedStyle(document.getElementById('fatal')).display !== 'none'),
+          sw: !!(navigator.serviceWorker),
+          coitry: new URLSearchParams(location.search).get('coitry') || '0',
+        }));
+      } catch (_) { /* mid-navigation; try again */ }
+      if (s) {
+        // Count the page's OWN reload lines, not ?coitry= — the page strips that
+        // param via history.replaceState the moment isolation succeeds, so
+        // reading it back reported "0 reloads" for a run that visibly did one.
+        const coiReloads = linesAll.filter((l) => /\[coi\] not cross-origin isolated — reload /.test(l)).length;
+        coiSettled = { isolated: s.isolated, ready: s.ready, tries: coiReloads,
+                       fatal: s.fatal, sw: s.sw, ms: Date.now() - t0 };
+        if ((s.isolated && s.ready) || s.fatal) break;
+      }
+      if (Date.now() - t0 > budget) break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    console.log('[probe] isolation: crossOriginIsolated=' + coiSettled.isolated +
+      ' (document ' + (coiSettled.ready ? 'complete' : 'STILL LOADING') + ')' +
+      ' after ' + coiSettled.tries + ' COI reload(s) in ' + coiSettled.ms + 'ms' +
+      (coiSettled.fatal ? ' — page raised its hard-stop panel' : '') +
+      ' (navigator.serviceWorker ' + (coiSettled.sw ? 'present' : 'ABSENT') + ')');
+  }
+
   // --- mobile shell state ---
   // Read the shell's own DOM rather than inferring it. `shellActive` is the
   // claim that matters: if this is false the "mobile" run silently measured
@@ -567,7 +807,12 @@ function classify(text) {
   async function shellState() {
     return page.evaluate(() => {
       const g = (id) => document.getElementById(id);
-      const vis = (el) => !!el && getComputedStyle(el).display !== 'none';
+      // REAL visibility, not the element's own display rule. The old test
+      // reported all 8 touch buttons as visible while their #mobileShell parent
+      // was display:none — an inherited hide does not change a child's own
+      // computed display. getClientRects() is empty for anything not laid out,
+      // parents included, which is the question actually being asked.
+      const vis = (el) => !!el && el.getClientRects().length > 0;
       const c = g('dc-canvas');
       const r = c ? c.getBoundingClientRect() : null;
       return {
@@ -719,9 +964,44 @@ function classify(text) {
   let midShots = MID_SHOTS_MS.slice();   // lever-4: timed mid-run screenshots
   let lastStrip = -1e9;                  // --shotevery: elapsed ms of the last strip frame
   let presses = PRESSES.slice().sort((a, b) => a.at - b.at);  // --press ms:Key:holdMs
+  // --- liveness samples -----------------------------------------------------
+  // window.__dcProbe() is the page's own monotonic progress counter. Sampling it
+  // is the ONLY instrument here that separates "still downloading a 1.13 GB
+  // disc" from "wedged": both paint a black canvas, so the pixel analysis above
+  // answers neither. A flat `seq` across consecutive samples is the finding.
+  const progSamples = [];
+  let lastProgAt = 0;
+  let progUnavailable = null;
+  async function sampleProgress() {
+    if (Date.now() - lastProgAt < PROG_MS) return;
+    lastProgAt = Date.now();
+    try {
+      const p = await page.evaluate(() => (typeof window.__dcProbe === 'function' ? window.__dcProbe() : null));
+      if (!p) {
+        if (progUnavailable === null) {
+          progUnavailable = 'window.__dcProbe is not defined — either this page predates the ' +
+            'progress counter or its script died before defining it';
+          process.stdout.write('[live] ' + progUnavailable + '\n');
+        }
+        return;
+      }
+      p.wall = Date.now() - start;
+      progSamples.push(p);
+      const prev = progSamples.length > 1 ? progSamples[progSamples.length - 2] : null;
+      const dseq = prev ? p.seq - prev.seq : p.seq;
+      process.stdout.write('[live] +' + (p.wall / 1000).toFixed(1) + 's ' + p.live.toUpperCase() +
+        ' phase=' + p.phase + ' seq=' + p.seq + ' (+' + dseq + ')' +
+        (p.discTotal ? ' disc=' + (p.discBytes / 1048576).toFixed(0) + '/' +
+                       (p.discTotal / 1048576).toFixed(0) + 'MB' : '') +
+        ' fields=' + p.fields + ' fps=' + p.fps +
+        ' idle=' + (p.idleMs / 1000).toFixed(1) + 's\n');
+    } catch (_) { /* navigation or a closed page: not a liveness fact */ }
+  }
+
   while (Date.now() - start < DURATION_MS) {
     await new Promise(r => setTimeout(r, 250));
     if (fatal) { stopReason = 'fatal'; break; }
+    await sampleProgress();
     await maybeProfile();
     while (presses.length && Date.now() - start >= presses[0].at) {
       const pr = presses.shift();
@@ -805,8 +1085,14 @@ function classify(text) {
   if (SCREENSHOT_PATH || SHOTDIR) await shoot('final');
   const postState = await shellState().catch(() => null);
 
+  // Last liveness sample before teardown — the verdict below is about the state
+  // the run ENDED in, so it must not be one poll interval stale.
+  lastProgAt = 0;
+  await sampleProgress();
+
   await browser.close();
   srv.close();
+  try { fs.rmSync(PROFILE_DIR, { recursive: true, force: true }); } catch (_) {}
 
   // --- summary ---
   console.log('');
@@ -819,6 +1105,59 @@ function classify(text) {
   for (const m of milestones) console.log('    + ' + m);
   if (fatal) {
     console.log('  fatal:          ' + fatal.replace(/\n.*/s, ''));
+  }
+
+  // --- BOOTING vs BROKEN -----------------------------------------------------
+  // The question a black canvas cannot answer. Read straight off the page's own
+  // monotonic counter, sampled over the run.
+  console.log('');
+  console.log('  --- liveness (booting vs broken) ---');
+  console.log('    isolation:     crossOriginIsolated=' + coiSettled.isolated +
+              ' after ' + coiSettled.tries + ' COI reload(s)' +
+              (NO_COI_HEADERS ? '  [server sent NO COOP/COEP — the service worker did this]'
+                              : '  [server sent COOP/COEP — the service worker was NOT exercised]') +
+              (NO_SW ? '  [navigator.serviceWorker hidden]' : ''));
+  if (!progSamples.length) {
+    console.log('    NO SAMPLES — ' + (progUnavailable ||
+      'window.__dcProbe() never returned; the page script may have died before defining it'));
+  } else {
+    const first = progSamples[0], last = progSamples[progSamples.length - 1];
+    // Longest run of consecutive samples with an unchanged seq. This is the
+    // measurement: a healthy slow boot advances every sample, a wedge does not
+    // advance at all, and the two are identical in a screenshot.
+    let flat = 0, flatMax = 0, flatAt = 0;
+    for (let i = 1; i < progSamples.length; i++) {
+      if (progSamples[i].seq === progSamples[i - 1].seq) {
+        flat++;
+        if (flat > flatMax) { flatMax = flat; flatAt = progSamples[i].wall; }
+      } else flat = 0;
+    }
+    const flatMs = flatMax * PROG_MS;
+    console.log('    samples:       ' + progSamples.length + ' every ~' + PROG_MS + 'ms');
+    console.log('    seq:           ' + first.seq + ' -> ' + last.seq +
+                ' (+' + (last.seq - first.seq) + ')');
+    console.log('    longest flat:  ' + flatMax + ' consecutive samples (~' + flatMs + 'ms)' +
+                (flatMax ? ' ending at +' + (flatAt / 1000).toFixed(1) + 's' : ''));
+    if (last.discTotal)
+      console.log('    disc:          ' + (last.discBytes / 1048576).toFixed(0) + '/' +
+                  (last.discTotal / 1048576).toFixed(0) + ' MB (' +
+                  ((last.discBytes / last.discTotal) * 100).toFixed(1) + '%)');
+    console.log('    final phase:   ' + last.phase + '  booted=' + last.booted +
+                '  fields=' + last.fields + '  fps=' + last.fps +
+                '  guest=' + (last.guestX || 0).toFixed(3) + 'x');
+    console.log('    caps:          coi=' + last.coi + ' sab=' + last.sab +
+                ' offscreen=' + last.offscreen + ' webgl2=' + last.webgl2 +
+                ' stencil=' + (last.stencil && last.stencil.known
+                                ? (last.stencil.on ? 'granted' : 'REFUSED') : 'unknown'));
+    console.log('    heap:          init=' + last.heap.init + 'MB max=' + last.heap.max +
+                'MB reduced=' + last.heap.reduced + (last.heap.err ? ' err=' + last.heap.err : ''));
+    const verdict =
+      last.live === 'running' ? 'RUNNING — frames are flowing'
+      : last.live === 'stopped' ? 'BROKEN — ' + last.why
+      : (last.seq > first.seq) ? 'BOOTING — the counter is still advancing, nothing has failed'
+      : 'BROKEN — the counter never advanced across ' + progSamples.length + ' samples';
+    console.log('    => ' + verdict);
+    console.log('    page headline: ' + last.headline);
   }
 
   // --- renderer health ---
