@@ -63,6 +63,24 @@ BIND_RE = re.compile(
     r'(?P<name>[A-Za-z_]\w*)\s*(?:=|\s)\s*'
     r'\(?\s*(?P<addr>0[xX][0-9A-Fa-f]{6,8})\s*[uU]?\)?')
 
+# Addresses established as the SAME cell under two names BY DESIGN. Each entry
+# must carry the reason it is not a collision — an unexplained entry here is how
+# a real collision gets buried, which is the failure this whole tool exists to
+# prevent. Verified by semantics, not by address.
+BENIGN = {
+    0x02680000: ("CT_BASE (ppc_worker.js) is a hand-copied JS MIRROR of "
+                 "CT_QUEUE_ADDR (sab_layout.h); the JS also duplicates "
+                 "CT_QUEUE_RECORDS_OFF/CAPACITY/CT_OFF_GTL/CT_REC_BYTES, all "
+                 "matching the header. Same struct, two names. "
+                 "⚠ LATENT DRIFT HAZARD: nothing checks the mirror stays in "
+                 "sync with the header."),
+    0x026B3A00: ("kCtl (VertexManagerBase.cpp, 'nonzero = census OFF') and "
+                 "CENSUS_BASE (dolphin_render_probe.js) are the same control "
+                 "cell — CENSUS_BASE is that cell plus the base of its 62-word "
+                 "read window. Producer/consumer under two names."),
+}
+
+
 def claims():
     out = defaultdict(list)          # addr -> [(name, relpath, lineno)]
     for d in SCAN_DIRS:
@@ -90,6 +108,7 @@ def main():
     show_all = '--list' in sys.argv
     c = claims()
     collisions = []
+    benign_hits = []
     for addr, entries in sorted(c.items()):
         names = {n for (n, _f, _l) in entries}
         files = {f for (_n, f, _l) in entries}
@@ -108,6 +127,9 @@ def main():
         # SAB address, not subsystem claims on a cell.
         if all(len(n) < 3 for n in names):
             continue
+        if addr in BENIGN:
+            benign_hits.append((addr, entries))
+            continue
         collisions.append((addr, entries))
 
     if show_all:
@@ -117,8 +139,17 @@ def main():
             print(f"  0x{addr:08X}  {owners}")
         print()
 
+    if benign_hits:
+        print(f"[sab-audit] {len(benign_hits)} known-benign alias pair(s), not counted as collisions:")
+        for addr, entries in benign_hits:
+            who = ", ".join(f"{n} ({f}:{l})" for n, f, l in entries)
+            print(f"  0x{addr:08X}  {who}")
+            print(f"      reason: {BENIGN[addr]}")
+        print()
+
     if not collisions:
-        print(f"[sab-audit] OK — {len(c)} claimed cell(s), 0 collisions")
+        print(f"[sab-audit] OK — {len(c)} claimed cell(s), 0 collisions "
+              f"({len(benign_hits)} allowlisted)")
         return 0
 
     print(f"[sab-audit] {len(collisions)} COLLISION(S) — one address bound to "
