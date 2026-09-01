@@ -320,23 +320,35 @@ def main():
         # Measured cost of that shape: 1.5 s of emulated time in 600 s = 0.0025x,
         # against 0.0328x for a loop that answers each stop immediately.
         # So: arm ONE hot anchor, keep the timeout short, and re-continue at once.
-        for tgt, _ in probes:
-            g.del_bp(tgt)
-        anchor = a.anchor if a.anchor else 0x800e78ac   # OSDisableInterrupts, 212 callers
-        g.add_bp(anchor)
-        print(f"[base] advancing the boot for {boot:.0f}s on a single hot anchor "
-              f"{anchor:#010x} (stops are answered immediately) ...", flush=True)
+        # BOOT ADVANCE, fifth revision -- and the fourth one was a REGRESSION.
+        # Copied from the loop that actually measured fast, capture_replayable_fixture
+        # (gamecube/tools/native_oracle_gdb.py): it issues cont(timeout=120) in a loop
+        # and NEVER resyncs inside it.  When the breakpoint does not fire, the guest
+        # runs FREELY for the whole timeout -- that is where 0.0328x came from.
+        # Two ways to lose it, both measured here:
+        #   * resync() inside the loop (rev 4).  resync ends in pc(), which needs a
+        #     HALTED cpu, so it blocks while the guest runs: 0.0025x.
+        #   * an anchor that is too hot (rev 5).  OSDisableInterrupts fired 2,170,350
+        #     times in 900 s = 2,412/s, and the per-stop round trip consumed the run:
+        #     0.0004x, SIX TIMES WORSE than the thing it was meant to fix.
+        # So: keep the RARE v3 probes armed (they fired 62-73 times in 981 s, which is
+        # enough to hand back control and cheap enough to ignore), a long timeout, and
+        # NO per-stop work whatsoever.
+        print(f"[base] advancing the boot for {boot:.0f}s on {len(probes)} rare probes, "
+              f"long cont, no resync in the loop ...", flush=True)
         last = t0
         while time.time() - t0 < boot:
+            remain = boot - (time.time() - t0)
             try:
-                g.cont(timeout=8.0)
+                g.cont(timeout=max(5.0, min(120.0, remain)))
                 tries += 1
             except Exception:
-                g.resync()
+                pass                      # timeout = the guest simply kept running
             if time.time() - last >= 120.0:
                 last = time.time()
                 print(f"[base]   t+{time.time() - t0:.0f}s  {tries} stops", flush=True)
-        g.del_bp(anchor)
+        for tgt, _ in probes:
+            g.del_bp(tgt)
         g.resync()
         print(f"[base] boot advanced: {tries} stops in {time.time() - t0:.0f}s")
 
