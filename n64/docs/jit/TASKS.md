@@ -7,7 +7,14 @@ result is not meant to ship); probe = `node tools/n64_boot_test.mjs <rom.z64>`
 against `npm run web` on :8080. Measurement hygiene gate #8 applies: clean
 build, baseline first, one change at a time.
 
-## M0 — build reproducibility  ✅ DONE 2026-06-12
+## M0 — build reproducibility  ✅ DONE 2026-06-12, RE-DONE 2026-09-01 under emsdk 6.0.2
+- [x] **2026-09-01: the vendored emsdk moved 3.1.67 → 6.0.2 and BROKE this
+      milestone; it is repaired and the dist now SHIPS FROM SOURCE** (213d49c0).
+      See "NEXT ACTIONS" item 4 for the three causes and the full gate. The two
+      that will bite anyone touching another emulator's build the same way:
+      emscripten 6 attaches `FS`/`HEAP*` to `Module` only when EXPORTED, and
+      `Module.calledRun` no longer exists at all — a harness gating on it
+      reports a healthy core as `launched:false` with empty logs.
 - [x] Vendored core rebuilds under repo emsdk 3.1.67 (two implicit-int fixes)
 - [x] Rebuilt binary boots Mario Kart headless: 98% speed, 0 page errors
 - [x] Decision: dist stays vendored until the JIT build picks flags
@@ -608,7 +615,17 @@ same wasm type and join immediately.
       the new path had fired at all — the exact wave-10a trap, caught here by
       looking for the counter rather than trusting the PASS. `nativeFPCvt` is
       now surfaced (index.html:2265).
-- [ ] **LIVENESS COUNTER NOT YET CAPTURED — the one gate wave 11a is missing.**
+- [x] **LIVENESS COUNTER CAPTURED — ✅ 2026-09-01.** `nativeFPCvt` is NONZERO on
+      live ROMs, read off `__jitStats()` in `tools/n64_jit_diff_test.mjs` runs
+      that also returned determinismControl PASS and jitVsInterp PASS at 600 VI:
+      **sm64 382, mariokart 125, oot 809** (0 emitFails, 0 instantiateFail on
+      all three). That is the single direct observation this item asked for, and
+      it replaces the two-step inference below. Taken incidentally while gating
+      the restored emsdk-6.0.2 core build (213d49c0) — on the REBUILT binary,
+      whose emission stats are bit-identical to the vendored core's, so it
+      applies to both. dk64 specifically is still unread; the three above are
+      sufficient to prove the path fires, not to rank it.
+      <details><summary>Original blocked note, kept for the record</summary>
       The re-run to read `nativeFPCvt` off a live ROM was queued through
       `probe_lock.sh` and **timed out after 2400 s without ever acquiring the
       lock** (11-12 sibling agents queued; the lock is an unfair `mkdir` spin,
@@ -624,6 +641,7 @@ same wasm type and join immediately.
       Worth fixing at the rig level too: the lock has no queue fairness, and a
       waiter that loses ~12 races in a row starves while the box sits at load
       0.5-1.0.
+      </details>
 
 ## Action #1 EXECUTED — waves 8/9/10a priced on a quiet box (2026-09-01)
 
@@ -779,15 +797,54 @@ NEXT ACTIONS, in order:
 2. ~~Fix the `thewheel.z64` `?jit` wedge~~ — ✅ DONE 2026-09-01 (607b3b1),
    a vendored-core null-ops bug, not an emitter bug. See its section above.
 3. Wave 11 — **11a (converts) DONE 2026-09-01**, see its section above.
-   **11b (compares + BC1) is BLOCKED on the N64 build toolchain**, not on the
-   emitter: it needs `jit_params[43] = &FCR31`, a one-line core change, and the
-   vendored emsdk is now 6.0.2 where `libretronew.c` does not compile.
-4. **RESTORE THE N64 CORE BUILD.** This was a background annoyance and is now
-   the critical path: it gates wave 11b (the largest remaining FP lever,
-   19-33% of heavy-set fallbacks), and CLAUDE.md notes the shipped
-   `n64/N64Wasm/dist/` is currently un-reproducible on this machine at all.
-   Either fix the 7 `-Wincompatible-pointer-types` in `libretronew.c` under
-   6.0.2, or pin a working emsdk deliberately.
+   **11b (compares + BC1) is UNBLOCKED as of 2026-09-01** — the build is
+   restored (action #4 below), so `jit_params[43] = (uint32_t)(uintptr_t)&FCR31;`
+   in `recomp.c` can now be added and shipped. This is the largest remaining FP
+   lever on the heavy set (19-33% of what still falls back on dk64/banjo).
+   Do it the documented way: edit `recomp.c`, `source emsdk/emsdk_env.sh && cd
+   n64/N64Wasm/code && make -j8`, then re-gate the dist as #4 did before
+   committing it — the build writes STRAIGHT INTO `../dist/`.
+4. ~~**RESTORE THE N64 CORE BUILD.**~~ — ✅ **DONE 2026-09-01** (4aaff9f2 source,
+   39a8477f Makefile, 8110341a harnesses, 213d49c0 the shipped dist). The core
+   builds from source under the vendored emsdk **6.0.2** and the rebuilt binary
+   is now what ships; `n64/N64Wasm/dist/` is reproducible again.
+   Three causes, and only the first was the one CLAUDE.md named:
+   - 7 `-Wincompatible-pointer-types` in `libretronew.c` (`gzFile` is already a
+     pointer; `savestate_buffer` is an array and decays on its own; one
+     `struct rgba*` → `uint32_t*` return), plus
+     `EXTRA_EXPORTED_RUNTIME_METHODS` → `EXPORTED_RUNTIME_METHODS`.
+   - **Emscripten 6 no longer attaches `FS` or the `HEAP*` views to `Module`**
+     unless they are EXPORTED (`emsdk/upstream/emscripten/src/runtime_common.js:
+     164-171`). `n64/index.html:2102` reads `Module.HEAP16.buffer` and
+     `dist/script.js:618,679,907,927,981` call `FS.*`, so the first rebuild died
+     with `Cannot read properties of undefined (reading 'buffer')`. The Makefile
+     export list is now a diffed SUPERSET of what the 3.1.67 binary exposed.
+   - **`Module.calledRun` DOES NOT EXIST under 6.0.2** — guarded by
+     `#if ASSERTIONS`, never assigned to `Module` (`src/postamble.js:117-120`).
+     Measured on the artifacts: shipped 3.1.67 `n64wasm.js` contains the string
+     6 times, the 6.0.2 rebuild 0 times. `n64_boot_test.mjs` and
+     `n64_gameplay_probe.mjs` gated boot on it and reported `launched:false` +
+     TimeoutError + **empty pageErrors AND empty coreLog** for a core that was
+     booting and rendering correctly. **The lesson: a silent harness failure is
+     not a core failure — sample the canvas for non-black + changing pixels
+     before believing any Module flag.** Both harnesses now try `calledRun`
+     first (so 3.1.67 behaviour is unchanged) then fall back to
+     `moduleInitializing === false` + exports attached.
+
+   Gated 8/8 ROMs paired against the vendored binary in one `probe_lock` window
+   (CPU_Speed_Limit 100, load 2.3-4.3, `.wasm` md5 checked before and after
+   every run): sm64 / mariokart / oot / starfox / dk64 / conker /
+   gauntletLegends / pkmnsnap all boot AND render on both arms, 0 page errors.
+   `n64_page_test.mjs` is identical across the two cores (ratetest 104/0 on
+   both; `pace.ok` false on BOTH — pre-existing). `n64_jit_diff_test.mjs` at 600
+   VI: determinism + jitVsInterp **PASS** on sm64/mariokart/oot with 0 emitFails,
+   and the emission stats are bit-identical to wave 11a's recorded table.
+   **Two control lessons worth keeping**: dk64 read `blackScreen=true` at the
+   default 8s settle *on both cores* (dark intro — use `N64_SETTLE_MS=25000`),
+   and one starfox arm failed on 4x `net::ERR_FAILED` from
+   `cdnjs.cloudflare.com` because the vendored `dist/n64.html` test page pulls
+   rivets/toastr/popper/nipplejs from a CDN. Neither is a core property; both
+   would have been reported as regressions without a matched control arm.
 5. Full-library differential sweep (all 27 ROMs bit-identical per VI) — the
    gate a5efb66 named before the ?jit default can flip. `thewheel` already
    proves this sweep is not a formality. NOT attempted 2026-09-01: it is a
