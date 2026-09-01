@@ -1,0 +1,15 @@
+diff --git a/core/oslib/virtmem.h b/core/oslib/virtmem.h
+index 1a62db5..b2fa53c 100644
+--- a/core/oslib/virtmem.h
++++ b/core/oslib/virtmem.h
+@@ -1,7 +1,9 @@
+ #pragma once
+ #include "types.h"
+ 
+-#if defined(_WIN32) || defined(__APPLE__)
++#if defined(_WIN32) || defined(__APPLE__) || defined(__EMSCRIPTEN__)
++// Emscripten: no `.text` section attribute on wasm32. Use the pointer-only
++// path; rec_wasm.cpp doesn't write blocks into a native code cache.
+ #define DECLARE_CODE_CACHE(Name, Size) static u8 *Name;
+ #elif defined(__ANDROID__)
+ #define DECLARE_CODE_CACHE(Name, Size) alignas(4096) static u8 Name[Size];

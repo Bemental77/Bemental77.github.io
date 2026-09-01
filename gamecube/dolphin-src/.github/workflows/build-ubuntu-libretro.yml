@@ -1,0 +1,46 @@
+name: Build Dolphin (libretro) on Ubuntu x64
+
+on: [push, pull_request]
+
+env:
+  core_id: dolphin_libretro
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - name: "Ubuntu x64"
+          os: ubuntu-latest
+          ZIP_NAME_SUFFIX: linux_x64
+    steps:
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y cmake ninja-build pkg-config \
+          libasound2-dev \
+          libx11-dev libxi-dev libxrandr-dev libudev-dev libevdev-dev \
+          libegl1-mesa-dev libgl1-mesa-dev \
+          libmbedtls-dev libcurl4-openssl-dev zlib1g-dev
+
+    - name: Checkout Dolphin (libretro) repo
+      uses: actions/checkout@v6
+      with:
+        path: ${{ env.core_id }}
+        submodules: recursive
+
+    - name: Configure
+      run: |
+        cd ${{ env.core_id }}
+        mkdir -p build && cd build
+        cmake .. \
+          -DLIBRETRO=ON \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX=${{ github.workspace }}/install
+
+    - name: Build
+      run: |
+        cd ${{ env.core_id }}/build
+        make -j$(nproc)

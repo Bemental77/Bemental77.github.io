@@ -1,0 +1,49 @@
+name: Build Dolphin (libretro) for Windows (MinGW on Ubuntu)
+
+on: [push, pull_request]
+
+env:
+  core_id: dolphin_libretro
+
+jobs:
+  build-windows-mingw:
+    runs-on: ubuntu-latest
+    container: ubuntu:25.10
+    steps:
+    - name: Install dependencies
+      run: |
+        apt update
+        apt install -y git cmake ninja-build pkg-config \
+          mingw-w64
+
+    - name: Checkout Dolphin (libretro) repo
+      uses: actions/checkout@v6
+      with:
+        path: ${{ env.core_id }}
+        submodules: recursive
+
+    - name: Configure (MinGW cross-compile)
+      run: |
+        cd ${{ env.core_id }}
+        export PKG_CONFIG_LIBDIR=/usr/x86_64-w64-mingw32/lib/pkgconfig
+        export PKG_CONFIG_PATH=/usr/x86_64-w64-mingw32/share/pkgconfig
+        export PKG_CONFIG_SYSROOT_DIR=/usr/x86_64-w64-mingw32
+        mkdir -p build && cd build
+        cmake .. \
+          -DLIBRETRO=ON \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_SYSTEM_NAME=Windows \
+          -DCMAKE_SYSTEM_PROCESSOR=x86_64 \
+          -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+          -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
+          -DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres \
+          -DCMAKE_FIND_ROOT_PATH=/usr/x86_64-w64-mingw32 \
+          -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+          -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+          -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+          -G Ninja
+
+    - name: Build
+      run: |
+        cd ${{ env.core_id }}/build
+        ninja -j$(nproc)

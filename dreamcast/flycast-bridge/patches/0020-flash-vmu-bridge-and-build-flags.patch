@@ -1,0 +1,98 @@
+diff --git a/core/build.h b/core/build.h
+index 41e4120..5f49faf 100755
+--- a/core/build.h
++++ b/core/build.h
+@@ -64,9 +64,10 @@
+ 
+ #if defined(__EMSCRIPTEN__)
+ // WASM target: SH4 dynarec via WasmDynarec (rec_wasm.cpp + bementalJIT).
+-// ARM7 (AICA) and DSP fall back to interpreters.
++// ARM7 (AICA) rec via arm7_rec_wasm.cpp (flycast-bridge, lever-7).
++// DSP falls back to the interpreter.
+ #define FEAT_SHREC DYNAREC_JIT
+-#define FEAT_AREC DYNAREC_NONE
++#define FEAT_AREC DYNAREC_JIT
+ #define FEAT_DSPREC DYNAREC_NONE
+ #endif
+ 
+diff --git a/core/hw/flashrom/nvmem.cpp b/core/hw/flashrom/nvmem.cpp
+index ca5903a..768c1f2 100644
+--- a/core/hw/flashrom/nvmem.cpp
++++ b/core/hw/flashrom/nvmem.cpp
+@@ -32,6 +32,20 @@ namespace nvmem
+ static MemChip *sys_rom;
+ static WritableChip *sys_nvmem;
+ 
++#ifdef __EMSCRIPTEN__
++// Console flash bridge (wasm build). PSO ties the Serial Number + Access Key
++// to the CONSOLE ("you must play on the same Dreamcast" — its own wording),
++// not to the memory card, so a card seeded with PSO______SYS still hits the
++// registration screen. Publish the system flash so the page can seed it from
++// a console that has already registered, and persist writes. Set once the
++// chip exists; the page seeds before the guest reads it.
++extern "C" {
++	u8 *g_dcflash_ptr = nullptr;
++	u32 g_dcflash_size = 0;
++	volatile u32 g_dcflash_gen = 0;
++}
++#endif
++
+ static std::string getRomPrefix()
+ {
+ 	switch (settings.platform.system)
+@@ -365,6 +379,11 @@ void init()
+ 		sys_rom = new RomChip(settings.platform.bios_size);
+ 		sys_nvmem = new DCFlashChip(settings.platform.flash_size);
+ 		reios_set_flash(sys_nvmem);
++#ifdef __EMSCRIPTEN__
++		g_dcflash_ptr = sys_nvmem->data;
++		g_dcflash_size = sys_nvmem->size;
++		++g_dcflash_gen;
++#endif
+ 		break;
+ 	case DC_PLATFORM_NAOMI:
+ 	case DC_PLATFORM_NAOMI2:
+diff --git a/core/hw/maple/maple_devs.cpp b/core/hw/maple/maple_devs.cpp
+index 66cf549..3163f22 100755
+--- a/core/hw/maple/maple_devs.cpp
++++ b/core/hw/maple/maple_devs.cpp
+@@ -347,6 +347,19 @@ u8 vmu_default[] = {
+ 		0x77,0x19,0x06,0xef,
+ };
+ 
++#ifdef __EMSCRIPTEN__
++// VMU bridge (wasm build). The emscripten VMU is in-memory only (see the
++// __EMSCRIPTEN__ branch of OnSetup), so the card is blank on every load and
++// anything the guest saved is gone. Publish the live flash buffer so the
++// worker shim can seed it from a shipped default card and persist guest
++// writes to IndexedDB. Single card (slot A1): last attached device wins.
++extern "C" {
++	u8 *g_vmu_flash_ptr = nullptr;
++	u32 g_vmu_flash_size = 0;
++	volatile u32 g_vmu_flash_gen = 0;   // bumped whenever flash_data changes
++}
++#endif
++
+ struct maple_sega_vmu: maple_base
+ {
+ 	FILE *file = nullptr;
+@@ -442,6 +455,9 @@ struct maple_sega_vmu: maple_base
+ 		file = nullptr;
+ 		initializeVmu();
+ 		fullSaveNeeded = false;
++		g_vmu_flash_ptr = flash_data;
++		g_vmu_flash_size = sizeof(flash_data);
++		++g_vmu_flash_gen;   // blank card ready; the shim may now seed it
+ 		return;
+ #endif
+ 
+@@ -708,6 +724,9 @@ struct maple_sega_vmu: maple_base
+ 							return MDRE_FileError; //invalid params
+ 						}
+ 						rptr(&flash_data[write_adr],write_len);
++#ifdef __EMSCRIPTEN__
++						++g_vmu_flash_gen;   // guest wrote the card
++#endif
+ 
+ 						if (file != nullptr)
+ 						{
