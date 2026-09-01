@@ -45,10 +45,32 @@ above the SAB window, so the wasm build gets a genuinely zeroed cell — and it 
 the same target the live build compiles to.
 
 ```bash
+# build (vendored emsdk is fine — the emitter is deterministic C++, so which
+# emcc compiled it cannot change the wasm it EMITS; this is not the dolphin
+# build and must not use the 4010 WebGPU pair)
+source emsdk/emsdk_env.sh
+emmake make -C gamecube/bementalJIT/build-emcc -j2
+cd gamecube/bementalJIT && em++ -std=c++2a -O1 -I. -Iinclude tools/op_census.cpp \
+  build-emcc/guests/powerpc-next/libbementalJITPowerPCNext.a build-emcc/libbementalJIT.a \
+  build-emcc/guests/powerpc/libbementalJITPowerPC.a \
+  build-emcc/guests/powerpc-next/libbementalJITPowerPCNext.a build-emcc/libbementalJIT.a \
+  -sGLOBAL_BASE=40894464 -sINITIAL_MEMORY=201326592 -sALLOW_MEMORY_GROWTH=1 \
+  -sNODERAWFS=1 -sEXIT_RUNTIME=1 -sSTACK_SIZE=4194304 -o /tmp/op_census.js
+
+# run
 node gamecube/tools/op_census_manifest.mjs /tmp/wasm_pc_hist.json /tmp/sab.manifest
 node /tmp/op_census.js /tmp/sab.manifest /tmp/census-out
 python3 gamecube/tools/op_census_report.py /tmp/census-out /tmp/sab.manifest.weights
 ```
+
+For an A/B, flip one compile-time constant, rebuild both, and census both into
+separate directories — never compare a census to a remembered number.
+
+The census itself needs no lock — it is offline, browser-free and load-independent,
+which is most of why it is worth having. **Anything that opens a browser does:
+`bash tools/probe_lock.sh run -- <cmd>`** (acquires, reaps orphaned browsers,
+waits for 1-minute load < 12, releases on every path). That includes the emitter
+test suite, which is a headless-browser harness, not just probes.
 
 Validate emitted modules with **`wasm-validate --enable-all`**. Plain
 `wasm-validate` rejects them with `memory may not be shared: threads not allowed`
