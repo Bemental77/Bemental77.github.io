@@ -57,6 +57,21 @@ const main = async () => {
     const j = JSON.parse(fs.readFileSync(file, 'utf8'));
     for (const fx of j.fixtures) {
       const entry = fx.entry >>> 0;
+      // HONOUR THE ARTIFACT'S OWN REJECTION FLAG.  Three records in
+      // sab_nonleaf_fixtures.json carry usable:false with the reason recorded at
+      // capture time -- 0x800e3970 has 30 unknown store forms so its write log is
+      // INCOMPLETE BY CONSTRUCTION, and 0x80118180 hit the 40,000-step cap without
+      // returning so the capture is TRUNCATED.  Neither can be a pass criterion.
+      // A closure build hid this by never emitting them ("not in this build"); a
+      // WHOLE-IMAGE build emits everything, so without this gate they run and
+      // "fail", which reads exactly like a correctness regression and is not one.
+      if (fx.usable === false) {
+        const why = fx.unknown_stores?.length ? `${fx.unknown_stores.length} unknown store forms`
+                  : fx.returned === false ? `did not return in ${fx.steps} steps`
+                  : !fx.n_calls ? 'no bl executed' : 'marked unusable at capture';
+        console.log(`SKIP  0x${entry.toString(16).padStart(8, '0')}  usable:false — ${why}`);
+        continue;
+      }
       const want = expandWrites(fx.writes);
       const tag = `0x${entry.toString(16).padStart(8, '0')}`;
       const runs = [];

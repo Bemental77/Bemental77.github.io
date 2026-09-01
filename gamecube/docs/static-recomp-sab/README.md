@@ -214,7 +214,31 @@ against that 4,671-function binary rather than the 4-function slice:
 md5 `c5b33b99aad50163b488b647ece420df` identical before and after the run. This is a
 materially stronger statement than the slice result: the vectors now execute inside a
 module that also contains 812 indirect-dispatch sites and every other translated
-function in the image, so nothing about the surrounding 4,667 functions perturbs them. That skip list is not a failure — it is written out with
+function in the image, so nothing about the surrounding 4,667 functions perturbs them.
+
+The 7 non-leaf fixtures run against the whole-image build too — **7 PASS / 0 FAIL**,
+md5 `51092aa5272349e1d8a1ed7aa25aead3` identical before and after, with the 3
+`usable:false` records correctly skipped.
+
+**Two things the whole-image build exposed that a closure build cannot.**
+
+1. **V8 has a hard per-function size ceiling and `-O2` crosses it.** Built at `-O2`,
+   the whole-image module fails at instantiate with
+   `CompileError: WebAssembly.instantiate(): size 8549242 > maximum function size 7654321`
+   — clang inlines the translated bodies into `sr_dispatch` and the result exceeds
+   V8's limit. It reads like a corrupt wasm, not a size limit. A whole-image build
+   must lower the optimisation level (`SR_OPT=-O0`); both build scripts now take that
+   knob. This is a **real scaling constraint on this route**, not a one-off.
+2. **A rig defect that would have read as a correctness regression.**
+   `verify_fixture.mjs` ignored the artifact's own `usable:false` flag. Three records
+   in `sab_nonleaf_fixtures.json` carry it with the reason recorded at capture time —
+   `0x800e3970` has **30 unknown store forms** so its write log is incomplete *by
+   construction*, and `0x80118180` hit the **40,000-step cap without returning** so
+   its capture is truncated. A closure build hid this by never emitting them
+   (`not in this build`); the whole-image build emits everything, so they ran and
+   "failed" with `read of UNSTAGED guest byte` and a write log that overflowed to
+   exactly 1,048,576 events (`g_wlog_cap = 1<<20`). Neither can be a pass criterion,
+   and the flag is now honoured. That skip list is not a failure — it is written out with
 `--skiplist` and **it is the host-binding worklist**, the same function-granular
 exclusion N64Recomp's toml provides (`~/gc_refs/N64Recomp/README.md:32`) and the
 mechanism by which a *binary* recomp gets MP4's "never compiled `OSThread.c` in"

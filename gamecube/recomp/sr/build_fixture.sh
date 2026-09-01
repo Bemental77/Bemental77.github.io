@@ -50,7 +50,11 @@ else
           "${ARGS[@]}" "${EXTRA[@]}" --closure --out "$OUT/sr_gen.c"
 fi
 
-emcc -O2 -DSR_VERIFY -I"$SR" "$OUT/sr_gen.c" "$SR/sr_driver.c" -o "$OUT/sr_fixture.js" \
+# SR_OPT: optimisation level.  MUST be lowered for a whole-image build: at -O2 clang
+# inlines the translated bodies into sr_dispatch and the result exceeds V8's hard
+# per-function ceiling -- "size 8549242 > maximum function size 7654321" at
+# instantiate time, which reads like a corrupt wasm rather than a size limit.
+emcc ${SR_OPT:--O2} -DSR_VERIFY -I"$SR" "$OUT/sr_gen.c" "$SR/sr_driver.c" -o "$OUT/sr_fixture.js" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \
   -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=134217728 \
   -sEXPORTED_FUNCTIONS=_sr_init,_sr_ram,_sr_ram_size,_sr_state,_sr_state_size,_sr_call,_sr_staged,_sr_wlog,_sr_wlog_n,_sr_unstaged,_sr_verify_reset,_malloc \
