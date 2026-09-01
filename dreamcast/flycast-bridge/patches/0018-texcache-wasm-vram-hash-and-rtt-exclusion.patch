@@ -1,0 +1,132 @@
+diff --git a/core/rend/TexCache.cpp b/core/rend/TexCache.cpp
+index 0a032fc..914a5ce 100644
+--- a/core/rend/TexCache.cpp
++++ b/core/rend/TexCache.cpp
+@@ -237,17 +237,71 @@ bool BaseTextureCacheData::NeedsUpdate() {
+ 			rc = true;
+ 	}
+ #ifdef __EMSCRIPTEN__
+-	else if (!rc)
++	// WASM has NO VRAM write detection at all, for ANY texture type.
++	// protectVRam() below calls addrspace::protectVram (addrspace.cpp:478),
++	// which falls through to virtmem::region_lock -> mprotect because
++	// virtmemEnabled() is false (virtmem::init returns false unconditionally
++	// under emscripten, core/linux/posix_vmem.cpp:167-171) — and mprotect is a
++	// no-op in wasm. `dirty` is only ever set from a fault handler
++	// (core/linux/common.cpp:52 -> VramLockedWrite), and linear-memory stores
++	// never trap. So once a texture is uploaded, the guest rewriting that VRAM
++	// never invalidates it: frozen animated textures, stale HUD/text, stale FMV
++	// frames. Only paletted textures recovered, via the palette-hash check
++	// above. (This block previously covered ONLY TextureType::_8.)
++	//
++	// Fix = hash the SOURCE VRAM bytes and force a re-decode when they change.
++	// Chosen over hooking write paths because it is the only COMPLETE option:
++	// it compares the bytes themselves, so it cannot miss a writer — SH4
++	// stores, ch2-DMA, TA/store-queue, and the emitter's immediate-EA raw VRAM
++	// store, which bypasses the sh4_mem_write* import entirely
++	// (bementalJIT/guests/sh4/wasm_emit.cpp:1327-1333) and is therefore
++	// invisible to any write-hook/SMC-map scheme.
++	//
++	// COST IS BOUNDED, not per-write and not per-draw: NeedsUpdate() runs once
++	// per BOUND texture (gles/gltex.cpp:285), the FrameCount guard collapses
++	// that to once per frame per texture, and an already-dirty texture skips
++	// the hash entirely.
++	//
++	// Range = exactly the range protectVRam() locks below (block->start =
++	// startAddress, block->end = mmStartAddress + size - 1), so the VQ codebook
++	// and the mip chain are covered too — the old _8-only version hashed only
++	// [mmStartAddress, +size) and excluded VQ.
++	//
++	// wasmVramIsSourceOfTruth() (TexCache.h:190) excludes the one class of entry for
++	// which hashing VRAM is WRONG: a render-to-texture surface under the default
++	// config::RenderToTextureBuffer == false. Its pixels exist only in the GPU
++	// texture handed over by the RTT pass — the backend attaches that texture and
++	// then does `dirty = 0; unprotectVRam();` (gles/gltex.cpp:290-291 and the
++	// four sibling backends), precisely so it is never re-sourced from VRAM.
++	// Without this guard those entries fell into the block below: wasmDataHash
++	// starts at 0 (TexCache.h:113), so the first post-RTT bind hashed non-zero
++	// and forced rc = true, and Update() has no unchanged-hash early-out — it
++	// clears dirty and re-decodes unconditionally (Update(), TexCache.cpp:507-511
++	// then :749) into the very texID the FBO was detached into. Result:
++	// mirrors/monitors/reflections
++	// overwritten with a decode of whatever the guest left at that VRAM address.
++	//
++	// Deliberately still hashed:
++	//  * config::RenderToTextureBuffer == true — there the RTT pass DOES write
++	//    the pixels back through WriteTextureToVRam() and leaves lock_block
++	//    installed, so VRAM is the source of truth. Native catches that write
++	//    with the vramlock fault; on wasm this hash is the only thing that does.
++	//  * paletted textures — the palette lives in PRAM and is already handled by
++	//    the palette_hash check above (and on the GPU for gpuPalette/_8 entries),
++	//    but the INDEX data is in VRAM and is exactly what this hash must track;
++	//    dynamically composed font atlases were the original motivating case.
++	//  * custom-texture replacements — VRAM still selects the replacement via
++	//    ComputeHash(), and Update() re-checks it and early-outs when unchanged
++	//    (TexCache.cpp:578-593), so a re-decode never lands.
++	if (!rc && wasmVramIsSourceOfTruth() && size > 0 && FrameCount != wasmHashFrame)
+ 	{
+-		// _8 (gpuPalette) textures are never invalidated on WASM (no mprotect write
+-		// detection), so a font atlas composed into VRAM after first decode stays a
+-		// stale all-zeros texture. Re-hash the source index data once per frame and
+-		// force a re-decode when it changes.
+-		if (FrameCount != wasmHashFrame && !tcw.VQ_Comp
+-				&& mmStartAddress < VRAM_SIZE && size > 0 && mmStartAddress + size <= VRAM_SIZE)
++		wasmHashFrame = FrameCount;
++		u32 end = mmStartAddress + size;
++		if (end > VRAM_SIZE)
++			end = VRAM_SIZE;			// same clamp protectVRam() applies
++		if (startAddress < end)
+ 		{
+-			wasmHashFrame = FrameCount;
+-			u32 h = XXH32(&vram[mmStartAddress], size, 7);
++			u32 h = XXH32(&vram[startAddress], end - startAddress, 7);
+ 			if (h != wasmDataHash) { wasmDataHash = h; rc = true; }
+ 		}
+ 	}
+diff --git a/core/rend/TexCache.h b/core/rend/TexCache.h
+index 595d679..1c10912 100644
+--- a/core/rend/TexCache.h
++++ b/core/rend/TexCache.h
+@@ -154,6 +154,42 @@ public:
+ 		return custom_load_in_progress == 0 && custom_image_data != NULL;
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	// Companion to the VRAM-hash compensation in NeedsUpdate() (TexCache.cpp:239).
++	//
++	// False == "the renderer deliberately detached this entry from VRAM, VRAM is
++	// NOT the source of truth for what is on the GPU". That is the render-to-
++	// texture case with config::RenderToTextureBuffer false (the default —
++	// cfg/option.cpp:73 declares it with no default value, so bool() == false).
++	// There the rendered image lives ONLY in the GPU texture and is never
++	// written back, so every backend ends the RTT pass with the same pair,
++	// `dirty = 0; unprotectVRam();`:
++	//     gles/gltex.cpp:290-291, dx11/dx11_renderer.cpp:1163-1164,
++	//     dx9/d3d_renderer.cpp:948-949, vulkan/drawer.cpp:573-574,
++	//     vulkan/oit/oit_drawer.cpp:701-702.
++	// Native then never invalidates it again: `dirty` is only ever re-set by
++	// invalidate() (TexCache.cpp:1321), which only runs off a vram_block, and
++	// unprotectVRam() just removed the only one.
++	//
++	// lock_block is precisely that signal, so no new state is needed. Note it is
++	// pure bookkeeping — protectVRam() sets it whether or not the underlying
++	// addrspace::protectVram actually took, which is why it stays meaningful on
++	// wasm where that call is a no-op:
++	//   * non-null after every successful Update() — protectVRam()
++	//     (TexCache.cpp:749, and :590 on the custom-texture early-out) always
++	//     installs a block when size > 0: its only bail is `startAddress > end`
++	//     (TexCache.cpp:322), unreachable because startAddress is VRAM_MASK-ed
++	//     and mmStartAddress >= startAddress, and vramlock_list_add() cannot
++	//     fail;
++	//   * null before the first Update() — but then dirty = FrameCount != 0
++	//     (ctor, TexCache.cpp:380);
++	//   * null right after invalidate() — but then dirty = FrameCount != 0 too
++	//     (TexCache.cpp:1323);
++	//   * null with dirty == 0 ONLY in the RTT detach above.
++	// So `!dirty && lock_block == nullptr` == "GPU-resident RTT surface".
++	bool wasmVramIsSourceOfTruth() const { return lock_block != nullptr; }
++#endif
++
+ 	void ComputeHash();
+ 	bool Update();
+ 	virtual void UploadToGPU(int width, int height, const u8 *temp_tex_buffer, bool mipmapped, bool mipmapsIncluded = false) = 0;

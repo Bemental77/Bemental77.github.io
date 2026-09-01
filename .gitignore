@@ -1,0 +1,85 @@
+# package directories
+node_modules
+jspm_packages
+
+# Serverless directories
+.serverless
+
+.env
+.zip
+.jsdos
+config.js
+send.email.ts
+config.js
+vikings.zip
+vikings.jsdos
+dos-games.yaml
+node_modules
+n64db.sqlite
+sample.sqlite
+.claude
+
+# Reference upstream PCSX-wasm checkout (not used by deployed site)
+ps1/ps1Wasm/wasmpsx-repo
+
+# GameCube — dolphin source tree. Source/, CMake/, Tools/, Installer/ are tracked
+# (~30 MB of canonical libretro/dolphin@0cd3bb8 + our minimum-JIT-swap edits).
+# Externals/ submodules + Data/Languages/ assets + build dirs are NOT tracked —
+# regenerate via `git submodule update --init --recursive` inside gamecube/dolphin-src
+# (after re-cloning the inner git history if needed for Externals).
+gamecube/dolphin-src/Externals/
+gamecube/dolphin-src/Data/
+gamecube/dolphin-src/Languages/
+gamecube/dolphin-src/docs/
+gamecube/dolphin-src/build-wasm/
+gamecube/dolphin-src/build-native-dbg/
+gamecube/dolphin-src/build/
+gamecube/dolphin-src/cmake-build-debug/
+gamecube/dolphin-src/cmake-build-release/
+gamecube/dolphin-src/Source/Core/Common/scmrev.h
+
+# bementalCompiler local build artifacts (the JIT lib is statically linked
+# into Dolphin via dolphin-src; only sources are deployed)
+bementalCompiler/build/
+
+# bementalJIT local build artifacts (host/test/emcc CMake out-of-tree builds)
+bementalJIT/build-*/
+# GameCube-owned bementalJIT copy (de-shared from root) — same build-dir pattern
+gamecube/bementalJIT/build-*/
+
+tools/bin/
+
+# Dreamcast — local-only artifacts (mirror gamecube pattern)
+# BIOS / Flash dumps (DC - BIOS.bin, DC - Flash.bin, etc.) — not redistributable
+dreamcast/bios/
+# Native oracle (redream binary + saves) — host-only, not deployed
+dreamcast/oracle/
+# Game images (.gdi/.cdi/.chd/.iso/.bin/.cue/.nrg)
+dreamcast/roms/
+# Flycast source tree (large internal build input — not deployed)
+dreamcast/flycast-src/
+# Flycast / sh4-worker local CMake build dirs (build-wasm/, build-host-test/, etc.)
+dreamcast/**/build-*/
+
+# Python bytecode
+**/__pycache__/
+
+# Old fork tree — preserved for MemArena port reference; remove after build Stage 0 passes (CC-1)
+gamecube/dolphin-src.bak/
+
+# Untracked-but-kept-local full disc/ROM images (2026-07-20 LFS teardown):
+# their content ships as the split .bin.parta* chunks; these full copies are
+# local oracle/test inputs only. Do NOT re-track (LFS budget exceeded).
+gamecube/roms/Sonic Adventure 2 - Battle (USA).iso
+dreamcast/discs/pso2/Track3.bin
+ps1/ps1Wasm/roms/MonsterRancher2.bin
+
+# 27MB PSO savestate: local probe/autoload asset. *.bin is an LFS rule here (.gitattributes),
+# so a stray `git add -A` would push it into an already-blown LFS budget.
+/state.bin
+
+# SM64 native port (decomp -> wasm) build output. The .wasm has ROM-derived
+# copyrighted assets baked in at compile time (extract_assets.py -> C data ->
+# linked in; there is no --preload-file separation). This repo publishes to
+# GitHub Pages -- do NOT commit or publish this directory.
+n64/sm64-native/

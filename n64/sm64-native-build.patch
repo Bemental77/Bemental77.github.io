@@ -1,0 +1,110 @@
+diff --git a/Makefile b/Makefile
+index cfac1e8..d3383a1 100644
+--- a/Makefile
++++ b/Makefile
+@@ -170,7 +170,7 @@ endif
+ ifeq ($(TARGET_N64),0)
+   OPT_FLAGS := -O2
+   ifeq ($(TARGET_WEB),1)
+-    OPT_FLAGS += -g4 --source-map-base http://localhost:8080/
++    # [bemental] -g4/--source-map-base removed: not valid on emscripten >=3.x
+   endif
+ endif
+ 
+@@ -462,6 +462,7 @@ ifneq ($(TARGET_WEB),1)
+   CXX := g++
+ else
+   CC := emcc
++  CXX := em++
+ endif
+ ifeq ($(CXX_FILES),"")
+   LD := $(CC)
+@@ -483,7 +484,7 @@ ifeq ($(TARGET_LINUX),1)
+ endif
+ ifeq ($(TARGET_WEB),1)
+   PLATFORM_CFLAGS  := -DTARGET_WEB
+-  PLATFORM_LDFLAGS := -lm -no-pie -s TOTAL_MEMORY=20MB -g4 --source-map-base http://localhost:8080/ -s "EXTRA_EXPORTED_RUNTIME_METHODS=['callMain']"
++  PLATFORM_LDFLAGS := -lm -sTOTAL_MEMORY=128MB -sEXPORTED_RUNTIME_METHODS=callMain -sEXPORTED_FUNCTIONS=_main
+ endif
+ 
+ PLATFORM_CFLAGS += -DNO_SEGMENTED_MEMORY -DUSE_SYSTEM_MALLOC
+@@ -501,8 +502,8 @@ ifeq ($(ENABLE_OPENGL),1)
+     GFX_LDFLAGS += -lGL $(shell sdl2-config --libs) -lX11 -lXrandr
+   endif
+   ifeq ($(TARGET_WEB),1)
+-    GFX_CFLAGS  += -s USE_SDL=2
+-    GFX_LDFLAGS += -lGL -lSDL2
++    GFX_CFLAGS  += -sUSE_SDL=2
++    GFX_LDFLAGS += -sUSE_SDL=2 -sLEGACY_GL_EMULATION=0 -sMAX_WEBGL_VERSION=2 -sMIN_WEBGL_VERSION=2
+   endif
+ endif
+ ifeq ($(ENABLE_DX11),1)
+@@ -517,7 +518,11 @@ endif
+ GFX_CFLAGS += -DWIDESCREEN
+ 
+ CC_CHECK := $(CC) -fsyntax-only -fsigned-char -Wall -Wextra -Wno-format-security -D_LANGUAGE_C $(DEF_INC_CFLAGS) $(PLATFORM_CFLAGS) $(GFX_CFLAGS)
+-CFLAGS := $(OPT_FLAGS) -D_LANGUAGE_C $(DEF_INC_CFLAGS) $(PLATFORM_CFLAGS) $(GFX_CFLAGS) -fno-strict-aliasing -fwrapv -march=native
++MARCH_FLAG := -march=native
++ifeq ($(TARGET_WEB),1)
++  MARCH_FLAG :=
++endif
++CFLAGS := $(OPT_FLAGS) -D_LANGUAGE_C $(DEF_INC_CFLAGS) $(PLATFORM_CFLAGS) $(GFX_CFLAGS) -fno-strict-aliasing -fwrapv $(MARCH_FLAG)
+ 
+ ASFLAGS := -I include -I $(BUILD_DIR) $(foreach d,$(DEFINES),--defsym $(d))
+ 
+diff --git a/src/pc/gfx/gfx_opengl.c b/src/pc/gfx/gfx_opengl.c
+index 7bc9745..e93408c 100644
+--- a/src/pc/gfx/gfx_opengl.c
++++ b/src/pc/gfx/gfx_opengl.c
+@@ -167,6 +167,9 @@ static void append_formula(char *buf, size_t *len, uint8_t c[2][4], bool do_sing
+ static struct ShaderProgram *gfx_opengl_create_and_load_new_shader(uint32_t shader_id) {
+     struct CCFeatures cc_features;
+     gfx_cc_get_features(shader_id, &cc_features);
++    // [bemental] mirror sm64ex gfx_opengl.c:213-217 -- noise shader is
++    // disabled on the GLES/WebGL path.
++    cc_features.opt_noise = false;
+ 
+     char vs_buf[1024];
+     char fs_buf[1024];
+@@ -175,7 +178,7 @@ static struct ShaderProgram *gfx_opengl_create_and_load_new_shader(uint32_t shad
+     size_t num_floats = 4;
+ 
+     // Vertex shader
+-    append_line(vs_buf, &vs_len, "#version 110");
++    append_line(vs_buf, &vs_len, "#version 100");  // [bemental] GLES2 for WebGL (was 110)
+     append_line(vs_buf, &vs_len, "attribute vec4 aVtxPos;");
+     if (cc_features.used_textures[0] || cc_features.used_textures[1]) {
+         append_line(vs_buf, &vs_len, "attribute vec2 aTexCoord;");
+@@ -206,8 +209,8 @@ static struct ShaderProgram *gfx_opengl_create_and_load_new_shader(uint32_t shad
+     append_line(vs_buf, &vs_len, "}");
+ 
+     // Fragment shader
+-    append_line(fs_buf, &fs_len, "#version 110");
+-    //append_line(fs_buf, &fs_len, "precision mediump float;");
++    append_line(fs_buf, &fs_len, "#version 100");  // [bemental] GLES2 for WebGL (was 110)
++    append_line(fs_buf, &fs_len, "precision mediump float;");
+     if (cc_features.used_textures[0] || cc_features.used_textures[1]) {
+         append_line(fs_buf, &fs_len, "varying vec2 vTexCoord;");
+     }
+diff --git a/src/pc/gfx/gfx_sdl2.c b/src/pc/gfx/gfx_sdl2.c
+index 4fd5c43..ef634de 100644
+--- a/src/pc/gfx/gfx_sdl2.c
++++ b/src/pc/gfx/gfx_sdl2.c
+@@ -186,9 +186,15 @@ static void gfx_sdl_init(const char *game_name, bool start_in_fullscreen) {
+         inverted_scancode_table[scancode_rmapping_extended[i][0]] = inverted_scancode_table[scancode_rmapping_extended[i][1]] + 0x100;
+     }
+ 
++    // [bemental fix] upstream sm64-port indexes scancode_rmapping_EXTENDED (4
++    // entries) while iterating scancode_rmapping_NONEXTENDED's count (11) ->
++    // reads 7 entries past the array, and the garbage values become OOB writes
++    // into inverted_scancode_table[512]. On wasm that corrupts address 0 and
++    // aborts in gfx_sdl_init before main() ever returns. sm64pc/sm64ex fixed
++    // this: src/pc/gfx/gfx_sdl2.c:195-197 uses _nonextended here.
+     for (size_t i = 0; i < sizeof(scancode_rmapping_nonextended) / sizeof(scancode_rmapping_nonextended[0]); i++) {
+-        inverted_scancode_table[scancode_rmapping_extended[i][0]] = inverted_scancode_table[scancode_rmapping_extended[i][1]];
+-        inverted_scancode_table[scancode_rmapping_extended[i][1]] += 0x100;
++        inverted_scancode_table[scancode_rmapping_nonextended[i][0]] = inverted_scancode_table[scancode_rmapping_nonextended[i][1]];
++        inverted_scancode_table[scancode_rmapping_nonextended[i][1]] += 0x100;
+     }
+ }
+ 

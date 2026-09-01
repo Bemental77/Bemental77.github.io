@@ -1,0 +1,61 @@
+diff --git a/core/hw/pvr/spg.cpp b/core/hw/pvr/spg.cpp
+index 0e2115c..53cbf4e 100755
+--- a/core/hw/pvr/spg.cpp
++++ b/core/hw/pvr/spg.cpp
+@@ -41,6 +41,36 @@ static u32 lightgun_line = 0xffff;
+ static u32 lightgun_hpos;
+ static bool maple_int_pending;
+ 
++// [2026-08-28] Delivered-vblank counters — ALWAYS compiled.
++//
++// The vblk_cnt / "SPG - ... V: ... R: ..." block further down is
++// `#if !defined(NDEBUG) || defined(DEBUGFAST)`, DEBUGFAST comes only from
++// ENABLE_LOG, and build-wasm/CMakeCache.txt has ENABLE_LOG:BOOL=OFF. So the
++// shipped wasm could only ever COMPUTE the vblank rate from SPG_LOAD /
++// SPG_CONTROL / FB_R_CTRL — it could never COUNT a delivered one. These two
++// plain u32s close that gap without dragging in the debug logging apparatus.
++//
++// Cost: two adds inside spg_line_sched, which is the sh4_sched scanline
++// callback (~525 * 60 = ~31.5k calls/s), NOT a per-instruction path.
++//
++//   spg_vblank_frames  — field start: prv_cur_scanline wraps to 0. This is the
++//                        exact event native's vblk_cnt counts (see the ++ at
++//                        the bottom of the `if (prv_cur_scanline == 0)` body),
++//                        so it is directly comparable to native's "V:" figure.
++//   spg_vblank_in_ints — SCANINT1 (vblank-IN) interrupt actually raised.
++//
++// Both are written only from spg_line_sched on the emu thread and read only by
++// the bridge's once-per-second heartbeat (EmscriptenWorker.cpp video_cb), so a
++// plain u32 is sufficient. Monotonic on purpose: never reset, not serialized —
++// a consumer differences two samples.
++u32 spg_vblank_frames;
++u32 spg_vblank_in_ints;
++
++// Frame_Cycles is file-static; expose it so the bridge can print the
++// register-derived prediction (SH4_MAIN_CLOCK / Frame_Cycles) next to the
++// counted rate, straight off the live registers rather than a hardcode.
++u32 spg_frame_cycles() { return Frame_Cycles; }
++
+ void CalculateSync()
+ {
+ 	u32 pixel_clock = PIXEL_CLOCK / (FB_R_CTRL.vclk_div ? 1 : 2);
+@@ -113,6 +143,7 @@ static int spg_line_sched(int tag, int cycles, int jitter, void *arg)
+ 				SB_MDST = 0;
+ 			}
+ 			asic_RaiseInterrupt(holly_SCANINT1);
++			++spg_vblank_in_ints;   // delivered vblank-IN interrupts (always compiled)
+ 		}
+ 
+ 		if (SPG_VBLANK_INT.vblank_out_interrupt_line_number == prv_cur_scanline)
+@@ -149,6 +180,11 @@ static int spg_line_sched(int tag, int cycles, int jitter, void *arg)
+ 		// Vblank
+ 		if (prv_cur_scanline == 0)
+ 		{
++			// Always-compiled twin of the vblk_cnt++ in the NDEBUG/DEBUGFAST
++			// block below — same event, same place, so the counted rate is
++			// directly comparable to native's "V:".
++			++spg_vblank_frames;
++
+ 			if (SPG_CONTROL.interlace)
+ 				SPG_STATUS.fieldnum = ~SPG_STATUS.fieldnum;
+ 			else

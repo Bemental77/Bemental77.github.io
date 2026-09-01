@@ -1,0 +1,81 @@
+*.iso filter=lfs diff=lfs merge=lfs -text
+*.wasm filter=lfs diff=lfs merge=lfs -text
+*.smc filter=lfs diff=lfs merge=lfs -text
+*.bin filter=lfs diff=lfs merge=lfs -text
+*.zip filter=lfs diff=lfs merge=lfs -text
+*.cue filter=lfs diff=lfs merge=lfs -text
+*.n64 filter=lfs diff=lfs merge=lfs -text
+*.z64 filter=lfs diff=lfs merge=lfs -text
+*.v64 filter=lfs diff=lfs merge=lfs -text
+
+# PS1 emulator binaries are small (<1 MB each) and must be served as real
+# content by GitHub Pages (which does not resolve LFS pointers). Override
+# the *.wasm / *.bin LFS rules for these specific paths.
+ps1/ps1Wasm/dist/*.wasm              filter= diff= merge= -text
+ps1/ps1Wasm/dist/*.bin               filter= diff= merge= -text
+ps1/ps1Wasm/pcsx-wasm-src/*.wasm     filter= diff= merge= -text
+ps1/ps1Wasm/pcsx-wasm-src/*.bin      filter= diff= merge= -text
+ps1/ps1Wasm/pcsx-wasm-src/docs/*.wasm filter= diff= merge= -text
+*.bin.parta* filter=lfs diff=lfs merge=lfs -text
+
+# Same reason as above: the PS1 lazy-loader (ps1.html ?lazy) fetches these
+# chunks directly. GitHub Pages does not resolve LFS pointers, so they must
+# ship as real blobs even though they're large.
+ps1/ps1Wasm/roms/*.bin.parta* filter= diff= merge= -text
+
+# N64 emulator assets must be served as real content by GitHub Pages (which
+# does not resolve LFS pointers) — same fix as the PS1 overrides above.
+# /n64/ stuck at "Loading core..." on prod = n64wasm.wasm was a 132-byte
+# LFS pointer (2026-06-12).
+n64/N64Wasm/dist/*.wasm              filter= diff= merge= -text
+n64/N64Wasm/dist/*.zip               filter= diff= merge= -text
+n64/N64Wasm/roms/*.z64               filter= diff= merge= -text
+# GameCube split ROM parts: like PS1/N64, served directly by Pages (LFS
+# pointers 404/serve-stub -> games dead on prod). Override the *.bin.parta* LFS rule.
+gamecube/roms/*.bin.parta* filter= diff= merge= -text
+
+# GameCube (Dolphin) deployable worker WASM must be served as real content by
+# GitHub Pages (does not resolve LFS pointers) — same fix as PS1/N64 above.
+# On prod it was a 133-byte LFS pointer (2026-06-22), so gamecube.html could
+# not load the worker. Override the *.wasm LFS rule for the deployable worker.
+gamecube/dolphin_libretro/dolphin_worker_emcc.wasm filter= diff= merge= -text
+# dolphin_libretro.wasm (14KB main-thread module instantiated by startEmulator)
+# was an LFS pointer on prod -> GitHub Pages served "version https://..." ("vers"
+# magic word) -> WebAssembly.instantiate CompileError, all GC games dead. Same
+# override as the worker.
+gamecube/dolphin_libretro/dolphin_libretro.wasm filter= diff= merge= -text
+# ppc-worker modules (Phase 2 PowerPC JIT worker, spawned by gamecube.html);
+# same LFS-pointer-on-prod break as the dolphin modules.
+gamecube/ppc-worker/ppc_worker_emcc.wasm filter= diff= merge= -text
+gamecube/ppc-worker/ppc_worker_mb.wasm filter= diff= merge= -text
+# GameCube AoT pack (fetched at runtime by ppc_worker.js on prod — Pages does
+# not resolve LFS pointers) + LFS budget exceeded 2026-07-20. Ship as real
+# blobs like the ROM parts / worker wasm above.
+gamecube/aot/**/*.bin filter= diff= merge= -text
+# 2026-07-20 LFS teardown: budget exceeded + GitHub Pages cannot serve LFS
+# pointers. Everything below is runtime-fetched by a page or worker — ship as
+# real blobs (same fix as the PS1/N64/GC overrides above). After this, the
+# ONLY remaining LFS objects are dreamcast/discs/pso2/Track3.bin.parta* —
+# 12x100MB, DC not yet shipping; converting would bloat every clone by 1.2GB.
+gamecube/IPL.bin filter= diff= merge= -text
+# recomp test/build wasm: fetched directly by recomp_render_test.html (Pages can't
+# serve LFS pointers) + LFS budget exceeded. Ship as a real blob like the others.
+gamecube/recomp/*.wasm filter= diff= merge= -text
+gba/gbaWasm/dist/*.wasm filter= diff= merge= -text
+snes/snesWasm/*.wasm filter= diff= merge= -text
+snes/snesWasm/roms/*.smc filter= diff= merge= -text
+ps1/*.bin filter= diff= merge= -text
+ps1/*.wasm filter= diff= merge= -text
+ps1/ps1Wasm/roms/bios/*.bin filter= diff= merge= -text
+dreamcast/flycast_libretro/*.wasm filter= diff= merge= -text
+dreamcast/discs/pso2/Track1.bin filter= diff= merge= -text
+dreamcast/discs/pso2/Track2.bin filter= diff= merge= -text
+dreamcast/discs/pso2/*.cue filter= diff= merge= -text
+# recomp FST (mp4_fst.bin) for recomp_live.html — un-LFS like the recomp *.wasm (Pages can't serve
+# LFS pointers + LFS budget exceeded). Ship as a real blob.
+gamecube/recomp/*.bin filter= diff= merge= -text
+# 2026-08-27 dreamcast SHIPS: the Track3 parts were the last LFS objects, and
+# GitHub Pages served their 133-byte pointers -> the page assembled a 1.6KB
+# Track3, the disc was garbage, and the game crashed on run_iter #1 (the
+# "pump stopped sh4_pc=0xa0000002" break). Same fix as PS1/N64/GC: real blobs.
+dreamcast/discs/pso2/*.bin.parta* filter= diff= merge= -text

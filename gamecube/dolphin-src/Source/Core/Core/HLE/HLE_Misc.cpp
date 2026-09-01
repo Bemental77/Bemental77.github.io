@@ -1,0 +1,133 @@
+// Copyright 2008 Dolphin Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#include "Core/HLE/HLE_Misc.h"
+
+#include "Common/CommonTypes.h"
+#include "Core/Core.h"
+#include "Core/GeckoCode.h"
+#include "Core/HW/CPU.h"
+#include "Core/Host.h"
+#include "Core/PowerPC/MMU.h"
+#include "Core/PowerPC/PowerPC.h"
+#include "Core/System.h"
+
+namespace HLE_Misc
+{
+// If you just want to kill a function, one of the three following are usually appropriate.
+// According to the PPC ABI, the return value is always in r3.
+void UnimplementedFunction(const Core::CPUThreadGuard& guard)
+{
+  auto& system = guard.GetSystem();
+  auto& ppc_state = system.GetPPCState();
+  ppc_state.npc = LR(ppc_state);
+}
+
+void HBReload(const Core::CPUThreadGuard& guard)
+{
+  // There isn't much we can do. Just stop cleanly.
+  auto& system = guard.GetSystem();
+  system.GetCPU().Break();
+  Host_Message(HostMessageID::WMUserStop);
+}
+
+void GeckoCodeHandlerICacheFlush(const Core::CPUThreadGuard& guard)
+{
+  auto& system = guard.GetSystem();
+  auto& ppc_state = system.GetPPCState();
+  auto& jit_interface = system.GetJitInterface();
+
+  // Work around the codehandler not properly invalidating the icache, but
+  // only the first few frames.
+  // (Project M uses a conditional to only apply patches after something has
+  // been read into memory, or such, so we do the first 5 frames.  More
+  // robust alternative would be to actually detect memory writes, but that
+  // would be even uglier.)
+  u32 gch_gameid = PowerPC::MMU::HostRead<u32>(guard, Gecko::INSTALLER_BASE_ADDRESS);
+  if (gch_gameid - Gecko::MAGIC_GAMEID == 5)
+  {
+    return;
+  }
+  else if (gch_gameid - Gecko::MAGIC_GAMEID > 5)
+  {
+    gch_gameid = Gecko::MAGIC_GAMEID;
+  }
+  PowerPC::MMU::HostWrite<u32>(guard, gch_gameid + 1, Gecko::INSTALLER_BASE_ADDRESS);
+
+  ppc_state.iCache.Reset(jit_interface);
+}
+
+// HLE_PPCMfhid2 — replacement for the SDK helper:
+//     mfspr r3, HID2
+//     blr
+// Native Dolphin installs this at every inlined copy in SAB (and other
+// SDK games) per the matching name in its os_patches table. Side-effect
+// = r3 ← HID2; LR ← already set by the bl caller, so we restore PC = LR
+// to fall through to the caller's next instruction without executing
+// the 2-instr inline body.
+void HLE_PPCMfhid2(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc_state = guard.GetSystem().GetPPCState();
+  ppc_state.gpr[3] = ppc_state.spr[SPR_HID2];
+  ppc_state.npc = LR(ppc_state);
+}
+
+// HLE_Strncpy — replacement for the SDK's strncpy(dst, src, n):
+//   r3 = dst, r4 = src, r5 = n
+//   returns dst (= r3 unchanged)
+// Uses MMU::HostRead<u8>/HostWrite<u8> so guest-virtual addresses route
+// through BAT/TLB the same way the SDK loop would.
+void HLE_Strncpy(const Core::CPUThreadGuard& guard)
+{
+  auto& ppc_state = guard.GetSystem().GetPPCState();
+  const u32 dst = ppc_state.gpr[3];
+  const u32 src = ppc_state.gpr[4];
+  const u32 n   = ppc_state.gpr[5];
+
+  u32 i = 0;
+  for (; i < n; ++i)
+  {
+    const u8 c = PowerPC::MMU::HostRead<u8>(guard, src + i);
+    PowerPC::MMU::HostWrite<u8>(guard, c, dst + i);
+    if (c == 0)
+      break;
+  }
+  // Pad the rest with zeros per strncpy spec
+  for (++i; i < n; ++i)
+    PowerPC::MMU::HostWrite<u8>(guard, 0u, dst + i);
+
+  // r3 (return) stays as dst. PC ← LR to skip the SDK loop.
+  ppc_state.npc = LR(ppc_state);
+}
+
+// HLE_TraceDispatcher — Start-hook for the interrupt-decoder at 0x800e7e9c.
+// No-op: this is a Start hook, so the original guest instruction still runs
+// after it. Registered in HLE.cpp and installed by EmscriptenWorker; kept as a
+// live registration target with no side effects.
+void HLE_TraceDispatcher(const Core::CPUThreadGuard& guard)
+{
+}
+
+// Because Dolphin messes around with the CPU state instead of patching the game binary, we
+// need a way to branch into the GCH from an arbitrary PC address. Branching is easy, returning
+// back is the hard part. This HLE function acts as a trampoline that restores the original LR, SP,
+// and PC before the magic, invisible BL instruction happened.
+void GeckoReturnTrampoline(const Core::CPUThreadGuard& guard)
+{
+  auto& system = guard.GetSystem();
+  auto& ppc_state = system.GetPPCState();
+
+  // Stack frame is built in GeckoCode.cpp, Gecko::RunCodeHandler.
+  const u32 SP = ppc_state.gpr[1];
+  ppc_state.gpr[1] = PowerPC::MMU::HostRead<u32>(guard, SP + 8);
+  ppc_state.npc = PowerPC::MMU::HostRead<u32>(guard, SP + 12);
+  LR(ppc_state) = PowerPC::MMU::HostRead<u32>(guard, SP + 16);
+  ppc_state.cr.Set(PowerPC::MMU::HostRead<u32>(guard, SP + 20));
+  for (int i = 0; i < 14; ++i)
+  {
+    ppc_state.ps[i].SetBoth(
+        PowerPC::MMU::HostRead<u64>(guard, SP + 24 + 2 * i * sizeof(u64)),
+        PowerPC::MMU::HostRead<u64>(guard, SP + 24 + (2 * i + 1) * sizeof(u64)));
+  }
+}
+}  // namespace HLE_Misc
