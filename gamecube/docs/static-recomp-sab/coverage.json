@@ -322,7 +322,7 @@
   "interpretation": "A 486 MHz Gekko cannot retire more than 486 M instr/s and in practice retires fewer, so translated code runs in the SAME ORDER as the console retire rate \u2014 on ONE function, in Node, with no system around it. NOT a whole-game speed and NOT comparable to the JIT 0.4115x wall-clock figure."
  },
  "overlay_differential": {
-  "status": "NOT YET ACHIEVED \u2014 still zero overlay functions differentially verified",
+  "status": "NOT ACHIEVED after 7 attempts \u2014 zero overlay functions differentially verified",
   "tooling": "gamecube/recomp/sr/fixture_rel.py (base recovery) + rel_emit.py --base/--entry",
   "base_recovery_method": "breakpoint a DOL target the overlay calls via REL24 imp->id==0 (OSLink.c:139-142 => addend is absolute); on the hit LR-4 is a live overlay address, so base = (LR-4) - site_off, byte-confirmed against live memory at non-relocated offsets",
   "blockers_found": [
@@ -330,7 +330,31 @@
    "GSNE8P.s01 COLD-BOOTS (connect pc=0x80003140 = the DOL entry point), reproducing b401f282:105.",
    "MY OWN BUG: probe targets were ranked by FEWEST call sites (to minimise base candidates), which armed the RAREST calls; 367 breakpoint hits without one from the overlay. Now ranked by MOST call sites; ambiguity is cheap (byte-confirmed), rarity is not."
   ],
-  "relocation_note": "shipped REL bytes are NOT what executes \u2014 OSLink Relocate() (OSLink.c:146-200) patches in place, and rel.py:147 returns raw file bytes, so the live relocated section is read back from the machine instead."
+  "relocation_note": "shipped REL bytes are NOT what executes \u2014 OSLink Relocate() (OSLink.c:146-200) patches in place, and rel.py:147 returns raw file bytes, so the live relocated section is read back from the machine instead.",
+  "causes_found_and_fixed": [
+   "REPO path 2 levels up (ModuleNotFoundError) \u2014 fixed, --selftest added",
+   "probe ranking v1 fewest-sites = rarest calls: 367 hits, none from the overlay",
+   "probe ranking v2 most-sites = DOL-hot: 40 armed -> 0.010x",
+   "scan cost: 960 of 981 s scanning -> boot first, scan once, chunk 0x1000 = 12 s / 20.6 MB",
+   "LR trick unsound for tail-called helpers (LR byte-identical across dozens of hits)",
+   "resync() inside the boot loop -> 0.0025x",
+   "MY OWN REGRESSION: hot anchor \"fix\" made it 6x worse (0.0004x, 2412 stops/s)"
+  ],
+  "structural_blocker": {
+   "best_rate_uninterrupted": "0.0312x (Step B: one cont(timeout=120) per connection)",
+   "measured_rate_repeated_conts": "0.0038x (rev 6, only 117 stops in 566 s)",
+   "wall_clock_for_30s_emulated": {
+    "0.0312x": "~16 min",
+    "0.0038x": "2.2 hours of held lock"
+   },
+   "note": "Stops were NOT the cost in rev 6. Consistent with the stub not resuming cleanly after a cont timeout; NOT PROVEN."
+  },
+  "remaining_requirement": "A Dolphin savestate at an overlay-resident scene written by the UPSTREAM oracle build (STATE_VERSION 189). Deletes the boot; every future overlay capture becomes seconds. Needs the GUI Dolphin \u2014 nogui has --save_state for LOADING only and the GDB stub cannot write one, so it is a one-time manual step.",
+  "tooling_ready": [
+   "fixture_rel.py (scan base recovery, live-section dump, --selftest)",
+   "rel_emit.py --base --entry --live-section (real addresses + DOL closure)",
+   "verify_fixture.mjs (honours usable:false)"
+  ]
  },
  "xform_update_ops": {
   "status": "reachability route CLOSED; injection harness built, oracle run pending",

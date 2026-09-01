@@ -634,6 +634,88 @@ base recovery separately from `--discover-budget` (the machine is already booted
 then), and documents the conversion so the next person picks a number in emulated
 time rather than wall time.
 
+## 5g. Overlay differential: NOT ACHIEVED, and the blocker is structural
+
+Seven attempts. **Zero overlay functions have been differentially verified**, which
+remains the largest unverified claim in this route — the overlays are 93.64% of SAB's
+code. The tooling is finished and tested; what is missing is a way to get the reference
+interpreter to a scene where an overlay is resident.
+
+### Six distinct causes, each measured and each removed
+
+| # | cause | evidence | outcome |
+|---|---|---|---|
+| 1 | `REPO` path two levels up | `ModuleNotFoundError: native_oracle_gdb` | fixed; `--selftest` added |
+| 2 | probe ranking v1 (fewest sites) | 367 hits, none from the overlay | rank by overlay ÷ DOL calls |
+| 3 | probe ranking v2 (most sites) | 40 armed → 0.010x | 12 DOL-quiet probes |
+| 4 | scan cost | 960 of 981 s scanning | boot first, scan once, `chunk=0x1000` → **12 s for 20.6 MB** |
+| 5 | LR trick unsound | LR byte-identical across dozens of hits = stale, tail-branch entry | replaced by MEM1 signature scan |
+| 6 | `resync()` in the boot loop | 0.0025x | removed |
+
+I also introduced a regression of my own along the way: "fix" #6 by arming a very hot
+anchor made it **6× worse** (0.0004x, 2,170,350 stops = 2,412/s), because the per-stop
+round trip became the run.
+
+### The structural blocker, measured two ways
+
+`GDB.cont()` blocks until a breakpoint hits — *"no async break exists"* — and
+`GDB.resync()` ends in `pc()`, which needs a halted CPU. The consequence:
+
+```
+Step B  4 functions x ONE cont(timeout=120), uninterrupted
+        2996 AID fires = 14.97 s emulated in ~480 s   =  0.0312x
+rev 6   cont re-issued after every timeout, only 117 stops in 566 s
+        434 AID fires  =  2.17 s emulated in  566 s   =  0.0038x
+```
+
+Stops were *not* the cost in rev 6 (117 of them). The difference is that Step B got
+**one clean 120 s `cont` per connection**, while rev 6 re-issues `cont` after each
+timeout. *I have not proven the stub fails to resume after a timeout* — but 0.0038x
+with almost no stops is consistent with that and inconsistent with the alternative.
+
+Either way the arithmetic is fatal for a cold boot:
+
+| rate | wall clock to reach ~30 s of emulated boot |
+|---|---|
+| 0.0312x (best possible, uninterrupted) | ~16 min |
+| 0.0038x (measured, repeated conts) | **2.2 hours of held lock** |
+
+A GameCube title screen is tens of seconds of emulated boot away. Taking 2+ hours of a
+lock that siblings queue on — one acquisition here already cost 2,975 s of waiting, and
+an ownerless lock starved 18 waiters earlier the same day — is not a reasonable thing to
+do, and the 0.0312x path cannot be sustained across the many `cont` cycles a full boot
+needs.
+
+### The precise remaining requirement
+
+**A Dolphin savestate parked at a scene where an overlay is resident, written by the
+upstream oracle build so its `STATE_VERSION` is 189.** That deletes the boot entirely
+and makes every future overlay capture a matter of seconds.
+
+Why the two states already present do not work:
+
+- `gamecube/states/sab-citye-gameplay.gcs.gz` is the port's format, `STATE_VERSION` **177**
+  (`gamecube/dolphin-src/.../State.cpp:98`), and the oracle is **189**
+  (`~/gc_refs/dolphin-upstream/.../State.cpp:98`); `State.cpp:723` rejects the mismatch.
+- `~/Library/.../StateSaves/GSNE8P.s01` **cold-boots** — connect PC is `0x80003140`,
+  the DOL entry point (reproducing `b401f282:105`).
+
+Producing one needs the **GUI** Dolphin: `dolphin-emu-nogui` has `--save_state` for
+*loading* only, and the GDB stub cannot write a savestate, so this is a one-time manual
+step and not something this tooling can do for itself.
+
+### What is already built and waiting for that savestate
+
+- `fixture_rel.py` — base recovery by relocation-free MEM1 signature scan (**12 s for
+  20.6 MB**), live relocated-section dump, entry discovery, fixture capture, `--selftest`.
+- `rel_emit.py --base --entry --live-section` — emits overlay functions at their real
+  runtime addresses **with their transitive DOL callee closure** in one TU, from the
+  *relocated* bytes. Dry-run verified: 1 overlay function + 4 DOL functions, 104
+  instructions.
+- `verify_fixture.mjs` — unchanged acceptance criteria, and it now honours `usable:false`.
+
+None of that needs revisiting. The next session's first action is the savestate.
+
 ## 6. The OS-thread / context-switch problem, measured
 
 The brief warned that a binary recomp cannot use MP4's escape (never compiling
