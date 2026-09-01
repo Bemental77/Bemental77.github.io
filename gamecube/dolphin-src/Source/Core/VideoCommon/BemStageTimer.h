@@ -118,20 +118,6 @@ inline constexpr std::uintptr_t kAblBPHitCell = 0x026B3B24u;
 inline constexpr std::uintptr_t kCoalesceCell = 0x026B3BE0u;
 inline constexpr std::uintptr_t kCoalesceHitCell = 0x026B3934u;  // uncontested; left in place
 
-// ---- externally-owned cells this header must never reuse --------------------
-// Compile-time guard for the collision class above: these addresses belong to
-// other subsystems, and reusing one silently changes THEIR behaviour.
-inline constexpr std::uintptr_t kForeign_FifoBrakeKill = 0x026B3B20u;  // CommandProcessor.cpp
-inline constexpr std::uintptr_t kForeign_ImportUnwrap  = 0x026B3930u;  // block_cache.cpp
-static_assert(kEnableCell != kForeign_FifoBrakeKill &&
-              kEnableCell != kForeign_ImportUnwrap,
-              "BemStage::kEnableCell collides with a foreign gate");
-static_assert(kCoalesceCell != kForeign_FifoBrakeKill &&
-              kCoalesceCell != kForeign_ImportUnwrap,
-              "BemStage::kCoalesceCell collides with a foreign gate");
-static_assert(kCoalesceHitCell != kForeign_FifoBrakeKill &&
-              kCoalesceHitCell != kForeign_ImportUnwrap,
-              "BemStage::kCoalesceHitCell collides with a foreign gate");
 // [why the coalescing lever nulled] Always-on census: WGPUGfx::SubmitFrame calls
 // (0x026B3938) and total bytes handed to wgpuQueueWriteBuffer for the vertex+index
 // rings (0x026B393C). If submits/frame is ~= batches/frame, coalescing collapses
@@ -146,10 +132,64 @@ inline constexpr std::uintptr_t kUploadBytesCell = 0x026B393Cu;
 // cost 3.59 ms = 17.0% of the render stage, and the two buffer binds are
 // (buffer, 0, WHOLE_SIZE) on literally every non-fold draw. 0x026B3944 counts
 // SKIPPED calls, so only this arm can advance it. DEFAULT OFF.
-inline constexpr std::uintptr_t kRedundantStateCell = 0x026B3940u;
-inline constexpr std::uintptr_t kRedundantStateHitCell = 0x026B3944u;
+// [CELL COLLISION FIX 2026-09-01 — the third and fourth in this header] These
+// were 0x026B3940 / 0x026B3944, which bementalJIT/src/block_cache.cpp already
+// owned as BEM_CC_EVICT_N / BEM_CC_MAP_SIZE inside its CONTIGUOUS, explicitly
+// free-verified census block 0x026B3940..0x026B397C. THIS PAIR WAS THE WORST OF
+// THE FOUR, because unlike the others it needed nobody to arm it:
+//   0x026B3940  block_cache.cpp:1278 does bem_cc_add(BEM_CC_EVICT_N, 1) every
+//               time the cap-eviction policy fires, and WGPUGfx.cpp:2118 reads
+//               that same cell as `_bem_rs != 0` — the LEVER 2 gate. So ONE block
+//               cache eviction silently ARMED a DEFAULT-OFF renderer behaviour
+//               change that makes DrawIndexed skip SetPipeline/SetVertexBuffer/
+//               SetIndexBuffer/SetBindGroup. Self-arming during normal operation.
+//   0x026B3944  mutual clobber, diagnostics only: block_cache.cpp:1308,:1586 do
+//               bem_cc_set(mapSize) while WGPUGfx.cpp:348 does ++hitCounter, so
+//               both numbers are garbage whenever the other side runs.
+// These two were the ONLY BemStage cells intruding into that block — every other
+// cell here is <= 0x026B393C or in the 0x026B3B.. region — so BemStage overreached
+// by exactly two cells. Moved to the free tail; the boundary is now asserted below.
+inline constexpr std::uintptr_t kRedundantStateCell = 0x026B3BE4u;
+inline constexpr std::uintptr_t kRedundantStateHitCell = 0x026B3BE8u;
 inline constexpr std::uintptr_t kMsBase = 0x026B3B40u;  // 11 x f64
 inline constexpr std::uintptr_t kNBase = 0x026B3B98u;   // 17 x u32
+
+// ---- externally-owned regions this header must never reuse ------------------
+// Four collisions in this one header (0x026B3B20, 0x026B3930, 0x026B3940,
+// 0x026B3944) all had the same shape: a cell was picked after a "repo-wide grep
+// shows no other use" that was simply wrong. A comment cannot enforce that, so
+// this is a compile-time guard, and it guards RANGES rather than single
+// addresses — single-address asserts would not have caught the 3940/3944 pair
+// creeping into the middle of a 16-cell block.
+inline constexpr std::uintptr_t kForeign_FifoBrakeKill = 0x026B3B20u;  // CommandProcessor.cpp
+inline constexpr std::uintptr_t kForeign_ImportUnwrap  = 0x026B3930u;  // block_cache.cpp:532
+// block_cache.cpp:51-66 census, contiguous and documented as its own block.
+inline constexpr std::uintptr_t kForeign_BlockCacheLo  = 0x026B3940u;
+inline constexpr std::uintptr_t kForeign_BlockCacheHi  = 0x026B397Cu;
+
+inline constexpr bool CellIsForeign(std::uintptr_t a)
+{
+  return a == kForeign_FifoBrakeKill || a == kForeign_ImportUnwrap ||
+         (a >= kForeign_BlockCacheLo && a <= kForeign_BlockCacheHi);
+}
+// Every gate/counter cell this header owns, checked against every foreign region.
+static_assert(!CellIsForeign(kEnableCell), "kEnableCell collides with a foreign cell");
+static_assert(!CellIsForeign(kCoalesceCell), "kCoalesceCell collides with a foreign cell");
+static_assert(!CellIsForeign(kCoalesceHitCell), "kCoalesceHitCell collides with a foreign cell");
+static_assert(!CellIsForeign(kSubmitCountCell), "kSubmitCountCell collides with a foreign cell");
+static_assert(!CellIsForeign(kUploadBytesCell), "kUploadBytesCell collides with a foreign cell");
+static_assert(!CellIsForeign(kRedundantStateCell), "kRedundantStateCell collides with a foreign cell");
+static_assert(!CellIsForeign(kRedundantStateHitCell), "kRedundantStateHitCell collides with a foreign cell");
+static_assert(!CellIsForeign(kAblAHitCell) && !CellIsForeign(kAblBHitCell) &&
+              !CellIsForeign(kAblApHitCell) && !CellIsForeign(kAblUploadCell) &&
+              !CellIsForeign(kAblUploadHitCell) && !CellIsForeign(kAblBPCell) &&
+              !CellIsForeign(kAblBPHitCell),
+              "an ablation cell collides with a foreign cell");
+// The two block bases, checked across their full extent (11 f64 / 17 u32).
+static_assert(!CellIsForeign(kMsBase) && !CellIsForeign(kMsBase + 11u * 8u - 1u),
+              "kMsBase block overlaps a foreign cell");
+static_assert(!CellIsForeign(kNBase) && !CellIsForeign(kNBase + 17u * 4u - 1u),
+              "kNBase block overlaps a foreign cell");
 
 inline double g_ms[kTimedCount] = {};
 inline std::uint32_t g_n[kCount] = {};
