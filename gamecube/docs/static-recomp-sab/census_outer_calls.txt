@@ -1,0 +1,66 @@
+[boundaries=outer+calls] dropped 100 nested entries (4811 -> 4711)
+[boundaries=outer+calls] split 16 entries at 30 interior call targets (4711 -> 4741)
+mapped functions in image : 4741
+mapped instructions       : 374807
+
+policy                                    functions         instructions
+P0 strict (today)                  4204 ( 88.67%)    279353 ( 74.53%)
+P1 + indirect dispatch             4671 ( 98.52%)    372753 ( 99.45%)
+P2 + host/privileged stubs         4737 ( 99.92%)    374790 (100.00%)
+P3 + boundary recovery             4741 (100.00%)    374807 (100.00%)
+P4 + translator gaps closed        4741 (100.00%)    374807 (100.00%)
+
+functions containing at least one blocker of each class:
+  INDIRECT      467 functions    93400 instrs in those functions     812 blocking instructions
+  PRIVILEGED     66 functions     2037 instrs in those functions     431 blocking instructions
+  TARGET          4 functions       17 instrs in those functions       4 blocking instructions
+  GAP             0 functions        0 instrs in those functions       0 blocking instructions
+
+blocking INSTRUCTIONS by reason (every occurrence, not first-per-fn):
+      665  INDIRECT    blrl
+      147  INDIRECT    bctr/bctrl
+       22  PRIVILEGED  op31 xo=83 (mfmsr)
+       22  PRIVILEGED  op31 xo=146 (mtmsr)
+       18  PRIVILEGED  cache/sync/trap op x470
+       16  PRIVILEGED  op31 xo=595 (mfsr)
+       16  PRIVILEGED  op31 xo=210 (mtsr)
+       13  PRIVILEGED  paired-single op4 xo=1014 xo5=22 (dcbz_l)
+       11  PRIVILEGED  rfi
+       11  PRIVILEGED  op31 xo=371 (mftb)
+       10  PRIVILEGED  mtspr SPR26
+        9  PRIVILEGED  mtspr SPR27
+        7  PRIVILEGED  mfspr SPR1008
+        7  PRIVILEGED  mfspr SPR920
+        7  PRIVILEGED  mtspr SPR1008
+        6  PRIVILEGED  mfspr SPR914
+        6  PRIVILEGED  mfspr SPR915
+        6  PRIVILEGED  mfspr SPR916
+        6  PRIVILEGED  mfspr SPR917
+        6  PRIVILEGED  mfspr SPR918
+        6  PRIVILEGED  mfspr SPR919
+        5  PRIVILEGED  mfspr SPR913
+        5  PRIVILEGED  mtspr SPR913
+        5  PRIVILEGED  mtspr SPR916
+        5  PRIVILEGED  mtspr SPR536
+        5  PRIVILEGED  mtspr SPR528
+        5  PRIVILEGED  mtspr SPR540
+        5  PRIVILEGED  mtspr SPR532
+        4  PRIVILEGED  mtspr SPR920
+        4  PRIVILEGED  mfspr SPR26
+        4  PRIVILEGED  mtspr SPR915
+        4  PRIVILEGED  mtspr SPR917
+        4  PRIVILEGED  mtspr SPR919
+        4  PRIVILEGED  mfspr SPR275
+        3  PRIVILEGED  sc
+        3  PRIVILEGED  mfspr SPR18
+        3  PRIVILEGED  mfspr SPR19
+        3  PRIVILEGED  mtspr SPR914
+        3  PRIVILEGED  mtspr SPR918
+        3  PRIVILEGED  mtspr SPR537
+        3  PRIVILEGED  mtspr SPR529
+        3  PRIVILEGED  mtspr SPR541
+        3  PRIVILEGED  mtspr SPR533
+        3  PRIVILEGED  mtspr SPR275
+        3  PRIVILEGED  mfspr SPR273
+
+GENUINE TRANSLATOR GAPS: 0 instructions, 0 distinct forms

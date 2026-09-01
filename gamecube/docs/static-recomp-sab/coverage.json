@@ -1,0 +1,231 @@
+{
+ "generated": "2026-09-01",
+ "game": "Sonic Adventure 2 Battle (USA), GSNE8P",
+ "iso": "gamecube/roms/Sonic Adventure 2 - Battle (USA).iso",
+ "dol_offset_source": "read from the ISO header at 0x420 -> 0x1e700 (never hardcoded)",
+ "dol_sections": {
+  "TEXT0": {
+   "file_off": 256,
+   "vaddr": 2147496192,
+   "bytes": 9216,
+   "instrs": 2304
+  },
+  "TEXT1": {
+   "file_off": 9472,
+   "vaddr": 2147505408,
+   "bytes": 1498176,
+   "instrs": 374544
+  },
+  "text_total_bytes": 1507392,
+  "text_total_instrs": 376848,
+  "entry": 2147496256,
+  "bss": {
+   "vaddr": 2149443072,
+   "bytes": 1900309
+  }
+ },
+ "symbol_map": {
+  "path": "dolphin_captures/sab.map (Dolphin BLR-scan generated)",
+  "text_entries": 5097,
+  "resident_in_this_dol": 4811,
+  "named": 840,
+  "auto_zz": 3971,
+  "union_bytes_inside_text": 1499228,
+  "union_pct_of_text": 99.46,
+  "unmapped_text_bytes": 8164,
+  "unmapped_text_instrs": 2041,
+  "sum_of_entry_sizes_bytes": 1662464,
+  "overlapping_adjacent_pairs": 100,
+  "overlap_bytes": 163236,
+  "overlap_pct_of_sum": 9.82,
+  "note": "nested entries share one end: the BLR scan ends every entry at the next blr, so a function with an early-exit blr emits several nested starts"
+ },
+ "boundary_policies": {
+  "asis": {
+   "functions": 4811,
+   "instrs": 415616,
+   "note": "instrs inflated 9.82% by nested-entry double count"
+  },
+  "clip": {
+   "functions": 4811,
+   "instrs": 374807,
+   "target_blocking_instrs": 960,
+   "note": "WRONG FIX - clipping the outer entry truncates the real function"
+  },
+  "outer": {
+   "functions": 4711,
+   "instrs": 374807,
+   "target_blocking_instrs": 106
+  },
+  "outer+calls": {
+   "functions": 4741,
+   "instrs": 374807,
+   "target_blocking_instrs": 4,
+   "note": "CHOSEN. drop 100 nested entries, then split 16 entries at 30 interior direct-call targets"
+  }
+ },
+ "direct_call_validation": {
+  "relative_bl_sites_in_text": 22878,
+  "distinct_bl_targets": 3457,
+  "bl_targets_not_a_mapped_function_start": 0,
+  "note": "every direct call in SAB .text lands on a mapped entry - direct-call boundary recovery is complete"
+ },
+ "dol_coverage_outer_calls": {
+  "functions": 4741,
+  "instructions": 374807,
+  "P0_strict_today": {
+   "functions": 4204,
+   "functions_pct": 88.67,
+   "instrs": 279353,
+   "instrs_pct": 74.53
+  },
+  "P1_plus_indirect_dispatch": {
+   "functions": 4671,
+   "functions_pct": 98.52,
+   "instrs": 372753,
+   "instrs_pct": 99.45
+  },
+  "P2_plus_host_priv_stubs": {
+   "functions": 4737,
+   "functions_pct": 99.92,
+   "instrs": 374790,
+   "instrs_pct": 100.0
+  },
+  "P3_plus_boundary_recovery": {
+   "functions": 4741,
+   "functions_pct": 100.0,
+   "instrs": 374807,
+   "instrs_pct": 100.0
+  },
+  "blocker_classes": {
+   "INDIRECT": {
+    "functions": 467,
+    "blocking_instrs": 812,
+    "forms": {
+     "blrl": 665,
+     "bctr/bctrl": 147
+    }
+   },
+   "PRIVILEGED": {
+    "functions": 66,
+    "blocking_instrs": 431
+   },
+   "TARGET": {
+    "functions": 4,
+    "blocking_instrs": 4
+   },
+   "GAP": {
+    "functions": 0,
+    "blocking_instrs": 0,
+    "note": "was 4 fns / 28 instrs (lwzux x21, lfdux x7); CLOSED in this pass by adding the x-form update load/stores to sr.py"
+   }
+  }
+ },
+ "rel_overlays": {
+  "count": 76,
+  "disc_bytes": 106735331,
+  "executable_bytes": 22205252,
+  "instructions": 5551313,
+  "decode_clean_pct": 99.9608,
+  "blocked_instrs": 2176,
+  "blocked_forms": {
+   "bctr/bctrl": 1195,
+   "blrl": 981
+  },
+  "privileged_instrs": 0,
+  "translator_gaps": 0,
+  "note": "ALL OS/kernel code lives in the DOL; the overlays contain zero privileged instructions and zero translator gaps - their only blocker is indirect dispatch"
+ },
+ "whole_game": {
+  "total_powerpc_instructions": 5928161,
+  "dol_share_pct": 6.36,
+  "rel_share_pct": 93.64,
+  "translatable_under_P2_plus_rel_indirect": 5926103,
+  "translatable_pct": 99.9653,
+  "remainder": {
+   "unmapped_dol_text_instrs": 2041,
+   "note_unmapped": "TEXT0 exception vectors - the host boundary by definition",
+   "residual_mid_function_branch_targets_instrs": 17
+  }
+ },
+ "host_os_boundary": {
+  "privileged_functions_in_dol": 66,
+  "privileged_instrs_in_those_functions": 2037,
+  "pct_of_mapped_dol_text": 0.54,
+  "privileged_functions_in_rels": 0,
+  "rfi_sites_in_text": 35,
+  "rfi_in_unmapped_TEXT0_exception_vectors": 24,
+  "rfi_in_mapped_fns": 11,
+  "sc_sites": 3,
+  "mtmsr_sites": 25,
+  "mfmsr_sites": 52,
+  "named_examples": [
+   "OSSaveContext",
+   "OSSetCurrentContext",
+   "__OSSaveFPUContext",
+   "__OSLoadFPUContext",
+   "OSDisableInterrupts",
+   "OSEnableInterrupts",
+   "OSRestoreInterrupts",
+   "__OSDBIntegrator",
+   "__DBExceptionDestination",
+   "OSGetTime",
+   "OSGetTick",
+   "Reset",
+   "DCEnable",
+   "ICEnable",
+   "ICFlashInvalidate",
+   "__LCEnable",
+   "LCDisable",
+   "PPCMfhid2",
+   "PPCMtwpar",
+   "PPCSync",
+   "__TRK_get_MSR",
+   "__TRK_set_MSR",
+   "TRK_ppc_memcpy",
+   "TRKRestoreExtended1Block"
+  ],
+  "thread_machinery": {
+   "__OSReschedule": {
+    "addr": 2148450152,
+    "bytes": 48,
+    "named_in_map": true,
+    "translates_clean": true,
+    "callers": 4,
+    "evidence": "body is lwz r0,RunQueueHint(r13); cmpwi 0; beq; li r3,0; bl 0x800ebd68 - matches ~/gc_refs/dolsdk2001/src/os/OSThread.c:395-399 exactly"
+   },
+   "SelectThread": {
+    "addr": 2148449640,
+    "named_in_map": false,
+    "translates_clean": true,
+    "evidence": "sole caller of OSSaveContext (DOLSDK OSThread.c:357 is OSSaveContext's only call site) and calls 0x800e56bc at 0x800ebf48"
+   },
+   "OSLoadContext": {
+    "addr": 2148423356,
+    "bytes": 216,
+    "named_in_map": false,
+    "privileged": true,
+    "callers": 9,
+    "rfi_at": 2148423568,
+    "evidence": "immediately follows OSSaveContext, ends in rfi, called by SelectThread - DOLSDK OSContext.c:281 with its rfi at :350. IDENTIFICATION IS STRUCTURAL, NOT SIGNATURE-MATCHED."
+   }
+  },
+  "conclusion": "the SCHEDULER POLICY (SelectThread, __OSReschedule) is ordinary translatable code; only the setjmp/longjmp primitives OSSaveContext + OSLoadContext are the host boundary. Two functions, not a rewrite of the OS."
+ },
+ "differential_regression": {
+  "slice": "4 SAB leaf fns 0x800ed368 PSMTXConcat / 0x800ed484 PSMTXInverse / 0x800edab8 PSMTXMultVec / 0x800ede34 PSVECCrossProduct",
+  "result": "1056 bit-exact / 0 mismatched of 1056",
+  "wasm_md5_before_and_after": "f14b813694fc243b74c9c85f8fc009fb",
+  "md5_matches_commit_e597dfa6": true,
+  "machine_load_at_run": "6.45 (uptime 14:50, up 5 days)"
+ },
+ "NOT_measured": [
+  "NO performance number of any kind for the SAB static-recomp path.",
+  "NO overlay (.rel) function has been differentially verified - all bit-exactness is DOL functions.",
+  "The new x-form update load/stores (lwzux/lbzux/lhzux/lhaux/stwux/stbux/sthux/lfsux/lfdux/stfsux/stfdux) are NOT differentially verified; the 1056-vector suite does not reach them. The wasm was byte-identical, so the edit is proven ADDITIVE, not proven CORRECT.",
+  "Indirect dispatch (blrl/bctr) is DESIGNED (N64Recomp LOOKUP_FUNC) but NOT BUILT here - P1 is a policy assumption, not a measurement.",
+  "The host context-switch implementation is not built; three known mechanisms exist (Asyncify, one host thread per guest thread, JSPI) and none is chosen or measured.",
+  "Executed-code coverage under a real SAB run was not measured. All numbers here are STATIC.",
+  "OSLoadContext / SelectThread identifications are structural (adjacency + rfi + call graph + DOLSDK source shape), not signature-matched against the SDK binary."
+ ]
+}

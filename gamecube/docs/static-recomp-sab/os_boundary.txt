@@ -1,0 +1,379 @@
+=== PRIVILEGED functions (the host/OS boundary), 67 ===
+  0x80003330     32B    2 priv  zz_80003330_
+  0x800e3494      8B    1 priv  __TRK_get_MSR
+  0x800e349c      8B    1 priv  __TRK_set_MSR
+  0x800e34a4      8B    1 priv  PPCMfhid2
+  0x800e34ac      8B    1 priv  PPCMfhid2
+  0x800e34b4      8B    1 priv  PPCMtwpar
+  0x800e34bc      8B    1 priv  PPCMtwpar
+  0x800e34c4      8B    1 priv  PPCSync
+  0x800e34cc     28B    1 priv  zz_800e34cc_
+  0x800e34e0      8B    1 priv  PPCMfhid2
+  0x800e34e8      8B    1 priv  PPCMtwpar
+  0x800e34f0      8B    1 priv  PPCMtwpar
+  0x800e3bf0     36B    1 priv  __OSDBIntegrator
+  0x800e3c48    152B   10 priv  zz_800e3c48_
+  0x800e3ce0    144B   10 priv  zz_800e3ce0_
+  0x800e3d38     56B    1 priv  zz_800e3d38_
+  0x800e445c    248B    7 priv  zz_800e445c_
+  0x800e4e08     20B    2 priv  DCEnable
+  0x800e4e1c     48B    1 priv  zz_800e4e1c_
+  0x800e4e4c     52B    1 priv  zz_800e4e4c_
+  0x800e4e80     52B    1 priv  zz_800e4e80_
+  0x800e4f4c     16B    2 priv  ICFlashInvalidate
+  0x800e4f5c     20B    2 priv  ICEnable
+  0x800e4f70    204B    7 priv  __LCEnable
+  0x800e5074     40B    3 priv  LCDisable
+  0x800e5388    292B    1 priv  __OSLoadFPUContext
+  0x800e54ac    296B    1 priv  __OSSaveFPUContext
+  0x800e55d4     92B    4 priv  OSSetCurrentContext
+  0x800e563c    128B    8 priv  OSSaveContext
+  0x800e56bc    216B   12 priv  zz_800e56bc_
+  0x800e5b24    132B    5 priv  zz_800e5b24_
+  0x800e78ac     20B    2 priv  OSDisableInterrupts
+  0x800e78c0     20B    2 priv  OSEnableInterrupts
+  0x800e78d4     36B    2 priv  OSRestoreInterrupts
+  0x800e80c8     80B    7 priv  zz_800e80c8_
+  0x800e894c    128B   16 priv  zz_800e894c_
+  0x800e89cc    128B   16 priv  zz_800e89cc_
+  0x800e8a4c     24B    4 priv  zz_800e8a4c_
+  0x800e8e90    184B    4 priv  Reset
+  0x800eb8bc     28B    4 priv  zz_800eb8bc_
+  0x800ecb48     24B    3 priv  OSGetTime
+  0x800ecb60      8B    1 priv  OSGetTick
+  0x800ecf78     44B    2 priv  __DBExceptionDestination
+  0x80108e98      8B    1 priv  __TRK_get_MSR
+  0x80108ea0      8B    1 priv  __TRK_set_MSR
+  0x80108fe0     60B    4 priv  TRK_ppc_memcpy
+  0x80109838    560B   20 priv  zz_80109838_
+  0x80109b18    196B    7 priv  zz_80109b18_
+  0x80109bdc    184B    3 priv  zz_80109bdc_
+  0x8010a474    180B    5 priv  zz_8010a474_
+  0x8010a6b4    440B   96 priv  zz_8010a6b4_
+  0x8010a86c    440B   84 priv  TRKRestoreExtended1Block
+  0x8010aa74    192B    5 priv  zz_8010aa74_
+  0x80113f98     40B    1 priv  zz_80113f98_
+  0x80113fc0     40B    1 priv  zz_80113fc0_
+  0x8011dc98    640B    1 priv  zz_8011dc98_
+  0x80144c54     16B    1 priv  zz_80144c54_
+  0x8014b504    184B   18 priv  zz_8014b504_
+  0x8014b5bc    172B    3 priv  zz_8014b5bc_
+  0x8014b680    300B    6 priv  zz_8014b680_
+  0x8014b7ac     52B    1 priv  zz_8014b7ac_
+  0x8014b8f4    528B    1 priv  zz_8014b8f4_
+  0x80150aa8     40B    3 priv  zz_80150aa8_
+  0x80169ae8     72B    3 priv  zz_80169ae8_
+  0x80169b34     52B    6 priv  zz_80169b34_
+  0x80169b68     52B    6 priv  zz_80169b68_
+  0x80169b9c   1076B    1 priv  zz_80169b9c_
+
+=== GAP functions (genuine translator holes), 4 ===
+  0x8014c580    120B    7 gap   zz_8014c580_
+  0x8014c5f8    140B    7 gap   zz_8014c5f8_
+  0x8014c748    304B    7 gap   zz_8014c748_
+  0x8014c878    336B    7 gap   zz_8014c878_
+
+=== TARGET functions, 19 ===
+  0x8003d27c   1020B    1 tgt   zz_8003d27c_
+  0x80057a08     20B    1 tgt   zz_80057a08_
+  0x80057ea0     20B    1 tgt   zz_80057ea0_
+  0x8006a2cc    224B    1 tgt   zz_8006a2cc_
+  0x8006ed80    188B    1 tgt   zz_8006ed80_
+  0x800a146c   1596B    1 tgt   zz_800a146c_
+  0x800c6520    736B    1 tgt   zz_800c6520_
+  0x800e3c14     32B    1 tgt   zz_800e3c14_
+  0x800e8210    396B    1 tgt   zz_800e8210_
+  0x800e85bc     48B    1 tgt   zz_800e85bc_
+  0x8011b070    880B    1 tgt   zz_8011b070_
+  0x8011c18c    144B    1 tgt   zz_8011c18c_
+  0x8013624c    352B    1 tgt   zz_8013624c_
+  0x8014c134   1100B    1 tgt   zz_8014c134_
+  0x80151120  15268B  126 tgt   zz_80151120_
+  0x80154fa0  15344B  128 tgt   zz_80154fa0_
+  0x80156850   9024B   68 tgt   zz_80156850_
+  0x80158fc4    612B    1 tgt   zz_80158fc4_
+  0x8016fc84    320B    1 tgt   zz_8016fc84_
+
+=== INDIRECT: 472 functions, 40 of them NAMED ===
+  0x8016fe50   1424B    1 ind   CARDCheckExAsync
+  0x800fe410   1060B    9 ind   __DSPHandler
+  0x800ea3f0    836B    2 ind   SIInterruptHandler
+  0x800eb1c4    664B    2 ind   GetTypeCallback
+  0x80172338    368B    1 ind   WriteCallback
+  0x800efda4    344B    2 ind   cbForStateGoToRetry
+  0x80170e58    324B    1 ind   FormatCallback
+  0x80171a9c    304B    1 ind   CreateCallbackFat
+  0x80171fec    304B    1 ind   ReadCallback
+  0x8016c778    280B    1 ind   __CARDExiHandler
+  0x800f004c    276B    2 ind   cbForStateCheckID1
+  0x8016cee8    272B    2 ind   UnlockedCallback
+  0x800f0204    252B    2 ind   cbForStateCheckID3
+  0x800e91e0    244B    1 ind   __OSResetSWInterruptHandler
+  0x800f04d8    228B    1 ind   cbForStateMotorStopped
+  0x8016ebcc    220B    1 ind   BlockReadCallback
+  0x8016ed0c    220B    1 ind   BlockReadCallback
+  0x8016c6a0    216B    2 ind   __CARDExtHandler
+  0x8016ee6c    212B    1 ind   WriteCallback
+  0x8016f270    208B    1 ind   WriteCallback
+  0x800f0344    204B    1 ind   stateCoverClosed
+  0x800f72f0    204B    2 ind   __ARQInterruptServiceRoutine
+  0x80103284    200B    1 ind   __GetImageTileCount
+  0x8016ef40    200B    1 ind   EraseCallback
+  0x8016f340    200B    1 ind   EraseCallback
+  0x801724a8    176B    1 ind   EraseCallback
+  0x8016c890    168B    1 ind   __CARDTxHandler
+  0x8016cc18    164B    1 ind   TimeoutHandler
+  0x801726b4    164B    1 ind   DeleteCallback
+  0x8016c938    132B    1 ind   __CARDUnlockedHandler
+  0x800f62a8    120B    1 ind   __ARHandler
+  0x800ee228    112B    1 ind   AlarmHandlerForTimeout
+  0x800e88e0    108B    1 ind   MEMIntrruptHandler
+  0x800f55b4     96B    1 ind   SamplingHandler
+  0x800f5d68     88B    1 ind   __AICallbackStackSwitch
+  0x800ece94     84B    1 ind   __init_cpp
+  0x8016c03c     64B    1 ind   DBGHandler
+  0x8016c07c     60B    1 ind   MWCallback
+  0x800ef420     48B    1 ind   cbForReadAsync
+  0x80133448     48B    1 ind   __DVDPrintFatalMessage
+=== rfi: 35 sites in .text ===
+  0x80003620  <UNMAPPED>
+  0x80003708  <UNMAPPED>
+  0x80003808  <UNMAPPED>
+  0x80003908  <UNMAPPED>
+  0x80003a08  <UNMAPPED>
+  0x80003b08  <UNMAPPED>
+  0x80003c08  <UNMAPPED>
+  0x80003d08  <UNMAPPED>
+  0x80004008  <UNMAPPED>
+  0x80004108  <UNMAPPED>
+  0x80004208  <UNMAPPED>
+  0x80004328  <UNMAPPED>
+  0x8000435c  <UNMAPPED>
+  0x80004444  <UNMAPPED>
+  0x80004544  <UNMAPPED>
+  0x80004644  <UNMAPPED>
+  0x80004708  <UNMAPPED>
+  0x80004808  <UNMAPPED>
+  0x80004a08  <UNMAPPED>
+  0x80004b08  <UNMAPPED>
+  0x80005008  <UNMAPPED>
+  0x80005108  <UNMAPPED>
+  0x80005208  <UNMAPPED>
+  0x80005308  <UNMAPPED>
+  0x800e3ccc  in zz_800e3c48_ (0x800e3c48+0x84)
+  0x800e3cdc  in zz_800e3c48_ (0x800e3c48+0x94)
+  0x800e5790  in zz_800e56bc_ (0x800e56bc+0xd4)
+  0x800e5ba4  in zz_800e5b24_ (0x800e5b24+0x80)
+  0x800e89c8  in zz_800e894c_ (0x800e894c+0x7c)
+  0x800e8a48  in zz_800e89cc_ (0x800e89cc+0x7c)
+  0x800e8a60  in zz_800e8a4c_ (0x800e8a4c+0x14)
+  0x800eb8d4  in zz_800eb8bc_ (0x800eb8bc+0x18)
+  0x801098fc  in zz_80109838_ (0x80109838+0xc4)
+  0x80109a64  in zz_80109838_ (0x80109838+0x22c)
+  0x80109bd8  in zz_80109b18_ (0x80109b18+0xc0)
+
+=== sc: 3 sites in .text ===
+  0x800e34c4  in PPCSync (0x800e34c4+0x0)
+  0x800e4e78  in zz_800e4e4c_ (0x800e4e4c+0x2c)
+  0x800e4eac  in zz_800e4e80_ (0x800e4e80+0x2c)
+
+=== mtmsr: 25 sites in .text ===
+  0x80003338  in zz_80003330_ (0x80003330+0x8)
+  0x800043fc  <UNMAPPED>
+  0x800044fc  <UNMAPPED>
+  0x800045fc  <UNMAPPED>
+  0x800e349c  in __TRK_set_MSR (0x800e349c+0x0)
+  0x800e3c0c  in __OSDBIntegrator (0x800e3bf0+0x1c)
+  0x800e4f78  in __LCEnable (0x800e4f70+0x8)
+  0x800e5604  in OSSetCurrentContext (0x800e55d4+0x30)
+  0x800e5624  in OSSetCurrentContext (0x800e55d4+0x50)
+  0x800e5774  in zz_800e56bc_ (0x800e56bc+0xb8)
+  0x800e5b2c  in zz_800e5b24_ (0x800e5b24+0x8)
+  0x800e78b4  in OSDisableInterrupts (0x800e78ac+0x8)
+  0x800e78c8  in OSEnableInterrupts (0x800e78c0+0x8)
+  0x800e78ec  in OSRestoreInterrupts (0x800e78d4+0x18)
+  0x800ecf80  in __DBExceptionDestination (0x800ecf78+0x8)
+  0x80108ea0  in __TRK_set_MSR (0x80108ea0+0x0)
+  0x80108ff0  in TRK_ppc_memcpy (0x80108fe0+0x10)
+  0x80108ffc  in TRK_ppc_memcpy (0x80108fe0+0x1c)
+  0x80109010  in TRK_ppc_memcpy (0x80108fe0+0x30)
+  0x80109864  in zz_80109838_ (0x80109838+0x2c)
+  0x80109988  in zz_80109838_ (0x80109838+0x150)
+  0x80109b64  in zz_80109b18_ (0x80109b18+0x4c)
+  0x80109bec  in zz_80109bdc_ (0x80109bdc+0x10)
+  0x8010a4b8  in zz_8010a474_ (0x8010a474+0x44)
+  0x8010aad4  in zz_8010aa74_ (0x8010aa74+0x60)
+
+=== mfmsr: 52 sites in .text ===
+  0x80003330  in zz_80003330_ (0x80003330+0x0)
+  0x80003604  <UNMAPPED>
+  0x800036ec  <UNMAPPED>
+  0x800037ec  <UNMAPPED>
+  0x800038ec  <UNMAPPED>
+  0x800039ec  <UNMAPPED>
+  0x80003aec  <UNMAPPED>
+  0x80003bec  <UNMAPPED>
+  0x80003cec  <UNMAPPED>
+  0x80003fec  <UNMAPPED>
+  0x800040ec  <UNMAPPED>
+  0x800041ec  <UNMAPPED>
+  0x8000430c  <UNMAPPED>
+  0x80004340  <UNMAPPED>
+  0x800043e4  <UNMAPPED>
+  0x800043f0  <UNMAPPED>
+  0x80004428  <UNMAPPED>
+  0x800044e4  <UNMAPPED>
+  0x800044f0  <UNMAPPED>
+  0x80004528  <UNMAPPED>
+  0x800045e4  <UNMAPPED>
+  0x800045f0  <UNMAPPED>
+  0x80004628  <UNMAPPED>
+  0x800046ec  <UNMAPPED>
+  0x800047ec  <UNMAPPED>
+  0x800049ec  <UNMAPPED>
+  0x80004aec  <UNMAPPED>
+  0x80004fec  <UNMAPPED>
+  0x800050ec  <UNMAPPED>
+  0x800051ec  <UNMAPPED>
+  0x800052ec  <UNMAPPED>
+  0x800e3494  in __TRK_get_MSR (0x800e3494+0x0)
+  0x800e3ca4  in zz_800e3c48_ (0x800e3c48+0x5c)
+  0x800e4f70  in __LCEnable (0x800e4f70+0x0)
+  0x800e55fc  in OSSetCurrentContext (0x800e55d4+0x28)
+  0x800e5618  in OSSetCurrentContext (0x800e55d4+0x44)
+  0x800e568c  in OSSaveContext (0x800e563c+0x50)
+  0x800e5768  in zz_800e56bc_ (0x800e56bc+0xac)
+  0x800e5b24  in zz_800e5b24_ (0x800e5b24+0x0)
+  0x800e78ac  in OSDisableInterrupts (0x800e78ac+0x0)
+  0x800e78c0  in OSEnableInterrupts (0x800e78c0+0x0)
+  0x800e78d8  in OSRestoreInterrupts (0x800e78d4+0x4)
+  0x800e89b4  in zz_800e894c_ (0x800e894c+0x68)
+  0x800e8a34  in zz_800e89cc_ (0x800e89cc+0x68)
+  0x800e8a54  in zz_800e8a4c_ (0x800e8a4c+0x8)
+  0x800ecf78  in __DBExceptionDestination (0x800ecf78+0x0)
+  0x80108e98  in __TRK_get_MSR (0x80108e98+0x0)
+  0x80108fe0  in TRK_ppc_memcpy (0x80108fe0+0x0)
+  0x80109b24  in zz_80109b18_ (0x80109b18+0xc)
+  0x80109b5c  in zz_80109b18_ (0x80109b18+0x44)
+  0x8010a4ac  in zz_8010a474_ (0x8010a474+0x38)
+  0x8010aac8  in zz_8010aa74_ (0x8010aa74+0x54)
+
+total relative `bl` sites in .text: 22878
+distinct bl targets              : 3457
+bl targets that are NOT a mapped function start: 0  (0 call sites)
+
+0x800ebf68 __OSReschedule (named)
+    direct `bl` call sites: 4
+      from 0x800e4430 in zz_800e422c_
+      from 0x800e5e48 in zz_800e5db8_
+      from 0x800e8098 in zz_800e7d84_
+      from 0x8016b8c0 in zz_8016b7bc_
+
+0x800e563c OSSaveContext (named)
+    direct `bl` call sites: 1
+      from 0x800ebe68 in zz_800ebd68_
+
+0x800e56bc zz_800e56bc_ [suspected OSLoadContext: adjacent to OSSaveContext, ends in rfi]
+    direct `bl` call sites: 9
+      from 0x800e426c in zz_800e422c_
+      from 0x800e4308 in zz_800e422c_
+      from 0x800e4438 in zz_800e422c_
+      from 0x800e5e50 in zz_800e5db8_
+      from 0x800e5e64 in zz_800e5db8_
+      from 0x800e7dcc in zz_800e7d84_
+      from 0x800e80a0 in zz_800e7d84_
+      from 0x800e80a8 in zz_800e7d84_
+      from 0x800ebf48 in zz_800ebd68_
+
+0x800e55d4 OSSetCurrentContext (named)
+    direct `bl` call sites: 41
+
+0x800e5388 __OSLoadFPUContext (named)
+    direct `bl` call sites: 1
+      from 0x800e5b60 in zz_800e5b24_
+
+0x800e54ac __OSSaveFPUContext (named)
+    direct `bl` call sites: 1
+      from 0x800e5b5c in zz_800e5b24_
+
+0x800e78ac OSDisableInterrupts (named)
+    direct `bl` call sites: 212
+
+0x800e78c0 OSEnableInterrupts (named)
+    direct `bl` call sites: 4
+      from 0x800e3954 in zz_800e362c_
+      from 0x800e8ce4 in zz_800e8c40_
+      from 0x800ebe9c in zz_800ebd68_
+      from 0x8013f204 in zz_8013f1d0_
+
+0x800e78d4 OSRestoreInterrupts (named)
+    direct `bl` call sites: 246
+
+__OSReschedule body (48 bytes):
+  0x800ebf68  7c0802a6
+  0x800ebf6c  90010004
+  0x800ebf70  9421fff8
+  0x800ebf74  800d8a24
+  0x800ebf78  2c000000
+  0x800ebf7c  4182000c
+  0x800ebf80  38600000
+  0x800ebf84  4bfffde5   -> 0x800ebd68 zz_800ebd68_ [LK]
+  0x800ebf88  8001000c
+  0x800ebf8c  38210008
+  0x800ebf90  7c0803a6
+  0x800ebf94  4e800020
+map .text entries total            : 5097
+deduped units resident in this DOL : 4811
+sum of entry sizes                 : 1662464 bytes (415616 instrs)
+UNION of entry extents             : 1499228 bytes (374807 instrs)
+overlap/double-count               : 163236 bytes (9.82% of the sum)
+DOL .text from the section table   : 1507392 bytes (376848 instrs)  TEXT0+TEXT1
+union INSIDE .text                 : 1499228 bytes = 99.46% of .text
+union OUTSIDE .text (overrun)      : 0 bytes
+UNMAPPED .text                     : 8164 bytes (2041 instrs)
+
+named units 840 / auto zz_ units 3971
+=== map entries covering 0x80150000..0x80159000 ===
+  zz_801500e4_         [0x801500e4, 0x80150298)     436B
+  zz_80150298_         [0x80150298, 0x80150370)     216B
+  zz_80150370_         [0x80150370, 0x80150424)     180B
+  zz_80150424_         [0x80150424, 0x801504d8)     180B
+  zz_801504d8_         [0x801504d8, 0x801509e4)    1292B
+  zz_801509e4_         [0x801509e4, 0x80150aa8)     196B
+  zz_80150aa8_         [0x80150aa8, 0x80150ad0)      40B
+  zz_80150ad0_         [0x80150ad0, 0x80150b6c)     156B
+  zz_80150b6c_         [0x80150b6c, 0x80154cc4)   16728B
+  zz_80151120_         [0x80151120, 0x80154cc4)   15268B
+  zz_80154cc4_         [0x80154cc4, 0x80158b90)   16076B
+  zz_80154fa0_         [0x80154fa0, 0x80158b90)   15344B
+  zz_80156850_         [0x80156850, 0x80158b90)    9024B
+  zz_80158b90_         [0x80158b90, 0x80158dbc)     556B
+  zz_80158dbc_         [0x80158dbc, 0x80159228)    1132B
+  zz_80158fc4_         [0x80158fc4, 0x80159228)     612B
+
+=== OVERLAPPING adjacent map entries: 100 pairs ===
+  zz_80003140_      [0x80003140,0x80003270) overlaps zz_80003254_      [0x80003254,0x80003270) by 28 bytes
+  zz_8002cbbc_      [0x8002cbbc,0x8002cc28) overlaps zz_8002cbe4_      [0x8002cbe4,0x8002cc28) by 68 bytes
+  zz_8002d83c_      [0x8002d83c,0x8002d8e0) overlaps zz_8002d8a4_      [0x8002d8a4,0x8002d8e0) by 60 bytes
+  zz_8002d8a4_      [0x8002d8a4,0x8002d8e0) overlaps zz_8002d8a8_      [0x8002d8a8,0x8002d8e0) by 56 bytes
+  zz_8002df3c_      [0x8002df3c,0x8002ee00) overlaps zz_8002ebdc_      [0x8002ebdc,0x8002ee00) by 548 bytes
+  zz_800334b0_      [0x800334b0,0x80033620) overlaps zz_800334c8_      [0x800334c8,0x80033620) by 344 bytes
+  zz_80035a7c_      [0x80035a7c,0x80035b38) overlaps zz_80035b1c_      [0x80035b1c,0x80035b38) by 28 bytes
+  zz_8003ca00_      [0x8003ca00,0x8003d678) overlaps zz_8003d27c_      [0x8003d27c,0x8003d678) by 1020 bytes
+  zz_8004c734_      [0x8004c734,0x8004d6d0) overlaps zz_8004c9f8_      [0x8004c9f8,0x8004d6d0) by 3288 bytes
+  zz_8006a14c_      [0x8006a14c,0x8006a3ac) overlaps zz_8006a2cc_      [0x8006a2cc,0x8006a3ac) by 224 bytes
+  zz_8006a5f4_      [0x8006a5f4,0x8006a868) overlaps zz_8006a6fc_      [0x8006a6fc,0x8006a868) by 364 bytes
+  zz_8006bb10_      [0x8006bb10,0x8006bcf0) overlaps zz_8006bbdc_      [0x8006bbdc,0x8006bcf0) by 276 bytes
+  zz_8006d878_      [0x8006d878,0x8006ee3c) overlaps zz_8006ed80_      [0x8006ed80,0x8006ee3c) by 188 bytes
+  zz_800763dc_      [0x800763dc,0x800766e8) overlaps zz_800765a0_      [0x800765a0,0x800766e8) by 328 bytes
+  zz_80077354_      [0x80077354,0x80077494) overlaps zz_8007742c_      [0x8007742c,0x80077494) by 104 bytes
+  zz_8007a3d0_      [0x8007a3d0,0x8007aa1c) overlaps zz_8007a604_      [0x8007a604,0x8007aa1c) by 1048 bytes
+  zz_8007e89c_      [0x8007e89c,0x80083e44) overlaps zz_8007ffd4_      [0x8007ffd4,0x80083e44) by 15984 bytes
+  zz_8007ffd4_      [0x8007ffd4,0x80083e44) overlaps zz_80080198_      [0x80080198,0x80083e44) by 15532 bytes
+  zz_80080198_      [0x80080198,0x80083e44) overlaps zz_80080d6c_      [0x80080d6c,0x80083e44) by 12504 bytes
+  zz_80083e44_      [0x80083e44,0x80086ba4) overlaps zz_80083e6c_      [0x80083e6c,0x80086ba4) by 11576 bytes
+  ... total overlap bytes = 163236
+
+=== how the two TARGET addresses are reached by opcode-18 branches ===
+  0x80154dcc: 130 sites, forms=['b']
+  0x80150eec: 130 sites, forms=['b']

@@ -1,0 +1,68 @@
+mapped functions in image : 4811
+mapped instructions       : 415616
+
+policy                                    functions         instructions
+P0 strict (today)                  4250 ( 88.34%)    299239 ( 72.00%)
+P1 + indirect dispatch             4721 ( 98.13%)    401400 ( 96.58%)
+P2 + host/privileged stubs         4788 ( 99.52%)    403560 ( 97.10%)
+P3 + boundary recovery             4807 ( 99.92%)    415391 ( 99.95%)
+P4 + translator gaps closed        4811 (100.00%)    415616 (100.00%)
+
+functions containing at least one blocker of each class:
+  INDIRECT      472 functions   102191 instrs in those functions     827 blocking instructions
+  PRIVILEGED     67 functions     2160 instrs in those functions     433 blocking instructions
+  TARGET         19 functions    11831 instrs in those functions     338 blocking instructions
+  GAP             4 functions      225 instrs in those functions      28 blocking instructions
+
+blocking INSTRUCTIONS by reason (every occurrence, not first-per-fn):
+      678  INDIRECT    blrl
+      196  TARGET      branch target 0x80154dcc is not a function start
+      149  INDIRECT    bctr/bctrl
+      126  TARGET      branch target 0x80150eec is not a function start
+       22  PRIVILEGED  op31 xo=83 (mfmsr)
+       22  PRIVILEGED  op31 xo=146 (mtmsr)
+       21  GAP         op31 xo=55 (lwzux)
+       18  PRIVILEGED  cache/sync/trap op x470
+       16  PRIVILEGED  op31 xo=595 (mfsr)
+       16  PRIVILEGED  op31 xo=210 (mtsr)
+       13  PRIVILEGED  paired-single op4 xo=1014 xo5=22 (dcbz_l)
+       11  PRIVILEGED  rfi
+       11  PRIVILEGED  op31 xo=371 (mftb)
+       10  PRIVILEGED  mtspr SPR26
+        9  PRIVILEGED  mtspr SPR27
+        8  PRIVILEGED  mfspr SPR920
+        7  PRIVILEGED  mfspr SPR1008
+        7  PRIVILEGED  mtspr SPR1008
+        7  GAP         op31 xo=631 (lfdux)
+        6  PRIVILEGED  mfspr SPR914
+        6  PRIVILEGED  mfspr SPR915
+        6  PRIVILEGED  mfspr SPR916
+        6  PRIVILEGED  mfspr SPR917
+        6  PRIVILEGED  mfspr SPR918
+        6  PRIVILEGED  mfspr SPR919
+        5  PRIVILEGED  mfspr SPR913
+        5  PRIVILEGED  mtspr SPR913
+        5  PRIVILEGED  mtspr SPR916
+        5  PRIVILEGED  mtspr SPR536
+        5  PRIVILEGED  mtspr SPR528
+        5  PRIVILEGED  mtspr SPR540
+        5  PRIVILEGED  mtspr SPR532
+        4  PRIVILEGED  mtspr SPR920
+        4  PRIVILEGED  mfspr SPR26
+        4  PRIVILEGED  mtspr SPR915
+        4  PRIVILEGED  mtspr SPR917
+        4  PRIVILEGED  mtspr SPR919
+        4  PRIVILEGED  mfspr SPR275
+        3  PRIVILEGED  sc
+        3  PRIVILEGED  mfspr SPR18
+        3  PRIVILEGED  mfspr SPR19
+        3  PRIVILEGED  mtspr SPR912
+        3  PRIVILEGED  mtspr SPR914
+        3  PRIVILEGED  mtspr SPR918
+        3  PRIVILEGED  mtspr SPR537
+
+GENUINE TRANSLATOR GAPS: 28 instructions, 2 distinct forms
+       21  op31 xo=55 (lwzux)
+        7  op31 xo=631 (lfdux)
+
+wrote /tmp/sr_sab/dol_census.json

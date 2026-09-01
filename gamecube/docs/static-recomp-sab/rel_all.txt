@@ -1,0 +1,15 @@
+ALL 76 overlays: 5551313 instructions decoded
+  clean      : 5549137  (99.9608%)
+  blocked    : 2176  (0.0392%)
+  PRIVILEGED : 0
+        1195  bctr/bctrl
+         981  blrl
+  overlays with the most blocked instructions:
+    advertiseD.rel               51 blocked of 66701
+    stg59D.rel                   45 blocked of 100587
+    stg25D.rel                   45 blocked of 100581
+    Boss_GolemED.rel             44 blocked of 88023
+    stg38D.rel                   43 blocked of 98621
+    stg26D.rel                   42 blocked of 95169
+    stg11D.rel                   40 blocked of 91606
+    boss_bigbogyD.rel            40 blocked of 90400

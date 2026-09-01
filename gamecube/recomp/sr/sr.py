@@ -463,6 +463,40 @@ class Translator:
             if xo == 599:  o.append(f"st->ps0[{f['frD']}] = gk_r64({ea_x(f)});"); return o       # lfdx
             if xo == 663:  o.append(f"gk_w32({ea_x(f)}, gk_cvt_to_single_ftz(st->ps0[{f['frS']}]));"); return o
             if xo == 727:  o.append(f"gk_w64({ea_x(f)}, st->ps0[{f['frS']}]);"); return o
+            # ---- indexed-with-update load/store (x-form) ---
+            # Same shape as the validated d-form update handling below (ops 33/35/41/43
+            # and 37/39/45): compute EA once, do the access, then write EA back to rA.
+            # PowerPC leaves the update forms INVALID when rA==0, and for loads also
+            # when rA==rD, so those stay Untranslatable rather than guessing.
+            LSUX = {55: 'gk_r32', 119: 'gk_r8', 311: 'gk_r16', 375: 'gk_r16s'}
+            if xo in LSUX:                               # lwzux/lbzux/lhzux/lhaux
+                if A == 0 or A == D:
+                    raise Untranslatable("invalid update form", pc, w)
+                fn = LSUX[xo]
+                rhs = (f"(uint32_t)(int32_t)(int16_t)gk_r16(_e)" if fn == 'gk_r16s'
+                       else f"{fn}(_e)")
+                o.append(f"{{ uint32_t _e = {ea_x(f)}; {self.gp(D)} = {rhs};"
+                         f" st->gpr[{A}] = _e; }}")
+                return o
+            STUX = {183: ('gk_w32', ''), 247: ('gk_w8', '(uint8_t)'),
+                    439: ('gk_w16', '(uint16_t)')}
+            if xo in STUX:                               # stwux/stbux/sthux
+                if A == 0:
+                    raise Untranslatable("invalid update form", pc, w)
+                fn, cast = STUX[xo]
+                o.append(f"{{ uint32_t _e = {ea_x(f)}; {fn}(_e, {cast}{self.gp(S)});"
+                         f" st->gpr[{A}] = _e; }}")
+                return o
+            FPUX = {567: f"st->ps0[{f['frD']}] = gk_cvt_to_double(gk_r32(_e));"
+                        f" st->ps1[{f['frD']}] = st->ps0[{f['frD']}];",   # lfsux
+                    631: f"st->ps0[{f['frD']}] = gk_r64(_e);",            # lfdux (PS0 only)
+                    695: f"gk_w32(_e, gk_cvt_to_single_ftz(st->ps0[{f['frS']}]));",  # stfsux
+                    759: f"gk_w64(_e, st->ps0[{f['frS']}]);"}             # stfdux
+            if xo in FPUX:
+                if A == 0:
+                    raise Untranslatable("invalid FP update form", pc, w)
+                o.append(f"{{ uint32_t _e = {ea_x(f)}; {FPUX[xo]} st->gpr[{A}] = _e; }}")
+                return o
             if xo == 339:                                # mfspr
                 spr = f['SPR']
                 src = {8: 'st->lr', 9: 'st->ctr', 1: 'st->xer'}.get(spr)
