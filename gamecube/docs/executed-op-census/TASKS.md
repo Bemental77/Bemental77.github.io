@@ -77,6 +77,38 @@ Validate emitted modules with **`wasm-validate --enable-all`**. Plain
 and reports every module invalid — that is the validator's default feature set,
 not a codegen bug. (This produced a full false alarm once already.)
 
+### ⚠ `test_gekko_next` needs a ~25-minute timeout, and a truncated run once read as `ALL PASS`
+
+`test_gekko_next` registers **171** tests and one of them streams a wasm hex dump
+through the headless console. The cost is documented in the test itself
+(`test_gekko_next.cpp:4147`: "the wasmdump hex stream takes ~15 min through the
+headless console pipe"), and `dump_block_wasm` (`:2501`) is called from 9 sites.
+There is no filter mechanism — `main()` (`:4310`) takes no arguments and parses
+no query string — so you cannot skip it. Budget for it:
+
+```bash
+TEST_TIMEOUT_MS=2400000 node gamecube/bementalJIT/tests/run_browser_test.mjs \
+  test_gekko_next gamecube/bementalJIT/build-emcc-test
+```
+
+Measured 2026-09-01: the 90 s default yielded **3** `[PASS]` lines; 900 s yielded
+**134** `[PASS]`, 0 `[FAIL]`, 10,859 console lines, and still timed out inside
+`[wasmdump IDCT_nospec]`.
+
+**The trap, and its fix.** `run_browser_test.mjs` used to decide the verdict as
+"FAIL if any `[FAIL]`, else **PASS if any `[PASS]`**, else INCONCLUSIVE" — it
+never checked the suite reached its end, so a run that timed out after 3 of 171
+cases reported **PASS**, and `run_tests.sh` printed **ALL PASS**. That happened
+here at load 26-45. A sibling fixed the harness the same day: it now carries a
+`DONE_RE` completion-marker check (`:77`) and reports **INCOMPLETE** with the
+`[PASS]` count and the timeout value (`:132-135`).
+
+The invariant that made it detectable is worth keeping regardless of the harness:
+**the suite's own completion marker is `TOTAL: %d passed, %d failed`
+(`test_gekko_next.cpp:4345`). If that line is absent from
+`/tmp/bjit-tests/<name>.log`, the run did not finish, whatever the verdict says.**
+Read the counts from that line, not from the summary.
+
 ## The finding
 
 Top-24 SAB hot buckets, post-boot segments, 8,696 weighted samples, 276 recovered
@@ -316,12 +348,16 @@ being decided.
   neither has a measured fps/speed delta. The probe lock was held by a sibling
   for the entire session and the box ran at load 6.8-38.6, above the ~25 at which
   gate #10 voids a pair anyway.
-- The emitter test suite (`bash gamecube/bementalJIT/run_tests.sh test_gekko_next
-  test_simd_bswap`) was queued behind the lock and did NOT run. Structural
-  verification that DID run: all 276 emitted modules validate under
+- The emitter suite is only PARTIALLY run. `test_simd_bswap` completed honestly:
+  **`TOTAL: 8 passed, 0 failed`** — and it is the suite that most directly covers
+  the store paths Lever 2 touches (psq_l/psq_st/lfd/stfd fastmem arms).
+  `test_gekko_next` reached **134 `[PASS]`, 0 `[FAIL]` of its 171 registered
+  cases** before timing out inside the wasm hex dump at a 900 s budget; a 2400 s
+  re-run is the way to close it (see the timeout note above). ZERO failures in
+  anything that ran. Also verified: all 276 emitted modules validate under
   `wasm-validate --enable-all` on both arms, and a differential disassembly of
-  0x80117e0c confirms the diet's emitted terminal is exactly the intended
-  transformation. That is not a substitute for the 169-case suite.
+  0x80117e0c confirms the diet's terminal is exactly the intended transformation.
+  None of that is a substitute for a complete 171/171.
 - No attempt at the internal-table / region re-enable — see correction (c). It is
   not a flag flip and the box could not support the matched pair it needs.
 - No change to the `[a]` downcount predicate, the vector guard's semantics, the
