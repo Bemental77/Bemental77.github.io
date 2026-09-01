@@ -300,12 +300,48 @@ window.GcRate = (function () {
   // measurement arm, not the product — those readings are stamped "[fast-fwd arm]" so a
   // fast-forwarded guest can never be quoted as shipped headroom.
   var TARGET_FPS = 120;
+  // ★ THE HEADLINE CAP MUST BE A ROBUST STATISTIC, NOT ONE WINDOW.
+  // MEASURED 2026-09-01 on the recomp path: the bar printed "520 fps cap (8.7x hw)" — and
+  // therefore "120 REACHED" — while a matched cross-check of the SAME tree put the sustainable
+  // figure at a p50 of 169.3/s. Two independent causes, both of which a single window exposes:
+  //   1. `cap` is min(guestCap, renderCap) per window, but when a stage was not observed at all
+  //      that stage is null and `cap` silently becomes the OTHER stage alone. The comment at
+  //      the guest branch already names this hazard verbatim — "would hand `cap` to the other
+  //      stage alone and OVERSTATE the pipeline by an unbounded factor" — and guards the guest
+  //      side; the render side has no such guard, so a window that watched rendering for a
+  //      sliver reports guest-only capacity as if it were the pipeline's.
+  //   2. Even with both stages seen, a 1s window that clips a busy span reads high. The
+  //      cross-check found the stages disagreeing by 2.15x (guestCap 364.7 vs renderCap 169.3).
+  // A median over recent windows is immune to both: a stage has to be genuinely fast in most
+  // windows to move it. This is the same correction the dropped-frames headline already got —
+  // a verdict announced off one lucky window is the fabricated number gate #9 forbids.
+  // Falls back to the raw per-window value when no history exists, so a caller that hands over
+  // a bare rate object (every self-test case, and the first window after boot) is unchanged.
+  function capForVerdict(r) {
+    return (r.capFpsP50 !== null && r.capFpsP50 !== undefined && isFinite(r.capFpsP50))
+      ? r.capFpsP50 : r.capFps;
+  }
+  // How many windows the median spans. Small enough to still track a real change in the
+  // pipeline, large enough that one clipped window cannot carry the verdict on its own.
+  var CAP_HIST_N = 15;
+  // Median of the last N per-window caps. Exported so the page owns the history and this stays
+  // a pure function — the self-test asserts the exact text the user reads.
+  function capMedian(hist) {
+    var v = [], i;
+    for (i = 0; i < hist.length; i++) {
+      if (hist[i] !== null && hist[i] !== undefined && isFinite(hist[i]) && hist[i] > 0) v.push(hist[i]);
+    }
+    if (!v.length) return null;
+    v.sort(function (a, b) { return a - b; });
+    var n = v.length;
+    return (n % 2) ? v[(n - 1) >> 1] : (v[(n >> 1) - 1] + v[n >> 1]) / 2;
+  }
   function gapText(r) {
     // No rate measured yet => no verdict. (Also keeps the pre-boot readout at a clean
     // "speed -- · cap --" instead of announcing a target for an emulator that has not run.)
     if (r.speed === null || r.speed === undefined) return null;
     var arm = (r.uncapped || (r.speedReq !== undefined && r.speedReq !== 1)) ? ' [fast-fwd arm]' : '';
-    var cap = r.capFps;
+    var cap = capForVerdict(r);
     var hz = r.nativeHz;
     // THE TWO HALVES HAVE DIFFERENT REQUIREMENTS, and conflating them cost a wrong headline.
     // The GAP to 120 needs only `cap`, the measured sustainable production rate — it is sound
@@ -333,8 +369,11 @@ window.GcRate = (function () {
         // headroom we shipped rather than the measurement arm it is (gate #9).
         + (r.uncapped ? ' UNCAPPED' : '')
         + (r.starved ? ' STARVED' : ''),
-      (r.capFps === null || r.capFps === undefined) ? 'cap --'
-        : num(r.capFps) + ' fps cap (' + num(r.capFps / r.guestHz, 1) + 'x hw)'
+      (function () {
+        var c = capForVerdict(r);
+        if (c === null || c === undefined || !isFinite(c)) return 'cap --';
+        return num(c) + ' fps cap (' + num(c / r.guestHz, 1) + 'x hw)';
+      })()
     ];
     var g = gapText(r);
     if (g) parts.push(g);
@@ -1560,6 +1599,63 @@ window.GcRate = (function () {
        fastN.painted <= fastN.rafTicks && fastN.qMaxSeen <= 3 && fastN.qDrops > 0,
        'painted ' + fastN.painted + '/' + fastN.rafTicks + ' rAF, queue drops ' + fastN.qDrops);
 
+    // ---- 24. THE HEADLINE CAP IS A MEDIAN, NOT ONE LUCKY WINDOW ------------------------------
+    // THE BUG THIS PINS, measured on the live recomp path: the bar printed "520 fps cap
+    // (8.7x hw)" and therefore "120 REACHED", while a matched cross-check of the same tree put
+    // the sustainable figure at a p50 of 169.3/s. `cap` is per-window, and a window that clipped
+    // a busy span — or that never observed one of the two stages, in which case `cap` silently
+    // becomes the other stage alone — reads far high. 24c is the control: the median must still
+    // TRACK a pipeline that is genuinely fast, or this would be smoothing that hides good news.
+    (function () {
+      var spike = [168, 171, 169, 170, 520, 167, 172];   // one clipped window among honest ones
+      ck('24a a single spiking window does NOT move the median',
+         near(capMedian(spike), 170, 2.01), 'median=' + fx(capMedian(spike), 1));
+      // 170 really does clear 120, so "120 REACHED" is CORRECT here and must stay. What the
+      // spike corrupted was the MAGNITUDE: off the raw 520 the bar claimed 8.7x hardware and
+      // 4.33x the target; off the median it claims 2.8x and 1.42x. That difference is the
+      // whole bug — an overstatement, not a false verdict.
+      ck('24b ...so the headline quotes the MEDIAN magnitude, not the spike',
+         (function () {
+           var r = { speed: 1.0, speedReq: 1, guestHz: 60, nativeHz: 60,
+                     capFps: 520, capFpsP50: capMedian(spike), shown: 60, published: 60 };
+           var s = format(r);
+           return s.indexOf('170 fps cap (2.8x hw)') !== -1 && s.indexOf('520') === -1 &&
+                  s.indexOf('120 REACHED (1.42x)') !== -1;
+         })(),
+         format({ speed: 1.0, speedReq: 1, guestHz: 60, nativeHz: 60,
+                  capFps: 520, capFpsP50: capMedian(spike), shown: 60, published: 60 }));
+      ck('24b2 CONTROL: the SAME object without a median still prints the overstated spike',
+         (function () {
+           var s = format({ speed: 1.0, speedReq: 1, guestHz: 60, nativeHz: 60,
+                            capFps: 520, capFpsP50: null, shown: 60, published: 60 });
+           return s.indexOf('520 fps cap (8.7x hw)') !== -1 && s.indexOf('120 REACHED (4.33x)') !== -1;
+         })(),
+         format({ speed: 1.0, speedReq: 1, guestHz: 60, nativeHz: 60,
+                  capFps: 520, capFpsP50: null, shown: 60, published: 60 }));
+      ck('24c CONTROL: a genuinely fast pipeline still reaches 120 — this smooths, it does not cap',
+         (function () {
+           var fast = [300, 310, 305, 302, 308];
+           var r = { speed: 1.0, speedReq: 1, guestHz: 60, nativeHz: 60,
+                     capFps: 305, capFpsP50: capMedian(fast), shown: 60, published: 60 };
+           return format(r).indexOf('120 REACHED') !== -1;
+         })(), format({ speed: 1.0, speedReq: 1, guestHz: 60, nativeHz: 60,
+                        capFps: 305, capFpsP50: capMedian([300, 310, 305, 302, 308]),
+                        shown: 60, published: 60 }));
+      ck('24d with no history the raw per-window value is used, unchanged',
+         (function () {
+           var r = { speed: 1.0, speedReq: 1, guestHz: 60, nativeHz: 60,
+                     capFps: 180, capFpsP50: null, shown: 60, published: 60 };
+           return format(r).indexOf('180 fps cap') !== -1;
+         })(), format({ speed: 1.0, speedReq: 1, guestHz: 60, nativeHz: 60,
+                        capFps: 180, capFpsP50: null, shown: 60, published: 60 }));
+      ck('24e the median ignores null/zero windows rather than counting them as slow',
+         capMedian([null, 0, 169, undefined, 171, NaN]) === 170,
+         'median=' + capMedian([null, 0, 169, undefined, 171, NaN]));
+      ck('24f an all-empty history yields null, not NaN or 0',
+         capMedian([null, undefined, NaN]) === null && capMedian([]) === null,
+         'got ' + capMedian([null, undefined, NaN]) + ' / ' + capMedian([]));
+    })();
+
     // ── DROPPED FRAMES MUST REACH THE HEADLINE ────────────────────────────────
     // Pinned because the bar read "60 shown / 60 published · 120 REACHED" during a
     // window whose real present rate was 45.2/s: `_rateDropped` was computed and
@@ -1590,6 +1686,7 @@ window.GcRate = (function () {
 
   return { makeModel: makeModel, seqDelta: seqDelta, format: format, num: num,
            route: route, RECOMP_TITLES: RECOMP_TITLES,
+           capMedian: capMedian, capForVerdict: capForVerdict, CAP_HIST_N: CAP_HIST_N,
            presentSim: presentSim, jitterSeries: jitterSeries,
            simulate: simulate, selfTest: selfTest, DEF: DEF,
            makeJitRate: makeJitRate, jitCycles: jitCycles, applyJit: applyJit,
@@ -5190,10 +5287,24 @@ window.GcRate = (function () {
     }
     _rateRender();
   }
+  // Rolling per-window cap history behind the headline's robust statistic (see capForVerdict).
+  // Pushed only when the value actually MOVES: this funnel can render more than once per
+  // measurement window, and re-pushing an unchanged reading would let one window vote many
+  // times — which is precisely the over-weighting the median exists to remove.
+  var _capHist = [], _capHistLast;
+  function _capHistPush(v) {
+    if (v === null || v === undefined || !isFinite(v) || v <= 0) return;
+    if (v === _capHistLast) return;
+    _capHistLast = v;
+    _capHist.push(v);
+    if (_capHist.length > GcRate.CAP_HIST_N) _capHist.shift();
+  }
   function _rateRender() {
     if (!fpsEl) return;
     // ?ratetest=1 parks its PASS/FAIL summary in this slot; the 1s tick must not wipe it.
     if (window.__gcRateTest) return;
+    _capHistPush(Rate.capFps);
+    Rate.capFpsP50 = GcRate.capMedian(_capHist);
     // nothing has run yet — keep the status bar clean rather than advertising a row of "--".
     if (!Rate.published && !Rate.shown && Rate.speed === null) { fpsEl.textContent = ''; return; }
     var offHwRate = Rate.speed !== null && Math.abs(Rate.speed - 1) > 0.02;
@@ -5201,8 +5312,15 @@ window.GcRate = (function () {
     fpsEl.title =
       'speed     = emulated time / wall time. 1.00x = exactly hardware rate (the target).\n' +
       'cap       = MEASURED frames/s this pipeline could sustain at 100% duty. Headroom, not\n' +
-      '            pixels. "' + _rateNum(Rate.capFps) + ' fps cap" at 1.00x = we are ' +
-      _rateNum(Rate.capFps === null ? null : Rate.capFps / Rate.guestHz, 1) + 'x ahead of the hardware.\n' +
+      '            pixels. "' + _rateNum(GcRate.capForVerdict(Rate)) + ' fps cap" at 1.00x = we are ' +
+      _rateNum(GcRate.capForVerdict(Rate) === null ? null : GcRate.capForVerdict(Rate) / Rate.guestHz, 1) +
+      'x ahead of the hardware.\n' +
+      // Both figures, always. The headline quotes the MEDIAN of recent windows because a single
+      // window that clipped a busy span (or watched only one stage) reads high — that is how
+      // "520 fps cap / 120 REACHED" got printed against a cross-checked 169.3/s. Showing the
+      // current window next to it means the smoothing can never hide a reading, only rank it.
+      '            median of last ' + _capHist.length + ' window(s) = ' + _rateNum(Rate.capFpsP50) +
+      ' · this window = ' + _rateNum(Rate.capFps) + '\n' +
       (Rate.capNote ? '            ' + Rate.capNote + '\n' : '') +
       // The 120 verdict, spelled out. The bar has room for the conclusion; the arithmetic and
       // the per-game target belong here.

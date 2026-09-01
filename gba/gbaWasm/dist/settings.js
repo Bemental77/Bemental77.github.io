@@ -1,4 +1,0 @@
-var GBAWASMETTINGS = {
-  CLOUDSAVEURL: "",
-  SHOWADVANCED: true
-}
