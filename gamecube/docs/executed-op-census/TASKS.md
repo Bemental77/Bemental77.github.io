@@ -81,6 +81,27 @@ The sharpest single case: `0x80117e0c` in SAB's frame-governor loop is a
 wasm ops, 51 of them prologue+terminal**. Its neighbours `0x80117e08` (`b +4`)
 and `0x80117e28` are the same shape.
 
+### The governor loop, per iteration (the case worth quoting)
+
+`sab-frame-governor/TASKS.md` measures this loop at 23.2% of all guest-PC
+samples. It is three JIT blocks — the `bl`, the pure leaf it calls, and the
+compare-and-branch tail:
+
+| block | guest instrs | prologue | body | terminal | total d0 |
+|---|---:|---:|---:|---:|---:|
+| `0x80117e0c` (`bl`) | 1 | 12 | 9 | 39 | 60 |
+| `0x800f3710` (leaf) | 2 | 15 | 36 | 39 | 90 |
+| `0x80117e10` (tail) | 6 | 18 | 109 | 39 | 166 |
+| **per iteration** | **9** | 45 | 154 | **117** | **316** |
+
+**316 executed unconditional wasm ops for 9 guest instructions = 35.1 ops per
+guest instruction, of which 162 (51.3%) is per-block fixed overhead and 117
+(37%) is the terminal alone, paid three times because the loop is cut into three
+blocks.** With the edge diet the terminal drops to 31/block and the iteration to
+**292 ops (−7.6%)**. Merging the three blocks into one would remove two entire
+terminals and two prologues — which is why the concurrent leaf-inline work and
+this diet compose rather than compete.
+
 ### Weighting caveat, stated not buried
 
 The PC sampler buckets to 256 bytes (`dolphin_render_probe.js:614`,
@@ -108,11 +129,23 @@ teed once and the bucket probe below reuses it instead of re-loading.
 
 **The guard is unchanged and stays PERMANENT** — same predicate, same bail.
 
-MEASURED, matched arms differing only in this change:
+MEASURED, matched arms differing only in this change. The per-block result is
+exact and has no weighting in it at all: **268 of the 276 blocks have a terminal
+of exactly 40 unconditional ops in the base arm and exactly 32 in the diet arm —
+−8 on every one of them.** The remaining 8 blocks read 934/1597/1987/2700/3009/
+3172/3862/3961 and each moves by exactly **−16 = 2 × −8**, which is the tell that
+they are two-arm (singles-speculation) blocks emitting the body twice
+(`ppc_emit.cpp:1805+`): the phase attribution lumps the second arm's body into
+the first arm's terminal span, so their *phase labels* are wrong while their
+*delta* is right. That artifact is the only reason the weighted terminal figure
+below reads 41.3 rather than 40. It inflates the `20+` row of the by-length table
+too. Fixing it needs per-arm span nesting in the report; it does not affect any
+delta.
 
 | | base | diet | delta |
 |---|---:|---:|---:|
-| terminal d0 ops | 41.3 | 32.8 | **−8.5 (−20.6%)** |
+| terminal, per block (268/276) | 40 | 32 | **−8 exactly** |
+| terminal d0 ops (weighted, incl. artifact) | 41.3 | 32.8 | −8.5 (−20.6%) |
 | terminal cond ops | 18.0 | 24.4 | +6.4 (moved off the executed path) |
 | 1-instr block mean d0 | 59.4 | 51.4 | −13.5% |
 | 3-5-instr block mean d0 | 125.4 | 117.5 | −6.3% |

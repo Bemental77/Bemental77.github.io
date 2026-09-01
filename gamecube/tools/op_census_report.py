@@ -21,6 +21,18 @@ Ops are counted as `wasm-objdump -d` instruction lines, NOT bytes: the emitters
 bake host addresses as LEB i32.const (cr_encode.cpp:30-31, ppc_emit.cpp:199-200)
 so byte totals carry a ~0.16% link-layout artifact (CLAUDE.md gate #10).
 
+KNOWN LIMITATION — two-arm blocks. A block with an FPR single/double
+speculation guard emits the body TWICE (`ppc_emit.cpp:1805+`), so the marks
+repeat. Only the first BLOCK_BEGIN is honoured, but the second arm's body still
+lands inside the first arm's terminal span, so those blocks report an absurd
+`terminal` (hundreds to thousands of ops) and a correspondingly small `body`.
+Measured on the SAB corpus: 268 of 276 blocks are single-arm and clean; the 8
+affected ones are identifiable because they move by an exact MULTIPLE of the
+single-arm delta under an A/B. Their PHASE LABELS are wrong; their DELTAS are
+not. Fixing this needs per-arm span nesting. Until then, read the per-block
+terminal column (a hard constant on single-arm blocks) in preference to the
+weighted phase total, which the artifact inflates.
+
 Usage: op_census_report.py <census_dir> <manifest.weights>
 """
 import os, re, subprocess, sys, collections
