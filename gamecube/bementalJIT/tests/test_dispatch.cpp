@@ -13,6 +13,7 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+
 #endif
 
 static std::vector<u8> build_return_five() {
@@ -67,6 +68,17 @@ static void report(const char* line, bool pass) {
     }, line, pass ? 1 : 0);
 #endif
 }
+// [completion-marker 2026-09-01] run_browser_test.mjs grants a PASS only when a
+// suite prints its own end-of-run line. These four suites had none, so a run cut
+// short mid-suite was indistinguishable from one that finished, and the harness
+// reported PASS off the first passing case.
+static inline void bem_test_total(int passed, int failed) {
+    std::printf("TOTAL: %d passed, %d failed\n", passed, failed);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('TOTAL: ' + $0 + ' passed, ' + $1 + ' failed'); }, passed, failed);
+#endif
+}
+
 
 int main() {
     std::vector<u8> bytes = build_return_five();
@@ -105,5 +117,6 @@ int main() {
     }
     report("evict ok", true);
 
+    bem_test_total(out == 5 ? 1 : 0, out == 5 ? 0 : 1);
     return out == 5 ? 0 : 1;
 }

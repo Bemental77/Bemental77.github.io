@@ -26,6 +26,8 @@
     @media (max-aspect-ratio: 4/3) { #canvasWrap:fullscreen #canvas, #canvasWrap:-webkit-full-screen #canvas { width: 100vw; height: calc(100vw * 3 / 4); } }
     #mobileShell:fullscreen, #mobileShell:-webkit-full-screen { width: 100vw; height: 100vh; }
     #statusBar { display: flex; gap: 16px; font-size: 12px; color: #888; font-family: monospace; }
+    #keyHelp { font-size: 12px; color: #777; text-align: center; max-width: 820px; line-height: 1.6; }
+    #keyHelp b { color: #bbb; font-family: monospace; background: #222; border: 1px solid #3a3a3a; border-radius: 3px; padding: 0 4px; }
     #log { display: none; height: 140px; min-height: 80px; max-height: 50vh; width: 100%; max-width: 820px; overflow: auto; border: 1px solid #333; padding: 4px; font-size: 11px; background: #0a0a0a; color: #bbb; white-space: pre-wrap; user-select: text; -webkit-user-select: text; resize: vertical; position: relative; }
     #log::after { content: "⋮"; position: absolute; bottom: 2px; right: 4px; color: #555; font-size: 10px; pointer-events: none; }
     #mobileShell { display: none; position: fixed; inset: 0; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); z-index: 1000; user-select: none; -webkit-user-select: none; touch-action: none; overflow: hidden; }
@@ -106,6 +108,7 @@
   </div>
   <div id="canvasWrap"><canvas id="canvas" width="640" height="480"></canvas></div>
   <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
+  <div id="keyHelp">Keyboard — D-pad <b>arrows</b> · <b>z</b> ✕ · <b>x</b> ○ · <b>s</b> □ · <b>d</b> △ · <b>w</b> L1 · <b>r</b> R1 · <b>e</b> L2 · <b>t</b> R2 · <b>v</b> Start · <b>c</b> Select. A gamepad works too.</div>
   <pre id="log" tabindex="0"></pre>
 </div>
 <div id="mobileShell">
@@ -224,13 +227,34 @@
     //   +6 u16 KeyStatus (active-low buttons); +8 u16 JoyKeyStatus; ...
     // This function used to write bytes +0/+1 — the JoyDev POINTER — so
     // mobile touches (and Edge-gamepad input, which feeds the same state)
-    // never reached the emulator; only desktop keyboard worked because
-    // CheckKeyboard writes the real KeyStatus in-wasm (2026-06-12 fix).
-    // On the mobile shell, this function OWNS KeyStatus: rebuild from the
-    // all-released base each call (CheckKeyboard is event-driven, so a
-    // read-modify-write would latch released buttons forever). Desktop
-    // keeps keyboard ownership — don't touch the field there.
-    if (!isMobile) return;
+    // never reached the emulator (2026-06-12 fix).
+    //
+    // This function OWNS KeyStatus on EVERY platform: rebuild from the
+    // all-released base each call (a read-modify-write would latch released
+    // buttons forever). It runs LAST in pollController, after
+    // Module._CheckKeyboard(), so the page's view always wins.
+    //
+    // It used to bail with `if (!isMobile) return;`, leaving desktop to the
+    // in-wasm SDL CheckKeyboard path. MEASURED 2026-09-01: that path is dead.
+    // Emscripten SDL1 attaches its keydown listener to
+    // `Module.keyboardListeningElement` (pcsx_ww.js `_SDL_Init`), which this
+    // page sets to the <canvas> — and a <canvas> with no tabindex can never
+    // hold focus, so a real keypress never targets it and never bubbles
+    // through it. Probe arms, Chrome, Monster Rancher 2, pad bytes at
+    // _get_ptr(1)+6/+7 (0xFF = all released):
+    //   A native 'v' (Start), nothing focused ....... [255,255]  DEAD
+    //   B native 'v' after clicking the canvas ...... [255,255]  DEAD
+    //     (activeElement after that click = BODY — the canvas can't take it)
+    //   C synthetic keydown dispatched ON <canvas> .. [247,255]  works
+    //   D synthetic keydown dispatched on document .. [255,255]  DEAD
+    //   E native 'v', canvas tabIndex=0 + focus() ... [247,255]  works
+    //   F gamepad button 0 -> Cross ................. [255,255]  DEAD
+    // So desktop keyboard AND desktop gamepad both produced nothing. Owning
+    // KeyStatus here fixes both at once, because the window-level key
+    // listener and pollGamepads already funnel through dispatchKey ->
+    // padState. SDL stays scoped to the canvas (the Xbox Edge reason for
+    // keyboardListeningElement is preserved: we never widen SDL's
+    // preventDefault chain to the document).
     var b0 = 0xFF, b1 = 0xFF;
     if (mobilePadState.select) b0 &= ~(1 << 0); if (mobilePadState.start) b0 &= ~(1 << 3);
     if (mobilePadState.up) b0 &= ~(1 << 4); if (mobilePadState.right) b0 &= ~(1 << 5);
@@ -275,6 +299,30 @@
     if (padBtn) { mobilePadState[padBtn] = (type === 'keydown'); updatePadState(); }
     if (key === KEYMAP.up) { if (type === 'keydown') _armUpHold(); else _cancelUpHold(); }
   }
+
+  // Physical keyboard -> pad state. The page owns KeyStatus (see updatePadState),
+  // so keys are funnelled through the same dispatchKey() the touch shell and the
+  // gamepad poller use. Listener is on `window` in the CAPTURE phase so it works
+  // no matter what has focus — the emulator canvas cannot take focus at all.
+  // Deliberately does NOT preventDefault: SDL's preventDefault chain on the
+  // document is what broke Xbox Edge's shell gestures, and this must not
+  // reintroduce it. `body` is overflow:hidden so arrow keys can't scroll anyway.
+  var KEY_TO_PAD_KEY = (function () {
+    var m = {};
+    Object.keys(KEYMAP).forEach(function (btn) { m[KEYMAP[btn]] = KEYMAP[btn]; });
+    return m;
+  })();
+  function onPhysicalKey(e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    var t = e.target && e.target.tagName;
+    if (t === 'INPUT' || t === 'SELECT' || t === 'TEXTAREA') return;
+    var k = e.key;
+    if (k && k.length === 1) k = k.toLowerCase();
+    if (!KEY_TO_PAD_KEY[k]) return;
+    dispatchKey(e.type, k);
+  }
+  window.addEventListener('keydown', onPhysicalKey, true);
+  window.addEventListener('keyup', onPhysicalKey, true);
 
   function wireButton(id, key) {
     var el = $(id); if (!el) return;
@@ -367,7 +415,54 @@
       case 'render': { var _t0 = performance.now(); if (_perfLastRenderMs) { var _gap = _t0 - _perfLastRenderMs; _perfGapSum += _gap; if (_gap > _perfGapMax) _perfGapMax = _gap; _perfGapCount++; } _perfLastRenderMs = _t0; var v = data.vram; Module.HEAPU8.set(v, vram_ptr); pcsx_worker.postMessage({ cmd: 'return_vram', vram: v }, [v.buffer]); Module._render(data.x, data.y, data.sx, data.sy, data.dx, data.dy, data.rgb24); renderFrames++; var _t1 = performance.now(); var _proc = _t1 - _t0; _perfProcSum += _proc; if (_proc > _perfProcMax) _perfProcMax = _proc; var now = _t1; if (now - lastFpsLog > 1000) { var _gapAvg = _perfGapCount ? (_perfGapSum / _perfGapCount).toFixed(1) : '?'; var _procAvg = renderFrames ? (_perfProcSum / renderFrames).toFixed(2) : '?'; fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now - lastFpsLog)).toFixed(1) + ' | gap avg=' + _gapAvg + 'ms max=' + _perfGapMax.toFixed(0) + 'ms | proc avg=' + _procAvg + 'ms max=' + _perfProcMax.toFixed(1) + 'ms'; renderFrames = 0; lastFpsLog = now; _perfGapSum = 0; _perfGapMax = 0; _perfGapCount = 0; _perfProcSum = 0; _perfProcMax = 0; } break; }
       case 'renderTick': { var _t0 = performance.now(); if (_perfLastRenderMs) { var _gap = _t0 - _perfLastRenderMs; _perfGapSum += _gap; if (_gap > _perfGapMax) _perfGapMax = _gap; _perfGapCount++; } _perfLastRenderMs = _t0; if (!vramSabI32 || !vramSabBytes) break; var rx,ry,rsx,rsy,rdx,rdy,rrgb,ok=false; for (var attempt=0; attempt<8; attempt++) { var s0 = Atomics.load(vramSabI32, 0); if (s0 & 1) continue; rx=Atomics.load(vramSabI32,1); ry=Atomics.load(vramSabI32,2); rsx=Atomics.load(vramSabI32,3); rsy=Atomics.load(vramSabI32,4); rdx=Atomics.load(vramSabI32,5); rdy=Atomics.load(vramSabI32,6); rrgb=Atomics.load(vramSabI32,7); Module.HEAPU8.set(vramSabBytes, vram_ptr); var s1 = Atomics.load(vramSabI32, 0); if (s1 === s0) { ok = true; break; } } if (!ok) break; Module._render(rx,ry,rsx,rsy,rdx,rdy,rrgb); renderFrames++; var _t1 = performance.now(); var _proc = _t1 - _t0; _perfProcSum += _proc; if (_proc > _perfProcMax) _perfProcMax = _proc; var now2 = _t1; if (now2 - lastFpsLog > 1000) { var _gapAvg2 = _perfGapCount ? (_perfGapSum / _perfGapCount).toFixed(1) : '?'; var _procAvg2 = renderFrames ? (_perfProcSum / renderFrames).toFixed(2) : '?'; fpsEl.textContent = 'FPS: ' + (renderFrames * 1000 / (now2 - lastFpsLog)).toFixed(1) + ' | gap avg=' + _gapAvg2 + 'ms max=' + _perfGapMax.toFixed(0) + 'ms | proc avg=' + _procAvg2 + 'ms max=' + _perfProcMax.toFixed(1) + 'ms [SAB]'; renderFrames = 0; lastFpsLog = now2; _perfGapSum = 0; _perfGapMax = 0; _perfGapCount = 0; _perfProcSum = 0; _perfProcMax = 0; } break; }
       case 'return_states': states_arrs.push(data.states); break;
-      case 'SoundFeedStreamData': { if (audioMuted || audioDraining) break; var ps = data.pSound; if (!window._soundScratchPtr) { window._soundScratchPtr = Module._malloc(8192); window._soundScratchSize = 8192; } if (data.lBytes > window._soundScratchSize) { Module._free(window._soundScratchPtr); window._soundScratchSize = data.lBytes; window._soundScratchPtr = Module._malloc(window._soundScratchSize); } Module.HEAPU8.set(ps.subarray(0, data.lBytes), window._soundScratchPtr); SoundFeedStreamData(window._soundScratchPtr, data.lBytes); break; }
+      // AUDIO BATCH FROM THE WORKER.
+      //
+      // Two invariants that were both broken here, and each one silently
+      // degrades sound rather than announcing itself:
+      //
+      // (1) CREDIT EVERY BYTE BACK, INCLUDING DROPPED ONES. The worker's
+      //     SoundGetBytesBuffered_value only ever INCREASES (dfsound/worker.c:84
+      //     `SoundGetBytesBuffered_value+=lBytes`). Its one and only decrement is
+      //     the 'soundBytes' reply (wasmpsx_worker.js "case soundBytes"), which
+      //     normally originates from the main-side SDL drain (dfsound/sdl.c:46).
+      //     dfsound/worker.c:42 returns SOUNDSIZE (70560) once that counter
+      //     passes 22050, and dfsound/spu.c:469-474 then makes SPUasync bail on
+      //     every call while SoundGetBytesBuffered() > TESTSIZE (24192).
+      //     So dropping a batch WITHOUT replying walks the counter up and never
+      //     brings it down: the SPU stops mixing entirely and audio does not come
+      //     back when you unmute. That is the stuck-buffer this used to have —
+      //     the old code did a bare `break` on the muted/draining path.
+      //     Crediting a dropped batch is pure bookkeeping: it does not feed the
+      //     sink, does not resample, and does not touch emulation rate.
+      //
+      // (2) RECYCLE THE TRANSFER BUFFER. The worker keeps a free-pool
+      //     (`pSound_arrs`, wasmpsx_worker.js SendSound) and pops from it when it
+      //     is non-empty, but the pool is refilled ONLY by a 'return_pSound'
+      //     reply — which this page never sent, so the pool was permanently
+      //     empty and every batch allocated a fresh 4096-byte Uint8Array. At the
+      //     observed batch cadence that is continuous main-thread garbage, and
+      //     GC pauses on the thread that owns the SDL timer chain are exactly
+      //     what makes this emulator crackle. The 'render' case one branch up
+      //     already does this with `return_vram`; this now matches it.
+      case 'SoundFeedStreamData': {
+        var ps = data.pSound;
+        var lb = data.lBytes | 0;
+        var ad = window.__audioDiag;
+        if (audioMuted || audioDraining) {
+          if (pcsx_worker) pcsx_worker.postMessage({ cmd: 'soundBytes', lBytes: lb });
+          if (ad) { ad.batchesDropped++; ad.bytesDropped += lb; }
+        } else {
+          if (!window._soundScratchPtr) { window._soundScratchPtr = Module._malloc(8192); window._soundScratchSize = 8192; }
+          if (lb > window._soundScratchSize) { Module._free(window._soundScratchPtr); window._soundScratchSize = lb; window._soundScratchPtr = Module._malloc(window._soundScratchSize); }
+          Module.HEAPU8.set(ps.subarray(0, lb), window._soundScratchPtr);
+          SoundFeedStreamData(window._soundScratchPtr, lb);
+          if (ad) { ad.batchesFed++; ad.bytesFed += lb; ad.framesProduced += lb >> 2; ad.lastFeedMs = performance.now(); }
+        }
+        // Hand the transfer buffer back in both paths — a dropped batch's buffer
+        // is just as reusable as a fed one.
+        if (pcsx_worker) { try { pcsx_worker.postMessage({ cmd: 'return_pSound', pSound: ps }, [ps.buffer]); } catch (e) {} }
+        break;
+      }
       case 'stateSaved': if (pendingSaveResolve) { pendingSaveResolve(new Uint8Array(data.heap)); pendingSaveResolve = null; } break;
       case 'stateLoaded': if (pendingLoadResolve) { pendingLoadResolve(); pendingLoadResolve = null; } break;
       default: pageLog('unknown worker cmd: ' + data.cmd);

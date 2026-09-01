@@ -86,14 +86,41 @@
         </header>
         <iframe src="diablo1.html" width="100%" height="500" style="border: none;"></iframe>
     </div>
+    </section>
 
-		<li><a href="/n64/">n64</a></li>
-		<li><a href="#" id="lookyBtn">looky here</a></li>
+    <!-- Emulators. Until 2026-09-01 the ONLY navigation link to any emulator
+         anywhere on the site was a bare "n64" list item floating outside any list,
+         in the middle of the section above — and index.html links none of them — so
+         ps1.html, gba.html and snes.html were reachable only by typing the URL.
+         (gamecube.html / dreamcast.html are deliberately not listed here: they are
+         another owner's active R&D and I have not tested them.) -->
+    <section id="emulators">
+      <div class="inner">
+        <header class="major">
+          <h2>Emulators</h2>
+        </header>
+        <p>WebAssembly console emulators, playable in the browser. Keyboard, gamepad
+           and on-screen touch controls; each runs its guest at true hardware speed.</p>
+        <ul class="alt">
+          <li><a href="/n64/">Nintendo 64</a> — N64Wasm core</li>
+          <li><a href="/ps1.html">PlayStation</a> — PCSX WebAssembly</li>
+          <li><a href="/snes.html">Super Nintendo</a> — snes9x-2005</li>
+          <li><a href="/gba.html">Game Boy Advance</a></li>
+        </ul>
+      </div>
+    </section>
 
-    <!-- output for getUserData -->
-    <div id="lookyOutput" class="inner" style="margin:1rem 0;">
-        <pre id="lookyPre" style="white-space:pre-wrap; word-break:break-word; background:#111; color:#eee; padding:1rem; border-radius:4px; max-height:400px; overflow:auto;">Click "looky here" to collect user info...</pre>
-    </div>
+    <section id="four">
+      <div class="inner">
+        <ul class="alt">
+          <li><a href="#" id="lookyBtn">looky here</a></li>
+        </ul>
+        <!-- output for getUserData -->
+        <div id="lookyOutput" style="margin:1rem 0;">
+          <pre id="lookyPre" style="white-space:pre-wrap; word-break:break-word; background:#111; color:#eee; padding:1rem; border-radius:4px; max-height:400px; overflow:auto;">Click "looky here" to collect user info...</pre>
+        </div>
+      </div>
+    </section>
 
 			<!-- Footer -->
 			<footer id="footer">

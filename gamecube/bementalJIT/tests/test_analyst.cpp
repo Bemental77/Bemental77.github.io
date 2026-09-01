@@ -21,6 +21,7 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+
 #endif
 
 using namespace bemental::powerpc;
@@ -236,6 +237,17 @@ static void case_d_forward_branch_coalesce() {
     report("case-d: IsForwardConditionalBranch(backward bne)==false",
            !IsForwardConditionalBranch(back_bne, fx.base_pc + 4));
 }
+// [completion-marker 2026-09-01] run_browser_test.mjs grants a PASS only when a
+// suite prints its own end-of-run line. These four suites had none, so a run cut
+// short mid-suite was indistinguishable from one that finished, and the harness
+// reported PASS off the first passing case.
+static inline void bem_test_total(int passed, int failed) {
+    std::printf("TOTAL: %d passed, %d failed\n", passed, failed);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('TOTAL: ' + $0 + ' passed, ' + $1 + ' failed'); }, passed, failed);
+#endif
+}
+
 
 int main() {
     case_a_basic_reg_flow();
@@ -251,5 +263,8 @@ int main() {
         pre.textContent += '\n' + $0 + ' passed, ' + $1 + ' failed\n';
     }, g_pass, g_fail);
 #endif
+    // Completion marker — run_browser_test.mjs REQUIRES this to grant a PASS.
+    // Without it a run cut short mid-suite reported PASS off its first case.
+    bem_test_total(g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

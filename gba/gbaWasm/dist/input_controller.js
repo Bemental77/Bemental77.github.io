@@ -319,5 +319,5 @@ window['myApp'].setupInputController()
 
 var rando3 = Math.floor(Math.random() * 100000)
 var wasmScript = document.createElement('script')
-wasmScript.src = 'gba/gbaWasm/dist/44gba.js?v=' + rando3
+wasmScript.src = '/gba/gbaWasm/dist/44gba.js?v=' + rando3
 document.getElementsByTagName('head')[0].appendChild(wasmScript)

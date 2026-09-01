@@ -46,7 +46,40 @@ const SOURCES = [
   'gamecube/dolphin-bridge/worker_funcs.js',
   'gamecube/dolphin_libretro/dolphin_worker.js',
   'dreamcast/flycast_libretro/flycast_worker.js',
+  // The three older emulator pages were NOT covered until 2026-09-01. They are
+  // as much a part of what a visitor hits as the GC/DC/N64 pages, and the same
+  // rsync-exclude class of bug would have been just as invisible on them.
+  'ps1.html',
+  'gba.html',
+  'snes.html',
+  'gba/gbaWasm/dist/script.js',          // -> input_controller.js
+  'gba/gbaWasm/dist/input_controller.js', // -> 44gba.js
 ];
+
+// Runtime assets that are REQUIRED but are never spelled out as a literal URL in
+// any source, so the scanner above cannot see them. Each entry names the code
+// that fetches it, because an unexplained entry here is just a wish list.
+const ALWAYS_REQUIRED = new Map([
+  // Emscripten sidecars, resolved at runtime through Module.locateFile.
+  ['/ps1/ps1Wasm/dist/pcsx_ww.wasm',
+   'ps1.html Module.locateFile = f => "/ps1/ps1Wasm/dist/" + f'],
+  ['/ps1/ps1Wasm/dist/wasmpsx_worker.js',
+   'ps1.html var_setup(): new Worker("/ps1/ps1Wasm/dist/wasmpsx_worker.js?v=" + Date.now())'],
+  ['/ps1/ps1Wasm/dist/wasmpsx_worker.wasm',
+   'wasmpsx_worker.js locateFile("wasmpsx_worker.wasm")'],
+  ['/ps1/ps1Wasm/dist/wasmpsx_worker.data',
+   'wasmpsx_worker.js preload package — it CONTAINS THE PSX BIOS at /bios/ps-41a.bin; without it the emulator has no BIOS to boot'],
+  ['/gba/gbaWasm/dist/44gba.wasm',
+   'gba script.js Module.locateFile = p => "/gba/gbaWasm/dist/" + p'],
+  ['/snes/snesWasm/snes9x_2005.wasm',
+   'snes.html Module.locateFile = p => "/snes/snesWasm/" + p'],
+  // Built-in ROMs: fetched from an array literal, not a literal URL argument.
+  ['/snes/snesWasm/roms/simcity.smc', 'snes.html ROMS[0].url'],
+  // PS1 discs are split; the page builds chunk names arithmetically from
+  // ROM_ROOT + base + ".bin.parta" + <letter>, so probe the first chunk of the
+  // default title. A deploy filter that strips the directory shows up here.
+  ['/ps1/ps1Wasm/roms/MonsterRancher2.bin.partaa', 'ps1.html ROMS[0] chunkRange("MonsterRancher2","f")'],
+]);
 
 // Known-optional at runtime: the code has an explicit graceful path, so a 404 is
 // a slower start rather than a broken page. Each needs the citation that proves
@@ -75,7 +108,7 @@ const liveRef = process.env.DEPLOY_REF || 'origin/prod';
 // motivated the whole check. A guard that cannot catch its own founding case is
 // decoration, so the terminator is now `?`, `#`, or the quote, and a trailing
 // concatenation is allowed. `assertCatchesFoundingCases()` below pins both.
-const URL_RE = /(?:fetch\(|importScripts\(|\.src\s*=\s*|src\s*=\s*|href\s*=\s*)['"](\/[A-Za-z0-9_][A-Za-z0-9_./-]*?)(?:['"?#])/g;
+const URL_RE = /(?:fetch\(|importScripts\(|new\s+(?:Shared)?Worker\(|\.src\s*=\s*|src\s*=\s*|href\s*=\s*)['"](\/[A-Za-z0-9_][A-Za-z0-9_./-]*?)(?:['"?#])/g;
 
 // Split-asset prefixes: the page builds `<prefix><suffix>` (e.g. ROM chunks
 // named partaa..partaf, per the ROM_CHUNKS array). The literal prefix is not a
@@ -143,6 +176,9 @@ function assertCatchesFoundingCases() {
      'plain fetch — the SAB symbol map, 404 in production'],
     ['<script src="/lib/capability.js"></script>', '/lib/capability.js',
      'plain script tag'],
+    ["pcsx_worker = new Worker('/ps1/ps1Wasm/dist/wasmpsx_worker.js?v=' + Date.now());",
+     '/ps1/ps1Wasm/dist/wasmpsx_worker.js',
+     'new Worker() — a worker URL is as load-bearing as a script tag; ps1.html spawns its whole emulator this way'],
   ];
   for (const [src, want, why] of cases) {
     const hits = [...src.matchAll(URL_RE)].map((m) => m[1]);
@@ -154,6 +190,9 @@ function assertCatchesFoundingCases() {
 }
 assertCatchesFoundingCases();
 
+for (const [u, why] of ALWAYS_REQUIRED) {
+  if (!found.has(u)) found.set(u, new Set([`ALWAYS_REQUIRED (${why})`]));
+}
 const urls = [...found.keys()].sort();
 for (const u of urls) {
   if (looksLikeSplitPrefix(u)) {

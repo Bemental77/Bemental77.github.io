@@ -1,0 +1,558 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>SNES Wasm</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <link rel="icon" href="data:,">
+  <!-- NO /coi-serviceworker.js on purpose. snes9x_2005 is a single-threaded
+       Emscripten build with no SharedArrayBuffer use (see snes/snesWasm/build.sh —
+       no -pthread, no -sSHARED_MEMORY), so cross-origin isolation buys this page
+       nothing. Same reasoning as gba.html and n64/index.html. -->
+  <script src="/lib/wakelock.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #ddd; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { overflow: hidden; }
+    #desktop { display: flex; flex-direction: column; align-items: center; padding: 12px; gap: 8px; height: 100vh; box-sizing: border-box; }
+    #title { margin: 0; font-size: 18px; letter-spacing: 1px; color: #aaa; }
+    #controlBar { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; }
+    #controlBar button { padding: 8px 14px; border: 1px solid #444; background: #222; color: #eee; border-radius: 4px; cursor: pointer; font-size: 14px; min-width: 44px; min-height: 36px; }
+    #controlBar button:hover:not(:disabled) { background: #333; }
+    #controlBar button:disabled { opacity: 0.4; cursor: not-allowed; }
+    #controlBar select { padding: 8px 10px; border: 1px solid #444; background: #222; color: #eee; border-radius: 4px; font-size: 14px; min-height: 36px; }
+    input[type="file"] { display: none; }
+    /* min-height:0 is load-bearing: a flex item defaults to min-height:auto and
+       refuses to shrink below its content, so without it the canvas overflowed
+       the viewport and its bottom rows were cut off (measured: 672px tall canvas
+       in a 600px window). */
+    #canvasWrap { background: #000; display: flex; align-items: center; justify-content: center; flex: 1; min-height: 0; width: 100%; max-width: 100vw; }
+    /* 256x224 framebuffer shown at the SNES's 4:3 display aspect. */
+    #canvas { background: #000; image-rendering: pixelated; height: 100%; width: auto; aspect-ratio: 4 / 3; max-width: 100%; max-height: 100%; }
+    #canvasWrap:fullscreen, #canvasWrap:-webkit-full-screen { width: 100vw; height: 100vh; }
+    #canvasWrap:fullscreen #canvas, #canvasWrap:-webkit-full-screen #canvas { width: auto; height: 100vh; max-width: 100vw; }
+    #statusBar { display: flex; gap: 16px; font-size: 12px; color: #888; font-family: monospace; }
+    #keyHelp { font-size: 12px; color: #777; text-align: center; max-width: 820px; line-height: 1.6; }
+    #keyHelp b { color: #bbb; font-family: monospace; background: #222; border: 1px solid #3a3a3a; border-radius: 3px; padding: 0 4px; }
+
+    /* ── mobile shell (structure mirrors ps1.html, which is the tested one) ── */
+    #mobileShell { display: none; position: fixed; inset: 0; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); z-index: 1000; user-select: none; -webkit-user-select: none; touch-action: none; overflow: hidden; }
+    #mobileScreen { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: #000; }
+    #mobileScreen canvas { image-rendering: pixelated; max-width: 100%; max-height: 100%; width: auto; height: 100%; }
+    .mobileSide { position: absolute; top: 0; bottom: 0; width: 32vw; max-width: 210px; display: flex; flex-direction: column; padding: 10px; box-sizing: border-box; pointer-events: none; }
+    .mobileSide > * { pointer-events: auto; }
+    .mobileSide.left { left: 0; }
+    .mobileSide.right { right: 0; }
+    .shoulderBtn { height: 36px; border-radius: 8px; background: linear-gradient(180deg, rgba(90,90,90,0.85), rgba(48,48,48,0.85)); border: 1px solid #5a5a5a; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; color: #ddd; letter-spacing: 1px; -webkit-tap-highlight-color: transparent; }
+    .shoulderBtn.held { filter: brightness(0.6); }
+    .dpadWrap, .faceWrap { flex: 1; display: flex; align-items: center; justify-content: center; }
+    .dpadDisc { width: min(34vh, 170px); height: min(34vh, 170px); border-radius: 50%; background: radial-gradient(circle at 40% 35%, #555 0%, #2a2a2a 60%, #1a1a1a 100%); border: 2px solid #333; box-shadow: inset 0 2px 4px rgba(255,255,255,0.18), 0 6px 12px rgba(0,0,0,0.6); position: relative; opacity: 0.72; }
+    .dpadV, .dpadH { position: absolute; background: #333; pointer-events: none; }
+    .dpadV { width: 30%; height: 90%; top: 5%; left: 35%; border-radius: 6px; }
+    .dpadH { width: 90%; height: 30%; top: 35%; left: 5%; border-radius: 6px; }
+    .dpadCenter { position: absolute; width: 30%; height: 30%; top: 35%; left: 35%; background: #1a1a1a; border-radius: 4px; pointer-events: none; z-index: 3; }
+    .arr { position: absolute; pointer-events: none; }
+    .arr-up { top: 6%; left: 50%; transform: translateX(-50%); border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 9px solid #888; }
+    .arr-down { bottom: 6%; left: 50%; transform: translateX(-50%); border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 9px solid #888; }
+    .arr-left { left: 6%; top: 50%; transform: translateY(-50%); border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-right: 9px solid #888; }
+    .arr-right { right: 6%; top: 50%; transform: translateY(-50%); border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-left: 9px solid #888; }
+    .dpadDisc.d-up .arr-up { border-bottom-color: #fff; }
+    .dpadDisc.d-down .arr-down { border-top-color: #fff; }
+    .dpadDisc.d-left .arr-left { border-right-color: #fff; }
+    .dpadDisc.d-right .arr-right { border-left-color: #fff; }
+    .faceDiamond { width: min(34vh, 170px); height: min(34vh, 170px); position: relative; }
+    /* SNES face layout: X top, Y left, A right, B bottom. */
+    .faceBtn { position: absolute; width: min(12vh, 60px); height: min(12vh, 60px); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; color: rgba(255,255,255,0.92); border: 2px solid rgba(0,0,0,0.3); box-shadow: 0 4px 0 rgba(0,0,0,0.5), inset 0 2px 4px rgba(255,255,255,0.25); -webkit-tap-highlight-color: transparent; opacity: 0.8; }
+    .faceBtn.held { filter: brightness(0.65); opacity: 1; }
+    .btn-x { background: radial-gradient(circle at 38% 32%, #7fa8e8, #2b4f96); top: 0; left: 50%; transform: translateX(-50%); }
+    .btn-y { background: radial-gradient(circle at 38% 32%, #7ec9a8, #216b4e); top: 50%; left: 0; transform: translateY(-50%); }
+    .btn-a { background: radial-gradient(circle at 38% 32%, #e87f7f, #96262b); top: 50%; right: 0; transform: translateY(-50%); }
+    .btn-b { background: radial-gradient(circle at 38% 32%, #e8d27f, #96792b); bottom: 0; left: 50%; transform: translateX(-50%); }
+    #mobileBottom { position: absolute; bottom: max(20px, calc(env(safe-area-inset-bottom, 0px) + 14px)); left: 50%; transform: translateX(-50%); display: flex; gap: 10px; align-items: center; z-index: 10; }
+    .sysBtn { height: 26px; padding: 0 14px; border-radius: 13px; background: linear-gradient(180deg, rgba(90,90,90,0.8), rgba(50,50,50,0.8)); border: 1px solid #222; color: #ccc; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
+    .sysBtn.held { filter: brightness(0.6); }
+    .menuBtn { width: 34px; height: 34px; border-radius: 17px; background: linear-gradient(180deg, #777 0%, #444 100%); border: 2px solid #222; color: #fff; font-size: 18px; font-weight: 700; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
+    #mobileMenu { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 2000; align-items: center; justify-content: center; }
+    #mobileMenu.open { display: flex; }
+    #mobileMenuBox { background: #222; color: #eee; border-radius: 10px; padding: 20px; min-width: 240px; text-align: center; }
+    #mobileMenuBox h6 { margin: 0 0 14px; font-size: 12px; text-transform: uppercase; letter-spacing: 2px; color: #888; }
+    #mobileMenuBox button { display: block; width: 100%; margin-bottom: 8px; padding: 10px; border: 1px solid #444; background: #2c2c2c; color: #eee; border-radius: 6px; font-size: 14px; }
+    #mobileSplash { display: none; position: absolute; inset: 0; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 24px; z-index: 2000; color: #eee; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); text-align: center; }
+    #mobileSplash h3 { margin: 0 0 4px; font-size: 22px; }
+    #mobileSplash select, #mobileSplash button { font-size: 16px; padding: 12px 20px; min-width: 240px; border-radius: 8px; border: 1px solid #444; background: #222; color: #fff; -webkit-appearance: none; }
+    #mobileSplash button#mobileSplashStart { background: #2a6b4a; border-color: #2a6b4a; }
+    #mobileSplash .rotateTip { font-size: 12px; opacity: 0.55; }
+    #mobileStatus { position: absolute; top: 8px; width: 100%; text-align: center; color: #888; z-index: 1500; font-size: 12px; pointer-events: none; }
+    #rotateHint { display: none; position: fixed; inset: 0; background: #111; color: #eee; align-items: center; justify-content: center; font-size: 18px; text-align: center; z-index: 3000; padding: 40px; }
+    #toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); padding: 10px 18px; border-radius: 6px; background: rgba(0,0,0,0.85); color: #fff; font-size: 13px; z-index: 9999; opacity: 0; transition: opacity 0.2s; pointer-events: none; max-width: 90vw; }
+    #toast.show { opacity: 1; }
+    #toast.err { background: rgba(170, 40, 40, 0.95); }
+    #banner { display: none; margin: 0 auto; max-width: 760px; padding: 10px 14px; border: 1px solid #6a4a1a; background: #2a2113; color: #e7d6b0; border-radius: 6px; font-size: 13px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+<div id="desktop">
+  <h3 id="title">SNES Wasm</h3>
+  <div id="banner"></div>
+  <div id="controlBar">
+    <select id="romSelect"></select>
+    <button id="btnStart">Start</button>
+    <button id="btnBrowse">Browse…</button>
+    <input id="fileInput" type="file" accept=".smc,.sfc,.fig,.swc" />
+    <button id="btnSave" disabled>Save State</button>
+    <button id="btnLoad" disabled>Load State</button>
+    <button id="btnMute" disabled>🔊 Mute</button>
+    <button id="btnFull" disabled>⛶ Fullscreen</button>
+  </div>
+  <div id="canvasWrap"><canvas id="canvas" width="256" height="224"></canvas></div>
+  <div id="statusBar"><span id="status">Idle.</span><span id="fps"></span></div>
+  <div id="keyHelp">Keyboard — D-pad <b>arrows</b> · <b>a</b> A · <b>z</b> B · <b>x</b> X · <b>s</b> Y · <b>d</b> L · <b>c</b> R · <b>Enter</b> Start · <b>Shift</b> Select. A gamepad works too.</div>
+</div>
+
+<div id="mobileShell">
+  <div id="mobileStatus"></div>
+  <div id="mobileSplash">
+    <h3>SNES Wasm</h3>
+    <label for="mobileRomSelect">Choose a game</label>
+    <select id="mobileRomSelect"></select>
+    <button id="mobileSplashStart" type="button">Start</button>
+    <p class="rotateTip">Rotate to landscape for the best view.</p>
+  </div>
+  <div id="mobileScreen"></div>
+  <div class="mobileSide left">
+    <div class="shoulderBtn" id="mobileL">L</div>
+    <div class="dpadWrap">
+      <div class="dpadDisc" id="mobileDpadDisc">
+        <div class="dpadV"></div><div class="dpadH"></div><div class="dpadCenter"></div>
+        <div class="arr arr-up"></div><div class="arr arr-down"></div><div class="arr arr-left"></div><div class="arr arr-right"></div>
+      </div>
+    </div>
+  </div>
+  <div class="mobileSide right">
+    <div class="shoulderBtn" id="mobileR">R</div>
+    <div class="faceWrap">
+      <div class="faceDiamond">
+        <div class="faceBtn btn-x" id="mobileX">X</div><div class="faceBtn btn-y" id="mobileY">Y</div>
+        <div class="faceBtn btn-a" id="mobileA">A</div><div class="faceBtn btn-b" id="mobileB">B</div>
+      </div>
+    </div>
+  </div>
+  <div id="mobileBottom">
+    <div class="sysBtn" id="mobileSelect">Select</div>
+    <div class="menuBtn" id="mobileMenuBtn">≡</div>
+    <div class="sysBtn" id="mobileStart">Start</div>
+  </div>
+  <div id="mobileMenu">
+    <div id="mobileMenuBox">
+      <h6>Menu</h6>
+      <button id="mSave" disabled>Save State</button><button id="mLoad" disabled>Load State</button>
+      <button id="mMute" disabled>Mute</button><button id="mFull" disabled>Fullscreen</button>
+      <button id="mClose">Close</button>
+    </div>
+  </div>
+  <div id="rotateHint">Rotate your device to landscape to play.</div>
+</div>
+<div id="toast"></div>
+
+<script>
+(function () {
+  'use strict';
+  const CORE_DIR = '/snes/snesWasm/';
+  const ROMS = [
+    { label: 'SimCity', url: '/snes/snesWasm/roms/simcity.smc' }
+  ];
+
+  // ── SNES pad bit positions. Taken from snes/snesWasm/doc/script.js, which is
+  //    the upstream demo for this exact core build; joyPadInput is passed
+  //    straight through to S9xReadJoypad() (snes/snesWasm/source/exports.c:38).
+  const BIT = { r: 4, l: 5, x: 6, a: 7, right: 8, left: 9, down: 10, up: 11, start: 12, select: 13, y: 14, b: 15 };
+
+  // ── THE GUEST CLOCK. The core has no timebase of its own: exports.c mainLoop()
+  //    runs exactly one SNES frame per call, so whatever rate JS calls it at IS
+  //    the emulated machine's speed. Driving it once per requestAnimationFrame —
+  //    which is what the upstream demo does — therefore runs the guest at the
+  //    DISPLAY's refresh rate: 1.000x on a 60 Hz panel but 2.00x on a 120 Hz one,
+  //    i.e. the game literally plays at double speed. This page uses a fixed
+  //    timestep accumulator pinned to the real NTSC SNES rate instead, so the
+  //    guest runs at 1.000x hardware on any display. Presenting fewer or more
+  //    times per second is a separate knob and must never move this one.
+  const SNES_HZ = 60.0988;
+  const FRAME_MS = 1000 / SNES_HZ;
+  const MAX_CATCHUP_FRAMES = 4;
+
+  // Audio: the non-blargg build hardcodes S9xSetPlaybackRate(36000)
+  // (exports.c startWithRom), so the core always produces 36 kHz regardless of
+  // what sample rate we ask for. getSoundBuffer() returns 2048 stereo frames,
+  // DE-interleaved: left in [0..2047], right in [2048..4095].
+  const SND_RATE = 36000, SND_BLOCK = 2048;
+
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $('status'), mobileStatusEl = $('mobileStatus'), fpsEl = $('fps'), toastEl = $('toast');
+  function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
+  function toast(msg, isErr) { toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2400); }
+  function banner(html) { var b = $('banner'); if (!b) return; b.innerHTML = html; b.style.display = 'block'; }
+
+  const isMobile = (() => {
+    const ua = navigator.userAgent.toLowerCase();
+    const touch = (navigator.maxTouchPoints || 0) > 0 || ('ontouchstart' in window);
+    return /iphone|ipad|ipod|android|mobile|xbox/.test(ua)
+        || (touch && Math.min(window.innerWidth, window.innerHeight) < 600)
+        || new URLSearchParams(location.search).has('mobile');
+  })();
+
+  (function populateRomSelect() {
+    [$('romSelect'), $('mobileRomSelect')].filter(Boolean).forEach(function (sel) {
+      ROMS.forEach(function (r, i) { var o = document.createElement('option'); o.value = String(i); o.textContent = r.label; sel.appendChild(o); });
+    });
+  })();
+
+  // ── module state ──────────────────────────────────────────────────────────
+  var wasmReady = false, running = false, romName = '', muted = false;
+  var ctx2d = null, imgData = null;      // 512x448 — see getScreenBuffer() below
+  var audioCtx = null, sndBlock = null, sndPos = 0;
+  var padState = { up: false, down: false, left: false, right: false, a: false, b: false, x: false, y: false, l: false, r: false, start: false, select: false };
+  var gpState = {};   // gamepad-only view, OR-ed in padMask()
+
+  window.Module = {
+    locateFile: (p) => CORE_DIR + p,
+    print: (t) => console.log('[snes]', t),
+    printErr: (t) => console.warn('[snes]', t),
+    onRuntimeInitialized: function () {
+      wasmReady = true;
+      setStatus('Core ready. Pick a game and press Start.');
+      $('btnStart').disabled = false;
+      $('btnBrowse').disabled = false;
+      if ($('mobileSplashStart')) $('mobileSplashStart').disabled = false;
+    }
+  };
+
+  // ── canvas ────────────────────────────────────────────────────────────────
+  // getScreenBuffer() (exports.c) always converts a 512x448 RGB565 field, because
+  // GFX.Pitch is IMAGE_WIDTH*2 = 512 pixels (display.c:8, snes9x.h:19). A normal
+  // 256x224 game therefore occupies the TOP-LEFT quadrant of that field, so the
+  // ImageData is 512x448 and the canvas — 256x224 — shows exactly that quadrant.
+  function initCanvas() {
+    var c = $('canvas');
+    c.width = 256; c.height = 224;
+    ctx2d = c.getContext('2d', { alpha: false });
+    imgData = ctx2d.getImageData(0, 0, 512, 448);
+  }
+
+  function padMask() {
+    var m = 0;
+    for (var k in BIT) { if (padState[k] || gpState[k]) m |= (1 << BIT[k]); }
+    return m;
+  }
+
+  var frameCount = 0, presented = 0, lastFpsAt = 0, guestFrames = 0;
+  window.__snesFrames = 0;     // read by tools/legacy_emu_page_test.mjs
+
+  function runFrame() {
+    Module._setJoypadInput(padMask());
+    Module._mainLoop();
+    frameCount++; guestFrames++; window.__snesFrames++;
+  }
+
+  function draw() {
+    var p = Module._getScreenBuffer();
+    // ALLOW_MEMORY_GROWTH=1 (build.sh) means HEAPU8.buffer can be replaced on a
+    // grow, which detaches any view we cached — so re-view it every frame.
+    var src = new Uint8Array(Module.HEAPU8.buffer, p, 512 * 448 * 4);
+    imgData.data.set(src);
+    ctx2d.putImageData(imgData, 0, 0);
+    presented++;
+  }
+
+  var accum = 0, lastTs = 0;
+  function loop(ts) {
+    requestAnimationFrame(loop);
+    if (!running) { lastTs = 0; return; }
+    if (!lastTs) { lastTs = ts; accum = 0; return; }
+    var d = ts - lastTs; lastTs = ts;
+    if (d > 100) d = 100;          // a long stall must not fast-forward the guest
+    accum += d;
+    var ran = 0;
+    while (accum >= FRAME_MS && ran < MAX_CATCHUP_FRAMES) { runFrame(); accum -= FRAME_MS; ran++; }
+    if (ran) draw();
+    if (!lastFpsAt) lastFpsAt = ts;
+    if (ts - lastFpsAt >= 1000) {
+      var secs = (ts - lastFpsAt) / 1000;
+      fpsEl.textContent = 'guest ' + (guestFrames / secs).toFixed(2) + '/s ('
+        + ((guestFrames / secs) / SNES_HZ).toFixed(3) + 'x hardware) · presented ' + (presented / secs).toFixed(1) + '/s';
+      guestFrames = 0; presented = 0; lastFpsAt = ts;
+    }
+  }
+  requestAnimationFrame(loop);
+
+  // ── audio ─────────────────────────────────────────────────────────────────
+  function initAudio() {
+    if (audioCtx) { if (audioCtx.state !== 'running') audioCtx.resume().catch(() => {}); return; }
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try { audioCtx = new AC({ sampleRate: SND_RATE, latencyHint: 'playback' }); }
+    catch (e) { try { audioCtx = new AC(); } catch (e2) { return; } }
+    var sp = audioCtx.createScriptProcessor(SND_BLOCK, 0, 2);
+    // One resampling path for every device. `step` is 1.0 when the context
+    // honoured our 36 kHz request (Chrome/Firefox do) and ~0.75 when it forced
+    // 48 kHz (some Safari builds), so a browser that ignores sampleRate gets
+    // correct PITCH rather than a game running a third too fast.
+    sp.onaudioprocess = function (ev) {
+      var oL = ev.outputBuffer.getChannelData(0), oR = ev.outputBuffer.getChannelData(1);
+      var n = oL.length;
+      if (!running || muted || !wasmReady) { oL.fill(0); oR.fill(0); return; }
+      var step = SND_RATE / audioCtx.sampleRate;
+      for (var i = 0; i < n; i++) {
+        if (!sndBlock || sndPos >= SND_BLOCK) {
+          var p = Module._getSoundBuffer();
+          sndBlock = new Float32Array(Module.HEAPF32.buffer, p, SND_BLOCK * 2);
+          sndPos = sndPos >= SND_BLOCK ? sndPos - SND_BLOCK : 0;
+        }
+        var idx = sndPos | 0;
+        oL[i] = sndBlock[idx];
+        oR[i] = sndBlock[SND_BLOCK + idx];
+        sndPos += step;
+      }
+    };
+    sp.connect(audioCtx.destination);
+    audioCtx.resume().catch(() => {});
+  }
+  document.addEventListener('click', function () { if (!muted && audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {}); });
+
+  // ── rom loading ───────────────────────────────────────────────────────────
+  function bootRom(bytes, name) {
+    if (!wasmReady) { toast('Core not ready yet', true); return; }
+    romName = name;
+    initAudio();
+    var ptr = Module._my_malloc(bytes.length);
+    if (!ptr) { toast('Out of memory loading ROM', true); return; }
+    Module.HEAPU8.set(bytes, ptr);
+    Module._startWithRom(ptr, bytes.length, SND_RATE);
+    Module._my_free(ptr);
+    initCanvas();
+    lastTs = 0; accum = 0; running = true;
+    setStatus('Running — ' + name);
+    [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mFull')].forEach(function (b) { if (b) b.disabled = false; });
+    if (isMobile) { $('mobileSplash').style.display = 'none'; checkOrientation(); }
+  }
+
+  async function startFromList() {
+    var sel = isMobile ? $('mobileRomSelect') : $('romSelect');
+    var pick = ROMS[+(sel && sel.value) || 0] || ROMS[0];
+    $('btnStart').disabled = true;
+    setStatus('Fetching ' + pick.label + '…');
+    try {
+      var r = await fetch(pick.url);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      var buf = new Uint8Array(await r.arrayBuffer());
+      bootRom(buf, pick.label);
+    } catch (e) {
+      $('btnStart').disabled = false;
+      setStatus('ROM fetch failed.');
+      banner('<b>Could not load ' + pick.label + '.</b> ' + String(e.message || e)
+        + ' — the built-in ROM lives at <code>' + pick.url + '</code>. You can still use <b>Browse…</b> to open a <code>.smc</code>/<code>.sfc</code> from this device.');
+      toast('ROM fetch failed', true);
+    }
+  }
+
+  $('btnStart').addEventListener('click', startFromList);
+  $('btnStart').disabled = true;
+  $('btnBrowse').disabled = true;
+  $('btnBrowse').addEventListener('click', function () { $('fileInput').click(); });
+  $('fileInput').addEventListener('change', function (e) {
+    var f = e.target.files && e.target.files[0];
+    if (!f) return;
+    var fr = new FileReader();
+    fr.onload = function () { bootRom(new Uint8Array(fr.result), f.name); };
+    fr.readAsArrayBuffer(f);
+  });
+
+  // ── save states (IndexedDB, gzipped) ──────────────────────────────────────
+  const DB_NAME = 'SNESWASMDB', STORE = 'SNESWASMSTATES';
+  function openDB() { return new Promise((res, rej) => { var q = indexedDB.open(DB_NAME); q.onupgradeneeded = (e) => e.target.result.createObjectStore(STORE); q.onsuccess = (e) => res(e.target.result); q.onerror = () => rej(q.error); }); }
+  async function idbPut(k, v) { var db = await openDB(); return new Promise((res, rej) => { var t = db.transaction(STORE, 'readwrite').objectStore(STORE).put(v, k); t.onsuccess = () => res(); t.onerror = () => rej(t.error); }); }
+  async function idbGet(k) { var db = await openDB(); return new Promise((res, rej) => { var t = db.transaction(STORE, 'readonly').objectStore(STORE).get(k); t.onsuccess = () => res(t.result); t.onerror = () => rej(t.error); }); }
+  async function gzip(u8) { var cs = new CompressionStream('gzip'); var w = cs.writable.getWriter(); w.write(u8); w.close(); return new Uint8Array(await new Response(cs.readable).arrayBuffer()); }
+  async function gunzip(u8) { var ds = new DecompressionStream('gzip'); var w = ds.writable.getWriter(); w.write(u8); w.close(); return new Uint8Array(await new Response(ds.readable).arrayBuffer()); }
+  const saveKey = () => romName + '.snesstate';
+
+  async function saveState() {
+    if (!running) return toast('Nothing running', true);
+    try {
+      var size = Module._getStateSaveSize();
+      var ptr = Module._saveState();
+      if (!ptr) return toast('Save failed (core returned null)', true);
+      var copy = new Uint8Array(new Uint8Array(Module.HEAPU8.buffer, ptr, size));  // copy out before free
+      Module._my_free(ptr);
+      await idbPut(saveKey(), await gzip(copy));
+      toast('State saved');
+    } catch (e) { toast('Save failed: ' + (e.message || e), true); }
+  }
+  async function loadState() {
+    if (!running) return toast('Nothing running', true);
+    try {
+      var stored = await idbGet(saveKey());
+      if (!stored) return toast('No save state for ' + romName, true);
+      var data = await gunzip(stored instanceof Uint8Array ? stored : new Uint8Array(stored));
+      var ptr = Module._my_malloc(data.length);
+      Module.HEAPU8.set(data, ptr);
+      var ok = Module._loadState(ptr, data.length);
+      Module._my_free(ptr);
+      toast(ok ? 'State restored' : 'State rejected (size mismatch)', !ok);
+    } catch (e) { toast('Load failed: ' + (e.message || e), true); }
+  }
+  function toggleMute() {
+    muted = !muted;
+    if (audioCtx) { muted ? audioCtx.suspend() : audioCtx.resume().catch(() => {}); }
+    $('btnMute').textContent = muted ? '🔇 Unmute' : '🔊 Mute';
+    if ($('mMute')) $('mMute').textContent = muted ? 'Unmute' : 'Mute';
+  }
+  function toggleFullscreen() {
+    var el = isMobile ? $('mobileShell') : $('canvasWrap');
+    if (document.fullscreenElement || document.webkitFullscreenElement) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); }
+    else { var fn = el.requestFullscreen || el.webkitRequestFullscreen; if (fn) fn.call(el).catch(() => {}); }
+  }
+  $('btnSave').addEventListener('click', saveState);
+  $('btnLoad').addEventListener('click', loadState);
+  $('btnMute').addEventListener('click', toggleMute);
+  $('btnFull').addEventListener('click', toggleFullscreen);
+
+  // ── input ─────────────────────────────────────────────────────────────────
+  const KEYMAP = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', a: 'a', z: 'b', x: 'x', s: 'y', d: 'l', c: 'r', Enter: 'start', Shift: 'select' };
+  function onKey(e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    var t = e.target && e.target.tagName;
+    if (t === 'INPUT' || t === 'SELECT' || t === 'TEXTAREA') return;
+    var k = e.key;
+    if (k && k.length === 1) k = k.toLowerCase();
+    var btn = KEYMAP[k];
+    if (!btn) return;
+    padState[btn] = (e.type === 'keydown');
+  }
+  window.addEventListener('keydown', onKey, true);
+  window.addEventListener('keyup', onKey, true);
+
+  function wireButton(id, btn) {
+    var el = $(id); if (!el) return;
+    function press(e) { if (e && e.preventDefault) e.preventDefault(); padState[btn] = true; el.classList.add('held'); }
+    function release(e) { if (e && e.preventDefault) e.preventDefault(); padState[btn] = false; el.classList.remove('held'); }
+    if (window.PointerEvent) {
+      el.addEventListener('pointerdown', function (e) { try { el.setPointerCapture(e.pointerId); } catch (_) {} press(e); });
+      el.addEventListener('pointerup', release); el.addEventListener('pointercancel', release); el.addEventListener('pointerleave', release);
+    }
+    el.addEventListener('touchstart', press, { passive: false });
+    el.addEventListener('touchend', release, { passive: false });
+    el.addEventListener('touchcancel', release, { passive: false });
+    el.addEventListener('mousedown', press); el.addEventListener('mouseup', release); el.addEventListener('mouseleave', release);
+  }
+
+  function wireDpad() {
+    var disc = $('mobileDpadDisc'); if (!disc) return;
+    var active = { up: false, down: false, left: false, right: false };
+    var captureId = null;
+    function compute(x, y) {
+      var rect = disc.getBoundingClientRect();
+      var cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2, r = rect.width / 2;
+      var dx = x - cx, dy = y - cy;
+      var next = { up: false, down: false, left: false, right: false };
+      if (Math.hypot(dx, dy) < r * 0.18) return next;
+      var deg = Math.atan2(dy, dx) * 180 / Math.PI;
+      if (deg > -67.5 && deg < 67.5) next.right = true;
+      if (deg > 22.5 && deg < 157.5) next.down = true;
+      if (deg > 112.5 || deg < -112.5) next.left = true;
+      if (deg > -157.5 && deg < -22.5) next.up = true;
+      return next;
+    }
+    function apply(next) {
+      ['up', 'down', 'left', 'right'].forEach(function (d) {
+        if (next[d] !== active[d]) { padState[d] = next[d]; active[d] = next[d]; disc.classList.toggle('d-' + d, next[d]); }
+      });
+    }
+    function reset() { apply({ up: false, down: false, left: false, right: false }); captureId = null; }
+    if (window.PointerEvent) {
+      disc.addEventListener('pointerdown', function (e) { e.preventDefault(); try { disc.setPointerCapture(e.pointerId); } catch (_) {} captureId = e.pointerId; apply(compute(e.clientX, e.clientY)); });
+      disc.addEventListener('pointermove', function (e) { if (captureId != null && e.pointerId !== captureId) return; if (e.pointerType === 'mouse' && !e.buttons) return; e.preventDefault(); apply(compute(e.clientX, e.clientY)); });
+      disc.addEventListener('pointerup', reset); disc.addEventListener('pointercancel', reset); disc.addEventListener('pointerleave', reset);
+    }
+    disc.addEventListener('touchstart', function (e) { e.preventDefault(); var t = e.touches[0]; if (t) apply(compute(t.clientX, t.clientY)); }, { passive: false });
+    disc.addEventListener('touchmove', function (e) { e.preventDefault(); var t = e.touches[0]; if (t) apply(compute(t.clientX, t.clientY)); }, { passive: false });
+    disc.addEventListener('touchend', reset); disc.addEventListener('touchcancel', reset);
+  }
+
+  // Standard-mapping gamepad. Bottom face -> SNES B, right face -> SNES A,
+  // left -> Y, top -> X, matching the physical SNES pad.
+  // Gamepad state is kept SEPARATE from padState and OR-ed in padMask(): a poll
+  // that wrote straight into padState would clear whatever the keyboard or a
+  // touch button had just set, every animation frame.
+  const GP_BTN = { 0: 'b', 1: 'a', 2: 'y', 3: 'x', 4: 'l', 5: 'r', 8: 'select', 9: 'start', 12: 'up', 13: 'down', 14: 'left', 15: 'right' };
+  const GP_DEAD = 0.35;
+  function pollGamepads() {
+    requestAnimationFrame(pollGamepads);
+    var next = {};
+    var pads = (navigator.getGamepads && navigator.getGamepads()) || [];
+    for (var i = 0; i < pads.length; i++) {
+      var gp = pads[i]; if (!gp) continue;
+      var btns = gp.buttons || [];
+      for (var b in GP_BTN) { if (btns[+b] && btns[+b].pressed) next[GP_BTN[b]] = true; }
+      var ax = gp.axes || [];
+      if ((ax[0] || 0) < -GP_DEAD) next.left = true;
+      if ((ax[0] || 0) > GP_DEAD) next.right = true;
+      if ((ax[1] || 0) < -GP_DEAD) next.up = true;
+      if ((ax[1] || 0) > GP_DEAD) next.down = true;
+    }
+    gpState = next;
+  }
+  if (navigator.getGamepads) requestAnimationFrame(pollGamepads);
+
+  // ── mobile shell ──────────────────────────────────────────────────────────
+  function checkOrientation() {
+    if (!isMobile) return;
+    var landscape = window.innerWidth > window.innerHeight;
+    $('rotateHint').style.display = (running && !landscape) ? 'flex' : 'none';
+  }
+  window.addEventListener('resize', checkOrientation);
+  window.addEventListener('orientationchange', checkOrientation);
+
+  function openMenu() { $('mobileMenu').classList.add('open'); }
+  function closeMenu() { $('mobileMenu').classList.remove('open'); }
+  $('mobileMenuBtn').addEventListener('click', openMenu);
+  $('mClose').addEventListener('click', closeMenu);
+  $('mSave').addEventListener('click', () => { saveState(); closeMenu(); });
+  $('mLoad').addEventListener('click', () => { loadState(); closeMenu(); });
+  $('mMute').addEventListener('click', () => { toggleMute(); closeMenu(); });
+  $('mFull').addEventListener('click', () => { toggleFullscreen(); closeMenu(); });
+
+  if (isMobile) {
+    $('desktop').style.display = 'none';
+    var c = $('canvas'); c.style.width = ''; c.style.height = '';
+    $('mobileScreen').appendChild(c);
+    $('mobileShell').style.display = 'block';
+    $('mobileSplash').style.display = 'flex';
+    wireButton('mobileA', 'a'); wireButton('mobileB', 'b'); wireButton('mobileX', 'x'); wireButton('mobileY', 'y');
+    wireButton('mobileL', 'l'); wireButton('mobileR', 'r');
+    wireButton('mobileStart', 'start'); wireButton('mobileSelect', 'select');
+    wireDpad();
+    checkOrientation();
+    $('mobileSplashStart').disabled = true;
+    $('mobileSplashStart').addEventListener('pointerdown', function (e) { e.preventDefault(); if (!wasmReady) return; startFromList(); });
+    setStatus('Loading core…');
+  } else {
+    wireButton('mobileA', 'a'); wireButton('mobileB', 'b'); wireButton('mobileX', 'x'); wireButton('mobileY', 'y');
+    wireButton('mobileL', 'l'); wireButton('mobileR', 'r');
+    wireButton('mobileStart', 'start'); wireButton('mobileSelect', 'select');
+    wireDpad();
+  }
+
+  // ── load the core ─────────────────────────────────────────────────────────
+  initCanvas();
+  setStatus('Loading core…');
+  var s = document.createElement('script');
+  s.src = '/snes/snesWasm/snes9x_2005.js';
+  s.onerror = function () {
+    setStatus('Core failed to load.');
+    banner('<b>The SNES core could not be loaded.</b> <code>/snes/snesWasm/snes9x_2005.js</code> did not fetch. '
+      + 'If you are seeing this on the live site it is a deploy problem, not your browser.');
+  };
+  document.body.appendChild(s);
+})();
+</script>
+</body>
+</html>

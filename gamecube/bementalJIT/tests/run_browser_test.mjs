@@ -59,7 +59,22 @@ function startServer() {
 // failed-count counts as a failure.
 const FAIL_RE = /\bLinkError\b|\bRuntimeError\b|\babort\(|\bAborted\b|uncaught|assertion failed|\[FAIL\]|\b[1-9]\d*\s+failed\b|requires a callable|Table\.grow|mismatch in shared state|memory access out of bounds|dispatch failed|dispatch trap/i;
 const PASS_RE = /\[PASS\]|ALL TESTS? (PASSED|OK|DONE)|\b(\d+)\/\1\b.*pass|\ball (\d+) .*pass|passed,?\s*0 failed|\[wild-perf summary\][^]*?\b0 failed|\bPASS\b\s*$/i;
-const DONE_RE = /\[wild-perf summary\]|ALL TESTS|\[(PASS|FAIL)\]|\d+\s+failed|tests? (passed|complete|done)|\bdone\b/i;
+// ★ COMPLETION marker only — NOT a per-case result line.
+//
+// THE FALSE-GREEN BUG THIS FIXES (measured 2026-09-01). This regex used to
+// include `\[(PASS|FAIL)\]`, so the wait loop below broke on the FIRST per-case
+// result line and the run was abandoned mid-suite; the verdict block then saw a
+// `[PASS]` with no `[FAIL]` and reported PASS. Observed directly: under load
+// `test_gekko_next` produced 3 of its ~169 cases, its own `TOTAL:` completion
+// marker (test_gekko_next.cpp:4345) was ABSENT from an 18-line log, and the
+// harness still exited 0. A suite that never reached the end cannot be a
+// correctness gate, and this one was being used as one.
+//
+// Every suite's real end-of-run line, verified by grepping tests/*.cpp:
+//   "TOTAL: %d passed, %d failed"            test_simd_bswap, test_gekko, ...
+//   "TOTAL  pass=%d  fail=%d  vacuous=%d"    test_leaf_inline
+//   "[wild-perf summary] ..."                test_perf_t1
+const DONE_RE = /\bTOTAL[: ]|\[wild-perf summary\]|ALL TESTS? (PASSED|OK|DONE|COMPLETE)/i;
 
 (async () => {
     const srv = await startServer();
@@ -105,10 +120,24 @@ const DONE_RE = /\[wild-perf summary\]|ALL TESTS|\[(PASS|FAIL)\]|\d+\s+failed|te
 
     const failHit = lines.find(l => FAIL_RE.test(l));
     const passHit = lines.find(l => PASS_RE.test(l));
+    const doneHit = lines.find(l => DONE_RE.test(l));
     let verdict, reason, code;
+    // ORDER MATTERS, AND SO DOES THE COMPLETION CHECK.
+    // A FAIL anywhere is a FAIL even if the suite also finished. But a PASS
+    // REQUIRES the suite to have reached its own end marker — otherwise a run
+    // that died, hung, or was cut off by TIMEOUT_MS after one passing case
+    // reports PASS, which is exactly the false green this harness shipped.
     if (failHit) { verdict = 'FAIL'; reason = failHit.slice(0, 120); code = 1; }
-    else if (passHit) { verdict = 'PASS'; reason = passHit.slice(0, 120); code = 0; }
-    else { verdict = 'INCONCLUSIVE'; reason = lines.length ? `no verdict marker; last: ${lines[lines.length-1].slice(0,80)}` : 'no console output'; code = 3; }
+    else if (!doneHit) {
+      verdict = 'INCOMPLETE';
+      code = 3;
+      const seen = lines.filter(l => /\[PASS\]/i.test(l)).length;
+      reason = `suite never reached its completion marker (saw ${seen} [PASS] line(s), ${lines.length} console line(s))`
+             + (Date.now() - t0 >= TIMEOUT_MS ? ` — hit TIMEOUT_MS=${TIMEOUT_MS}, raise it with argv[4] or TEST_TIMEOUT_MS` : '')
+             + (lines.length ? `; last: ${lines[lines.length-1].slice(0,80)}` : '');
+    }
+    else if (passHit) { verdict = 'PASS'; reason = `${doneHit.slice(0, 90)} | ${passHit.slice(0, 60)}`; code = 0; }
+    else { verdict = 'INCONCLUSIVE'; reason = `completed but no pass marker; last: ${(lines[lines.length-1]||'').slice(0,80)}`; code = 3; }
     console.log(`[verdict] ${testName}: ${verdict} (${reason})  [log: ${logPath}]`);
     process.exit(code);
 })().catch((e) => { console.error(`[verdict] ${testName}: harness error ${e.message}`); process.exit(2); });

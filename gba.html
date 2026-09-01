@@ -6,16 +6,24 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="keywords" content="GBA Emulator, Game Boy Advance, WebAssembly, HTML5">
     <meta charset="UTF-8">
+    <link rel="icon" href="data:,">
     <script src="/lib/wakelock.js"></script>
-    <script src="https://code.jquery.com/jquery-3.3.1.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/rivets/0.9.6/rivets.bundled.min.js"></script>
-    <link rel="stylesheet" href="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/css/bootstrap.min.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.12.9/umd/popper.min.js"></script>
-    <script src="https://maxcdn.bootstrapcdn.com/bootstrap/4.0.0/js/bootstrap.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/toastr.js/latest/toastr.min.js"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/toastr.js/latest/css/toastr.min.css">
-    <script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.2/dist/FileSaver.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/nipplejs/0.10.0/nipplejs.min.js"></script>
+    <!-- UI deps are SELF-HOSTED, same rationale as n64/vendor/: this page must not
+         depend on five third-party CDNs staying reachable to render at all, and a
+         sibling page's coi-serviceworker isolates this origin for every later visit.
+         Byte-identical copies of what the CDN tags used to fetch (jQuery 3.3.1,
+         rivets 0.9.6, bootstrap 4.0.0, popper 1.12.9, toastr).
+         DROPPED as verified-unused: file-saver (`saveAs` is never called anywhere
+         under gba/) and nipplejs (only referenced by InputController's
+         setupMobileControls(), which has no call site — the SP shell in this file
+         wires touch directly). -->
+    <script src="/gba/vendor/jquery-3.3.1.min.js"></script>
+    <script src="/gba/vendor/rivets.bundled.min.js"></script>
+    <link rel="stylesheet" href="/gba/vendor/bootstrap.min.css">
+    <script src="/gba/vendor/popper.min.js"></script>
+    <script src="/gba/vendor/bootstrap.min.js"></script>
+    <script src="/gba/vendor/toastr.min.js"></script>
+    <link rel="stylesheet" href="/gba/vendor/toastr.min.css">
 
     <style>
         input[type="file"] { display: none; }
@@ -334,6 +342,59 @@
         }
         .btn-a { background: radial-gradient(circle at 38% 32%, #e87070, #b02828); top: 4px; right: 4px; }
         .btn-b { background: radial-gradient(circle at 38% 32%, #6688ee, #2244aa); bottom: 4px; left: 4px; }
+
+        /* ════════════════════════════════════════
+           LANDSCAPE — the 50vh/50vh clamshell does not fit a phone on its side.
+           MEASURED 2026-09-01 at 844x390 (iPhone landscape): .sp-bottom got
+           195px, the d-pad alone asks for min(38vh,44vw)=148px plus a 22px
+           shoulder row and the speed row, so the control block overflowed its
+           half and the B button was rendered BELOW the viewport — unreachable.
+           The screen also got only 195px tall with wide black bars either side.
+           In landscape the controls therefore float OVER a full-bleed screen
+           (the layout ps1.html already uses), which both un-clips them and
+           gives the game the whole viewport.
+           ════════════════════════════════════════ */
+        @media (orientation: landscape) and (max-height: 560px) {
+            .sp-device { position: relative; }
+            .sp-top { position: absolute; inset: 0; height: 100%; flex: none; }
+            .sp-bottom {
+                position: absolute; inset: 0; height: 100%; flex: none;
+                background: none; border-top: 0; pointer-events: none;
+            }
+            /* re-arm hit-testing only on the controls themselves */
+            .sp-bottom > * { pointer-events: auto; }
+            .sp-shoulders { position: absolute; top: 0; left: 0; right: 0; }
+            .sp-shoulder {
+                width: 34vw; height: 30px; border-bottom: 0; border-radius: 0 0 8px 8px;
+                background: linear-gradient(180deg, rgba(194,194,194,0.82), rgba(144,144,144,0.82));
+            }
+            .sp-shoulder.R { margin-left: auto; }
+            /* inset must START BELOW the shoulder row. .sp-inner is a direct child
+               of .sp-bottom so it re-arms pointer-events, and it comes later in DOM
+               order — at inset:0 it painted over the shoulders and ate their taps
+               (measured: mobileL held=false). */
+            .sp-inner { position: absolute; inset: 30px 0 0; padding: 4px 6px 6px; }
+            .sp-menu-row { position: absolute; top: -26px; left: 50%; transform: translateX(-50%); margin: 0; }
+            #spSpeedRow { position: absolute; bottom: 4px; left: 50%; transform: translateX(-50%); margin: 0; }
+            #spSpeedSlider { width: 100px; }
+            #spSpeedLabel { color: #ddd; text-shadow: 0 1px 2px #000; }
+            .sp-controls { align-items: center; height: 100%; }
+            .sp-dpad-disc, .sp-ab {
+                width: min(56vh, 21vw); height: min(56vh, 21vw);
+                max-width: 160px; max-height: 160px;
+            }
+            .sp-btn-circle { width: min(24vh, 9vw); height: min(24vh, 9vw); max-width: 60px; max-height: 60px; }
+            /* Controls float over the picture, so they are translucent — the game
+               stays readable underneath and the touch targets stay thumb-sized
+               instead of being squeezed into the letterbox margins. */
+            .sp-dpad-disc { opacity: 0.62; }
+            .sp-btn-circle { opacity: 0.72; }
+            .sp-dpad-disc:active, .sp-dpad-v.held, .sp-dpad-h.held,
+            .sp-btn-circle:active, .sp-btn-circle.held { opacity: 0.95; }
+            .sp-center { flex: 0 0 auto; align-self: flex-end; padding-bottom: 30px; gap: 6px; }
+            .sp-sys-btn { background: linear-gradient(180deg, rgba(170,170,170,0.72), rgba(120,120,120,0.72)); }
+            .sp-led { display: none; }
+        }
 
         /* MOBILE MENU OVERLAY */
         #spMenuOverlay {
@@ -750,8 +811,11 @@
     window.spScaleCanvas = spScaleCanvas;
     </script>
 
-    <script src="gba/gbaWasm/dist/settings.js"></script>
-    <script src="gba/gbaWasm/dist/romlist.js"></script>
-    <script src="gba/gbaWasm/dist/script.js"></script>
+    <!-- Absolute, not relative: these are the URLs tools/verify_deploy_assets.mjs
+         can see statically (its URL_RE only matches /-rooted paths), so the deploy
+         gate now covers this page's runtime assets too. -->
+    <script src="/gba/gbaWasm/dist/settings.js"></script>
+    <script src="/gba/gbaWasm/dist/romlist.js"></script>
+    <script src="/gba/gbaWasm/dist/script.js"></script>
 </body>
 </html>

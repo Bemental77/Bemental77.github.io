@@ -25,6 +25,7 @@
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
+
 #endif
 
 using namespace bemental;
@@ -67,6 +68,17 @@ static u32 decode_block(const u32* guest_mem, u32 pc, u32* out_inst, u32 max_ins
     }
     return i;
 }
+// [completion-marker 2026-09-01] run_browser_test.mjs grants a PASS only when a
+// suite prints its own end-of-run line. These four suites had none, so a run cut
+// short mid-suite was indistinguishable from one that finished, and the harness
+// reported PASS off the first passing case.
+static inline void bem_test_total(int passed, int failed) {
+    std::printf("TOTAL: %d passed, %d failed\n", passed, failed);
+#ifdef __EMSCRIPTEN__
+    EM_ASM({ console.log('TOTAL: ' + $0 + ' passed, ' + $1 + ' failed'); }, passed, failed);
+#endif
+}
+
 
 int main() {
 #ifdef __EMSCRIPTEN__
@@ -184,5 +196,6 @@ int main() {
 
     std::free(ctx_raw);
     std::free(guest_mem);
+    bem_test_total((ok_str && ok_r3) ? 1 : 0, (ok_str && ok_r3) ? 0 : 1);
     return (ok_str && ok_r3) ? 0 : 1;
 }

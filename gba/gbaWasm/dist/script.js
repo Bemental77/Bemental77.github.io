@@ -53,7 +53,7 @@ class MyClass {
         // Tell Emscripten where to find the .wasm file
         // (needed because 44gba.js is dynamically inserted into <head>)
         window['Module'] = {
-            locateFile: (path) => 'gba/gbaWasm/dist/' + path
+            locateFile: (path) => '/gba/gbaWasm/dist/' + path
         };
 
         this.rivetsData = {
@@ -629,7 +629,20 @@ class MyClass {
     detectMobile() {
         const ua = navigator.userAgent.toLowerCase();
         this.iosMode = ua.includes('iphone') || ua.includes('ipad');
-        this.mobileMode = window.innerWidth < 600 || ua.includes('iphone');
+        // Was: `window.innerWidth < 600 || ua.includes('iphone')`.
+        // MEASURED 2026-09-01 with a Pixel 8 UA: portrait (412x915) gave
+        // mobileMode=true, but LANDSCAPE (915x412) gave mobileMode=false,
+        // spShell display:none, the canvas left in #canvasDiv and #mobileA with
+        // a zero-width rect — i.e. an Android visitor who turns the phone
+        // sideways (the natural way to hold a GBA) got the desktop UI with no
+        // touch controls and no keyboard. Only iPhone survived, and only
+        // because of the UA substring.
+        // Fix: decide from the SHORT edge, which does not change on rotation,
+        // and from a real touch capability rather than a width guess — so this
+        // is evaluated once and stays correct through every orientation change.
+        const touch = (navigator.maxTouchPoints || 0) > 0 || 'ontouchstart' in window;
+        const uaMobile = /iphone|ipad|ipod|android|mobile/.test(ua);
+        this.mobileMode = uaMobile || (touch && Math.min(window.innerWidth, window.innerHeight) < 600);
     }
 
     // ── REMAP MODAL ───────────────────────────────────────────────────────────
@@ -726,5 +739,5 @@ var myApp = myClass;
 // Load input controller, which then loads the 44vba WASM binary
 var _rando = Math.floor(Math.random() * 100000);
 var _ic = document.createElement('script');
-_ic.src = 'gba/gbaWasm/dist/input_controller.js?v=' + _rando;
+_ic.src = '/gba/gbaWasm/dist/input_controller.js?v=' + _rando;
 document.getElementsByTagName('head')[0].appendChild(_ic);
