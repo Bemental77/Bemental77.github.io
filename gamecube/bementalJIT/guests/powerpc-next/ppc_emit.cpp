@@ -254,12 +254,28 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
     // At IR=0 the vector is fetched physical (real-mode, correct) — let it chain
     // natively so the stub advances to its handler. At IR=1, force the JS dispatch
     // loop (CheckExternalExceptions/delivery clears IR to real-mode).
+    // [EDGE-DIET 2026-09-01 short-circuit] SAME PREDICATE, nested instead of
+    // flat-AND. The old form evaluated BOTH conjuncts unconditionally — two
+    // ctx loads, an extra normalize-to-0/1, and the and — 13 unconditional ops
+    // on every block edge. PC<0x4000 is the rare term (the PM51 census recorded
+    // at ppc_emit.cpp:72-74 measured the vector arm firing 0 times in 75 s
+    // against 362.5M chain-taken edges), so testing it OUTER makes the MSR load
+    // and the whole normalize disappear from the executed path: 13 -> 7
+    // unconditional ops. The inner test drops the `!= 0` normalize too — wasm
+    // `if` already branches on nonzero, and 0x20 is a single bit.
+    // The guard itself is UNCHANGED and stays PERMANENT (see the paragraph
+    // above): (PC < 0x4000) && (MSR & IR) is exactly what still bails.
+    // PC is teed into LOCAL_TMP_A_CHAIN here and REUSED by the bucket probe
+    // below, which is why the probe no longer re-loads it. Nothing between the
+    // two writes ctx.PC or that local: the only code in between is the PM54d
+    // direct-edge loop, which runs solely for region bodies (region_gen >= 0)
+    // and touches neither.
     b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
-    b.op_i32_const(0x4000); b.op_i32_lt_u();                 // (PC < 0x4000) -> 0/1
+    b.op_local_tee(LOCAL_TMP_A_CHAIN);
+    b.op_i32_const(0x4000); b.op_i32_lt_u();                 // (PC < 0x4000)
+    b.op_if(BLOCK_TYPE_VOID);
     b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::MSR);
-    b.op_i32_const(0x20); b.op_i32_and();                    // MSR & IR(0x20) -> 0/0x20
-    b.op_i32_const(0); b.op_i32_ne();                        // -> 0/1 (normalize before AND)
-    b.op_i32_and();                                          // (PC<0x4000) AND (IR set)
+    b.op_i32_const(0x20); b.op_i32_and();                    // MSR & IR(0x20)
     b.op_if(BLOCK_TYPE_VOID);
         // [PM51 bail-census — gated]
         if (BEM_PM51_CENSUS && g_bem_lc_base) {
@@ -269,7 +285,8 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
         }
         emit_exit_census(b, 0x026B34E0u);   // [census] vector_guard
         b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC); b.op_return();
-    b.op_end();
+    b.op_end();                              // close the MSR.IR test
+    b.op_end();                              // close the PC<0x4000 test
 
     // [PM54d payload] STATIC same-gen edges: PC-compare -> direct return_call
     // (same instance; ~500-wire-byte callees are TurboFan-inline candidates).
@@ -314,9 +331,9 @@ void emit_chain_or_return(WasmModuleBuilder& b, u32 ctx_ptr,
         b.op_end();
     }
 
-    // bucket byte-offset = ((PC>>2) & MASK) * 4 ; keep PC in TMP_A, byteoff in TMP_B
-    b.op_i32_const((s32)ctx_ptr); b.op_i32_load(ppc_off::PC);
-    b.op_local_tee(LOCAL_TMP_A_CHAIN);
+    // bucket byte-offset = ((PC>>2) & MASK) * 4 ; PC is ALREADY in TMP_A (teed by
+    // the vector-page guard above — see its note), byteoff goes to TMP_B.
+    b.op_local_get(LOCAL_TMP_A_CHAIN);
     b.op_i32_const(2); b.op_i32_shr_u();
     b.op_i32_const((s32)BEM_DISP_MASK_NEXT); b.op_i32_and();
     b.op_i32_const(4); b.op_i32_mul();
@@ -847,6 +864,14 @@ bool dispatch_op(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
 // Set by host integrator (JitWasm) to HLE::GetHookByAddress wrapper.
 HleHookQueryFn g_hle_hook_query = nullptr;
 
+// [op-census 2026-09-01] See ppc_emit.h. Null in every shipping build; the sole
+// writer is the host-native driver tools/op_census.cpp. Marks are READ-ONLY on
+// the builder (they pass b.size(), never the builder), so an installed callback
+// cannot change one emitted byte.
+BemEmitMarkFn g_bem_emit_mark_cb = nullptr;
+#define BEM_EMIT_MARK(tag, pc) \
+    do { if (g_bem_emit_mark_cb) g_bem_emit_mark_cb((tag), (pc), (u32)b.size()); } while (0)
+
 // [PM53h int-fusion] emit-time census: blocks compiled with the fused
 // integer-self-loop shape (tests assert this to prove the path emitted —
 // "one dispatch consumed N iterations" is also true for chain-dispatched
@@ -998,6 +1023,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     const bool idle_block = block.m_num_instructions > 0 &&
         buffer.data()[block.m_num_instructions - 1].branchIsIdleLoop;
     const u32 charge = stats.numCycles ? stats.numCycles : (u32)count;
+    BEM_EMIT_MARK(BEM_MARK_BLOCK_BEGIN, start_pc);
     {
         if (idle_block) {
             b.op_i32_const((s32)ctx_ptr);
@@ -1334,12 +1360,14 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
     // single arm) AND fp_resident_loop's SINGLES arm (with_singles); the double
     // fallback arm (with_singles==false) stays a normal deopt block.
     const bool resident_loop_arm = int_fused || (fp_resident_loop && with_singles);
+    BEM_EMIT_MARK(BEM_MARK_BODY_BEGIN, start_pc);
     if (resident_loop_arm) {
         b.op_loop(BLOCK_TYPE_VOID);
         fused_loop_depth = b.ctrlDepth();
     }
     for (std::size_t i = 0; i < n_ops; ++i) {
         const CodeOp& op = buffer[i];
+        BEM_EMIT_MARK(BEM_MARK_OP, op.address);
         const bool is_terminator = (i + 1 == n_ops);
         if (op.opinfo) {
             const OpType t = op.opinfo->type;
@@ -1797,9 +1825,11 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             }
         }
     }
+    BEM_EMIT_MARK(BEM_MARK_TERM_BEGIN, start_pc);
     emit_chain_or_return(b, ctx_ptr, chain_tag_addr, chain_slot_addr, merged,
                          region_gen, direct_pcs, direct_fidx, n_direct,
                          chain_tag_sym, chain_slot_sym);
+    BEM_EMIT_MARK(BEM_MARK_BLOCK_END, start_pc);
     };  // emit_arm
 
     if (assumed.m_val != 0u) {

@@ -541,6 +541,12 @@ static void emit_fastmem_store(WasmModuleBuilder& wb, LoadStoreParams params,
 // ---------------------------------------------------------------------------
 static constexpr bool BEM_GP_INWASM_ARM = true;
 
+// [gp-const-ea 2026-09-01] A/B toggle for the CONST-EA half of the same arm —
+// see the carve-out in emit_store_d. Flip to false to rebuild the pre-change
+// shape for a matched pair; the two arms must differ in emitted import calls on
+// SAB block 0x80120128 or the A/B is a placebo.
+static constexpr bool BEM_GP_CONST_EA_ARM = true;
+
 // SAB dual-core ownership cell (0 = dolphin EmuThread owns the guest CPU,
 // 1 = ppc-worker takeover). Same literal the bridge reads at
 // dolphin_jit_wimports.cpp:112 and GPFifo.cpp:217.
@@ -1048,6 +1054,55 @@ void emit_store_d(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
     // store ordering required by DVDInterface DICR.TSTART/DICMDBUF[0],
     // AudioInterface, etc.
     if (op.has_const_ea && is_mmio_const_addr(op.const_ea)) {
+        // [gp-const-ea 2026-09-01] WRITE-GATHER-PIPE CARVE-OUT. WPAR (0xCC008000)
+        // sits inside the 0xCC000000..0xCC03FFFF const-MMIO window, so a store
+        // whose EA the analyst folded — `lis rX,0xCC01` then `sth rY,-0x8000(rX)`,
+        // which is exactly how SAB's GX immediate-mode draw leaves are written —
+        // took the import path below and RETURNED, never reaching
+        // emit_store_common and therefore never reaching the in-wasm gather arm
+        // (emit_gp_or_import_store, :783). The SAME store issued through a
+        // dynamic EA has appended in-wasm since 2026-08-28. This is an
+        // inconsistency, not a decision: the const-MMIO routing predates the
+        // gather arm and its rationale (:912-924) is about DVDInterface
+        // DICR.TSTART/DICMDBUF ordering, which WPAR has no part in.
+        //
+        // MEASURED: op_census over the top-24 SAB hot buckets shows block
+        // 0x80120128 (`lis r5,0xCC01; sth r3,-0x8000(r5); sth r4,-0x8000(r5);
+        // blr`) emitting 2 x `call 4` (ppc_write16) — two host crossings per
+        // call, on a draw path the PC census puts at 4.4%+5.2% of samples.
+        //
+        // NOTE ON SIZING: this trades ~26 in-wasm ops for one cross-instance
+        // host call, so it is a REGRESSION in raw op count and the op census
+        // will score it that way. The win is the crossing, not the ops.
+        // frc.Flush is dropped for the same reason emit_store_common:879-883
+        // drops it on the integer store path: the host write handlers read
+        // gpr[], never ps[]. rc.Flush is kept.
+        if (BEM_GP_CONST_EA_ARM && BEM_GP_INWASM_ARM && params.lc_base &&
+            (op.const_ea & GP_EA_MASK) == GP_EA_MATCH) {
+            auto rc_rs = rc.Bind(rs, RCMode::Read);
+            const u32 src_local = rc_rs.local_idx();
+            rc.Flush(params.ctx_ptr);
+            // The EA is compile-time known, so the runtime region test collapses
+            // to its only variable term: does dolphin's own CPU thread still own
+            // the guest? (emit_gp_region_test's second conjunct — the ppc-worker
+            // excursion redirect must keep using the import.)
+            wb.op_i32_const((s32)GP_CPU_OWNER_CELL);
+            wb.op_i32_load(0);
+            wb.op_i32_eqz();
+            wb.op_if(BLOCK_TYPE_VOID);
+                emit_gp_append(wb, params, width, src_local);
+            wb.op_else();
+                wb.op_i32_const((s32)op.const_ea);
+                wb.op_local_get(src_local);
+                wb.op_call(write_import_for_width(width));
+            wb.op_end();
+            if (update && ra != 0) {
+                auto rc_ra = rc.Bind(ra, RCMode::Write);
+                wb.op_i32_const((s32)op.const_ea);
+                wb.op_local_set(rc_ra.local_idx());
+            }
+            return;
+        }
         auto rc_rs = rc.Bind(rs, RCMode::Read);
         emit_const_mmio_store(wb, rc, frc, params, op.const_ea, width,
                               rc_rs.local_idx());

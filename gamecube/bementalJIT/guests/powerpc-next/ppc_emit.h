@@ -88,6 +88,32 @@ using HleHookQueryFn = bool(*)(u32 pc);
 extern HleHookQueryFn g_hle_hook_query;
 
 // ---------------------------------------------------------------------------
+// [op-census 2026-09-01] Emit-phase marks — the OFFLINE executed-op instrument.
+//
+// WHY: every op-level number in this tree so far is a STATIC emitted-op count
+// (`BEM_EMIT_AUDIT` in tests/test_simd_bswap.cpp:336, `dump_block_wasm` in
+// tests/test_gekko_next.cpp:2506). Static size is not executed cost — the trap
+// commit dd6759fb names verbatim (jit_load_store.cpp:2116/:2173, a ~500-op
+// quantized tree behind an `op_if` that the float path never enters). To split
+// "emitted" from "executed" you need to know which BYTE RANGE of the emitted
+// body belongs to which emit phase, then intersect that with the wasm control
+// structure. These marks give the first half; op_census_report.py does the rest.
+//
+// CONTRACT: the callback receives the builder's CURRENT byte offset (b.size())
+// and the guest PC (0 for phase marks). It is handed no builder reference and
+// therefore CANNOT alter emitted bytes. The pointer is null in every shipping
+// build — its only writer is the host-native driver tools/op_census.cpp.
+enum BemEmitMarkTag : u32 {
+    BEM_MARK_BLOCK_BEGIN = 0,   // top of the block body (before downcount charge)
+    BEM_MARK_BODY_BEGIN  = 1,   // after prologue: downcount + census + regcache loads
+    BEM_MARK_OP          = 2,   // before one guest instruction's emit; pc = op.address
+    BEM_MARK_TERM_BEGIN  = 3,   // before emit_chain_or_return (the per-edge tax)
+    BEM_MARK_BLOCK_END   = 4,   // after emit_chain_or_return
+};
+using BemEmitMarkFn = void(*)(u32 tag, u32 pc, u32 byte_off);
+extern BemEmitMarkFn g_bem_emit_mark_cb;
+
+// ---------------------------------------------------------------------------
 // _next region/block-body entry points.
 //
 // block_cache.cpp's region_relink and JitWasm.cpp's per-block-body emit
