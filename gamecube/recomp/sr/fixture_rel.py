@@ -76,6 +76,55 @@ def reloc_site_offsets(rel, sec):
     return {r["site_off"] for _, r in rel.all_relocs() if r["site_sec"] == sec}
 
 
+def pick_signature(blob, reloc_offs, want=32, tries=4000):
+    """A distinctive, RELOCATION-FREE window of the overlay's exec section.
+
+    It must avoid relocation sites (OSLink patches those in memory, so they will not
+    match the file) and must not be a run of one byte, or it matches everywhere."""
+    best = None
+    n = len(blob)
+    for off in range(0, min(n - want, tries * 64), 64):
+        if any((off + k) in reloc_offs for k in range(0, want, 4)):
+            continue
+        w = blob[off:off + want]
+        distinct = len(set(w))
+        if distinct < 12:
+            continue
+        if best is None or distinct > best[0]:
+            best = (distinct, off, w)
+        if distinct >= 28:
+            break
+    return (best[1], best[2]) if best else (None, None)
+
+
+def scan_for_base(g, sig, sig_off, lo, hi, chunk=0x8000):
+    """Find the overlay by SEARCHING MEM1 for a relocation-free signature.
+
+    WHY NOT THE LR TRICK.  Recovering the base from a breakpoint's LR assumes the DOL
+    helper was reached by a `bl`.  Measured on titleD: every hit reported LR as a
+    CONSTANT top-of-MEM1 value (0x811fff80 / 0x811fff84 / 0x811fffa8, byte-identical
+    across dozens of hits of the same target), i.e. a stale stack-ish value, because
+    those helpers are entered by a TAIL BRANCH which does not write LR.  A stale LR
+    yields a plausible-looking base that never confirms.  A direct scan does not care
+    how the callee was entered."""
+    step = chunk - len(sig)
+    addr = lo
+    while addr < hi:
+        end = min(addr + chunk, hi)
+        try:
+            buf = g.read_range(addr, end, chunk=0x400)
+        except Exception:
+            addr += step
+            continue
+        i = buf.find(sig)
+        while i >= 0:
+            hit = addr + i
+            base = (hit - sig_off) & 0xFFFFFFFF
+            yield base, hit
+            i = buf.find(sig, i + 1)
+        addr += step
+
+
 def confirm_base(g, rel, sec, base, reloc_offs, blob, samples=24, window=32):
     """Byte-compare live memory against the shipped section at NON-relocated offsets.
 
@@ -108,6 +157,8 @@ def main():
     ap.add_argument('--rel', default='stg13D.rel')
     ap.add_argument('--state', default=O.SAB_STATE)
     ap.add_argument('--map', default=os.path.join(REPO, 'dolphin_captures/sab.map'))
+    ap.add_argument('--dol', default='/tmp/sr_sab/main.dol',
+                    help='extracted main.dol, for the DOL-internal call graph')
     ap.add_argument('--locate-only', action='store_true')
     ap.add_argument('--capture-n', type=int, default=3)
     ap.add_argument('--budget', type=float, default=120.0,
@@ -143,19 +194,43 @@ def main():
           f"{len(blob)} bytes ({len(blob)//4} instructions)")
     print(f"[rel] {len(sites)} distinct DOL call targets, "
           f"{sum(len(v) for v in sites.values())} REL24 sites")
+    dimg = sr.Image.from_dol(a.dol)
     textr = dol_text_ranges(a.iso)
     print("[rel] DOL text (LR in these ranges = a DOL-internal caller, skipped): "
           + ", ".join(f"{lo:#x}..{hi:#x}" for lo, hi in textr))
 
-    # Probe targets: MOST call sites first.  The first version of this ranked by
-    # FEWEST -- which minimises the number of base candidates per hit, and is exactly
-    # backwards: fewest call sites means the RAREST call, so the breakpoints that fire
-    # least often were the ones armed.  A titleD run took 367 breakpoint hits without
-    # ever seeing a call FROM the overlay.  Ambiguity is cheap to resolve (every
-    # candidate is byte-confirmed against live memory below), rarity is not.
-    probes = sorted(sites.items(), key=lambda kv: -len(kv[1]))[:a.probe_targets]
-    print(f"[rel] arming {len(probes)} DOL targets for base recovery "
-          f"(max {len(probes[0][1])} site(s), min {len(probes[-1][1])})")
+    # PROBE SELECTION, third revision -- the first two were each wrong for a different
+    # reason and both cost a run.
+    #   v1 ranked by FEWEST overlay call sites (to minimise base candidates per hit).
+    #      Backwards: fewest sites = the RAREST call. 367 hits, none from the overlay.
+    #   v2 ranked by MOST overlay call sites. Better signal, but the most-called DOL
+    #      helpers are exactly the ones the DOL ITSELF calls constantly, so every armed
+    #      breakpoint fires continuously on DOL-internal traffic. Each stop costs a
+    #      resync, and with 40 armed the interpreter slowed to 3.0 s of EMULATED time in
+    #      ~300 s of wall clock -- 0.010x, versus 0.0328x unimpeded. The breakpoints
+    #      were the bottleneck, not the interpreter.
+    #   v3 (this): score = overlay call sites / (1 + DOL internal callers). Wanted:
+    #      called OFTEN by the overlay and RARELY by the static image, so a stop is
+    #      likely to be the signal rather than noise. Both numbers are known ahead of
+    #      time -- the overlay's from its relocation table, the DOL's from its own call
+    #      graph -- so no guessing is involved.
+    dol_callers = collections.Counter()
+    for base_, blob_ in dimg.segs:
+        for off_ in range(0, len(blob_) - 3, 4):
+            w_ = struct.unpack('>I', blob_[off_:off_ + 4])[0]
+            if (w_ >> 26) != 18 or not (w_ & 1) or ((w_ >> 1) & 1):
+                continue
+            li_ = (w_ & 0x03FFFFFC) - (0x04000000 if w_ & 0x02000000 else 0)
+            dol_callers[(base_ + off_ + li_) & 0xFFFFFFFF] += 1
+    scored = sorted(sites.items(),
+                    key=lambda kv: -len(kv[1]) / (1.0 + dol_callers.get(kv[0], 0)))
+    probes = scored[:a.probe_targets]
+    print(f"[rel] arming {len(probes)} DOL targets for base recovery, ranked by "
+          f"overlay-calls / (1 + DOL-internal-callers):")
+    for t_, v_ in probes[:6]:
+        print(f"       {t_:#010x}  overlay sites={len(v_):4d}  DOL callers="
+              f"{dol_callers.get(t_, 0):4d}  score="
+              f"{len(v_) / (1.0 + dol_callers.get(t_, 0)):.1f}")
 
     osyms = O.load_map(a.map)
     dol = O.Dolphin(iso=a.iso, state=a.state, port=PORT,
@@ -174,39 +249,50 @@ def main():
                   "not a restored scene.  Overlays load only once the game reaches "
                   "the point that OSLinks them.")
 
-        # ---------------------------------------------------------- base recovery
+        # ------------------------------------------------- advance the boot, then SCAN
+        # Advancing needs periodic control, and an armed breakpoint is the only
+        # reliable way to get it (an async 0x03 break closes this stub's socket --
+        # recorded in gamecube/tools/golden_invoke_sab_psmtx.py).  But every stop
+        # costs a resync: with 40 targets armed the interpreter managed 3.0 s of
+        # EMULATED time in ~300 s wall (0.010x) against 0.0328x unimpeded.  So arm
+        # few, count fires, and do NO work per hit.
         for tgt, _ in probes:
             g.add_bp(tgt)
+        sig_off, sig = pick_signature(blob, reloc_offs)
+        if sig is None:
+            print("[base] no relocation-free signature available", file=sys.stderr)
+            sys.exit(6)
+        print(f"[base] signature: {len(sig)} bytes at +{sig_off:#x} = {sig[:16].hex()}...")
         t0 = time.time()
         tries = 0
+        interval = max(30.0, a.budget / 8.0)
+        next_scan = t0 + interval
         while base is None and time.time() - t0 < a.budget:
             try:
-                rep = g.cont(timeout=max(5.0, a.budget - (time.time() - t0)))
-            except Exception as e:
-                print(f"[base] cont failed: {type(e).__name__}: {e}")
-                break
-            pc = O.GDB.stop_pc(rep)
-            g.resync()
-            tries += 1
-            if pc not in sites:
+                g.cont(timeout=max(5.0, min(30.0, a.budget - (time.time() - t0))))
+                g.resync()
+                tries += 1
+            except Exception:
+                g.resync()
+            if time.time() < next_scan:
                 continue
-            lr = g.reg(67)                       # native_oracle_gdb.py:41 -> 67 = LR
-            if not (MEM1_LO <= lr < MEM1_HI):
-                continue
-            if any(lo <= lr < hi for lo, hi in textr):
-                continue                          # DOL-internal caller, not the overlay
-            call_pc = (lr - 4) & 0xFFFFFFFF
-            for (ssec, soff) in sites[pc]:
-                if ssec != sec:
-                    continue
-                cand = (call_pc - soff) & 0xFFFFFFFF
+            next_scan = time.time() + interval
+            for tgt, _ in probes:
+                g.del_bp(tgt)
+            el = time.time() - t0
+            print(f"[base] t+{el:.0f}s after {tries} stops — scanning MEM1 ...",
+                  flush=True)
+            for cand, hit in scan_for_base(g, sig, sig_off, 0x80100000, MEM1_HI):
                 ok, checked = confirm_base(g, rel, sec, cand, reloc_offs, blob)
-                print(f"[base] hit {pc:#010x} lr={lr:#010x} site=+{soff:#x} "
-                      f"-> candidate {cand:#010x}  confirm={'OK' if ok else 'no'} "
-                      f"({checked} windows byte-identical)")
+                print(f"[base]   signature at {hit:#010x} -> base {cand:#010x}  "
+                      f"confirm={'OK' if ok else 'no'} ({checked} windows)")
                 if ok:
                     base = cand
                     break
+            if base is None:
+                print(f"[base]   not resident yet at t+{el:.0f}s")
+                for tgt, _ in probes:
+                    g.add_bp(tgt)
         for tgt, _ in probes:
             g.del_bp(tgt)
         if base is None:

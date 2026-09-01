@@ -504,6 +504,45 @@ The three hits that did pass the DOL-TEXT filter had `lr` = `0x811fff58`, `0x811
 `pc=0x80003140` at connect, the reading is that the interpreter had not yet booted far
 enough to OSLink any overlay at all.
 
+### The LR trick is structurally wrong for tail-called helpers — replaced by a scan
+
+Base recovery originally read LR at a breakpoint on a DOL function the overlay calls,
+on the reasoning that LR points one instruction past the calling `bl`. With the probe
+ranking fixed, the probes finally fired — and every hit reported LR as a **constant
+top-of-MEM1 value**:
+
+```
+[base] hit 0x80071214 lr=0x811fff80 site=+0xbec -> candidate 0x811ff390  confirm=no
+[base] hit 0x80071214 lr=0x811fff80 site=+0xc44 -> candidate 0x811ff338  confirm=no
+[base] hit 0x80070c20 lr=0x811fff84 site=+0x348 -> candidate 0x811ffc38  confirm=no
+[base] hit 0x80022d34 lr=0x811fffa8 site=+0x350 -> candidate 0x811ffc54  confirm=no
+```
+
+Byte-identical LR across dozens of hits of the same target is not a return address —
+it is a stale value, because those helpers are entered by a **tail branch**, which does
+not write LR. The method assumes a `bl` and there is no way to tell from the stop
+whether one happened. A stale LR yields a plausible-looking candidate that never
+confirms, which is exactly the failure mode that wastes runs.
+
+**Replaced by a direct MEM1 signature scan**, which does not care how a callee was
+entered: pick a 32-byte window of the exec section that contains **no relocation site**
+(OSLink patches those in memory, so they cannot match the file) and is not a run of one
+byte, then search MEM1 for it and confirm the implied base with the existing
+byte-comparison. For `titleD` the chosen window is at `+0x2640`, has 26 distinct bytes,
+and occurs exactly **once** in the section. Scanning is also breakpoint-free, so it
+costs none of the interpreter slowdown below.
+
+### Probe selection, three revisions, two of them wrong
+
+| rev | ranked by | why it failed |
+|---|---|---|
+| v1 | **fewest** overlay call sites | fewest sites = the *rarest* call; 367 hits, none from the overlay |
+| v2 | **most** overlay call sites | the most-called DOL helpers are the ones the **DOL itself** calls constantly, so every armed breakpoint fires on internal traffic; with 40 armed the interpreter fell to **0.010x** (3.0 s emulated in ~300 s wall) versus 0.0328x unimpeded — the breakpoints, not the interpreter, were the bottleneck |
+| v3 | overlay sites ÷ (1 + DOL-internal callers) | called often by the overlay, rarely by the static image; both numbers are known ahead of time — the overlay's from its relocation table, the DOL's from its own call graph |
+
+For `titleD`, v3 picks `0x80022ecc` (12 overlay calls, 1 DOL caller) where v2 picked
+`0x80114058` (34 overlay calls but **20** DOL callers).
+
 ### The real reason, measured: the interpreter runs SAB at 0.0328x real time
 
 That last sentence was a reading, so I measured it. Dolphin's reference interpreter
