@@ -425,7 +425,30 @@
         }
         .sp-overlay-box .btn { display: block; width: 100%; margin-bottom: 10px; }
         .sp-overlay-box .btn:last-child { margin-bottom: 0; }
-    </style>
+    
+    /* [touch-targets 2026-09-01] MINIMUM 44x44 CSS px HIT AREA.
+       Measured on the device matrix at a 390x844 phone viewport: mobileMenuBtn
+       38x38, mobileStart 72x28, mobileSelect 79x28, shoulder buttons 92x40,
+       mobileCLeft 49x28 — all reachable, all under the 44px minimum that WCAG
+       2.5.5 and the Apple HIG call for, i.e. hittable but fiddly on a real
+       thumb. The controls are laid out tightly on purpose, so this enlarges
+       what the FINGER can hit without changing what the eye sees: an invisible
+       centred ::after, at least 44x44, inside each control.
+       It is a CHILD of the control, so `pointer-events:none` applied by
+       lib/capability.js's gate() still disables it — the tap-through fix is
+       not weakened. */
+    .menuBtn, #mobileStart, #mobileSelect, #mobileA, #mobileB,
+    #mobileL, #mobileR, #mobileZ, #mobileCLeft, #mobileCRight,
+    #mobileCUp, #mobileCDown, .sp-btn { position: relative; }
+    .menuBtn::after, #mobileStart::after, #mobileSelect::after,
+    #mobileA::after, #mobileB::after, #mobileL::after, #mobileR::after,
+    #mobileZ::after, #mobileCLeft::after, #mobileCRight::after,
+    #mobileCUp::after, #mobileCDown::after, .sp-btn::after {
+      content: ""; position: absolute; left: 50%; top: 50%;
+      transform: translate(-50%, -50%);
+      width: 100%; height: 100%; min-width: 44px; min-height: 44px;
+    }
+</style>
 </head>
 
 <body>
