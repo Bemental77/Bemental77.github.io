@@ -532,6 +532,36 @@ byte-comparison. For `titleD` the chosen window is at `+0x2640`, has 26 distinct
 and occurs exactly **once** in the section. Scanning is also breakpoint-free, so it
 costs none of the interpreter slowdown below.
 
+### The scan cost IS the budget — measured, and it inverted the run
+
+The first scanning build re-scanned `0x80100000..0x81800000` on an interval. Measured
+over 981 s:
+
+```
+[base] t+175s after 62 stops — scanning MEM1 ...   not resident yet
+[base] t+344s after 65 stops — scanning MEM1 ...   not resident yet
+[base] t+502s after 67 stops — scanning MEM1 ...   not resident yet
+[base] t+661s after 69 stops — scanning MEM1 ...   not resident yet
+[base] t+819s after 71 stops — scanning MEM1 ...   not resident yet
+[base] t+981s after 73 stops — scanning MEM1 ...
+```
+
+Six scans, ~160 s each = **960 of the 981 s spent scanning with the guest halted**, and
+the guest reached only **1.4 s of emulated time** (0.0016x). 23 MB at chunk `0x400` is
+~57,000 GDB round trips. Note also **62–73 stops in 981 s** — the v3 probe ranking is
+doing its job; the breakpoints were *not* the cost this time, the scan was.
+
+Two things follow, and both are now fixed: advance the boot **first** with no scanning
+at all, then scan **once**; and narrow the window — a REL is `OSAlloc`'d from the arena,
+which begins above the DOL's BSS end (`0x801de600 + 1,900,309`), so low MEM1 cannot
+contain it. The upper arena is searched first because that is where the earlier LR
+values pointed, with `--scan-chunk` raised to `0x1000` (the stub rejects a single
+`0x2000` read, so that is the ceiling).
+
+**"Not resident" is also the honest reading of those six scans**: at 1.4 s of emulated
+boot the game has not reached the point where it `OSLink`s anything. The signature was
+not missed — the overlay was not there yet.
+
 ### Probe selection, three revisions, two of them wrong
 
 | rev | ranked by | why it failed |

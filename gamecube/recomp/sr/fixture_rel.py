@@ -125,6 +125,18 @@ def scan_for_base(g, sig, sig_off, lo, hi, chunk=0x8000):
         addr += step
 
 
+def a_scan_windows(a, blob):
+    """Where to look, narrowest-first.  A REL is OSAlloc'd from the arena, which
+    begins above the DOL's BSS, so the low MEM1 region cannot contain it."""
+    bss_end = 0x801de600 + 1900309          # DOL header: BSS addr + size
+    hi = MEM1_HI
+    if a.scan_lo:
+        return [(int(a.scan_lo, 16), hi, 'user-specified')]
+    mid = 0x81000000
+    return [(mid, hi, 'upper arena — where the earlier LR values pointed'),
+            ((bss_end + 0xFFF) & ~0xFFF, mid, 'lower arena, above the DOL BSS')]
+
+
 def confirm_base(g, rel, sec, base, reloc_offs, blob, samples=24, window=32):
     """Byte-compare live memory against the shipped section at NON-relocated offsets.
 
@@ -180,6 +192,12 @@ def main():
     ap.add_argument('--max-arm', type=int, default=300)
     ap.add_argument('--max-steps', type=int, default=40000)
     ap.add_argument('--probe-targets', type=int, default=24)
+    ap.add_argument('--boot-advance', type=float, default=600.0,
+                    help='seconds to advance the boot BEFORE scanning at all')
+    ap.add_argument('--scan-chunk', type=lambda x: int(x, 0), default=0x1000,
+                    help='bytes per GDB read during the scan; the stub rejects a single '
+                         'read of 0x2000, so this stays below that')
+    ap.add_argument('--scan-lo', help='override the scan window start (hex)')
     a = ap.parse_args()
 
     disc = R.Disc(a.iso)
@@ -278,6 +296,12 @@ def main():
         # few, count fires, and do NO work per hit.
         for tgt, _ in probes:
             g.add_bp(tgt)
+        # SCAN COST IS THE BUDGET.  Scanning 0x80100000..0x81800000 at chunk 0x400 is
+        # ~57,000 GDB round trips with the guest HALTED throughout, and re-scanning on
+        # an interval spent the whole run doing it: measured 1.4 s of EMULATED time in
+        # 15 minutes of wall clock (0.0016x), i.e. the scan, not the interpreter and
+        # not the breakpoints, was the bottleneck.  So: advance the boot FIRST with no
+        # scanning at all, then scan ONCE, over a narrowed window, with big chunks.
         sig_off, sig = pick_signature(blob, reloc_offs)
         if sig is None:
             print("[base] no relocation-free signature available", file=sys.stderr)
@@ -285,36 +309,39 @@ def main():
         print(f"[base] signature: {len(sig)} bytes at +{sig_off:#x} = {sig[:16].hex()}...")
         t0 = time.time()
         tries = 0
-        interval = max(30.0, a.budget / 8.0)
-        next_scan = t0 + interval
-        while base is None and time.time() - t0 < a.budget:
+        boot = a.boot_advance
+        print(f"[base] advancing the boot for {boot:.0f}s with {len(probes)} probes "
+              f"armed and NO scanning ...", flush=True)
+        while time.time() - t0 < boot:
             try:
-                g.cont(timeout=max(5.0, min(30.0, a.budget - (time.time() - t0))))
+                g.cont(timeout=max(5.0, min(30.0, boot - (time.time() - t0))))
                 g.resync()
                 tries += 1
             except Exception:
                 g.resync()
-            if time.time() < next_scan:
-                continue
-            next_scan = time.time() + interval
-            for tgt, _ in probes:
-                g.del_bp(tgt)
-            el = time.time() - t0
-            print(f"[base] t+{el:.0f}s after {tries} stops — scanning MEM1 ...",
-                  flush=True)
-            for cand, hit in scan_for_base(g, sig, sig_off, 0x80100000, MEM1_HI):
+        for tgt, _ in probes:
+            g.del_bp(tgt)
+        print(f"[base] boot advanced: {tries} stops in {time.time() - t0:.0f}s")
+
+        # The arena RELs are allocated from starts above the DOL's BSS end, so there is
+        # no reason to search from 0x80100000.  Narrow to [bss_end, MEM1_HI) and use a
+        # big chunk: fewer, larger reads is the whole game here.
+        for lo_, hi_, why in a_scan_windows(a, blob):
+            print(f"[base] scanning {lo_:#010x}..{hi_:#010x} ({(hi_-lo_)//1024} KB, {why}) "
+                  f"chunk={a.scan_chunk:#x} ...", flush=True)
+            t1 = time.time()
+            found = False
+            for cand, hit in scan_for_base(g, sig, sig_off, lo_, hi_, chunk=a.scan_chunk):
                 ok, checked = confirm_base(g, rel, sec, cand, reloc_offs, blob)
                 print(f"[base]   signature at {hit:#010x} -> base {cand:#010x}  "
                       f"confirm={'OK' if ok else 'no'} ({checked} windows)")
                 if ok:
                     base = cand
+                    found = True
                     break
-            if base is None:
-                print(f"[base]   not resident yet at t+{el:.0f}s")
-                for tgt, _ in probes:
-                    g.add_bp(tgt)
-        for tgt, _ in probes:
-            g.del_bp(tgt)
+            print(f"[base]   window done in {time.time() - t1:.0f}s")
+            if found:
+                break
         if base is None:
             print(f"[base] NOT RECOVERED after {tries} breakpoint hits — the scene may "
                   f"not have {a.rel} resident.", file=sys.stderr)
