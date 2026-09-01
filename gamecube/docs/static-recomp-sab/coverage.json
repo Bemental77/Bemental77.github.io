@@ -1,5 +1,5 @@
 {
- "generated": "2026-09-01",
+ "generated": "2026-09-01 (updated: indirect dispatch built and measured)",
  "game": "Sonic Adventure 2 Battle (USA), GSNE8P",
  "iso": "gamecube/roms/Sonic Adventure 2 - Battle (USA).iso",
  "dol_offset_source": "read from the ISO header at 0x420 -> 0x1e700 (never hardcoded)",
@@ -220,12 +220,137 @@
   "machine_load_at_run": "6.45 (uptime 14:50, up 5 days)"
  },
  "NOT_measured": [
-  "NO performance number of any kind for the SAB static-recomp path.",
-  "NO overlay (.rel) function has been differentially verified - all bit-exactness is DOL functions.",
-  "The new x-form update load/stores (lwzux/lbzux/lhzux/lhaux/stwux/stbux/sthux/lfsux/lfdux/stfsux/stfdux) are NOT differentially verified; the 1056-vector suite does not reach them. The wasm was byte-identical, so the edit is proven ADDITIVE, not proven CORRECT.",
-  "Indirect dispatch (blrl/bctr) is DESIGNED (N64Recomp LOOKUP_FUNC) but NOT BUILT here - P1 is a policy assumption, not a measurement.",
-  "The host context-switch implementation is not built; three known mechanisms exist (Asyncify, one host thread per guest thread, JSPI) and none is chosen or measured.",
-  "Executed-code coverage under a real SAB run was not measured. All numbers here are STATIC.",
-  "OSLoadContext / SelectThread identifications are structural (adjacency + rfi + call graph + DOLSDK source shape), not signature-matched against the SDK binary."
- ]
+  "NO overlay (.rel) function has been differentially verified. Still the single largest unverified claim: overlays are 93.64% of SAB code.",
+  "The x-form update ops are NOT yet verified against an oracle \u2014 the injection harness is built and smoke-tested but the capture has not run.",
+  "Jump-table bctr targets are NOT resolved; 123 functions fault at run time if that path executes.",
+  "The host context-switch implementation is not built (Asyncify / host-thread-per-guest-thread / JSPI all remain candidates; none chosen or measured).",
+  "Performance is ONE function in Node, not a workload. No whole-game speed exists for this path.",
+  "Executed-code coverage under a real SAB run was never measured; all coverage here is STATIC."
+ ],
+ "indirect_dispatch": {
+  "status": "BUILT \u2014 sr.py --indirect, sr_indirect() in sr_driver.c",
+  "model": "runtime guest-address -> translated-function lookup; N64Recomp LOOKUP_FUNC (~/gc_refs/N64Recomp/include/recomp.h:450)",
+  "unknown_target": "FAULTS with prefix 0xE1 (sr_extern keeps 0xE0) \u2014 never falls through",
+  "measured_outer_calls": {
+   "without_indirect": {
+    "functions": 4207,
+    "functions_pct": 88.74,
+    "instrs": 279369,
+    "instrs_pct": 74.54
+   },
+   "with_indirect": {
+    "functions": 4674,
+    "functions_pct": 98.59,
+    "instrs": 372769,
+    "instrs_pct": 99.45
+   },
+   "still_blocked": 67,
+   "still_blocked_kind": "all privileged/host-boundary + 1 absolute branch"
+  },
+  "bctr_classification": {
+   "total_bctr_sites": 147,
+   "jump_table_lwzx_mtctr": 147,
+   "bctrl_sites": 0,
+   "blrl_sites": 665,
+   "blrl_functions": 354,
+   "bctr_functions": 123,
+   "both": 10,
+   "note": "ALL bctr are jump tables aiming at MID-FUNCTION switch labels, which are not dispatchable entries, so they FAULT until static table recovery exists (N64Recomp analysis.cpp:229-334). blrl targets ARE function starts and resolve."
+  },
+  "runtime_complete": {
+   "functions": 4551,
+   "functions_pct": 96.0,
+   "instrs": 307368,
+   "instrs_pct": 82.0,
+   "note": "THE NUMBER TO QUOTE. 99.45% is a TRANSLATION figure; 123 functions holding 65,401 instructions contain a jump-table bctr and fault at run time."
+  }
+ },
+ "whole_image_build": {
+  "emit": {
+   "c_bytes": 33942640,
+   "function_bodies": 4671,
+   "dispatch_cases": 4671,
+   "sr_indirect_sites": 812,
+   "sr_extern_sites": 721,
+   "skipped_functions": 70,
+   "skipped_instrs": 2054,
+   "skiplist_note": "the skip list IS the host-binding worklist (--skiplist)"
+  },
+  "link": {
+   "opt": "-O0",
+   "wasm_bytes": 21538982,
+   "md5": "c5b33b99aad50163b488b647ece420df",
+   "warnings": 3,
+   "errors": 0
+  },
+  "differentials": {
+   "leaf_1056": {
+    "result": "1056 bit-exact / 0 mismatched of 1056",
+    "md5_before_and_after": "c5b33b99aad50163b488b647ece420df"
+   },
+   "nonleaf_7": {
+    "result": "7 PASS / 0 FAIL, 3 usable:false skipped",
+    "wasm_bytes": 21540853,
+    "md5_before_and_after": "51092aa5272349e1d8a1ed7aa25aead3"
+   }
+  },
+  "v8_function_size_ceiling": {
+   "symptom": "CompileError: WebAssembly.instantiate(): size 8549242 > maximum function size 7654321",
+   "cause": "-O2 inlines the translated bodies into sr_dispatch",
+   "fix": "SR_OPT=-O0 for a whole-image build",
+   "note": "REAL SCALING CONSTRAINT \u2014 the dispatch function grows with the image, and the failure presents as a corrupt wasm rather than a size limit."
+  }
+ },
+ "performance_first_signal": {
+  "harness": "gamecube/recomp/sr/perf_fixture.mjs (matched pair, min of 7 trials)",
+  "quotable_band_guest_instrs_per_sec": "320-440 M across two runs, machine load 11-20",
+  "quotable_fixtures": [
+   "0x801113d4",
+   "0x801113f4",
+   "0x80111414",
+   "0x801115a8"
+  ],
+  "not_quotable": {
+   "fixtures": [
+    "0x8012d800",
+    "0x80131010",
+    "0x8013b170"
+   ],
+   "why": "restore control is 59-73% of the measured time; corrected figure is a small difference of two large numbers and swings up to 50% run-to-run"
+  },
+  "first_attempt_was_wrong": "contiguous [min,max] memory restore spanned 2,401,704 bytes for 84 staged bytes, cost MORE than the run, and the subtraction went negative",
+  "interpretation": "A 486 MHz Gekko cannot retire more than 486 M instr/s and in practice retires fewer, so translated code runs in the SAME ORDER as the console retire rate \u2014 on ONE function, in Node, with no system around it. NOT a whole-game speed and NOT comparable to the JIT 0.4115x wall-clock figure."
+ },
+ "overlay_differential": {
+  "status": "NOT YET ACHIEVED \u2014 still zero overlay functions differentially verified",
+  "tooling": "gamecube/recomp/sr/fixture_rel.py (base recovery) + rel_emit.py --base/--entry",
+  "base_recovery_method": "breakpoint a DOL target the overlay calls via REL24 imp->id==0 (OSLink.c:139-142 => addend is absolute); on the hit LR-4 is a live overlay address, so base = (LR-4) - site_off, byte-confirmed against live memory at non-relocated offsets",
+  "blockers_found": [
+   "gamecube/states/sab-citye-gameplay.gcs.gz is STATE_VERSION 177 (dolphin-src State.cpp:98) but the oracle is 189 (dolphin-upstream State.cpp:98); State.cpp:723 rejects a mismatch. gcs_to_dolphin_sav.py also records that a native dolphin-src build SIGSEGVs on restore.",
+   "GSNE8P.s01 COLD-BOOTS (connect pc=0x80003140 = the DOL entry point), reproducing b401f282:105.",
+   "MY OWN BUG: probe targets were ranked by FEWEST call sites (to minimise base candidates), which armed the RAREST calls; 367 breakpoint hits without one from the overlay. Now ranked by MOST call sites; ambiguity is cheap (byte-confirmed), rarity is not."
+  ],
+  "relocation_note": "shipped REL bytes are NOT what executes \u2014 OSLink Relocate() (OSLink.c:146-200) patches in place, and rel.py:147 returns raw file bytes, so the live relocated section is read back from the machine instead."
+ },
+ "xform_update_ops": {
+  "status": "reachability route CLOSED; injection harness built, oracle run pending",
+  "carriers": [
+   "0x8014c580 (lfdux x7)",
+   "0x8014c5f8 (lwzux x7)",
+   "0x8014c748 (lwzux x7)",
+   "0x8014c878 (lwzux x7)"
+  ],
+  "direct_callers": 0,
+  "capture_attempt": "0 of 4 fired \u2014 4x SKIPPED: TimeoutError",
+  "dead_code": false,
+  "data_references": {
+   "0x8014c580": 4,
+   "0x8014c5f8": 1,
+   "0x8014c748": 2,
+   "0x8014c878": 2,
+   "note": "all in DATA function-pointer tables (0x8017a258/268/458/468, 0x801dd7b4..0x801dd7cc) \u2014 live code reached through a pointer"
+  },
+  "replacement": "gamecube/recomp/sr/xform_vectors.py \u2014 inject `<insn>; blr` into scratch MEM1, sentinel LR, restore the pages; 66 vectors across 11 forms, HALF WITH A NEGATIVE INDEX because the update forms write EA back to rA and an unsigned-rB bug loads the right value while corrupting the base",
+  "offline_smoke_test": "66/66 translate, 66 EA write-backs emitted; a built slice dispatches, loads deadbeef and writes 0x81721004 back to rA"
+ }
 }
