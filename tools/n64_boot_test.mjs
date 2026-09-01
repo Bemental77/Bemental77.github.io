@@ -129,7 +129,26 @@ try {
   page.on('response', (r) => { if (r.status() >= 400) result.failedRequests.push(`${r.url()} HTTP${r.status()}`); });
 
   await page.goto(pageUrl, { waitUntil: 'networkidle2' });
-  await page.waitForFunction('!!(window.Module && Module.calledRun)', { timeout: 30000 });
+  // RUNTIME-READY GATE. This used to be `!!(window.Module && Module.calledRun)`
+  // and that is TOOLCHAIN-SPECIFIC: emscripten 6.0.2 guards `calledRun` behind
+  // `#if ASSERTIONS` and never assigns it to Module (emsdk/upstream/emscripten/
+  // src/postamble.js:117-120), so a release build emits it 0 times — verified,
+  // the shipped 3.1.67 n64wasm.js contains "calledRun" 6x and a 6.0.2 rebuild
+  // contains it 0x. Gating on it therefore TIMES OUT on a perfectly healthy
+  // core built with a modern toolchain, and reads as a silent boot failure
+  // (empty pageErrors, empty coreLog) when the emulator is in fact running.
+  // Old path is kept first so behaviour on the shipped 3.1.67 dist is unchanged.
+  await page.waitForFunction(() => {
+    if (!window.Module) return false;
+    if (Module.calledRun) return true;             // emscripten <= 5.x
+    // emscripten 6.x: onRuntimeInitialized has fired (script.js:1608 wires it to
+    // initModule, which clears rivetsData.moduleInitializing — script.js:30,:662)
+    // AND the exports this test is about to call are attached.
+    return typeof Module._runMainLoop === 'function'
+        && typeof Module._neilGetAudioWritePosition === 'function'
+        && !!(window.myApp && myApp.rivetsData
+              && myApp.rivetsData.moduleInitializing === false);
+  }, { timeout: 30000 });
   await page.evaluate(() => {
     const orig = Module._runMainLoop;
     window.__audioFrames = 0;

@@ -54,7 +54,18 @@ try {
   page.setDefaultTimeout(120000);
   page.on('pageerror', (e) => (out.pageError = String(e).slice(0, 200)));
   await page.goto(PAGE, { waitUntil: 'networkidle2' });
-  await page.waitForFunction('!!(window.Module && Module.calledRun)', { timeout: 60000 });
+  // Not `Module.calledRun`: emscripten 6.0.2 guards that behind #if ASSERTIONS
+  // and never assigns it to Module (emsdk/upstream/emscripten/src/postamble.js:
+  // 117-120), so a core rebuilt with the current emsdk exposes it 0 times and
+  // this wait would time out on a perfectly healthy build. Same fix as
+  // tools/n64_boot_test.mjs:140. Old path kept first for the shipped 3.1.67 dist.
+  await page.waitForFunction(() => {
+    if (!window.Module) return false;
+    if (Module.calledRun) return true;             // emscripten <= 5.x
+    return typeof Module._runMainLoop === 'function'
+        && !!(window.myApp && myApp.rivetsData
+              && myApp.rivetsData.moduleInitializing === false);
+  }, { timeout: 60000 });
   await page.evaluate((r) => { myApp.load_url('../roms/' + r); }, rom);
   await page.waitForFunction('myApp.rivetsData.beforeEmulatorStarted === false', { timeout: 120000 });
   await page.evaluate(() => myApp.audioContext && myApp.audioContext.resume());
