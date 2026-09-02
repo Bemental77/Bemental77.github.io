@@ -108,7 +108,25 @@ async function run(jit) {
   await page.goto(`http://localhost:8080/n64/?game=${rom}&autostart${jit ? '&jit=' + JIT_MODE : ''}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction('window.myApp && myApp.rivetsData.beforeEmulatorStarted === false', { timeout: 180000 });
 
-  const vi = () => page.evaluate(() => Module._neil_vi_total() >>> 0);
+  // A CDP evaluate runs ON the page's main thread, which is exactly the thread
+  // a slow or wedged emulator is monopolising — so `vi()` can expire even at
+  // protocolTimeout 600 s. It used to be unprotected, and the ProtocolError
+  // killed the whole harness: gauntletLegends.z64 produced a stack trace
+  // instead of a verdict, which n64/docs/jit/TASKS.md logged as "a THIRD
+  // failure mode, not an answer". Now the timeout IS an answer — it is
+  // recorded, and the stall detector below still gets to speak.
+  // The read is also BOUNDED at 20 s rather than left to protocolTimeout:
+  // waiting out 600 s per probe would make "how long has the main thread been
+  // blocked?" unmeasurable, because two failures would already be 20 minutes.
+  let cdpTimeouts = 0, cdpBlockedSince = null;
+  const bounded = (pr, ms, dflt) =>
+    Promise.race([pr.catch(() => dflt), new Promise((r) => setTimeout(() => r(dflt), ms))]);
+  const vi = async () => {
+    const v = await bounded(page.evaluate(() => Module._neil_vi_total() >>> 0), 20000, null);
+    if (v === null) { cdpTimeouts++; if (cdpBlockedSince === null) cdpBlockedSince = Date.now(); }
+    else cdpBlockedSince = null;
+    return v;
+  };
   const sched = schedule(WARMUP_VI + WINDOW_VI);
   let si = 0, held = new Set();
   let last = -1, stalled = Date.now();
@@ -116,6 +134,19 @@ async function run(jit) {
   const target = WARMUP_VI + WINDOW_VI;
   for (;;) {
     const n = await vi();
+    if (n === null) {
+      // no reading: the main thread never yielded. That is its own outcome and
+      // is NOT the same as "VI stalled" (which means the page answered and the
+      // counter had not moved).
+      if (Date.now() - cdpBlockedSince > 300000) {
+        arm.error = `MAIN THREAD BLOCKED: no CDP response for ${Math.round((Date.now() - cdpBlockedSince) / 1000)}s after VI ${last} (${cdpTimeouts} protocol timeouts)`;
+        break;
+      }
+      // a REJECTED (rather than timed-out) evaluate returns instantly, so pace
+      // the retry or this becomes a busy spin for the whole 300 s window
+      await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
     if (n !== last) { last = n; stalled = Date.now(); }
     else if (Date.now() - stalled > 60000) { arm.error = `VI stalled at ${n}`; break; }
     while (si < sched.length && sched[si][0] <= n) {
@@ -127,7 +158,7 @@ async function run(jit) {
       measuring = true;
       arm.viAtMeasureStart = n;
       arm.shotWarm = await (await page.$('#canvas')).screenshot().catch(() => null);
-      await page.evaluate(() => { Module._neil_frame_cost_reset(); window.__t0 = performance.now(); });
+      await page.evaluate(() => { Module._neil_frame_cost_reset(); window.__t0 = performance.now(); }).catch(() => {});
       cpu0 = treeCpuSeconds(browser.process()?.pid); t0 = Date.now();
     }
     if (n >= target) break;
@@ -142,11 +173,14 @@ async function run(jit) {
   const cpu1 = treeCpuSeconds(browser.process()?.pid);
   // if the run stalled before the measure window opened there is no baseline
   // to subtract -- report nothing rather than a number derived from NaN
+  // every post-loop evaluate is .catch()ed for the same reason as vi(): a
+  // blocked main thread must degrade the REPORT, not destroy it
   const m = measuring
-    ? await page.evaluate(() => ({ ms: Module._neil_frame_cost_ms(), n: Module._neil_frame_cost_n(), el: (performance.now() - window.__t0) / 1000 }))
+    ? await bounded(page.evaluate(() => ({ ms: Module._neil_frame_cost_ms(), n: Module._neil_frame_cost_n(), el: (performance.now() - window.__t0) / 1000 })), 30000, { ms: 0, n: 0, el: 0 })
     : { ms: 0, n: 0, el: 0 };
+  arm.cdpTimeouts = cdpTimeouts;
   arm.viEnd = await vi();
-  arm.stats = jit ? await page.evaluate(() => (window.__jitStats ? window.__jitStats() : null)) : null;
+  arm.stats = jit ? await bounded(page.evaluate(() => (window.__jitStats ? window.__jitStats() : null)), 30000, null) : null;
   fs.mkdirSync('/tmp/n64-ab', { recursive: true });
   const shotPath = `/tmp/n64-ab/${rom.replace(/\.z64$/, '')}-${arm.arm}.png`;
   const shot = await (await page.$('#canvas')).screenshot({ path: shotPath }).catch(() => null);

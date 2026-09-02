@@ -135,20 +135,44 @@ compile error under the wasm flags).
     revision can be tested directly. Run this BEFORE burning a probe.
   - `tools/n64_jit_diff_test.mjs <rom> [frames] [jitMode]` — the oracle:
     per-VI architectural checksum, interpreter vs ?jit, with a mandatory
-    two-interpreter determinism control.
+    two-interpreter determinism control. **A ROM too slow to reach `frames`
+    inside the wait no longer throws** (2026-09-02): the expiry is caught and
+    reported as `SLOW` / `WEDGED` / `NO CDP RESPONSE` by sampling
+    `_neil_vi_total()` twice 5 s apart, and a truncated stream reads
+    `INCOMPLETE`, never `PASS`. `N64_DIFF_TIMEOUT_MS` (default 180000) raises
+    the wait; `N64_EXTRA_QS` appends query params to BOTH arms.
+    **Lower `frames` before you assume a slow ROM is a wedge** — conker.z64 read
+    as a wedge for a whole session and is a divergence at frame 82, which
+    `conker.z64 300` shows in two minutes.
   - `tools/n64_jit_census.mjs <rom> [warmupVI] [windowVI]` — runtime
     fallback ranking in a driven gameplay window. A COUNTING arm, so its
     numbers survive a loaded machine when no timing number does.
+  - **The SPAN BISECT — use this before any class ablation.** Two temporary
+    hooks in `n64/index.html`'s `jitCompile` (add, use, REMOVE): `?jitonly=`
+    a comma-separated list of span vaddrs compiles ONLY those, and `?jitspan=N`
+    truncates a span to its first N instructions (legal: the block's
+    fall-through exit already sets `PC = entryPtr + span*stride`). Feed either
+    through `N64_EXTRA_QS` and binary-search on `firstDivergenceInCommonPrefix`.
+    On 2026-09-02 this took superMarioStarRoad from "somewhere in the emitter"
+    to ONE block and ONE instruction in 5 rounds, and conker to the same in 15.
+    **It is strictly better than the `?noemit=<class>` ablation**, which on
+    superMarioStarRoad named the wrong construct: a class ablation tells you
+    which SWITCH silences a bug, not which code is wrong, and it changes how
+    much code the run explores (33 blocks vs 584) so its arms are not
+    comparable. The span bisect changes ONE variable and ends at `blocks: 1`.
   - `bash tools/probe_lock.sh run -- bash tools/n64_jit_sweep.sh [frames]` —
     the full-library gate: the differential above over EVERY ROM in
     `n64/N64Wasm/roms/`, one TSV row each (verdicts, emission stats, and the
     load + `CPU_Speed_Limit` that row was taken under) at
     `/tmp/n64-jit-sweep/summary.tsv`. This is the gate `a5efb66` set before the
     `?jit` default can flip, and it exits nonzero unless every ROM is
-    PASS/PASS. A `NOJSON` row is a harness TIMEOUT, not a divergence — the
-    `threw@lineNN` column says which arm (`:59`/`:60` interpreter, `:61` jit),
-    and a `:61` throw is confounded because the jit arm is also the THIRD run
-    in the same browser. Run the mode ladder before hypothesising.
+    PASS/PASS. **Since 2026-09-02 a timeout no longer produces `NOJSON`** — the
+    row reads `INCOMPLETE` with a `liveness` column (SLOW / WEDGED / NO CDP
+    RESPONSE) and a `firstDiff` column giving any divergence inside the frames
+    both arms DID reach. `NOJSON` now means the harness threw for some other
+    reason, usually a boot failure. Note the jit arm is also the THIRD run in
+    the same browser, so it is confounded on any resource-exhaustion failure;
+    the ladder's `wrap` rung is the control for that.
   - `tools/n64_gameplay_ab.mjs <rom> [ab|ba] [warmupVI] [windowVI]` —
     interpreter vs ?jit over the SAME guest window. Unlike
     `tools/_jit_speed_ab.mjs` it counts the window in VI FRAMES rather than

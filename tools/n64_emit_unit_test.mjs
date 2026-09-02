@@ -64,7 +64,7 @@ const I = (op, rs, rt, imm) => ((op << 26) | (rs << 21) | (rt << 16) | (imm & 0x
 const R = (rs, rt, rd, sa, fn) => ((rs << 21) | (rt << 16) | (rd << 11) | (sa << 6) | fn) >>> 0;
 const OR = (rd, rs, rt) => R(rs, rt, rd, 0, 0x25);
 const OPC = { LB: 0x20, LH: 0x21, LW: 0x23, LBU: 0x24, LHU: 0x25, LWU: 0x27, LD: 0x37,
-              SB: 0x28, SH: 0x29, SW: 0x2b, SD: 0x3f, ADDIU: 0x09, BEQ: 0x04, BNE: 0x05, BNEL: 0x15 };
+              SB: 0x28, SH: 0x29, SW: 0x2b, SD: 0x3f, ADDIU: 0x09, LUI: 0x0f, BEQ: 0x04, BNE: 0x05, BNEL: 0x15 };
 const MFC1 = (rt, fs) => ((0x11 << 26) | (0x00 << 21) | (rt << 16) | (fs << 11)) >>> 0;
 const MFC0 = (rt, rd) => ((0x10 << 26) | (0x00 << 21) | (rt << 16) | (rd << 11)) >>> 0;
 const MTC0 = (rt, rd) => ((0x10 << 26) | (0x04 << 21) | (rt << 16) | (rd << 11)) >>> 0;
@@ -86,6 +86,20 @@ const CC = { F: 0x0, UN: 0x1, EQ: 0x2, UEQ: 0x3, OLT: 0x4, ULT: 0x5, OLE: 0x6, U
              SF: 0x8, NGLE: 0x9, SEQ: 0xa, NGL: 0xb, LT: 0xc, NGE: 0xd, LE: 0xe, NGT: 0xf };
 // BC1: which = (word >> 16) & 3 -> 0 BC1F, 1 BC1T, 2 BC1FL, 3 BC1TL
 const BC1 = (which, imm) => ((0x11 << 26) | (0x08 << 21) | (which << 16) | (imm & 0xffff)) >>> 0;
+// r0-destination family (2026-09-02). MULT/DIV/MTHI all encode rd = 0, which
+// is why the emitter's guard is keyed on the OPCODE's destination, not on the
+// rd field — see SPECIAL_RD_NOP in mips_emit.js.
+const SLL = (rd, rt, sa) => R(0, rt, rd, sa, 0x00);
+const MULT = (rs, rt) => R(rs, rt, 0, 0, 0x18);
+const DIV = (rs, rt) => R(rs, rt, 0, 0, 0x1a);
+const MTHI = (rs) => R(rs, 0, 0, 0, 0x11);
+const MFHI = (rd) => R(0, 0, rd, 0, 0x10);
+const MFLO = (rd) => R(0, 0, rd, 0, 0x12);
+const JALR = (rd, rs) => R(rs, 0, rd, 0, 0x09);
+const MTC1 = (rt, fs) => ((0x11 << 26) | (0x04 << 21) | (rt << 16) | (fs << 11)) >>> 0;
+// J whose target leaves the synthetic block (blockStart 0x80100000) -> the
+// _OUT variant, i.e. jump_to_address + jump_to_func
+const JOUT = (target) => ((0x02 << 26) | ((target >>> 2) & 0x3ffffff)) >>> 0;
 
 function makeWorld(words, opts = {}) {
   const mem = new WebAssembly.Memory({ initial: 1024 });          // 64 MB
@@ -522,6 +536,116 @@ const tests = [
   T('TRUNC.W.S in a branch delay slot', [I(OPC.BEQ, 4, 5, 2), C1(FMT.S, 1, 2, FN.TRUNC_W), OR(10, 8, 0), 0],
     { regs: { 4: '0x1', 5: '0x1' }, fprF32: { 1: -2.5 },
       expectFprI32: { 2: '0xfffffffe' }, expectStats: { fallbackOps: 0 } }),
+
+  // ---- recomp.c's RNOP rewrite: a DESTINATION of r0 is a whole-instruction
+  // NOP (2026-09-02, superMarioStarRoad.z64 divergence at VI frame 24) ----
+  //
+  // recomp.c ends most of its emitters with `if (dst->f.i.rt == reg) RNOP()`
+  // / `if (dst->f.r.rd == reg) RNOP()`, and `reg` is `&reg[0]`
+  // (recomp.c:99-117), so the test is "destination is r0". RNOP sets
+  // `dst->ops = NOP` (recomp.c:137-141): no arithmetic, no memory access, no
+  // write to reg[0]. The emitter used to write reg[0] anyway, and reg[0] is
+  // in the differential checksum.
+  //
+  // reg[0] is SEEDED with a sentinel in each case so "untouched" is proven
+  // rather than coinciding with wasm's zero-init. Reading $zero still reads
+  // that sentinel, which is faithful: this core has a real reg[0] cell.
+  T('ADDIU into $zero is a NOP (the superMarioStarRoad word 0x24000101)',
+    [0x24000101 >>> 0, 0],
+    { regs: { 0: '0x5a5a' }, expectRegs: { 0: '0x5a5a' } }),
+  T('ADDIU into $zero in a J_OUT delay slot (the exact ROM shape)',
+    [JOUT(0x80200000), 0x24000101 >>> 0, I(OPC.ADDIU, 0, 11, 1), 0],
+    { regs: { 0: '0x5a5a' }, expectRegs: { 0: '0x5a5a', 11: '0x0' },
+      expectStats: { nativeBranches: 1, fallbackOps: 0 } }),
+  T('ADDIU into $zero in a BEQ delay slot', [I(OPC.BEQ, 4, 5, 2), 0x24000101 >>> 0, OR(10, 8, 0), 0],
+    { regs: { 0: '0x5a5a', 4: '0x1', 5: '0x1' }, expectRegs: { 0: '0x5a5a' } }),
+  T('LUI into $zero is a NOP', [I(OPC.LUI, 0, 0, 0x8034), 0],
+    { regs: { 0: '0x5a5a' }, expectRegs: { 0: '0x5a5a' } }),
+  T('SLL into $zero is a NOP', [SLL(0, 8, 3), 0],
+    { regs: { 0: '0x5a5a', 8: '0xff' }, expectRegs: { 0: '0x5a5a' } }),
+  T('OR into $zero is a NOP', [OR(0, 8, 9), 0],
+    { regs: { 0: '0x5a5a', 8: V, 9: V }, expectRegs: { 0: '0x5a5a' } }),
+  T('SLTU into $zero is a NOP', [R(8, 9, 0, 0, 0x2b), 0],
+    { regs: { 0: '0x5a5a', 8: '0x1', 9: '0x2' }, expectRegs: { 0: '0x5a5a' } }),
+  // a load into r0 must not even PERFORM THE ACCESS (RLW recomp.c:1979-1985)
+  T('LW into $zero is a NOP (fast arm)', [I(OPC.LW, 4, 0, 0x18), 0],
+    { regs: { 0: '0x5a5a', 4: HIT_ADDR }, dram: { 0x100018: 0xcafebabe },
+      opts: { rdramHit: true }, expectRegs: { 0: '0x5a5a' } }),
+  T('LD into $zero is a NOP (fast arm)', [I(OPC.LD, 4, 0, 0x20), 0],
+    { regs: { 0: '0x5a5a', 4: HIT_ADDR }, dram: { 0x100020: 0xdeadbeef, 0x100024: 0x12345678 },
+      opts: { rdramHit: true }, expectRegs: { 0: '0x5a5a' } }),
+  T('MFHI into $zero is a NOP', [MTHI(8), MFHI(0), 0],
+    { regs: { 0: '0x5a5a', 8: V }, expectRegs: { 0: '0x5a5a' } }),
+  T('MFC0 into $zero is a NOP', [MFC0(0, 12), 0],
+    { regs: { 0: '0x5a5a' }, opts: { cp0: { 12: 0x12345678 } }, expectRegs: { 0: '0x5a5a' } }),
+  // RMFC1 (recomp.c:1530-1537) applies the guard, so a CU1 check never runs
+  // either — the whole instruction is gone
+  T('MFC1 into $zero is a NOP, even with CU1 clear', [MFC1(0, 1), I(OPC.ADDIU, 8, 9, 1), 0],
+    { regs: { 0: '0x5a5a', 8: '0x1' }, fprI32: { 1: 0x11223344 }, opts: { cu1: false },
+      expectRegs: { 0: '0x5a5a', 9: '0x2' } }),
+  // DECLARE_JUMP writes the link only `if (link_register != &reg[0])`
+  // (cached_interp.c:78-81); JALR's link register is &rrd, so rd=0 links nothing
+  T('JALR $zero, $rs jumps but links nothing', [JALR(0, 8), 0, 0, 0],
+    { regs: { 0: '0x5a5a', 8: '0x80100010' }, expectRegs: { 0: '0x5a5a' },
+      expectStats: { nativeBranches: 1 } }),
+
+  // ---- negative controls for the SAME fix: r0 as a SOURCE, and the ops
+  // recomp.c deliberately does NOT guard. These are the cases an over-broad
+  // "suppress anything mentioning r0" fix would break — note MULT/DIV/MTHI
+  // all encode rd = 0, so a guard keyed on the rd FIELD rather than on the
+  // opcode's actual destination would silently delete them.
+  T('control: MTHI/MFHI still move hi (MTHI encodes rd=0, unguarded)', [MTHI(8), MFHI(9), 0],
+    { regs: { 8: V }, expectRegs: { 9: V } }),
+  T('control: MULT still writes hi/lo (encodes rd=0, unguarded)', [MULT(8, 9), MFLO(10), MFHI(11), 0],
+    { regs: { 8: '0x3', 9: '0x5' }, expectRegs: { 10: '0xf', 11: '0x0' } }),
+  T('control: DIV still writes lo (encodes rd=0, unguarded)', [DIV(8, 9), MFLO(10), 0],
+    { regs: { 8: '0x11', 9: '0x3' }, expectRegs: { 10: '0x5' } }),
+  T('control: SW reads $zero as a SOURCE and still stores', [I(OPC.SW, 4, 0, 0x18), 0],
+    { regs: { 0: '0x5a5a', 4: HIT_ADDR }, opts: { rdramHit: true },
+      expectDram: { 0x100018: '0x5a5a' } }),
+  T('control: ADDIU from $zero still writes its destination', [I(OPC.ADDIU, 0, 9, 5), 0],
+    { regs: { 0: '0x0' }, expectRegs: { 9: '0x5' } }),
+  T('control: JALR $ra, $rs still links', [JALR(31, 8), 0, 0, 0],
+    // the link is SE32(PC->addr + 8) (cached_interp.c:80), so it sign-extends
+    { regs: { 8: '0x80100010' }, expectRegs: { 31: '0xffffffff80100008' },
+      expectStats: { nativeBranches: 1 } }),
+  T('control: MTC1 from $zero still writes the FPR', [MTC1(0, 1), 0],
+    { regs: { 0: '0x5a5a' }, expectFprI32: { 1: '0x5a5a' } }),
+
+  // ---- join contract, THIRD instance: a LOAD's slow arm (2026-09-02,
+  // conker.z64 diverged at VI frame 82) ----
+  //
+  // emitLoad's fast arm ends with C.writeFromStack(rt), marking rt dirty;
+  // slowArm's C.flushSnapshot() then stored that local on the SLOW arm, where
+  // it is never assigned — zeroing reg[rt] and only THEN calling the
+  // interpreter op. The old comment called it benign "because the op rewrites
+  // rt anyway"; it does not when the op faults (TLB/MMIO), when ops is
+  // NOTCOMPILED, or when rt is r0.
+  //
+  // The stub op in this harness only advances PC and writes NO register, so it
+  // models exactly that case. reg[rt] must come out untouched.
+  T('LW slow arm must not clobber rt when the interp op writes nothing',
+    [I(OPC.LW, 4, 9, 0x18), 0],
+    { regs: { 4: SLOW_ADDR, 9: V }, expectRegs: { 9: V } }),
+  T('LD slow arm must not clobber rt when the interp op writes nothing',
+    [I(OPC.LD, 4, 9, 0x18), 0],
+    { regs: { 4: SLOW_ADDR, 9: V }, expectRegs: { 9: V } }),
+  T('LBU slow arm must not clobber rt when the interp op writes nothing',
+    [I(OPC.LBU, 4, 9, 0x18), 0],
+    { regs: { 4: SLOW_ADDR, 9: V }, expectRegs: { 9: V } }),
+  // the delay-slot form takes slowArm's OTHER branch (hand the whole branch
+  // back and exit), which flushed the same unassigned local
+  T('LW slow arm in a delay slot must not clobber rt',
+    [I(OPC.BEQ, 5, 6, 2), I(OPC.LW, 4, 9, 0x18), OR(10, 8, 0), 0],
+    { regs: { 4: SLOW_ADDR, 5: '0x1', 6: '0x1', 9: V }, expectRegs: { 9: V } }),
+  // controls: the value ALREADY dirty on entry must still be flushed for the
+  // interp op to read, and rs==rt must still compute the address from rs
+  T('control: LW slow arm still flushes a register dirtied EARLIER in the block',
+    [I(OPC.ADDIU, 9, 9, 1), I(OPC.LW, 4, 8, 0x18), 0],
+    { regs: { 4: SLOW_ADDR, 9: '0x10' }, expectRegs: { 9: '0x11' } }),
+  T('control: LW slow arm, rs==rt keeps the address register',
+    [I(OPC.LW, 8, 8, 0x18), 0],
+    { regs: { 8: SLOW_ADDR }, expectRegs: { 8: SLOW_ADDR } }),
 ];
 
 let fail = 0;

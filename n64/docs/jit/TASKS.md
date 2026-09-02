@@ -777,7 +777,129 @@ return;`) until all three below are resolved.** The sweep earned its keep: two
 of the three are problems no per-wave gate in this campaign would ever have
 found, because both ROMs are outside the reference trio.
 
-### (1) `superMarioStarRoad.z64` — DIVERGED at frame 24. PRE-EXISTING.
+> **STATUS 2026-09-02 (later the same day).** (1) is **FIXED** — and the cause
+> was NOT the construct the ablation named. (2) and (3) are **STILL OPEN** and
+> both are now correctly CLASSIFIED where they were previously mis-classified:
+> conker is a **divergence**, not a throughput pathology; gauntletLegends is a
+> **wedge**, not conker's slowness. Two harness bugs that were producing those
+> mis-classifications are fixed. **The `?jit` default therefore STAYS OFF.**
+> Read each subsection below — the ✅/OPEN header states which.
+
+## Sweep RE-RUN after the fixes (2026-09-02) — **25 of 27 PASS/PASS**
+
+`bash tools/probe_lock.sh run -- bash tools/n64_jit_sweep.sh`, 600 VI per ROM,
+on the fixed emitter (`mips_emit.js` mtime 17:31) and the fixed harness (18:29),
+both settled before the first row at 18:31 — one rig, no mid-run edits.
+**`CPU_Speed_Limit` 100 on every single row**, 1-minute load **2.57-5.14**. The
+determinism control PASSED on all 27, `emitFails` is 0 on all 27, and `fcr31` is
+nonzero on all 25 that reported stats. **Exit status 1 — the gate is NOT clean
+and the `?jit` default stays off.**
+
+        rom                     det   jit                                      firstDiff  liveness                                           blocks  fallbackOps  emitFails  nullOpsRejects  load  limit
+        Banjo-Dreamie.z64       PASS  PASS                                     -1         -                                                  2063    524          0          93              4.59  100/100
+        banjo-tooie.z64         PASS  PASS                                     -1         -                                                  5215    8859         0          187             4.12  100/100
+        banjoChristmas.z64      PASS  PASS                                     -1         -                                                  2062    524          0          93              4.35  100/100
+        bk-jiggiesoftime.z64    PASS  PASS                                     -1         -                                                  2063    524          0          93              5.14  100/100
+        blitz2001.z64           PASS  PASS                                     -1         -                                                  1025    300          0          26              4.66  100/100
+        clayFighter.z64         PASS  PASS                                     -1         -                                                  772     137          0          33              4.73  100/100
+        conker.z64              PASS  INCOMPLETE (jit reached 454/600)         82         jit:SLOW (VI advanced 437->452 in 5s = 3.00 VI/s)  989     368          0          68              4.48  100/100
+        crusin.z64              PASS  PASS                                     -1         -                                                  460     290          0          25              3.79  100/100
+        diddyKongRacing.z64     PASS  PASS                                     -1         -                                                  828     802          0          72              4.58  100/100
+        dinosaurplanet.z64      PASS  PASS                                     -1         -                                                  881     543          0          81              4.04  100/100
+        dk64.z64                PASS  PASS                                     -1         -                                                  1216    839          0          95              4.01  100/100
+        flyingDragon.z64        PASS  PASS                                     -1         -                                                  507     189          0          33              3.49  100/100
+        gauntletLegends.z64     PASS  INCOMPLETE (jit reached UNREADABLE/600)  -1         jit:NO CDP RESPONSE (main thread never yielded)    -       -            -          -               3.41  100/100
+        mariokart.z64           PASS  PASS                                     -1         -                                                  475     234          0          34              5.06  100/100
+        marioo.z64              PASS  PASS                                     -1         -                                                  581     194          0          36              5.09  100/100
+        mariopartynew.z64       PASS  PASS                                     -1         -                                                  739     170          0          22              4.24  100/100
+        newTetris.z64           PASS  PASS                                     -1         -                                                  377     255          0          28              3.33  100/100
+        oot.z64                 PASS  PASS                                     -1         -                                                  1487    673          0          102             4.07  100/100
+        papermario.z64          PASS  PASS                                     -1         -                                                  658     1350         0          27              3.60  100/100
+        pkmnsnap.z64            PASS  PASS                                     -1         -                                                  705     350          0          42              3.45  100/100
+        podracer.z64            PASS  PASS                                     -1         -                                                  472     264          0          34              3.42  100/100
+        sm64.z64                PASS  PASS                                     -1         -                                                  851     508          0          58              3.54  100/100
+        starfox.z64             PASS  PASS                                     -1         -                                                  470     263          0          35              3.23  100/100
+        starfoxsurvival.z64     PASS  PASS                                     -1         -                                                  1119    394          0          61              2.57  100/100
+        superMarioStarRoad.z64  PASS  PASS                                     -1         -                                                  584     194          0          38              3.57  100/100
+        thewheel.z64            PASS  PASS                                     -1         -                                                  1290    214          0          48              2.68  100/100
+        zeldaMasterOfTime.z64   PASS  PASS                                     -1         -                                                  1475    660          0          91              3.27  100/100
+
+superMarioStarRoad moved DIVERGED@24 -> PASS. The two remaining rows are the
+ones the old rig could not describe at all: both used to be a bare `NOJSON`,
+and both now carry their own diagnosis in the row —
+**conker is SLOW *and* WRONG (`firstDiff 82`)**, gauntletLegends is a **WEDGE**
+(`NO CDP RESPONSE`, and `UNREADABLE` rather than a fake `0` frame count).
+That is the whole value of the harness fix: the sweep row now says which of the
+three failure modes it is.
+
+### (1) `superMarioStarRoad.z64` — ✅ FIXED 2026-09-02. It was NOT the _OUT tail.
+
+**RESOLVED. `node tools/n64_jit_diff_test.mjs superMarioStarRoad.z64 600` now
+reports `determinismControl: PASS` / `jitVsInterp: PASS`, 584 blocks, 194
+fallbackOps, 0 emitFails** (load 6.28 -> 3.91, `CPU_Speed_Limit` 100 before and
+after). Read the cause before the historical evidence below — **the localisation
+recorded there pointed at the wrong construct, and the reason it did is the
+lesson.**
+
+**ROOT CAUSE: `recomp.c` rewrites an instruction whose DESTINATION IS r0 into a
+plain NOP, and the emitter emitted it anyway.** Most recomp.c emitters end with
+`if (dst->f.i.rt == reg) RNOP();` / `if (dst->f.r.rd == reg) RNOP();` — `reg` is
+the global `int64_t reg[32]` and `recompile_standard_{i,r}_type` binds
+`f.i.rt = reg + rt` (recomp.c:99-117), so the test is exactly "destination is
+r0". `RNOP()` sets `dst->ops = NOP` (recomp.c:137-141): no arithmetic, **no
+memory access**, and no write to reg[0]. `mips_emit.js`'s header asserted the
+blanket opposite ("this core's interpreter WRITES reg[0] for ops whose
+destination is r0"), which is true only of the ops recomp.c does NOT guard —
+MTHI/MTLO/MULT/MULTU/DIV/DIVU (destination hi/lo), MTC1/DMTC1 (destination an
+FPR), and every store (no destination). `grep -c "== *reg) RNOP()" recomp.c`
+returns **58** — that is how many emitters carry the guard.
+
+**HOW IT WAS LOCALISED — a per-span bisect, which removed the confound the
+older note below flags.** A temporary `?jitonly=<vaddr,...>` hook (added, used
+and REMOVED; `n64/index.html` is byte-identical to `2877e30f`) compiles ONLY the
+listed spans. Bisecting the 32 spans this ROM offers in 30 frames converged in
+5 rounds on **one block, `0x802ca6d0`, compiled ALONE — `blocks: 1`,
+`DIVERGED at frame 24`.** Its 6 instructions:
+
+        802ca6d0 lui   $t2, 0x8034
+        802ca6d4 lw    $t3, -0x4d70($t2)
+        802ca6d8 addiu $t3, $t3, 1
+        802ca6dc sw    $t3, -0x4d70($t2)
+        802ca6e0 j     0x80327b98
+        802ca6e4 addiu $zero, $zero, 0x101   <- DELAY SLOT, word 0x24000101
+
+`RADDIU` (recomp.c:1770-1775) turns that delay slot into NOP. Runtime
+confirmation, not inference: the live `precomp_instr.ops` array dumped for this
+span reads `[2938, 2913, 2932, 2918, 2968, 3144, 3148, 3148]` — index 5 (the
+`addiu $zero`) binds table index **3144**, a DIFFERENT op from index 2's
+ordinary `addiu $t3, $t3, 1` (**2932**). The emitter computed `reg[0] + 0x101`
+and stored `0x101` into reg[0]; the core stores nothing; reg[0] is in the
+differential checksum.
+
+**WHY THE OLD ABLATION SAID "_OUT tail".** Disabling `_OUT` emission made the
+`j` fall back, and the interpreter then executed the delay slot itself — so the
+symptom vanished for a reason that had nothing to do with `emitOutJumpTail`.
+A class ablation tells you which SWITCH silences a bug, not which code is wrong;
+only the single-block + single-instruction bisect separated those.
+
+**FIX** (`mips_emit.js`): `SPECIAL_RD_NOP` / `ITYPE_RT_NOP` mirror recomp.c's
+guarded set exactly, and `emitAlu`, `emitLoad`, `emitCop0` (MFC0) and `emitCop1`
+(MFC1/DMFC1) emit NOTHING when the destination is r0. Two deliberate
+non-generalisations, both load-bearing: **MULT/DIV/MTHI all encode `rd = 0`**, so
+the guard is keyed on the opcode's real destination and not on the rd FIELD (a
+field-keyed guard would silently delete them — the unit corpus has a control for
+each); and a load into r0 must not even perform the ACCESS, which is why
+`emitLoad` returns before touching the dispatch table. `JALR $zero, $rs` is the
+same class from a different direction — `DECLARE_JUMP` writes the link only
+`if (link_register != &reg[0])` (cached_interp.c:78-81) — and is fixed too.
+
+**GATES**: unit corpus **76 -> 96 -> 102 cases**, all green; run against
+`git show HEAD:...mips_emit.js`, **13 of the 20 r0 cases FAIL** and every
+pre-existing case still passes. Differential PASS with determinism control PASS
+on superMarioStarRoad (600 VI), mariokart (600 VI, 475 blocks) and oot (600 VI,
+1487 blocks), 0 emitFails on all three.
+
+<details><summary>Original 2026-09-02 localisation, kept for the record — its verdict was wrong</summary>
 
 The first true correctness divergence this campaign has recorded. Localised in
 six runs and **NOT caused by wave 11b** — every step is a measurement:
@@ -814,7 +936,104 @@ six runs and **NOT caused by wave 11b** — every step is a measurement:
   not been positively excluded. The next step is to dump the _OUT branch sites
   in those 33 blocks and diff one against the interpreter.
 
-### (2) `conker.z64` — NOT a wedge: **70x SLOWER** under `?jit`
+  ⚠ That caveat was RIGHT to be stated and the "most likely reading" was right
+  too — 33 blocks is a consequence of diverging early, and the fixed emitter now
+  compiles 584 on this ROM. But the verdict the ablation reached ("_OUT tail")
+  was still wrong, for the reason given above.
+</details>
+
+### (2) `conker.z64` — NOT 70x slow: it **DIVERGES at frame 82**. STILL OPEN.
+
+**THE "THROUGHPUT PATHOLOGY" READING BELOW IS WRONG AND IS CORRECTED HERE
+(2026-09-02). conker is a CORRECTNESS DIVERGENCE; the 70x is its symptom.** The
+180 s wait hid it: at 600 VI the jit arm timed out before any comparison
+happened. Run it at a frame count the arm can actually reach and the oracle
+speaks:
+
+        node tools/n64_jit_diff_test.mjs conker.z64  60   ->  det PASS, jit PASS
+        node tools/n64_jit_diff_test.mjs conker.z64 300   ->  det PASS, jit DIVERGED at frame 82
+
+**Localised to ONE block and ONE instruction index**, by the same two bisects
+that solved superMarioStarRoad (temporary `?jitonly=` / `?jitspan=` hooks, both
+REMOVED; `n64/index.html` is byte-identical to `2877e30f`):
+
+- span bisect over the 928 spans conker offers in 100 frames, 15 rounds:
+  **`0x10014000` alone — `blocks: 1`, `DIVERGED at frame 82`.** That page is
+  **TLB-MAPPED** (vaddr < 0x80000000), which no ROM in the reference trio is.
+- truncating that block's span (`?jitspan=N`) and walking N down, **twice, on
+  two different emitter revisions**: `span<=18 .. span<=8` all diverge at 82,
+  `span<=7` is CLEAN. Index 7 is the block's first branch,
+  `beq $zero,$zero,+3` at `0x1001401c`. Control: every truncated span 6/7/8/9
+  compiles and instantiates in the offline rig (`blocks:1, fails:0`), so
+  "clean at 7" is not a compile failure.
+
+  ⚠ Note what this does and does not say. At `span=8` that branch FALLS BACK
+  (`i+1 >= span`), at `span=9` it is emitted NATIVELY, and **both diverge** — so
+  the trigger is not the branch emitter. The minimal diff between the clean and
+  dirty blocks, dumped and disassembled (`wasm2wat`), is literally one
+  flush + `PC = instrPtr` + `call_indirect` + PC-divergence check. Why that
+  changes anything is UNEXPLAINED, and saying so is the honest state.
+
+**MECHANISM OF THE 70x, measured.** The slowdown is a consequence of the
+divergence, not an independent problem:
+
+- `Count` runs away. Sampling `g_cp0_regs[COUNT]` every rAF: the interpreter arm
+  shows **no jumps at all** (Count 0x4d32351 at VI 123 = ~660K/VI), while the
+  jit arm sits at **~0xC0000000 and wraps through 2^32 repeatedly**. `0xC0000000`
+  is `3 * 2^30` — the exact signature of a WRAPPED `(a - b) >>> 2` multiplied by
+  `count_per_op`, i.e. a Count update computed from a `last_addr` that is AHEAD
+  of the current address. **conker's `count_per_op` IS 3**, cited not assumed:
+  `main/rom_luts.c:382-383` maps both Conker's Bad Fur Day CRCs to 3 in
+  `lut_cpop`. (A non-default `count_per_op` is not by itself the fault —
+  dk64 runs at 1, `rom_luts.c:393-396`, and passes the differential.)
+- With Count that far ahead, `next_interrupt` reaches **0** (`exception.c:144`,
+  and `remove_interrupt_event` when the queue head is far past), so
+  `next_interrupt <= Count` is true at EVERY branch tail.
+- `?jit=census` over a driven `600 900`-shaped window (`60 240`) then reads:
+  **`#gen_interrupt` 599,106,360** and **`#block-iter` 435,655,358** in 252 VI
+  — 1.73M block entries per VI frame, against **2,856/VI** measured on the
+  `?jit=wrap` arm (685,414 dispatches / 240 VI), a **605x** excess. The
+  fallback census is three buckets at essentially equal counts —
+  `MTC0.12` 54.4M, `SLOW:LW` 54.4M, `MTC0.11` 54.4M — and a per-block census
+  bucket names the loop: `@80000180` (the general exception vector) 53.4M plus
+  a chain of `@10007xxx` handler blocks. It is an interrupt storm in the guest's
+  own timer handler, which keeps rewriting `Compare` only to have it expire
+  immediately.
+- The same census at BOOT with no input reads `#block-iter` **875/VI** and
+  `#gen_interrupt` **1**. So the storm is phase-specific and begins after the
+  divergence, not at boot.
+
+**The plumbing is exonerated by the mode ladder** (`60 240` window, quiet box):
+
+        ?jit=v05   interp 5.5 ms/f   jit 5.738 ms/f   0.959x   60 VI/s
+        ?jit=wrap  interp 6.431      jit 6.325        1.017x   60 VI/s
+        ?jit=emit  interp 6.574      jit 460.782      0.014x
+
+So per-block instantiation and dispatch are at parity; only native emission
+storms.
+
+**Two real emitter bugs were found while chasing this and BOTH are fixed, and
+NEITHER of them is conker's cause** — stated plainly because a fix that does not
+move the symptom must not be reported as if it did:
+1. the r0/RNOP class (section 1 above) — conker still diverged at 82 after it;
+2. a THIRD join-contract instance in `emitLoad`: `fastBytes` ends with
+   `C.writeFromStack(rt)`, so `slowArm`'s `C.flushSnapshot()` stored a wasm
+   local that is only assigned on the FAST arm — zeroing `reg[rt]` and only then
+   calling the interpreter op. Benign only while the op rewrites `rt`; NOT benign
+   when it faults (TLB/MMIO), when `ops` is NOTCOMPILED, or when `rt == 0`. The
+   old comment there asserted "the redundant later flush rewrites identical
+   values", which was the same "benign" reasoning that hid bugs #1 and #2 of this
+   class. Fixed with cuGuard's `preFlush` pattern; 4 red tests, RED against both
+   `HEAD` and the r0-only intermediate. **conker still diverges at 82.**
+
+**NEXT STEP for whoever picks this up**: the repro is now cheap and exact —
+`?jitonly=10014000&jitspan=8` on `conker.z64` at 100 frames. The state dump at
+the divergence already shows `next_interrupt = 0` and Count wrapped, so the
+question is narrow: *which write puts `last_addr` ahead of the address the next
+`cp0_update_count()` sees?* A `last_addr` sampler that records every write (not
+just per-frame) would answer it directly.
+
+<details><summary>Original 2026-09-02 "throughput pathology" reading, kept for the record — the verdict was wrong</summary>
 
 The sweep row is `NOJSON` because `n64_jit_diff_test.mjs` threw a 180 s
 timeout, and the throw is at **:61, the JIT arm** (both interpreter arms
@@ -845,6 +1064,59 @@ emitter, same window:
 Identical to the resolution of the rig. Wave 11b did not cause it. (The 3%
 gap between the two jit numbers is well inside this rig's ~+/-6% single-pair
 resolution and must not be read as an effect.)
+</details>
+
+### (3) `gauntletLegends.z64` — ✅ SEPARATED 2026-09-02. It is a **WEDGE**, not slow.
+
+**The discriminator now survives, which was the actual blocker here.** The
+"third failure mode" recorded below was a HARNESS bug, not a property of the
+ROM: every CDP `evaluate` runs ON the page's main thread — the very thread a
+wedged emulator is monopolising — and both harnesses called it unprotected, so
+the ProtocolError propagated and killed the run before any detector could
+speak. (Note `n64_gameplay_ab.mjs` already had `protocolTimeout: 600000` in
+HEAD, so "raise protocolTimeout" was NOT the fix; raising it only makes the
+harness hang for ten minutes per probe instead of failing fast.) Both harnesses
+now BOUND every page read (15-60 s) and treat a non-answer as data.
+
+**VERDICT** — `node tools/n64_jit_diff_test.mjs gauntletLegends.z64 300`,
+reproduced with the wait raised to 600 s (`N64_DIFF_TIMEOUT_MS=600000`):
+
+        determinismControl            PASS   (both interpreter arms completed 300)
+        jitVsInterp                   INCOMPLETE
+        firstDivergenceInCommonPrefix -1
+        timeouts[jit].liveness        NO CDP RESPONSE (main thread never yielded)
+
+The page BOOTED (the `beforeEmulatorStarted === false` wait succeeded), and then
+the main thread never yielded again — not in 180 s, not in 600 s, and not to a
+15 s bounded probe. That is categorically different from conker, whose VI kept
+advancing at ~2 VI/s. This is the **thewheel SHAPE**: `README.md`'s contract
+item #1 — a block that reaches a state where the interrupt poll is never
+satisfied wedges the tab, because the core is single-threaded and one
+`retro_run` must end on a VI interrupt.
+
+⚠ **What that run does NOT say.** Its `framesReached` printed `0`, and that `0`
+was a bounded-read DEFAULT, not a count — the page could not be asked, so the
+true number is unknown. (The harness now prints `UNREADABLE (page did not
+answer)` there instead, precisely so this cannot be misread as "zero frames
+captured".) The only measured facts are: the interpreter arms completed, the jit
+arm did not, and the jit arm's main thread never answered.
+
+**But it is NOT wedged from the start.** The mode ladder at 60 VI is clean on
+every rung, `?jit=emit` included:
+
+        ?jit=wrap  det PASS  jit PASS   wrapped 42, calls 254,838
+        ?jit=v05   det PASS  jit PASS   wrapped 42, canaryFired 1
+        ?jit=nofp  det PASS  jit PASS   blocks 42, 0 emitFails, 0 nullOpsRejects
+        ?jit=emit  det PASS  jit PASS   blocks 42, 0 emitFails, 0 nullOpsRejects
+
+So the first 60 VI frames are bit-identical to the interpreter and the wedge is
+later — the same shape as conker (clean at 60, broken at 82) and as thewheel
+(clean to 244, trapped at 245). **The next step is the block bisect that solved
+both of the others**: re-add the temporary `?jitonly=`/`?jitspan=` hooks to
+`n64/index.html`'s `jitCompile` and bisect. Do NOT reach for the mode ladder
+again — it has already answered, and its answer is "native emission, later".
+
+<details><summary>Original 2026-09-02 note — the separation failed because of a harness bug</summary>
 
 ### (3) `gauntletLegends.z64` — same `NOJSON` at `:61`; SEPARATION FAILED, twice
 
@@ -862,13 +1134,31 @@ running FASTER under `?jit` (1.94-2.0x), so whatever this is, it is a change
 from a known state. Next step: raise `protocolTimeout` on the harness launch
 and re-run the discriminator; the stall detector at `n64_gameplay_ab.mjs:114-120`
 is the thing that actually answers the question, and it never got to speak.
+</details>
 
-### A rig limit this exposed
-`n64_jit_diff_test.mjs` hardcodes 180 s for the 600-VI wait, so ANY ROM slower
-than 3.33 VI/s reports as a failure indistinguishable from a wedge. It also
-runs the three arms in ONE browser with the jit arm always THIRD, so "jit arm"
-and "third arm" are confounded on any resource-exhaustion failure — the ladder's
-`wrap` rung is the control for that. Both are worth fixing before the next sweep.
+### A rig limit this exposed — ✅ FIXED 2026-09-02
+`n64_jit_diff_test.mjs` hardcoded 180 s for the 600-VI wait and simply THREW on
+expiry, so ANY ROM slower than 3.33 VI/s produced a bare stack trace that the
+sweep recorded as `NOJSON` — indistinguishable from a wedge. **That is the only
+reason conker's divergence went unseen for a whole session: the arm timed out
+before any checksum was compared.** The harness now:
+
+- takes `N64_DIFF_TIMEOUT_MS` (default still 180 s, so an ordinary sweep row
+  costs the same) and `N64_PROTOCOL_TIMEOUT_MS`;
+- **catches** the expiry and turns it into data — it samples `_neil_vi_total()`
+  twice, 5 s apart, and reports one of three named outcomes:
+  `SLOW (VI advanced A->B in 5s = N VI/s)`, `WEDGED (VI frozen at A for 5s)`, or
+  `NO CDP RESPONSE (main thread never yielded)`;
+- **never reports PASS on a truncated stream.** `firstDiff` only compares as far
+  as the shorter arm, so an arm that timed out at 200 of 600 frames and matched
+  over those 200 used to be able to read `-1` = PASS. A short stream is now
+  `INCOMPLETE`, and `firstDivergenceInCommonPrefix` is reported separately
+  because a divergence inside the frames both arms DID reach is real and is what
+  localises the bug.
+
+Still true and still worth fixing: it runs the three arms in ONE browser with
+the jit arm always THIRD, so "jit arm" and "third arm" are confounded on any
+resource-exhaustion failure — the ladder's `wrap` rung is the control for that.
 
 ### Also visible in the table
 `nullOpsRejects` is nonzero on **every** ROM (22-187, and 0 only on
@@ -1005,19 +1295,42 @@ census ranked are now native: SD/LD (wave 9), MFC0 (10a), and the whole FP
 block — converts (11a) plus compares and BC1 (11b). The core builds from
 source again and `jit_params` carries `&FCR31` behind a version magic.
 
-**What now stands between `?jit` and being the default.** The sweep has been
-RUN (24/27) and it is NOT clean, so the flip is blocked. All three blockers are
-PRE-EXISTING — none was introduced by wave 11b, and each was controlled against
-the HEAD~1 emitter rather than assumed:
-1. `superMarioStarRoad.z64` DIVERGES at frame 24 — a real correctness bug,
-   localised to the **_OUT branch path (wave 7)**;
-2. `conker.z64` runs **70x slower** under `?jit` (460 vs 6.6 ms/frame) — a
-   throughput pathology, not a hang;
-3. `gauntletLegends.z64` shows conker's signature but is UNSEPARATED — the
-   discriminator itself died on a CDP protocol timeout.
+**What now stands between `?jit` and being the default (updated 2026-09-02).
+THE FLIP IS STILL BLOCKED, and `n64/index.html:2200` (`if (!qs.has('jit'))
+return;`) must NOT be touched.** The re-run sweep is **25 of 27 PASS/PASS**
+(exit 1) — up from 24, and the two failures are now self-describing rows rather
+than blank `NOJSON`. Two of the three blockers moved:
+1. ~~`superMarioStarRoad.z64` DIVERGES at frame 24, localised to the _OUT
+   branch path (wave 7)~~ — ✅ **FIXED.** The _OUT localisation was WRONG; the
+   cause was `recomp.c`'s RNOP rewrite of any instruction whose destination is
+   r0. PASS at 600 VI with the determinism control PASS. See section (1).
+2. `conker.z64` — ~~a throughput pathology, not a hang~~ — **it is a
+   CORRECTNESS DIVERGENCE at frame 82**, and the 70x is the symptom (Count
+   wraps, `next_interrupt` reaches 0, 599M `gen_interrupt` calls in 252 VI).
+   Localised to ONE block (`0x10014000`, a TLB-mapped page) and to span index 7,
+   reproducibly, on two emitter revisions. **STILL OPEN** — two real emitter
+   bugs were fixed along the way and NEITHER moved it. See section (2).
+3. `gauntletLegends.z64` — ✅ **SEPARATED**: it is a **WEDGE** (the main thread
+   never yields, at 180 s and at 600 s), NOT conker's slowness. The thing
+   that had blocked it was a HARNESS bug — an unbounded CDP read on the very
+   thread the wedge owns. Clean on all four mode-ladder rungs at 60 VI, so the
+   wedge is later; block-bisect it next. **STILL OPEN as a sweep failure.**
 4. Separately, a THROUGHPUT number on a GAMEPLAY window. Every ratio this
    campaign owns was measured on a menu (screenshot-proven) and the acceptance
    bar is in-game. Waves 9/10a/11a/11b are all unpriced.
+
+**Three emitter bugs were fixed on 2026-09-02, all of the same shape — the
+emitter believed something about the core that a code read of `recomp.c` /
+`cached_interp.c` refutes.** This is the wave-11a/11b lesson for a third and
+fourth time: *read the code that actually runs.*
+- `recomp.c` RNOP-rewrites a destination of r0 to a plain NOP (59 emitters);
+  `emitAlu`/`emitLoad`/`emitCop0`/`emitCop1` wrote reg[0] anyway.
+- `DECLARE_JUMP` links only `if (link_register != &reg[0])`, so
+  `jalr $zero, $rs` links nothing; the emitter linked.
+- `emitLoad`'s slow arm flushed a wasm local assigned only on the fast arm —
+  the third instance of the join-contract class, and its comment claimed it was
+  "benign".
+Unit corpus **76 -> 102** cases; 17 of the 26 new ones are RED against `HEAD`.
 
 The correctness picture below is unchanged and still applies.
 
@@ -1122,6 +1435,15 @@ NEXT ACTIONS, in order:
    PASS/PASS. THE `?jit` DEFAULT MUST NOT FLIP YET — see the three exceptions
    below.** Now reproducible as `bash tools/probe_lock.sh run -- bash
    tools/n64_jit_sweep.sh`, which exits nonzero unless every ROM is clean.
+6. **THE ONE REMAINING CORRECTNESS BLOCKER IS conker.z64.** Repro, exact and
+   cheap: `N64_EXTRA_QS="jitonly=10014000&jitspan=8" node
+   tools/n64_jit_diff_test.mjs conker.z64 100` (the `jitonly`/`jitspan` hooks
+   are TEMPORARY and were removed — re-add them to `n64/index.html`'s
+   `jitCompile` to use this). The question is narrow and named in section (2):
+   which write leaves `last_addr` AHEAD of the address the next
+   `cp0_update_count()` sees. Do not flip the `?jit` default until it is closed
+   — `superMarioStarRoad` proved a sweep failure can be a genuine
+   guest-corrupting bug, not a formality.
 
 ### On measuring action #1 — the load source was OURS (2026-09-01)
 Every discarded A/B in this file blames "machine load". The largest single

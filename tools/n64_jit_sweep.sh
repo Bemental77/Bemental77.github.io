@@ -17,15 +17,23 @@
 # sampled before and after each ROM, because this project has voided whole
 # measurement campaigns to machine load. The sweep is a CORRECTNESS arm — its
 # PASS/FAIL verdicts are checksum comparisons and are immune to load — but the
-# harness has 120 s/180 s waitForFunction timeouts, so a loaded box turns a
-# healthy ROM into a `NOJSON` row. Read the load column before believing one.
+# harness has a 120 s boot wait and a 180 s frame wait, so a loaded box can
+# still turn a healthy ROM into an `INCOMPLETE` row. Read the load column.
 #
-# READING A FAILURE. `NOJSON` means the harness threw before printing its JSON,
-# which is almost always a timeout, NOT a divergence. Check WHICH ARM threw:
-#   n64_jit_diff_test.mjs:59 = interp-A   :60 = interp-B   :61 = jit
-# A throw at :59/:60 is a slow ROM or a busy box and says nothing about the
-# JIT. A throw at :61 is the thewheel.z64 shape — but note the jit arm is also
-# the THIRD run in the same browser, so "jit" and "third" are confounded; run
+# READING A FAILURE (updated 2026-09-02). A TIMEOUT no longer destroys the row.
+# The harness catches it and prints JSON: the `jit` column reads `INCOMPLETE`,
+# the `liveness` column says SLOW / WEDGED / NO CDP RESPONSE, and `firstDiff`
+# gives any divergence inside the frames both arms DID reach. That distinction
+# is not cosmetic — conker.z64 spent a whole session recorded as a "70x
+# throughput pathology" purely because its jit arm timed out before any
+# checksum was compared, and it is in fact a DIVERGENCE at frame 82. When a row
+# reads INCOMPLETE, re-run that ROM at a LOWER frame count before hypothesising.
+#
+# `NOJSON` now means the harness threw for some other reason (a boot failure is
+# the usual one). Check WHICH ARM threw — the column names the line:
+#   n64_jit_diff_test.mjs interp-A / interp-B / jit
+# A throw in an interpreter arm says nothing about the JIT. A throw in the jit
+# arm is confounded because it is also the THIRD run in the same browser; run
 # the mode ladder (?jit=wrap -> v05 -> nofp -> emit), whose `wrap` rung
 # controls for position as well as for emission, before hypothesising.
 set -uo pipefail
@@ -35,7 +43,7 @@ OUT="${SWEEP_OUT:-/tmp/n64-jit-sweep}"
 ROMDIR="${ROMDIR:-n64/N64Wasm/roms}"
 mkdir -p "$OUT"
 
-printf 'rom\tdet\tjit\tblocks\tnativeFPCmp\tnativeFPBranches\tfcr31\tfallbackOps\temitFails\tnullOpsRejects\texit\tload\tlimit\n' > "$OUT/summary.tsv"
+printf 'rom\tdet\tjit\tfirstDiff\tliveness\tblocks\tnativeFPCmp\tnativeFPBranches\tfcr31\tfallbackOps\temitFails\tnullOpsRejects\texit\tload\tlimit\n' > "$OUT/summary.tsv"
 
 for f in "$ROMDIR"/*.z64; do
   rom=$(basename "$f")
@@ -51,7 +59,13 @@ txt = open(path, errors='replace').read()
 try:
     d = json.loads(txt[txt.index('{'):txt.rindex('}') + 1])
     s = d.get('jitStats') or {}
+    # firstDivergenceInCommonPrefix + the SLOW/WEDGED liveness verdict are what
+    # separate "too slow to finish" from "wrong" — the distinction the old
+    # NOJSON row destroyed (n64/docs/jit/TASKS.md "A rig limit this exposed")
+    to = d.get('timeouts') or []
     row = [rom, d.get('determinismControl', '?'), d.get('jitVsInterp', '?'),
+           d.get('firstDivergenceInCommonPrefix', '-'),
+           '; '.join(f"{t.get('arm')}:{t.get('liveness')}" for t in to) or '-',
            s.get('blocks', '-'), s.get('nativeFPCmp', '-'), s.get('nativeFPBranches', '-'),
            s.get('fcr31', '-'), s.get('fallbackOps', '-'), s.get('emitFails', '-'),
            s.get('nullOpsRejects', '-'), ex, load, lim]
@@ -60,7 +74,7 @@ except Exception:
     # the whole diagnosis (see "READING A FAILURE" above)
     arm = next((l.split(':')[-2] for l in txt.splitlines()
                 if 'n64_jit_diff_test.mjs:' in l and 'async' in l), '?')
-    row = [rom, 'NOJSON', f'threw@line{arm}', '-', '-', '-', '-', '-', '-', '-', ex, load, lim]
+    row = [rom, 'NOJSON', f'threw@line{arm}', '-', '-', '-', '-', '-', '-', '-', '-', '-', ex, load, lim]
 print('\t'.join(str(x) for x in row))
 PY
   tail -1 "$OUT/summary.tsv"

@@ -14,9 +14,15 @@
 // block exit, and the loop back-edge (so the $top compile-time state is
 // empty on every path). After a fallback or gen_interrupt the entire cache
 // is INVALIDATED — the interpreter op may have written any register.
-// r0 is cached like any other register: this core's interpreter WRITES
-// reg[0] for ops whose destination is r0, and later reads observe it; the
-// differential gate compares reg[0] too.
+// r0 is cached like any other register, and the differential gate compares
+// reg[0] too — but WHETHER the core writes reg[0] is PER-OPCODE, not a rule.
+// recomp.c rewrites most instructions whose destination is r0 into a plain
+// NOP (`if (dst->f.i.rt == reg) RNOP()`), so they write nothing at all; the
+// ones it does NOT guard (MTHI/MTLO/MULT/DIV, MTC1/DMTC1, stores) still run
+// and do write reg[0]. See the SPECIAL_RD_NOP / ITYPE_RT_NOP block below —
+// an earlier version of this comment claimed a blanket "the interpreter
+// WRITES reg[0]", and that wrong belief WAS the superMarioStarRoad.z64
+// divergence.
 //
 // Per instruction:
 //   (a) native ALU — exact MIPS-III semantics on cached regs;
@@ -266,6 +272,57 @@
     return out;
   };
 
+  // ---- recomp.c's RNOP rewrite: a DESTINATION OF r0 makes the WHOLE
+  // instruction a NOP (2026-09-02) ----
+  //
+  // Most recomp.c emitters end with `if (dst->f.i.rt == reg) RNOP();` or
+  // `if (dst->f.r.rd == reg) RNOP();`. `reg` is the global `int64_t reg[32]`
+  // and `recompile_standard_{i,r}_type` binds `f.i.rt = reg + rt` /
+  // `f.r.rd = reg + rd` (recomp.c:99-117), so the test is exactly
+  // "destination register is r0". `RNOP()` sets `dst->ops = NOP`
+  // (recomp.c:137-141) — the instruction then does NOTHING: no arithmetic,
+  // NO MEMORY ACCESS, and no write to reg[0].
+  //
+  // This emitter's header used to assert the opposite ("this core's
+  // interpreter WRITES reg[0] for ops whose destination is r0"). That is true
+  // only of the ops recomp.c does NOT guard — MTHI/MTLO/MULT/MULTU/DIV/DIVU
+  // (destination is hi/lo), MTC1/DMTC1 (destination is an FPR) and every
+  // store (no destination at all). For the guarded family the emitter wrote
+  // reg[0] where the core writes nothing, and reg[0] IS in the differential
+  // checksum.
+  //
+  // Found on superMarioStarRoad.z64, which DIVERGED at VI frame 24. Bisecting
+  // the compiled spans (?jitonly=) isolated ONE block, 0x802ca6d0, span 6:
+  //     802ca6d0 lui   $t2, 0x8034
+  //     802ca6d4 lw    $t3, -0x4d70($t2)
+  //     802ca6d8 addiu $t3, $t3, 1
+  //     802ca6dc sw    $t3, -0x4d70($t2)
+  //     802ca6e0 j     0x80327b98
+  //     802ca6e4 addiu $zero, $zero, 0x101   <- delay slot
+  // RADDIU (recomp.c:1770-1775) turns that last one into NOP — the live
+  // precomp_instr.ops for it reads a different table index from its
+  // neighbouring ADDIU, which is the runtime confirmation — while emitAlu
+  // computed 0x101 and stored it into reg[0].
+  //
+  // (This is why the earlier per-class ablation pointed at the _OUT branch
+  // tail: disabling _OUT emission made the `j` fall back, and the interpreter
+  // then ran the delay slot itself. The tail was never the defect; the ALU
+  // delay slot it carried was.)
+  //
+  // SPECIAL fn codes this emitter handles whose destination is rd AND which
+  // recomp.c guards: RSLL/RSRL/RSRA (:148,:156,:164), RSLLV/RSRLV/RSRAV
+  // (:172,:180,:188), RMFHI/RMFLO (:228,:243), RADD/RADDU/RSUB/RSUBU
+  // (:338,:346,:354,:362), RAND/ROR/RXOR/RNOR (:370,:378,:386,:394),
+  // RSLT/RSLTU (:402,:410). Deliberately ABSENT: 0x11/0x13 (MTHI/MTLO) and
+  // 0x18-0x1B (MULT/MULTU/DIV/DIVU) — unguarded, they still run.
+  var SPECIAL_RD_NOP = { 0x00: 1, 0x02: 1, 0x03: 1, 0x04: 1, 0x06: 1, 0x07: 1, 0x10: 1, 0x12: 1,
+                         0x20: 1, 0x21: 1, 0x22: 1, 0x23: 1, 0x24: 1, 0x25: 1, 0x26: 1, 0x27: 1,
+                         0x2A: 1, 0x2B: 1 };
+  // I-type opcodes this emitter handles whose destination is rt AND which
+  // recomp.c guards: RADDI/RADDIU (:1766,:1774), RSLTI/RSLTIU (:1782,:1790),
+  // RANDI/RORI/RXORI/RLUI (:1798,:1806,:1814,:1822).
+  var ITYPE_RT_NOP = { 0x08: 1, 0x09: 1, 0x0A: 1, 0x0B: 1, 0x0C: 1, 0x0D: 1, 0x0E: 1, 0x0F: 1 };
+
   // ---- native ALU emitters ----
   // Returns body bytes (value computed and written into the cache) or null.
   var p_hi_lo = { hi: 0, lo: 0 }; // bound per-compile (hi/lo addresses)
@@ -279,6 +336,7 @@
     var v = null, dest = -1;
     if (op === 0) {
       dest = rd;
+      if (rd === 0 && SPECIAL_RD_NOP[fn]) return [];   // recomp.c RNOP
       switch (fn) {
         case 0x00: v = C.read(rt).concat(wrap, [OP.i32_const], sleb(sa), [OP.i32_shl], xs); break;   // SLL
         case 0x02: v = C.read(rt).concat(wrap, [OP.i32_const], sleb(sa), [OP.i32_shr_u], xs); break; // SRL
@@ -325,6 +383,7 @@
       return v.concat(C.writeFromStack(dest));
     }
     dest = rt;
+    if (rt === 0 && ITYPE_RT_NOP[op]) return [];   // recomp.c RNOP
     switch (op) {
       case 0x08:                                                                                          // ADDI (no trap in this core)
       case 0x09: v = C.read(rs).concat(wrap, [OP.i32_const], sleb(sext16(imm)), [OP.i32_add], xs); break; // ADDIU
@@ -367,7 +426,12 @@
       var fn0 = word & 0x3F;
       var rdJ = (word >>> 11) & 0x1F;
       if (fn0 === 0x08) return { cond: null, link: false, likely: false, target: null, targetReg: rs };
-      if (fn0 === 0x09) return { cond: null, link: true, linkReg: rdJ, likely: false, target: null, targetReg: rs };
+      // JALR's link register is `&rrd` (mips_instructions.def:1465) and
+      // DECLARE_JUMP writes it only `if (link_register != &reg[0])`
+      // (cached_interp.c:78-81) — so `jalr $zero, $rs` links NOTHING. RJALR
+      // (recomp.c:198-203) has no RNOP guard, so the jump itself still runs;
+      // only the link is suppressed. Same reg[0] class as the RNOP family.
+      if (fn0 === 0x09) return { cond: null, link: rdJ !== 0, linkReg: rdJ, likely: false, target: null, targetReg: rs };
       return null;
     }
     switch (op) {
@@ -453,16 +517,22 @@
   // taken. Re-running the branch from its own first instruction is EXACT:
   // the only guest state the block has written by then is the link register,
   // and DECLARE_JUMP writes it the identical value (SE32(addr+8)) again.
-  function slowArm(p, C, instrPtr, opsIdx, brDepth, slow, refreshReg) {
+  //
+  // `preFlush` is the caller's C.flushSnapshot() captured BEFORE it built the
+  // fast-arm bytes — the same parameter, for the same reason, as cuGuard's.
+  // Omit it only where the caller marks no register dirty while building that
+  // arm. See the note above emitLoad.
+  function slowArm(p, C, instrPtr, opsIdx, brDepth, slow, refreshReg, preFlush) {
+    var flushed = preFlush || C.flushSnapshot();
     if (slow) {
       return [].concat(
-        C.flushSnapshot(),
+        flushed,
         storeI32Const(p.pcGlobal, slow.ptr),
         [OP.i32_const], sleb(slow.opsIdx), [OP.call_indirect, 0x00, 0x00],
         [OP.br].concat(leb(brDepth)));
     }
     return [].concat(
-      C.flushSnapshot(),
+      flushed,
       storeI32Const(p.pcGlobal, instrPtr),
       [OP.i32_const], sleb(opsIdx), [OP.call_indirect, 0x00, 0x00],
       refreshReg >= 0 ? loadI64(p.regBase + refreshReg * 8).concat([OP.local_set], leb(L_REG0 + refreshReg)) : [],
@@ -478,10 +548,41 @@
   // traffic; only genuinely slow accesses (TLB/MMIO/fb-protected) pay an
   // exit. Compile-state mutations inside the fast arm are sound because the
   // fast arm is the only continuing path.
+  //
+  // JOIN CONTRACT, third instance — fixed 2026-09-02 (conker.z64 diverged at
+  // VI frame 82). `fastBytes` ends with `C.writeFromStack(rt)`, which marks rt
+  // DIRTY; `slowArm` then called `C.flushSnapshot()`, which on the SLOW arm
+  // emitted a store of a wasm local that is only assigned on the FAST arm —
+  // writing wasm's zero-init over reg[rt] and only then calling the
+  // interpreter op. The comment that used to sit here called that "benign"
+  // because the op normally rewrites reg[rt] straight after. It is not benign
+  // whenever the op does NOT write rt:
+  //   * the load FAULTS (TLB miss / MMIO) — the interpreter leaves reg[rt]
+  //     alone, we have already zeroed it, and PC divergence exits the block
+  //     with the wrong value live;
+  //   * `ops` is NOTCOMPILED/NOTCOMPILED2 — recompiles, writes no register;
+  //   * (before the RNOP fix above) rt == 0, where the op is a plain NOP.
+  // HONESTY NOTE ON REACH — the standing caveat wave 6's cuGuard carries. This
+  // was found while chasing conker.z64's frame-82 divergence and it did NOT
+  // fix it: conker still DIVERGES at 82 with this repaired. It is a real bug
+  // proven by executing unit tests; it is not a demonstrated cause of any
+  // observed misbehaviour on a ROM.
+  // The repair is cuGuard's: capture the snapshot BEFORE building the fast arm,
+  // so the slow arm flushes only what was dirty on ENTRY to this instruction.
+  // That is exact and costs nothing (unlike emitStore's C.ensure hoist, which
+  // is still right there because a store READS rt).
   function emitLoad(word, instrPtr, p, C, opsIdx, exitDepth, slow) {
     var op = (word >>> 26) & 0x3F;
     if (op !== 0x20 && op !== 0x21 && op !== 0x23 && op !== 0x24 && op !== 0x25 && op !== 0x27 && op !== 0x37) return null;
     var rs = (word >>> 21) & 0x1F, rt = (word >>> 16) & 0x1F;
+    // recomp.c RNOP (see SPECIAL_RD_NOP above): RLB/RLH/RLW/RLBU/RLHU/RLWU/RLD
+    // all end with `if (dst->f.i.rt == reg) RNOP()` (:1960,:1968,:1984,:1992,
+    // :2000,:2016,:2108). A load into r0 does not even perform the ACCESS —
+    // which also means it can neither fault nor touch MMIO, so emitting
+    // nothing is exact in a delay slot too.
+    if (rt === 0) return [];
+    // captured BEFORE fastBytes marks rt dirty — see the join-contract note above
+    var preFlush = C.flushSnapshot();
     var imm = sext16(word & 0xFFFF);
     var tableBase, cmpVal;
     if (op === 0x37) { tableBase = p.readmemD; cmpVal = p.rdRdramD; }   // LD (wave 9)
@@ -532,12 +633,12 @@
         fastBytes,
       [OP.else_],
         bump((slow ? 'SLOTSLOW:' : 'SLOW:') + mnem(word)),
-        // continue-after-fallback: snapshot-flush (compile-state untouched —
-        // the redundant later flush rewrites identical values), run the
-        // interp op, then refresh ONLY the op's write-set (rt) into its
-        // local so both arms join in the same compile-state (rt loaded).
+        // continue-after-fallback: flush the PRE-INSTRUCTION dirty set (rt is
+        // deliberately NOT in it — see the join-contract note above), run the
+        // interp op, then refresh ONLY the op's write-set (rt) into its local
+        // so both arms join in the same compile-state (rt loaded).
         // PC divergence (TLB exception) still exits.
-        slowArm(p, C, instrPtr, opsIdx, exitDepth + 1, slow, rt),
+        slowArm(p, C, instrPtr, opsIdx, exitDepth + 1, slow, rt, preFlush),
       [OP.end]
     );
   }
@@ -891,13 +992,18 @@
     // pass the gates looking green — the wave-10a `nativeCop0` lesson.
     var fpCvt = false;
     var fpCmp = false;
-    if (sub === 0x00) {        // MFC1: rt = SE32(*(i32*)simple[fs])
-      nat = fprPtr(p.cp1Simple, fs).concat([OP.i32_load, 0x02, 0x00], [OP.i64_extend_i32_s], C.writeFromStack(rt));
-    } else if (sub === 0x04) { // MTC1: *(i32*)simple[fs] = rt32
+    if (sub === 0x00 || sub === 0x01) { // MFC1 / DMFC1
+      // recomp.c RMFC1 (:1530-1537) / RDMFC1 (:1539-1546) end with
+      // `if (dst->f.r.rt == reg) RNOP()`, so a move into r0 is a NOP — no GPR
+      // write and, because RNOP replaces the op wholesale, NO CU1 CHECK
+      // either. Emitting nothing (not even cuGuard) is therefore exact.
+      if (rt === 0) return [];                                       // recomp.c RNOP
+      nat = (sub === 0x00)
+        ? fprPtr(p.cp1Simple, fs).concat([OP.i32_load, 0x02, 0x00], [OP.i64_extend_i32_s], C.writeFromStack(rt))
+        : fprPtr(p.cp1Double, fs).concat([OP.i64_load, 0x03, 0x00], C.writeFromStack(rt));
+    } else if (sub === 0x04) { // MTC1: *(i32*)simple[fs] = rt32 (RMTC1 :1558-1564 has NO r0 guard)
       nat = fprPtr(p.cp1Simple, fs).concat(C.read(rt), [OP.i32_wrap_i64], [OP.i32_store, 0x02, 0x00]);
-    } else if (sub === 0x01) { // DMFC1: rt = *(i64*)double[fs]
-      nat = fprPtr(p.cp1Double, fs).concat([OP.i64_load, 0x03, 0x00], C.writeFromStack(rt));
-    } else if (sub === 0x05) { // DMTC1
+    } else if (sub === 0x05) { // DMTC1 (RDMTC1 :1566-1572, likewise unguarded)
       nat = fprPtr(p.cp1Double, fs).concat(C.read(rt), [OP.i64_store, 0x03, 0x00]);
     } else if (sub === 0x10 || sub === 0x11) { // fmt S / D arithmetic
       var S = (sub === 0x10);
@@ -1035,6 +1141,10 @@
     if (((word >>> 26) & 0x3F) !== 0x10) return null;
     if (((word >>> 21) & 0x1F) !== 0x00) return null;      // MFC0 only (rs field)
     var rt = (word >>> 16) & 0x1F, rd = (word >>> 11) & 0x1F;
+    // recomp.c RMFC0 (:818-824) ends `if (dst->f.r.rt == reg) RNOP()`, and the
+    // guard is applied AFTER rd is rebound to g_cp0_regs — so it fires for
+    // every rd, RANDOM and COUNT included.
+    if (rt === 0) return [];                               // recomp.c RNOP
     if (rd === 1 || rd === 9) return null;                 // RANDOM / COUNT: cp0_update_count() first
     if ((p.cp0Status - p.count) !== 12) return null;       // layout guard (see above)
     return loadI32((p.count - 9 * 4) + rd * 4)
