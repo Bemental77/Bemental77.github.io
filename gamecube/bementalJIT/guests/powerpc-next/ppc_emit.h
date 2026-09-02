@@ -88,6 +88,31 @@ using HleHookQueryFn = bool(*)(u32 pc);
 extern HleHookQueryFn g_hle_hook_query;
 
 // ---------------------------------------------------------------------------
+// [MIPS meter runtime gate 2026-09-02] The executed-cycle meter emits a 6-op
+// read-modify-write of ONE global cell into the prologue of every non-idle
+// block execution, plus the same 6 ops on every fused-loop back edge. Measured
+// with the offline op census (gamecube/docs/executed-op-census/TASKS.md), that
+// is 2.2pp of all executed unconditional ops in emitted code: the per-block
+// FIXED share falls 41.3% -> 39.1% with it off, on the SAB corpus.
+//
+// It was a compile-time `true` carrying its own instruction to "flip false for
+// a final overhead-free fps read" — but flipping the constant also DELETES the
+// instrument, and the probe reads the cell (dolphin_render_probe.js:688,:1190).
+// So it is now gated at EMIT time on a SAB scratch cell instead: default 0 =
+// OFF and ZERO emitted ops, `?bjit_mips=1` (gamecube.html) sets the cell before
+// the run so blocks compile WITH the meter. Same shape as the batch-K cell
+// (0x026B39A0); the closest in-file precedent is the per-emit fp_force_off read
+// of 0x026B3408 at ppc_emit.cpp:1229-1230, which is likewise gated only on
+// g_bem_lc_base and sits in the same 4 KB page.
+//
+// CLAUDE.md gate #10 forbids quoting a guest-rate multiple from this meter; it
+// stays available for the executed-vs-credited split it was built for, and it
+// no longer taxes every block of every shipping run to do it.
+constexpr u32 BEM_MIPS_EXEC_CELL = 0x026B3420u;   // u32 lo, accumulated charge
+constexpr u32 BEM_MIPS_FLAG_CELL = 0x026B39B8u;   // 0 = OFF (browser-zeroed)
+bool bem_mips_census_on();
+
+// ---------------------------------------------------------------------------
 // [op-census 2026-09-01] Emit-phase marks — the OFFLINE executed-op instrument.
 //
 // WHY: every op-level number in this tree so far is a STATIC emitted-op count

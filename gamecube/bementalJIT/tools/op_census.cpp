@@ -66,8 +66,19 @@ extern unsigned char g_bem_chain_enabled;
 // Only their LEB widths depend on the exact numbers, so op counts are stable.
 static constexpr uint32_t kCtxPtr   = 0x02400000u;
 static constexpr uint32_t kMem1Base = 0x10000000u;
+// [census-fidelity 2026-09-02] ram_size is the ALLOCATED size, not the real
+// 24 MB: Memmap.cpp:100-102 sets m_ram_size = NextPowerOf2(24MB) = 32 MB and
+// m_ram_mask = m_ram_size - 1, so `mem1_mask == ram_size - 1` is an INVARIANT
+// of every live config. This matters because jit_load_store.cpp:239-246 elides
+// the fastmem bound check on exactly that equality. The old pair here
+// (mask 0x01FFFFFF, ram_size 0x01800000) broke it, so the census emitted a
+// 6-op bound check on EVERY load and store that the live build never emits —
+// inflating every load/store op count and the whole "guest work" total with it.
 static constexpr uint32_t kMem1Mask = 0x01FFFFFFu;
-static constexpr uint32_t kRamSize  = 0x01800000u;
+static constexpr uint32_t kRamSize  = 0x02000000u;
+static_assert(kMem1Mask == kRamSize - 1u,
+              "census must satisfy Memmap.cpp:102's m_ram_mask = ram_size - 1, "
+              "or jit_load_store.cpp:239 emits a bound check the live build elides");
 
 // JitWasm.cpp:102
 static constexpr uint32_t kMaxBlockInsts = 64u;
@@ -123,6 +134,21 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "[op_census] SAB window mapped; lc_base=0x02600000 (live shape)\n");
     }
 #endif
+    // [mips-gate A/B 2026-09-02] The executed-cycle meter is emit-time gated on
+    // SAB cell BEM_MIPS_FLAG_CELL (ppc_emit.h) and ships OFF. Setting
+    // OPCENSUS_MIPS=1 arms it here so BOTH arms of that gate can be censused —
+    // and, more usefully, so the ARMED arm can be byte-compared against a
+    // census taken before the gate existed. The cell lives in the SAB window
+    // zeroed just above, so this is the same write gamecube.html's
+    // `?bjit_mips=1` performs.
+    if (const char* mv = std::getenv("OPCENSUS_MIPS")) {
+        if (*mv && *mv != '0') {
+            *reinterpret_cast<volatile uint32_t*>(
+                static_cast<uintptr_t>(bemental::powerpc::BEM_MIPS_FLAG_CELL)) = 1u;
+            std::fprintf(stderr, "[op_census] MIPS meter ARMED (cell 0x%08X = 1)\n",
+                         bemental::powerpc::BEM_MIPS_FLAG_CELL);
+        }
+    }
     g_bem_fprf_enabled  = 0u;
     g_bem_accurate_nans = 0u;
     g_bem_chain_enabled = 1u;   // emit the real per-edge terminal

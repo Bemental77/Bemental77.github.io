@@ -26,6 +26,13 @@ run — it is stock HEAD, so this is a clean baseline in the gate-#8 sense.
 agree to the fourth decimal; `[mips]` is explicitly unvalidated (CLAUDE.md gate
 #10) and reads a different number in the same run.
 
+> **[2026-09-02] `[mips]` now ships OFF and prints `METER OFF`, not a number.**
+> Its 6-op prologue RMW was 2.2pp of all executed emitted ops (30% of the whole
+> block prologue), so it is emit-time gated on SAB cell `0x026B39B8` and armed
+> with **`?bjit_mips=1`**. The `EXECUTED=133.3 MHz` line above therefore cannot be
+> reproduced without that flag — and a run without it is NOT a 0 MHz reading.
+> See `gamecube/docs/executed-op-census/TASKS.md`.
+
 ## PC census — 15,478 samples, 81.0% of symbols unresolved
 
     14.9%  (unresolved 0x80117e00)     <-- the governor loop

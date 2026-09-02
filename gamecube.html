@@ -2686,6 +2686,24 @@ window.GcRate = (function () {
         pageLog('[batch-instances] blocks-per-module K=' + _bik);
       }
     } catch (e) { pageLog('[batch-instances] toggle write failed: ' + (e && e.message)); }
+    // [mips-meter gate 2026-09-02] ?bjit_mips=1 — arm the executed-cycle meter. The meter
+    // emits a 6-op read-modify-write of ONE global cell (0x026B3420) into the prologue of
+    // EVERY non-idle block execution and onto every fused-loop back edge. The offline op
+    // census measures that at 2.2pp of all executed unconditional ops in emitted code (the
+    // per-block FIXED share is 41.3% with it on, 39.1% off, SAB corpus) — a tax every
+    // shipping run paid for a diagnostic. SAB scratch cell 0x026B39B8, browser-zeroed
+    // 0 = OFF = zero emitted ops. Read at EMIT time (ppc_emit.cpp bem_mips_census_on), so
+    // arm it BEFORE the blocks you want metered are compiled — i.e. from the query string.
+    // CLAUDE.md gate #10: never quote a guest-rate multiple from this meter; it is the
+    // executed-vs-credited (phantom-credit) split and nothing more.
+    try {
+      var _bimips = new URLSearchParams(location.search).get('bjit_mips');
+      if (_bimips !== null) {
+        var _bim = (parseInt(_bimips, 10) !== 0) ? 1 : 0;
+        new Uint32Array(sharedMemory.buffer)[0x026B39B8 >> 2] = _bim;
+        pageLog('[mips-meter] emit-time gate = ' + _bim);
+      }
+    } catch (e) { pageLog('[mips-meter] toggle write failed: ' + (e && e.message)); }
     // [fifo-brake ESCAPE HATCH 2026-08-29] The host-side GX FIFO backpressure brake
     // (CommandProcessorManager::BemFifoBackpressure, CommandProcessor.cpp:426) ships DEFAULT ON
     // and reads kill-switch cell 0x026B3B20 (nonzero = brake DISABLED). Until now NOTHING in

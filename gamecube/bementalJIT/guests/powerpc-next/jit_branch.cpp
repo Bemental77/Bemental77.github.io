@@ -22,6 +22,7 @@
 #include "common/op_info.h"
 #include "cr_shadow.h"
 #include "ppc_analyst.h"
+#include "ppc_emit.h"        // BEM_MIPS_EXEC_CELL + bem_mips_census_on()
 #include "ppc_offsets.h"
 #include "reg_cache.h"
 
@@ -33,12 +34,14 @@ static constexpr u32 WIMPORT_INTERP = 6;
 // maskable-exception check and rfi can flip MSR.EE=1 with an IRQ pending.
 static constexpr u32 WIMPORT_CHECK_EXC = 7;
 
-// [MIPS meter 2026-08-11] Fused-loop back-edge charge accumulation — MUST stay
-// in sync with ppc_emit.cpp's BEM_MIPS_CENSUS / BEM_MIPS_EXEC_CELL (that file
-// owns the design comment). Counts the per-iteration re-charge so loop-resident
-// hot code is not undercounted (which would falsely inflate phantom).
-static constexpr bool BEM_MIPS_CENSUS    = true;
-static constexpr u32  BEM_MIPS_EXEC_CELL = 0x026B3420u;
+// [MIPS meter 2026-08-11] Fused-loop back-edge charge accumulation. Counts the
+// per-iteration re-charge so loop-resident hot code is not undercounted (which
+// would falsely inflate phantom).
+// [runtime-gated 2026-09-02] The duplicated `BEM_MIPS_CENSUS = true` /
+// `BEM_MIPS_EXEC_CELL` pair that had to be "kept in sync by hand" with
+// ppc_emit.cpp is GONE: both now come from ppc_emit.h, and the on/off decision
+// is the shared bem_mips_census_on() emit-time SAB read. Nothing to keep in
+// sync any more — the two sites cannot disagree.
 // Block-module import index for ppc_gather_drain (ppc_emit.cpp emitImportFunc
 // order; idx 12). Used by the coalesced taken-exit below to drain a pending
 // gather-pipe write, since the early op_return bypasses the block epilogue's
@@ -510,7 +513,7 @@ void emit_bcx_fused(WasmModuleBuilder& wb, RegCache& rc, FPRRegCache& frc,
             wb.op_i32_sub();
             wb.op_i32_store(ppc_off::DOWNCOUNT);
             // [MIPS meter] executed cycles += charge on each fused-loop iteration.
-            if (BEM_MIPS_CENSUS) {
+            if (bem_mips_census_on()) {
                 wb.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
                 wb.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
                 wb.op_i32_load(0);

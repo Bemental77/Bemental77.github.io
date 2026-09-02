@@ -80,11 +80,16 @@ static constexpr bool BEM_PM51_CENSUS = false;
 // credited = global_timer mirror 0x02680008/0C (free); executed = this cell;
 // phantom = credited - executed (the idle-skip jumps). The executed/credited
 // ratio makes phantom credit a visible number, ending the 5%-vs-37% class of
-// instrument confusion. Compile-time gate (like BEM_PM51_CENSUS): ON for the
-// measurement phase, flip false for a final overhead-free fps read. MUST stay
-// in sync with the identical const in jit_branch.cpp (the fused back-edge charge).
-static constexpr bool BEM_MIPS_CENSUS   = true;
-static constexpr u32  BEM_MIPS_EXEC_CELL = 0x026B3420u;
+// instrument confusion.
+//
+// [runtime-gated 2026-09-02] This was a compile-time `true` whose own comment
+// said to "flip false for a final overhead-free fps read". It is now gated on
+// SAB cell BEM_MIPS_FLAG_CELL instead — default OFF, `?bjit_mips=1` arms it —
+// so the meter survives while its 6-op-per-block-execution RMW stops taxing
+// every shipping run. See the design note in ppc_emit.h. The cell is read at
+// EMIT time (lc_base-gated like every other SAB read here), so an armed run
+// must set it before the blocks it cares about are compiled.
+// (bem_mips_census_on is defined below, after g_bem_lc_base is declared.)
 
 // In-WASM block chaining (defined in src/block_cache.cpp). Each per-block
 // module imports the host __indirect_function_table and, at its epilogue,
@@ -112,6 +117,25 @@ extern "C" {
     extern int           g_bem_aot_reloc_mode;    // [AOT v4 reloc] offline: emit OOB sentinels + reloc records instead of native &g_bem_* (wild-address class)
     int  bem_pc_force_double(uint32_t pc);      // [single-spec PM26] sticky deopt registry
 }
+// [MIPS meter runtime gate] see the design note at ppc_emit.h.
+//
+// Emit-time absolute read of a SAB scratch cell, gated ONLY on g_bem_lc_base —
+// the same shape as the fp_force_off read of 0x026B3408 at ppc_emit.cpp:1229-1230
+// ("Read per-emit so it needs no Init-timing dance; lc_base-gated (test memories
+// are small)"). That precedent matters: it also runs on EVERY emit, and its cell
+// is 0x026B3408 against this one's 0x026B39B8 — the same 4 KB page — so any heap
+// that survives one survives the other. (The psmtxro flag at :1136 is NOT the
+// right precedent to copy: it short-circuits on start_pc first and so reads its
+// cell for exactly one PC.)
+//
+// With lc_base unset — offline tools, small test heaps — the window is not mapped,
+// the read is skipped, and the answer is OFF, which is also the shipping default.
+bool bem_mips_census_on() {
+    return g_bem_lc_base != 0u &&
+           *reinterpret_cast<volatile uint32_t*>(
+               static_cast<uintptr_t>(BEM_MIPS_FLAG_CELL)) != 0u;
+}
+
 static constexpr u32 BEM_DISP_MASK_NEXT = 0x3FFFFu;  // MUST match block_cache.cpp BEM_DISP_MASK (BEM_DISP_BITS=18)
 static constexpr u32 LOCAL_TMP_A_CHAIN  = 0u;       // build_block_next i32 scratch 0
 static constexpr u32 LOCAL_TMP_B_CHAIN  = 1u;       // build_block_next i32 scratch 1
@@ -1039,7 +1063,7 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             // [MIPS meter] executed cycles += charge (this fires on EVERY real
             // block execution incl. tail-chained region bodies; idle blocks take
             // the force-zero branch above and are excluded by construction).
-            if (BEM_MIPS_CENSUS) {
+            if (bem_mips_census_on()) {
                 b.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
                 b.op_i32_const((s32)BEM_MIPS_EXEC_CELL);
                 b.op_i32_load(0);

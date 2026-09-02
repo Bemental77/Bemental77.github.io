@@ -66,6 +66,20 @@ python3 gamecube/tools/op_census_report.py /tmp/census-out /tmp/sab.manifest.wei
 For an A/B, flip one compile-time constant, rebuild both, and census both into
 separate directories — never compare a census to a remembered number.
 
+**For a RUNTIME-gated A/B, no rebuild is needed.** `OPCENSUS_MIPS=1` sets the
+`[mips]` meter's SAB flag cell in the driver, so one binary censuses both arms:
+
+```bash
+node /tmp/op_census.js /tmp/sab.manifest /tmp/census-off        # shipping default
+OPCENSUS_MIPS=1 node /tmp/op_census.js /tmp/sab.manifest /tmp/census-armed
+```
+
+⚠ **Compare the two in OPS, never with `cmp`.** Two censuses taken from
+separately-linked driver binaries differ in a handful of LEB bytes because the
+emitters bake host addresses as `i32.const` (CLAUDE.md gate #10) — measured here
+as exactly 4 bytes per module, all `0xC0` vs `0x80`, with the emitted OP STREAM
+identical. `cmp` reports 323/323 "differing" on two arms that are the same code.
+
 The census itself needs no lock — it is offline, browser-free and load-independent,
 which is most of why it is worth having. **Anything that opens a browser does:
 `bash tools/probe_lock.sh run -- <cmd>`** (acquires, reaps orphaned browsers,
@@ -109,6 +123,25 @@ The invariant that made it detectable is worth keeping regardless of the harness
 (`test_gekko_next.cpp:4345`). If that line is absent from
 `/tmp/bjit-tests/<name>.log`, the run did not finish, whatever the verdict says.**
 Read the counts from that line, not from the summary.
+
+> ## ⚠ 2026-09-02 — THE NUMBERS BELOW THIS LINE WERE MEASURED ON A CENSUS WITH A
+> ## FIDELITY BUG, AND ON A PRE-IDLE-SKIP WORKLOAD. See "Re-census" at the bottom.
+>
+> Two independent problems, both now fixed:
+> 1. **`op_census.cpp` emitted 6 ops per load/store that the live build never
+>    emits.** `Memmap.cpp:100-102` sets `m_ram_size = NextPowerOf2(24MB) = 32MB`
+>    and `m_ram_mask = m_ram_size - 1`, so `mem1_mask == ram_size - 1` is an
+>    INVARIANT of every live config — and `jit_load_store.cpp:239-246` elides the
+>    fastmem bound check on exactly that equality. The census hardcoded
+>    `kMem1Mask = 0x01FFFFFF` with `kRamSize = 0x01800000`, breaking the equality,
+>    so every load and store carried a phantom `local.get / i32.const mask /
+>    i32.and / i32.const bound / i32.lt_u / i32.and`. Fixed, with a `static_assert`
+>    so it cannot regress.
+> 2. **The weighting predates `8a4342e5`** (the governor idle-skip), as the note
+>    at the governor example already flagged.
+>
+> Both corrections move the headline numbers materially. The old figures are kept
+> for provenance; do not quote them.
 
 ## The finding
 
@@ -399,3 +432,332 @@ being decided.
   not a flag flip and the box could not support the matched pair it needs.
 - No change to the `[a]` downcount predicate, the vector guard's semantics, the
   `slot >= 0` check, or anything in `ppc_analyst.cpp`.
+
+---
+
+# Re-census 2026-09-02 — corrected instrument, fresh workload, and the CEILING
+
+Everything in this section is from ONE run of the corrected instrument:
+fresh `PROBE_PC_SAMPLE=1` histogram off the shipping binary
+(`md5 9267a160d3afd3114e4112c6a7c5bc91` = the `c224b7c2` batch build),
+14,905 samples, `TOPN=32`, 323 recovered blocks, 7,197 weighted samples,
+`kRamSize` corrected. The census is offline and load-independent.
+
+## What changed in the instrument
+
+Three additions to `gamecube/tools/op_census_report.py`, all of which report
+`d0` and `op_if`-gated ops separately as before:
+
+1. **Per-GUEST-OPCODE attribution.** `BEM_MARK_OP` already carries `op.address`
+   (`ppc_emit.cpp:1370`) and the `.marks` file already lists `inst <pc> <word>`,
+   so a tag-2 span joins directly to the guest instruction that produced it.
+   This is the "what ARE the 46x amplified ops" question the phase table could
+   not answer.
+2. **Per-WASM-MNEMONIC attribution**, split fixed (prologue+terminal) vs guest.
+3. **A NORMALIZED estimator, and it is the one to quote.** The per-opcode
+   ratio-of-sums is dominated by long blocks: `20+`-instruction blocks are 19.4%
+   of samples but **83% of the ratio-of-sums op total** (1396 x 3947 of 6.6M).
+   The normalized estimator weights each block's own COMPOSITION by its sample
+   share — the same estimator the fixed-overhead headline already used, correct
+   under `samples ∝ exec × ops` because the per-block `ops_b` cancels.
+
+**The two estimators disagree by 5-8x on individual opcodes and they disagree
+about the ANSWER.** Ratio-of-sums says SAB's emitted code is FP/paired-single
+dominated (`ps_madds0` 6.4%, `fctiw` 6.2%, `fmadds` 4.8%); normalized says it is
+branch and load dominated (`ps_madds0` 0.83%, `fctiw` 0.85%). The normalized
+reading is the one consistent with the independently-known fact that SAB is
+0.51% paired-single. **A ratio-of-sums per-opcode table on this corpus is
+actively misleading — it would have sent this work at the FP emitters.**
+
+## The corrected finding
+
+| | old census | corrected |
+|---|---:|---:|
+| per-block FIXED share (normalized) | 45.7% | **41.3%** (prologue 14.7 + terminal 26.6) |
+| mean guest instrs / block | 3-5.5 (stated) | 13.61 — **ratio-of-sums, see caveat** |
+| unconditional ops per guest instr | — | 55.6 — **ratio-of-sums, see caveat** |
+
+> **Caveat on the two ratio-of-sums rows.** `mean guest instrs/block` and
+> `ops/guest instr` are both sums-over-sums across the RECOVERED block set, and
+> `op_census_manifest.mjs` recovers a SUPERSET of the entered blocks (its own
+> header says so), splitting each 256-byte bucket's weight evenly across the
+> entries it finds. A long block the loop never enters therefore contributes its
+> full length. So 13.61 does NOT refute the independently-sourced "SAB averages
+> 3-5.5 guest instructions per block" — the two are different estimators over
+> different populations, and only the FIXED-share row uses the normalized
+> estimator that is robust to this. **Narrowing the probe's `pc & ~0xFF` bucket
+> mask (`dolphin_render_probe.js:614`) would remove this caveat entirely** and is
+> the single highest-value upgrade left in this instrument.
+
+| guest instrs / block | blocks | weight | mean d0 | mean fixed | fixed % |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 48 | 869 | 51.9 | 43.1 | **83.1%** |
+| 2 | 21 | 382 | 72.3 | 46.4 | **64.1%** |
+| 3-5 | 121 | 2548 | 112.1 | 46.5 | **41.5%** |
+| 6-9 | 46 | 1102 | 127.9 | 49.2 | 38.5% |
+| 10-19 | 45 | 901 | 650.3 | 171.1 | 26.3% |
+| 20+ | 42 | 1396 | 3947.2 | 548.3 | 13.9% |
+
+**Top guest opcodes, normalized share of executed unconditional ops.** Two arms,
+because the `[mips]` lever below changes the denominator — quote the SHIPPING one:
+
+| arm | `b` | `bclr` | `bc` | `lwz` | `cmpi` | `addi` | `stfs` | `stb` | `stw` | `fmadds` | branches | guest total |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| meter ON (pre-change) | 5.27 | 4.98 | 5.13 | 4.93 | 3.68 | 3.20 | 2.53 | 2.31 | 2.27 | 1.68 | **15.4%** | 58.71% |
+| **meter OFF (ships)** | 5.68 | 5.29 | 5.24 | 5.12 | 3.82 | 3.40 | 2.57 | 2.44 | 2.36 | 1.69 | **16.2%** | 60.91% |
+
+**Branches are the single largest executed guest-op class** (`b`+`bc`+`bclr` =
+16.2%), ahead of `lwz` at 5.12%. Cost per dynamic occurrence (shipping arm):
+`lwz` **19.1** unconditional wasm ops, `b` 18.9, `bclr` ~16.
+
+### Sensitivity: the fixed-overhead headline is NOT an artifact of the `TOPN` cut
+
+The whole ceiling argument rests on one number, so it was swept across a 4x range
+of corpus size (post-change binary, meter off):
+
+| `TOPN` | blocks | fixed % | prologue | terminal |
+|---:|---:|---:|---:|---:|
+| 12 | — | 41.8% | 10.3% | 31.5% |
+| 24 | — | 39.5% | 10.5% | 29.1% |
+| 32 | 323 | 39.1% | 10.3% | 28.7% |
+| 48 | — | 38.7% | 10.3% | 28.4% |
+
+**38.7-41.8%, and the prologue is flat at 10.3-10.5%.** Widening the corpus pulls
+in colder, longer blocks and slowly dilutes the terminal, exactly as the
+by-length table predicts. Nothing here hinges on where the cut is drawn.
+
+## ★ What the amplified ops ARE — and why op COUNT is the wrong currency
+
+Normalized share of executed unconditional ops, by wasm mnemonic:
+
+| mnemonic | fixed | guest | total |
+|---|---:|---:|---:|
+| **i32.const** | 13.48% | 17.50% | **30.98%** |
+| **local.get** | 1.93% | 9.09% | **11.02%** |
+| i32.load | 5.68% | 2.20% | 7.88% |
+| i32.store | 1.62% | 4.70% | 6.32% |
+| local.set | 1.00% | 4.79% | 5.79% |
+| i32.and | 0.99% | 3.48% | 4.47% |
+| if / end | 2.49% | 1.54% | 4.02% each |
+
+**Nearly a third of every executed op in emitted code is an `i32.const`, and
+another 17% is `local.get`/`local.set`.** That is the measured part.
+
+**The interpretation is a HYPOTHESIS, not a measurement** — I did not disassemble
+V8's machine output. But it is the standard behaviour of any optimising backend
+that these are the ops folded into addressing modes and register allocation:
+`i32.const ctx_ptr; i32.load offset=F` is the classic base+displacement pair, and
+`local.get`/`local.set` on a register-allocated local is a coalescable move. If
+that holds, **roughly 47% of the counted stream costs ~zero machine work**, and
+"executed op count" systematically overstates the payoff of cutting ops — which
+would be a structural explanation for why this tree's op-count levers keep
+measuring null (the SIMD byte-swap's proven −887 ops at 0.994x).
+
+**Cheap way to settle it:** run the emitted module under
+`--print-wasm-code` / `--trace-turbo` and count machine instructions per wasm op
+class. Until then: size levers in *loads, stores, branches and real ALU*, and
+treat a saved `i32.const` as suspect rather than as a win.
+
+## Levers sized against the corrected census
+
+| lever | executed-op reach | verdict |
+|---|---:|---|
+| **`[mips]` meter RMW in every block prologue** | **−2.2pp** (fixed 41.3% → 39.1%; **−30% of the whole prologue**, 14.7% → 10.3%) | **LANDED, runtime-gated** |
+| dead `ctx.PC` store before a branch that overwrites it | −0.40% (ratio-of-sums; `b`/`bclr`/`fctiw`/`mtmsr`) | measured, NOT worth the risk |
+| RegCache dead load on a pure-Write first-touch bind | 3 ops per load | **DO NOT** — see below |
+
+### The `[mips]` meter (LANDED)
+
+`ppc_emit.cpp` emitted a 6-op read-modify-write of ONE global cell
+(`BEM_MIPS_EXEC_CELL = 0x026B3420`) into the prologue of **every non-idle block
+execution**, plus the same 6 ops on every fused-loop back edge
+(`jit_branch.cpp`). Its own comment said "flip false for a final overhead-free
+fps read" — but flipping the compile-time constant also DELETES the instrument,
+which the probe reads (`dolphin_render_probe.js:688`, `:1190`).
+
+Now gated at EMIT time on SAB cell `BEM_MIPS_FLAG_CELL = 0x026B39B8`, default 0 =
+OFF = zero emitted ops; `?bjit_mips=1` (`gamecube.html`) arms it. Same shape as
+`?bjit_batch` (`0x026B39A0`) and the psmtxro flag (`ppc_emit.cpp:1112`). The
+duplicated `BEM_MIPS_CENSUS`/`BEM_MIPS_EXEC_CELL` pair that jit_branch.cpp had to
+"keep in sync by hand" is gone — both sites now call one `bem_mips_census_on()`.
+
+Census A/B, same corpus, cell 0 vs armed: total d0 916.2 → 910.4, prologue
+125.6 → 119.8, fixed 41.3% → 39.1%, prologue share 14.7% → 10.3%.
+
+**The per-block result is EXACT, not a weighted average.** Every bucket of the
+prologue op-count histogram shifts by exactly −6:
+
+| prologue d0 (armed) | 12 | 15 | 18 | 21 | 24 | … | 2087 | 2275 | 2651 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **shipping (off)** | **6** | **9** | **12** | **15** | **18** | … | **2081** | **2269** | **2645** |
+| blocks | 75 | 102 | 45 | 29 | 9 | | 2 | 1 | 1 |
+
+The only blocks that do not move are the **3 idle blocks**, which take the
+force-zero downcount branch and never emitted the meter by construction. Post
+change the modal prologue is **6 ops** (77 blocks — the bare downcount RMW) and
+**9 ops** (103 blocks — downcount + one RegCache load).
+
+Three independent correctness proofs, all offline:
+1. The runtime-gated build with the cell zeroed is **byte-identical** to the
+   compile-time-`false` arm — 323/323 modules, `cmp`-exact.
+2. The **armed** arm reproduces the pre-gate emit **exactly in ops** (916.2 d0,
+   3171.3 cond, fixed 41.3%, prologue 14.7% — every figure identical). Its four
+   per-module byte differences are LEB address bytes from link layout, per gate #10.
+3. 323/323 modules pass `wasm-validate --enable-all` on both arms.
+
+For reference, the terminal is **exactly 31 unconditional ops on all 336
+terminals** in this corpus — a hard constant with zero exceptions, confirming the
+edge diet's result on the shipping arm.
+
+#### Runtime verification (correctness, NOT a speed measurement)
+
+Both arms off ONE binary, `md5 e4a2abd035e389721fd4f27135d51ed3` before AND after
+(`HASH STABLE`), SAB `ROM_IDX=1` cold boot, `PROBE_DURATION_MS=75000`,
+`?bjit_batch=64`, `probe_lock`-held:
+
+| arm | `[mips]` line | guest (both AI-DMA witnesses) | published/s | traps | renders |
+|---|---|---:|---:|---:|---|
+| default (`bjit_mips` unset) | `METER OFF (no ops emitted; SAB cell 0x026B39B8 = 0)` | 0.4617 / 0.4616 | 18.85 | 0 | ✅ |
+| `?bjit_mips=1` | `EXECUTED=110.0 MHz CREDITED=218.6 MHz ratio=50.3%` | 0.4498 / 0.4499 | 18.35 | 0 | ✅ |
+
+**The gate works in both directions** — unarmed emits nothing and says so, armed
+restores a live meter — and both arms render (screenshots: SAB intro, clean
+geometry, no black world, no NaN).
+
+**⚠ DO NOT READ THE GUEST COLUMN AS THE LEVER'S EFFECT.** It is n=1 per arm, the
+two arms acquired the lock at **different loads** (4.68 vs 6.41), and I rebuilt
+the census library *during* the OFF arm. The +2.6% direction is consistent with
+the prediction and is **inside the noise floor** — gate #10 puts rig resolution
+at ~6-7%. This is a correctness check that happens to print rates, not a
+matched pair.
+
+**The lever's runtime effect is therefore UNMEASURED and is predicted to be BELOW RIG RESOLUTION**
+(2.2pp of emitted-code ops, and emitted code is 38-52% of thread self-time per
+correction (a), so ~1% of the thread against a ~6-7% resolution at load 9-11).
+Do NOT quote it as a speedup. It is landed because it is free, it removes a
+per-block global RMW, and it stops every shipping run paying for a meter
+CLAUDE.md gate #10 forbids quoting.
+
+### RegCache dead load — FOUND, DELIBERATELY NOT TAKEN
+
+Every guest load emits `i32.const ctx; i32.load gpr(RT); local.set <RT local>`
+**before** the fastmem branch tree, loading the DESTINATION register's old value,
+which the arms then unconditionally overwrite. It is a dead load on every `lwz`.
+
+`reg_cache.cpp:82-111` does this knowingly and says why: the 2026-06-11 PSO
+`__LCEnable` crash. RMW emitters bind DEST first (`Bind(ra, Write)` then
+`Bind(rs, Read)`); when `dest == src` and the reg is unassigned, a Write bind that
+marked `loaded` without loading made the Read bind consume a zero-initialised
+local. The comment states the trade explicitly: *"One redundant i32.load on a
+genuinely-overwritten first-touch reg is the price; coherence bugs of this class
+are gone."*
+
+A narrow fix exists (defer the load on pure-Write binds; emit it from the later
+Read bind — the 3-op sequence is stack-neutral so its position is safe). It was
+NOT taken here: the reward is ~3 ops on loads, and the failure mode is a Flush
+writing a never-written local over live guest state — the exact bug class that
+cost a PSO boot. Given the ceiling below, this is not where the risk budget goes.
+
+## ★★ THE CEILING — this is the answer, and it is not encouraging
+
+Two measured quantities bound the ENTIRE "make the block bodies cheaper" program:
+
+- **41.3%** of executed unconditional ops in emitted code is per-block FIXED
+  overhead (this census, normalized).
+- **38.04-51.51%** of CPU-thread self-time is `[13]`, the emitted bodies
+  (correction (a) above, four `.cpuprofile` files — **NOT reproduced here**;
+  taken as given and used at its most favourable end).
+
+**Remove 100% of the fixed overhead — every prologue and every terminal, which is
+impossible — and the thread gets 0.413 × 0.515 = 21.3% faster: `1.27x`.**
+SAB owes **2.29x** (0.4371 → 1.000).
+
+> **⚠ An unexplained baseline discrepancy, recorded rather than buried.** The
+> histogram run that produced this census — same binary
+> (`md5 9267a160d3afd3114e4112c6a7c5bc91`), same `?bjit_batch=64`, same
+> `PROBE_DURATION_MS=75000`, `ROM_IDX=1`, load 3.9-5.6 — measured
+> **guest = 0.4888x** on BOTH AI-DMA witnesses (`ai_dma_cb` and `aid_fire`
+> agreeing exactly), with `published = 20.60/s`. F9's nine-run campaign measured
+> 0.4203-0.4389 with `published` 16.4-17.5 at load 5.4-6.6. That is ~12% apart on
+> a witness pair that agrees with itself to four decimals, and it is **more than
+> the ~6-7% rig resolution**. I did not chase it — this run had `PROBE_PC_SAMPLE=1`
+> installed, which is a perturbation, and one run is not a measurement. **Do not
+> treat either number as settled without a fresh matched pair.** The ceiling
+> argument is unaffected: at 0.4888x SAB owes 2.05x, still far above the 1.27x
+> bound below.
+
+**The `[13]` share is the input I did not reproduce, so here is the ceiling as a
+function of it** — `1 / (1 − 0.413 × f13)`:
+
+| `[13]` self-time share | ceiling of removing ALL fixed overhead |
+|---:|---:|
+| 38% (low end of the measured split) | **1.19x** |
+| 45% | **1.23x** |
+| 52% (high end) | **1.27x** |
+| 68% (the RETRACTED, most optimistic figure ever claimed here) | **1.39x** |
+
+**Even at the retracted 68% the ceiling is 1.39x against 2.29x owed.** Inverted:
+to reach 1.000x by deleting fixed overhead you would need the fixed share to be
+**82.8%** of emitted-code ops even at `f13 = 0.68`, and **>100%** (i.e. flatly
+impossible) at `f13 = 0.52`. Measured fixed share is **41.3%**. The conclusion
+does not depend on which end of the `[13]` range is right.
+
+The bound is generous in three separate ways:
+
+1. **A third of "fixed" is `i32.const`** (13.48pp of the 41.3pp). IF the folding
+   hypothesis above holds — unverified — those cost ~nothing after the backend and
+   fixed's TIME share is well below its OP share. This one is a hypothesis, so the
+   ceiling stands without it; it only makes the ceiling lower.
+2. **It counts only unconditional ops, and the conditional ops are almost all
+   GUEST work.** Per block there are 3,171 `op_if`-gated ops against 916
+   unconditional, and one arm of each `if` DOES execute. Of those 3,171,
+   **3,058 (96.4%) sit in guest-op spans** and only 113 in prologue+terminal
+   (88.1 + 25.1). So whatever fraction of conditional work actually runs, it
+   lands overwhelmingly in the denominator's guest half — counting it can only
+   DECREASE fixed's share, never increase it. This holds without needing a model
+   of which arm runs.
+3. **Fixed is not removable.** Of the 43-49 fixed ops on a short block: downcount
+   RMW (6, CoreTiming slice accounting), meter (6 — **the only removable one, now
+   gone**), terminal 31 = service bail (6) + vector guard (7) + bucket probe (15)
+   + host return (3). The bail is slice/exception delivery, the guard is a
+   correctness invariant that prevents a real crash, and the bucket probe IS the
+   chaining mechanism. **6 of ~46 were removable, and they are now removed.**
+
+**Block merging — the one lever with the right shape — is also bounded.** The
+by-length table prices it exactly: if every block were `20+` instructions, fixed
+would be 13.9% instead of 41.3%. That removes 27.4pp of emitted-code ops =
+14.1% of thread = **`1.16x`**, for PERFECT merging of every block in the game.
+
+So: op removal and block merging are the same program (both attack `fixed`), and
+that program's ceiling is **~1.27x against 2.29x owed**. To reach 1.000x from
+inside the bodies you would have to delete all fixed overhead AND ~25% of the
+guest-work ops — and guest work is the translation of guest semantics.
+
+### Verdict
+
+**SAB's remaining 2.29x is NOT recoverable from inside the emitted block bodies.**
+That is not a claim that the emitter is optimal — **`lwz` costs 19.1 unconditional
+wasm ops** (weighted mean over 123 blocks; a clean instance is 3 set_pc + 4 EA +
+4 fastmem guard + 3 RegCache dead load + `if` + 2 result move) against Jit64's
+single fastmem instruction, which is obvious slack. But most of that slack is a
+*wasm-imposed floor*, not a code-quality defect: wasm has no trap-and-backpatch,
+so the `if/else/else` region tree on every memory access cannot be replaced by
+Dolphin's raw access + SIGSEGV handler. It is a claim about arithmetic: the
+recoverable share is bounded by 41.3% of 38-52%, and that product cannot reach 2.29x.
+
+The remaining deficit needs a different execution model. Static recompilation is
+the live candidate (`gamecube/docs/static-recomp-sab/`), and it is the one path
+that deletes the per-block prologue/terminal entirely rather than shrinking it.
+
+## Reproducing
+
+```bash
+# 1. fresh histogram off the shipping binary (browser — needs the lock)
+bash tools/probe_lock.sh run -- env PROBE_HEADLESS=1 PROBE_VANILLA_WEBGPU=1 \
+  ROM_IDX=1 PROBE_DURATION_MS=75000 PROBE_PC_SAMPLE=1 PROBE_QUERY=bjit_batch=64 \
+  node gamecube/tools/dolphin_render_probe.js > /tmp/probe-hist.log 2>&1
+# 2. manifest + census + report (offline, load-independent, no lock)
+TOPN=32 node gamecube/tools/op_census_manifest.mjs /tmp/wasm_pc_hist.json /tmp/sab2.manifest
+node /tmp/op_census.js /tmp/sab2.manifest /tmp/census-out          # build per the block at the top
+python3 gamecube/tools/op_census_report.py /tmp/census-out /tmp/sab2.manifest.weights
+```

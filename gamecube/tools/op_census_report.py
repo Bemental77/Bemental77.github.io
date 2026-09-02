@@ -39,6 +39,86 @@ import os, re, subprocess, sys, collections
 
 TAG = {0: 'prologue', 1: 'body', 2: 'op', 3: 'terminal', 4: 'end'}
 
+# --------------------------------------------------------------------------
+# Guest-opcode naming. BEM_MARK_OP (ppc_emit.cpp:1370) carries op.address, and
+# the .marks file lists `inst <pc> <word>` for every decoded instruction, so a
+# tag-2 span can be attributed to the GUEST instruction that produced it. That
+# is the join this report was missing: phase totals say how much is fixed
+# overhead, this says which guest instructions the non-fixed half is spent on.
+# Unknown encodings degrade to `op<N>` / `op<N>.<xo>` rather than being dropped.
+# --------------------------------------------------------------------------
+_PRIMARY = {
+    3: 'twi', 7: 'mulli', 8: 'subfic', 10: 'cmpli', 11: 'cmpi', 12: 'addic',
+    13: 'addic.', 14: 'addi', 15: 'addis', 16: 'bc', 17: 'sc', 18: 'b',
+    20: 'rlwimi', 21: 'rlwinm', 23: 'rlwnm', 24: 'ori', 25: 'oris',
+    26: 'xori', 27: 'xoris', 28: 'andi.', 29: 'andis.',
+    32: 'lwz', 33: 'lwzu', 34: 'lbz', 35: 'lbzu', 36: 'stw', 37: 'stwu',
+    38: 'stb', 39: 'stbu', 40: 'lhz', 41: 'lhzu', 42: 'lha', 43: 'lhau',
+    44: 'sth', 45: 'sthu', 46: 'lmw', 47: 'stmw',
+    48: 'lfs', 49: 'lfsu', 50: 'lfd', 51: 'lfdu', 52: 'stfs', 53: 'stfsu',
+    54: 'stfd', 55: 'stfdu', 56: 'psq_l', 57: 'psq_lu', 60: 'psq_st',
+    61: 'psq_stu',
+}
+_X31 = {
+    0: 'cmp', 8: 'subfc', 10: 'addc', 11: 'mulhwu', 19: 'mfcr', 20: 'lwarx',
+    23: 'lwzx', 24: 'slw', 26: 'cntlzw', 28: 'and', 32: 'cmpl', 40: 'subf',
+    54: 'dcbst', 55: 'lwzux', 60: 'andc', 75: 'mulhw', 83: 'mfmsr',
+    86: 'dcbf', 87: 'lbzx', 104: 'neg', 119: 'lbzux', 124: 'nor',
+    136: 'subfe', 138: 'adde', 144: 'mtcrf', 146: 'mtmsr', 150: 'stwcx.',
+    151: 'stwx', 183: 'stwux', 200: 'subfze', 202: 'addze', 210: 'mtsr',
+    215: 'stbx', 234: 'addme', 235: 'mullw', 247: 'stbux', 266: 'add',
+    279: 'lhzx', 284: 'eqv', 311: 'lhzux', 316: 'xor', 339: 'mfspr',
+    343: 'lhax', 371: 'mftb', 375: 'lhaux', 407: 'sthx', 412: 'orc',
+    439: 'sthux', 444: 'or', 459: 'divwu', 467: 'mtspr', 470: 'dcbi',
+    476: 'nand', 491: 'divw', 512: 'mcrxr', 533: 'lswx', 534: 'lwbrx',
+    535: 'lfsx', 536: 'srw', 567: 'lfsux', 595: 'mfsr', 597: 'lswi',
+    598: 'sync', 599: 'lfdx', 631: 'lfdux', 662: 'stwbrx', 663: 'stfsx',
+    695: 'stfsux', 725: 'stswi', 727: 'stfdx', 759: 'stfdux', 790: 'lhbrx',
+    792: 'sraw', 824: 'srawi', 854: 'eieio', 918: 'sthbrx', 922: 'extsh',
+    954: 'extsb', 982: 'icbi', 983: 'stfiwx', 1014: 'dcbz',
+}
+_X19 = {0: 'mcrf', 16: 'bclr', 33: 'crnor', 50: 'rfi', 129: 'crandc',
+        150: 'isync', 193: 'crxor', 225: 'crnand', 257: 'crand',
+        289: 'creqv', 417: 'crorc', 449: 'cror', 528: 'bcctr'}
+_X63 = {0: 'fcmpu', 12: 'frsp', 14: 'fctiw', 15: 'fctiwz', 32: 'fcmpo',
+        38: 'mtfsb1', 40: 'fneg', 64: 'mcrfs', 70: 'mtfsb0', 72: 'fmr',
+        134: 'mtfsfi', 136: 'fnabs', 264: 'fabs', 583: 'mffs', 711: 'mtfsf'}
+_A5 = {18: 'fdiv', 20: 'fsub', 21: 'fadd', 22: 'fsqrt', 23: 'fsel',
+       24: 'fres', 25: 'fmul', 26: 'frsqrte', 28: 'fmsub', 29: 'fmadd',
+       30: 'fnmsub', 31: 'fnmadd'}
+_PS5 = {10: 'ps_sum0', 11: 'ps_sum1', 12: 'ps_muls0', 13: 'ps_muls1',
+        14: 'ps_madds0', 15: 'ps_madds1', 18: 'ps_div', 20: 'ps_sub',
+        21: 'ps_add', 23: 'ps_sel', 24: 'ps_res', 25: 'ps_mul',
+        26: 'ps_rsqrte', 28: 'ps_msub', 29: 'ps_madd', 30: 'ps_nmsub',
+        31: 'ps_nmadd'}
+_PS10 = {0: 'ps_cmpu0', 32: 'ps_cmpo0', 40: 'ps_neg', 64: 'ps_cmpu1',
+         72: 'ps_mr', 96: 'ps_cmpo1', 136: 'ps_nabs', 264: 'ps_abs',
+         528: 'ps_merge00', 560: 'ps_merge01', 592: 'ps_merge10',
+         624: 'ps_merge11', 1014: 'dcbz_l'}
+
+
+def ppc_mnemonic(w):
+    op = (w >> 26) & 0x3f
+    if op in _PRIMARY:
+        return _PRIMARY[op]
+    xo10 = (w >> 1) & 0x3ff
+    xo5 = (w >> 1) & 0x1f
+    if op == 31:
+        return _X31.get(xo10, 'op31.%d' % xo10)
+    if op == 19:
+        return _X19.get(xo10, 'op19.%d' % xo10)
+    if op == 63:
+        if xo5 in _A5 and xo10 not in _X63:
+            return _A5[xo5]
+        return _X63.get(xo10, _A5.get(xo5, 'op63.%d' % xo10))
+    if op == 59:
+        return _A5.get(xo5, 'op59.%d' % xo5) + 's'
+    if op == 4:
+        if xo10 in _PS10:
+            return _PS10[xo10]
+        return _PS5.get(xo5, 'op4.%d' % xo10)
+    return 'op%d' % op
+
 # Control ops. `else` keeps the depth (it closes one arm and opens the sibling).
 OPENERS = ('block', 'loop', 'if', 'try')
 LINE_RE = re.compile(r'^\s*([0-9a-f]+):\s+(?:[0-9a-f]{2}\s+)+\|\s*(\S+)')
@@ -78,6 +158,14 @@ def main():
 
     phase_d0 = collections.Counter()
     phase_cond = collections.Counter()
+    mnem_d0 = collections.Counter()     # (phase, wasm mnemonic) -> weighted ops
+    mnem_cond = collections.Counter()
+    gop_d0 = collections.Counter()      # guest mnemonic -> weighted d0 ops
+    gop_cond = collections.Counter()
+    gop_w = collections.Counter()       # guest mnemonic -> weighted occurrences
+    gop_blocks = collections.defaultdict(set)
+    gop_share = collections.Counter()   # NORMALIZED: share of executed d0 ops
+    mn_share = collections.Counter()    # NORMALIZED: (fixed|guest, wasm mn)
     per_block = []
     n_inst_total = 0.0
     w_total = 0.0
@@ -87,13 +175,14 @@ def main():
             continue
         pc = fn[:-6]
         w = weights.get(pc, 0.0)
-        marks, n_insts = [], 0
+        marks, n_insts, word_of = [], 0, {}
         for ln in open(os.path.join(cdir, fn)):
             f = ln.split()
             if f and f[0] == 'mark':
                 marks.append((int(f[1]), f[2], int(f[3])))
             elif f and f[0] == 'inst':
                 n_insts += 1
+                word_of[f[1]] = int(f[2], 16)
         if not marks:
             continue
         ops = disasm(os.path.join(cdir, pc + '.wasm'))
@@ -115,12 +204,15 @@ def main():
             spans.append((tag, mpc, off, end))
 
         counts = collections.defaultdict(lambda: [0, 0])   # phase -> [d0, cond]
+        blk_gop = collections.Counter()    # this block: guest mnemonic -> d0 ops
+        blk_mn = collections.Counter()     # this block: (fixed|guest, wasm mn) -> d0
         # Depth at the start of each span defines "unconditional for this phase".
         for tag, mpc, s, e in spans:
             name = TAG.get(tag, str(tag))
             if name == 'end':
                 continue
             base = None
+            sd0 = scond = 0
             for off, mn, d in ops:
                 if off < s or off >= e:
                     continue
@@ -128,10 +220,34 @@ def main():
                     base = d
                 if d <= base:
                     counts[name][0] += 1
+                    sd0 += 1
+                    mnem_d0[(name, mn)] += w
+                    blk_mn[('fixed' if name in ('prologue', 'terminal')
+                            else 'guest', mn)] += 1
                 else:
                     counts[name][1] += 1
+                    scond += 1
+                    mnem_cond[(name, mn)] += w
+            if tag == 2 and mpc in word_of:
+                gm = ppc_mnemonic(word_of[mpc])
+                gop_d0[gm] += sd0 * w
+                gop_cond[gm] += scond * w
+                gop_w[gm] += w
+                gop_blocks[gm].add(pc)
+                blk_gop[gm] += sd0
         d0 = sum(v[0] for v in counts.values())
         cond = sum(v[1] for v in counts.values())
+        # NORMALIZED estimator (the one the fixed-overhead headline already
+        # uses): each block contributes its own COMPOSITION, weighted by its
+        # sample share. Under samples_b ∝ exec_b * ops_b the per-block ops_b
+        # cancels, so a 60-instruction FP routine no longer outvotes a 3-
+        # instruction loop body purely by being longer. The ratio-of-sums
+        # tables above do NOT have this property and over-weight long blocks.
+        if d0:
+            for gm, c in blk_gop.items():
+                gop_share[gm] += w * c / d0
+            for (ph, mn), c in blk_mn.items():
+                mn_share[(ph, mn)] += w * c / d0
         for k, v in counts.items():
             phase_d0[k] += v[0] * w
             phase_cond[k] += v[1] * w
@@ -168,12 +284,15 @@ def main():
     # i.e. to TIME), executed-fixed / executed-total collapses exactly to this
     # weighted mean of ratios — the per-block ops_b cancels, so a long block no
     # longer needs a matching execution count to be weighted correctly.
-    num = den = 0.0
+    num = den = pro = ter = 0.0
     for w, pc, gi, d0, cond, c, bk, nb in per_block:
         if d0:
             num += w * (c.get('prologue', [0, 0])[0] + c.get('terminal', [0, 0])[0]) / d0
+            pro += w * c.get('prologue', [0, 0])[0] / d0
+            ter += w * c.get('terminal', [0, 0])[0] / d0
             den += w
-    print(f'   sample-weighted MEAN of per-block fixed/total = {num / den * 100:.1f}%')
+    print(f'   sample-weighted MEAN of per-block fixed/total = {num / den * 100:.1f}%'
+          f'   (prologue {pro / den * 100:.1f}% + terminal {ter / den * 100:.1f}%)')
 
     print()
     print('BY BLOCK LENGTH  (the SAB regime is short blocks — this is where the tax lands)')
@@ -196,6 +315,51 @@ def main():
           f'{(phase_d0["body"] + phase_d0["op"]) / w_total:.1f} ops for '
           f'{n_inst_total / w_total:.2f} guest instrs = '
           f'{(phase_d0["body"] + phase_d0["op"]) / n_inst_total:.1f} ops/guest instr')
+    print()
+    print('GUEST-OPCODE BUDGET  (tag-2 spans only: the non-fixed half of the body)')
+    print('  d0/occ = unconditional emitted ops per DYNAMIC occurrence of that guest')
+    print('  instruction; cond/occ is behind an op_if and is an UPPER BOUND.')
+    print(f'{"guest op":<12}{"occ (w)":>10}{"occ %":>8}{"d0 ops":>10}{"d0 %":>8}'
+          f'{"d0/occ":>9}{"cond/occ":>10}{"blocks":>8}')
+    g_tot_d0 = sum(gop_d0.values())
+    g_tot_w = sum(gop_w.values())
+    for gm, v in gop_d0.most_common(28):
+        print(f'{gm:<12}{gop_w[gm]:>10.0f}{gop_w[gm] / g_tot_w * 100:>7.1f}%'
+              f'{v:>10.0f}{v / g_tot_d0 * 100:>7.1f}%'
+              f'{v / gop_w[gm]:>9.1f}{gop_cond[gm] / gop_w[gm]:>10.1f}'
+              f'{len(gop_blocks[gm]):>8}')
+    print(f'{"TOTAL":<12}{g_tot_w:>10.0f}{"":>8}{g_tot_d0:>10.0f}'
+          f'{"":>8}{g_tot_d0 / g_tot_w:>9.1f}'
+          f'{sum(gop_cond.values()) / g_tot_w:>10.1f}')
+
+    print()
+    print('*** NORMALIZED GUEST-OPCODE SHARE (the estimator to quote) ***')
+    print('  Share of EXECUTED unconditional emitted ops, per-block-normalized so a')
+    print('  long block cannot outvote a short one purely by length. Same estimator')
+    print('  as the fixed-overhead headline above.')
+    print(f'{"guest op":<12}{"share":>9}{"cum":>8}   {"vs ratio-of-sums":>18}')
+    gs_tot = sum(gop_share.values())
+    cum = 0.0
+    for gm, v in gop_share.most_common(26):
+        cum += v / w_total * 100
+        ros = gop_d0[gm] / max(g_tot_d0, 1) * 100 * (g_tot_d0 / max(tot_d0, 1))
+        print(f'{gm:<12}{v / w_total * 100:>8.2f}%{cum:>7.1f}%   {ros:>17.2f}%')
+    print(f'{"[guest ops]":<12}{gs_tot / w_total * 100:>8.2f}%')
+    print(f'{"[fixed]":<12}{num / den * 100:>8.2f}%   (prologue+terminal, same estimator)')
+
+    print()
+    print('WASM-MNEMONIC BUDGET  (normalized share of executed unconditional ops)')
+    print('  What the 46x-amplified ops ARE. `fixed` = prologue+terminal.')
+    hdr = ('mnemonic', 'fixed', 'guest', 'total')
+    print(f'{hdr[0]:<22}{hdr[1]:>9}{hdr[2]:>9}{hdr[3]:>9}')
+    by_mn = collections.Counter()
+    for (ph, mn), v in mn_share.items():
+        by_mn[mn] += v
+    for mn, v in by_mn.most_common(26):
+        print(f'{mn:<22}{mn_share[("fixed", mn)] / w_total * 100:>8.2f}%'
+              f'{mn_share[("guest", mn)] / w_total * 100:>8.2f}%'
+              f'{v / w_total * 100:>8.2f}%')
+
     print()
     print('TOP BLOCKS BY WEIGHT')
     print(f'{"weight":>9} {"pc":>9} {"gi":>3} {"d0":>5} {"cond":>5} '

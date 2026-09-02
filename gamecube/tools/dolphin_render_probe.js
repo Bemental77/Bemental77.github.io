@@ -1256,7 +1256,12 @@ function startServer() {
             _srRows.push(row);
             if (s.head) console.log('[page-headline] t=' + row.tsec + 's  "' + s.head + '"');
             console.log('[scene-rate] t=' + row.tsec + 's  speed=' + row.speed.toFixed(3)
-              + 'x  cred=' + row.credMHz + 'MHz exec=' + row.execMHz + 'MHz'
+              // [mips-gate 2026-09-02] exec is Δ0x026B3420, which the emitter
+              // only bumps when the meter is ARMED (?bjit_mips=1). Unarmed it is
+              // a constant 0, so print "off" rather than "exec=0.0MHz" — the
+              // latter reads as a measured zero-throughput CPU.
+              + 'x  cred=' + row.credMHz + 'MHz exec='
+              + (row.execMHz === 0 ? 'off' : row.execMHz + 'MHz')
               + '  drawn=' + row.drawn + '/s  published=' + row.pub + '/s'
               + '  rglDrain=' + row.rgl + '/s  xpc=0x' + (row.xpc || '?')
               + '  brake=' + row.bpDn + '/w(' + row.bpN + ' tot, ' + row.bpDms + 'ms/w, bail '
@@ -2304,9 +2309,22 @@ function startServer() {
       const execMHz = wallS > 0 ? execD / wallS / 1e6 : 0;
       const credMHz = wallS > 0 ? credD / wallS / 1e6 : 0;
       const ratio = credD > 0 ? execD / credD : 0;
-      console.log('[mips] EXECUTED=' + execMHz.toFixed(1) + ' MHz  CREDITED=' + credMHz.toFixed(1)
-        + ' MHz  ratio=' + (ratio * 100).toFixed(1) + '%  phantom=' + ((1 - ratio) * 100).toFixed(1)
-        + '%  (steady ' + wallS.toFixed(1) + 's; native Gekko=486 MHz)');
+      // [mips-gate 2026-09-02] The meter's 6-op prologue RMW is now emit-time
+      // gated on SAB cell 0x026B39B8 and ships OFF (gamecube/docs/
+      // executed-op-census/TASKS.md — it was 30% of the whole block prologue).
+      // An UNARMED run therefore reads execD == 0, which formats as a perfectly
+      // plausible "EXECUTED=0.0 MHz ... phantom=100.0%". Say ARMED/OFF instead of
+      // printing a number that looks measured: a silent instrument failure that
+      // still prints a number is the exact class CLAUDE.md gate #10 exists for.
+      if (execD === 0) {
+        console.log('[mips] METER OFF (no ops emitted; SAB cell 0x026B39B8 = 0) — '
+          + 'add ?bjit_mips=1 to arm it. CREDITED=' + credMHz.toFixed(1)
+          + ' MHz over ' + wallS.toFixed(1) + 's. NOT a 0 MHz reading.');
+      } else {
+        console.log('[mips] EXECUTED=' + execMHz.toFixed(1) + ' MHz  CREDITED=' + credMHz.toFixed(1)
+          + ' MHz  ratio=' + (ratio * 100).toFixed(1) + '%  phantom=' + ((1 - ratio) * 100).toFixed(1)
+          + '%  (steady ' + wallS.toFixed(1) + 's; native Gekko=486 MHz)');
+      }
     } else {
       console.log('[mips] no steady-window sample (run shorter than MIPS_WINDOW_MS or meter compiled off)');
     }
