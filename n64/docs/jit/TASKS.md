@@ -379,26 +379,16 @@ code, but a block that stops polling".
     pkmnsnap            0.351   22.7   29.0      7.0       7.9      3.1
     flyingDragon        0.087   28.4    7.0      2.9      16.0      4.5
 
-- [ ] **Wave 11 (FP) is now the top lever on the heavy set**: converts plus
-      compares/BC1 are 61.4% (dk64), 77.4-80.5% (the three Banjo titles) and
-      42.0% (clayFighter) of everything still falling back. Two sub-levers,
-      and they are NOT equally risky:
-      - **compares + BC1 are exactly emittable with plain wasm** and should
-        go first. Read fpu.h:222-300: `c_lt_s`/`c_le_s`/`c_seq_s`/`c_ngl_s`/
-        `c_nge_s`/`c_ngt_s` have NO isnan special case at all, and
-        `c_eq_s`/`c_olt_s`/`c_ole_s` clear the bit on NaN — which is exactly
-        what wasm `f32.eq/lt/le` already return for NaN. The `u`-prefixed
-        forms (`c_ueq/ult/ule`) SET the bit on NaN, so they need an explicit
-        `(s != s) | (t != t) |` term. BC1F/BC1T/BC1FL/BC1TL are just a branch
-        on FCR31 bit 23 (0x800000) — and today each one ALSO ends the block,
-        so the wave-8 argument applies: they cost more than their share.
-      - **converts are the risky half.** `trunc_w_s` is `(int32_t)truncf(f)`
-        (fpu.h:126-129) — C undefined behaviour out of range, so its wasm
-        lowering in the SHIPPED dist binary decides the answer, and
-        `cvt_w_s`/`cvt_s_w` route through `set_rounding()`/FCR31&3
-        (fpu.h:64-93, :178-200). Determine what the vendored .wasm actually
-        emitted BEFORE writing an emitter, or the bit-exactness gate will
-        fail on out-of-range and non-default-rounding inputs.
+- [x] **Wave 11 (FP) — 11a (converts) DONE 2026-09-01, 11b (compares + BC1)
+      DONE 2026-09-02.** Both sub-levers landed. The risk assessment written
+      here was BACKWARDS in both halves and both corrections came from reading
+      a compiled/dispatched artifact rather than the C:
+      - ~~compares + BC1 are exactly emittable with plain wasm~~ — TRUE for
+        the FCR31 result, FALSE for the instruction. Eight of the sixteen
+        predicates carry an `isnan -> stop = 1` side effect that fpu.h does
+        not show. See the wave-11b section.
+      - ~~converts are the risky half~~ — they were the SAFE half once the
+        shipped binary's own lowering was disassembled. See wave 11a.
 - [ ] **dk64 has a cheap 64-bit-integer cluster** the reference trio does not:
       DMULT 3.2% + DADD 3.2% + DSLL32 2.8% + DSRA32 2.8% + DMULTU 2.8%
       = ~14.7% of its remaining fallbacks, and every one of them is an exact
@@ -619,7 +609,21 @@ same wasm type and join immediately.
       live ROMs, read off `__jitStats()` in `tools/n64_jit_diff_test.mjs` runs
       that also returned determinismControl PASS and jitVsInterp PASS at 600 VI:
       **sm64 382, mariokart 125, oot 809** (0 emitFails, 0 instantiateFail on
-      all three). That is the single direct observation this item asked for, and
+      all three). ⚠ **THOSE THREE NUMBERS ARE INFLATED — the counter
+      double-counted, fixed 2026-09-02.** `emitCop1` is the only emitter that
+      bumps a stat itself, and compileSpan PROBES a branch's delay slot with a
+      throwaway register cache before deciding to emit it — the probe discarded
+      its bytes but kept the increment, so every FP op in a delay slot counted
+      twice. Proven by the wave-11b unit corpus, which read `nativeFPCmp` = 2
+      for a single C.LT.S in a delay slot; fixed in compileSpan by restoring
+      the two counters around the probe. The conclusion is unchanged (nonzero
+      is nonzero) but a liveness counter that over-reports is worse than none.
+      The post-fix readings are sm64 348, mariokart 116, oot 750 — **but those
+      are NOT a clean isolation of the fix**: they come from the wave-11b
+      build, which also changed which spans compile (mariokart 475 -> 481
+      blocks), so part of each delta is emission change, not de-duplication.
+      Only the double-count itself is proven; the size of it is not measured.
+      That is the single direct observation this item asked for, and
       it replaces the two-step inference below. Taken incidentally while gating
       the restored emsdk-6.0.2 core build (213d49c0) — on the REBUILT binary,
       whose emission stats are bit-identical to the vendored core's, so it
@@ -642,6 +646,217 @@ same wasm type and join immediately.
       waiter that loses ~12 races in a row starves while the box sits at load
       0.5-1.0.
       </details>
+
+## Wave 11b (2026-09-02) — FP compares + BC1 native; the wrapper fpu.h hides
+
+Landed in `2877e30f`. `jit_params[43] = &FCR31` was the one line 11a was
+blocked on; the emsdk-6.0.2 build restore (action #4) unblocked it, and the
+core now rebuilds and ships from source with the param added.
+
+**THE PLAN CHANGED ON A CODE READ, and this is the wave's main lesson.** The
+bullet above called compares "exactly emittable with plain wasm" on the
+strength of `fpu.h:222-388`. That reading is right about the FCR31 result and
+WRONG about the instruction. The dispatched op is not the fpu.h helper: for the
+eight SIGNALLING predicates — **SF NGLE SEQ NGL LT NGE LE NGT, fn 0x38-0x3F** —
+`mips_instructions.def` wraps the helper (`:1301-1391` for the S forms,
+`:1000-1090` for the D forms) in
+
+    if (isnan(*reg_cop1_simple[cffs]) || isnan(*reg_cop1_simple[cfft]))
+    { DebugMessage(M64MSG_ERROR, "Invalid operation exception in C opcode");
+      stop = 1; }
+
+and `stop` is the global that ends emulation (`r4300.c:53`, checked at
+`:147-166`). The FCR31 bit comes out **identical** either way, so a plain-wasm
+emitter is bit-exact on every architectural checksum this campaign gates on —
+GPR, CP0, FPR, FCR31, PC — and still fails to halt where the interpreter halts.
+`C.LT.S` and `C.LE.S` are in that group and are the two most common FP compares
+in these ROMs (dk64 census: `C.LT.S` 117,406 + `C.LE.S` 23,051 executions in
+one window), so this was not a corner. Those eight now carry a NaN pre-test
+that hands the instruction back to the interpreter and exits; the
+non-signalling eight (fn 0x30-0x37) have no wrapper and need no guard.
+
+**Same shape as wave 11a**: read the code that actually runs, not the helper it
+calls. 11a had to disassemble the shipped `.wasm` because fpu.h's casts are C
+UB; 11b had to read the `.def` because fpu.h is only half the instruction.
+
+Emission notes:
+- 12 of 16 predicates are ONE wasm compare. A wasm float relation is false
+  whenever an operand is NaN, which is exactly what fpu.h's isnan-clear forms
+  and its no-check forms both produce. The `u`-forms stay at one compare too:
+  **`ult(s,t) == !(s >= t)`** and **`ule(s,t) == !(s > t)`** (NaN makes ge/gt
+  false, so the negation is true; ordered operands give ordinary `<`/`<=`).
+  Only `UN` and `UEQ` genuinely need both operands twice, which is why
+  `L_F32B`/`L_F64B` were added — appended as NEW local groups so `L_F32`/
+  `L_F64` keep their wave-11a indices.
+- `C.F.*` takes no operands at all (`fpu.h:221-224`) and loads none.
+- **BC1 decodes as `recomp_bc[(word >> 16) & 3]` (`recomp.c:1584`) — bits 20:18
+  are IGNORED.** The emitter mirrors that mask, not MIPS-IV's wider `cc` field,
+  because the interpreter is the oracle.
+- `DECLARE_JUMP`'s `cop1` flag (`mips_instructions.def:741-744`) runs
+  `check_cop1_unusable()` BEFORE anything else, and on CU1-clear it raises the
+  exception and returns WITHOUT branching. Emitted as a bail PREFIX rather than
+  a wrapper: at that point not one byte of the instruction has run, so
+  re-executing the whole branch under the interpreter is exact — the same
+  argument `slowArm()` makes for a faulting delay slot, only stronger (there
+  the link register had already been written).
+- **VERSION SKEW FAILS SAFE.** FCR31 sits ~6.8 MB from `reg_cop1_simple` in a
+  different section, so unlike wave 10a's `g_cp0_regs` there is NO layout
+  identity to assert. A page reading index 43 of an OLD 43-entry `jit_params`
+  would get adjacent static data and **store the condition bit through it**.
+  `jit_params[44]` now carries a magic (`0x4E36344A`) the page must match
+  before it trusts index 43; without it compares and BC1 fall back.
+  `__jitStats().fcr31` surfaces the value so a skew reads as `fcr31: 0` rather
+  than as silently-zero counters — a zero counter alone cannot distinguish
+  "core too old" from "this ROM has no FP compares".
+
+- [x] **Differential PASS x5 at 600 VI with the determinism control PASS on
+      every one**, `CPU_Speed_Limit` 100 before and after, load 1.0-4.0:
+      mariokart, sm64, oot, dk64, bk-jiggiesoftime. 0 emitFails, 0 page errors.
+      `fcr31` nonzero (71215636) on all five, which is what proves the magic
+      matched in the shipped core.
+
+        rom               blocks  nativeFP  FPCmp  FPBr  fallbackOps  (11a fbOps)
+        mariokart            481      1411     44    42          235        321
+        sm64                 851      5247    107   102          508        719
+        oot                 1487     10021    590   552          673       1820
+        dk64                1216     10535    494   448          839       1788
+        bk-jiggiesoftime    2064      8613    515   481          524          —
+
+- [x] **EXECUTION PROVEN, not inferred** — the wave-10a trap, closed with a
+      counting arm rather than an emit-site counter. Census A/B on dk64, same
+      `600 900` window, the emitter file swapped as the ONLY variable (same
+      core, same page, same drive script):
+
+        BC1FL  146,076 -> 0     C.LT.S  117,406 -> 0     BC1F   47,253 -> 0
+        C.LE.S  23,051 -> 0     C.EQ.S   19,419 -> 0     C.LE.D 18,570 -> 0
+        C.EQ.D   9,444 -> 0     C.LT.D    8,289 -> 0     BC1T    5,088 -> 0
+        BC1TL    1,068 -> 0                       TOTAL 395,664 -> 0
+
+      Total fallback EXECUTIONS 1,054,063 -> 655,551 (**-37.8%**), against the
+      class's measured 37.5% share — the drop tracks the target class and
+      nothing else, the same evidence shape wave 9 used. `fb/iter` 0.142 ->
+      0.088. Block iterations moved only +0.24% (7,420,747 -> 7,438,852), so
+      the ratio is meaningful. `BEQL@slot:C.EQ.S` (18,109) also disappeared:
+      branches rejected because their delay slot was a compare are now
+      emittable, a wave-8 knock-on that was not designed for.
+- [x] Unit corpus **47 -> 76 cases**, all green, red-test discipline verified:
+      run against `git show HEAD~1:...mips_emit.js`, **all 30 new cases FAIL**
+      and the 46 pre-existing ones still pass. The corpus models FCR31 and an
+      `opts.noFcr31` arm (an old core / magic mismatch) so the fall-back path
+      is covered too. The NaN cases are the load-bearing ones: `C.LT.S` with a
+      NaN operand must leave FCR31 untouched AND must not execute the next
+      in-block instruction, while `C.EQ.S` with the same input must do both —
+      an emitter without the signalling guard fails the first and passes the
+      second.
+- [ ] **HONEST LIMIT ON REACH.** Neither guard arm was observed firing on a
+      live ROM: no `CMPNAN:` and no `CU1MISS:BC1*` bucket appeared in the dk64
+      census window. They are proven by executing unit tests, not by a ROM —
+      the same standing caveat wave 6's `cuGuard` carries. A census sweep
+      looking specifically for those buckets across the heavy set would close
+      it.
+
+**Next FP items this exposed.** `CFC1` (13,620 execs) and `CTC1` (5,785) are
+now visible in dk64's post-wave ranking — they move FCR31/FCR0 wholesale and
+FCR31's address is finally available, so they are cheap. dk64's 64-bit integer
+cluster (DMULT 10.3% + DADD 10.2% + DSLL32 9.3% + DSRA32 9.3% + DMULTU 9.2% =
+**48.3% of what remains**, up from 14.7% pre-wave because the denominator
+shrank) is now by far its largest block, and every one is an exact wasm i64 op.
+
+## Full-library sweep, 27 ROMs (2026-09-02) — 24 PASS/PASS, and the 3 that did not
+
+`bash tools/probe_lock.sh run -- bash tools/n64_jit_sweep.sh`, 600 VI per ROM,
+interpreter/interpreter-control/`?jit` per ROM. `CPU_Speed_Limit` **100 on
+every row**, 1-minute load **2.46-6.34**. The determinism control PASSED on all
+27, so the method is valid everywhere — including on the three that failed.
+Full table in the commit; `fcr31` was nonzero on all 24 that reported stats,
+which is the shipped-core proof that the wave-11b version magic matched.
+
+**This sweep is the gate a5efb66 set before `?jit` can become the default, and
+it is NOT clean. Do not flip `n64/index.html:2200` (`if (!qs.has('jit'))
+return;`) until all three below are resolved.** The sweep earned its keep: two
+of the three are problems no per-wave gate in this campaign would ever have
+found, because both ROMs are outside the reference trio.
+
+### (1) `superMarioStarRoad.z64` — DIVERGED at frame 24. PRE-EXISTING.
+
+The first true correctness divergence this campaign has recorded. Localised in
+six runs and **NOT caused by wave 11b** — every step is a measurement:
+
+- **Control, HEAD~1 emitter, same ROM/frames: `DIVERGED at frame 24`, blocks
+  33, fallbackOps 48 — identical.** So it predates wave 11b. (It also has
+  `nativeFPCmp` 0 and `nativeFPBranches` 0, i.e. wave 11b emitted nothing at
+  all for this ROM.)
+- **Mode ladder** (the thewheel protocol): `?jit=wrap` **PASS**, `?jit=v05`
+  **PASS**, `?jit=nofp` **DIVERGED at 24**, `?jit=emit` **DIVERGED at 24**.
+  So: native emission, not plumbing, not instantiation, and NOT FP.
+- **Per-class ablation** (temporary `?noemit=<class>` hooks, added, used, and
+  REMOVED — the emitter is byte-identical to `2877e30f` and the unit corpus is
+  76/76 on it):
+
+        noemit=load    DIVERGED @24     noemit=store   DIVERGED @24
+        noemit=alu     DIVERGED @24     noemit=cop0    DIVERGED @24
+        noemit=branch  PASS
+
+- **Sub-ablation inside the branch path** — only one arm clears it:
+
+        noemit=brslot   DIVERGED @24    noemit=brreg    DIVERGED @24
+        noemit=brlikely DIVERGED @24    noemit=brplain  DIVERGED @24
+        noemit=brout    PASS
+
+  **So the fault is in the _OUT branch path — wave 7's `jump_to_address` /
+  `jump_to_func` tail (`emitOutJumpTail`), not wave 8's delay slots.**
+  ⚠ One caveat on that last step, stated because it is a real confound: both
+  PASSING arms (`branch`, `brout`) report 584 blocks while every failing arm
+  reports 33. The most likely reading is that 33 is a CONSEQUENCE — a run that
+  diverges at frame 24 never explores more code — and `brplain` is the control
+  for it (it holds blocks at 33, changes only WHICH branches are native, and
+  still fails). But "the culprit block simply never compiles under brout" has
+  not been positively excluded. The next step is to dump the _OUT branch sites
+  in those 33 blocks and diff one against the interpreter.
+
+### (2) `conker.z64` — NOT a wedge: **70x SLOWER** under `?jit`
+
+The sweep row is `NOJSON` because `n64_jit_diff_test.mjs` threw a 180 s
+timeout, and the throw is at **:61, the JIT arm** (both interpreter arms
+completed). That is the thewheel SHAPE but not the thewheel CAUSE.
+`n64_gameplay_ab.mjs conker.z64 ab 60 240` separates them, because it has a
+stall detector (`:114-120`, "VI stalled at N" after 60 s of no VI progress):
+
+        interp  perFrameMs = 6.574    lum 0.7   error=None
+        jit     perFrameMs = 460.782  lum 0     error=None
+        speedupWallX = 0.014
+
+**The stall detector never fired — VI kept advancing.** So this is a
+throughput pathology, not a hang: 460 ms per `retro_run` is ~2.2 VI/s, under
+the 3.33 VI/s that 600 VI in 180 s requires, which fully explains the sweep
+timeout. 70x is far beyond ordinary compile cost and points at recompile churn
+(every invalidation rebuilds a `WebAssembly.Module` synchronously inside
+`retro_run`, and compile time is charged to `retro_run`); `slotReuses` vs
+`distinctSlots` on a conker run would test that directly. **Whether wave 11b
+contributed is being controlled against the HEAD~1 emitter — do not assume
+either way until that row is filled in.**
+
+### (3) `gauntletLegends.z64` — same `NOJSON` at `:61`, cause not yet separated
+
+Identical signature to conker (JIT arm, 180 s timeout, interpreter arms fine).
+The wedge-or-slow discriminator was queued behind conker's and has not been
+read yet. Note the 2026-06-12 record has gauntlet running FASTER under `?jit`
+(1.94-2.0x), so a 70x regression there would be a large change from a known
+state — which is exactly why it needs measuring rather than assuming.
+
+### A rig limit this exposed
+`n64_jit_diff_test.mjs` hardcodes 180 s for the 600-VI wait, so ANY ROM slower
+than 3.33 VI/s reports as a failure indistinguishable from a wedge. It also
+runs the three arms in ONE browser with the jit arm always THIRD, so "jit arm"
+and "third arm" are confounded on any resource-exhaustion failure — the ladder's
+`wrap` rung is the control for that. Both are worth fixing before the next sweep.
+
+### Also visible in the table
+`nullOpsRejects` is nonzero on **every** ROM (22-187, and 0 only on
+superMarioStarRoad, which diverges too early to accumulate any). The
+thewheel null-ops guard was written for what looked like one ROM's bug; it is
+in fact refusing spans across the whole library, and every refused span stays
+on the cached interpreter. Nobody has measured what that costs.
 
 ## Action #1 EXECUTED — waves 8/9/10a priced on a quiet box (2026-09-01)
 
@@ -708,7 +923,27 @@ only a dead owner's lock, releases on every exit path, and — the part the bare
 returning**, because sibling BUILDS never took the lock and holding it does not
 by itself make the box quiet.
 
-## `n64_page_test.mjs` rafdedupe — NOT SETTLED (2026-09-01)
+## `n64_page_test.mjs` rafdedupe — ✅ SETTLED 2026-09-02: it was CONTENTION
+
+Re-run on a quiet box (`bash tools/probe_lock.sh run -- node
+tools/n64_page_test.mjs`, load 2.58, `CPU_Speed_Limit` 100), during the wave-11b
+page e2e gate. Verbatim from `/tmp/n64-11b-pagetest.log`:
+
+    "controlShownPerSec": 58.22124071192913,
+    "extraLoops": 2,
+    "withExtraShownPerSec": 58,
+    "inflation": 0.996,
+    "armTook": true,
+    "ok": true,
+    "why": "shown held at 58.2/s -> 58.0/s with 2 extra rAF loops"
+
+0.996 is inside the 0.9-1.1 band, and `armTook` is true so the arm was not a
+placebo. The 0.723 reading was the loaded box, exactly as the mechanical
+argument below predicted — the dedupe bug INFLATES `shown` and cannot produce a
+decrease. The suggestion below still stands on its own merits: record load
+alongside `inflation` so this does not have to be re-litigated.
+
+<details><summary>Original 2026-09-01 analysis, kept for the record</summary>
 
 Raised because a loaded box read the `rafdedupe` section RED: `shown` moved
 **58.86/s -> 42.58/s (0.723x)** when only the number of rAF CALLBACKS changed,
@@ -743,8 +978,22 @@ contention; if it reproduces near 0.72 with load < 2, it is a real pacing bug.
 Consider also making the assertion tolerate a downward move under load, or
 recording load alongside `inflation`, so this question does not have to be
 re-litigated every time the box is busy.
+</details>
 
-## Campaign state (2026-08-29)
+## Campaign state (2026-09-02)
+M0-M2 COMPLETE through **wave 11b**. All three opcode classes the post-wave-9
+census ranked are now native: SD/LD (wave 9), MFC0 (10a), and the whole FP
+block — converts (11a) plus compares and BC1 (11b). The core builds from
+source again and `jit_params` carries `&FCR31` behind a version magic.
+
+**What now stands between `?jit` and being the default**, in order:
+1. the 27-ROM sweep verdict (below) — `conker.z64` is the one open item;
+2. a THROUGHPUT number on a GAMEPLAY window. Every ratio this campaign owns
+   was measured on a menu (screenshot-proven) and the acceptance bar is
+   in-game. Waves 9/10a/11a/11b are all unpriced.
+
+The correctness picture below is unchanged and still applies.
+
 M0-M2 COMPLETE through wave 10a. The JIT is correctness-proven on the ROMs
 it has been gated against (every wave 600-1200 VI frames bit-identical vs the
 interpreter with GPR+CP0+FPR+FCR31 in the checksum; savestates; invalidation;
@@ -796,14 +1045,11 @@ NEXT ACTIONS, in order:
    available from this rig at all.
 2. ~~Fix the `thewheel.z64` `?jit` wedge~~ — ✅ DONE 2026-09-01 (607b3b1),
    a vendored-core null-ops bug, not an emitter bug. See its section above.
-3. Wave 11 — **11a (converts) DONE 2026-09-01**, see its section above.
-   **11b (compares + BC1) is UNBLOCKED as of 2026-09-01** — the build is
-   restored (action #4 below), so `jit_params[43] = (uint32_t)(uintptr_t)&FCR31;`
-   in `recomp.c` can now be added and shipped. This is the largest remaining FP
-   lever on the heavy set (19-33% of what still falls back on dk64/banjo).
-   Do it the documented way: edit `recomp.c`, `source emsdk/emsdk_env.sh && cd
-   n64/N64Wasm/code && make -j8`, then re-gate the dist as #4 did before
-   committing it — the build writes STRAIGHT INTO `../dist/`.
+3. ~~Wave 11~~ — ✅ **BOTH HALVES DONE**: 11a (converts) 2026-09-01, 11b
+   (compares + BC1) 2026-09-02 in `2877e30f`. `jit_params[43] = &FCR31` is in
+   the shipped core and the dist rebuilt from source. See both sections above.
+   The FP class that was 19-33% of dk64/banjo fallbacks is gone: on dk64 it
+   measured 37.5% of fallback EXECUTIONS and is now 0.
 4. ~~**RESTORE THE N64 CORE BUILD.**~~ — ✅ **DONE 2026-09-01** (4aaff9f2 source,
    39a8477f Makefile, 8110341a harnesses, 213d49c0 the shipped dist). The core
    builds from source under the vendored emsdk **6.0.2** and the rebuilt binary
@@ -845,12 +1091,10 @@ NEXT ACTIONS, in order:
    `cdnjs.cloudflare.com` because the vendored `dist/n64.html` test page pulls
    rivets/toastr/popper/nipplejs from a CDN. Neither is a core property; both
    would have been reported as regressions without a matched control arm.
-5. Full-library differential sweep (all 27 ROMs bit-identical per VI) — the
-   gate a5efb66 named before the ?jit default can flip. `thewheel` already
-   proves this sweep is not a formality. NOT attempted 2026-09-01: it is a
-   ~40-minute exclusive lock hold and the box ran at load 12-41 with several
-   sibling agents measuring; queueing it would have starved them. It should be
-   run as a single `probe_lock.sh run` batch on a quiet box.
+5. ~~Full-library differential sweep~~ — ✅ **RUN 2026-09-02, 24 of 27
+   PASS/PASS. THE `?jit` DEFAULT MUST NOT FLIP YET — see the three exceptions
+   below.** Now reproducible as `bash tools/probe_lock.sh run -- bash
+   tools/n64_jit_sweep.sh`, which exits nonzero unless every ROM is clean.
 
 ### On measuring action #1 — the load source was OURS (2026-09-01)
 Every discarded A/B in this file blames "machine load". The largest single

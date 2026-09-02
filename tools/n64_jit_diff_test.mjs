@@ -34,7 +34,12 @@ async function run(label, jit) {
   // &difftrace makes the PAGE enable capture at module-ready — always before
   // the ROM download/callMain, so every run starts capture at VI frame 0
   // (harness-side enabling raced the boot and misaligned streams by ~2 VIs)
-  await page.goto(`http://localhost:8080/n64/?game=${rom}&autostart&difftrace${jit ? '&jit=' + JIT_MODE : ''}`, { waitUntil: 'domcontentloaded' });
+  // N64_EXTRA_QS appends arbitrary query params to BOTH arms, so an ablation
+  // flag can be bisected without editing this file each time. It is applied to
+  // the interpreter arms too on purpose: an option that changed only the jit
+  // arm's URL would make the comparison measure the URL, not the emitter.
+  const extra = process.env.N64_EXTRA_QS ? '&' + process.env.N64_EXTRA_QS.replace(/^&/, '') : '';
+  await page.goto(`http://localhost:8080/n64/?game=${rom}&autostart&difftrace${jit ? '&jit=' + JIT_MODE : ''}${extra}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction('window.myApp && myApp.rivetsData.beforeEmulatorStarted === false', { timeout: 120000 });
   await page.waitForFunction(`Module._neil_diff_count() >= ${FRAMES}`, { timeout: 180000, polling: 500 });
   const sums = await page.evaluate((n) => { const a = []; for (let i = 0; i < n; i++) a.push(Module._neil_diff_get(i) >>> 0); return a; }, FRAMES);

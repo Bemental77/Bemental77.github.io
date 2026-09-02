@@ -139,6 +139,16 @@ compile error under the wasm flags).
   - `tools/n64_jit_census.mjs <rom> [warmupVI] [windowVI]` — runtime
     fallback ranking in a driven gameplay window. A COUNTING arm, so its
     numbers survive a loaded machine when no timing number does.
+  - `bash tools/probe_lock.sh run -- bash tools/n64_jit_sweep.sh [frames]` —
+    the full-library gate: the differential above over EVERY ROM in
+    `n64/N64Wasm/roms/`, one TSV row each (verdicts, emission stats, and the
+    load + `CPU_Speed_Limit` that row was taken under) at
+    `/tmp/n64-jit-sweep/summary.tsv`. This is the gate `a5efb66` set before the
+    `?jit` default can flip, and it exits nonzero unless every ROM is
+    PASS/PASS. A `NOJSON` row is a harness TIMEOUT, not a divergence — the
+    `threw@lineNN` column says which arm (`:59`/`:60` interpreter, `:61` jit),
+    and a `:61` throw is confounded because the jit arm is also the THIRD run
+    in the same browser. Run the mode ladder before hypothesising.
   - `tools/n64_gameplay_ab.mjs <rom> [ab|ba] [warmupVI] [windowVI]` —
     interpreter vs ?jit over the SAME guest window. Unlike
     `tools/_jit_speed_ab.mjs` it counts the window in VI FRAMES rather than
