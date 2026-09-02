@@ -12,8 +12,34 @@
 # CANONICAL FULL-BOOT BUILD (what gamecube/recomp/mp4_game.{js,wasm} is built from —
 # a bare invocation omits the AOT overlays and the live path WEDGES at the first
 # overlay switch, ~f1033 after Start; cost a debug detour 2026-08-26):
+#
 #   RECOMP_MODESEL=1 RECOMP_MENT=1 RECOMP_W01=1 bash gamecube/recomp/build_wasm.sh
 # (bootDll is on by default; RECOMP_*DIAG vars are temporary diagnostics, keep OFF.)
+#
+# ⚠ RECOMP_MUSYX=1 IS DELIBERATELY NOT IN THAT LINE — AUDIO IS PROVEN BUT NOT SHIPPABLE YET.
+#   Measured 2026-09-02, on gamecube.html, both arms hash-guarded before and after, box load
+#   4.0-5.3 throughout:
+#     * IT WORKS AT THE TITLE. tools/audio_probe.mjs (tap validated 12/12 by
+#       tools/audio_tap_selftest.mjs) read audible YES, 63.55 s audible, 2,035,503 audible
+#       frames, 0 gaps, 0 discontinuities, peak 0.0758, at speed 1.000x / 60 shown / 60
+#       published. The matched shipped-binary arm read 0 audible out of 2,596,864 RENDERED
+#       frames at the same 1.000x / 60 / 60, so the difference is the sound, not the rig.
+#     * IT WEDGES ONE SCREEN LATER. Driven with real key presses (Start, then A) into MP4's
+#       file-select flow, the RECOMP_MUSYX build TRAPS: the worker log says
+#       `[recomp-worker] main stopped: memory access out of bounds`, the page falls to
+#       0 shown / 0 published and speed decays 0.79x -> 0.24x STARVED, and it never recovers.
+#       2 of 2 runs. The SAME journey on the shipped binary and on the HEAD default build held
+#       speed 1.00x / 60 published to the end, and NEITHER logged the trap (0 of 2 each) — so
+#       the fault is the audio build, and the memory-card shim (present in the HEAD default
+#       arm too) is exonerated.
+#   Shipping it would trade a silent-but-correct default for an audible-but-broken one.
+#   UNVERIFIED LEAD for whoever fixes it: aramUploadData (shims/src/gc_musyx_aram.c:84-93)
+#   bounds-checks only the ARAM DESTINATION; the `mram` SOURCE is checked for NULL and nothing
+#   else, so a bad guest pointer memcpy's out of linear memory, which is what a wasm OOB trap
+#   looks like. That is a code read, not a diagnosis — instrument it before believing it.
+#   Re-gate with: tools/audio_probe.mjs (title) AND a scripted-input journey run past the title
+#   (gamecube/tools/dolphin_render_probe.js with PROBE_PRESS=start@30000,a@45000,...), because
+#   a title-only measurement CANNOT SEE THIS BUG.
 set -u
 DECOMP="${DECOMP:-$HOME/gc_refs/marioparty4}"
 RECOMP="$(cd "$(dirname "$0")" && pwd)"
@@ -611,10 +637,27 @@ fi
 
 # 4. compile game + high-level SDK translation units to wasm objects. Force-include
 #    the canonical prototypes (types-only base, so no implicit-decl shift).
-CFLAGS=( -c -std=gnu89 -O2 -w -Wno-error -Wno-implicit-function-declaration
-        -Wno-return-mismatch -Wno-int-conversion
+# [-Wreturn-type 2026-09-02] `-w` USED TO BE HERE and it hid the two defects that made the
+# game silent. A missing `return` is not cosmetic in this port: mwcc on PowerPC leaves the
+# value in r3, which IS the return register, so a function whose last statement is a call
+# "returns" that call's result by accident and the retail disc works. clang->wasm has no such
+# coincidence — it returns whatever is on the value stack, and the caller reads garbage.
+# `adsrSetup` (synth_adsr.c:106) was exactly this and its symptom was "17 macros run, 0 audible
+# samples", which reads as a mixer bug rather than a one-line codegen difference.
+#   ORDER MATTERS AND `-w` CANNOT BE USED: clang's `-w` disables every warning REGARDLESS of
+#   flag position, so appending -Wreturn-type after it is a placebo (measured: a sweep with
+#   `-w -Wreturn-type` reported 0 hits over the whole tree; the same sweep with
+#   `-Wno-everything -Wreturn-type` reported 17). -Wno-everything IS order-dependent, so it
+#   silences the noise while leaving this one class armed. -Wreturn-mismatch is the sibling
+#   clang split out of -Wreturn-type (a bare `return;` in a non-void function) and is the exact
+#   shape of PlayCharVoice/PlayStepFX below, so both are on.
+# Cost of arming it: 17 warnings tree-wide, all pre-existing, none in MusyX/msm. They are
+# REPORTED, not fixed, by this script — see the [return-type] summary after the compile loop.
+CFLAGS=( -c -std=gnu89 -O2 -Wno-everything -Wno-error -Wno-implicit-function-declaration
+        -Wno-int-conversion
         -Wno-incompatible-function-pointer-types -Wno-incompatible-pointer-types
         -Wno-builtin-requires-header -fno-builtin
+        -Wreturn-type -Wreturn-mismatch
         -DVERSION=0 -fdeclspec ${RECOMP_HSFDIAG:+-DRECOMP_HSFDIAG}
         -I "$BUILD/include" -I "$BUILD/gen" -I "$BUILD/extern/musyx/include" -I "$BUILD/src" )
 # NOTE: implicit-declaration signature mismatches (a bounded finite set surfaced at
@@ -622,7 +665,11 @@ CFLAGS=( -c -std=gnu89 -O2 -w -Wno-error -Wno-implicit-function-declaration
 # force-include-everything shortcuts (hand prototypes / all-headers) proved fragile
 # (wrong-arg protos; missing-header propagation) and were dropped. See PLAN.md.
 rm -rf "$BUILD/obj"; mkdir -p "$BUILD/obj"
-ok=0; fail=0; : > "$BUILD/fails.txt"
+ok=0; fail=0; : > "$BUILD/fails.txt"; : > "$BUILD/returns.txt"
+# Per-file stderr is overwritten by the next file, so the -Wreturn-type hits have to be
+# harvested at each call site or they are gone. Kept out of fails.txt: these units COMPILE.
+collect_returns() { grep -E '\[-W(return-type|return-mismatch)\]' "$1" 2>/dev/null |
+                    sed "s|$BUILD/||" >> "$BUILD/returns.txt" || true; }
 # Units whose bodies are PPC inline asm and are replaced by portable shims
 # (gamecube/recomp/shims/src): the whole dolphin/mtx math library.
 # Skip: (a) the mtx asm math lib (replaced by portable shims); (b) kerent.c — the
@@ -651,6 +698,7 @@ compile_one() {
   o="$BUILD/obj/$(printf '%s' "${f#$BUILD/}" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
   if emcc "${CFLAGS[@]}" "$f" -o "$o" 2>/tmp/ce.txt; then ok=$((ok+1)); else
     fail=$((fail+1)); echo "$(basename "$f"): $(grep -m1 'error:' /tmp/ce.txt | sed 's|.*error: ||')" >> "$BUILD/fails.txt"; fi
+  collect_returns /tmp/ce.txt
 }
 compile_dir() {
   for f in $(find "$1" -name '*.c' 2>/dev/null); do skip_unit "$f" && continue; compile_one "$f"; done
@@ -693,11 +741,13 @@ if [ -n "${RECOMP_MUSYX:-}" ]; then
     o="$BUILD/obj/$(printf '%s' "${f#$BUILD/}" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
     if emcc "${CFLAGS[@]}" "${MUSYCF[@]}" "$f" -o "$o" 2>/tmp/ce_mx.txt; then ok=$((ok+1)); musyx_ok=$((musyx_ok+1));
     else fail=$((fail+1)); echo "  musyx/$(basename "$f"): $(grep -m1 'error:' /tmp/ce_mx.txt | sed 's|.*error: ||')" >> "$BUILD/fails.txt"; fi
+    collect_returns /tmp/ce_mx.txt
   done
   for f in "$BUILD"/src/msm/*.c; do
     o="$BUILD/obj/$(printf '%s' "${f#$BUILD/}" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
     if emcc "${CFLAGS[@]}" "${MUSYCF[@]}" "$f" -o "$o" 2>/tmp/ce_mx.txt; then ok=$((ok+1)); musyx_ok=$((musyx_ok+1));
     else fail=$((fail+1)); echo "  msm/$(basename "$f"): $(grep -m1 'error:' /tmp/ce_mx.txt | sed 's|.*error: ||')" >> "$BUILD/fails.txt"; fi
+    collect_returns /tmp/ce_mx.txt
   done
   # The audio host layer: software AX mixer (gc_musyx_mix.c), MusyX SAL backend replacing
   # hw_pc.c (gc_musyx_hw.c), the AI DMA model that drives the whole chain off emulated time
@@ -708,6 +758,7 @@ if [ -n "${RECOMP_MUSYX:-}" ]; then
     o="$BUILD/obj/$(printf '%s' "${f#$BUILD/}" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
     if emcc "${CFLAGS[@]}" "${MUSYCF[@]}" "$f" -o "$o" 2>/tmp/ce_mx.txt; then ok=$((ok+1)); musyx_ok=$((musyx_ok+1));
     else fail=$((fail+1)); echo "  audio/$(basename "$f"): $(grep -m1 'error:' /tmp/ce_mx.txt | sed 's|.*error: ||')" >> "$BUILD/fails.txt"; fi
+    collect_returns /tmp/ce_mx.txt
   done
   echo "[recomp] RECOMP_MUSYX: $musyx_ok MusyX/msm/audio-host objects built"
 fi
@@ -800,6 +851,14 @@ if [ -n "${RECOMP_W01:-}" ]; then
 fi
 echo "[recomp] wasm objects: $ok built, $fail failed"
 echo "[recomp] object bytes: $(cat "$BUILD"/obj/*.o 2>/dev/null | wc -c)"
+# [return-type] The class that made the game silent. Each line is a function whose value the
+# caller reads but which never sets one under clang — harmless on mwcc/PPC, garbage here. This
+# is a REPORT, not a gate: the build does not fail on it, because every hit below is
+# pre-existing game code, not audio, and fixing them is a separate correctness exercise.
+if [ -s "$BUILD/returns.txt" ]; then
+  echo "[recomp] missing-return defects (-Wreturn-type/-Wreturn-mismatch): $(sort -u "$BUILD/returns.txt" | wc -l | tr -d ' ')"
+  sort -u "$BUILD/returns.txt" | sed 's/^/  /'
+fi
 echo "[recomp] top remaining blockers:"
 sed -E 's/[0-9]+/N/g' "$BUILD/fails.txt" | sed -E "s/'[^']*'/X/g" | sort | uniq -c | sort -rn | head -10
 

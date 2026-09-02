@@ -37,22 +37,46 @@ let parts = [], fstBuf = null;
 const PART_SIZE = 104857600;   // 100MiB fixed part boundaries (gamecube.html chunkRange)
 
 // ---- AUDIO transport (page AudioWorklet ring) -------------------------------------------
-// THE STATE OF THIS PATH, so nobody reads sound out of it that isn't there: the recomp is
-// SILENT and this carries no game audio yet. MP4's engine is MusyX (extern/musyx, 34 .c) plus
-// the 6 src/msm wrappers, and neither is compiled into mp4_game.wasm — every one of its 36
-// msm* entry points is a host import answered by `default: return 0` at the bottom of stub().
-// gamecube/recomp/build_wasm.sh RECOMP_MUSYX=1 compiles them (verified 2026-09-01: 39/39 TUs,
-// 0 signature mismatches, the 36 msm* imports go away) but that STILL yields no samples,
-// because on real hardware MusyX mixes on the DSP: hw_dolphin.c hands salBuildCommandList's
-// output to the `dspSlave` microcode (dsp_import.c:4, 0x19E0 bytes of GC-DSP code), and the
-// MUSY_TARGET_PC backend is a stub, not a software renderer (hw_pc.c:89 salAiGetDest returns
-// NULL). What is still missing upstream of here: (1) a software AX-style mixer over the _PB
-// voice blocks, (2) a big-endian byte swapper for /sound/mpgcsnd.msm.
+// THE STATE OF THIS PATH, so nobody reads sound out of it that isn't there. [2026-09-02] THE
+// SHIPPED gamecube/recomp/mp4_game.wasm IS STILL SILENT, and that is now a DELIBERATE choice
+// rather than a missing feature: the audio build exists, it works, and it is held back because
+// it breaks the game one screen later. Measured, both arms hash-guarded, box load 4.0-5.3:
+//   * RECOMP_MUSYX=1 build, title screen — audible YES: 63.55 s audible, 2,035,503 audible
+//     frames, 0 gaps, 0 discontinuities, peak 0.0758, at speed 1.000x / 60 shown / 60
+//     published. (tools/audio_probe.mjs; its tap validated 12/12 by tools/audio_tap_selftest.)
+//   * THE SHIPPED build, same page, same scene — 0 audible out of 2,596,864 RENDERED frames,
+//     also 1.000x / 60 / 60. So silence here is real silence, not a dead instrument: the
+//     transport below is healthy and pushing ~26,900 PCM frames/s of zeros.
+//   * RECOMP_MUSYX=1 build, one screen later — pressing Start and advancing into the
+//     file-select flow TRAPS with `main stopped: memory access out of bounds` (logged by this
+//     worker), after which the page reads 0 shown / 0 published and speed decays to 0.24x
+//     STARVED. 2 of 2 runs; the shipped and HEAD-default builds survived the same scripted
+//     journey at 1.00x / 60 published and logged no trap, 0 of 2 each.
+// See gamecube/recomp/build_wasm.sh's header for the re-gating recipe. The one thing to carry
+// forward: A TITLE-SCREEN AUDIO MEASUREMENT CANNOT SEE THAT BUG. Do not ship an audio build on
+// a title-only pass.
 //
-// What IS here is the transport those samples will ride, wired and measurable end to end:
-// this worker -> {cmd:'audio'} -> gamecube.html -> window._gcAudioPushSamples -> the SAB ring
-// -> /gamecube/audio-worklet.js -> ctx.destination. `?audiotest=1` feeds it a synthetic tone
-// so the wiring can be PROVEN with tools/audio_probe.mjs rather than assumed.
+// Why compiling MusyX in was necessary but not sufficient: on real hardware MusyX mixes on the
+// DSP — hw_dolphin.c hands salBuildCommandList's output to the `dspSlave` microcode
+// (dsp_import.c:4, 0x19E0 bytes of GC-DSP code) — and the MUSY_TARGET_PC backend is a stub,
+// not a software renderer (hw_pc.c:89 salAiGetDest returns NULL). Three pieces closed it, all
+// under RECOMP_MUSYX: a software AX-style mixer over the _PB voice blocks (gc_musyx_mix.c), a
+// SAL backend + AI DMA model (gc_musyx_hw.c, gc_musyx_ai.c), and big-endian swappers for
+// /sound/mpgcsnd.msm and the sequences (gc_musyx_bswap.c, gc_musyx_song_bswap.c).
+//
+// ALSO OPEN, AND NOT THE SAME BUG: the sound is QUIET — title music peaks at 0.0758
+// (~-22 dBFS). It is NOT a global attenuation; the same build peaked 0.9037 later in the menu
+// flow. Two unverified candidates: (a) the mixer renders only the DRY stereo mix, so aux sends
+// (reverb/chorus), surround and studio-to-studio inputs contribute nothing; (b) OSGetSoundMode
+// reads an all-zero emulated SRAM (EXILock is a `return 0` host stub, so OSRtc.c:100 ReadSram
+// never fills it), so msmsys.c:909 selects MONO and every voice pans dead centre
+// (synth.c:670-692) instead of the SURROUND audio.c:62 would otherwise pick. Do not paper over
+// the level with a gain here — that would hide whichever one it is.
+//
+// The transport itself: this worker -> {cmd:'audio'} -> gamecube.html ->
+// window._gcAudioPushSamples -> the SAB ring -> /gamecube/audio-worklet.js -> ctx.destination.
+// `?audiotest=1` feeds it a synthetic tone so the wiring can be PROVEN independently of the
+// engine (it is NOT game audio and must never be quoted as evidence that the game has sound).
 //
 // GATE #9: the sample count is derived from viRetrace — EMULATED time — never from
 // performance.now(). Audio therefore cannot pull, push or stretch the guest clock, and
