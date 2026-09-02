@@ -89,6 +89,32 @@ if [ -n "${RECOMP_MUSYX:-}" ]; then
   #      compile AND behave identically; a plain void prototype makes sreset.c fail to compile.
   perl -0pi -e 's/void msmSysCheckInit\(void\)\s*\{\s*\n\s*sndIsInstalled\(\);\s*\n\}/s32 msmSysCheckInit(void)\n{\n    return sndIsInstalled();\n}/s' "$BUILD/src/msm/msmsys.c" 2>/dev/null || true
   perl -0pi -e 's/void msmSysCheckInit\(void\);/s32 msmSysCheckInit(void);/' "$BUILD/include/msm/msmsys.h" 2>/dev/null || true
+  #      SAME mwcc-r3 CLASS, AND IT WAS THE WHOLE REASON NOTHING EVER SOUNDED. synth_adsr.c:106
+  #      declares `u32 adsrSetup(ADSR_VARS*)` and its body is `adsr->state = 0;
+  #      salChangeADSRState(adsr);` with NO return. On PPC that is not a bug: salChangeADSRState
+  #      leaves its result in r3, which is also the return register, so adsrSetup returns it.
+  #      clang has no such accident. MEASURED in the emitted object before this fix
+  #      (wasm-objdump -d obj/extern_musyx_..._synth_adsr.c.o):
+  #          local.get 0 / i32.const 0 / i32.store8      ; adsr->state = 0
+  #          local.get 0 / call <salChangeADSRState> / drop
+  #          local.get 0 / end                           ; returns the ADSR_VARS* ARGUMENT
+  #      i.e. it returns a heap pointer, which is never 0 — and hw_dspctrl.c:545 reads it as
+  #          if (adsrSetup(&dsp_vptr->adsr) != 0) { salSynthSendMessage(v,0);
+  #                                                 salDeactivateVoice(v); continue; }
+  #      so EVERY voice was retired on the frame it started, before its _PB was ever filled.
+  #      Symptom it produced: msmSePlay returns entry ids, 17 macros run, cFlags 0x20->0x10 and
+  #      hwStart/salActivateVoice all fire (17 voices linked into active studio 0 immediately
+  #      before salBuildCommandList) — and 0 voices, 0 playing PBs and 0 non-zero samples
+  #      immediately after it. salChangeADSRState's real return is `VoiceDone`, i.e. "the
+  #      envelope is degenerate, do not start this voice", which is TRUE only for a zero
+  #      attack/decay/sustain envelope. Returning it is what the PPC binary did.
+  perl -0pi -e 's/(u32 adsrSetup\(ADSR_VARS\* adsr\) \{\s*\n\s*adsr->state = 0;\s*\n\s*)(salChangeADSRState\(adsr\);)/${1}return ${2}/s' "$BUILD/extern/musyx/src/musyx/runtime/synth_adsr.c" 2>/dev/null || true
+  #      hwSaveSample (hardware.c:478) is the ONE line that turns sdir->addr from a main-RAM
+  #      pointer into an ARAM offset, and its entire body is `#if MUSY_TARGET == MUSY_TARGET_DOLPHIN`.
+  #      With gc_musyx_aram.c supplying a real aramStoreData, that body is exactly what this port
+  #      needs, so un-gate it. Without this the store exists and nothing ever calls it, and every
+  #      _PB keeps the overflowing 0x80xxxxxx address described at the hw_aramdma.c exclusion.
+  perl -0pi -e 's/(void hwSaveSample\(void\* header, void\* data\) \{\n)\#if MUSY_TARGET == MUSY_TARGET_DOLPHIN\n(.*?)\#endif\n(\})/${1}${2}${3}/s' "$BUILD/extern/musyx/src/musyx/runtime/hardware.c" 2>/dev/null || true
   #      MusyX's own two: synthdata.c:672 calls free() with no prototype in scope (the decomp's
   #      own include/stdlib.h shadows the sysroot's and declares no free -> implicit int), and
   #      reverb_fx.c:20 declares ReverbHIModify void against reverb.c:82's bool definition.
@@ -656,6 +682,13 @@ if [ -n "${RECOMP_MUSYX:-}" ]; then
     # rather than left to -Wl,--allow-multiple-definition, because that resolves by link order
     # and has silently shadowed the wrong definition here before (the __frsqrte/sqrtf incident).
     case "$f" in */hw_pc.c) continue;; esac
+    # hw_aramdma.c's MUSY_TARGET_PC branch (:344-422) is stubs for the SAME reason and with a
+    # worse consequence: aramStoreData is `{}` on a void* return (:401) and aramUploadData has no
+    # body (:387), so no sample body is ever stored AND hwSaveSample (hardware.c:478, whose whole
+    # body is #if MUSY_TARGET_DOLPHIN) never rewrites sdir->addr from a main-RAM pointer to an
+    # ARAM offset. hw_dspctrl.c:594 then does `base = smp_info.addr * 2` on a 0x80xxxxxx pointer,
+    # which overflows 32 bits and loses bit 31. Replaced wholesale by shims/src/gc_musyx_aram.c.
+    case "$f" in */hw_aramdma.c) continue;; esac
 
     o="$BUILD/obj/$(printf '%s' "${f#$BUILD/}" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
     if emcc "${CFLAGS[@]}" "${MUSYCF[@]}" "$f" -o "$o" 2>/tmp/ce_mx.txt; then ok=$((ok+1)); musyx_ok=$((musyx_ok+1));
@@ -794,11 +827,17 @@ echo "[recomp] linking $(ls "$BUILD"/obj/*.o 2>/dev/null | wc -l) objects -> was
 #    mixer -> AI ring chain unreachable and strips it, taking the sound with it. Added only under
 #    RECOMP_MUSYX, because in the default build those symbols do not exist.
 AUDIO_EXPORTS=""
+# MusyX's ARAM (shims/src/gc_musyx_aram.c) is a 16 MB static, which pushes the module's own
+# static footprint past the default 32 MB INITIAL_MEMORY and fails the link outright with
+# `wasm-ld: error: initial memory too small, 40835536 bytes needed`. Raised ONLY under
+# RECOMP_MUSYX so the default build's link flags — and therefore its wasm — are untouched.
+AUDIO_INITMEM=33554432
 if [ -n "${RECOMP_MUSYX:-}" ]; then
-  AUDIO_EXPORTS=",___recomp_audio_pump,___recomp_audio_base,___recomp_audio_stat,___recomp_musyx_active_voices,___recomp_musyx_stat,___recomp_audio_selftest,___recomp_msm_bswap_unknowns"
+  AUDIO_EXPORTS=",___recomp_audio_pump,___recomp_audio_base,___recomp_audio_stat,___recomp_musyx_active_voices,___recomp_musyx_stat,___recomp_audio_selftest,___recomp_msm_bswap_unknowns,___recomp_musyx_aram_stat"
+  AUDIO_INITMEM=67108864
 fi
 if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.js" \
-     -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=33554432 \
+     -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=$AUDIO_INITMEM \
      -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=32768 ${RECOMP_PROFILING_FUNCS:+--profiling-funcs} \
      -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web,worker -sINVOKE_RUN=0 \
      -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm,___recomp_aram_base,___recomp_static_top,___recomp_card_base,___recomp_card_size,___recomp_card_seq,___recomp_card_adopt,___recomp_card_slots,___recomp_card_time"$AUDIO_EXPORTS" \

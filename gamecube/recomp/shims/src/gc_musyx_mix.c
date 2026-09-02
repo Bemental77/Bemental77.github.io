@@ -46,10 +46,15 @@ extern u8 salNumVoices;
 extern DSPstudioinfo dspStudio[8];
 extern DSPvoice* dspVoice;
 
-/* ARAM is a flat 16 MB buffer in this port (shims/src/gc_aram.c). Sample bodies are DMA'd into
- * it by MusyX's own aramStoreData (hw_aramdma.c:165), and every _PB address below is an offset
- * into it in that format's unit. */
-extern void *__recomp_aram_base(void);
+/* Sample bodies live in MusyX's OWN ARAM (shims/src/gc_musyx_aram.c), put there by aramStoreData
+ * and addressed by every _PB below as an offset into it, in that format's unit.
+ * NOT shims/src/gc_aram.c's `__recomp_aram` — that is the GAME's ARAM staging store for
+ * HuAR_DVDtoARAM, a different region with a different owner. Reading the wrong buffer is not a
+ * hypothetical: it measured `nonZeroARAM=0/512` under the read cursor of a healthy playing voice
+ * whose sample bytes were sitting in the other one. */
+extern void *__recomp_musyx_aram_base(void);
+/* Must equal gc_musyx_aram.c's MUSYX_ARAM_SIZE. Kept as a compile-time constant rather than a
+ * call to __recomp_musyx_aram_size() because it bounds every single accelerator byte fetch. */
 #define ARAM_SIZE 0x1000000u
 
 #define AX_FRAME_SAMPLES   160      /* one AI DMA buffer: 0x280 bytes / 4 = 160 stereo frames */
@@ -253,7 +258,7 @@ static void mix_voice(DSPvoice *dv, s32 *accL, s32 *accR) {
      * are applied, which is also where Dolphin puts it (AXVoice.h:424-425). */
     if (!pb) return;
 
-    const u8 *aram = (const u8 *)__recomp_aram_base();
+    const u8 *aram = (const u8 *)__recomp_musyx_aram_base();
     const u16 *patch = (const u16 *)dv->patchData;
     u32 ratio = HILO32(pb->src.ratioHi, pb->src.ratioLo);
     s16 buf[AX_SUBFRAME];
