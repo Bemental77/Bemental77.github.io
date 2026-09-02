@@ -352,12 +352,65 @@ function makeStub(n) {
         const stk = stkSchedule.get(viRetrace + 1) ?? [0, 0];
         if (Module.___recomp_set_inject_stkx) { Module.___recomp_set_inject_stkx(stk[0]); Module.___recomp_set_inject_stky(stk[1]); }
         viRetrace++;
+        pumpAudio();
         if (viRetrace >= PUMP_MAX) throw { __pumpDone: true };
         return 0;
       }
       default: return 0;
     }
   };
+}
+
+// ---- audio tap (RECOMP_MUSYX builds only) ------------------------------------------------
+// Drives ___recomp_audio_pump on the SAME schedule recomp_worker.js does — from
+// VIWaitForRetrace, with the sample count derived from viRetrace and nothing else — so what is
+// measured here is what the page would get, and no host clock can enter the guest's audio
+// timing (CLAUDE.md gate #9). It exists because "silent" needed to be attributable: the
+// counters below separate `no AI` from `AI but no voices` from `voices but no signal`.
+const AUDIO_RATE = 32000;
+// AUDIO_SELFTEST="frame:seId[,frame:seId...]" — call ___recomp_audio_selftest (msmSePlay) at
+// those retraces. Separates "the mixer cannot render" from "nothing has asked it to": the boot
+// parks on the title screen, so without this the mixer is measured with no voice ever started.
+const selftestSchedule = new Map();
+for (const tok of (process.env.AUDIO_SELFTEST || '').split(',').filter(Boolean)) {
+  const [fr, id] = tok.split(':');
+  selftestSchedule.set(parseInt(fr, 10), parseInt(id, 10));
+}
+let audioAcc = 0;
+const audio = { frames: 0, nonZero: 0, peak: 0, sumSq: 0, pumps: 0, maxVoices: 0, stat: [0,0,0,0,0,0,0,0] };
+function pumpAudio() {
+  if (!Module || !Module.___recomp_audio_pump || !Module.___recomp_audio_base) return;
+  if (selftestSchedule.has(viRetrace) && Module.___recomp_audio_selftest) {
+    const id = selftestSchedule.get(viRetrace);
+    const r = Module.___recomp_audio_selftest(id) | 0;
+    console.log(`[audio-selftest] frame ${viRetrace}: msmSePlay(${id}) -> ${r}`);
+  }
+  audioAcc += AUDIO_RATE;
+  const n = (audioAcc / 60) | 0;
+  audioAcc -= n * 60;
+  if (n <= 0) return;
+  audio.pumps++;
+  if (Module.___recomp_musyx_active_voices) {
+    const v = Module.___recomp_musyx_active_voices() | 0;
+    if (v > audio.maxVoices) audio.maxVoices = v;
+  }
+  if (Module.___recomp_musyx_stat) {
+    for (let i = 0; i < 8; i++) {
+      const v = Module.___recomp_musyx_stat(i) | 0;
+      if (v > audio.stat[i]) audio.stat[i] = v;
+    }
+  }
+  const got = Module.___recomp_audio_pump(n) | 0;
+  if (got <= 0) return;
+  const base = Module.___recomp_audio_base() >>> 0;
+  const pcm = new Int16Array(mem().buffer.slice(base, base + got * 4));
+  audio.frames += got;
+  for (let i = 0; i < pcm.length; i++) {
+    const a = Math.abs(pcm[i]);
+    if (a) audio.nonZero++;
+    if (a > audio.peak) audio.peak = a;
+    audio.sumSq += pcm[i] * pcm[i];
+  }
 }
 
 const instantiateWasm = (info, receive) => {
@@ -406,6 +459,19 @@ catch (e) {
 const drawsTotal = frames.reduce((s, f) => s + Math.max(0, f.draws), 0);
 const last = frames[frames.length - 1] || { bytes: 0, draws: 0 };
 const fib = (n) => (Module['___gc_fiber_stat_' + n] ? Module['___gc_fiber_stat_' + n]() : -1);
+if (Module && Module.___recomp_audio_pump) {
+  const st = (i) => (Module.___recomp_audio_stat ? Module.___recomp_audio_stat(i) | 0 : -1);
+  const rms = audio.frames ? Math.sqrt(audio.sumSq / (audio.frames * 2)) : 0;
+  console.log(`=== audio: pumps=${audio.pumps} framesOut=${audio.frames} nonZeroSamples=${audio.nonZero}` +
+              ` peak=${audio.peak} rms=${rms.toFixed(1)} maxActiveVoices=${audio.maxVoices}` +
+              ` | AI running=${st(0)} cbRegistered=${st(1)} ringDepth=${st(2)} inited=${st(3)}` +
+              ` | msmBswapUnknownReads=${Module.___recomp_msm_bswap_unknowns ? Module.___recomp_msm_bswap_unknowns() : '?'}`);
+  console.log(`=== audio stages (peak over the run): salNumVoices=${audio.stat[0]}` +
+              ` activeStudios=${audio.stat[1]} voiceMgrBusy=${audio.stat[2]}` +
+              ` pbPlaying=${audio.stat[3]} studioVoiceList=${audio.stat[4]}`);
+  console.log(`=== audio peaks (sampled at the 200Hz AI rate, inside the mixer):` +
+              ` voiceMgrBusy=${audio.stat[5]} pbPlaying=${audio.stat[6]} nonZeroMixedSamples=${audio.stat[7]}`);
+}
 console.log('=== result:', result);
 console.log(`=== frames=${frames.length} totalDraws=${drawsTotal} last={bytes:${last.bytes},draws:${last.draws}}`,
             `| dvd: ${dvdReads} reads / ${(dvdBytes / 1024) | 0}KB | OSReport: ${osReportN}`,

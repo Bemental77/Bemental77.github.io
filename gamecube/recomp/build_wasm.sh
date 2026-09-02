@@ -94,6 +94,23 @@ if [ -n "${RECOMP_MUSYX:-}" ]; then
   #      reverb_fx.c:20 declares ReverbHIModify void against reverb.c:82's bool definition.
   perl -0pi -e 's{\A(?!extern void free)}{extern void free(void *);\n}' "$BUILD/extern/musyx/src/musyx/runtime/synthdata.c" 2>/dev/null || true
   perl -0pi -e 's/extern void ReverbHIModify\(/extern bool ReverbHIModify(/' "$BUILD/extern/musyx/src/musyx/runtime/StdReverb/reverb_fx.c" 2>/dev/null || true
+  #  (d) [ENDIANNESS] The sound bank is a big-endian PowerPC asset and every reader — the msm
+  #      wrapper layer AND MusyX itself — uses native struct loads, with no byte-order handling
+  #      anywhere (grep bswap/endian over src/msm + extern/musyx: zero hits). MEASURED symptom
+  #      before this hook: `MSM(Sound Manager) Error:Error Code -121` = MSM_ERR_INVALIDFILE from
+  #      msmsys.c:807 reading `version` as 0x02000000 instead of 2, after which audio.c:57
+  #      `while (1);` parks the boot permanently.
+  #      msmFioRead (msmfio.c:11) is the single function all 15 bank reads funnel through, so
+  #      the swap hooks there and classifies each read by (file, offset) against the container's
+  #      own header. See shims/src/gc_musyx_bswap.c.
+  perl -0pi -e 's/(\n\s*)return fio\.read\(fileInfo, addr, length, offset, 2\);/${1}{ extern void __recomp_bswap_msm_read(u32, void *, s32, s32);\n      BOOL r_ = fio.read(fileInfo, addr, length, offset, 2);\n      if (r_ >= 0) __recomp_bswap_msm_read((u32)fileInfo->startAddr, addr, length, offset);\n      return r_; }/' "$BUILD/src/msm/msmfio.c" 2>/dev/null || true
+  #      Songs are reached by TWO routes — a DVD read into songBuf (msmmus.c:352) and a direct
+  #      pointer into an already-loaded group blob (msmmus.c:364) that never passes through
+  #      msmFioRead — so the sequence swap hooks where both converge: the `arrfile` handed to
+  #      sndSeqPlay (msmmus.c:392). The swapper is idempotent per ARR base for that reason.
+  perl -0pi -e 's{(sndSeqPlay\(\s*[^;]*?->sgid\s*,\s*[^;]*?->sid\s*,\s*)([A-Za-z_][\w\->\.]*)(\s*,)}
+                 {${1}__recomp_bswap_msm_song_ret($2)$3}sx;
+                 s{\A}{extern void *__recomp_bswap_msm_song_ret(void *);\n}' "$BUILD/src/msm/msmmus.c" 2>/dev/null || true
 fi
 # 3. programmatic fixes for non-mwcc-path decomp bugs (transform staged copy only).
 #    ext_math.h: forward decl missing ';' inside the #ifndef __MWERKS__ branch.
@@ -612,8 +629,13 @@ compile_one() {
 compile_dir() {
   for f in $(find "$1" -name '*.c' 2>/dev/null); do skip_unit "$f" && continue; compile_one "$f"; done
 }
-# portable replacements first
-for f in "$RECOMP"/shims/src/*.c; do compile_one "$f"; done
+# portable replacements first. gc_musyx_*.c are held back for the RECOMP_MUSYX block below:
+# they need -DMUSY_TARGET=0 for the MusyX headers, and compiling them here would also put the
+# real AI driver + the audio pump into the DEFAULT build, which must stay unaffected.
+for f in "$RECOMP"/shims/src/*.c; do
+  case "$f" in */gc_musyx_*.c) continue;; esac
+  compile_one "$f"
+done
 compile_dir "$BUILD/src/game"
 compile_dir "$BUILD/src/dolphin"
 compile_dir "$BUILD/src/libhu"
@@ -627,6 +649,14 @@ if [ -n "${RECOMP_MUSYX:-}" ]; then
   musyx_ok=0
   for f in $(find "$BUILD/extern/musyx/src/musyx/runtime" -name '*.c' 2>/dev/null); do
     case "$f" in */profile.c) continue;; esac      # not in MusyX's CMakeLists (needs musyx_priv.h)
+    # hw_pc.c is the library's DO-NOTHING target, not a software backend (salAiGetDest returns
+    # NULL at :89, salStartAi has no body at :82, salStartDsp is empty at :99). It is replaced
+    # wholesale by shims/src/gc_musyx_hw.c, which keeps hw_dolphin.c's AI rotation and callback
+    # chain and substitutes the software mixer for the dspSlave microcode. Excluded by name
+    # rather than left to -Wl,--allow-multiple-definition, because that resolves by link order
+    # and has silently shadowed the wrong definition here before (the __frsqrte/sqrtf incident).
+    case "$f" in */hw_pc.c) continue;; esac
+
     o="$BUILD/obj/$(printf '%s' "${f#$BUILD/}" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
     if emcc "${CFLAGS[@]}" "${MUSYCF[@]}" "$f" -o "$o" 2>/tmp/ce_mx.txt; then ok=$((ok+1)); musyx_ok=$((musyx_ok+1));
     else fail=$((fail+1)); echo "  musyx/$(basename "$f"): $(grep -m1 'error:' /tmp/ce_mx.txt | sed 's|.*error: ||')" >> "$BUILD/fails.txt"; fi
@@ -636,8 +666,17 @@ if [ -n "${RECOMP_MUSYX:-}" ]; then
     if emcc "${CFLAGS[@]}" "${MUSYCF[@]}" "$f" -o "$o" 2>/tmp/ce_mx.txt; then ok=$((ok+1)); musyx_ok=$((musyx_ok+1));
     else fail=$((fail+1)); echo "  msm/$(basename "$f"): $(grep -m1 'error:' /tmp/ce_mx.txt | sed 's|.*error: ||')" >> "$BUILD/fails.txt"; fi
   done
-  echo "[recomp] RECOMP_MUSYX: $musyx_ok MusyX/msm objects built (COMPILE-ONLY — there is still"
-  echo "[recomp]   no PCM source: the DSP microcode mixer and the .msm endian swap are missing)"
+  # The audio host layer: software AX mixer (gc_musyx_mix.c), MusyX SAL backend replacing
+  # hw_pc.c (gc_musyx_hw.c), the AI DMA model that drives the whole chain off emulated time
+  # (gc_musyx_ai.c), and the BE->LE swappers for the sound bank and the sequences
+  # (gc_musyx_bswap.c, gc_musyx_song_bswap.c). Built with MUSYCF so the two that include MusyX
+  # headers see the same MUSY_TARGET as the library.
+  for f in "$RECOMP"/shims/src/gc_musyx_*.c; do
+    o="$BUILD/obj/$(printf '%s' "${f#$BUILD/}" | tr '/' '_' | tr -c 'A-Za-z0-9_.-' '_').o"
+    if emcc "${CFLAGS[@]}" "${MUSYCF[@]}" "$f" -o "$o" 2>/tmp/ce_mx.txt; then ok=$((ok+1)); musyx_ok=$((musyx_ok+1));
+    else fail=$((fail+1)); echo "  audio/$(basename "$f"): $(grep -m1 'error:' /tmp/ce_mx.txt | sed 's|.*error: ||')" >> "$BUILD/fails.txt"; fi
+  done
+  echo "[recomp] RECOMP_MUSYX: $musyx_ok MusyX/msm/audio-host objects built"
 fi
 # [AOT-overlay, REL_ENDIANNESS_PLAN.md step 1] Compile the bootDll boot-logo overlay INTO the
 # DOL module (only its 3 units: executor.c shared prolog + bootDll/main.c + language.c). All 78
@@ -750,11 +789,19 @@ echo "[recomp] linking $(ls "$BUILD"/obj/*.o 2>/dev/null | wc -l) objects -> was
 #    supplies the 126 host-import stubs through instantiateWasm. -sASYNCIFY=1 enables the
 #    Binaryen asyncify pass + the fiber runtime. main is in DEFAULT_ASYNCIFY_EXPORTS so it is
 #    Promise-wrapped. EXPORTED_FUNCTIONS drives the glue export table (leading underscore).
+#    SAME TRAP, AUDIO: ___recomp_audio_pump/_base are only reachable from the HOST (recomp_worker.js
+#    pumpAudio calls them from VIWaitForRetrace), so without an export Binaryen proves the whole
+#    mixer -> AI ring chain unreachable and strips it, taking the sound with it. Added only under
+#    RECOMP_MUSYX, because in the default build those symbols do not exist.
+AUDIO_EXPORTS=""
+if [ -n "${RECOMP_MUSYX:-}" ]; then
+  AUDIO_EXPORTS=",___recomp_audio_pump,___recomp_audio_base,___recomp_audio_stat,___recomp_musyx_active_voices,___recomp_musyx_stat,___recomp_audio_selftest,___recomp_msm_bswap_unknowns"
+fi
 if emcc "$BUILD"/obj/*.o -o "$BUILD/mp4_game.js" \
      -sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=2176mb -sINITIAL_MEMORY=33554432 \
      -sASYNCIFY=1 -sASYNCIFY_STACK_SIZE=32768 ${RECOMP_PROFILING_FUNCS:+--profiling-funcs} \
      -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node,web,worker -sINVOKE_RUN=0 \
-     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm,___recomp_aram_base,___recomp_static_top,___recomp_card_base,___recomp_card_size,___recomp_card_seq,___recomp_card_adopt,___recomp_card_slots,___recomp_card_time \
+     -sEXPORTED_FUNCTIONS=_main,_gx_fifo_base,_gx_fifo_pos,_gx_fifo_reset,_OSSetArenaLo,_OSSetArenaHi,_emscripten_resize_heap,___gc_fiber_stat_fabricate,___gc_fiber_stat_enter,___gc_fiber_stat_swap,___DVDFSInit,___recomp_get_animtree,___recomp_get_bg_animtree,___recomp_get_anim_at,___recomp_get_anim_count,___recomp_set_inject_btn,___recomp_set_inject_dstk,___recomp_set_inject_stkx,___recomp_set_inject_stky,_HuMemHeapPtrGet,___recomp_dirty_base,___recomp_dirty_count,___recomp_dirty_overflow,___recomp_dirty_reset,___recomp_autoboard_arm,___recomp_aram_base,___recomp_static_top,___recomp_card_base,___recomp_card_size,___recomp_card_seq,___recomp_card_adopt,___recomp_card_slots,___recomp_card_time"$AUDIO_EXPORTS" \
      -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,HEAPU8,HEAP32,HEAPU32,wasmMemory,wasmExports \
      -Wl,--no-entry -Wl,--no-gc-sections -Wl,--allow-undefined -Wl,--allow-multiple-definition -O2 2>"$BUILD/link.txt"; then
   echo "[recomp] LINKED: $BUILD/mp4_game.js + $BUILD/mp4_game.wasm ($(stat -f%z "$BUILD/mp4_game.wasm" 2>/dev/null) bytes)"
