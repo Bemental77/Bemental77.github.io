@@ -133,10 +133,18 @@ The header states the rule verbatim:
 > *"V8's speculative inlining requires the call_indirect target to live in the
 > same instance's table, so the table MUST NOT be imported."*
 
-**Measured, six paired Chrome cells: B/A2 = 1.04, 0.80, 0.98, 1.07, 0.97, 1.01
-— median 0.99.** Making the table internal buys nothing detectable over an
-imported table, *provided the target is in the same instance*. Node agrees
-(median B/A2 = 0.96, i.e. arm B was slightly *slower*).
+**Measured, six paired Chrome cells: B/A2 = 1.040, 0.803, 0.984, 1.070, 0.968,
+1.009 — median 0.996.** Making the table internal buys nothing detectable over an
+imported table, *provided the target is in the same instance*.
+
+Node is not identical here and should not be reported as if it were: its six
+cells read 1.055, 1.029, 1.043, 1.003, 1.066, 1.020 — **median 1.036**, i.e. a
+small but consistently *positive* ~3-4% for the internal table, every cell above
+1.0. So V8 13.6 pays a few percent for an imported table and Chrome 152 pays
+nothing measurable. Either way the effect is one to two orders of magnitude
+below the 2.1-3.7x that same-instance buys, which is the decision-relevant fact;
+but "an internal table is worth ~0-4%" is the honest statement, not "worth
+nothing."
 
 This matters far more than it reads, because it removes the design constraint
 that made candidate #1 expensive. The doc's own reasoning was: *"an internal
