@@ -584,6 +584,22 @@ Ranking criterion: (expected effect on the *measured* profile) × (probability i
 
 ### #1 — Batch hot blocks into few multi-function modules with a **module-internal** table
 
+> **MEASURED 2026-09-02 — partly confirmed, and its central design constraint is
+> REFUTED.** `gamecube/tools/wasm_edge_cost_bench.mjs` priced the four topologies
+> directly (Chrome 152 and node, 12 cells, identical bodies/terminal/edge counts):
+> the shipping per-block-module edge costs **2.1-3.7x** more than a same-instance
+> edge, so the mechanism is real and larger than this section dared claim. **But
+> "module-internal" is not the operative word — SAME-INSTANCE is.** An imported
+> table costs nothing detectable once the target is in the caller's instance
+> (six paired Chrome cells, median 0.99x). The dispatch cache and the shared
+> `__indirect_function_table` therefore need no redesign at all. Two further
+> results bound the follow-through: a single module of **1024** functions loses
+> most of the win (B collapses 118 -> 38 Medge/s, stable over 10 reps), so the
+> hot set must span several modules; and at the recorded ~5% region hit rate the
+> blended speedup is **1.03x**, which is precisely why the three A/Bs below came
+> out negative. Full write-up + the unblocking plan:
+> `gamecube/docs/cross-instance-edge-cost/TASKS.md`.
+
 **Deployability:** shipping Chrome. No proposal, no flag.
 
 **External citations:**
@@ -652,6 +668,17 @@ loop.
 ---
 
 ### #2 — Emit the inline cache ourselves instead of relying on V8's (which cannot fire cross-instance)
+
+> **MEASURED 2026-09-02 — REFUTED at realistic scale. Do not build this.** Arm C
+> of `wasm_edge_cost_bench.mjs` is exactly this shape: guard the loaded slot
+> against each statically-known successor, direct `return_call` on a match, fall
+> back to the indirect edge. It wins at N=64 (175 vs 109 Medge/s) and **loses at
+> N=512 in 4 of 6 Chrome cells** (59.00 vs 84.41; 64.78 vs 69.66 on the
+> SAB-shaped cell). Across hundreds of functions the guard ladder and the code
+> growth cost more than the saved dispatch. This section's own stated risk — "if
+> the successor distribution at the hot edges is flat, this is pure added cost" —
+> is the right instinct; the measurement says it is worse than that, because it
+> loses even where the successor set is small and statically known.
 
 **Deployability:** shipping Chrome.
 

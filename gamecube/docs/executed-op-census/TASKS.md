@@ -321,6 +321,31 @@ all four profiles. It is still unmeasured, but it attacks a bigger and different
 bucket.
 
 **(c) The imported-table lever — real, but entangled, and NOT a flag flip.**
+
+> **UPDATED 2026-09-02 by measurement — this correction's DIAGNOSIS holds and its
+> PRESCRIPTION is wrong on two points.** See
+> `gamecube/docs/cross-instance-edge-cost/TASKS.md`.
+> 1. **"The compliant shape is inseparable from multi-block modules" is right;
+>    "the table must not be imported" is not.** An internal table buys nothing
+>    detectable in V8 (six paired Chrome cells, median 0.99x). What costs
+>    2.1-3.7x per edge is the target being in another INSTANCE. So the shared
+>    imported table and the global dispatch cache can be left alone — only module
+>    granularity has to change, which is a strictly smaller change than this
+>    paragraph assumes.
+> 2. **The circularity is already broken.** The runtime counter at
+>    `ppc_emit.cpp:1061` really is gated on `g_bem_promote_enabled`, but two
+>    ungated ranking signals exist on stock HEAD: `PROBE_PC_SAMPLE=1`
+>    (`dolphin_render_probe.js:40`, already consumed by
+>    `gamecube/tools/op_census_manifest.mjs`) and the per-module `callFrame.url`
+>    histogram of any existing `.cpuprofile`. Selection can be built and
+>    validated offline before anything is flipped — and seeding from a static
+>    list also keeps the promote-ring prologue compiled out, removing one of the
+>    three named regression causes by construction.
+>
+> Also sized there: at the recorded ~5% region hit rate the blended speedup is
+> **1.03x**, which quantitatively explains all three net-negative A/Bs; and a
+> single module of 1024 functions loses most of the win, so the hot set must span
+> several modules of a few hundred.
 `block_cache.h:17-20` states the rule verbatim: "V8's speculative inlining
 requires the call_indirect target to live in the same instance's table, so the
 table MUST NOT be imported." The shipping per-block path violates it at
