@@ -672,13 +672,15 @@ loop.
 > **MEASURED 2026-09-02 — REFUTED at realistic scale. Do not build this.** Arm C
 > of `wasm_edge_cost_bench.mjs` is exactly this shape: guard the loaded slot
 > against each statically-known successor, direct `return_call` on a match, fall
-> back to the indirect edge. It wins at N=64 (175 vs 109 Medge/s) and **loses at
-> N=512 in 4 of 6 Chrome cells** (59.00 vs 84.41; 64.78 vs 69.66 on the
-> SAB-shaped cell). Across hundreds of functions the guard ladder and the code
-> growth cost more than the saved dispatch. This section's own stated risk — "if
-> the successor distribution at the hot edges is flat, this is pure added cost" —
-> is the right instinct; the measurement says it is worse than that, because it
-> loses even where the successor set is small and statically known.
+> back to the indirect edge. It wins at N=64 (175 vs 109 Medge/s) and stops being
+> reliable at N=512: **9 of 12 cells across the two engines are a loss** (node
+> loses 6/6, C/B = 0.57-0.81; Chrome splits 3/3, C/B = 0.70-1.34), and the wins
+> do not reproduce between engines. Across hundreds of functions the guard ladder
+> and its code growth cost more than the saved dispatch. This section's own stated
+> risk — "if the successor distribution at the hot edges is flat, this is pure
+> added cost" — is the right instinct; the measurement says the problem is worse
+> than that, because it is unpredictable even where the successor set is small and
+> statically known.
 
 **Deployability:** shipping Chrome.
 

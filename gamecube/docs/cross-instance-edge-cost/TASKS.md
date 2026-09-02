@@ -169,11 +169,24 @@ engines penalise the topology; they do not penalise the same half of it.
 
 ### F3 — Candidate #2 (self-emitted inline cache of direct tail calls) is REFUTED at realistic scale
 
-Arm C beats the indirect arms at N=64 (175 vs 109 Medge/s) and **loses at
-N=512** in 4 of 6 Chrome cells (59.00 vs 84.41 at the SUCC=1/BODY=68 cell;
-64.78 vs 69.66 at the SAB-shaped cell). A guarded ladder of direct `return_call`s
-across hundreds of functions costs more in code growth than it saves in dispatch.
-Do not build the winliner-style IC as a standalone lever.
+Arm C beats the indirect arms at N=64 (175 vs 109 Medge/s), and at N=512 it stops
+being reliable. C/B per cell:
+
+| engine | C/B across the six N=512 cells | verdict |
+|---|---|---|
+| Chrome 152 | 1.34, 0.70, 0.71, 1.05, 0.93, 1.16 | beats both indirect arms in 3/6, loses to both in 3/6 |
+| node / V8 13.6 | 0.81, 0.66, 0.57, 0.80, 0.69, 0.71 | **loses to both in 6/6** |
+
+Nine of twelve cells are a loss and the wins do not reproduce across engines, so
+this is **no reliable win**, not a modest one — a guarded ladder of direct
+`return_call`s across hundreds of functions costs more in code growth than it
+saves in dispatch, and the swing (0.57x to 1.34x) says the outcome depends on
+inlining decisions we do not control. Do not build the winliner-style IC as a
+standalone lever.
+
+Note this is a weaker statement than "C is slower." It is "C is unpredictable at
+the scale that matters, and predominantly worse." A batching design should not
+count on it.
 
 ### F4 — Batch size has a ceiling, and it is below 1024
 
