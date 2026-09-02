@@ -2213,6 +2213,12 @@ N64Rate.selfTest = function (logFn) {
     if (mode === 'census') { window.__jitCensus = true; mode = 'emit'; }
     if (mode !== 'wrap' && mode !== 'v05') mode = 'emit';
     var wrapped = 0, calls = 0, canaryFired = 0, instantiateFail = 0;
+    // wave 11b: surfaced in __jitStats() so a param-block VERSION SKEW is
+    // visible as `fcr31: 0` rather than as silently-zero compare counters — a
+    // zero counter alone cannot distinguish "core too old" from "this ROM has
+    // no FP compares", and wave 10a's lesson was that an invisible no-op still
+    // passes every correctness gate.
+    var p_fcr31_seen = 0;
     function ping() { canaryFired++; if (canaryFired === 1) pageLog('[jit] canary: native block module EXECUTED'); }
     // The bridge passes one pointer to a 10-u32 param block (recomp.c):
     // [vaddr, entryPtr, span, srcPtr, stride, addrOff, &PC, &reg, &hi, &lo]
@@ -2235,7 +2241,16 @@ N64Rate.selfTest = function (logFn) {
         readmemD: Module.HEAPU32[q + 37], writememD: Module.HEAPU32[q + 38],
         rdRdramD: Module.HEAPU32[q + 39], wrRdramD: Module.HEAPU32[q + 40],
         jumpToAddr: Module.HEAPU32[q + 41], jumpToFunc: Module.HEAPU32[q + 42],
+        // wave 11b: &FCR31, but ONLY when the core stamped the param-block
+        // version magic at index 44. A core built before wave 11b has a
+        // 43-entry array, so reading index 43 would return whatever static
+        // data follows it — and the emitter would STORE the FP condition bit
+        // through that address. The magic makes a page/core skew fall back
+        // (compares + BC1 stay on the interpreter) instead of corrupting
+        // guest memory. recomp.c stamps it next to the pointer it guards.
+        fcr31: (Module.HEAPU32[q + 44] === 0x4E36344A) ? Module.HEAPU32[q + 43] : 0,
       };
+      p_fcr31_seen = p.fcr31;
       var entryOpsIdx = Module.HEAPU32[p.entryPtr >> 2];
       var idx = 0;
       if (mode === 'emit' && window.bementalMips) {
@@ -2262,7 +2277,7 @@ N64Rate.selfTest = function (logFn) {
     };
     window.__jitStats = function () {
       var s = { mode: mode, wrapped: wrapped, calls: calls, canaryFired: canaryFired, instantiateFail: instantiateFail };
-      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeMemSlots = e.nativeMemSlots; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.nativeFPCvt = e.nativeFPCvt || 0; s.nativeCop0 = e.nativeCop0; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; s.distinctSlots = e.distinctSlots; s.slotReuses = e.slotReuses; s.nullOpsRejects = e.nullOpsRejects || 0; }
+      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeMemSlots = e.nativeMemSlots; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.nativeFPCvt = e.nativeFPCvt || 0; s.nativeFPCmp = e.nativeFPCmp || 0; s.nativeFPBranches = e.nativeFPBranches || 0; s.fcr31 = p_fcr31_seen; s.nativeCop0 = e.nativeCop0; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; s.distinctSlots = e.distinctSlots; s.slotReuses = e.slotReuses; s.nullOpsRejects = e.nullOpsRejects || 0; }
       return s;
     };
     // ?jit=census dump: [[bucket, executions], ...] ranked. Buckets are

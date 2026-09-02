@@ -2490,7 +2490,7 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
       void gen_interrupt(void); /* interrupt.h not included in this TU */
       uint32_t jit_entry_i = (func & UINT32_C(0xFFF)) / 4;
       struct precomp_instr* jit_entry = block->block + jit_entry_i;
-      static uint32_t jit_params[43];
+      static uint32_t jit_params[45];
       int jit_idx;
       jit_params[0] = func;                                        /* entry vaddr */
       jit_params[1] = (uint32_t)(uintptr_t)jit_entry;              /* entry precomp_instr* */
@@ -2543,6 +2543,17 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
       jit_params[40] = (uint32_t)(uintptr_t)&write_rdramd;
       jit_params[41] = (uint32_t)(uintptr_t)&jump_to_address;
       jit_params[42] = (uint32_t)(uintptr_t)&jump_to_func;
+      /* wave 11b (FP compares + BC1) — FCR31 holds the COP1 condition bit
+       * (0x800000). Its address is NOT derivable from any other param: it
+       * lives ~6.8MB from reg_cop1_simple in a different section, so unlike
+       * g_cp0_regs (wave 10a) there is no layout identity the emitter can
+       * assert. A stale page reading index 43 out of a 43-entry array would
+       * get adjacent static data and STORE to it, silently corrupting guest
+       * memory instead of falling back — so index 44 carries a magic word the
+       * page must match before it trusts index 43 at all. Bump the magic
+       * whenever the meaning of an existing index changes. */
+      jit_params[43] = (uint32_t)(uintptr_t)&FCR31;
+      jit_params[44] = UINT32_C(0x4E36344A);                       /* 'N64J' — param-block version */
       jit_idx = EM_ASM_INT({
          return (typeof window !== 'undefined' && window.myApp && window.myApp.jitCompile)
             ? (window.myApp.jitCompile($0) | 0) : 0;

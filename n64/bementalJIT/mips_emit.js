@@ -64,6 +64,9 @@
     // wave 11a (FP converts)
     local_tee: 0x22, f32_const: 0x43, f64_const: 0x44,
     f32_lt: 0x5D, f64_lt: 0x63,
+    // wave 11b (FP compares): the rest of the float relational set
+    f32_eq: 0x5B, f32_ne: 0x5C, f32_gt: 0x5E, f32_le: 0x5F, f32_ge: 0x60,
+    f64_eq: 0x61, f64_ne: 0x62, f64_gt: 0x64, f64_le: 0x65, f64_ge: 0x66,
     f32_ceil: 0x8D, f32_floor: 0x8E, f32_trunc: 0x8F,
     f64_ceil: 0x9B, f64_floor: 0x9C, f64_trunc: 0x9D,
     i32_trunc_f32_s: 0xA8, i32_trunc_f64_s: 0xAA, i64_trunc_f32_s: 0xAE, i64_trunc_f64_s: 0xB0,
@@ -76,6 +79,11 @@
   // locals: 0,1 = i32 scratch (addr, word); 2..33 = i64 guest r0..r31
   var L_ADDR = 0, L_WORD = 1, L_REG0 = 2, L_I64S = 34, L_JT = 35, L_COND = 36; // i64 scratch (mult), i32 jump target, i32 branch condition
   var L_F32 = 37, L_F64 = 38;   // wave 11a: rounded-value scratch for the convert guard
+  // wave 11b: FP compares need BOTH operands in locals (the unordered
+  // predicates read each operand twice, for `x != x`). Appended as NEW local
+  // groups rather than widening the wave-11a pair, so L_F32/L_F64 keep their
+  // indices and roundToIntNat is untouched.
+  var L_F32B = 39, L_F64B = 40;
 
   function loadI64(addr) { return [OP.i32_const, 0x00, OP.i64_load, 0x03].concat(leb(addr)); }
   function loadI32(addr) { return [OP.i32_const, 0x00, OP.i32_load, 0x02].concat(leb(addr)); }
@@ -335,13 +343,26 @@
   // Returns { cond: null | (C)=>bytes, ... } — cond emission is DEFERRED so
   // that rejecting the candidate (IDLE/OUT/non-native slot) cannot poison
   // the cache compile-state with loads that were never emitted.
-  function decodeBranch(word, addr) {
+  function decodeBranch(word, addr, p) {
     var op = (word >>> 26) & 0x3F;
     var rs = (word >>> 21) & 0x1F, rt = (word >>> 16) & 0x1F;
     var imm = sext16(word & 0xFFFF);
     var bTarget = (addr + 4 + imm * 4) >>> 0;
     function cmpRR(opc) { return function (C) { return C.read(rs).concat(C.read(rt), [opc]); }; }
     function cmpRZ(opc) { return function (C) { return C.read(rs).concat([OP.i64_const, 0x00, opc]); }; }
+    // wave 11b: BC1F/BC1T/BC1FL/BC1TL — a branch on FCR31 bit 23. The core
+    // dispatches these as recomp_bc[(word >> 16) & 3] (recomp.c:1584), i.e.
+    // bits 20:18 are IGNORED, so the emitter mirrors that mask exactly rather
+    // than the wider MIPS-IV cc field. `cu1: true` marks the DECLARE_JUMP
+    // cop1 flag: check_cop1_unusable() runs BEFORE anything else
+    // (cached_interp.c:73-78), so compileSpan emits a bail prefix.
+    if (op === 0x11 && rs === 0x08) {
+      if (!p || !fcr31Ok(p)) return null;
+      var bcBytes = loadI32(p.fcr31).concat([OP.i32_const], sleb(0x800000), [OP.i32_and]);
+      if (!(rt & 1)) bcBytes = bcBytes.concat([OP.i32_eqz]);   // BC1F/BC1FL test == 0
+      return { cond: function () { return bcBytes.slice(); }, link: false,
+               likely: !!(rt & 2), target: bTarget, cu1: true };
+    }
     if (op === 0x00) { // SPECIAL: JR/JALR — runtime register target, ALWAYS the _OUT path
       var fn0 = word & 0x3F;
       var rdJ = (word >>> 11) & 0x1F;
@@ -660,6 +681,15 @@
   // push the float*/double* for FPR index i from the live bank
   function fprPtr(bank, i) { return [OP.i32_const, 0x00, OP.i32_load, 0x02].concat(leb(bank + i * 4)); }
 
+  // wave 11b: FCR31's address arrives as jit_params[43], gated by the version
+  // magic at [44] (recomp.c). Unlike wave 10a's g_cp0_regs there is NO layout
+  // identity to assert against another param — FCR31 sits ~6.8MB from
+  // reg_cop1_simple in a different section — so the ONLY protection against a
+  // page/core version skew is that magic plus this shape check. Emitting a
+  // store to a guessed address would silently corrupt guest memory instead of
+  // falling back, which is the failure this refuses.
+  function fcr31Ok(p) { return !!p.fcr31 && (p.fcr31 & 3) === 0; }
+
   // ---- COP1 converts (wave 11a) ----
   //
   // These are emitted from the SHIPPED dist binary's own lowering, not from a
@@ -766,6 +796,85 @@
     return [].concat(fprPtr(dstBank, fd), fprPtr(srcBank, fs), ld, [conv], st);
   }
 
+  // ---- COP1 compares (wave 11b) ----
+  //
+  // C.cond.fmt is `FCR31 = (FCR31 & ~0x800000) | (predicate << 23)`, and the
+  // 16 predicates differ ONLY in NaN handling. fpu.h:222-388 gives the
+  // FCR31 result for each, and wasm's float relations already match it for
+  // 12 of the 16: a wasm compare is false whenever either operand is NaN,
+  // which is exactly what fpu.h's isnan-clear and its no-isnan-check forms
+  // both produce. The four `u`-prefixed forms SET the bit on NaN, and are
+  // built here without a second compare of the same pair:
+  //     ult(s,t) == !(s >= t)     ule(s,t) == !(s > t)
+  // (NaN makes ge/gt false, so the negation is true — and for ordered
+  // operands the negation is the ordinary <, <=.) `un` and `ueq` genuinely
+  // need both operands twice, which is why L_F32B/L_F64B exist.
+  //
+  // ⚠ THE HALF fpu.h DOES NOT SHOW, and it changed this wave's plan. The
+  // dispatched instruction is NOT just the fpu.h helper: for the eight
+  // SIGNALLING predicates — SF NGLE SEQ NGL LT NGE LE NGT, fn 0x38-0x3F —
+  // mips_instructions.def:1300-1390 wraps the helper in
+  //     if (isnan(fs) || isnan(ft)) { DebugMessage(...); stop = 1; }
+  // `stop` is the global that ends emulation (r4300.c:53,147-166). The FCR31
+  // result is identical either way, so a "plain wasm" emitter would look
+  // bit-exact on every architectural checksum and still fail to halt where
+  // the interpreter halts. n64/docs/jit/TASKS.md called these predicates
+  // "exactly emittable with plain wasm" reading fpu.h alone; they are not.
+  // So 0x38-0x3F carry a NaN pre-test that hands the instruction back to the
+  // interpreter (which then does the message, `stop`, and the compare). The
+  // non-signalling eight, fn 0x30-0x37, have no such wrapper and need no
+  // guard. This is the wave-11a lesson again: read the dispatched code.
+  var CMP_SIGNALLING = 0x38;   // fn >= this => the isnan/stop wrapper applies
+  // predicate -> i32 0/1, given both operands already in locals a/b
+  function cmpPredicate(isS, cond, a, b) {
+    var O = isS ? 'f32_' : 'f64_';
+    var A = [OP.local_get].concat(leb(a)), B = [OP.local_get].concat(leb(b));
+    var nanA = A.concat(A, [OP[O + 'ne']]);          // s != s
+    var nanB = B.concat(B, [OP[O + 'ne']]);          // t != t
+    var rel = function (o) { return A.concat(B, [OP[O + o]]); };
+    switch (cond) {
+      case 0x0: case 0x8: case 0x9: return [OP.i32_const, 0x00];  // F / SF / NGLE: always clear
+      case 0x1: return nanA.concat(nanB, [OP.i32_or]);            // UN
+      case 0x2: case 0xA: case 0xB: return rel('eq');             // EQ / SEQ / NGL
+      case 0x3: return nanA.concat(nanB, [OP.i32_or], rel('eq'), [OP.i32_or]); // UEQ
+      case 0x4: case 0xC: case 0xD: return rel('lt');             // OLT / LT / NGE
+      case 0x5: return rel('ge').concat([OP.i32_eqz]);            // ULT == !(s >= t)
+      case 0x6: case 0xE: case 0xF: return rel('le');             // OLE / LE / NGT
+      case 0x7: return rel('gt').concat([OP.i32_eqz]);            // ULE == !(s > t)
+      default: return null;
+    }
+  }
+  // `bailBytes` runs the interpreter op and exits; it is only reachable on the
+  // signalling predicates with a NaN operand.
+  function compareNat(p, isS, fn, fs, ft, bailBytes) {
+    var cond = fn & 0x0F;
+    var bank = isS ? p.cp1Simple : p.cp1Double;
+    var ld = isS ? [OP.f32_load, 0x02, 0x00] : [OP.f64_load, 0x03, 0x00];
+    var a = isS ? L_F32 : L_F64, b = isS ? L_F32B : L_F64B;
+    var pred = cmpPredicate(isS, cond, a, b);
+    if (pred === null) return null;
+    // C.F.* takes no operands at all (fpu.h:221-224 c_f_s()) and has no
+    // signalling wrapper, so it loads nothing.
+    var needOperands = (cond !== 0x0) || (fn >= CMP_SIGNALLING);
+    var out = needOperands
+      ? [].concat(fprPtr(bank, fs), ld, [OP.local_set], leb(a),
+                  fprPtr(bank, ft), ld, [OP.local_set], leb(b))
+      : [];
+    if (fn >= CMP_SIGNALLING) {
+      var A = [OP.local_get].concat(leb(a)), B = [OP.local_get].concat(leb(b));
+      var ne = OP[(isS ? 'f32_' : 'f64_') + 'ne'];
+      out = out.concat(
+        A, A, [ne], B, B, [ne], [OP.i32_or],
+        [OP.if_, OP.void_],
+          bailBytes,
+        [OP.end]);
+    }
+    // FCR31 = (FCR31 & ~FCR31_CMP_BIT) | (pred << 23)
+    return out.concat(storeI32(p.fcr31,
+      loadI32(p.fcr31).concat([OP.i32_const], sleb(~0x800000 | 0), [OP.i32_and],
+        pred, [OP.i32_const], sleb(23), [OP.i32_shl], [OP.i32_or])));
+  }
+
   function emitCop1(word, instrPtr, p, C, opsIdx, exitDepth, slow) {
     var op = (word >>> 26) & 0x3F;
     if (op !== 0x11) return null;
@@ -781,6 +890,7 @@
     // separately in stats so a wave that silently emitted NOTHING new cannot
     // pass the gates looking green — the wave-10a `nativeCop0` lesson.
     var fpCvt = false;
+    var fpCmp = false;
     if (sub === 0x00) {        // MFC1: rt = SE32(*(i32*)simple[fs])
       nat = fprPtr(p.cp1Simple, fs).concat([OP.i32_load, 0x02, 0x00], [OP.i64_extend_i32_s], C.writeFromStack(rt));
     } else if (sub === 0x04) { // MTC1: *(i32*)simple[fs] = rt32
@@ -806,12 +916,25 @@
         case 0x07: unop = S ? OP.f32_neg : OP.f64_neg; break;
         default:
           // wave 11a: TRUNC/CEIL/FLOOR .W/.L and CVT.D.S / CVT.S.D.
-          // ROUND.* (0x08/0x0C), CVT.W/L.* (0x24/0x25) and the compares
-          // (0x30-0x3F) still fall back — see the wave-11a note above.
+          // ROUND.* (0x08/0x0C) and CVT.W/L.* (0x24/0x25) still fall back —
+          // see the wave-11a note above. wave 11b adds the compares (0x30-0x3F).
           var rc = CVT_ROUND[fn];
           if (rc) { fpCvt = true; nat = roundToIntNat(p, S, rc[1], rc[0], fs, fd); break; }
           var pc1 = plainCvtNat(p, sub, fn, fs, fd);
           if (pc1) { fpCvt = true; nat = pc1; break; }
+          if (fn >= 0x30 && fcr31Ok(p)) {
+            // inside the CU1 guard's if-arm, and (for the signalling
+            // predicates) inside the NaN pre-test's if-arm: two frames above
+            // whatever depth the caller handed us.
+            var cmpBail = [].concat(
+              bump((slow ? 'SLOTCMPNAN:' : 'CMPNAN:') + mnem(word)),
+              preFlush,
+              storeI32Const(p.pcGlobal, slow ? slow.ptr : instrPtr),
+              [OP.i32_const], sleb(slow ? slow.opsIdx : opsIdx), [OP.call_indirect, 0x00, 0x00],
+              [OP.br].concat(leb(exitDepth + 2)));
+            var cm = compareNat(p, S, fn, fs, rt, cmpBail);
+            if (cm) { fpCmp = true; nat = cm; break; }
+          }
           return null;
       }
       if (nat === null) {
@@ -836,6 +959,7 @@
       return null; // BC1 branches, COP1 control moves (CFC1/CTC1): fallback
     }
     if (fpCvt) stats.nativeFPCvt++;
+    if (fpCmp) stats.nativeFPCmp++;
     return cuGuard(p, C, nat, instrPtr, opsIdx, exitDepth, word, slow, preFlush);
   }
 
@@ -949,7 +1073,7 @@
   }
 
   // ---- block compiler ----
-  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeMemSlots: 0, nativeLoads: 0, nativeStores: 0, nativeFP: 0, nativeFPCvt: 0, nativeCop0: 0, fallbackOps: 0, fails: 0, slotReuses: 0, distinctSlots: 0 };
+  var stats = { blocks: 0, nativeOps: 0, nativeBranches: 0, nativeMemSlots: 0, nativeLoads: 0, nativeStores: 0, nativeFP: 0, nativeFPCvt: 0, nativeFPCmp: 0, nativeFPBranches: 0, nativeCop0: 0, fallbackOps: 0, fails: 0, slotReuses: 0, distinctSlots: 0 };
   // table slot per guest entry address: a recompile REUSES its slot via
   // wasmTable.set, unrooting the previous instance for GC — the table is
   // bounded by distinct block entries, not by recompile churn (vaddr keys
@@ -1008,7 +1132,7 @@
       // (b) native branch?
       var br = null, brOut = false, slotMem = false;
       var brReason = null;   // census: why a decodable branch was NOT emitted
-      var dec = decodeBranch(word, addr);
+      var dec = decodeBranch(word, addr, p);
       if (dec && i + 1 >= p.span) {
         brReason = 'span-end';
       } else if (dec) {
@@ -1024,12 +1148,22 @@
         probeC.loaded = C.loaded.slice(); probeC.dirty = C.dirty.slice();
         if (isIdle) brReason = 'idle';
         else if (emitAlu(slotWord, probeC) !== null) { br = dec; brOut = isOut; }
-        else if (emitSlotNative(slotWord, p.entryPtr + (i + 1) * p.stride, p, probeC,
-                                HEAPU32[(p.entryPtr + (i + 1) * p.stride) >> 2], 0,
-                                { ptr: instrPtr, opsIdx: HEAPU32[instrPtr >> 2] }) !== null) {
-          br = dec; brOut = isOut; slotMem = true;   // probe only — bytes discarded, probeC dies with it
+        else {
+          // The probe DISCARDS its bytes, but emitCop1 is the one emitter that
+          // bumps a stat itself — so a probed-then-emitted FP delay slot was
+          // counted TWICE (found by the unit corpus: nativeFPCmp read 2 for one
+          // C.LT.S in a slot; nativeFPCvt has had the same inflation since
+          // wave 11a). These counters are the LIVENESS evidence for a wave, so
+          // an over-reporting one is worse than none: restore them around the
+          // probe and let the real emission below do the counting.
+          var cvt0 = stats.nativeFPCvt, cmp0 = stats.nativeFPCmp;
+          var probed = emitSlotNative(slotWord, p.entryPtr + (i + 1) * p.stride, p, probeC,
+                                      HEAPU32[(p.entryPtr + (i + 1) * p.stride) >> 2], 0,
+                                      { ptr: instrPtr, opsIdx: HEAPU32[instrPtr >> 2] });
+          stats.nativeFPCvt = cvt0; stats.nativeFPCmp = cmp0;
+          if (probed !== null) { br = dec; brOut = isOut; slotMem = true; }
+          else brReason = 'slot:' + mnem(slotWord);
         }
-        else brReason = 'slot:' + mnem(slotWord);
       }
       if (br) {
         var slotWord2 = HEAPU32[(p.srcPtr >> 2) + i + 1];
@@ -1039,6 +1173,26 @@
         if (!brOut) {
           targetIdx = ((br.target - p.vaddr) | 0) / 4;
           targetPtr = p.entryPtr + targetIdx * p.stride;
+        }
+        // wave 11b: BC1* carry DECLARE_JUMP's cop1 flag, so
+        // check_cop1_unusable() runs FIRST and, when CU1 is clear, raises the
+        // exception and returns WITHOUT branching (cached_interp.c:73-78,
+        // cp0.c:76-85). Emit that as a bail PREFIX rather than wrapping the
+        // whole branch: at this point not one byte of this instruction has run,
+        // so re-executing the branch under the interpreter is exact — the same
+        // argument slowArm() makes for a faulting delay slot, only stronger
+        // (there, the link register had already been written).
+        var cu1Prefix = [];
+        if (br.cu1) {
+          cu1Prefix = [].concat(
+            loadI32(p.cp0Status), [OP.i32_const], sleb(0x20000000), [OP.i32_and], [OP.i32_eqz],
+            [OP.if_, OP.void_],
+              bump('CU1MISS:' + mnem(word)),
+              C.flushSnapshot(),
+              storeI32Const(p.pcGlobal, instrPtr),
+              [OP.i32_const], sleb(HEAPU32[instrPtr >> 2]), [OP.call_indirect, 0x00, 0x00],
+              [OP.br].concat(leb(EXIT + 1)),
+            [OP.end]);
         }
         var linkRegNo = br.link ? (br.linkReg !== undefined ? br.linkReg : 31) : -1;
         var linkBytes = br.link ? [OP.i64_const].concat(sleb((addr + 8) | 0), C.writeFromStack(linkRegNo)) : [];
@@ -1085,6 +1239,7 @@
         if (br.cond === null) {
           // unconditional: J/JAL/JR/JALR — capture, link, slot, count, flush, split
           body = body.concat(
+            cu1Prefix,
             captureBytes,
             linkBytes,
             emitSlot(C, EXIT),
@@ -1099,6 +1254,7 @@
           // if/else and can br out of the block, and stack residue across
           // those is needless risk
           body = body.concat(
+            cu1Prefix,
             br.cond(C), [OP.local_set], leb(L_COND),
             linkBytes,
             emitSlot(C, EXIT),
@@ -1114,6 +1270,7 @@
           C.invalidate();
         } else {
           body = body.concat(
+            cu1Prefix,
             br.cond(C),
             linkBytes,
             C.flush(),
@@ -1134,6 +1291,7 @@
           C.invalidate();
         }
         stats.nativeBranches++;
+        if (br.cu1) stats.nativeFPBranches++;   // wave-11b liveness counter
         if (slotMem) stats.nativeMemSlots++;
         i += 2;
         continue;
@@ -1202,7 +1360,7 @@
       storeI32Const(p.pcGlobal, p.entryPtr + p.span * p.stride)
     );
 
-    var full = [0x07, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7F, 0x01, 0x7D, 0x01, 0x7C,  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target, i32 branch-cond, f32+f64 convert scratch (wave 11a)
+    var full = [0x09, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7F, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7D, 0x01, 0x7C,  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target, i32 branch-cond, f32+f64 convert scratch (wave 11a), f32+f64 compare operand B (wave 11b)
       OP.block, OP.void_,
       OP.loop, OP.void_]
       .concat(bump('#block-iter'), body,
