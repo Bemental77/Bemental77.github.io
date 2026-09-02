@@ -32,7 +32,12 @@ const SRC = readFileSync(join(HERE, 'wasm_edge_cost_bench.mjs'), 'utf8').replace
 const CHROME = process.env.CHROME
   || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
-const PASS = ['N_BLOCKS', 'BODY_OPS', 'EDGES', 'SLICE', 'REPS', 'WARMUP', 'SUCC', 'SPREAD', 'ARMS'];
+// EVERY knob the bench reads must be listed. BATCHES and HIT were missing, and a
+// whole 5-point coverage sweep ran silently at the DEFAULTS — five identical
+// rows that looked like a flat curve. A knob that does not reach the arm is
+// indistinguishable from a knob that has no effect.
+const PASS = ['N_BLOCKS', 'BODY_OPS', 'EDGES', 'SLICE', 'REPS', 'WARMUP',
+              'SUCC', 'SPREAD', 'ARMS', 'BATCHES', 'HIT'];
 const envOut = {};
 for (const k of PASS) if (process.env[k] != null) envOut[k] = process.env[k];
 
@@ -65,7 +70,22 @@ for (const k of PASS) if (process.env[k] != null) envOut[k] = process.env[k];
 
     await page.evaluate(SRC);
     const result = await page.evaluate(() => globalThis.__EDGE_BENCH_RESULT || null);
-    if (!result) { console.error('NO RESULT — the bench threw; see [pageerror] above'); process.exitCode = 3; }
+    if (!result) { console.error('NO RESULT — the bench threw; see [pageerror] above'); process.exitCode = 3; return; }
+
+    // KNOB ECHO CHECK. The page reports the config it actually ran; every knob
+    // requested must come back equal. Without this, a knob missing from PASS
+    // runs the DEFAULT and the sweep silently produces identical rows that look
+    // like a real flat curve — which is exactly what happened to a 5-point
+    // coverage sweep before this check existed.
+    const bad = [];
+    for (const [k, v] of Object.entries(envOut)) {
+      if (!(k in result.config)) { bad.push(`${k}: not echoed by the bench`); continue; }
+      if (String(result.config[k]) !== String(v)) bad.push(`${k}: asked ${v}, ran ${result.config[k]}`);
+    }
+    if (bad.length) {
+      console.error('KNOB MISMATCH — this run does NOT measure what was asked:\n  ' + bad.join('\n  '));
+      process.exitCode = 4;
+    }
   } finally {
     await browser.close();
   }

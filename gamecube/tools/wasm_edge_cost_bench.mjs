@@ -114,14 +114,21 @@ const WORK = 0x3000;    // 4 live words the body reads and writes back
 // N_BLOCKS*PC_STEP, both asserted in main().
 const SUCC   = Number(ENV.SUCC   ?? 8);   // successor-table entries == HIT resolution
 const SPREAD = Number(ENV.SPREAD ?? 37);
-// GROUPS: arm G splits the N blocks into GROUPS modules of N/GROUPS functions.
+// BATCHES: arm G splits the N blocks into BATCHES modules of N/BATCHES functions.
 // In-group edges take that module's INTERNAL table; cross-group edges take the
-// shared IMPORTED table, exactly as a real batched JIT would. GROUPS=1 is arm B
-// plus a group test; GROUPS=N_BLOCKS is arm A plus a group test. The sweep
+// shared IMPORTED table, exactly as a real batched JIT would. BATCHES=1 is arm B
+// plus a group test; BATCHES=N_BLOCKS is arm A plus a group test. The sweep
 // between them is the realistic design space, because a single module of 1024
 // functions was measured to lose most of the batching win.
-const GROUPS = Number(ENV.GROUPS ?? 4);
-const GSIZE  = Math.floor(N_BLOCKS / GROUPS);
+// NOT named GROUPS. `GROUPS` is a special bash variable (the caller's group-ID
+// array) and a `GROUPS=8 cmd` assignment prefix is SILENTLY IGNORED — a whole
+// coverage sweep ran at the default and printed a believable flat curve twice
+// before this was found. `env GROUPS=8 cmd` works and a bash prefix does not,
+// which is what made it look like a bug in the runner. The knob-echo check in
+// the Chrome runner cannot catch this class: the variable never reaches the
+// node process at all, so there is nothing to compare against.
+const BATCHES = Number(ENV.BATCHES ?? 4);
+const GSIZE  = Math.floor(N_BLOCKS / BATCHES);
 const GSHIFT = Math.round(Math.log2(GSIZE));
 // HIT: the fraction of a block's successors that stay inside its own group.
 // This is the SELECTION POLICY variable — block_cache.cpp:205-232 blames all
@@ -143,22 +150,22 @@ const SUCC_IDX = [];
   //
   // Two modelling traps this shape exists to avoid, both of which produced
   // nonsense before:
-  //   * HIT=1 with GROUPS>1 TRAPS the chain inside one group — the working set
+  //   * HIT=1 with BATCHES>1 TRAPS the chain inside one group — the working set
   //     silently collapses to GSIZE blocks and even arm A (which has no groups)
-  //     sped up 2.7x across the sweep. HIT is clamped below 1 whenever GROUPS>1.
+  //     sped up 2.7x across the sweep. HIT is clamped below 1 whenever BATCHES>1.
   //   * A group of ONE block has no in-group successor except ITSELF, and a
   //     self-loop is a different, much faster shape than a chain edge (it read
   //     134 Medge/s where the arm should have matched A's 70).
-  // Arm A's own rate staying flat across a GROUPS/HIT sweep is the check that
+  // Arm A's own rate staying flat across a BATCHES/HIT sweep is the check that
   // the topology is being held fixed; if it moves, the sweep is invalid.
-  const usableHit = (GROUPS < 2 || GSIZE < 2) ? (GROUPS < 2 ? 1 : 0)
+  const usableHit = (BATCHES < 2 || GSIZE < 2) ? (BATCHES < 2 ? 1 : 0)
                                               : Math.min(HIT, (SUCC - 1) / SUCC);
   const inGroup = Math.round(usableHit * SUCC);
   for (let i = 0; i < N_BLOCKS; i++) {
     const myGroup = Math.floor(i / GSIZE), base = myGroup * GSIZE;
     const tIn  = base + ((i - base + 1) % GSIZE);                                  // in-group
-    const tOut = GROUPS < 2 ? ((i + 1) % N_BLOCKS)
-                            : (((myGroup + 1) % GROUPS) * GSIZE + ((i + 1) % GSIZE));  // other group
+    const tOut = BATCHES < 2 ? ((i + 1) % N_BLOCKS)
+                            : (((myGroup + 1) % BATCHES) * GSIZE + ((i + 1) % GSIZE));  // other group
     const idxs = [];
     for (let s = 0; s < SUCC; s++) idxs.push((s < inGroup ? tIn : tOut) % N_BLOCKS);
     SUCC_IDX.push(idxs);
@@ -399,17 +406,17 @@ function makeArm(name) {
     return { enter: inst.exports.run, label: 'B  one module, INTERNAL table' };
   }
   if (name === 'G') {
-    if (GSIZE * GROUPS !== N_BLOCKS) fatal('GROUPS must divide N_BLOCKS');
-    if ((GSIZE & (GSIZE - 1)) !== 0) fatal('N_BLOCKS/GROUPS must be a power of two');
+    if (GSIZE * BATCHES !== N_BLOCKS) fatal('BATCHES must divide N_BLOCKS');
+    if ((GSIZE & (GSIZE - 1)) !== 0) fatal('N_BLOCKS/BATCHES must be a power of two');
     const table = new WebAssembly.Table({ element: 'anyfunc', initial: N_BLOCKS, maximum: N_BLOCKS });
     let entry = null;
-    for (let g = 0; g < GROUPS; g++) {
+    for (let g = 0; g < BATCHES; g++) {
       const inst = new WebAssembly.Instance(new WebAssembly.Module(buildGroupModule(g)),
         { env: { memory, __indirect_function_table: table } });
       for (let k = 0; k < GSIZE; k++) table.set(g * GSIZE + k, inst.exports['f' + k]);
       if (g === 0) entry = inst.exports.f0;
     }
-    return { enter: entry, label: `G  ${GROUPS} modules x ${GSIZE} funcs, internal+shared` };
+    return { enter: entry, label: `G  ${BATCHES} modules x ${GSIZE} funcs, internal+shared` };
   }
   if (name === 'C') {
     const inst = new WebAssembly.Instance(new WebAssembly.Module(buildBatchModule('direct')), { env: { memory } });
@@ -458,7 +465,7 @@ function main() {
     fatal('ARMS DISAGREE on work done: ' + arms.map((a, i) => `${a.name}=${checks[i]}`).join(' '));
   }
   console.log(`# wasm chain-edge cost bench`);
-  console.log(`# N_BLOCKS=${N_BLOCKS} GROUPS=${GROUPS} HIT=${HIT} SUCC=${SUCC} BODY_OPS=${BODY_OPS} EDGES=${EDGES.toLocaleString()} SLICE=${SLICE} REPS=${REPS} WARMUP=${WARMUP}`);
+  console.log(`# N_BLOCKS=${N_BLOCKS} BATCHES=${BATCHES} HIT=${HIT} SUCC=${SUCC} BODY_OPS=${BODY_OPS} EDGES=${EDGES.toLocaleString()} SLICE=${SLICE} REPS=${REPS} WARMUP=${WARMUP}`);
   console.log(`# ${RUNTIME} — work-parity check PASS (${checks[0]} RMWs per arm)`);
   console.log('');
 
@@ -481,7 +488,7 @@ function main() {
   console.log(`\nratios vs ${arms[0].name} (${arms[0].label.trim()}):`);
   for (const a of arms) console.log(`  ${a.name.padEnd(4)} ${(out[a.name].median_medges_s / base).toFixed(4)}x`);
   const result = {
-    config: { N_BLOCKS, BODY_OPS, EDGES, SLICE, REPS, SUCC, SPREAD, runtime: RUNTIME },
+    config: { N_BLOCKS, BODY_OPS, EDGES, SLICE, REPS, WARMUP, SUCC, SPREAD, BATCHES, HIT, ARMS: ARMS.join(','), runtime: RUNTIME },
     arms: out,
   };
   globalThis.__EDGE_BENCH_RESULT = result;

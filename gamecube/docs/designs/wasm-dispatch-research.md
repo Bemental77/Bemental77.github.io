@@ -595,10 +595,19 @@ Ranking criterion: (expected effect on the *measured* profile) × (probability i
 > `__indirect_function_table` therefore need no redesign at all. Two further
 > results bound the follow-through: a single module of **1024** functions loses
 > most of the win (B collapses 118 -> 38 Medge/s, stable over 10 reps), so the
-> hot set must span several modules; and at the recorded ~5% region hit rate the
-> blended speedup is **1.03x**, which is precisely why the three A/Bs below came
-> out negative. Full write-up + the unblocking plan:
-> `gamecube/docs/cross-instance-edge-cost/TASKS.md`.
+> hot set must span several modules; and a coverage model put the blended gain at
+> the recorded ~5% region hit rate at 1.03x — **but that model was then refuted by
+> measurement.** Sweeping in-batch coverage from 0% to 87.5% at 8 modules x 64
+> functions moves the gain not at all (G/A = 1.885 / 1.966 / 1.814 / 1.711 /
+> 1.743 — flat). At **0% coverage**, where every edge still crosses instances
+> through the shared imported table, 8 modules still beat 512 modules-of-one by
+> **1.885x**, because a call site sees 8 target instances instead of 512. **The
+> variable is instance COUNT, not per-edge coverage** — which re-explains the
+> three A/Bs below better than the coverage wall did: promoting ~570 blocks while
+> thousands of per-block modules stay live barely moves the instance count, so the
+> benefit never appeared, while the promote-ring prologue and the per-miss
+> membrane crossing cost immediately. Full write-up + the unblocking plan:
+> `gamecube/docs/cross-instance-edge-cost/TASKS.md` (F8 supersedes F5).
 
 **Deployability:** shipping Chrome. No proposal, no flag.
 

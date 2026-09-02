@@ -342,10 +342,14 @@ bucket.
 >    list also keeps the promote-ring prologue compiled out, removing one of the
 >    three named regression causes by construction.
 >
-> Also sized there: at the recorded ~5% region hit rate the blended speedup is
-> **1.03x**, which quantitatively explains all three net-negative A/Bs; and a
-> single module of 1024 functions loses most of the win, so the hot set must span
-> several modules of a few hundred.
+> Also measured there: **in-batch coverage is not the variable.** Sweeping it
+> from 0% to 87.5% at 8 modules x 64 functions leaves the gain flat at
+> 1.71-1.97x, and at **0% coverage** — every edge still crossing instances —
+> 8 modules beat 512 modules-of-one by **1.885x**. What matters is how many
+> live INSTANCES a call site sees, so promotion should aim at collapsing the
+> module count rather than at capturing hot successors. A single module of 1024
+> functions loses most of the win, so the hot set must span several modules of a
+> few hundred.
 `block_cache.h:17-20` states the rule verbatim: "V8's speculative inlining
 requires the call_indirect target to live in the same instance's table, so the
 table MUST NOT be imported." The shipping per-block path violates it at

@@ -51,7 +51,7 @@ bash tools/probe_lock.sh run -- node gamecube/tools/wasm_edge_cost_bench_chrome.
 | A2 | 1 module, N funcs, table **imported** | isolates instance count from table provenance |
 | B | 1 module, N funcs, table **internal** | candidate #1 |
 | C | 1 module, N funcs, guarded **direct** `return_call` + indirect fallback | candidate #2, the self-emitted inline cache |
-| G | GROUPS modules × N/GROUPS funcs, internal table for in-group edges + the shared imported table for cross-group edges | the realistic batched design — and the shape `build_region_module_next` already emits (`ppc_emit.cpp:2288` imports the global table, `:2145-2147` declares an internal one) |
+| G | `BATCHES` modules × N/`BATCHES` funcs, internal table for in-group edges + the shared imported table for cross-group edges | the realistic batched design — and the shape `build_region_module_next` already emits (`ppc_emit.cpp:2288` imports the global table, `:2145-2147` declares an internal one) |
 
 ### Why node alone could not have answered this
 
@@ -210,7 +210,15 @@ them). **The actionable part is the constraint: batch at a few hundred functions
 not thousands.** The hot set therefore has to span *several* modules, and edges
 between them are cross-instance again — which is what arm G exists to price.
 
-### F5 — Coverage is the whole game, and the arithmetic explains all three recorded negatives
+### F5 — [SUPERSEDED BY F8 — read F8 first] A coverage model, and why it is wrong
+
+> ⚠ **This finding was refuted by my own follow-up measurement (F8). It is kept
+> because the reasoning is instructive and because the model's headline number
+> was quoted in three commits before F8 landed.** The model assumed an
+> out-of-batch edge costs the same as today's edge. **It does not** — in a
+> batched world there are only a handful of live instances, so even a 100%-miss
+> batch is ~1.9x faster than today. Coverage turns out to be nearly irrelevant;
+> instance COUNT is the variable. What follows is the superseded model.
 
 Blending the two measured edge costs — in-batch at rate `R` = 2.83x, out-of-batch
 at today's rate — gives `speedup(h) = 1 / (h/R + (1-h))` for in-batch hit rate `h`:
@@ -240,11 +248,62 @@ essentially everything to go right. **Treat 1.5-2x as the defensible target for
 this lever, not 2.83x.**
 
 > The model's one load-bearing assumption is that an out-of-batch edge costs the
-> same as today's edge, not more. That was **false** for the design that produced
-> the three negatives (it paid an extra EM_ASM membrane crossing per miss), and
-> `JitWasm.cpp:739-750` says that specific cost was already removed. The arm-G
-> sweep is the direct measurement that would replace this model; it was queued
-> behind a sibling's probe-lock hold and did not complete in this session.
+> same as today's edge. **F8 measured that assumption and it is false in the
+> optimistic direction.**
+
+### F8 — Coverage barely matters. INSTANCE COUNT is the variable. (This refutes F5.)
+
+Arm G, `BATCHES=8` (8 modules × 64 functions), N=512, SUCC=8, BODY_OPS=68,
+EDGES=30M, REPS=5 interleaved, Chrome 152, probe lock held, load 2.92 → 3.58:
+
+| HIT (in-batch edge fraction) | A | G | **G/A** |
+|---:|---:|---:|---:|
+| 0.000 | 38.57 | 72.71 | **1.885x** |
+| 0.250 | 37.56 | 73.86 | **1.966x** |
+| 0.500 | 43.07 | 78.10 | **1.814x** |
+| 0.750 | 44.66 | 76.41 | **1.711x** |
+| 0.875 | 44.25 | 77.10 | **1.743x** |
+
+**G/A is flat — 1.71x to 1.97x, with no trend — across the entire coverage
+range.** F5's model predicted 1.03x at low coverage and 2.4x at high; the
+measurement says ~1.8x everywhere.
+
+The `HIT=0` row is the decisive one. There, **every single edge leaves its batch
+and goes through the shared imported table to another instance** — arm G and arm
+A are executing the same edge kind, through the same table, with the same ops.
+The only surviving difference is that arm G's call sites see **8 target
+instances** and arm A's see **512**. That is worth **1.885x** by itself.
+
+So the mechanism is not "keep edges inside a module." It is **"stop having
+thousands of live instances."** V8's per-call-site instance check has to be
+monomorphic-ish to be cheap, and 512 modules-of-one guarantees it never is.
+
+**This changes the design target, and makes it easier.** The whole "coverage
+wall" framing — the thing all three recorded negatives were attributed to, and
+the thing F5 reconstructed arithmetically — is measuring the wrong variable.
+Promotion does not need to capture the successors of hot edges; it needs to
+capture *enough of the working set that few modules remain live*. It also
+re-explains the recorded negatives better than F5 did: promoting ~570 blocks
+into regions while thousands of per-block modules stay live barely moves the
+instance count, so the mechanism's actual benefit never had a chance to appear —
+while the promote-ring prologue, the per-miss membrane crossing and the
+region-first dispatch loop all cost immediately.
+
+**Validity caveat, stated not buried.** Arm A is *not* flat across this sweep —
+38.57 → 44.66, a 16% rise — so the topology is not perfectly held. That is
+expected and benign here: `HIT` changes the walk itself (at `HIT=0.875` seven of
+eight edges advance sequentially inside a 64-block window, which is more
+cache-friendly than the strided cross-batch walk at `HIT=0`), and it moves both
+arms. **The valid comparison is G/A within a row**, where both arms see the
+identical edge sequence; that ratio is what is flat. A cross-row reading of
+either arm's absolute rate is not supported.
+
+**Do not over-extend this.** It is measured at one batch size (8 × 64) on a
+512-block working set. The real build has 2,184-4,461 *live-and-sampled* modules
+(`wasm-dispatch-research.md:38-45`) and more created; F4 caps a module at a few
+hundred functions, so covering that set means order-10-to-30 modules, not 8 —
+and whether the instance-count benefit holds at 30 instances rather than 8 is
+**not measured here**.
 
 ### F6 — The selection-signal circularity is already broken
 
@@ -335,8 +394,10 @@ op side.
   that; this measurement says the edge's cost is **structural (a cross-instance
   call), not arithmetic (its op count)** — which is why the edge diet's −8 ops
   and this 2.83x are different claims about different things.
-- **Arm G's coverage sweep did not complete.** F5's curve is a model over two
-  measured endpoints, not a measured curve.
+- **Only ONE batch size was swept.** F8 is `BATCHES=8` on a 512-block working
+  set. Where the instance-count benefit saturates between 1 and ~30 modules is
+  the open question, and it is what decides whether this lever is worth 1.8x or
+  2.8x on the real build.
 - **The 1024-block collapse has no established mechanism.**
 - **Fidelity limits of the bench:** it imports memory and a table, where a real
   per-block module also imports 13 functions and declares globals
@@ -347,14 +408,15 @@ op side.
 
 ## The unblocking plan, in dependency order
 
-1. **Finish the arm-G coverage sweep** (`GROUPS=8`, `HIT` ∈ {0, 0.25, 0.5, 0.75,
-   0.875}, N=512, Chrome, arm A flat as the validity check). Replaces F5's model
-   with a measured curve and fixes the batch-size/hit-rate trade directly.
+1. **Sweep `BATCHES` at fixed coverage**, not coverage at fixed `BATCHES` — F8
+   says that is the axis that moves. The open question is where the
+   instance-count benefit saturates: it is 1.9x at 8 instances and ~2.8x at 1,
+   and the real build needs order-10-to-30. Measure 1 / 2 / 4 / 8 / 16 / 32 / 64
+   at a fixed `HIT`, with G/A read within each row.
 2. **Rank blocks offline** from a `PROBE_PC_SAMPLE=1` histogram or an existing
-   `.cpuprofile` URL histogram (F6). No JIT change. Produce a static top-N PC
-   list and check its predicted coverage against a second run's histogram —
-   if predicted `h` on unseen execution is below ~0.5, stop here, because F5
-   says the lever cannot pay off and no amount of emitter work will change that.
+   `.cpuprofile` URL histogram (F6). No JIT change. The goal is no longer a high
+   in-batch hit rate — it is a static partition of the working set into as few
+   modules as F4's size cap allows.
 3. **Only then** consider re-enabling N-fn promotion, seeded from that static
    list rather than from the runtime promote-ring — which keeps the
    `ppc_emit.cpp:1061` prologue compiled out and removes one of the three
