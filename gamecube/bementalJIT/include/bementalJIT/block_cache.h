@@ -16,8 +16,24 @@ namespace bemental {
 // declares an INTERNAL funcref table populated with the region's block
 // functions and exports each one as `fn_<idx>`. Branches inside a body
 // that target same-region PCs are emitted as `call_indirect (table 0,
-// type 0)` — V8's speculative inlining requires the call_indirect target
-// to live in the same instance's table, so the table MUST NOT be imported.
+// type 0)`.
+//
+// [CORRECTED 2026-09-02 — this block used to end "V8's speculative inlining
+// requires the call_indirect target to live in the same instance's table, so
+// the table MUST NOT be imported." THE SECOND HALF IS REFUTED and it was the
+// operative half.] gamecube/docs/cross-instance-edge-cost/TASKS.md F2 measured
+// internal-vs-imported table over six paired Chrome 152 cells: B/A2 = 1.040,
+// 0.803, 0.984, 1.070, 0.968, 1.009, median 0.996 — i.e. an internal table is
+// worth 0-4% (node/V8 13.6 median 1.036, consistently positive but small).
+// What V8 actually penalises is the callee living in ANOTHER INSTANCE: F8's
+// HIT=0 row has every edge crossing instances through the SHARED IMPORTED
+// table, and 8 modules still beat 512 modules-of-one by 1.885x. So the
+// binding design constraint is "few live instances", NOT "internal table" —
+// the shared imported __indirect_function_table and the global
+// g_bem_disp_tag/g_bem_disp_slot cache need no redesign. The correction was
+// deferred once because a comment-only touch of this header would have flipped
+// every sibling's verify_fresh_probe gate to STALE; it lands here with the
+// batch_* members below, which are a real change.
 //
 // Region boundaries derive from observed PSO/SAB DOL load addresses
 // captured 2026-05-03 (memory: multi_module_partition_2026_05_03.md):
@@ -233,6 +249,24 @@ public:
     void stash_block(u32 pc, const BlockEmitInputs& in);
     void promote_hot(u32 pc);
 
+    // ---- [batch-instances 2026-09-02] Instance-count reduction ------------
+    // Independent of the region/seal/promotion machinery above and of
+    // g_bem_promote_enabled. stash_block() queues every freshly compiled PC;
+    // once BEM_BI_K of them have queued, batch_flush() re-emits their bodies
+    // with the SAME emitter the per-block path uses, packs them into ONE
+    // module (build_block_batch_module_next), instantiates it once, and
+    // installs each fn_i AT THE WASMTABLE SLOT THAT BLOCK ALREADY OWNED.
+    // Nothing downstream sees a difference: the dispatch cache, the C chain
+    // loop, chain_dispatch_raw, evict() and the in-WASM tail-chain all address
+    // blocks by slot, and the slot numbers do not move. The per-block instance
+    // simply loses its last reference and is collected — which is the whole
+    // point (docs/cross-instance-edge-cost F8: instance COUNT is the variable).
+    //
+    // K comes from SAB cell BEM_BI_K, so ONE binary serves every arm of the
+    // sweep and the OFF arm (K < 2) is byte-identical to today.
+    void batch_note(u32 pc);
+    void batch_flush();
+
     // For REL unload (Phase 5). Drops the module and clears accumulator.
     void region_drop(Region r);
 
@@ -287,6 +321,11 @@ private:
     // the predecessor's own contiguous range, so InvalidateICacheRange(succ) never
     // selects the predecessor and it would keep running the stale spliced bytes.
     std::unordered_map<u32, std::vector<u32>> m_fused_succ_to_pred;
+    // [batch-instances] PCs compiled since the last batch flush, in compile
+    // order. Transient: entries that were evicted or re-compiled before the
+    // flush are dropped at flush time (both are re-queued by their own
+    // stash_block on recompile).
+    std::vector<u32> m_batch_pcs;
 };
 
 // ---- Lower-level free helpers ----

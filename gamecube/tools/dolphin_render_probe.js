@@ -2395,6 +2395,46 @@ function startServer() {
     }
   } catch (e) { console.error('[guestclock] readout failed: ' + e.message); }
 
+  // ---- [batch-instances] readout ------------------------------------------
+  // ARM-DIFFERENCE PROOF for the blocks-per-module A/B (?bjit_batch=<K>). The
+  // batching runs on the EmuThread pthread, whose console does NOT relay to
+  // page.on('console') (PM53d), so the only honest witness is the SAB census
+  // block.cache writes: K echo, modules built, block slots re-pointed, failures
+  // and cumulative build ms. Read ONCE, after the measured window, so it cannot
+  // perturb the numbers above. A K>0 run whose modules==0 is a VOID arm — the
+  // flag did not reach the JIT and the run measures the control.
+  //   0x026B39A0 K (W) · 39A4 modules · 39A8 blocks · 39AC failed · 39B0 ms · 39B4 kEcho
+  try {
+    const bi = await page.evaluate(() => {
+      if (!window.sharedMemory) return null;
+      const A = new Uint32Array(window.sharedMemory.buffer);
+      return {
+        k: A[0x026B39A0 >> 2] >>> 0, kEcho: A[0x026B39B4 >> 2] >>> 0,
+        modules: A[0x026B39A4 >> 2] >>> 0, blocks: A[0x026B39A8 >> 2] >>> 0,
+        failed: A[0x026B39AC >> 2] >>> 0, ms: A[0x026B39B0 >> 2] >>> 0,
+        mapSize: A[0x026B3944 >> 2] >>> 0, mapPeak: A[0x026B3948 >> 2] >>> 0,
+        distinctPc: A[0x026B395C >> 2] >>> 0, compiles: A[0x026B394C >> 2] >>> 0,
+      };
+    });
+    if (!bi) {
+      console.log('[batch-instances] sharedMemory absent');
+    } else {
+      // Live instance estimate: every compiled block owns a slot; a batched
+      // block's slot points into a shared module instead of its own. So
+      // instances ~= (blocks still per-module) + (batch modules).
+      const perBlock = Math.max(0, bi.mapSize - bi.blocks);
+      console.log('[batch-instances] K=' + bi.k + ' (echo ' + bi.kEcho + ')'
+        + '  modules=' + bi.modules + '  blocks_repointed=' + bi.blocks
+        + '  failed=' + bi.failed + '  build_ms=' + bi.ms
+        + '  | cache map=' + bi.mapSize + ' peak=' + bi.mapPeak
+        + ' distinctPc=' + bi.distinctPc + ' compiles=' + bi.compiles
+        + '  => live wasm instances ~= ' + (perBlock + bi.modules)
+        + ' (' + perBlock + ' per-block + ' + bi.modules + ' batch)');
+      if (bi.k >= 2 && bi.modules === 0)
+        console.log('[batch-instances] VOID ARM: K was set but no batch module was built');
+    }
+  } catch (e) { console.error('[batch-instances] readout failed: ' + e.message); }
+
   // ---- [restore witness] readout ------------------------------------------
   if (process.env.PROBE_RESTORE_WITNESS === '1') {
     try {

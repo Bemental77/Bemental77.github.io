@@ -2047,6 +2047,130 @@ std::vector<u8> build_block_next(u32 start_pc,
     return b.getBytes();
 }
 
+// ---------------------------------------------------------------------------
+// [batch-instances 2026-09-02] Body-only emit + N-function module wrapper.
+// See the contract note in ppc_emit.h. Deliberately placed directly under
+// build_block_next so the two stay visibly in lockstep: any change to the
+// analyzer call, the local declaration or the emit_block_body_into argument
+// list above MUST be mirrored here, or the batched arm stops being the same
+// code and the A/B stops measuring topology.
+// ---------------------------------------------------------------------------
+std::vector<u8> emit_block_body_flat_next(u32 start_pc, const u32* insts, u32 count,
+                                          u32 ctx_ptr,
+                                          u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                                          const u32* instr_pcs) {
+    PPCAnalyzer pa;
+    CodeBlock block;
+    BlockStats stats;
+    block.m_stats = &stats;
+    CodeBuffer buffer;
+    if (instr_pcs) {
+        // [FUSION v2 / LEAF-INLINE] exact-list mode: per-op pcs. Only reached
+        // for a genuinely non-contiguous stream — the caller passes nullptr for
+        // a contiguous block so it takes the identical path build_block_next
+        // takes (AnalyzeOps sets m_noncontiguous, which changes bl/blr emission).
+        pa.AnalyzeOps(insts, instr_pcs, count, &block, &buffer);
+    } else {
+        struct FetchCtx { const u32* insts; u32 base_pc; u32 count; };
+        FetchCtx fc{insts, start_pc, count};
+        auto fetch = +[](u32 pc, void* user) -> u32 {
+            const FetchCtx* f = static_cast<const FetchCtx*>(user);
+            const u32 idx = (pc - f->base_pc) / 4;
+            if (idx >= f->count) return 0;
+            return f->insts[idx];
+        };
+        pa.Analyze(start_pc, &block, &buffer, count, fetch, &fc);
+    }
+
+    WasmModuleBuilder b;
+    b.beginFuncBody();
+    {
+        // MUST match build_block_next's declaration exactly (9 groups).
+        const u32 counts[] = { 2u, 32u, 64u, 2u, 1u, 2u, 17u, 32u, 1u };
+        const u8  types[]  = { WASM_TYPE_I32, WASM_TYPE_I32, WASM_TYPE_I64,
+                               WASM_TYPE_I32, WASM_TYPE_F64, WASM_TYPE_I64,
+                               WASM_TYPE_F64, WASM_TYPE_V128, WASM_TYPE_V128 };
+        b.emitLocals(9u, counts, types);
+    }
+    // DEFAULT chain args = the global g_bem_disp_tag/g_bem_disp_slot cache,
+    // merged=nullptr, region_gen=-1, no lookup — i.e. byte-identical to the
+    // per-block body. Do NOT pass g_bem_rtag/g_bem_rslot here (that is
+    // emit_block_body_next's region contract, a different dispatch cache).
+    emit_block_body_into(b, block, buffer, stats, count, start_pc, ctx_ptr,
+                         mem1_base, mem1_mask, ram_size);
+    b.endFuncBody();
+    return b.getBytes();
+}
+
+std::vector<u8> build_block_batch_module_next(const u8* concatenated_bodies,
+                                              std::size_t concatenated_size,
+                                              u32 n_funcs,
+                                              u32 mem_pages) {
+    if (n_funcs == 0u || concatenated_bodies == nullptr || concatenated_size == 0u)
+        return {};
+    WasmModuleBuilder b;
+    b.emitHeader();
+
+    // Type section — identical to build_block_next.
+    b.emitTypeSection(4);
+    {
+        const u8 i32t[]  = { WASM_TYPE_I32 };
+        const u8 i32x2[] = { WASM_TYPE_I32, WASM_TYPE_I32 };
+        b.emitFuncType(nullptr, 0, i32t, 1);     // type 0: () -> i32
+        b.emitFuncType(i32t, 1, i32t, 1);        // type 1
+        b.emitFuncType(i32x2, 2, nullptr, 0);    // type 2
+        b.emitFuncType(i32x2, 2, i32t, 1);       // type 3
+    }
+    b.endSection();
+
+    // Import section — identical to build_block_next, INCLUDING the shared
+    // global __indirect_function_table as table 0. The bodies chain through it
+    // with return_call_indirect exactly as per-block bodies do; the only thing
+    // that changed is that N of them now live in one instance.
+    b.emitImportSection(1u + WIMPORT_COUNT + 1u);
+    b.emitImportMemory("env", "memory", mem_pages > 0u ? mem_pages : 1u);
+    b.emitImportFunc("env", "ppc_read8",       1);   // idx 0
+    b.emitImportFunc("env", "ppc_read16",      1);   // idx 1
+    b.emitImportFunc("env", "ppc_read32",      1);   // idx 2
+    b.emitImportFunc("env", "ppc_write8",      2);   // idx 3
+    b.emitImportFunc("env", "ppc_write16",     2);   // idx 4
+    b.emitImportFunc("env", "ppc_write32",     2);   // idx 5
+    b.emitImportFunc("env", "ppc_interp",      2);   // idx 6
+    b.emitImportFunc("env", "ppc_check_exc",   1);   // idx 7
+    b.emitImportFunc("env", "ppc_break_block", 2);   // idx 8
+    b.emitImportFunc("env", "ppc_hle_check",   1);   // idx 9
+    b.emitImportFunc("env", "ppc_hle_fire",    3);   // idx 10
+    b.emitImportFunc("env", "ppc_msr_updated", 2);   // idx 11
+    b.emitImportFunc("env", "ppc_gather_drain", 2);  // idx 12
+    b.emitImportTable("env", "__indirect_function_table", /*initial*/0u, /*hasMax*/false);
+    b.endSection();
+
+    {
+        std::vector<u32> typeIndices(n_funcs, 0u);
+        b.emitFunctionSection(n_funcs, typeIndices.data());
+    }
+
+    // No table section and no element section: this module declares NO internal
+    // table (F2 — the internal table is worth 0-4%; the instance count is the
+    // lever). Exports are fn_0..fn_{N-1}; the block cache installs each one at
+    // the wasmTable slot its per-block module already owned, so nothing
+    // downstream (dispatch cache, C chain loop, eviction) changes.
+    b.beginExportSection(n_funcs);
+    {
+        char name[24];
+        for (u32 i = 0; i < n_funcs; ++i) {
+            std::snprintf(name, sizeof(name), "fn_%u", (unsigned)i);
+            b.emitExport(name, WASM_EXPORT_FUNC, WIMPORT_COUNT + i);
+        }
+    }
+    b.endSection();
+
+    b.beginCodeSection(n_funcs);
+    b.emitBytes(concatenated_bodies, concatenated_size);
+    b.endSection();
+    return b.getBytes();
+}
+
 
 // [region-merged 2026-07-15] Region-path _next implementations — REAL, and
 // compiled UNCONDITIONALLY (the BEMENTALJIT_USE_REBUILD guards are gone: the

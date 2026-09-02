@@ -157,15 +157,13 @@ are.** The only thing that has to change is how many blocks share a module.
 SpiderMonkey's −30%/+18% private-table result does **not** transfer to V8. Both
 engines penalise the topology; they do not penalise the same half of it.
 
-> ⚠ **`block_cache.h:17-20` still states the refuted rule, deliberately.** The
-> correction was written into that header and then reverted, because
-> `.claude/hooks/verify_fresh_probe.sh:52` derives "newest GameCube source" from
-> an `mtime` walk of `gamecube/bementalJIT`, and the shipped
-> `dolphin_worker_emcc.wasm` mtime currently *equals* the newest source mtime
-> (both 1788304516). A comment-only touch would therefore have flipped every
-> sibling's probe to **STALE** until someone rebuilt — a false alarm charged to
-> other people's in-flight campaigns, for a comment. **Fold the correction into
-> that header the next time it is opened for a real change.**
+> ✅ **DONE 2026-09-02.** The correction is now in `block_cache.h`, folded in
+> alongside the `batch_note`/`batch_flush`/`m_batch_pcs` members of F9 — i.e.
+> the header was opened for a real change, which is the condition this note set.
+> (The deferral was because `.claude/hooks/verify_fresh_probe.sh:52` derives
+> "newest GameCube source" from an `mtime` walk of `gamecube/bementalJIT`, and a
+> comment-only touch would have flipped every sibling's probe to **STALE** for a
+> comment. F9's change rebuilt and relinked, so no sibling pays for it.)
 
 ### F3 — Candidate #2 (self-emitted inline cache of direct tail calls) is REFUTED at realistic scale
 
@@ -382,13 +380,102 @@ have fewer edges (bigger blocks, or blocks that share a module and can therefore
 be inlined into one another) — which is the same lever as F1, arrived at from the
 op side.
 
+### F9 — MEASURED ON THE REAL BUILD 2026-09-02: instance reduction TRANSFERS, and it is worth **+3.0% to +4.5% guest**, not 1.8-2.8x. The K sweep is FLAT.
+
+The mechanism this topic argued for was built and probed. `?bjit_batch=<K>`
+(SAB cell `0x026B39A0`, `gamecube.html`) makes K freshly compiled blocks share
+one `WebAssembly.Module`/`Instance`: `BlockCache::stash_block` queues every
+compiled PC, `BlockCache::batch_flush` re-emits their bodies with
+`emit_block_body_flat_next` (byte-for-byte the per-block body — global
+`g_bem_disp_tag`/`slot` cache, shared imported table 0, `region_gen = -1`),
+packs them with `build_block_batch_module_next`, and installs each `fn_i` **at
+the wasmTable slot that block already owned**. Nothing downstream changes: the
+dispatch cache, the C chain loop, the in-WASM tail-chain and `evict()` all
+address blocks by slot and the slots do not move. K < 2 is OFF and is the
+byte-identical control, so **every arm below came off ONE binary**
+(`md5 9267a160d3afd3114e4112c6a7c5bc91`).
+
+Deliberately NOT the promotion path: `g_bem_promote_enabled` stays 0 (so
+`ppc_emit.cpp:1061`'s prologue counter is still compiled out), no
+`region_dispatch` is consulted, and there is no miss path to pay a membrane
+crossing on. Those are the three causes the recorded negatives name.
+
+**SAB (`ROM_IDX=1`), cold boot, `PROBE_DURATION_MS=75000`, guest clock read from
+the two AI-DMA witnesses over the steady 40 s window, all runs `probe_lock`-held
+from a hermetic `PROBE_ROOT` snapshot, load 5.4-6.6 throughout.**
+
+| run | K | modules | live instances | guest | published/s |
+|---|---:|---:|---:|---:|---:|
+| A1 | 0 | 0 | **11,809** | 0.4227 | 16.38 |
+| B1 | 64 | 186 | 186 | **0.4389** | 17.43 |
+| A2 | 0 | 0 | 11,806 | 0.4246 | 16.72 |
+| B2 | 64 | 186 | 186 | **0.4337** | 17.23 |
+| A3 | 0 | 0 | 11,809 | 0.4203 | 16.70 |
+| K256 | 256 | 46 | 159 | **0.4370** | 17.20 |
+| K512 | 512 | 23 | 148 | **0.4387** | 17.43 |
+| K16 | 16 | 746 | 746 | **0.4370** | 17.48 |
+| A4 | 0 | 0 | 11,811 | 0.4050 | 16.50 |
+
+Zero `BLOCK TRAP`, zero `chain trap`, zero `C-dispatch trap`, zero
+`compile_raw failed`, zero batch-install failures in all nine runs, and both
+arms **render** — the 60 s screenshots are clean SAB intro frames, no black
+world, no NaN geometry. Batch build cost is `build_ms` 114-281 **cumulative for
+the whole run** (whole-ms truncation makes that a slight under-report), i.e. a
+third of a second against ~90 s, even though batching re-emits every body a
+second time.
+
+- **Complete separation.** Every treatment (5 runs, min 0.4337) is above every
+  control (4 runs, max 0.4246). One-sided exact permutation p = 1/C(9,4) =
+  **0.0079**. The delivered-fps witness separates identically and independently
+  (min treatment 17.20 > max control 16.72).
+- **Effect size, both estimators, because they differ.** Strict adjacent
+  interleaved pairs A1/B1 and A2/B2: **+3.0%**. All runs pooled: 0.43706 vs
+  0.41815 = **+4.5%**. Dropping A4 (a low control outlier — the other three
+  controls span only 0.4203-0.4246) gives +3.4%. **Report the range, not a point
+  estimate:** the control spread is about as wide as the effect.
+- **The instance count moved 63x and the guest rate moved 4%.** So the 2.1-3.7x
+  per-edge ratio of F1/F8 is real but is a small share of end-to-end cost, which
+  is consistent with F7: on a taken edge exactly one op is the call, and
+  `wasm-function[13]` (the block bodies themselves) is 47-68% of CPU thread
+  self-time. **This does not rescue SAB.** 0.4181x -> 0.4371x against a 1.000x
+  target is 2.29x still owed.
+
+#### F9b — the K sweep is FLAT, so "how many instances" is the wrong knob past the first batch
+
+This answers the open question this topic parked. Guest rate by live instance
+count: 746 -> 0.4370, 186 -> 0.4389/0.4337, 159 -> 0.4370, 148 -> 0.4387. **The
+spread ACROSS K (0.4337-0.4389) is no larger than the spread WITHIN K=64
+(0.4337-0.4389).** Cutting 746 instances to 148 buys nothing measurable; the
+entire win appears at the very first batching, K=16.
+
+That is not what F8's global-instance-count model predicts (it read 1.885x
+between 8 and 512 modules). **The reading I favour, stated as a hypothesis and
+not as established:** V8's check is per CALL SITE, and a call site only ever
+sees its own successors' instances — not the global population. Blocks are
+queued in COMPILE order, and a hot loop's 3-5 blocks are compiled together, so
+even K=16 already puts a loop's successors in one or two shared modules and
+collapses that site's polymorphism. Global instance count then has nothing left
+to give. I did not test this directly; the discriminating experiment would be a
+batch assignment that deliberately SCATTERS a loop's blocks across modules at
+fixed K, and it has not been run.
+
+Note K=256 and K=512 left 113 and 125 blocks unbatched (the trailing partial
+batch never flushes before the run ends) and still measured at the top of the
+range — another sign the residual per-block population is not what binds.
+
 ## What this topic does NOT establish
 
-- **No end-to-end fps or guest-rate delta.** Everything here is a synthetic edge
-  cost. Nothing was built, linked, or probed against SAB. The 2.83x is a per-edge
-  ratio in a microbenchmark, not a speedup of the emulator, and per CLAUDE.md
-  gate #10 the only thing that can establish the latter is a matched pair on the
-  real build.
+- ~~**No end-to-end fps or guest-rate delta.**~~ **SUPERSEDED BY F9** — the
+  matched pair was run. What stands: the 2.83x is a per-edge microbenchmark
+  ratio and it did NOT transfer as a speedup; the real build moved +3.0-4.5%.
+- **F9's arms are cold-boot runs and their SCENES diverge.** All four controls
+  screenshot the identical frame at 60 s and all treatments the identical
+  (later) frame — arm-linked, and in the direction of the speedup, which
+  corroborates it. But it means the two arms execute partly different guest code
+  over the window, and a scene-matched savestate A/B has not been run. The
+  AI-DMA witness is a host-side rate over a fixed 40 s wall window, so it is not
+  itself a scene proxy; the workload behind it still differs.
+- **Nothing here is measured on MP4 or PSO**, only SAB.
 - **The op-count null prior is untouched and still stands.** SIMD byte-swap
   landed −887 emitted ops and matched-paired at 0.994x. Nothing here contradicts
   that; this measurement says the edge's cost is **structural (a cross-instance
@@ -408,21 +495,28 @@ op side.
 
 ## The unblocking plan, in dependency order
 
-1. **Sweep `BATCHES` at fixed coverage**, not coverage at fixed `BATCHES` — F8
-   says that is the axis that moves. The open question is where the
-   instance-count benefit saturates: it is 1.9x at 8 instances and ~2.8x at 1,
-   and the real build needs order-10-to-30. Measure 1 / 2 / 4 / 8 / 16 / 32 / 64
-   at a fixed `HIT`, with G/A read within each row.
-2. **Rank blocks offline** from a `PROBE_PC_SAMPLE=1` histogram or an existing
-   `.cpuprofile` URL histogram (F6). No JIT change. The goal is no longer a high
-   in-batch hit rate — it is a static partition of the working set into as few
-   modules as F4's size cap allows.
-3. **Only then** consider re-enabling N-fn promotion, seeded from that static
-   list rather than from the runtime promote-ring — which keeps the
-   `ppc_emit.cpp:1061` prologue compiled out and removes one of the three
-   recorded regression causes by construction.
+~~1. Sweep `BATCHES` at fixed coverage~~ — **DONE, on the real build (F9b): the
+sweep is FLAT from 746 instances down to 148.** Do not spend another campaign
+looking for a better K; the whole effect is present at the smallest batch tried.
+
+~~2. Rank blocks offline from a `PROBE_PC_SAMPLE=1` histogram (F6).~~ — **not
+needed for this lever.** F9 batches in plain COMPILE order with no ranking at
+all and captures the entire available benefit, which is what F9b's flat sweep
+means. The ranking work would only matter if a scattered-assignment control
+(below) showed that locality of assignment, rather than batching per se, is what
+pays.
+
+3. **The one experiment left that would explain F9b**: at fixed K, deliberately
+   SCATTER each hot loop's blocks across different modules instead of letting
+   compile order co-locate them. If that erases the win, the mechanism is
+   per-call-site polymorphism (the F9b hypothesis) and the useful knob is
+   ASSIGNMENT, not count. If it does not, F9b has no explanation yet.
 4. Do **not** re-introduce a region-first dispatch loop (`block_cache.cpp:209`),
    and do **not** build candidate #2's inline cache (F3).
+5. **Do not expect this lever to close the gap.** F9 measures +3.0-4.5% against
+   the ~2.3x SAB still owes. It is worth shipping — it is free at runtime, costs
+   ~0.3 s of build time per run, and never traps — but the deficit is inside the
+   block bodies, not on the edges between them.
 
 ## References
 

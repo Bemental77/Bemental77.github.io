@@ -156,6 +156,38 @@ std::vector<u8> build_region_module_next(const u8* concatenated_bodies,
                                          u32 n_funcs,
                                          u32 mem_pages = 1);
 
+// ---------------------------------------------------------------------------
+// [batch-instances 2026-09-02] SAME BODY, FEWER INSTANCES.
+//
+// emit_block_body_flat_next emits exactly what build_block_next emits INSIDE
+// its one function — same analyzer call, same 9-group local declaration, same
+// emit_block_body_into invocation with its DEFAULT chain arguments (the GLOBAL
+// g_bem_disp_tag / g_bem_disp_slot cache, region_gen = -1, merged = nullptr, no
+// local-idx lookup) — but without the module wrapper.
+// build_block_batch_module_next then wraps N such bodies in ONE module whose
+// scaffolding is build_block_next's: the same 4 types, the same memory import,
+// the same 13 ppc_* imports in the same order, and the SHARED IMPORTED
+// `__indirect_function_table` as table 0. The only difference from the shipping
+// per-block module is that N block functions share one WebAssembly.Instance,
+// exported as fn_0..fn_{N-1} instead of a single "run".
+//
+// This is deliberately NOT the region/seal path: no module-internal table, no
+// gen-packed rslot, no fn_k entry wrappers, no region-first dispatch. Per
+// gamecube/docs/cross-instance-edge-cost/TASKS.md F2 an internal table is worth
+// 0-4% (Chrome median 0.996x), while F8 measured that the variable which
+// matters is how many INSTANCES a call site sees: 8 modules beat 512
+// modules-of-one by 1.885x with EVERY edge still crossing instances through the
+// shared imported table. So this changes instance count and nothing else.
+std::vector<u8> emit_block_body_flat_next(u32 start_pc, const u32* insts, u32 count,
+                                          u32 ctx_ptr,
+                                          u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                                          const u32* instr_pcs = nullptr);
+
+std::vector<u8> build_block_batch_module_next(const u8* concatenated_bodies,
+                                              std::size_t concatenated_size,
+                                              u32 n_funcs,
+                                              u32 mem_pages = 1);
+
 // [region-merged 2026-07-15] The REAL merged builder + RegionBlockDesc live in
 // bementalJIT/region_desc.h (shared with block_cache.cpp's seal call site,
 // sidestepping the BlockInputs ODR tangle). Implementation: ppc_emit.cpp

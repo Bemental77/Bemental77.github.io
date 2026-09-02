@@ -65,6 +65,35 @@
 #define BEM_CC_EVICT_MS     0x026B3978u
 #define BEM_CC_POLICY_ECHO  0x026B397Cu
 
+// ---- [batch-instances 2026-09-02] blocks-per-module knob + census ----------
+// THE LEAD: gamecube/docs/cross-instance-edge-cost/TASKS.md F8. A chain edge
+// into another INSTANCE costs 2.1-3.7x a same-instance edge in Chrome 152, and
+// the variable is instance COUNT, not in-batch coverage and not table
+// provenance: at HIT=0 — every edge still leaving its batch, through the same
+// shared imported table, same ops — 8 modules beat 512 modules-of-one by
+// 1.885x. The shipping JIT makes ONE module and ONE instance per block
+// (compile_raw below), so a call site sees thousands.
+//
+// BEM_BI_K is the only input: K blocks share one module. K < 2 = OFF and is
+// byte-identical to the pre-change build (batch_note returns before touching
+// anything), so one binary serves every arm — including the control.
+//
+// R = written here, read by the probe/page. W = written by the page.
+//   0x026B39A0 W K            blocks per module (0/1 = OFF = one per block)
+//   0x026B39A4 R modulesN     batch modules successfully instantiated
+//   0x026B39A8 R blocksN      block slots re-pointed into a batch module
+//   0x026B39AC R failedN      batch builds/instantiations that failed
+//   0x026B39B0 R buildMs      cumulative ms in re-emit + build + instantiate
+//   0x026B39B4 R kEcho        the K actually in force
+// Cells verified free 2026-09-02 by enumerating every 0x026B3xxx literal
+// in-tree: 0x026B3998 and 0x026B39F8 are taken, 0x026B39A0..0x026B39F4 are not.
+#define BEM_BI_K            0x026B39A0u
+#define BEM_BI_MODULES      0x026B39A4u
+#define BEM_BI_BLOCKS       0x026B39A8u
+#define BEM_BI_FAILED       0x026B39ACu
+#define BEM_BI_MS           0x026B39B0u
+#define BEM_BI_K_ECHO       0x026B39B4u
+
 // Policy bits (read from BEM_CC_POLICY on every compile — a live knob, so one
 // process can measure both arms).
 #define BEM_CC_POL_PARTIAL  0x1u   // evict the cold subset instead of clear()ing all
@@ -411,6 +440,19 @@ namespace powerpc {
                                              std::size_t concatenated_size,
                                              u32 n_funcs,
                                              u32 mem_pages);
+
+    // [batch-instances 2026-09-02] See ppc_emit.h. flat = the per-block body
+    // verbatim (global disp cache, imported table 0, no region gen); the batch
+    // module wrapper is build_block_next's scaffolding with N functions.
+    std::vector<u8> emit_block_body_flat_next(u32 start_pc, const u32* insts, u32 count,
+                                              u32 ctx_ptr,
+                                              u32 mem1_base, u32 mem1_mask, u32 ram_size,
+                                              const u32* instr_pcs);
+
+    std::vector<u8> build_block_batch_module_next(const u8* concatenated_bodies,
+                                                  std::size_t concatenated_size,
+                                                  u32 n_funcs,
+                                                  u32 mem_pages);
 }
 
 int compile_raw(const u8* bytes, std::size_t size) {
@@ -1560,9 +1602,18 @@ void BlockCache::clear() {
     m_aot_sealed = false;
     g_bem_aot_pc_slot.clear();       // [AOT A3.1] gen dies with clear(); re-seal repopulates
     m_fused_succ_to_pred.clear();   // [PM54f] fusion mappings die with the gens
+    // [batch-instances 2026-09-02] Every queued PC's slot was just released, so
+    // a flush after this point would re-point slots that no longer belong to
+    // those PCs. Drop the queue; the recompiles re-queue themselves.
+    m_batch_pcs.clear();
 #ifdef __EMSCRIPTEN__
     EM_ASM({
         if (Module.bemental_pc_to_handle) Module.bemental_pc_to_handle.clear();
+        // [batch-instances] Release the batch modules' last strong reference.
+        // Every slot they backed has been released above, so nothing can call
+        // into them any more and holding them would leak one instance per
+        // batch across a savestate load.
+        if (Module.bemental_batches) Module.bemental_batches.length = 0;
         if (Module.bemental_regions) {
             for (const k in Module.bemental_regions) {
                 const rg = Module.bemental_regions[k];
@@ -1843,6 +1894,162 @@ void BlockCache::region_accumulate(Region r, u32 pc,
 // Hot-only merge: stash emit inputs at compile (no body emitted yet).
 void BlockCache::stash_block(u32 pc, const BlockEmitInputs& in) {
     m_pending_emit[pc] = in;
+    // [batch-instances 2026-09-02] Every compiled PC is a batch candidate.
+    // Called from JitWasm::TryCompileBlock immediately after compile(), so the
+    // record this needs is the one just written on the line above.
+    batch_note(pc);
+}
+
+// ---------------------------------------------------------------------------
+// [batch-instances 2026-09-02] Instance-count reduction. See block_cache.h.
+//
+// WHY THIS IS NOT THE PROMOTION PATH, stated up front because the three
+// recorded net-negatives (this file, the g_bem_promote_enabled comment block)
+// are the obvious objection. F8 re-explains those results: promoting ~570
+// blocks while thousands of per-block modules stay live barely moves the
+// instance count, so the mechanism's benefit never had a chance to appear
+// while the promote-ring prologue, the per-miss membrane crossing and the
+// region-first dispatch loop all cost immediately. This path has NONE of those
+// three: g_bem_promote_enabled stays 0 so ppc_emit.cpp:1061's per-block
+// prologue counter is still compiled out; no region_dispatch is consulted;
+// there is no miss path at all, because a batched block is reached through the
+// SAME wasmTable slot it always had.
+// ---------------------------------------------------------------------------
+void BlockCache::batch_note(u32 pc) {
+    const uint32_t k = bem_cc_get(BEM_BI_K);
+    bem_cc_set(BEM_BI_K_ECHO, k);
+    if (k < 2u) return;                 // OFF: today's one module per block
+    m_batch_pcs.push_back(pc);
+    if (m_batch_pcs.size() >= static_cast<std::size_t>(k)) batch_flush();
+}
+
+void BlockCache::batch_flush() {
+#ifdef __EMSCRIPTEN__
+    if (m_batch_pcs.empty()) return;
+    const double t0 = emscripten_get_now();
+
+    std::vector<int> slots;
+    std::vector<u8>  bodies;
+    std::unordered_set<u32> seen;
+    slots.reserve(m_batch_pcs.size());
+    for (u32 pc : m_batch_pcs) {
+        // A PC recompiled inside the same window appears twice; keep the first
+        // (its record is the latest either way — m_pending_emit is overwritten
+        // in place) so the module never exports two functions for one slot.
+        if (!seen.insert(pc).second) continue;
+        auto mit = m_map.find(static_cast<u64>(pc));
+        if (mit == m_map.end()) continue;            // evicted since compile
+        auto pit = m_pending_emit.find(pc);
+        if (pit == m_pending_emit.end() || pit->second.insts.empty()) continue;
+        const BlockEmitInputs& in = pit->second;
+        const u32 n = static_cast<u32>(in.insts.size());
+        // Contiguity test: JitWasm fills instr_pcs = start_pc + i*4 for an
+        // ordinary block and with the real spliced pcs for a LEAF-INLINE
+        // block. Pass nullptr in the contiguous case so the analyzer takes
+        // PPCAnalyzer::Analyze — exactly the call build_block_next made for
+        // this block. Passing the pcs would route it to AnalyzeOps, which sets
+        // m_noncontiguous and changes bl/blr emission: the batched body would
+        // then differ from the running body by more than its module.
+        bool contiguous = (in.instr_pcs.size() == n);
+        for (u32 i = 0; contiguous && i < n; ++i)
+            if (in.instr_pcs[i] != in.start_pc + i * 4u) contiguous = false;
+        std::vector<u8> body = powerpc::emit_block_body_flat_next(
+            in.start_pc, in.insts.data(), n,
+            in.ctx_ptr_const, in.mem1_base, in.mem1_mask, in.ram_size,
+            contiguous ? nullptr : in.instr_pcs.data());
+        if (body.empty()) continue;
+        bodies.insert(bodies.end(), body.begin(), body.end());
+        slots.push_back(mit->second);
+    }
+    m_batch_pcs.clear();
+    if (slots.empty()) return;
+
+    std::vector<u8> bytes = powerpc::build_block_batch_module_next(
+        bodies.data(), bodies.size(), static_cast<u32>(slots.size()), 1u);
+    if (bytes.empty()) {
+        bem_cc_add(BEM_BI_FAILED, 1u);
+        bem_cc_add(BEM_BI_MS, (u32)(emscripten_get_now() - t0));
+        return;
+    }
+
+    const int ok = EM_ASM_INT({
+        // NOTE: one `const` per line. A comma-separated declaration list here
+        // is split by the C PREPROCESSOR into extra EM_ASM macro arguments
+        // (it balances parens only) — the same trap region_seal's `gen` object
+        // documents. Commas inside parentheses are fine.
+        const bytesPtr = $0;
+        const bytesLen = $1 >>> 0;
+        const slotsPtr = $2;
+        const n = $3 >>> 0;
+        try {
+            const view = new Uint8Array(Module.HEAPU8.buffer, bytesPtr, bytesLen);
+            const copy = new Uint8Array(view);   // detach: HEAPU8 may grow
+            // Copy the slot list SYNCHRONOUSLY — the C++ vector dies with this
+            // EM_ASM's return.
+            const slotArr = new Int32Array(n);
+            for (let i = 0; i < n; i++) slotArr[i] = HEAP32[(slotsPtr >>> 2) + i] | 0;
+
+            // Same import object compile_raw builds. env.__indirect_function_table
+            // is the SHARED host table: batched bodies chain through it exactly
+            // as per-block bodies do (F2 — the internal table is not the lever).
+            const memObj = (typeof wasmMemory !== 'undefined') ? wasmMemory : null;
+            const env = {};
+            if (memObj) env.memory = memObj;
+            if (Module.bemental_imports && Module.bemental_imports.env) {
+                Object.assign(env, Module.bemental_imports.env);
+            }
+            env.__indirect_function_table = wasmTable;
+
+            const inst = new WebAssembly.Instance(
+                new WebAssembly.Module(copy), { env: env });
+
+            // Resolve EVERY export before installing ANY of them: a partial
+            // re-point would leave some slots on the batch module and some on
+            // their per-block module, which is a state no later code expects.
+            const fns = new Array(n);
+            for (let i = 0; i < n; i++) {
+                fns[i] = inst.exports['fn_' + i];
+                if (typeof fns[i] !== 'function') {
+                    console.log('[worker] [bemental] batch FAILED: missing fn_' + i
+                        + ' of ' + n);
+                    return 0;
+                }
+            }
+            if (!Module.bemental_batches) Module.bemental_batches = [];
+            Module.bemental_batches.push(inst);   // strong ref: keeps the instance alive
+            if (!Module.bemental_cache) Module.bemental_cache = {};
+            for (let i = 0; i < n; i++) {
+                const slot = slotArr[i];
+                wasmTable.set(slot, fns[i]);
+                // The legacy JS chain loop (g_bem_cdispatch_enabled = 0) reads
+                // Module.bemental_cache[handle].exports.run, so keep that shape
+                // alive for the batched slot. The DEFAULT C loop and the in-WASM
+                // tail-chain both go through wasmTable and never read this.
+                // Overwriting also drops the last reference to the per-block
+                // instance, which is the entire point of this function.
+                const f = fns[i];
+                Module.bemental_cache[slot] = { exports: { run: f } };
+            }
+            return 1;
+        } catch (e) {
+            // console.log, not console.error — worker error lines do not relay
+            // to the probe log (PM53d finding).
+            console.log('[worker] [bemental] batch install FAILED: '
+                + (e && e.message ? e.message : String(e)));
+            return 0;
+        }
+    }, bytes.data(), (int)bytes.size(), slots.data(), (int)slots.size());
+
+    if (ok) {
+        bem_cc_add(BEM_BI_MODULES, 1u);
+        bem_cc_add(BEM_BI_BLOCKS, (u32)slots.size());
+    } else {
+        bem_cc_add(BEM_BI_FAILED, 1u);
+    }
+    bem_cc_add(BEM_BI_MS, (u32)(emscripten_get_now() - t0));
+#else
+    m_batch_pcs.clear();
+#endif
 }
 
 // Promote a hot block into the merged hot region (REGION_REL_0). Re-emits the

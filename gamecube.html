@@ -2667,6 +2667,25 @@ window.GcRate = (function () {
       if (_fpfuse !== null)
         new Uint32Array(sharedMemory.buffer)[0x026B342C >> 2] = (parseInt(_fpfuse, 10) !== 0) ? 1 : 0;
     } catch (e) { pageLog('[fp-fusion] toggle write failed: ' + (e && e.message)); }
+    // [batch-instances A/B 2026-09-02] ?bjit_batch=<K> — how many JIT blocks share one
+    // WebAssembly module/instance. SAB scratch cell 0x026B39A0; browser-zeroed 0 = OFF =
+    // one module per block = byte-identical to the pre-change tree, so the control arm and
+    // every K of the sweep come off ONE binary. Read once per compiled block in
+    // BlockCache::stash_block (never on the executed path).
+    // WHY: gamecube/docs/cross-instance-edge-cost/TASKS.md F8 — a chain edge into another
+    // INSTANCE costs 2.1-3.7x a same-instance edge in Chrome 152, and instance COUNT is the
+    // variable (8 modules beat 512 modules-of-one by 1.885x with every edge still crossing
+    // instances). F4 caps a module below 1024 functions, so sweep K in the tens-to-hundreds.
+    // Census cells: 0x026B39A4 modules, 0x026B39A8 blocks, 0x026B39AC failed, 0x026B39B0 ms.
+    try {
+      var _bibatch = new URLSearchParams(location.search).get('bjit_batch');
+      if (_bibatch !== null) {
+        var _bik = parseInt(_bibatch, 10);
+        if (!isFinite(_bik) || _bik < 0) _bik = 0;
+        new Uint32Array(sharedMemory.buffer)[0x026B39A0 >> 2] = _bik >>> 0;
+        pageLog('[batch-instances] blocks-per-module K=' + _bik);
+      }
+    } catch (e) { pageLog('[batch-instances] toggle write failed: ' + (e && e.message)); }
     // [fifo-brake ESCAPE HATCH 2026-08-29] The host-side GX FIFO backpressure brake
     // (CommandProcessorManager::BemFifoBackpressure, CommandProcessor.cpp:426) ships DEFAULT ON
     // and reads kill-switch cell 0x026B3B20 (nonzero = brake DISABLED). Until now NOTHING in
