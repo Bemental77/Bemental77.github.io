@@ -266,6 +266,50 @@ is only a prerequisite for the *runtime* counter, which is the one thing the
 2026-08-20 A/B named as part of the regression** (`block_cache.cpp:230`: *"the
 promote-ring prologue"*).
 
+### F7 — The cheaper-terminal family is exhausted, and this bench is the controlled experiment that says so
+
+The standing follow-up to the edge diet was "40 → 32 ops landed; what remains in
+those 32, and how much is unconditional on every edge?" Reading
+`emit_chain_or_return` for the shipping case (`merged == nullptr`,
+`region_gen < 0`, `n_direct == 0`) gives **31 by my count** against the census's
+measured 32 — I did not chase the one-op difference, which is plausibly how the
+report attributes a closing `end`:
+
+| phase | `ppc_emit.cpp` | d0 ops | what it is |
+|---|---|---:|---|
+| service bail | :233-244 | 6 | `ctx.DOWNCOUNT <= 0` → return PC |
+| vector guard | :273-289 | 7 | `PC < 0x4000` outer, `MSR & IR` inner, PC teed into `TMP_A` |
+| bucket probe | :336-344, :421 | 15 | `((PC>>2) & MASK)*4` → `TMP_B`, tag load, compare, `if` + its `end` |
+| host return | :461-462 | 3 | tag miss / freed slot → return PC to the C loop |
+
+On a **taken** edge the 3 host-return ops never execute and the structured
+`end`s are not runtime instructions, so the executed sequence is roughly 35
+machine-level operations — of which **exactly one is the call**.
+
+That single op is the whole story, and the two experiments are now matched:
+
+- The tree's own op-count experiment held topology fixed and removed ops: SIMD
+  byte-swap, **−887 emitted ops, matched-paired at 0.994x** — null. Stripping the
+  byte-swap entirely measured FLAT (`jit_load_store.cpp:270-278`).
+- **This bench holds the op count fixed and changes only the topology.** Arms A
+  and B execute the *identical* terminal — every op above, in the same order,
+  emitted from the same code — and differ solely in whether the callee lives in
+  the caller's instance. **2.1-3.7x.**
+
+So: cutting further into the remaining 31 ops is arithmetic, and arithmetic has a
+measured null prior in this tree. **Do not spend another campaign on the
+terminal.** The two items `executed-op-census/TASKS.md` still lists as "sized but
+not built" should be re-scoped accordingly — `BEM_MIPS_CENSUS`'s 6-op prologue
+RMW is worth removing because it instruments a meter gate #10 forbids quoting,
+not because 6 ops are worth speed; and the `slot >= 0` check's ~5 ops/edge are
+not worth the audit of every writer of `-1` that removing them safely requires.
+
+This does **not** retire the *other* half of the per-block fixed overhead. The
+census's 45.7% figure covers prologue + terminal, and the way to remove it is to
+have fewer edges (bigger blocks, or blocks that share a module and can therefore
+be inlined into one another) — which is the same lever as F1, arrived at from the
+op side.
+
 ## What this topic does NOT establish
 
 - **No end-to-end fps or guest-rate delta.** Everything here is a synthetic edge
