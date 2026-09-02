@@ -832,17 +832,36 @@ the 3.33 VI/s that 600 VI in 180 s requires, which fully explains the sweep
 timeout. 70x is far beyond ordinary compile cost and points at recompile churn
 (every invalidation rebuilds a `WebAssembly.Module` synchronously inside
 `retro_run`, and compile time is charged to `retro_run`); `slotReuses` vs
-`distinctSlots` on a conker run would test that directly. **Whether wave 11b
-contributed is being controlled against the HEAD~1 emitter — do not assume
-either way until that row is filled in.**
+`distinctSlots` on a conker run would test that directly.
 
-### (3) `gauntletLegends.z64` — same `NOJSON` at `:61`, cause not yet separated
+**PRE-EXISTING — controlled, not assumed.** The same command with the HEAD~1
+emitter, same window:
 
-Identical signature to conker (JIT arm, 180 s timeout, interpreter arms fine).
-The wedge-or-slow discriminator was queued behind conker's and has not been
-read yet. Note the 2026-06-12 record has gauntlet running FASTER under `?jit`
-(1.94-2.0x), so a 70x regression there would be a large change from a known
-state — which is exactly why it needs measuring rather than assuming.
+        arm     wave 11b            HEAD~1 (control)
+        interp  6.574 ms/frame      6.367 ms/frame
+        jit     460.782 ms/frame    446.615 ms/frame
+        ratio   0.014x              0.014x
+
+Identical to the resolution of the rig. Wave 11b did not cause it. (The 3%
+gap between the two jit numbers is well inside this rig's ~+/-6% single-pair
+resolution and must not be read as an effect.)
+
+### (3) `gauntletLegends.z64` — same `NOJSON` at `:61`; SEPARATION FAILED, twice
+
+Identical sweep signature to conker (JIT arm, 180 s timeout, interpreter arms
+fine). The wedge-or-slow discriminator did NOT answer it: the run died with
+
+    ProtocolError: Runtime.callFunctionOn timed out. Increase the
+    'protocolTimeout' setting in launch/connect calls ...
+
+i.e. a single CDP `evaluate` blocked past puppeteer's own default. That is a
+THIRD failure mode, not an answer — it is consistent with conker's severe
+main-thread blocking AND with a genuine hang, and does not distinguish them.
+**So gauntletLegends is UNSEPARATED.** Note the 2026-06-12 record has gauntlet
+running FASTER under `?jit` (1.94-2.0x), so whatever this is, it is a change
+from a known state. Next step: raise `protocolTimeout` on the harness launch
+and re-run the discriminator; the stall detector at `n64_gameplay_ab.mjs:114-120`
+is the thing that actually answers the question, and it never got to speak.
 
 ### A rig limit this exposed
 `n64_jit_diff_test.mjs` hardcodes 180 s for the 600-VI wait, so ANY ROM slower
@@ -986,11 +1005,19 @@ census ranked are now native: SD/LD (wave 9), MFC0 (10a), and the whole FP
 block — converts (11a) plus compares and BC1 (11b). The core builds from
 source again and `jit_params` carries `&FCR31` behind a version magic.
 
-**What now stands between `?jit` and being the default**, in order:
-1. the 27-ROM sweep verdict (below) — `conker.z64` is the one open item;
-2. a THROUGHPUT number on a GAMEPLAY window. Every ratio this campaign owns
-   was measured on a menu (screenshot-proven) and the acceptance bar is
-   in-game. Waves 9/10a/11a/11b are all unpriced.
+**What now stands between `?jit` and being the default.** The sweep has been
+RUN (24/27) and it is NOT clean, so the flip is blocked. All three blockers are
+PRE-EXISTING — none was introduced by wave 11b, and each was controlled against
+the HEAD~1 emitter rather than assumed:
+1. `superMarioStarRoad.z64` DIVERGES at frame 24 — a real correctness bug,
+   localised to the **_OUT branch path (wave 7)**;
+2. `conker.z64` runs **70x slower** under `?jit` (460 vs 6.6 ms/frame) — a
+   throughput pathology, not a hang;
+3. `gauntletLegends.z64` shows conker's signature but is UNSEPARATED — the
+   discriminator itself died on a CDP protocol timeout.
+4. Separately, a THROUGHPUT number on a GAMEPLAY window. Every ratio this
+   campaign owns was measured on a menu (screenshot-proven) and the acceptance
+   bar is in-game. Waves 9/10a/11a/11b are all unpriced.
 
 The correctness picture below is unchanged and still applies.
 
