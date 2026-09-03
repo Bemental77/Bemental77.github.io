@@ -135,18 +135,26 @@ def ps1_dependency(stream):
 
 
 # ------------------------------------------------------------------ candidates
-def clean_nonleaf_candidates(img, syms, lo_ins=8, hi_ins=4000):
+def clean_nonleaf_candidates(img, syms, lo_ins=8, hi_ins=4000, indirect=False,
+                             jumptables=False, bctr_only=False):
     byaddr = sr.index_functions(img, syms)
     rows = []
     for a, (size, name) in byaddr.items():
-        t = sr.Translator(img, a, a + size)
+        if bctr_only and not any(
+                (w := img.word(p)) is not None and (w >> 26) == 19
+                and ((w >> 1) & 0x3FF) == 528 and not (w & 1)
+                for p in range(a, a + size, 4)):
+            continue
+        t = sr.Translator(img, a, a + size, indirect=indirect,
+                          jumptables=jumptables)
         try:
             t.translate()
         except sr.Untranslatable:
             continue
         if not t.calls:
             continue
-        cl, probs = sr.closure_of(img, byaddr, [a])
+        cl, probs = sr.closure_of(img, byaddr, [a], indirect=indirect,
+                                  jumptables=jumptables)
         if probs:
             continue
         ins = sum(byaddr[x][0] // 4 for x in cl)
@@ -163,6 +171,13 @@ def main():
     ap.add_argument('--discover', action='store_true')
     ap.add_argument('--capture', action='append', default=[])
     ap.add_argument('--n-cand', type=int, default=1200)
+    ap.add_argument('--bctr-only', action='store_true',
+                    help='restrict discovery to functions containing a `bctr`, so a '
+                         'captured fixture can EXERCISE the recovered jump table. '
+                         'Without it the non-leaf suite contains zero bctr functions '
+                         'and any --jumptables regression run is VACUOUS.')
+    ap.add_argument('--indirect', action='store_true', default=True)
+    ap.add_argument('--jumptables', action='store_true', default=True)
     ap.add_argument('--max-steps', type=int, default=40000)
     ap.add_argument('--state', default=O.SAB_STATE)
     a = ap.parse_args()
@@ -171,19 +186,38 @@ def main():
     syms = sr.load_map(a.map)
     osyms = O.load_map(a.map)
 
+    # THE ORACLE IS CHOSEN BY THE STATE'S OWN VERSION COOKIE.  A hardcoded binary
+    # here meant a version-177 state loaded into the version-189 upstream build,
+    # which State.cpp:723 rejects and then SILENTLY COLD-BOOTS -- so every capture
+    # came from a boot rather than from the saved scene.
+    obin, sver, srev = O.pick_oracle(a.state)
+    print(f"[state] STATE_VERSION={sver} revision={srev!r}")
     dol = O.Dolphin(iso=O.SAB_ISO, state=a.state, port=PORT,
                     log=f"/tmp/sr_oracle_{PORT}.log", dual_core=True,
-                    binary=ORACLE_BIN,
+                    binary=obin,
                     extra=["-C", "Dolphin.Core.CPUCore=0"])   # REFERENCE INTERPRETER
-    print(f"[oracle] {ORACLE_BIN} port={PORT} core=interpreter state={a.state}")
+    print(f"[oracle] {obin} port={PORT} core=interpreter state={a.state}")
     try:
         g = dol.connect()
         print(f"[oracle] connected; pc={g.pc():#010x}")
-        gqr = read_gqrs(g)
-        print("[oracle] GQR " + " ".join(f"{i}={v:#010x}" for i, v in enumerate(gqr)))
+        # NON-FATAL AT CONNECT.  The gadget hijacks PC into scratch RAM and waits on
+        # a breakpoint; on a RESTORED scene (as opposed to a cold boot) that cont has
+        # been observed to time out.  It is not needed for --discover at all, and for
+        # --capture the GQRs are re-read per invocation below -- which is the reading
+        # that matters, since a savestate can land before the game programs them.
+        try:
+            gqr = read_gqrs(g)
+            print("[oracle] GQR " + " ".join(f"{i}={v:#010x}" for i, v in enumerate(gqr)))
+        except Exception as e:
+            gqr = [0] * 8
+            print(f"[oracle] GQR read at connect failed ({type(e).__name__}); "
+                  f"deferring to the per-capture read")
+            g.resync()
 
         if a.discover:
-            rows, _ = clean_nonleaf_candidates(img, syms)
+            rows, _ = clean_nonleaf_candidates(
+                img, syms, indirect=a.indirect, jumptables=a.jumptables,
+                bctr_only=a.bctr_only)
             cands = rows[:a.n_cand]
             print(f"[discover] arming {len(cands)} clean-closure non-leaf entries")
             for addr, *_ in cands:
@@ -239,13 +273,20 @@ def main():
             # record the function starts it touched before the trace is discarded.
             fx["entered"] = sorted({f"{pc:#010x}" for pc, _ in fx["stream"]
                                     if pc in fstarts})
+            # DID THE INVOCATION ACTUALLY EXECUTE A JUMP TABLE?  A --jumptables
+            # regression run over a trace that never reaches a bctr proves nothing;
+            # record it so a vacuous test cannot be reported as a pass.
+            fx["bctr_executed"] = [f"{pc:#010x}" for pc, w in fx["stream"]
+                                   if ((w >> 26) & 0x3F) == 19
+                                   and ((w >> 1) & 0x3FF) == 528 and not (w & 1)]
             del fx["stream"]
             print(f"    steps={fx['steps']} returned={fx['returned']} "
                   f"bl={fx['n_calls']} writes={len(fx['writes'])} "
                   f"initial_bytes={len(fx['initial_mem'])} "
                   f"unknown={len(fx['unknown_stores'])} "
                   f"outside_mem1={len(fx['outside_mem1'])} "
-                  f"ps1_dep={len(fx['ps1_dependency'])}")
+                  f"ps1_dep={len(fx['ps1_dependency'])} "
+                  f"bctr_executed={len(fx['bctr_executed'])}")
             out["fixtures"].append(fx)
             json.dump(out, open(OUT, "w"))
         json.dump(out, open(OUT, "w"))

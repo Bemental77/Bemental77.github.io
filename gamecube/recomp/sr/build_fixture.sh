@@ -47,7 +47,7 @@ if [ -n "${SR_GEN:-}" ]; then
 else
   ARGS=(); for f in "${FNS[@]}"; do ARGS+=(--fn "$f"); done
   python3 "$SR/sr.py" --image "$DOL" --map "$REPO/dolphin_captures/sab.map" \
-          "${ARGS[@]}" "${EXTRA[@]}" --closure --out "$OUT/sr_gen.c"
+          "${ARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"} --closure --out "$OUT/sr_gen.c"
 fi
 
 # SR_OPT: optimisation level.  MUST be lowered for a whole-image build: at -O2 clang

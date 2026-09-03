@@ -46,7 +46,7 @@ if [ -n "${SR_GEN:-}" ]; then
 else
   ARGS=(); if [ "$ALL_MODE" = 1 ]; then ARGS=(--all); else for f in "${FNS[@]}"; do ARGS+=(--fn "$f"); done; fi
   python3 "$SR/sr.py" --image "$DOL" --map "$REPO/dolphin_captures/sab.map" \
-          "${ARGS[@]}" "${EXTRA[@]}" --out "$OUT/sr_gen.c"
+          "${ARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"} --out "$OUT/sr_gen.c"
 fi
 
 emcc ${SR_OPT:--O2} -I"$SR" "$OUT/sr_gen.c" "$SR/sr_driver.c" -o "$OUT/sr_slice.js" \

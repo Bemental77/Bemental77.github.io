@@ -1,9 +1,29 @@
 # Static recompilation of Sonic Adventure 2 Battle — how far it reaches
 
-Measured 2026-09-01. Every number below was produced in this pass from the shipped
-disc; the reproducing command is printed next to each one. Artifact:
+Measured 2026-09-01, extended 2026-09-02. Every number below was produced from the
+shipped disc; the reproducing command is printed next to each one. Artifact:
 [`coverage.json`](coverage.json). Raw tool output: `census_asis.txt`,
 `census_outer_calls.txt`, `rel_all.txt`, `os_boundary.txt`.
+
+## Status at a glance
+
+| claim | evidence |
+|---|---|
+| leaf golden vectors | **1056 bit-exact / 0** — wasm md5 `f14b813694fc243b74c9c85f8fc009fb` |
+| non-leaf fixtures | **7 PASS / 0 FAIL** — md5 `823eaf6b7a25339fa8f660da74f06f5a` |
+| `blrl` indirect dispatch, by execution | **3 PASS / 0 FAIL** |
+| x-form update load/store | **66 bit-exact / 0**, all 11 forms |
+| **`.rel` OVERLAY function, by execution** | **1 PASS** — `stg13D` `0x8121d80c`, §5g/§5h |
+| `bctr` jump tables | **145 of 147 recovered**, and one **PASS by execution** with a faulting control arm, §5b |
+
+The two 2026-09-02 additions each came from a **harness** defect, not a translator one,
+and both are worth remembering because both produced a confident wrong reading:
+
+1. Seven overlay attempts failed because the oracle binary was `STATE_VERSION` **189**
+   and the savestate is **177**; Dolphin rejects the mismatch and then **silently
+   cold-boots**, which reads as "the boot is too slow to reach an overlay" (§5h).
+2. The overlay differential's one reported mismatch was `JSON.parse` rounding a 64-bit
+   FPR — the harness blamed the translator for its own precision loss (§5h).
 
 ---
 
@@ -273,7 +293,111 @@ side, and the pattern is mechanically recoverable (`lwzx` off a `lis`/`addi` tab
 behind a `cmplwi` bound), which is exactly what N64Recomp's static table recovery does
 (`analysis.cpp:229-334`). On the overlays it is easier still: `b401f282` established
 that ADDR32 self-relocations pointing into the executable section *enumerate* the
-jump-table code addresses. But until it is built, quote 82.0%, not 99.45%.
+jump-table code addresses. ~~But until it is built, quote 82.0%, not 99.45%.~~
+
+### ✅ BUILT, 2026-09-02 — `sr.py --jumptables`
+
+```
+python3 gamecube/recomp/sr/sr.py --image /tmp/sr_sab/main.dol \
+        --map dolphin_captures/sab.map --boundaries outer+calls --jumptable-census
+```
+```
+bctr sites in translatable functions : 147
+  jump table RECOVERED               : 145 (98.6%)
+  refused                            : 2
+         1  no lis/addi forming the table base
+         1  table base r3 defined by op32          (the base is LOADED from memory)
+
+case targets recovered: 3983
+       3969  inside the same function (emitted as a label)
+         14  another function start (emitted as a tail call)
+
+functions containing a bctr          : 123  (65401 instructions)
+  every bctr in them resolved        : 122  (65033 instructions)
+```
+
+A recovered `bctr` becomes a real dispatch instead of a fault:
+
+```c
+{ switch (st->ctr & ~3u) {  case 0x80019d68u: goto L_80019d68;
+                            case 0x80019d70u: goto L_80019d70;
+                            default: sr_indirect(st, st->ctr & ~3u); return; } }
+```
+
+The `default:` arm still faults deliberately — a CTR value outside the table means the
+bound check was not what we read, and must not be guessed.
+
+**Zero of the 3,983 targets is misaligned, mid-other-function, or outside a mapped
+function.** That is the strongest available static check: a mis-recovered table base
+would produce garbage addresses, and none appear.
+
+Two findings worth carrying:
+
+- The base is often materialised into a **different register** than `lis` wrote
+  (`lis r4,0x8018` / `addi r5,r4,23276` / `lwzx ?,r5,?`). A matcher requiring
+  `addi rT,rT,LO` missed **9 of 147**; a backward def-chain walk gets them.
+- Two tables aim at `0x8014c580`, `0x8014c5f8`, `0x8014c748`, `0x8014c878` — **exactly
+  the four functions §5e found have ZERO DIRECT CALLERS.** They are not four functions;
+  they are switch cases of one, which the Dolphin map over-split at each `blr` (§3).
+  §5e's conclusion that "the reachability route is closed" was right about the symptom;
+  the cause is a jump table, and `xform_vectors.py`'s injection harness — which was
+  built to work around it — turns out not to have been the only option.
+
+**Runtime-complete on the DOL therefore goes 307,368 (82.0%) → 372,401 (99.4%)** of
+374,807 mapped instructions, once these functions can execute their switches.
+
+### Verified BY EXECUTION, with a control arm
+
+The existing non-leaf suite contains **zero** `bctr` functions, so re-running it with
+`--jumptables` would have been a **vacuous** test. `fixture_nonleaf.py --discover
+--bctr-only` found three `bctr` functions live in the City Escape scene, and every
+fixture now records `bctr_executed` so a vacuous run cannot be mistaken for a pass:
+
+| entry | steps | `bctr_executed` | usable |
+|---|---|---|---|
+| `0x800e2194` | 20 | **0** — took an early exit | yes, but proves nothing here |
+| **`0x8010334c`** | **135** | **1** | **yes** — `unknown=0`, `outside_mem1=0`, ps1-indep |
+| `0x801011d8` | 79 | 2 | no — 12 unknown store forms, and touches WPAR `0xcc008000` |
+
+Both arms of `0x8010334c`, same fixture, one flag apart:
+
+| arm | result |
+|---|---|
+| `--indirect` only | **FAIL** — `fault=0xe11034f4` (`sr_indirect` refusing the jump-table target), 12 wrong GPRs, wrong LR, 63 write events instead of 66, wrong final memory |
+| `--indirect --jumptables` | **PASS** — fault 0, every GPR/FPR/CR/LR/CTR, all **66** ordered write events and all **84** final-memory bytes bit-identical |
+
+The fault address in the control arm is the proof that the table was the difference:
+`0xE1......` is `sr_indirect`'s "unresolved indirect target" prefix and `0x1034f4` is a
+mid-function switch label. **`sr.py --jumptables` is verified by execution, not only by
+static recovery.**
+
+### ⚠ And the pass needed one more harness correction: XER is not observable
+
+Before that PASS, the run reported exactly one difference — `xer want=20000000 got=0` —
+on a fixture where everything else was bit-identical. That is **not** a translator bug:
+
+- Dolphin keeps XER in **split fields** (`PowerPC.h:157-161` `xer_ca` / `xer_so_ov` /
+  `xer_stringctrl`), and `PowerPC.h:200` `SetCarry(ca) { xer_ca = ca; }` never touches
+  `spr[SPR_XER]`.
+- The **only two** references to `spr[SPR_XER]` in all of `Source/Core/Core/PowerPC`
+  are `GDBStub.cpp:451` (the read this harness uses, register 69) and `:674` (the
+  write). **Nothing keeps that slot live.**
+- The tell was in the capture itself: `state_in.xer == state_out.xer == 0x20000000`,
+  with `xer` absent from the capture's own `delta` — the oracle claiming XER never
+  changed across an invocation that executes four `addic.` and two `sraw`, every one of
+  which writes CA.
+
+XER is now reported and never scored, like FPSCR. Both sides of that comparison were
+stale, so it could never have been a valid criterion.
+
+**One real translator divergence did surface while chasing it**, and it is fixed on its
+own merit rather than because it changed this result (it did not): our `sraw` clamped
+the shift to 31 and tested the low `sh` bits, but `Interpreter_Integer.cpp:331-342`
+sets CA from the **sign bit** when `rB & 0x20`, because a shift of 32+ shifts every bit
+out. The clamped form answers NO for `rS = 0x80000000` — the one negative value with no
+other bit set. `sr.py` now mirrors the interpreter's structure exactly; the 4-function
+leaf slice still builds to md5 `f14b813694fc243b74c9c85f8fc009fb` and still scores
+1056/0, so the change is provably additive.
 
 ### Regression: both differentials re-run with indirect dispatch on
 
@@ -386,6 +510,11 @@ Two defects the first run surfaced, both now fixed and both worth knowing:
    looking plausible.
 
 ### ⛔ The in-tree City Escape savestate cannot be used with this oracle
+<!-- STILL TRUE for gamecube/states/sab-citye-gameplay.gcs.gz, but it stopped
+     mattering: a DIFFERENT state, ~/Library/.../StateSaves/GSNE8P.s01, is already
+     parked in City Escape and IS loadable — by /Applications/Dolphin.app, which is
+     the 2603a build that wrote it. See §5h. -->
+
 
 `gamecube/states/sab-citye-gameplay.gcs.gz` is the *port's* raw `State::DoState` buffer
 and `gamecube/tools/gcs_to_dolphin_sav.py` wraps it in Dolphin's on-disk header. It
@@ -634,7 +763,35 @@ base recovery separately from `--discover-budget` (the machine is already booted
 then), and documents the conversion so the next person picks a number in emulated
 time rather than wall time.
 
-## 5g. Overlay differential: NOT ACHIEVED, and the blocker is structural
+## 5g. Overlay differential: ACHIEVED — and the blocker was never the savestate
+
+> **SUPERSEDED, 2026-09-02.** Everything below this banner down to §5h is the record of
+> seven failed attempts. It is kept because the six causes it documents were all real
+> and all measured. But its CONCLUSION — "what is missing is a Dolphin savestate parked
+> where an overlay is resident, written by the upstream oracle so its `STATE_VERSION` is
+> 189" — was **wrong, and backwards**. See §5h.
+
+### RESULT
+
+```
+PASS  0x8121d80c  steps=236 bl=7 stores=22 write-events=47 final-mem-bytes=60
+                  staged=148 ps1-indep=true   fpscr:want=a622c000 got=a6204000 (NOT MODELLED)
+```
+
+`stg13D.rel` (City Escape) function at runtime address `0x8121d80c` — exit GPRs, FPR
+PS0 lanes, CR/XER/LR/CTR, the **complete 47-event ordered memory-write log**, and all
+60 bytes of final memory are bit-identical to native Dolphin's reference interpreter.
+Zero reads of unstaged guest memory, zero faults, PS1-independent. wasm md5
+`6f810afa5a28391d2522d3ce3eb173fd`, identical before and after the run; machine load 4.66.
+
+Artifacts: `gamecube/recomp/sr/sab_rel_stg13D_fixtures.json` and the relocated section
+`gamecube/recomp/sr/sab_rel_stg13D.sec1.live.bin`.
+
+Seven attempts failed for six measured reasons, and then an unmeasured seventh.
+
+Original section follows.
+
+### The (superseded) framing
 
 Seven attempts. **Zero overlay functions have been differentially verified**, which
 remains the largest unverified claim in this route — the overlays are 93.64% of SAB's
@@ -716,6 +873,125 @@ step and not something this tooling can do for itself.
 
 None of that needs revisiting. The next session's first action is the savestate.
 
+## 5h. What was actually wrong: the ORACLE BINARY, not the state
+
+**The state was there the whole time.** `~/Library/Application Support/Dolphin/StateSaves/GSNE8P.s01`
+is parked in City Escape with `stg13D.rel` resident. Every run above loaded it into a
+Dolphin that **cannot read it**, and Dolphin's response to that is not an error — it is
+to carry on **cold-booting**.
+
+| | STATE_VERSION | |
+|---|---|---|
+| `GSNE8P.s01` (cookie `0xBAADBB6F` − `0xBAADBABE`, revision `Dolphin 2603a`) | **177** | the state |
+| `~/gc_refs/dolphin-upstream/build-oracle` — what `fixture_nonleaf.py:41` pinned | **189** | rejects it at `State.cpp:723` |
+| `/Applications/Dolphin.app` — `Dolphin 2603a`, the build that WROTE the state | **177** | reads it |
+
+So §5g's requirement ("a state written by the upstream oracle so its version is 189")
+had it exactly backwards: what was needed was **a Dolphin that reads 177**, and it was
+already installed. With `/Applications/Dolphin.app` as the oracle the connect PC is
+`0x801012b4` — not `0x80003140` — on the first try.
+
+This also explains why only the OVERLAY differential ever failed. A cold boot still
+executes plenty of `main.dol`, so the leaf and non-leaf DOL fixtures captured fine; an
+overlay is not `OSLink`'d until the game reaches the level, so it was never present.
+Every "the interpreter runs SAB at 0.0328x, a title screen is tens of seconds of
+emulated boot away" measurement in §5f is correct and was solving a problem that did
+not need to be solved.
+
+`native_oracle_gdb.pick_oracle()` now derives the binary from the state file's own
+version cookie and **raises** rather than launching a Dolphin that would silently
+cold-boot. `fixture_rel.py` and `fixture_nonleaf.py` both use it.
+
+### Base recovery: ask the guest OS, do not scan for it
+
+`OSLink` registers every linked module in `__OSModuleInfoList` (`0x800030C8`,
+`OSLink.c:81`) and `OSLink.c:216-238` makes every field ABSOLUTE once linked. So the
+overlay's runtime base is simply *readable*, in about ten GDB reads:
+
+```
+[modlist] __OSModuleInfoList: 1 module(s) linked
+[modlist]   id=13  'c:\sonic2gc\cw\output\stg13D.plf'  sec1@0x811fff48 377296B EXEC
+[modlist] stg13D.rel id=13 sec1 base=0x811fff48 byte-confirm=OK (16384 windows)
+```
+
+That replaces the breakpoint-LR arithmetic, the MEM1 signature scan (12 s) and the
+600 s boot advance with a single structured read, and it *enumerates* what is resident
+instead of confirming a guess about one module. The same walk can be done entirely
+offline against the decompressed savestate — the state's LZ4 payload contains MEM1, and
+reading `0x800030C8` out of it gives the same answer with no Dolphin at all.
+
+### The seventh cause — an aligned-only relocation test
+
+With the CORRECT base handed over by the module list, `confirm_base()` still said
+**FAILED**. Of stg13D's 18,818 relocation sites in the executable section, **12,790
+(68.0%) sit at `site_off % 4 == 2`** — the immediate half of a `lis`/`addi` pair, which
+`R_PPC_ADDR16_HA/LO` patch through `*(u16*)p` (`OSLink.c:170-181`). Only the 6,028
+`R_PPC_REL24` sites are word-aligned. Both `confirm_base()` and `pick_signature()`
+tested `(off + k) for k in range(0, window, 4)`, so they were blind to two thirds of the
+relocations: they would call a window "relocation-free", compare it to live memory, and
+read a legitimate OSLink patch as a mismatch. **This would have defeated the signature
+scan too**, so no amount of fixing the boot would ever have produced a confirmed base.
+
+`patched_byte_offsets()` now derives the exact per-type byte ranges, and acceptance is a
+contiguous-region compare: *every* differing byte must lie inside a relocation site.
+
+| | bytes differing outside a relocation range |
+|---|---|
+| true base `0x811fff48` | **0** of 16,384 compared |
+| control: base off by 16 bytes | **262,032** — rejected |
+
+The control matters: with the old test the "check" could pass vacuously.
+
+### The differential said FAIL, and the harness was the liar
+
+The first run reported one difference on the one usable fixture:
+
+```
+f2(ps0) want=3f23a865467c9c00 got=3f23a865467c9bd3
+```
+
+Top 42 bits identical, low bits different — a rounding shape, so the shape was checked
+before the translator was blamed. The interpreter's own `state_out.fpr[2]` is
+`0x3f23a865467c9bd3` — **the value labelled `got`**. A JS `Number` cannot hold a 64-bit
+FPR pattern:
+
+```
+0x3f23a865467c9bd3 = 4549665201502067667
+through a JS double = 4549665201502067712 = 0x3f23a865467c9c00
+```
+
+`verify_fixture.mjs` read the fixture with plain `JSON.parse`, which corrupted **both**
+`state_in.fpr` (so the wasm was fed a slightly wrong input) and `state_out.fpr` (so the
+EXPECTED value was wrong). The wasm had been exactly right and the harness blamed the
+translator for its own rounding. This is the **same class of bug §5e already paid for**
+— `xform_vectors.py` serialises 64-bit values as hex strings for precisely this reason —
+resurfacing in a different file that reads the older number-valued fixtures.
+
+Fixed by parsing through the Node JSON **source reviver**, which recovers the exact
+digits, and hard-failing on a runtime that lacks it rather than silently degrading.
+Re-audited every committed suite for values that a double cannot hold exactly:
+
+| suite | inexact values | consequence |
+|---|---|---|
+| `sab_leaf_goldens.json` | **0** | prior 1056/0 unaffected |
+| `sab_xform_goldens.json` | **0** | prior 66/0 unaffected (already hex strings) |
+| `sab_blrl_fixtures.json` | **0** | prior 3 PASS unaffected |
+| `sab_nonleaf_fixtures.json` | **6** (NaN payloads) | re-run required |
+
+`sab_nonleaf_fixtures.json` re-run under the fixed reader: **7 PASS / 0 FAIL**, wasm md5
+`823eaf6b7a25339fa8f660da74f06f5a` — identical to the md5 already recorded in §5b. No
+regression.
+
+### Two of the three captured fixtures are NOT replayable, by construction
+
+`0x81217f48` and `0x81200438` each touch six addresses at `0xE0000000+`. The replay
+harness stages guest MEM1 only, so those bytes were never captured and replaying reads
+poison — producing a wall of register diffs that looks exactly like a translation defect
+and is not one. `verify_fixture.mjs` now refuses a fixture with a non-empty
+`outside_mem1` and says why, the same way it honours `usable:false`.
+
+So the honest score for this capture is **1 usable fixture, 1 PASS** — not 3 of 3.
+
 ## 6. The OS-thread / context-switch problem, measured
 
 The brief warned that a binary recomp cannot use MP4's escape (never compiling
@@ -776,9 +1052,11 @@ two.
    entire premise — that this escapes the JIT ceiling — is unmeasured for this game.
    MP4's ~1.000x is a *different game* reached by a *different (decomp→C)* route.
    Viability here means *translatability*, not speed.
-2. **No `.rel` overlay function has ever been differentially verified.** All 1,056
-   leaf vectors and all 7 non-leaf fixtures are DOL functions. 93.64% of SAB's code
-   is in overlays.
+2. ~~**No `.rel` overlay function has ever been differentially verified.**~~
+   **CLOSED 2026-09-02 (§5g/§5h): `stg13D.rel` `0x8121d80c` is bit-exact** — exit
+   registers, the 47-event ordered write log, and final memory. One function, from one
+   scene, so it evidences that overlay code translates correctly; it does not sample
+   the overlays broadly. The rig is now seconds-per-capture, so breadth is cheap.
 3. P1 is a **policy assumption**. Indirect dispatch is designed (N64Recomp
    `LOOKUP_FUNC`, `~/gc_refs/N64Recomp/include/recomp.h:450`) but not built here.
 4. The new x-form update ops are additive-proven, not correctness-proven.
@@ -793,8 +1071,19 @@ new rig:
    `bctr` through it, and re-run the 1,056 leaf vectors plus the 7 non-leaf fixtures.
    This converts P1 from an assumption into a measured number and unblocks 467 DOL
    functions and every overlay's entire residual. No savestate, no browser, no Dolphin.
-2. **Differentially verify one `stg13D` (City Escape) overlay function.** The rig
-   exists (`fixture_nonleaf.py` + `verify_fixture.mjs`); it needs a City Escape
-   savestate. This is the single claim never made, and it gates 93.64% of the code.
-3. Only then, a performance measurement — and per the product definition, the guest
+2. ~~**Differentially verify one `stg13D` (City Escape) overlay function.**~~ **DONE
+   2026-09-02 — §5g.** It did not need a new savestate; it needed the Dolphin that can
+   READ the one already on disk.
+3. **Capture a fixture that EXECUTES a recovered jump table.** `--jumptables` resolves
+   145 of 147 `bctr` sites and the emitted switch compiles, but nothing has yet run one
+   against the oracle — the existing non-leaf suite contains zero `bctr` functions, so
+   re-running it proves nothing. `fixture_nonleaf.py --discover --bctr-only` finds
+   candidates and every fixture records `bctr_executed`. Until that lands, the
+   99.4% runtime-complete figure is STATIC.
+4. **Broaden the overlay sample.** One overlay function is evidence that overlay code
+   translates; it is not a survey. Capture is now seconds per function against a
+   resident scene, and `fixture_rel.py` reports every resident module, so this is
+   cheap. Prefer fixtures with an empty `outside_mem1` — 2 of the first 3 captures
+   were rejected on that basis.
+5. Only then, a performance measurement — and per the product definition, the guest
    must run at exactly 1.000x; headroom is reported as capacity, never as speed-up.

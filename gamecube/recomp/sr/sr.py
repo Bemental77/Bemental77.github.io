@@ -150,7 +150,7 @@ def ea_x(f):
 
 class Translator:
     def __init__(self, img, fn_lo, fn_hi, resolve_call=None, starts=None, emitted=None,
-                 branch_reloc=None, indirect=False):
+                 branch_reloc=None, indirect=False, jumptables=False):
         self.img, self.lo, self.hi = img, fn_lo, fn_hi
         self.resolve_call = resolve_call
         # INDIRECT DISPATCH (blrl / bctr / bctrl).  Off by default so the historical
@@ -174,6 +174,14 @@ class Translator:
         #             a start outside `emitted` becomes sr_extern() = a hard fault.
         self.starts = starts
         self.emitted = emitted
+        # STATIC JUMP-TABLE RECOVERY for `bctr`.  Off by default so the historical
+        # --indirect numbers stay comparable; --jumptables turns it on.  Every one of
+        # SAB's 147 bctr sites is a switch table (lwzx -> mtctr -> bctr), so without
+        # this they ALL fault at run time and the 123 functions containing them --
+        # 65,401 instructions -- are translated but not runtime-complete.
+        self.jumptables = jumptables
+        self.jt_recovered = {}       # bctr pc -> [target, ...]
+        self.jt_refused = {}         # bctr pc -> why
         self.labels = set()
         self.calls = set()
 
@@ -195,6 +203,129 @@ class Translator:
         if self.emitted is None:
             return f"CALL({tgt:#010x}u);"
         return f"fn_{tgt:08x}(st);"
+
+    def recover_jump_table(self, pc):
+        """Static switch-table recovery for a `bctr`.  -> [targets] or None.
+
+        SHAPE, uniform across SAB's DOL (147 of 147 bctr sites match it):
+            cmplwi crX, rIdx, N            bound check
+            bc BO=12, BI=4X+1, default     leave when rIdx > N, so cases are 0..N
+            lis    rB, HI                  \\ the base is often materialised into a
+            addi   rT, rB, LO              /  DIFFERENT register than lis wrote
+            rlwinm rJ, rIdx, 2, 0, 29      index * 4
+            lwzx   rS, rT, rJ
+            mtctr  rS
+            bctr
+        This is the same recovery N64Recomp does (analysis.cpp:229-334).
+
+        REFUSES rather than guesses.  Every recovered target must be 4-byte aligned
+        and must land either INSIDE this function (emitted as a label) or exactly on
+        a known function start (emitted as a tail call).  Measured over the whole
+        DOL: 145 of 147 sites recover with all 3,983 targets resolvable -- 3,969
+        in-function, 14 on another function start, and ZERO mid-other-function,
+        misaligned, or outside any mapped function.  The 2 refusals both load the
+        table base from memory (`lwz`) rather than materialising it.
+        """
+        def back(frm, want_def, limit=48):
+            return range(frm, max(self.lo - 4, frm - 4 * limit), -4)
+
+        def word(p):
+            return self.img.word(p)
+
+        # mtctr rS
+        rs = mt = None
+        for p in back(pc - 4, None):
+            x = word(p)
+            if x is None:
+                return None
+            if (x >> 26) == 31 and ((x >> 1) & 0x3FF) == 467 and \
+                    ((((x >> 16) & 0x1F) | (((x >> 11) & 0x1F) << 5)) == 9):
+                rs, mt = (x >> 21) & 0x1F, p
+                break
+        if rs is None:
+            self.jt_refused[pc] = "no mtctr"
+            return None
+        # lwzx rS, rT, rJ
+        rt = lw = None
+        for p in back(mt - 4, None):
+            x = word(p)
+            if x is None:
+                return None
+            if (x >> 26) == 31 and ((x >> 1) & 0x3FF) == 23 and ((x >> 21) & 0x1F) == rs:
+                rt, lw = (x >> 16) & 0x1F, p
+                break
+        if rt is None:
+            self.jt_refused[pc] = "no lwzx feeding mtctr"
+            return None
+        # table base: follow the def chain of rT back through addi/addis to lis/li
+        base, acc, want, p = None, 0, rt, lw - 4
+        limit = max(self.lo - 4, lw - 4 * 48)
+        while p > limit:
+            x = word(p)
+            if x is None:
+                break
+            op, D, A = (x >> 26) & 0x3F, (x >> 21) & 0x1F, (x >> 16) & 0x1F
+            if D == want:
+                simm = x & 0xFFFF
+                simm = simm - 0x10000 if simm & 0x8000 else simm
+                if op == 14 and A == 0:
+                    base = acc + simm
+                    break
+                if op == 15 and A == 0:
+                    base = acc + ((x & 0xFFFF) << 16)
+                    break
+                if op == 14:
+                    acc += simm
+                    want = A
+                elif op == 15:
+                    acc += (x & 0xFFFF) << 16
+                    want = A
+                else:
+                    self.jt_refused[pc] = f"table base r{want} defined by op{op}"
+                    return None
+            p -= 4
+        if base is None:
+            self.jt_refused[pc] = "no lis/addi forming the table base"
+            return None
+        base &= 0xFFFFFFFF
+        # bound: the nearest cmplwi before the load
+        n = None
+        for p in back(lw - 4, None):
+            x = word(p)
+            if x is None:
+                break
+            if (x >> 26) == 10:                     # cmplwi rA, N -> cases 0..N
+                n = x & 0xFFFF
+                break
+            if (x >> 26) == 31 and ((x >> 1) & 0x3FF) == 32:
+                self.jt_refused[pc] = "register-form bound (cmplw)"
+                return None
+        if n is None:
+            self.jt_refused[pc] = "no cmplwi bound"
+            return None
+        if n > 4095:                                # a table that large is not a switch
+            self.jt_refused[pc] = f"implausible bound {n}"
+            return None
+        tgts = []
+        for i in range(n + 1):
+            v = word(base + 4 * i)
+            if v is None:
+                self.jt_refused[pc] = f"table word {i} at {base + 4*i:#010x} not in image"
+                return None
+            tgts.append(v)
+        for t in tgts:
+            if t & 3:
+                self.jt_refused[pc] = f"target {t:#010x} misaligned"
+                return None
+            if self.lo <= t < self.hi:
+                continue
+            if self.starts is not None and t in self.starts:
+                continue
+            self.jt_refused[pc] = (f"target {t:#010x} is neither inside "
+                                   f"[{self.lo:#x},{self.hi:#x}) nor a function start")
+            return None
+        self.jt_recovered[pc] = tgts
+        return tgts
 
     def branch_cond(self, f):
         """BO/BI -> (C condition expr, list of setup lines).  Models the CTR side too."""
@@ -289,6 +420,25 @@ class Translator:
                         f" sr_indirect(st, st->ctr & ~3u); }}")
                 o.append(body if cond == "1" else f"if ({cond}) {body}")
             else:                                        # bctr: a tail jump, LR untouched
+                tgts = self.recover_jump_table(pc) if self.jumptables else None
+                if tgts:
+                    # A RECOVERED SWITCH TABLE.  Dispatch on CTR to the case labels
+                    # directly; anything not in the table still falls through to
+                    # sr_indirect(), which FAULTS -- a value outside the table means
+                    # the bound check was not what we read, and must not be guessed.
+                    body = ["{ switch (st->ctr & ~3u) {"]
+                    for t in sorted(set(tgts)):
+                        if self.lo <= t < self.hi:
+                            self.labels.add(t)
+                            body.append(f"    case {t:#010x}u: goto L_{t:08x};")
+                        else:
+                            body.append(f"    case {t:#010x}u: "
+                                        f"{self.callexpr(t, pc, w)} return;")
+                    body.append("    default: sr_indirect(st, st->ctr & ~3u); return;")
+                    body.append("} }")
+                    txt = " ".join(body)
+                    o.append(txt if cond == "1" else f"if ({cond}) {txt}")
+                    return o
                 body = "{ sr_indirect(st, st->ctr & ~3u); return; }"
                 o.append(body if cond == "1" else f"if ({cond}) {body}")
             return o
@@ -466,11 +616,25 @@ class Translator:
                          f" {self.gp(A)} = (uint32_t)(v >> {sh}); }}")
                 rc(A); return o
             if xo == 792:                                # sraw
-                o.append(f"{{ uint32_t sh = {self.gp(B)} & 63; int32_t v = (int32_t){self.gp(S)};"
-                         f" if (sh > 31) sh = 31;"
-                         f" uint32_t ca = (v < 0 && (v & ((1 << sh) - 1)) != 0) ? 0x20000000u : 0u;"
-                         f" st->xer = (st->xer & ~0x20000000u) | ca;"
-                         f" {self.gp(A)} = (uint32_t)(v >> sh); }}")
+                # STRUCTURED EXACTLY LIKE THE REFERENCE INTERPRETER
+                # (Interpreter_Integer.cpp:326-351).  The previous form clamped the
+                # shift to 31 and tested the low `sh` bits, which is right for
+                # amount 0..31 but WRONG for a shift of 32 or more: the hardware
+                # shifts every bit out, so CA is just the sign bit, whereas the
+                # clamped test asks whether bits 0..30 are set and answers NO for
+                # rS = 0x80000000 -- the one negative value with no other bit set.
+                # Caught by the stg13D-scene fixture 0x8010334c, which matched on
+                # every GPR/FPR/CR/LR/CTR, all 66 write events and all 84 final
+                # memory bytes, and differed ONLY in XER[CA].
+                o.append(f"{{ uint32_t rb = {self.gp(B)}; int32_t rrs = (int32_t){self.gp(S)};"
+                         f" uint32_t ca;"
+                         f" if (rb & 0x20u) {{ ca = (rrs < 0) ? 0x20000000u : 0u;"
+                         f" {self.gp(A)} = (rrs < 0) ? 0xFFFFFFFFu : 0u; }}"
+                         f" else {{ uint32_t amt = rb & 0x1fu;"
+                         f" ca = (rrs < 0 && amt > 0 &&"
+                         f" ((uint32_t)rrs << (32 - amt)) != 0) ? 0x20000000u : 0u;"
+                         f" {self.gp(A)} = (uint32_t)(rrs >> amt); }}"
+                         f" st->xer = (st->xer & ~0x20000000u) | ca; }}")
                 rc(A); return o
             if xo == 0:                                  # cmp / cmpw
                 o.append(f"gk_cmp_signed(st, {f['crfD']}, (int32_t){self.gp(A)}, (int32_t){self.gp(B)});")
@@ -957,7 +1121,7 @@ def recover_boundaries(img, syms, policy='asis', log=None):
     return sorted(split)
 
 
-def closure_of(img, byaddr, roots):
+def closure_of(img, byaddr, roots, indirect=False, jumptables=False):
     """Transitive callee closure. -> (set of function starts, [(addr, why), ...]).
 
     A non-empty problem list means the closure CANNOT be translated end-to-end; the
@@ -973,7 +1137,13 @@ def closure_of(img, byaddr, roots):
             probs.append((a, "not a mapped function in this image"))
             continue
         size, _ = byaddr[a]
-        t = Translator(img, a, a + size, starts=starts)
+        # THE CLOSURE MUST TRANSLATE UNDER THE SAME SETTINGS AS THE EMISSION.
+        # Without this it refuses blrl/bctr even when the caller passed --indirect,
+        # so a root reached through an indirect branch reports CLOSURE BLOCKED and
+        # cannot be built at all -- which is why the blrl fixtures had to be run
+        # against a whole-image build instead of a closure build.
+        t = Translator(img, a, a + size, starts=starts, indirect=indirect,
+                       jumptables=jumptables)
         try:
             t.translate()
         except Untranslatable as e:
@@ -983,7 +1153,8 @@ def closure_of(img, byaddr, roots):
     return seen, probs
 
 
-def emit_c(img, fns, starts=None, branch_reloc=None, indirect=False):
+def emit_c(img, fns, starts=None, branch_reloc=None, indirect=False,
+           jumptables=False):
     emitted = {lo for lo, _, _ in fns}
     out = [HEADER]
     if len(fns) > 1:
@@ -992,7 +1163,8 @@ def emit_c(img, fns, starts=None, branch_reloc=None, indirect=False):
             out.append(f"void fn_{lo:08x}(GekkoState *st);   /* {name} */")
     for lo, size, name in fns:
         t = Translator(img, lo, lo + size, starts=starts, emitted=emitted,
-                       branch_reloc=branch_reloc, indirect=indirect)
+                       branch_reloc=branch_reloc, indirect=indirect,
+                       jumptables=jumptables)
         body = t.translate()
         out.append(f"\n// {name}  @ {lo:#010x}  ({size} bytes, {size // 4} instructions)")
         out.append(f"void fn_{lo:08x}(GekkoState *st) {{")
@@ -1028,6 +1200,19 @@ def main():
     ap.add_argument('--indirect', action='store_true',
                     help='translate blrl/bctr/bctrl as a runtime address->function '
                          'dispatch through sr_indirect() instead of refusing them')
+    ap.add_argument('--jumptable-census', action='store_true',
+                    help='report how many bctr jump tables statically RESOLVE. This is '
+                         'the runtime-completeness number; --coverage cannot show it '
+                         'because a bctr already "translates" under --indirect and '
+                         'only faults when executed.')
+    ap.add_argument('--jumptables', action='store_true',
+                    help='STATIC SWITCH-TABLE RECOVERY for bctr: read the jump table '
+                         'the compiler emitted and dispatch to the case labels '
+                         'directly, instead of faulting in sr_indirect(). Requires '
+                         '--indirect. Every SAB bctr is a jump table, so without this '
+                         '123 DOL functions (65,401 instructions) translate but fault '
+                         'at run time; that is the whole gap between 82.0%% and ~99.4%% '
+                         'runtime-complete.')
     ap.add_argument('--skiplist', help='write the --all host-binding worklist as JSON')
     ap.add_argument('--all', action='store_true',
                     help='emit every function in the boundary set (whole-image build)')
@@ -1044,7 +1229,8 @@ def main():
         reasons = collections.Counter()
         for lo, size, name in units:
             try:
-                Translator(img, lo, lo + size, indirect=a.indirect).translate()
+                Translator(img, lo, lo + size, indirect=a.indirect,
+                           jumptables=a.jumptables).translate()
                 ok += 1; ok_i += size // 4
             except Untranslatable as e:
                 fail += 1; fail_i += size // 4
@@ -1063,17 +1249,75 @@ def main():
     byaddr = {lo: (sz, nm) for lo, sz, nm in units}
     starts = set(byaddr)
 
+    if a.jumptable_census:
+        # RUNTIME completeness, which --coverage does NOT measure: under --indirect a
+        # `bctr` TRANSLATES (it becomes sr_indirect) but FAULTS when executed, because
+        # its target is a mid-function switch label and not a dispatchable entry.  So
+        # the census that matters is how many bctr sites resolve to a real table.
+        n_sites = n_ok = 0
+        refused = collections.Counter()
+        tgt = collections.Counter()
+        fn_all, fn_ok = set(), {}
+        for lo, size, name in units:
+            t = Translator(img, lo, lo + size, starts=starts, indirect=True,
+                           jumptables=True)
+            try:
+                t.translate()
+            except Untranslatable:
+                continue
+            sites = [p for p in range(lo, lo + size, 4)
+                     if (w := img.word(p)) is not None and (w >> 26) == 19
+                     and ((w >> 1) & 0x3FF) == 528 and not (w & 1)]
+            if not sites:
+                continue
+            fn_all.add(lo)
+            allok = True
+            for p in sites:
+                n_sites += 1
+                ts = t.jt_recovered.get(p)
+                if ts is None:
+                    refused[t.jt_refused.get(p, "not attempted")] += 1
+                    allok = False
+                    continue
+                n_ok += 1
+                for x in ts:
+                    tgt["inside the same function (emitted as a label)"
+                        if lo <= x < lo + size else
+                        "another function start (emitted as a tail call)"] += 1
+            fn_ok[lo] = allok and fn_ok.get(lo, True)
+        full = [f for f, v in fn_ok.items() if v]
+        i_full = sum(byaddr[f][0] for f in full) // 4
+        i_all = sum(byaddr[f][0] for f in fn_all) // 4
+        print(f"bctr sites in translatable functions : {n_sites}")
+        print(f"  jump table RECOVERED               : {n_ok} "
+              f"({100.0 * n_ok / max(n_sites, 1):.1f}%)")
+        print(f"  refused                            : {n_sites - n_ok}")
+        for r, c in refused.most_common():
+            print(f"      {c:4d}  {r}")
+        print(f"\ncase targets recovered: {sum(tgt.values())}")
+        for k, v in tgt.most_common():
+            print(f"      {v:5d}  {k}")
+        print(f"\nfunctions containing a bctr          : {len(fn_all)}  "
+              f"({i_all} instructions)")
+        print(f"  every bctr in them resolved        : {len(full)}  "
+              f"({i_full} instructions)")
+        print(f"\nThese instructions were TRANSLATED but not RUNTIME-COMPLETE before: "
+              f"under --indirect alone every bctr faults.")
+        return
+
     if a.closure_report:
         rows = []
         for lo, (size, name) in byaddr.items():
-            t = Translator(img, lo, lo + size, indirect=a.indirect)
+            t = Translator(img, lo, lo + size, indirect=a.indirect,
+                           jumptables=a.jumptables)
             try:
                 t.translate()
             except Untranslatable:
                 continue
             if not t.calls:
                 continue                                     # leaf
-            cl, probs = closure_of(img, byaddr, [lo])
+            cl, probs = closure_of(img, byaddr, [lo], indirect=a.indirect,
+                                   jumptables=a.jumptables)
             if probs:
                 continue
             rows.append((len(cl), sum(byaddr[x][0] // 4 for x in cl), lo, name, cl))
@@ -1099,12 +1343,14 @@ def main():
         for lo, size, name in units:
             try:
                 Translator(img, lo, lo + size, starts=starts,
-                           indirect=a.indirect).translate()
+                           indirect=a.indirect,
+                           jumptables=a.jumptables).translate()
                 ok.append((lo, size, name))
             except Untranslatable as e:
                 skipped.append((lo, size, name, e.why))
                 reasons[e.why.split('(')[0].strip()] += 1
-        src = emit_c(img, ok, starts=starts, indirect=a.indirect)
+        src = emit_c(img, ok, starts=starts, indirect=a.indirect,
+                     jumptables=a.jumptables)
         open(a.out, 'w').write(src)
         ni = sum(sz // 4 for _, sz, _ in ok)
         nt = sum(sz // 4 for _, sz, _ in units)
@@ -1130,7 +1376,8 @@ def main():
         sys.exit(1)
 
     if a.closure:
-        sel, probs = closure_of(img, byaddr, want)
+        sel, probs = closure_of(img, byaddr, want, indirect=a.indirect,
+                                jumptables=a.jumptables)
         if probs:
             for addr, why in sorted(set(probs)):
                 print(f"CLOSURE BLOCKED at {addr:#010x}: {why}", file=sys.stderr)
@@ -1140,7 +1387,8 @@ def main():
     else:
         sel = set(want)
     fns = sorted((lo, byaddr[lo][0], byaddr[lo][1]) for lo in sel)
-    src = emit_c(img, fns, starts=starts, indirect=a.indirect)
+    src = emit_c(img, fns, starts=starts, indirect=a.indirect,
+                 jumptables=a.jumptables)
     if a.out:
         open(a.out, 'w').write(src)
         print(f"wrote {a.out} ({len(src)} bytes, {len(fns)} functions)", file=sys.stderr)

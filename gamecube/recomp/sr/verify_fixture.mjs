@@ -8,7 +8,7 @@
 //   2. unstaged == 0                  every guest byte read was one the hardware read
 //   3. exit GPR[0..31]                bit-identical
 //   4. exit FPR PS0[0..31]            bit-identical (the GDB stub cannot see PS1)
-//   5. exit CR / XER / LR / CTR       bit-identical
+//   5. exit CR / LR / CTR             bit-identical  (XER is EXCLUDED -- see below)
 //   6. ordered memory-write log       identical as a sequence of per-byte CHANGE
 //                                     events (granularity-independent: native `stmw`
 //                                     is one 72-byte record, the translation emits 18
@@ -17,6 +17,13 @@
 // FPSCR is reported but NOT part of the pass criterion: gekko_rt.h states outright
 // that the exception/FPRF bits are not modelled.  It is printed either way so the
 // gap stays visible instead of being quietly dropped.
+//
+// XER is reported but NOT scored either, and for a sharper reason: THE ORACLE CANNOT
+// SEE IT.  Dolphin keeps XER in split fields (PowerPC.h:157-161 xer_ca / xer_so_ov /
+// xer_stringctrl; :200 SetCarry writes xer_ca) and the only two references to
+// spr[SPR_XER] in all of Source/Core/Core/PowerPC are GDBStub.cpp:451 (the read this
+// harness uses) and :674 (the write).  Nothing keeps that slot live, so register 69
+// is a stale value on BOTH sides of the diff.
 //
 // PS1 INDEPENDENCE: the stub exposes no PS1 lane, so each fixture is replayed TWICE
 // — once with ps1 = ps0 and once with ps1 = 0.  Identical results are the evidence
@@ -207,9 +214,29 @@ const main = async () => {
       for (let i = 0; i < 32; i++)
         if (A.out.fpr[i] !== BigInt(so.fpr[i]))
           bad.push(`f${i}(ps0) want=${BigInt(so.fpr[i]).toString(16)} got=${A.out.fpr[i].toString(16)}`);
-      for (const k of ['cr', 'xer', 'lr', 'ctr'])
+      // XER IS NOT OBSERVABLE THROUGH THIS ORACLE, so it cannot be a pass criterion.
+      // Dolphin's interpreter keeps XER in SPLIT FIELDS -- PowerPC.h:157-161
+      // `xer_ca` / `xer_so_ov` / `xer_stringctrl` -- and PowerPC.h:200
+      // `SetCarry(ca) { xer_ca = ca; }` never writes spr[SPR_XER].  The ONLY two
+      // references to spr[SPR_XER] anywhere in Source/Core/Core/PowerPC are
+      // GDBStub.cpp:451 (the read this harness uses, register 69) and :674 (the
+      // write).  Nothing syncs the slot, so it reports whatever was last poked into
+      // it, forever.
+      //
+      // The tell, on fixture 0x8010334c: state_in.xer == state_out.xer ==
+      // 0x20000000 with `xer` absent from the capture's own delta -- i.e. the
+      // oracle claims XER never changed across an invocation that executes four
+      // `addic.` and two `sraw`, every one of which writes CA.  Comparing against
+      // that produced `xer want=20000000 got=0` on a run where every GPR, every
+      // FPR, CR, LR, CTR, all 66 ordered write events and all 84 final memory
+      // bytes were bit-identical.  Reported, never scored -- same treatment FPSCR
+      // gets, and for a better-evidenced reason.
+      for (const k of ['cr', 'lr', 'ctr'])
         if (A.out[k] !== (so[k] >>> 0))
           bad.push(`${k} want=${(so[k] >>> 0).toString(16)} got=${A.out[k].toString(16)}`);
+      const xerNote = A.out.xer === (so.xer >>> 0) ? 'match'
+        : `want=${(so.xer >>> 0).toString(16)} got=${A.out.xer.toString(16)} ` +
+          `(NOT OBSERVABLE: GDBStub.cpp:451 reads a dead spr[SPR_XER] slot)`;
       if (A.wlog.length !== want.length)
         bad.push(`write events: want ${want.length}, got ${A.wlog.length}`);
       let firstWDiff = -1;
@@ -249,7 +276,7 @@ const main = async () => {
                   `stores=${fx.writes.length} write-events=${want.length} ` +
                   `final-mem-bytes=${fx._memBytes} ` +
                   `staged=${Object.keys(fx.initial_mem).length} ` +
-                  `ps1-indep=${ps1Indep}  fpscr:${fpscrNote}`);
+                  `ps1-indep=${ps1Indep}  fpscr:${fpscrNote}  xer:${xerNote}`);
       for (const b of bad.slice(0, 20)) console.log(`        ${b}`);
     }
   }

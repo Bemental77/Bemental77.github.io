@@ -55,23 +55,7 @@ DOL_ENTRY_PC = 0x80003140             # a connect here means the state did NOT r
 # Dolphin rejects a savestate whose STATE_VERSION differs (State.cpp:723) and then
 # SILENTLY COLD-BOOTS, which is what made seven overlay attempts look like boot-speed
 # problems.  Map cookie version -> the binary on this machine that can read it.
-COOKIE_BASE = 0xBAADBABE
-ORACLES_BY_STATE_VERSION = {
-    177: O.QT_APP,      # /Applications/Dolphin.app -- "Dolphin 2603a"
-    189: ORACLE_BIN,    # ~/gc_refs/dolphin-upstream/build-oracle nogui
-}
-
-
-def state_file_version(path):
-    """(version, revision_string) from a Dolphin savestate header.
-
-    Layout: StateHeaderLegacy (24 B) | version_cookie u32 | version_string_length u32
-    | version_string  -- State.h:28-54, written at State.cpp:385-387."""
-    with open(path, 'rb') as f:
-        head = f.read(4096)
-    cookie, slen = struct.unpack_from('<II', head, 24)
-    return cookie - COOKIE_BASE, head[32:32 + slen].decode('ascii', 'replace')
-
+# Oracle selection by state-file version lives in native_oracle_gdb.pick_oracle().
 
 def read_module_list(g):
     """Walk __OSModuleInfoList out of the live machine.
@@ -401,13 +385,12 @@ def main():
         return
 
     osyms = O.load_map(a.map)
-    sver, srev = state_file_version(a.state)
-    obin = a.oracle_bin or ORACLES_BY_STATE_VERSION.get(sver)
-    if obin is None:
-        print(f"[oracle] state {a.state} is STATE_VERSION {sver} ({srev!r}) and no "
-              f"Dolphin on this machine is known to read it; known: "
-              f"{sorted(ORACLES_BY_STATE_VERSION)}", file=sys.stderr)
+    try:
+        dflt, sver, srev = O.pick_oracle(a.state)
+    except Exception as e:
+        print(f"[oracle] {e}", file=sys.stderr)
         sys.exit(7)
+    obin = a.oracle_bin or dflt
     print(f"[state] {os.path.basename(a.state)}  STATE_VERSION={sver}  revision={srev!r}")
     print(f"[oracle] {obin}")
     dol = O.Dolphin(iso=a.iso, state=a.state, port=PORT,

@@ -66,6 +66,51 @@ SAB_STATE = os.path.expanduser(
     "~/Library/Application Support/Dolphin/StateSaves/GSNE8P.s01")
 SAB_MAP = os.path.join(REPO, "dolphin_captures/sab.map")
 
+# ---------------------------------------------------------------- oracle choice
+#
+# PICK THE DOLPHIN FROM THE STATE FILE, NEVER FROM A CONSTANT.  Dolphin refuses a
+# savestate whose STATE_VERSION differs (State.cpp:723) and then SILENTLY CONTINUES
+# COLD-BOOTING -- the connect PC is the DOL entry point and every downstream reading
+# still looks plausible.  That single mismatch is what made seven overlay-fixture
+# attempts read as "the interpreter boots too slowly to reach an overlay": the state
+# was version 177, the oracle was the upstream build at 189, and the scene never
+# loaded at all.  A cold boot still reaches plenty of DOL functions, which is why the
+# DOL fixtures worked and only the overlays failed -- an overlay is not OSLink'd until
+# the game reaches the level.
+COOKIE_BASE = 0xBAADBABE
+UPSTREAM_NOGUI = os.path.expanduser(
+    "~/gc_refs/dolphin-upstream/build-oracle/Binaries/dolphin-emu-nogui")
+ORACLES_BY_STATE_VERSION = {
+    177: QT_APP,           # /Applications/Dolphin.app -- "Dolphin 2603a"
+    189: UPSTREAM_NOGUI,
+}
+
+
+def state_file_version(path):
+    """(version, revision_string) from a Dolphin savestate header.
+
+    StateHeaderLegacy is 24 B, then version_cookie u32 and version_string_length u32,
+    then the string (State.h:28-54, written at State.cpp:385-387)."""
+    import struct as _struct
+    with open(path, "rb") as f:
+        head = f.read(4096)
+    cookie, slen = _struct.unpack_from("<II", head, 24)
+    return cookie - COOKIE_BASE, head[32:32 + slen].decode("ascii", "replace")
+
+
+def pick_oracle(state):
+    """The Dolphin on this machine that can READ `state`. -> (binary, version, rev)."""
+    if not state:
+        return DOLPHIN_BIN, None, None
+    ver, rev = state_file_version(state)
+    binary = ORACLES_BY_STATE_VERSION.get(ver)
+    if binary is None:
+        raise RSPError(
+            f"{state} is STATE_VERSION {ver} ({rev!r}); no Dolphin here is known to "
+            f"read it (known: {sorted(ORACLES_BY_STATE_VERSION)}). Loading it anyway "
+            f"would COLD-BOOT silently.")
+    return binary, ver, rev
+
 # ---------------------------------------------------------------- RSP client
 
 
