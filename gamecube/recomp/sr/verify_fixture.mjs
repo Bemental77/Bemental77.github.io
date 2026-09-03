@@ -31,6 +31,47 @@ const O_GPR = 0, O_PS0 = 128, O_PS1 = 384, O_CR = 640, O_XER = 644, O_LR = 648,
 
 const hexb = (s) => Buffer.from(s, 'hex');
 
+// ---------------------------------------------------------------- exact JSON
+// A JS Number CANNOT hold a 64-bit FPR pattern, and `JSON.parse` silently rounds
+// one to the nearest double.  This corrupted BOTH sides of the differential:
+// `state_in.fpr` (so the wasm was fed a slightly wrong input) and `state_out.fpr`
+// (so the EXPECTED value was wrong).  `BigInt(v)` at the use site does not help --
+// by then the precision is already gone.
+//
+// MEASURED, on the stg13D overlay fixture 0x8121d80c:
+//     interpreter state_out.fpr[2] = 0x3f23a865467c9bd3 = 4549665201502067667
+//     through a JS double          = 4549665201502067712 = 0x3f23a865467c9c00
+// The wasm produced 0x3f23a865467c9bd3 -- exactly right -- and this harness
+// reported it as `want=...9c00 got=...9bd3`, i.e. it blamed the translator for the
+// reader's own rounding.  Same class of bug as the one xform_vectors.py already
+// paid for (goldens there are hex strings for this reason); this file reads the
+// older number-valued fixtures, so it must parse them exactly instead.
+//
+// Numbers too large to be exact become BigInt, from the RAW SOURCE TEXT.  Every
+// other field (gpr, cr, ea, ...) is <= 32 bits and stays a Number.
+const SOURCE_REVIVER_OK = (() => {
+  try {
+    return JSON.parse('{"a":4550999638074826707}',
+                      (k, v, ctx) => (ctx && ctx.source) ? ctx.source : v).a === '4550999638074826707';
+  } catch { return false; }
+})();
+
+function parseExact(text) {
+  if (!SOURCE_REVIVER_OK) {
+    // Never fall back silently to the lossy reader -- that is what produced a
+    // false FAIL in the first place.
+    throw new Error(
+      `this Node (${process.version}) has no JSON source reviver, so 64-bit FPR ` +
+      `values cannot be read exactly. Node 21+ is required.`);
+  }
+  return JSON.parse(text, function (k, v, ctx) {
+    if (typeof v === 'number' && ctx && typeof ctx.source === 'string' &&
+        /^-?\d+$/.test(ctx.source) && !Number.isSafeInteger(v))
+      return BigInt(ctx.source);
+    return v;
+  });
+}
+
 function expandWrites(writes) {
   // -> [[physAddr, newByte], ...] in order, only bytes whose value CHANGED.
   const out = [];
@@ -54,7 +95,7 @@ const main = async () => {
 
   let allPass = true;
   for (const file of process.argv.slice(2)) {
-    const j = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const j = parseExact(fs.readFileSync(file, 'utf8'));
     for (const fx of j.fixtures) {
       const entry = fx.entry >>> 0;
       // HONOUR THE ARTIFACT'S OWN REJECTION FLAG.  Three records in
@@ -70,6 +111,20 @@ const main = async () => {
                   : fx.returned === false ? `did not return in ${fx.steps} steps`
                   : !fx.n_calls ? 'no bl executed' : 'marked unusable at capture';
         console.log(`SKIP  0x${entry.toString(16).padStart(8, '0')}  usable:false — ${why}`);
+        continue;
+      }
+      // NOT REPLAYABLE BY CONSTRUCTION: the harness stages guest MEM1 only
+      // (sr_ram covers 0x80000000..0x81800000), so an invocation that reads or
+      // writes outside it has bytes the fixture never captured.  Replaying it
+      // reads poison and produces a wall of register diffs that look like a
+      // translation defect and are not one -- the same trap `usable:false`
+      // exists for.  Reject it here rather than scoring it.
+      if (fx.outside_mem1?.length) {
+        const list = fx.outside_mem1.slice(0, 3)
+          .map((a) => `0x${(a >>> 0).toString(16)}`).join(', ');
+        console.log(`SKIP  0x${entry.toString(16).padStart(8, '0')}  not replayable — ` +
+                    `touches ${fx.outside_mem1.length} address(es) outside MEM1 (${list}` +
+                    `${fx.outside_mem1.length > 3 ? ', ...' : ''}); the harness stages MEM1 only`);
         continue;
       }
       const want = expandWrites(fx.writes);

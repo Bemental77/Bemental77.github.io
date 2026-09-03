@@ -44,6 +44,69 @@ PORT = int(os.environ.get("GDB_PORT", "9133"))
 OUT = os.environ.get("OUT", "/tmp/sr_rel_fixtures.json")
 MEM1_LO, MEM1_HI = 0x80000000, 0x81800000
 
+# OSLink.c:81-82 -- the guest OS's OWN registry of linked modules, at fixed
+# low-memory addresses.  Reading it is exact base recovery: no scan, no signature,
+# no heuristic, and it enumerates EVERY resident overlay rather than confirming a
+# guess about one.
+OS_MODULE_INFO_LIST = 0x800030C8      # OSModuleQueue {head, tail}
+OS_STRING_TABLE = 0x800030D0
+DOL_ENTRY_PC = 0x80003140             # a connect here means the state did NOT restore
+
+# Dolphin rejects a savestate whose STATE_VERSION differs (State.cpp:723) and then
+# SILENTLY COLD-BOOTS, which is what made seven overlay attempts look like boot-speed
+# problems.  Map cookie version -> the binary on this machine that can read it.
+COOKIE_BASE = 0xBAADBABE
+ORACLES_BY_STATE_VERSION = {
+    177: O.QT_APP,      # /Applications/Dolphin.app -- "Dolphin 2603a"
+    189: ORACLE_BIN,    # ~/gc_refs/dolphin-upstream/build-oracle nogui
+}
+
+
+def state_file_version(path):
+    """(version, revision_string) from a Dolphin savestate header.
+
+    Layout: StateHeaderLegacy (24 B) | version_cookie u32 | version_string_length u32
+    | version_string  -- State.h:28-54, written at State.cpp:385-387."""
+    with open(path, 'rb') as f:
+        head = f.read(4096)
+    cookie, slen = struct.unpack_from('<II', head, 24)
+    return cookie - COOKIE_BASE, head[32:32 + slen].decode('ascii', 'replace')
+
+
+def read_module_list(g):
+    """Walk __OSModuleInfoList out of the live machine.
+
+    Returns [ {id, name, sections: {idx: (addr, size, exec)}} ] in link order.
+    OSLink.c:216-238 makes every one of these fields ABSOLUTE once the module is
+    linked, so the executable section's address here IS the overlay's runtime base --
+    the quantity seven previous attempts tried to recover by breakpoint-LR arithmetic
+    and then by a MEM1 signature scan."""
+    def u32(a):
+        return struct.unpack('>I', g.mem(a, 4))[0]
+
+    mods, seen = [], set()
+    m = u32(OS_MODULE_INFO_LIST)
+    while m and MEM1_LO <= m < MEM1_HI and m not in seen and len(mods) < 64:
+        seen.add(m)
+        mid, nxt, nsec = u32(m + 0x00), u32(m + 0x04), u32(m + 0x0C)
+        sinfo, noff = u32(m + 0x10), u32(m + 0x14)
+        name = ""
+        if MEM1_LO <= noff < MEM1_HI:
+            try:
+                name = g.mem(noff, 64).split(b"\0")[0].decode("ascii", "replace")
+            except Exception:
+                pass
+        secs = {}
+        if MEM1_LO <= sinfo < MEM1_HI and 0 < nsec < 64:
+            blob = g.read_range(sinfo, sinfo + 8 * nsec)
+            for i in range(nsec):
+                off, size = struct.unpack_from('>II', blob, 8 * i)
+                if size:
+                    secs[i] = (off & ~1, size, bool(off & 1))
+        mods.append({"info": m, "id": mid, "name": name, "sections": secs})
+        m = nxt
+    return mods
+
 
 def dol_text_ranges(iso_path):
     """[(lo, hi)] of the DOL's TEXT sections, read from the header at ISO 0x420.
@@ -76,6 +139,39 @@ def reloc_site_offsets(rel, sec):
     return {r["site_off"] for _, r in rel.all_relocs() if r["site_sec"] == sec}
 
 
+def patched_byte_offsets(rel, sec):
+    """EVERY byte offset OSLink's Relocate() may rewrite -- not just the word-aligned ones.
+
+    THIS IS A REAL BUG THIS FILE SHIPPED.  Measured on stg13D: of 18,818 relocation
+    sites in the executable section, 12,790 (68.0%) sit at `site_off % 4 == 2` -- the
+    immediate half of a `lis`/`addi` pair, which R_PPC_ADDR16_HA/LO patch via
+    `*(u16*)p` (OSLink.c:170-181).  Only the 6,028 R_PPC_REL24 sites are word aligned.
+    Both confirm_base() and pick_signature() tested `(off + k) for k in range(0, n, 4)`,
+    so they were blind to 68% of the relocations: they would call a window
+    "relocation-free" when it contained an ADDR16 patch, then compare it against live
+    memory and see a legitimate difference as a MISMATCH.
+
+    Consequence, observed: with the CORRECT base 0x811fff48 handed over by the guest
+    OS's own module list, confirm_base() still reported FAILED.  The same blindness
+    would have made the signature scan pick an unmatchable window, so this defeats the
+    scan route too -- a seventh distinct cause, independent of the six already recorded.
+
+    Patch widths, from Relocate():
+      R_PPC_ADDR16* (3,4,5,6)  -> `*(u16*)p`, 2 bytes at the site
+      R_PPC_ADDR32 (1)         -> `*p`,       4 bytes
+      R_PPC_REL24/ADDR24 (10,2)-> `*p & ~0x03fffffc`, within the 4-byte word
+    """
+    out = set()
+    for _, r in rel.all_relocs():
+        if r["site_sec"] != sec:
+            continue
+        o, t = r["site_off"], r["type"]
+        n = 2 if t in (R.R_PPC_ADDR16, R.R_PPC_ADDR16_LO,
+                       R.R_PPC_ADDR16_HI, R.R_PPC_ADDR16_HA) else 4
+        out.update(range(o, o + n))
+    return out
+
+
 def pick_signature(blob, reloc_offs, want=32, tries=4000):
     """A distinctive, RELOCATION-FREE window of the overlay's exec section.
 
@@ -84,7 +180,9 @@ def pick_signature(blob, reloc_offs, want=32, tries=4000):
     best = None
     n = len(blob)
     for off in range(0, min(n - want, tries * 64), 64):
-        if any((off + k) in reloc_offs for k in range(0, want, 4)):
+        # EVERY byte, not every 4th: 68% of stg13D's relocation sites are the
+        # ADDR16_HA/LO immediate at off%4==2 -- see patched_byte_offsets().
+        if any((off + k) in reloc_offs for k in range(want)):
             continue
         w = blob[off:off + want]
         distinct = len(set(w))
@@ -137,30 +235,41 @@ def a_scan_windows(a, blob):
             ((bss_end + 0xFFF) & ~0xFFF, mid, 'lower arena, above the DOL BSS')]
 
 
-def confirm_base(g, rel, sec, base, reloc_offs, blob, samples=24, window=32):
-    """Byte-compare live memory against the shipped section at NON-relocated offsets.
+def confirm_base(g, rel, sec, base, patched, blob, samples=16, window=0x400):
+    """Byte-compare live memory against the shipped section.
 
-    Relocation sites are patched in place by OSLink, so they legitimately differ; any
-    mismatch anywhere else means this base is wrong."""
+    ACCEPTANCE: every byte that differs must lie inside a relocation site's patched
+    range (OSLink rewrites exactly those), and nothing else may differ.  That is far
+    stronger than the previous "find a window with no relocations and require equality"
+    -- which was also unusable here: stg13D has one relocation per ~20 bytes, so a
+    32-byte relocation-free window is rare, and the old aligned-only test only *looked*
+    like it was finding them because it was blind to the 68% of sites at off%4==2.
+
+    Reads contiguous KB-sized regions rather than sampling every Nth word, so the
+    evidence is "N,NNN bytes agree except at known patch sites", not "3 windows matched".
+    """
     n = len(blob)
-    step = max(4, (n // samples) & ~3)
-    checked = 0
-    for off in range(0, max(0, n - window), step):
-        if any((off + k) in reloc_offs for k in range(0, window, 4)):
-            continue
+    if samples < 1:
+        return False, 0
+    step = max(window, n // samples)
+    checked = mismatched = 0
+    for off in range(0, max(1, n - window), step):
         addr = base + off
         if not (MEM1_LO <= addr and addr + window <= MEM1_HI):
             return False, checked
         try:
-            live = g.mem(addr, window)
+            live = g.read_range(addr, addr + window, chunk=0x400)
         except Exception:
             return False, checked
-        if live != blob[off:off + window]:
-            return False, checked
-        checked += 1
-        if checked >= samples:
-            break
-    return checked >= 3, checked
+        ref = blob[off:off + window]
+        for i in range(len(ref)):
+            if live[i] != ref[i] and (off + i) not in patched:
+                mismatched += 1
+        checked += len(ref)
+    if mismatched:
+        print(f"[confirm] {mismatched} byte(s) differ OUTSIDE any relocation site "
+              f"over {checked} bytes compared", file=sys.stderr)
+    return mismatched == 0 and checked >= window, checked
 
 
 def main():
@@ -200,6 +309,21 @@ def main():
     ap.add_argument('--scan-lo', help='override the scan window start (hex)')
     ap.add_argument('--anchor', type=lambda x: int(x, 0),
                     help='hot DOL PC to advance the boot on (default OSDisableInterrupts)')
+    ap.add_argument('--oracle-bin', default=None,
+                    help='Dolphin to drive.  Default: chosen from the STATE FILE\'s own '
+                         'version cookie.  THIS DEFAULT IS THE FIX FOR SEVEN FAILED '
+                         'RUNS: the state is STATE_VERSION 177 and the upstream oracle '
+                         'is 189, so State.cpp:723 rejected it and Dolphin SILENTLY '
+                         'COLD-BOOTED -- which read as "the boot is too slow to reach '
+                         'an overlay" rather than "the state never loaded".')
+    ap.add_argument('--min-body', type=lambda x: int(x, 0), default=0x20,
+                    help='skip overlay entries whose body is smaller than this (default '
+                         '0x20 = 8 instructions).  stg13D has hundreds of 4-byte `blr` '
+                         'stubs and a one-instruction trace is not evidence.')
+    ap.add_argument('--scan', action='store_true',
+                    help='force the old MEM1 signature scan instead of reading the '
+                         'guest OS module list (only needed if __OSModuleInfoList is '
+                         'unusable)')
     a = ap.parse_args()
 
     disc = R.Disc(a.iso)
@@ -213,10 +337,14 @@ def main():
         sys.exit(2)
     sec = execs[0]["idx"]
     blob = rel.section_bytes(sec)
-    reloc_offs = reloc_site_offsets(rel, sec)
+    # BYTE offsets, not site offsets: 68% of the sites patch a 2-byte immediate at
+    # off%4==2 and an aligned-only test is blind to them.  See patched_byte_offsets().
+    reloc_offs = patched_byte_offsets(rel, sec)
     sites = dol_call_sites(rel)
     print(f"[rel] {ent['path']} id={rel.id} v{rel.version} exec sec={sec} "
           f"{len(blob)} bytes ({len(blob)//4} instructions)")
+    print(f"[rel] {len(reloc_site_offsets(rel, sec))} relocation sites covering "
+          f"{len(reloc_offs)} patchable bytes in section {sec}")
     print(f"[rel] {len(sites)} distinct DOL call targets, "
           f"{sum(len(v) for v in sites.values())} REL24 sites")
     dimg = sr.Image.from_dol(a.dol)
@@ -273,10 +401,19 @@ def main():
         return
 
     osyms = O.load_map(a.map)
+    sver, srev = state_file_version(a.state)
+    obin = a.oracle_bin or ORACLES_BY_STATE_VERSION.get(sver)
+    if obin is None:
+        print(f"[oracle] state {a.state} is STATE_VERSION {sver} ({srev!r}) and no "
+              f"Dolphin on this machine is known to read it; known: "
+              f"{sorted(ORACLES_BY_STATE_VERSION)}", file=sys.stderr)
+        sys.exit(7)
+    print(f"[state] {os.path.basename(a.state)}  STATE_VERSION={sver}  revision={srev!r}")
+    print(f"[oracle] {obin}")
     dol = O.Dolphin(iso=a.iso, state=a.state, port=PORT,
                     log=f"/tmp/sr_rel_oracle_{PORT}.log", dual_core=True,
-                    binary=ORACLE_BIN, extra=["-C", "Dolphin.Core.CPUCore=0"])
-    print(f"[oracle] {ORACLE_BIN} port={PORT} core=interpreter state={a.state}")
+                    binary=obin, extra=["-C", "Dolphin.Core.CPUCore=0"])
+    print(f"[oracle] port={PORT} core=interpreter state={a.state}")
     base = None
     try:
         g = dol.connect()
@@ -284,19 +421,53 @@ def main():
         print(f"[oracle] connected; pc={pc0:#010x}")
         # A savestate that fails to restore SILENTLY COLD-BOOTS and everything
         # downstream still looks plausible.  The DOL entry point is the tell.
-        if pc0 == 0x80003140:
+        if pc0 == DOL_ENTRY_PC:
             print("[oracle] WARNING: pc is the DOL ENTRY POINT — this is a COLD BOOT, "
                   "not a restored scene.  Overlays load only once the game reaches "
                   "the point that OSLinks them.")
 
+        # ------------------------------------- EXACT base recovery: ask the guest OS
+        # OSLink registers every linked module in __OSModuleInfoList with ABSOLUTE
+        # section addresses.  One read replaces the whole boot-advance + signature-scan
+        # apparatus below (which stays only as --scan, for a state where this is empty).
+        if not a.scan:
+            mods = read_module_list(g)
+            print(f"[modlist] __OSModuleInfoList: {len(mods)} module(s) linked")
+            for md in mods:
+                ex = [f"sec{i}@{v[0]:#010x} {v[1]}B{' EXEC' if v[2] else ''}"
+                      for i, v in sorted(md["sections"].items()) if v[2]]
+                print(f"[modlist]   id={md['id']:<4} {md['name']!r}  " + "; ".join(ex))
+            for md in mods:
+                if md["id"] == rel.id and sec in md["sections"]:
+                    addr, size, isexec = md["sections"][sec]
+                    if not isexec:
+                        continue
+                    if size != len(blob):
+                        print(f"[modlist] section {sec} is {size} B live but {len(blob)} B "
+                              f"in the file — refusing", file=sys.stderr)
+                        continue
+                    ok, checked = confirm_base(g, rel, sec, addr, reloc_offs, blob)
+                    print(f"[modlist] {a.rel} id={rel.id} sec{sec} base={addr:#010x} "
+                          f"byte-confirm={'OK' if ok else 'FAILED'} ({checked} windows)")
+                    if ok:
+                        base = addr
+                    break
+            else:
+                print(f"[modlist] {a.rel} (id={rel.id}) is NOT resident in this state")
+
         # ------------------------------------------------- advance the boot, then SCAN
+        # LEGACY COLD-BOOT PATH.  Every expensive step below is skipped outright once
+        # the module list has handed over a byte-confirmed base, which is the normal
+        # case against a restored scene.  It is kept for a state that genuinely does
+        # not have the overlay resident.
+        #
         # Advancing needs periodic control, and an armed breakpoint is the only
         # reliable way to get it (an async 0x03 break closes this stub's socket --
         # recorded in gamecube/tools/golden_invoke_sab_psmtx.py).  But every stop
         # costs a resync: with 40 targets armed the interpreter managed 3.0 s of
         # EMULATED time in ~300 s wall (0.010x) against 0.0328x unimpeded.  So arm
         # few, count fires, and do NO work per hit.
-        for tgt, _ in probes:
+        for tgt, _ in (probes if base is None else ()):
             g.add_bp(tgt)
         # SCAN COST IS THE BUDGET.  Scanning 0x80100000..0x81800000 at chunk 0x400 is
         # ~57,000 GDB round trips with the guest HALTED throughout, and re-scanning on
@@ -304,14 +475,16 @@ def main():
         # 15 minutes of wall clock (0.0016x), i.e. the scan, not the interpreter and
         # not the breakpoints, was the bottleneck.  So: advance the boot FIRST with no
         # scanning at all, then scan ONCE, over a narrowed window, with big chunks.
-        sig_off, sig = pick_signature(blob, reloc_offs)
-        if sig is None:
+        sig_off, sig = pick_signature(blob, reloc_offs) if base is None else (None, None)
+        if base is None and sig is None:
             print("[base] no relocation-free signature available", file=sys.stderr)
             sys.exit(6)
-        print(f"[base] signature: {len(sig)} bytes at +{sig_off:#x} = {sig[:16].hex()}...")
+        if sig is not None:
+            print(f"[base] signature: {len(sig)} bytes at +{sig_off:#x} = "
+                  f"{sig[:16].hex()}...")
         t0 = time.time()
         tries = 0
-        boot = a.boot_advance
+        boot = 0.0 if base is not None else a.boot_advance
         # ADVANCING THE BOOT IS ALL ABOUT NOT LEAVING THE CPU HALTED.
         # GDB.cont() "blocks until a breakpoint hits (no async break exists)" and
         # GDB.resync() ends by calling pc(), which needs a HALTED cpu.  Pairing a long
@@ -334,8 +507,9 @@ def main():
         # So: keep the RARE v3 probes armed (they fired 62-73 times in 981 s, which is
         # enough to hand back control and cheap enough to ignore), a long timeout, and
         # NO per-stop work whatsoever.
-        print(f"[base] advancing the boot for {boot:.0f}s on {len(probes)} rare probes, "
-              f"long cont, no resync in the loop ...", flush=True)
+        if boot:
+            print(f"[base] advancing the boot for {boot:.0f}s on {len(probes)} rare "
+                  f"probes, long cont, no resync in the loop ...", flush=True)
         last = t0
         while time.time() - t0 < boot:
             remain = boot - (time.time() - t0)
@@ -347,15 +521,16 @@ def main():
             if time.time() - last >= 120.0:
                 last = time.time()
                 print(f"[base]   t+{time.time() - t0:.0f}s  {tries} stops", flush=True)
-        for tgt, _ in probes:
+        for tgt, _ in (probes if boot else ()):
             g.del_bp(tgt)
-        g.resync()
-        print(f"[base] boot advanced: {tries} stops in {time.time() - t0:.0f}s")
+        if boot:
+            g.resync()
+            print(f"[base] boot advanced: {tries} stops in {time.time() - t0:.0f}s")
 
         # The arena RELs are allocated from starts above the DOL's BSS end, so there is
         # no reason to search from 0x80100000.  Narrow to [bss_end, MEM1_HI) and use a
         # big chunk: fewer, larger reads is the whole game here.
-        for lo_, hi_, why in a_scan_windows(a, blob):
+        for lo_, hi_, why in (a_scan_windows(a, blob) if base is None else ()):
             print(f"[base] scanning {lo_:#010x}..{hi_:#010x} ({(hi_-lo_)//1024} KB, {why}) "
                   f"chunk={a.scan_chunk:#x} ...", flush=True)
             t1 = time.time()
@@ -411,9 +586,15 @@ def main():
         entries = sorted({off for (s, off) in res["entries"] if s == sec})
         bodies = {E: v for (s, E), v in res["bodies"].items() if s == sec}
         print(f"[rel] {len(entries)} discovered function entries in section {sec}")
-        arm = [e for e in entries if e in bodies]
+        # Prefer SMALL bodies (cheap to single-step) but not TRIVIAL ones: stg13D has
+        # hundreds of 4-byte `blr` stubs, and a fixture whose whole trace is one
+        # instruction is not evidence that overlay code translates correctly.
+        arm = [e for e in entries
+               if e in bodies and bodies[e]["hi"] - bodies[e]["lo"] >= a.min_body]
         arm.sort(key=lambda e: bodies[e]["hi"] - bodies[e]["lo"])
         arm = arm[:a.max_arm]
+        print(f"[discover] {len(entries)} entries, {len(arm)} armed after "
+              f"--min-body {a.min_body} (smallest first)")
         dbudget = a.discover_budget if a.discover_budget else a.budget / 3.0
         print(f"[discover] arming {len(arm)} overlay entries for {dbudget:.0f}s")
         for off in arm:
