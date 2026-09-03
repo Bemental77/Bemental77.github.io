@@ -39,6 +39,10 @@
 //   AUDIO_OUT           JSON output path (default /tmp/audio-<page>.json)
 //   AUDIO_QUERY         extra query string appended to the page URL
 //   AUDIO_ROM_NAME      substring match to pick the ROM option instead of index
+//   AUDIO_PRESS         "v@8000,x@20000" — hold each LITERAL key at that offset
+//                       into the measurement window. USE IT: a title-only pass
+//                       cleared an audio build that trapped one screen later.
+//   AUDIO_PRESS_HOLD_MS how long each press is held (default 500)
 
 import puppeteer from 'puppeteer-core';
 import fs from 'node:fs';
@@ -276,6 +280,38 @@ try {
     // The whole point: audible frames must resume accumulating after unmute.
     result.muteCycle.recovered = (result.muteCycle.audibleGainedAfterUnmute ?? 0) > 1000;
   }
+
+  // --- scripted input during the window ------------------------------------
+  // AUDIO_PRESS="start@8000,x@20000" — hold each key for AUDIO_PRESS_HOLD_MS at
+  // that offset from the START of the measurement window, through page.keyboard
+  // (TRUSTED events, the real physical-keyboard path).
+  //
+  // THIS EXISTS BECAUSE A TITLE-ONLY AUDIO PASS READS ENTIRELY GREEN AND STILL
+  // SHIPS A BROKEN BUILD. Measured 2026-09-02: MP4's RECOMP_MUSYX build passed
+  // every audio gate at the title — audible, 0 gaps, 0 discontinuities, 1.000x —
+  // and then TRAPPED (`memory access out of bounds`, GenerateNextTrackEvent) on
+  // the first sequence the NEXT screen played, because the song byte-swapper
+  // assumed a fixed-size ARR header. The title screen simply never exercised the
+  // code that was wrong. An audio probe that cannot leave the first screen cannot
+  // clear an audio build.
+  //
+  // Key names are the LITERAL keys the page listens for, not GC button names,
+  // because the two emulator paths in gamecube.html bind different keys and only
+  // the page knows which (recomp: gamecube.html:7352 KEYB — KeyX=A KeyZ=B
+  // KeyV/Enter=Start; JIT: gamecube.html:5184 onKey — m=A n=B v=Start).
+  const PRESS_HOLD_MS = +(process.env.AUDIO_PRESS_HOLD_MS || 500);
+  result.presses = [];
+  (process.env.AUDIO_PRESS || '').split(',').filter(Boolean).forEach((spec) => {
+    const m = spec.trim().match(/^(\S+)@(\d+)$/);
+    if (!m) { console.log('[audio] AUDIO_PRESS spec ignored: ' + spec); return; }
+    setTimeout(async () => {
+      try {
+        await page.keyboard.down(m[1]);
+        result.presses.push({ key: m[1], atMs: +m[2] });
+        setTimeout(() => page.keyboard.up(m[1]).catch(() => {}), PRESS_HOLD_MS);
+      } catch (e) { console.log('[audio] press failed: ' + e.message); }
+    }, +m[2]);
+  });
 
   // --- measurement window --------------------------------------------------
   const SAMPLE_MS = 2000;

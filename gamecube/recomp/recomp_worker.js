@@ -37,24 +37,29 @@ let parts = [], fstBuf = null;
 const PART_SIZE = 104857600;   // 100MiB fixed part boundaries (gamecube.html chunkRange)
 
 // ---- AUDIO transport (page AudioWorklet ring) -------------------------------------------
-// THE STATE OF THIS PATH, so nobody reads sound out of it that isn't there. [2026-09-02] THE
-// SHIPPED gamecube/recomp/mp4_game.wasm IS STILL SILENT, and that is now a DELIBERATE choice
-// rather than a missing feature: the audio build exists, it works, and it is held back because
-// it breaks the game one screen later. Measured, both arms hash-guarded, box load 4.0-5.3:
-//   * RECOMP_MUSYX=1 build, title screen — audible YES: 63.55 s audible, 2,035,503 audible
-//     frames, 0 gaps, 0 discontinuities, peak 0.0758, at speed 1.000x / 60 shown / 60
-//     published. (tools/audio_probe.mjs; its tap validated 12/12 by tools/audio_tap_selftest.)
-//   * THE SHIPPED build, same page, same scene — 0 audible out of 2,596,864 RENDERED frames,
-//     also 1.000x / 60 / 60. So silence here is real silence, not a dead instrument: the
-//     transport below is healthy and pushing ~26,900 PCM frames/s of zeros.
-//   * RECOMP_MUSYX=1 build, one screen later — pressing Start and advancing into the
-//     file-select flow TRAPS with `main stopped: memory access out of bounds` (logged by this
-//     worker), after which the page reads 0 shown / 0 published and speed decays to 0.24x
-//     STARVED. 2 of 2 runs; the shipped and HEAD-default builds survived the same scripted
-//     journey at 1.00x / 60 published and logged no trap, 0 of 2 each.
-// See gamecube/recomp/build_wasm.sh's header for the re-gating recipe. The one thing to carry
-// forward: A TITLE-SCREEN AUDIO MEASUREMENT CANNOT SEE THAT BUG. Do not ship an audio build on
-// a title-only pass.
+// THE STATE OF THIS PATH. [2026-09-02] THE SHIPPED gamecube/recomp/mp4_game.wasm NOW HAS SOUND
+// (md5 00f457ce…, built with RECOMP_MUSYX=1). MP4 routes to the recomp by default
+// (gamecube.html:1038), so this is what a visitor hears. Measured on gamecube.html, every run
+// hash-guarded before and after and serialized through tools/probe_lock.sh, box load 2.5-5.4:
+//   * AUDIBLE, and driven PAST the title (Start x2 then A x8): audible YES, 2,265,587 audible
+//     frames, 70.7 s audible, peak 0.9008, on AudioContext id 1 — rank contexts by audible
+//     frames, NOT contexts[0], because this page builds a vestigial one too.
+//   * THE OLD SHIPPED build on the SAME journey: audible NO, "rendered frames were all exactly
+//     zero", 0 of 3,076,096 frames. So the difference is the sound, not the rig.
+//     (tools/audio_probe.mjs; its tap validated 12/12 by tools/audio_tap_selftest.mjs.)
+//   * 0 traps in 3 of 3 runs; guest rate 0.999x, 60 shown / 60 published, drawn 180/s, held to
+//     t=111s, screenshotted on MP4's PARTY MODE character-select screen.
+//
+// WHAT IT COST: headroom, not speed. The guest still runs at 0.999x, but producible capacity
+// fell from ~433-495 fps (7.2-8.2x hw) on the silent build to ~104-111 fps (1.7-1.8x hw) with
+// the software mixer in, so the page no longer reports "120 REACHED". Guest rate and presented
+// rate are separate knobs (CLAUDE.md gate #9); this moved only the second one.
+//
+// THE BUG THAT HELD THIS BACK FOR A ROUND was three wrong assumptions about the MusyX ARR
+// sequence format in shims/src/gc_musyx_song_bswap.c — see that file and build_wasm.sh. The
+// lesson for THIS file: `main stopped: memory access out of bounds` names nothing on its own,
+// which is why the catch below now logs e.stack. A TITLE-SCREEN AUDIO MEASUREMENT CANNOT CLEAR
+// AN AUDIO BUILD — the title-only pass read entirely green while the build died one screen on.
 //
 // Why compiling MusyX in was necessary but not sufficient: on real hardware MusyX mixes on the
 // DSP — hw_dolphin.c hands salBuildCommandList's output to the `dspSlave` microcode
@@ -64,14 +69,24 @@ const PART_SIZE = 104857600;   // 100MiB fixed part boundaries (gamecube.html ch
 // SAL backend + AI DMA model (gc_musyx_hw.c, gc_musyx_ai.c), and big-endian swappers for
 // /sound/mpgcsnd.msm and the sequences (gc_musyx_bswap.c, gc_musyx_song_bswap.c).
 //
-// ALSO OPEN, AND NOT THE SAME BUG: the sound is QUIET — title music peaks at 0.0758
-// (~-22 dBFS). It is NOT a global attenuation; the same build peaked 0.9037 later in the menu
-// flow. Two unverified candidates: (a) the mixer renders only the DRY stereo mix, so aux sends
-// (reverb/chorus), surround and studio-to-studio inputs contribute nothing; (b) OSGetSoundMode
-// reads an all-zero emulated SRAM (EXILock is a `return 0` host stub, so OSRtc.c:100 ReadSram
-// never fills it), so msmsys.c:909 selects MONO and every voice pans dead centre
-// (synth.c:670-692) instead of the SURROUND audio.c:62 would otherwise pick. Do not paper over
-// the level with a gain here — that would hide whichever one it is.
+// ALSO OPEN, AND NOT THE SAME BUG — TWO separate audio-quality defects, neither a ship blocker:
+//   (1) THE TITLE IS QUIET, the menu is not. Title music peaks 0.0758 (~-22 dBFS); the same
+//       build measured peak 0.9008 across a run driven into the menu flow, so it is NOT a
+//       global attenuation and there is no gain node to blame in this file or gamecube.html.
+//       Two candidates, both still unverified: (a) the mixer renders only the DRY stereo mix,
+//       so aux sends (reverb/chorus), surround and studio-to-studio inputs contribute nothing;
+//       (b) OSGetSoundMode() returns 0 => MONO, every voice panned dead centre
+//       (synth.c:670-692), where audio.c:60 would otherwise pick SURROUND. (b) has a CONFIRMED
+//       mechanism as of 2026-09-02: `wasm-objdump -j Import -x mp4_game.wasm` lists
+//       `env.EXILock` as a host import, this file answers unknown imports with
+//       `default: return 0`, and OSRtc.c:107 `if (!EXILock(...))` therefore makes ReadSram bail
+//       — so the emulated SRAM stays all-zero and msmsys.c:909 selects MONO. What is NOT
+//       verified is that this is what makes the TITLE specifically quiet.
+//   (2) CLICKS. Over the 70.7 s audible window the tap counted 69 discontinuities with
+//       maxStep 0.854 against peak 0.9008 — near-full-scale sample-to-sample jumps, about one
+//       per second. A title-only pass had read 0 of these, which is another reason not to
+//       trust one. Cause unknown; not investigated.
+// Do NOT paper over either with a gain node — that hides whichever one it is.
 //
 // The transport itself: this worker -> {cmd:'audio'} -> gamecube.html ->
 // window._gcAudioPushSamples -> the SAB ring -> /gamecube/audio-worklet.js -> ctx.destination.
@@ -690,9 +705,82 @@ async function boot(msg) {
   const mem = () => Module.wasmMemory;
   const dv = () => new DataView(mem().buffer);
 
+  // ---- OSReport: the guest's own diagnostic channel ---------------------------------------
+  // It used to fall through to `default: return 0`, so EVERY OSReport in the game, in MusyX's
+  // asserts, and in this port's own shims went nowhere. That is not a cosmetic gap: the shims
+  // deliberately report what they cannot classify rather than guessing (gc_musyx_bswap.c's
+  // "MSMBSWAP unclassified read" is the example), and a report nobody can read is the same as
+  // no report. It cost a round of the audio bring-up: the sequencer trapped and the only line
+  // available was `main stopped: memory access out of bounds`.
+  //
+  // ABI. OSReport is declared variadic, and wasm32 has no varargs — clang lowers a variadic
+  // call to (fmt_ptr, va_ptr) where va_ptr addresses a caller-allocated buffer of PROMOTED
+  // arguments: i32 4-byte aligned, f64 and i64 8-byte aligned. Confirmed on this module rather
+  // than assumed: `wasm-objdump -j Import -x mp4_game.wasm` gives `func[1] sig=2 <OSReport>`
+  // and `wasm-objdump -j Type -x` gives `type[2] (i32, i32) -> nil`.
+  //
+  // RATE LIMITED. Each line is a postMessage to the page, so a guest error loop would flood the
+  // console and perturb timing. After OSREPORT_MAX lines it says so once and goes quiet; it
+  // never silently truncates.
+  const OSREPORT_MAX = 500;
+  let osReportN = 0;
+  const cstr = (ptr) => {
+    if (!ptr) return '(null)';
+    const u8 = new Uint8Array(mem().buffer);
+    let e = ptr >>> 0, lim = (e + 4096) >>> 0;
+    while (e < lim && u8[e]) e++;
+    return new TextDecoder().decode(u8.subarray(ptr >>> 0, e));
+  };
+  function osReport(fmtPtr, vaPtr) {
+    if (osReportN >= OSREPORT_MAX) return;
+    if (++osReportN === OSREPORT_MAX) { log('OSReport: rate limit reached (' + OSREPORT_MAX + ' lines), further reports suppressed'); return; }
+    let fmt, out = '';
+    try { fmt = cstr(fmtPtr); } catch (e) { log('OSReport: unreadable format @0x' + (fmtPtr >>> 0).toString(16)); return; }
+    const d = dv();
+    let va = vaPtr >>> 0;
+    const i32 = () => { const v = d.getInt32(va, true); va += 4; return v; };
+    const u32 = () => { const v = d.getUint32(va, true); va += 4; return v >>> 0; };
+    const f64 = () => { va = (va + 7) & ~7; const v = d.getFloat64(va, true); va += 8; return v; };
+    const i64 = () => { va = (va + 7) & ~7; const v = d.getBigInt64(va, true); va += 8; return v; };
+    try {
+      for (let i = 0; i < fmt.length; i++) {
+        if (fmt[i] !== '%') { out += fmt[i]; continue; }
+        // flags/width/precision are consumed but not honoured — this is a diagnostic channel,
+        // not a formatter; the VALUES are what matter and mis-padding must never lose one.
+        let j = i + 1, lenmod = '';
+        while (j < fmt.length && '-+ #0123456789.*'.includes(fmt[j])) j++;
+        while (j < fmt.length && 'hlLqjzt'.includes(fmt[j])) { lenmod += fmt[j]; j++; }
+        const c = fmt[j];
+        if (c === undefined) { out += fmt.slice(i); break; }
+        switch (c) {
+          case '%': out += '%'; break;
+          case 'd': case 'i': out += (lenmod.includes('ll') ? i64() : i32()).toString(); break;
+          case 'u': out += (lenmod.includes('ll') ? i64() : u32()).toString(); break;
+          case 'x': out += (lenmod.includes('ll') ? i64() : u32()).toString(16); break;
+          case 'X': out += (lenmod.includes('ll') ? i64() : u32()).toString(16).toUpperCase(); break;
+          case 'p': out += '0x' + u32().toString(16); break;
+          case 'c': out += String.fromCharCode(i32() & 0xff); break;
+          case 'f': case 'F': case 'g': case 'G': case 'e': case 'E': out += f64().toString(); break;
+          case 's': out += cstr(u32()); break;
+          // An unknown specifier means the arg walk is no longer trustworthy: stop rather than
+          // print values pulled from the wrong offsets.
+          default: out += '%' + c + '<unhandled, args truncated>'; i = fmt.length; break;
+        }
+        i = j;
+      }
+    } catch (e) { out += ' <OSReport arg walk failed: ' + (e.message || e) + '>'; }
+    log('OSReport: ' + out.replace(/\n+$/, ''));
+  }
+
   function stub(n) {
     return (...a) => {
       switch (n) {
+        // OSReport is the only one of the family this module actually imports today
+        // (`wasm-objdump -j Import -x mp4_game.wasm` lists `func[1] sig=2 <OSReport>` and no
+        // OSPanic/OSFatal). OSPanic is kept because it is the same walk shifted by two
+        // — OSPanic(file, line, fmt, ...) — and a panic is the one message worth never losing.
+        case 'OSReport': osReport(a[0], a[1]); return 0;
+        case 'OSPanic':  log('OSPanic at ' + cstr(a[0]) + ':' + a[1]); osReport(a[2], a[3]); return 0;
         case 'OSInit':
           Module._OSSetArenaLo(0x80004000); Module._OSSetArenaHi(0x81800000); return 0;
         case 'OSGetTime': case '__OSGetSystemTime': return BigInt(viRetrace) * 675000n;
@@ -939,7 +1027,17 @@ async function boot(msg) {
   d.setUint32(0x80000038, 0x81C00000, true);
   d.setUint32(0x8000003C, fst.length, true);
   log('module up (' + hostNames.length + ' host stubs, ' + parts.length + ' disc parts); running main()');
-  try { await Module._main(); } catch (e) { log('main stopped: ' + (e.message || e)); }
+  // The STACK is the whole diagnosis when this fires. `main stopped: memory access out of
+  // bounds` on its own names nothing — a wasm trap message carries no location — and that is
+  // exactly how the 2026-09-02 audio-build trap stayed unattributed for a whole round. The
+  // stack DOES carry it, provided the wasm was linked with --profiling-funcs (build_wasm.sh
+  // honours RECOMP_PROFILING_FUNCS=1); without the name section the frames are `wasm-function[N]`
+  // indices, which `wasm-objdump -x` still resolves offline. Costs nothing on the happy path.
+  try { await Module._main(); }
+  catch (e) {
+    log('main stopped: ' + (e.message || e));
+    if (e && e.stack) log('main stopped, stack:\n' + String(e.stack).split('\n').slice(0, 40).join('\n'));
+  }
 }
 
 onmessage = (e) => {

@@ -13,33 +13,56 @@
 # a bare invocation omits the AOT overlays and the live path WEDGES at the first
 # overlay switch, ~f1033 after Start; cost a debug detour 2026-08-26):
 #
-#   RECOMP_MODESEL=1 RECOMP_MENT=1 RECOMP_W01=1 bash gamecube/recomp/build_wasm.sh
+#   RECOMP_MODESEL=1 RECOMP_MENT=1 RECOMP_W01=1 RECOMP_MUSYX=1 RECOMP_PROFILING_FUNCS=1 \
+#     bash gamecube/recomp/build_wasm.sh
 # (bootDll is on by default; RECOMP_*DIAG vars are temporary diagnostics, keep OFF.)
 #
-# ⚠ RECOMP_MUSYX=1 IS DELIBERATELY NOT IN THAT LINE — AUDIO IS PROVEN BUT NOT SHIPPABLE YET.
-#   Measured 2026-09-02, on gamecube.html, both arms hash-guarded before and after, box load
-#   4.0-5.3 throughout:
-#     * IT WORKS AT THE TITLE. tools/audio_probe.mjs (tap validated 12/12 by
-#       tools/audio_tap_selftest.mjs) read audible YES, 63.55 s audible, 2,035,503 audible
-#       frames, 0 gaps, 0 discontinuities, peak 0.0758, at speed 1.000x / 60 shown / 60
-#       published. The matched shipped-binary arm read 0 audible out of 2,596,864 RENDERED
-#       frames at the same 1.000x / 60 / 60, so the difference is the sound, not the rig.
-#     * IT WEDGES ONE SCREEN LATER. Driven with real key presses (Start, then A) into MP4's
-#       file-select flow, the RECOMP_MUSYX build TRAPS: the worker log says
-#       `[recomp-worker] main stopped: memory access out of bounds`, the page falls to
-#       0 shown / 0 published and speed decays 0.79x -> 0.24x STARVED, and it never recovers.
-#       2 of 2 runs. The SAME journey on the shipped binary and on the HEAD default build held
-#       speed 1.00x / 60 published to the end, and NEITHER logged the trap (0 of 2 each) — so
-#       the fault is the audio build, and the memory-card shim (present in the HEAD default
-#       arm too) is exonerated.
-#   Shipping it would trade a silent-but-correct default for an audible-but-broken one.
-#   UNVERIFIED LEAD for whoever fixes it: aramUploadData (shims/src/gc_musyx_aram.c:84-93)
-#   bounds-checks only the ARAM DESTINATION; the `mram` SOURCE is checked for NULL and nothing
-#   else, so a bad guest pointer memcpy's out of linear memory, which is what a wasm OOB trap
-#   looks like. That is a code read, not a diagnosis — instrument it before believing it.
-#   Re-gate with: tools/audio_probe.mjs (title) AND a scripted-input journey run past the title
-#   (gamecube/tools/dolphin_render_probe.js with PROBE_PRESS=start@30000,a@45000,...), because
-#   a title-only measurement CANNOT SEE THIS BUG.
+# RECOMP_MUSYX=1 IS NOW PART OF THAT LINE — THE AUDIO BUILD SHIPS (2026-09-02).
+#   gamecube/recomp/mp4_game.{js,wasm} md5 00f457ce…/fd341d95… replaced the silent
+#   8ec823be…/bed9aeac… pair. MP4 already routes to the recomp by default (gamecube.html:1038),
+#   so this IS what a visitor gets. Gate results, every run hash-guarded before AND after, box
+#   load 2.5-5.4 throughout, all runs serialized through tools/probe_lock.sh:
+#     * NO TRAP on the scripted journey (Start x2 then A x8 into file-select and past it):
+#       3 of 3 candidate runs and 2 of 2 shipped-binary control runs logged 0 traps. The
+#       screenshot at t=105s is MP4's PARTY MODE character-select screen — two screens beyond
+#       where the old build died.
+#     * AUDIBLE, driven past the title: audible YES, 2,265,587 audible frames, 70.7 s audible,
+#       peak 0.9008, on AudioContext id 1 (NOT contexts[0] — the page builds a vestigial one).
+#       The matched shipped-binary arm on the SAME journey read audible NO, "rendered frames
+#       were all exactly zero", 0 of 3,076,096 frames. tools/audio_tap_selftest.mjs 12/12.
+#     * GUEST RATE 0.999x, 60 shown / 60 published, drawn 180/s, held to t=111s.
+#     * ?ratetest=1 132 pass / 0 fail; ?captest=1 201 pass / 0 fail.
+#   ⚠ THE COST IS HEADROOM, NOT SPEED. Guest rate is unchanged (0.999x audio vs 0.999-1.000x
+#     silent), but producible capacity drops from ~433-495 fps (7.2-8.2x hw) on the silent
+#     control to ~104-111 fps (1.7-1.8x hw) with the software mixer in — the page stops
+#     reporting "120 REACHED". That is a real regression in headroom and the next thing to
+#     attack; it is not a speed regression (CLAUDE.md gate #9: the two are separate knobs).
+#   ⚠ STILL OPEN, not a ship blocker: 69 discontinuities / maxStep 0.854 over the 70 s audible
+#     window (a title-only pass had read 0) — audible clicks, cause unknown. And the TITLE is
+#     quiet (peak 0.0758) while the menu flow is not (0.9008); OSGetSoundMode() returns 0
+#     because EXILock is a `return 0` host import so OSRtc.c:107 ReadSram never fills SRAM,
+#     which selects MONO at msmsys.c:909 where audio.c:60 would pick SURROUND. Do NOT paper
+#     over either with a gain node.
+#
+# WHAT THE TRAP ACTUALLY WAS (three defects in shims/src/gc_musyx_song_bswap.c, all the same
+# class: the ARR sequence format was modelled by assumption instead of derived from the data):
+#   1. the ARR header was assumed to be a fixed 0x58 bytes; MP4's mode-select song puts its
+#      track table at 0x18, so the header swap covered 16 track entries and step 2 swapped
+#      them BACK to big-endian;
+#   2. swap_track treated a 0xFFFE loop entry as "keep scanning", but seq.c:975-982 JUMPS on
+#      it — so the walk ran out of every track into its neighbour and returned maxPattern
+#      0xfeff instead of 0x1b, which made step 4 size the pattern table at 65,536 entries and
+#      write all over the song (including the track table);
+#   3. `seen[]` keyed song identity on the ARR base pointer, but msmmus.c:438 gives each music
+#      player ONE reused buffer.
+#   Read that file's comments for the measured evidence. The stack that named it came from
+#   RECOMP_PROFILING_FUNCS=1 plus recomp_worker.js logging e.stack — before that the only line
+#   available was `main stopped: memory access out of bounds`, which names nothing.
+#
+# A TITLE-ONLY AUDIO PASS CANNOT CLEAR AN AUDIO BUILD. It read entirely green while the build
+# trapped one screen later. Re-gate with BOTH tools/audio_probe.mjs (now supports AUDIO_PRESS,
+# use it) AND dolphin_render_probe.js with PROBE_PRESS + PROBE_SCENE_RATE=5000 — the latter is
+# opt-in and is the only guest-rate witness on the recomp path.
 set -u
 DECOMP="${DECOMP:-$HOME/gc_refs/marioparty4}"
 RECOMP="$(cd "$(dirname "$0")" && pwd)"

@@ -450,6 +450,13 @@ void __recomp_bswap_msm_read(u32 startAddr, void *addr, s32 length, s32 offset) 
     if (!p || length <= 0) return;
     u32 len = (u32)length;
 
+    /* FIRST, before any classification return: fresh bytes have landed here, so any song the
+     * play-time swapper already marked as done at a base inside this range is stale. The music
+     * players re-use one fixed songBuf each (msmmus.c:438), so this is the normal case, not an
+     * edge one — see the seen[] note in gc_musyx_song_bswap.c. */
+    { extern void __recomp_msm_song_forget_range(const void *, u32);
+      __recomp_msm_song_forget_range(p, len); }
+
     /* --- the two self-identifying headers --- */
     if (offset == 0 && len == 0x60) {                 /* msmsys.c:803 */
         sw32n(p, 0x60 / 4);
