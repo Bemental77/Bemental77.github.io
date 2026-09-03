@@ -79,3 +79,9 @@ gamecube/recomp/*.bin filter= diff= merge= -text
 # Track3, the disc was garbage, and the game crashed on run_iter #1 (the
 # "pump stopped sh4_pc=0xa0000002" break). Same fix as PS1/N64/GC: real blobs.
 dreamcast/discs/pso2/*.bin.parta* filter= diff= merge= -text
+# Static-recomp differential fixtures: the RELOCATED overlay section captured from
+# the running oracle. Not served by Pages, but it is a MEASUREMENT ARTIFACT — an
+# LFS pointer here means a clone without LFS silently differentials against a
+# 133-byte stub instead of the overlay, which is exactly the false-negative class
+# this project has already paid for. Ship as a real blob.
+gamecube/recomp/sr/*.bin filter= diff= merge= -text
