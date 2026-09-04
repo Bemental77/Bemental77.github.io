@@ -481,6 +481,17 @@ against — but not excluded.
 **`m1` = `8a4342e5` therefore decides it alone**: the OLD arm renders, so `m1`
 black ⇒ `8a4342e5`; `m1` renders ⇒ `b8314d0a`.
 
+A code-read argument against `b8314d0a`, offered as reasoning and **not** as a
+measurement: its `WGPUGfx.cpp` hunk only moves the present READBACK from one
+`m_pixels` buffer to a 4-slot ring (`m_pixels_ring[slot_idx]`, seqlock per slot,
+publish index stored last). It changes *where already-rendered pixels are
+staged*, not what is drawn into the EFB. And the published slot demonstrably
+carries a **live** image — the HUD's timer advances between screenshots — so the
+consumer is not reading a stale or half-written slot. For this commit to be the
+cause, a fresh readback would have to contain the HUD but not the world, which
+this hunk has no mechanism to do. That leaves `8a4342e5` as the favourite **by
+elimination only**, which is exactly the standard §7 says not to ship a fix on.
+
 Arms staged (`/tmp/bw/snap-m{1,2}`, matched js/wasm, pinned page) and queued
 behind the probe lock. How to run one:
 
