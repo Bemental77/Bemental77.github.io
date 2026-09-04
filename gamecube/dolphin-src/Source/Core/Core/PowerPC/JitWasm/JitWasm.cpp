@@ -156,11 +156,21 @@ inline bool IsBlockTerminator(u32 inst)
 //   0x026B3B68  u32  spliced blocks the analyst then classified branchIsIdleLoop
 //   0x026B3B6C  u32  start_pc of the most recent such idle-classified block
 //   0x026B3B70  u32  spliced streams the emitter declined (fell back to contiguous)
+//   0x026B3B74  u32  KILL switch: 0 = splice active (default), nonzero = forced off
 constexpr u32 kLeafInlineCandCell    = 0x026B3B60u;
 constexpr u32 kLeafInlineSplicedCell = 0x026B3B64u;
 constexpr u32 kLeafInlineIdleCell    = 0x026B3B68u;
 constexpr u32 kLeafInlineLastPcCell  = 0x026B3B6Cu;
 constexpr u32 kLeafInlineBailCell    = 0x026B3B70u;
+// [LEAF-INLINE A/B 2026-09-04] kill switch, so the control arm and the shipped
+// arm come off ONE binary. Two separately-linked builds are NOT a clean control:
+// CLAUDE.md gate #10 records that the emitters bake host addresses as LEB
+// i32.const, so link layout shifts emitted bytes between builds. Read at COMPILE
+// time (same constraint as the [mips] gate): a block already compiled keeps the
+// path it was compiled with, so this must be armed from the query string
+// (?noleafinline=1) BEFORE the ROM boots. Browser-zeroed 0 = the shipped
+// behaviour, so the default path is byte-identical to the pre-switch tree.
+constexpr u32 kLeafInlineOffCell     = 0x026B3B74u;
 
 struct AotEntry { std::vector<u8> wasm; std::vector<u32> gwords; u32 gspan = 0; u32 ghash = 0; u32 cycles = 0; };
 std::unordered_map<u32, AotEntry> g_aot_blocks;
@@ -1075,9 +1085,17 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
     // candidate gate free: unless this block ENDS in a pc-relative `bl`, the
     // splice pass cannot possibly fire and we do not run it. Every non-`bl`
     // block therefore takes the exact same path it took before.
-    if (bemental::powerpc::IsInlinableBl(insts.back()))
-    {
+    const bool li_candidate = bemental::powerpc::IsInlinableBl(insts.back());
+    if (li_candidate)
       AotBump(kLeafInlineCandCell);
+    // [LEAF-INLINE A/B 2026-09-04] The candidate is counted on BOTH arms and the
+    // kill switch suppresses only the splice itself. That is deliberate: it makes
+    // the census the arm-difference proof. Control reads cand=N/spliced=0/idle=0,
+    // shipped reads cand=N/spliced=M/idle=M off the SAME binary. An all-zero
+    // census would instead be indistinguishable from "the census never ran",
+    // which is the placebo-arm failure lib/capability.js's matrix exists to catch.
+    if (li_candidate && *AotCell(kLeafInlineOffCell) == 0u)
+    {
       struct LeafFetchCtx { Memory::MemoryManager* mem; };
       LeafFetchCtx lfc{&mem};
       auto leaf_fetch = +[](u32 fpc, void* user) -> u32 {

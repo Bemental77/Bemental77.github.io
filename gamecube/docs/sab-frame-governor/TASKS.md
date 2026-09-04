@@ -1,9 +1,16 @@
-# SAB frame governor — 23.2% of guest execution is one un-skippable busy-wait
+# SAB frame governor — an undetected `bl`/`cmp`/`bne` busy-wait, and what skipping it actually costs
 
-> **⚠ THE 23.2% IN THIS TITLE DID NOT REPRODUCE (2026-09-04): a second run on the
-> same build measured 0.1%.** The MECHANISM on this page is still correct and
-> still unfixed; only the SIZE of the prize is retracted. See the box at the
-> bottom and `gamecube/docs/pc-census/TASKS.md` before acting on any number here.
+> **⚠ THE ORIGINAL HEADLINE ("23.2% of guest execution") IS RETRACTED TWICE OVER.**
+> 1. **The size did not reproduce (2026-09-04):** a second run on the same build
+>    measured **0.1%**. The pooled PC census is a phase mixture, not a property of
+>    the workload. See the retraction box near the bottom + `../pc-census/TASKS.md`.
+> 2. **The fix was built, and it is a NET LOSS on the probe's scene (2026-09-04):**
+>    an interleaved matched pair off ONE binary reads **-5.0% guest rate /
+>    -8.1% published** with the splice ON. See "RE-PRICED ON THE GUEST RATE".
+>
+> The MECHANISM analysis on this page is a code-read and still stands: the `bl`
+> really does split the block and `IsBusyWaitLoop` really cannot fire. Only the
+> value of fixing it is in question — and it currently measures negative.
 
 Measured 2026-09-01 on a QUIET box (load 1.37, no competing Chrome, orphan
 reaper run first). Every number here is a citation, not a recollection.
@@ -158,11 +165,121 @@ entry is **`0x80117df8`** (`mflr r0; stw r0,4(r1)`), not `0x80117e00`; and the
 `tools/gsne8p_xref.map` already named — the 256B bucket base `0x800f3700` fell in
 its neighbour, which is why it printed as unresolved.
 
+## ⚠ [2026-09-04] RE-PRICED ON THE GUEST RATE: THE LEVER FIRES AND **COSTS** ~5%
+
+The box above asked for a re-price with a witness that is not a PC histogram.
+Done. **The answer is worse than a null: on the scene the probe reaches, the
+shipped splice is a measured REGRESSION.**
+
+### Why this measurement is not the 2026-09-01 one
+
+`8a4342e5` priced this lever by comparing **two separately-linked binaries**
+(pre-change tree vs post-change tree). CLAUDE.md gate #10 records that the
+emitters bake host addresses as LEB `i32.const`, so **link layout shifts emitted
+bytes between builds** — two baseline binaries differed by 0.16% on emitted
+bytes for identical input. A cross-binary A/B carries that confound.
+
+This re-price removes it. A kill switch on SAB cell `0x026B3B74`
+(`JitWasm.cpp`, `?noleafinline=1` in `gamecube.html`) suppresses **only the
+splice**, so **both arms come off ONE binary**, md5
+`82bc8f8b6e1c6ac8db27ec0a5d49dadb`, verified identical before AND after every
+run. Read at emit time, so it is armed from the query string (same constraint as
+`?bjit_mips=1`).
+
+### The arm-difference proof is the census, not the flag
+
+The candidate counter is bumped on BOTH arms and only the splice is gated, so an
+inert flag is distinguishable from a working one (an all-zero census would look
+identical to "the census never ran" — the placebo-arm failure the device matrix
+exists to catch):
+
+    arm A (?noleafinline=1)  leafInline = 4866/0/0/0     lastIdlePc = 0
+    arm C (default, shipped) leafInline = 4866/15/15/219  lastIdlePc = 0x80117e0c
+
+`lastIdlePc = 0x80117e0c` is **this page's governor loop**. The lever provably
+fires, on exactly the intended block.
+
+### Matched pair, interleaved A/C/A/C, one binary
+
+Both guest-clock witnesses, never `[mips]`. They agree to 4 decimals in all runs.
+
+    run  arm  guest(ai_dma_cb)  guest(aid_fire)  published/s  load at start→end
+    A1   OFF      0.4396           0.4396          17.69        3.98 → 5.74
+    C1   ON       0.4151           0.4152          16.18        4.94 → 6.61
+    A2   OFF      0.4477           0.4476          18.15        5.91 → 6.61
+    C2   ON       0.4277           0.4277          16.75        6.88 → 7.30
+
+    mean  OFF 0.4437   ON 0.4214   ->  ON/OFF = 0.950  (-5.0% guest)
+    mean  OFF 17.92/s  ON 16.47/s  ->  ON/OFF = 0.919  (-8.1% published)
+
+**The two arms' ranges are DISJOINT on both metrics** — every OFF run beats every
+ON run. Load rose monotonically across the campaign, which works AGAINST this
+reading, not for it: within each arm the LATER, higher-load run was the FASTER
+one (A2 > A1, C2 > C1), so load drift is not producing the arm ordering.
+
+**LIMITATION — n = 2 per arm.** A third pair was attempted and ABANDONED, not
+silently dropped: a sibling agent began a back-to-back multi-ROM campaign and the
+queued run lost the probe lock for 14 minutes. It was killed (`rc=143`,
+`/tmp/li-A3.log` empty, no partial data used) because a run taken 40 minutes
+later under a different contention regime is *less* matched to A1-C2, not more.
+Note also that `ai_dma_cb` and `aid_fire` are two readings of the SAME guest
+clock, not independent evidence — they agree to 4 decimals by construction. The
+genuinely separate second metric is `published/s`. So this is 2 runs per arm on 2
+metrics, with disjoint ranges: strong enough to refuse the "+9.6% win" claim and
+to block a default flip, **not** strong enough to be a final price.
+
+### The cost mechanism (code-read, not speculation)
+
+`branchIsIdleLoop` makes the block store `downcount = 0` in its **prologue**
+(`ppc_emit.cpp:1051-1055`). That ends the CoreTiming slice on **every execution
+of that block**, forcing a return to the dispatcher instead of tail-chaining in
+WASM. That is a win only while the guest is genuinely PARKED in the loop. Per the
+retraction box above, on a run whose phases differ the loop is **0.1%** of
+samples — so the same mechanism buys nothing and each entry still pays the forced
+slice exit. Arm C also pays 234 extra `build_block_next` calls at compile time
+(15 kept + 219 bailed).
+
+**This is a hypothesis consistent with the data, not a proven cause.** What is
+measured is the sign and size of the delta, not the reason for it.
+
+### What this does NOT say
+
+* It does not say the mechanism analysis is wrong. `bl`/`cmp`/`bne` loops
+  genuinely are undetected; that part is a code-read and still stands.
+* It does not generalise past this scene. The probe's boot/menu path is the
+  phase mixture the retraction box documents. A scene where the guest really does
+  park in the retrace-wait could still favour the splice — that is exactly the
+  segmented, named-scene re-price still open below.
+* **The shipped default was left ON.** Flipping a shipped default on one
+  phase-mixed scene, days after this page's headline was retracted for being
+  scene-dependent, would repeat the failure this doc exists to record. The switch
+  makes the decision reversible in one query parameter; it should be made on a
+  named steady scene.
+
 ## Open
 
-- [ ] Contiguous pure-leaf inline + the correctness corpus that gates it
-      (LR exactness, refusal cases, non-self back-edge, the gate-#9 invariant).
-      **Re-price it first** — see the box above.
+- [x] **Contiguous pure-leaf inline + the correctness corpus that gates it.**
+      IMPLEMENTED and green — but see the re-price box directly above: on the
+      probe's scene the lever is a **-5.0% guest / -8.1% published REGRESSION**,
+      not a win. Code `8a4342e5` (`ppc_analyst.{h,cpp}` `DecodePureLeaf` /
+      `DecodeBlockLeafInlined`, spliced in `JitWasm::TryCompileBlock`), corpus
+      `02f8ef65`, A/B kill switch + this re-price 2026-09-04.
+      Corpus: `bash gamecube/bementalJIT/tests/run_leaf_inline_test.sh` —
+      **75 pass / 0 fail / 0 vacuous**, host-native, ~1s, no browser or ROM.
+      It covers LR exactness (G.3), the non-self back-edge cases (G.4a/b/c),
+      every refusal case (C.1-C.19: store, nested call, branches, non-`blr`
+      terminator, `blrl`, SPR/MSR writes, FPU, over-budget, self-recursive,
+      in-range target), and the gate-#9 invariant (GROUP E: a 15,686-cell sweep
+      asserting `downcount = 0` credits EXACTLY `slice_length` and global_timer
+      never passes the next scheduled event).
+      `run_leaf_inline_mutants.sh` is the red-test gate: **5/5 mutants caught**
+      (self-check, seam pairing, Store, CTR back-edge, SPR), control green.
+- [ ] **Re-price on a NAMED steady scene** (`SEG_SPLIT=1`, `SEG_MIN=4`, with a
+      screenshot), and decide the default there. Both arms are already available
+      from one binary via `?noleafinline=1`, so this is a probe-only task.
+- [ ] `gamecube/ppc-worker/ppc_worker_main.cpp` does NOT call the splice — only
+      the `dolphin_worker` path is wired. Left deliberately unwired while the
+      measured payoff on the shipped path is negative.
 - [x] **Resolve the census.** Done 2026-09-04, `gamecube/docs/pc-census/TASKS.md`.
       The cause was neither bucket granularity nor overlays (96.92% of samples
       are inside SAB's DOL `.text`): `tools/gsne8p_xref.map` names 441 functions

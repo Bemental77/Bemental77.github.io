@@ -2704,6 +2704,27 @@ window.GcRate = (function () {
         pageLog('[mips-meter] emit-time gate = ' + _bim);
       }
     } catch (e) { pageLog('[mips-meter] toggle write failed: ' + (e && e.message)); }
+    // [leaf-inline A/B 2026-09-04] ?noleafinline=1 — DISABLE the pure-leaf `bl` splice
+    // that idle-classifies SAB's VI-retrace frame governor at 0x80117e0c. (Do NOT quote
+    // the old "23.2% of guest-PC samples" for this loop — RETRACTED 2026-09-04, it did
+    // not reproduce and read 0.1% on a second run of the same build.) An interleaved
+    // matched pair off ONE binary measured the splice at -5.0% guest / -8.1% published
+    // on the probe's scene, i.e. it currently COSTS. SAB scratch cell 0x026B3B74; browser-zeroed
+    // 0 = OFF = the splice is ACTIVE, i.e. the shipped behaviour, so the default path is
+    // byte-identical to the pre-switch tree. Nonzero = suppressed = the A/B control arm.
+    // Read at EMIT time (JitWasm::TryCompileBlock), so it must be armed BEFORE the blocks
+    // you care about are compiled — i.e. from the query string, same constraint as
+    // ?bjit_mips=1. Census cells 0x026B3B60/64/68/70 are the arm-difference proof: the
+    // candidate count is bumped on BOTH arms, only spliced/idle differ.
+    // See gamecube/docs/sab-frame-governor/TASKS.md.
+    try {
+      var _bileaf = new URLSearchParams(location.search).get('noleafinline');
+      if (_bileaf !== null) {
+        var _bil = (parseInt(_bileaf, 10) !== 0) ? 1 : 0;
+        new Uint32Array(sharedMemory.buffer)[0x026B3B74 >> 2] = _bil;
+        pageLog('[leaf-inline] splice ' + (_bil ? 'DISABLED (control arm)' : 'enabled (default)'));
+      }
+    } catch (e) { pageLog('[leaf-inline] toggle write failed: ' + (e && e.message)); }
     // [fifo-brake ESCAPE HATCH 2026-08-29] The host-side GX FIFO backpressure brake
     // (CommandProcessorManager::BemFifoBackpressure, CommandProcessor.cpp:426) ships DEFAULT ON
     // and reads kill-switch cell 0x026B3B20 (nonzero = brake DISABLED). Until now NOTHING in
