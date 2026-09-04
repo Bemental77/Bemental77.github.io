@@ -8,7 +8,7 @@ SR_OUT=/tmp/sr_ctxsw_trace SR_TRACE_BUILD=1 bash gamecube/recomp/sr/build_ctxsw.
 node gamecube/recomp/sr/verify_ctxsw.mjs /tmp/sr_ctxsw /tmp/sr_ctxsw_trace
 ```
 
-**Result: 48 passed, 0 failed.** A guest thread switch really happens — thread A calls
+**Result: 63 passed, 0 failed.** A guest thread switch really happens — thread A calls
 the translated `OSSleepThread`, control crosses to a second host thread that runs the
 translated `OSWakeupThread`, and A resumes *inside* `SelectThread` with its
 callee-saved registers intact and `OSSleepThread` returning normally.
@@ -16,6 +16,7 @@ callee-saved registers intact and `OSSleepThread` returning normally.
 | | evidence |
 |---|---|
 | the switch happens | §6, trace of 17 host-boundary events, two `HANDOFF`s, two distinct host thread ids |
+| it is not nesting in disguise | §6a, a three-thread **non-LIFO rotation** A→B→C→A that resumes A while B is still parked — three distinct host threads |
 | the host layer is bit-exact with the shipped code | §5, three non-switching paths + the switch frozen at the `rfi`: identical `GekkoState` **and** identical FNV-1a over all 24 MB of MEM1 |
 | the host layer is load-bearing | §5 control arm D: with `sr_os_mode(0)` the same run faults at exactly `0xe00e78ac`, the fault in `docs/static-recomp-sab/README.md:1252` |
 | cost to the translated code | §8 — no Asyncify, no SjLj, no JSPI, no instrumentation of any translated body |
@@ -203,7 +204,8 @@ the two builds differ in exactly one function.
   `OSLoadContext` has loaded the next thread and is about to `rfi`, and the frozen
   machines are diffed. `snapshot GekkoState identical`, `snapshot MEM1 identical`,
   `pc == 0x800ec97c`. 5/5.
-- **C — the witness**, §6. 28/28.
+- **C — the witness**, §6. 29/29.
+- **E — a three-thread rotation**, §6a. 15/15.
 - **D — the control arm.** Same run, `sr_os_mode(0)`: **`0xe00e78ac`**. Without this
   the pass proves nothing about the host layer being load-bearing. 2/2.
 
@@ -246,6 +248,26 @@ produce that.
 
 **The thread proof.** `sr_os_slot_tid(0) = 0xd068`, `sr_os_slot_tid(1) = 0x185f1d8`
 — two different `pthread_t`s.
+
+## 6a. Three threads, and why that is the argument-ending one
+
+Two threads admit a sceptical reading: B could have run *nested* on A's host stack
+and simply returned, and every assertion in §6 would still hold. A rotation cannot be
+read that way. Test E stages a third thread and runs A→B→C→A:
+
+- A (prio 8) calls the translated `OSSleepThread(&q)` → parks, switch to B.
+- B (prio 16) *also* enters `OSSleepThread(&q)` → parks, switch to C.
+- C (prio 24) enters `OSWakeupThread(&q)`, which wakes **both** A and B, `SetRun`s
+  them, and reschedules; the scheduler picks A (highest priority).
+- **A resumes while B is still parked.** On one host stack this is impossible:
+  returning to A's frame would have to discard B's and C's frames, and B's would then
+  be unrecoverable — but B is still a live READY thread the scheduler may pick next.
+
+25 host-boundary events, three `SELECT_SAVE`s, three `HANDOFF`s in order
+A→B, B→C, C→A, and three distinct `pthread_t`s (`0xd068`, `0x185f1d8`, `0x186fad0`).
+Post-state: `__gCurrentThread == A`, A RUNNING, B and C READY,
+`RunQueueBits == 0x8080` (bits for priority 16 and 24), sleep queue empty, and A's
+r14..r29 unchanged across **two** intervening threads.
 
 ## 7. What is NOT solved — read before quoting any of this
 
@@ -295,9 +317,33 @@ inside `sr_host_os.c`, reached through one function-pointer test in `sr_extern`
 (`sr_driver.c:51`) that is NULL in every build that does not link the host layer.
 
 `-pthread` is nevertheless a codegen change, so "does threading cost the translated
-code?" is a matched pair, not an argument: `SR_PTHREAD=1` was added to
-`build_slice.sh` so the *same* generated whole-image C can be linked both ways. The
-measurement is recorded in §9.
+code?" is a matched pair, not an argument. **That pair is NOT TAKEN and no number is
+claimed here.** The rig for it is committed and is one command:
+
+```bash
+# same generated whole-image C, linked both ways; only the flag differs
+python3 gamecube/recomp/sr/sr.py --image /tmp/sr_ctxsw/main.dol \
+  --map dolphin_captures/sab.map --all --indirect --jumptables \
+  --boundaries outer+calls --dispatch-out /tmp/sr_wi_src/sr_dispatch.c \
+  --out /tmp/sr_wi_src/sr_gen.c
+SR_OUT=/tmp/sr_wi_base SR_FIXED_MEM=1 SR_GEN=/tmp/sr_wi_src/sr_gen.c \
+  SR_DISPATCH_C=/tmp/sr_wi_src/sr_dispatch.c bash gamecube/recomp/sr/build_slice.sh <dol> ALL
+SR_OUT=/tmp/sr_wi_pt   SR_PTHREAD=1   SR_GEN=/tmp/sr_wi_src/sr_gen.c \
+  SR_DISPATCH_C=/tmp/sr_wi_src/sr_dispatch.c bash gamecube/recomp/sr/build_slice.sh <dol> ALL
+# then, under tools/probe_lock.sh, alternate:
+SR_OUT=/tmp/sr_wi_{base,pt} node gamecube/recomp/sr/perf_fixture.mjs \
+  gamecube/recomp/sr/sab_nonleaf_fixtures.json
+```
+
+`SR_FIXED_MEM=1` exists so the non-pthread arm also drops `ALLOW_MEMORY_GROWTH`;
+`-pthread` + growth is the documented slow path (`-Wpthreads-mem-growth`), and a pair
+that differs in two flags is not a pair.
+
+Why it was not taken here: the whole-image `-O2` link exceeds ten minutes per arm,
+and a sibling agent held `tools/probe_lock.sh` for the whole window. Running two
+`-O2` links over 33 MB of generated C during someone else's live measurement is
+exactly the load contamination that has voided campaigns in this repo before. A
+number produced that way would be worse than no number.
 
 ## 9. Files
 

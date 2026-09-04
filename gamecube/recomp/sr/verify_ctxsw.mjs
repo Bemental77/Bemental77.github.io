@@ -326,6 +326,68 @@ if (h1 && h2) {
   eq('C: second handoff target is A', h2[2] >>> 0, THREAD_A);
 }
 
+// ============================================ E. THREE THREADS, NON-LIFO
+// Two threads can be explained away as nesting: B could have run on A's stack and
+// returned.  A rotation cannot.  A sleeps, B sleeps, C wakes both and the scheduler
+// picks A — so A resumes while B is STILL PARKED, which a single-stack scheme cannot
+// do: resuming A on one stack would have to discard B's frames.
+console.log('\n=== E. ROTATION: A -> B -> C -> A, with B still parked ===');
+{
+  const THREAD_C = 0x80303000, STACK_C = 0x8032ff00;
+  const E = await hleInst();
+  stage(E, { schedA: 8, schedB: 16, bEntry: OSSleepThread, bArg: QUEUE });
+  // add C at priority 24, READY on RunQueue[24], entry = OSWakeupThread(&q)
+  E.wbe16(THREAD_C + OSTH.STATE, 1);
+  E.wbe16(THREAD_C + OSTH.ATTR, 1);
+  E.wbe32(THREAD_C + OSTH.PRIORITY, 24);
+  E.wbe32(THREAD_C + OSTH.BASE, 24);
+  E.wbe32(THREAD_C + OSTH.QUEUE, RUNQUEUE + 24 * 8);
+  E.wbe32(RUNQUEUE + 24 * 8 + 0, THREAD_C);
+  E.wbe32(RUNQUEUE + 24 * 8 + 4, THREAD_C);
+  E.wbe32(RQBITS, ((1 << (31 - 16)) | (1 << (31 - 24))) >>> 0);
+  E.wbe32(THREAD_C + OSCTX.SRR0, OSWakeupThread);
+  E.wbe32(THREAD_C + OSCTX.SRR1, MSR0);
+  E.wbe32(THREAD_C + 4, STACK_C);
+  E.wbe32(THREAD_C + 8, R2);
+  E.wbe32(THREAD_C + 12, QUEUE);
+  E.wbe32(THREAD_C + 13 * 4, R13);
+  for (let r = 14; r < 32; r++) E.wbe32(THREAD_C + r * 4, (0xcc000000 | r) >>> 0);
+
+  setRegs(E, { r1: STACK_A, r3: QUEUE, lr: 0xfeed0000 });
+  E.M._sr_os_set_msr(MSR0); E.M._sr_os_trace_reset(); E.M._sr_os_bind_self(THREAD_A);
+  const b4 = snapRegs(E);
+  const t = Date.now();
+  const f = E.M._sr_call(OSSleepThread) >>> 0;
+  const ms = Date.now() - t;
+  const rows2 = dumpTrace(E, 'rotation');
+  const ev2 = rows2.map((r) => r[0]);
+  const hand = rows2.filter((r) => r[0] === 12);
+  console.log('');
+  eq('E: OSSleepThread returned with no fault', f, 0);
+  ok('E: it returned (no deadlock)', ms < 3500, `${ms} ms`);
+  ok('E: three SELECT_SAVEs (A, B, C)', ev2.filter((e) => e === 11).length === 3);
+  ok('E: three HANDOFFs', hand.length === 3);
+  if (hand.length === 3) {
+    eq('E: A -> B', hand[0][2] >>> 0, THREAD_B);
+    eq('E: B -> C', hand[1][2] >>> 0, THREAD_C);
+    eq('E: C -> A', hand[2][2] >>> 0, THREAD_A);
+  }
+  const tids = [0, 1, 2].map((i) => E.M._sr_os_slot_tid(i) >>> 0);
+  ok('E: three DISTINCT host threads', new Set(tids).size === 3, tids.map((x) => '0x' + x.toString(16)).join(' '));
+  eq('E: __gCurrentThread is A', E.rbe32(G_CURRENT_THREAD), THREAD_A);
+  eq('E: A is RUNNING', E.rbe16(THREAD_A + OSTH.STATE), 2);
+  eq('E: B was woken and is READY', E.rbe16(THREAD_B + OSTH.STATE), 1);
+  eq('E: C is READY', E.rbe16(THREAD_C + OSTH.STATE), 1);
+  eq('E: the sleep queue is empty', E.rbe32(QUEUE), 0);
+  eq('E: RunQueueBits = B(16) | C(24)', E.rbe32(RQBITS),
+     ((1 << (31 - 16)) | (1 << (31 - 24))) >>> 0);
+  let rr = true, bad = '';
+  for (let r = 14; r < 30; r++) if (snapRegs(E).gpr[r] !== b4.gpr[r]) {
+    rr = false; if (!bad) bad = `r${r}`;
+  }
+  ok('E: A\'s r14..r29 survived TWO intervening threads', rr, bad);
+}
+
 // ================================================ D. the CONTROL ARM
 // The same run with the host layer switched OFF must reproduce, exactly, the fault
 // this whole exercise started from: gamecube/docs/static-recomp-sab/README.md:1252
