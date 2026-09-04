@@ -1367,6 +1367,60 @@ column entry at all.
 default.** From here the sweep is the REGRESSION gate: the shipped page depends
 on it, and it still exits nonzero unless every ROM is PASS/PASS.
 
+## Throughput after the flip (2026-09-04) — the bar is still UNVERIFIED, and now we know WHY
+
+Six arms, three ROMs, arm order alternated, on a quiet box: **`CPU_Speed_Limit`
+100 before AND after every single arm**, 1-minute load 1.53-3.22, `loadSpread`
+<= 1.59 per round, 0 page errors, `sceneMovedDuringWindow` true on all six.
+These are post-fix numbers, so they already carry the delay-slot guard's cost
+(one `i32.load` + `if` per block entry).
+
+    rom        warmup/window  round  interp ms/f  jit ms/f  wallX  cpuX   VI/s (interp,jit)
+    mariokart     2400/900    ab        8.525      7.883    1.081  1.051   50.3, 50.3
+    mariokart     2400/900    ba        8.134      7.495    1.085  1.092   50.3, 50.4
+    dk64          1800/900    ab       15.632     15.037    1.040  0.951   54.8, 54.6
+    dk64          1800/900    ba       15.337     14.722    1.042  1.021   54.6, 55.7
+    conker        1800/900    ab        9.341      5.769    1.619  1.370   59.5, 60.0
+    conker        1800/900    ba        8.617      8.432    1.022  0.993   60.0, 60.0
+
+**WHAT IS QUOTABLE.** mariokart's two rounds are the first self-consistent
+alternated pair this campaign has produced — 1.081 / 1.085 wall and 1.051 /
+1.092 cpu, both metrics agreeing in sign and within the rig's ~±6% resolution.
+dk64's wall pair is also consistent (1.040 / 1.042) but its `cpuX` has OPPOSITE
+SIGNS across the two rounds (0.951 / 1.021), which this file's own rules call a
+pair disagreeing with itself. **conker's pair is VOID**: 1.619 vs 1.022 is 58%
+apart, an order of magnitude past the resolution, and a contradicting pair
+measures the machine or the scene rather than the code.
+
+**WHAT IS NOT QUOTABLE, AND THIS IS THE HEADLINE.** ⚠ **Every one of these six
+windows is a MENU or an ATTRACT SCREEN, screenshot-proven** — mariokart is
+PLAYER SELECT (`/tmp/n64-ab/mariokart-jit.png`), dk64 is the "…to kick some
+tail" intro cutscene, conker is the title iris. So the M4 acceptance bar
+(">=100% of hardware sustained IN-GAME on the heavy set") is STILL UNVERIFIED,
+for the fourth measurement round running.
+
+**The new fact is that raising the warmup does not fix it.** The 2026-09-01
+round blamed a 600 VI warmup and prescribed "raise the warmup until the PNG
+shows gameplay". That prescription is now REFUTED: at 1800 VI (dk64, conker) and
+at 2400 VI (mariokart) the screenshots are still menus. `n64_gameplay_ab.mjs`'s
+`schedule()` drives Start and A on VI thresholds, which is enough to skip logos
+and not enough to navigate a character/file/cup select. **The blocker is the
+DRIVE SCRIPT, not the window length**, and the fix is per-ROM menu navigation
+(or booting from a savestate into gameplay, with the restore screenshot-verified
+— the GameCube lesson that a failed restore silently cold-boots applies here).
+Until that exists, no in-game throughput number is available from this rig at
+any warmup, and the bar cannot be claimed either way.
+
+**One reading that does NOT depend on the JIT at all**, recorded because it is
+the only hardware-relative number in the table: `viRatePerSec` in the measured
+window was 50.3 (mariokart), 54.6-55.7 (dk64) and 59.5-60.0 (conker), and each
+is essentially IDENTICAL between the interpreter and `?jit` arms. NTSC VI
+interrupts are ~60/s, so mariokart and dk64 are running below hardware here on
+BOTH arms. ⚠ I have not verified whether the page caps VI at 60/s; conker
+sitting at exactly 60.0 on three of four arms is consistent with a cap, which
+would make the sub-60 readings genuine shortfalls and the conker readings
+uninformative. Confirm the cap before building anything on this.
+
 ## Action #1 EXECUTED — waves 8/9/10a priced on a quiet box (2026-09-01)
 
 The first throughput numbers in this campaign that pass its own measurement
