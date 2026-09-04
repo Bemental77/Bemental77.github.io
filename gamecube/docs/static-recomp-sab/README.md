@@ -13,7 +13,8 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | non-leaf fixtures | **7 PASS / 0 FAIL** — md5 `823eaf6b7a25339fa8f660da74f06f5a` |
 | `blrl` indirect dispatch, by execution | **3 PASS / 0 FAIL** |
 | x-form update load/store | **66 bit-exact / 0**, all 11 forms |
-| **`.rel` OVERLAY function, by execution** | **1 PASS** — `stg13D` `0x8121d80c`, §5g/§5h |
+| **`.rel` OVERLAY functions, by execution** | **18 PASS across two modules** — `otherprintD` 6/6, `stg13D` 12/15 with **0 refused** (was 4/15 with 11 refused, all one cause: the Gekko locked L1 cache), §5g/§5h/§5k |
+| **Gekko locked L1 cache (`0xE00000xx`)** | **modelled as real memory, staged from the oracle, compared byte for byte** — 8 refusals converted to bit-exact passes, with a `-DSR_NO_LC_MODEL` control arm that fails exactly those 8 and passes exactly the 4 that never touch it, §5k |
 | `bctr` jump tables | **145 of 147 recovered**, and one **PASS by execution** with a faulting control arm, §5b |
 | whole-image build at **`-O2`** | **builds, instantiates, 1056/0 bit-exact** — the "`-O0` is a real scaling constraint" note was an artifact worth **~24x**, §5j |
 | **DOL functions verified by execution** | **330 distinct, bit-exact** of 375 attempted — 44 of the top-120 hot functions, 19.92% of sampled PCs, §9.5 |
@@ -1013,6 +1014,12 @@ and is not one. `verify_fixture.mjs` now refuses a fixture with a non-empty
 
 So the honest score for this capture is **1 usable fixture, 1 PASS** — not 3 of 3.
 
+> **⌦ SUPERSEDED by §5k (2026-09-04).** "Not replayable, by construction" was true of
+> the harness, not of the guest state: the locked cache is ordinary memory and both
+> `0x81217f48` and `0x81200438` are now bit-exact with their `0xE00000xx` bytes staged
+> from the oracle and compared. The `outside_mem1` blanket refusal is gone; WPAR is
+> the only region that still gets a sink.
+
 ## 5j. The `-O0` constraint was an artifact, and removing it is worth ~24x
 
 §5b recorded "a whole-image build must lower the optimisation level (`SR_OPT=-O0`) …
@@ -1076,6 +1083,185 @@ of having all 4,671 functions in one 22.7 MB module.
 > only 4 are quotable. Faster code makes *fewer* fixtures quotable, not more — a
 > corrected figure whose control is a majority of the run is a small difference of two
 > large numbers and swings 50% run-to-run.
+
+## 5k. The Gekko locked L1 cache was the single cause of every survey refusal
+
+The two overlay surveys attempted 21 functions and verified 10. **All 11 refusals had
+one cause**: the invocation reads the Gekko locked L1 cache at `0xE00000xx`. Not a long
+tail of unrelated gaps — one named wall, 100% of the refusals, and a wall built out of
+two wrong beliefs.
+
+### What the oracle says the locked cache actually is
+
+**It is ordinary memory, and both halves of the reference say so.**
+
+- Guest side, `~/gc_refs/dolsdk2001/src/os/OSCache.c:309-365` `__LCEnable()`: the region
+  is mapped by **DBAT3** (`lis r3, LC_BASE_PREFIX` = `0xE000`, `mtspr DBAT3L/DBAT3U`) and
+  locked with `LC_LINES = 512` × 32 B `dcbz_l`. After that the program addresses it with
+  plain `lwz`/`stw`/`psq_l`/`psq_st`. There is no special access instruction.
+- Host side, Dolphin: `MMU.cpp:246-253` (read) and `MMU.cpp:437-442` (write) are a
+  straight `memcpy` in and out of `m_l1_cache`. `Memmap.h:253` sizes it 256 KB at
+  `0xE0000000`; `Memmap.cpp:114` registers it. **No cache semantics are modelled at all.**
+
+SAB uses it as a matrix stack. `main.dol 0x80116098` is the push: read the stack pointer
+from `0x803ae0c4`, `addi r5,r3,48`, then six `psq_l`/`psq_lu` and six `psq_st`/`psq_stu`
+— 48 bytes, one 3×4 `Mtx`.
+
+### Why the oracle "could not" read it — a HOST-side pointer path, not a guest fault
+
+An `m` packet at `0xE00000xx` panics Dolphin and then segfaults it. The chain is entirely
+in Dolphin's own tree:
+
+| step | what happens |
+|---|---|
+| `GDBStub.cpp:826` | gates the read on `MMU::HostIsRAMAddress` |
+| `MMU.cpp:926-929` | answers **TRUE** — segment `0xE` inside the L1 cache *is* RAM |
+| `GDBStub.cpp:831` | so it calls `Memory::GetPointerForRange` |
+| `Memmap.cpp:722-723` | `GetSpanForAddress` masks with `0x3FFFFFFF` and **has no L1 arm** |
+| `Memmap.cpp:739-740` | `PanicAlertFmt("Unknown Pointer …")`, returns an empty span |
+| `GDBStub.cpp:833-834` | hands the resulting `nullptr` to `Mem2hex` |
+
+`0xE0000030 & 0x3FFFFFFF == 0x20000030`, which is the address in the panic the user saw.
+**Two of Dolphin's own predicates disagree with each other**, and the guest was never
+faulting: guest loads reach the cache through `MMU.cpp:246-253` and are served correctly.
+
+### The fix: read it the way the machine reads it
+
+`native_oracle_gdb.LockedCacheReader` reads the cache by **executing one guest
+instruction** — an `lwz rD,0(rA)` — with `rA` pointed at the address wanted, then
+reading `rD`. No Dolphin patch, no host pointer, no `m` packet.
+
+Three properties of it were each paid for with a failed run, and each is a rule worth
+keeping:
+
+**1. It WRITES NOTHING.** The gadget instruction is one already present in `main.dol`,
+found by reading a window of guest text and decoding it (`lwz r5,0(r6)` at
+`0x800031b4`), not one this tool assembles into a scratch page. The first version did
+write its own into the page `read_gqrs` uses, at `+0x100`.
+
+**2. `MSR.EE` is cleared across the resume**, the way `LCEnable()` brackets its own
+locked-cache setup (`OSDisableInterrupts` / `OSRestoreInterrupts`,
+`OSCache.c:371-377`). Without it the very first attempt failed at the self-test:
+
+```
+RSPError: gadget selftest: step landed at 1284, not 0x81790104
+```
+
+`1284` is `0x504` — one instruction past the **external-interrupt vector**.
+`Interpreter.cpp SingleStep()` calls `CoreTiming::Advance()` *before*
+`SingleStepInner()`, so a timer event delivered at that boundary vectors the CPU away
+and the step executes the ISR's first instruction instead of the gadget, leaving
+`SRR0` pointing into the gadget. `PowerPC.cpp:720` gates delivery on
+`exceptions && m_ppc_state.msr.EE`. Masking also means no ISR can inject instructions
+into a fixture the reader is called from the middle of.
+
+**3. It is built LAZILY, on first use inside a capture — never at connect.** An
+earlier version built it at connect "so it would not be built mid-trace". That is
+backwards, and it cost a whole capture run: the survey armed 16 breakpoints and saw
+**zero fires in 300 s**, which reads exactly like "this scene does not run those
+functions". The control that settles it is `read_gqrs`, which is known-good — the
+recorded survey called it after each of its 15 captures and kept capturing — and
+which, **called at connect, times out on its very first `cont` to its own sentinel**.
+So the connect-time context is what is special, not the reader. Built lazily, the
+reader first runs at a breakpoint stop inside a capture, which is exactly the context
+`read_gqrs` is proven in.
+
+Diagnosing (3) took a bisect against a control that fires the overlay anchor
+`0x81218a30` every ~0.55 s (5 fires in 2.7 s). Each action alone, same savestate, same
+binary:
+
+| arm | anchor |
+|---|---|
+| control — connect, arm, `cont` | FIRED 0.5 s |
+| + read guest text (`m` only) | FIRED 0.5 s |
+| + add and remove the sentinel breakpoint | FIRED 0.5 s |
+| + write MSR with EE cleared and back | FIRED 0.6 s |
+| + hijack PC and restore it, **no execution** | FIRED 0.6 s |
+| + resume the guest's OWN next instruction | FIRED 0.5 s |
+| + single-step (which vectored to `0x504`), **no PC restore** | FIRED 0.5 s |
+| **whole reader at connect** | **nothing in 60 s** |
+
+and a separate probe proved the guest was **not** wedged in that last row —
+`OSDisableInterrupts` kept firing 6 times in 0.3 s. "Nothing fired" was never
+"the emulator is dead", which is the failure mode that made the first re-capture look
+like a scene problem.
+
+### The model
+
+`gekko_rt.h` now separates two things that were one class called "unmodelled":
+
+- **`0xE0000000..0xE0040000`, the locked cache — real memory.** A backing buffer in the
+  tail past MEM1, staged from the capture, loads checked against the staged map, stores
+  logged to the change log and compared byte for byte like any MEM1 store.
+- **`0xCC008000..0xCC009000`, WPAR — a sink.** MMIO, write-only; there is nothing to read
+  back, so its stores stay uncompared and are flagged on the result line.
+
+This is **unconditional now, not `SR_VERIFY`-only**: `gk_phys` masks to 26 bits, so in the
+shipping runtime `0xE0000030` aliased onto MEM1 offset `0x30` and a locked-cache store
+**corrupted guest low memory**. `gk_dcbz` went through the raw mask too — and `dcbz` on a
+locked-cache line is exactly how `OSCache.c:349-352` establishes the lock.
+
+### The result: 11 refusals → 0, and 8 of them converted to bit-exact passes
+
+Same 15 functions, same scene, same savestate, re-captured with the locked cache staged.
+
+| | before | after |
+|---|---|---|
+| **verified bit-exact** | 4 | **12** |
+| refused | **11** | **0** |
+| mismatched | 0 | 3 |
+| attempted | 15 | 15 |
+
+The 8 that converted, each now comparing its locked-cache bytes rather than skipping
+them (`read / written` are addresses, `words` are gadget reads):
+
+| entry | steps | locked L1 | write events | final bytes |
+|---|---|---|---|---|
+| `0x81217f48` | 59 | 6 read / 0 written, 12 words | 36 | 44 |
+| `0x81200438` | 35 | 6 read / 0 written, 12 words | 9 | 64 |
+| `0x8120cb54` | 900 | 6 read / 9 written, 102 words | 390 | 244 |
+| `0x81212248` | 619 | 6 read / 9 written, 66 words | 248 | 187 |
+| `0x812127b8` | 554 | 6 read / 18 written, 114 words | 270 | 312 |
+| `0x8121d210` | 1063 | 6 read / 8 written, 108 words | 564 | 359 |
+| `0x81218584` | 1002 | 6 read / 12 written, 84 words | 524 | 523 |
+| `0x812185b4` | 990 | 6 read / 12 written, 84 words | 517 | 515 |
+
+Every GPR, every FPR PS0, CR, LR, CTR bit-identical; every ordered per-byte write event
+identical in order; every final memory byte identical; zero unstaged reads;
+PS1-independent on both replay arms. The 4 that already passed still pass.
+
+**THE FAULTING CONTROL ARM.** Rebuild the *same* generated C with
+`SR_CFLAGS=-DSR_NO_LC_MODEL`, which drops only `gk_tail`'s locked-cache arm so
+`0xE00000xx` aliases into MEM1 the way it did before:
+
+```
+SUMMARY  4 verified / 15 attempted / 0 refused / 11 MISMATCHED
+```
+
+**Exactly the 8 converted fixtures fail, and exactly the 4 that never touch the window
+still pass** — i.e. the control arm reproduces the pre-change verified set precisely.
+The model is what made them pass. `test_lc_model.c` carries the same discipline at the
+unit level: it is built twice and both builds must pass, the second on inverted
+expectations.
+
+**The 3 that did not convert are blocked by something else, and it is named.**
+`0x81212004`, `0x81200460` and `0x81200678` (163, 506 and 303 `bl` each) all fault
+`0xE1` — `sr_indirect()` could not resolve an INDIRECT callee, which
+`verify_fixture.mjs` already reports as an address to add rather than a divergence to
+investigate. Adding them iteratively converged: 6 roots, then 8, then 10, each round
+resolving one target and revealing the next, until `rel_emit.py` refused to go further:
+
+```
+CLOSURE BLOCKED at 0x80113f98: mtspr SPR913 (privileged/host)
+CLOSURE BLOCKED at 0x8011c18c: branch target 0x8011c140 is not a function start
+```
+
+`SPR913` is `GQR1`; `sr.py` raises `Untranslatable` rather than approximate a
+quantisation-register write, and `0x8011c140` is `PSMTXReorder`, branched into
+mid-function. So the remaining ceiling on these three is **translator coverage of the
+indirect-callee closure**, not the locked cache. That is the honest count: the locked
+cache stopped being a blocker for 8 of 11, and named the blocker for the other 3.
+
 
 ## 6. The OS-thread / context-switch problem, measured
 

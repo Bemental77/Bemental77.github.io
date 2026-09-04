@@ -802,6 +802,18 @@ def main():
                   "not a restored scene.  Overlays load only once the game reaches "
                   "the point that OSLinks them.")
 
+        # DO NOT BUILD THE LOCKED-CACHE READER HERE.  An earlier version did, on the
+        # reasoning that building it lazily mid-trace was riskier.  The opposite is
+        # true, and it cost a capture run: HIJACKING PC AND RESUMING AT CONNECT TIME
+        # DOES NOT WORK ON THIS STUB.  The control that settles it is `read_gqrs`,
+        # which is known-good -- the recorded stg13D survey called it after each of
+        # its 15 captures and kept capturing -- and which, called at connect, times
+        # out on its very first `cont` to its own sentinel.  So it is the connect-time
+        # context that is special, not the reader.  Built lazily, the reader first
+        # runs at a BREAKPOINT STOP inside a capture, which is exactly the context
+        # read_gqrs is proven in.  It writes nothing to guest memory, so there is no
+        # `M`-mid-trace concern to trade against this.
+
         # ------------------------------------- EXACT base recovery: ask the guest OS
         # OSLink registers every linked module in __OSModuleInfoList with ABSOLUTE
         # section addresses.  One read replaces the whole boot-advance + signature-scan
@@ -1089,6 +1101,8 @@ def main():
                   f"initial_bytes={len(fx['initial_mem'])} "
                   f"unknown={len(fx['unknown_stores'])} "
                   f"outside_mem1={len(fx['outside_mem1'])} "
+                  f"lockedL1={len(fx.get('locked_cache', {}).get('kind', {}))}"
+                  f"/{fx.get('locked_cache', {}).get('words_read', 0)}w "
                   f"ps1_dep={len(fx['ps1_dependency'])}", flush=True)
             out["fixtures"].append(fx)
             json.dump(out, open(OUT, "w"))

@@ -50,14 +50,28 @@ else
           "${ARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"} --closure --out "$OUT/sr_gen.c"
 fi
 
-# SR_OPT: optimisation level.  MUST be lowered for a whole-image build: at -O2 clang
-# inlines the translated bodies into sr_dispatch and the result exceeds V8's hard
-# per-function ceiling -- "size 8549242 > maximum function size 7654321" at
-# instantiate time, which reads like a corrupt wasm rather than a size limit.
-emcc ${SR_OPT:--O2} -DSR_VERIFY -I"$SR" "$OUT/sr_gen.c" "$SR/sr_driver.c" -o "$OUT/sr_fixture.js" \
+# SR_DISPATCH_C: sr_dispatch compiled as its OWN TU (sr.py --dispatch-out).  Required
+# for a WHOLE-IMAGE verify build at -O2, for the same reason build_slice.sh takes it:
+# in one file clang inlines all 4,671 translated bodies into the dispatch switch and
+# V8 rejects the result at instantiate ("size ... > maximum function size 7654321"),
+# which reads like a corrupt wasm rather than a size limit.  Separate TU = no
+# cross-TU inlining without LTO, so the bodies keep -O2.  Measured worth ~24x
+# (README §5j).  Without it a whole-image verify build must use SR_OPT=-O0.
+EXTRA_SRC=(); [ -n "${SR_DISPATCH_C:-}" ] && EXTRA_SRC=("$SR_DISPATCH_C")
+
+# SR_CFLAGS: extra compiler flags.  The reason this exists is the FALSIFICATION
+# CONTROL ARM: `SR_CFLAGS=-DSR_NO_LC_MODEL` drops gekko_rt.h's locked-cache arm so an
+# 0xE00000xx access aliases into MEM1 the way it did before the model existed.  A
+# fixture that passes only because the cache is modelled MUST fail in that build; if
+# it passes in both, the pass was not evidence for the model.
+read -r -a SR_CF <<< "${SR_CFLAGS:-}"
+
+# SR_OPT: optimisation level.  MUST be lowered for a whole-image build UNLESS
+# SR_DISPATCH_C splits the dispatch out (see above).
+emcc ${SR_OPT:--O2} -DSR_VERIFY ${SR_CF[@]+"${SR_CF[@]}"} -I"$SR" "$OUT/sr_gen.c" ${EXTRA_SRC[@]+"${EXTRA_SRC[@]}"} "$SR/sr_driver.c" -o "$OUT/sr_fixture.js" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \
   -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=134217728 \
-  -sEXPORTED_FUNCTIONS=_sr_init,_sr_ram,_sr_ram_size,_sr_state,_sr_state_size,_sr_call,_sr_staged,_sr_wlog,_sr_wlog_n,_sr_unstaged,_sr_verify_reset,_malloc \
+  -sEXPORTED_FUNCTIONS=_sr_init,_sr_ram,_sr_ram_size,_sr_tail_size,_sr_state,_sr_state_size,_sr_call,_sr_staged,_sr_wlog,_sr_wlog_n,_sr_unstaged,_sr_verify_reset,_malloc \
   -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32,wasmMemory \
   -Wl,--no-entry
 

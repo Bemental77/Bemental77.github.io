@@ -11,16 +11,13 @@ uint32_t  g_fault = 0;
 
 #define MEM1_SIZE 0x01800000u   // 24 MB, GameCube MEM1
 
-// The differential build allocates a scratch tail past MEM1 for the two regions this
-// runtime does not model (the Gekko locked L1 at 0xE0000000 and WPAR at 0xCC008000).
-// `g_ram_size` still reports MEM1 only, so gk_ok's bound -- and everything the JS
-// harness stages and poisons -- is unchanged; gk_sink() maps into the tail.  See the
-// long note in gekko_rt.h.
-#ifdef SR_VERIFY
-#define SR_TAIL GK_SINK_SIZE
-#else
-#define SR_TAIL 0u
-#endif
+// EVERY build allocates a tail past MEM1 for the two guest windows that are not MEM1:
+// the Gekko locked L1 cache at 0xE0000000 (256 KB of ordinary memory -- see the long
+// note in gekko_rt.h) and WPAR at 0xCC008000 (4 KB, write-only MMIO).  It is not a
+// verification-only affordance: without it gk_phys aliases 0xE0000030 onto MEM1
+// offset 0x30 and a locked-cache store CORRUPTS GUEST LOW MEMORY in the shipping
+// runtime.  `g_ram_size` still reports MEM1 only, so gk_ok's bound is unchanged.
+#define SR_TAIL GK_TAIL_SIZE
 
 static GekkoState g_st;
 
@@ -33,6 +30,10 @@ EMSCRIPTEN_KEEPALIVE int sr_init(void) {
 }
 EMSCRIPTEN_KEEPALIVE uint8_t     *sr_ram(void)       { return g_ram; }
 EMSCRIPTEN_KEEPALIVE uint32_t     sr_ram_size(void)  { return g_ram_size; }
+// Bytes allocated PAST g_ram_size: the locked-cache + WPAR tail.  Exported so the JS
+// harness maps, poisons and stages exactly the buffer this build actually has,
+// instead of hardcoding a layout that can drift out from under it.
+EMSCRIPTEN_KEEPALIVE uint32_t     sr_tail_size(void) { return SR_TAIL; }
 EMSCRIPTEN_KEEPALIVE GekkoState  *sr_state(void)     { return &g_st; }
 EMSCRIPTEN_KEEPALIVE int          sr_state_size(void){ return (int)sizeof(GekkoState); }
 
@@ -84,9 +85,10 @@ uint32_t *g_wlog = 0;
 uint32_t g_wlog_n = 0, g_wlog_cap = 0;
 
 EMSCRIPTEN_KEEPALIVE uint8_t *sr_staged(void) {
-    // Covers the unmodelled-region tail too: a store there marks its bytes staged so
-    // a read-back of what this invocation just wrote is legal, while a read of
-    // anything else in those windows trips the unstaged-read check.
+    // Covers the tail too.  Locked-cache bytes are staged from the capture like any
+    // MEM1 byte; a WPAR store marks its own bytes staged so a read-back of what this
+    // invocation just wrote is legal, while a read of anything else in that window
+    // trips the unstaged-read check.
     if (!g_staged) g_staged = (uint8_t *)calloc(1, MEM1_SIZE + SR_TAIL);
     return g_staged;
 }
@@ -98,10 +100,13 @@ EMSCRIPTEN_KEEPALIVE uint32_t sr_wlog_n(void)     { return g_wlog_n; }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_unstaged(void)   { return g_unstaged; }
 EMSCRIPTEN_KEEPALIVE void sr_verify_reset(void) {
     g_wlog_n = 0; g_unstaged = 0;
-    // The JS harness poisons and clears MEM1 between runs but knows nothing about the
-    // tail, so clear it here -- otherwise the second replay of a fixture (the ps1 = 0
+    // Clear the tail too -- otherwise the second replay of a fixture (the ps1 = 0
     // arm) would read back what the first one wrote and the PS1-independence check
     // would be comparing against contaminated scratch.
+    // CALL THIS *BEFORE* STAGING, NOT AFTER.  verify_fixture.mjs now stages locked-
+    // cache bytes into the tail (they are real captured memory, not scratch), so a
+    // reset issued after staging would wipe them and every locked-cache read would
+    // come back as an unstaged-read fault.
     if (g_ram)    for (uint32_t i = 0; i < SR_TAIL; i++) g_ram[MEM1_SIZE + i] = 0;
     if (g_staged) for (uint32_t i = 0; i < SR_TAIL; i++) g_staged[MEM1_SIZE + i] = 0;
 }

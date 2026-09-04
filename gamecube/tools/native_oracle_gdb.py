@@ -599,6 +599,238 @@ def decode_load(word: int, gpr):
 
 
 MEM1_LO, MEM1_HI = 0x80000000, 0x81800000
+# The Gekko locked L1 cache.  Bounds from Dolphin: Memmap.h:253 sizes the region
+# [0xE0000000, 0xE0040000) and MMU.cpp:247-248 gates guest access on
+# `(em_address >> 28) == 0xE && em_address < 0xE0000000 + GetL1CacheSize()`.
+LC_LO, LC_HI = 0xE0000000, 0xE0040000
+# WPAR, the GX write-gather pipe.  MMIO, write-only -- NOT readable by any means, and
+# deliberately not handled by LockedCacheReader.
+WPAR_LO, WPAR_HI = 0xCC008000, 0xCC009000
+
+# WHERE TO LOOK FOR THE GADGET INSTRUCTION.  main.dol's first text section starts at
+# 0x80003100 and this window holds several `lwz rD,0(rA)` (three in its first 0x100
+# bytes).  It is READ, never written -- see the note in LockedCacheReader.
+LC_SCAN_LO, LC_SCAN_LEN = 0x80003100, 0x1000
+
+
+class LockedCacheReader:
+    """Read the Gekko locked L1 cache (0xE00000xx) out of native Dolphin.
+
+    AN `m` PACKET CANNOT DO THIS -- it panics the emulator and then segfaults it.
+    The chain, every step in this tree:
+        GDBStub.cpp:826   gates the read on MMU::HostIsRAMAddress, which
+        MMU.cpp:926-929   answers TRUE for segment 0xE inside the L1 cache, so
+        GDBStub.cpp:831   calls Memory::GetPointerForRange, which reaches
+        Memmap.cpp:722-723 GetSpanForAddress -- it masks with 0x3FFFFFFF and has NO
+                          L1-cache arm, so 0xE0000030 becomes 0x20000030, and
+        Memmap.cpp:739-740 PanicAlertFmt("Unknown Pointer {:#010x} ...") returns an
+                          empty span, which
+        GDBStub.cpp:833-834 hands to Mem2hex(reply, nullptr, len).
+    Both observed symptoms follow: a BLOCKING MODAL nothing clicks under -b, then
+    EXC_BAD_ACCESS at 0x0.  The user's own message -- "Unknown Pointer 0x20000030
+    PC 0x801160b8 LR 0x812004dc" -- is Memmap.cpp:740, and 0x801160b8 is a `psq_st`
+    inside SAB's matrix-stack push.  THIS IS A HOST-SIDE POINTER PATH ONLY.
+
+    THE GUEST HAS NO SUCH PROBLEM.  A guest load reaches the locked cache through
+    MMU.cpp:246-253, which is a plain memcpy out of `m_l1_cache` and entirely
+    correct.  So read it the way the machine reads it: execute ONE guest
+    instruction, `lwz rD,0(rA)`, with rA pointed at the address we want.
+
+    Nothing in Dolphin is patched AND NOTHING IN THE GUEST IS WRITTEN.  The gadget is
+    an `lwz rD,0(rA)` instruction ALREADY PRESENT in main.dol -- found by reading a
+    window of guest text and decoding it -- so this reader never modifies guest
+    memory.  PC / rA / rD / MSR are saved and restored, so the only architectural
+    state that changes is put back before the caller resumes.  A step that does not
+    land on gadget+4 is a HARD ERROR, never a silently-wrong byte.
+
+    NOT WRITING IS THE POINT, and it was measured.  The first version wrote its own
+    `lwz` into the scratch page fixture_nonleaf.read_gqrs uses (0x81790000), at
+    +0x100.  That 4-byte write WEDGED THE GUEST.  Controlled A/B on the same
+    savestate, same binary, same scene, anchor breakpoint 0x81218a30:
+
+        LC=0 (no reader armed)   anchor FIRED after 0.5 s
+        LC=1 (reader armed)      NOTHING FIRED in 90 s
+
+    and MSR read back identical (0x0000b032, EE set) on both arms, so it was not the
+    interrupt masking -- it was the write. The whole re-capture run before that A/B
+    enumerated 16 breakpoints for 300 s and saw zero fires, which reads exactly like
+    "this scene does not run those functions" and was entirely self-inflicted.
+    0x81790000 being survivable for read_gqrs is not evidence that 0x81790100 is.
+
+    MSR.EE IS CLEARED ACROSS THE STEPS, and that is not belt-and-braces -- the first
+    version without it failed on its very first step, at the SELF-TEST:
+        RSPError: gadget selftest: step landed at 1284, not 0x81790104
+    1284 is 0x504, i.e. one instruction past the EXTERNAL INTERRUPT VECTOR at 0x500.
+    Interpreter.cpp SingleStep() calls CoreTiming::Advance() BEFORE SingleStepInner(),
+    so a timer event delivered at that boundary vectors the CPU away and the step
+    executes the ISR's first instruction instead of the gadget -- with SRR0 left
+    pointing INTO the gadget page, which is also how restoring PC afterwards would
+    have corrupted a live ISR.  PowerPC.cpp:720 gates that delivery on
+    `exceptions && m_ppc_state.msr.EE`, so clearing EE makes the step deterministic.
+    OSCache.c:371-377 LCEnable() brackets its own locked-cache setup in exactly the
+    same way (OSDisableInterrupts / OSRestoreInterrupts), for the same reason.
+    """
+    MSR_EE = 0x00008000        # Gekko.h UReg_MSR BitField<15,1> EE
+    cont_timeout = 30.0        # the gadget's breakpoint is the very next instruction
+
+    def __init__(self, g: "GDB", scan_lo=LC_SCAN_LO, scan_len=LC_SCAN_LEN):
+        self.g = g
+        blob = g.read_range(scan_lo, scan_lo + scan_len)
+        found = None
+        for off in range(0, len(blob) - 3, 4):
+            w = int.from_bytes(blob[off:off + 4], "big")
+            # lwz rD,0(rA): primary opcode 32, displacement 0, rA != 0 (rA == 0 means
+            # a literal zero base, not a register).  rD != rA so the two can be saved
+            # and restored independently, and neither may be r1/r2/r13 -- SP, the
+            # small-data pointers -- so a restore that somehow failed could not take
+            # the guest's whole addressing model with it.
+            if (w >> 26) != 32 or (w & 0xFFFF) != 0:
+                continue
+            rd, ra = (w >> 21) & 31, (w >> 16) & 31
+            if ra == 0 or rd == ra or rd in (1, 2, 13) or ra in (1, 2, 13):
+                continue
+            found = (scan_lo + off, w, rd, ra)
+            break
+        if not found:
+            raise RSPError(f"no `lwz rD,0(rA)` gadget in guest text "
+                           f"{scan_lo:#010x}..{scan_lo + scan_len:#010x}")
+        self.pc, self.word, self.rd, self.ra = found
+        # Confirm against the machine a second time, on its own: the window read
+        # could in principle have been a torn or stale reply, and every later byte
+        # this class reports depends on this one instruction being what we think.
+        back = int.from_bytes(g.mem(self.pc, 4), "big")
+        if back != self.word:
+            raise RSPError(f"gadget at {self.pc:#010x} re-reads as {back:#010x}, "
+                           f"not {self.word:#010x}")
+        self.words_read = 0
+        self.calls = 0
+
+    def _words(self, addrs):
+        """Execute the gadget once per 4-byte-aligned address; -> list of u32.
+
+        Saves and restores PC, rA, rD and MSR.  Interrupts are masked for the whole
+        sequence, so exactly one guest instruction runs per address and no ISR can
+        inject instructions into a fixture this reader is called from the middle of.
+
+        RESUME WITH `c` TO A BREAKPOINT, NEVER WITH `s`.  A single `s` at a hijacked
+        PC LEAVES THE GUEST UNABLE TO RUN, and it cost two capture runs before it was
+        bisected.  Measured on the same savestate, same binary, anchor breakpoint
+        0x81218a30, one arm per action (scratchpad lc_bisect.py):
+
+            control (connect, arm, cont)          FIRED after 0.5 s
+            + read guest text (`m` only)          FIRED after 0.5 s
+            + write MSR with EE clear and back    FIRED after 0.6 s
+            + set PC and single-step, restore     NOTHING in 45 s
+
+        so it is neither the reads nor the MSR write -- it is the step.  This is the
+        same shape as `read_gqrs`, which sets PC and resumes with `c` to a sentinel
+        and has been run 15 times in one survey with captures continuing afterwards.
+        Resuming into a breakpoint also makes a taken interrupt self-healing: the ISR
+        vectors, `rfi` returns to SRR0 (this gadget), the `lwz` re-executes, and the
+        breakpoint at gadget+4 still stops it.
+        """
+        g = self.g
+        pc0 = g.pc()
+        gpr0 = g.gprs()
+        msr0 = g.reg(65)
+        sentinel = self.pc + 4
+        out = []
+        g.add_bp(sentinel)
+        try:
+            if g.cmd(f"P41={msr0 & ~self.MSR_EE:08x}") != "OK":
+                raise RSPError("P41 (MSR) rejected — cannot mask interrupts")
+            for a in addrs:
+                if g.cmd(f"P{self.ra:02x}={a:08x}") != "OK":
+                    raise RSPError(f"P{self.ra:02x} rejected")
+                if g.cmd(f"P40={self.pc:08x}") != "OK":
+                    raise RSPError("P40 rejected")
+                stop = GDB.stop_pc(g.cont(timeout=self.cont_timeout))
+                if stop != sentinel:
+                    raise RSPError(
+                        f"lwz gadget for {a:#010x} stopped at "
+                        f"{'None' if stop is None else f'{stop:#010x}'}, "
+                        f"not {sentinel:#010x} -- the gadget did not run")
+                g.resync(quiet=0.05)
+                out.append(g.reg(self.rd))
+                self.words_read += 1
+        finally:
+            # Restore unconditionally, including on the error path: leaving the guest
+            # with masked interrupts, a clobbered rA, a stray breakpoint or PC parked
+            # in the gadget would poison every later capture in this run.
+            g.del_bp(sentinel)
+            g.cmd(f"P{self.rd:02x}={gpr0[self.rd]:08x}")
+            g.cmd(f"P{self.ra:02x}={gpr0[self.ra]:08x}")
+            g.cmd(f"P41={msr0:08x}")
+            g.cmd(f"P40={pc0:08x}")
+            g.settle()
+            # DRAIN BEFORE HANDING CONTROL BACK.  CPU.cpp:167-190 re-evaluates its
+            # wait predicate in a loop and calls GDBStub::SendSignal(Sigtrap) EVERY
+            # time, so a `c` that stopped at a breakpoint can leave extra unsolicited
+            # T05 packets queued; the restore commands above would then each consume
+            # a stale one and leave this client permanently a packet behind.  That is
+            # the same failure resync() was written for, and skipping it here is what
+            # made a healthy guest look dead: after the reader ran, an anchor that
+            # fires every 0.55 s (measured, 5 fires in 2.7 s) never appeared to fire
+            # again in 60 s, while OSDisableInterrupts kept hitting 6 times in 0.3 s.
+            g.resync()
+        self.calls += 1
+        return out
+
+    def read(self, ea: int, n: int) -> bytes:
+        """Bytes [ea, ea+n) of the locked cache, in guest (big-endian) order."""
+        lo, hi = ea & ~3, (ea + n + 3) & ~3
+        if not (LC_LO <= lo and hi <= LC_HI):
+            raise RSPError(f"{ea:#010x}+{n} is not inside the locked cache window")
+        out = bytearray()
+        for w in self._words(range(lo, hi, 4)):
+            out += w.to_bytes(4, "big")
+        return bytes(out[ea - lo:ea - lo + n])
+
+    def selftest(self) -> dict:
+        """Prove the reader actually reads memory before any capture trusts it.
+
+        Two independent checks, both against the machine and neither against a
+        constant this file chose:
+          * the gadget word reads back from guest memory as written, and
+          * a MEM1 address read through the gadget equals the same address read
+            through an `m` packet.  The gadget cannot be 'reading zeros' or
+            'reading a stale register' and still pass that.
+        MEM1 is the only region where both instruments work, which is exactly what
+        makes it the right place to cross-check them.
+        """
+        probe = 0x80000000                      # guest low memory, always mapped
+        want = self.g.mem(probe, 4)
+        got = self._words([probe])[0].to_bytes(4, "big")
+        if got != want:
+            raise RSPError(f"gadget selftest: {probe:#010x} reads {got.hex()} through the "
+                           f"gadget but {want.hex()} through an `m` packet")
+        return {"probe": f"{probe:#010x}", "bytes": want.hex(),
+                "gadget_pc": f"{self.pc:#010x}",
+                "gadget": f"lwz r{self.rd},0(r{self.ra}) = {self.word:#010x}"}
+
+
+def lc_reader(g: "GDB") -> "LockedCacheReader":
+    """One reader per connection, built on first use and self-tested once."""
+    r = getattr(g, "_lc_reader", None)
+    if r is None:
+        r = LockedCacheReader(g)
+        r.proof = r.selftest()
+        g._lc_reader = r
+    return r
+
+
+def read_guest(g: "GDB", ea: int, n: int) -> bytes:
+    """Region-aware guest read: `m` for MEM1, the lwz gadget for the locked cache."""
+    if MEM1_LO <= ea and ea + n <= MEM1_HI:
+        return g.mem(ea, n)
+    if LC_LO <= ea and ea + n <= LC_HI:
+        return lc_reader(g).read(ea, n)
+    raise RSPError(f"{ea:#010x}+{n} is in no readable region")
+
+
+def readable(ea: int, n: int) -> bool:
+    return ((MEM1_LO <= ea and ea + n <= MEM1_HI) or
+            (LC_LO <= ea and ea + n <= LC_HI))
 
 
 def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000,
@@ -677,11 +909,17 @@ def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000
     written = set()       # bytes this invocation has already written
     outside = set()       # non-MEM1 addresses touched
     # ...and HOW.  A region this harness cannot stage is only fatal if the function
-    # READS from it: a write-only region (the GX write-gather pipe at 0xCC008000, and
-    # possibly the locked cache used purely as a scratch destination) needs somewhere
-    # to put the bytes, not a staged initial value.  Recording the direction is what
-    # makes that distinction available instead of refusing the whole class blind.
+    # READS from it: a write-only region (the GX write-gather pipe at 0xCC008000)
+    # needs somewhere to put the bytes, not a staged initial value.  Recording the
+    # direction is what makes that distinction available instead of refusing the
+    # whole class blind.  The LOCKED CACHE is no longer in this set at all -- it is
+    # ordinary memory, it is staged, and it is tracked separately in `lc_touched`.
     outside_kind = {}
+    lc_touched = {}       # locked-cache address -> 'load' / 'store' / 'both'
+    # The reader's counter is cumulative across the connection, so snapshot it and
+    # report the DELTA: a per-fixture number is what an artifact can be audited on.
+    lc_words0 = (getattr(g, "_lc_reader").words_read
+                 if getattr(g, "_lc_reader", None) else 0)
     steps, pc = 0, entry
     while steps < max_steps:
         word = body.get(pc)
@@ -699,14 +937,23 @@ def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000
             need = [a for a in range(ea, ea + size)
                     if a not in written and a not in initial]
             if need:
-                if MEM1_LO <= ea and ea + size <= MEM1_HI:
+                # THE LOCKED CACHE IS STAGED LIKE ANY OTHER MEMORY.  It used to land
+                # in `outside` -- unstageable, so verify_fixture.mjs refused the whole
+                # fixture -- and that ONE cause accounted for 11 of the 21 attempts in
+                # the two overlay surveys.  read_guest() reads it with the lwz gadget
+                # (LockedCacheReader) instead of the `m` packet that panics Dolphin.
+                if readable(ea, size):
                     try:
-                        blob = g.mem(ea, size)
+                        blob = read_guest(g, ea, size)
                         for i, a in enumerate(range(ea, ea + size)):
                             if a in need:
                                 initial[a] = blob[i]
-                    except RSPError:
-                        unknown.append({"pc": pc, "why": f"load read failed at {ea:#x}",
+                        if ea >= LC_LO:
+                            lc_touched[ea] = ('both' if lc_touched.get(ea) == 'store'
+                                              else 'load')
+                    except RSPError as e:
+                        unknown.append({"pc": pc,
+                                        "why": f"load read failed at {ea:#x}: {e}",
                                         "kind": "load"})
                 else:
                     outside.add(ea)
@@ -720,7 +967,7 @@ def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000
         pre = None
         if pend:
             ea, size = pend
-            if not (MEM1_LO <= ea and ea + size <= MEM1_HI):
+            if not readable(ea, size):
                 # DO NOT ASK THE STUB FOR IT.  This used to read the pre-image
                 # unconditionally, and an `m` packet for a GEKKO LOCKED CACHE address
                 # (0xE0000000..) walks Dolphin into an inconsistency between two of
@@ -749,19 +996,26 @@ def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000
                 # locked cache normally (two already-recorded fixtures touch
                 # 0xE0000000.. and 0xE0000060..).
                 #
-                # Recording the address in `outside` is all that is needed: the
-                # replay harness stages MEM1 only, so verify_fixture.mjs refuses any
-                # fixture with a non-empty outside_mem1 anyway.
+                # THE LOCKED CACHE NO LONGER REACHES THIS ARM.  readable() now
+                # includes it and LockedCacheReader reads it by executing a guest
+                # `lwz` -- exactly the path MMU.cpp:246-253 serves correctly -- so a
+                # locked-cache store gets a real before/after pair and is compared
+                # like any MEM1 store.  What still lands here is WPAR (0xCC008000),
+                # which is MMIO and has nothing to read back, and anything else.
                 outside.add(ea)
                 outside_kind[ea] = ('both' if outside_kind.get(ea) == 'load'
                                     else 'store')
                 pend = None
             else:
                 try:
-                    pre = g.mem(ea, size)
-                except RSPError:
+                    pre = read_guest(g, ea, size)
+                    if ea >= LC_LO:
+                        lc_touched[ea] = ('both' if lc_touched.get(ea) == 'load'
+                                          else 'store')
+                except RSPError as e:
                     pre = None
-                    unknown.append({"pc": pc, "why": f"store pre-read failed at {ea:#x}",
+                    unknown.append({"pc": pc,
+                                    "why": f"store pre-read failed at {ea:#x}: {e}",
                                     "kind": "store"})
 
         rep = g.step()
@@ -770,7 +1024,7 @@ def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000
         if pend and pre is not None:
             ea, size = pend
             try:
-                post = g.mem(ea, size)
+                post = read_guest(g, ea, size)
                 # Record EVERY store, including value-preserving ones: the replay
                 # comparator filters by per-byte change, so both sides must agree
                 # on what was attempted, not on what happened to differ.
@@ -780,8 +1034,9 @@ def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000
                     if a not in initial and a not in written:
                         initial[a] = pre[i]     # the pre-image IS the initial value
                     written.add(a)
-            except RSPError:
-                unknown.append({"pc": pc, "why": f"store post-read failed at {ea:#x}",
+            except RSPError as e:
+                unknown.append({"pc": pc,
+                                "why": f"store post-read failed at {ea:#x}: {e}",
                                 "kind": "store"})
         pc = npc
         if progress and steps % progress == 0:
@@ -804,6 +1059,20 @@ def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000
             "returned": pc == ret_addr, "state_in": st_in, "state_out": st_out,
             "delta": delta, "writes": writes, "unknown_stores": unknown,
             "initial_mem": {f"{a:08x}": b for a, b in sorted(initial.items())},
+            # THE EVIDENCE THAT THE LOCKED CACHE WAS ACTUALLY MODELLED, not that it
+            # merely happened not to be touched.  verify_fixture.mjs requires this
+            # record before it will score a fixture whose initial_mem carries
+            # 0xE00000xx bytes -- an artifact captured before the reader existed has
+            # no such field and stays refused instead of silently replaying zeros.
+            "locked_cache": {
+                "reader": "lwz-gadget",
+                "gadget_pc": (getattr(g, "_lc_reader").pc
+                              if getattr(g, "_lc_reader", None) else 0),
+                "window": [LC_LO, LC_HI],
+                "words_read": ((getattr(g, "_lc_reader").words_read - lc_words0)
+                               if getattr(g, "_lc_reader", None) else 0),
+                "kind": {f"{a:08x}": k for a, k in sorted(lc_touched.items())},
+            },
             "outside_mem1": sorted(outside),
             "outside_mem1_kind": {f"{a:08x}": k for a, k in sorted(outside_kind.items())},
             "stream": [[p, w] for p, w in stream]}

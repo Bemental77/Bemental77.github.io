@@ -14,6 +14,16 @@
 //                                     is one 72-byte record, the translation emits 18
 //                                     stores, and both expand to the same event list)
 //
+// "GUEST BYTE" INCLUDES THE GEKKO LOCKED L1 CACHE (0xE0000000..0xE0040000).  It is
+// ordinary memory — DOLSDK OSCache.c:309-365 maps it with DBAT3 and the program then
+// uses plain loads and stores on it, and Dolphin memcpys it in and out of m_l1_cache
+// (MMU.cpp:246-253 / :437-442) with no cache semantics at all.  So it is staged,
+// checked and compared exactly like MEM1.  The capture reads it by EXECUTING a guest
+// `lwz` (native_oracle_gdb.LockedCacheReader), because asking the stub for a host
+// pointer there panics Dolphin — Memmap.cpp:722-740 has no L1 arm while
+// MMU.cpp:926-929 says the address IS RAM.  WPAR (0xCC008000) is the one region that
+// stays a sink: it is write-only MMIO, so its stores are excluded and flagged.
+//
 // FPSCR is reported but NOT part of the pass criterion: gekko_rt.h states outright
 // that the exception/FPRF bits are not modelled.  It is printed either way so the
 // gap stays visible instead of being quietly dropped.
@@ -79,13 +89,28 @@ function parseExact(text) {
   });
 }
 
-function expandWrites(writes) {
+// ------------------------------------------------------------ region mapping
+// A MIRROR OF gekko_rt.h's gk_tail() / gk_phys(), and it has to stay one: the wasm
+// side decides where a guest address lands, and every address this harness stages,
+// poisons or compares has to land in the same place.  MEM1 masks to 26 bits; the two
+// windows that are not MEM1 live in a tail past g_ram_size.
+//   0xE0000000..0xE0040000  the Gekko locked L1 cache -- ORDINARY MEMORY (Dolphin
+//     MMU.cpp:246-253 / :437-442 memcpy it; Memmap.h:253 sizes it), staged from the
+//     capture and compared byte for byte like MEM1.
+//   0xCC008000..0xCC009000  WPAR, the GX write-gather pipe -- MMIO, write-only, a
+//     sink whose stores the wasm side never logs.
+const GK_L1_SIZE = 0x00040000, GK_WPAR_SIZE = 0x00001000;
+const GK_TAIL_SIZE = GK_L1_SIZE + GK_WPAR_SIZE;
+const IN_L1 = (a) => ((a >>> 0) >>> 28) === 0xE && ((a >>> 0) & 0x0FFFFFFF) < GK_L1_SIZE;
+const IN_WPAR = (a) => (((a >>> 0) & ~(GK_WPAR_SIZE - 1)) >>> 0) === 0xCC008000;
+
+function expandWrites(writes, phys) {
   // -> [[physAddr, newByte], ...] in order, only bytes whose value CHANGED.
   const out = [];
   for (const w of writes) {
     const b = hexb(w.before), a = hexb(w.after);
     for (let i = 0; i < a.length; i++)
-      if (b[i] !== a[i]) out.push([((w.ea + i) & 0x03ffffff) >>> 0, a[i]]);
+      if (b[i] !== a[i]) out.push([phys(w.ea + i), a[i]]);
   }
   return out;
 }
@@ -98,7 +123,23 @@ const main = async () => {
     throw new Error(`GekkoState size ${M._sr_state_size()} != expected ${SZ}`);
   const ram = M._sr_ram(), ramSize = M._sr_ram_size(), st = M._sr_state();
   const staged = M._sr_staged(), wlog = M._sr_wlog();
-  const phys = (a) => (a & 0x03ffffff) >>> 0;
+  // A build without this export predates the locked-cache model, and replaying a
+  // locked-cache fixture against it would write the tail off the end of the
+  // allocation.  Fail loudly rather than produce numbers from the wrong binary.
+  if (typeof M._sr_tail_size !== 'function')
+    throw new Error('this sr_fixture build has no _sr_tail_size — rebuild it ' +
+                    '(build_fixture.sh) before verifying locked-cache fixtures');
+  const tailSize = M._sr_tail_size();
+  if (tailSize !== GK_TAIL_SIZE)
+    throw new Error(`tail size ${tailSize} != ${GK_TAIL_SIZE} — gekko_rt.h and ` +
+                    `verify_fixture.mjs disagree about the region layout`);
+  const bufSize = ramSize + tailSize;
+  const phys = (a) => {
+    const ea = a >>> 0;
+    if (IN_L1(ea)) return (ramSize + (ea & (GK_L1_SIZE - 1))) >>> 0;
+    if (IN_WPAR(ea)) return (ramSize + GK_L1_SIZE + (ea & (GK_WPAR_SIZE - 1))) >>> 0;
+    return (ea & 0x03ffffff) >>> 0;
+  };
 
   let allPass = true;
   // COUNTS, NOT A VERDICT.  "ALL FIXTURES BIT-EXACT" used to print whenever nothing
@@ -106,7 +147,7 @@ const main = async () => {
   // which is a vacuous pass and exactly the shape a survey must never report. Every
   // refusal is tallied by its reason so a gap is visible as a named class with a
   // count, rather than as a smaller denominator nobody printed.
-  const tally = { pass: 0, fail: 0, refused: 0, notBuilt: 0, passWithSink: 0 };
+  const tally = { pass: 0, fail: 0, refused: 0, notBuilt: 0, passWithSink: 0, lcScored: 0 };
   const why = new Map();
   const refuse = (kind, line) => {
     tally.refused++;
@@ -178,36 +219,62 @@ const main = async () => {
       // log.  What is NOT sound is a READ of a byte this invocation did not write, so
       // that is still a refusal, by name.  Older fixtures carry no direction
       // information; those stay refused rather than being assumed write-only.
+      //
+      // [locked cache 2026-09-04] HALF OF THAT IS NOW OBSOLETE, and it was the whole
+      // blocker: 11 of the 21 attempts across the two overlay surveys were refused,
+      // every one of them for reading 0xE00000xx.  The locked L1 cache is not an
+      // unmodelled region at all -- DOLSDK OSCache.c:309-365 maps it with DBAT3 and
+      // the program uses plain loads and stores on it, and Dolphin models it as a
+      // flat buffer (MMU.cpp:246-253 read, :437-442 write, Memmap.h:253 size).  It is
+      // real memory here too now, staged from the capture and compared byte for byte.
+      // The oracle reads it by EXECUTING a guest `lwz` rather than asking the stub
+      // for a host pointer (native_oracle_gdb.LockedCacheReader), which is why the
+      // Memmap.cpp:740 panic is no longer in the way.  WPAR stays a sink: it is MMIO.
       const okind = fx.outside_mem1_kind;
       const readsOutside = okind
         ? Object.entries(okind).filter(([, k]) => k !== 'store')
         : null;
-      const KNOWN = (a) => ((a >>> 0) >= 0xE0000000 && (a >>> 0) < 0xE0040000) ||
-                           ((a >>> 0) >= 0xCC008000 && (a >>> 0) < 0xCC009000);
+      // THE ONLY WRITE-ONLY SINK LEFT IS WPAR.  The locked cache used to be in this
+      // set and it was the single cause of every refusal in both overlay surveys;
+      // it is modelled memory now, so a capture that still routes it through
+      // `outside_mem1` is one taken BEFORE the model existed and has no staged bytes
+      // for it.  Refusing such an artifact by name is the point -- replaying it
+      // would read the tail's zeros and score a fixture on fabricated inputs.
+      const KNOWN = (a) => IN_WPAR(a);
       const allKnown = (fx.outside_mem1 || []).every(KNOWN);
       let sinkNote = '';
       if (fx.outside_mem1?.length && okind && allKnown && readsOutside.length === 0) {
-        sinkNote = ` [${fx.outside_mem1.length} store(s) to unmodelled regions NOT compared]`;
+        sinkNote = ` [${fx.outside_mem1.length} WPAR store(s) NOT compared]`;
       } else if (fx.outside_mem1?.length) {
         const list = fx.outside_mem1.slice(0, 3)
           .map((a) => `0x${(a >>> 0).toString(16)}`).join(', ');
-        // Name the REGION, not just "outside MEM1": these are two distinct pieces of
-        // Gekko state, each with its own reason for being unmodelled, and lumping
-        // them together hides which one to fix first.
-        //   0xE0000000..  the LOCKED L1 CACHE (Memmap.h:253, 256 KB).  gekko_rt.h
-        //     gk_phys() masks an EA with 0x03FFFFFF, so 0xE0000030 would alias onto
-        //     MEM1 offset 0x30 -- and the oracle cannot even read it back: an `m`
-        //     packet there panics (see native_oracle_gdb.py).
-        //   0xCC008000   WPAR, the write-gather pipe -- i.e. the guest pushing GX
-        //     commands.  MMIO, not memory; nothing in the replay models it.
-        const region = (a) => ((a >>> 0) >= 0xE0000000 && (a >>> 0) < 0xE0040000)
+        // Name the REGION, not just "outside MEM1": these are distinct pieces of
+        // Gekko state with distinct reasons, and lumping them together hides which
+        // one to fix first.
+        //   0xE0000000..  the LOCKED L1 CACHE.  MODELLED NOW -- so seeing it here at
+        //     all means the CAPTURE predates the model and carries no staged bytes
+        //     for it.  Re-capture; do not relax this.
+        //   0xCC008000   WPAR, the write-gather pipe -- the guest pushing GX
+        //     commands.  MMIO, not memory; there is nothing to read back, ever.
+        const region = (a) => IN_L1(a)
           ? 'Gekko locked L1 cache 0xE00000xx'
-          : ((a >>> 0) === 0xCC008000 ? 'WPAR write-gather pipe 0xCC008000'
-                                      : `unmodelled 0x${(a >>> 0).toString(16)}`);
+          : (IN_WPAR(a) ? 'WPAR write-gather pipe 0xCC008000'
+                        : `unmodelled 0x${(a >>> 0).toString(16)}`);
         const kinds = [...new Set(fx.outside_mem1.map(region))];
-        const cause = !okind ? 'capture recorded no load/store direction'
-                    : !allKnown ? 'an address outside the two modelled windows'
-                    : `${readsOutside.length} address(es) READ, not just written`;
+        const staleLC = fx.outside_mem1.some(IN_L1);
+        const cause = staleLC
+                      ? 'the locked cache is MODELLED now — this capture predates it ' +
+                        '(no staged bytes for those addresses); re-capture it'
+                    : !okind ? 'capture recorded no load/store direction'
+                    : !allKnown ? 'an address outside the modelled windows'
+                    // A WPAR READ is not a gap to close, unlike the locked cache: the
+                    // write-gather pipe is MMIO (EA 0xCC008000 translates to physical
+                    // 0x0C008000, which MMU.cpp:233-244 routes to the MMIO mapping),
+                    // so there is no prior value to stage and reading it on the oracle
+                    // would have side effects on the machine being observed.
+                    : `${readsOutside.length} address(es) READ, not just written — a ` +
+                      `WPAR read is MMIO with side effects, so it cannot be staged ` +
+                      `from the oracle at all`;
         refuse(`touches ${kinds.join(' + ')} — ${cause}`,
                `SKIP  0x${entry.toString(16).padStart(8, '0')}  not replayable — ` +
                `touches ${fx.outside_mem1.length} address(es) outside MEM1 (${list}` +
@@ -215,14 +282,52 @@ const main = async () => {
                `${cause}`);
         continue;
       }
-      const want = expandWrites(fx.writes);
+      // LOCKED-CACHE PROVENANCE GATE.  This checks WHERE the 0xE00000xx bytes came
+      // from, and nothing else — COMPLETENESS is already enforced exactly, and by a
+      // better instrument: gk_rd_chk() faults on any read of an unstaged byte, so a
+      // locked-cache read this capture missed shows up below as
+      // `read of UNSTAGED guest byte 0xE00000xx` and FAILS the fixture. Re-deriving
+      // that here would only add a way to be wrong (a load whose bytes this
+      // invocation had already written is legitimately absent from initial_mem).
+      // What the runtime cannot see is provenance, so that is what is checked:
+      //   * staged 0xE00000xx bytes with no `locked_cache` record — nothing says how
+      //     they were obtained, and an `m` packet there panics Dolphin, so an
+      //     artifact claiming them without naming a reader is not trustworthy;
+      //   * a reader this harness does not know; and
+      //   * a record that claims locked-cache accesses while the gadget read zero
+      //     words, which is what a silently-broken reader looks like.
+      {
+        const lcKeys = Object.keys(fx.initial_mem).filter((k) => IN_L1(parseInt(k, 16)));
+        const lc = fx.locked_cache;
+        const nKind = Object.keys(lc?.kind || {}).length;
+        let bad = null;
+        if (lcKeys.length && !lc)
+          bad = [`${lcKeys.length} staged 0xE00000xx byte(s) but no locked_cache record`,
+                 'locked-cache bytes with no capture record'];
+        else if (lc && nKind && lc.reader !== 'lwz-gadget')
+          bad = [`locked_cache.reader = ${JSON.stringify(lc.reader)}, not "lwz-gadget"`,
+                 'locked-cache read by an unknown instrument'];
+        else if (lc && nKind && !lc.words_read)
+          bad = [`${nKind} locked-cache address(es) recorded but words_read = ` +
+                 `${lc.words_read} — the reader never ran`,
+                 'locked-cache record with no reader activity'];
+        if (bad) {
+          refuse(bad[1], `SKIP  0x${entry.toString(16).padStart(8, '0')}  ${bad[0]}`);
+          continue;
+        }
+      }
+      const want = expandWrites(fx.writes, phys);
       const tag = `0x${entry.toString(16).padStart(8, '0')}`;
       const runs = [];
 
       for (const ps1mode of ['ps1=ps0', 'ps1=0']) {
         const H = M.HEAPU8, dv = new DataView(H.buffer);
-        H.fill(0xa5, ram, ram + ramSize);         // poison: nothing legitimate reads it
-        H.fill(0, staged, staged + ramSize);
+        // RESET FIRST, THEN STAGE.  sr_verify_reset() zeroes the locked-cache /
+        // WPAR tail; staging before it would have the reset wipe every staged
+        // locked-cache byte and turn each read into an unstaged-read fault.
+        M._sr_verify_reset();
+        H.fill(0xa5, ram, ram + bufSize);          // poison: nothing legitimate reads it
+        H.fill(0, staged, staged + bufSize);
         for (const [aHex, byte] of Object.entries(fx.initial_mem)) {
           const p = phys(parseInt(aHex, 16));
           H[ram + p] = byte; H[staged + p] = 1;
@@ -244,7 +349,6 @@ const main = async () => {
           dv.setUint32(st + O_GQR + i * 4, (fx.gqr ? fx.gqr[i] : 0) >>> 0, true);
         dv.setUint32(st + O_PC, entry, true);
 
-        M._sr_verify_reset();
         const fault = M._sr_call(entry) >>> 0;
         const unstaged = M._sr_unstaged() >>> 0;
         const n = M._sr_wlog_n() >>> 0;
@@ -381,7 +485,17 @@ const main = async () => {
       allPass = allPass && ok;
       tally[ok ? 'pass' : 'fail']++;
       if (ok && sinkNote) tally.passWithSink++;
-      console.log(`${ok ? 'PASS' : 'FAIL'}  ${tag}${sinkNote}  steps=${fx.steps} bl=${fx.n_calls} ` +
+      // Count the locked-cache fixtures separately: "verified" means nothing here
+      // unless it is visible WHICH results rest on staged 0xE00000xx bytes.
+      const lcKind = fx.locked_cache?.kind || {};
+      const nLC = Object.keys(lcKind).length;
+      if (ok && nLC) tally.lcScored++;
+      const lcNote = nLC
+        ? ` [locked L1: ${Object.values(lcKind).filter((k) => k !== 'store').length} read / ` +
+          `${Object.values(lcKind).filter((k) => k !== 'load').length} written, ` +
+          `${fx.locked_cache.words_read} gadget words]`
+        : '';
+      console.log(`${ok ? 'PASS' : 'FAIL'}  ${tag}${sinkNote}${lcNote}  steps=${fx.steps} bl=${fx.n_calls} ` +
                   `stores=${fx.writes.length} write-events=${want.length} ` +
                   `final-mem-bytes=${fx._memBytes} ` +
                   `staged=${Object.keys(fx.initial_mem).length} ` +
@@ -399,8 +513,12 @@ const main = async () => {
     console.log(`  refused ${String(tally.notBuilt).padStart(4)}  not in this build`);
   if (tally.passWithSink)
     console.log(`  NOTE ${String(tally.passWithSink).padStart(6)}  of the verified ` +
-                `fixtures also store to an unmodelled region (locked L1 / WPAR); ` +
+                `fixtures also store to WPAR (0xCC008000), which is write-only MMIO; ` +
                 `those stores are not compared, everything else is`);
+  if (tally.lcScored)
+    console.log(`  NOTE ${String(tally.lcScored).padStart(6)}  of the verified ` +
+                `fixtures read and/or write the Gekko locked L1 cache; those bytes ` +
+                `ARE staged from the oracle and ARE compared`);
   // A run in which nothing was SCORED is not a pass, however few things failed.
   if (tally.fail) console.log('MISMATCHES PRESENT');
   else if (!tally.pass) console.log('NOTHING WAS SCORED — every fixture was refused');

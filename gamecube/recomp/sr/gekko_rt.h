@@ -53,68 +53,88 @@ static inline int gk_ok(uint32_t p, uint32_t n) {
     return 1;
 }
 
-// -------------------------------------------- UNMODELLED REGIONS (verify only)
-// Two pieces of Gekko state this runtime does not model, both of which real SAB
-// overlay code touches constantly:
-//   0xE0000000..0xE0040000  the LOCKED L1 CACHE (Dolphin Memmap.h:253, 256 KB).
-//   0xCC008000..0xCC009000  WPAR, the write-gather pipe -- the port the guest
-//                           pushes GX commands through.  Write-only by design.
+// ------------------------------------------------- GUEST REGIONS OUTSIDE MEM1
+// Two windows outside MEM1 that real SAB overlay code touches constantly.  They are
+// NOT the same kind of thing, and treating them as one class ("unmodelled") is what
+// made every locked-cache function unverifiable:
+//
+//   0xE0000000..0xE0040000  THE GEKKO LOCKED L1 CACHE -- and it is ORDINARY MEMORY.
+//     DOLSDK OSCache.c:309-365 `__LCEnable()` maps it with DBAT3 (LC_BASE_PREFIX =
+//     0xE000, `mtspr DBAT3L/DBAT3U`) and locks LC_LINES = 512 x 32 B with `dcbz_l`;
+//     from then on the program reads and writes it with plain lwz/stw/psq_l/psq_st
+//     (SAB's matrix stack lives there -- main.dol 0x80116098 pushes a 48-byte matrix
+//     with six psq_l/psq_st pairs off a pointer held at 0x803ae0c4).  Dolphin models
+//     it with NO cache semantics whatever: MMU.cpp:246-253 (read) and :437-442
+//     (write) are a straight memcpy into `m_l1_cache`, sized 256 KB at Memmap.h:253
+//     and registered at 0xE0000000 by Memmap.cpp:114.  So this runtime models it the
+//     SAME way -- a real backing buffer whose loads and stores are exactly as
+//     comparable as any MEM1 byte.
+//
+//   0xCC008000..0xCC009000  WPAR, the write-gather pipe -- the port the guest pushes
+//     GX commands through.  MMIO, write-only by design: there is nothing to read
+//     back and no bytes anyone can compare.  This one really is a sink.
+//
 // Under the plain masking above BOTH windows alias into live MEM1 -- gk_phys keeps
 // only 26 bits, so 0xE0000030 -> offset 0x30 and 0xCC008000 -> offset 0x8000 -- and
 // gk_ok's bound does not catch either, because an aliased offset that small is IN
-// RANGE.  So an access there does not fault; it CORRUPTS MEM1 and forges write
-// events.  (Do not confuse this with Dolphin's own mask: Memmap.cpp:723 uses
+// RANGE.  So an access there does not fault; it CORRUPTS MEM1 (offset 0x30 is guest
+// low memory) and forges write events.  That is a defect in the SHIPPING runtime and
+// not only in the differential one, which is why the mapping below is unconditional
+// now.  (Do not confuse this with Dolphin's own mask: Memmap.cpp:723 uses
 // 0x3FFFFFFF, under which 0xE0000030 becomes 0x20000030 -- that is the address in
 // its panic message, and a different number for a different reason.)
 //
 // THE ORDER OF THE TEST IS THE WHOLE POINT, and getting it wrong is measured: a first
-// version consulted gk_sink only AFTER the masked offset failed the bound, which
-// covers the locked cache by accident and misses WPAR entirely.  Fixture 0x812188c0
-// then FAILED with `write event #44: want [0x2d49e3]=0 got [0x8000]=61` and 169 write
-// events against 101 -- the guest pushing GX commands through WPAR, landing on MEM1
-// offset 0x8000.  A named window is decided by its EFFECTIVE address, before masking.
+// version consulted the window map only AFTER the masked offset failed the bound,
+// which covers the locked cache by accident and misses WPAR entirely.  Fixture
+// 0x812188c0 then FAILED with `write event #44: want [0x2d49e3]=0 got [0x8000]=61`
+// and 169 write events against 101 -- the guest pushing GX commands through WPAR,
+// landing on MEM1 offset 0x8000.  A named window is decided by its EFFECTIVE address,
+// before masking.
 //
-// So, IN THE DIFFERENTIAL BUILD ONLY, both windows get a private scratch buffer past
-// the end of MEM1.  Consequences, all deliberate:
-//   * a store there lands somewhere harmless and is NOT written to the change log,
-//     so it is not compared -- the oracle cannot show us those bytes either (an `m`
-//     packet for 0xE00000xx panics Dolphin: see native_oracle_gdb.py),
-//   * a read-back of something this same invocation wrote is CORRECT, which is the
-//     normal scratch-buffer idiom, and
-//   * a read of a byte this invocation did NOT write is NOT correct -- it reads the
-//     buffer's initial zero instead of the machine's value.  verify_fixture.mjs
-//     refuses any fixture whose capture recorded a LOAD from these windows
-//     (outside_mem1_kind), so that case is never scored, only refused by name.
-// The shipping runtime is unchanged: none of this is compiled without SR_VERIFY.
-#ifdef SR_VERIFY
-#define GK_SINK_L1    0x00040000u          /* 256 KB locked L1 */
-#define GK_SINK_WPAR  0x00001000u          /* 4 KB around WPAR */
-#define GK_SINK_SIZE  (GK_SINK_L1 + GK_SINK_WPAR)
-static inline int gk_sink(uint32_t ea, uint32_t n, uint32_t *p) {
-    if ((ea >> 28) == 0xEu && (ea & 0x0FFFFFFFu) + n <= GK_SINK_L1) {
-        *p = g_ram_size + (ea & 0x0003FFFFu);
+// Both windows live in a tail g_ram carries past MEM1 (sr_driver.c allocates it).
+// `g_ram_size` still reports MEM1 only, so gk_ok's bound is unchanged.
+#define GK_L1_SIZE    0x00040000u          /* 256 KB locked L1  (Memmap.h:253) */
+#define GK_WPAR_LO    0xCC008000u
+#define GK_WPAR_SIZE  0x00001000u          /* 4 KB around WPAR */
+#define GK_TAIL_SIZE  (GK_L1_SIZE + GK_WPAR_SIZE)
+#define GK_L1_OFF     (g_ram_size)
+#define GK_WPAR_OFF   (g_ram_size + GK_L1_SIZE)
+
+/* FALSIFICATION SWITCH -- build with -DSR_NO_LC_MODEL for the CONTROL ARM.  It drops
+   the locked-cache arm only, so an 0xE00000xx access aliases into MEM1 exactly as it
+   did before this model existed.  A fixture that passes only BECAUSE the cache is
+   modelled must FAIL in that build; one that passes in both was never testing the
+   model.  This is the same discipline that caught a `bctr` capture being credited
+   with exercising a path that never ran (commit 19412bf6). */
+#ifdef SR_NO_LC_MODEL
+#define GK_L1_MODELLED 0
+#else
+#define GK_L1_MODELLED 1
+#endif
+
+/* The predicate is a port of MMU.cpp:247-248 / :438-439: segment 0xE, below
+   0xE0000000 + GetL1CacheSize().  Everything else in segment 0xE is not the cache. */
+static inline int gk_tail(uint32_t ea, uint32_t n, uint32_t *p) {
+    if (GK_L1_MODELLED && (ea >> 28) == 0xEu && (ea & 0x0FFFFFFFu) + n <= GK_L1_SIZE) {
+        *p = GK_L1_OFF + (ea & (GK_L1_SIZE - 1u));
         return 1;
     }
-    if ((ea & ~0x0FFFu) == 0xCC008000u) {
-        *p = g_ram_size + GK_SINK_L1 + (ea & 0x0FFFu);
+    if ((ea & ~(GK_WPAR_SIZE - 1u)) == GK_WPAR_LO) {
+        *p = GK_WPAR_OFF + (ea & (GK_WPAR_SIZE - 1u));
         return 1;
     }
     return 0;
 }
 #define GK_MAP(ea, n, p, fail)  do {                                           \
-        if (!gk_sink((ea), (n), &(p))) {                                       \
+        if (!gk_tail((ea), (n), &(p))) {                                       \
             (p) = gk_phys(ea);                                                 \
             if (!gk_ok((p), (n))) { fail; }                                    \
         }                                                                      \
     } while (0)
-#define GK_IS_SINK(p) ((p) >= g_ram_size)
-#else
-#define GK_MAP(ea, n, p, fail)  do {                                           \
-        (p) = gk_phys(ea);                                                     \
-        if (!gk_ok((p), (n))) { fail; }                                        \
-    } while (0)
-#define GK_IS_SINK(p) 0
-#endif
+/* WPAR ONLY.  A store to the write-gather pipe is not a memory change anyone can
+   compare; a store to the locked cache is, and is logged like any other. */
+#define GK_IS_WPAR(p) ((p) >= GK_WPAR_OFF)
 
 // ------------------------------------------------- differential-verify hooks
 // Compiled in ONLY under -DSR_VERIFY (the fixture harness); the shipping runtime
@@ -143,12 +163,15 @@ static inline void gk_w_pre(uint32_t p, uint32_t n){
     if (n <= sizeof gk_wpre) for (uint32_t i = 0; i < n; i++) gk_wpre[i] = g_ram[p + i];
 }
 static inline void gk_w_post(uint32_t p, uint32_t n){
-    // A store into an UNMODELLED window is not a memory change anyone can compare:
-    // the oracle cannot read those bytes back either.  Do not log it -- but DO mark
-    // it staged, so a later read of what this same invocation just wrote is legal
-    // while a read of anything else in the window trips the unstaged-read check and
-    // fails the fixture loudly instead of quietly returning zero.
-    if (GK_IS_SINK(p)) {
+    // A store into WPAR is not a memory change anyone can compare: it is MMIO, the
+    // oracle cannot read those bytes back either.  Do not log it -- but DO mark it
+    // staged, so a later read of what this same invocation just wrote is legal while
+    // a read of anything else in the window trips the unstaged-read check and fails
+    // the fixture loudly instead of quietly returning zero.
+    // THE LOCKED CACHE IS NOT IN THIS ARM ANY MORE: it is modelled memory, its
+    // stores are logged and compared like MEM1's, and its initial contents are
+    // staged by the capture (native_oracle_gdb.LockedCacheReader).
+    if (GK_IS_WPAR(p)) {
         if (g_staged) for (uint32_t i = 0; i < n; i++) g_staged[p + i] = 1;
         return;
     }
@@ -410,9 +433,11 @@ static inline double gk_fres(double val){
 }
 
 // dcbz: zeroes the 32-byte cache block containing EA (Gekko line size = 32).
+// Goes through GK_MAP like every other store: `dcbz`/`dcbz_l` on a locked-cache
+// address is exactly how OSCache.c:349-352 establishes the lock in the first place,
+// so masking it into MEM1 would zero 32 bytes of guest low memory.
 static inline void gk_dcbz(uint32_t ea){
-    uint32_t p = gk_phys(ea) & ~31u;
-    if (!gk_ok(p, 32)) return;
+    uint32_t p; GK_MAP(ea & ~31u, 32, p, return);
     GK_WPRE(p, 32);
     for (int i = 0; i < 32; i++) g_ram[p + i] = 0;
     GK_WPOST(p, 32);
