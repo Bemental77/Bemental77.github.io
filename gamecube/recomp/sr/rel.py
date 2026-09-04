@@ -161,6 +161,29 @@ class Rel:
             for r in imp["relocs"]:
                 yield imp["id"], r
 
+    def section_bases(self, exec_base):
+        """Runtime address of every FILE-BACKED section, from one known one.
+
+        OSLink.c:236-240 relocates a section by `si->offset += (u32)moduleHeader` when
+        it has file bytes, so the whole REL blob is loaded contiguously at
+        moduleHeader and each such section sits at its FILE OFFSET within it.  Given
+        the executable section's runtime address (which __OSModuleInfoList reports, or
+        which base recovery confirms) the rest follow with no further reads.
+
+        VERIFIED against the machine on stg13D, 4 of 4 file-backed data sections:
+        moduleHeader = 0x811fff48 - 0xe8 = 0x811ffe60 -- which is also the module-info
+        pointer the guest OS itself holds -- and sec2/3/4/5 then predict
+        0x8125c118 / 0x8125c11c / 0x8125c120 / 0x8125dba0, exactly what the live
+        module list reports.
+
+        A BSS section is NOT covered: OSLink assigns it from the separate `bss`
+        pointer, so its address is not a function of the file.  It is omitted here
+        rather than guessed."""
+        e = next(s for s in self.sections if s["exec"] and s["size"])
+        hdr = (exec_base - e["offset"]) & 0xFFFFFFFF
+        return {s["idx"]: (hdr + s["offset"]) & 0xFFFFFFFF
+                for s in self.sections if s["size"] and not s["bss"]}
+
     def relocate(self, bases, sections=None):
         """Apply OSLink's Relocate() offline. -> {sec_idx: relocated bytes}.
 
@@ -194,6 +217,13 @@ class Rel:
             sec, off, typ = r["site_sec"], r["site_off"], r["type"]
             if sec not in out or off + 4 > len(out[sec]):
                 continue
+            if mid != 0 and (mid, r["ref_sec"]) not in bases:
+                raise KeyError(
+                    f"no runtime base for module {mid} section {r['ref_sec']} "
+                    f"(needed by a {RTYPE.get(typ, typ)} at sec{sec}+{off:#x}). "
+                    f"A BSS section's address is assigned from OSLink's `bss` pointer "
+                    f"(OSLink.c:236-240) and is NOT derivable from the file -- take it "
+                    f"from __OSModuleInfoList.")
             base = 0 if mid == 0 else bases[(mid, r["ref_sec"])]
             x = (base + r["addend"]) & 0xFFFFFFFF
             buf = out[sec]
