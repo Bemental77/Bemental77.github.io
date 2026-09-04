@@ -280,13 +280,32 @@ def main():
                                    if ((w >> 26) & 0x3F) == 19
                                    and ((w >> 1) & 0x3FF) == 528 and not (w & 1)]
             del fx["stream"]
+
+            # [usable 2026-09-04] EVERY record must carry this, and the reason.
+            # verify_fixture.mjs:128 refuses on `usable === false` — but this
+            # file never wrote the field at all, so its captures arrived as
+            # `undefined`, which is NOT `=== false`, and a TRUNCATED or
+            # unknown-store capture replayed as though it were sound.  Only
+            # fixture_rel.py set it, so the two producers disagreed and the
+            # consumer silently took the permissive branch.  A missing verdict
+            # must never read as a passing one.
+            _bad = []
+            if not fx["returned"]:            _bad.append("did not return (capture truncated)")
+            if fx["unknown_stores"]:          _bad.append(f"{len(fx['unknown_stores'])} unknown store forms")
+            if fx["outside_mem1"]:            _bad.append(f"{len(fx['outside_mem1'])} accesses outside MEM1")
+            if fx["ps1_dependency"]:          _bad.append(f"{len(fx['ps1_dependency'])} undefined PS1-lane reads")
+            fx["usable"] = not _bad
+            fx["unusable_reason"] = "; ".join(_bad) if _bad else None
+
             print(f"    steps={fx['steps']} returned={fx['returned']} "
                   f"bl={fx['n_calls']} writes={len(fx['writes'])} "
                   f"initial_bytes={len(fx['initial_mem'])} "
                   f"unknown={len(fx['unknown_stores'])} "
                   f"outside_mem1={len(fx['outside_mem1'])} "
                   f"ps1_dep={len(fx['ps1_dependency'])} "
-                  f"bctr_executed={len(fx['bctr_executed'])}")
+                  f"bctr_executed={len(fx['bctr_executed'])} "
+                  f"usable={fx['usable']}"
+                  + (f" ({fx['unusable_reason']})" if not fx['usable'] else ""))
             out["fixtures"].append(fx)
             json.dump(out, open(OUT, "w"))
         json.dump(out, open(OUT, "w"))

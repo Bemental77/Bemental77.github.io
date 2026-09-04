@@ -125,6 +125,32 @@ const main = async () => {
       // A closure build hid this by never emitting them ("not in this build"); a
       // WHOLE-IMAGE build emits everything, so without this gate they run and
       // "fail", which reads exactly like a correctness regression and is not one.
+      // [derive 2026-09-04] A MISSING VERDICT MUST NOT READ AS A PASSING ONE.
+      // Only fixture_rel.py wrote `usable`; fixture_nonleaf.py never did, so its
+      // captures arrived as `undefined` — which is not `=== false` — and a
+      // truncated or unknown-store capture replayed as sound. fixture_nonleaf.py
+      // now records it, but artifacts captured before that do not (sab_bctr,
+      // sab_blrl and sab_rel_stg13D_fixtures all carry 0 of the field), so the
+      // verdict is DERIVED here from the same evidence rather than assumed.
+      // Deriving keeps genuinely-sound old artifacts passing while refusing
+      // unsound ones; treating absence as "fine" did the opposite.
+      if (fx.usable === undefined) {
+        const bad = [];
+        if (fx.returned === false) bad.push(`did not return in ${fx.steps} steps`);
+        if (fx.unknown_stores?.length) bad.push(`${fx.unknown_stores.length} unknown store forms`);
+        // DELIBERATELY NOT outside_mem1 / ps1_dependency. Both have their own
+        // downstream handling below (:176-187 scores write-only stores to known
+        // unmodelled regions with a note and refuses READS), so deriving a
+        // blanket refusal from them here would reject captures the existing
+        // logic passes correctly. Only the two conditions that make a capture
+        // unsound BY CONSTRUCTION are derived: a truncated trace, and an
+        // incomplete write log.
+        if (bad.length) {
+          refuse(`unusable (derived: ${bad.join('; ')})`,
+                 `SKIP  0x${entry.toString(16).padStart(8, '0')}  no usable field — derived unusable: ${bad.join('; ')}`);
+          continue;
+        }
+      }
       if (fx.usable === false) {
         const why = fx.unknown_stores?.length ? `${fx.unknown_stores.length} unknown store forms`
                   : fx.returned === false ? `did not return in ${fx.steps} steps`
