@@ -15,6 +15,8 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | x-form update load/store | **66 bit-exact / 0**, all 11 forms |
 | **`.rel` OVERLAY function, by execution** | **1 PASS** — `stg13D` `0x8121d80c`, §5g/§5h |
 | `bctr` jump tables | **145 of 147 recovered**, and one **PASS by execution** with a faulting control arm, §5b |
+| whole-image build at **`-O2`** | **builds, instantiates, 1056/0 bit-exact** — the "`-O0` is a real scaling constraint" note was an artifact worth **~24x**, §5j |
+| **whole-image throughput** | **0.621x** translated-code, Chrome, vs a same-session JIT baseline of **0.4450x** — NOT a system rate, §8 |
 
 The two 2026-09-02 additions each came from a **harness** defect, not a translator one,
 and both are worth remembering because both produced a confident wrong reading:
@@ -248,7 +250,18 @@ md5 `51092aa5272349e1d8a1ed7aa25aead3` identical before and after, with the 3
    — clang inlines the translated bodies into `sr_dispatch` and the result exceeds
    V8's limit. It reads like a corrupt wasm, not a size limit. A whole-image build
    must lower the optimisation level (`SR_OPT=-O0`); both build scripts now take that
-   knob. This is a **real scaling constraint on this route**, not a one-off.
+   knob. ~~This is a **real scaling constraint on this route**, not a one-off.~~
+
+   > **⛔ THAT LAST SENTENCE IS WRONG, AND IT COST A 24x UNDER-READING. Corrected
+   > 2026-09-04 — see §8.** It is not a scaling constraint on the route, it is an
+   > artifact of emitting `sr_dispatch` in the *same translation unit* as the bodies.
+   > Every arm of that switch calls exactly one `fn_*` exactly once, so `-O2` inlines
+   > all 4,671 bodies into it — and inlining there buys nothing whatsoever. Split
+   > `sr_dispatch` into its own TU (`sr.py --dispatch-out`, `build_slice.sh
+   > SR_DISPATCH_C=`) and emcc cannot inline across it without LTO, so the bodies keep
+   > full `-O2` and the module instantiates. Measured: the whole image builds at `-O2`,
+   > scores **1056 bit-exact / 0 of 1056**, and runs **~24x** faster than the `-O0`
+   > build this bullet mandated.
 2. **A rig defect that would have read as a correctness regression.**
    `verify_fixture.mjs` ignored the artifact's own `usable:false` flag. Three records
    in `sab_nonleaf_fixtures.json` carry it with the reason recorded at capture time —
@@ -992,6 +1005,70 @@ and is not one. `verify_fixture.mjs` now refuses a fixture with a non-empty
 
 So the honest score for this capture is **1 usable fixture, 1 PASS** — not 3 of 3.
 
+## 5j. The `-O0` constraint was an artifact, and removing it is worth ~24x
+
+§5b recorded "a whole-image build must lower the optimisation level (`SR_OPT=-O0`) …
+this is a real scaling constraint on this route." **It is not a constraint on the route.
+It is a constraint on emitting `sr_dispatch` in the same translation unit as the bodies**,
+and it was suppressing every whole-image performance number by a factor of ~24.
+
+`sr_dispatch` is a 4,671-arm switch in which **every arm calls exactly one `fn_*`
+exactly once**. At `-O2` clang therefore inlines all 4,671 translated bodies into it,
+producing one function larger than V8's hard per-function ceiling. Inlining there was
+never worth anything — there is no call-site specialisation to win.
+
+The fix is `sr.py --dispatch-out <file>` + `build_slice.sh SR_DISPATCH_C=<file>`:
+`sr_dispatch` becomes its own TU, emcc does no cross-TU inlining without LTO, and the
+bodies keep full `-O2` including leaf inlining at their own call sites.
+
+**The change is provably additive.** Regenerating the whole image *without*
+`--dispatch-out` produces byte-identical C — md5 `4216085a115d3b829321e789a037b638`
+before and after the edit — which is the same "byte-identical output proves additive"
+standard §5 used for the x-form work.
+
+| whole-image build | wasm | instantiates | 1,056 leaf goldens |
+|---|---|---|---|
+| `-O0`, dispatch in-file | 24,940,816 B, md5 `2f91901b3a7b532a7534b8a5752fa501` | yes | — |
+| **`-O2`, dispatch split** | **22,710,127 B, md5 `b0e35dc87ee1567bc5a1215a0dd42153`** | **yes** | **1056 bit-exact / 0** |
+
+Both built from the same generated C with `--all --indirect --jumptables --boundaries
+outer+calls` (4,671 bodies, 4,671 dispatch cases, 812 `sr_indirect` sites, 721
+`sr_extern` sites; 70 functions / 2,054 instructions skipped as the host-binding
+worklist). md5 identical before and after the goldens run.
+
+### It was TWO stacked penalties, not one, and only one of them is `-O2`
+
+Isolated with matched builds one variable apart, same 12-function closure, same
+fixtures, same harness (`perf_fixture.mjs`, min of 7 trials, restore-corrected):
+
+| fixture | whole-image `-O0` | **closure** `-O0` | **closure** `-O2` | whole-image `-O2` |
+|---|---|---|---|---|
+| `0x801113d4` | 12.7 M | 77.3 M | 432.5 M | **326.6 M** |
+| `0x801113f4` | 13.6 M | 79.6 M | 380.0 M | **319.6 M** |
+| `0x80111414` | 11.7 M | 71.7 M | 342.3 M | **287.4 M** |
+| `0x801115a8` | 11.5 M | 72.5 M | 362.3 M | **299.0 M** |
+
+(guest instructions/second, restore-corrected)
+
+- **`-O2` vs `-O0` on identical code: ~4.8-5.6x.** That is the compiler.
+- **Whole-image vs closure at the same `-O0`: a further ~6x.** That is *not* the
+  compiler and it is not the translated bodies — it is `sr_dispatch` itself. At `-O0`
+  clang lowers a 4,671-case sparse switch without the balanced search tree it builds at
+  `-O2`, and `sr_call` pays that on *every* invocation. On a 58-70 instruction fixture
+  the dispatch swamped the function. **The `-O0` whole-image figure was measuring the
+  harness, not the recompiled code.**
+- The two multiply to the ~24x between the first and last columns.
+
+Whole-image `-O2` lands ~15-25% below closure `-O2`, which is the honest residual cost
+of having all 4,671 functions in one 22.7 MB module.
+
+> **Reading note carried from §5c:** as the engine gets faster the fixed per-invocation
+> *restore* control grows as a share of the measurement. At whole-image `-O0` all 7
+> non-leaf fixtures had a restore control under 50% of the run; at `-O2` only 4 do, so
+> only 4 are quotable. Faster code makes *fewer* fixtures quotable, not more — a
+> corrected figure whose control is a majority of the run is a small difference of two
+> large numbers and swings 50% run-to-run.
+
 ## 6. The OS-thread / context-switch problem, measured
 
 The brief warned that a binary recomp cannot use MP4's escape (never compiling
@@ -1037,6 +1114,150 @@ exist — Emscripten Asyncify (already used elsewhere in this repo), one host th
 guest thread (N64ModernRuntime's answer; `gamecube.html` already has SAB + COI so
 pthreads are available), and JSPI. **None is chosen, built, or measured here.**
 
+## 8. The whole-image performance number, and exactly what it is not
+
+Measured 2026-09-04. §5c's caveat — "there is no whole-game number, and the fixture
+figure is not comparable to the JIT's wall-clock rate" — is *partly* closed here: the
+throughput is now measured on the **whole-image** build rather than a 12-function
+closure, and against a **same-session** JIT baseline rather than a quoted one. It is
+still not a system rate, and §8.3 is the list of reasons.
+
+### 8.1 The two numbers
+
+**JIT baseline, measured this session, stock HEAD, no rebuild** (gate-#8 clean):
+
+```
+ROM_IDX=1 PROBE_HEADLESS=0 PROBE_DURATION_MS=75000 node gamecube/tools/dolphin_render_probe.js
+[guestclock:throttled] RAW ticksHz=486000000 period=121392 NumBlocks=20 window=40.00s
+                       d(ai_dma_cb)=71264 d(aid_fire)=3563
+[guestclock:throttled] ai_dma_cb=1781.56/s (hw 4003.56/s) => guest=0.4450x  aid_fire=89.07
+```
+
+**`guest = 0.4450x`.** Both witnesses agree (1781.56/4003.56 = 0.44500;
+89.07/200.18 = 0.44495). This is *higher* than the 0.4115x in
+`gamecube/docs/sab-frame-governor/TASKS.md:20-21`, and the phase-snap says why: that
+document's "Open" item landed — `"leafInline":"4851/15/15/219 lastIdlePc=80117e0c"`,
+i.e. the frame-governor loop at `0x80117e0c` is now being idle-collapsed. Quote
+**0.4450x** for HEAD, not 0.4115x.
+
+**Static recomp, whole-image `-O2` build** (md5 `b0e35dc87ee1567bc5a1215a0dd42153`,
+identical before and after the run), measured **in Chrome** by
+`gamecube/recomp/sr/perf_browser.mjs` — new in this pass — min of 7 trials,
+restore-corrected, under `tools/probe_lock.sh`, machine load 3.97 → 4.91:
+
+```
+SR_OUT=/tmp/sr_wi_o2_web node gamecube/recomp/sr/perf_browser.mjs \
+  gamecube/recomp/sr/sab_nonleaf_fixtures.json gamecube/recomp/sr/sab_blrl_fixtures.json \
+  gamecube/recomp/sr/sab_bctr_fixtures.json    gamecube/recomp/sr/sab_rel_stg13D_fixtures.json
+```
+
+| fixture | steps | guest instr/s | ×CPI 1.066 → guest cycles/s | ÷486 MHz |
+|---|---|---|---|---|
+| `0x801113d4` | 66 | 280.9 M | 299.4 M | **0.616x** |
+| `0x801113f4` | 70 | 304.3 M | 324.4 M | **0.667x** |
+| `0x80111414` | 58 | 269.8 M | 287.6 M | **0.592x** |
+| `0x801115a8` | 62 | 275.6 M | 293.8 M | **0.605x** |
+| **aggregate** (instruction-weighted) | | **282.9 M** | **301.6 M** | **0.621x** |
+
+Node cross-check on the same binary, same fixtures, at a quieter load (2.14 → 3.41)
+read 287.4-326.6 M, aggregate ~308 M → 0.676x. **Chrome is the number to quote**, because
+the JIT baseline it is being compared against is only ever measured in Chrome; running
+the two engines in two different runtimes would be an unmatched pair (gate #10). The
+~8% Node/Chrome spread is within the load difference between the two runs and should
+not be read as a runtime effect.
+
+**Why the browser run is measured on a *separately linked* binary and that is safe:**
+`-sENVIRONMENT` changes only the JS glue, and the web relink produced a wasm with the
+**identical md5** `b0e35dc87ee1567bc5a1215a0dd42153`. Hash-guarded before and after.
+
+### 8.1b Three results that came free with the run
+
+- **`SKIP 0x8121d80c faults 0xbad0d80c`** — the `stg13D` overlay function is *absent*
+  from the DOL-only whole-image build, and says so by execution. `0xBAD00000|addr` is
+  `sr_call`'s "not in `sr_dispatch`" code (`sr_driver.c:47`), distinct from
+  `sr_extern`'s `0xE0` and `sr_indirect`'s `0xE1`. This is the overlay gap (§8.3 item 6)
+  demonstrated rather than asserted.
+- **The three `blrl` fixtures and the `bctr` fixture all ran to completion with fault 0**
+  in the `-O2` split-dispatch build. `perf_browser.mjs` aborts a fixture on any fault,
+  so this is a free regression check that indirect dispatch and recovered jump tables
+  still work after the dispatch TU was split out.
+- **Restore control dominates far more in Chrome**: 74.7-91.5% for every fixture except
+  the four `0x80111xxx` ones (27-31%). `0x8013b170` "reads" 1260.0 M corrected off a
+  78.3% control — a small difference of two large numbers. Those rows are printed so the
+  instability is visible, not so they can be quoted, and the harness filters them.
+
+### 8.2 Why the ÷486 conversion is legitimate, and where CPI comes from
+
+The JIT's guest rate is *credited Gekko cycles / 486e6*, and credited cycles are the sum
+of Dolphin's own per-opcode `num_cycles` (`PPCTables.cpp` `GekkoOPTemplate`, accumulated
+at `ppc_analyst.cpp:650`). A throughput measured in guest *instructions* per second is
+therefore not directly a guest rate — it has to be multiplied by cycles-per-instruction
+under **the same cost model**, or the two sides are not the same unit.
+
+Only 40 of 243 opcodes cost more than 1 cycle. Computed over the recovered `outer+calls`
+boundary set:
+
+| scope | instructions | cycles | static CPI |
+|---|---|---|---|
+| whole `.text` | 374,807 | 410,972 | **1.0965** |
+| the measured fixture closures (16 fns) | 727 | 775 | **1.0660** |
+
+`mtspr` (2 cycles, and `mtlr`/`mtctr` are `mtspr`) is 1.31% of `.text` and dominates the
+correction; `mulli`/`mullw`/`lmw`/`stmw`/`fdivs` follow. **This is a STATIC CPI over the
+function bodies, not a dynamic CPI over the executed path** — the fixtures record
+`steps` and the ordered write log but not the executed instruction stream, so the
+executed mix cannot be recovered from them. The correction is small (+6.6%) and its
+error is smaller still, but it is an estimate, not a measurement.
+
+### 8.3 What this number is NOT — read before quoting it
+
+**0.676x is translated-code throughput. It is not "SAB runs at 0.68x".** The gap
+between the two is unmeasured, and every item below makes 0.676x optimistic:
+
+1. **There is no host layer at all.** No interrupt delivery, no DMA, no GPU/FIFO, no
+   audio, no OS scheduling, no DVD. The JIT's 0.4450x includes all of them. This is the
+   single largest reason the two are not comparable, and its size is unknown.
+2. **It is bare function replay on a hot cache** — one function, invoked 20,000 times
+   in a loop, with its working set resident. No cache pressure from the rest of the game.
+3. **The sample is 4 functions**, and they are *not* drawn from the hot profile —
+   mapping the measured PC histogram onto function boundaries puts none of them in the
+   top 120. They are the functions for which verified fixtures happen to exist.
+4. **Only 4 of 7 non-leaf fixtures are quotable at all**, because the per-invocation
+   restore control crosses 50% of the run for the three larger ones once the code is
+   this fast (§5j reading note).
+5. **SR has no idle-skip; the JIT's 0.4450x does.** The JIT is credited for cycles it
+   never executed (the `leafInline` collapse of the governor loop). On an
+   executed-work basis the two engines are closer than these numbers suggest; on a
+   delivered-rate basis SR would need the same mechanism to keep up. Neither engine's
+   phantom share was re-measured here — `[mips]` is unvalidated (CLAUDE.md gate #10)
+   and shipped OFF in this run.
+6. **The build is `main.dol` only.** The 76 `.rel` overlays are 93.64% of SAB's static
+   instructions and are absent. That matters less than it sounds *on this scene* —
+   96.92% of the 15,478 PC samples in the histogram fall inside the DOL's `.text`,
+   2.90% at `0x80bc____` (arena, i.e. an overlay) — but City Escape gameplay, where
+   `stg13D` is resident and running, would shift that a lot. **This is the boot/menu
+   scene, not gameplay.**
+7. **7 of the 70 skipped functions are in the hot profile**, including
+   `OSRestoreInterrupts` (0.53%), so even the DOL side is not fully executable yet.
+
+### 8.4 The honest reading
+
+On the one comparison that can be made today — translated code versus the JIT's
+whole-system rate, which favours the recompiler — static recomp is at **0.621x against
+0.4450x, i.e. ~1.40x the JIT**, and needs a further **~1.61x** to reach 1.000x.
+
+That is *not* the "it obviously escapes the ceiling" result the route was pitched on,
+and it is *not* a refutation either, because the comparison is unequal in the
+recompiler's favour and the host layer that would close the gap is unbuilt. **The
+decisive experiment is still the one nobody has run: SAB executing continuously through
+the recompiled image with a host layer under it.** The blocker for that is §6's
+`OSSaveContext`/`OSLoadContext` pair plus the ~66 privileged functions, not throughput.
+
+What DID change decisively this session is §5j: before the split-dispatch fix, any
+whole-image measurement would have read **~0.03x** and this route would have looked
+dead on arrival for a reason that was entirely an artifact of how one switch statement
+was emitted.
+
 ## 7. Decision
 
 **The route is VIABLE for SAB on translatability grounds, and the remaining work
@@ -1048,10 +1269,15 @@ two.
 
 **What that claim does NOT cover, stated plainly:**
 
-1. **There is no performance number of any kind for the SAB static-recomp path.** The
-   entire premise — that this escapes the JIT ceiling — is unmeasured for this game.
-   MP4's ~1.000x is a *different game* reached by a *different (decomp→C)* route.
-   Viability here means *translatability*, not speed.
+1. ~~**There is no performance number of any kind for the SAB static-recomp path.**~~
+   **SUPERSEDED 2026-09-04 — §8.** The whole-image `-O2` build measures **0.621x**
+   (translated-code throughput, Chrome) against a same-session JIT baseline of
+   **0.4450x**. That is ~1.40x the JIT and ~1.61x short of 1.000x — but the comparison
+   is unequal in the recompiler's favour (no host layer on the SR side at all), so it
+   bounds nothing on its own. **The premise "this escapes the JIT ceiling" is still
+   unproven**: what is measured is that translated code is not obviously the
+   bottleneck, not that the system built on it would hit 1.000x. Read §8.3 before
+   quoting any of it.
 2. ~~**No `.rel` overlay function has ever been differentially verified.**~~
    **CLOSED 2026-09-02 (§5g/§5h): `stg13D.rel` `0x8121d80c` is bit-exact** — exit
    registers, the 47-event ordered write log, and final memory. One function, from one

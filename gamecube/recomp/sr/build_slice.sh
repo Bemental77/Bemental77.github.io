@@ -49,8 +49,15 @@ else
           "${ARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"} --out "$OUT/sr_gen.c"
 fi
 
-emcc ${SR_OPT:--O2} -I"$SR" "$OUT/sr_gen.c" "$SR/sr_driver.c" -o "$OUT/sr_slice.js" \
-  -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \
+# SR_DISPATCH_C: sr_dispatch compiled as its OWN TU (sr.py --dispatch-out).  Required
+# for a whole-image build at -O2: in one file, clang inlines all 4,671 translated bodies
+# into the dispatch switch and V8 rejects the result at instantiate ("size ... > maximum
+# function size 7654321").  Separate TU = no cross-TU inlining without LTO, so the bodies
+# keep -O2.  Measured worth ~5x on identical code.
+EXTRA_SRC=(); [ -n "${SR_DISPATCH_C:-}" ] && EXTRA_SRC=("$SR_DISPATCH_C")
+
+emcc ${SR_OPT:--O2} -I"$SR" "$OUT/sr_gen.c" ${EXTRA_SRC[@]+"${EXTRA_SRC[@]}"} "$SR/sr_driver.c" -o "$OUT/sr_slice.js" \
+  -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT="${SR_ENV:-node}" -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \
   -sALLOW_MEMORY_GROWTH=1 \
   -sEXPORTED_FUNCTIONS=_sr_init,_sr_ram,_sr_ram_size,_sr_state,_sr_state_size,_sr_call,_malloc \
   -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32,wasmMemory \
