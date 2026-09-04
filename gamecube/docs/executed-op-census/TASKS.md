@@ -733,6 +733,29 @@ that program's ceiling is **~1.27x against 2.29x owed**. To reach 1.000x from
 inside the bodies you would have to delete all fixed overhead AND ~25% of the
 guest-work ops — and guest work is the translation of guest semantics.
 
+> ## ⚠ 2026-09-04 — THIS CEILING PRICES ONLY ONE OF TWO FACTORS
+>
+> See `gamecube/docs/wasm-tier/TASKS.md`. The arithmetic below bounds *how many wasm
+> ops we emit*. It says nothing about *what V8 compiles those ops into*, and that
+> second factor is larger: **TurboFan vs Liftoff measures 2.108x on this exact
+> corpus** (318 of these same blocks, census-weighted, offline, arms interleaved).
+> The two are multiplicative, not competing.
+>
+> Three things that land directly on this section:
+> 1. **The `[13]` self-time share used below was measured through
+>    `dolphin_render_probe.js`, which forces `--no-liftoff` (`:159`) — a V8 flag the
+>    shipping page cannot have.** The ceiling arithmetic is unaffected (it is a
+>    ratio), but every *absolute* guest rate it divides into is optimistic; offline
+>    replication sizes that gap at 1.164x.
+> 2. **Block merging is worth more than the 1.16x priced below.** V8's tier-up
+>    threshold is `13,000,000 / code_body_bytes` executions (measured, exact), so an
+>    N-way merge also crosses into TurboFan ~N times sooner and drags part of the
+>    cold tail over the line. That term is absent from the by-length table's pricing.
+> 3. **The "i32.const is ~free after the backend" hypothesis below now has a
+>    mechanism.** What an op costs depends on which compiler consumed it — and the
+>    compiler that does the folding is a 2.108x factor on the same op stream. That is
+>    consistent with why every op-count lever here has measured null.
+
 ### Verdict
 
 **SAB's remaining 2.29x is NOT recoverable from inside the emitted block bodies.**

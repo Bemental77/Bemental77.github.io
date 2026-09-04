@@ -522,7 +522,47 @@ clang++ -O2 -mexec-model=reactor \
     -fno-exceptions
 ```
 
-### Verified: V8 Liftoff is the only tier our blocks ever reach
+### ☠ REFUTED BY MEASUREMENT 2026-09-04: "Liftoff is the only tier our blocks ever reach"
+
+> **This section's conclusion is FALSE and the section is kept only for provenance.**
+> It was headed "Verified" but every bullet below is read from a V8 *blog post*,
+> not measured against this tree's blocks. Measured on node 24.15.0 (V8, disassembler
+> compiled in) over the 323 real emitted SAB block modules that
+> `gamecube/bementalJIT/tools/op_census.cpp` produces:
+>
+> - A real emitted block (`80022e0c.wasm`, the live per-block shape: 13 imports,
+>   `run` exported at function index 13, instantiated with synchronous
+>   `new WebAssembly.Module(bytes)`) reports **`compiler: TurboFan`** under
+>   `--print-wasm-code` after enough calls. It tiers up.
+> - Replicating the live many-module shape (323 separate Module+Instance pairs,
+>   census-weighted round-robin, 30M total executions), **260 of 323 modules
+>   reached TurboFan** under default V8.
+> - The bullet "TurboFan tier-up only happens for streaming-compiled modules —
+>   synchronous `new WebAssembly.Module(bytes)` generally stays at Liftoff" is the
+>   specific load-bearing error. Tier-up is not a function of the compile API. It is
+>   governed by **`--wasm-tiering-budget` (default 13,000,000, "rough approximation
+>   of bytes executed")**, charged per function against its own code-body size.
+> - The "**>= 128KB**" bullet is about TurboFan **code caching** across page loads,
+>   which is a different mechanism from dynamic tier-up. It does not gate tier-up.
+>
+> **The measured tier-up threshold is `13,000,000 / code_body_bytes` executions**,
+> confirmed on three blocks spanning a 275x size range — each crossed inside the
+> predicted bracket:
+>
+> | block | code body | predicted | measured threshold |
+> |---|---:|---:|---|
+> | `80022eec` | 223 B | 58,295 | between 40,000 and 58,000 ✅ |
+> | `80022e0c` | 431 B | 30,162 | between 20,000 and 30,000 ✅ |
+> | `80169d00` | 61,390 B | 211 | between 100 and 200 ✅ |
+>
+> See `gamecube/docs/wasm-tier/TASKS.md` for what the tier is worth (2.108x on
+> emitted bodies) and for the measurement-validity problem this uncovered in
+> `dolphin_render_probe.js`.
+>
+> The Liftoff *characterisation* below (no load elimination, no inlining, memory-base
+> reload) is accurate for code that is still in Liftoff, and the per-block tail that
+> never crosses its budget genuinely is Liftoff-only. Only the "no tier-up, ever"
+> conclusion is refuted.
 
 From V8 official wasm compilation pipeline doc + V8 code caching blog:
 - All freshly-compiled WASM modules go to Liftoff first (one-pass, fast)
@@ -538,6 +578,12 @@ From V8 official wasm compilation pipeline doc + V8 code caching blog:
 Per-block JIT consequence: each block module is sub-KB to a few KB. They
 will be Liftoff-only for their entire lifetime. **There is no TurboFan
 tier-up for our JIT'd blocks**, no matter how hot they get.
+<!-- ^^^ REFUTED 2026-09-04, see the box at the top of this section. Blocks DO
+     tier up; the threshold is 13,000,000 / code_body_bytes executions. The real
+     consequence of "sub-KB block bodies" is the OPPOSITE of what this paragraph
+     says: a SMALL body raises the execution count needed to tier up, so the
+     per-block shape delays tier-up rather than preventing it. -->
+
 
 This is significant because Liftoff:
 - Cannot do redundant load elimination across instructions
