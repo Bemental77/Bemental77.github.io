@@ -97,9 +97,40 @@ static inline int gk_ok(uint32_t p, uint32_t n) {
 #define GK_L1_SIZE    0x00040000u          /* 256 KB locked L1  (Memmap.h:253) */
 #define GK_WPAR_LO    0xCC008000u
 #define GK_WPAR_SIZE  0x00001000u          /* 4 KB around WPAR */
-#define GK_TAIL_SIZE  (GK_L1_SIZE + GK_WPAR_SIZE)
 #define GK_L1_OFF     (g_ram_size)
 #define GK_WPAR_OFF   (g_ram_size + GK_L1_SIZE)
+
+/* ------------------------------------------------- THE HARDWARE REGISTER WINDOW
+   -DSR_MMIO ONLY.  ADDITIVE AND DEFAULT-OFF: with it undefined every macro and
+   every emitted access below is byte-for-byte what it was, so no fixture, no
+   golden vector and no slice build changes.  It exists for the WHOLE-IMAGE BOOT
+   build (build_image.sh), which is the first build here to run `__start` and
+   therefore the first to touch a device register at all -- a fixture captured
+   mid-scene never does.
+
+   0xCC000000..0xCC008000 is the 32 KB of GameCube device registers: CP 0xCC000000,
+   PE 0xCC001000, VI 0xCC002000, PI 0xCC003000, MI 0xCC004000, DSP+AI 0xCC005000,
+   DI 0xCC006000, SI 0xCC006400, EXI 0xCC006800, AI 0xCC006C00.  WPAR at
+   0xCC008000 is deliberately NOT in this range -- it keeps its own arm above,
+   because it is a write-only FIFO port and this window is not.
+
+   WHAT THIS IS AND IS NOT.  It is a BACKING BUFFER, not a device model: a read
+   returns the last value written (or 0), and nothing here completes a DVD
+   command or advances a VI line counter.  That is stated so nobody reads a boot
+   that gets further with -DSR_MMIO as evidence that the hardware is emulated.
+   Its ONE correctness claim is the same one the locked-cache arm makes: without
+   a named window, gk_phys(0xCC002000) = 0x0C002000 leaves MEM1's 24 MB bound, so
+   the access FAULTS -- which is at least loud.  The far worse case is a register
+   in a range that masks back INTO MEM1; keeping the whole window named means no
+   device access can ever silently corrupt guest memory. */
+#ifdef SR_MMIO
+#define GK_HWREG_LO   0xCC000000u
+#define GK_HWREG_SIZE 0x00008000u          /* 32 KB of device registers */
+#define GK_HWREG_OFF  (g_ram_size + GK_L1_SIZE + GK_WPAR_SIZE)
+#define GK_TAIL_SIZE  (GK_L1_SIZE + GK_WPAR_SIZE + GK_HWREG_SIZE)
+#else
+#define GK_TAIL_SIZE  (GK_L1_SIZE + GK_WPAR_SIZE)
+#endif
 
 /* FALSIFICATION SWITCH -- build with -DSR_NO_LC_MODEL for the CONTROL ARM.  It drops
    the locked-cache arm only, so an 0xE00000xx access aliases into MEM1 exactly as it
@@ -124,6 +155,18 @@ static inline int gk_tail(uint32_t ea, uint32_t n, uint32_t *p) {
         *p = GK_WPAR_OFF + (ea & (GK_WPAR_SIZE - 1u));
         return 1;
     }
+#ifdef SR_MMIO
+    /* Tested AFTER WPAR so the WPAR arm keeps priority even if the ranges are ever
+       made to overlap; tested BEFORE the mask for the reason in the long note at
+       the top of this section -- a named window is decided by its EFFECTIVE
+       address.  n is not bounds-checked against the window end because the guest
+       cannot straddle 0xCC008000 with a single aligned access and WPAR owns the
+       next page anyway. */
+    if ((ea & ~(GK_HWREG_SIZE - 1u)) == GK_HWREG_LO) {
+        *p = GK_HWREG_OFF + (ea & (GK_HWREG_SIZE - 1u));
+        return 1;
+    }
+#endif
     return 0;
 }
 #define GK_MAP(ea, n, p, fail)  do {                                           \
@@ -134,7 +177,11 @@ static inline int gk_tail(uint32_t ea, uint32_t n, uint32_t *p) {
     } while (0)
 /* WPAR ONLY.  A store to the write-gather pipe is not a memory change anyone can
    compare; a store to the locked cache is, and is logged like any other. */
-#define GK_IS_WPAR(p) ((p) >= GK_WPAR_OFF)
+/* Bounded on BOTH sides rather than just the low end.  Without -DSR_MMIO the WPAR
+   page is the last thing in the tail, so the upper bound is unreachable and this is
+   byte-for-byte the old `(p) >= GK_WPAR_OFF`; with it, the device-register window
+   sits above WPAR and must NOT be silently reclassified as the write-gather pipe. */
+#define GK_IS_WPAR(p) ((p) >= GK_WPAR_OFF && (p) < GK_WPAR_OFF + GK_WPAR_SIZE)
 
 // ------------------------------------------------- differential-verify hooks
 // Compiled in ONLY under -DSR_VERIFY (the fixture harness); the shipping runtime
@@ -188,10 +235,40 @@ static inline void gk_w_post(uint32_t p, uint32_t n){
 #define GK_RD(p, n)  gk_rd_chk((p), (n))
 #define GK_WPRE(p, n)  gk_w_pre((p), (n))
 #define GK_WPOST(p, n) gk_w_post((p), (n))
+#ifdef SR_MMIO
+#error "-DSR_VERIFY and -DSR_MMIO are mutually exclusive: SR_VERIFY owns GK_RD/GK_WPOST for \
+the differential's staged-read and ordered-write instruments, and SR_MMIO needs the same two \
+hooks for device semantics. A fixture replay has no device window and a boot has no capture to \
+diff, so nothing needs both -- but a build that silently got one instrument instead of the other \
+would produce a plausible wrong answer, which is what this stops."
+#endif
+#else
+#ifdef SR_MMIO
+/* -------------------------------------------------- DEVICE HOOKS (-DSR_MMIO only)
+   The SAME two hook points the differential build uses for its staged-read and
+   ordered-write instruments, reused here for the thing a BOOT needs and a fixture
+   never does: a device register that is not just memory.
+
+   WHY A HOOK AND NOT A BACKING BUFFER.  Measured 2026-09-04 on the whole-image build
+   (wasm md5 0464002e...): SAB's `__OSReadROM` -> EXIImm/EXISync wedges FOREVER at
+   0x800e6494, polling EXI channel 0's CR register at 0xCC00680C for TSTART (bit 0) to
+   clear.  On hardware the EXI controller clears it when the transfer finishes.  Against
+   a plain backing buffer it stays set, and the guest spins.  The boot cannot get past
+   the SRAM read without SOMETHING clearing that bit.
+
+   Cost, stated plainly: one compare against the device window on every guest load and
+   every guest store.  That is not free, and it is why this is -DSR_MMIO-gated and why
+   no measurement build should define it. */
+extern void gk_dev_read (uint32_t p, uint32_t n);
+extern void gk_dev_write(uint32_t p, uint32_t n);
+#define GK_RD(p, n)    do { if ((p) >= GK_HWREG_OFF) gk_dev_read((p), (n)); } while (0)
+#define GK_WPRE(p, n)  ((void)0)
+#define GK_WPOST(p, n) do { if ((p) >= GK_HWREG_OFF) gk_dev_write((p), (n)); } while (0)
 #else
 #define GK_RD(p, n)    ((void)0)
 #define GK_WPRE(p, n)  ((void)0)
 #define GK_WPOST(p, n) ((void)0)
+#endif
 #endif
 
 // ------------------------------------------------------- big-endian guest memory

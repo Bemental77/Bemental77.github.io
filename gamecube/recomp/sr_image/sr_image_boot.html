@@ -1,0 +1,88 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SAB static-recomp — whole-image boot</title>
+<style>
+  body { background:#0b0d11; color:#d7dce3; font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; margin:0; padding:18px 22px; }
+  h1 { font-size:15px; font-weight:600; margin:0 0 2px; color:#f0f3f7; }
+  .sub { color:#7c8794; margin:0 0 16px; }
+  button { background:#1b212b; color:#d7dce3; border:1px solid #2f3846; border-radius:5px;
+           padding:6px 12px; font:inherit; cursor:pointer; margin-right:8px; }
+  button:hover { border-color:#4a5768; }
+  #out { white-space:pre-wrap; margin-top:14px; }
+  .REAL{color:#6ee7a8} .VOID{color:#8ab4f8} .UNIMPL{color:#ff8f80} .OS{color:#e0c184}
+  .k{color:#7c8794}
+</style>
+<h1>Sonic Adventure 2 Battle — statically recompiled whole image</h1>
+<p class="sub">
+  4,668 of 4,741 <code>main.dol</code> functions translated to C by <code>gamecube/recomp/sr/sr.py</code>
+  and linked as one wasm module. This page runs the guest's own <code>__start</code>.
+  <b>It is not an emulator</b>: no device is modelled, so nothing here renders.
+  The output is the ordered host-boundary trajectory and the point the boot reached.
+</p>
+<button id="walk">walk __start's callees (one at a time)</button>
+<button id="whole">run __start whole (may never return)</button>
+<div id="out"></div>
+<script>
+const out = document.getElementById('out');
+function line(html, cls) {
+  const d = document.createElement('div');
+  if (cls) d.className = cls;
+  d.innerHTML = html;
+  out.appendChild(d);
+}
+function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+// Published for the probe (gamecube/tools/sr_image_probe.mjs) so it reads structured
+// data instead of scraping this page's text.
+window.__srImage = { messages: [], done: false, error: null };
+
+function run(mode, walkList) {
+  out.textContent = '';
+  window.__srImage = { messages: [], done: false, error: null };
+  const w = new Worker('./sr_image_worker.js', { type: 'module' });
+  w.onerror = (e) => {
+    window.__srImage.error = e.message || String(e);
+    window.__srImage.done = true;
+    line('<b class="UNIMPL">worker error:</b> ' + esc(e.message || e), 'UNIMPL');
+  };
+  w.onmessage = (e) => {
+    const m = e.data;
+    window.__srImage.messages.push(m);
+    if (m.kind === 'status') line('<span class="k">·</span> ' + esc(m.text));
+    else if (m.kind === 'ready') {
+      line('<b>image up.</b> entry=' + m.entry + '  dol=' + m.dolBytes + 'B  copied=' + m.copied +
+           'B  MEM1=' + m.ramSize + '  tail=' + m.tailSize);
+      line('<span class="k">FST: ' + esc(JSON.stringify(m.fst)) + '</span>');
+      line('<span class="k">' + m.globals.length + ' low-memory globals staged (each cited in the worker)</span>');
+    }
+    else if (m.kind === 'step-enter') line('<span class="k">→ entering</span> ' + m.addr + '  ' + esc(m.what));
+    else if (m.kind === 'step-done')
+      line('  <b>' + m.addr + '</b> returned=' + m.returned + '  ' + m.ms.toFixed(1) + 'ms  boundary=' + m.logN +
+           (m.threw ? '  <span class="UNIMPL">THREW ' + esc(m.threw.split('\n')[0]) + '</span>' : ''));
+    else if (m.kind === 'done') {
+      window.__srImage.done = true;
+      line('');
+      line('<b>run finished</b>  mode=' + m.mode + '  ' + m.ms.toFixed(1) + 'ms  fault=' + m.fault +
+           (m.threw ? '  THREW' : ''));
+      if (m.threw) line('<span class="UNIMPL">' + esc(m.threw.split('\n').slice(0,3).join('\n')) + '</span>');
+      if (m.log && m.log.distinct) {
+        line('');
+        line('<b>host boundary — ' + m.log.total + ' crossings, ' + m.log.distinct.length +
+             ' distinct addresses' + (m.log.dropped ? ', ' + m.log.dropped + ' dropped' : '') + '</b>');
+        for (const d of m.log.distinct.slice(0, 60))
+          line('   ' + d.addr + '  <span class="' + d.disp + '">' + d.disp.padEnd(7) + '</span> x' + d.n);
+      }
+    }
+    else if (m.kind === 'error') {
+      window.__srImage.done = true;
+      window.__srImage.error = m.message;
+      line('<b class="UNIMPL">error:</b> ' + esc(m.message), 'UNIMPL');
+      line('<span class="k">' + esc(m.stack) + '</span>');
+    }
+  };
+  w.postMessage(Object.assign({ cmd: 'boot', base: './', mode, walkList }, window.__srImageArm || {}));
+}
+document.getElementById('walk').onclick = () => run('walk');
+document.getElementById('whole').onclick = () => run('whole');
+window.__srImageRun = run;
+</script>

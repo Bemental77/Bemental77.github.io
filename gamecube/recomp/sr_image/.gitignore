@@ -1,0 +1,28 @@
+# Build outputs of gamecube/recomp/sr/build_image.sh, and the disc-derived inputs it
+# needs. NOT tracked, for three separate reasons — each of which has bitten this repo:
+#
+# 1. SIZE + LFS + GITHUB PAGES. The repo's .gitattributes routes `*.wasm` and `*.bin`
+#    through Git LFS, and **GitHub Pages does not resolve LFS pointers** — it serves the
+#    133-byte pointer file as if it were the asset. That is exactly how the Dreamcast
+#    Track3 disc parts shipped broken on day one (commit ffa15b3, "Pages served pointers,
+#    the game crashed at boot"). sab_image.wasm is ~44 MB; putting it through LFS would
+#    reproduce that failure, and putting it in git directly would add 44 MB per rebuild.
+#
+# 2. REGENERABLE IN ONE COMMAND, from tracked sources:
+#       bash gamecube/recomp/sr/build_image.sh "gamecube/roms/Sonic Adventure 2 - Battle (USA).iso"
+#    sr_gen.c (33 MB) and sr_dispatch.c are sr.py output, not hand-written code. Tracking
+#    generated C would make every translator change a 33 MB diff nobody can review.
+#
+# 3. sab_main.dol AND sab_fst.bin ARE DISC CONTENT — the executable and the file system
+#    table lifted out of the retail ISO, which .gitignore:73 already excludes.
+#
+# What IS tracked here: sr_image_worker.js, sr_image_boot.html and this file. The build
+# script, the host layer (../sr/sr_image.c) and the probe (../../tools/sr_image_probe.mjs)
+# live outside this directory and are tracked there.
+sab_image.mjs
+sab_image.wasm
+sab_main.dol
+sab_fst.bin
+sr_gen.c
+sr_dispatch.c
+skiplist.json

@@ -26,6 +26,7 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **whole-image throughput** | ⛔ **NO VALID NUMBER — `0.50-0.54x`, `0.62x` and `0.676x` are all VOID, §8.6e.** `HandleReverb` is **not bit-exact** (308 spurious writes to a page the guest only reads), and `perf_browser.mjs`'s restore set does not cover them, so **rep 1 of ~160,000 timed invocations is the only one computing native's answer**. Direction of the error unknown — do not apply a correction factor. |
 | **JIT baseline, re-measured** | **0.3781x delivered / 141.6 MHz executed / 23.2% idle-skipped**, stock V8, n=3, cross-witness spread ≤0.0005. **1.000x costs 373.5 MHz on this scene → the JIT is 2.64x short.** §8.6b |
 | ~~JIT baseline `0.4450x`~~ | **RETRACTED, §8.6c** — a 75 s cold boot read over one 40 s window; re-reading that band from four fresh runs of ONE frozen binary returns **0.3338x–0.5097x**. The V8-tier mismatch §8.1 warned about measures **null on both engines** (§8.6d) and was the least of its defects. |
+| **WHOLE-IMAGE BOOT IN A BROWSER** | **LINKS, INSTANTIATES, AND EXECUTES GUEST CODE** — wasm md5 `0464002e92cecfaa3c1202484286249b`. `__start` → `__init_registers` → `__init_hardware` → `__init_data` → `DBInit` all return **fault-free**; 16 more guest functions clear inside `OSInit`. It stops in **`EXISync` (`0x800e6494`)**, spinning on EXI `TSTART` at `0xCC00680C` — **no device model and no interrupt delivery**, not a translator bug. **Nothing renders and no `drawn/s` is claimed.** §10 |
 | **guest OS CONTEXT SWITCH** | **WORKS** — 63 assertions / 0 failures, incl. a three-thread non-LIFO rotation on three real host threads and a control arm that reproduces `0xe00e78ac` with the host layer off. §6 (superseded there) and [`recomp/sr/CONTEXT_SWITCH.md`](../../recomp/sr/CONTEXT_SWITCH.md) |
 
 The two 2026-09-02 additions each came from a **harness** defect, not a translator one,
@@ -2540,6 +2541,217 @@ between the newly-unblocked set and either committed survey), because the offlin
 gate excluded all 499 from every arm list ever built. Capturing them needs a new
 oracle run, and the constraint on that is the one §9.6 already named — the scene,
 not the rig.
+
+## 10. THE WHOLE-IMAGE BOOT — it runs in a browser, and it stops at the first device
+
+Everything above this section is a **fixture**: one function, or one closure, staged from
+a native-Dolphin capture, run once, diffed. A fixture never executes `__start`, never
+touches a device register, and never needs a value the hardware boot left in low memory.
+This section is the first thing here that does.
+
+New, all landed together:
+
+| file | what it is |
+|---|---|
+| `recomp/sr/build_image.sh` | the whole-image build. `--all --indirect --jumptables --dispatch-out`, the 13-address guest-OS `--host` set, `-DSR_MMIO`, linked `-sENVIRONMENT=web,worker`. `SR_FNS="<addrs>"` is a seconds-long bring-up arm that builds one closure through the identical host layer and flags. |
+| `recomp/sr/sr_image.c` | the boot host layer: DOL loader, SPR file, timebase, FPU-context copy, the device boundary, the boundary log |
+| `recomp/sr_image/sr_image_worker.js` | the browser module worker: fetches `main.dol`, stages low memory, drives the guest |
+| `recomp/sr_image/sr_image_boot.html` | standalone bring-up page |
+| `tools/sr_image_probe.mjs` | the probe. `SRP_MODE=walk\|whole`, `SRP_WALK=<addr[:3=v+4=v]>,…`, `SRP_EXI=0`, `SRP_WATCHDOG=N`, `SRP_STRICT=1` |
+| `gamecube.html` | `?srimage=1` routing (`GcRate.routeImage`), 9 new `?ratetest=1` assertions — 21j…21r |
+
+`gekko_rt.h` is shared with every fixture in this directory, so the two additions to it
+(the device window and the device hooks) are **`-DSR_MMIO`-gated and proven inert**
+rather than argued to be. Compiling `sr_driver.c` and `sr_host_os.c` at `-O2` against
+`HEAD`'s header and against the edited one gives **byte-identical object files** in both
+existing modes:
+
+| TU | mode | md5 (HEAD) | md5 (edited) |
+|---|---|---|---|
+| `sr_driver.c` | `-DSR_VERIFY` | `4ec9c15943b7…` | `4ec9c15943b7…` |
+| `sr_host_os.c` | `-DSR_VERIFY` | `b0a34dfd32b9…` | `b0a34dfd32b9…` |
+| `sr_driver.c` | plain | `6acf7f22067d…` | `6acf7f22067d…` |
+| `sr_host_os.c` | plain | `130167114355…` | `130167114355…` |
+
+The two are also made **mutually exclusive by `#error`**: `SR_VERIFY` owns `GK_RD`/
+`GK_WPOST` for the differential's staged-read and ordered-write instruments, and
+`SR_MMIO` needs the same two hooks for device semantics. Nothing needs both — but a
+build that silently got one instrument instead of the other would produce a plausible
+wrong answer.
+
+### 10.1 What was measured
+
+Build: `-O1`, wasm **44,087,406 B, md5 `0464002e92cecfaa3c1202484286249b`**, identical
+before and after every run below. 4,668 of 4,741 functions (98.46%) / 372,613 of 374,807
+instructions (99.41%) translated; 73 host-bound or refused.
+
+| acceptance step | result |
+|---|---|
+| 1. the image LINKS | **YES** — 0 errors, 3 warnings |
+| 2. the worker INSTANTIATES in a browser | **YES** — Chrome, module worker, `main.dol` 1,960,192 B laid into a 25,165,824 B MEM1, entry `0x80003140` |
+| 3. guest code EXECUTES | **YES** — see the trajectory below |
+| 4. something RENDERS | **NO**, and the cause is named in §10.2 |
+| 5. `drawn/s` nonzero | **NO.** Not claimed. There is no renderer on this path at all. |
+
+**`__start`'s own callee sequence, one call at a time** (`SRP_MODE=walk`; the sequence is
+exact because `__start` is straight-line on this boot — both its branches test
+`0x800000F4`, which is 0 on a retail boot):
+
+| # | guest fn | result |
+|---|---|---|
+| 1 | `0x80003254` `__init_registers` | returns, **fault 0**, r1 = `0x803c1450` |
+| 2 | `0x80003330` `__init_hardware` | returns, **fault 0**, 22 boundary crossings |
+| 3 | `0x80003270` `__init_data` | returns, **fault 0** — the `.data` copy + `.bss` clear loops ran |
+| 4 | `0x800ecf08` `DBInit` | returns, **fault 0** |
+| 5 | `0x800e362c` `OSInit` | **NEVER RETURNS** |
+
+Walking `OSInit`'s own callees (weaker instrument — a standalone call sees the previous
+step's registers, not its caller's arguments; noted as such in the worker) puts **16
+consecutive guest functions through fault-free** and lands the hang precisely:
+
+```
+0x800ecb68 ✓  0x800e4b20 ✓  0x800e4b18 ✓  0x800e3970 ✓  0x800eb8dc ✓  0x800e3d84 ✓
+0x800e888c ✓  0x800e7928 ✓  0x800e78f8 ✓  0x800e5ba8 ✓  0x800e5294 ✓  0x800e71b4 ✓
+0x800ea98c ✓  →  0x800e9778  HANGS
+```
+
+`0x800e9778` is `__OSReadROM`, the SRAM read, and it is straight-line — no backward
+branch — so the hang is in a callee. Walking those with the real arguments staged into
+the GPRs (`EXILock(0,1,0)`, `EXISelect(0,1,3)`, `EXIImm(0,…)`, `EXISync(0)`) isolates it
+to one function.
+
+### 10.2 What stops it: **`EXISync` at `0x800e6494`**, and it is not a translator bug
+
+```
+800e6678  lwz    r0, 12(r31)          ; software channel state, MEM1 0x802CA88C
+800e667c  rlwinm r0, r0, 0, 29, 29    ; bit 0x4 = "transfer pending"
+800e6680  bne    0x800e64cc
+800e64cc  lwz    r0, 12(r29)          ; EXI channel 0 CR, MMIO 0xCC00680C
+800e64d0  rlwinm r0, r0, 0, 31, 31    ; bit 0x1 = TSTART
+800e64d4  bne    0x800e6678           ; ...forever
+```
+
+Two layers, one root cause. `EXIImm` starts a transfer; on hardware the EXI controller
+clears `TSTART` when it completes and then raises the EXI **interrupt**, whose handler
+clears the software "pending" bit. **This runtime has neither a device model nor any
+interrupt delivery**, so both bits stay set and the guest spins.
+
+Note what this is *not*. The translation is not implicated: the loop is a faithful
+translation of a loop that on real hardware exits because a *device* changed a word.
+`sr.py`'s GAP class is still zero. The blocker moved from **translation** to **the
+machine around it** — which is the same wall §9.6 predicted from a different direction.
+
+### 10.2a The fix, and its falsifying control arm — MEASURED
+
+Modelling EXI `TSTART` as **self-clearing** — an EXI device with zero latency, a statement
+about timing that invents no bytes — unblocks it. Measured on a `SR_FNS` closure build of
+`__OSReadROM` (32 functions, 1,699 instructions), wasm md5
+**`b0fcb5e4ae664696f5598cc555c58bff`**, and **both arms are the same binary with the same
+md5**, switched at run time by `sr_image_set_exi_model()`:
+
+| arm | `__OSReadROM` (`0x800e9778`) | device reads | TSTART clears |
+|---|---|---|---|
+| **model ON** | **returns, fault 0, r3 = 1, 2.0 ms** | 8 | **2** |
+| **model OFF** (control) | **NEVER RETURNS** — watchdog fired | **3,000,001** | **0** |
+
+The control is what makes the first row mean anything: the pass is caused by the model and
+nothing else, and no relink stands between the two readings. The register inventory shows
+the same thing from the other side — the ON arm's last two events are
+`0xcc00680c EXI-model-cleared-TSTART` followed by the guest's read of it, while the OFF
+arm's inventory simply stops at that read and never grows again.
+
+It also demonstrates the watchdog: the OFF arm ended at exactly `watchdog + 1` device
+reads with its log intact, instead of hanging the worker and reporting nothing.
+
+### 10.2b With EXI modelled, the boot advances — and the next two walls are named
+
+Same technique, a larger closure build (`OSInit` + its callee graph: 86 functions, 5,409
+instructions, wasm md5 **`c74e60e06dadce2860865e33ed249388`**). `OSInit` now reaches
+**27 distinct hardware registers** across **PI, MI, SI, DI, EXI and DSP/AI** — it was
+0 before, because it never got past the SRAM read. Walking its callees:
+
+| guest fn | | result |
+|---|---|---|
+| `0x800e9778` | `__OSReadROM` | **now returns** — fault 0, r3 = 1 (was the wedge) |
+| `0x800eb940` | `__OSThreadInit` | returns, but faults `0xC60E579C` |
+| `0x800e4b74` | `__OSInitAudioSystem` | **WEDGES** — watchdog, r3 left at `0xCC005000` |
+
+**Wall 2 — DSP.** `__OSInitAudioSystem` polls a DSP register in the `0xCC005000` block
+(last first-touch: a write to `0xCC005012`). Identical class to EXI: a device register
+that hardware changes and this runtime does not. It is the next device along, not a new
+kind of problem.
+
+**Wall 3 — the guest-OS context primitives, and this one is a build-mode gap, not a
+missing device.** `0xC60E579C` decodes as `SR_F_IMG_UNIMPL | 0x0E579C` → `0x800E579C`
+`OSClearContext`, with `0x800E55D4` `OSSetCurrentContext` right behind it. Both ARE
+implemented in `sr_host_os.c` — but `sr_host_call()` returns 0 for the whole context
+family when `g_mode == SR_OS_IRQ`, which is the mode this build installs
+(`sr_os_init_irq()`, no `-pthread`). They belong to `SR_OS_HLE`, the mode that owns
+`SelectThread` and needs one host thread per guest thread. **So the context-switch work
+in §6 / `CONTEXT_SWITCH.md` is not merely compatible with the boot — the boot reaches
+the exact point that needs it, 124 host-boundary crossings in.** Linking the image
+`-pthread` and calling `sr_os_init()` instead of `sr_os_init_irq()` is the change.
+
+### 10.3 Three things that came free with the run
+
+1. **The `OSDisableInterrupts` host boundary carries real traffic.** 108 host-boundary
+   crossings were recorded before the hang: **34 × `OSDisableInterrupts`**, **34 ×
+   `OSRestoreInterrupts`**, 13 × `OSGetTime`, 15 × the `PPCMf*/PPCMt*` SPR accessors,
+   4 × the cache-control no-ops, 3 × the TRK MSR pair. §9.3 sized that boundary
+   statically at 745 blocked functions; this is it executing.
+2. **A hang no longer costs the evidence.** The first `OSInit` probe recorded 100
+   boundary crossings and returned *none* of them, because the log was posted only from
+   the `done` message that a wedged call never sends. The worker now posts the log after
+   every step, and the C layer has a device-access watchdog that throws out of the module
+   — the only way to stop a running guest here (no `-pthread`, no Asyncify, no interrupt,
+   and `sr.py`'s bodies have no fault check between instructions: `grep g_fault` on the
+   generated file finds one `#define` and no reads).
+3. **A boundary crossing is the only observable.** A guest `bl` is a host C call, so
+   there is no PC to poll. The trajectory in §10.1 is a *boundary* trajectory, and every
+   number here should be read as one.
+
+### 10.4 Honest inventory of the host layer
+
+`sr_image.c` puts every host address in exactly one of three states, machine-readable at
+run time. The third is the point:
+
+- **REAL** — `__init_hardware`, `__OSPSInit` (GQRs cleared, which is the *only* mode
+  `gekko_rt.h`'s paired-single code implements), the SPR accessors (decoded from the
+  shipped instruction word, not a hardcoded table), `OSGetTime`/`OSGetTick` (host
+  monotonic at 40.5 MHz, **1:1 with wall time — gate #9 forbids scaling it**),
+  `__OSSaveFPUContext`/`__OSLoadFPUContext`.
+- **VOID** — 13 cache-control functions. Not a shortcut: MEM1 here is one flat buffer
+  with no cache and no address translation, so `DCEnable` has no state to change. The one
+  thing this does *not* cover is `DCInvalidateRange` before re-reading a DMA-written
+  buffer, and that is written down in the source rather than discovered later.
+- **UNIMPL** — everything else **faults and names itself**, and `SRP_STRICT=1` makes the
+  first one throw. This is deliberate contrast with `gamecube/recomp/`'s MP4 host layer,
+  which resolved 127 of 136 imports through `default: return 0` and shipped with **no
+  audio at all** because nothing could see it from the inside.
+
+Two fidelity gaps are recorded rather than papered over: the FST is staged at the disc's
+own `0x803EDE20` while `arenaLo` is left 0 (so SAB's arena starts *below* the FST — the
+apploader would have set it past), and the device window is a backing buffer, not a
+device model.
+
+### 10.5 The next things to build, named and ordered
+
+Not more translation — the translator's GAP class is still zero and 99.41% of `.text` is
+in the image. Three items, in the order the boot hits them:
+
+1. **A device layer.** EXI proved the shape of the fix in ~40 lines and one falsifying
+   control; DSP is next (§10.2b), then DI, VI and SI. The `sr_image_dev_log` inventory
+   makes this list measured rather than guessed — 27 registers across six blocks are
+   already recorded, and the register a wedged run last touched names the next one.
+2. **`SR_OS_HLE` instead of `SR_OS_IRQ`** — link the image `-pthread` and call
+   `sr_os_init()`. §6 and `CONTEXT_SWITCH.md` already built and verified this (63
+   assertions / 0 failures); the boot reaches `__OSThreadInit` and asks for it.
+3. **An interrupt path.** Even a fully modelled device is only half of it: `EXISync`'s
+   *other* poll is on a software flag that only the EXI **interrupt handler** clears, and
+   `__OSInterruptInit` ran cleanly while nothing will ever call its handlers. Modelling a
+   device without delivering its interrupt buys one poll loop, not a boot.
+
+Only after those does "something renders" become a question about the renderer.
 
 ## 7. Decision
 

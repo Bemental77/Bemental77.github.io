@@ -1058,6 +1058,70 @@ window.GcRate = (function () {
              reason: 'auto: ' + romBase + ' has no recomp build — JIT path' };
   }
 
+  // [engine-routing 2026-09-04] A THIRD ENGINE: the SAB STATIC-RECOMP IMAGE.
+  //
+  //   srimage  Sonic Adventure 2 Battle's own main.dol, BINARY-translated to C by
+  //            gamecube/recomp/sr/sr.py (4,668 of 4,741 functions, 99.41% of .text)
+  //            and linked as one wasm module by gamecube/recomp/sr/build_image.sh.
+  //            It is NOT the recomp engine above: `recomp` compiles Mario Party 4's
+  //            DECOMPILED C, and no decomp of SAB exists (docs/static-recomp-sab
+  //            README §1, verified negative), which is why this one starts from the
+  //            shipped binary instead.
+  //
+  // ⚠ THIS IS OPT-IN ONLY AND MUST STAY THAT WAY UNTIL IT RENDERS. route() above puts
+  // MP4 on the recomp engine for a plain visitor because that engine RUNS THE GAME at
+  // 1.000x/60. This one runs SAB's `__start` and models NO DEVICE — no VI, no DI, no
+  // interrupt source — so a visitor auto-routed here would get a blank page instead of
+  // the JIT boot that at least shows the title. An engine becomes a routing default the
+  // day it beats the one it replaces, not the day it exists.
+  //
+  // The precedent for pinning is the ?recomp=1 lesson recorded above: forcing an engine
+  // under a disc it cannot run parked THAT game's CPU and streamed the wrong frames over
+  // its renderer. So forcing implies pinning here too.
+  //
+  // Pure function of (srParam, recompParam, romBase) so ?ratetest=1 can assert the whole
+  // table with no emulator and no worker.
+  var SRIMAGE_TITLES = { SonicAdventure2Battle: 1 };
+  function routeImage(srParam, recompParam, romBase) {
+    if (srParam !== '1' && srParam !== '0' &&
+        srParam !== null && srParam !== undefined && srParam !== '')
+      return { mode: 'auto', engage: false, pin: false,
+               warn: 'ignoring malformed ?srimage=' + srParam + ' (only 1 and 0 are meaningful)',
+               reason: 'malformed ?srimage= — not engaging an engine on an unparseable value' };
+    if (srParam !== '1')
+      return { mode: 'auto', engage: false, pin: false, warn: null,
+               reason: 'the SAB static-recomp image is opt-in (?srimage=1); it renders nothing yet' };
+    // Both engines forced at once is a conflict, and silently picking one would make the
+    // A/B arm meaningless. recomp wins because it is the one that ships a playable title.
+    if (recompParam === '1')
+      return { mode: 'conflict', engage: false, pin: false,
+               warn: '?srimage=1 ignored: ?recomp=1 is also set and pins the ROM to Mario Party 4',
+               reason: '?recomp=1 and ?srimage=1 conflict — recomp wins (it is the shipping engine)' };
+    if (romBase === null || romBase === undefined || romBase === '')
+      return { mode: 'forced', engage: true, pin: true, warn: null,
+               reason: '?srimage=1 — SAB static-recomp image forced; ROM pinned to Sonic Adventure 2 Battle' };
+    if (SRIMAGE_TITLES[romBase])
+      return { mode: 'forced', engage: true, pin: true, warn: null,
+               reason: '?srimage=1 — SAB static-recomp image forced for ' + romBase };
+    // NEVER MOVE A TITLE OFF AN ENGINE THAT ALREADY RUNS IT AT 1.000x. This arm was
+    // written the other way first — pin unconditionally — and ?ratetest=1 test 21q
+    // caught it: with Mario Party 4 selected, ?srimage=1 pinned the ROM away from the
+    // one engine on this page that runs a game at hardware rate, onto one that renders
+    // nothing. A debug flag is allowed to be worse than the default; it is not allowed
+    // to silently take the best path away.
+    if (RECOMP_TITLES[romBase])
+      return { mode: 'refused', engage: false, pin: false,
+               warn: '?srimage=1 refused for ' + romBase + ': it already runs on the recomp engine at '
+                   + '1.000x, and the static-recomp image renders nothing',
+               reason: '?srimage=1 refused — ' + romBase + ' keeps the recomp engine' };
+    // A translated image is ONE GAME'S BINARY. Running it under another disc is the exact
+    // shape of the 2026-08-27 recomp bug, so it pins rather than refusing quietly.
+    return { mode: 'forced', engage: true, pin: true,
+             warn: '?srimage=1 with ' + romBase + ' selected: the image IS Sonic Adventure 2 Battle, '
+                 + 'so the ROM is pinned to it',
+             reason: '?srimage=1 — ROM pinned to Sonic Adventure 2 Battle (was ' + romBase + ')' };
+  }
+
   function selfTest(logFn) {
     var lines = [], pass = 0, fail = 0;
     function log(s) {
@@ -1635,6 +1699,43 @@ window.GcRate = (function () {
        live ? JSON.stringify(live) : 'window.__gcRecompRouting is undefined — the routing block '
               + 'did not run on a plain visit, so every title boots on the JIT');
 
+    // ---- 21j..21q. THE THIRD ENGINE: the SAB static-recomp image ------------------------
+    // The claim under test: adding a second non-JIT engine did not change what ANY plain
+    // visitor gets. 21j is the one that matters — it is the regression that would ship a
+    // blank page to someone who picked SAB — and the rest fence the opt-in.
+    var r21j = routeImage(null, null, 'SonicAdventure2Battle');
+    ck('21j a plain visit with SAB selected does NOT get the static-recomp image (it renders nothing yet)',
+       r21j.engage === false && r21j.mode === 'auto', JSON.stringify(r21j));
+    ck('21k adding the image engine did not move SAB off the JIT in route() either',
+       route(null, 'SonicAdventure2Battle').engage === false,
+       JSON.stringify(route(null, 'SonicAdventure2Battle')));
+    var r21l = routeImage('1', null, 'SonicAdventure2Battle');
+    ck('21l ?srimage=1 with SAB selected engages the image and pins the ROM',
+       r21l.engage === true && r21l.pin === true && r21l.mode === 'forced', JSON.stringify(r21l));
+    var r21m = routeImage('1', null, 'PhantasyStarOnline1And2Plus');
+    ck('21m ?srimage=1 under ANOTHER disc still pins to SAB and warns — the image IS one game’s binary',
+       r21m.engage === true && r21m.pin === true && r21m.warn !== null, JSON.stringify(r21m));
+    var r21n = routeImage('1', '1', 'SonicAdventure2Battle');
+    ck('21n ?recomp=1 and ?srimage=1 together is a CONFLICT, not a silent pick: recomp wins and it says so',
+       r21n.engage === false && r21n.mode === 'conflict' && r21n.warn !== null, JSON.stringify(r21n));
+    var r21o = routeImage('yes', null, 'SonicAdventure2Battle');
+    ck('21o a malformed ?srimage= does not engage an engine: it warns and stays off',
+       r21o.engage === false && r21o.warn !== null, JSON.stringify(r21o));
+    ck('21p ?srimage=0 is explicit off',
+       routeImage('0', null, 'SonicAdventure2Battle').engage === false,
+       JSON.stringify(routeImage('0', null, 'SonicAdventure2Battle')));
+    // The two engines must be MUTUALLY EXCLUSIVE for every title on the page, or a boot
+    // could start two CPU paths over one renderer — the 2026-08-27 failure exactly.
+    var bothOn = ['MarioParty4', 'SonicAdventure2Battle', 'PhantasyStarOnline1And2Plus', '240pSuite-1.10b']
+      .filter(function (t) { return route(null, t).engage === true && routeImage('1', null, t).engage === true; });
+    ck('21q no title can engage BOTH the recomp and the static-recomp image at once',
+       bothOn.length === 0, 'both-engaged titles: ' + JSON.stringify(bothOn));
+    // 21r is 21q's reason, stated positively. This assertion is the one that failed on the
+    // first draft of routeImage() and forced the `refused` arm — see the note there.
+    var r21r = routeImage('1', null, 'MarioParty4');
+    ck('21r ?srimage=1 is REFUSED for a title that already has an engine running it at 1.000x',
+       r21r.engage === false && r21r.mode === 'refused' && r21r.warn !== null, JSON.stringify(r21r));
+
     // ---- 23. PRESENT POLICY -----------------------------------------------------------------
     // Reproduces the shape MEASURED on the live recomp path: publishes at 60/s with a few ms of
     // jitter, rAF a locked 60/s. 23d is the control that keeps 23a honest.
@@ -1883,6 +1984,7 @@ window.GcRate = (function () {
 
   return { makeModel: makeModel, seqDelta: seqDelta, ringPlan: ringPlan, format: format, num: num,
            route: route, RECOMP_TITLES: RECOMP_TITLES,
+           routeImage: routeImage, SRIMAGE_TITLES: SRIMAGE_TITLES,
            capMedian: capMedian, capForVerdict: capForVerdict, CAP_HIST_N: CAP_HIST_N,
            presentSim: presentSim, jitterSeries: jitterSeries,
            simulate: simulate, selfTest: selfTest, DEF: DEF,
@@ -6852,6 +6954,79 @@ window.GcRate = (function () {
 // on a boot that is going to be a JIT boot. That last one was a live bug in the old block:
 // ?recomp=1 with PSO selected refused the takeover but still overwrote the JIT's rate readout
 // with a recomp-shaped model every second.
+// [engine-routing 2026-09-04] THE SAB STATIC-RECOMP IMAGE — ?srimage=1, opt-in only.
+//
+// Kept as its OWN block, ahead of the recomp block below and touching none of it. The
+// two engines are mutually exclusive by construction (GcRate.routeImage, asserted by
+// ?ratetest=1 test 21q), and this one engages for exactly one title that the recomp
+// engine never claims, so neither can start a second CPU path over the other's
+// renderer — the 2026-08-27 failure this page already paid for once.
+//
+// WHAT ENGAGING DOES, and what it deliberately does not do. It does NOT take over the
+// canvas, because there is nothing to put on it: the translated image runs SAB's own
+// `__start` on a flat MEM1 and models no device — no VI, no DI, no interrupt source —
+// so it produces no frame. It opens a diagnostic panel instead and reports the ordered
+// host-boundary trajectory. Presenting that as a game would be the "manufactured
+// number" failure in a different costume.
+(function () {
+  var q0 = new URLSearchParams(location.search);
+  var srParam = q0.has('srimage') ? q0.get('srimage') : null;
+  var rcParam = q0.has('recomp') ? q0.get('recomp') : null;
+  var d0 = GcRate.routeImage(srParam, rcParam, null);
+  window.__gcSrImageRouting = { param: srParam, mode: d0.mode, engage: d0.engage,
+                                reason: d0.reason, romBase: null };
+  if (d0.warn) console.warn('[srimage] ' + d0.warn);
+  if (!d0.engage) { if (srParam !== null) console.log('[srimage] ' + d0.reason); }
+  else {
+    console.log('[srimage] ' + d0.reason);
+    // Pin the ROM select to SAB by option label, the same way the recomp block pins to
+    // MP4 (ROMS is scoped inside the main IIFE, so match on text). Setting .value fires
+    // no 'change' event, so a visitor's saved pick for ordinary JIT visits is untouched.
+    [document.getElementById('romSelect'), document.getElementById('mobileRomSelect')].forEach(function (s) {
+      if (!s) return;
+      for (var oi = 0; oi < s.options.length; oi++)
+        if (/^Sonic Adventure 2/.test(s.options[oi].textContent)) { s.value = s.options[oi].value; break; }
+      s.disabled = true;
+    });
+    // Hold Start down with the PLAIN `disabled` property and a data marker. NOT
+    // aria-disabled: lib/capability.js is the sole writer of aria-disabled /
+    // data-cap-blocked on these controls and gamecube.html:1674 defers to it, so writing
+    // one here would forge a capability verdict this block has no standing to make.
+    ['btnStart', 'mobileSplashStart'].forEach(function (id) {
+      var b = document.getElementById(id);
+      if (!b) return;
+      b.disabled = true;
+      b.dataset.srimageHeld = '1';
+      b.title = 'held by ?srimage=1 — the static-recomp image is running instead of the JIT';
+    });
+    var panel = document.createElement('div');
+    panel.id = 'srimagePanel';
+    panel.style.cssText = 'position:fixed;inset:auto 12px 12px 12px;max-height:52vh;overflow:auto;' +
+      'z-index:99999;background:#0b0d11ee;color:#d7dce3;border:1px solid #2f3846;border-radius:8px;' +
+      'padding:12px 14px;font:12px/1.5 ui-monospace,Menlo,monospace;white-space:pre-wrap';
+    panel.textContent = '[srimage] ' + d0.reason + '\nloading the translated image…';
+    document.addEventListener('DOMContentLoaded', function () { document.body.appendChild(panel); });
+    if (document.body) document.body.appendChild(panel);
+    var w = new Worker('/gamecube/recomp/sr_image/sr_image_worker.js', { type: 'module' });
+    window.__srImage = { messages: [], done: false, error: null };
+    w.onerror = function (e) {
+      window.__srImage.error = e.message || String(e); window.__srImage.done = true;
+      panel.textContent += '\nworker error: ' + (e.message || e);
+    };
+    w.onmessage = function (e) {
+      var m = e.data; window.__srImage.messages.push(m);
+      if (m.kind === 'done' || m.kind === 'error') window.__srImage.done = true;
+      panel.textContent += '\n' + (m.kind === 'done'
+        ? 'FINISHED  fault=' + m.fault + '  ' + m.ms.toFixed(0) + 'ms  boundary=' +
+          (m.log && m.log.total) + ' crossings / ' + (m.log && m.log.distinct && m.log.distinct.length) + ' distinct'
+        : JSON.stringify(m).slice(0, 400));
+      panel.scrollTop = panel.scrollHeight;
+    };
+    w.postMessage({ cmd: 'boot', base: '/gamecube/recomp/sr_image/',
+                    mode: q0.get('srmode') === 'whole' ? 'whole' : 'walk' });
+  }
+})();
+
 (function () {
   var q = new URLSearchParams(location.search);
   var param = q.has('recomp') ? q.get('recomp') : null;
