@@ -17,6 +17,7 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | `bctr` jump tables | **145 of 147 recovered**, and one **PASS by execution** with a faulting control arm, §5b |
 | whole-image build at **`-O2`** | **builds, instantiates, 1056/0 bit-exact** — the "`-O0` is a real scaling constraint" note was an artifact worth **~24x**, §5j |
 | **whole-image throughput** | **0.50-0.54x** translated-code on the one HOT-path fixture, 2 runs (0.62x on four non-hot ones), Chrome, vs a same-session JIT baseline of **0.4450x** — NOT a system rate, §8 |
+| **guest OS CONTEXT SWITCH** | **WORKS** — 63 assertions / 0 failures, incl. a three-thread non-LIFO rotation on three real host threads and a control arm that reproduces `0xe00e78ac` with the host layer off. §6 (superseded there) and [`recomp/sr/CONTEXT_SWITCH.md`](../../recomp/sr/CONTEXT_SWITCH.md) |
 
 The two 2026-09-02 additions each came from a **harness** defect, not a translator one,
 and both are worth remembering because both produced a confident wrong reading:
@@ -1100,19 +1101,53 @@ The thread machinery, recovered from the call graph:
   *(This identification is structural — adjacency + `rfi` + call graph + DOLSDK
   source shape. It is not signature-matched against the SDK binary.)*
 
-**The consequence: `SelectThread` and `__OSReschedule` — the scheduler policy — are
+~~**The consequence: `SelectThread` and `__OSReschedule` — the scheduler policy — are
 ordinary translatable code and translate clean. Only the setjmp/longjmp primitives
 `OSSaveContext` and `OSLoadContext` are the host boundary. That is two functions to
-host-implement, not a rewrite of the guest OS.** Function-granular exclusion by
-address is exactly what `~/gc_refs/N64Recomp/README.md:32` provides ("stub out
-specific functions, skip recompilation of specific functions") and what
-`sr_dispatch`'s `default:` already gives here.
-
-The *unsolved* part is what the host implementation does: resuming a saved guest
+host-implement, not a rewrite of the guest OS.**~~
+~~The *unsolved* part is what the host implementation does: resuming a saved guest
 continuation when that continuation is a host wasm call stack. Three known mechanisms
-exist — Emscripten Asyncify (already used elsewhere in this repo), one host thread per
-guest thread (N64ModernRuntime's answer; `gamecube.html` already has SAB + COI so
-pthreads are available), and JSPI. **None is chosen, built, or measured here.**
+exist — Emscripten Asyncify, one host thread per guest thread, and JSPI. **None is
+chosen, built, or measured here.**~~
+
+**⛔ SUPERSEDED 2026-09-04 — THE PROPOSED CUT IS IMPOSSIBLE, AND THE PROBLEM IS
+SOLVED A DIFFERENT WAY. See [`gamecube/recomp/sr/CONTEXT_SWITCH.md`](../../recomp/sr/CONTEXT_SWITCH.md);
+63 assertions, 0 failures, `node gamecube/recomp/sr/verify_ctxsw.mjs`.**
+
+1. **A host-implemented `OSSaveContext` cannot exist.** It is a `setjmp`: it returns
+   TWICE. `sr.py:205` emits a guest call as a host call, so a host `OSSaveContext`'s
+   frame is dead the moment it returns the first time and there is nothing left to
+   `longjmp` into. Measured, not argued: a spike with exactly that shape throws out
+   of the module under BOTH longjmp backends — `Infinity` on the emscripten default,
+   `WebAssembly.Exception` under `-fwasm-exceptions -sSUPPORT_LONGJMP=wasm`. So the
+   three mechanisms listed above are not three ways to build this cut; two of them
+   (Asyncify, JSPI) are the only ways, and both cost the whole translated image.
+2. **The cut belongs one function higher, at `SelectThread` `0x800ebd68`** — the only
+   function containing both the save (`0x800ebe68`, its sole `bl` site) and the load
+   (`0x800ebf48`). There the park point and the resume point are the SAME host C
+   frame, so the switch is a semaphore hand-off between one host thread per guest
+   thread with **no stack switching at all**: no Asyncify, no `-sSUPPORT_LONGJMP`, no
+   JSPI, and zero instrumentation of any translated body.
+3. **The resume is bit-exact, not approximated.** `OSSaveContext` stamps
+   `srr0 = 0x800ebe6c` (the `bl` return) and `gpr[3] = 1`; the code there is
+   `cmplwi r3,0; beq` → `li r3,0` → epilogue, i.e. `SelectThread` returns NULL. A
+   host `SelectThread` that returns NULL after the round trip IS the machine.
+4. **One guest function is replaced.** `OSCreateThread`, `OSExitThread`,
+   `OSSleepThread`, `OSWakeupThread`, `OSJoinThread`, `__OSReschedule`, the mutexes
+   and the message queues all stay translated on the real guest structs. The host
+   layer verifies bit-exact against the TRANSLATED shipped `SelectThread` used as its
+   own oracle — identical `GekkoState` and identical FNV-1a over all 24 MB of MEM1,
+   including at the `rfi` instant of the switch itself.
+5. **The pthreads cost does not apply.** It was N64ModernRuntime's cost because the
+   N64 page deliberately lacks SAB. `gamecube.html:8` loads `coi-serviceworker.js`;
+   confirmed by execution rather than by reading the tag — the witness reports two
+   (and, in the three-thread rotation, three) distinct `pthread_self()` values.
+
+Still open there: no interrupt delivery, so no preemption — the eight
+non-`SelectThread` `OSLoadContext` sites are exception-return paths and still fault
+by name; an exception context resumes at an arbitrary PC and DOES need host stack
+switching. Function-granular exclusion by address is now built as `sr.py --host`,
+matching `~/gc_refs/N64Recomp/README.md:32`.
 
 ## 8. The whole-image performance number, and exactly what it is not
 
@@ -1264,6 +1299,20 @@ two of its callees are host-boundary primitives that do not exist yet. **This is
 argument turned from a static count into a runtime fault with an address attached**, and
 it is the concrete shape of why §8.4 says the blocker is the host layer rather than
 throughput.
+
+> **✅ CLOSED 2026-09-04.** Those primitives now exist —
+> [`gamecube/recomp/sr/CONTEXT_SWITCH.md`](../../recomp/sr/CONTEXT_SWITCH.md). Two
+> notes worth keeping, because both were re-derived the hard way:
+> * **`0xe00e78ac` is NOT the Gekko locked L1 cache**, despite the `0xE0` prefix and
+>   despite `gekko_rt.h` modelling `0xE0000000` as an unmapped window. It is
+>   `sr_extern`'s fault ENCODING, `sr_driver.c` `0xE0000000 | (addr & 0x00FFFFFF)`,
+>   so the callee it names is `0x800e78ac`. Test D of `verify_ctxsw.mjs` asserts the
+>   decomposition so this cannot be re-confused.
+> * `os_boundary.txt:276`'s "**suspected** OSLoadContext: adjacent to OSSaveContext,
+>   ends in rfi" is now **byte-exact**: the shipped words carry the Restartable
+>   Atomic Sequence fixup with `0x800e78ac` / `0x800e78bc` as literals — the first
+>   and last instruction of `OSDisableInterrupts`. The RAS window and the fault
+>   address are the same 20 bytes.
 
 ### 8.1b Three results that came free with the run
 

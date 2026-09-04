@@ -18,16 +18,18 @@ callee-saved registers intact and `OSSleepThread` returning normally.
 | the switch happens | §6, trace of 17 host-boundary events, two `HANDOFF`s, two distinct host thread ids |
 | it is not nesting in disguise | §6a, a three-thread **non-LIFO rotation** A→B→C→A that resumes A while B is still parked — three distinct host threads |
 | the host layer is bit-exact with the shipped code | §5, three non-switching paths + the switch frozen at the `rfi`: identical `GekkoState` **and** identical FNV-1a over all 24 MB of MEM1 |
-| the host layer is load-bearing | §5 control arm D: with `sr_os_mode(0)` the same run faults at exactly `0xe00e78ac`, the fault in `docs/static-recomp-sab/README.md:1252` |
+| the host layer is load-bearing | §5 control arm D: with `sr_os_mode(0)` the same run faults at exactly `0xe00e78ac`, the fault recorded in `docs/static-recomp-sab/README.md` §8.1d |
 | cost to the translated code | §8 — no Asyncify, no SjLj, no JSPI, no instrumentation of any translated body |
 
 ---
 
 ## 1. What `0xe00e78ac` actually is (it is NOT the locked cache)
 
-`docs/static-recomp-sab/README.md:1252` records `SKIP 0x800f13a8 faults 0xe00e78ac`.
+`docs/static-recomp-sab/README.md` §8.1d records `SKIP 0x800f13a8 faults 0xe00e78ac`
+(grep for the string — that file is being edited concurrently, so a line number goes
+stale; it was line 1252 at HEAD `b37ee217`).
 The `0xE0…` prefix invites the reading "Gekko locked L1 cache" (`0xE0000000`, which
-`gekko_rt.h:56` does model as an unmapped region). **It is not that.** It is
+`gekko_rt.h:61` does model as an unmapped region). **It is not that.** It is
 `sr_extern`'s fault *encoding*, `sr_driver.c:52`:
 
 ```c
@@ -57,7 +59,7 @@ decomposition, so this cannot be re-confused later.
 
 ## 2. The blocker, stated precisely — and why §6's proposed cut is impossible
 
-`docs/static-recomp-sab/README.md:1103-1109` concluded:
+`docs/static-recomp-sab/README.md` §6 concluded (now marked superseded there):
 
 > "Only the setjmp/longjmp primitives `OSSaveContext` and `OSLoadContext` are the
 > host boundary. That is two functions to host-implement, not a rewrite of the
@@ -65,7 +67,7 @@ decomposition, so this cannot be re-confused later.
 
 **That cut cannot be implemented, and the reason is structural.** `OSSaveContext` is
 a `setjmp`: it returns **twice** — 0 when saving, 1 when resumed. `sr.py` emits a
-guest call as a host call (`sr.py:205`, `fn_{tgt:08x}(st);`), so a host-implemented
+guest call as a host call (`sr.py:202`, `sr_extern`/`fn_{tgt:08x}(st);` at `sr.py:205`), so a host-implemented
 `OSSaveContext` is an ordinary C function whose frame is **gone** the moment it
 returns the first time. There is nothing left to `longjmp` back into.
 

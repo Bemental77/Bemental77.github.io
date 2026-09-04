@@ -390,7 +390,7 @@ console.log('\n=== E. ROTATION: A -> B -> C -> A, with B still parked ===');
 
 // ================================================ D. the CONTROL ARM
 // The same run with the host layer switched OFF must reproduce, exactly, the fault
-// this whole exercise started from: gamecube/docs/static-recomp-sab/README.md:1252
+// this whole exercise started from: gamecube/docs/static-recomp-sab/README.md §8.1d
 // records `SKIP 0x800f13a8 faults 0xe00e78ac` on the whole-image build.  0xE0 is
 // sr_extern's prefix and the low 24 bits are the callee, so
 //   0xE0000000 | (0x800e78ac & 0x00FFFFFF) = 0xE0000000 | 0x0E78AC = 0xE00E78AC
@@ -403,7 +403,7 @@ console.log('\n=== D. CONTROL: host layer OFF must reproduce the documented faul
   stage(off, { schedA: 8, schedB: 16 });
   setRegs(off, { r1: STACK_A, r3: QUEUE });
   const f = off.M._sr_call(OSSleepThread) >>> 0;
-  eq('D: OFF faults at 0xe00e78ac (README.md:1252, OSDisableInterrupts)', f, 0xe00e78ac);
+  eq('D: OFF faults at 0xe00e78ac (README.md §8.1d, OSDisableInterrupts)', f, 0xe00e78ac);
   ok('D: and 0xE0 is sr_extern, not a locked-cache address',
      ((f >>> 24) === 0xE0) && ((0xE0000000 | (0x800e78ac & 0x00ffffff)) >>> 0) === f);
 }
