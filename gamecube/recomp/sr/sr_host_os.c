@@ -297,8 +297,17 @@ static void trk_set_msr(GekkoState *st) {
 // ============================================================================
 static int      g_clock_on         = 1;             // independent of g_mode: the
                                                     // clock's own control arm
-static uint64_t g_tb_origin        = 0;             // ticks at g_cycles == 0
-static uint64_t g_cycles           = 0;             // RETIRED GUEST CPU cycles
+static uint64_t g_tb_origin        = 0;             // ticks at g_gk_cycles == 0
+// THE RETIRED-CYCLE COUNTER IS NOT DEFINED HERE ANY MORE.  It is `g_gk_cycles` in
+// sr_driver.c, declared by gekko_rt.h, and the EMITTED GUEST CODE feeds it directly
+// through gk_retire() (sr.py --retire) -- which is the whole point: a static
+// recompiler's guest clock has to be driven from inside the translated bodies, the
+// way Dolphin's is driven from inside its JIT blocks (Jit64/Jit.cpp:1003), not from
+// a host event.  This file remains the ONLY INTERPRETER of that counter: sr_tb_read
+// and sr_dec_read are the only expressions that turn cycles into time, so there is
+// still exactly one clock even though there are now two writers of the counter
+// (gk_retire from the guest, sr_tb_credit_cycles from a host-side driver such as
+// sr_tb_retrace).
 static uint32_t g_dec_start_value  = 0xFFFFFFFFu;   // SystemTimers.cpp:192-193
 static uint64_t g_dec_start_cycles = 0;
 static int      g_dec_armed        = 0;             // MSB clear at write => due
@@ -312,22 +321,22 @@ static uint32_t g_tb_stalls        = 0;
 //   FakeTBStartValue + (CoreTiming::GetTicks() - FakeTBStartTicks) / TIMER_RATIO
 // The division is done on the RUNNING TOTAL, never per credit, so the sub-tick
 // remainder is carried rather than truncated away 12 times a tick.
-uint64_t sr_tb_read(void) { return g_tb_origin + g_cycles / GK_TIMER_RATIO; }
+uint64_t sr_tb_read(void) { return g_tb_origin + g_gk_cycles / GK_TIMER_RATIO; }
 
 // SystemTimers.cpp:199-204, transcribed: the same tick source counting DOWN from
 // the value the guest last wrote.
 uint32_t sr_dec_read(void) {
     return g_dec_start_value
-         - (uint32_t)((g_cycles - g_dec_start_cycles) / GK_TIMER_RATIO);
+         - (uint32_t)((g_gk_cycles - g_dec_start_cycles) / GK_TIMER_RATIO);
 }
 
 // SystemTimers.cpp:181-196 DecrementerSet.  A write with the MSB CLEAR arms an
 // exception `v * TIMER_RATIO` cycles out; with it set, nothing is scheduled.
 void sr_dec_write(uint32_t v) {
     g_dec_start_value  = v;
-    g_dec_start_cycles = g_cycles;
+    g_dec_start_cycles = g_gk_cycles;
     g_dec_armed        = (v & 0x80000000u) == 0;
-    g_dec_due_cycles   = g_cycles + (uint64_t)v * GK_TIMER_RATIO;
+    g_dec_due_cycles   = g_gk_cycles + (uint64_t)v * GK_TIMER_RATIO;
 }
 
 // SystemTimers.cpp:139-143 DecrementerCallback -- MINUS the delivery.  Dolphin sets
@@ -336,7 +345,7 @@ void sr_dec_write(uint32_t v) {
 // and the register is rolled over.  An alarm handler armed this way never runs, and
 // sr_tb_dec_exceptions() is how you find out that is what happened.
 static void dec_check(void) {
-    if (!g_dec_armed || g_cycles < g_dec_due_cycles) return;
+    if (!g_dec_armed || g_gk_cycles < g_dec_due_cycles) return;
     g_dec_armed        = 0;
     g_dec_exceptions++;
     g_dec_start_value  = 0xFFFFFFFFu;
@@ -345,19 +354,35 @@ static void dec_check(void) {
 }
 
 void sr_tb_credit_cycles(uint64_t cycles) {
-    g_cycles += cycles;
+    g_gk_cycles += cycles;
     g_tb_dry_reads = 0;
     dec_check();
 }
 void sr_tb_retrace(void) { sr_tb_credit_cycles(GK_CYCLES_PER_FIELD); }
 
-void sr_tb_seed(uint64_t tb) { g_tb_origin = tb - g_cycles / GK_TIMER_RATIO; }
+void sr_tb_seed(uint64_t tb) { g_tb_origin = tb - g_gk_cycles / GK_TIMER_RATIO; }
 
 // A read with no credit since the last SR_TB_STALL_MAX reads means the guest is
 // spinning on a clock nothing is driving.  Fault LOUDLY rather than spin for ever
 // -- and note that the alternative failure a wall clock offers here is not "no
 // hang", it is "a hang you cannot see because the numbers look plausible".
+//
+// ⚠ THE TEST IS THE COUNTER, NOT THE CALL.  It used to be "reads since the last
+// sr_tb_credit_cycles() call", which was right while the only driver was a host-side
+// one -- and became WRONG the moment gk_retire() started feeding g_gk_cycles from
+// inside the emitted bodies, because that path does not call this file at all.  A
+// --retire build would have raised SR_F_TB_STALL on a guest whose clock was
+// advancing perfectly.  Comparing the COUNTER catches every writer by construction,
+// so the fault now means exactly one thing: the guest read the timebase
+// SR_TB_STALL_MAX times and NOT ONE GUEST CYCLE RETIRED in between -- i.e. no driver
+// is attached (a build without --retire and without a host-side retrace hook).
+static uint64_t g_tb_last_cycles = 0;
 static void tb_read_guard(uint32_t addr) {
+    if (g_gk_cycles != g_tb_last_cycles) {     // the guest did work; not a stall
+        g_tb_last_cycles = g_gk_cycles;
+        g_tb_dry_reads = 0;
+        return;
+    }
     if (++g_tb_dry_reads >= SR_TB_STALL_MAX) {
         g_tb_dry_reads = 0;
         g_tb_stalls++;
@@ -703,10 +728,21 @@ EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_lo(void)             { return (uint32_t)sr_t
 EMSCRIPTEN_KEEPALIVE void     sr_tb_seed_parts(uint32_t hi, uint32_t lo) {
     sr_tb_seed(((uint64_t)hi << 32) | lo);
 }
-EMSCRIPTEN_KEEPALIVE void     sr_tb_credit(uint32_t hi, uint32_t lo) {
+// ⚠ THESE TWO CARRY NO EMSCRIPTEN_KEEPALIVE, AND THAT IS THE MECHANISM, NOT AN
+// OVERSIGHT.  They ADD guest time from OUTSIDE the guest.  A worker that called
+// either on a host timer would be a wall clock wearing this facility's name — the
+// exact CLAUDE.md gate #9 bug the whole design exists to prevent.  KEEPALIVE would
+// put them in EVERY build's export table whether or not the link asked for them, so
+// they are exported only where an -sEXPORTED_FUNCTIONS list names them: the
+// verification builds (build_fixture.sh:79), which use them to seed a known amount of
+// work and check the arithmetic.  build_image.sh deliberately does NOT list them, so
+// the browser worker cannot reach them at all and the image's only drive is
+// gk_retire() inside the emitted guest bodies.  Verified after linking with
+// `grep -o -a -F sr_tb_field sab_image.wasm | wc -l` == 0.
+void     sr_tb_credit(uint32_t hi, uint32_t lo) {
     sr_tb_credit_cycles(((uint64_t)hi << 32) | lo);
 }
-EMSCRIPTEN_KEEPALIVE void     sr_tb_field(void)          { sr_tb_retrace(); }
+void     sr_tb_field(void)          { sr_tb_retrace(); }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_dec_get(void)           { return sr_dec_read(); }
 EMSCRIPTEN_KEEPALIVE void     sr_dec_set(uint32_t v)     { sr_dec_write(v); }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_calls(void)          { return g_tb_calls; }
@@ -715,15 +751,15 @@ EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_stalls(void)         { return g_tb_stalls; }
 // readout of the hole named in sr_host_os.h.  Nonzero here means a guest alarm
 // handler did not run; it does not mean anything went wrong in this facility.
 EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_dec_exceptions(void) { return g_dec_exceptions; }
-EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_cycles_hi(void)      { return (uint32_t)(g_cycles >> 32); }
-EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_cycles_lo(void)      { return (uint32_t)g_cycles; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_cycles_hi(void)      { return (uint32_t)(g_gk_cycles >> 32); }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_cycles_lo(void)      { return (uint32_t)g_gk_cycles; }
 // Per-fixture reset: counters and the DEC arm, so one replay cannot inherit the
 // previous one's state.  It does NOT clear the seeded origin; the harness seeds
 // that from the capture immediately afterwards.
 EMSCRIPTEN_KEEPALIVE void     sr_tb_reset(void) {
-    g_cycles = 0; g_dec_start_value = 0xFFFFFFFFu; g_dec_start_cycles = 0;
+    g_gk_cycles = 0; g_dec_start_value = 0xFFFFFFFFu; g_dec_start_cycles = 0;
     g_dec_armed = 0; g_dec_due_cycles = 0; g_dec_exceptions = 0;
-    g_tb_calls = 0; g_tb_dry_reads = 0; g_tb_stalls = 0;
+    g_tb_calls = 0; g_tb_dry_reads = 0; g_tb_stalls = 0; g_tb_last_cycles = 0;
 }
 EMSCRIPTEN_KEEPALIVE uint32_t *sr_os_trace(void)         { return g_trace; }
 EMSCRIPTEN_KEEPALIVE uint32_t  sr_os_trace_n(void)       { return g_trace_n; }

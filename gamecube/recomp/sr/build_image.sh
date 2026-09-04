@@ -19,6 +19,17 @@
 #                       static switch-table recovery.  Without --jumptables 123 DOL
 #                       functions translate but fault the moment they execute
 #                       (sr.py --help); a boot executes them.
+#   --retire            THE DRIVE, and the whole-image build is the reason it exists.
+#                       Every basic block credits its Gekko cycle cost to g_gk_cycles,
+#                       so OSGetTime / OSGetTick / the decrementer advance at exactly
+#                       40.5 MHz per 486 MHz of RETIRED GUEST WORK — never per second
+#                       of host time (CLAUDE.md gate #9).  A fixture build does not
+#                       need it (each replay is one function against a captured
+#                       state), so it stays off by default there and every committed
+#                       fixture artifact is byte-identical without it.  A BOOT needs
+#                       it: without a driver the clock is frozen at the origin and the
+#                       first guest that waits on an interval spins for ever —
+#                       diagnosably, as SR_F_TB_STALL naming the caller, but for ever.
 #   --dispatch-out      sr_dispatch in its OWN TU.  Not optional at -O2: in one file
 #                       clang inlines all 4,668 bodies into the dispatch switch and V8
 #                       rejects the result at instantiate with "size ... > maximum
@@ -98,20 +109,26 @@ HOSTS+=(
   0x800e3d38   # __OSPSInit           GQR0..7 = 0 (the only mode gekko_rt.h implements), HID2
   0x800e34a4 0x800e34ac 0x800e34b4 0x800e34bc   # PPCMf*/PPCMt* SPR accessors
   0x800e34e0 0x800e34e8 0x800e34f0              # ...decoded from the shipped instruction word
-  0x800ecb48   # OSGetTime            40.5 MHz, driven by RETIRED GUEST WORK (sr_host_os.c)
-  0x800ecb60   # OSGetTick            — NOT by the host clock; see sr_host_os.h gate-#9 note
+  0x800ecb48   # OSGetTime            40.5 MHz, driven by RETIRED GUEST WORK.  ANSWERED BY
+  0x800ecb60   # OSGetTick            sr_host_os.c, NOT sr_image.c — that file's two clock
+                                    # cases were deleted 2026-09-04 so the stall guard and
+                                    # the trace are not bypassed.  gate-#9 note: sr_host_os.h
   0x800e54ac   # __OSSaveFPUContext   FPR/PS1/FPSCR <-> OSContext
   0x800e5388   # __OSLoadFPUContext
-  # --- VOID: cache control, and there is no cache in this runtime to control
-  0x800e34c4   # PPCSync              (sc)
-  0x800e4e08   # DCEnable
-  0x800e4e1c   # cache/sync op x470
-  0x800e4e4c 0x800e4e80                          # DCFlushRange / DCStoreRange class (sc)
-  0x800e4f4c   # ICFlashInvalidate
-  0x800e4f5c   # ICEnable
-  0x800e4f70   # __LCEnable           the locked cache is already modelled memory (README §5k)
-  0x800e5074   # LCDisable
-  0x8014b504 0x8014b5bc 0x8014b680 0x8014b7ac    # cache/sync op x470
+  # --- cache control.  ⚠ THIS LIST SHRANK 2026-09-04 AND THAT IS THE POINT.  It used to
+  # also name PPCSync 0x800e34c4, DCInvalidateRange 0x800e4e1c, DCFlushRange 0x800e4e4c,
+  # DCStoreRange 0x800e4e80 and the four locked-cache allocators 0x8014b504 / 0x8014b5bc
+  # / 0x8014b680 / 0x8014b7ac.  Those now TRANSLATE (sr.py CACHE_NOP_XO + gk_sc + dcbz_l),
+  # and leaving them here would have kept --all from emitting them — i.e. the whole
+  # +125-function closure delta would have been measurable offline and absent from the
+  # binary.  Worse, each is a counted loop that leaves r3/r4/r5/CTR/CR0 changed, so the
+  # host stub was not merely redundant, it was WRONG for every one of those registers.
+  # An address that translates must NOT be listed here.
+  0x800e4e08   # DCEnable             mfspr/mtspr HID0 — still refused by the translator
+  0x800e4f4c   # ICFlashInvalidate    mfspr/mtspr HID0
+  0x800e4f5c   # ICEnable             mfspr/mtspr HID0
+  0x800e4f70   # __LCEnable           mfmsr + HID2 + DBAT3; the locked cache is already
+  0x800e5074   # LCDisable            modelled memory (README §5k), so both are VOID
 )
 # SR_HOSTS_EXTRA: additional --host addresses, for the SR_FNS closure arm.
 #
@@ -141,7 +158,7 @@ if [ -n "${SR_FNS:-}" ]; then
   FNARGS=(); for f in "${FNA[@]}"; do FNARGS+=(--fn "$f"); done
   echo "[sr] BRING-UP ARM: closure of ${SR_FNS} only, NOT the whole image"
   python3 "$SR/sr.py" --image "$DOL" --map "$REPO/dolphin_captures/sab.map" \
-          "${FNARGS[@]}" --closure --indirect --jumptables --boundaries outer+calls \
+          "${FNARGS[@]}" --closure --indirect --jumptables --retire --boundaries outer+calls \
           "${HOSTARGS[@]}" --out "$OUT/sr_gen.c"
 elif [ -n "${SR_GEN:-}" ]; then
   echo "[sr] reusing pre-generated $SR_GEN"
@@ -149,7 +166,7 @@ elif [ -n "${SR_GEN:-}" ]; then
   DISPATCH_SRC=("$OUT/sr_dispatch.c")
 else
   python3 "$SR/sr.py" --image "$DOL" --map "$REPO/dolphin_captures/sab.map" \
-          --all --indirect --jumptables --boundaries outer+calls \
+          --all --indirect --jumptables --retire --boundaries outer+calls \
           "${HOSTARGS[@]}" \
           --skiplist "$OUT/skiplist.json" \
           --dispatch-out "$OUT/sr_dispatch.c" \
@@ -168,6 +185,30 @@ EXPORTS=$EXPORTS,_sr_image_dev_log,_sr_image_dev_log_n,_sr_image_dev_reads,_sr_i
 EXPORTS=$EXPORTS,_sr_image_exi_clears,_sr_image_set_exi_model,_sr_image_set_watchdog,_sr_image_set_strict
 EXPORTS=$EXPORTS,_sr_os_mode,_sr_os_get_mode,_sr_os_set_msr,_sr_os_get_msr
 EXPORTS=$EXPORTS,_sr_os_trace,_sr_os_trace_n,_sr_os_trace_reset
+# THE CLOCK, READ-ONLY (plus the two writes that are legitimately the host's).
+# _sr_tb_hi/_lo is guest TIME, _sr_tb_cycles_hi/_lo is the RETIRED GUEST WORK behind
+# it, and their ratio against wall time measured OUTSIDE the guest is the headroom
+# number gate #9 asks for.  _sr_tb_stalls != 0 means a guest polled a clock nothing
+# was driving; _sr_tb_dec_exceptions is the count of decrementer interrupts that came
+# due and were never delivered.  _sr_tb_seed_parts sets the ORIGIN, which is the RTC's
+# job and is what Dolphin does once at boot (SystemTimers.cpp:269).
+#
+# ⚠ DELIBERATELY NOT EXPORTED: _sr_tb_credit and _sr_tb_field.  Those ADD guest time,
+# and a worker that called either on a host timer would be a wall clock wearing the
+# facility's name — the precise gate #9 bug this whole design exists to prevent.  The
+# image's drive is gk_retire(), inside the emitted guest bodies, where the host cannot
+# reach it.  When the VI path lands, sr_tb_retrace() must be called from the GUEST's
+# retrace boundary (a host-bound VIWaitForRetrace), never from JS.
+# THE OMISSION IS ENFORCED, not just intended: those two functions carry no
+# EMSCRIPTEN_KEEPALIVE (sr_host_os.c, above their definitions), which is what would
+# otherwise put them in every build's export table regardless of this list.  Check it
+# after any link with
+#   grep -o -a -F sr_tb_field "$OUT/sab_image.wasm" | wc -l     # must print 0
+# (-o | wc -l, not -c: a wasm has almost no newlines, so -c counts lines not matches).
+EXPORTS=$EXPORTS,_sr_tb_hi,_sr_tb_lo,_sr_tb_cycles_hi,_sr_tb_cycles_lo
+EXPORTS=$EXPORTS,_sr_tb_calls,_sr_tb_stalls,_sr_tb_dec_exceptions,_sr_dec_get
+EXPORTS=$EXPORTS,_sr_tb_seed_parts,_sr_tb_reset,_sr_tb_enable,_sr_tb_is_enabled
+EXPORTS=$EXPORTS,_sr_hid0,_sr_set_hid0
 
 set -x
 emcc ${SR_OPT:--O2} -DSR_MMIO -I"$SR" \

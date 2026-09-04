@@ -46,6 +46,51 @@ extern uint8_t *g_ram;
 extern uint32_t g_ram_size;
 extern uint32_t g_fault;      // 0 = clean; else the guest address that faulted
 
+// HID0 (SPR 1008).  ONE owner, for the same reason there is exactly one clock
+// (sr_tb_read): the guest reads it back through PPCMfhid0 and the `sc` vector reads
+// it, so two copies would be two answers.  Defined in sr_driver.c; sr_image.c's SPR
+// accessor routes SPR 1008 here instead of into its private g_spr[].
+// The initial value is the one the GameCube's BS2 leaves and the one the differential
+// ORACLE therefore has: Dolphin Boot_BS2Emu.cpp:85 "HID0 is 0x0011c464 on GC",
+// SetupHID setting BHT|BTIC|DCFA|DCFI|DCE|ICE|NHR|DPM (:86-97).
+#define GK_HID0_BOOT   0x0011c464u
+#define GK_HID0_ABE    0x00000008u   /* address broadcast; the `sc` vector pulses it */
+extern uint32_t g_hid0;
+
+// ====================================================================== THE DRIVE
+// RETIRED GUEST CPU CYCLES -- the ONE input to guest time, and the reason gate #9
+// can be met by a static recompiler at all.
+//
+// Dolphin derives the guest timebase from `CoreTiming::GetTicks()`, which is the
+// EMULATED CPU CYCLE COUNTER, divided by TIMER_RATIO=12 (SystemTimers.cpp:213-218,
+// SystemTimers.h:41).  That counter is fed one instruction at a time: the
+// interpreter returns `opinfo->num_cycles` per instruction (Interpreter.cpp:193)
+// and the JIT accumulates the same field per instruction into the block's downcount
+// (Jit64/Jit.cpp:1003).  `g_gk_cycles` is that counter, and gk_retire() is that
+// feed -- sr.py --retire emits ONE call per BASIC BLOCK carrying the summed
+// num_cycles of the instructions in it, which is exactly the JIT's granularity.
+//
+// WHY THIS AND NOT A WALL CLOCK, in one line: this makes the guest's time:work
+// ratio a constant of the GUEST -- 12 cycles per tick, 8,100,000 cycles per 60 Hz
+// field -- at any host speed.  A host clock makes that ratio a function of the
+// host, which is the gate #9 bug in both directions.  Nothing here reads host time;
+// `emscripten_get_now`, `clock_gettime`, `gettimeofday` and `time(` appear nowhere
+// in this facility, and verify_drive.mjs asserts the consequence by executing it.
+//
+// WHY IT IS NOT A SPEED CONTROL: crediting is not throttling.  The guest retires
+// the same cycle count for the same work no matter how fast the host runs it, so
+// this can neither speed the guest up nor slow it down -- it only makes guest time
+// agree with guest work.  How much WALL time a second of guest time costs is the
+// separate, outside-the-guest quantity gate #9 calls headroom.
+//
+// The counter lives in sr_driver.c because EVERY build links that; sr_host_os.c is
+// the only thing that INTERPRETS it (sr_tb_read / sr_dec_read), so there is still
+// exactly one clock.  A build WITHOUT --retire leaves it at 0 for ever, and a guest
+// that then polls the timebase raises SR_F_TB_STALL by name instead of spinning on
+// a plausible wrong number.
+extern uint64_t g_gk_cycles;
+static inline void gk_retire(uint32_t cycles){ g_gk_cycles += cycles; }
+
 static inline uint32_t gk_phys(uint32_t ea) { return ea & 0x03FFFFFFu; }
 
 static inline int gk_ok(uint32_t p, uint32_t n) {
@@ -518,6 +563,55 @@ static inline void gk_dcbz(uint32_t ea){
     GK_WPRE(p, 32);
     for (int i = 0; i < 32; i++) g_ram[p + i] = 0;
     GK_WPOST(p, 32);
+}
+
+// ---------------------------------------------------------------------- `sc`
+// THE GUEST'S SYSTEM CALL, and it is not a call into anything this runtime owns.
+// `sc` takes a Gekko SYSTEM CALL exception to 0x80000C00 and runs whatever the guest
+// OS installed there.  DOLSDK installs exactly one thing, and it is seven
+// instructions long -- ~/gc_refs/dolsdk2001/src/os/OSSync.c:9-21, copied to
+// OSPhysicalToCached(0xC00) by __OSInitSystemCall (:23-30, SAB 0x800eb8dc):
+//
+//     mfspr r9, HID0        <- CLOBBERS r9
+//     ori   r10, r9, 0x8    <- CLOBBERS r10   (HID0[ABE], address broadcast)
+//     mtspr HID0, r10
+//     isync
+//     sync
+//     mtspr HID0, r9        <- restores HID0; net change zero
+//     rfi
+//
+// So the ENTIRE purpose of `sc` on this platform is to pulse address-broadcast
+// around a `sync`, which is why OSCache.c puts one at the end of DCFlushRange
+// (:123) and DCStoreRange (:143) and nowhere else: it publishes the writebacks the
+// preceding dcbf/dcbst loop just issued to the OTHER bus masters.  This runtime has
+// one flat coherent buffer and one bus master, so the pulse and the barrier are both
+// no-ops -- but the handler does NOT save r9 and r10, so their clobber survives the
+// rfi and is visible to the caller.  verify_fixture.mjs scores all 32 GPRs
+// (:521-522), so dropping that clobber would be a scored miss, not a free
+// simplification.  Both are volatile under the PowerPC ABI, so no compiler-generated
+// caller depends on them -- this is exactness against the oracle, not a fix.
+//
+// WHAT IS NOT MODELLED, stated rather than implied:
+//  * SRR0/SRR1.  The exception writes them and the rfi consumes them; GekkoState has
+//    no field for either (there is no exception delivery in this runtime at all), so
+//    they are absent, not wrong.  Nothing in the image reads them outside the
+//    context-switch primitives, which are host-bound.
+//  * The 0xC00 BYTES ARE NOT CHECKED.  gk_sc reproduces DOLSDK's vector because that
+//    is what SAB installs; it does not read 0x80000C00 and confirm it, because in a
+//    FIXTURE build low memory is staged only where the capture recorded it and the
+//    check would fault on a correct run.  A title that installed a different vector
+//    would be modelled wrong here and silently -- the containment is `--cache-audit`,
+//    which enumerates all three `sc` sites and shows they are the SDK's own.
+//  * r9/r10 ARE MODELLED BUT NOT YET WITNESSED.  No committed fixture executes an
+//    `sc`: every function containing one was BLOCKED by the translator until this
+//    boundary, so the capture record has nothing to compare against.  Said plainly
+//    so the next capture through DCFlushRange is read as the first evidence, not as
+//    a regression.
+static inline void gk_sc(GekkoState *st){
+    st->gpr[9]  = g_hid0;
+    st->gpr[10] = g_hid0 | GK_HID0_ABE;
+    /* mtspr HID0,r10 ; isync ; sync ; mtspr HID0,r9  -> HID0 net unchanged, and both
+       barriers are no-ops on one flat coherent buffer with one bus master. */
 }
 
 // ------------------------------------------------------------- CR / XER helpers

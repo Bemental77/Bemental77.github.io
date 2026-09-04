@@ -3147,6 +3147,325 @@ So the next boundary worth building is the **context switch** (already transcrib
 after it **cache maintenance**, which `sr_image.c` already argues is `IMG_D_VOID` on
 structural grounds: there is no cache in this runtime to control.
 
+## 12. CACHE MAINTENANCE — built as an INSTRUCTION boundary, not a function one, and +125
+
+§11.8 named this as the next boundary and predicted its shape wrong in one important
+way, so start there: it is filed under `sr_image.c`'s `IMG_D_VOID` function list, and
+**answering for those functions from the host would have been worse than translating
+them.** `DCFlushRange` is not a no-op, it is a *counted loop that happens to do
+nothing*: `~/gc_refs/dolsdk2001/src/os/OSCache.c:107-125` leaves `r3` advanced by 32
+per line, `r4` = the line count, `r5` = `addr & 31`, `CTR` = 0 and `CR0` set. A host
+stub that returns immediately freezes every one of those, and `verify_fixture.mjs`
+scores all 32 GPRs plus `cr`/`lr`/`ctr` (grep `for (const k of ['cr', 'lr', 'ctr']`).
+A no-op *instruction* inside the real loop is exact; a no-op *function* is not.
+
+So the boundary was built one level down, in the translator.
+
+### 12.1 The set — read from the SHIPPED WORDS, because the map is silent here
+
+`dolphin_captures/sab.map` names `PPCSync`, `ICFlashInvalidate`, `__LCEnable`,
+`LCEnable` and `LCDisable` and **nothing else in this family** — no `DCFlushRange`, no
+`DCInvalidateRange`, no `DCStoreRange`. Every address below was recovered by
+disassembling `/tmp/sr_sab/main.dol` and matching `OSCache.c` line for line:
+
+| addr | shipped body | DOLSDK |
+|---|---|---|
+| `0x800e4e1c` | …`dcbi 0,r3`… `blr` | `DCInvalidateRange` OSCache.c:87-104 |
+| `0x800e4e4c` | …`dcbf 0,r3`… **`sc`** `blr` | `DCFlushRange` :107-125 |
+| `0x800e4e80` | …`dcbst 0,r3`… **`sc`** `blr` | `DCStoreRange` :127-146 |
+| `0x800e4eb4` | …`dcbf`… `blr` (no `sc`) | `DCFlushRangeNoSync` :148-165 |
+| `0x800e4ee4` | …`dcbst`… `blr` (no `sc`) | `DCStoreRangeNoSync` :168-186 |
+| `0x800e4f14` | …`icbi`… `sync` `isync` `blr` | `ICInvalidateRange` :228-248 |
+| `0x800e34c4` | `sc; blr` | `PPCSync` |
+
+That last-but-one row is the trap this family keeps setting: a map elsewhere in the
+tree labels `0x800e4f14` `DCZeroRange`, and its body is `icbi`. Same failure as
+`0x800e34bc` "PPCMtwpar" being `mtspr 22` = `mtdec` (§11.2) — `objdump` on the real
+words renders `mtdec` at `0x800e34bc` and `mtwpar` at `0x800e34f0`.
+
+**A census of the whole image, not a guess about which functions matter**: 183
+cache-maintenance sites in 46 functions — `dcbz` 68, `dcbt` 41, `sync` 29, `dcbi` 18,
+`dcbz_l` 13, `dcbst` 5, `icbi` 3, `sc` 3, `dcbf` 3. `sc` occurs at **exactly three
+addresses** and all three are the SDK's own store barrier. `tlbie`/`tlbia`/`tlbsync`
+and `tw`/`twi` occur **zero** times.
+
+### 12.2 What was actually refused, and it was two instructions
+
+`dcbst`, `dcbf`, `icbi`, `sync`, `eieio`, `dcbt`, `dcbtst` were **already** emitted as
+no-ops (`sr.py` had them in a "cache hints" list); `dcbz` was already a real
+`gk_dcbz()` store. The refusals were:
+
+* **`dcbi`** (op31 xo=470) — refused, while its five siblings were not. An
+  inconsistency, not a policy.
+* **`sc`** (op 17) — refused as "system call".
+* **`dcbz_l`** (op4 xo=1014 xo5=22) — refused as an unknown paired-single op, even
+  though `gekko_rt.h` already models the locked cache as real memory and `gk_dcbz()`
+  already existed to write it. The translator and the runtime disagreed.
+
+The table now lives in one place, `sr.CACHE_NOP_XO`, so `--cache-audit` can enumerate
+what the boundary claims and a leave-one-out is one deletion.
+
+### 12.3 `sc` is not a system call here — it is DOLSDK's seven-instruction vector
+
+This is the part that is worth reading even if the rest is obvious.
+`~/gc_refs/dolsdk2001/src/os/OSSync.c:9-21` is the entire GameCube system-call handler,
+memcpy'd to `OSPhysicalToCached(0xC00)` by `__OSInitSystemCall` (:23-30, SAB
+`0x800eb8dc`):
+
+```
+mfspr r9, HID0        <- CLOBBERS r9
+ori   r10, r9, 0x8    <- CLOBBERS r10   (HID0[ABE], address broadcast)
+mtspr HID0, r10 ; isync ; sync ; mtspr HID0, r9 ; rfi
+```
+
+`sc`'s whole purpose on this platform is to pulse address-broadcast around a `sync` so
+the `dcbf`/`dcbst` writebacks that precede *every* `sc` in `OSCache.c` become visible
+to the other bus masters. On one flat coherent buffer with one bus master the pulse and
+the barrier are both no-ops — **but the handler does not save r9 and r10**, so their
+clobber survives the `rfi` and reaches the caller, and both are scored. `gk_sc()`
+reproduces exactly that, sourcing HID0 from `g_hid0`, seeded with the value the
+GameCube's BS2 leaves: `0x0011c464`, Dolphin `Boot_BS2Emu.cpp:85`.
+
+HID0 now has **one owner**, the same discipline the clock collision (§12.6) forced:
+`sr_image.c`'s SPR accessor routes SPR 1008 to `g_hid0` instead of its private
+`g_spr[]`, and `DCEnable`/`ICEnable`/`ICFlashInvalidate` stop being `IMG_D_VOID` and set
+the bit they actually set.
+
+### 12.4 The closure delta, and the pair effect again
+
+Canonical instrument, `fixture_dol.py --shapes-only --irq-hosts --clock-hosts
+--new-only`, same image, one process:
+
+| | closure-clean |
+|---|---|
+| baseline, no `--host` at all | 3,581 → **3,626** |
+| with the MSR + clock host set | 4,269 → **4,394** |
+
+**+125 functions / +13,005 instructions = 3.47% of `.text`.** Leave-one-out over the
+three levers, four arms in one process on one image:
+
+| lever | alone | cost of DROPPING it from the set |
+|---|---|---|
+| `dcbi` | +33 | **−52** |
+| `sc` | +73 | **−89** |
+| `dcbz_l` | **+0** | **−3** |
+
+The same super-additive shape as `OSDisableInterrupts` (+65 alone / −492 dropped) and
+`PPCMtdec` (+0 / −112): 33 + 73 = 106 against 122 together, so 16 functions needed both.
+`dcbz_l` is the `PPCMtdec` case exactly — worthless alone, load-bearing in company.
+
+**The false-positive guard §11.3 paid for was run and is clean.** A `--host`-bound
+address has an empty closure walk and scores clean though `sr.py` never emits it; that
+produced a false +506 once. Zero of these 125 is host-bound, and their whole transitive
+closure — **991 functions — all translate**, checked by executing `Translator.translate()`
+on every one.
+
+The blocked-reason histogram collapses accordingly: `0x800e4e1c` 135→0, `0x800e4e4c`
+70→0, `0x800e4e80` 23→0, `0x800e34c4` 9→0, bare `xo=470` 6→0. What is left of the 347
+is 190 on `OSSaveContext` — the context boundary, a different agent's set.
+
+### 12.5 Containment — `sr.py --cache-audit`, and it is the INVERSE shape
+
+`--msr-audit` and `--tb-audit` fail if any body is **emitted**, because MSR and time are
+STATE with one host owner. Cache maintenance has no state here, so **emitting is the
+correct outcome and host-binding is the bug**. `--cache-audit` therefore fails on:
+
+* a REAL operation (`dcbz`/`dcbz_l`, which are 32-byte stores) reduced to a no-op, and
+* a cache site inside a `--host`-bound function, because a stub does not run the loop —
+  unless the caller `--cache-ack`s the address, which is how it says "I read that host
+  implementation and it does the stores".
+
+**It found one on its first run**, and the finding was real: `__LCEnable 0x800e4f70` is
+host-bound and its body ends in `OSCache.c:349-352` `_lockloop`, **512 × `dcbz_l`** —
+16 KB of zeroing the stub was dropping. Invisible on a cold boot because `sr_driver.c`
+`calloc`s the tail buffer, *not* invisible on an enable that follows a disable, and
+"correct by accident of the allocator" is not a semantics. `sr_image.c` performs the
+512 stores now; the audit exits 2 without `--cache-ack 0x800e4f70` and 0 with it, both
+arms run.
+
+### 12.6 What is NOT reproduced, stated rather than implied
+
+* **`dcbi` discards without writeback.** On real hardware a dirty line dropped by
+  `dcbi` loses the CPU's writes; here there is no dirty line and the writes survive.
+  Every `dcbi` site in `main.dol` is either `DCInvalidateRange` — whose callers are
+  re-reading a buffer a DMA engine wrote, and **no DMA engine is modelled**, so those
+  callers already read stale data for an unrelated reason — or the locked-cache
+  allocators invalidating the normal-cache alias of a line they are about to own in a
+  cache modelled as plain memory. Neither depends on the discard.
+* **`sc` does not check the bytes at `0x80000C00`.** It reproduces DOLSDK's vector
+  because that is what SAB installs; a title installing a different one would be wrong
+  here and silent. The containment is `--cache-audit` showing all three sites.
+* **SRR0/SRR1 are absent, not wrong.** `GekkoState` has no field for either; this
+  runtime has no exception delivery at all.
+* **r9/r10 are MODELLED BUT NOT YET WITNESSED against the oracle.** No committed
+  fixture executes an `sc` — every function containing one was BLOCKED until this
+  boundary — so the capture record has nothing to compare to. The next capture through
+  `DCFlushRange` is the first evidence, not a regression.
+* **`__LCEnable`'s register tail** (`r3 = 0xE0004000`, `r4 = HID2|0x100f0000`,
+  `r5 = MSR|0x1000`, `r6 = 0`, `CTR = 0`, plus MSR[ME]/HID2[LCE]/DBAT3) is not
+  reproduced. All volatile, and `LCEnable 0x800e503c` — its only caller — reads none of
+  them; a fixture differential would still score it.
+
+### 12.7 Verified BY EXECUTION — `verify_cache.mjs`, 51 passed / 0 failed
+
+One binary, md5 `58feaa55c892dd4be0d4d61104b0efd3` before and after the run.
+
+Four of the arms assert that memory did **not** change, which is exactly the shape of a
+vacuous null, so each is paired with two independent liveness proofs on the same wasm:
+
+1. **The register tail.** `r3 = addr + 32×lines`, `r4 = lines`, `r5 = addr & 31`,
+   `CTR = 0` — a body that never ran leaves the inputs. Plus the `n == 0` early-out
+   (`OSCache.c:89-90`) and the unaligned-start correction (`:91-93`, one extra line).
+2. **A positive control in the same binary**: `0x8014b504`, a `dcbi` + `dcbz_l` loop,
+   which **zeroes** the first 256 bytes of the locked cache and leaves byte 256 on
+   alone. If the harness could not see a guest store, the four nulls would mean nothing.
+
+`sc` gets its own falsifiability arm because a constant would pass the obvious one:
+r9/r10 must **track** HID0. Driven to `0`, `0x0011c464`, `0xdeadbe00` and `0xffffffff`,
+the pair follows every time. And `DCInvalidateRange`, which has no `sc`, leaves both at
+0 — the same test in the negative.
+
+A fourth arm re-proves the locked cache is real memory: a `dcbz_l` over `0xE0000000`
+leaves MEM1 offset 0..255 untouched, which `gk_phys`'s 26-bit mask would not.
+
+## 13. THE DRIVE — guest time, driven by RETIRED GUEST WORK, from instruction one
+
+§11.7 stated the gap plainly: *"no driver is attached in the whole-image build yet so
+the clock is frozen"*. This is the driver.
+
+### 13.1 Why it is not a retrace hook
+
+The shipping MP4 recomp holds 0.999x with one: `recomp_worker.js` answers OSGetTime
+with `viRetrace * 675000n` (grep `case 'OSGetTime'`) and bumps `viRetrace` once per
+`VIWaitForRetrace` (grep `viRetrace++`). It is the right shape for a frame boundary and
+`sr_tb_retrace()` keeps it available. It cannot be **this** image's drive, for two
+reasons that were checked rather than assumed:
+
+* SAB's `VIWaitForRetrace` is **not in `dolphin_captures/sab.map` at all** — its address
+  would have to be recovered by signature first.
+* The translated DOLSDK body (`~/gc_refs/dolsdk2001/src/vi/vi.c`) sleeps on
+  `retraceQueue` until a **VI interrupt** bumps `retraceCount`, and this runtime has no
+  interrupt delivery. It would not complete.
+
+A retrace hook is therefore inert until both are solved. The image is at `OSInit`.
+
+### 13.2 What the drive is: `gk_retire()` per basic block
+
+`sr.py --retire` opens every emitted **basic block** with `gk_retire(N)`, N = the summed
+Gekko cycle cost of the instructions in it, accumulating into `g_gk_cycles`. That is the
+same place and the same granularity Dolphin drives its clock from:
+
+| Dolphin | here |
+|---|---|
+| `Interpreter.cpp:193` returns `opinfo->num_cycles` per instruction | `gk_cycles(w)` |
+| `Jit64/Jit.cpp:1003` `js.downcountAmount += opinfo->num_cycles` per instruction in a block | one `gk_retire(N)` per block |
+| `SystemTimers.cpp:213-218` `GetFakeTimeBase = origin + CoreTiming::GetTicks()/TIMER_RATIO` | `sr_tb_read() = origin + g_gk_cycles/12` |
+
+**The cost table is Dolphin's, transcribed, and the transcription is proved
+mechanically, not by eye**: a checker rebuilds all five `PPCTables.cpp` lookup tables
+the way `PPCTables.cpp:526-600` builds them (`s_table4_2` and `s_table63_2` replicate
+over the low 5 bits of the extended opcode, `s_table4_3` over the low 6) and compares
+**1,134 table slots** against `sr.gk_cycles()` — **0 mismatches**. 203 of 243 entries
+cost 1; the exceptions are `divw*` 40, `fdivx` 31, `fdivsx`/`ps_div` 17, `lmw`/`stmw`
+11, the `dcb*` family and the multiplies 5, `icbi` 4, `sync`/`mulli`/`mfsr`/`mtfs*` 3,
+and `sc`/`mtspr`/`rfi`/`dcbt`/`dcbtst`/`ps_rsqrte`/`tw` 2. `dcbz_l` is **1** while
+`dcbz` is **5** — transcribed as found, because the point of using the oracle's table is
+that the two clocks agree.
+
+**Blocks are cut at the function entry, at every label, and after every instruction that
+may transfer control**, with `LK=1` forms (`bl`/`bcl`/`bctrl`/`blrl`) deliberately NOT
+ending a block — they are calls and control returns. Getting that wrong in the
+permissive direction over-credits: the `blelr` at `OSCache.c:90` can return before the
+loop runs, and a block credited at its head would have charged the guest for a loop it
+skipped.
+
+`--retire` is **off by default**, so every committed fixture artifact stays
+byte-identical; `build_image.sh` passes it.
+
+### 13.3 One counter, and the guard that had to change with it
+
+`g_cycles` used to be a `static` inside `sr_host_os.c`. It is now `g_gk_cycles` in
+`sr_driver.c` — which every build links — because the **emitted guest code** has to
+reach it. `sr_host_os.c` remains the only *interpreter* of it (`sr_tb_read`,
+`sr_dec_read`), so there is still exactly one clock.
+
+That move broke `tb_read_guard` in a way worth recording: it counted *"reads since the
+last `sr_tb_credit_cycles()` call"*, and `gk_retire()` does not call that function at
+all. A `--retire` build would have raised **`SR_F_TB_STALL` on a perfectly healthy
+clock** after 100,000 reads. The guard now compares the **counter**, which catches every
+writer by construction, and the fault means exactly one thing: the guest read the
+timebase `SR_TB_STALL_MAX` times and **not one guest cycle retired in between** — i.e.
+no driver is attached.
+
+### 13.4 The gate #9 firewall is a LINKER fact, not an intention
+
+`sr_tb_credit()` and `sr_tb_field()` **add** guest time. A worker calling either on a
+host timer would be a wall clock wearing this facility's name. `build_image.sh` does not
+list them in `EXPORTED_FUNCTIONS` — and, because `EMSCRIPTEN_KEEPALIVE` would have
+exported them anyway regardless of that list (measured: they were still in the image
+wasm on the first attempt), **both had their `KEEPALIVE` removed**. After the change:
+
+```
+image build   sr_tb_field wasm=0 mjs=0   sr_tb_credit wasm=0 mjs=0
+verify build  sr_tb_field wasm=1         sr_tb_credit wasm=1
+```
+
+The read side (`_sr_tb_hi/_lo`, `_sr_tb_cycles_hi/_lo`, `_sr_tb_calls`, `_sr_tb_stalls`,
+`_sr_tb_dec_exceptions`, `_sr_dec_get`) and the ORIGIN seed *are* exported: guest ticks
+against wall time measured **outside** the guest is the headroom number gate #9 asks for.
+
+### 13.5 THE CLOCK COLLISION THAT WAS LIVE AND INVISIBLE
+
+`sr_image.c` answered `OSGetTime`/`OSGetTick` at `0x800ecb48`/`0x800ecb60` *and* so did
+`sr_host_os.c` — and `img_hook` asks `img_host()` **first**, so this layer won every
+time. Both returned the same number (`img_timebase()` had already been pointed at
+`sr_tb_read()` by `f33b3795`), so no test and no log could tell. What was silently lost
+was everything the owning layer wraps around the value: the `SR_F_TB_STALL` guard, the
+`SR_EV_GET_TIME`/`GET_TICK` trace, and the read count. **A frozen clock has to be loud,
+and it cannot be loud from a layer that does not count reads.** The cases are deleted;
+`sr_host_os.c` owns the clock alone. That file's own COLLISION WATCH comment had said to
+do exactly this "the moment it lands" — it had landed, and the note went stale instead.
+
+### 13.6 Verified BY EXECUTION — `verify_drive.mjs`, 23 passed / 0 failed
+
+One binary, md5 `c13e158e3be4fdc104744bb14ce149d0` before and after.
+
+* **A — closed form.** `DCFlushRange(aligned, 256)` retires exactly
+  `2 + 2 + 4 + 7×8 + 3 = 67` cycles, derived from the shipped words and Dolphin's
+  table. **The control arm is in the same binary**: the `n == 0` early-out retires
+  exactly `2`. The delta 67 vs 2 *is* the loop.
+* **B — linearity.** 1 / 2 / 8 / 64 / 1024 lines → `11 + 7n` exactly. A per-function
+  credit cannot track this.
+* **C — the ratio is the hardware's.** 8,100,000 retired cycles = **exactly** 675,000
+  ticks = one 60 Hz field. 486,000,000 = **exactly** 40,500,000 = one second of guest
+  time.
+* **D — Test E from §11.5, restated for the driven clock.** 250 ms of *real host time*
+  advances the guest clock by **0** cycles and **0** ticks. A wall clock would have moved
+  ~10,125,000 ticks; that difference is the gate #9 bug.
+* **E — determinism, and no speed-up from a faster host.** Two replays are bit-identical;
+  1 / 10 / 500 calls cost exactly 1× / 10× / 500× one call, whatever the host took.
+* **F — the composition.** A real translated body, `0x800ecb68 __OSGetSystemTime`, reads
+  the clock **through the host boundary** and gets a value that moved because the guest
+  worked: after 1024 lines of `DCFlushRange` plus one more clock read, the second answer
+  is later than the first by exactly `(7179 + 26)/12 = 600` ticks.
+* **G — the stall fault still means what it says.** 150,000 consecutive guest clock reads
+  (> `SR_TB_STALL_MAX`) raise **zero** stalls, because each read retires work — which is
+  what real hardware does. This is the regression test for §13.3.
+
+### 13.7 What the drive does NOT claim
+
+A cycle count is **not a cycle-accurate model**. Gekko is superscalar and Dolphin's
+`num_cycles` is a per-opcode constant, not a pipeline simulation. What is claimed, and
+what arms C/D/E test, is the gate #9 property: **guest time is a function of guest work
+and of nothing else, at the hardware's 12-cycles-per-tick ratio**, so the guest can be
+neither sped up nor slowed down by the host. Crediting is not throttling — the guest
+retires the same cycle count for the same work however fast the host runs it. How much
+*wall* time a second of guest time costs is the separate, measured-outside-the-guest
+quantity gate #9 calls headroom, and this change does not measure it.
+
+Still not modelled, unchanged by this: the decrementer **interrupt** is counted and never
+delivered, so an `OSSetAlarm` handler behind it does not run.
+
 ### 9.8 The SCENE was the other bound — a way to MAKE scenes, and what three more moved
 
 §9.6 named this constraint exactly: *"The way to more breadth is more SCENES, not a

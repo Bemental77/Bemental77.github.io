@@ -8,6 +8,16 @@
 uint8_t  *g_ram = 0;
 uint32_t  g_ram_size = 0;
 uint32_t  g_fault = 0;
+// THE HID0.  Seeded with the value the GameCube's BS2 leaves (gekko_rt.h
+// GK_HID0_BOOT, cited to Dolphin Boot_BS2Emu.cpp:85) so a FIXTURE build -- which
+// never runs a boot -- still reads back what the oracle had.  A whole-image build
+// overwrites it from the guest's own HID0 writes through sr_image.c.
+uint32_t  g_hid0 = GK_HID0_BOOT;
+// RETIRED GUEST CPU CYCLES.  Defined here because every build links this file; only
+// sr_host_os.c interprets it (sr_tb_read / sr_dec_read), so there is still exactly one
+// clock.  See the long note beside gk_retire() in gekko_rt.h — this is the whole of
+// the drive, and it is fed by the GUEST, never by the host.
+uint64_t  g_gk_cycles = 0;
 
 #define MEM1_SIZE 0x01800000u   // 24 MB, GameCube MEM1
 
@@ -35,6 +45,11 @@ EMSCRIPTEN_KEEPALIVE uint32_t     sr_ram_size(void)  { return g_ram_size; }
 // instead of hardcoding a layout that can drift out from under it.
 EMSCRIPTEN_KEEPALIVE uint32_t     sr_tail_size(void) { return SR_TAIL; }
 EMSCRIPTEN_KEEPALIVE GekkoState  *sr_state(void)     { return &g_st; }
+// HID0, exposed for the same reason the timebase seed is: gk_sc() reads it, so a test
+// that wants to prove the `sc` vector's r9/r10 clobber TRACKS the machine (rather than
+// returning a constant that happens to match) has to be able to move it.
+EMSCRIPTEN_KEEPALIVE uint32_t     sr_hid0(void)          { return g_hid0; }
+EMSCRIPTEN_KEEPALIVE void         sr_set_hid0(uint32_t v){ g_hid0 = v; }
 EMSCRIPTEN_KEEPALIVE int          sr_state_size(void){ return (int)sizeof(GekkoState); }
 
 // HOST-BOUNDARY HOOK.  NULL unless sr_host_os.c is linked in AND sr_os_init() ran,

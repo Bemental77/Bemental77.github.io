@@ -53,6 +53,152 @@ class Untranslatable(Exception):
         self.why, self.pc, self.word = why, pc, word
 
 
+# ==========================================================================
+#                      THE CACHE-MAINTENANCE BOUNDARY
+# ==========================================================================
+# Gekko cache maintenance on a runtime that HAS NO CACHE.  gekko_rt.h maps every
+# guest access straight into one flat host buffer (gk_phys masks 26 bits and
+# indexes g_ram), there is one bus master, and no address translation.  So a
+# CACHE-STATE instruction has no state to change here and a no-op is the FULL
+# semantics, not an approximation of them -- with the two exceptions below, which
+# are NOT in this table because they are real observable operations:
+#
+#   dcbz  (op31 xo=1014)  ZEROES a 32-byte line -> gk_dcbz(), a real store.
+#   dcbz_l(op4  xo=1014)  the same, into the locked cache, which gekko_rt.h:61-71
+#                         establishes is ORDINARY MEMORY here with a real backing
+#                         buffer.  Also a real store.
+#
+# ⚠ WHAT A NO-OP DOES NOT REPRODUCE, stated rather than implied.  `dcbi` DISCARDS
+# a cache line WITHOUT writing it back.  On real hardware a dirty line dropped by
+# dcbi loses the CPU's writes and memory keeps the older value; here there is no
+# dirty line and the writes survive.  Every dcbi site in SAB's main.dol is either
+#   (a) DCInvalidateRange 0x800e4e1c, whose callers use it to re-read a buffer a
+#       DMA engine wrote -- and this runtime models NO DMA engine, so those callers
+#       already read stale data for a reason that has nothing to do with the cache
+#       op (the same hole sr_image.c:438-442 names), or
+#   (b) LCDisable 0x800e5074 and the locked-cache allocators 0x8014b504 /
+#       0x8014b5bc / 0x8014b680 / 0x8014b7ac, which invalidate the normal-cache
+#       alias of a line they are about to own in the LOCKED cache -- and the
+#       locked cache is modelled as plain memory, so there is no alias to drop.
+# Neither is a case where a guest DEPENDS on the discard, and neither is silent:
+# the divergence is wrong data from an unmodelled DMA, not a wrong cache model.
+#
+# The dict is keyed by extended opcode so `--cache-audit` can enumerate exactly
+# what this boundary claims, and so a leave-one-out measurement is one deletion
+# (see README §9.8): `sr.CACHE_NOP_XO.pop(470)` re-refuses dcbi and nothing else.
+CACHE_NOP_XO = {
+    54:  'dcbst',    # write back, keep valid          -- data already IS memory
+    86:  'dcbf',     # write back + invalidate         -- data already IS memory
+    246: 'dcbtst',   # touch-for-store hint            -- pure hint
+    278: 'dcbt',     # touch hint                      -- pure hint
+    470: 'dcbi',     # invalidate WITHOUT writeback    -- see the ⚠ above
+    598: 'sync',     # storage barrier, one bus master, one thread
+    854: 'eieio',    # storage-ordering barrier, same
+    982: 'icbi',     # instruction-cache invalidate    -- see the note below
+    # 1010 is inherited from the hint list this table replaced and is NOT named
+    # here because I could not ground it: it is unassigned in the 750 user manual
+    # and it OCCURS ZERO TIMES in SAB's main.dol (measured over all 4,741 recovered
+    # boundaries, alongside 0 sites for tlbsync/566, tlbia/370 and tw/4).  Kept so
+    # this change moves no REL-side behaviour, labelled by number rather than by a
+    # mnemonic I would be inventing.
+    1010:'op31 xo=1010 (unassigned; 0 sites in main.dol)',
+}
+# icbi deserves its own sentence: it is what a guest calls after WRITING code.  A
+# static recompiler cannot execute newly-written guest code whether or not the
+# icache is flushed, so the no-op is not what makes SMC unsupported -- the
+# translation model is.  Overlay (REL) code is translated ahead of time by rel.py,
+# not discovered at run time through this instruction.
+
+# Leave-one-out seams for the other two halves of the same boundary.  Each False
+# restores exactly the pre-boundary refusal for that ONE instruction class and
+# nothing else, which is how the +N attributable to each is measured separately --
+# and the measurement showed the three are NOT independent (README §9.8).
+SC_EMIT     = True    # `sc`   (op 17)              -> gk_sc(),   gekko_rt.h
+DCBZ_L_EMIT = True    # dcbz_l (op4 xo=1014 xo5=22) -> gk_dcbz(), gekko_rt.h
+
+
+# ==========================================================================
+#                   THE DRIVE — RETIRED GUEST CYCLES
+# ==========================================================================
+# Under --retire, every emitted BASIC BLOCK opens with `gk_retire(N)` where N is the
+# summed Gekko cycle cost of the instructions in it.  That counter (g_gk_cycles) is
+# the ONLY input to guest time; see the long note beside gk_retire() in gekko_rt.h
+# for why a host clock in its place is a gate #9 bug rather than a shortcut.
+#
+# THE COSTS BELOW ARE NOT INVENTED.  They are Dolphin's `num_cycles` field,
+# transcribed from Source/Core/Core/PowerPC/PPCTables.cpp -- the same field its
+# interpreter returns per instruction (Interpreter.cpp:193) and its JIT accumulates
+# per instruction into the block downcount (Jit64/Jit.cpp:1003), which is in turn
+# what feeds CoreTiming::GetTicks() and therefore GetFakeTimeBase.  Using anything
+# else would make our guest clock disagree with the differential oracle's.
+#
+# 203 of the 243 table entries cost 1, so only the exceptions are listed.  To
+# re-derive: parse the `{opcode, "name", OpType::T, num_cycles, flags}` rows out of
+# the five tables in PPCTables.cpp and keep num_cycles != 1.  The table layout is
+# PPCTables.cpp:526-600: s_table4_2 and s_table63_2 replicate over the low 5 bits of
+# the extended opcode (hence the _XO5 dicts), s_table4_3 over the low 6, and the
+# rest index the full 10-bit xo.  s_table59 is a 32-entry xo5 table.
+GK_CYCLES_PRIMARY = {7: 3,      # mulli
+                     17: 2,     # sc
+                     46: 11,    # lmw
+                     47: 11}    # stmw
+GK_CYCLES_T4_XO5  = {18: 17,    # ps_div
+                     26: 2}     # ps_rsqrte
+GK_CYCLES_T19_XO  = {50: 2}     # rfi
+GK_CYCLES_T31_XO  = {4: 2,      # tw
+                     11: 5, 75: 5, 235: 5, 747: 5,          # mulhwux/mulhwx/mullwx/o
+                     54: 5, 86: 5, 470: 5, 758: 5, 1014: 5, # dcbst/dcbf/dcbi/dcba/dcbz
+                     246: 2, 278: 2,                        # dcbtst / dcbt
+                     459: 40, 491: 40, 971: 40, 1003: 40,   # divwux/divwx + OE forms
+                     467: 2,                                # mtspr
+                     982: 4,                                # icbi
+                     595: 3, 659: 3, 598: 3}                # mfsr / mfsrin / sync
+GK_CYCLES_T59_XO5 = {18: 17}    # fdivsx
+GK_CYCLES_T63_XO  = {38: 3, 70: 3, 134: 3, 711: 3}   # mtfsb1x/mtfsb0x/mtfsfix/mtfsfx
+GK_CYCLES_T63_XO5 = {18: 31}    # fdivx
+# ⚠ dcbz_l (op4 xo=1014) is ONE cycle in Dolphin's table (s_table4), while dcbz
+# (op31 xo=1014) is FIVE.  Transcribed as found rather than "corrected": the point of
+# using the oracle's table is that our guest clock and its guest clock agree.
+
+
+def gk_cycles(w):
+    """Gekko cycle cost of one instruction word — Dolphin's num_cycles."""
+    op = w >> 26
+    xo, xo5 = (w >> 1) & 0x3FF, (w >> 1) & 0x1F
+    if op == 4:
+        # No exact-xo entry in s_table4 costs anything but 1, and none of them is
+        # congruent to 18 or 26 mod 32 (Dolphin ASSERTs the sub-tables are disjoint
+        # while building table4), so the xo5 test alone is unambiguous here.
+        return GK_CYCLES_T4_XO5.get(xo5, 1)
+    if op == 19:
+        return GK_CYCLES_T19_XO.get(xo, 1)
+    if op == 31:
+        return GK_CYCLES_T31_XO.get(xo, 1)
+    if op == 59:
+        return GK_CYCLES_T59_XO5.get(xo5, 1)
+    if op == 63:
+        return GK_CYCLES_T63_XO.get(xo, GK_CYCLES_T63_XO5.get(xo5, 1))
+    return GK_CYCLES_PRIMARY.get(op, 1)
+
+
+def ends_block(w):
+    """True if control MAY leave the straight line after this instruction.
+
+    LK=1 forms (bl / bcl / bctrl / blrl) are CALLS: control comes back to pc+4, so
+    they do NOT end the block.  `sc` does not end one either -- gk_sc() returns.
+    Getting this wrong in the permissive direction OVER-CREDITS: a `blelr` in the
+    middle of DCFlushRange (OSCache.c:90) can return before the loop runs, and a
+    block credited at its head would have charged the guest for a loop it skipped.
+    """
+    op, xo, lk = w >> 26, (w >> 1) & 0x3FF, w & 1
+    if lk:
+        return False
+    return op in (16, 18) or (op == 19 and xo in (16, 528))
+
+
+RETIRE = False   # --retire; off by default so no existing artifact changes
+
+
 # ------------------------------------------------------------------ image loader
 class Image:
     """Flat vaddr -> byte map assembled from a DOL's TEXT/DATA sections."""
@@ -445,7 +591,16 @@ class Translator:
         if op == 19 and f['xo'] == 50:
             raise Untranslatable("rfi (privileged)", pc, w)
         if op == 17:
-            raise Untranslatable("sc (system call)", pc, w)
+            # `sc` is NOT a call into anything this translator owns: it takes a Gekko
+            # SYSTEM CALL exception to 0x80000C00, and what runs there is whatever the
+            # guest OS installed.  DOLSDK installs exactly one thing and gk_sc()
+            # reproduces its observable effect -- see the long note there.  All three
+            # `sc` sites in SAB's main.dol are the SDK's own store barrier: PPCSync
+            # 0x800e34c4, DCFlushRange 0x800e4e4c, DCStoreRange 0x800e4e80.
+            if not SC_EMIT:
+                raise Untranslatable("sc (system call)", pc, w)
+            o.append("gk_sc(st);")
+            return o
 
         # ---- integer arithmetic / logic ------------------------------------
         if op == 14:                                     # addi / li
@@ -589,9 +744,11 @@ class Translator:
                 o.append(f"gk_set_cr(st, {f['crfD']}, (st->xer >> 28) & 0xFu);"
                          f" st->xer &= 0x0FFFFFFFu;")
                 return o
-            # --- cache hints: architecturally no-ops for a coherent flat host RAM ---
-            if xo in (278, 246, 54, 86, 598, 854, 982, 1010):
-                return [f"/* cache hint xo={xo} (no-op on flat host RAM) */"]
+            # --- cache maintenance: no state to change on ONE flat coherent buffer.
+            # The table and the reasoning (including what dcbi does NOT reproduce)
+            # live at CACHE_NOP_XO, top of file.
+            if xo in CACHE_NOP_XO:
+                return [f"/* {CACHE_NOP_XO[xo]} (no cache on flat host RAM) */"]
             if xo == 1014:                               # dcbz
                 o.append(f"gk_dcbz({ea_x(f)});")
                 return o
@@ -730,8 +887,14 @@ class Translator:
                     f"m |= 0x{(0xF << ((7 - i) * 4)):08x}u;" for i in range(8) if crm & (1 << (7 - i))
                 ) + f" st->cr = (st->cr & ~m) | ({self.gp(S)} & m); }}")
                 return o
-            if xo in (54, 86, 246, 470, 1014, 598, 982, 4, 566, 370, 566):
-                raise Untranslatable(f"cache/sync/trap op x{xo} (host boundary)", pc, w)
+            # What is LEFT after CACHE_NOP_XO and dcbz: the MMU ops and the trap.  No
+            # MMU is modelled (gk_phys is a mask, not a translation), so tlbie/tlbia/
+            # tlbsync cannot be no-ops -- a guest that remaps something and continues
+            # would be silently wrong.  `tw`/`twi` is a trap: it BRANCHES to 0x700 on
+            # its condition, which no part of this runtime can deliver.  All four
+            # occur ZERO times in SAB's main.dol; they are refused, not emitted.
+            if xo in (4, 306, 370, 566):
+                raise Untranslatable(f"MMU/trap op x{xo} (no MMU, no exceptions)", pc, w)
             raise Untranslatable(f"op31 xo={xo}", pc, w)
 
         # ---- opcode-19 CR logic ----------------------------------------------
@@ -975,6 +1138,19 @@ class Translator:
                                      f" uint64_t _r0 = (_a0 >= 0.0) ? st->ps0[{fC}] : st->ps0[{fB}];"
                                      f" uint64_t _r1 = (_a1 >= 0.0) ? st->ps1[{fC}] : st->ps1[{fB}];"
                                      f" st->ps0[{fD}] = _r0; st->ps1[{fD}] = _r1; }}"); return o   # ps_sel
+            # dcbz_l -- NOT a paired-single arithmetic op; it shares opcode 4 only by
+            # encoding.  It is the LOCKED-CACHE half of dcbz and it is a REAL STORE,
+            # not a hint: ~/gc_refs/dolsdk2001/src/os/OSCache.c:349-352 `_lockloop`
+            # is how __LCEnable ESTABLISHES the lock, 512 lines x 32 B at 0xE0000000,
+            # after which the program reads and writes that memory with plain
+            # lwz/stw/psq_l/psq_st.  gekko_rt.h:61-71 already models that window as a
+            # real backing buffer (Dolphin does the same, MMU.cpp:246-253 / :437-442
+            # into m_l1_cache), and gk_dcbz already routes through GK_MAP, so this is
+            # the SAME statement op31 dcbz emits -- it was simply never wired up on
+            # this opcode, which made every function containing one unbuildable.
+            if xo == 1014 and xo5 == 22 and DCBZ_L_EMIT:
+                o.append(f"gk_dcbz({ea_x(f)});")
+                return o
             raise Untranslatable(f"paired-single op4 xo={xo} xo5={xo5}", pc, w)
 
         # ---- quantized paired load/store (opcodes 56/60) -------------------------
@@ -1023,9 +1199,33 @@ class Translator:
             last_pc, last_w, _ = insts[-1]
             insts.append((self.hi, None,
                           [self.callexpr(self.hi, last_pc, last_w) + " return;"]))
+        # --- THE DRIVE.  One gk_retire() per BASIC BLOCK, carrying the summed Gekko
+        # cycle cost of the instructions in it (see "THE DRIVE" at the top of this
+        # file).  Blocks are cut at self.lo, at every label (so a `goto` INTO the
+        # middle of a body still credits what it is about to run), and after every
+        # instruction that may transfer control -- which is what keeps a conditional
+        # early-out from being charged for the loop it skipped.  Instructions in a
+        # block that is never entered are never credited, which is the whole reason
+        # this is per-block and not per-function.
+        credit = {}
+        if RETIRE:
+            heads, prev_exit = {self.lo}, False
+            for pc, w, _ in insts:
+                if prev_exit or pc in self.labels:
+                    heads.add(pc)
+                prev_exit = w is not None and ends_block(w)
+            head = None
+            for pc, w, _ in insts:
+                if head is None or pc in heads:
+                    head = pc
+                    credit[head] = 0
+                if w is not None:
+                    credit[head] += gk_cycles(w)
         for pc, w, lines in insts:
             if pc in self.labels:
                 body.append(f"L_{pc:08x}:;")
+            if credit.get(pc):
+                body.append(f"    gk_retire({credit[pc]});")
             body.append(f"    /* {pc:08x}: {w:08x} */" if w is not None
                         else f"    /* {pc:08x}: fall-through to the next entry */")
             for l in lines:
@@ -1294,6 +1494,39 @@ def main():
                          'guest time inside the emitted image, so a guest cannot read '
                          'the clock behind the host layer\'s back. Same shape as '
                          '--msr-audit; pair it with the same --host set the build uses.')
+    ap.add_argument('--cache-audit', action='store_true',
+                    help='AUDIT THE CACHE-MAINTENANCE BOUNDARY: list every cache '
+                         'instruction in the image (CACHE_NOP_XO, dcbz, dcbz_l, sc) '
+                         'with the claim it is emitted under, and prove that no REAL '
+                         'operation (dcbz/dcbz_l, which are 32-byte stores) was '
+                         'reduced to a no-op and that no cache site sits inside a '
+                         '--host-bound function -- a host stub does not run the loop, '
+                         'so it would freeze r3/r4/r5/CTR/CR0 that verify_fixture.mjs '
+                         'scores. Exit 2 on either. NOTE the shape is the INVERSE of '
+                         '--msr-audit/--tb-audit: those fail when a body is emitted, '
+                         'because MSR and time are STATE with one host owner; cache '
+                         'maintenance has no state here, so emitting is the correct '
+                         'outcome and host-binding is the bug.')
+    ap.add_argument('--retire', action='store_true',
+                    help='THE DRIVE: emit gk_retire(N) at the head of every basic '
+                         'block, N = the summed Gekko cycle cost of its instructions '
+                         '(Dolphin PPCTables.cpp num_cycles). This is what makes guest '
+                         'TIME a function of guest WORK, so OSGetTime/OSGetTick/DEC '
+                         'advance at exactly 40.5 MHz per 486 MHz of retired guest '
+                         'cycles no matter how fast the host runs — CLAUDE.md gate #9. '
+                         'Without it g_gk_cycles stays 0, the clock is FROZEN, and a '
+                         'guest that polls it raises SR_F_TB_STALL by name instead of '
+                         'returning a plausible wrong number. Off by default so every '
+                         'existing fixture artifact stays byte-identical; the '
+                         'whole-image build passes it.')
+    ap.add_argument('--cache-ack', action='append', default=[], metavar='ADDR',
+                    help='for --cache-audit: acknowledge that this HOST-BOUND address\'s '
+                         'host implementation really does perform the dcbz/dcbz_l stores '
+                         'in its body. Only 0x800e4f70 __LCEnable qualifies today '
+                         '(sr_image.c runs its 512-line OSCache.c:349-352 _lockloop). '
+                         'Without it the audit exits 2, which is the point: a stub that '
+                         'silently skips guest stores must be a deliberate, written-down '
+                         'decision.')
     ap.add_argument('--jumptable-census', action='store_true',
                     help='report how many bctr jump tables statically RESOLVE. This is '
                          'the runtime-completeness number; --coverage cannot show it '
@@ -1325,6 +1558,8 @@ def main():
                          '— see sr_host_os.h and CONTEXT_SWITCH.md. Repeatable.')
     a = ap.parse_args()
     hosts = {int(x, 16) for x in a.host}
+    global RETIRE
+    RETIRE = bool(a.retire)
 
     img = Image.from_dol(a.image)
     syms = load_map(a.map)
@@ -1448,6 +1683,102 @@ def main():
             sys.exit(2)
         print("PASS: no emitted body can reach the timebase except through the host "
               "boundary.")
+        return
+
+    if a.cache_audit:
+        # WHAT THE GUEST CAN DO TO THE CACHE, enumerated rather than argued.  This audit
+        # is the OPPOSITE SHAPE to --msr-audit / --tb-audit and the difference is the
+        # whole design: MSR and the timebase are STATE with one host owner, so those
+        # audits fail if any body is EMITTED.  Cache maintenance has no state at all
+        # here, so the correct outcome is that every site IS emitted -- and what has to
+        # be proved instead is that each one lands on the claim it is supposed to land
+        # on.  A no-op emitted for `dcbz` (a real store) would be silent data loss, and
+        # a no-op FUNCTION standing in for DCFlushRange would silently freeze r3/r4/r5/
+        # CTR/CR0.  So this fails on:
+        #   * a REAL operation (dcbz, dcbz_l) reduced to a no-op, and
+        #   * a cache-maintenance site inside a function that is HOST-BOUND, i.e. one
+        #     whose registers a host stub would have to reproduce by hand.
+        REAL = {(31, 1014): 'dcbz', (4, 1014): 'dcbz_l'}
+        rows, bad_real, bad_host = [], [], []
+        for lo, size, name in units:
+            for p in range(lo, lo + size, 4):
+                w = img.word(p)
+                if w is None:
+                    continue
+                op, xo, xo5 = w >> 26, (w >> 1) & 0x3FF, (w >> 1) & 0x1F
+                if op == 17:
+                    kind, cls = 'sc', 'gk_sc() — DOLSDK 0xC00 vector, OSSync.c:9-21'
+                elif op == 31 and xo == 1014:
+                    kind, cls = 'dcbz', 'gk_dcbz() — REAL 32-byte store'
+                elif op == 4 and xo == 1014 and xo5 == 22:
+                    kind, cls = 'dcbz_l', 'gk_dcbz() — REAL 32-byte store (locked cache)'
+                elif op == 31 and xo in CACHE_NOP_XO:
+                    kind, cls = CACHE_NOP_XO[xo], 'no-op — no cache exists in this runtime'
+                else:
+                    continue
+                rows.append((lo, name, p, kind, cls))
+                if (op, xo) in REAL and 'REAL' not in cls:
+                    bad_real.append((p, kind))
+                if lo in hosts:
+                    bad_host.append((lo, name, p, kind))
+        byfn = {}
+        for lo, name, p, kind, cls in rows:
+            byfn.setdefault(lo, [name, collections.Counter()])[1][kind] += 1
+        for lo in sorted(byfn):
+            name, kinds = byfn[lo]
+            try:
+                Translator(img, lo, lo + byaddr[lo][0], starts=starts,
+                           indirect=a.indirect, jumptables=a.jumptables).translate()
+                verdict = 'emitted'
+            except Untranslatable as e:
+                verdict = f'refused ({e.why})'
+            if lo in hosts:
+                verdict = '*** HOST-BOUND — a stub must reproduce this loop by hand ***'
+            ops = ', '.join(f"{k}x{v}" for k, v in kinds.most_common())
+            print(f"{lo:#010x} {name[:30]:30s} [{ops}]  {verdict}")
+        print(f"\n{len(rows)} cache-maintenance sites in {len(byfn)} functions.")
+        print("emitted as REAL stores : dcbz / dcbz_l -> gk_dcbz()")
+        print("emitted as no-ops      : " + ", ".join(sorted(set(CACHE_NOP_XO.values()))))
+        print("emitted as the vector  : sc -> gk_sc()  (r9/r10 clobber, HID0 net zero)")
+        if bad_real:
+            print(f"FAIL: {len(bad_real)} REAL cache operation(s) reduced to a no-op.",
+                  file=sys.stderr)
+            sys.exit(2)
+        # A HOST-BOUND function containing cache sites is TWO different problems and
+        # they are not equally bad, so they are reported apart:
+        #   REAL sites (dcbz/dcbz_l) -- the stub must actually perform those stores or
+        #       memory the guest can read comes out wrong.  This is a HARD FAIL unless
+        #       the caller ACKNOWLEDGES the address with --cache-ack, which is how it
+        #       says "I read that host implementation and it does the stores".
+        #   no-op sites -- the stub skips a loop that changed only r3/r4/r5/CTR/CR0.
+        #       No guest MEMORY differs; a fixture differential would still score it.
+        #       Reported every time, never fatal, because it is a build-configuration
+        #       choice and the choice is visible in build_image.sh's HOSTS list.
+        ack = {int(x, 16) for x in a.cache_ack}
+        real_fns = {lo for lo, _, _, k in bad_host if k in ('dcbz', 'dcbz_l')}
+        hard = [(lo, n, p, k) for lo, n, p, k in bad_host
+                if k in ('dcbz', 'dcbz_l') and lo not in ack]
+        soft = sorted({(lo, n) for lo, n, _, _ in bad_host if lo not in real_fns})
+        for lo, n in soft:
+            print(f"NOTE: {lo:#010x} {n} is HOST-BOUND and every cache site in it is a "
+                  f"no-op -- no guest MEMORY differs, but the stub does not run the "
+                  f"loop, so r3/r4/r5/CTR/CR0 keep their entry values and "
+                  f"verify_fixture.mjs scores all of them.")
+        for lo, n, p, k in sorted({(lo, n, p, k) for lo, n, p, k in bad_host
+                                   if k in ('dcbz', 'dcbz_l')}):
+            state = 'ACKNOWLEDGED (--cache-ack)' if lo in ack else '*** UNACKNOWLEDGED ***'
+            print(f"REAL-in-host: {lo:#010x} {n} {k} at {p:#010x}  {state}")
+        if hard:
+            fns = sorted({f"{lo:#010x}" for lo, _, _, _ in hard})
+            print(f"FAIL: {len(hard)} REAL cache store(s) (dcbz/dcbz_l) sit inside "
+                  f"HOST-BOUND function(s) {', '.join(fns)} with no --cache-ack.  A "
+                  f"host stub that returns without performing them drops guest stores "
+                  f"silently.  Either translate the function, make the stub do the "
+                  f"stores, or --cache-ack it once you have read that it does.",
+                  file=sys.stderr)
+            sys.exit(2)
+        print("PASS: every cache-maintenance site is emitted or accounted for, and "
+              "every REAL one (dcbz/dcbz_l) is a real store.")
         return
 
     if a.jumptable_census:

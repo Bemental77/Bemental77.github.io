@@ -142,11 +142,26 @@ EMSCRIPTEN_KEEPALIVE void     sr_image_set_spr(uint32_t n, uint32_t v) { g_spr[n
 // wall-clock input Dolphin has is the ORIGIN, taken once at boot from the RTC
 // (SystemTimers.cpp:269) — sr_tb_seed() is the equivalent here.
 //
-// DRIVER, still to be attached by this file's boot loop: call sr_tb_retrace() once per
-// guest VI retrace (+675,000 ticks), the same guest event recomp_worker.js:786 drives
-// the shipping MP4 recomp's OSGetTime from at 0.999x.  Until then the clock is FROZEN
-// and a guest spinning on it raises SR_F_TB_STALL — loud, rather than silently wrong.
-static uint64_t img_timebase(void) { return sr_tb_read(); }
+// THE DRIVER IS ATTACHED, and it is not in this file.  It is `gk_retire()` inside the
+// EMITTED GUEST BODIES: build_image.sh passes sr.py --retire, which opens every basic
+// block with the summed Gekko cycle cost of its instructions (Dolphin's own num_cycles
+// table), so guest time advances because the GUEST RAN — from instruction one, with no
+// host event and no host clock anywhere in the path.  That is where Dolphin drives its
+// clock from too (Jit64/Jit.cpp:1003 accumulates the same field per instruction).
+//
+// A RETRACE DRIVER IS STILL THE RIGHT SHAPE FOR THE FRAME BOUNDARY and is kept
+// available as sr_tb_retrace() (+675,000 ticks), the same guest event the shipping MP4
+// recomp drives OSGetTime from at 0.999x.  It is not attached here for two measured
+// reasons: SAB's VIWaitForRetrace is not named in dolphin_captures/sab.map at all, so
+// its address has to be recovered by signature first; and the translated DOLSDK body
+// (~/gc_refs/dolsdk2001/src/vi/vi.c) sleeps on retraceQueue until a VI INTERRUPT bumps
+// retraceCount, which this runtime cannot deliver.  Until both are solved a retrace
+// hook would be inert, while the retirement drive is live now.
+//
+// ⚠ sr_tb_retrace() MUST be reached from the guest's retrace boundary if it is ever
+// wired up — never from JS on a timer.  build_image.sh does not export _sr_tb_field or
+// _sr_tb_credit for exactly that reason, and sr_host_os.c drops EMSCRIPTEN_KEEPALIVE
+// from both so the omission is enforced by the linker rather than by intent.
 
 // --------------------------------------------------------------- OSContext layout
 // ~/gc_refs/dolsdk2001/include/dolphin/os/OSContext.h.  The four offsets sr_host_os.h
@@ -413,8 +428,16 @@ static int img_host(GekkoState *st, uint32_t addr) {
         // timebase (sr_host_os.h "THE GUEST TIMEBASE"), so it belongs there.
         // ⚠ Its INTERRUPT is still not delivered — sr_tb_dec_exceptions() counts what
         // would have fired — because this runtime has no interrupt delivery at all.
-        if      (spr == 22u && xo == 339u) st->gpr[rt] = sr_dec_read();
-        else if (spr == 22u && xo == 467u) sr_dec_write(st->gpr[rt]);
+        // SPR 1008 IS HID0 AND IT HAS A SECOND READER.  gk_sc() (gekko_rt.h) needs it,
+        // because DOLSDK's `sc` vector is `mfspr r9,HID0 / ori r10,r9,8 / ...` and both
+        // registers survive the rfi.  Routing HID0 into this file's private g_spr[]
+        // would put the guest's value where the emitted code cannot see it — the same
+        // two-owners-one-quantity mistake the clock made — so there is ONE HID0,
+        // g_hid0, declared in gekko_rt.h and seeded with the BS2 boot value.
+        if      (spr == 22u   && xo == 339u) st->gpr[rt] = sr_dec_read();
+        else if (spr == 22u   && xo == 467u) sr_dec_write(st->gpr[rt]);
+        else if (spr == 1008u && xo == 339u) st->gpr[rt] = g_hid0;
+        else if (spr == 1008u && xo == 467u) g_hid0 = st->gpr[rt];
         else if (xo == 339u) st->gpr[rt] = g_spr[spr & 1023u];   // mfspr
         else if (xo == 467u) g_spr[spr & 1023u] = st->gpr[rt];   // mtspr
         else { img_log(addr, IMG_D_UNIMPL);
@@ -424,48 +447,78 @@ static int img_host(GekkoState *st, uint32_t addr) {
         return 1;
     }
 
-    // ---- CACHE CONTROL — IMG_D_VOID, and the reason is structural rather than a
-    // shortcut: this runtime's MEM1 is one flat host buffer with no cache in front of
-    // it and no address translation (gekko_rt.h masks 26 bits and indexes it
-    // directly).  Enabling, disabling, flushing, storing or invalidating a cache that
-    // does not exist has no state to change, so a no-op is the FULL semantics here, not
-    // an approximation of them.  Two sub-classes are folded in for the same reason:
-    // 0x800e34c4 / 0x800e4e4c / 0x800e4e80 reach the same operations through `sc`, and
-    // 0x800e4f70 __LCEnable / 0x800e5074 LCDisable manage the LOCKED cache, which
-    // README §5k established is ORDINARY MEMORY here and is already backed by the tail
-    // buffer whether or not it has been "enabled".
+    // ---- CACHE CONTROL — what is LEFT of it.  ⚠ THIS LIST SHRANK on 2026-09-04 and
+    // the shrink is the point: the cache-maintenance INSTRUCTIONS are now emitted (dcbi
+    // and the rest of CACHE_NOP_XO as no-ops, `sc` as gk_sc(), dcbz_l as a real store —
+    // see the long notes at the top of sr.py and beside gk_sc in gekko_rt.h), so
+    // PPCSync 0x800e34c4, DCInvalidateRange 0x800e4e1c, DCFlushRange 0x800e4e4c,
+    // DCStoreRange 0x800e4e80 and the four locked-cache allocators 0x8014b504 /
+    // 0x8014b5bc / 0x8014b680 / 0x8014b7ac are TRANSLATED now and no longer reach this
+    // hook at all.  Answering for them HERE would have been strictly worse than
+    // translating them: each of those bodies is a counted loop that leaves r3, r4, r5,
+    // CTR and CR0 changed, verify_fixture.mjs scores all 32 GPRs plus cr/lr/ctr
+    // (:521-543), and a host stub that "does nothing" would leave every one of them at
+    // its entry value.  A no-op instruction inside the real loop is exact; a no-op
+    // FUNCTION is not.
     //
-    // ⚠ THE ONE THING THIS DOES NOT COVER: a guest that uses DCFlushRange to publish a
-    // buffer to a DMA engine is relying on an ordering this runtime cannot violate
-    // (there is one memory), but a guest that uses DCInvalidateRange to RE-READ a
-    // buffer a DMA engine wrote is relying on the DMA having happened — and no DMA
+    // What remains is the set the translator still refuses for a DIFFERENT reason —
+    // privileged SPR access (HID0 / HID2 / DBAT), not cache maintenance:
+    //   0x800e4e08 DCEnable          mfspr/mtspr HID0    (OSCache.c:22-29)
+    //   0x800e4f4c ICFlashInvalidate mfspr/mtspr HID0    (:251-257)
+    //   0x800e4f5c ICEnable          mfspr/mtspr HID0    (:259-266)
+    //   0x800e4f70 __LCEnable        mfmsr + HID2 + DBAT3 (:309-369)
+    //   0x800e5074 LCDisable         dcbi loop + HID2     (:380-393)
+    // The LOCKED CACHE those last two manage is ORDINARY MEMORY here (README §5k,
+    // gekko_rt.h:61-71) and is backed by the tail buffer whether or not it has been
+    // "enabled", so voiding the enable/disable pair changes no memory the guest can
+    // observe.  DCEnable / ICEnable / ICFlashInvalidate ARE modelled rather than
+    // voided: their whole body is `HID0 |= bit`, HID0 has one owner (g_hid0), and the
+    // guest reads it back through PPCMfhid0 — and `sc` reads it too.
+    //
+    // ⚠ THE ONE THING NONE OF THIS COVERS, unchanged: a guest that uses DCFlushRange to
+    // publish a buffer to a DMA engine is relying on an ordering this runtime cannot
+    // violate (there is one memory), but a guest that uses DCInvalidateRange to RE-READ
+    // a buffer a DMA engine wrote is relying on the DMA having happened — and no DMA
     // engine is modelled.  That failure surfaces as wrong data, not as a fault here.
-    case 0x800e34c4u:   // PPCSync                (sc)
-    case 0x800e4e08u:   // DCEnable
-    case 0x800e4e1cu:   // cache/sync op x470
-    case 0x800e4e4cu:   // DCFlushRange-class     (sc)
-    case 0x800e4e80u:   // DCStoreRange-class     (sc)
-    case 0x800e4f4cu:   // ICFlashInvalidate
-    case 0x800e4f5cu:   // ICEnable
+    case 0x800e4e08u: g_hid0 |= 0x00004000u;   // DCEnable          HID0[DCE]
+                      img_log(addr, IMG_D_REAL); return 1;
+    case 0x800e4f5cu: g_hid0 |= 0x00008000u;   // ICEnable          HID0[ICE]
+                      img_log(addr, IMG_D_REAL); return 1;
+    case 0x800e4f4cu: g_hid0 |= 0x00000800u;   // ICFlashInvalidate HID0[ICFI]
+                      img_log(addr, IMG_D_REAL); return 1;
+    // __LCEnable is NOT void, and `sr.py --cache-audit` is what caught that.  Its body
+    // ends in OSCache.c:349-352 `_lockloop`: 512 x `dcbz_l`, which is a REAL 32-byte
+    // store, and a stub that returns without performing them drops 16 KB of zeroing.
+    // It happens to be invisible on a COLD boot -- sr_driver.c calloc()s the tail
+    // buffer, so the locked cache is already zero -- but it would NOT be invisible on
+    // an enable that follows a disable, and "correct by accident of the allocator" is
+    // not a semantics.  LC_BASE_PREFIX 0xE000 and LC_LINES 512 are OSCache.c's own.
+    // ⚠ STILL NOT REPRODUCED, named rather than implied: the register tail.  The real
+    // body leaves r3 = 0xE0004000, r4 = HID2|0x100f0000, r5 = MSR|0x1000, r6 = 0 and
+    // CTR = 0, and it sets MSR[ME], HID2[LCE] and DBAT3.  All five registers are
+    // volatile under the ABI and LCEnable 0x800e503c -- its only caller -- reads none
+    // of them afterwards, so no guest code sees it; a fixture differential would.
     case 0x800e4f70u:   // __LCEnable
-    case 0x800e5074u:   // LCDisable
-    case 0x8014b504u:   // cache/sync op x470
-    case 0x8014b5bcu:   // cache/sync op x470
-    case 0x8014b680u:   // cache/sync op x470
-    case 0x8014b7acu:   // cache/sync op x470
+        for (uint32_t i = 0; i < 512u; i++) gk_dcbz(0xE0000000u + i * 32u);
+        img_log(addr, IMG_D_REAL);
+        return 1;
+    case 0x800e5074u:   // LCDisable — its only cache site is a dcbi loop, and dcbi has
+                        // nothing to discard here (sr.py CACHE_NOP_XO).  The locked
+                        // cache stays exactly as modelled memory, which is what README
+                        // §5k established it is whether or not it has been "enabled".
         img_log(addr, IMG_D_VOID);
         return 1;
 
-    // ---- 0x800ecb48 OSGetTime / 0x800ecb60 OSGetTick.  `op31 xo=371` is mftb.  Both
-    // are REAL: they return the host monotonic clock converted at 40.5 MHz, so guest
-    // elapsed time equals host elapsed time exactly (see the gate-#9 note above the
-    // timebase).  OSGetTime returns the 64-bit tick in r3:r4 (high:low); OSGetTick
-    // returns the low 32 in r3.
-    case 0x800ecb48u: { uint64_t t = img_timebase();
-                        st->gpr[3] = (uint32_t)(t >> 32); st->gpr[4] = (uint32_t)t;
-                        img_log(addr, IMG_D_REAL); return 1; }
-    case 0x800ecb60u: { st->gpr[3] = (uint32_t)img_timebase();
-                        img_log(addr, IMG_D_REAL); return 1; }
+    // ---- 0x800ecb48 OSGetTime / 0x800ecb60 OSGetTick ARE NOT ANSWERED HERE ANY MORE.
+    // They were, and this file's own COLLISION WATCH said to delete them the moment
+    // sr_host_os.c grew a clock.  f33b3795 did exactly that, and img_timebase() was
+    // pointed at sr_tb_read() — but leaving the CASES here kept THIS layer winning,
+    // because img_hook asks img_host() before sr_host_call().  The values agreed, so
+    // nothing looked wrong; what was silently lost is everything the shared
+    // implementation adds AROUND the value — tb_read_guard's SR_F_TB_STALL, the
+    // SR_EV_GET_TIME / SR_EV_GET_TICK trace, and the g_tb_calls count.  A frozen clock
+    // has to be LOUD (sr_host_os.h "THE STALL FAULT"), and it cannot be loud from a
+    // layer that does not count reads.  There is now ONE owner: sr_host_os.c.
 
     // ---- 0x800e54ac __OSSaveFPUContext / 0x800e5388 __OSLoadFPUContext.  Skipped by
     // the translator only for their `mfspr SPR920` (HID2) probe of whether the
@@ -500,17 +553,19 @@ static int img_host(GekkoState *st, uint32_t addr) {
 // it can own __init_hardware and the SPR file, and sr_host_os.c is asked SECOND for the
 // MSR / context / SelectThread set it already owns (sr_host_os.h).
 //
-// ⚠ COLLISION WATCH, and it is live as of 2026-09-04.  As written, the two layers claim
-// disjoint addresses — but `sr_host_os.h` has just grown SR_EV_GET_TIME / SR_EV_GET_TICK
-// / SR_EV_SET_DEC and an `sr_tb_*` guest timebase, i.e. a second implementation of
-// OSGetTime / OSGetTick, which THIS file already answers at 0x800ecb48 / 0x800ecb60.
-// `sr_host_os.c` does not implement them yet (verified: no match for `sr_tb_` in it), so
-// nothing is wrong today.  The moment it does, THIS LAYER SILENTLY WINS because it is
-// asked first, and a guest clock believed to come from the shared, decrementer-aware
-// implementation would actually be coming from the four lines below.  When that lands,
-// delete this file's two clock cases rather than reordering the hook — sr_host_os.c is
-// the layer that also owns the decrementer and the stall fault, and a clock split across
-// two owners is how a timing bug becomes unattributable.
+// ⚠ COLLISION WATCH — RESOLVED 2026-09-04, and the resolution is worth keeping because
+// the collision was INVISIBLE while it was live.  This file used to answer OSGetTime /
+// OSGetTick at 0x800ecb48 / 0x800ecb60 as well as sr_host_os.c, and because img_host()
+// is asked FIRST, this layer won every time.  Both returned the same number
+// (img_timebase() had already been pointed at sr_tb_read() by f33b3795), so no test and
+// no log could tell — what was lost was everything the owning layer wraps around the
+// value: the SR_F_TB_STALL guard, the SR_EV_GET_TIME/GET_TICK trace and the read count.
+// The cases are gone; sr_host_os.c owns the clock alone.  The standing rule that made
+// this findable: for any quantity BOTH layers could answer for, delete the case here
+// rather than reordering the hook — sr_host_os.c is the layer that also owns the
+// decrementer and the faults, and a quantity split across two owners is how a timing
+// bug becomes unattributable.  HID0 was the next one in line and is handled the same
+// way, by having exactly one variable (g_hid0) rather than one per layer.
 //
 // This hook ALWAYS returns 1 — including for an address nobody implements.  That is
 // deliberate: returning 0 would send control back into sr_extern(), which would set the

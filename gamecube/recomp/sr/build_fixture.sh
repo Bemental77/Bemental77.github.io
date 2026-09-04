@@ -92,7 +92,7 @@ read -r -a SR_CF <<< "${SR_CFLAGS:-}"
 emcc ${SR_OPT:--O2} -DSR_VERIFY ${SR_CF[@]+"${SR_CF[@]}"} -I"$SR" "$OUT/sr_gen.c" ${EXTRA_SRC[@]+"${EXTRA_SRC[@]}"} ${HOST_SRC[@]+"${HOST_SRC[@]}"} "$SR/sr_driver.c" -o "$OUT/sr_fixture.js" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \
   -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=134217728 \
-  -sEXPORTED_FUNCTIONS=_sr_init,_sr_ram,_sr_ram_size,_sr_tail_size,_sr_state,_sr_state_size,_sr_call,_sr_staged,_sr_wlog,_sr_wlog_n,_sr_unstaged,_sr_verify_reset,_malloc"$HOST_EXP" \
+  -sEXPORTED_FUNCTIONS=_sr_init,_sr_ram,_sr_ram_size,_sr_tail_size,_sr_state,_sr_state_size,_sr_call,_sr_staged,_sr_wlog,_sr_wlog_n,_sr_unstaged,_sr_verify_reset,_sr_hid0,_sr_set_hid0,_malloc"$HOST_EXP" \
   -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32,wasmMemory \
   -Wl,--no-entry
 
