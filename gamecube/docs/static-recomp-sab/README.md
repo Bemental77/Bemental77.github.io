@@ -16,7 +16,7 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **`.rel` OVERLAY function, by execution** | **1 PASS** — `stg13D` `0x8121d80c`, §5g/§5h |
 | `bctr` jump tables | **145 of 147 recovered**, and one **PASS by execution** with a faulting control arm, §5b |
 | whole-image build at **`-O2`** | **builds, instantiates, 1056/0 bit-exact** — the "`-O0` is a real scaling constraint" note was an artifact worth **~24x**, §5j |
-| **whole-image throughput** | **0.621x** translated-code, Chrome, vs a same-session JIT baseline of **0.4450x** — NOT a system rate, §8 |
+| **whole-image throughput** | **~0.50x** translated-code on the one HOT-path fixture (0.62x on four non-hot ones), Chrome, vs a same-session JIT baseline of **0.4450x** — NOT a system rate, §8 |
 
 The two 2026-09-02 additions each came from a **harness** defect, not a translator one,
 and both are worth remembering because both produced a confident wrong reading:
@@ -1170,6 +1170,58 @@ not be read as a runtime effect.
 `-sENVIRONMENT` changes only the JS glue, and the web relink produced a wasm with the
 **identical md5** `b0e35dc87ee1567bc5a1215a0dd42153`. Hash-guarded before and after.
 
+### 8.1a The one HOT-PATH fixture — and it is the best measurement here, and it is lower
+
+Everything above is measured on functions that exist as fixtures by accident of what was
+capturable, not because they are hot. Mapping the PC histogram onto recovered function
+boundaries (§8.5) puts **none of them in the top 120**. One hot function was captured for
+this pass — `0x800fa704` `HandleReverb`, **rank #9 at 3.21%** of the measured profile:
+
+```
+0x800fa704  steps=14423  restore-set=3632B
+   per invocation : 0.065750 ms  (restore control 0.002000 ms = 3.0% of it, net 0.063750 ms)
+   guest instr/s  : 219.4 M raw   226.2 M restore-corrected
+```
+
+**226.2 M guest instr/s × CPI 1.0774 (its own closure) = 243.7 M guest cycles/s =
+0.5015x.** Machine load 1.72 — the quietest run in this document.
+
+**This is the most trustworthy number in §8 and it should be preferred over the
+aggregate above**, on all four axes that have produced bad readings in this project:
+
+| | the four `0x80111xxx` fixtures | `HandleReverb` |
+|---|---|---|
+| in the measured hot profile | **no** (none in top 120) | **yes, rank #9, 3.21%** |
+| restore control as share of run | 27-31% | **3.0%** |
+| guest instructions per invocation | 58-70 | **14,423** |
+| machine load | 3.97 → 4.91 | **1.72** |
+
+So the honest range across real SAB code is **0.50x-0.67x, and the highest-quality
+point sits at the bottom of it.** Read the headline as **~0.50x**, not 0.62x.
+
+> One function is not a profile. `HandleReverb` is audio DSP work and its instruction mix
+> need not resemble the Hu3D/game-logic hot path. This narrows the sample's *quality*
+> problem, not its *size* problem.
+
+### 8.1c The hot path is mostly NOT capturable, which is a finding in itself
+
+Five hot functions were attempted for this pass; **one came back usable.** The four
+rejections are not random:
+
+| entry | profile share | rejected because |
+|---|---|---|
+| `0x8011fff4` | 5.16% (rank #2) | `outside_mem1` = 1 |
+| `0x800fa574` | 1.91% | `ps1_dependency` = **320** |
+| `0x8011da30` | 1.53% | `outside_mem1` = 8 |
+| `0x8011d7b4` | 1.34% | `outside_mem1` = 1 |
+
+`outside_mem1` means the function touches addresses the MEM1-only replay harness cannot
+stage — i.e. **MMIO**. `ps1_dependency` means the result depends on an incoming paired-single
+lane the GDB stub cannot read. Both are properties of the *code*, not of the tooling's
+luck: **SAB's hot path talks to hardware and uses paired singles**, so a replay-based
+throughput rig will keep bouncing off it. That is an argument for the continuous-execution
+experiment in §8.4 rather than for capturing more fixtures.
+
 ### 8.1b Three results that came free with the run
 
 - **`SKIP 0x8121d80c faults 0xbad0d80c`** — the `stg13D` overlay function is *absent*
@@ -1240,11 +1292,55 @@ between the two is unmeasured, and every item below makes 0.676x optimistic:
 7. **7 of the 70 skipped functions are in the hot profile**, including
    `OSRestoreInterrupts` (0.53%), so even the DOL side is not fully executable yet.
 
+### 8.5 Where "hot" comes from, and how much of the workload the DOL build covers
+
+`gamecube/recomp/sr/profile_map.py` (new) maps the JIT probe's 256-byte PC histogram onto
+the **same** recovered boundaries the emitter uses, so the hot set is measured rather than
+assumed. Straddling buckets are split by covered bytes; buckets outside every recovered
+function are reported as `unmapped`, not folded into a neighbour.
+
+```
+python3 gamecube/recomp/sr/profile_map.py            # -> /tmp/sab_hot.json
+samples 15478   unmapped 476 (3.08%)
+functions touched 2033 of 4741 recovered
+0x80117e40     112B     1008.0    6.51%  cum   6.51%   zz_80117e40_
+0x8011fff4     304B      798.1    5.16%  cum  11.67%   zz_8011fff4_
+0x80117eb0      92B      720.0    4.65%  cum  16.32%   zz_80117eb0_
+0x800f3780     152B      638.6    4.13%  cum  20.45%   zz_800f3780_
+0x80003140     276B      603.1    3.90%  cum  24.34%   zz_80003140_
+0x80117df8      72B      576.1    3.72%  cum  28.07%   zz_80117df8_
+0x80120158     648B      530.2    3.43%  cum  31.49%   zz_80120158_
+0x800f3718     104B      518.8    3.35%  cum  34.84%   getCurrentFieldEvenOdd
+0x800fa704    1292B      496.3    3.21%  cum  38.05%   HandleReverb
+```
+
+Two things follow that matter for §8:
+
+- **The workload has a long tail.** 2,033 distinct functions are touched and it takes ~47
+  of them to reach 66% of samples. There is no small hot set to hand-optimise.
+- **The DOL-only build covers 96.92% of the executed samples on this scene** — 15,002 of
+  15,478 inside the DOL's `.text`, 449 (2.90%) at `0x80bc____` (the OSAlloc arena, i.e. an
+  overlay), 27 below `0x80003100`. So the "overlays are 93.64% of the instructions"
+  figure, which is about *static code*, badly overstates the runtime gap **on this
+  scene**. City Escape gameplay with `stg13D` resident would shift it substantially, and
+  that has not been measured.
+
 ### 8.4 The honest reading
 
 On the one comparison that can be made today — translated code versus the JIT's
-whole-system rate, which favours the recompiler — static recomp is at **0.621x against
-0.4450x, i.e. ~1.40x the JIT**, and needs a further **~1.61x** to reach 1.000x.
+whole-system rate, which favours the recompiler — static recomp measures
+**0.50x-0.67x against 0.4450x**. Weighting by measurement quality (§8.1a), the number
+to carry is the hot-path one:
+
+| | translated-code rate | vs JIT 0.4450x | still needed for 1.000x |
+|---|---|---|---|
+| `HandleReverb`, hot, 3% control | **0.5015x** | **1.13x** | **2.00x** |
+| four non-hot fixtures, aggregate | 0.621x | 1.40x | 1.61x |
+
+**~0.50x and ~1.13x the JIT is the honest headline.** That is a much weaker result than
+"static recomp obviously escapes the JIT ceiling", and it is weaker in the direction that
+matters, because *every* remaining unknown pushes it down further, not up: the SR side
+has no host layer, no interrupts, no GPU, no audio, no OS scheduling, and a hot cache.
 
 That is *not* the "it obviously escapes the ceiling" result the route was pitched on,
 and it is *not* a refutation either, because the comparison is unequal in the
@@ -1270,9 +1366,10 @@ two.
 **What that claim does NOT cover, stated plainly:**
 
 1. ~~**There is no performance number of any kind for the SAB static-recomp path.**~~
-   **SUPERSEDED 2026-09-04 — §8.** The whole-image `-O2` build measures **0.621x**
-   (translated-code throughput, Chrome) against a same-session JIT baseline of
-   **0.4450x**. That is ~1.40x the JIT and ~1.61x short of 1.000x — but the comparison
+   **SUPERSEDED 2026-09-04 — §8.** The whole-image `-O2` build measures **~0.50x** on
+   the one hot-profile fixture (0.62x on four non-hot ones), translated-code throughput
+   in Chrome, against a same-session JIT baseline of
+   **0.4450x**. That is ~1.13x the JIT and ~2.0x short of 1.000x — but the comparison
    is unequal in the recompiler's favour (no host layer on the SR side at all), so it
    bounds nothing on its own. **The premise "this escapes the JIT ceiling" is still
    unproven**: what is measured is that translated code is not obviously the
