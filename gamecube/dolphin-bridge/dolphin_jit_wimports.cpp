@@ -467,16 +467,16 @@ uint32_t dolphin_check_exc(uint32_t /*unused*/) {
     // canonical vector stub loaded r4=junk, OSDefaultExceptionHandler ran on r1=0 forever
     // (~470k mailbox calls/60s). Generalizes the old EI-only 0xC0==0 suppression to ALL
     // delivery — pre-OSInit, native never vectors either.
+    //
+    // [libogc fix 2026-09-04] The bare MEM[0xC0] test is replaced by
+    // PowerPC::MaskableVectorGateSatisfied, which asks the guest's INSTALLED 0x500 stub
+    // whether it dereferences MEM[0xC0] at all. libogc's stub does not (it frames off r1),
+    // so MEM[0xC0] stays 0 for that guest's whole life and this gate held EXT|DEC pending
+    // forever — 240pSuite parked at pc=0x80009374 with Exceptions=0x5, 0 credited MHz.
+    // The SDK titles (MP4/SAB/PSO) all carry `lwz rD, 0xC0(r0)` at word 1 of their stub and
+    // therefore keep the exact old behaviour. Full derivation: PowerPC.cpp, at that function.
     {
-        const u8* ram0 = sys.GetMemory().GetRAM();
-        u32 os_ctx = 0;
-        if (ram0) {
-            os_ctx = (u32(ram0[0xC0]) << 24) | (u32(ram0[0xC1]) << 16) |
-                     (u32(ram0[0xC2]) << 8) | u32(ram0[0xC3]);
-        }
-        // Valid = nonzero PHYSICAL MEM1 pointer (the OS stores the context pointer at 0xC0
-        // as physical: steady-state observed 0x001a5b38; the seed-era garbage was 0x074d5045).
-        const bool os_ready = (os_ctx != 0u) && (os_ctx < 0x01800000u);
+        const bool os_ready = PowerPC::MaskableVectorGateSatisfied(sys);
         if (!os_ready) {
             // OS not ready: hold the MASKABLE classes (EXT|DEC — they dispatch through the
             // OSContext-loading stubs and seeded the r1=0 orbit); let sync exceptions
@@ -497,30 +497,13 @@ uint32_t dolphin_check_exc(uint32_t /*unused*/) {
     // of dolphin_check_exc self-time). Real exception logic follows.
 
     if (ps.Exceptions & EXCEPTION_EXTERNAL_INT) {
-        // Read MEM[0xC0] directly from host RAM (avoids MMU translation
-        // path's MSR.DR-state dependency). Memory::MemoryManager::GetRAM()
-        // returns the MEM1 base; OSCurrentContext lives at physical 0xC0.
-        const u8* ram = sys.GetMemory().GetRAM();
-        u32 os_current_context_ptr = 0;
-        if (ram) {
-            // Big-endian 4-byte read from MEM[0xC0..0xC3].
-            os_current_context_ptr = (u32(ram[0xC0]) << 24) |
-                                     (u32(ram[0xC1]) << 16) |
-                                     (u32(ram[0xC2]) <<  8) |
-                                      u32(ram[0xC3]);
-        }
-        if (os_current_context_ptr == 0) {
-            // OSCurrentContext not yet installed. Suppress EI delivery for
-            // THIS call by temporarily clearing the EXT_INT pending bit
-            // (other exceptions, if pending, still process), then restore
-            // it so subsequent dolphin_check_exc calls re-evaluate.
-            const u32 saved = ps.Exceptions & EXCEPTION_EXTERNAL_INT;
-            ps.Exceptions &= ~EXCEPTION_EXTERNAL_INT;
-            const u32 pc_before_supp = ps.pc;
-            PowerPC::CheckExceptionsFromJIT(ppc);
-            ps.Exceptions |= saved;
-            return (ps.pc != pc_before_supp) ? 1u : 0u;
-        }
+        // [libogc fix 2026-09-04] The bare `OSCurrentContext (MEM[0xC0]) == 0 -> suppress EI`
+        // branch that lived here is DELETED as redundant-for-SDK / fatal-for-libogc. It is
+        // strictly subsumed by the MaskableVectorGateSatisfied gate above:
+        //   * stub dereferences MEM[0xC0] (MP4/SAB/PSO): the gate already returned early when
+        //     that word was 0, so this branch was UNREACHABLE — removing it changes nothing.
+        //   * stub does not (libogc/240pSuite): MEM[0xC0] is 0 for the guest's entire life, so
+        //     this branch suppressed every external interrupt forever even once the gate opened.
 
         // Jit64 mtmsr "issue 4336": when the EI is caused by the Command
         // Processor (GPU FIFO), defer delivery so the next block runs and

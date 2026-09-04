@@ -372,6 +372,62 @@ Note the shape: **every rate witness reads 0 and so does `drawn/s`.** That is
 what a dead core looks like, and it is distinguishable from the F5 parked-core
 case only by the path — which is why the rig reports the path on every row.
 
+#### F6a. ROOT-CAUSED AND FIXED 2026-09-04 — the os-ready gate was SDK-only
+
+The dead core was **our** gate, not the guest. `PowerPC::CheckExternalExceptions`
+(`PowerPC.cpp`) and `dolphin_check_exc` (`dolphin_jit_wimports.cpp`) both refused
+to vector any maskable exception until `MEM[0x800000C0]` held a valid MEM1
+pointer. That word is the **Nintendo SDK's `OSCurrentContext`**; the gate exists
+because the SDK's 0x500 stub dereferences it. 240pSuite is **libogc**, whose 0x500
+stub frames off `r1` and never touches `MEM[0xC0]`, so the word stays 0 for the
+guest's whole life and the gate never opened.
+
+Evidence, all from this run and the native oracle:
+
+| | 240pSuite (libogc) | MP4 / SAB / PSO (SDK) |
+|---|---|---|
+| `stub500` word 1 | `0x542400BE` `clrlwi r4,r1,2` | `0x808000C0` `lwz r4,0xC0(r0)` |
+| `osCtxC0` | `0` in every captured run | `0x1a5828` / `0x2bafc8` / `0x5442d8` … |
+| gate verdict | never opens | opens |
+
+`MEM[0xC0..0xCF]` also reads all zeroes on **native** Dolphin dual-core
+(GDB stub, 6/6 breakpoint hits at `0x80009374`) while the suite renders normally
+(`[matlog] f=1 … f=301`) — so 0 there is correct libogc behaviour, not a fault.
+
+The fix makes the `MEM[0xC0]` test conditional on the installed stub actually
+containing an `lwz rD, 0xC0..0xDF(r0)` (`PowerPC::MaskableVectorGateSatisfied`),
+so the SDK titles keep the old behaviour byte-for-byte and libogc is unblocked.
+
+Measured delta, same page, same 3-step build, `.wasm` md5
+`82bc8f8b…` → `363668a9…`:
+
+| | before | after |
+|---|---:|---:|
+| credited | **0.0 MHz** over 95.1 s | **66.1 MHz** over 205.0 s |
+| guest clock (`ai_dma_cb`) | 0/s → n/a | 544.9/s → **0.136x** |
+| `ppc_state.Exceptions` | **0x5 stuck** (DEC\|EXT) | 0x1 (DEC), EXT clears |
+| `pc` | **frozen 0x80009374**, 32/33 windows | wanders, 24/24 windows distinct region |
+| blocks compiled | 596 | 698 |
+
+**Still open — a SECOND, distinct blocker.** 240pSuite now executes but never
+draws (`drawn=0/s`, `peFrames=0`, black canvas over 240 s = ~32 s of guest time;
+native reaches its first frame in ~10 s of guest time). The PC census
+(`/tmp/wasm_pc_hist.json`, 37,311 samples, flat across all 16 ten-second
+segments) puts 94% of samples in five libogc LWP functions:
+`fn_800297d8` 27.4% (`gettime`, the `mftbu/mftb/mftbu` retry),
+`fn_8000a950` 20.8% (GPR-restore epilogue),
+`fn_8002c5b4` 17.7% (watchdog insert, EE-disabled),
+`fn_8002c700` 16.4% (watchdog remove, EE-disabled),
+`fn_8002c4ec` 11.7% (watchdog remaining = deadline − `gettime`).
+That is a timed-wait being armed, measured and cancelled in a tight cycle — the
+shape of a system whose timer/VI interrupts never arrive. `Exceptions` reads
+`0x1` (DEC pending, undelivered) and `msr` reads `0x1032` (**EE=0**) at both
+end-of-run samples; `piCauseMirror` is `0x10008`→`0x10100` (VI asserted, stuck).
+No sample lands in the exception continuation `fn_80009730` or at a vector.
+REFUTED on the way: `make_ppc_mask` is correct for all 1024 (MB,ME) pairs
+including the wrapping forms this loop uses, so the `mtmsr`/EE-restore masks are
+not the cause.
+
 ### F7. Arming the meter is below this rig's resolution
 
 Matched pairs, same scene, same frozen binary, meter OFF → ON (W1 median):

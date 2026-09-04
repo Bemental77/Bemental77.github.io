@@ -673,6 +673,77 @@ void PowerPCManager::CheckExceptions()
   MSRUpdated();
 }
 
+#ifdef __EMSCRIPTEN__
+// [os-ready gate, generalized 2026-09-04 — the 240pSuite fix]
+//
+// WHAT THE OLD GATE DID. `CheckExternalExceptions` and `dolphin_check_exc` both refused
+// to vector ANY maskable exception (EXTERNAL_INT / DECREMENTER) unless MEM[0x800000C0]
+// held a plausible physical MEM1 pointer. That address is the NINTENDO SDK's
+// `OSCurrentContext`, and the gate exists because the SDK's canonical 0x500 stub
+// dereferences it: a boot-era delivery with MEM[0xC0] garbage (0x074d5045) sent
+// OSDefaultExceptionHandler orbiting on a null stack (~470k mailbox calls/60s).
+//
+// WHY IT WAS WRONG. `OSCurrentContext` is an SDK convention, not hardware. libogc's
+// exception stubs build their frame from the CURRENT STACK POINTER and never touch
+// MEM[0xC0], so a libogc title leaves that word 0 for its entire life — CONFIRMED on
+// native Dolphin (GDB stub, dual-core, 240pSuite-1.10b.dol: MEM[0xC0..0xCF] read all
+// zeroes at every one of 6 breakpoint hits while the suite rendered normally).
+// Against such a guest the gate never opens, so EXT and DEC can never be delivered.
+// Measured consequence (probe log /tmp/gcw/suite240p-cold.log, .wasm md5
+// 82bc8f8b6e1c6ac8db27ec0a5d49dadb): ppc_state.Exceptions stuck at 0x5
+// (DECREMENTER|EXTERNAL_INT), pc frozen at 0x80009374 — the instruction after the
+// `mtmsr` in libogc's context switch that first sets MSR.EE — for 32 of 33 sampled
+// windows, 0 credited MHz, 0 drawn/s, 0 published/s, black canvas.
+//
+// THE DISCRIMINATOR. Ask the installed stub itself whether it needs MEM[0xC0]. The
+// SDK stub's SECOND word is `lwz r4, 0xC0(r0)` (0x808000C0); libogc's second word is
+// `clrlwi r4, r1, 2` (0x542400BE). Measured over every captured probe run in
+// /tmp/gcw: MP4, SAB and PSO all carry an `lwz rD, 0xC0(r0)` at word 1 of their 0x500
+// stub AND a valid MEM[0xC0]; 240pSuite carries neither. So gating on the presence of
+// that load keeps the SDK titles on exactly the old behaviour and unblocks libogc.
+//
+// The "is a stub installed at all" check (word0 nonzero / not 0xFFFFFFFF) preserves
+// the boot-era protection the MEM[0xC0] test used to provide incidentally: nothing
+// vectors into a vector page the guest has not written yet.
+bool MaskableVectorGateSatisfied(Core::System& system)
+{
+  const u8* ram0 = system.GetMemory().GetRAM();
+  if (!ram0)
+    return false;
+  const auto read32 = [ram0](u32 off) {
+    return (u32(ram0[off]) << 24) | (u32(ram0[off + 1]) << 16) | (u32(ram0[off + 2]) << 8) |
+           u32(ram0[off + 3]);
+  };
+
+  // External-interrupt vector (0x500). DEC vectors to 0x900, but both are installed by
+  // the same OS routine and share a stub family, so 0x500 is the representative probe.
+  const u32 stub0 = read32(0x500);
+  if (stub0 == 0u || stub0 == 0xFFFFFFFFu)
+    return false;  // vector page not installed yet.
+
+  // Does the stub load from low memory 0xC0..0xDF off r0? That window is the SDK's
+  // OSCurrentContext (0xC0) / OSCurrentFPUContext (0xD4).
+  bool needs_os_context = false;
+  for (u32 i = 0; i < 8u; ++i)
+  {
+    const u32 inst = read32(0x500 + i * 4u);
+    const u32 opcode = inst >> 26;
+    const u32 ra = (inst >> 16) & 0x1Fu;
+    const u32 disp = inst & 0xFFFFu;
+    if (opcode == 32u && ra == 0u && disp >= 0xC0u && disp <= 0xDFu)  // lwz rD, disp(r0)
+    {
+      needs_os_context = true;
+      break;
+    }
+  }
+  if (!needs_os_context)
+    return true;  // stub is self-contained (libogc): safe to vector.
+
+  const u32 os_ctx = read32(0xC0);
+  return os_ctx != 0u && os_ctx < 0x01800000u;
+}
+#endif
+
 void PowerPCManager::CheckExternalExceptions()
 {
 #ifdef __EMSCRIPTEN__
@@ -696,15 +767,12 @@ void PowerPCManager::CheckExternalExceptions()
   // forever (~470k mailbox calls/60s). dolphin_check_exc has the same gate, but boot-era
   // callers (JitWasm.cpp:287 via the terminal else, CoreTiming Advance) bypass it — this is
   // the single funnel every route shares.
-  {
-    const u8* ram0 = m_system.GetMemory().GetRAM();
-    u32 os_ctx = 0;
-    if (ram0)
-      os_ctx = (u32(ram0[0xC0]) << 24) | (u32(ram0[0xC1]) << 16) |
-               (u32(ram0[0xC2]) << 8) | u32(ram0[0xC3]);
-    if (os_ctx == 0u || os_ctx >= 0x01800000u)
-      return;  // OS context not installed: nothing maskable may vector.
-  }
+  //
+  // [libogc fix 2026-09-04] The MEM[0xC0] test is now CONDITIONAL on the installed stub
+  // (PowerPC::MaskableVectorGateSatisfied below). Unconditional, it made 240pSuite
+  // permanently un-bootable — see that function's comment.
+  if (!PowerPC::MaskableVectorGateSatisfied(m_system))
+    return;  // exception stubs not ready to receive a maskable vector.
 #endif
   u32 exceptions = m_ppc_state.Exceptions;
 

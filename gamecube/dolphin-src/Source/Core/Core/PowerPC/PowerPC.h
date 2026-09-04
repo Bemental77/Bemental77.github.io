@@ -27,6 +27,10 @@ namespace CoreTiming
 {
 struct EventType;
 }
+namespace Core
+{
+class System;
+}
 
 namespace PowerPC
 {
@@ -349,6 +353,17 @@ void UpdatePerformanceMonitor(u32 cycles, u32 num_load_stores, u32 num_fp_inst,
 void CheckExceptionsFromJIT(PowerPCManager& power_pc);
 void CheckExternalExceptionsFromJIT(PowerPCManager& power_pc);
 void CheckAndHandleBreakPointsFromJIT(PowerPCManager& power_pc);
+
+#ifdef __EMSCRIPTEN__
+// [os-ready gate, generalized 2026-09-04] "May a MASKABLE exception (EXT/DEC)
+// vector right now?" — the boot-era guard that used to be an unconditional
+// `MEM[0xC0] must be a valid MEM1 pointer` test. It is now conditional on the
+// guest's INSTALLED 0x500 stub actually dereferencing MEM[0xC0]. See the
+// implementation in PowerPC.cpp for the measurement that motivated it.
+// Both delivery funnels (CheckExternalExceptions and the JIT's
+// dolphin_check_exc) must ask the same question, hence one shared predicate.
+bool MaskableVectorGateSatisfied(Core::System& system);
+#endif
 
 // Easy register access macros.
 #define HID0(ppc_state) ((UReg_HID0&)(ppc_state).spr[SPR_HID0])
