@@ -3147,6 +3147,208 @@ So the next boundary worth building is the **context switch** (already transcrib
 after it **cache maintenance**, which `sr_image.c` already argues is `IMG_D_VOID` on
 structural grounds: there is no cache in this runtime to control.
 
+### 9.8 The SCENE was the other bound — a way to MAKE scenes, and what three more moved
+
+§9.6 named this constraint exactly: *"The way to more breadth is more SCENES, not a
+faster rig — a second savestate is now the highest-value input to this route."* 373 of
+2,704 eligible DOL entries executed in the one parked City Escape state, and all 2,331
+refusals carried a single reason, `never executed in this scene`.
+
+**There was no way to make a second savestate.** The rig can read a state and can pick
+the Dolphin whose STATE_VERSION matches it (§5h), but nothing here could *play the
+game*, and the only SAB state on this machine was that one City Escape park
+(`~/Library/Application Support/Dolphin/StateSaves/GSNE8P.s01`, STATE_VERSION 177,
+written by `/Applications/Dolphin.app`). This is orthogonal to §9.7: the MSR boundary
+unblocks entries the offline gate *refuses*; this reaches entries the gate already
+allows and no scene has ever *run*.
+
+#### `gamecube/tools/scene_driver.py` — and three things that do not work
+
+It launches `/Applications/Dolphin.app` against a PRIVATE user directory (`-u`),
+navigates with synthetic input, screenshots what is on screen so the route is SEEN
+rather than guessed, and writes savestates through Dolphin's own hotkeys. Casey's real
+`~/Library/Application Support/Dolphin` config is never modified.
+
+1. **AppleScript cannot drive Dolphin at all.** Dolphin's macOS keyboard input is
+   `CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, m_keycode)`
+   (`InputCommon/ControllerInterface/Quartz/QuartzKeyboardAndMouse.mm:194`). `System
+   Events` posts to a process serial number, which never updates the HID system state,
+   so Dolphin sees **nothing** — observed here as the screenshot hotkey silently never
+   firing while every `osascript` call returned success. Events have to go through
+   `CGEventPost(kCGHIDEventTap, …)`; the tool compiles a small helper that does, from
+   source embedded in itself.
+2. **A zero-duration key TAP can be missed entirely**, because that key state is
+   POLLED. Every press is `key down` / hold N ms / `key up`. This applies to HOTKEYS
+   exactly as to the pad — `HotkeyScheduler` polls the same `ControllerInterface`
+   (`DolphinQt/HotkeyScheduler.cpp:152-165`).
+3. **`System Events` has no key constant for the arrow keys**, which the stock GCPad
+   profile binds the main stick to (`key down up arrow` is a -2740 syntax error). Moot
+   once presses are raw keycodes, but it is why the tool ships its own letter-only pad
+   profile inside its private user dir.
+
+Two more that cost time: a fresh Dolphin user dir raises a first-run analytics modal
+that nothing can click unless `[Analytics] PermissionAsked = True` is pre-written, and
+`screencapture` is unusable from this process ("could not create image from display" —
+no Screen Recording permission), so screenshots have to come from Dolphin's own hotkey.
+
+SAB's route to its own main menu is `Start`, `Start`, `Start`, `A` (memory-card slot
+screen), `A` (NEW FILE) — and one of those `Start`s lands on an attract-mode 3D
+character screen that looks nothing like the title screen. That is why the tool
+screenshots every step instead of replaying a guessed button sequence.
+
+#### The four scenes, each proven to restore
+
+All are STATE_VERSION 177 / `Dolphin 2603a` — the same oracle binary the committed City
+Escape state needs — so they drop straight into the existing rig, and all four are
+installed beside it in `~/Library/Application Support/Dolphin/StateSaves/`. Each was
+re-launched under `-s` and screenshotted BEFORE it was surveyed, because §5h's trap is
+that a refused state SILENTLY COLD-BOOTS and every later number still looks plausible.
+The survey adds a second, independent proof: `fixture_dol.py` aborts if the connect PC
+is the DOL entry `0x80003140`, and all five connect PCs below are distinct and none is
+it.
+
+| slot | scene | connect `pc` | evidence |
+|---|---|---|---|
+| `.s01` | City Escape (committed baseline) | `0x801012b4` | §9.4 |
+| `.s03` | title screen, rolling into the attract demo | `0x80123478` | `scenes/s03-title-at-save.png`, `scenes/restore-s03-title-plus22s-attract.png` |
+| `.s04` | main menu — 1P PLAY / 2P BATTLE / EXTRA / OPTIONS | `0x80101988` | `scenes/restore-s04-mainmenu.png` |
+| `.s05` | Dark-story opening cutscene (Iron Gate intro) | `0x801030f8` | `scenes/restore-s05-cutscene.png` |
+| `.s06` | Iron Gate — Eggman mech gameplay, live enemies | `0x80117e0c` | `scenes/restore-s06-irongate.png` |
+
+`0x80117e0c` is SAB's own frame-governor busy-wait head
+(`gamecube/docs/sab-frame-governor/TASKS.md:68`) — the game parked in its per-frame
+wait, mid-game and not a boot. The `.s06` restore screenshot was taken 22 s after the
+load and its stage timer has advanced from `00:13:57` to `00:49:50`; a stale-frame
+screenshot cannot fake that.
+
+#### ⚠ The survey's control anchor is picked by a heuristic that DIES, and it cost three runs
+
+Three surveys — Iron Gate, main menu, and an Iron Gate retry — **aborted mid-enumeration
+with `TimeoutError` and captured nothing** (`"n_armed": 2704, "fixtures": [], "aborted":
+"TimeoutError: timed out"`).
+
+`survey_waves` calibrates a control anchor and then takes the **rarest** candidate whose
+period is under `wave_budget / 4` (`fixture_rel.py:452-455`). At the defaults
+(`--anchor-budget 60`, `--wave-budget 180` → 45 s) that bar is cleared by **two hits**,
+and two hits is not a rate; both first runs picked a 2-hit candidate. Raising the sample
+to `--anchor-budget 120 --wave-budget 60` — a qualifying candidate then needs ≥ 8 hits
+and must fire 3× more often — picked `0x800d05d0` at *10 hits in 120 s* and **still
+died**.
+
+The anchor is the only thing that can hand control back (this stub has no async break),
+so when the parked scene moves on — a death, a menu timeout, a disc load — and that
+candidate stops being called, the `cont` blocks past `--cont-timeout` and the ENTIRE run
+is lost, *including the enumeration that had already succeeded*: `on_executed` runs only
+after enumeration completes, so a partial executed set is never written.
+
+**The fix is to stop guessing and name an anchor tied to the FRAME LOOP:**
+`--anchor-off 80117df8`. `zz_80117df8_` is SAB's frame governor; it is already in the
+eligible armed set (`nonleaf`, 72 B, closure 2, `blocked: None`) and it is 3.72% of the
+measured PC profile (§8.5). Every in-game and menu survey after that change ended
+cleanly on the `--enum-idle` rule instead of on a timeout. **Reproduce any survey below
+with `--anchor-off 80117df8`; the default heuristic is not usable on a live scene.**
+
+> It is not universal, and the exception is recorded rather than smoothed over: the
+> TITLE screen (`.s03`) aborted with the same `TimeoutError` under this anchor, so SAB's
+> in-game frame governor is **not** executed on a pre-game screen. That scene is made
+> and restore-proven but is NOT surveyed here; it needs an anchor of its own.
+
+#### Executed-entry delta — the armed set is byte-identical to the baseline's
+
+Every run below arms the same 2,704 eligible entries as the committed City Escape run —
+the `md5` of the joined armed list is `6354a7468f98` in the baseline's candidates file
+and in all three new ones — on the same `outer+calls` boundaries, against the same
+oracle (`/Applications/Dolphin.app`, `CPUCore=0` interpreter). Only the scene differs.
+"NEW" is cumulative down the table. Verification replays every fixture against the SAME
+whole-image build that produced §9.5's 330 — `--indirect --jumptables`, `-O0`, wasm md5
+`402d92fbc37861830d9565e73f1e92ab`, hash-identical before and after every run — so the
+delta is purely the scene. That build's regression gate was re-run first and scores
+§9.5's figure exactly: `12 verified / 16 attempted / 0 mismatched`.
+
+| scene | enum budget | executed / 2,704 | NEW vs the scenes above | captured | verified |
+|---|---|---|---|---|---|
+| City Escape `.s01` (the prior record) | 600 s | 373 (13.8%) | — | 372 | 330 |
+| Iron Gate `.s06` — different stage, gameplay | 600 s | 536 (19.8%) | **+181** | 317 | 287 |
+| Main menu `.s04` | 300 s | 257 (9.5%) | **+10** | 216 | 195 |
+| Cutscene `.s05` | 300 s | 470 (17.4%) | **+210** | 44 | 38 |
+| **UNION** | | **774 (28.6%)** | **+401 = +107.5%** | | **371 distinct** |
+
+**The executed fraction of the eligible set went from 13.8% to 28.6%, and the guest code
+reached went from 19,901 to 50,330 instructions — 2.53×.** Against all 4,741 recovered
+DOL boundaries: 7.9% → 16.3%.
+
+**Which KIND of scene matters is now measured, and it is not what "more savestates"
+suggests.** A different *stage with gameplay* added 181 entries and an in-engine
+*cutscene* added 210, but a different *menu* added **10**. Menus re-run the engine's
+common path; a stage and a cutscene each bring their own subsystem. The two cheapest
+scenes to make were the two least worth making.
+
+#### What the mismatches are — and two that are not boundary faults
+
+Across the three new scenes, 13 fixtures mismatched. **Eleven carry a host-boundary
+fault and the fault code names the callee**: 6 × `0xe00e78ac` (`OSDisableInterrupts` —
+exactly §9.7's boundary), 2 × `0xe0113fc0` and 1 × `0xe0113f98` (`mtspr SPR913`),
+1 × `0xe011c18c`, and 1 × `0xe12409f0`, which is `sr_indirect` reporting an INDIRECT
+target absent from the build — §9.6's item 4, the offline closure gate cannot see
+indirect callees, observed again.
+
+**The remaining two are the SAME function and carry no fault at all.** `0x800fa704`
+`HandleReverb` (`leaf+fp+xform`, 1,292 B) is the **9th hottest function in the measured
+profile at 3.21% of sampled PCs**, and nothing had ever scored it: City Escape's capture
+was marked unusable — *"did not return in 12000 steps"* — so §9.5 SKIPped it. Iron
+Gate's capture returns in 14,400 steps and the main menu's in 14,398, and **both
+mismatch, from two independent captures in two different scenes**:
+
+```
+irongate  FAIL 0x800fa704  write events: want 3586, got 3963   fpscr:want=a6224100 got=a6228100 (NOT MODELLED)
+mainmenu  FAIL 0x800fa704  write events: want  724, got 1153   f9(ps0) want=b6a0000000000000 got=0
+```
+
+Both report `ps1-indep=true`, so it is not the unobservable second paired-single lane.
+It is **not diagnosed here**. One plausible mechanism is that the guest consumes FPSCR
+bits `gekko_rt.h` states outright are not modelled, which would make the divergence real
+rather than cosmetic — but that is a hypothesis and it has not been tested. What is
+established is narrower and still worth having: *a scene change turned a hot function
+that had never been scorable into one that scores, and it does not pass.* That is §9.5's
+argument for a broad differential, made again for a broad scene set.
+
+#### The honest reading
+
+- **The scene bound moved by 2.1× and it is not exhausted.** 774 of 2,704 (28.6%); the
+  other 71.4% still reads `never executed in this scene`, and the marginal-return
+  measurement above says which scenes would move it — stages and cutscenes, not menus.
+- **Verified moved much less than executed**, 330 → 371 distinct, and that gap is a
+  BUDGET artifact rather than a limit. The capture phase is bounded by wall clock and
+  takes candidates in address order, so of Iron Gate's 181 new entries only 16 were
+  captured before its budget expired, and the cutscene captured 44 of 470. A pass that
+  arms ONLY the new-and-uncaptured entries enumerated **166 of 166 in 10 s** on three
+  separate runs — an independent reproduction of the executed set, and proof the
+  targeting works — but every attempt to capture from it was killed mid-run (see the
+  last bullet). The remaining yield is ~165 Iron Gate + ~205 cutscene entries that are
+  new, live, and never captured.
+- **The hot set barely moved: 49 → 52 of the top 120 executed.** That is a caveat on the
+  *hot list*, not on the scenes: `/tmp/sab_hot.json` is itself a ONE-SCENE measurement
+  (a JIT probe run from cold boot), so code that only a different stage runs cannot be
+  "hot" by that yardstick. A per-scene hot list is a separate measurement.
+- **45 of the top-120 hot functions can never be reached by any scene**, because they
+  are outside the ARMED set entirely: 20 are closure-blocked on the `OSDisableInterrupts`
+  family (`0x800e78ac` / `0x800e78d4`, `op31 xo=83`), 5 on `mtspr SPR913`, 8 are below
+  the `0x20` size floor and 2 above the `0x2000` ceiling. Those 45 carry **37.00% of
+  sampled PCs.** That is §9.7's boundary and the gate's own thresholds — not this one.
+  The part more scenes *can* reach is the 26 hot functions that are eligible and were
+  unexecuted, worth 12.82% of sampled PCs.
+- **Runs were repeatedly lost to something outside the rig.** `RSPError: stub closed the
+  connection` killed the title survey and every targeted-capture attempt, with no macOS
+  crash report and an oracle log that ends normally. `ORACLES.md` documents quitting
+  native Dolphin with `pkill -9 -f Dolphin`, which is GLOBAL, and a sibling agent was
+  running its own native-Dolphin surveys on this box throughout;
+  `native_oracle_gdb.Dolphin.kill()` (:432-437) only kills its own `self.proc`, so the
+  rig does not do this to itself. Unproven, but it is the reading the evidence supports,
+  and it is a real hazard whenever two agents drive native Dolphin at once. Worth fixing
+  two ways: quit by PID rather than by pattern, and have `fixture_dol.py` accumulate
+  across attempts — it currently starts each run with a fresh `out` dict and overwrites
+  `OUT`, so a retry DISCARDS the previous attempt's captures.
+
 ## 7. Decision
 
 **The route is VIABLE for SAB on translatability grounds, and the remaining work
