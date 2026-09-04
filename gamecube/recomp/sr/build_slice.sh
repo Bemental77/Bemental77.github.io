@@ -56,9 +56,21 @@ fi
 # keep -O2.  Measured worth ~5x on identical code.
 EXTRA_SRC=(); [ -n "${SR_DISPATCH_C:-}" ] && EXTRA_SRC=("$SR_DISPATCH_C")
 
+# SR_PTHREAD=1: add -pthread, so a whole-image build can be measured against an
+# otherwise IDENTICAL non-pthread one.  The guest context switch (build_ctxsw.sh /
+# sr_host_os.c) needs one host thread per guest thread, and -pthread is a codegen
+# change, so "does threading cost the translated bodies?" has to be a matched pair
+# rather than an argument.  Off by default: no existing build changes.
+PT=(); [ "${SR_PTHREAD:-0}" = "1" ] && PT=(-pthread -sPTHREAD_POOL_SIZE=8)
+# -pthread + ALLOW_MEMORY_GROWTH is the documented slow path (-Wpthreads-mem-growth),
+# so the pair is taken with growth OFF on BOTH sides or it is not a matched pair.
+MEM=(-sALLOW_MEMORY_GROWTH=1)
+[ "${SR_FIXED_MEM:-0}" = "1" ] && MEM=(-sINITIAL_MEMORY=134217728)
+[ "${SR_PTHREAD:-0}" = "1" ] && MEM=(-sINITIAL_MEMORY=134217728)
+
 emcc ${SR_OPT:--O2} -I"$SR" "$OUT/sr_gen.c" ${EXTRA_SRC[@]+"${EXTRA_SRC[@]}"} "$SR/sr_driver.c" -o "$OUT/sr_slice.js" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT="${SR_ENV:-node}" -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \
-  -sALLOW_MEMORY_GROWTH=1 \
+  ${PT[@]+"${PT[@]}"} "${MEM[@]}" \
   -sEXPORTED_FUNCTIONS=_sr_init,_sr_ram,_sr_ram_size,_sr_state,_sr_state_size,_sr_call,_malloc \
   -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32,wasmMemory \
   -Wl,--no-entry

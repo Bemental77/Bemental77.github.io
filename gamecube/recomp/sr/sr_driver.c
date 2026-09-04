@@ -36,10 +36,18 @@ EMSCRIPTEN_KEEPALIVE uint32_t     sr_ram_size(void)  { return g_ram_size; }
 EMSCRIPTEN_KEEPALIVE GekkoState  *sr_state(void)     { return &g_st; }
 EMSCRIPTEN_KEEPALIVE int          sr_state_size(void){ return (int)sizeof(GekkoState); }
 
+// HOST-BOUNDARY HOOK.  NULL unless sr_host_os.c is linked in AND sr_os_init() ran,
+// so every existing build keeps sr_extern's fault behaviour byte for byte.  When it
+// is installed, a guest call to a host-implemented address (the OS context/interrupt
+// primitives and SelectThread — see sr_host_os.h) is SERVICED instead of faulting.
+// That is the mechanism by which a binary recomp gets MP4's "never compiled
+// OSThread.c in" escape without having the source to omit.
+int (*sr_host_hook)(GekkoState *, uint32_t) = 0;
+
 // A call the generated file could not resolve to a translated function.  It FAULTS:
 // silently returning would leave the caller's output nearly-right and hide the hole.
 void sr_extern(GekkoState *st, uint32_t addr) {
-    (void)st;
+    if (sr_host_hook && sr_host_hook(st, addr)) return;
     if (!g_fault) g_fault = 0xE0000000u | (addr & 0x00FFFFFFu);
 }
 
@@ -55,7 +63,14 @@ void sr_indirect(GekkoState *st, uint32_t addr) {
 // Dispatch by guest address — the same table a full build would generate.
 EMSCRIPTEN_KEEPALIVE uint32_t sr_call(uint32_t addr) {
     g_fault = 0;
-    if (!sr_dispatch(addr, &g_st)) return 0xBAD00000u | (addr & 0xFFFFu);
+    if (!sr_dispatch(addr, &g_st)) {
+        // A host-bound address (sr.py --host) is deliberately absent from
+        // sr_dispatch.  Let the harness call one directly rather than reporting it
+        // as a missing translation; with no hook installed this is unreachable and
+        // the 0xBAD0 code is returned exactly as before.
+        if (sr_host_hook && sr_host_hook(&g_st, addr)) return g_fault;
+        return 0xBAD00000u | (addr & 0xFFFFu);
+    }
     return g_fault;
 }
 

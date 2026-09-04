@@ -1121,16 +1121,21 @@ def recover_boundaries(img, syms, policy='asis', log=None):
     return sorted(split)
 
 
-def closure_of(img, byaddr, roots, indirect=False, jumptables=False):
+def closure_of(img, byaddr, roots, indirect=False, jumptables=False, hosts=()):
     """Transitive callee closure. -> (set of function starts, [(addr, why), ...]).
 
     A non-empty problem list means the closure CANNOT be translated end-to-end; the
-    caller must not emit a partial closure and call it done."""
+    caller must not emit a partial closure and call it done.
+
+    `hosts` are addresses the HOST implements (sr.py --host). The walk stops there
+    and they are not returned in the closure, so an untranslatable primitive like
+    OSSaveContext does not block a root that merely calls it."""
     starts = set(byaddr)
-    seen, work, probs = set(), list(roots), []
+    hosts = set(hosts)
+    seen, work, probs = set(), [r for r in roots if r not in hosts], []
     while work:
         a = work.pop()
-        if a in seen:
+        if a in seen or a in hosts:
             continue
         seen.add(a)
         if a not in byaddr:
@@ -1257,7 +1262,16 @@ def main():
                          'per-function ceiling. Worth ~5x — see emit_dispatch_tu().')
     ap.add_argument('--all', action='store_true',
                     help='emit every function in the boundary set (whole-image build)')
+    ap.add_argument('--host', action='append', default=[], metavar='ADDR',
+                    help='HOST-BOUND function: never translate this address, and stop '
+                         'the closure walk there. Calls to it become sr_extern(), which '
+                         'sr_driver.c routes to sr_host_hook (sr_host_os.c) instead of '
+                         'faulting. This is the function-granular exclusion N64Recomp '
+                         'provides in its toml (~/gc_refs/N64Recomp/README.md:32), and '
+                         'it is how the guest-OS context switch is cut out of the image '
+                         '— see sr_host_os.h and CONTEXT_SWITCH.md. Repeatable.')
     a = ap.parse_args()
+    hosts = {int(x, 16) for x in a.host}
 
     img = Image.from_dol(a.image)
     syms = load_map(a.map)
@@ -1382,6 +1396,10 @@ def main():
             print('--all needs --out', file=sys.stderr); sys.exit(1)
         ok, skipped, reasons = [], [], collections.Counter()
         for lo, size, name in units:
+            if lo in hosts:
+                skipped.append((lo, size, name, 'host-bound (--host)'))
+                reasons['host-bound (--host)'] += 1
+                continue
             try:
                 Translator(img, lo, lo + size, starts=starts,
                            indirect=a.indirect,
@@ -1423,7 +1441,7 @@ def main():
 
     if a.closure:
         sel, probs = closure_of(img, byaddr, want, indirect=a.indirect,
-                                jumptables=a.jumptables)
+                                jumptables=a.jumptables, hosts=hosts)
         if probs:
             for addr, why in sorted(set(probs)):
                 print(f"CLOSURE BLOCKED at {addr:#010x}: {why}", file=sys.stderr)
@@ -1432,6 +1450,7 @@ def main():
               f"{sum(byaddr[x][0] // 4 for x in sel)} instructions", file=sys.stderr)
     else:
         sel = set(want)
+    sel -= hosts                    # host-bound: emit a call, never a body
     fns = sorted((lo, byaddr[lo][0], byaddr[lo][1]) for lo in sel)
     src = emit_c(img, fns, starts=starts, indirect=a.indirect,
                  jumptables=a.jumptables)
