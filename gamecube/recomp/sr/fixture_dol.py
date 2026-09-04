@@ -54,7 +54,19 @@ OUT = os.environ.get("OUT", "/tmp/sr_dol_survey.json")
 DOL_ENTRY_PC = 0x80003140      # a connect here means the savestate did NOT restore
 
 
-def classify_dol(img, byaddr, min_size):
+# The MSR / interrupt host boundary, sr_host_os.h's SR_OS_IRQ set.  Passing this to
+# --host makes the offline gate agree with a build linked SR_HOST_OS=1: neither
+# translates these five addresses, both let a `bl` to one reach sr_host_hook.
+IRQ_HOSTS = (0x800e78ac,   # OSDisableInterrupts   mfmsr / rlwinm / mtmsr / rlwinm / blr
+             0x800e78c0,   # OSEnableInterrupts
+             0x800e78d4,   # OSRestoreInterrupts
+             0x800e3494,   # __TRK_get_MSR   \  two byte-identical copies of each are
+             0x800e349c,   # __TRK_set_MSR    > linked into SAB; 0x80108e98 / 0x80108ea0
+             0x80108e98,   # __TRK_get_MSR   /  are the other pair
+             0x80108ea0)   # __TRK_set_MSR
+
+
+def classify_dol(img, byaddr, min_size, hosts=()):
     """Shape + emittability for every recovered DOL boundary.
 
     Delegates to rel_shapes.classify, which is written against a generic
@@ -62,7 +74,7 @@ def classify_dol(img, byaddr, min_size):
     for the DOL the entry set IS the boundary set, there are no relocations, and
     base 0 makes `off` the absolute address.
     """
-    return SH.classify(img, byaddr, byaddr, set(byaddr), {}, 0)
+    return SH.classify(img, byaddr, byaddr, set(byaddr), {}, 0, hosts=hosts)
 
 
 def main():
@@ -72,6 +84,22 @@ def main():
     ap.add_argument('--boundaries', default='outer+calls')
     ap.add_argument('--state', default=O.SAB_STATE)
     ap.add_argument('--iso', default=O.SAB_ISO)
+    ap.add_argument('--host', action='append', default=[], metavar='ADDR',
+                    help='a guest address the HOST implements (sr.py --host).  The '
+                         'closure gate stops there instead of refusing it, so a '
+                         'candidate that only reached a host-bound primitive becomes '
+                         'armable.  MUST match the --host set the replay build was '
+                         'linked with.  Repeatable.')
+    ap.add_argument('--irq-hosts', action='store_true',
+                    help='shorthand for --host on the whole SR_OS_IRQ set '
+                         '(OSDisableInterrupts / OSEnableInterrupts / '
+                         'OSRestoreInterrupts / the two __TRK_get_MSR + __TRK_set_MSR '
+                         'pairs) -- what a build linked SR_HOST_OS=1 services.')
+    ap.add_argument('--new-only', action='store_true',
+                    help='arm ONLY entries that the --host set newly unblocks, i.e. '
+                         'those refused by the same gate without it.  This is what '
+                         'makes a capture run evidence FOR the boundary rather than a '
+                         'resample of what already worked.')
     ap.add_argument('--shapes-only', action='store_true',
                     help='run the OFFLINE candidate census and exit -- no Dolphin, no '
                          'probe lock.  Always do this before taking the lock.')
@@ -108,10 +136,42 @@ def main():
     print(f"[dol] {len(byaddr)} function boundaries ({a.boundaries}), "
           f"{sum(s // 4 for s, _ in byaddr.values())} instructions")
 
+    hosts = {int(x, 16) for x in a.host}
+    if a.irq_hosts:
+        hosts |= set(IRQ_HOSTS)
+    if hosts:
+        print("[shapes] host-bound (closure stops here, sr_host_hook services it): "
+              + ", ".join(f"{h:#010x}" for h in sorted(hosts)))
+
     t0 = time.time()
-    rows = classify_dol(img, byaddr, a.min_body)
+    rows = classify_dol(img, byaddr, a.min_body, hosts=hosts)
     print(f"[shapes] classified in {time.time() - t0:.1f}s")
     SH.report(rows)
+
+    # THE DELTA, measured with the SAME instrument on the SAME tree.  Without this a
+    # "+N unblocked" claim would compare two different runs; here both numbers come
+    # from one process, one image and one classify() implementation.
+    newly = set()
+    if hosts:
+        base_rows = classify_dol(img, byaddr, a.min_body)
+        base_ok = {r["addr"] for r in base_rows if r["blocked"] is None}
+        now_ok = {r["addr"] for r in rows if r["blocked"] is None}
+        newly = now_ok - base_ok
+        lost = base_ok - now_ok
+        ni = sum(byaddr[x][0] // 4 for x in newly)
+        nt = sum(s // 4 for s, _ in byaddr.values())
+        print(f"[shapes] BASELINE (no --host): {len(base_ok)} closure-clean")
+        print(f"[shapes] WITH --host        : {len(now_ok)} closure-clean")
+        print(f"[shapes] NEWLY UNBLOCKED    : {len(newly)} functions, {ni} instructions "
+              f"({100.0 * ni / nt:.2f}% of .text)"
+              + (f"   [WARNING: {len(lost)} regressed]" if lost else ""))
+    if a.new_only:
+        if not hosts:
+            print("--new-only needs --host/--irq-hosts", file=sys.stderr)
+            sys.exit(1)
+        rows = [r for r in rows if r["addr"] in newly or r["blocked"] is not None]
+        print(f"[shapes] --new-only: candidate pool restricted to the "
+              f"{len(newly)} newly-unblocked entries")
 
     # THE ARM SET.  rel_shapes.arm_list already applies "closure-clean AND >= min_size"
     # and round-robins across shape buckets rarest-first; the extra gates here are
@@ -139,6 +199,9 @@ def main():
 
     censusfile = os.path.splitext(OUT)[0] + ".candidates.json"
     json.dump({"boundaries": a.boundaries, "n_functions": len(rows),
+               "hosts": [f"{h:#010x}" for h in sorted(hosts)],
+               "new_only": bool(a.new_only),
+               "newly_unblocked": [f"{h:#010x}" for h in sorted(newly)],
                "n_clean_closure": sum(1 for r in rows if r["blocked"] is None),
                "n_eligible": len(elig), "armed": [f"{x:#010x}" for x in arm],
                "shape_counts": dict(collections.Counter(

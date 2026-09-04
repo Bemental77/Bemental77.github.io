@@ -91,22 +91,37 @@ def shape_of(c):
     return "+".join(s)
 
 
-def classify(img, byaddr, ov_by, starts, breloc, base):
+def classify(img, byaddr, ov_by, starts, breloc, base, hosts=()):
     """-> [row] for every overlay entry, in address order.
 
     `emittable` is the real gate: the entry AND its whole callee closure must
     translate under the same settings the emission will use (--indirect
     --jumptables).  A row that fails carries the FIRST blocking reason, which is
-    what a refusal should be reported as."""
+    what a refusal should be reported as.
+
+    `hosts` are guest addresses the HOST implements (sr.py --host, serviced at run
+    time by sr_host_os.c through sr_driver.c's sr_host_hook).  The walk STOPS there
+    and does not translate them, exactly as `sr.closure_of(hosts=...)` does and
+    exactly as the emission does -- a `bl` to a host-bound address becomes
+    `sr_extern(st, addr)`, which the hook services.  THE GATE AND THE BUILD MUST
+    BE GIVEN THE SAME SET, or a candidate is armed that cannot run (or, worse, one
+    that can run is refused offline and never armed at all).
+
+    CAUTION when reading the refusal histogram this produces: it attributes each
+    blocked entry to its FIRST blocking callee only.  That is a reporting choice,
+    not a claim that removing that callee unblocks the entry -- 248 of the 745
+    entries whose first blocker is 0x800e78ac are ALSO blocked by something else.
+    Use sr.closure_of, which collects every blocker, to size a host boundary."""
     rows = []
+    hosts = set(hosts)
     for a in sorted(ov_by):
         size = ov_by[a][0]
         c = census(img, a, size)
         why, nclo = None, 0
-        seen, work = set(), [a]
+        seen, work = set(), [x for x in [a] if x not in hosts]
         while work:
             x = work.pop()
-            if x in seen:
+            if x in seen or x in hosts:
                 continue
             seen.add(x)
             if x not in byaddr:

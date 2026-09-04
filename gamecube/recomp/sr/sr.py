@@ -1256,6 +1256,16 @@ def main():
     ap.add_argument('--indirect', action='store_true',
                     help='translate blrl/bctr/bctrl as a runtime address->function '
                          'dispatch through sr_indirect() instead of refusing them')
+    ap.add_argument('--msr-audit', action='store_true',
+                    help='AUDIT THE MSR BOUNDARY: list every function in the image '
+                         'containing an instruction that can observe or alter MSR '
+                         '(mfmsr, mtmsr, rfi, mfspr/mtspr SRR0|SRR1) and prove each is '
+                         'either --host-bound or REFUSED by the translator. Exit 2 if '
+                         'any such function would be EMITTED as a translated body. '
+                         'That is the standing evidence that sr_host_os.c\'s one-word '
+                         'g_msr is not an approximation the guest can catch out: no '
+                         'emitted body can reach MSR except by calling the host layer. '
+                         'Pair it with the same --host set the build uses.')
     ap.add_argument('--jumptable-census', action='store_true',
                     help='report how many bctr jump tables statically RESOLVE. This is '
                          'the runtime-completeness number; --coverage cannot show it '
@@ -1318,6 +1328,49 @@ def main():
 
     byaddr = {lo: (sz, nm) for lo, sz, nm in units}
     starts = set(byaddr)
+
+    if a.msr_audit:
+        # WHAT THE GUEST CAN SEE OF MSR, enumerated rather than argued.  Six encodings
+        # reach it: mfmsr (op31 xo=83), mtmsr (xo=146), rfi (op19 xo=50), and
+        # mfspr/mtspr (xo=339/467) naming SRR0=26 or SRR1=27 -- rfi's MSR<-SRR1 makes
+        # SRR1 an MSR alias, so reading or writing it is observing MSR.
+        SPR_SRR = (26, 27)
+        owners = {}
+        for lo, size, name in units:
+            for p in range(lo, lo + size, 4):
+                w = img.word(p)
+                if w is None:
+                    continue
+                op, xo = w >> 26, (w >> 1) & 0x3FF
+                spr = ((w >> 16) & 31) | (((w >> 11) & 31) << 5)
+                if ((op == 31 and xo in (83, 146)) or (op == 19 and xo == 50)
+                        or (op == 31 and xo in (339, 467) and spr in SPR_SRR)):
+                    owners.setdefault(lo, [name, []])[1].append((p, w))
+        emitted = []
+        for lo in sorted(owners):
+            name, sites = owners[lo]
+            if lo in hosts:
+                verdict = 'HOST-BOUND (serviced by sr_host_os.c)'
+            else:
+                try:
+                    Translator(img, lo, lo + byaddr[lo][0], starts=starts,
+                               indirect=a.indirect, jumptables=a.jumptables).translate()
+                    verdict = '*** EMITTED — THE GUEST CAN OBSERVE MSR DIRECTLY ***'
+                    emitted.append(lo)
+                except Untranslatable as e:
+                    verdict = f'refused ({e.why})'
+            print(f"{lo:#010x} {name[:34]:34s} {len(sites):2d} site(s)  {verdict}")
+        nh = sum(1 for lo in owners if lo in hosts)
+        print(f"\n{len(owners)} functions can observe MSR: "
+              f"{nh} host-bound, {len(owners) - nh - len(emitted)} refused, "
+              f"{len(emitted)} EMITTED")
+        if emitted:
+            print("FAIL: an emitted body can read or write MSR without the host layer, "
+                  "so g_msr is no longer the only representation of MSR in this "
+                  "runtime and the two can disagree.", file=sys.stderr)
+            sys.exit(2)
+        print("PASS: no emitted body can reach MSR except through the host boundary.")
+        return
 
     if a.jumptable_census:
         # RUNTIME completeness, which --coverage does NOT measure: under --indirect a

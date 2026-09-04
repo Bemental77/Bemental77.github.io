@@ -134,6 +134,41 @@ const main = async () => {
     throw new Error(`tail size ${tailSize} != ${GK_TAIL_SIZE} — gekko_rt.h and ` +
                     `verify_fixture.mjs disagree about the region layout`);
   const bufSize = ramSize + tailSize;
+
+  // ---------------------------------------------------------- host OS boundary
+  // A build linked with SR_HOST_OS=1 can SERVICE a `bl` to one of the --host
+  // addresses instead of faulting.  Two things follow, and both are needed for the
+  // result to mean anything:
+  //
+  //  * MSR MUST BE SEEDED FROM THE CAPTURE.  The host layer keeps the guest MSR in
+  //    one word, and OSDisableInterrupts RETURNS the old MSR[EE] and CLOBBERS r4
+  //    with the whole new MSR.  Replaying with sr_host_os.c's compiled-in default
+  //    (0x9032) against a scene captured at 0xb032 -- 395 of the 456 committed
+  //    fixtures -- would differ in r4 while every other output matched, which reads
+  //    as a translator bug and is not one.  state_in.msr has been in every capture
+  //    since the beginning (native_oracle_gdb.arch_state), it was simply never used.
+  //  * MSR THEN BECOMES A COMPARED OUTPUT, not an untested side effect.  454 of the
+  //    456 committed fixtures have state_out.msr == state_in.msr (the two that do
+  //    not are truncated captures, already refused), so an unbalanced
+  //    disable/restore in the host layer is now a FAIL rather than invisible.
+  //
+  // SR_OS_MODE=0 is THE CONTROL ARM: same binary, same md5, boundary turned off, so
+  // every fixture that passed because of the primitive must go back to faulting
+  // 0xe00e78ac.  A control arm built as a SECOND binary could differ for other
+  // reasons; this one cannot.
+  const HAS_HOST = typeof M._sr_os_init_irq === 'function';
+  const OS_MODE = process.env.SR_OS_MODE === undefined ? 3
+                : parseInt(process.env.SR_OS_MODE, 10);
+  if (HAS_HOST) {
+    M._sr_os_init_irq();
+    M._sr_os_mode(OS_MODE);
+    console.log(`[host-os] linked; mode=${M._sr_os_get_mode()} ` +
+                `(${OS_MODE === 0 ? 'OFF — CONTROL ARM' : 'SR_OS_IRQ'}), ` +
+                `MSR seeded per fixture from state_in.msr`);
+  } else if (process.env.SR_OS_MODE !== undefined) {
+    throw new Error('SR_OS_MODE was set but this build has no host OS layer — ' +
+                    'rebuild with SR_HOST_OS=1 (build_fixture.sh)');
+  }
   const phys = (a) => {
     const ea = a >>> 0;
     if (IN_L1(ea)) return (ramSize + (ea & (GK_L1_SIZE - 1))) >>> 0;
@@ -147,7 +182,7 @@ const main = async () => {
   // which is a vacuous pass and exactly the shape a survey must never report. Every
   // refusal is tallied by its reason so a gap is visible as a named class with a
   // count, rather than as a smaller denominator nobody printed.
-  const tally = { pass: 0, fail: 0, refused: 0, notBuilt: 0, passWithSink: 0, lcScored: 0 };
+  const tally = { pass: 0, fail: 0, refused: 0, notBuilt: 0, passWithSink: 0, lcScored: 0, hostScored: 0 };
   const why = new Map();
   const refuse = (kind, line) => {
     tally.refused++;
@@ -348,6 +383,10 @@ const main = async () => {
         for (let i = 0; i < 8; i++)
           dv.setUint32(st + O_GQR + i * 4, (fx.gqr ? fx.gqr[i] : 0) >>> 0, true);
         dv.setUint32(st + O_PC, entry, true);
+        if (HAS_HOST) {
+          M._sr_os_set_msr(si.msr >>> 0);   // the guest MSR this invocation started with
+          M._sr_os_trace_reset();           // so hostCalls counts THIS replay only
+        }
 
         const fault = M._sr_call(entry) >>> 0;
         const unstaged = M._sr_unstaged() >>> 0;
@@ -366,6 +405,10 @@ const main = async () => {
           ctr: dv2.getUint32(st + O_CTR, true) >>> 0,
           fpscr: dv2.getUint32(st + O_FPSCR, true) >>> 0,
         };
+        if (HAS_HOST) {
+          outSt.msr = M._sr_os_get_msr() >>> 0;
+          outSt.hostCalls = M._sr_os_trace_n() >>> 0;
+        }
         runs.push({ ps1mode, fault, unstaged, wlog: got, out: outSt });
       }
 
@@ -445,6 +488,11 @@ const main = async () => {
       for (const k of ['cr', 'lr', 'ctr'])
         if (A.out[k] !== (so[k] >>> 0))
           bad.push(`${k} want=${(so[k] >>> 0).toString(16)} got=${A.out[k].toString(16)}`);
+      // MSR is scored ONLY when the host layer models it.  Without it there is no
+      // MSR in this runtime at all and comparing against the capture would be
+      // comparing against nothing (the same reason FPSCR is reported, not scored).
+      if (HAS_HOST && OS_MODE !== 0 && A.out.msr !== (so.msr >>> 0))
+        bad.push(`msr want=${(so.msr >>> 0).toString(16)} got=${A.out.msr.toString(16)}`);
       const xerNote = A.out.xer === (so.xer >>> 0) ? 'match'
         : `want=${(so.xer >>> 0).toString(16)} got=${A.out.xer.toString(16)} ` +
           `(NOT OBSERVABLE: GDBStub.cpp:451 reads a dead spr[SPR_XER] slot)`;
@@ -495,7 +543,13 @@ const main = async () => {
           `${Object.values(lcKind).filter((k) => k !== 'load').length} written, ` +
           `${fx.locked_cache.words_read} gadget words]`
         : '';
-      console.log(`${ok ? 'PASS' : 'FAIL'}  ${tag}${sinkNote}${lcNote}  steps=${fx.steps} bl=${fx.n_calls} ` +
+      // WHETHER THE HOST BOUNDARY WAS ACTUALLY EXERCISED.  A pass on a fixture that
+      // never crossed it is not evidence for the boundary, and counting the crossings
+      // is what makes the SR_OS_MODE=0 control arm falsifiable per fixture rather
+      // than in aggregate.
+      const hostNote = (HAS_HOST && A.out.hostCalls) ? ` host-calls=${A.out.hostCalls}` : '';
+      if (ok && HAS_HOST && A.out.hostCalls) tally.hostScored++;
+      console.log(`${ok ? 'PASS' : 'FAIL'}  ${tag}${sinkNote}${lcNote}${hostNote}  steps=${fx.steps} bl=${fx.n_calls} ` +
                   `stores=${fx.writes.length} write-events=${want.length} ` +
                   `final-mem-bytes=${fx._memBytes} ` +
                   `staged=${Object.keys(fx.initial_mem).length} ` +
@@ -515,6 +569,10 @@ const main = async () => {
     console.log(`  NOTE ${String(tally.passWithSink).padStart(6)}  of the verified ` +
                 `fixtures also store to WPAR (0xCC008000), which is write-only MMIO; ` +
                 `those stores are not compared, everything else is`);
+  if (tally.hostScored)
+    console.log(`  NOTE ${String(tally.hostScored).padStart(6)}  of the verified ` +
+                `fixtures CROSSED the host OS boundary (sr_host_os.c) at least once; ` +
+                `those are the ones the SR_OS_MODE=0 control arm must break`);
   if (tally.lcScored)
     console.log(`  NOTE ${String(tally.lcScored).padStart(6)}  of the verified ` +
                 `fixtures read and/or write the Gekko locked L1 cache; those bytes ` +

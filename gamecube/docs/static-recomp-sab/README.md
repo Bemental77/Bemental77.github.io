@@ -1800,11 +1800,14 @@ and the blocked column is a handful of addresses, not a long tail:
 | (its own `mfmsr`) | 14 | 291 | |
 | `0x800e55d4` | 13 | 908 | `mfmsr` |
 
-**One 24-byte guest function blocks 745 others — 15.7% of the image's functions and
+**One 20-byte guest function blocks 745 others — 15.7% of the image's functions and
 26.6% of its instructions — purely by sitting in their closure.** That is not a
 translator hole (the GAP class is still zero, §5); it is §6's host boundary, sized
 statically there at 66 functions / 0.54% of `.text`, re-sized here by its **blast
-radius**. It is owned by the concurrent context-switch work (`sr_host_os.c`, whose
+radius**. **Read that 745 as a first-blocker attribution, not as what removing this
+callee buys** — §9.7 host-implements it and measures the answer at **+506**, because
+265 of the 745 reach a second, unrelated boundary as well and `rel_shapes.classify`
+stops at the first. It is owned by the concurrent context-switch work (`sr_host_os.c`, whose
 trace events already include `SR_EV_DISABLE_IRQ` / `SR_EV_ENABLE_IRQ` /
 `SR_EV_RESTORE_IRQ`); this table is what landing it is worth. Nothing here implements
 it — it is left as an explicit unimplemented boundary, and every candidate whose
@@ -1897,7 +1900,8 @@ were exposed to it**.
 > spill the result to memory with `stfd` where the ordered write log can see it.
 
 **Every remaining mismatch is a host-boundary fault, not a translation divergence**, and
-the fault code names the callee: 4× `0xe00e78ac` (`OSDisableInterrupts`, `mfmsr`), 5×
+the fault code names the callee: 4× `0xe00e78ac` (`OSDisableInterrupts`, `mfmsr`
+— **all four are now PASSES, §9.7**), 5×
 `0xe0113fc0` (`mtspr SPR913`), 1× `0xe1212248` (an indirect call into `stg13D` overlay
 code, absent from a DOL-only build). All are on the 70-function skiplist or outside the
 image, and all were reached through an **indirect** call — which the offline closure
@@ -1974,7 +1978,195 @@ What this does **not** show:
    explicit transcription, and until it exists this is an approximation living inside a
    translator whose stated contract is to refuse rather than approximate.
 4. The offline closure gate cannot see indirect callees, so a candidate can still reach
-   the host boundary at run time (8 did).
+   the host boundary at run time (8 did). §9.7 removes the MSR half of that boundary:
+   4 of those 8 now pass, with the boundary-off control arm proving the primitive is
+   what carries them. The rest reach `mtspr SPR913`, which is still unbuilt.
+
+### 9.7 The MSR/interrupt host boundary — BUILT, and the 745 is +506 not +745
+
+`0x800e78ac` `OSDisableInterrupts` is host-implemented, together with the four
+sibling addresses the closure measurably requires. Reproduce every number below with:
+
+```bash
+# the closure delta, both arms from ONE process and ONE classify() implementation
+python3 gamecube/recomp/sr/fixture_dol.py --shapes-only --irq-hosts --new-only
+# the containment audit (exit 2 if any EMITTED body could observe MSR)
+python3 gamecube/recomp/sr/sr.py --image /tmp/sr_sab/main.dol --map dolphin_captures/sab.map \
+  --boundaries outer+calls --indirect --jumptables --msr-audit \
+  --host 0x800e78ac --host 0x800e78c0 --host 0x800e78d4 \
+  --host 0x800e3494 --host 0x800e349c --host 0x80108e98 --host 0x80108ea0
+```
+
+#### The set, chosen by leave-one-out rather than by name
+
+`sr_host_os.c` already carried byte-exact transcriptions of the three
+`OSInterrupt.c` primitives (they were built for the context switch); what was
+missing was a way to link them **without** the thread pool, a `--host` set for the
+closure gate, and a measurement. `SR_OS_IRQ` (`sr_host_os.h`) is that mode: it
+answers for the MSR family and nothing else, adds exactly one word of host state
+(`g_msr`), creates no host thread and needs no `-pthread` — `sr_os_init_irq()`.
+`__TRK_get_MSR` / `__TRK_set_MSR` are `mfmsr r3; blr` and `mtmsr r3; blr` verbatim
+(SAB links two byte-identical copies of each), i.e. the same primitive, so they are
+in the same boundary.
+
+Closure-clean DOL functions, `sr.closure_of(..., hosts=)`, whole `outer+calls` set:
+
+| host set | closure-clean | vs baseline |
+|---|---|---|
+| baseline (none) | **3,581** / 4,741 | — |
+| all seven | **4,087** / 4,741 | **+506 functions, +73,999 instructions = 19.74% of `.text`** |
+
+**The unit is the PAIR, not the function**, and this is why "measure, don't guess"
+was the instruction:
+
+| address | alone | dropped from the seven |
+|---|---|---|
+| `0x800e78ac` `OSDisableInterrupts` | +65 | **−492** |
+| `0x800e78d4` `OSRestoreInterrupts` | +4 | **−431** |
+| `0x800e78c0` `OSEnableInterrupts` | +1 | −1 |
+| `0x800e3494` `__TRK_get_MSR` | +1 | −1 |
+| `0x800e349c` `__TRK_set_MSR` | +1 | −1 |
+| `0x80108e98` `__TRK_get_MSR` | +3 | −6 |
+| `0x80108ea0` `__TRK_set_MSR` | +1 | −4 |
+
+`OSDisableInterrupts` on its own is worth **65**; in the presence of
+`OSRestoreInterrupts` it is worth **492**. Almost every caller brackets
+`level = OSDisableInterrupts(); … ; OSRestoreInterrupts(level)`, and a closure is an
+AND — freeing one leaf of a pair frees nothing. Neither is a majority of the 745 by
+itself; together they are.
+
+#### §9.3's "745" is a FIRST-BLOCKER attribution, not a blast radius
+
+`rel_shapes.classify` stops at a function's first blocking callee, so its histogram
+answers "which callee did I trip over first", not "what does removing this callee
+buy". `sr.closure_of` collects **every** blocker, and against the same 745:
+
+| | functions | instructions |
+|---|---|---|
+| of the published 745, **UNBLOCKED** | **480** | 72,622 |
+| of the published 745, **still blocked** | **265** | 26,965 |
+| newly clean whose first blocker was something *else* | +26 | +1,377 |
+| **net** | **+506** | **+73,999** |
+
+**265 of the 745 do not move**, because their closure reaches a second, unrelated
+boundary. Named, with complete blocker sets (a function can appear twice):
+
+| next blocker | of the 265 | what it is | owner |
+|---|---|---|---|
+| `0x800ecb48` `OSGetTime` | 208 | `mfspr` time base (`op31 xo=371`) | unclaimed — the largest remaining single boundary |
+| `0x800e34bc` `PPCMtwpar` | 145 | `mtspr SPR922`/WPAR | the concurrent WPAR/locked-L1 work |
+| `0x800e55d4` `OSSetCurrentContext` | 89 | `mfmsr` + MSR[FP] | context switch (`sr_host_os.c`, already written) |
+| `0x800e56bc` `OSLoadContext` | 86 | `rfi` | context switch |
+| `0x800e563c` `OSSaveContext` | 86 | the setjmp | context switch |
+| `0x800e4e4c` `DCFlushRange` | 53 | `dcbf` loop + `sc` | unclaimed cache-maintenance boundary |
+| `0x800e4e1c` `DCInvalidateRange` | 52 | `dcbi` loop | same |
+| `0x800ecb60` `OSGetTick` | 28 | `mfspr` time base | with `OSGetTime` |
+| `0x800e34c4` `PPCSync` | 13 | `sync` | — |
+
+So the honest headline is **+506 of a claimed 745**, and the next thing worth
+building on this route is a host **clock** (`OSGetTime`/`OSGetTick`, 236 functions),
+not more of the interrupt boundary.
+
+#### Is a one-word MSR a lie the guest can detect? Enumerated, not argued
+
+`sr.py --msr-audit` lists every function in `main.dol` containing an instruction
+that can observe or alter MSR — `mfmsr`, `mtmsr`, `rfi`, and `mfspr`/`mtspr` naming
+SRR0/SRR1 (`rfi` does `MSR <- SRR1`, so SRR1 is an MSR alias) — and classifies each:
+
+```
+28 functions can observe MSR: 7 host-bound, 21 refused, 0 EMITTED
+PASS: no emitted body can reach MSR except through the host boundary.
+```
+
+**Zero** translated bodies in the whole-image build can materialise an MSR access.
+The other 21 (`__LCEnable`, `__OSDBIntegrator`, `__DBExceptionDestination`, the TRK
+debugger stubs, the exception vectors) are refused by the translator and remain
+explicit faults. So `g_msr` is not an approximation of a register the guest can also
+read some other way — **within the emitted image it is the only representation of
+MSR that exists**, and it is exact on every path that can reach it. The audit exits
+2 if that ever stops being true.
+
+What this does **not** cover, and it is unchanged by this work: MSR[EE]'s *effect*.
+There is no interrupt delivery in this runtime (§6 / `CONTEXT_SWITCH.md` §7.1), so
+EE gates nothing, and a guest that spins waiting for a flag an ISR would set still
+never leaves the loop. The bit's *value* is modelled exactly; its *consequence* is
+not modelled at all, and that is the pre-existing hole, not a new one.
+
+One named residual: `sr_indirect` (`sr_driver.c:58`) does **not** consult
+`sr_host_hook`, so an indirect (`blrl`/`bctr`) call landing on a host-bound address
+would fault `0xE10E78AC` instead of being serviced. Left as a loud, correctly-named
+refusal rather than fixed speculatively: no committed fixture reaches one that way
+(`os_boundary.txt:33` records 212 **direct** `bl` sites for `0x800e78ac`), and the
+4 fixtures below reach it through direct `bl` inside indirectly-reached callees.
+
+#### Verified BY EXECUTION, with the control arm inside the same binary
+
+Whole-image `-O2` build, `--indirect --jumptables --boundaries outer+calls` plus the
+seven `--host` addresses, linked `SR_HOST_OS=1`. wasm md5
+`c06edbbfb073ebc50cbb29fffa936b98`, **identical before and after both arms**. Machine
+load 2.2–4.1 throughout. The emitted set is *unchanged* at 4,671/4,741 functions —
+all seven host-bound addresses were already refused, so nothing new is translated;
+what changes is only whether a `bl` to one of them faults.
+
+`verify_fixture.mjs` now seeds `g_msr` from `state_in.msr` per fixture and **scores
+MSR as an output** against `state_out.msr` (454 of the 456 committed captures have
+`state_out.msr == state_in.msr`; the two that do not are truncated captures already
+refused). It also counts host-boundary crossings per fixture, so a pass that never
+touched the boundary cannot be mistaken for evidence about it.
+
+**The control arm is `SR_OS_MODE=0` on the SAME binary** — one md5, so the pair
+cannot be confounded by a relink (the trap CLAUDE.md gate #10 records):
+
+| arm | verified | attempted | mismatched |
+|---|---|---|---|
+| `SR_OS_IRQ` | **401** | 453 | 6 |
+| **control, boundary OFF** | 397 | 453 | 10 |
+
+The delta is exactly **4**, and they are exactly the 4 fixtures the host arm reports
+as having crossed the boundary (`host-calls=4` each): `0x80123cec` (captured twice,
+in both surveys), `0x801307cc`, `0x80132ab8`. With the boundary off each fails
+
+```
+fault=0xe00e78ac: DIRECT call to 0x??e78ac is outside the emitted set
+        r4 want=0     got=10
+        r5 want=9032  got=0
+```
+
+— i.e. the control does not merely fault, it is missing precisely the values the
+primitive produces (`r5` = the restored MSR, `r4` = the EE bit `OSRestoreInterrupts`
+returns). **4 of 4, 0 of 4 without.**
+
+**And the seeding itself is falsifiable, not decorative.** Replaying `0x80123cec`
+against the same binary with three different seeds, everything else identical:
+
+| `sr_os_set_msr` seed | host-calls | fault | `r4` | `r5` | MSR out | |
+|---|---|---|---|---|---|---|
+| `0x9032` = `state_in.msr` | 4 | 0 | `0` | `9032` | `0x9032` | **PASS** |
+| `0xb032` | 4 | 0 | `0` | `b032` | `0xb032` | FAIL |
+| `0x1032` | 4 | 0 | `0` | `1032` | `0x1032` | FAIL |
+
+`r5` tracks the seed exactly, which is the primitive doing its job — `mtmsr` writes
+the restored MSR and the caller sees it. `0xb032` is not a hypothetical: it is the
+MSR in **327 of the 372** captures in `sab_dol_survey_all.json`, so any
+boundary-crossing fixture from the ordinary City Escape scene would have failed on
+`r4`/`r5` with `sr_host_os.c`'s compiled-in default. These three passed only because
+they happen to have been captured at `0x9032`. The 6 remaining mismatches are the
+pre-existing ones §9.5 already names — 5× `0xe0113fc0` (`mtspr SPR913`) and 1×
+`0xe1212248` (an indirect call into overlay code absent from a DOL-only build) — and
+the 4× `0xe00e78ac` §9.5 recorded are gone.
+
+The committed context-switch suite is a regression gate on this change and is
+unchanged: `verify_ctxsw.mjs` **63 passed, 0 failed**, including its own control arm
+D (`sr_os_mode(0)` → `0xe00e78ac`).
+
+**What these 4 are and are not.** They are proof the primitive is correct and
+load-bearing — but their *entries* were already closure-clean, and they reach
+`OSDisableInterrupts` through a `blrl`ed callee, which is §9.6's residual item 4.
+**None of the 506 newly-unblocked functions is among them** (measured: zero overlap
+between the newly-unblocked set and either committed survey), because the offline
+gate excluded all 506 from every arm list ever built. Capturing them needs a new
+oracle run, and the constraint on that is the one §9.6 already named — the scene,
+not the rig.
 
 ## 7. Decision
 

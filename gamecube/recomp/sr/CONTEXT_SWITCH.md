@@ -57,6 +57,17 @@ decomposition, so this cannot be re-confused later.
 > your address *family* but not your problem. It is a fault code, not a memory
 > access; no locked-cache read is involved. Nothing to hand off.
 
+**This fault is now SERVICED in a build that asks for it** —
+`docs/static-recomp-sab/README.md` §9.7 adds `SR_OS_IRQ`, a mode that answers for
+the MSR family (`OSDisableInterrupts`, `OSEnableInterrupts`, `OSRestoreInterrupts`
+and the two `__TRK_get_MSR`/`__TRK_set_MSR` pairs) and **nothing else**, creating no
+host thread and needing no `-pthread` (`sr_os_init_irq()`). It is the same
+`g_msr` and the same three transcriptions this file's design already contained;
+what it adds is a way to link them without the thread pool, plus the measurement:
+**+506 closure-clean DOL functions (3,581 → 4,087), +73,999 instructions**. Control
+arm D below is unaffected — it runs with the boundary switched OFF, which is still
+`0xe00e78ac`.
+
 ## 2. The blocker, stated precisely — and why §6's proposed cut is impossible
 
 `docs/static-recomp-sab/README.md` §6 concluded (now marked superseded there):

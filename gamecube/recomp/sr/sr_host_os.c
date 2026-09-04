@@ -271,6 +271,16 @@ static void os_restore_interrupts(GekkoState *st) {
     st->gpr[4] = gk_rotl32(st->gpr[4], 17) & gk_mask(31, 31);
     tr(SR_EV_RESTORE_IRQ, st->gpr[3], g_msr);
 }
+// __TRK_get_MSR / __TRK_set_MSR — two instructions each, quoted in sr_host_os.h.
+// `mfmsr r3; blr` and `mtmsr r3; blr`.  Nothing else in either body.
+static void trk_get_msr(GekkoState *st) {
+    st->gpr[3] = g_msr;
+    tr(SR_EV_GET_MSR, g_msr, 0);
+}
+static void trk_set_msr(GekkoState *st) {
+    g_msr = st->gpr[3];
+    tr(SR_EV_SET_MSR, g_msr, 0);
+}
 
 // ============================================================================
 // SelectThread, 0x800ebd68, 512 B — the host boundary.
@@ -476,10 +486,22 @@ L_epi:
 // ============================================================================
 int sr_host_call(GekkoState *st, uint32_t addr) {
     if (g_mode == SR_OS_OFF) return 0;
+    // THE MSR FAMILY.  Answered in every mode that is not OFF, because it is the
+    // whole of SR_OS_IRQ and a strict subset of what HLE/TRACE already needed.
     switch (addr) {
     case SAB_OSDisableInterrupts:  os_disable_interrupts(st);   return 1;
     case SAB_OSEnableInterrupts:   os_enable_interrupts(st);    return 1;
     case SAB_OSRestoreInterrupts:  os_restore_interrupts(st);   return 1;
+    case SAB_TRK_get_MSR_A:
+    case SAB_TRK_get_MSR_B:        trk_get_msr(st);             return 1;
+    case SAB_TRK_set_MSR_A:
+    case SAB_TRK_set_MSR_B:        trk_set_msr(st);             return 1;
+    }
+    // Everything below is CONTEXT, not interrupts.  SR_OS_IRQ deliberately does not
+    // answer for it: an unimplemented boundary must stay an explicit fault rather
+    // than become a silently-wrong body.  (CONTEXT_SWITCH.md §7.)
+    if (g_mode == SR_OS_IRQ) return 0;
+    switch (addr) {
     case SAB_OSSetCurrentContext:  os_set_current_context(st);  return 1;
     case SAB_OSGetCurrentContext:  os_get_current_context(st);  return 1;
     case SAB_OSClearContext:       os_clear_context(st);        return 1;
@@ -533,6 +555,14 @@ EMSCRIPTEN_KEEPALIVE int sr_os_init(int nthreads) {
         }
     sr_host_hook = sr_host_call;
     return g_nht;
+}
+// SR_OS_IRQ's init.  It creates NO host thread and calls nothing from <pthread.h>,
+// so a build that wants only the MSR boundary needs neither -pthread nor a thread
+// pool — the pool exists for SelectThread, and SelectThread is not in this mode.
+EMSCRIPTEN_KEEPALIVE int sr_os_init_irq(void) {
+    sr_host_hook = sr_host_call;
+    g_mode = SR_OS_IRQ;
+    return 1;
 }
 EMSCRIPTEN_KEEPALIVE void     sr_os_mode(int m)          { g_mode = m; }
 EMSCRIPTEN_KEEPALIVE int      sr_os_get_mode(void)       { return g_mode; }

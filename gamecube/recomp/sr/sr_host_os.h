@@ -35,6 +35,15 @@
                          // context primitives and STOPS at OSLoadContext, so the
                          // translated function itself can be used as the oracle
                          // for the HLE (CONTEXT_SWITCH.md §5, differential B).
+#define SR_OS_IRQ    3   // THE MSR FAMILY ONLY -- OSDisableInterrupts,
+                         // OSEnableInterrupts, OSRestoreInterrupts and the two
+                         // __TRK_get_MSR/__TRK_set_MSR pairs.  Everything else
+                         // (the context primitives, SelectThread) still faults by
+                         // name, so this mode adds exactly one word of host state
+                         // (`g_msr`) and NO threading: it needs no `-pthread`, no
+                         // host thread pool, and no `sr_os_init`.  See
+                         // README.md §9.7 -- this is the boundary whose blast
+                         // radius is 745 blocked DOL functions.
 
 // ------------------------------------------------- fault codes (0xC5 prefix)
 // Distinct from sr_extern (0xE0), sr_indirect (0xE1) and sr_call (0xBAD0) so a
@@ -65,6 +74,8 @@
 #define SR_EV_THREAD_EXIT    17   // a = host slot,    b = guest thread
 #define SR_EV_SAVECTX        20   // TRACE mode: a = ctx, b = srr0
 #define SR_EV_LOADCTX        21   // TRACE mode: a = ctx, b = srr0  (the rfi point)
+#define SR_EV_GET_MSR        22   // a = MSR returned  (__TRK_get_MSR)
+#define SR_EV_SET_MSR        23   // a = MSR written   (__TRK_set_MSR)
 
 // --------------------------------------------------------- the SAB OS ABI
 // RECOVERED FROM THE TRANSLATED CODE, not from a header.  Every constant below is
@@ -116,6 +127,16 @@
 #define SAB_OSDisableInterrupts   0x800e78acu
 #define SAB_OSEnableInterrupts    0x800e78c0u
 #define SAB_OSRestoreInterrupts   0x800e78d4u
+// The Metrowerks TRK debugger runtime's MSR accessors.  SAB links TWO byte-identical
+// copies of each; both are `mfmsr r3; blr` / `mtmsr r3; blr` verbatim:
+//   0x800e3494 7c6000a6 4e800020   __TRK_get_MSR      0x800e349c 7c600124 4e800020  __TRK_set_MSR
+//   0x80108e98 7c6000a6 4e800020   __TRK_get_MSR      0x80108ea0 7c600124 4e800020  __TRK_set_MSR
+// They are the same primitive as OSDisableInterrupts' first and third instructions,
+// so they belong to this boundary rather than to a second one.
+#define SAB_TRK_get_MSR_A         0x800e3494u
+#define SAB_TRK_set_MSR_A         0x800e349cu
+#define SAB_TRK_get_MSR_B         0x80108e98u
+#define SAB_TRK_set_MSR_B         0x80108ea0u
 #define SAB_OSSetCurrentContext   0x800e55d4u
 #define SAB_OSGetCurrentContext   0x800e5630u
 #define SAB_OSClearContext        0x800e579cu
@@ -124,5 +145,10 @@
 #define SAB_SelectThread          0x800ebd68u
 
 int  sr_host_call(GekkoState *st, uint32_t addr);   // 1 = handled, 0 = not ours
+
+// Install the hook WITHOUT creating any host thread and WITHOUT needing -pthread.
+// This is what a plain (non-context-switch) build calls to get SR_OS_IRQ; the
+// thread pool belongs to SelectThread, and SelectThread is not in this mode.
+int  sr_os_init_irq(void);
 
 #endif

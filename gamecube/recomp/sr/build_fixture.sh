@@ -59,6 +59,20 @@ fi
 # (README §5j).  Without it a whole-image verify build must use SR_OPT=-O0.
 EXTRA_SRC=(); [ -n "${SR_DISPATCH_C:-}" ] && EXTRA_SRC=("$SR_DISPATCH_C")
 
+# SR_HOST_OS=1: link the host OS boundary (sr_host_os.c) so a `bl` to a --host
+# address is SERVICED instead of faulting.  Off by default: without it sr_host_hook
+# stays NULL and every existing build's sr_extern behaviour is byte for byte what it
+# was.  NO -pthread is added -- SR_OS_IRQ (sr_os_init_irq) creates no host thread;
+# the pool belongs to SelectThread, which that mode does not answer for.
+# THE CONTROL ARM IS INSIDE THIS BUILD, not a second one: sr_os_mode(0) turns the
+# boundary off at run time, so the "does the primitive carry the pass?" pair is taken
+# on ONE binary with one md5 and cannot be confounded by a relink.
+HOST_SRC=(); HOST_EXP=""
+if [ "${SR_HOST_OS:-0}" = "1" ]; then
+  HOST_SRC=("$SR/sr_host_os.c")
+  HOST_EXP=",_sr_os_init_irq,_sr_os_mode,_sr_os_get_mode,_sr_os_set_msr,_sr_os_get_msr,_sr_os_trace,_sr_os_trace_n,_sr_os_trace_reset"
+fi
+
 # SR_CFLAGS: extra compiler flags.  The reason this exists is the FALSIFICATION
 # CONTROL ARM: `SR_CFLAGS=-DSR_NO_LC_MODEL` drops gekko_rt.h's locked-cache arm so an
 # 0xE00000xx access aliases into MEM1 the way it did before the model existed.  A
@@ -68,10 +82,10 @@ read -r -a SR_CF <<< "${SR_CFLAGS:-}"
 
 # SR_OPT: optimisation level.  MUST be lowered for a whole-image build UNLESS
 # SR_DISPATCH_C splits the dispatch out (see above).
-emcc ${SR_OPT:--O2} -DSR_VERIFY ${SR_CF[@]+"${SR_CF[@]}"} -I"$SR" "$OUT/sr_gen.c" ${EXTRA_SRC[@]+"${EXTRA_SRC[@]}"} "$SR/sr_driver.c" -o "$OUT/sr_fixture.js" \
+emcc ${SR_OPT:--O2} -DSR_VERIFY ${SR_CF[@]+"${SR_CF[@]}"} -I"$SR" "$OUT/sr_gen.c" ${EXTRA_SRC[@]+"${EXTRA_SRC[@]}"} ${HOST_SRC[@]+"${HOST_SRC[@]}"} "$SR/sr_driver.c" -o "$OUT/sr_fixture.js" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=node -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \
   -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=134217728 \
-  -sEXPORTED_FUNCTIONS=_sr_init,_sr_ram,_sr_ram_size,_sr_tail_size,_sr_state,_sr_state_size,_sr_call,_sr_staged,_sr_wlog,_sr_wlog_n,_sr_unstaged,_sr_verify_reset,_malloc \
+  -sEXPORTED_FUNCTIONS=_sr_init,_sr_ram,_sr_ram_size,_sr_tail_size,_sr_state,_sr_state_size,_sr_call,_sr_staged,_sr_wlog,_sr_wlog_n,_sr_unstaged,_sr_verify_reset,_malloc"$HOST_EXP" \
   -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32,wasmMemory \
   -Wl,--no-entry
 
