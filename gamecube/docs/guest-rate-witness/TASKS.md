@@ -483,3 +483,35 @@ matched-pair noise reaches ±25% at higher load.
       (`DSP.cpp:584-589`), so the rig cannot currently read a native reference
       run. A native oracle arm would turn W1/W2/W3 from "self-consistent" into
       "calibrated".
+
+### F6b — the SDK-only gate fix: MP4 and SAB regression, CLEARED
+
+`f89e23e7` shipped a rebuilt `dolphin_worker_emcc.wasm` (md5 `82bc8f8b…` ->
+`363668a9…`, 20,092,121 -> 20,092,429 B) whose author recorded an uncleared
+caveat: *"I have no measured MP4/SAB run on the new binary. The safety argument
+is structural."* Its own probe was queued behind a sibling holding the probe
+lock and never ran (`/tmp/probe-mp4-regress.log` existed at 0 bytes).
+
+That mattered because the commit was already on `prod` with the Pages deploy
+in flight, i.e. an untested binary was reaching visitors. Measured directly on
+the new binary, worker md5 `363668a9ace0ee34372efbd210f97574` identical before
+AND after both runs, `PROBE_DURATION_MS=70000`, load 2.2-6.6:
+
+| ROM | witness | published | panic entries | exit |
+|---|---|---|---|---|
+| SAB (`ROM_IDX=1`, JIT) | `ai_dma_cb=1473.16` = **0.3680x** | **17.34/s** | 0 | 0 |
+| MP4 (`ROM_IDX=0`, recomp) | `ai_dma_cb=0.00` (see below) | **59.93/s** | 0 | 0 |
+
+**No regression.** SAB's 0.3680x is against the honest §8.6b baseline of 0.3781x
+delivered / 17.69-18.15 published — a ~2.7% delta, inside this rig's stated
+~6-7% resolution.
+
+⚠ **MP4's `ai_dma_cb=0.00` is the DOCUMENTED FALSE ZERO, not a failure.** MP4
+routes to the RECOMP engine with no query parameter (`gamecube.html:1044`), so
+Dolphin's CoreTiming is parked and reads 0 callbacks *while the recomp renders*
+— here 59.93 published/s, essentially locked 60. Gate #10 records this shape
+and the witness rig refuses to print it as 0.000x. Do not read it as a wedge.
+
+Not covered by this run: PSO (`ROM_IDX=2`), and the second blocker §F6a records
+— 240pSuite now executes but still does not draw (`drawn=0/s`, `peFrames=0`),
+with 94% of its PC census in five libogc LWP functions.
