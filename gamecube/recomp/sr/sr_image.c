@@ -120,12 +120,20 @@ EMSCRIPTEN_KEEPALIVE void     sr_image_set_spr(uint32_t n, uint32_t v) { g_spr[n
 // credit model.  THE GUEST CLOCK IS HOST WALL TIME, 1:1.  It is not scaled and it must
 // never be: gate #9 makes speeding the guest up FORBIDDEN, and a timebase that runs
 // fast IS speeding the guest up, whatever a frame counter reads afterwards.
-#define GK_TB_HZ 40500000.0
+// GK_TB_HZ is now ALSO defined by sr_host_os.h (as GK_CPU_HZ / GK_TIMER_RATIO) — the
+// collision warned about at img_hook has already reached the macro level, and building
+// this file emitted `'GK_TB_HZ' macro redefined`. Defer to the shared header rather than
+// shadowing it: the two derivations agree at 40,500,000, and the day they DON'T is
+// exactly the day a duplicate definition here would hide it. `/ 1000.0` forces the
+// double arithmetic the header's unsigned constant would otherwise truncate.
+#ifndef GK_TB_HZ
+#define GK_TB_HZ 40500000u
+#endif
 static double g_tb_origin_ms = -1.0;
 static uint64_t img_timebase(void) {
     double now = emscripten_get_now();
     if (g_tb_origin_ms < 0) g_tb_origin_ms = now;
-    return (uint64_t)((now - g_tb_origin_ms) * (GK_TB_HZ / 1000.0));
+    return (uint64_t)((now - g_tb_origin_ms) * ((double)GK_TB_HZ / 1000.0));
 }
 
 // --------------------------------------------------------------- OSContext layout
