@@ -261,7 +261,32 @@ const main = async () => {
       // --- the diff ---------------------------------------------------------
       const so = fx.state_out;
       const bad = [];
-      if (A.fault !== 0) bad.push(`fault=0x${A.fault.toString(16)}`);
+      if (A.fault !== 0) {
+        // NAME THE FAULT.  sr_driver.c encodes what went wrong in the top byte, and
+        // two of the three are BUILD COMPLETENESS, not a translation defect:
+        //   0xE0 sr_extern()   a DIRECT call to a function outside the emitted set
+        //   0xE1 sr_indirect() an INDIRECT target (blrl/bctrl/bctr) that is not a
+        //                      dispatchable entry in this build -- and a static
+        //                      closure walk cannot find those, because nothing names
+        //                      them.  Measured: otherprintD 0x81200084 reported
+        //                      fault=0xe10ff010 plus a wall of write-event and
+        //                      final-memory diffs; the diffs were all downstream of
+        //                      the missed call, and adding 0x800ff010 (an exact DOL
+        //                      function start) as a root made the same fixture
+        //                      bit-exact. Reported as an address to add, not as a
+        //                      divergence to investigate.
+        //   0x80 gk_ok()       a guest access outside MEM1 and outside the two
+        //                      modelled windows -- that one IS a defect.
+        const t = A.fault >>> 24, lo = (A.fault & 0x00ffffff).toString(16);
+        bad.push(
+          t === 0xE1 ? `fault=0x${A.fault.toString(16)}: INDIRECT target 0x??${lo} is ` +
+                       `not in this build — re-emit with it as a root (a static ` +
+                       `closure cannot discover an indirect callee)`
+        : t === 0xE0 ? `fault=0x${A.fault.toString(16)}: DIRECT call to 0x??${lo} is ` +
+                       `outside the emitted set`
+        : `fault=0x${A.fault.toString(16)}` +
+          (t === 0x80 ? ` (guest access outside MEM1 at phys 0x${lo})` : ''));
+      }
       if (A.unstaged !== 0)
         bad.push(`read of UNSTAGED guest byte 0x${(A.unstaged & 0x7fffffff).toString(16)}`);
       for (let i = 0; i < 32; i++)
