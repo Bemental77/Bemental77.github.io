@@ -3,7 +3,17 @@
 //   SR_OUT=/tmp/sr_wi_o2 node gamecube/recomp/sr/perf_browser.mjs <fixture.json> [more.json ...]
 //
 // Env: SR_OUT (dir holding sr_slice.{js,wasm}, built with SR_ENV=web,worker),
-//      PERF_REPS (default 20000), PERF_TRIALS (default 7), PERF_HEADLESS=0 to watch.
+//      PERF_REPS (default 20000), PERF_TRIALS (default 7), PERF_HEADLESS=0 to watch,
+//      PERF_JS_FLAGS (default EMPTY = stock V8 = what a web page gets).
+//
+// WHY PERF_JS_FLAGS EXISTS. `gamecube/tools/dolphin_render_probe.js` used to force
+// `--js-flags=--no-liftoff` (TurboFan-only), a configuration a web page CANNOT
+// request, while this harness has always run stock V8. Every JIT-vs-SR ratio taken
+// across that difference was an unmatched pair in the V8 tier dimension
+// (gamecube/docs/wasm-tier/TASKS.md sizes the tier at 2.108x on emitted bodies,
+// ~1.164x residual under stock V8). Both harnesses now default to stock V8; this
+// knob exists so the OTHER half of the 2x2 can be taken deliberately, on both
+// engines, rather than silently on one of them.
 //
 // WHY A BROWSER AND NOT NODE. The number this produces is meant to be read next to
 // the JIT emulator's guest rate, and that rate is only ever measured in Chrome
@@ -15,8 +25,7 @@
 // WHAT THIS MEASURES, stated before the number so it cannot be quoted loose:
 //   * Real SAB functions, translated from the SHIPPED BINARY by sr.py, executing
 //     inside the WHOLE-IMAGE module (every translated function in main.dol present),
-//     replayed from entry states captured off native Dolphin's reference interpreter
-//     and already verified bit-exact by verify_fixture.mjs / verify_slice.mjs.
+//     replayed from entry states captured off native Dolphin's reference interpreter.
 //   * Guest state and every byte the function WRITES are restored before each
 //     invocation. That restore is measured in a matched empty-body control and
 //     SUBTRACTED; both raw and corrected figures are printed.
@@ -25,8 +34,20 @@
 //     The JIT's guest rate includes all of those, so this number is OPTIMISTIC
 //     against it. Say "translated-code throughput", never "the game runs at N".
 //
+// ⚠ WHAT THIS DOES **NOT** ESTABLISH, corrected 2026-09-04 after it published a VOID
+// number. This header used to say its fixtures were "already verified bit-exact by
+// verify_fixture.mjs / verify_slice.mjs". THAT WAS NOT TRUE, and it is not this
+// harness's to assert: the `-O2` slice build cannot even host the verify harness
+// (build_slice.sh exports no -DSR_VERIFY symbols and verify_fixture.mjs needs
+// sr_fixture.js from build_fixture.sh), so SPEED AND CORRECTNESS HAVE NEVER BEEN
+// MEASURED ON THE SAME BINARY. `0x800fa704` was timed for a published headline while
+// failing its differential. **Verify a fixture on a -DSR_VERIFY build before quoting
+// a speed for it.** See gamecube/docs/static-recomp-sab/README.md §8.6e.
+//
 // The run ABORTS a fixture if any invocation faults, so an early-exiting function
-// cannot be mistaken for a fast one.
+// cannot be mistaken for a fast one — and, since the same incident, if the
+// translation CORRUPTS its own staged input (the drift guard below), because a
+// corrupted rep is not the computation `fx.steps` describes.
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
@@ -36,6 +57,7 @@ const SLICE = process.env.SR_OUT || '/tmp/sr_slice';
 const REPS = Number(process.env.PERF_REPS || 20000);
 const TRIALS = Number(process.env.PERF_TRIALS || 7);
 const HEADLESS = process.env.PERF_HEADLESS !== '0';
+const JS_FLAGS = process.env.PERF_JS_FLAGS || '';
 const GEKKO_HZ = 486_000_000;
 
 // ---------------------------------------------------------------- exact JSON
@@ -153,9 +175,48 @@ async function measureInPage(page, wire, cfg) {
       const n = rOff.length;
       const restore = () => { H.set(stSnap, st); for (let i = 0; i < n; i++) H[ram + rOff[i]] = rVal[i]; };
 
+      // ---- DRIFT GUARD (added after this harness published a VOID number) --------
+      // `restore()` repairs ONLY bytes that appear in fx.writes, because those are
+      // the only bytes NATIVE wrote. If the TRANSLATION writes anywhere else, that
+      // byte is never repaired, so every rep after the first runs on mutated input
+      // and `fx.steps` — the oracle's count for rep 1 — stops describing the work
+      // being timed.
+      //
+      // MEASURED, and it is why this exists: `HandleReverb` 0x800fa704 makes 308
+      // spurious writes of 0xff across 0x802bba84..0x802bbcfb, a page native only
+      // READS (native's whole write range is 0x803c0b88..0x803fff58). The restore
+      // set is 3632 B and covers none of it, so reps 2+ ran with 839/3632 bytes
+      // wrong and the published 0.50-0.54x was not a measurement of the verified
+      // computation. See gamecube/docs/static-recomp-sab/README.md §8.6e.
+      //
+      // The guard is the staged-but-not-restored set: every initial_mem byte that
+      // fx.writes does not cover must still hold its staged value afterwards.
+      const gOff = [], gVal = [];
+      for (const [a, b] of fx.initial_mem) {
+        const off = phys(a);
+        if (!pre.has(off)) { gOff.push(off); gVal.push(b); }
+      }
+      const gO = new Int32Array(gOff), gV = new Uint8Array(gVal);
+      const drift = () => {
+        let bad = 0, first = -1;
+        for (let i = 0; i < gO.length; i++)
+          if (H[ram + gO[i]] !== gV[i]) { bad++; if (first < 0) first = gO[i]; }
+        return { bad, first };
+      };
+
       restore();
       const probe = M._sr_call(entry) >>> 0;
       if (probe !== 0) { out.push({ tag, skip: `faults 0x${probe.toString(16)}` }); continue; }
+
+      // ONE invocation is enough to expose it — check before spending the benchmark.
+      { const d = drift();
+        if (d.bad) {
+          out.push({ tag, skip: `NOT BIT-EXACT: wrote ${d.bad} staged byte(s) native ` +
+            `never writes (first at guest 0x${((0x80000000 | d.first) >>> 0).toString(16)}) — ` +
+            `restore() cannot repair these, so reps 2+ would run on corrupted input ` +
+            `and any timing here would be void (README §8.6e)` });
+          continue;
+        } }
 
       // MATCHED PAIR, min of TRIALS: identical rep counts for run and control, and
       // the MINIMUM rather than one sample — matched-pair noise on this box has been
@@ -170,6 +231,14 @@ async function measureInPage(page, wire, cfg) {
       }
       const fault = M._sr_call(entry) >>> 0;
       if (fault !== 0) { out.push({ tag, skip: `faulted mid-benchmark 0x${fault.toString(16)}` }); continue; }
+      // Re-check AFTER the benchmark too: a store that only fires on some inputs
+      // would not show up in the single pre-flight invocation above.
+      { const d = drift();
+        if (d.bad) {
+          out.push({ tag, skip: `DRIFTED DURING BENCHMARK: ${d.bad} staged byte(s) ` +
+            `corrupted (first at guest 0x${((0x80000000 | d.first) >>> 0).toString(16)}) — timing void` });
+          continue;
+        } }
 
       const perRunMs = runMin / cfg.reps, perCtrlMs = ctrlMin / cfg.reps;
       const netMs = perRunMs - perCtrlMs;
@@ -201,6 +270,7 @@ const main = async () => {
   console.log(`slice   : ${wasm}  ${fs.statSync(wasm).size} bytes`);
   console.log(`fixtures: ${wire.length} usable from ${files.length} file(s)`);
   console.log(`reps    : ${REPS} x ${TRIALS} trials (min)`);
+  console.log(`v8 flags: ${JS_FLAGS || '(none — stock V8, what a web page gets)'}`);
   console.log('');
 
   const srv = await startServer(SLICE);
@@ -208,7 +278,8 @@ const main = async () => {
   const SYS_CHROME = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
   const launchOpts = {
     headless: HEADLESS ? 'new' : false,
-    args: ['--no-sandbox', '--disable-dev-shm-usage'],
+    args: ['--no-sandbox', '--disable-dev-shm-usage',
+           ...(JS_FLAGS ? [`--js-flags=${JS_FLAGS}`] : [])],
     protocolTimeout: 1800000,
   };
   if (fs.existsSync(SYS_CHROME)) launchOpts.executablePath = SYS_CHROME;

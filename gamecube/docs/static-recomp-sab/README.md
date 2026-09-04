@@ -23,8 +23,9 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **overlay `bctr` recovery, all 76** | **1,189 of 1,195 (99.5%)** relocated vs **0 of 1,195** raw; 18,246 targets, 0 bogus, §9.1 |
 | **whole-image runtime completeness** | **99.88%** of 5,923,824 instructions (was 92.43% with the overlay half unrecovered), §9.2 |
 | translator divergence found by the survey | **1** — `fctiwz` negative-zero high word, 620 sites exposed; fixed, §9.5 |
-| **whole-image throughput, MATCHED** | **235.1 MHz executed vs the JIT's 138.8 MHz = 1.69x**, both arms on **stock V8** (what a web page gets), same SAB scene, interleaved, hash-guarded. **374.5 MHz is what 1.000x costs on this scene**, so SR is 1.59x short and the JIT 2.70x short. 1.69x is an UPPER bound — SR has no host layer. §8.6 |
-| ~~whole-image throughput~~ | ~~0.50-0.54x vs a JIT baseline of 0.4450x~~ — **RETRACTED, §8.6a**: that JIT baseline is a 75 s cold boot read over one 40 s window, which on this session's own runs returns **0.3338x–0.5097x from one frozen binary**. The V8-tier mismatch was the *least* important of its three defects. |
+| **whole-image throughput** | ⛔ **NO VALID NUMBER — `0.50-0.54x`, `0.62x` and `0.676x` are all VOID, §8.6e.** `HandleReverb` is **not bit-exact** (308 spurious writes to a page the guest only reads), and `perf_browser.mjs`'s restore set does not cover them, so **rep 1 of ~160,000 timed invocations is the only one computing native's answer**. Direction of the error unknown — do not apply a correction factor. |
+| **JIT baseline, re-measured** | **0.3781x delivered / 141.6 MHz executed / 23.2% idle-skipped**, stock V8, n=3, cross-witness spread ≤0.0005. **1.000x costs 373.5 MHz on this scene → the JIT is 2.64x short.** §8.6b |
+| ~~JIT baseline `0.4450x`~~ | **RETRACTED, §8.6c** — a 75 s cold boot read over one 40 s window; re-reading that band from four fresh runs of ONE frozen binary returns **0.3338x–0.5097x**. The V8-tier mismatch §8.1 warned about measures **null on both engines** (§8.6d) and was the least of its defects. |
 | **guest OS CONTEXT SWITCH** | **WORKS** — 63 assertions / 0 failures, incl. a three-thread non-LIFO rotation on three real host threads and a control arm that reproduces `0xe00e78ac` with the host layer off. §6 (superseded there) and [`recomp/sr/CONTEXT_SWITCH.md`](../../recomp/sr/CONTEXT_SWITCH.md) |
 
 The two 2026-09-02 additions each came from a **harness** defect, not a translator one,
@@ -1345,6 +1346,34 @@ matching `~/gc_refs/N64Recomp/README.md:32`.
 
 ## 8. The whole-image performance number, and exactly what it is not
 
+> # ⛔ EVERY STATIC-RECOMP THROUGHPUT FIGURE IN §8.1 THROUGH §8.5 IS VOID
+>
+> **Read [§8.6](#86-the-matched-re-take--the-jit-arm-holds-and-the-sr-arm-is-void)
+> first. Do not quote `0.50-0.54x`, `0.62x`, `0.621x`, `0.676x` or `0.4450x` from the
+> sections below, and do not rescale them** — the error direction is unknown, so no
+> correction factor exists.
+>
+> * **The SR numerator is not a measurement of the verified computation.**
+>   `HandleReverb` `0x800fa704` — the single fixture carrying §8.1a's headline — is
+>   **not bit-exact**: it makes 308 spurious writes to `0x802bba84..0x802bbcfb`, a
+>   page native only *reads*. `perf_browser.mjs` builds its restore set from
+>   `fx.writes` only, which does not cover that page, so the corruption **persists
+>   across reps** and rep 1 of ~160,000 timed invocations is the only one computing
+>   native's answer. §8.6e.
+> * **The `0.4450x` JIT denominator is not reproducible** — one 40 s window on a boot
+>   transient; the same band re-read from four fresh runs of one frozen binary returns
+>   **0.3338x–0.5097x**. §8.6c.
+> * **The `×1.0774` conversion is the wrong CPI** (static, where the JIT's cycles are
+>   dynamic; the dynamic value is ≤1.0017). §8.6f.
+> * The V8-tier mismatch the boxes below warn about is real but measures **null on
+>   both engines**. It was the least of the four defects. §8.6d.
+>
+> The sections below are kept unedited as the record of how the number was built and
+> what it cost to find out it was wrong. **The one surviving measurement is the JIT
+> arm, re-taken in §8.6b: `0.3781x` delivered, `141.6 MHz` executed, `23.2%`
+> idle-skipped, against the `373.5 MHz` that 1.000x costs on this scene — 2.64x
+> short.**
+
 Measured 2026-09-04. §5c's caveat — "there is no whole-game number, and the fixture
 figure is not comparable to the JIT's wall-clock rate" — is *partly* closed here: the
 throughput is now measured on the **whole-image** build rather than a 12-function
@@ -1388,15 +1417,22 @@ ROM_IDX=1 PROBE_HEADLESS=0 PROBE_DURATION_MS=75000 node gamecube/tools/dolphin_r
 >    from §8.1/§8.4.** Matched-pair ratios taken off one binary (§5j's `-O0`/`-O2`
 >    columns, §8.1a's two runs) are unaffected.
 >
-> **✅ RE-TAKEN 2026-09-04 — §8.6. Both corrections landed, and a THIRD, larger one
-> was found underneath them.** The matched pair exists now (both arms stock V8,
-> interleaved, one frozen binary each) and the V8 tier turned out to be **not
-> resolvable on either engine** (§8.6d). What actually broke this baseline is the
-> **window**: `0.4450x` is one 40 s read of a 75 s cold boot, and re-reading that
-> same band out of four fresh runs of the same frozen binary returns **0.3338x,
-> 0.3592x, 0.5010x, 0.5097x** (§8.6a). **Do not quote `0.4450x` at all** — it is not
-> reproducible. The scene-stable figure is `0.3771x delivered / 138.8 MHz executed /
-> 22.9% idle-skipped`.
+> **✅ RE-TAKEN 2026-09-04 — §8.6. Both corrections landed, and two LARGER ones were
+> found underneath them.** The matched pair exists now (both arms stock V8,
+> interleaved, one frozen binary each), and the V8 tier — the thing this box was
+> written about — turned out to be **not resolvable on either engine** (§8.6d).
+>
+> What actually broke this JIT baseline is the **window**: `0.4450x` is one 40 s read
+> of a 75 s cold boot, and re-reading that same band out of four fresh runs of the
+> same frozen binary returns **0.3338x, 0.3592x, 0.5010x, 0.5097x** (§8.6c). **Do not
+> quote `0.4450x` at all** — it is not reproducible. The scene-stable replacement,
+> n=3, is **`0.3781x` delivered / `141.6 MHz` executed / `23.2%` idle-skipped**
+> (§8.6b).
+>
+> And what broke the OTHER side is worse and is not about measurement at all: the SR
+> arm's fixture **is not bit-exact**, and the harness re-runs it ~160,000 times on
+> state its restore set never repairs, so **no SR throughput figure in §8 can be
+> quoted or rescaled** (§8.6e).
 
 ~~This is *higher* than the 0.4115x in
 `gamecube/docs/sab-frame-governor/TASKS.md:20-21`~~ — that comparison is void for the
@@ -1652,33 +1688,37 @@ Two things follow that matter for §8:
 
 On the one comparison that can be made today — translated code versus the JIT's
 whole-system rate, which favours the recompiler — static recomp measures
-**0.50x-0.67x against 0.4450x**. Weighting by measurement quality (§8.1a), the number
-to carry is the hot-path one:
+~~**0.50x-0.67x against 0.4450x**~~. Weighting by measurement quality (§8.1a), the
+number to carry is the hot-path one:
 
-| | translated-code rate | ~~vs JIT 0.4450x~~ | ~~still needed for 1.000x~~ |
+| | ~~translated-code rate~~ | ~~vs JIT 0.4450x~~ | ~~still needed for 1.000x~~ |
 |---|---|---|---|
 | `HandleReverb`, hot, 3% control, 2 runs | ~~0.50x-0.54x~~ | ~~1.13-1.21x~~ | ~~1.86-2.00x~~ |
 | four non-hot fixtures, aggregate | ~~0.621x~~ | ~~1.40x~~ | ~~1.61x~~ |
 
-> **⛔ THIS WHOLE TABLE IS SUPERSEDED BY §8.6 — do not quote any cell of it.** Three
-> separate defects, measured in §8.6a:
-> 1. **The `0.4450x` denominator is not reproducible.** Re-reading its 40 s band out
->    of four fresh runs of one frozen binary returns **0.3338x–0.5097x**.
-> 2. **The `0.50-0.54x` numerator used a STATIC CPI (1.0774) where the JIT's cycles
->    are dynamic.** `HandleReverb`'s dynamic CPI is **≤1.0017** — one backward edge,
->    all five multi-cycle instructions outside the loop — so those cells are inflated
->    by up to 7.55% and read `0.47x-0.50x` on their own data.
-> 3. The V8-tier mismatch this box used to warn about is real but measured
->    **unresolvable on either engine** (§8.6d). It was the least of the three.
+> **⛔ EVERY CELL OF THIS TABLE IS VOID — §8.6. Do not quote any of them, and do not
+> rescale them.** Both columns failed, for unrelated reasons:
+> 1. **The numerator is not a measurement of the verified computation.**
+>    `HandleReverb` is **not bit-exact** — 308 spurious writes of `0xff` to
+>    `0x802bba84..0x802bbcfb`, a page native only *reads* — and `perf_browser.mjs`'s
+>    restore set (built from `fx.writes` only) does not cover them, so the corruption
+>    persists and **rep 1 of ~160,000 timed invocations is the only one computing
+>    native's answer**. The direction of the error is UNKNOWN. §8.6e.
+> 2. **The `0.4450x` denominator is not reproducible** — re-reading its 40 s band out
+>    of four fresh runs of one frozen binary returns **0.3338x–0.5097x**. §8.6c.
+> 3. Secondary, and it was in SR's favour: the numerator used a **static** CPI
+>    (1.0774) where the JIT's cycles are **dynamic**. `HandleReverb`'s dynamic CPI is
+>    **≤1.0017**, so those cells were additionally inflated by up to 7.55%. §8.6f.
+> 4. The V8-tier mismatch this box used to warn about is real but measures
+>    **null on both engines** (§8.6d). It was the least of the four.
 
-**The matched replacement is §8.6: 235.1 MHz executed (SR) vs 138.8 MHz (JIT) = 1.69x,
-against the 374.5 MHz that 1.000x costs on this scene.** The direction of the old
-conclusion survives and its magnitude does not: static recomp is ahead of the JIT on
-executed code, by more than the retracted 1.1-1.2x, and still **1.59x short of
-1.000x** before it pays for a host layer it does not have. It remains weaker than
-"static recomp obviously escapes the JIT ceiling", and weaker in the direction that
-matters, because *every* remaining unknown pushes it down further, not up: the SR side
-has no host layer, no interrupts, no GPU, no audio, no OS scheduling, and a hot cache.
+**What replaces it is only half a comparison, because only half of it survived.** The
+JIT arm is re-measured and solid — `0.3781x` delivered, `141.6 MHz` executed, `23.2%`
+idle-skipped, against the `373.5 MHz` that 1.000x costs on this scene, i.e. **2.64x
+short**. There is **no static-recomp number to put next to it.** The paragraph below
+therefore stands on its structural argument alone, not on any measured ratio: the SR
+side has no host layer, no interrupts, no GPU, no audio, no OS scheduling, and a hot
+cache, so *every* unknown still points the same way.
 
 That is *not* the "it obviously escapes the ceiling" result the route was pitched on,
 and it is *not* a refutation either, because the comparison is unequal in the
@@ -1692,208 +1732,234 @@ whole-image measurement would have read **~0.03x** and this route would have loo
 dead on arrival for a reason that was entirely an artifact of how one switch statement
 was emitted.
 
-## 8.6 THE MATCHED COMPARISON — both engines, stock V8, one scene, interleaved
+## 8.6 THE MATCHED RE-TAKE — the JIT arm holds, and the SR arm is VOID
 
 Measured 2026-09-04. §8.1's boxed correction said the JIT-vs-SR ratio "must be
-re-taken with both arms under the same flag." This is that re-take. It also found
-that **the V8 flag was the least important of the three defects in the old pair.**
+re-taken with both arms under the same flag." This is that re-take. It did not
+produce a ratio, because **checking the SR arm's correctness before quoting its speed
+found that the benchmark is not measuring the verified computation.**
 
-### 8.6a The old comparison had THREE defects. Only one of them was the V8 tier.
+### 8.6a The headline
 
-| # | defect | measured size |
-|---|---|---|
-| 1 | **The JIT window straddled the boot transient.** §8.1's baseline is a 75 s cold boot read over a single 40 s window. SAB's boot is not steady there. | **the dominant defect** — see below |
-| 2 | **The CPI conversion was STATIC, and the JIT's is dynamic.** §8.1a multiplied SR by 1.0774 (the static body CPI). | SR inflated by up to **7.55%** |
-| 3 | **The V8 tier was unmatched** (JIT forced `--no-liftoff`, SR on stock V8). | **not resolvable** on either engine — see §8.6d |
+| | verdict |
+|---|---|
+| **JIT arm** | **SOLID.** SAB attract scene, stock V8: **0.3781x delivered guest clock, 141.6 MHz executed, 23.2% idle-skipped.** Cross-witness spread ≤0.0005, n=3, independently corroborated. |
+| **`0.4450x` (the old JIT denominator)** | **RETRACTED.** Not reproducible: the same 40 s band re-read from four fresh runs of one frozen binary returns **0.3338x–0.5097x**. |
+| **SR arm** | **VOID — no static-recomp throughput number can be quoted today**, including `0.50-0.54x`, `0.62x` and `0.676x`. §8.6e. |
+| **the comparison** | **CANNOT BE MADE.** Not for the V8 reason §8.1 flagged — that one measures null (§8.6d) — but because the SR measurand is broken. |
 
-**Defect 1, measured.** Re-reading a §8.1-style band (`t ∈ [35,75] s`) out of this
-session's own four cold-boot runs — same disc, same frozen binary — gives
-**0.3338x, 0.3592x, 0.5010x, 0.5097x**. The same runs read over a scene-stable band
-(`t ∈ [60,160] s`) give **0.3761x, 0.3781x, 0.3658x, 0.3880x**. So the old window is
-a **1.53x-wide lottery on one binary**, and §8.1's `0.4450x` sits in the middle of
-its range. That is not a measurement of an engine; it is a measurement of where the
-attract sequence happened to be.
+**What 1.000x actually costs on this scene**, since that half IS measured:
 
-The mechanism is visible per-window: the boot transient reads up to **1.0014x with
-81.5% idle-skip and exec collapsed to 90.2 MHz**, and the attract loop's tail
-transitions into another idle phase at `t ≳ 160 s` (57-82% idle-skip). Between them
-sits ~100 s of genuinely steady work at 22-23% idle-skip. **Only that band is
-comparable between runs.**
+```
+executed MHz needed for 1.000x = 486 MHz x (1 - idle-skip 23.2%) = 373.5 MHz
+   the JIT executes 141.6 MHz  ->  2.64x short
+```
 
-**Defect 2, measured.** `HandleReverb` is 323 instructions costing 348 Gekko cycles
-(static CPI 348/323 = **1.077399**, reproducing §8.1a's 1.0774 exactly; opcode costs
-from `GekkoOPTemplate.num_cycles`, `gamecube/dolphin-src/Source/Core/Core/PowerPC/PPCTables.cpp`,
-9 tables totalling 243 entries). But the JIT's credited cycles are **dynamic** —
-charged per block execution — so SR must be converted dynamically too. The function
-has **exactly one backward edge** (`bdnz` at `0x800fa9e4` → `0x800fa850`) and **all
-five multi-cycle instructions sit outside that loop** (`stmw` prologue, `lmw`
-epilogue, `mtctr`, two `mulli`). So at most 25 extra cycles are ever charged:
+### 8.6b The JIT arm
+
+`node gamecube/tools/guest_rate_witness.mjs --only sab-cold-mips` (the standing
+witness rig), `ROM_IDX=1`, `?bjit_mips=1`, frozen `PROBE_ROOT` snapshot, under
+`tools/probe_lock.sh` with `PROBE_LOCK_MAX_LOAD=3`, orphan-reaped first. Stock V8 is
+now the probe default (`d7c3415b`). Worker `.wasm` md5
+`82bc8f8b6e1c6ac8db27ec0a5d49dadb`, checked before AND after every run and identical
+every time. Medians over 20 five-second windows in `t ∈ [60,160] s`:
+
+| run | V8 | delivered (W1) | W1≡W2≡W3 spread | credited | **executed** | **idle-skip** | drawn/s |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `j-stock-r1` | stock | 0.3761x | 0.0003 | 182.8 MHz | 135.6 MHz | 22.7% | 21.2 |
+| `j-stock-r2` | stock | 0.3781x | 0.0002 | 183.8 MHz | 141.9 MHz | 23.2% | 22.2 |
+| `j-stock-r3` | stock | 0.3811x | 0.0002 | 185.2 MHz | 141.6 MHz | 23.3% | 22.1 |
+| `j-nl-r1` | `--no-liftoff` | 0.3658x | 0.0005 | 177.8 MHz | 135.8 MHz | 22.9% | 21.6 |
+| `j-nl-r2` | `--no-liftoff` | 0.3880x | 0.0003 | 188.6 MHz | 146.3 MHz | 22.8% | 22.4 |
+| `j-nl-r3` | `--no-liftoff` | 0.3617x | 0.0002 | 175.7 MHz | 136.7 MHz | 22.8% | 21.0 |
+
+**Independent corroboration.** `gamecube/docs/sab-frame-governor/TASKS.md` records
+`[mips] EXECUTED=133.3 MHz` on the same disc and scene on 2026-09-01, a different
+session and a different invocation. This campaign reads 135.6–146.3 MHz.
+
+**The idle-skip is mandatory context, not a footnote.** 23.2% of the credited clock
+is jumped over rather than executed, so `0.3781x` and `141.6 MHz` are two different
+true statements about the same run and neither substitutes for the other
+(`gamecube/docs/guest-rate-witness/TASKS.md` §F2/§F3).
+
+### 8.6c Why `0.4450x` is retracted: the window was a lottery
+
+§8.1's baseline is a 75 s cold boot read over a single 40 s window. **SAB's boot is
+not steady there.** Re-reading that band (`t ∈ [35,75] s`) out of this session's own
+four runs — same disc, same frozen binary — gives **0.3338x, 0.3592x, 0.5010x,
+0.5097x**, a 1.53x spread with `0.4450x` sitting in the middle of it.
+
+The mechanism is visible per window: the boot transient reaches **1.0014x with 81.5%
+idle-skip and executed collapsed to 90.2 MHz**, and the attract loop's tail enters
+another idle phase at `t ≳ 160 s` (57–82% idle-skip). Between them sits ~100 s of
+steady work at 22–23% idle-skip. **Only that band is comparable between runs**, which
+is why every figure in §8.6b is cut to it.
+
+The two arms are on the same scene: the hot profile that ranks `HandleReverb` #9 was
+produced by `gamecube/docs/sab-frame-governor/TASKS.md` from `ROM_IDX=1
+PROBE_DURATION_MS=75000`, a SAB cold boot. Screenshots at `t = 118 s`
+(`/tmp/gcm/j-*/sab-cold-mips.png`) show fully rendered 3D at ~21 drawn/s.
+
+> Two things the screenshots also show. (1) The arms sit at *different points of the
+> attract sequence* at the same instant — one frame is the City Escape demo, another
+> a Knuckles cutscene — so they are matched on scene, not frame-for-frame on content;
+> the mitigation is the 20-window median over ~100 s of a flat series, and the
+> residual is inside the quoted spread rather than separated from it. (2) **City
+> Escape renders correctly from cold boot on this binary**, while the `sab-ingame`
+> savestate cell draws the same level at 2.6/s behind a live HUD over a black world —
+> a lead for that open question pointing at the restore, not the renderer.
+
+### 8.6d The V8 tier is NOT resolvable live, on EITHER engine
+
+`gamecube/docs/wasm-tier/TASKS.md` sizes the tier at 2.108x on emitted bodies with a
+**1.164x** residual under stock V8, and voided its own live pair. This campaign took
+the matched live pair — and found no resolvable effect on either engine. The JIT's
+stock runs (0.3761 / 0.3781 / 0.3811) and its `--no-liftoff` runs (0.3658 / 0.3880 /
+0.3617) **interleave**; the SR cells likewise straddle the flag inside their own
+noise.
+
+So the V8-tier defect §8.1 warned about is real as a *method* flaw and is now closed
+by making both harnesses default to stock V8 (`d7c3415b`, plus the new
+`PERF_JS_FLAGS` knob in `perf_browser.mjs` — **the SR harness previously had no way
+to set a V8 flag at all, which is why the old pair could only ever be unmatched**).
+But it is **not what made the old number wrong.** Stated as a limitation rather than
+a refutation: this rig resolves ~6–7% at low load and 1.164x would have been visible;
+that it is not is consistent with `wasm-tier`'s own "260 of 323 modules tier up
+unaided".
+
+### 8.6e ⛔ THE SR ARM IS VOID — the benchmark runs on corrupted state after rep 1
+
+Before quoting the SR speed, its correctness was checked. It does not hold.
+
+**1. `HandleReverb` is not bit-exact.** On a whole-image `-DSR_VERIFY` build whose
+`sr_gen.c` is md5 `31ff4d0c2e893694d8f4009bcc07c9c3`, **byte-identical to the `-O2`
+perf build's `sr_gen.c`** (same translated C, different compile flags),
+`verify_fixture.mjs` returns, reproduced identically on two consecutive runs:
+
+```
+FAIL  0x800fa704  steps=14423 bl=0 stores=1481 write-events=3454 ... ps1-indep=true
+        write events: want 3454, got 3762
+        write event #134: want [0x3ece69]=a7 got [0x2bba84]=ff
+SUMMARY  0 verified / 7 attempted / 5 refused / 2 MISMATCHED
+```
+
+Fault 0, unstaged 0, exit GPRs / FPR PS0 / CR / LR / CTR all match, final memory over
+native's 3632 stored bytes matches. It fails on exactly one criterion — the ordered
+write log — and it fails by doing **more** memory work: **308 spurious writes of
+`0xff`** across `0x802bba84..0x802bbcfb`.
+
+**2. That page is one the guest only READS.** Confirmed here directly from the
+committed fixture, no build required:
+
+```
+restore-set bytes (from fx.writes): 3632      <- matches README 8.1a's "restore-set=3632B"
+does the restore set cover 0x802bba84?  False
+native write EA range: 0x803c0b88 .. 0x803fff58   (never touches page 0x802bb000)
+initial_mem staged on page 0x802bb000: 640 bytes, 0x802bba80..0x802bbcff
+```
+
+So native stages 640 bytes there because the guest reads that structure, and never
+writes one byte of it. The translation clobbers it.
+
+**3. The corruption PERSISTS ACROSS REPS on the perf binary, so the benchmark is not
+measuring the verified computation.** `perf_browser.mjs` builds its restore set from
+`fx.writes` **only** and stages `initial_mem` once before the loop, so any byte the
+translation writes outside `fx.writes` is never restored. Replaying the fixture
+directly on the real `-O2` perf wasm `b0e35dc87ee1567bc5a1215a0dd42153`, staged
+exactly as `perf_browser.mjs` stages it, reproduced the same **308** changed bytes on
+that page — a second instrument, a different binary, the same number — and then:
+
+```
+rep 2: fault=0x0  final-memory mismatches vs native = 839 / 3632
+rep 3: fault=0x0  final-memory mismatches vs native = 839 / 3632
+rep 4: fault=0x0  final-memory mismatches vs native = 839 / 3632
+```
+
+With the defaults `PERF_REPS=20000 × PERF_TRIALS=7` plus a warm-up pass, **rep 1 is
+the only one of ~160,000 timed invocations computing native's answer**, while
+`fx.steps = 14423` — the oracle's count for rep 1 — is divided by the mean wall time
+of all of them. **The denominator does not describe the numerator.**
+
+**Direction of the error is UNKNOWN.** Nobody has measured whether the
+corrupted-input reps are faster or slower than the correct one, so `0.50-0.54x` is
+not "too high" or "too low" — it is not a measurement of a defined quantity. Do not
+salvage it by applying a correction factor.
+
+> **The harness asserted a correctness property it does not have.**
+> `perf_browser.mjs`'s header says its fixtures are "already verified bit-exact by
+> `verify_fixture.mjs` / `verify_slice.mjs`". That is now known false for the one
+> fixture carrying the headline. **The four `0x80111xxx` fixtures behind the `0.62x`
+> aggregate have not been audited** and must be treated as unverified until they are.
+> The `-O2` perf build also **structurally cannot host the verify harness** —
+> `build_slice.sh` exports only `_sr_init/_sr_ram/_sr_ram_size/_sr_state/_sr_state_size/_sr_call/_malloc`
+> with no `-DSR_VERIFY`, while `verify_fixture.mjs` needs `sr_fixture.js` from
+> `build_fixture.sh` — so **speed and correctness have never been measured on the
+> same binary.** That is the gap that let this through.
+
+### 8.6f The CPI conversion was also wrong, in SR's favour
+
+Independent of the above, and load-bearing for any re-take. §8.1a multiplies SR by a
+**static** CPI of 1.0774 while the JIT's credited cycles are **dynamic** (charged per
+block execution), so the two sides were not in the same unit.
+
+The static figure itself reproduces exactly — `HandleReverb` is 323 instructions
+costing 348 Gekko cycles, 348/323 = **1.077399**, using `num_cycles` from
+`GekkoOPTemplate` in
+`gamecube/dolphin-src/Source/Core/Core/PowerPC/PPCTables.cpp` (9 tables, 243 entries;
+**34 of them carry `num_cycles > 1`, not the 40 §8.2 states** — 40 is the `!= 1`
+count, which also catches five `Subtable` dispatch stubs and `unknown_instruction` at
+0 cycles). But the *dynamic* CPI is far lower: the function has **exactly one
+backward edge** (`bdnz` at `0x800fa9e4` → `0x800fa850`) and **all five multi-cycle
+instructions sit outside that loop** (`stmw` prologue, `lmw` epilogue, `mtctr`, two
+`mulli`), so at most 25 extra cycles are ever charged:
 
 ```
 dynamic CPI <= (14423 + 25) / 14423 = 1.0017
 ```
 
-Corroborated independently by the fixture's own write log: all 45 store PCs outside
-the loop executed exactly once, the 9 inside executed 159-161 times. **The static
-1.0774 overstates this fixture by up to 7.55%**, so §8.1a's `0.50-0.54x` is really
-`0.47-0.50x` on its own data.
+Corroborated by the fixture's own write log: the 45 store PCs outside the loop each
+executed once, the 9 inside executed 159–161 times. **The static 1.0774 overstates
+this fixture by up to 7.55%.** Any future SR number must convert dynamically, or
+report guest instructions per second and not convert at all.
 
-### 8.6b The rig
+### 8.6g What a valid re-take needs
 
-Both arms alternated (`J S J S`), never taken in sequence. One frozen binary per
-engine, `md5` checked before AND after every single run and **identical every time**:
-dolphin worker `82bc8f8b6e1c6ac8db27ec0a5d49dadb`, SR whole-image `-O2`
-`b0e35dc87ee1567bc5a1215a0dd42153`. Every run under `tools/probe_lock.sh` with
-`PROBE_LOCK_MAX_LOAD=3`, orphan-reaped first, `uptime` recorded either side.
+1. **Fix the 308 spurious writes**, or establish which store is mis-targeted. Not
+   diagnosed here — nobody disassembled the emitted C for that store.
+2. **Make `perf_browser.mjs` fail loud instead of silently drifting.** It already
+   re-checks `fault` after the benchmark; it does **not** re-check state. Comparing
+   final memory against the fixture after the last rep would have caught this on day
+   one, and is cheap.
+3. **Measure speed and correctness on the SAME binary** — today `-O2` cannot host the
+   verify harness at all.
+4. **Audit the four `0x80111xxx` fixtures** before `0.62x` is quoted again.
+5. **A scene-locked JIT arm.** The cold-boot attract loop works but is content-mixed;
+   the in-repo SAB savestate is unusable until the black-world defect is resolved.
 
-- **Arm J** — `node gamecube/tools/guest_rate_witness.mjs --only sab-cold-mips`
-  (the standing witness rig), `ROM_IDX=1`, `?bjit_mips=1`, served from a frozen
-  `PROBE_ROOT` snapshot. Stock V8 is now the probe default (`d7c3415b`;
-  `dolphin_render_probe.js` line reading `PROBE_JS_FLAGS || ''`). The `--no-liftoff`
-  arm is `PROBE_JS_FLAGS=--no-liftoff`.
-- **Arm S** — `SR_OUT=/tmp/sr_wi_o2_web node gamecube/recomp/sr/perf_browser.mjs
-  gamecube/recomp/sr/sab_hot_fixtures.json`, i.e. `HandleReverb` `0x800fa704`, the
-  one hot-profile fixture (§8.1a). Its `--no-liftoff` arm uses the new
-  `PERF_JS_FLAGS` knob added in this pass — **the harness previously had no way to
-  set a V8 flag at all, which is why the old pair could only ever be unmatched.**
+### 8.6h The honest reading
 
-> **Two reproducibility debts, one paid and one not.** The fixture carrying this
-> entire SR number lived only at `/tmp/sab_hot_fixtures.json` — it is now committed as
-> `gamecube/recomp/sr/sab_hot_fixtures.json` (byte-identical copy), so §8.1a and §8.6
-> can be re-run. The **build** is still scratch-only: `/tmp/sr_wi_o2_web` holds
-> `sr_slice.wasm` md5 `b0e35dc87ee1567bc5a1215a0dd42153`, the same binary §5j records
-> at 1056 bit-exact / 0, but `/tmp` is volatile and there is no committed recipe that
-> reproduces that exact md5. Anyone re-taking §8.6 will have to rebuild and re-hash.
+**The strategic question is not answered, and it is less answered than it looked
+yesterday.** What is known:
 
-**The two arms are on the same scene, and that is checkable rather than asserted.**
-The hot profile that ranks `HandleReverb` #9 was produced by
-`gamecube/docs/sab-frame-governor/TASKS.md:20-23` from `ROM_IDX=1
-PROBE_DURATION_MS=75000` — a SAB cold boot, the same scene arm J measures.
-Screenshots at `t = 118 s` (`/tmp/gcm/j-*/sab-cold-mips.png`) show a fully rendered
-City Escape attract demo at 21 drawn/s — **not** the black-world pathology of the
-`sab-ingame` savestate cell.
+- The **JIT** side is now measured properly for the first time: `0.3781x` delivered
+  with `23.2%` of the clock skipped, `141.6 MHz` executed against the `373.5 MHz`
+  that 1.000x costs on this scene — **2.64x short**, on the V8 configuration a
+  visitor actually gets.
+- The **static-recomp** side has **no valid throughput number at all.** The premise
+  it was pitched on — "this escapes the JIT ceiling" — remains exactly as unproven as
+  it was before §8 was written, and the intermediate answer ("~1.1-1.2x the JIT") is
+  withdrawn from both directions: its denominator was a lottery and its numerator was
+  not a measurement of the verified computation.
+- §8.4's structural conclusion is untouched and is now the *only* thing §8 supports:
+  **the decisive experiment is SAB executing continuously through the recompiled
+  image with a host layer under it, and the blocker is that host layer, not
+  throughput.**
 
-> One residual mismatch, recorded rather than hidden: the probe passes
-> `--js-flags=--max-old-space-size=4096` on both its arms and `perf_browser.mjs`
-> passes no `--js-flags` at all. That sets a JS old-space heap limit; it is not a
-> wasm-tiering flag, so the arms are matched on the tier itself. Both engines now
-> run **stock dynamic tiering — the configuration a web page actually gets.**
+**Three sizings of this route have now evaporated under re-measurement.** The pattern
+in all three is the same and is worth naming: a number was produced by a rig that had
+never been asked to prove the thing it was timing was correct. The cheapest guard
+against a fourth is item 2 above.
 
-### 8.6c The result
-
-Arm J, medians over 20 five-second windows in `t ∈ [60,160] s`, per run:
-
-| run | V8 | delivered guest clock (W1) | W1≡W2≡W3 spread | credited | **executed** | **idle-skip** | drawn/s |
-|---|---|---:|---:|---:|---:|---:|---:|
-| `j-stock-r1` | stock | 0.3761x | 0.0003 | 182.8 MHz | **135.6 MHz** | 22.7% | 21.2 |
-| `j-stock-r2` | stock | 0.3781x | 0.0002 | 183.8 MHz | **141.9 MHz** | 23.2% | 22.2 |
-| `j-nl-r1` | `--no-liftoff` | 0.3658x | 0.0005 | 177.8 MHz | 135.8 MHz | 22.9% | 21.6 |
-| `j-nl-r2` | `--no-liftoff` | 0.3880x | 0.0003 | 188.6 MHz | 146.3 MHz | 22.8% | 22.4 |
-
-Arm S, `HandleReverb`, restore-corrected, min of 7 trials, restore control 3.2-3.5%:
-
-| run | V8 | guest instr/s | load at lock |
-|---|---|---:|---:|
-| `s-stock-r1` | stock | 206.2 M | 6.71 ⚠ |
-| `s-stock-r2` | stock | **234.7 M** | 2.93 |
-| `s-nl-r1` | `--no-liftoff` | 230.3 M | 2.93 |
-| `s-nl-r2` | `--no-liftoff` | 235.8 M | 2.81 |
-
-⚠ `s-stock-r1` is the only cell taken above the load gate — it ran 31 s after a JIT
-probe, before the gate was added, and it is 12% below its own arm's low-load point.
-It is printed, not dropped, and not used for the headline.
-
-### 8.6d The V8 tier is NOT resolvable live, on EITHER engine
-
-`gamecube/docs/wasm-tier/TASKS.md` sizes the tier at 2.108x on emitted bodies with a
-**1.164x** residual under stock V8, and voided its own live pair. This campaign gets
-the matched live pair and finds **no resolvable effect on either engine**:
-
-| engine | stock | `--no-liftoff` | ratio |
-|---|---:|---:|---|
-| JIT (delivered W1) | 0.3761 / 0.3781 | 0.3658 / 0.3880 | arms **interleave**, no separation |
-| SR (instr/s, low-load cells only) | 234.7 M | 230.3 / 235.8 M | **1.00x** |
-
-So the V8-tier defect in the old pair was real as a *method* flaw and is now closed,
-but it is **not what made the old number wrong** — defect 1 was. Stated as a
-limitation rather than a refutation: this rig resolves ~6-7% at low load, and 1.164x
-would have been visible; that it is not says the live many-module workload already
-collects the tier, consistent with `wasm-tier`'s own "260 of 323 modules tier up
-unaided".
-
-### 8.6e THE ONE NUMBER: executed Gekko MHz
-
-Ratios of two differently-defined rates are what produced every previous mistake
-here. Both engines reduce to **one unit** — Gekko cycles of real work executed per
-wall second — and the target is a measured property of the scene, not an assumption:
-
-```
-executed MHz needed for 1.000x on this scene
-   = 486 MHz x (1 - idle-skip 22.9%)   =  374.5 MHz
-```
-
-| | executed | short of 1.000x by |
-|---|---:|---:|
-| **JIT**, whole system, stock V8 | **138.8 MHz** | **2.70x** |
-| **static recomp**, translated code only, stock V8 | **235.1 MHz** | **1.59x** |
-| ratio SR ÷ JIT | **1.69x** | |
-
-Where each figure comes from, so neither can be re-quoted loose:
-
-- **JIT 138.8 MHz** = median of the two stock-V8 runs' medians (135.6, 141.9), each a
-  median over 20 windows. Cross-witness spread W1≡W2≡W3 ≤ 0.0003 in both.
-- **SR 235.1 MHz** = 234.7 M guest instr/s × **dynamic** CPI 1.0017 (§8.6a defect 2).
-  234.7 is the median of the **three low-load cells** (`s-stock-r2` 234.7,
-  `s-nl-r1` 230.3, `s-nl-r2` 235.8, all at lock-load 2.8-2.9); they are pooled across
-  the flag because §8.6d shows the flag has no resolvable effect on this engine, and
-  they span only 2.4%. `s-stock-r1` (load 6.71) is excluded and said so above.
-  Using the old STATIC CPI instead would read 0.5203x rather than 0.4837x.
-- **22.9% idle-skip** = median of the two stock runs (22.7%, 23.2%), from the
-  `?bjit_mips=1` meter — `EXECUTED` vs `CREDITED`, the ratio
-  `gamecube/docs/guest-rate-witness/TASKS.md` §F2 identifies as the meter's one
-  legitimate use.
-
-> **⚠ SAMPLE SIZE: n=2 per JIT arm and n=2 per SR arm.** A sibling agent held
-> `tools/probe_lock.sh` through this campaign's second half, so rounds 3 and 4 queued
-> and did not land. The within-arm spreads are 0.5% (JIT stock delivered), 4.6% (JIT
-> stock executed) and 2.4% (SR low-load), against this rig's documented ~6-7%
-> resolution — so the **1.69x is not a knife-edge**, but it is two runs per arm and
-> should not be quoted to three digits.
-
-**Independent corroboration of the JIT arm.** `gamecube/docs/sab-frame-governor/TASKS.md:38`
-recorded `[mips] EXECUTED=133.3 MHz` on the same disc and scene on 2026-09-01, in a
-different session with a different invocation. This campaign reads 135.6-146.3 MHz.
-
-### 8.6f The honest reading
-
-**Static recomp executes SAB's hot code at ~1.69x the JIT — and 1.69x is not 2.70x.**
-Neither engine has a demonstrated path to 1.000x on this scene, and the gap SR still
-owes (1.59x) is *larger* than the entire measured lever inventory on the JIT side.
-
-**The 1.69x is an upper bound, and every unquantified term pushes it down:**
-
-1. **SR has no host layer at all** (§8.3 item 1) — no interrupts, DMA, GPU/FIFO,
-   audio, OS scheduling, DVD. The JIT's 138.8 MHz is measured with all of them
-   running. This remains the single largest unequal term and its size is still
-   unmeasured.
-2. **SR is one function replayed on a hot cache**, 3.21% of the profile. §8.1c
-   established the rest of the hot path is mostly *not capturable* (MMIO, paired
-   singles), so this is not a sampling accident that more effort fixes cheaply.
-3. **SR gets no idle-skip.** The 374.5 MHz target already credits the JIT's 22.9%
-   clock-jumping; an SR-based system would have to build the same mechanism to
-   spend the same budget.
-4. The JIT arm carries the `?bjit_mips=1` meter, which can only **subtract** from
-   its throughput. `guest-rate-witness/TASKS.md` §F7 measured that cost as below
-   this rig's resolution across six pairs, but the direction is against the JIT.
-
-**What this does and does not settle.** It settles that the previously published
-"~1.1-1.2x the JIT" was arithmetic over an unreproducible baseline. It does *not*
-settle the strategic question, because the number that would — SAB executing
-continuously through the recompiled image with a host layer under it — is still
-unmeasured, and §8.4's conclusion stands unchanged: **the blocker is the host layer,
-not throughput.**
-
----
 
 ## 9. Whole-image runtime completeness, and the wall moving from TRANSLATION to VERIFICATION
 
@@ -2486,18 +2552,20 @@ two.
 
 **What that claim does NOT cover, stated plainly:**
 
-1. ~~**There is no performance number of any kind for the SAB static-recomp path.**~~
-   **SUPERSEDED 2026-09-04 — §8.6 (the earlier "0.50-0.54x vs 0.4450x = ~1.1-1.2x"
-   answer to this item is itself RETRACTED, §8.6a).** The matched measurement — both
-   engines on **stock V8**, same SAB scene, interleaved, one frozen binary each — is
-   in a single unit: **1.000x on this scene costs 374.5 MHz of executed Gekko work**
-   (486 MHz × (1 − 22.9% idle-skip); the idle-skip is measured, not assumed). The JIT
-   executes **138.8 MHz** of it (2.70x short); static recomp executes **235.1 MHz**
-   (1.59x short). SR is **1.69x** the JIT on executed code.
-   **That 1.69x is an UPPER bound** — the SR side still has no host layer at all, is
-   one hot function replayed on a hot cache, and gets none of the JIT's idle-skip
-   credit. **The premise "this escapes the JIT ceiling" is still unproven**: what is
-   measured is that translated code is faster than the JIT's, not that a system built
+1. **There is STILL no valid performance number for the SAB static-recomp path.**
+   The 2026-09-04 "SUPERSEDED" answer to this item — `0.50-0.54x vs 0.4450x`,
+   `~1.1-1.2x the JIT` — is **withdrawn from both sides (§8.6)**, and this item
+   reverts to open. The numerator is not a measurement of the verified computation
+   (`HandleReverb` is not bit-exact, and `perf_browser.mjs` re-runs it ~160,000 times
+   on state its restore set never repairs — §8.6e); the denominator was a
+   40 s window on a boot transient that returns `0.3338x–0.5097x` from one frozen
+   binary (§8.6c).
+   **What IS now measured is the JIT half, properly:** 1.000x on this scene costs
+   **373.5 MHz of executed Gekko work** (486 MHz × (1 − 23.2% idle-skip), the
+   idle-skip measured rather than assumed) and the JIT executes **141.6 MHz** of it —
+   **2.64x short**, on the V8 configuration a visitor actually gets.
+   **The premise "this escapes the JIT ceiling" is unproven and currently
+   unmeasured**: what is known is what the JIT costs, not that a system built
    on it would hit 1.000x. Read §8.3 and §8.6f before quoting any of it.
 2. ~~**No `.rel` overlay function has ever been differentially verified.**~~
    **CLOSED 2026-09-02 (§5g/§5h): `stg13D.rel` `0x8121d80c` is bit-exact** — exit
