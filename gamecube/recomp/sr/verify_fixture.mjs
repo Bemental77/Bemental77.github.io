@@ -106,7 +106,7 @@ const main = async () => {
   // which is a vacuous pass and exactly the shape a survey must never report. Every
   // refusal is tallied by its reason so a gap is visible as a named class with a
   // count, rather than as a smaller denominator nobody printed.
-  const tally = { pass: 0, fail: 0, refused: 0, notBuilt: 0 };
+  const tally = { pass: 0, fail: 0, refused: 0, notBuilt: 0, passWithSink: 0 };
   const why = new Map();
   const refuse = (kind, line) => {
     tally.refused++;
@@ -139,7 +139,30 @@ const main = async () => {
       // reads poison and produces a wall of register diffs that look like a
       // translation defect and are not one -- the same trap `usable:false`
       // exists for.  Reject it here rather than scoring it.
-      if (fx.outside_mem1?.length) {
+      // UNMODELLED REGIONS: refuse on a READ, score on write-only.
+      //
+      // The blanket "touches anything outside MEM1 -> not replayable" rule was too
+      // strict and it was throwing away most of the survey: SAB's City Escape overlay
+      // pushes GX commands through WPAR (0xCC008000) and uses the Gekko locked L1
+      // (0xE00000xx) as scratch, so almost every drawing function tripped it.  Neither
+      // region is memory anyone can compare -- the oracle cannot read them back
+      // either (an `m` packet at 0xE00000xx panics Dolphin) -- but a function that
+      // only WRITES there has every other effect fully checkable, and gekko_rt.h now
+      // gives both windows a private sink whose stores are excluded from the change
+      // log.  What is NOT sound is a READ of a byte this invocation did not write, so
+      // that is still a refusal, by name.  Older fixtures carry no direction
+      // information; those stay refused rather than being assumed write-only.
+      const okind = fx.outside_mem1_kind;
+      const readsOutside = okind
+        ? Object.entries(okind).filter(([, k]) => k !== 'store')
+        : null;
+      const KNOWN = (a) => ((a >>> 0) >= 0xE0000000 && (a >>> 0) < 0xE0040000) ||
+                           ((a >>> 0) >= 0xCC008000 && (a >>> 0) < 0xCC009000);
+      const allKnown = (fx.outside_mem1 || []).every(KNOWN);
+      let sinkNote = '';
+      if (fx.outside_mem1?.length && okind && allKnown && readsOutside.length === 0) {
+        sinkNote = ` [${fx.outside_mem1.length} store(s) to unmodelled regions NOT compared]`;
+      } else if (fx.outside_mem1?.length) {
         const list = fx.outside_mem1.slice(0, 3)
           .map((a) => `0x${(a >>> 0).toString(16)}`).join(', ');
         // Name the REGION, not just "outside MEM1": these are two distinct pieces of
@@ -156,11 +179,14 @@ const main = async () => {
           : ((a >>> 0) === 0xCC008000 ? 'WPAR write-gather pipe 0xCC008000'
                                       : `unmodelled 0x${(a >>> 0).toString(16)}`);
         const kinds = [...new Set(fx.outside_mem1.map(region))];
-        refuse(`touches ${kinds.join(' + ')}`,
+        const cause = !okind ? 'capture recorded no load/store direction'
+                    : !allKnown ? 'an address outside the two modelled windows'
+                    : `${readsOutside.length} address(es) READ, not just written`;
+        refuse(`touches ${kinds.join(' + ')} — ${cause}`,
                `SKIP  0x${entry.toString(16).padStart(8, '0')}  not replayable — ` +
                `touches ${fx.outside_mem1.length} address(es) outside MEM1 (${list}` +
                `${fx.outside_mem1.length > 3 ? ', ...' : ''}) = ${kinds.join(' + ')}; ` +
-               `the harness stages MEM1 only`);
+               `${cause}`);
         continue;
       }
       const want = expandWrites(fx.writes);
@@ -303,7 +329,8 @@ const main = async () => {
       const ok = bad.length === 0;
       allPass = allPass && ok;
       tally[ok ? 'pass' : 'fail']++;
-      console.log(`${ok ? 'PASS' : 'FAIL'}  ${tag}  steps=${fx.steps} bl=${fx.n_calls} ` +
+      if (ok && sinkNote) tally.passWithSink++;
+      console.log(`${ok ? 'PASS' : 'FAIL'}  ${tag}${sinkNote}  steps=${fx.steps} bl=${fx.n_calls} ` +
                   `stores=${fx.writes.length} write-events=${want.length} ` +
                   `final-mem-bytes=${fx._memBytes} ` +
                   `staged=${Object.keys(fx.initial_mem).length} ` +
@@ -319,6 +346,10 @@ const main = async () => {
     console.log(`  refused ${String(n).padStart(4)}  ${k}`);
   if (tally.notBuilt)
     console.log(`  refused ${String(tally.notBuilt).padStart(4)}  not in this build`);
+  if (tally.passWithSink)
+    console.log(`  NOTE ${String(tally.passWithSink).padStart(6)}  of the verified ` +
+                `fixtures also store to an unmodelled region (locked L1 / WPAR); ` +
+                `those stores are not compared, everything else is`);
   // A run in which nothing was SCORED is not a pass, however few things failed.
   if (tally.fail) console.log('MISMATCHES PRESENT');
   else if (!tally.pass) console.log('NOTHING WAS SCORED — every fixture was refused');

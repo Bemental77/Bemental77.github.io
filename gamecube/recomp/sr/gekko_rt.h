@@ -53,6 +53,60 @@ static inline int gk_ok(uint32_t p, uint32_t n) {
     return 1;
 }
 
+// -------------------------------------------- UNMODELLED REGIONS (verify only)
+// Two pieces of Gekko state this runtime does not model, both of which real SAB
+// overlay code touches constantly:
+//   0xE0000000..0xE0040000  the LOCKED L1 CACHE (Dolphin Memmap.h:253, 256 KB).
+//   0xCC008000..0xCC009000  WPAR, the write-gather pipe -- the port the guest
+//                           pushes GX commands through.  Write-only by design.
+// Under the plain masking above, 0xE0000030 aliases onto MEM1 offset 0x30 and
+// 0xCC008000 onto 0x00008000, so an access there would CORRUPT MEM1 and forge write
+// events; gk_ok's bound does not catch it because the aliased offset is in range.
+// (What actually happened was a fault, because 0xE0000030 & 0x03FFFFFF = 0x20000030
+// IS out of range -- but that is luck, not a check, and 0xCC008000 is not.)
+//
+// So, IN THE DIFFERENTIAL BUILD ONLY, both windows get a private scratch buffer past
+// the end of MEM1.  Consequences, all deliberate:
+//   * a store there lands somewhere harmless and is NOT written to the change log,
+//     so it is not compared -- the oracle cannot show us those bytes either (an `m`
+//     packet for 0xE00000xx panics Dolphin: see native_oracle_gdb.py),
+//   * a read-back of something this same invocation wrote is CORRECT, which is the
+//     normal scratch-buffer idiom, and
+//   * a read of a byte this invocation did NOT write is NOT correct -- it reads the
+//     buffer's initial zero instead of the machine's value.  verify_fixture.mjs
+//     refuses any fixture whose capture recorded a LOAD from these windows
+//     (outside_mem1_kind), so that case is never scored, only refused by name.
+// The shipping runtime is unchanged: none of this is compiled without SR_VERIFY.
+#ifdef SR_VERIFY
+#define GK_SINK_L1    0x00040000u          /* 256 KB locked L1 */
+#define GK_SINK_WPAR  0x00001000u          /* 4 KB around WPAR */
+#define GK_SINK_SIZE  (GK_SINK_L1 + GK_SINK_WPAR)
+static inline int gk_sink(uint32_t ea, uint32_t n, uint32_t *p) {
+    if ((ea >> 28) == 0xEu && (ea & 0x0FFFFFFFu) + n <= GK_SINK_L1) {
+        *p = g_ram_size + (ea & 0x0003FFFFu);
+        return 1;
+    }
+    if ((ea & ~0x0FFFu) == 0xCC008000u) {
+        *p = g_ram_size + GK_SINK_L1 + (ea & 0x0FFFu);
+        return 1;
+    }
+    return 0;
+}
+#define GK_MAP(ea, n, p, fail)  do {                                           \
+        (p) = gk_phys(ea);                                                     \
+        if ((p) + (n) > g_ram_size) {                                          \
+            if (!gk_sink((ea), (n), &(p))) { gk_ok((p), (n)); fail; }          \
+        }                                                                      \
+    } while (0)
+#define GK_IS_SINK(p) ((p) >= g_ram_size)
+#else
+#define GK_MAP(ea, n, p, fail)  do {                                           \
+        (p) = gk_phys(ea);                                                     \
+        if (!gk_ok((p), (n))) { fail; }                                        \
+    } while (0)
+#define GK_IS_SINK(p) 0
+#endif
+
 // ------------------------------------------------- differential-verify hooks
 // Compiled in ONLY under -DSR_VERIFY (the fixture harness); the shipping runtime
 // gets identical code to before.  Two checks, both of which have to hold for a
@@ -80,6 +134,15 @@ static inline void gk_w_pre(uint32_t p, uint32_t n){
     if (n <= sizeof gk_wpre) for (uint32_t i = 0; i < n; i++) gk_wpre[i] = g_ram[p + i];
 }
 static inline void gk_w_post(uint32_t p, uint32_t n){
+    // A store into an UNMODELLED window is not a memory change anyone can compare:
+    // the oracle cannot read those bytes back either.  Do not log it -- but DO mark
+    // it staged, so a later read of what this same invocation just wrote is legal
+    // while a read of anything else in the window trips the unstaged-read check and
+    // fails the fixture loudly instead of quietly returning zero.
+    if (GK_IS_SINK(p)) {
+        if (g_staged) for (uint32_t i = 0; i < n; i++) g_staged[p + i] = 1;
+        return;
+    }
     if (!g_wlog || n > sizeof gk_wpre) return;
     // Two words per event: a 24 MB MEM1 needs 25 address bits, so packing the byte
     // into the same word would overflow. Keep them separate.
@@ -100,18 +163,18 @@ static inline void gk_w_post(uint32_t p, uint32_t n){
 #endif
 
 // ------------------------------------------------------- big-endian guest memory
-static inline uint8_t  gk_r8 (uint32_t ea){ uint32_t p=gk_phys(ea); if(!gk_ok(p,1)) return 0; GK_RD(p,1); return g_ram[p]; }
-static inline uint16_t gk_r16(uint32_t ea){ uint32_t p=gk_phys(ea); if(!gk_ok(p,2)) return 0; GK_RD(p,2);
+static inline uint8_t  gk_r8 (uint32_t ea){ uint32_t p; GK_MAP(ea,1,p,return 0); GK_RD(p,1); return g_ram[p]; }
+static inline uint16_t gk_r16(uint32_t ea){ uint32_t p; GK_MAP(ea,2,p,return 0); GK_RD(p,2);
     return (uint16_t)((g_ram[p]<<8)|g_ram[p+1]); }
-static inline uint32_t gk_r32(uint32_t ea){ uint32_t p=gk_phys(ea); if(!gk_ok(p,4)) return 0; GK_RD(p,4);
+static inline uint32_t gk_r32(uint32_t ea){ uint32_t p; GK_MAP(ea,4,p,return 0); GK_RD(p,4);
     return ((uint32_t)g_ram[p]<<24)|((uint32_t)g_ram[p+1]<<16)|((uint32_t)g_ram[p+2]<<8)|g_ram[p+3]; }
 static inline uint64_t gk_r64(uint32_t ea){ return ((uint64_t)gk_r32(ea)<<32) | gk_r32(ea+4); }
 
-static inline void gk_w8 (uint32_t ea,uint8_t v){ uint32_t p=gk_phys(ea); if(!gk_ok(p,1))return;
+static inline void gk_w8 (uint32_t ea,uint8_t v){ uint32_t p; GK_MAP(ea,1,p,return);
     GK_WPRE(p,1); g_ram[p]=v; GK_WPOST(p,1); }
-static inline void gk_w16(uint32_t ea,uint16_t v){ uint32_t p=gk_phys(ea); if(!gk_ok(p,2))return; GK_WPRE(p,2);
+static inline void gk_w16(uint32_t ea,uint16_t v){ uint32_t p; GK_MAP(ea,2,p,return); GK_WPRE(p,2);
     g_ram[p]=(uint8_t)(v>>8); g_ram[p+1]=(uint8_t)v; GK_WPOST(p,2); }
-static inline void gk_w32(uint32_t ea,uint32_t v){ uint32_t p=gk_phys(ea); if(!gk_ok(p,4))return; GK_WPRE(p,4);
+static inline void gk_w32(uint32_t ea,uint32_t v){ uint32_t p; GK_MAP(ea,4,p,return); GK_WPRE(p,4);
     g_ram[p]=(uint8_t)(v>>24); g_ram[p+1]=(uint8_t)(v>>16); g_ram[p+2]=(uint8_t)(v>>8); g_ram[p+3]=(uint8_t)v;
     GK_WPOST(p,4); }
 static inline void gk_w64(uint32_t ea,uint64_t v){ gk_w32(ea,(uint32_t)(v>>32)); gk_w32(ea+4,(uint32_t)v); }
