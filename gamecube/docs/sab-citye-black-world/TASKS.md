@@ -249,8 +249,7 @@ are the useful part.
 
 **Status after F5/F6/F7.** H1 and H2 are dead, H3's general form is refuted, and
 the whole submit-path family is eliminated: `dEnc == fReal` exactly. What
-remains is scene-specific *shading or transform* state. The two live leads,
-neither measured:
+remains is scene-specific *shading or transform* state. Two leads were left open:
 (a) the City Escape state file may itself be a bad artifact — it was written by
 the port on 2026-08-29, it is **not** derived from the native `GSNE8P.s01`
 (payload md5s differ: `87a44ff5…` vs `ac48ab65…`, and the sizes differ by
@@ -259,9 +258,17 @@ the port on 2026-08-29, it is **not** derived from the native `GSNE8P.s01`
 PC census, and preloaded textures are not re-hashed from guest RAM the way
 ordinary ones are, so a wrong TMEM image after restore would sample black
 without any counter noticing.
-The cheapest next experiment for both: in a run where the world has **recovered**
+
+> **BOTH LEADS ARE NOW DEAD — see §9.** (a) died on a matched pair: the *same*
+> state file renders correctly under the 2026-08-29 binary (F9), so the artifact
+> is fine and the black world is a **regression**. (b) died on source: TMEM *is*
+> serialized, `VideoState.cpp:58` (F10). The experiment proposed below was
+> superseded — a fresh save was not needed, and the *native*-derived state cannot
+> be loaded into the port at all (F11).
+
+~~The cheapest next experiment for both: in a run where the world has **recovered**
 (F4), `PROBE_SAVE_STATE` a fresh City Escape state and reload it. If the fresh
-state renders, the shipped 2026-08-29 artifact is the defect, not the code.
+state renders, the shipped 2026-08-29 artifact is the defect, not the code.~~
 
 | # | hypothesis | why it fits | kill criterion |
 |---|---|---|---|
@@ -359,3 +366,124 @@ The four-way split:
 - Artifacts: `/tmp/gcw/repro-ingame.{log,rows.json}`,
   `/tmp/gcw/repro-t{42,70,140}.png`, `/tmp/gcw/sab-cold-mips.png`,
   `/tmp/gcw/sab-ingame{,-mips}.log`.
+
+---
+
+## 9. RESOLVED: the state file is exonerated — this is a REGRESSION
+
+### F8. The native oracle renders this scene perfectly
+
+Gate #1's default first action was never run against this scene. It works, and
+the route the topic recorded as blocked is only *half* blocked: a **native**
+Dolphin state loads natively via `-s`.
+
+```bash
+/Applications/Dolphin.app/Contents/MacOS/Dolphin -u /tmp/bw/dol-user \
+  -C Dolphin.Core.CPUThread=True -C Dolphin.Core.CPUCore=1 \
+  -C Graphics.Settings.DumpXFBTarget=True \
+  -e "gamecube/roms/Sonic Adventure 2 - Battle (USA).iso" \
+  -s "$HOME/Library/Application Support/Dolphin/StateSaves/GSNE8P.s01"
+```
+
+14 s, killed by PID (never `pkill -f Dolphin` — siblings drive Dolphin too).
+105 XFB PNGs in `/tmp/bw/dol-user/Dump/Textures/`, 5 distinct (the state rests on
+SA2's "Game Data cannot be found" modal, which pauses the world). The last frame,
+`/tmp/bw/native-last.png`, is **full 3D City Escape** — buildings, trees, taxi,
+road, ocean, HUD, modal. **The scene and its guest data are sound; a correct
+emulator renders them.**
+
+### F9. THE MATCHED PAIR — same state file, two committed binaries
+
+The decisive experiment. `gamecube/states/sab-citye-gameplay.gcs.gz` was added by
+`0e2dc92b` (2026-08-29), whose message reports City Escape gameplay rendering
+("Sonic boarding"). That commit's binaries are still in git, so the A/B needs **no
+rebuild**: stage a snapshot whose `gamecube.html` + `dolphin_libretro/` +
+`ppc-worker/` come from one commit, and vary only that.
+
+| arm | `dolphin_worker_emcc.wasm` | restore | t=60 | t=100 | world |
+|---|---|---|---:|---:|---|
+| `0e2dc92b` (2026-08-29) | `69e38d94…` | DISCONTINUITY PRESENT | HUD 140 / 00:17:37 / 008 | HUD 240 / 00:31:29 / 010 | **RENDERS** |
+| HEAD `0b6b61e9` (2026-09-04) | `82bc8f8b…` | `ack ok=true`, DISCONTINUITY PRESENT | HUD 140 / 00:19:10 / 009 | HUD 260 / 00:36:24 / 010 | **BLACK** |
+
+`/tmp/bw/old-t{60,100}.png` vs `/tmp/gcw/citye-gpu-t{60,100}.png`.
+Near-identical guest progress; opposite pictures. Steady-window medians (t≥45 s)
+show the **workload is the same**, so nothing is being submitted less:
+
+```
+                 speed  drawn/s  prim/frame  vert/frame  efbCopy/frame
+OLD  (renders)   0.3     19.9      2935        24634        7.3
+HEAD (black)     0.4     22.5      2598        23080        8.6
+```
+
+Both arms are display-list driven (`xfd` dlN 1.5M–2.2M), so §3's "the black scene
+uses display lists" is a *gameplay-vs-cinematic* difference, not a defect signal.
+
+**⇒ Lead (a) is DEAD. The committed state file is not the bad artifact.** The
+black world is a **regression in `dolphin_worker_emcc` between 2026-08-29 and
+2026-09-04** — five wasm-changing commits: `8a4342e5`, `b8314d0a`, `c224b7c2`,
+`7a77e12e`, `0b6b61e9`, all perf work. HEAD is *faster* and renders nothing.
+
+### F10. Lead (b) is dead on source: TMEM **is** in the savestate
+
+`VideoState.cpp:58` `p.DoArray(s_tex_mem)` serializes the full 1 MB TMEM, and
+`VideoState.cpp:62` `TMEM::DoState(p)` the 8 unit states. The file is a **verbatim**
+match to `~/gc_refs/dolphin/.../VideoState.cpp` (empty diff). Preload copies guest
+RAM into `s_tex_mem` at `BPStructs.cpp:661/681/683`. Nothing about preloaded
+textures is lost across a restore.
+
+### F11. Also killed, each by measurement or source
+
+- **The emitted-wasm vertex loader never runs on SAB.** `vtxCreate=17,
+  vtxBuilt=0, vtxUnsup=17` in all five runs — every SAB vertex format is rejected
+  by `VertexLoaderWasm::IsSupported`. `?bjit_vtx_software=1` is a **no-op A/B** on
+  this title; do not spend a lock slot on it.
+- **Every rendering-breaking ablation lever is off.** `abl=0/0/0/0/0` in every
+  window (`0x026B3B00/04/08`, `kAblBPCell 0x026B3B34`, `kAblUploadCell 0x026B3B38`).
+  `kCoalesceCell 0x026B3BE0` and `kRedundantStateCell 0x026B3BE4` have **no writer**
+  anywhere in the tree, and `tools/preflight_all.sh` "SAB cell-collision audit"
+  passes, so no sibling instrument is silently arming one.
+- **A native Dolphin state cannot be loaded into the port.** `/tmp/gcw/from-s01.gcs.gz`
+  (the `GSNE8P.s01` payload, 92,917,279 B) gave `[restore-witness] VERDICT: NO
+  DISCONTINUITY — nothing replaced CoreTiming`, then the guest wedged
+  (`drawn=0/s`, PC parked at `0x800ebea0`, `speed` still reading 1.000x — the
+  idle-credit artifact gate #10 warns about). The port's own DoState is
+  92,946,703 B (`[worker] loadState RESTORE-OK bytes=92946703`), 29,424 B more.
+  `window.__probeStateSize` exists for exactly this compat check.
+  **The screenshot from that run is a stale frame and is not evidence.**
+
+### F12. Open: which of the five commits, and why
+
+Two signals point at `8a4342e5`'s pure-leaf `bl` splice (idle-classifying SAB's
+VI-retrace frame governor), neither sufficient on its own:
+
+- `leafInline` census (`cand/spliced/idle/bailed`, cell `0x026B3B60…`):
+
+  | run | census | `lastIdlePc` | world |
+  |---|---|---|---|
+  | `old` (0e2dc92b) | `0/0/0/0` | `0` | renders |
+  | `sab-cold{,-mips}` (HEAD) | `4881/15/15/220` | `80117e0c` | renders |
+  | `selftest` (HEAD, restores its own state) | `13365/20/20/662` | `800fe5c8` | **renders** |
+  | `citye-gpu`, `sab-ingame{,-mips}`, `repro-ingame` (HEAD) | `…/20/20/…` | `80117e0c` | **black** |
+
+  ⚠ **The idle count does NOT discriminate**: `selftest` classifies the same 20
+  and renders. Its `lastIdlePc` is `0x800fe5c8` (the DSP-mailbox family), not the
+  governor, so the *sets* differ — but on this evidence the lever firing is
+  neither necessary nor sufficient, and the hypothesis is **unproven**.
+- `vtx` (`0x026B3580` = `m_vertex_cpu[0]`, i.e. the loader's first output dword =
+  position.x): quiet **NaN** (`0x7fc00000`/`0xffc00000`) in 6/6 occurrences across
+  the three black gameplay runs, and 0/29 snapshots across three rendering runs
+  (`sab-cold`, `sab-cold-mips`, `selftest`) and 0/6 in the OLD arm on this scene.
+  One sample per ~20 s, so this is a correlation, not a proof that most geometry
+  is NaN.
+
+The clean discriminator needs no rebuild: `0b6b61e9` shipped a kill switch,
+**`?noleafinline=1`** (SAB cell `0x026B3B74`, read at emit time in
+`JitWasm::TryCompileBlock`), so both arms come off ONE binary. It must be armed
+from the query string, and the page that reads it is HEAD's — pin it.
+
+> ⚠ **RIG TRAP, paid for here.** `/tmp/gcw/snap/gamecube.html` is a **symlink into
+> the working tree**, so writing a pinned page into a `cp -R` of that snapshot
+> writes *through* it and silently replaces the repo's `gamecube.html`. Break the
+> symlink (`rm -f "$DEST/gamecube.html"`) before writing. Verify with
+> `[ -L "$DEST/gamecube.html" ]` and re-check `git status gamecube.html` after
+> staging.
