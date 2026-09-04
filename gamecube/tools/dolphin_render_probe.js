@@ -35,9 +35,18 @@ const TRACE_PATH    = process.env.PROBE_TRACE_PATH || '/tmp/probe-trace.json';
 const CPU_PROFILE      = process.env.PROBE_CPU_PROFILE === '1';
 // [pc-sample 2026-07-23] PROBE_PC_SAMPLE=1 installs a page-side guest-PC sampler:
 // reads live ppc_state.pc via the published ctx ptr (@0x0250002C, same source as
-// bw.xpc), buckets 256B, segments per 10s with gc min/max — the WASM-side twin of
+// bw.xpc), segments per 10s with gc min/max — the WASM-side twin of
 // the native oracle's /tmp/native_pc_hist.txt. Dump → /tmp/wasm_pc_hist.json.
+//
+// [2026-09-04] BUCKET WIDTH IS NOW 4B (the exact PC), was 256B. A SAB function
+// averages 316 bytes (gc_funcmap.py recovers 4,766 in 1.5 MB of .text), so a
+// 256B bucket straddled more than one function for 74.8% of the samples in the
+// 2026-09-01 census — every one of those had to be printed as "A|B|C" because
+// nothing could say which of them the sample was in. Exact PC removes the
+// ambiguity entirely and costs one Map entry per distinct PC.
+// PROBE_PC_BUCKET=256 restores the old width for a like-for-like comparison.
 const PC_SAMPLE        = process.env.PROBE_PC_SAMPLE === '1';
+const PC_BUCKET        = parseInt(process.env.PROBE_PC_BUCKET || '4', 10);
 const CPU_PROFILE_DELAY = parseInt(process.env.PROBE_CPU_PROFILE_DELAY_MS || '12000', 10);
 const CPU_PROFILE_OUT  = process.env.PROBE_CPU_PROFILE_OUT || '/tmp/worker.cpuprofile';
 const METRICS_PATH  = process.env.PROBE_METRICS_PATH || '/tmp/probe-metrics.json';
@@ -641,8 +650,10 @@ function startServer() {
   // sharedMemory/ctx existing, so installing immediately is safe.
   if (PC_SAMPLE) {
     try {
-      await page.evaluate(() => {
-        window.__pcSamp = { t0: performance.now(), segs: [], n: 0 };
+      await page.evaluate((bucketBytes) => {
+        const MASK = ~(Math.max(4, bucketBytes) - 1);
+        window.__pcSamp = { t0: performance.now(), segs: [], n: 0,
+                            bucket: Math.max(4, bucketBytes) };
         setInterval(() => {
           try {
             if (!window.sharedMemory) return;
@@ -663,12 +674,12 @@ function startServer() {
               if (gc < sg.gcmin) sg.gcmin = gc;
               if (gc > sg.gcmax) sg.gcmax = gc;
             }
-            const b = (pc & ~0xFF) >>> 0;
+            const b = (pc & MASK) >>> 0;
             sg.hist.set(b, (sg.hist.get(b) || 0) + 1);
             sg.n++; st.n++;
           } catch (_e) {}
         }, 2);
-      });
+      }, PC_BUCKET);
       console.log('[probe] pc-sample: page-side guest-PC sampler installed');
     } catch (e) { console.error('[probe] pc-sample install failed: ' + e.message); }
   }
@@ -2493,14 +2504,20 @@ function startServer() {
   // ---- dump pc-sample histogram ------------------------------------------
   if (PC_SAMPLE) {
     try {
+      // The artifact now carries its own bucket width, so annotate_pc_hist.py
+      // never has to assume one. A bare array (no "bucket") is a pre-2026-09-04
+      // 256B artifact and is read as such.
       const dump = await page.evaluate(() => {
         const st = window.__pcSamp; if (!st) return null;
-        return st.segs.map((sg, i) => sg ? ({ seg: i, n: sg.n, gcmin: sg.gcmin,
-          gcmax: sg.gcmax, hist: Array.from(sg.hist.entries()) }) : null);
+        return { bucket: st.bucket || 0x100,
+          segs: st.segs.map((sg, i) => sg ? ({ seg: i, n: sg.n, gcmin: sg.gcmin,
+            gcmax: sg.gcmax, hist: Array.from(sg.hist.entries()) }) : null) };
       });
       fs.writeFileSync('/tmp/wasm_pc_hist.json', JSON.stringify(dump));
-      const tot = (dump || []).reduce((a, s) => a + (s ? s.n : 0), 0);
-      console.log('[probe] pc-sample: ' + tot + ' samples → /tmp/wasm_pc_hist.json');
+      const segs = (dump && dump.segs) || [];
+      const tot = segs.reduce((a, s) => a + (s ? s.n : 0), 0);
+      console.log('[probe] pc-sample: ' + tot + ' samples, bucket='
+        + ((dump && dump.bucket) || '?') + 'B → /tmp/wasm_pc_hist.json');
     } catch (e) { console.error('[probe] pc-sample dump failed: ' + e.message); }
   }
 
