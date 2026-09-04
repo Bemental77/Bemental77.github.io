@@ -16,8 +16,11 @@
 <p class="sub">
   4,668 of 4,741 <code>main.dol</code> functions translated to C by <code>gamecube/recomp/sr/sr.py</code>
   and linked as one wasm module. This page runs the guest's own <code>__start</code>.
-  <b>It is not an emulator</b>: no device is modelled, so nothing here renders.
-  The output is the ordered host-boundary trajectory and the point the boot reached.
+  <b>It is not an emulator.</b> Exactly one hardware register is modelled (EXI
+  <code>CR.TSTART</code>, which self-clears); every other device register is a backing
+  buffer, and <b>no interrupt is ever delivered</b>. So nothing here renders, and no
+  frame rate is claimed. The output is the ordered host-boundary trajectory, the
+  hardware registers the boot touched, and the point it reached.
 </p>
 <button id="walk">walk __start's callees (one at a time)</button>
 <button id="whole">run __start whole (may never return)</button>
