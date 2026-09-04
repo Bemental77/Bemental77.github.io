@@ -1996,9 +1996,16 @@ function startServer() {
             // [LEAF-INLINE 2026-09-01] pure-leaf `bl` splice census, written by
             // JitWasm::TryCompileBlock: candidates / spliced / idle-classified /
             // emitter-bailed, then the last idle-classified block's start_pc.
+            // arm= is the ARM CELL ITSELF (0x026B3B74). The splice fires ONLY when
+            // it holds 1eaf0001 (kLeafInlineArmMagic, JitWasm.cpp); ANY other value
+            // — 0 = never written, 1 = an old page's "suppressed" — is OFF. Printed
+            // because the arm-difference proof needs the INPUT as well as the
+            // counters: cand>0 & spliced=0 & arm=0 is "the lever was off", which is
+            // a different statement from "the census never ran".
             leafInline: (A[0x026B3B60 >> 2] >>> 0) + '/' + (A[0x026B3B64 >> 2] >>> 0)
               + '/' + (A[0x026B3B68 >> 2] >>> 0) + '/' + (A[0x026B3B70 >> 2] >>> 0)
-              + ' lastIdlePc=' + (A[0x026B3B6C >> 2] >>> 0).toString(16),
+              + ' lastIdlePc=' + (A[0x026B3B6C >> 2] >>> 0).toString(16)
+              + ' arm=' + (A[0x026B3B74 >> 2] >>> 0).toString(16),
             // [xf-word-loss PM37] producer first-word split: n(1.0) / n(0) / n(other) / lastOther
             // [m00-hunt PM37] runtime lanes at 0x800bb8f4: fbps1 / faps0 / result / hits
             xfi: (A[0x026B37B4 >> 2] >>> 0).toString(16) + '/'

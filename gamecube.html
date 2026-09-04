@@ -2811,19 +2811,21 @@ window.GcRate = (function () {
     // the old "23.2% of guest-PC samples" for this loop — RETRACTED 2026-09-04, it did
     // not reproduce and read 0.1% on a second run of the same build.) An interleaved
     // matched pair off ONE binary measured the splice at -5.0% guest / -8.1% published
-    // on the probe's scene, i.e. it currently COSTS. SAB scratch cell 0x026B3B74; browser-zeroed
-    // 0 = OFF = the splice is ACTIVE, i.e. the shipped behaviour, so the default path is
-    // byte-identical to the pre-switch tree. Nonzero = suppressed = the A/B control arm.
+    // on the probe's scene, i.e. it currently COSTS. SAB scratch cell 0x026B3B74.
+    // [POLARITY, as of the C++ flip below] 0x1EAF0001 = splice ARMED; ANY other value,
+    // including 0 = browser-zeroed / never written, = splice OFF. This used to read the
+    // other way round ("0 = active") and that is exactly what shipped the black world.
     // Read at EMIT time (JitWasm::TryCompileBlock), so it must be armed BEFORE the blocks
     // you care about are compiled — i.e. from the query string, same constraint as
     // ?bjit_mips=1. Census cells 0x026B3B60/64/68/70 are the arm-difference proof: the
     // candidate count is bumped on BOTH arms, only spliced/idle differ.
     // See gamecube/docs/sab-frame-governor/TASKS.md.
-    // [DEFAULT FLIPPED 2026-09-04 — the splice BREAKS RENDERING] The default is now
-    // 1 = splice SUPPRESSED. It was 0 = active, and that shipped a black world:
-    // SAB City Escape gameplay renders geometry that never reaches the screen. The
-    // page writes this cell unconditionally now, so the shipped default no longer
-    // depends on the SAB region happening to be browser-zeroed.
+    // [DEFAULT FLIPPED 2026-09-04 — the splice BREAKS RENDERING] The splice is now
+    // SUPPRESSED unless explicitly armed. It used to be on by default, and that
+    // shipped a black world: SAB City Escape gameplay renders geometry that never
+    // reaches the screen. The page writes this cell unconditionally now, so the
+    // shipped default no longer depends on the SAB region happening to be
+    // browser-zeroed.
     //   PROVEN on ONE binary (wasm 82bc8f8b, md5 identical before AND after every run),
     //   ONE page, the same savestate, restore proven in all three arms:
     //     ?noleafinline=1  leafInline 7011/0/0/0     canvas 307180/307200 -> FULL 3D
@@ -2839,11 +2841,26 @@ window.GcRate = (function () {
     // different scene; this change is justified by CORRECTNESS, not by speed.
     // ?noleafinline=0 restores the old behaviour for A/B work.
     // See gamecube/docs/sab-citye-black-world/TASKS.md §9.
+    // [C++ DEFAULT FLIPPED TOO 2026-09-04 — this cell is now an ARM, not a KILL]
+    // The engine used to read "cell == 0 => splice", so the broken behaviour was
+    // the ENGINE's default and any entry point that is not this page — a probe, a
+    // test, a bespoke harness booting dolphin_worker directly — still got the
+    // splice with nothing able to turn it off. JitWasm::TryCompileBlock now
+    // splices ONLY when this cell holds kLeafInlineArmMagic = 0x1EAF0001, so
+    // "never written" is OFF. A magic rather than "nonzero" is what makes it fail
+    // SAFE: every value a pre-flip writer could leave here (0 = browser-zeroed or
+    // an old page's ?noleafinline=0, 1 = f24a9a26's suppressed default) reads OFF.
+    // This page therefore writes 0 by default — byte-identical, from the engine's
+    // point of view, to a worker booted with no page at all — and the magic only
+    // for the explicit opt-in ?noleafinline=0.
     try {
       var _bileaf = new URLSearchParams(location.search).get('noleafinline');
       var _bil = (_bileaf === null) ? 1 : ((parseInt(_bileaf, 10) !== 0) ? 1 : 0);
-      new Uint32Array(sharedMemory.buffer)[0x026B3B74 >> 2] = _bil;
-      pageLog('[leaf-inline] splice ' + (_bil ? 'DISABLED (default)' : 'ENABLED (?noleafinline=0)'));
+      // 0x1EAF0001 MUST match kLeafInlineArmMagic in
+      // gamecube/dolphin-src/Source/Core/Core/PowerPC/JitWasm/JitWasm.cpp.
+      new Uint32Array(sharedMemory.buffer)[0x026B3B74 >> 2] = _bil ? 0 : 0x1EAF0001;
+      pageLog('[leaf-inline] splice ' + (_bil ? 'DISABLED (default; arm cell = 0)'
+                                              : 'ARMED (?noleafinline=0; arm cell = 1eaf0001)'));
     } catch (e) { pageLog('[leaf-inline] toggle write failed: ' + (e && e.message)); }
     // [fifo-brake ESCAPE HATCH 2026-08-29] The host-side GX FIFO backpressure brake
     // (CommandProcessorManager::BemFifoBackpressure, CommandProcessor.cpp:426) ships DEFAULT ON

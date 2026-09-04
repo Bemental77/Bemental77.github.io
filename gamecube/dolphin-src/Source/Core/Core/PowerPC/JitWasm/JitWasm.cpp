@@ -156,21 +156,51 @@ inline bool IsBlockTerminator(u32 inst)
 //   0x026B3B68  u32  spliced blocks the analyst then classified branchIsIdleLoop
 //   0x026B3B6C  u32  start_pc of the most recent such idle-classified block
 //   0x026B3B70  u32  spliced streams the emitter declined (fell back to contiguous)
-//   0x026B3B74  u32  KILL switch: 0 = splice active (default), nonzero = forced off
+//   0x026B3B74  u32  ARM switch: kLeafInlineArmMagic = splice ON, ANY other value
+//                    (incl. 0 = browser-zeroed / never written) = splice OFF
 constexpr u32 kLeafInlineCandCell    = 0x026B3B60u;
 constexpr u32 kLeafInlineSplicedCell = 0x026B3B64u;
 constexpr u32 kLeafInlineIdleCell    = 0x026B3B68u;
 constexpr u32 kLeafInlineLastPcCell  = 0x026B3B6Cu;
 constexpr u32 kLeafInlineBailCell    = 0x026B3B70u;
-// [LEAF-INLINE A/B 2026-09-04] kill switch, so the control arm and the shipped
+// [LEAF-INLINE A/B 2026-09-04] one cell, so the control arm and the experimental
 // arm come off ONE binary. Two separately-linked builds are NOT a clean control:
 // CLAUDE.md gate #10 records that the emitters bake host addresses as LEB
 // i32.const, so link layout shifts emitted bytes between builds. Read at COMPILE
 // time (same constraint as the [mips] gate): a block already compiled keeps the
 // path it was compiled with, so this must be armed from the query string
-// (?noleafinline=1) BEFORE the ROM boots. Browser-zeroed 0 = the shipped
-// behaviour, so the default path is byte-identical to the pre-switch tree.
-constexpr u32 kLeafInlineOffCell     = 0x026B3B74u;
+// (?noleafinline=0) BEFORE the ROM boots.
+//
+// [DEFAULT FLIPPED 2026-09-04 — THE SPLICE BLACKENS THE RENDERED WORLD]
+// This was a KILL switch reading "0 = splice active (default), nonzero = forced
+// off", i.e. the SHIPPED behaviour was the broken one and every entry point that
+// is not gamecube.html (a probe, a test, a bespoke harness booting the worker
+// directly) got the splice with nothing to turn it off. f24a9a26 fixed the page
+// by writing 1 unconditionally; this fixes the ENGINE.
+//
+// PROVEN before the flip, on ONE binary (wasm 82bc8f8b, md5 identical before AND
+// after every run), ONE page, one savestate, restore proven in all three arms —
+// SAB City Escape gameplay renders a BLACK WORLD behind a live HUD when the
+// splice is on (every draw submitted and encoded, none of it reaching the
+// screen):
+//     ?noleafinline=1  leafInline 7011/0/0/0      canvas 307180/307200 -> FULL 3D
+//     page default     leafInline 6989/0/0/0      canvas 307094/307200 -> FULL 3D
+//     ?noleafinline=0  leafInline 8087/20/20/334  canvas   4343/307200 -> BLACK
+//   lastIdlePc=80117e0c (SAB's VI-retrace frame governor) in the black arm.
+// The lever also has NO measured upside: 0b6b61e9's interleaved A/C/A/C pair off
+// one binary measured it at -5.0% guest / -8.1% published (OFF 0.4396/0.4477 vs
+// ON 0.4151/0.4277, ranges disjoint on both metrics). Its original "+9.6%" came
+// from comparing two SEPARATELY-LINKED binaries, which is the LEB i32.const
+// link-layout confound gate #10 warns about.
+//
+// A MAGIC value, not "nonzero", is what makes absence fail SAFE: every value any
+// pre-flip writer could leave here (0 from a browser-zeroed region or from an
+// old page's ?noleafinline=0; 1 from f24a9a26's page default) reads as OFF under
+// the new test, so a stale page or a naked harness can no longer arm the splice
+// by accident. Only a writer that knows this constant can.
+// See gamecube/docs/sab-citye-black-world/TASKS.md §F14.
+constexpr u32 kLeafInlineArmCell     = 0x026B3B74u;
+constexpr u32 kLeafInlineArmMagic    = 0x1EAF0001u;
 
 struct AotEntry { std::vector<u8> wasm; std::vector<u32> gwords; u32 gspan = 0; u32 ghash = 0; u32 cycles = 0; };
 std::unordered_map<u32, AotEntry> g_aot_blocks;
@@ -1089,12 +1119,16 @@ bool JitWasm::TryCompileBlock(u32 start_pc, u32 ctx_ptr, u32 mem1_base,
     if (li_candidate)
       AotBump(kLeafInlineCandCell);
     // [LEAF-INLINE A/B 2026-09-04] The candidate is counted on BOTH arms and the
-    // kill switch suppresses only the splice itself. That is deliberate: it makes
-    // the census the arm-difference proof. Control reads cand=N/spliced=0/idle=0,
-    // shipped reads cand=N/spliced=M/idle=M off the SAME binary. An all-zero
-    // census would instead be indistinguishable from "the census never ran",
-    // which is the placebo-arm failure lib/capability.js's matrix exists to catch.
-    if (li_candidate && *AotCell(kLeafInlineOffCell) == 0u)
+    // arm switch gates only the splice itself. That is deliberate: it makes the
+    // census the arm-difference proof. The default arm reads cand=N/spliced=0/
+    // idle=0, the armed arm reads cand=N/spliced=M/idle=M off the SAME binary. An
+    // all-zero census would instead be indistinguishable from "the census never
+    // ran", which is the placebo-arm failure lib/capability.js's matrix exists to
+    // catch.
+    // DEFAULT IS NOW OFF: the splice fires ONLY when the cell holds the magic, so
+    // a worker booted with nothing written there does not splice. See the
+    // kLeafInlineArmCell block above for the black-world evidence.
+    if (li_candidate && *AotCell(kLeafInlineArmCell) == kLeafInlineArmMagic)
     {
       struct LeafFetchCtx { Memory::MemoryManager* mem; };
       LeafFetchCtx lfc{&mem};

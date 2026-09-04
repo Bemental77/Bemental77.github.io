@@ -179,8 +179,8 @@ emitters bake host addresses as LEB `i32.const`, so **link layout shifts emitted
 bytes between builds** — two baseline binaries differed by 0.16% on emitted
 bytes for identical input. A cross-binary A/B carries that confound.
 
-This re-price removes it. A kill switch on SAB cell `0x026B3B74`
-(`JitWasm.cpp`, `?noleafinline=1` in `gamecube.html`) suppresses **only the
+This re-price removes it. A switch on SAB cell `0x026B3B74`
+(`JitWasm.cpp`, `?noleafinline` in `gamecube.html`) gates **only the
 splice**, so **both arms come off ONE binary**, md5
 `82bc8f8b6e1c6ac8db27ec0a5d49dadb`, verified identical before AND after every
 run. Read at emit time, so it is armed from the query string (same constraint as
@@ -292,11 +292,20 @@ measured is the sign and size of the delta, not the reason for it.
       renders the same savestate, and against native Dolphin. Full write-up:
       `gamecube/docs/sab-citye-black-world/TASKS.md` §9 F13.
       The fix is JS-only — `gamecube.html` now writes cell `0x026B3B74`
-      unconditionally, default `1`. ⚠ Do NOT read a perf win out of that table:
-      the black arm's higher `drawn/s` is an artifact of not drawing the world.
-- [ ] **Make the C++ side default-off too** (`JitWasm::TryCompileBlock` still
-      reads "cell == 0 ⇒ splice"), so an entry point that is not `gamecube.html`
-      cannot resurrect it. Needs a rebuild + its own matched pair.
+      unconditionally, default suppressed. ⚠ Do NOT read a perf win out of that
+      table: the black arm's higher `drawn/s` is an artifact of not drawing the
+      world.
+- [x] **Make the C++ side default-off too** — DONE. `JitWasm::TryCompileBlock`
+      no longer reads "cell == 0 ⇒ splice"; `0x026B3B74` is now an **ARM** cell
+      and the splice fires only on the magic `0x1EAF0001`
+      (`kLeafInlineArmMagic`), so a worker booted with nothing written there —
+      a probe, a test, a bespoke harness, a future page that forgets the cell —
+      does not splice. Every value a pre-flip writer could leave behind (`0`,
+      `1`) reads OFF, so it fails safe. Proven by an interleaved A/B/A/B matched
+      pair on ONE binary (`afa27eb8…`): `arm=0` ⇒ `spliced 0/0`, full-3D City
+      Escape; `arm=1eaf0001` ⇒ `spliced 20/20 lastIdlePc=80117e0c`, black world.
+      Full table and the idle-skip caveat:
+      `gamecube/docs/sab-citye-black-world/TASKS.md` §F14.
 - [ ] **Explain WHY the splice blackens the scene.** The count is not the
       trigger — `selftest` classifies the same 20 idle blocks on HEAD and renders
       (its `lastIdlePc` is `0x800fe5c8`, not the governor), and the cold-boot run

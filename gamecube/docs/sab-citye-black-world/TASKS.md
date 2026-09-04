@@ -576,14 +576,99 @@ the rates are not comparable. `0b6b61e9`'s interleaved pair measured the splice 
 correctness, not by speed**, and the fix may well cost presented fps now that the
 world is actually being drawn.
 
-**Follow-up, not done here:** the C++ default in `JitWasm::TryCompileBlock` is
-still "cell == 0 ⇒ splice", so any entry point that is *not* `gamecube.html`
-(a bespoke harness booting the worker directly) still gets the splice. Making the
-C++ side default-off needs a rebuild and should carry its own matched pair.
+**Follow-up, done in F14 below:** the C++ default in `JitWasm::TryCompileBlock`
+was still "cell == 0 ⇒ splice", so any entry point that is *not* `gamecube.html`
+(a bespoke harness booting the worker directly) still got the splice.
 `gamecube/ppc-worker/ppc_worker_main.cpp` never wired the splice, so it is
-unaffected.
+unaffected (re-verified at HEAD: `grep -rn 'LeafInline\|IsInlinableBl\|026B3B74'
+gamecube/ppc-worker/` returns nothing).
 
 **Still open (pre-existing, not caused by the splice):** F4's late "recovery" —
 whether the scene that appears after ~120–167 s in the *black* arm is City Escape
 rendering correctly or a different scene. With the fix in place the scene renders
 from the first frame, so this is now a curiosity rather than a blocker.
+
+### F14. The ENGINE default flipped too — absence-of-cell is now OFF
+
+F13 fixed the *page*. The *engine* still read `cell == 0 ⇒ splice`, so the broken
+behaviour remained the C++ default and every entry point that is not
+`gamecube.html` — a probe, a test, a bespoke harness booting `dolphin_worker`
+directly, or any future page that forgets the cell — still got a black world with
+nothing able to turn it off. That hole is now closed.
+
+**The change.** `JitWasm.cpp`'s `kLeafInlineOffCell` (a KILL switch) becomes
+`kLeafInlineArmCell` (an ARM switch) and the gate becomes
+
+```cpp
+if (li_candidate && *AotCell(kLeafInlineArmCell) == kLeafInlineArmMagic)   // 0x1EAF0001
+```
+
+A **magic** value rather than "nonzero" is what makes absence fail *safe*: every
+value a pre-flip writer could leave in that cell — `0` from a browser-zeroed
+region or from an old page's `?noleafinline=0`, `1` from `f24a9a26`'s suppressed
+default — reads OFF under the new test. Only a writer that knows the constant can
+arm it. `gamecube.html` therefore writes `0` by default (from the engine's point
+of view byte-identical to a worker booted with no page at all) and `0x1EAF0001`
+only for the explicit opt-in `?noleafinline=0`.
+
+**The edit is provably in the shipped binary**, and this is a better check than
+the usual string grep because a `constexpr` leaves no string: the emitters bake
+constants as LEB `i32.const`, so `sleb128(0x1EAF0001) = 81 80 bc f5 01` must
+appear. It occurs **1×** in `dolphin_worker_emcc.wasm` (`afa27eb8…`) and **0×**
+in the pre-flip `dolphin_worker_emcc.prev.wasm` (`363668a9…`).
+
+#### The matched pair — four interleaved runs, ONE binary
+
+`afa27eb89dc568cd0de38a6b9f3d8a03`, md5 identical before **and** after every run;
+`gamecube/tools/guest_rate_witness.mjs` cells `sab-ingame-mips` (arm A) and the
+new `sab-ingame-leafon-mips` (arm B), run A/B/A/B; the in-repo state
+`gamecube/states/sab-citye-gameplay.gcs.gz`; `worker ack ok=true` +
+`discontinuity@35.9/38.0/36.9/37.9 s` in all four. Load 1.9→8.3 throughout, well
+inside the lock's own "quiet enough to measure" threshold of 12.
+
+| run | arm cell | `leafInline` cand/spliced/idle/bail | `lastIdlePc` | W1 guest | idle-skip | drawn/s | pub/s | world (screenshot) |
+|---|---|---|---|---:|---:|---:|---:|---|
+| a1 | `0` | `509606/`**`0/0`**`/0` † | `0` | 0.3532x | 34.7% | — † | — † | **FULL 3D**, then stalled |
+| b1 | `1eaf0001` | `8625/`**`20/20`**`/383` | `80117e0c` | 0.3763x | 47.5% | 21.2 | 21.0 | **BLACK** (HUD only) |
+| a2 | `0` | `7789/`**`0/0`**`/0` | `0` | 0.3392x | 30.4% | 20.2 | 19.4 | **FULL 3D** |
+| b2 | `1eaf0001` | `8821/`**`20/20`**`/376` | `80117e0c` | 0.4023x | 53.0% | 22.8 | 22.2 | **BLACK** (HUD only) |
+
+Shots: `/tmp/gcw-leaf/{a1,b1,a2,b2}/*.png`. a2 and b2 are the clean pair — a2 is
+full-3D City Escape (Sonic on the board, mission timer `00:44:02`) at a steady
+18–23 drawn/s for the whole 200 s; b2 is the same scene as a live HUD
+(`00:49:17`) over a black world.
+
+**The census is the arm-difference proof and it now prints its own input.** The
+probe's `leafInline` field gained `arm=`, the arm cell itself, because
+`cand>0 & spliced=0 & arm=0` ("the lever was off") is a different statement from
+"the census never ran" — the placebo-arm failure the device matrix exists to
+catch. Candidates are counted on **both** arms; only `spliced`/`idle` move.
+
+**A no-cell boot now reads `spliced=0`.** Arm A's `arm=0` is exactly the state a
+worker booted without any page is in, so those two rows *are* the harness case.
+
+⚠ **The armed arm's HIGHER numbers are not a win, and its idle-skip says why.**
+B reads 0.3763/0.4023x guest against A's 0.3532/0.3392x (ranges disjoint), but B
+also idle-skips 47.5–53.0% of credited time against A's 30.4–34.7% — i.e. most of
+B's extra "guest rate" is the governor loop being clock-jumped, which is the
+lever's whole mechanism, while the world is not drawn at all. Its `drawn/s` is
+likewise higher (21.2/22.8 vs 20.2) *because* it is not drawing the world. Per
+gate #10 no rate here is quotable without its idle fraction, and none of these
+compare across arms.
+
+† **a1 hit an intermittent stall and DID NOT REPRODUCE (0/1 on repeat).** At
+t≈113 s it went `PRESENT STALLED` / `DOLPHIN CORETIMING PARKED`, `drawn/s → 0`,
+and the leaf-inline *candidate* counter exploded from 6,907 to 84,525 to 509,606
+(≈140 k compiles per snapshot interval) — block-cache thrash concurrent with the
+stall, not the splice: `spliced` stayed 0 the whole time. a2 ran the identical
+cell with zero parked windows and a candidate count of 7,789, in line with both B
+runs. Recorded rather than hidden; it is **not** attributable to this change,
+because with `arm=0` the emitted code is the same path the pre-flip binary took
+under `?noleafinline=1`, which `f24a9a26` measured rendering. It is an open
+intermittent in the *rendering* path, which the black world was previously
+masking — a1's median `drawn/s`/`pub/s` are post-stall zeros and are therefore
+withheld above rather than quoted as a rate.
+
+**Still not explained (unchanged from F13):** *why* the splice blackens the
+scene. The `downcount = 0` frame-pacing mechanism (`ppc_emit.cpp:1051-1055`)
+remains plausible and unproven, and the fix does not depend on it.

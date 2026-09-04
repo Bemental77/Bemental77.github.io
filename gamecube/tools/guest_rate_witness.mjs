@@ -91,6 +91,22 @@ const CELLS = [
   { name: 'sab-ingame-mips', rom: 1, ms: 150000, query: 'bjit_mips=1',
     state: path.join(REPO, 'gamecube/states/sab-citye-gameplay.gcs.gz'), stateMs: 30000,
     note: 'as sab-ingame + executed-cycle meter armed (idle-skip arm)' },
+  // [LEAF-INLINE A/B 2026-09-04] The pure-leaf `bl` splice ships OFF — in the page
+  // (f24a9a26) and, since the C++ default flip, in the ENGINE. These two cells are
+  // the ARMED arm, i.e. the only way to get the splice now: ?noleafinline=0 makes
+  // gamecube.html write kLeafInlineArmMagic (0x1EAF0001) into cell 0x026B3B74, and
+  // JitWasm::TryCompileBlock splices only on that exact value. Pair each against
+  // its unarmed twin above; the probe's `leafInline cand/spliced/idle/bail … arm=`
+  // field is the arm-difference proof (candidates are counted on BOTH arms).
+  // ⚠ The armed arm renders SAB City Escape as a BLACK WORLD behind a live HUD, and
+  // its drawn/s is HIGHER precisely because it is not drawing the world. Those
+  // rates are NOT comparable to the unarmed arm's. Screenshot both.
+  { name: 'sab-ingame-leafon', rom: 1, ms: 150000, query: 'noleafinline=0',
+    state: path.join(REPO, 'gamecube/states/sab-citye-gameplay.gcs.gz'), stateMs: 30000,
+    note: 'as sab-ingame + the leaf-inline splice ARMED (the broken arm — expect a black world)' },
+  { name: 'sab-ingame-leafon-mips', rom: 1, ms: 150000, query: 'bjit_mips=1&noleafinline=0',
+    state: path.join(REPO, 'gamecube/states/sab-citye-gameplay.gcs.gz'), stateMs: 30000,
+    note: 'as sab-ingame-mips + the leaf-inline splice ARMED (idle-skip arm of the broken arm)' },
   { name: 'pso-cold', rom: 2, ms: 130000, query: '', note: 'PSO cold boot (JIT)' },
   { name: 'pso-cold-mips', rom: 2, ms: 130000, query: 'bjit_mips=1',
     note: 'PSO cold boot + executed-cycle meter armed — THE 1.00x case, arm it or the reading is meaningless' },
