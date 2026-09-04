@@ -468,8 +468,19 @@ static int img_host(GekkoState *st, uint32_t addr) {
 
 // The single hook sr_driver.c calls.  ORDER MATTERS: the boot layer is asked FIRST so
 // it can own __init_hardware and the SPR file, and sr_host_os.c is asked SECOND for the
-// MSR / context / SelectThread set it already owns (sr_host_os.h).  Neither claims an
-// address the other does.
+// MSR / context / SelectThread set it already owns (sr_host_os.h).
+//
+// ⚠ COLLISION WATCH, and it is live as of 2026-09-04.  As written, the two layers claim
+// disjoint addresses — but `sr_host_os.h` has just grown SR_EV_GET_TIME / SR_EV_GET_TICK
+// / SR_EV_SET_DEC and an `sr_tb_*` guest timebase, i.e. a second implementation of
+// OSGetTime / OSGetTick, which THIS file already answers at 0x800ecb48 / 0x800ecb60.
+// `sr_host_os.c` does not implement them yet (verified: no match for `sr_tb_` in it), so
+// nothing is wrong today.  The moment it does, THIS LAYER SILENTLY WINS because it is
+// asked first, and a guest clock believed to come from the shared, decrementer-aware
+// implementation would actually be coming from the four lines below.  When that lands,
+// delete this file's two clock cases rather than reordering the hook — sr_host_os.c is
+// the layer that also owns the decrementer and the stall fault, and a clock split across
+// two owners is how a timing bug becomes unattributable.
 //
 // This hook ALWAYS returns 1 — including for an address nobody implements.  That is
 // deliberate: returning 0 would send control back into sr_extern(), which would set the
