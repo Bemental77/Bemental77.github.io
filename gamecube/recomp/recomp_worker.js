@@ -101,6 +101,12 @@ const AUDIO_RATE = 32000;      // MusyX's own output rate: hw_pc.c:76 / hw_dolph
 let audioTest = false;         // ?audiotest=1 — synthetic tone, transport self-test only
 let audioAcc = 0;              // fractional carry so 60 frames emit exactly AUDIO_RATE samples
 let audioPhase = 0;
+let audioStallFrames = 0;      // consecutive frames the mixer returned 0 samples (see pumpAudio)
+const AUDIO_STALL_FRAMES = 120;
+// A score that keeps crossing the threshold could emit two lines per 2 s indefinitely. Bounded
+// the same way OSReport is, and it says so when it stops rather than going quiet unannounced.
+let audioStallEpisodes = 0;
+const AUDIO_STALL_MAX_EPISODES = 20;
 
 const log = (txt) => postMessage({ cmd: 'log', txt: '[recomp-worker] ' + txt });
 
@@ -114,14 +120,33 @@ function pumpAudio() {
   audioAcc -= n * 60;
   if (n <= 0) return;
   let pcm = null;
-  // ENGINE PATH (not yet built — see the AUDIO transport note at the top of this file). When a
-  // software mixer exists it stages int16 stereo frames inside the wasm heap and returns how
-  // many it actually produced; copy them out because the heap can move on a memory growth.
+  // ENGINE PATH. The software mixer (shims/src/gc_musyx_mix.c, RECOMP_MUSYX=1) stages int16
+  // stereo frames inside the wasm heap and returns how many it actually produced; copy them out
+  // because the heap can move on a memory growth.
   if (Module && Module.___recomp_audio_pump && Module.___recomp_audio_base) {
     const got = Module.___recomp_audio_pump(n) | 0;
     if (got > 0) {
       const base = Module.___recomp_audio_base() >>> 0;
       pcm = new Int16Array(Module.wasmMemory.buffer.slice(base, base + got * 4));
+    }
+    // A mixer that produces nothing is the audio-path version of `default: return 0` — the
+    // transport stays healthy, every producer-side counter still reads fine, and the page is
+    // simply silent with nothing saying so. Report the transition in BOTH directions, once
+    // each, so a stall is attributable to a moment rather than discovered by listening.
+    // Threshold is in EMULATED frames (gate #9): 120 frames = 2 s of guest time, long enough
+    // that ordinary between-cue silence in a sequenced score does not trip it.
+    if (got > 0) {
+      if (audioStallFrames >= AUDIO_STALL_FRAMES && audioStallEpisodes <= AUDIO_STALL_MAX_EPISODES)
+        log('audio: mixer produced samples again after ' + audioStallFrames + ' silent frames');
+      audioStallFrames = 0;
+    } else if (++audioStallFrames === AUDIO_STALL_FRAMES
+               && ++audioStallEpisodes <= AUDIO_STALL_MAX_EPISODES) {
+      log('audio: mixer has returned 0 samples for ' + AUDIO_STALL_FRAMES + ' consecutive frames'
+          + ' (' + (AUDIO_STALL_FRAMES / 60).toFixed(1) + ' s of emulated time) — the transport is '
+          + 'fine and the page will be SILENT. active voices = '
+          + (Module.___recomp_musyx_active_voices ? Module.___recomp_musyx_active_voices() : '?')
+          + (audioStallEpisodes === AUDIO_STALL_MAX_EPISODES
+             ? ' [' + AUDIO_STALL_MAX_EPISODES + 'th episode — further stall reports suppressed]' : ''));
     }
   }
   // TRANSPORT SELF-TEST (?audiotest=1). A 440 Hz sine at 0.15 full scale, phase-continuous
@@ -772,6 +797,107 @@ async function boot(msg) {
     log('OSReport: ' + out.replace(/\n+$/, ''));
   }
 
+  // ---- UNIMPLEMENTED HOST IMPORTS: the census ---------------------------------------------
+  // WHY THIS EXISTS. `default: return 0` used to swallow every host import this file does not
+  // model, and a stub that returns 0 is indistinguishable, from the guest's side, from a call
+  // that SUCCEEDED. That is not hypothetical here — it is how this port shipped soundless and
+  // how it still downmixes to MONO:
+  //
+  //   MEASURED on the shipped mp4_game.wasm (md5 00f457ce…) 2026-09-04, by parsing its import
+  //   and name sections: 82 imports, 79 of them host stubs after the isEmscriptenProvided
+  //   filter above, 10 with a real switch case — so 69 fell through `default: return 0`.
+  //
+  //   THE CONSEQUENCE, traced to source: OSGetSoundMode (~/gc_refs/marioparty4/src/dolphin/os/
+  //   OSRtc.c:273-282) returns `(sram->flags & 0x4) ? STEREO : MONO` off the static SramControlBlock
+  //   `Scb` (OSRtc.c:24, BSS => all zero). It is supposed to be filled by __OSInitSram
+  //   (OSRtc.c:161-164) via ReadSram (OSRtc.c:100), which bails on `if (!EXILock(...)) return FALSE`
+  //   (OSRtc.c:105-107) leaving the buffer untouched. So the flag is never set and the mode is
+  //   always MONO.
+  //
+  //   ⚠ CORRECTION to the note at the top of this file and to build_wasm.sh:43, both of which
+  //   blame EXILock's `return 0` directly. In the SHIPPED binary EXILock is never reached on the
+  //   read path at all. The argument is about CALLERS, not about what survived linking:
+  //   __OSInitSram's only caller anywhere in the decomp is OS.c:279, inside OSInit — and OSInit
+  //   is a host import handled by the `case 'OSInit'` below, so OS.c is not compiled and nothing
+  //   in the module calls __OSInitSram. The SRAM read path is unreachable, and implementing the
+  //   EXI imports alone would be a NULL FIX for the sound mode: nothing would call them.
+  //   (The wasm name section agrees — __OSInitSram/ReadSram are absent from its 1601 named
+  //   functions — but do NOT lean on that alone: msmSysInit and salCalcVolume are also absent
+  //   and are certainly live, because inlined callees do not appear there. Name-section absence
+  //   is corroboration here, not proof; the caller argument is the proof.)
+  //
+  // WHAT THIS DOES. Every unmodelled import is counted and its FIRST call is logged by name.
+  // Counting is the point: it converts "69 unknowns" into two much smaller, actionable facts —
+  // which stubs the guest actually reaches, and which are provably dead in this workload. A name
+  // that never appears in the census was never called, and needs no model.
+  //
+  // WHY NOT LOG EVERY CALL. OSDisableInterrupts/OSRestoreInterrupts run per frame; a postMessage
+  // per call would flood the page and perturb a timing-sensitive path (CLAUDE.md gate #8 —
+  // diagnostics must not change what they measure). First-call-only + a counter is free.
+  //
+  // HOST_MODELLED is NOT an excuse list. A name belongs here only with a citation for why
+  // returning 0 is the CORRECT emulation of that call in this port, not merely a harmless one.
+  // Anything else stays unlisted and gets reported as UNIMPLEMENTED, including calls I believe
+  // are probably fine — "probably fine" is the assumption this whole block exists to stop.
+  const HOST_MODELLED = {
+    PADRead:        'input is injected, not polled — gc_input.c:1-8 (no VI-retrace ISR fires PadReadVSync)',
+    PADInit:        'ditto — gc_input.c:1-8',
+    PADReset:       'ditto — gc_input.c:1-8',
+    PADSetSpec:     'ditto — gc_input.c:1-8',
+    PADRecalibrate: 'ditto — gc_input.c:1-8',
+    PADControlMotor:'no rumble device is modelled',
+    DCInvalidateRange: 'wasm linear memory is flat and coherent — no D-cache to invalidate',
+    PPCSync:        'no store queue to drain on a flat heap',
+    __sync:         'no store queue to drain on a flat heap',
+    PPCMfhid2:      'no Gekko SPRs in wasm',
+    PPCMthid2:      'no Gekko SPRs in wasm',
+    PPCMfwpar:      'no Gekko SPRs in wasm (gather pipe is modelled by gx_wgpipe.c)',
+    PPCMtwpar:      'no Gekko SPRs in wasm (gather pipe is modelled by gx_wgpipe.c)',
+    LCEnable:       'the locked L1 cache is ordinary memory here (see docs/static-recomp-sab)',
+  };
+  const unimplHits = new Map();     // name -> call count, for every import with no switch case
+  function unimplemented(n) {
+    const c = (unimplHits.get(n) || 0) + 1;
+    unimplHits.set(n, c);
+    if (c === 1 && !(n in HOST_MODELLED))
+      log('UNIMPLEMENTED host import: ' + n + '() called for the first time — returning 0, which the '
+          + 'guest cannot distinguish from success. Census at boot+exit lists all of them.');
+    return 0;
+  }
+  // Called once the module is up (all names known) and again on demand, so the list is visible
+  // in the page console and capturable by tools/audio_probe.mjs / the render probe.
+  function reportImportCensus(when) {
+    const unmodelled = hostNames.filter((n) => !HANDLED.has(n));
+    const called = unmodelled.filter((n) => unimplHits.has(n));
+    const dead = unmodelled.filter((n) => !unimplHits.has(n));
+    // Count the switch cases this module ACTUALLY imports, not HANDLED.size: OSPanic has a case
+    // but is not among mp4_game.wasm's imports, so HANDLED.size would make the census print
+    // 11 + 69 = 80 against 79 host imports. An instrument whose own arithmetic does not close
+    // is not worth reading.
+    const modelled = hostNames.filter((n) => HANDLED.has(n)).length;
+    log('host-import census (' + when + '): ' + hostNames.length + ' host imports, '
+        + modelled + ' modelled by a switch case, ' + unmodelled.length + ' returning 0.');
+    if (called.length)
+      log('  REACHED by the guest (' + called.length + '): '
+          + called.sort((a, b) => unimplHits.get(b) - unimplHits.get(a))
+                 .map((n) => n + '×' + unimplHits.get(n) + (n in HOST_MODELLED ? '(modelled)' : ''))
+                 .join(', '));
+    if (dead.length)
+      log('  never called in this run (' + dead.length + '): ' + dead.sort().join(', '));
+    postMessage({ cmd: 'importCensus', when, total: hostNames.length, modelled,
+                  stubbed: unmodelled.length,
+                  reached: called.map((n) => ({ name: n, calls: unimplHits.get(n),
+                                                modelled: n in HOST_MODELLED })),
+                  dead });
+  }
+
+  // The names with a real body below. Kept next to the switch so the two cannot drift apart:
+  // the census subtracts this set from hostNames, so a case added without a HANDLED entry would
+  // be miscounted as stubbed (loud and wrong-in-the-safe-direction) rather than silently missed.
+  const HANDLED = new Set(['OSReport', 'OSPanic', 'OSInit', 'OSGetTime', '__OSGetSystemTime',
+    'OSGetTick', 'DVDInit', 'DVDReadAbsAsyncPrio', 'DVDReadAbsAsyncForBS', 'VIGetRetraceCount',
+    'VIWaitForRetrace']);
+
   function stub(n) {
     return (...a) => {
       switch (n) {
@@ -946,6 +1072,11 @@ async function boot(msg) {
           viRetrace++;
           pumpAudio();
           cardPoll();
+          // Periodic host-import census. main() never returns to the worker event loop (see the
+          // SAVE STATES note), so this frame hook is the only place a running census can be
+          // emitted. Every 1800 frames = every 30 s of EMULATED time; one postMessage per 30 s
+          // is far below the per-frame traffic already on this path.
+          if ((viRetrace % 1800) === 0) reportImportCensus('frame ' + viRetrace);
           // debug: periodic guest-side hex of watched addresses (boot msg peekAddrs;
           // diff against the dolphin worker's recompPeek of the same guest offsets)
           if (peekAddrs && (viRetrace % 1200) === 0) {
@@ -969,7 +1100,10 @@ async function boot(msg) {
           stateServiceCmd();
           return 0;
         }
-        default: return 0;
+        // NOT a silent 0 any more — see the census block above. The return value is unchanged
+        // (still 0) on purpose: this commit makes the gap VISIBLE without changing any guest-
+        // observable value, so it cannot itself be the cause of a behaviour change.
+        default: return unimplemented(n);
       }
     };
   }
@@ -1027,6 +1161,10 @@ async function boot(msg) {
   d.setUint32(0x80000038, 0x81C00000, true);
   d.setUint32(0x8000003C, fst.length, true);
   log('module up (' + hostNames.length + ' host stubs, ' + parts.length + ' disc parts); running main()');
+  // Boot census: every unmodelled import is 'never called' at this point, so this line is the
+  // full inventory of what has no body. The later censuses are the interesting ones — they say
+  // which of these the guest actually reaches.
+  reportImportCensus('boot');
   // The STACK is the whole diagnosis when this fires. `main stopped: memory access out of
   // bounds` on its own names nothing — a wasm trap message carries no location — and that is
   // exactly how the 2026-09-02 audio-build trap stayed unattributed for a whole round. The
@@ -1037,6 +1175,9 @@ async function boot(msg) {
   catch (e) {
     log('main stopped: ' + (e.message || e));
     if (e && e.stack) log('main stopped, stack:\n' + String(e.stack).split('\n').slice(0, 40).join('\n'));
+    // A trap is exactly when the stub inventory matters most: an import that returned a plausible
+    // 0 several thousand frames earlier is a prime suspect for a fault with no local cause.
+    reportImportCensus('after main stopped');
   }
 }
 
