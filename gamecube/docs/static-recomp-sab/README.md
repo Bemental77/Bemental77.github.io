@@ -2209,7 +2209,7 @@ What this does **not** show:
 
 ### 9.7 The MSR/interrupt host boundary — BUILT, and the 745 is +499 not +745
 
-`0x800e78ac` `OSDisableInterrupts` is host-implemented, together with the four
+`0x800e78ac` `OSDisableInterrupts` is host-implemented, together with the six
 sibling addresses the closure measurably requires. Reproduce every number below with:
 
 ```bash
@@ -2290,7 +2290,7 @@ boundary. Named, with complete blocker sets (a function can appear twice):
 | next blocker | of the 265 | what it is | owner |
 |---|---|---|---|
 | `0x800ecb48` `OSGetTime` | 208 | `mfspr` time base (`op31 xo=371`) | unclaimed — the largest remaining single boundary |
-| `0x800e34bc` `PPCMtwpar` | 145 | `mtspr SPR922`/WPAR | the concurrent WPAR/locked-L1 work |
+| `0x800e34bc` (map: `PPCMtwpar`) | 145 | `7c7603a6` = **`mtspr SPR22`** — the DECREMENTER, not WPAR; `sab.map` is partial so read the name as approximate | with the clock, below |
 | `0x800e55d4` `OSSetCurrentContext` | 89 | `mfmsr` + MSR[FP] | context switch (`sr_host_os.c`, already written) |
 | `0x800e56bc` `OSLoadContext` | 86 | `rfi` | context switch |
 | `0x800e563c` `OSSaveContext` | 86 | the setjmp | context switch |
@@ -2300,8 +2300,31 @@ boundary. Named, with complete blocker sets (a function can appear twice):
 | `0x800e34c4` `PPCSync` | 13 | `sync` | — |
 
 So the honest headline is **+499 of a claimed 745**, and the next thing worth
-building on this route is a host **clock** (`OSGetTime`/`OSGetTick`, 236 functions),
-not more of the interrupt boundary.
+building on this route is a host **CLOCK**, not more of the interrupt boundary. Read
+from the shipped words rather than the map names, the clock is bigger than any single
+row above: `OSGetTime` is a `mftb`/`mftbu` retry loop (`op31 xo=371`), `OSGetTick` is
+one `mftb`, and `0x800e34bc` is `mtspr SPR22` — the decrementer. That is 208 + 28 +
+145 blocked-function memberships across three addresses that are all one facility.
+`sr_host_os.c` already owns the pattern: one word of host state behind a handful of
+byte-exact transcriptions.
+
+#### What the 499 are worth, against the MEASURED workload rather than `.text`
+
+`profile_map.py` against the same recorded SAB PC histogram §8.5 uses:
+
+**7 of the measured top-120 hot functions are in the 499, and they carry 14.49% of
+all sampled PCs** — `0x80117eb0` (5.90%), `0x800f3780` (5.23%), `0x800fe130` (0.91%),
+`0x800f13a8` (0.90%), `0x800f135c` (0.76%), `0x800f3694` (0.67%), `0x800ff870`
+(0.13%). For scale, the entire verified DOL record of 330 functions covers 19.92%
+(§9.5), and **not one of these seven was ever armable** — the closure gate excluded
+all of them from every arm list ever built.
+
+`0x800f13a8` is worth naming: it is the function §8.1d recorded as
+`SKIP 0x800f13a8 faults 0xe00e78ac`, the observation this whole boundary was sized
+from. Its closure is clean now.
+
+This is a **static** claim — closure-clean and therefore armable — not a verification
+claim. None of the seven has been captured yet.
 
 #### Is a one-word MSR a lie the guest can detect? Enumerated, not argued
 
@@ -2340,9 +2363,22 @@ refusal rather than fixed speculatively: no committed fixture reaches one that w
 Whole-image `-O2` build, `--indirect --jumptables --boundaries outer+calls` plus the
 seven `--host` addresses, linked `SR_HOST_OS=1`. wasm md5
 `c06edbbfb073ebc50cbb29fffa936b98`, **identical before and after both arms**. Machine
-load 2.2–4.1 throughout. The emitted set is *unchanged* at 4,671/4,741 functions —
+load 2.2–4.1 throughout. Inputs hash-recorded, because this build links two files a
+concurrent agent was editing: `gekko_rt.h` blob
+`73d9d97fd8a876b97877e3c49cf29e753965a4a7` and `sr_driver.c` blob
+`f17627d5d28c1acf6e08856373600ce04d1a80fc`, both as at `f80a1ee1` — `gekko_rt.h` has
+been modified in the working tree since, so a rebuild will NOT reproduce this md5.
+
+The emitted set is *unchanged* at 4,671/4,741 functions —
 all seven host-bound addresses were already refused, so nothing new is translated;
 what changes is only whether a `bl` to one of them faults.
+
+The routing is wired and countable: the generated whole-image C contains **no body**
+for any of the seven and reaches them through `sr_extern` at **469 call sites** —
+212 for `OSDisableInterrupts`, 246 for `OSRestoreInterrupts`, 4 for
+`OSEnableInterrupts`, 7 across the four TRK accessors. The 212 is an independent
+corroboration: `os_boundary.txt:33` counted 212 direct `bl` sites for `0x800e78ac`
+from the raw binary, by a different instrument.
 
 `verify_fixture.mjs` now seeds `g_msr` from `state_in.msr` per fixture and **scores
 MSR as an output** against `state_out.msr` (454 of the 456 committed captures have
