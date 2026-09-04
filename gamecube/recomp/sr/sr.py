@@ -871,10 +871,25 @@ class Translator:
                         f" st->fpscr = (st->fpscr & ~m) | ((uint32_t)st->ps0[{fB}] & m); }}")
                     return o
                 if xo in (14, 15):                                               # fctiw / fctiwz
+                    # THE NEGATIVE-ZERO BIT.  Interpreter_FloatingPoint.cpp:135-137:
+                    #     u64 result = 0xfff8000000000000ull | value;
+                    #     if (value == 0 && std::signbit(b)) result |= 0x100000000ull;
+                    #     // "Based on HW tests"
+                    # i.e. a small NEGATIVE operand that truncates to integer 0 is
+                    # distinguishable from +0 in the undefined high word.  Omitting
+                    # this arm was a real divergence found BY EXECUTION, not by
+                    # inspection: SAB 0x80023ba0 stores the fctiwz result with `stfd`
+                    # (0x801115e8 fctiwz f0,f0 ; 0x801115ec stfd f0,0x10(r1)), so the
+                    # high word reaches GUEST MEMORY and the ordered write log caught
+                    # it -- oracle 0xFFF8000100000000 against our 0xFFF8000000000000,
+                    # one byte in 495 write events.  620 fctiwz sites in 264 DOL
+                    # functions are exposed to it.
                     o.append(f"{{ double _v = {b}; int32_t _i = (_v != _v) ? (int32_t)0x80000000 :"
                              f" (_v > 2147483647.0) ? (int32_t)0x7FFFFFFF :"
                              f" (_v < -2147483648.0) ? (int32_t)0x80000000 : (int32_t)_v;"
-                             f" st->ps0[{fD}] = 0xFFF8000000000000ull | (uint32_t)_i; }}")
+                             f" uint64_t _r = 0xFFF8000000000000ull | (uint32_t)_i;"
+                             f" if ((uint32_t)_i == 0u && signbit(_v)) _r |= 0x100000000ull;"
+                             f" st->ps0[{fD}] = _r; }}")
                     return o
             raise Untranslatable(f"FP op{op} xo={f['xo']} xo5={xo5}", pc, w)
 
