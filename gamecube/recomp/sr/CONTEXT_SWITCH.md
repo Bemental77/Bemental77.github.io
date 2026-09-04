@@ -64,7 +64,7 @@ and the two `__TRK_get_MSR`/`__TRK_set_MSR` pairs) and **nothing else**, creatin
 host thread and needing no `-pthread` (`sr_os_init_irq()`). It is the same
 `g_msr` and the same three transcriptions this file's design already contained;
 what it adds is a way to link them without the thread pool, plus the measurement:
-**+506 closure-clean DOL functions (3,581 → 4,087), +73,999 instructions**. Control
+**+499 closure-clean DOL functions (3,581 → 4,080), +73,972 instructions**. Control
 arm D below is unaffected — it runs with the boundary switched OFF, which is still
 `0xe00e78ac`.
 

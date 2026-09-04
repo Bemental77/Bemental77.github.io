@@ -118,7 +118,20 @@ def classify(img, byaddr, ov_by, starts, breloc, base, hosts=()):
         size = ov_by[a][0]
         c = census(img, a, size)
         why, nclo = None, 0
-        seen, work = set(), [x for x in [a] if x not in hosts]
+        # A HOST-BOUND ADDRESS IS NOT A CANDIDATE.  sr.py drops it from the emitted
+        # set (`sel -= hosts`), so there is no translated body to capture a fixture
+        # against.  Without this it reports CLEAN -- its closure walk starts with an
+        # empty work list, finds no problem, and passes vacuously -- which inflated the
+        # first "newly unblocked" count by exactly the size of the --host set (506 vs
+        # the real 499).  Same denominator error class as the overlapping-bodies bug
+        # in README §9.1: a number that is right about everything except what it counts.
+        if a in hosts:
+            rows.append({"addr": a, "off": a - base, "size": size, "census": dict(c),
+                         "shape": shape_of(c), "closure": 0,
+                         "blocked": "host-bound (--host): serviced by the host layer, "
+                                    "never emitted, so not a fixture candidate"})
+            continue
+        seen, work = set(), [a]
         while work:
             x = work.pop()
             if x in seen or x in hosts:

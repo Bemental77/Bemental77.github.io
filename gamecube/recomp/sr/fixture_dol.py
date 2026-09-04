@@ -37,7 +37,7 @@ containing one is blocked.  §8.1d of the README is the reason this matters -- a
 
 Env: GDB_PORT (default 9137), OUT (default /tmp/sr_dol_survey.json).
 """
-import argparse, collections, json, os, sys, time
+import argparse, collections, json, os, re, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -56,14 +56,33 @@ DOL_ENTRY_PC = 0x80003140      # a connect here means the savestate did NOT rest
 
 # The MSR / interrupt host boundary, sr_host_os.h's SR_OS_IRQ set.  Passing this to
 # --host makes the offline gate agree with a build linked SR_HOST_OS=1: neither
-# translates these five addresses, both let a `bl` to one reach sr_host_hook.
-IRQ_HOSTS = (0x800e78ac,   # OSDisableInterrupts   mfmsr / rlwinm / mtmsr / rlwinm / blr
-             0x800e78c0,   # OSEnableInterrupts
-             0x800e78d4,   # OSRestoreInterrupts
-             0x800e3494,   # __TRK_get_MSR   \  two byte-identical copies of each are
-             0x800e349c,   # __TRK_set_MSR    > linked into SAB; 0x80108e98 / 0x80108ea0
-             0x80108e98,   # __TRK_get_MSR   /  are the other pair
-             0x80108ea0)   # __TRK_set_MSR
+# translates these addresses, both let a `bl` to one reach sr_host_hook.
+#
+# READ FROM sr_host_os.h, NOT COPIED.  The gate and the build disagreeing silently is
+# the single most expensive failure shape in this tree (CLAUDE.md: a link that packages
+# a stale wasm, a probe gated on a flag that does not exist).  Here the consequence
+# would be an arm list of candidates that cannot run, or -- worse -- 506 runnable
+# candidates refused offline and never armed at all.  One definition, parsed.
+IRQ_HOST_NAMES = ("SAB_OSDisableInterrupts", "SAB_OSEnableInterrupts",
+                  "SAB_OSRestoreInterrupts",
+                  # `mfmsr r3; blr` / `mtmsr r3; blr`, two byte-identical copies of each
+                  "SAB_TRK_get_MSR_A", "SAB_TRK_set_MSR_A",
+                  "SAB_TRK_get_MSR_B", "SAB_TRK_set_MSR_B")
+
+
+def _irq_hosts():
+    """-> tuple of guest addresses, read out of sr_host_os.h by name."""
+    hdr = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sr_host_os.h")
+    defs = dict(re.findall(r"^#define\s+(SAB_\w+)\s+(0x[0-9a-fA-F]+)u?\s*$",
+                           open(hdr).read(), re.M))
+    missing = [n for n in IRQ_HOST_NAMES if n not in defs]
+    if missing:
+        raise SystemExit(f"{hdr} no longer defines {missing} -- the offline closure "
+                         f"gate and sr_host_os.c's SR_OS_IRQ switch have drifted apart")
+    return tuple(int(defs[n], 16) for n in IRQ_HOST_NAMES)
+
+
+IRQ_HOSTS = _irq_hosts()
 
 
 def classify_dol(img, byaddr, min_size, hosts=()):
