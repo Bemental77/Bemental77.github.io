@@ -467,13 +467,26 @@ def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusa
     fired = [anchor_off] if anchor_off in set(arm) else []
     print(f"[survey] enumerating which of {len(arm)} candidates execute here "
           f"(delete-on-fire, up to {a.enum_budget:.0f}s) ...", flush=True)
-    t0 = time.time()
+    # LEAVE WHILE CONTROL IS STILL AVAILABLE.  Enumeration used to run its full
+    # budget, and that lost a whole second-overlay run: otherprintD.rel is linked 52 s
+    # into a cold boot for a transient boot screen, 10 of its 31 candidates fired
+    # within 98 s, and then the screen moved on -- nothing fired again, the `cont`
+    # blocked past --cont-timeout, and because abandoning a cont is not recoverable
+    # the run aborted with 0 captured. Stopping after --enum-idle seconds without a
+    # NEW candidate exits the phase while stops are still arriving, so the capture
+    # wave gets the rest of the scene instead of the run getting nothing.
+    t0 = last_new = time.time()
     while pending and time.time() - t0 < a.enum_budget:
+        if time.time() - last_new > a.enum_idle:
+            print(f"[survey] no new candidate for {a.enum_idle:.0f}s — ending "
+                  f"enumeration early at t+{time.time() - t0:.0f}s", flush=True)
+            break
         rep = g.cont(timeout=a.cont_timeout)
         pc = O.GDB.stop_pc(rep)
         off = (pc - base) if pc is not None else None
         if off in pending:
             fired.append(off)
+            last_new = time.time()
             g.del_bp(base + off)
             pending.discard(off)
             if len(fired) % 10 == 0:
@@ -658,6 +671,11 @@ def main():
                     help='seconds spent measuring candidate fire RATES so the --survey '
                          'anchor can be the rarest one that still hands control back '
                          'often enough.  Skipped when --anchor-off is given.')
+    ap.add_argument('--enum-idle', type=float, default=45.0,
+                    help='end enumeration this many seconds after the last NEW '
+                         'candidate fired.  A transient scene stops running the '
+                         'overlay entirely, and once nothing fires there is no way '
+                         'back: this stops while control is still available.')
     ap.add_argument('--enum-budget', type=float, default=420.0,
                     help='seconds to enumerate which candidates execute in this scene '
                          '(--survey), arming all of them and deleting each on its '
