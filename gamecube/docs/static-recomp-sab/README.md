@@ -2390,8 +2390,9 @@ all of them from every arm list ever built.
 `SKIP 0x800f13a8 faults 0xe00e78ac`, the observation this whole boundary was sized
 from. Its closure is clean now.
 
-This is a **static** claim — closure-clean and therefore armable — not a verification
-claim. None of the seven has been captured yet.
+That was a **static** claim when written — closure-clean and therefore armable.
+`0x800f13a8` has since been captured and verified bit-exact (below); the other six of
+the seven have not.
 
 #### Is a one-word MSR a lie the guest can detect? Enumerated, not argued
 
@@ -2555,9 +2556,59 @@ phase with **more** breakpoints armed (485), which rules out armed-set size as t
 direct cause. Recorded as an open, reproducible-or-not failure rather than attributed
 to a guess.
 
-**So the 499 are still unverified by execution, and that is the honest state of this
-section.** Everything claimed about them above is static: closure-clean, therefore
-armable. The four fixtures verified below are *not* members of the 499.
+**The third attempt worked, and it is the acceptance evidence.** 60 armed — ranks
+3..62 of the same profiled list, with the two hottest entries (`0x80117eb0` 5.90%,
+`0x800f3780` 5.23%) DROPPED, because an armed breakpoint on the hottest function in
+the scene is exactly what `survey_waves` warns buys no emulated time. That one change
+made enumeration finish in 27 s instead of timing out:
+
+```
+[survey] anchor = +0x800f4b2c, 5 hits in 45s = one per 9.0s; 14 candidates fired during calibration
+[survey] no new candidate for 25s — ending enumeration early at t+26s
+[survey] 14 of 60 candidates executed in 27s; 46 never did
+[survey] wave done: 13/13 captured; 13 total in 33s
+```
+
+**All 13 captured entries are members of the 499** (checked, not assumed). Replayed
+against the same whole-image build, md5 `c06edbbfb073ebc50cbb29fffa936b98` before and
+after both arms, load 3.0–5.2:
+
+| arm | verified | attempted | refused | mismatched |
+|---|---|---|---|---|
+| `SR_OS_IRQ` | **10** | 13 | 3 | 0 |
+| **control, boundary OFF** | 3 | 13 | 3 | **7** |
+
+The 3 refusals are `usable:false` at capture (unknown store forms), refused identically
+in both arms. **The delta is exactly 7 — the 7 the host arm reports as having crossed
+the boundary — and every one of them faults `0xe00e78ac` with the boundary off:**
+
+| entry | shape | steps | captured MSR | control-arm diff |
+|---|---|---|---|---|
+| `0x800f13a8` | nonleaf | 40 | `0xb032` | `r4 want=0 got=802d49e0`, `r5 want=b032` |
+| `0x800f3628` | nonleaf | 136 | `0xb032` | `r3 want=1`, `r5 want=b032` |
+| `0x8013e824` | nonleaf+fp | 969 | `0xb032` | `r5 want=b032 got=3` |
+| `0x800ebac4` | nonleaf | 28 | `0x1032` | `r4 want=0 got=1`, `r5 want=1032 got=0` |
+| `0x800eba84` | nonleaf | 28 | `0x1030` | `r5 want=1030 got=77e3cb` |
+| `0x80124164` | nonleaf+blrl | 100 | `0x9032` | `r3 want=1`, `r4 want=0` |
+| `0x80123e90` | nonleaf+blrl | 93 | `0x9032` | `r3 want=1`, `r4 want=0` |
+
+**7 of 7 with the boundary, 0 of 7 without**, on one binary. `0x800f13a8` is the
+function §8.1d recorded as `SKIP 0x800f13a8 faults 0xe00e78ac` — the observation this
+whole boundary was sized from. It is now bit-exact: all 5 write events, all 16 final
+memory bytes, every GPR, FPR, CR, LR, CTR and MSR.
+
+**This is also where MSR seeding stops being a synthetic argument.** Five of the seven
+were captured at an MSR that is NOT `sr_host_os.c`'s compiled-in `0x9032` — three at
+`0xb032`, one at `0x1032`, one at `0x1030` — and the control arm prints the wanted
+value (`r5 want=b032`, `r5 want=1032`, `r5 want=1030`). Without seeding from
+`state_in.msr` those five would have failed on `r4`/`r5` in the *host* arm too.
+
+Also verified and worth separating out: `0x80024cb8`, `0x80141168` and `0x8013ba58`
+pass in **both** arms — they are members of the 499 that this scene reaches without
+touching the boundary. They are honest passes for the translator, not evidence for the
+boundary, and the `host-calls` counter is what tells them apart.
+
+Artifact: `gamecube/recomp/sr/sab_dol_irq_fixtures.json`.
 
 **What these 4 are and are not.** They are proof the primitive is correct and
 load-bearing — but their *entries* were already closure-clean, and they reach
