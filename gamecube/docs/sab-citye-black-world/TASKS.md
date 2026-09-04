@@ -463,15 +463,31 @@ passed only `?bjit_mips=1`:
   `li_candidate && *AotCell(kLeafInlineOffCell) == 0u`, so with the cell zero the
   path is byte-identical to `7a77e12e`.
 
-**Remaining: `8a4342e5` (leaf-inline splice, default ON), `b8314d0a` (4-slot
-publish ring: `WGPUGfx.cpp` +93, `gamecube.html` +410), `7a77e12e` (emitter:
-`jit_branch.cpp` +17, `ppc_emit.cpp` +36).** Note the publish ring is presentation
--side and the HUD *does* update live across screenshots (the timer advances), so a
-stale-slot present is already argued against — but not excluded.
+A third is inert too. **`7a77e12e`**'s entire emitter diff is the `[mips]` meter
+becoming runtime-gated: `jit_branch.cpp` drops its hand-synced
+`BEM_MIPS_CENSUS = true` / `BEM_MIPS_EXEC_CELL` duplicate in favour of
+`ppc_emit.h`, and both sites change `if (BEM_MIPS_CENSUS)` →
+`if (bem_mips_census_on())`. Nothing else. Every run in the pair passed
+`?bjit_mips=1`, which arms the meter, and the meter only increments a counter —
+so the emitted semantics are the same on both arms.
 
-Arms staged and queued (`/tmp/bw/snap-m{1,2}`, matched js/wasm, pinned page):
-`m1` = `8a4342e5` decides it alone — the OLD arm renders, so `m1` black ⇒
-`8a4342e5`; `m1` renders ⇒ `m2` decides between `b8314d0a` and `7a77e12e`.
+**Remaining: TWO — `8a4342e5` (leaf-inline splice, default ON) and `b8314d0a`
+(4-slot publish ring: `WGPUGfx.cpp` +93, `gamecube.html` +410).** The A/B swapped
+page *and* worker together, so `b8314d0a`'s page-side ring is inside the window.
+Against it: the publish ring is presentation-side, and the HUD updates live
+across screenshots (the timer advances), so a stale-slot present is argued
+against — but not excluded.
+
+**`m1` = `8a4342e5` therefore decides it alone**: the OLD arm renders, so `m1`
+black ⇒ `8a4342e5`; `m1` renders ⇒ `b8314d0a`.
+
+Arms staged (`/tmp/bw/snap-m{1,2}`, matched js/wasm, pinned page) and queued
+behind the probe lock. How to run one:
+
+```bash
+bash /tmp/bw/bisect.sh /tmp/bw/snap-m1 m1   # 8a4342e5
+bash /tmp/bw/bisect.sh /tmp/bw/snap-m2 m2   # b8314d0a
+```
 
 ### F12a. The leaf-inline signals, and why they are NOT yet proof
 
