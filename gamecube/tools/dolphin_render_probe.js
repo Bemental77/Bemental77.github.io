@@ -156,7 +156,20 @@ function startServer() {
            ...((process.env.PROBE_DISABLE_OVERLAYS === '0') ? [] :
                ['--disable-features=DelegatedCompositing,UseMultipleOverlays,MacOverlays,CanvasOopRasterization',
                 '--disable-mac-overlays']),
-           `--js-flags=--max-old-space-size=4096 ${process.env.PROBE_JS_FLAGS || '--no-liftoff'}`,
+           // [v8-tier] THE PROBE MEASURES WHAT THE PRODUCT CAN ACTUALLY SHIP.
+           // This used to default to `--no-liftoff`, which forces every wasm module
+           // straight into TurboFan. **A web page cannot set V8 flags.** Visitors to
+           // caseybement.com get stock V8: Liftoff first, TurboFan only after a module
+           // executes `--wasm-tiering-budget (13,000,000) / code_body_bytes` times.
+           // So every ABSOLUTE guest rate measured under the old default described a
+           // configuration that cannot exist in the product (matched-pair RATIOS taken
+           // with both arms under the same flag are unaffected).
+           //   Measured, gamecube/docs/wasm-tier/TASKS.md: the tier is worth 2.108x on
+           //   emitted bodies (318 blocks paired, per-arm floor subtracted, interleaved),
+           //   but under stock V8 260/323 modules tier up unaided, so the residual the
+           //   old flag was silently handing us is ~1.164x.
+           // Set PROBE_JS_FLAGS=--no-liftoff to restore the forced-tier arm for an A/B.
+           `--js-flags=--max-old-space-size=4096 ${process.env.PROBE_JS_FLAGS || ''}`.trimEnd(),
            // [cache-bust] disable Chrome's HTTP cache so pthread WORKERS (which
            // fetch dolphin_worker.js / emcc.js / .wasm by bare name, outside the
            // page's setCacheEnabled scope) always load the freshly-linked build.
