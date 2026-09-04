@@ -1220,11 +1220,31 @@ function startServer() {
               o.bpMax = A[0x026B3B1C >> 2] >>> 0;
               o.xpc  = (() => { const c = A[0x0250002C >> 2] >>> 0;
                 return c ? (A[c >> 2] >>> 0).toString(16) : '0'; })();
+              // [guest-rate witness 2026-09-04] The AI-DMA pair, sampled in the
+              // SAME window as cred/exec/drawn so one row carries every witness
+              // and cross-witness agreement is checkable per window rather than
+              // once per run. Cells are written unconditionally by
+              // DSP::DSPManager::UpdateAudioDMA (DSP.cpp:608 aidma, :642 aid,
+              // :610-617 the three descriptors) — no query-string arming.
+              // The descriptors are republished every callback so the reader
+              // never assumes 486 MHz or divisor 3375.
+              o.aid    = A[0x026B3918 >> 2] >>> 0;   // AID fires (DMA block wrap)
+              o.aidma  = A[0x026B391C >> 2] >>> 0;   // raw AI-DMA callbacks
+              o.aiPer  = A[0x026B3920 >> 2] >>> 0;   // callback period, CoreTiming ticks
+              o.tickHz = A[0x026B3924 >> 2] >>> 0;   // CoreTiming ticks/sec
+              o.nblk   = A[0x026B3928 >> 2] >>> 0;   // AudioDMAControl.NumBlocks
               const m1 = A[0x02500020 >> 2] >>> 0;
               if (m1) {
                 const u8 = new Uint8Array(window.sharedMemory.buffer);
                 const g = m1 + 0x1D3A54;
                 o.gc = ((u8[g] << 24 | u8[g + 1] << 16 | u8[g + 2] << 8 | u8[g + 3]) >>> 0);
+                // MP4-ONLY guest-side witness: retraceCount @0x801D4428 is bumped
+                // by the guest's VI retrace ISR, so it only advances if the guest
+                // is executing AND interrupts are being delivered. On any other
+                // title this address is unrelated data — the rig must gate on
+                // romIdx before reading it as a witness.
+                const r = m1 + 0x1D4428;
+                o.rt = ((u8[r] << 24 | u8[r + 1] << 16 | u8[r + 2] << 8 | u8[r + 3]) >>> 0);
               }
             }
           } catch (_e) {}
@@ -1264,6 +1284,67 @@ function startServer() {
               bpDn: (s.bpN || 0) - (_srPrev.bpN || 0), bpDms: (s.bpMs || 0) - (_srPrev.bpMs || 0),
               rate: s.rate || null };
             row.head = s.head || null;
+            // ---- [witness] the guest-rate truth row -------------------------
+            // Four witnesses over ONE window. W1/W2/W3 are three different code
+            // paths onto CoreTiming's global_timer; W4 is guest-EXECUTED and is
+            // the only one that also proves the guest is alive.
+            const u32d = (a, b) => { let d = (a >>> 0) - (b >>> 0); if (d < 0) d += 4294967296; return d; };
+            const hzAi  = (s.tickHz > 0 && s.aiPer > 0) ? (s.tickHz / s.aiPer) : 0;   // hw callbacks/s
+            const hzAid = (hzAi > 0 && s.nblk > 0) ? (hzAi / s.nblk) : 0;             // hw AID fires/s
+            const dAidma = u32d(s.aidma, _srPrev.aidma), dAid = u32d(s.aid, _srPrev.aid);
+            row.hz = s.tickHz || 0; row.aiPer = s.aiPer || 0; row.nblk = s.nblk || 0;
+            row.hzAi = +hzAi.toFixed(2); row.hzAid = +hzAid.toFixed(2);
+            row.aiPerS = +(dAidma / dw).toFixed(2); row.aidPerS = +(dAid / dw).toFixed(2);
+            row.gAi  = hzAi  > 0 ? +((dAidma / dw) / hzAi).toFixed(4)  : null;  // W1
+            row.gAid = hzAid > 0 ? +((dAid   / dw) / hzAid).toFixed(4) : null;  // W2
+            // W3: credited clock straight from the emulator's OWN ticks/sec cell
+            // — not the 486e6 literal `speed` above uses.
+            row.gCred = s.tickHz > 0 ? +((dcred / dw) / s.tickHz).toFixed(4) : null;
+            // Idle-skip: cycles CREDITED but never EXECUTED. dexec is 0 unless
+            // ?bjit_mips=1 armed the emitter's exec counter, so null (not 0%)
+            // when the meter is off — a 0 here would read as "nothing skipped".
+            row.idleFrac = (dexec > 0 && dcred > 0) ? +(1 - dexec / dcred).toFixed(4) : null;
+            // W4 plausibility. During boot MEM1 has not been laid out yet, so
+            // 0x801D3A54 / 0x801D4428 read whatever is resident and produced a
+            // 862,252,765/s "retrace rate" in the first measured run. A VI field
+            // counter cannot exceed ~60/s; anything above 1000/s is garbage, not
+            // a measurement, and must not be printed as one.
+            let dRt = null;
+            if (s.rt != null && _srPrev.rt != null) {
+              dRt = u32d(s.rt, _srPrev.rt);
+              const r = dRt / dw;
+              row.rtps = (r >= 0 && r <= 1000) ? +r.toFixed(2) : null;
+              row.rtRaw = +r.toFixed(2);
+            }
+            if (row.gcps != null && (row.gcps < 0 || row.gcps > 1000)) { row.gcRaw = row.gcps; row.gcps = null; }
+            row.path = (s.rate && s.rate.path) ? s.rate.path : null;
+            // THE PARKED-CORE CASE. W1/W2/W3 all read Dolphin's CoreTiming. On
+            // the recomp path (RECOMP_TITLES={MarioParty4:1}, gamecube.html:1044
+            // — a plain visit with MP4 selected routes there with NO query
+            // parameter) the recomp worker owns the game and dolphin's CoreTiming
+            // never advances, so all three read a hard 0. That is NOT a 0.000x
+            // guest clock; it is "this witness does not apply to this path".
+            // Printing it as 0x would be exactly the fabricated-number failure
+            // this rig exists to prevent.
+            row.dolphinParked = (dAidma === 0 && dcred === 0);
+            const wSet = [row.gAi, row.gAid, row.gCred].filter((x) => x != null);
+            row.spread = (wSet.length > 1 && !row.dolphinParked)
+              ? +(Math.max(...wSet) - Math.min(...wSet)).toFixed(4) : null;
+            if (row.dolphinParked) { row.gAi = null; row.gAid = null; row.gCred = null; }
+            const gx = (v) => (v == null ? 'n/a' : v + 'x');
+            console.log('[witness] t=' + row.tsec + 's  path=' + (row.path || '?')
+              + (row.dolphinParked
+                ? '  DOLPHIN CORETIMING PARKED (0 AI-DMA callbacks, 0 credited cycles) —'
+                  + ' W1/W2/W3 DO NOT APPLY on this path, this is NOT 0.000x'
+                : '  W1 ai_dma_cb=' + row.aiPerS + '/s (hw ' + row.hzAi + '/s) => ' + gx(row.gAi)
+                  + '  W2 aid_fire=' + row.aidPerS + '/s (hw ' + row.hzAid + '/s) => ' + gx(row.gAid)
+                  + '  W3 gt=' + gx(row.gCred)
+                  + '  spread=' + (row.spread == null ? 'n/a' : row.spread))
+              + '  idle-skip=' + (row.idleFrac == null ? 'METER-OFF(not 0%)' : (100 * row.idleFrac).toFixed(1) + '%')
+              + '  drawn=' + row.drawn + '/s  published=' + row.pub + '/s'
+              + '  W4 guestGC=' + (row.gcps == null ? 'n/a' : row.gcps + '/s')
+              + ' retrace=' + (row.rtps == null ? 'n/a' : row.rtps + '/s')
+              + '  [ticksHz=' + row.hz + ' period=' + row.aiPer + ' NumBlocks=' + row.nblk + ']');
             _srRows.push(row);
             if (s.head) console.log('[page-headline] t=' + row.tsec + 's  "' + s.head + '"');
             console.log('[scene-rate] t=' + row.tsec + 's  speed=' + row.speed.toFixed(3)
