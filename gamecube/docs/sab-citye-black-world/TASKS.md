@@ -451,7 +451,29 @@ textures is lost across a restore.
   `window.__probeStateSize` exists for exactly this compat check.
   **The screenshot from that run is a stale frame and is not evidence.**
 
-### F12. Open: which of the five commits, and why
+### F12. Open: which commit — FIVE narrowed to THREE on source
+
+Two of the five are **default-inert** and cannot be the cause of a run that
+passed only `?bjit_mips=1`:
+
+- **`c224b7c2`** (batch JIT blocks into shared wasm instances) is gated on SAB
+  cell `0x026B39A0`, "browser-zeroed 0 = OFF = one module per block =
+  byte-identical to the pre-change tree". `?bjit_batch` was never passed.
+- **`0b6b61e9`** adds only the `?noleafinline` kill switch; the gate is
+  `li_candidate && *AotCell(kLeafInlineOffCell) == 0u`, so with the cell zero the
+  path is byte-identical to `7a77e12e`.
+
+**Remaining: `8a4342e5` (leaf-inline splice, default ON), `b8314d0a` (4-slot
+publish ring: `WGPUGfx.cpp` +93, `gamecube.html` +410), `7a77e12e` (emitter:
+`jit_branch.cpp` +17, `ppc_emit.cpp` +36).** Note the publish ring is presentation
+-side and the HUD *does* update live across screenshots (the timer advances), so a
+stale-slot present is already argued against — but not excluded.
+
+Arms staged and queued (`/tmp/bw/snap-m{1,2}`, matched js/wasm, pinned page):
+`m1` = `8a4342e5` decides it alone — the OLD arm renders, so `m1` black ⇒
+`8a4342e5`; `m1` renders ⇒ `m2` decides between `b8314d0a` and `7a77e12e`.
+
+### F12a. The leaf-inline signals, and why they are NOT yet proof
 
 Two signals point at `8a4342e5`'s pure-leaf `bl` splice (idle-classifying SAB's
 VI-retrace frame governor), neither sufficient on its own:
