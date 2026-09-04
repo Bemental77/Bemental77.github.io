@@ -16,6 +16,12 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **`.rel` OVERLAY function, by execution** | **1 PASS** — `stg13D` `0x8121d80c`, §5g/§5h |
 | `bctr` jump tables | **145 of 147 recovered**, and one **PASS by execution** with a faulting control arm, §5b |
 | whole-image build at **`-O2`** | **builds, instantiates, 1056/0 bit-exact** — the "`-O0` is a real scaling constraint" note was an artifact worth **~24x**, §5j |
+| **DOL functions verified by execution** | **330 distinct, bit-exact** of 375 attempted — 44 of the top-120 hot functions, 19.92% of sampled PCs, §9.5 |
+| **`bctr` jump tables, by execution** | **43 verified**, with a **47-for-47 falsifying control arm** (no-`--jumptables` build: 46 fault, 1 stack-exhausts), §9.5 |
+| **`blrl` dispatch, by execution** | **48 of 48** fixtures carry an offline proof that the target was unreachable by direct calls, §9.5 |
+| **overlay `bctr` recovery, all 76** | **1,189 of 1,195 (99.5%)** relocated vs **0 of 1,195** raw; 18,246 targets, 0 bogus, §9.1 |
+| **whole-image runtime completeness** | **99.88%** of 5,923,824 instructions (was 92.43% with the overlay half unrecovered), §9.2 |
+| translator divergence found by the survey | **1** — `fctiwz` negative-zero high word, 620 sites exposed; fixed, §9.5 |
 | **whole-image throughput** | **0.50-0.54x** translated-code on the one HOT-path fixture, 2 runs (0.62x on four non-hot ones), Chrome, vs a same-session JIT baseline of **0.4450x** — NOT a system rate, §8 |
 | **guest OS CONTEXT SWITCH** | **WORKS** — 63 assertions / 0 failures, incl. a three-thread non-LIFO rotation on three real host threads and a control arm that reproduces `0xe00e78ac` with the host layer off. §6 (superseded there) and [`recomp/sr/CONTEXT_SWITCH.md`](../../recomp/sr/CONTEXT_SWITCH.md) |
 
@@ -65,6 +71,7 @@ and `b401f282`:
 | `sab_nonleaf_fixtures.json` | 7 replayable non-leaf fixtures (registers + ordered memory-write log) |
 | `build_slice.sh` / `build_rel.sh` / `verify_slice.mjs` / `verify_fixture.mjs` | build + differential |
 | `coverage_census.py` | **new in this pass** — every-blocker census + boundary-policy comparison |
+| `test_lc_model.c` | native C, no emscripten: asserts the region model (locked L1 = real memory, WPAR = write-only sink). Build it twice — plain, and with `-DSR_NO_LC_MODEL` for the falsification control arm — and **both must pass**, on inverted expectations. See §5k. |
 
 MP4's separate decomp→wasm path lives one level up in `gamecube/recomp/` and is a
 different lineage; nothing here depends on it.
@@ -1168,8 +1175,33 @@ ROM_IDX=1 PROBE_HEADLESS=0 PROBE_DURATION_MS=75000 node gamecube/tools/dolphin_r
 [guestclock:throttled] ai_dma_cb=1781.56/s (hw 4003.56/s) => guest=0.4450x  aid_fire=89.07
 ```
 
-**`guest = 0.4450x`.** Both witnesses agree (1781.56/4003.56 = 0.44500;
-89.07/200.18 = 0.44495). This is *higher* than the 0.4115x in
+**`guest = 0.4450x`.** ~~Both witnesses agree~~ (1781.56/4003.56 = 0.44500;
+89.07/200.18 = 0.44495).
+
+> **⚠ TWO CORRECTIONS TO THIS BASELINE, both received 2026-09-04 after §8 was written.
+> Neither is re-measured here; both are recorded so the number is not re-quoted as it
+> stands.**
+>
+> 1. **`ai_dma_cb` and `aid_fire` are TWO READINGS OF ONE CLOCK, not independent
+>    corroboration** (established by a concurrent agent). Their agreement to 5 decimal
+>    places is arithmetic, not evidence. `published/s` and `drawn/s` are the genuinely
+>    separate metrics; the same agent voided a live A/B on the grounds that the AI-DMA
+>    witness said +17.1% while `peFrames`/`published`/`shown` all said −21%, and two
+>    guest-side counters disagreeing in DIRECTION means a dirty rig, not a finding.
+> 2. **THIS IS AN UNMATCHED PAIR IN THE V8 TIER, and §8.4's "~1.1-1.2x the JIT" rests
+>    on it.** When this baseline was taken, `dolphin_render_probe.js` defaulted its V8
+>    flags to `--no-liftoff`, forcing every wasm module straight into TurboFan — a
+>    configuration **a web page cannot request**. The SR arm was measured by
+>    `perf_browser.mjs`, which launches Chrome with `args: ['--no-sandbox',
+>    '--disable-dev-shm-usage']` (`perf_browser.mjs:211`) and therefore ran on **stock
+>    V8**. So the JIT arm had a tier advantage the SR arm did not. Commit `d7c3415b`
+>    changed the probe default to empty; commit `6c210459` sizes the tier at 2.108x on
+>    emitted bodies, of which ~1.164x is the residual the flag was handing the JIT arm
+>    under stock V8. **Re-take both arms under the same flag before quoting any ratio
+>    from §8.1/§8.4.** Matched-pair ratios taken off one binary (§5j's `-O0`/`-O2`
+>    columns, §8.1a's two runs) are unaffected.
+
+This is *higher* than the 0.4115x in
 `gamecube/docs/sab-frame-governor/TASKS.md:20-21`, and the phase-snap says why: that
 document's "Open" item landed — `"leafInline":"4851/15/15/219 lastIdlePc=80117e0c"`,
 i.e. the frame-governor loop at `0x80117e0c` is now being idle-collapsed. Quote
@@ -1429,6 +1461,12 @@ to carry is the hot-path one:
 | `HandleReverb`, hot, 3% control, 2 runs | **0.50x-0.54x** | **1.13-1.21x** | **1.86-2.00x** |
 | four non-hot fixtures, aggregate | 0.621x | 1.40x | 1.61x |
 
+> **⚠ THE "vs JIT" COLUMN IS AN UNMATCHED PAIR — see the boxed correction in §8.1.**
+> The JIT arm was measured with the probe forcing `--no-liftoff` (TurboFan-only, a
+> configuration a web page cannot request); the SR arm ran on stock V8. The ratio must
+> be re-taken with both arms under the same flag. The `0.50-0.54x` translated-code
+> figure itself is a stock-V8 number and stands; it is the **comparison** that does not.
+
 **0.50-0.54x, i.e. ~1.1-1.2x the JIT, is the honest headline.** That is a much weaker result than
 "static recomp obviously escapes the JIT ceiling", and it is weaker in the direction that
 matters, because *every* remaining unknown pushes it down further, not up: the SR side
@@ -1445,6 +1483,312 @@ What DID change decisively this session is §5j: before the split-dispatch fix, 
 whole-image measurement would have read **~0.03x** and this route would have looked
 dead on arrival for a reason that was entirely an artifact of how one switch statement
 was emitted.
+
+## 9. Whole-image runtime completeness, and the wall moving from TRANSLATION to VERIFICATION
+
+Measured 2026-09-04, second pass. Three things were open. All three are now measured:
+what fraction of SAB's image translates **and can execute**; what stops the rest, by
+cause with counts; and whether the verified fraction is bounded by the translator, by
+the capture rig, or by the scene.
+
+### 9.1 The overlays' RUNTIME completeness was never measured. It is 99.5%.
+
+`rel.py --translatability ALL` is an **instruction-form** figure. It does not say a
+module can execute: under `--indirect` a `bctr` *translates* — into `sr_indirect()` —
+and then **faults**, because a switch case is an address inside a function and not a
+dispatchable entry. On the DOL that distinction is the whole gap between 82.0% and
+99.4% (§5b). For the 76 overlays — 93.64% of SAB's static instructions — it had never
+been measured, and `rel_emit.py`'s stg13D result was the only data point.
+
+`gamecube/recomp/sr/rel_jt_census.py` (new) measures it across every overlay, with the
+**unrelocated arm run as a control**, so the effect of applying OSLink's `Relocate()`
+offline is measured here rather than generalised from one module.
+
+```
+python3 gamecube/recomp/sr/rel_jt_census.py \
+  --iso "gamecube/roms/Sonic Adventure 2 - Battle (USA).iso" --raw-arm
+```
+
+| | relocated | raw (control) |
+|---|---|---|
+| `bctr` sites (de-duplicated) | 1,195 | 1,195 |
+| jump table **RECOVERED** | **1,189 (99.5%)** | **0 (0.0%)** |
+| case targets recovered | 18,246 | 0 |
+| …inside the same function (label) | 17,015 | — |
+| …another function start (tail call) | 1,231 | — |
+| …**misaligned, mid-other-function, or outside** | **0** | — |
+| runtime-complete instructions | **5,544,279 / 5,549,017 (99.91%)** | 5,103,003 (91.96%) |
+
+**74 of the 76 overlays are at 100%.** All 6 refusals are in two modules —
+`advertiseD.rel` 5, `titleD.rel` 1 — and each is named: 4 `table word not in image`
+where the table lives in a **BSS section**, whose runtime address genuinely is not
+derivable from the file (`OSLink.c:236-240` assigns it from OSLink's `bss` pointer) and
+must come from `__OSModuleInfoList`; 1 `table base r4 defined by op31` (the base is
+computed, not materialised by `lis`/`addi` — the same class as the DOL's 2 refusals);
+and 1 with no `lis`/`addi` at all. The census gives BSS and the null section a base in
+a distinct `0xB0......` window precisely so a table landing there is **visibly** not a
+code address rather than resolving to a plausible one.
+
+Three things are worth carrying:
+
+- **The control arm is the point.** 1,193 of the 1,195 raw-arm refusals are
+  `table word 0 at 0x00000000 not in image` — the shipped file words are
+  `R_PPC_ADDR32` placeholders and the data section is not even in the image. Applying
+  `Relocate()` offline is not an optimisation here, it is the entire mechanism.
+- **Zero of the 18,246 recovered targets is bogus.** A mis-recovered table base
+  produces garbage addresses and none appear — the same static check §5b applied to
+  the DOL's 3,983, at 4.6x the scale.
+- **⚠ A site whose two overlapping bodies DISAGREE is reported, not resolved.** One
+  exists (`CartD.rel`). The cause is structural: `recover_jump_table`'s backward
+  def-chain walk is bounded by the body's own start (`sr.py:230`, `:262`), so a body
+  that begins after the `lis` cannot see the table base. The first body's verdict is
+  taken and the disagreement is counted.
+
+> **TWO DENOMINATOR BUGS THIS CENSUS FOUND IN ITSELF.** Both inflated a headline, and
+> both are the same shape as traps already documented here.
+>
+> 1. **Reachability bodies OVERLAP, so counting per body double-counts.** The first run
+>    reported **1,818** `bctr` sites; a linear scan of the same sections finds
+>    **1,195**, i.e. the per-body figure was **1.52x** the truth and both the numerator
+>    and denominator of "99.1% recovered" were wrong. Instructions are worse: summed
+>    bodies come to 7,184,226 against 5,549,017 distinct — **29.5% double-counted**,
+>    *exceeding the executable sections themselves*. Only the union may be quoted. This
+>    is §3's 9.82% DOL-map trap, resurfacing on the overlay side.
+>    **`stg13D`'s recorded "0 of 23 → 23 of 23" was 23 body-visits of 15 distinct
+>    sites** (linear scan: 15 `bctr`, 0 `bctrl`). The ratio was right; the denominator
+>    was not.
+>    The census now runs the linear scan as its own control on **every** run and
+>    **raises** if the de-duplicated count exceeds it. Both instruments now agree
+>    exactly at 1,195 — and `rel.py --translatability ALL`, which derives its
+>    `1195 bctr/bctrl` a third independent way, agrees too.
+>    *(The DOL needs no such correction: its `outer+calls` boundary set was checked and
+>    has **zero** overlap — summed 374,807 = union 374,807 — and a linear scan finds
+>    exactly the 147 `bctr` the census reports inside mapped `.text`, plus 12 `bctr`
+>    and 1 `bctrl` bit-patterns that lie in DATA segments. So §5b's "not a single
+>    `bctrl` in the image" is right about code; the one `bctrl` encoding is data at
+>    `0x80176034`.)*
+> 2. **A missing base raised instead of counting.** `Rel.relocate()` looks the base up
+>    *before* it dispatches on relocation type, so a `R_DOLPHIN_NOP` naming section 0 —
+>    which writes nothing — still raised, and 4 overlays were silently absent from the
+>    first aggregate.
+
+### 9.2 Whole image
+
+| | instructions | runtime-complete |
+|---|---|---|
+| `main.dol` (mapped `.text`, `outer+calls`) | 374,807 | 372,401 (99.36%) |
+| 76 `.rel` overlays (de-duplicated) | 5,549,017 | 5,544,279 (99.91%) |
+| **total** | **5,923,824** | **5,916,680 (99.88%)** |
+
+Both DOL figures reproduce exactly (`sr.py --jumptable-census`: 145 of 147 sites,
+122 of 123 functions, 3,983 targets; `--coverage --indirect --jumptables`: 4,674 of
+4,741 functions, 372,769 instructions). The published overlay baseline reproduces too
+(`5551313 decoded / 5549137 clean / 0 PRIVILEGED`). Before this pass the overlay half
+was unmeasured; with its jump tables unrecovered the whole-image figure is **92.43%**.
+
+**Translation is not the wall** — with the denominator attached: 99.88% of 5.92 M
+PowerPC instructions translate *and* have every indirect branch statically resolved.
+
+### 9.3 The DOL's real blocker is ONE function, and it is not a translator gap
+
+Translating in isolation is not enough to build a fixture: the entry **and its whole
+transitive callee closure** must translate, or the emitted code calls `sr_extern()` and
+faults. §8.1d showed one instance. Measured across the whole DOL
+(`fixture_dol.py --shapes-only`, which delegates to `rel_shapes.classify`):
+
+| | functions | instructions |
+|---|---|---|
+| translate clean **with full callee closure** | **3,581 (75.5%)** | 240,714 (64.2%) |
+| blocked | 1,160 (24.5%) | 134,093 (35.8%) |
+
+and the blocked column is a handful of addresses, not a long tail:
+
+| blocking callee | functions | instructions | what it is |
+|---|---|---|---|
+| **`0x800e78ac`** | **745** | **99,587 (26.6% of `.text`)** | `OSDisableInterrupts` — one `mfmsr` |
+| `0x800e4e1c` | 99 | 10,855 | cache op `x470` |
+| `0x800e78d4` | 91 | 7,508 | `OSRestoreInterrupts` — `mfmsr` |
+| `0x800e4e4c` | 54 | 6,443 | `sc` |
+| `0x8011c18c` | 16 | 1,048 | mid-function branch target |
+| `0x80108e98` | 16 | 1,043 | `mfmsr` |
+| (its own `mfmsr`) | 14 | 291 | |
+| `0x800e55d4` | 13 | 908 | `mfmsr` |
+
+**One 24-byte guest function blocks 745 others — 15.7% of the image's functions and
+26.6% of its instructions — purely by sitting in their closure.** That is not a
+translator hole (the GAP class is still zero, §5); it is §6's host boundary, sized
+statically there at 66 functions / 0.54% of `.text`, re-sized here by its **blast
+radius**. It is owned by the concurrent context-switch work (`sr_host_os.c`, whose
+trace events already include `SR_EV_DISABLE_IRQ` / `SR_EV_ENABLE_IRQ` /
+`SR_EV_RESTORE_IRQ`); this table is what landing it is worth. Nothing here implements
+it — it is left as an explicit unimplemented boundary, and every candidate whose
+closure touches it is excluded by construction.
+
+### 9.4 Changing the DRIVING METHOD for `main.dol`, not the translator
+
+The DOL had no survey. It had `fixture_nonleaf.py --discover` (arm breakpoints, count
+hits) and then `--capture` **one address at a time**, each of which has to reach its
+entry a **second** time — so a function that runs once per scene is refused, which is
+exactly the class a survey is for. The overlays got `fixture_rel.py --survey` (capture
+at the moment the breakpoint fires, `at_entry=True`); the DOL never did.
+
+`gamecube/recomp/sr/fixture_dol.py` (new) is that survey for `main.dol`. It **reuses
+`fixture_rel.survey_waves` unchanged** — `base = 0`, offsets are absolute guest
+addresses — so it inherits all five hard-won properties instead of re-deriving them:
+capture-at-fire, never abandoning a `cont` (this stub has no async break), a calibrated
+rare-but-live control anchor, delete-on-fire enumeration, and leaving enumeration early
+while control is still available. Candidates are gated **offline** on closure-clean
+translation under the same `--indirect --jumptables` the whole-image build uses (§9.3),
+then selected round-robin across shape buckets, rarest first.
+
+Two runs, same parked City Escape savestate, oracle `/Applications/Dolphin.app`
+(STATE_VERSION 177), connect `pc=0x801012b4` — the §5h restore tell, so the state
+loaded rather than cold-booting. Both under `tools/probe_lock.sh`.
+
+| | armed | executed here | captured | usable |
+|---|---|---|---|---|
+| run 1 (shape-spread sample) | 300 | 66 | 65 | 59 |
+| run 2 (**every eligible entry**) | 2,704 | 373 | 372 | 336 |
+| **distinct** | | | **375** | |
+
+**Every capture wave took 100% of its live set** — 23/23, 24/24, 18/18 in run 1 and
+32/32 nine times in run 2, i.e. **437 of 437 attempts**, at ~2.5 s each. (The one
+executed entry per run that is not captured is the control anchor, which `survey_waves`
+excludes from its own waves by construction.) Nothing was lost to the "never reached
+again" refusal that dominated the one-at-a-time flow. **All 2,331 run-2 refusals have a
+single cause: `never executed in this scene`.**
+
+### 9.5 RESULT — 330 DOL functions verified bit-exact, and one real translator bug
+
+Replayed against a **whole-image** build (all 4,671 translated functions, `--indirect
+--jumptables`, `-O0`, wasm md5 `402d92fbc37861830d9565e73f1e92ab`, identical before and
+after every run):
+
+```
+SUMMARY  385 verified / 437 attempted / 42 refused
+```
+
+De-duplicated across the two runs: **330 distinct DOL functions PASS**, 8 FAIL, 37 SKIP.
+For scale, the entire prior DOL record was 4 leaf functions + 7 non-leaf + 3 `blrl` +
+1 `bctr`. **No entry passes in one run and fails in the other**, which is a free
+consistency check on 55 functions captured twice from independent invocations.
+
+**44 of the measured top-120 hot functions are verified, covering 19.92% of sampled
+PCs** (`profile_map.py`). §8.1c's attempt at the hot path was *11 attempted, 2 usable*;
+the difference is not a better rig, it is that the locked L1 stopped being a blanket
+refusal (§5k) and that capture stopped costing a second traversal.
+
+#### The one real divergence, and it was found BY EXECUTION
+
+Of the mismatches, exactly one carried **no fault** — `0x80023ba0`, 492 of 495 write
+events identical, differing in a single byte:
+
+```
+write events: want 495, got 492
+write event #287: want [0x3c11eb]=1 got [0x3c11eb]=0
+```
+
+That byte is the high word of an `stfd` at `0x801115ec`, and the value stored was
+produced by `fctiwz f0, f0` one instruction earlier at `0x801115e8`. `fctiwz` leaves the
+high 32 bits architecturally undefined, and the reference interpreter fills them by a
+rule `sr.py` did not model —
+`~/gc_refs/dolphin/.../Interpreter_FloatingPoint.cpp:135-137`:
+
+```cpp
+u64 result = 0xfff8000000000000ull | value;
+if (value == 0 && std::signbit(b))     // "Based on HW tests"
+  result |= 0x100000000ull;
+```
+
+A small **negative** operand that truncates to integer 0 is distinguishable from `+0`.
+`sr.py` emitted only `0xFFF8000000000000ull | value`. Fixed; the fixture now passes with
+all 495 write events bit-identical, and **620 `fctiwz` sites across 264 DOL functions
+were exposed to it**.
+
+> This is the argument for a *broad* differential in one data point. The gap is
+> invisible to inspection, invisible to the 1,056 leaf vectors, invisible to the 7
+> committed non-leaf fixtures, and only observable at all because the guest happens to
+> spill the result to memory with `stfd` where the ordered write log can see it.
+
+**Every remaining mismatch is a host-boundary fault, not a translation divergence**, and
+the fault code names the callee: 4× `0xe00e78ac` (`OSDisableInterrupts`, `mfmsr`), 5×
+`0xe0113fc0` (`mtspr SPR913`), 1× `0xe1212248` (an indirect call into `stg13D` overlay
+code, absent from a DOL-only build). All are on the 70-function skiplist or outside the
+image, and all were reached through an **indirect** call — which the offline closure
+gate cannot see. So that gate is necessary but not sufficient, and the residual is
+§9.3's boundary rather than anything the translator got wrong.
+
+> **A regression gate ran first, on both builds.** The committed non-leaf, `blrl` and
+> `bctr` suites score **12 verified / 16 attempted / 0 mismatched** before and after the
+> `fctiwz` change. That matters more than usual here: these builds link `gekko_rt.h` /
+> `sr_driver.c` from a working tree a concurrent agent was editing, so each snapshot's
+> inputs were hash-recorded and the prior results re-proved before any new number was
+> taken.
+
+#### The jump-table control arm, at 47x its previous scale
+
+`--jumptables` may only be credited on fixtures whose captured trace actually executed a
+`bctr`, and the pass must be paired with a build in which an unreached path faults.
+`survey_report.py --bctr-json` extracts exactly those, replayed against two whole-image
+builds **one flag apart**:
+
+| arm | wasm md5 | result |
+|---|---|---|
+| `--indirect --jumptables` | `402d92fbc37861830d9565e73f1e92ab` | **43 verified / 47** (4 = the `0xe0113fc0` boundary fault) |
+| **control: `--indirect`, NO `--jumptables`** | `93965999105a20bbb267bae06120878a` | **0 verified / 47** |
+
+Every control-arm failure is accounted for: **46 fault `0xE1......`** — `sr_indirect`'s
+"unresolved indirect target" — naming a mid-function switch label, and **1 exhausts the
+host stack**. That last one is worth keeping: where a recovered case label *coincides*
+with a function start, `sr_indirect` happily dispatches to it, the callee re-enters from
+the top, and the result is unbounded host recursion rather than a clean fault. So the
+no-jumptables build does not merely refuse — it can diverge silently until the stack
+dies. (Scored one process per fixture; a single crash otherwise truncates the run.)
+
+That takes the `--jumptables` evidence from **one** function verified by execution
+(§5b) to **43**, with a 47-for-47 falsifying control.
+
+#### `blrl` dispatch, proven offline from the captured trace
+
+`survey_report.py` recomputes, per fixture, the functions reachable from the entry
+through **direct `bl` edges only**, and reports which members of the trace's `entered`
+set fall outside it — those can only have been reached through an indirect branch.
+**48 of 48 `blrl`-executing fixtures carry that proof** (one entered 68 functions of
+which 67 are unreachable directly). This is §5b's argument mechanised, so it is re-run
+rather than re-written.
+
+### 9.6 The honest reading, and what is still open
+
+The bound on verification moved, and it is worth being exact about where it now sits:
+
+- **Capture cost is no longer the constraint.** 437 of 437 attempts succeeded at ~2.5 s
+  each.
+- **The scene is the constraint, and it binds far less on the DOL than on an overlay.**
+  373 of 2,704 eligible DOL entries (13.8%) execute in the parked City Escape scene;
+  the comparable overlay figure was 16 of 734. **The way to more breadth is more
+  SCENES, not a faster rig** — a second savestate is now the highest-value input to
+  this route.
+- **330 verified is 6.96% of the image's 4,741 functions**, and 44 of the top-120 hot
+  ones. That is the honest fraction; the other 93% is unverified, most of it because
+  this scene never runs it.
+
+What this does **not** show:
+
+1. Nothing here is a throughput measurement. §8's numbers are untouched (and carry
+   their own correction — see the boxed note in §8.1).
+2. `usable` is derived conservatively: a `ps1_dependency` marks a capture unusable here
+   as it does in `fixture_nonleaf.py`, even though `verify_fixture.mjs` would also
+   catch a real dependence by replaying twice. 11 captures were refused on that basis.
+3. **A second, unobserved `fctiw` gap is left open and named.** `fctiw` (xo=14, **8
+   sites in 1 DOL function**; `fctiwz` is xo=15 with 620) must round per FPSCR[RN], and
+   `sr.py` truncates unconditionally. It is not a one-line fix: Dolphin's own reference
+   (`RoundToIntegerMode`, `Interpreter_FloatingPoint.cpp:37-49`) implements it with the
+   2^52 add/subtract trick, which **delegates to the HOST rounding mode** — and wasm has
+   no dynamic rounding mode to set. Modelling the three non-default modes needs an
+   explicit transcription, and until it exists this is an approximation living inside a
+   translator whose stated contract is to refuse rather than approximate.
+4. The offline closure gate cannot see indirect callees, so a candidate can still reach
+   the host boundary at run time (8 did).
 
 ## 7. Decision
 
