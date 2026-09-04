@@ -650,11 +650,28 @@ int sr_host_call(GekkoState *st, uint32_t addr) {
     // answer for it: an unimplemented boundary must stay an explicit fault rather
     // than become a silently-wrong body.  (CONTEXT_SWITCH.md §7.)
     if (g_mode == SR_OS_IRQ) return 0;
+
+    // ---- TIER 1: the context primitives that need NO HOST THREAD. --------------
+    // Straight-line transcriptions with no control transfer, so a host C function can
+    // BE them -- which is what makes SR_OS_CTX a mode a NON-pthread build can install.
+    // Each is byte-verified against the shipped words as well as against DOLSDK; see
+    // the per-function comments above and CONTEXT_SWITCH.md §3.
     switch (addr) {
     case SAB_OSSetCurrentContext:  os_set_current_context(st);  return 1;
     case SAB_OSGetCurrentContext:  os_get_current_context(st);  return 1;
     case SAB_OSClearContext:       os_clear_context(st);        return 1;
+    }
 
+    // ---- TIER 2: the save/load/switch triple, which needs the HOST THREAD POOL. --
+    // SR_OS_CTX stops here and REFUSES (return 0), so the caller's own unimplemented
+    // path faults and names the address.  It must not fall into the TRACE arms below:
+    // TRACE's OSLoadContext performs the register half and RETURNS instead of
+    // transferring control, which is exactly right for an oracle frozen at the rfi
+    // instant (CONTEXT_SWITCH.md §5, differential B) and exactly wrong for a running
+    // boot -- the eight non-SelectThread call sites are exception-RETURN paths, and a
+    // silent return from one of those is a wrong body, not a missing one.
+    if (g_mode == SR_OS_CTX) return 0;
+    switch (addr) {
     case SAB_OSSaveContext:
         if (g_mode == SR_OS_TRACE) {
             ctx_save(st, st->gpr[3]);
@@ -711,6 +728,14 @@ EMSCRIPTEN_KEEPALIVE int sr_os_init(int nthreads) {
 EMSCRIPTEN_KEEPALIVE int sr_os_init_irq(void) {
     sr_host_hook = sr_host_call;
     g_mode = SR_OS_IRQ;
+    return 1;
+}
+// SR_OS_CTX's init.  Same shape as sr_os_init_irq(): no pthread_create, no thread
+// pool, nothing from <pthread.h>.  The three primitives it adds hold no host state
+// beyond g_msr, which SR_OS_IRQ already owns.
+EMSCRIPTEN_KEEPALIVE int sr_os_init_ctx(void) {
+    sr_host_hook = sr_host_call;
+    g_mode = SR_OS_CTX;
     return 1;
 }
 EMSCRIPTEN_KEEPALIVE void     sr_os_mode(int m)          { g_mode = m; }

@@ -50,6 +50,29 @@
                          // host thread pool, and no `sr_os_init`.  See
                          // README.md §9.7 -- this is the boundary whose blast
                          // radius is 745 blocked DOL functions.
+#define SR_OS_CTX    4   // SR_OS_IRQ *PLUS* the three CONTEXT primitives that need
+                         // NO host thread: OSSetCurrentContext, OSGetCurrentContext
+                         // and OSClearContext.  Like SR_OS_IRQ it creates no thread,
+                         // calls nothing from <pthread.h> and needs no -pthread
+                         // (`sr_os_init_ctx()`); unlike SR_OS_HLE it does NOT answer
+                         // for OSSaveContext / OSLoadContext / SelectThread, which
+                         // stay REFUSED so the caller faults and names them.
+                         //
+                         // WHY THIS TIER EXISTS AT ALL, rather than "just link HLE".
+                         // The three it answers for are pure guest-memory + GPR + MSR
+                         // transcriptions of ~/gc_refs/dolsdk2001/src/os/OSContext.c
+                         // :200-238 and :390-395 -- straight-line code with no control
+                         // transfer, which is why a host C function can BE them.  The
+                         // three it refuses cannot be host C functions at this cut:
+                         // OSSaveContext is a setjmp that RETURNS TWICE and
+                         // OSLoadContext is its rfi (CONTEXT_SWITCH.md §2, measured to
+                         // throw out of the module under BOTH longjmp backends), so
+                         // they are reachable only through the SelectThread cut, one
+                         // host thread per guest thread, which needs -pthread and
+                         // sr_os_init().  Collapsing the two tiers into one mode would
+                         // make "the context boundary is on" mean two different things
+                         // depending on how the image was linked -- and the whole-image
+                         // boot is linked WITHOUT -pthread today (build_image.sh).
 
 // ------------------------------------------------- fault codes (0xC5 prefix)
 // Distinct from sr_extern (0xE0), sr_indirect (0xE1) and sr_call (0xBAD0) so a
@@ -310,5 +333,9 @@ int  sr_host_call(GekkoState *st, uint32_t addr);   // 1 = handled, 0 = not ours
 // This is what a plain (non-context-switch) build calls to get SR_OS_IRQ; the
 // thread pool belongs to SelectThread, and SelectThread is not in this mode.
 int  sr_os_init_irq(void);
+// The same, one tier up: SR_OS_CTX.  Still no host thread and still no -pthread --
+// see the SR_OS_CTX note above for exactly which three primitives that buys and why
+// the other three cannot come with them.
+int  sr_os_init_ctx(void);
 
 #endif
