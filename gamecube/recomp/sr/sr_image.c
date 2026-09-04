@@ -30,10 +30,14 @@
 //
 // ------------------------------------------------------------ WHAT THIS IS NOT
 // This is not a GameCube.  With -DSR_MMIO the device-register window is a BACKING
-// BUFFER (gekko_rt.h): a read returns the last value written.  Nothing here
-// completes a DVD transfer, advances a VI line counter, or delivers an interrupt.
-// Any boot that gets further because the window exists got further because it stopped
-// FAULTING on a store, not because the device answered.
+// BUFFER (gekko_rt.h) with EXACTLY ONE modelled register: EXI CR's TSTART bit, which
+// self-clears (see THE DEVICE BOUNDARY below, and note the falsifying control arm that
+// ships with it).  Every other register in the window is memory: a read returns the last
+// value written.  Nothing here completes a DVD transfer, advances a VI line counter, or
+// delivers ANY interrupt — and the second of those matters more than it looks, because
+// the guest's own device drivers wait on interrupt-cleared software flags as often as
+// they poll a register.  Any boot that gets further because this window exists got
+// further because it stopped FAULTING on a store, not because a device answered.
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
