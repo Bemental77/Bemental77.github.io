@@ -37,6 +37,7 @@ binary the truth table used (committed at `0b6b61e9`). Same savestate
 | `sab-ingame` (reference) | 11:2x campaign | 2.6 | black |
 | `sab-ingame-mips` (reference) | 11:2x campaign | 2.6 | black |
 | `repro-ingame` (this session) | 15:2x | **23** (median, 27 windows) | black, then renders |
+| `citye-gpu` (this session) | 16:0x | **22.6** (median, 26 windows) | black |
 
 `/tmp/gcw/repro-ingame.log`, `/tmp/gcw/repro-ingame.rows.json`,
 `/tmp/gcw/repro-t{42,70,140}.png`.
@@ -210,26 +211,57 @@ mismatch return (`:806-827`) is discarding anything on this build. It also
 clears the two uncounted exits inside `DrawIndexed`, since `ENCODED` equals
 `enter`.
 
-> ⚠ These `[gpu-boundary]` numbers were captured on the SAB **attract sequence**,
-> not on the restored City Escape scene. The equivalent run for City Escape is
-> queued; until it lands, "nothing is dropped" is established for the attract
-> path only.
+### F7. …and the same is true ON the black City Escape scene — THE ANSWER
+
+`/tmp/gcw/citye-gpu.log` re-runs the City Escape cell with the `[gpu-boundary]`
+census (same frozen binary, restore proven, load 10.57 at the end). The world is
+black again — third independent reproduction, `/tmp/gcw/citye-gpu-t60.png`,
+score 140 / `00:19:10` / 9 rings / live "B" prompt. Median over 26 steady
+windows (`t ≥ 55 s`):
+
+```
+speed 0.388x   drawn 22.6/s   ⇒ W5 = 58.2 implied fps  (NTSC 59.94 — corroborates)
+prim/frame 2,921        vert/frame 25,527
+fReal = fDrawn = dEnter = dEnc = 63,886      (EXACTLY equal, every window)
+nullPipe 0   bail 0   cull 0   zeroIdx 0   LOST 0   wgpuErr 0/t0
+viewport 640x480   scissor 640x480   vpDegen 0   ablation 0/0/0/0/0
+```
+
+**Every draw the guest submits for the black world is encoded into a render
+pass, with a correct full-screen viewport and scissor and no WebGPU validation
+error.** Nothing is dropped, culled, skipped or rejected anywhere between the
+FIFO decoder and the GPU.
+
+So the black world is **not** a lost-draw bug. The draws are issued and
+rasterized; they simply produce nothing visible. That places the defect
+downstream of submission — in the transform or the shading of those draws
+(vertex constants, texture binding/contents, TEV, blend or depth state) — and,
+per F5, in something specific to *this restored scene* rather than to restoring
+in general.
 
 ---
 
 ## 4. Working hypotheses on the black world, and their kill criteria
 
-Ranked by fit to F3/F4. **None of these is confirmed.** The measurement that
-separates them is described in §5.
+Ranked by fit to F3/F4 as they stood when this topic opened. **F6/F7 have since
+killed every hypothesis in this table**; it is kept because the kill criteria
+are the useful part.
 
-**Status after F5/F6: H1 and H2 are KILLED, and H3's general form is REFUTED.**
-What survives is scene-specific: something about *this state* — not about
-restoring in general, and not about the submit path — makes the world produce no
-pixels while its draws are encoded normally. The two live leads are (a) the
-City Escape state file is itself a bad artifact (it was written by the port on
-2026-08-29 and there is no evidence its video chunk was ever round-tripped), and
-(b) SAB's TMEM-preloaded textures (`GXLoadTexObjPreLoaded` is in the guest PC
-census) do not survive this particular restore. Neither is measured yet.
+**Status after F5/F6/F7.** H1 and H2 are dead, H3's general form is refuted, and
+the whole submit-path family is eliminated: `dEnc == fReal` exactly. What
+remains is scene-specific *shading or transform* state. The two live leads,
+neither measured:
+(a) the City Escape state file may itself be a bad artifact — it was written by
+the port on 2026-08-29, it is **not** derived from the native `GSNE8P.s01`
+(payload md5s differ: `87a44ff5…` vs `ac48ab65…`, and the sizes differ by
+29,424 B), and nothing has ever round-tripped its video chunk;
+(b) SAB's TMEM-**preloaded** textures — `GXLoadTexObjPreLoaded` is in the guest
+PC census, and preloaded textures are not re-hashed from guest RAM the way
+ordinary ones are, so a wrong TMEM image after restore would sample black
+without any counter noticing.
+The cheapest next experiment for both: in a run where the world has **recovered**
+(F4), `PROBE_SAVE_STATE` a fresh City Escape state and reload it. If the fresh
+state renders, the shipped 2026-08-29 artifact is the defect, not the code.
 
 | # | hypothesis | why it fits | kill criterion |
 |---|---|---|---|
@@ -241,7 +273,7 @@ census) do not survive this particular restore. Neither is measured yet.
 
 ---
 
-## 5. The measurement that separates H1/H2/H3 (no rebuild needed)
+## 5. The measurement that separates H1/H2/H3 (RUN — see F6/F7)
 
 Every cell below already has a live writer in the shipping binary — the flush
 census is on unless `0x026B3A00` is set (`VertexManagerBase.cpp:126-146`) — so
