@@ -2431,6 +2431,41 @@ The committed context-switch suite is a regression gate on this change and is
 unchanged: `verify_ctxsw.mjs` **63 passed, 0 failed**, including its own control arm
 D (`sr_os_mode(0)` → `0xe00e78ac`).
 
+#### Capturing the 499: what the first attempt cost, and the knob that caused it
+
+The 499 have never been armed, so they need a fresh oracle run. The first attempt
+**aborted with 0 captured**, and the cause is worth recording because it is a knob this
+tool already documents:
+
+```
+[survey] anchor = +0x800e7c74, 2 hits in 60s = one per 30.0s; 58 candidates fired during calibration
+[survey] enumerating which of 485 candidates execute here (delete-on-fire, up to 420s) ...
+[survey]   50 fired, 435 still armed, t+4s
+[survey]   60 fired, 425 still armed, t+126s
+[survey]   90 fired, 395 still armed, t+182s
+[survey] ABORTED: TimeoutError: timed out
+```
+
+485 candidates were armed (`--max-arm 500 --max-closure 160`) against the tool's
+documented defaults of 300 / 40. `survey_waves`' own docstring says why that is the
+wrong direction — *"with 300 breakpoints armed on per-frame functions the interpreter
+is stopped almost continuously and buys almost no EMULATED time"* — and this set is
+worse than a shape spread for exactly that reason: it is drawn from the newly-unblocked
+pool, which is disproportionately **hot**. The trace shows it directly: 50 candidates
+fired in the first 4 seconds and the next 10 took 122. Emulated time then crawled
+slowly enough that the anchor's calibrated 30 s period stretched past the 180 s `cont`
+deadline, and **abandoning a `cont` is not recoverable on this stub** (§9.4), so the
+run ends rather than degrading.
+
+Two things this does establish, at no extra cost:
+
+- **At least 148 of the 499 execute in the parked City Escape scene** — 58 fired during
+  the 60 s anchor calibration and 90 more during enumeration, all of them newly-unblocked
+  entries. Against the baseline set's 373 of 2,704 (13.8%), this pool is far denser,
+  which is what a hot pool should be.
+- The failure is a **cost** knob, not a correctness one. Nothing here says the
+  candidates are unreachable.
+
 **What these 4 are and are not.** They are proof the primitive is correct and
 load-bearing — but their *entries* were already closure-clean, and they reach
 `OSDisableInterrupts` through a `blrl`ed callee, which is §9.6's residual item 4.
