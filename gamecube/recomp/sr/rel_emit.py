@@ -76,6 +76,38 @@ def emit_at_real_base(a, m, ent, res, dimg, dol_by, base):
 
     img = sr.Image()
     img.segs.append((base, blob))
+    # DATA SECTIONS, RELOCATED.  Without them every `bctr` switch table reads "not in
+    # image" and the site falls back to sr_indirect(), which FAULTS when executed --
+    # measured on stg13D: 0 of 23 sites recovered without this, 23 of 23 with it.
+    # The tables live in sec5 (a 2,620,456-byte file-backed data section) and their
+    # entries are R_PPC_ADDR32 relocations, so the RAW file words are placeholders;
+    # Rel.relocate() applies OSLink's own Relocate() offline.  That transcription is
+    # verified against ground truth: on sec1 it reproduces the live bytes read back
+    # out of the machine exactly (377,296 bytes, 18,818 words changed).
+    if a.sections:
+        # Same synthetic base for any module that is NOT resident as mod_vbase uses,
+        # so a cross-overlay reference stays obviously-not-a-real-address instead of
+        # crashing the relocation or, worse, landing on a plausible one.
+        bases = collections.defaultdict(
+            lambda: 0, {(mid, s): 0xA0000000 + (mid << 20) + (s << 12)
+                        for mid, r in m.all_relocs() for s in (r["ref_sec"],)
+                        if mid not in (0, m.id)})
+        bases[(m.id, sec)] = base
+        bases.update({(m.id, i): addr for i, (addr, _sz, _x) in a.sections.items()})
+        want = [i for i, (_a, _s, ex) in a.sections.items()
+                if not ex and i != sec and m.sections[i]["size"]
+                and not m.sections[i]["bss"]]
+        if want:
+            relocated = m.relocate(bases, sections=want)
+            for i in want:
+                img.segs.append((a.sections[i][0], relocated[i]))
+            print(f"[rel_emit] loaded {len(want)} relocated data section(s): "
+                  + ", ".join(f"sec{i}@{a.sections[i][0]:#010x} "
+                              f"{len(relocated[i])}B" for i in want))
+    else:
+        print("[rel_emit] WARNING: no section table given (--sections / --entries-from), "
+              "so DATA sections are absent from the image and every `bctr` jump table "
+              "will refuse to recover.", file=sys.stderr)
     if dimg is not None:
         img.segs += dimg.segs
     img.segs.sort()
@@ -106,7 +138,7 @@ def emit_at_real_base(a, m, ent, res, dimg, dol_by, base):
             continue
         size = byaddr[x][0]
         t = sr.Translator(img, x, x + size, starts=starts, branch_reloc=breloc,
-                          indirect=a.indirect)
+                          indirect=a.indirect, jumptables=a.jumptables)
         try:
             t.translate()
         except sr.Untranslatable as e:
@@ -119,7 +151,8 @@ def emit_at_real_base(a, m, ent, res, dimg, dol_by, base):
         raise SystemExit(2)
 
     fns = sorted((x, byaddr[x][0], byaddr[x][1]) for x in seen)
-    src = sr.emit_c(img, fns, starts=starts, branch_reloc=breloc, indirect=a.indirect)
+    src = sr.emit_c(img, fns, starts=starts, branch_reloc=breloc, indirect=a.indirect,
+                    jumptables=a.jumptables)
     os.makedirs(os.path.dirname(a.out) or '.', exist_ok=True)
     open(a.out, 'w').write(src)
     nov = sum(1 for x, _, _ in fns if x in ov_by)
@@ -132,7 +165,7 @@ def emit_at_real_base(a, m, ent, res, dimg, dol_by, base):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--iso', required=True)
-    ap.add_argument('--rel', required=True)
+    ap.add_argument('--rel')
     ap.add_argument('--out', required=True)
     ap.add_argument('--dol', default='/tmp/sr_slice/main.dol')
     ap.add_argument('--map', default='dolphin_captures/sab.map')
@@ -144,6 +177,11 @@ def main():
     ap.add_argument('--entry', action='append', default=[],
                     help='with --base: emit only these RUNTIME addresses and their '
                          'transitive callee closure (overlay AND DOL)')
+    ap.add_argument('--entries-from',
+                    help='a fixture JSON written by fixture_rel.py: emit exactly the '
+                         'functions it captured, and take --base from its rel_base. '
+                         'A SURVEY has one root per captured function and transcribing '
+                         'them by hand is how a build and its fixtures drift apart.')
     ap.add_argument('--live-section',
                     help='binary dump of the RELOCATED executable section, as written by '
                          'fixture_rel.py alongside its fixtures. Required for a '
@@ -151,9 +189,50 @@ def main():
                          'placeholder.')
     ap.add_argument('--indirect', action='store_true',
                     help='route blrl/bctr/bctrl through sr_indirect()')
+    ap.add_argument('--jumptables', action='store_true',
+                    help='static switch-table recovery for `bctr` (sr.Translator.'
+                         'recover_jump_table).  Requires --indirect: without it a bctr '
+                         'does not translate at all, and with --indirect ALONE it '
+                         'translates to sr_indirect() and then FAULTS at run time, '
+                         'because a switch case is an address INSIDE a function and '
+                         'therefore not a dispatchable entry.  A survey that wants to '
+                         'cover the bctr shape needs both.')
+    ap.add_argument('--sections-arg', dest='sections_arg', action='append', default=[],
+                    help='idx=hexaddr for a module section, repeatable.  Only needed '
+                         'when no --entries-from JSON carries rel_sections (which '
+                         'fixture_rel.py records from __OSModuleInfoList).  Sizes come '
+                         'from the REL header; only the runtime base is unknown.')
     ap.add_argument('--boundaries', default='outer+calls',
                     help='DOL boundary-recovery policy for the callee side')
     a = ap.parse_args()
+    a.sections = {}
+    if a.entries_from:
+        import json
+        j = json.load(open(a.entries_from))
+        a.sections = {int(k): v for k, v in (j.get("rel_sections") or {}).items()}
+        # Emit every CAPTURED function, including the ones verify_fixture.mjs will
+        # refuse.  A refusal must print its named reason ("touches addresses outside
+        # MEM1", "usable:false"), and it can only do that if the function is IN the
+        # build -- otherwise it prints "not in this build", which is a different and
+        # misleading claim.
+        a.entry += [f"{fx['entry']:#010x}" for fx in j["fixtures"]]
+        a.base = a.base or f"{j['rel_base']:#x}"
+        a.rel = a.rel or j["rel"]
+        if not a.live_section:
+            a.live_section = j.get("live_section")
+        print(f"[rel_emit] {a.entries_from}: {len(j['fixtures'])} captured function(s), "
+              f"rel={a.rel} base={a.base}, live-section={a.live_section}")
+    if not a.rel:
+        raise SystemExit("--rel is required (or supply it via --entries-from)")
+    for spec in a.sections_arg:
+        i, addr = spec.split('=')
+        a.sections[int(i)] = [int(addr, 16), 0, False]
+    if a.jumptables and not a.indirect:
+        raise SystemExit("--jumptables requires --indirect (a bctr does not translate "
+                         "at all without it)")
+    if a.jumptables and not a.base:
+        raise SystemExit("--jumptables is only wired into the --base (real-address) "
+                         "path; the symbolic path would silently ignore it")
 
     dol_starts, dol_by, dimg = set(), {}, None
     if os.path.exists(a.dol) and os.path.exists(a.map):
@@ -165,6 +244,13 @@ def main():
     disc = R.Disc(a.iso)
     ent = next(f for f in disc.files if f["name"] == a.rel or f["path"].endswith(a.rel))
     m = R.Rel(disc.read_file(ent), ent["path"])
+    # An overlay calls DOL entry points its own relocation table names but the DOL's
+    # call graph never does -- see rel.split_dol_units_for().
+    if dimg is not None:
+        dunits = R.split_dol_units_for(
+            m, [(lo, sz, nm) for lo, (sz, nm) in dol_by.items()], verbose=True)
+        dol_by = {lo: (sz, nm) for lo, sz, nm in dunits}
+        dol_starts = set(dol_by)
     res = R.translate_module_reach(m, dol_starts=dol_starts)
 
     if a.base:

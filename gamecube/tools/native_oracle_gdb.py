@@ -259,6 +259,16 @@ class GDB:
             a += k
         return bytes(out)
 
+    def settle(self, timeout=30.0):
+        """Restore the socket timeout.
+
+        `_read_packet(timeout=...)` SETS the socket timeout and never restores it, so
+        after a deliberately-short `cont(timeout=15)` every later command inherits 15 s
+        -- including ones issued when the stub is busy.  Observed as a bare
+        `TimeoutError: timed out` from `add_bp` at the start of the NEXT capture, which
+        reads like the emulator died and is only a leaked deadline."""
+        self.sock.settimeout(timeout)
+
     def cont(self, timeout=120.0) -> str:
         """Resume. Blocks until a breakpoint hits (no async break exists).
 
@@ -327,7 +337,7 @@ class Dolphin:
     """Headless native Dolphin with the GDB stub up and a savestate resident."""
 
     def __init__(self, iso=SAB_ISO, state=SAB_STATE, port=9123, log=None,
-                 dual_core=True, extra=(), binary=None):
+                 dual_core=True, extra=(), binary=None, gfx="Metal"):
         self.port = port
         self.log_path = log or f"/tmp/sabcensus/dolphin_{port}.log"
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
@@ -340,10 +350,29 @@ class Dolphin:
             "-C", "Dolphin.Core.CPUCore=1",
             # MANDATORY: without this the JIT emits no breakpoint checks at all.
             "-C", "Dolphin.Interface.DebugModeEnabled=True",
-            # Metal, not Null: the Qt app is the working binary and Null is not a
-            # path it is exercised on.  Audio is forced off -- two concurrent
-            # Dolphins corrupt CoreAudio's heap (crash 2026-08-29-170318).
-            "-C", "Dolphin.Core.GFXBackend=Metal",
+            # A GUEST PANIC IS A BLOCKING MODAL AND NOTHING CLICKS IT.  Observed
+            # 2026-09-04 mid-capture: "Unknown Pointer 0x20000030  PC 0x801160b8
+            # LR 0x812004dc" with [Ignore for this session]/[OK].  Under -b the
+            # process then stalls forever and every RSP read times out, which reads
+            # as "the stub never answered" rather than "a dialog is up".  Off, the
+            # same condition is a log line (Config::MAIN_USE_PANIC_HANDLERS,
+            # Source/Core/Core/Config/MainSettings.cpp:431).
+            "-C", "Dolphin.Interface.UsePanicHandlers=False",
+            # THE `-C` SYSTEM NAME FOR Dolphin.ini IS "Dolphin", NOT "Main".
+            # Config.cpp:158 maps System::Main -> "Dolphin", and
+            # CommandLineParse.cpp:54-60 SILENTLY DROPS a location whose system name
+            # does not resolve -- so `-C Main.General.GDBPort=...` sets nothing and
+            # says nothing.  The C++ Info<> objects are declared with System::Main,
+            # which is what makes "Main" look right in the source.
+            #
+            # Video: Null by default for a capture run.  Metal SEGV'd on the CPU-GPU
+            # thread (EXC_BAD_ACCESS at 0x0 in Dolphin 2603a, parent process Python,
+            # 2026-09-04) and a GDB-stub capture renders nothing it reads back.  Null
+            # is always registered (VideoBackendBase.cpp:245), unlike Software, which
+            # is compiled in only under HAS_OPENGL/__LIBRETRO__ (:242-244).  Audio is
+            # forced off -- two concurrent Dolphins corrupt CoreAudio's heap
+            # (crash 2026-08-29-170318).
+            "-C", f"Dolphin.Core.GFXBackend={gfx}",
             "-C", "Dolphin.DSP.Backend=No Audio Output",
             "-C", f"Dolphin.General.GDBPort={port}",
             *extra,
@@ -555,7 +584,8 @@ MEM1_LO, MEM1_HI = 0x80000000, 0x81800000
 
 
 def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000,
-                               progress=None):
+                               progress=None, cont_timeout=120.0, prefetch=None,
+                               at_entry=False):
     """capture_fixture + everything needed to RE-RUN the invocation elsewhere.
 
     capture_fixture records what changed.  To replay a function in the recompiled
@@ -568,22 +598,55 @@ def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000
     Also returns the executed instruction stream, which the caller needs to decide
     whether the fixture depends on incoming PS1 lanes (the GDB stub cannot read
     PS1, so a fixture that does is NOT replayable and must be rejected, not fudged).
+
+    `cont_timeout` bounds ONE read of the stop packet.  A SHORT value here is a trap
+    and it cost a run: `cont()` sends 'c' and the guest keeps running, and this stub
+    has NO async break, so a client that abandons the read and then sends anything
+    else is permanently one packet behind.  Measured, with cont_timeout=15 on
+    candidates that fired during discovery but not again: two abandoned conts, then
+    `ConnectionResetError` and `BrokenPipeError` on EVERY later capture -- which reads
+    exactly like Dolphin crashing and is entirely self-inflicted.  The way to survey
+    many functions cheaply is `at_entry` below, NOT a short deadline.
+
+    `prefetch` is {guest_addr: instruction_word} used instead of an `m` packet for the
+    instruction fetch.  For a REL overlay the relocated section has already been read
+    out of the machine in full (fixture_rel.py writes it next to the fixtures), so
+    every overlay instruction fetch can be served locally.  `syms` does the same job
+    for the DOL, but a symbol map cannot cover an overlay -- it has no symbols.
+
+    `at_entry` says the caller ALREADY holds the cpu stopped at `entry`, because its
+    own breakpoint just fired there.  A SURVEY needs this: otherwise every capture has
+    to reach the entry a SECOND time, and a function that runs once per scene never
+    does -- so the rarest functions, which are exactly the ones a survey is for, are
+    the ones that get refused.  The caller owns removing its own breakpoints before
+    this steps.
     """
-    g.add_bp(entry)
-    for _ in range(4000):
-        rep = g.cont(timeout=120.0)
-        if GDB.stop_pc(rep) == entry:
-            break
-    else:
-        raise RSPError(f"never reached {entry:#010x}")
-    g.del_bp(entry)
+    if not at_entry:
+        g.settle()        # a previous bounded cont() leaves its short deadline behind
+        g.add_bp(entry)
+        try:
+            for _ in range(4000):
+                rep = g.cont(timeout=cont_timeout)
+                if GDB.stop_pc(rep) == entry:
+                    break
+            else:
+                raise RSPError(f"never reached {entry:#010x}")
+        except (socket.timeout, TimeoutError) as e:
+            g.settle()
+            g.del_bp(entry)
+            raise RSPError(f"never reached {entry:#010x} in {cont_timeout:.0f}s") from e
+        g.settle()
+        g.del_bp(entry)
     g.resync()
+    pc_now = g.pc()
+    if pc_now != entry:
+        raise RSPError(f"not stopped at {entry:#010x} (pc={pc_now:#010x})")
 
     st_in = g.arch_state()
     ret_addr = st_in["lr"]
     sp_in = st_in["gpr"][1]
 
-    body = {}
+    body = dict(prefetch) if prefetch else {}
     if syms:
         s = symbolize(syms, entry)
         if s:
@@ -595,6 +658,12 @@ def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000
     initial = {}          # guest addr -> byte, as of entry
     written = set()       # bytes this invocation has already written
     outside = set()       # non-MEM1 addresses touched
+    # ...and HOW.  A region this harness cannot stage is only fatal if the function
+    # READS from it: a write-only region (the GX write-gather pipe at 0xCC008000, and
+    # possibly the locked cache used purely as a scratch destination) needs somewhere
+    # to put the bytes, not a staged initial value.  Recording the direction is what
+    # makes that distinction available instead of refusing the whole class blind.
+    outside_kind = {}
     steps, pc = 0, entry
     while steps < max_steps:
         word = body.get(pc)
@@ -623,6 +692,8 @@ def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000
                                         "kind": "load"})
                 else:
                     outside.add(ea)
+                    outside_kind[ea] = ('both' if outside_kind.get(ea) == 'store'
+                                        else 'load')
 
         pend = decode_store(word, gpr)
         if pend and pend[0] == "unknown":
@@ -632,13 +703,48 @@ def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000
         if pend:
             ea, size = pend
             if not (MEM1_LO <= ea and ea + size <= MEM1_HI):
+                # DO NOT ASK THE STUB FOR IT.  This used to read the pre-image
+                # unconditionally, and an `m` packet for a GEKKO LOCKED CACHE address
+                # (0xE0000000..) walks Dolphin into an inconsistency between two of
+                # its own predicates and takes the emulator with it.  The chain, all
+                # in this tree:
+                #   GDBStub.cpp:828  gates on MMU::HostIsRAMAddress, which
+                #   MMU.cpp:926-929  answers TRUE for segment 0xE inside the L1 cache
+                #   GDBStub.cpp:833  so it calls Memory::GetPointerForRange, which
+                #   Memmap.cpp:634   calls GetSpanForAddress, which
+                #   Memmap.cpp:723   masks the address with 0x3FFFFFFF and has NO
+                #                    L1-cache arm, so
+                #   Memmap.cpp:740   PanicAlertFmt("Unknown Pointer ...") and returns
+                #                    an empty span, and
+                #   Memmap.cpp:636-640 turns that into a nullptr, which
+                #   GDBStub.cpp:834  hands straight to Mem2hex(reply, data, len).
+                # Both observed symptoms follow: a BLOCKING MODAL that nothing clicks
+                # under -b (so the emulator stalls and every later RSP read times
+                # out), and then EXC_BAD_ACCESS at 0x0.  The message the user saw --
+                # "Unknown Pointer 0x20000030 PC 0x801160b8 LR 0x812004dc" -- is this
+                # line: 0xE0000030 & 0x3FFFFFFF == 0x20000030.
+                #
+                # THE GUEST WAS NOT FAULTING.  Guest loads and stores reach the
+                # locked cache through MMU.cpp:246-251, which handles it correctly;
+                # GetSpanForAddress is the HOST-side pointer path, and the only
+                # caller here was this line.  SAB's City Escape overlay uses the
+                # locked cache normally (two already-recorded fixtures touch
+                # 0xE0000000.. and 0xE0000060..).
+                #
+                # Recording the address in `outside` is all that is needed: the
+                # replay harness stages MEM1 only, so verify_fixture.mjs refuses any
+                # fixture with a non-empty outside_mem1 anyway.
                 outside.add(ea)
-            try:
-                pre = g.mem(ea, size)
-            except RSPError:
-                pre = None
-                unknown.append({"pc": pc, "why": f"store pre-read failed at {ea:#x}",
-                                "kind": "store"})
+                outside_kind[ea] = ('both' if outside_kind.get(ea) == 'load'
+                                    else 'store')
+                pend = None
+            else:
+                try:
+                    pre = g.mem(ea, size)
+                except RSPError:
+                    pre = None
+                    unknown.append({"pc": pc, "why": f"store pre-read failed at {ea:#x}",
+                                    "kind": "store"})
 
         rep = g.step()
         steps += 1
@@ -681,6 +787,7 @@ def capture_replayable_fixture(g: "GDB", entry: int, syms=None, max_steps=200000
             "delta": delta, "writes": writes, "unknown_stores": unknown,
             "initial_mem": {f"{a:08x}": b for a, b in sorted(initial.items())},
             "outside_mem1": sorted(outside),
+            "outside_mem1_kind": {f"{a:08x}": k for a, k in sorted(outside_kind.items())},
             "stream": [[p, w] for p, w in stream]}
 
 
@@ -732,10 +839,18 @@ def capture_fixture(g: "GDB", entry: int, syms=None, max_steps=200000,
         pre = None
         if pend:
             ea, size = pend
-            try:
-                pre = g.mem(ea, size)
-            except RSPError:
-                pre = None
+            # SAME HAZARD as in capture_replayable_fixture: an `m` packet for a
+            # non-MEM1 address (the Gekko locked cache at 0xE00000xx above all) walks
+            # GDBStub.cpp:828/833 -> Memmap.cpp:740 into a blocking panic modal and
+            # then a null dereference.  See the long note there for the exact chain.
+            if not (MEM1_LO <= ea and ea + size <= MEM1_HI):
+                unknown.append({"pc": pc, "why": f"store outside MEM1 at {ea:#x}"})
+                pend = None
+            else:
+                try:
+                    pre = g.mem(ea, size)
+                except RSPError:
+                    pre = None
         rep = g.step()
         steps += 1
         npc = GDB.stop_pc(rep)

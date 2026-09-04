@@ -161,6 +161,63 @@ class Rel:
             for r in imp["relocs"]:
                 yield imp["id"], r
 
+    def relocate(self, bases, sections=None):
+        """Apply OSLink's Relocate() offline. -> {sec_idx: relocated bytes}.
+
+        `bases` is {(module_id, section_idx): runtime address}, exactly what
+        __OSModuleInfoList reports once the module is linked.  Module id 0 is the
+        static DOL, for which OSLink.c:139-142 sets offset = 0 and the addend is
+        therefore already absolute.
+
+        WHY THIS EXISTS: THE JUMP TABLES ARE IN A DATA SECTION.  Static `bctr`
+        recovery reads the switch table out of the image, and on the DOL that works
+        (145 of 147 sites).  On stg13D it recovers 0 of 23 -- every table base lands
+        in sec5, a 2,620,456-byte FILE-BACKED data section that the emit path never
+        loads, so every table word reads "not in image" and the site silently falls
+        back to sr_indirect(), which faults at run time.  Loading the RAW sec5 does
+        not fix it either: a table of code addresses is a run of R_PPC_ADDR32
+        relocations, so the shipped words are placeholders.  This produces the
+        section as the machine has it.
+
+        Transcribed from ~/gc_refs/dolsdk2001/src/os/OSLink.c:146-201.  `p` there is
+        an ABSOLUTE pointer, which is why R_PPC_REL24 needs the site's runtime
+        address and not just its offset.
+
+        VALIDATED, not assumed: run against a section whose live bytes were read back
+        out of the machine, this must reproduce them exactly.  See the self-test in
+        __main__.
+        """
+        want = set(sections) if sections is not None else {
+            s["idx"] for s in self.sections if s["size"] and not s["bss"]}
+        out = {i: bytearray(self.section_bytes(i)) for i in want}
+        for mid, r in self.all_relocs():
+            sec, off, typ = r["site_sec"], r["site_off"], r["type"]
+            if sec not in out or off + 4 > len(out[sec]):
+                continue
+            base = 0 if mid == 0 else bases[(mid, r["ref_sec"])]
+            x = (base + r["addend"]) & 0xFFFFFFFF
+            buf = out[sec]
+            if typ == R_PPC_ADDR32:
+                struct.pack_into('>I', buf, off, x)
+            elif typ == R_PPC_ADDR24:
+                w = struct.unpack_from('>I', buf, off)[0]
+                struct.pack_into('>I', buf, off,
+                                 (w & ~0x03FFFFFC) | (x & 0x03FFFFFC))
+            elif typ in (R_PPC_ADDR16, R_PPC_ADDR16_LO):
+                struct.pack_into('>H', buf, off, x & 0xFFFF)
+            elif typ == R_PPC_ADDR16_HI:
+                struct.pack_into('>H', buf, off, (x >> 16) & 0xFFFF)
+            elif typ == R_PPC_ADDR16_HA:
+                struct.pack_into('>H', buf, off,
+                                 ((x >> 16) + (1 if (x & 0x8000) else 0)) & 0xFFFF)
+            elif typ == R_PPC_REL24:
+                p = (bases[(self.id, sec)] + off) & 0xFFFFFFFF
+                d = (x - p) & 0xFFFFFFFF
+                w = struct.unpack_from('>I', buf, off)[0]
+                struct.pack_into('>I', buf, off,
+                                 (w & ~0x03FFFFFC) | (d & 0x03FFFFFC))
+        return {i: bytes(b) for i, b in out.items()}
+
 
 # ------------------------------------------------------- translatability probe
 def decode_exec(rel):
@@ -404,6 +461,49 @@ def branch_relocs(rel, mod_vbase):
     return out
 
 
+def split_dol_units_for(rel, units, verbose=False):
+    """Split DOL boundary units at every entry point the OVERLAY's relocations name.
+
+    THE GAP THIS CLOSES.  sr.recover_boundaries derives DOL function starts from the
+    symbol map plus the DOL's OWN call graph.  An overlay calls into the DOL through
+    R_PPC_REL24 relocations, which that call graph never sees -- so a DOL entry point
+    used ONLY by overlays is not a "function start", and sr.Translator.callexpr
+    refuses to dispatch to it rather than silently entering mid-function.
+
+    Measured on stg13D: 10 of the 400 distinct DOL targets its relocation table names
+    are not starts under boundaries=outer+calls, all of them inside Metrowerks'
+    multi-entry `__save_gpr` / `__restore_gpr` (0x8010af98 / 0x8010afe4) -- where
+    entering at offset N is the entire point of the idiom.  Those 10 blocked 35 of
+    1,141 overlay entries from translating at all.
+
+    Splitting is semantically neutral: sr.Translator emits a fall-through as an
+    explicit tail call to the next start, so cutting one guest function into two
+    changes granularity, not behaviour (the same argument translate_module() relies
+    on for its entry fixpoint).
+    """
+    extra = {r["addend"] for mid, r in rel.all_relocs()
+             if mid == 0 and r["type"] in (R_PPC_REL24, R_PPC_ADDR24)}
+    starts = {lo for lo, _, _ in units}
+    cut = sorted(extra - starts)
+    if not cut:
+        return units
+    out = []
+    for lo, size, name in sorted(units):
+        inside = [c for c in cut if lo < c < lo + size]
+        if not inside:
+            out.append((lo, size, name))
+            continue
+        bounds = [lo] + inside + [lo + size]
+        for i in range(len(bounds) - 1):
+            out.append((bounds[i], bounds[i + 1] - bounds[i],
+                        name if i == 0 else f"{name}+{bounds[i] - lo:#x}"))
+    if verbose:
+        print(f"[rel] split {len(units)} DOL units -> {len(out)} at "
+              f"{len(cut)} overlay-only entry point(s): "
+              + ", ".join(f"{c:#010x}" for c in cut))
+    return sorted(out)
+
+
 def translate_module_reach(rel, dol_starts=frozenset(), max_rounds=16, verbose=False):
     """The overlay translation pass: reachability bodies + tail-call fixpoint +
     relocation-aware branches.  Returns per-function translatability."""
@@ -593,10 +693,50 @@ def main():
     ap.add_argument('--branches')
     ap.add_argument('--survey', action='store_true')
     ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--check-relocate', nargs=2, metavar=('REL', 'LIVE_SECTION'),
+                    help='SELF-TEST for Rel.relocate(): apply OSLink Relocate() offline '
+                         'to REL and require the result to equal LIVE_SECTION, a dump of '
+                         'that section read back out of a running machine.  Needs '
+                         '--sections idx=hexaddr for every section (from '
+                         '__OSModuleInfoList).  Also asserts the RAW file bytes differ, '
+                         'so a broken relocation cannot pass by doing nothing.')
+    ap.add_argument('--sections', action='append', default=[], metavar='IDX=HEXADDR')
     a = ap.parse_args()
 
     d = Disc(a.iso)
     rels = [f for f in d.files if f["path"].lower().endswith('.rel')]
+
+    if a.check_relocate:
+        name, livepath = a.check_relocate
+        ent = next(f for f in d.files
+                   if f["name"] == name or f["path"].endswith(name))
+        r = Rel(d.read_file(ent), ent["path"])
+        bases = {}
+        for spec in a.sections:
+            i, addr = spec.split('=')
+            bases[(r.id, int(i))] = int(addr, 16)
+        if not bases:
+            raise SystemExit("--check-relocate needs --sections IDX=HEXADDR "
+                             "(from __OSModuleInfoList)")
+        sec = r.exec_sections()[0]["idx"]
+        live = open(livepath, 'rb').read()
+        raw = r.section_bytes(sec)
+        if len(live) != len(raw):
+            raise SystemExit(f"{livepath} is {len(live)} B, section {sec} is {len(raw)} B")
+        mine = r.relocate(bases, sections=[sec])[sec]
+        nd = sum(1 for i in range(0, len(raw), 4) if raw[i:i + 4] != live[i:i + 4])
+        bad = [i for i in range(len(live)) if mine[i] != live[i]]
+        print(f"{ent['path']} sec{sec} @ {bases[(r.id, sec)]:#010x}: {len(raw)} bytes")
+        print(f"  words the relocation must change: {nd}")
+        print(f"  RAW file bytes == live            : {raw == live}  "
+              f"(must be False, or the test is vacuous)")
+        print(f"  offline-relocated == live          : {not bad}"
+              + (f"  ({len(bad)} bytes differ, first at +{bad[0]:#x})" if bad else ""))
+        if bad or raw == live or nd == 0:
+            print("FAIL")
+            sys.exit(1)
+        print("PASS — Rel.relocate() reproduces what OSLink actually wrote")
+        return
 
     if a.inventory:
         print(f"disc FST: {len(d.files)} files, dol@{d.dol_off:#x} fst@{d.fst_off:#x}")

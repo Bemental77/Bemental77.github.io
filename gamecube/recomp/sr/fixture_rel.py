@@ -256,6 +256,294 @@ def confirm_base(g, rel, sec, base, patched, blob, samples=16, window=0x400):
     return mismatched == 0 and checked >= window, checked
 
 
+def prep_rel(disc, relname):
+    """Parse one overlay off the disc. -> (ent, rel, sec, blob, reloc_offs, sites).
+
+    Split out of main() because WHICH overlay is being surveyed is not always known
+    before Dolphin is running: a cold boot links whatever module the game gets to
+    first, and paying the boot again to re-run with the right --rel is not affordable
+    (measured: 900 s of wall clock bought ~29 s of emulated boot and still had no
+    module linked).  So the identity comes from the machine and the parse happens
+    after."""
+    ent = next(f for f in disc.files
+               if f["name"] == relname or f["path"].endswith(relname))
+    rel = R.Rel(disc.read_file(ent), ent["path"])
+    execs = rel.exec_sections()
+    if len(execs) != 1:
+        print(f"[rel] {relname} has {len(execs)} executable sections; this tool "
+              f"assumes 1", file=sys.stderr)
+        sys.exit(2)
+    sec = execs[0]["idx"]
+    blob = rel.section_bytes(sec)
+    # BYTE offsets, not site offsets: 68% of the sites patch a 2-byte immediate at
+    # off%4==2 and an aligned-only test is blind to them.  See patched_byte_offsets().
+    reloc_offs = patched_byte_offsets(rel, sec)
+    sites = dol_call_sites(rel)
+    print(f"[rel] {ent['path']} id={rel.id} v{rel.version} exec sec={sec} "
+          f"{len(blob)} bytes ({len(blob)//4} instructions)")
+    print(f"[rel] {len(reloc_site_offsets(rel, sec))} relocation sites covering "
+          f"{len(reloc_offs)} patchable bytes in section {sec}")
+    print(f"[rel] {len(sites)} distinct DOL call targets, "
+          f"{sum(len(v) for v in sites.values())} REL24 sites")
+    return ent, rel, sec, blob, reloc_offs, sites
+
+
+def rel_by_module_id(disc):
+    """module id -> .rel file name, read from each REL's own header.
+
+    OSLink registers a module by ID, not by name, and the name in the module list is
+    the ORIGINAL BUILD PATH ('c:\\sonic2gc\\cw\\output\\stg13D.plf') -- a .plf, not the
+    .rel that shipped.  The id is authoritative and is the first u32 of the header."""
+    out = {}
+    for f in disc.files:
+        if not f["name"].lower().endswith(".rel"):
+            continue
+        try:
+            mid = struct.unpack('>I', disc.read_file(f)[:4])[0]
+        except Exception:
+            continue
+        out.setdefault(mid, f["name"])
+    return out
+
+
+def wait_for_link(g, oslink_pc, budget, poll=None):
+    """Advance a COLD BOOT until the guest OS finishes linking a module.
+
+    ANCHOR: OSLink itself.  It is not in SAB's symbol map, but it is the only DOL
+    function that STORES to __OSModuleInfoList (0x800030C8) and also LOADS
+    __OSStringTable (0x800030D0) and the queue head -- which is exactly the shape of
+    OSLink.c:213-273 (ENQUEUE_INFO, then the `if (__OSStringTable)` name fixup, then
+    the `for (moduleInfo = __OSModuleInfoList.head; ...)` relocate-everything loop).
+    In SAB's main.dol that is 0x800e839c; OSUnlink (0x800e87f8) writes the queue too
+    but never reads the string table.
+
+    WHY AN ANCHOR AND NOT POLLING.  Polling the module list means stopping the guest,
+    and the guest is the scarce resource: the reference interpreter runs SAB at
+    ~0.0328x real time, so every stop is paid for in emulated seconds that the boot
+    needs.  One breakpoint that fires EXACTLY ONCE, at the moment a module becomes
+    resident, costs nothing until it matters.
+
+    The stop is at OSLink's ENTRY, where the module is NOT yet enqueued and NOT yet
+    relocated -- reading the list there would report the module missing and reading
+    the section would return unrelocated bytes.  So this then breakpoints the return
+    address in LR and continues, and only reports success once OSLink has returned.
+    """
+    g.add_bp(oslink_pc)
+    t0 = time.time()
+    lr = None
+    while time.time() - t0 < budget:
+        try:
+            rep = g.cont(timeout=max(5.0, min(120.0, budget - (time.time() - t0))))
+        except Exception:
+            print(f"[oslink]   t+{time.time() - t0:.0f}s  still booting", flush=True)
+            continue
+        if O.GDB.stop_pc(rep) == oslink_pc:
+            g.resync()
+            lr = g.reg(67)
+            print(f"[oslink] OSLink entered at t+{time.time() - t0:.0f}s; "
+                  f"returns to {lr:#010x}", flush=True)
+            break
+        g.resync()
+    g.del_bp(oslink_pc)
+    if lr is None:
+        return False
+    g.add_bp(lr)
+    t1 = time.time()
+    while time.time() - t1 < max(60.0, budget - (time.time() - t0)):
+        try:
+            rep = g.cont(timeout=60.0)
+        except Exception:
+            continue
+        if O.GDB.stop_pc(rep) == lr:
+            break
+        g.resync()
+    g.del_bp(lr)
+    g.resync()
+    print(f"[oslink] OSLink returned after {time.time() - t1:.0f}s — the module is "
+          f"enqueued AND relocated", flush=True)
+    return True
+
+
+def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusal):
+    """Capture each candidate AT THE MOMENT ITS BREAKPOINT FIRES.
+
+    THE TWO THINGS THIS FIXES, both measured on this rig 2026-09-04:
+
+    1. DISCOVER-THEN-CAPTURE LOSES EXACTLY THE FUNCTIONS WORTH SURVEYING.  The old
+       flow noted which entries fired, then re-armed each one and waited for it to be
+       reached AGAIN.  A function that runs once per scene never is.  Capturing at the
+       fire needs the entry to be reached ONCE.
+
+    2. A BOUNDED `cont` IS NOT A LEGAL WAY TO GIVE UP.  `cont()` sends 'c' and the
+       guest keeps running; this stub has no async break, so abandoning the read and
+       sending anything else leaves the client permanently one packet behind.  With a
+       15 s deadline that produced ConnectionResetError, then BrokenPipeError on every
+       subsequent capture -- 8 refusals that were all one client-side desync.  So this
+       NEVER abandons a cont: an ANCHOR breakpoint on a frequently-executed entry
+       guarantees a stop arrives, and control is handed back by that instead.
+
+    Waves exist because the candidate breakpoints have to come off before single-
+    stepping (a step onto an armed address risks an extra unsolicited Sigtrap, which
+    is the desync `resync()` exists for) and go back on afterwards.  That is 2*W
+    packets per capture, so W is a cost knob, not a correctness one.
+
+    ARMED-SET SIZE IS ALSO WHY THE OLD DISCOVERY SAW SO LITTLE.  With 300 breakpoints
+    armed on per-frame functions the interpreter is stopped almost continuously and
+    buys almost no EMULATED time: 300 s of wall clock reached only 10 distinct entries
+    of 300.  Deleting each candidate once it has been captured makes the guest get
+    progressively faster through a wave.
+    """
+    # ---------------------------------------------------------------- ENUMERATE
+    # WHICH CANDIDATES ACTUALLY EXECUTE IN THIS SCENE.  A shape-spread candidate set
+    # is chosen for coverage, not for relevance: most of it does not run in a parked
+    # scene at all, and arming 32 of them at a time and waiting produced waves that
+    # captured 0 of 32 twice in a row.
+    #
+    # DELETE ON FIRE is what makes this cheap.  Leaving a breakpoint armed after it
+    # has fired means the interpreter keeps stopping on the same per-frame functions
+    # and buys almost no EMULATED time -- the reason the first attempt saw only 10 of
+    # 300 entries in 300 s of wall clock.  Removing each one as it fires makes the
+    # guest monotonically faster, so a full frame's worth of overlay calls is
+    # enumerated in roughly one stop per candidate rather than one stop per call.
+    #
+    # ONE breakpoint must survive: the ANCHOR.  There is no async break, so when the
+    # last armed breakpoint is deleted a `cont` never returns and the client cannot
+    # legally send anything.  The FIRST candidate to fire is kept armed for that job
+    # -- first to fire is the most frequent thing in the scene, which is exactly what
+    # a control anchor needs to be.
+    # WHICH candidate is the anchor is a first-order cost, not a detail.  Taking the
+    # FIRST ONE TO FIRE was tried and is wrong for the same reason OSDisableInterrupts
+    # was wrong as a boot anchor: first-to-fire IS the hottest function in the scene,
+    # so the interpreter stops on it constantly and buys no emulated time -- 480 s of
+    # enumeration under that choice never reached even 25 distinct entries.  So spend
+    # a short calibration measuring RATES, and take the RAREST candidate that still
+    # guarantees a stop inside a quarter of a wave.  Calibration runs with every
+    # candidate armed, i.e. the slowest regime, so a period measured there is an upper
+    # bound on the period later; the guarantee only gets stronger.
+    anchor_off = a.anchor_off
+    for off in arm:
+        g.add_bp(base + off)
+    if anchor_off is None:
+        print(f"[survey] calibrating an anchor over {a.anchor_budget:.0f}s ...",
+              flush=True)
+        hits, t0 = collections.Counter(), time.time()
+        while time.time() - t0 < a.anchor_budget:
+            rep = g.cont(timeout=a.cont_timeout)
+            pc = O.GDB.stop_pc(rep)
+            if pc is not None and (pc - base) in bodies:
+                hits[pc - base] += 1
+            g.resync(quiet=0.05)
+        if not hits:
+            for off in arm:
+                g.del_bp(base + off)
+            raise O.RSPError("no candidate fired during calibration; without one armed "
+                             "breakpoint that can hand control back there is no safe "
+                             "way to run a capture wave (this stub has no async break)")
+        want_period = max(1.0, a.wave_budget / 4.0)
+        okc = [(a.anchor_budget / n, off) for off, n in hits.items()
+               if a.anchor_budget / n <= want_period]
+        period, anchor_off = max(okc) if okc else \
+            (a.anchor_budget / hits.most_common(1)[0][1], hits.most_common(1)[0][0])
+        if not okc:
+            print(f"[survey] WARNING: nothing fires at least every {want_period:.0f}s; "
+                  f"using the most frequent candidate anyway", file=sys.stderr)
+        print(f"[survey] anchor = +{anchor_off:#x} ({base + anchor_off:#010x}), "
+              f"{hits[anchor_off]} hits in {a.anchor_budget:.0f}s = one per "
+              f"{period:.1f}s (rarest that still fires within {want_period:.0f}s); "
+              f"{len(hits)} candidates fired during calibration", flush=True)
+
+    pending = set(arm)
+    pending.discard(anchor_off)
+    fired = [anchor_off] if anchor_off in set(arm) else []
+    print(f"[survey] enumerating which of {len(arm)} candidates execute here "
+          f"(delete-on-fire, up to {a.enum_budget:.0f}s) ...", flush=True)
+    t0 = time.time()
+    while pending and time.time() - t0 < a.enum_budget:
+        rep = g.cont(timeout=a.cont_timeout)
+        pc = O.GDB.stop_pc(rep)
+        off = (pc - base) if pc is not None else None
+        if off in pending:
+            fired.append(off)
+            g.del_bp(base + off)
+            pending.discard(off)
+            if len(fired) % 10 == 0:
+                print(f"[survey]   {len(fired)} fired, {len(pending)} still armed, "
+                      f"t+{time.time() - t0:.0f}s", flush=True)
+        g.resync(quiet=0.05)
+    for off in pending:
+        g.del_bp(base + off)
+    g.del_bp(base + anchor_off)
+    g.resync()
+    if anchor_off is None:
+        raise O.RSPError("no candidate fired at all; without one armed breakpoint "
+                         "that can hand control back, a capture wave cannot be run "
+                         "safely (there is no async break)")
+    print(f"[survey] {len(fired)} of {len(arm)} candidates executed in "
+          f"{time.time() - t0:.0f}s; {len(pending)} never did", flush=True)
+    for off in sorted(pending):
+        on_refusal(off, base + off,
+                   f"never executed in {a.enum_budget:.0f}s of this scene", quiet=True)
+    anchor = base + anchor_off
+
+    todo = [o for o in arm if o in set(fired)]
+    done, t_all = 0, time.time()
+    W = max(1, a.wave)
+    i = 0
+    while i < len(todo):
+        if a.capture_budget and time.time() - t_all >= a.capture_budget:
+            print(f"[survey] budget {a.capture_budget:.0f}s spent; "
+                  f"{len(todo) - i} candidate(s) not attempted", flush=True)
+            break
+        wave = [o for o in todo[i:i + W] if o != anchor_off]
+        i += W
+        if not wave:
+            continue
+        live_set = set(wave)
+        for off in live_set:
+            g.add_bp(base + off)
+        g.add_bp(anchor)
+        t_w = time.time()
+        while live_set and time.time() - t_w < a.wave_budget:
+            if a.capture_budget and time.time() - t_all >= a.capture_budget:
+                break
+            rep = g.cont(timeout=a.cont_timeout)
+            pc = O.GDB.stop_pc(rep)
+            off = (pc - base) if pc is not None else None
+            if off not in live_set:
+                g.resync(quiet=0.05)
+                continue
+            # Stopped AT the entry.  Take every breakpoint off before stepping.
+            for o in live_set:
+                g.del_bp(base + o)
+            g.del_bp(anchor)
+            entry = base + off
+            print(f"[capture] {entry:#010x} (+{off:#x}) ...", flush=True)
+            try:
+                fx = O.capture_replayable_fixture(
+                    g, entry, syms=osyms, max_steps=a.max_steps, progress=5000,
+                    prefetch=prefetch, at_entry=True)
+                on_fixture(fx, off)
+                done += 1
+            except Exception as e:
+                on_refusal(off, entry, f"{type(e).__name__}: {e}")
+            live_set.discard(off)
+            for o in live_set:
+                g.add_bp(base + o)
+            g.add_bp(anchor)
+        for o in live_set:
+            g.del_bp(base + o)
+        g.del_bp(anchor)
+        g.resync()
+        if live_set:
+            for o in sorted(live_set):
+                on_refusal(o, base + o,
+                           f"executed during enumeration but not again within "
+                           f"{a.wave_budget:.0f}s of its capture wave", quiet=True)
+        print(f"[survey] wave done: {len(wave) - len(live_set)}/{len(wave)} captured; "
+              f"{done} total in {time.time() - t_all:.0f}s", flush=True)
+    return done, anchor_off
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--iso', default=O.SAB_ISO)
@@ -271,6 +559,28 @@ def main():
                          'before taking the probe lock: two locked runs have already been '
                          'lost to a bad import path and a missing module import.')
     ap.add_argument('--capture-n', type=int, default=3)
+    ap.add_argument('--capture-budget', type=float, default=0.0,
+                    help='wall-clock seconds for the whole capture phase (0 = no cap). '
+                         'A SURVEY needs this: --capture-n alone cannot bound the run '
+                         'because a candidate that fired during discovery and then '
+                         'never again costs --capture-cont-timeout before it is refused.')
+    ap.add_argument('--capture-cont-timeout', type=float, default=20.0,
+                    help='seconds to wait for a candidate to be reached again during '
+                         'capture.  Exceeded = REFUSED ("never reached"), never a '
+                         'partial capture.')
+    ap.add_argument('--capture-order', choices=['hits', 'arm'], default='hits',
+                    help='hits: capture the most frequently executed first (the default, '
+                         'and what a single-function proof wants).  arm: capture in the '
+                         'order given by --arm-offsets, which is how a SHAPE-SPREAD '
+                         'survey keeps its coverage instead of filling up with whichever '
+                         'function the frame loop calls most.')
+    ap.add_argument('--arm-offsets',
+                    help='file of section offsets (hex, one per line, # comments ok) to '
+                         'arm instead of the built-in smallest-body-first selection. '
+                         'This is how a survey arms a set chosen OFFLINE by shape '
+                         '(leaf/non-leaf, FP, memory, blrl, bctr, x-form update) and by '
+                         'whether the function and its whole callee closure actually '
+                         'translate -- neither of which body size predicts.')
     ap.add_argument('--budget', type=float, default=120.0,
                     help='seconds for BASE RECOVERY.  Size it in EMULATED time: the '
                          'reference interpreter runs SAB at ~0.0328x real time '
@@ -308,29 +618,73 @@ def main():
                     help='force the old MEM1 signature scan instead of reading the '
                          'guest OS module list (only needed if __OSModuleInfoList is '
                          'unusable)')
+    ap.add_argument('--survey', action='store_true',
+                    help='capture each candidate AT THE MOMENT its breakpoint fires, in '
+                         'waves, instead of discovering first and re-reaching each one '
+                         'later.  See survey_waves() -- this is what makes breadth '
+                         'affordable, and it is also the only shape that does not '
+                         'abandon a `cont`.')
+    ap.add_argument('--wave', type=int, default=24,
+                    help='candidates armed at once in --survey.  Cost knob only: each '
+                         'capture disarms and re-arms the wave (2*W packets) because a '
+                         'single-step onto an armed address risks the extra Sigtrap '
+                         'that resync() exists for.')
+    ap.add_argument('--wave-budget', type=float, default=180.0,
+                    help='seconds a --survey wave waits for its candidates to execute '
+                         'before giving up on the ones that have not.')
+    ap.add_argument('--cont-timeout', type=float, default=180.0,
+                    help='deadline on ONE stop-packet read in --survey.  Must be '
+                         'comfortably longer than the anchor breakpoint\'s period: '
+                         'exceeding it is unrecoverable, not a refusal.')
+    ap.add_argument('--anchor-off', type=lambda x: int(x, 16), default=None,
+                    help='section offset of the --survey control anchor (hex).  '
+                         'Default: the first candidate that fires during enumeration.')
+    ap.add_argument('--anchor-budget', type=float, default=60.0,
+                    help='seconds spent measuring candidate fire RATES so the --survey '
+                         'anchor can be the rarest one that still hands control back '
+                         'often enough.  Skipped when --anchor-off is given.')
+    ap.add_argument('--enum-budget', type=float, default=420.0,
+                    help='seconds to enumerate which candidates execute in this scene '
+                         '(--survey), arming all of them and deleting each on its '
+                         'first fire.  This is the phase that decides how much of the '
+                         'candidate set is even reachable, so give it room.')
+    ap.add_argument('--gfx', default='Null',
+                    help='Dolphin video backend.  Null by default: a GDB-stub capture '
+                         'renders nothing it reads back, and Metal SEGV\'d on the '
+                         'CPU-GPU thread during a capture run (Dolphin 2603a, '
+                         'EXC_BAD_ACCESS at 0x0, 2026-09-04).')
+    ap.add_argument('--wait-oslink', type=float, default=0.0,
+                    help='seconds to advance a COLD BOOT waiting for the guest OS to '
+                         'link ANY module, anchored on OSLink itself (see '
+                         'wait_for_link).  0 = off.  Needed for a second overlay: the '
+                         'only SAB savestate on this machine has exactly one module '
+                         'resident, so a second .rel can only come from a boot.')
+    ap.add_argument('--oslink', type=lambda x: int(x, 16), default=0x800e839c,
+                    help='OSLink entry in main.dol.  SAB default 0x800e839c, identified '
+                         'structurally, not guessed: it is the only DOL function that '
+                         'stores to __OSModuleInfoList (0x800030C8) AND loads '
+                         '__OSStringTable (0x800030D0) AND re-reads the queue head, '
+                         'which is the exact shape of OSLink.c:213-273.  OSUnlink '
+                         '(0x800e87f8) writes the queue but never reads the string '
+                         'table; __OSModuleInit (0x800e888c, named in the map) writes '
+                         'all three and is 24 bytes.')
+    ap.add_argument('--auto-rel', action='store_true',
+                    help='survey whichever module the machine actually has resident, '
+                         'matched by MODULE ID against every .rel on the disc, instead '
+                         'of insisting on --rel.  The name in the module list is the '
+                         'original build path of a .plf and cannot be used for this.')
+    ap.add_argument('--arm-select', choices=['size', 'shape'], default='size',
+                    help='size: the historical smallest-body-first selection.  shape: '
+                         'classify every entry IN PROCESS (rel_shapes.py) against the '
+                         'live relocated section and round-robin across shape buckets, '
+                         'rarest first.  `shape` is what a survey wants and it is the '
+                         'only option available on a cold boot, where the overlay '
+                         'identity is not known until Dolphin is already running and '
+                         'an offline --arm-offsets file cannot have been prepared.')
     a = ap.parse_args()
 
     disc = R.Disc(a.iso)
-    ent = next(f for f in disc.files
-               if f["name"] == a.rel or f["path"].endswith(a.rel))
-    rel = R.Rel(disc.read_file(ent), ent["path"])
-    execs = rel.exec_sections()
-    if len(execs) != 1:
-        print(f"[rel] {a.rel} has {len(execs)} executable sections; this tool assumes 1",
-              file=sys.stderr)
-        sys.exit(2)
-    sec = execs[0]["idx"]
-    blob = rel.section_bytes(sec)
-    # BYTE offsets, not site offsets: 68% of the sites patch a 2-byte immediate at
-    # off%4==2 and an aligned-only test is blind to them.  See patched_byte_offsets().
-    reloc_offs = patched_byte_offsets(rel, sec)
-    sites = dol_call_sites(rel)
-    print(f"[rel] {ent['path']} id={rel.id} v{rel.version} exec sec={sec} "
-          f"{len(blob)} bytes ({len(blob)//4} instructions)")
-    print(f"[rel] {len(reloc_site_offsets(rel, sec))} relocation sites covering "
-          f"{len(reloc_offs)} patchable bytes in section {sec}")
-    print(f"[rel] {len(sites)} distinct DOL call targets, "
-          f"{sum(len(v) for v in sites.values())} REL24 sites")
+    ent, rel, sec, blob, reloc_offs, sites = prep_rel(disc, a.rel)
     dimg = sr.Image.from_dol(a.dol)
     textr = dol_text_ranges(a.iso)
     print("[rel] DOL text (LR in these ranges = a DOL-internal caller, skipped): "
@@ -391,13 +745,19 @@ def main():
         print(f"[oracle] {e}", file=sys.stderr)
         sys.exit(7)
     obin = a.oracle_bin or dflt
-    print(f"[state] {os.path.basename(a.state)}  STATE_VERSION={sver}  revision={srev!r}")
+    if a.state:
+        print(f"[state] {os.path.basename(a.state)}  STATE_VERSION={sver}  "
+              f"revision={srev!r}")
+    else:
+        print("[state] NONE — COLD BOOT.  Nothing is OSLink'd at the entry point, so "
+              "this run depends on --wait-oslink reaching a link.")
     print(f"[oracle] {obin}")
     dol = O.Dolphin(iso=a.iso, state=a.state, port=PORT,
                     log=f"/tmp/sr_rel_oracle_{PORT}.log", dual_core=True,
-                    binary=obin, extra=["-C", "Dolphin.Core.CPUCore=0"])
+                    binary=obin, gfx=a.gfx, extra=["-C", "Dolphin.Core.CPUCore=0"])
     print(f"[oracle] port={PORT} core=interpreter state={a.state}")
     base = None
+    rel_sections = {}
     try:
         g = dol.connect()
         pc0 = g.pc()
@@ -415,11 +775,41 @@ def main():
         # apparatus below (which stays only as --scan, for a state where this is empty).
         if not a.scan:
             mods = read_module_list(g)
+            # COLD BOOT: nothing is linked yet.  Advance on the OSLink anchor rather
+            # than polling, then survey WHATEVER the game linked -- which is the only
+            # way to reach a SECOND overlay on this machine, because the one SAB
+            # savestate that exists has exactly one module resident (id=13 stg13D)
+            # and no mechanism here can write a new one.
+            if not mods and a.wait_oslink:
+                print(f"[oslink] no module linked; advancing the boot on OSLink "
+                      f"{a.oslink:#010x} for up to {a.wait_oslink:.0f}s ...", flush=True)
+                if wait_for_link(g, a.oslink, a.wait_oslink):
+                    mods = read_module_list(g)
+                else:
+                    print(f"[oslink] no module was linked within {a.wait_oslink:.0f}s",
+                          file=sys.stderr)
             print(f"[modlist] __OSModuleInfoList: {len(mods)} module(s) linked")
             for md in mods:
                 ex = [f"sec{i}@{v[0]:#010x} {v[1]}B{' EXEC' if v[2] else ''}"
                       for i, v in sorted(md["sections"].items()) if v[2]]
                 print(f"[modlist]   id={md['id']:<4} {md['name']!r}  " + "; ".join(ex))
+            # RE-TARGET.  The requested --rel is a guess about what the machine has;
+            # the module list is the fact.  Re-parse against the module that is
+            # actually resident instead of reporting "not resident" and exiting.
+            if a.auto_rel and mods and not any(md["id"] == rel.id for md in mods):
+                byid = rel_by_module_id(disc)
+                for md in mods:
+                    if md["id"] in byid:
+                        print(f"[auto-rel] requested {a.rel} (id={rel.id}) is not "
+                              f"resident; retargeting to {byid[md['id']]} "
+                              f"(id={md['id']}), which is")
+                        a.rel = byid[md["id"]]
+                        ent, rel, sec, blob, reloc_offs, sites = prep_rel(disc, a.rel)
+                        break
+                else:
+                    print(f"[auto-rel] none of the {len(mods)} resident module id(s) "
+                          f"{[md['id'] for md in mods]} matches a .rel on the disc",
+                          file=sys.stderr)
             for md in mods:
                 if md["id"] == rel.id and sec in md["sections"]:
                     addr, size, isexec = md["sections"][sec]
@@ -434,6 +824,13 @@ def main():
                           f"byte-confirm={'OK' if ok else 'FAILED'} ({checked} windows)")
                     if ok:
                         base = addr
+                        # RECORD EVERY SECTION, not just the executable one.  The
+                        # emit path needs the DATA sections too: every `bctr` switch
+                        # table in stg13D lives in sec5, and without a runtime base
+                        # for it Rel.relocate() cannot produce the table and static
+                        # jump-table recovery gets 0 of 23 sites.
+                        rel_sections = {i: list(v)
+                                        for i, v in sorted(md["sections"].items())}
                     break
             else:
                 print(f"[modlist] {a.rel} (id={rel.id}) is NOT resident in this state")
@@ -566,18 +963,126 @@ def main():
 
         # ------------------------------------------------- which entries execute
         res = R.translate_module_reach(rel)
+        shape_by_off, census_by_off = {}, {}
         entries = sorted({off for (s, off) in res["entries"] if s == sec})
         bodies = {E: v for (s, E), v in res["bodies"].items() if s == sec}
         print(f"[rel] {len(entries)} discovered function entries in section {sec}")
         # Prefer SMALL bodies (cheap to single-step) but not TRIVIAL ones: stg13D has
         # hundreds of 4-byte `blr` stubs, and a fixture whose whole trace is one
         # instruction is not evidence that overlay code translates correctly.
-        arm = [e for e in entries
-               if e in bodies and bodies[e]["hi"] - bodies[e]["lo"] >= a.min_body]
-        arm.sort(key=lambda e: bodies[e]["hi"] - bodies[e]["lo"])
-        arm = arm[:a.max_arm]
-        print(f"[discover] {len(entries)} entries, {len(arm)} armed after "
-              f"--min-body {a.min_body} (smallest first)")
+        if a.arm_select == 'shape':
+            # IN PROCESS, against the section just read back out of the machine.  A
+            # cold boot cannot use a precomputed --arm-offsets file: the overlay's
+            # identity and base are not known until Dolphin is already running, and
+            # re-running to apply an offline classification would cost the whole boot
+            # again.  See rel_shapes.py for what "shape" means and why the closure
+            # check is part of the gate.
+            import rel_shapes as RS
+            t_s = time.time()
+            _, _, img_s, byaddr_s, ov_s, starts_s, breloc_s = RS.build_image(
+                a.iso, a.rel, base, live, a.dol, a.map, sections=rel_sections)
+            rows_s = RS.classify(img_s, byaddr_s, ov_s, starts_s, breloc_s, base)
+            sel_s = RS.arm_list(rows_s, a.max_arm)
+            RS.report(rows_s, sel_s, out=lambda s: print(s, flush=True))
+            arm_path = os.path.splitext(OUT)[0] + f".{a.rel}.arm.txt"
+            RS.write_arm_file(arm_path, rows_s, sel_s, f"{a.rel} @ {base:#010x}")
+            print(f"[shapes] classified in {time.time() - t_s:.0f}s; wrote {arm_path}")
+            arm = [r["off"] for r in sel_s if r["off"] in bodies]
+            # Carry the classification onto the fixtures.  A survey's claim is about
+            # SHAPES covered, and that cannot be reconstructed from the artifact later
+            # without re-running the whole classification against the same live bytes.
+            shape_by_off = {r["off"]: r["shape"] for r in rows_s}
+            census_by_off = {r["off"]: r["census"] for r in rows_s}
+            print(f"[discover] {len(entries)} entries; arming {len(arm)} chosen by "
+                  f"SHAPE across {len(set(r['shape'] for r in sel_s))} buckets")
+        elif a.arm_offsets:
+            want, unknown_off = [], []
+            for line in open(a.arm_offsets):
+                line = line.split('#')[0].strip()
+                if not line:
+                    continue
+                o = int(line, 16)
+                (want if o in bodies else unknown_off).append(o)
+            if unknown_off:
+                print(f"[discover] {len(unknown_off)} offset(s) in {a.arm_offsets} are "
+                      f"not discovered function entries in section {sec} — REFUSED: "
+                      + ", ".join(f"+{o:#x}" for o in unknown_off[:8])
+                      + (", ..." if len(unknown_off) > 8 else ""), file=sys.stderr)
+            arm = want[:a.max_arm]
+            print(f"[discover] {len(entries)} entries; arming {len(arm)} of "
+                  f"{len(want)} offsets supplied by --arm-offsets {a.arm_offsets}")
+        else:
+            arm = [e for e in entries
+                   if e in bodies and bodies[e]["hi"] - bodies[e]["lo"] >= a.min_body]
+            arm.sort(key=lambda e: bodies[e]["hi"] - bodies[e]["lo"])
+            arm = arm[:a.max_arm]
+            print(f"[discover] {len(entries)} entries, {len(arm)} armed after "
+                  f"--min-body {a.min_body} (smallest first)")
+        # ------------------------------------------------- capture bookkeeping
+        out = {"game": "GSNE8P",
+               "oracle": "native Dolphin interpreter (CPUCore=0)",
+               "rel": a.rel, "rel_sec": sec, "rel_base": base,
+               "rel_sections": rel_sections,
+               "live_section": live_path, "live_words_patched": diff,
+               "capture": "gamecube/recomp/sr/fixture_rel.py",
+               "oracle_binary": obin, "state": a.state,
+               "fixtures": [], "refused": []}
+        # Serve every OVERLAY instruction fetch from the relocated section already read
+        # out of the machine, instead of one `m` packet per step.  A symbol map cannot
+        # do this job for an overlay -- an overlay has no symbols.
+        prefetch = {base + i: struct.unpack_from('>I', live, i)[0]
+                    for i in range(0, len(live), 4)}
+
+        def on_fixture(fx, off):
+            fx["gqr"] = read_gqrs(g)
+            fx["ps1_dependency"] = [[f"{p:#010x}", f"{w:08x}", why]
+                                    for p, w, why in ps1_dependency(fx["stream"])]
+            fx["n_calls"] = sum(1 for _, w in fx["stream"]
+                                if ((w >> 26) & 0x3F) == 18 and (w & 1))
+            fx["rel_off"] = off
+            if off in shape_by_off:
+                fx["shape"] = shape_by_off[off]
+                fx["census"] = census_by_off[off]
+            del fx["stream"]
+            # MARK AT CAPTURE TIME, not at verify time.  A fixture with an unknown
+            # store form has an INCOMPLETE write log and one that hit the step cap is
+            # TRUNCATED; either scores as a translation defect when replayed, and
+            # neither is one.  verify_fixture.mjs already honours `usable:false` and
+            # prints the reason -- the sab_nonleaf suite carries three such records.
+            if fx["unknown_stores"] or not fx["returned"]:
+                fx["usable"] = False
+            print(f"    steps={fx['steps']} returned={fx['returned']} "
+                  f"bl={fx['n_calls']} writes={len(fx['writes'])} "
+                  f"initial_bytes={len(fx['initial_mem'])} "
+                  f"unknown={len(fx['unknown_stores'])} "
+                  f"outside_mem1={len(fx['outside_mem1'])} "
+                  f"ps1_dep={len(fx['ps1_dependency'])}", flush=True)
+            out["fixtures"].append(fx)
+            json.dump(out, open(OUT, "w"))
+
+        def on_refusal(off, entry, why, quiet=False):
+            if not quiet:
+                print(f"    REFUSED: {why}", flush=True)
+            out["refused"].append({"entry": entry, "rel_off": off, "why": why,
+                                   "shape": shape_by_off.get(off)})
+            json.dump(out, open(OUT, "w"))
+
+        if a.survey:
+            try:
+                ndone, anchor_off = survey_waves(a, g, base, bodies, arm, osyms,
+                                                 prefetch, on_fixture, on_refusal)
+                out["survey_anchor_off"] = anchor_off
+            except Exception as e:
+                print(f"[survey] ABORTED: {type(e).__name__}: {e}", file=sys.stderr)
+                out["aborted"] = f"{type(e).__name__}: {e}"
+            json.dump(out, open(OUT, "w"))
+            nun = sum(1 for f in out["fixtures"] if f.get("usable") is False)
+            nout = sum(1 for f in out["fixtures"] if f.get("outside_mem1"))
+            print(f"[survey] wrote {OUT}: {len(out['fixtures'])} captured "
+                  f"({nun} marked unusable, {nout} touch addresses outside MEM1), "
+                  f"{len(out['refused'])} refused, of {len(arm)} armed")
+            return
+
         dbudget = a.discover_budget if a.discover_budget else a.budget / 3.0
         print(f"[discover] arming {len(arm)} overlay entries for {dbudget:.0f}s")
         for off in arm:
@@ -595,7 +1100,13 @@ def main():
         for off in arm:
             g.del_bp(base + off)
         print(f"[discover] {len(hits)} of {len(arm)} overlay entries fired")
-        ranked = sorted(hits.items(), key=lambda kv: -kv[1])
+        if a.capture_order == 'arm':
+            # SURVEY ORDER.  Ranking by hit count fills the capture budget with
+            # whatever the frame loop calls most, which is a handful of shapes; the
+            # arm file is already ordered for shape spread, so honour it.
+            ranked = [(off, hits[off]) for off in arm if off in hits]
+        else:
+            ranked = sorted(hits.items(), key=lambda kv: -kv[1])
         for off, n in ranked[:20]:
             b = bodies[off]
             print(f"   +{off:#08x} -> {base + off:#010x}  hits={n:5d}  "
@@ -605,45 +1116,37 @@ def main():
             sys.exit(4)
 
         # --------------------------------------------------------- capture
-        out = {"game": "GSNE8P",
-               "oracle": "native Dolphin interpreter (CPUCore=0)",
-               "rel": a.rel, "rel_sec": sec, "rel_base": base,
-               "live_section": live_path, "live_words_patched": diff,
-               "capture": "gamecube/recomp/sr/fixture_rel.py",
-               "fixtures": []}
         taken = 0
+        tcap0 = time.time()
         for off, n in ranked:
             if taken >= a.capture_n:
+                break
+            if a.capture_budget and time.time() - tcap0 >= a.capture_budget:
+                print(f"[capture] budget {a.capture_budget:.0f}s spent; "
+                      f"{len(ranked) - taken} candidate(s) not attempted", flush=True)
                 break
             entry = base + off
             print(f"[capture] {entry:#010x} (+{off:#x}, {n} hits) ...", flush=True)
             try:
-                fx = O.capture_replayable_fixture(g, entry, syms=osyms,
-                                                  max_steps=a.max_steps, progress=2000)
+                fx = O.capture_replayable_fixture(
+                    g, entry, syms=osyms, max_steps=a.max_steps, progress=2000,
+                    cont_timeout=a.capture_cont_timeout, prefetch=prefetch)
             except Exception as e:
-                print(f"    SKIPPED: {type(e).__name__}: {e}", flush=True)
+                on_refusal(off, entry, f"{type(e).__name__}: {e}")
+                try:
+                    g.resync()
+                except Exception:
+                    pass
                 continue
-            fx["gqr"] = read_gqrs(g)
-            fx["ps1_dependency"] = [[f"{p:#010x}", f"{w:08x}", why]
-                                    for p, w, why in ps1_dependency(fx["stream"])]
-            fx["n_calls"] = sum(1 for _, w in fx["stream"]
-                                if ((w >> 26) & 0x3F) == 18 and (w & 1))
-            fx["rel_off"] = off
-            del fx["stream"]
-            print(f"    steps={fx['steps']} returned={fx['returned']} "
-                  f"bl={fx['n_calls']} writes={len(fx['writes'])} "
-                  f"initial_bytes={len(fx['initial_mem'])} "
-                  f"unknown={len(fx['unknown_stores'])} "
-                  f"outside_mem1={len(fx['outside_mem1'])} "
-                  f"ps1_dep={len(fx['ps1_dependency'])}")
-            if fx["unknown_stores"]:
-                print("    NOTE: unknown store forms -> the write log is INCOMPLETE; "
-                      "this fixture cannot be a pass criterion")
-            out["fixtures"].append(fx)
+            on_fixture(fx, off)
             taken += 1
-            json.dump(out, open(OUT, "w"))
         json.dump(out, open(OUT, "w"))
-        print(f"[capture] wrote {OUT} ({len(out['fixtures'])} fixtures)")
+        nun = sum(1 for f in out["fixtures"] if f.get("usable") is False)
+        nout = sum(1 for f in out["fixtures"] if f.get("outside_mem1"))
+        print(f"[capture] wrote {OUT}: {len(out['fixtures'])} captured "
+              f"({nun} marked unusable, {nout} touch addresses outside MEM1), "
+              f"{len(out['refused'])} refused, "
+              f"{len(ranked)} candidates fired during discovery")
     finally:
         dol.kill()
 

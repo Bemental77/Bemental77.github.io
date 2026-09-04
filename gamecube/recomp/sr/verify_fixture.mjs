@@ -101,6 +101,18 @@ const main = async () => {
   const phys = (a) => (a & 0x03ffffff) >>> 0;
 
   let allPass = true;
+  // COUNTS, NOT A VERDICT.  "ALL FIXTURES BIT-EXACT" used to print whenever nothing
+  // FAILED -- including a run in which every fixture was refused and none was scored,
+  // which is a vacuous pass and exactly the shape a survey must never report. Every
+  // refusal is tallied by its reason so a gap is visible as a named class with a
+  // count, rather than as a smaller denominator nobody printed.
+  const tally = { pass: 0, fail: 0, refused: 0, notBuilt: 0 };
+  const why = new Map();
+  const refuse = (kind, line) => {
+    tally.refused++;
+    why.set(kind, (why.get(kind) || 0) + 1);
+    console.log(line);
+  };
   for (const file of process.argv.slice(2)) {
     const j = parseExact(fs.readFileSync(file, 'utf8'));
     for (const fx of j.fixtures) {
@@ -117,7 +129,8 @@ const main = async () => {
         const why = fx.unknown_stores?.length ? `${fx.unknown_stores.length} unknown store forms`
                   : fx.returned === false ? `did not return in ${fx.steps} steps`
                   : !fx.n_calls ? 'no bl executed' : 'marked unusable at capture';
-        console.log(`SKIP  0x${entry.toString(16).padStart(8, '0')}  usable:false — ${why}`);
+        refuse(`unusable at capture (${why})`,
+               `SKIP  0x${entry.toString(16).padStart(8, '0')}  usable:false — ${why}`);
         continue;
       }
       // NOT REPLAYABLE BY CONSTRUCTION: the harness stages guest MEM1 only
@@ -129,9 +142,25 @@ const main = async () => {
       if (fx.outside_mem1?.length) {
         const list = fx.outside_mem1.slice(0, 3)
           .map((a) => `0x${(a >>> 0).toString(16)}`).join(', ');
-        console.log(`SKIP  0x${entry.toString(16).padStart(8, '0')}  not replayable — ` +
-                    `touches ${fx.outside_mem1.length} address(es) outside MEM1 (${list}` +
-                    `${fx.outside_mem1.length > 3 ? ', ...' : ''}); the harness stages MEM1 only`);
+        // Name the REGION, not just "outside MEM1": these are two distinct pieces of
+        // Gekko state, each with its own reason for being unmodelled, and lumping
+        // them together hides which one to fix first.
+        //   0xE0000000..  the LOCKED L1 CACHE (Memmap.h:253, 256 KB).  gekko_rt.h
+        //     gk_phys() masks an EA with 0x03FFFFFF, so 0xE0000030 would alias onto
+        //     MEM1 offset 0x30 -- and the oracle cannot even read it back: an `m`
+        //     packet there panics (see native_oracle_gdb.py).
+        //   0xCC008000   WPAR, the write-gather pipe -- i.e. the guest pushing GX
+        //     commands.  MMIO, not memory; nothing in the replay models it.
+        const region = (a) => ((a >>> 0) >= 0xE0000000 && (a >>> 0) < 0xE0040000)
+          ? 'Gekko locked L1 cache 0xE00000xx'
+          : ((a >>> 0) === 0xCC008000 ? 'WPAR write-gather pipe 0xCC008000'
+                                      : `unmodelled 0x${(a >>> 0).toString(16)}`);
+        const kinds = [...new Set(fx.outside_mem1.map(region))];
+        refuse(`touches ${kinds.join(' + ')}`,
+               `SKIP  0x${entry.toString(16).padStart(8, '0')}  not replayable — ` +
+               `touches ${fx.outside_mem1.length} address(es) outside MEM1 (${list}` +
+               `${fx.outside_mem1.length > 3 ? ', ...' : ''}) = ${kinds.join(' + ')}; ` +
+               `the harness stages MEM1 only`);
         continue;
       }
       const want = expandWrites(fx.writes);
@@ -189,6 +218,7 @@ const main = async () => {
       // is "you did not translate this function", not a translation defect, so say so
       // instead of printing a wall of register diffs against an untouched state.
       if ((runs[0].fault >>> 16) === 0xBAD0) {
+        tally.notBuilt++;
         console.log(`SKIP  ${tag}  not in this build (sr_dispatch has no entry)`);
         continue;
       }
@@ -272,6 +302,7 @@ const main = async () => {
         : `want=${(so.fpscr >>> 0).toString(16)} got=${A.out.fpscr.toString(16)} (NOT MODELLED)`;
       const ok = bad.length === 0;
       allPass = allPass && ok;
+      tally[ok ? 'pass' : 'fail']++;
       console.log(`${ok ? 'PASS' : 'FAIL'}  ${tag}  steps=${fx.steps} bl=${fx.n_calls} ` +
                   `stores=${fx.writes.length} write-events=${want.length} ` +
                   `final-mem-bytes=${fx._memBytes} ` +
@@ -280,7 +311,18 @@ const main = async () => {
       for (const b of bad.slice(0, 20)) console.log(`        ${b}`);
     }
   }
-  console.log(allPass ? '\nALL FIXTURES BIT-EXACT' : '\nMISMATCHES PRESENT');
-  process.exit(allPass ? 0 : 1);
+  const attempted = tally.pass + tally.fail + tally.refused + tally.notBuilt;
+  console.log(`\nSUMMARY  ${tally.pass} verified / ${attempted} attempted / ` +
+              `${tally.refused + tally.notBuilt} refused` +
+              (tally.fail ? ` / ${tally.fail} MISMATCHED` : ''));
+  for (const [k, n] of [...why].sort((a, b) => b[1] - a[1]))
+    console.log(`  refused ${String(n).padStart(4)}  ${k}`);
+  if (tally.notBuilt)
+    console.log(`  refused ${String(tally.notBuilt).padStart(4)}  not in this build`);
+  // A run in which nothing was SCORED is not a pass, however few things failed.
+  if (tally.fail) console.log('MISMATCHES PRESENT');
+  else if (!tally.pass) console.log('NOTHING WAS SCORED — every fixture was refused');
+  else console.log(`ALL ${tally.pass} SCORED FIXTURES BIT-EXACT`);
+  process.exit(tally.fail || !tally.pass ? 1 : 0);
 };
 main();
