@@ -681,6 +681,19 @@
       sab: (typeof SharedArrayBuffer === 'function'),
       offscreen: HAS_OFFSCREEN,
       webgl2: !!(GLPROBE && GLPROBE.ok),
+      // The surface this page ACTUALLY renders on, reported separately from the
+      // main-thread one because they are separate capabilities and have been
+      // measured to disagree (see probeOffscreenGL2).
+      webgl2InOffscreen: safe(() => (GLPROBE && GLPROBE.offscreen) || null, null),
+      consoleUA: CONSOLE_UA,
+      // DID THE PAGE ACTUALLY START A BOOT? Not "is Start disabled" — the two
+      // came apart badly: every side effect of booting (worker spawn, canvas
+      // transfer, a 2048 MB shared-memory reservation) runs at PAGE LOAD, so a
+      // greyed-out Start button sat in front of a running emulator. This is the
+      // field a rig should assert on; `gatedBy` names the blockers when the boot
+      // was deliberately not started.
+      boot: safe(() => ({ started: bootStatus.started, gatedBy: bootStatus.gatedBy }),
+                 { started: false, gatedBy: null }),
       stencil: safe(() => stencilVerdict(), { known: false }),
       heap: { init: memInfo.initMB, max: memInfo.gotMaxMB, reduced: memInfo.reduced, err: memInfo.err },
       counters: Object.assign({}, counters),
@@ -754,9 +767,42 @@
     typeof HTMLCanvasElement !== 'undefined' && HTMLCanvasElement.prototype &&
     typeof HTMLCanvasElement.prototype.transferControlToOffscreen === 'function');
   const HAS_GUNZIP = (typeof DecompressionStream === 'function');
+  // ---------------------------------------------------------------------------
+  // CONSOLE / TV BROWSER — recorded as a FACT in the report, never used to gate.
+  //
+  // Sniffing a UA is normally the wrong instrument and every capability on this
+  // page is measured by doing it instead. This one is different in kind: it is
+  // not a capability, it is a DOCUMENTED RESOURCE BUDGET that cannot be
+  // feature-detected without risking the thing it would measure. Microsoft
+  // documents a console browser as an "app", with a 1 GB foreground memory
+  // budget and a 45% share of the GPU (Xbox One apps at D3D feature level 10.1,
+  // Series X|S at 11.0) — learn.microsoft.com/en-us/windows/uwp/xbox-apps/
+  // system-resource-allocation — and webRcade, a browser emulator frontend that
+  // ships on Xbox, reports the practical per-page ceiling on Xbox Series X|S
+  // Edge as "around 450 megabytes" (docs.webrcade.com/apps/emulators/3do/).
+  //
+  // This page's default shared heap asks for a 2048 MB MAXIMUM, and PSO's
+  // Track3.bin is 1,185,760,800 B which the eager path holds in the worker's JS
+  // heap. Neither fits in 450 MB. So when a report comes back from a console the
+  // reader needs to know that immediately, and the visitor needs to be told
+  // which two levers exist (?lazydisc=1, ?maxmem=) rather than being left with a
+  // dead tab. The Xbox UA carries an `Xbox` token inside an otherwise ordinary
+  // `Windows NT 10.0; Win64; x64` block, so naive sniffing sees desktop Edge.
+  const CONSOLE_UA = /\bXbox\b|\bPlayStation\b|\bNintendo\b|\bSmartTV\b|\bTizen\b|Web0S|\bAFT[A-Z]/i
+    .test(String(navigator.userAgent || ''));
+  const CONSOLE_HINT = CONSOLE_UA
+    ? ' This looks like a games console or TV browser. Those run the page as an "app" with a much '
+    + 'smaller memory and GPU budget than a desktop browser (Microsoft documents 1 GB and a 45% GPU '
+    + 'share for Xbox; the practical per-page ceiling measured by others is around 450 MB), and this '
+    + 'emulator asks for more than that by default. Try adding ?lazydisc=1&maxmem=256 to the address — '
+    + 'it streams the disc instead of holding it in memory and asks for the smallest heap.'
+    : '';
   function diagLine() {
     const n = navigator, yn = (v) => (v ? 'yes' : 'NO');
     return '[env] ' + n.userAgent +
+      (CONSOLE_UA ? '\n[env] CONSOLE/TV BROWSER detected from the user agent — these run the page under '
+                  + 'an app-class memory and GPU budget (Xbox: 1 GB / 45% GPU documented; ~450 MB '
+                  + 'per-page measured). Read every allocation below against that, not against a desktop.' : '') +
       '\n[env] crossOriginIsolated=' + yn(self.crossOriginIsolated) +
       ' SharedArrayBuffer=' + yn(typeof SharedArrayBuffer === 'function') +
       ' OffscreenCanvas+transfer=' + yn(HAS_OFFSCREEN) +
@@ -796,8 +842,56 @@
   // whole thing is wrapped so a driver that dislikes any of it cannot take the
   // boot down with it.
   // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // WEBGL2 ON AN OffscreenCanvas — the capability this page ACTUALLY needs, and
+  // for a long time the one nothing measured.
+  //
+  // :2106 hands the canvas to the worker with transferControlToOffscreen(), and
+  // from that instant the page can never take a context on it. The probe above
+  // therefore measures a surface this page does not render on, and the two are
+  // NOT the same capability. Measured on this machine 2026-09-04, Chrome, four
+  // arms, every cell the result of DOING it:
+  //
+  //     arm                  <canvas>   new OffscreenCanvas   transferred   in a WORKER
+  //     (none)               true       true                  true          true
+  //     --disable-gpu        false      false                 false         false
+  //     --disable-3d-apis    FALSE      TRUE                  TRUE          TRUE
+  //     --use-gl=swiftshader false      false                 false         false
+  //
+  // Row three is why the page probe must NOT be the gate — it is the case the
+  // headline() comment below already records, now with the reason named. The
+  // OffscreenCanvas spellings agreed with the worker on all four arms, which is
+  // what makes this the honest synchronous predictor of the worker's answer.
+  //
+  // Blocking requires BOTH spellings to refuse, so one unlucky null cannot kill
+  // a page that would have rendered.
+  function probeOffscreenGL2() {
+    const o = { supported: (typeof OffscreenCanvas === 'function'),
+                transferSupported: HAS_OFFSCREEN, newOk: null, xferOk: null, ok: false, err: null };
+    if (!o.supported) { o.err = 'OffscreenCanvas is not defined'; return o; }
+    const A = { alpha: false, depth: true, stencil: true, antialias: false, preserveDrawingBuffer: false };
+    const lose = (g) => { try { const l = g && g.getExtension('WEBGL_lose_context'); if (l) l.loseContext(); } catch (_) {} };
+    try { const g = new OffscreenCanvas(1, 1).getContext('webgl2', A); o.newOk = !!g; lose(g); }
+    catch (e) { o.newOk = false; o.err = 'new OffscreenCanvas(1,1).getContext("webgl2") threw: ' + (e && e.message ? e.message : String(e)); }
+    // Second opinion only when the first refused — a GL context is scarce on a
+    // phone and this runs on every load.
+    if (o.newOk !== true && o.transferSupported) {
+      try {
+        const c = document.createElement('canvas'); c.width = c.height = 1;
+        const g = c.transferControlToOffscreen().getContext('webgl2', A);
+        o.xferOk = !!g; lose(g);
+      } catch (e) { o.xferOk = false; o.err = (o.err ? o.err + '; ' : '') +
+        'transferControlToOffscreen().getContext("webgl2") threw: ' + (e && e.message ? e.message : String(e)); }
+    }
+    o.ok = (o.newOk === true) || (o.xferOk === true);
+    if (!o.ok && !o.err) o.err = 'getContext("webgl2", {alpha:false,depth:true,stencil:true}) on an ' +
+                                 'OffscreenCanvas returned null';
+    return o;
+  }
+
   function probeWebGL2() {
-    const out = { ok: false };
+    const out = { ok: false, offscreen: safe(probeOffscreenGL2,
+      { supported: false, newOk: null, xferOk: null, ok: false, err: 'the OffscreenCanvas probe threw' }) };
     let gl = null;
     try {
       const c = document.createElement('canvas');
@@ -880,6 +974,10 @@
   // in the log, so the report can state the rung without parsing English.
   const memInfo = { initMB: 0, wantMaxMB: 0, gotMaxMB: 0, rung: 0, rungs: 0,
                     reduced: false, err: null, text: '' };
+  // Whether a BOOT was actually started, as distinct from whether the Start
+  // button looks pressable. Read by window.__dcProbe() and by
+  // tools/device_matrix.mjs, which had no way to tell the two apart.
+  const bootStatus = { started: false, gatedBy: null };
 
   // ---------------------------------------------------------------------------
   // VERDICT — the fields that decide the diagnosis, in the first screenful.
@@ -926,8 +1024,23 @@
     // while the worker rendered PSO at 30 fps, and this line still announced
     // "THIS DEVICE HAS NO USABLE WEBGL2" over a working picture. So it yields
     // to demonstrated frames.
+    //
+    // AND IT NOW YIELDS TO THE RIGHT SURFACE FIRST. The OffscreenCanvas result
+    // is the one that predicts the worker (four-arm table at probeOffscreenGL2:
+    // it agreed with a real worker in every arm, while the <canvas> probe was
+    // wrong in one), so when the two disagree the headline must lead with the
+    // OffscreenCanvas answer or it repeats the --disable-3d-apis mistake in
+    // prose. This is also the case a console browser is most likely to land in.
+    const off = g.offscreen || {};
+    if (off.ok === false && !(safe(() => lastCalls, 0) > 0))
+      return 'THIS BROWSER WILL NOT GIVE A WORKER A WEBGL2 CONTEXT — ' + (off.err || 'unknown') +
+             '. The emulator renders WebGL2 from its worker thread and has no other drawing path, so ' +
+             'nothing can appear. (Main-thread WebGL2 on this device: ' + (g.ok ? 'works' : 'also refused') +
+             ' — the two are separate capabilities.)';
     if (!g.ok && !/skipped/.test(g.err || '') && !(safe(() => lastCalls, 0) > 0))
-      return 'THIS DEVICE HAS NO USABLE WEBGL2 — ' + (g.err || 'unknown');
+      return 'THIS DEVICE HAS NO USABLE WEBGL2 ON THE MAIN THREAD — ' + (g.err || 'unknown') +
+             (off.ok ? '. A worker CAN get one here, which is the surface this page actually renders on, ' +
+                       'so this on its own does not stop the emulator.' : '');
     if (st.known && !st.on) return 'STENCIL WAS NOT GRANTED (per the ' + st.src + '). Flycast drives modifier volumes entirely through the stencil buffer and the black-out quad paints the WHOLE FRAME when the plane is missing. This is the prime suspect for a black picture with correct-looking telemetry.';
     if (g.ok && g.fboD24S8 !== 'COMPLETE' && g.fboD32FS8 !== 'COMPLETE')
       return 'THIS GPU COMPLETES NEITHER DEPTH-STENCIL FORMAT (depth24_stencil8=' + g.fboD24S8 +
@@ -989,9 +1102,39 @@
                     : 'NO  <-- modifier volumes black the whole frame without it (' + st.src + ')')
            : 'UNKNOWN — ' + st.src,
          st.known ? (st.on ? 'good' : 'bad') : 'warn');
-    push('WebGL2 (page)', g.ok ? 'yes' : ('NO — ' + (g.err || 'unavailable') +
+    // THE DECISIVE ROW, ABOVE the main-thread one on purpose. This page draws
+    // only from the worker, on a canvas handed over with
+    // transferControlToOffscreen (:2154), so WebGL2 ON AN OffscreenCanvas is
+    // what decides whether it can run — and the two have been MEASURED to
+    // disagree (see probeOffscreenGL2's four-arm table). A panel that led with
+    // the main-thread number sent readers to the wrong conclusion twice.
+    {
+      const o = g.offscreen;
+      push('WebGL2 in a worker', !o ? 'not probed'
+        : o.ok ? ('yes' + (o.newOk === true ? '' : ' (via transferControlToOffscreen)'))
+        : ('NO — ' + (o.supported === false
+             ? 'this browser has no OffscreenCanvas at all'
+             : (o.transferSupported === false
+                 ? 'OffscreenCanvas exists but canvas.transferControlToOffscreen does not, so the page '
+                   + 'cannot hand its canvas to the worker'
+                 : (o.err || 'unavailable')))
+           + '  <-- THIS is the surface the emulator renders on'),
+        !o ? 'warn' : (o.ok ? 'good' : 'bad'));
+    }
+    push('WebGL2 (page, main thread)', g.ok ? 'yes' : ('NO — ' + (g.err || 'unavailable') +
          (g.plainWebgl2 ? ' (plain webgl2 DOES work — the attribute set is what was refused)' : '') +
-         (g.webgl1 !== undefined ? ' webgl1=' + g.webgl1 : '')), g.ok ? 'good' : 'bad');
+         (g.webgl1 !== undefined ? ' webgl1=' + g.webgl1 : '') +
+         ((GLPROBE && GLPROBE.offscreen && GLPROBE.offscreen.ok)
+            ? ' — but a worker CAN get one here, and that is the surface this page uses, so this alone '
+              + 'does not stop the emulator'
+            : '')),
+         g.ok ? 'good' : ((GLPROBE && GLPROBE.offscreen && GLPROBE.offscreen.ok) ? 'warn' : 'bad'));
+    if (CONSOLE_UA)
+      push('device class', 'CONSOLE / TV BROWSER (from the user agent). These run the page under an ' +
+           'app-class budget — Microsoft documents 1 GB of memory and a 45% GPU share for Xbox, and the ' +
+           'practical per-page ceiling measured by others is around 450 MB. This emulator asks for a ' +
+           '2048 MB heap maximum by default and PSO\'s disc is 1.13 GB. Try ?lazydisc=1&maxmem=256.',
+           'warn');
     if (g.ok) {
       const ds = dsFormat();
       push('depth-stencil in use', ds.name + ' = ' + ds.status, ds.status === 'COMPLETE' ? 'good' : 'bad');
@@ -1455,10 +1598,45 @@
       missing.push('Web Workers — the emulator runs off the main thread.');
     if (!HAS_OFFSCREEN)
       missing.push('OffscreenCanvas + canvas.transferControlToOffscreen — the emulator draws WebGL2 straight into this page’s canvas from its worker. On iPhone/iPad this needs iOS 17 or newer (iOS 16.4 shipped OffscreenCanvas with a 2D context only).');
+    // ── THE ONE THAT WAS MISSING, AND THE BUG IT LET THROUGH ─────────────────
+    // Until 2026-09-04 there was NO WebGL2 check in this list at all. GLPROBE
+    // was read in exactly three places — a report field (:683), a log line
+    // (:1516) and a marker (:1522) — and not one of them gated anything. So a
+    // device with no usable WebGL2 printed 'THIS DEVICE HAS NO USABLE WEBGL2'
+    // from headline(), fell straight through this gate, and went on to spawn the
+    // emulator worker (:1769), hand away its canvas (:2154) and reserve a
+    // 2048 MB shared WebAssembly.Memory (:1669) for a renderer that could never
+    // draw. Capability.autoGate() held the Start BUTTON down the whole time,
+    // which is a different thing from not booting: every one of those steps runs
+    // at page load, before anyone can press anything. A visitor reported it as
+    // "it says WebGL2 is not available and then the page crashes", which is
+    // exactly what that sequence looks like on a device with a tight memory
+    // budget — a console or TV browser above all.
+    //
+    // The test is deliberately the OffscreenCanvas one, not the <canvas> one.
+    // See probeOffscreenGL2 for the four-arm table: --disable-3d-apis refuses a
+    // <canvas> context and grants an OffscreenCanvas one, and the emulator
+    // renders fine there. Gating on the page probe would have made that device
+    // dead, trading one false verdict for another.
+    const NOGATE = new URLSearchParams(location.search).has('nogate');
+    const offGL = GLPROBE && GLPROBE.offscreen;
+    if (!NOGATE && offGL && offGL.ok === false && HAS_OFFSCREEN)
+      missing.push('WebGL2 inside a worker — this browser has OffscreenCanvas but will not give it a ' +
+                   'WebGL2 context (' + (offGL.err || 'reason not reported') + '). The emulator renders ' +
+                   'WebGL2 from its worker thread and has no other drawing path, so there is nothing for ' +
+                   'it to draw into.');
     if (missing.length) {
+      // The witness window.__dcProbe().boot reports. This `return` is why a
+      // gated page never reaches the async gate further down, so `gatedBy` has
+      // to be recorded HERE too or the report would say "not started" with no
+      // reason attached — which is the shape of a silent hang, not a stop.
+      bootStatus.gatedBy = missing.map((m) => String(m).split(' —')[0].trim());
       setStatus('This browser cannot run the emulator.');
       showFatal('This browser is missing what the Dreamcast emulator needs', missing,
-        'On iPhone and iPad every browser uses Safari’s engine, so switching apps will not help — iOS 17 or newer is the requirement. On desktop, current Chrome, Edge, Firefox and Safari all work.');
+        'On iPhone and iPad every browser uses Safari’s engine, so switching apps will not help — iOS 17 or newer is the requirement. ' +
+        'On a games console, TV or set-top browser, hardware-accelerated WebGL2 in a background thread is often simply not available. ' +
+        'On desktop, current Chrome, Edge, Firefox and Safari all work. ' +
+        'Add ?nogate=1 to the address to run it anyway and watch it fail.' + CONSOLE_HINT);
       return;
     }
   }
@@ -1471,7 +1649,21 @@
        ' gpu="' + GLPROBE.renderer + '" maxTex=' + GLPROBE.maxTex +
        ' exts=' + GLPROBE.extCount)
     : ('webgl2=NO ' + GLPROBE.err)));
-  mark('glprobe=' + (GLPROBE.ok ? ('stencil:' + GLPROBE.stencil) : 'no-webgl2'));
+  // THE LINE THAT DECIDES THIS PAGE, on its own. `webgl2=` above is the
+  // main-thread <canvas>; this is WebGL2 on an OffscreenCanvas, which is the
+  // only surface the emulator ever draws on. A report carrying only the first
+  // number sent two readers to the wrong conclusion (see probeOffscreenGL2).
+  {
+    const o = GLPROBE.offscreen;
+    pageLog('[glprobe] offscreen-webgl2=' + (!o ? 'not probed'
+      : (o.ok ? 'yes' : 'NO')) +
+      (o ? ' (OffscreenCanvas=' + (o.supported ? 'yes' : 'NO') +
+           ' new=' + String(o.newOk) + ' transferred=' + String(o.xferOk) +
+           (o.ok ? '' : ' — ' + (o.err || 'no reason reported')) + ')' : '') +
+      ' — THIS is the surface the emulator renders on');
+  }
+  mark('glprobe=' + (GLPROBE.ok ? ('stencil:' + GLPROBE.stencil) : 'no-webgl2') +
+       ',offscreen:' + (GLPROBE.offscreen ? (GLPROBE.offscreen.ok ? 'yes' : 'NO') : '?'));
   if (!HAS_GUNZIP) {
     pageLog('[caps] no DecompressionStream (Safari before 16.4 / iOS before 16.4) — ' +
             'the boot seed will be inflated by this page’s own decoder');
@@ -2118,8 +2310,66 @@
   // fixed ~496 MB offsets. The shim discards every message until it receives
   // mem-init, so this delay only postpones its importScripts, and the disc
   // fetch (the actual long pole) is unaffected — it already awaits worker ready.
-  capsPromise.then(() => {
+  // ---------------------------------------------------------------------------
+  // THE BOOT ITSELF IS GATED, NOT JUST THE BUTTON.
+  //
+  // Capability.autoGate() (wired at :28) disables #btnStart and #mobileSplashStart
+  // and raises a banner. That is the right thing and it is not enough: everything
+  // below this line runs AT PAGE LOAD, before a visitor can press anything.
+  // Reserving the shared memory and sending 'mem-init' starts the emulator core
+  // outright — on a device the capability layer has ALREADY judged unable to run
+  // it. A disabled button in front of a running boot is not a gate.
+  //
+  // The cost of getting this wrong is not cosmetic on a console. Microsoft
+  // documents a games-console browser as an APP, with a 1 GB foreground memory
+  // budget and a 45% share of the GPU (learn.microsoft.com/en-us/windows/uwp/
+  // xbox-apps/system-resource-allocation), and webRcade — a browser emulator
+  // frontend that ships on Xbox — reports the practical per-page ceiling on
+  // Xbox Series X|S Edge at "around 450 megabytes"
+  // (docs.webrcade.com/apps/emulators/3do/). createSharedMemory() below asks for
+  // a 2048 MB maximum by default, and a shared WebAssembly.Memory reserves its
+  // whole maximum as address space up front. A page that does that anyway, after
+  // deciding it cannot render, is a page that takes the tab down for nothing.
+  //
+  // Waiting on Capability.ready is bounded: lib/capability.js publishes within
+  // PROBE_BUDGET_MS (8 s) or publishes a NAMED timeout, and if the module is
+  // absent or throws we boot exactly as before rather than stranding the page.
+  const gateReady = (window.Capability && window.Capability.ready)
+    ? window.Capability.ready.then(
+        () => {
+          try {
+            const b = window.Capability.blockers(window.Capability.SPECS.dreamcast) || [];
+            return b.map((x) => x.id);
+          } catch (e) { return []; }
+        },
+        () => [])
+    : Promise.resolve([]);
+
+  Promise.all([capsPromise, gateReady]).then(([, blocked]) => {
+    // ?nogate=1 is the escape hatch the banner's "Try anyway" button uses, and a
+    // visitor is entitled to watch it fail. It is honoured here for the same
+    // reason lib/capability.js honours it: a page that cannot be overridden
+    // cannot be diagnosed from the outside.
+    if (blocked.length && !QS.has('nogate')) {
+      const v = safe(() => window.Capability.verdict(window.Capability.SPECS.dreamcast),
+                     { short: 'This device is missing ' + blocked.join(' and ') + '.', why: '' });
+      pageLog('[page] BOOT NOT STARTED — the capability layer reports this device is missing: ' +
+              blocked.join(', ') + '. No shared memory was reserved and the emulator core was never ' +
+              'started, because it could not have run.');
+      mark('boot-gated:' + blocked.join('+'));
+      bootStatus.gatedBy = blocked.slice();
+      PROG.stopped = 'this device is missing ' + blocked.join(' and ') +
+                     ', so the emulator was never started';
+      setStatus(v.short);
+      showFatal('This device cannot run the Dreamcast emulator',
+        [v.short, v.why || ''].filter(Boolean),
+        'Nothing was started, so nothing is broken — the page stopped before reserving memory it could ' +
+        'not have used. Add ?nogate=1 to the address to run it anyway and watch it fail, or use the ' +
+        '“Share report” button above to send the measurements back.' + CONSOLE_HINT);
+      return;
+    }
     mark('caps-probed');
+    bootStatus.started = true;
     createSharedMemory();
     mark('mem-init-sent');
     worker.postMessage({ cmd: 'mem-init', memory: sharedMemory,

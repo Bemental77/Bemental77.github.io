@@ -83,8 +83,13 @@ const JSON_ONLY = argv.includes('--json');
 const PAGES = [
   { id: 'gamecube', url: '/gamecube.html',
     spec: { wasm: 'required', worker: 'required', coi: 'required', sab: 'required', webgpu: 'required' } },
+  // ⚠ `webgl2Worker`, NOT `webgl2`. dreamcast.html transfers its canvas to the
+  // emulator worker and renders WebGL2 only from there, so main-thread WebGL2 is
+  // not its requirement — and requiring it was a MEASURED false negative (under
+  // --disable-3d-apis a <canvas> refuses a context while a worker gets a full
+  // one, and the shipped page disabled Start while its worker rendered).
   { id: 'dreamcast', url: '/dreamcast.html',
-    spec: { wasm: 'required', worker: 'required', coi: 'required', sab: 'required', webgl2: 'required' } },
+    spec: { wasm: 'required', worker: 'required', coi: 'required', sab: 'required', webgl2Worker: 'required' } },
   // THE PORTABILITY REFERENCE. N64Wasm is single-threaded: no SAB, no COI, no
   // WebGPU, no worker. If an arm breaks this page, the arm broke something
   // universal — which makes it the control for every other row.
@@ -220,6 +225,66 @@ const ARMS = [
                      + `${a.cap?.env?.iosUA}, webgl2.ok ${b.cap?.webgl2?.ok}->${a.cap?.webgl2?.ok} `
                      + `(the device emulation AND the GPU removal must BOTH take)` };
     },
+  },
+  {
+    // ── THE ARM ADDED FOR A REAL VISITOR ON A GAMES CONSOLE ──────────────────
+    // Reported 2026-09-04: dreamcast.html on the Xbox console's Edge browser
+    // said WebGL2 was unavailable and then the page died. The gap it exposed was
+    // structural, not cosmetic: dreamcast.html renders WebGL2 ONLY from its
+    // worker, on a canvas handed over with transferControlToOffscreen(), and
+    // NOTHING in the 21-cell matrix ever removed that path. Every GPU arm here
+    // removes the GPU from the whole browser, so main-thread and worker GL fall
+    // together and the two are never told apart.
+    //
+    // This arm removes ONLY the page's ability to hand a canvas to a worker,
+    // with the GPU fully intact. It is the iOS-16 shape the page already
+    // documents (Safari 16.4 shipped OffscreenCanvas with a 2D context only) and
+    // the plausible console shape, and it is a genuine condition rather than a
+    // faked measurement: the page really cannot call transferControlToOffscreen,
+    // exactly as on a browser that never had it.
+    //
+    // ⚠ WHAT THIS ARM STILL CANNOT REACH, stated rather than implied: the case
+    // where the page CAN transfer a canvas and a WORKER is refused a WebGL2
+    // context while the main thread keeps one. No Chrome flag produces that
+    // split — measured 2026-09-04, --disable-gpu and --use-gl=swiftshader take
+    // both surfaces down together, and --disable-3d-apis takes down the
+    // main-thread <canvas> while LEAVING worker GL working (the opposite split).
+    // Faking it by patching the probe's own worker would test the rig, not the
+    // platform. That cell needs the hardware.
+    id: 'no-offscreen-gl',
+    what: 'The GPU is intact but the page cannot hand a canvas to a worker: OffscreenCanvas and '
+        + 'canvas.transferControlToOffscreen are removed. Main-thread WebGL2 keeps working. This is the '
+        + 'ONLY arm that separates "this device has WebGL2" from "this device can render from a worker", '
+        + 'which is the requirement dreamcast.html actually has.',
+    args: [],
+    hook: async (page) => {
+      // In the DOCUMENT realm, before any page script runs. A browser without
+      // these is indistinguishable from this, which is the point — nothing here
+      // patches a probe or a result, only the platform surface the page reads.
+      await page.evaluateOnNewDocument(() => {
+        try { delete window.OffscreenCanvas; } catch (e) { window.OffscreenCanvas = undefined; }
+        try { delete HTMLCanvasElement.prototype.transferControlToOffscreen; } catch (e) {}
+      });
+    },
+    proof: (b, a) => {
+      const bo = b.cap?.webgl2?.offscreen, ao = a.cap?.webgl2?.offscreen;
+      const removed = bo?.supported === true && ao?.supported === false;
+      const xfer = bo?.transferSupported === true && ao?.transferSupported === false;
+      // ...and the GPU must be UNTOUCHED, or this is the no-gpu arm under a
+      // different name and it proves nothing about the worker path.
+      const glKept = b.cap?.webgl2?.ok === true && a.cap?.webgl2?.ok === true;
+      return { ok: removed && xfer && glKept,
+               detail: `webgl2.offscreen.supported ${bo?.supported}->${ao?.supported}, `
+                     + `transferSupported ${bo?.transferSupported}->${ao?.transferSupported} `
+                     + `(both must flip true->false); webgl2.ok ${b.cap?.webgl2?.ok}->${a.cap?.webgl2?.ok} `
+                     + `(must stay TRUE, or the GPU went down too and this arm is no-gpu in disguise)` };
+    },
+    // n64/ renders on the MAIN thread and never touches OffscreenCanvas, so
+    // removing it must change nothing there. That is the invariant, not a void.
+    invariantFor: { n64: (a) => ({
+      ok: a.cap?.webgl2?.ok === true,
+      detail: 'n64/ renders on the main thread and must be unaffected by OffscreenCanvas being absent; '
+            + `webgl2.ok=${a.cap?.webgl2?.ok}` }) },
   },
   {
     id: 'low-memory',
@@ -425,6 +490,27 @@ async function runCell(arm, pg) {
                  blockedBy: e.getAttribute('data-cap-blocked'), text: (e.textContent || '').trim().slice(0, 90) };
       };
       return { desktop: pick('btnStart'), mobile: pick('mobileSplashStart') };
+    }).catch(() => null);
+
+    // ---- DID THE PAGE BOOT ANYWAY, WITH NOBODY TOUCHING ANYTHING? -----------
+    // `start.disabled` and the tap test below both ask about the BUTTON. Neither
+    // asks the question that matters on dreamcast.html, where the emulator's
+    // whole startup — worker spawn, canvas hand-over, a 2048 MB shared-memory
+    // reservation — runs at PAGE LOAD, before any control can be pressed. A
+    // greyed-out Start sat in front of a running boot and every cell in this
+    // matrix scored it BLOCKED-HONESTLY.
+    //
+    // window.__dcProbe().boot is the page's own witness: `started` flips only
+    // where createSharedMemory() is actually called, `gatedBy` names the
+    // blockers where the boot was deliberately not begun. Pages that publish no
+    // such witness report null and are judged as before.
+    out.boot = await page.evaluate(() => {
+      try {
+        if (typeof window.__dcProbe !== 'function') return null;
+        const p = window.__dcProbe();
+        return { started: !!(p.boot && p.boot.started), gatedBy: (p.boot && p.boot.gatedBy) || null,
+                 heapMaxMB: (p.heap && p.heap.max) | 0 };
+      } catch (e) { return { error: String(e).slice(0, 120) }; }
     }).catch(() => null);
 
     // ---- THE ON-SCREEN CONTROLS, AT PHONE SIZE ------------------------------
@@ -849,7 +935,17 @@ function judge(arm, pg, cell, baselineCell) {
   v.tapStartedAnyway = !!(cell.tap && cell.tap.started);
   v.tapStillExplains = cell.tap ? cell.tap.stillExplains : null;
   v.tapTarget = cell.tap ? (cell.tap.target || cell.tap.skipped) : null;
-  v.honestGate = !enabledAndBlocked && !v.tapStartedAnyway;
+  // ...AND THE THIRD WAY A GATE CAN BE DISHONEST, which is the one a real
+  // visitor hit: nobody pressed anything and the page booted at load anyway.
+  // A page that reserves a 2 GB heap and starts its emulator core on a device
+  // its own capability layer has already judged unable to render is not gated,
+  // however grey the button is. Only asserted where the page publishes the
+  // witness (window.__dcProbe().boot); elsewhere it is null and changes nothing.
+  v.bootedWhileBlocked = !!(bl.length > 0 && cell.boot && cell.boot.started === true);
+  v.bootWitness = cell.boot ? (cell.boot.started ? 'BOOTED'
+                              : ('not started' + (cell.boot.gatedBy ? ' (gated by ' + cell.boot.gatedBy.join(',') + ')' : '')))
+                            : null;
+  v.honestGate = !enabledAndBlocked && !v.tapStartedAnyway && !v.bootedWhileBlocked;
   v.reportUsable = !!(cell.report && cell.report.hasHeader && cell.report.noUndefined && cell.report.len > 200);
   v.enginesDiffer = !!arm.enginesDiffer;
   // Unreachable controls fail the cell; small ones are reported, not gated.
@@ -868,6 +964,11 @@ function judge(arm, pg, cell, baselineCell) {
     v.why = `Start reads disabled but PRESSING IT started the emulator anyway (target=${v.tapTarget}); `
           + (v.tapStillExplains ? 'the explanation is at least still on screen. ' : 'and the explanation is GONE. ')
           + v.why;
+  }
+  if (v.bootedWhileBlocked) {
+    v.why = `NOBODY PRESSED ANYTHING AND THE PAGE BOOTED ANYWAY at load `
+          + `(heap reserved: ${cell.boot.heapMaxMB} MB). Gating the Start button does not gate a boot `
+          + `that begins before the button exists. ` + v.why;
   }
   return v;
 }
@@ -911,6 +1012,7 @@ async function main() {
   // THE GATE. A silent failure is the bug this whole exercise is about. A voided
   // arm is not a pass either: it means the rig did not create the condition.
   result.summary.tapStartedAnyway = v.filter((x) => x.tapStartedAnyway).length;
+  result.summary.bootedWhileBlocked = v.filter((x) => x.bootedWhileBlocked).length;
   result.summary.controlsUnreachable = v.filter((x) => x.touchReachable === false).length;
   result.ok = result.summary.controlsUnreachable === 0
            && result.summary.failsSilently === 0 && result.summary.errors === 0
@@ -953,7 +1055,7 @@ async function main() {
   }
 
   console.log('\n--- MATRIX ---');
-  console.log(`  ${pad('arm', 14)} ${pad('page', 10)} ${pad('verdict', 18)} ${pad('start', 14)} ${pad('tap', 28)} blockers`);
+  console.log(`  ${pad('arm', 16)} ${pad('page', 10)} ${pad('verdict', 18)} ${pad('start', 14)} ${pad('tap', 24)} ${pad('boot', 26)} blockers`);
   for (const x of result.verdicts) {
     const st = x.verdict === null ? '' : (x.startEnabled || []).map((e) => (e ? 'enabled' : 'DISABLED')).join(',');
     // The tap column is the one that would have caught the shipped bug: an
@@ -962,8 +1064,9 @@ async function main() {
       : x.tapTarget === null || x.tapTarget === undefined ? '-'
       : x.tapStartedAnyway ? `STARTED via ${x.tapTarget}`
       : `inert (${x.tapTarget})`;
-    console.log(`  ${pad(x.arm, 14)} ${pad(x.page, 10)} ${pad(x.verdict === null ? 'VOID (no verdict)' : x.verdict, 18)}`
-      + ` ${pad(st, 14)} ${pad(tap, 28)} ${(x.blockers || []).join(',')}`);
+    const boot = x.verdict === null ? '' : (x.bootWitness === null ? '-' : x.bootWitness);
+    console.log(`  ${pad(x.arm, 16)} ${pad(x.page, 10)} ${pad(x.verdict === null ? 'VOID (no verdict)' : x.verdict, 18)}`
+      + ` ${pad(st, 14)} ${pad(tap, 24)} ${pad(boot, 26)} ${(x.blockers || []).join(',')}`);
     if (x.verdict === null) console.log(`      ${x.void}`);
     else if (x.verdict === 'FAILS-SILENTLY') console.log(`      !! ${x.why}`);
   }
@@ -971,7 +1074,7 @@ async function main() {
   console.log('\n--- ARM-DIFFERENCE PROOFS (an arm without one measured nothing) ---');
   for (const x of result.verdicts) {
     if (x.page !== pages[0].id) continue;   // one line per arm
-    console.log(`  ${pad(x.arm, 14)} ${x.proofHeld ? 'HELD' : 'DID NOT HOLD'} — ${x.proof}`);
+    console.log(`  ${pad(x.arm, 16)} ${x.proofHeld ? 'HELD' : 'DID NOT HOLD'} — ${x.proof}`);
   }
 
   const tt = result.verdicts.filter((x) => x.touch);
