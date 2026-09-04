@@ -1447,7 +1447,10 @@ function startServer() {
               // the two counted drop reasons, i.e. the XF/BP mismatch return or the
               // null-pipeline skip, neither of which has a counter of its own.
               const lost = row.fReal - row.fDrawn - row.fCull - row.fZero;
-              const per = (n) => (row.drawn > 0 ? (n / row.drawn).toFixed(0) : '--');
+              // Divide by the FRAME COUNT in this window (dpe), not by row.drawn,
+              // which is frames per SECOND — dividing a whole-window total by a
+              // per-second rate inflates every figure by the window length.
+              const per = (n) => (dpe > 0 ? (n / dpe).toFixed(0) : '--');
               console.log('[gpu-boundary] t=' + row.tsec + 's  /frame: flushReal=' + per(row.fReal)
                 + ' drawn=' + per(row.fDrawn) + ' cull=' + per(row.fCull)
                 + ' zeroIdx=' + per(row.fZero) + ' LOST=' + per(lost)

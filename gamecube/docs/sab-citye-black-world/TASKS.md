@@ -169,6 +169,52 @@ different scene**, and the distinction matters for the mechanism.
 > screenshot is a full 3D cinematic. Use it only in the positive direction (a
 > fully coloured canvas cannot happen by accident), and prefer screenshots.
 
+### F5. The restore path does NOT break rendering in general — a matched self-test
+
+The obvious next suspicion was "any savestate restore leaves the renderer in a
+bad state". It does not. One run (`/tmp/gcw/selftest.log`, same frozen binary,
+`probe_lock`-serialized, load 5.35 → 9.45) does the whole experiment inside
+itself:
+
+1. cold-boot SAB, screenshot at t=138 s — **the title screen renders correctly**
+   (`/tmp/gcw/self-t138-BEFORE.png`);
+2. `PROBE_SAVE_STATE` at t=140 s — the port saves its own state
+   (8,976,696 gz bytes);
+3. `PROBE_LOAD_STATE` of *that same file* at t=170 s — restore proven (worker
+   `ack ok=true`, `RESTORE-OK bytes=92835094`, and the CoreTiming/MEM1
+   discontinuity witness);
+4. screenshot at t=176 s — **the title screen renders correctly again**
+   (`/tmp/gcw/self-t176-AFTER.png`), and at t=230 s the run is drawing a fully
+   textured, lit 3D cinematic (`/tmp/gcw/self-t230-AFTER.png`).
+
+So restoring a state captured from a known-good rendering moment reproduces the
+good rendering. **The black world is specific to the City Escape state, not to
+the restore mechanism.** (The white frame at t=190 in that run is the attract
+sequence's own transition, not a defect — t=230 is correct 3D.)
+
+### F6. Nothing is dropped anywhere in the submit path
+
+The same run carries the new `[gpu-boundary]` census. Across **every** window of
+the whole 260 s run, before and after the restore:
+
+```
+flushReal == fDrawn == DrawIndexed-enter == ENCODED
+LOST = 0   cull = 0   zeroIdx = 0   nullPipe = 0   bail = 0
+wgpuErr = 0/t0        ablation switches = 0/0/0/0/0
+```
+
+Every flush that is not a no-op reaches `DrawIndexed` **and** is encoded into a
+render pass. That **kills H1 and H2 below**: neither the sticky null pipeline
+(`VertexManagerBase.cpp:1037`/`:1266-1271`) nor the XF/BP texgen-colorchan
+mismatch return (`:806-827`) is discarding anything on this build. It also
+clears the two uncounted exits inside `DrawIndexed`, since `ENCODED` equals
+`enter`.
+
+> ⚠ These `[gpu-boundary]` numbers were captured on the SAB **attract sequence**,
+> not on the restored City Escape scene. The equivalent run for City Escape is
+> queued; until it lands, "nothing is dropped" is established for the attract
+> path only.
+
 ---
 
 ## 4. Working hypotheses on the black world, and their kill criteria
@@ -176,11 +222,20 @@ different scene**, and the distinction matters for the mechanism.
 Ranked by fit to F3/F4. **None of these is confirmed.** The measurement that
 separates them is described in §5.
 
+**Status after F5/F6: H1 and H2 are KILLED, and H3's general form is REFUTED.**
+What survives is scene-specific: something about *this state* — not about
+restoring in general, and not about the submit path — makes the world produce no
+pixels while its draws are encoded normally. The two live leads are (a) the
+City Escape state file is itself a bad artifact (it was written by the port on
+2026-08-29 and there is no evidence its video chunk was ever round-tripped), and
+(b) SAB's TMEM-preloaded textures (`GXLoadTexObjPreLoaded` is in the guest PC
+census) do not survive this particular restore. Neither is measured yet.
+
 | # | hypothesis | why it fits | kill criterion |
 |---|---|---|---|
-| H1 | **Sticky null pipeline.** `VertexManagerBase::UpdatePipelineObject` sets `m_current_pipeline_object = nullptr` **and clears `m_pipeline_config_changed`** (`VertexManagerBase.cpp:1266-1271`), so a config that fails once is **never retried**; the draw is then dropped at the **uncounted** `if (m_current_pipeline_object)` at `:1037`. | Sticky for as long as the scene keeps using that GX state, and heals when the game moves to a different state — exactly F4's shape. The flush census bumps `kFluDrawn` at `:1019`, i.e. **before** `:1037`, so this loss is invisible to every counter that existed. | `dEnter` (`0x026B3560`, DrawIndexed entries) ≈ `fDrawn` per frame ⇒ dead. |
-| H2 | **XF/BP texgen-or-colorchan mismatch** → silent `return` at `VertexManagerBase.cpp:806-827`. | Inherently differential: multi-texgen world vs 1-texgen HUD. No SAB counter, only `ERROR_LOG_FMT`. | `fReal - fDrawn - fCull - fZero` ≈ 0 per frame ⇒ dead. |
-| H3 | **Stale texture cache across the restore.** `TextureCacheBase::DoState` invalidates after `DoLoadState` **only when the backend is OGL** (`TextureCacheBase.cpp:563-569`, `__LIBRETRO__`-gated); the canonical backend's `CONFIG_NAME` is `"WGPU"` (`VideoBackends/WGPU/VideoBackend.h:20`) vs `"OGL"` (`VideoBackends/OGL/VideoBackend.h:24`), so it does not run on the shipping path. Upstream has no such call at all (`~/gc_refs/dolphin/.../TextureCacheBase.cpp:549-560`). | Restore-triggered, sticky, heals when the scene's textures are replaced. SAB uses TMEM-preloaded textures (`GXLoadTexObjPreLoaded` is in the guest PC census), which are not re-hashed from RAM the way ordinary textures are. | Draws reach the pass (`dEnc` high) **and** the world stays black ⇒ still live; `dEnc` ≈ 0 ⇒ the loss is upstream of the GPU and this is not it. |
+| H1 | ~~**Sticky null pipeline.**~~ **KILLED (F6)** `VertexManagerBase::UpdatePipelineObject` sets `m_current_pipeline_object = nullptr` **and clears `m_pipeline_config_changed`** (`VertexManagerBase.cpp:1266-1271`), so a config that fails once is **never retried**; the draw is then dropped at the **uncounted** `if (m_current_pipeline_object)` at `:1037`. | Sticky for as long as the scene keeps using that GX state, and heals when the game moves to a different state — exactly F4's shape. The flush census bumps `kFluDrawn` at `:1019`, i.e. **before** `:1037`, so this loss is invisible to every counter that existed. | `dEnter` (`0x026B3560`, DrawIndexed entries) ≈ `fDrawn` per frame ⇒ dead. |
+| H2 | ~~**XF/BP texgen-or-colorchan mismatch**~~ **KILLED (F6)** → silent `return` at `VertexManagerBase.cpp:806-827`. | Inherently differential: multi-texgen world vs 1-texgen HUD. No SAB counter, only `ERROR_LOG_FMT`. | `fReal - fDrawn - fCull - fZero` ≈ 0 per frame ⇒ dead. |
+| H3 | ~~**Stale texture cache across the restore (general form)**~~ **REFUTED (F5)** — `TextureCacheBase::DoState` invalidates after `DoLoadState` **only when the backend is OGL** (`TextureCacheBase.cpp:563-569`, `__LIBRETRO__`-gated); the canonical backend's `CONFIG_NAME` is `"WGPU"` (`VideoBackends/WGPU/VideoBackend.h:20`) vs `"OGL"` (`VideoBackends/OGL/VideoBackend.h:24`), so it does not run on the shipping path. Upstream has no such call at all (`~/gc_refs/dolphin/.../TextureCacheBase.cpp:549-560`). | Restore-triggered, sticky, heals when the scene's textures are replaced. SAB uses TMEM-preloaded textures (`GXLoadTexObjPreLoaded` is in the guest PC census), which are not re-hashed from RAM the way ordinary textures are. | Draws reach the pass (`dEnc` high) **and** the world stays black ⇒ still live; `dEnc` ≈ 0 ⇒ the loss is upstream of the GPU and this is not it. |
 | — | ~~Viewport/`pixelcentercorrection` not re-armed on load~~ | `XFStateManager::DoState` re-arms only `m_projection_changed`, not `m_viewport_changed` (`XFStateManager.cpp:46-51`), and that block is the sole writer of `pixelcentercorrection` and sole caller of `SetScissorAndViewport` (`VertexShaderManager.cpp:337-392`). | **KILLED.** `SetViewportChanged()` is called unconditionally on any XF viewport write (`XFStructs.cpp:117-126`) or BP scissor write (`BPStructs.cpp:146-151`), regardless of whether the value changed, so it self-heals within one frame. It remains a real first-frame-after-restore gap, but cannot hold a scene black for 100 s. |
 | — | ~~The emscripten device-gates drop the world~~ | — | **KILLED** by measurement: `0x026B336C` and `0x026B3370` both read 0 in all 27 windows. |
 
