@@ -220,7 +220,16 @@ def build_image(iso, relname, base, live_section, dol, mapfile, boundaries='oute
     # switch table lives there, so without them the bctr shape cannot be classified
     # as recoverable -- it merely "translates", into an sr_indirect() that faults.
     if sections:
-        bases = {(m.id, i): v[0] for i, v in sections.items()}
+        # Same synthetic base for a module that is NOT resident as branch_relocs uses,
+        # so a cross-overlay reference cannot KeyError here.  SAB never exercises this
+        # (every overlay checked imports only from module 0 and itself -- titleD id=1,
+        # stg13D id=13, advertiseD id=91 all show exactly {0, self}), but a missing
+        # base would crash the classification rather than degrade it.
+        bases = collections.defaultdict(
+            lambda: 0, {(mid, s): 0xA0000000 + (mid << 20) + (s << 12)
+                        for mid, r in m.all_relocs() for s in (r["ref_sec"],)
+                        if mid not in (0, m.id)})
+        bases.update({(m.id, i): v[0] for i, v in sections.items()})
         bases[(m.id, sec)] = base
         want = [i for i, v in sections.items()
                 if not v[2] and i != sec and m.sections[i]["size"]
