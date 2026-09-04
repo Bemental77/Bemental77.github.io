@@ -78,6 +78,37 @@ IRQ_HOST_NAMES = ("SAB_OSDisableInterrupts", "SAB_OSEnableInterrupts",
 CLOCK_HOST_NAMES = ("SAB_OSGetTime", "SAB_OSGetTick", "SAB_PPCMtdec")
 
 
+# The CONTEXT host boundary, split into the two tiers sr_host_os.c actually has, because
+# they are serviceable under DIFFERENT runtime requirements and an offline gate that
+# conflated them would arm candidates that cannot run:
+#
+#   CTX  -- OSSetCurrentContext / OSGetCurrentContext / OSClearContext.  Pure guest-memory
+#           + GPR + MSR transcriptions of ~/gc_refs/dolsdk2001/src/os/OSContext.c:200-238
+#           and :390-395.  NO host thread, no -pthread: sr_host_os.c services them in
+#           SR_OS_CTX, which is SR_OS_IRQ plus exactly these three.
+#   HLE  -- OSSaveContext / OSLoadContext / SelectThread.  OSSaveContext is a setjmp that
+#           returns TWICE and OSLoadContext is its rfi, so neither can be a host C function
+#           on its own (CONTEXT_SWITCH.md §2, measured under BOTH longjmp backends).  The
+#           cut is SelectThread, one host thread per guest thread, and it needs -pthread
+#           and sr_os_init().  Passing these to --host WITHOUT linking that build produces
+#           a candidate whose replay faults, which is the exact failure this file's
+#           docstring exists to prevent.
+#
+# Read from the SHIPPED WORDS, not the map -- sab.map does not name 0x800e56bc or
+# 0x800ebd68 at all (they come back `zz_800e56bc_` / `zz_800ebd68_`), and it has been
+# WRONG twice elsewhere in this family.  Verified at HEAD:
+#   0x800e579c OSClearContext   38a00000 li r5,0    / b0a301a0 sth r5,0x1a0(r3)  <- mode
+#                               3c808000 lis r4,0x8000 / b0a301a2 sth r5,0x1a2(r3) <- state
+#                               800400d8 lwz r0,0xd8(r4) / 7c030040 cmplw r3,r0
+#                               40820008 bne +8 / 90a400d8 stw r5,0xd8(r4) / 4e800020 blr
+#   0x800e5630 OSGetCurrentContext 3c608000 / 806300d4 lwz r3,0xd4(r3) / 4e800020
+#   0x800e55d4 OSSetCurrentContext 3c808000 / 906400d4 stw r3,0xd4(r4) / 546500be clrlwi
+#                               90a400c0 / 80a400d8 / 7c051800 cmpw r5,r3 / 40820020 bne
+CTX_HOST_NAMES = ("SAB_OSSetCurrentContext", "SAB_OSGetCurrentContext",
+                  "SAB_OSClearContext")
+HLE_HOST_NAMES = ("SAB_OSSaveContext", "SAB_OSLoadContext", "SAB_SelectThread")
+
+
 def _hosts_from_header(names, why):
     """-> tuple of guest addresses, read out of sr_host_os.h by name."""
     hdr = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sr_host_os.h")
@@ -92,6 +123,8 @@ def _hosts_from_header(names, why):
 
 IRQ_HOSTS = _hosts_from_header(IRQ_HOST_NAMES, "SR_OS_IRQ")
 CLOCK_HOSTS = _hosts_from_header(CLOCK_HOST_NAMES, "clock")
+CTX_HOSTS = _hosts_from_header(CTX_HOST_NAMES, "SR_OS_CTX")
+HLE_HOSTS = _hosts_from_header(HLE_HOST_NAMES, "SR_OS_HLE")
 
 
 def classify_dol(img, byaddr, min_size, hosts=()):
@@ -131,6 +164,17 @@ def main():
                          'PPCMtdec is worth +0 on its own but -112 when dropped from '
                          'the composed set, because SetTimer uses it with OSGetTime '
                          '(~/gc_refs/dolsdk2001/src/os/OSAlarm.c:37-46).')
+    ap.add_argument('--ctx-hosts', action='store_true',
+                    help='shorthand for --host on the THREAD-FREE context set '
+                         '(OSSetCurrentContext / OSGetCurrentContext / OSClearContext) '
+                         '-- what a build running sr_host_os.c in SR_OS_CTX services. '
+                         'Needs no -pthread and creates no host thread.')
+    ap.add_argument('--hle-hosts', action='store_true',
+                    help='shorthand for --host on the set that needs the HOST THREAD '
+                         'POOL (OSSaveContext / OSLoadContext / SelectThread). ONLY '
+                         'valid against a build linked -pthread and initialised with '
+                         'sr_os_init() (SR_OS_HLE); against any other build these arm '
+                         'candidates that fault on replay.')
     ap.add_argument('--new-only', action='store_true',
                     help='arm ONLY entries that the --host set newly unblocks, i.e. '
                          'those refused by the same gate without it.  This is what '
@@ -177,6 +221,10 @@ def main():
         hosts |= set(IRQ_HOSTS)
     if a.clock_hosts:
         hosts |= set(CLOCK_HOSTS)
+    if a.ctx_hosts:
+        hosts |= set(CTX_HOSTS)
+    if a.hle_hosts:
+        hosts |= set(HLE_HOSTS)
     if hosts:
         print("[shapes] host-bound (closure stops here, sr_host_hook services it): "
               + ", ".join(f"{h:#010x}" for h in sorted(hosts)))

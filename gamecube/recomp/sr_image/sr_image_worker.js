@@ -126,6 +126,11 @@ function bind(M) {
     devReads: '_sr_image_dev_reads', devWrites: '_sr_image_dev_writes',
     exiClears: '_sr_image_exi_clears', setExiModel: '_sr_image_set_exi_model',
     setWatchdog: '_sr_image_set_watchdog', setStrict: '_sr_image_set_strict',
+    // sr_host_os.c's mode.  sr_image_init() installs SR_OS_IRQ (the MSR family + the
+    // clock, no threading); `osMode` is the RUN-TIME switch that widens or narrows it
+    // on ONE binary with ONE md5, which is the only way this boundary can be measured
+    // against a falsifying control arm without a relink standing between the readings.
+    osMode: '_sr_os_mode', osGetMode: '_sr_os_get_mode',
   };
   const api = {}, missing = [];
   for (const [k, name] of Object.entries(want)) {
@@ -233,6 +238,12 @@ self.onmessage = async (e) => {
     api.setExiModel(msg.exiModel === 0 ? 0 : 1);
     api.setWatchdog((msg.watchdog | 0) >>> 0);      // 0 = off
     api.setStrict(msg.strict ? 1 : 0);
+    // THE GUEST-OS MODE.  sr_image_init() has just set SR_OS_IRQ (3).  Passing a
+    // different mode here is what turns the CONTEXT family on, and passing nothing
+    // leaves the build exactly as §10 measured it — so `osMode` off IS the control
+    // arm for every context-boundary claim, taken on the same wasm.
+    if (msg.osMode !== undefined && msg.osMode !== null) api.osMode(msg.osMode | 0);
+    const osMode = api.osGetMode();
 
     say('status', { text: 'fetching main.dol' });
     const dol = await fetchBin(base + 'sab_main.dol');
@@ -264,6 +275,7 @@ self.onmessage = async (e) => {
       globals: OS_GLOBALS.map(([ea, v, why]) =>
         ({ ea: '0x' + ea.toString(16), v: '0x' + (v >>> 0).toString(16), why })),
       arm,
+      osMode,
     });
 
     // ---- THE BOOT.
@@ -370,7 +382,7 @@ self.onmessage = async (e) => {
     say('done', {
       mode: msg.mode || 'whole',
       arm: { exiModel: msg.exiModel === 0 ? 0 : 1, watchdog: (msg.watchdog | 0) >>> 0,
-             strict: msg.strict ? 1 : 0 },
+             strict: msg.strict ? 1 : 0, osMode: api.osGetMode() },
       returned: ret === null ? null : '0x' + ret.toString(16),
       threw, ms, steps,
       fault: '0x' + (api.fault() >>> 0).toString(16),

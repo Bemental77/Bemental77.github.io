@@ -3684,6 +3684,302 @@ argument for a broad differential, made again for a broad scene set.
   across attempts — it currently starts each run with a fresh `out` dict and overwrites
   `OUT`, so a retry DISCARDS the previous attempt's captures.
 
+## 12. THE CONTEXT BOUNDARY — the boot's stall and the closure blocker turn out NOT to be the same function
+
+§10.2b named `0xC60E579C` = `OSClearContext` as the whole-image boot's third wall, and
+§11.8 named `OSSetCurrentContext` / `OSSaveContext` / `OSLoadContext` (216 / 198 / 198)
+as the largest remaining closure blockers. Those two readings invited one conclusion —
+"the context family is both the stall and the lever, build it once and both move" — and
+**measurement splits them apart**:
+
+* the function the boot faults on, `OSClearContext`, is worth **−1** to closure. It
+  translates perfectly; it is only a wall because `build_image.sh` `--host`-binds it and
+  `SR_OS_IRQ` does not answer for it. **The wall was self-inflicted by the host set.**
+* the closure lever is `OSSetCurrentContext` (+15 alone, −22 dropped) together with
+  `OSLoadContext` and `SelectThread`, and the whole family is worth **+58**, not the
+  ~200 the blast-radius table reads like.
+* what actually blocks the rest is **cache maintenance**, and that is now the top of the
+  table by a wide margin.
+
+Reproduce with:
+
+```bash
+# closure: every arm from ONE process, ONE classify(), against a HERMETIC HEAD snapshot
+python3 gamecube/recomp/sr/fixture_dol.py --shapes-only --irq-hosts --clock-hosts --new-only
+python3 gamecube/recomp/sr/fixture_dol.py --shapes-only --irq-hosts --clock-hosts --ctx-hosts --new-only
+python3 gamecube/recomp/sr/fixture_dol.py --shapes-only --irq-hosts --clock-hosts --ctx-hosts --hle-hosts --new-only
+# execution: the whole-image boot, TWO ARMS ON ONE BINARY switched at run time
+SRP_ROOT=<tree> SRP_MODE=whole SRP_WATCHDOG=3000000 node gamecube/tools/sr_image_probe.mjs
+SRP_ROOT=<tree> SRP_MODE=whole SRP_WATCHDOG=3000000 SRP_OSMODE=4 node gamecube/tools/sr_image_probe.mjs
+```
+
+### 12.0 ⚠ MEASURE FROM A HERMETIC SNAPSHOT — this section is the reason
+
+The first two closure arms taken here reported a BASELINE of **3,581** and the third
+reported **3,623**, on an input that cannot change. The instrument was fine: a sibling
+agent was editing `gamecube/recomp/sr/sr.py` in the shared working tree — 88,678 B at
+15:13, 95,086 B at 15:51, different again at 16:00 — and a translator that refuses less
+makes every arm read higher. The same 16-address set read **4,588** against the live tree
+and **4,325** against HEAD.
+
+Every number below comes from `git archive HEAD` into a scratch tree, HEAD's `sr.py`
+md5 `482edfe01d21ee2b6c1bae1c1144af1e`, and it reproduces §9.7's **4,080** and §11.3's
+**4,269** exactly. **A baseline that moves is the tell** — when it does, stop and pin the
+translator before believing any delta computed against it.
+
+### 12.1 The set, read from the SHIPPED WORDS — and `sab.map` is now wrong FOUR times
+
+```
+0x800e579c OSClearContext        38a00000 li r5,0        / b0a301a0 sth r5,0x1a0(r3)   <- mode
+                                 3c808000 lis r4,0x8000  / b0a301a2 sth r5,0x1a2(r3)   <- state
+                                 800400d8 lwz r0,0xd8(r4) <- __OSFPUContext
+                                 7c030040 cmplw r3,r0 / 40820008 bne +8
+                                 90a400d8 stw r5,0xd8(r4) / 4e800020 blr
+0x800e5630 OSGetCurrentContext   3c608000 / 806300d4 lwz r3,0xd4(r3) <- __OSCurrentContext / blr
+0x800e55d4 OSSetCurrentContext   3c808000 / 906400d4 / 546500be clrlwi r5,r3,2 / 90a400c0
+                                 80a400d8 / 7c051800 cmpw r5,r3 / 40820020 bne _disableFPU
+                                 ... 7cc000a6 mfmsr / 60c60002 ori 2 / 7cc00124 mtmsr / blr
+                                 _disableFPU: 54c604e2 rlwinm r6,r6,0,19,17 (x2) / 4c00012c isync
+0x800e56bc OSLoadContext         3c80800e / 80c30198 lwz r6,srr0 / 38a478ac / 7c062840 cmplw
+                                 ... the RAS window is literally 0x800e78ac..0x800e78bc
+```
+
+`OSClearContext` matches `~/gc_refs/dolsdk2001/src/os/OSContext.c:390-395` statement for
+statement, `OSSetCurrentContext` matches `:200-233` instruction for instruction including
+the `isync` on the `_disableFPU` arm, and `sr_host_os.c`'s `os_clear_context` /
+`os_set_current_context` transcribe the shipped **register** traffic (the `r5`/`r4`/`r0`
+clobbers and CR0), not the DOLSDK C.
+
+**Two more map errors, both inside `__OSThreadInit`'s own call sequence**, found by
+disassembling rather than by reading `sab.map`:
+
+| address | `sab.map` says | the shipped words say | DOLSDK |
+|---|---|---|---|
+| `0x800eba68` | `nlListContainer<P8SaveData>::__ct(void)` | `li r0,0 / stw r0,4(r3) / stw r0,0(r3) / blr` | **`OSInitThreadQueue`**, `OSThread.c:164-166` |
+| `0x800eba78` | `OSGetCurrentContext` | `lis r3,0x8000 / lwz r3,0xe4(r3) / blr` — reads `0x800000e4` | **`OSGetCurrentThread`**, `OSThread.c:168-170` |
+
+The second is the dangerous one: `0x800000e4` is `__gCurrentThread`, not `0x800000d4`
+`__OSCurrentContext`. An agent trusting the map would have host-bound `0x800eba78` as
+`OSGetCurrentContext` and returned the wrong global from a function whose name matched.
+The real `OSGetCurrentContext` is `0x800e5630`, which `sr_host_os.h` already had right.
+Counting `PPCMtwpar`/`DCZeroRange` (§11.2 and CLAUDE.md), **`sab.map` has now been wrong
+four times in this one neighbourhood.**
+
+### 12.2 `SR_OS_CTX` — a tier that needs no host thread
+
+`sr_host_call()` had one cut: `SR_OS_IRQ` answered the MSR family and refused everything
+else. That cut is in the wrong place, because the six "context" addresses are not one
+kind of thing:
+
+| tier | addresses | why it can be a host C function |
+|---|---|---|
+| **CTX** (`SR_OS_CTX`, new) | `OSSetCurrentContext`, `OSGetCurrentContext`, `OSClearContext` | straight-line, no control transfer — a host C function can *be* them. No `pthread`, no thread pool, no `-pthread`. |
+| **HLE** (`SR_OS_HLE`) | `OSSaveContext`, `OSLoadContext`, `SelectThread` | `OSSaveContext` RETURNS TWICE and `OSLoadContext` is its `rfi`; reachable only through the `SelectThread` cut, one host thread per guest thread (CONTEXT_SWITCH.md §2/§4) |
+
+`SR_OS_CTX` stops at the tier boundary and **refuses** the HLE three (`return 0`), so the
+caller's own unimplemented path faults and names them. It deliberately does not fall into
+the `SR_OS_TRACE` arms: TRACE's `OSLoadContext` performs the register half and *returns*
+instead of transferring control, which is exactly right for an oracle frozen at the `rfi`
+instant and exactly wrong for a running boot — the eight non-`SelectThread` call sites are
+exception-RETURN paths, and a silent return from one of those is a wrong body, not a
+missing one.
+
+### 12.3 The closure delta — +58, not ~200, and three of the six cost more than they buy
+
+`rel_shapes.classify` over the whole `outer+calls` set, all arms from ONE process against
+the pinned HEAD translator. `--ctx-hosts` and `--hle-hosts` are new shorthands in
+`fixture_dol.py`, and like `--irq-hosts` / `--clock-hosts` they are **parsed out of
+`sr_host_os.h` by name**, so the offline gate and the runtime switch cannot drift apart.
+
+| host set | closure-clean | vs 3,581 baseline | step |
+|---|---|---|---|
+| baseline (none) | 3,581 / 4,741 | — | — |
+| SR_OS_IRQ (7) — §9.7 | 4,080 | +499 | +499 |
+| + clock (10) — §11.3 | 4,269 | +688 | +189 |
+| + CTX-3 (13) | **4,282** | +701 | **+13** |
+| + CTX-3 + HLE-3 (16) — what `build_image.sh` binds today | **4,325** | +744 | +43 |
+| + the TRIMMED 3 `{OSSetCurrentContext, OSLoadContext, SelectThread}` (13) | **4,327** | **+746** | **+58** |
+
+**The trimmed set beats the full one.** Leave-one-out on top of the IRQ+clock floor
+(4,269), full = all six (4,325):
+
+| address | | alone | dropped |
+|---|---|---|---|
+| `0x800e55d4` | `OSSetCurrentContext` | **+15** | **−22** |
+| `0x800e5630` | `OSGetCurrentContext` | **−1** | **+1** |
+| `0x800e563c` | `OSSaveContext` | +0 | +0 |
+| `0x800e56bc` | `OSLoadContext` | +0 | **−4** |
+| `0x800e579c` | `OSClearContext` | **−1** | **+1** |
+| `0x800ebd68` | `SelectThread` | **+35** | **+1** |
+
+Read those rows as structure, not noise:
+
+* **`OSGetCurrentContext` and `OSClearContext` are net NEGATIVE.** Both translate cleanly;
+  host-binding them only removes them as fixture candidates and unblocks nothing. The
+  host bodies are not wrong — they are redundant with a correct translation.
+* **`OSSaveContext` is worth exactly nothing**, and structurally so: its *only* `bl` site
+  in the whole DOL is inside `SelectThread` (`os_boundary.txt`), so once `SelectThread` is
+  host-bound nothing can reach it. It is fully shadowed, not merely small.
+* **`OSLoadContext` is +0 alone and −4 dropped** — a pure pair member. Its nine `bl` sites
+  are one inside `SelectThread` and eight exception-return paths, and only the latter
+  eight can pay.
+* **`SelectThread` is +35 alone but +1 when dropped**: with `OSSaveContext` and
+  `OSLoadContext` host-bound, `SelectThread` itself becomes translatable, so binding it
+  costs it as a candidate. Third pair effect in this tree after `OSDisableInterrupts`
+  (§9.7) and `PPCMtdec` (§11.3) — **"alone" has now been a bad predictor of "worth" three
+  times running.**
+
+**Why +58 and not the ~200 §11.8 reads like.** That table lists COMPLETE blocker sets, so
+one function appears in several rows; `OSSetCurrentContext`'s 216 are overwhelmingly
+*also* blocked by something else. Re-run over the 414 that remain blocked at 4,327:
+
+| blocks | address | what |
+|---|---|---|
+| **190** | `0x800e4e4c` | `sc` — DCFlushRange |
+| **178** | `0x800e4e1c` | cache/sync/trap op x470 — DCInvalidateRange |
+| **53** | `0x800e4e80` | `sc` — DCStoreRange |
+| 31 / 31 / 29 | `0x80113fc0` / `0x80113f98` / `0x8011dc98` | `mtspr SPR913` (the GQR/quantised path) |
+| 28 | `0x8011c18c` | branch target `0x8011c140` is not a function start |
+| 21 | `0x800e34c4` | `sc` — PPCSync |
+| 14 / 13 | `0x800e4f4c` / `0x800e8e90` | `mfspr SPR1008` (HID0) |
+| 12 | `0x80169ae8` | `op31 xo=371` — the 2nd in-image timebase reader (§11.3 left it out on purpose) |
+
+**Cache maintenance is now the largest remaining closure boundary by a factor of three**,
+and it is the one boundary in the list `sr_image.c` already answers on structural grounds:
+its `IMG_D_VOID` case list holds `0x800e4e08`, `0x800e4e1c`, `0x800e4e4c`, `0x800e4e80`,
+`0x800e34c4`, `0x800e4f4c`, `0x800e4f5c`, `0x800e4f70`, `0x800e5074` because **there is no
+cache in this runtime to control** — `gekko_rt.h` maps one flat coherent buffer. The boot
+already treats them as no-ops; the offline gate has simply never been given the same set.
+
+### 12.4 The cache-maintenance boundary is TWICE the context one — and the two compose super-additively
+
+Same instrument, same pinned translator, same one-process discipline. `CACHE-9` is exactly
+the nine addresses `sr_image.c` **already** answers `IMG_D_VOID` and `build_image.sh`
+**already** passes to `--host`:
+
+| host set on top of the IRQ+clock floor | closure-clean | vs floor |
+|---|---|---|
+| floor (10) | 4,269 / 4,741 | — |
+| + CTX-paying-3 | 4,327 | **+58** |
+| + CACHE-9 | 4,386 | **+117** |
+| + CTX-paying-3 + CACHE-9 (22) | **4,585 / 4,741 = 96.71%** | **+316** |
+
+**+316 is far more than 58 + 117 = 175.** The two boundaries share 141 functions that need
+*both*, which is the fourth and largest pair effect in this tree — and it is why sizing
+either one alone under-reads it by roughly half.
+
+**What that does and does not mean.** The +316 is already true of the WHOLE-IMAGE build:
+`sr_image.c`'s `IMG_D_VOID` list holds all nine on the structural argument that *there is
+no cache in this runtime to control* (`gekko_rt.h` maps one flat coherent buffer), so the
+boot has been treating them as no-ops all along. It is **not** yet true of the FIXTURE rig:
+`build_fixture.sh` links `sr_driver.c` + `sr_host_os.c` and **never `sr_image.c`**, and
+`sr_host_os.c` answers no cache address at all. So arming those 316 candidates needs the
+`IMG_D_VOID` cache cases lifted out of `sr_image.c` into a TU both builds link, and then a
+`--cache-hosts` shorthand in `fixture_dol.py` parsed from the header like the other three.
+**That is the single largest measured closure step still available, and it is bookkeeping,
+not new semantics.**
+
+### 12.5 The fixture rig cannot evidence this boundary — a null, with its denominator
+
+Of **1,074 committed capture records** across every `gamecube/recomp/sr/sab_*.json`,
+**18** enter any of the six context addresses. Filtering to the ones a `SR_OS_CTX` build
+could actually replay — usable at capture time, entering CTX-3, and NOT entering the HLE-3
+that `SR_OS_CTX` refuses — leaves **3**, and all three are captures of the same function:
+`0x800e579c` `OSClearContext` itself, in `survey_all`, `survey_irongate` and
+`survey_mainmenu`.
+
+Those three cannot be replayed either, and the reason is the trim above: `OSClearContext`
+is `--host`-bound, so `sr.py` never emits a body to diff against. **Drop it from the host
+set — which the leave-one-out independently says gains +1 — and the same three captures
+become the first replayable evidence for it.** Nothing in the committed fixture set
+reaches `OSSetCurrentContext` usably at all, which is the same shape §11.5 hit for the
+clock. So the execution evidence for this boundary is the BOOT, below, not the rig.
+
+### 12.6 VERIFIED BY EXECUTION — the boot clears `0xC60E579C`, with the control arm inside the SAME binary
+
+One whole-image binary, hermetic (`git archive HEAD` + only `sr_host_os.{c,h}`), `-O1`,
+**47,897,286 B, wasm md5 `026245446e9f0feb02e7bcb80709d62d` — identical before AND after
+both arms**. The arms differ only by `SRP_OSMODE`, which calls the exported
+`_sr_os_mode` at run time; no relink stands between the readings. `sr_image_init()` still
+installs `SR_OS_IRQ`, so **the control arm is bit-for-bit the configuration §10 measured**.
+Machine load 5.62 / 5.41; both arms `whole` mode, `SRP_WATCHDOG=3000000`.
+
+| | **ARM A — control** (`SRP_OSMODE` unset → mode 3, `SR_OS_IRQ`) | **ARM B** (`SRP_OSMODE=4` → `SR_OS_CTX`) |
+|---|---|---|
+| `sr_os_get_mode()` | **3** | **4** |
+| `sr_image_boot()` fault | **`0xC60E579C`** | **`0x0`** |
+| `IMG_D_UNIMPL` addresses | **`0x800e579c` ×2, `0x800e55d4` ×1** | **(none)** |
+| `IMG_D_OS` addresses | `0x800e78ac`×46, `0x800e78d4`×45, `0x800e349c`×2, `0x800e3494`×1 | the same **plus `0x800e579c`×2, `0x800e55d4`×1** |
+| boundary crossings | 142 (17 distinct) | 142 (17 distinct) |
+| device registers first-touched | 24 | 24 |
+| device reads / writes / EXI clears | 3,000,001 / 25 / 2 | 3,000,001 / 25 / 2 |
+| last register touched | `0xCC005012` DSP/AI **write** | `0xCC005012` DSP/AI **write** |
+| ended by | watchdog, in `__OSInitAudioSystem` | watchdog, in `__OSInitAudioSystem` |
+
+**The delta is EXACTLY the facility's own addresses and nothing else**, and the counts are
+independently predicted: disassembling `__OSThreadInit` (`0x800eb940`, 296 B) gives its
+`bl` targets in order as `OSInitThreadQueue`, **`OSClearContext` (0x800eb9a8)**,
+**`OSSetCurrentContext` (0x800eb9b0)**, `OSInitThreadQueue` ×2, **`OSClearContext`
+(0x800eba4c)** — i.e. `OSClearContext` ×2 and `OSSetCurrentContext` ×1, which is precisely
+what moved from `UNIMPL` to `OS`. That call sequence is `~/gc_refs/dolsdk2001/src/os/
+OSThread.c:__OSThreadInit` line for line.
+
+**Read the unchanged columns honestly.** 142 crossings and 24 registers are the same in
+both arms because `sr.py`'s emitted bodies have no fault check between instructions
+(§10.3.3) — the control arm *also* ran on to the DSP wall, it just did so having skipped
+three calls and left `__OSCurrentContext`, `__OSCurrentPhysContext` and two `OSContext`
+`mode`/`state` fields unwritten. What arm B changes is that `__OSThreadInit` now performs
+its real work; what it does **not** change is where the boot stops.
+
+**The next wall is the one §10.2b already named — Wall 2, the DSP.** Both arms end at the
+device watchdog with `0xCC005012` (DSP/AI) as the last register touched, inside
+`__OSInitAudioSystem` (`0x800e4b74`), which `OSInit` calls immediately after
+`__OSThreadInit` (`bl` at `0x800e379c` then `0x800e37a0`). **No `SelectThread`
+(`0x800ebd68`) appears in either arm's boundary log**, so this boot never reaches a guest
+context *switch* — which is why it needed no host thread, no `-pthread`, and none of the
+`SR_OS_HLE` machinery.
+
+**Regression gate.** The committed context-switch suite, rebuilt through the changed
+`sr_host_os.c` (`build_ctxsw.sh` HLE wasm md5 `cc13b63808afd9b15af0872d427ad9e4`, TRACE
+oracle `16572a955c372bfaa36e43e7a7cf92bc`): **63 passed, 0 failed**, including the
+three-thread non-LIFO rotation on three distinct `pthread_t`
+(`0xd0a8`, `0x185f218`, `0x186fb10`) and control arm D, which still faults exactly
+`0xe00e78ac` with the host layer off.
+
+### 12.7 What this changes, ordered by measured payoff
+
+1. **Trim the host set.** Drop `0x800e5630` `OSGetCurrentContext` and `0x800e579c`
+   `OSClearContext` from `build_image.sh`'s `HOSTS`. Each is worth **+1** closure-clean,
+   each removes a host body that is redundant with a correct translation, and dropping
+   `OSClearContext` is what makes its **three** committed captures replayable (§12.5).
+   `0x800e563c` `OSSaveContext` can go too — it is worth exactly 0 and is fully shadowed
+   by `SelectThread` — but leaving it costs nothing either.
+2. **Give the FIXTURE rig the cache set the BOOT already has.** Lift `sr_image.c`'s nine
+   `IMG_D_VOID` cache cases into a TU `build_fixture.sh` also links, then add
+   `--cache-hosts` to `fixture_dol.py` parsed from the header. Measured: **4,269 → 4,585
+   (+316, 96.71% of 4,741)** when composed with the context set. Largest remaining
+   closure step, and it is bookkeeping rather than new semantics.
+3. **`SR_OS_HLE` for the boot** is still unbuilt and still needs `-pthread` +
+   `sr_os_init()`. Nothing in `__OSThreadInit` needs it — the whole boot wall cleared with
+   `SR_OS_CTX` and no host thread at all — so the trigger for doing it is the first
+   `SelectThread` the boot actually reaches, not this wall.
+4. **The device layer is still the boot's binding constraint**, exactly as §10.5 ordered
+   it. Clearing the context wall does not clear DSP.
+
+### 12.8 What is NOT claimed
+
+* **No renderer, no `drawn/s`, no frame.** Same as §10: there is no renderer on this path.
+* **`SR_OS_CTX` does not switch threads.** `OSSaveContext`, `OSLoadContext` and
+  `SelectThread` still fault by name. The context-switch mechanism in `CONTEXT_SWITCH.md`
+  is untouched, unbuilt into the image, and still measured at 63/0 in its own harness.
+* **The +316 cache figure is a CLOSURE number, not a verified-execution number.** It says
+  those functions and their callee graphs translate; it says nothing about whether they
+  are bit-exact, and the `DCInvalidateRange`-before-reading-a-DMA-written-buffer hole
+  `sr_image.c` documents is neither widened nor narrowed here.
+* **`0x800eba78` is `OSGetCurrentThread`, identified from its shipped words and DOLSDK,
+  not host-bound and not needed.** It is recorded because the map names it
+  `OSGetCurrentContext` and the next agent will otherwise re-find it the hard way.
+
 ## 7. Decision
 
 **The route is VIABLE for SAB on translatability grounds, and the remaining work

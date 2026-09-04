@@ -119,9 +119,15 @@ if (WALK_LIST.length) console.log('[srp] custom walk list:', WALK_LIST.map(
 // Arms. SRP_EXI=0 is the FALSIFYING CONTROL for the EXI zero-latency model: any claim
 // that the model unblocked something must reproduce the wedge with it off, on the SAME
 // binary and the same md5.
+// SRP_OSMODE is the same shape for the GUEST-OS boundary: unset leaves the build in the
+// SR_OS_IRQ mode sr_image_init() installs (README §10), so "unset" IS the control arm for
+// any claim about the context family, taken on the same binary and the same md5.
+//   0 = OFF   1 = HLE   2 = TRACE   3 = IRQ (the build default)   4 = CTX
 const ARM = { exiModel: process.env.SRP_EXI === '0' ? 0 : 1,
               watchdog: parseInt(process.env.SRP_WATCHDOG || '0', 10) >>> 0,
-              strict: process.env.SRP_STRICT === '1' };
+              strict: process.env.SRP_STRICT === '1',
+              osMode: process.env.SRP_OSMODE === undefined || process.env.SRP_OSMODE === ''
+                      ? null : parseInt(process.env.SRP_OSMODE, 10) };
 console.log('[srp] arm:', JSON.stringify(ARM));
 await page.evaluate((a) => { window.__srImageArm = a; }, ARM);
 await page.evaluate((m, w) => window.__srImageRun(m, w), MODE, WALK_LIST.length ? WALK_LIST : null);
