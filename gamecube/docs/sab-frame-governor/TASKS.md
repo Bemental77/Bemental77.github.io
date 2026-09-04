@@ -274,9 +274,37 @@ measured is the sign and size of the delta, not the reason for it.
       never passes the next scheduled event).
       `run_leaf_inline_mutants.sh` is the red-test gate: **5/5 mutants caught**
       (self-check, seam pairing, Store, CTR back-edge, SPR), control green.
-- [ ] **Re-price on a NAMED steady scene** (`SEG_SPLIT=1`, `SEG_MIN=4`, with a
-      screenshot), and decide the default there. Both arms are already available
-      from one binary via `?noleafinline=1`, so this is a probe-only task.
+- [x] **Decide the default.** DECIDED 2026-09-04 — **default is now OFF (splice
+      suppressed)**, and the deciding argument is CORRECTNESS, not price. On the
+      named steady scene `gamecube/states/sab-citye-gameplay.gcs.gz` (SAB City
+      Escape gameplay) the splice renders a **black world behind a live HUD**:
+      every draw is submitted and encoded, and none of it reaches the screen.
+      One binary `82bc8f8b` (md5 identical before **and** after every run), one
+      page, restore proven in all three arms:
+
+      | arm | `leafInline` | canvas `nonBlack` | world |
+      |---|---|---:|---|
+      | `?noleafinline=1` | `7011/0/0/0` | 307180/307200 | FULL 3D |
+      | default (after the fix) | `6989/0/0/0` | 307094/307200 | FULL 3D |
+      | `?noleafinline=0` | `8087/20/20/334` `lastIdlePc=80117e0c` | 4343/307200 | **BLACK** |
+
+      Cross-checked against the pre-splice binary `69e38d94` (`0e2dc92b`), which
+      renders the same savestate, and against native Dolphin. Full write-up:
+      `gamecube/docs/sab-citye-black-world/TASKS.md` §9 F13.
+      The fix is JS-only — `gamecube.html` now writes cell `0x026B3B74`
+      unconditionally, default `1`. ⚠ Do NOT read a perf win out of that table:
+      the black arm's higher `drawn/s` is an artifact of not drawing the world.
+- [ ] **Make the C++ side default-off too** (`JitWasm::TryCompileBlock` still
+      reads "cell == 0 ⇒ splice"), so an entry point that is not `gamecube.html`
+      cannot resurrect it. Needs a rebuild + its own matched pair.
+- [ ] **Explain WHY the splice blackens the scene.** The count is not the
+      trigger — `selftest` classifies the same 20 idle blocks on HEAD and renders
+      (its `lastIdlePc` is `0x800fe5c8`, not the governor), and the cold-boot run
+      classifies 15 *including* `0x80117e0c` and renders. So it is the splice
+      being live on the governor *while the gameplay scene runs*. The mechanism
+      (idle-classification stores `downcount = 0` in the block prologue,
+      `ppc_emit.cpp:1051-1055`, ending the CoreTiming slice on every execution)
+      is a plausible frame-pacing cause but is **NOT** proven.
 - [ ] `gamecube/ppc-worker/ppc_worker_main.cpp` does NOT call the splice — only
       the `dolphin_worker` path is wired. Left deliberately unwired while the
       measured payoff on the shipped path is negative.

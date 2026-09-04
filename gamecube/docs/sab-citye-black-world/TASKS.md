@@ -451,7 +451,7 @@ textures is lost across a restore.
   `window.__probeStateSize` exists for exactly this compat check.
   **The screenshot from that run is a stale frame and is not evidence.**
 
-### F12. Open: which commit — FIVE narrowed to THREE on source
+### F12. Which commit — FIVE narrowed to TWO on source (then settled by F13)
 
 Two of the five are **default-inert** and cannot be the cause of a run that
 passed only `?bjit_mips=1`:
@@ -536,3 +536,54 @@ from the query string, and the page that reads it is HEAD's — pin it.
 > symlink (`rm -f "$DEST/gamecube.html"`) before writing. Verify with
 > `[ -L "$DEST/gamecube.html" ]` and re-check `git status gamecube.html` after
 > staging.
+
+### F13. ROOT CAUSE, PROVEN — `8a4342e5`'s pure-leaf `bl` splice. FIXED.
+
+The kill switch `0b6b61e9` shipped settles it on the **shipping binary**, so no
+bisect arm was needed. One binary (`82bc8f8b`, md5 identical before **and** after
+every run), one page, the same savestate, `DISCONTINUITY PRESENT` +
+`RESTORE-OK bytes=92946703` in all three arms:
+
+| arm | `leafInline` cand/spliced/idle/bail | canvas `nonBlack` | world |
+|---|---|---:|---|
+| `?noleafinline=1` | `7011/`**`0/0`**`/0` | 307180/307200 = 100.0% | **FULL 3D** |
+| default, after this fix | `6989/`**`0/0`**`/0` | 307094/307200 = 100.0% | **FULL 3D** |
+| `?noleafinline=0` | `8087/`**`20/20`**`/334`, `lastIdlePc=80117e0c` | 4343/307200 = **1.4%** | **BLACK** (HUD only) |
+
+Shots: `/tmp/bw/leaf-OFF-t60.png`, `/tmp/bw/fix-default-t60.png`,
+`/tmp/bw/fix-control-t60.png`. The census is its own arm-difference proof — the
+candidate count is bumped on every arm and only `spliced`/`idle` move, so an
+all-zero row cannot be confused with "the census never ran".
+
+This also explains F12a's counter-evidence. `selftest` classifies 20 idle blocks
+too, but its `lastIdlePc` is `0x800fe5c8` (DSP mailbox), not `0x80117e0c`. **The
+count never mattered; which block is spliced does.** Every black run names the
+VI-retrace frame governor `0x80117e0c`; the cold-boot run that renders classifies
+15 and also names it, so the necessary condition is narrower still — the splice
+must be live on that block *while the gameplay scene is running*. Not chased
+further: the fix does not depend on it.
+
+**THE FIX (JS-only, no rebuild): `gamecube.html` now writes cell `0x026B3B74`
+unconditionally, defaulting to `1` = splice suppressed.** Previously it wrote the
+cell only when `?noleafinline` was present, so the shipped default depended on
+the SAB region happening to be browser-zeroed. `?noleafinline=0` restores the old
+behaviour for A/B work.
+
+⚠ **Do not read a perf win out of that table.** The black arm reports a *higher*
+`drawn/s` (21.2 vs 16.7–18.2) precisely because it is not drawing the world, so
+the rates are not comparable. `0b6b61e9`'s interleaved pair measured the splice at
+−5.0% guest / −8.1% published on a different scene; **this change is justified by
+correctness, not by speed**, and the fix may well cost presented fps now that the
+world is actually being drawn.
+
+**Follow-up, not done here:** the C++ default in `JitWasm::TryCompileBlock` is
+still "cell == 0 ⇒ splice", so any entry point that is *not* `gamecube.html`
+(a bespoke harness booting the worker directly) still gets the splice. Making the
+C++ side default-off needs a rebuild and should carry its own matched pair.
+`gamecube/ppc-worker/ppc_worker_main.cpp` never wired the splice, so it is
+unaffected.
+
+**Still open (pre-existing, not caused by the splice):** F4's late "recovery" —
+whether the scene that appears after ~120–167 s in the *black* arm is City Escape
+rendering correctly or a different scene. With the fix in place the scene renders
+from the first frame, so this is now a curiosity rather than a blocker.

@@ -2819,13 +2819,31 @@ window.GcRate = (function () {
     // ?bjit_mips=1. Census cells 0x026B3B60/64/68/70 are the arm-difference proof: the
     // candidate count is bumped on BOTH arms, only spliced/idle differ.
     // See gamecube/docs/sab-frame-governor/TASKS.md.
+    // [DEFAULT FLIPPED 2026-09-04 — the splice BREAKS RENDERING] The default is now
+    // 1 = splice SUPPRESSED. It was 0 = active, and that shipped a black world:
+    // SAB City Escape gameplay renders geometry that never reaches the screen. The
+    // page writes this cell unconditionally now, so the shipped default no longer
+    // depends on the SAB region happening to be browser-zeroed.
+    //   PROVEN on ONE binary (wasm 82bc8f8b, md5 identical before AND after every run),
+    //   ONE page, the same savestate, restore proven in all three arms:
+    //     ?noleafinline=1  leafInline 7011/0/0/0     canvas 307180/307200 -> FULL 3D
+    //     default (fixed)  leafInline 6989/0/0/0     canvas 307094/307200 -> FULL 3D
+    //     ?noleafinline=0  leafInline 8087/20/20/334 canvas   4343/307200 -> BLACK (HUD only)
+    //   Shots: /tmp/bw/{leaf-OFF,fix-default,fix-control}-t60.png. Cross-checked against
+    //   the pre-splice binary 69e38d94 (0e2dc92b), which renders the same state
+    //   (/tmp/bw/old-t60.png), and against native Dolphin (/tmp/bw/native-last.png).
+    // ⚠ Do NOT read a perf win out of that table: the black arm reports a HIGHER
+    // drawn/s (21.2 vs 16.7-18.2) precisely because it is not drawing the world, so
+    // the rates are not comparable. 0b6b61e9's own interleaved pair measured the
+    // splice at -5.0% guest / -8.1% published, which is a separate result on a
+    // different scene; this change is justified by CORRECTNESS, not by speed.
+    // ?noleafinline=0 restores the old behaviour for A/B work.
+    // See gamecube/docs/sab-citye-black-world/TASKS.md §9.
     try {
       var _bileaf = new URLSearchParams(location.search).get('noleafinline');
-      if (_bileaf !== null) {
-        var _bil = (parseInt(_bileaf, 10) !== 0) ? 1 : 0;
-        new Uint32Array(sharedMemory.buffer)[0x026B3B74 >> 2] = _bil;
-        pageLog('[leaf-inline] splice ' + (_bil ? 'DISABLED (control arm)' : 'enabled (default)'));
-      }
+      var _bil = (_bileaf === null) ? 1 : ((parseInt(_bileaf, 10) !== 0) ? 1 : 0);
+      new Uint32Array(sharedMemory.buffer)[0x026B3B74 >> 2] = _bil;
+      pageLog('[leaf-inline] splice ' + (_bil ? 'DISABLED (default)' : 'ENABLED (?noleafinline=0)'));
     } catch (e) { pageLog('[leaf-inline] toggle write failed: ' + (e && e.message)); }
     // [fifo-brake ESCAPE HATCH 2026-08-29] The host-side GX FIFO backpressure brake
     // (CommandProcessorManager::BemFifoBackpressure, CommandProcessor.cpp:426) ships DEFAULT ON
