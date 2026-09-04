@@ -259,6 +259,24 @@ class GDB:
             a += k
         return bytes(out)
 
+    def send_cont(self):
+        """Send 'c' and DO NOT read the reply.  Pairs with await_stop()."""
+        self._send("c")
+        self._dirty = True
+
+    def await_stop(self, timeout=120.0) -> str:
+        """Read the next stop packet WITHOUT sending anything.
+
+        THE ONLY LEGAL WAY TO WAIT A LONG TIME.  After 'c' the guest is running and
+        this stub has no async break, so a client that gives up on the read must NOT
+        then send another packet -- including another 'c'.  The stub is not listening
+        while the CPU runs, so the second 'c' sits in the socket, gets processed after
+        the eventual stop, and resumes the guest behind the client's back; every
+        exchange from there on is off by one.  Waiting for a rare event (a cold boot
+        reaching OSLink) therefore means: send_cont() ONCE, then await_stop() in a
+        loop, treating a timeout as "not yet" rather than as a reason to act."""
+        return self._read_packet(timeout=timeout)
+
     def settle(self, timeout=30.0):
         """Restore the socket timeout.
 

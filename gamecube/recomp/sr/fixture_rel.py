@@ -328,37 +328,46 @@ def wait_for_link(g, oslink_pc, budget, poll=None):
     the section would return unrelocated bytes.  So this then breakpoints the return
     address in LR and continues, and only reports success once OSLink has returned.
     """
-    g.add_bp(oslink_pc)
-    t0 = time.time()
-    lr = None
-    while time.time() - t0 < budget:
-        try:
-            rep = g.cont(timeout=max(5.0, min(120.0, budget - (time.time() - t0))))
-        except Exception:
-            print(f"[oslink]   t+{time.time() - t0:.0f}s  still booting", flush=True)
-            continue
-        if O.GDB.stop_pc(rep) == oslink_pc:
+    def wait_for(pc_want, deadline, label):
+        """cont ONCE, then read stop packets until `pc_want` or the deadline.
+
+        `g.cont()` is deliberately NOT used in the loop: it SENDS 'c' every call, and
+        after a timeout the guest is still running with the stub not listening, so the
+        extra 'c' is queued and resumes the guest behind our back.  Send once, then
+        await_stop() -- a timeout there means "not yet", not "act"."""
+        g.settle()
+        g.send_cont()
+        while time.time() < deadline:
+            try:
+                rep = g.await_stop(timeout=min(60.0, max(5.0, deadline - time.time())))
+            except (OSError, TimeoutError):
+                print(f"[oslink]   t+{time.time() - t0:.0f}s  {label}", flush=True)
+                continue
+            if O.GDB.stop_pc(rep) == pc_want:
+                g.resync()
+                return True
             g.resync()
-            lr = g.reg(67)
-            print(f"[oslink] OSLink entered at t+{time.time() - t0:.0f}s; "
-                  f"returns to {lr:#010x}", flush=True)
-            break
-        g.resync()
-    g.del_bp(oslink_pc)
-    if lr is None:
+            g.send_cont()
         return False
-    g.add_bp(lr)
+
+    t0 = time.time()
+    g.add_bp(oslink_pc)
+    hit = wait_for(oslink_pc, t0 + budget, "still booting")
+    g.del_bp(oslink_pc)
+    if not hit:
+        return False
+    lr = g.reg(67)
+    print(f"[oslink] OSLink entered at t+{time.time() - t0:.0f}s; "
+          f"returns to {lr:#010x}", flush=True)
     t1 = time.time()
-    while time.time() - t1 < max(60.0, budget - (time.time() - t0)):
-        try:
-            rep = g.cont(timeout=60.0)
-        except Exception:
-            continue
-        if O.GDB.stop_pc(rep) == lr:
-            break
-        g.resync()
+    g.add_bp(lr)
+    ok = wait_for(lr, t1 + max(120.0, budget - (t1 - t0)), "waiting for OSLink to return")
     g.del_bp(lr)
     g.resync()
+    if not ok:
+        print("[oslink] OSLink never returned; the module may be only partly linked",
+              file=sys.stderr)
+        return False
     print(f"[oslink] OSLink returned after {time.time() - t1:.0f}s — the module is "
           f"enqueued AND relocated", flush=True)
     return True
