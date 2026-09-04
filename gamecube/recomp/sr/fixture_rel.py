@@ -373,6 +373,36 @@ def wait_for_link(g, oslink_pc, budget, poll=None):
     return True
 
 
+def trace_alignment(stream):
+    """(score, n_branches) from a capture's OWN instruction stream.
+
+    THE INTEGRITY GATE FOR A TRACE, and it is free -- the stream is already recorded.
+    `GDB.check_alignment`'s docstring carries the measurement that makes it necessary:
+    a trace taken after a breakpoint stop WITHOUT `resync()` scores 0.0003 while a
+    clean one scores 0.996, i.e. A DESYNCHRONISED TRACE LOOKS ENTIRELY PLAUSIBLE AND
+    IS ENTIRELY WRONG.  `capture_replayable_fixture` never scored it, so the only way
+    such a capture ever surfaced was as a replay MISMATCH -- read as a translator bug.
+
+    Every unconditional branch (primary opcode 18) has an architectural target that is
+    computable from the word alone; the next PC in the stream must equal it.  Returns
+    (None, 0) for a body with no such branch, so a leaf is never failed for a
+    denominator it cannot have.
+    """
+    ok = bad = 0
+    for i in range(len(stream) - 1):
+        pc, w = stream[i][0], stream[i][1]
+        if ((w >> 26) & 0x3F) != 18:
+            continue
+        li = (w >> 2) & 0xFFFFFF
+        if li & 0x800000:
+            li -= 0x1000000
+        tgt = ((li << 2) if ((w >> 1) & 1) else (pc + (li << 2))) & 0xFFFFFFFF
+        ok += (tgt == stream[i + 1][0])
+        bad += (tgt != stream[i + 1][0])
+    n = ok + bad
+    return (ok / n if n else None), n
+
+
 def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusal,
                  on_executed=lambda fired: None):
     """Capture each candidate AT THE MOMENT ITS BREAKPOINT FIRES.
@@ -402,6 +432,37 @@ def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusa
     buys almost no EMULATED time: 300 s of wall clock reached only 10 distinct entries
     of 300.  Deleting each candidate once it has been captured makes the guest get
     progressively faster through a wave.
+
+    ------------------------------------------------------------------------------
+    `--capture-at-enum` -- THE THIRD THING, and it is why 774 entries EXECUTED while
+    only 371 were ever VERIFIED (README §9.8).  Point 1 above is true of the wave
+    against the ONE-AT-A-TIME flow it replaced, but the two-phase shape below still
+    needs the entry reached TWICE: ENUMERATION fires the breakpoint and DELETES it
+    (that is what makes enumeration cheap), and the capture wave then re-arms it and
+    waits for the entry to be reached AGAIN inside `--wave-budget`.  The entries a new
+    SCENE contributes are by construction the once-per-scene ones, which is exactly
+    the population a second-reach wave cannot catch.  MEASURED: a targeted pass arming
+    only the 165 new-and-uncaptured Iron Gate entries enumerated 166/166 in 10 s on
+    four separate runs and then captured SIX in 576 s.
+
+    With `--capture-at-enum` the fixture is taken AT THE ENUMERATION FIRE, before the
+    breakpoint is deleted, so ONE reach is sufficient and the executed set and the
+    capturable set become the same population.  The wave phase is kept and runs over
+    whatever the enum phase did not capture, so nothing regresses and each fixture
+    records `captured_at` = "enum" | "wave" for attribution.
+
+    THE ONE THING THAT CHANGES UNDER IT: the rest of the armed set is still armed while
+    the capture single-steps.  `--enum-disarm all` (the default) removes every armed
+    breakpoint first and puts them back after, which is exactly what the wave phase
+    already does for its own live set, at a cost of 2*|still armed| RSP packets per
+    capture.  `--enum-disarm none` skips that, and the reason it is believed safe is a
+    code read, not a hunch: `Interpreter::SingleStep()`
+    (dolphin-src/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp:195-214) does NOT
+    call `CheckAndHandleBreakPoints`; the only interpreter call site is inside `Run()`
+    (:261), i.e. the RUNNING loop, so a step that lands on an armed address does not
+    trap.  The oracle is a released Dolphin.app whose revision cannot be confirmed
+    against that tree, so BOTH policies score `trace_alignment` on every capture and a
+    desync is refused rather than replayed.
     """
     # ---------------------------------------------------------------- ENUMERATE
     # WHICH CANDIDATES ACTUALLY EXECUTE IN THIS SCENE.  A shape-spread candidate set
@@ -430,18 +491,38 @@ def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusa
     # guarantees a stop inside a quarter of a wave.  Calibration runs with every
     # candidate armed, i.e. the slowest regime, so a period measured there is an upper
     # bound on the period later; the guarantee only gets stronger.
+    capture_at_enum = bool(getattr(a, 'capture_at_enum', False))
+    disarm = getattr(a, 'enum_disarm', 'all')
+    min_align = float(getattr(a, 'min_align', 0.90))
+    min_align_n = int(getattr(a, 'min_align_branches', 4))
+
     anchor_off = a.anchor_off
     for off in arm:
         g.add_bp(base + off)
+    if anchor_off is not None and anchor_off not in set(arm):
+        # A NAMED ANCHOR OUTSIDE THE ARM SET WAS SILENTLY NEVER ARMED, which leaves the
+        # phase with nothing that can hand control back -- the exact condition the
+        # anchor exists to prevent, and it would present as a `cont` that never returns.
+        g.add_bp(base + anchor_off)
+        print(f"[survey] --anchor-off +{anchor_off:#x} is not in the arm set; "
+              f"armed separately as the control anchor", flush=True)
     if anchor_off is None:
         print(f"[survey] calibrating an anchor over {a.anchor_budget:.0f}s ...",
               flush=True)
-        hits, t0 = collections.Counter(), time.time()
-        while time.time() - t0 < a.anchor_budget:
+        # RECORD *WHEN* EACH CANDIDATE FIRES, not just how often.  Taking the rarest
+        # candidate under wave_budget/4 was measured to lose three whole runs: at the
+        # defaults that bar is cleared by TWO HITS, two hits is not a rate, and when
+        # the parked scene moved on the anchor stopped being called, the `cont` blocked
+        # past --cont-timeout and the run aborted with nothing written (README §9.8).
+        # A rate needs a MINIMUM SAMPLE, and liveness needs the candidate to still be
+        # firing at the END of the window -- neither is inferable from a total.
+        hits, last_hit, tc0 = collections.Counter(), {}, time.time()
+        while time.time() - tc0 < a.anchor_budget:
             rep = g.cont(timeout=a.cont_timeout)
             pc = O.GDB.stop_pc(rep)
             if pc is not None and (pc - base) in bodies:
                 hits[pc - base] += 1
+                last_hit[pc - base] = time.time() - tc0
             g.resync(quiet=0.05)
         if not hits:
             for off in arm:
@@ -450,16 +531,37 @@ def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusa
                              "breakpoint that can hand control back there is no safe "
                              "way to run a capture wave (this stub has no async break)")
         want_period = max(1.0, a.wave_budget / 4.0)
-        okc = [(a.anchor_budget / n, off) for off, n in hits.items()
-               if a.anchor_budget / n <= want_period]
-        period, anchor_off = max(okc) if okc else \
-            (a.anchor_budget / hits.most_common(1)[0][1], hits.most_common(1)[0][0])
-        if not okc:
-            print(f"[survey] WARNING: nothing fires at least every {want_period:.0f}s; "
-                  f"using the most frequent candidate anyway", file=sys.stderr)
+        min_hits = int(getattr(a, 'anchor_min_hits', 8))
+        tail = a.anchor_budget * 2.0 / 3.0
+        def _rarest(cands, why):
+            return (max(cands), why) if cands else (None, None)
+        # Tier 1: enough samples to BE a rate, fast enough for a wave, and still alive
+        # in the last third of the window.  Rarest of those -- rare is what buys
+        # emulated time, but only among candidates that have earned the guarantee.
+        pick, tier = _rarest([(a.anchor_budget / n, off) for off, n in hits.items()
+                              if n >= min_hits and a.anchor_budget / n <= want_period
+                              and last_hit[off] >= tail],
+                             f"rarest with >={min_hits} hits, period <={want_period:.0f}s, "
+                             f"still firing after t+{tail:.0f}s")
+        if pick is None:      # Tier 2: drop the liveness test, keep the sample floor
+            pick, tier = _rarest([(a.anchor_budget / n, off) for off, n in hits.items()
+                                  if n >= min_hits and a.anchor_budget / n <= want_period],
+                                 f"rarest with >={min_hits} hits (NO liveness proof)")
+        if pick is None:      # Tier 3: the old rule, which is what lost the three runs
+            pick, tier = _rarest([(a.anchor_budget / n, off) for off, n in hits.items()
+                                  if a.anchor_budget / n <= want_period],
+                                 "rarest under the period bar ONLY (<8 hits: NOT a rate)")
+        if pick is None:
+            off = hits.most_common(1)[0][0]
+            pick, tier = (a.anchor_budget / hits[off], off), "most frequent (no candidate cleared any bar)"
+        if not tier.startswith("rarest with >=%d hits, period" % min_hits):
+            print(f"[survey] WARNING: anchor fell back to '{tier}' — this is the "
+                  f"heuristic that aborted three runs mid-enumeration; prefer "
+                  f"--anchor-off on a frame-loop entry", file=sys.stderr)
+        period, anchor_off = pick
         print(f"[survey] anchor = +{anchor_off:#x} ({base + anchor_off:#010x}), "
               f"{hits[anchor_off]} hits in {a.anchor_budget:.0f}s = one per "
-              f"{period:.1f}s (rarest that still fires within {want_period:.0f}s); "
+              f"{period:.1f}s, last seen t+{last_hit[anchor_off]:.0f}s [{tier}]; "
               f"{len(hits)} candidates fired during calibration", flush=True)
 
     pending = set(arm)
@@ -475,23 +577,96 @@ def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusa
     # the run aborted with 0 captured. Stopping after --enum-idle seconds without a
     # NEW candidate exits the phase while stops are still arriving, so the capture
     # wave gets the rest of the scene instead of the run getting nothing.
+    #
+    # THE ENUM BUDGET IS GUEST-RUNNING TIME, NOT WALL CLOCK.  Under --capture-at-enum
+    # the captures happen inside this loop and the guest is STOPPED for all of them,
+    # so charging them to --enum-budget / --enum-idle would end the phase on work that
+    # bought no emulated time -- and would make the "executed" number depend on how
+    # many fixtures were taken, which is exactly the comparison this mode exists to
+    # make.  `t_cap` is subtracted from both deadlines.
+    done, captured, t_cap = 0, set(), 0.0
     t0 = last_new = time.time()
-    while pending and time.time() - t0 < a.enum_budget:
-        if time.time() - last_new > a.enum_idle:
-            print(f"[survey] no new candidate for {a.enum_idle:.0f}s — ending "
-                  f"enumeration early at t+{time.time() - t0:.0f}s", flush=True)
+    cap_at_last_new = 0.0
+    disarm_report = []
+
+    def _capture_here(off, phase, still_armed):
+        """Take the fixture at the stop we are ALREADY holding.  -> True if captured.
+
+        The caller owns breakpoint removal (capture_replayable_fixture's contract), and
+        `still_armed` is what has to come off first under --enum-disarm all.
+        """
+        nonlocal done, t_cap
+        t_c0 = time.time()
+        entry = base + off
+        print(f"[capture@{phase}] {entry:#010x} (+{off:#x}) "
+              f"[{len(still_armed)} still armed] ...", flush=True)
+        t_disarm = t_rearm = 0.0
+        if still_armed:
+            t_d = time.time()
+            for o in still_armed:
+                g.del_bp(base + o)
+            t_disarm = time.time() - t_d
+        ok = False
+        try:
+            fx = O.capture_replayable_fixture(
+                g, entry, syms=osyms, max_steps=a.max_steps, progress=5000,
+                prefetch=prefetch, at_entry=True)
+            score, nbr = trace_alignment(fx["stream"])
+            fx["trace_alignment"] = score
+            fx["trace_branches"] = nbr
+            fx["captured_at"] = phase
+            fx["armed_during_capture"] = 0 if still_armed else len(pending)
+            on_fixture(fx, off)
+            done += 1
+            captured.add(off)
+            ok = True
+        except Exception as e:                                   # noqa: BLE001
+            on_refusal(off, entry, f"{type(e).__name__}: {e}")
+        finally:
+            if still_armed:
+                t_r = time.time()
+                for o in still_armed:
+                    g.add_bp(base + o)
+                t_rearm = time.time() - t_r
+            t_cap += time.time() - t_c0
+        if still_armed and len(disarm_report) < 5:
+            # THE COST OF THE SAFE POLICY, MEASURED RATHER THAN ASSUMED.  2*|armed|
+            # RSP packets per capture is the whole price of --enum-disarm all; print
+            # it for the first few so a run says what that price actually was.
+            disarm_report.append((len(still_armed), t_disarm, t_rearm))
+            print(f"[capture@{phase}]   disarm {len(still_armed)} bp in {t_disarm:.2f}s, "
+                  f"rearm in {t_rearm:.2f}s", flush=True)
+        return ok
+
+    while pending and time.time() - t0 - t_cap < a.enum_budget:
+        if (time.time() - last_new) - (t_cap - cap_at_last_new) > a.enum_idle:
+            print(f"[survey] no new candidate for {a.enum_idle:.0f}s of guest time — "
+                  f"ending enumeration early at t+{time.time() - t0:.0f}s "
+                  f"({t_cap:.0f}s of that was capture)", flush=True)
             break
         rep = g.cont(timeout=a.cont_timeout)
         pc = O.GDB.stop_pc(rep)
         off = (pc - base) if pc is not None else None
         if off in pending:
             fired.append(off)
-            last_new = time.time()
+            last_new, cap_at_last_new = time.time(), t_cap
             g.del_bp(base + off)
             pending.discard(off)
+            if capture_at_enum and not (a.capture_budget and t_cap >= a.capture_budget):
+                _capture_here(off, "enum",
+                              (tuple(pending) + (anchor_off,)) if disarm == 'all' else ())
+                last_new, cap_at_last_new = time.time(), t_cap
             if len(fired) % 10 == 0:
                 print(f"[survey]   {len(fired)} fired, {len(pending)} still armed, "
-                      f"t+{time.time() - t0:.0f}s", flush=True)
+                      f"{done} captured, t+{time.time() - t0:.0f}s "
+                      f"({t_cap:.0f}s capture)", flush=True)
+            # A PARTIAL EXECUTED SET USED TO BE WORTH NOTHING.  on_executed ran only
+            # after the phase completed, so the three runs that died mid-enumeration
+            # (README §9.8) lost the enumeration they had already paid for.  Publish
+            # it as it grows -- but not on every fire, because the caller's callback
+            # rewrites a multi-megabyte artifact.
+            if len(fired) % 25 == 0:
+                on_executed(fired)
         g.resync(quiet=0.05)
     for off in pending:
         g.del_bp(base + off)
@@ -502,7 +677,12 @@ def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusa
                          "that can hand control back, a capture wave cannot be run "
                          "safely (there is no async break)")
     print(f"[survey] {len(fired)} of {len(arm)} candidates executed in "
-          f"{time.time() - t0:.0f}s; {len(pending)} never did", flush=True)
+          f"{time.time() - t0:.0f}s ({t_cap:.0f}s of it capture); "
+          f"{len(pending)} never did", flush=True)
+    if capture_at_enum:
+        print(f"[survey] captured AT THE ENUMERATION FIRE: {done} of {len(fired)} "
+              f"executed ({100.0 * done / max(len(fired), 1):.1f}%); "
+              f"--enum-disarm {disarm}", flush=True)
     # RECORD THE EXECUTED SET.  It is the survey's real denominator -- what this scene
     # exercises at all -- and it is expensive to rediscover (this pass is the single
     # longest phase).  A later targeted run can skip straight to capture with
@@ -513,12 +693,16 @@ def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusa
                    f"never executed in {a.enum_budget:.0f}s of this scene", quiet=True)
     anchor = base + anchor_off
 
-    todo = [o for o in arm if o in set(fired)]
-    done, t_all = 0, time.time()
+    # THE WAVE PHASE IS KEPT UNDER --capture-at-enum, over whatever the enum phase did
+    # not take (a capture that raised, or one deferred by --capture-budget).  Keeping
+    # both paths live is what makes the two flows A/B-able on one binary and one scene
+    # instead of on two tool versions.
+    todo = [o for o in arm if o in set(fired) and o not in captured]
+    t_all, t_cap_enum = time.time(), t_cap
     W = max(1, a.wave)
     i = 0
     while i < len(todo):
-        if a.capture_budget and time.time() - t_all >= a.capture_budget:
+        if a.capture_budget and time.time() - t_all + t_cap_enum >= a.capture_budget:
             print(f"[survey] budget {a.capture_budget:.0f}s spent; "
                   f"{len(todo) - i} candidate(s) not attempted", flush=True)
             break
@@ -532,7 +716,7 @@ def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusa
         g.add_bp(anchor)
         t_w = time.time()
         while live_set and time.time() - t_w < a.wave_budget:
-            if a.capture_budget and time.time() - t_all >= a.capture_budget:
+            if a.capture_budget and time.time() - t_all + t_cap_enum >= a.capture_budget:
                 break
             rep = g.cont(timeout=a.cont_timeout)
             pc = O.GDB.stop_pc(rep)
@@ -541,23 +725,9 @@ def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusa
                 g.resync(quiet=0.05)
                 continue
             # Stopped AT the entry.  Take every breakpoint off before stepping.
-            for o in live_set:
-                g.del_bp(base + o)
-            g.del_bp(anchor)
-            entry = base + off
-            print(f"[capture] {entry:#010x} (+{off:#x}) ...", flush=True)
-            try:
-                fx = O.capture_replayable_fixture(
-                    g, entry, syms=osyms, max_steps=a.max_steps, progress=5000,
-                    prefetch=prefetch, at_entry=True)
-                on_fixture(fx, off)
-                done += 1
-            except Exception as e:
-                on_refusal(off, entry, f"{type(e).__name__}: {e}")
+            g.del_bp(base + off)
             live_set.discard(off)
-            for o in live_set:
-                g.add_bp(base + o)
-            g.add_bp(anchor)
+            _capture_here(off, "wave", tuple(live_set) + (anchor_off,))
         for o in live_set:
             g.del_bp(base + o)
         g.del_bp(anchor)
@@ -592,6 +762,42 @@ def main():
                          'A SURVEY needs this: --capture-n alone cannot bound the run '
                          'because a candidate that fired during discovery and then '
                          'never again costs --capture-cont-timeout before it is refused.')
+    ap.add_argument('--capture-at-enum', action='store_true',
+                    help='CAPTURE AT THE ENUMERATION FIRE, before the breakpoint is '
+                         'deleted, instead of re-arming it for a second wave.  The '
+                         'two-phase default needs the entry reached TWICE, and the '
+                         'entries a new scene contributes are the once-per-scene ones '
+                         '-- MEASURED: 166/166 enumerated, 6 captured (README §9.8). '
+                         'The wave phase still runs afterwards over whatever the enum '
+                         'phase did not take, so both flows stay comparable on one run.')
+    ap.add_argument('--enum-disarm', choices=['all', 'none'], default='all',
+                    help='under --capture-at-enum, whether to remove the REST of the '
+                         'armed set before single-stepping a capture.  all (default) is '
+                         'what the wave phase already does, at 2*|armed| RSP packets per '
+                         'capture.  none skips it: Interpreter::SingleStep() does not '
+                         'call CheckAndHandleBreakPoints (only Interpreter::Run() does), '
+                         'so a step onto an armed address should not trap -- but the '
+                         'oracle is a released Dolphin.app, so trace_alignment is scored '
+                         'either way and a desync is refused, never replayed.')
+    ap.add_argument('--min-align', type=float, default=0.50,
+                    help='refuse a capture whose own instruction stream scores below '
+                         'this on branch-target self-consistency.  A desynchronised '
+                         'trace scores ~0.0003 where a clean one scores ~0.996, and it '
+                         'is otherwise INVISIBLE until it reads as a translator bug. '
+                         'The default is deliberately LOOSE, not tight: GDB.trace()\'s '
+                         'own docstring measures a clean post-breakpoint segment at 0.89 '
+                         'MEDIAN, so a bar near 0.9 would refuse good captures.  0.50 '
+                         'separates a catastrophic desync from ordinary jitter and '
+                         'nothing in between; the score is recorded on every fixture '
+                         'either way, so a tighter bar can be applied offline.')
+    ap.add_argument('--min-align-branches', type=int, default=4,
+                    help='minimum unconditional branches before --min-align is applied; '
+                         'a leaf with none must not be failed for a denominator of 0.')
+    ap.add_argument('--anchor-min-hits', type=int, default=8,
+                    help='minimum calibration hits before a candidate may be the control '
+                         'anchor.  At the old defaults the period bar was cleared by TWO '
+                         'hits, two hits is not a rate, and three runs died mid-'
+                         'enumeration when that anchor stopped being called.')
     ap.add_argument('--capture-cont-timeout', type=float, default=20.0,
                     help='seconds to wait for a candidate to be reached again during '
                          'capture.  Exceeded = REFUSED ("never reached"), never a '
@@ -1094,7 +1300,10 @@ def main():
             # TRUNCATED; either scores as a translation defect when replayed, and
             # neither is one.  verify_fixture.mjs already honours `usable:false` and
             # prints the reason -- the sab_nonleaf suite carries three such records.
-            if fx["unknown_stores"] or not fx["returned"]:
+            al, nbr = fx.get("trace_alignment"), fx.get("trace_branches", 0)
+            desync = (al is not None and nbr >= a.min_align_branches
+                      and al < a.min_align)
+            if fx["unknown_stores"] or not fx["returned"] or desync:
                 fx["usable"] = False
             print(f"    steps={fx['steps']} returned={fx['returned']} "
                   f"bl={fx['n_calls']} writes={len(fx['writes'])} "
@@ -1108,11 +1317,14 @@ def main():
             json.dump(out, open(OUT, "w"))
 
         def on_refusal(off, entry, why, quiet=False):
+            # See fixture_dol.py's on_refusal: a QUIET refusal must not re-serialise
+            # the whole artifact -- there is one per never-executed candidate.
             if not quiet:
                 print(f"    REFUSED: {why}", flush=True)
             out["refused"].append({"entry": entry, "rel_off": off, "why": why,
                                    "shape": shape_by_off.get(off)})
-            json.dump(out, open(OUT, "w"))
+            if not quiet:
+                json.dump(out, open(OUT, "w"))
 
         if a.survey:
             try:

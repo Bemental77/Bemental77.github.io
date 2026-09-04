@@ -184,6 +184,11 @@ def main():
                     help='run the OFFLINE candidate census and exit -- no Dolphin, no '
                          'probe lock.  Always do this before taking the lock.')
     ap.add_argument('--survey', action='store_true')
+    ap.add_argument('--append', action='store_true',
+                    help='resume into an existing OUT instead of starting empty: its '
+                         'fixtures are carried forward and their entries are dropped '
+                         'from the arm list.  Without it the previous artifact is still '
+                         'KEPT (renamed .<mtime>.bak) rather than overwritten.')
     ap.add_argument('--max-arm', type=int, default=300)
     ap.add_argument('--min-body', type=lambda x: int(x, 0), default=0x20,
                     help='skip bodies smaller than this (default 8 instructions). A '
@@ -207,6 +212,42 @@ def main():
     ap.add_argument('--enum-idle', type=float, default=45.0)
     ap.add_argument('--enum-budget', type=float, default=420.0)
     ap.add_argument('--capture-budget', type=float, default=0.0)
+    ap.add_argument('--capture-at-enum', action='store_true',
+                    help='CAPTURE AT THE ENUMERATION FIRE, before the breakpoint is '
+                         'deleted, instead of re-arming it for a second wave.  The '
+                         'two-phase default needs the entry reached TWICE, and the '
+                         'entries a new scene contributes are the once-per-scene ones '
+                         '-- MEASURED: 166/166 enumerated, 6 captured (README §9.8). '
+                         'The wave phase still runs afterwards over whatever the enum '
+                         'phase did not take, so both flows stay comparable on one run.')
+    ap.add_argument('--enum-disarm', choices=['all', 'none'], default='all',
+                    help='under --capture-at-enum, whether to remove the REST of the '
+                         'armed set before single-stepping a capture.  all (default) is '
+                         'what the wave phase already does, at 2*|armed| RSP packets per '
+                         'capture.  none skips it: Interpreter::SingleStep() does not '
+                         'call CheckAndHandleBreakPoints (only Interpreter::Run() does), '
+                         'so a step onto an armed address should not trap -- but the '
+                         'oracle is a released Dolphin.app, so trace_alignment is scored '
+                         'either way and a desync is refused, never replayed.')
+    ap.add_argument('--min-align', type=float, default=0.50,
+                    help='refuse a capture whose own instruction stream scores below '
+                         'this on branch-target self-consistency.  A desynchronised '
+                         'trace scores ~0.0003 where a clean one scores ~0.996, and it '
+                         'is otherwise INVISIBLE until it reads as a translator bug. '
+                         'The default is deliberately LOOSE, not tight: GDB.trace()\'s '
+                         'own docstring measures a clean post-breakpoint segment at 0.89 '
+                         'MEDIAN, so a bar near 0.9 would refuse good captures.  0.50 '
+                         'separates a catastrophic desync from ordinary jitter and '
+                         'nothing in between; the score is recorded on every fixture '
+                         'either way, so a tighter bar can be applied offline.')
+    ap.add_argument('--min-align-branches', type=int, default=4,
+                    help='minimum unconditional branches before --min-align is applied; '
+                         'a leaf with none must not be failed for a denominator of 0.')
+    ap.add_argument('--anchor-min-hits', type=int, default=8,
+                    help='minimum calibration hits before a candidate may be the control '
+                         'anchor.  At the old defaults the period bar was cleared by TWO '
+                         'hits, two hits is not a rate, and three runs died mid-'
+                         'enumeration when that anchor stopped being called.')
     a = ap.parse_args()
 
     img = sr.Image.from_dol(a.image)
@@ -315,6 +356,32 @@ def main():
            "capture": "gamecube/recomp/sr/fixture_dol.py",
            "oracle_binary": obin, "state": a.state, "boundaries": a.boundaries,
            "n_armed": len(arm), "fixtures": [], "refused": []}
+    # A RETRY USED TO DESTROY THE ATTEMPT BEFORE IT.  Every run started with a fresh
+    # `out` and overwrote OUT, and runs here are lost to causes outside the rig
+    # (README §9.8: four killed by `RSPError: stub closed the connection` with no
+    # crash report), so the natural response -- run it again -- discarded whatever the
+    # first attempt had already paid the oracle for.  Two changes, neither optional:
+    # the previous artifact is always kept, and --append resumes into it.
+    if os.path.exists(OUT):
+        keep = OUT + f".{int(os.path.getmtime(OUT))}.bak"
+        os.replace(OUT, keep)
+        print(f"[survey] kept the previous {OUT} as {keep}")
+        if a.append:
+            prev = json.load(open(keep))
+            out["fixtures"] = prev.get("fixtures", [])
+            out["refused"] = [r for r in prev.get("refused", [])
+                              if "never executed" not in r.get("why", "")]
+            if prev.get("executed"):
+                out["executed"] = prev["executed"]
+            have = {int(f["entry"]) if isinstance(f["entry"], int)
+                    else int(f["entry"], 16) for f in out["fixtures"]}
+            n0 = len(arm)
+            arm = [x for x in arm if x not in have]
+            print(f"[survey] --append: resuming into {len(out['fixtures'])} captured "
+                  f"fixtures; {n0 - len(arm)} of {n0} armed entries already done, "
+                  f"{len(arm)} left")
+            out["n_armed"] = len(arm)
+            out["appended_from"] = keep
     try:
         g = dol.connect()
         pc0 = g.pc()
@@ -350,6 +417,14 @@ def main():
             if not fx["returned"]:   bad.append("did not return (capture truncated)")
             if fx["unknown_stores"]: bad.append(f"{len(fx['unknown_stores'])} unknown store forms")
             if fx["ps1_dependency"]: bad.append(f"{len(fx['ps1_dependency'])} undefined PS1-lane reads")
+            # A DESYNCHRONISED TRACE IS PLAUSIBLE AND WRONG, and until now nothing
+            # scored it -- it could only surface as a replay MISMATCH, i.e. blamed on
+            # the translator.  fixture_rel.trace_alignment computes it from the
+            # capture's own stream at no cost.
+            al, nbr = fx.get("trace_alignment"), fx.get("trace_branches", 0)
+            if al is not None and nbr >= a.min_align_branches and al < a.min_align:
+                bad.append(f"trace desynchronised: branch-target alignment {al:.4f} "
+                           f"over {nbr} unconditional branches")
             fx["usable"] = not bad
             fx["unusable_reason"] = "; ".join(bad) if bad else None
             print(f"    steps={fx['steps']} returned={fx['returned']} "
@@ -359,16 +434,25 @@ def main():
                   f"outside_mem1={len(fx['outside_mem1'])} "
                   f"ps1_dep={len(fx['ps1_dependency'])} "
                   f"bctr={len(fx['bctr_executed'])} blrl={len(fx['blrl_executed'])} "
-                  f"usable={fx['usable']}", flush=True)
+                  f"align={al if al is None else round(al, 4)}/{nbr} "
+                  f"at={fx.get('captured_at')} usable={fx['usable']}", flush=True)
             out["fixtures"].append(fx)
             json.dump(out, open(OUT, "w"))
 
         def on_refusal(off, entry, why, quiet=False):
+            # A QUIET REFUSAL DOES NOT RE-SERIALISE THE ARTIFACT.  survey_waves emits
+            # one per never-executed candidate -- 2,297 of them on a 2,704-entry arm
+            # set -- and this used to json.dump the WHOLE `out` each time.  With 406
+            # captured fixtures in it that is tens of GB of writes and many minutes of
+            # wall clock, all of it while holding the probe lock, to record a set that
+            # is derivable from `executed` anyway.  main() dumps once when
+            # survey_waves returns, on both the success and the exception path.
             if not quiet:
                 print(f"    REFUSED: {why}", flush=True)
             out["refused"].append({"entry": entry, "why": why,
                                    "shape": shape_by.get(off)})
-            json.dump(out, open(OUT, "w"))
+            if not quiet:
+                json.dump(out, open(OUT, "w"))
 
         def on_executed(fired):
             out["executed"] = [f"{x:#010x}" for x in fired]
