@@ -2490,7 +2490,7 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
       void gen_interrupt(void); /* interrupt.h not included in this TU */
       uint32_t jit_entry_i = (func & UINT32_C(0xFFF)) / 4;
       struct precomp_instr* jit_entry = block->block + jit_entry_i;
-      static uint32_t jit_params[45];
+      static uint32_t jit_params[46];
       int jit_idx;
       jit_params[0] = func;                                        /* entry vaddr */
       jit_params[1] = (uint32_t)(uintptr_t)jit_entry;              /* entry precomp_instr* */
@@ -2553,7 +2553,17 @@ void recompile_block(const uint32_t *source, struct precomp_block *block, uint32
        * page must match before it trusts index 43 at all. Bump the magic
        * whenever the meaning of an existing index changes. */
       jit_params[43] = (uint32_t)(uintptr_t)&FCR31;
-      jit_params[44] = UINT32_C(0x4E36344A);                       /* 'N64J' — param-block version */
+      jit_params[44] = UINT32_C(0x4E36344B);                       /* 'N64K' — param-block version */
+      /* A JIT block is installed as the ENTRY instruction's ops, and the core
+       * calls `PC->ops()` for a BRANCH DELAY SLOT expecting it to execute
+       * EXACTLY ONE instruction -- FIN_BLOCK's delay-slot path
+       * (cached_interp.c:184-206) does that at every page boundary and then
+       * RESTORES `PC = inst+1`, discarding whatever PC the callee left. A
+       * multi-instruction block there runs the wrong code with delay_slot set
+       * and its last_addr/Count updates survive the PC restore, which wraps
+       * Count. The emitter needs to see the flag to refuse that entry, so
+       * export it. Measured on conker.z64 (n64/docs/jit/TASKS.md). */
+      jit_params[45] = (uint32_t)(uintptr_t)&g_dev.r4300.delay_slot;
       jit_idx = EM_ASM_INT({
          return (typeof window !== 'undefined' && window.myApp && window.myApp.jitCompile)
             ? (window.myApp.jitCompile($0) | 0) : 0;

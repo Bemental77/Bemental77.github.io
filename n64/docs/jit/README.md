@@ -76,7 +76,25 @@ compile error under the wasm flags).
    running block is never patched mid-flight (invalidation bites at next
    jump_to). adler32 CRC revalidation on TLB rewrites is perf-critical for
    TLB-heavy games.
-5. **Savestates**: serialize only runs between retro_run calls (JS-invoked,
+5. **A BLOCK ENTRY IS REACHABLE AS A BRANCH DELAY SLOT** (learned the hard way
+   2026-09-04 — this cost conker.z64 a frame-82 divergence and
+   gauntletLegends.z64 a wedge, and neither was an opcode bug). A JIT block is
+   installed as ONE instruction's `ops`, and the core calls `PC->ops()` in two
+   places that require **exactly one instruction** to execute:
+   `DECLARE_JUMP`'s delay slot (`cached_interp.c:87-91`), and — at EVERY 4KB
+   page boundary — `FIN_BLOCK`'s delay-slot path (`cached_interp.c:184-206`),
+   which `jump_to()`s the next page, calls that page's FIRST instruction as the
+   slot, and then **restores `PC = inst+1`**, discarding whatever PC the callee
+   left. A whole span running there executes instructions the guest never
+   issued, with `delay_slot` set, and its `last_addr`/`Count` writes SURVIVE the
+   PC restore — which is an unsigned `(PC->addr - last_addr) >> 2` away from
+   adding ~0xC0000000 to Count and collapsing `next_interrupt` to 0. The
+   emitter's block prologue therefore reads `g_dev.r4300.delay_slot`
+   (`jit_params[45]`) and, when set, calls the ENTRY instruction's ORIGINAL
+   interpreter op and returns. The reference trio never hits this path
+   (`#delayslot-entry` census bucket: mariokart 0, conker 1832, gauntlet 415),
+   which is exactly why it survived eleven waves of gating.
+6. **Savestates**: serialize only runs between retro_run calls (JS-invoked,
    single-threaded), so flush-at-block-exit register writeback is
    sufficient; savestate load calls invalidate_r4300_cached_code(0,0)
    (r4300_core.c:127-142) — the JIT must flush everything on that path and
@@ -135,7 +153,11 @@ compile error under the wasm flags).
     revision can be tested directly. Run this BEFORE burning a probe.
   - `tools/n64_jit_diff_test.mjs <rom> [frames] [jitMode]` — the oracle:
     per-VI architectural checksum, interpreter vs ?jit, with a mandatory
-    two-interpreter determinism control. **A ROM too slow to reach `frames`
+    two-interpreter determinism control. **Its interpreter arms pass `&jit=off`
+    and that is LOAD-BEARING** since the 2026-09-04 default flip: without the
+    opt-out the control arms would run the JIT too, the determinism control
+    would compare two JIT runs, and the whole differential would print PASS
+    while proving nothing. **A ROM too slow to reach `frames`
     inside the wait no longer throws** (2026-09-02): the expiry is caught and
     reported as `SLOW` / `WEDGED` / `NO CDP RESPONSE` by sampling
     `_neil_vi_total()` twice 5 s apart, and a truncated stream reads
@@ -153,6 +175,16 @@ compile error under the wasm flags).
     truncates a span to its first N instructions (legal: the block's
     fall-through exit already sets `PC = entryPtr + span*stride`). Feed either
     through `N64_EXTRA_QS` and binary-search on `firstDivergenceInCommonPrefix`.
+    **Its limit, learned on conker.z64 2026-09-04: it localises WHERE, and the
+    where can be innocent.** conker bisected cleanly to one block and one span
+    index whose emitted code was CORRECT — the defect was the block's ENTRY
+    context. The step that broke that deadlock was a third arm that changed the
+    suspect instruction's HANDLING rather than its identity (fall back and
+    *exit* vs fall back and *call in place*); when both spellings of the same
+    instruction diverge and the difference is only whether control returns to
+    the dispatcher, stop looking at emitters. And when the symptom is arithmetic
+    on core globals, instrument the CORE: a 20-line negative-delta detector in
+    `cp0_update_count` named this bug outright after two sessions of inference.
     On 2026-09-02 this took superMarioStarRoad from "somewhere in the emitter"
     to ONE block and ONE instruction in 5 rounds, and conker to the same in 15.
     **It is strictly better than the `?noemit=<class>` ablation**, which on
@@ -165,8 +197,10 @@ compile error under the wasm flags).
     `n64/N64Wasm/roms/`, one TSV row each (verdicts, emission stats, and the
     load + `CPU_Speed_Limit` that row was taken under) at
     `/tmp/n64-jit-sweep/summary.tsv`. This is the gate `a5efb66` set before the
-    `?jit` default can flip, and it exits nonzero unless every ROM is
-    PASS/PASS. **Since 2026-09-02 a timeout no longer produces `NOJSON`** — the
+    `?jit` default can flip; it went **27/27, exit 0, on 2026-09-04** and the
+    flip has happened, so from here it is the REGRESSION gate — it still exits
+    nonzero unless every ROM is PASS/PASS, and the shipped page now depends on
+    that. **Since 2026-09-02 a timeout no longer produces `NOJSON`** — the
     row reads `INCOMPLETE` with a `liveness` column (SLOW / WEDGED / NO CDP
     RESPONSE) and a `firstDiff` column giving any divergence inside the frames
     both arms DID reach. `NOJSON` now means the harness threw for some other

@@ -1202,6 +1202,21 @@
     var body = [];
     var EXIT = 1, TOP = 0;
     var i = 0;
+    // ---- DELAY-SLOT GUARD PRECONDITION ----
+    // `p.delaySlot` is &g_dev.r4300.delay_slot, behind the param-block version
+    // magic. Without it the block CANNOT tell that it was invoked as a branch
+    // delay slot (see the guard emitted at the bottom of this function), and an
+    // unguarded block is a guest-corrupting bug, not a missed optimisation. So a
+    // core too old to supply it gets NO jit at all — the whole ROM stays on the
+    // cached interpreter, which is the shipped default anyway.
+    if (!p.delaySlot) {
+      stats.noDelaySlotRejects = (stats.noDelaySlotRejects || 0) + 1;
+      if (stats.noDelaySlotRejects === 1 && typeof console !== 'undefined') {
+        console.warn('[jit] disabled: core does not export &delay_slot (param-block version skew)');
+      }
+      return 0;
+    }
+
     // ---- NULL-OPS GUARD (thewheel.z64 wedge, n64/docs/jit/TASKS.md:301) ----
     // Every interpreter-fallback path bakes a table index read at COMPILE time
     // (`HEAPU32[instrPtr >> 2]`) straight into a `call_indirect` -- slowArm:414
@@ -1470,9 +1485,51 @@
       storeI32Const(p.pcGlobal, p.entryPtr + p.span * p.stride)
     );
 
+    // ---- DELAY-SLOT ENTRY GUARD (conker.z64 frame-82 divergence, 2026-09-04) ----
+    // A JIT block is installed as ONE instruction's `ops`, and the core calls
+    // `PC->ops()` in two places that require it to execute EXACTLY ONE
+    // instruction and then return:
+    //   * DECLARE_JUMP's delay slot (`PC++; delay_slot=1; PC->ops();`,
+    //     cached_interp.c:87-90) — reachable whenever a block ENTRY address is
+    //     also some branch's `addr+4`;
+    //   * FIN_BLOCK's delay-slot path (cached_interp.c:184-206), which fires at
+    //     EVERY page boundary: it `jump_to()`s the next page, calls that page's
+    //     FIRST instruction as the slot, and then **RESTORES `PC = inst+1`** —
+    //     discarding whatever PC the callee left behind.
+    // A whole span running there is wrong twice over: it executes instructions
+    // the guest never issued (with `delay_slot` set, so any fault inside is
+    // recorded as a BD exception), and its `last_addr`/`Count` writes SURVIVE
+    // the PC restore. That is the conker.z64 bug, and it is a WRAP, not a
+    // drift: the block took its branch, wrote `last_addr = 0x1001402c`, and
+    // FIN_BLOCK then restored PC to 0x10014004, so the next
+    // `cp0_update_count()` computed `(0x10014004 - 0x1001402c) >> 2` = -40
+    // bytes as UNSIGNED — Count jumped by ~0xC0000000, `next_interrupt`
+    // collapsed to 0, and the guest fell into a permanent interrupt storm
+    // (599M gen_interrupt calls in 252 VI). Witnessed, not inferred: a
+    // temporary negative-delta watchdog in `cp0_update_count` fired exactly
+    // once in the ?jit arm with `PC->addr=0x10014004 last_addr=0x1001402c`
+    // and `delay_slot=1`, and ZERO times in the interpreter arm.
+    // The repair is the one the wave-8 slow arm already uses: hand the
+    // instruction back. `delay_slot != 0` means the caller wants one
+    // instruction, so run the ENTRY instruction's ORIGINAL interpreter op and
+    // return. That is exact — it is literally what `PC->ops()` would have done
+    // — and it costs one i32 load per block entry.
+    var entryOps = HEAPU32[p.entryPtr >> 2];
+    var slotGuard = [].concat(
+      loadI32(p.delaySlot),
+      [OP.if_, OP.void_],
+        // census bucket so the guard's REACH is measurable on a real ROM
+        // rather than assumed — a guard that never fires and a guard that
+        // saves the run look identical from a PASS (the wave-10a lesson).
+        bump('#delayslot-entry'),
+        [OP.i32_const], sleb(entryOps), [OP.call_indirect, 0x00, 0x00],
+        [OP.br].concat(leb(1)),          // inside the if (0) -> $exit block (1)
+      [OP.end]);
+
     var full = [0x09, 0x02, 0x7F, 0x20, 0x7E, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7F, 0x01, 0x7D, 0x01, 0x7C, 0x01, 0x7D, 0x01, 0x7C,  // locals: 2xi32, 32xi64 regs, i64 scratch, i32 jump-target, i32 branch-cond, f32+f64 convert scratch (wave 11a), f32+f64 compare operand B (wave 11b)
-      OP.block, OP.void_,
-      OP.loop, OP.void_]
+      OP.block, OP.void_]
+      .concat(slotGuard,
+      [OP.loop, OP.void_])
       .concat(bump('#block-iter'), body,
       [OP.end, OP.end, OP.end]);
 

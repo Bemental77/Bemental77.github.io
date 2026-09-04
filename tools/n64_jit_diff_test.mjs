@@ -58,7 +58,11 @@ async function run(label, jit) {
   // the interpreter arms too on purpose: an option that changed only the jit
   // arm's URL would make the comparison measure the URL, not the emitter.
   const extra = process.env.N64_EXTRA_QS ? '&' + process.env.N64_EXTRA_QS.replace(/^&/, '') : '';
-  await page.goto(`http://localhost:8080/n64/?game=${rom}&autostart&difftrace${jit ? '&jit=' + JIT_MODE : ''}${extra}`, { waitUntil: 'domcontentloaded' });
+  // `&jit=off` on the interpreter arms is LOAD-BEARING since 2026-09-04, when
+  // the JIT became the page DEFAULT: without it both control arms would run
+  // the JIT too, the determinism control would compare two JIT runs, and the
+  // whole differential would report PASS while proving nothing.
+  await page.goto(`http://localhost:8080/n64/?game=${rom}&autostart&difftrace${jit ? '&jit=' + JIT_MODE : '&jit=off'}${extra}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction('window.myApp && myApp.rivetsData.beforeEmulatorStarted === false', { timeout: 120000 });
   // Every read below is BOUNDED. A CDP evaluate runs on the page's main
   // thread — the very thread a slow or wedged emulator is monopolising — so an

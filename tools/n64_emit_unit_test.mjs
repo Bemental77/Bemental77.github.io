@@ -48,6 +48,9 @@ const CP1S = 0x60000, CP1D = 0x60100, FPRSTORE = 0x61000;
 // passes 0 and every compare/BC1 must fall back rather than store through a
 // guessed address.
 const FCR31A = 0x63000;
+// &g_dev.r4300.delay_slot. The block entry guard reads it; `opts.noDelaySlot`
+// models a core too old to export it (the emitter must then compile NOTHING).
+const DELAYSLOT = 0x63010;
 // g_cp0_regs must be modelled as a REAL uint32_t[32] array, because the
 // emitter derives its base from the 12-byte gap between the two elements the
 // param block exposes (count = index 9, status = index 12). A harness that
@@ -125,6 +128,10 @@ function makeWorld(words, opts = {}) {
   HEAPU32[COUNT >> 2] = 0;
   HEAPU32[SKIPJ >> 2] = 0;
   HEAPU32[LASTADDR >> 2] = 0x80100000;
+  HEAPU32[DELAYSLOT >> 2] = opts.inDelaySlot ? 1 : 0;
+  // the core always invokes a block through `PC->ops()`, so PC == entryPtr on
+  // entry; the delay-slot guard's `call_indirect` relies on that being true.
+  HEAPU32[PCG >> 2] = ENTRY;
   // Both FPR banks, 32 entries each, modelled the way the core lays them out
   // in FR=1 mode: reg_cop1_simple[i] and reg_cop1_double[i] both point at the
   // SAME 8-byte reg_cop1_fgr_64[i] slot (cp1.c:120-165), the float using its
@@ -161,12 +168,13 @@ function makeWorld(words, opts = {}) {
     readmemD: t(6), writememD: t(7), rdRdramD: RD_RDRAM_D, wrRdramD: WR_RDRAM_D,
     jumpToAddr: JTA, jumpToFunc: 1,
     fcr31: opts.noFcr31 ? 0 : FCR31A,
+    delaySlot: opts.noDelaySlot ? 0 : DELAYSLOT,
   };
   return { mem, table, HEAPU32, REG64, p };
 }
 
 function loadEmitter() {
-  const sb = { WebAssembly, console: { error() {}, log() {} }, Uint32Array, Object, Array, Math, String };
+  const sb = { WebAssembly, console: { error() {}, log() {}, warn() {} }, Uint32Array, Object, Array, Math, String };
   sb.window = sb; vm.createContext(sb); vm.runInContext(src, sb);
   return sb.bementalMips;
 }
@@ -174,7 +182,9 @@ function loadEmitter() {
 // run one case: seed regs/dram, emit, execute, compare
 function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}, expectStats = null, opts = {},
                           fprF32 = {}, fprF64 = {}, fprI32 = {}, fprI64 = {}, fcr31 = 0, expectFcr31 = null,
-                          expectFprI32 = {}, expectFprI64 = {}, expectFprF32 = {}, expectFprF64 = {} }) {
+                          expectFprI32 = {}, expectFprI64 = {}, expectFprF32 = {}, expectFprF64 = {},
+                          expectRefused = false, expectPC = null, expectLastAddr = null, expectCount = null,
+                          lastAddr = null }) {
   const bm = loadEmitter();
   const { mem, table, HEAPU32, REG64, p } = makeWorld(words, opts);
   const DV = new DataView(mem.buffer);
@@ -186,7 +196,15 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
   for (const [i, v] of Object.entries(fprI64)) DV.setBigInt64(fprAt(i), BigInt.asIntN(64, BigInt(v)), true);
   for (const [r, v] of Object.entries(regs)) REG64[(REG >> 3) + (+r)] = BigInt.asUintN(64, BigInt(v));
   for (const [a, v] of Object.entries(dram)) HEAPU32[(DRAM + (+a)) >> 2] = v >>> 0;
+  if (lastAddr !== null) HEAPU32[LASTADDR >> 2] = lastAddr >>> 0;
   const idx = bm.compileSpan(p, { HEAPU32, wasmTable: table, wasmMemory: mem });
+  // A refusal is a RESULT, not a failure: the delay-slot guard cannot be
+  // emitted without &delay_slot, and an unguarded block corrupts the guest, so
+  // the emitter must compile NOTHING rather than install one.
+  if (expectRefused) {
+    return { name, ok: idx === 0 && bm.stats.fails === 0,
+             detail: idx === 0 ? '' : `expected refusal, got slot ${idx} (fails=${bm.stats.fails})` };
+  }
   if (!(idx > 0)) return { name, ok: false, detail: `emit FAILED (idx=${idx}, emitFails=${bm.stats.fails})` };
   let threw = null;
   try { table.get(idx)(); } catch (e) { threw = String(e).slice(0, 120); }
@@ -218,6 +236,18 @@ function T(name, words, { regs = {}, dram = {}, expectRegs = {}, expectDram = {}
   if (expectFcr31 !== null) {
     const got = '0x' + (HEAPU32[FCR31A >> 2] >>> 0).toString(16);
     if (got !== expectFcr31) bad.push(`FCR31=${got} want ${expectFcr31}`);
+  }
+  if (expectPC !== null) {
+    const got = HEAPU32[PCG >> 2] >>> 0;
+    if (got !== (expectPC >>> 0)) bad.push(`PC=${got} want ${expectPC >>> 0}`);
+  }
+  if (expectLastAddr !== null) {
+    const got = '0x' + (HEAPU32[LASTADDR >> 2] >>> 0).toString(16);
+    if (got !== expectLastAddr) bad.push(`last_addr=${got} want ${expectLastAddr}`);
+  }
+  if (expectCount !== null) {
+    const got = '0x' + (HEAPU32[COUNT >> 2] >>> 0).toString(16);
+    if (got !== expectCount) bad.push(`Count=${got} want ${expectCount}`);
   }
   if (threw) bad.push('trapped: ' + threw);
   if (expectStats) for (const [k, want] of Object.entries(expectStats)) {
@@ -646,6 +676,44 @@ const tests = [
   T('control: LW slow arm, rs==rt keeps the address register',
     [I(OPC.LW, 8, 8, 0x18), 0],
     { regs: { 8: SLOW_ADDR }, expectRegs: { 8: SLOW_ADDR } }),
+
+  // ---- DELAY-SLOT ENTRY GUARD (conker.z64 frame-82 divergence, 2026-09-04) ----
+  // A JIT block is installed as ONE instruction's `ops`, and the core calls
+  // `PC->ops()` for a branch DELAY SLOT expecting exactly one instruction:
+  // DECLARE_JUMP (cached_interp.c:87-90) and, at EVERY page boundary,
+  // FIN_BLOCK's delay-slot path (cached_interp.c:184-206) — which then
+  // RESTORES `PC = inst+1`, discarding whatever PC the callee left. Running a
+  // whole span there executes instructions the guest never issued, and its
+  // last_addr/Count writes SURVIVE that PC restore. On conker.z64 the block at
+  // 0x10014000 took its branch, wrote last_addr = 0x1001402c, FIN_BLOCK
+  // restored PC to 0x10014004, and the next cp0_update_count() computed
+  // (0x10014004 - 0x1001402c) >> 2 as UNSIGNED -> Count += ~0xC0000000.
+  // These four are RED against the pre-fix emitter.
+  T('delay-slot entry runs ONE instruction, not the span',
+    [I(OPC.ADDIU, 0, 8, 0x11), I(OPC.ADDIU, 0, 9, 0x22), I(OPC.ADDIU, 0, 10, 0x33), 0],
+    { opts: { inDelaySlot: true },
+      // the stub interp op only advances PC, so a guarded entry writes NOTHING
+      expectRegs: { 8: '0x0', 9: '0x0', 10: '0x0' }, expectPC: ENTRY + STRIDE }),
+  T('control: the SAME span with delay_slot clear still runs natively',
+    [I(OPC.ADDIU, 0, 8, 0x11), I(OPC.ADDIU, 0, 9, 0x22), I(OPC.ADDIU, 0, 10, 0x33), 0],
+    { expectRegs: { 8: '0x11', 9: '0x22', 10: '0x33' } }),
+  // the load-bearing one: a delay-slot entry must not move last_addr/Count.
+  // The block below takes its branch, so an unguarded emitter writes
+  // last_addr = branch target and batches Count at the branch tail.
+  T('delay-slot entry must not touch last_addr or Count',
+    [I(OPC.BEQ, 5, 6, 2), 0, I(OPC.ADDIU, 0, 8, 0x11), 0, 0],
+    { regs: { 5: '0x7', 6: '0x7' }, lastAddr: 0x80100000,
+      opts: { inDelaySlot: true },
+      expectLastAddr: '0x80100000', expectCount: '0x0', expectRegs: { 8: '0x0' } }),
+  T('control: the SAME branch with delay_slot clear DOES move last_addr',
+    [I(OPC.BEQ, 5, 6, 2), 0, I(OPC.ADDIU, 0, 8, 0x11), 0, 0],
+    { regs: { 5: '0x7', 6: '0x7' }, lastAddr: 0x80100000,
+      expectLastAddr: '0x8010000c' }),
+  // A core that does not export &delay_slot cannot be made safe, so the
+  // emitter must compile NOTHING rather than install an unguarded block.
+  T('no &delay_slot param => the whole span is refused',
+    [I(OPC.ADDIU, 0, 8, 0x11), 0],
+    { opts: { noDelaySlot: true }, expectRefused: true }),
 ];
 
 let fail = 0;

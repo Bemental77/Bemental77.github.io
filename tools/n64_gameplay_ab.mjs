@@ -105,7 +105,9 @@ async function run(jit) {
   const errs = [];
   page.on('pageerror', (e) => errs.push(String(e).slice(0, 160)));
   const arm = { arm: jit ? 'jit' : 'interp', loadBefore: load1(), limitBefore: speedLimit() };
-  await page.goto(`http://localhost:8080/n64/?game=${rom}&autostart${jit ? '&jit=' + JIT_MODE : ''}`, { waitUntil: 'domcontentloaded' });
+  // `&jit=off` is load-bearing: the JIT is the page default since 2026-09-04,
+  // so the interpreter arm must opt OUT or this A/B compares jit against jit.
+  await page.goto(`http://localhost:8080/n64/?game=${rom}&autostart${jit ? '&jit=' + JIT_MODE : '&jit=off'}`, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction('window.myApp && myApp.rivetsData.beforeEmulatorStarted === false', { timeout: 180000 });
 
   // A CDP evaluate runs ON the page's main thread, which is exactly the thread

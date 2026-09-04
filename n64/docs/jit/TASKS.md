@@ -772,18 +772,24 @@ Full table in the commit; `fcr31` was nonzero on all 24 that reported stats,
 which is the shipped-core proof that the wave-11b version magic matched.
 
 **This sweep is the gate a5efb66 set before `?jit` can become the default, and
-it is NOT clean. Do not flip `n64/index.html:2200` (`if (!qs.has('jit'))
-return;`) until all three below are resolved.** The sweep earned its keep: two
-of the three are problems no per-wave gate in this campaign would ever have
-found, because both ROMs are outside the reference trio.
+on 2026-09-02 it was NOT clean.** (It went 27/27 on 2026-09-04 and the flip has
+happened — see the end of this file.) The sweep earned its keep: two of the
+three are problems no per-wave gate in this campaign would ever have found,
+because both ROMs are outside the reference trio.
 
-> **STATUS 2026-09-02 (later the same day).** (1) is **FIXED** — and the cause
-> was NOT the construct the ablation named. (2) and (3) are **STILL OPEN** and
-> both are now correctly CLASSIFIED where they were previously mis-classified:
-> conker is a **divergence**, not a throughput pathology; gauntletLegends is a
-> **wedge**, not conker's slowness. Two harness bugs that were producing those
-> mis-classifications are fixed. **The `?jit` default therefore STAYS OFF.**
-> Read each subsection below — the ✅/OPEN header states which.
+> **STATUS 2026-09-04. ALL THREE ARE FIXED and `?jit` IS NOW THE PAGE
+> DEFAULT** — see "BOTH REMAINING SWEEP BLOCKERS FIXED" below and the flip
+> record at the end of this file. (1) was `recomp.c`'s RNOP rewrite of an
+> r0 destination. (2) and (3) turned out to be ONE bug: a JIT block invoked as a
+> branch DELAY SLOT. Read each subsection below — the ✅ header states which.
+>
+> **STATUS 2026-09-02 (superseded, kept for the trail).** (1) is **FIXED** — and
+> the cause was NOT the construct the ablation named. (2) and (3) are **STILL
+> OPEN** and both are now correctly CLASSIFIED where they were previously
+> mis-classified: conker is a **divergence**, not a throughput pathology;
+> gauntletLegends is a **wedge**, not conker's slowness. Two harness bugs that
+> were producing those mis-classifications are fixed. **The `?jit` default
+> therefore STAYS OFF.**
 
 ## Sweep RE-RUN after the fixes (2026-09-02) — **25 of 27 PASS/PASS**
 
@@ -942,6 +948,137 @@ six runs and **NOT caused by wave 11b** — every step is a measurement:
   was still wrong, for the reason given above.
 </details>
 
+## ✅ BOTH REMAINING SWEEP BLOCKERS FIXED 2026-09-04 — one bug, not two: **a JIT block can be invoked as a BRANCH DELAY SLOT**
+
+`conker.z64` (a divergence at frame 82) and `gauntletLegends.z64` (a wedge) had
+the SAME root cause. It is not in any opcode emitter — it is in the block
+*entry* contract, and it is the reason 25 of 27 ROMs never saw it.
+
+**THE BUG.** A JIT block is installed as ONE instruction's `precomp_instr.ops`.
+The core calls `PC->ops()` in two places that require the callee to execute
+**exactly one instruction** and return:
+
+* `DECLARE_JUMP`'s delay slot — `PC++; delay_slot=1; PC->ops(); cp0_update_count();`
+  (`cached_interp.c:87-91`). Reachable whenever a block ENTRY address is also
+  some branch's `addr+4`.
+* **`FIN_BLOCK`'s delay-slot path (`cached_interp.c:184-206`), which fires at
+  EVERY 4KB page boundary.** When a branch sits in the last word of a page, its
+  delay slot is the FIN_BLOCK pseudo-instruction; FIN_BLOCK then `jump_to()`s
+  the next page, calls **that page's FIRST instruction** as the slot, and
+  afterwards **restores `PC = inst+1`** — discarding whatever PC the callee left.
+
+A whole span running there is wrong twice over. It executes instructions the
+guest never issued (with `delay_slot` set, so any fault inside is recorded as a
+BD exception), and — the part that actually killed conker — **its `last_addr`
+and `Count` writes SURVIVE the PC restore.**
+
+**THE WITNESS, not an inference.** A temporary negative-delta detector inside
+`cp0_update_count` (added, used, REMOVED; `cp0.c` is byte-identical to
+`2069a0a`) froze a 96-entry ring on the first `PC->addr < last_addr` event. It
+fired **once** in the `?jit` arm and **zero times** in the interpreter arm over
+the same window. The last two entries:
+
+        PC->addr=0x10014024  last_addr=0x10013fec  delta=+56  delay_slot=1
+        PC->addr=0x10014004  last_addr=0x1001402c  delta=-40  delay_slot=0
+
+The first line is the JIT block's OWN branch tail (`beq $zero,$zero` at
+`0x1001401c`, so `addr+8 = 0x10014024`) executing **with `delay_slot` set** —
+which only a delay-slot invocation can produce. It set `last_addr` to its branch
+target `0x1001402c`. FIN_BLOCK then restored `PC = inst+1 = 0x10014004`, and the
+next `cp0_update_count()` computed `(0x10014004 - 0x1001402c) >> 2` on
+**uint32**: `0xFFFFFFD8 >> 2 = 0x3FFFFFF6`, times conker's `count_per_op` of 3
+(`rom_luts.c:382-383`) = **+0xBFFFFFE2**.
+
+**The arithmetic closes exactly, which is the part that makes this a proof and
+not a story.** The ring's own Count at that entry is `0x02e956eb`, and
+`0x02e956eb + 0xBFFFFFE2 = 0xC2E956CD` — the *same* `0xc2e956cd` an independent
+per-rAF sampler read off `g_cp0_regs[COUNT]` in the `?jit` arm at VI 83, against
+`0x02f1921a` in the interpreter arm at the same VI. Two instruments, one number.
+`next_interrupt` then collapsed to 0 (`interrupt.c:553-556` returns 0 once Count
+is more than 2^31 past the queue head), and the guest fell into the permanent
+interrupt storm the old note below measured as 599M `gen_interrupt` calls in
+252 VI. **The 70x was never a throughput problem at all.**
+
+**THE FIX** — the same move `slowArm()` already makes for a faulting delay slot:
+hand the instruction back. The block now opens with
+
+        if (delay_slot != 0) { call_indirect(<entry instruction's ORIGINAL ops>); br $exit; }
+
+which is exact — it is literally what `PC->ops()` would have done — and costs one
+i32 load per block entry. `&g_dev.r4300.delay_slot` is a new
+`jit_params[45]`, and the param-block version magic at `[44]` moved
+`0x4E36344A` -> **`0x4E36344B`** so a page/core skew cannot read it as garbage.
+Unlike wave 11b's FCR31, a missing address here is not a lost optimisation but a
+guest-corrupting bug, so **a core that does not supply it gets NO jit at all**:
+`compileSpan` returns 0 for every span and counts `stats.noDelaySlotRejects`.
+
+**REACH PROVEN ON REAL ROMs, not just in the unit corpus** (the wave-10a
+lesson). The guard bumps a `#delayslot-entry` census bucket. Over the same
+`300 400 --noinput` window:
+
+        conker.z64           1,832 delay-slot entries   (#block-iter 2,334,318)
+        gauntletLegends.z64    415 delay-slot entries   (#block-iter   990,812)
+        mariokart.z64        bucket ABSENT (zero)
+
+That last row is the control, and it is why this survived 11 waves: the
+reference trio never enters a block through a delay slot at all.
+
+**ARM-DIFFERENCE PROOF.** With a temporary flag disabling ONLY the guard —
+same core, same emitter file, same frame count — `gauntletLegends.z64` at 300 VI
+reproduces the original signature exactly (`INCOMPLETE (jit reached
+UNREADABLE/300)`, `liveness: NO CDP RESPONSE (main thread never yielded)`); with
+the guard it is `det PASS / jit PASS` at 300 **and** 600 VI. conker is
+`det PASS / jit PASS` at 100, 300 **and** 600 VI, and now completes 600 VI well
+inside the harness's ordinary 180 s wait — the slowness went with the storm.
+
+**HOW IT WAS LOCALISED, and the one step that mattered.** The recorded
+localisation ("one block `0x10014000`, span index 7") reproduced exactly, but
+the reading of it was wrong: index 7 is not a defective instruction. A third
+arm settled it — the same `?jitspan=8` block with the generic fallback changed
+to *exit* the block instead of *calling* the interpreter op in place:
+
+        ?jitonly=10014000                      DIVERGED at 82
+        ?jitonly=10014000&jitspan=9            DIVERGED at 82   (branch emitted natively)
+        ?jitonly=10014000&jitspan=8            DIVERGED at 82   (branch falls back, called IN-BLOCK)
+        ?jitonly=10014000&jitspan=8&jitfbexit  PASS             (branch falls back, block EXITS first)
+        ?jitonly=10014000&jitspan=7            PASS
+        ?jitonly=10014000&jitspan=6            PASS
+
+The emitted code for indices 0-6 is byte-identical across all six arms. So the
+variable is not *which* code runs but **whether control returns to
+`r4300_step`'s dispatch loop before the branch** — which is a statement about
+the block's ENTRY context, not about any emitter. That is what pointed at the
+delay slot, and the `cp0_update_count` watchdog then named it outright.
+A span bisect that ends at `blocks: 1` is necessary but not sufficient: it
+localises *where*, and the where can still be innocent.
+
+**AN ADJACENT EXPOSURE OF THE SAME FAMILY, FOUND WHILE READING AND NOT FIXED —
+because it is UNVERIFIED and the sweep is clean.** `emitOutJumpTail`
+(`mips_emit.js`) is the ONLY place the emitter calls into the core WITHOUT first
+storing `PC`: it writes `jump_to_address` and calls `jump_to_func`. That
+function can fault — `update_invalid_addr()` on a TLB-mapped target raises a
+refill exception — and `exception_general()` then runs `cp0_update_count()`
+against whatever stale `PC` the block last wrote, while `emitCountBatch` has
+already advanced `Count` but has NOT advanced `last_addr` (only the post-jump
+`last_addr = PC->addr` does that). The interpreter's `X_OUT` reaches `jump_to()`
+with `PC = fallPtr` and `last_addr = addr+8`. So the exact repair, if anyone
+ever witnesses it, is to store both of those BEFORE the `jump_to_func` call —
+`storeI32Const(p.pcGlobal, fallPtr)` and `storeI32Const(p.lastAddr, fallAddr)`.
+**I have no witness that this fires**: the negative-delta detector caught only
+the delay-slot event, on the one ROM it was pointed at. Stated as an identified
+exposure with a named repair, not as a bug.
+
+**Gates**: unit corpus **102 -> 107**, all green; run against
+`git show HEAD:...mips_emit.js`, **3 of the 5 new cases FAIL** (the other two are
+deliberate controls that must pass on both) and all 102 pre-existing cases still
+pass. The new cases pin: a delay-slot entry runs ONE instruction and not the
+span; a delay-slot entry moves neither `last_addr` nor `Count`; the same span
+with `delay_slot` clear still runs natively and DOES move `last_addr`; and a core
+without the param refuses the span outright.
+
+<details><summary>The 2026-09-02 conker section, kept for the record — its
+"which write puts last_addr ahead?" question is answered above</summary>
+
 ### (2) `conker.z64` — NOT 70x slow: it **DIVERGES at frame 82**. STILL OPEN.
 
 **THE "THROUGHPUT PATHOLOGY" READING BELOW IS WRONG AND IS CORRECTED HERE
@@ -1066,7 +1203,18 @@ gap between the two jit numbers is well inside this rig's ~+/-6% single-pair
 resolution and must not be read as an effect.)
 </details>
 
-### (3) `gauntletLegends.z64` — ✅ SEPARATED 2026-09-02. It is a **WEDGE**, not slow.
+</details>
+
+### (3) `gauntletLegends.z64` — ✅ **FIXED 2026-09-04** (same delay-slot bug as conker; section above). Kept below: the 2026-09-02 separation that made it findable.
+
+**RESOLVED.** `det PASS / jit PASS` at 300 and 600 VI. The block-bisect the note
+below recommends was never needed — conker's fix cleared it outright, and the
+census then proved the shared mechanism fires here too (415 `#delayslot-entry`
+executions in a 400-VI window). The separation recorded below is what made that
+attribution possible at all: a run that reads `NO CDP RESPONSE` instead of
+throwing is what let a one-flag control arm prove the guard is the fix.
+
+### (3, original) `gauntletLegends.z64` — ✅ SEPARATED 2026-09-02. It is a **WEDGE**, not slow.
 
 **The discriminator now survives, which was the actual blocker here.** The
 "third failure mode" recorded below was a HARNESS bug, not a property of the
@@ -1166,6 +1314,58 @@ superMarioStarRoad, which diverges too early to accumulate any). The
 thewheel null-ops guard was written for what looked like one ROM's bug; it is
 in fact refusing spans across the whole library, and every refused span stays
 on the cached interpreter. Nobody has measured what that costs.
+
+## Sweep after the delay-slot fix (2026-09-04) — **27 of 27 PASS/PASS, exit 0. THE GATE IS CLEAN.**
+
+`bash tools/probe_lock.sh run -- bash tools/n64_jit_sweep.sh`, 600 VI per ROM,
+interpreter / interpreter-control / `?jit=emit` per ROM. **`CPU_Speed_Limit` was
+100 on every single row** and 1-minute load stayed **2.37-4.67**. The
+determinism control PASSED on all 27, `emitFails` is 0 on all 27, `fcr31` is
+nonzero on all 27, and `firstDivergenceInCommonPrefix` is -1 on all 27.
+
+The run was **hash-guarded**: `mips_emit.js` `50dc6d96...`, `index.html`
+`a44db1ee...`, `n64wasm.wasm` `8ac90212...`, identical before AND after. That
+guard is not ceremony here — an earlier attempt at this same sweep was KILLED
+and restarted because a comment-only edit to `mips_emit.js` landed mid-run, and
+a torn read of the emitter would have produced a silent `[jit] emitter failed to
+load` and therefore a row of FALSE PASSES.
+
+        rom                     det   jit   blocks  fallbackOps  emitFails  nullOpsRejects  load  limit
+        Banjo-Dreamie.z64       PASS  PASS  2062    524          0          93              2.76  100/100
+        banjo-tooie.z64         PASS  PASS  5215    8859         0          187             3.29  100/100
+        banjoChristmas.z64      PASS  PASS  2063    524          0          93              3.67  100/100
+        bk-jiggiesoftime.z64    PASS  PASS  2064    524          0          93              3.98  100/100
+        blitz2001.z64           PASS  PASS  1025    300          0          26              3.55  100/100
+        clayFighter.z64         PASS  PASS  772     137          0          33              3.46  100/100
+        conker.z64              PASS  PASS  1273    459          0          103             3.74  100/100
+        crusin.z64              PASS  PASS  460     290          0          25              3.97  100/100
+        diddyKongRacing.z64     PASS  PASS  828     802          0          72              3.21  100/100
+        dinosaurplanet.z64      PASS  PASS  881     543          0          81              3.14  100/100
+        dk64.z64                PASS  PASS  1216    839          0          95              4.26  100/100
+        flyingDragon.z64        PASS  PASS  507     189          0          33              3.27  100/100
+        gauntletLegends.z64     PASS  PASS  1485    355          0          52              3.29  100/100
+        mariokart.z64           PASS  PASS  475     234          0          34              3.57  100/100
+        marioo.z64              PASS  PASS  581     194          0          36              3.15  100/100
+        mariopartynew.z64       PASS  PASS  739     170          0          22              2.86  100/100
+        newTetris.z64           PASS  PASS  377     255          0          28              3.40  100/100
+        oot.z64                 PASS  PASS  1487    673          0          102             2.68  100/100
+        papermario.z64          PASS  PASS  658     1350         0          27              2.47  100/100
+        pkmnsnap.z64            PASS  PASS  705     350          0          42              2.37  100/100
+        podracer.z64            PASS  PASS  472     264          0          34              3.03  100/100
+        sm64.z64                PASS  PASS  851     508          0          58              3.02  100/100
+        starfox.z64             PASS  PASS  470     263          0          35              3.93  100/100
+        starfoxsurvival.z64     PASS  PASS  1119    394          0          61              3.02  100/100
+        superMarioStarRoad.z64  PASS  PASS  584     194          0          38              2.99  100/100
+        thewheel.z64            PASS  PASS  1290    214          0          48              4.67  100/100
+        zeldaMasterOfTime.z64   PASS  PASS  1475    660          0          91              4.05  100/100
+
+conker.z64 and gauntletLegends.z64 — the two rows that blocked this gate — now
+complete 600 VI inside the harness's ordinary 180 s wait, with no `liveness`
+column entry at all.
+
+**This is the gate `a5efb66` set, and it is met, so `?jit` is now the page
+default.** From here the sweep is the REGRESSION gate: the shipped page depends
+on it, and it still exits nonzero unless every ROM is PASS/PASS.
 
 ## Action #1 EXECUTED — waves 8/9/10a priced on a quiet box (2026-09-01)
 
@@ -1289,14 +1489,31 @@ recording load alongside `inflation`, so this question does not have to be
 re-litigated every time the box is busy.
 </details>
 
-## Campaign state (2026-09-02)
-M0-M2 COMPLETE through **wave 11b**. All three opcode classes the post-wave-9
-census ranked are now native: SD/LD (wave 9), MFC0 (10a), and the whole FP
-block — converts (11a) plus compares and BC1 (11b). The core builds from
-source again and `jit_params` carries `&FCR31` behind a version magic.
+## Campaign state (2026-09-04) — **`?jit` IS THE DEFAULT**
 
-**What now stands between `?jit` and being the default (updated 2026-09-02).
-THE FLIP IS STILL BLOCKED, and `n64/index.html:2200` (`if (!qs.has('jit'))
+M0-M2 COMPLETE through **wave 11b**, and the full-library gate is CLEAN. All
+three opcode classes the post-wave-9 census ranked are native: SD/LD (wave 9),
+MFC0 (10a), and the whole FP block — converts (11a) plus compares and BC1 (11b).
+The core builds from source and `jit_params` carries `&FCR31` **and**
+`&g_dev.r4300.delay_slot` behind a version magic (`0x4E36344B`).
+
+**THE FLIP HAPPENED.** `n64/index.html`'s bridge gate is now
+`if (mode === 'off' || qs.has('nojit')) return;` with `mode = qs.get('jit') ||
+'emit'` — the JIT runs for every visitor and `?jit=off` / `?nojit` opts out.
+The opt-out is load-bearing, not a courtesy: `tools/n64_jit_diff_test.mjs` and
+`tools/n64_gameplay_ab.mjs` now pass `&jit=off` on their interpreter arms,
+because without it the "interpreter" control would silently be a second JIT run
+and every differential in this file would become vacuous while still printing
+PASS.
+
+Arm-difference proof for the flip itself (mariokart, 124 VI, one browser):
+no `?jit` param -> `bementalMips` loaded, 299 blocks, `delaySlot` nonzero,
+0 emitFails, 0 page errors; `&jit=off` and `&nojit` -> emitter not fetched,
+`__jitStats` absent.
+
+<details><summary>What used to stand between `?jit` and the default (2026-09-02)</summary>
+
+**THE FLIP IS STILL BLOCKED, and `n64/index.html:2200` (`if (!qs.has('jit'))
 return;`) must NOT be touched.** The re-run sweep is **25 of 27 PASS/PASS**
 (exit 1) — up from 24, and the two failures are now self-describing rows rather
 than blank `NOJSON`. Two of the three blockers moved:
@@ -1332,14 +1549,22 @@ fourth time: *read the code that actually runs.*
   "benign".
 Unit corpus **76 -> 102** cases; 17 of the 26 new ones are RED against `HEAD`.
 
+</details>
+
+**A FOURTH bug of the same family landed 2026-09-04, and it is the one that
+closed the sweep**: the emitter believed a block could only be entered through
+the dispatcher, and `cached_interp.c` calls `PC->ops()` for a delay slot too.
+Unit corpus **102 -> 107**; 3 of the 5 new cases are RED against `HEAD`.
+
 The correctness picture below is unchanged and still applies.
 
 M0-M2 COMPLETE through wave 10a. The JIT is correctness-proven on the ROMs
 it has been gated against (every wave 600-1200 VI frames bit-identical vs the
 interpreter with GPR+CP0+FPR+FCR31 in the checksum; savestates; invalidation;
-zero emit failures ever shipped). The ?jit flag remains opt-in; the shipped
+zero emit failures ever shipped). ~~The ?jit flag remains opt-in; the shipped
 default is unchanged interpreter behavior — `mips_emit.js` is not even
-fetched without `?jit` (index.html:2254-2259).
+fetched without `?jit`~~ — **STALE as of 2026-09-04: the JIT is the default and
+`mips_emit.js` is fetched unless `?jit=off` / `?nojit` is passed.**
 
 Two things that were previously believed and are now known to be false:
 - "correctness-proven" did NOT mean bug-free. Two latent join-contract
@@ -1435,15 +1660,23 @@ NEXT ACTIONS, in order:
    PASS/PASS. THE `?jit` DEFAULT MUST NOT FLIP YET — see the three exceptions
    below.** Now reproducible as `bash tools/probe_lock.sh run -- bash
    tools/n64_jit_sweep.sh`, which exits nonzero unless every ROM is clean.
-6. **THE ONE REMAINING CORRECTNESS BLOCKER IS conker.z64.** Repro, exact and
-   cheap: `N64_EXTRA_QS="jitonly=10014000&jitspan=8" node
-   tools/n64_jit_diff_test.mjs conker.z64 100` (the `jitonly`/`jitspan` hooks
-   are TEMPORARY and were removed — re-add them to `n64/index.html`'s
-   `jitCompile` to use this). The question is narrow and named in section (2):
-   which write leaves `last_addr` AHEAD of the address the next
-   `cp0_update_count()` sees. Do not flip the `?jit` default until it is closed
-   — `superMarioStarRoad` proved a sweep failure can be a genuine
-   guest-corrupting bug, not a formality.
+6. ~~**THE ONE REMAINING CORRECTNESS BLOCKER IS conker.z64.**~~ — ✅ **CLOSED
+   2026-09-04, together with gauntletLegends: one bug, the delay-slot block
+   entry.** The question this item posed ("which write leaves `last_addr` AHEAD
+   of the address the next `cp0_update_count()` sees?") was answered by exactly
+   the instrument it asked for — a temporary negative-delta detector inside
+   `cp0_update_count`. Answer: the block's OWN branch tail, running while the
+   block was being invoked as a branch delay slot, after which `FIN_BLOCK`
+   restored PC behind it. See the section above.
+7. **THE `?jit` DEFAULT IS FLIPPED (2026-09-04).** Sweep 27/27, exit 0. What is
+   still open is the ACCEPTANCE BAR, not correctness: every throughput ratio
+   this campaign owns was measured on a MENU (screenshot-proven), and the bar in
+   M4 is ">=100% of hardware sustained IN-GAME on the heavy set". That number
+   does not exist yet. Note also that single-pair resolution on this rig is only
+   ~±6%, so it takes alternated pairs on a quiet box.
+8. `nullOpsRejects` is nonzero on every ROM (22-187) and every refused span
+   stays on the cached interpreter. Nobody has measured what that costs — and
+   now that the JIT is the default, it is a shipped cost.
 
 ### On measuring action #1 — the load source was OURS (2026-09-01)
 Every discarded A/B in this file blames "machine load". The largest single

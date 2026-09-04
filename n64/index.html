@@ -2197,7 +2197,18 @@ N64Rate.selfTest = function (logFn) {
   }
   function setupJitBridge() {
     var qs = new URLSearchParams(location.search);
-    if (!qs.has('jit')) return;
+    // ---- THE JIT IS ON BY DEFAULT as of 2026-09-04 ----
+    // The gate a5efb66 set for this flip is `bash tools/probe_lock.sh run --
+    // bash tools/n64_jit_sweep.sh`: every ROM in n64/N64Wasm/roms/ must report
+    // determinism control PASS **and** jit-vs-interpreter PASS. It went 27/27
+    // once the delay-slot block-entry bug was fixed (see the guard in
+    // n64/bementalJIT/mips_emit.js and n64/docs/jit/TASKS.md).
+    // `?jit=off` (or `?nojit`) opts OUT — and the differential harness's
+    // interpreter arms REQUIRE it, because without an opt-out its "interpreter"
+    // control would silently become a second JIT run and every comparison would
+    // be vacuous. Do not remove it.
+    var mode = qs.get('jit');
+    if (mode === 'off' || qs.has('nojit')) { pageLog('[jit] disabled by query flag'); return; }
     if (!window.Module || !Module.addFunction || !Module._neil_set_jit_bridge || !Module.wasmTable) {
       pageLog('[jit] bridge unavailable in this core build');
       return;
@@ -2208,7 +2219,7 @@ N64Rate.selfTest = function (logFn) {
     //        'nofp' (emit, FP emission disabled — perf attribution arm),
     //        'census' (emit + runtime execution census — COUNTING arm only,
     //                  never a timing arm: it adds a host-call per fallback)
-    var mode = qs.get('jit') || 'emit';
+    mode = mode || 'emit';
     if (mode === 'nofp') { window.__jitNoFP = true; mode = 'emit'; }
     if (mode === 'census') { window.__jitCensus = true; mode = 'emit'; }
     if (mode !== 'wrap' && mode !== 'v05') mode = 'emit';
@@ -2219,6 +2230,7 @@ N64Rate.selfTest = function (logFn) {
     // no FP compares", and wave 10a's lesson was that an invisible no-op still
     // passes every correctness gate.
     var p_fcr31_seen = 0;
+    var p_delayslot_seen = 0;
     function ping() { canaryFired++; if (canaryFired === 1) pageLog('[jit] canary: native block module EXECUTED'); }
     // The bridge passes one pointer to a 10-u32 param block (recomp.c):
     // [vaddr, entryPtr, span, srcPtr, stride, addrOff, &PC, &reg, &hi, &lo]
@@ -2248,9 +2260,16 @@ N64Rate.selfTest = function (logFn) {
         // through that address. The magic makes a page/core skew fall back
         // (compares + BC1 stay on the interpreter) instead of corrupting
         // guest memory. recomp.c stamps it next to the pointer it guards.
-        fcr31: (Module.HEAPU32[q + 44] === 0x4E36344A) ? Module.HEAPU32[q + 43] : 0,
+        fcr31: (Module.HEAPU32[q + 44] === 0x4E36344B) ? Module.HEAPU32[q + 43] : 0,
+        // &g_dev.r4300.delay_slot. Behind the SAME version magic — a block
+        // entry that is reachable as a branch DELAY SLOT must run exactly one
+        // instruction, and without this address the emitter cannot tell.
+        // A core too old to carry it yields 0, and the emitter then refuses to
+        // compile any span at all rather than install an unsafe block.
+        delaySlot: (Module.HEAPU32[q + 44] === 0x4E36344B) ? Module.HEAPU32[q + 45] : 0,
       };
       p_fcr31_seen = p.fcr31;
+      p_delayslot_seen = p.delaySlot;
       var entryOpsIdx = Module.HEAPU32[p.entryPtr >> 2];
       var idx = 0;
       if (mode === 'emit' && window.bementalMips) {
@@ -2277,7 +2296,7 @@ N64Rate.selfTest = function (logFn) {
     };
     window.__jitStats = function () {
       var s = { mode: mode, wrapped: wrapped, calls: calls, canaryFired: canaryFired, instantiateFail: instantiateFail };
-      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeMemSlots = e.nativeMemSlots; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.nativeFPCvt = e.nativeFPCvt || 0; s.nativeFPCmp = e.nativeFPCmp || 0; s.nativeFPBranches = e.nativeFPBranches || 0; s.fcr31 = p_fcr31_seen; s.nativeCop0 = e.nativeCop0; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; s.distinctSlots = e.distinctSlots; s.slotReuses = e.slotReuses; s.nullOpsRejects = e.nullOpsRejects || 0; }
+      if (window.bementalMips) { var e = window.bementalMips.stats; s.blocks = e.blocks; s.nativeOps = e.nativeOps; s.nativeBranches = e.nativeBranches; s.nativeMemSlots = e.nativeMemSlots; s.nativeLoads = e.nativeLoads; s.nativeStores = e.nativeStores; s.nativeFP = e.nativeFP; s.nativeFPCvt = e.nativeFPCvt || 0; s.nativeFPCmp = e.nativeFPCmp || 0; s.nativeFPBranches = e.nativeFPBranches || 0; s.fcr31 = p_fcr31_seen; s.nativeCop0 = e.nativeCop0; s.fallbackOps = e.fallbackOps; s.emitFails = e.fails; s.distinctSlots = e.distinctSlots; s.slotReuses = e.slotReuses; s.nullOpsRejects = e.nullOpsRejects || 0; s.noDelaySlotRejects = e.noDelaySlotRejects || 0; s.delaySlot = p_delayslot_seen; }
       return s;
     };
     // ?jit=census dump: [[bucket, executions], ...] ranked. Buckets are
