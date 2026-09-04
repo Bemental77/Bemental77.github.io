@@ -2533,6 +2533,32 @@ Two things this does establish, at no extra cost:
 - The failure is a **cost** knob, not a correctness one. Nothing here says the
   candidates are unreachable.
 
+**The retry aborted differently, and that one I cannot explain.** Armed set cut to 148
+entries that are both newly-unblocked *and* present in the measured SAB PC profile — so
+every armed entry is known to execute somewhere, which the blind 485-wide enumeration
+could not assume — with `--cont-timeout 400`. It died ~90 s in, inside the 60 s anchor
+calibration:
+
+```
+[oracle] connected; pc=0x801012b4
+[survey] calibrating an anchor over 60s ...
+[survey] ABORTED: ConnectionResetError: [Errno 54] Connection reset by peer
+```
+
+**Cause undetermined.** What has been ruled out, each by looking rather than by
+reasoning: no macOS crash report was written; `/tmp/sr_dol_oracle_9149.log` ends at
+normal DSP init with no panic and is byte-for-byte the same length as every other
+oracle log in this session; a sibling's teardown cannot have taken it, because
+`native_oracle_gdb.Dolphin.kill()` is `self.proc.kill()` on its own pid, not a
+pattern-matched `pkill -f Dolphin`; and the previous run survived the same calibration
+phase with **more** breakpoints armed (485), which rules out armed-set size as the
+direct cause. Recorded as an open, reproducible-or-not failure rather than attributed
+to a guess.
+
+**So the 499 are still unverified by execution, and that is the honest state of this
+section.** Everything claimed about them above is static: closure-clean, therefore
+armable. The four fixtures verified below are *not* members of the 499.
+
 **What these 4 are and are not.** They are proof the primitive is correct and
 load-bearing — but their *entries* were already closure-clean, and they reach
 `OSDisableInterrupts` through a `blrl`ed callee, which is §9.6's residual item 4.
