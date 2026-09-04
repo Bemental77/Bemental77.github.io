@@ -283,6 +283,119 @@ static void trk_set_msr(GekkoState *st) {
 }
 
 // ============================================================================
+//                      THE GUEST TIMEBASE AND DECREMENTER
+//
+// Read sr_host_os.h's "THE GUEST TIMEBASE" block first: it states the invariant,
+// cites the Dolphin expressions this reproduces, and enumerates what is NOT
+// modelled.  The short version, because it is the one thing in this file that can
+// be broken by a one-line "fix": THE HOST CLOCK IS NOT AN INPUT HERE.  There is no
+// emscripten_get_now, no clock_gettime, no time().  Guest time advances only when
+// guest work is credited, so the guest's time:work ratio is exactly the hardware's
+// at any host speed -- which is what CLAUDE.md gate #9 requires, and what a wall
+// clock destroys in BOTH directions (slow host => guest deadlines fire early; fast
+// host => guest time runs slow relative to guest work).
+// ============================================================================
+static int      g_clock_on         = 1;             // independent of g_mode: the
+                                                    // clock's own control arm
+static uint64_t g_tb_origin        = 0;             // ticks at g_cycles == 0
+static uint64_t g_cycles           = 0;             // RETIRED GUEST CPU cycles
+static uint32_t g_dec_start_value  = 0xFFFFFFFFu;   // SystemTimers.cpp:192-193
+static uint64_t g_dec_start_cycles = 0;
+static int      g_dec_armed        = 0;             // MSB clear at write => due
+static uint64_t g_dec_due_cycles   = 0;
+static uint32_t g_dec_exceptions   = 0;             // COUNTED, never DELIVERED
+static uint32_t g_tb_calls         = 0;             // clock boundary crossings
+static uint32_t g_tb_dry_reads     = 0;             // reads since the last credit
+static uint32_t g_tb_stalls        = 0;
+
+// Dolphin SystemTimers.cpp:213-218, transcribed:
+//   FakeTBStartValue + (CoreTiming::GetTicks() - FakeTBStartTicks) / TIMER_RATIO
+// The division is done on the RUNNING TOTAL, never per credit, so the sub-tick
+// remainder is carried rather than truncated away 12 times a tick.
+uint64_t sr_tb_read(void) { return g_tb_origin + g_cycles / GK_TIMER_RATIO; }
+
+// SystemTimers.cpp:199-204, transcribed: the same tick source counting DOWN from
+// the value the guest last wrote.
+uint32_t sr_dec_read(void) {
+    return g_dec_start_value
+         - (uint32_t)((g_cycles - g_dec_start_cycles) / GK_TIMER_RATIO);
+}
+
+// SystemTimers.cpp:181-196 DecrementerSet.  A write with the MSB CLEAR arms an
+// exception `v * TIMER_RATIO` cycles out; with it set, nothing is scheduled.
+void sr_dec_write(uint32_t v) {
+    g_dec_start_value  = v;
+    g_dec_start_cycles = g_cycles;
+    g_dec_armed        = (v & 0x80000000u) == 0;
+    g_dec_due_cycles   = g_cycles + (uint64_t)v * GK_TIMER_RATIO;
+}
+
+// SystemTimers.cpp:139-143 DecrementerCallback -- MINUS the delivery.  Dolphin sets
+// DEC = 0xFFFFFFFF and raises EXCEPTION_DECREMENTER; this runtime has no interrupt
+// delivery at all (README §6 / CONTEXT_SWITCH.md §7.1), so the exception is COUNTED
+// and the register is rolled over.  An alarm handler armed this way never runs, and
+// sr_tb_dec_exceptions() is how you find out that is what happened.
+static void dec_check(void) {
+    if (!g_dec_armed || g_cycles < g_dec_due_cycles) return;
+    g_dec_armed        = 0;
+    g_dec_exceptions++;
+    g_dec_start_value  = 0xFFFFFFFFu;
+    g_dec_start_cycles = g_dec_due_cycles;
+    tr(SR_EV_DEC_EXC, (uint32_t)sr_tb_read(), g_dec_exceptions);
+}
+
+void sr_tb_credit_cycles(uint64_t cycles) {
+    g_cycles += cycles;
+    g_tb_dry_reads = 0;
+    dec_check();
+}
+void sr_tb_retrace(void) { sr_tb_credit_cycles(GK_CYCLES_PER_FIELD); }
+
+void sr_tb_seed(uint64_t tb) { g_tb_origin = tb - g_cycles / GK_TIMER_RATIO; }
+
+// A read with no credit since the last SR_TB_STALL_MAX reads means the guest is
+// spinning on a clock nothing is driving.  Fault LOUDLY rather than spin for ever
+// -- and note that the alternative failure a wall clock offers here is not "no
+// hang", it is "a hang you cannot see because the numbers look plausible".
+static void tb_read_guard(uint32_t addr) {
+    if (++g_tb_dry_reads >= SR_TB_STALL_MAX) {
+        g_tb_dry_reads = 0;
+        g_tb_stalls++;
+        fault(SR_F_TB_STALL, addr & 0xFFFFu);
+    }
+}
+
+// ---- the three shipped bodies, register for register -----------------------
+// 0x800ecb48 OSGetTime: mftbu r3 / mftb r4 / mftbu r5 / cmpw r3,r5 / bne -16 / blr.
+// r5 AND CR0 ARE ARCHITECTURALLY VISIBLE OUTPUTS of this function and the fixture
+// differential scores both, so a host implementation that only set r3:r4 would fail
+// against its own translation.  The loop can only EXIT with r3 == r5, so CR0 is the
+// EQ result of comparing a snapshot with itself.
+static void os_get_time(GekkoState *st) {
+    tb_read_guard(SAB_OSGetTime);
+    uint64_t t = sr_tb_read();
+    st->gpr[3] = (uint32_t)(t >> 32);
+    st->gpr[4] = (uint32_t)t;
+    st->gpr[5] = st->gpr[3];
+    gk_cmp_signed(st, 0, (int32_t)st->gpr[3], (int32_t)st->gpr[5]);
+    tr(SR_EV_GET_TIME, st->gpr[3], st->gpr[4]);
+    g_tb_calls++;
+}
+// 0x800ecb60 OSGetTick: mftb r3 / blr.  Nothing else in the body.
+static void os_get_tick(GekkoState *st) {
+    tb_read_guard(SAB_OSGetTick);
+    st->gpr[3] = (uint32_t)sr_tb_read();
+    tr(SR_EV_GET_TICK, st->gpr[3], 0);
+    g_tb_calls++;
+}
+// 0x800e34bc PPCMtdec: mtspr 22,r3 / blr.  No GPR and no CR is written.
+static void ppc_mtdec(GekkoState *st) {
+    sr_dec_write(st->gpr[3]);
+    tr(SR_EV_SET_DEC, st->gpr[3], (uint32_t)sr_tb_read());
+    g_tb_calls++;
+}
+
+// ============================================================================
 // SelectThread, 0x800ebd68, 512 B — the host boundary.
 //
 // A register-for-register transcription of the shipped function (labels named
@@ -497,6 +610,17 @@ int sr_host_call(GekkoState *st, uint32_t addr) {
     case SAB_TRK_set_MSR_A:
     case SAB_TRK_set_MSR_B:        trk_set_msr(st);             return 1;
     }
+    // THE CLOCK.  Answered in every non-OFF mode for the same reason the MSR family
+    // is -- it adds no threading and no mode of its own -- but behind its OWN switch,
+    // so `sr_tb_enable(0)` is a control arm for THIS boundary alone, on one binary,
+    // without also disabling the MSR boundary the way sr_os_mode(0) does.
+    if (g_clock_on) {
+        switch (addr) {
+        case SAB_OSGetTime:        os_get_time(st);             return 1;
+        case SAB_OSGetTick:        os_get_tick(st);             return 1;
+        case SAB_PPCMtdec:         ppc_mtdec(st);               return 1;
+        }
+    }
     // Everything below is CONTEXT, not interrupts.  SR_OS_IRQ deliberately does not
     // answer for it: an unimplemented boundary must stay an explicit fault rather
     // than become a silently-wrong body.  (CONTEXT_SWITCH.md §7.)
@@ -569,6 +693,38 @@ EMSCRIPTEN_KEEPALIVE int      sr_os_get_mode(void)       { return g_mode; }
 EMSCRIPTEN_KEEPALIVE void     sr_os_set_msr(uint32_t m)  { g_msr = m; }
 EMSCRIPTEN_KEEPALIVE uint32_t sr_os_get_msr(void)        { return g_msr; }
 EMSCRIPTEN_KEEPALIVE void     sr_os_set_timeout(uint32_t ms) { g_park_ms = ms; }
+
+// ---- clock exports.  Split into u32 halves because these builds are not linked
+// -sWASM_BIGINT, so a u64 across the JS boundary would be silently truncated.
+EMSCRIPTEN_KEEPALIVE void     sr_tb_enable(int on)       { g_clock_on = on ? 1 : 0; }
+EMSCRIPTEN_KEEPALIVE int      sr_tb_is_enabled(void)     { return g_clock_on; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_hi(void)             { return (uint32_t)(sr_tb_read() >> 32); }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_lo(void)             { return (uint32_t)sr_tb_read(); }
+EMSCRIPTEN_KEEPALIVE void     sr_tb_seed_parts(uint32_t hi, uint32_t lo) {
+    sr_tb_seed(((uint64_t)hi << 32) | lo);
+}
+EMSCRIPTEN_KEEPALIVE void     sr_tb_credit(uint32_t hi, uint32_t lo) {
+    sr_tb_credit_cycles(((uint64_t)hi << 32) | lo);
+}
+EMSCRIPTEN_KEEPALIVE void     sr_tb_field(void)          { sr_tb_retrace(); }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_dec_get(void)           { return sr_dec_read(); }
+EMSCRIPTEN_KEEPALIVE void     sr_dec_set(uint32_t v)     { sr_dec_write(v); }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_calls(void)          { return g_tb_calls; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_stalls(void)         { return g_tb_stalls; }
+// Decrementer exceptions that WOULD have been delivered and were not -- the honest
+// readout of the hole named in sr_host_os.h.  Nonzero here means a guest alarm
+// handler did not run; it does not mean anything went wrong in this facility.
+EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_dec_exceptions(void) { return g_dec_exceptions; }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_cycles_hi(void)      { return (uint32_t)(g_cycles >> 32); }
+EMSCRIPTEN_KEEPALIVE uint32_t sr_tb_cycles_lo(void)      { return (uint32_t)g_cycles; }
+// Per-fixture reset: counters and the DEC arm, so one replay cannot inherit the
+// previous one's state.  It does NOT clear the seeded origin; the harness seeds
+// that from the capture immediately afterwards.
+EMSCRIPTEN_KEEPALIVE void     sr_tb_reset(void) {
+    g_cycles = 0; g_dec_start_value = 0xFFFFFFFFu; g_dec_start_cycles = 0;
+    g_dec_armed = 0; g_dec_due_cycles = 0; g_dec_exceptions = 0;
+    g_tb_calls = 0; g_tb_dry_reads = 0; g_tb_stalls = 0;
+}
 EMSCRIPTEN_KEEPALIVE uint32_t *sr_os_trace(void)         { return g_trace; }
 EMSCRIPTEN_KEEPALIVE uint32_t  sr_os_trace_n(void)       { return g_trace_n; }
 EMSCRIPTEN_KEEPALIVE void      sr_os_trace_reset(void)   { g_trace_n = 0; }

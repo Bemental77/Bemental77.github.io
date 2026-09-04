@@ -345,6 +345,20 @@ class GDB:
                           ("ctr", 68), ("xer", 69), ("fpscr", 70)):
             st[name] = self.reg(num)
         st["fpr"] = [self.reg(32 + i) for i in range(32)]
+        # THE GUEST CLOCK.  GDBStub.cpp:489-496 exposes SPR_TL=114, SPR_TU=115 and
+        # SPR_DEC=116, so a capture CAN carry the timebase the invocation started and
+        # ended with -- and it must, or verify_fixture.mjs has nothing to seed
+        # sr_host_os.c's clock from and must leave tb/dec unscored (the same rule
+        # README §9.7 established for MSR: seed from the capture or refuse, never 0).
+        # `tb` is the architectural 64-bit value; Dolphin keeps the halves in two SPRs.
+        # Wrapped because a stub that predates these ids answers `E..`, and a capture
+        # rig must degrade to "no tb field" rather than abort a whole survey.
+        try:
+            tl, tu, dec = self.reg(114), self.reg(115), self.reg(116)
+            st["tb"] = (tu << 32) | tl
+            st["dec"] = dec
+        except RSPError:
+            pass
         return st
 
 

@@ -2793,6 +2793,283 @@ in the image. Three items, in the order the boot hits them:
 
 Only after those does "something renders" become a question about the renderer.
 
+## 11. The guest TIMEBASE as a host facility — +189, and the one place gate #9 breaks by accident
+
+`0x800ecb48` `OSGetTime`, `0x800ecb60` `OSGetTick` and `0x800e34bc` `PPCMtdec` are
+host-implemented, driven by **retired guest work** and never by the host clock.
+Reproduce every number below with:
+
+```bash
+# the closure delta, both arms from ONE process and ONE classify() implementation
+python3 gamecube/recomp/sr/fixture_dol.py --shapes-only --irq-hosts --clock-hosts --new-only
+# the containment audit (exit 2 if any EMITTED body could read the clock)
+python3 gamecube/recomp/sr/sr.py --image /tmp/sr_sab/main.dol --map dolphin_captures/sab.map \
+  --boundaries outer+calls --indirect --jumptables --tb-audit \
+  --host 0x800ecb48 --host 0x800ecb60 --host 0x800e34bc
+# the execution differential, six arms on ONE binary
+SR_OUT=/tmp/sr_clock SR_HOST_OS=1 SR_OPT=-O2 SR_EXTRA_ARGS="--indirect --jumptables \
+  --boundaries outer+calls --host 0x800e78ac --host 0x800e78c0 --host 0x800e78d4 \
+  --host 0x800e3494 --host 0x800e349c --host 0x80108e98 --host 0x80108ea0 \
+  --host 0x800ecb48 --host 0x800ecb60 --host 0x800e34bc" \
+  bash gamecube/recomp/sr/build_fixture.sh /tmp/sr_sab/main.dol 0x800ecb68
+SR_OUT=/tmp/sr_clock node gamecube/recomp/sr/verify_clock.mjs
+```
+
+### 11.1 THE INVARIANT — and why the obvious implementation is a gate-#9 bug
+
+```
+TB  = TB_origin + floor(GUEST_CYCLES_RETIRED / 12)
+DEC = DEC_at_write - floor((GUEST_CYCLES_RETIRED - cycles_at_write) / 12)
+```
+
+**Guest cycles are the only input to the rate. A host wall-clock ORIGIN is legitimate;
+a host wall-clock RATE is not.** That distinction is not a house rule — it is exactly
+what the reference does. Dolphin `SystemTimers.cpp:213-218`:
+
+```cpp
+GetFakeTimeBase() = FakeTBStartValue
+                  + (CoreTiming::GetTicks() - FakeTBStartTicks) / TIMER_RATIO;
+```
+
+`CoreTiming::GetTicks()` is the **emulated CPU cycle counter**, not wall time;
+`:199-204` `GetFakeDecrementer()` is the same expression counting down; `SystemTimers.h:41`
+`TIMER_RATIO = 12` and `:103` `m_cpu_core_clock = 486000000` give 40.5 MHz, the constant
+CLAUDE.md gate #9 already names. The **only** wall-clock input Dolphin has is the
+origin, taken once at boot from the RTC (`:269`, seconds-since-GC-epoch × 40.5e6).
+
+Why it matters here rather than in the abstract: this runtime does not deliver guest
+work at hardware rate — the honest JIT figure is **0.3781x delivered** (§8.6b). Drive
+the timebase from `emscripten_get_now()` and the guest gets ~1.00 s of *time* for every
+~0.38 s of *work* it retired, so its time:work ratio — a **constant of the hardware** —
+becomes a function of the host. Guest deadlines fire early, measured intervals read
+long, and two replays of the same computation disagree, so no differential can ever be
+bit-exact. In the other direction, a host **faster** than hardware (the entire point of
+the 120 headroom target) makes guest time run **slow** against guest work. Both
+directions are the gate-#9 failure. Deriving the clock from retired work makes the
+ratio exactly hardware's **at any host speed**, and leaves "how much wall time one
+second of guest time costs" as a quantity measured *outside* the guest — gate #9's
+second, independent knob.
+
+> **This was live in the tree, with a comment arguing it was safe.** `sr_image.c`'s
+> `img_timebase()` read `emscripten_get_now()` under the note *"THE GUEST CLOCK IS HOST
+> WALL TIME, 1:1. It is not scaled and it must never be"*. The reasoning is plausible
+> and wrong for one measured reason: 1:1 with the host is not 1:1 with the hardware
+> unless the host delivers guest work at hardware rate, and it does not. That function
+> now delegates to `sr_tb_read()`, so the image has one clock instead of two.
+> `sr_image.c` also routed `mtspr 22` into its generic SPR file, where the write was a
+> dead store nothing counted down; SPR 22 is now special-cased to the shared
+> decrementer. **Both edits are in a file another agent owns and are deliberately left
+> uncommitted** — flag them rather than sweeping them into a commit message that does
+> not describe them (the failure `279f710e` is recorded for).
+
+### 11.2 The set — read from the shipped words, because the map is wrong here
+
+```
+0x800ecb48 OSGetTime  7c6d42e6 mftbu r3 / 7c8c42e6 mftb r4 / 7cad42e6 mftbu r5
+                      7c032800 cmpw r3,r5 / 4082fff0 bne -16 / 4e800020 blr
+0x800ecb60 OSGetTick  7c6c42e6 mftb r3 / 4e800020 blr
+0x800e34bc PPCMtdec   7c7603a6 mtspr 22,r3 / 4e800020 blr
+```
+
+`sab.map` calls `0x800e34bc` **`PPCMtwpar`** and that is wrong: the Gekko SPR field is
+encoded in swapped halves, and reassembling it gives **22 = DEC**. WPAR is SPR 921.
+`~/gc_refs/dolsdk2001/src/os/OSTime.c:15-38` is the same code as C, and
+`.../OSAlarm.c:37-46` `SetTimer` is why `PPCMtdec` belongs in this boundary rather than
+its own — it computes `alarm->fire - OSGetTime()` and `PPCMtdec`s the result.
+
+**`r5` and `CR0` are outputs of `OSGetTime`, not scratch.** The retry loop leaves
+`r5 = TBU` and `CR0 = EQ` from `cmpw r3,r5`, and the fixture differential scores both,
+so a host implementation that set only `r3:r4` would fail against its own translation.
+All three bodies are leaves that touch **no memory and take no stack frame**, which is
+what makes them safe to answer for without perturbing an ordered write log.
+
+### 11.3 The closure delta, and the pair effect reproduced independently
+
+`rel_shapes.classify`, whole `outer+calls` set, all arms from one process:
+
+| host set | closure-clean | vs 3,581 baseline |
+|---|---|---|
+| baseline (none) | 3,581 / 4,741 | — |
+| SR_OS_IRQ only (§9.7) | 4,080 / 4,741 | +499 |
+| **IRQ + clock (3)** | **4,269 / 4,741** | **+688 fn, +86,744 instr = 23.14% of `.text`** |
+
+**The clock's own contribution is +189 functions / +12,772 instructions (3.41% of
+`.text`)** on top of the committed 4,080. Leave-one-out, on top of the IRQ set:
+
+| address | alone | dropped from the set |
+|---|---|---|
+| `0x800ecb48` `OSGetTime` | +70 | **−182** |
+| `0x800ecb60` `OSGetTick` | +7 | −10 |
+| `0x800e34bc` `PPCMtdec` | **+0** | **−112** |
+
+`PPCMtdec` on its own is worth **nothing** and costs **112** when removed — §9.7's
+"the unit is the PAIR" finding, reproduced on a different pair for a different reason
+(`SetTimer` needs `OSGetTime` to compute the delta it then writes to the decrementer).
+Measuring it was the only way to know: by name it looks like the least important of
+the three.
+
+**The task framing of "381 blocked-function memberships" over-reads by design.** 208 +
+28 + 145 counts *memberships*, and a function appears in several rows; the ceiling was
+never more than the 265 that §9.7 left blocked, and **197** of those 265 clear when the
+2nd in-image timebase reader is included (**189** without it — see below). The rest
+reach a second, unrelated boundary.
+
+**A 4th address exists and is deliberately NOT host-bound.** `0x80169ae8` is a
+C-compiled `OSGetTime`: `mftbu r4 / mftb r31 / mftbu r0 / cmpw / bne`, then
+`li r3,0; li r5,32; bl 0x8010b338` (a 64-bit shift helper) and `or r4,r4,r31`, i.e. it
+returns `r3:r4 = TBU:TBL` — the same **value**. It is not the same **function**: it
+takes a stack frame and writes `r0` and `r31` into it, and host-binding it would
+silently delete two writes the oracle records in the ordered write log. Measured cost of
+leaving it out: **8 functions**. Named rather than quietly taken.
+
+### 11.4 Containment — `sr.py --tb-audit`, the same shape as `--msr-audit`
+
+```
+0x800e34bc PPCMtwpar       1 site(s) [mtspr DEC]                       HOST-BOUND
+0x800e8e90 Reset           2 site(s) [mftb TBL]                        refused (mfspr SPR1008)
+0x800ecb48 OSGetTime       3 site(s) [mftb TBL, mftb TBU]              HOST-BOUND
+0x800ecb60 OSGetTick       1 site(s) [mftb TBL]                        HOST-BOUND
+0x8010a6b4 zz_8010a6b4_    3 site(s) [mfspr DEC, mftb TBL, mftb TBU]   refused (op31 xo=595)
+0x8010a86c TRKRestoreExtended1Block 3 site(s) [mtspr DEC, mtspr TBL(w), mtspr TBU(w)]  refused
+0x80169ae8 zz_80169ae8_    3 site(s) [mftb TBL, mftb TBU]              refused (op31 xo=371)
+
+7 functions can observe the timebase/decrementer: 3 host-bound, 4 refused, 0 EMITTED
+PASS: no emitted body can reach the timebase except through the host boundary.
+```
+
+**Seven functions in the entire image can see guest time, and zero of them are
+emitted.** So `g_tb` is not an approximation the guest can catch out by reading the
+clock some other way — inside the emitted image it is the only representation of guest
+time that exists. The audit exits 2 if that stops being true. (Writing the TB —
+`mttbl`/`mttbu` — occurs in exactly one function, the Metrowerks debug monitor's
+`TRKRestoreExtended1Block`; it stays refused.)
+
+### 11.5 Verified BY EXECUTION, with the control arm inside the same binary
+
+The committed fixture record **cannot** evidence this boundary, and that is measured,
+not assumed: of 398 committed capture records, exactly **three** ever entered
+`OSGetTime` — `0x80123d24`, `0x801237d0`, `0x8012eda8` in `sab_dol_survey_all.json` —
+and **all three carry the artifact's own `usable:false` flag** from capture time
+("2 unknown store forms"; "did not return (capture truncated)"), so `verify_fixture.mjs`
+refuses them before the boundary is reached. Every other capture was armed by a closure
+gate that excluded every clock caller by construction. `verify_fixture.mjs` now says so
+explicitly rather than reporting a quiet zero.
+
+So the differential runs a **real translated guest body** whose answer comes from the
+guest's own source: **`0x800ecb68 __OSGetSystemTime`**, 100 B / 25 instructions,
+decoded from the shipped words and matching `~/gc_refs/dolsdk2001/src/os/OSTime.c:66-76`
+line for line — `OSDisableInterrupts` / `OSGetTime` / add the 64-bit adjust at
+`0x800030D8` / `OSRestoreInterrupts`, returning `r3:r4 = TB + adjust`. Its closure emits
+**one** body and reaches all three callees through `sr_extern`, so a pass is a
+translated caller reaching the host layer. `verify_clock.mjs`, wasm md5
+`16748f7f71959ed30fff49135ec7adf0` **identical before and after every arm**, machine
+load 1.3–2.2:
+
+| arm | what it establishes | result |
+|---|---|---|
+| **A** clock ON | `fault=0`, boundary crossed, `r3:r4 == seed + adjust` exactly | 4/4 |
+| **B** clock OFF, **same binary** | must fault `0xe00ecb48`, 0 crossings | 2/2 |
+| **C** four different seeds | the answer **tracks the seed**; a constant would pass A for the wrong reason | 4/4 |
+| **D** `PPCMtdec` | DEC reads back; counts **down** by `cycles/12`; the exception comes due | 4/4 |
+| **E** gate #9, as a test | 250 ms of **real host time** passes → guest ticks advance by **0** | 1/1 |
+| **F** retired work | one field = **exactly 675,000** ticks; 60 fields = 40,500,000; sub-tick remainder carried | 3/3 |
+
+**18 passed / 0 failed.** Arm E is the invariant stated as an executable check: a
+wall-clock timebase would have advanced ~10,125,000 ticks in that window, and that
+difference *is* the bug. Arm B is the falsifying control — same md5, switch flipped at
+run time, so the pair cannot be confounded by a relink.
+
+> **`sr_tb_enable()` is a separate switch from `sr_os_mode()` on purpose.** Turning the
+> clock off via `sr_os_mode(0)` would also turn the MSR boundary off, and the delta
+> would be un-attributable between two facilities. `SR_TB=0` isolates the clock.
+
+### 11.6 Arm C FAILED first, and it was a real translator bug
+
+On the first run, arm C failed on one seed:
+
+```
+FAIL  C seed=0xfffffffffff -> r3:r4  got=1000:23456788  want=1001:23456788
+```
+
+The high word was low by exactly 1 — a lost carry. Cause, at `sr.py:507` as it stood:
+`addc` (op31 xo=10) shared the `add` (xo=266) arm and emitted a plain
+`st->gpr[D] = A + B;`, **never writing XER[CA]** — while `adde` one instruction later
+has always *consumed* `XER[CA]` correctly. So every 64-bit add compiled as the canonical
+`addc rLO; adde rHI` pair silently dropped the carry, and was wrong by 1 in the high
+word **only when the low halves actually carried**. `subfc` (xo=8) and `addic`/`addic.`
+(op 12/13) were already correct, which is what makes this an omission rather than a
+modelling decision.
+
+**Blast radius, from the raw binary: 54 `addc` sites across 16 of the 4,741 functions,
+10 of them immediately followed by `adde`.** It was invisible to the 1,056 leaf vectors,
+to the 330 verified DOL functions and to inspection — and it surfaced only because
+`__OSGetSystemTime` became reachable at all, which required this boundary to exist. Same
+lesson as §9.5's `fctiwz`: a broad differential finds what reading cannot.
+
+**The fix is provably confined**, by the §5j standard. Regenerating the whole image with
+HEAD's translator and with the fixed one, same flags and same 10 `--host` addresses:
+
+| | |
+|---|---|
+| changed statements in `sr_gen.c` | **54** — exactly the 54 `addc` sites counted independently from the binary |
+| every removed line | a bare `st->gpr[D] = A + B;` (0 exceptions) |
+| every added line | sets `XER[CA]` (0 exceptions) |
+| `sr_dispatch.c` | **byte-identical**, md5 `c0d7757848e9a1ad4e62ad64c154294a` |
+
+**Regression gate:** the committed context-switch suite, rebuilt through the changed
+translator, is **63 passed / 0 failed**, including its own control arm D
+(`sr_os_mode(0)` → `0xe00e78ac`).
+
+### 11.7 What is NOT modelled — stated so nothing here implies completeness
+
+* **Decrementer interrupt DELIVERY.** The register is exact; its consequence is not.
+  Dolphin's `DecrementerCallback` (`SystemTimers.cpp:139-143`) sets `DEC = 0xFFFFFFFF`
+  and raises `EXCEPTION_DECREMENTER`; this runtime has **no interrupt delivery at all**
+  (§6, `CONTEXT_SWITCH.md` §7.1), and the 8 non-`SelectThread` `OSLoadContext` sites —
+  the exception-return paths — still fault `SR_F_LOADCTX_EXC`. So the facility **counts**
+  the exceptions that would have fired (`sr_tb_dec_exceptions()`, surfaced per-run by
+  `verify_fixture.mjs`) and delivers none. Direct consequence: `OSSetAlarm` programs a
+  timer whose handler never runs. This is the **same pre-existing hole MSR[EE] has** —
+  value exact, effect absent — neither widened nor narrowed here.
+* **No driver is attached in the whole-image build yet.** The facility owns the
+  register; the driver owns the credit. The proven one is
+  `sr_tb_retrace()` = +675,000 ticks per guest VI retrace, which is what
+  `recomp_worker.js:786` drives the shipping MP4 recomp's `OSGetTime` from at
+  **0.999x**. Until `sr_image.c`'s boot loop calls it, **the clock is frozen** — and a
+  frozen clock raises `SR_F_TB_STALL` after `SR_TB_STALL_MAX` uncredited reads, naming
+  the caller. That is deliberate: a stall is *loud*, a wall clock is *silently wrong*.
+* **The fixture rig does not advance the clock within one replay.** There is no
+  per-instruction retire counter in this runtime, so there is no honest cycle count to
+  credit for one invocation, and interpolating from the oracle's `steps` would be a
+  fabricated rate — the same class of error as reading the host clock. A fixture that
+  measures an *interval* inside a single call therefore sees a delta of 0. Limitation of
+  the **rig**, not the facility.
+* **No committed capture carries a guest TB.** `native_oracle_gdb.arch_state` now reads
+  GDB register ids **114/115/116** (`GDBStub.cpp:489-496` `SPR_TL`/`SPR_TU`/`SPR_DEC`),
+  so a future survey will; `verify_fixture.mjs` seeds and scores `tb`/`dec` only when the
+  capture has them, and refuses to seed 0 otherwise — the rule §9.7 established for MSR.
+
+### 11.8 What blocks the remaining 472, measured the same way
+
+Complete blocker sets (`sr.closure_of`) over every still-blocked entry, so this is a
+blast radius and not a first-blocker histogram:
+
+| next blocker | blocks | what it is |
+|---|---|---|
+| `0x800e55d4` `OSSetCurrentContext` | 216 | `mfmsr` + MSR[FP] — context switch, **already written** in `sr_host_os.c` |
+| `0x800e563c` `OSSaveContext` | 198 | the setjmp — same |
+| `0x800e56bc` `OSLoadContext` | 198 | `rfi` — same |
+| `0x800e4e4c` `DCFlushRange` | 190 | `dcbf` loop + `sc` — unclaimed cache-maintenance boundary |
+| `0x800e4e1c` `DCInvalidateRange` | 178 | `dcbi` loop — same |
+| `0x800e4e80` `DCStoreRange` | 53 | same |
+| `0x80113fc0` / `0x80113f98` | 31 / 31 | `mtspr SPR913` (the GQR/quantised path) |
+| `0x800e34c4` `PPCSync` | 21 | `sync` |
+
+So the next boundary worth building is the **context switch** (already transcribed, and
+`SR_OS_HLE` exists — it needs the closure gate and a measurement, not new code), and
+after it **cache maintenance**, which `sr_image.c` already argues is `IMG_D_VOID` on
+structural grounds: there is no cache in this runtime to control.
+
 ## 7. Decision
 
 **The route is VIABLE for SAB on translatability grounds, and the remaining work

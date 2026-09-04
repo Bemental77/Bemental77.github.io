@@ -169,6 +169,39 @@ const main = async () => {
     throw new Error('SR_OS_MODE was set but this build has no host OS layer — ' +
                     'rebuild with SR_HOST_OS=1 (build_fixture.sh)');
   }
+  // ------------------------------------------------------------- the guest clock
+  // The timebase boundary (OSGetTime / OSGetTick / PPCMtdec) has its OWN switch, so
+  // SR_TB=0 is a control arm for the CLOCK ALONE on the same binary — unlike
+  // SR_OS_MODE=0, which would also switch the MSR boundary off and make the delta
+  // un-attributable between two facilities.
+  //
+  // SEEDING.  A guest TB is an ORIGIN, and an origin must come from the capture or
+  // not at all: seeding 0 on a capture that has no `tb` field would be the exact
+  // failure §9.7 records for MSR (a wrong value that reads as a translator bug).  So
+  // a fixture WITHOUT state_in.tb runs with the clock's origin left at 0 and its
+  // tb/dec outputs NOT scored, and the run says so; a fixture WITH it is seeded and
+  // scored.  No committed capture has the field yet — native_oracle_gdb must read
+  // GDB register ids 114/115/116 (GDBStub.cpp:489-496 SPR_TL/SPR_TU/SPR_DEC) for a
+  // future survey to carry it.
+  //
+  // WHAT DOES *NOT* HAPPEN HERE, deliberately: the clock is NOT advanced during a
+  // replay.  This runtime has no per-instruction retire counter, so there is no
+  // honest number of guest cycles to credit for one fixture invocation, and
+  // interpolating from the oracle's `steps` would be a fabricated rate — the same
+  // class of error as reading the host clock. A fixture that measures an INTERVAL
+  // inside a single call therefore sees a delta of 0. That is a named limitation of
+  // the FIXTURE RIG, not of the facility: the whole-image driver credits real guest
+  // events (sr_tb_retrace, one 60 Hz field = 675,000 ticks).
+  const HAS_TB = typeof M._sr_tb_enable === 'function';
+  const TB_ON = process.env.SR_TB === undefined ? 1 : (parseInt(process.env.SR_TB, 10) ? 1 : 0);
+  if (HAS_TB) {
+    M._sr_tb_enable(TB_ON);
+    console.log(`[host-tb] timebase boundary ${TB_ON ? 'ON' : 'OFF — CONTROL ARM'}; ` +
+                `driven by RETIRED GUEST WORK only (no host clock is read)`);
+  } else if (process.env.SR_TB !== undefined) {
+    throw new Error('SR_TB was set but this build has no timebase boundary — ' +
+                    'rebuild with SR_HOST_OS=1 (build_fixture.sh)');
+  }
   const phys = (a) => {
     const ea = a >>> 0;
     if (IN_L1(ea)) return (ramSize + (ea & (GK_L1_SIZE - 1))) >>> 0;
@@ -182,7 +215,8 @@ const main = async () => {
   // which is a vacuous pass and exactly the shape a survey must never report. Every
   // refusal is tallied by its reason so a gap is visible as a named class with a
   // count, rather than as a smaller denominator nobody printed.
-  const tally = { pass: 0, fail: 0, refused: 0, notBuilt: 0, passWithSink: 0, lcScored: 0, hostScored: 0 };
+  const tally = { pass: 0, fail: 0, refused: 0, notBuilt: 0, passWithSink: 0, lcScored: 0,
+                  hostScored: 0, tbScored: 0, decExc: 0 };
   const why = new Map();
   const refuse = (kind, line) => {
     tally.refused++;
@@ -395,6 +429,12 @@ const main = async () => {
           M._sr_os_set_msr(si.msr >>> 0);   // the guest MSR this invocation started with
           M._sr_os_trace_reset();           // so hostCalls counts THIS replay only
         }
+        if (HAS_TB) {
+          M._sr_tb_reset();                 // counters + DEC arm, per replay
+          if (si.tb !== undefined)          // ORIGIN from the capture, or not at all
+            M._sr_tb_seed_parts(Math.floor(si.tb / 0x100000000) >>> 0, si.tb >>> 0);
+          if (si.dec !== undefined) M._sr_dec_set(si.dec >>> 0);
+        }
 
         const fault = M._sr_call(entry) >>> 0;
         const unstaged = M._sr_unstaged() >>> 0;
@@ -416,6 +456,13 @@ const main = async () => {
         if (HAS_HOST) {
           outSt.msr = M._sr_os_get_msr() >>> 0;
           outSt.hostCalls = M._sr_os_trace_n() >>> 0;
+        }
+        if (HAS_TB) {
+          outSt.tbCalls = M._sr_tb_calls() >>> 0;
+          outSt.tb = M._sr_tb_hi() * 0x100000000 + (M._sr_tb_lo() >>> 0);
+          outSt.dec = M._sr_dec_get() >>> 0;
+          outSt.tbStalls = M._sr_tb_stalls() >>> 0;
+          outSt.decExc = M._sr_tb_dec_exceptions() >>> 0;
         }
         runs.push({ ps1mode, fault, unstaged, wlog: got, out: outSt });
       }
@@ -501,6 +548,18 @@ const main = async () => {
       // comparing against nothing (the same reason FPSCR is reported, not scored).
       if (HAS_HOST && OS_MODE !== 0 && A.out.msr !== (so.msr >>> 0))
         bad.push(`msr want=${(so.msr >>> 0).toString(16)} got=${A.out.msr.toString(16)}`);
+      // The clock is scored on the SAME terms as MSR, and only when the capture
+      // actually carries it: an unseeded origin compared against a captured one would
+      // fail every fixture for a reason that is about the RIG, not the runtime.
+      if (HAS_TB && TB_ON && fx.state_in.tb !== undefined && so.tb !== undefined &&
+          A.out.tb !== so.tb)
+        bad.push(`tb want=${so.tb} got=${A.out.tb}`);
+      if (HAS_TB && TB_ON && fx.state_in.dec !== undefined && so.dec !== undefined &&
+          A.out.dec !== (so.dec >>> 0))
+        bad.push(`dec want=${(so.dec >>> 0).toString(16)} got=${A.out.dec.toString(16)}`);
+      if (HAS_TB && A.out.tbStalls)
+        bad.push(`timebase STALLED ${A.out.tbStalls}x — the guest polled a clock ` +
+                 `nothing is crediting guest work to`);
       const xerNote = A.out.xer === (so.xer >>> 0) ? 'match'
         : `want=${(so.xer >>> 0).toString(16)} got=${A.out.xer.toString(16)} ` +
           `(NOT OBSERVABLE: GDBStub.cpp:451 reads a dead spr[SPR_XER] slot)`;
@@ -557,7 +616,13 @@ const main = async () => {
       // than in aggregate.
       const hostNote = (HAS_HOST && A.out.hostCalls) ? ` host-calls=${A.out.hostCalls}` : '';
       if (ok && HAS_HOST && A.out.hostCalls) tally.hostScored++;
-      console.log(`${ok ? 'PASS' : 'FAIL'}  ${tag}${sinkNote}${lcNote}${hostNote}  steps=${fx.steps} bl=${fx.n_calls} ` +
+      // Clock crossings are counted SEPARATELY from hostCalls: hostCalls is the MSR
+      // trace's length, and a pass that never read the clock is not evidence about the
+      // clock. This is the per-fixture quantity the SR_TB=0 arm has to break.
+      const tbNote = (HAS_TB && A.out.tbCalls) ? ` tb-calls=${A.out.tbCalls}` : '';
+      if (ok && HAS_TB && A.out.tbCalls) tally.tbScored++;
+      if (HAS_TB && A.out.decExc) tally.decExc += A.out.decExc;
+      console.log(`${ok ? 'PASS' : 'FAIL'}  ${tag}${sinkNote}${lcNote}${hostNote}${tbNote}  steps=${fx.steps} bl=${fx.n_calls} ` +
                   `stores=${fx.writes.length} write-events=${want.length} ` +
                   `final-mem-bytes=${fx._memBytes} ` +
                   `staged=${Object.keys(fx.initial_mem).length} ` +
@@ -581,6 +646,21 @@ const main = async () => {
     console.log(`  NOTE ${String(tally.hostScored).padStart(6)}  of the verified ` +
                 `fixtures CROSSED the host OS boundary (sr_host_os.c) at least once; ` +
                 `those are the ones the SR_OS_MODE=0 control arm must break`);
+  if (tally.tbScored)
+    console.log(`  NOTE ${String(tally.tbScored).padStart(6)}  of the verified ` +
+                `fixtures CROSSED the TIMEBASE boundary (OSGetTime/OSGetTick/PPCMtdec) ` +
+                `at least once; those are the ones the SR_TB=0 control arm must break`);
+  else if (HAS_TB && TB_ON)
+    console.log(`  NOTE      0  fixtures crossed the TIMEBASE boundary — this run is ` +
+                `a NULL for the clock, not evidence for it. The committed captures ` +
+                `were all armed by a closure gate that EXCLUDED every clock caller, ` +
+                `so a clock-crossing fixture needs a new oracle run (fixture_dol.py ` +
+                `--clock-hosts --new-only).`);
+  if (tally.decExc)
+    console.log(`  NOTE ${String(tally.decExc).padStart(6)}  decrementer exceptions ` +
+                `came due and were NOT DELIVERED (no interrupt delivery exists in this ` +
+                `runtime — sr_host_os.h "WHAT IS NOT MODELLED"). Any guest alarm ` +
+                `handler behind one did not run.`);
   if (tally.lcScored)
     console.log(`  NOTE ${String(tally.lcScored).padStart(6)}  of the verified ` +
                 `fixtures read and/or write the Gekko locked L1 cache; those bytes ` +

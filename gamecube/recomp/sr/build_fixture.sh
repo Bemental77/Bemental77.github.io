@@ -71,6 +71,13 @@ HOST_SRC=(); HOST_EXP=""
 if [ "${SR_HOST_OS:-0}" = "1" ]; then
   HOST_SRC=("$SR/sr_host_os.c")
   HOST_EXP=",_sr_os_init_irq,_sr_os_mode,_sr_os_get_mode,_sr_os_set_msr,_sr_os_get_msr,_sr_os_trace,_sr_os_trace_n,_sr_os_trace_reset"
+  # The TIMEBASE boundary rides in the same TU and needs no mode of its own, but it
+  # gets its OWN run-time switch: SR_TB=0 turns the clock off while leaving the MSR
+  # boundary on, so the clock's control arm isolates the clock instead of also
+  # re-breaking every OSDisableInterrupts fixture.
+  HOST_EXP="$HOST_EXP,_sr_tb_enable,_sr_tb_is_enabled,_sr_tb_hi,_sr_tb_lo,_sr_tb_seed_parts"
+  HOST_EXP="$HOST_EXP,_sr_tb_credit,_sr_tb_field,_sr_dec_get,_sr_dec_set,_sr_tb_calls"
+  HOST_EXP="$HOST_EXP,_sr_tb_stalls,_sr_tb_dec_exceptions,_sr_tb_cycles_hi,_sr_tb_cycles_lo,_sr_tb_reset"
 fi
 
 # SR_CFLAGS: extra compiler flags.  The reason this exists is the FALSIFICATION

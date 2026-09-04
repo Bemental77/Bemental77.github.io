@@ -70,19 +70,28 @@ IRQ_HOST_NAMES = ("SAB_OSDisableInterrupts", "SAB_OSEnableInterrupts",
                   "SAB_TRK_get_MSR_B", "SAB_TRK_set_MSR_B")
 
 
-def _irq_hosts():
+# The TIMEBASE host boundary, sr_host_os.h's "THE GUEST TIMEBASE" set.  Three leaves,
+# read from the SHIPPED WORDS rather than from sab.map, which names 0x800e34bc
+# "PPCMtwpar" and is wrong -- the word is 7c7603a6 = `mtspr 22,r3`, and SPR 22 is the
+# DECREMENTER (WPAR is SPR 921).  All three touch no memory and take no stack frame,
+# which is what makes them safe to answer for without perturbing a fixture's write log.
+CLOCK_HOST_NAMES = ("SAB_OSGetTime", "SAB_OSGetTick", "SAB_PPCMtdec")
+
+
+def _hosts_from_header(names, why):
     """-> tuple of guest addresses, read out of sr_host_os.h by name."""
     hdr = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sr_host_os.h")
     defs = dict(re.findall(r"^#define\s+(SAB_\w+)\s+(0x[0-9a-fA-F]+)u?\s*$",
                            open(hdr).read(), re.M))
-    missing = [n for n in IRQ_HOST_NAMES if n not in defs]
+    missing = [n for n in names if n not in defs]
     if missing:
         raise SystemExit(f"{hdr} no longer defines {missing} -- the offline closure "
-                         f"gate and sr_host_os.c's SR_OS_IRQ switch have drifted apart")
-    return tuple(int(defs[n], 16) for n in IRQ_HOST_NAMES)
+                         f"gate and sr_host_os.c's {why} switch have drifted apart")
+    return tuple(int(defs[n], 16) for n in names)
 
 
-IRQ_HOSTS = _irq_hosts()
+IRQ_HOSTS = _hosts_from_header(IRQ_HOST_NAMES, "SR_OS_IRQ")
+CLOCK_HOSTS = _hosts_from_header(CLOCK_HOST_NAMES, "clock")
 
 
 def classify_dol(img, byaddr, min_size, hosts=()):
@@ -114,6 +123,14 @@ def main():
                          '(OSDisableInterrupts / OSEnableInterrupts / '
                          'OSRestoreInterrupts / the two __TRK_get_MSR + __TRK_set_MSR '
                          'pairs) -- what a build linked SR_HOST_OS=1 services.')
+    ap.add_argument('--clock-hosts', action='store_true',
+                    help='shorthand for --host on the TIMEBASE set (OSGetTime / '
+                         'OSGetTick / PPCMtdec) -- the guest clock, serviced by '
+                         'sr_host_os.c from RETIRED GUEST WORK, never from the host '
+                         'clock. Pair with --irq-hosts: the two sets compose, and '
+                         'PPCMtdec is worth +0 on its own but -112 when dropped from '
+                         'the composed set, because SetTimer uses it with OSGetTime '
+                         '(~/gc_refs/dolsdk2001/src/os/OSAlarm.c:37-46).')
     ap.add_argument('--new-only', action='store_true',
                     help='arm ONLY entries that the --host set newly unblocks, i.e. '
                          'those refused by the same gate without it.  This is what '
@@ -158,6 +175,8 @@ def main():
     hosts = {int(x, 16) for x in a.host}
     if a.irq_hosts:
         hosts |= set(IRQ_HOSTS)
+    if a.clock_hosts:
+        hosts |= set(CLOCK_HOSTS)
     if hosts:
         print("[shapes] host-bound (closure stops here, sr_host_hook services it): "
               + ", ".join(f"{h:#010x}" for h in sorted(hosts)))

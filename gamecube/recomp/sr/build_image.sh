@@ -98,8 +98,8 @@ HOSTS+=(
   0x800e3d38   # __OSPSInit           GQR0..7 = 0 (the only mode gekko_rt.h implements), HID2
   0x800e34a4 0x800e34ac 0x800e34b4 0x800e34bc   # PPCMf*/PPCMt* SPR accessors
   0x800e34e0 0x800e34e8 0x800e34f0              # ...decoded from the shipped instruction word
-  0x800ecb48   # OSGetTime            host monotonic at 40.5 MHz, 1:1 with wall time
-  0x800ecb60   # OSGetTick
+  0x800ecb48   # OSGetTime            40.5 MHz, driven by RETIRED GUEST WORK (sr_host_os.c)
+  0x800ecb60   # OSGetTick            — NOT by the host clock; see sr_host_os.h gate-#9 note
   0x800e54ac   # __OSSaveFPUContext   FPR/PS1/FPSCR <-> OSContext
   0x800e5388   # __OSLoadFPUContext
   # --- VOID: cache control, and there is no cache in this runtime to control

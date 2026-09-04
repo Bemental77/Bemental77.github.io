@@ -115,26 +115,38 @@ static uint32_t g_spr[1024];
 EMSCRIPTEN_KEEPALIVE uint32_t sr_image_spr(uint32_t n)             { return g_spr[n & 1023u]; }
 EMSCRIPTEN_KEEPALIVE void     sr_image_set_spr(uint32_t n, uint32_t v) { g_spr[n & 1023u] = v; }
 
-// Gekko timebase.  OS_BUS_CLOCK/4 = 162 MHz / 4 = 40.5 MHz, and 675,000 ticks is
-// exactly one 60 Hz frame — the same constant CLAUDE.md gate #9 names for the JIT's
-// credit model.  THE GUEST CLOCK IS HOST WALL TIME, 1:1.  It is not scaled and it must
-// never be: gate #9 makes speeding the guest up FORBIDDEN, and a timebase that runs
-// fast IS speeding the guest up, whatever a frame counter reads afterwards.
-// GK_TB_HZ is now ALSO defined by sr_host_os.h (as GK_CPU_HZ / GK_TIMER_RATIO) — the
-// collision warned about at img_hook has already reached the macro level, and building
-// this file emitted `'GK_TB_HZ' macro redefined`. Defer to the shared header rather than
-// shadowing it: the two derivations agree at 40,500,000, and the day they DON'T is
-// exactly the day a duplicate definition here would hide it. `/ 1000.0` forces the
-// double arithmetic the header's unsigned constant would otherwise truncate.
-#ifndef GK_TB_HZ
-#define GK_TB_HZ 40500000u
-#endif
-static double g_tb_origin_ms = -1.0;
-static uint64_t img_timebase(void) {
-    double now = emscripten_get_now();
-    if (g_tb_origin_ms < 0) g_tb_origin_ms = now;
-    return (uint64_t)((now - g_tb_origin_ms) * ((double)GK_TB_HZ / 1000.0));
-}
+// Gekko timebase.  40.5 MHz = GK_CPU_HZ / GK_TIMER_RATIO = 486 MHz / 12, and 675,000
+// ticks is exactly one 60 Hz field — the constants CLAUDE.md gate #9 names.  THE
+// IMPLEMENTATION LIVES IN sr_host_os.c (see sr_host_os.h, "THE GUEST TIMEBASE"), which
+// this file already links; this is a delegation so the image has ONE clock instead of
+// two that can disagree, and the GK_TB_HZ collision noted below is resolved by not
+// having a second definition of the clock at all.
+//
+// ⚠ THIS USED TO READ emscripten_get_now(), AND THAT WAS A GATE #9 BUG — recorded here
+// rather than silently deleted, because the reasoning that produced it is plausible.
+// Host wall time is NOT "1:1 with the guest".  This runtime does not deliver guest work
+// at hardware rate (the honest JIT figure is 0.3781x delivered on SAB cold-boot
+// attract, README §8.6b), so a wall-clock TB hands the guest ~1.00 s of TIME for every
+// ~0.38 s of WORK it actually retired.  The guest's own time:work ratio — a CONSTANT of
+// the hardware — becomes a function of the host: guest deadlines fire early, measured
+// intervals read long, and two replays of the same computation disagree, so no
+// differential can be bit-exact.  In the other direction, a host FASTER than hardware
+// (the entire point of the 120 headroom target) makes guest time run SLOW against guest
+// work.  Both directions break "ran precisely as the hardware intended".
+//
+// Deriving TB from RETIRED GUEST WORK makes the ratio exactly hardware's at ANY host
+// speed, and leaves "how much wall time one second of guest time costs" as a quantity
+// measured OUTSIDE the guest — gate #9's second, independent knob.  It is also what the
+// reference does: Dolphin's GetFakeTimeBase (SystemTimers.cpp:213-218) divides
+// CoreTiming::GetTicks(), the EMULATED CPU CYCLE COUNTER, by TIMER_RATIO=12.  The only
+// wall-clock input Dolphin has is the ORIGIN, taken once at boot from the RTC
+// (SystemTimers.cpp:269) — sr_tb_seed() is the equivalent here.
+//
+// DRIVER, still to be attached by this file's boot loop: call sr_tb_retrace() once per
+// guest VI retrace (+675,000 ticks), the same guest event recomp_worker.js:786 drives
+// the shipping MP4 recomp's OSGetTime from at 0.999x.  Until then the clock is FROZEN
+// and a guest spinning on it raises SR_F_TB_STALL — loud, rather than silently wrong.
+static uint64_t img_timebase(void) { return sr_tb_read(); }
 
 // --------------------------------------------------------------- OSContext layout
 // ~/gc_refs/dolsdk2001/include/dolphin/os/OSContext.h.  The four offsets sr_host_os.h
@@ -393,7 +405,17 @@ static int img_host(GekkoState *st, uint32_t addr) {
         uint32_t xo  = (w >> 1) & 0x3ffu;
         uint32_t spr = ((w >> 16) & 0x1fu) | (((w >> 11) & 0x1fu) << 5);
         uint32_t rt  = (w >> 21) & 0x1fu;
-        if      (xo == 339u) st->gpr[rt] = g_spr[spr & 1023u];   // mfspr
+        // SPR 22 IS THE DECREMENTER AND IT IS NOT AN INERT SLOT.  0x800e34bc is
+        // PPCMtdec (`7c7603a6 mtspr 22,r3`) — sab.map's "PPCMtwpar" is wrong; WPAR is
+        // SPR 921.  Routing it into g_spr[] would make the write a DEAD STORE that
+        // nothing counts down, i.e. a second, silent clock alongside sr_host_os.c's.
+        // The decrementer is slaved to the same retired-guest-work tick source as the
+        // timebase (sr_host_os.h "THE GUEST TIMEBASE"), so it belongs there.
+        // ⚠ Its INTERRUPT is still not delivered — sr_tb_dec_exceptions() counts what
+        // would have fired — because this runtime has no interrupt delivery at all.
+        if      (spr == 22u && xo == 339u) st->gpr[rt] = sr_dec_read();
+        else if (spr == 22u && xo == 467u) sr_dec_write(st->gpr[rt]);
+        else if (xo == 339u) st->gpr[rt] = g_spr[spr & 1023u];   // mfspr
         else if (xo == 467u) g_spr[spr & 1023u] = st->gpr[rt];   // mtspr
         else { img_log(addr, IMG_D_UNIMPL);
                if (!g_fault) g_fault = SR_F_IMG_UNIMPL | (addr & 0x00ffffffu);

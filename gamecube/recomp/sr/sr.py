@@ -504,8 +504,24 @@ class Translator:
         # ---- opcode-31 extended --------------------------------------------
         if op == 31:
             xo = f['xo']
-            if xo == 266 or xo == 10:                    # add / addc
+            if xo == 266:                                # add
                 o.append(f"{self.gp(D)} = {self.gp(A)} + {self.gp(B)};")
+                rc(D); return o
+            if xo == 10:                                 # addc — SETS XER[CA]
+                # FOUND BY EXECUTION, not by inspection (verify_clock.mjs arm C).
+                # `addc` used to share the `add` arm above and emit a plain `+`, so it
+                # never produced the carry -- while `adde` one line down has always
+                # CONSUMED XER[CA] correctly.  A 64-bit add compiled as the canonical
+                # `addc rLO; adde rHI` pair therefore lost the carry silently and was
+                # wrong by exactly 1 in the high word, only when the low halves
+                # actually carried.  `subfc` (xo=8) and `addic`/`addic.` (op 12/13)
+                # were already right, which is what makes this an omission rather than
+                # a modelling decision.  The instruction that exposed it is
+                # 0x800ecb98 in __OSGetSystemTime -- reachable only once the timebase
+                # boundary existed, because its closure runs through OSGetTime.
+                o.append(f"{{ uint64_t t = (uint64_t){self.gp(A)} + (uint64_t){self.gp(B)};"
+                         f" st->xer = (st->xer & ~0x20000000u) | ((t >> 32) ? 0x20000000u : 0u);"
+                         f" {self.gp(D)} = (uint32_t)t; }}")
                 rc(D); return o
             if xo == 40:                                 # subf
                 o.append(f"{self.gp(D)} = {self.gp(B)} - {self.gp(A)};")
@@ -1266,6 +1282,18 @@ def main():
                          'g_msr is not an approximation the guest can catch out: no '
                          'emitted body can reach MSR except by calling the host layer. '
                          'Pair it with the same --host set the build uses.')
+    ap.add_argument('--tb-audit', action='store_true',
+                    help='AUDIT THE TIMEBASE BOUNDARY: list every function in the '
+                         'image containing an instruction that can observe or alter '
+                         'the Gekko time base or decrementer (mftb, and mfspr/mtspr '
+                         'naming TBL=268 / TBU=269 / TBL_w=284 / TBU_w=285 / DEC=22) '
+                         'and prove each is either --host-bound or REFUSED by the '
+                         'translator. Exit 2 if any such function would be EMITTED as '
+                         'a translated body. That is the standing evidence that '
+                         'sr_host_os.c\'s g_tb/g_dec is the ONLY representation of '
+                         'guest time inside the emitted image, so a guest cannot read '
+                         'the clock behind the host layer\'s back. Same shape as '
+                         '--msr-audit; pair it with the same --host set the build uses.')
     ap.add_argument('--jumptable-census', action='store_true',
                     help='report how many bctr jump tables statically RESOLVE. This is '
                          'the runtime-completeness number; --coverage cannot show it '
@@ -1370,6 +1398,56 @@ def main():
                   "runtime and the two can disagree.", file=sys.stderr)
             sys.exit(2)
         print("PASS: no emitted body can reach MSR except through the host boundary.")
+        return
+
+    if a.tb_audit:
+        # WHAT THE GUEST CAN SEE OF TIME, enumerated rather than argued.  Three
+        # encodings reach it: mftb (op31 xo=371) and mfspr/mtspr (xo=339/467) naming
+        # one of the five time SPRs.  Gekko splits the SPR field into halves that are
+        # SWAPPED in the encoding, which is why the number is reassembled rather than
+        # masked out directly -- 0x7c6d42e6 is `mftbu r3`, spr field 0b1011000000,
+        # low half 13 | high half 8 << 5 = 269.
+        SPR_TIME = {268: 'TBL', 269: 'TBU', 284: 'TBL(w)', 285: 'TBU(w)', 22: 'DEC'}
+        owners = {}
+        for lo, size, name in units:
+            for p in range(lo, lo + size, 4):
+                w = img.word(p)
+                if w is None:
+                    continue
+                op, xo = w >> 26, (w >> 1) & 0x3FF
+                spr = ((w >> 16) & 31) | (((w >> 11) & 31) << 5)
+                if op == 31 and xo in (339, 371, 467) and spr in SPR_TIME:
+                    mn = {339: 'mfspr', 371: 'mftb', 467: 'mtspr'}[xo]
+                    owners.setdefault(lo, [name, []])[1].append(
+                        (p, f"{mn} {SPR_TIME[spr]}"))
+        emitted = []
+        for lo in sorted(owners):
+            name, sites = owners[lo]
+            if lo in hosts:
+                verdict = 'HOST-BOUND (serviced by sr_host_os.c)'
+            else:
+                try:
+                    Translator(img, lo, lo + byaddr[lo][0], starts=starts,
+                               indirect=a.indirect, jumptables=a.jumptables).translate()
+                    verdict = '*** EMITTED — THE GUEST CAN READ THE CLOCK DIRECTLY ***'
+                    emitted.append(lo)
+                except Untranslatable as e:
+                    verdict = f'refused ({e.why})'
+            ops = ', '.join(sorted({o for _, o in sites}))
+            print(f"{lo:#010x} {name[:30]:30s} {len(sites):2d} site(s) [{ops}]  {verdict}")
+        nh = sum(1 for lo in owners if lo in hosts)
+        print(f"\n{len(owners)} functions can observe the timebase/decrementer: "
+              f"{nh} host-bound, {len(owners) - nh - len(emitted)} refused, "
+              f"{len(emitted)} EMITTED")
+        if emitted:
+            print("FAIL: an emitted body can read or write the time base without the "
+                  "host layer, so sr_host_os.c's clock is no longer the only "
+                  "representation of guest time in this runtime and the two can "
+                  "disagree — which is precisely how a guest catches a modelled clock "
+                  "out.", file=sys.stderr)
+            sys.exit(2)
+        print("PASS: no emitted body can reach the timebase except through the host "
+              "boundary.")
         return
 
     if a.jumptable_census:
