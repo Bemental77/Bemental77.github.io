@@ -384,6 +384,14 @@ const main = async () => {
           dv.setUint32(st + O_GQR + i * 4, (fx.gqr ? fx.gqr[i] : 0) >>> 0, true);
         dv.setUint32(st + O_PC, entry, true);
         if (HAS_HOST) {
+          // `si.msr >>> 0` on a capture that has no msr field is 0, which would seed a
+          // WRONG MSR silently -- worse than not seeding at all, because MSR is scored.
+          // Every committed capture has it (native_oracle_gdb.arch_state has recorded it
+          // from the start), so absence means an artifact from somewhere else.
+          if (si.msr === undefined)
+            throw new Error(`fixture 0x${entry.toString(16)} has no state_in.msr, but ` +
+                            `this build models MSR — recapture it or run with ` +
+                            `SR_OS_MODE=0`);
           M._sr_os_set_msr(si.msr >>> 0);   // the guest MSR this invocation started with
           M._sr_os_trace_reset();           // so hostCalls counts THIS replay only
         }
