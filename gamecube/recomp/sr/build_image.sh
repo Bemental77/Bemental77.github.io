@@ -87,9 +87,22 @@ HOSTS=(
   0x800e349c   # __TRK_set_MSR
   0x80108e98   # __TRK_get_MSR   (SAB links two byte-identical copies)
   0x80108ea0   # __TRK_set_MSR
-  0x800e55d4   # OSSetCurrentContext    OSContext.c:200
-  0x800e5630   # OSGetCurrentContext    OSContext.c:236
-  0x800e579c   # OSClearContext         OSContext.c:390
+  0x800e55d4   # OSSetCurrentContext    OSContext.c:200   <- the ONLY one sr.py truly refuses (mfmsr)
+  # [host-set trim 2026-09-04] OSGetCurrentContext (0x800e5630) and OSClearContext
+  # (0x800e579c) were REMOVED from this list. Measured in README §12, leave-one-out:
+  # each is worth **-1** to closure — i.e. host-binding them made coverage WORSE, not
+  # better. sr.py translates both perfectly; they were only ever a wall because THIS
+  # LIST bound them while the runtime mode refused them. That is a self-inflicted
+  # boundary, and it is exactly the address the whole-image boot's `0xC60E579C` fault
+  # named — the two workstreams appeared to converge on one function and had not.
+  #
+  # Removing them also unblocks the three committed OSClearContext captures, which
+  # were unreplayable while it was host-bound (of 1,074 capture records, 18 enter this
+  # family and 3 are usable — all three of OSClearContext itself).
+  #
+  # NOT removed: OSSetCurrentContext above (a genuine `mfmsr` refusal), and
+  # OSSaveContext/OSLoadContext/SelectThread below (the setjmp/longjmp cut, which is
+  # a real host boundary — see CONTEXT_SWITCH.md).
   0x800e563c   # OSSaveContext          OSContext.c:240   <- the setjmp
   0x800e56bc   # OSLoadContext          OSContext.c:281   <- the longjmp (rfi)
   0x800ebd68   # SelectThread           OSThread.c:325    <- the CUT
