@@ -26,7 +26,7 @@ shipped disc; the reproducing command is printed next to each one. Artifact:
 | **whole-image throughput** | ⛔ **NO VALID NUMBER — `0.50-0.54x`, `0.62x` and `0.676x` are all VOID, §8.6e.** `HandleReverb` is **not bit-exact** (308 spurious writes to a page the guest only reads), and `perf_browser.mjs`'s restore set does not cover them, so **rep 1 of ~160,000 timed invocations is the only one computing native's answer**. Direction of the error unknown — do not apply a correction factor. |
 | **JIT baseline, re-measured** | **0.3781x delivered / 141.6 MHz executed / 23.2% idle-skipped**, stock V8, n=3, cross-witness spread ≤0.0005. **1.000x costs 373.5 MHz on this scene → the JIT is 2.64x short.** §8.6b |
 | ~~JIT baseline `0.4450x`~~ | **RETRACTED, §8.6c** — a 75 s cold boot read over one 40 s window; re-reading that band from four fresh runs of ONE frozen binary returns **0.3338x–0.5097x**. The V8-tier mismatch §8.1 warned about measures **null on both engines** (§8.6d) and was the least of its defects. |
-| **WHOLE-IMAGE BOOT IN A BROWSER** | **LINKS, INSTANTIATES, AND EXECUTES GUEST CODE** — wasm md5 `0464002e92cecfaa3c1202484286249b`. `__start` → `__init_registers` → `__init_hardware` → `__init_data` → `DBInit` all return **fault-free**; 16 more guest functions clear inside `OSInit`. It stops in **`EXISync` (`0x800e6494`)**, spinning on EXI `TSTART` at `0xCC00680C` — **no device model and no interrupt delivery**, not a translator bug. **Nothing renders and no `drawn/s` is claimed.** §10 |
+| **WHOLE-IMAGE BOOT IN A BROWSER** | **LINKS, INSTANTIATES, AND RUNS THE GUEST'S OWN `__start`** — wasm md5 `7bcca5756df27133d684c4281410171b`. `__init_registers` / `__init_hardware` / `__init_data` / `DBInit` all return **fault-free**, then `OSInit` reaches **27 distinct hardware registers** across PI/MI/DSP/SI/EXI/DI in **126 host-boundary crossings**. It stops in **`__OSInitAudioSystem`**, spinning on a DSP register — **no device model and no interrupt delivery**, not a translator bug (the GAP class is still zero). Modelling one register (EXI `TSTART`) moved it from 21 registers to 27, with a **falsifying control arm on the same md5**. **Nothing renders and no `drawn/s` is claimed.** §10 |
 | **guest OS CONTEXT SWITCH** | **WORKS** — 63 assertions / 0 failures, incl. a three-thread non-LIFO rotation on three real host threads and a control arm that reproduces `0xe00e78ac` with the host layer off. §6 (superseded there) and [`recomp/sr/CONTEXT_SWITCH.md`](../../recomp/sr/CONTEXT_SWITCH.md) |
 
 The two 2026-09-02 additions each came from a **harness** defect, not a translator one,
@@ -2581,21 +2581,49 @@ wrong answer.
 
 ### 10.1 What was measured
 
-Build: `-O1`, wasm **44,087,406 B, md5 `0464002e92cecfaa3c1202484286249b`**, identical
-before and after every run below. 4,668 of 4,741 functions (98.46%) / 372,613 of 374,807
-instructions (99.41%) translated; 73 host-bound or refused.
+Two whole-image binaries, both `-O1`, both md5-identical before and after every run.
+4,668 of 4,741 functions (98.46%) / 372,613 of 374,807 instructions (99.41%) translated;
+73 host-bound or refused.
+
+| | wasm | size | device layer |
+|---|---|---|---|
+| **A** | `0464002e92cecfaa3c1202484286249b` | 44,087,406 B | window only, no register modelled |
+| **B** (headline) | `7bcca5756df27133d684c4281410171b` | 47,894,210 B | + EXI `TSTART` model, inventory, watchdog |
+
+B is 8.6% larger: the device hooks put one compare against the window on every guest load
+and store. That is the price of `-DSR_MMIO` and it is why no measurement build should
+define it.
 
 | acceptance step | result |
 |---|---|
-| 1. the image LINKS | **YES** — 0 errors, 3 warnings |
+| 1. the image LINKS | **YES** — 0 errors (both A and B) |
 | 2. the worker INSTANTIATES in a browser | **YES** — Chrome, module worker, `main.dol` 1,960,192 B laid into a 25,165,824 B MEM1, entry `0x80003140` |
-| 3. guest code EXECUTES | **YES** — see the trajectory below |
-| 4. something RENDERS | **NO**, and the cause is named in §10.2 |
-| 5. `drawn/s` nonzero | **NO.** Not claimed. There is no renderer on this path at all. |
+| 3. guest code EXECUTES | **YES**, from the real entry point — `sr_image_boot()` → `sr_call(0x80003140)`, not a stepped walk |
+| 4. something RENDERS | **NO**, and the cause is named in §10.2 / §10.2b |
+| 5. `drawn/s` nonzero | **NO. Not claimed.** There is no renderer on this path at all. |
 
-**`__start`'s own callee sequence, one call at a time** (`SRP_MODE=walk`; the sequence is
-exact because `__start` is straight-line on this boot — both its branches test
-`0x800000F4`, which is 0 on a retail boot):
+**Binary B, `whole` mode, the guest's own `__start`** (machine load 2.15–2.73):
+
+| | model ON | model OFF (control, same md5) |
+|---|---|---|
+| distinct hardware registers reached | **27** — PI, MI, DSP/AI, SI, EXI, DI | **21** |
+| device writes | 28 | 21 |
+| EXI `TSTART` clears | 2 | **0** |
+| host-boundary crossings | **126** (16 distinct) | 110 (13 distinct) |
+| last register touched | `0xCC005012` DSP/AI write | `0xCC00680C` EXI read — *the spin* |
+| ended by | watchdog, in `__OSInitAudioSystem` | watchdog, in `EXISync` |
+
+**Binary B reproduces the closure builds exactly** — 126 crossings, 16 distinct addresses,
+27 registers, same order — which is independent confirmation that the `SR_FNS` closure arm
+is a faithful instrument and not an artefact of building less code.
+
+Binary A is kept in this table because it is the *before*: with no register modelled at
+all, the boot never got past the SRAM read, so its device inventory is the empty set and
+its trajectory is the one in §10.2.
+
+**On binary A — `__start`'s own callee sequence, one call at a time** (`SRP_MODE=walk`;
+the sequence is exact because `__start` is straight-line on this boot — both its branches
+test `0x800000F4`, which is 0 on a retail boot):
 
 | # | guest fn | result |
 |---|---|---|
@@ -2695,10 +2723,22 @@ the exact point that needs it, 124 host-boundary crossings in.** Linking the ima
 ### 10.3 Three things that came free with the run
 
 1. **The `OSDisableInterrupts` host boundary carries real traffic.** 108 host-boundary
-   crossings were recorded before the hang: **34 × `OSDisableInterrupts`**, **34 ×
-   `OSRestoreInterrupts`**, 13 × `OSGetTime`, 15 × the `PPCMf*/PPCMt*` SPR accessors,
-   4 × the cache-control no-ops, 3 × the TRK MSR pair. §9.3 sized that boundary
-   statically at 745 blocked functions; this is it executing.
+   crossings were recorded before the hang, and they sum exactly
+   (`/tmp/sr-exi2.json`, last completed step `0x800e60ac`):
+
+   | address | class | count | |
+   |---|---|---|---|
+   | `0x800e78ac` | OS | 34 | `OSDisableInterrupts` |
+   | `0x800e78d4` | OS | 34 | `OSRestoreInterrupts` |
+   | `0x800ecb48` | REAL | 13 | `OSGetTime` |
+   | `0x800e34ac` / `0x800e34b4` / `0x800e34a4` | REAL | 9 / 5 / 4 | the SPR accessors |
+   | `0x800e4f5c` / `0x800e4e08` | VOID | 2 / 2 | `ICEnable` / `DCEnable` |
+   | `0x800e349c` / `0x800e3494` | OS | 2 / 1 | the TRK MSR pair |
+   | `0x80003330` / `0x800e3d38` | REAL | 1 / 1 | `__init_hardware` / `__OSPSInit` |
+   | | | **108** | |
+
+   §9.3 sized the interrupt boundary statically at 745 blocked DOL functions; the top
+   two rows are it executing, 68 crossings in one partial `OSInit`.
 2. **A hang no longer costs the evidence.** The first `OSInit` probe recorded 100
    boundary crossings and returned *none* of them, because the log was posted only from
    the `done` message that a wedged call never sends. The worker now posts the log after
