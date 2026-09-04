@@ -59,11 +59,20 @@ static inline int gk_ok(uint32_t p, uint32_t n) {
 //   0xE0000000..0xE0040000  the LOCKED L1 CACHE (Dolphin Memmap.h:253, 256 KB).
 //   0xCC008000..0xCC009000  WPAR, the write-gather pipe -- the port the guest
 //                           pushes GX commands through.  Write-only by design.
-// Under the plain masking above, 0xE0000030 aliases onto MEM1 offset 0x30 and
-// 0xCC008000 onto 0x00008000, so an access there would CORRUPT MEM1 and forge write
-// events; gk_ok's bound does not catch it because the aliased offset is in range.
-// (What actually happened was a fault, because 0xE0000030 & 0x03FFFFFF = 0x20000030
-// IS out of range -- but that is luck, not a check, and 0xCC008000 is not.)
+// Under the plain masking above BOTH windows alias into live MEM1 -- gk_phys keeps
+// only 26 bits, so 0xE0000030 -> offset 0x30 and 0xCC008000 -> offset 0x8000 -- and
+// gk_ok's bound does not catch either, because an aliased offset that small is IN
+// RANGE.  So an access there does not fault; it CORRUPTS MEM1 and forges write
+// events.  (Do not confuse this with Dolphin's own mask: Memmap.cpp:723 uses
+// 0x3FFFFFFF, under which 0xE0000030 becomes 0x20000030 -- that is the address in
+// its panic message, and a different number for a different reason.)
+//
+// THE ORDER OF THE TEST IS THE WHOLE POINT, and getting it wrong is measured: a first
+// version consulted gk_sink only AFTER the masked offset failed the bound, which
+// covers the locked cache by accident and misses WPAR entirely.  Fixture 0x812188c0
+// then FAILED with `write event #44: want [0x2d49e3]=0 got [0x8000]=61` and 169 write
+// events against 101 -- the guest pushing GX commands through WPAR, landing on MEM1
+// offset 0x8000.  A named window is decided by its EFFECTIVE address, before masking.
 //
 // So, IN THE DIFFERENTIAL BUILD ONLY, both windows get a private scratch buffer past
 // the end of MEM1.  Consequences, all deliberate:
@@ -93,9 +102,9 @@ static inline int gk_sink(uint32_t ea, uint32_t n, uint32_t *p) {
     return 0;
 }
 #define GK_MAP(ea, n, p, fail)  do {                                           \
-        (p) = gk_phys(ea);                                                     \
-        if ((p) + (n) > g_ram_size) {                                          \
-            if (!gk_sink((ea), (n), &(p))) { gk_ok((p), (n)); fail; }          \
+        if (!gk_sink((ea), (n), &(p))) {                                       \
+            (p) = gk_phys(ea);                                                 \
+            if (!gk_ok((p), (n))) { fail; }                                    \
         }                                                                      \
     } while (0)
 #define GK_IS_SINK(p) ((p) >= g_ram_size)
