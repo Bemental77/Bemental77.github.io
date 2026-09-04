@@ -373,7 +373,8 @@ def wait_for_link(g, oslink_pc, budget, poll=None):
     return True
 
 
-def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusal):
+def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusal,
+                 on_executed=lambda fired: None):
     """Capture each candidate AT THE MOMENT ITS BREAKPOINT FIRES.
 
     THE TWO THINGS THIS FIXES, both measured on this rig 2026-09-04:
@@ -489,6 +490,11 @@ def survey_waves(a, g, base, bodies, arm, osyms, prefetch, on_fixture, on_refusa
                          "safely (there is no async break)")
     print(f"[survey] {len(fired)} of {len(arm)} candidates executed in "
           f"{time.time() - t0:.0f}s; {len(pending)} never did", flush=True)
+    # RECORD THE EXECUTED SET.  It is the survey's real denominator -- what this scene
+    # exercises at all -- and it is expensive to rediscover (this pass is the single
+    # longest phase).  A later targeted run can skip straight to capture with
+    # --arm-offsets built from it.
+    on_executed(fired)
     for off in sorted(pending):
         on_refusal(off, base + off,
                    f"never executed in {a.enum_budget:.0f}s of this scene", quiet=True)
@@ -1078,8 +1084,21 @@ def main():
 
         if a.survey:
             try:
+                def on_executed(fired):
+                    out["executed"] = list(fired)
+                    json.dump(out, open(OUT, "w"))
+                    path = os.path.splitext(OUT)[0] + f".{a.rel}.executed.txt"
+                    with open(path, "w") as f:
+                        f.write(f"# {len(fired)} of {len(arm)} armed entries executed "
+                                f"in this scene, in fire order\n")
+                        for o in fired:
+                            f.write(f"{o:#x}   # {base + o:#010x} "
+                                    f"{shape_by_off.get(o, '?')}\n")
+                    print(f"[survey] wrote {path}", flush=True)
+
                 ndone, anchor_off = survey_waves(a, g, base, bodies, arm, osyms,
-                                                 prefetch, on_fixture, on_refusal)
+                                                 prefetch, on_fixture, on_refusal,
+                                                 on_executed)
                 out["survey_anchor_off"] = anchor_off
             except Exception as e:
                 print(f"[survey] ABORTED: {type(e).__name__}: {e}", file=sys.stderr)
