@@ -409,9 +409,20 @@ matched-pair noise reaches ±25% at higher load.
       let the page publish `Nx (M% skipped)` with no per-block tax. Not
       attempted here (it needs a rebuild, and rebuilding the live worker
       poisons concurrently running sibling probes).
-- [ ] **Explain the SAB City Escape shortfall.** 0.465x clock and 118.9 MHz
-      executed, but only 2.6 drawn/s and a black world behind a live HUD. This
-      rig can say the three things disagree; it cannot say which is at fault.
+- [x] **Explain the SAB City Escape shortfall.** Taken up in
+      `gamecube/docs/sab-citye-black-world/TASKS.md` (2026-09-04). Outcome: the
+      three signals do **not** disagree — `0.4653x` is confirmed by a witness
+      that only advances when the guest executes (SAB's own on-screen mission
+      timer, which agrees with W1/W3 to 2.0% over a clean 28 s span), and the
+      black world is a **separate** defect that is present at 2.6 drawn/s and at
+      23 drawn/s alike. The misleading number is `drawn/s`: a re-run of this
+      exact cell on the same frozen binary and savestate sustained a median
+      **23 drawn/s** over 27 steady windows (W5 ⇒ 55.3 fps, which corroborates),
+      while total decoded geometry stayed within ±5% of the reference runs. **So
+      this row is not single-valued and its `drawn/s` must always be published
+      with a screenshot.** The black world's own mechanism is narrowed to three
+      candidates with a stated discriminator; two others were killed by
+      measurement. See that topic's §4 and §5.
 - [ ] **Native-Dolphin arm.** The witness cells compile out off-Emscripten
       (`DSP.cpp:584-589`), so the rig cannot currently read a native reference
       run. A native oracle arm would turn W1/W2/W3 from "self-consistent" into

@@ -1231,6 +1231,69 @@ function startServer() {
               o.bpBail = A[0x026B3B14 >> 2] >>> 0;
               o.bpMs = A[0x026B3B18 >> 2] >>> 0;
               o.bpMax = A[0x026B3B1C >> 2] >>> 0;
+              // [submitted-vs-rendered 2026-09-04] The FIFO decoder's own census,
+              // per window. `dN`/`dV` are bumped in OpcodeDecoding.cpp:171-174
+              // BEFORE the emscripten RunVertices device-gate at :203, so they
+              // count draws DECODED whether or not they were ever rasterized;
+              // `efbC` is bumped in BPStructs.cpp:290 AFTER its gate at :275, so
+              // it counts copies that actually EXECUTED. Divided by `drawn` they
+              // give prims/verts/copies per finished frame, which is the only way
+              // to tell "the guest submitted a lighter scene" from "the guest
+              // submitted the scene and it did not reach the screen".
+              o.dN   = A[0x026B289C >> 2] >>> 0;   // prim draws decoded
+              o.dV   = A[0x026B28A0 >> 2] >>> 0;   // vertices decoded
+              o.dlN  = A[0x026B28A4 >> 2] >>> 0;   // CALL_DL executions
+              o.efbC = A[0x026B2894 >> 2] >>> 0;   // EFB copies EXECUTED
+              // The two emscripten device-gates that silently DROP render work on
+              // a thread with no live WebGPU device. Both are one-shot flags, so
+              // 1 means "fired at least once, ever" and 0 is a real negative:
+              // 0x026B336C = the whole EFB-copy trigger skipped (BPStructs.cpp:286),
+              // 0x026B3370 = RunVertices skipped, draw counted anyway
+              // (OpcodeDecoding.cpp:204). A black world with a nonzero decoded-prim
+              // count is exactly what a firing :3370 gate looks like.
+              o.gEfb = A[0x026B336C >> 2] >>> 0;
+              o.gVtx = A[0x026B3370 >> 2] >>> 0;
+              // [submitted-vs-rendered 2026-09-04] The rest of the pipeline, so a
+              // "geometry decoded but no pixels" symptom can be localised to a
+              // STAGE instead of guessed at. Every cell below already has a live
+              // writer in the shipping binary — no rebuild needed.
+              //   VertexManagerBase.cpp:127-131 flush census (ON unless 0x026B3A00):
+              //     fReal  = flushes that were not a no-op
+              //     fDrawn = ...of those, the ones that REACHED the draw
+              //     fCull / fZero = the two COUNTED drop reasons.
+              //   fReal - fDrawn - fCull - fZero = draws dropped by the two
+              //   UNCOUNTED gates: the XF/BP texgen-colorchan mismatch return
+              //   (VertexManagerBase.cpp:806-827) and the null-pipeline skip (:1037).
+              o.fCalls = A[0x026B3A04 >> 2] >>> 0;
+              o.fReal  = A[0x026B3A0C >> 2] >>> 0;
+              o.fDrawn = A[0x026B3A10 >> 2] >>> 0;
+              o.fCull  = A[0x026B3A14 >> 2] >>> 0;
+              o.fZero  = A[0x026B3A18 >> 2] >>> 0;
+              //   WGPUGfx.cpp:1984/2015/2020/2197 — the GPU boundary itself.
+              //   dEnc is the only cell that means "a draw was encoded into a
+              //   render pass"; dEnter-dEnc is everything lost inside DrawIndexed.
+              o.dEnter = A[0x026B3560 >> 2] >>> 0;
+              o.dNullP = A[0x026B3564 >> 2] >>> 0;
+              o.dBail  = A[0x026B3568 >> 2] >>> 0;
+              o.dEnc   = A[0x026B356C >> 2] >>> 0;
+              //   WGPUGfx.cpp:47/48 — uncaptured WebGPU validation errors.
+              o.wErrN = A[0x026B3530 >> 2] >>> 0;
+              o.wErrT = A[0x026B3534 >> 2] >>> 0;
+              //   WGPUGfx.cpp:625/649/639 — the viewport/scissor ACTUALLY applied.
+              //   Packed (w<<16|h). VertexShaderManager.cpp:337 is the sole writer
+              //   of both these and pixelcentercorrection, and it is gated on
+              //   DidViewportChange() — which XFStateManager::DoState does NOT
+              //   re-arm on savestate load (it re-arms only m_projection_changed,
+              //   XFStateManager.cpp:46-51). So these two are exactly what a
+              //   restore can leave holding the PREVIOUS scene's values.
+              o.vpWH = A[0x026B3548 >> 2] >>> 0;
+              o.scWH = A[0x026B354C >> 2] >>> 0;
+              o.vpDegen = A[0x026B3550 >> 2] >>> 0;
+              //   Ablation switches that must all read 0 on a shipping run
+              //   (WGPUGfx.cpp:1994, VertexManagerBase.cpp:791/1464,
+              //    OpcodeDecoding.cpp:128, WGPUVertexManager.cpp:340).
+              o.abl = [0x026B3B00, 0x026B3B04, 0x026B3B08, 0x026B3B34, 0x026B3B38]
+                        .map((a) => A[a >> 2] >>> 0).join('/');
               o.xpc  = (() => { const c = A[0x0250002C >> 2] >>> 0;
                 return c ? (A[c >> 2] >>> 0).toString(16) : '0'; })();
               // [guest-rate witness 2026-09-04] The AI-DMA pair, sampled in the
@@ -1293,6 +1356,24 @@ function startServer() {
               drawn: +(dpe / dw).toFixed(1), pub: +(dpub / dw).toFixed(1),
               gcps: dgc == null ? null : +(dgc / dw).toFixed(1),
               rgl: +(drgl / dw).toFixed(0), xpc: s.xpc || null,
+              // per-FINISHED-FRAME decode census (see the o.dN comment above)
+              prim: dpe > 0 ? +(((s.dN >>> 0) - (_srPrev.dN >>> 0)) / dpe).toFixed(0) : null,
+              vert: dpe > 0 ? +(((s.dV >>> 0) - (_srPrev.dV >>> 0)) / dpe).toFixed(0) : null,
+              dl:   dpe > 0 ? +(((s.dlN >>> 0) - (_srPrev.dlN >>> 0)) / dpe).toFixed(0) : null,
+              efb:  dpe > 0 ? +(((s.efbC >>> 0) - (_srPrev.efbC >>> 0)) / dpe).toFixed(1) : null,
+              gEfb: s.gEfb || 0, gVtx: s.gVtx || 0,
+              // per-window deltas through the whole submit path
+              fReal:  (s.fReal  >>> 0) - (_srPrev.fReal  >>> 0),
+              fDrawn: (s.fDrawn >>> 0) - (_srPrev.fDrawn >>> 0),
+              fCull:  (s.fCull  >>> 0) - (_srPrev.fCull  >>> 0),
+              fZero:  (s.fZero  >>> 0) - (_srPrev.fZero  >>> 0),
+              dEnter: (s.dEnter >>> 0) - (_srPrev.dEnter >>> 0),
+              dNullP: (s.dNullP >>> 0) - (_srPrev.dNullP >>> 0),
+              dBail:  (s.dBail  >>> 0) - (_srPrev.dBail  >>> 0),
+              dEnc:   (s.dEnc   >>> 0) - (_srPrev.dEnc   >>> 0),
+              wErrN: s.wErrN || 0, wErrT: s.wErrT || 0,
+              vpWH: s.vpWH || 0, scWH: s.scWH || 0, vpDegen: s.vpDegen || 0,
+              abl: s.abl || null,
               bpN: s.bpN || 0, bpBail: s.bpBail || 0, bpMs: s.bpMs || 0, bpMax: s.bpMax || 0,
               bpDn: (s.bpN || 0) - (_srPrev.bpN || 0), bpDms: (s.bpMs || 0) - (_srPrev.bpMs || 0),
               rate: s.rate || null };
@@ -1359,6 +1440,24 @@ function startServer() {
               + ' retrace=' + (row.rtps == null ? 'n/a' : row.rtps + '/s')
               + '  [ticksHz=' + row.hz + ' period=' + row.aiPer + ' NumBlocks=' + row.nblk + ']');
             _srRows.push(row);
+            {
+              // [submitted-vs-rendered] one line that walks a frame's geometry from
+              // the FIFO decoder to the render pass. The interesting quantity is
+              // `lost` — real flushes that neither reached the draw nor hit one of
+              // the two counted drop reasons, i.e. the XF/BP mismatch return or the
+              // null-pipeline skip, neither of which has a counter of its own.
+              const lost = row.fReal - row.fDrawn - row.fCull - row.fZero;
+              const per = (n) => (row.drawn > 0 ? (n / row.drawn).toFixed(0) : '--');
+              console.log('[gpu-boundary] t=' + row.tsec + 's  /frame: flushReal=' + per(row.fReal)
+                + ' drawn=' + per(row.fDrawn) + ' cull=' + per(row.fCull)
+                + ' zeroIdx=' + per(row.fZero) + ' LOST=' + per(lost)
+                + '  || DrawIndexed enter=' + per(row.dEnter) + ' nullPipe=' + per(row.dNullP)
+                + ' bail=' + per(row.dBail) + ' ENCODED=' + per(row.dEnc)
+                + '  || vp=' + (row.vpWH >>> 16) + 'x' + (row.vpWH & 0xFFFF)
+                + ' scissor=' + (row.scWH >>> 16) + 'x' + (row.scWH & 0xFFFF)
+                + ' vpDegen=' + row.vpDegen
+                + '  wgpuErr=' + row.wErrN + '/t' + row.wErrT + '  abl=' + row.abl);
+            }
             if (s.head) console.log('[page-headline] t=' + row.tsec + 's  "' + s.head + '"');
             console.log('[scene-rate] t=' + row.tsec + 's  speed=' + row.speed.toFixed(3)
               // [mips-gate 2026-09-02] exec is Δ0x026B3420, which the emitter
@@ -1369,6 +1468,11 @@ function startServer() {
               + (row.execMHz === 0 ? 'off' : row.execMHz + 'MHz')
               + '  drawn=' + row.drawn + '/s  published=' + row.pub + '/s'
               + '  rglDrain=' + row.rgl + '/s  xpc=0x' + (row.xpc || '?')
+              + '  /frame[prim=' + (row.prim == null ? '--' : row.prim)
+              + ' vert=' + (row.vert == null ? '--' : row.vert)
+              + ' dl=' + (row.dl == null ? '--' : row.dl)
+              + ' efbCopy=' + (row.efb == null ? '--' : row.efb) + ']'
+              + '  gate[efb=' + row.gEfb + ' vtx=' + row.gVtx + ']'
               + '  brake=' + row.bpDn + '/w(' + row.bpN + ' tot, ' + row.bpDms + 'ms/w, bail '
               + row.bpBail + ', maxDist ' + row.bpMax + ')'
               + (row.gcps == null ? '' : '  guestGC=' + row.gcps + '/s')
