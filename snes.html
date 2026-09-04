@@ -99,10 +99,20 @@
        centred ::after, at least 44x44, inside each control.
        It is a CHILD of the control, so `pointer-events:none` applied by
        lib/capability.js's gate() still disables it — the tap-through fix is
-       not weakened. */
-    .menuBtn, #mobileStart, #mobileSelect, #mobileA, #mobileB,
+       not weakened.
+
+       ⚠ THE POSITION RULE MUST NOT OVERRIDE AN EXISTING ONE. The first version
+       of this block used bare ID selectors for `position: relative`, which is
+       specificity 100 and beat `.faceBtn { position: absolute }` (specificity
+       10) — so on dreamcast.html #mobileA and #mobileB dropped out of the face
+       DIAMOND into normal flow while #mobileX/#mobileY stayed absolute, landing
+       B and X on the SAME pixel (100% overlap, one button unreachable) and
+       overlapping A/B and X/Y. `:where()` has ZERO specificity, so any layout
+       the page already declares wins and this only supplies a containing block
+       for controls that are otherwise static. */
+    :where(.menuBtn, #mobileStart, #mobileSelect, #mobileA, #mobileB,
     #mobileL, #mobileR, #mobileZ, #mobileCLeft, #mobileCRight,
-    #mobileCUp, #mobileCDown, .sp-btn { position: relative; }
+    #mobileCUp, #mobileCDown, .sp-btn) { position: relative; }
     .menuBtn::after, #mobileStart::after, #mobileSelect::after,
     #mobileA::after, #mobileB::after, #mobileL::after, #mobileR::after,
     #mobileZ::after, #mobileCLeft::after, #mobileCRight::after,

@@ -120,7 +120,11 @@
     .shoulderBtn { width: 80%; height: 38px; border-radius: 8px; background: linear-gradient(180deg, #4a4a4a 0%, #2a2a2a 100%); border: 1px solid #555; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; color: #ddd; letter-spacing: 1px; box-shadow: 0 2px 4px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.12); -webkit-tap-highlight-color: transparent; }
     .shoulderBtn.held { filter: brightness(0.65); }
     .dpadWrap { flex: 1; display: flex; align-items: center; justify-content: center; }
-    .dpadDisc { width: min(32vh, 180px); height: min(32vh, 180px); border-radius: 50%; background: radial-gradient(circle at 40% 35%, #555 0%, #2a2a2a 60%, #1a1a1a 100%); border: 2px solid #333; box-shadow: inset 0 2px 4px rgba(255,255,255,0.2), 0 6px 12px rgba(0,0,0,0.6); position: relative; }
+    .dpadDisc { /* [diamond-fit 2026-09-04] Same squeeze as .faceBtn: the side COLUMN
+         constrains width but not height, so a declared square rendered 113x184 —
+         an ELLIPSE, on a control whose whole affordance is being a round disc.
+         Cap width at the column and let aspect-ratio keep it circular. */
+      width: min(32vh, 180px, 100%); aspect-ratio: 1; height: auto; border-radius: 50%; background: radial-gradient(circle at 40% 35%, #555 0%, #2a2a2a 60%, #1a1a1a 100%); border: 2px solid #333; box-shadow: inset 0 2px 4px rgba(255,255,255,0.2), 0 6px 12px rgba(0,0,0,0.6); position: relative; }
     .dpadV, .dpadH { position: absolute; background: #333; box-shadow: inset 0 1px 3px rgba(0,0,0,0.7); pointer-events: none; }
     .dpadV { width: 30%; height: 90%; top: 5%; left: 35%; border-radius: 6px; }
     .dpadH { width: 90%; height: 30%; top: 35%; left: 5%; border-radius: 6px; }
@@ -146,8 +150,18 @@
     #mobileShell.hide-controls { --dc-status-h: 0px; --dc-bottom-strip: 0px; }
     #mobileHideHint { display: none; position: absolute; top: calc(10px + var(--dc-banner, 0px)); right: 10px; width: 40px; height: 40px; border-radius: 20px; background: rgba(0,0,0,0.55); color: #fff; align-items: center; justify-content: center; font-size: 22px; font-weight: 700; z-index: 20; -webkit-tap-highlight-color: transparent; }
     .faceWrap { flex: 1; display: flex; align-items: center; justify-content: center; }
-    .faceDiamond { width: min(32vh, 180px); height: min(32vh, 180px); position: relative; }
-    .faceBtn { position: absolute; width: min(12vh, 64px); height: min(12vh, 64px); border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; color: rgba(255,255,255,0.9); border: 2px solid rgba(0,0,0,0.3); box-shadow: 0 4px 0 rgba(0,0,0,0.5), inset 0 2px 4px rgba(255,255,255,0.25); -webkit-tap-highlight-color: transparent; }
+    .faceDiamond { width: min(32vh, 180px, 100%); aspect-ratio: 1; height: auto; position: relative; }
+    .faceBtn { position: absolute; box-sizing: border-box;
+      /* [diamond-fit 2026-09-04] The 4th term is what stops B and X colliding.
+         .faceDiamond is min(32vh,180px) but the side COLUMN squeezes it — measured
+         113px wide at 390x844 — while the buttons stayed 64px+4px border, so
+         left:0 and right:0 overlapped by 23px. A diamond fits its left and right
+         buttons only when each is <=50% of the container; 40% leaves a real gap.
+         box-sizing:border-box so the 2px border counts inside that budget. */
+      /* aspect-ratio, not a second min(): height:40% resolves against the
+         diamond's HEIGHT and width:40% against its WIDTH, and the squeezed
+         column is not square — that produced 45x64 ELLIPSES in portrait. */
+      width: min(12vh, 64px, 40%); aspect-ratio: 1; height: auto; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700; color: rgba(255,255,255,0.9); border: 2px solid rgba(0,0,0,0.3); box-shadow: 0 4px 0 rgba(0,0,0,0.5), inset 0 2px 4px rgba(255,255,255,0.25); -webkit-tap-highlight-color: transparent; }
     .faceBtn.held { filter: brightness(0.65); box-shadow: 0 1px 0 rgba(0,0,0,0.4), inset 0 1px 3px rgba(0,0,0,0.3); }
     /* Dreamcast face colors/positions: Y(green) top, X(yellow) left, B(blue) right, A(red) bottom */
     .btn-y { background: radial-gradient(circle at 38% 32%, #44bb66, #116633); top: 0;   left: 50%; transform: translateX(-50%); }
@@ -292,10 +306,20 @@
        centred ::after, at least 44x44, inside each control.
        It is a CHILD of the control, so `pointer-events:none` applied by
        lib/capability.js's gate() still disables it — the tap-through fix is
-       not weakened. */
-    .menuBtn, #mobileStart, #mobileSelect, #mobileA, #mobileB,
+       not weakened.
+
+       ⚠ THE POSITION RULE MUST NOT OVERRIDE AN EXISTING ONE. The first version
+       of this block used bare ID selectors for `position: relative`, which is
+       specificity 100 and beat `.faceBtn { position: absolute }` (specificity
+       10) — so on dreamcast.html #mobileA and #mobileB dropped out of the face
+       DIAMOND into normal flow while #mobileX/#mobileY stayed absolute, landing
+       B and X on the SAME pixel (100% overlap, one button unreachable) and
+       overlapping A/B and X/Y. `:where()` has ZERO specificity, so any layout
+       the page already declares wins and this only supplies a containing block
+       for controls that are otherwise static. */
+    :where(.menuBtn, #mobileStart, #mobileSelect, #mobileA, #mobileB,
     #mobileL, #mobileR, #mobileZ, #mobileCLeft, #mobileCRight,
-    #mobileCUp, #mobileCDown, .sp-btn { position: relative; }
+    #mobileCUp, #mobileCDown, .sp-btn) { position: relative; }
     .menuBtn::after, #mobileStart::after, #mobileSelect::after,
     #mobileA::after, #mobileB::after, #mobileL::after, #mobileR::after,
     #mobileZ::after, #mobileCLeft::after, #mobileCRight::after,
