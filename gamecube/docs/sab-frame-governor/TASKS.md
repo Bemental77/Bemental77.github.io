@@ -1,5 +1,10 @@
 # SAB frame governor — 23.2% of guest execution is one un-skippable busy-wait
 
+> **⚠ THE 23.2% IN THIS TITLE DID NOT REPRODUCE (2026-09-04): a second run on the
+> same build measured 0.1%.** The MECHANISM on this page is still correct and
+> still unfixed; only the SIZE of the prize is retracted. See the box at the
+> bottom and `gamecube/docs/pc-census/TASKS.md` before acting on any number here.
+
 Measured 2026-09-01 on a QUIET box (load 1.37, no competing Chrome, orphan
 reaper run first). Every number here is a citation, not a recollection.
 
@@ -124,13 +129,61 @@ reaches (`xpc` 0x8011d890 / 0x8011da54). Both can be true — they are different
 scenes — but only the 23.2% figure has an artifact behind it in this repo. Do
 not quote the 65% figure without re-measuring it on the scene it names.
 
+## ⚠ [2026-09-04] THE 23.2% DOES NOT REPRODUCE — read `../pc-census/TASKS.md`
+
+A second 75s SAB run on the SAME build (`dolphin_worker_emcc.wasm` md5
+`82bc8f8b6e1c6ac8db27ec0a5d49dadb`, unchanged before and after), same `ROM_IDX=1`,
+same duration, box load 5.46→6.25, put this loop at **0.1% pooled** against this
+page's **14.9%**. Per 10s segment:
+
+    2026-09-01   0.0  0.1  23.1  54.1   9.5   2.8   2.0   2.1   -> 14.9% pooled
+    2026-09-04   0.0  0.0   0.1   0.0   0.2   0.0   0.1   0.2   ->  0.1% pooled
+
+Both runs are the same speed (`0.4115x` / 16.12 published vs `0.4176x` / 16.18),
+so this is not a perf difference — the two boots simply spent their middle
+segments in different PHASES. The 2026-09-01 run sat in this retrace-wait; the
+2026-09-04 run spent segments 2–3 in a DVD load (`fn_80022ef0`, a 3-instruction
+`lwz/cmpwi/bgt` spin, at 26.6%/32.0%) and reached a GX-submission-dominated
+steady scene in segments 4–7.
+
+**So "23.2% of guest execution" is a property of one boot's transient, not of the
+workload.** The mechanism analysis on this page still stands — the `bl` really
+does split the block and `IsBusyWaitLoop` really cannot fire — but the LEVER IS
+WORTH FAR LESS than 23.2%, and it must be re-priced on a named steady scene
+(`SEG_MIN=4`) before anyone builds the pure-leaf inline for it.
+
+Also corrected here: the disassembly above starts mid-function. The function
+entry is **`0x80117df8`** (`mflr r0; stw r0,4(r1)`), not `0x80117e00`; and the
+"pure leaf it calls" at `0x800f3710` is **`VIGetRetraceCount`**, which
+`tools/gsne8p_xref.map` already named — the 256B bucket base `0x800f3700` fell in
+its neighbour, which is why it printed as unresolved.
+
 ## Open
 
 - [ ] Contiguous pure-leaf inline + the correctness corpus that gates it
       (LR exactness, refusal cases, non-self back-edge, the gate-#9 invariant).
-- [ ] Resolve the census: 81.0% of symbols unresolved makes every future
-      GC census far weaker than it should be. `tools/gsne8p.map` is the SAB map;
-      `gamecube/tools/gc_symbols.py` is the resolver.
-- [ ] Classify the remaining hot buckets (0x80120100, 0x80120000, 0x800e7800,
-      `__check_pad3`, `HandleReverb`, `DoCrossTalk`) as busy-wait / real compute
-      / HLE candidate.
+      **Re-price it first** — see the box above.
+- [x] **Resolve the census.** Done 2026-09-04, `gamecube/docs/pc-census/TASKS.md`.
+      The cause was neither bucket granularity nor overlays (96.92% of samples
+      are inside SAB's DOL `.text`): `tools/gsne8p_xref.map` names 441 functions
+      covering 6.8% of `.text`, so there was nothing to resolve against.
+      `gamecube/tools/gc_funcmap.py` recovers function boundaries from the DOL
+      (validated on MP4 ground truth at 97.92% exact-start recall / 99.34%
+      attribution with the truth withheld from the seeds), and on THIS artifact
+      unresolved goes **62.3% → 3.1%**. (62.3%, not 81.0% — the 81.0% on this
+      page predates commit `02f8ef65`.) The sampler now records the exact PC, so
+      the 74.8% of samples that straddled two functions at 256B is 0.0%.
+- [x] **Classify the remaining hot buckets.** Done — full table with the
+      disassembly behind each verdict in `gamecube/docs/pc-census/TASKS.md` §6.
+      Headline corrections to this page's list:
+      * `0x80120100` + `0x80120000` are one function, `fn_8011fff4` — a GX
+        vertex-submission loop (`GXBegin`, `lfs`, then WPAR writers at
+        `0x80120144/138/128` storing to `0xCC008000`). REAL COMPUTE, and the
+        steady scene's #1 item at 8.5–12.2%.
+      * `__check_pad3` scored 5.2% only as a bucket artifact — at 4B resolution
+        it gets **0 samples** and all 783 in that region are `__start`, whose
+        802 samples in the 2026-09-01 run are **all in segment 1** (boot).
+      * `0x800e7800` is not one function — at 4B resolution `EXIGetID` is 0.04%
+        and the bucket's 3.8% was the interrupt primitives sharing it.
+      * `HandleReverb` + `DoCrossTalk` are DOLSDK AXFX (`src/axfx/reverb_*.c`) =
+        5.8% combined, the clearest HLE candidates in the census.

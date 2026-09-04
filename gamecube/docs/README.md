@@ -85,11 +85,24 @@ No CLI flags — env vars only: `PROBE_DURATION_MS` (default 60000), `PROBE_QUER
 | `gamecube/tools/sab_disasm.py` | PowerPC disassembly of SAB regions. Use to identify what the wasm-emitted block actually corresponds to. |
 | `gamecube/tools/run_perf_t1.mjs` | Runs the bementalJIT T1 perf harness. |
 
+### Guest-PC census (read `docs/pc-census/TASKS.md` BEFORE quoting a share)
+
+| Resource | What it answers |
+|---|---|
+| `PROBE_PC_SAMPLE=1` on the probe | Records the guest PC on a 2 ms timer into `/tmp/wasm_pc_hist.json`, 10s segments. Bucket width is `PROBE_PC_BUCKET` (default **4** = the exact PC) and is stored in the artifact. |
+| `gamecube/tools/annotate_pc_hist.py` | Renders the census by function. **`SEG_SPLIT=1` is the one to run** — a pooled ranking mixes boot, DVD load and the scene, and does not reproduce run to run (a 14.9% row measured 0.1% on a rerun of the same build). `SEG_MIN`/`SEG_MAX` restrict to a phase. `TOPN`, `ROM_IDX`. |
+| `gamecube/tools/gc_symbols.py` | Address → name. Layers the name map over the recovered boundary map and reports provenance via `kind()`: `named` / `xmatch` / `recovered` / `none`. `GC_SYMS_NO_FNMAP=1` = names only (the pre-2026-09-04 behaviour); `GC_SYMS_XMATCH=1` = also use the 96%-precise content-matched names. |
+| `gamecube/tools/gc_funcmap.py` | Recovers function boundaries from a DOL → `tools/<game>_fn.map`. **`--rom 0 --validate --no-map-seeds` scores it against MP4's decomp ground truth** (97.92% exact-start recall, 99.34% attribution) — run that before trusting it on a game with no decomp. |
+| `gamecube/tools/gc_disasm.py` | Static PowerPC disassembly of a DOL by address or by recovered function, capstone + Gekko paired-single, symbolised branch targets. `--classify` prints the load/store/call/back-edge shape a busy-wait verdict rests on. Prefer over `dump_sab_pc.mjs` for anything static — no browser, no lock, no load. |
+| `gamecube/tools/gc_xmatch.py` | Names a game's recovered functions by content-matching MP4's decomp (unlike `cross_ref_expand.py`, which matches by linker layout). `--check` scores precision against the names already known. |
+
 ### SDK signature scanning (tools/ at repo root)
 
 | Resource | What it answers |
 |---|---|
 | `tools/gcsdk_scan.py` + `tools/gcsdk_siggen.py` | SDK symbol signature scan against game binaries — names HLE candidates from the SDK source. |
+| `tools/gmpe01_fn.map` / `gsne8p_fn.map` / `gpoe8p_fn.map` / `suite240p_fn.map` | Recovered function boundaries (generated — `gc_funcmap.py`). Unnamed entries are `fn_<addr>`, which is a boundary, not a claimed identity. |
+| `tools/gsne8p_xmatch.map` | SAB names inherited from MP4 by content match (generated — `gc_xmatch.py`), 96.0% precise on labelled examples. Opt-in. |
 
 ### Tests (the existing proven harnesses)
 
