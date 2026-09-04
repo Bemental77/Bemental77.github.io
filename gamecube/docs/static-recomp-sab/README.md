@@ -3317,15 +3317,28 @@ argument for a broad differential, made again for a broad scene set.
 - **The scene bound moved by 2.1× and it is not exhausted.** 774 of 2,704 (28.6%); the
   other 71.4% still reads `never executed in this scene`, and the marginal-return
   measurement above says which scenes would move it — stages and cutscenes, not menus.
-- **Verified moved much less than executed**, 330 → 371 distinct, and that gap is a
-  BUDGET artifact rather than a limit. The capture phase is bounded by wall clock and
-  takes candidates in address order, so of Iron Gate's 181 new entries only 16 were
-  captured before its budget expired, and the cutscene captured 44 of 470. A pass that
-  arms ONLY the new-and-uncaptured entries enumerated **166 of 166 in 10 s** on three
+- **Verified moved much less than executed — 330 → 371 distinct — and the reason is
+  STRUCTURAL, not a budget.** It looked like a budget artifact (Iron Gate captured only
+  16 of its 181 new entries before its wall-clock cap), so a targeted pass was run that
+  arms ONLY the new-and-uncaptured set. It enumerated **166 of 166 in 10 s**, on four
   separate runs — an independent reproduction of the executed set, and proof the
-  targeting works — but every attempt to capture from it was killed mid-run (see the
-  last bullet). The remaining yield is ~165 Iron Gate + ~205 cutscene entries that are
-  new, live, and never captured.
+  targeting works — and then **captured 6 of them in 576 s**, at 0–4 per 24-member wave
+  against 15–18 for the full-arm-set run.
+
+  The cause: **a capture needs the entry reached TWICE.** Enumeration fires the
+  breakpoint and *deletes* it (that is what makes enumeration cheap); the capture wave
+  re-arms it and waits for it to be reached AGAIN within `--wave-budget`. §9.4's
+  "capture-at-fire needs the entry to be reached ONCE" is against the old
+  discover-then-recapture flow, which needed three reaches — it is two, not one. So the
+  entries a new scene adds are, almost by definition, the ones that run **once per
+  scene**, and those are exactly the ones the wave cannot catch. The executed set and
+  the capturable set are not the same population, and the gap between 774 and 371 is
+  mostly that.
+
+  **The fix is a rig change, not more scenes or more budget: capture at the enumeration
+  fire, before deleting the breakpoint.** That would make one reach sufficient and would
+  put the 401 new entries in range. Until then, "executed" is the honest denominator for
+  what a scene reaches and "verified" is bounded by re-entry frequency.
 - **The hot set barely moved: 49 → 52 of the top 120 executed.** That is a caveat on the
   *hot list*, not on the scenes: `/tmp/sab_hot.json` is itself a ONE-SCENE measurement
   (a JIT probe run from cold boot), so code that only a different stage runs cannot be
@@ -3338,8 +3351,11 @@ argument for a broad differential, made again for a broad scene set.
   The part more scenes *can* reach is the 26 hot functions that are eligible and were
   unexecuted, worth 12.82% of sampled PCs.
 - **Runs were repeatedly lost to something outside the rig.** `RSPError: stub closed the
-  connection` killed the title survey and every targeted-capture attempt, with no macOS
-  crash report and an oracle log that ends normally. `ORACLES.md` documents quitting
+  connection` killed two title-survey attempts and the first two targeted-capture
+  attempts, with no macOS crash report and an oracle log that ends normally.
+  (A later targeted attempt ran to its budget uninterrupted, which is where the 6-of-165
+  capture yield above comes from — that number is not a casualty of this.)
+  `ORACLES.md` documents quitting
   native Dolphin with `pkill -9 -f Dolphin`, which is GLOBAL, and a sibling agent was
   running its own native-Dolphin surveys on this box throughout;
   `native_oracle_gdb.Dolphin.kill()` (:432-437) only kills its own `self.proc`, so the
