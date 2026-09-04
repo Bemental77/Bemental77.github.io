@@ -3853,6 +3853,10 @@ already treats them as no-ops; the offline gate has simply never been given the 
 
 ### 12.4 The cache-maintenance boundary is TWICE the context one — and the two compose super-additively
 
+> **⚠ THE PRESCRIPTION IN THIS SUBSECTION IS SUPERSEDED by `bcad9e66`, which landed
+> cache maintenance as an INSTRUCTION boundary while this was being measured. The
+> diagnosis stands; the "host-bind the nine" step is now worth −1. See §12.9.**
+
 Same instrument, same pinned translator, same one-process discipline. `CACHE-9` is exactly
 the nine addresses `sr_image.c` **already** answers `IMG_D_VOID` and `build_image.sh`
 **already** passes to `--host`:
@@ -3954,7 +3958,10 @@ three-thread non-LIFO rotation on three distinct `pthread_t`
    `OSClearContext` is what makes its **three** committed captures replayable (§12.5).
    `0x800e563c` `OSSaveContext` can go too — it is worth exactly 0 and is fully shadowed
    by `SelectThread` — but leaving it costs nothing either.
-2. **Give the FIXTURE rig the cache set the BOOT already has.** Lift `sr_image.c`'s nine
+2. ~~**Give the FIXTURE rig the cache set the BOOT already has.**~~ **DONE BETTER by
+   `bcad9e66`** — as an instruction boundary in `sr.py`, not a host binding. See §12.9;
+   host-binding those nine now measures **−1**. The context boundary's own worth rose
+   from +58 to **+199** once this landed. Lift `sr_image.c`'s nine
    `IMG_D_VOID` cache cases into a TU `build_fixture.sh` also links, then add
    `--cache-hosts` to `fixture_dol.py` parsed from the header. Measured: **4,269 → 4,585
    (+316, 96.71% of 4,741)** when composed with the context set. Largest remaining
@@ -3979,6 +3986,46 @@ three-thread non-LIFO rotation on three distinct `pthread_t`
 * **`0x800eba78` is `OSGetCurrentThread`, identified from its shipped words and DOLSDK,
   not host-bound and not needed.** It is recorded because the map names it
   `OSGetCurrentContext` and the next agent will otherwise re-find it the hard way.
+
+### 12.9 RE-ANCHORED against HEAD after `bcad9e66` — the cache half LANDED, and the context boundary is now worth 3.4x more
+
+Everything above is anchored to `sr.py` md5 `482edfe01d21ee2b6c1bae1c1144af1e`, which is
+what the boot binary in §12.6 was built from. **While this section was being measured,
+`bcad9e66` "cache maintenance as an INSTRUCTION boundary (+125)" landed**, making the
+Gekko cache ops no-ops *inside the translator* rather than something a host has to answer
+for. Re-run of the same arms against HEAD's `sr.py` md5 `906fa43cf290c7b392030b96f0a9c203`,
+same one-process discipline:
+
+| host set on the IRQ+clock floor | pinned `482edfe0` | HEAD `906fa43c` |
+|---|---|---|
+| floor (10) | 4,269 | **4,394** (+125 — reproduces `bcad9e66`'s headline exactly) |
+| + CTX-paying-3 `{Set, Load, Select}` | 4,327 (+58) | **4,593 (+199)** = **96.88% of 4,741** |
+| + all 6 context | 4,325 | 4,591 |
+| + CACHE-9 as `--host` | 4,386 (+117) | **4,393 (−1)** |
+| + CTX-paying-3 + CACHE-9 | 4,585 (+316) | 4,592 (−1 vs CTX alone) |
+
+Three things follow, and one of them retires a recommendation this section made:
+
+1. **§12.4's "give the fixture rig the cache set as `--host`" is SUPERSEDED — do not do
+   it.** `bcad9e66` solved the same problem better, at the instruction level, so the nine
+   addresses now translate and host-binding them is worth **−1**: it only costs a fixture
+   candidate. The finding that *survives* is the diagnosis, not the prescription — cache
+   maintenance really was the top blocker (190/178/53 blast radius, §12.3).
+2. **The super-additivity is confirmed from the other side.** §12.4 measured that context
+   and cache shared 141 functions needing both. With the cache half landed, the context
+   boundary alone is worth **+199 instead of +58 — 3.4x** — because its co-blocker is
+   gone. Neither boundary could be correctly sized while the other was outstanding, which
+   is the same lesson as the three leave-one-out pair effects, one level up.
+3. **The trimmed set still wins**, by the same margin and for the same reason: 4,593 with
+   `{OSSetCurrentContext, OSLoadContext, SelectThread}` versus 4,591 with all six.
+   `OSGetCurrentContext` and `OSClearContext` remain net −1 each.
+
+**What this does NOT change.** §12.6's execution result stands as measured: the boot arms
+ran on a binary built from the pinned translator, and the fault clearing from `0xC60E579C`
+to `0x0` is a property of the host layer, not of how the cache ops are emitted. The
+`SR_OS_CTX` tier committed here is unaffected by `bcad9e66`, compiles clean against HEAD in
+all three configurations (plain / `-DSR_MMIO` / `-DSR_VERIFY`), and the context-switch
+suite is 63/0 through it.
 
 ## 7. Decision
 
