@@ -86,18 +86,25 @@ const JSON_ONLY = argv.includes('--json');
 //   2. NOTHING has taken the cursor away before Start (preStartWrites === 0) — this is
 //      the one that would strand a console visitor with no way to press any button;
 //   3. both transitions actually reach navigator.gamepadInputEmulation, in order;
-//   4. the LB+RB escape hatch arms in game mode and stops again on the way out.
+//   4. the LB+RB escape hatch works BOTH WAYS and only dies when the game stops.
+// (4) is here because it was a REAL BUG caught by audit before it reached a console:
+// cursorMode() used to cancel the rAF poll, so the FIRST LB+RB press killed the loop
+// watching for the next one. The stick then drove the cursor for the rest of the session
+// and the game could never get it back short of a reload. `watchSurvivesPointer` and
+// `backToGame` exist solely to stop that returning.
 const xboxStickOk = (a) => {
   const x = a.xboxInput || {};
   return x.libLoaded === true && x.preStartWrites === 0 && x.preStartWanted === 'mouse'
-      && x.exercised === 'gamepad,mouse' && x.armedWatch === true
-      && x.restored === true && x.watchStopped === true;
+      && x.exercised === 'gamepad,mouse,gamepad,mouse'
+      && x.armedInGame === true && x.watchSurvivesPointer === true
+      && x.backToGame === true && x.releasedWanted === 'mouse' && x.watchStopped === true;
 };
 const xboxStickDetail = (a) => {
   const x = a.xboxInput || {};
   return `stick{lib=${x.libLoaded} preStartWrites=${x.preStartWrites} (MUST be 0 — a cursor `
        + `is the only way to press Start on a console) exercised=[${x.exercised}] `
-       + `escapeHatch=${x.armedWatch}->${x.watchStopped} restored=${x.restored}}`;
+       + `twoWay=${x.watchSurvivesPointer}/${x.backToGame} (the escape hatch must not be `
+       + `one-way) released=${x.releasedWanted} watchStopped=${x.watchStopped}}`;
 };
 
 const PAGES = [
@@ -828,9 +835,10 @@ async function runCell(arm, pg) {
     // load would remove the cursor outright, and on a console the cursor is the ONLY way
     // to press Start or pick a ROM — the page would be unoperable with the one input
     // device the machine has.  So: cursor until the emulator runs, then the stick.
-    // Then exercise the two transitions directly, which proves the wiring without booting
-    // a game.  ⚠ It ends on cursorMode deliberately — that is the page's correct resting
-    // state, so this diagnostic leaves nothing behind (gate #8).
+    // Then walk the FULL cycle — game -> pointer -> game -> released — which proves the
+    // wiring without booting a game AND catches the one-way-escape-hatch regression.
+    // ⚠ It ends on release() deliberately: 'mouse' with the watch torn down is the page's
+    // correct resting state, so this diagnostic leaves nothing behind (gate #8).
     out.xboxInput = await page.evaluate(() => {
       try {
         const spy = window.__gie || { writes: [] };
@@ -838,16 +846,20 @@ async function runCell(arm, pg) {
         const lib = window.XboxInput;
         if (!lib) return { libLoaded: false, preStartWrites };
         const before = lib.report();
-        lib.gameMode('matrix probe');
-        const mid = lib.report();
-        lib.cursorMode('matrix probe restore');
-        const after = lib.report();
+        lib.gameMode('matrix probe');            const a = lib.report();
+        lib.cursorMode('matrix probe pointer');  const b = lib.report();
+        lib.gameMode('matrix probe back');       const c = lib.report();
+        lib.release('matrix probe restore');     const d = lib.report();
         return { libLoaded: true, supported: lib.supported === true,
                  preStartWrites,
                  preStartWanted: before.wanted,
                  exercised: spy.writes.slice(preStartWrites).join(','),
-                 armedWatch: mid.watching === true, restored: after.wanted === 'mouse',
-                 watchStopped: after.watching === false };
+                 armedInGame: a.armed === true,
+                 // THE REGRESSION GUARD: handing the pointer back must NOT disarm the
+                 // watch, or the visitor can never hand the stick back to the game.
+                 watchSurvivesPointer: b.armed === true,
+                 backToGame: c.wanted === 'gamepad',
+                 releasedWanted: d.wanted, watchStopped: d.armed === false };
       } catch (e) { return { libLoaded: false, error: String(e).slice(0, 120) }; }
     }).catch(() => null);
 
