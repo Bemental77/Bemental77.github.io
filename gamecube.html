@@ -6881,7 +6881,7 @@ window.GcRate = (function () {
   }
   var started = false; async function startEmulator() { if (started) return; started = true;
     // XBOX: stick drives the GAME from here, not Edge's cursor (lib/xboxinput.js).
-    try { window.XboxInput && XboxInput.gameMode('gamecube start'); } catch (e) {}
+    try { window.XboxInput && XboxInput.offerGameControls('gamecube start'); } catch (e) {}
     // Baseline for the present watchdog's boot window (gcPresentHealth): "no first frame after
     // GC_PRESENT_BOOT_MS" is only meaningful relative to when the emulator was actually asked
     // to run. Also latches the Start guard off — startEmulator owns the button from here.
@@ -7056,7 +7056,18 @@ window.GcRate = (function () {
     try { await navigator.clipboard.writeText(ta.value); toast('Diagnostics copied'); }
     catch (e) { try { ta.focus(); ta.select(); } catch (_) {} toast('Copy blocked — text is selected, press ⌘C / Ctrl+C', true); }
   });
-  (function () { var o = $('controlsOverlay'), b = $('btnControls'), c = $('controlsClose'); if (!o || !b) return; b.addEventListener('click', function () { o.style.display = (o.style.display === 'flex') ? 'none' : 'flex'; }); if (c) c.addEventListener('click', function () { o.style.display = 'none'; }); o.addEventListener('click', function (e) { if (e.target === o) o.style.display = 'none'; }); })();
+  // XBOX: hand the POINTER back whenever this overlay is up — in 'gamepad' mode the stick
+  // drives the game and nothing in the overlay can be reached. XboxInput.resume() is a
+  // no-op before Start, so this costs nothing on the menu screen.
+  (function () {
+    var o = $('controlsOverlay'), b = $('btnControls'), c = $('controlsClose'); if (!o || !b) return;
+    var cur = function (w) { try { window.XboxInput && XboxInput.cursorMode(w); } catch (e) {} };
+    var res = function (w) { try { window.XboxInput && XboxInput.resume(w); } catch (e) {} };
+    var show = function (on) { o.style.display = on ? 'flex' : 'none'; if (on) cur('controls overlay open'); else res('controls overlay closed'); };
+    b.addEventListener('click', function () { show(o.style.display !== 'flex'); });
+    if (c) c.addEventListener('click', function () { show(false); });
+    o.addEventListener('click', function (e) { if (e.target === o) show(false); });
+  })();
   function openMobileMenu() { $('mobileMenu').classList.add('open'); } function closeMobileMenu() { $('mobileMenu').classList.remove('open'); }
   function applyGhost(on) { $('mobileShell').classList.toggle('ghost', on); if ($('mGhost')) $('mGhost').textContent = 'Transparent Controls: ' + (on ? 'On' : 'Off'); }
   function toggleGhost() { var on = !$('mobileShell').classList.contains('ghost'); localStorage.setItem('gcwasm_ghost', on ? '1' : '0'); applyGhost(on); }

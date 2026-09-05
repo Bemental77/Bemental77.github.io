@@ -2431,7 +2431,7 @@ N64Rate.selfTest = function (logFn) {
   function startEmulator() {
     if (started) return; started = true;
     // XBOX: stick drives the GAME from here, not Edge's cursor (lib/xboxinput.js).
-    try { window.XboxInput && XboxInput.gameMode('n64 start'); } catch (e) {}
+    try { window.XboxInput && XboxInput.offerGameControls('n64 start'); } catch (e) {}
     mark('start-pressed');
     var sel = $('romSelect');
     var pick = ROMS[+sel.value] || ROMS[0];

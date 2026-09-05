@@ -1564,9 +1564,14 @@
   }
 
   // Controls overlay + fullscreen — same UX as gamecube.html.
-  $('btnControls').addEventListener('click', () => { $('controlsOverlay').style.display = 'flex'; });
-  $('controlsClose').addEventListener('click', () => { $('controlsOverlay').style.display = 'none'; });
-  $('controlsOverlay').addEventListener('click', (e) => { if (e.target === $('controlsOverlay')) $('controlsOverlay').style.display = 'none'; });
+  // XBOX: a dialog is exactly the case where the visitor needs a POINTER back — in
+  // 'gamepad' mode the stick drives the game and nothing in this overlay is reachable.
+  // resume() is a no-op before Start, so opening Controls on the menu screen costs nothing.
+  const dcCursor = (why) => { try { window.XboxInput && XboxInput.cursorMode(why); } catch (e) {} };
+  const dcResume = (why) => { try { window.XboxInput && XboxInput.resume(why); } catch (e) {} };
+  $('btnControls').addEventListener('click', () => { $('controlsOverlay').style.display = 'flex'; dcCursor('controls overlay open'); });
+  $('controlsClose').addEventListener('click', () => { $('controlsOverlay').style.display = 'none'; dcResume('controls overlay closed'); });
+  $('controlsOverlay').addEventListener('click', (e) => { if (e.target === $('controlsOverlay')) { $('controlsOverlay').style.display = 'none'; dcResume('controls overlay dismissed'); } });
   $('btnFull').addEventListener('click', () => {
     // Guarded: iOS Safari on iPhone has NO Element.requestFullscreen at all, so
     // the old unguarded `.call()` threw a TypeError on the exact devices this
@@ -3095,7 +3100,7 @@
       booted = true;
       // XBOX: the emulator is now running, so the LEFT STICK must drive THE GAME and
       // not Edge's virtual cursor.  See lib/xboxinput.js — this is a no-op off Xbox.
-      try { window.XboxInput && XboxInput.gameMode('dreamcast booted'); } catch (e) {}
+      try { window.XboxInput && XboxInput.offerGameControls('dreamcast booted'); } catch (e) {}
       setPhase('running');
       mark('booted');
       rebaseStallClocks();   // arm the stall detector from here, not from page load

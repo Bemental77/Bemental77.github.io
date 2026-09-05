@@ -913,7 +913,7 @@
         ['btnPlayGame', 'spLoadBtn'].forEach(function (id) {
           var el = document.getElementById(id);
           if (el) el.addEventListener('click', function () {
-            try { window.XboxInput && XboxInput.gameMode('gba start'); } catch (e) {}
+            try { window.XboxInput && XboxInput.offerGameControls('gba start'); } catch (e) {}
           });
         });
         function go() { Capability.autoGate(Capability.SPECS.gba, { startIds: ['btnPlayGame', 'spLoadBtn'] }); }

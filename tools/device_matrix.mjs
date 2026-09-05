@@ -94,15 +94,22 @@ const JSON_ONLY = argv.includes('--json');
 // `backToGame` exist solely to stop that returning.
 const xboxStickOk = (a) => {
   const x = a.xboxInput || {};
+  const o = x.offered || {};
   return x.libLoaded === true && x.preStartWrites === 0 && x.preStartWanted === 'mouse'
+      // The page must ASK ("Use game controls?") with the pointer still alive, and focus
+      // the button so a pad's A can answer it without any pointing.
+      && o.shown === true && o.focused === true && o.writesWhileAsking === 0
       && x.exercised === 'gamepad,mouse,gamepad,mouse'
       && x.armedInGame === true && x.watchSurvivesPointer === true
       && x.backToGame === true && x.releasedWanted === 'mouse' && x.watchStopped === true;
 };
 const xboxStickDetail = (a) => {
   const x = a.xboxInput || {};
+  const o = x.offered || {};
   return `stick{lib=${x.libLoaded} preStartWrites=${x.preStartWrites} (MUST be 0 — a cursor `
-       + `is the only way to press Start on a console) exercised=[${x.exercised}] `
+       + `is the only way to press Start on a console) `
+       + `asks{shown=${o.shown} focused=${o.focused} writesWhileAsking=${o.writesWhileAsking}} `
+       + `exercised=[${x.exercised}] `
        + `twoWay=${x.watchSurvivesPointer}/${x.backToGame} (the escape hatch must not be `
        + `one-way) released=${x.releasedWanted} watchStopped=${x.watchStopped}}`;
 };
@@ -846,6 +853,18 @@ async function runCell(arm, pg) {
         const lib = window.XboxInput;
         if (!lib) return { libLoaded: false, preStartWrites };
         const before = lib.report();
+        // THE PAGES ASK FIRST. offerGameControls() must put the question on screen while
+        // the page is STILL in 'mouse' mode — if it took the stick first, the pointer
+        // needed to answer the question would already be gone and the prompt would be a
+        // trap. So: prompt visible, its button focused (A on the pad activates it), and
+        // ZERO writes to gamepadInputEmulation at that moment.
+        lib.offerGameControls('matrix probe offer');
+        const promptEl = document.getElementById('xboxInputPrompt');
+        const yesEl = document.getElementById('xboxInputPromptYes');
+        const offered = { shown: !!(promptEl && promptEl.style.display !== 'none'),
+                          focused: !!(yesEl && document.activeElement === yesEl),
+                          writesWhileAsking: spy.writes.length - preStartWrites };
+        if (promptEl) promptEl.style.display = 'none';   // leave nothing behind (gate #8)
         lib.gameMode('matrix probe');            const a = lib.report();
         lib.cursorMode('matrix probe pointer');  const b = lib.report();
         lib.gameMode('matrix probe back');       const c = lib.report();
@@ -853,7 +872,8 @@ async function runCell(arm, pg) {
         return { libLoaded: true, supported: lib.supported === true,
                  preStartWrites,
                  preStartWanted: before.wanted,
-                 exercised: spy.writes.slice(preStartWrites).join(','),
+                 offered,
+                 exercised: spy.writes.slice(preStartWrites + offered.writesWhileAsking).join(','),
                  armedInGame: a.armed === true,
                  // THE REGRESSION GUARD: handing the pointer back must NOT disarm the
                  // watch, or the visitor can never hand the stick back to the game.

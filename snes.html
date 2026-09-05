@@ -403,7 +403,7 @@
     initCanvas();
     lastTs = 0; accum = 0; running = true;
     // XBOX: stick drives the GAME from here, not Edge's cursor (lib/xboxinput.js).
-    try { window.XboxInput && XboxInput.gameMode('snes running'); } catch (e) {}
+    try { window.XboxInput && XboxInput.offerGameControls('snes running'); } catch (e) {}
     setStatus('Running — ' + name);
     [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mFull')].forEach(function (b) { if (b) b.disabled = false; });
     if (isMobile) { $('mobileSplash').style.display = 'none'; checkOrientation(); }
