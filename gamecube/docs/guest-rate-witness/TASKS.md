@@ -515,3 +515,28 @@ and the witness rig refuses to print it as 0.000x. Do not read it as a wedge.
 Not covered by this run: PSO (`ROM_IDX=2`), and the second blocker §F6a records
 — 240pSuite now executes but still does not draw (`drawn=0/s`, `peFrames=0`),
 with 94% of its PC census in five libogc LWP functions.
+
+#### F6b-2 — PSO closes the last SDK title. Also CLEARED.
+
+`/tmp/probe-pso-regress.log`, `PROBE_DURATION_MS=90000`, lock-serialized,
+load 2.04 → 5.47. Worker md5 `afa27eb89dc568cd0de38a6b9f3d8a03` — **not** the
+`363668a9…` of the two runs above but a LATER binary that still contains the fix
+(`f89e23e7` is an ancestor of HEAD; `MaskableVectorGateSatisfied` greps present
+in the shipped `.wasm`). So this is not a matched pair against the fix alone; it
+is a "does the SDK branch still work" check, which is what PSO was wanted for.
+
+The gate branch was genuinely exercised: `page jit` on 8/8 samples (not recomp),
+`stub500` word 1 = `0x808000C0` `lwz r4,0xC0(r0)`, `osCtxC0 = 0x543fc8` — i.e.
+`needs_os_context = true` and the old MEM[0xC0] test ran and passed.
+
+| | this run | §5 `pso-cold` baseline |
+|---|---:|---:|
+| `ai_dma_cb` | **0.9945x** (3981.55/s of hw 4003.56/s) | 0.9998x |
+| `aid_fire` | 0.9945x (199.07/s of 200.18/s) | 1.0000x |
+| drawn / published | 29.9 / 29.9 per s | 30 / 30 |
+| credited | 483.3 MHz over 55.0 s | — |
+
+`peFrames=1891`, canvas `nonBlack=296079/307200`, `exc=0`, `msr=0xb032` (EE=1,
+no stuck pending bits), 0 panic entries, probe exit 0. A 0.5% delta against the
+baseline, far inside this rig's ~6-7% resolution. **All three SDK titles —
+MP4, SAB, PSO — are now measured clear on the SDK-only-gate change.**
