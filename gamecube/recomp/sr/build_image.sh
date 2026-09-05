@@ -233,8 +233,41 @@ EXPORTS=$EXPORTS,_sr_gx_set_capture,_sr_gx_get_capture,_sr_gx_fifo_base,_sr_gx_f
 EXPORTS=$EXPORTS,_sr_gx_fifo_cap,_sr_gx_fifo_reset,_sr_gx_writes,_sr_gx_bytes
 EXPORTS=$EXPORTS,_sr_gx_dropped,_sr_gx_off_max
 
+# ------------------------------------------------------------------ THE 9.9 MB FUNCTION
+# [sr-gx 2026-09-04] A full-image (--all) link produced a wasm Chrome REFUSES to load:
+#   CompileError: WebAssembly.instantiate(): size 9938512 > maximum function size 7654321
+# The function is sr_dispatch, and NOTHING in this tree emits it that large -- at compile
+# time sr_dispatch.o's largest code symbol is 145,839 B.  The growth is 68x and entirely
+# POST-LINK: --dispatch-out does its job and clang never sees the translated bodies, but
+# wasm-opt sees the whole module, and its single-caller inliner is UNBOUNDED by default:
+#   --one-caller-inline-max-function-size,-ocimfs   default -1, "all such functions are
+#                                                   inlined"
+# 1,270 of the 4,678 translated functions are called by NO other translated function, so
+# sr_dispatch's switch arm is their only caller and every one is eligible; single-caller
+# chains pull in more.  Measured on one linked module, one flag changed:
+#     raw wasm-ld, no wasm-opt        sr_dispatch     146,348 B   4,841 bodies
+#     wasm-opt -O2 (default -1)       sr_dispatch  10,534,664 B   3,323 bodies, 1 over cap
+#     wasm-opt -O2 -ocimfs=20         sr_dispatch     128,687 B   4,530 bodies, none over
+# The bound costs 0.033% of total code bytes (41,646,628 vs 41,632,984) and links 5.7x
+# faster.  Its effect on RUN-TIME speed is UNMEASURED -- it is applied here because an
+# over-cap module cannot be instantiated at all, not as a performance tuning.
+#
+# ⚠ THE DOCUMENTED ROUTE DOES NOT EXIST but the mechanism does.  settings.js:2239 says to
+# "Use BINARYEN_EXTRA_PASSES to add additional passes", which reads as passes-only -- yet
+# link.py:456-460 splits the value on commas and appends each entry VERBATIM (prefixing
+# '--' only when it does not already start with '-'), with no validation that it names a
+# pass.  So a '-'-prefixed OPTION rides through untouched.  Verified on this emsdk, the
+# emitted command line is:
+#     wasm-opt --strip-target-features --post-emscripten -O2 --low-memory-unused \
+#              --zero-filled-memory --pass-arg=... -ocimfs=20 out.wasm -o out.wasm
+# Set SR_OCIMFS= (empty) to restore the unbounded default for an A/B.
+SR_OCIMFS="${SR_OCIMFS-20}"
+OCIMFS_FLAG=()
+[ -n "$SR_OCIMFS" ] && OCIMFS_FLAG=(-sBINARYEN_EXTRA_PASSES="-ocimfs=$SR_OCIMFS")
+
 set -x
 emcc ${SR_OPT:--O2} -DSR_MMIO -I"$SR" \
+  ${OCIMFS_FLAG[@]+"${OCIMFS_FLAG[@]}"} \
   "$OUT/sr_gen.c" ${DISPATCH_SRC[@]+"${DISPATCH_SRC[@]}"} "$SR/sr_driver.c" "$SR/sr_host_os.c" "$SR/sr_image.c" "$SR/sr_gx.c" \
   -o "$OUT/sab_image.mjs" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT="${SR_ENV:-web,worker}" \
@@ -248,3 +281,14 @@ set +x
 echo "[sr] wasm: $OUT/sab_image.wasm  $(stat -f%z "$OUT/sab_image.wasm") bytes"
 echo "[sr] md5 : $(md5 -q "$OUT/sab_image.wasm")"
 echo "[sr] mjs : $OUT/sab_image.mjs  $(stat -f%z "$OUT/sab_image.mjs") bytes"
+
+# ---------------------------------------------------------------- OVER-CAP BODY GATE
+# emcc exits 0 on a module no browser will load (see the -ocimfs note above), and the
+# only symptom is a CompileError at instantiate time in whatever page loads it -- where
+# it reads like an emulator bug, days later, with the name section already stripped.
+# Fail HERE instead, where the cause is one scroll up.  Costs well under a second.
+if ! python3 "$(dirname "$0")/../../tools/wasm_max_body.py" "$OUT/sab_image.wasm"; then
+  echo "[sr] BUILD FAILED: the linked module cannot be instantiated (see above)." >&2
+  echo "[sr] Re-run with SR_OCIMFS=20 (the default) if you overrode it, or lower it." >&2
+  exit 1
+fi
