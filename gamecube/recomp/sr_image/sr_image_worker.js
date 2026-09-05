@@ -125,6 +125,8 @@ function bind(M) {
     devLogPtr: '_sr_image_dev_log', devLogN: '_sr_image_dev_log_n',
     devReads: '_sr_image_dev_reads', devWrites: '_sr_image_dev_writes',
     exiClears: '_sr_image_exi_clears', setExiModel: '_sr_image_set_exi_model',
+    setDspModel: '_sr_image_set_dsp_model', dspEvents: '_sr_image_dsp_events',
+    aramBytes: '_sr_image_aram_bytes',
     setWatchdog: '_sr_image_set_watchdog', setStrict: '_sr_image_set_strict',
     // sr_host_os.c's mode.  sr_image_init() installs SR_OS_IRQ (the MSR family + the
     // clock, no threading); `osMode` is the RUN-TIME switch that widens or narrows it
@@ -153,11 +155,38 @@ function readLog(M, a) {
 // The DEVICE inventory: the first touch of every distinct hardware register, in order,
 // tagged read / write / EXI-model-clear. This is the thing the fixtures could never
 // produce, because a fixture never reaches a device.
-const DEVKIND = { 1: 'read', 2: 'write', 3: 'EXI-model-cleared-TSTART' };
+const DEVKIND = { 1: 'read', 2: 'write', 3: 'EXI-model-cleared-TSTART',
+                  4: 'DSP-model-cleared-DSPReset', 5: 'DSP-model-ARAM-DMA-complete',
+                  6: 'DSP-model-mail-from-DSP' };
+// ⚠ AI (0xCC006C00) USED TO REPORT AS 'SI'. The chain tested `>= 0xCC006400 ? 'SI'`
+// after the EXI window, so every address at or above 0xCC006C00 fell into the SI arm —
+// and OSInit touches 0xCC006C00 twice, which therefore appeared in the inventory as SI.
+// AI is a separate device with its own unmodelled walls; mislabelling it hides one.
 const DEVNAME = (a) =>
-  a >= 0xCC006800 && a < 0xCC006C00 ? 'EXI'  : a >= 0xCC006400 ? 'SI'  :
-  a >= 0xCC006000 ? 'DI'   : a >= 0xCC005000 ? 'DSP/AI' : a >= 0xCC004000 ? 'MI' :
+  a >= 0xCC006C00 ? 'AI'   : a >= 0xCC006800 ? 'EXI' : a >= 0xCC006400 ? 'SI'  :
+  a >= 0xCC006000 ? 'DI'   : a >= 0xCC005000 ? 'DSP' : a >= 0xCC004000 ? 'MI' :
   a >= 0xCC003000 ? 'PI'   : a >= 0xCC002000 ? 'VI'     : a >= 0xCC001000 ? 'PE' : 'CP';
+// READ THE DEVICE WINDOW BACK.  The DSP model's whole output is a set of values it leaves
+// in the register window, and NOTHING ELSE CAN SEE THEM: the mailbox reply never reaches
+// guest memory (the retail build reads it into r4/r5 and drops it — its SDK-debug check of
+// the value, OSAudioSystem.c:72, is compiled out), so "the DSP replied 0x80544348" would
+// otherwise be an inference from source rather than an observation. The window sits at the
+// END of the tail buffer: gekko_rt.h:171-175 puts GK_HWREG_OFF at g_ram_size + L1 + WPAR
+// and GK_TAIL_SIZE at L1 + WPAR + 32 KB, so the base is ramSize + tailSize - 0x8000.
+const DSP_REGS = [[0x5000, 'MAIL_TO_DSP_HI'], [0x5002, 'MAIL_TO_DSP_LO'],
+                  [0x5004, 'MAIL_FROM_DSP_HI'], [0x5006, 'MAIL_FROM_DSP_LO'],
+                  [0x500A, 'CONTROL'], [0x5012, 'AR_INFO'],
+                  [0x5020, 'AR_DMA_MMADDR_H'], [0x5024, 'AR_DMA_ARADDR_H'],
+                  [0x5028, 'AR_DMA_CNT_H']];
+function readDspRegs(M, a) {
+  const base = a.ram() + a.ramSize() + a.tailSize() - 0x8000;
+  const H = M.HEAPU8, out = {};
+  const r16 = (o) => ((H[base + o] << 8) | H[base + o + 1]) >>> 0;
+  for (const [o, name] of DSP_REGS) out[name] = '0x' + r16(o).toString(16).padStart(4, '0');
+  out.MAIL_FROM_DSP = '0x' + (((r16(0x5004) << 16) | r16(0x5006)) >>> 0).toString(16).padStart(8, '0');
+  return out;
+}
+
 function readDev(M, a) {
   const n = a.devLogN(), base = a.devLogPtr() >>> 2, H = M.HEAPU32, out = [];
   for (let i = 0; i < n; i++) {
@@ -165,7 +194,8 @@ function readDev(M, a) {
     out.push({ addr: '0x' + addr.toString(16), block: DEVNAME(addr),
                kind: DEVKIND[H[base + 2 * i + 1]] || H[base + 2 * i + 1] });
   }
-  return { firstTouch: out, reads: a.devReads(), writes: a.devWrites(), exiClears: a.exiClears() };
+  return { firstTouch: out, reads: a.devReads(), writes: a.devWrites(), exiClears: a.exiClears(),
+           dspEvents: a.dspEvents(), aramBytes: a.aramBytes(), dsp: readDspRegs(M, a) };
 }
 
 // Collapse the ordered log into a run-length trajectory, so 4,000 crossings of the same
@@ -236,6 +266,11 @@ self.onmessage = async (e) => {
     // taken on ONE binary with one md5, which is the discipline build_fixture.sh's
     // SR_CFLAGS falsification arm already established for the locked-cache model.
     api.setExiModel(msg.exiModel === 0 ? 0 : 1);
+    // The DSP model has its OWN switch for the same reason and is independent of EXI's:
+    // the boot needs EXI to even REACH the DSP, so a single combined switch could not
+    // produce the one arm that matters — EXI on, DSP off — which is the exact `before`
+    // this model has to be measured against.
+    api.setDspModel(msg.dspModel === 0 ? 0 : 1);
     api.setWatchdog((msg.watchdog | 0) >>> 0);      // 0 = off
     api.setStrict(msg.strict ? 1 : 0);
     // THE GUEST-OS MODE.  sr_image_init() has just set SR_OS_IRQ (3).  Passing a
@@ -381,7 +416,8 @@ self.onmessage = async (e) => {
 
     say('done', {
       mode: msg.mode || 'whole',
-      arm: { exiModel: msg.exiModel === 0 ? 0 : 1, watchdog: (msg.watchdog | 0) >>> 0,
+      arm: { exiModel: msg.exiModel === 0 ? 0 : 1, dspModel: msg.dspModel === 0 ? 0 : 1,
+             watchdog: (msg.watchdog | 0) >>> 0,
              strict: msg.strict ? 1 : 0, osMode: api.osGetMode() },
       returned: ret === null ? null : '0x' + ret.toString(16),
       threw, ms, steps,

@@ -2797,6 +2797,306 @@ in §6 / `CONTEXT_SWITCH.md` is not merely compatible with the boot — the boot
 the exact point that needs it, 124 host-boundary crossings in.** Linking the image
 `-pthread` and calling `sr_os_init()` instead of `sr_os_init_irq()` is the change.
 
+### 10.2c WALL 4 — the DSP, cleared, and it is the same KIND of fix as EXI
+
+§10.2b named `__OSInitAudioSystem` (`0x800e4b74`) as the next wall and `0xCC005012` as the
+last register the boot touched. **`0xCC005012` was a red herring** — it is `AR_INFO`, which
+Dolphin masks to 7 bits and stores as a plain variable (`DSP.cpp:167` / `:186`), so the
+backing buffer was already right about it. It is simply the last register the boot
+*first-touches* before it starts spinning on one it had already touched.
+
+**The wall, read from the SHIPPED WORDS** (`python3 tools/disasm_fn.py --iso <sab.iso>
+--pc 0x800e4b74 --size 0x1bc`), not from `sab.map` and not from the SDK source:
+
+```
+800e4bc8  addi   r31, r3, 10          ; r31 = 0xCC00500A = DSP_CONTROL
+800e4bd4  lhz    r0, 10(r3)
+800e4bd8  ori    r0, r0, 0x1          ; DSPReset
+800e4bdc  sth    r0, 10(r3)
+800e4be0  lhz    r0, 0(r31)
+800e4be4  rlwinm r0, r0, 0, 31, 31    ; bit 0x1
+800e4be8  bne    0x800e4be0           ; ...forever
+```
+
+`DSP.h:49` states the hardware contract in one line — `u16 DSPReset : 1;  // Write 1 to
+reset and waits for 0` — and `DSPHLE.cpp:206-210` is the device doing it. **Identical shape
+to EXI `TSTART`: a bit the CPU sets and the DEVICE clears, modelled at zero latency.**
+
+**But one bit is not the function.** `__OSInitAudioSystem` is a nine-step handshake and
+each step blocks on a different device behaviour, so a one-bit fix only moves the wedge.
+The shipped words in order, with what each needs and where the reference states it:
+
+| shipped PCs | what the guest does | what the device must do | reference |
+|---|---|---|---|
+| `800e4bd4-be8` | set `DSPReset`, spin until 0 | self-clear | `DSP.h:49`, `DSPHLE.cpp:206-210` |
+| `800e4bf8-c10` | spin while mail-from-DSP has `0x80000000` | show nothing **while halted** | `MailHandler.cpp:37-43` |
+| `800e4c14-c50` | AR DMA, spin for `CONTROL & 0x20`, write it back | transfer, then raise `INT_ARAM`; the bit is write-1-to-clear | `DSP.cpp:457+`, `:99-104`, `:392-396`, `:285-291` |
+| `800e4c54-c68` | `OSGetTick` delay of `0x892` | nothing new — the clock is already driven by RETIRED GUEST WORK (§13) | |
+| `800e4c6c-c98` | a second identical AR DMA + ack | as above | |
+| `800e4c9c-cb0` | clear `DSPInit`, spin while `DSPInitCode` set | the 1→0 edge LOADS AND RUNS the 128-byte ucode; `DSPInitCode` is set then cleared "a bit later" | `DSPHLE.cpp:214-227` |
+| `800e4cb4-cbc` | clear `DSPHalt` | the DSP runs; the mailbox becomes visible | `DSPHLE.cpp:199-204` |
+| `800e4cc0-cd4` | spin until mail-from-DSP-HI has `0x8000` | the ucode replies | `INIT.cpp:20-23` |
+| `800e4cd8-d04` | re-halt, re-init, reset, spin on `DSPReset` | self-clear again | |
+
+**WHY THE REPLY IS NOT A FABRICATED VALUE, and this is the part that matters.** The model
+returns `0x80544348`. That is not a number invented to make a loop exit — it is what the
+128-byte ucode **the guest itself just uploaded** computes. Its last two instructions are
+`16 FC 00 54` / `16 FD 43 48` (store-immediate `0x0054`→DMBH, `0x4348`→DMBL) plus the
+hardware's mail-valid bit. **Three independent sources agree on it**: `dolsdk2001`'s
+`OSAudioSystem.c:14` ucode table and its debug check at `:72`
+(`(mail + 0x7FAC0000) != 0x4348` ⟹ `mail == 0x80544348`); MP4's revision-matched vendored
+SDK, whose `DSPInitCode[]` **bytes differ** but whose last two ucode words are the same
+(`~/gc_refs/marioparty4/src/dolphin/os/OSAudioSystem.c`); and Dolphin's own HLE constant,
+`INIT.cpp:22`. The DSP is HLE'd here exactly as Dolphin HLE's it — and **HLE is the
+reference configuration, not an obscure one**: `MainSettings.cpp:51` makes `MAIN_DSP_HLE`
+default `true`, so it is what the native oracle in `docs/ORACLES.md` runs.
+
+The one thing a backing buffer could never get right on its own is `DSP_CONTROL`'s three
+**write-1-to-clear** status bits (`DSP.cpp:285-291`): a plain store overwrites them with
+whatever the guest wrote, and `ARAM` (`0x20`) is exactly the bit the DMA handshake polls.
+So the model keeps a device-side shadow of `DSP_CONTROL` and stages it on every read —
+a read-side hook EXI never needed, because EXI's one modelled bit is written by the CPU
+and cleared in place, while the DSP's control word and mailbox are device-owned values no
+guest store ever put in the window.
+
+#### The falsifying control arm — ONE binary, both directions
+
+Closure build of `__OSInitAudioSystem` (4 functions, 146 instructions), wasm md5
+**`e7c2feb2518347b524a16255de414b86`**, **md5 verified intact before AND after both arms**,
+switched at run time by `sr_image_set_dsp_model()` (`SRP_DSP=0`). Measured from a
+`git archive HEAD` snapshot under a **uniquely-named** directory — §12.0's rule, and it was
+paid for again here: a first snapshot named `snap` was destroyed mid-build by a sibling
+agent that reuses the same scratchpad and the same name.
+
+| | model ON | model OFF (control, same md5) |
+|---|---|---|
+| `__OSInitAudioSystem` | **RETURNS**, r1 restored to `0x803c1450` | **NEVER RETURNS** — watchdog |
+| device reads | **14** | **1,000,001** |
+| device writes | 17 | 3 |
+| DSP-model events | **7** | 0 |
+| ARAM DMA bytes moved | **64** (2 × the guest's own `0x20`) | 0 |
+| distinct registers first-touched | **16** | 3 |
+| `MAIL_FROM_DSP` read back out of the window | **`0x00544348`** | `0x00000000` |
+| `DSP_CONTROL` read back out of the window | `0x0804` | **`0x08ad`** — reset bit still set |
+
+**Every one of the 13 new entries is in the DSP block `0xCC005000-0xCC005028`**, and the
+OFF arm's 3 are a strict prefix of the ON arm's 16 — the delta is exactly the registers the
+model touches and nothing else. The ON arm's `0x00544348` is `0x80544348` after the LOW
+read cleared the valid bit, which is `MailHandler.cpp:60-64` verbatim; the OFF arm's
+`0x08ad` is the guest's own last store with `DSPReset` never cleared, i.e. the wedge.
+
+The **7 events** are predicted independently from the disassembly before the run: 2
+`DSPReset` self-clears (`800e4bd4`, `800e4cf0`), 2 ARAM DMA completions (`800e4c14`,
+`800e4c6c`), 3 mailbox actions (the ucode queue at the `DSPInit` edge, the HI latch, the LO
+pop). **64 bytes** is 2 × the `0x20` the guest itself wrote to `AR_DMA_CNT`. The 6,581
+host-boundary crossings in the ON arm are all `0x800ecb60` `OSGetTick` — the `0x892`-tick
+delay loop, terminating because §13's retirement drive advances the clock.
+
+`aramBytes` is reported **separately** from `dspEvents` on purpose: "the DMA reported
+complete" and "the DMA moved data" are different claims and one counter would let either
+be quoted as the other.
+
+#### The furthest step actually reached: **`OSInit` RETURNS**
+
+Second closure, `OSInit` + its callee graph (86 functions, 5,375 instructions — the same
+closure §10.2b measured at 86/5,409), wasm md5 **`bbcdcff4bb6a562ac7fb31a38dcb2f49`**, md5
+intact before and after every arm. `SR_HOSTS_EXTRA=0x800e8a4c` was needed to make the closure
+BUILD (`mtspr SPR26`; `build_image.sh:146-155` documents this arm and that a host-bound
+address logs `IMG_D_UNIMPL` rather than fabricating a value).
+
+| | DSP ON | DSP OFF (control, same md5) |
+|---|---|---|
+| `OSInit` (`0x800e362c`) | **RETURNS** — r1 restored to `0x803c1450` | **NEVER RETURNS** — watchdog |
+| device reads / writes | **30 / 42** | 1,000,001 / 25 |
+| distinct registers first-touched | **41** across PI, MI, DSP, SI, EXI, DI, AI | 24 |
+| EXI TSTART clears | 2 | 2 |
+| DSP-model events / ARAM bytes | 7 / 64 | 0 / 0 |
+| host-boundary crossings | **6,722** (15 distinct) | 129 (10 distinct) |
+| fault | `0xC60E55D4` | none (wedged) |
+
+§10.1's whole-image boot reached **27** registers; this closure reaches **41**, and the 17
+the DSP model adds are all in `0xCC005000-0xCC005028`. The 6,583 `0x800ecb60` `OSGetTick`
+crossings are the guest's own `0x892`-tick delay, terminating because §13's retirement drive
+advances the clock — the DSP model contributes no clock of its own.
+
+**And the next wall was already built.** `0xC60E55D4` decodes as `SR_F_IMG_UNIMPL | 0x0E55D4`
+→ `0x800E55D4` `OSSetCurrentContext` — §12's `SR_OS_CTX` tier, and the probe can arm it at
+run time on the SAME binary. With `SRP_OSMODE=4`:
+
+| | osMode default (IRQ) | osMode 4 (`SR_OS_CTX`) |
+|---|---|---|
+| `0x800e55d4` in the boundary log | **`UNIMPL` x1** | **`OS` x1** — serviced |
+| fault | `0xC60E55D4` | `0xC60E8A4C` |
+| everything else (devices, 41 registers, 6,722 crossings, DSP window) | — | **identical** |
+
+So with the DSP modelled and the context tier armed, the **only** unimplemented boundary left
+anywhere in `OSInit` is `0x800e8a4c` — and that one is an artefact of this arm, because it is
+host-bound solely so the closure could build. ⚠ It is a `mtspr SPR26` (= SRR0), i.e. exception
+machinery, and whether it is a real wall in an `--all` build is **not established here**.
+
+#### ⚠ THE WHOLE-IMAGE `--all` BINARY DOES NOT INSTANTIATE AT HEAD, and it is not this model
+
+Built from the same snapshot, `--all --dispatch-out`, 0 compile errors, wasm md5
+`84c3c3d38159ef368143001e59eef6ed`, 39,229,684 B. Chrome refuses it:
+
+```
+CompileError: WebAssembly.instantiate(): size 9938512 > maximum function size 7654321 @+29246752
+```
+
+Walking the code section: **one body of 9,938,512 B at file offset +29,246,756 (body index
+3214). The next largest is 493,601 B — 20x smaller.** So it is one pathological function, not
+size creep, and it is 1.30x over V8's cap. This is the exact failure `build_image.sh:33-37`
+says `--dispatch-out` exists to prevent — and `--dispatch-out` **was applied** (the emcc line
+in the build log lists `sr_dispatch.c` as a TU), so this is a *new* oversized function
+elsewhere in the emitted bodies.
+
+**It is not attributable to the DSP model**: the failure is byte-identical with the model ON
+and OFF on the same md5, it is a compile-time rejection so no model code ever runs, and the
+only source change against the snapshot is `sr_image.c` (a separate TU) plus one `EXPORTS=`
+line — with no `-flto` anywhere in the link (`build_image.sh:237-246`), a host-layer TU cannot
+contribute a 9.9 MB body to `sr_gen.c`. ⚠ What is **not** established is whether HEAD alone
+reproduces it: no control build of HEAD's unmodified `sr_image.c` was taken. The cheapest next
+step is a relink with `--profiling-funcs` (the name section is stripped at `-O2`, which is why
+the body above can be sized but not named), then split or de-inline that one function.
+
+Until then the whole-image arm cannot be probed, and every result in this section comes from
+the closure arm — which is the same instrument §10.2a used for EXI, and which §10.1 recorded
+as reproducing the whole-image trajectory exactly (126 crossings, 16 distinct, 27 registers,
+same order).
+
+#### `sab.map` is now wrong SEVEN times in this neighbourhood, not four
+
+§12.1 records four. Four more, all in one quad, found by transcribing the shipped words:
+
+| address | `sab.map` says | the shipped words say | how it was pinned |
+|---|---|---|---|
+| `0x800e4b08` | `IPCGetBufferLo` (`ipc.a ipcMain.o`) | **`OSGetArenaHi`** | `lwz r3,-30280(r13); blr` |
+| `0x800e4b10` | `IPCGetBufferLo` **(again)** | **`OSGetArenaLo`** | `lwz r3,-32016(r13); blr` |
+| `0x800e4b18` | `IPCSetBufferLo` | **`OSSetArenaHi`** | `stw r3,-30280(r13); blr` |
+| `0x800e4b20` | `IPCSetBufferLo` **(again)** | **`OSSetArenaLo`** | `stw r3,-32016(r13); blr` |
+
+The duplicated names are the corruption tell. Three independent confirmations: the bodies
+are a Get/Get/Set/Set quad over two small-data globals; **`OSInit` calls `0x800e4b20`
+twice and `0x800e4b18` once** (`bl` at `0x800e3704`, `0x800e3740`, `0x800e3760`), matching
+`OS.c:127-131`'s two `OSSetArenaLo` and one `OSSetArenaHi` exactly; and MP4's
+revision-matched SDK opens this very function with
+`memcpy(OSGetArenaHi() - 128, __DSPWorkBuffer, 128)`, which is the call SAB makes at
+`0x800e4b84`. ⚠ This also explains a fault the walk arm reports and the boot does not:
+called standalone, `__OSInitAudioSystem` reads `__OSArenaHi` before `OSInit` ever set it,
+so the memcpy targets `0 - 128` and faults. That is the standalone-call caveat the worker
+documents, not a translation or model defect.
+
+#### What is NOT modelled — stated, not discovered later
+
+* **No DSP core.** The uploaded ucode is never executed. The init ucode's only externally
+  visible effect is the mail above, so this boot cannot tell — but the AX/Zelda ucodes the
+  game uploads later carry a whole command protocol and none of it exists here.
+* **No audio.** Nothing reaches AI (`0xCC006C00`) or produces a sample. The AUDIO_DMA
+  registers (`0xCC005030+`) are not modelled either; `AIInit`/`AIStartDMA` will be a new
+  wall when something reaches them.
+* **No interrupt.** The three `DSP_CONTROL` status bits are set, but the PI line they would
+  drive (`DSP.cpp:374-381`) is not, because this runtime delivers no interrupts at all.
+  This handshake happens to be interrupt-free **by the guest's own choice** — `0x8AC`
+  leaves all three interrupt MASKS clear — which is an accident of this function, not a
+  general property. §10.5's item 3 still stands.
+* **ARAM moves real bytes** into a plain `calloc`'d 16 MB buffer, with no refresh, no HSP
+  path and no wrap behaviour beyond Dolphin's 64 MB mirror mask.
+
+### 10.2d ⚠ ROUTING TO DOLPHIN IS THE DESTINATION, NOT MODELLING — and §10.2c should have checked FIRST
+
+**The process error, recorded because it is the expensive one.** §10.2c hand-wrote a DSP model
+without first asking whether Dolphin's DSP model — which is compiled into
+`dolphin_worker_emcc.wasm` and runs in the same page — could simply be *asked*. It can, in
+principle. There is a numbered MMIO command protocol, it is already shipping, and it already
+names the DSP block. **Checking for an existing implementation before writing one is the rule
+that was broken**, and no amount of rigour inside the model repairs that.
+
+**What exists**, all verified at HEAD:
+
+| fact | citation |
+|---|---|
+| a single-slot SAB mailbox at a FIXED address `0x02000000`, drained in-process | `EmscriptenWorker.cpp:779-836` |
+| commands 2..7 = `read8/16/32` / `write8/16/32` at an ARBITRARY guest EA — address-agnostic, so any register Dolphin registered is reachable | `EmscriptenWorker.cpp:814-826` |
+| a 256 KB mirror of the whole `0xCC000000..0xCC040000` window, with **`AR 0xCC005000 (ARAM DMA + DSP mailboxes)`** named explicitly | `sab_layout.h:108-130`, `:145-149` |
+| a per-cell, per-access-size classification table (`UNMAPPED`/`DIRECT_RW`/`READ_SE`/`WRITE_SE`/`READ_WRITE_SE`/`CONSTANT`) so reads can skip the round trip | `sab_layout.h:171-215` |
+| it is load-bearing in production for the recomp engine | `worker_funcs.js:339` |
+
+So the premise that each device (EXI, DSP, VI, SI, DI, AI) is a **separate wall** is wrong:
+they are one wiring job against a window Dolphin already implements. That is the finding that
+matters most here, and it is bigger than this wall.
+
+**Why it is nonetheless blocked TODAY. Three named facts, each with a citation.**
+
+1. **The mailbox requires the requester to SHARE Dolphin's linear memory, and the sr_image
+   build has no shared memory at all.** `MBX = 0x02000000` (`EmscriptenWorker.cpp:780`) is a
+   raw address into the shared heap; the protocol claims a slot with
+   `__atomic_compare_exchange_n` and wakes the requester with `emscripten_atomic_notify`
+   (`:800-802`, `:834`), and `:797` states the producer "is parked until reply". That is
+   `Atomics.wait` on a `SharedArrayBuffer`. `ppc-worker` can do it because the page hands it
+   **the same `WebAssembly.Memory`** as `dolphin_worker` (`gamecube.html:2482` creates one;
+   `:3296` `var ppcSharedMemory = sharedMemory;  // same memory as dolphin_worker`;
+   `:4140` posts it as `mem-init`). The sr_image worker is handed **nothing**: its boot payload
+   is `{ cmd, base, mode }` (`gamecube.html:7192-7193`) and the render arm's is
+   `{ cmd, base, mode, capture, frames }` (`:7278-7279`) — scalars, no transfer list. And the
+   link has no `-pthread` and no `-sSHARED_MEMORY`; it uses `-sALLOW_MEMORY_GROWTH=1`
+   (`build_image.sh:240-245`).
+2. **In the arm where the boot is actually measured there is no `dolphin_worker` at all.**
+   Under `?srimage=1` alone, Start is held disabled (`gamecube.html:7147` `if (!d0.render)` →
+   `:7150` `b.disabled = true`), so `startEmulator` never runs, so `var_setup` never runs, so
+   the `new Worker('/gamecube/dolphin_libretro/dolphin_worker.js…')` at `gamecube.html:2665`
+   never executes. Dolphin is not a renderer next door — it is absent.
+   Only `?srimage=1&srrender=1` boots it, and that arm boots Dolphin **running SAB itself**
+   (`gamecube.html:6798`/`:6819`/`:6830` → `worker_funcs.js:701` `load_iso`), with its pump
+   deliberately left running afterwards (`worker_funcs.js:324-345`). Routing the image's DSP
+   writes there would put **two guests on one DSP**, which is a correctness problem the design
+   has to answer before it is an improvement.
+3. **The page-side fallback route is asynchronous and cannot serve an in-flight guest.**
+   `mbx-cmd` is a `postMessage` with a reply listener (`gamecube.html:3706`, `:3780`;
+   `worker_funcs.js:1122-1130`, which measures the round trip at "~1-2ms wall" and calls it
+   "a perf concern for hot MMIO paths"). But `sr_call()` never returns to the worker's event
+   loop until the guest is done, so no reply can ever be delivered mid-call. This is not a new
+   hazard — it is the identical constraint `recomp_worker.js:435-437` records for the recomp
+   worker ("once boot() calls `Module._main()` this worker NEVER returns to its event loop, so
+   inbound messages are never serviced"), and its answer was a SAB command cell, i.e. blocker 1.
+
+**And the sibling's FIFO bridge does not solve it either, which is worth knowing before anyone
+proposes sharing it.** `sr_gx.c` writes into a static 8 MB buffer in the image's OWN linear
+memory (`sr_gx.c:54`, `:56`, `:91`) and JS reads it with `HEAPU8.subarray` **after `sr_call()`
+returns** (`sr_gx.c:99-100`; `sr_render_worker.js:145` then `:153`, `:239-250`). A FIFO is
+fire-and-forget and can be post-return; **an MMIO READ cannot** — the guest's `lhz` needs the
+answer inline. The two bridges want the same worker but not the same transport.
+
+**One more trap for whoever wires this.** The mailbox's read/write commands go through
+`dolphin_read*`/`dolphin_write*`, which are `MMU::Read/Write<T>(EA)` — and
+`EmscriptenWorker.cpp:861-867` already records that the EA path "depends on the guest's
+MOMENTARY translation state", fails and **RETURNS 0** whenever `MSR.DR=0`, and that this was
+the real cause of a shipped bug (intermittently-zero mirror cells, the `wp=0` DLBuf overflow).
+The fix there was to use the MMIO mapping with PHYSICAL addresses
+(`mmio->Read<u16>(system, 0x0C00…)`, `:869-886`) — which is **not exported**. A routed
+sr_image has no Dolphin-side MMU state of its own, so it wants the physical-address door, and
+that door has to be opened first.
+
+**Disposition of §10.2c's model.** It stays, and its role changes: it is the **acceptance test
+for the routed version**, not a competitor to it. Route the DSP block to Dolphin and it must
+reproduce §10.2c's ON-arm trajectory exactly — 14 device reads, 17 writes, `MAIL_FROM_DSP`
+reading back `0x00544348`, `DSP_CONTROL` `0x0804`, `__OSInitAudioSystem` returning — because
+that trajectory was derived from the SHIPPED GUEST WORDS and cross-checked against three
+independent SDK sources, and Dolphin's own model is where those semantics came from. A routed
+run that disagrees with it has a wiring bug.
+
+**Ordered next step, replacing §10.5's "write a device layer":**
+1. Link the image with shared memory and hand it the page's `sharedMemory`
+   (`gamecube.html:2482`), the way `ppc-worker` is wired at `:3296`/`:4140`.
+2. Point `gekko_rt.h`'s `-DSR_MMIO` window at the mailbox instead of the backing buffer —
+   the header's own note that it is "a BACKING BUFFER, not a device model" is exactly what
+   this removes.
+3. Export a PHYSICAL-address MMIO entry point alongside `dolphin_read*`, per the
+   `[phys-mmio fix 2026-07-21]` note.
+4. Decide what Dolphin is doing in that arm — a booted Dolphin running SAB cannot also be the
+   image's device model.
+5. **Only then** enumerate what genuinely cannot be serviced, with counts. `sr_image.c`
+   hand-answers 16 addresses today; that is the whole surface at risk.
+
 ### 10.3 Three things that came free with the run
 
 1. **The `OSDisableInterrupts` host boundary carries real traffic.** 108 host-boundary

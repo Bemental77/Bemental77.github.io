@@ -30,14 +30,15 @@
 //
 // ------------------------------------------------------------ WHAT THIS IS NOT
 // This is not a GameCube.  With -DSR_MMIO the device-register window is a BACKING
-// BUFFER (gekko_rt.h) with EXACTLY ONE modelled register: EXI CR's TSTART bit, which
-// self-clears (see THE DEVICE BOUNDARY below, and note the falsifying control arm that
-// ships with it).  Every other register in the window is memory: a read returns the last
-// value written.  Nothing here completes a DVD transfer, advances a VI line counter, or
-// delivers ANY interrupt — and the second of those matters more than it looks, because
-// the guest's own device drivers wait on interrupt-cleared software flags as often as
-// they poll a register.  Any boot that gets further because this window exists got
-// further because it stopped FAULTING on a store, not because a device answered.
+// BUFFER (gekko_rt.h) with TWO modelled devices: EXI CR's TSTART bit, which self-clears,
+// and the DSP interface (reset, the ARAM DMA and the mailbox) — see THE DEVICE BOUNDARY
+// below, and note that each ships with its own run-time falsifying control arm.  Every
+// other register in the window is memory: a read returns the last value written.  Nothing
+// here completes a DVD transfer, advances a VI line counter, or delivers ANY interrupt —
+// and the last of those matters more than it looks, because the guest's own device drivers
+// wait on interrupt-cleared software flags as often as they poll a register.  Any boot
+// that gets further because this window exists got further because it stopped FAULTING on
+// a store, not because a device answered.
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -218,6 +219,113 @@ static uint64_t img_r64(uint32_t ea) {
 #define EXI_CR_OFF    0x0Cu
 #define EXI_CR_TSTART 0x00000001u
 
+// THE SECOND MODELLED DEVICE — THE DSP INTERFACE, and it is the same KIND of model.
+//
+// With EXI modelled the boot walks straight through __OSReadROM and __OSThreadInit and
+// stops in `__OSInitAudioSystem` (0x800e4b74), which is the LAST device call OSInit makes
+// (~/gc_refs/dolsdk2001/src/os/OS.c:143 — everything after it is OSReport and
+// OSEnableInterrupts).  MEASURED on the closure build of that one function, wasm md5
+// cb6f5ea6a664a337133dd681b2d5a106: 3 registers first-touched (0xCC005012 write,
+// 0xCC00500A write, 0xCC00500A read) and then 1,000,001 device READS without returning.
+// The guest is spinning on ONE register.
+//
+// WHICH ONE, from the SHIPPED WORDS (`python3 tools/disasm_fn.py --iso <sab.iso>
+// --pc 0x800e4b74 --size 0x1bc`), NOT from sab.map and NOT from the SDK source:
+//
+//   800e4bc8  addi   r31, r3, 10          ; r31 = 0xCC00500A  = DSP_CONTROL
+//   800e4bd4  lhz    r0, 10(r3)
+//   800e4bd8  ori    r0, r0, 0x1          ; DSPReset
+//   800e4bdc  sth    r0, 10(r3)
+//   800e4be0  lhz    r0, 0(r31)
+//   800e4be4  rlwinm r0, r0, 0, 31, 31    ; bit 0x1
+//   800e4be8  bne    0x800e4be0           ; ...forever
+//
+// Dolphin's own header states the hardware contract in one line — DSP.h:49,
+// `u16 DSPReset : 1;  // Write 1 to reset and waits for 0` — and DSPHLE.cpp:206-210 is
+// the device doing it: `if (temp.DSPReset) { SetUCode(UCODE_ROM); temp.DSPReset = 0; }`.
+// So this is EXACTLY the EXI TSTART shape: a bit the CPU sets and the DEVICE clears,
+// modelled with zero latency.  It is a statement about timing; it invents no bytes.
+//
+// ONE SPIN IS NOT THE WHOLE FUNCTION.  Clearing DSPReset only moves the wedge to the next
+// poll, so the model has to be the whole init handshake or it is not a model at all.
+// The shipped words, in order, and what each needs (DOLSDK's OSAudioSystem.c:21-81 reads
+// as the same sequence; the retail build has the three ASSERTMSGLINEs compiled out, and
+// so has NO check of the mailbox VALUE — only of its valid bit):
+//
+//   1. 800e4bd4-800e4be8  set DSPReset, spin until the device clears it.
+//   2. 800e4bf8-800e4c10  spin while DSP_MAIL_FROM_DSP has bit 0x80000000 — i.e. wait for
+//                         the mailbox to be EMPTY.  A reset emptied it, so this exits at
+//                         once; it is also why the ucode's mail must NOT be queued at
+//                         reset time, only at the DSPInit edge below.
+//   3. 800e4c14-800e4c50  AR_DMA_MMADDR/ARADDR/CNT, then spin until DSP_CONTROL bit 0x20
+//                         (the ARAM-DMA-complete status), then write it back to ACK.
+//                         Dolphin: Do_ARAM_DMA (DSP.cpp:457-...) sets DMAState and
+//                         schedules CompleteARAM (DSP.cpp:99-104), which clears DMAState
+//                         and GenerateDSPInterrupt(INT_ARAM) — DSP.cpp:392-396 ORs the
+//                         status bit in regardless of the mask.  Zero latency = both, now.
+//   4. 800e4c54-800e4c68  OSGetTick delay of 0x892 ticks.  Needs nothing new: the clock is
+//                         already driven by RETIRED GUEST WORK (sr_host_os.c).
+//   5. 800e4c6c-800e4c98  a second identical ARAM DMA + ack.
+//   6. 800e4c9c-800e4cb0  clear DSPInit (0x800), then spin while DSPInitCode (0x400) is
+//                         set.  DSPHLE.cpp:214-227: the 1->0 edge on DSPInit is what makes
+//                         the DSP load the 128-byte ucode from 0x81000000 and run it, and
+//                         it sets DSPInitCode, "which gets unset a bit later".  A
+//                         zero-latency DSP has already unset it.
+//   7. 800e4cb4-800e4cbc  clear DSPHalt (0x4) — the DSP now runs.
+//   8. 800e4cc0-800e4cd4  spin until DSP_MAIL_FROM_DSP_HI has bit 0x8000: the ucode's
+//                         reply.  Dolphin's HLE of this exact ucode is one line —
+//                         INIT.cpp:20-23 `m_mail_handler.PushMail(0x80544348)`.
+//   9. 800e4cd8-800e4d04  re-halt, re-init, reset, spin on DSPReset again.
+//
+// WHY 0x80544348 IS NOT A FABRICATED VALUE.  It is what the 128-byte ucode the guest
+// ITSELF just uploaded computes: its last two instructions are `16 FC 00 54` / `16 FD 43
+// 48` (OSAudioSystem.c:14, DSPInitCode[]) — store-immediate 0x0054 to DMBH and 0x4348 to
+// DMBL — plus the hardware's mail-valid bit 0x80000000.  Two independent sources agree on
+// it: the SDK's own debug check (OSAudioSystem.c:72, `(mail + 0x7FAC0000) != 0x4348` =>
+// mail == 0x80544348) and Dolphin's HLE constant.  This runtime does not interpret DSP
+// code, so the DSP is HLE'd here exactly as Dolphin HLE's it — and that is stated as the
+// model's boundary, not hidden: see WHAT IS *NOT* MODELLED at the end of this block.
+//
+// AR_INFO (0xCC005012), the register the boot writes 0x43 to first, needs nothing: Dolphin
+// masks it to 0x7f (DSP.cpp:167) and stores it as a plain variable (DSP.cpp:186), and the
+// only use is `(m_aram_info.Hex & 0xf)` selecting between three ARAM memory maps whose GC
+// bodies are IDENTICAL (DSP.cpp:485-500).  It is already a backing buffer and it is right.
+//
+// WHAT IS *NOT* MODELLED, stated rather than discovered later:
+//   * NO DSP CORE.  The uploaded ucode is never executed.  The init ucode's ONLY externally
+//     visible effect is the mail above, so this boot cannot tell — but the AX/Zelda ucodes
+//     the game uploads later have a whole command protocol, and none of it exists here.
+//   * NO AUDIO.  Nothing reaches AI (0xCC006C00) or produces a sample.
+//   * NO INTERRUPT.  DSP_CONTROL's three status bits are set, but the PI line they would
+//     drive (DSP.cpp:374-381) is not, because this runtime delivers no interrupts at all.
+//     __OSInitAudioSystem happens to write 0x8AC, which leaves all three interrupt MASKS
+//     clear, so this whole handshake is interrupt-free by the GUEST's own choice — that is
+//     an accident of this function, not a general property.
+//   * THE ARAM DMA MOVES REAL BYTES but ARAM itself is a plain calloc'd 16 MB buffer with
+//     no refresh, no wrap behaviour beyond the 64 MB mirror mask, and no HSP path.
+#define DSP_MAIL_FROM_HI 0xCC005004u
+#define DSP_MAIL_FROM_LO 0xCC005006u
+#define DSP_CONTROL_EA   0xCC00500Au
+#define AR_DMA_MMADDR_EA 0xCC005020u
+#define AR_DMA_ARADDR_EA 0xCC005024u
+#define AR_DMA_CNT_EA    0xCC005028u
+#define AR_DMA_CNT_LO_EA 0xCC00502Au
+// DSP.h:42-68.  The three status bits the CPU can only ACKNOWLEDGE are grouped, because
+// the write path treats them as one class (write-1-to-clear) and nothing else does.
+#define DSPC_RESET      0x0001u
+#define DSPC_HALT       0x0004u
+#define DSPC_AID        0x0008u
+#define DSPC_ARAM       0x0020u
+#define DSPC_DSP        0x0080u
+#define DSPC_DMASTATE   0x0200u
+#define DSPC_INITCODE   0x0400u
+#define DSPC_INIT       0x0800u
+#define DSPC_INT_BITS   (DSPC_AID | DSPC_ARAM | DSPC_DSP)
+#define DSP_INIT_MAIL   0x80544348u   // INIT.cpp:22 == OSAudioSystem.c:72's expected value
+#define DSP_ROM_MAIL    0x8071FEEDu   // ROM.cpp ROMUCode::Initialize — the BOOT ROM's mail
+#define ARAM_SIZE       0x01000000u   // DSP.h:37 ARAM_SIZE — and 0x800000D0 stages the
+#define ARAM_MASK       0x00FFFFFFu   // same 16 MB into low memory (sr_image_worker.js)
+
 static uint8_t  g_dev_seen_rd[GK_HWREG_SIZE];
 static uint8_t  g_dev_seen_wr[GK_HWREG_SIZE];
 static uint32_t g_dev_rd_n = 0, g_dev_wr_n = 0;   // total accesses, not distinct
@@ -225,8 +333,42 @@ static uint32_t g_exi_model = 1;
 static uint32_t g_exi_clears = 0;
 static uint32_t g_watchdog = 0;                   // 0 = off
 
+// The DSP model's whole state.  g_dsp_ctrl is the DEVICE's copy of DSP_CONTROL: the
+// backing buffer cannot be it, because three of its bits are write-1-to-clear and a plain
+// store would overwrite them with whatever the guest wrote.
+//
+// THE POWER-ON VALUES ARE THE REFERENCE'S, and they are split across two objects there.
+// DSP_CONTROL reads as `(manager.Hex & ~0x0C07) | (emulator.Read() & 0x0C07)`
+// (DSP.cpp:252-255), so the emulator owns Reset/Assert/Halt/InitCode/Init: DSP.cpp:144-145
+// gives the manager half `Hex = 0; DSPHalt = 1`, and DSPHLE.cpp:31-33 gives the emulator
+// half `Hex = 0; DSPHalt = 1; DSPInit = 1`.  Composed = 0x0804.  DOLSDK agrees from the
+// other side — its (retail-compiled-out) entry assert for this very function is
+// `__DSPRegs[5] & 0x004` "DSP already working" (OSAudioSystem.c:32).
+// The mailbox is likewise NOT empty at power-on: DSPHLE.cpp:29 runs `SetUCode(UCODE_ROM)`
+// and ROM.cpp's ROMUCode::Initialize pushes 0x8071FEED.  It is invisible on this boot
+// because the DSP is HALTED throughout the guest's "wait for the mailbox to be empty"
+// loop and a halted mail handler shows nothing (MailHandler.cpp:37-43) — but seeding it
+// is what makes that the REASON the loop exits, rather than the loop being vacuous.
+static uint32_t g_dsp_model = 1;
+static uint32_t g_dsp_ctrl  = DSPC_HALT | DSPC_INIT;      // 0x0804
+static uint32_t g_dsp_mail  = 0;    // the DSP's last mail, latched on read (MailHandler.cpp)
+// ONE queued mail is enough and that is a property of the reference, not a shortcut:
+// DSPHLE::SetUCode (DSPHLE.cpp:72-77) calls ClearPending() and THEN the new ucode's
+// Initialize(), so a ucode change REPLACES the queue rather than appending to it, and
+// both ucodes this model knows push exactly one mail.
+static uint32_t g_dsp_mail_q = DSP_ROM_MAIL;
+static uint32_t g_dsp_mail_pending = 1;
+static uint32_t g_dsp_events = 0;   // modelled DSP actions taken — the ON-arm's witness
+static uint32_t g_aram_bytes = 0;   // bytes actually moved by a modelled ARAM DMA
+static uint8_t *g_aram = 0;         // allocated on the first DMA, never before
+
 #define DEV_LOG_CAP 512
-static uint32_t g_dev_log[DEV_LOG_CAP * 2];       // [guest addr][1=read 2=write 3=EXI-model]
+// [guest addr][kind]: 1=read 2=write 3=EXI-model, and 4..6 the three DSP-model actions.
+// sr_image_worker.js's DEVKIND table is the other half of this and must move with it.
+#define DEVK_DSP_RESET 4
+#define DEVK_DSP_ARAM  5
+#define DEVK_DSP_MAIL  6
+static uint32_t g_dev_log[DEV_LOG_CAP * 2];
 static uint32_t g_dev_log_n = 0;
 
 static void dev_log(uint32_t ea, uint32_t kind) {
@@ -234,6 +376,112 @@ static void dev_log(uint32_t ea, uint32_t kind) {
     g_dev_log[2 * g_dev_log_n] = ea;
     g_dev_log[2 * g_dev_log_n + 1] = kind;
     g_dev_log_n++;
+}
+
+// RAW window access — the same rule the EXI model states inline: a device hook must never
+// re-enter gk_r*/gk_w*, because those route straight back through GK_RD/GK_WPOST into
+// this file (unbounded recursion on the write side, double-counted inventory on the read
+// side).  These take a GUEST address and go directly to the backing bytes, big-endian.
+static uint32_t dev_p(uint32_t ea) { return GK_HWREG_OFF + (ea - GK_HWREG_LO); }
+static uint32_t dev_r16(uint32_t ea) {
+    uint8_t *r = g_ram + dev_p(ea);
+    return ((uint32_t)r[0] << 8) | r[1];
+}
+static void dev_w16(uint32_t ea, uint32_t v) {
+    uint8_t *r = g_ram + dev_p(ea);
+    r[0] = (uint8_t)(v >> 8); r[1] = (uint8_t)v;
+}
+static uint32_t dev_r32(uint32_t ea) {
+    uint8_t *r = g_ram + dev_p(ea);
+    return ((uint32_t)r[0] << 24) | ((uint32_t)r[1] << 16) | ((uint32_t)r[2] << 8) | r[3];
+}
+// Does an access of n bytes at ea touch the rsz-byte register at reg?  A 32-bit guest
+// store to 0xCC005028 covers AR_DMA_CNT_H *and* _LO, and it is the LO half that starts
+// the transfer on hardware (DSP.cpp:307-315) — so the test has to be overlap, not equality.
+static int dev_hits(uint32_t ea, uint32_t n, uint32_t reg, uint32_t rsz) {
+    return ea < reg + rsz && reg < ea + n;
+}
+
+// The ARAM DMA, zero-latency.  Dolphin's Do_ARAM_DMA byte-swaps on the way in and out
+// because its ARAM buffer is host-endian; MEM1 here is already GUEST bytes (gk_r32
+// assembles big-endian on every access), so ARAM holds guest bytes too and the transfer
+// is a memcpy.  The 0x3ffffff masks are Dolphin's, and its comment gives the reason:
+// "Incoming data into ARAM is mirrored every 64MB (verified on real HW)".
+static void dsp_aram_dma(void) {
+    uint32_t mm  = dev_r32(AR_DMA_MMADDR_EA) & 0x03FFFFFFu;
+    uint32_t ar  = dev_r32(AR_DMA_ARADDR_EA) & 0x03FFFFFFu;
+    uint32_t cnt = dev_r32(AR_DMA_CNT_EA);
+    uint32_t len = cnt & 0x7FFFFFFFu;      // DSP.h:114-122  count:31, dir:1
+    uint32_t dir = cnt >> 31;              // 0: MRAM -> ARAM   1: ARAM -> MRAM
+    if (!g_aram) g_aram = (uint8_t *)calloc(1, ARAM_SIZE);
+    // A transfer that would leave either buffer is DROPPED, not clamped, and the status
+    // bit is still raised — because that is what the hardware does with an out-of-range
+    // ARAddr too (Dolphin falls through to the HSP path and moves nothing).  The bytes
+    // actually moved are counted separately so "the DMA completed" and "the DMA moved
+    // data" can never be confused for one another from the outside.
+    if (g_aram && len && mm + len <= g_ram_size && (ar & ARAM_MASK) + len <= ARAM_SIZE) {
+        if (dir) memcpy(g_ram + mm, g_aram + (ar & ARAM_MASK), len);
+        else     memcpy(g_aram + (ar & ARAM_MASK), g_ram + mm, len);
+        g_aram_bytes += len;
+    }
+    g_dsp_ctrl = (g_dsp_ctrl & ~DSPC_DMASTATE) | DSPC_ARAM;
+    dev_w16(DSP_CONTROL_EA, g_dsp_ctrl);
+    g_dsp_events++;
+    dev_log(AR_DMA_CNT_EA, DEVK_DSP_ARAM);
+}
+
+// DSP_CONTROL write.  The guest has already stored its 16 bits into the window; this
+// turns them into the value a DSP would leave there.
+static void dsp_ctrl_write(void) {
+    uint32_t w   = dev_r16(DSP_CONTROL_EA);
+    uint32_t old = g_dsp_ctrl;
+    uint32_t eff = w;
+
+    // AID / ARAM / DSP are WRITE-1-TO-CLEAR status, so a 0 must PRESERVE the old bit
+    // rather than clear it (DSP.cpp:285-291: `if (tmpControl.AID) control.AID = 0;`).
+    // This is the one thing a backing buffer gets wrong on its own, and it is exactly the
+    // bit __OSInitAudioSystem's ARAM handshake polls.
+    eff = (eff & ~DSPC_INT_BITS) | (old & DSPC_INT_BITS & ~w);
+    // Device-owned status the CPU cannot assert: a DMA is never outstanding here, and
+    // DSPInitCode is set and cleared by the DSP itself (see the DSPInit edge below).
+    eff &= ~(DSPC_DMASTATE | DSPC_INITCODE);
+
+    if (w & DSPC_RESET) {
+        eff &= ~DSPC_RESET;                       // DSP.h:49 / DSPHLE.cpp:206-210
+        // A reset is `SetUCode(UCODE_ROM)` (DSPHLE.cpp:208), which clears the pending
+        // queue and then lets the BOOT ROM mail 0x8071FEED — it does NOT leave the
+        // mailbox empty.  The latched m_last_mail is not cleared by SetUCode either.
+        g_dsp_mail_q = DSP_ROM_MAIL; g_dsp_mail_pending = 1;
+        g_dsp_events++;
+        dev_log(DSP_CONTROL_EA, DEVK_DSP_RESET);
+    }
+    // DSPInit 1 -> 0 is the ucode load.  DSPHLE.cpp:214-227 — and note the direction: it
+    // is CLEARING the bit that starts the DSP, which is why the mail cannot be queued at
+    // reset time (step 2 of the sequence above spins until the mailbox is EMPTY).
+    if ((old & DSPC_INIT) && !(w & DSPC_INIT)) {
+        g_dsp_mail_q = DSP_INIT_MAIL;
+        g_dsp_mail_pending = 1;
+        g_dsp_events++;
+        dev_log(DSP_CONTROL_EA, DEVK_DSP_MAIL);
+    }
+    g_dsp_ctrl = eff;
+    dev_w16(DSP_CONTROL_EA, eff);
+}
+
+// DSP -> CPU mailbox read, staged into the window before the guest's load completes.
+// MailHandler.cpp:37-70 verbatim: the HIGH read LATCHES the pending mail without
+// consuming it, the LOW read consumes it and then clears bit 0x80000000 of the latched
+// value, and while the DSP is HALTED neither sees anything new.
+static void dsp_mail_read(int low) {
+    if (!(g_dsp_ctrl & DSPC_HALT) && g_dsp_mail_pending) {
+        g_dsp_mail = g_dsp_mail_q;
+        if (low) g_dsp_mail_pending = 0;
+        g_dsp_events++;
+        dev_log(low ? DSP_MAIL_FROM_LO : DSP_MAIL_FROM_HI, DEVK_DSP_MAIL);
+    }
+    if (low) g_dsp_mail &= ~0x80000000u;
+    dev_w16(DSP_MAIL_FROM_HI, g_dsp_mail >> 16);
+    dev_w16(DSP_MAIL_FROM_LO, g_dsp_mail & 0xFFFFu);
 }
 
 // THE WATCHDOG.  A guest that spins on a device register cannot be stopped from
@@ -253,6 +501,19 @@ void gk_dev_read(uint32_t p, uint32_t n) {
     if (off >= GK_HWREG_SIZE) return;
     g_dev_rd_n++;
     if (!g_dev_seen_rd[off]) { g_dev_seen_rd[off] = 1; dev_log(GK_HWREG_LO + off, 1); }
+    // THE READ SIDE HAS TO EXIST FOR THE DSP AND DID NOT FOR EXI.  GK_RD runs BEFORE the
+    // load (gekko_rt.h:320-326), so staging here is what the guest's `lhz` then reads.
+    // EXI needed none of this because its one modelled bit is written by the CPU and
+    // cleared in place; the DSP's control word and mailbox are DEVICE-owned values that
+    // no guest store ever put in the buffer.
+    if (g_dsp_model) {
+        uint32_t ea = GK_HWREG_LO + off;
+        if (dev_hits(ea, n, DSP_CONTROL_EA, 2))   dev_w16(DSP_CONTROL_EA, g_dsp_ctrl);
+        // Order matters and is hardware's: a 32-bit read of 0xCC005004 is two halfword
+        // reads, high first (DSP.cpp:355-359 ReadToSmaller), and only the low one pops.
+        if (dev_hits(ea, n, DSP_MAIL_FROM_HI, 2)) dsp_mail_read(0);
+        if (dev_hits(ea, n, DSP_MAIL_FROM_LO, 2)) dsp_mail_read(1);
+    }
     if (g_watchdog && g_dev_rd_n > g_watchdog) dev_watchdog();
 }
 
@@ -261,25 +522,32 @@ void gk_dev_write(uint32_t p, uint32_t n) {
     if (off >= GK_HWREG_SIZE) return;
     g_dev_wr_n++;
     if (!g_dev_seen_wr[off]) { g_dev_seen_wr[off] = 1; dev_log(GK_HWREG_LO + off, 2); }
-    if (!g_exi_model) return;
-    // EXI CR of any of the three channels, written with TSTART set: complete instantly.
     uint32_t ea = GK_HWREG_LO + off;
-    if (ea >= EXI_BASE && ea < EXI_BASE + 3u * EXI_CHAN_SZ &&
-        ((ea - EXI_BASE) % EXI_CHAN_SZ) == EXI_CR_OFF) {
-        // RAW buffer access, NOT gk_r32/gk_w32.  Those route back through GK_RD/GK_WPOST,
-        // i.e. straight back into this function — gk_w32 here is unbounded recursion, and
-        // gk_r32 would double-count every device read in the inventory.  The hook must
-        // never re-enter the hooked path.
-        uint8_t *r = g_ram + p;
-        uint32_t cr = ((uint32_t)r[0] << 24) | ((uint32_t)r[1] << 16) |
-                      ((uint32_t)r[2] << 8)  | r[3];
-        if (cr & EXI_CR_TSTART) {
-            cr &= ~EXI_CR_TSTART;
-            r[0] = (uint8_t)(cr >> 24); r[1] = (uint8_t)(cr >> 16);
-            r[2] = (uint8_t)(cr >> 8);  r[3] = (uint8_t)cr;
-            g_exi_clears++;
-            dev_log(ea, 3);
+    // TWO INDEPENDENT MODELS, TWO INDEPENDENT SWITCHES.  Each `if` is its own falsifying
+    // control arm; neither early-returns past the other, so a run can turn off exactly one.
+    if (g_exi_model) {
+        // EXI CR of any of the three channels, written with TSTART set: complete instantly.
+        if (ea >= EXI_BASE && ea < EXI_BASE + 3u * EXI_CHAN_SZ &&
+            ((ea - EXI_BASE) % EXI_CHAN_SZ) == EXI_CR_OFF) {
+            // RAW buffer access, NOT gk_r32/gk_w32.  Those route back through GK_RD/GK_WPOST,
+            // i.e. straight back into this function — gk_w32 here is unbounded recursion, and
+            // gk_r32 would double-count every device read in the inventory.  The hook must
+            // never re-enter the hooked path.
+            uint8_t *r = g_ram + p;
+            uint32_t cr = ((uint32_t)r[0] << 24) | ((uint32_t)r[1] << 16) |
+                          ((uint32_t)r[2] << 8)  | r[3];
+            if (cr & EXI_CR_TSTART) {
+                cr &= ~EXI_CR_TSTART;
+                r[0] = (uint8_t)(cr >> 24); r[1] = (uint8_t)(cr >> 16);
+                r[2] = (uint8_t)(cr >> 8);  r[3] = (uint8_t)cr;
+                g_exi_clears++;
+                dev_log(ea, 3);
+            }
         }
+    }
+    if (g_dsp_model) {
+        if (dev_hits(ea, n, DSP_CONTROL_EA, 2))    dsp_ctrl_write();
+        if (dev_hits(ea, n, AR_DMA_CNT_LO_EA, 2))  dsp_aram_dma();
     }
 }
 
@@ -288,9 +556,16 @@ EMSCRIPTEN_KEEPALIVE uint32_t  sr_image_dev_log_n(void) { return g_dev_log_n; }
 EMSCRIPTEN_KEEPALIVE uint32_t  sr_image_dev_reads(void) { return g_dev_rd_n; }
 EMSCRIPTEN_KEEPALIVE uint32_t  sr_image_dev_writes(void){ return g_dev_wr_n; }
 EMSCRIPTEN_KEEPALIVE uint32_t  sr_image_exi_clears(void){ return g_exi_clears; }
-// The falsifying control arm: 0 restores the pure-backing-buffer behaviour, so a claim
-// that the EXI model unblocked something must FAIL with it off.
+// The falsifying control arms: 0 restores the pure-backing-buffer behaviour for that ONE
+// device, so a claim that either model unblocked something must FAIL with it off — on the
+// same binary and the same md5, with no relink standing between the two readings.
 EMSCRIPTEN_KEEPALIVE void      sr_image_set_exi_model(uint32_t on) { g_exi_model = on; }
+EMSCRIPTEN_KEEPALIVE void      sr_image_set_dsp_model(uint32_t on) { g_dsp_model = on; }
+EMSCRIPTEN_KEEPALIVE uint32_t  sr_image_dsp_events(void) { return g_dsp_events; }
+// Kept SEPARATE from the event count on purpose: "the DMA reported complete" and "the DMA
+// moved bytes" are different claims and a single counter would let one be quoted as the
+// other.  0 events with nonzero bytes is impossible; nonzero events with 0 bytes is not.
+EMSCRIPTEN_KEEPALIVE uint32_t  sr_image_aram_bytes(void) { return g_aram_bytes; }
 EMSCRIPTEN_KEEPALIVE void      sr_image_set_watchdog(uint32_t n)   { g_watchdog = n; }
 
 // ------------------------------------------------------------------ the DOL image

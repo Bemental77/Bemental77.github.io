@@ -17,6 +17,7 @@
 //
 // env:
 //   SRP_MODE=walk|whole    default walk
+//   SRP_EXI=0 / SRP_DSP=0  turn ONE device model off — the falsifying control arms
 //   SRP_TIMEOUT_MS         default 120000
 //   SRP_HEADLESS=0         visible window
 //   SRP_PORT               pin the server port (default: OS-assigned ephemeral)
@@ -123,7 +124,11 @@ if (WALK_LIST.length) console.log('[srp] custom walk list:', WALK_LIST.map(
 // SR_OS_IRQ mode sr_image_init() installs (README §10), so "unset" IS the control arm for
 // any claim about the context family, taken on the same binary and the same md5.
 //   0 = OFF   1 = HLE   2 = TRACE   3 = IRQ (the build default)   4 = CTX
+// SRP_DSP=0 is the same thing for the DSP model, and it is SEPARATE from SRP_EXI because
+// the boot cannot reach the DSP at all with EXI off — the arm that matters is EXI on,
+// DSP off, which is the state this model's `before` was measured in.
 const ARM = { exiModel: process.env.SRP_EXI === '0' ? 0 : 1,
+              dspModel: process.env.SRP_DSP === '0' ? 0 : 1,
               watchdog: parseInt(process.env.SRP_WATCHDOG || '0', 10) >>> 0,
               strict: process.env.SRP_STRICT === '1',
               osMode: process.env.SRP_OSMODE === undefined || process.env.SRP_OSMODE === ''
@@ -206,8 +211,10 @@ const devSrc = done || [...stepDone].reverse().find((m) => m.dev);
 if (devSrc && devSrc.dev && devSrc.dev.firstTouch) {
   const d = devSrc.dev;
   console.log(`devices       : ${d.reads} reads / ${d.writes} writes, ${d.exiClears} EXI TSTART clears, ` +
+              `${d.dspEvents} DSP-model events, ${d.aramBytes} ARAM DMA bytes, ` +
               `${d.firstTouch.length} distinct registers first-touched`);
   for (const t of d.firstTouch.slice(0, 40)) console.log(`   ${t.addr}  ${t.block.padEnd(7)} ${t.kind}`);
+  if (d.dsp) console.log('dsp window    :', Object.entries(d.dsp).map(([k, v]) => k + '=' + v).join(' '));
 }
 if (done) {
   console.log('fault         :', done.fault);
