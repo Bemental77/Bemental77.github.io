@@ -4027,6 +4027,261 @@ to `0x0` is a property of the host layer, not of how the cache ops are emitted. 
 all three configurations (plain / `-DSR_MMIO` / `-DSR_VERIFY`), and the context-switch
 suite is 63/0 through it.
 
+### 9.9 CAPTURE AT THE ENUMERATION FIRE — §9.8's own named fix, built and measured
+
+§9.8 ended by naming its fix: *"The fix is a rig change, not more scenes or more budget:
+capture at the enumeration fire, before deleting the breakpoint. That would make one
+reach sufficient and would put the 401 new entries in range."* This is that change. It
+works, the yield per executed entry goes from **3.6% to 99.1%** — and the sentence above
+is still wrong in one respect that only running it exposes, recorded below.
+
+`survey_waves` gains `--capture-at-enum` (`fixture_rel.py`, exposed by both it and
+`fixture_dol.py`; grep `capture_at_enum`). The enumeration loop already stops AT the
+entry holding the right architectural state; it just deleted the breakpoint and moved
+on. Now it takes the fixture there with `at_entry=True` first. **The wave phase is
+kept** and runs over whatever the enum phase did not take, so the two flows are
+A/B-able inside one run on one binary rather than across two tool versions, and every
+fixture records `captured_at` = `"enum"` | `"wave"`.
+
+#### Why enumeration deleted the breakpoint, and what it costs to keep the set armed
+
+Delete-on-fire is not an accident — `survey_waves`' own docstring measures the
+alternative: with 300 breakpoints armed on per-frame functions *"300 s of wall clock
+reached only 10 distinct entries of 300."* Deleting each candidate as it fires is what
+makes the guest monotonically faster through the phase. That is preserved: the fixture
+is taken **before** the delete, and the delete still happens.
+
+The one thing that changes is that the rest of the armed set is still armed while a
+capture single-steps. `--enum-disarm all` (the default) takes every armed breakpoint off
+first and puts it back after — exactly what the wave phase already did for its own live
+set. **Measured, in the runs: `disarm 165 bp in 0.01s, rearm in 0.01s` at 166 armed and
+`disarm 2703 bp in 0.22s, rearm in 0.24s` at 2,704 armed** — ~87 µs per RSP breakpoint
+packet, i.e. **0.46 s per capture at full arm**, against captures that cost seconds to
+minutes. The safe policy is free; `--enum-disarm none` is built and was not needed.
+
+> `none` would also be sound on this tree, and the argument is a code read rather than a
+> hunch: `Interpreter::SingleStep()`
+> (`dolphin-src/Source/Core/Core/PowerPC/Interpreter/Interpreter.cpp:195-214`) does NOT
+> call `CheckAndHandleBreakPoints`; the only interpreter call site is `:261`, inside
+> `Run()`. (And `CPU.cpp:145-154` single-steps past a breakpoint at the current PC before
+> resuming, which is why the anchor loop and the locked-cache gadget's `cont` work at
+> all.) The oracle is a released `Dolphin.app` whose revision cannot be confirmed against
+> that tree, so the claim stays hedged and the default stays `all`.
+
+#### `trace_alignment` — the integrity gate that should always have been there
+
+`capture_replayable_fixture` never scored its own trace. `GDB.check_alignment`'s
+docstring carries the measurement that makes that dangerous: a trace taken after a
+breakpoint stop **without** `resync()` scores 0.0003 where a clean one scores 0.996 —
+i.e. a desynchronised trace looks entirely plausible and is entirely wrong, and the only
+place it could ever have surfaced is as a replay MISMATCH blamed on the translator.
+
+`fixture_rel.trace_alignment` recomputes it from the capture's own recorded stream at no
+cost: every primary-opcode-18 branch has a target computable from the word alone, and
+the next PC in the stream must equal it. Every survey fixture now carries
+`trace_alignment` / `trace_branches`, and a capture below `--min-align` is marked
+`usable:false` at capture time instead of replaying.
+
+**The default bar is 0.50, deliberately loose.** `GDB.trace()`'s docstring measures a
+clean post-breakpoint segment at **0.89 median**, so a bar near 0.9 would refuse good
+captures. Observed over the 903 captures below: 285 scored (≥ 4 branches), **minimum 0.75,
+none below 0.50**, and 341 bodies with no unconditional branch at all (scored `None`,
+never failed for a denominator they cannot have).
+
+#### Two more hazards §9.8 named, fixed here
+
+- **`fixture_dol.py` no longer destroys the previous attempt.** It started every run
+  with a fresh `out` and overwrote `OUT`, so a retry after one of §9.8's unexplained
+  `RSPError: stub closed the connection` kills discarded what the first attempt had
+  already paid the oracle for. The previous artifact is now always kept
+  (`OUT.<mtime>.bak`), and `--append` resumes into it, dropping already-captured entries
+  from the arm list.
+- **A partial executed set is now written.** `on_executed` used to run only after
+  enumeration completed, so the three runs that died mid-enumeration lost the
+  enumeration they had already paid for. It is now published every 25 fires.
+- **The anchor heuristic no longer accepts two hits as a rate.** Calibration records
+  *when* each candidate fires, not just how often, and selection is three-tier: rarest
+  candidate with ≥ `--anchor-min-hits` (8) hits AND a period under `wave-budget/4` AND
+  still firing in the last third of the window; then the same without the liveness test;
+  then §9.8's rule, which now prints a WARNING naming itself as the heuristic that
+  aborted three runs. `--anchor-off` remains the recommendation and is what every run
+  below used.
+- **A named `--anchor-off` outside the arm set used to be silently never armed**, which
+  leaves the phase with nothing that can hand control back — presenting as a `cont` that
+  never returns. It is now armed separately, with a printed note.
+
+#### THE A/B — same 166 entries, same scene, same oracle, one change
+
+§9.8's targeted pass is the cleanest available control: it armed the 165 Iron Gate
+entries that were new-and-uncaptured plus the anchor, enumerated 166/166 in 10 s on four
+independent runs, and then captured **6** in 576 s. Re-run with `--capture-at-enum`
+against the same `.s06` state, the same oracle (`/Applications/Dolphin.app`,
+`CPUCore=0`), and an arm list whose `','.join(armed)` md5 is **byte-identical**
+(`30576c014aa2` in both candidate files):
+
+| | armed | executed here | captured | verified |
+|---|---|---|---|---|
+| §9.8, discover-then-recapture | 166 | 166 | **6** (3.6% of executed) | — |
+| **`--capture-at-enum`** | 166 | 106 | **105** (99.1% of executed) | **89** |
+
+Not one capture was lost to `executed during enumeration but not again within its
+capture wave` — the refusal that accounted for 159 of 166 in the control. The refusals
+that remain are all `never executed in this scene`.
+
+#### The full-arm scene runs — same 2,704-entry armed set
+
+Both re-surveyed with `--arm-offsets` built out of §9.8's own candidates file, so
+`','.join(armed)` md5 is **`6354a7468f98`** — byte-identical to the four §9.8 runs — same
+`--anchor-off 80117df8`, same oracle. Connect PCs `0x801030f8` (`.s05`) and `0x80117e0c`
+(`.s06`): §9.8's recorded restore tells, and neither is the DOL entry `0x80003140`.
+
+| scene | flow | executed / 2,704 | captured | verified | mismatched |
+|---|---|---|---|---|---|
+| cutscene `.s05` | §9.8 | 470 (17.4%) | 44 | 38 | 3 |
+| cutscene `.s05` | **`--capture-at-enum`** | 407 (15.1%) | **406** (99.8% of executed) | **341** | 29 |
+| Iron Gate `.s06` | §9.8 | 536 (19.8%) | 317 | 287 | 6 |
+| Iron Gate `.s06` | **`--capture-at-enum`** | 478 (17.7%) | **392** (82.0%) | **352** | 12 |
+
+**Every fixture in all three new runs was taken at the enumeration fire** — `captured_at:
+{'enum': 406}` / `{'enum': 392}` / `{'enum': 105}`; the wave phase had nothing left to do.
+Iron Gate's 82% is not the flow giving up: `budget 3600s spent; 86 candidate(s) not
+attempted`. It is wall clock, which is a resource you can buy; a second reach is not.
+
+#### ⚠ THE PART §9.8's SENTENCE GOT WRONG: capture-at-enum PERTURBS THE SCENE IT IS ENUMERATING
+
+`executed` went **down**, not up — 470 → 407 on the cutscene and 166 → 106 on the
+targeted Iron Gate set — and both new runs ended on the `--enum-idle` rule while both
+controls ran their full budget. The controls separated the phases, so their `executed`
+was measured on a scene the rig had not touched; here every capture single-steps the
+guest tens to thousands of instructions in the middle of the enumeration.
+
+The mechanism is named but **not proven**, and three things are in it at once. The one
+worth naming first is structural: `Interpreter::SingleStep()`
+(`Interpreter.cpp:196-206`) calls `core_timing.Advance()` and then sets
+`slice_length = 1` / `downcount = 0` — **every single-stepped instruction ends a timing
+slice.** The cutscene run stepped 590,361 guest instructions, so the guest saw 590,361
+slice boundaries it would never otherwise see, and everything timer-driven (VI, DSP,
+alarms) advances on a completely different cadence. The other two are `read_gqrs`, which
+writes 8 bytes at `A_GADGET` (`0x81790000`) per capture and never restores them, and the
+locked-cache reader, which hijacks PC/MSR/GPRs per word.
+
+**So `executed` under `--capture-at-enum` is NOT the same measurement as §9.8's, and the
+two numbers must not be put in one column.** The protocol that gets both is two passes,
+and the A/B above IS that protocol: enumerate WITHOUT capture for the denominator (cheap
+— §9.8's own executed sets are committed and reproduce exactly across four runs), then
+arm that set and capture at fire. That took 105 of 106.
+
+#### Union, against the same 2,704 denominator
+
+Every number here is replayed against ONE whole-image build — `--all --indirect
+--jumptables`, `-O0`, wasm md5 `8bd7d47b19ecdb6b83b4e73718206728`, **identical before and
+after every run** — and that build's regression gate was re-scored FIRST and returns
+§9.5's figure exactly: **12 verified / 16 attempted / 0 mismatched**. It also reproduces
+§9.8's four scene rows on the committed artifacts — Iron Gate **287**, main menu **195**,
+cutscene **38**, and a union of **774 executed / 371 verified**, all exact — so it is a
+faithful stand-in for the retired `402d92fb…`. (Its City Escape row scores 328, not the
+330 §9.8's table prints; 330 is §9.5's figure de-duplicated across TWO runs and 437
+attempts, while the committed `sab_dol_survey_all.json` holds only 372 of them. The
+union, which is what the table is for, is identical.)
+
+| | union verified | of 2,704 |
+|---|---|---|
+| §9.8's four scenes, re-scored on this build | 371 | 13.7% |
+| + the 166-entry Iron Gate **targeted** pass | 456 | 16.9% (**+85**) |
+| + the cutscene **full-arm** run | 576 | 21.3% (**+120**) |
+| + the Iron Gate **full-arm** run | **576** | **21.3%** (**+0**) |
+
+**+205 distinct DOL functions verified bit-exact, with no new scene and no translator
+change.** Against all 4,741 recovered DOL boundaries: 7.8% → 12.1%. The count of entries
+that some scene executes and nothing has verified falls from **403 to 198**.
+
+> **The `+0` is the most useful row in the table, and it is a protocol result.** The Iron
+> Gate full-arm run cost 62 minutes of probe lock and verified 352 functions, every one of
+> which the 166-entry targeted pass (~25 min) and the cutscene run had already covered.
+> Arming 2,704 entries to reach a scene's ~500 is paying for 2,200 refusals and for
+> re-capturing what is already verified. **The efficient protocol is the targeted one**:
+> take the executed set from §9.8's committed artifacts (they reproduce exactly), subtract
+> what is already verified, arm only that, and capture at the fire.
+
+#### The control that matters: not one new unexplained divergence
+
+48 fixtures mismatched across the three new runs (29 + 12 + 7). **All 48 carry a fault,
+and the fault code names the callee — zero mismatch without one:**
+
+| fault | n | what it is |
+|---|---|---|
+| `0xe00e78ac` | 29 | `OSDisableInterrupts` — §9.7 built a host boundary for exactly this; this build does not link `SR_HOST_OS=1` |
+| `0xe011c18c` | 6 | §9.3's blocked callee (`branch target 0x8011c140 is not a function start`) |
+| `0xe0113fc0` | 5 | `mtspr SPR913`, still unbuilt |
+| `0xe0169ae8` | 2 | blocked callee, `op31 xo=371` |
+| `0xe1242a1c` / `0xe124bb9c` / `0xe1bd1768` | 2 + 2 + 2 | `sr_indirect` — an INDIRECT target absent from the build. §9.6's item 4: the offline closure gate cannot see indirect callees |
+
+That is the evidence that capturing at the fire — with 2,703 breakpoints coming off and
+going back on around every one of 903 captures — did not corrupt a single fixture. The
+second, independent witness is `trace_alignment` itself: over those 903 captures the
+minimum score is **0.75** and **none is below 0.50**.
+
+#### `0x800fa704 HandleReverb` — two more captures, and BOTH pass
+
+§9.8 left this open and asked for it not to be let past silently: rank 9 of the measured
+hot profile at 3.21% of sampled PCs, mismatching from two independent captures in two
+scenes with **no host fault**. Both new full-arm runs captured it, and both are
+**bit-exact**:
+
+| capture | scene | steps | stores | write-events | result |
+|---|---|---|---|---|---|
+| §9.8 | Iron Gate `.s06` | 14400 | 1479 | 3586 | **FAIL** |
+| §9.8 | main menu `.s04` | 14398 | 1477 | 724 | **FAIL** |
+| here | cutscene `.s05` | 14396 | 1478 | 26 | **PASS** |
+| here | **Iron Gate `.s06`** | 14398 | 1478 | 23 | **PASS** |
+
+**The fourth row is the one that matters: same function, same scene, same oracle, same
+savestate as the §9.8 capture that failed — and it passes.** So the divergence is not
+scene-dependent and not a structural translation bug (which would fail every time); it
+tracks the DATA of the particular invocation, and the two that failed are the two whose
+reverb buffer was actually changing (3586 and 724 write events against 26 and 23).
+
+Narrowing it further, all by reading rather than by trying:
+
+- **A host-boundary fault is structurally impossible here** — `n_calls = 0` and `entered`
+  is the function itself, so no callee exists. §9.8's "no host fault" was not luck.
+- The two failing captures differ **only in data**: steps 14400 / 14398, stores 1479 /
+  1477, `final-mem-bytes` 3632 and `staged` 4404 identical in both.
+- The divergence is **1–2 ULP in stored 32-bit singles**: `final memory 0x803ec23f: want
+  1 got 0` and seven more at the low byte of a word, one at `want 4 got 0`; and
+  `f9(ps0) want=b6a0000000000000 got=0`, where `b6a0…` is exactly −2⁻¹⁴⁹, the smallest
+  single-precision **denormal** — one intermediate landing either side of the
+  denormal/zero boundary.
+- **Ruled out**: FPSCR[NI] flush-to-zero (the captured FPSCR is `a6238000` / `a6224100`,
+  NI = 0 in both); FPSCR[RN] (0 = round-to-nearest, which `gk_force_single` assumes);
+  double-rounding in the FMA family (`gekko_rt.h:401-426` uses `fma()` with the 25-bit
+  frC narrowing AND the 2Sum tie-break, i.e. Dolphin's `NI_madd_msub`); §9.6 item 3's
+  open `fctiw` approximation — the DOL's only 8 `fctiw` (xo=14) sites are in
+  `zz_800fa574_`, a *different* function, and HandleReverb's two op-63 rounding
+  instructions are `fctiwz` (xo=15), which §9.5 already fixed; and paired singles
+  (`rel_shapes.shape_of` would have tagged `ps`; the shape is `leaf+fp+xform` and the
+  323-instruction body contains no `psq_*`).
+- Its arithmetic is 34 op-59 sites: **16 `fmadds`**, 6 `fnmsubs`, 5 `fmuls`, 4 `fadds`,
+  3 `fsubs`.
+- `trace_alignment` scores it `None` — its trace contains no unconditional branch at all,
+  so the new integrity gate cannot speak to this one either way. Said rather than left
+  to look like a clean bill of health.
+
+**NOT diagnosed.** Named next step: a per-instruction FP differential over the failing
+fixture's own trace, which the committed artifact already contains. One untested
+hypothesis worth trying first: **wasm has no hardware FMA**, so `fma()` is musl's
+software path — a different implementation from the host FMA the reference interpreter
+runs on.
+
+#### One more thing this run cost, and it is fixed
+
+`survey_waves` emits one refusal per never-executed candidate — 2,297 of them on a
+2,704-entry arm set — and `on_refusal` re-serialised the WHOLE artifact each time. With
+406 captured fixtures in it that is a ~17 MB `json.dump` × 2,297: the cutscene run spent
+**44 minutes at 100% CPU, holding the probe lock**, writing a set that is derivable from
+`executed`. Quiet refusals no longer dump; `main()` writes once when `survey_waves`
+returns, on both the success and the exception path.
+
 ## 7. Decision
 
 **The route is VIABLE for SAB on translatability grounds, and the remaining work
