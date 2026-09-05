@@ -332,6 +332,65 @@ replay's draws, to get REAL GPU time. That distinguishes "the GPU is genuinely b
 long" from "the CPU is blocked waiting on something that is not GPU work" — and every test so
 far has measured the CPU side of the fence only.
 
+## ★ SECOND ARGUMENT-SHAPE BUG: `readPixels` is not in the recorder surface
+
+Same class as the `bufferData` three-vs-five-parameter defect, and this one is a
+CORRECTNESS bug, not only a performance one.
+
+`gl-record.js` records a 65-method draw surface and *"falls back to the real context for any
+other method"*. `grep -c readPixels` returns **0 in both `gl-record.js` and
+`render-worker.js`** — it is not in that surface. So for
+`OGLStagingTexture::CopyFromTexture` (`OGLTexture.cpp:481`, GLES branch `:508-533`), which
+does `BindSharedReadFramebuffer` → `glFramebufferTextureLayer` ×2 → **`glReadPixels`** →
+`RestoreFramebufferBinding`:
+
+* the framebuffer binds and attachment mutations **replay on the main-thread context**;
+* the `glReadPixels` that consumes them **falls through to the dolphin worker's throwaway
+  1×1 context** (`EmscriptenWorker.cpp:424-430`, `renderViaOffscreenBackBuffer = true`,
+  `proxyContextToMainThread = PROXY_FALLBACK`).
+
+⇒ EFB readbacks read the **wrong context**, so the data is wrong, AND they are synchronous
+cross-thread proxied calls, so they are slow. This is exactly the shape of the measured
+census: **34 `GL_READ_FRAMEBUFFER` binds (`36008:fbo`) with `readPixels` = 0.**
+
+⚠ NOT a one-line fix, and not the same as the `bufferData` repair. A readback must RETURN
+pixels, so it cannot be a fire-and-forget ring command; it needs the blocking
+`Atomics.wait` ctrl round-trip that `getUniformLocation` / `getUniformBlockIndex` already use
+(`gl-record.js:64-81`). Both files are runtime-loaded, so still no rebuild — but it is a
+protocol addition, not an argument fix.
+⚠ NOT established: that this is on the per-frame GPU cost path. The readback executes on the
+*other* context, so a timer query on the replay context would not see it.
+
+### Where the framebuffer binds come from (census mapped to source)
+
+| census bucket | site | what it is |
+|---|---|---|
+| `36160:fbo` 253 | `OGLGfx.cpp:396` `OGLGfx::SetFramebuffer` | per-draw-group framebuffer retargeting — **80% of all binds** |
+| `36160:null` 28 | `OGLGfx.cpp:789-793` `RestoreFramebufferBinding` | restore-to-default after a copy |
+| `36008:fbo` 34 | `OGLGfx.cpp:781` `BindSharedReadFramebuffer` | the EFB→texture round trips above |
+
+`OGLTexture::BlitFramebuffer` (`OGLTexture.cpp:244-267`) costs THREE binds per blit plus two
+attachment mutations — but `blitFramebuffer` IS in the recorder surface and measured **0**,
+so that path never runs here. The readback path is the one that does.
+
+### Dropping `getError`: measured win, not yet a stability claim
+
+Removing it entirely took frames at equal elapsed from ~80 to ~350 (~4.4x). `render-worker.js`
+already documents why that should now be safe — the `texScratch` eager-copy *"severs the
+backlog at its source, so the heavy per-frame getError() sync can be dropped"* — and it was
+never dropped. ⚠ One run past the historical ~frame-40 fault is NOT stability. What would
+establish it: grep for the named failure signature (`texSubImage3D: ArrayBufferView not big
+enough`, then `webglcontextlost`, which `gamecube.html:2831` already listens for); ≥5 runs of
+≥2000 frames, headless AND headful; at least one different GPU/driver, since the fault is a
+driver resource-reclaim bug; confirm the eager-copy is live on this path; and **verify the
+extra frames carry content** — 4.4x more presents could be 4.4x more presents of incomplete
+buffers, which this campaign has already been fooled by once.
+
+⚠ CEILING, so nobody mistakes this for playability: real GPU cost per frame measured by
+`EXT_disjoint_timer_query_webgl2` caps this path near 5 fps regardless of the CPU side.
+Drawing is 0.13% of it (13.1 draws x ~0.020 per draw against ~197 per frame). Removing the
+sync is a multiplier on a number that is still an order of magnitude short.
+
 ## The open question
 
 
