@@ -341,9 +341,28 @@ const ARMS = [
     // n64/ never loads coi-serviceworker at all, so on that page this arm cannot
     // flip anything — and correctly so. It is skipped there rather than voided,
     // because "no change" IS the invariant being asserted for n64.
-    invariantFor: { n64: (a) => ({
-      ok: a.cap?.sab?.crossOriginIsolated === false,
-      detail: 'n64/ must be un-isolated with or without the service worker; it requires neither' }) },
+    // snes and gba are in EXACTLY n64's position and were voided until this was
+    // noticed: snes.html:9 and gba.html:15 both carry an explicit "NO
+    // /coi-serviceworker.js on purpose" comment — they are single-threaded cores
+    // that need neither COOP/COEP nor SAB.  Their crossOriginIsolated is false in
+    // the BASELINE too, so this arm has nothing to flip and correctly refuses a
+    // verdict.  That is a placebo cell, not a failure, and the honest expression
+    // of it is the same "no change IS the invariant" judge n64 already uses.
+    // ⚠ Not a timing race.  A first attempt widened the coi-reload settle on the
+    // theory their worker had not been CLAIMED yet; it changed nothing, because
+    // these pages register no worker at all.
+    invariantFor: {
+      n64: (a) => ({
+        ok: a.cap?.sab?.crossOriginIsolated === false,
+        detail: 'n64/ must be un-isolated with or without the service worker; it requires neither' }),
+      snes: (a) => ({
+        ok: a.cap?.sab?.crossOriginIsolated === false,
+        detail: 'snes.html:9 declines the coi worker on purpose (single-threaded snes9x_2005); '
+              + 'it must stay un-isolated and must still run' }),
+      gba: (a) => ({
+        ok: a.cap?.sab?.crossOriginIsolated === false,
+        detail: 'gba.html:15 declines the coi worker on purpose; it must stay un-isolated and still run' }),
+    },
   },
   {
     id: 'mobile-ios',
@@ -597,12 +616,24 @@ async function runCell(arm, pg) {
     out.coiSettle = await (async () => {
       for (let i = 0; i < 30; i++) {
         try {
-          const r = await page.evaluate(() => ({
-            coi: !!self.crossOriginIsolated,
-            ctl: !!(navigator.serviceWorker && navigator.serviceWorker.controller),
-          }));
-          if (r.coi || r.ctl) return { settled: true, ms: i * 200, coi: r.coi, ctl: r.ctl };
-          if (i >= 4) return { settled: false, ms: i * 200, coi: false, ctl: false, note: 'no SW on this page' };
+          const r = await page.evaluate(async () => {
+            let regs = -1;
+            try { regs = (await navigator.serviceWorker.getRegistrations()).length; } catch (_e) { regs = -1; }
+            return { coi: !!self.crossOriginIsolated,
+                     ctl: !!(navigator.serviceWorker && navigator.serviceWorker.controller),
+                     regs };
+          });
+          if (r.coi || r.ctl) return { settled: true, ms: i * 200, coi: r.coi, ctl: r.ctl, regs: r.regs };
+          // Bail early ONLY when the page genuinely has no service worker (n64 ships no
+          // coi-serviceworker by design).  A fixed 800ms bail was WRONG and cost two cells:
+          // snes and gba DO register the worker but had not been CLAIMED yet, so their
+          // baseline measured crossOriginIsolated=false, and the no-coi arm then had
+          // nothing to flip -> `false->false` -> VOID, a placebo verdict on a page that is
+          // actually fine.  Registration count, not the clock, is what distinguishes
+          // "no worker here" from "worker still activating".
+          if (i >= 4 && r.regs === 0) {
+            return { settled: false, ms: i * 200, coi: false, ctl: false, regs: 0, note: 'no SW on this page' };
+          }
         } catch (_e) { /* context destroyed == the reload; keep waiting */ }
         await new Promise((r) => setTimeout(r, 200));
       }
