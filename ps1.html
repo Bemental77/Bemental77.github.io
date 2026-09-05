@@ -22,6 +22,18 @@
     #controlBar select { padding: 8px 10px; border: 1px solid #444; background: #222; color: #eee; border-radius: 4px; font-size: 14px; min-height: 36px; }
     #canvasWrap { background: #000; display: flex; align-items: center; justify-content: center; flex: 1; width: 100%; max-width: 100vw; }
     #canvas { background: #000; image-rendering: pixelated; clip-path: inset(0 0 5.14% 0); width: 640px; height: 480px; max-width: 100%; max-height: 100%; }
+    /* TEN-FOOT VIEWING.  Consoles take the desktop branch (see isMobile), which pins
+       #canvas to 640x480 (:24) — 14.8% of a 1080p television.
+       ⚠ clip-path IS NOT REDECLARED HERE ON PURPOSE.  The `inset(0 0 5.14% 0)` overscan
+       crop at :24 applies to #canvas regardless of this rule, and :37 repeats it for the
+       mobile shell; overriding width/height alone leaves it intact.  Do not add a
+       clip-path here "for completeness" — a second declaration is a second thing to keep
+       in sync with :24 and :37.
+       aspect-ratio is explicit rather than left to `width:auto`: that resolves to the
+       INTRINSIC backing-store ratio, which measured 1.212 instead of 1.333 on gamecube
+       and shipped the exact stretch the rule was meant to prevent. */
+    .console-ua #canvas { width: auto; height: 100%; aspect-ratio: 4 / 3; max-width: 100%; max-height: 100%; }
+    @media (max-aspect-ratio: 4/3) { .console-ua #canvas { width: 100%; height: auto; aspect-ratio: 4 / 3; } }
     #canvasWrap:fullscreen, #canvasWrap:-webkit-full-screen { width: 100vw; height: 100vh; max-width: none; max-height: none; display: flex; align-items: center; justify-content: center; }
     #canvasWrap:fullscreen #canvas, #canvasWrap:-webkit-full-screen #canvas { width: auto; height: 100vh; max-width: 100vw; max-height: 100vh; }
     @media (min-aspect-ratio: 4/3) { #canvasWrap:fullscreen #canvas, #canvasWrap:-webkit-full-screen #canvas { width: calc(100vh * 4 / 3); } }
@@ -127,8 +139,26 @@
       width: 100%; height: 100%; min-width: 44px; min-height: 44px;
     }
 </style>
+  <!-- THE FLOOR NO RUNTIME GATE CAN REACH.  This page had no <noscript> at all, so a
+       visitor with JS disabled (blocked by an extension, or on a browser where the first
+       script threw) got the full shell — including an enabled-looking Start button that
+       does nothing when pressed.  That is the same "dead Start button" the capability
+       layer exists to prevent, reached before any JS can run to prevent it.  So the shell
+       is hidden by CSS the browser applies on its own, and one plain message is shown in
+       its place.  Ported verbatim from n64/index.html:162-180 — same shell ids. -->
+  <noscript><style>
+    #desktop, #mobileShell { display: none !important; }
+    #nojs { display: block !important; }
+  </style></noscript>
 </head>
 <body>
+<!-- Shown ONLY by the <noscript> stylesheet in <head>; invisible whenever JS runs. -->
+<div id="nojs" style="display:none;max-width:640px;margin:14vh auto;padding:0 22px;font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#ddd;">
+  <h1 style="font-size:20px;margin:0 0 10px;color:#fff;">JavaScript is turned off</h1>
+  <p style="margin:0 0 12px;">This page is an emulator: it compiles and runs a console's own code in your browser, so it cannot work without JavaScript and WebAssembly. There is no reduced version to fall back to.</p>
+  <p style="margin:0 0 12px;">Turn JavaScript on for this site — or allow it in your content blocker — and reload. If you are in a private window with scripting restricted, a normal window will work.</p>
+  <p style="margin:0;"><a href="/" style="color:#7ab7ff;">Back to the rest of the site</a></p>
+</div>
 <div id="desktop">
   <h3 id="title">PS1 Wasm</h3>
   <div id="controlBar">
@@ -221,7 +251,21 @@
   function pageLog(s) { if (logEl) { logEl.textContent += s + '\n'; logEl.scrollTop = logEl.scrollHeight; } console.log(s); }
   function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
   function toast(msg, isErr) { toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200); }
-  const isMobile = (() => { const ua = navigator.userAgent.toLowerCase(); return /iphone|ipad|ipod|android|mobile|xbox/.test(ua) || ('ontouchstart' in window) || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile'); })();
+  // A CONSOLE IS NOT A TOUCH DEVICE.  ps1 already had the back-nav trap (:702-712) —
+  // it is the page the other four were ported FROM — but it still classified an Xbox
+  // as mobile and handed a gamepad-only device a finger shell.
+  const isMobile = (() => {
+    const ua = navigator.userAgent.toLowerCase();
+    const console_ = /\bxbox\b|\bplaystation\b|\bnintendo\b/.test(ua);
+    if (console_ && !('ontouchstart' in window)) return new URLSearchParams(location.search).has('mobile');
+    return /iphone|ipad|ipod|android|mobile/.test(ua) || ('ontouchstart' in window)
+        || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile');
+  })();
+  if (/\bXbox\b|\bPlayStation\b|\bNintendo\b|\bSmartTV\b|\bTizen\b|Web0S|\bAFT[A-Z]/i
+      .test(String(navigator.userAgent || ''))) {
+    try { document.documentElement.classList.add('console-ua'); } catch (e) {}
+  }
+
   var do_iter = true;
   // keyboardListeningElement scopes SDL's keydown/keyup capture to the canvas only,
   // so document-level events (including any system gestures Xbox Edge dispatches) aren't

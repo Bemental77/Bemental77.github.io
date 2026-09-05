@@ -122,8 +122,26 @@
       width: 100%; height: 100%; min-width: 44px; min-height: 44px;
     }
 </style>
+  <!-- THE FLOOR NO RUNTIME GATE CAN REACH.  This page had no <noscript> at all, so a
+       visitor with JS disabled (blocked by an extension, or on a browser where the first
+       script threw) got the full shell — including an enabled-looking Start button that
+       does nothing when pressed.  That is the same "dead Start button" the capability
+       layer exists to prevent, reached before any JS can run to prevent it.  So the shell
+       is hidden by CSS the browser applies on its own, and one plain message is shown in
+       its place.  Ported verbatim from n64/index.html:162-180 — same shell ids. -->
+  <noscript><style>
+    #desktop, #mobileShell { display: none !important; }
+    #nojs { display: block !important; }
+  </style></noscript>
 </head>
 <body>
+<!-- Shown ONLY by the <noscript> stylesheet in <head>; invisible whenever JS runs. -->
+<div id="nojs" style="display:none;max-width:640px;margin:14vh auto;padding:0 22px;font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#ddd;">
+  <h1 style="font-size:20px;margin:0 0 10px;color:#fff;">JavaScript is turned off</h1>
+  <p style="margin:0 0 12px;">This page is an emulator: it compiles and runs a console's own code in your browser, so it cannot work without JavaScript and WebAssembly. There is no reduced version to fall back to.</p>
+  <p style="margin:0 0 12px;">Turn JavaScript on for this site — or allow it in your content blocker — and reload. If you are in a private window with scripting restricted, a normal window will work.</p>
+  <p style="margin:0;"><a href="/" style="color:#7ab7ff;">Back to the rest of the site</a></p>
+</div>
 <div id="desktop">
   <h3 id="title">SNES Wasm</h3>
   <div id="banner"></div>
@@ -228,10 +246,30 @@
   const isMobile = (() => {
     const ua = navigator.userAgent.toLowerCase();
     const touch = (navigator.maxTouchPoints || 0) > 0 || ('ontouchstart' in window);
-    return /iphone|ipad|ipod|android|mobile|xbox/.test(ua)
+    // A CONSOLE IS NOT A TOUCH DEVICE.  `xbox` was a token here, so a gamepad-only
+    // device with no touchscreen was served the finger shell.  snes needs NO
+    // .console-ua canvas rule: #canvas (:31) is already height:100%/width:auto with
+    // an explicit aspect-ratio 4/3, which is the pattern the other four pages were
+    // just corrected TO.  Token + back-nav trap only.
+    const console_ = /\bxbox\b|\bplaystation\b|\bnintendo\b/.test(ua);
+    if (console_ && !touch) return new URLSearchParams(location.search).has('mobile');
+    return /iphone|ipad|ipod|android|mobile/.test(ua)
         || (touch && Math.min(window.innerWidth, window.innerHeight) < 600)
         || new URLSearchParams(location.search).has('mobile');
   })();
+  if (/\bXbox\b|\bPlayStation\b|\bNintendo\b|\bSmartTV\b|\bTizen\b|Web0S|\bAFT[A-Z]/i
+      .test(String(navigator.userAgent || ''))) {
+    try { document.documentElement.classList.add('console-ua'); } catch (e) {}
+  }
+  // XBOX EDGE BACK-NAV TRAP.  snes.html had NONE (grep -c BrowserBack = 0), so L3
+  // (btn 10) unloaded a running emulator.  Port of ps1.html:702-712, both halves.
+  try { history.pushState({ snes: 1 }, ''); } catch (e) {}
+  window.addEventListener('popstate', function () { try { history.pushState({ snes: 1 }, ''); } catch (_) {} });
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'BrowserBack' || e.key === 'BrowserForward' || e.key === 'GoBack') {
+      e.preventDefault(); e.stopPropagation();
+    }
+  }, true);
 
   (function populateRomSelect() {
     [$('romSelect'), $('mobileRomSelect')].filter(Boolean).forEach(function (sel) {

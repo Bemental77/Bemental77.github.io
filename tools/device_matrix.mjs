@@ -94,6 +94,22 @@ const PAGES = [
   // WebGPU, no worker. If an arm breaks this page, the arm broke something
   // universal — which makes it the control for every other row.
   { id: 'n64', url: '/n64/', spec: { wasm: 'required', webgl2: 'required' } },
+  // ps1 and snes are here for the CONSOLE arm specifically.  Both carried the same
+  // `xbox`-in-isMobile defect as the three above, and neither was covered by any
+  // console-aware harness: tools/legacy_emu_page_test.mjs does cover them, but it
+  // asserts boot / guest-rate / input across desktop+iPhone+Android only — it has no
+  // console UA arm and no layout or back-trap assertion.
+  // Adding them was CHEAP and required no new machinery: both already load
+  // lib/capability.js (ps1.html:4, snes.html:4) and already call
+  // Capability.autoGate(Capability.SPECS.ps1|snes) (ps1.html:788, snes.html:620), and
+  // those specs already existed at lib/capability.js:982-984.  The console probe's
+  // PAIRS already contains ['canvas','canvasWrap'], which is exactly their markup
+  // (ps1.html:144, snes.html:140), and visAny(['wrap','desktop']) matches their
+  // desktop containers (ps1.html:132, snes.html:127).
+  // ⚠ CLAUDE.md states only gamecube/dreamcast/n64 load capability.js.  That is STALE —
+  // verified against the live files on 2026-09-05.
+  { id: 'ps1',  url: '/ps1.html',  spec: { wasm: 'required' } },
+  { id: 'snes', url: '/snes.html', spec: { wasm: 'required' } },
 ];
 
 // ---------------------------------------------------------------------------
@@ -186,6 +202,42 @@ const ARMS = [
                        + `shell=${c.shellShown} parent=${c.canvasParent} `
                        + `backTrap{swallowed=${b.keySwallowed} sentinel=${b.sentinel}} `
                        + `(4:3 display aspect, NOT the 640x528=1.2121 backing store)` };
+      },
+      // ps1 already had the back-nav trap (:702-712) — it is the page the others were
+      // ported FROM — so its console defect was the isMobile token plus a canvas pinned
+      // at 640x480 (:24).  Its `clip-path: inset(0 0 5.14% 0)` overscan crop is NOT
+      // asserted here: getBoundingClientRect reports the LAYOUT box and ignores
+      // clip-path, so `ratio` measures the element (4:3) and could not see the crop
+      // either way.  The crop is left declared once, at :24.
+      ps1: (a) => {
+        const c = a.dcConsole || {}, b = a.backTrap || {};
+        const ok = c.consoleClass === true && c.fillsWrapH === true
+                && Math.abs((c.ratio || 0) - 1.3333) < 0.02
+                && c.wrapShown === true && c.shellShown === false
+                && c.canvasParent === 'canvasWrap'
+                && b.keySwallowed === true && b.sentinel === true;
+        return { ok,
+                 detail: `console-ua=${c.consoleClass} canvas ${c.canvasW}x${c.canvasH} `
+                       + `fillsWrapH=${c.fillsWrapH} ratio=${c.ratio} desktop=${c.wrapShown} `
+                       + `shell=${c.shellShown} backTrap{swallowed=${b.keySwallowed} `
+                       + `sentinel=${b.sentinel}} (ratio is the layout box; clip-path is invisible to it)` };
+      },
+      // snes is the ONLY page that needed no .console-ua rule: snes.html:31 already
+      // ships `height:100%; width:auto; aspect-ratio:4/3`, the very pattern the other
+      // four were corrected TO.  It DID need the back-nav trap — it had none at all
+      // (grep -c BrowserBack snes.html = 0 before this change), so backTrap is the
+      // load-bearing half of this judge.
+      snes: (a) => {
+        const c = a.dcConsole || {}, b = a.backTrap || {};
+        const ok = c.consoleClass === true && c.fillsWrapH === true
+                && Math.abs((c.ratio || 0) - 1.3333) < 0.02
+                && c.wrapShown === true && c.shellShown === false
+                && b.keySwallowed === true && b.sentinel === true;
+        return { ok,
+                 detail: `console-ua=${c.consoleClass} canvas ${c.canvasW}x${c.canvasH} `
+                       + `fillsWrapH=${c.fillsWrapH} ratio=${c.ratio} desktop=${c.wrapShown} `
+                       + `shell=${c.shellShown} backTrap{swallowed=${b.keySwallowed} `
+                       + `sentinel=${b.sentinel}} (no .console-ua rule by design — :31 already scales)` };
       },
       dreamcast: (a) => {
         const c = a.dcConsole || {};
@@ -430,6 +482,11 @@ async function runCell(arm, pg) {
   try {
     browser = await puppeteer.launch({
       headless: 'new', executablePath: CHROME, userDataDir: dir,
+      // page.setDefaultTimeout below covers waitFor*/navigation but NOT page.evaluate;
+      // an evaluate is bounded only by CDP protocolTimeout, whose default is 180 s.  A
+      // dozen of those in the cell path is a quarter-hour of apparent silence.  120 s is
+      // still far above any legitimate evaluate here and turns a wedge into an error.
+      protocolTimeout: 120000,
       args: ['--no-sandbox', '--disable-dev-shm-usage', ...(arm.args || [])],
     });
     // [leak-guard] a SIGKILLed parent ORPHANS this browser (uncatchable in-process);
@@ -620,7 +677,7 @@ async function runCell(arm, pg) {
         window.dispatchEvent(ev);
         const st = history.state || {};
         return { keySwallowed: ev.defaultPrevented,
-                 sentinel: !!(st.dc || st.gc || st.n64 || st.ps1 || st.emu),
+                 sentinel: !!(st.dc || st.gc || st.n64 || st.ps1 || st.snes || st.emu),
                  sentinelKeys: Object.keys(st).join(',') };
       } catch (e) { return { error: String(e).slice(0, 120) }; }
     }).catch(() => null);
@@ -988,9 +1045,16 @@ async function redirectTest() {
 // rig that polled for `window.__capTest` once latched a 1-assertion result and
 // called it clean.
 // ---------------------------------------------------------------------------
-async function captestRun() {
+async function captestRun(pageList) {
   const out = { pages: {}, ok: true };
-  for (const pg of PAGES) {
+  // ⚠ `pageList`, NOT the module-level PAGES const.  This loop and noJsTest's used to
+  // read PAGES directly, so `--page=snes` still booted EVERY page here — twice, once per
+  // phase — before the first console.log (:1274 area) could print anything.  With 3 pages
+  // that was merely wasteful; adding ps1 and snes made it 5, and a single-page run looked
+  // like a HANG: zero output for 16m35s, killed by hand, its Chrome orphaned.  It was
+  // never an unbounded wait — each evaluate is bounded by CDP protocolTimeout (180 s
+  // default) and ~12 of them per wedged page is exactly that duration.
+  for (const pg of (pageList || PAGES)) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dmx-ct-${pg.id}-`));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
       args: ['--no-sandbox', '--disable-dev-shm-usage'] });
@@ -1025,9 +1089,9 @@ async function captestRun() {
 // an enabled-looking Start button that does nothing when pressed, which is the
 // same dead button the runtime gate exists to prevent.
 // ---------------------------------------------------------------------------
-async function noJsTest() {
+async function noJsTest(pageList) {
   const out = { pages: {}, ok: true };
-  for (const pg of PAGES) {
+  for (const pg of (pageList || PAGES)) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dmx-nojs-${pg.id}-`));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
       args: ['--no-sandbox', '--disable-dev-shm-usage'] });
@@ -1181,8 +1245,8 @@ async function main() {
 
   result.rig = await rigSelfTest();
   result.redirect = await redirectTest();
-  result.captest = await captestRun();
-  result.nojs = await noJsTest();
+  result.captest = await captestRun(pages);
+  result.nojs = await noJsTest(pages);
 
   // Cells run SERIALLY. Concurrent Chrome instances contend for CPU, and this
   // project has measured matched-pair noise at +-25% under load (CLAUDE.md gate
