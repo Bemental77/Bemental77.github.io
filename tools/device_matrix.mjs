@@ -115,6 +115,93 @@ const ARMS = [
     },
   },
   {
+    id: 'console',
+    what: 'A living-room console browser (Xbox Series X|S Edge): gamepad only, NO touchscreen, '
+        + '1920x1080 at ten feet. Reported by the owner as "the controls for dreamcast are broken". '
+        + 'The page used to classify this UA as MOBILE and serve it a finger shell.',
+    args: [],
+    // setUserAgent does NOT set Client Hints — navigator.userAgentData keeps the
+    // host values. Harmless today because dreamcast.html:797 reads the userAgent
+    // STRING, but a future UA-CH check would silently un-arm this cell.
+    ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; Xbox; Xbox Series X) AppleWebKit/537.36 '
+      + '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0',
+    // hasTouch:false is deliberate, not incidental: it makes the touch-target
+    // assertions below skip correctly for a touchless device, and dcInput's pad
+    // assertion becomes this arm's control check instead.
+    // ⚠ No arm overrides deviceMemory, so this cell gets the HOST's value. With
+    // CONSOLE_UA true that makes MEM_BUDGET min(mem*0.45, 450) = 450 MB and arms
+    // budgetForces/lazydisc — irrelevant while this arm boots nothing, a confound
+    // the moment it does.
+    viewport: { width: 1920, height: 1080, deviceScaleFactor: 1, hasTouch: false, isMobile: false },
+    // TWO-LEVEL PROOF, because judge() calls arm.proof PER PAGE and only
+    // dreamcast has a #dc-canvas — a canvas-only proof VOIDs the gamecube and
+    // n64 cells, which is what the first version of this arm did.
+    //   proof        : universal, holds on every page — the viewport took and the
+    //                  device is still touchless. Deliberately NOT
+    //                  __dcProbe().consoleUA, which is the page echoing back the
+    //                  UA we just set and therefore proves only that the UA took.
+    //   invariantFor : the page-specific, and much stronger, dreamcast assertion.
+    proof: (b, a) => {
+      const vw = b.cap?.env?.vw !== a.cap?.env?.vw && a.cap?.env?.vw === 1920;
+      const touchless = a.cap?.env?.touch === false;
+      return { ok: !!(vw && touchless),
+               detail: `viewport ${b.cap?.env?.vw}->${a.cap?.env?.vw} (must reach 1920), `
+                     + `touch ${a.cap?.env?.touch} (a console has none)` };
+    },
+    invariantFor: {
+      // n64 reads pads NATIVELY in the core (n64/index.html:2624 — emscripten HTML5
+      // gamepad API + config.txt), so there is no page-side pad seam to assert here;
+      // the canvas is the whole of n64's console fix.  Its canvas is 640x480 = exactly
+      // 4:3.
+      // ⚠ CORRECTION.  This comment used to say gamecube's is "640x528 = 1.2121 and must
+      // NOT reuse this number".  That conflated two different quantities: 640x528 is
+      // gamecube's BACKING STORE (gamecube.html:188), while its DISPLAY aspect is 4:3 —
+      // gamecube.html:58-59's own :fullscreen rules letterbox at 4/3.  Asserting 1.2121
+      // would have pinned a ~10% vertical stretch into this gate as "correct".  All three
+      // pages assert 4:3 here; they differ in backing store, not in display aspect.
+      n64: (a) => {
+        const c = a.dcConsole || {};
+        const ok = c.consoleClass === true && c.fillsWrapH === true
+                && Math.abs((c.ratio || 0) - 1.3333) < 0.02
+                && c.wrapShown === true && c.shellShown === false;
+        return { ok,
+                 detail: `console-ua=${c.consoleClass} canvas ${c.canvasW}x${c.canvasH} `
+                       + `fillsWrapH=${c.fillsWrapH} ratio=${c.ratio} wrap=${c.wrapShown} `
+                       + `shell=${c.shellShown} (n64 is 640x480, exactly 4:3)` };
+      },
+      // gamecube got the SAME two-part console fix (token + .console-ua) plus a THIRD
+      // part the other pages already had: a back-nav trap.  It had zero guards of any
+      // kind, so L3 on an Xbox pad unloaded a running emulator.  Hence backTrap is part
+      // of gamecube's pass criterion and not merely reported.
+      gamecube: (a) => {
+        const c = a.dcConsole || {}, b = a.backTrap || {};
+        const ok = c.consoleClass === true && c.fillsWrapH === true
+                && Math.abs((c.ratio || 0) - 1.3333) < 0.02
+                && c.wrapShown === true && c.shellShown === false
+                && c.canvasParent === 'canvasWrap'
+                && b.keySwallowed === true && b.sentinel === true;
+        return { ok,
+                 detail: `console-ua=${c.consoleClass} canvas ${c.canvasW}x${c.canvasH} `
+                       + `fillsWrapH=${c.fillsWrapH} ratio=${c.ratio} desktop=${c.wrapShown} `
+                       + `shell=${c.shellShown} parent=${c.canvasParent} `
+                       + `backTrap{swallowed=${b.keySwallowed} sentinel=${b.sentinel}} `
+                       + `(4:3 display aspect, NOT the 640x528=1.2121 backing store)` };
+      },
+      dreamcast: (a) => {
+        const c = a.dcConsole || {};
+        const ok = c.consoleClass === true && c.fillsWrapH === true
+                && Math.abs((c.ratio || 0) - 1.333) < 0.02
+                && c.wrapShown === true && c.shellShown === false
+                && c.canvasParent === 'canvasWrap';
+        return { ok,
+                 detail: `console-ua=${c.consoleClass} canvas ${c.canvasW}x${c.canvasH} `
+                       + `fillsWrapH=${c.fillsWrapH} ratio=${c.ratio} wrap=${c.wrapShown} `
+                       + `shell=${c.shellShown} parent=${c.canvasParent} `
+                       + `(a console must get the DESKTOP shell and a canvas that fills it at 4:3)` };
+      },
+    },
+  },
+  {
     id: 'no-webgpu',
     what: 'WebGPU removed, GPU otherwise intact — the realistic "my browser has no WebGPU" device '
         + '(Firefox, older Safari, enterprise policy). This is the arm for the GameCube black screen.',
@@ -510,6 +597,118 @@ async function runCell(arm, pg) {
         const p = window.__dcProbe();
         return { started: !!(p.boot && p.boot.started), gatedBy: (p.boot && p.boot.gatedBy) || null,
                  heapMaxMB: (p.heap && p.heap.max) | 0 };
+      } catch (e) { return { error: String(e).slice(0, 120) }; }
+    }).catch(() => null);
+
+    // ---- DREAMCAST INPUT, IN EVERY ARM --------------------------------------
+    // These four facts are UA-INDEPENDENT, so they belong here and not in the
+    // console arm: a mapping or trap regression on DESKTOP must not slip through
+    // because the assertion was scoped to a console. Pages that publish no
+    // __dcPad witness report null and are judged as before, exactly like
+    // out.boot above. Costs no emulator boot — packPad() is pure.
+    // ---- THE BACK-NAV TRAP, ON EVERY PAGE (not just dreamcast) --------------
+    // Lives OUTSIDE dcInput because dcInput gates on window.__dcPad, which only
+    // dreamcast has — so gamecube's brand-new trap would have gone unmeasured and
+    // the cell would have passed on an untested guard.  Each page pushes its own
+    // sentinel key (dreamcast `dc`, gamecube `gc`), so accept any of them rather
+    // than hardcoding one page's spelling.
+    // ⚠ Proves the PAGE swallows the event and keeps a history entry.  It does NOT
+    // prove Edge routes L3 to BrowserBack — that is shell behaviour, hardware-only.
+    out.backTrap = await page.evaluate(() => {
+      try {
+        const ev = new KeyboardEvent('keydown', { key: 'BrowserBack', bubbles: true, cancelable: true });
+        window.dispatchEvent(ev);
+        const st = history.state || {};
+        return { keySwallowed: ev.defaultPrevented,
+                 sentinel: !!(st.dc || st.gc || st.n64 || st.ps1 || st.emu),
+                 sentinelKeys: Object.keys(st).join(',') };
+      } catch (e) { return { error: String(e).slice(0, 120) }; }
+    }).catch(() => null);
+
+    out.dcInput = await page.evaluate(() => {
+      try {
+        if (typeof window.__dcPad !== 'function') return null;
+        const r = {};
+
+        // FIX 1, BOTH HALVES. dreamcast.html's Xbox trap is two mechanisms and a
+        // keydown assertion only covers one: the capture-phase listener swallows
+        // the synthetic BrowserBack, AND a history sentinel is pushed and
+        // re-pushed on popstate. Without the `sentinel` cell the re-push could be
+        // deleted and every row here would still pass.
+        // ⚠ This proves the PAGE's trap. It does NOT prove Edge actually routes
+        // L3 to BrowserBack — that is shell behaviour and is hardware-only.
+        const ev = new KeyboardEvent('keydown', { key: 'BrowserBack', bubbles: true, cancelable: true });
+        window.dispatchEvent(ev);
+        r.backTrap = { keySwallowed: ev.defaultPrevented,
+                       sentinel: !!(history.state && history.state.dc) };
+
+        // FIX 3. Three button classes for the price of one: face, system, d-pad.
+        // RB ids from dreamcast.html: B=0 START=3 UP=4 -> byte = id>>3, bit = id&7.
+        // ⚠ RESTORED AFTERWARDS (gate #8: diagnostics must not accumulate) — this
+        // overrides a page-realm global and other assertions share this page.
+        const orig = navigator.getGamepads;
+        try {
+          const fake = { id: 'MatrixPad', index: 0, mapping: 'standard', connected: true, timestamp: 1,
+            buttons: Array.from({ length: 17 }, () => ({ pressed: false, value: 0, touched: false })),
+            axes: [0, 0, 0, 0] };
+          navigator.getGamepads = () => [fake];
+          const press = (i) => { fake.buttons.forEach((b) => (b.pressed = false));
+                                 fake.buttons[i].pressed = true; return window.__dcPad(); };
+          r.padMap = { btn0_B: !!(press(0)[0] & 0x01),
+                       btn9_START: !!(press(9)[0] & 0x08),
+                       btn12_UP: !!(press(12)[0] & 0x10) };
+        } finally { navigator.getGamepads = orig; }
+
+        // FIX 5. A console visitor has no keyboard; the controls panel must
+        // document the pad. Static markup, so every arm can assert it.
+        const t = document.querySelector('#controlsOverlay table');
+        const head = t ? [...t.querySelectorAll('tr')][0] : null;
+        r.controlsGamepadCol = !!(head && /gamepad/i.test(head.textContent || ''));
+        return r;
+      } catch (e) { return { error: String(e).slice(0, 120) }; }
+    }).catch(() => null);
+
+    // ---- DREAMCAST ON A CONSOLE: THE SHELL AND CANVAS DELTAS ----------------
+    // These DO vary with the arm and are the console arm's arm-difference proof.
+    // __dcProbe().consoleUA is deliberately NOT the proof: it is the page echoing
+    // back the UA string the harness just set, so it shows the UA took, not that
+    // anything changed. The canvas dimensions and the shell flip are real deltas.
+    //
+    // ⚠ height-equality holds only while the viewport is WIDER than 4:3. The
+    // stylesheet carries a `@media (max-aspect-ratio: 4/3)` branch that flips to
+    // width:100%/height:auto, where equal heights would fail legitimately. The
+    // console arm pins 1920x1080 (aspect 1.78) so the wide branch applies; the
+    // 4:3 ratio cell is the viewport-independent half and catches a stretch.
+    out.dcConsole = await page.evaluate(() => {
+      try {
+        // Each page names its canvas and wrapper differently, and the EXPECTED RATIO
+        // differs too — gamecube is 640x528 (1.2121), not 4:3.  The ratio is asserted
+        // per page in invariantFor, not here; this only reports what it measured.
+        const PAIRS = [['dc-canvas', 'canvasWrap'], ['canvas', 'canvasDiv'], ['canvas', 'canvasWrap']];
+        let c = null, w = null;
+        for (const [ci, wi] of PAIRS) {
+          const cc = document.getElementById(ci), ww = document.getElementById(wi);
+          if (cc && ww) { c = cc; w = ww; break; }
+        }
+        if (!c || !w) return null;
+        const cr = c.getBoundingClientRect(), wr = w.getBoundingClientRect();
+        // The DESKTOP CONTAINER id differs per page — dreamcast/gamecube call it
+        // `wrap`, n64 calls it `desktop` (n64/index.html:2689 hides $('desktop')).
+        // Asserting dreamcast's id everywhere reports null and VOIDs a page that is
+        // actually correct, which is what the first version of this did.
+        const vis = (id) => { const e = document.getElementById(id);
+                              return e ? getComputedStyle(e).display !== 'none' : null; };
+        const visAny = (ids) => { for (const id of ids) { const v = vis(id); if (v !== null) return v; }
+                                  return null; };
+        return {
+          canvasW: Math.round(cr.width), canvasH: Math.round(cr.height),
+          wrapH: Math.round(wr.height),
+          fillsWrapH: Math.abs(cr.height - wr.height) <= 1,
+          ratio: cr.height ? +(cr.width / cr.height).toFixed(3) : null,
+          consoleClass: document.documentElement.classList.contains('console-ua'),
+          wrapShown: visAny(['wrap', 'desktop']), shellShown: vis('mobileShell'),
+          canvasParent: c.parentElement ? c.parentElement.id : null,
+        };
       } catch (e) { return { error: String(e).slice(0, 120) }; }
     }).catch(() => null);
 

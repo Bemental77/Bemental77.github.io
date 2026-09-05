@@ -60,6 +60,14 @@
     #canvasDiv:fullscreen #canvas, #canvasDiv:-webkit-full-screen #canvas { width: auto; height: 100vh; max-width: 100vw; max-height: 100vh; }
     @media (min-aspect-ratio: 4/3) { #canvasDiv:fullscreen #canvas, #canvasDiv:-webkit-full-screen #canvas { width: calc(100vh * 4 / 3); } }
     @media (max-aspect-ratio: 4/3) { #canvasDiv:fullscreen #canvas, #canvasDiv:-webkit-full-screen #canvas { width: 100vw; height: calc(100vw * 3 / 4); } }
+    /* TEN-FOOT VIEWING.  Consoles take the desktop branch (see isMobile), so they no
+       longer get #mobileScreen's full-screen canvas above — without this they get
+       #canvas pinned at 640x480 on a 1920x1080 television.  Same 4:3 letterbox maths
+       as the :fullscreen rules directly above, reused rather than re-derived.  N64 is
+       640x480, i.e. exactly 4:3 — do NOT copy this ratio to gamecube.html, whose
+       canvas is 640x528 (1.2121). */
+    .console-ua #canvas { width: auto; height: 100%; max-width: 100%; max-height: 100%; aspect-ratio: 4 / 3; }
+    @media (max-aspect-ratio: 4/3) { .console-ua #canvas { width: 100%; height: auto; aspect-ratio: 4 / 3; } }
     #mobileShell:fullscreen, #mobileShell:-webkit-full-screen { width: 100vw; height: 100vh; }
     #statusBar { display: flex; gap: 16px; font-size: 12px; color: #888; font-family: monospace; }
     #keyLegend { font-size: 11px; color: #666; font-family: monospace; text-align: center; max-width: 820px; }
@@ -1578,7 +1586,26 @@ N64Rate.selfTest = function (logFn) {
   }
   function setStatus(t) { if (statusEl) statusEl.textContent = t; if (mobileStatusEl) mobileStatusEl.textContent = t; }
   function toast(msg, isErr) { toastEl.textContent = msg; toastEl.classList.toggle('err', !!isErr); toastEl.classList.add('show'); clearTimeout(toast._t); toast._t = setTimeout(() => toastEl.classList.remove('show'), 2200); }
-  const isMobile = (() => { const ua = navigator.userAgent.toLowerCase(); return /iphone|ipad|ipod|android|mobile|xbox/.test(ua) || ('ontouchstart' in window) || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile'); })();
+  // A CONSOLE IS NOT A TOUCH DEVICE.  The regex used to contain `xbox`, so an Xbox
+  // (gamepad, no touchscreen) took the mobile branch and was handed a finger shell.
+  // Same defect and same fix as dreamcast.html, where it was measured under an Xbox UA.
+  // ⚠ TWO-PART CHANGE, not one token: the mobile branch also supplies a FULL-SCREEN
+  // canvas (#mobileScreen canvas at :70, height:100%/width:auto), while the desktop
+  // path pins #canvas to 640x480 (:58).  Removing the token alone would take the
+  // console off a full-screen picture and drop it on a 640px box on a television.
+  // The .console-ua rule beside the fullscreen block restores the size.
+  const isMobile = (() => {
+    const ua = navigator.userAgent.toLowerCase();
+    const console_ = /\bxbox\b|\bplaystation\b|\bnintendo\b/.test(ua);
+    const touchUA = /iphone|ipad|ipod|android|mobile/.test(ua);
+    if (console_ && !('ontouchstart' in window)) return new URLSearchParams(location.search).has('mobile');
+    return touchUA || ('ontouchstart' in window) || window.innerWidth < 720
+        || new URLSearchParams(location.search).has('mobile');
+  })();
+  if (/\bXbox\b|\bPlayStation\b|\bNintendo\b|\bSmartTV\b|\bTizen\b|Web0S|\bAFT[A-Z]/i
+      .test(String(navigator.userAgent || ''))) {
+    try { document.documentElement.classList.add('console-ua'); } catch (e) {}
+  }
 
   // ---- capability probe, run on EVERY load before anything can fail -----------------------
   // The N64 core is linked -s MIN_WEBGL_VERSION=2 -s FULL_ES3=1 (N64Wasm/code/Makefile:187-188)

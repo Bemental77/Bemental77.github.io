@@ -54,6 +54,16 @@
     #canvasWrap:fullscreen #dc-canvas, #canvasWrap:-webkit-full-screen #dc-canvas { width: auto; height: 100vh; max-width: 100vw; max-height: 100vh; }
     @media (min-aspect-ratio: 4/3) { #canvasWrap:fullscreen #dc-canvas, #canvasWrap:-webkit-full-screen #dc-canvas { width: calc(100vh * 4 / 3); } }
     @media (max-aspect-ratio: 4/3) { #canvasWrap:fullscreen #dc-canvas, #canvasWrap:-webkit-full-screen #dc-canvas { width: 100vw; height: calc(100vw * 3 / 4); } }
+    /* TEN-FOOT VIEWING.  Consoles no longer take the touch shell (see isMobile below),
+       which means they no longer get #mobileScreen's full-screen canvas above — they get
+       #dc-canvas pinned at 640x480, which is 14.8% of a 1920x1080 television.  That was a
+       regression introduced BY the correct controls fix, so it is repaired here rather
+       than by reverting it.  Same 4:3 letterbox maths as the :fullscreen rules above,
+       reused rather than re-derived.  Scoped to consoles on purpose: a desktop monitor at
+       arm's length may genuinely want the 1:1 pixelated box, and that intent is
+       unverified — desktop is deliberately left alone. */
+    .console-ua #dc-canvas { width: auto; height: 100%; max-width: 100%; max-height: 100%; aspect-ratio: 4 / 3; }
+    @media (max-aspect-ratio: 4/3) { .console-ua #dc-canvas { width: 100%; height: auto; aspect-ratio: 4 / 3; } }
     #fpsBar { font-size: 13px; color: #8f8; min-height: 16px; text-align: center;
               font-family: ui-monospace, Menlo, monospace; }
     /* Two independent numbers, never merged into one "FPS": the GUEST rate
@@ -393,7 +403,28 @@
     <button id="btnControls" type="button">🎮 Controls</button>
     <div id="controlsOverlay" style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.72);align-items:center;justify-content:center;">
       <div style="background:#1b1b1f;color:#eee;border:1px solid #444;border-radius:10px;padding:20px 26px;max-width:460px;font:14px/1.7 system-ui,sans-serif;box-shadow:0 8px 40px rgba(0,0,0,.6);">
-        <div style="font-size:18px;font-weight:600;margin-bottom:12px;">🎮 Keyboard Controls</div>
+        <div style="font-size:18px;font-weight:600;margin-bottom:12px;">🎮 Controls</div>
+        <!-- GAMEPAD COLUMN.  On a console the pad is the ONLY input, and this panel used to
+             list keyboard keys exclusively — a visitor with no keyboard could not discover
+             how to play.  EVERY ROW BELOW IS MEASURED, not transcribed: window.__dcPad()
+             was driven with a synthetic standard-mapping pad and the resulting bytes read
+             back (gate #6).  RB ids are RETROPAD ids; the Dreamcast labels come from the
+             page's own KEYMAP comments ([RB.B]:'m' // DC_A = CONFIRM, [RB.A]:'k' // DC_B).
+             Xbox X/Y land on RB.Y/RB.X because RetroPad transposes X and Y relative to an
+             Xbox pad — that is position-correct, and it is exactly why this column exists. -->
+        <table style="width:100%;border-collapse:collapse;margin-bottom:10px;">
+          <tr style="color:#9ad;font-weight:600;"><td>Gamepad</td><td>Dreamcast</td><td>Keyboard</td></tr>
+          <tr><td>Left Stick</td><td>Analog stick</td><td>Arrow Keys</td></tr>
+          <tr><td>D-pad</td><td>D-pad</td><td>W A S D</td></tr>
+          <tr><td>A</td><td>A — confirm</td><td>M</td></tr>
+          <tr><td>B</td><td>B — cancel</td><td>K</td></tr>
+          <tr><td>X</td><td>Y</td><td>N</td></tr>
+          <tr><td>Y</td><td>X</td><td>J</td></tr>
+          <tr><td>LT / RT</td><td>L / R triggers</td><td>Q / E</td></tr>
+          <tr><td>☰ Menu</td><td>Start</td><td>Enter</td></tr>
+          <tr style="color:#888;"><td>Stick click (L3)</td><td colspan="2">nothing — trapped so it cannot exit the page</td></tr>
+          <tr style="color:#888;"><td>View</td><td colspan="2">taken by the Xbox browser; the Dreamcast has no Select</td></tr>
+        </table>
         <table style="border-collapse:collapse;width:100%;">
           <tr><td style="padding:3px 0;color:#8bd;">Move&nbsp;(stick + d-pad)</td><td style="text-align:right;"><b>W&nbsp; A&nbsp; S&nbsp; D</b></td></tr>
           <tr><td style="padding:3px 0;color:#8bd;">Analog Stick</td><td style="text-align:right;"><b>Arrow Keys</b></td></tr>
@@ -796,6 +827,9 @@
   // `Windows NT 10.0; Win64; x64` block, so naive sniffing sees desktop Edge.
   const CONSOLE_UA = /\bXbox\b|\bPlayStation\b|\bNintendo\b|\bSmartTV\b|\bTizen\b|Web0S|\bAFT[A-Z]/i
     .test(String(navigator.userAgent || ''));
+  // Arms the .console-ua canvas scaling in the stylesheet.  Set from the SAME predicate
+  // that drives the memory budget, so "is this a console" is decided in one place.
+  if (CONSOLE_UA) { try { document.documentElement.classList.add('console-ua'); } catch (e) {} }
   // ---------------------------------------------------------------------------
   // DEVICE MEMORY BUDGET — the page sizes itself to the machine it landed on.
   //
@@ -3793,6 +3827,40 @@
                            RB.SELECT, RB.START, /*L3*/14, /*R3*/15,
                            RB.UP, RB.DOWN, RB.LEFT, RB.RIGHT];
 
+  // ---------------------------------------------------------------------------
+  // XBOX EDGE: KEEP L3 FROM UNLOADING THE RUNNING EMULATOR.
+  //
+  // Ported from ps1.html:702-712, which already solves this; dreamcast.html had
+  // NO BrowserBack/popstate guard at all (grep count: ps1 7, n64 3, dreamcast 0,
+  // gamecube 0).  Per the Xbox Edge button reference:
+  //   * L3 (btn 10) fires a `BrowserBack` KeyboardEvent AND triggers history.back
+  //     -- on a page with no history sentinel that UNLOADS the emulator mid-game,
+  //     which is indistinguishable from "the controls are broken".
+  //   * R3 (btn 11) is browser-forward.
+  //   * View (btn 8) is consumed by the Edge shell for chrome fullscreen and is
+  //     NOT observable from the page through any web API -- no Gamepad API press,
+  //     no key event, no fullscreenchange.  GP_BTN_TO_RETRO maps index 8 to
+  //     RB.SELECT above; that entry simply cannot fire on Xbox.  Harmless here
+  //     because the Dreamcast controller has no Select at all (A/B/X/Y/L/R/Start
+  //     + d-pad + analog), so nothing is lost -- unlike PSX, which needed the
+  //     hold-D-pad-Up alternate binding.
+  // Hold-Menu (the OS exit gesture) is shell-level and is deliberately untouched.
+  //
+  // The sentinel is pushed once and re-pushed on every popstate, so back can never
+  // pop past the page; the capture-phase keydown swallows the synthetic key.  This
+  // does NOT preventDefault anything else -- ps1.html:355-358 records that a
+  // document-wide preventDefault chain is what broke Xbox Edge's shell gestures.
+  // ---------------------------------------------------------------------------
+  try { history.pushState({ dc: 1 }, ''); } catch (e) {}
+  window.addEventListener('popstate', function () {
+    try { history.pushState({ dc: 1 }, ''); } catch (_) {}
+  });
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'BrowserBack' || e.key === 'BrowserForward' || e.key === 'GoBack') {
+      e.preventDefault(); e.stopPropagation();
+    }
+  }, true);
+
   function packPad() {
     const bytes = new Uint8Array(256);
     for (const [idStr, key] of Object.entries(KEYMAP)) {
@@ -3848,6 +3916,26 @@
   // path note above), not by this loop. rAF is bounded by the panel refresh
   // (and throttles to zero in a background tab), which is exactly why neither
   // the guest rate nor the presented rate is allowed to depend on it.
+  // TEST SEAM for GP_BTN_TO_RETRO.  packPad() is PURE — its inputs are heldKeys and
+  // navigator.getGamepads(), its output is the exact 256-byte buffer frameLoop posts to
+  // the worker — so the gamepad MAPPING can be asserted with no boot and no 1.1 GB disc.
+  //
+  // The worker half needs no such proof and is deliberately not re-tested here: touch,
+  // keyboard and gamepad all run through this same packPad/postMessage pair, and an
+  // emulated iPhone 13 Pro reached PSO character select at guest 1.001x with 8/8 touch
+  // buttons landing (dreamcast/docs/MOBILE-BUG-REPORT.md:181).  You do not reach character
+  // select unless input arrives in the core.
+  //
+  // A SIBLING of window.__dcProbe (above), not an extension of it: two tools already
+  // consume that function's return shape (dreamcast/tools/flycast_probe.js:186,
+  // tools/device_matrix.mjs:509), and widening it to carry pad bytes would risk them.
+  //
+  // ⚠ WHAT THIS CANNOT PROVE: a synthetic navigator.getGamepads override bypasses
+  // Chrome's user-activation gate on gamepad exposure, so this asserts the MAPPING only —
+  // not that a real Xbox pad is handed to the page.  That residual needs hardware and is
+  // uncovered, not implied covered.
+  window.__dcPad = () => Array.from(packPad());
+
   function frameLoop() {
     if (booted) {
       const pad = packPad();
@@ -3863,7 +3951,33 @@
   // Touch map: A=m (DC confirm), B=k (cancel), X=j, Y=n, L=q, R=e, Start=enter;
   // the d-pad disc holds w/a/s/d (drives the d-pad AND the analog stick).
   // ---------------------------------------------------------------------------
-  const isMobile = (() => { const ua = navigator.userAgent.toLowerCase(); return /iphone|ipad|ipod|android|mobile|xbox/.test(ua) || ('ontouchstart' in window) || window.innerWidth < 720 || new URLSearchParams(location.search).has('mobile'); })();
+  // XBOX IS NOT A TOUCH DEVICE, AND CLASSIFYING IT AS ONE IS WHY ITS CONTROLS READ AS
+  // BROKEN.  The regex used to contain `xbox` (ported verbatim from gamecube.html in
+  // 83e01419), so a console with a gamepad and NO touchscreen took the mobile branch at
+  // the `if (isMobile)` below: #wrap hidden, #mobileShell shown, the canvas reparented
+  // into #mobileScreen, and a finger d-pad presented on a television.
+  // MEASURED under an Xbox UA before this change: wrap=hidden, mobileShell=shown,
+  // mobileSplash=shown, canvasParent=mobileScreen.
+  //
+  // The touch shell is not even fully cursor-operable there: holdBtn (below) binds
+  // mouse events as well as pointer/touch, but wireDpadDisc binds ONLY pointer and
+  // touch — so the analog/d-pad disc depends entirely on PointerEvent.
+  //
+  // Consoles keep every OTHER console-specific behaviour: CONSOLE_UA above still drives
+  // the app-class memory budget (Xbox ~450 MB), which is a separate decision from
+  // "does this device have fingers".  `?mobile=1` still forces the shell for testing.
+  //
+  // Deliberately NOT changed in the sibling pages here — ps1.html:224,
+  // n64/index.html:1581 and gamecube.html:2465 carry the identical line and the same
+  // latent issue, but this change is scoped to the page whose controls were reported.
+  const isMobile = (() => {
+    const ua = navigator.userAgent.toLowerCase();
+    const console_ = /\bxbox\b|\bplaystation\b|\bnintendo\b/.test(ua);
+    const touchUA = /iphone|ipad|ipod|android|mobile/.test(ua);
+    if (console_ && !('ontouchstart' in window)) return new URLSearchParams(location.search).has('mobile');
+    return touchUA || ('ontouchstart' in window) || window.innerWidth < 720
+        || new URLSearchParams(location.search).has('mobile');
+  })();
   // Tap binding that does not depend on PointerEvent existing.
   //
   // The shell's own controls (Start on the splash, the ≡ menu, the show-controls
