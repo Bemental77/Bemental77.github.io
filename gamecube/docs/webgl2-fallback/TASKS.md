@@ -187,7 +187,52 @@ Native OGL on the same ISO logs **352 shader lines** and repeatedly links real p
 logs **zero** shader/pipeline activity after init. Both facts are consistent with the table
 above: ours builds its initial programs and then never reaches the per-draw path at all.
 
+## ★ LOCATED: not one flush is real, and not one frame ever ends
+
+`BemFlushCensus` (`VertexManagerBase.cpp:122-146`) is ALREADY in the shipped build and is
+ON by default — `kCtl` @ `0x026B3A00` disables it when NONZERO, and the SAB is
+browser-zeroed. So this needs **no rebuild and no flag**: read the cells off
+`window.sharedMemory` after Start.
+
+Same ROM (SAB, JIT engine), same build, only WebGPU availability differing:
+
+| | fluCalls | fluNoop | fluReal | fluDrawn | cullAll | zeroIdx | frames |
+|---|---|---|---|---|---|---|---|
+| WebGPU on — **renders** | 7,296,517 | 6,907,965 | **388,552** | **388,552** | 0 | 0 | **980** |
+| no WebGPU — **black** | 1,741,943 | **1,741,943** | **0** | **0** | 0 | 0 | **0** |
+
+Read it as:
+- **Every single `Flush()` on the broken arm short-circuits on `if (m_is_flushed) return`.**
+  1.74M calls, 1.74M no-ops. `m_is_flushed` is never cleared, so the decoded vertices never
+  enter the vertex manager's buffer.
+- **`OnEndFrame()` never runs** (`frames = 0` vs 980). No frame ever completes.
+- `cullAll` and `zeroIdx` are 0 on both arms, so culling and empty batches are not it.
+- ⇒ **`VertexManagerBase.cpp:1037`'s `if (m_current_pipeline_object)` is EXONERATED.** On the
+  working arm `fluReal == fluDrawn` exactly — every real flush reaches the draw, so that
+  guard never swallows one. This retires the candidate independently of the (already
+  falsified) shader-mode test, and it means a half-initialised `g_shader_cache` making BOTH
+  `GetPipelineForUid` and `GetUberPipelineForUid` return null is not the explanation either.
+
+**Leading explanation, and it makes the draw path innocent:** what runs on the no-WebGPU arm
+is the FIFO **preprocess** instantiation. `OpcodeDecoding.cpp:211` calls
+`VertexLoaderManager::RunVertices<is_preprocess>(...)`, and the preprocess pass loads
+vertices — which is why `totalVerts` reaches millions — without ever reaching the vertex
+manager or ending a frame. Every symptom follows with no bug in the draw path at all.
+
+⚠ `decoderDraws` / `totalVerts` CANNOT distinguish this: `OpcodeDecoding.cpp:168-175` is, by
+its own comment, an "ungated draw census" outside any `if constexpr (is_preprocess)` guard,
+so it counts BOTH instantiations. The discriminator is `kNIdx`, bumped only in the `else`
+branch at `:143-147`.
+
+⚠ Instruments that are RECOMP-ONLY and read as damning zeros on a JIT arm — do not quote
+them there: the whole `BemStage` window at `0x026B3B98` (published only by
+`EmscriptenWorker.cpp:584`, the last statement of `recomp_render_fifo`), and `[vtxcensus]`
+(`worker_funcs.js:1000`). Both read zero on SAB/JIT because they never publish, not because
+nothing happened.
+
 ## The open question
+
+
 
 **Why does the OGL path load no vertices when the decoder is decoding a million draws?**
 
