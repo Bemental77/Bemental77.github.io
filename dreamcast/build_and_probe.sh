@@ -16,6 +16,44 @@
 #   build_and_probe.sh --js-flags "--trace-deopt --print-wasm-code"
 #                                            # forwarded to V8 (puppeteer Chrome
 #                                            # via FLYCAST_V8_FLAGS env var)
+#
+# ---------------------------------------------------------------------------
+# WHICH SCENE ARE YOU MEASURING? READ THIS BEFORE QUOTING A NUMBER.
+# ---------------------------------------------------------------------------
+# [2026-09-04] A plain run of this script boots PSO and stops at a MENU, and
+# `--q autoload=1` restores the repo-root `state.bin`, which is PSO's CHARACTER
+# SELECT — also a menu. Every Dreamcast figure published before this date came
+# from one of those two, and they are not the game:
+#
+#   scene                        duty  cost/frame  headroom  producible
+#   character select              19%    6.4 ms      5.2x      155 fps
+#   Pioneer 2 + player motion     41%   13.7 ms      2.4x       73 fps
+#
+# Same binary, same box. Real 3D costs 2.1x more per frame and gives up more
+# than half the headroom. A menu number therefore says nothing about the game,
+# and "PSO runs at 0.99991x / 29.97 presents" was true and useless.
+#
+# THE HEAVY SCENES ALREADY EXIST — they are git-tracked in dreamcast/states/
+# and, until this note, NOTHING in the repo referenced them, which is exactly
+# why the menu number went unchallenged. Use one:
+#
+#   bash dreamcast/build_and_probe.sh --skip-link --duration 120000 \
+#        --q autoload=1 --loadstate dreamcast/states/pso2_pioneer2_lobby.state \
+#        --screenshot /tmp/dc/x.png --shotevery 20000 --canvasonly --vblsettle 25000
+#
+#   dreamcast/states/pso2_pioneer2_lobby.state              <- heavy 3D, start here
+#   dreamcast/states/pso2_pioneer2_transporter_room.state
+#   dreamcast/states/pso2_pioneer2_at_transporter_facing.state
+#   dreamcast/states/pso2_pioneer2_hunters_guild_counter.state
+#   dreamcast/states/pso2_boot.state
+#
+# And drive MOTION (`--press 45000:ArrowUp:20000` — arrow keys are the DC ANALOG
+# stick; PSO walking is analog-only and digital input reads as "unable to
+# move"). A standing scene understates a moving one by ~1.5x on duty.
+#
+# ALWAYS screenshot the scene you claim (`--screenshot` + `--shotevery`). A
+# savestate that fails to restore cold-boots into a menu and still prints a
+# plausible 1.000x.
 
 set -e
 
@@ -46,6 +84,15 @@ NOCOI=""
 NOSWA=""
 PROGMS=""
 AUDIOCLAMP=""
+SHOTEVERY=""
+SHOTFROM=""
+CANVASONLY=""
+MIDSHOTS=""
+SAVESTATE=""
+SAVEMS=""
+SAVEATS=""
+UNCAP=""
+VBLSETTLE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --skip-link|--skip-build) SKIP_LINK=1; shift ;;
@@ -117,6 +164,32 @@ while [ $# -gt 0 ]; do
     # Chrome honours 44100 — so without this arm the defect is unreachable from
     # this box. Same gap as --loadstate/--ctxms/--profat before it.
     --audioclamp)             AUDIOCLAMP="$2"; shift 2 ;;
+    # [2026-09-04] SCENE CAPTURE + EVIDENCE arms. Same gap as --loadstate /
+    # --ctxms / --profat / --mobile before them: flycast_probe.js has had all of
+    # these for days, the CANONICAL LOOP could not reach any of them, so every
+    # attempt to drive PSO to a NAMED SCENE and prove it with pixels was an
+    # improvised `node flycast_probe.js ...` outside gate #1. This is the whole
+    # reason "PSO runs at 0.99991x" was ever published off a BOOT/TITLE screen:
+    # the only scene the loop could reach was "it booted".
+    #   --shotevery <ms>  periodic canvas strip (evidence for "I measured X")
+    #   --shotfrom <ms>   don't start the strip before this
+    #   --canvasonly      drop the shell companion shot
+    #   --midshot <ms>    one-off timed shot (repeatable)
+    #   --savestate <f>   PUT sink: the page's Save State writes HERE
+    #   --savems <ms>     arm the page's own &autosave=<ms>
+    #   --saveat <ms>     click Save State at T (repeatable; needs --savestate)
+    #   --uncap           MEASUREMENT ARM ONLY (gate #9): governor delay=0. This
+    #                     MOVES THE GUEST and is never how 120 is reached.
+    #   --vblsettle <ms>  exclude this much boot ramp from the SETTLED window
+    --shotevery)              SHOTEVERY="$2"; shift 2 ;;
+    --shotfrom)               SHOTFROM="$2"; shift 2 ;;
+    --canvasonly)             CANVASONLY="--canvasonly"; shift ;;
+    --midshot)                MIDSHOTS="$MIDSHOTS --midshot $2"; shift 2 ;;
+    --savestate)              SAVESTATE="$2"; shift 2 ;;
+    --savems)                 SAVEMS="$2"; shift 2 ;;
+    --saveat)                 SAVEATS="$SAVEATS --saveat $2"; shift 2 ;;
+    --uncap)                  UNCAP="--uncap"; shift ;;
+    --vblsettle)              VBLSETTLE="$2"; shift 2 ;;
     -h|--help)                sed -n '2,/^set -e/p' "$0" | sed 's/^# //;/^set -e/d'; exit 0 ;;
     *)                        echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -179,6 +252,20 @@ CMD="node $PROBE_JS --log $PROBE_LOG $KEEP_NOISE $INTERP $PCTRACE"
 [ -n "$CTXMS" ]    && CMD="$CMD --ctxsnap --ctxms $CTXMS"
 [ -n "$PROFAT" ]   && CMD="$CMD --profat $PROFAT"
 [ -n "$PROFDUR" ]  && CMD="$CMD --profdur $PROFDUR"
+[ -n "$SHOTEVERY" ] && CMD="$CMD --shotevery $SHOTEVERY"
+[ -n "$SHOTFROM" ]  && CMD="$CMD --shotfrom $SHOTFROM"
+[ -n "$CANVASONLY" ] && CMD="$CMD $CANVASONLY"
+[ -n "$MIDSHOTS" ]  && CMD="$CMD$MIDSHOTS"
+[ -n "$SAVEMS" ]    && CMD="$CMD --savems $SAVEMS"
+[ -n "$SAVEATS" ]   && CMD="$CMD$SAVEATS"
+[ -n "$UNCAP" ]     && CMD="$CMD $UNCAP"
+[ -n "$VBLSETTLE" ] && CMD="$CMD --vblsettle $VBLSETTLE"
+# --savestate is a SINK path (the probe creates it), so unlike --loadstate it is
+# NOT existence-checked; its directory must exist though.
+if [ -n "$SAVESTATE" ]; then
+  [ -d "$(dirname "$SAVESTATE")" ] || { echo "FATAL: --savestate dir missing: $(dirname "$SAVESTATE")" >&2; exit 2; }
+  CMD="$CMD --savestate $SAVESTATE"
+fi
 if [ -n "$LOADSTATE" ]; then
   [ -f "$LOADSTATE" ] || { echo "FATAL: --loadstate file not found: $LOADSTATE" >&2; exit 2; }
   CMD="$CMD --loadstate $LOADSTATE"

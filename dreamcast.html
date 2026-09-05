@@ -2756,11 +2756,31 @@
   // ---------------------------------------------------------------------------
   // Lazy disc (?lazydisc=1) — OPT-IN, eager stays the default.
   //
-  // The eager path below fetches all 1,185,760,800 B of Track3 into bufs[],
-  // then allocates a SECOND full-size buffer and copies into it while bufs[] is
-  // still reachable (~2.21 GiB transient), and Module.FS.writeFile then retains
-  // a third copy in the worker's JS heap for the whole session. No phone holds
-  // that. The worker's 'discLazy' handler replaces it with an HTTP-Range
+  // [CORRECTED 2026-09-04] This block used to say the eager path fetches into
+  // bufs[], allocates a SECOND full-size buffer (~2.21 GiB transient) and leaves
+  // a THIRD copy in MEMFS. That described the pre-2026-08 path and is STALE —
+  // and being stale it cost two separate wrong root-cause diagnoses of the Xbox
+  // OOM, each proposing to build part-wise fetching that this page ALREADY has.
+  // What the code below actually does (fetchAndPostFile / fetchDiscInto:2738):
+  //   * `file.bytes` is known for Track3, so ONE 1,185,760,800 B buffer is
+  //     preallocated and each part's response body is streamed straight into it
+  //     at an offset (`out.set(chunk, w)`). The page NEVER concatenates, and
+  //     bufs[] is only the fallback for a file with no declared size.
+  //   * that single buffer is TRANSFERRED to the worker (zero-copy), and
+  //     flycast_worker.js:656 `FS.writeFile` then makes the MEMFS copy.
+  // So the real shape is TWO full-size copies transiently (~2.26 GiB peak) and
+  // ONE resident (~1.13 GiB in MEMFS) for the session — not three.
+  //
+  // ⚠ THE PART THAT MATTERS FOR A SMALL-BUDGET DEVICE: the resident 1.13 GiB
+  // MEMFS node is the floor of ANY path that materialises the whole disc. An
+  // incremental offset-write `discChunk` would drop the peak from ~2.26 GiB to
+  // ~1.23 GiB by removing the page-side buffer, but it CANNOT get under an
+  // app-class budget (Xbox ~450 MB) because the MEMFS node alone is 2.5x that.
+  // Only 'discLazy' — which never materialises the disc, keeping a bounded LRU
+  // of 1 MB chunks — fits. That is why the device-budget arm below reaches for
+  // lazy disc and not for a cleverer eager path.
+  //
+  // The worker's 'discLazy' handler replaces the eager path with an HTTP-Range
   // streaming FS node (1 MB chunks, bounded LRU, readahead).
   //
   // It is opt-in on purpose. Lazy disc previously shipped as a DEFAULT
@@ -2775,6 +2795,29 @@
   //     buffer and the caller zero-fills the remainder, which is silent disc
   //     corruption and is precisely the shape of the last break (an HTTP 200
   //     accepted without a length check).
+  //
+  // ⚠ "LAZY DISC IS DEAD ON GITHUB PAGES" IS FALSE — do not re-derive it.
+  // GitHub Pages DOES serve byte ranges. Verified 2026-09-04 against the live
+  // deploy, not inferred:
+  //     curl -H "Range: bytes=0-1023" \
+  //       https://caseybement.com/dreamcast/discs/pso2/Track3.bin.partaa
+  //     -> HTTP/2 206 · accept-ranges: bytes
+  //        content-range: bytes 0-1023/99614720
+  // so preflightRanges() PASSES on the deployed site and the device-budget arm
+  // below really does stream. End-to-end proof through the canonical loop
+  // (`build_and_probe.sh --q "lazydisc=1&maxmem=256"`): "[lazydisc] streaming
+  // Track3.bin (1185760800 B over 12 verified parts, 96 MB cache)", disc
+  // 16/16 MB downloaded instead of 1147, heap max=256MB, retro_load_game true,
+  // SETTLED guest ratio 1.00000x.
+  //
+  // WHERE THE "HTTP 200" SIGHTING COMES FROM: `npm run web` is
+  // `python3 -m http.server`, which has NO Range support and answers 200 with
+  // the whole 99,614,720 B part. Preflight then correctly refuses and falls
+  // back to eager — so ON THAT SERVER ONLY, the console/low-budget arm silently
+  // becomes the eager path and looks like a shipping bug. It is a rig artifact.
+  // The canonical loop's own server implements 206 for exactly this reason
+  // (dreamcast/tools/flycast_probe.js:396-420) — test this arm THERE, per
+  // CLAUDE.md gate #1, never against a hand-started python server.
   // ---------------------------------------------------------------------------
   async function preflightRanges(file, base) {
     const urls = file.parts.map((p) => base + p);
