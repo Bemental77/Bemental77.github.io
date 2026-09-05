@@ -10,13 +10,29 @@
 // byte offsets; the page writes a descriptor at GL_DESC_OFF (magic, ringOff,
 // ringWords, ctrlOff, enabled) that BOTH threads read from the shared heap.
 //
-//   ── UNCERTAIN STEP (must be probe-confirmed) ──────────────────────────────
-//   GL_RING_OFF / GL_CTRL_OFF (0x08000000 / 0x09100000) are chosen in the gap
-//   between the scratch SAB region (ends ~0x026Bxxxx) and Dolphin's data section
-//   (GLOBAL_BASE=0x10000000). They are unreferenced in sab_layout.h, but I have
-//   NOT verified the wasm STACK (STACK_SIZE=8MB) or low malloc arena doesn't
-//   reach 0x08000000. The probe's first run will show [fix1] gl-error / wrong
-//   render if these collide; bump them (e.g. to just-below 0x10000000) if so.
+//   ── RESOLVED 2026-09-05: THEY DID COLLIDE, AND THEY HAVE MOVED ────────────
+//   This block used to read "GL_RING_OFF / GL_CTRL_OFF (0x08000000 / 0x09100000)
+//   ... I have NOT verified the wasm STACK or low malloc arena doesn't reach
+//   0x08000000 ... bump them if so." They reach it. The address was not free:
+//
+//     gamecube/ppc-worker/build_ppc_worker.sh:77  GLOBAL_BASE=134217728 = 0x08000000
+//
+//   The ppc-worker's static data AND dlmalloc heap begin exactly there (the
+//   γ-fix of 2026-05-19 put them above 128 MB so the JIT's 0x026Bxxxx diagnostic
+//   cells would stop being clobbered). The 16 MB GL ring was written straight
+//   over it in the SHARED heap, destroying the ppc-worker's EM_ASM signature
+//   strings, so its next EM_ASM read a stray byte as a type char and the worker
+//   died with `Invalid character 54("6") in readEmAsmArgs`. dolphin_worker was
+//   never hit — its GLOBAL_BASE is 0x10000000 — which is why only the ppc-worker
+//   aborted and why it read like a JIT bug rather than a layout bug.
+//   ⚠ The predicted tell ("[fix1] gl-error / wrong render") never appeared:
+//   glErrors was 0 on every run. Do not wait for that symptom.
+//
+//   The offsets now live in gamecube.html's window.__gcGl (ring 0x03000000,
+//   ctrl 0x04100000) — in the gap 0x02700000..0x08000000 that belongs to nobody.
+//   ONLY GL_DESC_OFF is hardcoded here; ringByteOff/ringWords/ctrlByteOff are
+//   read out of the descriptor at runtime below, which is why moving the ring
+//   needed no relink of this file.
 var GL_DESC_OFF  = 0x07FF0000;  // descriptor: i32[0]=magic i32[1]=ringByteOff i32[2]=ringWords i32[3]=ctrlByteOff i32[4]=enabled
 var GL_DESC_MAGIC = 0x474C5244; // 'GLRD'
 var __gcRec = null;
