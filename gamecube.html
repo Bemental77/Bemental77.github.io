@@ -2579,9 +2579,36 @@ window.GcRate = (function () {
   // heap LATER, inside var_setup (window.__gcWriteGlDesc), so a probe that flips
   // window.__gcRenderWorker after page-load but before var_setup still takes
   // effect. The C++ install/present gates read this descriptor from the heap.
+  // ⚠ ringOff/ctrlOff MOVED OUT OF 0x08000000 — that was a hard address collision, and it
+  // is why ?hwRender=1 killed the ppc-worker instead of rendering.
+  //
+  //   gamecube/ppc-worker/build_ppc_worker.sh:77   GLOBAL_BASE=134217728 = 0x08000000
+  //   here (before)                                ringOff       = 0x08000000, 16 MB
+  //
+  // The ppc-worker's static data AND its dlmalloc heap begin at exactly 0x08000000 (pushed
+  // there deliberately by the γ-fix of 2026-05-19 so the JIT's 0x026Bxxxx diagnostic cells
+  // would stop being clobbered). The GL command ring was then written over the top of that
+  // same region in the SHARED heap. Its casualties included the ppc-worker's EM_ASM
+  // signature strings, so the very next EM_ASM read a stray byte as a type char and the
+  // worker died with:
+  //     Aborted(Assertion failed: Invalid character 54("6") in readEmAsmArgs!)
+  // — an error that reads like a JIT bug and is really a memory-layout bug. dolphin_worker
+  // was never hit because its GLOBAL_BASE is 0x10000000, which is exactly why ONLY the
+  // ppc-worker aborted. Matched pair, same binary, only the query string differing:
+  // default arm aborts=0 SET_HW_RENDER=0; ?hwRender=1 arm aborts=3 SET_HW_RENDER=1.
+  //
+  // NEW HOME: the free gap between the documented SAB reservations and the ppc-worker.
+  // sab_layout.h reserves up to 0x026A0000; ppc-worker owns 0x08000000 upward; dolphin
+  // owns 0x10000000 upward. So 0x02700000..0x08000000 (~88 MB) belongs to nobody.
+  //   ring 0x03000000 .. 0x04000000  (16 MB)   ~9.6 MB clear of the SAB region below
+  //   ctrl 0x04100000                (1 KB)    ~63 MB clear of the ppc-worker above
+  // descOff STAYS at 0x07FF0000: it is below 0x08000000 and therefore was never in the
+  // collision — and leaving it put means worker_funcs.js does NOT change, so this needs no
+  // relink. That file hardcodes only GL_DESC_OFF and reads ringByteOff/ringWords/
+  // ctrlByteOff out of the descriptor at runtime (worker_funcs.js:37-39).
   window.__gcGl = { descOff: 0x07FF0000, magic: 0x474C5244 /*'GLRD'*/,
-                    ringOff: 0x08000000 /*128MB*/, ringWords: 1 << 22 /*16MB i32*/,
-                    ctrlOff: 0x09100000 };
+                    ringOff: 0x03000000 /*48MB*/, ringWords: 1 << 22 /*16MB i32*/,
+                    ctrlOff: 0x04100000 };
   window.__gcWriteGlDesc = function () {
     var d = window.__gcGl;
     var i32 = new Int32Array(sharedMemory.buffer);
