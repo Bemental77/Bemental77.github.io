@@ -2500,6 +2500,77 @@ function startServer() {
     } catch (_e) { /* page may be navigating / closed */ }
   }, METRICS_INTERVAL_MS);
 
+  // ---- [wasm-tier 2026-09-04] block-cache CHURN telemetry -----------------
+  // WHY: V8 charges the wasm tiering budget PER FUNCTION against its own code
+  // body (`--wasm-tiering-budget 13,000,000 / code_body_bytes` executions).
+  // EVERY recompile of a guest PC produces a FRESH module whose budget RESETS
+  // to 13,000,000 — so a block that is recompiled faster than it can execute
+  // its threshold can never leave Liftoff, no matter how hot it is.
+  // `block_cache.cpp` has counted this since 2026-08-29 (BEM_CC_* cells) but
+  // NOTHING read the cells, so churn appears in no log in this tree and the
+  // `gamecube/docs/wasm-tier/TASKS.md` residual (1.164x) assumes zero churn.
+  // This is read-only telemetry: it writes no cell and changes no code path,
+  // and it runs in BOTH arms of a matched pair so it cancels.
+  // PROBE_CHURN_MS=<ms> sets the sample interval (default 10000); 0 disables.
+  const CHURN_MS = parseInt(process.env.PROBE_CHURN_MS || '10000', 10);
+  const churnRows = [];
+  let churnTimer = null;
+  if (CHURN_MS > 0) {
+    const churnSnap = async () => {
+      try {
+        const s = await page.evaluate(() => {
+          if (!window.sharedMemory) return null;
+          const A = new Uint32Array(window.sharedMemory.buffer);
+          const rd = (a) => A[a >> 2] >>> 0;
+          return {
+            wall: performance.now(),
+            evictAtCap: rd(0x026B3940), mapSize: rd(0x026B3944), mapPeak: rd(0x026B3948),
+            compileN: rd(0x026B394C), compileMs: rd(0x026B3950),
+            clearN: rd(0x026B3954), clearMs: rd(0x026B3958),
+            distinctPc: rd(0x026B395C), recompileN: rd(0x026B3960),
+            evictedBlocks: rd(0x026B3964), sealedPc: rd(0x026B3968),
+            capEcho: rd(0x026B3974), evictCapMs: rd(0x026B3978), policyEcho: rd(0x026B397C),
+            // [batch-instances] K blocks share one MODULE — note this does NOT
+            // change per-FUNCTION body size, so it does not move the tier budget.
+            biModules: rd(0x026B39A4), biBlocks: rd(0x026B39A8),
+            biFailed: rd(0x026B39AC), biMs: rd(0x026B39B0), kEcho: rd(0x026B39B4),
+            // [promote/fusion census] The four seal-census cells published by
+            // block_cache.cpp region_seal (:2648-2653) plus the promote arm cell.
+            // These are the ARM-DIFFERENCE PROOF: they must be read on BOTH arms,
+            // so an inert flag cannot masquerade as a working one. region_seal
+            // runs on the EmuThread pthread whose console is NOT forwarded to
+            // puppeteer, which is why its `run-fusion:` EM_ASM has never appeared
+            // in any probe log — SAB cells are the only channel that crosses.
+            fuseMode: rd(0x026B3430), fusedRuns: rd(0x026B3434),
+            fusedBlocks: rd(0x026B3438), fuseCls1: rd(0x026B343C),
+            promoteArm: rd(0x026B3B78), regionEntry: rd(0x026B3404),
+          };
+        });
+        if (!s) return;
+        const p = churnRows.length ? churnRows[churnRows.length - 1] : null;
+        churnRows.push(s);
+        const d = (k) => p ? (s[k] - p[k]) : s[k];
+        const dt = p ? (s.wall - p.wall) / 1000 : s.wall / 1000;
+        const per = (k) => dt > 0 ? (d(k) / dt).toFixed(1) : '0.0';
+        console.log('[churn] t=' + (s.wall / 1000).toFixed(1) + 's'
+          + ' compile=' + s.compileN + '(+' + d('compileN') + ', ' + per('compileN') + '/s)'
+          + ' recompile=' + s.recompileN + '(+' + d('recompileN') + ', ' + per('recompileN') + '/s)'
+          + ' distinctPc=' + s.distinctPc
+          + ' map=' + s.mapSize + '/peak' + s.mapPeak
+          + ' evictAtCap=' + s.evictAtCap + ' evictedBlocks=' + s.evictedBlocks + '(+' + d('evictedBlocks') + ')'
+          + ' clear=' + s.clearN + '(+' + d('clearN') + ')'
+          + ' | compileMs=' + s.compileMs + ' clearMs=' + s.clearMs + ' evictCapMs=' + s.evictCapMs
+          + ' cap=' + s.capEcho + ' pol=' + s.policyEcho + ' sealed=' + s.sealedPc
+          + ' | batch k=' + s.kEcho + ' mod=' + s.biModules + ' blk=' + s.biBlocks + ' fail=' + s.biFailed
+          + ' | promoteArm=0x' + s.promoteArm.toString(16) + ' region=' + s.regionEntry
+          + ' fuseMode=' + s.fuseMode + ' fusedRuns=' + s.fusedRuns
+          + ' fusedBlocks=' + s.fusedBlocks + ' fpCls1=' + s.fuseCls1);
+      } catch (_e) { /* page may be navigating/closed */ }
+    };
+    await churnSnap();
+    churnTimer = setInterval(churnSnap, CHURN_MS);
+  }
+
   await new Promise((r) => {
     const start = Date.now();
     const tick = setInterval(() => {
@@ -2516,6 +2587,46 @@ function startServer() {
     }, STUCK_POLL_MS);
   });
   clearInterval(metricsTimer);
+  if (churnTimer) {
+    clearInterval(churnTimer);
+    // Final churn summary. The load-bearing ratio is recompile/distinct: a PC
+    // compiled once keeps its V8 tiering budget and can reach TurboFan; a PC
+    // recompiled N times restarts from 13,000,000 N times.
+    if (churnRows.length >= 2) {
+      const a = churnRows[0], z = churnRows[churnRows.length - 1];
+      const secs = (z.wall - a.wall) / 1000;
+      const rec = z.recompileN - a.recompileN, comp = z.compileN - a.compileN;
+      console.log('[churn] WINDOW ' + secs.toFixed(1) + 's'
+        + ' compiles=' + comp + ' (' + (comp / secs).toFixed(2) + '/s)'
+        + ' recompiles=' + rec + ' (' + (rec / secs).toFixed(2) + '/s)'
+        + ' recompile-share=' + (comp > 0 ? (100 * rec / comp).toFixed(1) : '0.0') + '%'
+        + ' distinctPc=' + z.distinctPc + ' (+' + (z.distinctPc - a.distinctPc) + ')'
+        + ' evictedBlocks=' + (z.evictedBlocks - a.evictedBlocks)
+        + ' clears=' + (z.clearN - a.clearN)
+        + ' liveMap=' + z.mapSize + ' peak=' + z.mapPeak);
+      // FIRING PROOF. sealed==0 AND fusedRuns==0 means region_seal never ran and
+      // run-fusion is INERT — any A/B against it compared two identical configs.
+      console.log('[churn] FUSION arm=0x' + z.promoteArm.toString(16)
+        + (z.promoteArm === 0xF05E0001 ? ' (ARMED)' : ' (off)')
+        + ' sealedPc=' + z.sealedPc + ' regionEntry=' + z.regionEntry
+        + ' fuseMode=' + z.fuseMode + ' fusedRuns=' + z.fusedRuns
+        + ' fusedBlocks=' + z.fusedBlocks + ' fpClass1Records=' + z.fuseCls1
+        + '  => ' + ((z.sealedPc > 0 || z.fusedRuns > 0) ? 'FIRED' : 'INERT (no seal, no fusion)'));
+      // Churn per LIVE block per second is what decides whether a warm block
+      // can ever out-run its own budget reset.
+      if (z.mapSize > 0 && secs > 0) {
+        console.log('[churn] recompiles per live block per second = '
+          + (rec / z.mapSize / secs).toFixed(5)
+          + '  (mean seconds between recompiles of a given live block = '
+          + (rec > 0 ? (z.mapSize * secs / rec).toFixed(1) : 'inf') + ')');
+      }
+    }
+    if (process.env.PROBE_CHURN_JSON) {
+      try { fs.writeFileSync(process.env.PROBE_CHURN_JSON, JSON.stringify(churnRows, null, 1));
+            console.log('[churn] rows -> ' + process.env.PROBE_CHURN_JSON); }
+      catch (e) { console.log('[churn] write failed: ' + e.message); }
+    }
+  }
   if (stuckReason) console.log('[probe] EXIT-STUCK: ' + stuckReason);
 
   // ---- MIPS meter readout (executed vs credited, steady window) -----------

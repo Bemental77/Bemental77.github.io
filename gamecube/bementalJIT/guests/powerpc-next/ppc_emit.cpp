@@ -136,6 +136,45 @@ bool bem_mips_census_on() {
                static_cast<uintptr_t>(BEM_MIPS_FLAG_CELL)) != 0u;
 }
 
+// [promote/fusion ARM 2026-09-04 — gamecube/docs/wasm-tier] WHY THIS EXISTS.
+//
+// The whole region-promotion + run-fusion machinery in block_cache.cpp
+// (promote_hot / region_seal / the three FUSION v2 seam shapes / the
+// fused-extent SMC layer) is UNREACHABLE in the shipping build, and the reason
+// is this one flag rather than anything about the workload:
+//
+//   * the ONLY writer of g_bem_promote_ring / g_bem_promote_n is the emitted
+//     wasm block prologue at :1085 below;
+//   * that prologue is EMIT-TIME gated on g_bem_promote_enabled;
+//   * g_bem_promote_enabled is `unsigned char = 0` at block_cache.cpp:262 and
+//     NOTHING in the tree ever writes it (verified by grep over every .cpp/.h/
+//     .js: the only other assignment is aot_merge.cpp:123, which sets it to 0).
+//
+// So the ring stays empty -> s_hit_hist stays empty -> s_hist_samples never
+// reaches kWindowSamples (65536) -> promote_hot is never called -> n_funcs
+// stays 0 -> region_should_relink is false -> region_seal never runs -> the
+// fusion branch inside it is never reached. The MAX_GENS early-return, the
+// FP-record filter and SMC teardown are all DOWNSTREAM of a gate that never
+// opens, so none of them can be the cause. Measured live to agree: SAB reports
+// sealed=0 in every 10 s window of a 90 s run.
+//
+// A MAGIC value, not "nonzero", for the reason kLeafInlineArmMagic documents at
+// JitWasm.cpp:196-201: absence must fail SAFE. A browser-zeroed cell, a naked
+// harness, or a stale writer leaving 1 here all read as OFF; only a writer that
+// knows this constant can arm promotion. Read at EMIT time, so it must be armed
+// from the query string BEFORE the blocks you want promoted are compiled —
+// the same constraint as the [mips] gate (CLAUDE.md gate #10).
+//
+// Default (cell unwritten) is byte-identical to the pre-change tree, so the
+// control arm and the armed arm come off ONE binary.
+static constexpr u32 BEM_PROMOTE_ARM_CELL  = 0x026B3B78u;
+static constexpr u32 BEM_PROMOTE_ARM_MAGIC = 0xF05E0001u;   // 'FUSE' 1
+static bool bem_promote_arm_on() {
+    return g_bem_lc_base != 0u &&
+           *reinterpret_cast<volatile uint32_t*>(
+               static_cast<uintptr_t>(BEM_PROMOTE_ARM_CELL)) == BEM_PROMOTE_ARM_MAGIC;
+}
+
 static constexpr u32 BEM_DISP_MASK_NEXT = 0x3FFFFu;  // MUST match block_cache.cpp BEM_DISP_MASK (BEM_DISP_BITS=18)
 static constexpr u32 LOCAL_TMP_A_CHAIN  = 0u;       // build_block_next i32 scratch 0
 static constexpr u32 LOCAL_TMP_B_CHAIN  = 1u;       // build_block_next i32 scratch 1
@@ -1082,7 +1121,11 @@ static void emit_block_body_into(WasmModuleBuilder& b, CodeBlock& block,
             // against m_sealed_pcs), so the ~20-op counter+ring sequence on
             // EVERY execution of the hottest code was pure waste (15-40% of
             // executed ops on 3-9-instr blocks).
-            if (g_bem_promote_enabled && region_gen < 0) {
+            // [promote/fusion ARM 2026-09-04] `|| bem_promote_arm_on()` is the
+            // ONLY way this prologue can be emitted in a shipping build — see
+            // the note at bem_promote_arm_on(). g_bem_promote_enabled stays the
+            // compile-time default (0, no writer in-tree).
+            if ((g_bem_promote_enabled || bem_promote_arm_on()) && region_gen < 0) {
                 const u32 bkt       = (start_pc >> 2) & BEM_DISP_MASK_NEXT;
                 const u32 exec_addr = (u32)(uintptr_t)&g_bem_pc_exec[bkt];
                 const u32 ring_addr = (u32)(uintptr_t)&g_bem_promote_ring[0];
