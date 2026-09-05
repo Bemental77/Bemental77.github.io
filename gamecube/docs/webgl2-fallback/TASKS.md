@@ -304,6 +304,34 @@ file, so no rebuild.
 getError sweep exceeded wall time, which means those deltas include main-thread suspension —
 the RATIO and the INVARIANCE are the load-bearing results there, not the absolutes.
 
+## ELIMINATION TABLE for the ~1.5 fps — eight candidates measured dead
+
+Do not re-test these. Each was measured, not reasoned about.
+
+| candidate | verdict | evidence |
+|---|---|---|
+| draw volume | dead | ~6 draws/frame, zero readPixels/blitFramebuffer/copyTexSubImage2D/finish |
+| shader compilation | dead | 19 programs / 28 shaders, compiled once; two instruments agree |
+| `GETERR_EVERY` interval | dead | 8 -> 64: 8x fewer syncs, 8x longer each, same total, same fps |
+| process-wide GPU stall | dead | a 2nd WebGL2 context on the SAME page, ON-SCREEN and size-matched to 640x528, fences at `cost=0.2..0.9` while replay runs `fps 1.31-1.53` |
+| 512 MB bufferData uploads | dead **as a perf cause** | real bug, fixed (`VIEW 536870912B x2` -> `VIEW 256B x1 VIEW 32B x1`); fps 1.31-1.65 -> 1.51, FLAT |
+| software rasteriser fallback | dead | both contexts report `ANGLE (Intel, ANGLE Metal Renderer: Intel(R) UHD Graphics 630)`, neither lost |
+| `.console-ua` CSS scaling | dead | probe ran on the DEFAULT UA so the rule never applied — canvas `canvasW:640 cssW:640`, unscaled — and still `fps 1.54` |
+| Dolphin PerfQuery readback | dead | `createQuery:512` but `beginQuery:0 endQuery:0 getQueryParameter:0 clientWaitSync:0 fenceSync:0` — 512 queries created and NEVER USED |
+
+⚠ `createQuery: 512` with zero use is itself waste worth removing, but it is not the fence.
+
+**New datum, not yet a diagnosis:** `bindFramebuffer` runs at **18.5 per frame** against 13.1
+`drawElements` and 4.7 `clear` — a render-pass switch roughly every 0.7 draws. On ANGLE-Metal
+each `bindFramebuffer` can begin a new render pass with a full attachment load/store, so this
+is a poor ratio and a real inefficiency. ⚠ I have NOT established that it accounts for a
+seconds-scale stall, and I am not asserting it does.
+
+**Next instrument that would settle it:** `EXT_disjoint_timer_query_webgl2` around the
+replay's draws, to get REAL GPU time. That distinguishes "the GPU is genuinely busy for that
+long" from "the CPU is blocked waiting on something that is not GPU work" — and every test so
+far has measured the CPU side of the fence only.
+
 ## The open question
 
 
