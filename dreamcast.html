@@ -884,10 +884,37 @@
   // THIRD copy for the session. That is the ~2.2x transient the comment at the
   // lazy-disc block records. A disc is affordable eagerly only if that fits.
   const EAGER_DISC_FACTOR = 2.2;
+  // ⚠ ABSOLUTE CEILING, checked BEFORE the device budget. Reported live as
+  // "not enough memory for this page" — a tab OOM on an ordinary DESKTOP, on the
+  // deployed site.
+  //
+  // The relative check alone could not prevent it, and the reason is that a device-RAM
+  // budget is not a per-tab allocation ceiling. Measured on the machine that crashed:
+  //     [mem] device budget 7373 MB (navigator.deviceMemory=16 GiB x 0.45) — ample
+  // PSO Track 3 (1,131 MB) costs 1131 x 2.2 = 2489 MB transient, so 2489 <= 7373 and the
+  // eager path was chosen. It does not fit in reality: that is a ~2.5 GB allocation chain
+  // (the whole track in bufs[], a second full-size copy made while bufs[] is still
+  // reachable, then FS.writeFile retaining a third) inside ONE tab, next to a wasm heap.
+  // More machine RAM makes the computed budget larger and the crash MORE likely, which is
+  // the wrong direction for a guard.
+  //
+  // The lazy-disc block below already states the intent — "no app-class budget can hold
+  // it" — but the guard it was given was purely relative, so the intent only held on
+  // devices that report small. This makes it true everywhere.
+  //
+  // 1200 MB is a transient ceiling, not a disc-size ceiling: a disc is eager-loadable up
+  // to ~545 MB, which covers every other title here, and PSO goes lazy. Lazy is not a
+  // degradation for it — byte ranges are verified working on the deployed origin
+  // (HTTP/2 206, accept-ranges: bytes) and streaming fetches 16 MB instead of 1,131 MB.
+  const EAGER_ABS_CEILING_MB = 1200;
   function eagerDiscFitsBudget(discBytes) {
-    if (!MEM_BUDGET.known) return true;          // unknown -> unchanged behaviour
     if (!(discBytes > 0)) return true;
-    return ((discBytes / 1048576) * EAGER_DISC_FACTOR) <= MEM_BUDGET.mb;
+    const costMb = (discBytes / 1048576) * EAGER_DISC_FACTOR;
+    // Absolute first, and deliberately ALSO when the budget is unknown — "unknown" used
+    // to mean "unchanged behaviour", which is exactly the path a desktop took into the OOM.
+    if (costMb > EAGER_ABS_CEILING_MB) return false;
+    if (!MEM_BUDGET.known) return true;
+    return costMb <= MEM_BUDGET.mb;
   }
   const CONSOLE_HINT = CONSOLE_UA
     ? ' This looks like a games console or TV browser. Those run the page as an "app" with a much '
@@ -2906,9 +2933,17 @@
     const budgetForces = !eagerDiscFitsBudget(file.bytes || 0);
     if (why !== 'fallback' && !QS.has('lazydisc') && !budgetForces) return false;
     if (budgetForces && why !== 'fallback' && !QS.has('lazydisc')) {
-      pageLog('[lazydisc] armed by DEVICE BUDGET: disc ' +
-              Math.round((file.bytes || 0) / 1048576) + ' MB x' + EAGER_DISC_FACTOR +
-              ' eager cost exceeds ' + MEM_BUDGET.mb + ' MB (' + MEM_BUDGET.why + ')');
+      // Name the guard that ACTUALLY fired. This line used to always say "exceeds
+      // <device budget>", which was wrong and actively misleading once the absolute
+      // ceiling existed: on the desktop that OOMed it would have read "2489 exceeds
+      // 7373", a false statement, while the real reason was the fixed transient cap.
+      const _costMb = Math.round(((file.bytes || 0) / 1048576) * EAGER_DISC_FACTOR);
+      const _absHit = _costMb > EAGER_ABS_CEILING_MB;
+      pageLog('[lazydisc] armed by ' + (_absHit ? 'ABSOLUTE TRANSIENT CEILING' : 'DEVICE BUDGET') +
+              ': disc ' + Math.round((file.bytes || 0) / 1048576) + ' MB x' + EAGER_DISC_FACTOR +
+              ' = ' + _costMb + ' MB eager cost exceeds ' +
+              (_absHit ? (EAGER_ABS_CEILING_MB + ' MB per-tab ceiling')
+                       : (MEM_BUDGET.mb + ' MB (' + MEM_BUDGET.why + ')')));
       why = why || 'budget';
     }
     if (!caps.lazyDisc) {
