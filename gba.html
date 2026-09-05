@@ -105,6 +105,21 @@
            ════════════════════════════════════════ */
         html, body { margin: 0; padding: 0; height: 100%; }
 
+        /* TEN-FOOT VIEWING.  #canvas carries an INLINE `width: 480px` (see the desktop
+           canvas markup), and an inline style can only be beaten by !important — that is
+           why these two declarations carry it and the other pages' equivalents do not.
+           ⚠ 3 / 2, NOT 4 / 3.  The GBA is 240x160 (see the cw/ch defaults in the resize
+           helper below), so it is the ONE page in this repo whose console rule must not
+           reuse the 4:3 the other five share.  Copying that number here would letterbox a
+           correct image into the wrong shape. */
+        .console-ua #canvas { width: auto !important; height: 100% !important;
+                              aspect-ratio: 3 / 2; max-width: 100%; max-height: 100%; }
+        @media (max-aspect-ratio: 3/2) {
+          .console-ua #canvas { width: 100% !important; height: auto !important; aspect-ratio: 3 / 2; }
+        }
+        .console-ua #canvasDiv { display: flex; align-items: center; justify-content: center;
+                                 height: 80vh; }
+
         #spShell {
             display: none;
             flex-direction: column;
@@ -460,9 +475,23 @@
       width: 100%; height: 100%; min-width: 44px; min-height: 44px;
     }
 </style>
+  <!-- THE FLOOR NO RUNTIME GATE CAN REACH.  Ported from n64/index.html:162-180, with
+       THIS page's shell ids: gba has #maindiv/#middleDiv/#spShell, not #desktop/#mobileShell.
+       Without it, a visitor with JS off got the full shell and controls that can never work. -->
+  <noscript><style>
+    #maindiv, #middleDiv, #spShell { display: none !important; }
+    #nojs { display: block !important; }
+  </style></noscript>
 </head>
 
 <body>
+<!-- Shown ONLY by the <noscript> stylesheet in <head>; invisible whenever JS runs. -->
+<div id="nojs" style="display:none;max-width:640px;margin:14vh auto;padding:0 22px;font:15px/1.6 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#ddd;">
+  <h1 style="font-size:20px;margin:0 0 10px;color:#fff;">JavaScript is turned off</h1>
+  <p style="margin:0 0 12px;">This page is an emulator: it compiles and runs a console's own code in your browser, so it cannot work without JavaScript and WebAssembly. There is no reduced version to fall back to.</p>
+  <p style="margin:0 0 12px;">Turn JavaScript on for this site — or allow it in your content blocker — and reload. If you are in a private window with scripting restricted, a normal window will work.</p>
+  <p style="margin:0;"><a href="/" style="color:#7ab7ff;">Back to the rest of the site</a></p>
+</div>
 
     <!-- ══ DESKTOP UI ══════════════════════════════════════════════════ -->
     <div id="maindiv" class="container text-center">
@@ -861,6 +890,22 @@
     (function () {
       if (!window.Capability) return;                 // never break the page
       Capability.ready.then(function () {
+        // XBOX EDGE: L3 (btn 10) fires a BrowserBack KeyboardEvent AND history.back(),
+        // which UNLOADS a running emulator.  gba.html had NO guard of any kind.  Port of
+        // ps1.html:702-712, both halves (history sentinel + capture-phase key swallow).
+        // gba has no isMobile branch at all, so unlike the other five pages there is no
+        // UA token to correct here — the trap and the canvas rule are its whole fix.
+        try { history.pushState({ gba: 1 }, ''); } catch (e) {}
+        window.addEventListener('popstate', function () { try { history.pushState({ gba: 1 }, ''); } catch (_) {} });
+        window.addEventListener('keydown', function (e) {
+          if (e.key === 'BrowserBack' || e.key === 'BrowserForward' || e.key === 'GoBack') {
+            e.preventDefault(); e.stopPropagation();
+          }
+        }, true);
+        if (/\bXbox\b|\bPlayStation\b|\bNintendo\b|\bSmartTV\b|\bTizen\b|Web0S|\bAFT[A-Z]/i
+            .test(String(navigator.userAgent || ''))) {
+          try { document.documentElement.classList.add('console-ua'); } catch (e) {}
+        }
         function go() { Capability.autoGate(Capability.SPECS.gba, { startIds: ['btnPlayGame', 'spLoadBtn'] }); }
         if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', go);
         else go();

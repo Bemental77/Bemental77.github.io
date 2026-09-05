@@ -110,6 +110,11 @@ const PAGES = [
   // verified against the live files on 2026-09-05.
   { id: 'ps1',  url: '/ps1.html',  spec: { wasm: 'required' } },
   { id: 'snes', url: '/snes.html', spec: { wasm: 'required' } },
+  // gba is the ODD ONE OUT and is here to keep it honest: it has NO isMobile branch at
+  // all (so no UA token to correct), its canvas carries an INLINE width that only
+  // !important can beat, and it displays at 240x160 = 3:2 — the one page in this repo
+  // whose console rule must not reuse the 4:3 the other five share.
+  { id: 'gba',  url: '/gba.html',  spec: { wasm: 'required' } },
 ];
 
 // ---------------------------------------------------------------------------
@@ -209,6 +214,22 @@ const ARMS = [
       // asserted here: getBoundingClientRect reports the LAYOUT box and ignores
       // clip-path, so `ratio` measures the element (4:3) and could not see the crop
       // either way.  The crop is left declared once, at :24.
+      // gba asserts the RULE, not the box: #canvasDiv is display:none until start
+      // (gba.html:523), so there is nothing to measure pre-boot and `boxless` will be
+      // true.  cssAspect === '3 / 2' proves the .console-ua rule matched — and proves it
+      // did NOT get the 4:3 the other five use, which is the specific mistake available
+      // here.  backTrap is the load-bearing half: gba had no guard of any kind.
+      gba: (a) => {
+        const c = a.dcConsole || {}, b = a.backTrap || {};
+        const aspectOk = String(c.cssAspect || '').replace(/\s/g, '') === '3/2';
+        const ok = c.consoleClass === true && aspectOk
+                && b.keySwallowed === true && b.sentinel === true;
+        return { ok,
+                 detail: `console-ua=${c.consoleClass} cssAspect=${c.cssAspect} (must be 3 / 2, `
+                       + `NOT the 4:3 the other five use) boxless=${c.boxless} `
+                       + `backTrap{swallowed=${b.keySwallowed} sentinel=${b.sentinel}} `
+                       + `(gba: 240x160, canvasDiv is display:none until start)` };
+      },
       ps1: (a) => {
         const c = a.dcConsole || {}, b = a.backTrap || {};
         const ok = c.consoleClass === true && c.fillsWrapH === true
@@ -239,17 +260,31 @@ const ARMS = [
                        + `shell=${c.shellShown} backTrap{swallowed=${b.keySwallowed} `
                        + `sentinel=${b.sentinel}} (no .console-ua rule by design — :31 already scales)` };
       },
+      // ⚠ dreamcast is THE REPORTED PAGE ("the controls for dreamcast on the xbox chrome
+      // browser are broken"), and this judge used to assert layout ONLY — not the back-nav
+      // trap, and not the pad map, even though dcInput measures both and gamecube/ps1/snes
+      // all gate on backTrap.  The page whose bug started this campaign had the weakest
+      // criterion of the five.  It now asserts all three:
+      //   layout   — desktop shell + a canvas that fills it at 4:3
+      //   backTrap — L3/BrowserBack swallowed AND the history sentinel present
+      //   padMap   — one face, one system and one d-pad button survive packPad(), which is
+      //              the mapping the report actually named.  Measured, not assumed.
       dreamcast: (a) => {
-        const c = a.dcConsole || {};
+        const c = a.dcConsole || {}, b = a.backTrap || {}, m = (a.dcInput && a.dcInput.padMap) || {};
+        const padOk = m.btn0_B === true && m.btn9_START === true && m.btn12_UP === true;
         const ok = c.consoleClass === true && c.fillsWrapH === true
                 && Math.abs((c.ratio || 0) - 1.333) < 0.02
                 && c.wrapShown === true && c.shellShown === false
-                && c.canvasParent === 'canvasWrap';
+                && c.canvasParent === 'canvasWrap'
+                && b.keySwallowed === true && b.sentinel === true
+                && padOk;
         return { ok,
                  detail: `console-ua=${c.consoleClass} canvas ${c.canvasW}x${c.canvasH} `
                        + `fillsWrapH=${c.fillsWrapH} ratio=${c.ratio} wrap=${c.wrapShown} `
                        + `shell=${c.shellShown} parent=${c.canvasParent} `
-                       + `(a console must get the DESKTOP shell and a canvas that fills it at 4:3)` };
+                       + `backTrap{swallowed=${b.keySwallowed} sentinel=${b.sentinel}} `
+                       + `pad{B=${m.btn0_B} START=${m.btn9_START} UP=${m.btn12_UP}} `
+                       + `(desktop shell, canvas fills it at 4:3, L3 trapped, pad reaches packPad)` };
       },
     },
   },
@@ -544,6 +579,36 @@ async function runCell(arm, pg) {
     await page.goto(BASE + pg.url, { waitUntil: 'domcontentloaded' });
     out.navMs = Date.now() - t0;
 
+    // ABSORB THE coi-serviceworker RELOAD BEFORE PROBING ANYTHING.
+    // coi-serviceworker.js ends with `doReload: () => window.location.reload()` and
+    // fires it whenever crossOriginIsolated is false and the SW activates.  This rig
+    // uses a FRESH userDataDir per cell (deliberately — isolation is origin-scoped and
+    // persists), so that reload is GUARANTEED on first load of every page that ships the
+    // worker: gamecube, dreamcast, ps1, snes, gba.  Only n64 is exempt (it loads no
+    // coi-serviceworker, by design — it is single-threaded and needs no SAB).
+    // Racing it produced intermittent, page-specific `Execution context was destroyed,
+    // most likely because of a navigation` errors — 2 of 50 cells in one full run, both
+    // gamecube, on arms as unrelated as `console` and `mobile-ios`, and NOT reproducible
+    // on demand.  That reads like a page bug and is not one; it is the rig probing across
+    // a navigation the site is documented to perform.
+    // The catch is the POINT, not defensive padding: a destroyed context IS the reload we
+    // are waiting for, so it means "keep waiting", not "fail".  Bounded at ~6s; a page
+    // that never isolates simply proceeds and its own assertions speak.
+    out.coiSettle = await (async () => {
+      for (let i = 0; i < 30; i++) {
+        try {
+          const r = await page.evaluate(() => ({
+            coi: !!self.crossOriginIsolated,
+            ctl: !!(navigator.serviceWorker && navigator.serviceWorker.controller),
+          }));
+          if (r.coi || r.ctl) return { settled: true, ms: i * 200, coi: r.coi, ctl: r.ctl };
+          if (i >= 4) return { settled: false, ms: i * 200, coi: false, ctl: false, note: 'no SW on this page' };
+        } catch (_e) { /* context destroyed == the reload; keep waiting */ }
+        await new Promise((r) => setTimeout(r, 200));
+      }
+      return { settled: false, ms: 6000, timedOut: true };
+    })();
+
     // window.__cap is published by lib/capability.js once its async probes
     // resolve. Waiting for the PROMISE, not polling for a truthy value, is what
     // keeps a half-filled report from being read as a finished one.
@@ -677,7 +742,7 @@ async function runCell(arm, pg) {
         window.dispatchEvent(ev);
         const st = history.state || {};
         return { keySwallowed: ev.defaultPrevented,
-                 sentinel: !!(st.dc || st.gc || st.n64 || st.ps1 || st.snes || st.emu),
+                 sentinel: !!(st.dc || st.gc || st.n64 || st.ps1 || st.snes || st.gba || st.emu),
                  sentinelKeys: Object.keys(st).join(',') };
       } catch (e) { return { error: String(e).slice(0, 120) }; }
     }).catch(() => null);
@@ -739,8 +804,11 @@ async function runCell(arm, pg) {
     out.dcConsole = await page.evaluate(() => {
       try {
         // Each page names its canvas and wrapper differently, and the EXPECTED RATIO
-        // differs too — gamecube is 640x528 (1.2121), not 4:3.  The ratio is asserted
-        // per page in invariantFor, not here; this only reports what it measured.
+        // differs too — gba is 240x160 = 3:2 while the other five display at 4:3.
+        // (gamecube's 640x528 = 1.2121 is its BACKING STORE, not its display aspect;
+        // gamecube.html:58-59 letterboxes at 4/3 and is the authority.  Asserting
+        // 1.2121 would pin a ~10% vertical stretch as "correct".)
+        // The ratio is asserted per page in invariantFor, not here; this only reports.
         const PAIRS = [['dc-canvas', 'canvasWrap'], ['canvas', 'canvasDiv'], ['canvas', 'canvasWrap']];
         let c = null, w = null;
         for (const [ci, wi] of PAIRS) {
@@ -749,6 +817,13 @@ async function runCell(arm, pg) {
         }
         if (!c || !w) return null;
         const cr = c.getBoundingClientRect(), wr = w.getBoundingClientRect();
+        // COMPUTED aspect-ratio, not just the measured box.  gba's #canvasDiv ships
+        // `display:none` until the emulator starts, so its canvas has NO box to measure
+        // before boot and every dimension above reads 0.  getComputedStyle still resolves
+        // on a display:none element, so this proves the .console-ua RULE MATCHED — which
+        // is the thing under test — without booting a game or mutating the page.
+        const cssAspect = (() => { try { return getComputedStyle(c).aspectRatio; } catch (e) { return null; } })();
+        const boxless = !(cr.width > 0 && cr.height > 0);
         // The DESKTOP CONTAINER id differs per page — dreamcast/gamecube call it
         // `wrap`, n64 calls it `desktop` (n64/index.html:2689 hides $('desktop')).
         // Asserting dreamcast's id everywhere reports null and VOIDs a page that is
@@ -763,7 +838,12 @@ async function runCell(arm, pg) {
           fillsWrapH: Math.abs(cr.height - wr.height) <= 1,
           ratio: cr.height ? +(cr.width / cr.height).toFixed(3) : null,
           consoleClass: document.documentElement.classList.contains('console-ua'),
-          wrapShown: visAny(['wrap', 'desktop']), shellShown: vis('mobileShell'),
+          cssAspect, boxless,
+          // gba names them differently again: #maindiv is its desktop shell and #spShell
+          // its phone shell (gba.html:468 / :534).  visAny takes the first id that EXISTS,
+          // so adding them here is additive and cannot change the other five pages.
+          wrapShown: visAny(['wrap', 'desktop', 'maindiv']),
+          shellShown: visAny(['mobileShell', 'spShell']),
           canvasParent: c.parentElement ? c.parentElement.id : null,
         };
       } catch (e) { return { error: String(e).slice(0, 120) }; }
@@ -935,6 +1015,7 @@ async function rigSelfTest() {
   {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dmx-self-a-'));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
+      protocolTimeout: 120000,
       args: ['--no-sandbox', '--disable-dev-shm-usage'] });
   // [leak-guard] A SIGKILLed parent ORPHANS this browser — verified by test and
   // uncatchable in-process. `node tools/browser_leak_guard.js reap` kills it once
@@ -951,6 +1032,7 @@ async function rigSelfTest() {
   {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dmx-self-b-'));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
+      protocolTimeout: 120000,
       args: ['--no-sandbox', '--disable-dev-shm-usage'] });
     // [leak-guard] a SIGKILLed parent ORPHANS this browser (uncatchable in-process);
     // `node tools/browser_leak_guard.js reap` kills it once this process is gone.
@@ -985,6 +1067,7 @@ async function redirectTest() {
   const run = async (label, opts) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dmx-rd-${label}-`));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
+      protocolTimeout: 120000,
       args: ['--no-sandbox', '--disable-dev-shm-usage'] });
     // [leak-guard] a SIGKILLed parent ORPHANS this browser (uncatchable in-process);
     // `node tools/browser_leak_guard.js reap` kills it once this process is gone.
@@ -1057,6 +1140,7 @@ async function captestRun(pageList) {
   for (const pg of (pageList || PAGES)) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dmx-ct-${pg.id}-`));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
+      protocolTimeout: 120000,
       args: ['--no-sandbox', '--disable-dev-shm-usage'] });
     try { (await import('./browser_leak_guard.js')).default.guard(b, import.meta.url); } catch (_e) {}
     const p = await b.newPage();
@@ -1094,6 +1178,7 @@ async function noJsTest(pageList) {
   for (const pg of (pageList || PAGES)) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), `dmx-nojs-${pg.id}-`));
     const b = await puppeteer.launch({ headless: 'new', executablePath: CHROME, userDataDir: dir,
+      protocolTimeout: 120000,
       args: ['--no-sandbox', '--disable-dev-shm-usage'] });
     try { (await import('./browser_leak_guard.js')).default.guard(b, import.meta.url); } catch (_e) {}
     const p = await b.newPage();
