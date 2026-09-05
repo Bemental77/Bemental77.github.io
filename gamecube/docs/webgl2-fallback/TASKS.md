@@ -73,14 +73,99 @@ The chain, with the measurement for each link:
 |---|---|---|
 | guest executes | audio 0.75–1.0x, guest frames > 2800 | OK |
 | CP/FIFO fed, opcodes decoded | `decoderDraws` (`OpcodeDecoding.cpp:169-171`, backend-agnostic) 194 → 1,006,100 | OK |
-| **vertices loaded** | `[vtxcensus-jit] loaders=0 verts=0`; the non-jit `[vtxcensus]` line **never appears** (it reports `loaders=3 verts=256→2788` on the WGPU arm) | **BROKEN** |
-| vertex manager flushes | no draw opcodes in the ring, ever | dead downstream of the above |
+| ~~vertices loaded~~ | ~~`[vtxcensus]` never appears~~ | **RETRACTED — see below** |
+| vertex manager flushes | no draw opcodes in the ring, ever | consistent, cause not yet located |
 | GL overlay installed | `GLctxIsRecorder=true` at t=1s AND t=45s, `nMakes=1` | OK |
 | ring transport | HEAD=TAIL=9786 on both sides, same offset/capacity | OK |
 
-⇒ **A million decoded draws produce no loaded vertices.** That is the single remaining gap,
-and it sits in `VertexLoaderManager` / the `OpcodeDecoding` → vertex-loader hand-off on the
-OGL path, not in GL, not in the bridge, not in the ring.
+### ⚠ RETRACTED: "no vertices are ever loaded". The instrument was engine-specific.
+
+I claimed the missing `[vtxcensus]` line proved the vertex loader never runs. **It proves no
+such thing.** That line is printed by `worker_funcs.js:1000`, inside the
+`Module._recomp_render_fifo` block gated on `__recompLiveFrames` — it belongs to the
+**static-recomp engine's** render loop, not to Dolphin. It cannot print on a Dolphin-only
+arm no matter how well vertex loading works.
+
+Worse, the comparison that produced it was confounded at the root. `gamecube.html:1044`
+routes **by title**: Mario Party 4 gets the recomp engine, everything else keeps the JIT. My
+"WebGPU arm that renders" was running MP4, i.e. **recomp vs Dolphin**, not one Dolphin
+backend against another. (CLAUDE.md gate #10 already warns about exactly this routing.)
+
+**Re-measured on Sonic Adventure 2 Battle** — no decomp exists for it, so both arms are
+genuinely Dolphin+JIT, composited screenshots, same build:
+
+| arm (SAB, JIT engine) | t~25s | t~60s |
+|---|---|---|
+| WebGPU on, bare | 15.3% non-black / 182 colours | **36% / 414** |
+| no WebGPU, bare | 4.5% / 6 (static) | 4.5% / 6 (static) |
+| no WebGPU, `?hwRender=1` | 4.5% / 6 (static) | 4.5% / 6 (static) |
+
+⇒ **The headline survives the correction**: Dolphin renders with WebGPU and not without, on
+one ROM, one engine, one build. What does NOT survive is the claim about vertex loading, and
+any inference that rested on `[vtxcensus]`.
+
+⚠ The opcode histogram below was taken on the DEFAULT ROM (MP4), where engine routing makes
+attribution ambiguous even though the dolphin worker demonstrably ran (`SET_HW_RENDER`,
+`video_cb`). **Re-take it on SAB before building on it.**
+
+### Vertices ARE loaded — the opposite of what I claimed
+
+`totalVerts` @ `0x026B28A0` (`OpcodeDecoding.cpp:171-174`) is the free companion to
+`decoderDraws` and needs no rebuild. On the `?hwRender=1` / no-WebGPU arm:
+
+```
+t1  decoderDraws 210      totalVerts 840
+t2  decoderDraws 2026     totalVerts 8104
+t3  decoderDraws 226223   totalVerts 16750436
+```
+
+**16.75 million vertices**, and `OpcodeDecoding.cpp:211` calls
+`VertexLoaderManager::RunVertices<>(...)` unconditionally in that same `OnPrimitiveCommand`
+body, with `RefreshLoader<>` at `:349` populating the very map `bem_vtx_census` enumerates.
+⚠ Hedge: that census block is not inside an `if constexpr (is_preprocess)` guard (its own
+comment calls it an "ungated draw census"), so it counts both template instantiations and
+cannot separate real draws from FIFO preprocess passes.
+
+Why `[vtxcensus-jit] loaders=0` is a sampling artifact and not a finding: it fires only when
+`__vtxJitPumps` is exactly 600, 1800 or 3600 (`worker_funcs.js:481-502`), then disables
+itself at `__vtxJitDone >= 3`. Those land during early boot, before any loader exists — and
+it reads `loaders=0` on the arm that renders a full scene too.
+
+### Another premise of mine, corrected
+
+`__gcSoftwareRender` names the **page-side present path**, not the Dolphin backend
+(`gamecube.html:2727-2733`: the WGPU backend renders to an offscreen texture, reads pixels
+back and postMessages them in the same `{cmd:'render',pixels}` shape the Software renderer's
+`video_cb` uses). So "the working arm is Dolphin's Software Renderer" was wrong. `gpuSubmits`
+@ `0x026B352C` — incremented only by `WGPU/WGPUVertexManager.cpp:544` — reached 258,896, which
+the Software Renderer could not do. **The hardware vertex path works in this build.**
+
+### Hypothesis TESTED AND NEGATIVE: shader compilation mode
+
+`Video.cpp:129-136` (WGPU) sets `MAIN_GFX_BACKEND` **and**
+`ShaderCompilationMode::SynchronousUberShaders`. `Video.cpp:141-146` (GL) sets **neither**, so
+OGL runs at the default `Synchronous` (`GraphicsSettings.cpp:103-104`) = specialized GX
+shaders compiled per pipeline at runtime — exactly what native repeats 352 times
+(`ProgramShaderCache.cpp:451`) and what ours does 19/24/24 times at init and then never again.
+
+Tested WITHOUT a rebuild by writing `GFX.ini` (`[Settings]` / `ShaderCompilationMode = 1`;
+enum order from `VideoConfig.h:42-48`, so 1 = SynchronousUberShaders) beside the Dolphin.ini
+the worker already writes, patched into the shipped glue and then reverted.
+
+Result on SAB / no-WebGPU / `?hwRender=1`: **no change — 4.5% / 6 colours, static, at every
+sample.** Log confirms `[worker] TEST wrote GFX.ini ShaderCompilationMode=1` and
+`Active title: GSNE8P`, so the file was written on the right title.
+⚠ What is NOT proven: that Dolphin READ it. Same directory as Dolphin.ini, which demonstrably
+takes effect (`GFXBackend=OGL` is honoured), but consumption of GFX.ini was not directly
+witnessed. Re-test that before discarding the shader-mode theory entirely.
+
+### A trap in Video.cpp for whoever reads it next
+
+`Video.cpp:184-190` carries the comment *"Uncomment the next two lines to force the WGPU
+backend … Default OFF"* — and the two lines are **uncommented**, followed by an
+unconditional `return`, making the OGL-preferring block beneath dead code. Believed
+unreachable in an emscripten build (the `#ifdef __EMSCRIPTEN__` path returns at `:147-148`),
+so probably not the current bug — but the comment is a lie about its own state.
 
 ⚠ Two hypotheses that were TESTED AND KILLED, so they are not retried:
 - *"ContextReset undoes the recording overlay."* No — the overlay marker is still true 45s
