@@ -119,6 +119,42 @@ before use. Scan against game binaries with `tools/gcsdk_scan.py` / `tools/gcsdk
 `gamecube/tools/` — `dump_sab_pc.mjs`, `diagnose_gc.mjs`, `sab_disasm.py`, `gdb_memdump.py`,
 `memdiff.py`, and the `find_*.mjs` / `perf_*.mjs` family. Full table in `gamecube/docs/README.md`.
 
+## Running WITHOUT WebGPU (the console / Xbox case) — answered by the oracle 2026-09-05
+
+This file had **nothing** on this question, and its absence cost real time: the WASM page's
+own text asserted the no-WebGPU path "does not produce a usable picture — expect a flat green
+frame", which reads as *the fallback cannot work* and was used to justify holding Start down
+forever. The oracle says otherwise.
+
+Both fallback backends render this game correctly in native Dolphin. Measured with the
+mandatory-first-action command plus `-C Dolphin.Movie.DumpFrames=True`, frames written to
+`~/Library/Application Support/Dolphin/Dump/Frames`:
+
+| `-C Dolphin.Core.GFXBackend=` | frames (~10s, MP4) | picture |
+|---|---|---|
+| `OGL` | 389 | full 3D scene — characters, castle, terrain. Correct. |
+| `Software Renderer` | 126 | correct Hudson logo. Correct, just slow. |
+
+```bash
+~/gc_refs/dolphin-upstream/build-oracle/Binaries/dolphin-emu-nogui \
+  -C Dolphin.Core.CPUThread=True -C Dolphin.Core.CPUCore=1 \
+  -C Dolphin.Core.GFXBackend=OGL \
+  -C Dolphin.Movie.DumpFrames=True \
+  -e "/Users/caseybement/Downloads/Mario Party 4 (USA).iso"
+# quit: pkill -9 -f dolphin-emu-nogui   (frames land in Dump/Frames as framedump_N.png)
+```
+
+**Therefore a black screen without WebGPU is a bug in OUR bridge, not an inherent limit.**
+Do not re-derive "the fallback is useless" — it is not; it is unfinished.
+
+⚠ Frame dumping is the right instrument here and was not documented anywhere in this repo.
+It gives PIXELS from the oracle, which is the only thing that can settle a "does it render"
+question — a log line cannot, and neither can the absence of a crash.
+
+⚠ Xbox has no WebGPU at all (owner-reported from hardware: the page shows
+"This device is missing WebGPU"). That is what makes this path the product question for
+consoles rather than a debugging curiosity.
+
 ## Canonical build + probe loop (three discrete foreground steps — no wrapper)
 
 **Canonical = dual-core WebGPU: `build-wasm-4010` + `~/emsdk-upstream` (4.0.10) + `dolphin_worker_link_4010.sh`.**

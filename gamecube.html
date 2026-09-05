@@ -2338,11 +2338,26 @@ window.GcRate = (function () {
                   + 'through the shared-heap present path — the fast path, and the one every performance '
                   + 'number for this page was measured on.' };
     }
+    // ⚠ STAYS 'bad' — Start stays down — but the DIAGNOSIS below was too pessimistic and
+    // the correction matters, because it decides whether this is worth fixing.
+    // Oracle run 2026-09-05, native Dolphin dual-core on Mario Party 4, per
+    // gamecube/docs/ORACLES.md's mandatory-first-action command, frames dumped to disk:
+    //     GFXBackend=OGL                389 frames in ~10s — full 3D scene, correct
+    //     GFXBackend=Software Renderer  126 frames        — correct Hudson logo, just slow
+    // So NEITHER fallback is broken in Dolphin. "Does not produce a usable picture" is a
+    // property of THIS BUILD's bridge, not of the Software Renderer or of OGL, and the
+    // no-WebGPU black screen is therefore OUR bug and fixable — not a dead end and not a
+    // reason to tell a visitor their machine is at fault.
+    // (The original "flat green frame" note was measured on the PSO savestate, a different
+    // title; it is not contradicted for PSO, but it does not generalise, and it was being
+    // read as "the fallback cannot work". It can.)
     return { level: 'bad', short: 'render: SOFTWARE — NO WebGPU ⚠',
              why: 'WebGPU could not be acquired, so Dolphin force-selects its CPU Software Renderer '
-                + '(Video.cpp:147). On this build that path does not produce a usable picture — expect a '
-                + 'flat green frame and a frame counter stuck at 0. This is a GPU/browser problem on this '
-                + 'machine, NOT the emulator running slowly. Reason: ' + ((w && w.err) || 'unknown') };
+                + '(Video.cpp:147). On this build that path does not yet put a picture on the canvas, '
+                + 'so Start is held down rather than starting a black screen. That is a gap in THIS '
+                + 'build, not a fault in your device: native Dolphin renders this game correctly on '
+                + 'both its OpenGL and Software backends. Reason WebGPU was unavailable: '
+                + ((w && w.err) || 'unknown') };
   }
   // Returning from a hidden tab, rAF has been parked and _presentLastMs is stale by however
   // long the tab was away. Without this grace the watchdog would fire a PRESENT STALLED on
