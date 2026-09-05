@@ -427,7 +427,19 @@ function makeRecordingGL(rec, fallback) {
       s[0] = target; s[1] = dstOff; s[2] = off; s[3] = n; rec.emit(OP.bufferSubData, s, 4);
     }
   };
-  g.bufferData = (target, srcView, usage) => {
+  // ⚠ FIVE PARAMETERS, NOT THREE. WebGL2 adds
+  //   bufferData(target, srcData, usage, srcOffset, length)
+  // and emscripten uses that form by passing the WHOLE HEAP as srcData plus an
+  // element offset and length. This recorder took only (target, srcView, usage), so it
+  // dropped srcOffset/length and encoded byteOffset=0 with byteLength = the whole heap.
+  // MEASURED before this fix, on the replay context:
+  //   bufferData: ALLOC 67108864B x1  VIEW 536870912B x2  ALLOC 50331648B x1 ...
+  // 536,870,912 is exactly INITIAL_MEMORY — two half-gigabyte uploads, on a workload of
+  // ~6 trivial draws per frame. That is what gl.getError() was fencing on, which is why
+  // sweeping GETERR_EVERY changed nothing (8x fewer syncs, 8x longer each, same total).
+  // heapByteOff() below already handles exactly this (a)/(b)/(c) argument shape for the
+  // texSubImage paths; bufferData simply never got it.
+  g.bufferData = (target, srcView, usage, srcOffset, length) => {
     if (typeof srcView === 'number') {
       // ALLOCATE-ONLY form: glBufferData(target, size, usage) — no data. Dolphin's
       // streaming + uniform buffers allocate this way. Recording it as a 0-byte
@@ -436,8 +448,15 @@ function makeRecordingGL(rec, fallback) {
       // "uniform buffer too small" -> nothing renders. Sentinel off=0xFFFFFFFF.
       s[0] = target; s[1] = 0xFFFFFFFF; s[2] = srcView | 0; s[3] = usage;
     } else {
-      const off = (srcView && srcView.byteOffset) || 0;
-      const n = srcView ? srcView.byteLength : 0;
+      const bpe = (srcView && srcView.BYTES_PER_ELEMENT) || 1;
+      // Absolute byte offset: view's own offset PLUS srcOffset, which emscripten passes in
+      // ELEMENTS for the 5-arg form (same convention heapByteOff documents for (a)).
+      const off = ((srcView && srcView.byteOffset) || 0) + ((srcOffset || 0) * bpe);
+      // TRUE length: `length` when the 5-arg form supplies it, else the view's own extent.
+      // Taking byteLength unconditionally is what produced the 512 MB uploads.
+      const n = (length !== undefined && length !== null)
+        ? (length * bpe)
+        : (srcView ? srcView.byteLength : 0);
       s[0] = target; s[1] = off; s[2] = n; s[3] = usage;
     }
     rec.emit(OP.bufferData, s, 4);
