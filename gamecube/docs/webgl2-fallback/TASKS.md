@@ -1,5 +1,44 @@
 # WebGL2 fallback for devices with NO WebGPU (the Xbox case)
 
+## ★★ ROOT CAUSE FOUND AND FIXED 2026-09-05 — it was ONE predicate, and it disabled
+## ALL rendering on any backend that is not WGPU
+
+`OpcodeDecoding.cpp:203` skipped `RunVertices` entirely when
+`!Core::WGPUDeviceLiveOnThisThread()`. That predicate reads `tls_wgpu_device_live`, set
+**only** by `MarkWGPUDeviceThread()`, called **only** from the `WGPUGfx` constructor. On the
+OGL backend `WGPUGfx` is never constructed, so it was false forever and the gate fired on
+every draw. Six siblings read the same predicate (`Fifo.cpp:346/478/497`,
+`BPStructs.cpp:207/275`); `Fifo.cpp:333-335` names three of them — "EFB-copy trigger,
+RunVertices, VertexManager Flush".
+
+An interim gate for a genuine WGPU hazard (RunVertices reaching WGPU vertex-manager buffer
+paths on a device-less gpu_thread and never returning), guarded on `__EMSCRIPTEN__` alone —
+so it also disabled a backend with no WGPU device requirement at all.
+
+**Fix:** `WGPUDeviceLiveOnThisThread()` returns TRUE when the WGPU backend is not in use.
+Every call site asks "is it safe to do device work here?", and on a non-WGPU backend the
+honest answer is yes. The new flag is set at backend SELECTION (`Video.cpp`'s WGPU branch),
+not from the `WGPUGfx` ctor, so it is known before the first draw instead of racing it.
+
+| SAB, no WebGPU, `?hwRender=1` | before | after |
+|---|---|---|
+| gate-hit flag `0x026B3370` | 1 | **0** |
+| `fluReal` / `fluDrawn` | 0 / 0 | **384 / 384** |
+| `kDrawCall` | 0 | **384** |
+| `frames` | 0 | **385** |
+| pixels (composited screenshot) | 4.5% / 6 colours, static, every sample | **32.6% / 79 colours at t~25s** |
+| `video_cb` | 1 | 7 |
+
+⚠ **NOT finished.** Rendering is INTERMITTENT — 32.6% at t~25s, back to 4.5%/6 at t~45s and
+t~60s. Something still stops it after it starts. That is the next question, and it is a
+different one from "nothing draws".
+
+⚠ This is also why every downstream hypothesis tested negative — shader compilation mode,
+the `VertexManagerBase.cpp:1037` pipeline guard, the ring transport, the GL overlay. They
+were all innocent, and each negative result was correct. The break was upstream of all of
+them.
+
+
 Why this exists: the owner runs `gamecube.html` in Edge on an Xbox Series X. Xbox Edge
 exposes **no WebGPU**, so the page shows *"This device is missing WebGPU"* and holds Start
 down. This folder tracks getting a picture on that device.
