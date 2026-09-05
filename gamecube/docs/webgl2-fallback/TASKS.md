@@ -269,6 +269,41 @@ them there: the whole `BemStage` window at `0x026B3B98` (published only by
 (`worker_funcs.js:1000`). Both read zero on SAB/JIT because they never publish, not because
 nothing happened.
 
+## ★ THE 1.5 fps CAUSE: two 512 MB bufferData UPLOADS per run
+
+After the device-gate fix the page renders, but at ~1.5 fps. Chain, each step measured:
+
+1. `present` holds **75.8%** of replay time (auditor's per-opcode timing: 15,660 ms / 24 calls).
+2. Inside `present`, `gl.flush()` is free and `gl.getError()` carries all of it
+   (bracketed separately: flush 4 over 539 calls; getError all of the rest).
+3. `getError` is a SYMPTOM, not overhead. Sweeping `GETERR_EVERY`:
+   8 -> fps 1.41-1.65, 67 syncs; 64 -> fps 1.45-1.50, 8 syncs — **8x fewer syncs, 8x longer
+   each, same total, same fps.** It blocks until the GPU finishes work that genuinely takes
+   that long.
+4. The GPU is NOT busy with drawing: ~6 draw calls/frame, zero `readPixels`, zero
+   `blitFramebuffer`, zero `copyTexSubImage2D`, zero `finish`, 11 texture uploads total,
+   19 programs compiled once. Headful == headless, so not a rig artifact.
+5. The stall is NOT process-wide: a second WebGL2 context on the SAME page — on-screen and
+   size-matched to 640x528 so it is genuinely composited — fences at `cost=0.2`..`0.9`
+   while the replay context sits at `fps 1.31-1.53`.
+6. **What the replay context is actually asked to do:**
+   `bufferData: ALLOC 67108864B x1  VIEW 536870912B x2  ALLOC 50331648B x1  ALLOC 8388608B x1`
+   The ALLOCs are Dolphin's normal stream buffers (`VertexManagerBase.h:99-102` = 48/8/64/16 MB,
+   rounded by `OGLStreamBuffer.cpp:25` `NextPowerOf2`). **The two VIEWs are 536,870,912-byte
+   uploads — exactly the wasm heap size — of half a gigabyte each.**
+
+⇒ The fence waits on two 512 MB GPU uploads. Nothing in the guest workload asks for that.
+
+Next: `render-worker.js:457` replays a view-form bufferData as
+`g.bufferData(target, texHeapSrc(offset, len), usage)`, and `texHeapSrc` copies `len` bytes
+out of the heap. So `len` arrives as ~512 MB from the recorded descriptor — the defect is in
+what `gl-record.js` encodes for that call, or in what Dolphin passes when the stream buffer
+orphans. ⚠ I have NOT yet read the encoder side; that is the next step, and it is a runtime
+file, so no rebuild.
+⚠ Also unverified: whether these two uploads are once-per-run or repeat. Both totals in the
+getError sweep exceeded wall time, which means those deltas include main-thread suspension —
+the RATIO and the INVARIANCE are the load-bearing results there, not the absolutes.
+
 ## The open question
 
 
