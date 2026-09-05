@@ -25,13 +25,28 @@
 # SELECT — also a menu. Every Dreamcast figure published before this date came
 # from one of those two, and they are not the game:
 #
-#   scene                        duty  cost/frame  headroom  producible
-#   character select              19%    6.4 ms      5.2x      155 fps
-#   Pioneer 2 + player motion     41%   13.7 ms      2.4x       73 fps
+#   scene                        duty  cost/frame  headroom  producible  guest
+#   character select              19%    6.4 ms      5.2x      155 fps   1.0002x
+#   Pioneer 2, standing           37%   12.2 ms      2.8x       85 fps   0.9998x
+#   Pioneer 2, walking            37%   12.4 ms      2.7x       82 fps   0.9999x
 #
-# Same binary, same box. Real 3D costs 2.1x more per frame and gives up more
-# than half the headroom. A menu number therefore says nothing about the game,
-# and "PSO runs at 0.99991x / 29.97 presents" was true and useless.
+# Same binary (md5 31f2a9faa98cb87aa63db001c5fc9407, hash-guard STABLE), same
+# box, all three at load < 5.1. Real 3D costs ~1.9x more per frame than a menu
+# and gives up nearly half the headroom, so a menu number says nothing about
+# the game and "PSO runs at 0.99991x / 29.97 presents" was true and useless.
+#
+# ⚠ TWO THINGS THAT LOOK LIKE FINDINGS AND ARE NOT — both cost a wrong claim:
+#   * MOTION IS A NULL. Walking vs standing inside Pioneer 2 is 37% vs 37% duty
+#     on a quiet box. An earlier run made motion look like a 1.5x cost; that run
+#     sat at load 11.8-12.7 with a sibling agent building, and the "cost" was
+#     machine load moving under the arms. Do not quote a motion penalty.
+#   * DUTY/HEADROOM ARE LOAD-SENSITIVE, THE GUEST RATIO IS NOT — until it snaps.
+#     Quiet box: guest 0.9998x, ZERO one-second windows below 0.99x. At load
+#     12.7 the SAME scene put 9.3% of windows below 0.99x (floor 0.53x) with 11
+#     heartbeats at duty >= 95%. Headroom is the margin that absorbs the rest of
+#     the machine; heavy 3D has ~2.8x of it where a menu has 5.2x, which is why
+#     a real desktop can stutter here while this rig reads a clean 1.000x.
+#     ALWAYS report `uptime` beside any duty/headroom/capacity number.
 #
 # THE HEAVY SCENES ALREADY EXIST — they are git-tracked in dreamcast/states/
 # and, until this note, NOTHING in the repo referenced them, which is exactly
@@ -47,9 +62,11 @@
 #   dreamcast/states/pso2_pioneer2_hunters_guild_counter.state
 #   dreamcast/states/pso2_boot.state
 #
-# And drive MOTION (`--press 45000:ArrowUp:20000` — arrow keys are the DC ANALOG
-# stick; PSO walking is analog-only and digital input reads as "unable to
-# move"). A standing scene understates a moving one by ~1.5x on duty.
+# To drive input: `--press 45000:ArrowUp:20000` — arrow keys are the DC ANALOG
+# stick (PSO walking is analog-only; digital input reads as "unable to move"),
+# `m` is DC_A / menu confirm, `k` is DC_B / cancel (dreamcast.html:3724). Note
+# the null above: driving motion does NOT change the cost, so use input to
+# REACH a scene, not to make one heavier.
 #
 # ALWAYS screenshot the scene you claim (`--screenshot` + `--shotevery`). A
 # savestate that fails to restore cold-boots into a menu and still prints a
