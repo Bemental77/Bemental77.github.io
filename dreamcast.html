@@ -13,6 +13,7 @@
        module generalises; it does not replace this page's own probeWebGL2 or its
        [glinfo] pinning, which remain the authority on what the WORKER's context got. -->
   <script src="/lib/capability.js"></script>
+  <script src="/lib/xboxinput.js"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH. Gates BOTH Start
     // controls (#btnStart and the mobile splash's #mobileSplashStart — the phone
@@ -3092,6 +3093,9 @@
       setPhase('audio-init');
       await initAudio();
       booted = true;
+      // XBOX: the emulator is now running, so the LEFT STICK must drive THE GAME and
+      // not Edge's virtual cursor.  See lib/xboxinput.js — this is a no-op off Xbox.
+      try { window.XboxInput && XboxInput.gameMode('dreamcast booted'); } catch (e) {}
       setPhase('running');
       mark('booted');
       rebaseStallClocks();   // arm the stall detector from here, not from page load

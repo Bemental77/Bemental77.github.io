@@ -80,8 +80,31 @@ const JSON_ONLY = argv.includes('--json');
 // The three pages, with the capability spec each one actually needs. The specs
 // are the same shape lib/capability.js consumes and lib/capability.test.js
 // asserts, so a page and the rig cannot drift apart on what "required" means.
+// THE XBOX STICK CONTRACT, asserted identically on all six pages.
+// Shared rather than repeated six times, because the contract IS the same everywhere:
+//   1. the shared lib is present at all;
+//   2. NOTHING has taken the cursor away before Start (preStartWrites === 0) — this is
+//      the one that would strand a console visitor with no way to press any button;
+//   3. both transitions actually reach navigator.gamepadInputEmulation, in order;
+//   4. the LB+RB escape hatch arms in game mode and stops again on the way out.
+const xboxStickOk = (a) => {
+  const x = a.xboxInput || {};
+  return x.libLoaded === true && x.preStartWrites === 0 && x.preStartWanted === 'mouse'
+      && x.exercised === 'gamepad,mouse' && x.armedWatch === true
+      && x.restored === true && x.watchStopped === true;
+};
+const xboxStickDetail = (a) => {
+  const x = a.xboxInput || {};
+  return `stick{lib=${x.libLoaded} preStartWrites=${x.preStartWrites} (MUST be 0 — a cursor `
+       + `is the only way to press Start on a console) exercised=[${x.exercised}] `
+       + `escapeHatch=${x.armedWatch}->${x.watchStopped} restored=${x.restored}}`;
+};
+
 const PAGES = [
   { id: 'gamecube', url: '/gamecube.html',
+    // webgpu is 'required' and MUST stay in step with lib/capability.js (this rig fails
+    // on spec drift).  A 'degraded' experiment was reverted — see the note there: the gate
+    // is not what blocks this page, gamecube.html:2397 is.
     spec: { wasm: 'required', worker: 'required', coi: 'required', sab: 'required', webgpu: 'required' } },
   // ⚠ `webgl2Worker`, NOT `webgl2`. dreamcast.html transfers its canvas to the
   // emulator worker and renders WebGL2 only from there, so main-thread WebGL2 is
@@ -184,11 +207,12 @@ const ARMS = [
         const c = a.dcConsole || {};
         const ok = c.consoleClass === true && c.fillsWrapH === true
                 && Math.abs((c.ratio || 0) - 1.3333) < 0.02
-                && c.wrapShown === true && c.shellShown === false;
+                && c.wrapShown === true && c.shellShown === false
+                && xboxStickOk(a);
         return { ok,
                  detail: `console-ua=${c.consoleClass} canvas ${c.canvasW}x${c.canvasH} `
                        + `fillsWrapH=${c.fillsWrapH} ratio=${c.ratio} wrap=${c.wrapShown} `
-                       + `shell=${c.shellShown} (n64 is 640x480, exactly 4:3)` };
+                       + `shell=${c.shellShown} ` + xboxStickDetail(a) };
       },
       // gamecube got the SAME two-part console fix (token + .console-ua) plus a THIRD
       // part the other pages already had: a back-nav trap.  It had zero guards of any
@@ -200,13 +224,14 @@ const ARMS = [
                 && Math.abs((c.ratio || 0) - 1.3333) < 0.02
                 && c.wrapShown === true && c.shellShown === false
                 && c.canvasParent === 'canvasWrap'
-                && b.keySwallowed === true && b.sentinel === true;
+                && b.keySwallowed === true && b.sentinel === true
+                && xboxStickOk(a);
         return { ok,
                  detail: `console-ua=${c.consoleClass} canvas ${c.canvasW}x${c.canvasH} `
                        + `fillsWrapH=${c.fillsWrapH} ratio=${c.ratio} desktop=${c.wrapShown} `
                        + `shell=${c.shellShown} parent=${c.canvasParent} `
                        + `backTrap{swallowed=${b.keySwallowed} sentinel=${b.sentinel}} `
-                       + `(4:3 display aspect, NOT the 640x528=1.2121 backing store)` };
+                       + `(4:3, NOT the 640x528 backing store) ` + xboxStickDetail(a) };
       },
       // ps1 already had the back-nav trap (:702-712) — it is the page the others were
       // ported FROM — so its console defect was the isMobile token plus a canvas pinned
@@ -223,12 +248,13 @@ const ARMS = [
         const c = a.dcConsole || {}, b = a.backTrap || {};
         const aspectOk = String(c.cssAspect || '').replace(/\s/g, '') === '3/2';
         const ok = c.consoleClass === true && aspectOk
-                && b.keySwallowed === true && b.sentinel === true;
+                && b.keySwallowed === true && b.sentinel === true
+                && xboxStickOk(a);
         return { ok,
                  detail: `console-ua=${c.consoleClass} cssAspect=${c.cssAspect} (must be 3 / 2, `
                        + `NOT the 4:3 the other five use) boxless=${c.boxless} `
                        + `backTrap{swallowed=${b.keySwallowed} sentinel=${b.sentinel}} `
-                       + `(gba: 240x160, canvasDiv is display:none until start)` };
+                       + `(gba: 240x160, canvasDiv is display:none until start) ` + xboxStickDetail(a) };
       },
       ps1: (a) => {
         const c = a.dcConsole || {}, b = a.backTrap || {};
@@ -236,12 +262,13 @@ const ARMS = [
                 && Math.abs((c.ratio || 0) - 1.3333) < 0.02
                 && c.wrapShown === true && c.shellShown === false
                 && c.canvasParent === 'canvasWrap'
-                && b.keySwallowed === true && b.sentinel === true;
+                && b.keySwallowed === true && b.sentinel === true
+                && xboxStickOk(a);
         return { ok,
                  detail: `console-ua=${c.consoleClass} canvas ${c.canvasW}x${c.canvasH} `
                        + `fillsWrapH=${c.fillsWrapH} ratio=${c.ratio} desktop=${c.wrapShown} `
                        + `shell=${c.shellShown} backTrap{swallowed=${b.keySwallowed} `
-                       + `sentinel=${b.sentinel}} (ratio is the layout box; clip-path is invisible to it)` };
+                       + `sentinel=${b.sentinel}} ` + xboxStickDetail(a) };
       },
       // snes is the ONLY page that needed no .console-ua rule: snes.html:31 already
       // ships `height:100%; width:auto; aspect-ratio:4/3`, the very pattern the other
@@ -253,12 +280,13 @@ const ARMS = [
         const ok = c.consoleClass === true && c.fillsWrapH === true
                 && Math.abs((c.ratio || 0) - 1.3333) < 0.02
                 && c.wrapShown === true && c.shellShown === false
-                && b.keySwallowed === true && b.sentinel === true;
+                && b.keySwallowed === true && b.sentinel === true
+                && xboxStickOk(a);
         return { ok,
                  detail: `console-ua=${c.consoleClass} canvas ${c.canvasW}x${c.canvasH} `
                        + `fillsWrapH=${c.fillsWrapH} ratio=${c.ratio} desktop=${c.wrapShown} `
                        + `shell=${c.shellShown} backTrap{swallowed=${b.keySwallowed} `
-                       + `sentinel=${b.sentinel}} (no .console-ua rule by design — :31 already scales)` };
+                       + `sentinel=${b.sentinel}} ` + xboxStickDetail(a) };
       },
       // ⚠ dreamcast is THE REPORTED PAGE ("the controls for dreamcast on the xbox chrome
       // browser are broken"), and this judge used to assert layout ONLY — not the back-nav
@@ -277,14 +305,15 @@ const ARMS = [
                 && c.wrapShown === true && c.shellShown === false
                 && c.canvasParent === 'canvasWrap'
                 && b.keySwallowed === true && b.sentinel === true
-                && padOk;
+                && padOk
+                && xboxStickOk(a);
         return { ok,
                  detail: `console-ua=${c.consoleClass} canvas ${c.canvasW}x${c.canvasH} `
                        + `fillsWrapH=${c.fillsWrapH} ratio=${c.ratio} wrap=${c.wrapShown} `
                        + `shell=${c.shellShown} parent=${c.canvasParent} `
                        + `backTrap{swallowed=${b.keySwallowed} sentinel=${b.sentinel}} `
                        + `pad{B=${m.btn0_B} START=${m.btn9_START} UP=${m.btn12_UP}} `
-                       + `(desktop shell, canvas fills it at 4:3, L3 trapped, pad reaches packPad)` };
+                       + `(desktop shell, 4:3, L3 trapped, pad reaches packPad) ` + xboxStickDetail(a) };
       },
     },
   },
@@ -591,6 +620,22 @@ async function runCell(arm, pg) {
     };
     await applyThrottle();
 
+    // XBOX STICK-vs-CURSOR SPY, installed BEFORE any page script runs.
+    // On Xbox, Edge's default `navigator.gamepadInputEmulation = 'mouse'` makes the LEFT
+    // STICK drive a virtual cursor, so pushing the stick moves a pointer instead of the
+    // character — reported as "as soon as I touch the joystick the cursor is used again".
+    // The property does not exist in desktop Chrome, so defining it here is what lets this
+    // rig see the page's side of the contract at all.  It proves WHAT THE PAGE ASKS FOR
+    // AND WHEN.  It cannot prove the Xbox shell honours it — that is hardware.
+    await page.evaluateOnNewDocument(() => {
+      window.__gie = { writes: [], value: 'mouse' };
+      Object.defineProperty(Navigator.prototype, 'gamepadInputEmulation', {
+        configurable: true,
+        get() { return window.__gie.value; },
+        set(v) { window.__gie.value = v; window.__gie.writes.push(v); },
+      });
+    });
+
     // PROBE ON THE REAL PAGE. An earlier matrix probed about:blank and got
     // navigator.gpu=false in BOTH arms, proving nothing: about:blank has no
     // origin, no service worker, and no page-side probe to read.
@@ -776,6 +821,34 @@ async function runCell(arm, pg) {
                  sentinel: !!(st.dc || st.gc || st.n64 || st.ps1 || st.snes || st.gba || st.emu),
                  sentinelKeys: Object.keys(st).join(',') };
       } catch (e) { return { error: String(e).slice(0, 120) }; }
+    }).catch(() => null);
+
+    // ---- THE STICK MUST NOT BE STOLEN BEFORE START --------------------------
+    // The load-bearing assertion is `preStartWrites === 0`.  Setting 'gamepad' at page
+    // load would remove the cursor outright, and on a console the cursor is the ONLY way
+    // to press Start or pick a ROM — the page would be unoperable with the one input
+    // device the machine has.  So: cursor until the emulator runs, then the stick.
+    // Then exercise the two transitions directly, which proves the wiring without booting
+    // a game.  ⚠ It ends on cursorMode deliberately — that is the page's correct resting
+    // state, so this diagnostic leaves nothing behind (gate #8).
+    out.xboxInput = await page.evaluate(() => {
+      try {
+        const spy = window.__gie || { writes: [] };
+        const preStartWrites = spy.writes.length;
+        const lib = window.XboxInput;
+        if (!lib) return { libLoaded: false, preStartWrites };
+        const before = lib.report();
+        lib.gameMode('matrix probe');
+        const mid = lib.report();
+        lib.cursorMode('matrix probe restore');
+        const after = lib.report();
+        return { libLoaded: true, supported: lib.supported === true,
+                 preStartWrites,
+                 preStartWanted: before.wanted,
+                 exercised: spy.writes.slice(preStartWrites).join(','),
+                 armedWatch: mid.watching === true, restored: after.wanted === 'mouse',
+                 watchStopped: after.watching === false };
+      } catch (e) { return { libLoaded: false, error: String(e).slice(0, 120) }; }
     }).catch(() => null);
 
     out.dcInput = await page.evaluate(() => {

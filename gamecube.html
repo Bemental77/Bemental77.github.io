@@ -14,6 +14,7 @@
        the functional SAB/worker test. Does not replace __gcGpu, which stays the page's
        own render-path authority. -->
   <script src="/lib/capability.js"></script>
+  <script src="/lib/xboxinput.js"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH.
     // Measured on a desktop profile with no WebGPU adapter: this page logged
@@ -6879,6 +6880,8 @@ window.GcRate = (function () {
     [$('btnSave'), $('btnLoad'), $('btnExport'), $('btnImport'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
   }
   var started = false; async function startEmulator() { if (started) return; started = true;
+    // XBOX: stick drives the GAME from here, not Edge's cursor (lib/xboxinput.js).
+    try { window.XboxInput && XboxInput.gameMode('gamecube start'); } catch (e) {}
     // Baseline for the present watchdog's boot window (gcPresentHealth): "no first frame after
     // GC_PRESENT_BOOT_MS" is only meaningful relative to when the emulator was actually asked
     // to run. Also latches the Start guard off — startEmulator owns the button from here.

@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <script src="/lib/capability.js"></script>
+  <script src="/lib/xboxinput.js"></script>
   <meta charset="UTF-8" />
   <title>SNES Wasm</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -401,6 +402,8 @@
     Module._my_free(ptr);
     initCanvas();
     lastTs = 0; accum = 0; running = true;
+    // XBOX: stick drives the GAME from here, not Edge's cursor (lib/xboxinput.js).
+    try { window.XboxInput && XboxInput.gameMode('snes running'); } catch (e) {}
     setStatus('Running — ' + name);
     [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mFull')].forEach(function (b) { if (b) b.disabled = false; });
     if (isMobile) { $('mobileSplash').style.display = 'none'; checkOrientation(); }

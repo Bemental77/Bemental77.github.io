@@ -3,6 +3,7 @@
 
 <head>
   <script src="/lib/capability.js"></script>
+  <script src="/lib/xboxinput.js"></script>
     <title>GBA Wasm</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="keywords" content="GBA Emulator, Game Boy Advance, WebAssembly, HTML5">
@@ -906,6 +907,15 @@
             .test(String(navigator.userAgent || ''))) {
           try { document.documentElement.classList.add('console-ua'); } catch (e) {}
         }
+        // XBOX: gba has no page-side "now running" flag (nothing in this page ever
+        // shows #canvasDiv — the vendored core does), so the START GESTURE is the hook.
+        // Both ids are the same ones the capability gate already treats as "start".
+        ['btnPlayGame', 'spLoadBtn'].forEach(function (id) {
+          var el = document.getElementById(id);
+          if (el) el.addEventListener('click', function () {
+            try { window.XboxInput && XboxInput.gameMode('gba start'); } catch (e) {}
+          });
+        });
         function go() { Capability.autoGate(Capability.SPECS.gba, { startIds: ['btnPlayGame', 'spLoadBtn'] }); }
         if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', go);
         else go();

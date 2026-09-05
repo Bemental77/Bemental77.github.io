@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
   <script src="/lib/capability.js"></script>
+  <script src="/lib/xboxinput.js"></script>
   <meta charset="UTF-8" />
   <title>PS1 Wasm — Monster Rancher 2</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover" />
@@ -720,7 +721,7 @@
     }
     return fetchRomStreamAndBoot();
   }
-  var started = false; function startEmulator() { if (started) return; started = true; var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; ROM_SIZE = pick.size || 0; ROM_CHUNK_SIZES = pick.chunkSizes || null; SAVE_KEY = ROM_NAME + '.ps1state'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); bindAudioDiagCtx(); } } catch (e) {} pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...'); setStatus('Loading LLVM runtime...'); var s = document.createElement('script'); s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now(); document.body.appendChild(s); }
+  var started = false; function startEmulator() { if (started) return; started = true; try { window.XboxInput && XboxInput.gameMode('ps1 start'); } catch (e) {} var sel = $('romSelect'); if (sel) { var pick = ROMS[+sel.value] || ROMS[0]; ROM_NAME = pick.base; ROM_CHUNKS = pick.chunks; ROM_SIZE = pick.size || 0; ROM_CHUNK_SIZES = pick.chunkSizes || null; SAVE_KEY = ROM_NAME + '.ps1state'; sel.disabled = true; pageLog('[ui] selected ROM: ' + pick.label); } $('btnStart').disabled = true; try { var AC = window.AudioContext || window.webkitAudioContext; if (AC) { Module.preCreatedAudioContext = new AC(); if (Module.preCreatedAudioContext.resume) Module.preCreatedAudioContext.resume(); bindAudioDiagCtx(); } } catch (e) {} pageLog('[ui] loading /ps1/ps1Wasm/dist/pcsx_ww.js ...'); setStatus('Loading LLVM runtime...'); var s = document.createElement('script'); s.src = '/ps1/ps1Wasm/dist/pcsx_ww.js?v=' + Date.now(); document.body.appendChild(s); }
   $('btnStart').addEventListener('click', startEmulator);
   const DB_NAME = 'PS1WASMDB', STORE = 'PS1WASMSTATES'; var SAVE_KEY = ROM_NAME + '.ps1state';
   function openDB() { return new Promise((resolve, reject) => { var req = indexedDB.open(DB_NAME); req.onupgradeneeded = e => e.target.result.createObjectStore(STORE); req.onsuccess = e => resolve(e.target.result); req.onerror = () => reject(req.error); }); }

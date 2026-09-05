@@ -13,6 +13,7 @@
        lets tools/device_matrix.mjs ask every page the same questions. Loaded before <base>
        so its own absolute paths are unambiguous. -->
   <script src="/lib/capability.js"></script>
+  <script src="/lib/xboxinput.js"></script>
   <script>
     // Same honest-failure contract as the sibling pages, with the spec that makes
     // this the PORTABILITY REFERENCE: Capability.SPECS.n64 requires only
@@ -2429,6 +2430,8 @@ N64Rate.selfTest = function (logFn) {
 
   function startEmulator() {
     if (started) return; started = true;
+    // XBOX: stick drives the GAME from here, not Edge's cursor (lib/xboxinput.js).
+    try { window.XboxInput && XboxInput.gameMode('n64 start'); } catch (e) {}
     mark('start-pressed');
     var sel = $('romSelect');
     var pick = ROMS[+sel.value] || ROMS[0];
