@@ -134,6 +134,11 @@ void UndeclareAsGPUThread();
 // gpu_thread can decode + raise PE_FINISH without issuing cross-pthread wgpu* calls.
 void MarkWGPUDeviceThread();
 bool WGPUDeviceLiveOnThisThread();
+// Set once, at backend SELECTION time, when the WGPU backend is the one in use.
+// Read by WGPUDeviceLiveOnThisThread() so the WGPU-only device gates do not fire on a
+// backend that has no WGPU device requirement at all (OGL / Software).
+void MarkWGPUBackendSelected();
+bool WGPUBackendSelected();
 
 std::string StopMessage(bool main_thread, std::string_view message);
 

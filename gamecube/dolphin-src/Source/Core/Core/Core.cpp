@@ -345,8 +345,44 @@ void MarkWGPUDeviceThread()
   tls_wgpu_device_live = true;
 }
 
+// [device-gate scope fix 2026-09-05] Set at backend SELECTION (DolphinLibretro/Video.cpp),
+// not from the WGPUGfx ctor: the gates below must already know the answer before the first
+// draw, and the ctor runs too late to order against that safely.
+static std::atomic<bool> s_wgpu_backend_selected{false};
+void MarkWGPUBackendSelected()
+{
+  s_wgpu_backend_selected.store(true, std::memory_order_relaxed);
+}
+bool WGPUBackendSelected()
+{
+  return s_wgpu_backend_selected.load(std::memory_order_relaxed);
+}
+
+// ⚠ THIS RETURNS TRUE WHEN THE WGPU BACKEND IS NOT IN USE, AND THAT IS THE POINT.
+//
+// Seven call sites read this, and every one of them is really asking "is it safe to do
+// device work on this thread?" — they are the EFB-copy, RunVertices and VertexManager-Flush
+// gates plus the AsyncRequests pulls (see the list in Fifo.cpp:333-335). They were written
+// for a WGPU-specific hazard: RunVertices reaches the WGPU vertex-manager buffer paths on a
+// gpu_thread that owns no WebGPU device, and never returns.
+//
+// tls_wgpu_device_live is set ONLY by MarkWGPUDeviceThread(), called ONLY from the WGPUGfx
+// constructor. So on the OGL backend it is never set, this returned false forever, and all
+// seven gates fired on every draw — on a machine with NO WebGPU that is every draw of every
+// frame. MEASURED before this change, no-WebGPU + ?hwRender=1: the gate-hit flag at
+// 0x026B3370 reads 1, RunVertices is skipped, PrepareForAdditionalData is therefore never
+// called (VertexLoaderManager.cpp:485), m_is_flushed is never cleared
+// (VertexManagerBase.cpp:531 is its only writer), and so 2,286,965 of 2,286,965 Flush()
+// calls were no-ops with zero draws and zero frames. That is the whole reason GameCube
+// rendered only with WebGPU.
+//
+// On a backend with no WGPU device requirement the hazard does not exist, so the honest
+// answer to "is it safe here?" is yes. WGPU behaviour is unchanged: when the WGPU backend
+// IS selected this still reports genuine per-thread device liveness.
 bool WGPUDeviceLiveOnThisThread()
 {
+  if (!s_wgpu_backend_selected.load(std::memory_order_relaxed))
+    return true;
   return tls_wgpu_device_live;
 }
 

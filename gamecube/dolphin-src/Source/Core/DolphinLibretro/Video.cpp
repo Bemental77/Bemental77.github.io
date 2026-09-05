@@ -127,6 +127,9 @@ void Init()
     if (want_wgpu)
     {
       Config::SetBase(Config::MAIN_GFX_BACKEND, "WGPU");
+      // Arms the WGPU-only device gates (Core::WGPUDeviceLiveOnThisThread). Done HERE, at
+      // selection time, so the answer is known before the first draw.
+      Core::MarkWGPUBackendSelected();
       // [WGPU B1] Force UBERSHADER-EXCLUSIVE shader compilation. The WGPU backend's
       // CreateShaderFromSource returns the PRE-TRANSLATED naga uber WGSL (gamecube/wgsl/
       // dolphin_vk.{vert,frag}.wgsl) per stage; it has no runtime GLSL->WGSL translator, so it can
