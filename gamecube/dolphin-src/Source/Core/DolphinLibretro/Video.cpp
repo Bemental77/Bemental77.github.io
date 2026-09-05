@@ -142,7 +142,46 @@ void Init()
       return (h[0x07FF0000 >> 2] === 0x474C5244 && h[(0x07FF0000 >> 2) + 4] === 1) ? 1 : 0;
     });
     if (want_gl && SetHWRender(RETRO_HW_CONTEXT_OPENGLES3))
+    {
+      // ⚠ SET BOTH, exactly as the WGPU branch above does. This branch used to call
+      // SetHWRender and return having set NEITHER, and that asymmetry is the best
+      // explanation left for "OGL initialises and then never draws".
+      //
+      // MAIN_GFX_BACKEND: not strictly required — VideoBackendBase.cpp:224 registers OGL
+      // first, so backends.front() (MainSettings.cpp:250-251) already resolves to "OGL"
+      // under emscripten. It is set explicitly because relying on registration ORDER for
+      // the product's backend is a silent dependency, and because it makes the two
+      // branches read the same way. ⚠ It also means "GFXBackend=OGL was honoured" can
+      // never again be mistaken for evidence that a config file was read — it was the
+      // default all along, which is exactly how an ini-consumption test came back void.
+      //
+      // ⚠ SHADER MODE: DELIBERATELY NOT SET HERE. A forced
+      // ShaderCompilationMode::SynchronousUberShaders was tried and FALSIFIED — do not
+      // re-add it hoping it fixes the black screen.
+      //   Theory: left unset, OGL runs at the default Synchronous
+      //   (GraphicsSettings.cpp:103-104), so VertexManagerBase.cpp:1278 resolves every draw
+      //   through GetPipelineForUid() — a SPECIALIZED GLSL shader compiled at draw time —
+      //   and if that returns null, :1037's `if (m_current_pipeline_object)` skips the draw
+      //   with NO GL call and NO GL error. That matches the observed signature exactly
+      //   (decoder runs, vertices load, zero drawElements, glErrors=0). WGPU never hits it
+      //   because it forces ubershaders and takes the :1285 GetUberPipelineForUid path.
+      //   Test: this line, built and linked, branch WITNESSED at runtime via the log below.
+      //   Result: SAB / no-WebGPU / ?hwRender=1 stayed at 4.5% non-black, 6 colours, static
+      //   at every sample — byte-identical to without it. The theory is dead; the stage it
+      //   accused is not where the draws are lost.
+      //   It is not kept "just in case": OGL compiles GLSL natively, so ubershader-exclusive
+      //   has none of the justification WGPU has, and leaving it in would bake an unmotivated
+      //   choice into the only fallback path consoles can use.
+      //
+      // ⚠ This could NOT have been tested through a config file. The worker's Dolphin.ini is
+      // NOT consumed: requesting "Software Renderer" in it still produced `video_cb data=-1`
+      // (the HW/OGL signature), because this build configures through libretro core options
+      // programmatically (Boot.cpp:295, :333-334). And "GFXBackend=OGL was honoured" was
+      // never evidence of consumption either — see the MAIN_GFX_BACKEND note above.
+      Config::SetBase(Config::MAIN_GFX_BACKEND, "OGL");
+      MAIN_THREAD_EM_ASM({ postMessage({cmd: 'print', txt: '[ogl] Init: MAIN_GFX_BACKEND = OGL (explicit; shader mode left at default)'}); });
       return;
+    }
   }
   Config::SetBase(Config::MAIN_GFX_BACKEND, "Software Renderer");
   return;
