@@ -51,9 +51,74 @@ misled us for a while.
 The OGL backend initialises and then stops drawing while the guest keeps executing (guest
 frame counter passed 2800 in the same run).
 
+## Narrowed further: the backend INITIALISES fine and then never draws — because no
+## vertices are ever loaded
+
+Per-opcode histogram taken at the single `emit()` site in `gl-record.js` (temporary, since
+removed — no rebuild needed, that file is `importScripts`'d at runtime). Identical at t=2s
+and t=45s apart from two `bindVertexArray`:
+
+```
+createQuery:512  bindAttribLocation:180  bindVertexArray:27->29  useProgram:24
+attachShader:24  activeTexture:19  bindTexture:19  createShader:19
+```
+
+So the OGL backend **does** initialise — it creates 19 shaders, attaches 24, binds attribute
+locations, allocates 512 queries — and then issues **zero `drawElements` / `drawArrays`, ever.**
+It is not stuck in init and it is not erroring; it simply never draws.
+
+The chain, with the measurement for each link:
+
+| link | evidence | verdict |
+|---|---|---|
+| guest executes | audio 0.75–1.0x, guest frames > 2800 | OK |
+| CP/FIFO fed, opcodes decoded | `decoderDraws` (`OpcodeDecoding.cpp:169-171`, backend-agnostic) 194 → 1,006,100 | OK |
+| **vertices loaded** | `[vtxcensus-jit] loaders=0 verts=0`; the non-jit `[vtxcensus]` line **never appears** (it reports `loaders=3 verts=256→2788` on the WGPU arm) | **BROKEN** |
+| vertex manager flushes | no draw opcodes in the ring, ever | dead downstream of the above |
+| GL overlay installed | `GLctxIsRecorder=true` at t=1s AND t=45s, `nMakes=1` | OK |
+| ring transport | HEAD=TAIL=9786 on both sides, same offset/capacity | OK |
+
+⇒ **A million decoded draws produce no loaded vertices.** That is the single remaining gap,
+and it sits in `VertexLoaderManager` / the `OpcodeDecoding` → vertex-loader hand-off on the
+OGL path, not in GL, not in the bridge, not in the ring.
+
+⚠ Two hypotheses that were TESTED AND KILLED, so they are not retried:
+- *"ContextReset undoes the recording overlay."* No — the overlay marker is still true 45s
+  after ContextReset, and `emits` kept rising past it. (Also killable from the counters
+  alone: had the overlay been swapped out, `emits` would have frozen at 1039.)
+- *"The ring/consumer is broken."* No — see the transport row above.
+
+⚠ A counter that looked like the root cause and is VOID: `gpuSubmits` @ `0x026B352C` reads 0
+on the OGL arm, which reads as "draws decoded but never submitted". That address is written
+**only** by `VideoBackends/WGPU/WGPUVertexManager.cpp:543-544` — it is WGPU-only
+instrumentation and does not exist on the OGL path. `decoderDraws` @ `0x026B289C` IS
+backend-agnostic and is the one to quote. (Same class as CLAUDE.md gate #10's `[mips]`
+lesson: confirm what a value MEANS before building a theory on it.)
+
+## Native reference for the same stage
+
+Native OGL on the same ISO logs **352 shader lines** and repeatedly links real programs
+(`VideoBackends/OGL/ProgramShaderCache.cpp:451 "Program linked with warnings"`). Our OGL arm
+logs **zero** shader/pipeline activity after init. Both facts are consistent with the table
+above: ours builds its initial programs and then never reaches the per-draw path at all.
+
 ## The open question
 
-**Why does Dolphin's OGL backend issue no per-frame draws after init?**
+**Why does the OGL path load no vertices when the decoder is decoding a million draws?**
+
+⚠ `Video.cpp:140-146` is worth reading first and is a candidate, not a conclusion: the WGPU
+branch does `Config::SetBase(MAIN_GFX_BACKEND, "WGPU")` **and** forces
+`ShaderCompilationMode::SynchronousUberShaders`; the GL branch calls `SetHWRender` and
+returns having set **neither**. `GFXBackend = OGL` does reach Dolphin.ini (confirmed in the
+worker log), so the backend selection itself is probably fine — but the shader-mode
+asymmetry is unexamined, and an unready-pipeline state is one way a backend decodes without
+drawing.
+
+Next instrument, per the auditor and requiring the canonical 3-step rebuild: mirror
+`WGPUVertexManager.cpp:543-544`'s counter into `OGL/OGLVertexManager.cpp` at its draw
+submission (a distinct SAB address), and read it beside `decoderDraws` from one run.
+
+**Older framing, superseded by the table above:**
 
 The one ordering fact worth chasing first:
 
