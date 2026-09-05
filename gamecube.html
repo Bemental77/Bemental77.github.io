@@ -1081,42 +1081,72 @@ window.GcRate = (function () {
   //
   // Pure function of (srParam, recompParam, romBase) so ?ratetest=1 can assert the whole
   // table with no emulator and no worker.
+  // [sr-gx 2026-09-04] A FOURTH ARGUMENT: ?srrender=1, the RENDER arm of this engine.
+  //
+  // ?srimage=1 alone is unchanged — it opens the diagnostic panel and reports the boot's
+  // host-boundary trajectory, and renders nothing. ?srrender=1 additionally routes the
+  // image's GX output to the WebGPU consumer the recomp engine already uses.
+  //
+  // WHY IT IS A SECOND FLAG AND NOT A WIDENING OF THE FIRST. The two arms answer
+  // different questions and one of them is a MEASUREMENT that the other would perturb:
+  // ?srimage=1's whole product is the ordered boundary log of an unaided `__start`, and
+  // the render arm drives GX entry points by hand from the host, which puts calls in that
+  // log that the guest never made. Folding them together would mean every trajectory
+  // reading afterwards had the driver's fingerprints on it.
+  //
+  // RENDER NEVER TURNS THE ENGINE ON. It is strictly a modifier on an arm that already
+  // engaged, so ?srrender=1 by itself, or with a malformed/absent ?srimage=, changes
+  // nothing — and it can never resurrect the `conflict` or `refused` arms, which is what
+  // keeps test 21r's guarantee (never move a title off a 1.000x engine) intact.
   var SRIMAGE_TITLES = { SonicAdventure2Battle: 1 };
-  function routeImage(srParam, recompParam, romBase) {
+  function routeImage(srParam, recompParam, romBase, renderParam) {
+    var wantRender = (renderParam === '1');
+    // Every non-engaging return below goes through this, so `render` is false on all of
+    // them by construction rather than by remembering to write it out each time.
+    function off(o) { o.render = false; return o; }
     if (srParam !== '1' && srParam !== '0' &&
         srParam !== null && srParam !== undefined && srParam !== '')
-      return { mode: 'auto', engage: false, pin: false,
+      return off({ mode: 'auto', engage: false, pin: false,
                warn: 'ignoring malformed ?srimage=' + srParam + ' (only 1 and 0 are meaningful)',
-               reason: 'malformed ?srimage= — not engaging an engine on an unparseable value' };
+               reason: 'malformed ?srimage= — not engaging an engine on an unparseable value' });
     if (srParam !== '1')
-      return { mode: 'auto', engage: false, pin: false, warn: null,
-               reason: 'the SAB static-recomp image is opt-in (?srimage=1); it renders nothing yet' };
+      return off({ mode: 'auto', engage: false, pin: false,
+               warn: wantRender ? '?srrender=1 ignored: it is a modifier on ?srimage=1, not an engine switch'
+                                : null,
+               reason: 'the SAB static-recomp image is opt-in (?srimage=1); ?srrender=1 adds its renderer' });
     // Both engines forced at once is a conflict, and silently picking one would make the
     // A/B arm meaningless. recomp wins because it is the one that ships a playable title.
     if (recompParam === '1')
-      return { mode: 'conflict', engage: false, pin: false,
+      return off({ mode: 'conflict', engage: false, pin: false,
                warn: '?srimage=1 ignored: ?recomp=1 is also set and pins the ROM to Mario Party 4',
-               reason: '?recomp=1 and ?srimage=1 conflict — recomp wins (it is the shipping engine)' };
+               reason: '?recomp=1 and ?srimage=1 conflict — recomp wins (it is the shipping engine)' });
     if (romBase === null || romBase === undefined || romBase === '')
-      return { mode: 'forced', engage: true, pin: true, warn: null,
-               reason: '?srimage=1 — SAB static-recomp image forced; ROM pinned to Sonic Adventure 2 Battle' };
+      return { mode: 'forced', engage: true, pin: true, warn: null, render: wantRender,
+               reason: '?srimage=1 — SAB static-recomp image forced; ROM pinned to Sonic Adventure 2 Battle'
+                     + (wantRender ? '; ?srrender=1 routes its GX output to the WebGPU consumer' : '') };
     if (SRIMAGE_TITLES[romBase])
-      return { mode: 'forced', engage: true, pin: true, warn: null,
-               reason: '?srimage=1 — SAB static-recomp image forced for ' + romBase };
+      return { mode: 'forced', engage: true, pin: true, warn: null, render: wantRender,
+               reason: '?srimage=1 — SAB static-recomp image forced for ' + romBase
+                     + (wantRender ? '; ?srrender=1 routes its GX output to the WebGPU consumer' : '') };
     // NEVER MOVE A TITLE OFF AN ENGINE THAT ALREADY RUNS IT AT 1.000x. This arm was
     // written the other way first — pin unconditionally — and ?ratetest=1 test 21q
     // caught it: with Mario Party 4 selected, ?srimage=1 pinned the ROM away from the
     // one engine on this page that runs a game at hardware rate, onto one that renders
     // nothing. A debug flag is allowed to be worse than the default; it is not allowed
     // to silently take the best path away.
+    // ⚠ THE `refused` ARM SURVIVES ?srrender=1 UNCHANGED, and that is deliberate. The
+    // render arm makes this engine put a picture on the screen, which is exactly the
+    // argument someone would use to reopen this branch — and it would still be wrong.
+    // What MP4 has on the recomp engine is the GUEST RUNNING AT 1.000x; what this engine
+    // has is a driven render with no guest timeline at all. Test 21w pins that down.
     if (RECOMP_TITLES[romBase])
-      return { mode: 'refused', engage: false, pin: false,
+      return off({ mode: 'refused', engage: false, pin: false,
                warn: '?srimage=1 refused for ' + romBase + ': it already runs on the recomp engine at '
-                   + '1.000x, and the static-recomp image renders nothing',
-               reason: '?srimage=1 refused — ' + romBase + ' keeps the recomp engine' };
+                   + '1.000x, and the static-recomp image has no guest loop to replace it with',
+               reason: '?srimage=1 refused — ' + romBase + ' keeps the recomp engine' });
     // A translated image is ONE GAME'S BINARY. Running it under another disc is the exact
     // shape of the 2026-08-27 recomp bug, so it pins rather than refusing quietly.
-    return { mode: 'forced', engage: true, pin: true,
+    return { mode: 'forced', engage: true, pin: true, render: wantRender,
              warn: '?srimage=1 with ' + romBase + ' selected: the image IS Sonic Adventure 2 Battle, '
                  + 'so the ROM is pinned to it',
              reason: '?srimage=1 — ROM pinned to Sonic Adventure 2 Battle (was ' + romBase + ')' };
@@ -1735,6 +1765,40 @@ window.GcRate = (function () {
     var r21r = routeImage('1', null, 'MarioParty4');
     ck('21r ?srimage=1 is REFUSED for a title that already has an engine running it at 1.000x',
        r21r.engage === false && r21r.mode === 'refused' && r21r.warn !== null, JSON.stringify(r21r));
+
+    // ---- 21s..21x. THE RENDER ARM (?srrender=1) ----------------------------------------
+    // [sr-gx 2026-09-04] The image's GX output now has somewhere to go. These fence the
+    // new flag against the two ways a render arm could do damage: turning the engine on
+    // for someone who did not ask, and reopening a branch that exists to protect a
+    // 1.000x title.
+    //
+    // 21s is the compatibility claim that keeps every assertion ABOVE meaningful — all of
+    // them call routeImage with three arguments, so if the fourth defaulted to anything
+    // but "no render" they would have been silently testing the render arm instead.
+    var r21s = routeImage('1', null, 'SonicAdventure2Battle');
+    ck('21s ?srimage=1 WITHOUT ?srrender=1 engages the diagnostic arm and renders nothing',
+       r21s.engage === true && r21s.render === false, JSON.stringify(r21s));
+    var r21t = routeImage('1', null, 'SonicAdventure2Battle', '1');
+    ck('21t ?srimage=1&srrender=1 engages the image AND its renderer',
+       r21t.engage === true && r21t.render === true && r21t.mode === 'forced', JSON.stringify(r21t));
+    // The dangerous direction: a render flag that could switch the engine on by itself
+    // would put a plain visitor who typed one query parameter onto an engine with no
+    // guest loop. It must be inert without ?srimage=1.
+    var r21u = routeImage(null, null, 'SonicAdventure2Battle', '1');
+    ck('21u ?srrender=1 ALONE never engages the engine — it is a modifier, not a switch',
+       r21u.engage === false && r21u.render === false && r21u.warn !== null, JSON.stringify(r21u));
+    var r21v = routeImage('1', '1', 'SonicAdventure2Battle', '1');
+    ck('21v ?srrender=1 cannot override the recomp conflict: still conflict, still no render',
+       r21v.engage === false && r21v.mode === 'conflict' && r21v.render === false, JSON.stringify(r21v));
+    // 21w is 21r re-asserted THROUGH the new flag. This is the one that matters: the
+    // whole argument for reopening `refused` would be "but now it renders".
+    var r21w = routeImage('1', null, 'MarioParty4', '1');
+    ck('21w ?srrender=1 does NOT reopen the refusal for a 1.000x title — MP4 keeps the recomp engine',
+       r21w.engage === false && r21w.mode === 'refused' && r21w.render === false, JSON.stringify(r21w));
+    // And the malformed arm keeps its shape with the modifier present.
+    var r21x = routeImage('yes', null, 'SonicAdventure2Battle', '1');
+    ck('21x a malformed ?srimage= still stays off even with ?srrender=1 set',
+       r21x.engage === false && r21x.render === false && r21x.warn !== null, JSON.stringify(r21x));
 
     // ---- 23. PRESENT POLICY -----------------------------------------------------------------
     // Reproduces the shape MEASURED on the live recomp path: publishes at 60/s with a few ms of
@@ -6997,18 +7061,39 @@ window.GcRate = (function () {
 // engine never claims, so neither can start a second CPU path over the other's
 // renderer — the 2026-08-27 failure this page already paid for once.
 //
-// WHAT ENGAGING DOES, and what it deliberately does not do. It does NOT take over the
-// canvas, because there is nothing to put on it: the translated image runs SAB's own
-// `__start` on a flat MEM1 and models no device — no VI, no DI, no interrupt source —
-// so it produces no frame. It opens a diagnostic panel instead and reports the ordered
-// host-boundary trajectory. Presenting that as a game would be the "manufactured
-// number" failure in a different costume.
+// WHAT ENGAGING DOES, and what it deliberately does not do. ?srimage=1 alone does NOT
+// take over the canvas, because there is nothing to put on it: the translated image runs
+// SAB's own `__start` on a flat MEM1 and models no device — no VI, no DI, no interrupt
+// source — so its boot produces no frame. It opens a diagnostic panel instead and
+// reports the ordered host-boundary trajectory. Presenting that as a game would be the
+// "manufactured number" failure in a different costume.
+//
+// [sr-gx 2026-09-04] ?srrender=1 ADDS THE RENDER ARM, and the paragraph above is still
+// true of the boot — which is exactly why the render arm is a separate flag and why the
+// text it puts on screen says "driven", not "running".
+//
+// WHAT THE RENDER ARM ACTUALLY DOES. It does not add a renderer to this page. The image
+// translates SAB's OWN GX library out of main.dol, so its GX calls are guest stores to
+// the write-gather pipe at 0xCC008000; sr_gx.c captures that byte stream and
+// sr_render_worker.js posts it in the SAME {cmd:'frame', fifo, mem1, regions} shape
+// recomp_worker.js:1056 posts, so the relay below and Dolphin's OpcodeDecoder::RunFifo
+// consume it without knowing which engine produced it. Every FIFO byte is written by
+// translated SAB code.
+//
+// ⚠ AND WHAT IT IS NOT. The image's boot stops in __OSInitAudioSystem on a DSP register,
+// so it never reaches its own video init; the worker therefore CALLS SAB's GX entry
+// points directly. The pixels are the guest's, the schedule is the host's. There is no
+// guest main loop on this path, so NO GUEST RATE IS CLAIMED — not 1.000x, not anything.
+// This block deliberately never calls window.__gcRate.set(): a speed readout here would
+// be a number with no referent, which is the failure CLAUDE.md gate #9 exists to stop.
 (function () {
   var q0 = new URLSearchParams(location.search);
   var srParam = q0.has('srimage') ? q0.get('srimage') : null;
   var rcParam = q0.has('recomp') ? q0.get('recomp') : null;
-  var d0 = GcRate.routeImage(srParam, rcParam, null);
-  window.__gcSrImageRouting = { param: srParam, mode: d0.mode, engage: d0.engage,
+  var rnParam = q0.has('srrender') ? q0.get('srrender') : null;
+  var d0 = GcRate.routeImage(srParam, rcParam, null, rnParam);
+  window.__gcSrImageRouting = { param: srParam, renderParam: rnParam, mode: d0.mode,
+                                engage: d0.engage, render: d0.render,
                                 reason: d0.reason, romBase: null };
   if (d0.warn) console.warn('[srimage] ' + d0.warn);
   if (!d0.engage) { if (srParam !== null) console.log('[srimage] ' + d0.reason); }
@@ -7027,7 +7112,13 @@ window.GcRate = (function () {
     // aria-disabled: lib/capability.js is the sole writer of aria-disabled /
     // data-cap-blocked on these controls and gamecube.html:1674 defers to it, so writing
     // one here would forge a capability verdict this block has no standing to make.
-    ['btnStart', 'mobileSplashStart'].forEach(function (id) {
+    //
+    // ⚠ THE RENDER ARM MUST NOT HOLD START, and this is the one line where the two arms
+    // genuinely differ in what the page does. The consumer this arm feeds IS Dolphin's
+    // WebGPU backend, which only exists after a normal boot brings dolphin_worker up
+    // (worker_funcs.js:919 drops every recompFrame while __recompLive is false). Holding
+    // Start down would keep the renderer from ever existing to hand frames to.
+    if (!d0.render) ['btnStart', 'mobileSplashStart'].forEach(function (id) {
       var b = document.getElementById(id);
       if (!b) return;
       b.disabled = true;
@@ -7042,23 +7133,140 @@ window.GcRate = (function () {
     panel.textContent = '[srimage] ' + d0.reason + '\nloading the translated image…';
     document.addEventListener('DOMContentLoaded', function () { document.body.appendChild(panel); });
     if (document.body) document.body.appendChild(panel);
-    var w = new Worker('/gamecube/recomp/sr_image/sr_image_worker.js', { type: 'module' });
-    window.__srImage = { messages: [], done: false, error: null };
-    w.onerror = function (e) {
-      window.__srImage.error = e.message || String(e); window.__srImage.done = true;
-      panel.textContent += '\nworker error: ' + (e.message || e);
+
+    // The image lives at /gamecube/recomp/sr_image/ by default. ?srbase= points at an
+    // ALTERNATE build directory, which is how a capture-arm A/B or a not-yet-promoted
+    // build gets measured without a second copy of this page. It is a same-origin path
+    // prefix, so it is constrained to one: no scheme, no '..', trailing slash forced.
+    var srBase = '/gamecube/recomp/sr_image/';
+    if (q0.has('srbase')) {
+      var b0 = String(q0.get('srbase'));
+      if (/^\/[A-Za-z0-9_\-/.]*$/.test(b0) && b0.indexOf('..') === -1)
+        srBase = b0.charAt(b0.length - 1) === '/' ? b0 : b0 + '/';
+      else console.warn('[srimage] ignoring malformed ?srbase=' + b0);
+    }
+
+    if (!d0.render) {
+      // ---- THE DIAGNOSTIC ARM, unchanged.
+      var w = new Worker('/gamecube/recomp/sr_image/sr_image_worker.js', { type: 'module' });
+      window.__srImage = { messages: [], done: false, error: null };
+      w.onerror = function (e) {
+        window.__srImage.error = e.message || String(e); window.__srImage.done = true;
+        panel.textContent += '\nworker error: ' + (e.message || e);
+      };
+      w.onmessage = function (e) {
+        var m = e.data; window.__srImage.messages.push(m);
+        if (m.kind === 'done' || m.kind === 'error') window.__srImage.done = true;
+        panel.textContent += '\n' + (m.kind === 'done'
+          ? 'FINISHED  fault=' + m.fault + '  ' + m.ms.toFixed(0) + 'ms  boundary=' +
+            (m.log && m.log.total) + ' crossings / ' + (m.log && m.log.distinct && m.log.distinct.length) + ' distinct'
+          : JSON.stringify(m).slice(0, 400));
+        panel.scrollTop = panel.scrollHeight;
+      };
+      w.postMessage({ cmd: 'boot', base: srBase,
+                      mode: q0.get('srmode') === 'whole' ? 'whole' : 'walk' });
+      return;
+    }
+
+    // ================================================================ THE RENDER ARM
+    // The takeover is the recomp block's (gamecube.html startRecomp), with the three
+    // things that are MP4-specific removed — no disc prefetch, no memory card, no
+    // savestate routing — because none of them has a counterpart on this path.
+    var srState = window.__srImage = {
+      messages: [], done: false, error: null, engaged: false,
+      framesPosted: 0, framesRelayed: 0, acks: 0, lastFifoBytes: 0, mem1Sent: 0,
+      // The control arm, taken on ONE wasm with one md5: ?srcapture=0 leaves sr_gx.c
+      // counting WPAR stores but keeping no bytes, so every posted frame is an empty
+      // stream. A picture that survives THAT did not come from this capture.
+      capture: q0.get('srcapture') === '0' ? 0 : 1,
+      mode: q0.get('srmode') === 'main' ? 'main' : 'gx',
+      base: srBase,
     };
-    w.onmessage = function (e) {
-      var m = e.data; window.__srImage.messages.push(m);
-      if (m.kind === 'done' || m.kind === 'error') window.__srImage.done = true;
-      panel.textContent += '\n' + (m.kind === 'done'
-        ? 'FINISHED  fault=' + m.fault + '  ' + m.ms.toFixed(0) + 'ms  boundary=' +
-          (m.log && m.log.total) + ' crossings / ' + (m.log && m.log.distinct && m.log.distinct.length) + ' distinct'
-        : JSON.stringify(m).slice(0, 400));
+    function srSay(s) {
+      panel.textContent += '\n' + s;
       panel.scrollTop = panel.scrollHeight;
-    };
-    w.postMessage({ cmd: 'boot', base: '/gamecube/recomp/sr_image/',
-                    mode: q0.get('srmode') === 'whole' ? 'whole' : 'walk' });
+      console.log('[srimage] ' + s);
+    }
+    srSay('render arm: waiting for the WebGPU renderer to come up (press Start)');
+
+    function srTakeover(why) {
+      if (srState.engaged) return;
+      srState.engaged = true;
+      srSay('taking over (' + why + '), capture=' + srState.capture + ' mode=' + srState.mode);
+      // Same two moves the recomp path makes, for the same two reasons.
+      dolphin_worker.postMessage({ cmd: 'recompStart' });
+      // STOP the JIT guest for real. recomp_pause_cpu only breaks the dolphin-side CPU
+      // manager; the JIT loop lives in the ppc-worker THREAD and would keep executing
+      // against the SHARED guest RAM, stomping whatever mem1 this worker installs.
+      if (window.ppc_worker) {
+        try { window.ppc_worker.terminate(); } catch (e) {}
+        window.ppc_worker = null; window._bdLoopRunning = false;
+        srSay('ppc_worker terminated (JIT guest stopped)');
+      }
+      var origOnWorkerMsg = dolphin_worker.onmessage;
+      dolphin_worker.onmessage = function (e) {
+        if (e.data && e.data.cmd === 'recompAck') { srState.acks++; return; }
+        if (origOnWorkerMsg) origOnWorkerMsg(e);
+      };
+      var rw = new Worker('/gamecube/recomp/sr_image/sr_render_worker.js', { type: 'module' });
+      window.__srRenderWorker = rw;
+      rw.onerror = function (e) {
+        srState.error = e.message || String(e); srSay('worker error: ' + srState.error);
+      };
+      rw.onmessage = function (e) {
+        var m = e.data;
+        if (m.kind === 'frame') return;   // reserved; frames arrive as cmd, not kind
+        if (m.cmd === 'frame') {
+          srState.framesPosted++;
+          srState.lastFifoBytes = m.fifo.byteLength;
+          if (m.mem1) srState.mem1Sent++;
+          var tr = [m.fifo];
+          if (m.mem1) tr.push(m.mem1);
+          // skipRender:false — this path posts a driven frame at ~60/s and does not
+          // model backpressure, because there is no guest to fall behind. If the
+          // renderer is slow the frames simply queue; nothing is silently dropped.
+          dolphin_worker.postMessage({ cmd: 'recompFrame', n: m.n, fifo: m.fifo,
+                                       mem1: m.mem1, regions: [], skipRender: false }, tr);
+          srState.framesRelayed++;
+          return;
+        }
+        srState.messages.push(m);
+        if (m.kind === 'done' || m.kind === 'error') srState.done = true;
+        if (m.kind === 'ready')
+          srSay('image ready: MEM1 ' + m.ramSize + 'B, DOL ' + m.dolBytes + 'B, capture=' + m.capture);
+        else if (m.kind === 'step')
+          srSay('  ' + m.name + ' ' + m.addr + '  fault=' + m.fault +
+                '  fifo+' + m.fifoDelta + 'B  wpar-writes=' + m.writes +
+                (m.threw ? '  THREW ' + String(m.threw).slice(0, 120) : ''));
+        else if (m.kind === 'setup-done')
+          srSay('GX setup done: prologue=' + m.prologueBytes + 'B from ' + m.gxWrites +
+                ' WPAR stores (' + m.gxBytes + 'B), wpar-page-offset-max=' + m.offMax);
+        else if (m.kind === 'frames')
+          srSay('frame ' + m.n + ': ' + (m.last && m.last.fifoBytes) + 'B fifo (' +
+                (m.last && m.last.tailBytes) + 'B new), acks=' + srState.acks);
+        else if (m.kind === 'error')
+          srSay('ERROR: ' + m.message);
+        else
+          srSay(JSON.stringify(m).slice(0, 300));
+      };
+      rw.postMessage({ cmd: 'boot', base: srState.base, mode: srState.mode,
+                       capture: srState.capture, frames: (q0.get('srframes') | 0) || 0,
+                       colorCycle: q0.get('srcolor') === 'cycle' });
+    }
+
+    // Arm on the SAME signal the recomp block uses: the renderer having produced a frame
+    // (window._firstFrame) plus a settling second, with a wall-clock ceiling so a boot
+    // that never draws still hands over rather than hanging silently.
+    var srT0 = Date.now();
+    var srTimer = setInterval(function () {
+      if (typeof dolphin_worker === 'undefined' || !dolphin_worker) return;
+      if (window._firstFrame && !window.__srFirstFrameAt) window.__srFirstFrameAt = Date.now();
+      if (window.__srFirstFrameAt && Date.now() - window.__srFirstFrameAt >= 2000) {
+        clearInterval(srTimer); srTakeover('renderer up');
+      } else if (Date.now() - srT0 >= 90000) {
+        clearInterval(srTimer); srTakeover('90s ceiling — renderer may not be up');
+      }
+    }, 500);
   }
 })();
 

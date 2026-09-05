@@ -306,9 +306,32 @@ would produce a plausible wrong answer, which is what this stops."
    no measurement build should define it. */
 extern void gk_dev_read (uint32_t p, uint32_t n);
 extern void gk_dev_write(uint32_t p, uint32_t n);
+
+/* ------------------------------------------------ THE WRITE-GATHER PIPE IS NOT A SINK
+   [sr-gx 2026-09-04]  The store hook's lower bound moves from GK_HWREG_OFF down to
+   GK_WPAR_OFF, so the WPAR page reaches a hook for the first time.
+
+   WHY IT HAS TO.  This image translates SAB's OWN GX library out of main.dol -- GX is
+   not shimmed here the way gamecube/recomp/shims/src/gx_wgpipe.c shims MP4's decomp.
+   So every GX command this guest issues is a plain guest store to 0xCC008000, and
+   gk_tail() (:199-202) maps that to a 4 KB scratch page that NOTHING reads.  The old
+   comment at :118-121 calls WPAR "a sink"; that is true of the REGISTER (there is
+   nothing to read back) and false of the STREAM, which is the entire graphics output
+   of the machine.  Under the old bound those bytes were overwritten every 4 KB, so
+   "the boot never reached GX" and "GX ran and its output vanished" were not
+   distinguishable by any instrument this image had.
+
+   ONE compare, not two.  Everything at or above GK_WPAR_OFF goes to gk_tail_write(),
+   which does the WPAR-vs-device split itself (sr_gx.c) and forwards device writes to
+   gk_dev_write() unchanged.  A MEM1 store -- the overwhelming majority -- still costs
+   exactly one compare against one global, as it did before.
+
+   The load hook is deliberately NOT moved: WPAR really is write-only, and a read there
+   has no value to stage. */
+extern void gk_tail_write(uint32_t p, uint32_t n);
 #define GK_RD(p, n)    do { if ((p) >= GK_HWREG_OFF) gk_dev_read((p), (n)); } while (0)
 #define GK_WPRE(p, n)  ((void)0)
-#define GK_WPOST(p, n) do { if ((p) >= GK_HWREG_OFF) gk_dev_write((p), (n)); } while (0)
+#define GK_WPOST(p, n) do { if ((p) >= GK_WPAR_OFF) gk_tail_write((p), (n)); } while (0)
 #else
 #define GK_RD(p, n)    ((void)0)
 #define GK_WPRE(p, n)  ((void)0)

@@ -196,6 +196,7 @@ EXPORTS=$EXPORTS,_sr_image_fault,_sr_image_log,_sr_image_log_n,_sr_image_log_dro
 EXPORTS=$EXPORTS,_sr_image_log_reset,_sr_image_spr,_sr_image_set_spr,_sr_image_set_global
 EXPORTS=$EXPORTS,_sr_image_dev_log,_sr_image_dev_log_n,_sr_image_dev_reads,_sr_image_dev_writes
 EXPORTS=$EXPORTS,_sr_image_exi_clears,_sr_image_set_exi_model,_sr_image_set_watchdog,_sr_image_set_strict
+EXPORTS=$EXPORTS,_sr_image_set_dsp_model,_sr_image_dsp_events,_sr_image_aram_bytes
 EXPORTS=$EXPORTS,_sr_os_mode,_sr_os_get_mode,_sr_os_set_msr,_sr_os_get_msr
 EXPORTS=$EXPORTS,_sr_os_trace,_sr_os_trace_n,_sr_os_trace_reset
 # THE CLOCK, READ-ONLY (plus the two writes that are legitimately the host's).
@@ -222,10 +223,19 @@ EXPORTS=$EXPORTS,_sr_tb_hi,_sr_tb_lo,_sr_tb_cycles_hi,_sr_tb_cycles_lo
 EXPORTS=$EXPORTS,_sr_tb_calls,_sr_tb_stalls,_sr_tb_dec_exceptions,_sr_dec_get
 EXPORTS=$EXPORTS,_sr_tb_seed_parts,_sr_tb_reset,_sr_tb_enable,_sr_tb_is_enabled
 EXPORTS=$EXPORTS,_sr_hid0,_sr_set_hid0
+# [sr-gx 2026-09-04] THE WRITE-GATHER PIPE AS A STREAM (sr_gx.c).  _sr_gx_set_capture is
+# the RUN-TIME arm, so the capture-off control and the capture-on reading come from ONE
+# binary with ONE md5 -- the same discipline as _sr_image_set_exi_model and _sr_os_mode.
+# _sr_gx_writes/_bytes count with the capture OFF and are the ONLY way to tell "the boot
+# never reached GX" apart from "GX ran and its output was discarded"; _sr_gx_off_max is
+# the falsifier for the append-order assumption documented in sr_gx.c.
+EXPORTS=$EXPORTS,_sr_gx_set_capture,_sr_gx_get_capture,_sr_gx_fifo_base,_sr_gx_fifo_pos
+EXPORTS=$EXPORTS,_sr_gx_fifo_cap,_sr_gx_fifo_reset,_sr_gx_writes,_sr_gx_bytes
+EXPORTS=$EXPORTS,_sr_gx_dropped,_sr_gx_off_max
 
 set -x
 emcc ${SR_OPT:--O2} -DSR_MMIO -I"$SR" \
-  "$OUT/sr_gen.c" ${DISPATCH_SRC[@]+"${DISPATCH_SRC[@]}"} "$SR/sr_driver.c" "$SR/sr_host_os.c" "$SR/sr_image.c" \
+  "$OUT/sr_gen.c" ${DISPATCH_SRC[@]+"${DISPATCH_SRC[@]}"} "$SR/sr_driver.c" "$SR/sr_host_os.c" "$SR/sr_image.c" "$SR/sr_gx.c" \
   -o "$OUT/sab_image.mjs" \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT="${SR_ENV:-web,worker}" \
   -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 \

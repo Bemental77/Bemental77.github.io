@@ -1,0 +1,17 @@
+# [sr-gx 2026-09-04] Build outputs of gamecube/recomp/sr/build_image.sh under SR_OUT.
+# Same three reasons as gamecube/recomp/sr_image/.gitignore — read that file for the
+# full rationale; the short version is that `*.wasm` is LFS-routed, GitHub Pages does
+# NOT resolve LFS pointers (it served 133-byte pointers as a Dreamcast disc and the
+# game crashed at boot, commit ffa15b3), sr_gen.c is 33 MB of generated C that is
+# regenerable in one command, and sab_main.dol / sab_fst.bin are retail disc content.
+#
+# This directory exists because two -O2 compiles of the 33 MB translation unit cannot
+# share a box with 16 GB of RAM, so a second output tree keeps a relink here from
+# tearing the .js/.wasm pair a sibling agent's probe is reading.
+sab_image.mjs
+sab_image.wasm
+sab_main.dol
+sab_fst.bin
+sr_gen.c
+sr_dispatch.c
+skiplist.json
