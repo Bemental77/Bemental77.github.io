@@ -55,6 +55,40 @@ tracked_sane() {
 }
 gate "index not collapsed (git ls-files)" tracked_sane
 
+# --- the stale-worktree disk guard --------------------------------------------
+# [2026-09-04] Casey found the repo at 188 GB. 145 GB of that was
+# .claude/worktrees: 19 abandoned agent worktrees, each a full checkout of a
+# ~43 GB tree, left behind by agents that had finished. Nothing ever cleaned
+# them, so they only accumulated. macOS reports the repo under "Documents" in
+# Storage settings, so it reads as the user's own data.
+#
+# Removing a worktree destroys NOTHING — `git worktree remove` deletes only the
+# checkout; every branch and commit stays in .git (verified: both removed
+# branches and their commits were still present afterwards). So this is safe to
+# act on, and the fix is one command:
+#     git worktree list --porcelain | awk '/^worktree /{print $2}' \
+#       | grep '/.claude/worktrees/' \
+#       | while read -r w; do git worktree unlock "$w" 2>/dev/null; \
+#                             git worktree remove --force "$w"; done
+#     git worktree prune
+#
+# ⚠ Locks can be STALE: the 19 were locked by "claude agent … (pid 26783)",
+# a process that no longer existed. Check the pid is dead before unlocking —
+# a LIVE agent's worktree must be left alone.
+#
+# Warn, do not fail: a couple of live agent worktrees is normal operation.
+worktrees_bounded() {
+  local n sz
+  n=$(git worktree list 2>/dev/null | grep -c "/.claude/worktrees/" || true)
+  sz=$(du -sm .claude/worktrees 2>/dev/null | awk '{print $1}'); sz=${sz:-0}
+  echo "agent worktrees: $n  (.claude/worktrees = ${sz} MB)"
+  if [ "$sz" -gt 20000 ]; then
+    echo "  ⚠ over 20 GB of agent worktrees — prune the ones whose owner pid is dead (see comment above)"
+  fi
+  [ "$n" -le 12 ]
+}
+gate "agent worktrees not accumulating" worktrees_bounded
+
 # --- static correctness -------------------------------------------------------
 gate "SAB cell-collision audit"            python3 tools/sab_cell_audit.py
 gate "leaf-inline corpus"                  bash gamecube/bementalJIT/tests/run_leaf_inline_test.sh
