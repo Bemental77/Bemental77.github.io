@@ -500,7 +500,25 @@ function readIntArr(a, base) {
 // was draining no longer forms, so this drops to a rare error-report heartbeat (~1/sec
 // at native) rather than a per-frame brake. flush() every frame still keeps the driver
 // moving without blocking.
-const GETERR_EVERY = 8;   // [2026-06-26] was 64; at the now-unthrottled present rate (~46fps) a 64-frame
+// [2026-09-05] 240, raised from 8. The comment below records why 8 was chosen: at the
+// then-unthrottled ~46 fps present rate a 64-frame backlog overran the ANGLE-Metal command
+// buffer. Two things have changed since, and both remove that reasoning.
+//   1. The texScratch EAGER-COPY (see texHeapSrc) already "severs the backlog at its source,
+//      so the heavy per-frame getError() sync can be dropped" — this file's own words. It was
+//      never actually dropped.
+//   2. This path presents nowhere near 46 fps, so the per-frame backlog the 8 was sized
+//      against is far smaller.
+// MEASURED, SAB / no WebGPU / ?hwRender=1, composited screenshots:
+//   GETERR_EVERY=8    every sample 4.5% non-black / 6 colours (sampling lands mid-frame)
+//   GETERR_EVERY=240  29.4%/167, 43%/86, 29.4%/167, 29.4%/167   glErrors=0
+//   getError removed  29.4%/167, 42.4%/179, 29.4%/167, 29.4%/167  glErrors=0
+// and frames at equal elapsed went from ~80 to ~350 with the sync removed. 240 captures that
+// while KEEPING a periodic drain, so the driver still gets a reclaim point — removing it
+// outright would rely entirely on (1) with no safety valve.
+// ⚠ NOT a stability claim. The historical failure is specific — "texSubImage3D:
+// ArrayBufferView not big enough" then a frozen black canvas — and clearing it needs repeated
+// long runs, headless AND headful, on more than one GPU. This is one machine.
+const GETERR_EVERY = 240;
                           // backlog overran the ANGLE-Metal command buffer — drain the GPU far more often.
 let _fpsFrames = 0, _fpsLastMs = 0;   // main-thread [fps] metric (probe parses these)
 function present() {
