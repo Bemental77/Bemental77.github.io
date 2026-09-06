@@ -3867,6 +3867,45 @@
   };
   // Standard-mapping gamepad button index -> RETRO id. The old passthrough
   // used the raw index (html B=1 -> RETRO_Y etc.) — only A landed right.
+  // ---- CONTROLLER BOOTSTRAP, MIRRORED FROM ps1.html:791 ----------------------------
+  // ps1.html and n64 prompt "use game controls" on Xbox Edge; this page did not. The
+  // difference is here and nowhere else: PS1 registers a `gamepadconnected` listener that
+  // starts a continuous requestAnimationFrame poll of navigator.getGamepads() INDEPENDENTLY
+  // of the emulator. `grep -c gamepadconnected` was 1 on ps1.html and 0 on this page, and
+  // this page's only getGamepads() call lived inside frameLoop(), which does not start until
+  // after Start and a successful boot.
+  // Edge offers its "use game controls" affordance when a page USES the Gamepad API. With no
+  // listener and no poll before boot, this page never used it, so Edge never offered — and
+  // pressing right trigger (which IS a click on Xbox Edge) had nothing to trigger.
+  // ⚠ Do NOT make this conditional on a user-agent match. The console UA test is duplicated
+  // twelve times across seven files and is a guess at a string never observed on hardware;
+  // gating this on it would reintroduce the exact bug. Polling a couple of times per frame
+  // costs nothing on a desktop with no pad attached.
+  (function () {
+    var _gpPolling = false;
+    function _gpPoll() {
+      try { if (navigator.getGamepads) navigator.getGamepads(); } catch (e) {}
+      try { requestAnimationFrame(_gpPoll); } catch (e) { _gpPolling = false; }
+    }
+    function _gpStart(why) {
+      if (_gpPolling) return;
+      _gpPolling = true;
+      pageLog('[pad] polling started (' + why + ')');
+      try { requestAnimationFrame(_gpPoll); } catch (e) { _gpPolling = false; }
+    }
+    try {
+      window.addEventListener('gamepadconnected', function (e) {
+        var id = (e && e.gamepad && e.gamepad.id) ? String(e.gamepad.id) : 'unknown';
+        pageLog('[pad] controller connected: ' + id);
+        try { setStatus('Controller connected: ' + id); } catch (_e) {}
+        _gpStart('gamepadconnected');
+      });
+    } catch (e) {}
+    // Start immediately too: `gamepadconnected` only fires on a pad's FIRST input, so a pad
+    // already present when the page loads would otherwise go unseen until it is used.
+    _gpStart('page load');
+  })();
+
   const GP_BTN_TO_RETRO = [RB.B, RB.A, RB.Y, RB.X, RB.L, RB.R, RB.L2, RB.R2,
                            RB.SELECT, RB.START, /*L3*/14, /*R3*/15,
                            RB.UP, RB.DOWN, RB.LEFT, RB.RIGHT];
