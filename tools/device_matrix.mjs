@@ -116,10 +116,10 @@ const xboxStickDetail = (a) => {
 
 const PAGES = [
   { id: 'gamecube', url: '/gamecube.html',
-    // webgpu is 'required' and MUST stay in step with lib/capability.js (this rig fails
-    // on spec drift).  A 'degraded' experiment was reverted — see the note there: the gate
-    // is not what blocks this page, gamecube.html:2397 is.
-    spec: { wasm: 'required', worker: 'required', coi: 'required', sab: 'required', webgpu: 'required' } },
+    // Mirrors lib/capability.js — this rig fails on spec drift. 'degraded' because the
+    // WebGL2 fallback now renders on a no-WebGPU device (measured 29.4-42.4% non-black at
+    // ~35 present fps), so 'required' would assert something false.
+    spec: { wasm: 'required', worker: 'required', coi: 'required', sab: 'required', webgpu: 'degraded' } },
   // ⚠ `webgl2Worker`, NOT `webgl2`. dreamcast.html transfers its canvas to the
   // emulator worker and renders WebGL2 only from there, so main-thread WebGL2 is
   // not its requirement — and requiring it was a MEASURED false negative (under

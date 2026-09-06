@@ -2351,6 +2351,20 @@ window.GcRate = (function () {
     // (The original "flat green frame" note was measured on the PSO savestate, a different
     // title; it is not contradicted for PSO, but it does not generalise, and it was being
     // read as "the fallback cannot work". It can.)
+    // ⚠ 'warn', NOT 'bad', once the WebGL2 fallback is actually armed. gcApplyStartGuard
+    // disables Start on 'bad' only — its comment says 'warn' is deliberately exempt — and
+    // 'bad' asserts "this path does not produce a usable picture". That assertion is no
+    // longer true: with the hardware path selected the same build measures 29.4-42.4%
+    // non-black at ~35 present fps with glErrors=0, where the software path measured a
+    // static 4.5%/6. Holding Start down now would refuse a path that works.
+    // ⚠ Still never 'ok': the timer-query numbers cap guest work far below full speed, so
+    // this is "runs, reduced", which is exactly what 'warn' is for.
+    if (!window.__gcSoftwareRender && window.__gcRenderWorker) {
+      return { level: 'warn', short: 'render: WebGL2 fallback (no WebGPU)',
+               why: 'WebGPU is unavailable on this device, so the page is using its WebGL2 '
+                  + 'fallback instead of the fast WGPU path. It renders, but expect reduced '
+                  + 'performance. Reason WebGPU was unavailable: ' + ((w && w.err) || 'unknown') };
+    }
     return { level: 'bad', short: 'render: SOFTWARE — NO WebGPU ⚠',
              why: 'WebGPU could not be acquired, so Dolphin force-selects its CPU Software Renderer '
                 + '(Video.cpp:147). On this build that path does not yet put a picture on the canvas, '
@@ -2477,6 +2491,32 @@ window.GcRate = (function () {
     pageLog('[gpu] ' + v.short + ' — ' + v.why);
     pageLog('[gpu] webgl2 renderer=' + (window.__gcGpu.webgl2 || {}).renderer);
     if (v.level === 'bad') setStatus('No WebGPU on this machine — the emulator cannot render here. See 🩺 Diagnostics.');
+    // ⚠ NO WebGPU: RE-ENTER ON THE WEBGL2 FALLBACK, ONCE.
+    // The render path and the main-thread GL context are chosen at top level, BEFORE this
+    // probe resolves — so by the time we learn there is no WebGPU, the software path is
+    // already committed and its context is built. Deciding earlier is impossible (the answer
+    // is not known); deciding later means re-running that setup, which is a refactor of the
+    // context/descriptor block. Re-entering with the parameter that already selects the
+    // working path is the low-risk route to the same place, and it uses the exact code path
+    // that is measured good rather than a second one that would need its own proof.
+    // MEASURED on the fallback, SAB / no WebGPU, composited screenshots, same build:
+    //   software path (what a console gets today)  4.5% non-black / 6 colours, static
+    //   ?hwRender=1                                29.4%/167 .. 42.4%/179, glErrors=0
+    // plus ~35 present fps after GETERR_EVERY was raised. A console visitor cannot type a
+    // query parameter, so the page has to.
+    // ⚠ LOOP GUARD is mandatory: `hwauto=1` is set on the way out and checked on the way in,
+    // so a device that still reports no WebGPU after the reload does NOT bounce forever.
+    // ?hwRender=0 opts out entirely.
+    try {
+      var _qs = location.search || '';
+      var _already = /[?&]hwauto=1\b/.test(_qs) || /[?&]hwRender=[01]\b/.test(_qs);
+      if (window.__gcWebGPUUnavailable && !_already) {
+        pageLog('[gpu] no WebGPU — re-entering once on the WebGL2 fallback (?hwRender=1)');
+        var _sep = _qs ? '&' : '?';
+        location.replace(location.pathname + _qs + _sep + 'hwRender=1&hwauto=1' + location.hash);
+        return window.__gcGpu.webgpu;
+      }
+    } catch (e) { pageLog('[gpu] fallback re-entry failed: ' + (e && e.message)); }
     return window.__gcGpu.webgpu;
   })();
   gcRenderBadge();
@@ -2576,7 +2616,9 @@ window.GcRate = (function () {
   // moot under Software, so default it OFF. Opt back into HW by setting
   // window.__gcSoftwareRender=false before this script runs.
   if (typeof window.__gcSoftwareRender === 'undefined') {
-    try { window.__gcSoftwareRender = !/[?&]hwRender=1\b/.test(location.search); }
+    try {
+      window.__gcSoftwareRender = !/[?&]hwRender=1\b/.test(location.search);
+    }
     catch (e) { window.__gcSoftwareRender = true; }
   }
   if (typeof window.__gcRenderWorker === 'undefined') {
@@ -2784,6 +2826,22 @@ window.GcRate = (function () {
     // /tmp/gcshots-ogl 2026-07-13). Fix lands in VideoBackends/WGPU, not in backend selection.
     var _wgpu = !/[?&]wgpu=0/.test(location.search) && !window.__gcWebGPUUnavailable;
     if (_wgpu) { window.__gcSoftwareRender = true; window.__gcRenderWorker = false; }
+    // ⚠ NO WebGPU: TAKE THE HARDWARE PATH, not the software one.
+    // This decision has to live HERE and not with the other defaults further up, because
+    // __gcWebGPUUnavailable is set ASYNCHRONOUSLY by the adapter probe — at the earlier site
+    // it is still undefined, so a check there reads "WebGPU is fine" on every device. That is
+    // exactly what my first attempt did, and it silently did nothing.
+    // MEASURED, SAB / no WebGPU, composited screenshots, same build:
+    //   software path (old default)  4.5% non-black / 6 colours, static at every sample
+    //   hardware path                29.4%/167, 42.4%/179, 29.4%/167, 29.4%/167, glErrors=0
+    // plus ~35 present fps once GETERR_EVERY was raised. A console visitor was never going to
+    // type ?hwRender=1 to reach that, so the default has to do it.
+    // Explicit forms still win: ?hwRender=1 forces hardware, ?hwRender=0 forces software.
+    else if (!/[?&]hwRender=0\b/.test(location.search)) {
+      window.__gcSoftwareRender = false;
+      window.__gcRenderWorker = true;
+      pageLog('[gpu] no WebGPU — selecting the WebGL2 fallback (hardware path) instead of the software renderer');
+    }
     // [region-sweep] Thread BJIT_* tuning env vars from the URL into the worker's
     // Module.ENV (getenv-read by the JIT block cache region caps — no rebuild needed).
     // e.g. ?wgpu=1&bjit_max_gens=8&bjit_seal_batch=256&bjit_promote_after_ticks=20000000
