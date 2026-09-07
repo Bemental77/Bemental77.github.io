@@ -353,6 +353,126 @@
   const pumpChannel = new MessageChannel();
   pumpChannel.port1.onmessage = pumpTick;
 
+  // ---------------------------------------------------------------------------
+  // C++ THROW DECODER.  A crash report that says
+  //     "freerun run_iter threw (pump stopped): [object Object] sh4_pc=0x..."
+  // names NOTHING.  The link is `-fexceptions` (JS-based emscripten EH, see
+  // flycast-bridge/flycast_worker_link.sh:346), so a C++ throw arrives in JS as
+  // a `CppException` — a class whose ONLY field is `excPtr`
+  // (flycast_worker_emcc.js:452-457).  It has no `.message` and no `.stack`,
+  // which is exactly why `String(err)` degrades to `[object Object]` and why the
+  // shim's `stack=` suffix was absent from the field report.  That is a
+  // *formatting* dead end, not a missing signal: everything is reachable from
+  // excPtr.
+  //
+  //   type      = HEAPU32[(excPtr - 24 + 4) >> 2]     ExceptionInfo.get_type()
+  //               (flycast_worker_emcc.js:1365-1376 — the metadata header sits
+  //                24 bytes BELOW the thrown object)
+  //   mangled   = C string at HEAPU32[(type + 4) >> 2]
+  //               (Itanium type_info: vptr, then const char* __type_name)
+  //   message   = C string at HEAPU32[(excPtr + 4) >> 2] for anything derived
+  //               from std::runtime_error (libc++ __libcpp_refstring holds a
+  //               bare char* at offset 0 of the runtime_error subobject).
+  //               FlycastException IS one — core/types.h:231.
+  //
+  // Verified against the SHIPPED binary: `16FlycastException` and
+  // `18SH4ThrownException` are both present in flycast_worker_emcc.wasm, so the
+  // RTTI names survive the release link and this decode has something to read.
+  // Every step is bounds-checked and the whole thing is wrapped — a decoder
+  // that throws while decoding a crash would erase the crash.
+  // ---------------------------------------------------------------------------
+  function cstr(u8, p, max) {
+    if (!(p > 0) || p >= u8.length) return '';
+    let s = '';
+    for (let i = 0; i < max && p + i < u8.length; i++) {
+      const c = u8[p + i];
+      if (c === 0) break;
+      s += (c >= 0x20 && c < 0x7f) ? String.fromCharCode(c) : '?';
+    }
+    return s;
+  }
+  function describeThrow(Module, err) {
+    // Non-C++ throws (wasm traps, RangeError, ...) already stringify usefully.
+    if (!err || typeof err !== 'object' || !('excPtr' in err)) {
+      return (err && err.message) ? err.message : String(err);
+    }
+    let out = 'C++ throw';
+    try {
+      const u8 = Module.HEAPU8, u32 = Module.HEAPU32;
+      const excPtr = err.excPtr >>> 0;
+      out += ' excPtr=0x' + excPtr.toString(16);
+      const type = (excPtr >= 24) ? (u32[(excPtr - 20) >> 2] >>> 0) : 0;
+      const name = type ? cstr(u8, u32[(type + 4) >> 2] >>> 0, 96) : '';
+      if (name) out += ' type=' + name;
+      // std::runtime_error-derived: the what() string is one indirection in.
+      const msg = cstr(u8, u32[(excPtr + 4) >> 2] >>> 0, 160);
+      if (msg) out += ' what="' + msg + '"';
+    } catch (e) {
+      out += ' (decode failed: ' + e + ')';
+    }
+    return out;
+  }
+  // Guest-CPU state at the moment the throw escaped. flycast_ctx_snapshot is
+  // EXPORTED IN THE SHIPPED BINARY (rec_wasm.cpp:1072) and cases 0-11 are plain
+  // Sh4cntx field reads, so this costs nothing and is available on any deploy.
+  // SR bit 28 is BL (exception-blocked); Do_Exception throws
+  // FlycastException("Fatal: SH4 exception when blocked") when it is set
+  // (core/hw/sh4/sh4_interrupts.cpp:222-223), so SR is the field that
+  // discriminates that path from every other escape.
+  // NOTE: ctx_snapshot cases 60-67 read g_pc_ring, which NOTHING WRITES
+  // (grepped: rec_wasm.cpp declares it and only ever reads it) — they return 0
+  // and are deliberately not sampled here.
+  // Guest memory around the fault, read through the SAME export the ?peek
+  // command uses (Module._sh4_mem_read32, flycast_worker.js case 'peek'). The
+  // question a "pump stopped" report cannot answer on its own is "what code was
+  // the guest about to run, and what does its exception vector hold" — both are
+  // one read away and neither survives the tab closing.
+  function dumpGuest(Module, label, addr, words) {
+    try {
+      if (typeof Module._sh4_mem_read32 !== 'function') return;
+      const a = addr >>> 0, out = [];
+      for (let k = 0; k < words; k++) {
+        let v;
+        try { v = Module._sh4_mem_read32(a + k * 4) >>> 0; } catch (_) { v = 0xBADA5510; }
+        out.push(('0000000' + v.toString(16)).slice(-8));
+      }
+      postMessage({ cmd: 'print', txt: '[crash-mem] ' + label + ' 0x' + a.toString(16) + ': ' + out.join(' ') });
+    } catch (_) {}
+  }
+  function dumpCrashContext(Module) {
+    try {
+      const g = (i) => Module._flycast_ctx_snapshot(i) >>> 0;
+      const pc = (typeof Module._flycast_get_sh4_pc === 'function') ? (Module._flycast_get_sh4_pc() >>> 0) : 0;
+      const vbr = g(6), spc = g(9), pr = g(11);
+      dumpGuest(Module, 'pc-16',      (pc - 16) >>> 0, 12);
+      dumpGuest(Module, 'ram+0',      0x8c000000, 12);
+      // The general-exception handler is the code that decides where the guest
+      // goes after the FIRST fault, so it is dumped long enough to disassemble.
+      for (let i = 0; i < 6; i++)
+        dumpGuest(Module, 'vbr+0x100+' + (i * 32), (vbr + 0x100 + i * 32) >>> 0, 8);
+      dumpGuest(Module, 'vbr+0x400',  (vbr + 0x400) >>> 0, 8);
+      dumpGuest(Module, 'vbr+0x600',  (vbr + 0x600) >>> 0, 8);
+      dumpGuest(Module, 'pr-16',      (pr - 16) >>> 0, 8);
+      dumpGuest(Module, 'spc-16',     (spc - 16) >>> 0, 8);
+      // CCN: EXPEVT holds the code of the exception that was actually VECTORED
+      // (Do_Exception throws before it writes CCN_EXPEVT, so this is fault #1,
+      // not the fatal one). INTEVT/TRA round out the CPU's own account.
+      dumpGuest(Module, 'CCN EXPEVT/INTEVT', 0xFF000024, 2);
+      dumpGuest(Module, 'CCN TRA',          0xFF000020, 1);
+    } catch (_) {}
+  }
+  function sh4StateLine(Module) {
+    try {
+      if (typeof Module._flycast_ctx_snapshot !== 'function') return '';
+      const g = (i) => (Module._flycast_ctx_snapshot(i) >>> 0).toString(16);
+      const sr = Module._flycast_ctx_snapshot(1) >>> 0;
+      return ' sr=0x' + sr.toString(16) + ' BL=' + ((sr >>> 28) & 1) +
+             ' MD=' + ((sr >>> 30) & 1) +
+             ' spc=0x' + g(9) + ' ssr=0x' + g(10) + ' pr=0x' + g(11) +
+             ' vbr=0x' + g(6) + ' pend=0x' + g(2) + ' run=' + g(5);
+    } catch (_) { return ''; }
+  }
+
   // Asyncify-suspension guard: run_iter can SUSPEND internally (asyncify);
   // its export then returns immediately with the C-side in-flight flag still
   // set. Re-entering while suspended corrupts the asyncify state machine
@@ -391,7 +511,9 @@
       var pcTxt = '';
       try { if (Module._flycast_get_sh4_pc) pcTxt = ' sh4_pc=0x' + (Module._flycast_get_sh4_pc() >>> 0).toString(16); } catch (_) {}
       var stk = (err && err.stack) ? (' stack=' + String(err.stack).split('\n').slice(0, 4).join(' | ')) : '';
-      postMessage({ cmd: 'print', txt: '[flycast-shim] freerun run_iter threw (pump stopped): ' + (err && err.message ? err.message : String(err)) + pcTxt + stk });
+      postMessage({ cmd: 'print', txt: '[flycast-shim] freerun run_iter threw (pump stopped): ' +
+        describeThrow(Module, err) + pcTxt + sh4StateLine(Module) + stk });
+      dumpCrashContext(Module);
       return;
     }
     // Wall time actually spent emulating. Taken once, and reused as the
@@ -758,7 +880,8 @@
           var pcTxt = '';
           try { if (Module._flycast_get_sh4_pc) pcTxt = ' sh4_pc=0x' + (Module._flycast_get_sh4_pc() >>> 0).toString(16); } catch (_) {}
           var stk = (err && err.stack) ? (' stack=' + String(err.stack).split('\n').slice(0,4).join(' | ')) : '';
-          postMessage({ cmd: 'print', txt: '[flycast-shim] run_iter threw: ' + (err && err.message ? err.message : String(err)) + pcTxt + stk });
+          postMessage({ cmd: 'print', txt: '[flycast-shim] run_iter threw: ' +
+            describeThrow(Module, err) + pcTxt + sh4StateLine(Module) + stk });
         }
         break;
       }
