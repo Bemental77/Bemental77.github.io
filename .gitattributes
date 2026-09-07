@@ -79,6 +79,18 @@ gamecube/recomp/*.bin filter= diff= merge= -text
 # Track3, the disc was garbage, and the game crashed on run_iter #1 (the
 # "pump stopped sh4_pc=0xa0000002" break). Same fix as PS1/N64/GC: real blobs.
 dreamcast/discs/pso2/*.bin.parta* filter= diff= merge= -text
+# GENERALISED 2026-09-07 when the second Dreamcast disc was added. The pso2 lines
+# above are PATH-SPECIFIC, so a new game directory fell straight through to the
+# generic *.bin / *.cue / *.bin.parta* LFS rules at the top of this file — i.e.
+# every disc added after PSO would have shipped as 133-byte pointers and been
+# dead on prod in exactly the way the comment above describes. These globs cover
+# every present and future disc directory. (LFS is not an option regardless: the
+# budget was exceeded 2026-07-20.)
+dreamcast/discs/**/*.bin filter= diff= merge= -text
+dreamcast/discs/**/*.bin.parta* filter= diff= merge= -text
+dreamcast/discs/**/*.cue filter= diff= merge= -text
+dreamcast/discs/**/*.cdi filter= diff= merge= -text
+dreamcast/discs/**/*.gdi filter= diff= merge= -text
 # Static-recomp differential fixtures: the RELOCATED overlay section captured from
 # the running oracle. Not served by Pages, but it is a MEASUREMENT ARTIFACT — an
 # LFS pointer here means a clone without LFS silently differentials against a
