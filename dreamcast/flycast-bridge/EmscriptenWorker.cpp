@@ -1260,6 +1260,18 @@ static int load_disc_impl(const char* path) {
     // (mcfg_CreateDevices runs inside retro_load_game). Native oracle runs the
     // same way (controller polling, SB_MDSTAR double-buffered) and never storms.
     retro_set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
+    // PORT 1 = ONLINE PLAYER 2. Without this the guest's input reaches the worker
+    // and is never read: input_state_cb already serves 4 ports out of
+    // g_maple_pad_state (64 bytes each) and dreamcast.html already writes port 1,
+    // but flycast only POLLS a port that has a Maple device on it, and per the
+    // comment above every port stays MDT_None unless something plugs one in.
+    // Measured before this line: the guest's bytes arrived at the worker —
+    // port 1 = 0x81 lx=+32766 — while no device existed to read them, so nothing
+    // moved on screen. Gauntlet Legends is 4-player co-op, so this is the whole
+    // point of the online mode.
+    // A second controller also gets its own VMU from createDreamcastDevices(),
+    // which is what lets each player keep their own memory card.
+    retro_set_controller_port_device(1, RETRO_DEVICE_JOYPAD);
 
     // NOTE: the VMU (memory card) is attached from CORE code — see
     // createDreamcastDevices() in core/hw/maple/maple_cfg.cpp (__EMSCRIPTEN__).
@@ -1517,6 +1529,27 @@ void emscripten_run_iter(void) {
 EMSCRIPTEN_KEEPALIVE
 void emscripten_reset(void) {
     if (g_loaded) retro_reset();
+}
+
+// ── RESTORED EXPORTS: flycast_set_fog / flycast_set_modvol ──────────────────
+// These two are exported by flycast_worker_link.sh:81-82 and called by the shim
+// (flycast_worker.js:1069,1079) behind ?nofog=1 / ?nomodvol=1, and they exist in
+// the SHIPPED wasm — but NO SOURCE FILE IN THE TREE DEFINED THEM. Every relink
+// therefore died with
+//   wasm-ld: error: symbol exported via --export not found: flycast_set_fog
+// which is why the deployed worker still dates from before they went missing:
+// the Dreamcast core could not be relinked AT ALL. Found while adding Maple
+// port 1, and it blocked that outright.
+// Re-implemented against the options they were clearly written for
+// (core/cfg/option.h:441 ModifierVolumes, :455 Fog) rather than deleted from the
+// export list, because deleting them would quietly drop a render-bisect tool
+// that shipped code still calls.
+extern "C" {
+EMSCRIPTEN_KEEPALIVE
+void flycast_set_fog(int on) { config::Fog.override(on != 0); }
+
+EMSCRIPTEN_KEEPALIVE
+void flycast_set_modvol(int on) { config::ModifierVolumes.override(on != 0); }
 }
 
 EMSCRIPTEN_KEEPALIVE
