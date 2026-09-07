@@ -531,7 +531,7 @@
                 <button class="btn btn-primary mt-2 mb-2" onclick="myApp.newRom()">New Rom</button>
                 <button class="btn btn-primary mt-2 mb-2" onclick="myApp.saveStateLocal()">Save State</button>
                 <button class="btn btn-primary mt-2 mb-2" onclick="myApp.loadStateLocal()"
-                    rv-disabled="data.noLocalSave">Load State</button>
+                    rv-disabled="data.noLocalState">Load State</button>
                 <button class="btn btn-primary mt-2 mb-2" onclick="myApp.zoomOut()">Zoom Out</button>
                 <button class="btn btn-primary mt-2 mb-2" onclick="myApp.zoomIn()">Zoom In</button>
                 <button class="btn btn-primary mt-2 mb-2" onclick="myApp.showRemapModal()">Remap Buttons</button>
@@ -722,8 +722,9 @@
     <script>
     function spToggleMenu() {
         document.getElementById('spMenuOverlay').classList.toggle('open');
-        var noSave = window.myApp && myApp.rivetsData.noLocalSave;
-        document.getElementById('spLoadBtn').disabled = !!noSave;
+        // Gate on the SAVE STATE key, not the SRAM key — see _findInDatabase in script.js.
+        var noState = window.myApp && myApp.rivetsData.noLocalState;
+        document.getElementById('spLoadBtn').disabled = !!noState;
     }
     function spCloseMenu() {
         document.getElementById('spMenuOverlay').classList.remove('open');

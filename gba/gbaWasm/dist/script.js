@@ -62,6 +62,10 @@ class MyClass {
             hasRoms: false,
             romList: [],
             noLocalSave: true,
+            // Separate from noLocalSave on purpose: noLocalSave tracks the SRAM
+            // battery file, this tracks a SAVE STATE. They are different keys and
+            // the Load State button must gate on THIS one — see _findInDatabase.
+            noLocalState: true,
             lblError: '',
             remappings: null,
             remapMode: '',
@@ -443,34 +447,144 @@ class MyClass {
     // Module.HEAPU8.set() restores state in-place and all existing typed-array
     // views (idata, saveBuf, etc.) remain valid — no re-init needed.
 
-    async _compressHeap(u8) {
-        const cs = new CompressionStream('gzip');
-        const writer = cs.writable.getWriter();
-        writer.write(u8);
-        writer.close();
-        const chunks = [];
-        const reader = cs.readable.getReader();
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
-        }
-        return new Uint8Array(await new Blob(chunks).arrayBuffer());
+    // ── STREAMING HEAP <-> GZIP ───────────────────────────────────────────────
+    // These stream in SLICES so a save/restore never materialises a second copy
+    // of the 128 MB heap. Measured on desktop Chrome (tools/gba_state_persist_test.mjs),
+    // renderer RSS with a ROM running is already ~450 MB, and the old whole-buffer
+    // versions added a peak of +133 MB on save and +305 MB on restore — restore
+    // accumulated every decompressed chunk AND then copied the lot again through
+    // `new Blob(chunks).arrayBuffer()` before touching the heap. On a console-class
+    // memory budget that is the difference between working and dying.
+    //
+    // The reader is started BEFORE the writes and drained concurrently: writing a
+    // whole stream before reading it just moves the accumulation into the stream's
+    // internal queue, which is the same allocation with a different owner.
+    static get _SLICE() { return 4 << 20; }   // 4 MB
+
+    // The ROM's byte range inside the heap, or an empty range when no ROM is loaded.
+    //
+    // WHY THE ROM IS EXCLUDED FROM A SAVE STATE: it dominated the file. Measured on
+    // Kirby (8 MB ROM), the whole 128 MB heap gzipped to 4,972,418 B while the ROM
+    // ALONE gzips to 4,728,261 B — 95.1% of the state was a second copy of a file the
+    // page re-fetches on every load. The 16 MB ROMs in the list would have paid ~10 MB
+    // per state. On a console-class storage budget that is what gets refused or evicted.
+    //
+    // Skipping the range on restore (rather than re-injecting the ROM) is what makes
+    // this compatible in BOTH directions: a state written before this change still
+    // holds the real ROM bytes there, and those are by definition the same bytes the
+    // page has already loaded, so declining to write them changes nothing.
+    _romWindow() {
+        const base = this.romBufferPtr, size = this.romSize;
+        if (!(base >= 0) || !(size > 0)) return [0, 0];
+        return [base, Math.min(base + size, Module.HEAPU8.byteLength)];
     }
 
-    async _decompressHeap(u8) {
-        const ds = new DecompressionStream('gzip');
-        const writer = ds.writable.getWriter();
-        writer.write(u8);
-        writer.close();
+    // Compress Module.HEAPU8 straight out of the wasm heap. The caller must have
+    // PAUSED the emulator loop: slices are read over time, so a running game would
+    // tear the snapshot across them.
+    async _compressHeapLive() {
+        const cs = new CompressionStream('gzip');
         const chunks = [];
-        const reader = ds.readable.getReader();
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            chunks.push(value);
+        let total = 0;
+        const drain = (async () => {
+            const reader = cs.readable.getReader();
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(value); total += value.length;
+            }
+        })();
+        const writer = cs.writable.getWriter();
+        const len = Module.HEAPU8.byteLength;
+        const [rs, re] = this._romWindow();
+        let scratch = null;
+        for (let off = 0; off < len; off += MyClass._SLICE) {
+            await writer.ready;
+            const end = Math.min(off + MyClass._SLICE, len);
+            // Re-derive the view each slice: cheap, and correct even if the heap
+            // is ever reallocated under us.
+            if (re <= off || rs >= end) {
+                await writer.write(Module.HEAPU8.subarray(off, end));   // no ROM here: zero-copy
+            } else {
+                // This slice overlaps the ROM. Write zeros there instead of the ROM
+                // bytes — gzip collapses a zero run to almost nothing, and the ROM is
+                // re-supplied from the page on restore. Only the 2-4 slices that
+                // actually straddle the ROM pay for this copy.
+                if (!scratch) scratch = new Uint8Array(MyClass._SLICE);
+                const n = end - off;
+                const view = scratch.subarray(0, n);
+                view.set(Module.HEAPU8.subarray(off, end));
+                view.fill(0, Math.max(rs, off) - off, Math.min(re, end) - off);
+                await writer.write(view);
+            }
         }
-        return new Uint8Array(await new Blob(chunks).arrayBuffer());
+        await writer.close();
+        await drain;
+        const out = new Uint8Array(total);
+        let o = 0;
+        for (const c of chunks) { out.set(c, o); o += c.length; }
+        return out;
+    }
+
+    // Decompress straight INTO the wasm heap. Peak extra memory is one gzip output
+    // chunk, not another 128 MB.
+    // ⚠ Deliberate trade: this writes as it decodes, so a stream that fails PART WAY
+    // leaves the heap half-overwritten. The old whole-buffer version could not corrupt
+    // the heap that way — but it is also the version that could not run at all on a
+    // memory-constrained device. gzip's CRC is checked at close(), so a truncated or
+    // corrupt state throws after the writes; the caller must treat a throw here as
+    // "this session is gone, reload the ROM", which is what restoreFailed does.
+    async _decompressIntoHeap(compressed) {
+        const ds = new DecompressionStream('gzip');
+        const heap = Module.HEAPU8;
+        let off = 0;
+        const drain = (async () => {
+            const reader = ds.readable.getReader();
+            const [rs, re] = this._romWindow();
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const end = off + value.length;
+                if (end > heap.length)
+                    throw new Error('save state is larger than the heap (' + end + ' > ' + heap.length + ')');
+                if (re <= off || rs >= end) {
+                    heap.set(value, off);
+                } else {
+                    // Do not overwrite the ROM. Whatever the state holds there is either
+                    // zeros (states written by this build) or an identical copy of the ROM
+                    // (states written before it) — in both cases the ROM the page just
+                    // loaded is the correct bytes, so skipping the range is right for old
+                    // and new states alike.
+                    if (rs > off) heap.set(value.subarray(0, rs - off), off);
+                    if (re < end) heap.set(value.subarray(re - off), re);
+                }
+                off = end;
+            }
+        })();
+        const writer = ds.writable.getWriter();
+        await writer.write(compressed);
+        await writer.close();
+        await drain;
+        if (off !== heap.length)
+            throw new Error('save state size mismatch (' + off + ' != ' + heap.length + ')');
+        return off;
+    }
+
+    // Ask for storage that the browser will not evict under pressure. Without this
+    // the origin is "best-effort" and a multi-MB state is exactly what gets reclaimed
+    // first on a device with a small storage budget — which reads to the visitor as
+    // "my save state vanished after a refresh". Chromium grants this on engagement
+    // without prompting; a refusal is not fatal, so this never blocks a save.
+    async _requestPersistentStorage() {
+        if (this._persistAsked) return this._persistGranted;
+        this._persistAsked = true;
+        try {
+            if (navigator.storage && navigator.storage.persist) {
+                this._persistGranted = await navigator.storage.persisted() || await navigator.storage.persist();
+                console.log('Persistent storage:', this._persistGranted ? 'granted' : 'DENIED (state may be evicted)');
+            }
+        } catch (e) { console.log('Persistent storage request failed:', e.message); }
+        return this._persistGranted;
     }
 
     async saveStateLocal() {
@@ -478,19 +592,38 @@ class MyClass {
         const key = this._getSaveKey();
         if (!key) { toastr.error('No ROM loaded.'); return; }
         toastr.info('Saving state…');
+        // PAUSE while the heap is walked. The old code copied all 128 MB in one
+        // synchronous set() so it could snapshot under a running loop; streaming
+        // reads the heap over several turns instead, so the loop has to hold still
+        // or the state tears across slices. A save is a moment of pause anyway.
+        const wasRunning = this.isRunning;
+        this.isRunning = false;
+        let compressed;
         try {
-            // Snapshot full 128 MB heap while the game loop keeps running
-            const snap = new Uint8Array(Module.HEAPU8.byteLength);
-            snap.set(Module.HEAPU8);
-            const compressed = await this._compressHeap(snap);
-            this._putDB(key + '.state', compressed,
-                () => {
-                    this.rivetsData.noLocalSave = false;
-                    toastr.info('State saved (' + (compressed.byteLength / 1024 / 1024).toFixed(1) + ' MB).');
-                },
-                () => toastr.error('State save failed.')
-            );
-        } catch (e) { toastr.error('State save error: ' + e.message); }
+            compressed = await this._compressHeapLive();
+        } catch (e) {
+            this.isRunning = wasRunning;
+            toastr.error('State save error: ' + e.message);
+            return;
+        }
+        this.isRunning = wasRunning;
+        await this._requestPersistentStorage();
+        this._putDB(key + '.state', compressed,
+            () => {
+                this.rivetsData.noLocalSave = false;
+                this.rivetsData.noLocalState = false;
+                toastr.info('State saved (' + (compressed.byteLength / 1024 / 1024).toFixed(1) + ' MB).');
+            },
+            // A put can fail for a reason the visitor can act on (out of storage),
+            // so say which rather than a bare 'failed'.
+            (ev) => {
+                const err = ev && ev.target && ev.target.error;
+                const nm = err && err.name ? err.name : 'unknown error';
+                toastr.error(nm === 'QuotaExceededError'
+                    ? 'State save failed — out of browser storage on this device.'
+                    : 'State save failed (' + nm + ').');
+            }
+        );
     }
 
     async loadStateLocal() {
@@ -501,14 +634,15 @@ class MyClass {
             try {
                 this.isRunning = false;
                 const compressed = data instanceof Uint8Array ? data : new Uint8Array(data);
-                const heap = await this._decompressHeap(compressed);
-                // Restore heap in-place — typed-array views stay valid
-                Module.HEAPU8.set(heap);
+                // Decompresses IN PLACE into the heap — typed-array views stay valid.
+                await this._decompressIntoHeap(compressed);
                 this.isRunning = true;
                 toastr.info('State restored.');
             } catch (e) {
-                this.isRunning = true;
-                toastr.error('State restore error: ' + e.message);
+                // The heap may be partially overwritten — see _decompressIntoHeap.
+                // Stay stopped and say so plainly rather than run a corrupt machine.
+                this.isRunning = false;
+                toastr.error('State restore failed — load the ROM again. (' + e.message + ')');
             }
         }, () => toastr.error('No save state found for this ROM.'));
     }
@@ -548,12 +682,21 @@ class MyClass {
         };
     }
 
+    // Probe BOTH keys after a ROM load. This used to look up only the SRAM key
+    // (`<rom>.sav`) and use the answer to enable the LOAD STATE button, which reads
+    // the wrong thing: a save state lives at `<rom>.sav.state`. A visitor who saved
+    // a state and refreshed could find Load State greyed out because the game had
+    // not happened to write SRAM yet — the state was on disk the whole time.
     _findInDatabase() {
         const key = this._getSaveKey();
         if (!key) return;
         this._getDB(key,
             () => { this.rivetsData.noLocalSave = false; },
             () => { }
+        );
+        this._getDB(key + '.state',
+            () => { this.rivetsData.noLocalState = false; },
+            () => { this.rivetsData.noLocalState = true; }
         );
     }
 
