@@ -668,6 +668,59 @@
       }
 
       case 'discReady': {
+        // ── PER-GAME CUSTOM-TEXTURE DIRECTORY ────────────────────────────────
+        // flycast stats /bios/dc/textures/<PRODUCT-ID>/ while loading a disc and
+        // THROWS if it is absent, which surfaces as the disc being rejected:
+        //   load_disc: std::exception during retro_load_game:
+        //     Cannot stat /bios/dc/textures/T1215N/
+        // PSO never hit this because flycast_worker_link.sh:386 embeds a
+        // placeholder for exactly ONE id — MK-51193, which IS PSO Ver.2 — so the
+        // hole only opened when a second game was added. EmscriptenWorker.cpp:1180
+        // already forces CustomTextures off; that suppresses the PRELOADER, not
+        // this stat.
+        // Rather than embed a directory per game (a relink, and a new way to
+        // forget one), read the product id out of the disc: every Dreamcast image
+        // carries an IP.BIN whose header is 'SEGA SEGAKATANA' with the product
+        // number at +0x40. Verified against both discs present when this was
+        // written — pso2 -> 'MK-51193' (matching the embedded placeholder) and
+        // cannonspike -> 'T1215N' (matching the thrown path).
+        // Only the first 64 KB of each file is read: a full FS.readFile of a
+        // 1.19 GB track would be a catastrophic copy.
+        try {
+          const dir = '/discs';
+          for (const nm of Module.FS.readdir(dir)) {
+            if (nm === '.' || nm === '..') continue;
+            let st = null;
+            try {
+              st = Module.FS.open(dir + '/' + nm, 'r');
+              const buf = new Uint8Array(65536);
+              const n = Module.FS.read(st, buf, 0, buf.length, 0);
+              let sig = -1;
+              const NEEDLE = 'SEGA SEGAKATANA';
+              for (let i = 0; i + NEEDLE.length < n; i++) {
+                let ok = true;
+                for (let k = 0; k < NEEDLE.length; k++) { if (buf[i + k] !== NEEDLE.charCodeAt(k)) { ok = false; break; } }
+                if (ok) { sig = i; break; }
+              }
+              if (sig < 0) continue;
+              let id = '';
+              for (let k = 0; k < 10; k++) id += String.fromCharCode(buf[sig + 0x40 + k]);
+              id = id.replace(/\0/g, '').trim();
+              if (!id) continue;
+              let made = '';
+              for (const seg of ['/bios', '/bios/dc', '/bios/dc/textures', '/bios/dc/textures/' + id]) {
+                try { Module.FS.mkdir(seg); made = seg; } catch (_) { /* already there */ }
+              }
+              postMessage({ cmd: 'print', txt: '[flycast-shim] disc product id ' + id +
+                            ' — texture dir ready' + (made ? (' (created ' + made + ')') : ' (already present)') });
+              break;
+            } catch (_) { /* unreadable entry: try the next */ }
+            finally { if (st) { try { Module.FS.close(st); } catch (_) {} } }
+          }
+        } catch (err) {
+          // Never fatal: if this fails the core simply behaves as it did before.
+          postMessage({ cmd: 'print', txt: '[flycast-shim] texture-dir prep skipped: ' + (err && err.message ? err.message : String(err)) });
+        }
         try {
           const ret = Module.ccall('emscripten_load_disc', 'number', ['string'], [data.cuePath]);
           postMessage({ cmd: 'discLoaded', cuePath: data.cuePath, success: !!ret });

@@ -388,6 +388,7 @@
   <div id="controlBar">
     <select id="romSelect">
       <option value="pso2">Phantasy Star Online Ver. 2 (USA)</option>
+      <option value="cannonspike">Cannon Spike (USA)</option>
     </select>
     <button id="btnStart">Start</button>
     <button id="btnReset" disabled>Reset</button>
@@ -1824,6 +1825,25 @@
         { name: 'PSO.cue' },
       ],
     },
+    // Split at the SAME 99,614,720 B boundary as pso2 (12 parts, last 89,998,880),
+    // and `bytes` is the assembled total asserted by both the eager and the lazy
+    // path — the check that turns a Git-LFS-pointer deploy into a clear error
+    // instead of an SH4 crash at boot. Verified: the 12 parts sum to exactly
+    // 1,185,760,800 B. Only the PARTS are tracked, never the assembled Track3,
+    // which is how pso2 ships (git ls-tree origin/prod -- dreamcast/discs/pso2).
+    cannonspike: {
+      name: 'Cannon Spike (USA)',
+      base: '/dreamcast/discs/cannonspike/',
+      cue:  'CannonSpike.cue',
+      files: [
+        { name: 'Track1.bin' },
+        { name: 'Track2.bin' },
+        { name: 'Track3.bin', bytes: 1185760800,
+          parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
+                   .map(s => 'Track3.bin.part' + s) },
+        { name: 'CannonSpike.cue' },
+      ],
+    },
   };
 
   const QS = new URLSearchParams(location.search);
@@ -3093,7 +3113,13 @@
       // Kick the boot seed off alongside the disc stream so it is in hand by
       // the time the first frame lands. Nothing awaits it here — the boot is
       // never blocked on the seed, and it is 0.75% of the disc's bytes.
-      if (seedAllowed()) seedPromise = fetchSeedState();
+      // ⚠ THE SEED IS A PSO SAVESTATE, i.e. a whole machine image. Applying it
+      // on any other disc does not "skip a screen", it REPLACES THE RUNNING GAME
+      // with PSO. Measured the moment a second disc was added: selecting Cannon
+      // Spike booted the disc correctly (retro_load_game true, disc_type=128,
+      // guest 1.000x) and then rendered PSO's character-select screen, because
+      // this line was unconditional. Gate it on the game it belongs to.
+      if (key === 'pso2' && seedAllowed()) seedPromise = fetchSeedState();
       // 1. Stream every file. The worker queues writes until runtime-ready
       //    (the post-js drains queued messages on init).
       for (const f of game.files) {
@@ -3152,6 +3178,7 @@
       // A returning player always wins. If this browser already holds its own
       // savestate, never seed over it — that would eat their progress.
       await savedStateReady;
+      if (STATE_KEY !== stateKeyFor(key)) await loadSavedStateFor(key);   // selection changed late
       if (seedPromise) {
         if (savedState) pageLog('[seed] this browser has its own saved state — seed skipped');
         else seedArmed = true;
@@ -3173,7 +3200,15 @@
   // Maple VMU is wired.
   // ---------------------------------------------------------------------------
   let savedState = null;
-  const STATE_KEY = 'pso2';
+  // Per-game, because the catalog now holds more than one disc. PSO KEEPS THE
+  // BARE 'pso2' KEY it has always used — changing it would orphan the savestate
+  // of every existing player. Anything else is namespaced.
+  const stateKeyFor = (g) => (g === 'pso2' ? 'pso2' : 'state:' + g);
+  const currentGameKey = () => {
+    const el = document.getElementById('romSelect');
+    return (el && el.value) || 'pso2';
+  };
+  let STATE_KEY = stateKeyFor(currentGameKey());
   function idbOpen() {
     return new Promise((res, rej) => {
       const r = indexedDB.open('dc-savestates', 1);
@@ -3204,9 +3239,21 @@
   // Restore any previously-persisted state so Load State works after a reload.
   // Kept as a promise: the boot seed must not race it (a returning player's
   // own state wins over the shipped one).
-  const savedStateReady = idbGet(STATE_KEY)
-    .then((v) => { if (v) { savedState = new Uint8Array(v); pageLog('[page] found saved state ' + savedState.byteLength + ' B — Start, then Load State to restore'); } })
-    .catch(() => {});
+  function loadSavedStateFor(gameKey) {
+    STATE_KEY = stateKeyFor(gameKey);
+    savedState = null;
+    return idbGet(STATE_KEY)
+      .then((v) => { if (v) { savedState = new Uint8Array(v); pageLog('[page] found saved state ' + savedState.byteLength + ' B for ' + gameKey + ' — Start, then Load State to restore'); } })
+      .catch(() => {});
+  }
+  let savedStateReady = loadSavedStateFor(currentGameKey());
+  // Re-resolve when the visitor picks a different disc: states are per-game now,
+  // so the one held in memory must follow the selection or Load State would apply
+  // another game's machine image.
+  {
+    const sel = document.getElementById('romSelect');
+    if (sel) sel.addEventListener('change', () => { savedStateReady = loadSavedStateFor(currentGameKey()); });
+  }
 
   // ---------------------------------------------------------------------------
   // Fresh-boot seed state — PSO Ver.2 Serial Number / Access Key.
