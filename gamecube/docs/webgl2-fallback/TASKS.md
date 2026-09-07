@@ -361,6 +361,38 @@ protocol addition, not an argument fix.
 ⚠ NOT established: that this is on the per-frame GPU cost path. The readback executes on the
 *other* context, so a timer query on the replay context would not see it.
 
+### ⚠ THE PLANNED readPixels FIX WOULD NOT HAVE WORKED — checked 2026-09-06, not built
+
+Two facts read off the source before writing any code, both of which change the shape
+of the fix described above:
+
+1. **Dolphin does not read into the heap. It reads into a PIXEL_PACK_BUFFER.**
+   `OGLTexture.cpp:497` does `glBindBuffer(GL_PIXEL_PACK_BUFFER, m_buffer_name)` and
+   `:530` passes `reinterpret_cast<void*>(dst_offset)` — a BUFFER OFFSET, not a
+   pointer. So the readback destination is a GPU object that already lives on the
+   render-worker's context. `readPixels` therefore does NOT need the blocking
+   `Atomics.wait` ctrl round-trip this doc proposed; it is an ordinary fire-and-forget
+   ring opcode like every other draw command.
+
+2. **The CPU never gets the pixels anyway, and adding readPixels would not change that.**
+   The data leaves the PBO through `OGLStagingTexture::Map()` (`OGLTexture.cpp:627+`),
+   which calls `glMapBufferRange` with `GL_MAP_READ_BIT`. In the SHIPPED glue
+   (`dolphin_worker_emcc.js`, `_glMapBufferRange`) the first statement is:
+
+   ```js
+   if((access&(1|32))!=0){err("glMapBufferRange access does not support MAP_READ or MAP_UNSYNCHRONIZED");return 0}
+   ```
+
+   `GL_MAP_READ_BIT` is 1, so it returns a NULL pointer and refuses. Emscripten's WebGL2
+   layer has no `getBufferSubData` in this build either (`grep -c getBufferSubData` = 0).
+   ⇒ EFB readback is broken END TO END on this path, not merely mis-routed to the wrong
+   context, and the blocking round-trip is the wrong instrument for it.
+
+⚠ NOT established: that any of this is reached at runtime on SAB, nor what breaks
+visually when it is. The 34 `36008:fbo` binds say `BindSharedReadFramebuffer` runs; they
+do not say `Map()` is called or that its null return is mishandled. Grep a run for the
+`glMapBufferRange access does not support MAP_READ` string before building anything.
+
 ### Where the framebuffer binds come from (census mapped to source)
 
 | census bucket | site | what it is |
