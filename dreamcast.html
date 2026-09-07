@@ -4457,6 +4457,7 @@
     mirror: null, mirrorCtx: null, mirrorTicks: 0, mirrorErr: null,
     sentP2: null,       // last port-1 bytes handed to the worker (host)
     videoTracks: null,  // what the guest actually received
+    unmuteArmed: false, // a one-shot gesture listener is waiting to turn sound on
   };
   const NET_FPS = 60;
 
@@ -4609,6 +4610,17 @@
     if (v.srcObject === ms) return;
     v.srcObject = ms;
     netShowGuestVideo(true);
+    // ⚠ CLEAR THE MUTE BEFORE TRYING. The catch path below sets v.muted = true
+    // and NOTHING used to clear it, so one refusal muted every LATER session
+    // too — and silently, because a muted element's play() always resolves, so
+    // the catch never ran again and the player was told "Connected — you are
+    // Player 2." with no mention of sound.
+    // MEASURED, Chrome 152 under --autoplay-policy=user-gesture-required, three
+    // sessions on one guest tab: join #1 audible (muted=false, paused=false),
+    // rejoin #2 audible, and a rejoin AFTER a refusal read muted=true /
+    // audible=false while the status line still read "Connected — you are
+    // Player 2." That last one is a guest with no sound and no way to know why.
+    v.muted = false;
     // Try WITH sound first. Autoplay policy can refuse an audible element even
     // after a click, and a rejected play() leaves a black rectangle — so fall
     // back to muted playback and tell the player how to get the sound back,
@@ -4618,11 +4630,41 @@
       v.muted = true;
       try { await v.play(); netStatus('Connected — tap the picture to turn sound on.', 'good'); } catch (_) {}
       pageLog('[net] audible autoplay refused (' + ((e && e.message) ? e.message : e) + ') — playing muted');
+      netArmUnmuteGesture();
     }
-    v.onclick = () => { if (v.muted) { v.muted = false; v.play().catch(() => {}); } };
+    v.onclick = () => netUnmute();
   }
 
-  async function netStartHost() {
+  // The picture is not always the thing under the player's finger — on the phone
+  // shell it sits behind the lobby overlay, and a guest who taps "Close" rather
+  // than the video would stay muted with a message telling them to tap the
+  // picture. ANY gesture is enough for the autoplay policy, so take any of them.
+  function netUnmute() {
+    const v = $('netVideo');
+    // No stream means the session already ended: unmuting a detached element
+    // only produces a rejected play() that re-mutes it for the NEXT session.
+    if (!v || !v.muted || !v.srcObject) return;
+    v.muted = false;
+    v.play().then(() => {
+      if (NET.session && NET.session.state === 'connected')
+        netStatus('Connected — you are Player 2.', 'good');
+    }).catch(() => { v.muted = true; v.play().catch(() => {}); });
+  }
+  function netArmUnmuteGesture() {
+    if (NET.unmuteArmed) return;
+    NET.unmuteArmed = true;
+    const go = () => {
+      netUnmute();
+      NET.unmuteArmed = false;
+      ['pointerdown', 'keydown', 'touchend'].forEach((t) => document.removeEventListener(t, go, true));
+    };
+    ['pointerdown', 'keydown', 'touchend'].forEach((t) => document.addEventListener(t, go, true));
+  }
+
+  // `fixedCode` is the handoff from dreamcast_multiplayer.html. That page shows a
+  // code to the player BEFORE anything is downloaded, so minting a fresh one here
+  // would silently strand a guest already waiting on the published one.
+  async function netStartHost(fixedCode) {
     if (NET.session) return;
     if (!booted) {
       netStatus('Hosting needs a running game — pick a disc and press Start first, then host.', 'bad');
@@ -4741,8 +4783,30 @@
     remotePad: NET.session && NET.role === 'host' ? NET.session.remotePad() : null,
     sentP2: NET.sentP2,            // the bytes actually posted to the worker for port 1
     videoTracks: NET.videoTracks,
+    // AUDIBILITY IS NOT A TRACK STATE. `audio:live` says a track exists, not
+    // that a person can hear it — a muted element renders the samples just the
+    // same (measured: peak 0.506 through a muted <audio>). The only thing that
+    // decides whether the guest HEARS the host is this element, so the test seam
+    // reports the element, not the track.
+    guestAudio: (function () {
+      const v = $('netVideo');
+      if (!v) return null;
+      return {
+        muted: v.muted, paused: v.paused,
+        audible: v.muted === false && v.paused === false,
+        hasAudioTrack: !!(v.srcObject && v.srcObject.getAudioTracks().length),
+        unmuteArmed: NET.unmuteArmed,
+      };
+    })(),
     booted: booted,
   });
+
+  // The MediaStream this side has in hand: what the HOST published, or what the
+  // GUEST received. A MediaStream cannot survive a page.evaluate() return, so
+  // this is a function the rig calls INSIDE the page and measures there — which
+  // is the only way to check the SENDER as well as the receiver, and a guest
+  // reading zero is meaningless without that.
+  window.__dcNetStream = () => (NET.session ? NET.session.remoteStream() : null);
 
   (function wireNetplay() {
     // NEVER SHOW A CONTROL THAT CANNOT WORK. The three entry points stay

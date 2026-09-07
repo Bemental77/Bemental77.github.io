@@ -12,7 +12,15 @@ const res = [];
 const ok  = (n, d) => { res.push({ n, ok: true }); console.log(`  PASS  ${n}  ${d}`); };
 const bad = (n, d) => { res.push({ n, ok: false }); console.log(`  FAIL  ${n}  ${d}`); };
 
-const browser = await puppeteer.launch({ headless: 'new', executablePath: CHROME, args: ['--no-sandbox'] });
+const browser = await puppeteer.launch({ headless: 'new', executablePath: CHROME, args: [
+  '--no-sandbox',
+  // The audio arm below needs an AudioContext that RUNS. Without this the
+  // context starts 'suspended' with no gesture to resume it and the host's tone
+  // would be a real zero — a rig artifact indistinguishable from the bug the
+  // arm exists to catch. The arm asserts the context state anyway, so a
+  // suspended one is REPORTED rather than silently scored as silence.
+  '--autoplay-policy=no-user-gesture-required',
+] });
 const mk = async () => {
   const p = await browser.newPage();
   // A LIGHT page on the same origin. dreamcast.html installs coi-serviceworker
@@ -98,9 +106,18 @@ await host.evaluate(async (c) => {
   const g = cv.getContext('2d');
   let i = 0;
   setInterval(() => { g.fillStyle = ['#f00','#0f0','#00f'][i++ % 3]; g.fillRect(0,0,320,240); }, 33);
+  // A KNOWN TONE, so "did sound cross?" is a number and not an impression.
+  // 440 Hz at amplitude 0.5, wired the way dreamcast.html wires its worklet:
+  // node -> ctx.destination, and attachMedia takes a COPY off that same node.
+  const ctx = new AudioContext({ sampleRate: 44100 });
+  await ctx.resume();
+  const osc = ctx.createOscillator(); osc.frequency.value = 440;
+  const tone = ctx.createGain(); tone.gain.value = 0.5;
+  osc.connect(tone); tone.connect(ctx.destination); osc.start();
+  window.__hctx = ctx; window.__htone = tone;
   const s = new Netplay.Session({ game: 'gauntlet', host: true, code: c, transport: 'local' });
   window.__h2 = s;
-  window.__captured = s.attachMedia(cv, null);     // BEFORE start(), or no track
+  window.__captured = s.attachMedia(cv, tone);     // BEFORE start(), or no track
   await s.start();
 }, code3);
 await guest.evaluate(async (c) => {
@@ -122,6 +139,82 @@ for (let i = 0; i < 100 && !tracks; i++) { tracks = await guest.evaluate(() => w
 (tracks && tracks.some(t => t.startsWith('video:live')))
   ? ok('guest-receives-video', JSON.stringify(tracks))
   : bad('guest-receives-video', JSON.stringify(tracks));
+
+console.log('\n== the guest can HEAR the host ==');
+// ⚠ `audio:live` IS NOT EVIDENCE OF SOUND. A guest sat on exactly that track
+// reading peak 0.00000 is what this arm was written for: an inbound WebRTC audio
+// track produces NO SAMPLES until an HTMLMediaElement renders it, so a session
+// whose page only ran Web Audio over the track was silent while every status in
+// sight said connected. lib/netplay.js now owns a muted sink for precisely this;
+// with that removed, this arm reads 0 again.
+//
+// A KNOWN AMPLITUDE, measured at three points, so a zero says WHERE it broke:
+//   host-tone-at-source   the host's own captured track, before the wire
+//   guest-audio-audible   the guest's received track, through Web Audio
+//   (getStats)            totalSamplesReceived — no Web Audio involved at all
+const PEAK = `
+  window.__peak = async function (ctx, node, ms) {
+    const an = ctx.createAnalyser(); an.fftSize = 2048; node.connect(an);
+    const buf = new Float32Array(an.fftSize);
+    let peak = 0;
+    for (let i = 0; i < ms / 50; i++) {
+      await new Promise(r => setTimeout(r, 50));
+      an.getFloatTimeDomainData(buf);
+      for (let k = 0; k < buf.length; k++) if (Math.abs(buf[k]) > peak) peak = Math.abs(buf[k]);
+    }
+    return +peak.toFixed(5);
+  };`;
+await host.evaluate(PEAK); await guest.evaluate(PEAK);
+
+// 1. IS THE TAP EVEN CARRYING THE TONE? Read the host's OWN captured
+//    MediaStreamDestination track back. A zero here means attachMedia was handed
+//    a node that is not on the path the game's sound takes, and nothing
+//    downstream could ever have worked.
+const srcSide = await host.evaluate(async () => {
+  const at = window.__h2._stream.getAudioTracks();
+  if (!at.length) return { err: 'attachMedia added no audio track' };
+  const c2 = new AudioContext({ sampleRate: 44100 }); await c2.resume();
+  const peak = await __peak(c2, c2.createMediaStreamSource(new MediaStream([at[0]])), 1000);
+  await c2.close();
+  return { ctx: __hctx.state, peak };
+});
+(!srcSide.err && srcSide.ctx === 'running' && srcSide.peak > 0.1)
+  ? ok('host-tone-at-source', `the host's own captured track reads peak ${srcSide.peak} (440 Hz @ 0.5) — the tap is live before the wire`)
+  : bad('host-tone-at-source', JSON.stringify(srcSide));
+
+// 2. THE ONE THAT MATTERS. Deliberately NO media element of the test's own: this
+//    is the bare pattern a page would use, and it is the pattern that measured
+//    silence before lib/netplay.js started sinking the track itself.
+await new Promise(r => setTimeout(r, 1500));       // let RTP flow
+const heard = await guest.evaluate(async () => {
+  const ms = window.__g2.remoteStream();
+  const at = ms ? ms.getAudioTracks() : [];
+  if (!at.length) return { err: 'no audio track on the received stream' };
+  const c2 = new AudioContext({ sampleRate: 44100 }); await c2.resume();
+  const peak = await __peak(c2, c2.createMediaStreamSource(new MediaStream([at[0]])), 2000);
+  await c2.close();
+  let stats = null;
+  (await window.__g2._pc.getStats()).forEach((r) => {
+    if (r.type === 'inbound-rtp' && r.kind === 'audio')
+      stats = { packets: r.packetsReceived, bytes: r.bytesReceived,
+                samples: r.totalSamplesReceived, audioLevel: r.audioLevel };
+  });
+  return { peak, track: at[0].readyState, ctx: c2.state, stats };
+});
+(!heard.err && heard.peak > 0.1)
+  ? ok('guest-audio-audible', `peak ${heard.peak} on the received track (host sent 0.5) — sound crosses the wire`)
+  : bad('guest-audio-audible', `peak ${heard.err ? 'n/a' : heard.peak} — a live track carrying silence. ${JSON.stringify(heard)}`);
+// The independent witness: samples the DECODER produced, with no Web Audio
+// anywhere in the path. This is the field that read 0 WHILE PACKETS WERE
+// ARRIVING, which is what proved the break was rendering and not transport.
+// ⚠ Do not read audioLevel here. It is the level of what was RENDERED, and the
+// session's sink is deliberately muted, so it reads 0.0000 on a perfectly
+// working stream — through an AUDIBLE element the same track measured 0.5045.
+// totalSamplesReceived is the field that means "the decoder ran".
+(heard.stats && heard.stats.samples > 0)
+  ? ok('guest-audio-decoded', `totalSamplesReceived=${heard.stats.samples} from ${heard.stats.packets} packets / ` +
+      `${heard.stats.bytes} B — getStats agrees, independently of Web Audio`)
+  : bad('guest-audio-decoded', `packets arrived but the decoder produced no samples: ${JSON.stringify(heard.stats)}`);
 
 // pad travels guest -> host and is readable as player 2
 for (let i = 0; i < 60 && !(await host.evaluate(() => window.__h2.state === 'connected')); i++) await new Promise(r => setTimeout(r, 200));

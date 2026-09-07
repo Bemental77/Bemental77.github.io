@@ -85,7 +85,14 @@ try { (await import('./browser_leak_guard.js')).default.guard(browser, 'dreamcas
 // document to settle before touching anything.
 const openPage = async (label, query) => {
   const p = await browser.newPage();
-  p.on('pageerror', (e) => console.log(`  [${label}!] ${e.message}`));
+  // ⚠ NOT `e.message`. A wasm trap reaches this hook as an object with no
+  // `message` — puppeteer's #handleException emitted a bare `ErrorEvent` and a
+  // null — so reading it threw INSIDE the listener and took the whole run down
+  // with a TypeError at this line, after the host had already booted. The rig
+  // then looked like it had crashed when what it had actually done was
+  // faithfully observe the core trapping.
+  p.on('pageerror', (e) => console.log(`  [${label}!] ` +
+    ((e && (e.message || e.type)) || (e === null ? 'null (no detail from the page)' : String(e)))));
   p.on('console', (m) => {
     const t = m.text();
     if (/\[net\]|\[flycast-worker\] load_disc|\[page\] worker ready|audio init failed/.test(t))
@@ -258,11 +265,19 @@ info('frame-signatures', `${distinctExact} distinct exact hashes vs ${distinct} 
       `(block means ${[...new Set(good.map((s) => s.coarse))].slice(0, 4).join('  ')})`)
   : bad('guest-frames-changing', `only ${distinct} distinct coarse signature(s) — the picture is frozen, not live`);
 
-// Sound, MEASURED rather than inferred from a track's readyState. Reported as
-// an observation and not asserted: a Dreamcast that happens to be on a silent
-// screen legitimately produces zero, so a zero here would not be evidence of a
-// broken tap — only a non-zero is evidence of a working one.
-const rms = await guest.evaluate(async () => {
+console.log('\n== the guest can HEAR the game ==');
+// Sound, MEASURED rather than inferred from a track's readyState. `audio:live`
+// says a track exists, NOT that anything is coming out of it: an inbound WebRTC
+// audio track produces no samples at all until an HTMLMediaElement renders it,
+// and a guest measuring the track through Web Audio alone read peak 0.00000
+// while packets were arriving. lib/netplay.js now sinks the track itself.
+//
+// Level is still an OBSERVATION, not an assertion: a Dreamcast sitting on a
+// silent screen legitimately produces zero, so a zero is not evidence of a
+// broken tap — only a non-zero is evidence of a working one. What IS asserted
+// is the pair of things that are faults no matter what the game is playing:
+// an audio track must be there, and the guest's element must be AUDIBLE.
+const snd = await guest.evaluate(async () => {
   const v = document.getElementById('netVideo');
   if (!v.srcObject || !v.srcObject.getAudioTracks().length) return { err: 'no audio track on the stream' };
   const ac = new AudioContext();
@@ -270,19 +285,67 @@ const rms = await guest.evaluate(async () => {
   const an = ac.createAnalyser(); an.fftSize = 2048;
   src.connect(an);
   const buf = new Float32Array(an.fftSize);
+  let peakRms = 0, peak = 0;
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 50));
+    an.getFloatTimeDomainData(buf);
+    let s = 0;
+    for (let k = 0; k < buf.length; k++) { s += buf[k] * buf[k]; if (Math.abs(buf[k]) > peak) peak = Math.abs(buf[k]); }
+    peakRms = Math.max(peakRms, Math.sqrt(s / buf.length));
+  }
+  await ac.close();
+  return { peakRms: +peakRms.toFixed(5), peak: +peak.toFixed(5) };
+});
+// AUDIBILITY IS AN ELEMENT STATE, NOT A TRACK STATE. A muted element renders
+// the samples exactly the same (measured: peak 0.506 through a muted <audio>),
+// so an analyser reading cannot tell you whether a person hears anything —
+// only #netVideo.muted can.
+const ga = await guest.evaluate(() => window.__dcNet().guestAudio);
+(ga && ga.hasAudioTrack)
+  ? ok('guest-has-audio-track', 'the received stream carries an audio track')
+  : bad('guest-has-audio-track', JSON.stringify(ga) + ' — the host published no sound');
+(ga && ga.audible)
+  ? ok('guest-audio-audible', `#netVideo muted=${ga.muted} paused=${ga.paused} — the sound is actually being played, not just received`)
+  : bad('guest-audio-audible', JSON.stringify(ga) +
+      ' — a connected guest that cannot hear anything. A muted element still ' +
+      'decodes, so this is invisible to a track-state or analyser check.');
+// ⚠ MEASURE THE SENDER TOO, ALWAYS. A guest reading zero has two completely
+// different causes and the guest-side number alone cannot separate them: the
+// transport dropped the sound, or the EMULATOR ISN'T MAKING ANY. Reading the
+// host's own captured MediaStreamDestination track back — the same track that
+// was published, before it goes anywhere — makes every zero attributable.
+const tap = await host.evaluate(async () => {
+  const s = window.__dcNetStream ? window.__dcNetStream() : null;
+  const at = s ? s.getAudioTracks() : [];
+  if (!at.length) return { err: 'the host published no audio track' };
+  const ac = new AudioContext();
+  const src = ac.createMediaStreamSource(new MediaStream([at[0]]));
+  const an = ac.createAnalyser(); an.fftSize = 2048;
+  src.connect(an);
+  const buf = new Float32Array(an.fftSize);
   let peak = 0;
   for (let i = 0; i < 40; i++) {
     await new Promise((r) => setTimeout(r, 50));
     an.getFloatTimeDomainData(buf);
-    let s = 0; for (let k = 0; k < buf.length; k++) s += buf[k] * buf[k];
-    peak = Math.max(peak, Math.sqrt(s / buf.length));
+    for (let k = 0; k < buf.length; k++) if (Math.abs(buf[k]) > peak) peak = Math.abs(buf[k]);
   }
   await ac.close();
-  return { peakRms: +peak.toFixed(5) };
+  return { peak: +peak.toFixed(5) };
 });
-info('guest-audio-rms', rms.err ? rms.err
-  : `peak RMS ${rms.peakRms} over 2 s on the received audio track` +
-    (rms.peakRms > 0 ? ' — sound is crossing the wire' : ' — silent here; that is not by itself a fault'));
+info('host-audio-tap', tap.err ? tap.err
+  : `peak ${tap.peak} on the host's OWN captured track, before the wire`);
+info('guest-audio-level', snd.err ? snd.err
+  : `peak ${snd.peak} / peak RMS ${snd.peakRms} over 2 s on the received audio track`);
+// The verdict is the PAIR, not either number alone.
+if (!tap.err && !snd.err) {
+  info('audio-attribution', tap.peak <= 0.0001
+    ? `the host's own tap is silent too (${tap.peak}) — the EMULATOR produced no sound in this window, ` +
+      `so the guest's ${snd.peak} says nothing about the transport either way`
+    : (snd.peak > 0.0001
+        ? `host tap ${tap.peak} -> guest ${snd.peak}: the sound the emulator made reached the other browser`
+        : `host tap ${tap.peak} but guest ${snd.peak} — the emulator WAS making sound and it did NOT cross. ` +
+          `That is a transport fault, not a silent game.`));
+}
 
 // Evidence WHILE CONNECTED, which is the only moment the claim is about.
 try {
