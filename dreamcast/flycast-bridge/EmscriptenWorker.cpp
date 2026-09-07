@@ -1324,6 +1324,32 @@ static int load_disc_impl(const char* path) {
         }, vmuDev, vmuType);
     }
 
+    // FULL BUS DUMP. The single-slot probe above cannot distinguish "no VMU" from
+    // "NO DEVICES AT ALL", and those have very different consequences: an EMPTY
+    // Maple bus makes PSO's DMA-complete handler (guest 0x8c378d46) bail before
+    // its unconditional SB_ISTNRM ACK, so the Maple bit latches and re-vectors
+    // forever. Slot 5 is the main device, slots 0/1 the expansion (VMU/rumble).
+    // MapleDevices is a plain pointer array (maple_if.h) — no config::Option
+    // template crosses the TU boundary here, so this is ODR-safe from the bridge.
+    {
+        char mbuf[512];
+        int mo = snprintf(mbuf, sizeof(mbuf), "[maple] bus (type per slot, -1=empty):");
+        for (int bus = 0; bus < 4 && mo + 32 < (int)sizeof(mbuf); bus++)
+        {
+            mo += snprintf(mbuf + mo, sizeof(mbuf) - mo, " p%d[", bus);
+            for (int slot = 0; slot < 6 && mo + 8 < (int)sizeof(mbuf); slot++)
+            {
+                int t = MapleDevices[bus][slot] != nullptr
+                        ? (int)MapleDevices[bus][slot]->get_device_type() : -1;
+                mo += snprintf(mbuf + mo, sizeof(mbuf) - mo, "%s%d", slot ? "," : "", t);
+            }
+            mo += snprintf(mbuf + mo, sizeof(mbuf) - mo, "]");
+        }
+        MAIN_THREAD_EM_ASM({
+            postMessage({cmd: 'print', txt: UTF8ToString($0)});
+        }, mbuf);
+    }
+
 #ifdef FLYCAST_BRIDGE_DIAG
     // Dump 1 KiB of guest RAM at the addresses where we've observed wedges,
     // so we can statically disassemble what was loaded there post-boot.
@@ -1531,26 +1557,14 @@ void emscripten_reset(void) {
     if (g_loaded) retro_reset();
 }
 
-// ── RESTORED EXPORTS: flycast_set_fog / flycast_set_modvol ──────────────────
-// These two are exported by flycast_worker_link.sh:81-82 and called by the shim
-// (flycast_worker.js:1069,1079) behind ?nofog=1 / ?nomodvol=1, and they exist in
-// the SHIPPED wasm — but NO SOURCE FILE IN THE TREE DEFINED THEM. Every relink
-// therefore died with
-//   wasm-ld: error: symbol exported via --export not found: flycast_set_fog
-// which is why the deployed worker still dates from before they went missing:
-// the Dreamcast core could not be relinked AT ALL. Found while adding Maple
-// port 1, and it blocked that outright.
-// Re-implemented against the options they were clearly written for
-// (core/cfg/option.h:441 ModifierVolumes, :455 Fog) rather than deleted from the
-// export list, because deleting them would quietly drop a render-bisect tool
-// that shipped code still calls.
-extern "C" {
-EMSCRIPTEN_KEEPALIVE
-void flycast_set_fog(int on) { config::Fog.override(on != 0); }
-
-EMSCRIPTEN_KEEPALIVE
-void flycast_set_modvol(int on) { config::ModifierVolumes.override(on != 0); }
-}
+// ── flycast_set_fog / flycast_set_modvol live in shell/libretro/libretro.cpp ──
+// NOT here. They are exported by flycast_worker_link.sh:81-82 and called by the
+// shim behind ?nofog=1 / ?nomodvol=1, and defining them in THIS TU is a trap:
+// cfg/option.h switches on LIBRETRO, the bridge is compiled -D__LIBRETRO__ only,
+// so config::Option has a DIFFERENT memory layout here than in the core, and an
+// override() across that mismatch corrupts the options array (same reason the
+// VMU must not be forced from here — see the note in load_disc_impl). The core
+// TU defines both under __EMSCRIPTEN__ at the end of libretro.cpp.
 
 EMSCRIPTEN_KEEPALIVE
 uint8_t* emscripten_get_maple_ptr(void) {

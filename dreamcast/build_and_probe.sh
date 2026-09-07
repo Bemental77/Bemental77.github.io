@@ -104,6 +104,7 @@ AUDIOCLAMP=""
 SHOTEVERY=""
 SHOTFROM=""
 CANVASONLY=""
+GAMEKEY=""
 MIDSHOTS=""
 SAVESTATE=""
 SAVEMS=""
@@ -201,6 +202,12 @@ while [ $# -gt 0 ]; do
     --shotevery)              SHOTEVERY="$2"; shift 2 ;;
     --shotfrom)               SHOTFROM="$2"; shift 2 ;;
     --canvasonly)             CANVASONLY="--canvasonly"; shift ;;
+    # [2026-09-07] --game <key>: choose the disc from dreamcast.html's #romSelect
+    # before Start. Without it the canonical loop could ONLY ever boot pso2, so
+    # "the core boots" was a one-game claim and gauntlet (the 4-player co-op
+    # title the online mode exists for) was unreachable. Same gap class as
+    # --loadstate / --ctxms / --profat before it.
+    --game)                   GAMEKEY="$2"; shift 2 ;;
     --midshot)                MIDSHOTS="$MIDSHOTS --midshot $2"; shift 2 ;;
     --savestate)              SAVESTATE="$2"; shift 2 ;;
     --savems)                 SAVEMS="$2"; shift 2 ;;
@@ -272,6 +279,7 @@ CMD="node $PROBE_JS --log $PROBE_LOG $KEEP_NOISE $INTERP $PCTRACE"
 [ -n "$SHOTEVERY" ] && CMD="$CMD --shotevery $SHOTEVERY"
 [ -n "$SHOTFROM" ]  && CMD="$CMD --shotfrom $SHOTFROM"
 [ -n "$CANVASONLY" ] && CMD="$CMD $CANVASONLY"
+[ -n "$GAMEKEY" ]   && CMD="$CMD --game $GAMEKEY"
 [ -n "$MIDSHOTS" ]  && CMD="$CMD$MIDSHOTS"
 [ -n "$SAVEMS" ]    && CMD="$CMD --savems $SAVEMS"
 [ -n "$SAVEATS" ]   && CMD="$CMD$SAVEATS"

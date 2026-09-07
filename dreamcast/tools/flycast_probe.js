@@ -105,6 +105,16 @@ let MID_SHOTS_MS = [];     // lever-4: --midshot <ms> (repeatable) — timed scr
 let SHOT_EVERY = 0;        // --shotevery <ms>: periodic canvas shot, 0 = off
 let SHOT_FROM  = 0;        // --shotfrom <ms>: don't start the strip before this
 let CANVAS_ONLY = false;   // --canvasonly: skip the #wrap/shell companion shot
+// [2026-09-07] --game <key>: pick the disc from dreamcast.html's #romSelect
+// BEFORE Start is clicked. Until now the probe could only ever boot whatever
+// #romSelect defaults to (pso2), so gauntlet — the 4-player co-op title the
+// online mode exists for — was UNREACHABLE from the canonical loop, and every
+// "the core boots" claim covered exactly one game. The page has no ?game= URL
+// param and this must not add one (dreamcast.html is owned elsewhere), so the
+// selector is driven through the DOM exactly as a user would: set .value, then
+// dispatch 'change' so the page's own listener (dreamcast.html:2017) rebuilds
+// the disc manifest. Empty = leave the page's default alone.
+let GAME_KEY = '';         // --game <key>: #romSelect value to choose
 let PARITY = 0;            // lever-4 task 6: --parity <frames> — run the IC parity gate
 let PARITY_MS = 0;         // --parityms <ms> — when to fire it (default page-side 70s)
 let PARITY_FROM = '';      // lever-6 cert: --parityfrom load — replay the autoloaded state.bin
@@ -255,6 +265,7 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === '--shotevery') SHOT_EVERY = parseInt(process.argv[++i], 10) >>> 0;
   else if (a === '--shotfrom') SHOT_FROM = parseInt(process.argv[++i], 10) >>> 0;
   else if (a === '--canvasonly') CANVAS_ONLY = true;
+  else if (a === '--game') GAME_KEY = process.argv[++i];
   else if (a === '--parity') PARITY = parseInt(process.argv[++i], 10) >>> 0;
   else if (a === '--parityms') PARITY_MS = parseInt(process.argv[++i], 10) >>> 0;
   else if (a === '--parityfrom') PARITY_FROM = process.argv[++i];
@@ -1117,6 +1128,21 @@ function classify(text) {
         lastSignalTime = Date.now();
       } else {
         try {
+          if (GAME_KEY) {
+            const gsel = await page.evaluate((key) => {
+              const el = document.getElementById('romSelect');
+              if (!el) return { ok: false, how: 'no #romSelect' };
+              if (!Array.from(el.options).some(o => o.value === key))
+                return { ok: false, how: 'no such option; have ' +
+                  Array.from(el.options).map(o => o.value).join(',') };
+              el.value = key;
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              return { ok: true, how: el.value };
+            }, GAME_KEY);
+            process.stdout.write('[probe] game select: ' +
+              (gsel.ok ? 'OK -> ' : 'FAILED — ') + gsel.how + '\n');
+            if (!gsel.ok) { fatal = fatal || '[probe] --game failed: ' + gsel.how; }
+          }
           await page.click('#btnStart');
           process.stdout.write('[probe] clicked Start\n');
           clicked = true;

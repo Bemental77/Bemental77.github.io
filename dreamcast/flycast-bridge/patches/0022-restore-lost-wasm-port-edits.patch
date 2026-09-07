@@ -1,0 +1,703 @@
+# 0022 — restore the wasm-port edits that dreamcast/flycast-src had LOST
+#
+# WHY THIS PATCH EXISTS. dreamcast/flycast-src/ is gitignored in its entirety
+# (.gitignore:60 — `git ls-files dreamcast/flycast-src` returns 0 of its 1,834
+# .cpp files), so nothing in this repo records its contents and nothing warns
+# when it drifts. It drifted: eight files silently reverted to a pre-wasm-port
+# state, and because the SHIPPED flycast_worker_emcc.wasm predated the drift,
+# the damage was invisible until someone tried to relink. Every relink from
+# 2026-09-04 onward produced a worker that booted PSO to two frames and then
+# died; `git log` showed nothing because git cannot see this tree.
+#
+# THE TWO EDITS THAT ACTUALLY KILLED THE BOOT (the rest are correctness/perf):
+#
+#   core/emulator.cpp  Emulator::start() — config::ThreadedRendering.override(false)
+#     Without it flycast takes the ThreadedRendering branch and spawns its own
+#     std::async SH4 thread, which races the worker's own dispatch pump.
+#
+#   core/hw/sh4/dyna/ssa.cpp — disable the read-only const-fold on WASM
+#     The fold's safety depends on page-fault SMC, which wasm does not have, so
+#     PSO's interrupt dispatcher froze its latched INTEVT word at 0x320 (VBlank)
+#     and every interrupt — including Maple 0x360 — routed to the VBlank
+#     handler. Maple bit12 never got acked => re-vector storm, the guest stopped
+#     submitting frames, and the renderer's 20 ms wait turned into an ASYNCIFY
+#     suspension that unwound out of retro_run as a bare `unwind` exception.
+#
+# THE REAL SOURCE OF TRUTH IS NOT THIS PATCH. It is the sibling checkout at
+#   /Users/caseybement/Dev/dreamcastHtml/dreamcast/flycast-src
+# (the "source repo" that commit 9441581f says this tree was synced from). This
+# patch is a REPLAY of one recovery and will rot. To check for drift, diff the
+# trees directly — it takes seconds and is exact:
+#
+#   diff -rq -x "build-*" -x .git -x .DS_Store \
+#     dreamcast/flycast-src /Users/caseybement/Dev/dreamcastHtml/dreamcast/flycast-src
+#
+# Anything but `core/version.h` (a generated build stamp) is drift. Do that
+# BEFORE trusting any relink, and prefer syncing the named files from the
+# reference over replaying patches: `patch --dry-run` LIED about this tree in
+# both directions (BSD patch skips already-applied hunks and still exits 0, and
+# fuzz matched a FEAT_AREC hunk against the wrong one of build.h's four
+# identical `#define FEAT_AREC DYNAREC_NONE` lines).
+#
+# Baseline for this patch = the tree as found on 2026-09-07. Files covered:
+#   core/build.h                  FEAT_AREC DYNAREC_JIT (0020 hunk; the whole
+#                                 ARM7 wasm dynarec was compiling out)
+#   core/emulator.cpp             single-threaded pin (BOOT-CRITICAL)
+#   core/hw/sh4/dyna/ssa.cpp      const-fold disabled on wasm (BOOT-CRITICAL)
+#   core/hw/sh4/sh4_mem.cpp       smc_mark_range at the 3 DMA/block chokepoints
+#   core/hw/maple/maple_cfg.cpp   VMU on bus 0 expansion slot A1
+#   core/hw/aica/sgc_if.cpp       0021 disabled-channel hoist
+#   core/rend/TexCache.{cpp,h}    0018 wasm VRAM source hash + RTT exclusion
+#   core/rend/gles/{gles.cpp,gles.h,gltex.cpp}  0017 mobile precision/FBO
+#   shell/libretro/libretro.cpp   flycast_set_fog / flycast_set_modvol, defined
+#                                 in a CORE TU (the bridge's config::Option
+#                                 layout differs — see the note in that hunk)
+#
+--- a/core/build.h
++++ b/core/build.h
+@@ -64,9 +64,10 @@
+ 
+ #if defined(__EMSCRIPTEN__)
+ // WASM target: SH4 dynarec via WasmDynarec (rec_wasm.cpp + bementalJIT).
+-// ARM7 (AICA) and DSP fall back to interpreters.
++// ARM7 (AICA) rec via arm7_rec_wasm.cpp (flycast-bridge, lever-7).
++// DSP falls back to the interpreter.
+ #define FEAT_SHREC DYNAREC_JIT
+-#define FEAT_AREC DYNAREC_NONE
++#define FEAT_AREC DYNAREC_JIT
+ #define FEAT_DSPREC DYNAREC_NONE
+ #endif
+ 
+--- a/core/emulator.cpp
++++ b/core/emulator.cpp
+@@ -984,6 +984,17 @@
+ 
+ void Emulator::start()
+ {
++#ifdef __EMSCRIPTEN__
++	// dreamcastHtml lever-4 D1: the worker drives frames itself (single-
++	// threaded contract, EmscriptenWorker init override). That override gets
++	// CLOBBERED by settings reloads (the documented loadGameSpecificSettings
++	// class), and retro_unserialize's trailing emu.start() then took the
++	// ThreadedRendering branch — spawning a std::async SH4 thread that raced
++	// the worker's own dispatch (wild call_indirect on the em-pthread, proven
++	// by the trap stack: runInternal <- std::__async_assoc_state<...start()::$_0>).
++	// Re-pin HERE, before any branch reads it, so no reload can resurrect it.
++	config::ThreadedRendering.override(false);
++#endif
+ 	if (state == Running)
+ 		return;
+ 	if (state != Loaded) {
+--- a/core/hw/aica/sgc_if.cpp
++++ b/core/hw/aica/sgc_if.cpp
+@@ -715,8 +715,28 @@
+ 
+ 	static void StepAll(SampleType& mixl, SampleType& mixr)
+ 	{
++		// [wasm port, 2026-08-29] Skip disabled channels BEFORE the per-channel
++		// mix tail. This is BIT-EXACT, not an accuracy trade:
++		//   Step(oLeft,oRight,oDsp) returns immediately for a disabled channel
++		//   (line ~647) with oLeft=oRight=oDsp=0 and mutates NO channel state,
++		//   so the tail in Step(mixl,mixr) degenerates to
++		//     *VolMix.DSPOut += 0;  oLeft=oRight=(0>>4);  mixl += 0;  mixr += 0;
++		//   i.e. every effect is the identity. Nothing the guest can read
++		//   changes -- including dsp::state.MIXS, which IS guest-visible
++		//   (aica_mem.cpp:63, DSP MIXS @ 0x4500); that is why this skips the
++		//   "+= 0" and does NOT touch the MIXS memset in AICA_Sample.
++		// Why it is worth a branch: this loop runs 64x per 44.1 kHz sample
++		// (AICA_TICK=4535 -> 44.1K AicaUpdate/s, aica.cpp:85) whether or not any
++		// voice is keyed on. In the wasm build AICA_Sample and ChannelEx::Step
++		// are both inlined into AicaUpdate (they are absent from
++		// flycast_worker_emcc.js.symbols; only the address-taken Step* member
++		// pointers survive), whose SELF time is 9.26% of the emu worker
++		// (/tmp/dcx-worker.cpuprofile, 2026-08-28, 25s heavy scene). Per
++		// channel the emitted loop body was ~63 wasm instructions plus the
++		// callee's early-out; this cuts the disabled case to a load + branch.
+ 		for (ChannelEx& channel : Chans)
+-			channel.Step(mixl, mixr);
++			if (channel.enabled)
++				channel.Step(mixl, mixr);
+ 	}
+ 
+ 	void SetAegState(EGState newstate)
+--- a/core/hw/maple/maple_cfg.cpp
++++ b/core/hw/maple/maple_cfg.cpp
+@@ -377,6 +377,20 @@
+ 
+ static void createDreamcastDevices()
+ {
++#ifdef __EMSCRIPTEN__
++	// Headless WASM build: the JS bridge plugs a controller on port 0 but no
++	// libretro frontend is present to attach an expansion device, so the VMU
++	// slot ends up empty and games (e.g. PSO Ver.2) report "no memory card
++	// connected" and refuse to save. Attach an in-memory VMU on the main
++	// controller's expansion slot A1 (bus 0, port 0) — matches the native
++	// default (config::MapleExpansionDevices default is MDT_SegaVMU). The VMU
++	// is memory-only (see maple_sega_vmu::OnSetup __EMSCRIPTEN__ path). This
++	// runs in CORE code, whose config::Option layout is the real one, so it is
++	// safe (unlike forcing from the bridge TU which has a mismatched layout).
++	if (config::MapleMainDevices[0] == MDT_SegaController
++			&& config::MapleExpansionDevices[0][0] == MDT_None)
++		config::MapleExpansionDevices[0][0].override(MDT_SegaVMU);
++#endif
+ 	for (int bus = 0; bus < MAPLE_PORTS; ++bus)
+ 	{
+ 		switch (config::MapleMainDevices[bus])
+--- a/core/hw/sh4/dyna/ssa.cpp
++++ b/core/hw/sh4/dyna/ssa.cpp
+@@ -488,10 +488,31 @@
+ 				// If we know the address to read and it's in the same memory page(s) as the block
+ 				// and if those pages are read-only, then we can directly read the memory at compile time
+ 				// and propagate the read value as a constant.
++				//
++				// ORDER 21b — DISABLED on the WASM build (bementalJIT). This fold's
++				// safety depends on page-fault SMC (bm_RamWriteAccess, fired from the
++				// SIGSEGV/SEH handlers in core/linux/common.cpp + core/windows/
++				// fault_handler.cpp): when the guest writes a word inside a protected
++				// code page, native un-protects the page and discards the block, so the
++				// block re-decodes with read_only=false and the fold does not recur.
++				// WASM has no mprotect/page faults, so bm_RamWriteAccess is NEVER called;
++				// RAM code blocks stay read_only=true forever and the fold bakes in a
++				// STALE value. PSO's interrupt dispatcher (guest 0x8c379a88) reads the
++				// latched INTEVT word 0x8c379b7c — which the entry stub rewrites every
++				// interrupt but which lives in the dispatcher's own code page — so the
++				// fold froze it at 0x320 (VBlank), routing every interrupt (incl. Maple
++				// 0x360) to the VBlank handler; Maple bit12 never got acked → the ~126K/s
++				// re-vector storm that pinned the boot at 0x8c411054. Emitting the read
++				// at runtime is always fresh and correct; re-enabling this fold on WASM
++				// needs a software-SMC hook in the writem path (Phase 3 perf lever).
+ 				if (op.op == shop_readm  && block->read_only
++#ifndef __EMSCRIPTEN__
+ 						&& (op.rs1._imm >> 12) >= (block->vaddr >> 12)
+ 						&& (op.rs1._imm >> 12) <= ((block->vaddr + block->sh4_code_size - 1) >> 12)
+ 						&& op.size <= 4)
++#else
++						&& false)
++#endif
+ 				{
+ 					void *ptr;
+ 					bool isRam;
+--- a/core/hw/sh4/sh4_mem.cpp
++++ b/core/hw/sh4/sh4_mem.cpp
+@@ -201,9 +201,22 @@
+ 	addrspace::term();
+ }
+ 
++#ifdef __EMSCRIPTEN__
++// dreamcastHtml lever-4 (Build 2): per-write SMC hook, defined in
++// flycast-bridge/rec_wasm.cpp — bumps the inline-cache generation when a bulk
++// write (DMA/SQ) touches a page holding compiled code. WASM has no mprotect
++// page-fault SMC detection (same family as the ssa.cpp fold-disable), so every
++// RAM-write chokepoint must report. See dreamcast/docs/lever-4-smc-bitmap.
++extern "C" void smc_mark_range(u32 addr, u32 len, u32 tag);
++#define DCX_SMC_MARK_RANGE(a, l) smc_mark_range((a), (l), 1)
++#else
++#define DCX_SMC_MARK_RANGE(a, l) ((void)0)
++#endif
++
+ void WriteMemBlock_nommu_dma(u32 dst, u32 src, u32 size)
+ {
+ 	bool dst_ismem, src_ismem;
++	DCX_SMC_MARK_RANGE(dst, size);
+ 	void* dst_ptr = addrspace::writeConst(dst, dst_ismem, 4);
+ 	void* src_ptr = addrspace::readConst(src, src_ismem, 4);
+ 
+@@ -226,6 +239,7 @@
+ void WriteMemBlock_nommu_ptr(u32 dst, const u32 *src, u32 size)
+ {
+ 	bool dst_ismem;
++	DCX_SMC_MARK_RANGE(dst, size);
+ 
+ 	void* dst_ptr = addrspace::writeConst(dst, dst_ismem, 4);
+ 
+@@ -260,6 +274,7 @@
+ void WriteMemBlock_nommu_sq(u32 dst, const SQBuffer *src)
+ {
+ 	// destination address is 32-byte aligned
++	DCX_SMC_MARK_RANGE(dst, sizeof(SQBuffer));
+ 	SQBuffer *pdst = (SQBuffer *)GetMemPtr(dst, sizeof(SQBuffer));
+ 	if (pdst != nullptr)
+ 	{
+--- a/core/rend/gles/gles.cpp
++++ b/core/rend/gles/gles.cpp
+@@ -132,7 +132,12 @@
+ /* Shader program params*/
+ /* gles has no alpha test stage, so its emulated on the shader */
+ uniform highp float cp_AlphaTestValue;
+-uniform lowp vec4 pp_ClipTest;
++// pp_ClipTest was lowp: it carries SCREEN PIXEL coordinates (fed from
++// clip_rect.origin / clip_rect.bottomRight() in gldraw.cpp, up to 2048x1024) and
++// is compared against gl_FragCoord below. ESSL only guarantees lowp float over
++// (-2,2), so these saturate on a GPU that implements lowp natively; desktop
++// drivers promote lowp to fp32, hiding it. Same class of bug as texSize.
++uniform highp vec4 pp_ClipTest;
+ uniform lowp vec3 sp_FOG_COL_RAM,sp_FOG_COL_VERT;
+ uniform highp float sp_FOG_DENSITY;
+ uniform sampler2D tex,fog_table;
+@@ -141,13 +146,21 @@
+ uniform lowp vec4 fog_clamp_max;
+ #if pp_Palette != 0
+ uniform sampler2D palette;
+-uniform mediump int palette_index;
++// palette_index was mediump int: gldraw.cpp feeds it (tcw.PalSelect << 4), which
++// reaches 1008 for a 6-bit PalSelect, against mediump int's guaranteed
++// (-1024,1024) -- legal but with zero headroom, and getPaletteEntry() below
++// already accumulates it into a highp int. This path is live.
++uniform highp int palette_index;
+ #if TARGET_GL == GLES2 || TARGET_GL == GL2
+-uniform lowp vec2 texSize;
++uniform highp vec2 texSize;   // was lowp — same precision bug as the GLES3 local at palettePixelBilinear: this carries a texture DIMENSION (512/1024), which lowp cannot represent. Inert on our WebGL2/GLES3 path (that branch takes the local instead), fixed for correctness.
+ #endif
+ #endif
+ #if DITHERING == 1
+-uniform lowp vec4 ditherDivisor;
++// ditherDivisor was lowp: renderFrame() writes 1.0, 2.0 and 4.0 into it, and 4.0
++// does not fit in lowp's guaranteed (-2,2) range at all. Currently unreachable
++// (DITHERING is gated on config::EmulateFramebuffer, which defaults false in
++// cfg/option.cpp) but wrong as written. mediump matches the `dv` local below.
++uniform mediump vec4 ditherDivisor;
+ #endif
+ 
+ /* Vertex input*/
+@@ -166,9 +179,14 @@
+ 						  sp_FOG_DENSITY * w
+ #endif
+ 											, 1.0, 255.9999);
+-	mediump float exp = floor(log2(z));
++	// `idx` was mediump: it reaches 127.5 and is used directly as a texture
++	// coordinate (idx / 128.0) into the 128-wide fog LUT, so mediump's guaranteed
++	// relative precision allows up to ~1/8 texel of shift. `exp` widened with it
++	// so the exp * 16.0 term is not narrowed on the way into idx. Cosmetic
++	// (fog banding), not a correctness cliff.
++	highp float exp = floor(log2(z));
+ 	highp float m = z * 16.0 / pow(2.0, exp) - 16.0;
+-	mediump float idx = floor(m) + exp * 16.0 + 0.5;
++	highp float idx = floor(m) + exp * 16.0 + 0.5;
+ 	highp vec4 fog_coef = texture(fog_table, vec2(idx / 128.0, 0.75 - (m - floor(m)) / 2.0));
+ 	return fog_coef.FOG_CHANNEL;
+ }
+@@ -218,7 +236,7 @@
+ 	coords.xy /= coords.z;
+ #endif
+ #if TARGET_GL != GLES2 && TARGET_GL != GL2
+-	lowp vec2 texSize = vec2(textureSize(tex, 0));
++	highp vec2 texSize = vec2(textureSize(tex, 0));   // was lowp: ESSL only guarantees lowp float over (-2,2), so a 512/1024 texture dimension SATURATES on GPUs that implement lowp natively (Adreno/Mali/Apple). Desktop drivers promote lowp to fp32, which is why this was invisible on desktop and wrong on a phone. texSize feeds pixCoord/sampleUV below.
+ #endif
+ 	highp vec2 pixCoord = coords.xy * texSize - 0.5;		// coordinates of top left pixel
+ 	highp vec2 originPixCoord = floor(pixCoord);
+--- a/core/rend/gles/gles.h
++++ b/core/rend/gles/gles.h
+@@ -29,8 +29,152 @@
+ #ifndef GL_R8
+ #define GL_R8 0x8229
+ #endif
++
++// ---------------------------------------------------------------------------
++// glCheck() — GL error check at a renderer call site.
++//
++// Upstream this is `verify(glGetError()==GL_NO_ERROR)` gated on
++// config::OpenGlChecks.  In THIS build that gate is DEAD, so all 44 call sites
++// under core/rend/gles/ and core/rend/gl4/ are runtime no-ops:
++//   * core/cfg/option.cpp has `Option<bool> OpenGlChecks("OpenGlChecks", false, "validate")`,
++//     but the libretro shell overrides that TU with
++//     shell/libretro/option.cpp `Option<bool> OpenGlChecks("", false)` —
++//     default false AND an EMPTY core-option name, so it is not user-settable.
++//   * Nothing in dreamcast/flycast-bridge/ sets it.
++// On a phone that means a GL error only the mobile driver raises is discarded
++// silently and the session produces no evidence at all.
++//
++// Under Emscripten we therefore make glCheck() LOG instead of trap:
++//
++//   * LOG, never verify()/abort.  An abort on a device tells us strictly less
++//     than a message: we would get one failure with no context instead of the
++//     whole sequence of errors leading to it, and the page would die before
++//     the log could be read off the screen.
++//
++//   * WARN_LOG(RENDERER, ...) is the transport ON PURPOSE — it is the only one
++//     that reaches the phone's screen.  Route, each hop read:
++//       WARN_LOG (core/log/Log.h) -> GenericLog
++//         -> LogManager::LogWithFullPath (shell/libretro/LogManager.cpp)
++//         -> retro_printf, i.e. flycast_log_cb
++//            (dreamcast/flycast-bridge/EmscriptenWorker.cpp, registered from
++//             environment_cb's RETRO_ENVIRONMENT_GET_LOG_INTERFACE case)
++//         -> MAIN_THREAD_EM_ASM postMessage({cmd:'print', txt:'[flycast.log] '...})
++//         -> dreamcast.html's worker onmessage `case 'print': pageLog(d.txt)`
++//         -> the page's #log element.
++//     A bare printf/console.log from the worker does NOT reach the page.
++//     WARN_LOG also survives the NDEBUG log-level cut: MAX_LOGLEVEL is
++//     LWARNING there (core/log/Log.h, the `#if !defined(NDEBUG)` block), so
++//     INFO_LOG/DEBUG_LOG would be compiled out of this build entirely.
++//
++// KNOWN BLIND SPOT: GL_INVALID_ENUM (0x0500) can never appear here.  The
++// worker-side JS shim drains it before it reaches C —
++// dreamcast/flycast-bridge/webgl2-compat.js drains 0x500 in its ctx.getError
++// wrapper, deliberately, because GLGraphicsContext::findGLVersion()
++// (core/wsi/gl_context.cpp) reads a 0x500 following glGetIntegerv(GL_MAJOR_VERSION)
++// as "this is GLES2" and would downgrade the whole renderer.  That shim now
++// COUNTS and WARNs what it swallows ("[glcompat] swallowed GL_INVALID_ENUM"),
++// so look there for 0x500, not here.
++//
++// ***** OFF BY DEFAULT — AND MUST BE OFF FOR ANY PERF MEASUREMENT. *****
++// glGetError() under WebGL is a SYNCHRONOUS round-trip: it flushes the pending
++// command buffer and blocks until the GL side answers.  Several call sites sit
++// directly on per-draw paths — the glDrawElements lines in
++// core/rend/gles/gldraw.cpp and core/rend/gl4/gldraw.cpp, and the per-param
++// SetCull/glDrawArrays lines in core/rend/gl4/abuffer.cpp all end in
++// `; glCheck();` — so enabling this serializes the renderer against every
++// draw.  An fps / MHz / frame-count / "it wedged" reading taken from a build
++// with FLYCAST_GL_CHECKS on is not a measurement of anything — same rule and
++// the same reason as -DFLYCAST_BRIDGE_DIAG (see the DIAG-flavor block in
++// dreamcast/flycast-bridge/flycast_worker_link.sh, where the per-access trace
++// stalled the guest badly enough to look like a boot wedge).  The one-shot
++// banner below exists so a screenshot from a device can never be mistaken for
++// a clean run.
++//
++// Opt in the same way the bridge diag flavors do — a compile define, absent by
++// default:   -DFLYCAST_GL_CHECKS
++//
++// NOTE, and this differs from the bridge diag flags: FLYCAST_BRIDGE_DIAG and
++// DEBUG_DISPATCH reach ONLY the bridge TUs on the emcc link line, so those are
++// re-link-only.  gles.h is compiled into the flycast_libretro STATIC ARCHIVE,
++// so toggling FLYCAST_GL_CHECKS requires rebuilding the archive
++// (`emmake make`), not just re-running the link script.
++// ---------------------------------------------------------------------------
++#if defined(__EMSCRIPTEN__) && defined(FLYCAST_GL_CHECKS)
++
++// Flood budget.  A GL error raised inside a per-draw path repeats on every
++// single draw call, and an unbounded per-event log is a proven hazard in this
++// project: the per-access [gdrom] trace emitted 51,867 of 53,319 console lines
++// in one 60s run and starved the very loop it was watching (the DIAG-flavor
++// banner in flycast_worker_link.sh records it).  The first errors identify the failure;
++// the rest are the same line.  Budget is intentionally small, and exhaustion
++// prints exactly one trailing line so a truncated log is never misread as a
++// clean one.
++inline int& glCheckLogBudget() { static int budget = 128; return budget; }
+ 
++inline const char *glCheckErrorName(GLenum err)
++{
++	switch (err)
++	{
++	case 0x0500: return "GL_INVALID_ENUM";
++	case 0x0501: return "GL_INVALID_VALUE";
++	case 0x0502: return "GL_INVALID_OPERATION";
++	case 0x0503: return "GL_STACK_OVERFLOW";
++	case 0x0504: return "GL_STACK_UNDERFLOW";
++	case 0x0505: return "GL_OUT_OF_MEMORY";
++	case 0x0506: return "GL_INVALID_FRAMEBUFFER_OPERATION";
++	case 0x0507: return "GL_CONTEXT_LOST";
++	case 0x9242: return "GL_CONTEXT_LOST_WEBGL";
++	default:     return "GL_<unknown>";
++	}
++}
++
++inline void glCheckImpl(const char *file, int line)
++{
++	static bool banner = false;
++	if (!banner)
++	{
++		banner = true;
++		WARN_LOG(RENDERER, "[glcheck] ENABLED (-DFLYCAST_GL_CHECKS). Every GL call site now does a "
++				"synchronous glGetError() round-trip. NO fps / MHz / frame-count / wedge claim "
++				"may be made from this build.");
++	}
++	// glGetError() reports and clears ONE error per call, so drain: otherwise
++	// the next site reports this site's error and every attribution is off by
++	// one call.  Bounded — a lost context returns GL_CONTEXT_LOST_WEBGL
++	// forever and an unbounded drain would spin here.
++	GLenum err;
++	int drained = 0;
++	while ((err = glGetError()) != 0 /* GL_NO_ERROR */ && ++drained <= 8)
++	{
++		int &budget = glCheckLogBudget();
++		if (budget < 0)
++			continue;
++		if (budget-- == 0)
++		{
++			WARN_LOG(RENDERER, "[glcheck] log budget exhausted — further GL errors are SILENCED "
++					"(checks still run). Earlier [glcheck] lines are the complete evidence.");
++			continue;
++		}
++		WARN_LOG(RENDERER, "[glcheck] %s (0x%04x) at %s:%d", glCheckErrorName(err), (unsigned)err, file, line);
++	}
++	// One-shot: if the queue will not drain, it will not drain on every
++	// subsequent site either, and this line must not become the flood.
++	static bool undrainable = false;
++	if (drained > 8 && !undrainable)
++	{
++		undrainable = true;
++		WARN_LOG(RENDERER, "[glcheck] error queue did not drain in 8 reads at %s:%d — context likely LOST", file, line);
++	}
++}
++
++#define glCheck() glCheckImpl(__FILE__, __LINE__)
++
++#else
++// Unchanged upstream behavior for native builds, and the zero-cost default for
++// the shipping wasm build (config::OpenGlChecks is false and unsettable, so
++// this compiles to a predictable never-taken branch).
+ #define glCheck() do { if (unlikely(config::OpenGlChecks)) { verify(glGetError()==GL_NO_ERROR); } } while(0)
++#endif
+ 
+ #define VERTEX_POS_ARRAY 0
+ #define VERTEX_COL_BASE_ARRAY 1
+--- a/core/rend/gles/gltex.cpp
++++ b/core/rend/gles/gltex.cpp
+@@ -4,6 +4,12 @@
+ 
+ #include <memory>
+ 
++// Present in the emsdk GLES3 headers (GLES3/gl3.h:831) but not in ES2-only
++// header sets. Guarded the same way gles.h guards GL_RGBA8 / GL_R8.
++#ifndef GL_DEPTH_STENCIL_ATTACHMENT
++#define GL_DEPTH_STENCIL_ATTACHMENT       0x821A
++#endif
++
+ GlTextureCache TexCache;
+ void (TextureCacheData::*TextureCacheData::uploadToGpu)(int, int, const u8 *, bool, bool) = &TextureCacheData::UploadToGPUGl2;
+ 
+@@ -159,8 +165,20 @@
+ 		break;
+ 
+ 	case 1: //0x1   565 RGB 16 bit
+-		channels = GL_RGB;
+-		format = GL_UNSIGNED_SHORT_5_6_5;
++		// Was GL_RGB / GL_UNSIGNED_SHORT_5_6_5, the only non-RGBA8 attachment in
++		// the build. Emscripten's glTexImage2D only rewrites internalFormat for
++		// DEPTH_COMPONENT+UNSIGNED_INT, RGBA+half-float, DEPTH_STENCIL and
++		// RGBA+FLOAT -- RGB+5_6_5 is not among them, so it reaches the driver as
++		// unsized GL_RGB 5:6:5 and resolves to a real no-alpha 16-bit attachment
++		// on mobile. Desktop drivers promote it to RGBA8, which is why this is
++		// invisible here. With no destination alpha the GL_DST_ALPHA /
++		// GL_ONE_MINUS_DST_ALPHA blend modes and the alpha-0 clear are wrong.
++		// Widening costs no fidelity: when config::RenderToTextureBuffer is set,
++		// ReadRTTBuffer() re-quantizes to 565 in software via WriteTextureToVRam()
++		// anyway; when it is not (the default), the texture is handed straight to
++		// the texture cache, where RGBA8 is strictly better than 565.
++		channels = GL_RGBA;
++		format = GL_UNSIGNED_BYTE;
+ 		break;
+ 
+ 	case 2: //0x2   4444 ARGB 16 bit
+@@ -417,10 +435,31 @@
+ #endif
+ 
+ 		// Attach the depth buffer we just created to our FBO.
+-		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthBuffer);
+-
+-		if (!gl.is_gles || gl.gl_major >= 3 || gl.GL_OES_packed_depth_stencil_supported)
+-			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depthBuffer);
++		// The storage allocated above is a *packed* DEPTH24_STENCIL8 image on
++		// GL 3+ / GLES 3+, so attach it once through GL_DEPTH_STENCIL_ATTACHMENT
++		// rather than binding the same renderbuffer separately to
++		// GL_DEPTH_ATTACHMENT and GL_STENCIL_ATTACHMENT. ES 3.0 permits the split
++		// form when both points name the same image, but GL_DEPTH_STENCIL_ATTACHMENT
++		// is the combination WebGL 2 documents as guaranteed framebuffer-complete.
++		// Getting this wrong costs the stencil plane silently, and Flycast drives
++		// modifier volumes purely through stencil: with no stencil buffer the
++		// stencil test always passes, so the "black out any stencil == 1"
++		// full-screen quad in DrawModVols() paints over the whole frame.
++		if (!gl.is_gles || gl.gl_major >= 3)
++		{
++			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depthBuffer);
++		}
++		else
++		{
++			// GLES2: GL_DEPTH_STENCIL_ATTACHMENT does not exist, so the
++			// OES_packed_depth_stencil idiom is to attach the same renderbuffer to
++			// both attachment points. Unchanged from the original behavior, incl.
++			// the depth-only case (DEPTH_COMPONENT24_OES / DEPTH_COMPONENT16),
++			// which has no stencil to attach.
++			glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthBuffer);
++			if (gl.GL_OES_packed_depth_stencil_supported)
++				glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, depthBuffer);
++		}
+ 	}
+ 
+ 	// Attach the texture/renderbuffer to the FBO
+@@ -428,6 +467,24 @@
+ 		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
+ 	else
+ 		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, colorBuffer);
++
++	// Validate. Every FBO in this build is built here, and until now nothing
++	// checked one for completeness: glCheckFramebufferStatus was only called on
++	// the throwaway 32x32 FBOs in testBlitFramebuffer() -- which pass
++	// withDepth == false, so the depth/stencil configuration above was never
++	// validated anywhere -- and in the non-default OIT path. The two guards in
++	// the render path (`if (BindRTT() == 0)` and
++	// `if (init_output_framebuffer(...) == 0)`) only test a name returned by
++	// glGenFramebuffers, which is never 0, so they cannot catch this.
++	// An incomplete FBO is otherwise entirely silent: every draw becomes
++	// GL_INVALID_FRAMEBUFFER_OPERATION and every glClear a no-op, i.e. a black
++	// screen with no error reported anywhere.
++	// Log only -- deliberately no control-flow change, since altering behavior
++	// mid-session on a device we cannot test against is worse than a log line.
++	GLenum fbStatus = glCheckFramebufferStatus(GL_FRAMEBUFFER);
++	if (fbStatus != GL_FRAMEBUFFER_COMPLETE)
++		ERROR_LOG(RENDERER, "GlFramebuffer: INCOMPLETE framebuffer %u (%dx%d withDepth=%d texture=%u colorBuffer=%u): status 0x%x",
++				framebuffer, width, height, (int)withDepth, texture, colorBuffer, (unsigned)fbStatus);
+ }
+ 
+ GlFramebuffer::GlFramebuffer(int width, int height, bool withDepth, bool withTexture)
+--- a/core/rend/TexCache.cpp
++++ b/core/rend/TexCache.cpp
+@@ -235,7 +235,77 @@
+ 			rc = true;
+ 		else if (tcw.PixelFmt == PixelPal8 && palette_hash != pal_hash_256[tcw.PalSelect >> 4])
+ 			rc = true;
++	}
++#ifdef __EMSCRIPTEN__
++	// WASM has NO VRAM write detection at all, for ANY texture type.
++	// protectVRam() below calls addrspace::protectVram (addrspace.cpp:478),
++	// which falls through to virtmem::region_lock -> mprotect because
++	// virtmemEnabled() is false (virtmem::init returns false unconditionally
++	// under emscripten, core/linux/posix_vmem.cpp:167-171) — and mprotect is a
++	// no-op in wasm. `dirty` is only ever set from a fault handler
++	// (core/linux/common.cpp:52 -> VramLockedWrite), and linear-memory stores
++	// never trap. So once a texture is uploaded, the guest rewriting that VRAM
++	// never invalidates it: frozen animated textures, stale HUD/text, stale FMV
++	// frames. Only paletted textures recovered, via the palette-hash check
++	// above. (This block previously covered ONLY TextureType::_8.)
++	//
++	// Fix = hash the SOURCE VRAM bytes and force a re-decode when they change.
++	// Chosen over hooking write paths because it is the only COMPLETE option:
++	// it compares the bytes themselves, so it cannot miss a writer — SH4
++	// stores, ch2-DMA, TA/store-queue, and the emitter's immediate-EA raw VRAM
++	// store, which bypasses the sh4_mem_write* import entirely
++	// (bementalJIT/guests/sh4/wasm_emit.cpp:1327-1333) and is therefore
++	// invisible to any write-hook/SMC-map scheme.
++	//
++	// COST IS BOUNDED, not per-write and not per-draw: NeedsUpdate() runs once
++	// per BOUND texture (gles/gltex.cpp:285), the FrameCount guard collapses
++	// that to once per frame per texture, and an already-dirty texture skips
++	// the hash entirely.
++	//
++	// Range = exactly the range protectVRam() locks below (block->start =
++	// startAddress, block->end = mmStartAddress + size - 1), so the VQ codebook
++	// and the mip chain are covered too — the old _8-only version hashed only
++	// [mmStartAddress, +size) and excluded VQ.
++	//
++	// wasmVramIsSourceOfTruth() (TexCache.h:190) excludes the one class of entry for
++	// which hashing VRAM is WRONG: a render-to-texture surface under the default
++	// config::RenderToTextureBuffer == false. Its pixels exist only in the GPU
++	// texture handed over by the RTT pass — the backend attaches that texture and
++	// then does `dirty = 0; unprotectVRam();` (gles/gltex.cpp:290-291 and the
++	// four sibling backends), precisely so it is never re-sourced from VRAM.
++	// Without this guard those entries fell into the block below: wasmDataHash
++	// starts at 0 (TexCache.h:113), so the first post-RTT bind hashed non-zero
++	// and forced rc = true, and Update() has no unchanged-hash early-out — it
++	// clears dirty and re-decodes unconditionally (Update(), TexCache.cpp:507-511
++	// then :749) into the very texID the FBO was detached into. Result:
++	// mirrors/monitors/reflections
++	// overwritten with a decode of whatever the guest left at that VRAM address.
++	//
++	// Deliberately still hashed:
++	//  * config::RenderToTextureBuffer == true — there the RTT pass DOES write
++	//    the pixels back through WriteTextureToVRam() and leaves lock_block
++	//    installed, so VRAM is the source of truth. Native catches that write
++	//    with the vramlock fault; on wasm this hash is the only thing that does.
++	//  * paletted textures — the palette lives in PRAM and is already handled by
++	//    the palette_hash check above (and on the GPU for gpuPalette/_8 entries),
++	//    but the INDEX data is in VRAM and is exactly what this hash must track;
++	//    dynamically composed font atlases were the original motivating case.
++	//  * custom-texture replacements — VRAM still selects the replacement via
++	//    ComputeHash(), and Update() re-checks it and early-outs when unchanged
++	//    (TexCache.cpp:578-593), so a re-decode never lands.
++	if (!rc && wasmVramIsSourceOfTruth() && size > 0 && FrameCount != wasmHashFrame)
++	{
++		wasmHashFrame = FrameCount;
++		u32 end = mmStartAddress + size;
++		if (end > VRAM_SIZE)
++			end = VRAM_SIZE;			// same clamp protectVRam() applies
++		if (startAddress < end)
++		{
++			u32 h = XXH32(&vram[startAddress], end - startAddress, 7);
++			if (h != wasmDataHash) { wasmDataHash = h; rc = true; }
++		}
+ 	}
++#endif
+ 
+ 	return rc;
+ }
+--- a/core/rend/TexCache.h
++++ b/core/rend/TexCache.h
+@@ -106,6 +106,13 @@
+ 	u32 texture_hash;			// xxhash of texture data, used for custom textures
+ 	u32 old_vqtexture_hash;		// legacy hash for vq textures
+ 	u32 old_texture_hash;		// legacy hash
++#ifdef __EMSCRIPTEN__
++	// WASM has no mprotect-based VRAM write detection, so gpuPalette (_8) textures
++	// whose index data is written after first decode (e.g. dynamically composed font
++	// atlases) never get invalidated. Detect data changes by hashing the source VRAM.
++	u32 wasmDataHash = 0;
++	u32 wasmHashFrame = 0;
++#endif
+ 	u8* custom_image_data;		// loaded custom image data
+ 	u32 custom_width;
+ 	u32 custom_height;
+@@ -147,6 +154,42 @@
+ 		return custom_load_in_progress == 0 && custom_image_data != NULL;
+ 	}
+ 
++#ifdef __EMSCRIPTEN__
++	// Companion to the VRAM-hash compensation in NeedsUpdate() (TexCache.cpp:239).
++	//
++	// False == "the renderer deliberately detached this entry from VRAM, VRAM is
++	// NOT the source of truth for what is on the GPU". That is the render-to-
++	// texture case with config::RenderToTextureBuffer false (the default —
++	// cfg/option.cpp:73 declares it with no default value, so bool() == false).
++	// There the rendered image lives ONLY in the GPU texture and is never
++	// written back, so every backend ends the RTT pass with the same pair,
++	// `dirty = 0; unprotectVRam();`:
++	//     gles/gltex.cpp:290-291, dx11/dx11_renderer.cpp:1163-1164,
++	//     dx9/d3d_renderer.cpp:948-949, vulkan/drawer.cpp:573-574,
++	//     vulkan/oit/oit_drawer.cpp:701-702.
++	// Native then never invalidates it again: `dirty` is only ever re-set by
++	// invalidate() (TexCache.cpp:1321), which only runs off a vram_block, and
++	// unprotectVRam() just removed the only one.
++	//
++	// lock_block is precisely that signal, so no new state is needed. Note it is
++	// pure bookkeeping — protectVRam() sets it whether or not the underlying
++	// addrspace::protectVram actually took, which is why it stays meaningful on
++	// wasm where that call is a no-op:
++	//   * non-null after every successful Update() — protectVRam()
++	//     (TexCache.cpp:749, and :590 on the custom-texture early-out) always
++	//     installs a block when size > 0: its only bail is `startAddress > end`
++	//     (TexCache.cpp:322), unreachable because startAddress is VRAM_MASK-ed
++	//     and mmStartAddress >= startAddress, and vramlock_list_add() cannot
++	//     fail;
++	//   * null before the first Update() — but then dirty = FrameCount != 0
++	//     (ctor, TexCache.cpp:380);
++	//   * null right after invalidate() — but then dirty = FrameCount != 0 too
++	//     (TexCache.cpp:1323);
++	//   * null with dirty == 0 ONLY in the RTT detach above.
++	// So `!dirty && lock_block == nullptr` == "GPU-resident RTT surface".
++	bool wasmVramIsSourceOfTruth() const { return lock_block != nullptr; }
++#endif
++
+ 	void ComputeHash();
+ 	bool Update();
+ 	virtual void UploadToGPU(int width, int height, const u8 *temp_tex_buffer, bool mipmapped, bool mipmapsIncluded = false) = 0;
+--- a/shell/libretro/libretro.cpp
++++ b/shell/libretro/libretro.cpp
+@@ -3835,4 +3835,20 @@
+ 	retromsg.msg = msg;
+ 	retromsg.frames = durationMs / 17;
+ 	environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &retromsg);
++}
++
++#ifdef __EMSCRIPTEN__
++// Render-feature toggles for the wasm bridge. Defined HERE, in a core TU:
++// the bridge TUs are compiled -D__LIBRETRO__ with a DIFFERENT config::Option
++// memory layout, and an override() from across that ODR mismatch corrupts
++// the options array (see the VMU note in EmscriptenWorker.cpp).
++#include <emscripten.h>
++extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_fog(int on)
++{
++	config::Fog.override(on != 0);
+ }
++extern "C" EMSCRIPTEN_KEEPALIVE void flycast_set_modvol(int on)
++{
++	config::ModifierVolumes.override(on != 0);
++}
++#endif

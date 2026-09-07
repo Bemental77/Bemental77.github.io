@@ -1,94 +1,158 @@
-# The Dreamcast core CANNOT BE RELINKED — the committed source does not build a working binary
+# The Dreamcast core could not be relinked — FIXED 2026-09-07
 
-## The finding
+## Status: RESOLVED. A fresh relink boots both shipped games.
 
-Rebuilding + relinking the Flycast core from the CURRENT committed source produces
-a worker that dies at boot, immediately after the disc loads:
+| game | guest rate | fps | non-black | evidence |
+|---|---|---|---|---|
+| `pso2` | **1.001x** | 30 | 99.6% | `/tmp/probe-dcx-pso2-final.log`, `/tmp/dc-shots/pso2.png` (Character Select) |
+| `gauntlet` | **0.997x** | 30 | 83.0% | `/tmp/probe-dcx-gauntlet.log`, `/tmp/dc-shots/gauntlet.png` (3D attract) |
+
+Both at `fields=30`, `=> RUNNING — frames are flowing`, hash-guard STABLE
+(`flycast_worker_emcc.wasm` sha256=`90b543892bb3fe38`, size 8,704,796), audio
+`HEALTHY — zero underrun after the boot ramp`, load 1.56–2.53. The 60 s PSO run
+before them held `presented=30/s duty=28% headroom=3.6x capacity≈107fps`.
+
+`retro_set_controller_port_device(1, RETRO_DEVICE_JOYPAD)` is IN and works:
+`[maple] bus (type per slot, -1=empty): p0[1,-1,-1,-1,-1,0] p1[-1,-1,-1,-1,-1,0]`
+— controllers (`MDT_SegaController=0`) on ports 0 **and** 1, VMU
+(`MDT_SegaVMU=1`) in port 0's expansion slot A1. Player 2 has a Maple device, so
+`input_state_cb` is polled for port 1.
+
+## Root cause: `dreamcast/flycast-src/` is GITIGNORED and had silently drifted
+
+`.gitignore:60` ignores the whole tree — `git ls-files dreamcast/flycast-src`
+returns **0** of its 1,834 `.cpp` files. Nothing records its contents and nothing
+warns when it changes. Eight files had reverted to a pre-wasm-port state. Because
+the shipped `.wasm` predated the drift, the damage was invisible until a relink.
+
+Confirmed by diffing against the sibling checkout that commit `9441581f` says
+this tree was synced from:
 
 ```
-[flycast-worker] load_disc: retro_load_game returned true
-[pageerror] CppException
-[page] emulator worker error: Uncaught [object ErrorEvent] @ .../flycast_worker_emcc.js:1144
+/Users/caseybement/Dev/dreamcastHtml/dreamcast/flycast-src     <-- SOURCE OF TRUTH
 ```
 
-The SHIPPED worker is fine and boots PSO at guest=1.000x with a full picture. It
-is fine because it PREDATES the core changes now in the tree:
+Exactly 8 files differed; `core/version.h` (a generated build stamp) is the only
+legitimate one.
 
-```
-dreamcast/flycast_libretro/flycast_worker_emcc.wasm   built Aug 29
-dreamcast/flycast-src/build-wasm/libflycast_libretro.a  built Sep 4 from COMMITTED source
-```
+### The two edits that killed the boot
 
-## It is NOT the change that exposed it
+1. **`core/emulator.cpp` — `Emulator::start()` lost its `__EMSCRIPTEN__` guard**
+   ```cpp
+   config::ThreadedRendering.override(false);
+   ```
+   Without it flycast takes the `ThreadedRendering` branch and spawns its own
+   `std::async` SH4 thread that races the worker's dispatch pump. The reference
+   comment records the same trap being found before, via the trap stack
+   `runInternal <- std::__async_assoc_state<...start()::$_0>`.
 
-Found while arming Maple port 1 for online co-op. Controlled A/B, one variable,
-same build flow, same probe:
+2. **`core/hw/sh4/dyna/ssa.cpp` — the read-only const-fold was re-enabled on wasm**
+   The fold's safety depends on page-fault SMC (`bm_RamWriteAccess` from the
+   SIGSEGV handler). WASM has no mprotect faults, so RAM code blocks stay
+   `read_only=true` forever and the fold bakes in a STALE value. PSO's interrupt
+   dispatcher (guest `0x8c379a88`) reads its latched INTEVT word `0x8c379b7c`,
+   which lives in the dispatcher's own code page — so the fold froze it at
+   `0x320` (VBlank) and routed **every** interrupt, Maple `0x360` included, to
+   the VBlank handler. Maple bit12 never got acked ⇒ re-vector storm.
 
-| arm | boots? |
+The observed failure was the downstream symptom: the guest stopped submitting
+frames, so `PvrMessageQueue::dequeue`'s 20 ms `enqueueEvent.Wait(timeout)`
+blocked on the worker's main runtime thread, which under `-sASYNCIFY` becomes
+`_do_futex_wait -> _emscripten_yield -> emscripten_exit_with_live_runtime ->
+throw "unwind"`. That unwound out of `retro_run` and the shim stopped the pump.
+
+### The other six (correctness/perf, not boot)
+
+| file | what was lost |
 |---|---|
-| with `retro_set_controller_port_device(1, RETRO_DEVICE_JOYPAD)` | NO — CppException |
-| identical build, that ONE line commented out | **NO — same CppException** |
+| `core/build.h` | `FEAT_AREC DYNAREC_JIT` (patch 0020's hunk). The **entire ARM7/AICA wasm dynarec compiled out** — `arm7_rec_wasm.cpp` is wrapped in `#if FEAT_AREC != DYNAREC_NONE`. |
+| `core/hw/sh4/sh4_mem.cpp` | `smc_mark_range()` at the three `WriteMemBlock_nommu_{dma,ptr,sq}` chokepoints. Lever-4's invariant is that every write into a compiled code word bumps `g_ic_generation`; lever-5E1 **skips the per-lookup verify** when it hasn't moved. Without these a DMA burst overwrites compiled code and the JIT keeps running the stale block. |
+| `core/hw/maple/maple_cfg.cpp` | VMU on bus 0 expansion slot A1 (the `g_vmu_flash_ptr` bridge was dead code without it). |
+| `core/hw/aica/sgc_if.cpp` | patch 0021 disabled-channel hoist. |
+| `core/rend/TexCache.{cpp,h}` | patch 0018 wasm VRAM source hash + RTT exclusion. |
+| `core/rend/gles/{gles.cpp,gles.h,gltex.cpp}` | patch 0017 mobile precision / FBO diagnostics. |
+| `shell/libretro/libretro.cpp` | `flycast_set_fog` / `flycast_set_modvol`, defined in a **core** TU. |
 
-So the port-1 line is exonerated and the relink itself is the fault. Anything that
-requires a core rebuild is blocked behind this, which is a much bigger problem
-than the feature that ran into it.
+## How to check for this drift (do it before trusting any relink)
 
-## A second, separate breakage found on the way — FIXED
-
-The link failed outright before any of the above:
-
+```bash
+diff -rq -x "build-*" -x .git -x .DS_Store \
+  dreamcast/flycast-src /Users/caseybement/Dev/dreamcastHtml/dreamcast/flycast-src
 ```
-wasm-ld: error: symbol exported via --export not found: flycast_set_fog
-wasm-ld: error: symbol exported via --export not found: flycast_set_modvol
-```
 
-`flycast_worker_link.sh:81-82` exports both, `flycast_worker.js:1069,1079` calls
-both behind `?nofog=1` / `?nomodvol=1`, and both are present in the shipped wasm —
-but NO SOURCE FILE IN THE TREE DEFINED THEM. They were lost at some point and the
-loss was invisible because nobody relinked. Re-implemented in
-`EmscriptenWorker.cpp` against the options they were written for
-(`core/cfg/option.h:441` ModifierVolumes, `:455` Fog) rather than deleted from the
-export list, which would have quietly dropped a render-bisect tool shipped code
-still calls. After this the link SUCCEEDS — it is the resulting binary that fails.
+Anything but `core/version.h` is drift. **Sync the named files from the
+reference; do not replay patches.** `patch --dry-run` lied about this tree in
+both directions: BSD `patch` silently skips already-applied hunks and still
+exits 0, and fuzzy matching applied a `FEAT_AREC` hunk against the wrong one of
+`build.h`'s four identical `#define FEAT_AREC DYNAREC_NONE` lines. A
+content-level audit (grep each patch's added lines) is the only check that held.
 
-## State of the tree
+`dreamcast/flycast-bridge/patches/0022-restore-lost-wasm-port-edits.patch`
+records this recovery for a tree in the same state, but the reference checkout
+is the authority.
 
-`EmscriptenWorker.cpp` carries the port-1 line and the restored exports. ⚠ THE
-SHIPPED WASM DOES NOT CONTAIN THEM — it is the working Aug 29 binary, deliberately
-restored from git after the A/B, because shipping a core that dies at boot is far
-worse than shipping one without player 2. Source and binary therefore disagree,
-which is exactly the stale-build trap CLAUDE.md warns about; it is recorded here
-rather than left to be rediscovered.
+## The technique that found it, worth reusing
 
-## What online co-op is missing because of this
+Symbol names first, then body sizes — both from the `--emit-symbol-map` output
+and the wasm code section, no rebuild needed:
 
-Everything except the emulator's second controller works and is tested: pairing,
-the host streaming its canvas + audio, the guest's pad reaching the worker
-(measured: port 1 = 0x81 lx=+32766 in the byte array handed to the core), and the
-save handoff. But `input_state_cb` is only called for a port that has a Maple
-device, and per the comment at `EmscriptenWorker.cpp:1258` every port stays
-MDT_None unless something plugs one in. So the guest's bytes arrive and nothing
-polls them.
+* **name-set diff** (good vs broken) surfaced `smc_mark_range` present in the
+  shipped binary and absent from the relink, plus the whole
+  `aica::arm::Arm7WasmEmitter` family — that is what exposed `FEAT_AREC`.
+* **per-function body-size diff** then reduced the search to **6 differing
+  bodies out of 4,898 common ones**, four of which were my own edits. The two
+  left were `Emulator::start()` (−21 bytes) and `compilePC`. `Emulator::start()`
+  was the boot bug.
 
-## THERE IS NO NO-RELINK WORKAROUND — all three candidate paths checked and closed
+A working binary is a complete record of the source that built it. Diff against
+it before bisecting commits — commits could never have found this, because the
+drifted tree is not in git.
 
-Worth stating because it is the obvious thing to try next and all of it is a dead
-end. Arming Maple port 1 REQUIRES a working relink; nothing at runtime can do it.
+## What was ELIMINATED on the way (do not re-investigate)
 
-| candidate | why it is closed |
-|---|---|
-| libretro core options | `EmscriptenWorker.cpp:394-395` answers `RETRO_ENVIRONMENT_GET_VARIABLE` with a bare `return false`, so every option falls back to its default |
-| a config file in MEMFS | there is no `loadAll` / `cfgOpen` / `LoadSettings` call in `shell/libretro/libretro.cpp`, so no cfg is read; `Option::load()` (`core/cfg/option.h:119`) is never reached |
-| writing the pad buffer harder | irrelevant — `input_state_cb` is only CALLED for a port that has a Maple device, and `option.cpp:200-203` leaves `device2` at `MDT_None` |
+Each of these was a full build+probe A/B on the canonical loop, and each still
+reproduced the identical crash (`sh4_pc=0x8c379a42 spc=0x8c378d72`):
 
-That leaves `config::MapleMainDevices[1].override(...)` / `retro_set_controller_port_device(1, ...)` in C++, which is compiled in. Hence the relink.
+* **The emsdk.** Both the shipped and the relinked glue are emscripten **6.0.2**
+  (`emcc -v`). The "3.1.67" string in both files is the link script's own patch
+  comment (`flycast_worker_link.sh:400-405`), **not** a toolchain stamp — do not
+  read it as one.
+* **`retro_set_controller_port_device(1, ...)`** — re-A/B'd on the fully
+  restored tree; boots with it in.
+* **`config::Option::override()` called from `EmscriptenWorker.cpp`** (the
+  restored `flycast_set_fog`/`flycast_set_modvol`) — neutralising both bodies
+  changed nothing. They have since been moved to `libretro.cpp` anyway, which is
+  where the reference puts them and where the `Option` layout is correct.
+* **`LEVER14_PREF_NARROW_SYNC`** in `bementalJIT/guests/sh4/wasm_emit.cpp` —
+  built with the author's own `=0` byte-for-byte revert switch; no change.
+* **`c5b70e2e` + `63e654f9`** (the delete-7851-files incident and its repair) —
+  `git diff c5b70e2e^ 63e654f9 -- bementalJIT dreamcast` is **empty**; the
+  restore was byte-identical. Not a suspect.
+* **The VMU** — restoring it made `[maple]` match the shipped binary exactly and
+  the crash was unchanged. It was lost work worth restoring, not the cause.
 
-## Next
+## ⚠ Two landmines of the same class are still live
 
-1. Bisect the core commits between the Aug 29 wasm and the current tree to find
-   what broke the build. `git log --oneline -- dreamcast/flycast-src` is the range.
-2. The exception is thrown after `retro_load_game` succeeds, so the crash is in
-   early run/render setup rather than disc handling. A DIAG link (`FLYCAST_DIAG=1`)
-   would name it — the RELEASE flavor swallows the C++ exception into a bare
-   `CppException`.
-3. Only after the core builds again does the port-1 line become testable.
+1. **`dreamcast/flycast-bridge/arm7_rec_wasm.cpp` is UNTRACKED** (`git log` on it
+   is empty). `flycast_worker_link.sh:314` compiles it by name, so if it is ever
+   lost the link fails outright. It is another agent's in-progress work, so it is
+   flagged here rather than swept into this commit — it should be committed by
+   its author.
+2. **HEAD does not compile on its own.** `bementalJIT/guests/sh4/wasm_emit.cpp`
+   calls `b.ifDepth()` 13 times (committed in `c7888a76`), but the definition in
+   `bementalJIT/include/bementalJIT/wasm_module_builder.h` was **never
+   committed** — `git log -S ifDepth` on that header returns nothing. A clean
+   checkout of HEAD cannot build the SH4 emitter. The verified binary in this
+   commit was built WITH those uncommitted working-tree edits.
+
+## Tooling added
+
+* `flycast_probe.js --game <key>` + `build_and_probe.sh --game <key>` — sets
+  `dreamcast.html`'s `#romSelect` through the DOM before Start. Until now the
+  canonical loop could only ever boot `pso2`, so "the core boots" was a one-game
+  claim and **gauntlet — the 4-player co-op title the online mode exists for —
+  was unreachable**. Same gap class as `--loadstate` / `--ctxms` / `--profat`.
+* `EmscriptenWorker.cpp` now logs the **whole** Maple bus, not just slot A1:
+  `[maple] bus (type per slot, -1=empty): p0[...] p1[...] p2[...] p3[...]`.
+  The old single-slot probe could not tell "no VMU" from "no devices at all",
+  which are very different faults. One line, once, at load.
