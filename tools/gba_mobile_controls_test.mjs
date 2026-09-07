@@ -28,12 +28,16 @@
 // EVERY ARM ASSERTS ON A MEASURED VALUE — a control's real bounding box after a
 // real drag, localStorage's real contents, and the input flag the CORE reads.
 //
-// USAGE  npm run web    # required: http://localhost:8080
+// USAGE  npm run web    # required for the default origin
 //        node tools/gba_mobile_controls_test.mjs
+//        ORIGIN=https://caseybement.com node tools/gba_mobile_controls_test.mjs
 import puppeteer from 'puppeteer';
 
 const CHROME = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const ORIGIN = 'http://localhost:8080';
+// ORIGIN override so the same arms can be run against the DEPLOYED page, not
+// just localhost — a gate that can only see the dev server cannot tell you
+// whether what shipped works.
+const ORIGIN = process.env.ORIGIN || 'http://localhost:8080';
 const IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 const results = [];
 const ok = (arm, name, detail) => { results.push({ arm, name, detail, ok: true }); console.log(`  PASS  ${name}  ${detail}`); };
