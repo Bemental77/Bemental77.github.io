@@ -54,6 +54,7 @@ const SOURCES = [
   'snes.html',
   'gba/gbaWasm/dist/script.js',          // -> input_controller.js
   'gba/gbaWasm/dist/input_controller.js', // -> 44gba.js
+  'genesis.html',
 ];
 
 // Runtime assets that are REQUIRED but are never spelled out as a literal URL in
@@ -75,6 +76,14 @@ const ALWAYS_REQUIRED = new Map([
    'snes.html Module.locateFile = p => "/snes/snesWasm/" + p'],
   // Built-in ROMs: fetched from an array literal, not a literal URL argument.
   ['/snes/snesWasm/roms/simcity.smc', 'snes.html ROMS[0].url'],
+  ['/genesis/genesisWasm/dist/genesis_plus_gx.wasm',
+   'genesis.html Module.locateFile = p => "/genesis/genesisWasm/dist/" + p'],
+  // Both Mega Drive ROMs are listed explicitly: their names contain SPACES and
+  // PARENTHESES, so they are exactly the kind of URL a static scanner should not
+  // be trusted to recover from a source file, and a deploy filter that dropped
+  // the directory would otherwise pass silently.
+  ['/genesis/genesisWasm/roms/Sonic the Hedgehog 3 (USA).gen', 'genesis.html ROMS[0].url'],
+  ['/genesis/genesisWasm/roms/X-Men (U).gen', 'genesis.html ROMS[1].url'],
   // PS1 discs are split; the page builds chunk names arithmetically from
   // ROM_ROOT + base + ".bin.parta" + <letter>, so probe the first chunk of the
   // default title. A deploy filter that strips the directory shows up here.
