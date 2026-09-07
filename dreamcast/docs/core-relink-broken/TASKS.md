@@ -70,6 +70,19 @@ device, and per the comment at `EmscriptenWorker.cpp:1258` every port stays
 MDT_None unless something plugs one in. So the guest's bytes arrive and nothing
 polls them.
 
+## THERE IS NO NO-RELINK WORKAROUND — all three candidate paths checked and closed
+
+Worth stating because it is the obvious thing to try next and all of it is a dead
+end. Arming Maple port 1 REQUIRES a working relink; nothing at runtime can do it.
+
+| candidate | why it is closed |
+|---|---|
+| libretro core options | `EmscriptenWorker.cpp:394-395` answers `RETRO_ENVIRONMENT_GET_VARIABLE` with a bare `return false`, so every option falls back to its default |
+| a config file in MEMFS | there is no `loadAll` / `cfgOpen` / `LoadSettings` call in `shell/libretro/libretro.cpp`, so no cfg is read; `Option::load()` (`core/cfg/option.h:119`) is never reached |
+| writing the pad buffer harder | irrelevant — `input_state_cb` is only CALLED for a port that has a Maple device, and `option.cpp:200-203` leaves `device2` at `MDT_None` |
+
+That leaves `config::MapleMainDevices[1].override(...)` / `retro_set_controller_port_device(1, ...)` in C++, which is compiled in. Hence the relink.
+
 ## Next
 
 1. Bisect the core commits between the Aug 29 wasm and the current tree to find
