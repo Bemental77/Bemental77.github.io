@@ -390,6 +390,7 @@
       <option value="pso2">Phantasy Star Online Ver. 2 (USA)</option>
       <option value="cannonspike">Cannon Spike (USA)</option>
       <option value="sa2">Sonic Adventure 2 (USA)</option>
+      <option value="gauntlet">Gauntlet Legends (USA)</option>
       <option value="mvc2">Marvel vs. Capcom 2 (USA)</option>
     </select>
     <button id="btnStart">Start</button>
@@ -1862,6 +1863,27 @@
           parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
                    .map(s => 'Track3.bin.part' + s) },
         { name: 'SonicAdventure2.cue' },
+      ],
+    },
+    // Five tracks, and the FIRST disc here with more than one split file —
+    // Track3 (487,889,472 B, 5 parts) and Track5 (696,634,176 B, 7 parts) both
+    // exceed the part size, while Track1/2/4 ship whole. Each split file carries
+    // its own `bytes` because that is the per-file assembled total the fetch path
+    // asserts against, not a disc-wide figure.
+    gauntlet: {
+      name: 'Gauntlet Legends (USA)',
+      base: '/dreamcast/discs/gauntlet/',
+      cue:  'GauntletLegends.cue',
+      productId: 'T9710N',
+      files: [
+        { name: 'Track1.bin' },
+        { name: 'Track2.bin' },
+        { name: 'Track3.bin', bytes: 487889472,
+          parts: ['aa','ab','ac','ad','ae'].map(s => 'Track3.bin.part' + s) },
+        { name: 'Track4.bin' },
+        { name: 'Track5.bin', bytes: 696634176,
+          parts: ['aa','ab','ac','ad','ae','af','ag'].map(s => 'Track5.bin.part' + s) },
+        { name: 'GauntletLegends.cue' },
       ],
     },
     // A .cdi is ONE file, not a cue plus tracks — `cue` here is really "the disc
