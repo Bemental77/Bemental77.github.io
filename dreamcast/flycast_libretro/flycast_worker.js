@@ -687,6 +687,22 @@
         // Only the first 64 KB of each file is read: a full FS.readFile of a
         // 1.19 GB track would be a catastrophic copy.
         try {
+          // FAST PATH: the page passes the product id from the catalog when it
+          // knows it. Needed for .cdi, where IP.BIN is NOT near the start — in
+          // Marvel vs Capcom 2's image the 'SEGA SEGAKATANA' header sits at
+          // 0x4b85988 (~79 MB in), so the 64 KB scan below cannot reach it and
+          // would leave the directory uncreated. Scanning that far in the worker
+          // is a lot of reading to rediscover a constant the catalog can just
+          // state. The scan remains as the fallback for a disc added without one.
+          if (data.productId) {
+            let made = '';
+            for (const seg of ['/bios', '/bios/dc', '/bios/dc/textures', '/bios/dc/textures/' + data.productId]) {
+              try { Module.FS.mkdir(seg); made = seg; } catch (_) {}
+            }
+            postMessage({ cmd: 'print', txt: '[flycast-shim] disc product id ' + data.productId +
+                          ' (from catalog) — texture dir ready' + (made ? (' (created ' + made + ')') : '') });
+            throw { __done: true };
+          }
           const dir = '/discs';
           for (const nm of Module.FS.readdir(dir)) {
             if (nm === '.' || nm === '..') continue;
@@ -719,7 +735,8 @@
           }
         } catch (err) {
           // Never fatal: if this fails the core simply behaves as it did before.
-          postMessage({ cmd: 'print', txt: '[flycast-shim] texture-dir prep skipped: ' + (err && err.message ? err.message : String(err)) });
+          if (!(err && err.__done))
+            postMessage({ cmd: 'print', txt: '[flycast-shim] texture-dir prep skipped: ' + (err && err.message ? err.message : String(err)) });
         }
         try {
           const ret = Module.ccall('emscripten_load_disc', 'number', ['string'], [data.cuePath]);

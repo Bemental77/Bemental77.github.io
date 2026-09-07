@@ -389,6 +389,7 @@
     <select id="romSelect">
       <option value="pso2">Phantasy Star Online Ver. 2 (USA)</option>
       <option value="cannonspike">Cannon Spike (USA)</option>
+      <option value="mvc2">Marvel vs. Capcom 2 (USA)</option>
     </select>
     <button id="btnStart">Start</button>
     <button id="btnReset" disabled>Reset</button>
@@ -1810,6 +1811,7 @@
       name: 'Phantasy Star Online Ver. 2 (USA)',
       base: '/dreamcast/discs/pso2/',
       cue:  'PSO.cue',
+      productId: 'MK-51193',
       files: [
         { name: 'Track1.bin' },
         { name: 'Track2.bin' },
@@ -1835,6 +1837,9 @@
       name: 'Cannon Spike (USA)',
       base: '/dreamcast/discs/cannonspike/',
       cue:  'CannonSpike.cue',
+      // From the disc's own IP.BIN header (+0x40). flycast stats
+      // /bios/dc/textures/<id>/ and throws if it is missing — see the worker shim.
+      productId: 'T1215N',
       files: [
         { name: 'Track1.bin' },
         { name: 'Track2.bin' },
@@ -1842,6 +1847,21 @@
           parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
                    .map(s => 'Track3.bin.part' + s) },
         { name: 'CannonSpike.cue' },
+      ],
+    },
+    // A .cdi is ONE file, not a cue plus tracks — `cue` here is really "the disc
+    // image to hand the core", which is what emscripten_load_disc takes.
+    // productId is mandatory in practice for .cdi: the shim's 64 KB IP.BIN scan
+    // cannot see this image's header at 0x4b85988.
+    mvc2: {
+      name: 'Marvel vs. Capcom 2 (USA)',
+      base: '/dreamcast/discs/mvc2/',
+      cue:  'MvC2.cdi',
+      productId: 'T1212N',
+      files: [
+        { name: 'MvC2.cdi', bytes: 799165154,
+          parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai']
+                   .map(s => 'MvC2.cdi.part' + s) },
       ],
     },
   };
@@ -3146,7 +3166,7 @@
           resolve('timeout');
         }, 120000);
         pendingDiscLoad = (v) => { clearTimeout(t); resolve(v); };
-        worker.postMessage({ cmd: 'discReady', cuePath: '/discs/' + game.cue });
+        worker.postMessage({ cmd: 'discReady', cuePath: '/discs/' + game.cue, productId: game.productId || null });
       });
       if (ok === 'timeout') {
         throw new Error('the emulator never acknowledged the disc after 120 s — it did not answer ' +
