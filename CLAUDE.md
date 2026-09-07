@@ -212,6 +212,25 @@ git commit -- <path> [<path>...]        # pathspec-limited; ignores the rest of 
 git diff --cached --name-only           # ALWAYS read this before committing
 git show --stat --format="" HEAD | tail -25   # and verify AFTER: did it take only what you meant?
 ```
+
+**⚠ THE PATHSPEC RULE IS NOT SUFFICIENT FOR A FILE TWO AGENTS SHARE.** `git commit -- <path>`
+commits the **WORKING TREE** content of those paths, NOT the index — so it protects you from
+sweeping other FILES, and not at all from sweeping another agent's UNSTAGED HUNKS IN THE SAME
+FILE. Verified here 2026-09-07 with a throwaway repo:
+
+```
+index has:    A b c              # what I staged
+worktree has: A b B-unstaged     # sibling's edit, unstaged
+git commit -- f.txt
+COMMITTED:    A b B-unstaged     # the sibling's hunk went in
+```
+
+It bit an agent for real on `dreamcast.html` (three of a sibling's hunks). `git diff --cached`
+does NOT warn you, because the extra content was never in the index. When a file is being
+edited by someone else: leave it to them entirely, or commit only your own hunks
+(`git stash` is FORBIDDEN here — it is shared state). If it has already happened, the repair
+is `commit-tree` + `update-ref`, which rewrites your commit without touching the shared
+working tree or index.
 Checking `git status` is NOT sufficient — it shows the sibling's staged files as ordinary staged entries, indistinguishable from your own. When a file you need is being edited by a sibling (e.g. `gamecube.html` carrying both a present-ring change and a capability fix), either leave it entirely to that agent or stage only your own hunks; do not commit the file wholesale.
 
 ### Before any measured run (not optional)
