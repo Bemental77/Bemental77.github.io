@@ -87,7 +87,9 @@ const ALWAYS_REQUIRED = new Map([
   // PS1 discs are split; the page builds chunk names arithmetically from
   // ROM_ROOT + base + ".bin.parta" + <letter>, so probe the first chunk of the
   // default title. A deploy filter that strips the directory shows up here.
-  ['/ps1/ps1Wasm/roms/MonsterRancher2.bin.partaa', 'ps1.html ROMS[0] chunkRange("MonsterRancher2","f")'],
+  // .gz because the ROM libraries are gzipped and inflated by the page — see
+  // the chunkRange note in ps1.html. The raw name no longer exists anywhere.
+  ['/ps1/ps1Wasm/roms/MonsterRancher2.bin.partaa.gz', 'ps1.html ROMS[0] chunkRange("MonsterRancher2","f")'],
 ]);
 
 // Known-optional at runtime: the code has an explicit graceful path, so a 404 is
@@ -206,10 +208,15 @@ const urls = [...found.keys()].sort();
 for (const u of urls) {
   if (looksLikeSplitPrefix(u)) {
     // Check the first real chunk instead of the (non-existent) prefix.
-    const probe = u + SPLIT_PREFIX_SUFFIXES[0];
-    const present = await check(probe);
-    if (present) { ok.push(`${u}* (probed ${SPLIT_PREFIX_SUFFIXES[0]})`); }
-    else { missing.push(probe); found.set(probe, found.get(u)); }
+    // The chunk may be stored gzipped (the pages inflate it), so accept either
+    // spelling. Checking only the raw name reported a FALSE MISSING for every
+    // ROM the moment the libraries were compressed — the gate failed the deploy
+    // on files that were present under a different extension.
+    const probes = [u + SPLIT_PREFIX_SUFFIXES[0], u + SPLIT_PREFIX_SUFFIXES[0] + '.gz'];
+    let hit = null;
+    for (const probe of probes) { if (await check(probe)) { hit = probe; break; } }
+    if (hit) { ok.push(`${u}* (probed ${hit.slice(u.length)})`); }
+    else { missing.push(probes[0] + ' (and .gz)'); found.set(probes[0] + ' (and .gz)', found.get(u)); }
     continue;
   }
   const present = await check(u);
