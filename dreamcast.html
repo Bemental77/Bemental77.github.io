@@ -14,6 +14,13 @@
        [glinfo] pinning, which remain the authority on what the WORKER's context got. -->
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
+  <!-- Online co-op. ONE INSTANCE RUNS THE GAME: the host's emulator is the only
+       emulator, it streams its picture and sound over WebRTC, and the person who
+       joins sends controller state back which the host feeds in as PLAYER 2. The
+       emulator is never told any of this is happening — it sees a second pad on
+       the same machine. Everything below is guarded on Netplay.supported(): a
+       browser without RTCPeerConnection never sees the button at all. -->
+  <script src="/lib/netplay.js"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH. Gates BOTH Start
     // controls (#btnStart and the mobile splash's #mobileSplashStart — the phone
@@ -339,6 +346,59 @@
       transform: translate(-50%, -50%);
       width: 100%; height: 100%; min-width: 44px; min-height: 44px;
     }
+
+    /* ---- Online play -------------------------------------------------------
+       The lobby is a modal in the same idiom as #controlsOverlay (dark sheet,
+       one card, 44 px hit targets) so it reads as part of the page rather than
+       a bolted-on feature. #netVideo is the GUEST's screen: it stands exactly
+       where #dc-canvas stands, in whichever container the canvas was put into
+       (#canvasWrap on desktop, #mobileScreen on the phone shell), so the touch
+       pad and the keyboard keep working underneath it unchanged. */
+    #netOverlay { display: none; position: fixed; inset: 0; z-index: 99999;
+      background: rgba(0,0,0,.72); align-items: center; justify-content: center; }
+    #netOverlay.on { display: flex; }
+    #netBox { background: #1b1b1f; color: #eee; border: 1px solid #444; border-radius: 10px;
+      padding: 20px 24px; width: min(420px, calc(100vw - 32px)); max-height: calc(100vh - 32px);
+      overflow: auto; font: 14px/1.6 system-ui, sans-serif; box-shadow: 0 8px 40px rgba(0,0,0,.6); }
+    #netBox h6 { margin: 0 0 10px; font-size: 18px; font-weight: 600; color: #fff; }
+    #netBox p.lead { margin: 0 0 14px; color: #9aa6b2; font-size: 13px; }
+    #netBox .netLabel { color: #8bd; font-size: 12px; text-transform: uppercase;
+      letter-spacing: .06em; margin: 14px 0 6px; }
+    #netBox button, #netBox select, #netBox input {
+      padding: 10px 14px; border: 1px solid #444; background: #222; color: #eee;
+      border-radius: 6px; font-size: 14px; min-height: 44px; cursor: pointer; }
+    #netBox button.primary { background: #2a6b4a; border-color: #3fa06e; }
+    #netBox button[disabled] { opacity: .45; cursor: default; }
+    #netRow { display: flex; gap: 8px; flex-wrap: wrap; }
+    #netRow button, #netRow select { flex: 1 1 auto; }
+    #netCode { font: 700 30px/1.2 ui-monospace, Menlo, monospace; letter-spacing: .22em;
+      color: #7ee787; background: #010409; border: 1px solid #30363d; border-radius: 6px;
+      padding: 12px; text-align: center; -webkit-user-select: all; user-select: all; }
+    #netCodeIn { width: 100%; box-sizing: border-box; font: 700 22px/1.2 ui-monospace, Menlo, monospace;
+      letter-spacing: .18em; text-align: center; text-transform: uppercase; }
+    #netStatus { margin-top: 14px; padding: 9px 11px; border-radius: 6px; background: #0d1117;
+      border: 1px solid #30363d; font-size: 13px; color: #e6edf3; }
+    #netStatus.good { border-color: #2ea043; color: #7ee787; }
+    #netStatus.bad  { border-color: #f85149; color: #ff7b72; }
+    #netStatus.busy { border-color: #9e6a03; color: #ffa657; }
+    .netActions { display: flex; gap: 8px; margin-top: 14px; justify-content: flex-end; }
+    /* The guest's picture. Sized like the canvas it stands in for, in every
+       layout the canvas itself has a rule for (desktop, fullscreen, console,
+       phone shell) — a video that keeps 640x480 inside a fullscreen wrap would
+       be the same 14.8%-of-the-screen bug the .console-ua rules above fix. */
+    #netVideo { display: none; background: #000; image-rendering: pixelated;
+      width: 640px; height: 480px; max-width: 100%; max-height: 100%; object-fit: contain; }
+    #netVideo.on { display: block; }
+    #canvasWrap:fullscreen #netVideo, #canvasWrap:-webkit-full-screen #netVideo {
+      width: auto; height: 100vh; max-width: 100vw; max-height: 100vh; }
+    @media (min-aspect-ratio: 4/3) { #canvasWrap:fullscreen #netVideo,
+      #canvasWrap:-webkit-full-screen #netVideo { width: calc(100vh * 4 / 3); } }
+    @media (max-aspect-ratio: 4/3) { #canvasWrap:fullscreen #netVideo,
+      #canvasWrap:-webkit-full-screen #netVideo { width: 100vw; height: calc(100vw * 3 / 4); } }
+    .console-ua #netVideo { width: auto; height: 100%; max-width: 100%; max-height: 100%; aspect-ratio: 4 / 3; }
+    @media (max-aspect-ratio: 4/3) { .console-ua #netVideo { width: 100%; height: auto; aspect-ratio: 4 / 3; } }
+    #mobileScreen video { image-rendering: pixelated; max-width: 100%; max-height: 100%;
+      width: auto; height: 100%; }
 </style>
   <!-- JAVASCRIPT OFF. Measured 2026-09-01: none of the three emulator pages had a
        <noscript> at all, so a visitor with JS disabled (blocked by an extension, or on
@@ -406,6 +466,9 @@
     <button id="btnLog"   type="button">Toggle Log</button>
     <button id="btnDiag"  type="button">🩺 Diagnostics</button>
     <button id="btnControls" type="button">🎮 Controls</button>
+    <!-- Hidden outright unless Netplay.supported() — never present a control
+         that cannot work (the same rule the capability layer applies to Start). -->
+    <button id="btnNet" type="button" style="display:none">🌐 Play Online</button>
     <div id="controlsOverlay" style="display:none;position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.72);align-items:center;justify-content:center;">
       <div style="background:#1b1b1f;color:#eee;border:1px solid #444;border-radius:10px;padding:20px 26px;max-width:460px;font:14px/1.7 system-ui,sans-serif;box-shadow:0 8px 40px rgba(0,0,0,.6);">
         <div style="font-size:18px;font-weight:600;margin-bottom:12px;">🎮 Controls</div>
@@ -443,7 +506,11 @@
     </div>
   </div>
   <div id="status"></div>
-  <div id="canvasWrap"><canvas id="dc-canvas" width="640" height="480"></canvas></div>
+  <!-- The GUEST's screen. Empty and hidden until a stream arrives; the guest
+       runs no emulator, so this <video> is the only picture it ever has. It is
+       moved alongside the canvas by the mobile shell (both are reparented into
+       #mobileScreen), which is why it lives in #canvasWrap and not at body level. -->
+  <div id="canvasWrap"><canvas id="dc-canvas" width="640" height="480"></canvas><video id="netVideo" playsinline autoplay></video></div>
   <div id="fpsBar"><span class="k">guest</span> — <span class="sep">|</span> <span class="k">presented</span> — <span class="sep">|</span> <span class="k">headroom</span> —</div>
   <pre id="log"></pre>
 </div>
@@ -459,6 +526,10 @@
          it the Diagnostics entry) is unreachable. A boot that dies here would
          otherwise be reportable only by whatever auto-opens. -->
     <button id="mobileSplashDiag" type="button" class="linkBtn">🩺 Diagnostics</button>
+    <!-- The splash covers #mobileBottom, so the ≡ menu is unreachable until the
+         visitor Starts a game. A GUEST never starts one — it joins someone
+         else's — so without this entry, joining from a phone is impossible. -->
+    <button id="mobileSplashNet" type="button" class="linkBtn" style="display:none">🌐 Play Online</button>
   </div>
   <div id="mobileScreen"></div>
   <div class="mobileSide left">
@@ -493,11 +564,47 @@
       <button id="mGhost">Transparent Controls: Off</button>
       <button id="mHide">Hide Controls: Off</button>
       <button id="mLog">Show Log: Off</button><button id="mDiag">🩺 Diagnostics</button>
+      <button id="mNet" style="display:none">🌐 Play Online</button>
       <button id="mFull">Fullscreen</button><button id="mClose">Close</button>
     </div>
   </div>
 </div>
 <div id="rotateHint">Rotate your device to landscape to play.</div>
+<!-- ---- Online play lobby ------------------------------------------------------
+     Two doors and nothing else. HOST keeps the emulator it already has running
+     and hands out a 5-character code; JOIN takes a code and gets a picture. The
+     game selector is on the JOIN side because lib/netplay.js refuses a pairing
+     whose game names differ — the guest has to name the disc the host chose, and
+     a wrong pick has to fail legibly rather than connect to a black screen. -->
+<div id="netOverlay">
+  <div id="netBox">
+    <h6>🌐 Play Online</h6>
+    <p class="lead">One machine runs the game. The host's Dreamcast is the only Dreamcast —
+      it streams picture and sound to whoever joins, and they play as <b>Player&nbsp;2</b>.</p>
+    <div id="netRow">
+      <button id="netHostBtn" class="primary" type="button">Host a game</button>
+      <button id="netJoinBtn" type="button">Join a game</button>
+    </div>
+    <div id="netHostPane" style="display:none">
+      <div class="netLabel">Share this code</div>
+      <div id="netCode">·····</div>
+      <div class="netActions"><button id="netCopy" type="button">Copy code</button></div>
+    </div>
+    <div id="netJoinPane" style="display:none">
+      <div class="netLabel">Game the host is running</div>
+      <select id="netGame"></select>
+      <div class="netLabel">Their code</div>
+      <input id="netCodeIn" type="text" maxlength="5" autocomplete="off" autocapitalize="characters"
+             spellcheck="false" placeholder="ABC12" inputmode="latin">
+      <div class="netActions"><button id="netGo" class="primary" type="button">Join</button></div>
+    </div>
+    <div id="netStatus">Not connected.</div>
+    <div class="netActions">
+      <button id="netLeave" type="button" style="display:none">Leave</button>
+      <button id="netClose" type="button">Close</button>
+    </div>
+  </div>
+</div>
 <script>
 (function () {
   'use strict';
@@ -2650,6 +2757,13 @@
   // Audio worklet. Created on first user gesture (browser autoplay policy).
   // ---------------------------------------------------------------------------
   let audioContext = null;
+  // The worklet node, hoisted out of initAudio() so the netplay host can TAP it.
+  // Netplay connects it to an extra MediaStreamDestination, which is ADDITIVE —
+  // the node keeps its existing connection to audioContext.destination, so the
+  // host goes on hearing the game exactly as before. Reset Audio rebuilds the
+  // graph and therefore replaces this; a session running across a reset loses
+  // the audio track (the video track is unaffected) and says so in the log.
+  let audioNode = null;
   // ---------------------------------------------------------------------------
   // AUDIO HEALTH — the SINK side, which this page had never observed.
   //
@@ -2752,6 +2866,7 @@
         if (d.underrunFrames > 0) bump('audioUnderrunSeconds');
       };
       node.connect(audioContext.destination);
+      audioNode = node;   // the netplay host taps this; see the declaration above
       if (audioContext.state === 'suspended') { try { await audioContext.resume(); } catch (_) {} }
       mark('audio-' + audioContext.state);
       // A context stuck 'suspended' after resume() is silent audio with no
@@ -2783,10 +2898,15 @@
   });
   $('btnResetAudio').addEventListener('click', async () => {
     try { if (audioContext) await audioContext.close(); } catch (_) {}
-    audioContext = null; muted = false;
+    audioContext = null; audioNode = null; muted = false;
     $('btnMute').textContent = '🔊 Mute';
     await initAudio();
     pageLog('[page] audio context reset');
+    // Say it rather than let it be discovered: the outgoing audio track was
+    // sourced from the OLD graph, and an already-negotiated WebRTC session does
+    // not pick up a replacement node on its own.
+    if (NET.session && NET.role === 'host' && NET.session.state === 'connected')
+      pageLog('[net] audio was reset while hosting — the guest keeps the picture but loses the sound. Leave and host again to restore it.');
   });
 
   // ---------------------------------------------------------------------------
@@ -3297,7 +3417,7 @@
       }
       setStatus('Running.');
       worker.postMessage({ cmd: 'freerun', on: 1 });
-      requestAnimationFrame(frameLoop);
+      startInputPump();
       // A returning player always wins. If this browser already holds its own
       // savestate, never seed over it — that would eat their progress.
       await savedStateReady;
@@ -4161,7 +4281,45 @@
       if (btns[6] && btns[6].value > 0) putS16(bytes, base + 16, btns[6].value * 32767);
       if (btns[7] && btns[7].value > 0) putS16(bytes, base + 18, btns[7].value * 32767);
     }
+    // PLAYER 2 IS THE REMOTE GUEST. It lands in port 1's slot — bytes 64..127 —
+    // and nothing above this line writes there unless a SECOND LOCAL PAD is
+    // plugged into this machine, in which case the two are OR'd and both drive
+    // the same Dreamcast controller, which is what a splitter would do anyway.
+    // Port 0 is never touched: the host keeps its own controller no matter what
+    // arrives over the wire.
+    {
+      const rp = netRemotePad();
+      if (rp !== null) netApplyPadMask(bytes, 64, rp);
+    }
     return bytes;
+  }
+
+  // ---- the guest's pad, packed into ONE integer ------------------------------
+  // lib/netplay.js's sendPad carries a single int32 (`v: mask|0`), so the pad has
+  // to fit in 32 bits. Layout:
+  //     bits  0..15  digital buttons, one bit per RETRO id (the same ids KEYMAP
+  //                  and GP_BTN_TO_RETRO use — ids run 0..15, so they fit exactly)
+  //     bits 16..23  left-stick X, signed byte
+  //     bits 24..31  left-stick Y, signed byte
+  // The analog axes are NOT optional decoration: PSO and Gauntlet Legends both
+  // walk on the stick, and a digital-only remote pad reproduces the exact
+  // "unable to move" bug the arrow-key mapping was added to fix (see KEYMAP).
+  // 8 bits per axis is 258 units of stick per step, which is finer than the
+  // 0.08 deadzone the gamepad path already applies.
+  function netPadMask(bytes, base) {
+    let m = 0;
+    for (let id = 0; id < 16; id++) if (bytes[base + (id >> 3)] & (1 << (id & 7))) m |= (1 << id);
+    const s16 = (o) => ((bytes[base + o] | (bytes[base + o + 1] << 8)) << 16) >> 16;
+    const q = (v) => Math.max(-127, Math.min(127, v >> 8)) & 0xff;   // s16 -> signed byte
+    m |= (q(s16(8)) << 16);
+    m |= (q(s16(10)) << 24);
+    return m | 0;
+  }
+  function netApplyPadMask(bytes, base, m) {
+    m = m | 0;
+    for (let id = 0; id < 16; id++) if (m & (1 << id)) bytes[base + (id >> 3)] |= (1 << (id & 7));
+    const lx = (m << 8) >> 24, ly = m >> 24;      // sign-extend bits 16..23 / 24..31
+    if (lx || ly) { putS16(bytes, base + 8, lx * 258); putS16(bytes, base + 10, ly * 258); }
   }
 
   // Input-only rAF loop — emulation is paced by the worker's free-run pump and
@@ -4189,13 +4347,451 @@
   // uncovered, not implied covered.
   window.__dcPad = () => Array.from(packPad());
 
-  function frameLoop() {
-    if (booted) {
+  function frameStep() {
+    // A GUEST never boots — it has no disc, no worker run loop and no picture of
+    // its own — so the pump can no longer be gated on `booted` alone or the
+    // guest's controller would never be read at all.
+    if (booted || NET.guest) {
       const pad = packPad();
-      worker.postMessage({ cmd: 'input', states: pad }, [pad.buffer]);
+      if (NET.guest && NET.session) NET.session.sendPad(netPadMask(pad, 0));
+      if (booted) {
+        // The exact bytes handed to the worker, kept for the netplay test's
+        // player-2 assertion. Twelve bytes, and only while hosting.
+        if (NET.role === 'host') NET.sentP2 = Array.from(pad.subarray(64, 76));
+        worker.postMessage({ cmd: 'input', states: pad }, [pad.buffer]);
+      }
     }
-    requestAnimationFrame(frameLoop);
+    if (NET.mirrorCtx) netPumpMirror();
   }
+  const _now = () => ((performance && performance.now) ? performance.now() : Date.now());
+  let _lastRafAt = 0;
+  function frameLoop() { _lastRafAt = _now(); frameStep(); requestAnimationFrame(frameLoop); }
+
+  // Idempotent, because there are now TWO reasons to start pumping input: the
+  // host boots a game, or a guest joins one. Two rAF chains would double every
+  // input message.
+  //
+  // ⚠ rAF DOES NOT FIRE AT ALL IN A TAB THAT IS NOT BEING PRESENTED, and it is
+  // not a matter of degree. MEASURED 2026-09-06 with two dreamcast.html tabs in
+  // one Chrome, the host behind the guest: the capture mirror painted ONCE in
+  // 900 ms and `sentP2` was still null after a full second of the remote player
+  // holding two buttons — i.e. not one input message reached the emulator
+  // worker. The three usual --disable-*-throttling flags did not change it,
+  // because rAF is driven by the compositor rather than by a timer.
+  //
+  // That is a REAL defect, not a rig artifact: a host who switches tabs, or a
+  // phone whose screen is a fraction of a second from sleeping, would silently
+  // stop feeding player 2 and stop sending video. So a timer stands in whenever
+  // rAF has been quiet for more than ~100 ms and no-ops the rest of the time.
+  // In a truly backgrounded real browser the timer is itself clamped (to ~1 Hz,
+  // and harder after five minutes) — 1 input/s is a degraded remote player, not
+  // a dead one, and the emulator's own progress was never on this clock anyway
+  // (the worker free-runs; see the presentation-path note above).
+  //
+  // ⚠ THE WATCHDOG MUST WATCH rAF, NOT ITSELF. The first version compared
+  // against the last STEP time, which its own steps kept refreshing — so once
+  // rAF died it could only fire at 1/threshold, and it measured 9 mirror paints
+  // in 900 ms (10 Hz) instead of ~60. Comparing against the last rAF tick keeps
+  // the fallback at the timer's own cadence.
+  let _inputPumpOn = false;
+  function startInputPump() {
+    if (_inputPumpOn) return;
+    _inputPumpOn = true;
+    _lastRafAt = _now();
+    requestAnimationFrame(frameLoop);
+    setInterval(() => { if (_now() - _lastRafAt > 100) frameStep(); }, 16);
+  }
+
+  // ===========================================================================
+  // ONLINE CO-OP
+  //
+  // THE MODEL (lib/netplay.js's header states it too): ONE INSTANCE RUNS THE
+  // GAME. The host's emulator is the only emulator. It streams its picture and
+  // sound over WebRTC and the guest sends controller state back, which lands in
+  // port 1 of the pad buffer. There is no lockstep, no rollback and no
+  // determinism requirement, because there is only one machine to be in sync
+  // with.
+  //
+  // ---------------------------------------------------------------------------
+  // THE OBSTACLE THIS PAGE HAS AND THE CANVAS DEMO DOES NOT: #dc-canvas IS GONE.
+  //
+  // :2593 calls transferControlToOffscreen() on it, and the comment there is
+  // explicit — the worker's GL-owning pthread renders straight into the
+  // OffscreenCanvas and the page "cannot call getContext on it anymore". The
+  // element left behind is a PLACEHOLDER canvas. OffscreenCanvas itself has no
+  // captureStream at all, so the obvious route is closed on both ends.
+  //
+  // MEASURED rather than assumed (Chrome 152.0.7977.76, a worker holding a
+  // WebGL2 context on a transferred canvas, clearing to a new colour every
+  // 33 ms; each arm sampled through a <video srcObject> for 12 frames):
+  //
+  //   arm                                 result
+  //   placeholder.captureStream(60)       video:live, 320x240, 12/12 frames
+  //                                       non-black, 3 distinct colours — the
+  //                                       WORKER's pixels, on the main thread
+  //   drawImage(placeholder) -> mirror    same: 3 distinct colours, 76800/76800
+  //                                       non-black pixels per sample
+  //
+  // So Chrome DOES feed a placeholder canvas' capture stream from the worker's
+  // commits. That is not something to ship on faith — a `video:live` track that
+  // carries nothing looks identical to a working one from the outside — so the
+  // page does not READ a capability, it DOES the thing and counts the frames
+  // that come out (netCountFrames below, the same discipline lib/capability.js
+  // applies to WebGL2). If the direct capture yields fewer than two frames in
+  // 900 ms, it falls back to a MIRROR canvas painted from drawImage() on the
+  // input rAF — a path that needs nothing but drawImage + captureStream, both
+  // of which this page already depends on.
+  //
+  // Not chosen, and why: reading the frame back out of the worker would need a
+  // glReadPixels per frame plus a C++ change to EmscriptenWorker.cpp and a
+  // relink of the core; getDisplayMedia would put a screen-picker prompt in
+  // front of the host and capture the whole window rather than the game.
+  // ===========================================================================
+  const NET = {
+    session: null,      // the live Netplay.Session, or null
+    role: null,         // 'host' | 'guest' | null
+    guest: false,       // guest input pump armed
+    surface: null,      // the canvas actually being captured (host)
+    how: null,          // which arm won, with its measured frame count
+    leaving: false,     // this side pressed Leave (decides what 'closed' means)
+    mirror: null, mirrorCtx: null, mirrorTicks: 0, mirrorErr: null,
+    sentP2: null,       // last port-1 bytes handed to the worker (host)
+    videoTracks: null,  // what the guest actually received
+  };
+  const NET_FPS = 60;
+
+  // BroadcastChannel pairs two tabs in ONE browser and needs no third party, so
+  // it is what the headless test uses; PeerJS's public broker is what a real
+  // pair of devices needs. Default to the one real users need, and let the rig
+  // ask for the other explicitly.
+  function netTransport() {
+    const v = new URLSearchParams(location.search).get('net');
+    return v === 'local' ? 'local' : 'peerjs';
+  }
+  function netSupported() {
+    return !!(window.Netplay && Netplay.supported && Netplay.supported());
+  }
+
+  // Host: what player 2 is holding, or null when nobody is connected. Read from
+  // packPad(), so window.__dcPad() reflects the remote pad too and the existing
+  // pad test seam covers player 2 as well as player 1.
+  function netRemotePad() {
+    const s = NET.session;
+    if (!s || NET.role !== 'host' || s.state !== 'connected') return null;
+    return s.remotePad() | 0;
+  }
+
+  function netPumpMirror() {
+    try {
+      NET.mirrorCtx.drawImage($('dc-canvas'), 0, 0, NET.mirror.width, NET.mirror.height);
+      NET.mirrorTicks++;
+    } catch (e) { NET.mirrorErr = (e && e.message) ? e.message : String(e); }
+  }
+
+  // DO the capture and COUNT the frames. requestVideoFrameCallback fires once
+  // per frame actually presented, which is the only signal that separates a
+  // working track from a live-but-empty one; where it does not exist, an
+  // advancing currentTime is the fallback witness.
+  function netCountFrames(stream, ms) {
+    return new Promise((resolve) => {
+      const v = document.createElement('video');
+      v.muted = true; v.playsInline = true; v.autoplay = true;
+      try { v.srcObject = stream; } catch (e) { return resolve(0); }
+      let n = 0, done = false, iv = null;
+      const finish = () => {
+        if (done) return; done = true;
+        if (iv) clearInterval(iv);
+        try { v.pause(); v.srcObject = null; } catch (e) {}
+        resolve(n);
+      };
+      const p = v.play(); if (p && p.catch) p.catch(() => {});
+      if (typeof v.requestVideoFrameCallback === 'function') {
+        const tick = () => { n++; if (!done) { try { v.requestVideoFrameCallback(tick); } catch (e) {} } };
+        try { v.requestVideoFrameCallback(tick); } catch (e) {}
+      } else {
+        let last = -1;
+        iv = setInterval(() => { if (v.currentTime > last) { last = v.currentTime; n++; } }, 50);
+      }
+      setTimeout(finish, ms);
+    });
+  }
+
+  async function netCaptureSurface() {
+    const dc = $('dc-canvas');
+    // ARM 1 — the transferred canvas itself.
+    try {
+      const probe = dc.captureStream(NET_FPS);
+      const n = await netCountFrames(probe, 900);
+      probe.getTracks().forEach((t) => { try { t.stop(); } catch (e) {} });
+      if (n >= 2) {
+        pageLog('[net] capture arm: the transferred canvas produced ' + n + ' frames in 900 ms — using it directly');
+        return { el: dc, how: 'transferred-canvas (' + n + ' frames/900ms)' };
+      }
+      pageLog('[net] capture arm: the transferred canvas produced only ' + n + ' frames in 900 ms — falling back to a mirror');
+    } catch (e) {
+      pageLog('[net] capture arm: captureStream on the transferred canvas threw (' +
+              ((e && e.message) ? e.message : String(e)) + ') — falling back to a mirror');
+    }
+    // ARM 2 — a main-thread mirror, painted from the placeholder each rAF.
+    const m = document.createElement('canvas');
+    m.width = dc.width || 640; m.height = dc.height || 480;
+    NET.mirror = m;
+    NET.mirrorCtx = m.getContext('2d', { alpha: false });
+    netPumpMirror();                    // paint once now so the first frame is not blank
+    const probe2 = m.captureStream(NET_FPS);
+    const n2 = await netCountFrames(probe2, 900);
+    probe2.getTracks().forEach((t) => { try { t.stop(); } catch (e) {} });
+    pageLog('[net] capture arm: mirror canvas produced ' + n2 + ' frames in 900 ms (' +
+            NET.mirrorTicks + ' paints' + (NET.mirrorErr ? ', drawImage error: ' + NET.mirrorErr : '') + ')');
+    return { el: m, how: 'mirror (' + n2 + ' frames/900ms)' };
+  }
+
+  // ---- lobby UI -------------------------------------------------------------
+  function netStatus(text, cls) {
+    const el = $('netStatus');
+    if (!el) return;
+    el.textContent = text;
+    el.className = cls || '';
+  }
+  function netOpen() {
+    $('netOverlay').classList.add('on');
+    // The host has to be running something to stream. Say so before they press
+    // a button that cannot work, rather than after.
+    if (!NET.session) netStatus(booted ? 'Not connected.'
+      : 'Not connected. Hosting needs a running game — press Start first. Joining does not.');
+  }
+  function netClose() { $('netOverlay').classList.remove('on'); }
+
+  function netOnStatus(e) {
+    const s = e.state;
+    if (s === 'signalling') netStatus(NET.role === 'host'
+      ? 'Waiting for someone to join with code ' + NET.session.code + '…'
+      : 'Looking for the host…', 'busy');
+    else if (s === 'connected') {
+      netStatus(NET.role === 'host'
+        ? 'Connected — the other player is Player 2.'
+        : 'Connected — you are Player 2.', 'good');
+      $('netLeave').style.display = '';
+    } else if (s === 'closed') {
+      // WHO hung up decides what this says. The channel's onclose fires on both
+      // sides and arrives AFTER netLeave() has set its own text, so without the
+      // flag the person who pressed Leave is told the other player left.
+      netStatus(NET.leaving ? 'Left the session.' : 'The other player left.', 'busy');
+      if (NET.role === 'guest') netShowGuestVideo(false);
+    } else if (s === 'failed') {
+      netStatus('Could not connect' + (e.detail ? ': ' + e.detail : '.'), 'bad');
+    }
+    pageLog('[net] ' + (NET.role || 'session') + ' ' + s + (e.detail ? ' (' + e.detail + ')' : ''));
+  }
+
+  // The guest's picture replaces the (permanently black) local canvas. The
+  // controls are untouched: touch, keyboard and gamepad all write heldKeys,
+  // which frameLoop reads whether or not this machine ever booted a disc.
+  function netShowGuestVideo(on) {
+    const v = $('netVideo'), c = $('dc-canvas');
+    if (!v) return;
+    v.classList.toggle('on', !!on);
+    if (c) c.style.display = on ? 'none' : '';
+    if (!on) { try { v.srcObject = null; } catch (e) {} }
+  }
+
+  async function netAttachRemote(ms) {
+    const v = $('netVideo');
+    NET.videoTracks = ms.getTracks().map((t) => t.kind + ':' + t.readyState);
+    pageLog('[net] stream received: ' + NET.videoTracks.join(', '));
+    // ⚠ THIS FIRES ONCE PER TRACK. RTCPeerConnection.ontrack is per-track, and
+    // the host publishes video AND audio, so 'stream' arrives twice for the same
+    // MediaStream. MEASURED: re-assigning srcObject the second time aborts the
+    // first play() ("The play() request was interrupted by a new load request")
+    // and left the element at readyState 0 with videoWidth 0 — a connected
+    // session showing nothing. Attach once; the second event only refreshes the
+    // track list above.
+    if (v.srcObject === ms) return;
+    v.srcObject = ms;
+    netShowGuestVideo(true);
+    // Try WITH sound first. Autoplay policy can refuse an audible element even
+    // after a click, and a rejected play() leaves a black rectangle — so fall
+    // back to muted playback and tell the player how to get the sound back,
+    // rather than losing the picture to keep the audio.
+    try { await v.play(); }
+    catch (e) {
+      v.muted = true;
+      try { await v.play(); netStatus('Connected — tap the picture to turn sound on.', 'good'); } catch (_) {}
+      pageLog('[net] audible autoplay refused (' + ((e && e.message) ? e.message : e) + ') — playing muted');
+    }
+    v.onclick = () => { if (v.muted) { v.muted = false; v.play().catch(() => {}); } };
+  }
+
+  async function netStartHost() {
+    if (NET.session) return;
+    if (!booted) {
+      netStatus('Hosting needs a running game — pick a disc and press Start first, then host.', 'bad');
+      return;
+    }
+    $('netHostPane').style.display = '';
+    $('netJoinPane').style.display = 'none';
+    const code = Netplay.makeCode(5);
+    $('netCode').textContent = code;
+    netStatus('Preparing the video stream…', 'busy');
+    NET.role = 'host';
+    const surf = await netCaptureSurface();
+    NET.surface = surf.el; NET.how = surf.how;
+    const s = new Netplay.Session({
+      game: $('romSelect').value, host: true, code, transport: netTransport(),
+    });
+    NET.session = s;
+    s.on('status', netOnStatus);
+    // ⚠ BEFORE start(). Tracks added after the offer is created never appear in
+    // it, and the guest connects to a session with no picture.
+    const gotMedia = s.attachMedia(surf.el, audioNode);
+    if (!gotMedia) {
+      pageLog('[net] attachMedia failed: ' + (s.lastError || 'unknown') + ' — the guest would get no picture');
+      netStatus('Could not capture the game: ' + (s.lastError || 'unknown'), 'bad');
+      NET.session = null; NET.role = null;
+      return;
+    }
+    pageLog('[net] hosting ' + $('romSelect').value + ' as ' + code +
+            ' via ' + netTransport() + '; capture = ' + surf.how +
+            '; audio = ' + (audioNode ? 'tapped' : 'NOT AVAILABLE (no worklet node yet)'));
+    await s.start();
+  }
+
+  async function netStartGuest() {
+    if (NET.session) return;
+    const code = ($('netCodeIn').value || '').trim().toUpperCase();
+    if (!/^[A-HJ-NP-Z2-9]{5}$/.test(code)) {
+      netStatus('That does not look like a code — 5 characters, no I O 0 or 1.', 'bad');
+      return;
+    }
+    NET.role = 'guest';
+    // lib/netplay.js refuses a pairing whose game names differ, and coerces a
+    // falsy name to 'unknown' — so the guest MUST name the same disc the host
+    // chose. That is why the join pane carries a game selector; a wrong pick
+    // fails with "the other player is on <game>" instead of connecting to
+    // nothing.
+    const game = $('netGame').value;
+    const s = new Netplay.Session({ game, host: false, code, transport: netTransport() });
+    NET.session = s;
+    s.on('status', netOnStatus);
+    s.on('stream', netAttachRemote);
+    NET.guest = true;
+    // A guest never boots, so nothing else would ever start the input pump —
+    // and without it the guest's controller is read zero times.
+    startInputPump();
+    netGuestStartLock(true);
+    // The phone shell's splash sits on top of everything until Start is pressed,
+    // and a guest never presses it.
+    const sp = $('mobileSplash'); if (sp) sp.style.display = 'none';
+    pageLog('[net] joining ' + code + ' (' + game + ') via ' + netTransport());
+    await s.start();
+  }
+
+  function netLeave() {
+    const s = NET.session, wasGuest = NET.role === 'guest';
+    NET.leaving = true;
+    if (s) { try { s.close(); } catch (e) {} }
+    NET.session = null; NET.role = null; NET.guest = false;
+    NET.mirror = null; NET.mirrorCtx = null; NET.sentP2 = null;
+    netShowGuestVideo(false);
+    if (wasGuest) netGuestStartLock(false);
+    $('netLeave').style.display = 'none';
+    $('netHostPane').style.display = 'none';
+    $('netJoinPane').style.display = 'none';
+    netStatus('Left the session.');
+    pageLog('[net] session closed by this side');
+    setTimeout(() => { NET.leaving = false; }, 2000);
+  }
+
+  // A GUEST MUST NOT START ITS OWN EMULATOR. Pressing Start while watching
+  // someone else's game would boot a second Dreamcast behind the video, on a
+  // machine already decoding a stream, and then send every key press to BOTH
+  // the local core and the remote host. Hold the two Start controls down for as
+  // long as the session lasts.
+  //
+  // ⚠ `disabled`, never `aria-disabled`: that attribute belongs to
+  // lib/capability.js (it is the sole writer, and a control it is holding down
+  // must never be re-enabled by anyone else), so a button the capability layer
+  // already blocked is left exactly as it found it.
+  function netGuestStartLock(on) {
+    ['btnStart', 'mobileSplashStart'].forEach((id) => {
+      const b = $(id);
+      if (!b) return;
+      if (on) {
+        b.disabled = true;
+        b.title = 'You are watching someone else\'s game. Leave the online session to start your own.';
+      } else if (b.getAttribute('aria-disabled') !== 'true' && !booted) {
+        b.disabled = false;
+        b.title = '';
+      }
+    });
+  }
+
+  // Test seam. Deliberately a SIBLING of window.__dcPad / window.__dcProbe
+  // rather than a widening of either — both already have consumers whose shape
+  // must not move (see the note above __dcPad).
+  window.__dcNet = () => ({
+    supported: netSupported(),
+    transport: netTransport(),
+    role: NET.role,
+    state: NET.session ? NET.session.state : null,
+    code: NET.session ? NET.session.code : null,
+    capture: NET.how,
+    mirrorTicks: NET.mirrorTicks,
+    mirrorErr: NET.mirrorErr,
+    remotePad: NET.session && NET.role === 'host' ? NET.session.remotePad() : null,
+    sentP2: NET.sentP2,            // the bytes actually posted to the worker for port 1
+    videoTracks: NET.videoTracks,
+    booted: booted,
+  });
+
+  (function wireNetplay() {
+    // NEVER SHOW A CONTROL THAT CANNOT WORK. The three entry points stay
+    // display:none unless the browser has the primitives.
+    if (!netSupported()) {
+      pageLog('[net] online play unavailable: this browser has no ' +
+              (typeof RTCPeerConnection !== 'function' ? 'RTCPeerConnection' : 'BroadcastChannel'));
+      return;
+    }
+    // The join pane's game list mirrors #romSelect so the two cannot drift, and
+    // so it works on the phone shell where #romSelect is inside a hidden #wrap.
+    const sel = $('netGame'), src = $('romSelect');
+    if (sel && src) {
+      sel.innerHTML = '';
+      Array.prototype.forEach.call(src.options, (o) => {
+        const opt = document.createElement('option');
+        opt.value = o.value; opt.textContent = o.textContent;
+        sel.appendChild(opt);
+      });
+      sel.value = src.value;
+    }
+    ['btnNet', 'mNet', 'mobileSplashNet'].forEach((id) => { const b = $(id); if (b) b.style.display = ''; });
+    const open = () => { const m = $('mobileMenu'); if (m) m.classList.remove('open'); netOpen(); };
+    ['btnNet', 'mNet', 'mobileSplashNet'].forEach((id) => { const b = $(id); if (b) b.addEventListener('click', open); });
+    $('netClose').addEventListener('click', netClose);
+    $('netOverlay').addEventListener('click', (e) => { if (e.target === $('netOverlay')) netClose(); });
+    $('netHostBtn').addEventListener('click', netStartHost);
+    $('netJoinBtn').addEventListener('click', () => {
+      $('netJoinPane').style.display = '';
+      $('netHostPane').style.display = 'none';
+      $('netCodeIn').focus();
+    });
+    $('netGo').addEventListener('click', netStartGuest);
+    // stopPropagation is not cosmetic: the page's window-level keydown handler
+    // swallows W/A/S/D, M/K/J/N and Enter for the emulator, so without this the
+    // code field could not be typed into and Enter would press Start instead.
+    $('netCodeIn').addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') netStartGuest();
+    });
+    $('netCopy').addEventListener('click', async () => {
+      const code = $('netCode').textContent;
+      try { await navigator.clipboard.writeText(code); $('netCopy').textContent = 'Copied'; }
+      catch (e) { $('netCopy').textContent = 'Copy failed — read it out'; }
+      setTimeout(() => { $('netCopy').textContent = 'Copy code'; }, 1800);
+    });
+    $('netLeave').addEventListener('click', netLeave);
+    pageLog('[net] online play available (' + netTransport() + ' signalling)');
+  })();
 
   // ---------------------------------------------------------------------------
   // Mobile shell (ported from gamecube.html). Touch controls mutate heldKeys
@@ -4312,6 +4908,10 @@
     shell.style.display = 'block';
     $('mobileSplash').style.display = 'flex';
     $('mobileScreen').appendChild($('dc-canvas'));
+    // The guest's <video> stands in for the canvas, so it has to be reparented
+    // WITH it — left behind in #canvasWrap it would be inside a hidden #wrap and
+    // a phone guest would see nothing at all.
+    if ($('netVideo')) $('mobileScreen').appendChild($('netVideo'));
     holdBtn('mobileA', 'm'); holdBtn('mobileB', 'k'); holdBtn('mobileX', 'j'); holdBtn('mobileY', 'n');
     holdBtn('mobileL', 'q'); holdBtn('mobileR', 'e'); holdBtn('mobileStart', 'enter');
     wireDpadDisc();
