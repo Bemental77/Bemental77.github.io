@@ -1,4 +1,5 @@
 var ROMLIST = [
+  {url:"/gba/gbaWasm/roms/Pokemon SoulGold (v1.1.1).gba",title:"Pokemon SoulGold"},
   {url:"/gba/gbaWasm/roms/pokemonUltraViolet.gba",title:"PKMN Ultra Violet"},
   {url:"/gba/gbaWasm/roms/Sim City 2000 (U).gba",title:"Sim City 2000"},
   {url:"/gba/gbaWasm/roms/Sonic Advance 3 (U).gba",title:"Sonic Advance 3"},
