@@ -510,8 +510,14 @@
   var _padPressAt = Object.create(null), _padRelTimer = Object.create(null);
   // up<->down and left<->right on the d-pad; C-pad directions too where the
   // page has them. Read by the hold function below.
-  var PAD_OPPOSITE = { up: 'down', down: 'up', left: 'right', right: 'left',
-                       cup: 'cdown', cdown: 'cup', cleft: 'cright', cright: 'cleft' };
+  // D-PAD ONLY, and the omission is deliberate. This console has no C-buttons, so
+  // those entries were inert here — but the same map on n64 was a real defect: its
+  // C-Left/C-Right are four INDEPENDENT digital buttons, not an axis, and guarding
+  // them removed the console's ability to press C-Left and C-Right together
+  // (measured: 0/28 samples reached the core with them mapped, 19/28 once narrowed).
+  // Only pair directions that are physically exclusive on the real hardware —
+  // a d-pad axis, or an analog stick as on gamecube.html's synthesized C-stick.
+  var PAD_OPPOSITE = { up: 'down', down: 'up', left: 'right', right: 'left' };
   function padHold(btn, down) {
     if (_padRelTimer[btn]) { clearTimeout(_padRelTimer[btn]); _padRelTimer[btn] = null; }
     if (down) {
