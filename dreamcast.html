@@ -4672,7 +4672,7 @@
     }
     $('netHostPane').style.display = '';
     $('netJoinPane').style.display = 'none';
-    const code = Netplay.makeCode(5);
+    const code = fixedCode || Netplay.makeCode(5);
     $('netCode').textContent = code;
     netStatus('Preparing the video stream…', 'busy');
     NET.role = 'host';
@@ -4833,7 +4833,10 @@
     ['btnNet', 'mNet', 'mobileSplashNet'].forEach((id) => { const b = $(id); if (b) b.addEventListener('click', open); });
     $('netClose').addEventListener('click', netClose);
     $('netOverlay').addEventListener('click', (e) => { if (e.target === $('netOverlay')) netClose(); });
-    $('netHostBtn').addEventListener('click', netStartHost);
+    // ⚠ NOT `addEventListener('click', netStartHost)` — netStartHost now takes a
+    // code, and a listener bound that way would hand it the MouseEvent, which is
+    // truthy, so `fixedCode || makeCode(5)` would use the event as the room name.
+    $('netHostBtn').addEventListener('click', () => netStartHost());
     $('netJoinBtn').addEventListener('click', () => {
       $('netJoinPane').style.display = '';
       $('netHostPane').style.display = 'none';
@@ -4855,6 +4858,51 @@
     });
     $('netLeave').addEventListener('click', netLeave);
     pageLog('[net] online play available (' + netTransport() + ' signalling)');
+
+    // ---- ?np=<code>&game=<key>: HANDED OVER FROM dreamcast_multiplayer.html ---
+    // The party forms on that page, not this one, because a GUEST needs no
+    // emulator and no disc — only a <video> and a pad — and this page downloads
+    // hundreds of megabytes before it can show anything. So the lobby lives
+    // there and sends only the HOST here, carrying the code it already published
+    // and the disc both players agreed on.
+    //
+    // Two things are deliberately NOT done here. It does not open the overlay:
+    // the host already read the code on the lobby page, and a panel over a game
+    // that is about to start is something to dismiss, not something to read. And
+    // it does not touch #btnStart when the button is disabled — that is either a
+    // boot already in flight or lib/capability.js holding it down, and this page
+    // never re-enables a control the capability layer blocked (see netGuestStartLock).
+    {
+      const npGame = QS.get('game');
+      const npCode = (QS.get('np') || '').toUpperCase();
+      if (npGame && GAMES[npGame]) {
+        const rs = $('romSelect');
+        rs.value = npGame;
+        // The per-game savestate key follows #romSelect via a 'change' listener
+        // (see loadSavedStateFor); assigning .value fires nothing on its own, so
+        // without this the page would look up ANOTHER game's machine image.
+        rs.dispatchEvent(new Event('change'));
+        const ng = $('netGame'); if (ng) ng.value = npGame;
+      }
+      if (/^[A-HJ-NP-Z2-9]{5}$/.test(npCode)) {
+        pageLog('[net] handed a session by the lobby: hosting ' +
+                $('romSelect').value + ' as ' + npCode + ' via ' + netTransport());
+        // The phone shell's splash waits for a Start that this player already
+        // pressed — on the other page.
+        const sp = $('mobileSplash'); if (sp) sp.style.display = 'none';
+        const st = $('btnStart');
+        if (st && !st.disabled) st.click();
+        else pageLog('[net] Start is held down — not overriding it; hosting will arm if the game boots anyway');
+        // The disc load is minutes long on a cold cache and there is no boot
+        // event to hang this off, so it waits for `booted` rather than assuming
+        // a duration. netStartHost() itself refuses to run before that.
+        const iv = setInterval(() => {
+          if (!booted || NET.session) return;
+          clearInterval(iv);
+          netStartHost(npCode);
+        }, 250);
+      }
+    }
   })();
 
   // ---------------------------------------------------------------------------

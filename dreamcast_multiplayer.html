@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Dreamcast — Play Online</title>
+<!--
+  dreamcast_multiplayer.html — THE PARTY, AND PLAYER 2'S WHOLE MACHINE.
+
+  WHY THIS PAGE EXISTS AT ALL, AND WHY IT IS NOT PART OF dreamcast.html.
+
+  In this model exactly ONE browser runs an emulator (lib/netplay.js's header
+  states the same thing): the host boots the disc, captures its canvas and its
+  audio, and streams both over WebRTC; the guest sends controller state back and
+  the host drops it into port 1. So the GUEST NEEDS NO EMULATOR AND NO DISC. It
+  needs a <video> and a pad. Nothing else on this page.
+
+  That is not a small saving. dreamcast.html fetches a disc image before it can
+  show anything — Gauntlet Legends is 563 MB of split, gzipped parts — plus a
+  WebAssembly core, a SharedArrayBuffer, a cross-origin-isolating service worker
+  and a WebGL2 context. A phone, a tablet or a console browser that only wants
+  to be player 2 should pay none of it, and on a metered connection or a small
+  memory budget it often CANNOT pay it. This page fetches two small scripts.
+
+  It is a separate file rather than a mode of dreamcast.html for the same reason:
+  a mode still ships the page. Loading four thousand lines of emulator to hide
+  them again is the failure this avoids.
+
+  WHAT EACH SIDE DOES HERE
+    HOST  picks a disc, is given a code, and is handed straight over to
+          dreamcast.html?np=<code>&game=<key>. That page auto-selects the disc,
+          presses its own Start, and — once the game is actually running —
+          hosts under THAT EXACT CODE (dreamcast.html's wireNetplay tail). No
+          session is created on this page for a host: navigating away would tear
+          down the RTCPeerConnection and leave a paired guest holding a code
+          that leads nowhere.
+    GUEST stays here forever. It joins, receives the stream, and becomes
+          player 2. lib/netplay.js's guest retries 'peer-unavailable' rather
+          than failing, so joining BEFORE the host has finished downloading is
+          the normal case, not a race.
+
+  ⚠ WHAT IS NOT PROVEN YET. The pad reaches the host and the host hands the
+  right bytes to the emulator worker for port 1 — tools/dreamcast_mp_page_test.mjs
+  asserts exactly that, on the literal byte array. It stops there ON PURPOSE:
+  the shipped core has no Maple device on controller port 1
+  (dreamcast/docs/core-relink-broken/ records the measurement and the reason —
+  input_state_cb is only called for a port that has one), so the bytes arrive
+  and nothing polls them. Two characters moving on screen is NOT claimed here.
+
+  NO coi-serviceworker.js ON PURPOSE. Cross-origin isolation buys
+  SharedArrayBuffer, which this page has no use for, and the script's
+  registration forces a page reload that has already produced phantom
+  "Execution context destroyed" failures in the rigs. If a sibling page already
+  registered it, this page is isolated anyway and still works: that service
+  worker stamps Cross-Origin-Resource-Policy: cross-origin onto what it proxies,
+  which is what lets lib/netplay.js pull the PeerJS broker script under COEP.
+-->
+<script src="/lib/netplay.js"></script>
+<script src="/lib/netplay-ui.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0b0d10; color: #e8e8e8;
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overscroll-behavior: none; }
+  a { color: #7cc; }
+
+  /* ---- lobby ---- */
+  #lobby { min-height: 100%; display: flex; flex-direction: column; align-items: center;
+           justify-content: center; gap: 18px; padding: 24px 14px 40px; }
+  #lobby h1 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: .2px; }
+  #lobby .lede { margin: 0; max-width: 460px; text-align: center; color: #9aa; font-size: 13.5px; }
+  #lobbyCard { width: 100%; }
+  #back { color: #789; font-size: 13px; text-decoration: none; }
+
+  /* ---- the guest's whole screen ---- */
+  #play { position: fixed; inset: 0; display: none; background: #000; }
+  #play.on { display: block; }
+  #mpVideo { position: absolute; inset: 0; width: 100%; height: 100%;
+             object-fit: contain; background: #000; }
+
+  #hud { position: absolute; top: 0; left: 0; right: 0; display: flex; gap: 8px;
+         align-items: center; padding: 8px 10px; z-index: 30;
+         background: linear-gradient(180deg, rgba(0,0,0,.65), rgba(0,0,0,0));
+         font-size: 12.5px; padding-top: max(8px, env(safe-area-inset-top)); }
+  #hudMsg { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #cde; }
+  #hud button { min-height: 34px; padding: 6px 11px; border-radius: 8px; border: 1px solid #556;
+                background: rgba(20,24,30,.85); color: #dde; font-size: 12.5px; cursor: pointer; }
+  #hud button.warn { border-color: #a55; color: #fbb; }
+
+  /* ---- touch pad ---- */
+  #pad { position: absolute; inset: 0; z-index: 20; display: none;
+         touch-action: none; -webkit-user-select: none; user-select: none; }
+  #pad.on { display: block; }
+  #disc { position: absolute; left: max(14px, env(safe-area-inset-left)); bottom: max(18px, env(safe-area-inset-bottom));
+          width: 148px; height: 148px; border-radius: 50%; border: 2px solid rgba(255,255,255,.22);
+          background: rgba(255,255,255,.07); }
+  #nub { position: absolute; left: 50%; top: 50%; width: 54px; height: 54px; margin: -27px 0 0 -27px;
+         border-radius: 50%; background: rgba(255,255,255,.30); pointer-events: none; }
+  #face { position: absolute; right: max(14px, env(safe-area-inset-right)); bottom: max(18px, env(safe-area-inset-bottom));
+          width: 172px; height: 172px; }
+  .tb { position: absolute; border-radius: 50%; border: 2px solid rgba(255,255,255,.24);
+        background: rgba(255,255,255,.10); color: #fff; font: 700 17px/1 sans-serif;
+        display: flex; align-items: center; justify-content: center; }
+  .tb.down { background: rgba(120,200,255,.55); }
+  .tb.sq { border-radius: 12px; font-size: 13px; }
+  #tX { left: 56px; top: 0;   width: 60px; height: 60px; }
+  #tY { left: 0;   top: 56px; width: 60px; height: 60px; }
+  #tB { right: 0;  top: 56px; width: 60px; height: 60px; }
+  #tA { left: 56px; top: 112px; width: 60px; height: 60px; }
+  #tL { position: absolute; left: max(14px, env(safe-area-inset-left)); bottom: 178px; width: 74px; height: 44px; }
+  #tR { position: absolute; right: max(14px, env(safe-area-inset-right)); bottom: 178px; width: 74px; height: 44px; }
+  #tS { position: absolute; left: 50%; margin-left: -46px; bottom: max(18px, env(safe-area-inset-bottom));
+        width: 92px; height: 40px; }
+
+  #unsupported { max-width: 520px; margin: 12vh auto; padding: 0 20px; }
+  #unsupported h1 { font-size: 20px; }
+  #unsupported code { color: #9cf; }
+</style>
+</head>
+<body>
+
+<div id="unsupported" hidden>
+  <h1>This browser cannot play online</h1>
+  <p id="unsupportedWhy" class="lede"></p>
+  <p><a href="/dreamcast.html">Play on your own instead →</a></p>
+</div>
+
+<div id="lobby" hidden>
+  <h1>Dreamcast — Play Online</h1>
+  <p class="lede">One player loads the game; everyone else just watches and plays.
+     Player&nbsp;2 needs no disc and no download — pick <b>Join</b> on the device you
+     want to play on.</p>
+  <div id="lobbyCard"></div>
+  <a id="back" href="/dreamcast.html">← single player</a>
+</div>
+
+<div id="play">
+  <video id="mpVideo" playsinline autoplay></video>
+  <div id="hud">
+    <span id="hudMsg">Connecting…</span>
+    <button type="button" id="btnSound" hidden>🔇 Sound on</button>
+    <button type="button" id="btnPad">🎮 Controls</button>
+    <button type="button" id="btnLeave" class="warn">Leave</button>
+  </div>
+  <div id="pad">
+    <div id="disc"><div id="nub"></div></div>
+    <div id="face">
+      <div class="tb" id="tX">X</div>
+      <div class="tb" id="tY">Y</div>
+      <div class="tb" id="tB">B</div>
+      <div class="tb" id="tA">A</div>
+    </div>
+    <div class="tb sq" id="tL">L</div>
+    <div class="tb sq" id="tR">R</div>
+    <div class="tb sq" id="tS">Start</div>
+  </div>
+</div>
+
+<script>
+'use strict';
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const QS = new URLSearchParams(location.search);
+
+  // ---------------------------------------------------------------------------
+  // NEVER RENDER WHAT CANNOT WORK. Same rule lib/netplay-ui.js and
+  // lib/capability.js apply: a control the visitor can press that does nothing
+  // reads as "the site is broken", which is worse than an honest explanation.
+  // ---------------------------------------------------------------------------
+  if (!window.Netplay || !Netplay.supported()) {
+    const missing = (typeof RTCPeerConnection !== 'function') ? 'WebRTC (RTCPeerConnection)'
+                  : (typeof BroadcastChannel !== 'function') ? 'BroadcastChannel'
+                  : 'the netplay library';
+    $('unsupportedWhy').textContent =
+      'Online play needs ' + missing + ', which this browser does not provide. ' +
+      'Single player does not need it and still works.';
+    $('unsupported').hidden = false;
+    window.__dcmp = () => ({ supported: false, missing });
+    return;
+  }
+  $('lobby').hidden = false;
+
+  // ---------------------------------------------------------------------------
+  // THE DISC LIST IS A COPY, AND THE TEST IS WHAT KEEPS IT HONEST.
+  //
+  // lib/netplay.js refuses a pairing whose game names differ, so both sides must
+  // name the same key — which means this list has to agree with dreamcast.html's
+  // <select id="romSelect"> (dreamcast.html:449). Fetching that page to read its
+  // list would undo the entire point of this one: it is ~290 KB of emulator that
+  // player 2 exists to avoid downloading. So it is copied, and
+  // tools/dreamcast_mp_page_test.mjs compares the two lists and FAILS on drift —
+  // a mechanical check rather than a comment asking someone to remember.
+  // ---------------------------------------------------------------------------
+  const GAMES = [
+    { value: 'pso2',        label: 'Phantasy Star Online Ver. 2 (USA)' },
+    { value: 'cannonspike', label: 'Cannon Spike (USA)' },
+    { value: 'sa2',         label: 'Sonic Adventure 2 (USA)' },
+    { value: 'gauntlet',    label: 'Gauntlet Legends (USA)' },
+    { value: 'mvc2',        label: 'Marvel vs. Capcom 2 (USA)' },
+  ];
+  // Gauntlet Legends is the co-op target — it is the two-player game this whole
+  // path exists for — so it is what the picker opens on.
+  const DEFAULT_GAME = QS.get('game') && GAMES.some((g) => g.value === QS.get('game'))
+    ? QS.get('game') : 'gauntlet';
+
+  // BroadcastChannel pairs two tabs in ONE browser with no third party, which is
+  // what the headless test uses; PeerJS's public broker is what pairs two
+  // DEVICES. Default to the one real players need. (Identical rule and identical
+  // spelling to dreamcast.html's netTransport, so ?net=local reaches both pages.)
+  const transport = QS.get('net') === 'local' ? 'local' : 'peerjs';
+
+  // ===========================================================================
+  // PLAYER 2'S CONTROLLER
+  //
+  // ⚠ THIS IS A WIRE FORMAT SHARED WITH dreamcast.html AND MUST NOT DRIFT.
+  // lib/netplay.js's sendPad carries ONE int32 (`v: mask|0`). dreamcast.html's
+  // netApplyPadMask decodes it into bytes 64..127 of the 256-byte pad buffer
+  // (port 1) and multiplies each analog byte by 258. Layout, verbatim from
+  // that function:
+  //     bits  0..15  digital buttons, one bit per RETRO id
+  //     bits 16..23  left-stick X, signed byte  (±127 -> ±32766 on the host)
+  //     bits 24..31  left-stick Y, signed byte  (+ = down)
+  //
+  // THE ANALOG AXES ARE NOT DECORATION. dreamcast.html records that PSO and
+  // Gauntlet Legends both WALK ON THE STICK and that all-digital input
+  // reproduced an "unable to move" bug. A d-pad-only remote player would look
+  // connected and be unable to take a step.
+  // ===========================================================================
+  const RB = { B:0, Y:1, SELECT:2, START:3, UP:4, DOWN:5, LEFT:6, RIGHT:7,
+               A:8, X:9, L:10, R:11, L2:12, R2:13 };
+  // Keyboard, identical to dreamcast.html:4135 so muscle memory carries between
+  // the two pages. In this libretro core the Dreamcast CONFIRM button is DC_A,
+  // which maps to RETRO_B -> 'm'; 'k' cancels.
+  const KEYMAP = {
+    [RB.UP]: 'w', [RB.DOWN]: 's', [RB.LEFT]: 'a', [RB.RIGHT]: 'd',
+    [RB.B]: 'm',   // DC_A  = menu CONFIRM
+    [RB.A]: 'k',   // DC_B  = menu CANCEL
+    [RB.X]: 'j',
+    [RB.Y]: 'n',
+    [RB.L2]: 'q', [RB.R2]: 'e',   // DC L/R triggers
+    [RB.START]: 'enter', [RB.SELECT]: 'shift',
+  };
+  const ANALOG_KEYS = new Set(['arrowup', 'arrowdown', 'arrowleft', 'arrowright']);
+  const MAPPED = new Set([...Object.values(KEYMAP), ...ANALOG_KEYS]);
+  // Standard-mapping gamepad index -> RETRO id, copied from dreamcast.html:4199.
+  // A guest on a console browser or a desktop with a pad is exactly the "as if
+  // player 2 was on the same couch" case, so the pad has to work here too.
+  const GP_BTN_TO_RETRO = [RB.B, RB.A, RB.Y, RB.X, RB.L, RB.R, RB.L2, RB.R2,
+                           RB.SELECT, RB.START, /*L3*/14, /*R3*/15,
+                           RB.UP, RB.DOWN, RB.LEFT, RB.RIGHT];
+
+  const held = new Set();          // keyboard
+  const touched = new Set();       // on-screen buttons, by RETRO id
+  const stick = { x: 0, y: 0 };    // on-screen disc, -1..1
+  const norm = (e) => String(e.key || '').toLowerCase();
+  // ⚠ THE LOBBY HAS A TEXT FIELD AND THE CODE ALPHABET OVERLAPS THE KEYMAP.
+  // 'a', 'd', 'e', 'j', 'k', 'm', 'n', 'q', 's' and 'w' are all buttons here and
+  // all legal code characters, so a window-level preventDefault would make the
+  // Join field silently refuse most of what is typed into it. dreamcast.html hit
+  // the same thing and answered it with stopPropagation on its own input; this
+  // page cannot, because lib/netplay-ui.js owns that element — so the check is
+  // on this side instead.
+  const typing = (e) => {
+    const t = e.target;
+    return !!t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' ||
+                   t.tagName === 'TEXTAREA' || t.isContentEditable);
+  };
+  addEventListener('keydown', (e) => {
+    if (typing(e)) return;
+    const k = norm(e);
+    if (MAPPED.has(k)) e.preventDefault();
+    held.add(k);
+  });
+  // Release is NEVER filtered: a key that went down while the field was not
+  // focused must still come up, or it stays held on the host's port 1 forever.
+  addEventListener('keyup', (e) => held.delete(norm(e)));
+  // A key held while the tab loses focus would otherwise stay held forever on
+  // the HOST's port 1 — a stuck button on someone else's machine.
+  addEventListener('blur', () => { held.clear(); touched.clear(); stick.x = stick.y = 0; });
+
+  function packMask() {
+    let m = 0;
+    for (const idStr of Object.keys(KEYMAP)) if (held.has(KEYMAP[idStr])) m |= (1 << (+idStr));
+    touched.forEach((id) => { m |= (1 << id); });
+
+    // Analog, in priority order: the on-screen disc, then a real gamepad, then
+    // the arrow keys. Whichever is actually being used wins; they are never
+    // summed, because two sources at full deflection would still be one stick.
+    let ax = stick.x, ay = stick.y;
+    const pads = (navigator.getGamepads && navigator.getGamepads()) || [];
+    for (let p = 0; p < pads.length; p++) {
+      const gp = pads[p]; if (!gp) continue;
+      const btns = gp.buttons || [];
+      for (let i = 0; i < btns.length && i < GP_BTN_TO_RETRO.length; i++) {
+        if (btns[i] && btns[i].pressed) m |= (1 << GP_BTN_TO_RETRO[i]);
+      }
+      const a = gp.axes || [], dz = 0.08;
+      if (!ax && !ay && a.length >= 2) {
+        if (Math.abs(a[0]) > dz) ax = a[0];
+        if (Math.abs(a[1]) > dz) ay = a[1];
+      }
+      break;   // one remote player, one stick
+    }
+    if (!ax && !ay) {
+      ax = ((held.has('arrowright') || held.has('d')) ? 1 : 0) - ((held.has('arrowleft') || held.has('a')) ? 1 : 0);
+      ay = ((held.has('arrowdown')  || held.has('s')) ? 1 : 0) - ((held.has('arrowup')   || held.has('w')) ? 1 : 0);
+      // The Dreamcast stick reports a CIRCLE, so a diagonal is not 1,1.
+      if (ax && ay) { ax *= 0.7071; ay *= 0.7071; }
+    }
+    // A pushed stick also presses the d-pad: menus read the d-pad while
+    // gameplay reads the stick, and driving only one of them is the exact
+    // "the menu ignores me" / "I cannot walk" pair of bugs.
+    if (ax >  0.4) m |= (1 << RB.RIGHT);
+    if (ax < -0.4) m |= (1 << RB.LEFT);
+    if (ay >  0.4) m |= (1 << RB.DOWN);
+    if (ay < -0.4) m |= (1 << RB.UP);
+
+    const q = (v) => Math.max(-127, Math.min(127, Math.round(v * 127))) & 0xff;
+    m |= (q(ax) << 16);
+    m |= (q(ay) << 24);
+    return m | 0;
+  }
+
+  // ---- on-screen controls ---------------------------------------------------
+  const holdBtn = (elm, id) => {
+    if (!elm) return;
+    const down = (e) => { e.preventDefault(); touched.add(id); elm.classList.add('down'); };
+    const up   = (e) => { e.preventDefault(); touched.delete(id); elm.classList.remove('down'); };
+    // Pointer events cover mouse, touch and pen; the touch pair is the fallback
+    // for browsers without PointerEvent, and 'mouse' is what makes the pad
+    // clickable on a desktop (and in a headless test).
+    elm.addEventListener('pointerdown', down); elm.addEventListener('pointerup', up);
+    elm.addEventListener('pointercancel', up); elm.addEventListener('pointerleave', up);
+    elm.addEventListener('touchstart', down, { passive: false });
+    elm.addEventListener('touchend', up, { passive: false });
+    elm.addEventListener('mousedown', down); elm.addEventListener('mouseup', up);
+  };
+  // Labels are DREAMCAST names; the ids underneath are the RETRO ids this core
+  // maps them to (dreamcast.html's touch map: A=m, B=k, X=j, Y=n, L=q, R=e).
+  holdBtn($('tA'), RB.B);  holdBtn($('tB'), RB.A);
+  holdBtn($('tX'), RB.X);  holdBtn($('tY'), RB.Y);
+  holdBtn($('tL'), RB.L2); holdBtn($('tR'), RB.R2);
+  holdBtn($('tS'), RB.START);
+
+  (function wireDisc() {
+    const disc = $('disc'), nub = $('nub');
+    if (!disc) return;
+    let id = null;
+    const setFrom = (cx, cy) => {
+      const r = disc.getBoundingClientRect();
+      const rad = r.width / 2;
+      let dx = (cx - (r.left + rad)) / rad, dy = (cy - (r.top + rad)) / rad;
+      const mag = Math.hypot(dx, dy);
+      if (mag > 1) { dx /= mag; dy /= mag; }
+      stick.x = dx; stick.y = dy;
+      nub.style.transform = 'translate(' + (dx * rad * 0.55) + 'px,' + (dy * rad * 0.55) + 'px)';
+    };
+    const clear = () => { stick.x = stick.y = 0; nub.style.transform = ''; id = null; };
+    disc.addEventListener('pointerdown', (e) => { e.preventDefault(); id = e.pointerId;
+      try { disc.setPointerCapture(id); } catch (_) {} setFrom(e.clientX, e.clientY); });
+    disc.addEventListener('pointermove', (e) => { if (id === e.pointerId) setFrom(e.clientX, e.clientY); });
+    ['pointerup', 'pointercancel'].forEach((t) => disc.addEventListener(t, (e) => { if (id === e.pointerId) clear(); }));
+    disc.addEventListener('touchstart', (e) => { e.preventDefault(); const t = e.touches[0]; if (t) setFrom(t.clientX, t.clientY); }, { passive: false });
+    disc.addEventListener('touchmove',  (e) => { e.preventDefault(); const t = e.touches[0]; if (t) setFrom(t.clientX, t.clientY); }, { passive: false });
+    disc.addEventListener('touchend',   (e) => { e.preventDefault(); clear(); }, { passive: false });
+  })();
+
+  // Shown by default wherever fingers are the only input. On a desktop the
+  // keyboard is already mapped, so the pad starts out of the way of the picture
+  // and is one button away.
+  const touchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints || 0) > 0;
+  let padOn = QS.has('pad') ? QS.get('pad') !== '0' : touchDevice;
+  const applyPad = () => {
+    $('pad').classList.toggle('on', padOn);
+    $('btnPad').textContent = padOn ? '🎮 Hide' : '🎮 Controls';
+  };
+  $('btnPad').addEventListener('click', () => { padOn = !padOn; applyPad(); });
+  applyPad();
+
+  // ===========================================================================
+  // THE SESSION
+  // ===========================================================================
+  const NET = { session: null, role: null, state: null, code: null, game: null,
+                mask: 0, sends: 0, tracks: null, leaving: false, saved: null };
+
+  const say = (t) => { $('hudMsg').textContent = t; };
+
+  function showPlay(on) {
+    $('play').classList.toggle('on', !!on);
+    $('lobby').hidden = !!on;
+  }
+
+  async function attachStream(ms) {
+    const v = $('mpVideo');
+    NET.tracks = ms.getTracks().map((t) => t.kind + ':' + t.readyState);
+    // ⚠ ontrack FIRES ONCE PER TRACK and the host publishes video AND audio, so
+    // this arrives twice for one MediaStream. dreamcast.html measured what
+    // re-assigning srcObject does: it aborts the first play() and leaves the
+    // element at readyState 0 with videoWidth 0 — a connected session showing
+    // nothing. Attach once.
+    if (v.srcObject === ms) return;
+    v.srcObject = ms;
+    showPlay(true);
+    startPump();
+    try { await v.play(); $('btnSound').hidden = true; }
+    catch (e) {
+      // Autoplay policy can refuse an AUDIBLE element even after a click. Losing
+      // the picture to keep the sound is the wrong trade — play muted and offer
+      // the sound back explicitly.
+      v.muted = true;
+      try { await v.play(); } catch (_) {}
+      $('btnSound').hidden = false;
+      say('Connected — sound is off until you turn it on.');
+    }
+  }
+  $('btnSound').addEventListener('click', () => {
+    const v = $('mpVideo');
+    v.muted = false; v.play().catch(() => {});
+    $('btnSound').hidden = true;
+  });
+  $('mpVideo').addEventListener('click', () => {
+    const v = $('mpVideo');
+    if (v.muted) { v.muted = false; v.play().catch(() => {}); $('btnSound').hidden = true; }
+  });
+
+  // ---- the input pump -------------------------------------------------------
+  // ⚠ rAF DOES NOT FIRE IN A TAB THAT IS NOT BEING PRESENTED, and dreamcast.html
+  // measured the consequence directly: with the guest tab in front, the host's
+  // pump stopped and not one input message reached the emulator for a full
+  // second. The same hazard applies here in reverse — a guest whose screen is
+  // about to sleep, or who switched tabs, would silently stop being player 2. So
+  // a timer stands in whenever rAF has been quiet, and no-ops otherwise. A
+  // clamped timer is a degraded remote player; a dead rAF is no player at all.
+  let pumpOn = false, lastRaf = 0;
+  const now = () => (performance && performance.now ? performance.now() : Date.now());
+  function step() {
+    if (!NET.session || NET.role !== 'guest') return;
+    const m = packMask();
+    NET.mask = m;
+    NET.sends++;
+    NET.session.sendPad(m);
+  }
+  function startPump() {
+    if (pumpOn) return;
+    pumpOn = true;
+    lastRaf = now();
+    const loop = () => { lastRaf = now(); step(); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+    setInterval(() => { if (now() - lastRaf > 100) step(); }, 16);
+  }
+
+  function onStatus(e) {
+    NET.state = e.state;
+    if (e.state === 'signalling') say('Looking for the host…');
+    else if (e.state === 'connected') { say('Connected — you are Player 2.'); showPlay(true); startPump(); }
+    else if (e.state === 'closed') {
+      say(NET.leaving ? 'Left the session.' : 'The host left.');
+      setTimeout(() => showPlay(false), 1200);
+    } else if (e.state === 'failed') say('Could not connect' + (e.detail ? ': ' + e.detail : '.'));
+  }
+
+  $('btnLeave').addEventListener('click', () => {
+    NET.leaving = true;
+    try { NET.session && NET.session.close(); } catch (_) {}
+    NET.session = null; NET.role = null;
+    try { $('mpVideo').srcObject = null; } catch (_) {}
+    showPlay(false);
+    location.reload();   // back to a clean lobby; there is nothing to preserve
+  });
+
+  // ---- lobby ----------------------------------------------------------------
+  const ui = NetplayUI.mount({
+    game: DEFAULT_GAME,
+    games: GAMES,
+    transport,
+    container: $('lobbyCard'),
+    // HOST: hand the party to the only page that has an emulator. The code is
+    // the one already shown to the other player, so it must travel verbatim.
+    onHost(code, game) {
+      const q = new URLSearchParams({ np: code, game });
+      if (transport === 'local') q.set('net', 'local');
+      location.href = '/dreamcast.html?' + q.toString();
+    },
+    // Called the moment the session is constructed, BEFORE start(). The stream
+    // handler has to be here: ontrack can beat the DataChannel's open, and
+    // 'connected' (which is what fires onReady) IS that open — subscribing in
+    // onReady can miss the only event that carries the picture.
+    onSession(session, role) {
+      NET.session = session; NET.role = role; NET.code = session.code; NET.game = session.game;
+      session.on('stream', attachStream);
+      session.on('status', onStatus);
+      // Every player comes away with their own copy of the session's save; only
+      // the host's browser ever holds the memory card that was played on.
+      // lib/netplay.js namespaces these keys :mp so a co-op card can never
+      // silently overwrite a single-player one.
+      session.on('save', async (m) => {
+        if (!m || !m.ok) { NET.saved = { ok: false, error: m && m.error }; return; }
+        try {
+          await Netplay.SaveStore.put(Netplay.Session.saveKey(session.game, 'state'), m.bytes, m.meta);
+          NET.saved = { ok: true, bytes: m.bytes.length };
+          say('Saved your copy of this session (' + m.bytes.length + ' bytes).');
+        } catch (e) { NET.saved = { ok: false, error: e.message }; }
+      });
+    },
+    onReady(session, role) {
+      NET.session = session; NET.role = role; NET.code = session.code; NET.game = session.game;
+      showPlay(true);
+      startPump();
+      say('Connected — you are Player 2.');
+      // If the track arrived before this fired, the stream is already on the
+      // session; ask for it rather than waiting for an event that is now past.
+      const ms = session.remoteStream && session.remoteStream();
+      if (ms) attachStream(ms);
+    },
+  });
+  // mount() returns { supported:false } and renders nothing on a browser without
+  // the primitives — but this page already refused to get here in that case, so
+  // reaching it means the component itself declined and the page must say so
+  // rather than show an empty card.
+  if (!ui.supported) {
+    $('lobby').hidden = true;
+    $('unsupportedWhy').textContent = 'The lobby could not start on this browser.';
+    $('unsupported').hidden = false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // TEST SEAM. A sibling of dreamcast.html's window.__dcNet / __dcPad and
+  // deliberately not an extension of either — both already have consumers whose
+  // shape must not move. Everything here is the RESULT of doing the thing:
+  // `mask` is what was last handed to sendPad, `tracks` is what actually
+  // arrived, `videoW/H` are 0 until a frame has really been decoded.
+  // ---------------------------------------------------------------------------
+  window.__dcmp = () => {
+    const v = $('mpVideo');
+    return {
+      supported: true,
+      transport,
+      games: GAMES.map((g) => g.value),
+      role: NET.role,
+      state: NET.session ? NET.session.state : NET.state,
+      code: NET.session ? NET.session.code : null,
+      game: NET.session ? NET.session.game : null,
+      mask: NET.mask, sends: NET.sends,
+      tracks: NET.tracks,
+      saved: NET.saved,
+      padShown: $('pad').classList.contains('on'),
+      playing: $('play').classList.contains('on'),
+      videoW: v.videoWidth, videoH: v.videoHeight,
+      muted: v.muted, paused: v.paused, readyState: v.readyState,
+    };
+  };
+  // The mask packer is PURE — its inputs are `held`, `touched`, `stick` and the
+  // Gamepad API — so the WIRE FORMAT can be asserted with no session at all.
+  window.__dcmpMask = () => packMask();
+})();
+</script>
+</body>
+</html>
