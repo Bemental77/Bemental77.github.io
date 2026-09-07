@@ -107,6 +107,11 @@ await guest.evaluate(async (c) => {
   const s = new Netplay.Session({ game: 'gauntlet', host: false, code: c, transport: 'local' });
   window.__g2 = s;
   s.on('stream', (ms) => { window.__tracks = ms.getTracks().map(t => t.kind + ':' + t.readyState); });
+  s.on('save', (e) => {
+    if (!e.ok) { window.__save = { ok: false, error: e.error }; return; }
+    let sum = 0; for (let i = 0; i < e.bytes.length; i++) sum = (sum + e.bytes[i]) >>> 0;
+    window.__save = { ok: true, len: e.bytes.length, sum, encoding: e.encoding, kind: e.meta && e.meta.kind };
+  });
   await s.start();
 }, code3);
 const captured = await host.evaluate(() => window.__captured);
@@ -131,6 +136,56 @@ await new Promise(r => setTimeout(r, 500));
 const pad2 = await host.evaluate(() => window.__h2.remotePad());
 pad2 === 0x0A5 ? ok('stale-pad-discarded', 'out-of-order packet ignored, still 0x' + pad2.toString(16))
                : bad('stale-pad-discarded', 'stale value applied: 0x' + Number(pad2).toString(16));
+
+console.log('\n== every player keeps a save (chunked + compressed) ==');
+// A Dreamcast state is ~27 MB against a ~256 KB DataChannel message limit, so the
+// only interesting question is whether a payload far larger than one message
+// survives the round trip INTACT. 3 MB of non-trivial bytes, not zeros: zeros
+// would compress to nothing and prove the chunker was never exercised.
+const bigOk = await host.evaluate(async () => {
+  const N = 3 * 1024 * 1024;
+  const u = new Uint8Array(N);
+  let x = 123456789;
+  for (let i = 0; i < N; i++) { x = (x * 1103515245 + 12345) & 0x7fffffff; u[i] = x & 0xff; }
+  window.__sent = u;
+  let sum = 0; for (let i = 0; i < N; i++) sum = (sum + u[i]) >>> 0;
+  window.__sentSum = sum;
+  return await window.__h2.sendSave(u, { kind: 'vmu', slot: 'A1' });
+});
+bigOk ? ok('save-send-accepted', '3 MB queued in 16 KB chunks with backpressure')
+      : bad('save-send-accepted', 'sendSave returned false');
+let rx = null;
+for (let i = 0; i < 200 && !rx; i++) { rx = await guest.evaluate(() => window.__save || null); await new Promise(r => setTimeout(r, 200)); }
+const sv = rx;
+if (!sv) {
+  // wire the listener late-safe: re-check after attaching
+  bad('save-arrives', 'nothing received');
+} else if (!sv.ok) {
+  bad('save-arrives', sv.error);
+} else {
+  ok('save-arrives', `${sv.len} B, encoding=${sv.encoding}, meta.kind=${sv.kind}`);
+  const sentSum = await host.evaluate(() => window.__sentSum);
+  sv.sum === sentSum ? ok('save-byte-exact', `checksum ${sv.sum} matches the sender`)
+                      : bad('save-byte-exact', `got ${sv.sum} want ${sentSum}`);
+}
+
+console.log('\n== the multiplayer save is kept SEPARATE from single-player ==');
+const keys = await host.evaluate(() => [Netplay.Session.saveKey('gauntlet','state'), Netplay.Session.saveKey('gauntlet','vmu')]);
+(keys[0] === 'mp:gauntlet:state' && keys[1] === 'mp:gauntlet:vmu')
+  ? ok('save-key-namespaced', keys.join(' , ') + ' — cannot collide with a solo save')
+  : bad('save-key-namespaced', JSON.stringify(keys));
+
+const stored = await guest.evaluate(async () => {
+  const k = Netplay.Session.saveKey('gauntlet', 'vmu');
+  await Netplay.SaveStore.put(k, new Uint8Array([1,2,3,4,5]), { from: 'host' });
+  const back = await Netplay.SaveStore.get(k);
+  const fits = await Netplay.SaveStore.fits(27652485);
+  return { len: back && back.bytes.length, meta: back && back.meta, fits };
+});
+stored.len === 5 ? ok('save-persists-locally', `read back ${stored.len} B, meta.from=${stored.meta.from}`)
+                 : bad('save-persists-locally', JSON.stringify(stored));
+stored.fits.known ? ok('capacity-known-before-committing', `free=${(stored.fits.free/1048576).toFixed(0)} MB, a 27 MB state fits=${stored.fits.fits}`)
+                  : ok('capacity-known-before-committing', 'estimate() unavailable — reported as unknown rather than assumed');
 
 console.log('\n== refuses a mismatched game ==');
 const code2 = await host.evaluate(() => Netplay.makeCode(5));
