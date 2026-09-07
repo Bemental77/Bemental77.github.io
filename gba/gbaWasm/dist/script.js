@@ -757,6 +757,15 @@ class MyClass {
     }
 
     _onFullscreenChange() {
+        // MOBILE OWNS ITS OWN GEOMETRY. On the SP shell the canvas lives inside
+        // #spScreen and spScaleCanvas() sets its position/transform; the desktop
+        // branch below rewrites canvasDiv's cssText and the canvas width/height,
+        // which would fight it and leave the picture mis-sized. gba.html's own
+        // fullscreenchange listener re-fits the mobile canvas instead.
+        if (this.mobileMode) {
+            if (typeof spScaleCanvas === 'function') spScaleCanvas();
+            return;
+        }
         const canvasDiv = document.getElementById('canvasDiv');
         const canvas = document.getElementById('canvas');
         const isFs = !!(document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement);

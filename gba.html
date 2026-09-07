@@ -381,7 +381,22 @@
             }
             /* re-arm hit-testing only on the controls themselves */
             .sp-bottom > * { pointer-events: auto; }
-            .sp-shoulders { position: absolute; top: 0; left: 0; right: 0; }
+            /* The CONTAINER spans the full width, so its empty middle sat on top of
+               .sp-menu-row (which landscape lifts to top:-26px, i.e. into this same
+               band) and ate the menu button's taps:
+                 document.elementFromPoint(<spMenuBtn centre>) === .sp-shoulders
+               That is the button that opens Save / Load / Fullscreen / Move Controls,
+               so on a landscape phone none of them could be reached. Same remedy the
+               page already uses one level up for .sp-bottom: the container stops
+               hit-testing and the buttons themselves re-arm. */
+            .sp-shoulders { position: absolute; top: 0; left: 0; right: 0; pointer-events: none; }
+            .sp-shoulder { pointer-events: auto; }
+            /* toastr defaults to the top-right corner, which in landscape is exactly
+               where the R shoulder sits — measured elementFromPoint(<mobileR centre>)
+               === .toast-info while any notification was on screen, i.e. saving a
+               state made R unpressable until the toast faded. Clear the 30px
+               shoulder band. */
+            #toast-container.toast-top-right, #toast-container.toast-top-center { top: 36px; }
             .sp-shoulder {
                 width: 34vw; height: 30px; border-bottom: 0; border-radius: 0 0 8px 8px;
                 background: linear-gradient(180deg, rgba(194,194,194,0.82), rgba(144,144,144,0.82));
@@ -392,8 +407,28 @@
                order — at inset:0 it painted over the shoulders and ate their taps
                (measured: mobileL held=false). */
             .sp-inner { position: absolute; inset: 30px 0 0; padding: 4px 6px 6px; }
-            .sp-menu-row { position: absolute; top: -26px; left: 50%; transform: translateX(-50%); margin: 0; }
-            #spSpeedRow { position: absolute; bottom: 4px; left: 50%; transform: translateX(-50%); margin: 0; }
+            /* FIXED, not absolute, and it is not cosmetic. .sp-inner is
+               `position:absolute; inset:30px 0 0` with `overflow:hidden`, so an
+               absolutely-positioned child at top:-26px lands at y 4..30 — WHOLLY
+               ABOVE its parent's box — and is clipped out of existence. Measured:
+                 .sp-inner    box [0, 30, 844, 360]  overflow hidden
+                 .sp-menu-row box [409, 4, 26, 26]
+                 document.elementsFromPoint(422, 17) = canvas > spScreen > sp-top
+               with no menu row anywhere in the stack. So in landscape the button
+               that opens the menu was invisible AND untappable, which is why Save,
+               Load and New Rom could not be reached on a phone held sideways.
+               A fixed element is positioned against the viewport and is NOT clipped
+               by an ancestor's overflow, so it escapes the band it was drawn into.
+               (No ancestor sets a transform/filter — measured tf:none on .sp-inner,
+               .sp-bottom and .sp-top — which is what keeps `fixed` viewport-relative
+               here rather than re-anchored to an ancestor.) */
+            .sp-menu-row { position: fixed; top: 4px; left: 50%; transform: translateX(-50%); margin: 0; z-index: 4; }
+            /* z-index above #mobileSelect's 44px hit area (z-index 1): the slider sits
+               2px below Select's visual box, so Select's downward-grown target reached
+               y 383 and swallowed the slider's centre (measured
+               elementFromPoint(422,366) === #mobileSelect). Ordering it explicitly
+               hands the overlap to the visible control rather than to an invisible one. */
+            #spSpeedRow { position: absolute; bottom: 4px; left: 50%; transform: translateX(-50%); margin: 0; z-index: 3; }
             #spSpeedSlider { width: 100px; }
             #spSpeedLabel { color: #ddd; text-shadow: 0 1px 2px #000; }
             .sp-controls { align-items: center; height: 100%; }
@@ -425,6 +460,32 @@
             justify-content: center;
         }
         #spMenuOverlay.open { display: flex; }
+
+        /* ── MOVABLE-CONTROL EDIT MODE ────────────────────────────────
+           touch-action:none on a draggable is required, not cosmetic: without it
+           the browser claims the gesture for scroll/zoom and pointermove stops
+           firing partway through a drag. */
+        #spShell.sp-editing .sp-draggable {
+            touch-action: none;
+            outline: 2px dashed #4da3ff;
+            outline-offset: 3px;
+            cursor: grab;
+            opacity: 0.92;
+        }
+        #spShell.sp-editing .sp-draggable:active { cursor: grabbing; }
+        #spEditBar {
+            position: fixed; left: 50%; top: 10px; transform: translateX(-50%);
+            z-index: 2147483000; display: flex; align-items: center; gap: 10px;
+            background: rgba(0,0,0,0.86); color: #fff; border: 1px solid #666;
+            border-radius: 10px; padding: 10px 14px; max-width: 92vw;
+            font: 14px/1.3 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        #spEditBar span { flex: 1; }
+        #spEditBar button {
+            border: 0; border-radius: 7px; padding: 8px 14px; font-size: 14px;
+            min-height: 44px; background: #555; color: #fff;   /* 44px: the touch-target floor at gba.html:446 */
+        }
+        #spEditBar button.done { background: #2b7cd3; font-weight: 600; }
         .sp-overlay-box {
             background: #fff;
             border-radius: 12px;
@@ -474,6 +535,31 @@
       content: ""; position: absolute; left: 50%; top: 50%;
       transform: translate(-50%, -50%);
       width: 100%; height: 100%; min-width: 44px; min-height: 44px;
+    }
+
+    /* ⚠ TWO CENTRED 44px TARGETS DO NOT FIT IN 36px OF STACKED SPACE, and the
+       later sibling silently eats the earlier one's taps.
+       MEASURED on gba.html at 844x390 (iPhone landscape), before this rule:
+         #mobileStart box y 318..333 (centre 326)   .sp-sys-btn is 15px tall
+         #mobileSelect box y 339..354 (centre 347)  6px apart
+         Select's centred ::after therefore spans y 325..369, swallowing BOTH
+         Start's centre AND #spSpeedRow's, and it paints later in DOM order:
+           document.elementFromPoint(422, 326) === #mobileSelect
+         tools/legacy_emu_page_test.mjs recorded this as
+           gba/ios-landscape touch/mobileStart reachable=true held=false
+         i.e. the button was visible, correctly sized, and could not be pressed.
+       FIX: keep 44px for both, but grow them APART instead of through each other
+       — Start's area is anchored to its bottom edge and grows UP, Select's to its
+       top edge and grows DOWN. Each still fully contains its own button, and
+       neither reaches the other's centre. The z-index pair settles the 6px of
+       gap they share deterministically rather than by document order.
+       Scoped under #spSys so the shared rule above — which dreamcast, n64 and
+       ps1 also rely on — is untouched. */
+    #spSys #mobileStart::after {
+      top: auto; bottom: 0; transform: translate(-50%, 0); z-index: 2;
+    }
+    #spSys #mobileSelect::after {
+      top: 0; bottom: auto; transform: translate(-50%, 0); z-index: 1;
     }
 </style>
   <!-- THE FLOOR NO RUNTIME GATE CAN REACH.  Ported from n64/index.html:162-180, with
@@ -579,7 +665,7 @@
                 </div>
 
                 <div class="sp-inner">
-                    <div class="sp-menu-row">
+                    <div class="sp-menu-row" id="spMenuRow">
                         <div class="sp-menu-btn" id="spMenuBtn" onclick="spToggleMenu()">
                             <div class="sp-menu-icon"></div>
                         </div>
@@ -592,7 +678,7 @@
 
                     <div class="sp-controls">
 
-                        <div class="sp-dpad-disc">
+                        <div class="sp-dpad-disc" id="spDpad">
                             <div class="sp-dpad-v" id="spDpadV">
                                 <div class="arr arr-up"></div>
                                 <div class="arr arr-down"></div>
@@ -604,12 +690,12 @@
                             <div class="sp-dpad-center"></div>
                         </div>
 
-                        <div class="sp-center">
+                        <div class="sp-center" id="spSys">
                             <div class="sp-sys-btn" id="mobileStart">Start</div>
                             <div class="sp-sys-btn" id="mobileSelect">Select</div>
                         </div>
 
-                        <div class="sp-ab">
+                        <div class="sp-ab" id="spAB">
                             <div class="sp-btn-circle btn-a" id="mobileA">A</div>
                             <div class="sp-btn-circle btn-b" id="mobileB">B</div>
                         </div>
@@ -628,6 +714,8 @@
             <button class="btn btn-primary" onclick="myApp.saveStateLocal(); spCloseMenu();">Save State</button>
             <button class="btn btn-primary" onclick="myApp.loadStateLocal(); spCloseMenu();"
                 id="spLoadBtn">Load State</button>
+            <button class="btn btn-primary" id="spFullBtn" onclick="spToggleFullscreen(); spCloseMenu();">Fullscreen</button>
+            <button class="btn btn-primary" onclick="spEnterEditMode(); spCloseMenu();">Move Controls</button>
             <button class="btn btn-secondary" onclick="myApp.newRom()">New Rom</button>
             <hr style="margin: 12px 0;">
             <button class="btn btn-outline-secondary btn-sm" onclick="spCloseMenu()">Close</button>
@@ -735,12 +823,14 @@
         if (!el) return;
         function press(e) {
             e.preventDefault();
+            if (window.spEditMode) return;          // dragging a control must not press it
             if (window.myApp && myApp.rivetsData.inputController)
                 myApp.rivetsData.inputController[flagName] = true;
             el.classList.add('held');
         }
         function release(e) {
             e.preventDefault();
+            if (window.spEditMode) return;
             if (window.myApp && myApp.rivetsData.inputController)
                 myApp.rivetsData.inputController[flagName] = false;
             el.classList.remove('held');
@@ -757,7 +847,7 @@
         function ic() { return window.myApp && myApp.rivetsData.inputController; }
         function vPress(e) {
             e.preventDefault();
-            if (!ic()) return;
+            if (window.spEditMode || !ic()) return;
             var rect  = vEl.getBoundingClientRect();
             var touch = e.touches[0] || e.changedTouches[0];
             if (touch.clientY < rect.top + rect.height / 2) { ic().Key_Up = true;  ic().Key_Down  = false; }
@@ -766,12 +856,13 @@
         }
         function vRelease(e) {
             e.preventDefault();
+            if (window.spEditMode) return;
             if (ic()) { ic().Key_Up = false; ic().Key_Down = false; }
             vEl.classList.remove('held');
         }
         function hPress(e) {
             e.preventDefault();
-            if (!ic()) return;
+            if (window.spEditMode || !ic()) return;
             var rect  = hEl.getBoundingClientRect();
             var touch = e.touches[0] || e.changedTouches[0];
             if (touch.clientX < rect.left + rect.width / 2) { ic().Key_Left = true;  ic().Key_Right = false; }
@@ -780,6 +871,7 @@
         }
         function hRelease(e) {
             e.preventDefault();
+            if (window.spEditMode) return;
             if (ic()) { ic().Key_Left = false; ic().Key_Right = false; }
             hEl.classList.remove('held');
         }
@@ -872,7 +964,216 @@
         setTimeout(spScaleCanvas, 600);
         setTimeout(spScaleCanvas, 1500);
         window.addEventListener('resize', spScaleCanvas);
+
+        // Movable controls: wire the drag handlers once, then apply whatever the
+        // visitor saved. Positions are per-orientation, so a rotation has to
+        // re-apply rather than keep the other orientation's layout.
+        spWireDrag();
+        spApplyCtrlPositions();
+        window.addEventListener('resize', spApplyCtrlPositions);
+        window.addEventListener('orientationchange', function () {
+            setTimeout(spApplyCtrlPositions, 150);   // dimensions are stale on the first tick
+            setTimeout(spScaleCanvas, 150);
+        });
     }
+
+    /* ══ MOBILE FULLSCREEN ═══════════════════════════════════════════
+       The page already had a fullscreen control, but it was desktop-only in two
+       separate ways and so was unusable from a phone:
+         1. It lived at gba.html:538 inside #topPanel, which _setupMobileMode
+            hides outright — there was no fullscreen entry in the SP menu at all.
+         2. myApp.fullscreen() (script.js:753-754) requests fullscreen on
+            #canvas. A fullscreen element paints only ITS OWN subtree, and
+            #canvas has no children, so every touch control would vanish the
+            instant it succeeded — the game would be unplayable.
+       ps1.html:736 and snes.html:484-486 already solve this the right way
+       (`isMobile ? mobileShell : canvasWrap`); this is that pattern with gba's
+       own ids. #spShell contains BOTH .sp-top (screen) and .sp-bottom (controls).
+       ⚠ The iOS guard is dreamcast.html:1603-1614's, and it is not theoretical:
+       iPhone Safari has NO Element.requestFullscreen, so the unguarded `.call()`
+       in script.js throws TypeError there — swallowed by its own try/catch, which
+       is why it reads as "nothing happens" rather than as an error. */
+    function spToggleFullscreen() {
+        var shell = document.getElementById('spShell');
+        var inFs  = document.fullscreenElement || document.webkitFullscreenElement;
+        if (inFs) {
+            var ex = document.exitFullscreen || document.webkitExitFullscreen;
+            if (ex) ex.call(document);
+            return;
+        }
+        var fn = shell.requestFullscreen || shell.webkitRequestFullscreen || shell.webkitRequestFullScreen;
+        if (!fn) {
+            spToast('Fullscreen is not available in this browser');
+            return;
+        }
+        try {
+            var r = fn.call(shell);
+            if (r && r.catch) r.catch(function () { spToast('Fullscreen was refused'); });
+        } catch (e) { spToast('Fullscreen is not available in this browser'); }
+    }
+    // Re-fit the picture whenever fullscreen state changes: entering or leaving
+    // changes the viewport, and spScaleCanvas is what owns canvas geometry on
+    // this shell (script.js's _onFullscreenChange owns only the desktop layout).
+    ['fullscreenchange', 'webkitfullscreenchange'].forEach(function (ev) {
+        document.addEventListener(ev, function () {
+            var btn = document.getElementById('spFullBtn');
+            var inFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+            if (btn) btn.textContent = inFs ? 'Exit Fullscreen' : 'Fullscreen';
+            spScaleCanvas();
+            setTimeout(spScaleCanvas, 120);   // iOS reports stale dimensions on the first frame
+            spApplyCtrlPositions();
+        });
+    });
+
+    function spToast(msg) {
+        try {
+            if (window.toastr) { toastr.info(msg); return; }
+        } catch (e) {}
+        try { console.log('[gba] ' + msg); } catch (e) {}
+    }
+
+    /* ══ MOVABLE TOUCH CONTROLS ══════════════════════════════════════
+       Positions are stored as a PERCENTAGE OF THE VIEWPORT and keyed by
+       orientation, because this shell has two genuinely different layouts: a
+       50vh/50vh clamshell in portrait, and controls floating over a full-bleed
+       screen in landscape (the @media block at gba.html:375). A single stored
+       set would put a control somewhere sensible in one and off-screen in the
+       other. Percentages (rather than px) also survive rotation, a resize, and
+       entering fullscreen, none of which preserve pixel geometry.
+       A placed control becomes position:fixed against the viewport, so it no
+       longer depends on the flex layout it was dragged out of. */
+    var SP_CTRL_KEY = 'gbawasm_ctrlpos_v1';
+    var SP_DRAGGABLE = ['spDpad', 'spAB', 'spSys', 'mobileL', 'mobileR', 'spMenuRow', 'spSpeedRow'];
+    window.spEditMode = false;
+
+    function spOrient() {
+        return (window.innerWidth > window.innerHeight) ? 'landscape' : 'portrait';
+    }
+    function spLoadCtrlPositions() {
+        try { return JSON.parse(localStorage.getItem(SP_CTRL_KEY)) || {}; } catch (e) { return {}; }
+    }
+    function spSaveCtrlPositions(all) {
+        try { localStorage.setItem(SP_CTRL_KEY, JSON.stringify(all)); } catch (e) {}
+    }
+    function spPlace(el, xPct, yPct) {
+        el.style.position  = 'fixed';
+        el.style.left      = xPct + '%';
+        el.style.top       = yPct + '%';
+        el.style.right     = 'auto';
+        el.style.bottom    = 'auto';
+        el.style.margin    = '0';
+        el.style.transform = 'translate(-50%, -50%)';
+        el.style.zIndex    = '1200';
+        el.dataset.spMoved = '1';
+    }
+    function spUnplace(el) {
+        ['position', 'left', 'top', 'right', 'bottom', 'margin', 'transform', 'zIndex']
+            .forEach(function (k) { el.style[k] = ''; });
+        delete el.dataset.spMoved;
+    }
+    function spApplyCtrlPositions() {
+        var pos = spLoadCtrlPositions()[spOrient()] || {};
+        SP_DRAGGABLE.forEach(function (id) {
+            var el = document.getElementById(id);
+            if (!el) return;
+            if (pos[id]) spPlace(el, pos[id].x, pos[id].y);
+            else if (el.dataset.spMoved) spUnplace(el);
+        });
+    }
+    window.spApplyCtrlPositions = spApplyCtrlPositions;
+
+    function spEnterEditMode() {
+        if (window.spEditMode) return;
+        window.spEditMode = true;
+        document.getElementById('spShell').classList.add('sp-editing');
+        SP_DRAGGABLE.forEach(function (id) {
+            var el = document.getElementById(id);
+            if (el) el.classList.add('sp-draggable');
+        });
+        spShowEditBar();
+    }
+    function spExitEditMode() {
+        window.spEditMode = false;
+        document.getElementById('spShell').classList.remove('sp-editing');
+        SP_DRAGGABLE.forEach(function (id) {
+            var el = document.getElementById(id);
+            if (el) el.classList.remove('sp-draggable');
+        });
+        var bar = document.getElementById('spEditBar');
+        if (bar) bar.remove();
+    }
+    function spResetCtrlPositions() {
+        var all = spLoadCtrlPositions();
+        delete all[spOrient()];
+        spSaveCtrlPositions(all);
+        SP_DRAGGABLE.forEach(function (id) {
+            var el = document.getElementById(id);
+            if (el) spUnplace(el);
+        });
+        spToast('Controls reset for ' + spOrient());
+    }
+    function spShowEditBar() {
+        var bar = document.getElementById('spEditBar');
+        if (!bar) {
+            bar = document.createElement('div');
+            bar.id = 'spEditBar';
+            bar.innerHTML =
+                '<span>Drag the controls where you want them</span>' +
+                '<button type="button" onclick="spResetCtrlPositions()">Reset</button>' +
+                '<button type="button" class="done" onclick="spExitEditMode()">Done</button>';
+        }
+        // Re-host on every show: a fullscreen element paints only its own subtree,
+        // so a bar parented to <body> is INVISIBLE while #spShell is fullscreen —
+        // exactly the trap lib/xboxinput.js documents for its own hint.
+        var host = document.fullscreenElement || document.webkitFullscreenElement || document.body;
+        if (bar.parentNode !== host) host.appendChild(bar);
+    }
+
+    // One pointer-driven drag implementation for mouse and touch alike. Pointer
+    // events are used so a desktop check of this feature exercises the same code
+    // path a phone does, rather than a mouse-only twin that can drift from it.
+    function spWireDrag() {
+        SP_DRAGGABLE.forEach(function (id) {
+            var el = document.getElementById(id);
+            if (!el) return;
+            var dragging = false, pid = null;
+            el.addEventListener('pointerdown', function (e) {
+                if (!window.spEditMode) return;
+                e.preventDefault(); e.stopPropagation();
+                dragging = true; pid = e.pointerId;
+                try { el.setPointerCapture(pid); } catch (_) {}
+            });
+            el.addEventListener('pointermove', function (e) {
+                if (!dragging || !window.spEditMode) return;
+                e.preventDefault(); e.stopPropagation();
+                var x = (e.clientX / window.innerWidth) * 100;
+                var y = (e.clientY / window.innerHeight) * 100;
+                // Clamp to the viewport so a control can never be dragged out of
+                // reach — an off-screen control cannot be dragged back.
+                x = Math.max(3, Math.min(97, x));
+                y = Math.max(3, Math.min(97, y));
+                spPlace(el, +x.toFixed(2), +y.toFixed(2));
+            });
+            function end(e) {
+                if (!dragging) return;
+                dragging = false;
+                try { el.releasePointerCapture(pid); } catch (_) {}
+                if (!window.spEditMode) return;
+                var all = spLoadCtrlPositions(), o = spOrient();
+                all[o] = all[o] || {};
+                all[o][id] = { x: parseFloat(el.style.left), y: parseFloat(el.style.top) };
+                spSaveCtrlPositions(all);
+            }
+            el.addEventListener('pointerup', end);
+            el.addEventListener('pointercancel', end);
+        });
+    }
+
+    window.spToggleFullscreen    = spToggleFullscreen;
+    window.spEnterEditMode       = spEnterEditMode;
+    window.spExitEditMode        = spExitEditMode;
+    window.spResetCtrlPositions  = spResetCtrlPositions;
+    window.spWireDrag            = spWireDrag;
 
     window.spScaleCanvas = spScaleCanvas;
     </script>
