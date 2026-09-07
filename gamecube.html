@@ -5571,10 +5571,51 @@ window.GcRate = (function () {
     Module.HEAPU8[padStatus1] = b0; Module.HEAPU8[padStatus1 + 1] = b1; Module.HEAPU8[padStatus1 + 2] = b2;
   }
   var KEY_CODES = { 'ArrowUp': ['ArrowUp', 38], 'ArrowDown': ['ArrowDown', 40], 'ArrowLeft': ['ArrowLeft', 37], 'ArrowRight': ['ArrowRight', 39], 'x': ['KeyX', 88], 'z': ['KeyZ', 90], 's': ['KeyS', 83], 'd': ['KeyD', 68], 'w': ['KeyW', 87], 'r': ['KeyR', 82], 'e': ['KeyE', 69], 'v': ['KeyV', 86], 'c': ['KeyC', 67] };
+  // ── MINIMUM PRESS DURATION ────────────────────────────────────────────────
+  // mobilePadState is a plain boolean set, and the CORE only ever looks at it
+  // when pollController copies it across to the worker. A press whose whole
+  // lifetime falls between two of those copies is invisible to the game.
+  //
+  // MEASURED, tools/mobile_input_latency.mjs, 2026-09-06, iPhone viewport,
+  // 240pSuite, reading the bytes at the moment they are handed to the worker:
+  // the 10 ms poll measured 10.7 ms p50 (52.3 ms max) and lost 0 of 70 real
+  // synthetic taps — this page is the fastest of the six — but with the
+  // touchstart/touchend pair dispatched 0 ms apart it still lost 8 of 8, and
+  // 4 of 8 at a 4 ms gap. The window is narrow, not absent. Flooring the
+  // release at MIN_PRESS_MS closes it; 50 ms is well under a human tap
+  // (60-100 ms) so on an ordinary press it never fires, and a new press
+  // cancels any pending deferred release, so holds are unaffected.
+  var MIN_PRESS_MS = 50;
+  var _padPressAt = Object.create(null), _padRelTimer = Object.create(null);
+  // up<->down and left<->right on the d-pad; C-pad directions too where the
+  // page has them. Read by the hold function below.
+  var PAD_OPPOSITE = { up: 'down', down: 'up', left: 'right', right: 'left',
+                       cup: 'cdown', cdown: 'cup', cleft: 'cright', cright: 'cleft' };
+  function padHold(btn, down) {
+    if (_padRelTimer[btn]) { clearTimeout(_padRelTimer[btn]); _padRelTimer[btn] = null; }
+    if (down) {
+    // ⚠ OPPOSITE DIRECTIONS MUST NOT BOTH BE HELD. The deferred release above
+    // can outlive the press that follows it: flick the d-pad from Left to Right
+    // inside the floor and Left's release is still pending while Right is set,
+    // so the core is handed Left+Right together — a state no physical pad can
+    // produce and which several guests treat as "neither". The floor exists to
+    // stop a press being LOST, not to invent one, so a new direction cancels its
+    // opposite immediately, bypassing the floor. Non-directional buttons are
+    // unaffected (they have no opposite).
+      var opp = PAD_OPPOSITE[btn];
+      if (opp) { if (_padRelTimer[opp]) { clearTimeout(_padRelTimer[opp]); _padRelTimer[opp] = null; } mobilePadState[opp] = false; }
+      _padPressAt[btn] = performance.now(); mobilePadState[btn] = true; updatePadState(); return;
+    }
+    var held = performance.now() - (_padPressAt[btn] || 0);
+    if (held >= MIN_PRESS_MS) { mobilePadState[btn] = false; updatePadState(); return; }
+    _padRelTimer[btn] = setTimeout(function () {
+      _padRelTimer[btn] = null; mobilePadState[btn] = false; updatePadState();
+    }, MIN_PRESS_MS - held);
+  }
   function dispatchKey(type, key) {
     var keyToPad = { 'ArrowUp': 'up', 'ArrowDown': 'down', 'ArrowLeft': 'left', 'ArrowRight': 'right', 'x': 'a', 'z': 'b', 's': 'x', 'd': 'y', 'w': 'l', 'r': 'r', 'e': 'z', 'v': 'start', 'c': 'select' };
     var padBtn = keyToPad[key];
-    if (padBtn) { mobilePadState[padBtn] = (type === 'keydown'); updatePadState(); }
+    if (padBtn) { padHold(padBtn, type === 'keydown'); }
     var info = KEY_CODES[key]; if (!info) return;
     try { var evt = new KeyboardEvent(type, { key: key, code: info[0], keyCode: info[1], which: info[1], bubbles: true, cancelable: true }); Object.defineProperty(evt, 'keyCode', { get: function () { return info[1]; } }); Object.defineProperty(evt, 'which', { get: function () { return info[1]; } }); window.dispatchEvent(evt); document.dispatchEvent(evt); } catch (e) {}
   }
@@ -5599,10 +5640,11 @@ window.GcRate = (function () {
       var padBtn = keyToPad[e.key];
       if (!padBtn) return;
       e.preventDefault();
-      if (mobilePadState[padBtn] !== (type === 'keydown')) {
-        mobilePadState[padBtn] = (type === 'keydown');
-        updatePadState();
-      }
+      // No `if (state !== next)` guard here any more: with a deferred release in
+      // flight the flag still READS pressed, so that guard would swallow the
+      // re-press and let the pending timer clear a key that is being held.
+      // padHold is idempotent — a repeat keydown just re-arms it.
+      padHold(padBtn, type === 'keydown');   // same minimum-press floor as touch
     }
     window.addEventListener('keydown', function (e) { onKey('keydown', e); });
     window.addEventListener('keyup', function (e) { onKey('keyup', e); });

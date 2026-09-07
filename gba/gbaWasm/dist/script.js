@@ -647,6 +647,66 @@ class MyClass {
         }, () => toastr.error('No save state found for this ROM.'));
     }
 
+    // ── EXPORT / IMPORT A SAVE STATE ──────────────────────────────────────────
+    // A state that only exists inside one browser's IndexedDB is one cleared
+    // site-data away from gone, and cannot move to another device. gamecube.html
+    // and dreamcast.html have had Export/Import for a while; this is the same
+    // capability for the GBA. The exported file is EXACTLY the bytes stored —
+    // the gzip stream written by _compressHeapLive — so an export re-imports
+    // byte-for-byte with no re-encoding step to get wrong.
+    async exportStateLocal() {
+        const key = this._getSaveKey();
+        if (!key) { toastr.error('No ROM loaded.'); return; }
+        this._getDB(key + '.state', (data) => {
+            const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+            if (!bytes.byteLength) { toastr.error('Saved state is empty.'); return; }
+            const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+            const a = document.createElement('a');
+            // Name it after the ROM so a folder of exports stays sortable, and keep
+            // the .gz so the file's own type is honest about its contents.
+            a.href = url; a.download = key + '.state.gz';
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 5000);
+            toastr.info('Exported ' + (bytes.byteLength / 1048576).toFixed(2) + ' MB.');
+        }, () => toastr.error('No save state to export — press Save State first.'));
+    }
+
+    importStateLocal() {
+        const key = this._getSaveKey();
+        if (!key) { toastr.error('Load a ROM first, then import.'); return; }
+        const inp = document.createElement('input');
+        inp.type = 'file';
+        inp.accept = '.gz,.state,application/octet-stream';
+        inp.addEventListener('change', async () => {
+            const f = inp.files && inp.files[0];
+            if (!f) return;
+            try {
+                const buf = new Uint8Array(await f.arrayBuffer());
+                // Validate before storing: a gzip stream starts 1f 8b. Writing an
+                // unreadable blob over a good state would destroy the thing the
+                // visitor was trying to protect.
+                if (buf.length < 3 || buf[0] !== 0x1f || buf[1] !== 0x8b) {
+                    toastr.error('That file is not a GBA save state (no gzip header).');
+                    return;
+                }
+                this._putDB(key + '.state', buf,
+                    () => {
+                        this.rivetsData.noLocalState = false;
+                        toastr.info('Imported ' + (buf.byteLength / 1048576).toFixed(2) +
+                                    ' MB — press Load State to apply it.');
+                    },
+                    (ev) => {
+                        const err = ev && ev.target && ev.target.error;
+                        const nm = err && err.name ? err.name : 'unknown error';
+                        toastr.error(nm === 'QuotaExceededError'
+                            ? 'Import failed — out of browser storage on this device.'
+                            : 'Import failed (' + nm + ').');
+                    });
+            } catch (e) { toastr.error('Import failed: ' + e.message); }
+        });
+        inp.click();
+    }
+
     _loadSave(cb) {
         const key = this._getSaveKey();
         if (!key) { cb(false); return; }

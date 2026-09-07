@@ -492,6 +492,46 @@
 
   // ── input ─────────────────────────────────────────────────────────────────
   const KEYMAP = { ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right', a: 'a', z: 'b', x: 'x', s: 'y', d: 'l', c: 'r', Enter: 'start', Shift: 'select' };
+  // ── MINIMUM PRESS DURATION ────────────────────────────────────────────────
+  // padState is a plain boolean set, and the CORE only ever looks at it once
+  // per emulated frame, in runFrame() -> Module._setJoypadInput(padMask()).
+  // A press whose whole lifetime falls between two of those calls is invisible
+  // to the game: the player pressed the button and nothing happened.
+  //
+  // MEASURED, tools/mobile_input_latency.mjs, 2026-09-06, iPhone viewport,
+  // hooked ON _setJoypadInput so the reading is what the core was actually
+  // handed: with the touchstart/touchend pair dispatched 0 ms apart, 8 of 8
+  // presses never reached the core; at a 4 ms gap 6 of 8; at 8 ms 3 of 8; a
+  // gap of one frame (16 ms) or more always landed. Flooring the release at
+  // MIN_PRESS_MS makes a press impossible to miss, and 50 ms is well under a
+  // human tap (60-100 ms) so on an ordinary press it never fires. A new press
+  // cancels any pending deferred release, so holds are unaffected.
+  var MIN_PRESS_MS = 50;
+  var _padPressAt = Object.create(null), _padRelTimer = Object.create(null);
+  // up<->down and left<->right on the d-pad; C-pad directions too where the
+  // page has them. Read by the hold function below.
+  var PAD_OPPOSITE = { up: 'down', down: 'up', left: 'right', right: 'left',
+                       cup: 'cdown', cdown: 'cup', cleft: 'cright', cright: 'cleft' };
+  function padHold(btn, down) {
+    if (_padRelTimer[btn]) { clearTimeout(_padRelTimer[btn]); _padRelTimer[btn] = null; }
+    if (down) {
+    // ⚠ OPPOSITE DIRECTIONS MUST NOT BOTH BE HELD. The deferred release above
+    // can outlive the press that follows it: flick the d-pad from Left to Right
+    // inside the floor and Left's release is still pending while Right is set,
+    // so the core is handed Left+Right together — a state no physical pad can
+    // produce and which several guests treat as "neither". The floor exists to
+    // stop a press being LOST, not to invent one, so a new direction cancels its
+    // opposite immediately, bypassing the floor. Non-directional buttons are
+    // unaffected (they have no opposite).
+      var opp = PAD_OPPOSITE[btn];
+      if (opp) { if (_padRelTimer[opp]) { clearTimeout(_padRelTimer[opp]); _padRelTimer[opp] = null; } padState[opp] = false; }
+      _padPressAt[btn] = performance.now(); padState[btn] = true; return;
+    }
+    var held = performance.now() - (_padPressAt[btn] || 0);
+    if (held >= MIN_PRESS_MS) { padState[btn] = false; return; }
+    _padRelTimer[btn] = setTimeout(function () { _padRelTimer[btn] = null; padState[btn] = false; }, MIN_PRESS_MS - held);
+  }
+
   function onKey(e) {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
     var t = e.target && e.target.tagName;
@@ -500,15 +540,15 @@
     if (k && k.length === 1) k = k.toLowerCase();
     var btn = KEYMAP[k];
     if (!btn) return;
-    padState[btn] = (e.type === 'keydown');
+    padHold(btn, e.type === 'keydown');
   }
   window.addEventListener('keydown', onKey, true);
   window.addEventListener('keyup', onKey, true);
 
   function wireButton(id, btn) {
     var el = $(id); if (!el) return;
-    function press(e) { if (e && e.preventDefault) e.preventDefault(); padState[btn] = true; el.classList.add('held'); }
-    function release(e) { if (e && e.preventDefault) e.preventDefault(); padState[btn] = false; el.classList.remove('held'); }
+    function press(e) { if (e && e.preventDefault) e.preventDefault(); padHold(btn, true); el.classList.add('held'); }
+    function release(e) { if (e && e.preventDefault) e.preventDefault(); padHold(btn, false); el.classList.remove('held'); }
     if (window.PointerEvent) {
       el.addEventListener('pointerdown', function (e) { try { el.setPointerCapture(e.pointerId); } catch (_) {} press(e); });
       el.addEventListener('pointerup', release); el.addEventListener('pointercancel', release); el.addEventListener('pointerleave', release);
@@ -538,7 +578,7 @@
     }
     function apply(next) {
       ['up', 'down', 'left', 'right'].forEach(function (d) {
-        if (next[d] !== active[d]) { padState[d] = next[d]; active[d] = next[d]; disc.classList.toggle('d-' + d, next[d]); }
+        if (next[d] !== active[d]) { padHold(d, next[d]); active[d] = next[d]; disc.classList.toggle('d-' + d, next[d]); }
       });
     }
     function reset() { apply({ up: false, down: false, left: false, right: false }); captureId = null; }

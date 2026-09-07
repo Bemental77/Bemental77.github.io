@@ -388,10 +388,56 @@
       }, SELECT_PULSE_MS);
     }, UP_HOLD_SELECT_MS);
   }
+  // ── MINIMUM PRESS DURATION ────────────────────────────────────────────────
+  // This shell writes a boolean on press and clears it on release, and the CORE
+  // only ever looks at that boolean when pollController copies it across
+  // (below). A press whose entire lifetime falls between two of those copies is
+  // therefore invisible to the game — the player pressed the button and nothing
+  // happened.
+  //
+  // MEASURED, tools/mobile_input_latency.mjs, 2026-09-06, iPhone viewport,
+  // reading the bytes at the moment they are handed to the worker:
+  //   pollController cadence ................ 33.9 ms p50
+  //   REAL synthetic taps, 6 ms hold ........ 7 of 10 never reached the core
+  //   REAL synthetic taps, 14 ms hold ....... 4 of 10 never reached the core
+  //   touchstart/touchend dispatched 0 ms apart .. 8 of 8 lost
+  // A press held for longer than one sampler period cannot be missed, so the
+  // release is floored to MIN_PRESS_MS. 50 ms is longer than the sampler period
+  // on every one of these pages and longer than a 30 Hz guest frame, and is
+  // still well under a human tap (60-100 ms) — so on an ordinary press it never
+  // fires at all. A press arriving while a deferred release is pending simply
+  // cancels it and the button stays down, so holds are unaffected.
+  var MIN_PRESS_MS = 50;
+  var _padPressAt = Object.create(null), _padRelTimer = Object.create(null);
+  function _padWrite(btn, down) { mobilePadState[btn] = down; updatePadState(); }
+  // up<->down and left<->right on the d-pad; C-pad directions too where the
+  // page has them. Read by the hold function below.
+  var PAD_OPPOSITE = { up: 'down', down: 'up', left: 'right', right: 'left',
+                       cup: 'cdown', cdown: 'cup', cleft: 'cright', cright: 'cleft' };
+  function padHold(btn, down) {
+    if (_padRelTimer[btn]) { clearTimeout(_padRelTimer[btn]); _padRelTimer[btn] = null; }
+    if (down) {
+    // ⚠ OPPOSITE DIRECTIONS MUST NOT BOTH BE HELD. The deferred release above
+    // can outlive the press that follows it: flick the d-pad from Left to Right
+    // inside the floor and Left's release is still pending while Right is set,
+    // so the core is handed Left+Right together — a state no physical pad can
+    // produce and which several guests treat as "neither". The floor exists to
+    // stop a press being LOST, not to invent one, so a new direction cancels its
+    // opposite immediately, bypassing the floor. Non-directional buttons are
+    // unaffected (they have no opposite).
+      var opp = PAD_OPPOSITE[btn];
+      if (opp) { if (_padRelTimer[opp]) { clearTimeout(_padRelTimer[opp]); _padRelTimer[opp] = null; } _padWrite(opp, false); }
+      _padPressAt[btn] = performance.now(); _padWrite(btn, true); return;
+    }
+    var held = performance.now() - (_padPressAt[btn] || 0);
+    if (held >= MIN_PRESS_MS) { _padWrite(btn, false); return; }
+    _padRelTimer[btn] = setTimeout(function () { _padRelTimer[btn] = null; _padWrite(btn, false); }, MIN_PRESS_MS - held);
+  }
+
   function dispatchKey(type, key) {
     var keyToPad = { 'ArrowUp': 'up', 'ArrowDown': 'down', 'ArrowLeft': 'left', 'ArrowRight': 'right', 'z': 'cross', 'x': 'circle', 's': 'square', 'd': 'triangle', 'w': 'l1', 'r': 'r1', 'e': 'l2', 't': 'r2', 'v': 'start', 'c': 'select' };
     var padBtn = keyToPad[key];
-    if (padBtn) { mobilePadState[padBtn] = (type === 'keydown'); updatePadState(); }
+    if (padBtn) { padHold(padBtn, type === 'keydown'); }
     if (key === KEYMAP.up) { if (type === 'keydown') _armUpHold(); else _cancelUpHold(); }
   }
 
@@ -494,7 +540,15 @@
     var arr; while (states_arrs.length > 50) states_arrs.pop();
     if (states_arrs.length > 0) { arr = states_arrs.pop(); arr.set(src); } else arr = new Uint8Array(src);
     pcsx_worker.postMessage({ cmd: 'padStatus', states: arr }, [arr.buffer]);
-    setTimeout(pollController, 33);
+    // 8 ms, not 33. THIS IS THE INPUT SAMPLER: nothing a touch or a key does
+    // reaches the emulator until this fires, so its period is a floor under
+    // every button's latency. At 33 ms it measured 33.9 ms p50 in the browser
+    // and 30.1 ms p50 of press latency — the worst of the six emulator pages,
+    // roughly one and a half NTSC frames of dead time before the guest could
+    // possibly react. gamecube.html has run its equivalent poll at 10 ms for a
+    // long time (gamecube.html, pollController) with no ill effect; the payload
+    // here is 48 bytes on a transferable, so 125 Hz costs essentially nothing.
+    setTimeout(pollController, 8);
   }
 
   var renderFrames = 0, lastFpsLog = performance.now();
@@ -658,7 +712,7 @@
     pcsx_worker.postMessage({ cmd: 'romBegin', name: ROM_NAME + '.bin', size: totalSize, urls: urls, preload: preloadBuf }, preloadBuf ? [preloadBuf] : []);
     setStatus('Booting emulator (lazy)…');
     pcsx_worker.postMessage({ cmd: 'romEnd' });
-    setTimeout(pollController, 33);
+    setTimeout(pollController, 8);   // boot arm of the 8 ms input sampler — see pollController
     [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
   }
   async function fetchRomStreamAndBoot() {
@@ -712,7 +766,7 @@
     pageLog('[rom] streamed ' + (total/1048576).toFixed(1) + ' MB — booting');
     setStatus('Booting emulator…');
     pcsx_worker.postMessage({ cmd: 'romEnd' });
-    setTimeout(pollController, 33);
+    setTimeout(pollController, 8);   // boot arm of the 8 ms input sampler — see pollController
     [$('btnSave'), $('btnLoad'), $('btnMute'), $('btnResetAudio'), $('btnFull'), $('mSave'), $('mLoad'), $('mMute'), $('mResetAudio'), $('mFull')].forEach(b => b && (b.disabled = false));
   }
   async function fetchRomAndBoot() {

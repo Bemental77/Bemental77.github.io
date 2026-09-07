@@ -618,6 +618,9 @@
                 <button class="btn btn-primary mt-2 mb-2" onclick="myApp.saveStateLocal()">Save State</button>
                 <button class="btn btn-primary mt-2 mb-2" onclick="myApp.loadStateLocal()"
                     rv-disabled="data.noLocalState">Load State</button>
+                <button class="btn btn-primary mt-2 mb-2" onclick="myApp.exportStateLocal()"
+                    rv-disabled="data.noLocalState">Export State</button>
+                <button class="btn btn-primary mt-2 mb-2" onclick="myApp.importStateLocal()">Import State</button>
                 <button class="btn btn-primary mt-2 mb-2" onclick="myApp.zoomOut()">Zoom Out</button>
                 <button class="btn btn-primary mt-2 mb-2" onclick="myApp.zoomIn()">Zoom In</button>
                 <button class="btn btn-primary mt-2 mb-2" onclick="myApp.showRemapModal()">Remap Buttons</button>
@@ -714,6 +717,9 @@
             <button class="btn btn-primary" onclick="myApp.saveStateLocal(); spCloseMenu();">Save State</button>
             <button class="btn btn-primary" onclick="myApp.loadStateLocal(); spCloseMenu();"
                 id="spLoadBtn">Load State</button>
+            <button class="btn btn-primary" onclick="myApp.exportStateLocal(); spCloseMenu();"
+                id="spExportBtn">Export State</button>
+            <button class="btn btn-primary" onclick="myApp.importStateLocal(); spCloseMenu();">Import State</button>
             <button class="btn btn-primary" id="spFullBtn" onclick="spToggleFullscreen(); spCloseMenu();">Fullscreen</button>
             <button class="btn btn-primary" onclick="spEnterEditMode(); spCloseMenu();">Move Controls</button>
             <button class="btn btn-secondary" onclick="myApp.newRom()">New Rom</button>
@@ -813,9 +819,55 @@
         // Gate on the SAVE STATE key, not the SRAM key — see _findInDatabase in script.js.
         var noState = window.myApp && myApp.rivetsData.noLocalState;
         document.getElementById('spLoadBtn').disabled = !!noState;
+        var ex = document.getElementById('spExportBtn');
+        if (ex) ex.disabled = !!noState;   // nothing to export until a state exists
     }
     function spCloseMenu() {
         document.getElementById('spMenuOverlay').classList.remove('open');
+    }
+
+    // ── MINIMUM PRESS DURATION ────────────────────────────────────────────
+    // These handlers set a boolean on inputController, and the CORE only ever
+    // looks at that boolean once per emulated frame, in script.js _runFrame ->
+    // Module._emuRunFrame(this._getKeyMask()). A press whose whole lifetime
+    // falls between two of those calls is invisible to the game: the player
+    // pressed the button and nothing happened.
+    //
+    // MEASURED, tools/mobile_input_latency.mjs, 2026-09-06, iPhone viewport,
+    // hooked ON _emuRunFrame so the reading is the mask the core was actually
+    // handed: with the touchstart/touchend pair dispatched 0 ms apart, 8 of 8
+    // presses never reached the core; at a 4 ms gap 5 of 8; at 8 ms 4 of 8; a
+    // gap of one frame (16 ms) or more always landed. Flooring the release at
+    // MIN_PRESS_MS makes a press impossible to miss, and 50 ms is well under a
+    // human tap (60-100 ms) so on an ordinary press it never fires. A new
+    // press cancels any pending deferred release, so holds are unaffected.
+    var SP_MIN_PRESS_MS = 50;
+    var _spPressAt = Object.create(null), _spRelTimer = Object.create(null);
+    function spSetFlag(flagName, v) {
+        var ic = window.myApp && myApp.rivetsData && myApp.rivetsData.inputController;
+        if (ic) ic[flagName] = v;
+    }
+    var SP_OPPOSITE = { Key_Up: 'Key_Down', Key_Down: 'Key_Up', Key_Left: 'Key_Right', Key_Right: 'Key_Left' };
+    function spHold(flagName, down) {
+        if (_spRelTimer[flagName]) { clearTimeout(_spRelTimer[flagName]); _spRelTimer[flagName] = null; }
+        if (down) {
+        // ⚠ OPPOSITE DIRECTIONS MUST NOT BOTH BE HELD. The deferred release above
+        // can outlive the press that follows it: flick the d-pad from Left to Right
+        // inside the floor and Left's release is still pending while Right is set,
+        // so the core is handed Left+Right together — a state no physical pad can
+        // produce and which several guests treat as "neither". The floor exists to
+        // stop a press being LOST, not to invent one, so a new direction cancels its
+        // opposite immediately, bypassing the floor. Non-directional buttons are
+        // unaffected (they have no opposite).
+          var opp = SP_OPPOSITE[flagName];
+          if (opp) { if (_spRelTimer[opp]) { clearTimeout(_spRelTimer[opp]); _spRelTimer[opp] = null; } spSetFlag(opp, false); }
+          _spPressAt[flagName] = performance.now(); spSetFlag(flagName, true); return;
+        }
+        var held = performance.now() - (_spPressAt[flagName] || 0);
+        if (held >= SP_MIN_PRESS_MS) { spSetFlag(flagName, false); return; }
+        _spRelTimer[flagName] = setTimeout(function () {
+            _spRelTimer[flagName] = null; spSetFlag(flagName, false);
+        }, SP_MIN_PRESS_MS - held);
     }
 
     function spWireBtn(id, flagName) {
@@ -824,15 +876,13 @@
         function press(e) {
             e.preventDefault();
             if (window.spEditMode) return;          // dragging a control must not press it
-            if (window.myApp && myApp.rivetsData.inputController)
-                myApp.rivetsData.inputController[flagName] = true;
+            spHold(flagName, true);
             el.classList.add('held');
         }
         function release(e) {
             e.preventDefault();
             if (window.spEditMode) return;
-            if (window.myApp && myApp.rivetsData.inputController)
-                myApp.rivetsData.inputController[flagName] = false;
+            spHold(flagName, false);
             el.classList.remove('held');
         }
         el.addEventListener('touchstart', press,    { passive: false });
@@ -850,14 +900,14 @@
             if (window.spEditMode || !ic()) return;
             var rect  = vEl.getBoundingClientRect();
             var touch = e.touches[0] || e.changedTouches[0];
-            if (touch.clientY < rect.top + rect.height / 2) { ic().Key_Up = true;  ic().Key_Down  = false; }
-            else                                             { ic().Key_Down = true; ic().Key_Up   = false; }
+            if (touch.clientY < rect.top + rect.height / 2) { spHold('Key_Up', true);  spHold('Key_Down', false); }
+            else                                             { spHold('Key_Down', true); spHold('Key_Up', false); }
             vEl.classList.add('held');
         }
         function vRelease(e) {
             e.preventDefault();
             if (window.spEditMode) return;
-            if (ic()) { ic().Key_Up = false; ic().Key_Down = false; }
+            spHold('Key_Up', false); spHold('Key_Down', false);
             vEl.classList.remove('held');
         }
         function hPress(e) {
@@ -865,14 +915,14 @@
             if (window.spEditMode || !ic()) return;
             var rect  = hEl.getBoundingClientRect();
             var touch = e.touches[0] || e.changedTouches[0];
-            if (touch.clientX < rect.left + rect.width / 2) { ic().Key_Left = true;  ic().Key_Right = false; }
-            else                                             { ic().Key_Right = true; ic().Key_Left  = false; }
+            if (touch.clientX < rect.left + rect.width / 2) { spHold('Key_Left', true);  spHold('Key_Right', false); }
+            else                                             { spHold('Key_Right', true); spHold('Key_Left', false); }
             hEl.classList.add('held');
         }
         function hRelease(e) {
             e.preventDefault();
             if (window.spEditMode) return;
-            if (ic()) { ic().Key_Left = false; ic().Key_Right = false; }
+            spHold('Key_Left', false); spHold('Key_Right', false);
             hEl.classList.remove('held');
         }
         vEl.addEventListener('touchstart', vPress,   { passive: false });

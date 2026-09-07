@@ -1,5 +1,21 @@
 name: Deploy to GitHub Pages
 
+# ⚠ GITHUB PAGES HAS A HARD 10 GB DEPLOY LIMIT AND THIS SITE IS AT IT.
+# Run #167 (commit 4ee03d8d) failed with, verbatim:
+#   Artifact could not be deployed. Please ensure the content does not contain
+#   any hard links, symlinks and total size is less than 10GB.
+# Upload succeeded; DEPLOY is where it died. The artifact was ~14.07 GB after four
+# Dreamcast discs were added. Content, measured from the prod tree:
+#   dreamcast/discs 5.3 GB | ps1/ps1Wasm 4.4 GB | gamecube/roms 3.4 GB
+# None of it is waste — there is no redundancy (checked: no file is tracked both
+# whole and split into parts). So the ceiling is structural, not a cleanup problem.
+# The four NEW discs are excluded below to get deploys working again; the files stay
+# in git, so re-enabling is deleting four lines once they are hosted somewhere with
+# its own budget. Excluding just those lands at 9.99 GB, which is too close to the
+# limit to be safe, hence the dev-only cuts alongside them (dreamcast/states keeps
+# ONLY pso2_boot.state, the sole state dreamcast.html fetches — verified by grep;
+# the four pioneer2 states are dev artifacts).
+#
 # This replaces the default GH Pages deploy. The repo includes ~10 GB of dev sources
 # (emsdk, pcsx-wasm-src, gamecube/dolphin-src, bementalJIT, build artifacts) that aren't
 # needed at runtime. We stage a minimal artifact and only ship what the deployed site serves.
@@ -69,6 +85,14 @@ jobs:
             --exclude='serverless.yml' \
             --exclude='send.email.js' \
             --exclude='send.email.ts' \
+            --exclude='/dreamcast/discs/cannonspike' \
+            --exclude='/dreamcast/discs/sa2' \
+            --exclude='/dreamcast/discs/gauntlet' \
+            --exclude='/dreamcast/discs/mvc2' \
+            --exclude='/dreamcast/states/pso2_pioneer2_*' \
+            --exclude='/ps1/duckstation-master' \
+            --exclude='/gamecube/docs' \
+            --exclude='/dreamcast/docs' \
             ./ _deploy/
           echo "::group::Deploy artifact size + top dirs"
           du -sh _deploy
