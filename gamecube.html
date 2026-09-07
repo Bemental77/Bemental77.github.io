@@ -2080,7 +2080,14 @@ window.GcRate = (function () {
 (function () {
   'use strict';
   const ROM_ROOT = '/gamecube/roms/';
-  function chunkRange(base, lastLetter) { var urls = []; for (var i = 'a'.charCodeAt(0); i <= lastLetter.charCodeAt(0); i++) { urls.push(ROM_ROOT + base + '.bin.parta' + String.fromCharCode(i)); } return urls; }
+  // ── GZIPPED ROM CHUNKS ────────────────────────────────────────────────
+  // The chunks ship gzipped because GitHub Pages refuses to DEPLOY an artifact
+  // over 10 GB and this site's ROM libraries do not fit beside the Dreamcast
+  // discs. Measured on real parts: GameCube 104,857,600 -> 87,120,849 (1.20x),
+  // PS1 89,128,960 -> 65,772,989 (1.36x). Modest, but 1.7 GB across the two
+  // libraries, which is the difference between deploying and not.
+  // Inflated as a STREAM so a chunk is never held twice.
+  function chunkRange(base, lastLetter) { var urls = []; for (var i = 'a'.charCodeAt(0); i <= lastLetter.charCodeAt(0); i++) { urls.push(ROM_ROOT + base + '.bin.parta' + String.fromCharCode(i) + '.gz'); } return urls; }
   const ROMS = [
     { label: 'Mario Party 4', base: 'MarioParty4', chunks: chunkRange('MarioParty4', 'f') },
     { label: 'Sonic Adventure 2 Battle', base: 'SonicAdventure2Battle', chunks: chunkRange('SonicAdventure2Battle', 'q') },
@@ -6995,7 +7002,10 @@ window.GcRate = (function () {
       }));
       totalSize = sizes.reduce(function (a, b) { return a + b; }, 0);
     } catch (e) { pageLog('[rom] sizing skipped: ' + e); }
-    var totalMB = totalSize ? (totalSize/1048576).toFixed(0) : '?';
+    // ⚠ With gzipped chunks these HEADs report COMPRESSED lengths, so this hint
+    // reads low. It is only a progress denominator — `total` below is summed from
+    // real inflated byteLengths and is what boot uses, per the note further down.
+    var totalMB = totalSize ? (totalSize/1048576).toFixed(0) + ' compressed' : '?';
     pageLog('[rom] size hint ' + totalMB + ' MB across ' + ROM_CHUNKS.length + ' chunks');
     setStatus('Loading ' + ROM_NAME + '…');
     var total = 0;
@@ -7003,7 +7013,12 @@ window.GcRate = (function () {
       setStatus('Loading ' + (i+1) + '/' + ROM_CHUNKS.length + ' — ' + (total/1048576).toFixed(0) + ' / ' + totalMB + ' MB');
       var r = await fetch(ROM_CHUNKS[i]);
       if (!r.ok) { setStatus('Chunk fetch failed: ' + ROM_CHUNKS[i]); return; }
-      var buf = await r.arrayBuffer();
+      var buf;
+      if (/\.gz$/.test(ROM_CHUNKS[i]) && typeof DecompressionStream === 'function') {
+        buf = await new Response(r.body.pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
+      } else {
+        buf = await r.arrayBuffer();
+      }
       total += buf.byteLength;
       pageLog('[rom] chunk ' + (i+1) + '/' + ROM_CHUNKS.length + '  (' + (total/1048576).toFixed(1) + ' MB)');
       dolphin_worker.postMessage({ cmd: 'romChunk', buf: buf }, [buf]);
@@ -8130,7 +8145,7 @@ window.GcRate = (function () {
     var suffixes = ['aa', 'ab', 'ac', 'ad', 'ae', 'af'];
     discP = Promise.all([
       Promise.all(suffixes.map(function (sx) {
-        return fetch('/gamecube/roms/MarioParty4.bin.part' + sx).then(function (r) {
+        return fetch('/gamecube/roms/MarioParty4.bin.part' + sx + '.gz').then(function (r) {
           if (!r.ok) throw new Error('part' + sx + ' ' + r.status);
           return r.arrayBuffer();
         });

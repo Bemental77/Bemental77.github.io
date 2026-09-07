@@ -228,7 +228,14 @@
 (function () {
   'use strict';
   const ROM_ROOT = '/ps1/ps1Wasm/roms/';
-  function chunkRange(base, lastLetter) { var urls = []; for (var i = 'a'.charCodeAt(0); i <= lastLetter.charCodeAt(0); i++) { urls.push(ROM_ROOT + base + '.bin.parta' + String.fromCharCode(i)); } return urls; }
+  // ── GZIPPED ROM CHUNKS ────────────────────────────────────────────────
+  // The chunks ship gzipped because GitHub Pages refuses to DEPLOY an artifact
+  // over 10 GB and this site's ROM libraries do not fit beside the Dreamcast
+  // discs. Measured on real parts: GameCube 104,857,600 -> 87,120,849 (1.20x),
+  // PS1 89,128,960 -> 65,772,989 (1.36x). Modest, but 1.7 GB across the two
+  // libraries, which is the difference between deploying and not.
+  // Inflated as a STREAM so a chunk is never held twice.
+  function chunkRange(base, lastLetter) { var urls = []; for (var i = 'a'.charCodeAt(0); i <= lastLetter.charCodeAt(0); i++) { urls.push(ROM_ROOT + base + '.bin.parta' + String.fromCharCode(i) + '.gz'); } return urls; }
   const ROMS = [
     { label: 'Monster Rancher 2', base: 'MonsterRancher2', size: 451280592, chunks: chunkRange('MonsterRancher2', 'f'), chunkSizes: [89128960,89128960,89128960,89128960,89128960,5635792] },
     { label: 'Metal Gear Solid (Disc 1)', base: 'MetalGearSolidDisc1', size: 705614112, chunks: chunkRange('MetalGearSolidDisc1', 'h'), chunkSizes: [89128960,89128960,89128960,89128960,89128960,89128960,89128960,81711392] },
@@ -645,6 +652,16 @@
     return 0;
   }
   async function fetchRomLazyAndBoot() {
+    // ⚠ RANGE-BASED LAZY LOADING CANNOT READ A GZIPPED CHUNK. This path maps a
+    // guest byte offset onto a chunk by ARITHMETIC on raw chunk sizes and asks
+    // the server for that range; a compressed chunk's bytes are not the ROM's
+    // bytes, so every range would land on wrong data and the emulator would be
+    // handed a corrupt disc that still appears to load. Refuse here and let the
+    // streaming path take it — slower, but correct.
+    if (ROM_CHUNKS.some(function (u) { return /\.gz$/.test(u); })) {
+      pageLog('[rom] lazy path unavailable — chunks are gzipped; range-mapping a compressed chunk would corrupt the disc. Streaming instead.');
+      return fetchRomStreamAndBoot();   // fall THROUGH, never return empty-handed
+    }
     setStatus('Preparing lazy ROM…');
     var urls = [];
     // Use hardcoded per-chunk sizes if present (bypasses gzip-compressed Content-Length on the deployed CDN).
@@ -742,7 +759,11 @@
       setStatus('Loading ' + (i+1) + '/' + ROM_CHUNKS.length + ' — ' + (total/1048576).toFixed(0) + ' / ' + totalMB + ' MB');
       var r = await fetch(ROM_CHUNKS[i]);
       if (!r.ok) { setStatus('Chunk fetch failed: ' + ROM_CHUNKS[i]); return; }
-      var reader = r.body.getReader();
+      // Inflate in the stream so the batching below is unchanged and a chunk is
+      // never materialised whole.
+      var _body = (/\.gz$/.test(ROM_CHUNKS[i]) && typeof DecompressionStream === 'function')
+        ? r.body.pipeThrough(new DecompressionStream('gzip')) : r.body;
+      var reader = _body.getReader();
       while (true) {
         var step = await reader.read();
         if (step.done) break;

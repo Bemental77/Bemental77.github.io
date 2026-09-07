@@ -9,12 +9,16 @@ name: Deploy to GitHub Pages
 #   dreamcast/discs 5.3 GB | ps1/ps1Wasm 4.4 GB | gamecube/roms 3.4 GB
 # None of it is waste — there is no redundancy (checked: no file is tracked both
 # whole and split into parts). So the ceiling is structural, not a cleanup problem.
-# The four NEW discs are excluded below to get deploys working again; the files stay
-# in git, so re-enabling is deleting four lines once they are hosted somewhere with
-# its own budget. Excluding just those lands at 9.99 GB, which is too close to the
-# limit to be safe, hence the dev-only cuts alongside them (dreamcast/states keeps
-# ONLY pso2_boot.state, the sole state dreamcast.html fetches — verified by grep;
-# the four pioneer2 states are dev artifacts).
+# The four NEW discs are excluded below; the files stay in git, so re-enabling is
+# deleting four lines. Dev-only cuts sit alongside them (dreamcast/states keeps ONLY
+# pso2_boot.state, the sole state dreamcast.html fetches — verified by grep).
+#
+# RESOLVED: every disc AND both ROM libraries are now gzipped and inflated by the
+# pages that fetch them. Measured, all five discs included: 9.06 GB.
+#   dreamcast/discs 5.32 -> 2.52 GB   ps1/ps1Wasm 4.39 -> 2.77 GB
+#   gamecube/roms   3.29 -> 2.70 GB
+# Nothing is excluded for size any more. If this creeps back toward 10 GB the next
+# lever is n64/N64Wasm (870 MB, still raw).
 #
 # This replaces the default GH Pages deploy. The repo includes ~10 GB of dev sources
 # (emsdk, pcsx-wasm-src, gamecube/dolphin-src, bementalJIT, build artifacts) that aren't
@@ -85,10 +89,6 @@ jobs:
             --exclude='serverless.yml' \
             --exclude='send.email.js' \
             --exclude='send.email.ts' \
-            --exclude='/dreamcast/discs/cannonspike' \
-            --exclude='/dreamcast/discs/sa2' \
-            --exclude='/dreamcast/discs/gauntlet' \
-            --exclude='/dreamcast/discs/mvc2' \
             --exclude='/dreamcast/states/pso2_pioneer2_*' \
             --exclude='/ps1/duckstation-master' \
             --exclude='/gamecube/docs' \

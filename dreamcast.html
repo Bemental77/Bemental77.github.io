@@ -1825,7 +1825,7 @@
         // an SH4 crash at boot. A length check turns that into a clear error.
         { name: 'Track3.bin', bytes: 1185760800,
           parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
-                   .map(s => 'Track3.bin.part' + s) },
+                   .map(s => 'Track3.bin.part' + s + '.gz') },
         { name: 'PSO.cue' },
       ],
     },
@@ -1836,9 +1836,6 @@
     // 1,185,760,800 B. Only the PARTS are tracked, never the assembled Track3,
     // which is how pso2 ships (git ls-tree origin/prod -- dreamcast/discs/pso2).
     cannonspike: {
-      // NOT IN THE DEPLOYED ARTIFACT — see .github/workflows/deploy.yml. The files
-      // are in git; Pages has a hard 10 GB limit and the artifact hit 14.07 GB.
-      hosted: false,
       name: 'Cannon Spike (USA)',
       base: '/dreamcast/discs/cannonspike/',
       cue:  'CannonSpike.cue',
@@ -1850,14 +1847,11 @@
         { name: 'Track2.bin' },
         { name: 'Track3.bin', bytes: 1185760800,
           parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
-                   .map(s => 'Track3.bin.part' + s) },
+                   .map(s => 'Track3.bin.part' + s + '.gz') },
         { name: 'CannonSpike.cue' },
       ],
     },
     sa2: {
-      // NOT IN THE DEPLOYED ARTIFACT — see .github/workflows/deploy.yml. The files
-      // are in git; Pages has a hard 10 GB limit and the artifact hit 14.07 GB.
-      hosted: false,
       name: 'Sonic Adventure 2 (USA)',
       base: '/dreamcast/discs/sa2/',
       cue:  'SonicAdventure2.cue',
@@ -1867,7 +1861,7 @@
         { name: 'Track2.bin' },
         { name: 'Track3.bin', bytes: 1185760800,
           parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
-                   .map(s => 'Track3.bin.part' + s) },
+                   .map(s => 'Track3.bin.part' + s + '.gz') },
         { name: 'SonicAdventure2.cue' },
       ],
     },
@@ -1877,9 +1871,6 @@
     // its own `bytes` because that is the per-file assembled total the fetch path
     // asserts against, not a disc-wide figure.
     gauntlet: {
-      // NOT IN THE DEPLOYED ARTIFACT — see .github/workflows/deploy.yml. The files
-      // are in git; Pages has a hard 10 GB limit and the artifact hit 14.07 GB.
-      hosted: false,
       name: 'Gauntlet Legends (USA)',
       base: '/dreamcast/discs/gauntlet/',
       cue:  'GauntletLegends.cue',
@@ -1888,10 +1879,10 @@
         { name: 'Track1.bin' },
         { name: 'Track2.bin' },
         { name: 'Track3.bin', bytes: 487889472,
-          parts: ['aa','ab','ac','ad','ae'].map(s => 'Track3.bin.part' + s) },
+          parts: ['aa','ab','ac','ad','ae'].map(s => 'Track3.bin.part' + s + '.gz') },
         { name: 'Track4.bin' },
         { name: 'Track5.bin', bytes: 696634176,
-          parts: ['aa','ab','ac','ad','ae','af','ag'].map(s => 'Track5.bin.part' + s) },
+          parts: ['aa','ab','ac','ad','ae','af','ag'].map(s => 'Track5.bin.part' + s + '.gz') },
         { name: 'GauntletLegends.cue' },
       ],
     },
@@ -1900,9 +1891,6 @@
     // productId is mandatory in practice for .cdi: the shim's 64 KB IP.BIN scan
     // cannot see this image's header at 0x4b85988.
     mvc2: {
-      // NOT IN THE DEPLOYED ARTIFACT — see .github/workflows/deploy.yml. The files
-      // are in git; Pages has a hard 10 GB limit and the artifact hit 14.07 GB.
-      hosted: false,
       name: 'Marvel vs. Capcom 2 (USA)',
       base: '/dreamcast/discs/mvc2/',
       cue:  'MvC2.cdi',
@@ -1910,7 +1898,7 @@
       files: [
         { name: 'MvC2.cdi', bytes: 799165154,
           parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai']
-                   .map(s => 'MvC2.cdi.part' + s) },
+                   .map(s => 'MvC2.cdi.part' + s + '.gz') },
       ],
     },
   };
@@ -2906,10 +2894,35 @@
   async function fetchDiscInto(url, out, off, limit) {
     const r = await fetch(url);
     if (!r.ok) throw new Error('fetch ' + url + ' -> ' + r.status);
+    // ── GZIPPED DISC PARTS ────────────────────────────────────────────────
+    // The parts ship gzipped because GitHub Pages refuses to deploy an artifact
+    // over 10 GB and five Dreamcast discs of raw GD-ROM do not fit. A GD-ROM's
+    // high-density area is mostly padding, so the win is large and measured, not
+    // hoped for: Cannon Spike's Track3 is 1,185,760,800 B raw and 175,404,513 B
+    // gzipped, 6.8x, and one part went 99,614,720 -> 3,119,149 (32x).
+    // Inflated STRAIGHT INTO the preallocated disc buffer at its offset — the
+    // whole point of this function — so decompression costs one stream chunk,
+    // not another copy of the disc.
+    let body = r;
+    if (/\.gz$/.test(url)) {
+      if (HAS_GUNZIP) {
+        body = new Response(r.body.pipeThrough(new DecompressionStream('gzip')));
+      } else {
+        // Safari before 16.4 has no DecompressionStream. gunzipBytes is this
+        // page's own inflater, already carried for the boot seed. It needs the
+        // whole part in memory (~95 MB), which is one part, not one disc.
+        const raw = gunzipBytes(new Uint8Array(await r.arrayBuffer()));
+        if (off + raw.length > limit)
+          throw new Error(url + ' overruns the declared disc size at byte ' + off);
+        out.set(raw, off);
+        progress(raw.length);
+        return raw.length;
+      }
+    }
     // A 133 B LFS pointer would stream in as a 133 B part. The assembled-size
     // check downstream catches it, but naming it here keeps the old diagnosis.
     let w = off;
-    const n = await readBody(r, url, (chunk) => {
+    const n = await readBody(body, url, (chunk) => {
       if (w + chunk.byteLength > limit)
         throw new Error(url + ' overruns the declared disc size at byte ' + w);
       out.set(chunk, w); w += chunk.byteLength;
@@ -3018,6 +3031,18 @@
   // trying, because the alternative is a hard stop.
   async function tryPostLazy(file, base, why) {
     if (!file.parts) return false;
+    // ⚠ LAZY DISC AND GZIPPED PARTS ARE INCOMPATIBLE. The streaming path maps a
+    // guest byte range onto a part by ARITHMETIC on raw part sizes and asks the
+    // server for that range; a gzipped part's bytes are not the disc's bytes, so
+    // every range would land on the wrong data and the core would be handed a
+    // corrupt disc that still "loads". This must be refused, not attempted —
+    // and refused HERE rather than downstream, because the arming reason is a
+    // low-memory device, i.e. exactly the visitor least able to recover.
+    if (file.parts.some((n) => /\.gz$/.test(n))) {
+      pageLog('[lazydisc] not available for ' + file.name +
+              ' — its parts are gzipped, and range-mapping a compressed part would corrupt the disc');
+      return false;
+    }
     // [device-budget 2026-09-04] A THIRD arming reason: the eager path does not
     // fit this device's measured budget. Confirmed by a real device — the Xbox
     // Edge browser reported "OUT OF MEMORY" on a page whose only console-aware
