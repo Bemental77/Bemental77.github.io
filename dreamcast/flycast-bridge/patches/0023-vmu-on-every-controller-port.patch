@@ -1,0 +1,26 @@
+--- a/core/hw/maple/maple_cfg.cpp
++++ b/core/hw/maple/maple_cfg.cpp
+@@ -387,9 +387,20 @@
+ 	// is memory-only (see maple_sega_vmu::OnSetup __EMSCRIPTEN__ path). This
+ 	// runs in CORE code, whose config::Option layout is the real one, so it is
+ 	// safe (unlike forcing from the bridge TU which has a mismatched layout).
+-	if (config::MapleMainDevices[0] == MDT_SegaController
+-			&& config::MapleExpansionDevices[0][0] == MDT_None)
+-		config::MapleExpansionDevices[0][0].override(MDT_SegaVMU);
++	// EVERY controller gets its own VMU, not just port 0. Online co-op plugs a
++	// second controller on port 1 (EmscriptenWorker.cpp calls
++	// retro_set_controller_port_device for both), and the owner's requirement is
++	// that EVERY player comes away with their own memory card — "all memory cards
++	// that were used in the last game". With this loop bounded to bus 0, player 2
++	// had a controller and no card: measured as
++	//   [maple] bus: p0[1,-1,-1,-1,-1,0]  p1[-1,-1,-1,-1,-1,0]
++	// where slot 5 is the main device and slot 0 the expansion — p1's expansion
++	// empty. config::MapleExpansionDevices defaults device2.1/2.2 to MDT_None
++	// (core/cfg/option.cpp:209-210), which is why only port 0 was covered.
++	for (int bus = 0; bus < MAPLE_PORTS; ++bus)
++		if (config::MapleMainDevices[bus] == MDT_SegaController
++				&& config::MapleExpansionDevices[bus][0] == MDT_None)
++			config::MapleExpansionDevices[bus][0].override(MDT_SegaVMU);
+ #endif
+ 	for (int bus = 0; bus < MAPLE_PORTS; ++bus)
+ 	{
