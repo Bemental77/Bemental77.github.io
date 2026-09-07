@@ -389,6 +389,7 @@
     <select id="romSelect">
       <option value="pso2">Phantasy Star Online Ver. 2 (USA)</option>
       <option value="cannonspike">Cannon Spike (USA)</option>
+      <option value="sa2">Sonic Adventure 2 (USA)</option>
       <option value="mvc2">Marvel vs. Capcom 2 (USA)</option>
     </select>
     <button id="btnStart">Start</button>
@@ -1847,6 +1848,20 @@
           parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
                    .map(s => 'Track3.bin.part' + s) },
         { name: 'CannonSpike.cue' },
+      ],
+    },
+    sa2: {
+      name: 'Sonic Adventure 2 (USA)',
+      base: '/dreamcast/discs/sa2/',
+      cue:  'SonicAdventure2.cue',
+      productId: 'MK-51117',
+      files: [
+        { name: 'Track1.bin' },
+        { name: 'Track2.bin' },
+        { name: 'Track3.bin', bytes: 1185760800,
+          parts: ['aa','ab','ac','ad','ae','af','ag','ah','ai','aj','ak','al']
+                   .map(s => 'Track3.bin.part' + s) },
+        { name: 'SonicAdventure2.cue' },
       ],
     },
     // A .cdi is ONE file, not a cue plus tracks — `cue` here is really "the disc
