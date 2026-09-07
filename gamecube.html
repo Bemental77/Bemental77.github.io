@@ -15,6 +15,11 @@
        own render-path authority. -->
   <script src="/lib/capability.js"></script>
   <script src="/lib/xboxinput.js"></script>
+  <!-- Online co-op. THE HOST HALF ONLY lives on this page: the guest runs on
+       gamecube_multiplayer.html, which needs no core, no SharedArrayBuffer and
+       no ROM — a <video> and a pad. Everything below is guarded on
+       Netplay.supported() and nothing here runs without ?np=. -->
+  <script src="/lib/netplay.js"></script>
   <script>
     // NEVER PRESENT AN ENABLED START BEHIND A BROKEN PATH.
     // Measured on a desktop profile with no WebGPU adapter: this page logged
@@ -5690,7 +5695,26 @@ window.GcRate = (function () {
     var src = Module.HEAPU8.subarray(padStatus1, padStatus1 + 16);
     var arr; while (states_arrs.length > 50) states_arrs.pop();
     if (states_arrs.length > 0) { arr = states_arrs.pop(); arr.set(src); } else arr = new Uint8Array(src);
+    // PLAYER 2 IS THE REMOTE GUEST, and this is the only place pad bytes reach
+    // the core. The buffer is 16 bytes = 2 ports x 8 (input_state_cb reads
+    // g_pad[port*8 + id/8] bit (id%8), EmscriptenWorker.cpp:171-180), so port 1
+    // is bytes 8..15 and PORT 0 IS NEVER TOUCHED — the host keeps its own
+    // controller no matter what arrives over the wire. arr.set(src) above is a
+    // full recompute every poll, so a release crosses the wire as surely as a
+    // press.
+    var _rm = gcNetRemoteMask();
+    if (_rm !== null) gcNetApplyMask(arr, 8, _rm);
+    // Snapshot BEFORE postMessage: arr.buffer is transferred and unreadable
+    // afterwards. This is what the netplay test asserts on — the literal bytes
+    // handed to the emulator, not a session field.
+    if (GCNET.role === 'host') { GCNET.sentP1 = Array.prototype.slice.call(arr.subarray(0, 8));
+                                 GCNET.sentP2 = Array.prototype.slice.call(arr.subarray(8, 16)); }
     dolphin_worker.postMessage({ cmd: 'input', states: arr }, [arr.buffer]);
+    // The capture mirror rides THIS loop rather than rAF on purpose: it is a
+    // setTimeout chain, so it survives the tab being backgrounded (degraded to
+    // the timer clamp) where rAF stops dead. dreamcast.html MEASURED the rAF
+    // version painting once in 900 ms behind another tab.
+    if (GCNET.mirrorCtx) gcNetPumpMirror();
     setTimeout(pollController, 10);
   }
   var renderFrames = 0, lastFpsLog = performance.now();
@@ -7270,6 +7294,259 @@ window.GcRate = (function () {
   }
   if (isMobile) { $('desktop').style.display = 'none'; var c = $('canvas'); c.style.width = ''; c.style.height = ''; $('mobileScreen').appendChild(c); $('mobileShell').style.display = 'block'; $('mobileSplash').style.display = 'flex'; wireMobileControls(); checkOrientation(); $('mobileSplashStart').addEventListener('pointerdown', function (e) { e.preventDefault(); if (splashStartIsHeld(e.currentTarget)) return; var mSel = $('mobileRomSelect'); var dSel = $('romSelect'); if (mSel && dSel) dSel.value = mSel.value; $('mobileSplash').style.display = 'none'; startEmulator(); checkOrientation(); }); setStatus('Pick a game and tap Start.'); }
   document.addEventListener('touchstart', function (e) { if (e.target.closest('.faceBtn, .shoulderBtn, .dpadV, .dpadH, .sysBtn, .menuBtn')) {} }, { passive: true });
+
+  // ===========================================================================
+  // ONLINE CO-OP — THE HOST HALF, AND NOTHING ELSE.
+  //
+  // THE MODEL (lib/netplay.js's header states it too): ONE INSTANCE RUNS THE
+  // GAME. This page's emulator is the only emulator. It streams its picture and
+  // its sound over WebRTC and the guest sends controller state back, which lands
+  // in port 1 of the pad buffer. No lockstep, no rollback, no determinism
+  // requirement — there is only one machine to be in sync with.
+  //
+  // THE LOBBY IS NOT HERE. It is gamecube_multiplayer.html, because a GUEST
+  // needs no core, no SharedArrayBuffer and no ROM — and this page fetches a
+  // multi-hundred-megabyte disc before it can show anything. So the party forms
+  // there and only the HOST is sent here, carrying ?np=<code>&game=<base>. That
+  // keeps this file's addition to: capture a surface, open a session under the
+  // code it was handed, and drop the remote pad into port 1.
+  //
+  // THE CAPTURE PROBLEM, and why there are two arms. #canvas may or may not
+  // still belong to the main thread: the Software-Renderer path keeps it here
+  // for paintFrame2D, while the WebGPU path calls transferControlToOffscreen and
+  // the page can no longer getContext on it. dreamcast.html MEASURED that Chrome
+  // still feeds a transferred canvas' captureStream from the worker's commits —
+  // but a `video:live` track that carries nothing is indistinguishable from a
+  // working one, so this does not READ a capability, it DOES the capture and
+  // COUNTS the frames that come out. Fewer than two in 900 ms and it falls back
+  // to a mirror canvas painted with drawImage from pollController.
+  // ===========================================================================
+  var GCNET = { session: null, role: null, code: null, how: null, surface: null,
+                mirror: null, mirrorCtx: null, mirrorTicks: 0, mirrorErr: null, mirrorAt: 0,
+                sentP1: null, sentP2: null, why: null, game: null, armReason: null };
+  var GC_NET_FPS = 60;
+  // Identical spelling to dreamcast.html's netTransport and to the multiplayer
+  // page's, so one ?net=local reaches every page in a session.
+  function gcNetTransport() { return new URLSearchParams(location.search).get('net') === 'local' ? 'local' : 'peerjs'; }
+  function gcNetSupported() { return !!(window.Netplay && Netplay.supported && Netplay.supported()); }
+  // "Is there a game to stream?" answered by frames, not by a start flag:
+  // __gcStartedAtMs is set the instant Start is pressed, long before the core
+  // exists, and capturing then would publish a black canvas.
+  function gcNetLive() {
+    try {
+      var R = window.__gcRate || {};
+      return (R.published > 0) || (R.shown > 0) || (window._totalRenderFrames > 0);
+    } catch (e) { return false; }
+  }
+  // The CPU side, which is a different question and is what player 2 actually
+  // depends on: padStatus1 is the core's pad buffer and pollController is the
+  // loop that ships it, so both existing means the wire to the emulator is open
+  // whether or not anything has been DRAWN yet.
+  var _gcNetCoreUpAt = 0;
+  function gcNetCoreUp() {
+    var up = !!padStatus1 && !!dolphin_worker;
+    if (up && !_gcNetCoreUpAt) _gcNetCoreUpAt = performance.now();
+    return up;
+  }
+  // ⚠ A RENDER-PATH FAULT MUST NOT ALSO BE A CO-OP FAULT. This page has a
+  // standing, separately-tracked failure where the core runs and nothing is
+  // drawn — its own status line says "render: NO FIRST FRAME" — and MEASURED
+  // 2026-09-07 in headless Chrome with --enable-unsafe-webgpu, __gcRate read
+  // published=0 shown=0 for the whole run on 240pSuite while the core was up.
+  // Waiting for a frame forever would turn that into "online play is broken",
+  // and player 2's controller does not depend on the picture at all. So frames
+  // are PREFERRED and a running core is ACCEPTED after a grace period — and the
+  // capture arm below then MEASURES how many frames the stream really carries
+  // and says so, rather than hiding an empty picture behind a green light.
+  var GC_NET_NOFRAME_GRACE_MS = 15000;
+  function gcNetHostReady() {
+    if (!gcNetCoreUp()) return null;
+    if (gcNetLive()) return 'frames';
+    if (performance.now() - _gcNetCoreUpAt > GC_NET_NOFRAME_GRACE_MS) return 'core-up-no-frames';
+    return null;
+  }
+
+  // ---- guest -> port 1 ------------------------------------------------------
+  // ⚠ WIRE FORMAT, SHARED WITH gamecube_multiplayer.html. lib/netplay.js's
+  // sendPad carries ONE int32, and this console needs no analog bytes in it:
+  // the worker SYNTHESIZES the main stick from the d-pad bits (see the physical
+  // keyboard note above updatePadState), so the whole pad fits in the digital
+  // bitmap. Bits 0..19 are RETRO joypad ids, which is exactly the layout
+  // updatePadState composes for port 0 — including the C-stick at ids 16..19.
+  function gcNetApplyMask(bytes, base, m) {
+    m = m | 0;
+    for (var id = 0; id < 20; id++) if (m & (1 << id)) bytes[base + (id >> 3)] |= (1 << (id & 7));
+  }
+  function gcNetRemoteMask() {
+    var s = GCNET.session;
+    if (!s || GCNET.role !== 'host' || s.state !== 'connected') return null;
+    return s.remotePad() | 0;
+  }
+
+  // ---- capture --------------------------------------------------------------
+  function gcNetPumpMirror() {
+    var t = performance.now();
+    if (t - GCNET.mirrorAt < 15) return;      // pollController is a 10 ms loop; cap at ~60 Hz
+    GCNET.mirrorAt = t;
+    try { GCNET.mirrorCtx.drawImage($('canvas'), 0, 0, GCNET.mirror.width, GCNET.mirror.height); GCNET.mirrorTicks++; }
+    catch (e) { GCNET.mirrorErr = (e && e.message) ? e.message : String(e); }
+  }
+  // requestVideoFrameCallback fires once per frame actually PRESENTED, which is
+  // the only signal that separates a working track from a live-but-empty one;
+  // where it does not exist, an advancing currentTime is the fallback witness.
+  function gcNetCountFrames(stream, ms) {
+    return new Promise(function (resolve) {
+      var v = document.createElement('video');
+      v.muted = true; v.playsInline = true; v.autoplay = true;
+      try { v.srcObject = stream; } catch (e) { return resolve(0); }
+      var n = 0, done = false, iv = null;
+      var finish = function () {
+        if (done) return; done = true;
+        if (iv) clearInterval(iv);
+        try { v.pause(); v.srcObject = null; } catch (e) {}
+        resolve(n);
+      };
+      var pr = v.play(); if (pr && pr.catch) pr.catch(function () {});
+      if (typeof v.requestVideoFrameCallback === 'function') {
+        var tick = function () { n++; if (!done) { try { v.requestVideoFrameCallback(tick); } catch (e) {} } };
+        try { v.requestVideoFrameCallback(tick); } catch (e) {}
+      } else {
+        var last = -1;
+        iv = setInterval(function () { if (v.currentTime > last) { last = v.currentTime; n++; } }, 50);
+      }
+      setTimeout(finish, ms);
+    });
+  }
+  async function gcNetCaptureSurface() {
+    var c = $('canvas');
+    try {
+      var probe = c.captureStream(GC_NET_FPS);
+      var n = await gcNetCountFrames(probe, 900);
+      probe.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
+      if (n >= 2) {
+        pageLog('[net] capture arm: #canvas produced ' + n + ' frames in 900 ms — using it directly');
+        return { el: c, how: 'canvas (' + n + ' frames/900ms)' };
+      }
+      pageLog('[net] capture arm: #canvas produced only ' + n + ' frames in 900 ms — falling back to a mirror');
+    } catch (e) {
+      pageLog('[net] capture arm: captureStream on #canvas threw (' + ((e && e.message) ? e.message : e) + ') — falling back to a mirror');
+    }
+    var m = document.createElement('canvas');
+    m.width = c.width || 640; m.height = c.height || 528;
+    GCNET.mirror = m;
+    GCNET.mirrorCtx = m.getContext('2d', { alpha: false });
+    gcNetPumpMirror();                        // paint once now so frame 1 is not blank
+    var probe2 = m.captureStream(GC_NET_FPS);
+    var n2 = await gcNetCountFrames(probe2, 900);
+    probe2.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
+    pageLog('[net] capture arm: mirror canvas produced ' + n2 + ' frames in 900 ms (' + GCNET.mirrorTicks + ' paints'
+            + (GCNET.mirrorErr ? ', drawImage error: ' + GCNET.mirrorErr : '') + ')');
+    return { el: m, how: 'mirror (' + n2 + ' frames/900ms)' };
+  }
+
+  // `code` is the one gamecube_multiplayer.html ALREADY SHOWED the other player.
+  // Minting a fresh one here would silently strand a guest waiting on the old.
+  async function gcNetStartHost(code, game) {
+    if (GCNET.session) return;
+    GCNET.role = 'host'; GCNET.code = code; GCNET.game = game;
+    var surf = await gcNetCaptureSurface();
+    GCNET.surface = surf.el; GCNET.how = surf.how;
+    var s = new Netplay.Session({ game: game, host: true, code: code, transport: gcNetTransport() });
+    GCNET.session = s;
+    s.on('status', function (e) {
+      pageLog('[net] host ' + e.state + (e.detail ? ' (' + e.detail + ')' : ''));
+      if (e.state === 'connected') setStatus('Player 2 connected.');
+    });
+    // ⚠ BEFORE start(). Tracks added after the offer is created never appear in
+    // it and the guest connects to a session with no picture.
+    var got = s.attachMedia(surf.el, (typeof GcAudio !== 'undefined' && GcAudio) ? GcAudio.node : null);
+    if (!got) {
+      GCNET.why = 'attachMedia failed: ' + (s.lastError || 'unknown');
+      pageLog('[net] ' + GCNET.why + ' — the guest would get no picture');
+      GCNET.session = null; GCNET.role = null;
+      return;
+    }
+    pageLog('[net] hosting ' + game + ' as ' + code + ' via ' + gcNetTransport()
+            + '; capture = ' + surf.how + '; audio = '
+            + ((typeof GcAudio !== 'undefined' && GcAudio && GcAudio.node) ? 'tapped' : 'NOT AVAILABLE (no worklet node yet)'));
+    await s.start();
+  }
+
+  // ---- ?np=<code>&game=<base>: HANDED OVER FROM gamecube_multiplayer.html ----
+  (function gcNetHandoff() {
+    var qs = new URLSearchParams(location.search);
+    var np = (qs.get('np') || '').toUpperCase();
+    var game = qs.get('game') || '';
+    if (!np && !game) return;                          // no handoff, nothing runs
+    if (!gcNetSupported()) { pageLog('[net] handoff ignored: this browser has no WebRTC'); return; }
+    // The ROM is named by its BASE STRING, never by its index into ROMS[].
+    // CLAUDE.md records an index going stale — ROM_IDX=1 silently loaded SAB for
+    // months of "PSO" runs — and a lobby on another page cannot see this list.
+    var idx = -1;
+    for (var i = 0; i < ROMS.length; i++) if (ROMS[i].base === game) idx = i;
+    if (idx >= 0) {
+      ['romSelect', 'mobileRomSelect'].forEach(function (id) {
+        var sel = $(id); if (!sel) return;
+        sel.value = String(idx);
+        sel.dispatchEvent(new Event('change'));        // the pair mirror each other on 'change'
+      });
+      pageLog('[net] handed a session by the lobby: hosting ' + ROMS[idx].label + ' as ' + np);
+    } else if (game) {
+      pageLog('[net] handoff named an unknown game "' + game + '" — using the current selection');
+    }
+    if (!/^[A-HJ-NP-Z2-9]{5}$/.test(np)) return;
+    // The phone shell's splash waits for a Start this player already pressed —
+    // on the other page.
+    var sp = $('mobileSplash'); if (sp) sp.style.display = 'none';
+    var st = $('btnStart');
+    // NEVER override a Start the capability layer or the render gate is holding
+    // down: that button being disabled is the page saying this device cannot run
+    // the emulator, and clicking past it is the exact bug splashStartIsHeld exists
+    // to stop.
+    if (st && !st.disabled && st.getAttribute('aria-disabled') !== 'true') st.click();
+    else pageLog('[net] Start is held down — not overriding it; hosting will arm if the game runs anyway');
+    // There is no boot event to hang this off and the disc load is minutes long,
+    // so it waits for FRAMES rather than assuming a duration.
+    var iv = setInterval(function () {
+      if (GCNET.session) { clearInterval(iv); return; }
+      var why = gcNetHostReady();
+      if (!why) return;
+      clearInterval(iv);
+      GCNET.armReason = why;
+      if (why === 'core-up-no-frames') {
+        pageLog('[net] arming the session with NO FRAME YET — the core is running but nothing has '
+                + 'been drawn for ' + (GC_NET_NOFRAME_GRACE_MS / 1000) + 's. Player 2\'s controller '
+                + 'works regardless; the capture arm below reports what the picture actually carries.');
+      }
+      gcNetStartHost(np, (idx >= 0 ? ROMS[idx].base : ROM_NAME));
+    }, 250);
+  })();
+
+  // Test seam. A SIBLING of window.__gcRate / __gcGpu, not an extension of
+  // either — both already have consumers whose shape must not move. sentP1 and
+  // sentP2 are the literal bytes handed to the emulator worker, which is the
+  // only place a player-2 claim can honestly be made.
+  window.__gcNet = function () {
+    return {
+      supported: gcNetSupported(),
+      transport: gcNetTransport(),
+      role: GCNET.role,
+      state: GCNET.session ? GCNET.session.state : null,
+      code: GCNET.session ? GCNET.session.code : null,
+      game: GCNET.game,
+      capture: GCNET.how,
+      mirrorTicks: GCNET.mirrorTicks,
+      mirrorErr: GCNET.mirrorErr,
+      remotePad: (GCNET.session && GCNET.role === 'host') ? GCNET.session.remotePad() : null,
+      sentP1: GCNET.sentP1,
+      sentP2: GCNET.sentP2,
+      live: gcNetLive(),            // frames are being produced
+      coreUp: gcNetCoreUp(),        // the CPU + pad wire is open (a DIFFERENT question)
+      armReason: GCNET.armReason || null,
+      why: GCNET.why,
+      rom: (function () { var sel = $('romSelect'); return sel ? sel.value : null; })(),
+    };
+  };
 })();
 </script>
 <script>

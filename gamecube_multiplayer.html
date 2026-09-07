@@ -1,0 +1,503 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>GameCube — Play Online</title>
+<!--
+  gamecube_multiplayer.html — THE PARTY, AND PLAYER 2'S WHOLE MACHINE.
+
+  The sibling of dreamcast_multiplayer.html, and it exists for the same reason.
+  ONE browser runs an emulator: the host boots the ROM, captures its canvas and
+  audio and streams both over WebRTC; the guest sends controller state back and
+  the host drops it into port 1 of the pad buffer. So the GUEST NEEDS NO CORE,
+  NO SharedArrayBuffer, NO WebGPU AND NO ROM — a <video> and a pad.
+
+  On this console that saving is larger than on the Dreamcast. gamecube.html
+  fetches a multi-hundred-megabyte disc image in chunks, spawns a WebAssembly
+  Dolphin plus a second JIT worker across SharedArrayBuffer, and needs WebGPU
+  for a usable picture at all — gamecube.html's own render-path note records
+  that without it Dolphin force-selects the CPU Software Renderer and this build
+  draws a flat green frame. A phone or a console browser that only wants to be
+  player 2 should meet none of those requirements, and often cannot.
+
+  WHAT EACH SIDE DOES
+    HOST  picks a game, is given a code, and is handed to
+          gamecube.html?np=<code>&game=<base>. That page selects the ROM,
+          presses its own Start, waits for FRAMES (not for a start flag — the
+          flag is set before the core exists) and then hosts under THAT EXACT
+          CODE. No session is opened here for a host: navigating away would tear
+          down the RTCPeerConnection and leave a paired guest on a dead code.
+    GUEST stays here. It joins, receives the stream, and is player 2.
+          lib/netplay.js's guest retries 'peer-unavailable' rather than failing,
+          so joining while the host is still downloading is the normal case.
+
+  ⚠ NOT PROVEN HERE: that two characters move. tools/gamecube_mp_page_test.mjs
+  asserts the chain up to and including the literal byte array gamecube.html
+  hands the emulator worker for port 1 (window.__gcNet().sentP2) and stops
+  there. Whether Dolphin's second GameCube controller is configured to read that
+  port is a core question, not a page one, and is not tested from here.
+
+  NO coi-serviceworker.js ON PURPOSE — cross-origin isolation buys
+  SharedArrayBuffer, which this page has no use for, and its registration forces
+  a reload that has produced phantom "Execution context destroyed" failures in
+  the rigs. If a sibling page already registered it this page is isolated anyway
+  and still works: that worker stamps Cross-Origin-Resource-Policy: cross-origin
+  onto what it proxies, which is what lets lib/netplay.js load the PeerJS broker
+  under COEP.
+-->
+<script src="/lib/netplay.js"></script>
+<script src="/lib/netplay-ui.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0b0d10; color: #e8e8e8;
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overscroll-behavior: none; }
+  a { color: #7cc; }
+
+  #lobby { min-height: 100%; display: flex; flex-direction: column; align-items: center;
+           justify-content: center; gap: 18px; padding: 24px 14px 40px; }
+  #lobby h1 { margin: 0; font-size: 22px; font-weight: 700; }
+  #lobby .lede { margin: 0; max-width: 470px; text-align: center; color: #9aa; font-size: 13.5px; }
+  #lobbyCard { width: 100%; }
+  #back { color: #789; font-size: 13px; text-decoration: none; }
+
+  #play { position: fixed; inset: 0; display: none; background: #000; }
+  #play.on { display: block; }
+  /* ⚠ THE STREAM'S INTRINSIC RATIO IS NOT THE PICTURE'S RATIO. gamecube.html's
+     #canvas is 640x528 (:56) — a 1.2121 backing store for a console that outputs
+     4:3 — so object-fit:contain on the raw video would letterbox it at 1.2121
+     and stretch every circle. gamecube.html's own console rule (:77) pins the
+     canvas to aspect-ratio 4/3 for exactly this reason; the stage below does the
+     same thing to the received video, and object-fit:fill inside a 4:3 box is
+     what performs the correction rather than preserving the wrong ratio. */
+  #stage { position: absolute; inset: 0; margin: auto; aspect-ratio: 4 / 3;
+           max-width: 100%; max-height: 100%; }
+  #mpVideo { width: 100%; height: 100%; object-fit: fill; background: #000; display: block; }
+
+  #hud { position: absolute; top: 0; left: 0; right: 0; display: flex; gap: 8px;
+         align-items: center; padding: 8px 10px; z-index: 30;
+         background: linear-gradient(180deg, rgba(0,0,0,.65), rgba(0,0,0,0));
+         font-size: 12.5px; padding-top: max(8px, env(safe-area-inset-top)); }
+  #hudMsg { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #cde; }
+  #hud button { min-height: 34px; padding: 6px 11px; border-radius: 8px; border: 1px solid #556;
+                background: rgba(20,24,30,.85); color: #dde; font-size: 12.5px; cursor: pointer; }
+  #hud button.warn { border-color: #a55; color: #fbb; }
+
+  #pad { position: absolute; inset: 0; z-index: 20; display: none;
+         touch-action: none; -webkit-user-select: none; user-select: none; }
+  #pad.on { display: block; }
+  #disc { position: absolute; left: max(14px, env(safe-area-inset-left)); bottom: max(18px, env(safe-area-inset-bottom));
+          width: 148px; height: 148px; border-radius: 50%; border: 2px solid rgba(255,255,255,.22);
+          background: rgba(255,255,255,.07); }
+  #nub { position: absolute; left: 50%; top: 50%; width: 54px; height: 54px; margin: -27px 0 0 -27px;
+         border-radius: 50%; background: rgba(255,255,255,.30); pointer-events: none; }
+  #face { position: absolute; right: max(14px, env(safe-area-inset-right)); bottom: max(18px, env(safe-area-inset-bottom));
+          width: 176px; height: 176px; }
+  .tb { position: absolute; border-radius: 50%; border: 2px solid rgba(255,255,255,.24);
+        background: rgba(255,255,255,.10); color: #fff; font: 700 17px/1 sans-serif;
+        display: flex; align-items: center; justify-content: center; }
+  .tb.down { background: rgba(120,200,255,.55); }
+  .tb.sq { border-radius: 12px; font-size: 13px; }
+  /* GameCube face layout: a big green A with B, X and Y around it. */
+  #tA { left: 50px; top: 56px; width: 76px; height: 76px; font-size: 22px;
+        border-color: rgba(120,230,150,.55); background: rgba(90,200,120,.22); }
+  #tB { left: 8px;  top: 118px; width: 50px; height: 50px; }
+  #tX { right: 0;   top: 46px;  width: 54px; height: 54px; }
+  #tY { left: 62px; top: 0;     width: 54px; height: 54px; }
+  #tL { position: absolute; left: max(14px, env(safe-area-inset-left)); bottom: 178px; width: 74px; height: 44px; }
+  #tR { position: absolute; right: max(14px, env(safe-area-inset-right)); bottom: 224px; width: 74px; height: 44px; }
+  #tZ { position: absolute; right: max(14px, env(safe-area-inset-right)); bottom: 178px; width: 74px; height: 44px; }
+  #tS { position: absolute; left: 50%; margin-left: -46px; bottom: max(18px, env(safe-area-inset-bottom));
+        width: 92px; height: 40px; }
+
+  #unsupported { max-width: 520px; margin: 12vh auto; padding: 0 20px; }
+  #unsupported h1 { font-size: 20px; }
+</style>
+</head>
+<body>
+
+<div id="unsupported" hidden>
+  <h1>This browser cannot play online</h1>
+  <p id="unsupportedWhy" class="lede"></p>
+  <p><a href="/gamecube.html">Play on your own instead →</a></p>
+</div>
+
+<div id="lobby" hidden>
+  <h1>GameCube — Play Online</h1>
+  <p class="lede">One player loads the game; everyone else just watches and plays.
+     Player&nbsp;2 needs no ROM, no download and no WebGPU — pick <b>Join</b> on the
+     device you want to play on.</p>
+  <div id="lobbyCard"></div>
+  <a id="back" href="/gamecube.html">← single player</a>
+</div>
+
+<div id="play">
+  <div id="stage"><video id="mpVideo" playsinline autoplay></video></div>
+  <div id="hud">
+    <span id="hudMsg">Connecting…</span>
+    <button type="button" id="btnSound" hidden>🔇 Sound on</button>
+    <button type="button" id="btnPad">🎮 Controls</button>
+    <button type="button" id="btnLeave" class="warn">Leave</button>
+  </div>
+  <div id="pad">
+    <div id="disc"><div id="nub"></div></div>
+    <div id="face">
+      <div class="tb" id="tA">A</div>
+      <div class="tb" id="tB">B</div>
+      <div class="tb" id="tX">X</div>
+      <div class="tb" id="tY">Y</div>
+    </div>
+    <div class="tb sq" id="tL">L</div>
+    <div class="tb sq" id="tR">R</div>
+    <div class="tb sq" id="tZ">Z</div>
+    <div class="tb sq" id="tS">Start</div>
+  </div>
+</div>
+
+<script>
+'use strict';
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const QS = new URLSearchParams(location.search);
+
+  // NEVER RENDER WHAT CANNOT WORK — the rule lib/netplay-ui.js and
+  // lib/capability.js both apply. A control that does nothing when pressed reads
+  // as "the site is broken", which is worse than an honest explanation.
+  if (!window.Netplay || !Netplay.supported()) {
+    const missing = (typeof RTCPeerConnection !== 'function') ? 'WebRTC (RTCPeerConnection)'
+                  : (typeof BroadcastChannel !== 'function') ? 'BroadcastChannel'
+                  : 'the netplay library';
+    $('unsupportedWhy').textContent =
+      'Online play needs ' + missing + ', which this browser does not provide. ' +
+      'Single player does not need it and still works.';
+    $('unsupported').hidden = false;
+    window.__gcmp = () => ({ supported: false, missing });
+    return;
+  }
+  $('lobby').hidden = false;
+
+  // ---------------------------------------------------------------------------
+  // THE GAME LIST IS A COPY, AND THE TEST IS WHAT KEEPS IT HONEST.
+  //
+  // lib/netplay.js refuses a pairing whose game names differ, so both sides must
+  // name the same key. Fetching gamecube.html to read its ROMS[] would undo the
+  // entire point of this page — it is half a megabyte of emulator that player 2
+  // exists to avoid. So the list is copied from gamecube.html's ROMS[] and
+  // tools/gamecube_mp_page_test.mjs compares the two and FAILS on drift.
+  //
+  // The key is the ROM's `base` STRING, never its index. CLAUDE.md records an
+  // index going stale in exactly this way: ROM_IDX=1 was documented as PSO and
+  // silently loaded Sonic Adventure 2 Battle after two titles were inserted.
+  // ---------------------------------------------------------------------------
+  const GAMES = [
+    { value: 'MarioParty4',                 label: 'Mario Party 4' },
+    { value: 'SonicAdventure2Battle',       label: 'Sonic Adventure 2 Battle' },
+    { value: 'PhantasyStarOnline1And2Plus', label: 'Phantasy Star Online Episode I & II Plus' },
+    { value: '240pSuite-1.10b',             label: '240pSuite (homebrew)' },
+  ];
+  const DEFAULT_GAME = GAMES.some((g) => g.value === QS.get('game'))
+    ? QS.get('game') : 'SonicAdventure2Battle';
+
+  // BroadcastChannel pairs two tabs in ONE browser with no third party, which is
+  // what the headless test uses; PeerJS's public broker is what pairs two
+  // DEVICES. Same spelling as gamecube.html's gcNetTransport, so one ?net=local
+  // reaches both pages.
+  const transport = QS.get('net') === 'local' ? 'local' : 'peerjs';
+
+  // ===========================================================================
+  // PLAYER 2'S CONTROLLER
+  //
+  // ⚠ WIRE FORMAT SHARED WITH gamecube.html — do not drift. lib/netplay.js's
+  // sendPad carries ONE int32, and this console needs no analog bytes in it:
+  // the emulator worker SYNTHESIZES the main stick from the d-pad bits (see
+  // gamecube.html's physical-keyboard note above updatePadState), so the whole
+  // controller fits in the digital bitmap. Bits 0..19 are RETRO joypad ids,
+  // decoded by gamecube.html's gcNetApplyMask into bytes 8..15 of the 16-byte
+  // pad buffer (port 1). The ids below are exactly what updatePadState composes
+  // for port 0, byte for byte and bit for bit.
+  // ===========================================================================
+  const B = { b: 0, y: 1, select: 2, start: 3, up: 4, down: 5, left: 6, right: 7,
+              a: 8, x: 9, z: 11, l: 12, r: 13,
+              cup: 16, cdown: 17, cleft: 18, cright: 19 };
+  // Keyboard, identical to gamecube.html's own physical-keyboard map so muscle
+  // memory carries between the two pages.
+  const KEYMAP = {
+    [B.up]: ['w', 'arrowup'], [B.down]: ['s', 'arrowdown'],
+    [B.left]: ['a', 'arrowleft'], [B.right]: ['d', 'arrowright'],
+    [B.a]: ['m'], [B.b]: ['n'], [B.y]: ['j'], [B.x]: ['k'],
+    [B.l]: ['q'], [B.r]: ['r'], [B.z]: ['e'],
+    [B.start]: ['v'], [B.select]: ['c'],
+    [B.cup]: ['p'], [B.cleft]: ['l'], [B.cdown]: [';'], [B.cright]: ["'"],
+  };
+  const MAPPED = new Set(Object.values(KEYMAP).flat());
+  // Standard-mapping gamepad index -> GC button. gamecube.html reads real pads
+  // through Module._CheckJoy inside the core and publishes no table to copy, so
+  // this one is THIS PAGE'S, chosen to put the GameCube face buttons where a
+  // modern pad's are: A on the bottom button, B to its left/right neighbour.
+  const GP = [B.a, B.b, B.x, B.y, B.l, B.r, B.z, B.z,
+              B.select, B.start, -1, -1, B.up, B.down, B.left, B.right];
+
+  const held = new Set();
+  const touched = new Set();
+  const stick = { x: 0, y: 0 };
+  const norm = (e) => String(e.key || '').toLowerCase();
+  // ⚠ THE LOBBY HAS A TEXT FIELD AND THE CODE ALPHABET OVERLAPS THE KEYMAP.
+  // 'a','c','d','j','k','l','m','n','p','q','r','s','v','w' are all buttons here
+  // and all legal code characters, so a window-level preventDefault would make
+  // the Join field silently refuse most of what is typed into it. The check is
+  // on this side because lib/netplay-ui.js owns that element.
+  const typing = (e) => {
+    const t = e.target;
+    return !!t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' ||
+                   t.tagName === 'TEXTAREA' || t.isContentEditable);
+  };
+  addEventListener('keydown', (e) => {
+    if (typing(e)) return;
+    const k = norm(e);
+    if (MAPPED.has(k)) e.preventDefault();
+    held.add(k);
+  });
+  // Release is NEVER filtered: a key that went down while the field was not
+  // focused must still come up, or it stays held on the host's port 1 forever.
+  addEventListener('keyup', (e) => held.delete(norm(e)));
+  addEventListener('blur', () => { held.clear(); touched.clear(); stick.x = stick.y = 0; });
+
+  function packMask() {
+    let m = 0;
+    for (const idStr of Object.keys(KEYMAP)) {
+      if (KEYMAP[idStr].some((k) => held.has(k))) m |= (1 << (+idStr));
+    }
+    touched.forEach((id) => { m |= (1 << id); });
+
+    // ANALOG IS EXPRESSED AS D-PAD BITS, and that is not a shortcut: the
+    // emulator worker builds the main stick from these bits, so a pushed stick
+    // and a pressed d-pad are the same thing to the core. The disc is still
+    // analog on this side (it reads a direction, not a quadrant) because the
+    // threshold is what makes diagonals reachable.
+    let ax = stick.x, ay = stick.y;
+    const pads = (navigator.getGamepads && navigator.getGamepads()) || [];
+    for (let p = 0; p < pads.length; p++) {
+      const gp = pads[p]; if (!gp) continue;
+      const btns = gp.buttons || [];
+      for (let i = 0; i < btns.length && i < GP.length; i++) {
+        if (btns[i] && btns[i].pressed && GP[i] >= 0) m |= (1 << GP[i]);
+      }
+      const a = gp.axes || [], dz = 0.3;
+      if (!ax && !ay && a.length >= 2) { ax = Math.abs(a[0]) > dz ? a[0] : 0; ay = Math.abs(a[1]) > dz ? a[1] : 0; }
+      // The C-stick is a real GameCube control (camera in most games), and it
+      // has ids of its own — 16..19 — so the right stick drives it directly.
+      if (a.length >= 4) {
+        if (a[2] < -dz) m |= (1 << B.cleft);
+        if (a[2] >  dz) m |= (1 << B.cright);
+        if (a[3] < -dz) m |= (1 << B.cup);
+        if (a[3] >  dz) m |= (1 << B.cdown);
+      }
+      break;   // one remote player, one pad
+    }
+    if (!ax && !ay) {
+      ax = (held.has('d') || held.has('arrowright') ? 1 : 0) - (held.has('a') || held.has('arrowleft') ? 1 : 0);
+      ay = (held.has('s') || held.has('arrowdown')  ? 1 : 0) - (held.has('w') || held.has('arrowup')   ? 1 : 0);
+    }
+    if (ax >  0.4) m |= (1 << B.right);
+    if (ax < -0.4) m |= (1 << B.left);
+    if (ay >  0.4) m |= (1 << B.down);
+    if (ay < -0.4) m |= (1 << B.up);
+    return m | 0;
+  }
+
+  // ---- on-screen controls ---------------------------------------------------
+  const holdBtn = (elm, id) => {
+    if (!elm) return;
+    const down = (e) => { e.preventDefault(); touched.add(id); elm.classList.add('down'); };
+    const up   = (e) => { e.preventDefault(); touched.delete(id); elm.classList.remove('down'); };
+    elm.addEventListener('pointerdown', down); elm.addEventListener('pointerup', up);
+    elm.addEventListener('pointercancel', up); elm.addEventListener('pointerleave', up);
+    elm.addEventListener('touchstart', down, { passive: false });
+    elm.addEventListener('touchend', up, { passive: false });
+    elm.addEventListener('mousedown', down); elm.addEventListener('mouseup', up);
+  };
+  holdBtn($('tA'), B.a); holdBtn($('tB'), B.b); holdBtn($('tX'), B.x); holdBtn($('tY'), B.y);
+  holdBtn($('tL'), B.l); holdBtn($('tR'), B.r); holdBtn($('tZ'), B.z); holdBtn($('tS'), B.start);
+
+  (function wireDisc() {
+    const disc = $('disc'), nub = $('nub');
+    if (!disc) return;
+    let id = null;
+    const setFrom = (cx, cy) => {
+      const r = disc.getBoundingClientRect(), rad = r.width / 2;
+      let dx = (cx - (r.left + rad)) / rad, dy = (cy - (r.top + rad)) / rad;
+      const mag = Math.hypot(dx, dy);
+      if (mag > 1) { dx /= mag; dy /= mag; }
+      stick.x = dx; stick.y = dy;
+      nub.style.transform = 'translate(' + (dx * rad * 0.55) + 'px,' + (dy * rad * 0.55) + 'px)';
+    };
+    const clear = () => { stick.x = stick.y = 0; nub.style.transform = ''; id = null; };
+    disc.addEventListener('pointerdown', (e) => { e.preventDefault(); id = e.pointerId;
+      try { disc.setPointerCapture(id); } catch (_) {} setFrom(e.clientX, e.clientY); });
+    disc.addEventListener('pointermove', (e) => { if (id === e.pointerId) setFrom(e.clientX, e.clientY); });
+    ['pointerup', 'pointercancel'].forEach((t) => disc.addEventListener(t, (e) => { if (id === e.pointerId) clear(); }));
+    disc.addEventListener('touchstart', (e) => { e.preventDefault(); const t = e.touches[0]; if (t) setFrom(t.clientX, t.clientY); }, { passive: false });
+    disc.addEventListener('touchmove',  (e) => { e.preventDefault(); const t = e.touches[0]; if (t) setFrom(t.clientX, t.clientY); }, { passive: false });
+    disc.addEventListener('touchend',   (e) => { e.preventDefault(); clear(); }, { passive: false });
+  })();
+
+  const touchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints || 0) > 0;
+  let padOn = QS.has('pad') ? QS.get('pad') !== '0' : touchDevice;
+  const applyPad = () => {
+    $('pad').classList.toggle('on', padOn);
+    $('btnPad').textContent = padOn ? '🎮 Hide' : '🎮 Controls';
+  };
+  $('btnPad').addEventListener('click', () => { padOn = !padOn; applyPad(); });
+  applyPad();
+
+  // ===========================================================================
+  // THE SESSION
+  // ===========================================================================
+  const NET = { session: null, role: null, state: null, code: null, game: null,
+                mask: 0, sends: 0, tracks: null, leaving: false, saved: null };
+  const say = (t) => { $('hudMsg').textContent = t; };
+  function showPlay(on) { $('play').classList.toggle('on', !!on); $('lobby').hidden = !!on; }
+
+  async function attachStream(ms) {
+    const v = $('mpVideo');
+    NET.tracks = ms.getTracks().map((t) => t.kind + ':' + t.readyState);
+    // ⚠ ontrack FIRES ONCE PER TRACK and the host publishes video AND audio, so
+    // this arrives twice for one MediaStream. dreamcast.html measured what
+    // re-assigning srcObject then does: it aborts the first play() and leaves
+    // the element at readyState 0 with videoWidth 0 — a connected session
+    // showing nothing. Attach once.
+    if (v.srcObject === ms) return;
+    v.srcObject = ms;
+    showPlay(true);
+    startPump();
+    try { await v.play(); $('btnSound').hidden = true; }
+    catch (e) {
+      v.muted = true;
+      try { await v.play(); } catch (_) {}
+      $('btnSound').hidden = false;
+      say('Connected — sound is off until you turn it on.');
+    }
+  }
+  $('btnSound').addEventListener('click', () => {
+    const v = $('mpVideo'); v.muted = false; v.play().catch(() => {}); $('btnSound').hidden = true;
+  });
+  $('mpVideo').addEventListener('click', () => {
+    const v = $('mpVideo');
+    if (v.muted) { v.muted = false; v.play().catch(() => {}); $('btnSound').hidden = true; }
+  });
+
+  // ⚠ rAF DOES NOT FIRE IN A TAB THAT IS NOT BEING PRESENTED. dreamcast.html
+  // measured the consequence: not one input message reached the emulator for a
+  // full second with the tab behind another. A guest whose screen is about to
+  // sleep would silently stop being player 2, so a timer stands in whenever rAF
+  // has been quiet and no-ops otherwise.
+  let pumpOn = false, lastRaf = 0;
+  const now = () => (performance && performance.now ? performance.now() : Date.now());
+  function step() {
+    if (!NET.session || NET.role !== 'guest') return;
+    const m = packMask();
+    NET.mask = m; NET.sends++;
+    NET.session.sendPad(m);
+  }
+  function startPump() {
+    if (pumpOn) return;
+    pumpOn = true; lastRaf = now();
+    const loop = () => { lastRaf = now(); step(); requestAnimationFrame(loop); };
+    requestAnimationFrame(loop);
+    setInterval(() => { if (now() - lastRaf > 100) step(); }, 16);
+  }
+
+  function onStatus(e) {
+    NET.state = e.state;
+    if (e.state === 'signalling') say('Looking for the host…');
+    else if (e.state === 'connected') { say('Connected — you are Player 2.'); showPlay(true); startPump(); }
+    else if (e.state === 'closed') {
+      say(NET.leaving ? 'Left the session.' : 'The host left.');
+      setTimeout(() => showPlay(false), 1200);
+    } else if (e.state === 'failed') say('Could not connect' + (e.detail ? ': ' + e.detail : '.'));
+  }
+
+  $('btnLeave').addEventListener('click', () => {
+    NET.leaving = true;
+    try { NET.session && NET.session.close(); } catch (_) {}
+    NET.session = null; NET.role = null;
+    try { $('mpVideo').srcObject = null; } catch (_) {}
+    showPlay(false);
+    location.reload();
+  });
+
+  const ui = NetplayUI.mount({
+    game: DEFAULT_GAME,
+    games: GAMES,
+    transport,
+    container: $('lobbyCard'),
+    onHost(code, game) {
+      const q = new URLSearchParams({ np: code, game });
+      if (transport === 'local') q.set('net', 'local');
+      location.href = '/gamecube.html?' + q.toString();
+    },
+    // Called the moment the session is constructed, BEFORE start(). The stream
+    // handler has to be here: ontrack can beat the DataChannel's open, and
+    // 'connected' (which fires onReady) IS that open — subscribing in onReady
+    // can miss the only event that carries the picture.
+    onSession(session, role) {
+      NET.session = session; NET.role = role; NET.code = session.code; NET.game = session.game;
+      session.on('stream', attachStream);
+      session.on('status', onStatus);
+      // Every player comes away with their own copy of the session's save; only
+      // the host's browser ever holds the memory card that was played on.
+      // lib/netplay.js namespaces these keys :mp so a co-op card can never
+      // silently overwrite a single-player one.
+      session.on('save', async (m) => {
+        if (!m || !m.ok) { NET.saved = { ok: false, error: m && m.error }; return; }
+        try {
+          await Netplay.SaveStore.put(Netplay.Session.saveKey(session.game, 'state'), m.bytes, m.meta);
+          NET.saved = { ok: true, bytes: m.bytes.length };
+          say('Saved your copy of this session (' + m.bytes.length + ' bytes).');
+        } catch (e) { NET.saved = { ok: false, error: e.message }; }
+      });
+    },
+    onReady(session, role) {
+      NET.session = session; NET.role = role; NET.code = session.code; NET.game = session.game;
+      showPlay(true); startPump();
+      say('Connected — you are Player 2.');
+      const ms = session.remoteStream && session.remoteStream();
+      if (ms) attachStream(ms);
+    },
+  });
+  if (!ui.supported) {
+    $('lobby').hidden = true;
+    $('unsupportedWhy').textContent = 'The lobby could not start on this browser.';
+    $('unsupported').hidden = false;
+  }
+
+  // TEST SEAM. A sibling of gamecube.html's window.__gcNet / __gcRate, not an
+  // extension of either. Everything is the RESULT of doing the thing: `mask` is
+  // what was last handed to sendPad, `tracks` is what actually arrived, and
+  // videoW/H stay 0 until a frame has really been decoded.
+  window.__gcmp = () => {
+    const v = $('mpVideo');
+    return {
+      supported: true, transport,
+      games: GAMES.map((g) => g.value),
+      role: NET.role,
+      state: NET.session ? NET.session.state : NET.state,
+      code: NET.session ? NET.session.code : null,
+      game: NET.session ? NET.session.game : null,
+      mask: NET.mask, sends: NET.sends,
+      tracks: NET.tracks, saved: NET.saved,
+      padShown: $('pad').classList.contains('on'),
+      playing: $('play').classList.contains('on'),
+      videoW: v.videoWidth, videoH: v.videoHeight,
+      muted: v.muted, paused: v.paused, readyState: v.readyState,
+    };
+  };
+  // packMask is PURE — its inputs are `held`, `touched`, `stick` and the Gamepad
+  // API — so the WIRE FORMAT can be asserted with no session at all.
+  window.__gcmpMask = () => packMask();
+})();
+</script>
+</body>
+</html>
