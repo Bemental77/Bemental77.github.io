@@ -62,6 +62,13 @@ gamecube/IPL.bin filter= diff= merge= -text
 # serve LFS pointers) + LFS budget exceeded. Ship as a real blob like the others.
 gamecube/recomp/*.wasm filter= diff= merge= -text
 gba/gbaWasm/dist/*.wasm filter= diff= merge= -text
+# genesis.html's core. SHIPPED AS A 132-BYTE LFS POINTER (2026-09-07): the blanket
+# *.wasm rule at the top of this file caught it because the new page arrived without
+# an override, and GitHub Pages serves the pointer verbatim — measured live,
+# content-length 132, body "version https://git-lfs.github.com/spec/v1", against a
+# real file of 2,937,687 B. Same break as ps1/n64/gamecube above, and the reason
+# every emulator wasm needs a line here.
+genesis/genesisWasm/dist/*.wasm filter= diff= merge= -text
 snes/snesWasm/*.wasm filter= diff= merge= -text
 snes/snesWasm/roms/*.smc filter= diff= merge= -text
 ps1/*.bin filter= diff= merge= -text

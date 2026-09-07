@@ -1836,6 +1836,9 @@
     // 1,185,760,800 B. Only the PARTS are tracked, never the assembled Track3,
     // which is how pso2 ships (git ls-tree origin/prod -- dreamcast/discs/pso2).
     cannonspike: {
+      // NOT IN THE DEPLOYED ARTIFACT — see .github/workflows/deploy.yml. The files
+      // are in git; Pages has a hard 10 GB limit and the artifact hit 14.07 GB.
+      hosted: false,
       name: 'Cannon Spike (USA)',
       base: '/dreamcast/discs/cannonspike/',
       cue:  'CannonSpike.cue',
@@ -1852,6 +1855,9 @@
       ],
     },
     sa2: {
+      // NOT IN THE DEPLOYED ARTIFACT — see .github/workflows/deploy.yml. The files
+      // are in git; Pages has a hard 10 GB limit and the artifact hit 14.07 GB.
+      hosted: false,
       name: 'Sonic Adventure 2 (USA)',
       base: '/dreamcast/discs/sa2/',
       cue:  'SonicAdventure2.cue',
@@ -1871,6 +1877,9 @@
     // its own `bytes` because that is the per-file assembled total the fetch path
     // asserts against, not a disc-wide figure.
     gauntlet: {
+      // NOT IN THE DEPLOYED ARTIFACT — see .github/workflows/deploy.yml. The files
+      // are in git; Pages has a hard 10 GB limit and the artifact hit 14.07 GB.
+      hosted: false,
       name: 'Gauntlet Legends (USA)',
       base: '/dreamcast/discs/gauntlet/',
       cue:  'GauntletLegends.cue',
@@ -1891,6 +1900,9 @@
     // productId is mandatory in practice for .cdi: the shim's 64 KB IP.BIN scan
     // cannot see this image's header at 0x4b85988.
     mvc2: {
+      // NOT IN THE DEPLOYED ARTIFACT — see .github/workflows/deploy.yml. The files
+      // are in git; Pages has a hard 10 GB limit and the artifact hit 14.07 GB.
+      hosted: false,
       name: 'Marvel vs. Capcom 2 (USA)',
       base: '/dreamcast/discs/mvc2/',
       cue:  'MvC2.cdi',
@@ -1902,6 +1914,18 @@
       ],
     },
   };
+
+  // Label any disc that is not in the deployed artifact, so the picker never
+  // silently offers a game that cannot load. Local dev serves the files straight
+  // from the repo, so this only marks them when they are genuinely absent.
+  (function markUnhostedDiscs() {
+    const sel = document.getElementById('romSelect');
+    if (!sel) return;
+    for (const opt of sel.options) {
+      const g = GAMES[opt.value];
+      if (g && g.hosted === false) opt.textContent = g.name + ' — not deployed yet';
+    }
+  })();
 
   const QS = new URLSearchParams(location.search);
 
@@ -3157,6 +3181,23 @@
     const key = $('romSelect').value;
     const game = GAMES[key];
     if (!game) { setStatus('Unknown game: ' + key); return; }
+    // A disc excluded from the deploy artifact 404s part-by-part; without this the
+    // visitor gets a fetch error that says nothing about why. Local dev serves the
+    // files, so probe one part rather than trusting the flag blindly.
+    if (game.hosted === false) {
+      const first = (game.files.find((f) => f.parts) || {});
+      const probe = first.parts ? (game.base + first.parts[0]) : null;
+      let there = false;
+      if (probe) {
+        try { there = (await fetch(probe, { method: 'HEAD' })).ok; } catch (e) { there = false; }
+      }
+      if (!there) {
+        pageFail(game.name + ' is not deployed yet — its disc is in the repository but is held out of '
+               + 'the published site, which has a hard 10 GB limit. Every other title still works.');
+        $('btnStart').disabled = false;
+        return;
+      }
+    }
 
     $('btnStart').disabled = true;
     setStatus('Loading ' + game.name + '...');
