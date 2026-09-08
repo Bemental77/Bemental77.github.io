@@ -85,9 +85,15 @@ const PAGES = [
     menuBtn: '#mobileMenuBtn', menu: '#mobileMenu', menuOpenClass: 'open',
     menuNet: '#mNet', splashNet: '#mobileSplashNet' },
 
+  // ⚠ gamecube's witness is `started`, NOT frames. #rotateHint there is gated on
+  // `started` (gamecube.html:7098), and window.__gcStartedAtMs is set six lines
+  // later in the same function — an exact proxy. __gcNet().live means FRAMES ARE
+  // BEING PRODUCED, which additionally needs a GPU path this page may not get in
+  // a headless browser: measured, it stayed false for 300 s and VOIDed both cells
+  // while the overlay's own precondition had been true the whole time.
   { name: 'gamecube', url: '/gamecube.html',
     shell: '#mobileShell', start: '#mobileSplashStart',
-    seam: '__gcNet', liveField: 'live', liveMs: 300000,
+    liveExpr: '!!window.__gcStartedAtMs', liveMs: 120000,
     menuBtn: '#mobileMenuBtn', menu: '#mobileMenu', menuOpenClass: 'open',
     menuNet: null, splashNet: null },       // this page has no mobile netplay entry
 
@@ -294,13 +300,17 @@ async function cell(spec, orient) {
     const t0 = Date.now();
     let live = false;
     while (Date.now() - t0 < spec.liveMs) {
-      live = await page.evaluate((s, f) => {
-        try { const r = window[s] && window[s](); return !!(r && r[f]); } catch (e) { return false; }
-      }, spec.seam, spec.liveField).catch(() => false);
+      live = await page.evaluate((s, f, expr) => {
+        try {
+          if (expr) return !!eval(expr);
+          const r = window[s] && window[s](); return !!(r && r[f]);
+        } catch (e) { return false; }
+      }, spec.seam || '', spec.liveField || '', spec.liveExpr || '').catch(() => false);
       if (live) break;
       await sleep(2000);
     }
-    out.push(`    live witness window.${spec.seam}().${spec.liveField} = ${live}` +
+    const witness = spec.liveExpr || ('window.' + spec.seam + '().' + spec.liveField);
+    out.push(`    live witness ${witness} = ${live}` +
              ` after ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     if (!live) {
       rec.verdict = 'VOID';

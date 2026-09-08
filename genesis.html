@@ -107,18 +107,53 @@
     .sysBtn { height: 28px; padding: 0 16px; border-radius: 14px; background: linear-gradient(180deg, rgba(90,90,90,0.8), rgba(50,50,50,0.8)); border: 1px solid #222; color: #ccc; font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
     .sysBtn.held { filter: brightness(0.6); }
     .menuBtn { width: 36px; height: 36px; border-radius: 18px; background: linear-gradient(180deg, #777 0%, #444 100%); border: 2px solid #222; color: #fff; font-size: 18px; font-weight: 700; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
-    #mobileMenu { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 2000; align-items: center; justify-content: center; }
+    /* SCROLLABLE, and centred with `margin: auto` on the box rather than
+       `align-items: center`: a centred flex item that overflows its container
+       has its TOP edge clipped and cannot be scrolled back to. */
+    #mobileMenu { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.8); z-index: 2000;
+      overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 10px; box-sizing: border-box; }
     #mobileMenu.open { display: flex; }
-    #mobileMenuBox { background: #222; color: #eee; border-radius: 10px; padding: 20px; min-width: 240px; text-align: center; }
+    #mobileMenuBox { margin: auto; background: #222; color: #eee; border-radius: 10px; padding: 20px; min-width: 240px; text-align: center; }
     #mobileMenuBox h6 { margin: 0 0 14px; font-size: 12px; text-transform: uppercase; letter-spacing: 2px; color: #888; }
     #mobileMenuBox button { display: block; width: 100%; margin-bottom: 8px; padding: 10px; border: 1px solid #444; background: #2c2c2c; color: #eee; border-radius: 6px; font-size: 14px; }
+    /* SHORT VIEWPORT — a phone in LANDSCAPE is ~390 px tall, and this single
+       column of entries is taller than that, so the last ones (Play Online and
+       Close among them) sat BELOW THE FOLD with a centred flex item's top edge
+       clipped and unscrollable. Two columns fit, and #mobileMenu scrolls now as
+       a backstop. Measured before this: #mNet rect top=434 in a 390 px
+       viewport, elementFromPoint at its centre returned a different button. */
+    @media (max-height: 520px) {
+      #mobileMenuBox { display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+        min-width: min(430px, 92vw); padding: 12px 14px; }
+      #mobileMenuBox h6 { grid-column: 1 / -1; margin: 0 0 2px; }
+      #mobileMenuBox button { margin-bottom: 0; padding: 7px 8px; font-size: 13px; }
+    }
     #mobileSplash { display: none; position: absolute; inset: 0; flex-direction: column; align-items: center; justify-content: center; gap: 16px; padding: 24px; z-index: 2000; color: #eee; background: linear-gradient(180deg, #1a1a1a 0%, #0a0a0a 100%); text-align: center; }
     #mobileSplash h3 { margin: 0 0 4px; font-size: 22px; }
     #mobileSplash select, #mobileSplash button { font-size: 16px; padding: 12px 20px; min-width: 240px; border-radius: 8px; border: 1px solid #444; background: #222; color: #fff; -webkit-appearance: none; }
     #mobileSplash button#mobileSplashStart { background: #2a6b4a; border-color: #2a6b4a; }
     #mobileSplash .rotateTip { font-size: 12px; opacity: 0.55; }
     #mobileStatus { position: absolute; top: 8px; width: 100%; text-align: center; color: #888; z-index: 1500; font-size: 12px; pointer-events: none; }
-    #rotateHint { display: none; position: fixed; inset: 0; background: #111; color: #eee; align-items: center; justify-content: center; font-size: 18px; text-align: center; z-index: 3000; padding: 40px; }
+    /* [portrait-gate FIX 2026-09-08] A HINT MUST NOT BE A GATE. Shared verbatim
+       with dreamcast.html, gamecube.html, ps1.html, snes.html, genesis.html and
+       n64/index.html, all of which shipped the identical overlay.
+       It was `position: fixed; inset: 0; background: #111; z-index: 3000` — an
+       OPAQUE FULL-SCREEN PANEL shown whenever the emulator was running and the
+       device was in portrait. MEASURED on dreamcast.html at 390x844 with the
+       core running: document.elementFromPoint at the centre of #mobileMenuBtn
+       returned #rotateHint, and the hint measured rect=0,0,390x844 — the menu
+       button, START, the d-pad, the face buttons and Play Online were ALL
+       unreachable in portrait. Four of the six pages had no dismiss gesture at
+       all, so on those it was a permanent lock-out, not a nuisance.
+       It is now a small pill that CANNOT intercept a touch (pointer-events:
+       none) and retires itself after a few seconds. Do not restore `inset: 0`. */
+    #rotateHint { display: none; position: fixed; left: 50%; transform: translateX(-50%);
+      top: calc(env(safe-area-inset-top, 0px) + 8px);
+      max-width: min(84vw, 320px); box-sizing: border-box;
+      align-items: center; justify-content: center; text-align: center;
+      background: rgba(17,17,17,0.86); color: #eee; border: 1px solid #3a3a3a;
+      border-radius: 999px; font-size: 13px; line-height: 1.3; padding: 7px 16px;
+      z-index: 3000; pointer-events: none; }
     #toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); padding: 10px 18px; border-radius: 6px; background: rgba(0,0,0,0.85); color: #fff; font-size: 13px; z-index: 9999; opacity: 0; transition: opacity 0.2s; pointer-events: none; max-width: 90vw; }
     #toast.show { opacity: 1; }
     #toast.err { background: rgba(170, 40, 40, 0.95); }
@@ -277,7 +312,7 @@
       <button id="mClose">Close</button>
     </div>
   </div>
-  <div id="rotateHint">Rotate your device to landscape to play.</div>
+  <div id="rotateHint">Landscape gives a bigger picture.</div>
 </div>
 <div id="toast"></div>
 
@@ -831,10 +866,23 @@
   if (navigator.getGamepads) requestAnimationFrame(pollGamepads);
 
   // ── mobile shell ──────────────────────────────────────────────────────────
+  // [portrait-gate FIX 2026-09-08] The hint is a NON-BLOCKING pill now
+  // (pointer-events: none — see its CSS), and it retires itself after
+  // ROTATE_HINT_MS so it does not sit on the picture forever. Rotating back to
+  // landscape re-arms it for the next portrait.
+  var ROTATE_HINT_MS = 5000;
+  var _rotRetired = false, _rotTimer = 0;
+  function rotateHintTick(show) {
+    $('rotateHint').style.display = show ? 'flex' : 'none';
+    if (show && !_rotTimer) {
+      _rotTimer = setTimeout(function () { _rotTimer = 0; _rotRetired = true; checkOrientation(); }, ROTATE_HINT_MS);
+    } else if (!show && _rotTimer) { clearTimeout(_rotTimer); _rotTimer = 0; }
+  }
   function checkOrientation() {
     if (!isMobile) return;
     var landscape = window.innerWidth > window.innerHeight;
-    $('rotateHint').style.display = (running && !landscape) ? 'flex' : 'none';
+    if (landscape) _rotRetired = false;
+    rotateHintTick(running && !landscape && !_rotRetired);
   }
   window.addEventListener('resize', checkOrientation);
   window.addEventListener('orientationchange', checkOrientation);

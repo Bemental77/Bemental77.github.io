@@ -456,16 +456,30 @@
         }
 
         /* MOBILE MENU OVERLAY */
+        /* SCROLLABLE, and the box is centred with `margin: auto` rather than
+           `align-items: center`: a centred flex item that overflows its
+           container has its TOP edge clipped and cannot be scrolled back to.
+           A phone in LANDSCAPE is ~390 px tall and this card carries nine
+           entries, so Play Online and Close were below the fold. */
         #spMenuOverlay {
             display: none;
             position: fixed;
             inset: 0;
             background: rgba(0,0,0,0.75);
             z-index: 9999;
-            align-items: center;
-            justify-content: center;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            padding: 10px;
+            box-sizing: border-box;
         }
         #spMenuOverlay.open { display: flex; }
+        #spMenuOverlay .sp-overlay-box { margin: auto; }
+        @media (max-height: 520px) {
+          .sp-overlay-box { display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+            min-width: min(430px, 92vw); padding: 12px 16px; }
+          .sp-overlay-box h6, .sp-overlay-box hr { grid-column: 1 / -1; margin: 0; }
+          .sp-overlay-box .btn { margin-bottom: 0 !important; padding: 7px 8px; font-size: 13px; }
+        }
 
         /* ── MOVABLE-CONTROL EDIT MODE ────────────────────────────────
            touch-action:none on a draggable is required, not cosmetic: without it

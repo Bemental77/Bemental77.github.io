@@ -205,6 +205,18 @@
     #mobileMenuBox h6 { margin: 0 0 14px; font-size: 12px; text-transform: uppercase; letter-spacing: 2px; color: #888; }
     #mobileMenuBox button { display: block; width: 100%; margin-bottom: 8px; padding: 10px; border: 1px solid #444; background: #2c2c2c; color: #eee; border-radius: 6px; font-size: 14px; cursor: pointer; }
     #mobileMenuBox button:last-child { margin-bottom: 0; }
+    /* SHORT VIEWPORT — a phone in LANDSCAPE is ~390 px tall, and this single
+       column of entries is taller than that, so the last ones (Play Online and
+       Close among them) sat BELOW THE FOLD with a centred flex item's top edge
+       clipped and unscrollable. Two columns fit, and #mobileMenu scrolls now as
+       a backstop. Measured before this: #mNet rect top=434 in a 390 px
+       viewport, elementFromPoint at its centre returned a different button. */
+    @media (max-height: 520px) {
+      #mobileMenuBox { display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+        min-width: min(430px, 92vw); padding: 12px 14px; }
+      #mobileMenuBox h6 { grid-column: 1 / -1; margin: 0 0 2px; }
+      #mobileMenuBox button { margin-bottom: 0; padding: 7px 8px; font-size: 13px; }
+    }
     /* [portrait-gate FIX 2026-09-08] A HINT MUST NOT BE A GATE.
        This was `position: fixed; inset: 0; background: #111; z-index: 3000` — an
        OPAQUE FULL-SCREEN PANEL shown whenever `booted && !landscape`, i.e. the
@@ -5040,8 +5052,17 @@
   // The fix belongs here rather than in any one handler: every tapBind caller
   // (the ≡ menu, the splash's Start and Diagnostics, the show-controls hint)
   // reveals or hides something under the finger.
+  // ⚠ ONLY A TRUSTED CLICK. The first cut of this swallowed every click for
+  // 500 ms, and the very first casualty was the page's OWN
+  // `$('btnStart').click()` — the splash's Start handler dispatches it from
+  // inside the pointerdown that arms the swallower, so the emulator silently
+  // never started: splash hidden, status still "Pick a game and tap Start.",
+  // btnStart never entered. MEASURED as `WINDOW-CAPTURE click -> #btnStart
+  // trusted=false` with no listener on the target ever running.
+  // `isTrusted` is the exact discriminator: a browser-synthesised ghost click is
+  // trusted, an `element.click()` is not.
   function swallowGhostClick() {
-    const kill = (ev) => { ev.stopPropagation(); ev.preventDefault(); done(); };
+    const kill = (ev) => { if (!ev.isTrusted) return; ev.stopPropagation(); ev.preventDefault(); done(); };
     const done = () => { window.removeEventListener('click', kill, true); clearTimeout(t); };
     const t = setTimeout(done, 500);   // expire if no click follows (mouse, cancelled tap)
     window.addEventListener('click', kill, true);
