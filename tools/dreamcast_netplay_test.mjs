@@ -195,6 +195,15 @@ await guest.evaluate((g, c) => {
   document.getElementById('netCodeIn').value = c;
   document.getElementById('netGo').click();
 }, GAME, code || '');
+
+// ⚠ THE HOST IS ASKED FIRST — docs/audit-2026-09-08.md. An inbound peer is held
+// with no media, no input and no save until a human allows it; lib/netplay.js
+// draws the dialog, so dreamcast.html needed no change to get it.
+const prompt = await until(host, () => !!document.getElementById('npApproveAllow'), 60000);
+prompt ? ok('host-is-asked-before-anything-flows', 'Allow/Deny raised on the host before any media or input')
+       : bad('host-is-asked-before-anything-flows', 'no approval dialog — a code guesser would have been let in');
+await host.evaluate(() => { const b = document.getElementById('npApproveAllow'); if (b) b.click(); });
+
 const gConn = await until(guest, () => window.__dcNet().state === 'connected', 60000);
 const hConn = await until(host,  () => window.__dcNet().state === 'connected', 60000);
 (gConn && hConn) ? ok('peers-connected', 'both sides report connected')

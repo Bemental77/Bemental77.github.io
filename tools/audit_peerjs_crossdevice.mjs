@@ -257,6 +257,22 @@ try {
     document.querySelector('#lobbyCard .np-act button').click();
   }, P.game, code || '');
 
+  // ⚠ THE HOST IS ASKED FIRST, over the real broker path too — added
+  // 2026-09-08 with the fix for this file's own "any session can be joined by a
+  // stranger" finding. The broker id is now PBKDF2-derived rather than
+  // `bemental-<CODE>-h`, so this arm is also the only coverage of the derived
+  // id actually registering and resolving on the public broker.
+  const prompt = await until(host, () => {
+    const p = document.getElementById('npApprove');
+    if (!p) return null;
+    const s = document.getElementById('npApproveSas');
+    return { sas: s ? s.getAttribute('data-sas') : null, allow: !!document.getElementById('npApproveAllow') };
+  }, 150000, 500);
+  prompt && prompt.allow
+    ? ok('host-is-asked-before-anything-flows', `Allow/Deny raised over the BROKER path with confirmation code ${prompt.sas}`)
+    : bad('host-is-asked-before-anything-flows', 'no approval dialog — a code guesser would have been let straight in');
+  await host.evaluate(() => { const b = document.getElementById('npApproveAllow'); if (b) b.click(); });
+
   const gConn = await until(guest, (s) => window[s]().state === 'connected' || null, 150000, 500, P.guestSeam);
   const hConn = await until(host,  (s) => window[s]().state === 'connected' || null, 30000,  500, P.hostSeam);
   (gConn && hConn)

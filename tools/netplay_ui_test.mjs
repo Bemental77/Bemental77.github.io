@@ -55,6 +55,24 @@ await guest.evaluate((c) => {
   i.dispatchEvent(new Event('change'));
 }, code);
 
+// ⚠ THE HOST IS ASKED FIRST. Since docs/audit-2026-09-08.md, an inbound peer is
+// held with no media, no input and no save until a human allows it. The lobby
+// does not draw its own dialog, so lib/netplay.js's built-in one appears on the
+// host page — and clicking it is now part of the flow this suite covers.
+const prompt = await (async () => { for (let i=0;i<100;i++){
+  const s = await host.evaluate(() => { const p = document.getElementById('npApprove');
+    return p ? { sas: document.getElementById('npApproveSas').getAttribute('data-sas'),
+                 allow: !!document.getElementById('npApproveAllow') } : null; });
+  if (s) return s; await new Promise(r=>setTimeout(r,200)); } return null; })();
+prompt && prompt.allow
+  ? ok('host-is-asked-before-anything-flows', `Allow/Deny raised on the host with confirmation code ${prompt.sas}`)
+  : bad('host-is-asked-before-anything-flows', 'no approval dialog appeared — a guesser would have been let straight in');
+const beforeAllow = await host.evaluate(() => NetplayUI.session.admission());
+(beforeAllow.approved === false && beforeAllow.offered === false)
+  ? ok('no-offer-before-allow', 'the host has not created an SDP offer yet — the tracks have not left the page')
+  : bad('no-offer-before-allow', JSON.stringify(beforeAllow));
+await host.evaluate(() => document.getElementById('npApproveAllow').click());
+
 const settled = async (p) => { for (let i=0;i<80;i++){
   const s = await p.evaluate(()=>document.querySelectorAll('.np-p')[1].querySelector('.np-dot').className);
   if (s.includes('on')) return true; await new Promise(r=>setTimeout(r,200)); } return false; };

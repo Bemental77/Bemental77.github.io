@@ -383,6 +383,33 @@ async function run(key, browser, res) {
     document.querySelector('#lobbyCard .np-in').value = c;
     document.querySelector('#lobbyCard .np-act button').click();            // Join
   }, P.game, code || '');
+
+  // ---- 4b. THE HOST IS ASKED FIRST ---------------------------------------
+  // docs/audit-2026-09-08.md found that knowing the 5-character code was enough
+  // to receive the host's live video and audio, inject player-2 input and take
+  // the end-of-session save. An inbound peer is now held with none of that
+  // until a human on the host's machine allows it. lib/netplay.js draws the
+  // dialog itself, so every one of these pages gets it without a page edit —
+  // and reaching 'connected' below now REQUIRES this click.
+  console.log('  ── the host is asked before anything flows');
+  const prompt = await until(host, () => {
+    const p = document.getElementById('npApprove');
+    if (!p) return null;
+    const s = document.getElementById('npApproveSas');
+    return { sas: s ? s.getAttribute('data-sas') : null, allow: !!document.getElementById('npApproveAllow') };
+  }, 90000, 250);
+  prompt && prompt.allow
+    ? ok('host-is-asked-before-anything-flows', `Allow/Deny raised on ${P.hostPage} with confirmation code ${prompt.sas}`)
+    : bad('host-is-asked-before-anything-flows', 'no approval dialog — a code guesser would have been let straight in');
+  const preAllow = await host.evaluate(() => {
+    const sess = window.Netplay && Netplay.hostSession();
+    return sess ? sess.admission() : null;
+  }).catch(() => null);
+  (preAllow && preAllow.approved === false && preAllow.offered === false)
+    ? ok('no-offer-before-allow', 'the host has created no SDP offer yet — the tracks have not left the page')
+    : bad('no-offer-before-allow', J(preAllow));
+  await host.evaluate(() => { const b = document.getElementById('npApproveAllow'); if (b) b.click(); });
+
   const gConn = await until(guest, (s) => window[s]().state === 'connected' || null, 90000, 250, null, P.guestSeam);
   const hConn = await until(host, (s) => window[s]().state === 'connected' || null, 90000, 250, null, P.hostSeam);
   (gConn && hConn) ? ok('peers-connected', 'both sides report connected')

@@ -42,12 +42,19 @@ const code = await host.evaluate(() => Netplay.makeCode(5));
 /^[A-HJ-NP-Z2-9]{5}$/.test(code) ? ok('code-format', `"${code}" — no look-alike characters`)
                                  : bad('code-format', code);
 
+// ⚠ A HOST NOW ADMITS NOBODY UNTIL A HUMAN SAYS SO (docs/audit-2026-09-08.md:
+// "any session can be joined by a stranger"). Registering a 'join-request'
+// handler is what a page does instead of taking the built-in Allow/Deny dialog;
+// this rig approves from it, which is also how the arm below asserts that the
+// request really was raised and carried a confirmation code.
 const boot = async (page, isHost) => page.evaluate(async (code, isHost) => {
   window.__log = [];
+  window.__req = null;
   const s = new Netplay.Session({ game: 'gauntlet', host: isHost, code, transport: 'local', delayFrames: 0 });
   window.__s = s;
   s.on('status', (e) => window.__log.push(e.state + (e.detail ? ':' + e.detail : '')));
   s.on('sync', (m) => { window.__sync = m.payload; });
+  if (isHost) s.on('join-request', (r) => { window.__req = { id: r.id, sas: r.sas, game: r.game }; r.approve(); });
   await s.start();
   return true;
 }, code, isHost);
@@ -69,6 +76,19 @@ const wait = async (p) => {
 const [hc, gc] = [await wait(host), await wait(guest)];
 (hc && gc) ? ok('datachannel-open', 'both peers report connected')
            : bad('datachannel-open', `host=${hc} guest=${gc} hostLog=${JSON.stringify(await host.evaluate(() => window.__log))}`);
+
+// The pairing above only happened because the host was ASKED and answered. The
+// request itself is the new thing: it carries a confirmation code both sides
+// derive from the room key, so a host reading it out can tell whether they are
+// talking to the person they invited.
+const req = await host.evaluate(() => window.__req);
+const gsas = await guest.evaluate(() => window.__s.sas);
+(req && /^[A-HJ-NP-Z2-9]{4}$/.test(req.sas || ''))
+  ? ok('host-was-asked-first', `join-request raised for game="${req.game}" with confirmation code ${req.sas} — no media, no input, no save until approve()`)
+  : bad('host-was-asked-first', JSON.stringify(req));
+(req && gsas && req.sas === gsas)
+  ? ok('confirmation-code-matches-on-both-sides', `${req.sas} — derived from the room key and the challenge, not sent in the clear`)
+  : bad('confirmation-code-matches-on-both-sides', `host=${req && req.sas} guest=${gsas}`);
 
 console.log('\n== input exchange ==');
 // Each side pushes a distinct value per frame; each must SEE the other's value.
@@ -117,6 +137,10 @@ await host.evaluate(async (c) => {
   window.__hctx = ctx; window.__htone = tone;
   const s = new Netplay.Session({ game: 'gauntlet', host: true, code: c, transport: 'local' });
   window.__h2 = s;
+  window.__h2req = null;
+  // Same as above: the stream does not leave this page until this fires and is
+  // answered. window.__h2.admission().offered stays false until then.
+  s.on('join-request', (r) => { window.__h2req = { id: r.id, sas: r.sas }; r.approve(); });
   window.__captured = s.attachMedia(cv, tone);     // BEFORE start(), or no track
   await s.start();
 }, code3);

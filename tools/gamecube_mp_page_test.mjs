@@ -227,6 +227,31 @@ await guest.evaluate((g, c) => {
   document.querySelector('#lobbyCard .np-in').value = c;
   document.querySelector('#lobbyCard .np-act button').click();          // Join
 }, GAME, code || '');
+
+// ⚠ THE HOST IS ASKED FIRST — docs/audit-2026-09-08.md. Knowing the 5-character
+// code used to be enough to receive gamecube.html's live video and audio, inject
+// player-2 input and take the end-of-session save. lib/netplay.js now holds an
+// inbound peer with none of that until a human allows it, and draws the dialog
+// itself, so gamecube.html needed no change to get it.
+console.log('\n== the host is asked before anything flows ==');
+const prompt = await until(host, () => {
+  const p = document.getElementById('npApprove');
+  if (!p) return null;
+  const s = document.getElementById('npApproveSas');
+  return { sas: s ? s.getAttribute('data-sas') : null, allow: !!document.getElementById('npApproveAllow') };
+}, 90000);
+prompt && prompt.allow
+  ? ok('host-is-asked-before-anything-flows', `Allow/Deny raised on gamecube.html with confirmation code ${prompt.sas}`)
+  : bad('host-is-asked-before-anything-flows', 'no approval dialog — a code guesser would have been let straight in');
+const preAllow = await host.evaluate(() => {
+  const s = window.Netplay && Netplay.hostSession();
+  return s ? s.admission() : null;
+}).catch(() => null);
+(preAllow && preAllow.approved === false && preAllow.offered === false)
+  ? ok('no-offer-before-allow', 'the host has created no SDP offer yet — the tracks have not left the page')
+  : bad('no-offer-before-allow', JSON.stringify(preAllow));
+await host.evaluate(() => { const b = document.getElementById('npApproveAllow'); if (b) b.click(); });
+
 const gConn = await until(guest, () => window.__gcmp().state === 'connected', 60000);
 const hConn = await until(host,  () => window.__gcNet().state === 'connected', 60000);
 (gConn && hConn) ? ok('peers-connected', 'both sides report connected')
