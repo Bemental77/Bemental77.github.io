@@ -422,6 +422,22 @@ const HARNESSES = [
     requires: ['tools/verify_deployed_matches_repo.mjs'],
     timeoutMs: 10 * MIN,
   },
+  // ⚠ THIS GATE IS RED ON PURPOSE, AND IT IS THE MOST IMPORTANT ROW HERE.
+  // Streaming was cancelled by user directive — every player runs their own core
+  // and only pad bytes cross the wire. Dreamcast was converted; thirteen pages
+  // were not, and NOTHING NOTICED, because no test asserted the architecture.
+  // Every one of those pages passes its own suite by correctly implementing the
+  // thing that was cancelled. It goes green as each page is ported.
+  {
+    name: 'no-streaming',
+    file: 'tools/no_streaming_test.mjs',
+    cmd: ['node', 'tools/no_streaming_test.mjs'],
+    desc: 'every page that offers online play drives the lockstep frame loop and carries NO streaming machinery — a requirement that lived only in a conversation until now, which is why thirteen pages kept streaming while passing all their tests',
+    fast: true, ci: true,
+    server: false,
+    requires: ['dreamcast.html'],
+    timeoutMs: 5 * MIN,
+  },
   {
     name: 'netplay-lockstep',
     file: 'tools/netplay_lockstep_test.mjs',
