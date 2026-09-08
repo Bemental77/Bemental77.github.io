@@ -387,10 +387,9 @@
     /* ---- Online play -------------------------------------------------------
        The lobby is a modal in the same idiom as #controlsOverlay (dark sheet,
        one card, 44 px hit targets) so it reads as part of the page rather than
-       a bolted-on feature. #netVideo is the GUEST's screen: it stands exactly
-       where #dc-canvas stands, in whichever container the canvas was put into
-       (#canvasWrap on desktop, #mobileScreen on the phone shell), so the touch
-       pad and the keyboard keep working underneath it unchanged. */
+       a bolted-on feature. There is no #netVideo any more: it was the GUEST's
+       screen under the streaming model, and streaming is cancelled — every
+       player renders their own #dc-canvas from their own core. */
     #netOverlay { display: none; position: fixed; inset: 0; z-index: 99999;
       background: rgba(0,0,0,.72); align-items: center; justify-content: center; }
     #netOverlay.on { display: flex; }
@@ -419,21 +418,82 @@
     #netStatus.bad  { border-color: #f85149; color: #ff7b72; }
     #netStatus.busy { border-color: #9e6a03; color: #ffa657; }
     .netActions { display: flex; gap: 8px; margin-top: 14px; justify-content: flex-end; }
-    /* The guest's picture. Sized like the canvas it stands in for, in every
-       layout the canvas itself has a rule for (desktop, fullscreen, console,
-       phone shell) — a video that keeps 640x480 inside a fullscreen wrap would
-       be the same 14.8%-of-the-screen bug the .console-ua rules above fix. */
-    #netVideo { display: none; background: #000; image-rendering: pixelated;
-      width: 640px; height: 480px; max-width: 100%; max-height: 100%; object-fit: contain; }
-    #netVideo.on { display: block; }
-    #canvasWrap:fullscreen #netVideo, #canvasWrap:-webkit-full-screen #netVideo {
-      width: auto; height: 100vh; max-width: 100vw; max-height: 100vh; }
-    @media (min-aspect-ratio: 4/3) { #canvasWrap:fullscreen #netVideo,
-      #canvasWrap:-webkit-full-screen #netVideo { width: calc(100vh * 4 / 3); } }
-    @media (max-aspect-ratio: 4/3) { #canvasWrap:fullscreen #netVideo,
-      #canvasWrap:-webkit-full-screen #netVideo { width: 100vw; height: calc(100vw * 3 / 4); } }
-    .console-ua #netVideo { width: auto; height: 100%; max-width: 100%; max-height: 100%; aspect-ratio: 4 / 3; }
-    @media (max-aspect-ratio: 4/3) { .console-ua #netVideo { width: 100%; height: auto; aspect-ratio: 4 / 3; } }
+
+    /* ---- THE ROOM ----------------------------------------------------------
+       Online play is a ROOM, not a pair. The Dreamcast has four controller
+       ports (flycast-src/core/hw/maple/maple_devs.h:193 MAPLE_PORTS 4) and
+       Gauntlet Legends is a four-player game, so a lobby that can only seat two
+       is not the product. One row per PORT, and the port count comes from the
+       engine — writing a 4 here would be wrong on the next console. */
+    #netRoom { margin-top: 14px; }
+    #netRoster { list-style: none; margin: 6px 0 0; padding: 0; }
+    #netRoster li { display: flex; align-items: center; gap: 8px; padding: 7px 9px;
+      border: 1px solid #30363d; border-radius: 6px; margin-bottom: 6px; background: #0d1117;
+      font: 12px/1.4 ui-monospace, Menlo, monospace; }
+    #netRoster li .port { color: #8bd; font-weight: 700; min-width: 2.4em; }
+    #netRoster li .who { flex: 1 1 auto; color: #e6edf3; overflow: hidden; text-overflow: ellipsis; }
+    #netRoster li .state { font-size: 11px; }
+    #netRoster li.you { border-color: #2ea043; }
+    #netRoster li.you .who { color: #7ee787; }
+    #netRoster li.free { opacity: .5; }
+    #netRoster li.free .who { color: #7d8fa3; font-style: italic; }
+    #netRoster li.loading .state { color: #ffa657; }
+    #netRoster li.ready .state { color: #7ee787; }
+    #netRoster li.gone { border-color: #f85149; }
+    #netRoster li.gone .state { color: #ff7b72; }
+    /* PER-PLAYER LOAD PROGRESS, not a global spinner. The discs here run to
+       1,131 MB and a phone on mobile data is a normal case — "still loading"
+       has to be visible PER PERSON so three people can see which one they are
+       waiting for instead of staring at a frozen room. */
+    #netRoster li .bar { flex: 0 0 72px; height: 5px; border-radius: 3px; background: #21262d; overflow: hidden; }
+    #netRoster li .bar i { display: block; height: 100%; background: #3fb950; width: 0; transition: width .3s linear; }
+    #netBarrier { font-size: 12px; color: #9aa6b2; margin-top: 10px; display: block; }
+    #netBarrier.hold { color: #ffa657; }
+    #netBarrier.go { color: #7ee787; font-weight: 700; }
+
+    /* ---- THE SESSION TRUTH PANEL -------------------------------------------
+       Two people can be connected, both reading "Connected", and still be
+       playing different games. Nothing on this page said which MODE a session
+       was in, how far behind the other player it was running, whether it was
+       WAITING on them, or — the one that matters — whether the two simulations
+       had diverged. A desync that is not surfaced is two people wasting an
+       evening while both think they are fine.
+
+       It sits INSIDE #canvasWrap (and moves into #mobileScreen with the canvas
+       on the phone shell) rather than at body level, because a position:fixed
+       element at body level is NOT RENDERED while #canvasWrap is fullscreen —
+       which is exactly when a player is least able to see the lobby. */
+    #canvasWrap, #mobileScreen { position: relative; }
+    #netHud { display: none; position: absolute; left: 8px; top: 8px; z-index: 40;
+      font: 11px/1.5 ui-monospace, Menlo, monospace; color: #cfe3ff;
+      background: rgba(3,7,14,.82); border: 1px solid #2b3f57; border-radius: 6px;
+      padding: 5px 9px; pointer-events: none; max-width: calc(100% - 16px);
+      text-shadow: 0 1px 2px #000; }
+    #netHud.on { display: block; }
+    #netHud .k { color: #7d8fa3; }
+    #netHud .mode { font-weight: 700; letter-spacing: .04em; }
+    #netHud.stream .mode { color: #ffa657; }
+    #netHud.lockstep .mode { color: #7ee787; }
+    #netHud .warn { color: #ffa657; font-weight: 700; }
+    /* STALLING IS ITS OWN COLOUR, not a word buried in a line. A player whose
+       game has stopped needs to know in one glance that it stopped BECAUSE OF
+       THE OTHER PLAYER and not because this machine broke. */
+    #netHud.stalling { border-color: #9e6a03; background: rgba(60,36,0,.9); }
+    #netHud.stalling .stall { color: #ffd479; font-weight: 700; }
+    /* LOUD. A desync is not a status line — it is the session being over.
+       Full width, red, on top of the picture, and it does not go away on its
+       own, because the two machines are now showing different games and every
+       further second of play is wasted. */
+    #netDesync { display: none; position: absolute; left: 0; right: 0; top: 0; z-index: 60;
+      background: #7d1a12; color: #fff; border-bottom: 2px solid #ff7b72;
+      font: 600 13px/1.45 system-ui, sans-serif; padding: 10px 14px; text-align: left;
+      box-shadow: 0 4px 18px rgba(0,0,0,.7); }
+    #netDesync.on { display: block; animation: netDesyncPulse 1.1s ease-in-out 4; }
+    #netDesync b { display: block; font-size: 15px; margin-bottom: 3px; }
+    #netDesync .detail { font-weight: 400; opacity: .92; font-family: ui-monospace, Menlo, monospace;
+      font-size: 11px; margin-top: 4px; }
+    @keyframes netDesyncPulse { 0%,100% { background: #7d1a12; } 50% { background: #b3261a; } }
+    @media (prefers-reduced-motion: reduce) { #netDesync.on { animation: none; } }
     #mobileScreen video { image-rendering: pixelated; max-width: 100%; max-height: 100%;
       width: auto; height: 100%; }
 </style>
@@ -547,7 +607,14 @@
        runs no emulator, so this <video> is the only picture it ever has. It is
        moved alongside the canvas by the mobile shell (both are reparented into
        #mobileScreen), which is why it lives in #canvasWrap and not at body level. -->
-  <div id="canvasWrap"><canvas id="dc-canvas" width="640" height="480"></canvas><video id="netVideo" playsinline autoplay></video></div>
+  <div id="canvasWrap"><canvas id="dc-canvas" width="640" height="480"></canvas>
+    <!-- What this session actually IS, over the picture, in both shells and in
+         fullscreen. Hidden entirely when there is no session, so single player
+         is untouched. aria-live because a desync has to reach a screen reader
+         too. See netHudTick() for every field and where its value comes from. -->
+    <div id="netHud" aria-live="polite"></div>
+    <div id="netDesync" role="alert" aria-live="assertive"></div>
+  </div>
   <div id="fpsBar"><span class="k">guest</span> — <span class="sep">|</span> <span class="k">presented</span> — <span class="sep">|</span> <span class="k">headroom</span> —</div>
   <pre id="log"></pre>
 </div>
@@ -622,11 +689,17 @@
 <div id="netOverlay">
   <div id="netBox">
     <h6>🌐 Play Online</h6>
-    <p class="lead">One machine runs the game. The host's Dreamcast is the only Dreamcast —
-      it streams picture and sound to whoever joins, and they play as <b>Player&nbsp;2</b>.</p>
+    <!-- ⚠ THIS PANEL DESCRIBES LOCKSTEP AND ONLY LOCKSTEP. It used to read "One
+         machine runs the game … it streams picture and sound to whoever joins".
+         Streaming is cancelled (user directive 2026-09-08, "WE WILL NOT USE
+         STREAMING") — every machine runs the game, every player's pad drives
+         their OWN console, and nobody watches a video of anybody else. -->
+    <p class="lead">Everyone runs the game on their own machine and plays together, like
+      controllers plugged into one console. <b>Join the room first</b> — you do not need a
+      disc loaded yet. Once everybody is in, you all load the same game and start together.</p>
     <div id="netRow">
-      <button id="netHostBtn" class="primary" type="button">Host a game</button>
-      <button id="netJoinBtn" type="button">Join a game</button>
+      <button id="netHostBtn" class="primary" type="button">Open a room</button>
+      <button id="netJoinBtn" type="button">Join a room</button>
     </div>
     <div id="netHostPane" style="display:none">
       <div class="netLabel">Share this code</div>
@@ -634,12 +707,20 @@
       <div class="netActions"><button id="netCopy" type="button">Copy code</button></div>
     </div>
     <div id="netJoinPane" style="display:none">
-      <div class="netLabel">Game the host is running</div>
+      <div class="netLabel">Game the room is playing</div>
       <select id="netGame"></select>
       <div class="netLabel">Their code</div>
       <input id="netCodeIn" type="text" maxlength="5" autocomplete="off" autocapitalize="characters"
              spellcheck="false" placeholder="ABC12" inputmode="latin">
       <div class="netActions"><button id="netGo" class="primary" type="button">Join</button></div>
+    </div>
+    <!-- THE ROOM. Hidden until there is a session; every row is one PORT of the
+         console, filled from the engine's own port count. See netRoomRender(). -->
+    <div id="netRoom" style="display:none">
+      <div class="netLabel">The room <span id="netRoomPorts"></span></div>
+      <ul id="netRoster"></ul>
+      <button id="netReady" type="button" style="display:none">I'm ready</button>
+      <span id="netBarrier"></span>
     </div>
     <div id="netStatus">Not connected.</div>
     <div class="netActions">
@@ -4435,9 +4516,13 @@
     // A GUEST never boots — it has no disc, no worker run loop and no picture of
     // its own — so the pump can no longer be gated on `booted` alone or the
     // guest's controller would never be read at all.
-    if (booted || NET.guest) {
+    // ⚠ EVERY PEER SENDS ITS OWN PAD, AND EVERY PEER BOOTS. Under streaming the
+    // guest never booted and only the guest sent a pad; under lockstep both
+    // halves of that are wrong — each player runs their own console and each
+    // player's pad has to reach everybody else's.
+    if (booted || NET.session) {
       const pad = packPad();
-      if (NET.guest && NET.session) NET.session.sendPad(netPadMask(pad, 0));
+      if (NET.session && NET.session.state === 'connected') NET.session.sendPad(netPadMask(pad, 0));
       if (booted) {
         // The exact bytes handed to the worker, kept for the netplay test's
         // player-2 assertion. Twelve bytes, and only while hosting.
@@ -4445,7 +4530,6 @@
         worker.postMessage({ cmd: 'input', states: pad }, [pad.buffer]);
       }
     }
-    if (NET.mirrorCtx) netPumpMirror();
   }
   const _now = () => ((performance && performance.now) ? performance.now() : Date.now());
   let _lastRafAt = 0;
@@ -4487,63 +4571,60 @@
   }
 
   // ===========================================================================
-  // ONLINE CO-OP
+  // ONLINE CO-OP — LOCKSTEP, AND NOTHING ELSE
   //
-  // THE MODEL (lib/netplay.js's header states it too): ONE INSTANCE RUNS THE
-  // GAME. The host's emulator is the only emulator. It streams its picture and
-  // sound over WebRTC and the guest sends controller state back, which lands in
-  // port 1 of the pad buffer. There is no lockstep, no rollback and no
-  // determinism requirement, because there is only one machine to be in sync
-  // with.
+  // ⚠ THE MODEL CHANGED, AND THE OLD ONE IS NOT A FALLBACK. This page used to
+  // run ONE emulator: the host's core was the only core, it captured its canvas
+  // with captureStream(), streamed picture and sound over WebRTC, and the guest
+  // sent controller state back into port 1 of the host's pad buffer. On the
+  // user's instruction (2026-09-08, "WE WILL NOT USE STREAMING! WTF!") that
+  // architecture is CANCELLED and has been removed from this file rather than
+  // left behind a flag — netCaptureSurface(), netCountFrames(), the mirror
+  // canvas, attachMedia(), the <video> stand-in, the unmute gesture and the
+  // guest's Start lock are all gone.
   //
-  // ---------------------------------------------------------------------------
-  // THE OBSTACLE THIS PAGE HAS AND THE CANVAS DEMO DOES NOT: #dc-canvas IS GONE.
+  // WHAT IT IS NOW: every player runs the game on their own machine, every
+  // player's pad drives their OWN console's port, and the peers exchange input
+  // so that all the simulations stay identical. The players are meant to feel
+  // like controllers plugged into one console.
   //
-  // :2593 calls transferControlToOffscreen() on it, and the comment there is
-  // explicit — the worker's GL-owning pthread renders straight into the
-  // OffscreenCanvas and the page "cannot call getContext on it anymore". The
-  // element left behind is a PLACEHOLDER canvas. OffscreenCanvas itself has no
-  // captureStream at all, so the obvious route is closed on both ends.
+  // WHY THE OLD MODEL HAD TO GO, in the numbers it was measured at rather than
+  // in adjectives (dreamcast/tools/netplay_stream_baseline.mjs, two runs, both
+  // browsers on ONE box at 0-1 ms RTT — i.e. these are FLOORS):
   //
-  // MEASURED rather than assumed (Chrome 152.0.7977.76, a worker holding a
-  // WebGL2 context on a transferred canvas, clearing to a new colour every
-  // 33 ms; each arm sampled through a <video srcObject> for 12 frames):
+  //   what player 2 paid                      run 1        run 2
+  //   input -> the emulator holds the byte     25 ms p50    21 ms p50
+  //   host's picture -> player 2's picture     68 ms        52 ms
+  //   ADDED input-to-visible                   93 ms        73 ms
+  //                                            = 5.6 frames = 4.4 frames
+  //   audio behind the host                    52 ms        36 ms
+  //   frames per second actually seen          28.7         42.8   (host: 60)
+  //   bitrate for a 640x480 60 Hz source       1544 kbps    1599 kbps
+  //                                            = 0.10 bits per pixel
   //
-  //   arm                                 result
-  //   placeholder.captureStream(60)       video:live, 320x240, 12/12 frames
-  //                                       non-black, 3 distinct colours — the
-  //                                       WORKER's pixels, on the main thread
-  //   drawImage(placeholder) -> mirror    same: 3 distinct colours, 76800/76800
-  //                                       non-black pixels per sample
+  // Player 1 paid NONE of it. Under lockstep neither player does: each machine
+  // draws its own frames at its own 1.000x, and the only cost is the input
+  // delay the room agrees on, which the on-screen panel states in frames.
   //
-  // So Chrome DOES feed a placeholder canvas' capture stream from the worker's
-  // commits. That is not something to ship on faith — a `video:live` track that
-  // carries nothing looks identical to a working one from the outside — so the
-  // page does not READ a capability, it DOES the thing and counts the frames
-  // that come out (netCountFrames below, the same discipline lib/capability.js
-  // applies to WebGL2). If the direct capture yields fewer than two frames in
-  // 900 ms, it falls back to a MIRROR canvas painted from drawImage() on the
-  // input rAF — a path that needs nothing but drawImage + captureStream, both
-  // of which this page already depends on.
-  //
-  // Not chosen, and why: reading the frame back out of the worker would need a
-  // glReadPixels per frame plus a C++ change to EmscriptenWorker.cpp and a
-  // relink of the core; getDisplayMedia would put a screen-picker prompt in
-  // front of the host and capture the whole window rather than the game.
+  // THE ORDER PLAYERS GO THROUGH — and note it is the OPPOSITE of the old one,
+  // which made you boot a 1,131 MB disc before you were allowed to host:
+  //   1. everyone opens the page and joins the ROOM. No disc, nothing started.
+  //   2. ports are assigned and shown. A player learns they are Player 3 BEFORE
+  //      the game starts, because that is which character they get.
+  //   3. everyone loads the SAME disc, with per-player progress visible.
+  //   4. a START BARRIER — nobody advances frame 0 until every peer is ready.
+  //   5. all cores run frame 0 together.
+  // There is NO savestate handoff, and that is a stronger guarantee: identical
+  // starting state by construction beats a transfer that can silently fail to
+  // restore (CLAUDE.md gate #10).
   // ===========================================================================
   const NET = {
     session: null,      // the live Netplay.Session, or null
-    role: null,         // 'host' | 'guest' | null
-    guest: false,       // guest input pump armed
-    surface: null,      // the canvas actually being captured (host)
-    how: null,          // which arm won, with its measured frame count
+    role: null,         // 'host' | 'guest' | null — who OPENED the room, nothing more
+    guest: false,       // this side joined rather than opened
     leaving: false,     // this side pressed Leave (decides what 'closed' means)
-    mirror: null, mirrorCtx: null, mirrorTicks: 0, mirrorErr: null,
-    sentP2: null,       // last port-1 bytes handed to the worker (host)
-    videoTracks: null,  // what the guest actually received
-    unmuteArmed: false, // a one-shot gesture listener is waiting to turn sound on
+    sentP2: null,       // last remote-port bytes handed to the worker
   };
-  const NET_FPS = 60;
 
   // BroadcastChannel pairs two tabs in ONE browser and needs no third party, so
   // it is what the headless test uses; PeerJS's public broker is what a real
@@ -4566,70 +4647,6 @@
     return s.remotePad() | 0;
   }
 
-  function netPumpMirror() {
-    try {
-      NET.mirrorCtx.drawImage($('dc-canvas'), 0, 0, NET.mirror.width, NET.mirror.height);
-      NET.mirrorTicks++;
-    } catch (e) { NET.mirrorErr = (e && e.message) ? e.message : String(e); }
-  }
-
-  // DO the capture and COUNT the frames. requestVideoFrameCallback fires once
-  // per frame actually presented, which is the only signal that separates a
-  // working track from a live-but-empty one; where it does not exist, an
-  // advancing currentTime is the fallback witness.
-  function netCountFrames(stream, ms) {
-    return new Promise((resolve) => {
-      const v = document.createElement('video');
-      v.muted = true; v.playsInline = true; v.autoplay = true;
-      try { v.srcObject = stream; } catch (e) { return resolve(0); }
-      let n = 0, done = false, iv = null;
-      const finish = () => {
-        if (done) return; done = true;
-        if (iv) clearInterval(iv);
-        try { v.pause(); v.srcObject = null; } catch (e) {}
-        resolve(n);
-      };
-      const p = v.play(); if (p && p.catch) p.catch(() => {});
-      if (typeof v.requestVideoFrameCallback === 'function') {
-        const tick = () => { n++; if (!done) { try { v.requestVideoFrameCallback(tick); } catch (e) {} } };
-        try { v.requestVideoFrameCallback(tick); } catch (e) {}
-      } else {
-        let last = -1;
-        iv = setInterval(() => { if (v.currentTime > last) { last = v.currentTime; n++; } }, 50);
-      }
-      setTimeout(finish, ms);
-    });
-  }
-
-  async function netCaptureSurface() {
-    const dc = $('dc-canvas');
-    // ARM 1 — the transferred canvas itself.
-    try {
-      const probe = dc.captureStream(NET_FPS);
-      const n = await netCountFrames(probe, 900);
-      probe.getTracks().forEach((t) => { try { t.stop(); } catch (e) {} });
-      if (n >= 2) {
-        pageLog('[net] capture arm: the transferred canvas produced ' + n + ' frames in 900 ms — using it directly');
-        return { el: dc, how: 'transferred-canvas (' + n + ' frames/900ms)' };
-      }
-      pageLog('[net] capture arm: the transferred canvas produced only ' + n + ' frames in 900 ms — falling back to a mirror');
-    } catch (e) {
-      pageLog('[net] capture arm: captureStream on the transferred canvas threw (' +
-              ((e && e.message) ? e.message : String(e)) + ') — falling back to a mirror');
-    }
-    // ARM 2 — a main-thread mirror, painted from the placeholder each rAF.
-    const m = document.createElement('canvas');
-    m.width = dc.width || 640; m.height = dc.height || 480;
-    NET.mirror = m;
-    NET.mirrorCtx = m.getContext('2d', { alpha: false });
-    netPumpMirror();                    // paint once now so the first frame is not blank
-    const probe2 = m.captureStream(NET_FPS);
-    const n2 = await netCountFrames(probe2, 900);
-    probe2.getTracks().forEach((t) => { try { t.stop(); } catch (e) {} });
-    pageLog('[net] capture arm: mirror canvas produced ' + n2 + ' frames in 900 ms (' +
-            NET.mirrorTicks + ' paints' + (NET.mirrorErr ? ', drawImage error: ' + NET.mirrorErr : '') + ')');
-    return { el: m, how: 'mirror (' + n2 + ' frames/900ms)' };
-  }
 
   // ---- lobby UI -------------------------------------------------------------
   function netStatus(text, cls) {
@@ -4640,10 +4657,15 @@
   }
   function netOpen() {
     $('netOverlay').classList.add('on');
-    // The host has to be running something to stream. Say so before they press
-    // a button that cannot work, rather than after.
-    if (!NET.session) netStatus(booted ? 'Not connected.'
-      : 'Not connected. Hosting needs a running game — press Start first. Joining does not.');
+    // ⚠ THERE IS NO BOOT-FIRST GATE ANY MORE, and its removal is the point.
+    // It existed ONLY because streaming had to capture a canvas that was
+    // already drawing, so the host had to be running a game before anyone could
+    // join. Streaming is cancelled (user directive 2026-09-08), and under
+    // lockstep the order is BACKWARDS: everyone joins the room FIRST, ports are
+    // assigned, and only then does everybody load the same disc and start
+    // together. Making a player boot a 1.1 GB disc before they are allowed to
+    // find out whether they even got a port is exactly the wrong way round.
+    if (!NET.session) netStatus('Not connected. Open a room or join one — you do not need a game running first.');
   }
   function netClose() { $('netOverlay').classList.remove('on'); }
 
@@ -4653,133 +4675,61 @@
       ? 'Waiting for someone to join with code ' + NET.session.code + '…'
       : 'Looking for the host…', 'busy');
     else if (s === 'connected') {
-      netStatus(NET.role === 'host'
-        ? 'Connected — the other player is Player 2.'
-        : 'Connected — you are Player 2.', 'good');
+      // ⚠ NOT "you are Player 2". Which port a player holds is the ENGINE's
+      // answer and it can be any of the console's ports — hardcoding 2 here is
+      // how a Player 3 ends up told they are Player 2 and reaches for the wrong
+      // character. The room panel and the on-screen HUD carry the real port.
+      const t = netTelemetry();
+      const myPort = (t && t.you && t.you.port != null) ? t.you.port : null;
+      netStatus(myPort != null
+        ? 'In the room — you are Player ' + (myPort + 1) + '.'
+        : 'In the room.', 'good');
       $('netLeave').style.display = '';
+      netHudStart();
     } else if (s === 'closed') {
       // WHO hung up decides what this says. The channel's onclose fires on both
       // sides and arrives AFTER netLeave() has set its own text, so without the
       // flag the person who pressed Leave is told the other player left.
-      netStatus(NET.leaving ? 'Left the session.' : 'The other player left.', 'busy');
-      if (NET.role === 'guest') netShowGuestVideo(false);
+      netStatus(NET.leaving ? 'Left the room.' : 'The room closed.', 'busy');
+      netHudStop(); netRoomStop();
     } else if (s === 'failed') {
       netStatus('Could not connect' + (e.detail ? ': ' + e.detail : '.'), 'bad');
     }
     pageLog('[net] ' + (NET.role || 'session') + ' ' + s + (e.detail ? ' (' + e.detail + ')' : ''));
   }
 
-  // The guest's picture replaces the (permanently black) local canvas. The
-  // controls are untouched: touch, keyboard and gamepad all write heldKeys,
-  // which frameLoop reads whether or not this machine ever booted a disc.
-  function netShowGuestVideo(on) {
-    const v = $('netVideo'), c = $('dc-canvas');
-    if (!v) return;
-    v.classList.toggle('on', !!on);
-    if (c) c.style.display = on ? 'none' : '';
-    if (!on) { try { v.srcObject = null; } catch (e) {} }
-  }
-
-  async function netAttachRemote(ms) {
-    const v = $('netVideo');
-    NET.videoTracks = ms.getTracks().map((t) => t.kind + ':' + t.readyState);
-    pageLog('[net] stream received: ' + NET.videoTracks.join(', '));
-    // ⚠ THIS FIRES ONCE PER TRACK. RTCPeerConnection.ontrack is per-track, and
-    // the host publishes video AND audio, so 'stream' arrives twice for the same
-    // MediaStream. MEASURED: re-assigning srcObject the second time aborts the
-    // first play() ("The play() request was interrupted by a new load request")
-    // and left the element at readyState 0 with videoWidth 0 — a connected
-    // session showing nothing. Attach once; the second event only refreshes the
-    // track list above.
-    if (v.srcObject === ms) return;
-    v.srcObject = ms;
-    netShowGuestVideo(true);
-    // ⚠ CLEAR THE MUTE BEFORE TRYING. The catch path below sets v.muted = true
-    // and NOTHING used to clear it, so one refusal muted every LATER session
-    // too — and silently, because a muted element's play() always resolves, so
-    // the catch never ran again and the player was told "Connected — you are
-    // Player 2." with no mention of sound.
-    // MEASURED, Chrome 152 under --autoplay-policy=user-gesture-required, three
-    // sessions on one guest tab: join #1 audible (muted=false, paused=false),
-    // rejoin #2 audible, and a rejoin AFTER a refusal read muted=true /
-    // audible=false while the status line still read "Connected — you are
-    // Player 2." That last one is a guest with no sound and no way to know why.
-    v.muted = false;
-    // Try WITH sound first. Autoplay policy can refuse an audible element even
-    // after a click, and a rejected play() leaves a black rectangle — so fall
-    // back to muted playback and tell the player how to get the sound back,
-    // rather than losing the picture to keep the audio.
-    try { await v.play(); }
-    catch (e) {
-      v.muted = true;
-      try { await v.play(); netStatus('Connected — tap the picture to turn sound on.', 'good'); } catch (_) {}
-      pageLog('[net] audible autoplay refused (' + ((e && e.message) ? e.message : e) + ') — playing muted');
-      netArmUnmuteGesture();
-    }
-    v.onclick = () => netUnmute();
-  }
-
-  // The picture is not always the thing under the player's finger — on the phone
-  // shell it sits behind the lobby overlay, and a guest who taps "Close" rather
-  // than the video would stay muted with a message telling them to tap the
-  // picture. ANY gesture is enough for the autoplay policy, so take any of them.
-  function netUnmute() {
-    const v = $('netVideo');
-    // No stream means the session already ended: unmuting a detached element
-    // only produces a rejected play() that re-mutes it for the NEXT session.
-    if (!v || !v.muted || !v.srcObject) return;
-    v.muted = false;
-    v.play().then(() => {
-      if (NET.session && NET.session.state === 'connected')
-        netStatus('Connected — you are Player 2.', 'good');
-    }).catch(() => { v.muted = true; v.play().catch(() => {}); });
-  }
-  function netArmUnmuteGesture() {
-    if (NET.unmuteArmed) return;
-    NET.unmuteArmed = true;
-    const go = () => {
-      netUnmute();
-      NET.unmuteArmed = false;
-      ['pointerdown', 'keydown', 'touchend'].forEach((t) => document.removeEventListener(t, go, true));
-    };
-    ['pointerdown', 'keydown', 'touchend'].forEach((t) => document.addEventListener(t, go, true));
-  }
 
   // `fixedCode` is the handoff from dreamcast_multiplayer.html. That page shows a
   // code to the player BEFORE anything is downloaded, so minting a fresh one here
   // would silently strand a guest already waiting on the published one.
   async function netStartHost(fixedCode) {
     if (NET.session) return;
-    if (!booted) {
-      netStatus('Hosting needs a running game — pick a disc and press Start first, then host.', 'bad');
-      return;
-    }
+    // NO `if (!booted) return` HERE. See netOpen() above: the gate was a
+    // streaming requirement and streaming is cancelled. A room is opened before
+    // any disc is fetched, which is what lets four people agree on a game and
+    // then all pay the download at the same time instead of one at a time.
     $('netHostPane').style.display = '';
     $('netJoinPane').style.display = 'none';
     const code = fixedCode || Netplay.makeCode(5);
     $('netCode').textContent = code;
-    netStatus('Preparing the video stream…', 'busy');
+    netStatus('Room open. Share the code — everyone loads the game once you are all in.', 'busy');
     NET.role = 'host';
-    const surf = await netCaptureSurface();
-    NET.surface = surf.el; NET.how = surf.how;
-    const s = new Netplay.Session({
+    // ⚠ NOTHING IS CAPTURED HERE ANY MORE. This used to call
+    // netCaptureSurface() and s.attachMedia(canvas, audioNode) — 1.8 s of
+    // frame-counting probes to pick a canvas to stream. Streaming is cancelled;
+    // every machine runs the game, so there is no picture to publish and no
+    // reason to make the person opening the room wait for a capture arm to be
+    // chosen before they can read their own code.
+    const s2 = new Netplay.Session({
       game: $('romSelect').value, host: true, code, transport: netTransport(),
     });
-    NET.session = s;
-    s.on('status', netOnStatus);
-    // ⚠ BEFORE start(). Tracks added after the offer is created never appear in
-    // it, and the guest connects to a session with no picture.
-    const gotMedia = s.attachMedia(surf.el, audioNode);
-    if (!gotMedia) {
-      pageLog('[net] attachMedia failed: ' + (s.lastError || 'unknown') + ' — the guest would get no picture');
-      netStatus('Could not capture the game: ' + (s.lastError || 'unknown'), 'bad');
-      NET.session = null; NET.role = null;
-      return;
-    }
-    pageLog('[net] hosting ' + $('romSelect').value + ' as ' + code +
-            ' via ' + netTransport() + '; capture = ' + surf.how +
-            '; audio = ' + (audioNode ? 'tapped' : 'NOT AVAILABLE (no worklet node yet)'));
-    await s.start();
+    NET.session = s2;
+    s2.on('status', netOnStatus);
+    // The room is drawn from the moment there IS one, not from `connected`: the
+    // person who opened it needs to watch the seats fill.
+    netHudClearDesync(); netRoomStart(); netHudStart();
+    pageLog('[net] room ' + code + ' open (' + netTransport() + '), game ' + $('romSelect').value);
+    await s2.start();
   }
 
   async function netStartGuest() {
@@ -4799,16 +4749,16 @@
     const s = new Netplay.Session({ game, host: false, code, transport: netTransport() });
     NET.session = s;
     s.on('status', netOnStatus);
-    s.on('stream', netAttachRemote);
+    netHudClearDesync(); netRoomStart(); netHudStart();
     NET.guest = true;
-    // A guest never boots, so nothing else would ever start the input pump —
-    // and without it the guest's controller is read zero times.
+    // The input pump has to run before this machine boots, because the pad has
+    // to reach the other players from the moment the room is live.
     startInputPump();
-    netGuestStartLock(true);
-    // The phone shell's splash sits on top of everything until Start is pressed,
-    // and a guest never presses it.
-    const sp = $('mobileSplash'); if (sp) sp.style.display = 'none';
-    pageLog('[net] joining ' + code + ' (' + game + ') via ' + netTransport());
+    // ⚠ NO START LOCK. netGuestStartLock() used to DISABLE Start for a joiner,
+    // because under streaming a guest had no emulator and must not launch one.
+    // Under lockstep a joiner runs their own console and MUST start it — the
+    // lock was the single line that made this page two-machines-one-emulator.
+    pageLog('[net] joining room ' + code + ' (' + game + ') via ' + netTransport());
     await s.start();
   }
 
@@ -4816,41 +4766,16 @@
     const s = NET.session, wasGuest = NET.role === 'guest';
     NET.leaving = true;
     if (s) { try { s.close(); } catch (e) {} }
-    NET.session = null; NET.role = null; NET.guest = false;
-    NET.mirror = null; NET.mirrorCtx = null; NET.sentP2 = null;
-    netShowGuestVideo(false);
-    if (wasGuest) netGuestStartLock(false);
+    NET.session = null; NET.role = null; NET.guest = false; NET.sentP2 = null;
     $('netLeave').style.display = 'none';
     $('netHostPane').style.display = 'none';
     $('netJoinPane').style.display = 'none';
-    netStatus('Left the session.');
+    netHudStop(); netRoomStop();
+    netStatus('Left the room.');
     pageLog('[net] session closed by this side');
     setTimeout(() => { NET.leaving = false; }, 2000);
   }
 
-  // A GUEST MUST NOT START ITS OWN EMULATOR. Pressing Start while watching
-  // someone else's game would boot a second Dreamcast behind the video, on a
-  // machine already decoding a stream, and then send every key press to BOTH
-  // the local core and the remote host. Hold the two Start controls down for as
-  // long as the session lasts.
-  //
-  // ⚠ `disabled`, never `aria-disabled`: that attribute belongs to
-  // lib/capability.js (it is the sole writer, and a control it is holding down
-  // must never be re-enabled by anyone else), so a button the capability layer
-  // already blocked is left exactly as it found it.
-  function netGuestStartLock(on) {
-    ['btnStart', 'mobileSplashStart'].forEach((id) => {
-      const b = $(id);
-      if (!b) return;
-      if (on) {
-        b.disabled = true;
-        b.title = 'You are watching someone else\'s game. Leave the online session to start your own.';
-      } else if (b.getAttribute('aria-disabled') !== 'true' && !booted) {
-        b.disabled = false;
-        b.title = '';
-      }
-    });
-  }
 
   // Test seam. Deliberately a SIBLING of window.__dcPad / window.__dcProbe
   // rather than a widening of either — both already have consumers whose shape
@@ -4861,36 +4786,446 @@
     role: NET.role,
     state: NET.session ? NET.session.state : null,
     code: NET.session ? NET.session.code : null,
-    capture: NET.how,
-    mirrorTicks: NET.mirrorTicks,
-    mirrorErr: NET.mirrorErr,
+    // ⚠ `capture` / `mirrorTicks` / `mirrorErr` / `videoTracks` / `guestAudio`
+    // ARE GONE, not renamed. They described the streaming path — which canvas
+    // was being captured, how many frames its probe produced, whether the guest
+    // could hear the host. Streaming is cancelled; a seam that still answered
+    // those questions would keep rigs asserting an architecture the product no
+    // longer has (tools/netplay_realui_pair_test.mjs read `capture`).
     remotePad: NET.session && NET.role === 'host' ? NET.session.remotePad() : null,
     sentP2: NET.sentP2,            // the bytes actually posted to the worker for port 1
-    videoTracks: NET.videoTracks,
-    // AUDIBILITY IS NOT A TRACK STATE. `audio:live` says a track exists, not
-    // that a person can hear it — a muted element renders the samples just the
-    // same (measured: peak 0.506 through a muted <audio>). The only thing that
-    // decides whether the guest HEARS the host is this element, so the test seam
-    // reports the element, not the track.
-    guestAudio: (function () {
-      const v = $('netVideo');
-      if (!v) return null;
-      return {
-        muted: v.muted, paused: v.paused,
-        audible: v.muted === false && v.paused === false,
-        hasAudioTrack: !!(v.srcObject && v.srcObject.getAudioTracks().length),
-        unmuteArmed: NET.unmuteArmed,
-      };
-    })(),
     booted: booted,
   });
 
-  // The MediaStream this side has in hand: what the HOST published, or what the
-  // GUEST received. A MediaStream cannot survive a page.evaluate() return, so
-  // this is a function the rig calls INSIDE the page and measures there — which
-  // is the only way to check the SENDER as well as the receiver, and a guest
-  // reading zero is meaningless without that.
-  window.__dcNetStream = () => (NET.session ? NET.session.remoteStream() : null);
+
+  // ===========================================================================
+  // THE SESSION TRUTH PANEL
+  //
+  // Four people can be connected, all four reading "Connected", and be playing
+  // DIFFERENT GAMES. Until this existed the page said nothing about who was in
+  // the room, which port each of them held, how far behind the others it was
+  // running, whether it was WAITING on one of them, or whether the simulations
+  // had diverged. The last one is the one that costs an evening.
+  //
+  // ⚠ STREAMING IS CANCELLED (user directive 2026-09-08: "WE WILL NOT USE
+  // STREAMING"). Lockstep is the ONLY online architecture, so there is no
+  // fallback for this panel to hide a fault behind. A session that reports
+  // anything other than lockstep is therefore not a MODE — it is a FAULT, and
+  // it is surfaced as one.
+  //
+  // WHAT IS SHOWN, and where every value comes from:
+  //
+  //   THE ROOM      one chip per PORT the console has — not per person, and the
+  //                 count comes from the engine, never from a 4 written here.
+  //                 The Dreamcast has four (flycast-src/core/hw/maple/
+  //                 maple_devs.h:193 `#define MAPLE_PORTS 4`); GameCube's bridge
+  //                 currently wires one. A player has to know they are Player 3
+  //                 BEFORE the game starts, because that is which character they
+  //                 get, and a rejoin that shuffles the room is a gameplay bug.
+  //
+  //   INPUT DELAY   the EXACT integer the engine is holding inputs for, in
+  //                 frames and in ms. Not an estimate: lockstep has a frame
+  //                 number, which is the whole point of it.
+  //
+  //   STALLING      NAMED. "Waiting…" in a room of four is not actionable — the
+  //                 panel says WHICH player the session is stalled on, so the
+  //                 other three know whose connection to blame and the person
+  //                 responsible can see it is them.
+  //
+  //   DESYNC        loud, latched, names the peers that diverged, and does not
+  //                 clear itself. Once two simulations disagree, nothing anyone
+  //                 does is shared and every further second is wasted.
+  // ===========================================================================
+
+  // ---- the seam the lockstep engine fills ----------------------------------
+  // The page ASKS the session what it is; it never infers, and it never counts
+  // ports for itself. A session that answers nothing at all reports as a fault
+  // rather than silently rendering a plausible room.
+  //
+  //   session.netTelemetry() -> {
+  //     mode:        'lockstep'            // anything else is a FAULT
+  //     ports:       <int>                 // ports THIS console has
+  //     you:         { port, name }
+  //     peers:       [ { id, name, port, connected, frame, rttMs, stalling } ]
+  //     delayFrames: <int>                 // input delay currently in force
+  //     frame:       <int>                 // local simulated frame
+  //     waitingOn:   [ port, ... ] | null  // WHO we are stalled on right now
+  //     stalled:     <bool>, stallMs, stallTotalMs
+  //     desync:      <bool>, desyncFrame, desyncPeers: [port,...], desyncDetail
+  //   }
+  //
+  // `session.lockstep` holding the same object is accepted too, so the engine
+  // can expose a method or a field without this file changing again. Every
+  // field is optional and a missing one renders as "—", never as a wrong number.
+  function netTelemetry() {
+    const s = NET.session;
+    if (!s) return null;
+    let t = null;
+    try { if (typeof s.netTelemetry === 'function') t = s.netTelemetry(); } catch (e) {}
+    if (!t) { try { t = s.lockstep || null; } catch (e) {} }
+    // TEST SEAM, in the same family as __dcPad / __dcNet / __dcProbe. Reaching
+    // it needs script execution in the page, so it is not a user-facing mode; it
+    // exists so the stall line, the roster and the desync banner can be PROVEN
+    // rather than asserted, on a deterministic input, without waiting on a live
+    // four-way divergence to happen by luck.
+    if (window.__dcNetTelemetryOverride) t = window.__dcNetTelemetryOverride;
+    // ⚠ THE "NO TELEMETRY" ANSWER MUST BE THE SAME SHAPE AS A REAL ONE. The
+    // first version returned a bare { mode, fault }, so the very first HUD tick
+    // — which always runs before any engine has published anything — threw on
+    // t.desyncPeers.length, and the throw escaped netHudStart() BEFORE it
+    // installed its interval. The panel was then permanently dead while
+    // reporting on:true, which is the worst possible failure for the one thing
+    // that exists to tell a player their session is broken. Caught by
+    // dreamcast/tools/room_hud_test.mjs (hud-names-the-mode + no-page-errors).
+    if (!t || typeof t !== 'object') {
+      return {
+        mode: 'none', fault: 'the session reports no lockstep telemetry at all',
+        ports: null, you: null, peers: [], barrier: null,
+        delayFrames: null, frame: null, waitingOn: null,
+        stalled: false, stallMs: 0, stallTotalMs: 0,
+        desync: false, desyncFrame: null, desyncPeers: [], desyncDetail: null,
+      };
+    }
+    const num = (v) => (typeof v === 'number' && isFinite(v)) ? v : null;
+    const arr = (v) => (Array.isArray(v) ? v : null);
+    return {
+      mode: t.mode || 'none',
+      fault: t.mode === 'lockstep' ? null : ('this session is running "' + (t.mode || 'nothing') + '", not lockstep'),
+      ports: num(t.ports),
+      // ⚠ EVERY FIELD THE ROOM RENDERS MUST BE COPIED HERE. The first version
+      // of this normaliser dropped `ready` and `loadPct`, so a peer sitting at
+      // 41% of a 1,131 MB download rendered as "not ready" with no bar — the
+      // exact silent-freeze this panel exists to prevent, reintroduced by the
+      // sanitiser meant to protect it. dreamcast/tools/room_hud_test.mjs
+      // (per-player-load-progress) is what caught it and is what stops it
+      // coming back.
+      you: (t.you && typeof t.you === 'object')
+        ? { port: num(t.you.port), name: t.you.name || null, ready: !!t.you.ready, loadPct: num(t.you.loadPct) }
+        : null,
+      peers: (arr(t.peers) || []).map((q) => ({
+        id: q && q.id != null ? String(q.id) : null,
+        name: q && q.name ? String(q.name).slice(0, 24) : null,
+        port: num(q && q.port), connected: (q && q.connected !== undefined) ? !!q.connected : true,
+        ready: !!(q && q.ready), loadPct: num(q && q.loadPct),
+        frame: num(q && q.frame), rttMs: num(q && q.rttMs), stalling: !!(q && q.stalling),
+      })),
+      barrier: (t.barrier && typeof t.barrier === 'object')
+        ? { started: !!t.barrier.started, startFrame: num(t.barrier.startFrame) } : null,
+      delayFrames: num(t.delayFrames), frame: num(t.frame),
+      waitingOn: arr(t.waitingOn),
+      stalled: !!t.stalled, stallMs: num(t.stallMs) || 0, stallTotalMs: num(t.stallTotalMs) || 0,
+      desync: !!t.desync, desyncFrame: num(t.desyncFrame),
+      desyncPeers: arr(t.desyncPeers) || [],
+      desyncDetail: t.desyncDetail ? String(t.desyncDetail).slice(0, 300) : null,
+    };
+  }
+
+  const HUD = { on: false, tickTimer: 0, desyncLatched: false, desyncAt: 0, text: '', mode: null, tel: null };
+  const FRAME_MS = 1000 / 60;
+  const esc = (v) => String(v == null ? '' : v).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  // A player's LABEL. Ports are 0-based in the pad buffer and 1-based to a
+  // human, and mixing the two is how "you are Player 2" ends up next to a
+  // character that port 3 is driving.
+  const netPlayerLabel = (port, tel) => {
+    if (port == null) return '—';
+    const you = tel && tel.you && tel.you.port;
+    if (you != null && port === you) return 'P' + (port + 1) + ' (you)';
+    const peer = (tel && tel.peers || []).find((q) => q.port === port);
+    return 'P' + (port + 1) + (peer && peer.name ? ' ' + peer.name : '');
+  };
+
+  function netHudTick() {
+    const el = $('netHud'), ban = $('netDesync');
+    if (!el) return;
+    const s = NET.session;
+    // ⚠ NOT `state !== 'connected'`. The minutes a player spends in a room
+    // waiting for three other people to arrive and download the disc are
+    // exactly when they need to see the room, so the panel lives for as long as
+    // the SESSION does. It stops when there is no session at all.
+    if (!s) { netHudStop(); return; }
+    const connected = (s.state === 'connected');
+    const t = netTelemetry() || { mode: 'none', fault: 'no session telemetry' };
+    HUD.mode = t.mode; HUD.tel = t;
+
+    // ---- desync: latched, loud, NAMED, never cleared by the page ------------
+    if (t.desync && !HUD.desyncLatched) {
+      HUD.desyncLatched = true; HUD.desyncAt = Date.now();
+      pageLog('[net] DESYNC' + (t.desyncFrame != null ? ' at frame ' + t.desyncFrame : '') +
+              (t.desyncPeers.length ? ' with ' + t.desyncPeers.map((p) => 'P' + (p + 1)).join(', ') : '') +
+              (t.desyncDetail ? ' — ' + t.desyncDetail : ''));
+      bump('netDesync');
+    }
+    if (HUD.desyncLatched && ban) {
+      const who = t.desyncPeers.length
+        ? t.desyncPeers.map((p) => esc(netPlayerLabel(p, t))).join(' and ')
+        : 'another player';
+      ban.innerHTML = '<b>⚠ DESYNC — you are no longer playing the same game as ' + who + '</b>' +
+        'The simulations stopped agreeing' + (t.desyncFrame != null ? ' at frame ' + t.desyncFrame : '') +
+        '. Nothing anyone does from here is shared. Leave and rejoin to start again.' +
+        (t.desyncDetail ? '<span class="detail">' + esc(t.desyncDetail) + '</span>' : '');
+      ban.classList.add('on');
+    }
+
+    // ---- the fault case: this is NOT lockstep -------------------------------
+    // Streaming is cancelled. There is no other mode to fall back to, so a
+    // session that is not lockstep is broken and says so where the desync
+    // banner says so, because it has the same consequence: what is on screen is
+    // not the shared game.
+    // ⚠ AN EMPTY ROOM IS NOT A FAULT. A session that has published no
+    // telemetry yet because nobody has joined must not raise the same banner as
+    // a session that is actually running the wrong architecture — a page that
+    // cries wolf while you wait for your friends teaches people to ignore the
+    // one banner that matters. Silence is a fault only once peers are
+    // CONNECTED; an explicit non-lockstep mode is a fault immediately.
+    const notLockstepFault = (t.mode === 'lockstep') ? false
+      : (t.mode === 'none' ? connected : true);
+    if (notLockstepFault && ban && !HUD.desyncLatched) {
+      ban.innerHTML = '<b>⚠ THIS SESSION IS NOT RUNNING LOCKSTEP</b>' +
+        esc(t.fault || 'the session reported no lockstep telemetry') +
+        '. Online play on this page is lockstep only — every machine runs the game. ' +
+        'Leave and rejoin; if it happens again the session is faulty, not slow.';
+      ban.classList.add('on');
+    } else if (!notLockstepFault && ban && !HUD.desyncLatched) {
+      ban.classList.remove('on');
+    }
+
+    // ---- the roster: one chip per PORT, from the engine's own count ---------
+    let roster = '';
+    if (t.ports != null) {
+      const chips = [];
+      for (let port = 0; port < t.ports; port++) {
+        const you = t.you && t.you.port === port;
+        const peer = t.peers.find((q) => q.port === port);
+        let cls = 'slot free', body = 'P' + (port + 1) + ' <span class="k">open</span>';
+        if (you) { cls = 'slot you'; body = 'P' + (port + 1) + ' you'; }
+        else if (peer) {
+          cls = 'slot' + (peer.stalling ? ' waiting' : (peer.connected ? ' ok' : ' gone'));
+          body = 'P' + (port + 1) + ' ' + esc(peer.name || 'player') +
+                 (peer.rttMs != null ? ' <span class="k">' + peer.rttMs + 'ms</span>' : '');
+        }
+        chips.push('<span class="' + cls + '">' + body + '</span>');
+      }
+      roster = '<br>' + chips.join(' ');
+    }
+
+    // ---- stalling, NAMED ----------------------------------------------------
+    let stalled = !!t.stalled, stallWhy = '';
+    const waitNames = (t.waitingOn || []).map((p) => netPlayerLabel(p, t));
+    if (!waitNames.length) {
+      const st = t.peers.filter((q) => q.stalling).map((q) => netPlayerLabel(q.port, t));
+      if (st.length) { stalled = true; waitNames.push.apply(waitNames, st); }
+    }
+    if (stalled) {
+      stallWhy = 'WAITING FOR ' + (waitNames.length ? waitNames.map(esc).join(' AND ') : 'ANOTHER PLAYER') +
+        (t.stallMs ? ' — ' + (t.stallMs / 1000).toFixed(1) + ' s' : '');
+    }
+
+    const d = t.delayFrames;
+    const modeWord = (t.mode === 'lockstep') ? 'LOCKSTEP'
+      : (t.mode === 'none' && !connected) ? 'ROOM OPEN' : 'NOT LOCKSTEP';
+    let html = '<span class="mode">' + modeWord + '</span> ' +
+      '<span class="k">' + (modeWord === 'ROOM OPEN'
+        ? 'waiting for players — nothing starts until everyone is in'
+        : 'every machine runs the game · your pad drives your own console') + '</span>';
+    html += '<br><span class="k">input delay</span> ' +
+      (d == null ? '—' : d + (d === 1 ? ' frame' : ' frames') + ' (' + Math.round(d * FRAME_MS) + ' ms)') +
+      ' <span class="k">· frame</span> ' + (t.frame == null ? '—' : t.frame) +
+      (t.stallTotalMs > 0 ? ' <span class="k">· stalled</span> ' + (t.stallTotalMs / 1000).toFixed(1) + ' s total' : '');
+    html += roster;
+    if (stalled) html += '<br><span class="stall">⏸ ' + stallWhy + '</span>';
+
+    el.className = 'on ' + (t.mode === 'lockstep' ? 'lockstep' : 'fault') + (stalled ? ' stalling' : '');
+    if (html !== HUD.text) { el.innerHTML = html; HUD.text = html; }
+    HUD.stalled = stalled; HUD.stallWhy = stallWhy; HUD.waitingOn = waitNames;
+  }
+
+  function netHudStart() {
+    if (HUD.on) return;
+    HUD.on = true; HUD.text = '';
+    // ⚠ THE INTERVAL IS INSTALLED FIRST, and the first tick is guarded. A throw
+    // in tick 0 used to escape and leave the panel permanently dead — see the
+    // note in netTelemetry(). Belt as well as braces: this panel reports faults,
+    // so it must not be able to become one silently.
+    HUD.tickTimer = setInterval(() => { try { netHudTick(); } catch (e) { pageLog('[net] HUD tick threw: ' + ((e && e.message) || e)); } }, 400);
+    try { netHudTick(); } catch (e) { pageLog('[net] HUD tick threw: ' + ((e && e.message) || e)); }
+  }
+  function netHudStop() {
+    HUD.on = false;
+    if (HUD.tickTimer) clearInterval(HUD.tickTimer);
+    HUD.tickTimer = 0;
+    const el = $('netHud'); if (el) { el.className = ''; el.innerHTML = ''; }
+    HUD.text = '';
+    // ⚠ THE BANNER IS NOT CLEARED HERE. Leaving a desynced session is exactly
+    // when a player still needs to be able to read why it ended. It is cleared
+    // on the next JOIN, by netHudClearDesync().
+  }
+  function netHudClearDesync() {
+    HUD.desyncLatched = false; HUD.desyncAt = 0;
+    const ban = $('netDesync'); if (ban) { ban.classList.remove('on'); ban.innerHTML = ''; }
+  }
+
+  // ===========================================================================
+  // THE ROOM — who is in it, which PORT each of them holds, and the START
+  // BARRIER that stops anybody advancing frame 0 alone.
+  //
+  // THE ORDER, and why it is this way round:
+  //   1. everybody opens the page and joins the ROOM — no disc, nothing started
+  //   2. ports are assigned and SHOWN, so a player knows they are Player 3
+  //      before the game starts, because that is which character they get
+  //   3. everybody loads the SAME disc, with per-player progress visible —
+  //      these discs run to 1,131 MB and a phone on mobile data is normal, so
+  //      "still loading" is a state three other people can see, not a freeze
+  //   4. a START BARRIER: nobody advances frame 0 until every peer is ready
+  //   5. all cores run frame 0 together
+  //
+  // ⚠ THERE IS NO SAVESTATE HANDOFF, and that is a STRONGER guarantee, not a
+  // missing feature. Every core boots the same disc from frame 0, so the
+  // starting states are identical BY CONSTRUCTION — where a transferred
+  // savestate can fail to restore and silently cold-boot instead (CLAUDE.md
+  // gate #10 records exactly that trap producing plausible-looking numbers).
+  //
+  // ⚠ THE PORT COUNT COMES FROM THE ENGINE. A 4 written here would be wrong on
+  // the next console: the Dreamcast has four Maple ports
+  // (flycast-src/core/hw/maple/maple_devs.h:193) and GameCube's bridge
+  // currently wires one (gamecube/dolphin-bridge/EmscriptenWorker.cpp:473).
+  // ===========================================================================
+  const ROOM = { timer: 0, on: false, lastHtml: '', lastPortsTxt: '', lastBarrier: '' };
+
+  // What THIS machine has of the disc, 0..1, for the engine to publish to the
+  // room. PROG is the page's own download/boot progress — the same fields the
+  // boot UI and __dcProbe already read, so this cannot drift from what the
+  // player is being shown elsewhere.
+  function netLocalLoad() {
+    if (safe(() => booted, false)) return 1;
+    const tot = PROG.discTotal || 0, got = PROG.discBytes || 0;
+    if (!tot) return 0;
+    return Math.max(0, Math.min(1, got / tot));
+  }
+
+  function netRoomRender() {
+    const box = $('netRoom'), ul = $('netRoster');
+    const s = NET.session;
+    if (!box || !ul) return;
+    if (!s) { box.style.display = 'none'; return; }
+    box.style.display = '';
+
+    // Publish our own progress if the engine will take it. Guarded: an engine
+    // without the method costs the room a progress bar, not a session.
+    try { if (typeof s.setLoadProgress === 'function') s.setLoadProgress(netLocalLoad()); } catch (e) {}
+
+    const t = netTelemetry() || {};
+    const ports = (t.ports != null) ? t.ports : null;
+    const peers = t.peers || [];
+    const youPort = t.you ? t.you.port : null;
+
+    // ⚠ NO INVENTED ROOM. Until the engine publishes a port count and a roster
+    // there is nothing truthful to draw, and drawing a plausible two-seat room
+    // would be the same class of lie as a status line that says "Connected"
+    // while nothing is connected.
+    if (ports == null) {
+      const txt = 'waiting for the room';
+      if (ROOM.lastHtml !== txt) {
+        ul.innerHTML = '<li class="free"><span class="port">—</span>' +
+          '<span class="who">the session has not published a room yet</span></li>';
+        ROOM.lastHtml = txt;
+      }
+      $('netRoomPorts').textContent = '';
+      return;
+    }
+
+    const taken = peers.filter((q) => q.port != null).length + (youPort != null ? 1 : 0);
+    const portsTxt = '· ' + ports + (ports === 1 ? ' port' : ' ports') + ' · ' +
+      Math.max(0, ports - taken) + ' free';
+    if (portsTxt !== ROOM.lastPortsTxt) { $('netRoomPorts').textContent = portsTxt; ROOM.lastPortsTxt = portsTxt; }
+
+    const rows = [];
+    for (let port = 0; port < ports; port++) {
+      const isYou = (youPort === port);
+      const peer = peers.find((q) => q.port === port);
+      const who = isYou ? (t.you.name || 'you') : (peer ? (peer.name || 'player') : 'open');
+      let cls = 'free', state = '', pct = null;
+      if (isYou || peer) {
+        const src = isYou ? t.you : peer;
+        pct = (typeof src.loadPct === 'number') ? Math.max(0, Math.min(1, src.loadPct)) : null;
+        if (peer && peer.connected === false) { cls = 'gone'; state = 'disconnected'; }
+        else if (src.ready) { cls = 'ready'; state = 'ready'; }
+        else if (pct != null && pct < 1) { cls = 'loading'; state = Math.round(pct * 100) + '% loaded'; }
+        else { cls = 'loading'; state = 'not ready'; }
+        if (isYou) cls += ' you';
+      }
+      rows.push('<li class="' + cls + '">' +
+        '<span class="port">P' + (port + 1) + '</span>' +
+        '<span class="who">' + esc(who) + (isYou ? ' (you)' : '') + '</span>' +
+        (pct != null && pct < 1 ? '<span class="bar"><i style="width:' + Math.round(pct * 100) + '%"></i></span>' : '') +
+        '<span class="state">' + esc(state) + '</span></li>');
+    }
+    const html = rows.join('');
+    if (html !== ROOM.lastHtml) { ul.innerHTML = html; ROOM.lastHtml = html; }
+
+    // ---- the start barrier --------------------------------------------------
+    const bar = $('netBarrier'), rdy = $('netReady');
+    const b = t.barrier || {};
+    const notReady = [];
+    if (youPort != null && t.you && !t.you.ready) notReady.push('you');
+    peers.forEach((q) => { if (q.port != null && !q.ready) notReady.push(netPlayerLabel(q.port, t)); });
+    let btxt, bcls;
+    if (b.started) { btxt = 'Everyone started together at frame ' + (b.startFrame != null ? b.startFrame : 0) + '.'; bcls = 'go'; }
+    else if (notReady.length) { btxt = 'Nobody starts until everyone is ready — waiting for ' + notReady.join(', ') + '.'; bcls = 'hold'; }
+    else { btxt = 'Everyone is ready. Starting together.'; bcls = 'go'; }
+    if (btxt !== ROOM.lastBarrier) { bar.textContent = btxt; bar.className = bcls; ROOM.lastBarrier = btxt; }
+
+    // The ready button exists only while there is something to be ready FOR.
+    if (rdy) {
+      const canReady = !b.started && youPort != null && t.you && !t.you.ready && netLocalLoad() >= 1;
+      rdy.style.display = (!b.started && youPort != null) ? '' : 'none';
+      rdy.disabled = !canReady;
+      rdy.textContent = (t.you && t.you.ready) ? "You're ready" :
+        (netLocalLoad() < 1 ? 'Loading the game…' : "I'm ready");
+    }
+  }
+  function netRoomStart() {
+    if (ROOM.on) return;
+    ROOM.on = true; ROOM.lastHtml = ''; ROOM.lastPortsTxt = ''; ROOM.lastBarrier = '';
+    ROOM.timer = setInterval(() => { try { netRoomRender(); } catch (e) { pageLog('[net] room render threw: ' + ((e && e.message) || e)); } }, 500);
+    try { netRoomRender(); } catch (e) { pageLog('[net] room render threw: ' + ((e && e.message) || e)); }
+  }
+  function netRoomStop() {
+    ROOM.on = false;
+    if (ROOM.timer) clearInterval(ROOM.timer);
+    ROOM.timer = 0;
+    const box = $('netRoom'); if (box) box.style.display = 'none';
+  }
+  window.__dcNetRoom = () => {
+    const ul = $('netRoster');
+    return {
+      on: ROOM.on,
+      visible: !!($('netRoom') && $('netRoom').style.display !== 'none'),
+      ports: $('netRoomPorts') ? $('netRoomPorts').textContent : '',
+      rows: ul ? Array.prototype.map.call(ul.children, (li) => ({
+        cls: li.className, text: (li.textContent || '').replace(/\s+/g, ' ').trim(),
+      })) : [],
+      barrier: $('netBarrier') ? $('netBarrier').textContent : '',
+      barrierClass: $('netBarrier') ? $('netBarrier').className : '',
+      readyShown: !!($('netReady') && $('netReady').style.display !== 'none'),
+      readyEnabled: !!($('netReady') && !$('netReady').disabled),
+      localLoad: netLocalLoad(),
+    };
+  };
+
+  // Test seam, a SIBLING of __dcNet/__dcPad/__dcProbe for the same reason they
+  // are siblings of each other: three rigs already consume __dcNet's shape.
+  window.__dcNetHud = () => ({
+    on: HUD.on,
+    visible: !!($('netHud') && $('netHud').classList.contains('on')),
+    mode: HUD.mode,
+    text: $('netHud') ? ($('netHud').textContent || '') : '',
+    stalled: !!HUD.stalled, stallWhy: HUD.stallWhy || null, waitingOn: HUD.waitingOn || [],
+    desyncLatched: HUD.desyncLatched,
+    bannerVisible: !!($('netDesync') && $('netDesync').classList.contains('on')),
+    bannerText: $('netDesync') ? ($('netDesync').textContent || '') : '',
+    telemetry: HUD.tel || null,
+  });
 
   (function wireNetplay() {
     // NEVER SHOW A CONTROL THAT CANNOT WORK. The three entry points stay
@@ -4940,6 +5275,19 @@
       catch (e) { $('netCopy').textContent = 'Copy failed — read it out'; }
       setTimeout(() => { $('netCopy').textContent = 'Copy code'; }, 1800);
     });
+    // THE START BARRIER's one control. Ready is a per-player claim the ENGINE
+    // owns — the page only says "this person pressed it"; whether frame 0 runs
+    // is decided by every peer being ready, not by this click.
+    const rdy = $('netReady');
+    if (rdy) rdy.addEventListener('click', () => {
+      const sess = NET.session;
+      if (!sess) return;
+      try {
+        if (typeof sess.setReady === 'function') sess.setReady(true);
+        else pageLog('[net] this build has no start barrier yet (session.setReady is missing)');
+      } catch (e) { pageLog('[net] setReady threw: ' + ((e && e.message) || e)); }
+      netRoomRender();
+    });
     $('netLeave').addEventListener('click', netLeave);
     pageLog('[net] online play available (' + netTransport() + ' signalling)');
 
@@ -4955,7 +5303,7 @@
     // that is about to start is something to dismiss, not something to read. And
     // it does not touch #btnStart when the button is disabled — that is either a
     // boot already in flight or lib/capability.js holding it down, and this page
-    // never re-enables a control the capability layer blocked (see netGuestStartLock).
+    // never re-enables a control the capability layer blocked.
     {
       const npGame = QS.get('game');
       const npCode = (QS.get('np') || '').toUpperCase();
@@ -5154,10 +5502,12 @@
     shell.style.display = 'block';
     $('mobileSplash').style.display = 'flex';
     $('mobileScreen').appendChild($('dc-canvas'));
-    // The guest's <video> stands in for the canvas, so it has to be reparented
-    // WITH it — left behind in #canvasWrap it would be inside a hidden #wrap and
-    // a phone guest would see nothing at all.
-    if ($('netVideo')) $('mobileScreen').appendChild($('netVideo'));
+    // The session-truth panel and the desync banner are positioned against
+    // whichever container holds the picture, so they follow it. Left behind in
+    // #canvasWrap they would be inside a hidden #wrap and a phone player would
+    // never be told their game had desynced.
+    if ($('netHud')) $('mobileScreen').appendChild($('netHud'));
+    if ($('netDesync')) $('mobileScreen').appendChild($('netDesync'));
     holdBtn('mobileA', 'm'); holdBtn('mobileB', 'k'); holdBtn('mobileX', 'j'); holdBtn('mobileY', 'n');
     holdBtn('mobileL', 'q'); holdBtn('mobileR', 'e'); holdBtn('mobileStart', 'enter');
     wireDpadDisc();
