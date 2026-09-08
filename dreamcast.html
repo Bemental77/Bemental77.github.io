@@ -5208,6 +5208,9 @@
     // assigned, and only then does everybody load the same disc and start
     // together. Making a player boot a 1.1 GB disc before they are allowed to
     // find out whether they even got a port is exactly the wrong way round.
+    // The disc can have changed since the page loaded; the join pane must name
+    // what this player actually has selected, not what was selected at init.
+    if (NET.syncNetGame && !NET.session) { try { NET.syncNetGame(); } catch (e) {} }
     if (!NET.session) netStatus('Not connected. Open a room or join one — you do not need a game running first.');
   }
   function netClose() { $('netOverlay').classList.remove('on'); }
@@ -6006,18 +6009,40 @@
               (typeof RTCPeerConnection !== 'function' ? 'RTCPeerConnection' : 'BroadcastChannel'));
       return;
     }
-    // The join pane's game list mirrors #romSelect so the two cannot drift, and
-    // so it works on the phone shell where #romSelect is inside a hidden #wrap.
-    const sel = $('netGame'), src = $('romSelect');
-    if (sel && src) {
-      sel.innerHTML = '';
-      Array.prototype.forEach.call(src.options, (o) => {
-        const opt = document.createElement('option');
-        opt.value = o.value; opt.textContent = o.textContent;
-        sel.appendChild(opt);
-      });
-      sel.value = src.value;
-    }
+    // ⚠ THIS RAN ONCE AT PAGE INIT AND NEVER AGAIN, which made a joiner send the
+    // game that was selected WHEN THE PAGE LOADED rather than the one they had
+    // chosen. A user with Gauntlet loaded was refused with "Could not connect:
+    // the other player is on gauntlet" — told they disagreed about the game they
+    // were both on. netOpen() did not re-sync it and #romSelect had no change
+    // listener feeding it, so the value went stale the moment anybody picked a
+    // different disc.
+    //
+    // ONE SOURCE OF TRUTH: #romSelect. The phone's #mobileRomSelect is already
+    // kept in step with it in both directions (mirrorRomSelectToMobile), so
+    // syncing from #romSelect covers the phone shell too, where #romSelect
+    // itself lives inside a hidden #wrap.
+    const syncNetGame = () => {
+      const sel = $('netGame'), src = $('romSelect');
+      if (!sel || !src) return;
+      const want = src.value;
+      if (sel.options.length !== src.options.length) {
+        sel.innerHTML = '';
+        Array.prototype.forEach.call(src.options, (o) => {
+          const opt = document.createElement('option');
+          opt.value = o.value; opt.textContent = o.textContent;
+          sel.appendChild(opt);
+        });
+      }
+      sel.value = want;
+    };
+    syncNetGame();
+    // Re-sync on every route by which the disc can change: the desktop picker,
+    // the phone picker (which writes through to #romSelect), and opening the
+    // lobby at all — a player picks the game and THEN goes looking for the
+    // button, so the open is the last moment before they commit.
+    const rs = $('romSelect'); if (rs) rs.addEventListener('change', syncNetGame);
+    const mrs = $('mobileRomSelect'); if (mrs) mrs.addEventListener('change', syncNetGame);
+    NET.syncNetGame = syncNetGame;
     ['btnNet', 'mNet', 'mobileSplashNet'].forEach((id) => { const b = $(id); if (b) b.style.display = ''; });
     const open = () => { const m = $('mobileMenu'); if (m) m.classList.remove('open'); netOpen(); };
     ['btnNet', 'mNet', 'mobileSplashNet'].forEach((id) => { const b = $(id); if (b) b.addEventListener('click', open); });
