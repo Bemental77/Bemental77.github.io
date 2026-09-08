@@ -34,10 +34,22 @@ permissions:
   pages: write
   id-token: write
 
-# Cancel a running deploy if a newer push lands.
-concurrency:
-  group: pages
-  cancel-in-progress: true
+# ⚠ NOT AT WORKFLOW LEVEL, AND NOT CANCELLING A DEPLOY THAT IS PUBLISHING.
+# Together with the decide job this produced a site that silently stopped
+# updating, which is worse than a slow deploy:
+#   762682c1 (a real page fix)  -> run CANCELLED by the next push
+#   778fe23f, 72ab3cf9, 5f9feabf -> each CANCELLED by the next push
+#   6aff7958 (tools only)        -> decide=false, deploy job SKIPPED
+#                                   run conclusion: SUCCESS
+# Five green-looking runs, nothing published, and the live page sat at d80aac9b
+# while the user kept reporting a bug that was fixed and pushed. A workflow-level
+# group let a run that was NEVER GOING TO DEPLOY cancel one that was mid-upload,
+# and then decline to take its place.
+#
+# So the group is on the deploy JOB only — a decide-only run cannot cancel a
+# publish — and cancel-in-progress is off, because this deploy's cost means a
+# cancellation is very likely to be the last word rather than a superseded one.
+# The decide job is what stops needless deploys now; that is its whole purpose.
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -80,13 +92,34 @@ jobs:
             echo "Not a push (${{ github.event_name }}) — deploying."
             exit 0
           fi
-          BEFORE="${{ github.event.before }}"
+          # ⚠ COMPARE AGAINST WHAT IS PUBLISHED, NOT AGAINST THE PREVIOUS PUSH.
+          # "Did this push change anything?" is the wrong question whenever the
+          # last deploy did not happen — cancelled, skipped, or failed. Asking it
+          # is what let the site sit at d80aac9b through five later commits: each
+          # push only looked one step back, saw nothing of its own to publish,
+          # and never noticed the fix four commits earlier had never gone out.
+          # The github-pages environment records the commit that actually
+          # deployed, so that is the baseline. It self-heals: a missed deploy is
+          # simply still pending next time.
+          LIVE=$(GH_TOKEN="${{ github.token }}" gh api "repos/${{ github.repository }}/deployments?environment=github-pages&per_page=1" \
+                   --jq '.[0].sha' 2>/dev/null || true)
+          if [ -n "$LIVE" ] && [ "$LIVE" != "null" ]; then
+            git fetch --no-tags --filter=blob:none --depth=1 origin "$LIVE" 2>/dev/null || true
+          fi
+          if [ -n "$LIVE" ] && [ "$LIVE" != "null" ] && git cat-file -e "$LIVE^{commit}" 2>/dev/null; then
+            echo "Baseline = last PUBLISHED commit $LIVE"
+            BEFORE="$LIVE"
+          else
+            echo "No usable published commit (got '$LIVE') — falling back to the previous push."
+            BEFORE="${{ github.event.before }}"
+          fi
           # Fetch just the one commit we are diffing against, without its file
           # contents. If it is unreachable — force-push, or history rewritten —
           # this fails and the guard below deploys, which is the safe answer.
           if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
             git fetch --no-tags --filter=blob:none --depth=1 origin "$BEFORE" 2>/dev/null || true
           fi
+          git cat-file -e "$BEFORE^{commit}" 2>/dev/null || echo "(baseline $BEFORE not reachable — the guard below will deploy)"
           # A new branch, a force-push past what we have, or a first run: the
           # honest answer is "we do not know what changed", and the safe answer
           # is to deploy.
@@ -105,6 +138,9 @@ jobs:
   deploy:
     needs: decide
     if: needs.decide.outputs.deploy == 'true'
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     environment:
       name: github-pages
