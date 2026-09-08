@@ -59,7 +59,10 @@ const installFakePeer = (page, mode) => page.evaluate((mode) => {
       // Nobody is registered under the host id — the broker's answer to a
       // wrong code, and to a host who has not started yet.
       if (mode === 'unavailable') { setTimeout(() => fire('error', { type: 'peer-unavailable' }), 5); return { on: () => {}, open: false }; }
-      return { on: () => {}, open: false };
+      // The host IS registered, but the connection to it never comes up and
+      // never errors — what a peerjs DataConnection does when neither network
+      // will carry a direct path. This is the stall with no error to catch.
+      return { on: () => {}, open: false, close: () => { window.__peerLog.push('hangup'); } };
     };
     window.__peerLog.push('new Peer ' + id);
     // 1. never answers: no 'open', no 'error'. The old code hung here.
@@ -73,6 +76,8 @@ const installFakePeer = (page, mode) => page.evaluate((mode) => {
     }
     // 3. answers, but the peer being dialled is not there. Bounded knocking.
     if (mode === 'unavailable') { setTimeout(() => fire('open', id), 5); return; }
+    // 4. the broker knows the host, but the dial never opens and never errors.
+    if (mode === 'dial-never-opens') { setTimeout(() => fire('open', id), 5); return; }
   };
 }, mode);
 
@@ -154,28 +159,46 @@ console.log('\n== 3. no host registered under that code ==');
   await p.close();
 }
 
-// ---- ARM 4: the game connection must offer a RELAY, not STUN alone ----------
-console.log('\n== 4. ICE configuration of the GAME connection ==');
+// ---- ARM 4: host registered, but the dial never opens ----------------------
+// The stall that best fits the reported failure: a peerjs DataConnection is
+// itself a WebRTC connection, so on networks that will not carry a direct path
+// it is created, emits NO error, and simply never opens. Nothing timed it.
+console.log('\n== 4. host is there, but the connection never comes up ==');
 {
   const p = await mk();
-  const ice = await p.evaluate(async () => {
-    // Read what the session actually hands RTCPeerConnection, by intercepting
-    // the constructor — asserting on the source text would prove nothing about
-    // what runs.
-    const Real = window.RTCPeerConnection;
-    let seen = null;
-    window.RTCPeerConnection = function (cfg) { seen = cfg; return new Real(cfg); };
-    window.RTCPeerConnection.prototype = Real.prototype;
-    const s = new Netplay.Session({ game: 'g', host: true, code: 'ABCDE', transport: 'local' });
-    await s.start();
-    try { s.close(); } catch (e) {}
-    window.RTCPeerConnection = Real;
-    return seen;
+  await installFakePeer(p, 'dial-never-opens');
+  await run(p, false);
+  const v = await waitFor(p, (x) => x.state === 'failed', 240000);
+  if (v.state === 'failed' && /blocking direct peer-to-peer/.test(String(v.last)))
+    ok('dead-dial-is-diagnosed', `"${v.last}"`);
+  else
+    bad('dead-dial-is-diagnosed', `state=${v.state} lastError=${JSON.stringify(v.last)} statuses=${JSON.stringify(v.st)}`);
+  const hangups = (v.peerLog || []).filter((l) => l === 'hangup').length;
+  if (hangups > 1) ok('dead-dial-is-retried', `${hangups} dials hung up and re-placed instead of waiting forever`);
+  else bad('dead-dial-is-retried', `${hangups} hangups — a dial that never opens is never retried`);
+  await p.close();
+}
+
+// ---- ARM 5: no dead relay is shipped ---------------------------------------
+// peerjs 1.5.4 hardcodes turn:eu-0/us-0.turn.peerjs.com as its defaults and
+// NEITHER RESOLVES (dig +short A ... @8.8.8.8 is empty). Shipping them here
+// would look like a fix and relay nothing.
+console.log('\n== 5. no decorative relay ==');
+{
+  const p = await mk();
+  const cfg = await p.evaluate(() => window.Netplay.iceConfig());
+  const j = JSON.stringify(cfg);
+  if (/stun:/.test(j)) ok('stun-is-configured', j);
+  else bad('stun-is-configured', j);
+  if (!/turn\.peerjs\.com/.test(j)) ok('no-dead-relay-shipped', 'the unresolvable peerjs TURN hosts are not in the config');
+  else bad('no-dead-relay-shipped', `ships a relay whose DNS does not resolve :: ${j}`);
+  const withRelay = await p.evaluate(() => {
+    const r = window.Netplay.useRelay([{ urls: 'turn:relay.example:3478', username: 'u', credential: 'p' }]);
+    window.Netplay.useRelay([]);
+    return r;
   });
-  const urls = JSON.stringify((ice && ice.iceServers) || []);
-  const hasTurn = /turn:/.test(urls), hasStun = /stun:/.test(urls);
-  if (hasTurn && hasStun) ok('game-connection-has-a-relay', urls);
-  else bad('game-connection-has-a-relay', `STUN=${hasStun} TURN=${hasTurn} :: ${urls} — two peers behind symmetric NATs cannot reach each other with STUN alone`);
+  if (/turn:relay\.example:3478/.test(JSON.stringify(withRelay))) ok('a-real-relay-is-one-setting', JSON.stringify(withRelay));
+  else bad('a-real-relay-is-one-setting', JSON.stringify(withRelay));
   await p.close();
 }
 
