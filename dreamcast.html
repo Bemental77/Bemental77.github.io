@@ -4760,9 +4760,12 @@
       NET.sentP2 = Array.from(r.image.subarray(64, 76));
       worker.postMessage({ cmd: 'lsInput', f: r.frame, states: r.image });
       LS.fedTo = r.frame + 1;
-      const owed = (typeof ls.wantsHash === 'function') ? ls.wantsHash(r.frame) : false;
+      // ⚠ THE PAGE DOES NOT DECIDE WHICH FRAMES ARE FINGERPRINTED, so it does
+      // not track what it is owed. The worker hashes on its own hashEvery and
+      // posts 'lsHash'; submitHash() takes whatever arrives, for whatever frame
+      // it names, and is idempotent. An earlier version kept an `owed` frame
+      // here and never read it.
       ls.endFrame(null);                 // advance the clock; the hash is late — see submitHash
-      if (owed) LS.hashOwed = r.frame;
       // A runaway feed would be a bug in this loop, not a feature. The bound is
       // never reached in practice (lookahead is `delay`), and reaching it is
       // worth catching rather than sprinting the guest.
@@ -4783,6 +4786,23 @@
     if (typeof ls.submitHash !== 'function') { LS.hashSink = false; return; }
     LS.hashSink = true;
     if (ls.submitHash(d.f | 0, d.h >>> 0, d.w || null)) LS.hashesFed++;
+  }
+
+  // ---- and RELEASING it, which is not optional ------------------------------
+  // ⚠ A GATED CORE WHOSE ROOM IS GONE IS A FROZEN CONSOLE. The gate holds the
+  // pump on an empty queue; if the session ends while it is armed, nothing ever
+  // feeds it again and the player is left staring at a still picture with no
+  // room and no explanation. Leaving a room (or the room closing under you)
+  // therefore hands the console back: lockstep off, the worker's own free-run
+  // governor resumes at 1.000x, and the game carries on single-player from
+  // exactly the frame it was holding.
+  function lsDisarm(why) {
+    if (!LS.armed) return;
+    LS.armed = false; LS.running = false; LS.lastImage = null;
+    LS.stalling = false; LS.waitingOn = []; LS.stallReason = null; LS.workerStall = false;
+    if (booted) worker.postMessage({ cmd: 'lockstep', on: 0 });
+    pageLog('[lockstep] frame gate RELEASED — ' + why + '. This console free-runs from here and is no longer ' +
+            'sharing frames with anybody.');
   }
 
   // ---- arming, in the two places the ORDER matters --------------------------
@@ -5165,6 +5185,7 @@
       // sides and arrives AFTER netLeave() has set its own text, so without the
       // flag the person who pressed Leave is told the other player left.
       netStatus(NET.leaving ? 'Left the room.' : 'The room closed.', 'busy');
+      lsDisarm(NET.leaving ? 'you left the room' : 'the room closed');
       netHudStop(); netRoomStop();
     } else if (s === 'failed') {
       netStatus('Could not connect' + (e.detail ? ': ' + e.detail : '.'), 'bad');
@@ -5259,6 +5280,7 @@
     $('netLeave').style.display = 'none';
     $('netHostPane').style.display = 'none';
     $('netJoinPane').style.display = 'none';
+    lsDisarm('you left the room');
     netHudStop(); netRoomStop();
     netStatus('Left the room.');
     pageLog('[net] session closed by this side');
