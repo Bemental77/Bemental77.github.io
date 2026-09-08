@@ -59,10 +59,15 @@ jobs:
     outputs:
       deploy: ${{ steps.check.outputs.deploy }}
     steps:
-      - name: Checkout (blobless, history only)
+      # ⚠ NOT `fetch-depth: 0`. The first version of this job used a full
+      # blobless clone and took 143 s to answer a yes/no question (run
+      # 34248235082, 15:59:39 -> 16:02:02) — overhead charged to EVERY deploy,
+      # which eats much of what skipping a needless one saves. Only two commits
+      # are ever compared, so only two are fetched.
+      - name: Checkout (shallow)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           filter: blob:none
           lfs: false
 
@@ -76,6 +81,12 @@ jobs:
             exit 0
           fi
           BEFORE="${{ github.event.before }}"
+          # Fetch just the one commit we are diffing against, without its file
+          # contents. If it is unreachable — force-push, or history rewritten —
+          # this fails and the guard below deploys, which is the safe answer.
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            git fetch --no-tags --filter=blob:none --depth=1 origin "$BEFORE" 2>/dev/null || true
+          fi
           # A new branch, a force-push past what we have, or a first run: the
           # honest answer is "we do not know what changed", and the safe answer
           # is to deploy.
