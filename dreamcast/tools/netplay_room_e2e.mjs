@@ -831,14 +831,24 @@ try {
     say(`  P${i + 1} keydown -> the frame image its OWN core consumes:  n=${s.n} min ${s.min} p50 ${s.p50} p95 ${s.p95} max ${s.max} ms`);
   }
   RESULT.latency = lat;
+  // ⚠ IN MEASURED MILLISECONDS, NOT AT 60 Hz. A lockstep frame is one
+  // retro_run, and Gauntlet renders every other vblank — so its frame is ~34 ms
+  // and this line printed HALF the delay the players were actually paying. Same
+  // mistake the page's own panel made (fixed there too): 2 frames read "33 ms"
+  // while the panel beside it, and the measured latency, said 69.
   const delayInfo = await pages[0].evaluate(() => {
     const n = window.__dcNet(); const h = window.__dcNetHud();
+    const p = window.__dcProbe();
+    const frameMs = (p && p.fps > 0) ? (1000 / p.fps) : (1000 / 60);
+    const d = h.telemetry && h.telemetry.delayFrames != null ? h.telemetry.delayFrames : null;
     return { delay: n && n.lockstep ? n.lockstep.delay : null,
-             ms: h.telemetry && h.telemetry.delayFrames != null ? Math.round(h.telemetry.delayFrames * 1000 / 60) : null };
+             frameMs: +frameMs.toFixed(1), measured: !!(p && p.fps > 0),
+             ms: d == null ? null : Math.round(d * frameMs) };
   });
   RESULT.delay = delayInfo;
-  say(`  the room's agreed input delay: ${delayInfo.delay} frames (~${delayInfo.ms} ms at 60 Hz) — every player pays ` +
-      'it symmetrically, and it is what buys a local-feeling pad instead of a variable network one');
+  say(`  the room's agreed input delay: ${delayInfo.delay} frames = ${delayInfo.ms} ms at this title's measured ` +
+      `${delayInfo.frameMs} ms frame${delayInfo.measured ? '' : ' (ESTIMATED — no frame rate measured)'} — every ` +
+      'player pays it symmetrically, and it is what buys a local-feeling pad instead of a variable network one');
 
   // ---- 8b. AND WHAT THE WIRE COSTS, PER PAIR, WITH N CORES RUNNING ---------
   // The figure above is a player's own pad reaching their own core — the number

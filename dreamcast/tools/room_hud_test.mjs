@@ -224,7 +224,14 @@ try {
   cell(h1.visible && /LOCKSTEP/.test(h1.text), 'hud-names-the-mode',
     `the HUD over the picture reads "${h1.text.replace(/\s+/g, ' ').slice(0, 110)}…"`,
     `HUD not visible or not naming the mode: ${J(h1)}`);
-  cell(/3 frames \(50 ms\)/.test(h1.text), 'hud-shows-input-delay-in-frames',
+  // ⚠ THE `est.` SUFFIX IS REQUIRED HERE, NOT TOLERATED. A lockstep frame is
+  // one retro_run, not one vblank, so its length is a MEASURED quantity — and
+  // this fixture has no core running, which means 50 ms is a 60 Hz guess. The
+  // panel printed exactly that guess unlabelled for a Gauntlet room whose real
+  // frame is ~34 ms and whose measured keydown->core latency was 128-139 ms
+  // p50, i.e. it halved the number the player was trying to feel. So the cell
+  // below accepts the label, and the one after it INSISTS on it.
+  cell(/3 frames \(50 ms( est\.)?\)/.test(h1.text), 'hud-shows-input-delay-in-frames',
     'input delay is shown as "3 frames (50 ms)" — an exact integer, which is what lockstep has and streaming did not',
     `the HUD does not carry the frame delay: "${h1.text}"`);
 
@@ -236,6 +243,12 @@ try {
   await page.evaluate((t) => { window.__dcNetTelemetryOverride = t; }, stalled);
   await sleep(900);
   const h2 = await page.evaluate(() => window.__dcNetHud());
+  cell(/50 ms est\./.test(h1.text), 'an-UNMEASURED-frame-length-is-labelled-as-an-estimate',
+    'with no core running the panel says "50 ms est." rather than asserting 50 ms — the frame length is ' +
+    'measured from the presented rate at 1.000x, and a title that renders every other vblank has a ~34 ms ' +
+    'frame, so an unlabelled 60 Hz figure is a wrong number stated confidently',
+    `the panel printed an unlabelled millisecond figure with no core running: "${h1.text.replace(/\s+/g, ' ').slice(0, 140)}"`);
+
   cell(h2.stalled && /WAITING FOR/.test(h2.text) && /P2/.test(h2.text),
     'stall-names-the-player',
     `the HUD reads "${(h2.stallWhy || '').slice(0, 90)}" — in a room of four, "waiting…" is not actionable; ` +

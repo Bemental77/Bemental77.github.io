@@ -4675,6 +4675,21 @@
     engagedAt: 0,
   };
 
+  // HOW LONG A LOCKSTEP FRAME ACTUALLY IS, MEASURED — not 1000/60.
+  // ⚠ A FRAME IS ONE retro_run, NOT ONE VBLANK. lib/netplay.js says so directly
+  // above class Lockstep ("delay=3 is 100 ms there and 50 ms on a 60 fps
+  // title"), and this page printed the 60 Hz figure anyway: the panel read
+  // "3 frames (50 ms)" on a Gauntlet room whose keydown->core latency measured
+  // 128-139 ms p50, because Gauntlet renders every other vblank and its frame
+  // is ~34 ms. A panel that halves the number a player is trying to feel is
+  // worse than one that says nothing, so this is measured from the presented
+  // rate at 1.000x and is LABELLED when it has to fall back to an estimate.
+  function lsFrameMs() {
+    const f = safe(() => lastFps, 0);
+    return (f > 0) ? (1000 / f) : (1000 / 60);
+  }
+  function lsFrameMsIsMeasured() { return safe(() => lastFps, 0) > 0; }
+
   function lsEngine() {
     const s = NET.session;
     if (!s) return null;
@@ -4786,6 +4801,40 @@
     if (typeof ls.submitHash !== 'function') { LS.hashSink = false; return; }
     LS.hashSink = true;
     if (ls.submitHash(d.f | 0, d.h >>> 0, d.w || null)) LS.hashesFed++;
+  }
+
+  // The host's one decision about how the room will feel. No-op for a guest
+  // (the host's number wins and arrives in 'lsgo') and no-op if the engine or
+  // the RTT probe is missing, in which case the constructor default stands and
+  // the panel still states whatever is actually in force.
+  async function lsChooseDelay(sess) {
+    try {
+      const ls = sess && sess.ls;
+      if (!ls || !ls.isHost) return null;
+      if (typeof sess.rttReport !== 'function') return null;
+      // ⚠ SHORT TIMEOUT ON PURPOSE. rttReport pings the peers ONE AT A TIME, so
+      // the timeout multiplies by the number of players — and this runs while
+      // the room is waiting to start. A healthy link answers in 2-3 ms; a peer
+      // that does not answer inside 600 ms is not a peer whose RTT should be
+      // allowed to hold up the barrier, and its absence simply leaves the
+      // default in force.
+      const r = await sess.rttReport(600);
+      const want = r && r.recommendedDelay != null ? Math.max(1, Math.min(10, r.recommendedDelay | 0)) : null;
+      if (want == null || want === ls.delay) return ls.delay;
+      const was = ls.delay;
+      ls.delay = want;
+      // ⚠ SAY WHICH IT IS. This runs BEFORE the barrier, so no core has
+      // presented a frame yet and lsFrameMs() is still the 60 Hz fallback — the
+      // very thing the panel was just fixed for. Printing "at the measured
+      // frame length" here would reintroduce the same wrong-number-stated-
+      // confidently in the log instead of on screen.
+      pageLog('[lockstep] input delay ' + was + ' -> ' + want + ' frames (' + Math.round(want * lsFrameMs()) +
+              ' ms' + (lsFrameMsIsMeasured() ? ' at the measured frame length' : ' estimated at 60 Hz; the ' +
+              'panel will state the measured figure once frames flow') + ') — chosen from the worst measured RTT ' +
+              (r.worstMs == null ? '?' : Math.round(r.worstMs)) + ' ms, not from a default');
+      return want;
+    } catch (e) { pageLog('[lockstep] delay choice failed, keeping the default: ' + ((e && e.message) || e)); }
+    return null;
   }
 
   // ---- and RELEASING it, which is not optional ------------------------------
@@ -5549,6 +5598,26 @@
         else { LSWAIT.ports = []; LSWAIT.since = 0; }
       });
       ls.on('resume', () => { LSWAIT.ports = []; LSWAIT.since = 0; });
+      // ⚠ AND KICK THE FEED WHEN AN INPUT ACTUALLY LANDS.
+      // lsFeed() otherwise runs only on rAF and on the worker's own frame ack,
+      // so a machine stalled on a peer sat idle until the next animation frame
+      // even though the byte it was waiting for had already arrived. Measured
+      // in the four-player run: `core parked at frame N — no input yet` ->
+      // `resumed after 20 ms` on essentially every frame, and 21-37 s of engine
+      // stall inside a 70 s session. One rAF of dead time per frame is a third
+      // of a 34 ms frame given away for nothing.
+      // This wraps the engine's own public receive() rather than reaching into
+      // it: the input is delivered exactly as before and the only addition is
+      // that the page tries to build the next frame immediately afterwards.
+      if (!ls.__dcFeedKick && typeof ls.receive === 'function') {
+        ls.__dcFeedKick = true;
+        const deliver = ls.receive.bind(ls);
+        ls.receive = (m) => {
+          const r = deliver(m);
+          if (m && m.t === 'ls' && LS.armed) { try { lsFeed(); } catch (e) {} }
+          return r;
+        };
+      }
     } catch (e) {}
   }
   const FRAME_MS = 1000 / 60;
@@ -5695,8 +5764,10 @@
         ? 'waiting for players — nothing starts until everyone is in'
         : 'every machine runs the game · your pad drives your own console';
     let html = '<span class="mode">' + modeWord + '</span> <span class="k">' + tagline + '</span>';
+    const fms = lsFrameMs();
     html += '<br><span class="k">input delay</span> ' +
-      (d == null ? '—' : d + (d === 1 ? ' frame' : ' frames') + ' (' + Math.round(d * FRAME_MS) + ' ms)') +
+      (d == null ? '—' : d + (d === 1 ? ' frame' : ' frames') + ' (' + Math.round(d * fms) + ' ms' +
+        (lsFrameMsIsMeasured() ? '' : ' est.') + ')') +
       ' <span class="k">· frame</span> ' + (t.frame == null ? '—' : t.frame) +
       (t.coreFrame != null ? ' <span class="k">· core ran</span> ' + t.coreFrame : '') +
       (t.stallTotalMs > 0 ? ' <span class="k">· stalled</span> ' + (t.stallTotalMs / 1000).toFixed(1) + ' s total' : '');
@@ -5979,9 +6050,20 @@
     // owns — the page only says "this person pressed it"; whether frame 0 runs
     // is decided by every peer being ready, not by this click.
     const rdy = $('netReady');
-    if (rdy) rdy.addEventListener('click', () => {
+    if (rdy) rdy.addEventListener('click', async () => {
       const sess = NET.session;
       if (!sess) return;
+      // ⚠ CHOOSE THE DELAY FROM THE MEASURED RTT, HOST-AUTHORITATIVE, BEFORE
+      // THE BARRIER RELEASES. The engine ships Lockstep.recommendDelay() and
+      // rttReport() for exactly this and the page called neither, so every room
+      // ran on the constructor default of 3 whatever the link was worth. In the
+      // four-player run that was 3 frames of a 34 ms title = 103 ms of input
+      // delay on a room whose worst measured RTT was 4 ms, and rttReport itself
+      // said the right answer was 2. The delay MUST be identical everywhere —
+      // two machines holding inputs for different numbers of frames desync by
+      // construction — so only the host sets it, and 'lsgo' pushes it to
+      // everyone when the barrier releases.
+      await lsChooseDelay(sess);
       try {
         if (typeof sess.setReady === 'function') sess.setReady(true);
         else pageLog('[net] this build has no start barrier yet (session.setReady is missing)');
