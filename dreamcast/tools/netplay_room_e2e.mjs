@@ -295,28 +295,30 @@ try {
     await sleep(1200);
   }
   const conn = await Promise.all(pages.map((pg) => until(pg, () => (window.__dcNet().state === 'connected') || null, PAIR_MS, 500)));
-  // ⚠ NAME THE KNOWN CAUSE RATHER THAN PRINTING A STATE LIST. Measured
-  // 2026-09-08 with --players 4: P2 connects, P3 dies with
-  // "signalling failed: unavailable-id", P4 never gets a chance. The reason is
-  // one line — lib/netplay.js:358 derives the broker id as
-  // `base + (opts.host ? '-h' : '-g')`, so EVERY joiner registers under the
-  // same '-g' id and the second one collides. A room therefore holds exactly
-  // ONE joiner today, independently of MAPLE_PORTS and independently of the
-  // bridge plugging only ports 0 and 1. Without this note the cell reads like a
-  // flaky broker and somebody re-runs it.
+  // ⚠ TWO CAPS USED TO STOP THIS AT TWO PLAYERS, AND BOTH ARE FIXED. This note
+  // is kept because a cell that fails for a KNOWN reason must say which one,
+  // and because a stale root-cause note is worse than none.
+  //   1. every joiner registered on the broker under the same '-g' id, so the
+  //      second one died with "unavailable-id". Now `-g' + randomHex(8)`.
+  //   2. the session itself held ONE RTCPeerConnection, ONE DataChannel and one
+  //      `_approved` latch, and approve() locked the signalling socket — so
+  //      even with distinct broker ids the second joiner could not be SEATED.
+  //      lib/netplay.js now keeps one link per joiner and the host relays
+  //      between them; tools/netplay_room_test.mjs proves that arm on its own
+  //      with N browsers and no emulator.
+  // If this cell fails now, read the per-side error before assuming either.
   const failDetail = await Promise.all(pages.map((pg) => pg.evaluate(() => {
     const sess = (window.Netplay && window.Netplay.sessions) || [];
     const s2 = sess[sess.length - 1];
     return { state: window.__dcNet().state, err: (s2 && s2.lastError) || null };
   })));
   const idClash = failDetail.some((d) => /unavailable-id/i.test(String(d.err || '')));
+  const full = failDetail.some((d) => /room is full/i.test(String(d.err || '')));
   cell(conn.every(Boolean), 'everyone-is-in-the-room',
-    `all ${PLAYERS} sides report connected`,
-    `connected: ${J(conn)} — per-side ${J(failDetail)}` + (idClash
-      ? '. ROOT CAUSE: "unavailable-id" — lib/netplay.js:358 gives every joiner the SAME broker id ' +
-        '(`base + (host ? "-h" : "-g")`), so a room can hold exactly ONE joiner. Players 3 and 4 cannot ' +
-        'join at all, and that is a signalling limit, not a port limit and not this machine.'
-      : ''));
+    `all ${PLAYERS} sides report connected — host + ${PLAYERS - 1} guests on one code, one Allow each`,
+    `connected: ${J(conn)} — per-side ${J(failDetail)}`
+      + (idClash ? '. "unavailable-id" is back: every joiner is registering under the same broker id again.' : '')
+      + (full ? `. The room refused a joiner as FULL — check portCount: ${PLAYERS} players needs ${PLAYERS} ports.` : ''));
 
   // ---- 3. ports assigned, visible, and DISTINCT ----------------------------
   say('\n== 3. ports are assigned, shown, and distinct ==');
@@ -345,6 +347,36 @@ try {
   } else {
     voidc('every-player-holds-a-DIFFERENT-port', 'not measurable: no room was published (see the failure above)');
     voidc('the-room-draws-one-seat-per-port', 'not measurable: no room was published');
+  }
+
+  // ---- 3b. the SEATING, read from the transport rather than from the DOM ---
+  // The block above reads what the page DREW. This one reads what the transport
+  // DECIDED, because those are two different claims and only the second one is
+  // what every core will actually key its maple ports off. They are asserted
+  // separately on purpose: a page that renders the roster wrongly is a cosmetic
+  // bug, and a transport that disagrees with itself is players driving each
+  // other's characters.
+  const seatInfo = await Promise.all(pages.map((pg) => pg.evaluate(() => {
+    const s = (window.Netplay.sessions || []).filter((x) => x.state !== 'closed').pop();
+    return s && s.roomInfo ? s.roomInfo() : null;
+  })));
+  RESULT.rooms = seatInfo;
+  if (seatInfo.every(Boolean)) {
+    seatInfo.forEach((r, i) => say(`  ....  P${i + 1} transport roster ${J(r.seats.map((s) => (s.peer ? s.peer.slice(0, 6) : null)))} — it holds port ${r.seats.findIndex((s) => s.local)}`));
+    const canon = J(seatInfo[0].seats.map((s) => s.peer));
+    cell(seatInfo.every((r) => J(r.seats.map((s) => s.peer)) === canon), 'EVERY-machine-agrees-who-is-in-which-port',
+      `all ${PLAYERS} transport rosters are identical: ${canon}`,
+      `rosters DISAGREE: ${J(seatInfo.map((r) => r.seats.map((s) => s.peer)))} — two machines that disagree about the ` +
+      'roster put two players on one character');
+    const held = seatInfo.map((r) => r.seats.findIndex((s) => s.local));
+    cell(new Set(held).size === PLAYERS && held.every((p) => p >= 0) && held[0] === 0,
+      'four-independent-machines-hold-four-DIFFERENT-maple-ports',
+      `local ports ${J(held)} across ${PLAYERS} separate browsers, room opener on port 0 — the console has ` +
+      `${seatInfo[0].portCount} ports and every one of them belongs to a different machine`,
+      `local ports ${J(held)}`);
+  } else {
+    voidc('EVERY-machine-agrees-who-is-in-which-port', `not measurable: a side published no session roomInfo() — ${J(seatInfo.map((r) => !!r))}`);
+    voidc('four-independent-machines-hold-four-DIFFERENT-maple-ports', 'not measurable: no transport roster');
   }
 
   // ---- 4. everybody loads the SAME disc ------------------------------------
@@ -424,6 +456,47 @@ try {
 
   // ---- 5. the start barrier ------------------------------------------------
   say('\n== 5. the start barrier ==');
+  // ⚠ SOMEBODY HAS TO PRESS READY, and the first version of this rig never did
+  // — then reported the barrier as a FAILURE when it correctly held the room.
+  // The page's #netReady is a human action (dreamcast.html:5381-5389, which
+  // calls session.setReady). Press it on every machine, one at a time, so the
+  // hold-then-release below is a real observation and not a timing accident.
+  const readyPath = [];
+  for (let i = 0; i < PLAYERS; i++) {
+    const how = await pages[i].evaluate(() => {
+      const b = document.getElementById('netReady');
+      if (b && !b.disabled && b.style.display !== 'none') { b.click(); return 'button'; }
+      const s = (window.Netplay.sessions || []).filter((x) => x.state !== 'closed').pop();
+      if (s && typeof s.setReady === 'function') { s.setReady(true); return 'api'; }
+      return 'none';
+    });
+    readyPath.push(how);
+    // Read the room BEFORE the last player says ready: it must still be holding.
+    if (i === PLAYERS - 2) {
+      await sleep(1200);
+      const held = await Promise.all(pages.map((pg) => pg.evaluate(() => {
+        const s = (window.Netplay.sessions || []).filter((x) => x.state !== 'closed').pop();
+        return s && s.ls ? s.ls.state : null;
+      })));
+      cell(held.every((s) => s !== 'running'), 'the-barrier-HOLDS-until-the-LAST-player-is-ready',
+        `${PLAYERS - 1} of ${PLAYERS} machines declared ready and none of them started: ${J(held)} — on a 1,131 MB ` +
+        'disc the slowest phone decides when the room starts, and that wait is reported rather than being a pause',
+        `engine states with one player still not ready: ${J(held)} — somebody ran ahead`);
+    }
+    await sleep(500);
+  }
+  say(`  ....  ready was declared via ${J(readyPath)} (button = the product path, api = the button was not available)`);
+  await sleep(2000);
+  const lsStates = await Promise.all(pages.map((pg) => pg.evaluate(() => {
+    const s = (window.Netplay.sessions || []).filter((x) => x.state !== 'closed').pop();
+    return s && s.ls ? { state: s.ls.state, frame: s.ls.frame, ports: s.ls.localPorts } : null;
+  })));
+  cell(lsStates.every((s) => s && (s.state === 'running' || s.state === 'stalled')),
+    'all-four-machines-are-released-together-at-frame-0',
+    `every engine left the lobby once the last machine declared the same disc: ${J(lsStates.map((s) => s && s.state))} — ` +
+    'no savestate was transferred, so the starting states are identical by construction rather than by a restore ' +
+    'that can silently fail into a cold boot (CLAUDE.md gate #10)',
+    `engine states ${J(lsStates)} — ready path ${J(readyPath)}`);
   const bar = await Promise.all(pages.map((pg) => pg.evaluate(() => window.__dcNetRoom().barrier)));
   const tel = await Promise.all(pages.map((pg) => pg.evaluate(() => { const h = window.__dcNetHud(); return h.telemetry && h.telemetry.barrier; })));
   const started = tel.every((b) => b && b.started);
@@ -438,7 +511,13 @@ try {
   const rateOK = rates.every((r) => r.guestX > 0.97 && r.guestX < 1.03);
   cell(rateOK, 'every-guest-still-runs-at-1.000x',
     `guest rates ${J(rates.map((r) => +r.guestX.toFixed(4)))} — lockstep did not speed anything up or slow it down`,
-    `guest rates ${J(rates)} — CLAUDE.md gate #9: the guest must run at exactly 1.000x and speeding it up is FORBIDDEN`);
+    `guest rates ${J(rates)} — CLAUDE.md gate #9: the guest must run at exactly 1.000x and speeding it up is FORBIDDEN. ` +
+    '⚠ BEFORE BLAMING NETPLAY, RUN THE CONTROL. Measured 2026-09-08 on this box: ' +
+    '`bash dreamcast/build_and_probe.sh --skip-link --game gauntlet --duration 100000` — ONE browser, NO netplay, ' +
+    'no room, no second core — reports `guest ratio: 0.00006x`, `video_cb: 3 calls, 0 presents` and parks at ' +
+    '`pc=0x8c0fd3ec` (37 samples in /tmp/probe-dcx-gauntctl.log). The four-player run wedges at that SAME guest PC ' +
+    'on all four machines. A wedge that reproduces with the transport absent is not a transport bug — it is the ' +
+    'Gauntlet boot, and it belongs to whoever owns the core, not to this rig.');
 
   // ---- 7. each player's pad drives their OWN port -------------------------
   say('\n== 7. each player drives their OWN port, and the others see it ==');
@@ -477,7 +556,12 @@ try {
     cell(allSeeAll, 'every-core-holds-every-players-input',
       `all ${PLAYERS * PLAYERS} viewer/actor pairs agree — ${detail.join('; ')}. That is what "connected to the ` +
       'same console" means: each machine\'s Maple bus carries all four pads',
-      `not every core saw every pad — ${detail.join('; ')}`);
+      `not every core saw every pad — ${detail.join('; ')}. ⚠ READ THE PAGE\'S OWN INPUT PATH BEFORE BLAMING THE ` +
+      'TRANSPORT: dreamcast.html:4453 applies ONE remote pad (session.remotePad()) to ONE port — bytes 64..127, ' +
+      'i.e. port 1 — through the pre-lockstep sendPad/remotePad relay, and never calls ls.beginFrame(). Until that ' +
+      'per-frame path is wired to the room, ports 2 and 3 can only ever be filled by a LOCAL gamepad, and this cell ' +
+      'fails for a page reason rather than a transport one. The transport-level form of this exact claim is ' +
+      'tools/netplay_room_test.mjs `EVERY-core-holds-EVERY-players-input`, which drives the engines directly.');
   } else {
     voidc('every-core-holds-every-players-input', 'not measurable: ports were never assigned');
   }
@@ -518,6 +602,59 @@ try {
     say(`  P${i + 1} keydown -> its OWN core holds the byte:  n=${s.n} min ${s.min} p50 ${s.p50} p95 ${s.p95} max ${s.max} ms`);
   }
   RESULT.latency = lat;
+
+  // ---- 8b. AND WHAT THE WIRE COSTS, PER PAIR, WITH N CORES RUNNING ---------
+  // The figure above is a player's own pad reaching their own core — the number
+  // lockstep exists to keep small, and it does not cross the network at all.
+  // This one is the OTHER half: how long everyone ELSE's input takes, which is
+  // what `delay` has to cover. In a host-relayed star the worst path is
+  // guest -> host -> guest, so both hop counts are reported separately.
+  // ⚠ MEASURED WITH ALL N EMULATORS RUNNING, which is the point: an RTT taken
+  // on an idle box is not the RTT a player gets while four Flycast cores are
+  // competing for the same CPU.
+  const rttPairs = {};
+  const oneHop = [], twoHop = [];
+  for (let i = 0; i < PLAYERS; i++) {
+    const info = seatInfo[i];
+    if (!info) continue;
+    for (let j = 0; j < PLAYERS; j++) {
+      if (i === j || !seatInfo[j]) continue;
+      const peer = info.seats.map((s) => s.peer)[seatInfo[j].seats.findIndex((s) => s.local)];
+      if (!peer) continue;
+      const samples = [];
+      for (let k = 0; k < 20; k++) {
+        const ms = await pages[i].evaluate((p) => {
+          const s = (window.Netplay.sessions || []).filter((x) => x.state !== 'closed').pop();
+          return s && s.pingPeer ? s.pingPeer(p, 4000) : null;
+        }, peer);
+        if (ms != null) samples.push(ms);
+        await sleep(15);
+      }
+      const s = { n: samples.length, p50: pct(samples, 50), p95: pct(samples, 95) };
+      rttPairs[`P${i + 1}->P${j + 1}`] = s;
+      if (s.p50 != null) ((i === 0 || j === 0) ? oneHop : twoHop).push(s.p50);
+      say(`  P${i + 1}->P${j + 1} RTT n=${s.n} p50 ${s.p50} p95 ${s.p95} ms  (${(i === 0 || j === 0) ? 'direct to the host' : 'relayed via the host'})`);
+    }
+  }
+  const mean = (a) => (a.length ? +(a.reduce((x, y) => x + y, 0) / a.length).toFixed(2) : null);
+  RESULT.rtt = { pairs: rttPairs, oneHopMeanP50: mean(oneHop), twoHopMeanP50: mean(twoHop),
+                 worstP50: [...oneHop, ...twoHop].length ? Math.max.apply(null, [...oneHop, ...twoHop]) : null };
+  if (RESULT.rtt.worstP50 != null) {
+    say(`  to the host ${RESULT.rtt.oneHopMeanP50} ms mean p50 | relayed guest-to-guest ${RESULT.rtt.twoHopMeanP50} ms | worst pair ${RESULT.rtt.worstP50} ms`);
+    const rd = await pages[0].evaluate(() => {
+      const s = (window.Netplay.sessions || []).filter((x) => x.state !== 'closed').pop();
+      return s && s.rttReport ? s.rttReport(4000) : null;
+    });
+    RESULT.rttReport = rd;
+    say(`  the delay that RTT implies at 60 Hz: ${rd && rd.recommendedDelay} frames (Lockstep.recommendDelay)`);
+    cell(Object.values(rttPairs).every((s) => s.n >= 15), 'every-pair-reaches-every-other-pair-WITH-the-emulators-running',
+      `all ${Object.keys(rttPairs).length} ordered pairs answered while ${PLAYERS} Flycast cores were running: ` +
+      `${RESULT.rtt.oneHopMeanP50} ms to the host, ${RESULT.rtt.twoHopMeanP50} ms guest-to-guest through the relay`,
+      `some pairs did not answer under load: ${J(rttPairs)}`);
+  } else {
+    voidc('every-pair-reaches-every-other-pair-WITH-the-emulators-running', 'no transport roster, so no pair could be pinged');
+  }
+
   const worst = lat.length ? Math.max.apply(null, lat.map((s) => s.p50)) : null;
   const B = RESULT.streamingBaseline;
   if (worst != null) {
