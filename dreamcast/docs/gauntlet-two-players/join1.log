@@ -1,0 +1,181 @@
+[0.7s] profile=/private/tmp/claude-501/dc-p2-profile game=gauntlet url=http://localhost:8080
+[1.8s]   [console] [pad] polling started (page load)
+[1.8s]   [console] [net] online play available (peerjs signalling)
+[1.8s] cross-origin isolated + __dcPad present: true
+[1.8s] port-1 synthetic gamepad installed at getGamepads()[1]; __p2sig() sampler installed
+[1.8s]   [console] [page] sharedMemory allocated (initial 128 MB, maximum 2048 MB, granted 128 MB now, heap-allocated fb/audio; the module import declares initial 128 MB / maximum 4096 MB)
+[1.8s]   [console] [flycast-shim] mem-init received, importScripts factory
+[1.8s] booting disc-fetch 0%
+[1.9s]   [console] [page] found saved state 27785359 B for gauntlet — Start, then Load State to restore
+[2.0s]   [console] [flycast-worker] main pthread entered (idle)
+[2.0s]   [console] [flycast-funcs] post-js installed
+[2.0s]   [console] [flycast-worker] video target set buf=42167000 w=640 h=480
+[2.0s]   [console] [flycast-worker] audio ring addr=43395808 capacity=16384 frames
+[2.0s]   [console] [page] worker-reported SAB layout: fb=42167000 audio=43395808 frames=16384
+[2.0s]   [console] [flycast-shim] fb=42167000 audio=43395808 (heap-allocated)
+[2.0s]   [console] [flycast-shim] registered offscreen in GL.offscreenCanvases
+[2.0s]   [console] [flycast-wasm] patched WebGL2 context
+[2.0s]   [console] [flycast-wasm] patched WebGL2 context
+[2.0s]   [console] [flycast-worker] WebGL2 ctx created on main-runtime thread, handle=43526952, make_current=0
+[2.0s]   [console] [flycast-shim] create_gl_context returned 43526952
+[2.0s]   [console] [flycast.log] shell/libretro/libretro.cpp:337 N[BOOT]: retro_init
+
+[2.0s]   [console] [flycast.log] core/hw/mem/addrspace.cpp:410 W[VMEM]: Warning! nvmem is DISABLED (due to failure or not being built-in
+
+[2.0s]   [console] [flycast.log] core/hw/mem/addrspace.cpp:461 N[VMEM]: BASE 0 RAM(16 MB) 0x69d0000 VRAM64(8 MB) 0x79e0000 ARAM(2 MB) 0x81f0000
+
+[2.0s]   [console] [flycast-worker] worker_init: retro_init done
+[2.0s]   [console] [flycast-shim] worker_init returned
+[2.0s]   [console] [flycast-shim] runtime + core ready
+[2.0s]   [console] [page] worker ready
+[2.1s]   [console] [flycast-shim] wrote /discs/Track1.bin (1999200 B) wasm=153MB
+[2.1s]   [console] [flycast-shim] wrote /discs/Track2.bin (1589952 B) wasm=153MB
+[2.8s] booting disc-fetch 41%
+[3.2s]   [console] [flycast-shim] wrote /discs/Track3.bin (487889472 B) wasm=153MB
+[3.3s]   [console] [flycast-shim] wrote /discs/Track4.bin (1237152 B) wasm=153MB
+[3.8s] booting disc-fetch 60%
+[4.9s] booting disc-fetch 74%
+[6.0s] booting disc-fetch 86%
+[7.0s] booting disc-fetch 100%
+[7.3s]   [console] [flycast-shim] wrote /discs/Track5.bin (696634176 B) wasm=153MB
+[7.3s]   [console] [flycast-shim] wrote /discs/GauntletLegends.cue (447 B) wasm=153MB
+[7.4s]   [console] [flycast-shim] disc product id T9710N (from catalog) — texture dir ready (created /bios/dc/textures/T9710N)
+[7.4s]   [console] [flycast-worker] load_disc: /discs/GauntletLegends.cue
+[7.4s]   [console] [flycast.log] shell/libretro/libretro.cpp:2151 N[BOOT]: retro_load_game: /discs/GauntletLegends.cue
+
+[7.4s]   [console] [flycast.log] File extension is: .cue
+
+[7.4s]   [console] [flycast-worker] SET_HW_RENDER captured (ctx_type=2, ver=0.0)
+[7.4s]   [console] [flycast.log] core/hw/mem/addrspace.cpp:410 W[VMEM]: Warning! nvmem is DISABLED (due to failure or not being built-in
+
+[7.4s]   [console] [flycast.log] core/hw/mem/addrspace.cpp:461 N[VMEM]: BASE 0 RAM(16 MB) 0x69d0000 VRAM64(8 MB) 0x79e0000 ARAM(2 MB) 0x81f0000
+
+[7.4s]   [console] [flycast.log] core/emulator.cpp:61 N[BOOT]: Game ID is [T9710N]
+
+[7.4s]   [console] [flycast.log] core/rend/CustomTexture.cpp:51 N[RENDERER]: Found custom textures directory: /bios/dc/textures/T9710N/
+
+[7.4s]   [console] [flycast.log] core/emulator.cpp:616 N[BOOT]: Did not load BIOS, using reios
+
+[7.4s]   [console] [flycast.log] core/emulator.cpp:61 N[BOOT]: Game ID is [T9710N]
+
+[7.4s]   [console] [flycast-worker] load_disc: retro_load_game returned true
+[7.4s]   [console] [flycast-worker] disc_type=128 (0=CdRom 1=CdRom_XA 4=GdRom 16=NoDisk)
+[7.4s]   [console] [flycast.log] shell/libretro/libretro.cpp:2502 N[RENDERER]: retro_get_system_av_info: Res=480
+
+[7.4s]   [console] [flycast-worker] av_info base=640x480 max=853x853 fps=59
+[7.4s]   [console] [flycast-worker] invoking hw_render.context_reset
+[7.4s]   [console] [flycast.log] core/rend/gles/gles.cpp:624 N[RENDERER]: OpenGL ES version 3.0
+
+[7.4s]   [console] [flycast.log] core/rend/gles/gles.cpp:625 N[RENDERER]: Vendor 'WebKit' Renderer 'WebKit WebGL' Version 'OpenGL ES 3.0 (OpenGL ES 3.0 WebGL 2.0)'
+
+[7.4s]   [console] [flycast.log] core/rend/gles/gltex.cpp:579 W[RENDERER]: testBlitFramebuffer: Expected 0xFF00FF00 but was 00000000
+
+[7.4s]   [console] [flycast.log] core/rend/gles/gles.cpp:634 W[RENDERER]: glBlitFramebuffer is bogus. Using quad drawer instead
+
+[7.4s]   [console] [flycast.log] shell/libretro/libretro.cpp:1358 N[RENDERER]: Current renderer does not support 'Per-Pixel' Alpha Sorting.
+
+[7.4s]   [console] [flycast-worker] hw_render.context_reset returned
+[7.7s]   [console] [flycast-shim] freerun ON (worker-owned run loop, real-time governor ON — guest paced to 1.000x)
+[7.7s]   [console] [flycast-worker] run_iter enter #1
+[7.7s]   [console] [flycast.log] core/reios/reios.cpp:639 N[REIOS]: -----------------
+
+[7.7s]   [console] [flycast.log] core/reios/reios.cpp:640 N[REIOS]: REIOS: Booting up
+
+[7.7s]   [console] [flycast.log] core/reios/reios.cpp:641 N[REIOS]: -----------------
+
+[7.8s]   [console] [page] heartbeat fps=0 hw=0 video_cb=0/s iters=0/s clk=0.00MHz pc=0x0 istnrm=0x0 istext=0x0 | guest=0.000x governed=1 presented=0/s duty=0% cost=0.0ms/f headroom=0.0x capacity=0fps arms=none
+[7.9s]   [console] [flycast-worker] video_cb #1 data=0 w=853 h=480 pitch=0 real_frames=0
+[7.9s]   [console] [flycast-worker] run_iter exit  #1
+[7.9s]   [console] [flycast-worker] run_iter enter #2
+[8.0s]   [console] [flycast-worker] video_cb #2 data=0 w=853 h=480 pitch=0 real_frames=0
+[8.0s]   [console] [flycast-worker] run_iter exit  #2
+[8.0s]   [console] [flycast-worker] run_iter enter #3
+[8.0s] booted=true phase=running webgl2=true coi=true fps=0 guestX=0.000
+[8.0s]   [console] [flycast-worker] run_iter exit  #3
+[8.0s]   [console] [flycast-worker] run_iter enter #4
+[8.1s]   [console] [flycast-worker] video_cb #4 HW_FRAME_VALID #1 commit_frame=0 w=640 h=480
+[8.1s]   [console] [flycast-worker] run_iter exit  #4
+[9.0s] frames flowing (distinct): true
+[9.8s]   [console] [page] heartbeat fps=1 hw=1 video_cb=14/s iters=14/s clk=140.66MHz pc=0x8c0084f4 istnrm=0x38 istext=0x0 | guest=0.703x governed=1 presented=1/s duty=100% cost=999.0ms/f headroom=0.7x capacity=1fps arms=none
+[10.2s] GATE port-1 press -> p1 bytes [8,0,0,0,0,0,0,0,255,127,0,0]  p0 bytes [0,0,0,0,0,0,0,0,0,0,0,0]
+[10.2s] GATE startBit=true p1Lx=32767 p0Untouched=true releases=true
+[10.2s] sampler: {"nonBlack":48684,"mean":183.739}
+[11.8s]   [console] [page] heartbeat fps=0 hw=0 video_cb=13/s iters=12/s clk=133.69MHz pc=0x8c0084f2 istnrm=0x38 istext=0x0 | guest=0.668x governed=1 presented=0/s duty=100% cost=0.0ms/f headroom=0.7x capacity=0fps arms=none
+[13.8s]   [console] [page] heartbeat fps=0 hw=0 video_cb=11/s iters=11/s clk=108.82MHz pc=0x8c031f40 istnrm=0x38 istext=0x0 | guest=0.544x governed=1 presented=0/s duty=100% cost=0.0ms/f headroom=0.5x capacity=0fps arms=none
+[15.3s] shot /tmp/dc-p2/join1-boot0.png
+[15.8s]   [console] [page] heartbeat fps=0 hw=0 video_cb=21/s iters=20/s clk=208.19MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=1.041x governed=1 presented=0/s duty=48% cost=0.0ms/f headroom=2.2x capacity=0fps arms=none
+[17.8s]   [console] [page] heartbeat fps=0 hw=0 video_cb=20/s iters=20/s clk=199.89MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=0.999x governed=1 presented=0/s duty=50% cost=0.0ms/f headroom=2.0x capacity=0fps arms=none
+[17.8s]   [console] [flycast-worker] video_cb #158 HW_FRAME_VALID #2 commit_frame=0 w=640 h=480
+[17.9s]   [console] [flycast-worker] video_cb #159 HW_FRAME_VALID #3 commit_frame=0 w=640 h=480
+[17.9s]   [console] [flycast-worker] video_cb #160 HW_FRAME_VALID #4 commit_frame=0 w=640 h=480
+[19.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.11MHz pc=0x8c0387fe istnrm=0x10 istext=0x0 | guest=1.001x governed=1 presented=30/s duty=41% cost=13.6ms/f headroom=2.5x capacity=74fps arms=none
+[21.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.71MHz pc=0x8c036600 istnrm=0x10 istext=0x0 | guest=1.004x governed=1 presented=30/s duty=43% cost=14.3ms/f headroom=2.3x capacity=70fps arms=none
+[23.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.69MHz pc=0x8c03677e istnrm=0x10 istext=0x0 | guest=0.998x governed=1 presented=30/s duty=38% cost=12.6ms/f headroom=2.6x capacity=80fps arms=none
+[25.3s] shot /tmp/dc-p2/join1-attract1.png
+[25.8s]   [console] [page] heartbeat fps=16 hw=16 video_cb=25/s iters=21/s clk=203.46MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=1.017x governed=1 presented=16/s duty=30% cost=19.0ms/f headroom=3.3x capacity=53fps arms=none
+[27.8s]   [console] [page] heartbeat fps=1 hw=1 video_cb=25/s iters=20/s clk=252.00MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=1.260x governed=1 presented=1/s duty=32% cost=323.6ms/f headroom=3.9x capacity=3fps arms=none
+[29.8s]   [console] [page] heartbeat fps=0 hw=0 video_cb=20/s iters=20/s clk=198.52MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=0.993x governed=1 presented=0/s duty=37% cost=0.0ms/f headroom=2.7x capacity=0fps arms=none
+[31.8s]   [console] [page] heartbeat fps=1 hw=1 video_cb=20/s iters=20/s clk=197.47MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=0.987x governed=1 presented=1/s duty=67% cost=666.7ms/f headroom=1.5x capacity=2fps arms=none
+[33.8s]   [console] [page] heartbeat fps=33 hw=33 video_cb=33/s iters=35/s clk=109.30MHz pc=0x8c036600 istnrm=0x10 istext=0x0 | guest=0.546x governed=1 presented=33/s duty=98% cost=29.7ms/f headroom=0.6x capacity=34fps arms=none
+[35.4s] shot /tmp/dc-p2/join1-attract2.png
+[35.8s]   [console] [page] heartbeat fps=63 hw=63 video_cb=63/s iters=61/s clk=208.53MHz pc=0x8c030e0e istnrm=0x10 istext=0x0 | guest=1.043x governed=1 presented=63/s duty=75% cost=12.0ms/f headroom=1.4x capacity=84fps arms=none
+[37.8s]   [console] [page] heartbeat fps=60 hw=60 video_cb=60/s iters=59/s clk=199.87MHz pc=0x8c038756 istnrm=0x10 istext=0x0 | guest=0.999x governed=1 presented=60/s duty=70% cost=11.7ms/f headroom=1.4x capacity=86fps arms=none
+[39.1s]   [console] [flycast-worker] video_cb #900 HW_FRAME_VALID #600 commit_frame=0 w=640 h=480
+[39.8s]   [console] [page] heartbeat fps=60 hw=60 video_cb=60/s iters=53/s clk=200.10MHz pc=0x8c02fbec istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=60/s duty=83% cost=13.9ms/f headroom=1.2x capacity=72fps arms=none
+[40.9s]   [console] [flycast-worker] run_iter enter #1000
+[40.9s]   [console] [flycast-worker] run_iter exit  #1000
+[41.8s]   [console] [page] heartbeat fps=60 hw=60 video_cb=60/s iters=60/s clk=199.88MHz pc=0x8c030dfc istnrm=0x10 istext=0x0 | guest=0.999x governed=1 presented=60/s duty=69% cost=11.4ms/f headroom=1.5x capacity=88fps arms=none
+[43.8s]   [console] [page] heartbeat fps=60 hw=60 video_cb=60/s iters=60/s clk=199.94MHz pc=0x8c0441be istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=60/s duty=64% cost=10.7ms/f headroom=1.6x capacity=94fps arms=none
+[45.6s] shot /tmp/dc-p2/join1-attract3.png
+[45.8s]   [console] [page] heartbeat fps=60 hw=60 video_cb=60/s iters=60/s clk=200.00MHz pc=0x8c0441be istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=60/s duty=62% cost=10.3ms/f headroom=1.6x capacity=97fps arms=none
+[47.7s] tap p0 enter
+[47.8s]   [console] [page] heartbeat fps=60 hw=60 video_cb=60/s iters=60/s clk=200.52MHz pc=0x8c0441f0 istnrm=0x10 istext=0x0 | guest=1.003x governed=1 presented=60/s duty=63% cost=10.4ms/f headroom=1.6x capacity=96fps arms=none
+[49.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.52MHz pc=0x8c038874 istnrm=0x10 istext=0x0 | guest=0.998x governed=1 presented=30/s duty=37% cost=12.4ms/f headroom=2.7x capacity=81fps arms=none
+[50.9s] shot /tmp/dc-p2/join1-start1.png
+[50.9s]   [console] [flycast-worker] video_cb #1504 HW_FRAME_VALID #1200 commit_frame=0 w=640 h=480
+[51.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.93MHz pc=0x8c038740 istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=30/s duty=39% cost=13.0ms/f headroom=2.6x capacity=77fps arms=none
+[53.0s] tap p0 enter
+[53.8s]   [console] [page] heartbeat fps=11 hw=11 video_cb=24/s iters=23/s clk=202.92MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=1.015x governed=1 presented=11/s duty=35% cost=32.1ms/f headroom=2.9x capacity=31fps arms=none
+[55.8s]   [console] [page] heartbeat fps=0 hw=0 video_cb=20/s iters=20/s clk=200.96MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=1.005x governed=1 presented=0/s duty=37% cost=0.0ms/f headroom=2.7x capacity=0fps arms=none
+[56.1s] shot /tmp/dc-p2/join1-start2.png
+[57.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.87MHz pc=0x8c03c97c istnrm=0x10 istext=0x0 | guest=0.999x governed=1 presented=30/s duty=41% cost=13.7ms/f headroom=2.4x capacity=73fps arms=none
+[58.2s] tap p0 m
+[59.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=201.03MHz pc=0x8c038756 istnrm=0x10 istext=0x0 | guest=1.005x governed=1 presented=30/s duty=40% cost=13.4ms/f headroom=2.5x capacity=74fps arms=none
+[61.3s] shot /tmp/dc-p2/join1-charselect.png
+[61.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.84MHz pc=0x8c03c97c istnrm=0x10 istext=0x0 | guest=0.999x governed=1 presented=30/s duty=37% cost=12.5ms/f headroom=2.7x capacity=80fps arms=none
+[63.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.34MHz pc=0x8c036600 istnrm=0x10 istext=0x0 | guest=0.997x governed=1 presented=30/s duty=36% cost=12.0ms/f headroom=2.8x capacity=84fps arms=none
+[64.4s] arm ctrlA: 12 samples, mean 34.072
+[65.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.09MHz pc=0x8c03677e istnrm=0x10 istext=0x0 | guest=0.995x governed=1 presented=30/s duty=44% cost=14.8ms/f headroom=2.2x capacity=68fps arms=none
+[67.4s] arm ctrlB: 12 samples, mean 33.603
+[67.6s] shot /tmp/dc-p2/join1-before.png
+[67.7s] tap p1 btn9
+[67.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.48MHz pc=0x8c036600 istnrm=0x10 istext=0x0 | guest=1.002x governed=1 presented=30/s duty=44% cost=14.6ms/f headroom=2.3x capacity=69fps arms=none
+[68.9s]   [console] [flycast-worker] run_iter enter #2000
+[69.0s]   [console] [flycast-worker] run_iter exit  #2000
+[69.8s]   [console] [page] heartbeat fps=3 hw=3 video_cb=20/s iters=28/s clk=196.74MHz pc=0x8c036600 istnrm=0x10 istext=0x0 | guest=0.984x governed=1 presented=3/s duty=43% cost=142.6ms/f headroom=2.3x capacity=7fps arms=none
+[71.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=201.35MHz pc=0x8c03677e istnrm=0x10 istext=0x0 | guest=1.007x governed=1 presented=30/s duty=36% cost=11.9ms/f headroom=2.8x capacity=84fps arms=none
+[72.3s] arm afterA: 12 samples, mean 33.994
+[72.4s] shot /tmp/dc-p2/join1-after1.png
+[72.5s] tap p1 btn9
+[73.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.16MHz pc=0x8c0387c0 istnrm=0x10 istext=0x0 | guest=0.996x governed=1 presented=30/s duty=45% cost=15.0ms/f headroom=2.2x capacity=67fps arms=none
+[75.4s]   [console] [flycast-worker] video_cb #2194 HW_FRAME_VALID #1800 commit_frame=0 w=640 h=480
+[75.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.41MHz pc=0x8c02fbf2 istnrm=0x10 istext=0x0 | guest=0.997x governed=1 presented=30/s duty=45% cost=15.1ms/f headroom=2.2x capacity=66fps arms=none
+[77.0s] arm afterB: 12 samples, mean 34.002
+[77.2s] shot /tmp/dc-p2/join1-after2.png
+[77.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.13MHz pc=0x8c036600 istnrm=0x10 istext=0x0 | guest=1.001x governed=1 presented=30/s duty=43% cost=14.5ms/f headroom=2.3x capacity=69fps arms=none
+[79.4s] shot /tmp/dc-p2/join1-after3.png
+[79.4s] 
+=== ARM STATISTICS (8x6 block-mean luminance) ===
+[79.4s]   ctrlA              n=12 meanLum=34.072 nonBlack=40495 within-arm churn=0.948
+[79.4s]   ctrlB              n=12 meanLum=33.603 nonBlack=40448 within-arm churn=0.025
+[79.4s]   afterA             n=12 meanLum=33.994 nonBlack=40448 within-arm churn=0.037
+[79.4s]   afterB             n=12 meanLum=34.002 nonBlack=40449 within-arm churn=0.035
+[79.4s] 
+=== BETWEEN-ARM DISTANCE vs WITHIN-ARM CHURN ===
+[79.4s]   ctrlA -> ctrlB: distance 0.546, churn 0.948, ratio 0.58x
+[79.4s]   ctrlA -> afterA: distance 0.704, churn 0.948, ratio 0.74x
+[79.4s]   ctrlA -> afterB: distance 0.945, churn 0.948, ratio 1x
+[79.4s]   ctrlB -> afterA: distance 0.481, churn 0.037, ratio 12.99x
+[79.4s]   ctrlB -> afterB: distance 0.476, churn 0.035, ratio 13.6x
+[79.4s]   afterA -> afterB: distance 0.88, churn 0.037, ratio 23.77x
+[79.4s] json -> /tmp/dc-p2/join1.json

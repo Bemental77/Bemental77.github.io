@@ -1,0 +1,271 @@
+[0.7s] profile=/private/tmp/claude-501/dc-p2-profile game=gauntlet url=http://localhost:8080
+[0.7s] wasm BEFORE: 14bddf42b8255a0c (8704964 B)
+[0.8s]   [console] [pad] polling started (page load)
+[0.8s]   [console] [net] online play available (peerjs signalling)
+[0.8s] cross-origin isolated + __dcPad present: true
+[0.8s] port-1 synthetic gamepad installed at getGamepads()[1]; __p2sig() sampler installed
+[0.8s] booting disc-fetch 0%
+[0.9s]   [console] [page] found saved state 27785359 B for gauntlet — Start, then Load State to restore
+[1.8s]   [console] [page] sharedMemory allocated (initial 128 MB, maximum 2048 MB, granted 128 MB now, heap-allocated fb/audio; the module import declares initial 128 MB / maximum 4096 MB)
+[1.8s]   [console] [flycast-shim] mem-init received, importScripts factory
+[1.9s]   [console] [flycast-worker] main pthread entered (idle)
+[1.9s]   [console] [flycast-funcs] post-js installed
+[1.9s]   [console] [flycast-worker] video target set buf=42167000 w=640 h=480
+[1.9s]   [console] [flycast-worker] audio ring addr=43395808 capacity=16384 frames
+[1.9s]   [console] [page] worker-reported SAB layout: fb=42167000 audio=43395808 frames=16384
+[1.9s]   [console] [flycast-shim] fb=42167000 audio=43395808 (heap-allocated)
+[1.9s]   [console] [flycast-shim] registered offscreen in GL.offscreenCanvases
+[1.9s]   [console] [flycast-wasm] patched WebGL2 context
+[1.9s]   [console] [flycast-wasm] patched WebGL2 context
+[2.0s]   [console] [flycast-worker] WebGL2 ctx created on main-runtime thread, handle=43526952, make_current=0
+[2.0s]   [console] [flycast-shim] create_gl_context returned 43526952
+[2.0s]   [console] [flycast.log] shell/libretro/libretro.cpp:337 N[BOOT]: retro_init
+
+[2.0s]   [console] [flycast.log] core/hw/mem/addrspace.cpp:410 W[VMEM]: Warning! nvmem is DISABLED (due to failure or not being built-in
+
+[2.0s]   [console] [flycast.log] core/hw/mem/addrspace.cpp:461 N[VMEM]: BASE 0 RAM(16 MB) 0x69d0000 VRAM64(8 MB) 0x79e0000 ARAM(2 MB) 0x81f0000
+
+[2.0s]   [console] [flycast-worker] worker_init: retro_init done
+[2.0s]   [console] [flycast-shim] worker_init returned
+[2.0s]   [console] [flycast-shim] runtime + core ready
+[2.0s]   [console] [page] worker ready
+[2.0s]   [console] [flycast-shim] wrote /discs/Track1.bin (1999200 B) wasm=153MB
+[2.0s]   [console] [flycast-shim] wrote /discs/Track2.bin (1589952 B) wasm=153MB
+[3.2s] booting disc-fetch 50%
+[3.2s]   [console] [flycast-shim] wrote /discs/Track3.bin (487889472 B) wasm=153MB
+[3.2s]   [console] [flycast-shim] wrote /discs/Track4.bin (1237152 B) wasm=153MB
+[4.2s] booting disc-fetch 67%
+[5.4s] booting disc-fetch 81%
+[6.4s] booting disc-fetch 94%
+[7.1s]   [console] [flycast-shim] wrote /discs/Track5.bin (696634176 B) wasm=153MB
+[7.1s]   [console] [flycast-shim] wrote /discs/GauntletLegends.cue (447 B) wasm=153MB
+[7.1s]   [console] [flycast-shim] disc product id T9710N (from catalog) — texture dir ready (created /bios/dc/textures/T9710N)
+[7.1s]   [console] [flycast-worker] load_disc: /discs/GauntletLegends.cue
+[7.1s]   [console] [flycast.log] shell/libretro/libretro.cpp:2151 N[BOOT]: retro_load_game: /discs/GauntletLegends.cue
+
+[7.1s]   [console] [flycast.log] File extension is: .cue
+
+[7.1s]   [console] [flycast-worker] SET_HW_RENDER captured (ctx_type=2, ver=0.0)
+[7.1s]   [console] [flycast.log] core/hw/mem/addrspace.cpp:410 W[VMEM]: Warning! nvmem is DISABLED (due to failure or not being built-in
+
+[7.1s]   [console] [flycast.log] core/hw/mem/addrspace.cpp:461 N[VMEM]: BASE 0 RAM(16 MB) 0x69d0000 VRAM64(8 MB) 0x79e0000 ARAM(2 MB) 0x81f0000
+
+[7.2s]   [console] [flycast.log] core/emulator.cpp:61 N[BOOT]: Game ID is [T9710N]
+
+[7.2s]   [console] [flycast.log] core/rend/CustomTexture.cpp:51 N[RENDERER]: Found custom textures directory: /bios/dc/textures/T9710N/
+
+[7.2s]   [console] [flycast.log] core/emulator.cpp:616 N[BOOT]: Did not load BIOS, using reios
+
+[7.2s]   [console] [flycast.log] core/emulator.cpp:61 N[BOOT]: Game ID is [T9710N]
+
+[7.2s]   [console] [flycast-worker] load_disc: retro_load_game returned true
+[7.2s]   [console] [maple] vmuDev=1 type=1 (MDT_SegaVMU=1)
+[7.2s]   [console] [maple] bus (type per slot, -1=empty): p0[1,-1,-1,-1,-1,0] p1[1,-1,-1,-1,-1,0] p2[-1,-1,-1,-1,-1,-1] p3[-1,-1,-1,-1,-1,-1]
+[7.2s]   [console] [flycast-worker] disc_type=128 (0=CdRom 1=CdRom_XA 4=GdRom 16=NoDisk)
+[7.2s]   [console] [flycast.log] shell/libretro/libretro.cpp:2502 N[RENDERER]: retro_get_system_av_info: Res=480
+
+[7.2s]   [console] [flycast-worker] av_info base=640x480 max=853x853 fps=59
+[7.2s]   [console] [flycast-worker] invoking hw_render.context_reset
+[7.2s]   [console] [flycast.log] core/rend/gles/gles.cpp:624 N[RENDERER]: OpenGL ES version 3.0
+
+[7.2s]   [console] [flycast.log] core/rend/gles/gles.cpp:625 N[RENDERER]: Vendor 'WebKit' Renderer 'WebKit WebGL' Version 'OpenGL ES 3.0 (OpenGL ES 3.0 WebGL 2.0)'
+
+[7.2s]   [console] [flycast.log] core/rend/gles/gltex.cpp:579 W[RENDERER]: testBlitFramebuffer: Expected 0xFF00FF00 but was 00000000
+
+[7.2s]   [console] [flycast.log] core/rend/gles/gles.cpp:634 W[RENDERER]: glBlitFramebuffer is bogus. Using quad drawer instead
+
+[7.2s]   [console] [flycast.log] shell/libretro/libretro.cpp:1358 N[RENDERER]: Current renderer does not support 'Per-Pixel' Alpha Sorting.
+
+[7.2s]   [console] [flycast-worker] hw_render.context_reset returned
+[7.4s] booting audio-init 100%
+[7.4s]   [console] [flycast-shim] freerun ON (worker-owned run loop, real-time governor ON — guest paced to 1.000x)
+[7.4s]   [console] [flycast-worker] run_iter enter #1
+[7.4s]   [console] [flycast.log] core/reios/reios.cpp:639 N[REIOS]: -----------------
+
+[7.4s]   [console] [flycast.log] core/reios/reios.cpp:640 N[REIOS]: REIOS: Booting up
+
+[7.4s]   [console] [flycast.log] core/reios/reios.cpp:641 N[REIOS]: -----------------
+
+[7.6s]   [console] [flycast-worker] video_cb #1 data=0 w=853 h=480 pitch=0 real_frames=0
+[7.6s]   [console] [flycast-worker] run_iter exit  #1
+[7.6s]   [console] [flycast-worker] run_iter enter #2
+[7.7s]   [console] [flycast-worker] video_cb #2 data=0 w=853 h=480 pitch=0 real_frames=0
+[7.7s]   [console] [flycast-worker] run_iter exit  #2
+[7.7s]   [console] [flycast-worker] run_iter enter #3
+[7.8s]   [console] [flycast-worker] run_iter exit  #3
+[7.8s]   [console] [flycast-worker] run_iter enter #4
+[7.9s]   [console] [flycast-worker] video_cb #4 HW_FRAME_VALID #1 commit_frame=0 w=640 h=480
+[7.9s]   [console] [flycast-worker] run_iter exit  #4
+[8.4s] booted=true phase=running webgl2=true coi=true fps=0 guestX=0.000
+[8.8s]   [console] [page] heartbeat fps=1 hw=1 video_cb=14/s iters=13/s clk=133.31MHz pc=0x8c0084f6 istnrm=0x38 istext=0x0 | guest=0.667x governed=1 presented=1/s duty=100% cost=996.5ms/f headroom=0.7x capacity=1fps arms=none
+[8.9s] frames flowing (distinct): true
+[10.1s] GATE port-1 press -> p1 bytes [8,0,0,0,0,0,0,0,255,127,0,0]  p0 bytes [0,0,0,0,0,0,0,0,0,0,0,0]
+[10.1s] GATE startBit=true p1Lx=32767 p0Untouched=true releases=true
+[10.2s] sampler: {"nonBlack":48684,"mean":183.739}
+[10.8s]   [console] [page] heartbeat fps=0 hw=0 video_cb=13/s iters=13/s clk=132.15MHz pc=0x8c0084f2 istnrm=0x38 istext=0x0 | guest=0.661x governed=1 presented=0/s duty=100% cost=0.0ms/f headroom=0.7x capacity=0fps arms=none
+[12.8s]   [console] [page] heartbeat fps=0 hw=0 video_cb=12/s iters=11/s clk=115.13MHz pc=0x8c031f40 istnrm=0x38 istext=0x0 | guest=0.576x governed=1 presented=0/s duty=100% cost=0.0ms/f headroom=0.6x capacity=0fps arms=none
+[14.8s]   [console] [page] heartbeat fps=0 hw=0 video_cb=12/s iters=18/s clk=119.89MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=0.599x governed=1 presented=0/s duty=70% cost=0.0ms/f headroom=0.9x capacity=0fps arms=none
+[15.2s] NOTE boot
+[16.8s]   [console] [page] heartbeat fps=0 hw=0 video_cb=20/s iters=20/s clk=201.54MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=1.008x governed=1 presented=0/s duty=39% cost=0.0ms/f headroom=2.6x capacity=0fps arms=none
+[17.8s]   [console] [flycast-worker] video_cb #158 HW_FRAME_VALID #2 commit_frame=0 w=640 h=480
+[17.9s]   [console] [flycast-worker] video_cb #159 HW_FRAME_VALID #3 commit_frame=0 w=640 h=480
+[17.9s]   [console] [flycast-worker] video_cb #160 HW_FRAME_VALID #4 commit_frame=0 w=640 h=480
+[18.8s]   [console] [page] heartbeat fps=3 hw=3 video_cb=20/s iters=27/s clk=184.52MHz pc=0x8c0387c0 istnrm=0x10 istext=0x0 | guest=0.923x governed=1 presented=3/s duty=54% cost=180.6ms/f headroom=1.7x capacity=6fps arms=none
+[20.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=201.10MHz pc=0x8c03c97c istnrm=0x10 istext=0x0 | guest=1.006x governed=1 presented=30/s duty=35% cost=11.7ms/f headroom=2.9x capacity=86fps arms=none
+[22.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.45MHz pc=0x8c0387fe istnrm=0x10 istext=0x0 | guest=0.997x governed=1 presented=30/s duty=44% cost=14.8ms/f headroom=2.2x capacity=68fps arms=none
+[24.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.06MHz pc=0x8c03c976 istnrm=0x10 istext=0x0 | guest=0.995x governed=1 presented=30/s duty=44% cost=14.5ms/f headroom=2.3x capacity=69fps arms=none
+[25.2s] NOTE x
+[26.8s]   [console] [page] heartbeat fps=1 hw=1 video_cb=20/s iters=20/s clk=200.17MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=1.001x governed=1 presented=1/s duty=39% cost=386.8ms/f headroom=2.6x capacity=3fps arms=none
+[28.8s]   [console] [page] heartbeat fps=1 hw=1 video_cb=20/s iters=20/s clk=199.41MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=0.997x governed=1 presented=1/s duty=28% cost=279.7ms/f headroom=3.6x capacity=4fps arms=none
+[30.8s]   [console] [page] heartbeat fps=1 hw=1 video_cb=20/s iters=20/s clk=200.37MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=1.002x governed=1 presented=1/s duty=38% cost=375.4ms/f headroom=2.7x capacity=3fps arms=none
+[32.8s]   [console] [page] heartbeat fps=0 hw=0 video_cb=20/s iters=22/s clk=199.69MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=0.998x governed=1 presented=0/s duty=60% cost=0.0ms/f headroom=1.7x capacity=0fps arms=none
+[34.8s]   [console] [page] heartbeat fps=56 hw=56 video_cb=56/s iters=60/s clk=186.13MHz pc=0x8c03c976 istnrm=0x10 istext=0x0 | guest=0.931x governed=1 presented=56/s duty=85% cost=15.3ms/f headroom=1.1x capacity=66fps arms=none
+[35.2s] NOTE x
+[36.8s]   [console] [page] heartbeat fps=60 hw=60 video_cb=60/s iters=59/s clk=199.62MHz pc=0x8c030e0e istnrm=0x10 istext=0x0 | guest=0.998x governed=1 presented=60/s duty=77% cost=12.8ms/f headroom=1.3x capacity=78fps arms=none
+[38.8s]   [console] [page] heartbeat fps=59 hw=59 video_cb=59/s iters=60/s clk=198.21MHz pc=0x8c036600 istnrm=0x10 istext=0x0 | guest=0.991x governed=1 presented=59/s duty=74% cost=12.5ms/f headroom=1.3x capacity=80fps arms=none
+[39.1s]   [console] [flycast-worker] video_cb #900 HW_FRAME_VALID #600 commit_frame=0 w=640 h=480
+[40.8s]   [console] [page] heartbeat fps=51 hw=51 video_cb=54/s iters=53/s clk=201.88MHz pc=0x8c0441f0 istnrm=0x10 istext=0x0 | guest=1.009x governed=1 presented=51/s duty=79% cost=15.5ms/f headroom=1.3x capacity=65fps arms=none
+[40.9s]   [console] [flycast-worker] run_iter enter #1000
+[40.9s]   [console] [flycast-worker] run_iter exit  #1000
+[42.8s]   [console] [page] heartbeat fps=60 hw=60 video_cb=60/s iters=60/s clk=200.24MHz pc=0x8c044162 istnrm=0x10 istext=0x0 | guest=1.001x governed=1 presented=60/s duty=69% cost=11.6ms/f headroom=1.4x capacity=86fps arms=none
+[44.8s]   [console] [page] heartbeat fps=60 hw=60 video_cb=60/s iters=60/s clk=200.03MHz pc=0x8c030e0e istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=60/s duty=70% cost=11.7ms/f headroom=1.4x capacity=86fps arms=none
+[45.2s] NOTE x
+[46.8s]   [console] [page] heartbeat fps=60 hw=60 video_cb=60/s iters=60/s clk=199.80MHz pc=0x8c036600 istnrm=0x10 istext=0x0 | guest=0.999x governed=1 presented=60/s duty=70% cost=11.6ms/f headroom=1.4x capacity=86fps arms=none
+[47.2s] tap p0 enter
+[48.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.32MHz pc=0x8c03845a istnrm=0x10 istext=0x0 | guest=0.997x governed=1 presented=30/s duty=45% cost=15.1ms/f headroom=2.2x capacity=66fps arms=none
+[50.2s] NOTE x
+[50.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.86MHz pc=0x8c0387c0 istnrm=0x10 istext=0x0 | guest=0.999x governed=1 presented=30/s duty=43% cost=14.4ms/f headroom=2.3x capacity=69fps arms=none
+[51.4s]   [console] [flycast-worker] video_cb #1504 HW_FRAME_VALID #1200 commit_frame=0 w=640 h=480
+[52.3s] tap p0 enter
+[52.8s]   [console] [page] heartbeat fps=26 hw=26 video_cb=29/s iters=28/s clk=202.33MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=1.012x governed=1 presented=26/s duty=40% cost=15.5ms/f headroom=2.5x capacity=65fps arms=none
+[54.8s]   [console] [page] heartbeat fps=1 hw=1 video_cb=21/s iters=21/s clk=201.59MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=1.008x governed=1 presented=1/s duty=51% cost=514.3ms/f headroom=2.0x capacity=2fps arms=none
+[55.3s] NOTE x
+[56.8s]   [console] [page] heartbeat fps=25 hw=25 video_cb=28/s iters=27/s clk=196.59MHz pc=0x8c038740 istnrm=0x10 istext=0x0 | guest=0.983x governed=1 presented=25/s duty=44% cost=17.5ms/f headroom=2.2x capacity=57fps arms=none
+[57.4s] tap p0 m
+[58.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=201.35MHz pc=0x8c038756 istnrm=0x10 istext=0x0 | guest=1.007x governed=1 presented=30/s duty=46% cost=15.2ms/f headroom=2.2x capacity=66fps arms=none
+[60.6s] shot /tmp/dc-p2/p2proof-01-charselect-p1-only.png
+[60.7s] tap p1 btn9
+[60.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.36MHz pc=0x8c03c976 istnrm=0x10 istext=0x0 | guest=1.002x governed=1 presented=30/s duty=45% cost=15.1ms/f headroom=2.2x capacity=66fps arms=none
+[62.3s] shot /tmp/dc-p2/p2proof-02-p2-start-opens-new-load.png
+[62.5s] tap p1 btn9
+[62.8s]   [console] [page] heartbeat fps=25 hw=25 video_cb=28/s iters=26/s clk=198.03MHz pc=0x8c0387fe istnrm=0x10 istext=0x0 | guest=0.990x governed=1 presented=25/s duty=41% cost=16.4ms/f headroom=2.4x capacity=61fps arms=none
+[64.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.90MHz pc=0x8c03c976 istnrm=0x10 istext=0x0 | guest=0.999x governed=1 presented=30/s duty=45% cost=14.9ms/f headroom=2.2x capacity=67fps arms=none
+[65.1s] shot /tmp/dc-p2/p2proof-03-p2-joined.png
+[66.7s] tap p0 m
+[66.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.96MHz pc=0x8c03c976 istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=30/s duty=41% cost=13.8ms/f headroom=2.4x capacity=73fps arms=none
+[68.0s] NOTE x
+[68.1s] tap p1 btn0
+[68.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.04MHz pc=0x8c036600 istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=30/s duty=53% cost=17.6ms/f headroom=1.9x capacity=57fps arms=none
+[69.4s] NOTE x
+[69.5s] tap p0 m
+[69.5s]   [console] [flycast-worker] run_iter enter #2000
+[69.5s]   [console] [flycast-worker] run_iter exit  #2000
+[70.8s] NOTE x
+[70.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=198.94MHz pc=0x8c038756 istnrm=0x10 istext=0x0 | guest=0.995x governed=1 presented=30/s duty=43% cost=14.3ms/f headroom=2.3x capacity=70fps arms=none
+[70.9s] tap p1 btn0
+[72.3s] shot /tmp/dc-p2/p2proof-04-two-characters-chosen.png
+[72.4s] tap p0 m
+[72.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.43MHz pc=0x8c0387c0 istnrm=0x10 istext=0x0 | guest=1.002x governed=1 presented=30/s duty=47% cost=15.5ms/f headroom=2.2x capacity=64fps arms=none
+[73.7s] NOTE x
+[73.8s] tap p1 btn0
+[74.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.89MHz pc=0x8c0387c0 istnrm=0x10 istext=0x0 | guest=0.999x governed=1 presented=30/s duty=44% cost=14.8ms/f headroom=2.3x capacity=68fps arms=none
+[75.1s] NOTE x
+[75.2s] tap p0 m
+[76.5s] NOTE x
+[76.6s] tap p1 btn0
+[76.8s]   [console] [page] heartbeat fps=2 hw=2 video_cb=20/s iters=20/s clk=196.26MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=0.981x governed=1 presented=2/s duty=65% cost=325.3ms/f headroom=1.5x capacity=3fps arms=none
+[77.9s] NOTE x
+[78.8s]   [console] [page] heartbeat fps=0 hw=0 video_cb=18/s iters=27/s clk=180.16MHz pc=0x8c00fa00 istnrm=0x30 istext=0x0 | guest=0.901x governed=1 presented=0/s duty=88% cost=0.0ms/f headroom=1.0x capacity=0fps arms=none
+[78.9s]   [console] [flycast-worker] video_cb #2253 HW_FRAME_VALID #1800 commit_frame=0 w=640 h=480
+[79.9s] NOTE x
+[80.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=29/s clk=200.98MHz pc=0x8c03c976 istnrm=0x10 istext=0x0 | guest=1.005x governed=1 presented=30/s duty=69% cost=23.0ms/f headroom=1.5x capacity=43fps arms=none
+[82.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=29/s clk=200.42MHz pc=0x8c03845a istnrm=0x10 istext=0x0 | guest=1.002x governed=1 presented=30/s duty=62% cost=20.7ms/f headroom=1.6x capacity=48fps arms=none
+[82.9s] NOTE x
+[84.8s]   [console] [page] heartbeat fps=29 hw=29 video_cb=29/s iters=30/s clk=199.93MHz pc=0x8c03677e istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=29/s duty=65% cost=22.5ms/f headroom=1.5x capacity=45fps arms=none
+[86.8s]   [console] [page] heartbeat fps=29 hw=29 video_cb=29/s iters=29/s clk=199.95MHz pc=0x8c038756 istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=29/s duty=63% cost=21.8ms/f headroom=1.6x capacity=46fps arms=none
+[87.9s] NOTE x
+[88.8s]   [console] [page] heartbeat fps=29 hw=29 video_cb=29/s iters=28/s clk=199.63MHz pc=0x8c03c97c istnrm=0x10 istext=0x0 | guest=0.998x governed=1 presented=29/s duty=61% cost=21.0ms/f headroom=1.6x capacity=48fps arms=none
+[90.8s]   [console] [page] heartbeat fps=29 hw=29 video_cb=29/s iters=29/s clk=199.63MHz pc=0x8c03c97c istnrm=0x10 istext=0x0 | guest=0.998x governed=1 presented=29/s duty=64% cost=22.0ms/f headroom=1.6x capacity=46fps arms=none
+[92.8s]   [console] [page] heartbeat fps=29 hw=29 video_cb=29/s iters=30/s clk=199.98MHz pc=0x8c038756 istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=29/s duty=64% cost=22.0ms/f headroom=1.6x capacity=46fps arms=none
+[93.1s] shot /tmp/dc-p2/p2proof-05-in-game.png
+[94.8s]   [console] [page] heartbeat fps=29 hw=29 video_cb=29/s iters=29/s clk=200.16MHz pc=0x8c036600 istnrm=0x10 istext=0x0 | guest=1.001x governed=1 presented=29/s duty=61% cost=21.2ms/f headroom=1.6x capacity=47fps arms=none
+[95.2s] pos rest0: n=10 yellowX=276.88 (px 1282) blueX=179.31 (px 657)  PAD p0[btn=0x0 lx=0] p1[btn=0x0 lx=0]
+[95.4s] shot /tmp/dc-p2/p2proof-06-rest0.png
+[95.4s] hold p0 arrowleft
+[95.4s]   [console] [input] analog engaged x=-32767 y=0
+[96.8s]   [console] [page] heartbeat fps=29 hw=29 video_cb=29/s iters=29/s clk=199.07MHz pc=0x8c036600 istnrm=0x10 istext=0x0 | guest=0.995x governed=1 presented=29/s duty=65% cost=22.4ms/f headroom=1.5x capacity=45fps arms=none
+[98.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.66MHz pc=0x8c0387c0 istnrm=0x10 istext=0x0 | guest=1.003x governed=1 presented=30/s duty=64% cost=21.3ms/f headroom=1.6x capacity=47fps arms=none
+[99.4s]   [console] [flycast-worker] video_cb #2853 HW_FRAME_VALID #2400 commit_frame=0 w=640 h=480
+[99.6s] pos p1left: n=10 yellowX=230.20 (px 1029) blueX=345.12 (px 978)  PAD p0[btn=0x0 lx=-32767] p1[btn=0x0 lx=0]
+[99.8s] shot /tmp/dc-p2/p2proof-07-p1-left-only.png
+[99.8s] release p0 arrowleft
+[100.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.82MHz pc=0x8c038740 istnrm=0x10 istext=0x0 | guest=0.999x governed=1 presented=30/s duty=56% cost=18.8ms/f headroom=1.8x capacity=53fps arms=none
+[102.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.50MHz pc=0x8c03677e istnrm=0x10 istext=0x0 | guest=1.002x governed=1 presented=30/s duty=61% cost=20.2ms/f headroom=1.7x capacity=49fps arms=none
+[103.6s] pos rest1: n=10 yellowX=254.94 (px 980) blueX=449.85 (px 968)  PAD p0[btn=0x0 lx=0] p1[btn=0x0 lx=0]
+[103.8s] shot /tmp/dc-p2/p2proof-08-rest1.png
+[103.8s] p1 axis0=-1
+[104.3s]   [console] [flycast-worker] run_iter enter #3000
+[104.3s]   [console] [flycast-worker] run_iter exit  #3000
+[104.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.45MHz pc=0x8c0387c0 istnrm=0x10 istext=0x0 | guest=0.997x governed=1 presented=30/s duty=58% cost=19.4ms/f headroom=1.7x capacity=52fps arms=none
+[106.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.83MHz pc=0x8c0387c0 istnrm=0x10 istext=0x0 | guest=1.004x governed=1 presented=30/s duty=61% cost=20.2ms/f headroom=1.7x capacity=49fps arms=none
+[108.0s] pos p2left: n=10 yellowX=270.11 (px 2125) blueX=107.25 (px 687)  PAD p0[btn=0x0 lx=0] p1[btn=0x0 lx=-32767]
+[108.2s] shot /tmp/dc-p2/p2proof-09-p2-left-only.png
+[108.2s] p1 axis0=0
+[108.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=29/s clk=199.98MHz pc=0x8c038756 istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=30/s duty=55% cost=18.4ms/f headroom=1.8x capacity=54fps arms=none
+[110.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.35MHz pc=0x8c03845a istnrm=0x10 istext=0x0 | guest=1.002x governed=1 presented=30/s duty=57% cost=19.0ms/f headroom=1.8x capacity=53fps arms=none
+[112.0s] pos rest2: n=10 yellowX=337.62 (px 2193) blueX=50.78 (px 579)  PAD p0[btn=0x0 lx=0] p1[btn=0x0 lx=0]
+[112.2s] shot /tmp/dc-p2/p2proof-10-rest2.png
+[112.2s] hold p0 arrowleft
+[112.2s] p1 axis0=1
+[112.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.97MHz pc=0x8c03c976 istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=30/s duty=57% cost=18.9ms/f headroom=1.8x capacity=53fps arms=none
+[114.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.89MHz pc=0x8c0387c0 istnrm=0x10 istext=0x0 | guest=1.004x governed=1 presented=30/s duty=57% cost=19.0ms/f headroom=1.8x capacity=53fps arms=none
+[116.8s] pos split: n=10 yellowX=277.86 (px 2567) blueX=469.10 (px 580)  PAD p0[btn=0x0 lx=-32767] p1[btn=0x0 lx=32767]
+[116.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.05MHz pc=0x8c03c97c istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=30/s duty=53% cost=17.5ms/f headroom=1.9x capacity=57fps arms=none
+[116.9s] shot /tmp/dc-p2/p2proof-11-p1-left-p2-right.png
+[116.9s] release p0 arrowleft
+[116.9s] p1 axis0=0
+[118.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.16MHz pc=0x8c02fbf2 istnrm=0x10 istext=0x0 | guest=1.001x governed=1 presented=30/s duty=58% cost=19.3ms/f headroom=1.7x capacity=52fps arms=none
+[119.4s]   [console] [flycast-worker] video_cb #3453 HW_FRAME_VALID #3000 commit_frame=0 w=640 h=480
+[120.5s] pos rest3: n=10 yellowX=289.61 (px 2514) blueX=473.88 (px 394)  PAD p0[btn=0x0 lx=0] p1[btn=0x0 lx=0]
+[120.5s] hold p0 arrowright
+[120.5s] p1 axis0=-1
+[120.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.09MHz pc=0x8c03c976 istnrm=0x10 istext=0x0 | guest=1.000x governed=1 presented=30/s duty=54% cost=17.9ms/f headroom=1.9x capacity=56fps arms=none
+[122.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.14MHz pc=0x8c038756 istnrm=0x10 istext=0x0 | guest=0.996x governed=1 presented=30/s duty=56% cost=18.5ms/f headroom=1.8x capacity=54fps arms=none
+[124.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.80MHz pc=0x8c02fbf2 istnrm=0x10 istext=0x0 | guest=1.004x governed=1 presented=30/s duty=58% cost=19.3ms/f headroom=1.7x capacity=52fps arms=none
+[125.0s] pos swap: n=10 yellowX=333.64 (px 2444) blueX=61.56 (px 576)  PAD p0[btn=0x0 lx=32767] p1[btn=0x0 lx=-32767]
+[125.2s] shot /tmp/dc-p2/p2proof-12-p1-right-p2-left.png
+[125.2s] release p0 arrowright
+[125.2s] p1 axis0=0
+[126.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=199.77MHz pc=0x8c03677e istnrm=0x10 istext=0x0 | guest=0.999x governed=1 presented=30/s duty=57% cost=18.9ms/f headroom=1.8x capacity=53fps arms=none
+[128.8s] pos rest4: n=10 yellowX=343.41 (px 2531) blueX=47.77 (px 611)  PAD p0[btn=0x0 lx=0] p1[btn=0x0 lx=0]
+[128.8s]   [console] [page] heartbeat fps=30 hw=30 video_cb=30/s iters=30/s clk=200.43MHz pc=0x8c0387fe istnrm=0x10 istext=0x0 | guest=1.002x governed=1 presented=30/s duty=57% cost=19.0ms/f headroom=1.8x capacity=53fps arms=none
+[128.9s] shot /tmp/dc-p2/p2proof-13-rest4.png
+[128.9s] 
+=== ARM STATISTICS (8x6 block-mean luminance) ===
+[128.9s] 
+=== BETWEEN-ARM DISTANCE vs WITHIN-ARM CHURN ===
+[128.9s] 
+=== PER-CHARACTER X POSITION (colour-keyed centroid, play area only, 512 px wide) ===
+[128.9s]   rest0            n=10  WIZARD/yellow x=276.88 (sd 5.07, 1282 px)   VALKYRIE/blue x=179.31 (sd 0.92, 657 px)
+[128.9s]   p1left           n=10  WIZARD/yellow x=230.2 (sd 16.43, 1029 px)   VALKYRIE/blue x=345.12 (sd 47.09, 978 px)
+[128.9s]   rest1            n=10  WIZARD/yellow x=254.94 (sd 13.59, 980 px)   VALKYRIE/blue x=449.85 (sd 1.83, 968 px)
+[128.9s]   p2left           n=10  WIZARD/yellow x=270.11 (sd 63.36, 2125 px)   VALKYRIE/blue x=107.25 (sd 43.26, 687 px)
+[128.9s]   rest2            n=10  WIZARD/yellow x=337.62 (sd 4.56, 2193 px)   VALKYRIE/blue x=50.78 (sd 2.44, 579 px)
+[128.9s]   split            n=10  WIZARD/yellow x=277.86 (sd 4.89, 2567 px)   VALKYRIE/blue x=469.1 (sd 12.01, 580 px)
+[128.9s]   rest3            n=10  WIZARD/yellow x=289.61 (sd 8.21, 2514 px)   VALKYRIE/blue x=473.88 (sd 0.83, 394 px)
+[128.9s]   swap             n=10  WIZARD/yellow x=333.64 (sd 2.68, 2444 px)   VALKYRIE/blue x=61.56 (sd 2.73, 576 px)
+[128.9s]   rest4            n=10  WIZARD/yellow x=343.41 (sd 3.09, 2531 px)   VALKYRIE/blue x=47.77 (sd 3.42, 611 px)
+[128.9s] 
+=== DELTAS BETWEEN CONSECUTIVE ARMS ===
+[128.9s]   rest0 -> p1left: WIZARD dx=-46.68   VALKYRIE dx=165.81
+[128.9s]   p1left -> rest1: WIZARD dx=24.74   VALKYRIE dx=104.73
+[128.9s]   rest1 -> p2left: WIZARD dx=15.17   VALKYRIE dx=-342.60
+[128.9s]   p2left -> rest2: WIZARD dx=67.51   VALKYRIE dx=-56.47
+[128.9s]   rest2 -> split: WIZARD dx=-59.76   VALKYRIE dx=418.32
+[128.9s]   split -> rest3: WIZARD dx=11.75   VALKYRIE dx=4.78
+[128.9s]   rest3 -> swap: WIZARD dx=44.03   VALKYRIE dx=-412.32
+[128.9s]   swap -> rest4: WIZARD dx=9.77   VALKYRIE dx=-13.79
+[128.9s] 
+wasm BEFORE: 14bddf42b8255a0c (8704964 B)
+wasm AFTER:  14bddf42b8255a0c (8704964 B)  (STABLE)
+[128.9s] json -> /tmp/dc-p2/p2proof.json
