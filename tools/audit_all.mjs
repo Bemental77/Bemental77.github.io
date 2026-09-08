@@ -389,6 +389,23 @@ const HARNESSES = [
   // nobody. That is the exact shape of gap this file exists to close — a test
   // that exists but is never invoked is indistinguishable from no test, and it
   // is worse, because its presence implies coverage.
+  // ⚠ THE ONLY ARM THAT LOOKS AT PRODUCTION. Every other harness here — and
+  // every emulator probe in this repo — reads the WORKING TREE on the machine
+  // that built it. That blind spot shipped a real failure: the Dreamcast
+  // lockstep desync fix was measured green by two rigs on a wasm that was never
+  // committed, so production served the pre-fix binary while the page asked it
+  // for an export it did not have. A local pass is not a deployment.
+  {
+    name: 'deployed-matches-repo',
+    file: 'tools/verify_deployed_matches_repo.mjs',
+    cmd: ['node', 'tools/verify_deployed_matches_repo.mjs'],
+    desc: 'the bytes production serves are the bytes committed at HEAD — a STALE row means either a deploy has not landed or an artifact was built and never committed, and the second is invisible to every other test here',
+    fast: false, ci: false,
+    ciWhy: 'it fetches the live origin, so in CI it would fail for the entirely normal reason that the push being tested has not deployed yet — a red cell that says nothing about the change. It belongs in a full local run, after a deploy',
+    server: false,
+    requires: ['tools/verify_deployed_matches_repo.mjs'],
+    timeoutMs: 10 * MIN,
+  },
   {
     name: 'netplay-lockstep',
     file: 'tools/netplay_lockstep_test.mjs',
