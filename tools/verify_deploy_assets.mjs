@@ -34,6 +34,7 @@
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
+import { runInNewContext } from 'node:vm';
 
 // Files whose literal runtime URLs must resolve in the artifact. These are the
 // entry points a browser actually loads — pages plus the worker shims/glue they
@@ -149,6 +150,77 @@ const looksLikeSplitPrefix = (u) => /\.part$/.test(u) || /\.bin\.part$/.test(u);
 
 const found = new Map();   // url -> Set(source)
 const unchecked = [];
+const catalogFaults = [];         // structural faults in the catalog itself, not 404s
+const skipDirAbsent = new Set();  // staged mode: whole disc dir absent from the checkout
+
+// ---------------------------------------------------------------------------
+// THE DREAMCAST DISC CATALOG — derived, never hand-listed.
+//
+// WHY THIS EXISTS (measured 2026-09-08, on the LIVE site): four of five
+// Dreamcast games 404'd their disc in production WHILE THIS CHECK PASSED, 67
+// present / 0 MISSING. A commit converted every disc to block-gzip (.bgz plus a
+// .bgzi.json block index) and DELETED the old .gz parts, but updated only
+// gauntlet's GAMES entry. Every file the check knew about existed; the catalog
+// simply NAMED DIFFERENT ONES. "Does this file exist?" cannot see that. The
+// only question that can is "does every URL the catalog NAMES resolve?", so the
+// URL list is now derived FROM the catalog instead of maintained beside it —
+// a list maintained beside it is precisely what drifted.
+//
+// The parts are built as .map(s => name + s + ext), so no static regex can
+// recover them. The object literal is evaluated instead, in a bare context with
+// no globals: it is pure data plus arrow functions over string literals.
+function extractGames(text, srcName) {
+  const i = text.indexOf('const GAMES = {');
+  if (i < 0) return null;
+  const j = text.indexOf('\n  };', i);
+  if (j < 0) return null;
+  // A parse failure must be LOUD. If this silently returned {}, the check would
+  // go straight back to reporting 0 MISSING on a catalog that names nothing
+  // which exists — the exact production failure above, wearing a PASS.
+  const g = runInNewContext(text.slice(i, j + 5) + '\nGAMES;', Object.create(null),
+                            { timeout: 5000, filename: srcName });
+  if (!g || typeof g !== 'object' || !Object.keys(g).length) return null;
+  return g;
+}
+
+// Every URL a game's entry names, plus the one structural rule that no amount
+// of URL-resolving can express.
+function catalogUrls(games) {
+  const out = [];
+  for (const [key, g] of Object.entries(games)) {
+    // Not deployed on purpose — dreamcast.html:2152 relabels the option and
+    // :3685 refuses to launch it. Asserting on it would be a false red.
+    if (g.hosted === false) continue;
+    const base = g.base;
+    if (!base) { catalogFaults.push('GAMES.' + key + ' has no base'); continue; }
+    for (const f of g.files || []) {
+      const why = 'dreamcast.html GAMES.' + key + ' files[' + f.name + ']';
+      if (f.parts) {
+        // ⚠ THE RULE THIS GATE WILL NOT TRADE FOR SPEED. Per dreamcast.html:3614,
+        // the extension test in fetchDiscInto is /\.gz$/, which does NOT match
+        // ".bgz" — so a .bgz file with no index makes the EAGER path "silently
+        // write COMPRESSED bytes" into the disc buffer. That is a corrupt disc
+        // that still loads, not a clean failure. Every URL below would resolve
+        // and the game would still be broken, so this is checked structurally
+        // rather than by fetching anything. A 404 is loud and recoverable;
+        // silent corruption is neither.
+        if (f.parts.some((n) => /\.bgz$/.test(n)) && !f.index) {
+          catalogFaults.push(
+            'GAMES.' + key + ' ' + f.name + ' has .bgz parts but no index: — the eager path ' +
+            'would write COMPRESSED bytes into the disc buffer (dreamcast.html:3614)');
+        }
+        if (f.index) out.push([base + f.index, why + ' .index']);
+        for (const n of f.parts) out.push([base + n, why + ' .parts[]']);
+      } else {
+        out.push([base + f.name, why]);
+      }
+    }
+    if (g.cue && !(g.files || []).some((f) => f.name === g.cue)) {
+      out.push([base + g.cue, 'dreamcast.html GAMES.' + key + '.cue']);
+    }
+  }
+  return out;
+}
 
 // ⚠ SOURCE/TARGET COHERENCE — a flaw this tool shipped with, caught in review.
 // The first version read WORKING-TREE sources while checking LIVE URLs, which
@@ -182,6 +254,34 @@ for (const src of SOURCES) {
   // how much of the surface this check actually covers.
   const dyn = (text.match(/(?:fetch\(|importScripts\()\s*[`'"]?\s*(?:\$\{|['"]\s*\+)/g) || []).length;
   if (dyn) unchecked.push(`${src}: ${dyn} dynamically-built URL(s) not statically checkable`);
+
+  // The disc catalog is DATA, not a URL literal — evaluate it and expand it.
+  if (src === 'dreamcast.html') {
+    const games = extractGames(text, src);
+    if (!games) {
+      console.error('[deploy-assets] FATAL: could not evaluate the GAMES catalog in ' + src +
+        '. Refusing to report a result — this check PASSED at 67 present / 0 MISSING while ' +
+        'four games were 404 in production, and a silently-empty catalog is that same PASS.');
+      process.exit(2);
+    }
+    for (const [u, why] of catalogUrls(games)) {
+      if (!found.has(u)) found.set(u, new Set());
+      found.get(u).add(why);
+    }
+    // STAGED MODE ONLY: the CI checkout omits dreamcast/discs entirely — which
+    // is why this harness had to be marked ci:false, since it reported MISSING
+    // for files that were deployed fine and so nobody read the red. An ABSENT
+    // DIRECTORY is not evidence of breakage; a PRESENT directory missing a
+    // NAMED file is. Live mode has no such excuse and asserts on everything.
+    if (!liveMode) {
+      for (const [k, g] of Object.entries(games)) {
+        if (g.hosted === false || !g.base) continue;
+        if (!existsSync(join(root, g.base.replace(/^\//, '')))) {
+          for (const [u] of catalogUrls({ [k]: g })) skipDirAbsent.add(u);
+        }
+      }
+    }
+  }
 }
 
 const missing = [], optionalMissing = [], ok = [];
@@ -219,11 +319,53 @@ function assertCatchesFoundingCases() {
 }
 assertCatchesFoundingCases();
 
+// SELF-TEST 2: the catalog expansion must catch ITS founding case — the
+// 2026-09-08 break, where four games named .part*.gz files the bgz conversion
+// had deleted. A gate that cannot fail on the bug it was written for is
+// decoration, and this one shipped a PASS over that exact bug once already.
+function assertCatchesCatalogFoundingCases() {
+  const BROKEN = [
+    "  const GAMES = {",
+    "    sa2: { name: 'x', base: '/dreamcast/discs/sa2/', cue: 'S.cue',",
+    "      files: [ { name: 'Track1.bin' },",
+    "        { name: 'Track3.bin', bytes: 1,",
+    "          parts: ['aa','ab'].map(s => 'Track3.bin.part' + s + '.gz') },",
+    "        { name: 'S.cue' } ] },",
+    "  };",
+  ].join('\n');
+  const g = extractGames(BROKEN, 'self-test');
+  if (!g) { console.error('[deploy-assets] SELF-TEST FAILED: catalog would not evaluate'); process.exit(2); }
+  const urls = catalogUrls(g).map(([u]) => u);
+  // The .map()-built part names are the whole point: a static regex sees none
+  // of these, which is why the 404s were invisible.
+  for (const want of ['/dreamcast/discs/sa2/Track3.bin.partaa.gz',
+                      '/dreamcast/discs/sa2/Track3.bin.partab.gz',
+                      '/dreamcast/discs/sa2/Track1.bin']) {
+    if (!urls.includes(want)) {
+      console.error('[deploy-assets] SELF-TEST FAILED: catalog expansion did not yield ' + want +
+                    '\n  got: ' + urls.join(', '));
+      process.exit(2);
+    }
+  }
+  // And the silent-corruption rule: .bgz parts with no index: must fault.
+  const before = catalogFaults.length;
+  catalogUrls(extractGames(BROKEN.replace(/\.gz'\)/, ".bgz')"), 'self-test'));
+  if (catalogFaults.length !== before + 1) {
+    console.error('[deploy-assets] SELF-TEST FAILED: .bgz parts with no index: did not fault');
+    process.exit(2);
+  }
+  catalogFaults.length = before;   // discard the synthetic fault
+}
+assertCatchesCatalogFoundingCases();
+
 for (const [u, why] of ALWAYS_REQUIRED) {
   if (!found.has(u)) found.set(u, new Set([`ALWAYS_REQUIRED (${why})`]));
 }
 const urls = [...found.keys()].sort();
 for (const u of urls) {
+  // Staged mode, whole disc directory not in the checkout — see the note in the
+  // catalog block. Reported, never counted as breakage.
+  if (skipDirAbsent.has(u)) continue;
   if (looksLikeSplitPrefix(u)) {
     // Check the first real chunk instead of the (non-existent) prefix.
     // The chunk may be stored gzipped (the pages inflate it), so accept either
@@ -242,11 +384,29 @@ for (const u of urls) {
   (OPTIONAL.has(u) ? optionalMissing : missing).push(u);
 }
 
+if (skipDirAbsent.size) {
+  unchecked.push(`dreamcast.html: ${skipDirAbsent.size} catalog URL(s) skipped — their disc ` +
+                 `directory is absent from this checkout (use --live to assert on them)`);
+}
 console.log(`[deploy-assets] target=${liveMode ? origin : resolve(root)}`);
 console.log(`[deploy-assets] ${ok.length} present · ${optionalMissing.length} optional-missing · ${missing.length} MISSING`);
 for (const u of optionalMissing) console.log(`  optional  ${u}\n            (${OPTIONAL.get(u)})`);
 for (const u of unchecked) console.log(`  unchecked ${u}`);
 for (const u of missing) console.log(`  MISSING   ${u}\n            referenced by: ${[...found.get(u)].join(', ')}`);
+
+for (const f of catalogFaults) console.log(`  CATALOG   ${f}`);
+
+// A structural catalog fault fails even when every URL resolves — that is the
+// point of it. Silent disc corruption is strictly worse than a 404.
+if (catalogFaults.length) {
+  console.error(
+    `\n[deploy-assets] FAIL — ${catalogFaults.length} structural fault(s) in the GAMES catalog.\n` +
+    `These are NOT missing files; every URL may resolve. A .bgz file whose entry\n` +
+    `has no index: loads COMPRESSED BYTES into the disc buffer as if they were\n` +
+    `disc data (dreamcast.html:3614), which boots a corrupt disc instead of\n` +
+    `failing. Wire the index: the way GAMES.gauntlet does.\n`);
+  process.exit(1);
+}
 
 if (missing.length) {
   console.error(
