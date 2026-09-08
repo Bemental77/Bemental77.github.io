@@ -25,6 +25,10 @@
 //                 co-op target; it is a two-player game, which is the point)
 //   DCNET_BOOT_MS how long to wait for the host to boot (default 300000 — the
 //                 disc is 563 MB of gzipped parts served by python http.server)
+//   DCNET_AUDIO_WAIT_MS how long to WAIT FOR THE GAME TO MAKE A SOUND before
+//                 voiding the audio cell (default 120000). Gauntlet Legends is
+//                 silent through its VMU-check and logo screens and first went
+//                 audible 22 s after the guest connected on this box.
 //   DCNET_KEEP    leave the browser open at the end (debugging)
 import puppeteer from 'puppeteer';
 import fs from 'fs';
@@ -38,6 +42,12 @@ const res = [];
 const ok  = (n, d) => { res.push({ n, ok: true }); console.log(`  PASS  ${n}  ${d}`); };
 const bad = (n, d) => { res.push({ n, ok: false }); console.log(`  FAIL  ${n}  ${d}`); };
 const info = (n, d) => console.log(`  ....  ${n}  ${d}`);
+// ⚠ A THIRD OUTCOME, and leaving it out is what made this rig publish a bare
+// zero as if it were a reading. A cell whose PRECONDITION never happened has
+// not passed and has not failed — it measured nothing, and printing it as
+// either is a lie in one direction or the other. VOID says so, names the
+// precondition, and is excluded from the tally.
+const voidc = (n, d) => console.log(`  VOID  ${n}  ${d}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ⚠ POLL FROM NODE, never page.waitForFunction — it polls on rAF, and one of
@@ -272,30 +282,31 @@ console.log('\n== the guest can HEAR the game ==');
 // and a guest measuring the track through Web Audio alone read peak 0.00000
 // while packets were arriving. lib/netplay.js now sinks the track itself.
 //
-// Level is still an OBSERVATION, not an assertion: a Dreamcast sitting on a
-// silent screen legitimately produces zero, so a zero is not evidence of a
-// broken tap — only a non-zero is evidence of a working one. What IS asserted
-// is the pair of things that are faults no matter what the game is playing:
-// an audio track must be there, and the guest's element must be AUDIBLE.
-const snd = await guest.evaluate(async () => {
-  const v = document.getElementById('netVideo');
-  if (!v.srcObject || !v.srcObject.getAudioTracks().length) return { err: 'no audio track on the stream' };
-  const ac = new AudioContext();
-  const src = ac.createMediaStreamSource(v.srcObject);
-  const an = ac.createAnalyser(); an.fftSize = 2048;
-  src.connect(an);
-  const buf = new Float32Array(an.fftSize);
-  let peakRms = 0, peak = 0;
-  for (let i = 0; i < 40; i++) {
-    await new Promise((r) => setTimeout(r, 50));
-    an.getFloatTimeDomainData(buf);
-    let s = 0;
-    for (let k = 0; k < buf.length; k++) { s += buf[k] * buf[k]; if (Math.abs(buf[k]) > peak) peak = Math.abs(buf[k]); }
-    peakRms = Math.max(peakRms, Math.sqrt(s / buf.length));
-  }
-  await ac.close();
-  return { peakRms: +peakRms.toFixed(5), peak: +peak.toFixed(5) };
-});
+// ⚠ THE WINDOW IS THE WHOLE PROBLEM, and a fixed one is why this section used
+// to publish a bare zero. Until 2026-09-07 it read the level ONCE for 2 s
+// immediately after the video samples and reported whatever it found. MEASURED
+// on the two-tab run that produced that zero: the host's own captured track sat
+// at exactly 0.00000 for the first 20 s after the guest connected and then went
+// to 0.21875 at t+22s, with the guest reading 0.20911 in the same second and a
+// peak of 0.25337 over the session. The screenshot at the moment of the zero is
+// Gauntlet Legends' "VMU has adequate storage space" screen — the game had not
+// made a sound yet. So the 2 s window was landing ~20 s early on a SILENT part
+// of the boot, and the rig reported the game's own silence as if it were a
+// finding about netplay.
+//
+// A LEVEL OF ZERO IS THEREFORE NOT A RESULT UNLESS THE HOST IS AUDIBLE. What is
+// asserted is the implication that is a fault no matter what is on screen:
+//   host makes a sound  =>  the guest hears it.
+// The rig WAITS for the antecedent (polling a persistent analyser on each side)
+// and, if the game never makes a sound inside the window, VOIDs the cell and
+// says which screen it was looking at instead of scoring it.
+//
+// What IS asserted unconditionally is the pair of things that are faults
+// regardless of what the game is playing: an audio track must be there, and the
+// guest's element must be AUDIBLE.
+const AUDIO_WAIT_MS = parseInt(process.env.DCNET_AUDIO_WAIT_MS || '120000', 10);
+const AUDIBLE = 0.0001;   // above Opus comfort noise: a silent track reads 0.00003
+
 // AUDIBILITY IS AN ELEMENT STATE, NOT A TRACK STATE. A muted element renders
 // the samples exactly the same (measured: peak 0.506 through a muted <audio>),
 // so an analyser reading cannot tell you whether a person hears anything —
@@ -309,43 +320,103 @@ const ga = await guest.evaluate(() => window.__dcNet().guestAudio);
   : bad('guest-audio-audible', JSON.stringify(ga) +
       ' — a connected guest that cannot hear anything. A muted element still ' +
       'decodes, so this is invisible to a track-state or analyser check.');
+
 // ⚠ MEASURE THE SENDER TOO, ALWAYS. A guest reading zero has two completely
 // different causes and the guest-side number alone cannot separate them: the
 // transport dropped the sound, or the EMULATOR ISN'T MAKING ANY. Reading the
 // host's own captured MediaStreamDestination track back — the same track that
 // was published, before it goes anywhere — makes every zero attributable.
-const tap = await host.evaluate(async () => {
-  const s = window.__dcNetStream ? window.__dcNetStream() : null;
+//
+// ⚠ AND ARM THE HOST ANALYSER ONLY AFTER THE SESSION EXISTS. netStartHost()
+// awaits netCaptureSurface() (a 900 ms capture probe) BEFORE it constructs the
+// Session, so __dcNetStream() returns null for about a second after the button
+// click and an early read reports "the host published no audio track" for a
+// session that has not been built yet. By this point the guest is connected, so
+// the stream is there — but the failure mode is worth naming.
+const armLevel = (page, side) => page.evaluate((side) => {
+  const s = side === 'host' ? (window.__dcNetStream && window.__dcNetStream())
+                            : document.getElementById('netVideo').srcObject;
   const at = s ? s.getAudioTracks() : [];
-  if (!at.length) return { err: 'the host published no audio track' };
+  if (!at.length) return { err: 'no audio track on this side' };
   const ac = new AudioContext();
   const src = ac.createMediaStreamSource(new MediaStream([at[0]]));
   const an = ac.createAnalyser(); an.fftSize = 2048;
   src.connect(an);
-  const buf = new Float32Array(an.fftSize);
-  let peak = 0;
-  for (let i = 0; i < 40; i++) {
-    await new Promise((r) => setTimeout(r, 50));
-    an.getFloatTimeDomainData(buf);
-    for (let k = 0; k < buf.length; k++) if (Math.abs(buf[k]) > peak) peak = Math.abs(buf[k]);
-  }
-  await ac.close();
-  return { peak: +peak.toFixed(5) };
+  window.__dcLevel = { ac, an, buf: new Float32Array(an.fftSize) };
+  return { rate: ac.sampleRate, state: ac.state };
+}, side);
+const readLevel = (page) => page.evaluate(() => {
+  const L = window.__dcLevel;
+  if (!L) return null;
+  L.an.getFloatTimeDomainData(L.buf);
+  let p = 0;
+  for (let k = 0; k < L.buf.length; k++) { const a = Math.abs(L.buf[k]); if (a > p) p = a; }
+  return +p.toFixed(5);
 });
-info('host-audio-tap', tap.err ? tap.err
-  : `peak ${tap.peak} on the host's OWN captured track, before the wire`);
-info('guest-audio-level', snd.err ? snd.err
-  : `peak ${snd.peak} / peak RMS ${snd.peakRms} over 2 s on the received audio track`);
-// The verdict is the PAIR, not either number alone.
-if (!tap.err && !snd.err) {
-  info('audio-attribution', tap.peak <= 0.0001
-    ? `the host's own tap is silent too (${tap.peak}) — the EMULATOR produced no sound in this window, ` +
-      `so the guest's ${snd.peak} says nothing about the transport either way`
-    : (snd.peak > 0.0001
-        ? `host tap ${tap.peak} -> guest ${snd.peak}: the sound the emulator made reached the other browser`
-        : `host tap ${tap.peak} but guest ${snd.peak} — the emulator WAS making sound and it did NOT cross. ` +
-          `That is a transport fault, not a silent game.`));
+const dropLevel = (page) => page.evaluate(() => {
+  try { window.__dcLevel && window.__dcLevel.ac.close(); } catch (e) {}
+  window.__dcLevel = null;
+}).catch(() => {});
+
+const hArm = await armLevel(host, 'host');
+const gArm = await armLevel(guest, 'guest');
+// Poll both sides together. The host is the trigger; the guest's peak is
+// accumulated across the whole window and for a grace period afterwards,
+// because the sound has to be encoded, sent and decoded before it can be read.
+let hPeak = 0, gPeak = 0, firstSoundMs = null, hLast = 0, gLast = 0;
+const tAudio0 = Date.now();
+if (!hArm.err && !gArm.err) {
+  for (;;) {
+    const el = Date.now() - tAudio0;
+    const h = await readLevel(host), g = await readLevel(guest);
+    if (h != null && h > hPeak) hPeak = h;
+    if (g != null && g > gPeak) gPeak = g;
+    if (h != null) hLast = h;
+    if (g != null) gLast = g;
+    if (firstSoundMs == null && hPeak > AUDIBLE) {
+      firstSoundMs = el;
+      info('host-first-sound', `the emulator's own captured track went audible ${(el / 1000).toFixed(1)} s ` +
+        `into the audio window (peak ${hPeak}) — everything before that was the game being silent, not a fault`);
+    }
+    // Stop as soon as the implication is settled either way, or the window ends.
+    if (firstSoundMs != null && (gPeak > AUDIBLE || el > firstSoundMs + 5000)) break;
+    if (el > AUDIO_WAIT_MS) break;
+    await sleep(250);
+  }
 }
+info('host-audio-tap', hArm.err ? hArm.err
+  : `peak ${hPeak} on the host's OWN captured track, before the wire ` +
+    `(${((Date.now() - tAudio0) / 1000).toFixed(1)} s window, last read ${hLast})`);
+info('guest-audio-level', gArm.err ? gArm.err
+  : `peak ${gPeak} on the received audio track over the same window (last read ${gLast})`);
+
+// THE VERDICT IS THE IMPLICATION, and it is only scoreable once the host is
+// audible. A guest zero under a host zero is the game being quiet; a guest zero
+// under a host peak is a transport fault; both non-zero is the feature working.
+if (hArm.err || gArm.err) {
+  bad('guest-hears-the-game', `could not arm an analyser: host=${JSON.stringify(hArm)} guest=${JSON.stringify(gArm)}`);
+} else if (hPeak <= AUDIBLE) {
+  // Name the screen. "Zero" with a picture attached is diagnosable; "zero" is not.
+  let shot = 'screenshot failed';
+  try { await guest.screenshot({ path: '/tmp/dcnet-guest-silent-window.png' }); shot = '/tmp/dcnet-guest-silent-window.png'; }
+  catch (e) {}
+  voidc('guest-hears-the-game',
+    `NOT MEASURED: the HOST'S OWN captured track never rose above ${AUDIBLE} in ` +
+    `${(AUDIO_WAIT_MS / 1000).toFixed(0)} s (peak ${hPeak}), so ${GAME} produced digital silence for the ` +
+    `whole window and the guest's ${gPeak} says nothing about the transport either way. ` +
+    `This is what the emulator was showing: ${shot}. ` +
+    `Gauntlet is silent through its VMU/logo screens — raise DCNET_AUDIO_WAIT_MS, ` +
+    `or pick a disc that makes noise sooner.`);
+} else if (gPeak > AUDIBLE) {
+  ok('guest-hears-the-game',
+    `host tap ${hPeak} -> guest ${gPeak}: the sound the EMULATOR made crossed a real ` +
+    `RTCPeerConnection and came out of the other browser's element`);
+} else {
+  bad('guest-hears-the-game',
+    `host tap ${hPeak} but guest ${gPeak} — the emulator WAS making sound and it did NOT cross. ` +
+    `That is a transport fault, not a silent game.`);
+}
+await dropLevel(host); await dropLevel(guest);
 
 // Evidence WHILE CONNECTED, which is the only moment the claim is about.
 try {
