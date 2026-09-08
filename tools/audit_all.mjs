@@ -370,6 +370,60 @@ const HARNESSES = [
     ciWhy: 'same as audit-peerjs-crossdevice — it deliberately uses the real broker and real ICE, so it is network-dependent by design',
     server: true, requires: ['lib/netplay.js'], timeoutMs: 25 * MIN,
   },
+
+  // ---- the lockstep determinism gate -------------------------------------
+  // THE ONLY GATE THAT CAN CATCH THIS REGRESSION, and the reason it is worth
+  // three minutes of a full run: the fix it protects is INVISIBLE TO EVERY
+  // STATE-DIFF INSTRUMENT. A one-sided-normalize probe showed the operation
+  // that removes the divergence is state-NEUTRAL in the serialized set —
+  // normalizing instance A alone left A's state hash unchanged (3986917111 ->
+  // 3986917111) with `DIFFERING RUNS: 0, 0 B differing across all 27,785,287`.
+  // So the carrier is provably NOT in anything retro_serialize writes, no
+  // byte-diff of a savestate can see it, and only a BEHAVIOURAL arm — run two
+  // independent boots and compare their trajectories — can tell whether it
+  // came back. The fix is flush -> serialize/unserialize round-trip -> flush at
+  // room start, all three steps AND their order load-bearing, which is why
+  // every single-variable isolation of it read null.
+  {
+    name: 'dreamcast-determinism',
+    file: 'dreamcast/tools/determinism_probe.mjs',
+    cmd: ['node', 'dreamcast/tools/determinism_probe.mjs',
+          '--frame0', '--normalize', '--arms', 'cross',
+          '--frames', '1800', '--runs', '3', '--warmup', '0', '--name', 'audit-det'],
+    desc: 'deterministic lockstep still holds: TWO independent cores boot dreamcast.html from frame 0 with no savestate, are normalized at the room-start seam, and are then driven frame-gated through 1800 frames of identical scripted pad input — a PASS means all 3 runs kept BYTE-IDENTICAL retro_serialize state and guest cycle counts the whole way, i.e. two real peers would not desync',
+    fast: false, ci: false,
+    ciWhy: 'it needs a 503 MB Dreamcast disc out of dreamcast/discs (2.7 GB, absent from the size-bounded CI checkout) AND two live emulator cores in one Chrome with SharedArrayBuffer; with no disc the probe has nothing to boot and would report a rig fault, which is a red cell that says nothing about determinism',
+    server: true,
+    requires: ['dreamcast/discs/gauntlet', 'dreamcast/flycast_libretro/flycast_worker_emcc.wasm'],
+    timeoutMs: 30 * MIN,
+    // ⚠ THE PROBE EXITS 0 WHETHER IT PASSES OR FAILS (determinism_probe.mjs
+    // ends `await finish(0)` on the success path regardless of the verdict —
+    // it is a measurement rig, not a gate). Judging this one on its exit status
+    // would therefore be a PERMANENT GREEN. That is still true of the `--gate`
+    // convenience mode the probe grew on 2026-09-08: it prints its own
+    // `GATE: PASS/FAIL` line and then exits 0 like every other path (verified:
+    // the only terminal call on the success path is `await finish(0)`), and it
+    // also wipes its Chrome profile on every run, which re-downloads the 503 MB
+    // disc. So this entry passes the flags explicitly and reads the verdict out
+    // of the long-stable `VERDICT <arm>:` line. The verdict is read out of stdout,
+    // and the wasm hash guard (CLAUDE.md gate #10) is read with it: a run whose
+    // binary changed underneath it is VOID, not a pass.
+    judge: (out, code) => {
+      if (code !== 0) return { ok: false, note: `probe exited ${code} — FATAL/rig fault, no verdict produced` };
+      const before = /wasm BEFORE: (\S+)/.exec(out);
+      const after  = /wasm AFTER: (\S+)/.exec(out);
+      if (!before || !after) return { ok: false, note: 'no wasm hash-guard lines on stdout — cannot tell what was measured' };
+      if (before[1] !== after[1]) return { ok: false, note: `wasm CHANGED mid-run ${before[1]} -> ${after[1]} (concurrent relink) — run VOID` };
+      const m = /VERDICT cross: (\d+)\/(\d+) runs byte-identical over (\d+) frames(?: \(\+(\d+) rig faults\))?; first-divergence frames: (\[[^\]]*\]); watchdog fires: (\d+)/.exec(out);
+      if (!m) return { ok: false, note: 'no "VERDICT cross:" line on stdout — the probe never reached a verdict' };
+      const identical = +m[1], measured = +m[2], frames = +m[3], faults = +(m[4] || 0), where = m[5], dog = +m[6];
+      if (measured < 3) return { ok: false, note: `only ${measured} of 3 cross runs produced a measurement (+${faults} rig faults) — not a verdict` };
+      const ok = identical === measured && faults === 0;
+      return { ok, note: ok
+        ? `cross ${identical}/${measured} runs byte-identical over ${frames} frames, watchdog ${dog}, wasm ${before[1]}`
+        : `DESYNC — cross ${identical}/${measured} runs byte-identical over ${frames} frames; first divergence at frame(s) ${where}${faults ? ` (+${faults} rig faults)` : ''}; wasm ${before[1]}` };
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -401,7 +455,11 @@ const NOT_RUN = [
   { file: 'tools/mobile_input_latency.mjs, tools/turn_probe.mjs, tools/pacing_matrix.mjs, tools/audio_probe.mjs, tools/n64_gameplay_ab.mjs, tools/n64_gameplay_probe.mjs, tools/n64_jit_census.mjs, tools/sm64_native_probe.mjs, tools/_jit_speed_ab.mjs',
     why: 'MEASUREMENT probes — they report numbers (latency, ICE relays, pacing, audio rate, A/B throughput) and have no pass/fail contract. A number is not a verdict and must not be dressed as one' },
   { file: 'gamecube/tools/*, dreamcast/tools/* (probes)',
-    why: 'the GameCube and Dreamcast probes are the emulators’ canonical inner loops (CLAUDE.md gates #1 and #8) and require a built .wasm newer than its sources. Running them from a generic auditor would violate the freshness gate the .claude hooks enforce' },
+    why: 'the GameCube and Dreamcast probes are the emulators’ canonical inner loops (CLAUDE.md gates #1 and #8) and require a built .wasm newer than its sources. Running them from a generic auditor would violate the freshness gate the .claude hooks enforce. ONE EXCEPTION, and it is deliberate: dreamcast/tools/determinism_probe.mjs runs as the `dreamcast-determinism` harness above, because deterministic lockstep is the one property in this repo that NO state-diff instrument can check — the operation that fixes it is state-neutral in the serialized set — so a behavioural arm is the only gate there can be. It is run against the shipped binary as a CONSUMER, with no build step and no flag this runner invented' },
+  { file: 'dreamcast/tools/determinism_ports4.mjs',
+    why: 'the FOUR-PORT determinism arm. Not a per-push gate: it plugs four Maple controllers through a throwaway MAIN-world extension, boots the page twice for a plug proof and then twice more for the measurement, and takes about twice the two-port arm. `dreamcast-determinism` above covers the shipping two-player case on every full run; this one is the campaign instrument for the four-player device set (four VMUs, twice the host-time surface) and is run by hand' },
+  { file: 'dreamcast/tools/port_plug_test.mjs',
+    why: 'it asserts (exit code and PASS/FAIL lines) rather than measuring, so it COULD be a gate — naming it here is an honest gap, not a judgement: it boots the Gauntlet disc twice (players=4 and players=1) and belongs in the table once someone has priced its runtime against the rest of the dreamcast set' },
 ];
 
 // ---------------------------------------------------------------------------
@@ -532,6 +590,40 @@ const CI = hasFlag('--ci');
 const LIST = hasFlag('--list');
 const ONLY = (flagVal('--only') || '').split(',').map((s) => s.trim()).filter(Boolean);
 const SKIP = (flagVal('--skip') || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+// ---------------------------------------------------------------------------
+// --judge <name> --judgelog <file> [--judgecode <n>]
+//
+// Apply ONE harness's judge to a CAPTURED stdout instead of running it. This
+// exists because of a rule this repo has already paid for twice: a gate nobody
+// has SEEN GO RED is not evidence. Judges that read a verdict out of stdout are
+// the easy place to write a permanent green — a regex that never matches, or a
+// tolerance that swallows the failure — and running the harness itself cannot
+// show that, because the passing run is the only one you have.
+//
+// With this, a captured failing log and a captured passing log are fed to the
+// same judge, and the red/green pair is the proof. It is not a way to fake a
+// result: it prints the harness name and reads a file, and nothing in the
+// normal run path consults it.
+// ---------------------------------------------------------------------------
+const JUDGE_NAME = flagVal('--judge');
+if (JUDGE_NAME) {
+  const h = HARNESSES.find((x) => x.name === JUDGE_NAME);
+  if (!h) {
+    console.error(`unknown harness: ${JUDGE_NAME}\nknown: ` + HARNESSES.map((x) => x.name).join(', '));
+    process.exit(2);
+  }
+  const logPath = flagVal('--judgelog');
+  if (!logPath) { console.error('--judge needs --judgelog <captured stdout file>'); process.exit(2); }
+  if (!fs.existsSync(logPath)) { console.error('no such log: ' + logPath); process.exit(2); }
+  const captured = fs.readFileSync(logPath, 'utf8');
+  const exitCode = Number(flagVal('--judgecode') ?? 0);
+  const j = h.judge ? h.judge(captured, exitCode)
+                    : { ok: exitCode === 0, note: `no judge — exit status only (exit ${exitCode})` };
+  console.log(`${j.ok ? C.g + 'PASS' + C.x : C.r + 'FAIL' + C.x}  ${C.b}${h.name}${C.x}  ${j.note}`);
+  console.log(`${C.d}judged: ${logPath} (${captured.length} B, exit code ${exitCode})${C.x}`);
+  process.exit(j.ok ? 0 : 1);
+}
 
 // ---------------------------------------------------------------------------
 // pre-flight on the table itself: a declared harness that is not on disk is a
